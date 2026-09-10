@@ -1145,13 +1145,13 @@ func TestTeamsMainLoopOutboxFairnessSeesChatsBeyondScanPrefix(t *testing.T) {
 }
 
 func TestTeamsMainLoopOutboxFairnessWalksPastDistinctChatScanPrefix(t *testing.T) {
+	const distinctChats = mainLoopOutboxFairnessScanLimit + 4
 	for _, useSQLite := range []bool{false, true} {
 		t.Run(map[bool]string{false: "json", true: "sqlite"}[useSQLite], func(t *testing.T) {
 			ctx := context.Background()
+			now := time.Now().UTC()
 			store := newBridgeTestStore(t)
-			bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
-			base := time.Now().UTC().Add(-time.Hour)
-			const distinctChats = mainLoopOutboxFairnessScanLimit + 4
+			base := now.Add(-time.Hour)
 			rows := make([]teamstore.OutboxMessage, 0, distinctChats)
 			for i := 0; i < distinctChats; i++ {
 				rows = append(rows, teamstore.OutboxMessage{
@@ -1161,26 +1161,172 @@ func TestTeamsMainLoopOutboxFairnessWalksPastDistinctChatScanPrefix(t *testing.T
 					CreatedAt: base.Add(time.Duration(i) * time.Millisecond),
 				})
 			}
-			seedBridgeTestOutboxRows(t, ctx, store, rows...)
 			if useSQLite {
 				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
 					t.Fatalf("migrate distinct-chat outbox: %v", err)
 				}
 			}
+			seedBridgeTestOutboxRows(t, ctx, store, rows...)
 
+			// The full boundary walk is a keyset-query assertion. Repeating the
+			// Bridge preflight here would also persist the fairness cursor on every
+			// cycle, turning this test into hundreds of durable commits without
+			// adding another ordering assertion.
 			seen := make(map[string]bool, distinctChats)
-			for cycle := 0; cycle < distinctChats/2+3; cycle++ {
-				chatIDs, err := bridge.pendingMainLoopOutboxChatIDs(ctx)
+			afterChatID := ""
+			pages := 0
+			for {
+				chatIDs, err := store.PendingOutboxChatIDsAt(ctx, teamstore.PendingOutboxQuery{
+					Now:         now,
+					AfterChatID: afterChatID,
+				}, mainLoopOutboxFairnessScanLimit)
 				if err != nil {
-					t.Fatalf("fairness preflight cycle %d: %v", cycle, err)
+					t.Fatalf("fairness keyset page %d: %v", pages, err)
 				}
+				if pages == 0 && len(chatIDs) != mainLoopOutboxFairnessScanLimit {
+					t.Fatalf("fairness keyset first page length = %d, want %d", len(chatIDs), mainLoopOutboxFairnessScanLimit)
+				}
+				if pages == 1 && len(chatIDs) != distinctChats-mainLoopOutboxFairnessScanLimit {
+					t.Fatalf("fairness keyset second page length = %d, want %d", len(chatIDs), distinctChats-mainLoopOutboxFairnessScanLimit)
+				}
+				previousChatID := afterChatID
 				for _, chatID := range chatIDs {
+					if chatID <= previousChatID {
+						t.Fatalf("fairness keyset page %d is not strictly increasing: previous=%q current=%q", pages, previousChatID, chatID)
+					}
+					if seen[chatID] {
+						t.Fatalf("fairness keyset page %d repeated chat %s", pages, chatID)
+					}
 					seen[chatID] = true
+					previousChatID = chatID
+				}
+				if len(chatIDs) == 0 {
+					break
+				}
+				nextChatID := chatIDs[len(chatIDs)-1]
+				if nextChatID <= afterChatID {
+					t.Fatalf("fairness keyset page %d did not advance: after=%q next=%q", pages, afterChatID, nextChatID)
+				}
+				afterChatID = nextChatID
+				pages++
+				if pages > 2 {
+					t.Fatalf("fairness keyset needed more than two pages: after=%q seen=%d", afterChatID, len(seen))
 				}
 			}
-			wantTail := fmt.Sprintf("chat-distinct-%03d", distinctChats-1)
-			if !seen[wantTail] {
-				t.Fatalf("distinct-chat fairness never reached %s; saw %d/%d chats", wantTail, len(seen), distinctChats)
+			if pages != 2 {
+				t.Fatalf("fairness keyset pages = %d, want 2 for %d chats and limit %d", pages, distinctChats, mainLoopOutboxFairnessScanLimit)
+			}
+			if len(seen) != distinctChats {
+				t.Fatalf("fairness keyset saw %d/%d chats", len(seen), distinctChats)
+			}
+			for i := 0; i < distinctChats; i++ {
+				chatID := fmt.Sprintf("chat-distinct-%03d", i)
+				if !seen[chatID] {
+					t.Fatalf("fairness keyset missed %s", chatID)
+				}
+			}
+		})
+	}
+}
+
+func TestTeamsMainLoopOutboxFairnessCursorWalksPastDistinctChatScanPrefix(t *testing.T) {
+	const distinctChats = mainLoopOutboxFairnessScanLimit + 4
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(map[bool]string{false: "json", true: "sqlite"}[useSQLite], func(t *testing.T) {
+			ctx := context.Background()
+			path := filepath.Join(t.TempDir(), "state.json")
+			store, err := teamstore.Open(path)
+			if err != nil {
+				t.Fatalf("open fairness cursor store: %v", err)
+			}
+			storeClosed := false
+			t.Cleanup(func() {
+				if !storeClosed {
+					_ = store.Close()
+				}
+			})
+
+			now := time.Now().UTC()
+			base := now.Add(-time.Hour)
+			rows := make([]teamstore.OutboxMessage, 0, distinctChats)
+			for i := 0; i < distinctChats; i++ {
+				rows = append(rows, teamstore.OutboxMessage{
+					ID:          fmt.Sprintf("outbox:cursor-fair:%03d", i),
+					TeamsChatID: fmt.Sprintf("chat-distinct-%03d", i),
+					Kind:        "helper", Body: fmt.Sprintf("body-%03d", i), Sequence: 1,
+					CreatedAt: base.Add(time.Duration(i) * time.Millisecond),
+				})
+			}
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate distinct-chat cursor outbox: %v", err)
+				}
+			}
+			seedBridgeTestOutboxRows(t, ctx, store, rows...)
+
+			bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+			owner := teamstore.OwnerMetadata{MachineID: bridge.machine.ID, LeaseGeneration: 7}
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				state.ControlLease = teamstore.ControlLease{
+					ScopeID: bridge.scope.ID, HolderMachineID: owner.MachineID, Generation: owner.LeaseGeneration,
+					Status: teamstore.ControlLeaseStatusActive, LeaseUntil: now.Add(time.Hour),
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed fairness owner lease: %v", err)
+			}
+			if _, err := store.SetOutboxFairCursorForOwner(ctx, "chat-distinct-255", owner.MachineID, owner.LeaseGeneration); err != nil {
+				t.Fatalf("seed fairness cursor: %v", err)
+			}
+			ownerCtx := withTeamsOwnerCapability(ctx, owner)
+			assertFairnessCursorSelection := func(callCtx context.Context, bridge *Bridge, want []string, wantCursor string) {
+				t.Helper()
+				got, err := bridge.pendingMainLoopOutboxChatIDs(callCtx)
+				if err != nil {
+					t.Fatalf("pending fairness chat IDs: %v", err)
+				}
+				if len(got) != len(want) {
+					t.Fatalf("fairness chat IDs = %v, want %v", got, want)
+				}
+				for i := range want {
+					if got[i] != want[i] {
+						t.Fatalf("fairness chat IDs = %v, want %v", got, want)
+					}
+				}
+				control, err := bridge.store.ReadControl(callCtx)
+				if err != nil {
+					t.Fatalf("read persisted fairness cursor: %v", err)
+				}
+				if control.OutboxFairCursor != wantCursor {
+					t.Fatalf("persisted fairness cursor = %q, want %q", control.OutboxFairCursor, wantCursor)
+				}
+			}
+
+			assertFairnessCursorSelection(ownerCtx, bridge,
+				[]string{"chat-distinct-256", "chat-distinct-257"}, "chat-distinct-257")
+
+			if err := store.Close(); err != nil {
+				t.Fatalf("close fairness cursor store: %v", err)
+			}
+			storeClosed = true
+			reopened, err := teamstore.Open(path)
+			if err != nil {
+				t.Fatalf("reopen fairness cursor store: %v", err)
+			}
+			t.Cleanup(func() { _ = reopened.Close() })
+			bridge = newBridgeTestBridge(nil, reopened, &recordingExecutor{})
+			assertFairnessCursorSelection(ownerCtx, bridge,
+				[]string{"chat-distinct-258", "chat-distinct-259"}, "chat-distinct-259")
+			assertFairnessCursorSelection(ownerCtx, bridge,
+				[]string{"chat-distinct-000", "chat-distinct-001"}, "chat-distinct-001")
+			if err := reopened.Update(ctx, func(state *teamstore.State) error {
+				state.ControlLease.Generation++
+				return nil
+			}); err != nil {
+				t.Fatalf("advance fairness owner generation: %v", err)
+			}
+			if _, err := bridge.pendingMainLoopOutboxChatIDs(ownerCtx); !errors.Is(err, teamstore.ErrControlLeaseNotHeld) {
+				t.Fatalf("stale owner fairness preflight error = %v, want ErrControlLeaseNotHeld", err)
 			}
 		})
 	}

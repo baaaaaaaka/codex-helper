@@ -2467,7 +2467,7 @@ jobs:
           # corpus. Run every discovered Test/Example/Fuzz entry exactly once,
           # but in bounded prefix shards so one package test process cannot
           # spend the entire 20-minute watchdog behind unrelated fixtures.
-          if ! go run ./scripts/ci/run_full_go_test_shards.go -timeout=20m -parallel=16 -shards=8 -partition-count=2 -partition-index="${{ matrix.partition }}" 2>&1 | tee "$log"; then
+          if ! go run ./scripts/ci/run_full_go_test_shards.go -timeout=20m -parallel=16 -shards=16 -partition-count=2 -partition-index="${{ matrix.partition }}" 2>&1 | tee "$log"; then
             summary="$(grep -E -A8 '^--- FAIL:|^FAIL[[:space:]]|^panic:|^fatal error:' "$log" | tail -80 | tr '\n' ' ' || true)"
             if ! grep -Eq '^--- FAIL:|^panic:|^fatal error:' "$log"; then
               summary="$(tail -40 "$log" | tr '\n' ' ')"
@@ -2510,7 +2510,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        partition: [0, 1]
+        # Race shards are independent hosted runners. Four partitions keep
+        # the exclusive phase balanced and leave only the mathematically
+        # unavoidable second wave for one of the 17 heavy parallel jobs.
+        partition: [0, 1, 2, 3]
 
     steps:
       - name: Checkout
@@ -2526,7 +2529,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          go run ./scripts/ci/run_full_go_test_shards.go -race -timeout=30m -parallel=16 -shards=8 -partition-count=2 -partition-index="${{ matrix.partition }}" 2>&1 | tee "$RUNNER_TEMP/race-test.log"
+          go run ./scripts/ci/run_full_go_test_shards.go -race -timeout=30m -parallel=16 -shards=16 -partition-count=4 -partition-index="${{ matrix.partition }}" 2>&1 | tee "$RUNNER_TEMP/race-test.log"
 
       - name: Upload race diagnostics
         if: ${{ failure() }}

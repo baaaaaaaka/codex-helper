@@ -1,6 +1,7 @@
 import json
 import pathlib
 import re
+import subprocess
 import unittest
 
 
@@ -29,6 +30,163 @@ def step_blocks(job: str) -> dict[str, str]:
 
 
 class TargetedShardWorkflowTests(unittest.TestCase):
+    def test_full_runner_partitions_cover_every_runnable_job_exactly_once(self):
+        def plan(*, race: bool, partition_count: int, partition_index: int) -> list[str]:
+            command = [
+                "go",
+                "run",
+                "./scripts/ci/run_full_go_test_shards.go",
+                "-timeout=30m",
+                "-parallel=16",
+                "-shards=16",
+            ]
+            if race:
+                command.append("-race")
+            command.extend(
+                [
+                    f"-partition-count={partition_count}",
+                    f"-partition-index={partition_index}",
+                    "-list-only",
+                ]
+            )
+            completed = subprocess.run(
+                command,
+                cwd=ROOT,
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            return [line for line in completed.stdout.splitlines() if ": go " in line]
+
+        for race, partition_count in ((False, 2), (True, 4)):
+            with self.subTest(race=race, partition_count=partition_count):
+                complete_plan = plan(
+                    race=race,
+                    partition_count=1,
+                    partition_index=0,
+                )
+                self.assertTrue(complete_plan)
+                self.assertTrue(
+                    any(
+                        "TestTeamsMainLoopOutboxFairnessCursorWalksPastDistinctChatScanPrefix" in job
+                        for job in complete_plan
+                    )
+                )
+                if len(complete_plan) != len(set(complete_plan)):
+                    self.fail("unpartitioned full-test plan contains duplicate jobs")
+                for job in complete_plan:
+                    if ' "-run" ' in job or ' "-skip" ' in job:
+                        self.assertNotRegex(job, r' "-(?:run|skip)" ""')
+                partition_plan_by_index = [
+                    plan(
+                        race=race,
+                        partition_count=partition_count,
+                        partition_index=partition_index,
+                    )
+                    for partition_index in range(partition_count)
+                ]
+                partition_plans = [job for jobs in partition_plan_by_index for job in jobs]
+                self.assertEqual(len(partition_plans), len(complete_plan))
+                self.assertEqual(len(partition_plans), len(set(partition_plans)))
+                self.assertEqual(set(partition_plans), set(complete_plan))
+                def metadata(job: str) -> tuple[int, bool]:
+                    match = re.search(
+                        r" # estimated-weight=(\d+) estimated-exclusive=(true|false)$", job
+                    )
+                    self.assertIsNotNone(match, job)
+                    return int(match.group(1)), match.group(2) == "true"
+
+                for job in partition_plans:
+                    self.assertGreater(metadata(job)[0], 0, job)
+                exclusive_loads = []
+                parallel_spans = []
+                total_loads = []
+                critical_paths = []
+                for partition_jobs in partition_plan_by_index:
+                    self.assertTrue(partition_jobs)
+                    exclusive = [metadata(job)[0] for job in partition_jobs if metadata(job)[1]]
+                    parallel = [metadata(job)[0] for job in partition_jobs if not metadata(job)[1]]
+                    exclusive_loads.append(sum(exclusive))
+                    total_loads.append(sum(exclusive) + sum(parallel))
+                    worker_loads = [0, 0, 0, 0]
+                    for weight in sorted(parallel, reverse=True):
+                        target = min(range(len(worker_loads)), key=worker_loads.__getitem__)
+                        worker_loads[target] += weight
+                    parallel_spans.append(max(worker_loads))
+                    critical_paths.append(sum(exclusive) + max(worker_loads))
+                self.assertLessEqual(
+                    max(exclusive_loads) - min(exclusive_loads),
+                    max(1, max(exclusive_loads) // 10),
+                    f"exclusive phase estimate is skewed: {exclusive_loads}",
+                )
+                if race and partition_count == 4:
+                    # There are 16 large Teams shards and four workers per
+                    # runner. One runner must receive a fifth shard; assert
+                    # that this is only one extra wave instead of requiring
+                    # an impossible equal span across all partitions.
+                    largest_parallel = max(metadata(job)[0] for job in partition_plans if not metadata(job)[1])
+                    self.assertLessEqual(
+                        max(parallel_spans),
+                        2 * largest_parallel,
+                        f"parallel phase exceeds two largest-job waves: {parallel_spans}",
+                    )
+                else:
+                    self.assertLessEqual(
+                        max(parallel_spans) - min(parallel_spans),
+                        max(1, max(parallel_spans) // 10),
+                        f"parallel phase estimate is skewed: {parallel_spans}",
+                    )
+                self.assertLessEqual(
+                    max(total_loads) - min(total_loads),
+                    max(1, max(total_loads) // 10),
+                    f"estimated total work is skewed: {total_loads}",
+                )
+                if race and partition_count == 4:
+                    # A fifth heavy job is unavoidable with 17 heavy jobs and
+                    # four workers per runner. Keep the bound explicit: no
+                    # partition may grow beyond two largest-job waves plus its
+                    # already-balanced exclusive phase.
+                    largest_parallel = max(metadata(job)[0] for job in partition_plans if not metadata(job)[1])
+                    self.assertLessEqual(
+                        max(critical_paths),
+                        max(exclusive_loads) + 2 * largest_parallel,
+                        f"estimated critical path exceeds two largest-job waves: {critical_paths}",
+                    )
+                else:
+                    self.assertLessEqual(
+                        max(critical_paths) - min(critical_paths),
+                        max(1, max(critical_paths) // 10),
+                        f"estimated critical path is skewed: {critical_paths}",
+                    )
+
+    def test_direct_isolated_lane_reports_run_and_pass(self):
+        test_name = "TestTeamsMainLoopOutboxFairnessCursorWalksPastDistinctChatScanPrefix"
+        for race in (False, True):
+            command = ["go", "test", "./internal/teams"]
+            if race:
+                command.append("-race")
+            command.extend(
+                [
+                    "-count=1",
+                    "-timeout=5m",
+                    "-run",
+                    f"^{test_name}$",
+                    "-json",
+                ]
+            )
+            completed = subprocess.run(
+                command,
+                cwd=ROOT,
+                check=True,
+                text=True,
+                capture_output=True,
+            )
+            events = [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
+            for suffix in ("json", "sqlite"):
+                subtest_name = f"{test_name}/{suffix}"
+                self.assertTrue(any(event.get("Action") == "run" and event.get("Test") == subtest_name for event in events))
+                self.assertTrue(any(event.get("Action") == "pass" and event.get("Test") == subtest_name for event in events))
+
     def test_teams_runtime_safety_uses_one_shared_shard_definition(self):
         script = TEAMS_RUNTIME_SHARD.read_text(encoding="utf-8")
         for shard in (
@@ -190,9 +348,9 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             "name: Race test (ubuntu-latest / partition ${{ matrix.partition }})",
             race,
         )
-        self.assertIn("partition: [0, 1]", race)
+        self.assertIn("partition: [0, 1, 2, 3]", race)
         self.assertIn(
-            "-partition-count=2 -partition-index=\"${{ matrix.partition }}\"",
+            "-partition-count=4 -partition-index=\"${{ matrix.partition }}\"",
             race,
         )
 
@@ -215,8 +373,29 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             'strings.HasPrefix(name, "TestTeamsGraph429Stress")',
             runner,
         )
+        for name in (
+            "TestProxyStartBackgroundReapsExitedDetachedChild",
+            "TestStartCodexAppProxyDaemonReapsExitedDetachedChild",
+        ):
+            self.assertRegex(runner, rf'"{name}"\s*:\s*true')
         self.assertIn("runnableIsolationMap(packageName, names)", runner)
         self.assertIn("runnableExclusivityMap(packageName, names)", runner)
+
+    def test_outbox_fixtures_keep_process_isolation_without_host_exclusivity(self):
+        runner = FULL_GO_TEST_SHARDS.read_text(encoding="utf-8")
+        isolated_start = runner.index("func autoIsolatedRunnableName")
+        isolated_end = runner.index("func isCodexRunnerPackage", isolated_start)
+        isolated = runner[isolated_start:isolated_end]
+        self.assertIn('strings.HasPrefix(name, "TestTeamsMainLoopOutbox")', isolated)
+
+        exclusive_start = runner.index("func autoExclusiveRunnableName")
+        exclusive_end = runner.index("func isCodexRunnerPackage", exclusive_start)
+        exclusive = runner[exclusive_start:exclusive_end]
+        self.assertNotIn('strings.HasPrefix(name, "TestTeamsMainLoopOutbox")', exclusive)
+        self.assertRegex(runner, r'"TestTeamsMainLoopOutboxFairnessCursorWalksPastDistinctChatScanPrefix"\s*:\s*true')
+        self.assertRegex(runner, r'"TestTeamsMainLoopOutboxLedgerFailureDoesNotStarveHealthyTail"\s*:\s*true')
+        self.assertIn("Process isolation protects package globals", runner)
+        self.assertIn("if autoExclusiveRunnableName(packageName, name)", runner)
 
     def test_ubuntu_package_bootstrap_uses_source_isolated_update(self):
         targeted = targeted_job()
