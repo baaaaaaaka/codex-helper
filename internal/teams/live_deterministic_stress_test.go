@@ -442,6 +442,15 @@ func newDeterministicStressGraph(t *testing.T) (*GraphClient, *[]bridgeSentMessa
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
+		case r.Method == http.MethodGet && r.URL.String() == "/me?$select=id,displayName,userPrincipalName":
+			_, _ = fmt.Fprint(w, `{"id":"deterministic-user","displayName":"Deterministic User","userPrincipalName":"deterministic@example.test"}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/me/onlineMeetings/createOrGet":
+			subject := decodeTestOnlineMeetingSubject(t, r)
+			mu.Lock()
+			chatID := fmt.Sprintf("work-chat-%02d", len(created)+1)
+			created = append(created, chatID)
+			mu.Unlock()
+			writeTestOnlineMeeting(w, chatID, subject)
 		case r.Method == http.MethodPost && r.URL.Path == "/me/onlineMeetings":
 			subject := decodeTestOnlineMeetingSubject(t, r)
 			mu.Lock()

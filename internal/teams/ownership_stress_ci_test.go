@@ -347,6 +347,7 @@ func TestTeamsOwnershipStressHeadReadFailureRecoversWithoutCursorAdvanceCI(t *te
 	mu.Lock()
 	recoveryAllowed = true
 	mu.Unlock()
+	expireGraphReadGateForTest(t, bridge, store, first.ChatID)
 
 	if _, err := bridge.pollChatWithRole(ctx, first.ChatID, 20, inboundPollRoleWork, false, func(ctx context.Context, msg ChatMessage, text string) error {
 		return bridge.handleSessionMessage(ctx, first.ChatID, msg, text)
@@ -604,9 +605,11 @@ func TestTeamsOwnershipStressControlReplyStallStillReachesWorkPollCI(t *testing.
 	}
 	bridge.graph = bridge.readGraph
 
-	err := bridge.pollOnce(context.Background(), 20)
-	if err == nil {
-		t.Fatal("pollOnce returned nil after bounded control reply timeout")
+	// Polling only durably admits the control command now.  Its Graph response is
+	// deliberately sent by the independent outbox phase, so a stalled control
+	// write cannot prevent pollOnce from completing the work-chat quantum.
+	if err := bridge.pollOnce(context.Background(), 20); err != nil {
+		t.Fatalf("pollOnce returned an error before the independent outbox phase: %v", err)
 	}
 	mu.Lock()
 	gotWorkReads := workReads
@@ -614,12 +617,32 @@ func TestTeamsOwnershipStressControlReplyStallStillReachesWorkPollCI(t *testing.
 	if gotWorkReads != 1 {
 		t.Fatalf("work Graph reads after control reply stall = %d, want one", gotWorkReads)
 	}
-	poll, ok, pollErr := store.ChatPoll(context.Background(), bridge.reg.ControlChatID)
-	if pollErr != nil || !ok {
-		t.Fatalf("control poll after reply stall: ok=%v err=%v", ok, pollErr)
+	if err := bridge.flushPendingOutboxMainLoop(context.Background()); err == nil {
+		t.Fatal("outbox phase returned nil after bounded control reply timeout")
 	}
-	if poll.LastError == "" || poll.ContinuationPath != "" {
-		t.Fatalf("control reply stall was not retained as retryable state: %#v", poll)
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load state after control reply stall: %v", err)
+	}
+	retryableControlOutbox := false
+	for _, msg := range state.OutboxMessages {
+		if msg.TeamsChatID != bridge.reg.ControlChatID {
+			continue
+		}
+		knownRetryable := msg.Status == teamstore.OutboxStatusQueued
+		// A transport/5xx response has an unknown external outcome, so the
+		// fail-closed sender deliberately keeps it in Sending rather than making
+		// it a replayable queued row. Both forms are durable retry/repair state;
+		// this test is checking that the failed control write is not lost, not
+		// asking the read poll to own the write's status transition.
+		ambiguousHeld := msg.Status == teamstore.OutboxStatusSending && msg.TeamsMessageID == ""
+		if (knownRetryable || ambiguousHeld) && msg.LastSendError != "" && !msg.NextAttemptAt.IsZero() && msg.NextAttemptAt.After(time.Now()) {
+			retryableControlOutbox = true
+			break
+		}
+	}
+	if !retryableControlOutbox {
+		t.Fatalf("control reply stall was not retained as a retryable outbox row: %#v", state.OutboxMessages)
 	}
 }
 
@@ -1050,6 +1073,11 @@ func TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI(t *t
 	}
 	bridge.maxWorkChatPollsPerCycle = len(sessions)
 	bridge.leaseDuration = time.Minute
+	// pollOnce is normally entered from listenOwnerGeneration, which marks the
+	// asynchronous listener lane.  Carry that production mode here so the
+	// SQLite-BUSY retry path is exercised without allowing a direct synchronous
+	// poll to replay a handler that could perform a Graph write.
+	bridge.asyncTurns = true
 	if active, err := bridge.claimControlLease(setupCtx); err != nil || !active {
 		t.Fatalf("claim control lease: active=%t err=%v", active, err)
 	}
@@ -1075,6 +1103,7 @@ func TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI(t *t
 
 	var mu sync.Mutex
 	requestCount := 0
+	requestByChat := make(map[string]int, len(sessions))
 	activeRequests := 0
 	maxActiveRequests := 0
 	var saturatedOnce sync.Once
@@ -1088,6 +1117,10 @@ func TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI(t *t
 		}
 		mu.Lock()
 		requestCount++
+		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+		if len(parts) >= 2 {
+			requestByChat[parts[1]]++
+		}
 		ordinal := requestCount
 		if ordinal <= 4 {
 			activeRequests++
@@ -1121,12 +1154,12 @@ func TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI(t *t
 		sleep:      func(context.Context, time.Duration) error { return nil },
 		jitter:     func(d time.Duration) time.Duration { return d },
 	}
-
 	// Start the scenario budget only after the file-backed store, lease, and
 	// SQLite migration are ready. Setup can be slow under -race, but it is not
 	// the liveness behavior this test is measuring.
 	ctx, cancel := context.WithTimeout(context.Background(), ownershipStressTestTimeout(10*time.Second))
 	defer cancel()
+	ctx = context.WithValue(ctx, teamsListenerPollContextKey{}, true)
 
 	heartbeatCtx, stopHeartbeat := context.WithCancel(ctx)
 	heartbeatDone := bridge.startOwnerHeartbeat(heartbeatCtx)
@@ -1207,9 +1240,18 @@ func TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI(t *t
 
 	mu.Lock()
 	gotRequests := requestCount
+	gotRequestsByChat := make(map[string]int, len(requestByChat))
+	for chatID, count := range requestByChat {
+		gotRequestsByChat[chatID] = count
+	}
 	mu.Unlock()
-	if gotRequests != 5 {
-		t.Fatalf("saturated Graph worker requests = %d, want exactly five due chats", gotRequests)
+	if gotRequests < len(sessions) || gotRequests > len(sessions)+pollSQLiteBusyRetryAttempts {
+		t.Fatalf("saturated Graph worker requests = %d, want five due chats plus only bounded BUSY retries; by-chat=%v", gotRequests, gotRequestsByChat)
+	}
+	for _, session := range sessions {
+		if gotRequestsByChat[session.ChatID] == 0 {
+			t.Fatalf("due chat %s never reached Graph; requests=%d by-chat=%v", session.ChatID, gotRequests, gotRequestsByChat)
+		}
 	}
 	if maxActiveRequests != maxConcurrentWorkChatPolls {
 		t.Fatalf("maximum simultaneous Graph worker requests = %d, want %d", maxActiveRequests, maxConcurrentWorkChatPolls)
@@ -1441,6 +1483,7 @@ func TestTeamsOwnershipStressHeadContinuationSurvivesOldContinuationFailureCI(t 
 	}
 	oldRecoveryAllowed = true
 	for i := 0; i < 3; i++ {
+		expireGraphReadGateForTest(t, bridge, store, session.ChatID)
 		if _, err := bridge.pollChatWithRole(ctx, session.ChatID, 20, inboundPollRoleWork, false, handle); err != nil {
 			t.Fatalf("dual-frontier recovery poll %d: %v", i+1, err)
 		}

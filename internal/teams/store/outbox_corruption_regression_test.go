@@ -190,6 +190,48 @@ func TestSQLiteSemanticallyMalformedSentSideEffectRowDoesNotHideHealthyWork(t *t
 	}
 }
 
+// A production-shaped store contains many already-sent rows with no pending
+// marker. The side-effect lane must use the marker index as its candidate
+// source and still find a real pending row after that sent history. This is a
+// liveness regression test for the old JSON1 scan, which spent the whole
+// outbox phase evaluating every Sent payload even when the marker was false.
+func TestSQLitePendingSentOutboxSideEffectsSkipsSentHistory(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Now().UTC().Add(-time.Hour)
+	const historyRows = 256
+	if err := store.Update(ctx, func(state *State) error {
+		for i := 0; i < historyRows; i++ {
+			id := fmt.Sprintf("outbox:sent-history-%03d", i)
+			state.OutboxMessages[id] = OutboxMessage{
+				ID: id, TeamsChatID: "chat:sent-history", Kind: "helper-final",
+				Body: strings.Repeat("already delivered ", 8), Status: OutboxStatusSent,
+				TeamsMessageID: fmt.Sprintf("teams:sent-history-%03d", i),
+				CreatedAt:      now.Add(time.Duration(i) * time.Microsecond), UpdatedAt: now,
+			}
+		}
+		pendingID := "outbox:sent-history-pending"
+		state.OutboxMessages[pendingID] = OutboxMessage{
+			ID: pendingID, TeamsChatID: "chat:sent-history", Kind: "helper-final",
+			Body: "post-send work", Status: OutboxStatusSent,
+			TeamsMessageID: "teams:sent-history-pending", PostSendEffectsPending: true,
+			CreatedAt: now.Add(time.Duration(historyRows+1) * time.Microsecond), UpdatedAt: now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed sent history: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+
+	pending, err := store.PendingSentOutboxSideEffects(ctx, 1)
+	if err != nil {
+		t.Fatalf("PendingSentOutboxSideEffects: %v", err)
+	}
+	if len(pending) != 1 || pending[0].ID != "outbox:sent-history-pending" {
+		t.Fatalf("pending side effects = %#v, want the indexed pending marker", pending)
+	}
+}
+
 // Echo recovery is bounded per status, but the SQL LIMIT must not be applied
 // before the local JSON decode. A row with a valid projection and a malformed
 // optional field can otherwise hide the only usable candidate behind it.
@@ -437,8 +479,8 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	if err != nil {
 		t.Fatalf("pending chat IDs with malformed numeric projection: %v", err)
 	}
-	if len(chatIDs) != 1 || chatIDs[0] != healthy.TeamsChatID {
-		t.Fatalf("pending chat IDs = %#v, want only %q", chatIDs, healthy.TeamsChatID)
+	if !containsStringForTest(chatIDs, healthy.TeamsChatID) {
+		t.Fatalf("pending chat IDs = %#v, want candidate hint to retain healthy chat %q", chatIDs, healthy.TeamsChatID)
 	}
 	if err := store.Update(ctx, func(state *State) error {
 		state.ControlChat.TeamsChatID = "chat:unrelated-after-malformed-numeric"
@@ -451,10 +493,10 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	}
 }
 
-// PendingOutboxChatIDsAt is a chat-level hint. It must group after SQLite has
-// applied the same primitive JSON admission contract as the typed sender, so a
-// large malformed prefix in one chat cannot force Go to decode every row before
-// a later healthy chat becomes visible.
+// PendingOutboxChatIDsAt is a chat-level hint rather than a send authorization.
+// It must stay cheap even with a large malformed prefix; the targeted page is
+// the authoritative primitive/canonical admission boundary and must still
+// expose a later healthy chat without decoding the whole outbox here.
 func TestSQLitePendingOutboxChatIDsGroupsBeforeMalformedSameChatPrefix(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)
@@ -490,8 +532,105 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	if err != nil {
 		t.Fatalf("pending chat IDs with malformed same-chat prefix: %v", err)
 	}
-	if len(chatIDs) != 1 || chatIDs[0] != healthy.TeamsChatID {
-		t.Fatalf("pending chat IDs = %#v, want only healthy chat %q", chatIDs, healthy.TeamsChatID)
+	if !containsStringForTest(chatIDs, healthy.TeamsChatID) {
+		t.Fatalf("pending chat IDs = %#v, want candidate hint to retain healthy chat %q", chatIDs, healthy.TeamsChatID)
+	}
+	page, err := store.PendingOutboxPageAt(ctx, PendingOutboxQuery{Now: now, Limit: 2})
+	if err != nil {
+		t.Fatalf("pending page after candidate hint: %v", err)
+	}
+	if len(page.Messages) != 1 || page.Messages[0].ID != healthy.ID {
+		t.Fatalf("pending page = %#v, want only healthy row %q", page.Messages, healthy.ID)
+	}
+}
+
+// A canonical retry schedule may temporarily be newer than the legacy
+// deliver_after projection.  The chat selector must not let rows whose
+// canonical schedule is still in the future consume the lexical candidate
+// limit, and the targeted authoritative page must still recover a row whose
+// canonical schedule is due even when its scalar gate is stale and future.
+func TestSQLitePendingOutboxNativeLanePreservesCanonicalScheduleAndTail(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Date(2026, 9, 1, 17, 0, 0, 0, time.UTC)
+	const falsePrefixCount = 80
+	const tailID = "outbox:hint-schedule-tail"
+	const canonicalDueID = "outbox:hint-schedule-canonical-due"
+	const tailChatID = "chat:hint-z-tail"
+	const canonicalDueChatID = "chat:hint-z-canonical-due"
+
+	if err := store.Update(ctx, func(state *State) error {
+		for i := 0; i < falsePrefixCount; i++ {
+			id := fmt.Sprintf("outbox:hint-schedule-future-%03d", i)
+			chatID := fmt.Sprintf("chat:hint-future-%03d", i)
+			state.OutboxMessages[id] = OutboxMessage{
+				ID: id, TeamsChatID: chatID, Kind: "helper-status", Body: "future",
+				Status: OutboxStatusQueued, Sequence: 1,
+				CreatedAt:     now.Add(time.Duration(i) * time.Second),
+				UpdatedAt:     now.Add(time.Duration(i) * time.Second),
+				NextAttemptAt: now.Add(time.Hour),
+			}
+		}
+		state.OutboxMessages[tailID] = OutboxMessage{
+			ID: tailID, TeamsChatID: tailChatID, Kind: "helper-status", Body: "tail",
+			Status: OutboxStatusQueued, Sequence: 1,
+			CreatedAt: now.Add(2 * time.Hour), UpdatedAt: now.Add(2 * time.Hour),
+		}
+		state.OutboxMessages[canonicalDueID] = OutboxMessage{
+			ID: canonicalDueID, TeamsChatID: canonicalDueChatID, Kind: "helper-status", Body: "canonical due",
+			Status: OutboxStatusQueued, Sequence: 1,
+			CreatedAt: now.Add(2*time.Hour + time.Second), UpdatedAt: now.Add(2 * time.Hour),
+			NextAttemptAt: now.Add(-time.Minute),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed canonical schedule fixture: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	if err := store.PrepareOutboxProjection(ctx); err != nil {
+		t.Fatalf("PrepareOutboxProjection: %v", err)
+	}
+	if got := sqliteMetaValueForTest(t, store, sqliteOutboxProjectionTrustKey); got != sqliteOutboxProjectionTrustTrusted {
+		t.Fatalf("outbox projection marker = %q, want trusted", got)
+	}
+
+	// Keep the marker trusted: next_attempt_at is deliberately the canonical
+	// schedule, so a stale compatibility deliver_after is allowed.  The old
+	// GROUP BY hint would return the first false-prefix chats; the row-wise
+	// scalar lane must decode and reject them before filling the result page.
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		for i := 0; i < falsePrefixCount; i++ {
+			id := fmt.Sprintf("outbox:hint-schedule-future-%03d", i)
+			if _, err := tx.ExecContext(ctx, `UPDATE outbox_messages SET deliver_after = ? WHERE id = ?`, now.UnixNano(), id); err != nil {
+				return err
+			}
+		}
+		_, err := tx.ExecContext(ctx, `UPDATE outbox_messages SET deliver_after = ? WHERE id = ?`, now.Add(time.Hour).UnixNano(), canonicalDueID)
+		return err
+	})
+	if got := sqliteMetaValueForTest(t, store, sqliteOutboxProjectionTrustKey); got != sqliteOutboxProjectionTrustTrusted {
+		t.Fatalf("stale canonical schedule projection revoked marker = %q, want trusted", got)
+	}
+
+	chatIDs, err := store.PendingOutboxChatIDsAt(ctx, PendingOutboxQuery{Now: now}, 2)
+	if err != nil {
+		t.Fatalf("PendingOutboxChatIDsAt with canonical schedule overrides: %v", err)
+	}
+	if !containsStringForTest(chatIDs, tailChatID) || !containsStringForTest(chatIDs, canonicalDueChatID) {
+		t.Fatalf("pending chat IDs = %#v, want due tail %q and canonical-due chat %q", chatIDs, tailChatID, canonicalDueChatID)
+	}
+	for _, chatID := range chatIDs {
+		if strings.HasPrefix(chatID, "chat:hint-future-") {
+			t.Fatalf("future canonical chat incorrectly filled hint page: %#v", chatIDs)
+		}
+	}
+
+	page, err := store.PendingOutboxPageAt(ctx, PendingOutboxQuery{Now: now, TeamsChatID: canonicalDueChatID, Limit: 1})
+	if err != nil {
+		t.Fatalf("targeted page with stale future scalar: %v", err)
+	}
+	if len(page.Messages) != 1 || page.Messages[0].ID != canonicalDueID {
+		t.Fatalf("targeted canonical-due page = %#v, want %q", page.Messages, canonicalDueID)
 	}
 }
 
@@ -518,6 +657,15 @@ func TestSQLiteExplicitNullNextAttemptAtIsImmediatelyDue(t *testing.T) {
 	if len(pending) != 1 || pending[0].ID != id {
 		t.Fatalf("pending = %#v, want explicit-null row %q", pending, id)
 	}
+}
+
+func containsStringForTest(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestSQLiteOutboxProjectionMismatchIsOpaqueToEveryHotLane(t *testing.T) {
@@ -580,6 +728,83 @@ func TestSQLiteOutboxProjectionMismatchIsOpaqueToEveryHotLane(t *testing.T) {
 		if _, err := store.OutboxMessageByID(ctx, id); !errors.Is(err, ErrOutboxNotFound) {
 			t.Fatalf("projection-mismatched point read %q error = %v, want quarantine as ErrOutboxNotFound", id, err)
 		}
+	}
+}
+
+// SQLite's julianday() comparison is intentionally tolerant enough for normal
+// RFC3339Nano values, but that means it cannot see a sub-millisecond scalar
+// created_at tear. The Go decoder can see the exact nanosecond mismatch. A
+// trusted scalar page must therefore request the canonical lane rather than
+// silently returning a page that omitted a possible FIFO predecessor.
+func TestSQLiteTrustedPendingPageFallsBackOnExactCreatedAtProjectionMismatch(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Date(2026, 9, 1, 13, 30, 0, 123456000, time.UTC)
+	target := OutboxMessage{
+		ID: "outbox:exact-created-at-mismatch", SessionID: "session:exact-created-at-mismatch",
+		TeamsChatID: "chat:exact-created-at-mismatch", Kind: "helper-status",
+		Body: "canonical FIFO target", Status: OutboxStatusQueued, Sequence: 1,
+		CreatedAt: now, UpdatedAt: now,
+	}
+	if err := store.Update(ctx, func(state *State) error {
+		state.OutboxMessages[target.ID] = target
+		return nil
+	}); err != nil {
+		t.Fatalf("seed exact created_at fixture: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	if err := store.PrepareOutboxProjection(ctx); err != nil {
+		t.Fatalf("PrepareOutboxProjection: %v", err)
+	}
+	if got := sqliteMetaValueForTest(t, store, sqliteOutboxProjectionTrustKey); got != sqliteOutboxProjectionTrustTrusted {
+		t.Fatalf("initial outbox projection marker = %q, want trusted", got)
+	}
+
+	// This remains inside the SQL tolerance used by the audit/trigger, but it
+	// is not equal at the nanosecond precision used by the durable keyset.
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE outbox_messages SET created_at = ? WHERE id = ?`, sqliteTime(now.Add(time.Nanosecond)), target.ID)
+		return err
+	})
+	if got := sqliteMetaValueForTest(t, store, sqliteOutboxProjectionTrustKey); got != sqliteOutboxProjectionTrustTrusted {
+		t.Fatalf("sub-millisecond created_at tear revoked marker = %q, want trigger tolerance to leave trusted for row-local fallback", got)
+	}
+
+	var fastErr error
+	if err := store.withStateLock(ctx, func() error {
+		pointer, ok, err := store.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := store.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		_, fastErr = pendingOutboxPageAtSQLiteFast(ctx, db, PendingOutboxQuery{Now: now.Add(time.Hour), Limit: 1})
+		return nil
+	}); err != nil {
+		t.Fatalf("run trusted scalar page: %v", err)
+	}
+	if !errors.Is(fastErr, errSQLiteOutboxProjectionFallback) {
+		t.Fatalf("trusted scalar page error = %v, want canonical fallback sentinel", fastErr)
+	}
+
+	fallbackCalled := make(chan struct{}, 1)
+	previousHook := sqliteOutboxPendingPageCanonicalFallbackTestHook
+	sqliteOutboxPendingPageCanonicalFallbackTestHook = func() {
+		select {
+		case fallbackCalled <- struct{}{}:
+		default:
+		}
+	}
+	t.Cleanup(func() { sqliteOutboxPendingPageCanonicalFallbackTestHook = previousHook })
+	if _, err := store.PendingOutboxPageAt(ctx, PendingOutboxQuery{Now: now.Add(time.Hour), Limit: 1}); err != nil {
+		t.Fatalf("PendingOutboxPageAt after scalar mismatch: %v", err)
+	}
+	select {
+	case <-fallbackCalled:
+	default:
+		t.Fatal("trusted scalar mismatch did not enter canonical pending-page fallback")
 	}
 }
 
@@ -698,7 +923,6 @@ func TestSQLiteLegacyOutboxProjectionHydratesEveryDeliveryLane(t *testing.T) {
 			[]byte(`{"id":"outbox:legacy-projection-sent","kind":"helper-final","body":"sent legacy body","created_at":"2026-09-07T14:00:01Z"}`), sentID)
 		return err
 	})
-
 	page, err := store.PendingOutboxPageAt(ctx, PendingOutboxQuery{Now: now, Limit: 10})
 	if err != nil {
 		t.Fatalf("legacy queued pending page: %v", err)
@@ -880,6 +1104,253 @@ func TestSQLiteOutboxFIFOIndeterminateWhenJSONSequenceIsHiddenByScalar(t *testin
 	}
 	if all, err := store.EarlierUnsentOutboxes(ctx, later); !errors.Is(err, ErrOutboxPredecessorIndeterminate) || len(all) != 0 {
 		t.Fatalf("hidden-sequence batch FIFO predecessors = %#v err=%v, want indeterminate", all, err)
+	}
+}
+
+// The scalar compatibility lane is not optional: a mixed-version/torn write
+// can leave the indexed chat pointing at this destination while canonical JSON
+// points elsewhere. Such a row must remain an indeterminate FIFO fence instead
+// of being skipped by the JSON-first fast lane.
+func TestSQLiteEarlierUnsentOutboxChecksScalarCompatibilityLane(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Date(2026, 9, 7, 16, 45, 0, 0, time.UTC)
+	const chatID = "chat:fifo-scalar-compatibility"
+	const earlierID = "outbox:fifo-scalar-compatibility-earlier"
+	const laterID = "outbox:fifo-scalar-compatibility-later"
+	if err := store.Update(ctx, func(state *State) error {
+		state.OutboxMessages[laterID] = OutboxMessage{
+			ID: laterID, TeamsChatID: chatID, Kind: "helper", Body: "later", Status: OutboxStatusQueued,
+			Sequence: 2, CreatedAt: now.Add(time.Second), UpdatedAt: now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed scalar compatibility later row: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		raw := []byte(`{"id":"outbox:fifo-scalar-compatibility-earlier","teams_chat_id":"chat:other","status":"queued","sequence":1,"created_at":"2026-09-07T16:45:00Z","body":"conflicting chat"}`)
+		_, err := tx.ExecContext(ctx, `INSERT INTO outbox_messages
+(id, session_id, turn_id, teams_chat_id, teams_message_id, status, sequence, created_at, deliver_after, post_send_effects_pending, json)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, earlierID, "", "", chatID, "", string(OutboxStatusQueued), 1, sqliteTime(now), 0, 0, raw)
+		return err
+	})
+	later, err := store.OutboxMessageByID(ctx, laterID)
+	if err != nil {
+		t.Fatalf("load scalar compatibility later row: %v", err)
+	}
+	if earlier, found, err := store.EarlierUnsentOutbox(ctx, later); !errors.Is(err, ErrOutboxPredecessorIndeterminate) || found || earlier.ID != "" {
+		t.Fatalf("scalar compatibility predecessor = %#v found=%v err=%v, want indeterminate", earlier, found, err)
+	}
+}
+
+// The native scalar keyset is enabled only after a complete projection audit.
+// Both cross-lane combinations must therefore fall back to the exact JSON
+// predicate and remain an indeterminate FIFO fence. Otherwise a contradictory
+// row could be invisible to the fast path and let a later message through.
+func TestSQLiteEarlierUnsentOutboxCrossLaneMismatchIsIndeterminate(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name       string
+		jsonChat   string
+		scalarChat string
+		jsonSeq    int
+		scalarSeq  int
+	}{
+		{name: "canonical-chat-scalar-sequence", jsonChat: "chat:fifo-cross", scalarChat: "chat:other", jsonSeq: 100, scalarSeq: 1},
+		{name: "scalar-chat-canonical-sequence", jsonChat: "chat:other", scalarChat: "chat:fifo-cross", jsonSeq: 1, scalarSeq: 100},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newTestStore(t)
+			now := time.Date(2026, 9, 7, 16, 50, 0, 0, time.UTC)
+			later := OutboxMessage{
+				ID: "outbox:fifo-cross-later", TeamsChatID: "chat:fifo-cross", Kind: "helper", Body: "later",
+				Status: OutboxStatusQueued, Sequence: 10, CreatedAt: now.Add(time.Minute), UpdatedAt: now.Add(time.Minute),
+			}
+			if _, _, err := store.QueueOutbox(ctx, later); err != nil {
+				t.Fatalf("seed cross-lane later row: %v", err)
+			}
+			migrateStoreToSQLiteForTest(t, store)
+			withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+				raw := []byte(fmt.Sprintf(`{"id":"outbox:fifo-cross-earlier","teams_chat_id":%q,"status":"queued","sequence":%d,"created_at":"2026-09-07T16:50:00Z","body":"conflicting projection"}`, tc.jsonChat, tc.jsonSeq))
+				_, err := tx.ExecContext(ctx, `INSERT INTO outbox_messages
+(id, session_id, turn_id, teams_chat_id, teams_message_id, status, sequence, created_at, deliver_after, post_send_effects_pending, json)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, "outbox:fifo-cross-earlier", "", "", tc.scalarChat, "", string(OutboxStatusQueued), tc.scalarSeq, sqliteTime(now), 0, 0, raw)
+				return err
+			})
+
+			got, found, err := store.EarlierUnsentOutbox(ctx, later)
+			if !errors.Is(err, ErrOutboxPredecessorIndeterminate) || found || got.ID != "" {
+				t.Fatalf("cross-lane predecessor = %#v found=%v err=%v, want indeterminate", got, found, err)
+			}
+			all, err := store.EarlierUnsentOutboxes(ctx, later)
+			if !errors.Is(err, ErrOutboxPredecessorIndeterminate) || len(all) != 0 {
+				t.Fatalf("cross-lane predecessors = %#v err=%v, want indeterminate", all, err)
+			}
+		})
+	}
+}
+
+// Once the clean scalar projection is trusted, a later contradictory write
+// must revoke that trust before the next FIFO proof. This covers direct SQL or
+// an older mixed-version writer that bypasses the current Go upsert helper.
+func TestSQLiteOutboxProjectionGuardRevokesNativeTrust(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Date(2026, 9, 7, 16, 55, 0, 0, time.UTC)
+	later := OutboxMessage{ID: "outbox:fifo-guard-later", TeamsChatID: "chat:fifo-guard", Kind: "helper", Body: "later", Status: OutboxStatusQueued, Sequence: 2, CreatedAt: now.Add(time.Minute), UpdatedAt: now.Add(time.Minute)}
+	if _, _, err := store.QueueOutbox(ctx, later); err != nil {
+		t.Fatalf("seed guard row: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	if _, found, err := store.EarlierUnsentOutbox(ctx, later); err != nil || found {
+		t.Fatalf("clean native predecessor = found=%v err=%v, want empty", found, err)
+	}
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		raw := []byte(`{"id":"outbox:fifo-guard-earlier","teams_chat_id":"chat:fifo-guard","status":"queued","sequence":9,"created_at":"2026-09-07T16:55:00Z","body":"conflicting sequence"}`)
+		_, err := tx.ExecContext(ctx, `INSERT INTO outbox_messages
+(id, session_id, turn_id, teams_chat_id, teams_message_id, status, sequence, created_at, deliver_after, post_send_effects_pending, json)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, "outbox:fifo-guard-earlier", "", "", "chat:fifo-guard", "", string(OutboxStatusQueued), 1, sqliteTime(now), 0, 0, raw)
+		return err
+	})
+	got, found, err := store.EarlierUnsentOutbox(ctx, later)
+	if !errors.Is(err, ErrOutboxPredecessorIndeterminate) || found || got.ID != "" {
+		t.Fatalf("guard-revoked predecessor = %#v found=%v err=%v, want indeterminate", got, found, err)
+	}
+}
+
+// The one-time outbox projection audit belongs to the listener startup
+// boundary, not to the first foreground send.  Verify that the explicit
+// preparation API resolves the durable capability marker before FIFO lookup
+// and leaves the normal predecessor result unchanged.
+func TestSQLitePrepareOutboxProjectionBeforeForegroundFIFO(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Date(2026, 9, 7, 16, 58, 0, 0, time.UTC)
+	if err := store.Update(ctx, func(state *State) error {
+		state.OutboxMessages["outbox:prepare-fifo-earlier"] = OutboxMessage{
+			ID: "outbox:prepare-fifo-earlier", TeamsChatID: "chat:prepare-fifo", Kind: "helper",
+			Body: "earlier", Status: OutboxStatusSent, Sequence: 1, CreatedAt: now, UpdatedAt: now,
+		}
+		state.OutboxMessages["outbox:prepare-fifo-later"] = OutboxMessage{
+			ID: "outbox:prepare-fifo-later", TeamsChatID: "chat:prepare-fifo", Kind: "helper",
+			Body: "later", Status: OutboxStatusQueued, Sequence: 2, CreatedAt: now.Add(time.Second), UpdatedAt: now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed prepare FIFO rows: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+
+	readMarker := func() string {
+		t.Helper()
+		var marker string
+		if err := store.withStateLock(ctx, func() error {
+			pointer, ok, err := store.currentSQLitePointerUnlocked()
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return errors.New("store is not backed by sqlite")
+			}
+			db, err := store.sqliteDBUnlocked(pointer)
+			if err != nil {
+				return err
+			}
+			return db.QueryRowContext(ctx, `SELECT value FROM state_meta WHERE key = ?`, sqliteOutboxProjectionTrustKey).Scan(&marker)
+		}); err != nil {
+			t.Fatalf("read outbox projection marker: %v", err)
+		}
+		return marker
+	}
+	if got := readMarker(); got != sqliteOutboxProjectionTrustUnknown {
+		t.Fatalf("initial outbox projection marker = %q, want %q", got, sqliteOutboxProjectionTrustUnknown)
+	}
+	if err := store.PrepareOutboxProjection(ctx); err != nil {
+		t.Fatalf("PrepareOutboxProjection: %v", err)
+	}
+	if got := readMarker(); got != sqliteOutboxProjectionTrustTrusted {
+		t.Fatalf("prepared outbox projection marker = %q, want %q", got, sqliteOutboxProjectionTrustTrusted)
+	}
+
+	later, err := store.OutboxMessageByID(ctx, "outbox:prepare-fifo-later")
+	if err != nil {
+		t.Fatalf("load prepared later row: %v", err)
+	}
+	if earlier, found, err := store.EarlierUnsentOutbox(ctx, later); err != nil || found {
+		t.Fatalf("prepared FIFO predecessor = %#v found=%v err=%v, want no predecessor", earlier, found, err)
+	}
+}
+
+// Keep the performance fix tied to the actual native FIFO query shape. A
+// future refactor that leaves the scalar index unused and reintroduces a full
+// JSON scan should fail this test before it reaches a real backlog.
+func TestSQLiteEarlierUnsentOutboxUsesOrderedChatSequenceIndex(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	if _, _, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID: "outbox:fifo-index-seed", TeamsChatID: "chat:fifo-index", Status: OutboxStatusQueued,
+		Sequence: 2, CreatedAt: time.Date(2026, 9, 7, 17, 0, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf("seed FIFO index row: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	var details []string
+	err := store.withStateLock(ctx, func() error {
+		pointer, ok, err := store.currentSQLitePointerUnlocked()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errors.New("store is not backed by sqlite")
+		}
+		db, err := store.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		if _, err := db.ExecContext(ctx, `ANALYZE`); err != nil {
+			return err
+		}
+		jsonExpr := "CASE WHEN length(o.json) <= ? THEN o.json ELSE NULL END"
+		rows, err := db.QueryContext(ctx, `EXPLAIN QUERY PLAN SELECT `+sqliteOutboxProjectionSelectWithJSON("o.", jsonExpr)+`, length(o.json) FROM outbox_messages o
+WHERE o.teams_chat_id = ?
+  AND o.id <> ?
+  AND o.sequence > 0 AND o.sequence < ?
+  AND o.status NOT IN (?, ?)
+  AND (o.sequence > ? OR (o.sequence = ? AND (o.created_at > ? OR (o.created_at = ? AND o.id > ?))))
+ORDER BY o.sequence, o.created_at, o.id LIMIT ?`, sqliteOutboxFIFOLegacyMaxJSONRowBytes, "chat:fifo-index", "outbox:fifo-index-cursor", 3, string(OutboxStatusSent), string(OutboxStatusSkipped), 0, 0, 0, 0, "", 128)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id, parent, unused int
+			var detail string
+			if err := rows.Scan(&id, &parent, &unused, &detail); err != nil {
+				return err
+			}
+			details = append(details, detail)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		t.Fatalf("explain native FIFO query: %v", err)
+	}
+	usesIndex := false
+	usesTempSort := false
+	for _, detail := range details {
+		if strings.Contains(detail, "outbox_chat_sequence_order_idx") {
+			usesIndex = true
+		}
+		if strings.Contains(detail, "USE TEMP B-TREE") {
+			usesTempSort = true
+		}
+	}
+	if !usesIndex {
+		t.Fatalf("native FIFO query plan = %v, want outbox_chat_sequence_order_idx", details)
+	}
+	if usesTempSort {
+		t.Fatalf("native FIFO query plan = %v, want no temporary sort", details)
 	}
 }
 

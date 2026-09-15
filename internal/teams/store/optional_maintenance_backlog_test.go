@@ -30,7 +30,6 @@ func TestTeamsOperationalBacklogAcrossBackends(t *testing.T) {
 				state.ChatPolls["chat-frontier"] = ChatPollState{
 					ChatID:           "chat-frontier",
 					ContinuationPath: "/chats/chat-frontier/messages?$skiptoken=durable",
-					PendingPage:      &ChatPollPendingPage{},
 					Gap:              &ChatPollGap{Kind: "test-gap"},
 					UpdatedAt:        now,
 				}
@@ -96,6 +95,59 @@ func TestTeamsOperationalBacklogAcrossBackends(t *testing.T) {
 			}
 			if got.Active() {
 				t.Fatalf("clean-store backlog = %#v, want inactive", got)
+			}
+		})
+	}
+}
+
+func TestTeamsOperationalBacklogIgnoresRegistryMigrationProvenanceAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	for _, backend := range []string{"json", "sqlite"} {
+		t.Run(backend, func(t *testing.T) {
+			st := newTestStore(t)
+			if err := st.Update(ctx, func(state *State) error {
+				state.InboundEvents["migration-provenance"] = InboundEvent{
+					ID:             "migration-provenance",
+					TeamsChatID:    "chat-migrated",
+					TeamsMessageID: "message-already-seen",
+					Source:         "registry_migration",
+					Status:         InboundStatusPersisted,
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed registry migration provenance: %v", err)
+			}
+			if backend == "sqlite" {
+				migrateStoreToSQLiteForTest(t, st)
+			}
+			backlog, err := st.TeamsOperationalBacklog(ctx)
+			if err != nil {
+				t.Fatalf("TeamsOperationalBacklog for migration provenance: %v", err)
+			}
+			if backlog.PendingInbound {
+				t.Fatalf("registry migration provenance kept inbound backlog active: %#v", backlog)
+			}
+
+			// The exclusion is intentionally narrow. An ordinary persisted orphan
+			// still needs compatibility recovery and must keep the gate open.
+			if err := st.Update(ctx, func(state *State) error {
+				state.InboundEvents["ordinary-orphan"] = InboundEvent{
+					ID:             "ordinary-orphan",
+					TeamsChatID:    "chat-ordinary",
+					TeamsMessageID: "message-ordinary",
+					Source:         "teams",
+					Status:         InboundStatusPersisted,
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed ordinary persisted orphan: %v", err)
+			}
+			backlog, err = st.TeamsOperationalBacklog(ctx)
+			if err != nil {
+				t.Fatalf("TeamsOperationalBacklog for ordinary orphan: %v", err)
+			}
+			if !backlog.PendingInbound {
+				t.Fatalf("ordinary persisted orphan was hidden by migration filter: %#v", backlog)
 			}
 		})
 	}
@@ -1048,6 +1100,137 @@ func TestTeamsOperationalBacklogKeepsFuture429RecoveryRequired(t *testing.T) {
 	}
 }
 
+func TestSQLiteOperationalBacklogKeepsPendingPageDuringFuture429(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	st := newTestStore(t)
+	const chatID = "chat-operational-pending-page-429"
+	if err := st.Update(ctx, func(state *State) error {
+		state.ChatPolls[chatID] = ChatPollState{
+			ChatID: chatID, Seeded: true, PollState: chatPollStateWarm,
+			NextPollAt: now.Add(time.Hour), BlockedUntil: now.Add(time.Hour),
+			LastError: "Graph messages failed: HTTP 429 Too Many Requests", LastErrorAt: now,
+			PendingPage: &ChatPollPendingPage{
+				ChatID: chatID, RequestPath: "/chats/" + chatID + "/messages?$top=20",
+				ReceiptID: "receipt-operational-pending-page-429", Frontier: "head", PollRole: "work",
+				RecordIDs: []string{}, RecordHashes: []string{},
+			},
+			UpdatedAt: now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed pending-page operational backlog: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, st)
+
+	backlog, err := st.TeamsOperationalBacklog(ctx)
+	if err != nil {
+		t.Fatalf("pending-page future 429 backlog probe: %v", err)
+	}
+	if !backlog.OperationalPollFrontier {
+		t.Fatalf("durable pending page was hidden by future 429 retry: %#v", backlog)
+	}
+	// Force the compatibility JSON lane. The pending receipt must remain
+	// visible there as well; otherwise a mixed-version marker downgrade can
+	// reintroduce the exact 429 starvation that the trusted scalar lane avoids.
+	withSQLiteTxForTest(t, st, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE state_meta SET value = ? WHERE key = ?`, "0", sqliteChatPollScheduleProjectionVersionKey)
+		return err
+	})
+	backlog, err = st.TeamsOperationalBacklog(ctx)
+	if err != nil {
+		t.Fatalf("pending-page future 429 compatibility backlog probe: %v", err)
+	}
+	if !backlog.OperationalPollFrontier {
+		t.Fatalf("compatibility JSON lane hid durable pending page behind future 429: %#v", backlog)
+	}
+}
+
+func TestSQLiteOperationalBacklogUsesCanonicalTurnSessionWhenScalarIsBlank(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	st := newTestStore(t)
+	const turnID = "turn-canonical-session-backlog"
+	const sessionID = "session-canonical-session-backlog"
+	if err := st.Update(ctx, func(state *State) error {
+		state.Turns[turnID] = Turn{
+			ID: turnID, SessionID: sessionID, Status: TurnStatusRunning,
+			CreatedAt: now, UpdatedAt: now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed canonical turn-session backlog: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, st)
+
+	for _, tc := range []struct {
+		name  string
+		value any
+	}{
+		{name: "null", value: nil},
+		{name: "empty", value: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withSQLiteTxForTest(t, st, func(tx *sql.Tx) error {
+				_, err := tx.ExecContext(ctx, `UPDATE turns SET session_id = ? WHERE id = ?`, tc.value, turnID)
+				return err
+			})
+			backlog, err := st.TeamsOperationalBacklog(ctx)
+			if err != nil {
+				t.Fatalf("blank scalar backlog probe: %v", err)
+			}
+			if !backlog.ActiveTurns {
+				t.Fatalf("canonical active turn was hidden by %s session_id scalar: %#v", tc.name, backlog)
+			}
+			hasUnfinished, err := st.HasUnfinishedTurns(ctx)
+			if err != nil {
+				t.Fatalf("HasUnfinishedTurns with %s session_id scalar: %v", tc.name, err)
+			}
+			if !hasUnfinished {
+				t.Fatalf("HasUnfinishedTurns hid canonical active turn with %s session_id scalar", tc.name)
+			}
+		})
+	}
+}
+
+func TestSQLiteOperationalBacklogUsesCanonicalInboundStatusWhenScalarIsStale(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	st := newTestStore(t)
+	const inboundID = "inbound-canonical-status-backlog"
+	event := InboundEvent{
+		ID: inboundID, TeamsChatID: "chat-canonical-status-backlog", TeamsMessageID: "message-canonical-status-backlog",
+		Source: "teams", Status: InboundStatusPersisted, CreatedAt: now, UpdatedAt: now,
+	}
+	if err := st.Update(ctx, func(state *State) error {
+		state.InboundEvents[inboundID] = event
+		return nil
+	}); err != nil {
+		t.Fatalf("seed canonical inbound status backlog: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, st)
+	raw, err := json.Marshal(event)
+	if err != nil {
+		t.Fatalf("marshal canonical inbound event: %v", err)
+	}
+	withSQLiteTxForTest(t, st, func(tx *sql.Tx) error {
+		// Leave the canonical JSON actionable while making the compatibility
+		// status disagree. The trigger must revoke the row-local proof and the
+		// fallback must read the canonical status rather than hide the event.
+		_, err := tx.ExecContext(ctx, `UPDATE inbound_events SET status = ?, json = ? WHERE id = ?`,
+			string(InboundStatusIgnored), raw, inboundID)
+		return err
+	})
+
+	backlog, err := st.TeamsOperationalBacklog(ctx)
+	if err != nil {
+		t.Fatalf("stale inbound status backlog probe: %v", err)
+	}
+	if !backlog.PendingInbound {
+		t.Fatalf("canonical persisted inbound was hidden by stale status scalar: %#v", backlog)
+	}
+}
+
 func TestSQLiteOperationalBacklogTreatsSemanticallyInvalidPollAsRecovery(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
@@ -1072,6 +1255,87 @@ func TestSQLiteOperationalBacklogTreatsSemanticallyInvalidPollAsRecovery(t *test
 	}
 	if !backlog.OperationalPollFrontier {
 		t.Fatalf("semantically invalid poll was hidden from recovery: %#v", backlog)
+	}
+}
+
+func TestSQLiteOperationalBacklogUsesTrustedScalarsAndFailsClosedOnRevocation(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 12, 12, 0, 0, 0, time.UTC)
+	st := newTestStore(t)
+	if err := st.Update(ctx, func(state *State) error {
+		state.Sessions["session-scalar-backlog"] = SessionContext{
+			ID: "session-scalar-backlog", TeamsChatID: "chat-scalar-backlog", Status: SessionStatusActive,
+			UpdatedAt: now,
+		}
+		state.Turns["turn-scalar-backlog"] = Turn{
+			ID: "turn-scalar-backlog", SessionID: "session-scalar-backlog", Status: TurnStatusRunning,
+			CreatedAt: now, UpdatedAt: now,
+		}
+		state.InboundEvents["inbound-scalar-backlog"] = InboundEvent{
+			ID: "inbound-scalar-backlog", SessionID: "session-scalar-backlog", TeamsChatID: "chat-scalar-backlog",
+			TeamsMessageID: "message-scalar-backlog", Status: InboundStatusPersisted, TurnID: "turn-scalar-backlog",
+			Source: "teams", CreatedAt: now, UpdatedAt: now,
+		}
+		state.ChatPolls["chat-scalar-backlog"] = ChatPollState{
+			ChatID: "chat-scalar-backlog", Seeded: true, PollState: "warm",
+			ContinuationPath: "/chats/chat-scalar-backlog/messages?$skiptoken=durable",
+			NextPollAt:       now, LastActivityAt: now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed scalar backlog fixture: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, st)
+
+	var scalar TeamsOperationalBacklog
+	var scalarUsable bool
+	if err := st.withStateLock(ctx, func() error {
+		pointer, ok, err := st.currentSQLitePointerUnlocked()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			t.Fatal("store did not retain SQLite pointer after migration")
+		}
+		db, err := st.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		scalar, scalarUsable, err = sqliteTeamsOperationalBacklogScalar(ctx, db, now)
+		return err
+	}); err != nil {
+		t.Fatalf("probe trusted scalar backlog lane: %v", err)
+	}
+	if !scalarUsable || !scalar.ActiveTurns || !scalar.PendingInbound || !scalar.OperationalPollFrontier {
+		t.Fatalf("trusted scalar backlog=%#v usable=%v, want active turns, inbound and poll frontier", scalar, scalarUsable)
+	}
+	got, err := st.TeamsOperationalBacklog(ctx)
+	if err != nil {
+		t.Fatalf("trusted scalar TeamsOperationalBacklog: %v", err)
+	}
+	if !reflect.DeepEqual(got, scalar) {
+		t.Fatalf("trusted scalar backlog=%#v differs from direct scalar=%#v", got, scalar)
+	}
+
+	// A mixed-version writer can change only a compatibility scalar. The
+	// trigger must revoke the row-local proof, and the canonical fallback must
+	// still see the active JSON values instead of trusting the stale inactive
+	// scalar and allowing optional maintenance to run.
+	withSQLiteTxForTest(t, st, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `UPDATE turns SET status = ?, json = ? WHERE id = ?`,
+			string(TurnStatusCompleted), []byte(`{"id":"turn-scalar-backlog","session_id":"session-scalar-backlog","status":"running"}`), "turn-scalar-backlog"); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `UPDATE chat_polls SET frontier_active = 0, json = ? WHERE chat_id = ?`,
+			[]byte(`{"chat_id":"chat-scalar-backlog","continuation_path":"/chats/chat-scalar-backlog/messages?$skiptoken=durable"}`), "chat-scalar-backlog")
+		return err
+	})
+	got, err = st.TeamsOperationalBacklog(ctx)
+	if err != nil {
+		t.Fatalf("revoked scalar TeamsOperationalBacklog: %v", err)
+	}
+	if !got.ActiveTurns || !got.PendingInbound || !got.OperationalPollFrontier {
+		t.Fatalf("revoked scalar backlog=%#v, want canonical active work", got)
 	}
 }
 
@@ -1126,6 +1390,13 @@ func TestSQLiteChatPollFrontierHintRepairIsVersioned(t *testing.T) {
 		t.Fatalf("reopen hint-version store: %v", err)
 	}
 	defer reopened.Close()
+	// Opening a Store is setup-free.  The listener/startup boundary explicitly
+	// prepares the inherited schema before any owner-scoped operation; exercise
+	// that boundary here so this test verifies the versioned repair rather than
+	// relying on the old implicit DDL-on-Open behavior.
+	if err := reopened.PrepareSQLiteSchemaBeforeOwner(ctx); err != nil {
+		t.Fatalf("prepare reopened hint-version store: %v", err)
+	}
 	withSQLiteTxForTest(t, reopened, func(tx *sql.Tx) error {
 		var version string
 		if err := tx.QueryRowContext(ctx, `SELECT value FROM state_meta WHERE key = ?`, sqliteChatPollFrontierHintVersionKey).Scan(&version); err != nil {
@@ -1235,15 +1506,82 @@ END`,
 		if active != 0 {
 			return fmt.Errorf("dormant gap frontier_active = %d after trigger migration, want 0", active)
 		}
-		var triggerSQL string
-		if err := tx.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?`, "chat_polls_frontier_hint_repair_update").Scan(&triggerSQL); err != nil {
-			return err
-		}
-		if !strings.Contains(triggerSQL, "head_probe_pending") || !strings.Contains(triggerSQL, "recovery_path") {
-			return fmt.Errorf("frontier trigger was not upgraded to dormant-gap predicate: %s", triggerSQL)
+		for _, expected := range sqliteChatPollFrontierHintTriggerDefinitions() {
+			name := strings.Fields(expected)[2]
+			var triggerSQL string
+			if err := tx.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = ?`, name).Scan(&triggerSQL); err != nil {
+				return err
+			}
+			if normalizeSQLiteDDL(triggerSQL) != normalizeSQLiteDDL(expected) {
+				return fmt.Errorf("frontier trigger %q was not upgraded to the exact current definition: %s", name, triggerSQL)
+			}
 		}
 		return nil
 	})
+}
+
+func TestSQLiteChatPollFrontierHintMigrationRejectsNearMissTrigger(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	if err := st.Update(ctx, func(state *State) error {
+		state.ChatPolls["chat-near-miss-frontier-trigger"] = ChatPollState{
+			ChatID: "chat-near-miss-frontier-trigger",
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed near-miss trigger poll: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, st)
+	if err := st.withStateLock(ctx, func() error {
+		pointer, ok, err := st.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			if err == nil {
+				err = sql.ErrNoRows
+			}
+			return err
+		}
+		db, err := st.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		if _, err := db.Exec(`DROP TRIGGER IF EXISTS chat_polls_frontier_hint_repair_update`); err != nil {
+			return err
+		}
+		// This deliberately contains both field names used by the current
+		// trigger, but has a different predicate and repair action. A substring
+		// check would incorrectly accept it as current.
+		if _, err := db.Exec(`CREATE TRIGGER chat_polls_frontier_hint_repair_update
+AFTER UPDATE OF json, frontier_active ON chat_polls
+WHEN json_valid(NEW.json)
+ AND COALESCE(NEW.frontier_active, 0) != 0
+ AND json_extract(NEW.json, '$.gap.head_probe_pending') = 1
+ AND trim(COALESCE(json_extract(NEW.json, '$.gap.recovery_path'), '')) = ''
+BEGIN
+  UPDATE chat_polls SET frontier_active = 0 WHERE chat_id = NEW.chat_id;
+END`); err != nil {
+			return err
+		}
+		current, err := sqliteChatPollFrontierHintTriggersCurrent(db)
+		if err != nil {
+			return err
+		}
+		if current {
+			return fmt.Errorf("near-miss frontier trigger was accepted as current")
+		}
+		if err := ensureSQLiteChatPollFrontierHintTriggers(db); err != nil {
+			return err
+		}
+		current, err = sqliteChatPollFrontierHintTriggersCurrent(db)
+		if err != nil {
+			return err
+		}
+		if !current {
+			return fmt.Errorf("near-miss frontier trigger was not repaired")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestSQLiteChatPollFrontierHintSaveDoesNotRecreateTriggers(t *testing.T) {

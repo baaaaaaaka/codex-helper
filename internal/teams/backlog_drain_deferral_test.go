@@ -419,6 +419,10 @@ func TestPollDeferredContinuationRecoversAfterTransientGraphFailure(t *testing.T
 			if tc.statusCode == http.StatusTooManyRequests && failed.ContinuationFailureCount != 1 {
 				t.Fatalf("429 continuation failure budget = %d, want one recorded failure: %#v", failed.ContinuationFailureCount, failed)
 			}
+			// The production path keeps both the durable retry deadline and a
+			// process-local fence after a transient failure. Advance those fences
+			// explicitly instead of turning this unit test into a real-time sleep.
+			expireGraphReadGateForTest(t, bridge, store, chatID)
 
 			if _, err := bridge.pollChatWithRoleStateOptions(ctx, chatID, 20, inboundPollRoleWork, false, teamstore.ChatPollState{}, false, pollChatWithRoleOptions{
 				AllowBacklogDrain: true,

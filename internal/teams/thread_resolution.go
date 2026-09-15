@@ -109,6 +109,26 @@ func (b *Bridge) resolveCodexThreadDecision(ctx context.Context, session *Sessio
 		}
 		candidates = appendUniqueString(candidates, strings.TrimSpace(rec.CodexThreadID))
 	}
+	// Once an isolated live branch has been durably bound, the unresolved
+	// anchor's ThreadID is historical provenance, not a second live candidate.
+	// Keep any other unexpected durable thread as a conflict, but do not let the
+	// deliberately quarantined old thread block every later turn on the verified
+	// LiveBranchThreadID. The checkpoint is part of this scoped snapshot so JSON
+	// and SQLite make the same decision without a full-state load.
+	if checkpoint, ok := state.ImportCheckpoints[transcriptCheckpointID(sessionID)]; ok && executionAnchorActive(checkpoint.UnresolvedExecution) && checkpoint.UnresolvedExecution != nil {
+		oldThreadID := strings.TrimSpace(checkpoint.UnresolvedExecution.ThreadID)
+		liveBranchThreadID := strings.TrimSpace(checkpoint.UnresolvedExecution.LiveBranchThreadID)
+		if liveBranchThreadID != "" && liveBranchThreadID != oldThreadID {
+			filtered := make([]string, 0, len(candidates)+1)
+			for _, candidate := range candidates {
+				if candidate == oldThreadID {
+					continue
+				}
+				filtered = appendUniqueString(filtered, candidate)
+			}
+			candidates = appendUniqueString(filtered, liveBranchThreadID)
+		}
+	}
 	if len(candidates) > 1 {
 		return threadResolveDecision{
 			Action:  threadResolveBlock,

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -110,6 +111,177 @@ func TestSQLiteHotPollAdmissionFiltersDeferredChatsAndPreservesDueFences(t *test
 	}
 	if poll.Attempt == nil || poll.Attempt.ID != "attempt-hot-poll-due" || poll.Attempt.Owner != "owner-a" || poll.Attempt.ExpectedPollRevision != 17 {
 		t.Fatalf("due poll attempt fence was not preserved: %#v", poll.Attempt)
+	}
+}
+
+func TestSQLiteHotPollCandidatesKeepDueIdlePollRetryVisible(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	store := newTestStore(t)
+	old := now.Add(-2 * time.Hour)
+
+	if err := store.Update(ctx, func(state *State) error {
+		state.Sessions["session-idle-poll-retry"] = SessionContext{
+			ID: "session-idle-poll-retry", Status: SessionStatusActive,
+			TeamsChatID: "chat-idle-poll-retry", UpdatedAt: old,
+		}
+		state.ChatPolls["chat-idle-poll-retry"] = ChatPollState{
+			ChatID: "chat-idle-poll-retry", Seeded: true,
+			PollState: chatPollStateCold, NextPollAt: now.Add(-time.Minute),
+			LastActivityAt: old, LastSuccessfulPollAt: old.Add(-time.Hour),
+			FailureCount: 1, LastError: "Graph HTTP 429 Too Many Requests",
+			LastErrorAt: now.Add(-time.Minute), UpdatedAt: now.Add(-time.Minute),
+		}
+		state.Sessions["session-idle-poll-clean"] = SessionContext{
+			ID: "session-idle-poll-clean", Status: SessionStatusActive,
+			TeamsChatID: "chat-idle-poll-clean", UpdatedAt: old,
+		}
+		state.ChatPolls["chat-idle-poll-clean"] = ChatPollState{
+			ChatID: "chat-idle-poll-clean", Seeded: true,
+			PollState: chatPollStateCold, NextPollAt: now.Add(-time.Minute),
+			LastActivityAt: old, LastSuccessfulPollAt: old.Add(-time.Hour),
+			UpdatedAt: now.Add(-time.Minute),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed idle retry admission fixture: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+
+	assertCandidates := func(name string, load func() ([]SessionContext, error)) {
+		t.Helper()
+		candidates, err := load()
+		if err != nil {
+			t.Fatalf("%s idle retry candidates: %v", name, err)
+		}
+		if len(candidates) != 1 || candidates[0].ID != "session-idle-poll-retry" {
+			t.Fatalf("%s idle retry candidates = %#v, want only the due failed chat", name, candidates)
+		}
+	}
+	assertCandidates("optimized", func() ([]SessionContext, error) {
+		candidates, handled, err := store.HotPollWorkCandidatesExcludingIdleAt(ctx, "control-chat", now.Add(-time.Hour), now)
+		if err == nil && !handled {
+			return nil, fmt.Errorf("optimized SQLite admission was not handled")
+		}
+		return candidates, err
+	})
+	assertCandidates("legacy", func() ([]SessionContext, error) {
+		var candidates []SessionContext
+		err := store.withStateLock(ctx, func() error {
+			pointer, ok, err := store.currentSQLitePointerUnlocked()
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return fmt.Errorf("SQLite pointer missing")
+			}
+			db, err := store.sqliteDBUnlocked(pointer)
+			if err != nil {
+				return err
+			}
+			candidates, err = loadSQLiteHotPollWorkCandidatesLegacy(ctx, db, "control-chat", now.Add(-time.Hour), now, sqliteHotPollReadyLimit)
+			return err
+		})
+		return candidates, err
+	})
+}
+
+func TestSQLiteHotPollRetryLanePrecedesLargeOrdinaryBacklog(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 9, 13, 0, 0, 0, time.UTC)
+	store := newTestStore(t)
+	const retryChat = "chat-retry-behind-backlog"
+	_, ordinaryLimit := sqliteHotPollLaneLimits(sqliteHotPollReadyLimit)
+
+	if err := store.Update(ctx, func(state *State) error {
+		// Make the failed row sort after the ordinary rows. Without a dedicated
+		// retry lane it would fall behind the ordinary LIMIT and never reach the
+		// bridge when a large fresh backlog is due at the same time.
+		state.Sessions["session-retry-behind-backlog"] = SessionContext{
+			ID: "session-retry-behind-backlog", Status: SessionStatusActive,
+			TeamsChatID: retryChat, UpdatedAt: now,
+		}
+		state.ChatPolls[retryChat] = ChatPollState{
+			ChatID: retryChat, Seeded: true, PollState: chatPollStateCold,
+			NextPollAt: now.Add(-time.Minute), LastActivityAt: now,
+			LastSuccessfulPollAt: now.Add(-time.Hour), FailureCount: 1,
+			LastError: "Graph HTTP 429 Too Many Requests", LastErrorAt: now.Add(-time.Minute), UpdatedAt: now,
+		}
+		for i := 0; i < ordinaryLimit+4; i++ {
+			chatID := fmt.Sprintf("chat-ordinary-backlog-%02d", i)
+			sessionID := fmt.Sprintf("session-ordinary-backlog-%02d", i)
+			updatedAt := now.Add(-time.Duration(100+i) * time.Second)
+			state.Sessions[sessionID] = SessionContext{
+				ID: sessionID, Status: SessionStatusActive, TeamsChatID: chatID, UpdatedAt: updatedAt,
+			}
+			state.ChatPolls[chatID] = ChatPollState{
+				ChatID: chatID, Seeded: true, PollState: chatPollStateCold,
+				NextPollAt: now.Add(-time.Minute), LastActivityAt: now, UpdatedAt: updatedAt,
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed retry lane fixture: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+
+	assertRetryVisible := func(name string, load func() ([]SessionContext, error)) {
+		t.Helper()
+		candidates, err := load()
+		if err != nil {
+			t.Fatalf("%s retry lane candidates: %v", name, err)
+		}
+		foundRetry := false
+		ordinaryCount := 0
+		for _, candidate := range candidates {
+			if candidate.TeamsChatID == retryChat {
+				foundRetry = true
+			}
+			if strings.HasPrefix(candidate.TeamsChatID, "chat-ordinary-backlog-") {
+				ordinaryCount++
+			}
+		}
+		if !foundRetry {
+			t.Fatalf("%s omitted due failed chat behind ordinary backlog: %#v", name, candidates)
+		}
+		if ordinaryCount == 0 {
+			t.Fatalf("%s dropped the healthy ordinary lane while admitting retry: %#v", name, candidates)
+		}
+	}
+
+	assertRetryVisible("optimized", func() ([]SessionContext, error) {
+		candidates, handled, err := store.HotPollWorkCandidatesExcludingIdleAt(ctx, "control-chat", time.Time{}, now)
+		if err == nil && !handled {
+			return nil, fmt.Errorf("optimized SQLite admission was not handled")
+		}
+		return candidates, err
+	})
+	assertRetryVisible("legacy", func() ([]SessionContext, error) {
+		var candidates []SessionContext
+		err := store.withStateLock(ctx, func() error {
+			pointer, ok, err := store.currentSQLitePointerUnlocked()
+			if err != nil {
+				return err
+			}
+			if !ok {
+				return fmt.Errorf("SQLite pointer missing")
+			}
+			db, err := store.sqliteDBUnlocked(pointer)
+			if err != nil {
+				return err
+			}
+			candidates, err = loadSQLiteHotPollWorkCandidatesLegacy(ctx, db, "control-chat", time.Time{}, now, sqliteHotPollReadyLimit)
+			return err
+		})
+		return candidates, err
+	})
+
+	schedule, err := store.HotPollReadyScheduleState(ctx, "control-chat", now)
+	if err != nil {
+		t.Fatalf("retry lane ready schedule: %v", err)
+	}
+	if _, ok := schedule.ChatPolls[retryChat]; !ok {
+		t.Fatalf("ready schedule omitted due failed chat behind ordinary backlog")
 	}
 }
 

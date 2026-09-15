@@ -66,16 +66,22 @@ func (p *bridgeMachineRegistryPublisher) pollDelegationInbox(ctx context.Context
 		return nil
 	}
 	headID := strings.TrimSpace(head[0].ID)
-	if headID != "" && headID == p.lastInboxHeadID {
+	cursor := p.delegationInboxCursor(chatID)
+	// lastInboxHeadID is only an in-process fast hint.  A durable cursor may
+	// still contain an unconsumed continuation after a bounded window scan, so
+	// the same Graph head must not suppress that continuation.
+	if headID != "" && headID == p.lastInboxHeadID &&
+		strings.TrimSpace(cursor.ContinuationPath) == "" &&
+		strings.TrimSpace(cursor.LastHeadMessageID) == headID {
 		return nil
 	}
-	messages, err := p.drainDelegationInboxMessages(ctx, chatID)
+	messages, continuationPath, err := p.drainDelegationInboxMessages(ctx, chatID)
 	if err != nil {
 		return err
 	}
-	p.lastInboxHeadID = headID
 	records := delegation.ObserveRecords(machineDelegationMessages(messages))
 	states := reduceOpenDelegations(records, p.now().UTC())
+	deferred := false
 	for _, state := range states {
 		if state.Status == delegation.StateCanceled {
 			p.cancelDelegationActive(state.DelegationID)
@@ -85,16 +91,89 @@ func (p *bridgeMachineRegistryPublisher) pollDelegationInbox(ctx context.Context
 			continue
 		}
 		if state.Status != delegation.StateOpen {
+			if (state.Status == delegation.StateClaimed || state.Status == delegation.StateRunning) &&
+				(state.WinningClaim == nil || strings.TrimSpace(state.WinningClaim.WorkerInstanceID) != strings.TrimSpace(p.workerInstanceID())) {
+				// A claim/running witness from another worker is ambiguous after a
+				// restart. Without provider idempotency or a lease-expiry takeover
+				// protocol, advancing past it could lose the request; taking it over
+				// could execute it twice. Retain the inbox boundary and wait for a
+				// terminal record or explicit operator reconciliation.
+				deferred = true
+			}
+			// A claim may have been durably published before the process was
+			// canceled or lost its admission read. Treat our own claimed state as
+			// resumable; otherwise the deferred cursor fix would correctly retain
+			// the request but the next poll would have no actionable state left.
+			// Claims from another worker remain untouched.
+			if state.Status != delegation.StateClaimed || state.WinningClaim == nil ||
+				strings.TrimSpace(state.WinningClaim.MachineID) != strings.TrimSpace(p.machineID) ||
+				strings.TrimSpace(state.WinningClaim.WorkerInstanceID) != strings.TrimSpace(p.workerInstanceID()) {
+				continue
+			}
+		}
+		if state.Status != delegation.StateOpen && state.Status != delegation.StateClaimed {
 			continue
 		}
 		if !p.tryMarkDelegationActive(*state.Request) {
+			// This request is actionable for this machine, but a local active
+			// delegation or shared remote-thread fence currently owns its durable
+			// execution slot. Do not advance the observation cursor past it: once
+			// the owner completes, the next poll must be able to see this request.
+			deferred = true
 			continue
 		}
-		if err := p.claimAndRunDelegation(ctx, chatID, *state.Request); err != nil {
+		handled, err := p.claimAndRunDelegation(ctx, chatID, *state.Request)
+		if err != nil {
 			p.clearDelegationActive(state.DelegationID)
 			return err
 		}
+		if !handled {
+			deferred = true
+		}
 	}
+	if deferred {
+		// lastInboxHeadID is only an in-memory suppression hint. Clearing it is
+		// essential here: the durable cursor intentionally remains unchanged, so
+		// a same-head retry must not be hidden by this process-local fast path.
+		p.lastInboxHeadID = ""
+		return nil
+	}
+	// Advance the durable observation boundary only after every actionable
+	// record in this window has reached its own durable claim/admission path.
+	// If claimAndRunDelegation failed, the old boundary remains visible and the
+	// next poll will retry the same request instead of silently skipping it.
+	cursorForUpdate := cursor
+	if strings.TrimSpace(continuationPath) == "" &&
+		strings.TrimSpace(cursor.LastHeadMessageID) == "" {
+		// A deep scan that started without an older boundary needs one final
+		// head probe before publishing that head as observed. If the head is
+		// unchanged, the complete continuation covers the whole visible inbox;
+		// if it changed, retain an empty boundary and force one fresh head scan
+		// next time. In neither case can a message inserted during the scan be
+		// silently hidden behind the process-local hint.
+		latestHead, headErr := p.listDelegationInboxHead(ctx, chatID)
+		if headErr != nil {
+			return headErr
+		}
+		if firstMachineRegistryMessageID(latestHead) == "" {
+			// The original head disappeared while the bounded scan was running.
+			// Keep the cursor unchanged so a later poll can establish a new
+			// boundary instead of treating a possibly incomplete view as complete.
+			return nil
+		}
+		// Whether or not the head changed, the original head is the only safe
+		// boundary we can publish here: the scan covered the view observed at
+		// the first probe, while messages inserted afterwards still need to be
+		// re-read on the next poll. Storing the old head turns that re-read into
+		// a bounded prefix scan instead of restarting the same deep offset on
+		// every cycle.
+		cursorForUpdate.LastHeadMessageID = headID
+		cursorForUpdate.ContinuationPath = ""
+	}
+	if err := p.updateDelegationInboxCursor(chatID, cursorForUpdate, headID, continuationPath); err != nil {
+		return err
+	}
+	p.lastInboxHeadID = headID
 	return nil
 }
 
@@ -105,38 +184,45 @@ func (p *bridgeMachineRegistryPublisher) listDelegationInboxHead(ctx context.Con
 	return p.store.Graph.ListMessages(ctx, chatID, 1)
 }
 
-func (p *bridgeMachineRegistryPublisher) claimAndRunDelegation(ctx context.Context, chatID string, request delegation.Record) error {
+func (p *bridgeMachineRegistryPublisher) claimAndRunDelegation(ctx context.Context, chatID string, request delegation.Record) (bool, error) {
 	now := p.now().UTC()
 	claim, err := delegation.NewClaimRecord(request.DelegationID, p.machineID, p.workerInstanceID(), 1, now)
 	if err != nil {
-		return err
+		return false, err
 	}
 	claim.InboxRef = strings.TrimSpace(p.cache.InboxExternalID)
 	claim.InboxGeneration = strings.TrimSpace(p.cache.InboxGeneration)
 	if err := p.sendDelegationInboxRecord(ctx, chatID, claim); err != nil {
-		return err
+		return false, err
 	}
 	if err := p.waitBeforeDelegationClaimRecheck(ctx); err != nil {
-		return err
+		return false, err
 	}
-	messages, err := p.drainDelegationInboxMessages(ctx, chatID)
+	// The claim itself is a newly appended message. Re-read from the current
+	// head rather than a possibly resumed deep-page continuation so the reducer
+	// can observe that claim before deciding whether this worker won.
+	messages, _, err := p.drainDelegationInboxMessagesFromHead(ctx, chatID)
 	if err != nil {
-		return err
+		return false, err
 	}
 	records := delegation.RecordsForID(delegation.ObserveRecords(machineDelegationMessages(messages)), request.DelegationID)
 	state := delegation.Reduce(records, now)
 	if state.WinningClaim == nil || state.WinningClaim.RecordID != claim.RecordID {
 		p.clearDelegationActive(request.DelegationID)
-		return nil
+		return true, nil
 	}
 	started, err := p.tryStartDelegationExecution(request, claim)
 	if err != nil {
 		p.clearDelegationActive(request.DelegationID)
-		return err
+		return false, err
 	}
 	if !started {
 		p.clearDelegationActive(request.DelegationID)
-		return nil
+		// A durable execution or remote-thread fence already owns this request.
+		// It has not been handled by this poller, so retain the inbox boundary
+		// and let a later poll observe a terminal/result record or an explicit
+		// recovery disposition.
+		return false, nil
 	}
 	running, err := delegation.NewStatusRecord(request.DelegationID, claim, delegation.StateRunning, "Delegated worker accepted the task.", p.now().UTC())
 	if err == nil {
@@ -147,7 +233,7 @@ func (p *bridgeMachineRegistryPublisher) claimAndRunDelegation(ctx context.Conte
 	execCtx, cancel := context.WithCancel(context.Background())
 	p.setDelegationActiveCancel(request.DelegationID, cancel)
 	go p.executeDelegation(execCtx, chatID, request, claim)
-	return nil
+	return true, nil
 }
 
 func (p *bridgeMachineRegistryPublisher) waitBeforeDelegationClaimRecheck(ctx context.Context) error {
@@ -206,57 +292,99 @@ func (p *bridgeMachineRegistryPublisher) executeDelegation(ctx context.Context, 
 	_ = p.finishDelegationExecution(request, claim, status)
 }
 
-func (p *bridgeMachineRegistryPublisher) drainDelegationInboxMessages(ctx context.Context, chatID string) ([]machineregistry.ChatMessage, error) {
+func (p *bridgeMachineRegistryPublisher) drainDelegationInboxMessages(ctx context.Context, chatID string) ([]machineregistry.ChatMessage, string, error) {
+	return p.drainDelegationInboxMessagesWithCursor(ctx, chatID, true)
+}
+
+func (p *bridgeMachineRegistryPublisher) drainDelegationInboxMessagesFromHead(ctx context.Context, chatID string) ([]machineregistry.ChatMessage, string, error) {
+	return p.drainDelegationInboxMessagesWithCursor(ctx, chatID, false)
+}
+
+func (p *bridgeMachineRegistryPublisher) drainDelegationInboxMessagesWithCursor(ctx context.Context, chatID string, resume bool) ([]machineregistry.ChatMessage, string, error) {
 	windowLister, ok := p.store.Graph.(machineRegistryWindowLister)
 	if !ok {
 		messages, err := p.store.Graph.ListMessages(ctx, chatID, delegationInboxDrainTop)
-		if err == nil {
-			p.updateDelegationInboxCursor(chatID, firstMachineRegistryMessageID(messages))
-		}
-		return messages, err
+		return messages, "", err
 	}
 	cursor := p.delegationInboxCursor(chatID)
+	if !resume {
+		cursor = delegation.InboxCursor{ChatID: strings.TrimSpace(chatID)}
+	}
 	var (
 		out      []machineregistry.ChatMessage
 		nextPath string
-		headID   string
 	)
+	continuationPath := strings.TrimSpace(cursor.ContinuationPath)
 	for page := 0; page < 20; page++ {
 		var (
 			window machineregistry.MessageWindow
 			err    error
 		)
-		if page == 0 {
+		if page == 0 && continuationPath == "" {
 			window, err = windowLister.ListMessagesWindow(ctx, chatID, delegationInboxDrainTop)
 		} else {
-			window, err = windowLister.ListMessagesWindowFromPath(ctx, nextPath)
+			path := nextPath
+			if page == 0 {
+				path = continuationPath
+			}
+			window, err = windowLister.ListMessagesWindowFromPath(ctx, path)
 		}
 		if err != nil {
-			return nil, err
-		}
-		if page == 0 {
-			headID = firstMachineRegistryMessageID(window.Messages)
+			return nil, "", err
 		}
 		for _, msg := range window.Messages {
+			// Stop at the durable observation boundary whenever the provider page
+			// happens to include it. A continuation normally starts after that
+			// boundary, but a newly inserted head can shift an offset-based test
+			// provider (and a stale/rewound token can do the same in production).
+			// Failing closed here may re-read an already observed prefix; it cannot
+			// silently skip a newer request.
 			if strings.TrimSpace(cursor.LastHeadMessageID) != "" && strings.TrimSpace(msg.ID) == strings.TrimSpace(cursor.LastHeadMessageID) {
-				p.updateDelegationInboxCursor(chatID, headID)
-				return out, nil
+				return out, "", nil
 			}
 			out = append(out, msg)
 		}
 		if !window.Truncated || strings.TrimSpace(window.NextPath) == "" {
-			p.updateDelegationInboxCursor(chatID, headID)
-			return out, nil
+			return out, "", nil
 		}
 		nextPath = window.NextPath
 	}
-	p.updateDelegationInboxCursor(chatID, headID)
-	return out, nil
+	// The bounded scan made real progress but did not reach the old boundary.
+	// Keep the old LastHeadMessageID and persist this continuation only after
+	// the caller has durably handled the records already returned. This avoids
+	// both deep-backlog starvation and cursor advancement over a failed claim.
+	if strings.TrimSpace(nextPath) == "" {
+		return out, "", nil
+	}
+	return out, strings.TrimSpace(nextPath), nil
 }
 
 func (p *bridgeMachineRegistryPublisher) sendDelegationInboxRecord(ctx context.Context, chatID string, record delegation.Record) error {
-	if err := p.updateDelegationOutbox(record, delegation.OutboxPending, chatID, "", ""); err != nil {
+	if strings.TrimSpace(p.delegationStatePath) == "" {
+		// Without a durable pre-POST reservation there is no way to distinguish
+		// a process crash before Graph from an accepted POST whose response was
+		// lost. Refuse the non-idempotent operation rather than create a future
+		// automatic-duplicate window.
+		return errors.New("delegation worker durable state path is required before Graph POST")
+	}
+	// The POST below is not idempotent. Reserve its durable outbox identity
+	// before crossing the Graph boundary; the reservation is atomic across
+	// concurrent workers/processes. A false result means an earlier pending,
+	// sent, or unknown witness already owns this record, so reconcile visibility
+	// but never create a second message.
+	existing, reserved, err := delegation.ReserveOutbox(ctx, p.delegationStatePath, record, chatID, p.now().UTC())
+	if err != nil {
 		return err
+	}
+	if !reserved {
+		messages, readErr := p.store.Graph.ListMessages(ctx, chatID, delegationInboxDrainTop)
+		if readErr != nil {
+			return fmt.Errorf("delegation record %s already has durable POST witness (%s); visibility check failed: %w", record.RecordID, existing.Status, readErr)
+		}
+		if containsMachineDelegationRecordID(messages, record.RecordID) {
+			return p.updateDelegationOutbox(record, delegation.OutboxVisible, chatID, existing.MessageID, "")
+		}
+		return fmt.Errorf("delegation record %s already has durable POST witness (%s); refusing automatic replay", record.RecordID, existing.Status)
 	}
 	msg, sendErr := p.store.Graph.SendHTML(ctx, chatID, delegation.RenderRecordHTML(record))
 	if sendErr != nil {
@@ -264,9 +392,18 @@ func (p *bridgeMachineRegistryPublisher) sendDelegationInboxRecord(ctx context.C
 		if readErr == nil && containsMachineDelegationRecordID(messages, record.RecordID) {
 			return p.updateDelegationOutbox(record, delegation.OutboxVisible, chatID, "", "")
 		}
-		_ = p.updateDelegationOutbox(record, delegation.OutboxFailed, chatID, "", sendErr.Error())
+		// The transport may have failed after Graph accepted the POST. Keep an
+		// explicit unknown witness rather than Failed, because Failed would make
+		// the next poll look like a safe opportunity to POST again.
+		unknownErr := p.updateDelegationOutbox(record, delegation.OutboxUnknown, chatID, "", sendErr.Error())
 		if readErr != nil {
+			if unknownErr != nil {
+				return fmt.Errorf("send delegation record %s: %w; visibility check failed: %v; unknown witness failed: %v", record.RecordID, sendErr, readErr, unknownErr)
+			}
 			return fmt.Errorf("send delegation record %s: %w; visibility check failed: %v", record.RecordID, sendErr, readErr)
+		}
+		if unknownErr != nil {
+			return fmt.Errorf("send delegation record %s: %w; unknown witness failed: %v", record.RecordID, sendErr, unknownErr)
 		}
 		return sendErr
 	}
@@ -276,7 +413,7 @@ func (p *bridgeMachineRegistryPublisher) sendDelegationInboxRecord(ctx context.C
 		return err
 	}
 	if !containsMachineDelegationRecordID(messages, record.RecordID) {
-		_ = p.updateDelegationOutbox(record, delegation.OutboxFailed, chatID, msg.ID, "sent record was not visible in inbox reread")
+		_ = p.updateDelegationOutbox(record, delegation.OutboxSent, chatID, msg.ID, "sent record was not visible in inbox reread")
 		return fmt.Errorf("delegation record %s sent as message %s but was not visible in inbox reread", record.RecordID, msg.ID)
 	}
 	return p.updateDelegationOutbox(record, delegation.OutboxVisible, chatID, msg.ID, "")
@@ -285,79 +422,76 @@ func (p *bridgeMachineRegistryPublisher) sendDelegationInboxRecord(ctx context.C
 func (p *bridgeMachineRegistryPublisher) tryStartDelegationExecution(request delegation.Record, claim delegation.Record) (bool, error) {
 	path := strings.TrimSpace(p.delegationStatePath)
 	if path == "" {
-		return true, nil
+		return false, errors.New("delegation worker durable state path is required before execution admission")
 	}
 	if delegation.StorePathUsesSQLite(path) {
 		return delegation.TryStartWorkerSQLite(path, request, claim, p.now().UTC(), delegationWorkerSQLitePruneLimits())
 	}
-	store, err := delegation.LoadStore(path)
-	if err != nil {
-		return false, err
-	}
-	p.pruneDelegationWorkerState(&store)
-	if existing, ok := store.ExecutionForID(request.DelegationID); ok {
-		if existing.ClaimID == claim.ClaimID && existing.ClaimEpoch == claim.ClaimEpoch && existing.WorkerInstanceID == claim.WorkerInstanceID {
-			return false, nil
-		}
-		if existing.Status == delegation.StateRunning || existing.Status == delegation.StateComplete || existing.Status == delegation.StateBlocked || existing.Status == delegation.StateCanceled || existing.Status == delegation.StateReuseRejected {
-			return false, nil
-		}
-	}
-	if threadID := strings.TrimSpace(request.RemoteThreadID); threadID != "" {
-		if thread, ok := store.RemoteThreadForID(threadID); ok {
-			activeID := strings.TrimSpace(thread.ActiveDelegationID)
-			if thread.State == delegation.RemoteThreadStateActive && activeID != "" && activeID != strings.TrimSpace(request.DelegationID) {
-				return false, nil
+	started := false
+	now := p.now().UTC()
+	err := delegation.UpdateStoreJSON(context.Background(), path, func(store *delegation.Store) error {
+		p.pruneDelegationWorkerState(store)
+		if existing, ok := store.ExecutionForID(request.DelegationID); ok {
+			if existing.ClaimID == claim.ClaimID && existing.ClaimEpoch == claim.ClaimEpoch && existing.WorkerInstanceID == claim.WorkerInstanceID {
+				return nil
+			}
+			if existing.Status == delegation.StateRunning || existing.Status == delegation.StateComplete || existing.Status == delegation.StateBlocked || existing.Status == delegation.StateCanceled || existing.Status == delegation.StateReuseRejected {
+				return nil
 			}
 		}
-	}
-	now := p.now().UTC()
-	nowText := now.Format(time.RFC3339Nano)
-	store.UpsertExecution(delegation.ExecutionFence{
-		DelegationID:     request.DelegationID,
-		ClaimID:          claim.ClaimID,
-		ClaimEpoch:       claim.ClaimEpoch,
-		WorkerInstanceID: claim.WorkerInstanceID,
-		MachineID:        claim.MachineID,
-		Status:           delegation.StateRunning,
-		StartedAt:        nowText,
-		UpdatedAt:        nowText,
+		if threadID := strings.TrimSpace(request.RemoteThreadID); threadID != "" {
+			if thread, ok := store.RemoteThreadForID(threadID); ok {
+				activeID := strings.TrimSpace(thread.ActiveDelegationID)
+				if thread.State == delegation.RemoteThreadStateActive && activeID != "" && activeID != strings.TrimSpace(request.DelegationID) {
+					return nil
+				}
+			}
+		}
+		nowText := now.Format(time.RFC3339Nano)
+		store.UpsertExecution(delegation.ExecutionFence{
+			DelegationID:     request.DelegationID,
+			ClaimID:          claim.ClaimID,
+			ClaimEpoch:       claim.ClaimEpoch,
+			WorkerInstanceID: claim.WorkerInstanceID,
+			MachineID:        claim.MachineID,
+			Status:           delegation.StateRunning,
+			StartedAt:        nowText,
+			UpdatedAt:        nowText,
+		})
+		p.upsertDelegationRemoteThread(store, request, delegation.RemoteThreadStateActive, request.DelegationID, now)
+		store.Prune(now, delegation.DefaultStoreRetention)
+		p.pruneDelegationWorkerState(store)
+		started = true
+		return nil
 	})
-	p.upsertDelegationRemoteThread(&store, request, delegation.RemoteThreadStateActive, request.DelegationID, now)
-	store.Prune(now, delegation.DefaultStoreRetention)
-	p.pruneDelegationWorkerState(&store)
-	_, err = delegation.SaveStore(path, store)
-	return err == nil, err
+	return started, err
 }
 
 func (p *bridgeMachineRegistryPublisher) finishDelegationExecution(request delegation.Record, claim delegation.Record, status string) error {
 	path := strings.TrimSpace(p.delegationStatePath)
 	if path == "" {
-		return nil
+		return errors.New("delegation worker durable state path is required before execution completion")
 	}
 	if delegation.StorePathUsesSQLite(path) {
 		return delegation.FinishWorkerSQLite(path, request, claim, status, p.now().UTC(), delegationWorkerSQLitePruneLimits())
 	}
-	store, err := delegation.LoadStore(path)
-	if err != nil {
-		return err
-	}
 	now := p.now().UTC()
-	nowText := now.Format(time.RFC3339Nano)
-	store.UpsertExecution(delegation.ExecutionFence{
-		DelegationID:     request.DelegationID,
-		ClaimID:          claim.ClaimID,
-		ClaimEpoch:       claim.ClaimEpoch,
-		WorkerInstanceID: claim.WorkerInstanceID,
-		MachineID:        claim.MachineID,
-		Status:           status,
-		UpdatedAt:        nowText,
+	return delegation.UpdateStoreJSON(context.Background(), path, func(store *delegation.Store) error {
+		nowText := now.Format(time.RFC3339Nano)
+		store.UpsertExecution(delegation.ExecutionFence{
+			DelegationID:     request.DelegationID,
+			ClaimID:          claim.ClaimID,
+			ClaimEpoch:       claim.ClaimEpoch,
+			WorkerInstanceID: claim.WorkerInstanceID,
+			MachineID:        claim.MachineID,
+			Status:           status,
+			UpdatedAt:        nowText,
+		})
+		p.clearDelegationWorkerRemoteThread(store, request)
+		store.Prune(now, delegation.DefaultStoreRetention)
+		p.pruneDelegationWorkerState(store)
+		return nil
 	})
-	p.clearDelegationWorkerRemoteThread(&store, request)
-	store.Prune(now, delegation.DefaultStoreRetention)
-	p.pruneDelegationWorkerState(&store)
-	_, err = delegation.SaveStore(path, store)
-	return err
 }
 
 func (p *bridgeMachineRegistryPublisher) upsertDelegationRemoteThread(store *delegation.Store, request delegation.Record, state string, activeDelegationID string, now time.Time) {
@@ -496,38 +630,7 @@ func (p *bridgeMachineRegistryPublisher) updateDelegationOutbox(record delegatio
 	if delegation.StorePathUsesSQLite(path) {
 		return delegation.UpsertWorkerOutboxSQLite(path, record, status, chatID, messageID, errText, p.now().UTC(), delegationWorkerSQLitePruneLimits())
 	}
-	store, err := delegation.LoadStore(path)
-	if err != nil {
-		return err
-	}
-	now := p.now().UTC().Format(time.RFC3339Nano)
-	existing, _ := store.OutboxForRecordID(record.RecordID)
-	attempts := existing.Attempts
-	if status == delegation.OutboxPending {
-		attempts++
-	}
-	createdAt := existing.CreatedAt
-	if strings.TrimSpace(createdAt) == "" {
-		createdAt = now
-	}
-	if strings.TrimSpace(messageID) == "" {
-		messageID = existing.MessageID
-	}
-	store.UpsertOutbox(delegation.OutboxRecord{
-		RecordID:     record.RecordID,
-		DelegationID: record.DelegationID,
-		ChatID:       strings.TrimSpace(chatID),
-		InboxRef:     strings.TrimSpace(record.InboxRef),
-		Status:       strings.TrimSpace(status),
-		MessageID:    strings.TrimSpace(messageID),
-		Attempts:     attempts,
-		Error:        strings.TrimSpace(errText),
-		CreatedAt:    createdAt,
-		UpdatedAt:    now,
-	})
-	store.Prune(p.now().UTC(), delegation.DefaultStoreRetention)
-	_, err = delegation.SaveStore(path, store)
-	return err
+	return delegation.UpsertWorkerOutboxJSON(path, record, status, chatID, messageID, errText, p.now().UTC())
 }
 
 func (p *bridgeMachineRegistryPublisher) delegationInboxCursor(chatID string) delegation.InboxCursor {
@@ -553,35 +656,36 @@ func (p *bridgeMachineRegistryPublisher) delegationInboxCursor(chatID string) de
 	return cursor
 }
 
-func (p *bridgeMachineRegistryPublisher) updateDelegationInboxCursor(chatID string, headID string) {
+func (p *bridgeMachineRegistryPublisher) updateDelegationInboxCursor(chatID string, previous delegation.InboxCursor, headID string, continuationPath string) error {
 	chatID = strings.TrimSpace(chatID)
 	headID = strings.TrimSpace(headID)
 	if chatID == "" || headID == "" {
-		return
+		return nil
 	}
 	path := strings.TrimSpace(p.delegationStatePath)
 	if path == "" {
-		return
+		return nil
+	}
+	continuationPath = strings.TrimSpace(continuationPath)
+	lastHeadID := strings.TrimSpace(previous.LastHeadMessageID)
+	// A continuation scan starts below the durable head boundary. Even when it
+	// reaches the end of that continuation, a new message may have arrived
+	// between the initial head probe and the continuation read. Preserve the
+	// old boundary for one fresh head scan instead of claiming that the current
+	// head was observed and silently skipping that new message.
+	if continuationPath == "" && strings.TrimSpace(previous.ContinuationPath) == "" {
+		lastHeadID = headID
+	}
+	cursor := delegation.InboxCursor{
+		ChatID:            chatID,
+		LastHeadMessageID: lastHeadID,
+		ContinuationPath:  continuationPath,
+		UpdatedAt:         p.now().UTC().Format(time.RFC3339Nano),
 	}
 	if delegation.StorePathUsesSQLite(path) {
-		_ = delegation.UpsertInboxCursorSQLite(path, delegation.InboxCursor{
-			ChatID:            chatID,
-			LastHeadMessageID: headID,
-			UpdatedAt:         p.now().UTC().Format(time.RFC3339Nano),
-		})
-		return
+		return delegation.UpsertInboxCursorSQLite(path, cursor)
 	}
-	store, err := delegation.LoadStore(path)
-	if err != nil {
-		return
-	}
-	store.UpsertInboxCursor(delegation.InboxCursor{
-		ChatID:            chatID,
-		LastHeadMessageID: headID,
-		UpdatedAt:         p.now().UTC().Format(time.RFC3339Nano),
-	})
-	store.Prune(p.now().UTC(), delegation.DefaultStoreRetention)
-	_, _ = delegation.SaveStore(path, store)
+	return delegation.UpsertInboxCursorJSON(path, cursor)
 }
 
 func (p *bridgeMachineRegistryPublisher) delegationInboxBackoffDelay() time.Duration {
@@ -641,20 +745,13 @@ func (p *bridgeMachineRegistryPublisher) recordDelegationInboxBackoff(delay time
 			UpdatedAt:    now.Format(time.RFC3339Nano),
 		})
 	}
-	store, err := delegation.LoadStore(path)
-	if err != nil {
-		return err
-	}
 	now := p.now().UTC()
-	store.UpsertInboxBackoff(delegation.InboxBackoff{
+	return delegation.UpsertInboxBackoffJSON(path, delegation.InboxBackoff{
 		ChatID:       chatID,
 		BlockedUntil: now.Add(delay).Format(time.RFC3339Nano),
 		Reason:       strings.TrimSpace(reason),
 		UpdatedAt:    now.Format(time.RFC3339Nano),
 	})
-	store.Prune(now, delegation.DefaultStoreRetention)
-	_, err = delegation.SaveStore(path, store)
-	return err
 }
 
 func delegationWorkerSQLitePruneLimits() delegation.WorkerStorePruneLimits {

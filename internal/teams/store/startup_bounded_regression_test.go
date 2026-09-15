@@ -4,7 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -140,6 +143,321 @@ func TestExistingSQLiteStartupBoundedReadsDoNotDecodeBusinessRows(t *testing.T) 
 	}
 }
 
+func TestSQLiteStartupCompatibilityLookupsAvoidUnboundedOutboxAndInboundLoads(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	scope := ScopeIdentity{ID: "scope-startup-compat", AccountID: "account-startup-compat", Profile: "default", CreatedAt: now, UpdatedAt: now}
+	completion := OutboxMessage{
+		ID:          "outbox:completion-targeted",
+		TeamsChatID: "control-startup-compat",
+		Kind:        "control-upgrade-complete",
+		Body:        "completion body",
+		Status:      OutboxStatusSent,
+		CreatedAt:   now,
+		UpdatedAt:   now,
+	}
+	attachment := OutboxMessage{
+		ID:             "outbox:attachment-targeted",
+		TeamsChatID:    "chat-startup-compat",
+		Kind:           "attachment",
+		Body:           "attachment body",
+		Status:         OutboxStatusQueued,
+		AttachmentPath: filepath.Join(t.TempDir(), ".outbox", "keep.bin"),
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	if err := store.Update(ctx, func(state *State) error {
+		state.Scope = scope
+		state.MachineIdentity = MachineIdentity{ID: "machine-startup-compat", ScopeID: scope.ID, AccountID: scope.AccountID, Profile: scope.Profile, CreatedAt: now, UpdatedAt: now}
+		state.ControlChat = ControlChatBinding{ScopeID: scope.ID, AccountID: scope.AccountID, Profile: scope.Profile, TeamsChatID: "control-startup-compat", UpdatedAt: now}
+		state.InboundEvents["unrelated-large-inbound"] = InboundEvent{ID: "unrelated-large-inbound", TeamsChatID: "chat-unrelated", Text: strings.Repeat("inbound ", 1024), Status: InboundStatusPersisted, CreatedAt: now, UpdatedAt: now}
+		state.OutboxMessages[completion.ID] = completion
+		state.OutboxMessages[attachment.ID] = attachment
+		return nil
+	}); err != nil {
+		t.Fatalf("seed startup compatibility state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+
+	// Make the unbounded business row unreadable. The targeted startup helpers
+	// must still be able to protect the attachment and adopt the completion
+	// notice without materializing that row or the complete outbox table.
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE inbound_events SET json = '{broken-inbound' WHERE id = ?`, "unrelated-large-inbound")
+		return err
+	})
+
+	fullLoads := 0
+	previousHook := sqliteStateLoadTestHook
+	sqliteStateLoadTestHook = func() { fullLoads++ }
+	t.Cleanup(func() { sqliteStateLoadTestHook = previousHook })
+
+	control, err := store.ReadControlChat(ctx)
+	if err != nil {
+		t.Fatalf("ReadControlChat: %v", err)
+	}
+	if control.TeamsChatID != "control-startup-compat" {
+		t.Fatalf("ReadControlChat = %#v, want chat %q", control, "control-startup-compat")
+	}
+	got, found, err := store.FindOutboxMessageByChatKindBodyAfter(ctx, completion.TeamsChatID, completion.Kind, completion.Body, now.Add(-time.Minute))
+	if err != nil {
+		t.Fatalf("FindOutboxMessageByChatKindBodyAfter: %v", err)
+	}
+	if !found || got.ID != completion.ID {
+		t.Fatalf("targeted completion lookup = %#v found=%t, want %#v/true", got, found, completion)
+	}
+	paths, err := store.ActiveOutboxAttachmentPaths(ctx)
+	if err != nil {
+		t.Fatalf("ActiveOutboxAttachmentPaths: %v", err)
+	}
+	if len(paths) != 1 || paths[0] != attachment.AttachmentPath {
+		t.Fatalf("active attachment paths = %#v, want [%q]", paths, attachment.AttachmentPath)
+	}
+	if fullLoads != 0 {
+		t.Fatalf("startup compatibility lookups invoked full SQLite loader %d time(s)", fullLoads)
+	}
+}
+
+// Startup cleanup must not keep one SQLite transaction open while it walks a
+// large unrelated outbox prefix. The owner heartbeat uses the liveness handle
+// and must be able to commit between cleanup pages; otherwise a slow cleanup
+// can look like a dead owner and cause a takeover/restart loop.
+func TestSQLiteLegacyHistoryGateCleanupReleasesBetweenPages(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	ownerAt := testOwnerStart()
+	owner := testOwner("startup-cleanup", "", ownerAt)
+	if _, err := store.RecordOwnerHeartbeat(ctx, owner, time.Minute, ownerAt); err != nil {
+		t.Fatalf("seed owner heartbeat: %v", err)
+	}
+	if err := store.Update(ctx, func(state *State) error {
+		for i := 0; i < 12; i++ {
+			id := fmt.Sprintf("outbox-normal-%02d", i)
+			createdAt := ownerAt.Add(time.Duration(i) * time.Second)
+			state.OutboxMessages[id] = OutboxMessage{
+				ID: id, TeamsChatID: "chat-startup-cleanup", Kind: "final",
+				Status: OutboxStatusQueued, CreatedAt: createdAt, UpdatedAt: createdAt,
+			}
+		}
+		legacyAt := ownerAt.Add(12 * time.Second)
+		state.OutboxMessages["outbox-legacy-history-gate"] = OutboxMessage{
+			ID: "outbox-legacy-history-gate", TeamsChatID: "chat-startup-cleanup",
+			Kind: "sync-status-backlog-blocked", Body: "obsolete history gate",
+			Status: OutboxStatusQueued, CreatedAt: legacyAt, UpdatedAt: legacyAt,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed startup cleanup outbox: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+
+	firstPageCommitted := make(chan struct{})
+	releaseNextPage := make(chan struct{})
+	var pauseOnce sync.Once
+	previousHook := sqliteLegacyHistoryGatePageTestHook
+	sqliteLegacyHistoryGatePageTestHook = func() {
+		pauseOnce.Do(func() {
+			close(firstPageCommitted)
+			<-releaseNextPage
+		})
+	}
+	t.Cleanup(func() {
+		sqliteLegacyHistoryGatePageTestHook = previousHook
+		select {
+		case <-releaseNextPage:
+		default:
+			close(releaseNextPage)
+		}
+	})
+
+	type cleanupResult struct {
+		retired int
+		err     error
+	}
+	cleanupDone := make(chan cleanupResult, 1)
+	go func() {
+		retired, err := store.RetireLegacyHistoryGateOutboxForStartup(ctx, 2, 2)
+		cleanupDone <- cleanupResult{retired: retired, err: err}
+	}()
+	select {
+	case <-firstPageCommitted:
+	case <-time.After(time.Second):
+		t.Fatal("startup cleanup did not commit its first page")
+	}
+
+	heartbeatCtx, cancel := context.WithTimeout(ctx, time.Second)
+	defer cancel()
+	heartbeatAt := ownerAt.Add(time.Minute)
+	if _, err := store.RecordOwnerHeartbeat(heartbeatCtx, owner, time.Minute, heartbeatAt); err != nil {
+		close(releaseNextPage)
+		t.Fatalf("owner heartbeat blocked between cleanup pages: %v", err)
+	}
+	close(releaseNextPage)
+
+	select {
+	case result := <-cleanupDone:
+		if result.err != nil {
+			t.Fatalf("bounded startup cleanup: %v", result.err)
+		}
+		if result.retired != 0 {
+			t.Fatalf("bounded startup cleanup retired %d rows before reaching the later legacy row", result.retired)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("bounded startup cleanup did not finish after releasing the next page")
+	}
+
+	pending, err := store.HasPendingLegacyHistoryGateOutbox(ctx)
+	if err != nil {
+		t.Fatalf("HasPendingLegacyHistoryGateOutbox after bounded cleanup: %v", err)
+	}
+	if !pending {
+		t.Fatal("bounded cleanup unexpectedly removed the later legacy notice")
+	}
+
+	retired, err := store.RetireLegacyHistoryGateOutboxForStartup(ctx, 4, 8)
+	if err != nil || retired != 1 {
+		t.Fatalf("follow-up startup cleanup retired=%d err=%v, want one legacy notice", retired, err)
+	}
+	pending, err = store.HasPendingLegacyHistoryGateOutbox(ctx)
+	if err != nil || pending {
+		t.Fatalf("legacy notice after follow-up cleanup pending=%t err=%v", pending, err)
+	}
+}
+
+func TestSQLiteTurnRecoverySnapshotLoadsOnlyReferencedActiveInboundRows(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Date(2026, 9, 9, 13, 0, 0, 0, time.UTC)
+	if err := store.Update(ctx, func(state *State) error {
+		state.Sessions["session-recovery-bounded"] = SessionContext{
+			ID:          "session-recovery-bounded",
+			Status:      SessionStatusActive,
+			TeamsChatID: "chat-recovery-bounded",
+			UpdatedAt:   now,
+		}
+		state.Turns["turn-recovery-queued"] = Turn{
+			ID:             "turn-recovery-queued",
+			SessionID:      "session-recovery-bounded",
+			InboundEventID: "inbound-recovery-target",
+			Status:         TurnStatusQueued,
+			QueuedAt:       now,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}
+		state.Turns["turn-recovery-completed"] = Turn{
+			ID:             "turn-recovery-completed",
+			SessionID:      "session-recovery-bounded",
+			InboundEventID: "inbound-recovery-history",
+			Status:         TurnStatusCompleted,
+			CompletedAt:    now,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}
+		state.Turns["turn-recovery-malformed-active"] = Turn{
+			ID:        "turn-recovery-malformed-active",
+			SessionID: "session-recovery-bounded",
+			Status:    TurnStatusRunning,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		state.InboundEvents["inbound-recovery-target"] = InboundEvent{
+			ID:             "inbound-recovery-target",
+			SessionID:      "session-recovery-bounded",
+			TeamsChatID:    "chat-recovery-bounded",
+			TeamsMessageID: "message-recovery-target",
+			Text:           "recover this queued prompt",
+			Status:         InboundStatusQueued,
+			TurnID:         "turn-recovery-queued",
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}
+		state.InboundEvents["inbound-recovery-history"] = InboundEvent{
+			ID:             "inbound-recovery-history",
+			SessionID:      "session-recovery-bounded",
+			TeamsChatID:    "chat-recovery-bounded",
+			TeamsMessageID: "message-recovery-history",
+			Text:           strings.Repeat("historical inbound ", 4096),
+			Status:         InboundStatusIgnored,
+			TurnID:         "turn-recovery-completed",
+			CreatedAt:      now,
+			UpdatedAt:      now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed turn recovery state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+
+	// A completed historical inbound row and an active malformed payload are
+	// both useful safety fixtures: the first proves that recovery is targeted,
+	// while the second proves the active SQL identity still becomes a held
+	// turn rather than disappearing when its JSON is unreadable.
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `UPDATE inbound_events SET json = '{broken-history-inbound' WHERE id = ?`, "inbound-recovery-history"); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `UPDATE turns SET json = '{broken-active-turn' WHERE id = ?`, "turn-recovery-malformed-active")
+		return err
+	})
+
+	fullLoads := 0
+	previousHook := sqliteStateLoadTestHook
+	sqliteStateLoadTestHook = func() { fullLoads++ }
+	t.Cleanup(func() { sqliteStateLoadTestHook = previousHook })
+
+	snapshot, err := store.TurnRecoveryStateSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("TurnRecoveryStateSnapshot: %v", err)
+	}
+	if _, ok := snapshot.Sessions["session-recovery-bounded"]; !ok {
+		t.Fatalf("recovery snapshot missing session binding: %#v", snapshot.Sessions)
+	}
+	if len(snapshot.Turns) != 2 {
+		t.Fatalf("recovery snapshot turns = %d, want queued plus held malformed active turn: %#v", len(snapshot.Turns), snapshot.Turns)
+	}
+	if snapshot.Turns["turn-recovery-queued"].Status != TurnStatusQueued {
+		t.Fatalf("queued recovery turn = %#v", snapshot.Turns["turn-recovery-queued"])
+	}
+	if held := snapshot.Turns["turn-recovery-malformed-active"]; held.Status != TurnStatusRunning || held.ID == "" || held.SessionID != "session-recovery-bounded" {
+		t.Fatalf("malformed active turn was not held conservatively: %#v", held)
+	}
+	if len(snapshot.InboundEvents) != 1 || snapshot.InboundEvents["inbound-recovery-target"].TeamsMessageID != "message-recovery-target" {
+		t.Fatalf("recovery snapshot inbound rows = %#v, want only target inbound", snapshot.InboundEvents)
+	}
+	if _, ok := snapshot.InboundEvents["inbound-recovery-history"]; ok {
+		t.Fatal("recovery snapshot decoded unrelated completed historical inbound row")
+	}
+	if fullLoads != 0 {
+		t.Fatalf("TurnRecoveryStateSnapshot invoked full SQLite loader %d time(s)", fullLoads)
+	}
+}
+
+func TestSQLiteActiveOutboxAttachmentPathsFailsClosedOnOpaqueRow(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	if err := store.Update(ctx, func(state *State) error {
+		state.OutboxMessages["outbox:opaque-attachment"] = OutboxMessage{
+			ID:          "outbox:opaque-attachment",
+			TeamsChatID: "chat-opaque-attachment",
+			Kind:        "attachment",
+			Status:      OutboxStatusQueued,
+			CreatedAt:   time.Now(),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed opaque attachment state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE outbox_messages SET json = '{broken-outbox' WHERE id = ?`, "outbox:opaque-attachment")
+		return err
+	})
+	if _, err := store.ActiveOutboxAttachmentPaths(ctx); err == nil {
+		t.Fatal("ActiveOutboxAttachmentPaths accepted an opaque outbox row")
+	}
+}
+
 func TestLoadPathGlobalOutboundReadOnlySQLiteSkipsUnrelatedRows(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)
@@ -267,6 +585,68 @@ func TestHasUnfinishedTurnsSQLiteTreatsUnknownIndexedStatusAsActive(t *testing.T
 	}
 	if fullLoads != 0 {
 		t.Fatalf("HasUnfinishedTurns invoked full SQLite loader %d time(s)", fullLoads)
+	}
+}
+
+// A mixed-version writer can update the indexed turn status before the JSON
+// payload contains the newer status field.  Recovery must use that scalar as
+// a narrow compatibility fallback for omitted/null/empty JSON status values;
+// otherwise a queued turn silently disappears from the startup snapshot and
+// can remain stranded forever.  This is deliberately tested through both
+// HasUnfinishedTurns and the targeted recovery snapshot, not through a full
+// state load.
+func TestSQLiteTurnRecoveryUsesIndexedStatusWhenJSONStatusIsBlank(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 13, 9, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name      string
+		jsonState string
+	}{
+		{name: "omitted", jsonState: `{"id":"turn-status-fallback","session_id":"session-status-fallback"}`},
+		{name: "null", jsonState: `{"id":"turn-status-fallback","session_id":"session-status-fallback","status":null}`},
+		{name: "empty", jsonState: `{"id":"turn-status-fallback","session_id":"session-status-fallback","status":""}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newTestStore(t)
+			if err := store.Update(ctx, func(state *State) error {
+				state.Sessions["session-status-fallback"] = SessionContext{
+					ID: "session-status-fallback", Status: SessionStatusActive,
+					TeamsChatID: "chat-status-fallback", UpdatedAt: now,
+				}
+				state.Turns["turn-status-fallback"] = Turn{
+					ID: "turn-status-fallback", SessionID: "session-status-fallback",
+					Status: TurnStatusQueued, QueuedAt: now, CreatedAt: now, UpdatedAt: now,
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed status fallback turn: %v", err)
+			}
+			migrateStoreToSQLiteForTest(t, store)
+			withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+				_, err := tx.ExecContext(ctx, `UPDATE turns SET json = ?, status = ? WHERE id = ?`,
+					[]byte(tc.jsonState), string(TurnStatusQueued), "turn-status-fallback")
+				return err
+			})
+
+			hasUnfinished, err := store.HasUnfinishedTurns(ctx)
+			if err != nil {
+				t.Fatalf("HasUnfinishedTurns: %v", err)
+			}
+			if !hasUnfinished {
+				t.Fatal("HasUnfinishedTurns hid queued turn with blank JSON status")
+			}
+			snapshot, err := store.TurnRecoveryStateSnapshot(ctx)
+			if err != nil {
+				t.Fatalf("TurnRecoveryStateSnapshot: %v", err)
+			}
+			turn, ok := snapshot.Turns["turn-status-fallback"]
+			if !ok {
+				t.Fatalf("recovery snapshot omitted queued turn: %#v", snapshot.Turns)
+			}
+			if turn.Status != TurnStatusQueued {
+				t.Fatalf("recovery status = %q, want queued; turn=%#v", turn.Status, turn)
+			}
+		})
 	}
 }
 

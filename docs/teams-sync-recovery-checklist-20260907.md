@@ -82,6 +82,8 @@ Merged failure matrix from the first investigation round:
 - [x] Preserve durable deferral/wake behavior and owner fencing for all control/checkpoint writes.
 - [x] Ensure a failed fairness quantum retries without losing dirty paths or silently advancing a cursor.
 - [x] Ensure the fairness quantum cannot execute two durable frontiers or consume pending inbound claims in bulk.
+- [x] Reserve the oldest due operational frontier after the bounded poll cap is applied, so a hot-chat/ordinary-chat replacement cannot evict the only expired continuation or pending-page lane.
+- [x] Preserve the sole operational frontier during the earlier non-hot reservation as well; ordinary fairness reservations must not reintroduce starvation after the final operational reservation.
 
 ### 3.3 Stale-state and diagnostic handling
 
@@ -89,6 +91,9 @@ Merged failure matrix from the first investigation round:
 - [x] Ensure stale queued inbound and poll-frontier rows remain observable and independently drainable rather than making the whole listener appear healthy.
 - [x] Add phase-level diagnostics for Graph status/operator errors, gap progress, retry/backoff, history fairness runs, and durable completion so a future stall is distinguishable from ordinary slowness.
 - [x] Verify SQLite targeted reads/writes remain targeted on hot paths and that the fix does not introduce full-state loads or transaction-held Graph I/O.
+- [x] Make queue-only linked-transcript work skip non-essential chat-title Graph/store side effects; retain automatic title refresh for direct, non-queue-only maintenance.
+- [x] Represent child phase-budget expiry in linked-transcript and history-watch workers as typed durable deferral when the parent listener is healthy; preserve process-wide and parent-context failures as real errors.
+- [x] Let a replacement control-lease generation immediately reconcile tokenful `Sending` rows owned by the old generation; keep current-owner fresh sends and markerless legacy sends lease-gated.
 
 New issues found by the final clean review and their disposition:
 
@@ -101,6 +106,16 @@ New issues found by the final clean review and their disposition:
 - [x] Add a one-time bootstrap for old SQLite stores whose runtime projection is empty; partial materialized projections still fail closed and never fall back to stale cold state.
 - [x] Give exceptional outbox recovery explicit boundaries: ambiguous POST reconciliation uses a durable owner-fenced cursor and page budget; recent echo lookup uses a finite keyset scan and cancellable context without silently hiding a valid candidate.
 - [x] Exclude exact-top maintenance pages from the Docker poll-served durability oracle; the prior oracle falsely treated parked-chat lookups as poll delivery.
+
+### 3.4 Selective native SQLite hot path
+
+- [x] Keep the outbox JSON blob as the repair/compatibility payload and use the existing typed `teams_chat_id`, `sequence`, `status`, and ordering columns for FIFO candidate selection.
+- [x] Gate the scalar-only FIFO query with a durable projection-trust marker; unknown, incomplete, or contradictory rows stay on the historical JSON-aware fail-closed path.
+- [x] Add row-local SQLite triggers that revoke the native marker when a mixed-version/direct write publishes an unsafe projection.
+- [x] Preserve cross-lane mismatch semantics: a canonical chat/sequence value hidden behind a different scalar chat/sequence must return `ErrOutboxPredecessorIndeterminate`, never silently release a later message.
+- [x] Implement the initial trust audit as a streaming raw-column/Go decode pass rather than a wide per-row JSON1 expression scan.
+- [x] Verify the native query uses `outbox_chat_sequence_idx` and retains owner/lease/attempt/frontier boundaries in its callers.
+- [ ] Do not broaden this into an all-at-once native migration for sessions, turns, poll state, or full message bodies until each family has its own typed-authority marker, backfill, parity tests, and realistic Docker evidence.
 
 ## 4. Unit and package regression tests
 
@@ -125,13 +140,17 @@ New issues found by the final clean review and their disposition:
 - [x] Assert restart while backlog is active preserves the fairness cursor and does not create a partial unsafe history baseline.
 - [x] Assert fairness-job failure keeps dirty paths/checkpoints eligible for retry and does not move their cursor.
 - [x] Assert owner takeover cannot commit an old fairness worker’s checkpoint.
+- [x] Assert queue-only linked work still enqueues the transcript tail while issuing no chat-title PATCH, and that direct maintenance retains title refresh behavior.
+- [x] Assert bounded linked/history child timeouts are counted as deferrals rather than phase failures, while parent cancellation and lease/process errors remain visible.
 
 ### 4.3 Durable SQLite/outbox tests
 
 - [x] Exercise queued inbound claim/complete one message at a time with owner/lease/attempt/frontier CAS.
 - [x] Exercise 429 retry-after and repeated transient failures without a tight loop or global starvation.
+- [x] Treat a later successful Graph page with a still-draining durable receipt as recovered for retry-gate purposes; retain the old error only as diagnostic evidence until the receipt reaches terminal completion.
 - [x] Exercise unknown Graph POST result and verify exactly one external attempt with no automatic duplicate.
 - [x] Exercise stale `sending` recovery and verify it remains explicit/ambiguous until safe reconciliation.
+- [x] Exercise restart during a fresh tokenful `Sending` row and verify takeover performs read-only reconciliation, preserves the unknown row, and lets a later distinct turn progress without a duplicate POST.
 - [x] Exercise SQLite restart/migration and verify targeted projections preserve poll/gap/schedule/control state.
 - [x] Exercise concurrent head/gap/continuation writers and assert one durable frontier only.
 - [x] Add write/lock/phase observability assertions or benchmarks for the recovery and fairness hot paths.
@@ -148,7 +167,9 @@ New issues found by the final clean review and their disposition:
 - [x] Require more than synthetic “one message completed” success: assert no unsupported-filter requests, positive durable inbound and completion progress, no duplicate unknown POST, stable owner generation, closed turn accounting for replayed rows, and measurable history progress.
 - [x] Add a negative pre-fix/contract mode that demonstrably fails on unsupported `ge`/`le` or zero history progress, so the Docker test cannot silently regress to a smoke test.
 - [x] Run a duration long enough to measure steady throughput and report Graph requests, 429s, gap progress, phase durations, queued/running/failed/interrupted counts, and history offset delta.
+- [x] Run the realistic copied-data experiment through a process restart against the same disposable runtime; require both processes to preserve one owner generation, continue durable completion, and keep the unknown-POST/duplicate-message invariants.
 - [x] Verify source hashes and live helper/process state before and after the Docker run; the diagnostic run correctly detected live source drift and was not accepted as point-in-time green.
+- [x] Require the optional-maintenance duration assertion to distinguish a pure optional quantum from a quantum that also contains mandatory recovery; retain strict correctness, error, and deadline gates in both cases.
 
 ## 6. Validation and completion gate
 
@@ -158,7 +179,7 @@ New issues found by the final clean review and their disposition:
 - [x] Run the Teams package test suite and race suite as appropriate after the latest status-safety and owner-claim additions.
 - [x] Run the repository-required CI selector/manifest checks, including exact-match checks for the new SQLite and backlog selectors.
 - [x] Run `go vet` and `git diff --check`.
-- [x] Run the real-data Docker experiment from the copied current fixture, not a smoke test; it failed its throughput gate with actionable diagnostics.
+- [x] Run the real-data Docker experiment from the copied current fixture, not a smoke test; the latest 4-minute two-process diagnostic completed 144 messages in the first process at 0.575 measured completed msg/s and 135 additional completions after restart at 0.483 measured completed msg/s, with 429/503 faults exercised, no duplicate unknown POST, no duplicate Graph-served messages, and stable owner generations. Source drift still makes it diagnostic rather than point-in-time acceptance evidence.
 - [x] Inspect all new failures as code, dependency, environment, network, or fixture-target failures; the two late failures were code-path parity bugs, while Docker source drift/throughput was classified as diagnostic fixture/target evidence.
 - [x] Re-run the independent review loop against the final diff and Docker evidence; no additional concrete safety or liveness defect remained after the JSON/SQLite claim-path fixes.
 - [x] Record remaining uncertainty explicitly; tests prove the supported-filter and durable-fencing contracts, not future Graph behavior or a point-in-time drain of a changing live source.
@@ -169,10 +190,13 @@ New issues found by the final clean review and their disposition:
 - Plan review reports: the clean reviews identified malformed schedule times, unbounded semantic admission scans, JSON-expression query cost, incomplete turn safety fencing, legacy interrupted-probe mismatches, full-rewrite turn loss risk, unscoped claim semantics, startup backfill cost, empty-runtime fallback, and soft-boundary outbox recovery. Each item was either fixed with a regression test or explicitly reclassified as a bounded/compatibility-preserving performance boundary.
 - Files changed: see the working-tree file list; no prerelease or live helper/database mutation was performed.
 - Focused test results: store projection/corruption/ownership tests passed; Docker fake Graph contract and poll-served oracle tests passed; `go vet ./internal/teams/...`, `git diff --check`, shell syntax, and Python syntax checks passed.
+- Native SQLite FIFO probe: on the disposable 864MB/51,439-row copy, the first streaming projection audit took 9.65s and the subsequent indexed `EarlierUnsentOutbox` lookup took 16.5ms; the prior JSON1 audit took 1m40s on the same copy. `pending-page-control` remained about 0.13s. The probe only touched the copied database.
 - Full package/race results: `go test ./... -count=1 -timeout=30m` passed; `go test -race ./internal/teams/... -count=1 -timeout=30m` passed with no race reports; `go vet ./internal/teams/...` and `git diff --check` passed. The final selector additions have an additional focused JSON/SQLite fairness run.
+- Final verification rerun: `go test ./internal/teams/... -count=1 -timeout=30m` passed (`internal/teams` 338s, store 116s); `go test ./... -count=1 -timeout=30m` passed (`internal/teams` 466s, store 132s); `go test -race` for the new scheduler/frontier cases passed; `go vet ./...` and `git diff --check` passed.
 - Performance evidence: realistic SQLite benchmark (one fixture iteration) measured idle main-loop 6.692s with 2.28MiB disk writes and 72.9MiB logical reads; one-message drain 0.611s with 1.03MiB disk writes and 204.5MiB logical reads; parked-chat hoarder idle tick 5.527s. These are diagnostic current-workload measurements, not a claim of 1 msg/s production throughput.
+- Amdahl reading of the latest Docker trace: the fixed startup load was about 3m38s and is outside the steady window; inside the window, `ready-schedule+work-candidates` reached 3.74s, the poll/SQLite cycle reached 7.33s, worker Graph work reached 1.85s, and store-lock waits reached about 1.02–1.38s in samples. This makes scheduling/durable SQLite contention the larger serial fraction; reducing Graph retry latency alone cannot approach 1 msg/s. The measured completed rates were 0.575/s in the first process and 0.483/s after restart.
 - Docker command and measured result: `CXP_TEAMS_DOCKER_ALLOW_SOURCE_DRIFT=1 CXP_TEAMS_DOCKER_REAL_DATA_DURATION=1m CXP_TEAMS_DOCKER_REAL_DATA_MODE=throughput scripts/ci/teams_real_data_docker_experiment.sh ...`; copied 7,457-row replay corpus, 357 chats, 44 expired continuations; the latest run reached 10 durable completions at 0.083 measured completions/s, with `graph_429=1`, `graph_503=4`, no unknown POST, stable owner generation, and poll errors/deadlines recorded. The run was diagnostic only because source drift was detected and it did not meet the 100-completion throughput gate.
-- New issues discovered during Docker: the previous 15-message durability failure was an oracle false positive from exact-top maintenance pages and is fixed; the remaining real bottleneck is phase-budget starvation/slow per-chat polls, not a dead Graph loop.
+- New issues discovered during Docker: the previous 15-message durability failure was an oracle false positive from exact-top maintenance pages and is fixed; linked/history child budget expiry was initially reported as a phase error and is now typed as durable deferral; queue-only title PATCHes were also removed. The remaining real bottleneck is phase-budget starvation/slow per-chat polls, not a dead Graph loop.
 - Final review conclusion: the original unsupported-filter dead loop and the late JSON/SQLite owner-claim parity bug are fixed; durable liveness/safety tests are green. The accepted remaining uncertainty is operational throughput on a changing live fixture: the Docker experiment demonstrates progress and fault handling but is not a strict point-in-time full-drain acceptance run.
 - CI follow-up: the first cross-platform PR run found the intentionally large semantic-malformed SQLite admission test exceeded its 10-second Windows race watchdog while blocked in the bounded keyset scan; its assertion was not failing. A later hosted Ubuntu race run also exceeded 30 seconds under load, so the isolated manifest budget is now 90 seconds, without weakening the test or changing the production bound.
 - CI follow-up: a later Windows race run exposed a test-only observation window where continuous fast-poll could stage a new legitimate head attempt after the test had observed a clean frontier. The stateful frontier test now pauses only at a completed cycle after its clean-state condition, preserving the continuous-listener exercise without weakening the terminal frontier assertion.
@@ -182,3 +206,6 @@ New issues found by the final clean review and their disposition:
 - CI follow-up: the full race shard also showed that the backlog gate's second durable turn could still be completing when the 10-second post-release assertion expired. That assertion now has the same finite multi-step test-only window and both backlog selectors have a 90-second manifest watchdog; production polling and fairness intervals remain unchanged.
 - CI follow-up: another hosted race shard observed the inbound task/prompt final immediately after the Graph POST but before its durable outbox finalization, and a multi-day owner handoff exceeded the 5-second fixture context. Those bounds now use finite test-only multi-step/SQLite margins (up to 120 seconds in the manifest); no production deadline or retry policy changed.
 - CI follow-up: the next Windows run exposed two independent test-observation gaps: listener startup on the Graph-head-failure fixture could exceed the old 10-second assertion window, and the stale-transcript test could observe a legitimate Accepted final before the listener's next local reconciliation pass. The affected assertions now use finite hosted-test margins and explicitly run the idempotent Accepted-to-Sent reconciliation; no Graph POST, production timeout, retry, or durable safety boundary changed.
+- CI follow-up: the full race shard exposed a takeover liveness gap: a tokenful `Sending` row from the old control-lease generation was hidden until its two-minute send lease expired, blocking a distinct continuation final in the restart fixture. Recovery now admits only that old-generation shape for immediate marker reconciliation; current-owner fresh sends and markerless fresh rows remain protected, and the repeated JSON/SQLite race fixture passes.
+- Docker follow-up: a realistic replay with 8 hot poll slots initially dropped the only due operational frontier while replacing a non-hot candidate, so an expired continuation was never exercised. Selection now protects the sole operational frontier in both reservation passes and explicitly restores the oldest due operational frontier after capping; the focused scheduler test and the 4-minute two-process Docker replay pass.
+- Docker follow-up: a successful Graph read can leave a durable pending receipt while retaining an older 429/503 diagnostic. The partial-quantum contract now has JSON/SQLite coverage and the real-data assertion treats `LastSuccessfulPollAt > LastErrorAt` plus a pending receipt as recovered rather than a terminal retry failure.

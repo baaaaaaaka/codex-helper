@@ -387,7 +387,11 @@ func TestCXPPerfModelExternalScenariosCoverCommonPaths(t *testing.T) {
 	for _, scenario := range cxpPerfExternalScenarios {
 		scenario := scenario
 		t.Run(scenario.Name, func(t *testing.T) {
-			t.Parallel()
+			// cxpPerfWithImmediateHelperService temporarily changes the package-level
+			// helper restart delay. Keep these scenarios serialized so another test
+			// cannot restore that global while the delayed service hook is being
+			// scheduled; parallel subtests made the hook assertions flaky in the
+			// full Teams package run.
 			store, bridge, harness := newCXPPerfExternalBridge(t, scenario)
 			if err := cxpPerfRunListenOnce(context.Background(), bridge, store, scenario, harness); err != nil && !cxpPerfExpectedListenError(err, scenario) {
 				t.Fatalf("listen once external scenario error: %v", err)
@@ -446,6 +450,31 @@ func TestCXPPerfModelSQLiteProfilesCoverUpgradeOperations(t *testing.T) {
 					bridge.asyncTurns = true
 					if err := bridge.processQueuedTurns(context.Background()); err != nil {
 						t.Fatalf("sqlite queued drain: %v", err)
+					}
+					bridge.asyncTurnWG.Wait()
+					if profile.RateLimited {
+						// A permanent read throttle must preserve queued work rather
+						// than making this fixture pass by interrupting every turn.
+						// The durable chat gate prevents a hot retry until Graph is
+						// available again; once it expires, normal admission retries
+						// the same queued input.
+						hasQueued, err := store.HasQueuedTurns(context.Background())
+						if err != nil {
+							t.Fatalf("sqlite rate-limited queued state: %v", err)
+						}
+						if !hasQueued {
+							t.Fatal("rate-limited queued turns were discarded instead of retained")
+						}
+						for chat := 0; chat < profile.WorkChats; chat++ {
+							turn, ok, err := store.TurnByID(context.Background(), fmt.Sprintf("perf-drain-turn-%03d", chat))
+							if err != nil || !ok {
+								t.Fatalf("load rate-limited queued turn %d: ok=%v err=%v", chat, ok, err)
+							}
+							if turn.Status != teamstore.TurnStatusQueued {
+								t.Fatalf("rate-limited turn %s status=%q, want queued", turn.ID, turn.Status)
+							}
+						}
+						return
 					}
 					if err := cxpPerfDrainAsyncTurns(context.Background(), bridge); err != nil {
 						t.Fatalf("sqlite queued drain wait: %v", err)
@@ -940,7 +969,12 @@ func BenchmarkCXPPerfModelSQLiteRealisticMixedUser(b *testing.B) {
 		_ = store
 	})
 	b.Run("transcript-sync-due", func(b *testing.B) {
-		_, bridge := newCXPPerfRealisticMixedUserFixture(b)
+		store, bridge := newCXPPerfRealisticMixedUserFixture(b)
+		// The due transcript phase is an end-to-end benchmark, so give it the
+		// same bounded, real JSONL source shape used by the history benchmarks.
+		// Keep this setup before ResetTimer: source creation is fixture cost, not
+		// the per-tick listener cost being measured.
+		cxpPerfSeedLinkedTranscriptFiles(b, store, bridge, cxpPerfRealisticMixedUserProfile())
 		ctx := context.Background()
 		now := time.Date(2026, 5, 23, 10, 0, 0, 0, time.UTC)
 		opts := BridgeOptions{Top: ownerPollMessageTop, MaxWorkChatPollsPerCycle: DefaultMaxWorkChatPollsPerCycle, Interval: 5 * time.Second}
@@ -2998,7 +3032,13 @@ func BenchmarkCXPPerfModelSQLiteRealisticMixedUserIdleLoopBreakdown(b *testing.B
 		"registry_save",
 	}
 	totals := make(map[string]cxpPerfProcIO, len(stages))
-	_, bridge := newCXPPerfRealisticMixedUserFixture(b)
+	durations := make(map[string]time.Duration, len(stages))
+	store, bridge := newCXPPerfRealisticMixedUserFixture(b)
+	bridge.queuedTurnTraceHook = func(stage, sessionID, turnID string, started bool, err error) {
+		if err != nil {
+			b.Logf("queued turn debug: stage=%s session=%s turn=%s started=%t err=%v", stage, sessionID, turnID, started, err)
+		}
+	}
 	ctx := context.Background()
 	now := time.Date(2026, 5, 23, 10, 0, 0, 0, time.UTC)
 	opts := BridgeOptions{Top: ownerPollMessageTop, MaxWorkChatPollsPerCycle: DefaultMaxWorkChatPollsPerCycle, Interval: 5 * time.Second}
@@ -3009,11 +3049,17 @@ func BenchmarkCXPPerfModelSQLiteRealisticMixedUserIdleLoopBreakdown(b *testing.B
 		tick := now.Add(time.Duration(i) * 3 * time.Second)
 		runStage := func(name string, fn func() error) {
 			b.Helper()
+			started := time.Now()
 			delta, err := cxpPerfMeasureProcIO(fn)
+			durations[name] += time.Since(started)
 			total := totals[name]
 			total.add(delta)
 			totals[name] = total
 			if err != nil {
+				if name == "deferred_inbound" {
+					state, loadErr := store.Load(context.Background())
+					b.Logf("lease debug: bridge=%#v state=%#v loadErr=%v", bridge.currentLease(), state.ControlLease, loadErr)
+				}
 				b.Fatalf("%s: %v", name, err)
 			}
 		}
@@ -3089,6 +3135,7 @@ func BenchmarkCXPPerfModelSQLiteRealisticMixedUserIdleLoopBreakdown(b *testing.B
 	}
 	for _, stage := range stages {
 		cxpPerfReportNamedProcIO(b, stage, totals[stage], b.N)
+		b.ReportMetric(float64(durations[stage])/float64(b.N), stage+"_ns/op")
 	}
 }
 
@@ -5104,6 +5151,7 @@ func cxpPerfSeedRealisticChatHistory(state *teamstore.State, chat int, sessionID
 		messageID := fmt.Sprintf("realistic-user-message-%03d-%05d", chat, turn)
 		state.InboundEvents[inboundID] = teamstore.InboundEvent{
 			ID:             inboundID,
+			TurnID:         turnID,
 			SessionID:      sessionID,
 			TeamsChatID:    chatID,
 			TeamsMessageID: messageID,

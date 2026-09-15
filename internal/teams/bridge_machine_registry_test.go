@@ -742,6 +742,430 @@ func TestBridgeMachineDelegationWorkerRetriesSameHeadAfterDrainFailure(t *testin
 	}
 }
 
+func TestBridgeMachineDelegationWorkerDoesNotAdvanceCursorBeforeClaimAdmission(t *testing.T) {
+	for _, backend := range []string{"json", "sqlite"} {
+		t.Run(backend, func(t *testing.T) {
+			now := time.Date(2026, 6, 21, 10, 0, 0, 0, time.UTC)
+			graph := newFakeBridgeMachineRegistryGraph()
+			bridge := testBridgeForMachineRegistry()
+			statePath := filepath.Join(t.TempDir(), "delegation-worker."+backend)
+			executor := &fakeMachineDelegationExecutor{result: ExecutionResult{Text: "cursor retry result"}}
+			publisher, err := bridge.newBridgeMachineRegistryPublisher(BridgeOptions{
+				MachineRegistryGraph:               graph,
+				MachineRegistryCachePath:           filepath.Join(t.TempDir(), "machine-registry.json"),
+				MachineRegistryNow:                 func() time.Time { return now },
+				MachineDelegationStatePath:         statePath,
+				MachineDelegationClaimRecheckDelay: time.Hour,
+				Executor:                           executor,
+			})
+			if err != nil {
+				t.Fatalf("new publisher: %v", err)
+			}
+			if err := publisher.publish(context.Background(), false); err != nil {
+				t.Fatalf("publish: %v", err)
+			}
+			req, err := delegation.NewRequestRecord("session-cursor", "turn-cursor", "", []string{"machine-source"}, "machine-a", delegation.TaskSpec{Objective: "cursor must wait for admission"}, now)
+			if err != nil {
+				t.Fatalf("request: %v", err)
+			}
+			req.InboxRef = publisher.cache.InboxExternalID
+			req.InboxGeneration = publisher.cache.InboxGeneration
+			if _, err := graph.SendHTML(context.Background(), publisher.cache.InboxChatID, delegation.RenderRecordHTML(req)); err != nil {
+				t.Fatalf("seed request: %v", err)
+			}
+
+			pollCtx, cancel := context.WithCancel(context.Background())
+			pollDone := make(chan error, 1)
+			go func() { pollDone <- publisher.pollDelegationInbox(pollCtx) }()
+			claimSeen := false
+			deadline := time.Now().Add(2 * time.Second)
+			for time.Now().Before(deadline) {
+				messages, listErr := graph.ListMessages(context.Background(), publisher.cache.InboxChatID, 100)
+				if listErr != nil {
+					t.Fatalf("observe claim: %v", listErr)
+				}
+				for _, record := range delegation.ObserveRecords(machineDelegationMessages(messages)) {
+					if record.DelegationID == req.DelegationID && record.Kind == delegation.ClaimKind {
+						claimSeen = true
+						break
+					}
+				}
+				if claimSeen {
+					break
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			if !claimSeen {
+				cancel()
+				<-pollDone
+				t.Fatal("claim was not sent before the recheck delay")
+			}
+			cancel()
+			if err := <-pollDone; !errors.Is(err, context.Canceled) {
+				t.Fatalf("canceled post-claim poll error = %v, want context.Canceled", err)
+			}
+			var cursor delegation.InboxCursor
+			var ok bool
+			if backend == "sqlite" {
+				cursor, ok, err = delegation.InboxCursorSQLite(statePath, publisher.cache.InboxChatID)
+			} else {
+				var workerStore delegation.Store
+				workerStore, err = delegation.LoadStore(statePath)
+				if err == nil {
+					cursor, ok = workerStore.InboxCursorForChat(publisher.cache.InboxChatID)
+				}
+			}
+			if err != nil {
+				t.Fatalf("load cursor after canceled claim: %v", err)
+			}
+			if ok && (strings.TrimSpace(cursor.LastHeadMessageID) != "" || strings.TrimSpace(cursor.ContinuationPath) != "") {
+				t.Fatalf("cursor advanced before claim admission: %#v", cursor)
+			}
+
+			publisher.claimRecheckDelay = 0
+			if err := publisher.pollDelegationInbox(context.Background()); err != nil {
+				t.Fatalf("retry post-claim poll: %v", err)
+			}
+			deadline = time.Now().Add(2 * time.Second)
+			var state delegation.State
+			for time.Now().Before(deadline) {
+				messages, listErr := graph.ListMessages(context.Background(), publisher.cache.InboxChatID, 100)
+				if listErr != nil {
+					t.Fatalf("list final delegation records: %v", listErr)
+				}
+				state = delegation.Reduce(delegation.RecordsForID(delegation.ObserveRecords(machineDelegationMessages(messages)), req.DelegationID), now)
+				if state.Status == delegation.StateComplete {
+					break
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			if state.Status != delegation.StateComplete {
+				allMessages, listErr := graph.ListMessages(context.Background(), publisher.cache.InboxChatID, 100)
+				if listErr != nil {
+					t.Fatalf("retried delegation state = %#v; list records: %v", state, listErr)
+				}
+				allRecords := delegation.ObserveRecords(machineDelegationMessages(allMessages))
+				workerStore, workerErr := delegation.LoadStore(statePath)
+				t.Fatalf("retried delegation state = %#v records=%#v worker=%#v workerErr=%v, want complete", state, delegation.RecordsForID(allRecords, req.DelegationID), workerStore, workerErr)
+			}
+			if !waitPublishersIdle(time.Second, publisher) {
+				t.Fatal("publisher did not finish cursor retry delegation")
+			}
+		})
+	}
+}
+
+func TestBridgeMachineDelegationWorkerResumesDeepInboxContinuation(t *testing.T) {
+	now := time.Date(2026, 6, 21, 10, 0, 0, 0, time.UTC)
+	graph := newFakeBridgeMachineRegistryGraph()
+	bridge := testBridgeForMachineRegistry()
+	statePath := filepath.Join(t.TempDir(), "delegation-worker.json")
+	publisher, err := bridge.newBridgeMachineRegistryPublisher(BridgeOptions{
+		MachineRegistryGraph:       graph,
+		MachineRegistryCachePath:   filepath.Join(t.TempDir(), "machine-registry.json"),
+		MachineRegistryNow:         func() time.Time { return now },
+		MachineDelegationStatePath: statePath,
+		Executor:                   &fakeMachineDelegationExecutor{result: ExecutionResult{Text: "deep result"}},
+	})
+	if err != nil {
+		t.Fatalf("new publisher: %v", err)
+	}
+	if err := publisher.publish(context.Background(), false); err != nil {
+		t.Fatalf("publish: %v", err)
+	}
+	req, err := delegation.NewRequestRecord("session-deep", "turn-deep", "", []string{"machine-source"}, "machine-a", delegation.TaskSpec{Objective: "deep inbox continuation"}, now)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	req.InboxRef = publisher.cache.InboxExternalID
+	req.InboxGeneration = publisher.cache.InboxGeneration
+	if _, err := graph.SendHTML(context.Background(), publisher.cache.InboxChatID, delegation.RenderRecordHTML(req)); err != nil {
+		t.Fatalf("seed deep request: %v", err)
+	}
+	for i := 0; i < delegationInboxDrainTop*20+10; i++ {
+		graph.addMessage(publisher.cache.InboxChatID, fmt.Sprintf("deep-noise-%04d", i), "<p>noise</p>")
+	}
+	if err := publisher.pollDelegationInbox(context.Background()); err != nil {
+		t.Fatalf("first bounded deep poll: %v", err)
+	}
+	workerStore, err := delegation.LoadStore(statePath)
+	if err != nil {
+		t.Fatalf("load continuation cursor: %v", err)
+	}
+	cursor, ok := workerStore.InboxCursorForChat(publisher.cache.InboxChatID)
+	if !ok || strings.TrimSpace(cursor.ContinuationPath) == "" {
+		t.Fatalf("cursor after bounded deep poll = %#v ok=%v, want durable continuation", cursor, ok)
+	}
+	completedCursor := false
+	for attempt := 0; attempt < 8; attempt++ {
+		if err := publisher.pollDelegationInbox(context.Background()); err != nil {
+			t.Fatalf("continuation poll %d: %v", attempt, err)
+		}
+		workerStore, err = delegation.LoadStore(statePath)
+		if err != nil {
+			t.Fatalf("load continuation cursor %d: %v", attempt, err)
+		}
+		cursor, ok = workerStore.InboxCursorForChat(publisher.cache.InboxChatID)
+		if ok && strings.TrimSpace(cursor.ContinuationPath) == "" && strings.TrimSpace(cursor.LastHeadMessageID) != "" {
+			completedCursor = true
+			break
+		}
+	}
+	if !completedCursor {
+		t.Fatalf("deep continuation did not reach a durable head boundary: %#v", cursor)
+	}
+	if !waitPublishersIdle(2*time.Second, publisher) {
+		t.Fatal("publisher did not finish deep delegation")
+	}
+	messages, err := graph.ListMessages(context.Background(), publisher.cache.InboxChatID, 2000)
+	if err != nil {
+		t.Fatalf("list deep delegation records: %v", err)
+	}
+	state := delegation.Reduce(delegation.RecordsForID(delegation.ObserveRecords(machineDelegationMessages(messages)), req.DelegationID), now)
+	if state.Status != delegation.StateComplete || state.Terminal == nil || state.Terminal.Body != "deep result" {
+		t.Fatalf("deep delegation state = %#v, want complete result", state)
+	}
+	workerStore, err = delegation.LoadStore(statePath)
+	if err != nil {
+		t.Fatalf("reload deep cursor: %v", err)
+	}
+	cursor, ok = workerStore.InboxCursorForChat(publisher.cache.InboxChatID)
+	if !ok || strings.TrimSpace(cursor.ContinuationPath) != "" || strings.TrimSpace(cursor.LastHeadMessageID) == "" {
+		t.Fatalf("final deep cursor = %#v ok=%v, want completed boundary", cursor, ok)
+	}
+}
+
+func TestBridgeMachineDelegationWorkerRetainsRequestWhenRemoteThreadBusy(t *testing.T) {
+	for _, backend := range []string{"json", "sqlite"} {
+		t.Run(backend, func(t *testing.T) {
+			now := time.Date(2026, 6, 21, 10, 0, 0, 0, time.UTC)
+			graph := newFakeBridgeMachineRegistryGraph()
+			bridge := testBridgeForMachineRegistry()
+			statePath := filepath.Join(t.TempDir(), "delegation-worker."+backend)
+			executor := &fakeMachineDelegationExecutor{result: ExecutionResult{Text: "busy-thread result"}}
+			publisher, err := bridge.newBridgeMachineRegistryPublisher(BridgeOptions{
+				MachineRegistryGraph:       graph,
+				MachineRegistryCachePath:   filepath.Join(t.TempDir(), "machine-registry.json"),
+				MachineRegistryNow:         func() time.Time { return now },
+				MachineDelegationStatePath: statePath,
+				Executor:                   executor,
+			})
+			if err != nil {
+				t.Fatalf("new publisher: %v", err)
+			}
+			if err := publisher.publish(context.Background(), false); err != nil {
+				t.Fatalf("publish: %v", err)
+			}
+			req, err := delegation.NewRequestRecord("session-busy", "turn-busy", "", []string{"machine-source"}, "machine-a", delegation.TaskSpec{Objective: "wait for shared remote thread"}, now)
+			if err != nil {
+				t.Fatalf("request: %v", err)
+			}
+			req.InboxRef = publisher.cache.InboxExternalID
+			req.InboxGeneration = publisher.cache.InboxGeneration
+			req.RemoteThreadID = "rth-busy"
+			req.ThreadPolicy = delegation.ThreadPolicyReuse
+			req.ThreadGeneration = "generation-busy"
+			graph.addMessage(publisher.cache.InboxChatID, "busy-request", delegation.RenderRecordHTML(req))
+
+			workerStore := delegation.Store{}
+			workerStore.UpsertRemoteThread(delegation.RemoteThread{
+				ThreadID: "rth-busy", State: delegation.RemoteThreadStateActive,
+				ActiveDelegationID: "another-delegation", MachineID: "machine-a",
+				Generation: "generation-busy", CreatedAt: now.Format(time.RFC3339Nano),
+				UpdatedAt: now.Format(time.RFC3339Nano), LastUsedAt: now.Format(time.RFC3339Nano),
+			})
+			if _, err := delegation.SaveStore(statePath, workerStore); err != nil {
+				t.Fatalf("seed busy remote thread: %v", err)
+			}
+
+			if err := publisher.pollDelegationInbox(context.Background()); err != nil {
+				t.Fatalf("busy-thread poll: %v", err)
+			}
+			workerStore, err = delegation.LoadStore(statePath)
+			if err != nil {
+				t.Fatalf("load busy cursor: %v", err)
+			}
+			if cursor, ok := workerStore.InboxCursorForChat(publisher.cache.InboxChatID); ok && (cursor.LastHeadMessageID != "" || cursor.ContinuationPath != "") {
+				t.Fatalf("busy request cursor advanced before durable admission: %#v", cursor)
+			}
+			if publisher.lastInboxHeadID != "" {
+				t.Fatalf("busy request lastInboxHeadID=%q, want no suppression hint", publisher.lastInboxHeadID)
+			}
+
+			workerStore.RemoteThreads["rth-busy"] = delegation.RemoteThread{
+				ThreadID: "rth-busy", State: delegation.RemoteThreadStateIdle,
+				MachineID: "machine-a", Generation: "generation-busy",
+				CreatedAt: now.Format(time.RFC3339Nano), UpdatedAt: now.Format(time.RFC3339Nano),
+				LastUsedAt: now.Format(time.RFC3339Nano),
+			}
+			if _, err := delegation.SaveStore(statePath, workerStore); err != nil {
+				t.Fatalf("release busy remote thread: %v", err)
+			}
+			if err := publisher.pollDelegationInbox(context.Background()); err != nil {
+				t.Fatalf("released-thread poll: %v", err)
+			}
+			records := waitForBridgeDelegationStatus(t, graph, publisher.cache.InboxChatID, req.DelegationID, delegation.StateComplete)
+			if got := delegation.Reduce(delegation.RecordsForID(records, req.DelegationID), now); got.Terminal == nil || got.Terminal.Body != "busy-thread result" {
+				t.Fatalf("released-thread state = %#v, want completed result", got)
+			}
+			if executor.runCount() != 1 {
+				t.Fatalf("executor run count = %d, want exactly one after busy retry", executor.runCount())
+			}
+			if !waitPublishersIdle(time.Second, publisher) {
+				t.Fatal("busy-thread publisher did not finish")
+			}
+		})
+	}
+}
+
+func TestBridgeMachineDelegationWorkerDoesNotSkipNewHeadDuringContinuation(t *testing.T) {
+	for _, backend := range []string{"json", "sqlite"} {
+		t.Run(backend, func(t *testing.T) {
+			now := time.Date(2026, 6, 21, 10, 0, 0, 0, time.UTC)
+			graph := newFakeBridgeMachineRegistryGraph()
+			bridge := testBridgeForMachineRegistry()
+			statePath := filepath.Join(t.TempDir(), "delegation-worker."+backend)
+			executor := &fakeMachineDelegationExecutor{result: ExecutionResult{Text: "new-head result"}}
+			publisher, err := bridge.newBridgeMachineRegistryPublisher(BridgeOptions{
+				MachineRegistryGraph:       graph,
+				MachineRegistryCachePath:   filepath.Join(t.TempDir(), "machine-registry.json"),
+				MachineRegistryNow:         func() time.Time { return now },
+				MachineDelegationStatePath: statePath,
+				Executor:                   executor,
+			})
+			if err != nil {
+				t.Fatalf("new publisher: %v", err)
+			}
+			if err := publisher.publish(context.Background(), false); err != nil {
+				t.Fatalf("publish: %v", err)
+			}
+			chatID := publisher.cache.InboxChatID
+			boundary := graph.addMessage(chatID, "continuation-boundary", "<p>boundary</p>")
+			for i := 0; i < delegationInboxDrainTop+20; i++ {
+				graph.addMessage(chatID, fmt.Sprintf("continuation-noise-%03d", i), "<p>noise</p>")
+			}
+			messages, err := graph.ListMessages(context.Background(), chatID, 2000)
+			if err != nil {
+				t.Fatalf("list continuation fixture: %v", err)
+			}
+			boundaryIndex := -1
+			for index, message := range messages {
+				if message.ID == boundary.ID {
+					boundaryIndex = index
+					break
+				}
+			}
+			if boundaryIndex < 4 {
+				t.Fatalf("boundary index=%d, want enough prefix for continuation", boundaryIndex)
+			}
+			workerStore := delegation.Store{}
+			workerStore.UpsertInboxCursor(delegation.InboxCursor{
+				ChatID:            chatID,
+				LastHeadMessageID: boundary.ID,
+				ContinuationPath:  fmt.Sprintf("fake-window:%s 10 %d", chatID, boundaryIndex-3),
+				UpdatedAt:         now.Format(time.RFC3339Nano),
+			})
+			if _, err := delegation.SaveStore(statePath, workerStore); err != nil {
+				t.Fatalf("seed continuation cursor: %v", err)
+			}
+			req, err := delegation.NewRequestRecord("session-new-head", "turn-new-head", "", []string{"machine-source"}, "machine-a", delegation.TaskSpec{Objective: "must survive continuation"}, now)
+			if err != nil {
+				t.Fatalf("request: %v", err)
+			}
+			req.InboxRef = publisher.cache.InboxExternalID
+			req.InboxGeneration = publisher.cache.InboxGeneration
+			graph.addMessage(chatID, "new-head-request", delegation.RenderRecordHTML(req))
+
+			if err := publisher.pollDelegationInbox(context.Background()); err != nil {
+				t.Fatalf("continuation completion poll: %v", err)
+			}
+			workerStore, err = delegation.LoadStore(statePath)
+			if err != nil {
+				t.Fatalf("load preserved continuation boundary: %v", err)
+			}
+			cursor, ok := workerStore.InboxCursorForChat(chatID)
+			if !ok || cursor.LastHeadMessageID != boundary.ID || cursor.ContinuationPath != "" {
+				t.Fatalf("cursor after continuation with new head = %#v ok=%v, want old boundary and no continuation", cursor, ok)
+			}
+			if err := publisher.pollDelegationInbox(context.Background()); err != nil {
+				t.Fatalf("fresh head recovery poll: %v", err)
+			}
+			records := waitForBridgeDelegationStatus(t, graph, chatID, req.DelegationID, delegation.StateComplete)
+			state := delegation.Reduce(delegation.RecordsForID(records, req.DelegationID), now)
+			if state.Terminal == nil || state.Terminal.Body != "new-head result" {
+				t.Fatalf("new-head state = %#v, want completed result", state)
+			}
+			if executor.runCount() != 1 {
+				t.Fatalf("new-head executor run count = %d, want exactly one", executor.runCount())
+			}
+			if !waitPublishersIdle(time.Second, publisher) {
+				t.Fatal("new-head publisher did not finish")
+			}
+		})
+	}
+}
+
+func TestBridgeMachineDelegationWorkerDoesNotAdvanceCursorPastForeignRunningClaim(t *testing.T) {
+	for _, backend := range []string{"json", "sqlite"} {
+		t.Run(backend, func(t *testing.T) {
+			now := time.Date(2026, 6, 21, 10, 0, 0, 0, time.UTC)
+			graph := newFakeBridgeMachineRegistryGraph()
+			bridge := testBridgeForMachineRegistry()
+			statePath := filepath.Join(t.TempDir(), "delegation-worker."+backend)
+			executor := &fakeMachineDelegationExecutor{result: ExecutionResult{Text: "must not duplicate"}}
+			publisher, err := bridge.newBridgeMachineRegistryPublisher(BridgeOptions{
+				MachineRegistryGraph:       graph,
+				MachineRegistryCachePath:   filepath.Join(t.TempDir(), "machine-registry.json"),
+				MachineRegistryNow:         func() time.Time { return now },
+				MachineDelegationStatePath: statePath,
+				Executor:                   executor,
+			})
+			if err != nil {
+				t.Fatalf("new publisher: %v", err)
+			}
+			if err := publisher.publish(context.Background(), false); err != nil {
+				t.Fatalf("publish: %v", err)
+			}
+			request, err := delegation.NewRequestRecord("session-foreign-running", "turn-foreign-running", "", []string{"machine-source"}, "machine-a", delegation.TaskSpec{Objective: "retain foreign running claim"}, now)
+			if err != nil {
+				t.Fatalf("request: %v", err)
+			}
+			request.InboxRef = publisher.cache.InboxExternalID
+			request.InboxGeneration = publisher.cache.InboxGeneration
+			claim, err := delegation.NewClaimRecord(request.DelegationID, "machine-a", "worker-old", 1, now.Add(time.Second))
+			if err != nil {
+				t.Fatalf("claim: %v", err)
+			}
+			claim.InboxRef = request.InboxRef
+			claim.InboxGeneration = request.InboxGeneration
+			running, err := delegation.NewStatusRecord(request.DelegationID, claim, delegation.StateRunning, "old worker is running", now.Add(2*time.Second))
+			if err != nil {
+				t.Fatalf("running: %v", err)
+			}
+			running.InboxRef = request.InboxRef
+			running.InboxGeneration = request.InboxGeneration
+			for _, record := range []delegation.Record{request, claim, running} {
+				if _, err := graph.SendHTML(context.Background(), publisher.cache.InboxChatID, delegation.RenderRecordHTML(record)); err != nil {
+					t.Fatalf("seed %s: %v", record.Kind, err)
+				}
+			}
+			if err := publisher.pollDelegationInbox(context.Background()); err != nil {
+				t.Fatalf("foreign running poll: %v", err)
+			}
+			workerStore, err := delegation.LoadStore(statePath)
+			if err != nil {
+				t.Fatalf("load worker store: %v", err)
+			}
+			if cursor, ok := workerStore.InboxCursorForChat(publisher.cache.InboxChatID); ok && (cursor.LastHeadMessageID != "" || cursor.ContinuationPath != "") {
+				t.Fatalf("foreign running cursor advanced: %#v", cursor)
+			}
+			if publisher.lastInboxHeadID != "" || executor.runCount() != 0 {
+				t.Fatalf("foreign running request was handled unexpectedly: head=%q runs=%d", publisher.lastInboxHeadID, executor.runCount())
+			}
+		})
+	}
+}
+
 func TestBridgeMachineDelegationWorkerRetryAfterBackoffSkipsPoll(t *testing.T) {
 	now := time.Date(2026, 6, 21, 10, 0, 0, 0, time.UTC)
 	graph := newFakeBridgeMachineRegistryGraph()
@@ -1350,13 +1774,17 @@ type fakeBridgeMachineRegistryGraph struct {
 	chatOrder map[string][]string
 	nextID    int
 
-	createCalls    int
-	sendCount      int
-	patchCount     int
-	patchErr       error
-	exactErr       error
-	windowErrOnce  error
-	exactListCalls int
+	createCalls     int
+	sendCount       int
+	sendErr         error
+	sendErrAfterAdd bool
+	patchCount      int
+	patchErr        error
+	listErr         error
+	listErrOnce     bool
+	exactErr        error
+	windowErrOnce   error
+	exactListCalls  int
 }
 
 func newFakeBridgeMachineRegistryGraph() *fakeBridgeMachineRegistryGraph {
@@ -1407,7 +1835,22 @@ func (g *fakeBridgeMachineRegistryGraph) SendHTML(_ context.Context, chatID stri
 	defer g.mu.Unlock()
 	g.sendCount++
 	g.nextID++
-	return g.addMessageLocked(chatID, fmt.Sprintf("message-%06d", g.nextID), html), nil
+	msg := machineregistry.ChatMessage{ID: fmt.Sprintf("message-%06d", g.nextID)}
+	msg.Body.Content = html
+	if g.sendErrAfterAdd {
+		g.addMessageLocked(chatID, msg.ID, html)
+	}
+	if g.sendErr != nil {
+		err := g.sendErr
+		g.sendErr = nil
+		g.sendErrAfterAdd = false
+		return msg, err
+	}
+	g.messages[msg.ID] = msg
+	g.order = append([]string{msg.ID}, g.order...)
+	chatID = strings.TrimSpace(chatID)
+	g.chatOrder[chatID] = append([]string{msg.ID}, g.chatOrder[chatID]...)
+	return msg, nil
 }
 
 func (g *fakeBridgeMachineRegistryGraph) UpdateChatMessageHTML(_ context.Context, _ string, messageID string, html string) error {
@@ -1431,6 +1874,14 @@ func (g *fakeBridgeMachineRegistryGraph) UpdateChatMessageHTML(_ context.Context
 func (g *fakeBridgeMachineRegistryGraph) ListMessages(_ context.Context, chatID string, top int) ([]machineregistry.ChatMessage, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	if g.listErr != nil {
+		err := g.listErr
+		if g.listErrOnce {
+			g.listErr = nil
+			g.listErrOnce = false
+		}
+		return nil, err
+	}
 	return g.listMessagesLocked(chatID, top), nil
 }
 

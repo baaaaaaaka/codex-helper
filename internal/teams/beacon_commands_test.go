@@ -2165,6 +2165,11 @@ func newBeaconMeetingBridgeTestGraph(t *testing.T) (*GraphClient, *[]bridgeSentM
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
+		case r.Method == http.MethodGet && r.URL.String() == "/me?$select=id,displayName,userPrincipalName":
+			_, _ = fmt.Fprint(w, `{"id":"beacon-test-user","displayName":"Beacon Test User","userPrincipalName":"beacon@example.test"}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/me/onlineMeetings/createOrGet":
+			subject := decodeTestOnlineMeetingSubject(t, r)
+			writeTestOnlineMeeting(w, "work-chat", subject)
 		case r.Method == http.MethodPost && r.URL.Path == "/me/onlineMeetings":
 			_, _ = fmt.Fprint(w, `{"subject":"work topic","joinWebUrl":"https://teams.example/join","chatInfo":{"threadId":"work-chat"}}`)
 		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages"):

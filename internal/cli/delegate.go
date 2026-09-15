@@ -1097,9 +1097,31 @@ func appendDelegateInboxRecordForClaim(opts *delegateOptions, record delegation.
 }
 
 func appendDelegateInboxRecordWithOutbox(opts *delegateOptions, session *delegateRegistrySession, chatID string, inboxRef string, record delegation.Record) ([]delegation.Record, error) {
-	if err := saveDelegateOutbox(opts, record, delegation.OutboxPending, chatID, inboxRef, "", ""); err != nil {
+	record.InboxRef = firstNonEmptyString(record.InboxRef, inboxRef)
+	path, err := delegateRouteStorePath(opts)
+	if err != nil {
 		return nil, err
 	}
+	existing, reserved, err := delegation.ReserveOutbox(opts.context(), path, record, chatID, opts.now().UTC())
+	if err != nil {
+		return nil, err
+	}
+	if !reserved {
+		records, readErr := readDelegateInboxRecords(opts, session, chatID)
+		if readErr != nil {
+			return nil, fmt.Errorf("delegation record %s already has durable POST witness (%s); visibility check failed: %w", record.RecordID, existing.Status, readErr)
+		}
+		if containsDelegateRecordID(records, record.RecordID) {
+			if err := saveDelegateOutbox(opts, record, delegation.OutboxVisible, chatID, inboxRef, existing.MessageID, ""); err != nil {
+				return nil, err
+			}
+			return records, nil
+		}
+		return nil, fmt.Errorf("delegation record %s already has durable POST witness (%s); refusing automatic replay", record.RecordID, existing.Status)
+	}
+	// ReserveOutbox is the durable Pending transition. Do not perform a
+	// second read/modify/write here: it only adds JSON lock contention and
+	// could regress the reservation under a legacy caller.
 	msg, sendErr := session.graph.SendHTML(opts.context(), chatID, delegation.RenderRecordHTML(record))
 	if sendErr != nil {
 		records, readErr := readDelegateInboxRecords(opts, session, chatID)
@@ -1109,7 +1131,10 @@ func appendDelegateInboxRecordWithOutbox(opts *delegateOptions, session *delegat
 			}
 			return records, nil
 		}
-		_ = saveDelegateOutbox(opts, record, delegation.OutboxFailed, chatID, inboxRef, "", sendErr.Error())
+		// A non-idempotent POST can be accepted even when the client receives
+		// an error. If visibility cannot be established, keep an Unknown
+		// witness and never automatically POST this record again.
+		_ = saveDelegateOutbox(opts, record, delegation.OutboxUnknown, chatID, inboxRef, "", sendErr.Error())
 		if readErr != nil {
 			return nil, fmt.Errorf("send delegation record %s: %w; visibility check failed: %v", record.RecordID, sendErr, readErr)
 		}
@@ -1121,7 +1146,7 @@ func appendDelegateInboxRecordWithOutbox(opts *delegateOptions, session *delegat
 		return nil, err
 	}
 	if !containsDelegateRecordID(records, record.RecordID) {
-		_ = saveDelegateOutbox(opts, record, delegation.OutboxFailed, chatID, inboxRef, msg.ID, "sent record was not visible in inbox reread")
+		_ = saveDelegateOutbox(opts, record, delegation.OutboxSent, chatID, inboxRef, msg.ID, "sent record was not visible in inbox reread")
 		return nil, fmt.Errorf("delegation record %s sent as message %s but was not visible in inbox reread", record.RecordID, msg.ID)
 	}
 	if err := saveDelegateOutbox(opts, record, delegation.OutboxVisible, chatID, inboxRef, msg.ID, ""); err != nil {
@@ -1138,35 +1163,8 @@ func saveDelegateOutbox(opts *delegateOptions, record delegation.Record, status 
 	if delegation.StorePathUsesSQLite(path) {
 		return delegation.UpsertOutboxSQLite(path, record, status, chatID, inboxRef, messageID, errText, opts.now().UTC(), delegation.DefaultStoreRetention)
 	}
-	store, err := delegation.LoadStore(path)
-	if err != nil {
-		return err
-	}
-	now := opts.now().UTC().Format(time.RFC3339Nano)
-	existing, _ := store.OutboxForRecordID(record.RecordID)
-	attempts := existing.Attempts
-	if status == delegation.OutboxPending {
-		attempts++
-	}
-	createdAt := existing.CreatedAt
-	if strings.TrimSpace(createdAt) == "" {
-		createdAt = now
-	}
-	store.UpsertOutbox(delegation.OutboxRecord{
-		RecordID:     record.RecordID,
-		DelegationID: record.DelegationID,
-		ChatID:       strings.TrimSpace(chatID),
-		InboxRef:     strings.TrimSpace(inboxRef),
-		Status:       strings.TrimSpace(status),
-		MessageID:    strings.TrimSpace(firstNonEmptyString(messageID, existing.MessageID)),
-		Attempts:     attempts,
-		Error:        strings.TrimSpace(errText),
-		CreatedAt:    createdAt,
-		UpdatedAt:    now,
-	})
-	store.Prune(opts.now().UTC(), delegation.DefaultStoreRetention)
-	_, err = delegation.SaveStore(path, store)
-	return err
+	record.InboxRef = firstNonEmptyString(record.InboxRef, inboxRef)
+	return delegation.UpsertWorkerOutboxJSON(path, record, status, chatID, messageID, errText, opts.now().UTC())
 }
 
 func containsDelegateRecordID(records []delegation.Record, recordID string) bool {

@@ -57,6 +57,21 @@ type listenerRecoveryGraphState struct {
 	// Tests use this to model a bad chat's Graph head without making the fake
 	// server itself unavailable to healthy chats.
 	getFailures map[string]int
+	// globalRead429Remaining models an account/tenant-wide Graph read budget,
+	// rather than a per-chat fault.  It is deliberately owned by the fake
+	// server state so two different chat paths consume the same budget.
+	globalRead429Remaining int
+	read429RetryAfter      string
+	read429Scope           string
+	read429Count           int
+	listReadRequests       int
+	readRequestTimes       []time.Time
+	readRequestTimesByChat map[string][]time.Time
+	read429Times           []time.Time
+	chatRead429Remaining   map[string]int
+	chatRead429RetryAfter  string
+	chatRead429Count       map[string]int
+	chatRead429Times       map[string][]time.Time
 	// blockContinuation pauses a selected skip-token request after the first
 	// page has been durably committed.  It lets restart tests stop the first
 	// listener with a real persisted frontier instead of seeding one directly.
@@ -103,10 +118,11 @@ func (b *listenerRecoveryCancelAfterReadBody) Close() error { return nil }
 func newListenerRecoveryGraph(t *testing.T, delays map[string]time.Duration, messages map[string][]ChatMessage, postWait time.Duration) (*GraphClient, *listenerRecoveryGraphState) {
 	t.Helper()
 	state := &listenerRecoveryGraphState{
-		delays:   delays,
-		messages: messages,
-		gets:     make(map[string]int),
-		postWait: postWait,
+		delays:                 delays,
+		messages:               messages,
+		gets:                   make(map[string]int),
+		readRequestTimesByChat: make(map[string][]time.Time),
+		postWait:               postWait,
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -176,6 +192,10 @@ func newListenerRecoveryGraph(t *testing.T, delays map[string]time.Duration, mes
 					return
 				}
 				state.mu.Lock()
+				state.listReadRequests++
+				readAt := time.Now()
+				state.readRequestTimes = append(state.readRequestTimes, readAt)
+				state.readRequestTimesByChat[chatID] = append(state.readRequestTimesByChat[chatID], readAt)
 				state.gets[chatID]++
 				requestNumber := state.gets[chatID]
 				delay := state.delays[chatID]
@@ -213,6 +233,48 @@ func newListenerRecoveryGraph(t *testing.T, delays map[string]time.Duration, mes
 					}
 					state.mu.Unlock()
 				}()
+				state.mu.Lock()
+				globalRead429 := state.globalRead429Remaining > 0
+				if globalRead429 {
+					state.globalRead429Remaining--
+					state.read429Count++
+					state.read429Times = append(state.read429Times, time.Now())
+				}
+				retryAfter := state.read429RetryAfter
+				read429Scope := state.read429Scope
+				chatRead429 := state.chatRead429Remaining[chatID] > 0
+				if chatRead429 {
+					state.chatRead429Remaining[chatID]--
+					if state.chatRead429Count == nil {
+						state.chatRead429Count = make(map[string]int)
+					}
+					state.chatRead429Count[chatID]++
+					if state.chatRead429Times == nil {
+						state.chatRead429Times = make(map[string][]time.Time)
+					}
+					state.chatRead429Times[chatID] = append(state.chatRead429Times[chatID], time.Now())
+				}
+				chatRead429RetryAfter := state.chatRead429RetryAfter
+				state.mu.Unlock()
+				if globalRead429 {
+					if strings.TrimSpace(retryAfter) == "" {
+						retryAfter = "600"
+					}
+					if scope := strings.TrimSpace(read429Scope); scope != "" {
+						w.Header().Set("X-CXP-RateLimit-Scope", scope)
+					}
+					w.Header().Set("Retry-After", retryAfter)
+					http.Error(w, `{"error":{"code":"TooManyRequests","message":"account-level fake Graph read throttle"}}`, http.StatusTooManyRequests)
+					return
+				}
+				if chatRead429 {
+					if strings.TrimSpace(chatRead429RetryAfter) == "" {
+						chatRead429RetryAfter = "1"
+					}
+					w.Header().Set("Retry-After", chatRead429RetryAfter)
+					http.Error(w, `{"error":{"code":"TooManyRequests","message":"chat-local fake Graph read throttle"}}`, http.StatusTooManyRequests)
+					return
+				}
 				if barrierSlow {
 					select {
 					case <-barrierRelease:
@@ -347,6 +409,36 @@ func (s *listenerRecoveryGraphState) getCount(chatID string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.gets[chatID]
+}
+
+func (s *listenerRecoveryGraphState) readRequestTimesSnapshot() []time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]time.Time(nil), s.readRequestTimes...)
+}
+
+func (s *listenerRecoveryGraphState) readRequestTimesForChatSnapshot(chatID string) []time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]time.Time(nil), s.readRequestTimesByChat[chatID]...)
+}
+
+func (s *listenerRecoveryGraphState) read429TimesSnapshot() []time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]time.Time(nil), s.read429Times...)
+}
+
+func (s *listenerRecoveryGraphState) chatRead429CountFor(chatID string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.chatRead429Count[chatID]
+}
+
+func (s *listenerRecoveryGraphState) chatRead429TimesSnapshot(chatID string) []time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]time.Time(nil), s.chatRead429Times[chatID]...)
 }
 
 func (s *listenerRecoveryGraphState) clearMessages(chatID string) {
@@ -1230,6 +1322,421 @@ func TestTeamsListenFalseGraphWorkerSaturationPreservesHealthyPoll(t *testing.T)
 	}
 }
 
+// TestTeamsListenFalseAccountRead429DoesNotBlockQueuedOutboxWrite exercises
+// the complete listener cycle with a shared account-level read throttle.  The
+// read Graph client returns 429 for every chat-list request, while the write
+// Graph client remains available.  A poll failure must persist its scoped
+// backoff and let the following outbox phase deliver already durable local
+// work; otherwise a tenant-wide read limit can strand all queued replies.
+func TestTeamsListenFalseAccountRead429DoesNotBlockQueuedOutboxWrite(t *testing.T) {
+	t.Run("json", func(t *testing.T) {
+		testTeamsListenFalseAccountRead429DoesNotBlockQueuedOutboxWrite(t)
+	})
+}
+
+func testTeamsListenFalseAccountRead429DoesNotBlockQueuedOutboxWrite(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC().Add(-time.Minute)
+	readGraph, readState := newListenerRecoveryGraph(t, nil, map[string][]ChatMessage{}, 0)
+	readGraph.maxRetries = 0
+	readState.mu.Lock()
+	readState.globalRead429Remaining = 1000
+	readState.read429RetryAfter = "600"
+	readState.read429Scope = "account"
+	readState.mu.Unlock()
+	store := newBridgeTestStore(t)
+	// The shared fake handles PATCH/POST startup and write traffic as well as
+	// GETs.  Only its list-message GET branch consumes the account-wide 429
+	// budget, so using it for both clients models a real tenant throttle without
+	// accidentally rejecting the control-chat update path.
+	bridge := newBridgeTestBridge(readGraph, store, &recordingExecutor{})
+	bridge.readGraph = readGraph
+	bridge.reg.Sessions = nil
+	bridge.reg.ControlChatID = "control-chat"
+	for index, chatID := range []string{"account-429-chat-a", "account-429-chat-b"} {
+		appendBridgeTestSession(t, bridge, store, fmt.Sprintf("account-429-session-%d", index), chatID)
+	}
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.ControlChat = teamstore.ControlChatBinding{
+			TeamsChatID:    "control-chat",
+			TeamsChatURL:   "https://teams.example/control-chat",
+			TeamsChatTopic: "control",
+			UpdatedAt:      now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed account-429 control binding: %v", err)
+	}
+	listenerRecoverySeedDuePoll(t, store, "control-chat", now)
+	if _, err := store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
+		ChatID:         "control-chat",
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(time.Hour),
+		LastActivityAt: now,
+	}); err != nil {
+		t.Fatalf("defer control poll while testing work-chat account gate: %v", err)
+	}
+	for _, chatID := range []string{"account-429-chat-a", "account-429-chat-b"} {
+		listenerRecoverySeedDuePoll(t, store, chatID, now)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate account-429 listener fixture: %v", err)
+	}
+	outboxID := "outbox:account-429:already-queued"
+	if _, _, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
+		ID: outboxID,
+		// Use the same chat that the read path is throttling.  A tenant-wide
+		// read gate must not serialize an already durable write on that chat.
+		TeamsChatID: "account-429-chat-a",
+		Kind:        "helper",
+		Body:        "durable write must progress during account read throttle",
+	}); err != nil {
+		t.Fatalf("queue account-429 outbox: %v", err)
+	}
+	options := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), bridge.executor)
+	options.PhaseBudget = mainLoopPhaseBudget
+	options.PollWorkerBudget = mainLoopPollWorkerBudget
+	// Keep one work candidate per cycle so the first scoped 429 must be observed
+	// before the sibling can issue a read. This makes the test prove the actual
+	// account-wide gate rather than merely observing two concurrent 429s.
+	options.MaxWorkChatPollsPerCycle = 1
+	listener := startListenerRecovery(t, bridge, options)
+	waitListenerRecovery(t, func() bool {
+		state, err := store.Load(ctx)
+		if err != nil {
+			return false
+		}
+		message, ok := state.OutboxMessages[outboxID]
+		return ok && message.Status == teamstore.OutboxStatusSent && strings.TrimSpace(message.TeamsMessageID) != ""
+	}, 20*time.Second, "queued outbox delivery during account-level read 429")
+	listener.stop(t)
+
+	if got := countListenerRecoverySentBodies(readState.sentSnapshot(), "durable write must progress during account read throttle"); got != 1 {
+		t.Fatalf("queued outbox POST count = %d, want exactly one; sent=%#v", got, readState.sentSnapshot())
+	}
+	readState.mu.Lock()
+	read429Count := readState.read429Count
+	readRequests := readState.listReadRequests
+	chatAReads := readState.gets["account-429-chat-a"]
+	chatBReads := readState.gets["account-429-chat-b"]
+	readState.mu.Unlock()
+	if read429Count == 0 || read429Count != readRequests {
+		t.Fatalf("account-level read throttle counts = 429:%d requests:%d, want every list request to be 429", read429Count, readRequests)
+	}
+	if limit, ok, err := store.ChatRateLimit(ctx, graphReadAccountRateLimitKey); err != nil || !ok || !limit.BlockedUntil.After(time.Now()) {
+		t.Fatalf("listener did not persist explicit account-wide read gate: found=%v err=%v limit=%#v", ok, err, limit)
+	}
+	if chatAReads+chatBReads != 1 || (chatAReads != 0 && chatAReads != 1) || (chatBReads != 0 && chatBReads != 1) {
+		t.Fatalf("account-level read throttle did not gate sibling work chat: chat-a=%d chat-b=%d requests=%d", chatAReads, chatBReads, readRequests)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load account-429 final state: %v", err)
+	}
+	for _, chatID := range []string{"account-429-chat-a", "account-429-chat-b"} {
+		poll, ok := state.ChatPolls[chatID]
+		if !ok {
+			t.Fatalf("account-level read 429 lost poll state for %s", chatID)
+		}
+		if readState.getCount(chatID) == 0 {
+			if poll.FailureCount != 0 || poll.LastError != "" {
+				t.Fatalf("account-level gate changed unread sibling %s: poll=%#v", chatID, poll)
+			}
+			continue
+		}
+		if poll.FailureCount == 0 || poll.LastError == "" || !poll.NextPollAt.After(poll.LastErrorAt) {
+			t.Fatalf("account-level read 429 was not durably isolated for %s: poll=%#v", chatID, poll)
+		}
+	}
+}
+
+// TestTeamsListenFalseAccountRead429RecoversWithoutManualStateChange runs the
+// complete continuous listener against both durable backends and both explicit
+// account/global scope spellings. The fake Graph shares one finite read-429
+// budget across two chats. Once the first response is persisted, the second
+// chat must not issue a read during that durable account gate; after the
+// provider window expires, the same listener must read both prompts, execute
+// them, and publish both finals without a test-side schedule mutation.
+func TestTeamsListenFalseAccountRead429RecoversWithoutManualStateChange(t *testing.T) {
+	for _, backend := range []struct {
+		name      string
+		useSQLite bool
+	}{
+		{name: "json"},
+		{name: "sqlite", useSQLite: true},
+	} {
+		for _, scope := range []string{"account", "global"} {
+			t.Run(backend.name+"/"+scope, func(t *testing.T) {
+				ctx := context.Background()
+				now := time.Now().UTC().Add(-time.Minute)
+				chatIDs := []string{"listener-429-recovery-a", "listener-429-recovery-b"}
+				messages := make(map[string][]ChatMessage, len(chatIDs))
+				for index, chatID := range chatIDs {
+					message := bridgePollMessage(
+						fmt.Sprintf("listener-429-recovery-message-%d", index),
+						now.Add(time.Duration(index+1)*time.Second).Format(time.RFC3339),
+						fmt.Sprintf("@codex LISTENER_429_RECOVERY_PROMPT_%d", index),
+					)
+					message.ChatID = chatID
+					messages[chatID] = []ChatMessage{message}
+				}
+				graph, graphState := newListenerRecoveryGraph(t, nil, messages, 0)
+				graph.maxRetries = 0
+				graphState.mu.Lock()
+				// Two finite 429s are consumed serially because the listener is
+				// deliberately limited to one work chat per cycle. This keeps the
+				// account/global gate observable instead of allowing two workers to
+				// race before the first durable gate is published.
+				graphState.globalRead429Remaining = len(chatIDs)
+				graphState.read429RetryAfter = "1"
+				graphState.read429Scope = scope
+				graphState.mu.Unlock()
+
+				store := newBridgeTestStore(t)
+				executor := &listenerRecoveryExecutor{
+					called: make(chan string),
+					result: ExecutionResult{
+						Text:          "LISTENER_429_RECOVERY_FINAL",
+						CodexThreadID: "listener-429-recovery-thread",
+						CodexTurnID:   "listener-429-recovery-turn",
+					},
+				}
+				bridge := newBridgeTestBridge(graph, store, executor)
+				bridge.readGraph = graph
+				bridge.reg.Sessions = nil
+				bindBridgeTestControlChat(t, store, bridge.reg.ControlChatID)
+				for index, chatID := range chatIDs {
+					appendBridgeTestSession(t, bridge, store, fmt.Sprintf("listener-429-recovery-session-%d", index), chatID)
+					listenerRecoverySeedDuePoll(t, store, chatID, now)
+				}
+				listenerRecoverySeedDuePoll(t, store, bridge.reg.ControlChatID, now)
+				if _, err := store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
+					ChatID: bridge.reg.ControlChatID, PollState: inboundPollStateWarm,
+					NextPollAt: now.Add(time.Hour), LastActivityAt: now,
+				}); err != nil {
+					t.Fatalf("defer control poll: %v", err)
+				}
+				if backend.useSQLite {
+					if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+						t.Fatalf("migrate listener 429 fixture: %v", err)
+					}
+				}
+
+				options := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), executor)
+				options.PhaseBudget = mainLoopPhaseBudget
+				options.PollWorkerBudget = mainLoopPollWorkerBudget
+				options.TranscriptSyncInterval = time.Hour
+				options.MaxWorkChatPollsPerCycle = 1
+				listener := startListenerRecovery(t, bridge, options)
+
+				waitListenerRecovery(t, func() bool {
+					graphState.mu.Lock()
+					read429Observed := graphState.read429Count >= 1
+					graphState.mu.Unlock()
+					limit, found, err := store.ChatRateLimit(ctx, graphReadAccountRateLimitKey)
+					return read429Observed && err == nil && found && limit.BlockedUntil.After(time.Now())
+				}, 10*time.Second, "first account/global read 429 and durable gate")
+				limit, found, err := store.ChatRateLimit(ctx, graphReadAccountRateLimitKey)
+				if err != nil || !found || !limit.BlockedUntil.After(time.Now()) {
+					t.Fatalf("first %s 429 did not install durable account gate: found=%v err=%v limit=%#v", scope, found, err, limit)
+				}
+				// Retry-After is one second. Inspect the complete durable window rather
+				// than a short sample: a busy-loop that sleeps for 150ms can still issue
+				// an illegal sibling read later in the same gate. The fake records both
+				// request and 429 timestamps while the listener remains continuous.
+				first429 := graphState.read429TimesSnapshot()
+				if len(first429) == 0 {
+					t.Fatalf("%s account gate has no recorded first 429 timestamp", scope)
+				}
+				gateUntil := limit.BlockedUntil
+				if wait := time.Until(gateUntil); wait > 0 {
+					timer := time.NewTimer(wait + 25*time.Millisecond)
+					<-timer.C
+				}
+				for _, at := range graphState.readRequestTimesSnapshot() {
+					if at.After(first429[0]) && at.Before(gateUntil) {
+						t.Fatalf("%s account gate allowed Graph read during full Retry-After window: at=%s first_429=%s gate_until=%s", scope, at, first429[0], gateUntil)
+					}
+				}
+
+				waitListenerRecovery(t, func() bool {
+					return len(executor.callsSnapshot()) == len(chatIDs)
+				}, 20*time.Second, "both prompts after account/global read 429")
+				waitListenerRecovery(t, func() bool {
+					return countListenerRecoverySentBodies(graphState.sentSnapshot(), "LISTENER_429_RECOVERY_FINAL") == len(chatIDs)
+				}, 20*time.Second, "both finals after account/global read 429")
+
+				state := mustListenerRecoveryState(t, store)
+				for index, chatID := range chatIDs {
+					poll, ok := state.ChatPolls[chatID]
+					if !ok || poll.FailureCount != 0 || poll.LastError != "" || poll.LastSuccessfulPollAt.IsZero() {
+						t.Fatalf("%s %s poll did not recover: ok=%v poll=%#v", backend.name, scope, ok, poll)
+					}
+					if got := countListenerRecoveryInbound(state, fmt.Sprintf("listener-429-recovery-session-%d", index), messages[chatID][0].ID); got != 1 {
+						t.Fatalf("%s %s inbound count for %s = %d, want one", backend.name, scope, chatID, got)
+					}
+					if graphState.getCount(chatID) < 1 {
+						t.Fatalf("%s %s Graph reads for %s = %d, want at least one listener read; calls=%#v sent=%#v state=%#v", backend.name, scope, chatID, graphState.getCount(chatID), executor.callsSnapshot(), graphState.sentSnapshot(), state)
+					}
+				}
+				graphState.mu.Lock()
+				read429Count := graphState.read429Count
+				graphState.mu.Unlock()
+				if read429Count != len(chatIDs) {
+					t.Fatalf("%s %s finite account/global 429 count = %d, want %d", backend.name, scope, read429Count, len(chatIDs))
+				}
+				listener.stop(t)
+			})
+		}
+	}
+}
+
+// TestTeamsListenFalseChatRead429RecoversWithoutManualStateChange is the
+// full-listener counterpart to the direct poll 429 test. A chat-local read
+// throttle must remain local: the healthy sibling should reach the executor
+// while the throttled chat waits, and the same continuous listener must later
+// retry the throttled chat without a test-side schedule edit.
+func TestTeamsListenFalseChatRead429RecoversWithoutManualStateChange(t *testing.T) {
+	for _, backend := range []struct {
+		name      string
+		useSQLite bool
+	}{
+		{name: "json"},
+		{name: "sqlite", useSQLite: true},
+	} {
+		t.Run(backend.name, func(t *testing.T) {
+			ctx := context.Background()
+			now := time.Now().UTC().Add(-time.Minute)
+			blockedChat := "listener-chat-429-a"
+			healthyChat := "listener-chat-429-b"
+			messages := map[string][]ChatMessage{}
+			for index, chatID := range []string{blockedChat, healthyChat} {
+				message := bridgePollMessage(
+					fmt.Sprintf("listener-chat-429-message-%d", index),
+					now.Add(time.Duration(index+1)*time.Second).Format(time.RFC3339),
+					fmt.Sprintf("@codex LISTENER_CHAT_429_PROMPT_%d", index),
+				)
+				message.ChatID = chatID
+				messages[chatID] = []ChatMessage{message}
+			}
+			graph, graphState := newListenerRecoveryGraph(t, nil, messages, 0)
+			graph.maxRetries = 0
+			graphState.mu.Lock()
+			graphState.chatRead429Remaining = map[string]int{blockedChat: 2}
+			graphState.chatRead429RetryAfter = "1"
+			graphState.mu.Unlock()
+
+			store := newBridgeTestStore(t)
+			executor := &listenerRecoveryExecutor{
+				called: make(chan string),
+				result: ExecutionResult{
+					Text:          "LISTENER_CHAT_429_FINAL",
+					CodexThreadID: "listener-chat-429-thread",
+					CodexTurnID:   "listener-chat-429-turn",
+				},
+			}
+			bridge := newBridgeTestBridge(graph, store, executor)
+			bridge.readGraph = graph
+			bridge.reg.Sessions = nil
+			bindBridgeTestControlChat(t, store, bridge.reg.ControlChatID)
+			for index, chatID := range []string{blockedChat, healthyChat} {
+				appendBridgeTestSession(t, bridge, store, fmt.Sprintf("listener-chat-429-session-%d", index), chatID)
+				listenerRecoverySeedDuePoll(t, store, chatID, now)
+			}
+			listenerRecoverySeedDuePoll(t, store, bridge.reg.ControlChatID, now)
+			if _, err := store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
+				ChatID: bridge.reg.ControlChatID, PollState: inboundPollStateWarm,
+				NextPollAt: now.Add(time.Hour), LastActivityAt: now,
+			}); err != nil {
+				t.Fatalf("defer chat-local-429 control poll: %v", err)
+			}
+			if backend.useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate chat-local-429 fixture: %v", err)
+				}
+			}
+			outboxID := "outbox:chat-local-429:already-queued"
+			if _, _, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
+				ID:          outboxID,
+				TeamsChatID: blockedChat,
+				Kind:        "helper",
+				Body:        "CHAT_LOCAL_429_WRITE_MUST_PROGRESS",
+			}); err != nil {
+				t.Fatalf("queue chat-local-429 outbox: %v", err)
+			}
+
+			options := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), executor)
+			options.PhaseBudget = mainLoopPhaseBudget
+			options.PollWorkerBudget = mainLoopPollWorkerBudget
+			options.TranscriptSyncInterval = time.Hour
+			options.MaxWorkChatPollsPerCycle = 2
+			listener := startListenerRecovery(t, bridge, options)
+
+			waitListenerRecovery(t, func() bool {
+				return graphState.chatRead429CountFor(blockedChat) >= 1
+			}, 10*time.Second, "chat-local read 429")
+			first429 := graphState.chatRead429TimesSnapshot(blockedChat)
+			if len(first429) == 0 {
+				t.Fatal("chat-local read gate has no recorded first 429 timestamp")
+			}
+			// The fake advertises Retry-After: 1.  The listener may retry after
+			// that deadline, but it must not issue a tight read loop during the
+			// advertised window even though the local poll row is eventually
+			// cleared by the successful retry.
+			gateUntil := first429[0].Add(time.Second)
+			if wait := time.Until(gateUntil); wait > 0 {
+				timer := time.NewTimer(wait + 25*time.Millisecond)
+				<-timer.C
+			}
+			for _, at := range graphState.readRequestTimesForChatSnapshot(blockedChat) {
+				if at.After(first429[0]) && at.Before(gateUntil) {
+					t.Fatalf("chat-local gate allowed blocked-chat Graph read during full Retry-After window: at=%s first_429=%s gate_until=%s", at, first429[0], gateUntil)
+				}
+			}
+			waitListenerRecovery(t, func() bool {
+				state, err := store.Load(ctx)
+				if err != nil {
+					return false
+				}
+				message, ok := state.OutboxMessages[outboxID]
+				return ok && message.Status == teamstore.OutboxStatusSent && strings.TrimSpace(message.TeamsMessageID) != ""
+			}, 10*time.Second, "queued same-chat outbox during chat-local read 429")
+			waitListenerRecovery(t, func() bool {
+				for _, call := range executor.callsSnapshot() {
+					if strings.Contains(call, "LISTENER_CHAT_429_PROMPT_1") {
+						return true
+					}
+				}
+				return false
+			}, 20*time.Second, "healthy sibling during chat-local read 429")
+			waitListenerRecovery(t, func() bool {
+				return len(executor.callsSnapshot()) == 2
+			}, 30*time.Second, "both prompts after chat-local read 429")
+			waitListenerRecovery(t, func() bool {
+				return countListenerRecoverySentBodies(graphState.sentSnapshot(), "LISTENER_CHAT_429_FINAL") == 2
+			}, 30*time.Second, "both finals after chat-local read 429")
+
+			state := mustListenerRecoveryState(t, store)
+			for _, chatID := range []string{blockedChat, healthyChat} {
+				poll, ok := state.ChatPolls[chatID]
+				if !ok || poll.FailureCount != 0 || poll.LastError != "" || poll.LastSuccessfulPollAt.IsZero() {
+					t.Fatalf("%s chat-local read 429 poll did not recover: ok=%v poll=%#v", chatID, ok, poll)
+				}
+			}
+			if got := graphState.chatRead429CountFor(blockedChat); got != 2 {
+				t.Fatalf("chat-local read 429 count=%d, want exactly two finite failures", got)
+			}
+			if got := graphState.chatRead429CountFor(healthyChat); got != 0 {
+				t.Fatalf("healthy sibling received chat-local 429 count=%d, want zero", got)
+			}
+			if got := countListenerRecoverySentBodies(graphState.sentSnapshot(), "CHAT_LOCAL_429_WRITE_MUST_PROGRESS"); got != 1 {
+				t.Fatalf("queued same-chat outbox POST count = %d, want exactly one; sent=%#v", got, graphState.sentSnapshot())
+			}
+			listener.stop(t)
+		})
+	}
+}
+
 // TestTeamsListenFalseGraphHeadFailureDoesNotStarveHealthyTail proves the
 // simpler failure shape behind the saturation test: one chat's Graph head can
 // return repeated retryable errors while a later chat has a real user message.
@@ -1526,14 +2033,25 @@ func TestTeamsListenFalseGraphContinuationRecoversAfterTransientOutage(t *testin
 	if !strings.Contains(requestText, "skiptoken=old-2") {
 		t.Fatalf("continuation recovery never requested the advertised second page; requests=%s", requestText)
 	}
-	if len(gotPosts) != 2 {
-		t.Fatalf("Graph POST count = %d, want one ACK and one recovered final; posts=%#v", len(gotPosts), gotPosts)
+	if len(gotPosts) != 3 {
+		t.Fatalf("Graph POST count = %d, want one ACK, one queued-start notice, and one recovered final; posts=%#v", len(gotPosts), gotPosts)
 	}
+	ackPosts := 0
+	queuedStartPosts := 0
 	finalPosts := 0
 	for _, body := range gotPosts {
-		if strings.Contains(PlainTextFromTeamsHTML(body), "LISTENER_RECOVERY_CONTINUATION_FINAL") {
+		plain := PlainTextFromTeamsHTML(body)
+		switch {
+		case strings.Contains(plain, "Codex is working. Request accepted."):
+			ackPosts++
+		case strings.Contains(plain, "Codex is starting this queued request."):
+			queuedStartPosts++
+		case strings.Contains(plain, "LISTENER_RECOVERY_CONTINUATION_FINAL"):
 			finalPosts++
 		}
+	}
+	if ackPosts != 1 || queuedStartPosts != 1 {
+		t.Fatalf("recovery progress POST counts = ack:%d queued-start:%d; posts=%#v", ackPosts, queuedStartPosts, gotPosts)
 	}
 	if finalPosts != 1 {
 		t.Fatalf("recovered final POST count = %d, want one; posts=%#v", finalPosts, gotPosts)
@@ -1664,9 +2182,16 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 	// not the short-budget isolation path.  Use the production budgets so race
 	// instrumentation or a busy hosted runner cannot cancel the poll between
 	// the head page and its durable continuation; the finite progress watchdog
-	// below still detects a genuinely wedged listener.
-	options.PhaseBudget = mainLoopPhaseBudget
-	options.PollWorkerBudget = mainLoopPollWorkerBudget
+	// below still detects a genuinely wedged listener. The fake intentionally
+	// holds one Graph request until the revision-adoption assertion, so this
+	// fixture needs a larger finite phase than production's short worker slice.
+	options.PhaseBudget = 40 * time.Second
+	// The fake deliberately holds the continuation request until the durable
+	// revision-adoption assertion runs. Give that one request a finite budget
+	// longer than the assertion's scheduling margin; the production worker
+	// budget remains intentionally short so real read stalls cannot monopolize
+	// the write lane.
+	options.PollWorkerBudget = listenerRecoveryExtendedProgressTimeout
 	// The listener deliberately remains continuous, and final-answer delivery
 	// enables the production fast-poll interval.  On a slow Windows race
 	// runner, the next legitimate head attempt can therefore be staged between
@@ -1704,23 +2229,6 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 		state, _ := store.Load(context.Background())
 		t.Fatalf("stateful head prompt did not reach executor: calls=%#v; state=%+v; requests=%v", executor.callsSnapshot(), state, graphState.requestsSnapshot())
 	}
-	waitListenerRecovery(t, func() bool {
-		if bridge.activeAsyncTurnCount() != 0 {
-			return false
-		}
-		finals := 0
-		for _, sent := range graphState.sentSnapshot() {
-			if strings.Contains(PlainTextFromTeamsHTML(sent.Body), "LISTENER_RECOVERY_STATEFUL_FINAL") {
-				finals++
-			}
-		}
-		// The executor's active count reaches zero before the outbox's final
-		// delivery/boost side effects necessarily finish. Release the second
-		// Graph page only after the first final is durable at the fake provider;
-		// otherwise the fixture permits the two independent poll revisions to
-		// overlap and makes the assertion depend on filesystem scheduling.
-		return finals >= 1
-	}, listenerRecoveryExtendedProgressTimeout, "stateful head turn and final delivery")
 	select {
 	case <-graphState.continuationEntered:
 	case <-time.After(listenerRecoveryExtendedProgressTimeout):
@@ -1743,6 +2251,9 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 		t.Fatalf("stateful poll boost did not merge the live attempt revision: %#v", boosted)
 	}
 	close(continuationRelease)
+	// The poll phase is deliberately serial with outbox delivery. The first
+	// final cannot be sent until this held continuation is released; the
+	// revision assertion above is therefore the correct pre-release boundary.
 	deadline := time.Now().Add(listenerRecoveryExtendedProgressTimeout)
 	for time.Now().Before(deadline) {
 		calls := executor.callsSnapshot()
@@ -2582,6 +3093,23 @@ func TestTeamsListenFalseOwnerLossCancelsHistoryWatchBeforeStaleCommit(t *testin
 		t.Fatalf("stat owner-loss transcript: %v", err)
 	}
 	checkpoint := listenerRecoveryHistoryCheckpoint(path, "owner-loss-session", "owner-loss-thread", info)
+	// Keep the checkpoint on the mandatory recovery lane while the due work-chat
+	// poll is active. Ordinary history tails are intentionally suppressed under
+	// foreground pressure; this fixture is specifically exercising cancellation
+	// after a mandatory history recovery job has entered its worker. A pending
+	// semantic range is executable by the mandatory lane; an unusable optional
+	// proof is intentionally deferred until explicit recovery and would be the
+	// wrong fixture for testing worker cancellation.
+	checkpoint.PendingHistoryRange = &teamstore.HistoryPendingRange{
+		SourcePath:       path,
+		SourceGeneration: checkpoint.SourceGeneration,
+		RangeID:          "owner-loss-range",
+		Kind:             "owner-loss",
+		StartOffset:      0,
+		StartOffsetKnown: true,
+		ExclusiveEnd:     info.Size(),
+		RangeFingerprint: checkpoint.SourceFingerprint,
+	}
 	if err := store.UpdateHistoryWatch(context.Background(), func(history map[string]teamstore.HistoryWatchCheckpoint, ready *time.Time) error {
 		history[checkpoint.ID] = checkpoint
 		*ready = time.Now().UTC().Add(-time.Minute)
@@ -2592,8 +3120,19 @@ func TestTeamsListenFalseOwnerLossCancelsHistoryWatchBeforeStaleCommit(t *testin
 	if err := appendListenerRecoveryTranscript(path, listenerRecoveryTranscriptLine("owner-loss-tail", "owner-loss-tail-status")); err != nil {
 		t.Fatalf("append owner-loss transcript: %v", err)
 	}
-	bridge.lastHistoryWatchReconcile = time.Now().UTC()
+	// Make reconciliation immediately due. The hook-entry assertion is about
+	// owner-loss cancellation, not the five-minute discovery cadence; setting a
+	// fresh timestamp makes the test depend on which listener phase happens to
+	// win the first scheduler race.
+	bridge.lastHistoryWatchReconcile = time.Now().UTC().Add(-historyWatchReconcileInterval - time.Second)
 	listenerRecoverySeedDuePoll(t, store, bridge.reg.ControlChatID, time.Now().UTC().Add(-time.Minute))
+	var phaseMu sync.Mutex
+	var phases []string
+	bridge.mainLoopPhaseTraceHook = func(name string, duration time.Duration, err error) {
+		phaseMu.Lock()
+		phases = append(phases, fmt.Sprintf("%s=%s err=%v", name, duration, err))
+		phaseMu.Unlock()
+	}
 
 	entered := make(chan struct{})
 	hookExited := make(chan struct{})
@@ -2628,7 +3167,11 @@ func TestTeamsListenFalseOwnerLossCancelsHistoryWatchBeforeStaleCommit(t *testin
 	case err := <-listenDone:
 		t.Fatalf("listener exited before owner-loss hook: %v", err)
 	case <-time.After(listenerRecoveryProgressTimeout):
-		t.Fatal("owner-loss history-watch hook was not entered")
+		phaseMu.Lock()
+		phaseSnapshot := append([]string(nil), phases...)
+		phaseMu.Unlock()
+		backlog, backlogErr := store.TeamsOperationalBacklog(context.Background())
+		t.Fatalf("owner-loss history-watch hook was not entered; phases=%v history=%#v poll=%#v backlog=%#v backlog_err=%v", phaseSnapshot, bridge.mainLoopPhaseStatsSnapshot("history-watch"), bridge.mainLoopPhaseStatsSnapshot("poll"), backlog, backlogErr)
 	}
 	oldGeneration := bridge.currentLeaseGeneration()
 	if oldGeneration <= 0 {
@@ -2665,11 +3208,17 @@ func TestTeamsListenFalseOwnerLossCancelsHistoryWatchBeforeStaleCommit(t *testin
 		t.Fatal("listener did not stop after explicit owner-loss test cancellation")
 	}
 	replacement := teamstore.MachineRecord{ID: "owner-loss-replacement", ScopeID: bridge.scope.ID, Kind: teamstore.MachineKindPrimary}
+	// A replacement follows the same startup protocol as the listener: a prior
+	// owner-loss cancellation may have left a fail-closed schema marker behind,
+	// so structural preparation must precede the new lease claim.
+	if err := store.PrepareSQLiteSchemaBeforeOwner(context.Background()); err != nil {
+		t.Fatalf("prepare replacement schema: %v", err)
+	}
 	decision, err := store.ClaimControlLease(context.Background(), teamstore.ControlLeaseClaim{
 		Scope: bridge.scope, Machine: replacement, Duration: time.Minute, Now: time.Now().UTC(),
 	})
 	if err != nil || decision.Mode != teamstore.LeaseModeActive {
-		t.Fatalf("claim replacement owner: mode=%v err=%v", decision.Mode, err)
+		t.Fatalf("claim replacement owner: mode=%v err=%v sqlite=%s", decision.Mode, err, listenerRecoverySQLiteSchemaDiagnostic(store))
 	}
 	state, err := store.HistoryWatchState(context.Background())
 	if err != nil {
@@ -2678,6 +3227,31 @@ func TestTeamsListenFalseOwnerLossCancelsHistoryWatchBeforeStaleCommit(t *testin
 	if got := state.HistoryWatch[checkpoint.ID]; got.Offset != checkpoint.Offset {
 		t.Fatalf("stale owner advanced history-watch offset from %d to %d", checkpoint.Offset, got.Offset)
 	}
+}
+
+func listenerRecoverySQLiteSchemaDiagnostic(store *teamstore.Store) string {
+	if store == nil {
+		return "store=nil"
+	}
+	path := filepath.Join(filepath.Dir(store.Path()), teamstore.SQLiteFileName)
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return fmt.Sprintf("path=%s open=%v", path, err)
+	}
+	defer db.Close()
+	var marker, markerErr string
+	if err := db.QueryRow(`SELECT CAST(value AS TEXT) FROM state_meta WHERE key = 'sqlite_schema_preparation_version'`).Scan(&marker); err != nil {
+		markerErr = err.Error()
+	}
+	var pointer string
+	if err := db.QueryRow(`SELECT CAST(value AS TEXT) FROM state_meta WHERE key = 'state_json_revision'`).Scan(&pointer); err != nil {
+		pointer = "error:" + err.Error()
+	}
+	var pollCount int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM chat_polls`).Scan(&pollCount); err != nil {
+		pollCount = -1
+	}
+	return fmt.Sprintf("path=%s marker=%q marker_err=%q state_json_revision=%q chat_polls=%d", path, marker, markerErr, pointer, pollCount)
 }
 
 // TestTeamsListenFalseOwnerLossFencesCooperativeTurn proves that a live
@@ -3995,6 +4569,96 @@ func TestTeamsListenFalseMalformedActiveSQLitePollDoesNotBaseline(t *testing.T) 
 	listener.stop(t)
 }
 
+// TestPollSQLiteOpaquePendingReceiptIsRepairedBeforeCapability exercises a
+// type error in an unrelated top-level ChatPoll field while the durable page
+// receipt remains valid. The receipt must survive decoding, one local repair
+// must clear the opaque fence, and the page must be handled exactly once
+// without issuing a fresh Graph head request.
+func TestPollSQLiteOpaquePendingReceiptIsRepairedBeforeCapability(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	chatID := "chat-opaque-pending-receipt"
+	now := time.Now().UTC().Add(-time.Minute)
+	message := bridgePollMessage("opaque-pending-message", now.Format(time.RFC3339Nano), "opaque pending prompt")
+	message.ChatID = chatID
+	requestPath := chatMessagesPath(chatID, 20, time.Time{})
+	page, err := pendingPageFromWindow(chatID, requestPath, pollFrontierHead, 0, MessageWindow{Messages: []ChatMessage{message}}, false)
+	if err != nil {
+		t.Fatalf("build pending receipt: %v", err)
+	}
+	page.PollRole = string(inboundPollRoleWork)
+	page.ReceiptID = pendingPageReceiptID(page)
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.ChatPolls[chatID] = teamstore.ChatPollState{
+			ChatID: chatID, Seeded: true, PollState: inboundPollStateWarm,
+			PendingPage: page, UpdatedAt: now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed opaque pending receipt: %v", err)
+	}
+	migration, err := store.MigrateLargeStateToSQLite(ctx, 0)
+	if err != nil {
+		t.Fatalf("migrate opaque pending receipt fixture: %v", err)
+	}
+	sqlitePath := migration.Path
+	if strings.TrimSpace(sqlitePath) == "" {
+		sqlitePath = filepath.Join(filepath.Dir(store.Path()), teamstore.SQLiteFileName)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close fixture before corrupting opaque pending receipt: %v", err)
+	}
+	db, err := sql.Open("sqlite", sqlitePath)
+	if err != nil {
+		t.Fatalf("open opaque pending receipt SQLite fixture: %v", err)
+	}
+	pendingRaw, err := json.Marshal(page)
+	if err != nil {
+		_ = db.Close()
+		t.Fatalf("marshal pending receipt: %v", err)
+	}
+	corruptRaw, err := json.Marshal(map[string]json.RawMessage{
+		"chat_id":      json.RawMessage(fmt.Sprintf("%q", chatID)),
+		"seeded":       json.RawMessage(`true`),
+		"state":        json.RawMessage(`123`),
+		"pending_page": pendingRaw,
+	})
+	if err != nil {
+		_ = db.Close()
+		t.Fatalf("marshal corrupt poll row: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE chat_polls SET json = ? WHERE chat_id = ?`, corruptRaw, chatID); err != nil {
+		_ = db.Close()
+		t.Fatalf("corrupt opaque pending receipt row: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close corrupted opaque pending receipt fixture: %v", err)
+	}
+	reopened, err := teamstore.Open(store.Path())
+	if err != nil {
+		t.Fatalf("reopen opaque pending receipt fixture: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	bridge := newBridgeTestBridge(nil, reopened, &recordingExecutor{})
+	var handled []string
+	if _, err := bridge.pollChat(ctx, chatID, 20, func(_ context.Context, _ ChatMessage, text string) error {
+		handled = append(handled, text)
+		return nil
+	}); err != nil {
+		t.Fatalf("replay opaque pending receipt: %v", err)
+	}
+	if len(handled) != 1 || handled[0] != "opaque pending prompt" {
+		t.Fatalf("handled opaque pending receipt = %#v, want one prompt", handled)
+	}
+	poll, found, err := reopened.ChatPoll(ctx, chatID)
+	if err != nil || !found {
+		t.Fatalf("read repaired opaque pending poll: found=%v err=%v poll=%#v", found, err, poll)
+	}
+	if poll.RecoveryRequired || poll.RecoverySourceHash != "" || poll.PendingPage != nil || poll.Attempt != nil {
+		t.Fatalf("opaque pending receipt retained transient recovery state: %#v", poll)
+	}
+}
+
 // TestPollMissingFrontierEstablishedSessionDoesNotBaseline covers the other
 // half of the row-local recovery boundary: a partial migration or repair may
 // remove a valid chat_polls row without corrupting the session row. An
@@ -4816,7 +5480,12 @@ func runListenerRecoveryPollFrontierSurvivesReopen(t *testing.T, useSQLite bool)
 	// finite so a real liveness failure still fails, but give the complete
 	// Graph/outbox/state transition the same backlog budget as the other
 	// recovery fixtures.
-	progressTimeout := listenerRecoveryExtendedProgressTimeout
+	// This vertical fixture crosses two durable poll generations and a full
+	// SQLite/Graph continuation. Under -race the same safe transition can take
+	// longer than the ordinary 20-second hosted-runner margin; keep the
+	// liveness bound finite but use the multi-step budget so instrumentation
+	// does not turn a correct frontier test into a false failure.
+	progressTimeout := listenerRecoveryMultiStepProgressTimeout
 	ctx := context.Background()
 	storePath := filepath.Join(t.TempDir(), "state.json")
 	chatID := "chat-reopen-frontier"
@@ -5029,10 +5698,9 @@ func runListenerRecoveryPollContinuationSurvivesReopenBeforeDrain(t *testing.T, 
 		first.stop(t)
 		t.Fatalf("timed out waiting for durable continuation before restart: turn=%#v poll=%#v turns=%#v requests=%v phase=%#v", firstTurn, lastState.ChatPolls[chatID], lastState.Turns, graphState.requestsSnapshot(), firstBridge.mainLoopPhaseStatsSnapshot("poll"))
 	}
-	if got := countListenerRecoverySentBodies(graphState.sentSnapshot(), "LISTENER_RECOVERY_REOPEN_BEFORE_DRAIN_FINAL_1"); got != 1 {
-		first.stop(t)
-		t.Fatalf("first page final count before restart=%d, want one", got)
-	}
+	waitListenerRecovery(t, func() bool {
+		return countListenerRecoverySentBodies(graphState.sentSnapshot(), "LISTENER_RECOVERY_REOPEN_BEFORE_DRAIN_FINAL_1") == 1
+	}, listenerRecoveryDurableIOProgressTimeout, "first-page final before continuation restart")
 
 	first.stop(t)
 	graphState.mu.Lock()
@@ -5079,9 +5747,32 @@ func runListenerRecoveryPollContinuationSurvivesReopenBeforeDrain(t *testing.T, 
 		state, _ := recoveredStore.Load(ctx)
 		t.Fatalf("replacement owner did not execute the persisted continuation page; state=%#v requests=%v", state, graphState.requestsSnapshot())
 	}
-	waitListenerRecovery(t, func() bool {
+	if !waitListenerRecoveryResult(func() bool {
 		return countListenerRecoverySentBodies(graphState.sentSnapshot(), "LISTENER_RECOVERY_REOPEN_BEFORE_DRAIN_FINAL_2") == 1
-	}, listenerRecoveryDurableIOProgressTimeout, "replacement continuation final")
+	}, listenerRecoveryDurableIOProgressTimeout) {
+		state, loadErr := recoveredStore.Load(ctx)
+		outboxSummary := make([]string, 0)
+		if loadErr == nil {
+			for id, outbox := range state.OutboxMessages {
+				if outbox.TeamsChatID != chatID {
+					continue
+				}
+				outboxSummary = append(outboxSummary, fmt.Sprintf("%s status=%s seq=%d next=%s last=%s err=%q token=%t", id, outbox.Status, outbox.Sequence, outbox.NextAttemptAt.Format(time.RFC3339Nano), outbox.LastSendAttempt.Format(time.RFC3339Nano), outbox.LastSendError, strings.TrimSpace(outbox.SendAttemptToken) != ""))
+			}
+			sort.Strings(outboxSummary)
+		}
+		requests := graphState.requestsSnapshot()
+		if len(requests) > 12 {
+			requests = requests[len(requests)-12:]
+		}
+		select {
+		case err := <-listener.done:
+			listener.err = err
+			t.Fatalf("replacement continuation listener exited before final: %v; load=%v outbox=%v lastRequests=%#v errors=%#v outboxPhase=%#v pollPhase=%#v", err, loadErr, outboxSummary, requests, graphState.errorsSnapshot(), recoveredBridge.mainLoopPhaseStatsSnapshot("outbox"), recoveredBridge.mainLoopPhaseStatsSnapshot("poll"))
+		default:
+			t.Fatalf("timed out waiting for replacement continuation final; load=%v outbox=%v lastRequests=%#v errors=%#v outboxPhase=%#v pollPhase=%#v", loadErr, outboxSummary, requests, graphState.errorsSnapshot(), recoveredBridge.mainLoopPhaseStatsSnapshot("outbox"), recoveredBridge.mainLoopPhaseStatsSnapshot("poll"))
+		}
+	}
 
 	firstCalls := firstExecutor.callsSnapshot()
 	if len(firstCalls) != 1 || !strings.Contains(firstCalls[0], "REOPEN_BEFORE_DRAIN_PROMPT_2") {
@@ -5090,6 +5781,15 @@ func runListenerRecoveryPollContinuationSurvivesReopenBeforeDrain(t *testing.T, 
 	recoveredCalls := recoveredExecutor.callsSnapshot()
 	if len(recoveredCalls) != 1 || !strings.Contains(recoveredCalls[0], "REOPEN_BEFORE_DRAIN_PROMPT_1") {
 		t.Fatalf("replacement owner calls=%v, want only older continuation-page prompt", recoveredCalls)
+	}
+	recoveredState, err := recoveredStore.Load(ctx)
+	if err != nil {
+		t.Fatalf("load replacement continuation state: %v", err)
+	}
+	oldFinal := recoveredState.OutboxMessages["outbox:turn:inbound:"+chatID+":reopen-before-drain-message-2:final"]
+	oldFinalUnknown := oldFinal.Status == teamstore.OutboxStatusSending && teamstore.OutboxSendIsAmbiguous(oldFinal) && strings.TrimSpace(oldFinal.TeamsMessageID) == ""
+	if oldFinal.Status != teamstore.OutboxStatusSent && !oldFinalUnknown {
+		t.Fatalf("replacement owner changed unknown first-page final outcome: %#v", oldFinal)
 	}
 	if got := countListenerRecoverySentBodies(graphState.sentSnapshot(), "LISTENER_RECOVERY_REOPEN_BEFORE_DRAIN_FINAL_1"); got != 1 {
 		t.Fatalf("first page final was replayed after restart: count=%d", got)

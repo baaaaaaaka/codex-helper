@@ -1111,6 +1111,36 @@ func TestDelegateInboxStartTreatsCommitThenTimeoutAsVisible(t *testing.T) {
 	}
 }
 
+func TestDelegateInboxUnknownPOSTIsNotRetriedAfterVisibilityReadFailure(t *testing.T) {
+	now := time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC)
+	graph := newFakeDelegateRegistryGraph()
+	graph.sendErrBeforeCommit = errors.New("transport outcome unknown")
+	graph.listErrAfterSend = errors.New("visibility read unavailable")
+	path := filepath.Join(t.TempDir(), "routes.json")
+	request := mustDelegateRequestForCLITest(t, now)
+	request.InboxRef = "inbox-ref-b"
+	session := &delegateRegistrySession{graph: graph, chatID: "chat-inbox-ref-b", close: func(context.Context) error { return nil }}
+	opts := &delegateOptions{routeStorePath: path, now: func() time.Time { return now }}
+	if _, err := appendDelegateInboxRecordWithOutbox(opts, session, session.chatID, request.InboxRef, request); err == nil {
+		t.Fatal("unknown POST was reported as successful")
+	}
+	store, err := delegation.LoadStore(path)
+	if err != nil {
+		t.Fatalf("load unknown outbox: %v", err)
+	}
+	outbox, ok := store.OutboxForRecordID(request.RecordID)
+	if !ok || outbox.Status != delegation.OutboxUnknown || outbox.Attempts != 1 {
+		t.Fatalf("unknown outbox = %#v ok=%v, want unknown with one attempt", outbox, ok)
+	}
+	graph.listErrAfterSend = nil
+	if _, err := appendDelegateInboxRecordWithOutbox(opts, session, session.chatID, request.InboxRef, request); err == nil {
+		t.Fatal("retry with an unknown POST witness was accepted")
+	}
+	if graph.sendCount != 1 {
+		t.Fatalf("unknown POST was retried: send count=%d, want one", graph.sendCount)
+	}
+}
+
 func TestDelegateStartRejectsStaleCandidateTokenGeneration(t *testing.T) {
 	now := time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC)
 	machineGraph := newFakeMachineRegistryGraph()
@@ -1565,11 +1595,13 @@ func containsString(values []string, want string) bool {
 }
 
 type fakeDelegateRegistryGraph struct {
-	messagesByChat     map[string][]teams.ChatMessage
-	chatsByRef         map[string]string
-	sendCount          int
-	windowListCount    int
-	sendErrAfterCommit error
+	messagesByChat      map[string][]teams.ChatMessage
+	chatsByRef          map[string]string
+	sendCount           int
+	windowListCount     int
+	sendErrAfterCommit  error
+	sendErrBeforeCommit error
+	listErrAfterSend    error
 }
 
 func newFakeDelegateRegistryGraph() *fakeDelegateRegistryGraph {
@@ -1585,6 +1617,11 @@ func (g *fakeDelegateRegistryGraph) SendHTML(_ context.Context, chatID string, c
 	msg := teams.ChatMessage{ID: id}
 	msg.Body.Content = content
 	chatID = strings.TrimSpace(chatID)
+	if g.sendErrBeforeCommit != nil {
+		err := g.sendErrBeforeCommit
+		g.sendErrBeforeCommit = nil
+		return teams.ChatMessage{}, err
+	}
 	g.messagesByChat[chatID] = append([]teams.ChatMessage{msg}, g.messagesByChat[chatID]...)
 	if g.sendErrAfterCommit != nil {
 		err := g.sendErrAfterCommit
@@ -1595,6 +1632,9 @@ func (g *fakeDelegateRegistryGraph) SendHTML(_ context.Context, chatID string, c
 }
 
 func (g *fakeDelegateRegistryGraph) ListMessages(_ context.Context, chatID string, top int) ([]teams.ChatMessage, error) {
+	if g.listErrAfterSend != nil {
+		return nil, g.listErrAfterSend
+	}
 	messages := g.messagesByChat[strings.TrimSpace(chatID)]
 	if top <= 0 || top > len(messages) {
 		top = len(messages)
@@ -1607,10 +1647,16 @@ func (g *fakeDelegateRegistryGraph) ListMessagesExactTopWithoutRateLimitRetry(ct
 }
 
 func (g *fakeDelegateRegistryGraph) ListMessagesWindow(_ context.Context, chatID string, top int, _ time.Time) (teams.MessageWindow, error) {
+	if g.listErrAfterSend != nil {
+		return teams.MessageWindow{}, g.listErrAfterSend
+	}
 	return g.listMessagesWindowFromOffset(chatID, top, 0), nil
 }
 
 func (g *fakeDelegateRegistryGraph) ListMessagesWindowFromPath(_ context.Context, path string) (teams.MessageWindow, error) {
+	if g.listErrAfterSend != nil {
+		return teams.MessageWindow{}, g.listErrAfterSend
+	}
 	var chatID string
 	var top, offset int
 	if _, err := fmt.Sscanf(path, "fake-window:%s %d %d", &chatID, &top, &offset); err != nil {

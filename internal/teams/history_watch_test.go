@@ -177,6 +177,65 @@ func TestHistoryWatchMandatoryRecoveryIncludesUnprovedAndRecoveryFlags(t *testin
 	}
 }
 
+func TestHistoryWatchBacklogRecoveryExcludesOrdinaryDirtyPaths(t *testing.T) {
+	root := t.TempDir()
+	ordinary := filepath.Join(root, "ordinary.jsonl")
+	mandatory := filepath.Join(root, "mandatory.jsonl")
+	unknown := filepath.Join(root, "unindexed.jsonl")
+	state := teamstore.State{HistoryWatch: map[string]teamstore.HistoryWatchCheckpoint{
+		historyWatchCheckpointID(ordinary): {
+			Path: ordinary, Size: 128, Offset: 128, SourceFingerprint: "trusted",
+		},
+		historyWatchCheckpointID(mandatory): {
+			Path:                 mandatory,
+			Size:                 128,
+			Offset:               128,
+			SourceRewriteBlocked: true,
+		},
+	}}
+
+	got := historyWatchMandatoryRecoveryPaths(state, []string{ordinary, mandatory, unknown})
+	want := []string{cleanComparablePath(mandatory)}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("backlog history recovery paths = %#v, want only mandatory path %#v", got, want)
+	}
+}
+
+func TestHistoryWatchBacklogFairnessDiscoversRecentPathBeforeBaselineReady(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	root := newBridgeTestCodexRoot(t)
+	now := time.Now().UTC()
+	path := filepath.Join(root, "sessions", now.Format("2006"), now.Format("01"), now.Format("02"), "fresh.jsonl")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("create recent history directory: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("recent\n"), 0o600); err != nil {
+		t.Fatalf("write recent history path: %v", err)
+	}
+	bridge := &Bridge{store: store, scope: teamstore.ScopeIdentity{CodexHome: root}, transcriptSyncWorkerCount: 1}
+	var selected string
+	bridge.historyWatchPathHook = func(_ context.Context, got string) error {
+		selected = got
+		return context.Canceled
+	}
+
+	err := bridge.syncCodexHistoryFinalsForBacklogWithDiscovery(ctx, now, true)
+	if selected != cleanComparablePath(path) {
+		t.Fatalf("backlog fairness selected %q, want recent unindexed path %q; err=%v", selected, cleanComparablePath(path), err)
+	}
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("backlog fairness error = %v, want bounded worker cancellation", err)
+	}
+	state, err := store.HistoryWatchState(ctx)
+	if err != nil {
+		t.Fatalf("read history watch state: %v", err)
+	}
+	if !state.HistoryWatchReady.IsZero() {
+		t.Fatalf("fairness discovery established a baseline: ready=%s", state.HistoryWatchReady)
+	}
+}
+
 func TestHistoryWatchDirtyPathsRetainsFailedPathUntilAcknowledged(t *testing.T) {
 	changedPath := filepath.Join(t.TempDir(), "changed.jsonl")
 	recentPath := filepath.Join(t.TempDir(), "recent.jsonl")
@@ -262,6 +321,40 @@ func TestHistoryWatchWorkerStopsQueuedJobsAfterProcessWideFailure(t *testing.T) 
 	}
 	if attempts != 1 {
 		t.Fatalf("history workers started %d queued jobs after lease loss, want 1", attempts)
+	}
+}
+
+func TestHistoryWatchBudgetTimeoutIsDeferredWithoutHidingParentFailure(t *testing.T) {
+	bridge := &Bridge{transcriptSyncWorkerCount: 1}
+	bridge.historyWatchPathHook = func(ctx context.Context, _ string) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	parent, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	err := bridge.runHistoryWatchSyncJobs(parent, []string{"/history/slow.jsonl"}, time.Now())
+	if err == nil || !isHistoryWatchJobDeferred(err) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("history child timeout = %v, want typed bounded deferral", err)
+	}
+
+	bridge = &Bridge{transcriptSyncWorkerCount: 1}
+	bridge.historyWatchPathHook = func(context.Context, string) error {
+		return teamstore.ErrControlLeaseNotHeld
+	}
+	if err := bridge.runHistoryWatchSyncJobs(context.Background(), []string{"/history/lease-loss.jsonl"}, time.Now()); !teamstore.IsProcessWideStateError(err) {
+		t.Fatalf("history parent/lease failure = %v, want process-wide lease error", err)
+	}
+
+	bridge = &Bridge{}
+	deferred := &historyWatchJobDeferredError{Path: "/history/slow.jsonl", Err: context.DeadlineExceeded}
+	if err := bridge.runMainLoopPhase(context.Background(), "history-watch", func(context.Context) error {
+		return deferred
+	}); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("history phase returned %v, want child deadline", err)
+	}
+	stats := bridge.mainLoopPhaseStatsSnapshot("history-watch")
+	if stats.Errors != 0 || stats.Deferred != 1 {
+		t.Fatalf("history deferred stats = %#v, want errors=0 deferred=1", stats)
 	}
 }
 

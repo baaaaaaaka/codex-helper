@@ -652,13 +652,21 @@ func newTeamsChatQuarantineCmd() *cobra.Command {
 				return err
 			}
 			defer st.Close()
-			report, err := st.QuarantineSession(cmd.Context(), teamsstore.SessionQuarantineRequest{
+			expectedOwner := teamsstore.OwnerMetadata{}
+			expectOwner := target.Owner != nil
+			if expectOwner {
+				expectedOwner = *target.Owner
+			}
+			report, applied, err := st.QuarantineSessionIfOwnerSame(cmd.Context(), expectedOwner, expectOwner, teamsstore.SessionQuarantineRequest{
 				SessionID: target.Session.ID,
 				Reason:    firstNonEmptyString(strings.TrimSpace(opts.Reason), "manual Teams chat quarantine"),
 				Source:    "teams_chat_quarantine_cli",
 			})
 			if err != nil {
 				return err
+			}
+			if !applied {
+				return fmt.Errorf("Teams bridge owner changed while quarantining %s; retry the maintenance command", target.Path)
 			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams session quarantined: %s\nStore: %s\nChat: %s\nInterrupted turns: %d\nIgnored inbound: %d\nSkipped outbox: %d\n", report.Session.ID, target.Path, report.Session.TeamsChatID, len(report.InterruptedTurnIDs), len(report.IgnoredInboundIDs), len(report.SkippedOutboxIDs))
 			return nil
@@ -695,9 +703,17 @@ func newTeamsChatUnquarantineCmd() *cobra.Command {
 				return err
 			}
 			defer st.Close()
-			report, err := st.UnquarantineSession(cmd.Context(), teamsstore.SessionUnquarantineRequest{SessionID: target.Session.ID})
+			expectedOwner := teamsstore.OwnerMetadata{}
+			expectOwner := target.Owner != nil
+			if expectOwner {
+				expectedOwner = *target.Owner
+			}
+			report, applied, err := st.UnquarantineSessionIfOwnerSame(cmd.Context(), expectedOwner, expectOwner, teamsstore.SessionUnquarantineRequest{SessionID: target.Session.ID})
 			if err != nil {
 				return err
+			}
+			if !applied {
+				return fmt.Errorf("Teams bridge owner changed while unquarantining %s; retry the maintenance command", target.Path)
 			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams session unquarantined: %s\nStore: %s\nChat: %s\nPrevious inbound/turn/outbox records were not replayed.\n", report.Session.ID, target.Path, report.Session.TeamsChatID)
 			return nil
@@ -794,10 +810,6 @@ func openTeamsChatMaintenanceStore(ctx context.Context, target teamsChatMaintena
 		if !stale && !locallyDead {
 			_ = st.Close()
 			return nil, fmt.Errorf("Teams bridge owner is active in %s: pid=%d host=%s; stop the service first or use automatic in-process containment", target.Path, owner.PID, owner.Hostname)
-		}
-		if _, err := st.ClearOwnerIfSame(ctx, owner); err != nil {
-			_ = st.Close()
-			return nil, fmt.Errorf("clear stale Teams bridge owner in %s: %w", target.Path, err)
 		}
 	}
 	return st, nil
@@ -2142,14 +2154,14 @@ func recoverTeamsStore(ctx context.Context, path string, force bool, staleAfter 
 		return fmt.Errorf("Teams bridge owner is active in %s: pid=%d host=%s active_session=%s active_turn=%s; run `teams drain` first or use `teams recover --force` if the process is gone", path, owner.PID, owner.Hostname, owner.ActiveSessionID, owner.ActiveTurnID)
 	}
 	if ok && (force || teamsstore.IsStale(owner, staleAfter, time.Now())) {
-		if err := st.ClearOwner(ctx); err != nil {
-			return err
-		}
 		summary.ClearedOwners = append(summary.ClearedOwners, fmt.Sprintf("%s pid=%d host=%s active_session=%s active_turn=%s", path, owner.PID, owner.Hostname, owner.ActiveSessionID, owner.ActiveTurnID))
 	}
-	report, err := st.Recover(ctx)
+	report, applied, err := st.RecoverIfOwnerSame(ctx, owner, ok)
 	if err != nil {
 		return err
+	}
+	if !applied {
+		return fmt.Errorf("Teams bridge owner changed while recovering %s; retry recovery", path)
 	}
 	for _, id := range report.InterruptedTurnIDs {
 		summary.RecoveredTurns = append(summary.RecoveredTurns, path+" "+id)

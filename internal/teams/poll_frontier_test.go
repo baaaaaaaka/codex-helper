@@ -3,6 +3,7 @@ package teams
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -45,6 +47,76 @@ func TestChatMessagesGapPathUsesSupportedExclusiveDateOperators(t *testing.T) {
 	crossedFilter := "lastModifiedDateTime gt " + formatGraphDateTimeBound(lower) + " and lastModifiedDateTime lt " + formatGraphDateTimeBound(lower)
 	if got := mustParseTestURL(t, crossed).Query().Get("$filter"); got != crossedFilter {
 		t.Fatalf("crossed gap filter = %q, want impossible bounded interval %q", got, crossedFilter)
+	}
+}
+
+func TestChatMessagesHeadPathUsesSupportedExclusiveDateOperator(t *testing.T) {
+	modifiedAfter := time.Date(2026, 9, 1, 12, 0, 0, 123456789, time.UTC)
+	parsed, err := url.Parse(chatMessagesPath("chat-head-filter-contract", 20, modifiedAfter))
+	if err != nil {
+		t.Fatalf("parse head path: %v", err)
+	}
+	filter := parsed.Query().Get("$filter")
+	if strings.Contains(filter, " ge ") || strings.Contains(filter, " le ") {
+		t.Fatalf("head filter uses unsupported inclusive operator: %q", filter)
+	}
+	want := "lastModifiedDateTime gt " + formatGraphDateTimeBound(modifiedAfter)
+	if filter != want {
+		t.Fatalf("head filter = %q, want %q", filter, want)
+	}
+	if parsed.Query().Get("$orderby") != "lastModifiedDateTime desc" {
+		t.Fatalf("head order = %q, want descending lastModifiedDateTime", parsed.Query().Get("$orderby"))
+	}
+	if !allowedMessagesQuery(parsed.Query()) {
+		t.Fatalf("production head query was rejected by the Graph request allow-list: %q", parsed.RawQuery)
+	}
+}
+
+func TestPollFrontierGraphReadQueryShapesStayBoundedAcrossLanes(t *testing.T) {
+	now := time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC)
+	chatID := "chat-query-contract"
+	cases := []struct {
+		name string
+		path string
+	}{
+		{name: "unseeded-head", path: chatMessagesPath(chatID, 20, time.Time{})},
+		{name: "seeded-head", path: chatMessagesPath(chatID, 20, now.Add(-time.Minute))},
+		{name: "gap-recovery", path: chatMessagesGapPath(chatID, 20, now.Add(-time.Hour), now.Add(-time.Minute))},
+		{name: "opaque-continuation", path: "/chats/" + chatID + "/messages?$top=20&$skiptoken=opaque-provider-token"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			parsed := mustParseTestURL(t, tc.path)
+			if !isChatMessagesPath(parsed.Path) {
+				t.Fatalf("query path %q is not a chat message collection", parsed.Path)
+			}
+			if !allowedMessagesQuery(parsed.Query()) {
+				t.Fatalf("Graph read query is outside the supported message allow-list: %q", parsed.RawQuery)
+			}
+			filter := strings.ToLower(parsed.Query().Get("$filter"))
+			if strings.Contains(filter, " ge ") || strings.Contains(filter, " le ") || strings.Contains(filter, " or ") {
+				t.Fatalf("Graph read query contains an unsupported or widening filter: %q", filter)
+			}
+			if filter != "" && parsed.Query().Get("$orderby") != "lastModifiedDateTime desc" {
+				t.Fatalf("filtered Graph read omitted descending order: %q", parsed.RawQuery)
+			}
+		})
+	}
+
+	// The scheduler must select the already durable continuation as the sole
+	// next page operation. It must not add a second head read in the same poll
+	// quantum merely because the chat is active.
+	frontier, path, _ := pollPageRequestForState(chatID, 20, inboundPollRoleWork, teamstore.ChatPollState{
+		ChatID:             chatID,
+		Seeded:             true,
+		ContinuationPath:   "/chats/" + chatID + "/messages?$top=20&$skiptoken=durable",
+		LastModifiedCursor: now.Add(-time.Hour),
+	})
+	if frontier != pollFrontierContinuation {
+		t.Fatalf("durable continuation frontier = %q, want %q", frontier, pollFrontierContinuation)
+	}
+	if path != "/chats/"+chatID+"/messages?$top=20&$skiptoken=durable" {
+		t.Fatalf("durable continuation path = %q, want opaque provider path", path)
 	}
 }
 
@@ -834,11 +906,14 @@ func TestPendingPageRepairIdentityIncludesDurableSemantics(t *testing.T) {
 		})
 	}
 	baseState := teamstore.ChatPollState{
-		ChatID:           base.ChatID,
-		PollRevision:     17,
-		ScheduleRevision: 4,
-		FrontierEpoch:    base.FrontierEpoch,
-		PendingPage:      base,
+		ChatID:             base.ChatID,
+		PollRevision:       17,
+		ScheduleRevision:   4,
+		FrontierEpoch:      base.FrontierEpoch,
+		RecoveryRequired:   true,
+		RecoveryReason:     "opaque poll field requires repair",
+		RecoverySourceHash: "repair-source-1",
+		PendingPage:        base,
 		Attempt: &teamstore.ChatPollAttempt{
 			ID: "attempt-repair", Owner: "owner-repair", ProcessIncarnation: "process-repair",
 			LeaseGeneration: 8, ExpectedPollRevision: 17, ExpectedScheduleRevision: 4,
@@ -851,6 +926,9 @@ func TestPendingPageRepairIdentityIncludesDurableSemantics(t *testing.T) {
 		"poll revision":     func(state *teamstore.ChatPollState) { state.PollRevision++ },
 		"schedule revision": func(state *teamstore.ChatPollState) { state.ScheduleRevision++ },
 		"frontier epoch":    func(state *teamstore.ChatPollState) { state.FrontierEpoch++ },
+		"recovery required": func(state *teamstore.ChatPollState) { state.RecoveryRequired = false },
+		"recovery reason":   func(state *teamstore.ChatPollState) { state.RecoveryReason = "different repair evidence" },
+		"recovery source":   func(state *teamstore.ChatPollState) { state.RecoverySourceHash = "repair-source-2" },
 		"attempt expiry": func(state *teamstore.ChatPollState) {
 			state.Attempt.ExpiresAt = state.Attempt.ExpiresAt.Add(time.Minute)
 		},
@@ -880,35 +958,67 @@ func TestPollFrontierMalformedPendingPageMovesToGapInsteadOfLivelocking(t *testi
 		t.Run(name, func(t *testing.T) {
 			ctx := context.Background()
 			store := newBridgeTestStore(t)
+			var pendingPage *teamstore.ChatPollPendingPage
+			if !useSQLite {
+				pendingPage = &teamstore.ChatPollPendingPage{
+					ReceiptID: "malformed-receipt",
+					ChatID:    "chat-malformed-page",
+					Frontier:  pollFrontierHead,
+				}
+			}
 			if err := store.Update(ctx, func(state *teamstore.State) error {
 				state.ChatPolls["chat-malformed-page"] = teamstore.ChatPollState{
-					ChatID:    "chat-malformed-page",
-					Seeded:    true,
-					PollState: inboundPollStateWarm,
-					PendingPage: &teamstore.ChatPollPendingPage{
-						ReceiptID: "malformed-receipt",
-						ChatID:    "chat-malformed-page",
-						Frontier:  pollFrontierHead,
-					},
+					ChatID:      "chat-malformed-page",
+					Seeded:      true,
+					PollState:   inboundPollStateWarm,
+					PendingPage: pendingPage,
 				}
 				return nil
 			}); err != nil {
 				t.Fatalf("seed malformed page: %v", err)
 			}
 			if useSQLite {
-				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+				migration, err := store.MigrateLargeStateToSQLite(ctx, 0)
+				if err != nil {
 					t.Fatalf("migrate malformed page: %v", err)
 				}
+				path := store.Path()
+				if err := store.Close(); err != nil {
+					t.Fatalf("close before malformed page injection: %v", err)
+				}
+				sqlitePath := migration.Path
+				if strings.TrimSpace(sqlitePath) == "" {
+					sqlitePath = filepath.Join(filepath.Dir(path), teamstore.SQLiteFileName)
+				}
+				db, err := sql.Open("sqlite", sqlitePath)
+				if err != nil {
+					t.Fatalf("open malformed page SQLite fixture: %v", err)
+				}
+				raw := []byte(`{"chat_id":"chat-malformed-page","seeded":true,"state":"warm","pending_page":{"receipt_id":"malformed-receipt","chat_id":"chat-malformed-page","frontier":"head"}}`)
+				if _, err := db.ExecContext(ctx, `UPDATE chat_polls SET json = ?, frontier_active = 1 WHERE chat_id = ?`, raw, "chat-malformed-page"); err != nil {
+					_ = db.Close()
+					t.Fatalf("inject malformed page SQLite row: %v", err)
+				}
+				if err := db.Close(); err != nil {
+					t.Fatalf("close malformed page SQLite fixture: %v", err)
+				}
+				reopened, err := teamstore.Open(path)
+				if err != nil {
+					t.Fatalf("reopen malformed page SQLite fixture: %v", err)
+				}
+				store = reopened
+				t.Cleanup(func() { _ = reopened.Close() })
 			}
 			bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
-			if _, err := bridge.pollChat(ctx, "chat-malformed-page", 20, func(context.Context, ChatMessage, string) error {
+			_, pollErr := bridge.pollChat(ctx, "chat-malformed-page", 20, func(context.Context, ChatMessage, string) error {
 				return nil
-			}); err == nil || !strings.Contains(err.Error(), "empty Graph request path") {
-				t.Fatalf("malformed page poll error = %v, want empty-path diagnostic", err)
-			}
+			})
 			poll, ok, err := store.ChatPoll(ctx, "chat-malformed-page")
 			if err != nil || !ok {
 				t.Fatalf("read repaired malformed page: ok=%v err=%v", ok, err)
+			}
+			if pollErr != nil && !strings.Contains(pollErr.Error(), "empty Graph request path") {
+				t.Fatalf("malformed page poll error = %v", pollErr)
 			}
 			if poll.PendingPage != nil || poll.Gap == nil || poll.Gap.QuarantinedPage == nil {
 				t.Fatalf("malformed page was not retired into gap evidence: %#v", poll)
@@ -1211,6 +1321,7 @@ func TestPollFrontierOversizedUserRecordRefetchesBeforeHandling(t *testing.T) {
 	mu.Lock()
 	refetchAllowed = true
 	mu.Unlock()
+	expireGraphReadGateForTest(t, bridge, store, "chat-oversized-user")
 	if _, err := bridge.pollChat(ctx, "chat-oversized-user", 20, handle); err != nil {
 		t.Fatalf("oversized user replay after refetch recovery: %v", err)
 	}
@@ -1927,6 +2038,81 @@ func TestPollFrontierPartialQuantumAdvancesDurableServiceAgeAcrossBackends(t *te
 	}
 }
 
+// TestPollFrontierPartialQuantumTreatsSuccessfulReadAsRecoveredWhileReceiptDrains
+// covers the retry boundary exercised by the real-data Docker run. A provider
+// error may be followed by a successful Graph page whose one-action quantum
+// leaves a durable receipt pending. The old error may remain as diagnostics,
+// but it must no longer be treated as an unrecovered retry gate or hide the
+// local receipt behind the provider backoff.
+func TestPollFrontierPartialQuantumTreatsSuccessfulReadAsRecoveredWhileReceiptDrains(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := newBridgeTestStore(t)
+			chatID := "chat-partial-recovered-retry"
+			lastErrorAt := now.Add(-time.Minute)
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				state.ChatPolls[chatID] = teamstore.ChatPollState{
+					ChatID:         chatID,
+					Seeded:         true,
+					PollState:      inboundPollStateCold,
+					NextPollAt:     lastErrorAt,
+					FailureCount:   2,
+					LastError:      "Graph messages failed: HTTP 503 Service Unavailable",
+					LastErrorAt:    lastErrorAt,
+					LastActivityAt: lastErrorAt,
+					PendingPage:    &teamstore.ChatPollPendingPage{ChatID: chatID, RequestPath: "/chats/" + chatID + "/messages", ReceiptID: "receipt-partial-recovered-retry", Frontier: "head", PollRole: "work"},
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed recovered partial retry: %v", err)
+			}
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate recovered partial retry: %v", err)
+				}
+			}
+			before, ok, err := store.ChatPoll(ctx, chatID)
+			if err != nil || !ok {
+				t.Fatalf("read recovered partial retry before attempt: ok=%v err=%v", ok, err)
+			}
+			started, acquired, err := store.BeginChatPollAttempt(ctx, teamstore.ChatPollAttemptRequest{
+				ChatID: chatID, Owner: "partial-recovered-owner", ProcessIncarnation: "partial-recovered-process",
+				ExpectedPollRole:     string(inboundPollRoleWork),
+				ExpectedPollRevision: before.PollRevision, HasExpectedPollRevision: true,
+				ExpectedFrontier:  pollFrontierIdentity(pollFrontierHead, before.PendingPage.RequestPath),
+				ExpectedReceiptID: before.PendingPage.ReceiptID,
+				Now:               now,
+			})
+			if err != nil || !acquired || started.Attempt == nil {
+				t.Fatalf("begin recovered partial retry: acquired=%v attempt=%#v err=%v", acquired, started.Attempt, err)
+			}
+			bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+			committed, err := bridge.commitPollAttemptPartial(ctx, chatID, started.Attempt.ID, started.PollRevision, pollMessageWindowResult{
+				ActivityAt: now, ActionLimitReached: true,
+			}, false)
+			if err != nil || !committed {
+				t.Fatalf("commit recovered partial retry: committed=%v err=%v", committed, err)
+			}
+			after, ok, err := store.ChatPoll(ctx, chatID)
+			if err != nil || !ok {
+				t.Fatalf("read recovered partial retry after attempt: ok=%v err=%v", ok, err)
+			}
+			if after.PendingPage == nil || after.LastSuccessfulPollAt.IsZero() || !after.LastSuccessfulPollAt.After(after.LastErrorAt) {
+				t.Fatalf("successful partial read did not retain a locally replayable recovered receipt: %#v", after)
+			}
+			if chatPollHasUnrecoveredRetryableError(after) {
+				t.Fatalf("successful partial read remained behind a retry gate: %#v", after)
+			}
+		})
+	}
+}
+
 // TestPollSchedulerContinuousPartialChatsRotateBeyondCycleCap proves the
 // scheduler-level consequence of the partial-quantum service-age rule. Nine
 // continuously due chats each retain a three-record pending page, while one
@@ -2407,6 +2593,9 @@ func TestPollFrontierGenericContinuationFailureUsesBoundedGap(t *testing.T) {
 		if _, err := bridge.pollChat(ctx, "chat-generic", 20, func(context.Context, ChatMessage, string) error { return nil }); err == nil {
 			t.Fatalf("generic continuation failure %d unexpectedly succeeded", attempt+1)
 		}
+		if attempt+1 < continuationFailureBudget {
+			expireGraphReadGateForTest(t, bridge, store, "chat-generic")
+		}
 	}
 	poll, ok, err := store.ChatPoll(ctx, "chat-generic")
 	if err != nil || !ok {
@@ -2457,6 +2646,24 @@ func TestPollFrontierRepeated429UsesBoundedGapWithoutDroppingContinuation(t *tes
 	}
 	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
 	for attempt := 0; attempt < continuationFailureBudget; attempt++ {
+		if attempt > 0 {
+			// The production fence must suppress an immediate duplicate Graph
+			// request after a 429. Advance only the test's durable retry clock so
+			// this test can exercise the bounded continuation-failure budget
+			// without sleeping for the provider's default 30-second deadline.
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				poll := state.ChatPolls["chat-429-frontier"]
+				poll.NextPollAt = time.Now().Add(-time.Second)
+				poll.BlockedUntil = time.Time{}
+				state.ChatPolls["chat-429-frontier"] = poll
+				return nil
+			}); err != nil {
+				t.Fatalf("advance repeated-429 test deadline: %v", err)
+			}
+			bridge.graphReadGateMu.Lock()
+			delete(bridge.graphReadChatLocalUntil, "chat-429-frontier")
+			bridge.graphReadGateMu.Unlock()
+		}
 		if _, err := bridge.pollChat(ctx, "chat-429-frontier", 20, func(context.Context, ChatMessage, string) error { return nil }); err == nil || !isGraphRateLimitError(err) {
 			t.Fatalf("repeated-429 continuation attempt %d error = %v, want Graph 429", attempt+1, err)
 		}

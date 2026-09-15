@@ -33,6 +33,35 @@ type driveUploadSessionCheckpoint struct {
 	Offset             int64
 }
 
+// errUploadSessionCheckpointIndeterminate means a persisted upload-session
+// witness exists, but it is not safe to resume or prove that the remote session
+// is gone. The caller must keep the outbox in its no-new-POST recovery lane.
+var errUploadSessionCheckpointIndeterminate = errors.New("upload session checkpoint outcome is indeterminate")
+
+// uploadSessionRateLimitError is returned for a 429 on an already-created
+// upload session. The request was explicitly rejected and the durable session
+// URL remains a safe resume witness; the outbox can therefore return to its
+// queued/backoff state without creating another session. It is deliberately
+// distinct from a 429 on createUploadSession, whose POST outcome is not safe
+// to replay after the request crossed the network boundary.
+type uploadSessionRateLimitError struct {
+	err error
+}
+
+func (e *uploadSessionRateLimitError) Error() string {
+	if e == nil || e.err == nil {
+		return "upload session rate limited"
+	}
+	return e.err.Error()
+}
+
+func (e *uploadSessionRateLimitError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
 type driveUploadChunkResponse struct {
 	NextExpectedRanges []string `json:"nextExpectedRanges"`
 }
@@ -197,6 +226,13 @@ func (g *GraphClient) transferHTTPClient() *http.Client {
 }
 
 func (g *GraphClient) doTransferRequest(ctx context.Context, req *http.Request) (*http.Response, error) {
+	return g.doTransferRequestWithOptions(ctx, req, graphRequestOptions{})
+}
+
+func (g *GraphClient) doTransferRequestWithOptions(ctx context.Context, req *http.Request, opts graphRequestOptions) (*http.Response, error) {
+	if err := runGraphRequestBeforeEachRequest(opts.beforeEachRequest); err != nil {
+		return nil, err
+	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -294,24 +330,58 @@ func (g *GraphClient) uploadDriveItemFromFileWithCheckpoint(ctx context.Context,
 	if size <= g.singlePutLimit() {
 		return g.uploadDriveItemSingleFileWithOptions(ctx, folder, name, f, size, contentType, opts)
 	}
-	// An upload-session URL is deliberately not retried forever. A 401/403/404/410
-	// means the server-side session is gone; recreate it a bounded number of
-	// times and restart from byte zero. Other failures stay fail-closed and are
-	// surfaced to the outbox retry policy.
+	// An upload-session URL is deliberately not retried forever. A checkpoint
+	// persisted by a previous attempt is an external-side-effect witness: even
+	// if Graph now says the session is gone, the last PUT may already have
+	// created/replaced the Drive item before the checkpoint advanced. Never
+	// create a second session from that witness without an exact remote
+	// reconciliation API. A session created during this call retains the
+	// bounded same-call expiry recovery only until its first durable checkpoint
+	// is written; after that it is the same external-side-effect witness.
 	var session *driveUploadSession
 	var offset int64
-	if checkpoint != nil && strings.TrimSpace(checkpoint.UploadURL) != "" && checkpoint.Offset >= 0 && checkpoint.Offset < size && g.uploadSessionCheckpointUsable(*checkpoint) {
+	resumedFromDurableCheckpoint := checkpoint != nil
+	checkpointHasURL := checkpoint != nil && strings.TrimSpace(checkpoint.UploadURL) != ""
+	if resumedFromDurableCheckpoint && !checkpointHasURL {
+		return DriveItem{}, fmt.Errorf("%w: persisted upload session URL is missing", errUploadSessionCheckpointIndeterminate)
+	}
+	if checkpointHasURL {
+		if checkpoint.Offset < 0 || checkpoint.Offset > size {
+			return DriveItem{}, fmt.Errorf("%w: offset %d is invalid for file size %d", errUploadSessionCheckpointIndeterminate, checkpoint.Offset, size)
+		}
 		candidate := driveUploadSession{
 			UploadURL:          strings.TrimSpace(checkpoint.UploadURL),
 			ExpirationDateTime: strings.TrimSpace(checkpoint.ExpirationDateTime),
 		}
-		if err := g.validateUploadSessionURL(candidate.UploadURL); err == nil {
-			if next, queryErr := g.queryUploadSessionOffset(ctx, candidate.UploadURL, size); queryErr == nil {
-				if next >= 0 && next <= size {
-					session = &candidate
-					offset = next
+		if err := g.validateUploadSessionURL(candidate.UploadURL); err != nil {
+			return DriveItem{}, fmt.Errorf("%w: %v", errUploadSessionCheckpointIndeterminate, err)
+		}
+		if expiry := strings.TrimSpace(candidate.ExpirationDateTime); expiry != "" {
+			expiresAt, err := time.Parse(time.RFC3339Nano, expiry)
+			if err != nil {
+				return DriveItem{}, fmt.Errorf("%w: invalid expiration time %q", errUploadSessionCheckpointIndeterminate, expiry)
+			}
+			if !time.Now().Before(expiresAt) {
+				return DriveItem{}, fmt.Errorf("%w: persisted upload session expired at %s", errUploadSessionCheckpointIndeterminate, expiresAt.Format(time.RFC3339Nano))
+			}
+		}
+		if checkpointHasURL {
+			if next, queryErr := g.queryUploadSessionOffset(ctx, candidate.UploadURL, size, opts); queryErr == nil {
+				if next < 0 || next > size {
+					return DriveItem{}, fmt.Errorf("%w: remote offset %d is invalid for file size %d", errUploadSessionCheckpointIndeterminate, next, size)
 				}
-			} else if !isExpiredUploadSessionError(queryErr) {
+				session = &candidate
+				offset = next
+			} else if isExpiredUploadSessionError(queryErr) {
+				// The provider response does not prove that the last accepted PUT
+				// did not create the item. Keep the durable witness unresolved and
+				// prevent a second createUploadSession POST.
+				return DriveItem{}, fmt.Errorf("%w: persisted upload session status is unavailable: %v", errUploadSessionCheckpointIndeterminate, queryErr)
+			} else if uploadSessionStatusQueryRateLimited(queryErr) {
+				// Reading the offset is a safe retry against the same durable
+				// session. A read-side 429 does not authorize a new session POST.
+				return DriveItem{}, &uploadSessionRateLimitError{err: queryErr}
+			} else {
 				return DriveItem{}, queryErr
 			}
 		}
@@ -329,10 +399,24 @@ func (g *GraphClient) uploadDriveItemFromFileWithCheckpoint(ctx context.Context,
 			if err := persist(driveUploadSessionCheckpoint{UploadURL: session.UploadURL, ExpirationDateTime: session.ExpirationDateTime, Offset: offset}); err != nil {
 				return DriveItem{}, err
 			}
+			// The callback has durably recorded the session URL. Do not let a
+			// later 404/410 or transport-unknown chunk result create a second
+			// session in this invocation.
+			resumedFromDurableCheckpoint = true
 		}
 		item, err := g.uploadDriveItemSession(ctx, *session, f, size, opts, offset, persist)
 		if err == nil {
 			return item, nil
+		}
+		var rateLimitErr *uploadSessionRateLimitError
+		if errors.As(err, &rateLimitErr) {
+			// A 429 from an already-created session is an explicit rejection of
+			// this PUT, not an unknown create-session outcome. Preserve the URL
+			// and let the caller apply the durable write gate before retrying.
+			return DriveItem{}, err
+		}
+		if resumedFromDurableCheckpoint {
+			return DriveItem{}, fmt.Errorf("%w: persisted upload session failed: %v", errUploadSessionCheckpointIndeterminate, err)
 		}
 		if !isExpiredUploadSessionError(err) || sessionRecreates >= g.transferRetries() || ctx.Err() != nil {
 			return DriveItem{}, err
@@ -381,7 +465,7 @@ func (g *GraphClient) uploadDriveItemSingleFileWithOptions(ctx context.Context, 
 		if contentType != "" {
 			req.Header.Set("Content-Type", contentType)
 		}
-		resp, err := g.doTransferRequest(ctx, req)
+		resp, err := g.doTransferRequestWithOptions(ctx, req, opts)
 		if err != nil {
 			if ctx.Err() != nil {
 				return DriveItem{}, ctx.Err()
@@ -534,19 +618,34 @@ func (g *GraphClient) uploadDriveItemSessionChunk(ctx context.Context, uploadURL
 		req.Header.Set("Content-Length", strconv.FormatInt(length, 10))
 		req.Header.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", offset, offset+length-1, total))
 		req.Header.Set("Content-Type", "application/octet-stream")
-		resp, err := g.doTransferRequest(ctx, req)
+		resp, err := g.doTransferRequestWithOptions(ctx, req, opts)
 		if err != nil {
-			if next, queryErr := g.queryUploadSessionOffset(ctx, uploadURL, total); queryErr == nil {
+			// A local capability fence proves that this attempt never crossed the
+			// network. Do not issue a compensating status GET: that read would both
+			// violate the same owner boundary and obscure the fact that the chunk
+			// was never sent.
+			var preflightErr *graphRequestPreflightError
+			if errors.As(err, &preflightErr) {
+				return DriveItem{}, 0, err
+			}
+			if next, queryErr := g.queryUploadSessionOffset(ctx, uploadURL, total, opts); queryErr == nil {
 				if rangeErr := validateUploadSessionNextOffset(next, offset, length, total); rangeErr != nil {
 					return DriveItem{}, 0, rangeErr
 				}
 				return DriveItem{}, next, nil
 			} else if isExpiredUploadSessionError(queryErr) {
-				// The body request may have failed before a response was
-				// available, but the status query is authoritative when it says
-				// that the pre-authenticated session no longer exists. Let the
-				// bounded outer loop recreate it instead of retrying a dead URL.
-				return DriveItem{}, 0, queryErr
+				// The body request crossed the HTTP boundary but its outcome is
+				// unknown. A 404/410 from the follow-up status query cannot prove
+				// that the PUT was rejected: the final PUT may have completed and
+				// Graph may have retired the session before the query arrived.
+				// Do not let the outer loop create a second upload session.
+				return DriveItem{}, 0, fmt.Errorf("%w: upload chunk outcome unknown after %v; status query failed: %v", errUploadSessionCheckpointIndeterminate, err, queryErr)
+			} else if opts.returnRateLimitWithoutRetry && uploadSessionStatusQueryRateLimited(queryErr) {
+				// The PUT outcome is still unknown, but the follow-up read was
+				// explicitly throttled. Preserve that typed gate so the caller
+				// retries the same durable upload session instead of treating the
+				// read as a generic transport failure.
+				return DriveItem{}, 0, &uploadSessionRateLimitError{err: queryErr}
 			}
 			if retries < g.transferRetries() && ctx.Err() == nil {
 				retries++
@@ -579,17 +678,25 @@ func (g *GraphClient) uploadDriveItemSessionChunk(ctx context.Context, uploadURL
 			return DriveItem{}, 0, closeErr
 		}
 		if resp.StatusCode == http.StatusRequestedRangeNotSatisfiable {
-			if next, queryErr := g.queryUploadSessionOffset(ctx, uploadURL, total); queryErr == nil {
+			if next, queryErr := g.queryUploadSessionOffset(ctx, uploadURL, total, opts); queryErr == nil {
 				if rangeErr := validateUploadSessionNextOffset(next, offset, length, total); rangeErr != nil {
 					return DriveItem{}, 0, rangeErr
 				}
 				return DriveItem{}, next, nil
 			} else if isExpiredUploadSessionError(queryErr) {
-				return DriveItem{}, 0, queryErr
+				// The PUT crossed the HTTP boundary; a 404/410 status query is
+				// not proof that the final range was rejected.
+				return DriveItem{}, 0, fmt.Errorf("%w: upload session status unavailable after HTTP 416: %v", errUploadSessionCheckpointIndeterminate, queryErr)
+			} else if opts.returnRateLimitWithoutRetry && uploadSessionStatusQueryRateLimited(queryErr) {
+				return DriveItem{}, 0, &uploadSessionRateLimitError{err: queryErr}
 			}
 		}
 		if resp.StatusCode >= 400 {
-			return DriveItem{}, 0, graphStatusError(http.MethodPut, "/drive/upload-session", resp, raw)
+			statusErr := graphStatusError(http.MethodPut, "/drive/upload-session", resp, raw)
+			if resp.StatusCode == http.StatusTooManyRequests && opts.returnRateLimitWithoutRetry {
+				return DriveItem{}, 0, &uploadSessionRateLimitError{err: statusErr}
+			}
+			return DriveItem{}, 0, statusErr
 		}
 		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusCreated {
 			if offset+length != total {
@@ -648,12 +755,20 @@ func isExpiredUploadSessionError(err error) bool {
 		statusErr.StatusCode == http.StatusGone
 }
 
-func (g *GraphClient) queryUploadSessionOffset(ctx context.Context, uploadURL string, total int64) (int64, error) {
+func uploadSessionStatusQueryRateLimited(err error) bool {
+	var statusErr *GraphStatusError
+	if !errors.As(err, &statusErr) {
+		return false
+	}
+	return statusErr.StatusCode == http.StatusTooManyRequests && strings.EqualFold(strings.TrimSpace(statusErr.Method), http.MethodGet)
+}
+
+func (g *GraphClient) queryUploadSessionOffset(ctx context.Context, uploadURL string, total int64, opts graphRequestOptions) (int64, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, uploadURL, nil)
 	if err != nil {
 		return 0, err
 	}
-	resp, err := g.doTransferRequest(ctx, req)
+	resp, err := g.doTransferRequestWithOptions(ctx, req, opts)
 	if err != nil {
 		return 0, err
 	}
@@ -816,7 +931,12 @@ func (g *GraphClient) downloadSharedDriveItemContentToFileWithOptions(ctx contex
 				refreshed = true
 				continue
 			}
-			if retryableTransferError(err) && retries < g.transferRetries() && ctx.Err() == nil {
+			// The no-rate-limit-retry API is used by Teams admission paths that
+			// must return a Graph 429 to the durable caller immediately. The URL
+			// resolver is itself a Graph GET, so a 429 from that first request must
+			// not fall through to the transfer retry loop and sleep/reissue it.
+			resolverRateLimited := opts.returnRateLimitWithoutRetry && errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusTooManyRequests
+			if retryableTransferError(err) && !resolverRateLimited && retries < g.transferRetries() && ctx.Err() == nil {
 				retries++
 				if err := g.sleepFor(ctx, g.retryDelay(nil, retries-1)); err != nil {
 					return "", 0, err

@@ -311,3 +311,65 @@ func TestUpdateChatPollSchedulesForOwnerConcurrentCASAcrossBackends(t *testing.T
 		})
 	}
 }
+
+func TestChatPollOwnerWrappersFailClosedAfterTakeover(t *testing.T) {
+	ctx := context.Background()
+	for _, backend := range []string{"json", "sqlite"} {
+		t.Run(backend, func(t *testing.T) {
+			store := newTestStore(t)
+			now := time.Now().UTC()
+			if err := store.Update(ctx, func(state *State) error {
+				state.ControlLease = ControlLease{
+					HolderMachineID: "owner-new",
+					Generation:      2,
+					Status:          ControlLeaseStatusActive,
+					LeaseUntil:      now.Add(time.Hour),
+					LastHeartbeat:   now,
+				}
+				state.ChatPolls["chat-owner-wrapper"] = ChatPollState{
+					ChatID: "chat-owner-wrapper", PollState: chatPollStateWarm,
+					PollRevision: 7, ScheduleRevision: 3,
+					NextPollAt: now, UpdatedAt: now,
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed takeover wrapper fixture: %v", err)
+			}
+			if backend == "sqlite" {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			before, ok, err := store.ChatPoll(ctx, "chat-owner-wrapper")
+			if err != nil || !ok {
+				t.Fatalf("load takeover wrapper fixture: ok=%v err=%v", ok, err)
+			}
+
+			staleMachine := "owner-old"
+			staleGeneration := int64(1)
+			if _, err := store.UpdateChatPollScheduleForOwner(ctx, ChatPollScheduleUpdate{
+				ChatID: "chat-owner-wrapper", PollState: chatPollStateBlocked,
+				BlockedUntil: now.Add(time.Hour), NextPollAt: now.Add(time.Hour),
+			}, staleMachine, staleGeneration); !errors.Is(err, ErrControlLeaseNotHeld) {
+				t.Fatalf("stale schedule wrapper error=%v, want ErrControlLeaseNotHeld", err)
+			}
+			if _, err := store.MarkChatPollParkNoticeSentForOwner(ctx, "chat-owner-wrapper", now.Add(time.Minute), staleMachine, staleGeneration); !errors.Is(err, ErrControlLeaseNotHeld) {
+				t.Fatalf("stale park-notice wrapper error=%v, want ErrControlLeaseNotHeld", err)
+			}
+			if _, err := store.RecordChatPollSuccessWithContinuationAndScheduleForOwner(ctx, "chat-owner-wrapper", now, true, false, 0, "", func(poll ChatPollState) (ChatPollScheduleUpdate, error) {
+				return ChatPollScheduleUpdate{ChatID: poll.ChatID, PollState: chatPollStateHot, NextPollAt: now}, nil
+			}, staleMachine, staleGeneration); !errors.Is(err, ErrControlLeaseNotHeld) {
+				t.Fatalf("stale success wrapper error=%v, want ErrControlLeaseNotHeld", err)
+			}
+			if err := store.RecordChatPollErrorWithBlockForOwner(ctx, "chat-owner-wrapper", "stale error", now.Add(time.Hour), staleMachine, staleGeneration); !errors.Is(err, ErrControlLeaseNotHeld) {
+				t.Fatalf("stale error wrapper error=%v, want ErrControlLeaseNotHeld", err)
+			}
+
+			after, ok, err := store.ChatPoll(ctx, "chat-owner-wrapper")
+			if err != nil || !ok {
+				t.Fatalf("load takeover wrapper result: ok=%v err=%v", ok, err)
+			}
+			if !reflect.DeepEqual(after, before) {
+				t.Fatalf("stale owner wrapper changed poll: before=%#v after=%#v", before, after)
+			}
+		})
+	}
+}

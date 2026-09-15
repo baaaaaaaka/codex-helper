@@ -76,6 +76,7 @@ func TestReasoningEffortWorkCommandPersistsAndQueuedTurnSnapshots(t *testing.T) 
 	if !strings.Contains(message, "`xhigh`") || session.ReasoningEffort != "xhigh" {
 		t.Fatalf("message/session = %q / %#v", message, session)
 	}
+	persistReasoningEffortInbound(t, ctx, store, session, "inbound-effort-1")
 	turn, created, err := bridge.queueTurn(ctx, session, teamstore.InboundEvent{ID: "inbound-effort-1"})
 	if err != nil || !created {
 		t.Fatalf("queueTurn created=%v err=%v", created, err)
@@ -188,6 +189,7 @@ func TestReasoningEffortUsesExecutorDefaultUntilChatOverridesIt(t *testing.T) {
 		t.Fatalf("ensureDurableSession: %v", err)
 	}
 
+	persistReasoningEffortInbound(t, ctx, store, session, "inbound-default")
 	turn, created, err := bridge.queueTurn(ctx, session, teamstore.InboundEvent{ID: "inbound-default"})
 	if err != nil || !created {
 		t.Fatalf("queueTurn created=%v err=%v", created, err)
@@ -273,6 +275,7 @@ func TestReasoningEffortRuntimeFallbackTurnSnapshotSurvivesChatOverride(t *testi
 		t.Fatal(err)
 	}
 
+	persistReasoningEffortInbound(t, ctx, store, session, "inbound-runtime-default")
 	turn, created, err := bridge.queueTurn(ctx, session, teamstore.InboundEvent{ID: "inbound-runtime-default"})
 	if err != nil || !created {
 		t.Fatalf("queueTurn created=%v err=%v", created, err)
@@ -335,6 +338,23 @@ func TestReasoningEffortAcceptsFutureModelAdvertisedValue(t *testing.T) {
 	}
 	if session.ReasoningEffort != "future-ultra" {
 		t.Fatalf("future effort = %q, want canonical model value", session.ReasoningEffort)
+	}
+}
+
+func persistReasoningEffortInbound(t *testing.T, ctx context.Context, store *teamstore.Store, session *Session, id string) {
+	t.Helper()
+	if session == nil {
+		t.Fatal("persist reasoning-effort inbound: session is nil")
+	}
+	if _, _, err := store.PersistInbound(ctx, teamstore.InboundEvent{
+		ID:             id,
+		SessionID:      session.ID,
+		TeamsChatID:    session.ChatID,
+		TeamsMessageID: "teams:" + id,
+		Text:           "reasoning effort test",
+		Status:         teamstore.InboundStatusPersisted,
+	}); err != nil {
+		t.Fatalf("persist reasoning-effort inbound %q: %v", id, err)
 	}
 }
 

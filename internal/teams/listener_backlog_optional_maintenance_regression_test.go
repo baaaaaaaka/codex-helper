@@ -3,14 +3,19 @@ package teams
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
@@ -26,6 +31,389 @@ func TestTeamsListenFalseBacklogSkipsOptionalHistoryMaintenanceJSON(t *testing.T
 
 func TestTeamsListenFalseBacklogSkipsOptionalHistoryMaintenanceSQLite(t *testing.T) {
 	runTeamsListenFalseBacklogSkipsOptionalHistoryMaintenance(t, true)
+}
+
+func TestTeamsPollForegroundPressureSkipsColdMaintenanceForOneCycle(t *testing.T) {
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+	ctx := context.Background()
+
+	bridge.setPollForegroundPressure(true)
+	plan, err := bridge.optionalMaintenancePlanForOwner(ctx, time.Now())
+	if err != nil {
+		t.Fatalf("optionalMaintenancePlanForOwner under poll pressure: %v", err)
+	}
+	if plan.runNormal || plan.runMandatory || !plan.backlogActive {
+		t.Fatalf("poll-pressure maintenance plan = %#v, want all cold work deferred", plan)
+	}
+
+	bridge.setPollForegroundPressure(false)
+	plan, err = bridge.optionalMaintenancePlanForOwner(ctx, time.Now())
+	if err != nil {
+		t.Fatalf("optionalMaintenancePlanForOwner after quiet poll: %v", err)
+	}
+	if !plan.runNormal || plan.runMandatory || plan.backlogActive {
+		t.Fatalf("quiet-poll maintenance plan = %#v, want normal cold work eligible", plan)
+	}
+}
+
+func TestTeamsPollForegroundPressureDoesNotHideMandatoryMaintenance(t *testing.T) {
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+	ctx := context.Background()
+
+	bridge.historyWatchEventsMu.Lock()
+	bridge.historyWatchPendingDirty = map[string]struct{}{"mandatory-history.jsonl": {}}
+	bridge.historyWatchEventsMu.Unlock()
+	bridge.setPollForegroundPressure(true)
+
+	plan, err := bridge.optionalMaintenancePlanForOwner(ctx, time.Now())
+	if err != nil {
+		t.Fatalf("optionalMaintenancePlanForOwner under foreground pressure: %v", err)
+	}
+	if plan.runNormal || !plan.runMandatory || !plan.backlogActive {
+		t.Fatalf("foreground-pressure mandatory plan = %#v, want mandatory-only maintenance", plan)
+	}
+}
+
+func TestTeamsFastPollHintDoesNotKeepColdMaintenanceBlockedAfterBacklogDrains(t *testing.T) {
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+	ctx := context.Background()
+
+	bridge.boostPolling(time.Now())
+	plan, err := bridge.optionalMaintenancePlanForOwner(ctx, time.Now())
+	if err != nil {
+		t.Fatalf("optionalMaintenancePlanForOwner after fast-poll hint: %v", err)
+	}
+	if !plan.runNormal || plan.runMandatory || plan.backlogActive {
+		t.Fatalf("post-backlog fast-poll maintenance plan = %#v, want normal cold work eligible", plan)
+	}
+}
+
+func TestTeamsBacklogOptionalQuantumLimitsColdDiscoveryToOneJob(t *testing.T) {
+	bridge := &Bridge{}
+	optionalPaths := []string{"optional-a", "optional-b", "optional-c"}
+	if got := bridge.selectBacklogHistoryDiscoveryPaths(optionalPaths, maxBacklogOptionalMaintenanceJobs); len(got) != 1 {
+		t.Fatalf("optional history quantum selected %d paths, want one: %v", len(got), got)
+	}
+	optionalJobs := make([]linkedTranscriptSyncJob, 0, len(optionalPaths))
+	for _, id := range optionalPaths {
+		optionalJobs = append(optionalJobs, linkedTranscriptSyncJob{session: Session{ID: id}})
+	}
+	if got := bridge.selectBacklogLinkedRecoveryJobsWithLimit(optionalJobs, maxBacklogOptionalMaintenanceJobs); len(got) != 1 {
+		t.Fatalf("optional linked quantum selected %d jobs, want one: %#v", len(got), got)
+	}
+	if maxBacklogOptionalMaintenanceJobs != 1 {
+		t.Fatalf("optional maintenance quantum = %d, want one cold job", maxBacklogOptionalMaintenanceJobs)
+	}
+}
+
+func TestTeamsBacklogOptionalLinkedJobSkipsChatTitleSideEffects(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		queueOnly  bool
+		suppressed bool
+		wantPatch  int
+	}{
+		{name: "direct maintenance keeps title update", wantPatch: 1},
+		{name: "explicit optional suppression", suppressed: true},
+		{name: "queue-only listener defers title update", queueOnly: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := newBridgeTestStore(t)
+			var patchCount int
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPatch || r.URL.Path != "/chats/chat-1" {
+					t.Errorf("unexpected Graph request: %s %s", r.Method, r.URL.Path)
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				patchCount++
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			t.Cleanup(server.Close)
+			bridge := newBridgeTestBridge(&GraphClient{
+				auth:       &fakeGraphAuth{token: "access"},
+				client:     server.Client(),
+				baseURL:    server.URL,
+				maxRetries: 0,
+				sleep:      sleepContext,
+				jitter:     func(d time.Duration) time.Duration { return d },
+			}, store, &recordingExecutor{})
+			session := bridge.reg.Sessions[0]
+			session.Topic = "💬 Codex Work - old title"
+			session.CodexThreadID = "thread-title-policy"
+			checkpointID := transcriptCheckpointID(session.ID)
+			if _, _, err := store.UpdateImportCheckpoint(context.Background(), checkpointID, func(_ teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+				return teamstore.ImportCheckpoint{
+					ID: checkpointID, SessionID: session.ID, Status: importCheckpointStatusImporting,
+					UpdatedAt: now,
+				}, true, nil
+			}); err != nil {
+				t.Fatalf("seed importing checkpoint: %v", err)
+			}
+			ctx := context.Background()
+			if test.suppressed {
+				ctx = context.WithValue(ctx, linkedTranscriptSkipNonEssentialSideEffects{}, true)
+			}
+			if err := bridge.syncSessionTranscriptFromSnapshotWithOptions(
+				ctx, session, codexhistory.Session{SessionID: session.CodexThreadID, Summary: "new title"},
+				teamstore.State{}, teamstore.ImportCheckpoint{ID: checkpointID, SessionID: session.ID, Status: importCheckpointStatusImporting}, true, test.queueOnly,
+			); err != nil {
+				t.Fatalf("sync transcript with title side-effect policy: %v", err)
+			}
+			if patchCount != test.wantPatch {
+				t.Fatalf("chat title PATCH count = %d, want %d", patchCount, test.wantPatch)
+			}
+		})
+	}
+}
+
+func TestTeamsQueueOnlyLinkedTranscriptQueuesTailWithoutChatTitlePatch(t *testing.T) {
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	oldRecord := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
+	if err := os.WriteFile(transcriptPath, []byte(oldRecord), 0o600); err != nil {
+		t.Fatalf("write initial transcript: %v", err)
+	}
+	var patchCount int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPatch || r.URL.Path != "/chats/chat-1" {
+			t.Errorf("unexpected Graph request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		patchCount++
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(server.Close)
+	bridge := newBridgeTestBridge(&GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, newBridgeTestStore(t), &recordingExecutor{})
+	bridge.machine.Label = "qa-host"
+	session := bridge.reg.SessionByChatID("chat-1")
+	session.CodexThreadID = "thread-queue-only-title"
+	session.Cwd = "/home/user/project/alpha"
+	session.Topic = WorkChatTitle(ChatTitleOptions{
+		MachineLabel: bridge.machine.Label,
+		Topic:        "old title",
+		Cwd:          session.Cwd,
+	})
+	session.TitleSource = sessionTitleSourceAuto
+	local := codexhistory.Session{
+		SessionID:   session.CodexThreadID,
+		ProjectPath: session.Cwd,
+		FilePath:    transcriptPath,
+		Summary:     "old title",
+	}
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensureDurableSession: %v", err)
+	}
+	// Establish the trusted old EOF through the direct maintenance path. The
+	// later queue-only call must process only the appended tail.
+	if err := bridge.syncSessionTranscriptFromSnapshotWithOptions(context.Background(), *session, local, teamstore.State{}, teamstore.ImportCheckpoint{}, false, false); err != nil {
+		t.Fatalf("seed transcript checkpoint: %v", err)
+	}
+	state, err := bridge.store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load seeded state: %v", err)
+	}
+	checkpointID := transcriptCheckpointID(session.ID)
+	checkpoint, ok := state.ImportCheckpoints[checkpointID]
+	if !ok || checkpoint.LastOffset <= 0 {
+		t.Fatalf("seed checkpoint = %#v, want trusted old EOF", checkpoint)
+	}
+	newRecord := `{"id":"new","role":"assistant","text":"new answer"}` + "\n"
+	file, err := os.OpenFile(transcriptPath, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open transcript for append: %v", err)
+	}
+	if _, err := file.WriteString(newRecord); err != nil {
+		_ = file.Close()
+		t.Fatalf("append transcript: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close transcript: %v", err)
+	}
+	local.Summary = "new title"
+	state, err = bridge.store.TranscriptImportStateSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("load transcript state before queue-only sync: %v", err)
+	}
+	if err := bridge.syncSessionTranscriptFromSnapshotWithOptions(context.Background(), *session, local, state, checkpoint, true, true); err != nil {
+		t.Fatalf("queue-only transcript sync: %v", err)
+	}
+	if patchCount != 0 {
+		t.Fatalf("queue-only linked sync issued %d title PATCHes, want none", patchCount)
+	}
+	state, err = bridge.store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load queue-only state: %v", err)
+	}
+	foundTail := false
+	for _, outbox := range state.OutboxMessages {
+		if outbox.SessionID == session.ID && strings.Contains(outbox.Body, "new answer") {
+			foundTail = true
+			break
+		}
+	}
+	if !foundTail {
+		t.Fatalf("queue-only linked sync did not durably queue the appended tail: %#v", state.OutboxMessages)
+	}
+}
+
+func TestTeamsBacklogOptionalLinkedJobPropagatesSideEffectPolicy(t *testing.T) {
+	bridge := &Bridge{transcriptSyncWorkerCount: 1}
+	var observed bool
+	bridge.linkedTranscriptSessionHook = func(ctx context.Context, _ Session) error {
+		observed = linkedTranscriptNonEssentialSideEffectsSuppressed(ctx)
+		return context.Canceled
+	}
+	err := bridge.runLinkedTranscriptSyncJobs(context.Background(), []linkedTranscriptSyncJob{
+		{session: Session{ID: "optional-policy"}, skipNonEssentialSideEffects: true},
+	}, func(context.Context, Session, teamstore.ImportCheckpoint) (teamstore.State, error) {
+		t.Fatal("optional linked job loaded durable state after its preflight hook failed")
+		return teamstore.State{}, nil
+	})
+	if err == nil {
+		t.Fatal("optional linked job swallowed its local cancellation")
+	}
+	if !observed {
+		t.Fatal("optional linked job did not propagate the side-effect suppression policy")
+	}
+}
+
+func TestTeamsLinkedTranscriptPhaseSeparatesBoundedOptionalDeferralFromFailure(t *testing.T) {
+	deferred := &linkedTranscriptJobDeferredError{SessionID: "optional-deferred", Err: context.Canceled}
+	bridge := &Bridge{}
+	if err := bridge.runMainLoopPhase(context.Background(), "linked-transcript", func(context.Context) error {
+		return deferred
+	}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("linked phase returned %v, want the original child cancellation", err)
+	}
+	stats := bridge.mainLoopPhaseStatsSnapshot("linked-transcript")
+	if stats.Errors != 0 || stats.Deferred != 1 {
+		t.Fatalf("bounded linked deferral stats = %#v, want errors=0 deferred=1", stats)
+	}
+
+	bridge = &Bridge{}
+	mixed := errors.Join(deferred, errors.New("real linked transcript failure"))
+	if err := bridge.runMainLoopPhase(context.Background(), "linked-transcript", func(context.Context) error {
+		return mixed
+	}); err == nil {
+		t.Fatal("mixed linked phase failure was swallowed")
+	}
+	stats = bridge.mainLoopPhaseStatsSnapshot("linked-transcript")
+	if stats.Errors != 1 || stats.Deferred != 0 {
+		t.Fatalf("mixed linked phase stats = %#v, want errors=1 deferred=0", stats)
+	}
+}
+
+func TestTeamsLinkedTranscriptBudgetDeferralRequiresLiveParent(t *testing.T) {
+	parent := context.Background()
+	jobCtx, cancelJob := context.WithDeadline(parent, time.Now().Add(-time.Second))
+	defer cancelJob()
+	if !linkedTranscriptJobBudgetDeferral(context.Canceled, jobCtx, parent) {
+		t.Fatal("child timeout surfaced as context.Canceled was not classified as a bounded deferral")
+	}
+
+	canceledParent, cancelParent := context.WithCancel(context.Background())
+	jobCtx, cancelJob = context.WithDeadline(canceledParent, time.Now().Add(-time.Second))
+	defer cancelJob()
+	cancelParent()
+	if linkedTranscriptJobBudgetDeferral(context.Canceled, jobCtx, canceledParent) {
+		t.Fatal("owner/phase cancellation was incorrectly classified as an optional child deferral")
+	}
+}
+
+func TestTeamsLinkedTranscriptBudgetTimeoutIsDeferredForMandatoryJob(t *testing.T) {
+	bridge := &Bridge{transcriptSyncWorkerCount: 1}
+	bridge.linkedTranscriptSessionHook = func(ctx context.Context, _ Session) error {
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	parent, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	err := bridge.runLinkedTranscriptSyncJobs(parent, []linkedTranscriptSyncJob{
+		{session: Session{ID: "mandatory-timeout"}, mandatory: true},
+	}, func(context.Context, Session, teamstore.ImportCheckpoint) (teamstore.State, error) {
+		t.Fatal("mandatory timed-out linked job loaded durable state after its hook timed out")
+		return teamstore.State{}, nil
+	})
+	if err == nil || !isLinkedTranscriptJobDeferred(err) || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("mandatory child timeout = %v, want typed bounded deferral", err)
+	}
+}
+
+func TestTeamsNormalMaintenanceRechecksBacklogAfterInitialQuietProbe(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			store := newBridgeTestStore(t)
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate store to SQLite: %v", err)
+				}
+			}
+			bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+
+			plan, err := bridge.optionalMaintenancePlanForOwner(ctx, time.Now())
+			if err != nil {
+				t.Fatalf("initial optional-maintenance plan: %v", err)
+			}
+			if !plan.runNormal || plan.backlogActive {
+				t.Fatalf("initial quiet plan = %#v, want normal maintenance eligible", plan)
+			}
+
+			now := time.Now().UTC()
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				if state.InboundEvents == nil {
+					state.InboundEvents = make(map[string]teamstore.InboundEvent)
+				}
+				if state.Turns == nil {
+					state.Turns = make(map[string]teamstore.Turn)
+				}
+				state.InboundEvents["inbound-maintenance-race"] = teamstore.InboundEvent{
+					ID:             "inbound-maintenance-race",
+					SessionID:      "session-maintenance-race",
+					TeamsChatID:    "chat-maintenance-race",
+					TeamsMessageID: "message-maintenance-race",
+					Status:         teamstore.InboundStatusPersisted,
+					TurnID:         "turn-maintenance-race",
+					CreatedAt:      now,
+					UpdatedAt:      now,
+				}
+				state.Turns["turn-maintenance-race"] = teamstore.Turn{
+					ID:             "turn-maintenance-race",
+					SessionID:      "session-maintenance-race",
+					InboundEventID: "inbound-maintenance-race",
+					Status:         teamstore.TurnStatusQueued,
+					CreatedAt:      now,
+					UpdatedAt:      now,
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed backlog after initial quiet probe: %v", err)
+			}
+
+			allowed, err := bridge.normalOptionalMaintenanceStillAllowed(ctx)
+			if err != nil {
+				t.Fatalf("recheck normal maintenance admission: %v", err)
+			}
+			if allowed {
+				t.Fatalf("normal maintenance remained allowed after a durable queued turn was added")
+			}
+		})
+	}
 }
 
 func TestTeamsBacklogFairQuantumDelaysInitialRunAndReservesOptionalSlots(t *testing.T) {

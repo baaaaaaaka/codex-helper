@@ -4,10 +4,115 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
 )
+
+func TestSQLiteSchemaPreparationCancellationResumesCompatibilityPages(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	if err := store.Update(ctx, func(state *State) error {
+		for i := 0; i < 2*sqliteProjectionBackfillBatchSize+1; i++ {
+			id := fmt.Sprintf("cancel-session-%04d", i)
+			state.Sessions[id] = SessionContext{
+				ID: id, Status: SessionStatusActive, TeamsChatID: "cancel-chat-" + id, UpdatedAt: now,
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed cancellable projection state: %v", err)
+	}
+	result := migrateStoreToSQLiteForTest(t, store)
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `UPDATE state_meta SET value = ? WHERE key = ?`, "0", sqliteSessionProjectionVersionKey); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `DELETE FROM state_meta WHERE key = ?`, sqliteBackfillCursorKey(sqliteSessionProjectionVersionKey))
+		return err
+	})
+
+	prepareCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	previousHook := sqliteCompatibilityProjectionPageTestHook
+	sqliteCompatibilityProjectionPageTestHook = func(cursorKey string) {
+		if cursorKey == sqliteBackfillCursorKey(sqliteSessionProjectionVersionKey) {
+			cancel()
+		}
+	}
+	t.Cleanup(func() { sqliteCompatibilityProjectionPageTestHook = previousHook })
+	err := store.withStateLock(prepareCtx, func() error {
+		pointer, ok, err := store.currentSQLitePointerUnlocked()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return sql.ErrNoRows
+		}
+		db, err := store.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		return ensureSQLiteSchemaContext(prepareCtx, db)
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled schema preparation error = %v, want context canceled", err)
+	}
+
+	// Inspect the durable state through a separate handle. The structural
+	// capability must be revoked, while the logical page cursor must survive so
+	// the next preparation resumes rather than reparsing the first page.
+	inspect, err := openSQLiteStore(result.Path, false)
+	if err != nil {
+		t.Fatalf("open canceled-preparation inspection handle: %v", err)
+	}
+	var marker string
+	if markerErr := inspect.QueryRow(`SELECT value FROM state_meta WHERE key = ?`, sqliteSchemaPreparationVersionKey).Scan(&marker); !errors.Is(markerErr, sql.ErrNoRows) {
+		_ = inspect.Close()
+		t.Fatalf("schema marker after cancellation = %q/%v, want absent", marker, markerErr)
+	}
+	var cursor string
+	if err := inspect.QueryRow(`SELECT value FROM state_meta WHERE key = ?`, sqliteBackfillCursorKey(sqliteSessionProjectionVersionKey)).Scan(&cursor); err != nil {
+		_ = inspect.Close()
+		t.Fatalf("session cursor after cancellation: %v", err)
+	}
+	if cursor == "" {
+		_ = inspect.Close()
+		t.Fatal("session cursor after cancellation is empty")
+	}
+	if err := inspect.Close(); err != nil {
+		t.Fatalf("close canceled-preparation inspection handle: %v", err)
+	}
+
+	sqliteCompatibilityProjectionPageTestHook = nil
+	if err := store.PrepareSQLiteSchemaBeforeOwner(ctx); err != nil {
+		t.Fatalf("resume canceled schema preparation: %v", err)
+	}
+	if err := store.withStateLock(ctx, func() error {
+		pointer, ok, err := store.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			if err == nil {
+				err = sql.ErrNoRows
+			}
+			return err
+		}
+		db, err := store.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		if err := db.QueryRowContext(ctx, `SELECT value FROM state_meta WHERE key = ?`, sqliteSessionProjectionVersionKey).Scan(&marker); err != nil {
+			return err
+		}
+		if marker != sqliteSessionProjectionVersion {
+			return fmt.Errorf("session projection marker = %q", marker)
+		}
+		return db.QueryRowContext(ctx, `SELECT 1 FROM state_meta WHERE key = ?`, sqliteBackfillCursorKey(sqliteSessionProjectionVersionKey)).Scan(&marker)
+	}); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("resumed schema cursor = %v, want absent", err)
+	}
+}
 
 // A mixed-version writer can leave the canonical JSON row newer than the
 // indexed SQLite columns. Startup must repair only those narrow projections;
@@ -542,7 +647,6 @@ func TestSQLiteHotCheckpointAdmissionUsesCanonicalIdentityAndStatus(t *testing.T
 			"canonical-checkpoint-wrong-session", importCheckpointStatusComplete, checkpoint.ID)
 		return err
 	})
-
 	schedule, err := store.HotPollReadyScheduleState(ctx, "", now)
 	if err != nil {
 		t.Fatalf("HotPollReadyScheduleState with stale checkpoint projections: %v", err)
@@ -558,6 +662,28 @@ func TestSQLiteHotCheckpointAdmissionUsesCanonicalIdentityAndStatus(t *testing.T
 	}
 	if got, ok := full.ImportCheckpoints[checkpoint.ID]; !ok || got.SessionID != session.ID || got.Status != importCheckpointStatusImporting {
 		t.Fatalf("full hot canonical importing checkpoint = %#v present=%v, want %#v", got, ok, checkpoint)
+	}
+
+	point, found, err := store.ImportCheckpoint(ctx, checkpoint.ID)
+	if err != nil || !found || point.SessionID != session.ID || point.Status != importCheckpointStatusImporting {
+		t.Fatalf("point canonical checkpoint = %#v found=%v err=%v, want %#v", point, found, err, checkpoint)
+	}
+	selected, err := store.ImportCheckpointsForSessions(ctx, []string{session.ID})
+	if err != nil || selected[checkpoint.ID].SessionID != session.ID || selected[checkpoint.ID].Status != importCheckpointStatusImporting {
+		t.Fatalf("selected canonical checkpoints = %#v err=%v, want session-local checkpoint", selected, err)
+	}
+	snapshot, err := store.LinkedTranscriptSessionSnapshot(ctx, []string{session.ID})
+	if err != nil || snapshot.Checkpoints[checkpoint.ID].SessionID != session.ID || snapshot.Checkpoints[checkpoint.ID].Status != importCheckpointStatusImporting {
+		t.Fatalf("linked canonical snapshot = %#v err=%v, want session-local checkpoint", snapshot, err)
+	}
+	updated, changed, err := store.UpdateImportCheckpoint(ctx, checkpoint.ID, func(current ImportCheckpoint, ok bool, _ time.Time) (ImportCheckpoint, bool, error) {
+		if !ok || current.SessionID != session.ID {
+			return ImportCheckpoint{}, false, fmt.Errorf("callback received checkpoint=%#v found=%v", current, ok)
+		}
+		return current, false, nil
+	})
+	if err != nil || changed || updated.SessionID != session.ID || updated.Status != importCheckpointStatusImporting {
+		t.Fatalf("no-op point checkpoint update = %#v changed=%v err=%v", updated, changed, err)
 	}
 }
 

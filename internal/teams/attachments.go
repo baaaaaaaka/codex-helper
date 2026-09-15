@@ -199,6 +199,28 @@ func hostedContentLimitMessage() string {
 	return fmt.Sprintf("Teams message has more than %d inline Teams media attachments. Please send fewer media items in one message.", maxHostedContentPerMessage)
 }
 
+// teamsMessagePreparationRequiresGraph describes the attachment shapes for
+// which prompt preparation still performs a read after the original message
+// has already been durably received. A normal text receipt can therefore be
+// replayed during a read throttle, while hosted content, downloadable files,
+// and message references remain behind the same read gate.
+func teamsMessagePreparationRequiresGraph(msg ChatMessage) bool {
+	if refs, _ := hostedContentRefsFromMessage(msg, maxHostedContentPerMessage); len(refs) > 0 {
+		return true
+	}
+	for _, attachment := range msg.Attachments {
+		if isSupportedReferenceAttachment(attachment) {
+			return true
+		}
+		if isMessageReferenceAttachment(attachment) && strings.EqualFold(strings.TrimSpace(attachment.ContentType), "messageReference") {
+			if id := strings.TrimSpace(firstNonEmptyString(attachment.ID, referencedMessageFromAttachment(attachment).MessageID)); id != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (b *Bridge) downloadHostedContentAttachments(ctx context.Context, session *Session, chatID string, msg ChatMessage) ([]LocalAttachment, func(), string, error) {
 	refs, truncated := hostedContentRefsFromMessage(msg, maxHostedContentPerMessage)
 	if len(refs) == 0 {
@@ -219,9 +241,21 @@ func (b *Bridge) downloadHostedContentAttachments(ctx context.Context, session *
 	}
 	var files []LocalAttachment
 	for i, ref := range refs {
+		// Hosted-content messages can contain several independent Graph reads.
+		// Recheck the account/chat read gate before every item so a sibling
+		// request that discovers a throttle cannot let the remainder of this
+		// preparation pass through. The Graph response remains authoritative if
+		// the throttle races this check.
+		if err := b.ensureMessageGraphReadAllowed(ctx, chatID, msg); err != nil {
+			cleanup()
+			return nil, func() {}, "", err
+		}
 		value, err := b.readClient().GetHostedContentValueWithoutRateLimitRetry(ctx, chatID, msg.ID, ref.ID)
 		if err != nil {
 			cleanup()
+			if isRetryableGraphReadFailure(err) {
+				return nil, func() {}, "", b.recordGraphReadRetryableFailureAndMark(ctx, chatID, err)
+			}
 			return nil, func() {}, "", err
 		}
 		ext := attachmentExtension(value.ContentType)
@@ -337,20 +371,38 @@ func (b *Bridge) downloadReferenceFileAttachments(ctx context.Context, session *
 	cleanup := func() {
 		_ = os.RemoveAll(dir)
 	}
+	chatID := ""
+	if session != nil {
+		chatID = strings.TrimSpace(session.ChatID)
+	}
 	var files []LocalAttachment
 	usedNames := make(map[string]bool)
 	for i, attachment := range refs {
 		var metadata DriveItem
 		if referenceAttachmentNeedsMetadata(attachment.Name) {
+			if err := b.ensureMessageGraphReadAllowed(ctx, chatID, ChatMessage{Attachments: []MessageAttachment{attachment}}); err != nil {
+				cleanup()
+				return nil, func() {}, "", err
+			}
 			if item, metaErr := b.readClient().GetSharedDriveItemMetadataWithoutRateLimitRetry(ctx, attachment.ContentURL); metaErr == nil {
 				metadata = item
+			} else if isRetryableGraphReadFailure(metaErr) {
+				cleanup()
+				return nil, func() {}, "", b.recordGraphReadRetryableFailureAndMark(ctx, chatID, metaErr)
 			}
 		}
 		originalName := bestReferenceAttachmentName(attachment.Name, metadata.Name)
 		downloadPath := filepath.Join(dir, fmt.Sprintf(".download-%03d", i+1))
+		if err := b.ensureMessageGraphReadAllowed(ctx, chatID, ChatMessage{Attachments: []MessageAttachment{attachment}}); err != nil {
+			cleanup()
+			return nil, func() {}, "", err
+		}
 		contentType, _, err := b.readClient().DownloadSharedDriveItemContentToFileWithoutRateLimitRetry(ctx, attachment.ContentURL, downloadPath)
 		if err != nil {
 			cleanup()
+			if isRetryableGraphReadFailure(err) {
+				return nil, func() {}, "", b.recordGraphReadRetryableFailureAndMark(ctx, chatID, err)
+			}
 			return nil, func() {}, "", err
 		}
 		contentType = preferredAttachmentContentType(contentType, driveItemMimeType(metadata), attachment.ContentType, originalName)
@@ -392,11 +444,26 @@ func (b *Bridge) readMessageReferenceAttachments(ctx context.Context, chatID str
 		ref := referencedMessageFromAttachment(attachment)
 		if strings.EqualFold(strings.TrimSpace(attachment.ContentType), "messageReference") {
 			if id := strings.TrimSpace(firstNonEmptyString(ref.MessageID, attachment.ID)); id != "" {
+				if err := b.ensureMessageGraphReadAllowed(ctx, chatID, ChatMessage{Attachments: []MessageAttachment{attachment}}); err != nil {
+					return nil, "", err
+				}
 				if fetched, err := b.readClient().GetMessageWithoutRateLimitRetry(ctx, chatID, id); err != nil {
+					if isRetryableGraphReadFailure(err) {
+						return nil, "", b.recordGraphReadRetryableFailureAndMark(ctx, chatID, err)
+					}
 					if ref.Text == "" {
 						ref.Text = "Referenced message could not be read from Graph: " + err.Error()
 					}
 				} else {
+					if identityErr := validateFetchedMessageIdentity(chatID, id, fetched); identityErr != nil {
+						// The attachment preview remains the only local evidence. Do
+						// not enrich it with a response for a different message/chat.
+						if ref.Text == "" {
+							ref.Text = "Referenced message content could not be verified from Graph."
+						}
+						refs = append(refs, ref)
+						continue
+					}
 					if fetched.ChatID != "" && fetched.ChatID != chatID {
 						if ref.Text == "" {
 							ref.Text = "Referenced message belongs to a different Teams chat and was not read."

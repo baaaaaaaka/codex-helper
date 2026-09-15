@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -698,26 +699,35 @@ func TestBridgeLinkedTranscriptConcurrentSQLiteSyncPublishesExactlyOnce(t *testi
 // TestBridgeLinkedTranscriptGraph429RetainsCheckpointUntilOutboxDelivery
 // checks the write-side half of a rate-limited outage. A transcript POST that
 // receives 429 must leave the source cursor behind the record while retaining
-// the queued, source-proofed outbox row; clearing the chat block then sends it
-// once and advances the checkpoint.
+// the ambiguous, source-proofed outbox row.  A later owner may settle it only
+// by finding the exact provenance marker; it must never issue a replacement
+// POST merely because the rate-limit gate was cleared.
 func TestBridgeLinkedTranscriptGraph429RetainsCheckpointUntilOutboxDelivery(t *testing.T) {
 	var mu sync.Mutex
 	blocked := false
 	requests := 0
 	var sent []string
+	var remote ChatMessage
+	var remoteReady bool
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages") {
+			mu.Lock()
+			found := remoteReady
+			message := remote
+			mu.Unlock()
+			w := httptest.NewRecorder()
+			w.Header().Set("Content-Type", "application/json")
+			if found {
+				_ = json.NewEncoder(w).Encode(struct {
+					Value []ChatMessage `json:"value"`
+				}{Value: []ChatMessage{message}})
+			} else {
+				_, _ = io.WriteString(w, `{"value":[]}`)
+			}
+			return w.Result(), nil
+		}
 		if r.Method != http.MethodPost || !strings.HasPrefix(r.URL.Path, "/chats/") || !strings.HasSuffix(r.URL.Path, "/messages") {
 			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
-		}
-		mu.Lock()
-		requests++
-		isBlocked := blocked
-		mu.Unlock()
-		if isBlocked {
-			w := httptest.NewRecorder()
-			w.Header().Set("Retry-After", "60")
-			http.Error(w, `{"error":{"code":"TooManyRequests","message":"transcript rate limit"}}`, http.StatusTooManyRequests)
-			return w.Result(), nil
 		}
 		var body struct {
 			Body struct {
@@ -728,10 +738,26 @@ func TestBridgeLinkedTranscriptGraph429RetainsCheckpointUntilOutboxDelivery(t *t
 			t.Fatalf("decode transcript Graph request: %v", err)
 		}
 		mu.Lock()
-		sent = append(sent, PlainTextFromTeamsHTML(body.Body.Content))
+		requests++
+		isBlocked := blocked
+		if isBlocked {
+			remote = bridgeTestMessageWithText("transcript-accepted-before-429", body.Body.Content)
+			remote.ChatID = "chat-1"
+			remote.CreatedDateTime = time.Now().UTC().Format(time.RFC3339Nano)
+			remote.LastModifiedDateTime = remote.CreatedDateTime
+			remoteReady = true
+		}
+		if !isBlocked {
+			sent = append(sent, PlainTextFromTeamsHTML(body.Body.Content))
+		}
 		messageID := len(sent)
 		mu.Unlock()
 		w := httptest.NewRecorder()
+		if isBlocked {
+			w.Header().Set("Retry-After", "60")
+			http.Error(w, `{"error":{"code":"TooManyRequests","message":"transcript rate limit"}}`, http.StatusTooManyRequests)
+			return w.Result(), nil
+		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprintf(w, `{"id":"transcript-sent-%d","messageType":"message"}`, messageID)
 		return w.Result(), nil
@@ -787,14 +813,14 @@ func TestBridgeLinkedTranscriptGraph429RetainsCheckpointUntilOutboxDelivery(t *t
 	queued := 0
 	for _, outbox := range state.OutboxMessages {
 		if outbox.SessionID == session.ID && strings.Contains(outbox.Body, "final after Graph 429") {
-			if outbox.Status != teamstore.OutboxStatusQueued {
-				t.Fatalf("transcript outbox after 429 = %#v, want queued", outbox)
+			if outbox.Status != teamstore.OutboxStatusSending || !teamstore.OutboxSendIsAmbiguous(outbox) {
+				t.Fatalf("transcript outbox after 429 = %#v, want sending/ambiguous", outbox)
 			}
 			queued++
 		}
 	}
 	if queued != 1 {
-		t.Fatalf("queued transcript outboxes after 429 = %d, want one; state=%#v", queued, state.OutboxMessages)
+		t.Fatalf("ambiguous transcript outboxes after 429 = %d, want one; state=%#v", queued, state.OutboxMessages)
 	}
 	limit, ok := state.ChatRateLimits[session.ChatID]
 	if !ok || !limit.BlockedUntil.After(time.Now()) || !strings.Contains(limit.Reason, "429") {
@@ -855,15 +881,21 @@ func TestBridgeLinkedTranscriptGraph429RetainsCheckpointUntilOutboxDelivery(t *t
 	if err := recoveredStore.ClearChatRateLimit(context.Background(), recoveredSession.ChatID); err != nil {
 		t.Fatalf("clear transcript chat rate limit: %v", err)
 	}
-	if err := recoveredBridge.flushPendingOutboxForChat(context.Background(), recoveredSession.ChatID); err != nil {
-		t.Fatalf("flush queued transcript after Graph 429 recovery: %v", err)
+	held, err := recoveredStore.OutboxMessageByID(context.Background(), queuedDelivery.OutboxID)
+	if err != nil {
+		t.Fatalf("load ambiguous transcript outbox after restart: %v", err)
+	}
+	recovered, err := recoveredBridge.recoverAcceptedOutboxFromGraph(context.Background(), held, outboxSendOptions{})
+	if err != nil || !recovered {
+		t.Fatalf("exact transcript recovery after Graph 429 = recovered:%t err:%v", recovered, err)
 	}
 	mu.Lock()
 	sentAfterRecovery := append([]string(nil), sent...)
+	gotRequests := requests
 	mu.Unlock()
-	if got := countStringsContaining(sentAfterRecovery, "final after Graph 429"); got != 1 {
+	if got := countStringsContaining(sentAfterRecovery, "final after Graph 429"); got != 0 || gotRequests != 1 {
 		recoveredState, loadErr := recoveredStore.Load(context.Background())
-		t.Fatalf("recovered transcript sends = %d, want one: sent=%#v checkpoint=%#v outbox=%#v deliveries=%#v load_err=%v", got, sentAfterRecovery, recoveredState.ImportCheckpoints[transcriptCheckpointID(session.ID)], recoveredState.OutboxMessages, recoveredState.TranscriptDeliveries, loadErr)
+		t.Fatalf("recovered transcript replayed the POST or lost exact recovery: sends=%d requests=%d sent=%#v checkpoint=%#v outbox=%#v deliveries=%#v load_err=%v", got, gotRequests, sentAfterRecovery, recoveredState.ImportCheckpoints[transcriptCheckpointID(session.ID)], recoveredState.OutboxMessages, recoveredState.TranscriptDeliveries, loadErr)
 	}
 	if err := recoveredBridge.syncLinkedTranscripts(context.Background()); err != nil && !isOutboxDeliveryDeferred(err) {
 		t.Fatalf("sync after recovered transcript POST: %v", err)
@@ -892,11 +924,8 @@ func TestBridgeLinkedTranscriptGraph429RetainsCheckpointUntilOutboxDelivery(t *t
 	if !ok || recoveredOutbox.Status != teamstore.OutboxStatusSent || recoveredOutbox.TranscriptSourcePath != path || !recoveredOutbox.TranscriptSourceOffsetKnown || recoveredOutbox.TranscriptSourceProofFingerprint == "" || !recoveredOutbox.TranscriptSourceReadProofRangeKnown || recoveredOutbox.TranscriptSourceReadProofFingerprint == "" || recoveredOutbox.TranscriptSourceReadProofStartOffset > checkpointBefore.LastOffset || recoveredOutbox.TranscriptSourceReadProofEndOffset < recoveredOutbox.TranscriptSourceProofOffset {
 		t.Fatalf("recovered transcript outbox provenance = %#v found=%v, want sent offset/read-range proof", recoveredOutbox, ok)
 	}
-	mu.Lock()
-	gotRequests := requests
-	mu.Unlock()
-	if gotRequests != 2 {
-		t.Fatalf("transcript Graph POST requests = %d, want one failed and one recovered send", gotRequests)
+	if gotRequests != 1 {
+		t.Fatalf("transcript Graph POST requests = %d, want one ambiguous POST and no replay", gotRequests)
 	}
 }
 

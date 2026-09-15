@@ -1606,6 +1606,47 @@ jobs:
           go test ./internal/teams -count=1 -run 'TestSendQueuedOutboxFallsBackToControlMentionAfterDefiniteWebhookFailureSQLite$' -v
           go test ./internal/cli -count=1 -run "$workflow_cli_pattern" -v
 
+      - name: Teams scalar hot admission regressions
+        if: matrix.shard == 'core-b'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Keep the projection contract in an explicit, non-empty selector.
+          # The broad store test remains supplemental; this gate protects the
+          # trust/revision fence, JSON fallback, selected hydration, and the
+          # single-connection quarantine path from silently disappearing when
+          # a test is renamed or moved.
+          hot_admission_pattern='^Test(SQLiteHotPollScalarProjectionTrustIsFencedAndFallsBack|SQLiteHotPollTrustedWorkCandidatesMatchJSONOracle|SQLiteHotPollSelectedRefreshHydratesFreshSession|SQLiteTurnProjectionBackfillStopsAtDurablePageBoundary|SQLiteHotPollScalarProjectionTriggerDefinitionsAreCurrent|SQLiteHotPollScalarTrustRevokesContradictoryJSONWithMatchingRevision|SQLiteHotPollTrustedReadyUsesCanonicalTimeForDueGate|SQLiteHotPollAdmissionFallbackKeepsHealthyRowsOnScalarLane|SQLiteHotPollTrustedWorkCandidatesQuarantinesBadRowsWithoutDeadlock|SQLiteHotPollTrustedWorkCandidatesContinuesPastInvalidPage|SQLiteHotPollAdmissionFallbackProbeUsesPartialIndexes|SQLiteHotPollScheduleAndWorkCandidatesMatchesSeparateAdmission|SQLiteHotPollSelectedStateForChatsAndSessionsIsBoundedAndFresh|SQLiteOpenBackfillsLegacyChatSequencesWhenTableAlreadyExists)$'
+          listed="$(go test ./internal/teams/store -run '^$' -list "$hot_admission_pattern")"
+          if ! grep -q '^Test' <<<"$listed"; then
+            echo "scalar hot admission selector matched no tests" >&2
+            exit 1
+          fi
+          go test ./internal/teams/store -count=1 -run "$hot_admission_pattern" -v
+
+      - name: Teams durable deferred-retry and unknown-result regressions
+        if: matrix.shard == 'core-b'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # These tests are kept in a dedicated selector because the broad
+          # Teams patterns are intentionally partitioned and could otherwise
+          # omit the per-row retry gate or unknown-POST fence silently.
+          recovery_store_pattern='^Test(InboundRecoveryCandidatesAcrossBackends|QueueTurnReconcilesExistingDeferredInboundAcrossBackends|QueueTurnFindsLegacyTurnByInboundEventIDWithoutCreatingDuplicate|QueueTurnFailsClosedWhenInboundHasConflictingLegacyTurns|QueueTurnRejectsForeignInboundAndTurnAcrossBackends|QueueTurnRejectsIgnoredInboundWithoutRevivingAcrossBackends|TerminalIgnoredInboundClearsRetryMetadataAcrossLifecyclePaths)$'
+          listed_store="$(go test ./internal/teams/store -count=1 -run '^$' -list "$recovery_store_pattern")"
+          if ! grep -q '^Test' <<<"$listed_store"; then
+            echo "deferred-retry store selector matched no tests" >&2
+            exit 1
+          fi
+          go test ./internal/teams/store -count=1 -run "$recovery_store_pattern" -v
+          recovery_bridge_pattern='^TestBridge(DeferredControlNewUnknownCreateResultUsesStableCreateOrGetKey|DeferredInboundGraphFailureDoesNotBlockLaterRow|DeferredAttachmentNotFoundUsesExplicitPermanentDisposition|DeferredAttachmentContentNotFoundUsesExplicitPermanentDisposition|AttachmentUploadSessionUnknownPOSTIsDurablyNonReplayable|SQLiteSyntaxCorruptPollRepairsWithoutGraphHead)$'
+          listed_bridge="$(go test ./internal/teams -count=1 -run '^$' -list "$recovery_bridge_pattern")"
+          if ! grep -q '^Test' <<<"$listed_bridge"; then
+            echo "deferred-retry bridge selector matched no tests" >&2
+            exit 1
+          fi
+          go test ./internal/teams -count=1 -run "$recovery_bridge_pattern" -v
+
       - name: Teams ambiguous execution diagnostic regressions
         if: matrix.shard == 'core'
         shell: bash
@@ -1765,6 +1806,8 @@ jobs:
           go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteNewChatCompleteTurnBreakdown$' -benchtime=1x -count=1
           go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLite(LongTranscriptFinalArrival|StatusOnlyFinalArrival)$' -benchtime=1x -count=1
           go test ./internal/teams -run '^$' -bench '^BenchmarkCXPPerfModelSQLiteTargetedSessionQuarantine$' -benchtime=1x -count=1 -benchmem
+          go test ./internal/teams/store -run '^$' -bench '^BenchmarkSQLiteHotPollAdmissionScalarVsLegacy$' -benchtime=1x -count=1 -benchmem
+          go test ./internal/teams -run '^$' -bench '^BenchmarkCXPPerfModelSQLiteRealisticMixedUser/idle-main-loop$' -benchtime=1x -count=1 -benchmem
           go test ./internal/teams -run '^$' -bench '^BenchmarkLinkedTranscriptProvenanceMatrix$' -benchtime=10ms -count=1 -benchmem
           go test ./internal/teams -run '^$' -bench '^BenchmarkHistoryWatchUnchangedPartialTail(Poll|CheckpointPersistence)$' -benchtime=100ms -count=1 -benchmem
 
@@ -2418,18 +2461,10 @@ jobs:
               summary="$(tail -40 "$log" | tr '\n' ' ')"
             fi
             echo "::error title=Full Go test failure::${summary:-go test failed without a recognized summary; inspect the retained step log}"
-            retry_log="$RUNNER_TEMP/full-go-test-cli-retry.log"
-            set +e
-            go test -v -count=1 ./internal/cli 2>&1 | tee "$retry_log"
-            retry_status="${PIPESTATUS[0]}"
-            set -e
-            retry_summary="$(grep -E -A8 '^--- FAIL:|^FAIL[[:space:]]|^panic:|^fatal error:' "$retry_log" | tail -80 | tr '\n' ' ' || true)"
-            if [ "$retry_status" = 0 ]; then
-              retry_summary="isolated internal/cli retry passed; the original failure depends on full-suite concurrency or ambient runner state"
-            elif [ -z "$retry_summary" ]; then
-              retry_summary="$(tail -40 "$retry_log" | tr '\n' ' ')"
-            fi
-            echo "::error title=Isolated CLI retry after full-suite failure::$retry_summary"
+            # A passing retry of internal/cli cannot diagnose a failure in
+            # another package, or establish contention as its cause. Keep the
+            # original shard failure authoritative; reproduce that exact
+            # package/test and mode separately when investigating it.
             exit 1
           fi
 

@@ -64,6 +64,62 @@ func TestPollStagedForkChildrenBoundsFailedAttemptsPerCycle(t *testing.T) {
 	}
 }
 
+// A staged-child Graph outage must consume one bounded quantum, not one full
+// worker budget per child. Otherwise a few serial staged children can exhaust
+// the parent poll phase before ordinary work chats are admitted.
+func TestPollStagedForkChildrenHasTotalGraphBudget(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	now := time.Now().UTC()
+	const stagedChildren = 9
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		for i := 0; i < stagedChildren; i++ {
+			childID := fmt.Sprintf("total-budget-child-%02d", i)
+			chatID := fmt.Sprintf("total-budget-chat-%02d", i)
+			state.Sessions[childID] = teamstore.SessionContext{
+				ID: childID, Status: teamstore.SessionStatusStaging, TeamsChatID: chatID,
+				CodexThreadID: "thread-" + childID, UpdatedAt: now,
+			}
+			state.ChatPolls[chatID] = teamstore.ChatPollState{
+				ChatID: chatID, Seeded: true, PollState: inboundPollStateWarm,
+				NextPollAt: now.Add(-time.Second), LastActivityAt: now,
+			}
+			state.ForkOperations[fmt.Sprintf("total-budget-operation-%02d", i)] = teamstore.ForkOperation{
+				ID: fmt.Sprintf("total-budget-operation-%02d", i), ChildSessionID: childID,
+				ChildChatID: chatID, Phase: teamstore.ForkPhaseChildChatStaged, UpdatedAt: now,
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed staged fork children: %v", err)
+	}
+	var requests atomic.Int64
+	graph := &GraphClient{
+		auth: &fakeGraphAuth{token: "access"},
+		client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			requests.Add(1)
+			<-req.Context().Done()
+			return nil, req.Context().Err()
+		})},
+		baseURL:    "https://graph.example.test",
+		maxRetries: 0,
+		sleep:      func(context.Context, time.Duration) error { return nil },
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.maxWorkChatPollsPerCycle = stagedChildren
+	started := time.Now()
+	if err := bridge.pollStagedForkChildren(ctx, 20, 100*time.Millisecond); err == nil {
+		t.Fatal("staged child outage unexpectedly returned nil")
+	}
+	if elapsed := time.Since(started); elapsed > 700*time.Millisecond {
+		t.Fatalf("staged child lane consumed %s, want one total Graph quantum", elapsed)
+	}
+	if got := requests.Load(); got == 0 {
+		t.Fatal("staged child lane issued no Graph request")
+	}
+}
+
 func TestSplitForkHistoryBodyUsesTeamsChunkLimit(t *testing.T) {
 	text := strings.Repeat("<&> history line\n", 6000)
 	chunks := splitForkHistoryBody("assistant", text)
