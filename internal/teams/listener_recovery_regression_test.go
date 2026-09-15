@@ -1178,7 +1178,7 @@ func TestTeamsListenFalseUntrustedSQLiteLeaseHoldsAndRecovers(t *testing.T) {
 	if !waitListenerRecoveryResult(func() bool {
 		owner, ok, readErr := reopened.ReadOwner(ctx)
 		return readErr == nil && ok && owner.MachineID == bridge.machine.ID && bridge.currentLease().Generation > 0
-	}, 4*time.Second) {
+	}, listenerRecoveryExtendedProgressTimeout) {
 		state, loadErr := reopened.Load(ctx)
 		select {
 		case err := <-listener.done:
