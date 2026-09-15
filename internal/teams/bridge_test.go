@@ -30855,7 +30855,7 @@ func TestBridgeSyncLinkedTranscriptSkipsRecentTeamsTurnAgentMessageMirrorByCodex
 	fragment := "Let me continue the research where it left off."
 	final := "Here is the complete final answer."
 	updated := initial +
-		`{"type":"event_msg","payload":{"id":"frag-1","type":"agent_message","thread_id":"thread-1","turn_id":"codex-turn-1","phase":"final_answer","message":` + strconv.Quote(fragment) + `}}` + "\n" +
+		`{"type":"event_msg","payload":{"id":"frag-1","type":"agent_message","thread_id":"thread-1","turn_id":"codex-turn-1","phase":"in_progress","message":` + strconv.Quote(fragment) + `}}` + "\n" +
 		`{"type":"response_item","payload":{"id":"assistant-full","type":"message","role":"assistant","thread_id":"thread-1","turn_id":"codex-turn-1","phase":"final_answer","content":[{"type":"output_text","text":` + strconv.Quote(final) + `}]}}` + "\n"
 	if err := os.WriteFile(transcriptPath, []byte(updated), 0o600); err != nil {
 		t.Fatalf("write updated transcript: %v", err)

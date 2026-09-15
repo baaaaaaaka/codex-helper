@@ -29700,7 +29700,7 @@ func (b *Bridge) advanceRecentCompletedTeamsTranscriptTailWithParentFence(ctx co
 		if !skip && dedupe.shouldSkip(record, body) {
 			skip = true
 		}
-		if !skip && transcriptRecordIsRecentTeamsMirrorFollower(record) && sawRecentTeamsTurnRecord {
+		if !skip && transcriptRecordIsRecentTeamsMirrorFollower(record) && !transcriptRecordIsFinalAnswerAgentMessage(record) && sawRecentTeamsTurnRecord {
 			skip = true
 		}
 		if !skip {
@@ -29804,7 +29804,15 @@ func (s *recentCompletedTeamsTranscriptMirrorSkipper) shouldSkip(record Transcri
 	if s == nil || !s.enabled {
 		return false
 	}
-	if s.matchesRecentCodexTurn(record) && transcriptRecordIsLiveAgentMirrorCandidate(record) {
+	// A final_answer agent_message can itself be the canonical terminal record.
+	// A matching completed Teams turn is not sufficient proof that this exact
+	// record was already sent live: after a restart the durable turn may be
+	// completed while the linked transcript final is still unread. The normal
+	// delivered-status/final outbox ledgers below provide the stronger text-bound
+	// proof for streamed final fragments. Keep the turn-ID fallback for
+	// non-terminal streaming candidates, where it prevents replay of live
+	// commentary without allowing an unproven final to disappear.
+	if s.matchesRecentCodexTurn(record) && transcriptRecordIsLiveAgentMirrorCandidate(record) && !transcriptRecordIsFinalAnswerAgentMessage(record) {
 		s.seen = true
 		return true
 	}
@@ -29813,7 +29821,7 @@ func (s *recentCompletedTeamsTranscriptMirrorSkipper) shouldSkip(record Transcri
 		s.seen = true
 		return true
 	}
-	if transcriptRecordIsRecentTeamsMirrorFollower(record) && s.seen {
+	if transcriptRecordIsRecentTeamsMirrorFollower(record) && !transcriptRecordIsFinalAnswerAgentMessage(record) && s.seen {
 		return true
 	}
 	if s.seen {
@@ -29837,6 +29845,10 @@ func (s *recentCompletedTeamsTranscriptMirrorSkipper) matchesRecentCodexTurn(rec
 
 func transcriptRecordIsRecentTeamsMirrorFollower(record TranscriptRecord) bool {
 	return !record.Internal && (record.Kind == TranscriptKindStatus || transcriptRecordIsLiveAgentMirrorCandidate(record))
+}
+
+func transcriptRecordIsFinalAnswerAgentMessage(record TranscriptRecord) bool {
+	return transcriptRecordIsLiveAgentMirrorCandidate(record) && strings.EqualFold(strings.TrimSpace(record.Phase), "final_answer")
 }
 
 func (s *localTranscriptDeltaState) setCheckpointBeforeActive(records []TranscriptRecord, index int) {
