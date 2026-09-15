@@ -6502,30 +6502,31 @@ func TestSQLiteHotPollWorkCandidatesRotateOperationalRowsBeyondLimit(t *testing.
 	if len(firstIDs) != len(first) {
 		t.Fatalf("first hot-poll candidates contain duplicate sessions: %#v", first)
 	}
-
-	// A successful/partial poll commit updates the durable service-age key. Use
-	// the public schedule CAS to model that commit without invoking Graph; the
-	// next bounded SQL admission must then select the previously omitted rows.
-	for _, session := range first {
-		if _, err := store.UpdateChatPollSchedule(ctx, ChatPollScheduleUpdate{
-			ChatID:     session.TeamsChatID,
-			NextPollAt: time.Now().UTC().Add(-time.Minute),
-		}); err != nil {
-			t.Fatalf("age selected operational row %s: %v", session.ID, err)
+	ageSelected := func(sessions []SessionContext, phase string) {
+		t.Helper()
+		updates := make([]ChatPollScheduleUpdate, 0, len(sessions))
+		for _, session := range sessions {
+			updates = append(updates, ChatPollScheduleUpdate{
+				ChatID:     session.TeamsChatID,
+				NextPollAt: time.Now().UTC().Add(-time.Minute),
+			})
+		}
+		if _, err := store.UpdateChatPollSchedules(ctx, updates); err != nil {
+			t.Fatalf("age selected operational rows in %s: %v", phase, err)
 		}
 	}
+
+	// A successful/partial poll commit updates the durable service-age key. Use
+	// the public schedule batch API to model that commit without invoking Graph;
+	// the next bounded SQL admission must then select the previously omitted
+	// rows. One durable batch also mirrors the production owner-fenced schedule
+	// flush and keeps this regression test bounded on slow Windows SQLite.
+	ageSelected(first, "initial batch")
 	seenIDs := firstIDs
 	current := first
 	maxRounds := total/sqliteHotPollReadyLimit + 3
 	for round := 0; len(seenIDs) < total && round < maxRounds; round++ {
-		for _, session := range current {
-			if _, err := store.UpdateChatPollSchedule(ctx, ChatPollScheduleUpdate{
-				ChatID:     session.TeamsChatID,
-				NextPollAt: time.Now().UTC().Add(-time.Minute),
-			}); err != nil {
-				t.Fatalf("age selected operational row %s in round %d: %v", session.ID, round+1, err)
-			}
-		}
+		ageSelected(current, fmt.Sprintf("round %d", round+1))
 		next, handled, err := store.HotPollWorkCandidates(ctx, "control-chat")
 		if err != nil || !handled {
 			t.Fatalf("hot-poll candidate load round %d = handled:%v err:%v", round+1, handled, err)
