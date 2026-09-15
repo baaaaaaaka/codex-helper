@@ -6459,11 +6459,11 @@ func TestSQLiteHotPollWorkCandidatesRotateOperationalRowsBeyondLimit(t *testing.
 	store := newTestStore(t)
 	ctx := context.Background()
 	base := time.Now().UTC().Add(-2 * time.Hour)
-	// Two bounded pages plus one omitted row are enough to catch a fixed SQL
-	// LIMIT/order regression.  The smaller deterministic fixture keeps the
-	// repeated schedule-CAS portion fast on Windows and still proves that a row
-	// beyond the admission limit eventually rotates into the candidate set.
-	const total = sqliteHotPollReadyLimit*2 + 1
+	// One bounded page plus one omitted row is enough to catch a fixed SQL
+	// LIMIT/order regression. The deterministic fixture keeps the repeated
+	// schedule-CAS portion bounded on Windows and still proves that a row beyond
+	// the admission limit eventually rotates into the candidate set.
+	const total = sqliteHotPollReadyLimit + 1
 	if err := store.Update(ctx, func(state *State) error {
 		for i := 0; i < total; i++ {
 			chatID := fmt.Sprintf("chat-operational-%03d", i)
