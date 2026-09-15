@@ -13783,7 +13783,7 @@ WHERE trim(COALESCE(s.teams_chat_id, '')) != ''
        OR `+sqliteStoredInt64SQL("p.blocked_until")+` <= ?)
 ORDER BY `+sqliteStoredInt64SQL("p.updated_at")+`, `+sqliteStoredInt64SQL("p.next_poll_at")+`,
          `+sqliteStoredInt64SQL("p.last_activity_at")+`, p.chat_id
-LIMIT ?`, controlChatID, controlChatID, chatPollStateBlocked, sqliteTime(now), sqliteHotPollLegacyMaxRows)
+LIMIT ?`, controlChatID, controlChatID, chatPollStateBlocked, sqliteTime(now), malformedLimit)
 		if err != nil {
 			return nil, 0, err
 		}
@@ -13855,6 +13855,15 @@ WHERE p.chat_id = ?
 			for _, chatID := range fastMalformedPollIDs {
 				args = append(args, chatID)
 			}
+			// The bounded quarantine query above has already reserved the only
+			// malformed poll slots this cycle.  Keep the remaining writer-marked
+			// invalid rows out of the ordered compatibility pages: otherwise the
+			// malformedPoll JSON1 predicate would parse every quarantined row just
+			// to discard it after the lane quota was filled.  NULL is deliberately
+			// treated as unknown and remains in the canonical path; only the
+			// explicit current-writer invalid bit is safe to skip here.
+			where += `
+  AND (p.chat_id IS NULL OR COALESCE(p.admission_valid, 1) != 0)`
 		}
 		if operational {
 			where += `

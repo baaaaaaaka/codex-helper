@@ -186,6 +186,12 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestTeamsMainLoopOutboxFairnessWalksPastDistinctChatScanPrefix":       true,
 		"TestTeamsMainLoopOutboxLedgerFailureDoesNotStarveHealthyTail":         true,
 		"TestTeamsUnresolvedTranscriptOutboxDoesNotLivelockHealthyTail":        true,
+		// These matrices perform a long sequence of durable listener/control
+		// operations. Keep them away from unrelated shard processes so hosted
+		// scheduler and filesystem pressure cannot turn the service-hook
+		// readiness assertion into a false failure.
+		"TestCXPPerfModelExternalScenariosCoverCommonPaths":       true,
+		"TestCXPPerfModelSQLiteExternalScenariosCoverCommonPaths": true,
 	},
 	"./internal/teams/store": {
 		"TestSQLiteHotPollAdmissionBoundsSemanticallyMalformedPollLaneAndPreservesHealthyChat": true,

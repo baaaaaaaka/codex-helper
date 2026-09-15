@@ -108,16 +108,21 @@ func TestMCPRefreshCoordinatorDoesNotRefreshStableConfig(t *testing.T) {
 
 func TestMCPRefreshCoordinatorDoesNotRetryUnchangedFailure(t *testing.T) {
 	configPath := writeMCPRefreshTestConfigAt(t, t.TempDir(), "initial")
+	initialState := readMCPConfigFileState(configPath)
 	started := make(chan int, 4)
 	var calls atomic.Int32
 	coordinator := newMCPRefreshCoordinator(configPath, 5*time.Millisecond, func(context.Context) error {
 		started <- int(calls.Add(1))
 		return fmt.Errorf("synthetic reload failure")
 	})
-	coordinator.start(context.Background())
+	// Complete the write before the watcher starts.  A direct os.WriteFile can
+	// expose a brief truncated-file state on slower Windows filesystems; that
+	// is a distinct observed state, not an unchanged-failure retry, and would
+	// make this focused assertion depend on filesystem scheduling.
+	writeMCPRefreshTestConfig(t, configPath, "first-change")
+	coordinator.startWithInitialState(context.Background(), initialState)
 	defer coordinator.stopAndWait()
 
-	writeMCPRefreshTestConfig(t, configPath, "first-change")
 	waitForMCPRefreshCall(t, started, 1)
 	select {
 	case call := <-started:

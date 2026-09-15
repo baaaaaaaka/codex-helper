@@ -17,7 +17,10 @@ validate_positive_int() {
   local value="$2"
   local minimum="$3"
   if [[ ! "$value" =~ ^[1-9][0-9]*$ ]] || (( value < minimum )); then
-    echo "${name} must be an integer >= ${minimum}; got ${value@Q}" >&2
+    # Bash 3.2 (the system shell on hosted macOS runners) does not support
+    # the newer ${value@Q} expansion. The raw value is sufficient here: this
+    # is a validation diagnostic, not a shell command.
+    printf '%s\n' "$name must be an integer >= $minimum; got $value" >&2
     exit 2
   fi
 }

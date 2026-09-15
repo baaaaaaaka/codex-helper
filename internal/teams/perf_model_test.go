@@ -4686,9 +4686,11 @@ func (h *cxpPerfServiceHarness) waitReload(t *testing.T) {
 
 func (h *cxpPerfServiceHarness) waitCount(t *testing.T, counter *atomic.Int32, label string) {
 	t.Helper()
-	// Durable control handling can take longer than a second on hosted
+	// Durable control handling can take longer than a few seconds on hosted
 	// macOS/Windows runners even though the service hook is eventually called.
-	deadline := time.Now().Add(10 * time.Second)
+	// Keep this as a test-only readiness budget; it does not change the
+	// production service/reload timeout.
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		if counter.Load() > 0 {
 			return
