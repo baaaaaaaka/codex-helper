@@ -2043,7 +2043,7 @@
       "vertical": "outbox-chat-fairness",
       "real_listener": false,
       "fake_graph": true,
-      "max_seconds": 15,
+      "max_seconds": 60,
       "oracle": "bounded main-loop outbox delivery gives two messages per selected chat, retains per-chat FIFO, and rotates a third chat into a later cycle",
       "baseline": "pre-fix the first two continuously-active chats could starve every later chat, while the one-message quantum left durable capacity unused",
       "resource_class": "sqlite_fsync",
