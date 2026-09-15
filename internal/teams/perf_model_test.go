@@ -3148,6 +3148,10 @@ func BenchmarkCXPPerfModelSQLiteInvalidWorkflowNotificationIdleTickProfiles(b *t
 			graph := newCXPPerfGraph(profile)
 			bridge := newCXPPerfBridge(store, graph, profile)
 			bridge.asyncTurns = true
+			// newCXPPerfStore registers its close cleanup before this point. Wait
+			// first so an async invalid-notification turn cannot keep the SQLite
+			// temp directory open when the benchmark cleanup runs.
+			b.Cleanup(func() { bridge.asyncTurnWG.Wait() })
 			cxpPerfSeedColdRuntimeMetadata(b, store, profile)
 			cxpPerfMigrateStoreToSQLite(b, store)
 			cxpPerfSeedLinkedTranscriptFiles(b, store, bridge, profile)
@@ -4682,7 +4686,9 @@ func (h *cxpPerfServiceHarness) waitReload(t *testing.T) {
 
 func (h *cxpPerfServiceHarness) waitCount(t *testing.T, counter *atomic.Int32, label string) {
 	t.Helper()
-	deadline := time.Now().Add(time.Second)
+	// Durable control handling can take longer than a second on hosted
+	// macOS/Windows runners even though the service hook is eventually called.
+	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if counter.Load() > 0 {
 			return

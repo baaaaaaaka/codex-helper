@@ -39991,6 +39991,11 @@ func TestBridgeMainLoopFlushesKnownQueuedBeforeSlowAmbiguousRecovery(t *testing.
 	bridge.pollWorkerBudget = 25 * time.Millisecond
 	flushCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
 	defer cancel()
+	// Production main-loop phases retain a durable execution context after the
+	// short phase deadline.  Keep the direct test invocation on the same path so
+	// a slow ambiguous recovery cannot cancel the known queued message's final
+	// durable CAS on hosted runners.
+	flushCtx = withTeamsPhaseExecutionContext(flushCtx, context.Background())
 	flushErr := bridge.flushPendingOutboxMainLoop(flushCtx)
 	if flushErr == nil {
 		t.Fatal("flushPendingOutboxMainLoop unexpectedly settled the slow ambiguous recovery")

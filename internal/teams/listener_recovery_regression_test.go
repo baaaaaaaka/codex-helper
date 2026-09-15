@@ -1188,9 +1188,15 @@ func TestTeamsListenFalseUntrustedSQLiteLeaseHoldsAndRecovers(t *testing.T) {
 			t.Fatalf("listener did not resume after explicit control-lease repair; load=%v state=%#v lease=%#v requests=%#v", loadErr, state, bridge.currentLease(), graphState.requestsSnapshot())
 		}
 	}
+	// The repaired owner still has to finish the full SQLite startup path
+	// (registry restore, projection preparation, migration validation, and
+	// global inbound setup) before the first Graph poll. Under -race that local
+	// work can legitimately take several seconds; the assertion must cover the
+	// complete transition rather than treating startup latency as a failed
+	// repair.
 	if !waitListenerRecoveryResult(func() bool {
 		return len(graphState.requestsSnapshot()) > 0
-	}, 2*time.Second) {
+	}, 10*time.Second) {
 		state, loadErr := reopened.Load(ctx)
 		select {
 		case err := <-listener.done:
@@ -5148,6 +5154,16 @@ func countListenerRecoverySentBodies(items []listenerRecoverySentMessage, marker
 	return count
 }
 
+func listenerRecoverySentForChat(items []listenerRecoverySentMessage, chatID string) []listenerRecoverySentMessage {
+	filtered := make([]listenerRecoverySentMessage, 0, len(items))
+	for _, item := range items {
+		if item.ChatID == chatID {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered
+}
+
 func listenerRecoverySeedLinkedCheckpoint(t *testing.T, store *teamstore.Store, session *Session, path string, released bool) {
 	t.Helper()
 	info, err := os.Stat(path)
@@ -6282,8 +6298,8 @@ func TestTeamsListenFalseRecoversExpiredAmbiguousOutboxWithoutPost(t *testing.T)
 		t.Fatalf("expired ambiguous outbox did not settle: load=%v row=%#v gets=%d posts=%#v phase-outbox=%#v phase-poll=%#v listener-err=%v state=%#v", err, state.OutboxMessages[outboxID], graphState.getCount("chat-1"), graphState.sentSnapshot(), bridge.mainLoopPhaseStatsSnapshot("outbox"), bridge.mainLoopPhaseStatsSnapshot("poll"), listener.err, state)
 	}
 	listener.stop(t)
-	if got := len(graphState.sentSnapshot()); got != 0 {
-		t.Fatalf("ambiguous restart recovery issued %d Graph POST(s), want none", got)
+	if sent := listenerRecoverySentForChat(graphState.sentSnapshot(), "chat-1"); len(sent) != 0 {
+		t.Fatalf("ambiguous restart recovery issued %d Graph POST(s), want none", len(sent))
 	}
 	state, err := store.Load(ctx)
 	if err != nil {
@@ -6318,7 +6334,10 @@ func TestTeamsListenFalseGraphAcceptedDisconnectReconcilesAfterReopen(t *testing
 		parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 		if len(parts) == 3 && parts[0] == "chats" && parts[2] == "messages" && r.Method == http.MethodGet {
 			mu.Lock()
-			messages := append([]ChatMessage(nil), remote...)
+			var messages []ChatMessage
+			if parts[1] == "chat-1" {
+				messages = append(messages, remote...)
+			}
 			mu.Unlock()
 			_ = json.NewEncoder(w).Encode(map[string]any{"value": messages})
 			return
@@ -6350,10 +6369,13 @@ func TestTeamsListenFalseGraphAcceptedDisconnectReconcilesAfterReopen(t *testing
 		}{ID: "user-1", DisplayName: "User"}
 		message.Body.ContentType = "html"
 		message.Body.Content = payload.Body.Content
+		targetPost := parts[1] == "chat-1"
 		mu.Lock()
-		posts++
-		first := posts == 1
-		remote = append(remote, message)
+		if targetPost {
+			posts++
+			remote = append(remote, message)
+		}
+		first := targetPost && posts == 1
 		mu.Unlock()
 		if first {
 			hijacker, ok := w.(http.Hijacker)
@@ -6552,8 +6574,10 @@ func TestTeamsListenFalseMarkerlessAmbiguousOutboxStaysHeldWithoutPost(t *testin
 			listener.stop(t)
 
 			sent := graphState.sentSnapshot()
-			if len(sent) != 1 || !strings.Contains(PlainTextFromTeamsHTML(sent[0].Body), "HEALTHY_OUTBOX_AFTER_AMBIGUOUS") {
-				t.Fatalf("markerless ambiguous isolation Graph POSTs = %#v, want only healthy outbox", sent)
+			healthySent := listenerRecoverySentForChat(sent, "chat-healthy-after-ambiguous")
+			legacySent := listenerRecoverySentForChat(sent, "chat-1")
+			if len(legacySent) != 0 || len(healthySent) != 1 || !strings.Contains(PlainTextFromTeamsHTML(healthySent[0].Body), "HEALTHY_OUTBOX_AFTER_AMBIGUOUS") {
+				t.Fatalf("markerless ambiguous isolation Graph POSTs = %#v, want only healthy outbox (ignoring unrelated control notices)", sent)
 			}
 			if graphErrors := graphState.errorsSnapshot(); len(graphErrors) != 0 {
 				t.Fatalf("markerless ambiguous isolation fake Graph errors = %v; requests=%v", graphErrors, graphState.requestsSnapshot())

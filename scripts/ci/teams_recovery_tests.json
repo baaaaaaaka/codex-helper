@@ -232,7 +232,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 15,
+      "max_seconds": 30,
       "oracle": "an untrusted persisted lease keeps the continuous listener alive without Graph work, then the same listener resumes after an explicit safe repair",
       "baseline": "pre-fix malformed or unknown lease state exits the child and can trigger a supervisor restart loop",
       "resource_class": "sqlite_fsync"

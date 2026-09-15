@@ -81,6 +81,11 @@ func TestBridgeRecoversPersistedAndQueuedInboundOrphansAcrossBackends(t *testing
 			if got := executor.promptCount(); got != 2 {
 				t.Fatalf("recovery replayed already-linked inbound; prompt count = %d, want 2", got)
 			}
+			// The executor is launched asynchronously. Join it before the subtest
+			// cleanup closes the temporary store, otherwise a hosted Windows race
+			// run can leave a late durable completion holding the SQLite directory
+			// open.
+			waitForBridgeAsyncTurns(t, bridge)
 		})
 	}
 }

@@ -6802,9 +6802,11 @@ func TestSQLiteHotPollAdmissionBoundsSemanticallyMalformedPollLaneAndPreservesHe
 	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
 		// Keep the fixture construction bounded as one statement. This produces
 		// the same valid-but-undecodable JSON for every row while avoiding 520
-		// repeated SQL parses on the Windows race runner.
+		// repeated SQL parses on the Windows race runner. Do not use json_set
+		// here: parsing and rewriting every JSON blob makes the fixture itself
+		// exceed the hot-poll compatibility budget on hosted race runners.
 		if _, err := tx.ExecContext(ctx, `UPDATE chat_polls
-SET json = json_set(json, '$.next_poll_at', 17), frontier_active = 0
+SET json = '{"chat_id":"' || chat_id || '","seeded":true,"state":"hot","next_poll_at":17}', frontier_active = 0
 WHERE chat_id LIKE 'chat-semantic-malformed-poll-lane-%'`); err != nil {
 			return err
 		}

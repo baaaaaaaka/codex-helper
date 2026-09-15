@@ -44,11 +44,19 @@ mutations = {
     "chat-error-global": (
         "internal/teams/bridge.go",
         '''\t\t\t\tif err := runPhase("linked-transcript", func(phaseCtx context.Context) error {
+\t\t\t\t\tallowed, err := b.normalOptionalMaintenanceStillAllowed(phaseCtx)
+\t\t\t\t\tif err != nil || !allowed {
+\t\t\t\t\t\treturn err
+\t\t\t\t\t}
 \t\t\t\t\treturn b.syncLinkedTranscriptsIfDue(phaseCtx, time.Now())
 \t\t\t\t}); err != nil && b.out != nil {
 \t\t\t\t\t_, _ = fmt.Fprintf(b.out, "Teams transcript sync error: %v\\n", err)
 \t\t\t\t}''',
         '''\t\t\t\tif err := runPhase("linked-transcript", func(phaseCtx context.Context) error {
+\t\t\t\t\tallowed, err := b.normalOptionalMaintenanceStillAllowed(phaseCtx)
+\t\t\t\t\tif err != nil || !allowed {
+\t\t\t\t\t\treturn err
+\t\t\t\t\t}
 \t\t\t\t\treturn b.syncLinkedTranscriptsIfDue(phaseCtx, time.Now())
 \t\t\t\t}); err != nil {
 \t\t\t\t\treturn err // mutation: a chat-local error stops the listener
