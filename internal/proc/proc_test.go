@@ -5,6 +5,7 @@ package proc
 import (
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -37,7 +38,7 @@ func TestIsAliveAfterProcessExit(t *testing.T) {
 }
 
 func TestIsAliveTreatsLinuxZombieAsDead(t *testing.T) {
-	if _, err := os.Stat("/proc/self/stat"); err != nil {
+	if runtime.GOOS != "linux" {
 		t.Skip("requires Linux procfs")
 	}
 	cmd := exec.Command("sh", "-c", "exit 0")
@@ -60,6 +61,15 @@ func TestIsAliveTreatsLinuxZombieAsDead(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Skip("child did not become a visible zombie before timeout")
+}
+
+func TestIsLinuxZombieTreatsMissingProcEntryAsDead(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("requires Linux procfs")
+	}
+	if !isLinuxZombie(1 << 30) {
+		t.Fatal("missing Linux proc entry must be treated as dead")
+	}
 }
 
 func TestLinuxProcStateFromStatParsesLastParen(t *testing.T) {

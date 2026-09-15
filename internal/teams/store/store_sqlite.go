@@ -4094,7 +4094,7 @@ LIMIT 1`, controlChatID, controlChatID).Scan(&hasValidUntrustedPoll); errors.Is(
 		if operational {
 			where += `
 	  AND ` + frontier + ` != 0
-		  AND ((` + pendingPage + ` = 1 AND ` + pendingPageGraphReplay + ` = 0) OR (` + nextPollDue + ` <= julianday(?)
+			  AND ((` + pendingPage + ` = 1 AND ` + pendingPageGraphReplay + ` = 0) OR (` + nextPollDue + ` <= julianday(?)
 	       AND ` + blockedUntilDue + ` <= julianday(?)))`
 			args = append(args, now.UTC().Format(time.RFC3339Nano), now.UTC().Format(time.RFC3339Nano))
 		} else {
@@ -8150,7 +8150,7 @@ func ensureSQLiteSchemaContext(ctx context.Context, db *sql.DB) (err error) {
 		_, _ = db.Exec(`DELETE FROM state_meta WHERE key = ?`, sqliteSchemaPreparationVersionKey)
 		return err
 	}
-	if err := ensureSQLiteChatPollFrontierHintTriggers(db); err != nil {
+	if err := ensureSQLiteChatPollFrontierHintTriggersContext(ctx, db); err != nil {
 		return err
 	}
 	if err := ensureSQLiteAdmissionProjectionTriggers(db); err != nil {
@@ -9260,7 +9260,14 @@ func sqliteOutboxTurnProjectionNativeObjectReady(object map[string]json.RawMessa
 // helper-owned triggers so an old helper cannot turn a dormant gap back into
 // an operational frontier after the migration backfill.
 func ensureSQLiteChatPollFrontierHintTriggers(db *sql.DB) error {
-	current, err := sqliteChatPollFrontierHintTriggersCurrent(db)
+	return ensureSQLiteChatPollFrontierHintTriggersContext(context.Background(), db)
+}
+
+func ensureSQLiteChatPollFrontierHintTriggersContext(ctx context.Context, db *sql.DB) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	current, err := sqliteChatPollFrontierHintTriggersCurrentContext(ctx, db)
 	if err != nil {
 		return err
 	}
@@ -9322,7 +9329,14 @@ END`,
 }
 
 func sqliteChatPollFrontierHintTriggersCurrent(db *sql.DB) (bool, error) {
-	rows, err := db.Query(`SELECT name, COALESCE(sql, '') FROM sqlite_master
+	return sqliteChatPollFrontierHintTriggersCurrentContext(context.Background(), db)
+}
+
+func sqliteChatPollFrontierHintTriggersCurrentContext(ctx context.Context, db *sql.DB) (bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	rows, err := db.QueryContext(ctx, `SELECT name, COALESCE(sql, '') FROM sqlite_master
 WHERE type = 'trigger' AND name IN (?, ?)
 ORDER BY name`, "chat_polls_frontier_hint_repair_insert", "chat_polls_frontier_hint_repair_update")
 	if err != nil {

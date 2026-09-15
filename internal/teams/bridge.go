@@ -31,6 +31,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	"github.com/baaaaaaaka/codex-helper/internal/teams/machineregistry"
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
+	"github.com/baaaaaaaka/codex-helper/internal/testphase"
 	xhtml "golang.org/x/net/html"
 )
 
@@ -1122,6 +1123,11 @@ type Bridge struct {
 	// bridge's smaller per-cycle selection quantum. The callback is observation
 	// only and must not mutate the decision slice.
 	pollDecisionTraceHook func(string, []inboundPollDecision)
+	// pollAttemptBeforeTerminalCommitHook is a test-only seam for the narrow
+	// window after handler work has finished and before the terminal capability
+	// CAS. It lets recovery tests place a legitimate retained-capability
+	// scheduler update at that boundary without adding a production sleep.
+	pollAttemptBeforeTerminalCommitHook func(string, teamstore.ChatPollAttemptCapability, uint64)
 	// outboxSendHook is a narrow test seam used to stop immediately before a
 	// Graph side effect. Production bridges leave it nil; recovery tests use it
 	// to make a durable restart boundary deterministic without manufacturing an
@@ -2498,8 +2504,15 @@ func (b *Bridge) listenOwnerGeneration(ctx context.Context, opts BridgeOptions) 
 	if deferMigration, err := b.shouldDeferTeamsStoreSQLiteMigration(ownerWorkCtx); err != nil {
 		return err
 	} else if !deferMigration {
-		if err := b.migrateTeamsStoreToSQLiteOrFallback(ownerWorkCtx); err != nil {
-			return err
+		testphase.Emit("bridge_startup_migration_started", nil)
+		migrationStarted := time.Now()
+		migrationErr := b.migrateTeamsStoreToSQLiteOrFallback(ownerWorkCtx)
+		testphase.Emit("bridge_startup_migration_finished", map[string]string{
+			"duration_ms": fmt.Sprintf("%d", time.Since(migrationStarted).Milliseconds()),
+			"success":     fmt.Sprintf("%t", migrationErr == nil),
+		})
+		if migrationErr != nil {
+			return migrationErr
 		}
 		// A legacy JSON store can have become SQLite during the migration above.
 		// Prepare again at that boundary so a newly created sidecar also reaches
@@ -2562,6 +2575,7 @@ func (b *Bridge) listenOwnerGeneration(ctx context.Context, opts BridgeOptions) 
 		_, _ = fmt.Fprintf(b.out, "Teams control chat: %s\n", chat.WebURL)
 		_, _ = fmt.Fprintln(b.out, "Listening. Send `help`, `p`, or `n <directory>` in the control chat.")
 	}
+	testphase.Emit("bridge_startup_ready", nil)
 	for {
 		if teamsStartupFallbackStopRequested() {
 			if b.out != nil {
@@ -5862,6 +5876,9 @@ func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string
 		return result.Handled, nil
 	} else {
 		expectedRevision = refreshed
+	}
+	if b.pollAttemptBeforeTerminalCommitHook != nil {
+		b.pollAttemptBeforeTerminalCommitHook(chatID, attemptCapability, expectedRevision)
 	}
 	if handlerErr != nil {
 		var readGateErr *graphReadGateActiveError

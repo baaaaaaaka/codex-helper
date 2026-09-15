@@ -22,11 +22,13 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
+	"github.com/baaaaaaaka/codex-helper/internal/testphase"
 	_ "modernc.org/sqlite"
 )
 
@@ -1037,7 +1039,10 @@ func startListenerRecovery(t *testing.T, bridge *Bridge, options BridgeOptions) 
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- bridge.Listen(ctx, options) }()
+	go func() {
+		testphase.Emit("listener_goroutine_started", nil)
+		done <- bridge.Listen(ctx, options)
+	}()
 	handle := &listenerRecoveryHandle{cancel: cancel, done: done}
 	t.Cleanup(func() { handle.stop(t) })
 	return handle
@@ -1064,6 +1069,7 @@ func (h *listenerRecoveryHandle) stop(t *testing.T) {
 		h.cancel()
 		select {
 		case h.err = <-h.done:
+			testphase.Emit("listener_stopped", nil)
 		case <-time.After(5 * time.Second):
 			t.Errorf("listener recovery test listener did not stop within 5s")
 		}
@@ -2124,6 +2130,30 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 		called: make(chan string),
 	}
 	bridge := newBridgeTestBridge(graph, store, executor)
+	// Arm a deterministic barrier only after the continuation request has
+	// started. The hook pauses the second page after handler work has completed
+	// but before terminal CAS, so the explicit final-answer boost below cannot be
+	// mistaken for a timing-dependent sleep experiment.
+	var terminalBarrierArmed atomic.Bool
+	terminalCommitEntered := make(chan struct{})
+	terminalCommitRelease := make(chan struct{})
+	var terminalCommitOnce sync.Once
+	bridge.pollAttemptBeforeTerminalCommitHook = func(hChatID string, _ teamstore.ChatPollAttemptCapability, _ uint64) {
+		if hChatID != chatID || !terminalBarrierArmed.Load() {
+			return
+		}
+		terminalCommitOnce.Do(func() {
+			close(terminalCommitEntered)
+			<-terminalCommitRelease
+		})
+	}
+	t.Cleanup(func() {
+		select {
+		case <-terminalCommitRelease:
+		default:
+			close(terminalCommitRelease)
+		}
+	})
 	// Keep the real listener's history-watch phase out of the host user's
 	// Codex directory.  This test is about a stateful Graph frontier; inheriting
 	// CODEX_HOME (or the default user home) can make an unrelated session scan
@@ -2250,10 +2280,33 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 	} else if boosted.Attempt == nil || boosted.Attempt.ExpectedPollRevision != boosted.PollRevision {
 		t.Fatalf("stateful poll boost did not merge the live attempt revision: %#v", boosted)
 	}
+	terminalBarrierArmed.Store(true)
 	close(continuationRelease)
 	// The poll phase is deliberately serial with outbox delivery. The first
 	// final cannot be sent until this held continuation is released; the
 	// revision assertion above is therefore the correct pre-release boundary.
+	select {
+	case <-terminalCommitEntered:
+	case <-time.After(listenerRecoveryExtendedProgressTimeout):
+		t.Fatal("stateful terminal CAS barrier was not reached")
+	}
+	// Advance the retained capability after the handler has read its revision.
+	// The terminal commit must adopt this safe scheduler revision atomically;
+	// an old strict CAS would leave the pending page and attempt stranded.
+	boosted, changed, err = store.BoostChatPollAfterFinalAnswer(context.Background(), teamstore.FinalAnswerPollBoostRequest{
+		SessionID:      "s-stateful",
+		TeamsChatID:    chatID,
+		NextPollAt:     time.Now().UTC().Add(5 * time.Second),
+		LastActivityAt: time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatalf("advance terminal-boundary poll revision: %v", err)
+	} else if !changed {
+		t.Fatal("terminal-boundary poll revision was not advanced")
+	} else if boosted.Attempt == nil || boosted.Attempt.ExpectedPollRevision != boosted.PollRevision {
+		t.Fatalf("terminal-boundary poll boost did not merge the live attempt revision: %#v", boosted)
+	}
+	close(terminalCommitRelease)
 	deadline := time.Now().Add(listenerRecoveryExtendedProgressTimeout)
 	for time.Now().Before(deadline) {
 		calls := executor.callsSnapshot()
@@ -5475,17 +5528,12 @@ func TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover(t *test
 // staging, attempt ownership, or the first generation's durable commit.
 func runListenerRecoveryPollFrontierSurvivesReopen(t *testing.T, useSQLite bool) {
 	t.Helper()
-	// The SQLite-backed first generation performs a durable continuation
-	// transition while the full hosted package is under load. Keep this bound
-	// finite so a real liveness failure still fails, but give the complete
-	// Graph/outbox/state transition the same backlog budget as the other
-	// recovery fixtures.
-	// This vertical fixture crosses two durable poll generations and a full
-	// SQLite/Graph continuation. Under -race the same safe transition can take
-	// longer than the ordinary 20-second hosted-runner margin; keep the
-	// liveness bound finite but use the multi-step budget so instrumentation
-	// does not turn a correct frontier test into a false failure.
-	progressTimeout := listenerRecoveryMultiStepProgressTimeout
+	// Both backend variants perform a complete production listener cycle and
+	// then reopen the durable frontier. On hosted Windows the JSON variant can
+	// spend tens of seconds in the two-message/outbox drain even after startup
+	// is ready. Use the existing finite durable-I/O budget so the assertion
+	// measures frontier completion rather than an unrelated short watchdog.
+	progressTimeout := listenerRecoveryDurableIOProgressTimeout
 	ctx := context.Background()
 	storePath := filepath.Join(t.TempDir(), "state.json")
 	chatID := "chat-reopen-frontier"
@@ -5656,7 +5704,12 @@ func runListenerRecoveryPollContinuationSurvivesReopenBeforeDrain(t *testing.T, 
 	}
 	firstOptions := listenerRecoveryBaseOptions(firstStore, filepath.Join(t.TempDir(), "registry-first.json"), firstExecutor)
 	firstOptions.Interval = time.Hour
-	firstOptions.PhaseBudget = 5 * time.Second
+	// The first page is observed after real listener startup, including the
+	// legacy JSON-to-SQLite compatibility migration that production performs on
+	// every new owner. Keep the production phase budget here so a slow durable
+	// startup cannot cancel the first page before the restart boundary is even
+	// reached; the outer progress watchdog still fails a genuinely stuck owner.
+	firstOptions.PhaseBudget = mainLoopPhaseBudget
 	// This fixture intentionally suppresses the next cycle until the
 	// continuation is interrupted. Keep the worker budget at the production
 	// value so a slow Windows durable transition cannot cancel the only first

@@ -251,6 +251,109 @@ func TestTeamsGraph429StressOutboxMaintainsAvailabilityAndSuppressesLoopsCI(t *t
 	requireTeamsGraph429OutboxFinalState(t, store, blockedChats, requests, sentPlain, remotePlain, scale)
 }
 
+// TestTeamsGraph429SQLiteAdmissionDoesNotLoseTheRetry exercises the production
+// SQLite candidate path after a retryable Graph failure. The first request is
+// deliberately made while the chat is recent so it is admitted normally; the
+// test then ages only the disposable schedule row before the retry. This models
+// a real old/cold chat whose durable FailureCount/NextPollAt says it must retry,
+// and proves that idle admission does not hide that retry after the gate opens.
+func TestTeamsGraph429SQLiteAdmissionDoesNotLoseTheRetry(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+	store := newBridgeTestStore(t)
+	blockedChat := "sqlite-admission-429-blocked"
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/chats/"+blockedChat+"/messages" {
+			t.Fatalf("unexpected SQLite admission Graph request: %s %s", r.Method, r.URL.String())
+		}
+		requests++
+		if requests == 1 {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, `{"error":{"code":"TooManyRequests","message":"SQLite admission retry"}}`, http.StatusTooManyRequests)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"value":[]}`)
+	}))
+	t.Cleanup(server.Close)
+	readGraph := &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep: func(context.Context, time.Duration) error {
+			t.Fatal("SQLite admission 429 path attempted hidden Graph sleep")
+			return nil
+		},
+		jitter: func(d time.Duration) time.Duration { return d },
+	}
+	writeGraph, _ := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	bridge.readGraph = readGraph
+	bridge.reg.Sessions = nil
+	bridge.maxWorkChatPollsPerCycle = 1
+	bridge.pollWorkerBudget = 5 * time.Second
+	seedTeamsGraph429ControlPoll(t, store, now)
+	session := Session{
+		ID:        "sqlite-admission-429-session",
+		ChatID:    blockedChat,
+		ChatURL:   "https://teams.example/" + blockedChat,
+		Topic:     blockedChat,
+		Status:    "active",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	bridge.reg.Sessions = append(bridge.reg.Sessions, session)
+	if err := bridge.ensureDurableSession(ctx, &bridge.reg.Sessions[0]); err != nil {
+		t.Fatalf("ensure durable SQLite admission session: %v", err)
+	}
+	if _, err := store.RecordChatPollSuccess(ctx, blockedChat, now.Add(-time.Minute), true, false, 1); err != nil {
+		t.Fatalf("seed SQLite admission poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
+		ChatID: blockedChat, PollState: inboundPollStateWarm,
+		NextPollAt: now.Add(-time.Second), LastActivityAt: now,
+	}); err != nil {
+		t.Fatalf("schedule SQLite admission poll: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate SQLite admission fixture: %v", err)
+	}
+
+	if err := bridge.pollOnce(ctx, ownerPollMessageTop); err != nil {
+		t.Fatalf("first SQLite admission poll: %v", err)
+	}
+	poll, ok, err := store.ChatPoll(ctx, blockedChat)
+	if err != nil || !ok {
+		t.Fatalf("read SQLite admission poll after 429: ok=%v err=%v poll=%#v", ok, err, poll)
+	}
+	if requests != 1 || poll.FailureCount != 1 || poll.LastError == "" || !poll.NextPollAt.After(poll.LastErrorAt) {
+		t.Fatalf("SQLite admission state after 429: requests=%d poll=%#v", requests, poll)
+	}
+	// Age only the disposable activity/schedule fields. FailureCount and the
+	// retry error remain durable, matching an old chat that failed after its
+	// last successful activity; no cursor/seen/frontier field is changed.
+	old := now.Add(-49 * time.Hour)
+	if _, err := store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
+		ChatID: blockedChat, PollState: inboundPollStateCold,
+		NextPollAt: time.Now().Add(-time.Second), LastActivityAt: old,
+		ClearBlockedUntil: true,
+	}); err != nil {
+		t.Fatalf("age SQLite admission retry fixture: %v", err)
+	}
+	if err := bridge.pollOnce(ctx, ownerPollMessageTop); err != nil {
+		t.Fatalf("second SQLite admission poll after durable retry gate: %v", err)
+	}
+	poll, ok, err = store.ChatPoll(ctx, blockedChat)
+	if err != nil || !ok {
+		t.Fatalf("read SQLite admission poll after recovery: ok=%v err=%v poll=%#v", ok, err, poll)
+	}
+	if requests != 2 || poll.FailureCount != 0 || poll.LastError != "" || poll.LastSuccessfulPollAt.IsZero() {
+		t.Fatalf("SQLite admission retry was lost: requests=%d poll=%#v", requests, poll)
+	}
+}
+
 func TestTeamsGraph429PollAutomaticallyRecoversWithoutManualUnblock(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
@@ -374,109 +477,6 @@ func TestTeamsGraph429PollAutomaticallyRecoversWithoutManualUnblock(t *testing.T
 	}
 	if blockedPoll.PollState == inboundPollStateBlocked || !blockedPoll.BlockedUntil.IsZero() || strings.TrimSpace(blockedPoll.LastError) != "" || blockedPoll.FailureCount != 0 {
 		t.Fatalf("blocked chat did not automatically recover after finite 429 sequence: %#v", blockedPoll)
-	}
-}
-
-// TestTeamsGraph429SQLiteAdmissionDoesNotLoseTheRetry exercises the production
-// SQLite candidate path after a retryable Graph failure. The first request is
-// deliberately made while the chat is recent so it is admitted normally; the
-// test then ages only the disposable schedule row before the retry. This models
-// a real old/cold chat whose durable FailureCount/NextPollAt says it must retry,
-// and proves that idle admission does not hide that retry after the gate opens.
-func TestTeamsGraph429SQLiteAdmissionDoesNotLoseTheRetry(t *testing.T) {
-	ctx := context.Background()
-	now := time.Now().UTC()
-	store := newBridgeTestStore(t)
-	blockedChat := "sqlite-admission-429-blocked"
-	var requests int
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet || r.URL.Path != "/chats/"+blockedChat+"/messages" {
-			t.Fatalf("unexpected SQLite admission Graph request: %s %s", r.Method, r.URL.String())
-		}
-		requests++
-		if requests == 1 {
-			w.Header().Set("Retry-After", "1")
-			http.Error(w, `{"error":{"code":"TooManyRequests","message":"SQLite admission retry"}}`, http.StatusTooManyRequests)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = fmt.Fprintf(w, `{"value":[]}`)
-	}))
-	t.Cleanup(server.Close)
-	readGraph := &GraphClient{
-		auth:       &fakeGraphAuth{token: "access"},
-		client:     server.Client(),
-		baseURL:    server.URL,
-		maxRetries: 0,
-		sleep: func(context.Context, time.Duration) error {
-			t.Fatal("SQLite admission 429 path attempted hidden Graph sleep")
-			return nil
-		},
-		jitter: func(d time.Duration) time.Duration { return d },
-	}
-	writeGraph, _ := newBridgeTestGraph(t)
-	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
-	bridge.readGraph = readGraph
-	bridge.reg.Sessions = nil
-	bridge.maxWorkChatPollsPerCycle = 1
-	bridge.pollWorkerBudget = 5 * time.Second
-	seedTeamsGraph429ControlPoll(t, store, now)
-	session := Session{
-		ID:        "sqlite-admission-429-session",
-		ChatID:    blockedChat,
-		ChatURL:   "https://teams.example/" + blockedChat,
-		Topic:     blockedChat,
-		Status:    "active",
-		CreatedAt: now,
-		UpdatedAt: now,
-	}
-	bridge.reg.Sessions = append(bridge.reg.Sessions, session)
-	if err := bridge.ensureDurableSession(ctx, &bridge.reg.Sessions[0]); err != nil {
-		t.Fatalf("ensure durable SQLite admission session: %v", err)
-	}
-	if _, err := store.RecordChatPollSuccess(ctx, blockedChat, now.Add(-time.Minute), true, false, 1); err != nil {
-		t.Fatalf("seed SQLite admission poll: %v", err)
-	}
-	if _, err := store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
-		ChatID: blockedChat, PollState: inboundPollStateWarm,
-		NextPollAt: now.Add(-time.Second), LastActivityAt: now,
-	}); err != nil {
-		t.Fatalf("schedule SQLite admission poll: %v", err)
-	}
-	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
-		t.Fatalf("migrate SQLite admission fixture: %v", err)
-	}
-
-	if err := bridge.pollOnce(ctx, ownerPollMessageTop); err != nil {
-		t.Fatalf("first SQLite admission poll: %v", err)
-	}
-	poll, ok, err := store.ChatPoll(ctx, blockedChat)
-	if err != nil || !ok {
-		t.Fatalf("read SQLite admission poll after 429: ok=%v err=%v poll=%#v", ok, err, poll)
-	}
-	if requests != 1 || poll.FailureCount != 1 || poll.LastError == "" || !poll.NextPollAt.After(poll.LastErrorAt) {
-		t.Fatalf("SQLite admission state after 429: requests=%d poll=%#v", requests, poll)
-	}
-	// Age only the disposable activity/schedule fields. FailureCount and the
-	// retry error remain durable, matching an old chat that failed after its
-	// last successful activity; no cursor/seen/frontier field is changed.
-	old := now.Add(-49 * time.Hour)
-	if _, err := store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
-		ChatID: blockedChat, PollState: inboundPollStateCold,
-		NextPollAt: time.Now().Add(-time.Second), LastActivityAt: old,
-		ClearBlockedUntil: true,
-	}); err != nil {
-		t.Fatalf("age SQLite admission retry fixture: %v", err)
-	}
-	if err := bridge.pollOnce(ctx, ownerPollMessageTop); err != nil {
-		t.Fatalf("second SQLite admission poll after durable retry gate: %v", err)
-	}
-	poll, ok, err = store.ChatPoll(ctx, blockedChat)
-	if err != nil || !ok {
-		t.Fatalf("read SQLite admission poll after recovery: ok=%v err=%v poll=%#v", ok, err, poll)
-	}
-	if requests != 2 || poll.FailureCount != 0 || poll.LastError != "" || poll.LastSuccessfulPollAt.IsZero() {
-		t.Fatalf("SQLite admission retry was lost: requests=%d poll=%#v", requests, poll)
 	}
 }
 

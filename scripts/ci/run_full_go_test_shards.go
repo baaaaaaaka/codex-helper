@@ -28,18 +28,41 @@ import (
 )
 
 const (
-	defaultShardCount = 8
+	defaultShardCount = 16
 	maxConcurrentJobs = 4
 )
 
 var runnableNamePattern = regexp.MustCompile(`^(Test|Example|Fuzz)[A-Za-z0-9_]*$`)
 
-// A small number of tests intentionally exercise long-lived listener state,
-// timing-sensitive error isolation, or process-wide performance fixtures. These
-// tests are independently correct but share process-global test plumbing with
-// older package fixtures. Keep them in their own test process rather than
-// allowing unrelated tests to make their timing assertions nondeterministic.
+// Host-sensitive test families intentionally exercise long-lived listener
+// state, timing-sensitive error isolation, or process-wide performance
+// fixtures. These tests are independently correct but share process-global
+// test plumbing with older package fixtures. Keep them in their own test
+// process rather than allowing unrelated tests to make their timing assertions
+// nondeterministic.
 var isolatedRunnableNames = map[string]map[string]bool{
+	"./internal/cli": {
+		// This fixture starts a real Codex-shaped process tree and asserts
+		// bounded process-group cancellation. Keep it out of the ordinary
+		// package pool, where unrelated test processes can make the PID and
+		// signal observation nondeterministic.
+		"TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup": true,
+		// App Gateway daemon tests observe short registration, cooldown, and
+		// restart windows. Running the package beside Teams/store shards can
+		// delay those observations on hosted Windows runners even though the
+		// daemon fixture itself is isolated in a temporary directory.
+		"TestRunAppGatewayDaemonKeepsStableFrontendWhileBackendRuns":            true,
+		"TestRunAppGatewayDaemonDoesNotConsumeLegacyBlockedBudget":              true,
+		"TestRunAppGatewayDaemonModernStandbyDNSGapThenRecoveryKeepsClientPort": true,
+		"TestRunAppGatewayDaemonBoundsBackendRecoveryBeforeCooldown":            true,
+		"TestRunAppGatewayDaemonBackendSwapKeepsFrontendPort":                   true,
+		"TestRunAppGatewayDaemonRestartReusesStablePort":                        true,
+		// These tests launch a detached child and observe a short /proc reaping
+		// window. Keep their process-tree observation away from concurrent race
+		// shard pressure so an exited PID cannot be sampled through a stale read.
+		"TestProxyStartBackgroundReapsExitedDetachedChild":     true,
+		"TestStartCodexAppProxyDaemonReapsExitedDetachedChild": true,
+	},
 	"./internal/tui": {
 		// This test drives a real refresh ticker and has a short semantic
 		// context. Keep its scheduler observation independent from the large
@@ -102,6 +125,10 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		// unrelated store shards share the hosted runner. Keep the migration
 		// observation isolated instead of weakening its finite assertions.
 		"TestStoreHistoryWatchOwnerCapabilityFencesTakeoverAcrossBackends": true,
+		// This cross-backend legacy-owner test performs the same durable lease
+		// migration and can spend its whole short budget in a Windows SQLite
+		// commit. Keep its two backend assertions in a clean process as well.
+		"TestStoreOwnerBindsLegacyQueuedTurnAndRejectsPreviousOwnerCallbacks": true,
 	},
 }
 
@@ -111,6 +138,17 @@ var isolatedRunnableNames = map[string]map[string]bool{
 // runner's scheduler and filesystem while a finite liveness observation is in
 // progress.
 var exclusiveRunnableNames = map[string]map[string]bool{
+	"./internal/cli": {
+		"TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup":     true,
+		"TestRunAppGatewayDaemonKeepsStableFrontendWhileBackendRuns":            true,
+		"TestRunAppGatewayDaemonDoesNotConsumeLegacyBlockedBudget":              true,
+		"TestRunAppGatewayDaemonModernStandbyDNSGapThenRecoveryKeepsClientPort": true,
+		"TestRunAppGatewayDaemonBoundsBackendRecoveryBeforeCooldown":            true,
+		"TestRunAppGatewayDaemonBackendSwapKeepsFrontendPort":                   true,
+		"TestRunAppGatewayDaemonRestartReusesStablePort":                        true,
+		"TestProxyStartBackgroundReapsExitedDetachedChild":                      true,
+		"TestStartCodexAppProxyDaemonReapsExitedDetachedChild":                  true,
+	},
 	"./internal/tui": {
 		"TestSelectSessionAutoRefreshUpdatesThreadNameTitle": true,
 	},
@@ -139,12 +177,22 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestTeamsOwnershipStressTranscriptCatchupWhileTUIContinuesCI":             true,
 		"TestTeamsOwnershipStressFifthChatReachesNextWorkerWaveCI":                 true,
 		"TestTeamsOutboxAcceptedResponseFinishesAfterPhaseDeadline":                true,
+		// These outbox regressions exercise durable SQLite/file boundaries in
+		// addition to fairness. Keep the process isolated and serialize it on the
+		// hosted runner so unrelated shard I/O cannot turn the durable assertion
+		// into another readiness tail.
+		"TestTeamsMainLoopOutboxFairnessBypassesPersistentGraphFailurePrefix":  true,
+		"TestTeamsMainLoopOutboxFairnessCursorWalksPastDistinctChatScanPrefix": true,
+		"TestTeamsMainLoopOutboxFairnessWalksPastDistinctChatScanPrefix":       true,
+		"TestTeamsMainLoopOutboxLedgerFailureDoesNotStarveHealthyTail":         true,
+		"TestTeamsUnresolvedTranscriptOutboxDoesNotLivelockHealthyTail":        true,
 	},
 	"./internal/teams/store": {
 		"TestSQLiteHotPollAdmissionBoundsSemanticallyMalformedPollLaneAndPreservesHealthyChat": true,
 		"TestSQLiteSemanticallyMalformedOutboxRowsDoNotHideHealthyWork":                        true,
 		"TestSQLiteHotPollWorkCandidatesRotateOperationalRowsBeyondLimit":                      true,
 		"TestStoreHistoryWatchOwnerCapabilityFencesTakeoverAcrossBackends":                     true,
+		"TestStoreOwnerBindsLegacyQueuedTurnAndRejectsPreviousOwnerCallbacks":                  true,
 	},
 }
 
@@ -171,18 +219,21 @@ type shardPlan struct {
 	packageName string
 	prefixes    []string
 	count       int
+	weight      int
 	exclusive   bool
 }
 
 type testJob struct {
 	label     string
 	args      []string
+	weight    int
 	exclusive bool
 }
 
 type jobResult struct {
-	label string
-	err   error
+	label    string
+	err      error
+	duration time.Duration
 }
 
 func main() {
@@ -236,7 +287,7 @@ func main() {
 			for _, arg := range job.args {
 				fmt.Printf(" %q", arg)
 			}
-			fmt.Println()
+			fmt.Printf(" # estimated-weight=%d estimated-exclusive=%t\n", job.weight, job.exclusive)
 		}
 		return
 	}
@@ -258,24 +309,111 @@ func main() {
 }
 
 // partitionTestJobs assigns complete test processes to independent hosted
-// runners.  This is deliberately done after makeJobs has established the
+// runners. This is deliberately done after makeJobs has established the
 // exact-once name coverage and after host-sensitive tests have been marked
-// exclusive.  A partition therefore never runs half of a test, and the
+// exclusive. A partition therefore never runs half of a test, and the
 // existing exclusive-before-parallel ordering is retained within each runner.
 // The runners have independent filesystems, so this increases wall-clock
 // parallelism without introducing the same-runner SQLite contention that
 // prevents increasing maxConcurrentJobs safely.
+//
+// Jobs are placed by descending estimated work rather than by index modulo.
+// Large package shards use their discovered test-name count as the estimate;
+// isolated semantic families use a small conservative multiplier. Exclusive
+// and parallel jobs are assigned independently because the former is a serial
+// phase while the latter is drained by a four-process worker pool. The estimate
+// is only for cross-runner bin packing: every selected command still runs with
+// its original timeout, race mode, selector, and assertions.
 func partitionTestJobs(jobs []testJob, partitionCount, partitionIndex int) []testJob {
 	if partitionCount <= 1 {
 		return jobs
 	}
+	assignments := make([]int, len(jobs))
+	for _, exclusive := range []bool{true, false} {
+		indices := make([]int, 0, len(jobs))
+		for index := range jobs {
+			if jobs[index].exclusive == exclusive {
+				indices = append(indices, index)
+			}
+			if jobs[index].weight <= 0 {
+				jobs[index].weight = 1
+			}
+		}
+		assignBalancedJobIndices(jobs, indices, partitionCount, assignments)
+	}
 	selected := make([]testJob, 0, (len(jobs)+partitionCount-1)/partitionCount)
 	for index, job := range jobs {
-		if index%partitionCount == partitionIndex {
+		if assignments[index] == partitionIndex {
 			selected = append(selected, job)
 		}
 	}
 	return selected
+}
+
+// assignBalancedJobIndices uses deterministic largest-first packing for one
+// execution phase. Keeping phases separate prevents a large parallel shard from
+// hiding a serial exclusive wave (or vice versa) in a single aggregate score.
+func assignBalancedJobIndices(jobs []testJob, indices []int, partitionCount int, assignments []int) {
+	if len(indices) == 0 {
+		return
+	}
+	type partitionBin struct {
+		weight int
+		jobs   int
+	}
+	bins := make([]partitionBin, partitionCount)
+	sort.SliceStable(indices, func(i, j int) bool {
+		left, right := jobs[indices[i]], jobs[indices[j]]
+		if left.weight != right.weight {
+			return left.weight > right.weight
+		}
+		return left.label < right.label
+	})
+	for _, jobIndex := range indices {
+		best := 0
+		for index := 1; index < len(bins); index++ {
+			if bins[index].weight < bins[best].weight ||
+				(bins[index].weight == bins[best].weight && bins[index].jobs < bins[best].jobs) {
+				best = index
+			}
+		}
+		assignments[jobIndex] = best
+		bins[best].weight += jobs[jobIndex].weight
+		bins[best].jobs++
+	}
+}
+
+func estimatedIsolatedJobWeight(packageName, name string) int {
+	// A discovered test name is one logical job even when it contains many
+	// subtests. These families are known to perform bounded listener, process,
+	// or SQLite observations, so give them a conservative scheduling weight to
+	// avoid placing all of the long single-test jobs in one hosted partition.
+	if isTeamsRecoveryPackage(packageName) {
+		switch {
+		case strings.HasPrefix(name, "TestTeamsListenFalse"), strings.HasPrefix(name, "TestTeamsOwnershipStress"):
+			return 8
+		case strings.HasPrefix(name, "TestTeamsMainLoopOutbox"), strings.Contains(name, "SQLite"):
+			return 4
+		case strings.Contains(name, "Stress"), strings.Contains(name, "Outbox"):
+			return 4
+		}
+	}
+	if isCodexRunnerPackage(packageName) || strings.Contains(name, "AppGateway") {
+		return 4
+	}
+	return 1
+}
+
+func estimatedRegularJobWeight(testNameCount int) int {
+	if testNameCount <= 0 {
+		return 1
+	}
+	// Ordinary packages are deliberately kept as one process, so their raw
+	// name count is not comparable to a large-package shard. A conservative
+	// eight-name bucket keeps a 1,400-name CLI package near the cost of one
+	// 250-name Teams shard while still leaving the full package invocation
+	// intact.
+	return (testNameCount + 7) / 8
 }
 
 func fatal(err error) {
@@ -302,10 +440,83 @@ func listPackages() ([]string, error) {
 
 func makeJobs(packages []string, shardCount, parallel int, testTimeout time.Duration, race bool) ([]testJob, error) {
 	var ordinary []string
+	var ordinaryIsolated []testJob
 	var plans []shardPlan
 	for _, packageName := range packages {
 		if !isLargePackage(packageName) {
-			ordinary = append(ordinary, packageName)
+			if len(isolatedRunnableNamesForPackage(packageName)) == 0 && !isCodexRunnerPackage(packageName) {
+				ordinary = append(ordinary, packageName)
+				continue
+			}
+			// Ordinary packages may still contain a small, reviewed family of
+			// host-sensitive tests. Discover the names before constructing the
+			// ordinary job so semantic families receive the same exact-once
+			// process/resource boundary as large packages.
+			names, err := listRunnableNames(packageName, race)
+			if err != nil {
+				return nil, err
+			}
+			isolated := runnableIsolationMap(packageName, names)
+			if len(isolated) == 0 {
+				ordinary = append(ordinary, packageName)
+				continue
+			}
+			var isolatedNames []string
+			var regularNames []string
+			for _, name := range names {
+				if isolated[name] {
+					isolatedNames = append(isolatedNames, name)
+				} else {
+					regularNames = append(regularNames, name)
+				}
+			}
+			if len(isolatedNames) == 0 {
+				// A platform-specific isolated test may not be compiled on this
+				// runner. Keep the package in the ordinary invocation in that case.
+				ordinary = append(ordinary, packageName)
+				continue
+			}
+			sort.Strings(isolatedNames)
+			if len(regularNames) != 0 {
+				args := []string{"test"}
+				if race {
+					args = append(args, "-race")
+				}
+				args = append(args,
+					fmt.Sprintf("-timeout=%s", testTimeout),
+					fmt.Sprintf("-parallel=%d", parallel),
+					"-count=1",
+					packageName,
+					"-skip",
+					exactRunnablePattern(isolatedNames),
+				)
+				ordinaryIsolated = append(ordinaryIsolated, testJob{
+					label:  fmt.Sprintf("%s ordinary tests (isolated names skipped)", packageName),
+					args:   args,
+					weight: estimatedRegularJobWeight(len(regularNames)),
+				})
+			}
+			exclusive := runnableExclusivityMap(packageName, names)
+			for _, name := range isolatedNames {
+				args := []string{"test"}
+				if race {
+					args = append(args, "-race")
+				}
+				args = append(args,
+					fmt.Sprintf("-timeout=%s", testTimeout),
+					fmt.Sprintf("-parallel=%d", parallel),
+					"-count=1",
+					packageName,
+					"-run",
+					exactRunnablePattern([]string{name}),
+				)
+				ordinaryIsolated = append(ordinaryIsolated, testJob{
+					label:     fmt.Sprintf("%s isolated test %s", packageName, name),
+					args:      args,
+					weight:    estimatedIsolatedJobWeight(packageName, name),
+					exclusive: exclusive[name],
+				})
+			}
 			continue
 		}
 		names, err := listRunnableNames(packageName, race)
@@ -319,8 +530,8 @@ func makeJobs(packages []string, shardCount, parallel int, testTimeout time.Dura
 			continue
 		}
 		var isolatedNames []string
-		isolated := isolatedRunnableNamesForPackage(packageName)
-		exclusive := exclusiveRunnableNamesForPackage(packageName)
+		isolated := runnableIsolationMap(packageName, names)
+		exclusive := runnableExclusivityMap(packageName, names)
 		for _, name := range names {
 			if isolated[name] {
 				isolatedNames = append(isolatedNames, name)
@@ -336,6 +547,7 @@ func makeJobs(packages []string, shardCount, parallel int, testTimeout time.Dura
 				packageName: packageName,
 				prefixes:    []string{regexp.QuoteMeta(name) + "$"},
 				count:       1,
+				weight:      estimatedIsolatedJobWeight(packageName, name),
 				exclusive:   exclusive[name],
 			})
 		}
@@ -359,8 +571,10 @@ func makeJobs(packages []string, shardCount, parallel int, testTimeout time.Dura
 		}
 		args = append(args, fmt.Sprintf("-timeout=%s", testTimeout), fmt.Sprintf("-parallel=%d", parallel), "-count=1")
 		args = append(args, ordinary...)
-		jobs = append(jobs, testJob{label: "ordinary packages", args: args})
+		jobs = append(jobs, testJob{label: "ordinary packages", args: args, weight: len(ordinary)})
 	}
+	sort.Slice(ordinaryIsolated, func(i, j int) bool { return ordinaryIsolated[i].label < ordinaryIsolated[j].label })
+	jobs = append(jobs, ordinaryIsolated...)
 	planTotals := make(map[string]int)
 	for _, plan := range plans {
 		planTotals[plan.packageName]++
@@ -385,6 +599,7 @@ func makeJobs(packages []string, shardCount, parallel int, testTimeout time.Dura
 		jobs = append(jobs, testJob{
 			label:     fmt.Sprintf("%s shard %d/%d (%d test names)", plan.packageName, planIndex, planTotals[plan.packageName], plan.count),
 			args:      args,
+			weight:    plan.weight,
 			exclusive: plan.exclusive,
 		})
 	}
@@ -409,6 +624,9 @@ func isolatedRunnableNamesForPackage(packageName string) map[string]bool {
 	if strings.HasSuffix(packageName, "/internal/tui") {
 		return isolatedRunnableNames["./internal/tui"]
 	}
+	if strings.HasSuffix(packageName, "/internal/cli") {
+		return isolatedRunnableNames["./internal/cli"]
+	}
 	if strings.HasSuffix(packageName, "/internal/teams/store") {
 		return isolatedRunnableNames["./internal/teams/store"]
 	}
@@ -418,12 +636,94 @@ func isolatedRunnableNamesForPackage(packageName string) map[string]bool {
 	return nil
 }
 
+// runnableIsolationMap combines the reviewed exact-name list with bounded
+// semantic families whose members are expected to grow as regressions are
+// added. Keeping the family rule here means a newly-added listener liveness
+// case cannot silently fall back into a broad shard until someone remembers
+// to edit a second static map.
+func runnableIsolationMap(packageName string, names []string) map[string]bool {
+	base := isolatedRunnableNamesForPackage(packageName)
+	isolated := make(map[string]bool, len(base)+len(names))
+	for name := range base {
+		isolated[name] = true
+	}
+	for _, name := range names {
+		if autoIsolatedRunnableName(packageName, name) {
+			isolated[name] = true
+		}
+	}
+	return isolated
+}
+
+func autoIsolatedRunnableName(packageName, name string) bool {
+	if isTeamsRecoveryPackage(packageName) {
+		// Every TestTeamsListenFalse case drives the continuous listener through
+		// a finite readiness/recovery window. Keeping the family rule broad
+		// prevents a newly-added listener regression (for example a SQLite
+		// admission flood) from silently joining a shard with unrelated test
+		// processes. The outbox family is process-isolated because it owns temporary
+		// stores and scheduler state, but it does not observe host-level scheduling;
+		// host exclusivity is assigned separately below.
+		return strings.HasPrefix(name, "TestTeamsListenFalse") ||
+			strings.HasPrefix(name, "TestTeamsMainLoopOutbox") ||
+			strings.HasPrefix(name, "TestTeamsThirdPartyCacheStress") ||
+			strings.HasPrefix(name, "TestTeamsOwnershipStress") ||
+			strings.HasPrefix(name, "TestTeamsGraph429Stress") ||
+			name == "TestTeamsWorkChatAudienceLookupUsesPollBudget"
+	}
+	if isCodexRunnerPackage(packageName) {
+		// These fixtures start an OS wrapper and a long-lived descendant, then
+		// assert that Close tears down the whole tree. Their short PID/readiness
+		// and cleanup windows are real host observations; unrelated full-suite
+		// processes can delay PowerShell/tasklist without changing the product
+		// behavior under test.
+		return strings.HasPrefix(name, "TestAppServerProcessCloseTerminates")
+	}
+	return false
+}
+
+// autoExclusiveRunnableName is deliberately narrower than
+// autoIsolatedRunnableName. Process isolation protects package globals and
+// temporary stores; host exclusivity is reserved for fixtures whose semantic
+// deadline observes runner-wide scheduling, process trees, or host I/O. Most
+// outbox fairness tests can therefore remain in their own process while
+// sharing the bounded worker pool with ordinary shards; explicitly durable
+// outbox regressions stay in the reviewed exclusive map above.
+func autoExclusiveRunnableName(packageName, name string) bool {
+	if isTeamsRecoveryPackage(packageName) {
+		// Cache-stress and audience-admission fixtures also make short async or
+		// Graph-budget observations; keep them away from unrelated shard pressure.
+		return strings.HasPrefix(name, "TestTeamsListenFalse") ||
+			strings.HasPrefix(name, "TestTeamsThirdPartyCacheStress") ||
+			strings.HasPrefix(name, "TestTeamsOwnershipStress") ||
+			strings.HasPrefix(name, "TestTeamsGraph429Stress") ||
+			name == "TestTeamsWorkChatAudienceLookupUsesPollBudget"
+	}
+	if isCodexRunnerPackage(packageName) {
+		return strings.HasPrefix(name, "TestAppServerProcessCloseTerminates")
+	}
+	return false
+}
+
+func isCodexRunnerPackage(packageName string) bool {
+	packageName = strings.TrimSuffix(strings.TrimSpace(packageName), "/")
+	return packageName == "./internal/codexrunner" || strings.HasSuffix(packageName, "/internal/codexrunner")
+}
+
+func isTeamsRecoveryPackage(packageName string) bool {
+	packageName = strings.TrimSuffix(strings.TrimSpace(packageName), "/")
+	return packageName == "./internal/teams" || strings.HasSuffix(packageName, "/internal/teams")
+}
+
 func exclusiveRunnableNamesForPackage(packageName string) map[string]bool {
 	if names, ok := exclusiveRunnableNames[packageName]; ok {
 		return names
 	}
 	if strings.HasSuffix(packageName, "/internal/tui") {
 		return exclusiveRunnableNames["./internal/tui"]
+	}
+	if strings.HasSuffix(packageName, "/internal/cli") {
+		return exclusiveRunnableNames["./internal/cli"]
 	}
 	if strings.HasSuffix(packageName, "/internal/teams/store") {
 		return exclusiveRunnableNames["./internal/teams/store"]
@@ -432,6 +732,20 @@ func exclusiveRunnableNamesForPackage(packageName string) map[string]bool {
 		return exclusiveRunnableNames["./internal/teams"]
 	}
 	return nil
+}
+
+func runnableExclusivityMap(packageName string, names []string) map[string]bool {
+	base := exclusiveRunnableNamesForPackage(packageName)
+	exclusive := make(map[string]bool, len(base)+len(names))
+	for name := range base {
+		exclusive[name] = true
+	}
+	for _, name := range names {
+		if autoExclusiveRunnableName(packageName, name) {
+			exclusive[name] = true
+		}
+	}
+	return exclusive
 }
 
 func plansForPackage(plans []shardPlan, packageName string) []shardPlan {
@@ -554,6 +868,7 @@ func planPackageShards(packageName string, names []string, shardCount int, isola
 	}
 	for i := range bins {
 		sort.Strings(bins[i].prefixes)
+		bins[i].weight = bins[i].count
 	}
 	sort.Slice(bins, func(i, j int) bool {
 		if bins[i].count != bins[j].count {
@@ -637,6 +952,14 @@ func joinPatterns(prefixes []string) string {
 	return strings.Join(prefixes, "|")
 }
 
+func exactRunnablePattern(names []string) string {
+	quoted := make([]string, 0, len(names))
+	for _, name := range names {
+		quoted = append(quoted, regexp.QuoteMeta(name))
+	}
+	return "^(?:" + joinPatterns(quoted) + ")$"
+}
+
 func planPattern(plan shardPlan) string {
 	return "^(?:" + joinPatterns(plan.prefixes) + ")"
 }
@@ -683,9 +1006,9 @@ func runExclusiveJobs(jobs []testJob, testTimeout time.Duration) []jobResult {
 		fmt.Printf("starting %s\n", job.label)
 		result := executeJob(job, testTimeout)
 		if result.err == nil {
-			fmt.Printf("passed %s\n", result.label)
+			fmt.Printf("passed %s duration=%s\n", result.label, result.duration)
 		} else {
-			fmt.Printf("failed %s\n%s\n", result.label, result.err)
+			fmt.Printf("failed %s duration=%s\n%s\n", result.label, result.duration, result.err)
 		}
 		collected = append(collected, result)
 	}
@@ -709,12 +1032,23 @@ func runParallelJobs(jobs []testJob, testTimeout time.Duration) []jobResult {
 	if len(jobs) == 0 {
 		return nil
 	}
+	// Start the largest estimated jobs first so the actual four-worker queue
+	// follows the same longest-processing-time order used by the partition
+	// guard. This reduces the chance that a late heavy shard becomes the final
+	// worker tail when earlier jobs finish at different times.
+	ordered := append([]testJob(nil), jobs...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		if ordered[i].weight != ordered[j].weight {
+			return ordered[i].weight > ordered[j].weight
+		}
+		return ordered[i].label < ordered[j].label
+	})
 	workerCount := maxConcurrentJobs
-	if len(jobs) < workerCount {
-		workerCount = len(jobs)
+	if len(ordered) < workerCount {
+		workerCount = len(ordered)
 	}
 	queue := make(chan testJob)
-	results := make(chan jobResult, len(jobs))
+	results := make(chan jobResult, len(ordered))
 	var wg sync.WaitGroup
 	for i := 0; i < workerCount; i++ {
 		wg.Add(1)
@@ -726,7 +1060,7 @@ func runParallelJobs(jobs []testJob, testTimeout time.Duration) []jobResult {
 		}()
 	}
 	go func() {
-		for _, job := range jobs {
+		for _, job := range ordered {
 			fmt.Printf("starting %s\n", job.label)
 			queue <- job
 		}
@@ -735,12 +1069,12 @@ func runParallelJobs(jobs []testJob, testTimeout time.Duration) []jobResult {
 		close(results)
 	}()
 
-	collected := make([]jobResult, 0, len(jobs))
+	collected := make([]jobResult, 0, len(ordered))
 	for result := range results {
 		if result.err == nil {
-			fmt.Printf("passed %s\n", result.label)
+			fmt.Printf("passed %s duration=%s\n", result.label, result.duration)
 		} else {
-			fmt.Printf("failed %s\n%s\n", result.label, result.err)
+			fmt.Printf("failed %s duration=%s\n%s\n", result.label, result.duration, result.err)
 		}
 		collected = append(collected, result)
 	}
@@ -748,6 +1082,7 @@ func runParallelJobs(jobs []testJob, testTimeout time.Duration) []jobResult {
 }
 
 func executeJob(job testJob, testTimeout time.Duration) jobResult {
+	startedAt := time.Now()
 	// The Go test watchdog is the semantic deadline. A small outer grace keeps
 	// the runner from killing the wrapper at the exact instant it is collecting
 	// the test process's timeout report.
@@ -763,9 +1098,10 @@ func executeJob(job testJob, testTimeout time.Duration) jobResult {
 	}
 	if err != nil {
 		return jobResult{
-			label: job.label,
-			err:   fmt.Errorf("%w\n%s", err, strings.TrimSpace(output.String())),
+			label:    job.label,
+			err:      fmt.Errorf("%w\n%s", err, strings.TrimSpace(output.String())),
+			duration: time.Since(startedAt),
 		}
 	}
-	return jobResult{label: job.label}
+	return jobResult{label: job.label, duration: time.Since(startedAt)}
 }

@@ -1655,7 +1655,13 @@ func upgradeCodexInstalledWithOptions(ctx context.Context, out io.Writer, opts c
 			}
 		}
 
-		path, err := resolveUpgradedCodexPath(ctx, source.codexPath)
+		var probe func(context.Context, string) error
+		if opts.probeManagedCodex != nil {
+			probe = func(probeCtx context.Context, path string) error {
+				return opts.probeManagedCodex(probeCtx, path, opts.installerEnv)
+			}
+		}
+		path, err := resolveUpgradedCodexPath(ctx, source.codexPath, probe)
 		if err != nil {
 			return codexPostInstallError("upgrade", err)
 		}
@@ -1941,9 +1947,14 @@ func isCodexNPMOptionalConfigKey(key string) bool {
 	return false
 }
 
-func resolveUpgradedCodexPath(ctx context.Context, preferred string) (string, error) {
+func resolveUpgradedCodexPath(ctx context.Context, preferred string, probe func(context.Context, string) error) (string, error) {
 	preferred = normalizeExecutablePath(preferred)
-	if preferred != "" && executableExists(preferred) && probeCodex(ctx, preferred) {
+	if probe == nil {
+		probe = func(probeCtx context.Context, path string) error {
+			return probeCodexVersion(probeCtx, path)
+		}
+	}
+	if preferred != "" && executableExists(preferred) && probe(ctx, preferred) == nil {
 		return preferred, nil
 	}
 	return findInstalledCodex(ctx)

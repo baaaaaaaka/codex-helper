@@ -29,7 +29,7 @@ func TestRuntimeProcessIdentityWindows(t *testing.T) {
 		if _, ok := Current(); !ok {
 			os.Exit(3)
 		}
-		if err := os.WriteFile(os.Getenv("CXP_TEST_READY"), []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+		if err := publishProcessIdentityReady(os.Getenv("CXP_TEST_READY"), os.Getpid()); err != nil {
 			os.Exit(4)
 		}
 		time.Sleep(30 * time.Second)

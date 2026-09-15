@@ -18,9 +18,16 @@ class ConfigureContainerReposTests(unittest.TestCase):
         if not self.bash:
             self.skipTest("bash not available")
 
-    def run_script(self, strategy: str, root: Path) -> subprocess.CompletedProcess[str]:
+    def run_script(
+        self,
+        strategy: str,
+        root: Path,
+        extra_env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
         env["CI_CONTAINER_ROOT"] = str(root)
+        if extra_env:
+            env.update(extra_env)
         return subprocess.run(
             [self.bash, str(SCRIPT), strategy],
             env=env,
@@ -52,9 +59,61 @@ class ConfigureContainerReposTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             text = repo.read_text(encoding="utf-8")
             self.assertIn("#mirrorlist=http://mirrorlist.centos.org/", text)
-            self.assertIn("baseurl=https://archive.kernel.org/centos-vault/7.9.2009/os/$basearch/", text)
-            self.assertIn("baseurl=https://archive.kernel.org/centos-vault/7.9.2009/updates/$basearch/", text)
-            self.assertIn("baseurl=https://archive.kernel.org/centos-vault/7.9.2009/extras/$basearch/", text)
+            baseurl_roots = [
+                "https://linuxsoft.cern.ch/centos-vault/7.9.2009/",
+                "https://mirrors.aliyun.com/centos-vault/7.9.2009/",
+                "https://mirror.nsc.liu.se/centos-store/7.9.2009/",
+                "https://archive.kernel.org/centos-vault/7.9.2009/",
+            ]
+            for suffix in ("os", "updates", "extras"):
+                expected = "baseurl=" + " ".join(
+                    f"{root}{suffix}/$basearch/" for root in baseurl_roots
+                )
+                self.assertIn(expected, text)
+
+    def test_centos_vault_rewrites_previous_single_mirror_to_fallback_list(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo_dir = root / "etc" / "yum.repos.d"
+            repo_dir.mkdir(parents=True)
+            repo = repo_dir / "CentOS-Base.repo"
+            repo.write_text(
+                "#baseurl=https://archive.kernel.org/centos-vault/7.9.2009/os/$basearch/\n",
+                encoding="utf-8",
+            )
+
+            proc = self.run_script("centos-vault", root)
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            text = repo.read_text(encoding="utf-8")
+            self.assertIn(
+                "baseurl=https://linuxsoft.cern.ch/centos-vault/7.9.2009/os/$basearch/ ",
+                text,
+            )
+            self.assertIn("https://archive.kernel.org/centos-vault/7.9.2009/os/$basearch/", text)
+
+    def test_centos_vault_accepts_configured_fallback_list(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo_dir = root / "etc" / "yum.repos.d"
+            repo_dir.mkdir(parents=True)
+            repo = repo_dir / "CentOS-Base.repo"
+            repo.write_text(
+                "baseurl=http://mirror.centos.org/centos/$releasever/os/$basearch/\n",
+                encoding="utf-8",
+            )
+
+            proc = self.run_script(
+                "centos-vault",
+                root,
+                {"CENTOS_VAULT_BASEURLS": "https://one.example/ https://two.example/"},
+            )
+
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertEqual(
+                repo.read_text(encoding="utf-8"),
+                "baseurl=https://one.example/os/$basearch/ https://two.example/os/$basearch/\n",
+            )
 
     def test_rocky_official_rewrites_repo_files(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
