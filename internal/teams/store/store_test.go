@@ -6800,16 +6800,13 @@ func TestSQLiteHotPollAdmissionBoundsSemanticallyMalformedPollLaneAndPreservesHe
 	}
 	migrateStoreToSQLiteForTest(t, store)
 	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
-		for i := 0; i < malformedCount; i++ {
-			chatID := fmt.Sprintf("chat-semantic-malformed-poll-lane-%03d", i)
-			// This is valid JSON, but the time.Time decoder rejects the numeric
-			// next_poll_at value. It must enter the bounded local-recovery lane;
-			// otherwise 80 decodable-looking rows can consume the SQL LIMIT and
-			// hide the healthy ordinary chat.
-			raw := []byte(fmt.Sprintf(`{"chat_id":%q,"seeded":true,"state":"hot","next_poll_at":17}`, chatID))
-			if _, err := tx.ExecContext(ctx, `UPDATE chat_polls SET json = ?, frontier_active = 0 WHERE chat_id = ?`, raw, chatID); err != nil {
-				return err
-			}
+		// Keep the fixture construction bounded as one statement. This produces
+		// the same valid-but-undecodable JSON for every row while avoiding 520
+		// repeated SQL parses on the Windows race runner.
+		if _, err := tx.ExecContext(ctx, `UPDATE chat_polls
+SET json = json_set(json, '$.next_poll_at', 17), frontier_active = 0
+WHERE chat_id LIKE 'chat-semantic-malformed-poll-lane-%'`); err != nil {
+			return err
 		}
 		return nil
 	})
