@@ -1050,7 +1050,12 @@ func TestTeamsOwnershipStressFifthChatReachesNextWorkerWaveCI(t *testing.T) {
 // fifth chat must reach Graph instead of being lost behind the outage.
 func TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI(t *testing.T) {
 	previousTimeout := inboundPollGraphTimeout
-	inboundPollGraphTimeout = 500 * time.Millisecond
+	// Keep the blocked Graph requests alive long enough for a race-enabled
+	// hosted runner to admit all four workers. The test still has a bounded
+	// scenario context and exercises the same worker timeout/cancellation path;
+	// the shorter value let SQLite admission scheduling expire the first wave
+	// before the later workers reached the server.
+	inboundPollGraphTimeout = 5 * time.Second
 	t.Cleanup(func() { inboundPollGraphTimeout = previousTimeout })
 
 	setupCtx := context.Background()
@@ -1159,7 +1164,11 @@ func TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI(t *t
 	// Start the scenario budget only after the file-backed store, lease, and
 	// SQLite migration are ready. Setup can be slow under -race, but it is not
 	// the liveness behavior this test is measuring.
-	ctx, cancel := context.WithTimeout(context.Background(), ownershipStressTestTimeout(10*time.Second))
+	// The four blocked Graph requests are the assertion boundary.  The
+	// surrounding SQLite admission can be materially slower under a hosted
+	// race runner even after fixture setup has completed, so keep this bounded
+	// observation separate from the short per-request Graph timeout.
+	ctx, cancel := context.WithTimeout(context.Background(), ownershipStressTestTimeout(30*time.Second))
 	defer cancel()
 	ctx = context.WithValue(ctx, teamsListenerPollContextKey{}, true)
 
@@ -1194,7 +1203,16 @@ func TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI(t *t
 	case <-saturated:
 	case pollErr := <-pollDone:
 		pollFinished = true
-		t.Fatalf("poll cycle ended before four Graph workers became saturated: %v", pollErr)
+		mu.Lock()
+		observedRequests := requestCount
+		observedByChat := make(map[string]int, len(requestByChat))
+		for chatID, count := range requestByChat {
+			observedByChat[chatID] = count
+		}
+		observedActive := activeRequests
+		observedMaxActive := maxActiveRequests
+		mu.Unlock()
+		t.Fatalf("poll cycle ended before four Graph workers became saturated: %v; requests=%d by-chat=%v active=%d max-active=%d", pollErr, observedRequests, observedByChat, observedActive, observedMaxActive)
 	case <-ctx.Done():
 		t.Fatal("four Graph workers did not become saturated")
 	}

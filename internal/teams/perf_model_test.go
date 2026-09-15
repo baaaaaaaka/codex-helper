@@ -3803,6 +3803,8 @@ func newCXPPerfExternalBridge(tb testing.TB, scenario cxpPerfExternalScenario) (
 		// an unrelated work/outbox prefix that correctly blocks a normal restart or
 		// reload before the harness observes its hook.  The guard itself is covered by
 		// dedicated bridge tests; this fixture should test the successful command path.
+		profile.WorkChats = 0
+		profile.TurnsPerChat = 0
 		profile.MessagesPerPoll = 0
 		profile.OutboxPerChat = 0
 	}

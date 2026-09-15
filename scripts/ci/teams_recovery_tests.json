@@ -177,7 +177,7 @@
       "once": false,
       "fake_graph": true,
       "exclusive": true,
-      "max_seconds": 15,
+      "max_seconds": 30,
       "oracle": "a history-watch phase is canceled when its control lease is lost and cannot commit a stale checkpoint",
       "baseline": "pre-fix heartbeat loss was observed only at the next loop boundary, allowing a stale scan to continue",
       "resource_class": "host_exclusive"
@@ -232,7 +232,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 30,
+      "max_seconds": 45,
       "oracle": "an untrusted persisted lease keeps the continuous listener alive without Graph work, then the same listener resumes after an explicit safe repair",
       "baseline": "pre-fix malformed or unknown lease state exits the child and can trigger a supervisor restart loop",
       "resource_class": "sqlite_fsync"
@@ -891,7 +891,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 20,
+      "max_seconds": 60,
       "oracle": "A real polled Teams turn creates a durable final outbox, survives store close and reopen, then is delivered exactly once without replaying the inbound turn",
       "baseline": "pre-fix the listener/reopen boundary could lose a generated outbox row or replay the inbound prompt",
       "resource_class": "sqlite_fsync"

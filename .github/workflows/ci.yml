@@ -2472,7 +2472,9 @@ jobs:
           frontier_recovery_pattern='^TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover$'
           migration_process_pattern='^TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup$'
           external_perf_pattern='^(?:TestCXPPerfModelExternalScenariosCoverCommonPaths|TestCXPPerfModelSQLiteExternalScenariosCoverCommonPaths)$'
-          isolated_skip_pattern='^(?:TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover|TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup|TestCXPPerfModelExternalScenariosCoverCommonPaths|TestCXPPerfModelSQLiteExternalScenariosCoverCommonPaths)$'
+          teams_durable_pattern='^(?:TestBridgeSyncLinkedTranscriptPersistsHistoryQuarantineWithLegacyGeneration|TestBridgeSyncLinkedTranscriptReleasesPendingRootAcrossSQLiteStoreReopen|TestTeamsListenFalseMalformedActiveSQLitePollDoesNotBaseline|TestTeamsListenFalsePolledTurnOutboxSurvivesReopen|TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI)$'
+          store_durable_pattern='^(?:TestSQLiteHotPollAdmissionAdmitsMalformedPollWithoutStarvingHealthyChat|TestSQLiteHotPollReadyScheduleSkipsMalformedOperationalPrefix|TestSQLiteLegacyEmptyRuntimeProjectionBootstrapsOnceForHotPoll|TestSQLiteMalformedNumericCompatibilityColumnsDoNotAbortRecovery|TestSQLiteHotPollTrustedWorkCandidatesContinuesPastInvalidPage|TestSQLiteHotPollAdmissionUsesJSONFrontierHonorsBlockedUntilAndReservesControl|TestStoreOwnerBoundOutboxAdmissionRejectsStaleOwnerAcrossBackends)$'
+          isolated_skip_pattern='^(?:TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover|TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup|TestCXPPerfModelExternalScenariosCoverCommonPaths|TestCXPPerfModelSQLiteExternalScenariosCoverCommonPaths|TestBridgeSyncLinkedTranscriptPersistsHistoryQuarantineWithLegacyGeneration|TestBridgeSyncLinkedTranscriptReleasesPendingRootAcrossSQLiteStoreReopen|TestTeamsListenFalseMalformedActiveSQLitePollDoesNotBaseline|TestTeamsListenFalsePolledTurnOutboxSurvivesReopen|TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI|TestSQLiteHotPollAdmissionAdmitsMalformedPollWithoutStarvingHealthyChat|TestSQLiteHotPollReadyScheduleSkipsMalformedOperationalPrefix|TestSQLiteLegacyEmptyRuntimeProjectionBootstrapsOnceForHotPoll|TestSQLiteMalformedNumericCompatibilityColumnsDoNotAbortRecovery|TestSQLiteHotPollTrustedWorkCandidatesContinuesPastInvalidPage|TestSQLiteHotPollAdmissionUsesJSONFrontierHonorsBlockedUntilAndReservesControl|TestStoreOwnerBoundOutboxAdmissionRejectsStaleOwnerAcrossBackends)$'
           if ! go test -timeout=20m -parallel=16 -skip "$isolated_skip_pattern" -coverprofile=coverage.out ./... 2>&1 | tee "$log"; then
             summary="$(grep -E -A8 '^--- FAIL:|^FAIL[[:space:]]|^panic:|^fatal error:' "$log" | tail -80 | tr '\n' ' ' || true)"
             if ! grep -Eq '^--- FAIL:|^panic:|^fatal error:' "$log"; then
@@ -2514,6 +2516,22 @@ jobs:
             exit 1
           fi
           tail -n +2 "$external_perf_profile" >> coverage.out
+          teams_durable_log="$RUNNER_TEMP/teams-durable-isolated.log"
+          teams_durable_profile="$RUNNER_TEMP/teams-durable-coverage.out"
+          if ! go test ./internal/teams -timeout=12m -parallel=1 -count=1 -run "$teams_durable_pattern" -coverprofile="$teams_durable_profile" -v 2>&1 | tee "$teams_durable_log"; then
+            summary="$(grep -E -A8 '^--- FAIL:|^FAIL[[:space:]]|^panic:|^fatal error:' "$teams_durable_log" | tail -80 | tr '\n' ' ' || true)"
+            echo "::error title=Isolated Teams durable test failure::${summary:-isolated Teams durable test failed; inspect the retained step log}"
+            exit 1
+          fi
+          tail -n +2 "$teams_durable_profile" >> coverage.out
+          store_durable_log="$RUNNER_TEMP/store-durable-isolated.log"
+          store_durable_profile="$RUNNER_TEMP/store-durable-coverage.out"
+          if ! go test ./internal/teams/store -timeout=12m -parallel=1 -count=1 -run "$store_durable_pattern" -coverprofile="$store_durable_profile" -v 2>&1 | tee "$store_durable_log"; then
+            summary="$(grep -E -A8 '^--- FAIL:|^FAIL[[:space:]]|^panic:|^fatal error:' "$store_durable_log" | tail -80 | tr '\n' ' ' || true)"
+            echo "::error title=Isolated store durable test failure::${summary:-isolated store durable test failed; inspect the retained step log}"
+            exit 1
+          fi
+          tail -n +2 "$store_durable_profile" >> coverage.out
 
       - name: go test (without coverage, non-Linux)
         if: runner.os != 'Linux'
@@ -2548,6 +2566,8 @@ jobs:
             ${{ runner.temp }}/frontier-recovery-isolated.log
             ${{ runner.temp }}/migration-process-isolated.log
             ${{ runner.temp }}/external-perf-isolated.log
+            ${{ runner.temp }}/teams-durable-isolated.log
+            ${{ runner.temp }}/store-durable-isolated.log
           if-no-files-found: ignore
 
       - name: Coverage gate (Linux only)

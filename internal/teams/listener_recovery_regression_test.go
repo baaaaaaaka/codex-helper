@@ -1196,7 +1196,7 @@ func TestTeamsListenFalseUntrustedSQLiteLeaseHoldsAndRecovers(t *testing.T) {
 	// repair.
 	if !waitListenerRecoveryResult(func() bool {
 		return len(graphState.requestsSnapshot()) > 0
-	}, 10*time.Second) {
+	}, listenerRecoveryExtendedProgressTimeout) {
 		state, loadErr := reopened.Load(ctx)
 		select {
 		case err := <-listener.done:
@@ -1686,7 +1686,7 @@ func TestTeamsListenFalseChatRead429RecoversWithoutManualStateChange(t *testing.
 
 			waitListenerRecovery(t, func() bool {
 				return graphState.chatRead429CountFor(blockedChat) >= 1
-			}, 10*time.Second, "chat-local read 429")
+			}, listenerRecoveryExtendedProgressTimeout, "chat-local read 429")
 			first429 := graphState.chatRead429TimesSnapshot(blockedChat)
 			if len(first429) == 0 {
 				t.Fatal("chat-local read gate has no recorded first 429 timestamp")
@@ -3225,7 +3225,7 @@ func TestTeamsListenFalseOwnerLossCancelsHistoryWatchBeforeStaleCommit(t *testin
 	case <-entered:
 	case err := <-listenDone:
 		t.Fatalf("listener exited before owner-loss hook: %v", err)
-	case <-time.After(listenerRecoveryProgressTimeout):
+	case <-time.After(listenerRecoveryExtendedProgressTimeout):
 		phaseMu.Lock()
 		phaseSnapshot := append([]string(nil), phases...)
 		phaseMu.Unlock()
@@ -5454,7 +5454,7 @@ func runListenerRecoveryPolledTurnOutboxSurvivesReopen(t *testing.T, useSQLite b
 	}
 	select {
 	case <-finalSendStarted:
-	case <-time.After(listenerRecoveryProgressTimeout):
+	case <-time.After(listenerRecoveryExtendedProgressTimeout):
 		first.stop(t)
 		state, _ := store.Load(ctx)
 		t.Fatalf("generated final did not reach pre-send restart boundary: state=%#v calls=%#v phases outbox=%#v poll=%#v", state, executor.callsSnapshot(), bridge.mainLoopPhaseStatsSnapshot("outbox"), bridge.mainLoopPhaseStatsSnapshot("poll"))

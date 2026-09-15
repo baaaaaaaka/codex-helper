@@ -99,17 +99,22 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		"TestTeamsListenFalseShutdownDoesNotRunAsyncTurnFollowupAfterGrace":        true,
 		"TestTeamsListenFalseMalformedPollDoesNotBlockHealthyChat":                 true,
 		"TestBridgeSyncLinkedTranscriptReleasesPendingRootAcrossSQLiteStoreReopen": true,
-		"TestTeamsOwnershipStressGraphStallDoesNotStopOtherChatPollCI":             true,
-		"TestTeamsOwnershipStressGraphStallThenTranscriptCatchupCI":                true,
-		"TestTeamsOwnershipStressTranscriptCatchupWhileTUIContinuesCI":             true,
-		"TestTeamsOwnershipStressContinuationFailureIsIsolatedByPollOnceCI":        true,
-		"TestTeamsOwnershipStressFifthChatReachesNextWorkerWaveCI":                 true,
-		"TestTeamsOwnershipStressPagedBacklogAfterServiceOutageCI":                 true,
-		"TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI":   true,
-		"TestCXPPerfModelSQLiteExternalScenariosCoverCommonPaths":                  true,
-		"TestCXPPerfModelProfilesCanSeedStoreAndPoll":                              true,
-		"TestTeamsUnresolvedTranscriptOutboxDoesNotLivelockHealthyTail":            true,
-		"TestTeamsOutboxAcceptedResponseFinishesAfterPhaseDeadline":                true,
+		// These durable recovery/quarantine fixtures perform long SQLite
+		// preparation or reopen transitions. Keep them out of the ordinary
+		// package shard so a separate test's WAL/FS activity cannot consume
+		// their finite compatibility budget.
+		"TestBridgeSyncLinkedTranscriptPersistsHistoryQuarantineWithLegacyGeneration": true,
+		"TestTeamsOwnershipStressGraphStallDoesNotStopOtherChatPollCI":                true,
+		"TestTeamsOwnershipStressGraphStallThenTranscriptCatchupCI":                   true,
+		"TestTeamsOwnershipStressTranscriptCatchupWhileTUIContinuesCI":                true,
+		"TestTeamsOwnershipStressContinuationFailureIsIsolatedByPollOnceCI":           true,
+		"TestTeamsOwnershipStressFifthChatReachesNextWorkerWaveCI":                    true,
+		"TestTeamsOwnershipStressPagedBacklogAfterServiceOutageCI":                    true,
+		"TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI":      true,
+		"TestCXPPerfModelSQLiteExternalScenariosCoverCommonPaths":                     true,
+		"TestCXPPerfModelProfilesCanSeedStoreAndPoll":                                 true,
+		"TestTeamsUnresolvedTranscriptOutboxDoesNotLivelockHealthyTail":               true,
+		"TestTeamsOutboxAcceptedResponseFinishesAfterPhaseDeadline":                   true,
 		// This listener test starts a real continuous loop over a file-backed
 		// store.  Keep startup/recovery timing independent from unrelated
 		// package tests; the test's own Graph fixture already covers the
@@ -128,7 +133,14 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		// This cross-backend legacy-owner test performs the same durable lease
 		// migration and can spend its whole short budget in a Windows SQLite
 		// commit. Keep its two backend assertions in a clean process as well.
-		"TestStoreOwnerBindsLegacyQueuedTurnAndRejectsPreviousOwnerCallbacks": true,
+		"TestStoreOwnerBindsLegacyQueuedTurnAndRejectsPreviousOwnerCallbacks":            true,
+		"TestStoreOwnerBoundOutboxAdmissionRejectsStaleOwnerAcrossBackends":              true,
+		"TestSQLiteHotPollAdmissionAdmitsMalformedPollWithoutStarvingHealthyChat":        true,
+		"TestSQLiteHotPollReadyScheduleSkipsMalformedOperationalPrefix":                  true,
+		"TestSQLiteLegacyEmptyRuntimeProjectionBootstrapsOnceForHotPoll":                 true,
+		"TestSQLiteMalformedNumericCompatibilityColumnsDoNotAbortRecovery":               true,
+		"TestSQLiteHotPollTrustedWorkCandidatesContinuesPastInvalidPage":                 true,
+		"TestSQLiteHotPollAdmissionUsesJSONFrontierHonorsBlockedUntilAndReservesControl": true,
 	},
 }
 
@@ -156,27 +168,28 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		// These tests already run in their own process, but their first listener
 		// cycle is itself the assertion.  Do not start them beside other shard
 		// processes that can consume the hosted runner before Graph admission.
-		"TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle":               true,
-		"TestTeamsListenFalseSlowInboundMutationDoesNotConsumeDurableCleanupGrace": true,
-		"TestTeamsListenFalseGraphWorkerSaturationPreservesHealthyPoll":            true,
-		"TestTeamsListenFalseGraphHeadFailureDoesNotStarveHealthyTail":             true,
-		"TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage":      true,
-		"TestTeamsListenFalseHistoryWatchFullPoolDoesNotStarveHealthyTail":         true,
-		"TestTeamsListenFalseLinkedTranscriptFullPoolDoesNotStarveHealthyTail":     true,
-		"TestTeamsListenFalseUsesConfiguredRunnerStreaming":                        true,
-		"TestTeamsListenFalseSQLiteTranscriptBacklogProgresses":                    true,
-		"TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover":      true,
-		"TestTeamsListenFalsePollContinuationSurvivesReopenBeforeDrain":            true,
-		"TestTeamsListenFalseShutdownDoesNotRunAsyncTurnFollowupAfterGrace":        true,
-		"TestTeamsListenFalseOwnerLossCancelsHistoryWatchBeforeStaleCommit":        true,
-		"TestTeamsListenFalseOwnerLossFencesCooperativeTurn":                       true,
-		"TestTeamsListenFalseRecoversExpiredAmbiguousOutboxWithoutPost":            true,
-		"TestTeamsListenFalseStartupHeartbeatProtectsSlowInitialization":           true,
-		"TestTeamsListenFalseMalformedPollDoesNotBlockHealthyChat":                 true,
-		"TestBridgeSyncLinkedTranscriptReleasesPendingRootAcrossSQLiteStoreReopen": true,
-		"TestTeamsOwnershipStressTranscriptCatchupWhileTUIContinuesCI":             true,
-		"TestTeamsOwnershipStressFifthChatReachesNextWorkerWaveCI":                 true,
-		"TestTeamsOutboxAcceptedResponseFinishesAfterPhaseDeadline":                true,
+		"TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle":                  true,
+		"TestTeamsListenFalseSlowInboundMutationDoesNotConsumeDurableCleanupGrace":    true,
+		"TestTeamsListenFalseGraphWorkerSaturationPreservesHealthyPoll":               true,
+		"TestTeamsListenFalseGraphHeadFailureDoesNotStarveHealthyTail":                true,
+		"TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage":         true,
+		"TestTeamsListenFalseHistoryWatchFullPoolDoesNotStarveHealthyTail":            true,
+		"TestTeamsListenFalseLinkedTranscriptFullPoolDoesNotStarveHealthyTail":        true,
+		"TestTeamsListenFalseUsesConfiguredRunnerStreaming":                           true,
+		"TestTeamsListenFalseSQLiteTranscriptBacklogProgresses":                       true,
+		"TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover":         true,
+		"TestTeamsListenFalsePollContinuationSurvivesReopenBeforeDrain":               true,
+		"TestTeamsListenFalseShutdownDoesNotRunAsyncTurnFollowupAfterGrace":           true,
+		"TestTeamsListenFalseOwnerLossCancelsHistoryWatchBeforeStaleCommit":           true,
+		"TestTeamsListenFalseOwnerLossFencesCooperativeTurn":                          true,
+		"TestTeamsListenFalseRecoversExpiredAmbiguousOutboxWithoutPost":               true,
+		"TestTeamsListenFalseStartupHeartbeatProtectsSlowInitialization":              true,
+		"TestTeamsListenFalseMalformedPollDoesNotBlockHealthyChat":                    true,
+		"TestBridgeSyncLinkedTranscriptReleasesPendingRootAcrossSQLiteStoreReopen":    true,
+		"TestBridgeSyncLinkedTranscriptPersistsHistoryQuarantineWithLegacyGeneration": true,
+		"TestTeamsOwnershipStressTranscriptCatchupWhileTUIContinuesCI":                true,
+		"TestTeamsOwnershipStressFifthChatReachesNextWorkerWaveCI":                    true,
+		"TestTeamsOutboxAcceptedResponseFinishesAfterPhaseDeadline":                   true,
 		// These outbox regressions exercise durable SQLite/file boundaries in
 		// addition to fairness. Keep the process isolated and serialize it on the
 		// hosted runner so unrelated shard I/O cannot turn the durable assertion
@@ -199,6 +212,13 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestSQLiteHotPollWorkCandidatesRotateOperationalRowsBeyondLimit":                      true,
 		"TestStoreHistoryWatchOwnerCapabilityFencesTakeoverAcrossBackends":                     true,
 		"TestStoreOwnerBindsLegacyQueuedTurnAndRejectsPreviousOwnerCallbacks":                  true,
+		"TestStoreOwnerBoundOutboxAdmissionRejectsStaleOwnerAcrossBackends":                    true,
+		"TestSQLiteHotPollAdmissionAdmitsMalformedPollWithoutStarvingHealthyChat":              true,
+		"TestSQLiteHotPollReadyScheduleSkipsMalformedOperationalPrefix":                        true,
+		"TestSQLiteLegacyEmptyRuntimeProjectionBootstrapsOnceForHotPoll":                       true,
+		"TestSQLiteMalformedNumericCompatibilityColumnsDoNotAbortRecovery":                     true,
+		"TestSQLiteHotPollTrustedWorkCandidatesContinuesPastInvalidPage":                       true,
+		"TestSQLiteHotPollAdmissionUsesJSONFrontierHonorsBlockedUntilAndReservesControl":       true,
 	},
 }
 
