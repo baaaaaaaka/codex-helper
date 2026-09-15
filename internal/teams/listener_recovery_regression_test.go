@@ -5806,7 +5806,11 @@ func runListenerRecoveryPollContinuationSurvivesReopenBeforeDrain(t *testing.T, 
 	recoveredBridge.machine.ScopeID = recoveredBridge.scope.ID
 	recoveredBridge.machine.Kind = teamstore.MachineKindPrimary
 	options := listenerRecoveryBaseOptions(recoveredStore, filepath.Join(t.TempDir(), "registry-recovered.json"), recoveredExecutor)
-	options.PhaseBudget = 5 * time.Second
+	// The replacement owner must use the production phase budget. A short
+	// isolation budget can cancel the durable outbox recovery before its owner
+	// CAS completes on a slow Windows race runner, leaving the test observing an
+	// unresolved Sending row instead of exercising continuation recovery.
+	options.PhaseBudget = mainLoopPhaseBudget
 	options.PollWorkerBudget = mainLoopPollWorkerBudget
 	listener := startListenerRecovery(t, recoveredBridge, options)
 	defer listener.stop(t)

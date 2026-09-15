@@ -3797,11 +3797,28 @@ func cxpPerfExternalBaseProfile() cxpPerfProfile {
 func newCXPPerfExternalBridge(tb testing.TB, scenario cxpPerfExternalScenario) (*teamstore.Store, *Bridge, *cxpPerfServiceHarness) {
 	tb.Helper()
 	profile := cxpPerfExternalBaseProfile()
+	if scenario.ServiceMode != cxpPerfServiceIdle {
+		// Service lifecycle commands exercise the production no-active-work guard.
+		// Keep this matrix case control-only so the bounded listener run cannot leave
+		// an unrelated work/outbox prefix that correctly blocks a normal restart or
+		// reload before the harness observes its hook.  The guard itself is covered by
+		// dedicated bridge tests; this fixture should test the successful command path.
+		profile.MessagesPerPoll = 0
+		profile.OutboxPerChat = 0
+	}
 	store := newCXPPerfStore(tb, profile)
 	if scenario.QueueOutbox {
 		cxpPerfQueuePendingOutbox(tb, store, profile)
 	}
-	graph := newCXPPerfGraphWithScenario(profile, scenario)
+	graphScenario := scenario
+	if scenario.ServiceMode != cxpPerfServiceIdle {
+		// cxpPerfRunListenOnce invokes the command directly after the listener
+		// startup. Do not also inject the same command into the queue-only control
+		// poll, which would test duplicate lifecycle handling rather than the
+		// service hook under test.
+		graphScenario.ControlPrompt = ""
+	}
+	graph := newCXPPerfGraphWithScenario(profile, graphScenario)
 	bridge := newCXPPerfBridge(store, graph, profile)
 	harness := &cxpPerfServiceHarness{}
 	bridge.executor = cxpPerfExecutor{mode: scenario.CodexMode}
