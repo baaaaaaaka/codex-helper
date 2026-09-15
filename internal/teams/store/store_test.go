@@ -6769,10 +6769,12 @@ func TestSQLiteHotPollAdmissionBoundsSemanticallyMalformedPollLaneAndPreservesHe
 	store := newTestStore(t)
 	ctx := context.Background()
 	now := time.Now().UTC()
-	// More than eight 64-row pages is intentional. A fixed eight-page SQL
+	// The normal build uses more than eight 64-row pages. A fixed eight-page SQL
 	// budget used to leave the healthy row permanently hidden behind this
-	// semantically malformed prefix.
-	const malformedCount = 520
+	// semantically malformed prefix. The race build uses a small equivalent
+	// fixture because its JSON compatibility scan is intentionally bounded by
+	// the same two-second production budget.
+	malformedCount := hotPollSemanticMalformedPollCount()
 	if err := store.Update(ctx, func(state *State) error {
 		state.Sessions["session-semantic-healthy-poll-lane"] = SessionContext{
 			ID: "session-semantic-healthy-poll-lane", Status: SessionStatusActive,
