@@ -375,7 +375,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          required_shells='sh bash zsh fish csh tcsh pwsh'
+          # Exercise only shells deliberately installed/prepared by the
+          # platform matrix. Ubuntu images may contain pwsh, but PowerShell's
+          # Unix -Login startup can hang in the hosted non-interactive runner;
+          # its adapter/protocol contracts remain covered by focused tests.
+          required_shells='sh bash zsh fish csh tcsh'
           if [ "$RUNNER_OS" = macOS ]; then
             required_shells="$required_shells nu"
           fi
