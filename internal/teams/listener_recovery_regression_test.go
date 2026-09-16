@@ -1712,7 +1712,7 @@ func TestTeamsListenFalseChatRead429RecoversWithoutManualStateChange(t *testing.
 				}
 				message, ok := state.OutboxMessages[outboxID]
 				return ok && message.Status == teamstore.OutboxStatusSent && strings.TrimSpace(message.TeamsMessageID) != ""
-			}, 10*time.Second, "queued same-chat outbox during chat-local read 429")
+			}, listenerRecoveryDurableIOProgressTimeout, "queued same-chat outbox during chat-local read 429")
 			waitListenerRecovery(t, func() bool {
 				for _, call := range executor.callsSnapshot() {
 					if strings.Contains(call, "LISTENER_CHAT_429_PROMPT_1") {
@@ -2353,7 +2353,7 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 			}
 		}
 		return finals == 2
-	}, listenerRecoveryExtendedProgressTimeout) {
+	}, listenerRecoveryDurableIOProgressTimeout) {
 		t.Fatalf("stateful final delivery did not complete; calls=%#v; sent=%#v; requests=%v; phase=%#v", executor.callsSnapshot(), graphState.sentSnapshot(), graphState.requestsSnapshot(), bridge.mainLoopPhaseStatsSnapshot("poll"))
 	}
 	if !waitListenerRecoveryResult(func() bool {
