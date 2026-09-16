@@ -5932,7 +5932,7 @@ func runListenerRecoveryPollContinuationSurvivesReopenBeforeDrain(t *testing.T, 
 
 // TestTeamsListenFalseSQLiteOperationalFloodPreservesHealthyOrdinaryChat
 // exercises the production listener admission path with more operational
-// continuation rows than the durable hot-poll quantum.  The healthy chat is
+// continuation rows than one bounded listener work quantum.  The healthy chat is
 // deliberately inserted after that prefix and has no continuation.  It must
 // still reach Graph and Codex in the same listener lifetime; testing only the
 // store candidate list would miss a regression in the real Listen pipeline.
@@ -5962,14 +5962,37 @@ func TestTeamsListenFalseSQLiteOperationalFloodPreservesHealthyOrdinaryChat(t *t
 	// ordinary candidate and make the fairness assertion select that fixture
 	// instead of the deliberately tail-positioned healthy chat.
 	bridge.reg.Sessions = nil
-	const operationalCount = 65
+	operationalCount := listenerRecoveryOperationalFloodCount()
+	// These rows only establish the durable admission shape for the listener;
+	// their CreateSession/registry side effects are covered by the session
+	// lifecycle tests. Seed the complete fixture in one durable update instead
+	// of issuing one full JSON load/save per row, which otherwise makes the
+	// race-only fairness test spend most of its budget on setup I/O.
+	sessions := make([]Session, 0, operationalCount+1)
+	createdAt := time.Now().UTC()
 	for i := 0; i < operationalCount; i++ {
 		chatID := fmt.Sprintf("chat-operational-flood-%03d", i)
-		appendBridgeTestSession(t, bridge, store, fmt.Sprintf("session-operational-flood-%03d", i), chatID)
+		sessionID := fmt.Sprintf("session-operational-flood-%03d", i)
+		sessions = append(sessions, Session{
+			ID: sessionID, ChatID: chatID, ChatURL: "https://teams.example/" + chatID,
+			Topic: "topic " + sessionID, Status: "active", CreatedAt: createdAt, UpdatedAt: createdAt,
+		})
 	}
-	appendBridgeTestSession(t, bridge, store, "session-operational-flood-healthy", healthyChatID)
+	sessions = append(sessions, Session{
+		ID: "session-operational-flood-healthy", ChatID: healthyChatID,
+		ChatURL: "https://teams.example/" + healthyChatID, Topic: "topic session-operational-flood-healthy",
+		Status: "active", CreatedAt: createdAt, UpdatedAt: createdAt,
+	})
+	bridge.reg.Sessions = sessions
 	listenerRecoverySeedDuePoll(t, store, bridge.reg.ControlChatID, now)
 	if err := store.Update(ctx, func(state *teamstore.State) error {
+		for _, session := range sessions {
+			state.Sessions[session.ID] = teamstore.SessionContext{
+				ID: session.ID, Status: teamstore.SessionStatusActive,
+				TeamsChatID: session.ChatID, TeamsChatURL: session.ChatURL, TeamsTopic: session.Topic,
+				RunnerKind: "executor", CreatedAt: session.CreatedAt, UpdatedAt: session.UpdatedAt,
+			}
+		}
 		for i := 0; i < operationalCount; i++ {
 			chatID := fmt.Sprintf("chat-operational-flood-%03d", i)
 			state.ChatPolls[chatID] = teamstore.ChatPollState{
@@ -6007,7 +6030,12 @@ func TestTeamsListenFalseSQLiteOperationalFloodPreservesHealthyOrdinaryChat(t *t
 	bridge.leaseDuration = 5 * time.Minute
 	bridge.ownerHeartbeatInterval = 5 * time.Second
 	listener := startListenerRecovery(t, bridge, options)
-	progressDeadline := listenerRecoveryDurableIOProgressTimeout
+	// The race fixture still performs a full multi-row SQLite listener startup
+	// and can spend more than the generic durable-I/O watchdog before its first
+	// fair selection. Keep the bound finite, but allow one complete backlog
+	// recovery window; the manifest's 180-second process watchdog remains the
+	// outer cap for a genuinely wedged listener.
+	progressDeadline := listenerRecoveryBacklogProgressTimeout
 	select {
 	case <-executor.called:
 		calls := executor.callsSnapshot()
