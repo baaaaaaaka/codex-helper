@@ -2038,7 +2038,7 @@ func TestTeamsListenFalseGraphContinuationRecoversAfterTransientOutage(t *testin
 			}
 		}
 		return false
-	}, listenerRecoveryProgressTimeout, "continuation final delivery")
+	}, listenerRecoveryDurableIOProgressTimeout, "continuation final delivery")
 	mu.Lock()
 	gotRequests := continuationRequests
 	gotPosts := append([]string(nil), posts...)
