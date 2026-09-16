@@ -1085,6 +1085,15 @@ func pruneGlobalInboundSQLiteDB(ctx context.Context, db *sql.DB, now time.Time) 
 }
 
 func pruneGlobalInboundSQLiteWithFileLock(ctx context.Context, ledgerPath string, db *sql.DB, now time.Time) error {
+	return pruneGlobalInboundSQLiteWithFileLockBudget(ctx, ledgerPath, db, now, globalInboundPruneCloseTimeout)
+}
+
+// pruneGlobalInboundSQLiteWithFileLockBudget is kept separate so tests can
+// distinguish the production best-effort close budget from the maintenance
+// operation's eventual convergence.  The listener deliberately uses the
+// short budget above; a later maintenance owner may use its own longer
+// lifecycle budget when the host filesystem is temporarily slow.
+func pruneGlobalInboundSQLiteWithFileLockBudget(ctx context.Context, ledgerPath string, db *sql.DB, now time.Time, budget time.Duration) error {
 	if db == nil {
 		return nil
 	}
@@ -1093,7 +1102,7 @@ func pruneGlobalInboundSQLiteWithFileLock(ctx context.Context, ledgerPath string
 		return pruneGlobalInboundSQLiteDB(ctx, db, now)
 	}
 	lock := flock.New(ledgerPath + ".lock")
-	lockCtx, cancel := context.WithTimeout(ctx, globalInboundPruneCloseTimeout)
+	lockCtx, cancel := context.WithTimeout(ctx, budget)
 	defer cancel()
 	ok, err := lock.TryLockContext(lockCtx, 10*time.Millisecond)
 	if err != nil {
