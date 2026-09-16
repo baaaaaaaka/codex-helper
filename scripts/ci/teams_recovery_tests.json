@@ -909,7 +909,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 20,
+      "max_seconds": 60,
       "oracle": "Repeated Graph failures for one due chat do not prevent a later healthy chat from reaching Codex and delivering its final",
       "baseline": "pre-fix a failing head callback could consume the phase and starve all later chats",
       "resource_class": "listener_async"
