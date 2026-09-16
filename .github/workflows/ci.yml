@@ -1824,7 +1824,12 @@ jobs:
           go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLite(LongTranscriptFinalArrival|StatusOnlyFinalArrival)$' -benchtime=1x -count=1
           go test ./internal/teams -run '^$' -bench '^BenchmarkCXPPerfModelSQLiteTargetedSessionQuarantine$' -benchtime=1x -count=1 -benchmem
           go test ./internal/teams/store -run '^$' -bench '^BenchmarkSQLiteHotPollAdmissionScalarVsLegacy$' -benchtime=1x -count=1 -benchmem
-          go test ./internal/teams -run '^$' -bench '^BenchmarkCXPPerfModelSQLiteRealisticMixedUser/idle-main-loop$' -benchtime=1x -count=1 -benchmem
+          # The 2100-chat RealisticMixedUser idle benchmark is an intentionally
+          # large profiling fixture. A single iteration can exceed the owner
+          # lease and take tens of minutes, so it belongs in a dedicated
+          # profiling run rather than this bounded PR smoke lane. The selected
+          # snapshot benchmark above still exercises the large-state SQLite
+          # admission path here.
           go test ./internal/teams -run '^$' -bench '^BenchmarkLinkedTranscriptProvenanceMatrix$' -benchtime=10ms -count=1 -benchmem
           go test ./internal/teams -run '^$' -bench '^BenchmarkHistoryWatchUnchangedPartialTail(Poll|CheckpointPersistence)$' -benchtime=100ms -count=1 -benchmem
 
