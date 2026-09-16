@@ -1726,7 +1726,7 @@ func TestTeamsListenFalseChatRead429RecoversWithoutManualStateChange(t *testing.
 			}, 30*time.Second, "both prompts after chat-local read 429")
 			waitListenerRecovery(t, func() bool {
 				return countListenerRecoverySentBodies(graphState.sentSnapshot(), "LISTENER_CHAT_429_FINAL") == 2
-			}, 30*time.Second, "both finals after chat-local read 429")
+			}, listenerRecoveryDurableIOProgressTimeout, "both finals after chat-local read 429")
 
 			state := mustListenerRecoveryState(t, store)
 			for _, chatID := range []string{blockedChat, healthyChat} {

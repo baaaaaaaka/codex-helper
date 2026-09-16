@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -85,6 +86,90 @@ func insertSQLiteFIFOOutboxRowForTest(t *testing.T, tx *sql.Tx, id string, chatI
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, "", "", chatID, "", string(OutboxStatusQueued), sequence, sqliteTime(at), 0, 0, []byte(raw))
 	return err
+}
+
+func insertSQLiteFIFOOutboxRowsForTest(t *testing.T, tx *sql.Tx, chatID string, firstSequence, count int64, at time.Time) error {
+	t.Helper()
+	if count <= 0 {
+		return nil
+	}
+	return withSQLiteOutboxProjectionTriggersDisabledForTest(t, tx, func() error {
+		const batchSize int64 = 512
+		for offset := int64(0); offset < count; {
+			batchCount := count - offset
+			if batchCount > batchSize {
+				batchCount = batchSize
+			}
+			var query strings.Builder
+			query.WriteString(`INSERT INTO outbox_messages
+(id, session_id, turn_id, teams_chat_id, teams_message_id, status, sequence, created_at, deliver_after, post_send_effects_pending, json)
+VALUES `)
+			args := make([]any, 0, batchCount*11)
+			for index := int64(0); index < batchCount; index++ {
+				sequence := firstSequence + offset + index
+				id := fmt.Sprintf("outbox:fallback-budget:%05d", sequence)
+				rowAt := at.Add(time.Duration(sequence) * time.Nanosecond)
+				canonicalTime := rowAt.UTC().Format(time.RFC3339Nano)
+				raw := fmt.Sprintf(`{"id":%q,"teams_chat_id":%q,"status":%q,"sequence":%d,"created_at":%q,"body":"fifo fallback test"}`,
+					id, chatID, string(OutboxStatusQueued), sequence, canonicalTime)
+				if index != 0 {
+					query.WriteString(",")
+				}
+				query.WriteString("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+				args = append(args, id, "", "", chatID, "", string(OutboxStatusQueued), sequence, sqliteTime(rowAt), 0, 0, []byte(raw))
+			}
+			if _, err := tx.ExecContext(context.Background(), query.String(), args...); err != nil {
+				return err
+			}
+			offset += batchCount
+		}
+		return nil
+	})
+}
+
+func withSQLiteOutboxProjectionTriggersDisabledForTest(t *testing.T, tx *sql.Tx, fn func() error) error {
+	t.Helper()
+	names := []string{
+		"outbox_projection_guard_insert", "outbox_projection_guard_update",
+		"outbox_session_projection_guard_insert", "outbox_session_projection_guard_update",
+		"outbox_turn_projection_guard_insert", "outbox_turn_projection_guard_update",
+		"outbox_generation_bump_insert", "outbox_generation_bump_update", "outbox_generation_bump_delete",
+	}
+	type definition struct {
+		name string
+		sql  string
+	}
+	definitions := make([]definition, 0, len(names))
+	for _, name := range names {
+		var ddl string
+		if err := tx.QueryRowContext(context.Background(), `SELECT COALESCE(sql, '') FROM sqlite_master WHERE type = 'trigger' AND name = ?`, name).Scan(&ddl); err != nil {
+			return fmt.Errorf("read outbox trigger %q: %w", name, err)
+		}
+		if strings.TrimSpace(ddl) == "" {
+			return fmt.Errorf("outbox trigger %q has empty DDL", name)
+		}
+		definitions = append(definitions, definition{name: name, sql: ddl})
+	}
+	for _, trigger := range definitions {
+		if _, err := tx.ExecContext(context.Background(), `DROP TRIGGER `+trigger.name); err != nil {
+			return fmt.Errorf("drop outbox trigger %q: %w", trigger.name, err)
+		}
+	}
+	operationErr := fn()
+	var restoreErr error
+	for _, trigger := range definitions {
+		if _, err := tx.ExecContext(context.Background(), trigger.sql); err != nil {
+			restoreErr = fmt.Errorf("restore outbox trigger %q: %w", trigger.name, err)
+			break
+		}
+	}
+	if operationErr != nil {
+		if restoreErr != nil {
+			return fmt.Errorf("seed outbox rows: %v; %w", operationErr, restoreErr)
+		}
+		return operationErr
+	}
+	return restoreErr
 }
 
 func TestSQLitePendingOutboxKeysetAcceptsZeroTimestampCursor(t *testing.T) {
@@ -394,12 +479,7 @@ func TestSQLiteUntrustedOutboxFIFOFallbackIsBoundedAndFailClosed(t *testing.T) {
 		if _, err := tx.ExecContext(ctx, `UPDATE state_meta SET value = ? WHERE key = ?`, sqliteOutboxProjectionTrustDeferred, sqliteOutboxProjectionTrustKey); err != nil {
 			return err
 		}
-		for i := int64(1); i <= sqliteOutboxFIFOLegacyMaxRows+1; i++ {
-			if err := insertSQLiteFIFOOutboxRowForTest(t, tx, fmt.Sprintf("outbox:fallback-budget:%05d", i), "chat:fallback-budget", i, now.Add(time.Duration(i)*time.Nanosecond)); err != nil {
-				return err
-			}
-		}
-		return nil
+		return insertSQLiteFIFOOutboxRowsForTest(t, tx, "chat:fallback-budget", 1, sqliteOutboxFIFOLegacyMaxRows+1, now)
 	})
 	later, err := store.OutboxMessageByID(ctx, "outbox:fallback-later")
 	if err != nil {

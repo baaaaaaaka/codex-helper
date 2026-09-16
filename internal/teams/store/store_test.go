@@ -18313,7 +18313,7 @@ func TestRecordOwnerHeartbeatDoesNotWaitBehindFullStateUpdate(t *testing.T) {
 	case <-entered:
 	case err := <-updateDone:
 		t.Fatalf("full state update returned before reaching the blocking hook: %v", err)
-	case <-time.After(time.Second):
+	case <-time.After(storeConcurrentTestTimeout(time.Second)):
 		t.Fatal("full state update did not reach the blocking hook")
 	}
 

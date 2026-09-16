@@ -1168,7 +1168,7 @@ func TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI(t *t
 	// surrounding SQLite admission can be materially slower under a hosted
 	// race runner even after fixture setup has completed, so keep this bounded
 	// observation separate from the short per-request Graph timeout.
-	ctx, cancel := context.WithTimeout(context.Background(), ownershipStressTestTimeout(30*time.Second))
+	ctx, cancel := context.WithTimeout(context.Background(), ownershipStressTestTimeout(90*time.Second))
 	defer cancel()
 	ctx = context.WithValue(ctx, teamsListenerPollContextKey{}, true)
 

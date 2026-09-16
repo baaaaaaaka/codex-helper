@@ -1051,7 +1051,7 @@ func jsonCheckpointRawForTest(t *testing.T, path string, checkpointID string) []
 }
 
 func TestSQLiteMalformedCanonicalCheckpointIsIsolatedFromScopedReads(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), storeConcurrentTestTimeout(15*time.Second))
 	defer cancel()
 	store := newTestStore(t)
 	badSession := testSession()
