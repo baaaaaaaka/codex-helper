@@ -5549,7 +5549,14 @@ func runListenerRecoveryPollFrontierSurvivesReopen(t *testing.T, useSQLite bool)
 	// spend tens of seconds in the two-message/outbox drain even after startup
 	// is ready. Use the existing finite durable-I/O budget so the assertion
 	// measures frontier completion rather than an unrelated short watchdog.
+	// The SQLite race path can cross several reopen/owner-CAS boundaries on a
+	// busy hosted runner. Keep the assertion below the manifest's 180-second
+	// process watchdog while leaving enough margin above the observed durable
+	// I/O tail; the JSON path retains the same finite bound as before.
 	progressTimeout := listenerRecoveryDurableIOProgressTimeout
+	if useSQLite {
+		progressTimeout = 2 * listenerRecoveryDurableIOProgressTimeout
+	}
 	ctx := context.Background()
 	storePath := filepath.Join(t.TempDir(), "state.json")
 	chatID := "chat-reopen-frontier"
