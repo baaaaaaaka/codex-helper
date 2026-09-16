@@ -3983,7 +3983,7 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 			}
 		}
 		return false
-	}, listenerRecoveryExtendedProgressTimeout, "phase-timeout final delivery")
+	}, listenerRecoveryDurableIOProgressTimeout, "phase-timeout final delivery")
 	messageModifiedAt, err := time.Parse(time.RFC3339Nano, message.LastModifiedDateTime)
 	if err != nil {
 		t.Fatalf("parse phase-timeout message timestamp: %v", err)
@@ -4000,7 +4000,7 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 		}
 		poll := state.ChatPolls["chat-1"]
 		return !poll.LastModifiedCursor.Before(messageModifiedAt)
-	}, listenerRecoveryExtendedProgressTimeout, "phase-timeout durable cursor")
+	}, listenerRecoveryDurableIOProgressTimeout, "phase-timeout durable cursor")
 
 	// The listener continues polling after the final outbox side effect. Stop
 	// it after the successful retry's cursor is durable. Keep the message in the
