@@ -100,9 +100,14 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 	recoveryJob := workflowJobBlock(t, workflow, "teams-recovery-test")
 	requireStepContains(t, recoveryJob,
 		"name: Teams transcript recovery (${{ matrix.os }} / ${{ matrix.mode }} / partition ${{ matrix.partition }})",
-		`partition_flags=("-partition-count=1" "-partition-index=0")`,
 		`partition_flags=("-partition-count=2" "-partition-index=${{ matrix.partition }}")`,
 	)
+	if strings.Contains(recoveryJob, `partition_flags=("-partition-count=1" "-partition-index=0")`) {
+		t.Fatal("Teams recovery still contains an unsplit Unix partition fallback")
+	}
+	if strings.Count(recoveryJob, `partition_flags=("-partition-count=2"`) != 2 {
+		t.Fatalf("Teams recovery normal and race steps must both select the matrix partition")
+	}
 
 	windowsLifecycle := workflowJobBlock(t, workflow, "windows-proxy-lifecycle")
 	requireStepContains(t, windowsLifecycle,
