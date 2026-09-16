@@ -1375,7 +1375,7 @@ func TestSQLiteProjectionAuditPublicationPermanentPathErrorIsBounded(t *testing.
 	if !errors.Is(err, ErrSQLiteOutboxProjectionAuditPermanent) {
 		t.Fatalf("permanent path error = %v, want ErrSQLiteOutboxProjectionAuditPermanent", err)
 	}
-	if elapsed := time.Since(started); elapsed > time.Second {
+	if elapsed := time.Since(started); elapsed > sqliteProjectionAuditPermanentPathMaxDurationForTest() {
 		t.Fatalf("permanent path error took %s; publication retry should stop immediately", elapsed)
 	}
 }

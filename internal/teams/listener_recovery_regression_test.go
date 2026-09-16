@@ -2778,10 +2778,12 @@ func TestTeamsListenFalseLinkedTranscriptFullPoolDoesNotStarveHealthyTail(t *tes
 	}
 
 	options := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), bridge.executor)
-	// Use the same bounded production phase as the listener.  A short synthetic
-	// phase can cancel the healthy worker during its SQLite checkpoint commit on
-	// a Windows race runner, obscuring the full-pool fairness invariant.
-	options.PhaseBudget = mainLoopPhaseBudget
+	// Keep the phase finite but leave one production-sized 5s job slice for each
+	// cooperative worker.  This fairness fixture uses JSON and does not need the
+	// full 15s phase used by durable SQLite recovery; shortening the idle tail
+	// keeps the test from becoming a 15s scheduler sleep while retaining enough
+	// time for the healthy checkpoint/outbox boundary to commit.
+	options.PhaseBudget = 2 * mainLoopPollWorkerBudget
 	options.PollWorkerBudget = mainLoopPollWorkerBudget
 	listener := startListenerRecovery(t, bridge, options)
 	waitListenerRecovery(t, func() bool {
@@ -2800,11 +2802,10 @@ func TestTeamsListenFalseLinkedTranscriptFullPoolDoesNotStarveHealthyTail(t *tes
 		t.Fatalf("stat healthy transcript: %v", err)
 	}
 	waitListenerRecovery(t, func() bool {
-		state, loadErr := store.Load(context.Background())
-		if loadErr != nil {
+		checkpoint, found, loadErr := store.ImportCheckpoint(context.Background(), transcriptCheckpointID("s005"))
+		if loadErr != nil || !found {
 			return false
 		}
-		checkpoint := state.ImportCheckpoints[transcriptCheckpointID("s005")]
 		if checkpoint.LastOffset != healthyInfo.Size() {
 			return false
 		}

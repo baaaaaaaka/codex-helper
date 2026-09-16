@@ -4,6 +4,10 @@ package store
 
 func hotPollInvalidPageBadCount() int { return sqliteHotPollReadyLimit }
 
+func hotPollInvalidPageHealthyCount() int { return 20 }
+
+func hotPollReadyAdmissionHealthyCount() int { return 20 }
+
 func hotPollSemanticMalformedPollCount() int { return 520 }
 
 // The normal build keeps the page-sized semantic-malformed prefix so this

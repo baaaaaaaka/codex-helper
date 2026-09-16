@@ -22332,7 +22332,10 @@ func newTestStore(t *testing.T) *Store {
 // transaction semantics.  Building the fixture in one transaction keeps the
 // backend boundary real (including the SQLite connection and projections)
 // without making every owner-fencing assertion pay the migration's full
-// filesystem flush cost on hosted Windows runners.
+// filesystem flush cost on hosted Windows runners.  Keep the already-prepared
+// handle attached to the Store: closing and reopening it through Store.Load
+// repeats compatibility validation and turns this short owner-admission
+// contract into a long filesystem-sensitive test, especially under -race.
 func newSQLiteTestStore(t *testing.T) *Store {
 	t.Helper()
 	store := newTestStore(t)
@@ -22355,18 +22358,22 @@ func newSQLiteTestStore(t *testing.T) *Store {
 		_ = db.Close()
 		t.Fatalf("insert sqlite test fixture state: %v", err)
 	}
+	if err := ensureSQLiteSchemaContext(ctx, db); err != nil {
+		_ = db.Close()
+		t.Fatalf("prepare sqlite test fixture schema: %v", err)
+	}
 	if _, err := db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
 		_ = db.Close()
 		t.Fatalf("checkpoint sqlite test fixture: %v", err)
 	}
-	if err := db.Close(); err != nil {
-		t.Fatalf("close sqlite test fixture: %v", err)
-	}
 	writeSQLitePointerForTest(t, store, storeSQLiteFileName)
+	store.sqliteRuntimeMu.Lock()
+	store.sqliteDB = db
+	store.sqliteDBPath = dbPath
+	store.sqliteSchemaReadyPath = dbPath
+	store.sqliteSchemaContractPath = dbPath
+	store.sqliteRuntimeMu.Unlock()
 	testphase.Emit("fixture_ready", map[string]string{"backend": "sqlite", "path": dbPath})
-	if _, err := store.Load(ctx); err != nil {
-		t.Fatalf("load sqlite test fixture through store: %v", err)
-	}
 	return store
 }
 

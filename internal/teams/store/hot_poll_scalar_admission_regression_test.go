@@ -2618,7 +2618,7 @@ func TestSQLiteHotPollTrustedWorkCandidatesContinuesPastInvalidPage(t *testing.T
 	store := newTestStore(t)
 	_, ordinaryLimit := sqliteHotPollLaneLimits(sqliteHotPollReadyLimit)
 	badCount := hotPollInvalidPageBadCount()
-	const healthyCount = 20
+	healthyCount := hotPollInvalidPageHealthyCount()
 	if err := store.Update(ctx, func(state *State) error {
 		for i := 0; i < badCount+healthyCount; i++ {
 			id := fmt.Sprintf("invalid-page-session-%03d", i)
@@ -2665,10 +2665,14 @@ func TestSQLiteHotPollTrustedWorkCandidatesContinuesPastInvalidPage(t *testing.T
 			t.Fatalf("invalid canonical session was admitted: %#v", candidate)
 		}
 	}
-	if len(seen) != ordinaryLimit {
-		t.Fatalf("healthy candidates after invalid page=%d, want ordinary lane quota %d: %#v", len(seen), ordinaryLimit, seen)
+	wantHealthy := healthyCount
+	if wantHealthy > ordinaryLimit {
+		wantHealthy = ordinaryLimit
 	}
-	for i := badCount; i < badCount+ordinaryLimit; i++ {
+	if len(seen) != wantHealthy {
+		t.Fatalf("healthy candidates after invalid page=%d, want %d: %#v", len(seen), wantHealthy, seen)
+	}
+	for i := badCount; i < badCount+wantHealthy; i++ {
 		id := fmt.Sprintf("invalid-page-session-%03d", i)
 		if !seen[id] {
 			t.Fatalf("invalid page prevented healthy candidate %q from admission: %#v", id, seen)
@@ -3042,7 +3046,7 @@ func TestSQLiteHotPollReadyAdmissionDoesNotReserveEmptyRecoverySlot(t *testing.T
 	ctx := context.Background()
 	now := time.Now().UTC().Truncate(time.Microsecond)
 	store := newTestStore(t)
-	const healthyCount = 20
+	healthyCount := hotPollReadyAdmissionHealthyCount()
 	if err := store.Update(ctx, func(state *State) error {
 		for i := 0; i < healthyCount; i++ {
 			chatID := fmt.Sprintf("ready-quota-healthy-%03d", i)
@@ -3089,8 +3093,12 @@ func TestSQLiteHotPollReadyAdmissionDoesNotReserveEmptyRecoverySlot(t *testing.T
 		t.Fatalf("ready quota admission: %v", err)
 	}
 	_, ordinaryLimit := sqliteHotPollLaneLimits(sqliteHotPollReadyLimit)
-	if len(ids) != ordinaryLimit {
-		t.Fatalf("healthy ready IDs=%d, want ordinary quota %d: %#v", len(ids), ordinaryLimit, ids)
+	wantHealthy := healthyCount
+	if wantHealthy > ordinaryLimit {
+		wantHealthy = ordinaryLimit
+	}
+	if len(ids) != wantHealthy {
+		t.Fatalf("healthy ready IDs=%d, want %d: %#v", len(ids), wantHealthy, ids)
 	}
 	for _, id := range ids {
 		if id == "ready-quota-future-corrupt" {

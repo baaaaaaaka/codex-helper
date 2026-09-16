@@ -11,6 +11,18 @@ package store
 // retains the full 64-row page-boundary fixture below.
 func hotPollInvalidPageBadCount() int { return 1 }
 
+// One healthy tail row is enough to prove that the bounded canonical fallback
+// crosses a malformed prefix. Keeping the race fixture narrow avoids spending
+// the production two-second compatibility budget decoding healthy rows that do
+// not add another invariant to this test; the non-race build retains the larger
+// quota-sized fixture.
+func hotPollInvalidPageHealthyCount() int { return 1 }
+
+// The race build only needs one healthy row to prove that a corrupt future row
+// does not consume the ready admission slot. The normal build retains the
+// larger fixture that also exercises filling the ordinary quota.
+func hotPollReadyAdmissionHealthyCount() int { return 1 }
+
 // The normal build keeps the large semantic-malformed prefix to exercise
 // keyset traversal beyond eight 64-row pages. Race instrumentation makes the
 // canonical JSON compatibility scan materially slower and would turn that
