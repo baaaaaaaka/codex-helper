@@ -125,6 +125,10 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		"TestSQLiteHotPollAdmissionBoundsSemanticallyMalformedPollLaneAndPreservesHealthyChat": true,
 		"TestSQLiteSemanticallyMalformedOutboxRowsDoNotHideHealthyWork":                        true,
 		"TestSQLiteHotPollWorkCandidatesRotateOperationalRowsBeyondLimit":                      true,
+		// This writer-close test observes a SQLite prune/reopen boundary. Keep
+		// it out of broad package shards so unrelated WAL activity cannot make
+		// the bounded maintenance handoff look like a production lock failure.
+		"TestGlobalInboundSQLiteWriterDefersPruneUntilClose": true,
 		// This cross-backend owner-fencing test migrates a file-backed store to
 		// SQLite. On Windows, modernc SQLite may block in FlushFileBuffers when
 		// unrelated store shards share the hosted runner. Keep the migration
@@ -210,15 +214,19 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestSQLiteHotPollAdmissionBoundsSemanticallyMalformedPollLaneAndPreservesHealthyChat": true,
 		"TestSQLiteSemanticallyMalformedOutboxRowsDoNotHideHealthyWork":                        true,
 		"TestSQLiteHotPollWorkCandidatesRotateOperationalRowsBeyondLimit":                      true,
-		"TestStoreHistoryWatchOwnerCapabilityFencesTakeoverAcrossBackends":                     true,
-		"TestStoreOwnerBindsLegacyQueuedTurnAndRejectsPreviousOwnerCallbacks":                  true,
-		"TestStoreOwnerBoundOutboxAdmissionRejectsStaleOwnerAcrossBackends":                    true,
-		"TestSQLiteHotPollAdmissionAdmitsMalformedPollWithoutStarvingHealthyChat":              true,
-		"TestSQLiteHotPollReadyScheduleSkipsMalformedOperationalPrefix":                        true,
-		"TestSQLiteLegacyEmptyRuntimeProjectionBootstrapsOnceForHotPoll":                       true,
-		"TestSQLiteMalformedNumericCompatibilityColumnsDoNotAbortRecovery":                     true,
-		"TestSQLiteHotPollTrustedWorkCandidatesContinuesPastInvalidPage":                       true,
-		"TestSQLiteHotPollAdmissionUsesJSONFrontierHonorsBlockedUntilAndReservesControl":       true,
+		// Keep the SQLite prune/reopen observation host-exclusive as well as
+		// process-isolated; its finite busy-lock boundary is sensitive to
+		// unrelated runner-wide filesystem pressure.
+		"TestGlobalInboundSQLiteWriterDefersPruneUntilClose":                             true,
+		"TestStoreHistoryWatchOwnerCapabilityFencesTakeoverAcrossBackends":               true,
+		"TestStoreOwnerBindsLegacyQueuedTurnAndRejectsPreviousOwnerCallbacks":            true,
+		"TestStoreOwnerBoundOutboxAdmissionRejectsStaleOwnerAcrossBackends":              true,
+		"TestSQLiteHotPollAdmissionAdmitsMalformedPollWithoutStarvingHealthyChat":        true,
+		"TestSQLiteHotPollReadyScheduleSkipsMalformedOperationalPrefix":                  true,
+		"TestSQLiteLegacyEmptyRuntimeProjectionBootstrapsOnceForHotPoll":                 true,
+		"TestSQLiteMalformedNumericCompatibilityColumnsDoNotAbortRecovery":               true,
+		"TestSQLiteHotPollTrustedWorkCandidatesContinuesPastInvalidPage":                 true,
+		"TestSQLiteHotPollAdmissionUsesJSONFrontierHonorsBlockedUntilAndReservesControl": true,
 	},
 }
 
