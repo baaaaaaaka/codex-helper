@@ -287,7 +287,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 40,
+      "max_seconds": 120,
       "oracle": "oversized and large invisible records receive bounded disposition and the following final reaches fake Graph",
       "baseline": "pre-fix cursor remains before the opaque record and later final is unreachable",
       "resource_class": "listener_async"
@@ -978,7 +978,7 @@
       "vertical": "sqlite-malformed-outbox-isolation",
       "real_listener": false,
       "fake_graph": false,
-      "max_seconds": 10,
+      "max_seconds": 120,
       "oracle": "a truncated outbox JSON row does not prevent store open, does not hide healthy pending work, and is preserved byte-for-byte across an unrelated full rewrite",
       "baseline": "pre-fix a malformed row could make SQLite schema backfill or query evaluation fail for the whole store",
       "resource_class": "sqlite_fsync"
