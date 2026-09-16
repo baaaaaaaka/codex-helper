@@ -11,7 +11,11 @@ import (
 	"github.com/gofrs/flock"
 )
 
-const delegationOutboxReservationLockTimeout = 5 * time.Second
+// Auxiliary worker-store updates can serialize several full JSON
+// read/modify/write operations behind one cross-process lock. Keep the wait
+// finite, but allow slow hosted filesystems and concurrent safety updates to
+// drain instead of turning ordinary contention into a lost retry/backoff.
+const delegationOutboxReservationLockTimeout = 30 * time.Second
 
 // ReserveOutbox durably reserves the one non-idempotent POST associated with a
 // delegation record. The reservation is made before the Graph call and is
