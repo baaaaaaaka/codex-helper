@@ -1036,10 +1036,12 @@ func waitListenerRecovery(t *testing.T, waitFor func() bool, timeout time.Durati
 }
 
 type listenerRecoveryHandle struct {
-	cancel context.CancelFunc
-	done   <-chan error
-	once   sync.Once
-	err    error
+	cancel   context.CancelFunc
+	done     <-chan error
+	finished <-chan struct{}
+	once     sync.Once
+	errMu    sync.Mutex
+	err      error
 }
 
 func startListenerRecovery(t *testing.T, bridge *Bridge, options BridgeOptions) *listenerRecoveryHandle {
@@ -1052,13 +1054,33 @@ func startListenerRecovery(t *testing.T, bridge *Bridge, options BridgeOptions) 
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
+	finished := make(chan struct{})
+	handle := &listenerRecoveryHandle{cancel: cancel, done: done, finished: finished}
 	go func() {
 		testphase.Emit("listener_goroutine_started", nil)
-		done <- bridge.Listen(ctx, options)
+		err := bridge.Listen(ctx, options)
+		handle.errMu.Lock()
+		handle.err = err
+		handle.errMu.Unlock()
+		close(finished)
+		done <- err
 	}()
-	handle := &listenerRecoveryHandle{cancel: cancel, done: done}
 	t.Cleanup(func() { handle.stop(t) })
 	return handle
+}
+
+func (h *listenerRecoveryHandle) finishedError() (error, bool) {
+	if h == nil {
+		return nil, false
+	}
+	select {
+	case <-h.finished:
+		h.errMu.Lock()
+		defer h.errMu.Unlock()
+		return h.err, true
+	default:
+		return nil, false
+	}
 }
 
 func (h *listenerRecoveryHandle) stop(t *testing.T) {
@@ -1070,9 +1092,17 @@ func (h *listenerRecoveryHandle) stop(t *testing.T) {
 		// its context) explicitly stops them.  A completed nil result is not a
 		// successful cleanup: it would make a false-positive test look healthy
 		// while all later cycles had already been lost.
+		if err, finished := h.finishedError(); finished {
+			if err == nil {
+				t.Errorf("listener recovery test listener exited before explicit cancellation")
+			}
+			return
+		}
 		select {
 		case err := <-h.done:
+			h.errMu.Lock()
 			h.err = err
+			h.errMu.Unlock()
 			if err == nil {
 				t.Errorf("listener recovery test listener exited before explicit cancellation")
 			}
@@ -1087,9 +1117,33 @@ func (h *listenerRecoveryHandle) stop(t *testing.T) {
 			t.Errorf("listener recovery test listener did not stop within 5s")
 		}
 	})
-	if h.err != nil && !errors.Is(h.err, context.Canceled) {
-		t.Errorf("Listen returned unexpected error: %v", h.err)
+	h.errMu.Lock()
+	err := h.err
+	h.errMu.Unlock()
+	if err != nil && !errors.Is(err, context.Canceled) {
+		t.Errorf("Listen returned unexpected error: %v", err)
 	}
+}
+
+func waitListenerRecoveryWithHandle(t *testing.T, handle *listenerRecoveryHandle, waitFor func() bool, timeout time.Duration, description string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if err, finished := handle.finishedError(); finished {
+			t.Fatalf("listener exited before %s: %v", description, err)
+		}
+		if waitFor() {
+			return
+		}
+		time.Sleep(listenerRecoveryPollInterval)
+	}
+	if err, finished := handle.finishedError(); finished {
+		t.Fatalf("listener exited before %s: %v", description, err)
+	}
+	if waitFor() {
+		return
+	}
+	t.Fatalf("timed out waiting for %s", description)
 }
 
 func listenerRecoveryBaseOptions(store *teamstore.Store, registryPath string, executor Executor) BridgeOptions {
@@ -5694,11 +5748,14 @@ func runListenerRecoveryPollFrontierSurvivesReopen(t *testing.T, useSQLite bool)
 	first := startListenerRecovery(t, firstBridge, firstOptions)
 	select {
 	case <-firstExecutor.called:
+	case <-first.finished:
+		err, _ := first.finishedError()
+		t.Fatalf("first listener exited before processing production poll page: %v", err)
 	case <-time.After(progressTimeout):
 		first.stop(t)
 		t.Fatalf("first listener did not process production poll page; Graph reads=%d errors=%v", graphState.getCount(chatID), graphState.errorsSnapshot())
 	}
-	waitListenerRecovery(t, func() bool {
+	waitListenerRecoveryWithHandle(t, first, func() bool {
 		state, err := firstStore.Load(ctx)
 		if err != nil {
 			return false
@@ -5743,7 +5800,7 @@ func runListenerRecoveryPollFrontierSurvivesReopen(t *testing.T, useSQLite bool)
 	options.PhaseBudget = mainLoopPhaseBudget
 	options.PollWorkerBudget = mainLoopPollWorkerBudget
 	listener := startListenerRecovery(t, recoveredBridge, options)
-	waitListenerRecovery(t, func() bool {
+	waitListenerRecoveryWithHandle(t, listener, func() bool {
 		state, err := recoveredStore.Load(ctx)
 		return err == nil && state.ControlLease.Generation > oldGeneration
 	}, progressTimeout, "reopened listener owner takeover")

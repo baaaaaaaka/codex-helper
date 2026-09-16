@@ -7614,7 +7614,11 @@ func TestSQLiteHotPollAdmissionDoesNotLetStaleOrdinaryHintStarveDueChat(t *testi
 	store := newTestStore(t)
 	ctx := context.Background()
 	now := time.Now().UTC()
-	const staleOperational = 24
+	// Keep the normal build at a page-sized prefix so it exercises hint
+	// reconciliation beyond the scalar admission page. The race build uses a
+	// single row because the compatibility JSON oracle is intentionally bounded
+	// by the production two-second lane budget; the invariant is identical.
+	staleOperational := hotPollOperationalHintPrefixCount()
 	if err := store.Update(ctx, func(state *State) error {
 		for i := 0; i < staleOperational; i++ {
 			chatID := fmt.Sprintf("chat-stale-operational-hint-%03d", i)
@@ -10505,13 +10509,11 @@ func TestEarlierUnsentOutboxKeepsSameTurnAmbiguousPredecessor(t *testing.T) {
 			if err != nil || len(all) != 1 || all[0].ID != ambiguous.ID {
 				t.Fatalf("same-turn predecessor list = %#v err=%v, want ambiguous blocker", all, err)
 			}
-			if err := store.Update(ctx, func(state *State) error {
-				row := state.OutboxMessages[sameTurn.ID]
-				row.Status = OutboxStatusSent
-				row.TeamsMessageID = "teams-same-turn-next"
-				state.OutboxMessages[row.ID] = row
-				return nil
-			}); err != nil {
+			claimed, err := store.MarkOutboxSendAttempt(ctx, sameTurn.ID)
+			if err != nil {
+				t.Fatalf("claim same-turn successor for distinct-turn check: %v", err)
+			}
+			if _, err := store.MarkOutboxSentForAttempt(ctx, sameTurn.ID, claimed.SendAttemptToken, "teams-same-turn-next"); err != nil {
 				t.Fatalf("mark same-turn successor sent for distinct-turn check: %v", err)
 			}
 			got, ok, err = store.EarlierUnsentOutbox(ctx, differentTurn)
@@ -10519,6 +10521,55 @@ func TestEarlierUnsentOutboxKeepsSameTurnAmbiguousPredecessor(t *testing.T) {
 				t.Fatalf("different-turn predecessor = %#v ok=%v err=%v, want ambiguous row skipped", got, ok, err)
 			}
 		})
+	}
+}
+
+func TestSQLiteStoreCloseReleasesStateLockForImmediateReopen(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	if err := store.Update(ctx, func(state *State) error {
+		state.Scope = ScopeIdentity{ID: "close-reopen-scope", AccountID: "close-reopen-account", Profile: "default"}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed store: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate store: %v", err)
+	}
+
+	// Exercise the ownership boundary directly. Store.Close must release an
+	// outstanding state-lock handle before another Store instance is opened on
+	// the same durable path; this is especially important on Windows, where a
+	// live handle can make the next schema preflight fail with Access is denied.
+	if err := store.lock.Lock(); err != nil {
+		t.Fatalf("hold state lock for close: %v", err)
+	}
+	path := store.Path()
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Errorf("close reopened store: %v", err)
+		}
+	})
+	locked, err := reopened.lock.TryLock()
+	if err != nil {
+		t.Fatalf("acquire reopened state lock: %v", err)
+	}
+	if !locked {
+		t.Fatal("reopened store state lock remained held after Close")
+	}
+	if err := reopened.lock.Unlock(); err != nil {
+		t.Fatalf("release reopened state lock: %v", err)
+	}
+	if err := reopened.PrepareSQLiteSchemaBeforeOwner(ctx); err != nil {
+		t.Fatalf("prepare reopened SQLite schema: %v", err)
 	}
 }
 

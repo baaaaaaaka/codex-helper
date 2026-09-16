@@ -3197,6 +3197,16 @@ func (s *Store) Close() error {
 	}
 	s.sqliteOutboxProjectionDBPath = ""
 	s.sqliteOutboxProjectionTrust = ""
+	// Store owns the state-lock object as well as its SQLite handles.  Normal
+	// mutations unlock it at the end of each operation, but an interrupted
+	// lifecycle or a caller closing during an externally-held boundary can
+	// otherwise leave the Windows handle live across an immediate Store reopen.
+	// flock.Close is idempotent when the lock is already released.
+	if s.lock != nil {
+		if lockErr := s.lock.Close(); closeErr == nil {
+			closeErr = lockErr
+		}
+	}
 	return closeErr
 }
 

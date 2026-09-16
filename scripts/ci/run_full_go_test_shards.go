@@ -139,8 +139,14 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		"TestCXPPerfModelSQLiteExternalScenariosCoverCommonPaths":                     true,
 		"TestCXPPerfModelProfilesCanSeedStoreAndPoll":                                 true,
 		"TestTeamsUnresolvedTranscriptOutboxDoesNotLivelockHealthyTail":               true,
-		"TestTeamsOutboxAcceptedResponseFinishesAfterPhaseDeadline":                   true,
-		"TestTeamsOutboxPredecessorMutationRefreshesFIFOSnapshotSQLite":               true,
+		// These targeted outbox sender fixtures perform bounded durable state
+		// transitions. A broad race shard can delay the SQLite claim/complete
+		// boundary until the test's finite retry window expires, so compile each
+		// assertion in its own process.
+		"TestTeamsSameChatDefinitiveSendFailureDoesNotStarveLaterOutbox":                 true,
+		"TestSendQueuedOutboxFallsBackToControlMentionAfterDefiniteWebhookFailureSQLite": true,
+		"TestTeamsOutboxAcceptedResponseFinishesAfterPhaseDeadline":                      true,
+		"TestTeamsOutboxPredecessorMutationRefreshesFIFOSnapshotSQLite":                  true,
 		// This listener test starts a real continuous loop over a file-backed
 		// store.  Keep startup/recovery timing independent from unrelated
 		// package tests; the test's own Graph fixture already covers the
@@ -158,6 +164,7 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		// healthy operation into a false readiness or budget failure.
 		"TestSQLiteHotPollCorruptProbeRejectsNonRFC3339Times":                                  true,
 		"TestSQLiteHotPollCanonicalFallbackReleasesStoreLockDuringRead":                        true,
+		"TestSQLiteHotPollStandaloneCanonicalFallbackReleasesStoreLockDuringRead":              true,
 		"TestSQLiteInterruptedOutboxProjectionAuditLeavesAuditingAndCanResume":                 true,
 		"TestSQLiteHotPollAdmissionBoundsSemanticallyMalformedPollLaneAndPreservesHealthyChat": true,
 		"TestSQLiteSemanticallyMalformedOutboxRowsDoNotHideHealthyWork":                        true,
@@ -167,6 +174,8 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		// production code reaches the boundary.
 		"TestSQLiteHotPollAdmissionQuarantinesStructurallyEmptyPendingPage":          true,
 		"TestSQLiteLegacyHistoryGateCleanupReleasesBetweenPages":                     true,
+		"TestEarlierUnsentOutboxKeepsSameTurnAmbiguousPredecessor":                   true,
+		"TestSQLiteStoreCloseReleasesStateLockForImmediateReopen":                    true,
 		"TestSQLiteOutboxPostSendEffectsBackfillYieldsToOwnerHeartbeat":              true,
 		"TestRecordOwnerHeartbeatDoesNotWaitBehindFullStateUpdate":                   true,
 		"TestRecordOwnerHeartbeatUsesDedicatedRuntimeConnectionDuringForegroundRead": true,
@@ -268,11 +277,13 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		// addition to fairness. Keep the process isolated and serialize it on the
 		// hosted runner so unrelated shard I/O cannot turn the durable assertion
 		// into another readiness tail.
-		"TestTeamsMainLoopOutboxFairnessBypassesPersistentGraphFailurePrefix":  true,
-		"TestTeamsMainLoopOutboxFairnessCursorWalksPastDistinctChatScanPrefix": true,
-		"TestTeamsMainLoopOutboxFairnessWalksPastDistinctChatScanPrefix":       true,
-		"TestTeamsMainLoopOutboxLedgerFailureDoesNotStarveHealthyTail":         true,
-		"TestTeamsUnresolvedTranscriptOutboxDoesNotLivelockHealthyTail":        true,
+		"TestTeamsMainLoopOutboxFairnessBypassesPersistentGraphFailurePrefix":            true,
+		"TestTeamsMainLoopOutboxFairnessCursorWalksPastDistinctChatScanPrefix":           true,
+		"TestTeamsMainLoopOutboxFairnessWalksPastDistinctChatScanPrefix":                 true,
+		"TestTeamsMainLoopOutboxLedgerFailureDoesNotStarveHealthyTail":                   true,
+		"TestTeamsUnresolvedTranscriptOutboxDoesNotLivelockHealthyTail":                  true,
+		"TestTeamsSameChatDefinitiveSendFailureDoesNotStarveLaterOutbox":                 true,
+		"TestSendQueuedOutboxFallsBackToControlMentionAfterDefiniteWebhookFailureSQLite": true,
 		// These matrices perform a long sequence of durable listener/control
 		// operations. Keep them away from unrelated shard processes so hosted
 		// scheduler and filesystem pressure cannot turn the service-hook
@@ -286,6 +297,7 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 	"./internal/teams/store": {
 		"TestSQLiteHotPollCorruptProbeRejectsNonRFC3339Times":                                  true,
 		"TestSQLiteHotPollCanonicalFallbackReleasesStoreLockDuringRead":                        true,
+		"TestSQLiteHotPollStandaloneCanonicalFallbackReleasesStoreLockDuringRead":              true,
 		"TestSQLiteInterruptedOutboxProjectionAuditLeavesAuditingAndCanResume":                 true,
 		"TestSQLiteHotPollAdmissionBoundsSemanticallyMalformedPollLaneAndPreservesHealthyChat": true,
 		"TestSQLiteSemanticallyMalformedOutboxRowsDoNotHideHealthyWork":                        true,
@@ -317,6 +329,8 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestSQLiteOwnerMigrationRejectsSourceChangeBeforePointerPublication":                  true,
 		"TestSQLiteOwnerOutboxProjectionAuditClaimTokenFencesTakeoverOverlap":                  true,
 		"TestSQLiteFullAcceptedOutboxCASRecoversAfterCapacityReturns":                          true,
+		"TestEarlierUnsentOutboxKeepsSameTurnAmbiguousPredecessor":                             true,
+		"TestSQLiteStoreCloseReleasesStateLockForImmediateReopen":                              true,
 	},
 }
 
@@ -366,6 +380,7 @@ func main() {
 	testTimeout := flag.Duration("timeout", 20*time.Minute, "per-shard go test timeout")
 	race := flag.Bool("race", false, "pass -race to go test")
 	listOnly := flag.Bool("list-only", false, "print the plan without executing tests")
+	listAllPartitions := flag.Bool("list-all-partitions", false, "with -list-only, print the complete plan and every partition plan in one discovery pass")
 	partitionCount := flag.Int("partition-count", 1, "number of independent hosted-runner partitions")
 	partitionIndex := flag.Int("partition-index", 0, "zero-based hosted-runner partition index")
 	var requestedPackages stringList
@@ -387,6 +402,9 @@ func main() {
 	if *partitionIndex < 0 || *partitionIndex >= *partitionCount {
 		fatal(fmt.Errorf("partition-index %d is outside partition-count %d", *partitionIndex, *partitionCount))
 	}
+	if *listAllPartitions && !*listOnly {
+		fatal(errors.New("list-all-partitions requires list-only"))
+	}
 
 	packages := []string(requestedPackages)
 	if len(packages) == 0 {
@@ -401,18 +419,21 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
+	if *listOnly && *listAllPartitions {
+		printTestJobs("complete", jobs)
+		for partitionIndex := 0; partitionIndex < *partitionCount; partitionIndex++ {
+			partitionJobs := append([]testJob(nil), jobs...)
+			partitionJobs = partitionTestJobs(partitionJobs, *partitionCount, partitionIndex)
+			printTestJobs(fmt.Sprintf("partition-%d", partitionIndex), partitionJobs)
+		}
+		return
+	}
 	jobs = partitionTestJobs(jobs, *partitionCount, *partitionIndex)
 	if len(jobs) == 0 {
 		fatal(fmt.Errorf("partition %d/%d selected no test jobs", *partitionIndex+1, *partitionCount))
 	}
 	if *listOnly {
-		for _, job := range jobs {
-			fmt.Printf("%s: go", job.label)
-			for _, arg := range job.args {
-				fmt.Printf(" %q", arg)
-			}
-			fmt.Printf(" # estimated-weight=%d estimated-exclusive=%t\n", job.weight, job.exclusive)
-		}
+		printTestJobs("", jobs)
 		return
 	}
 
@@ -430,6 +451,19 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Printf("full test shards passed: %d job(s)\n", len(jobs))
+}
+
+func printTestJobs(planName string, jobs []testJob) {
+	if planName != "" {
+		fmt.Printf("plan %s:\n", planName)
+	}
+	for _, job := range jobs {
+		fmt.Printf("%s: go", job.label)
+		for _, arg := range job.args {
+			fmt.Printf(" %q", arg)
+		}
+		fmt.Printf(" # estimated-weight=%d estimated-exclusive=%t\n", job.weight, job.exclusive)
+	}
 }
 
 // partitionTestJobs assigns complete test processes to independent hosted

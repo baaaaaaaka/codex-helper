@@ -1,7 +1,9 @@
 import json
+import os
 import pathlib
 import re
 import subprocess
+import tempfile
 import unittest
 
 
@@ -31,40 +33,60 @@ def step_blocks(job: str) -> dict[str, str]:
 
 class TargetedShardWorkflowTests(unittest.TestCase):
     def test_full_runner_partitions_cover_every_runnable_job_exactly_once(self):
-        def plan(*, race: bool, partition_count: int, partition_index: int) -> list[str]:
-            command = [
-                "go",
-                "run",
-                "./scripts/ci/run_full_go_test_shards.go",
-                "-timeout=30m",
-                "-parallel=16",
-                "-shards=16",
-            ]
-            if race:
-                command.append("-race")
-            command.extend(
-                [
-                    f"-partition-count={partition_count}",
-                    f"-partition-index={partition_index}",
-                    "-list-only",
-                ]
+        with tempfile.TemporaryDirectory(prefix="cxp-ci-shard-runner-") as temp_dir:
+            runner_path = pathlib.Path(temp_dir) / (
+                "run_full_go_test_shards.exe" if os.name == "nt" else "run_full_go_test_shards"
             )
-            completed = subprocess.run(
-                command,
+            subprocess.run(
+                ["go", "build", "-o", str(runner_path), "./scripts/ci/run_full_go_test_shards.go"],
                 cwd=ROOT,
                 check=True,
                 text=True,
                 capture_output=True,
             )
-            return [line for line in completed.stdout.splitlines() if ": go " in line]
 
+            def plans(*, race: bool, partition_count: int) -> dict[str, list[str]]:
+                command = [
+                    str(runner_path),
+                    "-timeout=30m",
+                    "-parallel=16",
+                    "-shards=16",
+                ]
+                if race:
+                    command.append("-race")
+                command.extend(
+                    [
+                        f"-partition-count={partition_count}",
+                        "-partition-index=0",
+                        "-list-only",
+                        "-list-all-partitions",
+                    ]
+                )
+                completed = subprocess.run(
+                    command,
+                    cwd=ROOT,
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                )
+                parsed: dict[str, list[str]] = {}
+                current_plan = None
+                for line in completed.stdout.splitlines():
+                    if line.startswith("plan ") and line.endswith(":"):
+                        current_plan = line[len("plan ") : -1]
+                        parsed[current_plan] = []
+                    elif ": go " in line:
+                        self.assertIsNotNone(current_plan, line)
+                        parsed[current_plan].append(line)
+                return parsed
+
+            self._assert_full_runner_partition_plans(plans)
+
+    def _assert_full_runner_partition_plans(self, run_plans):
         for race, partition_count in ((False, 2), (True, 4)):
             with self.subTest(race=race, partition_count=partition_count):
-                complete_plan = plan(
-                    race=race,
-                    partition_count=1,
-                    partition_index=0,
-                )
+                plans = run_plans(race=race, partition_count=partition_count)
+                complete_plan = plans["complete"]
                 self.assertTrue(complete_plan)
                 self.assertTrue(
                     any(
@@ -78,11 +100,7 @@ class TargetedShardWorkflowTests(unittest.TestCase):
                     if ' "-run" ' in job or ' "-skip" ' in job:
                         self.assertNotRegex(job, r' "-(?:run|skip)" ""')
                 partition_plan_by_index = [
-                    plan(
-                        race=race,
-                        partition_count=partition_count,
-                        partition_index=partition_index,
-                    )
+                    plans[f"partition-{partition_index}"]
                     for partition_index in range(partition_count)
                 ]
                 partition_plans = [job for jobs in partition_plan_by_index for job in jobs]
@@ -522,6 +540,7 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             "TestBridgePollOnceDispositionsOnlyCorruptDurableSession",
             "TestSQLiteHotPollCorruptProbeRejectsNonRFC3339Times",
             "TestSQLiteHotPollCanonicalFallbackReleasesStoreLockDuringRead",
+            "TestSQLiteHotPollStandaloneCanonicalFallbackReleasesStoreLockDuringRead",
             "TestSQLiteInterruptedOutboxProjectionAuditLeavesAuditingAndCanResume",
             "TestSQLiteNullableTeamsMessageProjectionDoesNotHideUnknownOutbox",
             "TestSQLiteOutboxProjectionPreparationDoesNotStarveOwnerHeartbeat",
@@ -531,6 +550,10 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             "TestSQLiteOwnerMigrationRejectsSourceChangeBeforePointerPublication",
             "TestSQLiteOwnerOutboxProjectionAuditClaimTokenFencesTakeoverOverlap",
             "TestSQLiteFullAcceptedOutboxCASRecoversAfterCapacityReturns",
+            "TestSQLiteStoreCloseReleasesStateLockForImmediateReopen",
+            "TestEarlierUnsentOutboxKeepsSameTurnAmbiguousPredecessor",
+            "TestTeamsSameChatDefinitiveSendFailureDoesNotStarveLaterOutbox",
+            "TestSendQueuedOutboxFallsBackToControlMentionAfterDefiniteWebhookFailureSQLite",
             "TestTeamsOutboxPredecessorMutationRefreshesFIFOSnapshotSQLite",
         )
         for fixture_name in fixtures:
