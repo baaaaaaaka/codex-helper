@@ -1992,6 +1992,13 @@ func TestTeamsListenFalseGraphContinuationRecoversAfterTransientOutage(t *testin
 	}); err != nil {
 		t.Fatalf("seed continuation frontier: %v", err)
 	}
+	// This fixture validates the Graph continuation state machine, not the
+	// online JSON-to-SQLite migration. Prepare the durable backend before the
+	// listener starts so its heartbeat cannot race migration materialization and
+	// turn a healthy continuation assertion into a migration-fallback timeout.
+	if _, err := store.MigrateLargeStateToSQLite(context.Background(), 0); err != nil {
+		t.Fatalf("prepare continuation fixture SQLite store: %v", err)
+	}
 
 	registryPath := filepath.Join(t.TempDir(), "registry.json")
 	options := listenerRecoveryBaseOptions(store, registryPath, executor)
@@ -2200,6 +2207,13 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 		return nil
 	}); err != nil {
 		t.Fatalf("seed stateful modified cursor: %v", err)
+	}
+	// The assertion starts after all fixture state is present. Keep startup
+	// migration out of this Graph frontier test; migration/fallback behavior has
+	// dedicated coverage and can otherwise consume the same legacy JSON source
+	// while the listener heartbeat is active on slow hosted runners.
+	if _, err := store.MigrateLargeStateToSQLite(context.Background(), 0); err != nil {
+		t.Fatalf("prepare stateful frontier SQLite store: %v", err)
 	}
 
 	registryPath := filepath.Join(t.TempDir(), "registry.json")
@@ -3095,6 +3109,12 @@ func TestTeamsListenFalseHistoryWatchFullPoolDoesNotStarveHealthyTail(t *testing
 	}
 	bridge.lastHistoryWatchReconcile = time.Now().UTC()
 	listenerRecoverySeedDuePoll(t, store, bridge.reg.ControlChatID, time.Now().UTC().Add(-time.Minute))
+	// History-watch fairness is independent of the startup migration path. Start
+	// from SQLite so the owner heartbeat and the four cooperative workers only
+	// contend with the history rows under test.
+	if _, err := store.MigrateLargeStateToSQLite(context.Background(), 0); err != nil {
+		t.Fatalf("prepare history-watch pool SQLite store: %v", err)
+	}
 
 	options := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), bridge.executor)
 	// This path is intentionally cooperative and exercises the same worker
@@ -4212,6 +4232,13 @@ func TestTeamsListenFalseLargeTranscriptRecordDoesNotBlockLaterFinal(t *testing.
 			now := time.Now().UTC().Add(-time.Minute)
 			listenerRecoverySeedDuePoll(t, store, bridge.reg.ControlChatID, now)
 			listenerRecoverySeedDuePoll(t, store, session.ChatID, now)
+			// The large-record assertion is about bounded transcript parsing and
+			// later-final delivery. Pre-materialize the small durable fixture so
+			// online migration/heartbeat contention does not dominate the 8 MiB
+			// record observation on hosted Windows runners.
+			if _, err := store.MigrateLargeStateToSQLite(context.Background(), 0); err != nil {
+				t.Fatalf("prepare large transcript SQLite store: %v", err)
+			}
 
 			options := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), bridge.executor)
 			// The opaque-record path must read the complete record before it can
@@ -4245,7 +4272,7 @@ func TestTeamsListenFalseLargeTranscriptRecordDoesNotBlockLaterFinal(t *testing.
 				// user-visible delivery and therefore must not manufacture a delivery
 				// ledger row merely to make this test pass.
 				return true
-			}, 15*time.Second)
+			}, listenerRecoveryLargeTranscriptTimeout())
 			if !largeDispositionReady {
 				state, loadErr := store.Load(context.Background())
 				listener.stop(t)
@@ -4276,7 +4303,7 @@ func TestTeamsListenFalseLargeTranscriptRecordDoesNotBlockLaterFinal(t *testing.
 					}
 				}
 				return false
-			}, 15*time.Second, "large transcript durable disposition")
+			}, listenerRecoveryLargeTranscriptTimeout(), "large transcript durable disposition")
 			plain := sentPlainJoinedListenerRecovery(graphState.sentSnapshot())
 			if strings.Contains(plain, "helper publish-history") || strings.Contains(plain, "previous Codex execution is still unconfirmed") {
 				t.Fatalf("large transcript emitted a manual/recovery gate: %s", plain)
@@ -6371,10 +6398,23 @@ func TestTeamsListenFalseRecoversExpiredAmbiguousOutboxWithoutPost(t *testing.T)
 	prepareBridgeTestGlobalOutboundLedger(t, ctx, bridge)
 	listenerRecoverySeedDuePoll(t, store, bridge.reg.ControlChatID, now.Add(-time.Minute))
 	listenerRecoverySeedDuePoll(t, store, "chat-1", now.Add(-time.Minute))
+	// This test exercises ambiguous-outbox reconciliation. Make the listener
+	// start from the already-materialized durable backend so an unrelated online
+	// migration/source-change fallback cannot hide the Graph history lookup.
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("prepare ambiguous outbox SQLite store: %v", err)
+	}
 
-	listener := startListenerRecovery(t, bridge, listenerRecoveryBaseOptions(store, registryPath, bridge.executor))
+	options := listenerRecoveryBaseOptions(store, registryPath, bridge.executor)
+	// Recovery must perform a real Graph history lookup before the exact marker
+	// can settle the row. Use production-sized phase/worker budgets so a race
+	// instrumented durable startup cannot cancel that read and convert a safe
+	// no-duplicate recovery into a test-only retry deferral.
+	options.PhaseBudget = mainLoopPhaseBudget
+	options.PollWorkerBudget = mainLoopPollWorkerBudget
+	listener := startListenerRecovery(t, bridge, options)
 	settled := false
-	deadline := time.Now().Add(listenerRecoveryProgressTimeout)
+	deadline := time.Now().Add(listenerRecoveryDurableIOProgressTimeout)
 	for time.Now().Before(deadline) {
 		state, err := store.Load(ctx)
 		if err == nil {
