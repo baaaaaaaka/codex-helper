@@ -269,8 +269,8 @@ class TargetedShardWorkflowTests(unittest.TestCase):
         self.assertIn("os: [ubuntu-latest, macos-latest, windows-latest]", job)
         self.assertIn("mode: [normal, race]", job)
         self.assertIn("partition: [0, 1]", job)
-        self.assertIn("- os: ubuntu-latest\n            partition: 1", job)
-        self.assertIn("- os: macos-latest\n            partition: 1", job)
+        self.assertNotIn("exclude:", job)
+        self.assertIn("Every hosted OS gets both independent partitions", job)
         self.assertIn(
             "go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery -list-only",
             job,
@@ -324,6 +324,16 @@ class TargetedShardWorkflowTests(unittest.TestCase):
         self.assertEqual(item["resource_class"], "sqlite_fsync")
         self.assertTrue(item["exclusive"])
         self.assertGreaterEqual(item["max_seconds"], 180)
+
+    def test_transient_continuation_fixture_runs_before_recovery_pool(self):
+        manifest = json.loads((ROOT / "scripts" / "ci" / "teams_recovery_tests.json").read_text(encoding="utf-8"))
+        item = next(
+            entry
+            for entry in manifest["tests"]
+            if entry["name"] == "TestTeamsListenFalseGraphContinuationRecoversAfterTransientOutage"
+        )
+        self.assertTrue(item["exclusive"])
+        self.assertEqual(item["resource_class"], "listener_async")
 
     def test_long_full_suite_jobs_use_independent_runner_partitions(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
@@ -511,6 +521,9 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             "TestSQLiteHotPollCorruptProbeRejectsNonRFC3339Times",
             "TestSQLiteHotPollCanonicalFallbackReleasesStoreLockDuringRead",
             "TestSQLiteInterruptedOutboxProjectionAuditLeavesAuditingAndCanResume",
+            "TestSQLiteNullableTeamsMessageProjectionDoesNotHideUnknownOutbox",
+            "TestSQLiteOutboxProjectionPreparationDoesNotStarveOwnerHeartbeat",
+            "TestSQLiteHotPollReadGateCanonicalFallbackKeepsLocalReceiptWithStaleScalar",
         )
         for fixture_name in fixtures:
             fixture = f'"{fixture_name}"'
@@ -519,6 +532,15 @@ class TargetedShardWorkflowTests(unittest.TestCase):
                 2,
                 f"{fixture_name} must be both process-isolated and host-exclusive",
             )
+
+    def test_full_go_runner_isolates_machine_delegation_cancellation_fixture(self):
+        runner = FULL_GO_TEST_SHARDS.read_text(encoding="utf-8")
+        fixture_name = "TestBridgeMachineDelegationWorkerCancelsRunningExecution"
+        self.assertEqual(
+            runner.count(f'"{fixture_name}"'),
+            2,
+            f"{fixture_name} must be both process-isolated and host-exclusive",
+        )
 
     def test_full_go_runner_isolates_cli_process_group_fixture(self):
         runner = FULL_GO_TEST_SHARDS.read_text(encoding="utf-8")

@@ -145,6 +145,10 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		// package tests; the test's own Graph fixture already covers the
 		// concurrency boundary it needs.
 		"TestTeamsListenFalseRecoversExpiredAmbiguousOutboxWithoutPost": true,
+		// This test observes asynchronous durable completion. A broad package
+		// shard can delay the final JSON writer past the test's safety budget even
+		// though the cancellation transition itself is correct.
+		"TestBridgeMachineDelegationWorkerCancelsRunningExecution": true,
 	},
 	"./internal/teams/store": {
 		// These tests deliberately observe the first phase of a SQLite
@@ -186,6 +190,12 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		"TestSQLiteHotPollAdmissionUsesJSONFrontierHonorsBlockedUntilAndReservesControl": true,
 		"TestSQLiteHotPollAdmissionDoesNotLetStaleOrdinaryHintStarveDueChat":             true,
 		"TestSQLiteHotPollAdmissionReconcilesDueOrdinaryBehindOperationalHintPrefix":     true,
+		// These tests observe a bounded compatibility fallback or an explicit
+		// audit/heartbeat handoff. Keep their short wall-clock assertions away
+		// from broad race-shard I/O.
+		"TestSQLiteNullableTeamsMessageProjectionDoesNotHideUnknownOutbox":           true,
+		"TestSQLiteOutboxProjectionPreparationDoesNotStarveOwnerHeartbeat":           true,
+		"TestSQLiteHotPollReadGateCanonicalFallbackKeepsLocalReceiptWithStaleScalar": true,
 	},
 }
 
@@ -262,6 +272,9 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		// readiness assertion into a false failure.
 		"TestCXPPerfModelExternalScenariosCoverCommonPaths":       true,
 		"TestCXPPerfModelSQLiteExternalScenariosCoverCommonPaths": true,
+		// This asynchronous durable completion check must run without other
+		// package processes consuming the hosted runner's short observation window.
+		"TestBridgeMachineDelegationWorkerCancelsRunningExecution": true,
 	},
 	"./internal/teams/store": {
 		"TestSQLiteHotPollCorruptProbeRejectsNonRFC3339Times":                                  true,
@@ -289,6 +302,9 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestSQLiteUntrustedOutboxFIFOFallbackDoesNotHoldStateLock":                            true,
 		"TestSQLiteHotPollAdmissionDoesNotLetStaleOrdinaryHintStarveDueChat":                   true,
 		"TestSQLiteHotPollAdmissionReconcilesDueOrdinaryBehindOperationalHintPrefix":           true,
+		"TestSQLiteNullableTeamsMessageProjectionDoesNotHideUnknownOutbox":                     true,
+		"TestSQLiteOutboxProjectionPreparationDoesNotStarveOwnerHeartbeat":                     true,
+		"TestSQLiteHotPollReadGateCanonicalFallbackKeepsLocalReceiptWithStaleScalar":           true,
 	},
 }
 

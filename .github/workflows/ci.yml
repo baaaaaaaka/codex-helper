@@ -2281,14 +2281,12 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         mode: [normal, race]
         partition: [0, 1]
-        exclude:
-          # Unix recovery is already short. Windows serializes manifest
-          # entries for file-backed SQLite safety; split only that host across
-          # independent runners instead of introducing same-host contention.
-          - os: ubuntu-latest
-            partition: 1
-          - os: macos-latest
-            partition: 1
+        # Every hosted OS gets both independent partitions. The Unix race
+        # corpus now has the same long listener/SQLite tail as Windows; keeping
+        # a single Unix partition makes a healthy job wait behind unrelated
+        # manifest entries for 30–45 minutes. Each partition uses its own
+        # runner filesystem, and the manifest runner still serializes the
+        # resource-sensitive entries within that runner.
 
     steps:
       - name: Checkout
