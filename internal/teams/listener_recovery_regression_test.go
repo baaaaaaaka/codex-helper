@@ -891,6 +891,12 @@ const listenerRecoveryDurableIOProgressTimeout = 60 * time.Second
 // listener into an unbounded test.
 const listenerRecoveryAccountGlobalFinalTimeout = 90 * time.Second
 
+// A single healthy tail final can cross the general multi-step window on a
+// hosted macOS runner even after the executor callback has fired. Keep this
+// platform-sensitive observation finite and below the manifest's 60-second
+// per-backend watchdog.
+const listenerRecoveryHostedFinalProgressTimeout = 30 * time.Second
+
 // State-based eventual assertions should not poll SQLite at scheduler
 // granularity. A 10ms loop creates a read flood that can compete with the
 // listener's durable writes on slower runners without improving the tested
@@ -1811,7 +1817,7 @@ func TestTeamsListenFalseGraphHeadFailureDoesNotStarveHealthyTail(t *testing.T) 
 	}
 	waitListenerRecovery(t, func() bool {
 		return countListenerRecoverySentBodies(graphState.sentSnapshot(), "LISTENER_RECOVERY_HEAD_FAILURE_HEALTHY_FINAL") == 1
-	}, listenerRecoveryExtendedProgressTimeout, "healthy tail final after Graph head failures")
+	}, listenerRecoveryHostedFinalProgressTimeout, "healthy tail final after Graph head failures")
 	badDeadline := time.Now().Add(listenerRecoveryExtendedProgressTimeout)
 	var badPoll teamstore.ChatPollState
 	for time.Now().Before(badDeadline) {
