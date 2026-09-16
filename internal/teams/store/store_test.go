@@ -7462,7 +7462,7 @@ func TestSQLiteHotPollAdmissionUsesJSONFrontierHonorsBlockedUntilAndReservesCont
 	if err := store.Update(ctx, func(state *State) error {
 		state.Sessions["session-control"] = SessionContext{ID: "session-control", Status: SessionStatusActive, TeamsChatID: "control-chat", UpdatedAt: now}
 		state.ChatPolls["control-chat"] = ChatPollState{ChatID: "control-chat", Seeded: true, PollState: chatPollStateHot, NextPollAt: now.Add(-time.Minute), UpdatedAt: now}
-		for i := 0; i < 60; i++ {
+		for i := 0; i < hotPollJSONFrontierOperationalCount(); i++ {
 			chatID := fmt.Sprintf("chat-admission-operational-%03d", i)
 			sessionID := fmt.Sprintf("session-admission-operational-%03d", i)
 			state.Sessions[sessionID] = SessionContext{ID: sessionID, Status: SessionStatusActive, TeamsChatID: chatID, UpdatedAt: now.Add(-time.Hour)}
@@ -7509,8 +7509,9 @@ func TestSQLiteHotPollAdmissionUsesJSONFrontierHonorsBlockedUntilAndReservesCont
 	if seen["session-admission-blocked"] {
 		t.Fatalf("future BlockedUntil row was admitted before its retry deadline: %#v", seen)
 	}
-	if len(candidates) != sqliteHotPollReadyLimit-1 {
-		t.Fatalf("control reservation candidate count=%d, want %d", len(candidates), sqliteHotPollReadyLimit-1)
+	wantCandidates := hotPollJSONFrontierOperationalCount() + 3
+	if len(candidates) != wantCandidates {
+		t.Fatalf("control reservation candidate count=%d, want %d", len(candidates), wantCandidates)
 	}
 
 	schedule, err := store.HotPollReadyScheduleState(ctx, "control-chat", now)

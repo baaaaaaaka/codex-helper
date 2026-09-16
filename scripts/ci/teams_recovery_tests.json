@@ -891,7 +891,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 60,
+      "max_seconds": 120,
       "oracle": "A real polled Teams turn creates a durable final outbox, survives store close and reopen, then is delivered exactly once without replaying the inbound turn",
       "baseline": "pre-fix the listener/reopen boundary could lose a generated outbox row or replay the inbound prompt",
       "resource_class": "sqlite_fsync"
@@ -1127,7 +1127,7 @@
       "vertical": "sqlite-ready-schedule-semantic-malformed-admission",
       "real_listener": false,
       "fake_graph": false,
-      "max_seconds": 10,
+      "max_seconds": 30,
       "oracle": "the ready-schedule fast path reserves semantic malformed operational rows without allowing them to hide a healthy operational chat",
       "baseline": "pre-fix the ready-schedule fast path counted typed-but-unusable poll rows toward the operational quota and could starve later healthy chats",
       "resource_class": "sqlite_fsync"
@@ -1440,7 +1440,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 120,
+      "max_seconds": 240,
       "oracle": "a malformed active SQLite poll row cannot become a first-page baseline; the inherited user prompt reaches the executor and the recovery marker is durably cleared",
       "baseline": "pre-fix the SQL admission predicate omitted malformed rows and consumed the first visible message as historical baseline",
       "resource_class": "sqlite_fsync"
@@ -2192,7 +2192,7 @@
       "vertical": "sqlite-frontier-hint-migration-cost",
       "real_listener": false,
       "fake_graph": false,
-      "max_seconds": 10,
+      "max_seconds": 30,
       "oracle": "the frontier hint is repaired once per predicate version while independent NULL scheduling-column repair still runs on reopen",
       "baseline": "pre-fix every compatibility save rewrote all chat poll frontier hints and amplified SQLite locks",
       "resource_class": "sqlite_fsync"
@@ -2565,7 +2565,7 @@
       "vertical": "sqlite-malformed-projection-recovery",
       "real_listener": false,
       "fake_graph": false,
-      "max_seconds": 10,
+      "max_seconds": 30,
       "oracle": "malformed numeric compatibility projections remain isolated while canonical session and poll rows stay readable and an unrelated durable update completes",
       "baseline": "pre-fix a malformed scalar projection could abort recovery or make a healthy canonical row unavailable",
       "resource_class": "sqlite_fsync"

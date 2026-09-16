@@ -17,3 +17,9 @@ func hotPollInvalidPageBadCount() int { return 1 }
 // scale check into a production two-second-budget test; the race build keeps
 // the healthy-tail and malformed-row admission invariant covered with one row.
 func hotPollSemanticMalformedPollCount() int { return 1 }
+
+// This admission fixture needs enough rows to exercise the control-chat
+// reservation and stale-frontier fallback, but it is not the keyset-scale
+// stress test. Keep the race build below the production two-second legacy
+// compatibility budget; the normal build retains the full page-sized fixture.
+func hotPollJSONFrontierOperationalCount() int { return 8 }

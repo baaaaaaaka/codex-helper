@@ -72,8 +72,17 @@ var isolatedRunnableNames = map[string]map[string]bool{
 	},
 	"./internal/teams": {
 		"TestBridgeLinkedTranscriptConcurrentSQLiteSyncPublishesExactlyOnce": true,
-		"TestCXPPerfModelExternalScenariosCoverCommonPaths":                  true,
-		"TestTeamsListenFalseGraphWorkerSaturationPreservesHealthyPoll":      true,
+		// This test runs two durable poll generations against the same store.
+		// Keep its SQLite/Graph handoff away from broad race-shard pressure.
+		"TestTeamsMainLoopAllowsDistinctTurnPastProtectedAmbiguousPredecessor": true,
+		// This listener watchdog must observe a second poll; unrelated package
+		// shards can otherwise consume the short startup window.
+		"TestBridgeContinuousListenKeepsOwnerForPersistentPollFailure": true,
+		// The shared inbound ledger deliberately observes close-time pruning;
+		// keep its bounded writer lifecycle in a clean teams process.
+		"TestGlobalInboundSQLiteWriterDefersPruneUntilClose":            true,
+		"TestCXPPerfModelExternalScenariosCoverCommonPaths":             true,
+		"TestTeamsListenFalseGraphWorkerSaturationPreservesHealthyPoll": true,
 		// This liveness fixture must observe an actual listener scheduling
 		// window. Keep it out of the broad shard pool, where unrelated race and
 		// SQLite processes can consume the hosted runner before its first poll.
@@ -125,10 +134,12 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		"TestSQLiteHotPollAdmissionBoundsSemanticallyMalformedPollLaneAndPreservesHealthyChat": true,
 		"TestSQLiteSemanticallyMalformedOutboxRowsDoNotHideHealthyWork":                        true,
 		"TestSQLiteHotPollWorkCandidatesRotateOperationalRowsBeyondLimit":                      true,
-		// This writer-close test observes a SQLite prune/reopen boundary. Keep
-		// it out of broad package shards so unrelated WAL activity cannot make
-		// the bounded maintenance handoff look like a production lock failure.
-		"TestGlobalInboundSQLiteWriterDefersPruneUntilClose": true,
+		// These tests observe page-boundary SQLite scheduling/heartbeat behavior;
+		// broad race shards can make their finite hook windows expire before the
+		// production code reaches the boundary.
+		"TestSQLiteHotPollAdmissionQuarantinesStructurallyEmptyPendingPage": true,
+		"TestSQLiteLegacyHistoryGateCleanupReleasesBetweenPages":            true,
+		"TestSQLiteOutboxPostSendEffectsBackfillYieldsToOwnerHeartbeat":     true,
 		// This cross-backend owner-fencing test migrates a file-backed store to
 		// SQLite. On Windows, modernc SQLite may block in FlushFileBuffers when
 		// unrelated store shards share the hosted runner. Keep the migration
@@ -169,6 +180,10 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestSelectSessionAutoRefreshUpdatesThreadNameTitle": true,
 	},
 	"./internal/teams": {
+		"TestBridgeLinkedTranscriptConcurrentSQLiteSyncPublishesExactlyOnce":   true,
+		"TestTeamsMainLoopAllowsDistinctTurnPastProtectedAmbiguousPredecessor": true,
+		"TestBridgeContinuousListenKeepsOwnerForPersistentPollFailure":         true,
+		"TestGlobalInboundSQLiteWriterDefersPruneUntilClose":                   true,
 		// These tests already run in their own process, but their first listener
 		// cycle is itself the assertion.  Do not start them beside other shard
 		// processes that can consume the hosted runner before Graph admission.
@@ -214,19 +229,18 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestSQLiteHotPollAdmissionBoundsSemanticallyMalformedPollLaneAndPreservesHealthyChat": true,
 		"TestSQLiteSemanticallyMalformedOutboxRowsDoNotHideHealthyWork":                        true,
 		"TestSQLiteHotPollWorkCandidatesRotateOperationalRowsBeyondLimit":                      true,
-		// Keep the SQLite prune/reopen observation host-exclusive as well as
-		// process-isolated; its finite busy-lock boundary is sensitive to
-		// unrelated runner-wide filesystem pressure.
-		"TestGlobalInboundSQLiteWriterDefersPruneUntilClose":                             true,
-		"TestStoreHistoryWatchOwnerCapabilityFencesTakeoverAcrossBackends":               true,
-		"TestStoreOwnerBindsLegacyQueuedTurnAndRejectsPreviousOwnerCallbacks":            true,
-		"TestStoreOwnerBoundOutboxAdmissionRejectsStaleOwnerAcrossBackends":              true,
-		"TestSQLiteHotPollAdmissionAdmitsMalformedPollWithoutStarvingHealthyChat":        true,
-		"TestSQLiteHotPollReadyScheduleSkipsMalformedOperationalPrefix":                  true,
-		"TestSQLiteLegacyEmptyRuntimeProjectionBootstrapsOnceForHotPoll":                 true,
-		"TestSQLiteMalformedNumericCompatibilityColumnsDoNotAbortRecovery":               true,
-		"TestSQLiteHotPollTrustedWorkCandidatesContinuesPastInvalidPage":                 true,
-		"TestSQLiteHotPollAdmissionUsesJSONFrontierHonorsBlockedUntilAndReservesControl": true,
+		"TestStoreHistoryWatchOwnerCapabilityFencesTakeoverAcrossBackends":                     true,
+		"TestStoreOwnerBindsLegacyQueuedTurnAndRejectsPreviousOwnerCallbacks":                  true,
+		"TestStoreOwnerBoundOutboxAdmissionRejectsStaleOwnerAcrossBackends":                    true,
+		"TestSQLiteHotPollAdmissionAdmitsMalformedPollWithoutStarvingHealthyChat":              true,
+		"TestSQLiteHotPollReadyScheduleSkipsMalformedOperationalPrefix":                        true,
+		"TestSQLiteLegacyEmptyRuntimeProjectionBootstrapsOnceForHotPoll":                       true,
+		"TestSQLiteMalformedNumericCompatibilityColumnsDoNotAbortRecovery":                     true,
+		"TestSQLiteHotPollTrustedWorkCandidatesContinuesPastInvalidPage":                       true,
+		"TestSQLiteHotPollAdmissionUsesJSONFrontierHonorsBlockedUntilAndReservesControl":       true,
+		"TestSQLiteHotPollAdmissionQuarantinesStructurallyEmptyPendingPage":                    true,
+		"TestSQLiteLegacyHistoryGateCleanupReleasesBetweenPages":                               true,
+		"TestSQLiteOutboxPostSendEffectsBackfillYieldsToOwnerHeartbeat":                        true,
 	},
 }
 

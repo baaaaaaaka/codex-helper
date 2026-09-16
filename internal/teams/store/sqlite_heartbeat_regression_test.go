@@ -908,7 +908,7 @@ func TestSQLiteOutboxPostSendEffectsBackfillYieldsToOwnerHeartbeat(t *testing.T)
 	case <-pageCommitted:
 	case err := <-prepareDone:
 		t.Fatalf("post-send backfill finished before first page: %v", err)
-	case <-time.After(5 * time.Second):
+	case <-time.After(storeBackfillPageWaitTimeoutForTest()):
 		t.Fatal("post-send backfill did not commit its first page")
 	}
 

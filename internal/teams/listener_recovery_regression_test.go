@@ -4591,7 +4591,7 @@ func TestTeamsListenFalseMalformedActiveSQLitePollDoesNotBaseline(t *testing.T) 
 	if !waitListenerRecoveryResult(func() bool {
 		calls := executor.callsSnapshot()
 		return len(calls) == 1 && strings.Contains(calls[0], "LISTENER_RECOVERY_SQLITE_MALFORMED_POLL_PROMPT")
-	}, listenerRecoveryDurableIOProgressTimeout) {
+	}, listenerRecoveryBacklogProgressTimeout) {
 		state, _ := reopened.Load(ctx)
 		listener.stop(t)
 		t.Fatalf("SQLite malformed-poll chat did not reach execution; calls=%#v polls=%#v phase=%#v", executor.callsSnapshot(), state.ChatPolls, bridge.mainLoopPhaseStatsSnapshot("poll"))
@@ -4603,7 +4603,7 @@ func TestTeamsListenFalseMalformedActiveSQLitePollDoesNotBaseline(t *testing.T) 
 			}
 		}
 		return false
-	}, listenerRecoveryExtendedProgressTimeout, "SQLite malformed-poll final")
+	}, listenerRecoveryDurableIOProgressTimeout, "SQLite malformed-poll final")
 	waitListenerRecovery(t, func() bool {
 		state, err := reopened.Load(ctx)
 		if err != nil {
@@ -4611,7 +4611,7 @@ func TestTeamsListenFalseMalformedActiveSQLitePollDoesNotBaseline(t *testing.T) 
 		}
 		poll := state.ChatPolls[message.ChatID]
 		return !poll.RecoveryRequired && poll.RecoverySourceHash == "" && poll.PendingPage == nil && poll.Attempt == nil
-	}, listenerRecoveryExtendedProgressTimeout, "SQLite malformed-poll recovery marker retirement")
+	}, listenerRecoveryDurableIOProgressTimeout, "SQLite malformed-poll recovery marker retirement")
 	state, err := reopened.Load(ctx)
 	if err != nil {
 		listener.stop(t)
@@ -5508,7 +5508,7 @@ func runListenerRecoveryPolledTurnOutboxSurvivesReopen(t *testing.T, useSQLite b
 		}
 		outbox, ok := state.OutboxMessages[generatedID]
 		return ok && outbox.Status == teamstore.OutboxStatusSent && countListenerRecoverySentBodies(graphState.sentSnapshot(), "LISTENER_RECOVERY_POLLED_REOPEN_FINAL") == 1
-	}, listenerRecoveryExtendedProgressTimeout, "polled generated outbox after reopen")
+	}, listenerRecoveryDurableIOProgressTimeout, "polled generated outbox after reopen")
 	recovered.stop(t)
 
 	if got := len(executor.callsSnapshot()); got != 1 {

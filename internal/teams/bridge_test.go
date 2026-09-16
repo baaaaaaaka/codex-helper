@@ -27148,7 +27148,7 @@ func TestBridgeContinuousListenKeepsOwnerForPersistentPollFailure(t *testing.T) 
 	bridge.persistentPollFailureFirstAt = time.Now().Add(-persistentPollFailureRestartAfter - time.Second)
 	bridge.persistentPollFailureCount = persistentPollFailureRestartMinCount - 1
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), bridgeIdleWaitTimeoutForTest())
 	defer cancel()
 	listenDone := make(chan error, 1)
 	go func() {
