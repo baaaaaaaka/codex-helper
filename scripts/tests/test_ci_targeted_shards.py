@@ -279,6 +279,8 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             "partition_flags=(\"-partition-count=2\" \"-partition-index=${{ matrix.partition }}\")",
             job,
         )
+        self.assertNotIn('partition_flags=("-partition-count=1" "-partition-index=0")', job)
+        self.assertEqual(job.count('partition_flags=("-partition-count=2"'), 2)
         self.assertIn(
             "go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery \"${partition_flags[@]}\"",
             job,
@@ -524,6 +526,12 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             "TestSQLiteNullableTeamsMessageProjectionDoesNotHideUnknownOutbox",
             "TestSQLiteOutboxProjectionPreparationDoesNotStarveOwnerHeartbeat",
             "TestSQLiteHotPollReadGateCanonicalFallbackKeepsLocalReceiptWithStaleScalar",
+            "TestSQLiteHotPollWorkAdmissionRecoversStaleProjectionGeneration",
+            "TestSQLiteOutboxProjectionGuardRevokesNativeTrust",
+            "TestSQLiteOwnerMigrationRejectsSourceChangeBeforePointerPublication",
+            "TestSQLiteOwnerOutboxProjectionAuditClaimTokenFencesTakeoverOverlap",
+            "TestSQLiteFullAcceptedOutboxCASRecoversAfterCapacityReturns",
+            "TestTeamsOutboxPredecessorMutationRefreshesFIFOSnapshotSQLite",
         )
         for fixture_name in fixtures:
             fixture = f'"{fixture_name}"'

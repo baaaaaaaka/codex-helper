@@ -100,6 +100,17 @@ func bridgeIdleWaitTimeoutForTest() time.Duration {
 	return 5 * time.Second
 }
 
+// Windows hosted runners can spend several seconds in listener startup
+// materialization before the first Graph request. Keep this timeout local to
+// the persistent-poll watchdog; the other idle assertions retain their short
+// bound.
+func bridgeListenerPollWaitTimeoutForTest() time.Duration {
+	if bridgeRaceDetectorEnabled {
+		return 45 * time.Second
+	}
+	return 15 * time.Second
+}
+
 var discoverCodexSessionTestMu sync.Mutex
 
 type recordingExecutor struct {
@@ -27148,7 +27159,7 @@ func TestBridgeContinuousListenKeepsOwnerForPersistentPollFailure(t *testing.T) 
 	bridge.persistentPollFailureFirstAt = time.Now().Add(-persistentPollFailureRestartAfter - time.Second)
 	bridge.persistentPollFailureCount = persistentPollFailureRestartMinCount - 1
 
-	ctx, cancel := context.WithTimeout(context.Background(), bridgeIdleWaitTimeoutForTest())
+	ctx, cancel := context.WithTimeout(context.Background(), bridgeListenerPollWaitTimeoutForTest())
 	defer cancel()
 	listenDone := make(chan error, 1)
 	go func() {

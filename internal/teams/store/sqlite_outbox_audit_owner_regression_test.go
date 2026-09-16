@@ -14,6 +14,11 @@ import (
 	"time"
 )
 
+// The ownership/concurrency tests pause the audit at explicit hook boundaries.
+// They need one valid row to exercise the scan, not a large corpus: a large
+// JSON fixture only turns the race build into an avoidable full-scan tail.
+const sqliteOutboxAuditOwnershipRowsForTest = 1
+
 func seedSQLiteOutboxAuditOwnerForTest(t *testing.T, store *Store, owner OwnerMetadata, rows int) {
 	t.Helper()
 	now := time.Now().UTC().Truncate(time.Microsecond)
@@ -89,7 +94,7 @@ func TestSQLiteOwnerOutboxProjectionAuditIsSingleFlightAcrossStores(t *testing.T
 		InstanceID: "audit-owner-instance", ScopeID: "audit-owner-scope",
 		MachineID: "audit-owner-machine", LeaseGeneration: 1,
 	}
-	seedSQLiteOutboxAuditOwnerForTest(t, store, owner, 2000)
+	seedSQLiteOutboxAuditOwnerForTest(t, store, owner, sqliteOutboxAuditOwnershipRowsForTest)
 	peer, err := Open(store.Path())
 	if err != nil {
 		t.Fatalf("open peer store: %v", err)
@@ -205,7 +210,7 @@ func TestSQLiteOwnerOutboxProjectionAuditCannotPublishAfterTakeover(t *testing.T
 	ownerB.InstanceID = "audit-owner-b"
 	ownerB.MachineID = "audit-machine-b"
 	ownerB.LeaseGeneration = 2
-	seedSQLiteOutboxAuditOwnerForTest(t, store, ownerA, 2000)
+	seedSQLiteOutboxAuditOwnerForTest(t, store, ownerA, sqliteOutboxAuditOwnershipRowsForTest)
 
 	opened := make(chan struct{})
 	release := make(chan struct{})
@@ -298,7 +303,7 @@ func TestSQLiteOwnerOutboxProjectionAuditClaimTokenFencesTakeoverOverlap(t *test
 	ownerB.InstanceID = "audit-overlap-b"
 	ownerB.MachineID = "audit-overlap-machine-b"
 	ownerB.LeaseGeneration = 2
-	seedSQLiteOutboxAuditOwnerForTest(t, store, ownerA, 2000)
+	seedSQLiteOutboxAuditOwnerForTest(t, store, ownerA, sqliteOutboxAuditOwnershipRowsForTest)
 	peer, err := Open(store.Path())
 	if err != nil {
 		t.Fatalf("open replacement owner store: %v", err)
@@ -406,7 +411,7 @@ func TestSQLiteOwnerOutboxProjectionAuditCancellationLeavesAuditing(t *testing.T
 		InstanceID: "audit-cancel-instance", ScopeID: "audit-cancel-scope",
 		MachineID: "audit-cancel-machine", LeaseGeneration: 1,
 	}
-	seedSQLiteOutboxAuditOwnerForTest(t, store, owner, 2000)
+	seedSQLiteOutboxAuditOwnerForTest(t, store, owner, sqliteOutboxAuditOwnershipRowsForTest)
 	var once sync.Once
 	previousHook := sqliteOutboxAuditTestHook
 	sqliteOutboxAuditTestHook = func(stage string) {
@@ -1175,7 +1180,7 @@ func TestSQLiteUnownedOutboxProjectionAuditCannotPublishAfterLeaseTakeover(t *te
 	ownerB.MachineID = "audit-unowned-machine-b"
 	ownerB.InstanceID = "audit-unowned-b"
 	ownerB.LeaseGeneration = 2
-	seedSQLiteOutboxAuditOwnerForTest(t, store, ownerA, 2000)
+	seedSQLiteOutboxAuditOwnerForTest(t, store, ownerA, sqliteOutboxAuditOwnershipRowsForTest)
 	peer, err := Open(store.Path())
 	if err != nil {
 		t.Fatalf("open peer store: %v", err)

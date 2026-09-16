@@ -561,10 +561,11 @@ func TestSQLiteUntrustedOutboxFIFOFallbackDoesNotHoldStateLock(t *testing.T) {
 	writeCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	writeDone := make(chan error, 1)
 	go func() {
-		writeDone <- store.Update(writeCtx, func(state *State) error {
-			state.ControlChat.TeamsChatID = "fallback-lock-control-update"
-			return nil
-		})
+		// Use the narrow runtime-state writer so this assertion measures the
+		// Store/file-lock boundary rather than serializing the entire legacy
+		// state blob while the independent read snapshot is held.
+		_, writeErr := store.SetDraining(writeCtx, "fallback-lock-control-update")
+		writeDone <- writeErr
 	}()
 	select {
 	case err := <-writeDone:

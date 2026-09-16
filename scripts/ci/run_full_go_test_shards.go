@@ -140,6 +140,7 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		"TestCXPPerfModelProfilesCanSeedStoreAndPoll":                                 true,
 		"TestTeamsUnresolvedTranscriptOutboxDoesNotLivelockHealthyTail":               true,
 		"TestTeamsOutboxAcceptedResponseFinishesAfterPhaseDeadline":                   true,
+		"TestTeamsOutboxPredecessorMutationRefreshesFIFOSnapshotSQLite":               true,
 		// This listener test starts a real continuous loop over a file-backed
 		// store.  Keep startup/recovery timing independent from unrelated
 		// package tests; the test's own Graph fixture already covers the
@@ -190,12 +191,17 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		"TestSQLiteHotPollAdmissionUsesJSONFrontierHonorsBlockedUntilAndReservesControl": true,
 		"TestSQLiteHotPollAdmissionDoesNotLetStaleOrdinaryHintStarveDueChat":             true,
 		"TestSQLiteHotPollAdmissionReconcilesDueOrdinaryBehindOperationalHintPrefix":     true,
+		"TestSQLiteHotPollWorkAdmissionRecoversStaleProjectionGeneration":                true,
 		// These tests observe a bounded compatibility fallback or an explicit
 		// audit/heartbeat handoff. Keep their short wall-clock assertions away
 		// from broad race-shard I/O.
 		"TestSQLiteNullableTeamsMessageProjectionDoesNotHideUnknownOutbox":           true,
 		"TestSQLiteOutboxProjectionPreparationDoesNotStarveOwnerHeartbeat":           true,
 		"TestSQLiteHotPollReadGateCanonicalFallbackKeepsLocalReceiptWithStaleScalar": true,
+		"TestSQLiteOutboxProjectionGuardRevokesNativeTrust":                          true,
+		"TestSQLiteOwnerMigrationRejectsSourceChangeBeforePointerPublication":        true,
+		"TestSQLiteOwnerOutboxProjectionAuditClaimTokenFencesTakeoverOverlap":        true,
+		"TestSQLiteFullAcceptedOutboxCASRecoversAfterCapacityReturns":                true,
 	},
 }
 
@@ -257,6 +263,7 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestTeamsOwnershipStressTranscriptCatchupWhileTUIContinuesCI":                   true,
 		"TestTeamsOwnershipStressFifthChatReachesNextWorkerWaveCI":                       true,
 		"TestTeamsOutboxAcceptedResponseFinishesAfterPhaseDeadline":                      true,
+		"TestTeamsOutboxPredecessorMutationRefreshesFIFOSnapshotSQLite":                  true,
 		// These outbox regressions exercise durable SQLite/file boundaries in
 		// addition to fairness. Keep the process isolated and serialize it on the
 		// hosted runner so unrelated shard I/O cannot turn the durable assertion
@@ -302,9 +309,14 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestSQLiteUntrustedOutboxFIFOFallbackDoesNotHoldStateLock":                            true,
 		"TestSQLiteHotPollAdmissionDoesNotLetStaleOrdinaryHintStarveDueChat":                   true,
 		"TestSQLiteHotPollAdmissionReconcilesDueOrdinaryBehindOperationalHintPrefix":           true,
+		"TestSQLiteHotPollWorkAdmissionRecoversStaleProjectionGeneration":                      true,
 		"TestSQLiteNullableTeamsMessageProjectionDoesNotHideUnknownOutbox":                     true,
 		"TestSQLiteOutboxProjectionPreparationDoesNotStarveOwnerHeartbeat":                     true,
 		"TestSQLiteHotPollReadGateCanonicalFallbackKeepsLocalReceiptWithStaleScalar":           true,
+		"TestSQLiteOutboxProjectionGuardRevokesNativeTrust":                                    true,
+		"TestSQLiteOwnerMigrationRejectsSourceChangeBeforePointerPublication":                  true,
+		"TestSQLiteOwnerOutboxProjectionAuditClaimTokenFencesTakeoverOverlap":                  true,
+		"TestSQLiteFullAcceptedOutboxCASRecoversAfterCapacityReturns":                          true,
 	},
 }
 

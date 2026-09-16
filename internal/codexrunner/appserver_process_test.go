@@ -494,7 +494,10 @@ func readProcessTestLine(t *testing.T, transport AppServerLineTransport) []byte 
 	// Windows hosted runners can take a few seconds to create a PowerShell
 	// fixture before its first line is available. Keep this bounded, but avoid
 	// turning runner startup variance into a false process-lifecycle failure.
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// A Windows hosted runner may spend more than ten seconds starting the
+	// PowerShell descendant fixture while another job is compiling. This is a
+	// test harness readiness bound, not a production process lifetime budget.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	line, err := transport.ReadLine(ctx)
 	if err != nil {

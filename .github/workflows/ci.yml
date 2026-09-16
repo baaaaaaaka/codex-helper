@@ -2322,10 +2322,7 @@ jobs:
           TEMP: ${{ runner.temp }}
         run: |
           set -euo pipefail
-          partition_flags=("-partition-count=1" "-partition-index=0")
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            partition_flags=("-partition-count=2" "-partition-index=${{ matrix.partition }}")
-          fi
+          partition_flags=("-partition-count=2" "-partition-index=${{ matrix.partition }}")
           go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery "${partition_flags[@]}"
 
       - name: Run Teams recovery manifest (race)
@@ -2341,10 +2338,7 @@ jobs:
           TEMP: ${{ runner.temp }}
         run: |
           set -euo pipefail
-          partition_flags=("-partition-count=1" "-partition-index=0")
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            partition_flags=("-partition-count=2" "-partition-index=${{ matrix.partition }}")
-          fi
+          partition_flags=("-partition-count=2" "-partition-index=${{ matrix.partition }}")
           go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery -race "${partition_flags[@]}"
 
       - name: Upload Teams recovery phase diagnostics

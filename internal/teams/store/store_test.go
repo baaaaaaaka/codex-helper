@@ -298,7 +298,10 @@ func TestSQLiteFullAcceptedOutboxCASRecoversAfterCapacityReturns(t *testing.T) {
 		ID:          "outbox:sqlite-full-accepted-cas",
 		TeamsChatID: "chat-full-cas",
 		Kind:        "final",
-		Body:        strings.Repeat("accepted CAS payload ", 256*1024),
+		// The quota boundary only needs one additional SQLite page. Keep the
+		// synthetic payload small so race builds do not spend minutes parsing a
+		// multi-megabyte JSON1 trigger argument.
+		Body: strings.Repeat("accepted CAS payload ", 8*1024),
 	})
 	if err != nil {
 		t.Fatalf("QueueOutbox: %v", err)
@@ -309,9 +312,9 @@ func TestSQLiteFullAcceptedOutboxCASRecoversAfterCapacityReturns(t *testing.T) {
 		t.Fatalf("MarkOutboxSendAttempt: outbox=%#v err=%v", claimed, err)
 	}
 	// The oversized accepted ID makes the CAS require a fresh SQLite page even
-	// when the queued row already occupies its own overflow pages.  It is only
-	// a deterministic quota trigger; production Graph IDs are much smaller.
-	acceptedID := "teams-full-cas-" + strings.Repeat("x", 2*1024*1024)
+	// when the queued row already occupies its own overflow pages. It is only a
+	// deterministic quota trigger; production Graph IDs are much smaller.
+	acceptedID := "teams-full-cas-" + strings.Repeat("x", 32*1024)
 
 	if err := store.withStateLock(ctx, func() error {
 		pointer, ok, err := store.currentSQLitePointerUnlocked()

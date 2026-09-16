@@ -1040,11 +1040,11 @@ func runTeamsListenFalseBacklogSkipsOptionalHistoryMaintenance(t *testing.T, use
 		t.Fatalf("mandatory linked recovery did not run during backlog; phase=%#v output=%s", bridge.mainLoopPhaseStatsSnapshot("linked-transcript"), listenerOutput.String())
 	}
 
-	queued, err := store.HasQueuedTurns(ctx)
+	backlog, err := store.TeamsOperationalBacklog(ctx)
 	if err != nil {
 		t.Fatalf("check durable Teams backlog after observation: %v", err)
 	}
-	if !queued {
+	if !backlog.Active() {
 		t.Fatal("Teams backlog disappeared while the first executor was deliberately blocked")
 	}
 	control, err := store.ReadControl(ctx)
@@ -1062,18 +1062,18 @@ func runTeamsListenFalseBacklogSkipsOptionalHistoryMaintenance(t *testing.T, use
 	// ordinary 10-second assertion window even though it is making progress.
 	deadline := time.Now().Add(listenerRecoveryMultiStepProgressTimeout)
 	for time.Now().Before(deadline) {
-		queued, err = store.HasQueuedTurns(ctx)
+		backlog, err = store.TeamsOperationalBacklog(ctx)
 		if err != nil {
 			t.Fatalf("check Teams backlog after releasing executor: %v", err)
 		}
-		if !queued {
+		if !backlog.Active() {
 			break
 		}
 		time.Sleep(listenerRecoveryPollInterval)
 	}
-	if queued {
+	if backlog.Active() {
 		state, _ := store.Load(ctx)
-		t.Fatalf("Teams backlog did not drain after executor release: turns=%#v output=%s", state.Turns, listenerOutput.String())
+		t.Fatalf("Teams operational backlog did not drain after executor release: backlog=%#v turns=%#v output=%s", backlog, state.Turns, listenerOutput.String())
 	}
 	select {
 	case <-historyEntered:
