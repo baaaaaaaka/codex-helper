@@ -684,6 +684,41 @@ func TestGraphReadAccountGateMarkerAvoidsDuplicateDurableWrite(t *testing.T) {
 	}
 }
 
+func TestGraphReadRateLimitKeepsLocalFenceBeyondShortRetryAfter(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+	minimum := time.Now().Add(graphReadGateStoreFailureBackoff - 100*time.Millisecond)
+
+	account429 := &GraphStatusError{
+		Method: http.MethodGet, StatusCode: http.StatusTooManyRequests,
+		RateLimitScope: "account", RetryAfter: time.Second, Message: "short account read throttle",
+	}
+	if err := bridge.recordGraphReadAccountRateLimit(ctx, account429); err != nil {
+		t.Fatalf("record account read throttle: %v", err)
+	}
+	bridge.graphReadGateMu.Lock()
+	accountUntil := bridge.graphReadAccountLocalUntil
+	bridge.graphReadGateMu.Unlock()
+	if accountUntil.Before(minimum) {
+		t.Fatalf("account local fence = %s, want at least %s after durable write window", accountUntil, minimum)
+	}
+
+	chat429 := &GraphStatusError{
+		Method: http.MethodGet, StatusCode: http.StatusTooManyRequests,
+		RetryAfter: time.Second, Message: "short chat read throttle",
+	}
+	if err := bridge.recordGraphReadRetryableFailure(ctx, "short-chat-read-gate", chat429); err != nil {
+		t.Fatalf("record chat read throttle: %v", err)
+	}
+	bridge.graphReadGateMu.Lock()
+	chatUntil := bridge.graphReadChatLocalUntil["short-chat-read-gate"]
+	bridge.graphReadGateMu.Unlock()
+	if chatUntil.Before(minimum) {
+		t.Fatalf("chat local fence = %s, want at least %s after durable write window", chatUntil, minimum)
+	}
+}
+
 func TestGraphReadRateLimitDoesNotInstallOutboxWriteGate(t *testing.T) {
 	for _, useSQLite := range []bool{false, true} {
 		name := "json"

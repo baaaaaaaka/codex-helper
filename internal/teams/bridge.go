@@ -26920,8 +26920,9 @@ func (b *Bridge) recordGraphReadRetryableFailure(ctx context.Context, chatID str
 	if pollErr != nil {
 		poll = teamstore.ChatPollState{ChatID: chatID}
 	}
-	blockedUntil := inboundPollBlockedUntil(poll, err, time.Now())
-	b.setLocalGraphReadChatBlockedUntil(chatID, blockedUntil)
+	recordedAt := time.Now()
+	blockedUntil := inboundPollBlockedUntil(poll, err, recordedAt)
+	b.setLocalGraphReadChatBlockedUntil(chatID, graphReadGateProcessFenceUntil(blockedUntil, recordedAt))
 	persistErr := b.recordChatPollErrorWithCurrentOwner(ctx, chatID, err.Error(), blockedUntil)
 	if persistErr != nil {
 		// The local timer is only a short first fence. Retain the failed durable
@@ -27004,11 +27005,17 @@ func (b *Bridge) recordGraphReadAccountRateLimit(ctx context.Context, err error)
 	if method := strings.ToUpper(strings.TrimSpace(graphErr.Method)); method != "" && method != http.MethodGet && method != http.MethodHead && method != http.MethodOptions {
 		return nil
 	}
-	blockedUntil := time.Now().Add(graphErr.RetryAfter)
+	recordedAt := time.Now()
+	blockedUntil := recordedAt.Add(graphErr.RetryAfter)
 	if graphErr.RetryAfter <= 0 {
-		blockedUntil = time.Now().Add(30 * time.Second)
+		blockedUntil = recordedAt.Add(30 * time.Second)
 	}
-	b.setLocalGraphReadAccountBlockedUntil(blockedUntil)
+	// The provider deadline can be shorter than the SQLite durable write. Keep
+	// sibling workers behind a process-local fence until that write either
+	// commits or reaches its bounded retry window; otherwise a short
+	// Retry-After can expire while the durable account gate is still waiting on
+	// the single SQLite writer, allowing an unsafe sibling Graph read.
+	b.setLocalGraphReadAccountBlockedUntil(graphReadGateProcessFenceUntil(blockedUntil, recordedAt))
 	reason := "account Graph read throttle: " + graphErr.Error()
 	if persistErr := b.persistGraphReadAccountGate(ctx, blockedUntil, reason); persistErr != nil {
 		// Keep an explicit in-memory retry intent in addition to the short local
@@ -27021,6 +27028,22 @@ func (b *Bridge) recordGraphReadAccountRateLimit(ctx context.Context, err error)
 		b.clearGraphReadAccountGateWriteFailure(blockedUntil)
 	}
 	return nil
+}
+
+// graphReadGateProcessFenceUntil keeps a just-observed Graph read throttle
+// fail-closed while its durable gate write is in flight. A provider can return
+// a one-second Retry-After while SQLite needs longer to acquire its writer
+// lock; the existing store-failure retry window is the bounded local fence for
+// that interval. Longer provider deadlines remain authoritative unchanged.
+func graphReadGateProcessFenceUntil(blockedUntil, recordedAt time.Time) time.Time {
+	if recordedAt.IsZero() {
+		recordedAt = time.Now()
+	}
+	minimum := recordedAt.Add(graphReadGateStoreFailureBackoff)
+	if minimum.After(blockedUntil) {
+		return minimum
+	}
+	return blockedUntil
 }
 
 func graphRateLimitScopeIsAccountWide(scope string) bool {
