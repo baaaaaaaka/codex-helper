@@ -348,9 +348,9 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             "name: Race test (ubuntu-latest / partition ${{ matrix.partition }})",
             race,
         )
-        self.assertIn("partition: [0, 1, 2, 3]", race)
+        self.assertIn("partition: [0, 1, 2, 3, 4, 5, 6, 7]", race)
         self.assertIn(
-            "-partition-count=4 -partition-index=\"${{ matrix.partition }}\"",
+            "-partition-count=8 -partition-index=\"${{ matrix.partition }}\"",
             race,
         )
 
