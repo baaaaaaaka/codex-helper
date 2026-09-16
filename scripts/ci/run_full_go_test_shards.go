@@ -71,6 +71,12 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		"TestSelectSessionAutoRefreshUpdatesThreadNameTitle": true,
 	},
 	"./internal/teams": {
+		// These corruption-recovery probes intentionally enter the bounded JSON
+		// compatibility lane.  Under -race, running them beside a broad shard
+		// can make the production two-second lane budget expire before the
+		// probe reaches its one-row fixture; keep the assertion in a clean test
+		// process so it measures the recovery path rather than runner pressure.
+		"TestBridgePollOnceDispositionsOnlyCorruptDurableSession":            true,
 		"TestBridgeLinkedTranscriptConcurrentSQLiteSyncPublishesExactlyOnce": true,
 		// This test runs two durable poll generations against the same store.
 		// Keep its SQLite/Graph handoff away from broad race-shard pressure.
@@ -139,6 +145,13 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		"TestTeamsListenFalseRecoversExpiredAmbiguousOutboxWithoutPost": true,
 	},
 	"./internal/teams/store": {
+		// These tests deliberately observe the first phase of a SQLite
+		// compatibility/fallback operation.  Their correctness depends on a
+		// short hook/legacy-lane window, so broad race-shard I/O must not turn a
+		// healthy operation into a false readiness or budget failure.
+		"TestSQLiteHotPollCorruptProbeRejectsNonRFC3339Times":                                  true,
+		"TestSQLiteHotPollCanonicalFallbackReleasesStoreLockDuringRead":                        true,
+		"TestSQLiteInterruptedOutboxProjectionAuditLeavesAuditingAndCanResume":                 true,
 		"TestSQLiteHotPollAdmissionBoundsSemanticallyMalformedPollLaneAndPreservesHealthyChat": true,
 		"TestSQLiteSemanticallyMalformedOutboxRowsDoNotHideHealthyWork":                        true,
 		"TestSQLiteHotPollWorkCandidatesRotateOperationalRowsBeyondLimit":                      true,
@@ -188,6 +201,7 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestSelectSessionAutoRefreshUpdatesThreadNameTitle": true,
 	},
 	"./internal/teams": {
+		"TestBridgePollOnceDispositionsOnlyCorruptDurableSession":                true,
 		"TestBridgeLinkedTranscriptConcurrentSQLiteSyncPublishesExactlyOnce":     true,
 		"TestTeamsMainLoopAllowsDistinctTurnPastProtectedAmbiguousPredecessor":   true,
 		"TestBridgeContinuousListenKeepsOwnerForPersistentPollFailure":           true,
@@ -239,6 +253,9 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestCXPPerfModelSQLiteExternalScenariosCoverCommonPaths": true,
 	},
 	"./internal/teams/store": {
+		"TestSQLiteHotPollCorruptProbeRejectsNonRFC3339Times":                                  true,
+		"TestSQLiteHotPollCanonicalFallbackReleasesStoreLockDuringRead":                        true,
+		"TestSQLiteInterruptedOutboxProjectionAuditLeavesAuditingAndCanResume":                 true,
 		"TestSQLiteHotPollAdmissionBoundsSemanticallyMalformedPollLaneAndPreservesHealthyChat": true,
 		"TestSQLiteSemanticallyMalformedOutboxRowsDoNotHideHealthyWork":                        true,
 		"TestSQLiteHotPollWorkCandidatesRotateOperationalRowsBeyondLimit":                      true,

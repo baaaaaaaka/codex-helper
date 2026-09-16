@@ -504,6 +504,22 @@ class TargetedShardWorkflowTests(unittest.TestCase):
                 f"{fixture_name} must be both process-isolated and host-exclusive",
             )
 
+    def test_full_go_runner_isolates_sqlite_compatibility_window_fixtures(self):
+        runner = FULL_GO_TEST_SHARDS.read_text(encoding="utf-8")
+        fixtures = (
+            "TestBridgePollOnceDispositionsOnlyCorruptDurableSession",
+            "TestSQLiteHotPollCorruptProbeRejectsNonRFC3339Times",
+            "TestSQLiteHotPollCanonicalFallbackReleasesStoreLockDuringRead",
+            "TestSQLiteInterruptedOutboxProjectionAuditLeavesAuditingAndCanResume",
+        )
+        for fixture_name in fixtures:
+            fixture = f'"{fixture_name}"'
+            self.assertEqual(
+                runner.count(fixture),
+                2,
+                f"{fixture_name} must be both process-isolated and host-exclusive",
+            )
+
     def test_full_go_runner_isolates_cli_process_group_fixture(self):
         runner = FULL_GO_TEST_SHARDS.read_text(encoding="utf-8")
         fixture_name = "TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup"
