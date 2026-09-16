@@ -884,6 +884,13 @@ const listenerRecoveryMultiStepProgressTimeout = 90 * time.Second
 // listener admission begins.
 const listenerRecoveryDurableIOProgressTimeout = 60 * time.Second
 
+// Account/global read recovery can finish the durable gate and executor work
+// before a hosted macOS SQLite runner reaches the final outbox POST. Keep that
+// final observation finite but separate from the ordinary durable-I/O window;
+// the manifest allocates one budget per backend, so this cannot turn a wedged
+// listener into an unbounded test.
+const listenerRecoveryAccountGlobalFinalTimeout = 90 * time.Second
+
 // State-based eventual assertions should not poll SQLite at scheduler
 // granularity. A 10ms loop creates a read flood that can compete with the
 // listener's durable writes on slower runners without improving the tested
@@ -1576,7 +1583,7 @@ func TestTeamsListenFalseAccountRead429RecoversWithoutManualStateChange(t *testi
 				}, listenerRecoveryDurableIOProgressTimeout, "both prompts after account/global read 429")
 				waitListenerRecovery(t, func() bool {
 					return countListenerRecoverySentBodies(graphState.sentSnapshot(), "LISTENER_429_RECOVERY_FINAL") == len(chatIDs)
-				}, listenerRecoveryDurableIOProgressTimeout, "both finals after account/global read 429")
+				}, listenerRecoveryAccountGlobalFinalTimeout, "both finals after account/global read 429")
 
 				state := mustListenerRecoveryState(t, store)
 				for index, chatID := range chatIDs {

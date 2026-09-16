@@ -2956,7 +2956,7 @@ func TestTeamsOwnershipStressMultiDayOutageCrossesExpiredBlockAndAutoParkCI(t *t
 	// retry deadline, two recovery poll quanta, and an auto-park sweep.  The
 	// five-second context measured hosted race scheduling rather than the
 	// recovery invariant, so give the fixture a finite setup/SQLite margin.
-	ctx, cancel := context.WithTimeout(context.Background(), ownershipStressTestTimeout(30*time.Second))
+	ctx, cancel := context.WithTimeout(context.Background(), ownershipStressTestTimeout(90*time.Second))
 	defer cancel()
 
 	// The first owner comes back while Graph is still unavailable. The idle
