@@ -1846,7 +1846,12 @@ func TestTeamsOwnershipStressTranscriptCatchupWhileTUIContinuesCI(t *testing.T) 
 	close(release)
 	select {
 	case err := <-syncDone:
-		if err != nil {
+		// A transcript worker has its own bounded child budget.  Hosted Windows
+		// can spend that budget in durable queue admission even after the fake
+		// Graph request is released; that is a retry point, not a failed
+		// catch-up.  The exact-once loop below remains the assertion that the
+		// later retry actually delivers every record.
+		if err != nil && !isLinkedTranscriptJobDeferred(err) {
 			t.Fatalf("live transcript catchup sync: %v", err)
 		}
 	case <-ctx.Done():
@@ -1867,7 +1872,7 @@ func TestTeamsOwnershipStressTranscriptCatchupWhileTUIContinuesCI(t *testing.T) 
 		if allPresent {
 			break
 		}
-		if err := bridge.syncLinkedTranscripts(ctx); err != nil {
+		if err := bridge.syncLinkedTranscripts(ctx); err != nil && !isLinkedTranscriptJobDeferred(err) {
 			t.Fatalf("resume live transcript catchup attempt %d: %v", attempt+1, err)
 		}
 	}

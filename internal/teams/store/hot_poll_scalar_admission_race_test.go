@@ -30,6 +30,18 @@ func hotPollReadyAdmissionHealthyCount() int { return 1 }
 // the healthy-tail and malformed-row admission invariant covered with one row.
 func hotPollSemanticMalformedPollCount() int { return 1 }
 
+// Keep the structural pending-page regression inside the production two-second
+// compatibility budget under -race. One malformed row still proves that an
+// empty pending page is quarantined and cannot hide the healthy ordinary chat;
+// the non-race fixture covers traversal beyond a full SQL page.
+func hotPollStructurallyEmptyPendingPageCount() int { return 1 }
+
+// One operational row is enough to prove that a stale operational hint cannot
+// hide a due ordinary row. The non-race fixture retains a full operational
+// prefix to exercise the scale boundary; keeping that prefix in a race build
+// would make the bounded JSON fallback itself exceed its production budget.
+func hotPollOperationalHintPrefixCount() int { return 1 }
+
 // Keep the ready-schedule regression focused on the healthy-tail and bounded
 // malformed-row invariant under -race. The non-race build retains the larger
 // prefix to exercise keyset traversal; race JSON evaluation must stay inside

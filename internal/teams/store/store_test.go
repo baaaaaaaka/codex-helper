@@ -6911,7 +6911,11 @@ func TestSQLiteHotPollAdmissionQuarantinesStructurallyEmptyPendingPage(t *testin
 	store := newTestStore(t)
 	ctx := context.Background()
 	now := time.Now().UTC()
-	const malformedCount = sqliteHotPollReadyLimit + 8
+	// The normal build crosses one SQL page to exercise keyset traversal. The
+	// race build keeps the same malformed-row/healthy-tail invariant with the
+	// smallest fixture because this path intentionally uses the bounded JSON
+	// compatibility oracle.
+	malformedCount := hotPollStructurallyEmptyPendingPageCount()
 	if err := store.Update(ctx, func(state *State) error {
 		state.Sessions["session-empty-pending-healthy"] = SessionContext{
 			ID: "session-empty-pending-healthy", Status: SessionStatusActive,
@@ -7683,7 +7687,7 @@ func TestSQLiteHotPollAdmissionReconcilesDueOrdinaryBehindOperationalHintPrefix(
 	store := newTestStore(t)
 	ctx := context.Background()
 	now := time.Now().UTC()
-	const operationalCount = sqliteHotPollReadyLimit
+	operationalCount := hotPollOperationalHintPrefixCount()
 	if err := store.Update(ctx, func(state *State) error {
 		for i := 0; i < operationalCount; i++ {
 			chatID := fmt.Sprintf("chat-operational-hint-prefix-%03d", i)
@@ -22324,18 +22328,16 @@ func newTestStore(t *testing.T) *Store {
 	return store
 }
 
-// newSQLiteTestStore creates a minimal, current-schema SQLite store without
-// exercising the legacy migration path.  Backend contract tests should not
-// make migration, pointer publication, and owner admission one timing
-// sensitive operation: migration has its own durability and recovery tests,
-// while the contract tests need a stable SQLite backend to exercise their
-// transaction semantics.  Building the fixture in one transaction keeps the
-// backend boundary real (including the SQLite connection and projections)
-// without making every owner-fencing assertion pay the migration's full
-// filesystem flush cost on hosted Windows runners.  Keep the already-prepared
-// handle attached to the Store: closing and reopening it through Store.Load
-// repeats compatibility validation and turns this short owner-admission
-// contract into a long filesystem-sensitive test, especially under -race.
+// newSQLiteTestStore creates a minimal current-schema SQLite store without
+// exercising the legacy migration path. Backend contract tests should not make
+// migration, pointer publication, and owner admission one timing-sensitive
+// operation: migration has its own durability and recovery tests, while the
+// contract tests need a stable SQLite backend to exercise transaction
+// semantics. Prepare the empty schema before inserting fixture rows so the
+// compatibility backfill has no legacy rows to scan. Keep the prepared handle
+// attached to the Store: closing and reopening it through Store.Load repeats
+// compatibility validation and turns this short owner-admission contract into
+// a long filesystem-sensitive test, especially under -race.
 func newSQLiteTestStore(t *testing.T) *Store {
 	t.Helper()
 	store := newTestStore(t)
@@ -22354,13 +22356,13 @@ func newSQLiteTestStore(t *testing.T) *Store {
 		_ = db.Close()
 		t.Fatalf("create sqlite test fixture schema: %v", err)
 	}
-	if err := insertOfficialReleaseSQLiteStateForTest(db, state); err != nil {
-		_ = db.Close()
-		t.Fatalf("insert sqlite test fixture state: %v", err)
-	}
 	if err := ensureSQLiteSchemaContext(ctx, db); err != nil {
 		_ = db.Close()
 		t.Fatalf("prepare sqlite test fixture schema: %v", err)
+	}
+	if err := insertOfficialReleaseSQLiteStateForTest(db, state); err != nil {
+		_ = db.Close()
+		t.Fatalf("insert sqlite test fixture state: %v", err)
 	}
 	if _, err := db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
 		_ = db.Close()
