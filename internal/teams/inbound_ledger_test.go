@@ -1104,23 +1104,29 @@ func seedGlobalInboundSQLiteForPrune(t *testing.T, path string, itemFor func(int
 	if err != nil {
 		t.Fatalf("open inbound prune ledger: %v", err)
 	}
-	defer db.Close()
 	if err := ensureGlobalInboundSQLite(ctx, db); err != nil {
+		_ = db.Close()
 		t.Fatalf("ensure inbound prune ledger: %v", err)
 	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
+		_ = db.Close()
 		t.Fatalf("begin inbound prune seed: %v", err)
 	}
 	for i := 0; i < maxGlobalInboundLedgerIDs+1; i++ {
 		item := itemFor(i)
 		if err := upsertGlobalInboundSQLiteTx(ctx, tx, globalInboundKey(item.ChatID, item.MessageID), item); err != nil {
 			tx.Rollback()
+			_ = db.Close()
 			t.Fatalf("seed inbound prune row %d: %v", i, err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
+		_ = db.Close()
 		t.Fatalf("commit inbound prune seed: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close inbound prune seed: %v", err)
 	}
 }
 
