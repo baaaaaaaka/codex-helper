@@ -4106,7 +4106,7 @@ func TestTeamsListenFalseSlowInboundMutationDoesNotConsumeDurableCleanupGrace(t 
 			}
 		}
 		return false
-	}, 8*time.Second, "slow inbound final delivery")
+	}, listenerRecoveryExtendedProgressTimeout, "slow inbound final delivery")
 	// The real Graph query would exclude this message after the durable cursor
 	// advances. Stop returning it from the mutable fake now so the 1ms listener
 	// interval cannot admit an unrelated second attempt while this test waits for
