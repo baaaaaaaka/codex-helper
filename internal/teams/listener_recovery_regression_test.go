@@ -3131,7 +3131,7 @@ func TestTeamsListenFalseHistoryWatchFullPoolDoesNotStarveHealthyTail(t *testing
 		default:
 			return false
 		}
-	}, listenerRecoveryExtendedProgressTimeout, "history-watch healthy tail to enter after full slow worker pool")
+	}, listenerRecoveryDurableIOProgressTimeout, "history-watch healthy tail to enter after full slow worker pool")
 
 	healthyPath := paths[len(paths)-1]
 	healthyInfo, err := os.Stat(healthyPath)
@@ -3145,7 +3145,7 @@ func TestTeamsListenFalseHistoryWatchFullPoolDoesNotStarveHealthyTail(t *testing
 			return false
 		}
 		return state.HistoryWatch[historyWatchCheckpointID(healthyPath)].Offset == healthyInfo.Size()
-	}, listenerRecoveryExtendedProgressTimeout, "history-watch healthy tail after full slow worker pool")
+	}, listenerRecoveryDurableIOProgressTimeout, "history-watch healthy tail after full slow worker pool")
 	listener.stop(t)
 }
 
