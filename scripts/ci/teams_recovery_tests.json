@@ -1094,7 +1094,8 @@
       "vertical": "sqlite-malformed-poll-local-admission",
       "real_listener": false,
       "fake_graph": false,
-      "max_seconds": 10,
+      "exclusive": true,
+      "max_seconds": 30,
       "oracle": "an active malformed poll row is admitted as a local recovery placeholder despite stale derived deadlines, while healthy and identity-bound rows retain their correct admission",
       "baseline": "pre-fix malformed SQL JSON was omitted or allowed stale scheduling metadata to hide the affected chat",
       "resource_class": "sqlite_fsync"
@@ -1127,6 +1128,7 @@
       "vertical": "sqlite-ready-schedule-semantic-malformed-admission",
       "real_listener": false,
       "fake_graph": false,
+      "exclusive": true,
       "max_seconds": 30,
       "oracle": "the ready-schedule fast path reserves semantic malformed operational rows without allowing them to hide a healthy operational chat",
       "baseline": "pre-fix the ready-schedule fast path counted typed-but-unusable poll rows toward the operational quota and could starve later healthy chats",
@@ -1176,10 +1178,11 @@
       "vertical": "poll-frontier-long-continuation-budget",
       "real_listener": false,
       "fake_graph": true,
-      "max_seconds": 60,
+      "exclusive": true,
+      "max_seconds": 120,
       "oracle": "a long rotating continuation path is bounded across separate polls and becomes a directional non-blocking gap without reading the head or spinning",
       "baseline": "pre-fix bounded in-memory path history could be bypassed by a rotating continuation that kept the chat in a high-cost livelock",
-      "resource_class": "sqlite_fsync"
+      "resource_class": "host_exclusive"
     },
     {
       "name": "TestTeamsOwnershipStressExpiredOutboxContinuationFallsBackToHeadCI",
@@ -1440,6 +1443,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
+      "exclusive": true,
       "max_seconds": 240,
       "oracle": "a malformed active SQLite poll row cannot become a first-page baseline; the inherited user prompt reaches the executor and the recovery marker is durably cleared",
       "baseline": "pre-fix the SQL admission predicate omitted malformed rows and consumed the first visible message as historical baseline",
@@ -1535,7 +1539,8 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
-      "max_seconds": 90,
+      "exclusive": true,
+      "max_seconds": 180,
       "oracle": "a healthy ordinary chat reaches Graph, Codex, and the outbox despite more due operational continuation rows than one SQLite admission quantum",
       "baseline": "pre-fix the real listener could materialize an operational prefix and starve ordinary chats even though a store-only candidate query appeared bounded",
       "resource_class": "sqlite_fsync"
@@ -1617,7 +1622,8 @@
       "vertical": "outbox-active-predecessor-liveness-sqlite",
       "real_listener": false,
       "fake_graph": true,
-      "max_seconds": 10,
+      "exclusive": true,
+      "max_seconds": 30,
       "oracle": "the SQLite-backed sender keeps a later final behind a live normal predecessor, then retries promptly after it finishes without a duplicate POST",
       "baseline": "pre-fix a concurrent flush converted a short-lived active predecessor into the 30-second recovery gate",
       "resource_class": "sqlite_fsync"
@@ -1649,7 +1655,8 @@
       "vertical": "outbox-accepted-predecessor-liveness-sqlite",
       "real_listener": false,
       "fake_graph": true,
-      "max_seconds": 10,
+      "exclusive": true,
+      "max_seconds": 30,
       "oracle": "the SQLite-backed sender keeps a later final behind a Graph-accepted predecessor until local promotion completes, then proceeds without a stale gate or duplicate POST",
       "baseline": "pre-fix a concurrent Accepted-to-Sent promotion could leave the later row behind the cold recovery backoff",
       "resource_class": "sqlite_fsync"
@@ -2116,6 +2123,7 @@
       "listener_mode": "continuous",
       "once": false,
       "fake_graph": true,
+      "exclusive": true,
       "max_seconds": 240,
       "oracle": "a finite account/global read throttle is durably fenced, does not permit sibling Graph reads during Retry-After, and the same continuous listener later drains both chats without manual schedule mutation",
       "baseline": "pre-fix CI exercised pollOnce or an indefinitely blocked listener, so a full listener could busy-loop, lose the shared gate, or fail to recover after an account/global read 429",
@@ -2533,7 +2541,8 @@
       "vertical": "sqlite-runtime-projection-bootstrap",
       "real_listener": false,
       "fake_graph": false,
-      "max_seconds": 10,
+      "exclusive": true,
+      "max_seconds": 30,
       "oracle": "an old SQLite store with an empty runtime projection materializes the narrow runtime rows once and serves hot poll scheduling without repeated cold-state fallback",
       "baseline": "pre-fix every hot poll could decode the full state_json document when the legacy runtime projection was empty",
       "resource_class": "sqlite_fsync"

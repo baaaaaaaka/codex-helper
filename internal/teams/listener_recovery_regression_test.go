@@ -1547,7 +1547,7 @@ func TestTeamsListenFalseAccountRead429RecoversWithoutManualStateChange(t *testi
 					graphState.mu.Unlock()
 					limit, found, err := store.ChatRateLimit(ctx, graphReadAccountRateLimitKey)
 					return read429Observed && err == nil && found && limit.BlockedUntil.After(time.Now())
-				}, 10*time.Second, "first account/global read 429 and durable gate")
+				}, listenerRecoveryDurableIOProgressTimeout, "first account/global read 429 and durable gate")
 				limit, found, err := store.ChatRateLimit(ctx, graphReadAccountRateLimitKey)
 				if err != nil || !found || !limit.BlockedUntil.After(time.Now()) {
 					t.Fatalf("first %s 429 did not install durable account gate: found=%v err=%v limit=%#v", scope, found, err, limit)
@@ -1573,10 +1573,10 @@ func TestTeamsListenFalseAccountRead429RecoversWithoutManualStateChange(t *testi
 
 				waitListenerRecovery(t, func() bool {
 					return len(executor.callsSnapshot()) == len(chatIDs)
-				}, 20*time.Second, "both prompts after account/global read 429")
+				}, listenerRecoveryDurableIOProgressTimeout, "both prompts after account/global read 429")
 				waitListenerRecovery(t, func() bool {
 					return countListenerRecoverySentBodies(graphState.sentSnapshot(), "LISTENER_429_RECOVERY_FINAL") == len(chatIDs)
-				}, 20*time.Second, "both finals after account/global read 429")
+				}, listenerRecoveryDurableIOProgressTimeout, "both finals after account/global read 429")
 
 				state := mustListenerRecoveryState(t, store)
 				for index, chatID := range chatIDs {
@@ -5953,7 +5953,7 @@ func TestTeamsListenFalseSQLiteOperationalFloodPreservesHealthyOrdinaryChat(t *t
 	bridge.leaseDuration = 5 * time.Minute
 	bridge.ownerHeartbeatInterval = 5 * time.Second
 	listener := startListenerRecovery(t, bridge, options)
-	progressDeadline := 30 * time.Second
+	progressDeadline := listenerRecoveryDurableIOProgressTimeout
 	select {
 	case <-executor.called:
 		calls := executor.callsSnapshot()

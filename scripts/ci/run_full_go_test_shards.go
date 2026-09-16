@@ -80,9 +80,17 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		"TestBridgeContinuousListenKeepsOwnerForPersistentPollFailure": true,
 		// The shared inbound ledger deliberately observes close-time pruning;
 		// keep its bounded writer lifecycle in a clean teams process.
-		"TestGlobalInboundSQLiteWriterDefersPruneUntilClose":            true,
-		"TestCXPPerfModelExternalScenariosCoverCommonPaths":             true,
-		"TestTeamsListenFalseGraphWorkerSaturationPreservesHealthyPoll": true,
+		"TestGlobalInboundSQLiteWriterDefersPruneUntilClose": true,
+		// These durable SQLite/frontier fixtures can spend tens of seconds in
+		// race-instrumented JSON/SQLite writes even when they make progress.
+		// Keep their finite observations independent from the broad shard pool.
+		"TestPollFrontierLongRotatingContinuationStopsAtDurablePageBudget":       true,
+		"TestTeamsListenFalseAccountRead429RecoversWithoutManualStateChange":     true,
+		"TestTeamsListenFalseSQLiteOperationalFloodPreservesHealthyOrdinaryChat": true,
+		"TestTeamsActiveOutboxPredecessorUsesShortRetryGateSQLite":               true,
+		"TestTeamsAcceptedOutboxPredecessorUsesShortRetryGateSQLite":             true,
+		"TestCXPPerfModelExternalScenariosCoverCommonPaths":                      true,
+		"TestTeamsListenFalseGraphWorkerSaturationPreservesHealthyPoll":          true,
 		// This liveness fixture must observe an actual listener scheduling
 		// window. Keep it out of the broad shard pool, where unrelated race and
 		// SQLite processes can consume the hosted runner before its first poll.
@@ -180,10 +188,15 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestSelectSessionAutoRefreshUpdatesThreadNameTitle": true,
 	},
 	"./internal/teams": {
-		"TestBridgeLinkedTranscriptConcurrentSQLiteSyncPublishesExactlyOnce":   true,
-		"TestTeamsMainLoopAllowsDistinctTurnPastProtectedAmbiguousPredecessor": true,
-		"TestBridgeContinuousListenKeepsOwnerForPersistentPollFailure":         true,
-		"TestGlobalInboundSQLiteWriterDefersPruneUntilClose":                   true,
+		"TestBridgeLinkedTranscriptConcurrentSQLiteSyncPublishesExactlyOnce":     true,
+		"TestTeamsMainLoopAllowsDistinctTurnPastProtectedAmbiguousPredecessor":   true,
+		"TestBridgeContinuousListenKeepsOwnerForPersistentPollFailure":           true,
+		"TestGlobalInboundSQLiteWriterDefersPruneUntilClose":                     true,
+		"TestPollFrontierLongRotatingContinuationStopsAtDurablePageBudget":       true,
+		"TestTeamsListenFalseAccountRead429RecoversWithoutManualStateChange":     true,
+		"TestTeamsListenFalseSQLiteOperationalFloodPreservesHealthyOrdinaryChat": true,
+		"TestTeamsActiveOutboxPredecessorUsesShortRetryGateSQLite":               true,
+		"TestTeamsAcceptedOutboxPredecessorUsesShortRetryGateSQLite":             true,
 		// These tests already run in their own process, but their first listener
 		// cycle is itself the assertion.  Do not start them beside other shard
 		// processes that can consume the hosted runner before Graph admission.
