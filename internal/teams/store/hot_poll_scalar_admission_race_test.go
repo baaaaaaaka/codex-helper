@@ -18,6 +18,12 @@ func hotPollInvalidPageBadCount() int { return 1 }
 // the healthy-tail and malformed-row admission invariant covered with one row.
 func hotPollSemanticMalformedPollCount() int { return 1 }
 
+// Keep the ready-schedule regression focused on the healthy-tail and bounded
+// malformed-row invariant under -race. The non-race build retains the larger
+// prefix to exercise keyset traversal; race JSON evaluation must stay inside
+// the production compatibility budget on hosted runners.
+func hotPollReadyScheduleSemanticMalformedCount() int { return 1 }
+
 // This admission fixture needs enough rows to exercise the control-chat
 // reservation and stale-frontier fallback, but it is not the keyset-scale
 // stress test. Keep the race build below the production two-second legacy

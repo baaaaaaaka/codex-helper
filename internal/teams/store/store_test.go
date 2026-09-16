@@ -6994,7 +6994,7 @@ func TestSQLiteHotPollReadyScheduleSkipsMalformedOperationalPrefix(t *testing.T)
 	store := newTestStore(t)
 	ctx := context.Background()
 	now := time.Now().UTC()
-	const malformedCount = sqliteHotPollReadyLimit + 8
+	malformedCount := hotPollReadyScheduleSemanticMalformedCount()
 	if err := store.Update(ctx, func(state *State) error {
 		state.Sessions["session-ready-semantic-healthy"] = SessionContext{
 			ID: "session-ready-semantic-healthy", Status: SessionStatusActive,
