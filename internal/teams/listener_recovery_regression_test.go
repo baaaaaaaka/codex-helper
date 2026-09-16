@@ -4586,7 +4586,12 @@ func TestTeamsListenFalseMalformedActiveSQLitePollDoesNotBaseline(t *testing.T) 
 	// admission failure.
 	options.PhaseBudget = mainLoopPhaseBudget
 	options.PollWorkerBudget = mainLoopPollWorkerBudget
-	options.Interval = 25 * time.Millisecond
+	// This assertion covers admission and durable recovery, not sub-100ms
+	// scheduling. A 25ms test-only tick creates a synthetic SQLite retry/read
+	// flood under -race and can starve the very durable write this test waits
+	// for on a hosted runner. Keep the normal recovery harness interval while
+	// retaining the same finite liveness budget and exact-once assertions.
+	options.Interval = listenerRecoveryCycleInterval
 	listener := startListenerRecovery(t, bridge, options)
 	if !waitListenerRecoveryResult(func() bool {
 		calls := executor.callsSnapshot()
