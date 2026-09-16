@@ -4553,6 +4553,14 @@ func TestTeamsListenFalseMalformedActiveSQLitePollDoesNotBaseline(t *testing.T) 
 	}
 	listenerRecoverySeedDuePoll(t, store, seedBridge.reg.ControlChatID, now)
 	listenerRecoverySeedDuePoll(t, store, message.ChatID, now)
+	if _, err := store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
+		ChatID:         seedBridge.reg.ControlChatID,
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(time.Hour),
+		LastActivityAt: now,
+	}); err != nil {
+		t.Fatalf("defer unrelated control poll: %v", err)
+	}
 	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
 		t.Fatalf("migrate malformed-poll fixture to SQLite: %v", err)
 	}
@@ -4592,6 +4600,43 @@ func TestTeamsListenFalseMalformedActiveSQLitePollDoesNotBaseline(t *testing.T) 
 	// for on a hosted runner. Keep the normal recovery harness interval while
 	// retaining the same finite liveness budget and exact-once assertions.
 	options.Interval = listenerRecoveryCycleInterval
+	// The base recovery harness uses a one-second stale-owner window for tests
+	// that exercise takeover. This fixture does not; the frequent heartbeat
+	// writes would continuously invalidate the read-only canonical snapshot and
+	// turn malformed-row admission into a hosted-race contention test.
+	options.OwnerStaleAfter = 2 * time.Minute
+	var traceMu sync.Mutex
+	var phaseTrace []string
+	var decisionTrace []string
+	var loopTrace []string
+	recordTrace := func(dst *[]string, value string) {
+		const maxTraceEntries = 48
+		if len(*dst) == maxTraceEntries {
+			copy(*dst, (*dst)[1:])
+			(*dst)[maxTraceEntries-1] = value
+			return
+		}
+		*dst = append(*dst, value)
+	}
+	bridge.pollPhaseTraceHook = func(name string, duration time.Duration, phaseErr error) {
+		traceMu.Lock()
+		defer traceMu.Unlock()
+		recordTrace(&phaseTrace, fmt.Sprintf("%s=%s err=%v", name, duration, phaseErr))
+	}
+	bridge.pollDecisionTraceHook = func(stage string, decisions []inboundPollDecision) {
+		traceMu.Lock()
+		defer traceMu.Unlock()
+		chats := make([]string, 0, len(decisions))
+		for _, decision := range decisions {
+			chats = append(chats, decision.ChatID)
+		}
+		recordTrace(&decisionTrace, fmt.Sprintf("%s=%v", stage, chats))
+	}
+	bridge.mainLoopPhaseTraceHook = func(name string, duration time.Duration, phaseErr error) {
+		traceMu.Lock()
+		defer traceMu.Unlock()
+		recordTrace(&loopTrace, fmt.Sprintf("%s=%s err=%v", name, duration, phaseErr))
+	}
 	listener := startListenerRecovery(t, bridge, options)
 	if !waitListenerRecoveryResult(func() bool {
 		calls := executor.callsSnapshot()
@@ -4599,7 +4644,10 @@ func TestTeamsListenFalseMalformedActiveSQLitePollDoesNotBaseline(t *testing.T) 
 	}, listenerRecoveryBacklogProgressTimeout) {
 		state, _ := reopened.Load(ctx)
 		listener.stop(t)
-		t.Fatalf("SQLite malformed-poll chat did not reach execution; calls=%#v polls=%#v phase=%#v", executor.callsSnapshot(), state.ChatPolls, bridge.mainLoopPhaseStatsSnapshot("poll"))
+		traceMu.Lock()
+		phases, decisions, loops := append([]string(nil), phaseTrace...), append([]string(nil), decisionTrace...), append([]string(nil), loopTrace...)
+		traceMu.Unlock()
+		t.Fatalf("SQLite malformed-poll chat did not reach execution; calls=%#v polls=%#v phase=%#v phases=%v decisions=%v loop=%v", executor.callsSnapshot(), state.ChatPolls, bridge.mainLoopPhaseStatsSnapshot("poll"), phases, decisions, loops)
 	}
 	waitListenerRecovery(t, func() bool {
 		for _, sent := range graphState.sentSnapshot() {
