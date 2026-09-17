@@ -632,6 +632,8 @@ echo 'ok'
             "TestSendQueuedOutboxFallsBackToControlMentionAfterDefiniteWebhookFailureSQLite",
             "TestTeamsOutboxPredecessorMutationRefreshesFIFOSnapshotSQLite",
             "TestBridgeMainLoopOutboxFlushUsesSmallBudget",
+            "TestTeamsMainLoopOutboxRotatesBeyondFirstTwoChats",
+            "TestBridgeAttachmentUploadSession429RecordsWriteGateWithoutReplay",
         )
         for fixture_name in fixtures:
             fixture = f'"{fixture_name}"'

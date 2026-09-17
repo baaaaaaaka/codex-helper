@@ -111,7 +111,14 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		// This main-loop budget fixture observes a small asynchronous flush
 		// window. Keep it out of broad race shards so host scheduling cannot make
 		// a healthy two-row flush look like a production budget regression.
-		"TestBridgeMainLoopOutboxFlushUsesSmallBudget":                                   true,
+		"TestBridgeMainLoopOutboxFlushUsesSmallBudget": true,
+		// This upload-session 429 fixture must reach the Graph boundary after
+		// durable FIFO admission. Keep its SQLite subtest away from broad race
+		// shard I/O so a lookup timeout cannot mask the intended rate-limit gate.
+		"TestBridgeAttachmentUploadSession429RecordsWriteGateWithoutReplay": true,
+		// This two-wave rotation fixture observes a small SQLite-backed send
+		// window. Keep the fairness order independent of hosted runner pressure.
+		"TestTeamsMainLoopOutboxRotatesBeyondFirstTwoChats":                              true,
 		"TestTeamsListenFalseHistoryWatchFullPoolDoesNotStarveHealthyTail":               true,
 		"TestTeamsListenFalseUsesConfiguredRunnerStreaming":                              true,
 		"TestTeamsListenFalseLinkedTranscriptSessionErrorDoesNotStarveHealthyTail":       true,
@@ -303,7 +310,9 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestTeamsMainLoopOutboxFairnessBypassesPersistentGraphFailurePrefix":            true,
 		"TestTeamsMainLoopOutboxFairnessCursorWalksPastDistinctChatScanPrefix":           true,
 		"TestTeamsMainLoopOutboxFairnessWalksPastDistinctChatScanPrefix":                 true,
+		"TestTeamsMainLoopOutboxRotatesBeyondFirstTwoChats":                              true,
 		"TestTeamsMainLoopOutboxLedgerFailureDoesNotStarveHealthyTail":                   true,
+		"TestBridgeAttachmentUploadSession429RecordsWriteGateWithoutReplay":              true,
 		"TestTeamsUnresolvedTranscriptOutboxDoesNotLivelockHealthyTail":                  true,
 		"TestTeamsSameChatDefinitiveSendFailureDoesNotStarveLaterOutbox":                 true,
 		"TestSendQueuedOutboxFallsBackToControlMentionAfterDefiniteWebhookFailureSQLite": true,
