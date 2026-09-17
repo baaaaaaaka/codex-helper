@@ -236,6 +236,35 @@ func definitiveGraphSendFailure(err error) bool {
 	return statusErr.StatusCode >= http.StatusBadRequest && statusErr.StatusCode < http.StatusInternalServerError
 }
 
+// graphPostOutcomeMayBeUnknown identifies a non-idempotent request whose HTTP
+// response is not proof that Graph did not accept the operation. A gateway can
+// commit a POST and then emit a timeout, conflict, early-data, or throttle
+// response while the result is being generated. The sender must therefore keep
+// the durable attempt in the ambiguous/recovery lane instead of converting it
+// back to Queued, which would permit a later flush to issue a duplicate POST.
+// Read errors never reach this sender path; PATCH is included because callers
+// may use it for a non-idempotent Graph mutation with the same ambiguity.
+func graphPostOutcomeMayBeUnknown(err error) bool {
+	if err == nil {
+		return false
+	}
+	var statusErr *GraphStatusError
+	if !errors.As(err, &statusErr) {
+		return false
+	}
+	switch strings.ToUpper(strings.TrimSpace(statusErr.Method)) {
+	case http.MethodPost, http.MethodPatch:
+		switch statusErr.StatusCode {
+		case http.StatusRequestTimeout, http.StatusConflict, http.StatusTooEarly, http.StatusTooManyRequests:
+			return true
+		default:
+			return false
+		}
+	default:
+		return false
+	}
+}
+
 func graphUnauthorizedError(err error) bool {
 	if err == nil {
 		return false
@@ -244,14 +273,43 @@ func graphUnauthorizedError(err error) bool {
 	return errors.As(err, &statusErr) && statusErr.StatusCode == http.StatusUnauthorized
 }
 
+// definitiveDriveItemMissingError is limited to the metadata endpoint used to
+// prepare an already-uploaded attachment. A 404/410 from another Graph route,
+// or a permission/authentication response, must not erase a durable remote
+// identity. An empty error code is accepted because compatible Graph proxies
+// often omit the JSON error envelope; the endpoint and status still identify
+// the narrow missing-item case.
+func definitiveDriveItemMissingError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var statusErr *GraphStatusError
+	if !errors.As(err, &statusErr) || strings.ToUpper(strings.TrimSpace(statusErr.Method)) != http.MethodGet {
+		return false
+	}
+	if statusErr.StatusCode != http.StatusNotFound && statusErr.StatusCode != http.StatusGone {
+		return false
+	}
+	path := pathWithoutQuery(strings.TrimSpace(statusErr.Path))
+	if !strings.HasPrefix(path, "/me/drive/items/") || strings.TrimSpace(strings.TrimPrefix(path, "/me/drive/items/")) == "" {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(statusErr.Code)) {
+	case "", "itemnotfound", "resourcenotfound", "notfound":
+		return true
+	default:
+		return false
+	}
+}
+
 // attachmentPostResponseAllowsPendingReset identifies an explicit provider
 // response that rejects a fresh attachment POST before it can be accepted.
-// It is deliberately not true for transport errors, 408/409/425, or 5xx:
+// It is deliberately not true for transport errors, 408/409/425/429, or 5xx:
 // those responses leave the external outcome uncertain and must remain behind
-// the exact-marker recovery fence.  A 401/429 can safely return a fresh row to
-// the pre-POST state, allowing credential refresh or throttling backoff to
-// make progress without forcing every normal attachment retry through an
-// inconclusive history scan.
+// the exact-marker recovery fence. A 401 is the only response accepted here:
+// it is an explicit authentication rejection of the request. A 429 may be
+// emitted by a gateway after the provider accepted the POST, so it must never
+// turn a started attachment message back into a replayable pending row.
 func attachmentPostResponseAllowsPendingReset(err error) bool {
 	if err == nil {
 		return false
@@ -260,7 +318,17 @@ func attachmentPostResponseAllowsPendingReset(err error) bool {
 	if !errors.As(err, &statusErr) {
 		return false
 	}
-	return statusErr.StatusCode == http.StatusUnauthorized || statusErr.StatusCode == http.StatusTooManyRequests
+	return statusErr.StatusCode == http.StatusUnauthorized
+}
+
+// uploadSessionPostResponseAllowsPendingReset is intentionally conservative.
+// Once beforeFirstRequest has run, a provider HTTP response is evidence that
+// the createUploadSession request crossed the network boundary, not proof that
+// Graph did not create a session.  The caller therefore keeps every provider
+// status behind the durable started/unknown fence; only a local error that is
+// not represented by GraphStatusError can be considered before-request.
+func uploadSessionPostResponseAllowsPendingReset(err error) bool {
+	return false
 }
 
 // permanentGraphSendFailure identifies a response that proves this payload
@@ -300,7 +368,10 @@ func (b *Bridge) noteUnprovenancedHelperEcho(ctx context.Context, chatID string,
 	if b == nil || b.store == nil || strings.TrimSpace(msg.ID) == "" {
 		return false, nil
 	}
-	session := b.sessionByChatIDForPoll(strings.TrimSpace(chatID))
+	// A selected work poll carries the exact session identity through its
+	// context.  Resolving by chat here would pick an arbitrary sibling when a
+	// rebind/migration temporarily leaves two sessions on the same chat.
+	session := b.sessionByChatIDForPollContext(ctx, strings.TrimSpace(chatID))
 	if session == nil || strings.TrimSpace(session.ID) == "" {
 		return false, nil
 	}

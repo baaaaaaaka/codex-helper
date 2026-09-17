@@ -46,14 +46,16 @@ func openTeamsLedgerSQLite(path string) (*sql.DB, error) {
 	}
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	stmts := []string{
-		`PRAGMA synchronous = NORMAL`,
-		`PRAGMA busy_timeout = 5000`,
-		`PRAGMA temp_store = MEMORY`,
-	}
+	// Install the connection-local busy handler before any startup PRAGMA that
+	// may need to rendezvous with a writer closing a WAL transaction.  In
+	// particular, reopening immediately after a deferred prune used to execute
+	// synchronous/journal setup with SQLite's default zero wait and surface a
+	// transient SQLITE_BUSY as a durable startup failure.
+	stmts := []string{`PRAGMA busy_timeout = 5000`}
 	if newDB {
-		stmts = append([]string{`PRAGMA journal_mode = WAL`}, stmts...)
+		stmts = append(stmts, `PRAGMA journal_mode = WAL`)
 	}
+	stmts = append(stmts, `PRAGMA synchronous = NORMAL`, `PRAGMA temp_store = MEMORY`)
 	for _, stmt := range stmts {
 		if _, err := db.Exec(stmt); err != nil {
 			_ = db.Close()

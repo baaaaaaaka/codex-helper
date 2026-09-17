@@ -13,11 +13,32 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 
 	_ "modernc.org/sqlite"
 )
 
 const delegationSQLiteStoreVersion = 1
+
+// The worker store deliberately opens short-lived *sql.DB handles for each
+// atomic operation. SQLite serializes writers across processes, but separate
+// handles in one process can still race while repeatedly applying connection
+// PRAGMAs and starting a write transaction. Keep operations for the same file
+// ordered in-process; SQLite's busy timeout continues to cover other
+// processes. The lock is keyed by path so unrelated worker stores retain
+// concurrency.
+var delegationSQLiteProcessLocks sync.Map // map[string]*sync.Mutex
+
+func lockDelegationSQLiteProcess(path string) func() {
+	key := filepath.Clean(strings.TrimSpace(path))
+	if absolute, err := filepath.Abs(key); err == nil {
+		key = absolute
+	}
+	value, _ := delegationSQLiteProcessLocks.LoadOrStore(key, &sync.Mutex{})
+	mutex := value.(*sync.Mutex)
+	mutex.Lock()
+	return mutex.Unlock
+}
 
 func storePathUsesSQLite(path string) bool {
 	return strings.EqualFold(filepath.Ext(strings.TrimSpace(path)), ".sqlite")
@@ -79,6 +100,8 @@ func loadSQLiteStore(path string) (Store, error) {
 		}
 		return newStore(), nil
 	}
+	unlock := lockDelegationSQLiteProcess(path)
+	defer unlock()
 	db, err := openDelegationSQLiteStore(path, false)
 	if err != nil {
 		return Store{}, err
@@ -102,6 +125,8 @@ func saveSQLiteStore(path string, store Store) (bool, error) {
 	store.EnsureOutbox()
 	store.EnsureInboxCursors()
 	store.EnsureInboxBackoffs()
+	unlock := lockDelegationSQLiteProcess(path)
+	defer unlock()
 	db, err := openDelegationSQLiteStore(path, true)
 	if err != nil {
 		return false, err

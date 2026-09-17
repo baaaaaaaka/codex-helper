@@ -83,6 +83,32 @@ func TestTeamsCyclePhaseStatsExposeBlockedCallbackAsActive(t *testing.T) {
 	}
 }
 
+func TestTeamsOutboxPhaseSeparatesSafeDeferralFromFailure(t *testing.T) {
+	bridge := &Bridge{}
+	deferredUntil := time.Now().Add(time.Minute)
+	deferredErr := bridge.runMainLoopPhase(context.Background(), "outbox", func(context.Context) error {
+		return outboxDeliveryDeferredError{ChatID: "chat-1", Until: deferredUntil}
+	})
+	if !isOutboxDeliveryDeferred(deferredErr) {
+		t.Fatalf("pure outbox deferral error = %v, want typed deferral", deferredErr)
+	}
+	stats := bridge.mainLoopPhaseStatsSnapshot("outbox")
+	if stats.Errors != 0 || stats.Deferred != 1 {
+		t.Fatalf("pure outbox deferral stats = %#v, want errors=0 deferred=1", stats)
+	}
+
+	mixedErr := bridge.runMainLoopPhase(context.Background(), "outbox", func(context.Context) error {
+		return errors.Join(deferredErr, errors.New("durable outbox failure"))
+	})
+	if mixedErr == nil || !isOutboxDeliveryDeferred(mixedErr) {
+		t.Fatalf("mixed outbox error = %v, want to retain the deferral cause", mixedErr)
+	}
+	stats = bridge.mainLoopPhaseStatsSnapshot("outbox")
+	if stats.Errors != 1 || stats.Deferred != 1 {
+		t.Fatalf("mixed outbox deferral stats = %#v, want errors=1 deferred=1", stats)
+	}
+}
+
 func TestBoundedTeamsPhaseJobContextCutsWorkerBudgetFromPhaseDeadline(t *testing.T) {
 	parent, cancelParent := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancelParent()
@@ -130,8 +156,9 @@ func TestTeamsWorkChatAudienceLookupUsesPollBudget(t *testing.T) {
 		pollWorkerBudget:      40 * time.Millisecond,
 	}
 	startedAt := time.Now()
-	if !bridge.workChatRequiresCodexMention(context.Background(), "chat-audience-budget") {
-		t.Fatal("failed audience lookup must conservatively require @codex")
+	requiresMention, err := bridge.workChatRequiresCodexMention(context.Background(), "chat-audience-budget")
+	if err == nil || requiresMention {
+		t.Fatalf("failed audience lookup = requiresMention:%t err:%v, want an explicit retryable error", requiresMention, err)
 	}
 	if elapsed := time.Since(startedAt); elapsed > 500*time.Millisecond {
 		t.Fatalf("audience lookup took %s after its 40ms poll budget; Graph admission was not bounded", elapsed)
@@ -171,8 +198,9 @@ func TestTeamsWorkChatAudienceLookupDoesNotRetry429InsidePollWorker(t *testing.T
 		groupChatGuardEnabled: true,
 		pollWorkerBudget:      5 * time.Second,
 	}
-	if !bridge.workChatRequiresCodexMention(context.Background(), "chat-audience-429") {
-		t.Fatal("429 audience lookup must conservatively require @codex")
+	requiresMention, err := bridge.workChatRequiresCodexMention(context.Background(), "chat-audience-429")
+	if err == nil || requiresMention {
+		t.Fatalf("429 audience lookup = requiresMention:%t err:%v, want an explicit retryable error", requiresMention, err)
 	}
 	if requests != 1 {
 		t.Fatalf("429 audience lookup requests = %d, want one request", requests)
@@ -182,6 +210,66 @@ func TestTeamsWorkChatAudienceLookupDoesNotRetry429InsidePollWorker(t *testing.T
 	}
 }
 
+func TestTeamsGraphRead429UsesSharedDurableReadGateWithoutBlockingOutbox(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+	readErr := &GraphStatusError{StatusCode: http.StatusTooManyRequests, RetryAfter: 120 * time.Millisecond, RateLimitScope: "account", Message: "account read throttle"}
+
+	bridge.recordGraphReadRetryableFailure(ctx, "chat-read-a", readErr)
+	blockedUntil, blocked := bridge.chatReadBlockedUntil(ctx, "chat-read-b")
+	if !blocked || !blockedUntil.After(time.Now()) {
+		t.Fatalf("shared read gate = %s/%v, want a future gate for an unrelated chat", blockedUntil, blocked)
+	}
+
+	if _, _, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
+		ID:          "outbox:read-gate-write-independent",
+		TeamsChatID: "chat-read-b",
+		Kind:        "final",
+		Body:        "write remains eligible while reads are throttled",
+	}); err != nil {
+		t.Fatalf("QueueOutbox during read gate: %v", err)
+	}
+	ids, err := store.PendingOutboxChatIDsAt(ctx, teamstore.PendingOutboxQuery{
+		Now:         time.Now(),
+		TeamsChatID: "chat-read-b",
+	}, 1)
+	if err != nil {
+		t.Fatalf("PendingOutboxChatIDsAt during read gate: %v", err)
+	}
+	if len(ids) != 1 || ids[0] != "chat-read-b" {
+		t.Fatalf("outbox admission during account read gate = %#v, want chat-read-b", ids)
+	}
+}
+
+func TestTeamsBareGraphRead429RemainsChatLocalWithoutScopeEvidence(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+	readErr := &GraphStatusError{StatusCode: http.StatusTooManyRequests, RetryAfter: time.Minute, Message: "chat-local throttle"}
+
+	bridge.recordGraphReadRetryableFailure(ctx, "chat-local-a", readErr)
+	if _, blocked := bridge.chatReadBlockedUntil(ctx, "chat-local-a"); !blocked {
+		t.Fatal("bare 429 did not retain the failed chat's local retry gate")
+	}
+	if _, blocked := bridge.chatReadBlockedUntil(ctx, "chat-local-b"); blocked {
+		t.Fatal("bare 429 incorrectly created an account-wide read gate")
+	}
+}
+
+func TestGraphReadGatePollSnapshotReusesDurableDecisionAndSeesNewLocalGate(t *testing.T) {
+	bridge := &Bridge{}
+	initial := time.Now().Add(time.Minute)
+	ctx := context.WithValue(context.Background(), graphReadAccountGateSnapshotContextKey{}, graphReadAccountGateSnapshot{Until: initial})
+	if got, blocked := bridge.graphReadAccountBlockedUntilForPoll(ctx); !blocked || !got.Equal(initial) {
+		t.Fatalf("poll account gate snapshot = %s/%v, want %s/true", got, blocked, initial)
+	}
+	newer := initial.Add(time.Minute)
+	bridge.setLocalGraphReadAccountBlockedUntil(newer)
+	if got, blocked := bridge.graphReadAccountBlockedUntilForPoll(ctx); !blocked || !got.Equal(newer) {
+		t.Fatalf("poll account gate after sibling throttle = %s/%v, want %s/true", got, blocked, newer)
+	}
+}
 func TestOutboxRetryGateHonorsGraph429RetryAfter(t *testing.T) {
 	now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
 	err := &GraphStatusError{
@@ -344,6 +432,83 @@ func runTeamsActiveOutboxPredecessorUsesShortRetryGate(t *testing.T, useSQLite b
 	final, err := store.OutboxMessageByID(ctx, later.ID)
 	if err != nil || final.Status != teamstore.OutboxStatusSent {
 		t.Fatalf("final after predecessor finished = %#v, err=%v, want Sent", final, err)
+	}
+}
+
+// A predecessor cleanup changes the SQLite generation.  The FIFO proof used
+// for the current row must be reacquired after that mutation; otherwise the
+// sender turns an expected progress case into a stale-proof defer and needs a
+// later retry cycle before it can send the healthy tail.  Two disposable
+// ambiguous progress rows make the regression observable: the current row
+// must skip both and send exactly once in the same call.
+func TestTeamsOutboxPredecessorMutationRefreshesFIFOSnapshotJSON(t *testing.T) {
+	runTeamsOutboxPredecessorMutationRefreshesFIFOSnapshot(t, false)
+}
+
+func TestTeamsOutboxPredecessorMutationRefreshesFIFOSnapshotSQLite(t *testing.T) {
+	runTeamsOutboxPredecessorMutationRefreshesFIFOSnapshot(t, true)
+}
+
+func runTeamsOutboxPredecessorMutationRefreshesFIFOSnapshot(t *testing.T, useSQLite bool) {
+	t.Helper()
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	now := time.Now().UTC()
+	rows := []teamstore.OutboxMessage{
+		{
+			ID: "outbox:proof-refresh-progress-1", TeamsChatID: "chat:proof-refresh",
+			TurnID: "turn:proof-refresh",
+			Kind:   "progress-1", Body: "old progress 1", Status: teamstore.OutboxStatusSending,
+			Sequence: 1, SendAttemptToken: "attempt:proof-refresh-1",
+			LastSendAttempt: now.Add(-time.Hour), LastSendError: "ambiguous Graph send; response lost",
+			CreatedAt: now.Add(-3 * time.Minute), UpdatedAt: now.Add(-3 * time.Minute),
+		},
+		{
+			ID: "outbox:proof-refresh-progress-2", TeamsChatID: "chat:proof-refresh",
+			TurnID: "turn:proof-refresh",
+			Kind:   "progress-2", Body: "old progress 2", Status: teamstore.OutboxStatusSending,
+			Sequence: 2, SendAttemptToken: "attempt:proof-refresh-2",
+			LastSendAttempt: now.Add(-time.Hour), LastSendError: "ambiguous Graph send; response lost",
+			CreatedAt: now.Add(-2 * time.Minute), UpdatedAt: now.Add(-2 * time.Minute),
+		},
+		{
+			ID: "outbox:proof-refresh-tail", TeamsChatID: "chat:proof-refresh",
+			TurnID: "turn:proof-refresh",
+			Kind:   "helper", Body: "healthy tail", Status: teamstore.OutboxStatusQueued,
+			Sequence: 3, CreatedAt: now, UpdatedAt: now,
+		},
+	}
+	seedBridgeTestOutboxRows(t, ctx, store, rows...)
+	if useSQLite {
+		if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+			t.Fatalf("MigrateLargeStateToSQLite: %v", err)
+		}
+	}
+	prepareBridgeTestGlobalOutboundLedger(t, ctx, bridge)
+
+	if err := bridge.sendQueuedOutboxWithOptions(ctx, rows[2], outboxSendOptions{AllowAmbiguousRetry: true}); err != nil {
+		t.Fatalf("send tail after predecessor cleanup: %v", err)
+	}
+	if got := len(*sent); got != 1 {
+		t.Fatalf("Graph POST count = %d, want one tail POST", got)
+	}
+	for _, row := range rows[:2] {
+		got, err := store.OutboxMessageByID(ctx, row.ID)
+		if err != nil {
+			t.Fatalf("reload predecessor %s: %v", row.ID, err)
+		}
+		if got.Status != teamstore.OutboxStatusSkipped {
+			t.Fatalf("predecessor %s status = %q, want skipped", row.ID, got.Status)
+		}
+	}
+	got, err := store.OutboxMessageByID(ctx, rows[2].ID)
+	if err != nil {
+		t.Fatalf("reload healthy tail: %v", err)
+	}
+	if got.Status != teamstore.OutboxStatusSent {
+		t.Fatalf("healthy tail status = %q, want sent", got.Status)
 	}
 }
 
@@ -1033,7 +1198,7 @@ func TestTeamsOutboxAttemptBudgetAndFairness(t *testing.T) {
 	}
 }
 
-func TestTeamsMainLoopOutboxReservesOneHeadForAnotherChat(t *testing.T) {
+func TestTeamsMainLoopOutboxReservesTwoHeadsForAnotherChat(t *testing.T) {
 	ctx := context.Background()
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
@@ -1044,14 +1209,15 @@ func TestTeamsMainLoopOutboxReservesOneHeadForAnotherChat(t *testing.T) {
 		teamstore.OutboxMessage{ID: "outbox:fair:a2", TeamsChatID: "chat-a", Kind: "helper", Body: "a2", Sequence: 2, CreatedAt: base.Add(time.Second)},
 		teamstore.OutboxMessage{ID: "outbox:fair:a3", TeamsChatID: "chat-a", Kind: "helper", Body: "a3", Sequence: 3, CreatedAt: base.Add(2 * time.Second)},
 		teamstore.OutboxMessage{ID: "outbox:fair:b1", TeamsChatID: "chat-b", Kind: "helper", Body: "b1", Sequence: 1, CreatedAt: base.Add(3 * time.Second)},
+		teamstore.OutboxMessage{ID: "outbox:fair:b2", TeamsChatID: "chat-b", Kind: "helper", Body: "b2", Sequence: 2, CreatedAt: base.Add(4 * time.Second)},
 	)
 	if err := bridge.flushPendingOutboxMainLoop(ctx); err != nil {
 		t.Fatalf("fair main-loop outbox flush: %v", err)
 	}
-	if len(*sent) != 2 || (*sent)[0].ChatID != "chat-a" || (*sent)[1].ChatID != "chat-b" {
-		t.Fatalf("main-loop send order = %#v, want one head from chat-a then chat-b", *sent)
+	if len(*sent) != 4 || (*sent)[0].ChatID != "chat-a" || (*sent)[1].ChatID != "chat-a" || (*sent)[2].ChatID != "chat-b" || (*sent)[3].ChatID != "chat-b" {
+		t.Fatalf("main-loop send order = %#v, want two FIFO heads from chat-a then chat-b", *sent)
 	}
-	for _, id := range []string{"outbox:fair:a1", "outbox:fair:b1"} {
+	for _, id := range []string{"outbox:fair:a1", "outbox:fair:a2", "outbox:fair:b1", "outbox:fair:b2"} {
 		row, err := store.OutboxMessageByID(ctx, id)
 		if err != nil {
 			t.Fatalf("load sent row %s: %v", id, err)
@@ -1060,12 +1226,12 @@ func TestTeamsMainLoopOutboxReservesOneHeadForAnotherChat(t *testing.T) {
 			t.Fatalf("row %s status = %q, want sent", id, row.Status)
 		}
 	}
-	later, err := store.OutboxMessageByID(ctx, "outbox:fair:a2")
+	later, err := store.OutboxMessageByID(ctx, "outbox:fair:a3")
 	if err != nil {
 		t.Fatalf("load reserved chat-a tail: %v", err)
 	}
 	if later.Status == teamstore.OutboxStatusSent {
-		t.Fatalf("chat-a tail was sent in the reserved two-head flush: %#v", later)
+		t.Fatalf("chat-a third row was sent beyond the per-chat quantum: %#v", later)
 	}
 }
 
@@ -1084,8 +1250,12 @@ func TestTeamsMainLoopOutboxRotatesBeyondFirstTwoChats(t *testing.T) {
 			seedBridgeTestOutboxRows(t, ctx, store,
 				teamstore.OutboxMessage{ID: "outbox:rotate:a1", TeamsChatID: "chat-a", Kind: "helper", Body: "a1", Sequence: 1, CreatedAt: base},
 				teamstore.OutboxMessage{ID: "outbox:rotate:a2", TeamsChatID: "chat-a", Kind: "helper", Body: "a2", Sequence: 2, CreatedAt: base.Add(time.Second)},
-				teamstore.OutboxMessage{ID: "outbox:rotate:b1", TeamsChatID: "chat-b", Kind: "helper", Body: "b1", Sequence: 1, CreatedAt: base.Add(2 * time.Second)},
-				teamstore.OutboxMessage{ID: "outbox:rotate:c1", TeamsChatID: "chat-c", Kind: "helper", Body: "c1", Sequence: 1, CreatedAt: base.Add(3 * time.Second)},
+				teamstore.OutboxMessage{ID: "outbox:rotate:a3", TeamsChatID: "chat-a", Kind: "helper", Body: "a3", Sequence: 3, CreatedAt: base.Add(2 * time.Second)},
+				teamstore.OutboxMessage{ID: "outbox:rotate:a4", TeamsChatID: "chat-a", Kind: "helper", Body: "a4", Sequence: 4, CreatedAt: base.Add(3 * time.Second)},
+				teamstore.OutboxMessage{ID: "outbox:rotate:b1", TeamsChatID: "chat-b", Kind: "helper", Body: "b1", Sequence: 1, CreatedAt: base.Add(4 * time.Second)},
+				teamstore.OutboxMessage{ID: "outbox:rotate:b2", TeamsChatID: "chat-b", Kind: "helper", Body: "b2", Sequence: 2, CreatedAt: base.Add(5 * time.Second)},
+				teamstore.OutboxMessage{ID: "outbox:rotate:c1", TeamsChatID: "chat-c", Kind: "helper", Body: "c1", Sequence: 1, CreatedAt: base.Add(6 * time.Second)},
+				teamstore.OutboxMessage{ID: "outbox:rotate:c2", TeamsChatID: "chat-c", Kind: "helper", Body: "c2", Sequence: 2, CreatedAt: base.Add(7 * time.Second)},
 			)
 			if useSQLite {
 				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
@@ -1095,14 +1265,14 @@ func TestTeamsMainLoopOutboxRotatesBeyondFirstTwoChats(t *testing.T) {
 			if err := bridge.flushPendingOutboxMainLoop(ctx); err != nil {
 				t.Fatalf("first rotating outbox flush: %v", err)
 			}
-			if len(*sent) != 2 || (*sent)[0].ChatID != "chat-a" || (*sent)[1].ChatID != "chat-b" {
-				t.Fatalf("first rotating send order = %#v, want chat-a/chat-b", *sent)
+			if len(*sent) != 4 || (*sent)[0].ChatID != "chat-a" || (*sent)[1].ChatID != "chat-a" || (*sent)[2].ChatID != "chat-b" || (*sent)[3].ChatID != "chat-b" {
+				t.Fatalf("first rotating send order = %#v, want two messages from chat-a then chat-b", *sent)
 			}
 			if err := bridge.flushPendingOutboxMainLoop(ctx); err != nil {
 				t.Fatalf("second rotating outbox flush: %v", err)
 			}
-			if len(*sent) != 4 || (*sent)[2].ChatID != "chat-a" || (*sent)[3].ChatID != "chat-c" {
-				t.Fatalf("second rotating send order = %#v, want chat-a/chat-c", *sent)
+			if len(*sent) != 8 || (*sent)[4].ChatID != "chat-a" || (*sent)[5].ChatID != "chat-a" || (*sent)[6].ChatID != "chat-c" || (*sent)[7].ChatID != "chat-c" {
+				t.Fatalf("second rotating send order = %#v, want two messages from chat-a then chat-c", *sent)
 			}
 		})
 	}
@@ -1126,21 +1296,23 @@ func TestTeamsMainLoopOutboxFairnessSeesChatsBeyondScanPrefix(t *testing.T) {
 		})
 	}
 	rows = append(rows,
-		teamstore.OutboxMessage{ID: "outbox:deep-fair:b", TeamsChatID: "chat-deep-b", Kind: "helper", Body: "b", Sequence: 1, CreatedAt: base.Add(time.Duration(mainLoopOutboxFairnessScanLimit*2+1) * time.Second)},
-		teamstore.OutboxMessage{ID: "outbox:deep-fair:c", TeamsChatID: "chat-deep-c", Kind: "helper", Body: "c", Sequence: 1, CreatedAt: base.Add(time.Duration(mainLoopOutboxFairnessScanLimit*2+2) * time.Second)},
+		teamstore.OutboxMessage{ID: "outbox:deep-fair:b1", TeamsChatID: "chat-deep-b", Kind: "helper", Body: "b1", Sequence: 1, CreatedAt: base.Add(time.Duration(mainLoopOutboxFairnessScanLimit*2+1) * time.Second)},
+		teamstore.OutboxMessage{ID: "outbox:deep-fair:b2", TeamsChatID: "chat-deep-b", Kind: "helper", Body: "b2", Sequence: 2, CreatedAt: base.Add(time.Duration(mainLoopOutboxFairnessScanLimit*2+2) * time.Second)},
+		teamstore.OutboxMessage{ID: "outbox:deep-fair:c1", TeamsChatID: "chat-deep-c", Kind: "helper", Body: "c1", Sequence: 1, CreatedAt: base.Add(time.Duration(mainLoopOutboxFairnessScanLimit*2+3) * time.Second)},
+		teamstore.OutboxMessage{ID: "outbox:deep-fair:c2", TeamsChatID: "chat-deep-c", Kind: "helper", Body: "c2", Sequence: 2, CreatedAt: base.Add(time.Duration(mainLoopOutboxFairnessScanLimit*2+4) * time.Second)},
 	)
 	seedBridgeTestOutboxRows(t, ctx, store, rows...)
 	if err := bridge.flushPendingOutboxMainLoop(ctx); err != nil {
 		t.Fatalf("first deep-prefix outbox flush: %v", err)
 	}
-	if len(*sent) != 2 || (*sent)[0].ChatID != "chat-deep-a" || (*sent)[1].ChatID != "chat-deep-b" {
-		t.Fatalf("first deep-prefix send order = %#v, want chat-deep-a/chat-deep-b", *sent)
+	if len(*sent) != 4 || (*sent)[0].ChatID != "chat-deep-a" || (*sent)[1].ChatID != "chat-deep-a" || (*sent)[2].ChatID != "chat-deep-b" || (*sent)[3].ChatID != "chat-deep-b" {
+		t.Fatalf("first deep-prefix send order = %#v, want two messages from chat-deep-a then chat-deep-b", *sent)
 	}
 	if err := bridge.flushPendingOutboxMainLoop(ctx); err != nil {
 		t.Fatalf("second deep-prefix outbox flush: %v", err)
 	}
-	if len(*sent) != 4 || (*sent)[2].ChatID != "chat-deep-a" || (*sent)[3].ChatID != "chat-deep-c" {
-		t.Fatalf("second deep-prefix send order = %#v, want chat-deep-a/chat-deep-c", *sent)
+	if len(*sent) != 8 || (*sent)[4].ChatID != "chat-deep-a" || (*sent)[5].ChatID != "chat-deep-a" || (*sent)[6].ChatID != "chat-deep-c" || (*sent)[7].ChatID != "chat-deep-c" {
+		t.Fatalf("second deep-prefix send order = %#v, want two messages from chat-deep-a then chat-deep-c", *sent)
 	}
 }
 
@@ -1703,6 +1875,70 @@ func TestTeamsQueuedAdmissionBoundedStart(t *testing.T) {
 	waitForBridgeAsyncTurns(t, bridge)
 	waitForCompletedTurnCount(t, store, first.ID, 1)
 	waitForCompletedTurnCount(t, store, second.ID, 0)
+}
+
+func TestTeamsQueuedTurnStartNoticeDoesNotFlushOutboxBeforeExecutor(t *testing.T) {
+	graph, _ := newBridgeQueuedTurnGraph(t, map[string]string{
+		"queued-start-no-flush": "run without waiting for the old outbox prefix",
+	})
+	store := newBridgeTestStore(t)
+	executor := &parallelBlockingExecutor{
+		started: make(chan parallelSessionStart, 1),
+		release: make(chan struct{}),
+	}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	session := bridge.reg.SessionByID("s001")
+	if session == nil {
+		t.Fatal("missing base session")
+	}
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensure durable session: %v", err)
+	}
+	queueBridgeTurnForTest(t, bridge, session, "queued-start-no-flush", "run without waiting for the old outbox prefix", time.Now())
+
+	// Before this boundary, the queued-start notice synchronously entered the
+	// chat outbox sender. Model an inherited/deferred head by failing that exact
+	// send; the executor must still be admitted because the notice is only a
+	// durable progress hint. Other outbox kinds are allowed to use the normal
+	// test Graph path.
+	queuedStartFlush := make(chan struct{}, 1)
+	bridge.outboxSendHook = func(_ context.Context, msg teamstore.OutboxMessage) error {
+		if msg.Kind == "queued-status" {
+			select {
+			case queuedStartFlush <- struct{}{}:
+			default:
+			}
+			return outboxDeliveryDeferredError{ChatID: msg.TeamsChatID, Until: time.Now().Add(time.Minute)}
+		}
+		return nil
+	}
+
+	started, err := bridge.processQueuedTurnsWithStartBudget(context.Background(), 1, true)
+	if err != nil || started != 1 {
+		close(executor.release)
+		t.Fatalf("queued admission started=%d err=%v, want one", started, err)
+	}
+	select {
+	case got := <-executor.started:
+		if got.SessionID != session.ID {
+			close(executor.release)
+			t.Fatalf("executor session=%q, want %q", got.SessionID, session.ID)
+		}
+	case <-time.After(bridgeAsyncTestTimeout):
+		close(executor.release)
+		t.Fatal("queued turn did not reach executor")
+	}
+	select {
+	case <-queuedStartFlush:
+		close(executor.release)
+		t.Fatal("queued-start notice synchronously flushed the blocked outbox head")
+	default:
+	}
+
+	close(executor.release)
+	waitForCompletedTurnCount(t, store, session.ID, 1)
+	waitForBridgeAsyncTurns(t, bridge)
 }
 
 func TestTeamsQueuedAdmissionPhaseDoesNotCancelStartedTurn(t *testing.T) {

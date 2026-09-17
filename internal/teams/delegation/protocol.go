@@ -40,6 +40,10 @@ const (
 	OutboxSent    = "sent"
 	OutboxVisible = "visible"
 	OutboxFailed  = "failed"
+	// OutboxUnknown means that a POST crossed the Graph boundary but its
+	// outcome could not be established. It is intentionally non-retryable:
+	// replaying it automatically could duplicate a record that Graph accepted.
+	OutboxUnknown = "unknown"
 
 	ThreadPolicyNew   = "new"
 	ThreadPolicyReuse = "reuse"
@@ -284,7 +288,13 @@ type OutboxRecord struct {
 type InboxCursor struct {
 	ChatID            string `json:"chat_id"`
 	LastHeadMessageID string `json:"last_head_message_id,omitempty"`
-	UpdatedAt         string `json:"updated_at,omitempty"`
+	// ContinuationPath is a provider-issued page boundary for a bounded inbox
+	// drain. It is only an observation cursor; it never authorizes a send. A
+	// non-empty value means the previous scan completed its durable handling for
+	// the pages it read but intentionally has not advanced LastHeadMessageID
+	// past the unconsumed tail.
+	ContinuationPath string `json:"continuation_path,omitempty"`
+	UpdatedAt        string `json:"updated_at,omitempty"`
 }
 
 type InboxBackoff struct {

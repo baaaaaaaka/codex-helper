@@ -37,6 +37,7 @@ func TestTunnelStopTerminatesProcessGroupDescendants(t *testing.T) {
 	if err := tun.Stop(50 * time.Millisecond); err == nil {
 		t.Fatal("Stop unexpectedly reported a clean exit after forced process-group termination")
 	}
+	waitForTestProcessTermination(t, tun.PID(), childPID)
 	if processGroupExists(tun.PID()) {
 		t.Fatalf("tunnel process group %d still exists after Stop", tun.PID())
 	}
@@ -58,4 +59,20 @@ func waitForTestPID(t *testing.T, path string) int {
 	}
 	t.Fatalf("timed out waiting for child PID file %s", path)
 	return 0
+}
+
+func waitForTestProcessTermination(t *testing.T, pgid, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if !processGroupExists(pgid) && !testProcessExists(pid) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func testProcessExists(pid int) bool {
+	err := syscall.Kill(pid, 0)
+	return err == nil || !errors.Is(err, syscall.ESRCH)
 }

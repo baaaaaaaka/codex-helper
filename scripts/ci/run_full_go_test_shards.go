@@ -63,6 +63,12 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		"TestProxyStartBackgroundReapsExitedDetachedChild":     true,
 		"TestStartCodexAppProxyDaemonReapsExitedDetachedChild": true,
 	},
+	"./internal/helperruntime": {
+		// This Windows-only test starts a copied executable and queries the
+		// resulting process tree. Keep the host observation out of the ordinary
+		// package job so process enumeration cannot inherit unrelated shard load.
+		"TestRuntimeProcessIdentityWindows": true,
+	},
 	"./internal/tui": {
 		// This test drives a real refresh ticker and has a short semantic
 		// context. Keep its scheduler observation independent from the large
@@ -71,55 +77,135 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		"TestSelectSessionAutoRefreshUpdatesThreadNameTitle": true,
 	},
 	"./internal/teams": {
+		// These corruption-recovery probes intentionally enter the bounded JSON
+		// compatibility lane.  Under -race, running them beside a broad shard
+		// can make the production two-second lane budget expire before the
+		// probe reaches its one-row fixture; keep the assertion in a clean test
+		// process so it measures the recovery path rather than runner pressure.
+		"TestBridgePollOnceDispositionsOnlyCorruptDurableSession":            true,
 		"TestBridgeLinkedTranscriptConcurrentSQLiteSyncPublishesExactlyOnce": true,
-		"TestCXPPerfModelExternalScenariosCoverCommonPaths":                  true,
-		"TestTeamsListenFalseGraphWorkerSaturationPreservesHealthyPoll":      true,
+		// This test runs two durable poll generations against the same store.
+		// Keep its SQLite/Graph handoff away from broad race-shard pressure.
+		"TestTeamsMainLoopAllowsDistinctTurnPastProtectedAmbiguousPredecessor": true,
+		// This listener watchdog must observe a second poll; unrelated package
+		// shards can otherwise consume the short startup window.
+		"TestBridgeContinuousListenKeepsOwnerForPersistentPollFailure": true,
+		// The shared inbound ledger deliberately observes close-time pruning;
+		// keep its bounded writer lifecycle in a clean teams process.
+		"TestGlobalInboundSQLiteWriterDefersPruneUntilClose": true,
+		// These durable SQLite/frontier fixtures can spend tens of seconds in
+		// race-instrumented JSON/SQLite writes even when they make progress.
+		// Keep their finite observations independent from the broad shard pool.
+		"TestPollFrontierLongRotatingContinuationStopsAtDurablePageBudget":       true,
+		"TestTeamsListenFalseAccountRead429RecoversWithoutManualStateChange":     true,
+		"TestTeamsListenFalseSQLiteOperationalFloodPreservesHealthyOrdinaryChat": true,
+		"TestTeamsActiveOutboxPredecessorUsesShortRetryGateSQLite":               true,
+		"TestTeamsAcceptedOutboxPredecessorUsesShortRetryGateSQLite":             true,
+		"TestCXPPerfModelExternalScenariosCoverCommonPaths":                      true,
+		"TestTeamsListenFalseGraphWorkerSaturationPreservesHealthyPoll":          true,
 		// This liveness fixture must observe an actual listener scheduling
 		// window. Keep it out of the broad shard pool, where unrelated race and
 		// SQLite processes can consume the hosted runner before its first poll.
-		"TestTeamsListenFalseGraphHeadFailureDoesNotStarveHealthyTail":             true,
-		"TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage":      true,
-		"TestTeamsListenFalseHistoryWatchFullPoolDoesNotStarveHealthyTail":         true,
-		"TestTeamsListenFalseUsesConfiguredRunnerStreaming":                        true,
-		"TestTeamsListenFalseLinkedTranscriptSessionErrorDoesNotStarveHealthyTail": true,
-		"TestTeamsListenFalseLinkedTranscriptSlowHeadDoesNotStarveHealthyTail":     true,
-		"TestTeamsListenFalseLinkedTranscriptFullPoolDoesNotStarveHealthyTail":     true,
-		"TestTeamsListenFalseHistoryWatchSlowHeadDoesNotStarveHealthyTail":         true,
-		"TestTeamsListenFalseOwnerLossCancelsHistoryWatchBeforeStaleCommit":        true,
-		"TestTeamsListenFalseOwnerLossFencesCooperativeTurn":                       true,
-		"TestTeamsListenFalseTaskStartedPromptRaceRecoversAfterNextCycle":          true,
-		"TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle":               true,
-		"TestTeamsListenFalseSlowInboundMutationDoesNotConsumeDurableCleanupGrace": true,
-		"TestTeamsListenFalseStartupHeartbeatProtectsSlowInitialization":           true,
-		"TestTeamsListenFalseCurrentStateReplayMatrix":                             true,
-		"TestTeamsListenFalseSQLiteTranscriptBacklogProgresses":                    true,
-		"TestTeamsListenFalseMalformedActiveSQLitePollDoesNotBaseline":             true,
-		"TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover":      true,
-		"TestTeamsListenFalsePollContinuationSurvivesReopenBeforeDrain":            true,
-		"TestTeamsListenFalseShutdownDoesNotRunAsyncTurnFollowupAfterGrace":        true,
-		"TestTeamsListenFalseMalformedPollDoesNotBlockHealthyChat":                 true,
-		"TestBridgeSyncLinkedTranscriptReleasesPendingRootAcrossSQLiteStoreReopen": true,
-		"TestTeamsOwnershipStressGraphStallDoesNotStopOtherChatPollCI":             true,
-		"TestTeamsOwnershipStressGraphStallThenTranscriptCatchupCI":                true,
-		"TestTeamsOwnershipStressTranscriptCatchupWhileTUIContinuesCI":             true,
-		"TestTeamsOwnershipStressContinuationFailureIsIsolatedByPollOnceCI":        true,
-		"TestTeamsOwnershipStressFifthChatReachesNextWorkerWaveCI":                 true,
-		"TestTeamsOwnershipStressPagedBacklogAfterServiceOutageCI":                 true,
-		"TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI":   true,
-		"TestCXPPerfModelSQLiteExternalScenariosCoverCommonPaths":                  true,
-		"TestCXPPerfModelProfilesCanSeedStoreAndPoll":                              true,
-		"TestTeamsUnresolvedTranscriptOutboxDoesNotLivelockHealthyTail":            true,
-		"TestTeamsOutboxAcceptedResponseFinishesAfterPhaseDeadline":                true,
+		"TestTeamsListenFalseGraphHeadFailureDoesNotStarveHealthyTail":        true,
+		"TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage": true,
+		// This main-loop budget fixture observes a small asynchronous flush
+		// window. Keep it out of broad race shards so host scheduling cannot make
+		// a healthy two-row flush look like a production budget regression.
+		"TestBridgeMainLoopOutboxFlushUsesSmallBudget": true,
+		// This upload-session 429 fixture must reach the Graph boundary after
+		// durable FIFO admission. Keep its SQLite subtest away from broad race
+		// shard I/O so a lookup timeout cannot mask the intended rate-limit gate.
+		"TestBridgeAttachmentUploadSession429RecordsWriteGateWithoutReplay": true,
+		// This two-wave rotation fixture observes a small SQLite-backed send
+		// window. Keep the fairness order independent of hosted runner pressure.
+		"TestTeamsMainLoopOutboxRotatesBeyondFirstTwoChats":                              true,
+		"TestTeamsListenFalseHistoryWatchFullPoolDoesNotStarveHealthyTail":               true,
+		"TestTeamsListenFalseUsesConfiguredRunnerStreaming":                              true,
+		"TestTeamsListenFalseLinkedTranscriptSessionErrorDoesNotStarveHealthyTail":       true,
+		"TestTeamsListenFalseLinkedTranscriptSlowHeadDoesNotStarveHealthyTail":           true,
+		"TestTeamsListenFalseLinkedTranscriptFullPoolDoesNotStarveHealthyTail":           true,
+		"TestTeamsListenFalseHistoryWatchSlowHeadDoesNotStarveHealthyTail":               true,
+		"TestTeamsListenFalseOwnerLossCancelsHistoryWatchBeforeStaleCommit":              true,
+		"TestTeamsListenFalseOwnerLossFencesCooperativeTurn":                             true,
+		"TestTeamsListenFalseTaskStartedPromptRaceRecoversAfterNextCycle":                true,
+		"TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle":                     true,
+		"TestTeamsListenFalseSlowInboundMutationDoesNotConsumeDurableCleanupGrace":       true,
+		"TestTeamsListenFalseStartupHeartbeatProtectsSlowInitialization":                 true,
+		"TestTeamsListenFalseCurrentStateReplayMatrix":                                   true,
+		"TestTeamsListenFalseSQLiteTranscriptBacklogProgresses":                          true,
+		"TestTeamsListenFalseMalformedActiveSQLitePollDoesNotBaseline":                   true,
+		"TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover":            true,
+		"TestTeamsListenFalsePollContinuationSurvivesReopenBeforeDrain":                  true,
+		"TestTeamsListenFalseShutdownDoesNotRunAsyncTurnFollowupAfterGrace":              true,
+		"TestTeamsListenFalseMalformedPollDoesNotBlockHealthyChat":                       true,
+		"TestBridgeSyncLinkedTranscriptReleasesPendingRootAcrossSQLiteStoreReopen":       true,
+		"TestBridgeIdleWorkChatAutoParkSweeperProcessesOneSQLiteCandidatePerInterval":    true,
+		"TestBridgeIdleWorkChatAutoParkSweeperDrainsIdleContinuationThenParksAndResumes": true,
+		// These durable recovery/quarantine fixtures perform long SQLite
+		// preparation or reopen transitions. Keep them out of the ordinary
+		// package shard so a separate test's WAL/FS activity cannot consume
+		// their finite compatibility budget.
+		"TestBridgeSyncLinkedTranscriptPersistsHistoryQuarantineWithLegacyGeneration": true,
+		"TestTeamsOwnershipStressGraphStallDoesNotStopOtherChatPollCI":                true,
+		"TestTeamsOwnershipStressGraphStallThenTranscriptCatchupCI":                   true,
+		"TestTeamsOwnershipStressTranscriptCatchupWhileTUIContinuesCI":                true,
+		"TestTeamsOwnershipStressContinuationFailureIsIsolatedByPollOnceCI":           true,
+		"TestTeamsOwnershipStressFifthChatReachesNextWorkerWaveCI":                    true,
+		"TestTeamsOwnershipStressPagedBacklogAfterServiceOutageCI":                    true,
+		"TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI":      true,
+		"TestCXPPerfModelSQLiteExternalScenariosCoverCommonPaths":                     true,
+		"TestCXPPerfModelProfilesCanSeedStoreAndPoll":                                 true,
+		"TestTeamsUnresolvedTranscriptOutboxDoesNotLivelockHealthyTail":               true,
+		// These targeted outbox sender fixtures perform bounded durable state
+		// transitions. A broad race shard can delay the SQLite claim/complete
+		// boundary until the test's finite retry window expires, so compile each
+		// assertion in its own process.
+		"TestTeamsSameChatDefinitiveSendFailureDoesNotStarveLaterOutbox":                 true,
+		"TestSendQueuedOutboxFallsBackToControlMentionAfterDefiniteWebhookFailureSQLite": true,
+		"TestTeamsOutboxAcceptedResponseFinishesAfterPhaseDeadline":                      true,
+		"TestTeamsOutboxPredecessorMutationRefreshesFIFOSnapshotSQLite":                  true,
 		// This listener test starts a real continuous loop over a file-backed
 		// store.  Keep startup/recovery timing independent from unrelated
 		// package tests; the test's own Graph fixture already covers the
 		// concurrency boundary it needs.
+		"TestTeamsListenFalseUntrustedSQLiteLeaseHoldsAndRecovers":      true,
 		"TestTeamsListenFalseRecoversExpiredAmbiguousOutboxWithoutPost": true,
+		// This test observes asynchronous durable completion. A broad package
+		// shard can delay the final JSON writer past the test's safety budget even
+		// though the cancellation transition itself is correct.
+		"TestBridgeMachineDelegationWorkerCancelsRunningExecution": true,
 	},
 	"./internal/teams/store": {
+		// These tests deliberately observe the first phase of a SQLite
+		// compatibility/fallback operation.  Their correctness depends on a
+		// short hook/legacy-lane window, so broad race-shard I/O must not turn a
+		// healthy operation into a false readiness or budget failure.
+		"TestSQLiteHotPollCorruptProbeRejectsNonRFC3339Times": true,
+		// This corrupt-session witness must reach the bounded compatibility
+		// fallback before its two-second admission budget expires. A broad race
+		// shard can consume that budget in SQLite setup/I/O even though the
+		// production path is correctly fenced.
+		"TestSQLiteHotPollCorruptSessionWithOpaquePollIsFencedAcrossReopen":                    true,
+		"TestSQLiteHotPollCanonicalFallbackReleasesStoreLockDuringRead":                        true,
+		"TestSQLiteHotPollStandaloneCanonicalFallbackReleasesStoreLockDuringRead":              true,
+		"TestSQLiteInterruptedOutboxProjectionAuditLeavesAuditingAndCanResume":                 true,
 		"TestSQLiteHotPollAdmissionBoundsSemanticallyMalformedPollLaneAndPreservesHealthyChat": true,
+		"TestSQLiteHotPollAdmissionBoundsMalformedPollLaneAndPreservesHealthyChat":             true,
 		"TestSQLiteSemanticallyMalformedOutboxRowsDoNotHideHealthyWork":                        true,
 		"TestSQLiteHotPollWorkCandidatesRotateOperationalRowsBeyondLimit":                      true,
+		// These tests observe page-boundary SQLite scheduling/heartbeat behavior;
+		// broad race shards can make their finite hook windows expire before the
+		// production code reaches the boundary.
+		"TestSQLiteHotPollAdmissionQuarantinesStructurallyEmptyPendingPage":          true,
+		"TestSQLiteLegacyHistoryGateCleanupReleasesBetweenPages":                     true,
+		"TestEarlierUnsentOutboxKeepsSameTurnAmbiguousPredecessor":                   true,
+		"TestSQLiteStoreCloseReleasesStateLockForImmediateReopen":                    true,
+		"TestSQLiteOutboxPostSendEffectsBackfillYieldsToOwnerHeartbeat":              true,
+		"TestRecordOwnerHeartbeatDoesNotWaitBehindFullStateUpdate":                   true,
+		"TestRecordOwnerHeartbeatUsesDedicatedRuntimeConnectionDuringForegroundRead": true,
+		"TestSQLiteMalformedCanonicalCheckpointIsIsolatedFromScopedReads":            true,
+		"TestSQLiteUntrustedOutboxFIFOFallbackIsBoundedAndFailClosed":                true,
+		"TestSQLiteUntrustedOutboxFIFOFallbackDoesNotHoldStateLock":                  true,
 		// This cross-backend owner-fencing test migrates a file-backed store to
 		// SQLite. On Windows, modernc SQLite may block in FlushFileBuffers when
 		// unrelated store shards share the hosted runner. Keep the migration
@@ -128,7 +214,28 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		// This cross-backend legacy-owner test performs the same durable lease
 		// migration and can spend its whole short budget in a Windows SQLite
 		// commit. Keep its two backend assertions in a clean process as well.
-		"TestStoreOwnerBindsLegacyQueuedTurnAndRejectsPreviousOwnerCallbacks": true,
+		"TestStoreOwnerBindsLegacyQueuedTurnAndRejectsPreviousOwnerCallbacks":            true,
+		"TestStoreOwnerBoundOutboxAdmissionRejectsStaleOwnerAcrossBackends":              true,
+		"TestSQLiteHotPollAdmissionAdmitsMalformedPollWithoutStarvingHealthyChat":        true,
+		"TestSQLiteHotPollReadyScheduleSkipsMalformedOperationalPrefix":                  true,
+		"TestSQLiteLegacyEmptyRuntimeProjectionBootstrapsOnceForHotPoll":                 true,
+		"TestSQLiteMalformedNumericCompatibilityColumnsDoNotAbortRecovery":               true,
+		"TestSQLiteHotPollTrustedWorkCandidatesContinuesPastInvalidPage":                 true,
+		"TestSQLiteHotPollAdmissionUsesJSONFrontierHonorsBlockedUntilAndReservesControl": true,
+		"TestSQLiteHotPollAdmissionDoesNotLetStaleOrdinaryHintStarveDueChat":             true,
+		"TestSQLiteHotPollAdmissionReconcilesDueOrdinaryBehindOperationalHintPrefix":     true,
+		"TestSQLiteHotPollWorkAdmissionRecoversStaleProjectionGeneration":                true,
+		"TestSQLiteActiveJSONSessionSurvivesStaleSQLStatus":                              true,
+		// These tests observe a bounded compatibility fallback or an explicit
+		// audit/heartbeat handoff. Keep their short wall-clock assertions away
+		// from broad race-shard I/O.
+		"TestSQLiteNullableTeamsMessageProjectionDoesNotHideUnknownOutbox":           true,
+		"TestSQLiteOutboxProjectionPreparationDoesNotStarveOwnerHeartbeat":           true,
+		"TestSQLiteHotPollReadGateCanonicalFallbackKeepsLocalReceiptWithStaleScalar": true,
+		"TestSQLiteOutboxProjectionGuardRevokesNativeTrust":                          true,
+		"TestSQLiteOwnerMigrationRejectsSourceChangeBeforePointerPublication":        true,
+		"TestSQLiteOwnerOutboxProjectionAuditClaimTokenFencesTakeoverOverlap":        true,
+		"TestSQLiteFullAcceptedOutboxCASRecoversAfterCapacityReturns":                true,
 	},
 }
 
@@ -149,50 +256,116 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestProxyStartBackgroundReapsExitedDetachedChild":                      true,
 		"TestStartCodexAppProxyDaemonReapsExitedDetachedChild":                  true,
 	},
+	"./internal/helperruntime": {
+		"TestRuntimeProcessIdentityWindows": true,
+	},
 	"./internal/tui": {
 		"TestSelectSessionAutoRefreshUpdatesThreadNameTitle": true,
 	},
 	"./internal/teams": {
+		"TestBridgePollOnceDispositionsOnlyCorruptDurableSession":                true,
+		"TestBridgeLinkedTranscriptConcurrentSQLiteSyncPublishesExactlyOnce":     true,
+		"TestTeamsMainLoopAllowsDistinctTurnPastProtectedAmbiguousPredecessor":   true,
+		"TestBridgeContinuousListenKeepsOwnerForPersistentPollFailure":           true,
+		"TestGlobalInboundSQLiteWriterDefersPruneUntilClose":                     true,
+		"TestPollFrontierLongRotatingContinuationStopsAtDurablePageBudget":       true,
+		"TestTeamsListenFalseAccountRead429RecoversWithoutManualStateChange":     true,
+		"TestTeamsListenFalseSQLiteOperationalFloodPreservesHealthyOrdinaryChat": true,
+		"TestTeamsActiveOutboxPredecessorUsesShortRetryGateSQLite":               true,
+		"TestTeamsAcceptedOutboxPredecessorUsesShortRetryGateSQLite":             true,
 		// These tests already run in their own process, but their first listener
 		// cycle is itself the assertion.  Do not start them beside other shard
 		// processes that can consume the hosted runner before Graph admission.
-		"TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle":               true,
-		"TestTeamsListenFalseSlowInboundMutationDoesNotConsumeDurableCleanupGrace": true,
-		"TestTeamsListenFalseGraphWorkerSaturationPreservesHealthyPoll":            true,
-		"TestTeamsListenFalseGraphHeadFailureDoesNotStarveHealthyTail":             true,
-		"TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage":      true,
-		"TestTeamsListenFalseHistoryWatchFullPoolDoesNotStarveHealthyTail":         true,
-		"TestTeamsListenFalseLinkedTranscriptFullPoolDoesNotStarveHealthyTail":     true,
-		"TestTeamsListenFalseUsesConfiguredRunnerStreaming":                        true,
-		"TestTeamsListenFalseSQLiteTranscriptBacklogProgresses":                    true,
-		"TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover":      true,
-		"TestTeamsListenFalsePollContinuationSurvivesReopenBeforeDrain":            true,
-		"TestTeamsListenFalseShutdownDoesNotRunAsyncTurnFollowupAfterGrace":        true,
-		"TestTeamsListenFalseOwnerLossCancelsHistoryWatchBeforeStaleCommit":        true,
-		"TestTeamsListenFalseOwnerLossFencesCooperativeTurn":                       true,
-		"TestTeamsListenFalseRecoversExpiredAmbiguousOutboxWithoutPost":            true,
-		"TestTeamsListenFalseStartupHeartbeatProtectsSlowInitialization":           true,
-		"TestTeamsListenFalseMalformedPollDoesNotBlockHealthyChat":                 true,
-		"TestBridgeSyncLinkedTranscriptReleasesPendingRootAcrossSQLiteStoreReopen": true,
-		"TestTeamsOwnershipStressTranscriptCatchupWhileTUIContinuesCI":             true,
-		"TestTeamsOwnershipStressFifthChatReachesNextWorkerWaveCI":                 true,
-		"TestTeamsOutboxAcceptedResponseFinishesAfterPhaseDeadline":                true,
+		"TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle":                     true,
+		"TestTeamsListenFalseSlowInboundMutationDoesNotConsumeDurableCleanupGrace":       true,
+		"TestTeamsListenFalseGraphWorkerSaturationPreservesHealthyPoll":                  true,
+		"TestTeamsListenFalseGraphHeadFailureDoesNotStarveHealthyTail":                   true,
+		"TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage":            true,
+		"TestBridgeMainLoopOutboxFlushUsesSmallBudget":                                   true,
+		"TestTeamsListenFalseHistoryWatchFullPoolDoesNotStarveHealthyTail":               true,
+		"TestTeamsListenFalseLinkedTranscriptFullPoolDoesNotStarveHealthyTail":           true,
+		"TestTeamsListenFalseUntrustedSQLiteLeaseHoldsAndRecovers":                       true,
+		"TestTeamsListenFalseUsesConfiguredRunnerStreaming":                              true,
+		"TestTeamsListenFalseSQLiteTranscriptBacklogProgresses":                          true,
+		"TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover":            true,
+		"TestTeamsListenFalsePollContinuationSurvivesReopenBeforeDrain":                  true,
+		"TestTeamsListenFalseShutdownDoesNotRunAsyncTurnFollowupAfterGrace":              true,
+		"TestTeamsListenFalseOwnerLossCancelsHistoryWatchBeforeStaleCommit":              true,
+		"TestTeamsListenFalseOwnerLossFencesCooperativeTurn":                             true,
+		"TestTeamsListenFalseRecoversExpiredAmbiguousOutboxWithoutPost":                  true,
+		"TestTeamsListenFalseStartupHeartbeatProtectsSlowInitialization":                 true,
+		"TestTeamsListenFalseMalformedPollDoesNotBlockHealthyChat":                       true,
+		"TestBridgeSyncLinkedTranscriptReleasesPendingRootAcrossSQLiteStoreReopen":       true,
+		"TestBridgeSyncLinkedTranscriptPersistsHistoryQuarantineWithLegacyGeneration":    true,
+		"TestBridgeIdleWorkChatAutoParkSweeperProcessesOneSQLiteCandidatePerInterval":    true,
+		"TestBridgeIdleWorkChatAutoParkSweeperDrainsIdleContinuationThenParksAndResumes": true,
+		"TestTeamsOwnershipStressTranscriptCatchupWhileTUIContinuesCI":                   true,
+		"TestTeamsOwnershipStressFifthChatReachesNextWorkerWaveCI":                       true,
+		"TestTeamsOutboxAcceptedResponseFinishesAfterPhaseDeadline":                      true,
+		"TestTeamsOutboxPredecessorMutationRefreshesFIFOSnapshotSQLite":                  true,
 		// These outbox regressions exercise durable SQLite/file boundaries in
 		// addition to fairness. Keep the process isolated and serialize it on the
 		// hosted runner so unrelated shard I/O cannot turn the durable assertion
 		// into another readiness tail.
-		"TestTeamsMainLoopOutboxFairnessBypassesPersistentGraphFailurePrefix":  true,
-		"TestTeamsMainLoopOutboxFairnessCursorWalksPastDistinctChatScanPrefix": true,
-		"TestTeamsMainLoopOutboxFairnessWalksPastDistinctChatScanPrefix":       true,
-		"TestTeamsMainLoopOutboxLedgerFailureDoesNotStarveHealthyTail":         true,
-		"TestTeamsUnresolvedTranscriptOutboxDoesNotLivelockHealthyTail":        true,
+		"TestTeamsMainLoopOutboxFairnessBypassesPersistentGraphFailurePrefix":            true,
+		"TestTeamsMainLoopOutboxFairnessCursorWalksPastDistinctChatScanPrefix":           true,
+		"TestTeamsMainLoopOutboxFairnessWalksPastDistinctChatScanPrefix":                 true,
+		"TestTeamsMainLoopOutboxRotatesBeyondFirstTwoChats":                              true,
+		"TestTeamsMainLoopOutboxLedgerFailureDoesNotStarveHealthyTail":                   true,
+		"TestBridgeAttachmentUploadSession429RecordsWriteGateWithoutReplay":              true,
+		"TestTeamsUnresolvedTranscriptOutboxDoesNotLivelockHealthyTail":                  true,
+		"TestTeamsSameChatDefinitiveSendFailureDoesNotStarveLaterOutbox":                 true,
+		"TestSendQueuedOutboxFallsBackToControlMentionAfterDefiniteWebhookFailureSQLite": true,
+		// These matrices perform a long sequence of durable listener/control
+		// operations. Keep them away from unrelated shard processes so hosted
+		// scheduler and filesystem pressure cannot turn the service-hook
+		// readiness assertion into a false failure.
+		"TestCXPPerfModelExternalScenariosCoverCommonPaths":       true,
+		"TestCXPPerfModelSQLiteExternalScenariosCoverCommonPaths": true,
+		// This asynchronous durable completion check must run without other
+		// package processes consuming the hosted runner's short observation window.
+		"TestBridgeMachineDelegationWorkerCancelsRunningExecution": true,
 	},
 	"./internal/teams/store": {
+		"TestSQLiteHotPollCorruptProbeRejectsNonRFC3339Times":                                  true,
+		"TestSQLiteHotPollCorruptSessionWithOpaquePollIsFencedAcrossReopen":                    true,
+		"TestSQLiteHotPollCanonicalFallbackReleasesStoreLockDuringRead":                        true,
+		"TestSQLiteHotPollStandaloneCanonicalFallbackReleasesStoreLockDuringRead":              true,
+		"TestSQLiteInterruptedOutboxProjectionAuditLeavesAuditingAndCanResume":                 true,
 		"TestSQLiteHotPollAdmissionBoundsSemanticallyMalformedPollLaneAndPreservesHealthyChat": true,
+		"TestSQLiteHotPollAdmissionBoundsMalformedPollLaneAndPreservesHealthyChat":             true,
 		"TestSQLiteSemanticallyMalformedOutboxRowsDoNotHideHealthyWork":                        true,
 		"TestSQLiteHotPollWorkCandidatesRotateOperationalRowsBeyondLimit":                      true,
 		"TestStoreHistoryWatchOwnerCapabilityFencesTakeoverAcrossBackends":                     true,
 		"TestStoreOwnerBindsLegacyQueuedTurnAndRejectsPreviousOwnerCallbacks":                  true,
+		"TestStoreOwnerBoundOutboxAdmissionRejectsStaleOwnerAcrossBackends":                    true,
+		"TestSQLiteHotPollAdmissionAdmitsMalformedPollWithoutStarvingHealthyChat":              true,
+		"TestSQLiteHotPollReadyScheduleSkipsMalformedOperationalPrefix":                        true,
+		"TestSQLiteLegacyEmptyRuntimeProjectionBootstrapsOnceForHotPoll":                       true,
+		"TestSQLiteMalformedNumericCompatibilityColumnsDoNotAbortRecovery":                     true,
+		"TestSQLiteHotPollTrustedWorkCandidatesContinuesPastInvalidPage":                       true,
+		"TestSQLiteHotPollAdmissionUsesJSONFrontierHonorsBlockedUntilAndReservesControl":       true,
+		"TestSQLiteHotPollAdmissionQuarantinesStructurallyEmptyPendingPage":                    true,
+		"TestSQLiteLegacyHistoryGateCleanupReleasesBetweenPages":                               true,
+		"TestSQLiteOutboxPostSendEffectsBackfillYieldsToOwnerHeartbeat":                        true,
+		"TestRecordOwnerHeartbeatDoesNotWaitBehindFullStateUpdate":                             true,
+		"TestRecordOwnerHeartbeatUsesDedicatedRuntimeConnectionDuringForegroundRead":           true,
+		"TestSQLiteMalformedCanonicalCheckpointIsIsolatedFromScopedReads":                      true,
+		"TestSQLiteUntrustedOutboxFIFOFallbackIsBoundedAndFailClosed":                          true,
+		"TestSQLiteUntrustedOutboxFIFOFallbackDoesNotHoldStateLock":                            true,
+		"TestSQLiteHotPollAdmissionDoesNotLetStaleOrdinaryHintStarveDueChat":                   true,
+		"TestSQLiteHotPollAdmissionReconcilesDueOrdinaryBehindOperationalHintPrefix":           true,
+		"TestSQLiteHotPollWorkAdmissionRecoversStaleProjectionGeneration":                      true,
+		"TestSQLiteNullableTeamsMessageProjectionDoesNotHideUnknownOutbox":                     true,
+		"TestSQLiteOutboxProjectionPreparationDoesNotStarveOwnerHeartbeat":                     true,
+		"TestSQLiteHotPollReadGateCanonicalFallbackKeepsLocalReceiptWithStaleScalar":           true,
+		"TestSQLiteOutboxProjectionGuardRevokesNativeTrust":                                    true,
+		"TestSQLiteOwnerMigrationRejectsSourceChangeBeforePointerPublication":                  true,
+		"TestSQLiteOwnerOutboxProjectionAuditClaimTokenFencesTakeoverOverlap":                  true,
+		"TestSQLiteFullAcceptedOutboxCASRecoversAfterCapacityReturns":                          true,
+		"TestSQLiteActiveJSONSessionSurvivesStaleSQLStatus":                                    true,
+		"TestEarlierUnsentOutboxKeepsSameTurnAmbiguousPredecessor":                             true,
+		"TestSQLiteStoreCloseReleasesStateLockForImmediateReopen":                              true,
 	},
 }
 
@@ -242,6 +415,7 @@ func main() {
 	testTimeout := flag.Duration("timeout", 20*time.Minute, "per-shard go test timeout")
 	race := flag.Bool("race", false, "pass -race to go test")
 	listOnly := flag.Bool("list-only", false, "print the plan without executing tests")
+	listAllPartitions := flag.Bool("list-all-partitions", false, "with -list-only, print the complete plan and every partition plan in one discovery pass")
 	partitionCount := flag.Int("partition-count", 1, "number of independent hosted-runner partitions")
 	partitionIndex := flag.Int("partition-index", 0, "zero-based hosted-runner partition index")
 	var requestedPackages stringList
@@ -263,6 +437,9 @@ func main() {
 	if *partitionIndex < 0 || *partitionIndex >= *partitionCount {
 		fatal(fmt.Errorf("partition-index %d is outside partition-count %d", *partitionIndex, *partitionCount))
 	}
+	if *listAllPartitions && !*listOnly {
+		fatal(errors.New("list-all-partitions requires list-only"))
+	}
 
 	packages := []string(requestedPackages)
 	if len(packages) == 0 {
@@ -277,18 +454,21 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
+	if *listOnly && *listAllPartitions {
+		printTestJobs("complete", jobs)
+		for partitionIndex := 0; partitionIndex < *partitionCount; partitionIndex++ {
+			partitionJobs := append([]testJob(nil), jobs...)
+			partitionJobs = partitionTestJobs(partitionJobs, *partitionCount, partitionIndex)
+			printTestJobs(fmt.Sprintf("partition-%d", partitionIndex), partitionJobs)
+		}
+		return
+	}
 	jobs = partitionTestJobs(jobs, *partitionCount, *partitionIndex)
 	if len(jobs) == 0 {
 		fatal(fmt.Errorf("partition %d/%d selected no test jobs", *partitionIndex+1, *partitionCount))
 	}
 	if *listOnly {
-		for _, job := range jobs {
-			fmt.Printf("%s: go", job.label)
-			for _, arg := range job.args {
-				fmt.Printf(" %q", arg)
-			}
-			fmt.Printf(" # estimated-weight=%d estimated-exclusive=%t\n", job.weight, job.exclusive)
-		}
+		printTestJobs("", jobs)
 		return
 	}
 
@@ -306,6 +486,19 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Printf("full test shards passed: %d job(s)\n", len(jobs))
+}
+
+func printTestJobs(planName string, jobs []testJob) {
+	if planName != "" {
+		fmt.Printf("plan %s:\n", planName)
+	}
+	for _, job := range jobs {
+		fmt.Printf("%s: go", job.label)
+		for _, arg := range job.args {
+			fmt.Printf(" %q", arg)
+		}
+		fmt.Printf(" # estimated-weight=%d estimated-exclusive=%t\n", job.weight, job.exclusive)
+	}
 }
 
 // partitionTestJobs assigns complete test processes to independent hosted
@@ -627,6 +820,9 @@ func isolatedRunnableNamesForPackage(packageName string) map[string]bool {
 	if strings.HasSuffix(packageName, "/internal/cli") {
 		return isolatedRunnableNames["./internal/cli"]
 	}
+	if strings.HasSuffix(packageName, "/internal/helperruntime") {
+		return isolatedRunnableNames["./internal/helperruntime"]
+	}
 	if strings.HasSuffix(packageName, "/internal/teams/store") {
 		return isolatedRunnableNames["./internal/teams/store"]
 	}
@@ -724,6 +920,9 @@ func exclusiveRunnableNamesForPackage(packageName string) map[string]bool {
 	}
 	if strings.HasSuffix(packageName, "/internal/cli") {
 		return exclusiveRunnableNames["./internal/cli"]
+	}
+	if strings.HasSuffix(packageName, "/internal/helperruntime") {
+		return exclusiveRunnableNames["./internal/helperruntime"]
 	}
 	if strings.HasSuffix(packageName, "/internal/teams/store") {
 		return exclusiveRunnableNames["./internal/teams/store"]

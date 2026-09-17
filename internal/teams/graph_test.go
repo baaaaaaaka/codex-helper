@@ -148,6 +148,55 @@ func TestGraphStatusErrorIncludesSafeMessage(t *testing.T) {
 	}
 }
 
+func TestGraphStatusErrorRetainsExplicitRateLimitScopeOnly(t *testing.T) {
+	accountHeader := make(http.Header)
+	accountHeader.Set("X-CXP-RateLimit-Scope", "account")
+	account := graphStatusError(http.MethodGet, "/chats/chat-a/messages", &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+		Header:     accountHeader,
+	}, []byte(`{"error":{"code":"TooManyRequests","message":"account throttle"}}`))
+	var accountErr *GraphStatusError
+	if !errors.As(account, &accountErr) || accountErr.RateLimitScope != "account" {
+		t.Fatalf("account-scoped Graph error = %#v, want explicit account scope", accountErr)
+	}
+	if !graphRateLimitScopeIsAccountWide(accountErr.RateLimitScope) {
+		t.Fatal("explicit account scope was not recognized as account-wide")
+	}
+
+	bare := graphStatusError(http.MethodGet, "/chats/chat-b/messages", &http.Response{
+		StatusCode: http.StatusTooManyRequests,
+	}, []byte(`{"error":{"code":"TooManyRequests","message":"chat throttle"}}`))
+	var bareErr *GraphStatusError
+	if !errors.As(bare, &bareErr) || bareErr.RateLimitScope != "" {
+		t.Fatalf("bare Graph 429 = %#v, want no inferred scope", bareErr)
+	}
+	if graphRateLimitScopeIsAccountWide(bareErr.RateLimitScope) {
+		t.Fatal("bare Graph 429 was incorrectly promoted to an account-wide gate")
+	}
+	for _, scope := range []string{"tenant", "user"} {
+		header := make(http.Header)
+		header.Set("X-CXP-RateLimit-Scope", scope)
+		err := graphStatusError(http.MethodGet, "/chats/chat-scope/messages", &http.Response{
+			StatusCode: http.StatusTooManyRequests,
+			Header:     header,
+		}, nil)
+		var scopedErr *GraphStatusError
+		if !errors.As(err, &scopedErr) || scopedErr.RateLimitScope != "" {
+			t.Fatalf("unsupported scope %q was retained as %q; gate has no durable identity", scope, scopedErr.RateLimitScope)
+		}
+	}
+	for _, scope := range []string{"tenant", "user", "workspace", " account-local "} {
+		if graphRateLimitScopeIsAccountWide(scope) {
+			t.Fatalf("scope %q was incorrectly treated as account-wide", scope)
+		}
+	}
+	for _, scope := range []string{"account", "ACCOUNT", " global "} {
+		if !graphRateLimitScopeIsAccountWide(scope) {
+			t.Fatalf("scope %q was not treated as account-wide", scope)
+		}
+	}
+}
+
 func TestGraphStatusErrorDropsSensitiveMessage(t *testing.T) {
 	err := graphStatusError(http.MethodGet, "/me", &http.Response{StatusCode: http.StatusServiceUnavailable}, []byte(`{"error":{"code":"ServiceUnavailable","message":"secret bearer raw-token should not be shown"}}`))
 	var graphErr *GraphStatusError
@@ -162,6 +211,250 @@ func TestGraphStatusErrorDropsSensitiveMessage(t *testing.T) {
 	}
 	if got := err.Error(); strings.Contains(got, "secret") || strings.Contains(got, "raw-token") || strings.Contains(got, "bearer") {
 		t.Fatalf("Graph error leaked sensitive message: %s", got)
+	}
+}
+
+func TestGraphBeforeFirstRequestContextFenceStopsPost(t *testing.T) {
+	auth := &fakeGraphAuth{token: "access"}
+	requests := 0
+	graph := &GraphClient{
+		auth: auth,
+		client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			requests++
+			return jsonResponse(http.StatusOK, `{"id":"unexpected"}`), nil
+		})},
+		baseURL:    "https://graph.example.test",
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	preflightErr := errors.New("owner lease was taken over")
+	ctx := withGraphBeforeFirstRequest(context.Background(), func() error { return preflightErr })
+	if _, err := graph.SendHTMLWithoutRateLimitRetry(ctx, "chat-fenced", "must not post"); !errors.Is(err, preflightErr) {
+		t.Fatalf("fenced Graph send error = %v, want preflight error", err)
+	}
+	if requests != 0 {
+		t.Fatalf("fenced Graph send issued %d HTTP request(s), want zero", requests)
+	}
+}
+
+func TestGraphBeforeFirstRequestContextFenceRechecksAfterTakeover(t *testing.T) {
+	auth := &fakeGraphAuth{token: "access"}
+	requests := 0
+	graph := &GraphClient{
+		auth: auth,
+		client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			requests++
+			return jsonResponse(http.StatusOK, `{"id":"unexpected"}`), nil
+		})},
+		baseURL:    "https://graph.example.test",
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	takenOver := false
+	ctx := withGraphBeforeFirstRequest(context.Background(), func() error {
+		close(entered)
+		<-release
+		if takenOver {
+			return errors.New("owner lease was taken over")
+		}
+		return nil
+	})
+	done := make(chan error, 1)
+	go func() {
+		_, err := graph.SendHTMLWithoutRateLimitRetry(ctx, "chat-fenced", "must not post")
+		done <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Graph send did not reach the last pre-request fence")
+	}
+	takenOver = true
+	close(release)
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "owner lease was taken over") {
+			t.Fatalf("fenced Graph send error = %v, want takeover fence", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Graph send did not finish after takeover fence")
+	}
+	if requests != 0 {
+		t.Fatalf("takeover-fenced Graph send issued %d HTTP request(s), want zero", requests)
+	}
+}
+
+func TestGraphBeforeEachRequestFenceStopsRetryBeforeSecondHTTPAttempt(t *testing.T) {
+	auth := &fakeGraphAuth{token: "access"}
+	attempts := 0
+	fenceCalls := 0
+	graph := &GraphClient{
+		auth: auth,
+		client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			attempts++
+			return jsonResponse(http.StatusServiceUnavailable, `{}`), nil
+		})},
+		baseURL:    "https://graph.example.test",
+		maxRetries: 1,
+		backoffMin: time.Millisecond,
+		backoffMax: time.Millisecond,
+		sleep:      func(context.Context, time.Duration) error { return nil },
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	err := graph.doWithOptions(context.Background(), http.MethodGet, "/me", nil, nil, graphRequestOptions{
+		beforeEachRequest: func() error {
+			fenceCalls++
+			if fenceCalls == 2 {
+				return errors.New("owner lease was taken over")
+			}
+			return nil
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "owner lease was taken over") {
+		t.Fatalf("Graph retry fence error = %v, want owner takeover fence", err)
+	}
+	if attempts != 1 || fenceCalls != 2 {
+		t.Fatalf("HTTP attempts=%d fence calls=%d, want 1 HTTP attempt and 2 fence calls", attempts, fenceCalls)
+	}
+}
+
+func TestGraphBeforeEachRequestContextFenceStopsRetryBeforeSecondHTTPAttempt(t *testing.T) {
+	auth := &fakeGraphAuth{token: "access"}
+	attempts := 0
+	fenceCalls := 0
+	graph := &GraphClient{
+		auth: auth,
+		client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			attempts++
+			return jsonResponse(http.StatusServiceUnavailable, `{}`), nil
+		})},
+		baseURL:    "https://graph.example.test",
+		maxRetries: 1,
+		backoffMin: time.Millisecond,
+		backoffMax: time.Millisecond,
+		sleep:      func(context.Context, time.Duration) error { return nil },
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	ctx := withGraphBeforeEachRequest(context.Background(), func() error {
+		fenceCalls++
+		if fenceCalls == 2 {
+			return errors.New("account read gate was installed")
+		}
+		return nil
+	})
+	err := graph.doWithOptions(ctx, http.MethodGet, "/me", nil, nil, graphRequestOptions{})
+	if err == nil || !strings.Contains(err.Error(), "account read gate was installed") {
+		t.Fatalf("context Graph retry fence error = %v, want gate fence", err)
+	}
+	if attempts != 1 || fenceCalls != 2 {
+		t.Fatalf("HTTP attempts=%d fence calls=%d, want 1 HTTP attempt and 2 context fence calls", attempts, fenceCalls)
+	}
+}
+
+func TestGraphAttachmentPostFenceStopsBeforeHTTP(t *testing.T) {
+	requests := 0
+	graph := &GraphClient{
+		auth: &fakeGraphAuth{token: "access"},
+		client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			requests++
+			return jsonResponse(http.StatusOK, `{"id":"unexpected"}`), nil
+		})},
+		baseURL:    "https://graph.example.test",
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	ownerErr := errors.New("owner lease was taken over")
+	_, err := graph.sendDriveItemAttachmentWithProvenanceAndOptions(context.Background(), "chat-fenced", DriveItem{
+		ID: "drive-item-1", Name: "fenced.txt", WebURL: "https://files.example.test/fenced.txt", ETag: `"{1176C944-0CB9-4304-974C-5837185EFD6A},1"`,
+	}, "must not post", "outbox:fenced", graphRequestOptions{
+		beforeEachRequest: func() error { return ownerErr },
+	})
+	if err == nil || !errors.Is(err, ownerErr) {
+		t.Fatalf("fenced attachment POST error = %v, want owner takeover fence", err)
+	}
+	if requests != 0 {
+		t.Fatalf("fenced attachment POST issued %d HTTP request(s), want zero", requests)
+	}
+}
+
+func TestGraphUploadSessionChunkFenceStopsBeforeNextChunk(t *testing.T) {
+	var posts, puts int
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost:
+			posts++
+			_, _ = fmt.Fprintf(w, `{"uploadUrl":%q}`, server.URL+"/upload-session")
+		case r.Method == http.MethodPut && r.URL.Path == "/upload-session":
+			puts++
+			if _, err := io.Copy(io.Discard, r.Body); err != nil {
+				t.Fatalf("read upload chunk: %v", err)
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = fmt.Fprint(w, `{"nextExpectedRanges":["4-"]}`)
+		default:
+			t.Fatalf("unexpected upload request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	filePath := filepath.Join(t.TempDir(), "fenced.bin")
+	if err := os.WriteFile(filePath, []byte("01234567"), 0o600); err != nil {
+		t.Fatalf("write upload fixture: %v", err)
+	}
+	checks := 0
+	graph := newTestGraphClient(&fakeGraphAuth{token: "access"}, server, nil)
+	graph.singlePutMaxBytes = 1
+	graph.transferChunkSize = 4
+	graph.transferMaxRetries = 0
+	_, err := graph.uploadDriveItemFromFileWithCheckpoint(context.Background(), "folder", "fenced.bin", filePath, 8, "application/octet-stream", graphRequestOptions{
+		beforeEachRequest: func() error {
+			checks++
+			if checks == 3 {
+				return errors.New("owner lease was taken over")
+			}
+			return nil
+		},
+	}, nil, nil)
+	if err == nil || !strings.Contains(err.Error(), "owner lease was taken over") {
+		t.Fatalf("fenced upload error = %v, want owner takeover fence", err)
+	}
+	if posts != 1 || puts != 1 || checks != 3 {
+		t.Fatalf("requests posts=%d puts=%d fenceChecks=%d, want 1/1/3", posts, puts, checks)
+	}
+}
+
+func TestGraphUploadSessionStatusFenceStopsBeforeStatusGET(t *testing.T) {
+	var statusGets int
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		statusGets++
+		t.Fatalf("status request crossed owner fence: %s %s", r.Method, r.URL.String())
+	}))
+	defer server.Close()
+
+	filePath := filepath.Join(t.TempDir(), "status-fenced.bin")
+	if err := os.WriteFile(filePath, []byte("01234567"), 0o600); err != nil {
+		t.Fatalf("write upload fixture: %v", err)
+	}
+	graph := newTestGraphClient(&fakeGraphAuth{token: "access"}, server, nil)
+	graph.singlePutMaxBytes = 1
+	graph.transferChunkSize = 4
+	graph.transferMaxRetries = 0
+	_, err := graph.uploadDriveItemFromFileWithCheckpoint(context.Background(), "folder", "status-fenced.bin", filePath, 8, "application/octet-stream", graphRequestOptions{
+		beforeEachRequest: func() error { return errors.New("owner lease was taken over") },
+	}, &driveUploadSessionCheckpoint{UploadURL: server.URL + "/upload-session", Offset: 0}, nil)
+	if err == nil || !strings.Contains(err.Error(), "owner lease was taken over") {
+		t.Fatalf("fenced status query error = %v, want owner takeover fence", err)
+	}
+	if statusGets != 0 {
+		t.Fatalf("fenced status query issued %d HTTP request(s), want zero", statusGets)
 	}
 }
 
@@ -272,6 +565,18 @@ func TestGraphRetriesTooManyRequestsAfterHTTPDateRetryAfter(t *testing.T) {
 	}
 	if len(sleeps) != 1 || sleeps[0] <= 0 || sleeps[0] > 3*time.Second {
 		t.Fatalf("unexpected HTTP-date retry sleep: %v", sleeps)
+	}
+}
+
+func TestRetryAfterClampsFarFutureProviderValues(t *testing.T) {
+	for _, value := range []string{
+		"9223372036854775807",
+		time.Now().Add(48 * time.Hour).UTC().Format(http.TimeFormat),
+	} {
+		got := retryAfter(value)
+		if got <= 0 || got > time.Hour {
+			t.Fatalf("retryAfter(%q) = %v, want a positive delay no greater than 1h", value, got)
+		}
 	}
 }
 
@@ -1884,6 +2189,206 @@ func TestGraphUploadDriveItemFromFilePersistsSessionCheckpoint(t *testing.T) {
 	}
 }
 
+func TestGraphUploadDriveItemFromFileRetriesSameDurableSessionAfterChunk429(t *testing.T) {
+	var posts, statusGets, puts int
+	var checkpoints []driveUploadSessionCheckpoint
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/createUploadSession"):
+			posts++
+			_, _ = fmt.Fprintf(w, `{"uploadUrl":%q,"expirationDateTime":%q}`, server.URL+"/upload-session", time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano))
+		case r.Method == http.MethodGet && r.URL.Path == "/upload-session":
+			statusGets++
+			_, _ = fmt.Fprint(w, `{"nextExpectedRanges":["0-"]}`)
+		case r.Method == http.MethodPut && r.URL.Path == "/upload-session":
+			puts++
+			if _, err := io.Copy(io.Discard, r.Body); err != nil {
+				t.Fatalf("read upload chunk: %v", err)
+			}
+			if puts == 1 {
+				w.Header().Set("Retry-After", "60")
+				http.Error(w, `{"error":{"code":"TooManyRequests","message":"chunk throttle"}}`, http.StatusTooManyRequests)
+				return
+			}
+			_, _ = fmt.Fprint(w, `{"id":"item-after-chunk-429","name":"chunk-429.bin","size":8}`)
+		default:
+			t.Fatalf("unexpected upload request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	filePath := filepath.Join(t.TempDir(), "chunk-429.bin")
+	if err := os.WriteFile(filePath, []byte("01234567"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	graph := newTestGraphClient(&fakeGraphAuth{token: "access"}, server, nil)
+	graph.singlePutMaxBytes = 1
+	graph.transferChunkSize = 8
+	graph.transferMaxRetries = 0
+	graph.sleep = func(context.Context, time.Duration) error {
+		t.Fatal("durable upload-session 429 must return to the caller without sleeping")
+		return nil
+	}
+
+	_, firstErr := graph.uploadDriveItemFromFileWithCheckpoint(context.Background(), "folder", "chunk-429.bin", filePath, 8, "application/octet-stream", graphRequestOptions{returnRateLimitWithoutRetry: true}, nil, func(checkpoint driveUploadSessionCheckpoint) error {
+		checkpoints = append(checkpoints, checkpoint)
+		return nil
+	})
+	var rateLimitErr *uploadSessionRateLimitError
+	if firstErr == nil || !errors.As(firstErr, &rateLimitErr) || !isGraphRateLimitError(firstErr) {
+		t.Fatalf("first chunk 429 error = %v, want durable-session rate-limit error", firstErr)
+	}
+	if posts != 1 || puts != 1 || statusGets != 0 {
+		t.Fatalf("first chunk 429 requests: posts=%d puts=%d statusGets=%d, want 1/1/0", posts, puts, statusGets)
+	}
+	if len(checkpoints) != 1 || checkpoints[0].UploadURL != server.URL+"/upload-session" || checkpoints[0].Offset != 0 {
+		t.Fatalf("durable session checkpoint after chunk 429 = %#v, want one zero-offset witness", checkpoints)
+	}
+
+	item, err := graph.uploadDriveItemFromFileWithCheckpoint(context.Background(), "folder", "chunk-429.bin", filePath, 8, "application/octet-stream", graphRequestOptions{returnRateLimitWithoutRetry: true}, &checkpoints[0], nil)
+	if err != nil {
+		t.Fatalf("same-session retry after chunk 429: %v", err)
+	}
+	if item.ID != "item-after-chunk-429" || posts != 1 || puts != 2 || statusGets != 1 {
+		t.Fatalf("same-session retry item=%#v requests: posts=%d puts=%d statusGets=%d, want item/1/2/1", item, posts, puts, statusGets)
+	}
+}
+
+func TestGraphUploadDoesNotRecreateAfterDurableSessionThenChunk404Or410(t *testing.T) {
+	for _, status := range []int{http.StatusNotFound, http.StatusGone} {
+		t.Run(fmt.Sprintf("chunk_status_%d", status), func(t *testing.T) {
+			var posts, puts int
+			var server *httptest.Server
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/createUploadSession"):
+					posts++
+					_, _ = fmt.Fprintf(w, `{"uploadUrl":%q}`, server.URL+"/upload-session")
+				case r.Method == http.MethodPut && r.URL.Path == "/upload-session":
+					puts++
+					http.Error(w, `{"error":{"code":"uploadSessionGone"}}`, status)
+				default:
+					t.Fatalf("unexpected durable-session upload request: %s %s", r.Method, r.URL.String())
+				}
+			}))
+			defer server.Close()
+
+			filePath := filepath.Join(t.TempDir(), "durable-session.bin")
+			if err := os.WriteFile(filePath, []byte("01234567"), 0o600); err != nil {
+				t.Fatalf("write fixture: %v", err)
+			}
+			graph := newTestGraphClient(&fakeGraphAuth{token: "access"}, server, nil)
+			graph.singlePutMaxBytes = 1
+			graph.transferChunkSize = 8
+			graph.transferMaxRetries = 1
+			graph.sleep = func(context.Context, time.Duration) error { return nil }
+			var persisted []driveUploadSessionCheckpoint
+			_, err := graph.uploadDriveItemFromFileWithCheckpoint(context.Background(), "folder", "durable-session.bin", filePath, 8, "application/octet-stream", graphRequestOptions{}, nil, func(checkpoint driveUploadSessionCheckpoint) error {
+				persisted = append(persisted, checkpoint)
+				return nil
+			})
+			if err == nil || !errors.Is(err, errUploadSessionCheckpointIndeterminate) {
+				t.Fatalf("chunk %d after durable session error = %v, want indeterminate", status, err)
+			}
+			if posts != 1 || puts != 1 {
+				t.Fatalf("chunk %d after durable session requests: posts=%d puts=%d, want 1/1", status, posts, puts)
+			}
+			if len(persisted) != 1 || persisted[0].UploadURL != server.URL+"/upload-session" || persisted[0].Offset != 0 {
+				t.Fatalf("durable upload checkpoint = %#v, want one zero-offset witness", persisted)
+			}
+		})
+	}
+}
+
+func TestGraphUploadDoesNotRecreateAfter416StatusQuery404Or410(t *testing.T) {
+	for _, status := range []int{http.StatusNotFound, http.StatusGone} {
+		t.Run(fmt.Sprintf("status_query_%d", status), func(t *testing.T) {
+			var posts, puts, statusGets int
+			var server *httptest.Server
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/createUploadSession"):
+					posts++
+					_, _ = fmt.Fprintf(w, `{"uploadUrl":%q}`, server.URL+"/upload-session")
+				case r.Method == http.MethodPut && r.URL.Path == "/upload-session":
+					puts++
+					http.Error(w, `{"error":{"code":"invalidRange"}}`, http.StatusRequestedRangeNotSatisfiable)
+				case r.Method == http.MethodGet && r.URL.Path == "/upload-session":
+					statusGets++
+					http.Error(w, `{"error":{"code":"uploadSessionGone"}}`, status)
+				default:
+					t.Fatalf("unexpected 416 upload request: %s %s", r.Method, r.URL.String())
+				}
+			}))
+			defer server.Close()
+
+			filePath := filepath.Join(t.TempDir(), "range-session.bin")
+			if err := os.WriteFile(filePath, []byte("01234567"), 0o600); err != nil {
+				t.Fatalf("write fixture: %v", err)
+			}
+			graph := newTestGraphClient(&fakeGraphAuth{token: "access"}, server, nil)
+			graph.singlePutMaxBytes = 1
+			graph.transferChunkSize = 8
+			graph.transferMaxRetries = 1
+			graph.sleep = func(context.Context, time.Duration) error { return nil }
+			_, err := graph.uploadDriveItemFromFileWithCheckpoint(context.Background(), "folder", "range-session.bin", filePath, 8, "application/octet-stream", graphRequestOptions{}, nil, nil)
+			if err == nil || !errors.Is(err, errUploadSessionCheckpointIndeterminate) {
+				t.Fatalf("416 status query %d error = %v, want indeterminate", status, err)
+			}
+			if posts != 1 || puts != 1 || statusGets != 1 {
+				t.Fatalf("416 status query %d requests: posts=%d puts=%d gets=%d, want 1/1/1", status, posts, puts, statusGets)
+			}
+		})
+	}
+}
+
+func TestGraphUpload416StatusQuery429PreservesUploadRateLimit(t *testing.T) {
+	var posts, puts, statusGets int
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/createUploadSession"):
+			posts++
+			_, _ = fmt.Fprintf(w, `{"uploadUrl":%q}`, server.URL+"/upload-session")
+		case r.Method == http.MethodPut && r.URL.Path == "/upload-session":
+			puts++
+			http.Error(w, `{"error":{"code":"invalidRange"}}`, http.StatusRequestedRangeNotSatisfiable)
+		case r.Method == http.MethodGet && r.URL.Path == "/upload-session":
+			statusGets++
+			w.Header().Set("Retry-After", "17")
+			http.Error(w, `{"error":{"code":"tooManyRequests"}}`, http.StatusTooManyRequests)
+		default:
+			t.Fatalf("unexpected 416/429 upload request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	filePath := filepath.Join(t.TempDir(), "range-rate-limit.bin")
+	if err := os.WriteFile(filePath, []byte("01234567"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	graph := newTestGraphClient(&fakeGraphAuth{token: "access"}, server, nil)
+	graph.singlePutMaxBytes = 1
+	graph.transferChunkSize = 8
+	graph.transferMaxRetries = 0
+	_, err := graph.uploadDriveItemFromFileWithCheckpoint(context.Background(), "folder", "range-rate-limit.bin", filePath, 8, "application/octet-stream", graphRequestOptions{returnRateLimitWithoutRetry: true}, nil, nil)
+	var rateLimitErr *uploadSessionRateLimitError
+	if !errors.As(err, &rateLimitErr) {
+		t.Fatalf("416 followed by status-query 429 error=%v, want uploadSessionRateLimitError", err)
+	}
+	if errors.Is(err, errUploadSessionCheckpointIndeterminate) {
+		t.Fatalf("416 followed by status-query 429 became indeterminate: %v", err)
+	}
+	if posts != 1 || puts != 1 || statusGets != 1 {
+		t.Fatalf("416 followed by status-query 429 requests: posts=%d puts=%d gets=%d, want 1/1/1", posts, puts, statusGets)
+	}
+}
+
 func TestGraphUploadDriveItemFromFileResumesPersistedSessionCheckpoint(t *testing.T) {
 	var posts, statusGets, puts int
 	var persisted []driveUploadSessionCheckpoint
@@ -1944,6 +2449,198 @@ func TestGraphUploadDriveItemFromFileResumesPersistedSessionCheckpoint(t *testin
 	if len(persisted) != 2 || persisted[0].Offset != 4 || persisted[1].Offset != 8 {
 		t.Fatalf("persisted checkpoints = %#v, want offsets 4, 8", persisted)
 	}
+}
+
+func TestGraphUploadDriveItemFromFileDoesNotCreateSessionFromUnusableCheckpoint(t *testing.T) {
+	filePath := filepath.Join(t.TempDir(), "checkpoint-guard.bin")
+	if err := os.WriteFile(filePath, []byte("01234567"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+
+	cases := []struct {
+		name              string
+		checkpoint        func(string) driveUploadSessionCheckpoint
+		wantIndeterminate bool
+		wantStatusGet     bool
+	}{
+		{
+			name: "offset at end keeps existing session",
+			checkpoint: func(uploadURL string) driveUploadSessionCheckpoint {
+				return driveUploadSessionCheckpoint{UploadURL: uploadURL, Offset: 8}
+			},
+			wantStatusGet: true,
+		},
+		{
+			name: "offset beyond file fails closed",
+			checkpoint: func(uploadURL string) driveUploadSessionCheckpoint {
+				return driveUploadSessionCheckpoint{UploadURL: uploadURL, Offset: 9}
+			},
+			wantIndeterminate: true,
+		},
+		{
+			name: "malformed URL fails closed",
+			checkpoint: func(string) driveUploadSessionCheckpoint {
+				return driveUploadSessionCheckpoint{UploadURL: "not-a-url", Offset: 0}
+			},
+			wantIndeterminate: true,
+		},
+		{
+			name: "malformed expiry fails closed",
+			checkpoint: func(uploadURL string) driveUploadSessionCheckpoint {
+				return driveUploadSessionCheckpoint{UploadURL: uploadURL, ExpirationDateTime: "not-a-time", Offset: 0}
+			},
+			wantIndeterminate: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var posts, statusGets int
+			var server *httptest.Server
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch {
+				case r.Method == http.MethodPost:
+					posts++
+					t.Fatalf("unexpected createUploadSession POST after persisted checkpoint")
+				case r.Method == http.MethodGet && r.URL.Path == "/upload-session":
+					statusGets++
+					_, _ = fmt.Fprint(w, `{"nextExpectedRanges":["8-"]}`)
+				default:
+					t.Fatalf("unexpected upload request: %s %s", r.Method, r.URL.String())
+				}
+			}))
+			defer server.Close()
+
+			graph := newTestGraphClient(&fakeGraphAuth{token: "access"}, server, nil)
+			graph.singlePutMaxBytes = 1
+			graph.transferChunkSize = 4
+			graph.transferMaxRetries = 0
+			_, err := graph.uploadDriveItemFromFileWithCheckpoint(context.Background(), "folder", "checkpoint-guard.bin", filePath, 8, "application/octet-stream", graphRequestOptions{}, ptrUploadSessionCheckpoint(tc.checkpoint(server.URL+"/upload-session")), nil)
+			if tc.wantIndeterminate {
+				if err == nil || !errors.Is(err, errUploadSessionCheckpointIndeterminate) {
+					t.Fatalf("error = %v, want indeterminate checkpoint error", err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "completed without drive item metadata") {
+				t.Fatalf("error = %v, want existing-session no-item error", err)
+			}
+			if posts != 0 {
+				t.Fatalf("createUploadSession POSTs = %d, want zero", posts)
+			}
+			if got := statusGets > 0; got != tc.wantStatusGet {
+				t.Fatalf("status GET present = %v, want %v", got, tc.wantStatusGet)
+			}
+		})
+	}
+}
+
+func TestGraphUploadDriveItemFromFileDoesNotRecreateExpiredPersistedSession(t *testing.T) {
+	filePath := filepath.Join(t.TempDir(), "expired-checkpoint.bin")
+	if err := os.WriteFile(filePath, []byte("01234567"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	for _, tc := range []struct {
+		name      string
+		status    int
+		expiredAt string
+		wantGET   int
+	}{
+		{name: "local expiry", expiredAt: time.Now().Add(-time.Minute).UTC().Format(time.RFC3339Nano)},
+		{name: "remote not found", status: http.StatusNotFound, expiredAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano), wantGET: 1},
+		{name: "remote gone", status: http.StatusGone, expiredAt: time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano), wantGET: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var posts, statusGets int
+			var server *httptest.Server
+			server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				switch r.Method {
+				case http.MethodPost:
+					posts++
+					t.Fatalf("unexpected createUploadSession POST after persisted checkpoint")
+				case http.MethodGet:
+					statusGets++
+					if tc.status == 0 {
+						t.Fatalf("unexpected status query for locally expired checkpoint")
+					}
+					http.Error(w, `{"error":{"code":"uploadSessionGone"}}`, tc.status)
+				default:
+					t.Fatalf("unexpected upload request: %s %s", r.Method, r.URL.String())
+				}
+			}))
+			defer server.Close()
+
+			graph := newTestGraphClient(&fakeGraphAuth{token: "access"}, server, nil)
+			graph.singlePutMaxBytes = 1
+			graph.transferChunkSize = 4
+			graph.transferMaxRetries = 0
+			_, err := graph.uploadDriveItemFromFileWithCheckpoint(context.Background(), "folder", "expired-checkpoint.bin", filePath, 8, "application/octet-stream", graphRequestOptions{}, &driveUploadSessionCheckpoint{
+				UploadURL:          server.URL + "/upload-session",
+				ExpirationDateTime: tc.expiredAt,
+				Offset:             4,
+			}, nil)
+			if err == nil || !errors.Is(err, errUploadSessionCheckpointIndeterminate) {
+				t.Fatalf("persisted expired session error = %v, want indeterminate checkpoint error", err)
+			}
+			if posts != 0 || statusGets != tc.wantGET {
+				t.Fatalf("persisted expired session requests: posts=%d statusGets=%d, want posts=0 statusGets=%d", posts, statusGets, tc.wantGET)
+			}
+		})
+	}
+}
+
+func TestGraphUploadDriveItemFromFileDoesNotRecreateSessionAfterUnknownFinalPut(t *testing.T) {
+	filePath := filepath.Join(t.TempDir(), "unknown-final.bin")
+	if err := os.WriteFile(filePath, []byte("01234567"), 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	var posts, puts, statusGets int
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/createUploadSession"):
+			posts++
+			_, _ = fmt.Fprintf(w, `{"uploadUrl":%q}`, server.URL+"/upload-session")
+		case r.Method == http.MethodPut && r.URL.Path == "/upload-session":
+			puts++
+			_, _ = io.Copy(io.Discard, r.Body)
+			// The remote side may have accepted the final PUT, but the client
+			// loses the response. The subsequent session probe must not turn a
+			// 404 into permission to create a second session.
+			hj, ok := w.(http.Hijacker)
+			if !ok {
+				t.Fatalf("test server does not support hijacking")
+			}
+			conn, _, err := hj.Hijack()
+			if err != nil {
+				t.Fatalf("hijack final PUT: %v", err)
+			}
+			_ = conn.Close()
+		case r.Method == http.MethodGet && r.URL.Path == "/upload-session":
+			statusGets++
+			http.Error(w, `{"error":{"code":"itemNotFound"}}`, http.StatusNotFound)
+		default:
+			t.Fatalf("unexpected upload request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	graph := newTestGraphClient(&fakeGraphAuth{token: "access"}, server, nil)
+	graph.singlePutMaxBytes = 1
+	graph.transferChunkSize = 8
+	graph.transferMaxRetries = 0
+	_, err := graph.uploadDriveItemFromFileWithCheckpoint(context.Background(), "folder", "unknown-final.bin", filePath, 8, "application/octet-stream", graphRequestOptions{}, nil, nil)
+	if err == nil || !errors.Is(err, errUploadSessionCheckpointIndeterminate) {
+		t.Fatalf("unknown final PUT error = %v, want indeterminate checkpoint error", err)
+	}
+	if posts != 1 || puts != 1 || statusGets != 1 {
+		t.Fatalf("unknown final PUT requests: posts=%d puts=%d statusGets=%d, want 1/1/1", posts, puts, statusGets)
+	}
+}
+
+func ptrUploadSessionCheckpoint(checkpoint driveUploadSessionCheckpoint) *driveUploadSessionCheckpoint {
+	return &checkpoint
 }
 
 func TestGraphUploadDriveItemFromFileRejectsUploadSessionOffsetRollback(t *testing.T) {
@@ -2118,6 +2815,35 @@ func TestGraphDownloadSharedDriveItemContentToFileStreamsPastClientTimeout(t *te
 	}
 	if string(data) != "streamed-file" || size != int64(len(data)) || contentType != "text/plain" {
 		t.Fatalf("download result type=%q size=%d data=%q", contentType, size, data)
+	}
+}
+
+func TestGraphDownloadSharedDriveItemContentWithoutRateLimitRetryReturnsResolver429Immediately(t *testing.T) {
+	rawURL := "https://contoso.sharepoint.com/sites/team/Shared%20Documents/rate-limited.txt"
+	wantPath := "/shares/" + url.PathEscape(graphShareID(rawURL)) + "/driveItem/content"
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.EscapedPath() != wantPath {
+			t.Fatalf("unexpected resolver request: %s %s", r.Method, r.URL.String())
+		}
+		requests++
+		w.Header().Set("Retry-After", "600")
+		http.Error(w, `{"error":{"code":"TooManyRequests"}}`, http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+
+	var sleeps []time.Duration
+	graph := newTestGraphClient(&fakeGraphAuth{token: "access"}, server, &sleeps)
+	destination := filepath.Join(t.TempDir(), "rate-limited.txt")
+	_, _, err := graph.DownloadSharedDriveItemContentToFileWithoutRateLimitRetry(context.Background(), rawURL, destination)
+	if err == nil || !isGraphRateLimitError(err) {
+		t.Fatalf("resolver 429 error = %v, want typed Graph 429", err)
+	}
+	if requests != 1 {
+		t.Fatalf("resolver 429 requests = %d, want one", requests)
+	}
+	if len(sleeps) != 0 {
+		t.Fatalf("resolver 429 sleeps = %#v, want no hidden Retry-After/retry sleep", sleeps)
 	}
 }
 

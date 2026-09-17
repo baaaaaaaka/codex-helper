@@ -135,10 +135,12 @@ func TestOpenAIChatAdapterDistinguishesSemanticProgressFromTransportHeartbeats(t
 			w.Header().Set("Content-Type", "text/event-stream")
 			w.WriteHeader(http.StatusOK)
 			flusher, _ := w.(http.Flusher)
+			_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"start\"}}]}\n\n"))
+			flusher.Flush()
 			for i := 0; i < 20; i++ {
 				_, _ = w.Write([]byte(": heartbeat\n\n"))
 				flusher.Flush()
-				time.Sleep(3 * time.Millisecond)
+				time.Sleep(50 * time.Millisecond)
 			}
 			_, _ = w.Write([]byte("data: [DONE]\n\n"))
 			flusher.Flush()
@@ -146,7 +148,7 @@ func TestOpenAIChatAdapterDistinguishesSemanticProgressFromTransportHeartbeats(t
 		defer server.Close()
 		adapter := OpenAIChatAdapter{
 			BaseURL: server.URL + "/v1", HTTPClient: server.Client(), MaxRetries: -1,
-			StreamIdleTimeout: 200 * time.Millisecond, SemanticProgressTimeout: 20 * time.Millisecond,
+			StreamIdleTimeout: 2 * time.Second, SemanticProgressTimeout: 500 * time.Millisecond,
 			HeartbeatMode: "semantic",
 		}
 		stream, err := adapter.Stream(context.Background(), ProviderRequest{Model: "model-a", InputText: "x"})

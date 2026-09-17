@@ -437,8 +437,7 @@ func (s *Store) BeginFork(ctx context.Context, req ForkBeginRequest) (ForkOperat
 		state.ForkOperations[op.ID] = op
 		if inboundID := strings.TrimSpace(req.CommandInboundID); inboundID != "" {
 			if inbound, ok := state.InboundEvents[inboundID]; ok {
-				inbound.Status = InboundStatusIgnored
-				inbound.UpdatedAt = now
+				markInboundIgnored(&inbound, now)
 				state.InboundEvents[inboundID] = inbound
 			}
 		}
@@ -842,6 +841,21 @@ func (s *Store) stageForkChat(ctx context.Context, operationID string, chatID st
 		if !ok {
 			return fmt.Errorf("fork child session %q not found", op.ChildSessionID)
 		}
+		oldChatID := strings.TrimSpace(child.TeamsChatID)
+		for sessionID, other := range state.Sessions {
+			if sessionID != child.ID && strings.TrimSpace(other.TeamsChatID) == chatID {
+				return fmt.Errorf("fork child chat %q is already bound to session %q", chatID, sessionID)
+			}
+		}
+		// Never steal an in-flight capability belonging to an unrelated chat
+		// owner. The caller can retry after that owner has durably completed or
+		// abandoned the attempt; returning before mutating the child preserves
+		// both bindings and their CAS fences.
+		if oldChatID != chatID {
+			if targetPoll, exists := state.ChatPolls[chatID]; exists && targetPoll.Attempt != nil {
+				return fmt.Errorf("fork child chat %q has an active poll attempt", chatID)
+			}
+		}
 		now := time.Now()
 		op.ChildChatID = chatID
 		op.ChildChatURL = strings.TrimSpace(chatURL)
@@ -860,21 +874,27 @@ func (s *Store) stageForkChat(ctx context.Context, operationID string, chatID st
 		child.Status = SessionStatusAwaitingHistory
 		child.UpdatedAt = now
 		state.Sessions[child.ID] = child
-		poll := state.ChatPolls[chatID]
-		poll.ChatID = chatID
-		poll.Seeded = true
-		poll.PollState = "warm"
-		if !start.IsZero() {
-			poll.LastModifiedCursor = start
+		if oldChatID != chatID {
+			if oldPoll, exists := state.ChatPolls[oldChatID]; exists && oldChatID != "" {
+				// Fork staging replaces the chat/session binding outside the
+				// poll-owner capability. Fence the old chat immediately; a retained
+				// pending page remains available for the new owner to reconcile.
+				oldPoll.PollRevision++
+				oldPoll.ScheduleRevision++
+				invalidateChatPollAttempt(&oldPoll)
+				oldPoll.UpdatedAt = now
+				state.ChatPolls[oldChatID] = oldPoll
+			}
 		}
-		// Fork staging replaces the chat/session binding outside the poll-owner
-		// capability. Fence any older poll completion immediately; a retained
-		// page remains available for the new owner to reconcile.
-		poll.PollRevision++
-		poll.ScheduleRevision++
-		invalidateChatPollAttempt(&poll)
-		poll.UpdatedAt = now
-		state.ChatPolls[chatID] = poll
+		if _, targetExists := state.ChatPolls[chatID]; !targetExists {
+			poll := ChatPollState{ChatID: chatID, Seeded: true, PollState: "warm", UpdatedAt: now}
+			if !start.IsZero() {
+				poll.LastModifiedCursor = start
+			}
+			poll.PollRevision = 1
+			poll.ScheduleRevision = 1
+			state.ChatPolls[chatID] = poll
+		}
 		out = *op
 		return nil
 	})

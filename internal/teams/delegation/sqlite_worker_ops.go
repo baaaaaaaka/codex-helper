@@ -28,6 +28,8 @@ func TryStartWorkerSQLite(path string, request Record, claim Record, now time.Ti
 	if err := materializeSQLiteStoreFromLegacy(path); err != nil {
 		return false, err
 	}
+	unlock := lockDelegationSQLiteProcess(path)
+	defer unlock()
 	db, err := openDelegationSQLiteStore(path, true)
 	if err != nil {
 		return false, err
@@ -111,6 +113,8 @@ func FinishWorkerSQLite(path string, request Record, claim Record, status string
 	if err := materializeSQLiteStoreFromLegacy(path); err != nil {
 		return err
 	}
+	unlock := lockDelegationSQLiteProcess(path)
+	defer unlock()
 	db, err := openDelegationSQLiteStore(path, true)
 	if err != nil {
 		return err
@@ -184,6 +188,8 @@ func UpsertWorkerOutboxSQLite(path string, record Record, status string, chatID 
 	if err := materializeSQLiteStoreFromLegacy(path); err != nil {
 		return err
 	}
+	unlock := lockDelegationSQLiteProcess(path)
+	defer unlock()
 	db, err := openDelegationSQLiteStore(path, true)
 	if err != nil {
 		return err
@@ -211,6 +217,95 @@ func UpsertWorkerOutboxSQLite(path string, record Record, status string, chatID 
 	return nil
 }
 
+// reserveOutboxSQLite uses a write-first transaction so two processes cannot
+// both observe an absent outbox row and then proceed to the non-idempotent
+// Graph POST. The exact raw JSON compare on the update branch also protects a
+// legacy unattempted row from an ABA replacement between read and reserve.
+func reserveOutboxSQLite(ctx context.Context, path string, record Record, chatID string, now time.Time) (OutboxRecord, bool, error) {
+	var zero OutboxRecord
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	path = strings.TrimSpace(path)
+	record.RecordID = strings.TrimSpace(record.RecordID)
+	if path == "" || record.RecordID == "" {
+		return zero, false, nil
+	}
+	if err := materializeSQLiteStoreFromLegacy(path); err != nil {
+		return zero, false, err
+	}
+	unlock := lockDelegationSQLiteProcess(path)
+	defer unlock()
+	db, err := openDelegationSQLiteStore(path, true)
+	if err != nil {
+		return zero, false, err
+	}
+	defer db.Close()
+	if err := ensureDelegationSQLiteSchema(ctx, db); err != nil {
+		return zero, false, err
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return zero, false, err
+	}
+	defer tx.Rollback()
+
+	first := nextWorkerOutbox(OutboxRecord{}, record, OutboxPending, chatID, "", "", now)
+	firstRaw, err := json.Marshal(first)
+	if err != nil {
+		return zero, false, err
+	}
+	result, err := tx.ExecContext(ctx, `INSERT INTO outbox(id, json) VALUES (?, ?) ON CONFLICT(id) DO NOTHING`, record.RecordID, firstRaw)
+	if err != nil {
+		return zero, false, err
+	}
+	if affected, err := result.RowsAffected(); err != nil {
+		return zero, false, err
+	} else if affected == 1 {
+		if err := tx.Commit(); err != nil {
+			return zero, false, err
+		}
+		chmodDelegationSQLiteFiles(path)
+		return first, true, nil
+	}
+
+	var existingRaw []byte
+	if err := tx.QueryRowContext(ctx, `SELECT json FROM outbox WHERE id = ?`, record.RecordID).Scan(&existingRaw); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return zero, false, fmt.Errorf("delegation outbox %q disappeared during reservation", record.RecordID)
+		}
+		return zero, false, err
+	}
+	var existing OutboxRecord
+	if err := json.Unmarshal(existingRaw, &existing); err != nil {
+		return zero, false, err
+	}
+	if outboxHasDeliveryWitness(existing) {
+		return existing, false, nil
+	}
+	next := nextWorkerOutbox(existing, record, OutboxPending, chatID, "", "", now)
+	nextRaw, err := json.Marshal(next)
+	if err != nil {
+		return zero, false, err
+	}
+	result, err = tx.ExecContext(ctx, `UPDATE outbox SET json = ? WHERE id = ? AND json = ?`, nextRaw, record.RecordID, existingRaw)
+	if err != nil {
+		return zero, false, err
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return zero, false, err
+	}
+	if affected != 1 {
+		return existing, false, fmt.Errorf("delegation outbox %q changed during reservation", record.RecordID)
+	}
+	if err := tx.Commit(); err != nil {
+		return zero, false, err
+	}
+	chmodDelegationSQLiteFiles(path)
+	return next, true, nil
+}
+
 func UpsertOutboxSQLite(path string, record Record, status string, chatID string, inboxRef string, messageID string, errText string, now time.Time, retention time.Duration) error {
 	if !storePathUsesSQLite(path) {
 		return fmt.Errorf("delegation store %q is not sqlite", path)
@@ -218,6 +313,8 @@ func UpsertOutboxSQLite(path string, record Record, status string, chatID string
 	if err := materializeSQLiteStoreFromLegacy(path); err != nil {
 		return err
 	}
+	unlock := lockDelegationSQLiteProcess(path)
+	defer unlock()
 	db, err := openDelegationSQLiteStore(path, true)
 	if err != nil {
 		return err
@@ -247,6 +344,13 @@ func UpsertOutboxSQLite(path string, record Record, status string, chatID string
 
 func InboxCursorSQLite(path string, chatID string) (InboxCursor, bool, error) {
 	return sqliteLoadByID[InboxCursor](path, "inbox_cursors", chatID)
+}
+
+// OutboxSQLite reads one durable worker outbox witness without materializing
+// the whole worker store. Callers use it before a non-idempotent Graph POST to
+// distinguish a first attempt from a retry after an unknown outcome.
+func OutboxSQLite(path string, recordID string) (OutboxRecord, bool, error) {
+	return sqliteLoadByID[OutboxRecord](path, "outbox", recordID)
 }
 
 func UpsertInboxCursorSQLite(path string, cursor InboxCursor) error {
@@ -318,6 +422,8 @@ func sqliteLoadByID[T any](path string, table string, id string) (T, bool, error
 	if err := materializeSQLiteStoreFromLegacy(path); err != nil {
 		return zero, false, err
 	}
+	unlock := lockDelegationSQLiteProcess(path)
+	defer unlock()
 	if exists, err := osStatSQLite(path); err != nil {
 		return zero, false, err
 	} else if !exists {
@@ -354,6 +460,8 @@ func sqliteUpsertSingle[T any](path string, table string, id string, value T) er
 	if err := materializeSQLiteStoreFromLegacy(path); err != nil {
 		return err
 	}
+	unlock := lockDelegationSQLiteProcess(path)
+	defer unlock()
 	db, err := openDelegationSQLiteStore(path, true)
 	if err != nil {
 		return err

@@ -359,6 +359,32 @@ func TestSQLiteMissingControlLeaseProjectionFailsClosed(t *testing.T) {
 	}
 }
 
+// The materialized marker is the publication boundary for the runtime lease
+// projection. If an external repair/copy removes every runtime row but leaves
+// that marker behind, ValidateControlLease must not fall back to the stale
+// state_json lease. The missing projection is ownership-unknown and must stay
+// fail-closed until an explicit preparation repairs it.
+func TestSQLiteMarkerOnlyRuntimeProjectionFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := testOwnerStart()
+	scope := ScopeIdentity{ID: "scope-marker-only-runtime", AccountID: "account-marker-only-runtime", OSUser: "tester", Profile: "default"}
+	oldMachine := MachineRecord{ID: "machine-marker-only-runtime-old", ScopeID: scope.ID, Kind: MachineKindPrimary}
+	claimed, err := store.ClaimControlLease(ctx, ControlLeaseClaim{Scope: scope, Machine: oldMachine, Duration: time.Hour, Now: now})
+	if err != nil {
+		t.Fatalf("initial claim: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `DELETE FROM runtime_state`)
+		return err
+	})
+
+	if _, err := store.ValidateControlLease(ctx, oldMachine.ID, claimed.Lease.Generation, now); !errors.Is(err, ErrSQLiteRuntimeProjectionIncomplete) {
+		t.Fatalf("marker-only runtime lease validation error = %v, want runtime-projection-incomplete", err)
+	}
+}
+
 // A partially materialized runtime projection must not make the hot poll path
 // resurrect a stale control binding from state_json.  The ready scheduler can
 // use the caller's registry control-chat ID and the bounded chat-poll rows even
@@ -557,6 +583,9 @@ func TestSQLitePartialMaterializedRuntimeProjectionRejectsFullStateMutation(t *t
 		_, err := tx.ExecContext(ctx, `DELETE FROM runtime_state WHERE key = ?`, sqliteRuntimeKeyScope)
 		return err
 	})
+	if _, err := store.ReadScope(ctx); !errors.Is(err, ErrSQLiteRuntimeProjectionIncomplete) {
+		t.Fatalf("ReadScope with missing materialized scope row = %v, want ErrSQLiteRuntimeProjectionIncomplete", err)
+	}
 
 	if _, err := store.SetDraining(ctx, "partial-runtime-projection"); !errors.Is(err, ErrSQLiteRuntimeProjectionIncomplete) {
 		t.Fatalf("full runtime mutation error = %v, want ErrSQLiteRuntimeProjectionIncomplete", err)
@@ -804,7 +833,10 @@ func TestClaimControlLeaseDoesNotOverwriteFreshLegacyOwnerWithoutLeaseHistory(t 
 			// shape and therefore models the actual missing-history boundary.
 			legacyLease := ControlLease{ScopeID: scope.ID}
 			if err := store.Update(ctx, func(state *State) error {
-				state.Scope = scope
+				// Model the oldest lease shape: the control-lease tuple is live,
+				// while the top-level scope publication was also absent. A standby
+				// claimant must not fill that scope before it owns the lease.
+				state.Scope = ScopeIdentity{}
 				state.Machines[oldMachine.ID] = oldMachine
 				state.ServiceOwner = &oldOwner
 				state.LockOwner = &oldOwner
@@ -843,6 +875,107 @@ func TestClaimControlLeaseDoesNotOverwriteFreshLegacyOwnerWithoutLeaseHistory(t 
 			}
 			if state.ControlLease != legacyLease {
 				t.Fatalf("fresh legacy owner claim changed lease history: got=%#v want=%#v", state.ControlLease, legacyLease)
+			}
+		})
+	}
+}
+
+// ScopeID was introduced after the original holder/expiry lease tuple.  A
+// live legacy lease that is missing only that field must still fence a new
+// claimant until expiry; otherwise the first post-upgrade claim can create
+// two active writers.  Once the legacy expiry has passed, takeover remains
+// available and materializes the current scope/generation.
+func TestClaimControlLeaseHonorsLiveLegacyLeaseWithoutScopeID(t *testing.T) {
+	prevHostname := ownerHostname
+	prevAlive := ownerProcessAlive
+	t.Cleanup(func() {
+		ownerHostname = prevHostname
+		ownerProcessAlive = prevAlive
+	})
+	ownerHostname = func() (string, error) { return "host-a", nil }
+	ownerProcessAlive = func(pid int) bool { return pid == 4242 || pid == 7777 }
+
+	ctx := context.Background()
+	now := testOwnerStart()
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := newTestStore(t)
+			scope := ScopeIdentity{ID: "scope-live-legacy-lease-" + name}
+			oldMachine := MachineRecord{ID: "machine-live-legacy-old-" + name, ScopeID: scope.ID, Kind: MachineKindPrimary}
+			oldOwner := testOwner("legacy-live-session", "legacy-live-turn", now)
+			oldOwner.PID = 4242
+			oldOwner.MachineID = oldMachine.ID
+			oldOwner.ScopeID = scope.ID
+			legacyLease := ControlLease{
+				// ScopeID and Generation are intentionally absent: these fields
+				// did not exist in the oldest holder/expiry representation.
+				HolderMachineID: oldMachine.ID,
+				HolderKind:      oldMachine.Kind,
+				Priority:        oldMachine.Priority,
+				LeaseUntil:      now.Add(time.Minute),
+				LastHeartbeat:   now,
+				UpdatedAt:       now,
+			}
+			if err := store.Update(ctx, func(state *State) error {
+				// The oldest lease representation had no scope field, and this
+				// fixture intentionally keeps the top-level scope absent too. A
+				// standby claimant must not publish its scope before it owns the
+				// still-live legacy lease.
+				state.Scope = ScopeIdentity{}
+				state.Machines[oldMachine.ID] = oldMachine
+				state.ServiceOwner = &oldOwner
+				state.LockOwner = &oldOwner
+				state.ControlLease = legacyLease
+				return nil
+			}); err != nil {
+				t.Fatalf("seed live legacy lease: %v", err)
+			}
+			if useSQLite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+
+			newMachine := MachineRecord{ID: "machine-live-legacy-new-" + name, ScopeID: scope.ID, Kind: MachineKindPrimary}
+			newOwner := testOwner("new-live-session", "new-live-turn", now.Add(10*time.Second))
+			newOwner.PID = 7777
+			newOwner.MachineID = newMachine.ID
+			newOwner.ScopeID = scope.ID
+			beforeExpiry, err := store.ClaimControlLease(ctx, ControlLeaseClaim{
+				Scope: scope, Machine: newMachine, Owner: newOwner,
+				Duration: time.Minute, Now: now.Add(10 * time.Second),
+			})
+			if err != nil {
+				t.Fatalf("claim before legacy expiry: %v", err)
+			}
+			if beforeExpiry.Mode != LeaseModeStandby || beforeExpiry.Lease.HolderMachineID != oldMachine.ID {
+				t.Fatalf("claim before legacy expiry = %#v, want standby held by %q", beforeExpiry, oldMachine.ID)
+			}
+			state, err := store.Load(ctx)
+			if err != nil {
+				t.Fatalf("load before legacy expiry: %v", err)
+			}
+			if state.ControlLease.HolderMachineID != oldMachine.ID || !state.ControlLease.LeaseUntil.Equal(legacyLease.LeaseUntil) {
+				t.Fatalf("live legacy lease changed before expiry: %#v, want %#v", state.ControlLease, legacyLease)
+			}
+			if state.Scope.ID != "" {
+				t.Fatalf("standby legacy lease claim published scope %q before ownership", state.Scope.ID)
+			}
+
+			afterExpiry, err := store.ClaimControlLease(ctx, ControlLeaseClaim{
+				Scope: scope, Machine: newMachine, Owner: newOwner,
+				Duration: time.Minute, Now: now.Add(2 * time.Minute),
+			})
+			if err != nil {
+				t.Fatalf("claim after legacy expiry: %v", err)
+			}
+			if afterExpiry.Mode != LeaseModeActive || afterExpiry.Lease.HolderMachineID != newMachine.ID || afterExpiry.Lease.Generation <= 0 {
+				t.Fatalf("claim after legacy expiry = %#v, want active new generation", afterExpiry)
+			}
+			if afterExpiry.Lease.ScopeID != scope.ID {
+				t.Fatalf("takeover did not materialize scope id: %#v", afterExpiry.Lease)
 			}
 		})
 	}

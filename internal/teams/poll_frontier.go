@@ -36,11 +36,12 @@ const (
 )
 
 var (
-	errPendingPageInvalid      = errors.New("pending Graph page is invalid")
-	errPendingPageIdentity     = errors.New("pending Graph page identity is ambiguous")
-	errPendingPageTooLarge     = errors.New("pending Graph page exceeds bounded storage")
-	errPollMessageChatMismatch = errors.New("Graph message belongs to a different Teams chat")
-	errContinuationNoProgress  = errors.New("Graph continuation made no progress")
+	errPendingPageInvalid          = errors.New("pending Graph page is invalid")
+	errPendingPageIdentity         = errors.New("pending Graph page identity is ambiguous")
+	errPendingPageTooLarge         = errors.New("pending Graph page exceeds bounded storage")
+	errPollMessageChatMismatch     = errors.New("Graph message belongs to a different Teams chat")
+	errPollMessageIdentityMismatch = errors.New("Graph message identity does not match the requested Teams message")
+	errContinuationNoProgress      = errors.New("Graph continuation made no progress")
 )
 
 type pollFailureScope uint8
@@ -146,6 +147,25 @@ func pollMessageBelongsToChat(chatID string, msg ChatMessage) bool {
 	chatID = strings.TrimSpace(chatID)
 	messageChatID := strings.TrimSpace(msg.ChatID)
 	return chatID != "" && (messageChatID == "" || messageChatID == chatID)
+}
+
+// validateFetchedMessageIdentity is used for a direct message GET, where the
+// request itself names one message but Graph can still return a structurally
+// valid representation for a different resource (for example after a stale
+// proxy/cache response). List-page validation already checks this boundary;
+// recovery must enforce the same identity proof before preparing or executing
+// the durable turn.
+func validateFetchedMessageIdentity(chatID, expectedMessageID string, msg ChatMessage) error {
+	chatID = strings.TrimSpace(chatID)
+	expectedMessageID = strings.TrimSpace(expectedMessageID)
+	actualMessageID := strings.TrimSpace(msg.ID)
+	if expectedMessageID == "" || actualMessageID == "" || actualMessageID != expectedMessageID {
+		return fmt.Errorf("%w: got message %q, want %q", errPollMessageIdentityMismatch, actualMessageID, expectedMessageID)
+	}
+	if !pollMessageBelongsToChat(chatID, msg) {
+		return fmt.Errorf("%w: message %q reports chat %q, want %q", errPollMessageChatMismatch, actualMessageID, strings.TrimSpace(msg.ChatID), chatID)
+	}
+	return nil
 }
 
 func pendingPageFromWindow(chatID, requestPath, frontier string, epoch uint64, window MessageWindow, baselineOnly bool) (*teamstore.ChatPollPendingPage, error) {
@@ -309,7 +329,48 @@ func pendingPageMatchesRepairTarget(current, expected *teamstore.ChatPollPending
 // repair must become a no-op and the next poll must re-read the authoritative
 // row before deciding what to retire.
 func chatPollMatchesPendingRepairTarget(current, expected teamstore.ChatPollState) bool {
+	if reflect.DeepEqual(current, expected) {
+		return true
+	}
+	// RecoveryRequired/Reason/SourceHash are durable evidence, not formatting
+	// noise. A repair that ignores them can clear a newer marker written after
+	// the caller's snapshot and reopen a different corrupted frontier.
+	normalizeChatPollRepairTimes(&current)
+	normalizeChatPollRepairTimes(&expected)
 	return reflect.DeepEqual(current, expected)
+}
+
+func normalizeChatPollRepairTimes(poll *teamstore.ChatPollState) {
+	if poll == nil {
+		return
+	}
+	for _, value := range []*time.Time{
+		&poll.NextPollAt, &poll.LastActivityAt, &poll.BlockedUntil, &poll.ParkedAt,
+		&poll.ParkNoticeSentAt, &poll.LastModifiedCursor, &poll.ContinuationSafeCursor,
+		&poll.LastSuccessfulPollAt, &poll.LastErrorAt, &poll.LastWindowFullAt,
+		&poll.ContinuationFirstFailureAt, &poll.ContinuationLastFailureAt, &poll.UpdatedAt,
+	} {
+		if !value.IsZero() {
+			*value = value.UTC()
+		}
+	}
+	if page := poll.PendingPage; page != nil && !page.ReceivedAt.IsZero() {
+		page.ReceivedAt = page.ReceivedAt.UTC()
+	}
+	if gap := poll.Gap; gap != nil {
+		for _, value := range []*time.Time{&gap.SafeCursor, &gap.RecoveryCursor, &gap.OpenedAt, &gap.LastProgressAt} {
+			if !value.IsZero() {
+				*value = value.UTC()
+			}
+		}
+	}
+	if attempt := poll.Attempt; attempt != nil {
+		for _, value := range []*time.Time{&attempt.StartedAt, &attempt.ExpiresAt} {
+			if !value.IsZero() {
+				*value = value.UTC()
+			}
+		}
+	}
 }
 
 func sameIntSlice(left, right []int) bool {

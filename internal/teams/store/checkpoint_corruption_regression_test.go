@@ -1051,7 +1051,7 @@ func jsonCheckpointRawForTest(t *testing.T, path string, checkpointID string) []
 }
 
 func TestSQLiteMalformedCanonicalCheckpointIsIsolatedFromScopedReads(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), storeConcurrentTestTimeout(15*time.Second))
 	defer cancel()
 	store := newTestStore(t)
 	badSession := testSession()
@@ -1194,7 +1194,7 @@ func TestSQLiteOpaqueCheckpointRepairUsesRawCAS(t *testing.T) {
 	migrateStoreToSQLiteForTest(t, store)
 	badRaw := []byte(`{"last_offset_known":1}`)
 	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
-		_, err := tx.ExecContext(ctx, `UPDATE import_checkpoints SET json = ? WHERE id = ?`, badRaw, checkpointID)
+		_, err := tx.ExecContext(ctx, `UPDATE import_checkpoints SET session_id = NULL, json = ? WHERE id = ?`, badRaw, checkpointID)
 		return err
 	})
 	expectedRaw := sqliteRawImportCheckpointJSONForTest(t, store, checkpointID)
@@ -1231,6 +1231,20 @@ func TestSQLiteOpaqueCheckpointRepairUsesRawCAS(t *testing.T) {
 	}
 	if err := store.RepairOpaqueImportCheckpoint(ctx, checkpointID, expectedRaw, replacement); err != nil {
 		t.Fatalf("idempotent RepairOpaqueImportCheckpoint retry: %v", err)
+	}
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE import_checkpoints SET session_id = ? WHERE id = ?`, "stale-session-id", checkpointID)
+		return err
+	})
+	if err := store.RepairOpaqueImportCheckpoint(ctx, checkpointID, expectedRaw, replacement); err != nil {
+		t.Fatalf("RepairOpaqueImportCheckpoint should normalize stale canonical session projection: %v", err)
+	}
+	var repairedSessionID string
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		return tx.QueryRowContext(ctx, `SELECT session_id FROM import_checkpoints WHERE id = ?`, checkpointID).Scan(&repairedSessionID)
+	})
+	if repairedSessionID != session.ID {
+		t.Fatalf("canonical repair session_id = %q, want %q after stale projection", repairedSessionID, session.ID)
 	}
 	staleReplacement := replacement
 	staleReplacement.LastRecordID = "stale-replacement"

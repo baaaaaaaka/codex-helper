@@ -65,14 +65,17 @@ func TestAccountDefaultLiveShellMatrix(t *testing.T) {
 		{name: "pwsh", commands: []string{"pwsh", "powershell"}, marker: pwshMarker},
 		{name: "nu", commands: []string{"nu"}, marker: nuMarker},
 	}
-	required := make(map[string]bool)
+	selected := make(map[string]bool)
 	for _, name := range strings.FieldsFunc(os.Getenv("CODEX_HELPER_USER_PATH_LIVE_SHELLS"), func(r rune) bool {
 		return r == ',' || r == ' ' || r == '\t' || r == '\n'
 	}) {
-		required[strings.ToLower(name)] = true
+		selected[strings.ToLower(name)] = true
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
+			if len(selected) > 0 && !selected[test.name] {
+				t.Skip("shell is not selected for this platform live matrix")
+			}
 			shell := ""
 			for _, command := range test.commands {
 				if found, err := exec.LookPath(command); err == nil {
@@ -81,7 +84,7 @@ func TestAccountDefaultLiveShellMatrix(t *testing.T) {
 				}
 			}
 			if shell == "" {
-				if required[test.name] {
+				if selected[test.name] {
 					t.Fatalf("required live shell %s is not installed", test.name)
 				}
 				t.Skip("shell is not installed")

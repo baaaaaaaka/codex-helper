@@ -529,6 +529,22 @@ func TestPendingOutboxRecoveryAdoptsTokenfulSendingWithoutPOSTProofAcrossBackend
 			if len(ordinary.Messages) != 0 {
 				t.Fatalf("ambiguous tokenful row entered ordinary FIFO: %#v", ordinary.Messages)
 			}
+			fresh := OutboxMessage{
+				ID: "outbox:tokenful-fresh", TeamsChatID: "chat:tokenful-recovery", Kind: "final",
+				Body: "still owned by the current sender", Status: OutboxStatusSending,
+				MachineID: machineB.ID, LeaseGeneration: leaseB.Lease.Generation,
+				SendAttemptToken: "current-attempt-token", LastSendAttempt: now.Add(time.Second / 2),
+			}
+			if OutboxSendRecoveryEligibleForOwner(fresh, now.Add(time.Second), machineB.ID, leaseB.Lease.Generation) {
+				t.Fatalf("current owner's fresh Sending row was admitted to takeover recovery: %#v", fresh)
+			}
+			if !OutboxSendRecoveryEligibleForOwner(fresh, now.Add(time.Second), "machine:another-owner", leaseB.Lease.Generation+1) {
+				t.Fatalf("new owner did not admit an older-generation tokenful Sending row: %#v", fresh)
+			}
+			fresh.SendAttemptToken = ""
+			if OutboxSendRecoveryEligibleForOwner(fresh, now.Add(time.Second), "machine:another-owner", leaseB.Lease.Generation+1) {
+				t.Fatalf("markerless fresh Sending row was admitted to takeover recovery: %#v", fresh)
+			}
 		})
 	}
 }
@@ -665,6 +681,14 @@ func TestStoreOwnerFencedOutboxRecoveryAndQueuedCleanupAcrossBackends(t *testing
 			deferred, err := store.DeferOutboxDeliveryUntilForOwner(ctx, claimed.ID, now.Add(time.Hour), machineB.ID, leaseB.Lease.Generation, bound.SendAttemptToken)
 			if err != nil || !deferred.NextAttemptAt.Equal(now.Add(time.Hour)) {
 				t.Fatalf("current owner defer = %#v err=%v, want durable gate", deferred, err)
+			}
+
+			if _, err := store.DeferOutboxDeliveryUntilForOwner(ctx, "outbox:fenced-queued", now.Add(2*time.Hour), machineA.ID, leaseA.Lease.Generation, ""); !errors.Is(err, ErrControlLeaseNotHeld) {
+				t.Fatalf("stale queued owner defer error = %v, want ErrControlLeaseNotHeld", err)
+			}
+			adoptedQueued, err := store.DeferOutboxDeliveryUntilForOwner(ctx, "outbox:fenced-queued", now.Add(2*time.Hour), machineB.ID, leaseB.Lease.Generation, "")
+			if err != nil || adoptedQueued.MachineID != machineB.ID || adoptedQueued.LeaseGeneration != leaseB.Lease.Generation || !adoptedQueued.NextAttemptAt.Equal(now.Add(2*time.Hour)) {
+				t.Fatalf("replacement queued defer = %#v err=%v, want owner adoption and durable gate", adoptedQueued, err)
 			}
 
 			if _, _, err := store.MarkOutboxSkippedIfQueuedForOwner(ctx, "outbox:fenced-queued", "obsolete queued row", machineA.ID, leaseA.Lease.Generation); !errors.Is(err, ErrControlLeaseNotHeld) {

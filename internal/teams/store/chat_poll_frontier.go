@@ -31,6 +31,38 @@ func (s *Store) UpdateChatPollForOwner(ctx context.Context, chatID, machineID st
 	return s.updateChatPollWithCapability(ctx, chatID, capability, fn)
 }
 
+// UpdateChatPollAtRevision applies a row-local mutation only when the caller's
+// snapshot is still the current poll revision. It is used by pre-attempt
+// repair paths: unlike a plain UpdateChatPoll, a stale repair must not clear a
+// recovery marker or replace a frontier that another worker has changed.
+func (s *Store) UpdateChatPollAtRevision(ctx context.Context, chatID string, expectedRevision uint64, fn func(*ChatPollState) error) (ChatPollState, bool, error) {
+	return s.updateChatPollAtRevision(ctx, chatID, expectedRevision, nil, fn)
+}
+
+// UpdateChatPollForOwnerAtRevision is the owner-fenced form of
+// UpdateChatPollAtRevision. The revision check and control-lease check are
+// evaluated inside the same JSON/SQLite mutation, so a repair cannot pass a
+// read-then-write gap after a takeover.
+func (s *Store) UpdateChatPollForOwnerAtRevision(ctx context.Context, chatID string, expectedRevision uint64, machineID string, leaseGeneration int64, fn func(*ChatPollState) error) (ChatPollState, bool, error) {
+	if strings.TrimSpace(machineID) == "" || leaseGeneration <= 0 {
+		return ChatPollState{}, false, ErrControlLeaseNotHeld
+	}
+	capability := &ChatPollAttemptCapability{Owner: strings.TrimSpace(machineID), LeaseGeneration: leaseGeneration}
+	return s.updateChatPollAtRevision(ctx, chatID, expectedRevision, capability, fn)
+}
+
+func (s *Store) updateChatPollAtRevision(ctx context.Context, chatID string, expectedRevision uint64, capability *ChatPollAttemptCapability, fn func(*ChatPollState) error) (ChatPollState, bool, error) {
+	if fn == nil {
+		return ChatPollState{}, false, fmt.Errorf("chat poll mutation is required")
+	}
+	return s.updateChatPollWithCapability(ctx, chatID, capability, func(poll *ChatPollState) error {
+		if poll == nil || poll.PollRevision != expectedRevision {
+			return errStoreNoChange
+		}
+		return fn(poll)
+	})
+}
+
 // UpdateChatPollScheduleForOwner applies the same schedule reducer as
 // UpdateChatPollSchedule, but fences the mutation against the control lease
 // captured by the caller. Schedule updates are often performed after a
@@ -42,7 +74,7 @@ func (s *Store) UpdateChatPollScheduleForOwner(ctx context.Context, update ChatP
 		return ChatPollState{}, fmt.Errorf("chat id is required")
 	}
 	var out ChatPollState
-	_, _, err := s.UpdateChatPollForOwner(ctx, chatID, machineID, leaseGeneration, func(poll *ChatPollState) error {
+	_, _, err := s.updateChatPollWithCapabilityForOwner(ctx, chatID, machineID, leaseGeneration, func(poll *ChatPollState) error {
 		state := State{ChatPolls: map[string]ChatPollState{chatID: *poll}}
 		next, changed, err := applyChatPollScheduleUpdateLocked(&state, update, time.Now())
 		if err != nil {
@@ -56,7 +88,7 @@ func (s *Store) UpdateChatPollScheduleForOwner(ctx context.Context, update ChatP
 		*poll = next
 		return nil
 	})
-	if out.ChatID == "" {
+	if out.ChatID == "" && err == nil {
 		out, _, _ = s.ChatPoll(ctx, chatID)
 	}
 	return out, err
@@ -74,7 +106,7 @@ func (s *Store) MarkChatPollParkNoticeSentForOwner(ctx context.Context, chatID s
 		at = time.Now()
 	}
 	var out ChatPollState
-	_, _, err := s.UpdateChatPollForOwner(ctx, chatID, machineID, leaseGeneration, func(poll *ChatPollState) error {
+	_, _, err := s.updateChatPollWithCapabilityForOwner(ctx, chatID, machineID, leaseGeneration, func(poll *ChatPollState) error {
 		poll.ChatID = chatID
 		poll.ParkNoticeSentAt = at
 		poll.UpdatedAt = time.Now()
@@ -84,7 +116,7 @@ func (s *Store) MarkChatPollParkNoticeSentForOwner(ctx context.Context, chatID s
 		out = *poll
 		return nil
 	})
-	if out.ChatID == "" {
+	if out.ChatID == "" && err == nil {
 		out, _, _ = s.ChatPoll(ctx, chatID)
 	}
 	return out, err
@@ -97,7 +129,11 @@ func (s *Store) MarkChatPollParkNoticeSentForOwner(ctx context.Context, chatID s
 // be unable to advance a replacement owner's cursor.
 func (s *Store) RecordChatPollSuccessWithContinuationAndScheduleForOwner(ctx context.Context, chatID string, lastModifiedCursor time.Time, seeded bool, windowFull bool, fetched int, continuationPath string, schedule func(ChatPollState) (ChatPollScheduleUpdate, error), machineID string, leaseGeneration int64) (ChatPollState, error) {
 	var out ChatPollState
-	_, _, err := s.UpdateChatPollForOwner(ctx, chatID, machineID, leaseGeneration, func(poll *ChatPollState) error {
+	_, _, err := s.updateChatPollWithCapabilityForOwner(ctx, chatID, machineID, leaseGeneration, func(poll *ChatPollState) error {
+		if poll != nil && chatPollHasOpaqueRecoveryEvidence(*poll) {
+			out = *poll
+			return ErrChatPollOpaqueRecoveryRequired
+		}
 		state := State{ChatPolls: map[string]ChatPollState{chatID: *poll}}
 		now := time.Now()
 		next, changed := applyChatPollSuccessLocked(&state, chatID, lastModifiedCursor, seeded, windowFull, fetched, strings.TrimSpace(continuationPath), now)
@@ -128,7 +164,7 @@ func (s *Store) RecordChatPollSuccessWithContinuationAndScheduleForOwner(ctx con
 		*poll = next
 		return nil
 	})
-	if out.ChatID == "" {
+	if out.ChatID == "" && err == nil {
 		out, _, _ = s.ChatPoll(ctx, chatID)
 	}
 	return out, err
@@ -138,7 +174,7 @@ func (s *Store) RecordChatPollSuccessWithContinuationAndScheduleForOwner(ctx con
 // projection only for the current control-lease holder. A Graph error must
 // never let a stale listener block a new owner's poll lane.
 func (s *Store) RecordChatPollErrorWithBlockForOwner(ctx context.Context, chatID string, message string, blockedUntil time.Time, machineID string, leaseGeneration int64) error {
-	_, _, err := s.UpdateChatPollForOwner(ctx, chatID, machineID, leaseGeneration, func(poll *ChatPollState) error {
+	_, _, err := s.updateChatPollWithCapabilityForOwner(ctx, chatID, machineID, leaseGeneration, func(poll *ChatPollState) error {
 		state := State{ChatPolls: map[string]ChatPollState{chatID: *poll}}
 		next := applyChatPollErrorWithBlockLocked(&state, strings.TrimSpace(chatID), trimDiagnostic(message, 240), blockedUntil, time.Now())
 		invalidateChatPollAttempt(&next)
@@ -154,6 +190,34 @@ func (s *Store) RecordChatPollErrorWithBlockForOwner(ctx context.Context, chatID
 // the frontier write. Stores without a materialized control lease retain the
 // legacy unbound behavior so an older state file can still be migrated.
 func (s *Store) updateChatPollWithCapability(ctx context.Context, chatID string, capability *ChatPollAttemptCapability, fn func(*ChatPollState) error) (ChatPollState, bool, error) {
+	out, changed, err := s.updateChatPollWithCapabilityChecked(ctx, chatID, capability, fn)
+	if err == errStoreOwnerCapabilityMismatch {
+		// Preserve the historical public API contract for callers that only need
+		// an owner-fenced no-op. The checked wrappers below use the same durable
+		// mutation but surface the mismatch so they can stop before side effects.
+		return out, false, nil
+	}
+	return out, changed, err
+}
+
+func (s *Store) updateChatPollWithCapabilityForOwner(ctx context.Context, chatID, machineID string, leaseGeneration int64, fn func(*ChatPollState) error) (ChatPollState, bool, error) {
+	if strings.TrimSpace(machineID) == "" || leaseGeneration <= 0 {
+		return ChatPollState{}, false, ErrControlLeaseNotHeld
+	}
+	capability := &ChatPollAttemptCapability{Owner: strings.TrimSpace(machineID), LeaseGeneration: leaseGeneration}
+	out, changed, err := s.updateChatPollWithCapabilityChecked(ctx, chatID, capability, fn)
+	if err == errStoreOwnerCapabilityMismatch {
+		return out, false, ErrControlLeaseNotHeld
+	}
+	return out, changed, err
+}
+
+// updateChatPollWithCapabilityChecked retains the exact durable mutation used
+// by the compatibility API, but distinguishes an owner fence failure from a
+// callback that intentionally made no change. This distinction is essential
+// after a network request: a stale listener must not continue to Graph or
+// session side effects merely because its schedule write became a no-op.
+func (s *Store) updateChatPollWithCapabilityChecked(ctx context.Context, chatID string, capability *ChatPollAttemptCapability, fn func(*ChatPollState) error) (ChatPollState, bool, error) {
 	chatID = strings.TrimSpace(chatID)
 	if chatID == "" {
 		return ChatPollState{}, false, fmt.Errorf("chat id is required")
@@ -202,7 +266,7 @@ func (s *Store) updateChatPollWithCapability(ctx context.Context, chatID string,
 	err := s.Update(ctx, func(state *State) error {
 		if !storeOwnerCapabilityMatchesActiveLease(state, capabilityOwner(capability), capabilityLeaseGeneration(capability)) {
 			out = state.ChatPolls[chatID]
-			return errStoreNoChange
+			return errStoreOwnerCapabilityMismatch
 		}
 		if state.ChatPolls == nil {
 			state.ChatPolls = make(map[string]ChatPollState)
@@ -211,7 +275,7 @@ func (s *Store) updateChatPollWithCapability(ctx context.Context, chatID string,
 		if chatPollAttemptNeedsActiveLeaseForReclaim(&poll, capability) &&
 			!storeOwnerCapabilityMatchesMaterializedActiveLease(state, capabilityOwner(capability), capabilityLeaseGeneration(capability)) {
 			out = poll
-			return errStoreNoChange
+			return errStoreOwnerCapabilityMismatch
 		}
 		if err := mutate(&poll); err != nil {
 			if err == errStoreNoChange {
@@ -506,6 +570,14 @@ func chatPollAttemptRevisionCanBeAdopted(poll *ChatPollState, attemptID string, 
 
 func chatPollAttemptMatchesCapability(poll *ChatPollState, attemptID string, expectedRevision uint64, capability *ChatPollAttemptCapability, now time.Time) bool {
 	if poll == nil || poll.Attempt == nil || strings.TrimSpace(poll.Attempt.ID) != attemptID {
+		return false
+	}
+	// A syntactically valid but semantically malformed row is retained as
+	// recovery evidence.  It is never an executable capability, even if an
+	// older writer happened to leave an otherwise well-shaped Attempt inside
+	// that opaque JSON.  This closes the SQLite opaque-row fence without
+	// rewriting forensic bytes during a session rebind/close.
+	if chatPollHasOpaqueRecoveryEvidence(*poll) {
 		return false
 	}
 	// A zero revision is never a valid capability. Treating it as a wildcard

@@ -19,9 +19,15 @@ import (
 )
 
 const (
-	globalInboundClaimTTL     = 5 * time.Minute
-	globalInboundLockTimeout  = 500 * time.Millisecond
-	maxGlobalInboundLedgerIDs = 2000
+	globalInboundClaimTTL          = 5 * time.Minute
+	globalInboundLockTimeout       = 500 * time.Millisecond
+	globalInboundPruneCloseTimeout = 250 * time.Millisecond
+	// The one-time legacy/projection validation is deliberately outside the
+	// first poll worker fan-out.  Keep startup bounded if the sidecar is damaged
+	// or another process holds its file lock; a later owner generation can retry
+	// the same fail-closed preparation.
+	globalInboundPreparationTimeout = 30 * time.Second
+	maxGlobalInboundLedgerIDs       = 2000
 )
 
 var ErrInboundLedgerProjectionUntrusted = errors.New("Teams inbound ledger projection is untrusted")
@@ -85,10 +91,12 @@ type globalInboundSQLiteWriter struct {
 	gate          chan struct{}
 	stateMu       sync.Mutex
 	path          string
+	ledgerPath    string
 	db            *sql.DB
 	identity      os.FileInfo
 	schemaReady   bool
 	schemaVersion int64
+	prunePending  bool
 }
 
 func (w *globalInboundSQLiteWriter) gateChannel() chan struct{} {
@@ -117,18 +125,25 @@ func (w *globalInboundSQLiteWriter) release() {
 	w.gateChannel() <- struct{}{}
 }
 
-func (w *globalInboundSQLiteWriter) open(path string) (*sql.DB, error) {
+func (w *globalInboundSQLiteWriter) open(path string, ledgerPath ...string) (*sql.DB, error) {
 	if w == nil {
 		return openTeamsLedgerSQLite(path)
 	}
 	w.stateMu.Lock()
 	defer w.stateMu.Unlock()
 	path = filepath.Clean(strings.TrimSpace(path))
+	requestedLedgerPath := ""
+	if len(ledgerPath) > 0 {
+		requestedLedgerPath = filepath.Clean(strings.TrimSpace(ledgerPath[0]))
+	}
 	info, statErr := os.Stat(path)
 	if statErr != nil && !os.IsNotExist(statErr) {
 		return nil, statErr
 	}
 	if w.db != nil && w.path == path && w.identity != nil && info != nil && os.SameFile(w.identity, info) {
+		if requestedLedgerPath != "" {
+			w.ledgerPath = requestedLedgerPath
+		}
 		return w.db, nil
 	}
 	if w.db != nil {
@@ -136,9 +151,11 @@ func (w *globalInboundSQLiteWriter) open(path string) (*sql.DB, error) {
 	}
 	w.db = nil
 	w.path = ""
+	w.ledgerPath = ""
 	w.identity = nil
 	w.schemaReady = false
 	w.schemaVersion = 0
+	w.prunePending = false
 	db, err := openTeamsLedgerSQLite(path)
 	if err != nil {
 		return nil, err
@@ -149,9 +166,19 @@ func (w *globalInboundSQLiteWriter) open(path string) (*sql.DB, error) {
 		return nil, err
 	}
 	w.path = path
+	w.ledgerPath = requestedLedgerPath
 	w.db = db
 	w.identity = info
 	return db, nil
+}
+
+func (w *globalInboundSQLiteWriter) markPrunePending() {
+	if w == nil {
+		return
+	}
+	w.stateMu.Lock()
+	w.prunePending = true
+	w.stateMu.Unlock()
 }
 
 func (w *globalInboundSQLiteWriter) close() error {
@@ -167,12 +194,26 @@ func (w *globalInboundSQLiteWriter) close() error {
 	if w.db == nil {
 		return nil
 	}
+	// Pruning is retention-only maintenance.  Keep it out of every claim and
+	// completion transaction so a poll window with many messages does not scan
+	// the entire replay ledger once per durable transition.  Run at most one
+	// bounded cleanup when the shared writer is closed.  If another process is
+	// using the ledger or the budget expires, leaving extra terminal rows is
+	// safe; the next writer close can retry it.  The file lock preserves the
+	// same cross-process serialization used by the per-message transaction.
+	if w.prunePending && strings.TrimSpace(w.ledgerPath) != "" {
+		pruneCtx, cancel := context.WithTimeout(context.Background(), globalInboundPruneCloseTimeout)
+		_ = pruneGlobalInboundSQLiteWithFileLock(pruneCtx, w.ledgerPath, w.db, time.Now())
+		cancel()
+	}
 	err := w.db.Close()
 	w.db = nil
 	w.path = ""
+	w.ledgerPath = ""
 	w.identity = nil
 	w.schemaReady = false
 	w.schemaVersion = 0
+	w.prunePending = false
 	return err
 }
 
@@ -187,6 +228,39 @@ func globalInboundLedgerPathForRegistry(registryPath string) (string, bool) {
 		return filepath.Join(filepath.Dir(filepath.Dir(dir)), "global-inbound-ledger.json"), true
 	}
 	return filepath.Join(dir, "teams-global-inbound-ledger.json"), true
+}
+
+// prepareGlobalInboundLedger performs the one-time sidecar setup and legacy
+// projection validation before a listener starts its first concurrent poll.
+// It does not claim, complete, or merge any inbound transition; those remain
+// individual transactions in updateGlobalInboundSQLiteWithWriter. Running the
+// preparation here prevents the first worker that happens to claim a message
+// from holding the process-local writer gate while validating every historical
+// row in a large copied/older sidecar.
+func prepareGlobalInboundLedger(ctx context.Context, path string) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return nil
+	}
+	return updateGlobalInboundSQLite(ctx, path, func(*sql.Tx, time.Time) error {
+		return nil
+	})
+}
+
+func (b *Bridge) prepareGlobalInboundLedger(ctx context.Context) error {
+	if b == nil {
+		return nil
+	}
+	path, ok := globalInboundLedgerPathForRegistry(b.registryPath)
+	if !ok {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	prepareCtx, cancel := context.WithTimeout(ctx, globalInboundPreparationTimeout)
+	defer cancel()
+	return prepareGlobalInboundLedger(prepareCtx, path)
 }
 
 func (b *Bridge) tryClaimGlobalInbound(ctx context.Context, chatID string, messageID string) (globalInboundClaim, bool, error) {
@@ -402,7 +476,7 @@ func updateGlobalInboundSQLiteWithWriter(ctx context.Context, path string, write
 	defer func() { _ = lock.Unlock() }()
 	var db *sql.DB
 	if writer != nil {
-		db, err = writer.open(teamsLedgerSQLitePath(path))
+		db, err = writer.open(teamsLedgerSQLitePath(path), path)
 	} else {
 		db, err = openTeamsLedgerSQLite(teamsLedgerSQLitePath(path))
 	}
@@ -448,6 +522,10 @@ func updateGlobalInboundSQLiteWithWriter(ctx context.Context, path string, write
 	// be rolled back and become invisible to the poller.
 	if err := tx.Commit(); err != nil {
 		return err
+	}
+	if writer != nil {
+		writer.markPrunePending()
+		return nil
 	}
 	_ = pruneGlobalInboundSQLiteDB(ctx, db, now)
 	return nil
@@ -1004,6 +1082,40 @@ func pruneGlobalInboundSQLiteDB(ctx context.Context, db *sql.DB, now time.Time) 
 		return err
 	}
 	return tx.Commit()
+}
+
+func pruneGlobalInboundSQLiteWithFileLock(ctx context.Context, ledgerPath string, db *sql.DB, now time.Time) error {
+	return pruneGlobalInboundSQLiteWithFileLockBudget(ctx, ledgerPath, db, now, globalInboundPruneCloseTimeout)
+}
+
+// pruneGlobalInboundSQLiteWithFileLockBudget is kept separate so tests can
+// distinguish the production best-effort close budget from the maintenance
+// operation's eventual convergence.  The listener deliberately uses the
+// short budget above; a later maintenance owner may use its own longer
+// lifecycle budget when the host filesystem is temporarily slow.
+func pruneGlobalInboundSQLiteWithFileLockBudget(ctx context.Context, ledgerPath string, db *sql.DB, now time.Time, budget time.Duration) error {
+	if db == nil {
+		return nil
+	}
+	ledgerPath = strings.TrimSpace(ledgerPath)
+	if ledgerPath == "" {
+		return pruneGlobalInboundSQLiteDB(ctx, db, now)
+	}
+	lock := flock.New(ledgerPath + ".lock")
+	lockCtx, cancel := context.WithTimeout(ctx, budget)
+	defer cancel()
+	ok, err := lock.TryLockContext(lockCtx, 10*time.Millisecond)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		if ctxErr := lockCtx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return fmt.Errorf("global Teams inbound ledger is locked: %s", ledgerPath)
+	}
+	defer func() { _ = lock.Unlock() }()
+	return pruneGlobalInboundSQLiteDB(lockCtx, db, now)
 }
 
 // inboundSQLitePruneEligibility returns whether a row is safe to evict from

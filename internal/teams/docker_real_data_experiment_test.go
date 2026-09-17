@@ -1,6 +1,8 @@
 package teams
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -8,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -21,6 +24,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
@@ -30,9 +35,12 @@ const (
 	dockerRealDataModeEnv            = "CXP_TEAMS_DOCKER_REAL_DATA_MODE"
 	dockerRealDataDurationEnv        = "CXP_TEAMS_DOCKER_REAL_DATA_DURATION"
 	dockerRealDataResumeEnv          = "CXP_TEAMS_DOCKER_REAL_DATA_RESUME"
+	dockerRealDataProcessRestartEnv  = "CXP_TEAMS_DOCKER_PROCESS_RESTART"
 	dockerRealData429ExperimentEnv   = "CXP_TEAMS_DOCKER_REAL_DATA_429"
 	dockerRealData429ScopeEnv        = "CXP_TEAMS_DOCKER_REAL_DATA_429_SCOPE"
+	dockerRealData429PollOnlyEnv     = "CXP_TEAMS_DOCKER_REAL_DATA_429_POLL_ONLY"
 	dockerRealDataPollIntervalEnv    = "CXP_TEAMS_DOCKER_REAL_DATA_POLL_INTERVAL"
+	dockerRealDataStartupDeadlineEnv = "CXP_TEAMS_DOCKER_STARTUP_DEADLINE"
 	dockerRealDataPageSize           = 20
 	dockerRealDataMessageIDPrefix    = "docker-real-data:"
 	dockerRealDataDefaultDuration    = 5 * time.Minute
@@ -46,11 +54,21 @@ const (
 	dockerRealData429HealthyChats    = 1
 	dockerRealData429ScopeChat       = "chat"
 	dockerRealData429ScopeAccount    = "account"
+	dockerRealData429ScopeGlobal     = "global"
 	dockerRealDataDefaultTop         = ownerPollMessageTop
 	dockerRealDataMinimumReplay      = 100
 	dockerRealDataModeThroughput     = "throughput"
 	dockerRealDataModeComplete       = "complete"
 	dockerRealDataExecutionPrefix    = "docker real-data execution result #"
+	dockerRealDataAnyExecutionMarker = "__docker_real_data_any_execution_result__"
+	dockerRealDataGraphOpMessageList = "message-list-get"
+	dockerRealDataGraphOpMessageItem = "message-item-get"
+	dockerRealDataGraphOpMembers     = "members-get"
+	dockerRealDataGraphOpMe          = "me-get"
+	dockerRealDataGraphOpMessagePost = "message-post"
+	dockerRealDataGraphOpMarkUnread  = "mark-unread-post"
+	dockerRealDataGraphOpMeetingPost = "meeting-post"
+	dockerRealDataGraphOpPatch       = "chat-patch"
 )
 
 func dockerRealDataProductionPhaseNames() []string {
@@ -237,6 +255,98 @@ func dockerRealDataInheritedOperationalRows(state teamstore.State) (inboundRows,
 	return inboundRows, turnRows, outboxRows
 }
 
+// dockerRealDataInheritedOperationalRowsWithoutOutbox keeps the data audit
+// useful without materializing the copied production outbox. The source
+// fixture can contain more than a gigabyte of outbox JSON; the throughput
+// experiment only needs the inherited operational-row count, not every body.
+func dockerRealDataInheritedOperationalRowsWithoutOutbox(state teamstore.State) (inboundRows, turnRows int) {
+	isSynthetic := func(messageID string) bool {
+		return strings.HasPrefix(strings.TrimSpace(messageID), dockerRealDataMessageIDPrefix)
+	}
+	for _, inbound := range state.InboundEvents {
+		if !strings.EqualFold(strings.TrimSpace(inbound.Source), "teams") || isSynthetic(inbound.TeamsMessageID) {
+			continue
+		}
+		switch inbound.Status {
+		case teamstore.InboundStatusPersisted, teamstore.InboundStatusDeferred, teamstore.InboundStatusQueued:
+		default:
+			continue
+		}
+		turn, found := state.Turns[strings.TrimSpace(inbound.TurnID)]
+		if !found || !dockerRealDataTerminalTurn(turn.Status) {
+			inboundRows++
+		}
+	}
+	for _, turn := range state.Turns {
+		if turn.Status != teamstore.TurnStatusQueued && turn.Status != teamstore.TurnStatusRunning {
+			continue
+		}
+		inbound, found := state.InboundEvents[strings.TrimSpace(turn.InboundEventID)]
+		if !found || !isSynthetic(inbound.TeamsMessageID) {
+			turnRows++
+		}
+	}
+	return inboundRows, turnRows
+}
+
+// dockerRealDataInheritedOperationalOutboxRowsCount observes only indexed
+// outbox columns plus the small synthetic markers. It deliberately does not
+// decode a historical outbox body; the copied rows remain untouched and the
+// production listener still sees the complete table.
+func dockerRealDataInheritedOperationalOutboxRowsCount(ctx context.Context, path string) (int, error) {
+	query := url.Values{}
+	query.Set("mode", "ro")
+	db, err := sql.Open("sqlite", teamsSQLiteFileURI(path, query))
+	if err != nil {
+		return 0, err
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	var count int
+	err = db.QueryRowContext(ctx, `
+		SELECT count(*)
+		FROM outbox_messages
+		WHERE status IN (?, ?, ?)
+		  AND COALESCE(trim(turn_id), '') NOT LIKE 'docker-real-data-turn-%'
+		  AND COALESCE(CAST(json AS TEXT), '') NOT LIKE '%' || ? || '%'`,
+		string(teamstore.OutboxStatusQueued), string(teamstore.OutboxStatusSending), string(teamstore.OutboxStatusAccepted), dockerRealDataExecutionPrefix).Scan(&count)
+	return count, err
+}
+
+// dockerRealDataOutboxMessageByIDReadOnly is the only outbox materialization
+// needed by a resumed run: the prior process writes one durable ambiguous-POST
+// witness ID. A point lookup keeps the resume audit independent of the size of
+// the inherited outbox table.
+func dockerRealDataOutboxMessageByIDReadOnly(ctx context.Context, path string, outboxID string) (teamstore.OutboxMessage, bool, error) {
+	query := url.Values{}
+	query.Set("mode", "ro")
+	db, err := sql.Open("sqlite", teamsSQLiteFileURI(path, query))
+	if err != nil {
+		return teamstore.OutboxMessage{}, false, err
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	var rowID string
+	var raw []byte
+	err = db.QueryRowContext(ctx, `SELECT id, json FROM outbox_messages WHERE id = ?`, strings.TrimSpace(outboxID)).Scan(&rowID, &raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return teamstore.OutboxMessage{}, false, nil
+	}
+	if err != nil {
+		return teamstore.OutboxMessage{}, false, err
+	}
+	var message teamstore.OutboxMessage
+	if err := json.Unmarshal(raw, &message); err != nil {
+		return teamstore.OutboxMessage{}, false, fmt.Errorf("decode outbox witness %q: %w", rowID, err)
+	}
+	if strings.TrimSpace(message.ID) == "" || strings.TrimSpace(message.ID) != strings.TrimSpace(rowID) {
+		return teamstore.OutboxMessage{}, false, fmt.Errorf("outbox witness identity mismatch: sql=%q json=%q", rowID, message.ID)
+	}
+	return message, true, nil
+}
+
 func dockerRealDataReplayCorpusPath(statePath string) string {
 	return filepath.Join(filepath.Dir(statePath), "docker-real-data-replay-corpus.json")
 }
@@ -287,15 +397,145 @@ func dockerRealDataTerminalTurn(status teamstore.TurnStatus) bool {
 }
 
 func dockerRealDataAmbiguousExecutionOutboxes(state teamstore.State) []teamstore.OutboxMessage {
-	const firstExecutionBody = dockerRealDataExecutionPrefix + "1"
 	rows := make([]teamstore.OutboxMessage, 0)
 	for _, outbox := range state.OutboxMessages {
-		if strings.TrimSpace(outbox.Body) != firstExecutionBody || !teamstore.OutboxSendIsAmbiguous(outbox) {
+		if !dockerRealDataExecutionResultBody(outbox.Body) || !teamstore.OutboxSendIsAmbiguous(outbox) {
 			continue
 		}
 		rows = append(rows, outbox)
 	}
 	return rows
+}
+
+func dockerRealDataAmbiguousOutboxesForChat(state teamstore.State, chatID string) []teamstore.OutboxMessage {
+	chatID = strings.TrimSpace(chatID)
+	rows := make([]teamstore.OutboxMessage, 0)
+	for _, outbox := range state.OutboxMessages {
+		if strings.TrimSpace(outbox.TeamsChatID) != chatID || !teamstore.OutboxSendIsAmbiguous(outbox) {
+			continue
+		}
+		rows = append(rows, outbox)
+	}
+	sort.Slice(rows, func(i, j int) bool {
+		return strings.TrimSpace(rows[i].ID) < strings.TrimSpace(rows[j].ID)
+	})
+	return rows
+}
+
+type dockerRealDataUnknownPostWitness struct {
+	OutboxID    string `json:"outbox_id"`
+	ChatID      string `json:"chat_id"`
+	BodyHash    string `json:"body_hash"`
+	PayloadHash string `json:"payload_hash"`
+}
+
+func dockerRealDataUnknownPostWitnessPath(statePath string) string {
+	return filepath.Join(filepath.Dir(statePath), "docker-real-data-unknown-post-witness.json")
+}
+
+func dockerRealDataOutboxBodyHash(body string) string {
+	digest := sha256.Sum256([]byte(body))
+	return fmt.Sprintf("%x", digest[:])
+}
+
+func dockerRealDataPostPayloadHash(payload []byte) string {
+	digest := sha256.Sum256(payload)
+	return fmt.Sprintf("%x", digest[:])
+}
+
+func dockerRealDataPostPayloadOutboxID(raw []byte) string {
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return ""
+	}
+	contentFrom := func(value any) string {
+		body, ok := value.(map[string]any)
+		if !ok {
+			return ""
+		}
+		content, _ := body["content"].(string)
+		return content
+	}
+	if id := helperOutboxProvenanceMarkerID(contentFrom(payload["body"])); id != "" {
+		return id
+	}
+	replyMessage, _ := payload["replyMessage"].(map[string]any)
+	return helperOutboxProvenanceMarkerID(contentFrom(replyMessage["body"]))
+}
+
+func dockerRealDataUnknownPostDispositionSafe(outbox teamstore.OutboxMessage) bool {
+	switch outbox.Status {
+	case teamstore.OutboxStatusSending:
+		return strings.TrimSpace(outbox.TeamsMessageID) == "" && teamstore.OutboxSendIsAmbiguous(outbox)
+	case teamstore.OutboxStatusAccepted, teamstore.OutboxStatusSent:
+		return strings.TrimSpace(outbox.TeamsMessageID) != ""
+	case teamstore.OutboxStatusSkipped:
+		// Only low-value control/progress output may be retired after an unknown
+		// POST to release a later user-visible row. A final/turn_completed row
+		// must never satisfy this oracle: skipping it would hide a lost answer
+		// behind a superficially "safe" non-queued status.
+		return outboxDeliverySupersedable(outbox) && !isCompletionNotificationOutbox(outbox)
+	default:
+		return false
+	}
+}
+
+func writeDockerRealDataUnknownPostWitness(t *testing.T, statePath string, outbox teamstore.OutboxMessage, graph *dockerRealDataGraphServer) {
+	t.Helper()
+	witness := dockerRealDataUnknownPostWitness{
+		OutboxID:    strings.TrimSpace(outbox.ID),
+		ChatID:      strings.TrimSpace(outbox.TeamsChatID),
+		BodyHash:    dockerRealDataOutboxBodyHash(outbox.Body),
+		PayloadHash: graph.unknownPostPayloadHashSnapshot(),
+	}
+	if witness.PayloadHash == "" {
+		t.Fatalf("write Docker real-data unknown POST witness: fake Graph has no accepted payload hash")
+	}
+	data, err := json.Marshal(witness)
+	if err != nil {
+		t.Fatalf("encode Docker real-data unknown POST witness: %v", err)
+	}
+	if err := os.WriteFile(dockerRealDataUnknownPostWitnessPath(statePath), data, 0o600); err != nil {
+		t.Fatalf("write Docker real-data unknown POST witness: %v", err)
+	}
+}
+
+func readDockerRealDataUnknownPostWitness(t *testing.T, statePath string) dockerRealDataUnknownPostWitness {
+	t.Helper()
+	path := dockerRealDataUnknownPostWitnessPath(statePath)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read Docker real-data unknown POST witness %q: %v", path, err)
+	}
+	var witness dockerRealDataUnknownPostWitness
+	if err := json.Unmarshal(data, &witness); err != nil {
+		t.Fatalf("decode Docker real-data unknown POST witness %q: %v", path, err)
+	}
+	if witness.OutboxID == "" || witness.ChatID == "" || witness.BodyHash == "" || witness.PayloadHash == "" {
+		t.Fatalf("Docker real-data unknown POST witness is incomplete: %#v", witness)
+	}
+	return witness
+}
+
+func dockerRealDataExecutionResultBody(text string) bool {
+	text = strings.TrimSpace(text)
+	if !strings.HasPrefix(text, dockerRealDataExecutionPrefix) {
+		return false
+	}
+	suffix := text[len(dockerRealDataExecutionPrefix):]
+	digits := 0
+	for digits < len(suffix) && suffix[digits] >= '0' && suffix[digits] <= '9' {
+		digits++
+	}
+	return digits > 0 && strings.TrimSpace(suffix[digits:]) == ""
+}
+
+func lastLineAfterTeamsLabel(plain string) string {
+	index := strings.LastIndex(plain, dockerRealDataExecutionPrefix)
+	if index < 0 {
+		return ""
+	}
+	return strings.TrimSpace(plain[index:])
 }
 
 func dockerRealDataTurnStatusSQL(alias string) string {
@@ -417,7 +657,14 @@ func dockerRealDataReplayCorpus(state teamstore.State, controlChatID string) (ma
 		report.Accepted++
 	}
 
-	base := time.Now().UTC().Add(2 * time.Second)
+	// The copied store can spend seconds (or, on a large historical fixture,
+	// minutes) preparing its first durable cycle.  A two-second lead is not a
+	// stable freshness boundary: by the time the listener builds its first
+	// Graph filter, the synthetic page may already be behind the copied cursor
+	// or the current-time lower bound and the experiment would measure an empty
+	// page instead of the real admission path.  Keep the replay timestamps
+	// comfortably ahead of startup while retaining their source order.
+	base := time.Now().UTC().Add(10 * time.Minute)
 	corpus := make(map[string][]ChatMessage, len(byChat))
 	total := 0
 	for chatID, sources := range byChat {
@@ -521,14 +768,95 @@ func TestDockerRealDataInheritedOutboxRowsAreRejectedFromSyntheticAccounting(t *
 	}
 }
 
+type dockerRealDataTimingAggregate struct {
+	Count  int
+	Errors int
+	Total  time.Duration
+	Max    time.Duration
+}
+
 type dockerRealDataTraceWriter struct {
-	mu            sync.Mutex
-	listeningAt   time.Time
-	lines         []string
-	events        []string
-	leaseClaims   []string
-	ownerFailures []string
-	pollChats     []string
+	mu             sync.Mutex
+	listeningAt    time.Time
+	lines          []string
+	events         []string
+	leaseClaims    []string
+	ownerFailures  []string
+	pollChats      []string
+	pollSelections []string
+	queuedTurns    []string
+	pollMessages   []string
+	outboxStages   []string
+	storeTimings   []string
+	timings        map[string]dockerRealDataTimingAggregate
+}
+
+// recordTiming retains every observation for the real-data diagnosis. A phase
+// can run jobs concurrently, so Total is the sum of observations while Max is
+// the contribution of the slowest member to the phase wall time. The report
+// emits both instead of incorrectly treating parallel work as serial.
+func (w *dockerRealDataTraceWriter) recordTiming(name string, elapsed time.Duration, err error) {
+	if w == nil || strings.TrimSpace(name) == "" {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.timings == nil {
+		w.timings = make(map[string]dockerRealDataTimingAggregate)
+	}
+	name = strings.TrimSpace(name)
+	aggregate := w.timings[name]
+	aggregate.Count++
+	aggregate.Total += elapsed
+	if elapsed > aggregate.Max {
+		aggregate.Max = elapsed
+	}
+	if err != nil {
+		aggregate.Errors++
+	}
+	w.timings[name] = aggregate
+}
+
+func (w *dockerRealDataTraceWriter) timingAggregatesSummary() string {
+	return w.timingAggregatesSummaryFor()
+}
+
+func (w *dockerRealDataTraceWriter) timingAggregatesSummaryFor(prefixes ...string) string {
+	if w == nil {
+		return "count=0"
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.timings) == 0 {
+		return "count=0"
+	}
+	keys := make([]string, 0, len(w.timings))
+	for key := range w.timings {
+		if len(prefixes) > 0 {
+			matched := false
+			for _, prefix := range prefixes {
+				if strings.HasPrefix(key, prefix) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
+		}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(keys))
+	for _, key := range keys {
+		aggregate := w.timings[key]
+		average := time.Duration(0)
+		if aggregate.Count > 0 {
+			average = aggregate.Total / time.Duration(aggregate.Count)
+		}
+		parts = append(parts, fmt.Sprintf("%s{n=%d,total=%s,avg=%s,max=%s,errors=%d}", key, aggregate.Count, aggregate.Total, average, aggregate.Max, aggregate.Errors))
+	}
+	return strings.Join(parts, " ")
 }
 
 func (w *dockerRealDataTraceWriter) recordPollChat(chatID string, elapsed time.Duration, err error) {
@@ -554,6 +882,157 @@ func (w *dockerRealDataTraceWriter) pollChatsSnapshot() []string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return append([]string(nil), w.pollChats...)
+}
+
+func (w *dockerRealDataTraceWriter) recordPollSelection(stage, faultChatID string, decisions []inboundPollDecision) {
+	if w == nil || strings.TrimSpace(faultChatID) == "" {
+		return
+	}
+	present := false
+	targetIndex := -1
+	var target inboundPollDecision
+	for index, decision := range decisions {
+		if strings.TrimSpace(decision.ChatID) == strings.TrimSpace(faultChatID) {
+			targetIndex = index
+			target = decision
+			present = true
+			break
+		}
+	}
+	targetSummary := "absent"
+	if targetIndex >= 0 {
+		targetSummary = fmt.Sprintf("index=%d state=%s due=%t retry=%t operational=%t next=%s last_error=%s last_success=%s last_activity=%s", targetIndex, target.State, target.Due, target.RetryFailure, target.OperationalFrontier, target.NextPollAt.UTC().Format(time.RFC3339Nano), target.LastErrorAt.UTC().Format(time.RFC3339Nano), target.LastSuccessfulPollAt.UTC().Format(time.RFC3339Nano), target.LastActivityAt.UTC().Format(time.RFC3339Nano))
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.pollSelections) >= 128 {
+		return
+	}
+	w.pollSelections = append(w.pollSelections, fmt.Sprintf("stage=%s fault_chat=%s target_present=%t decisions=%d target=%s", strings.TrimSpace(stage), strings.TrimSpace(faultChatID), present, len(decisions), targetSummary))
+}
+
+func (w *dockerRealDataTraceWriter) pollSelectionsSnapshot() []string {
+	if w == nil {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]string(nil), w.pollSelections...)
+}
+
+func (w *dockerRealDataTraceWriter) recordQueuedTurn(stage, sessionID, turnID string, started bool, err error) {
+	if w == nil {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.queuedTurns) >= 512 {
+		return
+	}
+	diagnostic := ""
+	if err != nil {
+		diagnostic = trimPollDiagnostic(err.Error())
+	}
+	w.queuedTurns = append(w.queuedTurns, fmt.Sprintf("at=%s stage=%s session=%s turn=%s started=%t err=%q", time.Now().UTC().Format(time.RFC3339Nano), stage, strings.TrimSpace(sessionID), strings.TrimSpace(turnID), started, diagnostic))
+}
+
+func (w *dockerRealDataTraceWriter) queuedTurnsSnapshot() []string {
+	if w == nil {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]string(nil), w.queuedTurns...)
+}
+
+func (w *dockerRealDataTraceWriter) recordPollMessage(chatID, messageID, disposition string, err error) {
+	if w == nil {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.pollMessages) >= 2048 {
+		return
+	}
+	diagnostic := ""
+	if err != nil {
+		diagnostic = trimPollDiagnostic(err.Error())
+	}
+	w.pollMessages = append(w.pollMessages, fmt.Sprintf("at=%s chat=%s message=%s disposition=%s err=%q", time.Now().UTC().Format(time.RFC3339Nano), strings.TrimSpace(chatID), strings.TrimSpace(messageID), strings.TrimSpace(disposition), diagnostic))
+}
+
+func (w *dockerRealDataTraceWriter) pollMessagesSnapshot() []string {
+	if w == nil {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]string(nil), w.pollMessages...)
+}
+
+func (w *dockerRealDataTraceWriter) recordOutboxSendStage(outboxID, stage string, duration time.Duration, err error) {
+	if w == nil {
+		return
+	}
+	w.recordTiming("outbox.send."+strings.TrimSpace(stage), duration, err)
+	if duration < 10*time.Millisecond && err == nil {
+		return
+	}
+	diagnostic := ""
+	if err != nil {
+		diagnostic = trimPollDiagnostic(err.Error())
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.outboxStages) >= 1024 {
+		return
+	}
+	w.outboxStages = append(w.outboxStages, fmt.Sprintf("outbox=%s stage=%s duration=%s err=%q", strings.TrimSpace(outboxID), strings.TrimSpace(stage), duration, diagnostic))
+}
+
+func (w *dockerRealDataTraceWriter) outboxSendStagesSnapshot() []string {
+	if w == nil {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]string(nil), w.outboxStages...)
+}
+
+func (w *dockerRealDataTraceWriter) recordStoreTiming(event teamstore.StoreTimingEvent) {
+	if w == nil {
+		return
+	}
+	// Store emits a timing event for every lock/file boundary. Recording every
+	// sub-millisecond event would make the diagnostic observer itself contend
+	// with the Store mutex and distort the workload. The report is intended to
+	// explain material wall-time, so retain >=1ms events and every error; the
+	// existing sample remains stricter at 10ms.
+	if event.Duration >= time.Millisecond || event.Err != nil {
+		w.recordTiming("store."+strings.TrimSpace(event.Operation)+"."+strings.TrimSpace(event.Stage), event.Duration, event.Err)
+	}
+	if event.Duration < 10*time.Millisecond && event.Err == nil {
+		return
+	}
+	diagnostic := ""
+	if event.Err != nil {
+		diagnostic = trimPollDiagnostic(event.Err.Error())
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.storeTimings) >= 1024 {
+		return
+	}
+	w.storeTimings = append(w.storeTimings, fmt.Sprintf("operation=%s stage=%s duration=%s err=%q", strings.TrimSpace(event.Operation), strings.TrimSpace(event.Stage), event.Duration, diagnostic))
+}
+
+func (w *dockerRealDataTraceWriter) storeTimingsSnapshot() []string {
+	if w == nil {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]string(nil), w.storeTimings...)
 }
 
 func (w *dockerRealDataTraceWriter) Write(p []byte) (int, error) {
@@ -586,6 +1065,26 @@ func (w *dockerRealDataTraceWriter) linesSnapshot() []string {
 	return append([]string(nil), w.lines...)
 }
 
+// linesContaining returns only the small, structured diagnostics needed to
+// explain a slow phase. Keep this separate from linesSnapshot: the latter is
+// intentionally capped and is useful for startup failures, while a realistic
+// replay can fill that cap with unrelated listener output before the final
+// throughput assertion runs.
+func (w *dockerRealDataTraceWriter) linesContaining(needle string) []string {
+	if w == nil || strings.TrimSpace(needle) == "" {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var out []string
+	for _, line := range w.lines {
+		if strings.Contains(line, needle) {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
 func (w *dockerRealDataTraceWriter) listeningTime() time.Time {
 	if w == nil {
 		return time.Time{}
@@ -614,6 +1113,23 @@ func (w *dockerRealDataTraceWriter) recordLeaseClaim(decision teamstore.ControlL
 		return
 	}
 	w.leaseClaims = append(w.leaseClaims, fmt.Sprintf("mode=%s generation=%d holder=%s reason=%q err=%v", decision.Mode, decision.Lease.Generation, decision.Lease.HolderMachineID, decision.Reason, err))
+}
+
+func (w *dockerRealDataTraceWriter) recordLeaseClaimWitness(store *teamstore.Store) {
+	if w == nil || store == nil {
+		return
+	}
+	owner, found, err := store.ReadOwner(context.Background())
+	diagnostic := ""
+	if err != nil {
+		diagnostic = trimPollDiagnostic(err.Error())
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.leaseClaims) >= 32 {
+		return
+	}
+	w.leaseClaims = append(w.leaseClaims, fmt.Sprintf("witness found=%t machine=%s generation=%d pid=%d instance=%s err=%q", found, strings.TrimSpace(owner.MachineID), owner.LeaseGeneration, owner.PID, strings.TrimSpace(owner.InstanceID), diagnostic))
 }
 
 func (w *dockerRealDataTraceWriter) leaseClaimsSnapshot() []string {
@@ -739,6 +1255,8 @@ type dockerRealDataMaintenanceTrace struct {
 	ordinaryLinkedWhileBacklog  int
 	ordinaryHistoryPaths        []string
 	ordinaryLinkedSessions      []string
+	ordinaryLinkedSuppressed    int
+	ordinaryLinkedUnsuppressed  int
 	ordinaryUnindexedLinked     int
 	ordinaryUnindexedLinkedIDs  map[string]int
 	syntheticBacklogSamples     int
@@ -803,6 +1321,11 @@ func (t *dockerRealDataMaintenanceTrace) observeLinked(ctx context.Context, sess
 	if !mandatory {
 		t.mu.Lock()
 		t.ordinaryLinkedWhileBacklog++
+		if linkedTranscriptNonEssentialSideEffectsSuppressed(ctx) {
+			t.ordinaryLinkedSuppressed++
+		} else {
+			t.ordinaryLinkedUnsuppressed++
+		}
 		if t.linkedUnindexed[session.ID] {
 			t.ordinaryUnindexedLinked++
 			if t.ordinaryUnindexedLinkedIDs == nil {
@@ -834,6 +1357,15 @@ func (t *dockerRealDataMaintenanceTrace) ordinaryWorkSnapshot() (historyPaths, l
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return append([]string(nil), t.ordinaryHistoryPaths...), append([]string(nil), t.ordinaryLinkedSessions...)
+}
+
+func (t *dockerRealDataMaintenanceTrace) ordinaryLinkedPolicySnapshot() (suppressed, unsuppressed int) {
+	if t == nil {
+		return 0, 0
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.ordinaryLinkedSuppressed, t.ordinaryLinkedUnsuppressed
 }
 
 func (t *dockerRealDataMaintenanceTrace) ordinaryUnindexedLinkedSnapshot() int {
@@ -888,37 +1420,129 @@ type dockerRealDataGraphServer struct {
 	postAttempts              map[string]int
 	acceptedPostKeys          map[string]int
 	pollServedMessageIDs      map[string]int
+	pollServedMessageRequests map[string][]string
 	providerTokens            map[string]dockerRealDataProviderContinuation
 	expiredTokens             map[string]struct{}
 	unknownPostKey            string
 	unknownPostChat           string
+	unknownPostOutboxID       string
+	unknownPostPayloadHash    string
 	unknownPostMarker         string
+	// durableUnknownPostWitness is loaded from the previous disposable
+	// process.  It is a test-side remote-operation fence: if a resumed listener
+	// tries to POST the exact already-ambiguous outbox again, the fake Graph
+	// rejects it and records the replay instead of accepting a new operation.
+	durableUnknownPostWitness bool
 	faultChatID               string
 	faultSequence             []int
+	faultResponses            []int
+	faultRequestPaths         []string
 	rateLimitListFailures     map[string]int
 	rateLimitBindRemaining    int
 	rateLimitFailureBudget    int
 	rateLimitGlobalRemaining  int
 	rateLimitGlobalConfigured bool
+	rateLimitGlobalScope      string
+	rateLimitOperations       map[string]dockerRealDataRateLimitBudget
+	graphRequests             []dockerRealDataGraphRequest
+	graphRequestCounts        map[string]int
+	graphRequest429s          map[string]int
+	graphRequestAccepts       map[string]int
 
-	listGETs             atomic.Int64
-	itemGETs             atomic.Int64
-	posts                atomic.Int64
-	status429            atomic.Int64
-	status503            atomic.Int64
-	unknownPosts         atomic.Int64
-	unknownPostRepeats   atomic.Int64
-	opaqueContinuations  atomic.Int64
-	expiredContinuations atomic.Int64
-	unknownContinuations atomic.Int64
-	unsupportedFilters   atomic.Int64
-	invalidListQueries   atomic.Int64
-	pageCounts           map[string]int
+	listGETs              atomic.Int64
+	itemGETs              atomic.Int64
+	itemGETNotFound       atomic.Int64
+	posts                 atomic.Int64
+	messagePostAttempts   atomic.Int64
+	messagePostResponses  atomic.Int64
+	messagePostAccepts    atomic.Int64
+	markUnreadPosts       atomic.Int64
+	status429             atomic.Int64
+	status503             atomic.Int64
+	unknownPosts          atomic.Int64
+	unknownPostRepeats    atomic.Int64
+	unknownPostMismatches atomic.Int64
+	opaqueContinuations   atomic.Int64
+	expiredContinuations  atomic.Int64
+	unknownContinuations  atomic.Int64
+	unsupportedFilters    atomic.Int64
+	invalidListQueries    atomic.Int64
+	pageCounts            map[string]int
 }
 
 type dockerRealDataProviderContinuation struct {
 	chatID string
 	offset int
+	query  url.Values
+	poll   bool
+}
+
+// dockerRealDataGraphRequest is a bounded, exact remote-side witness for the
+// fake Graph boundary. The real-data experiment must be able to prove which
+// operation consumed a fault and whether that operation reached the fake
+// remote side; aggregate status429 counters alone cannot distinguish a poll
+// list read from an outbox POST or a maintenance PATCH.
+type dockerRealDataGraphRequest struct {
+	Method         string
+	Path           string
+	Operation      string
+	BodyHash       string
+	StatusCode     int
+	RateLimitScope string
+	RemoteAccepted bool
+	StartedAt      time.Time
+	CompletedAt    time.Time
+}
+
+type dockerRealDataRateLimitBudget struct {
+	Scope     string
+	Remaining int
+}
+
+// dockerRealDataResponseWriter captures the final HTTP status without
+// weakening the unknown-POST test's connection-hijack behavior.
+type dockerRealDataResponseWriter struct {
+	http.ResponseWriter
+	status      int
+	wroteHeader bool
+}
+
+func (w *dockerRealDataResponseWriter) WriteHeader(status int) {
+	if w.wroteHeader {
+		return
+	}
+	w.status = status
+	w.wroteHeader = true
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *dockerRealDataResponseWriter) Write(body []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(body)
+}
+
+func (w *dockerRealDataResponseWriter) finalStatus() int {
+	if w == nil || !w.wroteHeader {
+		return http.StatusOK
+	}
+	return w.status
+}
+
+func (w *dockerRealDataResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := w.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("fake Graph response writer does not support hijacking")
+	}
+	return hijacker.Hijack()
+}
+
+func (w *dockerRealDataResponseWriter) Flush() {
+	flusher, ok := w.ResponseWriter.(http.Flusher)
+	if ok {
+		flusher.Flush()
+	}
 }
 
 type dockerRealDataExpiredContinuationError struct {
@@ -935,22 +1559,31 @@ func newDockerRealDataGraphServer(token string, user User, replay map[string][]C
 		knownChats[strings.TrimSpace(chatID)] = struct{}{}
 	}
 	return &dockerRealDataGraphServer{
-		token:                 token,
-		user:                  user,
-		base:                  time.Now().UTC().Add(2 * time.Second),
-		replay:                replay,
-		knownChats:            knownChats,
-		postAttempts:          make(map[string]int),
-		acceptedPostKeys:      make(map[string]int),
-		pollServedMessageIDs:  make(map[string]int),
-		providerTokens:        make(map[string]dockerRealDataProviderContinuation),
-		expiredTokens:         make(map[string]struct{}),
-		rateLimitListFailures: make(map[string]int),
-		pageCounts:            make(map[string]int),
+		token:                     token,
+		user:                      user,
+		base:                      time.Now().UTC().Add(2 * time.Second),
+		replay:                    replay,
+		knownChats:                knownChats,
+		postAttempts:              make(map[string]int),
+		acceptedPostKeys:          make(map[string]int),
+		pollServedMessageIDs:      make(map[string]int),
+		pollServedMessageRequests: make(map[string][]string),
+		providerTokens:            make(map[string]dockerRealDataProviderContinuation),
+		expiredTokens:             make(map[string]struct{}),
+		rateLimitListFailures:     make(map[string]int),
+		rateLimitOperations:       make(map[string]dockerRealDataRateLimitBudget),
+		graphRequestCounts:        make(map[string]int),
+		graphRequest429s:          make(map[string]int),
+		graphRequestAccepts:       make(map[string]int),
+		pageCounts:                make(map[string]int),
 	}
 }
 
 func (g *dockerRealDataGraphServer) setValidProviderContinuation(token string, chatID string, offset int) {
+	g.setValidProviderContinuationWithQuery(token, chatID, offset, nil)
+}
+
+func (g *dockerRealDataGraphServer) setValidProviderContinuationWithQuery(token string, chatID string, offset int, query url.Values) {
 	if g == nil || strings.TrimSpace(token) == "" {
 		return
 	}
@@ -959,7 +1592,19 @@ func (g *dockerRealDataGraphServer) setValidProviderContinuation(token string, c
 	if g.providerTokens == nil {
 		g.providerTokens = make(map[string]dockerRealDataProviderContinuation)
 	}
-	g.providerTokens[strings.TrimSpace(token)] = dockerRealDataProviderContinuation{chatID: strings.TrimSpace(chatID), offset: offset}
+	cleanQuery := make(url.Values, len(query))
+	for key, values := range query {
+		if key == "$skiptoken" {
+			continue
+		}
+		cleanQuery[key] = append([]string(nil), values...)
+	}
+	g.providerTokens[strings.TrimSpace(token)] = dockerRealDataProviderContinuation{
+		chatID: strings.TrimSpace(chatID),
+		offset: offset,
+		query:  cleanQuery,
+		poll:   dockerRealDataPollListRequest(cleanQuery),
+	}
 	delete(g.expiredTokens, strings.TrimSpace(token))
 }
 
@@ -1026,6 +1671,42 @@ func dockerRealDataExpiredProviderTokens(server *dockerRealDataGraphServer, stat
 	return len(seen)
 }
 
+// dockerRealDataExpiredProviderContinuationChats returns copied chats that
+// still carry at least one provider-issued opaque continuation. The real-data
+// experiment uses the first such chat as a targeted recovery witness: it only
+// changes that disposable row's due-time ordering, so a short listener window
+// cannot finish without exercising the expired-continuation path.
+func dockerRealDataExpiredProviderContinuationChats(state teamstore.State) []string {
+	chats := make([]string, 0)
+	seenChats := make(map[string]struct{})
+	for chatID, poll := range state.ChatPolls {
+		chatID = strings.TrimSpace(chatID)
+		if chatID == "" {
+			continue
+		}
+		paths := []string{poll.ContinuationPath, poll.DeferredContinuationPath}
+		if poll.PendingPage != nil {
+			paths = append(paths, poll.PendingPage.RequestPath, poll.PendingPage.NextPath)
+		}
+		if poll.Gap != nil {
+			paths = append(paths, poll.Gap.FrontierPath, poll.Gap.RecoveryPath, poll.Gap.HeadProbeContinuationPath)
+		}
+		for _, path := range paths {
+			if dockerRealDataProviderToken(path) == "" {
+				continue
+			}
+			if _, seen := seenChats[chatID]; seen {
+				break
+			}
+			seenChats[chatID] = struct{}{}
+			chats = append(chats, chatID)
+			break
+		}
+	}
+	sort.Strings(chats)
+	return chats
+}
+
 func (g *dockerRealDataGraphServer) skipOffset(chatID string, values url.Values, filteredLength int) (int, error) {
 	raw := strings.TrimSpace(values.Get("$skiptoken"))
 	if raw == "" {
@@ -1056,6 +1737,39 @@ func (g *dockerRealDataGraphServer) skipOffset(chatID string, values url.Values,
 	return provider.offset, nil
 }
 
+func (g *dockerRealDataGraphServer) effectiveListQuery(values url.Values) (url.Values, bool) {
+	if g == nil {
+		return values, dockerRealDataPollListRequest(values)
+	}
+	effective := make(url.Values, len(values))
+	for key, rawValues := range values {
+		effective[key] = append([]string(nil), rawValues...)
+	}
+	pollRequest := dockerRealDataPollListRequest(values)
+	rawToken := strings.TrimSpace(values.Get("$skiptoken"))
+	if rawToken == "" || strings.HasPrefix(rawToken, "docker-real-data-page:") {
+		return effective, pollRequest
+	}
+	g.mu.Lock()
+	provider, found := g.providerTokens[rawToken]
+	g.mu.Unlock()
+	if !found {
+		return effective, pollRequest
+	}
+	// Real Graph nextLink values are opaque: a continuation may contain only
+	// $skiptoken and $top, with no copy of the original filter/order. The fake
+	// stores the provider-side query semantics out of band and applies them to
+	// the request while retaining the actual opaque URL shape for diagnostics.
+	for key, rawValues := range provider.query {
+		effective[key] = append([]string(nil), rawValues...)
+	}
+	if top := values.Get("$top"); top != "" {
+		effective.Set("$top", top)
+	}
+	effective.Set("$skiptoken", rawToken)
+	return effective, pollRequest || provider.poll
+}
+
 func (g *dockerRealDataGraphServer) setKnownChats(chatIDs ...string) {
 	if g == nil {
 		return
@@ -1078,6 +1792,8 @@ func (g *dockerRealDataGraphServer) setFaultChat(chatID string) {
 	}
 	g.mu.Lock()
 	g.faultChatID = strings.TrimSpace(chatID)
+	g.faultResponses = nil
+	g.faultRequestPaths = nil
 	// The GET client retries 5xx responses in-process. Keep the 503 fault active
 	// for the complete client retry budget so the listener must durably record a
 	// failed poll and recover it in a later cycle; a single 503 would otherwise
@@ -1089,14 +1805,14 @@ func (g *dockerRealDataGraphServer) setFaultChat(chatID string) {
 	g.mu.Unlock()
 }
 
-func (g *dockerRealDataGraphServer) consumeListFault(chatID string) int {
+func (g *dockerRealDataGraphServer) consumeListFault(chatID string, pollRequest bool, requestPath string) int {
 	if g == nil {
 		return 0
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	chatID = strings.TrimSpace(chatID)
-	if chatID == "" || chatID == strings.TrimSpace(g.controlChatID) || len(g.faultSequence) == 0 {
+	if !pollRequest || chatID == "" || chatID == strings.TrimSpace(g.controlChatID) || len(g.faultSequence) == 0 {
 		return 0
 	}
 	// Bind a fault configured without a chat to the first real replay chat that
@@ -1118,7 +1834,29 @@ func (g *dockerRealDataGraphServer) consumeListFault(chatID string) int {
 	}
 	status := g.faultSequence[0]
 	g.faultSequence = g.faultSequence[1:]
+	g.faultResponses = append(g.faultResponses, status)
+	if len(g.faultRequestPaths) < 16 {
+		g.faultRequestPaths = append(g.faultRequestPaths, requestPath)
+	}
 	return status
+}
+
+func (g *dockerRealDataGraphServer) faultStateSnapshot() (string, []int, int) {
+	if g == nil {
+		return "", nil, 0
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.faultChatID, append([]int(nil), g.faultResponses...), len(g.faultSequence)
+}
+
+func (g *dockerRealDataGraphServer) faultRequestPathsSnapshot() []string {
+	if g == nil {
+		return nil
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]string(nil), g.faultRequestPaths...)
 }
 
 // setPersistentList429 arms a deterministic, chat-local provider throttle for
@@ -1138,6 +1876,7 @@ func (g *dockerRealDataGraphServer) setPersistentList429(chatIDs []string, chats
 	g.rateLimitFailureBudget = failures
 	g.rateLimitGlobalRemaining = 0
 	g.rateLimitGlobalConfigured = false
+	g.rateLimitGlobalScope = ""
 	for _, chatID := range chatIDs {
 		chatID = strings.TrimSpace(chatID)
 		if chatID == "" || chatID == strings.TrimSpace(g.controlChatID) {
@@ -1157,8 +1896,16 @@ func (g *dockerRealDataGraphServer) setPersistentList429(chatIDs []string, chats
 // window finite makes the Docker experiment fast while still exercising a
 // tenant-wide outage followed by automatic recovery.
 func (g *dockerRealDataGraphServer) setPersistentGlobalList429(requests int) {
+	g.setPersistentGlobalList429WithScope(requests, dockerRealData429ScopeAccount)
+}
+
+func (g *dockerRealDataGraphServer) setPersistentGlobalList429WithScope(requests int, scope string) {
 	if g == nil || requests <= 0 {
 		return
+	}
+	scope = strings.ToLower(strings.TrimSpace(scope))
+	if scope != dockerRealData429ScopeAccount && scope != dockerRealData429ScopeGlobal {
+		scope = dockerRealData429ScopeAccount
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -1167,6 +1914,7 @@ func (g *dockerRealDataGraphServer) setPersistentGlobalList429(requests int) {
 	g.rateLimitFailureBudget = 0
 	g.rateLimitGlobalRemaining = requests
 	g.rateLimitGlobalConfigured = true
+	g.rateLimitGlobalScope = scope
 }
 
 func (g *dockerRealDataGraphServer) consumePersistentGlobalList429() bool {
@@ -1189,6 +1937,145 @@ func (g *dockerRealDataGraphServer) persistentGlobalList429Configured() bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.rateLimitGlobalConfigured
+}
+
+// setPersistentOperation429 arms a finite fault for one exact Graph
+// operation. It intentionally does not reuse the legacy list-only counters:
+// a Docker acceptance run must be able to distinguish a tenant-wide list
+// throttle from a write or item-read throttle. The scope is recorded in the
+// response and request witness, while the operation key is matched before any
+// fake remote side effect is performed.
+func (g *dockerRealDataGraphServer) setPersistentOperation429(operation string, scope string, requests int) {
+	if g == nil || strings.TrimSpace(operation) == "" || requests <= 0 {
+		return
+	}
+	scope = strings.ToLower(strings.TrimSpace(scope))
+	if scope != dockerRealData429ScopeChat && scope != dockerRealData429ScopeAccount && scope != dockerRealData429ScopeGlobal {
+		scope = dockerRealData429ScopeAccount
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.rateLimitOperations == nil {
+		g.rateLimitOperations = make(map[string]dockerRealDataRateLimitBudget)
+	}
+	g.rateLimitOperations[strings.TrimSpace(operation)] = dockerRealDataRateLimitBudget{Scope: scope, Remaining: requests}
+}
+
+func (g *dockerRealDataGraphServer) consumePersistentOperation429(operation string) (string, bool) {
+	if g == nil {
+		return "", false
+	}
+	operation = strings.TrimSpace(operation)
+	if operation == "" {
+		return "", false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	budget, ok := g.rateLimitOperations[operation]
+	if !ok || budget.Remaining <= 0 {
+		return "", false
+	}
+	budget.Remaining--
+	g.rateLimitOperations[operation] = budget
+	return budget.Scope, true
+}
+
+func (g *dockerRealDataGraphServer) graphRequestsSnapshot() []dockerRealDataGraphRequest {
+	if g == nil {
+		return nil
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]dockerRealDataGraphRequest(nil), g.graphRequests...)
+}
+
+func (g *dockerRealDataGraphServer) graphOperationCounts(operation string) (attempts, throttled, accepted int) {
+	if g == nil {
+		return 0, 0, 0
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	operation = strings.TrimSpace(operation)
+	return g.graphRequestCounts[operation], g.graphRequest429s[operation], g.graphRequestAccepts[operation]
+}
+
+func dockerRealDataGraphOperation(req *http.Request) string {
+	if req == nil || req.URL == nil {
+		return "unknown"
+	}
+	path := req.URL.Path
+	if req.Method == http.MethodGet {
+		if _, list := dockerFixtureChatIDFromMessagesPath(path); list {
+			return dockerRealDataGraphOpMessageList
+		}
+		if _, _, ok := dockerRealDataChatItemPath(path); ok {
+			return dockerRealDataGraphOpMessageItem
+		}
+		if path == "/me" {
+			return dockerRealDataGraphOpMe
+		}
+		if strings.HasPrefix(path, "/chats/") && strings.HasSuffix(path, "/members") {
+			return dockerRealDataGraphOpMembers
+		}
+	}
+	if req.Method == http.MethodPost {
+		if strings.HasPrefix(path, "/chats/") && strings.HasSuffix(path, "/markChatUnreadForUser") {
+			return dockerRealDataGraphOpMarkUnread
+		}
+		if _, _, ok := dockerRealDataPostChatPath(path); ok {
+			return dockerRealDataGraphOpMessagePost
+		}
+		if path == "/me/onlineMeetings" {
+			return dockerRealDataGraphOpMeetingPost
+		}
+	}
+	if req.Method == http.MethodPatch && strings.HasPrefix(path, "/chats/") {
+		return dockerRealDataGraphOpPatch
+	}
+	return "unknown"
+}
+
+func (g *dockerRealDataGraphServer) recordGraphRequest(req *http.Request, operation string, bodyHash string, status int, scope string, accepted bool, startedAt time.Time) {
+	if g == nil {
+		return
+	}
+	if req == nil || req.URL == nil {
+		return
+	}
+	record := dockerRealDataGraphRequest{
+		Method:         req.Method,
+		Path:           req.URL.RequestURI(),
+		Operation:      strings.TrimSpace(operation),
+		BodyHash:       strings.TrimSpace(bodyHash),
+		StatusCode:     status,
+		RateLimitScope: strings.TrimSpace(scope),
+		RemoteAccepted: accepted,
+		StartedAt:      startedAt,
+		CompletedAt:    time.Now(),
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.graphRequestCounts == nil {
+		g.graphRequestCounts = make(map[string]int)
+	}
+	if g.graphRequest429s == nil {
+		g.graphRequest429s = make(map[string]int)
+	}
+	if g.graphRequestAccepts == nil {
+		g.graphRequestAccepts = make(map[string]int)
+	}
+	g.graphRequestCounts[record.Operation]++
+	if status == http.StatusTooManyRequests {
+		g.graphRequest429s[record.Operation]++
+	}
+	if accepted {
+		g.graphRequestAccepts[record.Operation]++
+	}
+	// Keep enough detail for a real-data diagnostic while bounding memory on a
+	// long fixture run. Aggregate counters remain exact after this sample fills.
+	if len(g.graphRequests) < 4096 {
+		g.graphRequests = append(g.graphRequests, record)
+	}
 }
 
 func (g *dockerRealDataGraphServer) consumePersistentList429(chatID string, pollRequest bool) bool {
@@ -1239,6 +2126,25 @@ func (g *dockerRealDataGraphServer) setUnknownPostMarker(marker string) {
 	g.mu.Unlock()
 }
 
+func (g *dockerRealDataGraphServer) setDurableUnknownPostWitness(witness dockerRealDataUnknownPostWitness) {
+	if g == nil {
+		return
+	}
+	witness.OutboxID = strings.TrimSpace(witness.OutboxID)
+	witness.ChatID = strings.TrimSpace(witness.ChatID)
+	witness.BodyHash = strings.TrimSpace(witness.BodyHash)
+	witness.PayloadHash = strings.TrimSpace(witness.PayloadHash)
+	if witness.OutboxID == "" || witness.ChatID == "" || witness.BodyHash == "" || witness.PayloadHash == "" {
+		return
+	}
+	g.mu.Lock()
+	g.unknownPostOutboxID = witness.OutboxID
+	g.unknownPostChat = witness.ChatID
+	g.unknownPostPayloadHash = witness.PayloadHash
+	g.durableUnknownPostWitness = true
+	g.mu.Unlock()
+}
+
 func dockerRealDataPostPayloadMatchesMarker(raw []byte, marker string) bool {
 	marker = strings.TrimSpace(marker)
 	if marker == "" {
@@ -1260,7 +2166,37 @@ func dockerRealDataPostPayloadMatchesMarker(raw []byte, marker string) bool {
 	if payload.Body != nil && payload.Body.Content == marker {
 		return true
 	}
-	return payload.ReplyMessage != nil && payload.ReplyMessage.Body != nil && payload.ReplyMessage.Body.Content == marker
+	if payload.ReplyMessage != nil && payload.ReplyMessage.Body != nil && payload.ReplyMessage.Body.Content == marker {
+		return true
+	}
+	// Production final outbox rows are sent as Teams-rendered HTML and include
+	// the assistant label before the rendered result. Match the exact final
+	// text at a line boundary after HTML decoding; a substring match would let
+	// an unrelated metadata field or a result such as "#10" consume the fault.
+	isRenderedMarker := func(content string) bool {
+		plain := strings.TrimSpace(PlainTextFromTeamsHTML(content))
+		if marker == dockerRealDataAnyExecutionMarker {
+			// The first executor invocation is not guaranteed to be the first
+			// final POST: startup/control work and per-chat FIFO predecessors can
+			// legitimately win that race. Match one complete deterministic
+			// executor-result line instead of assuming result #1 is observable in
+			// this finite real-data window.
+			return dockerRealDataExecutionResultBody(lastLineAfterTeamsLabel(plain))
+		}
+		if plain == marker {
+			return true
+		}
+		if !strings.HasSuffix(plain, marker) {
+			return false
+		}
+		prefix := plain[:len(plain)-len(marker)]
+		last, _ := utf8.DecodeLastRuneInString(prefix)
+		return unicode.IsSpace(last)
+	}
+	if payload.Body != nil && isRenderedMarker(payload.Body.Content) {
+		return true
+	}
+	return payload.ReplyMessage != nil && payload.ReplyMessage.Body != nil && isRenderedMarker(payload.ReplyMessage.Body.Content)
 }
 
 func dockerRealDataRequestDiagnostic(req *http.Request) string {
@@ -1301,19 +2237,65 @@ func (g *dockerRealDataGraphServer) listRequests() []string {
 	return append([]string(nil), g.listPaths...)
 }
 
+// dockerRealDataRequestSummary keeps Docker acceptance output useful when a
+// copied production fixture produces many reads. The full bounded request
+// sample remains available through listRequests for focused unit assertions;
+// the long-running experiment should report counts and a small redacted sample
+// instead of spending most of its log budget printing opaque continuations.
+func dockerRealDataRequestSummary(requests []string) string {
+	if len(requests) == 0 {
+		return "count=0"
+	}
+	routeCounts := make(map[string]int)
+	for _, request := range requests {
+		route := strings.TrimSpace(request)
+		if fields := strings.Fields(route); len(fields) >= 2 {
+			route = fields[0] + " " + strings.SplitN(fields[1], "?", 2)[0]
+		}
+		routeCounts[route]++
+	}
+	routes := make([]string, 0, len(routeCounts))
+	for route, count := range routeCounts {
+		routes = append(routes, fmt.Sprintf("%s=%d", route, count))
+	}
+	sort.Strings(routes)
+	sample := append([]string(nil), requests...)
+	if len(sample) > 6 {
+		sample = append(append([]string(nil), sample[:3]...), sample[len(sample)-3:]...)
+	}
+	return fmt.Sprintf("count=%d routes=%v sample=%v", len(requests), routes, sample)
+}
+
+// dockerRealDataTraceSummary bounds high-cardinality diagnostics without
+// dropping the first and last observations that explain a phase transition.
+// Failure assertions still carry the precise counters and durable state; this
+// helper only prevents a realistic fixture from hiding those counters behind
+// thousands of repetitive trace entries.
+func dockerRealDataTraceSummary(values []string) string {
+	if len(values) == 0 {
+		return "count=0"
+	}
+	sample := append([]string(nil), values...)
+	if len(sample) > 8 {
+		sample = append(append([]string(nil), sample[:4]...), sample[len(sample)-4:]...)
+	}
+	return fmt.Sprintf("count=%d sample=%v", len(values), sample)
+}
+
 // dockerRealDataPollListRequest identifies the list shape emitted by the
 // durable Teams poller. Exact-top maintenance lookups (park notices), outbox
 // reconciliation, and delegation inbox probes deliberately do not carry the
 // poll's descending timestamp filter; counting those pages as poll delivery
 // would make the real-data durability oracle report false missing messages.
-// A filtered request is also preserved on every fake continuation link, so
-// all pages of a real poll remain observable.
+// The fake keeps opaque continuation semantics out of band, so a provider
+// nextLink that omits the original filter/order is still attributed to the
+// poll that created it without classifying maintenance reads as delivery.
 func dockerRealDataPollListRequest(values url.Values) bool {
 	return strings.TrimSpace(values.Get("$filter")) != "" &&
 		values.Get("$orderby") == "lastModifiedDateTime desc"
 }
 
-func (g *dockerRealDataGraphServer) recordPollServedMessages(messages []ChatMessage) {
+func (g *dockerRealDataGraphServer) recordPollServedMessages(messages []ChatMessage, request string) {
 	if g == nil || len(messages) == 0 {
 		return
 	}
@@ -1322,9 +2304,15 @@ func (g *dockerRealDataGraphServer) recordPollServedMessages(messages []ChatMess
 	if g.pollServedMessageIDs == nil {
 		g.pollServedMessageIDs = make(map[string]int)
 	}
+	if g.pollServedMessageRequests == nil {
+		g.pollServedMessageRequests = make(map[string][]string)
+	}
 	for _, message := range messages {
 		if id := strings.TrimSpace(message.ID); id != "" {
 			g.pollServedMessageIDs[id]++
+			if strings.TrimSpace(request) != "" && len(g.pollServedMessageRequests[id]) < 8 {
+				g.pollServedMessageRequests[id] = append(g.pollServedMessageRequests[id], request)
+			}
 		}
 	}
 }
@@ -1338,6 +2326,19 @@ func (g *dockerRealDataGraphServer) servedMessages() map[string]int {
 	out := make(map[string]int, len(g.pollServedMessageIDs))
 	for id, count := range g.pollServedMessageIDs {
 		out[id] = count
+	}
+	return out
+}
+
+func (g *dockerRealDataGraphServer) servedMessageRequests() map[string][]string {
+	if g == nil {
+		return nil
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	out := make(map[string][]string, len(g.pollServedMessageRequests))
+	for id, requests := range g.pollServedMessageRequests {
+		out[id] = append([]string(nil), requests...)
 	}
 	return out
 }
@@ -1376,6 +2377,24 @@ func (g *dockerRealDataGraphServer) unknownPostChatSnapshot() string {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	return g.unknownPostChat
+}
+
+func (g *dockerRealDataGraphServer) unknownPostOutboxIDSnapshot() string {
+	if g == nil {
+		return ""
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.unknownPostOutboxID
+}
+
+func (g *dockerRealDataGraphServer) unknownPostPayloadHashSnapshot() string {
+	if g == nil {
+		return ""
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.unknownPostPayloadHash
 }
 
 func (g *dockerRealDataGraphServer) unknownPostAcceptedAttempts() int {
@@ -1549,6 +2568,38 @@ func dockerRealDataPostChatPath(path string) (chatID string, replyWithQuote bool
 }
 
 func (g *dockerRealDataGraphServer) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	startedAt := time.Now()
+	operation := dockerRealDataGraphOperation(req)
+	bodyHash := ""
+	if req != nil && req.Body != nil {
+		rawBody, readErr := io.ReadAll(req.Body)
+		_ = req.Body.Close()
+		req.Body = io.NopCloser(bytes.NewReader(rawBody))
+		if readErr == nil {
+			bodyHash = dockerRealDataPostPayloadHash(rawBody)
+		} else {
+			bodyHash = "read-error"
+		}
+	}
+	responseWriter := &dockerRealDataResponseWriter{ResponseWriter: w}
+	remoteAccepted := false
+	rateLimitScope := ""
+	defer func() {
+		g.recordGraphRequest(req, operation, bodyHash, responseWriter.finalStatus(), rateLimitScope, remoteAccepted, startedAt)
+	}()
+	w = responseWriter
+	consumeOperation429 := func() bool {
+		scope, limited := g.consumePersistentOperation429(operation)
+		if !limited {
+			return false
+		}
+		rateLimitScope = scope
+		g.status429.Add(1)
+		w.Header().Set("Retry-After", "1")
+		w.Header().Set("X-CXP-RateLimit-Scope", scope)
+		w.WriteHeader(http.StatusTooManyRequests)
+		return true
+	}
 	if req.Header.Get("Authorization") != "Bearer "+g.token {
 		http.Error(w, "deterministic Docker Graph token required", http.StatusUnauthorized)
 		return
@@ -1572,6 +2623,9 @@ func (g *dockerRealDataGraphServer) ServeHTTP(w http.ResponseWriter, req *http.R
 			http.Error(w, "unknown replay chat", http.StatusNotFound)
 			return
 		}
+		if consumeOperation429() {
+			return
+		}
 		// Account-level throttling is applied before the control/work distinction:
 		// every message-list read shares the same provider budget. It is still
 		// limited to this deterministic fake Graph boundary and never touches the
@@ -1579,6 +2633,14 @@ func (g *dockerRealDataGraphServer) ServeHTTP(w http.ResponseWriter, req *http.R
 		if g.consumePersistentGlobalList429() {
 			g.status429.Add(1)
 			w.Header().Set("Retry-After", "1")
+			g.mu.Lock()
+			scope := g.rateLimitGlobalScope
+			g.mu.Unlock()
+			if scope == "" {
+				scope = dockerRealData429ScopeAccount
+			}
+			rateLimitScope = scope
+			w.Header().Set("X-CXP-RateLimit-Scope", scope)
 			w.WriteHeader(http.StatusTooManyRequests)
 			return
 		}
@@ -1589,7 +2651,8 @@ func (g *dockerRealDataGraphServer) ServeHTTP(w http.ResponseWriter, req *http.R
 			return
 		}
 		values := req.URL.Query()
-		if status := g.consumeListFault(chatID); status != 0 {
+		effectiveValues, pollRequest := g.effectiveListQuery(values)
+		if status := g.consumeListFault(chatID, pollRequest, dockerRealDataRequestDiagnostic(req)); status != 0 {
 			w.Header().Set("Retry-After", "1")
 			if status == http.StatusTooManyRequests {
 				g.status429.Add(1)
@@ -1599,7 +2662,7 @@ func (g *dockerRealDataGraphServer) ServeHTTP(w http.ResponseWriter, req *http.R
 			w.WriteHeader(status)
 			return
 		}
-		if g.consumePersistentList429(chatID, dockerRealDataPollListRequest(values)) {
+		if g.consumePersistentList429(chatID, pollRequest) {
 			g.status429.Add(1)
 			w.Header().Set("Retry-After", "1")
 			w.WriteHeader(http.StatusTooManyRequests)
@@ -1608,7 +2671,7 @@ func (g *dockerRealDataGraphServer) ServeHTTP(w http.ResponseWriter, req *http.R
 		if rawToken := strings.TrimSpace(values.Get("$skiptoken")); rawToken != "" && !strings.HasPrefix(rawToken, "docker-real-data-page:") {
 			g.opaqueContinuations.Add(1)
 		}
-		filter, filterErr := dockerRealDataListFilter(values)
+		filter, filterErr := dockerRealDataListFilter(effectiveValues)
 		if filterErr != nil {
 			if strings.Contains(values.Get("$filter"), " ge ") || strings.Contains(values.Get("$filter"), " le ") {
 				g.unsupportedFilters.Add(1)
@@ -1618,7 +2681,7 @@ func (g *dockerRealDataGraphServer) ServeHTTP(w http.ResponseWriter, req *http.R
 			http.Error(w, filterErr.Error(), http.StatusBadRequest)
 			return
 		}
-		if rawTop := strings.TrimSpace(values.Get("$top")); rawTop != "" {
+		if rawTop := strings.TrimSpace(effectiveValues.Get("$top")); rawTop != "" {
 			top, topErr := strconv.Atoi(rawTop)
 			if topErr != nil || top <= 0 || top > ownerPollMessageTop {
 				g.invalidListQueries.Add(1)
@@ -1626,7 +2689,7 @@ func (g *dockerRealDataGraphServer) ServeHTTP(w http.ResponseWriter, req *http.R
 				return
 			}
 		}
-		if order := strings.TrimSpace(values.Get("$orderby")); order != "" && order != "lastModifiedDateTime desc" {
+		if order := strings.TrimSpace(effectiveValues.Get("$orderby")); order != "" && order != "lastModifiedDateTime desc" {
 			g.invalidListQueries.Add(1)
 			http.Error(w, "invalid $orderby", http.StatusBadRequest)
 			return
@@ -1655,7 +2718,7 @@ func (g *dockerRealDataGraphServer) ServeHTTP(w http.ResponseWriter, req *http.R
 			http.Error(w, offsetErr.Error(), http.StatusBadRequest)
 			return
 		}
-		if values.Get("$orderby") == "lastModifiedDateTime desc" {
+		if effectiveValues.Get("$orderby") == "lastModifiedDateTime desc" {
 			sort.SliceStable(filtered, func(i, j int) bool {
 				left, _ := time.Parse(time.RFC3339Nano, filtered[i].LastModifiedDateTime)
 				right, _ := time.Parse(time.RFC3339Nano, filtered[j].LastModifiedDateTime)
@@ -1680,8 +2743,8 @@ func (g *dockerRealDataGraphServer) ServeHTTP(w http.ResponseWriter, req *http.R
 			end = len(filtered)
 		}
 		messages := filtered[offset:end]
-		if dockerRealDataPollListRequest(values) {
-			g.recordPollServedMessages(messages)
+		if pollRequest {
+			g.recordPollServedMessages(messages, dockerRealDataRequestDiagnostic(req))
 		}
 		g.recordListPage(chatID)
 		response := struct {
@@ -1690,16 +2753,26 @@ func (g *dockerRealDataGraphServer) ServeHTTP(w http.ResponseWriter, req *http.R
 		}{Value: messages}
 		if end < len(filtered) {
 			next := url.Values{}
-			if top := values.Get("$top"); top != "" {
+			if top := effectiveValues.Get("$top"); top != "" {
 				next.Set("$top", top)
 			}
-			if order := values.Get("$orderby"); order != "" {
-				next.Set("$orderby", order)
+			if pollRequest {
+				// Keep the continuation URL opaque, as Graph does. Its server-side
+				// query semantics are retained in providerTokens rather than echoed
+				// into the request; this also makes the poll classifier exercise the
+				// same provenance path used by a copied durable continuation.
+				token := fmt.Sprintf("Source=MessagingFrontEnd##DockerContinuation=%s:%d", shortStableID(chatID), end)
+				g.setValidProviderContinuationWithQuery(token, chatID, end, effectiveValues)
+				next.Set("$skiptoken", token)
+			} else {
+				if order := effectiveValues.Get("$orderby"); order != "" {
+					next.Set("$orderby", order)
+				}
+				if rawFilter := effectiveValues.Get("$filter"); rawFilter != "" {
+					next.Set("$filter", rawFilter)
+				}
+				next.Set("$skiptoken", "docker-real-data-page:"+shortStableID(chatID)+":"+strconv.Itoa(end))
 			}
-			if rawFilter := values.Get("$filter"); rawFilter != "" {
-				next.Set("$filter", rawFilter)
-			}
-			next.Set("$skiptoken", "docker-real-data-page:"+shortStableID(chatID)+":"+strconv.Itoa(end))
 			response.NextLink = "/chats/" + url.PathEscape(chatID) + "/messages?" + next.Encode()
 		}
 		writeDockerRealDataJSON(w, response)
@@ -1709,6 +2782,9 @@ func (g *dockerRealDataGraphServer) ServeHTTP(w http.ResponseWriter, req *http.R
 		if !g.knownChat(chatID) {
 			g.recordUnknown(dockerRealDataRequestDiagnostic(req))
 			http.Error(w, "unknown replay chat", http.StatusNotFound)
+			return
+		}
+		if consumeOperation429() {
 			return
 		}
 		var message ChatMessage
@@ -1721,7 +2797,13 @@ func (g *dockerRealDataGraphServer) ServeHTTP(w http.ResponseWriter, req *http.R
 			}
 		}
 		if !found {
-			g.recordUnknown(dockerRealDataRequestDiagnostic(req))
+			// A targeted lookup for a durable recovery receipt may refer to a
+			// message that is no longer present in the copied Graph corpus (for
+			// example, a deleted/expired control message). This is a recognized
+			// Graph route with an ordinary 404, not an unmodeled request. Keep it
+			// visible as a diagnostic without failing the real-data experiment's
+			// route-completeness assertion.
+			g.itemGETNotFound.Add(1)
 			http.Error(w, "unknown replay message", http.StatusNotFound)
 			return
 		}
@@ -1744,7 +2826,12 @@ func (g *dockerRealDataGraphServer) ServeHTTP(w http.ResponseWriter, req *http.R
 			http.Error(w, "invalid mark-unread payload", http.StatusBadRequest)
 			return
 		}
+		if consumeOperation429() {
+			return
+		}
 		g.posts.Add(1)
+		g.markUnreadPosts.Add(1)
+		remoteAccepted = true
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
@@ -1778,7 +2865,37 @@ func (g *dockerRealDataGraphServer) ServeHTTP(w http.ResponseWriter, req *http.R
 				http.Error(w, "invalid message payload", http.StatusBadRequest)
 				return
 			}
+			if consumeOperation429() {
+				return
+			}
+			// On a resumed Docker process the prior fake Graph may already have
+			// accepted this exact outbox operation before its response was lost.
+			// Keep that witness across the process boundary: a buggy sender that
+			// POSTs it again must be observable and must not be rewarded with a
+			// second synthetic remote message.
+			payloadOutboxID := dockerRealDataPostPayloadOutboxID(rawPayload)
+			payloadHash := dockerRealDataPostPayloadHash(rawPayload)
+			g.mu.Lock()
+			witnessOperation := g.durableUnknownPostWitness &&
+				payloadOutboxID != "" && payloadOutboxID == g.unknownPostOutboxID &&
+				chatID == g.unknownPostChat
+			witnessReplay := witnessOperation && payloadHash == g.unknownPostPayloadHash
+			witnessPayloadMismatch := witnessOperation && !witnessReplay
+			g.mu.Unlock()
+			if witnessReplay || witnessPayloadMismatch {
+				g.posts.Add(1)
+				g.messagePostAttempts.Add(1)
+				if witnessPayloadMismatch {
+					g.unknownPostMismatches.Add(1)
+					http.Error(w, "durable unknown POST witness payload mismatch", http.StatusConflict)
+				} else {
+					g.unknownPostRepeats.Add(1)
+					http.Error(w, "durable unknown POST witness replay rejected", http.StatusConflict)
+				}
+				return
+			}
 			g.posts.Add(1)
+			g.messagePostAttempts.Add(1)
 			g.mu.Lock()
 			g.postAttempts[postKey]++
 			attempt := g.postAttempts[postKey]
@@ -1786,6 +2903,7 @@ func (g *dockerRealDataGraphServer) ServeHTTP(w http.ResponseWriter, req *http.R
 			// response is lost. The production outbox must therefore treat the
 			// first transport failure as ambiguous and never issue a second POST.
 			g.acceptedPostKeys[postKey]++
+			g.messagePostAccepts.Add(1)
 			marker := strings.TrimSpace(g.unknownPostMarker)
 			markerMatches := dockerRealDataPostPayloadMatchesMarker(rawPayload, marker)
 			if g.unknownPostKey == "" && markerMatches {
@@ -1795,6 +2913,8 @@ func (g *dockerRealDataGraphServer) ServeHTTP(w http.ResponseWriter, req *http.R
 			repeatUnknown := postKey == g.unknownPostKey && attempt > 1
 			if unknown {
 				g.unknownPostChat = chatID
+				g.unknownPostOutboxID = dockerRealDataPostPayloadOutboxID(rawPayload)
+				g.unknownPostPayloadHash = payloadHash
 			}
 			g.mu.Unlock()
 			if unknown {
@@ -1814,6 +2934,8 @@ func (g *dockerRealDataGraphServer) ServeHTTP(w http.ResponseWriter, req *http.R
 			if repeatUnknown {
 				g.unknownPostRepeats.Add(1)
 			}
+			g.messagePostResponses.Add(1)
+			remoteAccepted = true
 			message := dockerRealDataMessage(chatID, 0, int(g.posts.Load()), g.base)
 			message.ID = fmt.Sprintf("docker-real-data-outbound:%06d", g.posts.Load())
 			writeDockerRealDataJSON(w, message)
@@ -1821,6 +2943,9 @@ func (g *dockerRealDataGraphServer) ServeHTTP(w http.ResponseWriter, req *http.R
 		}
 	}
 	if req.Method == http.MethodGet && path == "/me" {
+		if consumeOperation429() {
+			return
+		}
 		writeDockerRealDataJSON(w, g.user)
 		return
 	}
@@ -1830,6 +2955,9 @@ func (g *dockerRealDataGraphServer) ServeHTTP(w http.ResponseWriter, req *http.R
 		if !g.knownChat(chatID) {
 			g.recordUnknown(dockerRealDataRequestDiagnostic(req))
 			http.Error(w, "unknown replay chat", http.StatusNotFound)
+			return
+		}
+		if consumeOperation429() {
 			return
 		}
 		writeDockerRealDataJSON(w, struct {
@@ -1858,10 +2986,18 @@ func (g *dockerRealDataGraphServer) ServeHTTP(w http.ResponseWriter, req *http.R
 			http.Error(w, "invalid patch payload", http.StatusBadRequest)
 			return
 		}
+		if consumeOperation429() {
+			return
+		}
+		remoteAccepted = true
 		w.WriteHeader(http.StatusNoContent)
 		return
 	}
 	if req.Method == http.MethodPost && path == "/me/onlineMeetings" {
+		if consumeOperation429() {
+			return
+		}
+		remoteAccepted = true
 		writeDockerRealDataJSON(w, OnlineMeeting{ID: "docker-real-data-meeting", Subject: "Docker real-data experiment"})
 		return
 	}
@@ -1885,6 +3021,8 @@ type dockerRealDataCounts struct {
 
 type dockerRealDataMeasuredWindow struct {
 	completed                    bool
+	startedAt                    time.Time
+	endedAt                      time.Time
 	before                       dockerRealDataCounts
 	after                        dockerRealDataCounts
 	executorBefore               int64
@@ -1898,6 +3036,24 @@ type dockerRealDataMeasuredWindow struct {
 	phaseDeadlinesAtStop         map[string]uint64
 	startupPhaseErrors           map[string]uint64
 	startupPhaseDeadlines        map[string]uint64
+}
+
+// dockerRealDataCompletionForGate keeps the throughput result inside the
+// declared measurement window.  Graceful teardown may complete already-admitted
+// work afterwards, but that drain is a separate diagnostic and must not inflate
+// a rate or make a zero-throughput window pass.
+func dockerRealDataCompletionForGate(mode string, measured, overall int64) int64 {
+	if mode == dockerRealDataModeThroughput {
+		return measured
+	}
+	return overall
+}
+
+func dockerRealDataMeasuredWindowDuration(window dockerRealDataMeasuredWindow, fallback time.Duration) time.Duration {
+	if !window.startedAt.IsZero() && !window.endedAt.IsZero() && window.endedAt.After(window.startedAt) {
+		return window.endedAt.Sub(window.startedAt)
+	}
+	return fallback
 }
 
 func dockerRealDataSyntheticInboundIDs(ctx context.Context, path string) (map[string]struct{}, error) {
@@ -2080,7 +3236,14 @@ func dockerRealDataPollHasRecovery(poll teamstore.ChatPollState) bool {
 // on a real fixture that can dominate the experiment and look like a hung
 // 429 retry. The query is read-only and keeps the same typed JSON validation
 // as the assertions, while unrelated historical rows remain untouched.
-func dockerRealDataPostStateFromSQLite(ctx context.Context, path string, corpus map[string][]ChatMessage) (teamstore.State, error) {
+//
+// extraOutboxIDs is an explicit observation set for durable witnesses created
+// by the experiment. A low-value ACK/helper row can be the first POST whose
+// response is lost, but it has neither a synthetic turn ID nor the synthetic
+// execution-result body marker. Omitting that row from this bounded
+// post-reader would make the harness report a false data-loss failure even
+// though SQLite still contains the durable row.
+func dockerRealDataPostStateFromSQLite(ctx context.Context, path string, corpus map[string][]ChatMessage, extraOutboxIDs ...string) (teamstore.State, error) {
 	query := url.Values{}
 	query.Set("mode", "ro")
 	db, err := sql.Open("sqlite", teamsSQLiteFileURI(path, query))
@@ -2178,7 +3341,30 @@ func dockerRealDataPostStateFromSQLite(ctx context.Context, path string, corpus 
 		}
 	}
 
-	outboxRows, err := db.QueryContext(ctx, `SELECT id, json FROM outbox_messages WHERE turn_id LIKE ? OR json LIKE ?`, "docker-real-data-turn-%", "%"+dockerRealDataExecutionPrefix+"%")
+	outboxQuery := `SELECT id, json FROM outbox_messages WHERE turn_id LIKE ? OR json LIKE ?`
+	outboxArgs := []any{"docker-real-data-turn-%", "%" + dockerRealDataExecutionPrefix + "%"}
+	witnessIDs := make([]string, 0, len(extraOutboxIDs))
+	seenWitnessIDs := make(map[string]struct{}, len(extraOutboxIDs))
+	for _, id := range extraOutboxIDs {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		if _, seen := seenWitnessIDs[id]; seen {
+			continue
+		}
+		seenWitnessIDs[id] = struct{}{}
+		witnessIDs = append(witnessIDs, id)
+	}
+	if len(witnessIDs) > 0 {
+		placeholders := make([]string, len(witnessIDs))
+		for index, id := range witnessIDs {
+			placeholders[index] = "?"
+			outboxArgs = append(outboxArgs, id)
+		}
+		outboxQuery += ` OR id IN (` + strings.Join(placeholders, ",") + `)`
+	}
+	outboxRows, err := db.QueryContext(ctx, outboxQuery, outboxArgs...)
 	if err != nil {
 		return teamstore.State{}, err
 	}
@@ -2198,7 +3384,11 @@ func dockerRealDataPostStateFromSQLite(ctx context.Context, path string, corpus 
 			_ = outboxRows.Close()
 			return teamstore.State{}, fmt.Errorf("synthetic outbox identity mismatch: sql=%q json=%q", rowID, outbox.ID)
 		}
-		if strings.HasPrefix(strings.TrimSpace(outbox.TurnID), "docker-real-data-turn-") || strings.HasPrefix(strings.TrimSpace(outbox.Body), dockerRealDataExecutionPrefix) {
+		include := strings.HasPrefix(strings.TrimSpace(outbox.TurnID), "docker-real-data-turn-") || strings.HasPrefix(strings.TrimSpace(outbox.Body), dockerRealDataExecutionPrefix)
+		if _, witness := seenWitnessIDs[strings.TrimSpace(outbox.ID)]; witness {
+			include = true
+		}
+		if include {
 			state.OutboxMessages[outbox.ID] = outbox
 		}
 	}
@@ -2300,17 +3490,26 @@ func dockerRealDataSyntheticResiduals(state teamstore.State, corpus map[string][
 	return residual
 }
 
-// dockerRealDataDurableCorrelation verifies the stronger invariant that every
-// synthetic inbound event has exactly one durable turn. Complete mode also
-// requires that turn to reach completion; throughput mode intentionally allows
-// the measured window to stop with a queued turn, while still rejecting
+type dockerRealDataCorrelationAudit struct {
+	Unresolved          int64
+	MissingTurn         int64
+	DuplicateTurn       int64
+	MissingMessageIDs   []string
+	DuplicateMessageIDs []string
+}
+
+// dockerRealDataDurableCorrelationAudit verifies the stronger invariant that
+// every synthetic inbound event has exactly one durable turn. Complete mode
+// also requires that turn to reach completion; throughput mode intentionally
+// allows the measured window to stop with a queued turn, while still rejecting
 // duplicate admission or an inbound row that never acquired a turn.
-func dockerRealDataDurableCorrelation(ctx context.Context, path string, requireCompleted bool) (int64, error) {
+func dockerRealDataDurableCorrelationAudit(ctx context.Context, path string, requireCompleted bool) (dockerRealDataCorrelationAudit, error) {
+	var audit dockerRealDataCorrelationAudit
 	query := url.Values{}
 	query.Set("mode", "ro")
 	db, err := sql.Open("sqlite", teamsSQLiteFileURI(path, query))
 	if err != nil {
-		return 0, err
+		return audit, err
 	}
 	defer db.Close()
 	db.SetMaxOpenConns(1)
@@ -2324,7 +3523,7 @@ func dockerRealDataDurableCorrelation(ctx context.Context, path string, requireC
 		WHERE i.teams_message_id LIKE ?
 		ORDER BY i.teams_message_id, t.id`, dockerRealDataMessageIDPrefix+"%")
 	if err != nil {
-		return 0, err
+		return audit, err
 	}
 	type correlation struct {
 		turns     int
@@ -2337,7 +3536,7 @@ func dockerRealDataDurableCorrelation(ctx context.Context, path string, requireC
 		var status sql.NullString
 		if err := rows.Scan(&messageID, &turnID, &status); err != nil {
 			_ = rows.Close()
-			return 0, err
+			return audit, err
 		}
 		entry := byMessage[messageID]
 		if entry == nil {
@@ -2354,18 +3553,32 @@ func dockerRealDataDurableCorrelation(ctx context.Context, path string, requireC
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
-		return 0, err
+		return audit, err
 	}
 	if err := rows.Close(); err != nil {
-		return 0, err
+		return audit, err
 	}
-	var unresolved int64
-	for _, entry := range byMessage {
+	for messageID, entry := range byMessage {
+		switch {
+		case entry.turns == 0:
+			audit.MissingTurn++
+			audit.MissingMessageIDs = append(audit.MissingMessageIDs, messageID)
+		case entry.turns > 1:
+			audit.DuplicateTurn++
+			audit.DuplicateMessageIDs = append(audit.DuplicateMessageIDs, messageID)
+		}
 		if entry.turns != 1 || (requireCompleted && entry.completed != 1) {
-			unresolved++
+			audit.Unresolved++
 		}
 	}
-	return unresolved, nil
+	sort.Strings(audit.MissingMessageIDs)
+	sort.Strings(audit.DuplicateMessageIDs)
+	return audit, nil
+}
+
+func dockerRealDataDurableCorrelation(ctx context.Context, path string, requireCompleted bool) (int64, error) {
+	audit, err := dockerRealDataDurableCorrelationAudit(ctx, path, requireCompleted)
+	return audit.Unresolved, err
 }
 
 func dockerRealDataInterruptedTurnDetails(ctx context.Context, path string) ([]string, error) {
@@ -2398,8 +3611,17 @@ func dockerRealDataInterruptedTurnDetails(ctx context.Context, path string) ([]s
 		if err := rows.Scan(&id, &inboundID, &raw); err != nil {
 			return nil, err
 		}
+		var turn teamstore.Turn
+		decodeErr := json.Unmarshal(raw, &turn)
 		digest := sha256.Sum256(raw)
-		details = append(details, fmt.Sprintf("id=%s inbound_event_id=%s bytes=%d sha256=%x", id, inboundID.String, len(raw), digest))
+		if decodeErr != nil {
+			details = append(details, fmt.Sprintf("id=%s inbound_event_id=%s bytes=%d sha256=%x decode_error=%q", id, inboundID.String, len(raw), digest, trimPollDiagnostic(decodeErr.Error())))
+			continue
+		}
+		// Keep the interrupted-turn diagnostic body-free. These fields identify
+		// whether the row was interrupted by a pre-dispatch preparation failure,
+		// an ownership fence, or intentional shutdown without copying prompt text.
+		details = append(details, fmt.Sprintf("id=%s inbound_event_id=%s session=%s status=%s start_new=%t recovery_reason=%q codex_thread=%s codex_turn=%s bytes=%d sha256=%x", id, inboundID.String, turn.SessionID, turn.Status, turn.StartNewCodexThread, trimPollDiagnostic(turn.RecoveryReason), turn.CodexThreadID, turn.CodexTurnID, len(raw), digest))
 	}
 	return details, rows.Err()
 }
@@ -2412,6 +3634,71 @@ func dockerRealDataHistoryOffsetSum(state teamstore.State) int64 {
 		}
 	}
 	return total
+}
+
+func dockerRealDataHistoryCheckpointEqual(a, b teamstore.HistoryWatchCheckpoint) bool {
+	// UpdatedAt is an audit timestamp and is deliberately excluded from the
+	// store's history-watch CAS equality. Match that semantic comparison here:
+	// a durable partial-read hint, recovery boundary, or source proof change is
+	// progress even when the physical newline cursor cannot advance safely.
+	a.UpdatedAt = time.Time{}
+	b.UpdatedAt = time.Time{}
+	return reflect.DeepEqual(a, b)
+}
+
+func dockerRealDataOrdinaryHistoryDurableProgress(before, after teamstore.State, mandatory map[string]bool) (changed, added int, details []string) {
+	seen := make(map[string]struct{})
+	for id, beforeCheckpoint := range before.HistoryWatch {
+		if mandatory[id] {
+			continue
+		}
+		seen[id] = struct{}{}
+		afterCheckpoint, found := after.HistoryWatch[id]
+		if !found {
+			changed++
+			details = append(details, fmt.Sprintf("removed=%s", id))
+			continue
+		}
+		if !dockerRealDataHistoryCheckpointEqual(beforeCheckpoint, afterCheckpoint) {
+			changed++
+			details = append(details, fmt.Sprintf("changed=%s offset=%d->%d size=%d->%d partial=%d/%d->%d/%d", id, beforeCheckpoint.Offset, afterCheckpoint.Offset, beforeCheckpoint.Size, afterCheckpoint.Size, beforeCheckpoint.PartialReadOffset, beforeCheckpoint.PartialObservedSize, afterCheckpoint.PartialReadOffset, afterCheckpoint.PartialObservedSize))
+		}
+	}
+	for id, afterCheckpoint := range after.HistoryWatch {
+		if mandatory[id] {
+			continue
+		}
+		if _, wasPresent := seen[id]; wasPresent {
+			continue
+		}
+		if _, wasPresent := before.HistoryWatch[id]; wasPresent {
+			continue
+		}
+		added++
+		details = append(details, fmt.Sprintf("added=%s offset=%d size=%d", id, afterCheckpoint.Offset, afterCheckpoint.Size))
+	}
+	sort.Strings(details)
+	return changed, added, details
+}
+
+func dockerRealDataBacklogFairCursorChanges(before, after teamstore.ServiceControl) []string {
+	changes := make([]string, 0, 4)
+	values := []struct {
+		lane   string
+		before string
+		after  string
+	}{
+		{teamstore.BacklogFairLaneHistoryRecovery, before.BacklogHistoryRecoveryFairCursor, after.BacklogHistoryRecoveryFairCursor},
+		{teamstore.BacklogFairLaneHistoryDiscovery, before.BacklogHistoryDiscoveryFairCursor, after.BacklogHistoryDiscoveryFairCursor},
+		{teamstore.BacklogFairLaneLinkedDiscovery, before.BacklogLinkedDiscoveryFairCursor, after.BacklogLinkedDiscoveryFairCursor},
+		{teamstore.BacklogFairLaneLinked, before.BacklogLinkedFairCursor, after.BacklogLinkedFairCursor},
+	}
+	for _, value := range values {
+		if strings.TrimSpace(value.before) != strings.TrimSpace(value.after) {
+			changes = append(changes, fmt.Sprintf("%s=%q->%q", value.lane, value.before, value.after))
+		}
+	}
+	return changes
 }
 
 func dockerRealDataDuration(t *testing.T) time.Duration {
@@ -2431,6 +3718,19 @@ func dockerRealDataDuration(t *testing.T) time.Duration {
 		t.Fatalf("invalid %s=%q; want a duration of at least %s", dockerRealDataDurationEnv, raw, minimum)
 	}
 	return duration
+}
+
+func dockerRealDataStartupDeadline(t *testing.T) time.Duration {
+	t.Helper()
+	raw := strings.TrimSpace(os.Getenv(dockerRealDataStartupDeadlineEnv))
+	if raw == "" {
+		return 5 * time.Minute
+	}
+	deadline, err := time.ParseDuration(raw)
+	if err != nil || deadline < 30*time.Second {
+		t.Fatalf("invalid %s=%q; want a duration of at least 30s", dockerRealDataStartupDeadlineEnv, raw)
+	}
+	return deadline
 }
 
 func dockerRealDataPollInterval(t *testing.T, rateLimitExperiment bool) time.Duration {
@@ -2455,10 +3755,32 @@ func dockerRealData429Scope(t *testing.T) string {
 	if scope == "" {
 		return dockerRealData429ScopeChat
 	}
-	if scope != dockerRealData429ScopeChat && scope != dockerRealData429ScopeAccount {
-		t.Fatalf("invalid %s=%q; want %q or %q", dockerRealData429ScopeEnv, scope, dockerRealData429ScopeChat, dockerRealData429ScopeAccount)
+	if scope != dockerRealData429ScopeChat && scope != dockerRealData429ScopeAccount && scope != dockerRealData429ScopeGlobal {
+		t.Fatalf("invalid %s=%q; want %q, %q, or %q", dockerRealData429ScopeEnv, scope, dockerRealData429ScopeChat, dockerRealData429ScopeAccount, dockerRealData429ScopeGlobal)
 	}
 	return scope
+}
+
+func dockerRealData429ScopeIsAccountWide(scope string) bool {
+	switch strings.ToLower(strings.TrimSpace(scope)) {
+	case dockerRealData429ScopeAccount, dockerRealData429ScopeGlobal:
+		return true
+	default:
+		return false
+	}
+}
+
+func dockerRealData429PollOnly(t *testing.T) bool {
+	t.Helper()
+	switch strings.TrimSpace(os.Getenv(dockerRealData429PollOnlyEnv)) {
+	case "", "0":
+		return false
+	case "1":
+		return true
+	default:
+		t.Fatalf("invalid %s=%q; want 0 or 1", dockerRealData429PollOnlyEnv, os.Getenv(dockerRealData429PollOnlyEnv))
+		return false
+	}
 }
 
 func dockerRealDataMode(t *testing.T) string {
@@ -2510,24 +3832,97 @@ func prepareDockerRealDataPollSchedules(t *testing.T, store *teamstore.Store, st
 			pollState = inboundPollStateWarm
 		}
 		nextPollAt := now.Add(-time.Second)
-		if _, ok := replay[chatID]; !ok {
+		lastActivityAt := poll.LastActivityAt
+		replayMessages, isReplay := replay[chatID]
+		if !isReplay || len(replayMessages) == 0 {
 			emptyChats++
 		} else {
 			replayChats++
+			// The replay corpus is copied from durable queued work rather than
+			// from a live Graph timestamp. Wake only those chats in the disposable
+			// schedule; leaving their historical activity untouched makes the
+			// production idle-admission query correctly exclude every old chat
+			// before the experiment can observe its replay page.
+			lastActivityAt = now
 		}
 		updates = append(updates, teamstore.ChatPollScheduleUpdate{
-			ChatID:            chatID,
-			PollState:         pollState,
-			NextPollAt:        nextPollAt,
-			LastActivityAt:    poll.LastActivityAt,
-			ClearBlockedUntil: true,
-			ResetFailures:     true,
+			ChatID:         chatID,
+			PollState:      pollState,
+			NextPollAt:     nextPollAt,
+			LastActivityAt: lastActivityAt,
 		})
+		if isReplay && len(replayMessages) > 0 {
+			updates[len(updates)-1].ClearBlockedUntil = true
+			updates[len(updates)-1].ResetFailures = true
+		}
 	}
 	if _, err := store.UpdateChatPollSchedules(context.Background(), updates); err != nil {
 		t.Fatalf("prepare disposable replay schedules: %v", err)
 	}
 	return replayChats, emptyChats
+}
+
+func TestPrepareDockerRealDataPollSchedulesWakesReplayChats(t *testing.T) {
+	store := newBridgeTestStore(t)
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load disposable Teams state: %v", err)
+	}
+	state.Sessions["docker-replay-session"] = teamstore.SessionContext{
+		ID:          "docker-replay-session",
+		Status:      teamstore.SessionStatusActive,
+		TeamsChatID: "docker-replay-chat",
+		UpdatedAt:   now.Add(-49 * time.Hour),
+	}
+	state.Sessions["docker-empty-session"] = teamstore.SessionContext{
+		ID:          "docker-empty-session",
+		Status:      teamstore.SessionStatusActive,
+		TeamsChatID: "docker-empty-chat",
+		UpdatedAt:   now.Add(-49 * time.Hour),
+	}
+	state.ChatPolls["docker-replay-chat"] = teamstore.ChatPollState{
+		ChatID:         "docker-replay-chat",
+		Seeded:         true,
+		PollState:      inboundPollStateCold,
+		LastActivityAt: now.Add(-49 * time.Hour),
+		BlockedUntil:   now.Add(2 * time.Hour),
+		FailureCount:   7,
+	}
+	state.ChatPolls["docker-empty-chat"] = teamstore.ChatPollState{
+		ChatID:         "docker-empty-chat",
+		Seeded:         true,
+		PollState:      inboundPollStateCold,
+		LastActivityAt: now.Add(-49 * time.Hour),
+		BlockedUntil:   now.Add(2 * time.Hour),
+		FailureCount:   11,
+	}
+	if err := store.Update(context.Background(), func(current *teamstore.State) error {
+		*current = state
+		return nil
+	}); err != nil {
+		t.Fatalf("persist disposable Docker schedule fixture: %v", err)
+	}
+	replayChats, emptyChats := prepareDockerRealDataPollSchedules(t, store, state, map[string][]ChatMessage{
+		"docker-replay-chat": {{ID: "docker-replay-message"}},
+	}, "control-chat", now)
+	if replayChats != 1 || emptyChats != 1 {
+		t.Fatalf("prepared Docker replay schedule counts = replay=%d empty=%d, want 1/1", replayChats, emptyChats)
+	}
+	replayPoll, found, err := store.ChatPoll(context.Background(), "docker-replay-chat")
+	if err != nil || !found {
+		t.Fatalf("read replay chat poll found=%v err=%v", found, err)
+	}
+	if !replayPoll.LastActivityAt.Equal(now) || !replayPoll.NextPollAt.Before(time.Now()) || !replayPoll.BlockedUntil.IsZero() || replayPoll.FailureCount != 0 {
+		t.Fatalf("replay chat was not durably woken: %#v", replayPoll)
+	}
+	emptyPoll, found, err := store.ChatPoll(context.Background(), "docker-empty-chat")
+	if err != nil || !found {
+		t.Fatalf("read empty chat poll found=%v err=%v", found, err)
+	}
+	if !emptyPoll.LastActivityAt.Equal(now.Add(-49*time.Hour)) || !emptyPoll.BlockedUntil.Equal(now.Add(2*time.Hour)) || emptyPoll.FailureCount != 11 {
+		t.Fatalf("empty chat activity was changed unexpectedly: %#v", emptyPoll)
+	}
 }
 
 // prioritizeDockerRealDataReplaySchedules changes only the disposable
@@ -2781,6 +4176,29 @@ func TestDockerRealDataGraphServerEnforcesFilterAndOpaquePagination(t *testing.T
 	if serverState.listPageCount(chatID) < 3 {
 		t.Fatalf("strict Docker Graph pagination used %d pages, want at least 3", serverState.listPageCount(chatID))
 	}
+	served := serverState.servedMessages()
+	if len(served) != len(messages) {
+		t.Fatalf("strict Docker Graph poll served %d/%d unique messages", len(served), len(messages))
+	}
+	for _, message := range messages {
+		if got := served[message.ID]; got != 1 {
+			t.Fatalf("strict Docker Graph poll served message %q %d times, want exactly once", message.ID, got)
+		}
+	}
+	if serverState.opaqueContinuationCount() < 2 {
+		t.Fatalf("strict Docker Graph poll did not exercise opaque continuations: count=%d", serverState.opaqueContinuationCount())
+	}
+	var opaquePollRequest bool
+	for _, request := range serverState.listRequests() {
+		if strings.Contains(request, "%24skiptoken=%3Credacted%3E") &&
+			!strings.Contains(request, "%24filter=") && !strings.Contains(request, "%24orderby=") {
+			opaquePollRequest = true
+			break
+		}
+	}
+	if !opaquePollRequest {
+		t.Fatalf("strict Docker Graph poll did not issue an opaque continuation without filter/order: requests=%v", serverState.listRequests())
+	}
 	validItem := httptest.NewRequest(http.MethodGet, "/chats/"+url.PathEscape(chatID)+"/messages/"+url.PathEscape(messages[0].ID), nil)
 	validItem.Header.Set("Authorization", "Bearer docker-contract-token")
 	validItemRecorder := httptest.NewRecorder()
@@ -2811,6 +4229,7 @@ func TestDockerRealDataGraphServerEnforcesFilterAndOpaquePagination(t *testing.T
 	providerToken := "Source=MessagingFrontEnd##ContinuationToken=provider-issued-opaque-token"
 	values.Set("$skiptoken", providerToken)
 	serverState.setValidProviderContinuation(providerToken, chatID, len(messages)-dockerRealDataPageSize)
+	opaqueBeforeExplicitProviderRequest := serverState.opaqueContinuationCount()
 	opaqueRequest := httptest.NewRequest(http.MethodGet, "/chats/"+url.PathEscape(chatID)+"/messages?"+values.Encode(), nil)
 	opaqueRequest.Header.Set("Authorization", "Bearer docker-contract-token")
 	opaqueRecorder := httptest.NewRecorder()
@@ -2818,8 +4237,8 @@ func TestDockerRealDataGraphServerEnforcesFilterAndOpaquePagination(t *testing.T
 	if opaqueRecorder.Code != http.StatusOK {
 		t.Fatalf("Docker Graph provider opaque continuation response = %d, want 200", opaqueRecorder.Code)
 	}
-	if serverState.opaqueContinuationCount() != 1 {
-		t.Fatalf("Docker Graph did not exercise exactly one provider opaque continuation: count=%d", serverState.opaqueContinuationCount())
+	if serverState.opaqueContinuationCount() != opaqueBeforeExplicitProviderRequest+1 {
+		t.Fatalf("Docker Graph did not exercise exactly one explicit provider opaque continuation: before=%d after=%d", opaqueBeforeExplicitProviderRequest, serverState.opaqueContinuationCount())
 	}
 	unknownValues := url.Values{}
 	unknownValues.Set("$top", "20")
@@ -2857,6 +4276,63 @@ func TestDockerRealDataGraphServerEnforcesFilterAndOpaquePagination(t *testing.T
 		if invalidRecorder.Code != http.StatusBadRequest {
 			t.Fatalf("Docker Graph invalid opaque token %q response = %d, want 400", rawToken, invalidRecorder.Code)
 		}
+	}
+}
+
+func TestDockerRealDataGraphServerRetryFaultIgnoresNonPollReads(t *testing.T) {
+	chatID := "docker-retry-fault-chat"
+	message := dockerRealDataMessage(chatID, 0, 0, time.Now().UTC())
+	serverState := newDockerRealDataGraphServer("docker-retry-fault-token", User{ID: "docker-retry-fault-user"}, map[string][]ChatMessage{
+		chatID: {message},
+	})
+	serverState.setFaultChat("")
+	server := httptest.NewServer(serverState)
+	t.Cleanup(server.Close)
+
+	requestStatus := func(path string) int {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodGet, server.URL+path, nil)
+		if err != nil {
+			t.Fatalf("retry fault request %q: %v", path, err)
+		}
+		req.Header.Set("Authorization", "Bearer docker-retry-fault-token")
+		resp, err := server.Client().Do(req)
+		if err != nil {
+			t.Fatalf("retry fault request %q: %v", path, err)
+		}
+		defer resp.Body.Close()
+		return resp.StatusCode
+	}
+
+	// Outbox recovery and other message reads must not consume the poll fault:
+	// otherwise a real-data run can report a 429 without ever exercising the
+	// durable poll retry path it was intended to test.
+	nonPollPath := "/chats/" + url.PathEscape(chatID) + "/messages?$top=20"
+	if got := requestStatus(nonPollPath); got != http.StatusOK {
+		t.Fatalf("non-poll read status = %d, want 200", got)
+	}
+	if serverState.status429.Load() != 0 || serverState.status503.Load() != 0 {
+		t.Fatalf("non-poll read consumed retry fault: 429=%d 503=%d", serverState.status429.Load(), serverState.status503.Load())
+	}
+
+	values := url.Values{}
+	values.Set("$filter", "lastModifiedDateTime gt 2026-09-07T12:00:00Z")
+	values.Set("$orderby", "lastModifiedDateTime desc")
+	values.Set("$top", "20")
+	pollPath := "/chats/" + url.PathEscape(chatID) + "/messages?" + values.Encode()
+	for index, want := range append([]int{http.StatusTooManyRequests}, make([]int, defaultGraphRetries+1)...) {
+		if index > 0 {
+			want = http.StatusServiceUnavailable
+		}
+		if got := requestStatus(pollPath); got != want {
+			t.Fatalf("poll retry fault request %d status = %d, want %d", index+1, got, want)
+		}
+	}
+	if got := requestStatus(pollPath); got != http.StatusOK {
+		t.Fatalf("poll request after retry fault status = %d, want 200", got)
+	}
+	if serverState.status429.Load() != 1 || serverState.status503.Load() != int64(defaultGraphRetries+1) {
+		t.Fatalf("retry fault counts = 429:%d 503:%d, want 1/%d", serverState.status429.Load(), serverState.status503.Load(), defaultGraphRetries+1)
 	}
 }
 
@@ -2959,6 +4435,192 @@ func TestDockerRealDataGraphServerAccount429SharesBudgetAcrossChats(t *testing.T
 	}
 }
 
+func TestDockerRealDataGraphServerGlobal429PreservesExplicitScope(t *testing.T) {
+	chatID := "global-429-chat"
+	serverState := newDockerRealDataGraphServer("global-429-token", User{ID: "global-429-user"}, map[string][]ChatMessage{
+		chatID: {dockerRealDataMessage(chatID, 0, 0, time.Now().UTC())},
+	})
+	serverState.setPersistentGlobalList429WithScope(1, dockerRealData429ScopeGlobal)
+	server := httptest.NewServer(serverState)
+	t.Cleanup(server.Close)
+
+	request := func() (*http.Response, error) {
+		req, err := http.NewRequest(http.MethodGet, server.URL+"/chats/"+url.PathEscape(chatID)+"/messages?$top=20", nil)
+		if err != nil {
+			return nil, err
+		}
+		req.Header.Set("Authorization", "Bearer global-429-token")
+		return server.Client().Do(req)
+	}
+	first, err := request()
+	if err != nil {
+		t.Fatalf("global 429 request: %v", err)
+	}
+	if first.StatusCode != http.StatusTooManyRequests || first.Header.Get("X-CXP-RateLimit-Scope") != dockerRealData429ScopeGlobal {
+		_ = first.Body.Close()
+		t.Fatalf("global 429 response = status=%d scope=%q, want 429/global", first.StatusCode, first.Header.Get("X-CXP-RateLimit-Scope"))
+	}
+	_ = first.Body.Close()
+	second, err := request()
+	if err != nil {
+		t.Fatalf("global recovery request: %v", err)
+	}
+	defer second.Body.Close()
+	if second.StatusCode != http.StatusOK {
+		t.Fatalf("global recovery response status = %d, want 200", second.StatusCode)
+	}
+}
+
+func TestDockerRealDataGraphServerOperation429WitnessCoversReadsAndWrites(t *testing.T) {
+	chatID := "operation-429-chat"
+	message := dockerRealDataMessage(chatID, 0, 0, time.Now().UTC())
+	serverState := newDockerRealDataGraphServer("operation-429-token", User{ID: "operation-429-user"}, map[string][]ChatMessage{
+		chatID: {message},
+	})
+	serverState.setUnknownPostMarker("__operation_429_unknown_marker__")
+	for _, operation := range []string{
+		dockerRealDataGraphOpMessageItem,
+		dockerRealDataGraphOpMembers,
+		dockerRealDataGraphOpMe,
+		dockerRealDataGraphOpMessagePost,
+		dockerRealDataGraphOpMarkUnread,
+		dockerRealDataGraphOpMeetingPost,
+		dockerRealDataGraphOpPatch,
+	} {
+		serverState.setPersistentOperation429(operation, dockerRealData429ScopeGlobal, 1)
+	}
+	server := httptest.NewServer(serverState)
+	t.Cleanup(server.Close)
+
+	request := func(method, path, body string) int {
+		t.Helper()
+		var bodyReader io.Reader
+		if body != "" {
+			bodyReader = strings.NewReader(body)
+		}
+		req, err := http.NewRequest(method, server.URL+path, bodyReader)
+		if err != nil {
+			t.Fatalf("create operation 429 request %s %s: %v", method, path, err)
+		}
+		req.Header.Set("Authorization", "Bearer operation-429-token")
+		resp, err := server.Client().Do(req)
+		if err != nil {
+			t.Fatalf("operation 429 request %s %s: %v", method, path, err)
+		}
+		defer resp.Body.Close()
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return resp.StatusCode
+	}
+
+	itemPath := "/chats/" + url.PathEscape(chatID) + "/messages/" + url.PathEscape(message.ID)
+	if got := request(http.MethodGet, itemPath, ""); got != http.StatusTooManyRequests {
+		t.Fatalf("item GET first status=%d, want 429", got)
+	}
+	if got := request(http.MethodGet, itemPath, ""); got != http.StatusOK {
+		t.Fatalf("item GET recovery status=%d, want 200", got)
+	}
+	if got := request(http.MethodGet, "/chats/"+url.PathEscape(chatID)+"/members", ""); got != http.StatusTooManyRequests {
+		t.Fatalf("members GET first status=%d, want 429", got)
+	}
+	if got := request(http.MethodGet, "/chats/"+url.PathEscape(chatID)+"/members", ""); got != http.StatusOK {
+		t.Fatalf("members GET recovery status=%d, want 200", got)
+	}
+	if got := request(http.MethodGet, "/me", ""); got != http.StatusTooManyRequests {
+		t.Fatalf("/me first status=%d, want 429", got)
+	}
+	if got := request(http.MethodGet, "/me", ""); got != http.StatusOK {
+		t.Fatalf("/me recovery status=%d, want 200", got)
+	}
+	messageBody := `{"body":{"content":"operation fault post"}}`
+	messagePath := "/chats/" + url.PathEscape(chatID) + "/messages"
+	if got := request(http.MethodPost, messagePath, messageBody); got != http.StatusTooManyRequests {
+		t.Fatalf("message POST first status=%d, want 429", got)
+	}
+	if got := request(http.MethodPost, messagePath, messageBody); got != http.StatusOK {
+		t.Fatalf("message POST recovery status=%d, want 200", got)
+	}
+	markUnreadPath := "/chats/" + url.PathEscape(chatID) + "/markChatUnreadForUser"
+	if got := request(http.MethodPost, markUnreadPath, `{"user":{"id":"operation-429-user"}}`); got != http.StatusTooManyRequests {
+		t.Fatalf("mark-unread POST first status=%d, want 429", got)
+	}
+	if got := request(http.MethodPost, markUnreadPath, `{"user":{"id":"operation-429-user"}}`); got != http.StatusNoContent {
+		t.Fatalf("mark-unread POST recovery status=%d, want 204", got)
+	}
+	if got := request(http.MethodPost, "/me/onlineMeetings", `{"subject":"operation fault meeting"}`); got != http.StatusTooManyRequests {
+		t.Fatalf("meeting POST first status=%d, want 429", got)
+	}
+	if got := request(http.MethodPost, "/me/onlineMeetings", `{"subject":"operation fault meeting"}`); got != http.StatusOK {
+		t.Fatalf("meeting POST recovery status=%d, want 200", got)
+	}
+	patchPath := "/chats/" + url.PathEscape(chatID) + "/messages/" + url.PathEscape(message.ID)
+	patchBody := `{"body":{"content":"operation fault patch"}}`
+	if got := request(http.MethodPatch, patchPath, patchBody); got != http.StatusTooManyRequests {
+		t.Fatalf("PATCH first status=%d, want 429", got)
+	}
+	if got := request(http.MethodPatch, patchPath, patchBody); got != http.StatusNoContent {
+		t.Fatalf("PATCH recovery status=%d, want 204", got)
+	}
+
+	for _, operation := range []string{
+		dockerRealDataGraphOpMessageItem,
+		dockerRealDataGraphOpMembers,
+		dockerRealDataGraphOpMe,
+		dockerRealDataGraphOpMessagePost,
+		dockerRealDataGraphOpMarkUnread,
+		dockerRealDataGraphOpMeetingPost,
+		dockerRealDataGraphOpPatch,
+	} {
+		attempts, throttled, accepted := serverState.graphOperationCounts(operation)
+		if attempts != 2 || throttled != 1 {
+			t.Fatalf("operation %s counts=(attempts=%d,429=%d,accepted=%d), want 2/1", operation, attempts, throttled, accepted)
+		}
+		if operation == dockerRealDataGraphOpMessagePost || operation == dockerRealDataGraphOpMarkUnread || operation == dockerRealDataGraphOpMeetingPost || operation == dockerRealDataGraphOpPatch {
+			if accepted != 1 {
+				t.Fatalf("operation %s accepted=%d, want one remote accept after one 429", operation, accepted)
+			}
+		} else if accepted != 0 {
+			t.Fatalf("read operation %s accepted=%d, want zero remote write accepts", operation, accepted)
+		}
+	}
+
+	records := serverState.graphRequestsSnapshot()
+	if len(records) != 14 {
+		t.Fatalf("graph request witness count=%d, want 14", len(records))
+	}
+	seen429 := make(map[string]bool)
+	seenAccepted := make(map[string]bool)
+	for _, record := range records {
+		if record.RateLimitScope != "" && record.RateLimitScope != dockerRealData429ScopeGlobal {
+			t.Fatalf("request witness scope=%q, want global: %#v", record.RateLimitScope, record)
+		}
+		if record.StatusCode == http.StatusTooManyRequests {
+			seen429[record.Operation] = true
+			if record.RemoteAccepted {
+				t.Fatalf("429 request was marked remotely accepted: %#v", record)
+			}
+		}
+		if record.RemoteAccepted {
+			seenAccepted[record.Operation] = true
+			if record.BodyHash == "" {
+				t.Fatalf("accepted write lacks exact body hash: %#v", record)
+			}
+		}
+	}
+	for _, operation := range []string{
+		dockerRealDataGraphOpMessageItem,
+		dockerRealDataGraphOpMembers,
+		dockerRealDataGraphOpMe,
+		dockerRealDataGraphOpMessagePost,
+		dockerRealDataGraphOpMarkUnread,
+		dockerRealDataGraphOpMeetingPost,
+		dockerRealDataGraphOpPatch,
+	} {
+		if !seen429[operation] || (operation == dockerRealDataGraphOpMessagePost && !seenAccepted[operation]) {
+			t.Fatalf("operation %s lacks a complete 429/accept witness: records=%#v", operation, records)
+		}
+	}
+}
+
 func TestDockerRealDataGraphServerParsesMessagePostRoutes(t *testing.T) {
 	chatID := "19:docker-post-chat@thread.v2"
 	for _, test := range []struct {
@@ -3009,6 +4671,18 @@ func TestDockerRealDataGraphServerParsesMessagePostRoutes(t *testing.T) {
 	if got := serverState.posts.Load(); got != 2 {
 		t.Fatalf("valid message POST count = %d, want 2", got)
 	}
+	if got := serverState.messagePostAttempts.Load(); got != 2 {
+		t.Fatalf("valid message POST attempts = %d, want 2", got)
+	}
+	if got := serverState.messagePostAccepts.Load(); got != 2 {
+		t.Fatalf("valid message POST remote accepts = %d, want 2", got)
+	}
+	if got := serverState.messagePostResponses.Load(); got != 1 {
+		t.Fatalf("successful message POST responses = %d, want 1 after one unknown response", got)
+	}
+	if got := serverState.markUnreadPosts.Load(); got != 0 {
+		t.Fatalf("mark-unread POST count = %d, want 0", got)
+	}
 }
 
 func TestDockerRealDataGraphServerUnknownPostMarkerSkipsUnrelatedOutbox(t *testing.T) {
@@ -3043,20 +4717,149 @@ func TestDockerRealDataGraphServerUnknownPostMarkerSkipsUnrelatedOutbox(t *testi
 	}
 }
 
+func TestDockerRealDataGraphServerRejectsDurableUnknownPostReplay(t *testing.T) {
+	chatID := "docker-durable-witness-chat"
+	outboxID := "docker-durable-witness-outbox"
+	serverState := newDockerRealDataGraphServer("docker-durable-witness-token", User{ID: "docker-durable-witness-user"}, map[string][]ChatMessage{chatID: nil})
+	payload := `{"body":{"content":"replayed result ` + helperOutboxProvenanceMarker(outboxID) + `"}}`
+	serverState.setDurableUnknownPostWitness(dockerRealDataUnknownPostWitness{
+		OutboxID:    outboxID,
+		ChatID:      chatID,
+		BodyHash:    "already-recorded-body",
+		PayloadHash: dockerRealDataPostPayloadHash([]byte(payload)),
+	})
+	server := httptest.NewServer(serverState)
+	t.Cleanup(server.Close)
+	req, err := http.NewRequest(http.MethodPost, server.URL+"/chats/"+url.PathEscape(chatID)+"/messages", strings.NewReader(payload))
+	if err != nil {
+		t.Fatalf("create replay request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer docker-durable-witness-token")
+	response, err := server.Client().Do(req)
+	if err != nil {
+		t.Fatalf("durable unknown POST replay request: %v", err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("durable unknown POST replay status = %d, want %d", response.StatusCode, http.StatusConflict)
+	}
+	if got := serverState.unknownPostRepeats.Load(); got != 1 {
+		t.Fatalf("durable unknown POST replay count = %d, want 1", got)
+	}
+	if got := serverState.messagePostAttempts.Load(); got != 1 {
+		t.Fatalf("durable unknown POST replay attempts = %d, want 1", got)
+	}
+	if got := serverState.messagePostAccepts.Load(); got != 0 {
+		t.Fatalf("durable unknown POST replay remote accepts = %d, want 0", got)
+	}
+	// Matching the outbox ID and destination is not sufficient: a changed
+	// payload must not be mistaken for the previously accepted operation.
+	mismatchPayload := `{"body":{"content":"changed result ` + helperOutboxProvenanceMarker(outboxID) + `"}}`
+	mismatchReq, err := http.NewRequest(http.MethodPost, server.URL+"/chats/"+url.PathEscape(chatID)+"/messages", strings.NewReader(mismatchPayload))
+	if err != nil {
+		t.Fatalf("create mismatched replay request: %v", err)
+	}
+	mismatchReq.Header.Set("Authorization", "Bearer docker-durable-witness-token")
+	mismatchResponse, err := server.Client().Do(mismatchReq)
+	if err != nil {
+		t.Fatalf("mismatched durable unknown POST replay request: %v", err)
+	}
+	defer mismatchResponse.Body.Close()
+	if mismatchResponse.StatusCode != http.StatusConflict {
+		t.Fatalf("mismatched durable unknown POST replay status = %d, want %d", mismatchResponse.StatusCode, http.StatusConflict)
+	}
+	if got := serverState.unknownPostMismatches.Load(); got != 1 {
+		t.Fatalf("mismatched durable unknown POST count = %d, want 1", got)
+	}
+	if got := serverState.messagePostAccepts.Load(); got != 0 {
+		t.Fatalf("mismatched durable unknown POST remote accepts = %d, want 0", got)
+	}
+}
+
 func TestDockerRealDataPostMarkerRequiresExactRenderedBody(t *testing.T) {
 	marker := "docker real-data execution result #1"
 	for name, payload := range map[string]string{
 		"ordinary":         `{"body":{"content":"docker real-data execution result #1"}}`,
 		"quoted":           `{"messageIds":["source"],"replyMessage":{"body":{"content":"docker real-data execution result #1"}}}`,
+		"rendered":         `{"body":{"content":"<p><strong>Codex:</strong></p><p>docker real-data execution result #1</p>"}}`,
+		"rendered-quoted":  `{"replyMessage":{"body":{"content":"<p><strong>Codex:</strong></p><p>docker real-data execution result #1</p>"}}}`,
 		"suffix":           `{"body":{"content":"docker real-data execution result #10"}}`,
 		"nested-unrelated": `{"body":{"content":"unrelated","metadata":"docker real-data execution result #1"}}`,
 	} {
 		t.Run(name, func(t *testing.T) {
-			want := name == "ordinary" || name == "quoted"
+			want := name == "ordinary" || name == "quoted" || name == "rendered" || name == "rendered-quoted"
 			if got := dockerRealDataPostPayloadMatchesMarker([]byte(payload), marker); got != want {
 				t.Fatalf("marker match = %v, want %v for payload %s", got, want, payload)
 			}
 		})
+	}
+	for name, payload := range map[string]string{
+		"any-rendered":  `{"body":{"content":"<p><strong>🤖 ✅ Codex answer:</strong></p><p>docker real-data execution result #10</p>"}}`,
+		"any-unrelated": `{"body":{"content":"<p>unrelated docker real-data execution result #10 metadata</p>"}}`,
+		"any-no-number": `{"body":{"content":"<p>docker real-data execution result #</p>"}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			want := name == "any-rendered"
+			if got := dockerRealDataPostPayloadMatchesMarker([]byte(payload), dockerRealDataAnyExecutionMarker); got != want {
+				t.Fatalf("any execution marker match = %v, want %v for payload %s", got, want, payload)
+			}
+		})
+	}
+}
+
+func TestDockerRealDataUnknownPostDispositionRejectsSkippedCompletion(t *testing.T) {
+	base := teamstore.OutboxMessage{Status: teamstore.OutboxStatusSkipped, TeamsChatID: "chat-disposition"}
+	for name, msg := range map[string]teamstore.OutboxMessage{
+		"ack": {
+			Status:      base.Status,
+			TeamsChatID: base.TeamsChatID,
+			Kind:        "ack",
+		},
+		"helper": {
+			Status:      base.Status,
+			TeamsChatID: base.TeamsChatID,
+			Kind:        "helper-status",
+		},
+		"final": {
+			Status:           base.Status,
+			TeamsChatID:      base.TeamsChatID,
+			Kind:             "final",
+			NotificationKind: "turn_completed",
+		},
+		"needs-attention": {
+			Status:           base.Status,
+			TeamsChatID:      base.TeamsChatID,
+			Kind:             "final",
+			NotificationKind: "needs_attention",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			want := name == "ack" || name == "helper"
+			if got := dockerRealDataUnknownPostDispositionSafe(msg); got != want {
+				t.Fatalf("unknown POST disposition safe = %v, want %v for %#v", got, want, msg)
+			}
+		})
+	}
+}
+
+func TestDockerRealDataThroughputGateExcludesGracefulDrain(t *testing.T) {
+	if got := dockerRealDataCompletionForGate(dockerRealDataModeThroughput, 0, 7); got != 0 {
+		t.Fatalf("throughput gate completion = %d, want measured-window value 0", got)
+	}
+	if got := dockerRealDataCompletionForGate(dockerRealDataModeThroughput, 3, 7); got != 3 {
+		t.Fatalf("throughput gate completion = %d, want measured-window value 3", got)
+	}
+	if got := dockerRealDataCompletionForGate(dockerRealDataModeComplete, 0, 7); got != 7 {
+		t.Fatalf("complete gate completion = %d, want post-drain value 7", got)
+	}
+	started := time.Unix(100, 0)
+	ended := started.Add(1250 * time.Millisecond)
+	window := dockerRealDataMeasuredWindow{startedAt: started, endedAt: ended}
+	if got := dockerRealDataMeasuredWindowDuration(window, 9*time.Second); got != 1250*time.Millisecond {
+		t.Fatalf("measured window duration = %s, want 1.25s", got)
+	}
+	if got := dockerRealDataMeasuredWindowDuration(dockerRealDataMeasuredWindow{}, 9*time.Second); got != 9*time.Second {
+		t.Fatalf("invalid measured window duration = %s, want fallback 9s", got)
 	}
 }
 
@@ -3092,6 +4895,51 @@ func TestDockerRealDataReplayCorpusPersistsAcrossProcessBoundary(t *testing.T) {
 	}
 }
 
+func TestDockerRealDataPostStateIncludesExplicitOutboxWitness(t *testing.T) {
+	ctx := context.Background()
+	statePath := filepath.Join(t.TempDir(), "state", "state.json")
+	store, err := teamstore.Open(statePath)
+	if err != nil {
+		t.Fatalf("open witness store: %v", err)
+	}
+	defer store.Close()
+	createdAt := time.Now().UTC()
+	witness := teamstore.OutboxMessage{
+		ID:              "outbox:docker-real-data-helper-witness",
+		TeamsChatID:     "docker-real-data-witness-chat",
+		Kind:            "helper-008",
+		Body:            "low-value helper acknowledgement",
+		Status:          teamstore.OutboxStatusSending,
+		CreatedAt:       createdAt,
+		UpdatedAt:       createdAt,
+		LastSendAttempt: createdAt,
+	}
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.OutboxMessages[witness.ID] = witness
+		return nil
+	}); err != nil {
+		t.Fatalf("seed witness store: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate witness store to SQLite: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close witness store before read: %v", err)
+	}
+
+	got, err := dockerRealDataPostStateFromSQLite(ctx, filepath.Join(filepath.Dir(statePath), teamstore.SQLiteFileName), map[string][]ChatMessage{}, witness.ID)
+	if err != nil {
+		t.Fatalf("read explicit outbox witness: %v", err)
+	}
+	row, found := got.OutboxMessages[witness.ID]
+	if !found {
+		t.Fatalf("post-state reader omitted explicit helper witness %q", witness.ID)
+	}
+	if row.TeamsChatID != witness.TeamsChatID || row.Body != witness.Body || row.Status != witness.Status {
+		t.Fatalf("post-state helper witness = %#v, want chat/body/status from %#v", row, witness)
+	}
+}
+
 // TestDockerRealDataTeamsProgressThroughput is an opt-in experiment, not a
 // smoke test. It runs the actual listener loop against a point-in-time copy of
 // the current Teams SQLite state, registry projection, shared ledgers, and a
@@ -3106,19 +4954,35 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	resume := dockerRealDataResume(t)
 	rateLimitExperiment := os.Getenv(dockerRealData429ExperimentEnv) == "1"
 	rateLimitScope := dockerRealData429Scope(t)
+	rateLimitAccountWide := dockerRealData429ScopeIsAccountWide(rateLimitScope)
+	rateLimitPollOnly := rateLimitExperiment && dockerRealData429PollOnly(t)
 	duration := dockerRealDataDuration(t)
+	startupDeadlineDuration := dockerRealDataStartupDeadline(t)
 	pollInterval := dockerRealDataPollInterval(t, rateLimitExperiment)
 	fixtureRoot := dockerTeamsFixtureRoot(t)
 	store, statePath := prepareDockerFixtureStore(t, fixtureRoot)
 	dockerFixtureRemapCodexPaths(t, store)
+	dockerFixtureRebindSourceProofs(t, store)
+	dockerFixtureVerifyOutboxSourceProofs(t, store)
 	ctx, cancel := context.WithTimeout(context.Background(), duration+10*time.Minute)
 	defer cancel()
 
 	loadStarted := time.Now()
-	beforeState, err := store.Load(ctx)
+	// This experiment needs the real queued inbound/turn/poll/checkpoint rows,
+	// but it must not materialize the inherited outbox just to establish a
+	// baseline. The current fixture contains about 1.3GB of outbox JSON; the
+	// production listener keeps that table intact, while this test uses a
+	// scalar/SQL count and reads a single resume witness by ID.
+	beforeState, err := store.PollStateSnapshot(ctx)
 	if err != nil {
-		t.Fatalf("load copied real Teams SQLite state: %v", err)
+		t.Fatalf("load copied real Teams SQLite poll state: %v", err)
 	}
+	historyState, err := store.HistoryWatchState(ctx)
+	if err != nil {
+		t.Fatalf("load copied real Teams SQLite history state: %v", err)
+	}
+	beforeState.HistoryWatch = historyState.HistoryWatch
+	beforeState.HistoryWatchReady = historyState.HistoryWatchReady
 	loadElapsed := time.Since(loadStarted)
 	if beforeState.Scope.ID == "" || beforeState.ControlChat.TeamsChatID == "" {
 		t.Fatalf("copied real state is missing scope/control binding: scope=%q control=%q", beforeState.Scope.ID, beforeState.ControlChat.TeamsChatID)
@@ -3129,17 +4993,36 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read copied real-data baseline counters: %v", err)
 	}
+	beforeCorrelationAudit, err := dockerRealDataDurableCorrelationAudit(ctx, filepath.Join(filepath.Dir(statePath), teamstore.SQLiteFileName), false)
+	if err != nil {
+		t.Fatalf("read copied real-data baseline inbound/turn correlation: %v", err)
+	}
 	if !resume && beforeCounts.inbound != 0 {
 		t.Fatalf("copied runtime already contains synthetic inbound rows before experiment: %d", beforeCounts.inbound)
 	}
-	inheritedInbound, inheritedTurns, inheritedOutbox := dockerRealDataInheritedOperationalRows(beforeState)
+	inheritedInbound, inheritedTurns := dockerRealDataInheritedOperationalRowsWithoutOutbox(beforeState)
+	inheritedOutbox, err := dockerRealDataInheritedOperationalOutboxRowsCount(ctx, filepath.Join(filepath.Dir(statePath), teamstore.SQLiteFileName))
+	if err != nil {
+		t.Fatalf("count copied inherited operational outbox rows: %v", err)
+	}
 	t.Logf("real-data source audit: inherited operational Teams inbound=%d turns=%d outbox=%d; retained in disposable fixture and excluded from synthetic counters; terminal queued provenance is excluded from inbound count", inheritedInbound, inheritedTurns, inheritedOutbox)
+	var resumeWitnessOutboxID string
+	var resumeUnknownPostWitness dockerRealDataUnknownPostWitness
 	if resume {
-		ambiguous := dockerRealDataAmbiguousExecutionOutboxes(beforeState)
-		if len(ambiguous) != 1 {
-			t.Fatalf("real-data resume expected exactly one durable ambiguous first execution outbox from the previous process, got=%d rows=%#v", len(ambiguous), ambiguous)
+		witness := readDockerRealDataUnknownPostWitness(t, statePath)
+		resumeUnknownPostWitness = witness
+		resumeWitnessOutboxID = witness.OutboxID
+		ambiguous, found, witnessErr := dockerRealDataOutboxMessageByIDReadOnly(ctx, filepath.Join(filepath.Dir(statePath), teamstore.SQLiteFileName), witness.OutboxID)
+		if witnessErr != nil {
+			t.Fatalf("read real-data resume outbox witness: %v", witnessErr)
 		}
-		t.Logf("real-data resume audit: retained one ambiguous first execution outbox=%q; the second process must not POST it again", ambiguous[0].ID)
+		if !found {
+			t.Fatalf("real-data resume lost the durable outbox selected by the previous unknown POST: witness=%#v", witness)
+		}
+		if strings.TrimSpace(ambiguous.TeamsChatID) != witness.ChatID || dockerRealDataOutboxBodyHash(ambiguous.Body) != witness.BodyHash || !dockerRealDataUnknownPostDispositionSafe(ambiguous) {
+			t.Fatalf("real-data resume changed the durable unknown-POST witness: witness=%#v row=%#v", witness, ambiguous)
+		}
+		t.Logf("real-data resume audit: retained ambiguous outbox=%q for chat=%q; the second process must not POST it again", ambiguous.ID, ambiguous.TeamsChatID)
 	}
 
 	// The source snapshot may contain the live helper's lease. Retire it only in
@@ -3195,16 +5078,43 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	t.Logf("real-data replay corpus: queued Teams payloads=%d chats=%d; bodies/authors/order copied from durable rows, only IDs/timestamps remapped", replayCount, len(replayCorpus))
 	scheduleNow := time.Now()
 	replayChats, emptyChats := prepareDockerRealDataPollSchedules(t, store, beforeState, replayCorpus, beforeState.ControlChat.TeamsChatID, scheduleNow)
-	if rateLimitExperiment {
-		prioritizeDockerRealDataReplaySchedules(t, store, beforeState, replayCorpus, beforeState.ControlChat.TeamsChatID, scheduleNow)
-		t.Logf("real-data disposable schedule: replay chats prioritized=%d active chats with empty fake corpus deferred=%d; only copied due-time ordering changed; source schedule/database is untouched", replayChats, emptyChats)
-	} else {
-		t.Logf("real-data disposable schedule: replay chats due=%d active chats with empty fake corpus also due=%d; no active chat is held for 24h; source schedule/database is untouched", replayChats, emptyChats)
+	// The copied production snapshot can contain hundreds of active chats whose
+	// durable queue has no ordinary replay row.  Leaving all of them due lets the
+	// ordinary admission lane consume its bounded quantum before a real replay
+	// chat is ever handed to Graph, which turns this acceptance test into a
+	// scheduler-shape false negative.  Keep every copied frontier, cursor,
+	// failure, and ownership field intact; only the disposable due-time ordering
+	// is changed so the complete real queued corpus is observed first.
+	prioritizeDockerRealDataReplaySchedules(t, store, beforeState, replayCorpus, beforeState.ControlChat.TeamsChatID, scheduleNow)
+	t.Logf("real-data disposable schedule: replay chats prioritized=%d active chats with empty fake corpus deferred=%d; only copied due-time ordering changed; source schedule/database is untouched", replayChats, emptyChats)
+	// Validate the exact durable admission boundary before starting the listener.
+	// A schedule update that is visible through ChatPoll but absent from the hot
+	// candidate query would otherwise look like a Graph or token failure while
+	// producing zero requests.
+	admissionNow := time.Now()
+	admitted, admissionHandled, admissionErr := store.HotPollWorkCandidatesExcludingIdleAt(ctx, beforeState.ControlChat.TeamsChatID, admissionNow.Add(-inboundPollParkAfter), admissionNow)
+	if admissionErr != nil {
+		t.Fatalf("inspect real-data durable poll admission: %v", admissionErr)
+	}
+	t.Logf("real-data durable poll admission: handled=%t candidates=%d replay_chats=%d", admissionHandled, len(admitted), func() int {
+		count := 0
+		for _, session := range admitted {
+			if len(replayCorpus[strings.TrimSpace(session.TeamsChatID)]) > 0 {
+				count++
+			}
+		}
+		return count
+	}())
+	if !admissionHandled || len(admitted) == 0 {
+		t.Fatalf("real-data durable poll admission returned no candidates after waking %d replay chats", replayChats)
 	}
 
 	const graphToken = "docker-real-data-deterministic-token"
 	graphServerState := newDockerRealDataGraphServer(graphToken, user, replayCorpus)
 	graphServerState.controlChatID = beforeState.ControlChat.TeamsChatID
+	if resume {
+		graphServerState.setDurableUnknownPostWitness(resumeUnknownPostWitness)
+	}
 	// Arm the unknown-result fault only for the synthetic final body emitted by
 	// the disposable executor. This prevents an old/control outbox row copied
 	// from the source snapshot from consuming the fault and making the experiment
@@ -3225,7 +5135,15 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 		// ambiguous final outbox behind.
 		graphServerState.setUnknownPostMarker("__docker_real_data_unknown_post_disabled__")
 	} else {
-		graphServerState.setUnknownPostMarker(dockerRealDataExecutionPrefix + "1")
+		// The first executor result can be held behind an inherited per-chat
+		// FIFO, so result #1 is not guaranteed to be POSTed in the measured
+		// window. The ordinary real-data run needs one deterministic unknown
+		// message-POST witness, not a particular result number. Match any
+		// synthetic executor-result body so inherited operational outbox rows
+		// can be sent normally and cannot consume the fault before the replay
+		// lane reaches its own unknown POST boundary. The production outbox must
+		// preserve that one ambiguous row and never replay it.
+		graphServerState.setUnknownPostMarker(dockerRealDataAnyExecutionMarker)
 	}
 	knownChats := []string{beforeState.ControlChat.TeamsChatID}
 	for _, session := range beforeState.Sessions {
@@ -3241,8 +5159,34 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	// Keep them in the fake Graph's namespace and return an empty page instead
 	// of manufacturing a 404 that would look like a listener bug.
 	graphServerState.setKnownChats(knownChats...)
+	expiredProviderChats := dockerRealDataExpiredProviderContinuationChats(beforeState)
 	expiredProviderTokens := dockerRealDataExpiredProviderTokens(graphServerState, beforeState)
 	t.Logf("real-data persisted provider continuations marked expired in isolated Graph: %d; arbitrary opaque tokens remain invalid", expiredProviderTokens)
+	if len(expiredProviderChats) > 0 {
+		// The copied production schedule can contain many due chats and the
+		// listener intentionally admits only a bounded quantum. Move one actual
+		// expired-continuation chat to the front of the disposable due order so a
+		// short, realistic run proves the recovery response is handled by the
+		// production poller. This changes no frontier, cursor, receipt, or source
+		// identity; it is the same due-time-only adjustment used for replay chats.
+		recoveryChat := expiredProviderChats[0]
+		recoveryPoll := beforeState.ChatPolls[recoveryChat]
+		pollState := strings.TrimSpace(recoveryPoll.PollState)
+		if pollState == "" {
+			pollState = inboundPollStateWarm
+		}
+		if _, err := store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
+			ChatID:            recoveryChat,
+			PollState:         pollState,
+			NextPollAt:        scheduleNow.Add(-2 * time.Minute),
+			LastActivityAt:    scheduleNow.Add(-time.Minute),
+			ClearBlockedUntil: true,
+			ResetFailures:     true,
+		}); err != nil {
+			t.Fatalf("wake copied expired-continuation chat %q: %v", recoveryChat, err)
+		}
+		t.Logf("real-data expired-continuation witness: chat=%q moved to the front of disposable due ordering", recoveryChat)
+	}
 	// Bind the retryable fault to the first replay chat that the production
 	// scheduler actually selects. Picking an arbitrary corpus entry can leave
 	// the fault unobserved when the real schedule does not reach that chat in
@@ -3257,7 +5201,7 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 			t.Fatalf("select real-data 429 poll sessions: %v", selectionErr)
 		}
 		docker429ThrottledSessions = docker429PollSessions[:dockerRealData429Chats]
-		if rateLimitScope == dockerRealData429ScopeAccount {
+		if rateLimitAccountWide {
 			// An account-level throttle affects every selected chat. Keep both
 			// sessions in the throttled set so every round must observe the same
 			// tenant-wide 429 before the final recovery round.
@@ -3269,8 +5213,12 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 		// The high-intensity path invokes these exact copied real chats, so the
 		// fault cannot silently bind to an unrelated schedule row. Account scope
 		// uses one shared request budget; chat scope keeps independent budgets.
-		if rateLimitScope == dockerRealData429ScopeAccount {
-			graphServerState.setPersistentGlobalList429(len(docker429ThrottledSessions) * dockerRealData429Failures)
+		if rateLimitAccountWide {
+			// The durable account gate should collapse each concurrent wave to
+			// one provider request. A budget proportional to the number of chats
+			// would let a broken gate consume duplicate 429s and still appear to
+			// recover, so keep the oracle's exact one-per-round budget here.
+			graphServerState.setPersistentGlobalList429WithScope(dockerRealData429Failures, rateLimitScope)
 		} else {
 			graphServerState.setPersistentList429(docker429RateLimitedChats, dockerRealData429Chats, dockerRealData429Failures)
 		}
@@ -3297,6 +5245,11 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	}
 	executor := &dockerRealDataExecutor{holdFirst: executorHoldFirst}
 	traceWriter := &dockerRealDataTraceWriter{}
+	// Store timing is opt-in and observation-only. Keep the real-data fixture's
+	// lock/hold tail visible so an Amdahl diagnosis can distinguish JSON/SQLite
+	// work from contention without changing the production lock contract.
+	store.SetTimingObserver(traceWriter.recordStoreTiming)
+	t.Cleanup(func() { store.SetTimingObserver(nil) })
 	historyMandatory := make(map[string]bool)
 	for _, checkpoint := range beforeState.HistoryWatch {
 		if historyWatchCheckpointNeedsMandatoryMaintenance(checkpoint) {
@@ -3384,11 +5337,53 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 			maxWorkChatPollsPerCycle: DefaultMaxWorkChatPollsPerCycle,
 			pollWorkerBudget:         mainLoopPollWorkerBudget,
 		}
-		bridge.controlLeaseClaimHook = traceWriter.recordLeaseClaim
+		bridge.controlLeaseClaimHook = func(decision teamstore.ControlLeaseDecision, err error) {
+			traceWriter.recordLeaseClaim(decision, err)
+			traceWriter.recordLeaseClaimWitness(activeStore)
+		}
 		bridge.ownerFailureHook = traceWriter.recordOwnerFailure
 		bridge.pollChatTraceHook = traceWriter.recordPollChat
-		bridge.historyWatchPathHook = maintenanceTrace.observeHistory
-		bridge.linkedTranscriptSessionHook = maintenanceTrace.observeLinked
+		bridge.mainLoopPhaseTraceHook = func(name string, duration time.Duration, err error) {
+			traceWriter.recordTiming("phase."+strings.TrimSpace(name), duration, err)
+		}
+		bridge.pollDecisionTraceHook = func(stage string, decisions []inboundPollDecision) {
+			traceWriter.recordPollSelection(stage, graphServerState.faultChatSnapshot(), decisions)
+		}
+		bridge.outboxPhaseTraceHook = func(name string, duration time.Duration, err error) {
+			traceWriter.recordTiming("outbox.phase."+strings.TrimSpace(name), duration, err)
+			_, _ = fmt.Fprintf(traceWriter, "Teams outbox step name=%s duration=%s err=%v\n", name, duration, err)
+		}
+		bridge.outboxSendTraceHook = func(outboxID, stage string, duration time.Duration, err error) {
+			// Keep the realistic fixture output bounded and independent from the
+			// general listener log cap. Sub-10ms stages are not useful for the
+			// Amdahl diagnosis, while every error and material long-tail stage
+			// remains visible with its durable row identity.
+			traceWriter.recordOutboxSendStage(outboxID, stage, duration, err)
+		}
+		bridge.pollPhaseTraceHook = func(name string, duration time.Duration, err error) {
+			traceWriter.recordTiming("poll.phase."+strings.TrimSpace(name), duration, err)
+			_, _ = fmt.Fprintf(traceWriter, "Teams poll step name=%s duration=%s err=%v\n", name, duration, err)
+		}
+		bridge.queuedTurnTraceHook = traceWriter.recordQueuedTurn
+		bridge.pollMessageTraceHook = traceWriter.recordPollMessage
+		bridge.historyWatchPathHook = func(hookCtx context.Context, path string) error {
+			started := time.Now()
+			err := maintenanceTrace.observeHistory(hookCtx, path)
+			traceWriter.recordTiming("diagnostic.history-observer", time.Since(started), err)
+			return err
+		}
+		bridge.linkedTranscriptSessionHook = func(hookCtx context.Context, session Session) error {
+			started := time.Now()
+			err := maintenanceTrace.observeLinked(hookCtx, session)
+			traceWriter.recordTiming("diagnostic.linked-observer", time.Since(started), err)
+			return err
+		}
+		bridge.historyWatchJobTraceHook = func(path string, duration time.Duration, err error) {
+			traceWriter.recordTiming("history.job", duration, err)
+		}
+		bridge.linkedTranscriptJobTraceHook = func(sessionID string, duration time.Duration, err error) {
+			traceWriter.recordTiming("linked.job", duration, err)
+		}
 		cycleDone := make(chan struct{}, 1)
 		var measuredWindowCompleted atomic.Bool
 		var startupTimedOut atomic.Bool
@@ -3415,7 +5410,7 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 			// copied production registry/history projection.  Start the measured
 			// listener window only after the first complete main-loop cycle, so the
 			// stop boundary cannot be scheduled in the middle of startup work.
-			startupDeadline := time.NewTimer(5 * time.Minute)
+			startupDeadline := time.NewTimer(startupDeadlineDuration)
 			select {
 			case <-cycleDone:
 				if !startupDeadline.Stop() {
@@ -3442,12 +5437,12 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 				} else {
 					startupFailure = errors.New("listener returned before its first main-loop cycle")
 				}
-				t.Logf("real-data listener returned before its first main-loop cycle: err=%v phases=%#v lease_claims=%v owner_failures=%v lines=%v", listenErr, bridge.mainLoopPhaseStatsSnapshot("poll"), traceWriter.leaseClaimsSnapshot(), traceWriter.ownerFailuresSnapshot(), traceWriter.linesSnapshot())
+				t.Logf("real-data listener returned before its first main-loop cycle: err=%v phases=%#v lease_claims=%v owner_failures=%v lines=%v store_timings=%v", listenErr, bridge.mainLoopPhaseStatsSnapshot("poll"), traceWriter.leaseClaimsSnapshot(), traceWriter.ownerFailuresSnapshot(), traceWriter.linesSnapshot(), traceWriter.storeTimingsSnapshot())
 				return
 			case <-startupDeadline.C:
 				startupTimedOut.Store(true)
 				startupFailure = errors.New("first main-loop cycle did not complete before the startup deadline")
-				t.Logf("real-data listener did not complete its first main-loop cycle before the startup deadline: phases=%#v lease_claims=%v owner_failures=%v lines=%v", bridge.mainLoopPhaseStatsSnapshot("poll"), traceWriter.leaseClaimsSnapshot(), traceWriter.ownerFailuresSnapshot(), traceWriter.linesSnapshot())
+				t.Logf("real-data listener did not complete its first main-loop cycle before the startup deadline: phases=%#v lease_claims=%v owner_failures=%v lines=%v store_timings=%v", bridge.mainLoopPhaseStatsSnapshot("poll"), traceWriter.leaseClaimsSnapshot(), traceWriter.ownerFailuresSnapshot(), traceWriter.linesSnapshot(), traceWriter.storeTimingsSnapshot())
 				listenCancel()
 				return
 			case <-ctx.Done():
@@ -3468,15 +5463,18 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 				measuredWindow.phaseErrorsAtMeasureStart[phaseName] = stats.Errors
 				measuredWindow.phaseDeadlinesAtMeasureStart[phaseName] = stats.DeadlineExceeded
 			}
+			measuredWindow.startedAt = time.Now()
 			timer := time.NewTimer(duration)
 			defer timer.Stop()
 			select {
 			case <-timer.C:
-				measuredWindowCompleted.Store(true)
+				sampleEndedAt := time.Now()
+				measuredWindow.endedAt = sampleEndedAt
 				measuredWindow.executorAfter = executor.runs.Load()
 				measuredWindow.after, measuredWindow.afterCountsReadError = dockerRealDataCountsFromSQLite(ctx, filepath.Join(filepath.Dir(statePath), teamstore.SQLiteFileName))
 				measuredWindow.completed = measuredWindow.afterCountsReadError == nil
-				measuredWindow.stopRequestedAt = time.Now()
+				measuredWindow.stopRequestedAt = sampleEndedAt
+				measuredWindowCompleted.Store(true)
 				measuredWindow.phaseErrorsAtStop = make(map[string]uint64, len(phaseNames))
 				measuredWindow.phaseDeadlinesAtStop = make(map[string]uint64, len(phaseNames))
 				for _, phaseName := range phaseNames {
@@ -3570,7 +5568,7 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 		ownerChanges += changes
 		if measuredWindowCompleted.Load() {
 			measuredWindows++
-			measuredElapsed += duration
+			measuredElapsed += dockerRealDataMeasuredWindowDuration(measuredWindow, duration)
 			if measuredWindow.beforeCountsReadError != nil {
 				return fmt.Errorf("read measured Docker window baseline counters: %w", measuredWindow.beforeCountsReadError)
 			}
@@ -3624,11 +5622,13 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	// linked-transcript work. On a copied multi-gigabyte state those phases can
 	// legitimately consume the entire phase budget before a second poll wave is
 	// reached. That is useful diagnostic information, but it is an inefficient
-	// way to answer the narrower 429 question. In high-intensity mode, keep the
-	// same copied SQLite/registry/Codex corpus, fake Graph boundary, owner lease,
-	// per-chat poll frontier, and real message handler, then drive only the
-	// selected poll quantum directly. No schedule clearing or failure reset is
-	// performed between rounds; the loop waits for each durable Retry-After gate.
+	// way to answer the narrower 429 question. The explicitly requested
+	// poll-only mode keeps the same copied SQLite/registry/Codex corpus, fake
+	// Graph boundary, owner lease, per-chat poll frontier, and real message
+	// handler, then drives only the selected poll quantum directly. No schedule
+	// clearing or failure reset is performed between rounds; the loop waits for
+	// each durable Retry-After gate. The default Docker 429 experiment uses the
+	// full Bridge.Listen path above.
 	run429PollOnly := func(activeStore *teamstore.Store) error {
 		if len(docker429PollSessions) != dockerRealData429Chats+dockerRealData429HealthyChats {
 			return fmt.Errorf("429 poll-only selection has %d sessions; want %d", len(docker429PollSessions), dockerRealData429Chats+dockerRealData429HealthyChats)
@@ -3661,9 +5661,17 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 			maxWorkChatPollsPerCycle: len(docker429PollSessions),
 			pollWorkerBudget:         mainLoopPollWorkerBudget,
 		}
-		bridge.controlLeaseClaimHook = traceWriter.recordLeaseClaim
+		bridge.controlLeaseClaimHook = func(decision teamstore.ControlLeaseDecision, err error) {
+			traceWriter.recordLeaseClaim(decision, err)
+			traceWriter.recordLeaseClaimWitness(activeStore)
+		}
 		bridge.ownerFailureHook = traceWriter.recordOwnerFailure
 		bridge.pollChatTraceHook = traceWriter.recordPollChat
+		bridge.pollDecisionTraceHook = func(stage string, decisions []inboundPollDecision) {
+			traceWriter.recordPollSelection(stage, graphServerState.faultChatSnapshot(), decisions)
+		}
+		bridge.queuedTurnTraceHook = traceWriter.recordQueuedTurn
+		bridge.pollMessageTraceHook = traceWriter.recordPollMessage
 		active, err := bridge.claimControlLease(ctx)
 		if err != nil {
 			return fmt.Errorf("claim disposable owner lease for 429 poll-only run: %w", err)
@@ -3686,11 +5694,12 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 			pollInboundWriter = &globalInboundSQLiteWriter{}
 			defer func() { _ = pollInboundWriter.close() }()
 		}
-		measureStarted := time.Now()
 		measureBefore, err := dockerRealDataCountsFromSQLite(ctx, filepath.Join(filepath.Dir(statePath), teamstore.SQLiteFileName))
 		if err != nil {
 			return fmt.Errorf("read 429 poll-only baseline counters: %w", err)
 		}
+		measureExecutorBefore := executor.runs.Load()
+		measureStarted := time.Now()
 		type pollResult struct {
 			chatID string
 			err    error
@@ -3711,10 +5720,11 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 			if pollInboundWriter != nil {
 				roundCtx = context.WithValue(roundCtx, pollInboundLedgerWriterContextKey{}, pollInboundWriter)
 			}
+			requestSnapshotBeforeRound := graphServerState.graphRequestsSnapshot()
 			results := make(chan pollResult, len(docker429PollSessions))
 			var workers sync.WaitGroup
 			roundSessions := docker429ThrottledSessions
-			if round == 0 || rateLimitScope == dockerRealData429ScopeAccount {
+			if round == 0 || rateLimitAccountWide {
 				// Exercise sibling availability once while the selected real chat is
 				// rate-limited. In account scope every selected chat is throttled on
 				// every pre-recovery round; in chat scope repeating the healthy handler
@@ -3743,8 +5753,21 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 			workers.Wait()
 			close(results)
 			var roundErrors []string
+			sawAccountRateLimit := false
 			for result := range results {
 				_, rateLimited := rateLimitedSet[result.chatID]
+				if round < dockerRealData429Failures && rateLimitAccountWide {
+					// A durable account gate intentionally suppresses sibling
+					// requests after the first observed 429 in this wave.  Only
+					// the first provider failure is required; nil means this
+					// worker observed the already-persisted shared gate.
+					if result.err != nil && isGraphRateLimitError(result.err) {
+						sawAccountRateLimit = true
+					} else if result.err != nil {
+						roundErrors = append(roundErrors, fmt.Sprintf("%s: %v", result.chatID, result.err))
+					}
+					continue
+				}
 				if round < dockerRealData429Failures && rateLimited {
 					if result.err == nil || !isGraphRateLimitError(result.err) {
 						roundErrors = append(roundErrors, fmt.Sprintf("%s: %v", result.chatID, result.err))
@@ -3754,6 +5777,9 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 				}
 			}
 			roundCancel()
+			if round < dockerRealData429Failures && rateLimitAccountWide && !sawAccountRateLimit {
+				return fmt.Errorf("429 poll-only round %d did not observe any account-scoped provider 429", round+1)
+			}
 			if len(roundErrors) > 0 {
 				return fmt.Errorf("429 poll-only round %d errors: %s", round+1, strings.Join(roundErrors, "; "))
 			}
@@ -3761,16 +5787,56 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 				break
 			}
 			var retryAt time.Time
-			for _, selected := range docker429ThrottledSessions {
-				poll, found, pollErr := activeStore.ChatPoll(ctx, selected.ChatID)
-				if pollErr != nil {
-					return fmt.Errorf("read durable 429 gate for %s after round %d: %w", selected.ChatID, round+1, pollErr)
+			if rateLimitAccountWide {
+				limit, found, gateErr := activeStore.ChatRateLimit(ctx, graphReadAccountRateLimitKey)
+				if gateErr != nil {
+					return fmt.Errorf("read durable account 429 gate after round %d: %w", round+1, gateErr)
 				}
-				if !found || poll.LastErrorAt.IsZero() || !poll.NextPollAt.After(poll.LastErrorAt) {
-					return fmt.Errorf("chat %s did not persist a Retry-After gate after round %d: %#v", selected.ChatID, round+1, poll)
+				if !found || !limit.BlockedUntil.After(time.Now()) {
+					return fmt.Errorf("account 429 gate was not durable after round %d: %#v", round+1, limit)
 				}
-				if poll.NextPollAt.After(retryAt) {
-					retryAt = poll.NextPollAt
+				retryAt = limit.BlockedUntil
+				// The fake Graph records both request start and completion. Once the
+				// first account/global 429 response has completed, a healthy sibling
+				// must not start another list GET before the durable shared gate
+				// expires. Requests already in flight before that response are a
+				// legitimate concurrency race; requests started afterwards prove that
+				// the read gate was not consulted or was scoped per chat.
+				requestSnapshotAfterRound := graphServerState.graphRequestsSnapshot()
+				first429CompletedAt := time.Time{}
+				for index := len(requestSnapshotBeforeRound); index < len(requestSnapshotAfterRound); index++ {
+					record := requestSnapshotAfterRound[index]
+					if record.Operation == dockerRealDataGraphOpMessageList &&
+						record.StatusCode == http.StatusTooManyRequests &&
+						dockerRealData429ScopeIsAccountWide(record.RateLimitScope) {
+						first429CompletedAt = record.CompletedAt
+						break
+					}
+				}
+				if first429CompletedAt.IsZero() {
+					return fmt.Errorf("account 429 round %d lacks a timestamped provider witness: requests=%#v", round+1, requestSnapshotAfterRound)
+				}
+				for index := len(requestSnapshotBeforeRound); index < len(requestSnapshotAfterRound); index++ {
+					record := requestSnapshotAfterRound[index]
+					if record.Operation != dockerRealDataGraphOpMessageList ||
+						record.StartedAt.Before(first429CompletedAt) ||
+						!record.StartedAt.Before(retryAt) {
+						continue
+					}
+					return fmt.Errorf("account 429 round %d started a sibling list GET after the shared 429 and before gate expiry: record=%#v gate=%s", round+1, record, retryAt)
+				}
+			} else {
+				for _, selected := range docker429ThrottledSessions {
+					poll, found, pollErr := activeStore.ChatPoll(ctx, selected.ChatID)
+					if pollErr != nil {
+						return fmt.Errorf("read durable 429 gate for %s after round %d: %w", selected.ChatID, round+1, pollErr)
+					}
+					if !found || poll.LastErrorAt.IsZero() || !poll.NextPollAt.After(poll.LastErrorAt) {
+						return fmt.Errorf("chat %s did not persist a Retry-After gate after round %d: %#v", selected.ChatID, round+1, poll)
+					}
+					if poll.NextPollAt.After(retryAt) {
+						retryAt = poll.NextPollAt
+					}
 				}
 			}
 			wait := time.Until(retryAt) + 20*time.Millisecond
@@ -3789,15 +5855,17 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 				}
 			}
 		}
+		measureEnded := time.Now()
+		measureExecutorAfter := executor.runs.Load()
 		measureAfter, err := dockerRealDataCountsFromSQLite(ctx, filepath.Join(filepath.Dir(statePath), teamstore.SQLiteFileName))
 		if err != nil {
 			return fmt.Errorf("read 429 poll-only final counters: %w", err)
 		}
 		measuredWindows++
-		measuredElapsed += time.Since(measureStarted)
+		measuredElapsed += measureEnded.Sub(measureStarted)
 		measuredInbound += measureAfter.inbound - measureBefore.inbound
 		measuredCompleted += measureAfter.completed - measureBefore.completed
-		measuredExecutorRuns += executor.runs.Load()
+		measuredExecutorRuns += measureExecutorAfter - measureExecutorBefore
 		measuredWindowInbound = append(measuredWindowInbound, measureAfter.inbound-measureBefore.inbound)
 		measuredWindowCompletedDeltas = append(measuredWindowCompletedDeltas, measureAfter.completed-measureBefore.completed)
 		ownerTrace.stopTrace()
@@ -3816,7 +5884,7 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 		return nil
 	}
 
-	if rateLimitExperiment {
+	if rateLimitPollOnly {
 		if err := run429PollOnly(store); err != nil {
 			t.Fatal(err)
 		}
@@ -3835,7 +5903,11 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read copied real-data result counters: %v", err)
 	}
-	afterState, err := dockerRealDataPostStateFromSQLite(postCtx, filepath.Join(filepath.Dir(statePath), teamstore.SQLiteFileName), replayCorpus)
+	postStateWitnessOutboxID := graphServerState.unknownPostOutboxIDSnapshot()
+	if resume {
+		postStateWitnessOutboxID = resumeWitnessOutboxID
+	}
+	afterState, err := dockerRealDataPostStateFromSQLite(postCtx, filepath.Join(filepath.Dir(statePath), teamstore.SQLiteFileName), replayCorpus, postStateWitnessOutboxID)
 	if err != nil {
 		t.Fatalf("read copied real-data synthetic state after listener experiment: %v", err)
 	}
@@ -3877,13 +5949,20 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	}
 	unknown := graphServerState.unknownPaths()
 	servedMessages := graphServerState.servedMessages()
+	servedMessageRequests := graphServerState.servedMessageRequests()
 	persistedSyntheticIDs, err := dockerRealDataSyntheticInboundIDs(postCtx, filepath.Join(filepath.Dir(statePath), teamstore.SQLiteFileName))
 	if err != nil {
 		t.Fatalf("read Graph-served synthetic inbound IDs: %v", err)
 	}
 	protectedPollMessageIDs := dockerRealDataProtectedPollMessageIDs(afterState)
 	if len(servedMessages) == 0 && (!resume || resumeWorkExpected) {
-		t.Fatalf("real-data fake Graph served no replay messages; throughput would be an unmeasured scheduler result: list_gets=%d status429=%d invalid_queries=%d unsupported_filters=%d poll_traces=%v requests=%v", graphServerState.listGETs.Load(), graphServerState.status429.Load(), graphServerState.invalidListQueries.Load(), graphServerState.unsupportedFilters.Load(), traceWriter.pollChatsSnapshot(), graphServerState.listRequests())
+		phaseStats := make(map[string]mainLoopPhaseStats)
+		if len(bridges) > 0 {
+			for _, phaseName := range phaseNames {
+				phaseStats[phaseName] = bridges[len(bridges)-1].mainLoopPhaseStatsSnapshot(phaseName)
+			}
+		}
+		t.Fatalf("real-data fake Graph served no replay messages; throughput would be an unmeasured scheduler result: list_gets=%d status429=%d invalid_queries=%d unsupported_filters=%d poll_traces=%s queued_turns=%s poll_messages=%s requests=%s phase_stats=%v listener_lines=%s listener_error=%v", graphServerState.listGETs.Load(), graphServerState.status429.Load(), graphServerState.invalidListQueries.Load(), graphServerState.unsupportedFilters.Load(), dockerRealDataTraceSummary(traceWriter.pollChatsSnapshot()), dockerRealDataTraceSummary(traceWriter.queuedTurnsSnapshot()), dockerRealDataTraceSummary(traceWriter.pollMessagesSnapshot()), dockerRealDataRequestSummary(graphServerState.listRequests()), phaseStats, dockerRealDataTraceSummary(traceWriter.linesSnapshot()), lastListenerErr)
 	}
 	missingDurableInbound := make([]string, 0)
 	protectedServedMessages := 0
@@ -3919,16 +5998,32 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 		if len(missingDurableInbound) > 16 {
 			missingDurableInbound = missingDurableInbound[:16]
 		}
-		t.Fatalf("fake Graph served replay messages without durable inbound events (first %d): %v", len(missingDurableInbound), missingDurableInbound)
-	}
-	duplicateServedMessages := 0
-	for _, count := range servedMessages {
-		if count > 1 {
-			duplicateServedMessages += count - 1
+		unprotected := make(map[string][]string)
+		for chatID, messages := range replayCorpus {
+			for _, message := range messages {
+				messageID := strings.TrimSpace(message.ID)
+				if messageID == "" {
+					continue
+				}
+				if _, served := servedMessages[messageID]; !served {
+					continue
+				}
+				if _, found := persistedSyntheticIDs[messageID]; found {
+					continue
+				}
+				if _, protected := protectedPollMessageIDs[messageID]; protected {
+					continue
+				}
+				unprotected[messageID] = []string{chatID}
+				unprotected[messageID] = append(unprotected[messageID], servedMessageRequests[messageID]...)
+			}
 		}
+		t.Logf("real-data durability diagnostic: unprotected_served=%v poll_messages=%s queued_turns=%s list_requests=%s", unprotected, dockerRealDataTraceSummary(traceWriter.pollMessagesSnapshot()), dockerRealDataTraceSummary(traceWriter.queuedTurnsSnapshot()), dockerRealDataRequestSummary(graphServerState.listRequests()))
+		t.Fatalf("fake Graph served replay messages without durable inbound events (first %d): %v", len(missingDurableInbound), missingDurableInbound)
 	}
 	backlogSamples, ordinaryHistoryWhileBacklog, ordinaryLinkedWhileBacklog := maintenanceTrace.snapshot()
 	ordinaryHistoryPaths, ordinaryLinkedSessions := maintenanceTrace.ordinaryWorkSnapshot()
+	ordinaryLinkedSuppressed, ordinaryLinkedUnsuppressed := maintenanceTrace.ordinaryLinkedPolicySnapshot()
 	ordinaryUnindexedLinked := maintenanceTrace.ordinaryUnindexedLinkedSnapshot()
 	ordinaryUnindexedLinkedIDs := maintenanceTrace.ordinaryUnindexedLinkedIDsSnapshot()
 	phaseStats := func(name string) mainLoopPhaseStats {
@@ -3938,6 +6033,7 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 			total.Runs += current.Runs
 			total.DeadlineExceeded += current.DeadlineExceeded
 			total.Errors += current.Errors
+			total.Deferred += current.Deferred
 			if current.LastStartedAt.After(total.LastStartedAt) {
 				total.LastStartedAt = current.LastStartedAt
 			}
@@ -3953,6 +6049,12 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 		}
 		return total
 	}
+	duplicateServedMessages := 0
+	for _, count := range servedMessages {
+		if count > 1 {
+			duplicateServedMessages += count - 1
+		}
+	}
 	phaseStatsByName := make(map[string]mainLoopPhaseStats, len(phaseNames))
 	for _, phaseName := range phaseNames {
 		phaseStatsByName[phaseName] = phaseStats(phaseName)
@@ -3960,8 +6062,112 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	pollStats := phaseStatsByName["poll"]
 	historyWatchStats := phaseStatsByName["history-watch"]
 	linkedTranscriptStats := phaseStatsByName["linked-transcript"]
-	t.Logf("real-data Teams experiment: resume=%t startup_load=%s listener_wall=%s measured_windows=%d measured_window=%s startup_ready_after=%s first_execution_after=%s baseline_inbound=%d final_inbound=%d inbound_delta=%d final_completed=%d completed_delta=%d failed=%d queued=%d running=%d interrupted=%d executor_runs=%d measured_inbound=%d measured_completed=%d measured_executor_runs=%d wall_inbound_per_sec=%.3f measured_inbound_per_sec=%.3f measured_completed_per_sec=%.3f measured_executor_per_sec=%.3f graph_list_gets=%d graph_item_gets=%d graph_posts_blocked_locally=%d graph_429=%d graph_503=%d unknown_posts=%d repeated_unknown_posts=%d graph_served_unique=%d graph_served_duplicates=%d history_offset_delta=%d poll_runs=%d poll_deadlines=%d poll_errors=%d poll_last_duration=%s poll_last_error=%q history_watch_runs=%d history_watch_deadlines=%d history_watch_errors=%d history_watch_last_duration=%s history_watch_last_error=%q linked_transcript_runs=%d linked_transcript_deadlines=%d linked_transcript_errors=%d linked_transcript_last_duration=%s linked_transcript_last_error=%q phase_stats=%v startup_phase_errors=%v startup_phase_deadlines=%v owner_generations=%v owner_changes=%d owner_changes_by_run=%v backlog_samples=%d ordinary_history_while_backlog=%d ordinary_linked_while_backlog=%d ordinary_unindexed_linked=%d unindexed_linked_candidates=%d ordinary_history_paths=%v ordinary_linked_sessions=%v ordinary_unindexed_linked_ids=%v baseline_history_offset_sum=%d final_history_offset_sum=%d graph_list_requests=%v unknown_graph_paths=%v listener_error=%v", resume, loadElapsed, runElapsed, measuredWindows, steadyElapsed, startupReadyElapsed, firstExecutionElapsed, beforeCounts.inbound, afterCounts.inbound, inboundDelta, afterCounts.completed, completedDelta, afterCounts.failed, afterCounts.queued, afterCounts.running, afterCounts.interrupted, runs, measuredInbound, measuredCompleted, measuredExecutorRuns, float64(inboundDelta)/runElapsed.Seconds(), float64(measuredInbound)/steadyElapsed.Seconds(), float64(measuredCompleted)/steadyElapsed.Seconds(), float64(measuredExecutorRuns)/steadyElapsed.Seconds(), graphServerState.listGETs.Load(), graphServerState.itemGETs.Load(), graphServerState.posts.Load(), graphServerState.status429.Load(), graphServerState.status503.Load(), graphServerState.unknownPosts.Load(), graphServerState.unknownPostRepeats.Load(), len(servedMessages), duplicateServedMessages, afterHistoryOffsets-beforeHistoryOffsets, pollStats.Runs, pollStats.DeadlineExceeded, pollStats.Errors, pollStats.LastDuration, pollStats.LastError, historyWatchStats.Runs, historyWatchStats.DeadlineExceeded, historyWatchStats.Errors, historyWatchStats.LastDuration, historyWatchStats.LastError, linkedTranscriptStats.Runs, linkedTranscriptStats.DeadlineExceeded, linkedTranscriptStats.Errors, linkedTranscriptStats.LastDuration, linkedTranscriptStats.LastError, phaseStatsByName, startupPhaseErrors, startupPhaseDeadlines, ownerGenerations, ownerChanges, ownerChangesByRun, backlogSamples, ordinaryHistoryWhileBacklog, ordinaryLinkedWhileBacklog, ordinaryUnindexedLinked, len(linkedUnindexed), ordinaryHistoryPaths, ordinaryLinkedSessions, ordinaryUnindexedLinkedIDs, beforeHistoryOffsets, afterHistoryOffsets, graphServerState.listRequests(), unknown, lastListenerErr)
-	t.Logf("real-data per-chat poll timings: %v", traceWriter.pollChatsSnapshot())
+	// Emit this before the intentionally verbose aggregate diagnostic so a
+	// command-line log cap cannot hide the per-send bottleneck evidence.
+	t.Logf("real-data outbox send stage timings: %s", dockerRealDataTraceSummary(traceWriter.outboxSendStagesSnapshot()))
+	t.Logf("real-data Teams experiment: resume=%t startup_load=%s listener_wall=%s measured_windows=%d measured_window=%s startup_ready_after=%s first_execution_after=%s baseline_inbound=%d final_inbound=%d inbound_delta=%d final_completed=%d completed_delta=%d failed=%d queued=%d running=%d interrupted=%d executor_runs=%d measured_inbound=%d measured_completed=%d measured_executor_runs=%d wall_inbound_per_sec=%.3f measured_inbound_per_sec=%.3f measured_completed_per_sec=%.3f measured_executor_per_sec=%.3f graph_list_gets=%d graph_item_gets=%d graph_posts_total=%d graph_message_post_attempts=%d graph_message_post_responses=%d graph_message_post_accepts=%d graph_mark_unread_posts=%d graph_429=%d graph_503=%d unknown_posts=%d repeated_unknown_posts=%d graph_served_unique=%d graph_served_duplicates=%d history_offset_delta=%d poll_runs=%d poll_deadlines=%d poll_errors=%d poll_last_duration=%s poll_last_error=%q history_watch_runs=%d history_watch_deadlines=%d history_watch_errors=%d history_watch_last_duration=%s history_watch_last_error=%q linked_transcript_runs=%d linked_transcript_deadlines=%d linked_transcript_errors=%d linked_transcript_last_duration=%s linked_transcript_last_error=%q phase_stats=%v startup_phase_errors=%v startup_phase_deadlines=%v owner_generations=%v owner_changes=%d owner_changes_by_run=%v backlog_samples=%d ordinary_history_while_backlog=%d ordinary_linked_while_backlog=%d ordinary_linked_suppressed=%d ordinary_linked_unsuppressed=%d ordinary_unindexed_linked=%d unindexed_linked_candidates=%d ordinary_history_paths=%v ordinary_linked_sessions=%v ordinary_unindexed_linked_ids=%v baseline_history_offset_sum=%d final_history_offset_sum=%d graph_list_requests=%s unknown_graph_paths=%v listener_error=%v", resume, loadElapsed, runElapsed, measuredWindows, steadyElapsed, startupReadyElapsed, firstExecutionElapsed, beforeCounts.inbound, afterCounts.inbound, inboundDelta, afterCounts.completed, completedDelta, afterCounts.failed, afterCounts.queued, afterCounts.running, afterCounts.interrupted, runs, measuredInbound, measuredCompleted, measuredExecutorRuns, float64(inboundDelta)/runElapsed.Seconds(), float64(measuredInbound)/steadyElapsed.Seconds(), float64(measuredCompleted)/steadyElapsed.Seconds(), float64(measuredExecutorRuns)/steadyElapsed.Seconds(), graphServerState.listGETs.Load(), graphServerState.itemGETs.Load(), graphServerState.posts.Load(), graphServerState.messagePostAttempts.Load(), graphServerState.messagePostResponses.Load(), graphServerState.messagePostAccepts.Load(), graphServerState.markUnreadPosts.Load(), graphServerState.status429.Load(), graphServerState.status503.Load(), graphServerState.unknownPosts.Load(), graphServerState.unknownPostRepeats.Load(), len(servedMessages), duplicateServedMessages, afterHistoryOffsets-beforeHistoryOffsets, pollStats.Runs, pollStats.DeadlineExceeded, pollStats.Errors, pollStats.LastDuration, pollStats.LastError, historyWatchStats.Runs, historyWatchStats.DeadlineExceeded, historyWatchStats.Errors, historyWatchStats.LastDuration, historyWatchStats.LastError, linkedTranscriptStats.Runs, linkedTranscriptStats.DeadlineExceeded, linkedTranscriptStats.Errors, linkedTranscriptStats.LastDuration, linkedTranscriptStats.LastError, phaseStatsByName, startupPhaseErrors, startupPhaseDeadlines, ownerGenerations, ownerChanges, ownerChangesByRun, backlogSamples, ordinaryHistoryWhileBacklog, ordinaryLinkedWhileBacklog, ordinaryLinkedSuppressed, ordinaryLinkedUnsuppressed, ordinaryUnindexedLinked, len(linkedUnindexed), ordinaryHistoryPaths, ordinaryLinkedSessions, ordinaryUnindexedLinkedIDs, beforeHistoryOffsets, afterHistoryOffsets, dockerRealDataRequestSummary(graphServerState.listRequests()), unknown, lastListenerErr)
+	t.Logf("real-data outbox step timings: %s", dockerRealDataTraceSummary(traceWriter.linesContaining("Teams outbox step")))
+	t.Logf("real-data outbox send stage timings: %s", dockerRealDataTraceSummary(traceWriter.outboxSendStagesSnapshot()))
+	t.Logf("real-data store lock timings: %s", dockerRealDataTraceSummary(traceWriter.storeTimingsSnapshot()))
+	t.Logf("real-data poll step timings: %s", dockerRealDataTraceSummary(traceWriter.linesContaining("Teams poll step")))
+	t.Logf("real-data per-chat poll timings: %s", dockerRealDataTraceSummary(traceWriter.pollChatsSnapshot()))
+	t.Logf("real-data poll selection trace: %s", dockerRealDataTraceSummary(traceWriter.pollSelectionsSnapshot()))
+	t.Logf("real-data queued-turn admission trace: %s", dockerRealDataTraceSummary(traceWriter.queuedTurnsSnapshot()))
+	t.Logf("real-data poll-message disposition trace: %s", dockerRealDataTraceSummary(traceWriter.pollMessagesSnapshot()))
+	t.Logf("real-data timing aggregates phase: %s", traceWriter.timingAggregatesSummaryFor("phase.", "poll.phase.", "outbox.phase.", "outbox.send.", "history.", "linked.", "diagnostic."))
+	t.Logf("real-data timing aggregates store: %s", traceWriter.timingAggregatesSummaryFor("store."))
+
+	// Validate provider/query and no-duplicate safety before the throughput gate.
+	// A deliberately short diagnostic run may not reach the configured completion
+	// count, but it must still fail (or pass) on the Graph fault it was meant to
+	// exercise rather than hiding that result behind a throughput assertion.
+	requireGraphWork := !resume || resumeWorkExpected
+	if len(unknown) != 0 {
+		t.Fatalf("fake Graph observed unexpected routes in the production listener: %v", unknown)
+	}
+	if graphServerState.unsupportedFilters.Load() != 0 || graphServerState.invalidListQueries.Load() != 0 {
+		t.Fatalf("strict fake Graph observed invalid production list queries: unsupported_filters=%d invalid_queries=%d requests=%s", graphServerState.unsupportedFilters.Load(), graphServerState.invalidListQueries.Load(), dockerRealDataRequestSummary(graphServerState.listRequests()))
+	}
+	if requireGraphWork && !rateLimitExperiment {
+		faultChatID := graphServerState.faultChatSnapshot()
+		if faultChatID == "" || graphServerState.listPageCount(faultChatID) == 0 {
+			faultID, faultResponses, faultRemaining := graphServerState.faultStateSnapshot()
+			faultPoll := afterState.ChatPolls[faultChatID]
+			candidateState, candidateSessions, candidateHandled, candidateErr := store.HotPollScheduleAndWorkCandidatesExcludingIdleAt(postCtx, beforeState.ControlChat.TeamsChatID, time.Now().Add(-inboundPollParkAfter), time.Now())
+			candidateFound := false
+			for _, candidate := range candidateSessions {
+				if strings.TrimSpace(candidate.TeamsChatID) == strings.TrimSpace(faultChatID) {
+					candidateFound = true
+					break
+				}
+			}
+			_, readyFound := candidateState.ChatPolls[faultChatID]
+			t.Fatalf("retryable Graph fault never recovered to a successful page: fault_chat=%q snapshot_chat=%q successful_pages=%d responses=%v request_paths=%v remaining=%d poll=%#v candidate_handled=%t candidate_err=%v candidate_count=%d candidate_found=%t ready_poll_found=%t", faultChatID, faultID, graphServerState.listPageCount(faultChatID), faultResponses, graphServerState.faultRequestPathsSnapshot(), faultRemaining, faultPoll, candidateHandled, candidateErr, len(candidateSessions), candidateFound, readyFound)
+		}
+		if faultPoll, found := afterState.ChatPolls[faultChatID]; !found {
+			t.Fatalf("retryable Graph fault chat has no durable poll state after recovery: chat=%q", faultChatID)
+		} else if strings.Contains(faultPoll.LastError, "429") || strings.Contains(faultPoll.LastError, "503") {
+			// A successful Graph page may be committed as a partial quantum when
+			// the bounded action budget leaves its immutable receipt pending. In
+			// that case the old provider error remains as a diagnostic until the
+			// receipt is fully drained; LastSuccessfulPollAt proves the retry gate
+			// is no longer active, and the pending page is locally executable.
+			if faultPoll.PendingPage == nil || faultPoll.LastSuccessfulPollAt.IsZero() || !faultPoll.LastSuccessfulPollAt.After(faultPoll.LastErrorAt) {
+				t.Fatalf("retryable Graph fault remained the terminal durable poll error after a later successful page: chat=%q poll=%#v", faultChatID, faultPoll)
+			}
+			t.Logf("real-data retryable Graph fault completed a successful page and retained only a non-terminal diagnostic while its durable page drains: chat=%q", faultChatID)
+		}
+	}
+	if requireGraphWork && !rateLimitExperiment && expiredProviderTokens > 0 && graphServerState.expiredContinuationCount() == 0 {
+		t.Fatalf("real-data replay copied %d opaque provider continuations but never exercised an expired continuation response", expiredProviderTokens)
+	}
+	// Keep the fault-specific recovery diagnosis above the generic fault-budget
+	// assertions. Otherwise a short/slow real-data run reports only that the
+	// injected 503s were not reached, hiding whether the failed chat was absent
+	// from durable admission or merely waiting for its retry deadline.
+	if requireGraphWork && !rateLimitExperiment && (graphServerState.status429.Load() == 0 || graphServerState.status503.Load() == 0) {
+		faultChatID, faultResponses, faultRemaining := graphServerState.faultStateSnapshot()
+		faultPoll, _ := afterState.ChatPolls[faultChatID]
+		t.Fatalf("real-data replay did not exercise both retryable Graph failures: 429=%d 503=%d fault_chat=%q fault_responses=%v fault_request_paths=%v fault_remaining=%d fault_poll=%#v list_requests=%s", graphServerState.status429.Load(), graphServerState.status503.Load(), faultChatID, faultResponses, graphServerState.faultRequestPathsSnapshot(), faultRemaining, faultPoll, dockerRealDataRequestSummary(graphServerState.listRequests()))
+	}
+	if requireGraphWork && !rateLimitExperiment && graphServerState.status503.Load() < int64(defaultGraphRetries+1) {
+		t.Fatalf("real-data replay did not exhaust the in-process 503 retry budget: 503=%d retry_budget=%d", graphServerState.status503.Load(), defaultGraphRetries)
+	}
+	ambiguousUnknownRows := dockerRealDataAmbiguousExecutionOutboxes(afterState)
+	if resume {
+		if graphServerState.unknownPosts.Load() != 0 || graphServerState.unknownPostRepeats.Load() != 0 || graphServerState.unknownPostMismatches.Load() != 0 {
+			t.Fatalf("resumed process replayed an unknown Graph POST result: unknown=%d repeats=%d payload_mismatches=%d", graphServerState.unknownPosts.Load(), graphServerState.unknownPostRepeats.Load(), graphServerState.unknownPostMismatches.Load())
+		}
+		witness := readDockerRealDataUnknownPostWitness(t, statePath)
+		var preserved *teamstore.OutboxMessage
+		for _, row := range afterState.OutboxMessages {
+			if strings.TrimSpace(row.ID) != witness.OutboxID {
+				continue
+			}
+			copy := row
+			preserved = &copy
+			break
+		}
+		if preserved == nil || strings.TrimSpace(preserved.TeamsChatID) != witness.ChatID || dockerRealDataOutboxBodyHash(preserved.Body) != witness.BodyHash || !teamstore.OutboxSendIsAmbiguous(*preserved) {
+			t.Fatalf("resumed process did not preserve the durable ambiguous outbox without retrying it: witness=%#v row=%#v", witness, preserved)
+		}
+	} else if unknownFaultEnabled {
+		if graphServerState.unknownPosts.Load() != 1 || graphServerState.unknownPostRepeats.Load() != 0 || graphServerState.unknownPostMismatches.Load() != 0 || graphServerState.unknownPostAcceptedAttempts() != 1 {
+			t.Fatalf("unknown Graph POST result was not handled as one remotely accepted, non-replayed attempt: unknown=%d repeats=%d payload_mismatches=%d remote_accepts=%d", graphServerState.unknownPosts.Load(), graphServerState.unknownPostRepeats.Load(), graphServerState.unknownPostMismatches.Load(), graphServerState.unknownPostAcceptedAttempts())
+		}
+		unknownPostChat := graphServerState.unknownPostChatSnapshot()
+		unknownPostOutboxID := graphServerState.unknownPostOutboxIDSnapshot()
+		row, found := afterState.OutboxMessages[unknownPostOutboxID]
+		if unknownPostChat == "" || unknownPostOutboxID == "" || !found || strings.TrimSpace(row.TeamsChatID) != unknownPostChat || !dockerRealDataUnknownPostDispositionSafe(row) {
+			t.Fatalf("unknown Graph POST was not represented by one safe durable outbox disposition: chat=%q outbox_id=%q found=%t row=%#v all_execution_rows=%#v", unknownPostChat, unknownPostOutboxID, found, row, ambiguousUnknownRows)
+		}
+		writeDockerRealDataUnknownPostWitness(t, statePath, row, graphServerState)
+	} else if graphServerState.unknownPosts.Load() != 0 || len(ambiguousUnknownRows) != 0 {
+		t.Fatalf("complete real-data mode unexpectedly left an ambiguous Graph POST: unknown=%d rows=%#v", graphServerState.unknownPosts.Load(), ambiguousUnknownRows)
+	}
+	if graphServerState.unknownPostMismatches.Load() != 0 {
+		t.Fatalf("fake Graph observed unknown-POST witness payload mismatches: %d", graphServerState.unknownPostMismatches.Load())
+	}
 
 	minimumCompleted := int64(replayCount)
 	if minimumCompleted > dockerRealDataMinimumReplay {
@@ -3974,15 +6180,25 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 		// would turn the test back into a throughput smoke test.
 		minimumCompleted = 1
 	}
-	if (!resume && completedDelta <= 0) || (resume && resumeWorkExpected && completedDelta <= 0) || (!resume && inboundDelta <= 0) || (!resume && runs <= 0) {
-		t.Fatalf("real copied Teams workload did not make durable execution progress: before=%#v after=%#v executor_runs=%d listener_err=%v", beforeCounts, afterCounts, runs, lastListenerErr)
+	completionForGate := dockerRealDataCompletionForGate(mode, measuredCompleted, completedDelta)
+	if (!resume && completionForGate <= 0) || (resume && resumeWorkExpected && completionForGate <= 0) || (!resume && inboundDelta <= 0) || (!resume && runs <= 0) {
+		phaseDiagnostics := make(map[string]mainLoopPhaseStats, len(phaseNames))
+		if len(bridges) > 0 {
+			for _, phaseName := range phaseNames {
+				phaseDiagnostics[phaseName] = bridges[len(bridges)-1].mainLoopPhaseStatsSnapshot(phaseName)
+			}
+		}
+		t.Fatalf("real copied Teams workload did not make durable execution progress: before=%#v after=%#v executor_runs=%d listener_err=%v phases=%#v listener_lines=%s poll_traces=%s queued_turns=%s poll_messages=%s graph_requests=%s", beforeCounts, afterCounts, runs, lastListenerErr, phaseDiagnostics, dockerRealDataTraceSummary(traceWriter.linesSnapshot()), dockerRealDataTraceSummary(traceWriter.pollChatsSnapshot()), dockerRealDataTraceSummary(traceWriter.queuedTurnsSnapshot()), dockerRealDataTraceSummary(traceWriter.pollMessagesSnapshot()), dockerRealDataRequestSummary(graphServerState.listRequests()))
 	}
 	if len(measuredWindowInbound) != measuredWindows || len(measuredWindowCompletedDeltas) != measuredWindows {
 		t.Fatalf("real-data measured window accounting is incomplete: windows=%d inbound_deltas=%v completed_deltas=%v", measuredWindows, measuredWindowInbound, measuredWindowCompletedDeltas)
 	}
 	for index := range measuredWindowInbound {
-		if ((!resume || resumeWorkExpected) && measuredWindowCompletedDeltas[index] <= 0) || (!resume && measuredWindowInbound[index] <= 0) {
+		if !resume && measuredWindowInbound[index] <= 0 {
 			t.Fatalf("real-data measured window %d made no durable progress: inbound_delta=%d completed_delta=%d", index+1, measuredWindowInbound[index], measuredWindowCompletedDeltas[index])
+		}
+		if mode == dockerRealDataModeThroughput && (!resume || resumeWorkExpected) && measuredWindowCompletedDeltas[index] <= 0 {
+			t.Fatalf("real-data throughput window %d had no durable completion before the measurement sample: measured_completed_delta=%d overall_completion_delta=%d inbound_delta=%d", index+1, measuredWindowCompletedDeltas[index], completedDelta, measuredWindowInbound[index])
 		}
 	}
 	if resume {
@@ -3992,8 +6208,13 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 			minimumCompleted = 0
 		}
 	}
-	if mode == dockerRealDataModeThroughput && completedDelta < minimumCompleted {
-		t.Fatalf("real-data process %s completed only %d synthetic turns; want at least %d new completions to make the measured rate meaningful (corpus=%d duration=%s windows=%d)", map[bool]string{true: "resume", false: "initial"}[resume], completedDelta, minimumCompleted, replayCount, duration, measuredWindows)
+	drainCompleted := completedDelta - measuredCompleted
+	if drainCompleted < 0 {
+		drainCompleted = 0
+	}
+	t.Logf("real-data completion accounting: measured=%d overall=%d post-window-drain=%d gate=%d", measuredCompleted, completedDelta, drainCompleted, completionForGate)
+	if mode == dockerRealDataModeThroughput && completionForGate < minimumCompleted {
+		t.Fatalf("real-data process %s completed only %d synthetic turns inside the measured window (overall including drain=%d); want at least %d new completions to make the measured rate meaningful (corpus=%d duration=%s windows=%d)", map[bool]string{true: "resume", false: "initial"}[resume], completionForGate, completedDelta, minimumCompleted, replayCount, duration, measuredWindows)
 	}
 	if afterCounts.inbound > int64(replayCount) {
 		t.Fatalf("synthetic inbound count=%d exceeded replay corpus=%d", afterCounts.inbound, replayCount)
@@ -4010,9 +6231,45 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 			}
 		}
 	}
+	correlationAudit, err := dockerRealDataDurableCorrelationAudit(postCtx, filepath.Join(filepath.Dir(statePath), teamstore.SQLiteFileName), mode == dockerRealDataModeComplete)
+	if err != nil {
+		t.Fatalf("read synthetic inbound/turn correlation: %v", err)
+	}
+	if correlationAudit.DuplicateTurn != 0 || (resume && beforeCorrelationAudit.DuplicateTurn != 0) {
+		t.Fatalf("synthetic durable inbound/turn correlation contains duplicate admission: before=%+v after=%+v", beforeCorrelationAudit, correlationAudit)
+	}
+	// A graceful stop can land after the inbound row is durable but before the
+	// separate QueueTurn transaction commits. That is recoverable only when this
+	// Docker harness is explicitly going to start the same disposable runtime a
+	// second time. On a resumed bounded window, the invariant is that every
+	// orphan present at the previous process boundary disappears; new rows
+	// created after the current measurement sample are the next process's work.
+	// The first restart-mode process may stop after the inbound write and before
+	// its separate QueueTurn transaction commits; the resume process is the
+	// required repair boundary for that case. Once resume has run, accepting a
+	// newly-created orphan would make a two-process experiment appear healthy
+	// while still proving nothing about the final lifecycle edge.
+	allowGracefulAdmissionBoundary := mode == dockerRealDataModeThroughput && os.Getenv(dockerRealDataProcessRestartEnv) == "1" && !resume
+	currentMissing := make(map[string]struct{}, len(correlationAudit.MissingMessageIDs))
+	for _, messageID := range correlationAudit.MissingMessageIDs {
+		currentMissing[messageID] = struct{}{}
+	}
+	unrepairedPreviousMissing := make([]string, 0)
+	for _, messageID := range beforeCorrelationAudit.MissingMessageIDs {
+		if _, found := currentMissing[messageID]; found {
+			unrepairedPreviousMissing = append(unrepairedPreviousMissing, messageID)
+		}
+	}
+	if resume && len(unrepairedPreviousMissing) != 0 {
+		t.Fatalf("resumed real-data process did not repair inbound rows orphaned by the previous process: ids=%v before=%+v after=%+v", unrepairedPreviousMissing, beforeCorrelationAudit, correlationAudit)
+	}
 	accounted := afterCounts.completed + afterCounts.failed + afterCounts.queued + afterCounts.running + afterCounts.interrupted
 	if accounted != afterCounts.inbound {
-		t.Fatalf("synthetic durable turn accounting is not closed: inbound=%d completed=%d failed=%d queued=%d running=%d interrupted=%d", afterCounts.inbound, afterCounts.completed, afterCounts.failed, afterCounts.queued, afterCounts.running, afterCounts.interrupted)
+		missingAccounting := afterCounts.inbound - accounted
+		if !allowGracefulAdmissionBoundary || missingAccounting != correlationAudit.MissingTurn {
+			t.Fatalf("synthetic durable turn accounting is not closed: inbound=%d completed=%d failed=%d queued=%d running=%d interrupted=%d correlation=%+v", afterCounts.inbound, afterCounts.completed, afterCounts.failed, afterCounts.queued, afterCounts.running, afterCounts.interrupted, correlationAudit)
+		}
+		t.Logf("real-data graceful boundary: %d inbound row(s) have not acquired a turn yet; previous-process orphans repaired=%d; a later process must repair only these newly-created rows", correlationAudit.MissingTurn, len(beforeCorrelationAudit.MissingMessageIDs)-len(unrepairedPreviousMissing))
 	}
 	if afterCounts.failed != 0 || afterCounts.running != 0 || afterCounts.interrupted != 0 {
 		interruptedDetails, detailErr := dockerRealDataInterruptedTurnDetails(postCtx, filepath.Join(filepath.Dir(statePath), teamstore.SQLiteFileName))
@@ -4022,25 +6279,17 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	if runs != completedDelta {
 		t.Fatalf("executor invocation count=%d does not equal this process's durable completion delta=%d (before=%d after=%d); possible owner/fence loss or duplicate admission", runs, completedDelta, beforeCounts.completed, afterCounts.completed)
 	}
-	unresolvedCorrelations, err := dockerRealDataDurableCorrelation(postCtx, filepath.Join(filepath.Dir(statePath), teamstore.SQLiteFileName), mode == dockerRealDataModeComplete)
-	if err != nil {
-		t.Fatalf("read synthetic inbound/turn correlation: %v", err)
-	}
-	if unresolvedCorrelations != 0 {
-		t.Fatalf("synthetic durable inbound/turn correlation has %d unresolved or duplicate message(s)", unresolvedCorrelations)
+	if correlationAudit.Unresolved != 0 {
+		if !allowGracefulAdmissionBoundary {
+			t.Fatalf("synthetic durable inbound/turn correlation has %d unresolved or duplicate message(s): %+v", correlationAudit.Unresolved, correlationAudit)
+		}
+		t.Logf("real-data correlation is intentionally open only at the current graceful admission boundary: %+v", correlationAudit)
 	}
 	for run, changes := range ownerChangesByRun {
 		if changes != 0 {
 			t.Fatalf("listener owner generation changed within isolated run %d: changes=%d all_generations=%v", run+1, changes, ownerGenerations)
 		}
 	}
-	if len(unknown) != 0 {
-		t.Fatalf("fake Graph observed unexpected routes in the production listener: %v", unknown)
-	}
-	if graphServerState.unsupportedFilters.Load() != 0 || graphServerState.invalidListQueries.Load() != 0 {
-		t.Fatalf("strict fake Graph observed invalid production list queries: unsupported_filters=%d invalid_queries=%d requests=%v", graphServerState.unsupportedFilters.Load(), graphServerState.invalidListQueries.Load(), graphServerState.listRequests())
-	}
-	requireGraphWork := !resume || resumeWorkExpected
 	observedPaginatedChats := 0
 	largeReplayChats := 0
 	unobservedLargeReplayChats := 0
@@ -4081,8 +6330,13 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 			t.Fatal("real-data account-scoped 429 experiment did not arm the shared Graph request budget")
 		}
 		want429 := int64(len(docker429RateLimitedChats) * dockerRealData429Failures)
-		if graphServerState.status429.Load() < want429 {
-			t.Fatalf("real-data %s-scoped 429 experiment did not exercise the finite high-intensity throttle: 429=%d want_at_least=%d chats=%v", rateLimitScope, graphServerState.status429.Load(), want429, docker429RateLimitedChats)
+		if rateLimitAccountWide {
+			// One provider 429 opens the durable account gate for the whole
+			// concurrent wave; sibling reads are deliberately suppressed.
+			want429 = int64(dockerRealData429Failures)
+		}
+		if graphServerState.status429.Load() != want429 {
+			t.Fatalf("real-data %s-scoped 429 experiment did not exercise exactly the finite high-intensity throttle: 429=%d want=%d chats=%v", rateLimitScope, graphServerState.status429.Load(), want429, docker429RateLimitedChats)
 		}
 		for _, chatID := range docker429RateLimitedChats {
 			if graphServerState.listPageCount(chatID) == 0 {
@@ -4102,43 +6356,6 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 				t.Logf("real-data 429 chat completed a successful Graph recovery and retained only a non-terminal diagnostic while its durable page drains: chat=%q", chatID)
 			}
 		}
-	} else if requireGraphWork && (graphServerState.status429.Load() == 0 || graphServerState.status503.Load() == 0) {
-		t.Fatalf("real-data replay did not exercise both retryable Graph failures: 429=%d 503=%d", graphServerState.status429.Load(), graphServerState.status503.Load())
-	} else if requireGraphWork && graphServerState.status503.Load() < int64(defaultGraphRetries+1) {
-		t.Fatalf("real-data replay did not exhaust the in-process 503 retry budget: 503=%d retry_budget=%d", graphServerState.status503.Load(), defaultGraphRetries)
-	}
-	if requireGraphWork && !rateLimitExperiment && expiredProviderTokens > 0 && graphServerState.expiredContinuationCount() == 0 {
-		t.Fatalf("real-data replay copied %d opaque provider continuations but never exercised an expired continuation response", expiredProviderTokens)
-	}
-	faultChatID := graphServerState.faultChatSnapshot()
-	if requireGraphWork && !rateLimitExperiment && (faultChatID == "" || graphServerState.listPageCount(faultChatID) == 0) {
-		t.Fatalf("retryable Graph fault never recovered to a successful page: fault_chat=%q successful_pages=%d", faultChatID, graphServerState.listPageCount(faultChatID))
-	}
-	if requireGraphWork && !rateLimitExperiment {
-		if faultPoll, found := afterState.ChatPolls[faultChatID]; !found {
-			t.Fatalf("retryable Graph fault chat has no durable poll state after recovery: chat=%q", faultChatID)
-		} else if strings.Contains(faultPoll.LastError, "429") || strings.Contains(faultPoll.LastError, "503") {
-			t.Fatalf("retryable Graph fault remained the terminal durable poll error after a later successful page: chat=%q poll=%#v", faultChatID, faultPoll)
-		}
-	}
-	ambiguousUnknownRows := dockerRealDataAmbiguousExecutionOutboxes(afterState)
-	if resume {
-		if graphServerState.unknownPosts.Load() != 0 || graphServerState.unknownPostRepeats.Load() != 0 {
-			t.Fatalf("resumed process replayed an unknown Graph POST result: unknown=%d repeats=%d", graphServerState.unknownPosts.Load(), graphServerState.unknownPostRepeats.Load())
-		}
-		if len(ambiguousUnknownRows) != 1 {
-			t.Fatalf("resumed process did not preserve exactly one durable ambiguous outbox without retrying it: rows=%#v", ambiguousUnknownRows)
-		}
-	} else if unknownFaultEnabled {
-		if graphServerState.unknownPosts.Load() != 1 || graphServerState.unknownPostRepeats.Load() != 0 || graphServerState.unknownPostAcceptedAttempts() != 1 {
-			t.Fatalf("unknown Graph POST result was not handled as one remotely accepted, non-replayed attempt: unknown=%d repeats=%d remote_accepts=%d", graphServerState.unknownPosts.Load(), graphServerState.unknownPostRepeats.Load(), graphServerState.unknownPostAcceptedAttempts())
-		}
-		unknownPostChat := graphServerState.unknownPostChatSnapshot()
-		if unknownPostChat == "" || len(ambiguousUnknownRows) != 1 || strings.TrimSpace(ambiguousUnknownRows[0].TeamsChatID) != unknownPostChat {
-			t.Fatalf("unknown Graph POST was not represented by one durable ambiguous outbox row: chat=%q rows=%#v", unknownPostChat, ambiguousUnknownRows)
-		}
-	} else if graphServerState.unknownPosts.Load() != 0 || len(ambiguousUnknownRows) != 0 {
-		t.Fatalf("complete real-data mode unexpectedly left an ambiguous Graph POST: unknown=%d rows=%#v", graphServerState.unknownPosts.Load(), ambiguousUnknownRows)
 	}
 	replayBacklogObserved := false
 	if !rateLimitExperiment {
@@ -4147,10 +6364,15 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 			t.Fatalf("real-data replay never observed its synthetic Teams backlog while optional maintenance was running; backlog_samples=%d ordinary_history=%d ordinary_linked=%d", backlogSamples, ordinaryHistoryWhileBacklog, ordinaryLinkedWhileBacklog)
 		}
 		// Fairness is intentionally allowed during a long-lived backlog, but it
-		// must be measured by durable history progress. A callback can return
-		// without advancing its checkpoint, so callback counts alone must not make
-		// this experiment pass.
-		if afterHistoryOffsets <= beforeHistoryOffsets {
+		// must be measured by durable state, not callback counts. A safe history
+		// quantum may encounter an incomplete JSONL tail or an already-EOF file:
+		// in those cases the physical offset must not move speculatively, while a
+		// bounded partial-read/recovery checkpoint or the restart-safe fairness
+		// cursor can still advance. Require one of those durable facts.
+		ordinaryHistoryChanged, ordinaryHistoryAdded, ordinaryHistoryDetails := dockerRealDataOrdinaryHistoryDurableProgress(beforeState, afterHistoryState, historyMandatory)
+		fairCursorChanges := dockerRealDataBacklogFairCursorChanges(beforeState.ServiceControl, afterState.ServiceControl)
+		t.Logf("real-data backlog fairness durability: ordinary_history_changed=%d ordinary_history_added=%d checkpoint_details=%v fair_cursor_changes=%v offset_delta=%d", ordinaryHistoryChanged, ordinaryHistoryAdded, ordinaryHistoryDetails, fairCursorChanges, afterHistoryOffsets-beforeHistoryOffsets)
+		if ordinaryHistoryChanged == 0 && ordinaryHistoryAdded == 0 && len(fairCursorChanges) == 0 {
 			t.Fatalf("optional history maintenance made no durable progress while Teams backlog remained: history_callbacks=%d linked_callbacks=%d offsets_before=%d offsets_after=%d", ordinaryHistoryWhileBacklog, ordinaryLinkedWhileBacklog, beforeHistoryOffsets, afterHistoryOffsets)
 		}
 		if len(linkedUnindexed) == 0 {
@@ -4168,8 +6390,10 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 				t.Fatalf("backlog fairness did not reach every unindexed active linked session: missing=%v candidates=%d ordinary_unindexed_linked=%d observed=%v", missingUnindexed, len(linkedUnindexed), ordinaryUnindexedLinked, ordinaryUnindexedLinkedIDs)
 			}
 		}
+	} else if rateLimitPollOnly {
+		t.Logf("real-data 429 experiment used the explicitly requested targeted poll-only mode; optional maintenance fairness assertions are not applicable")
 	} else {
-		t.Logf("real-data 429 experiment used targeted poll-only mode; optional maintenance fairness assertions are not applicable")
+		t.Logf("real-data 429 experiment used the full Bridge.Listen main loop; optional maintenance fairness was measured with the ordinary listener policy")
 	}
 	latestGracefulStop := time.Time{}
 	for _, stoppedAt := range gracefulStopAt {
@@ -4215,12 +6439,24 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	}
 	if replayBacklogObserved {
 		// A real replay run is intentionally long enough to leave a durable Teams
-		// backlog. Optional history work must not consume the same phase budget in
-		// that state; a short no-op phase is acceptable, but a full scan/deadline
-		// is not.
+		// backlog. When no mandatory recovery candidate exists, the optional
+		// fairness quantum is one cold job and must remain a short no-op-sized
+		// phase. If mandatory recovery is present, its bounded work is deliberately
+		// included in the same phase and may account for the extra time; the phase
+		// error/deadline checks above still enforce that it cannot consume the owner
+		// budget or become an unbounded scan.
 		const optionalMaintenanceBudget = time.Second
-		if historyWatchStats.LastDuration > optionalMaintenanceBudget || linkedTranscriptStats.LastDuration > optionalMaintenanceBudget {
-			t.Fatalf("optional maintenance remained expensive while the synthetic Teams backlog was observed: queued_after=%d history=%#v linked=%#v", afterCounts.queued, historyWatchStats, linkedTranscriptStats)
+		if len(historyMandatory) == 0 && historyWatchStats.LastDuration > optionalMaintenanceBudget {
+			t.Fatalf("optional history maintenance remained expensive while the synthetic Teams backlog was observed: queued_after=%d history=%#v", afterCounts.queued, historyWatchStats)
+		}
+		if len(linkedMandatory) == 0 && linkedTranscriptStats.LastDuration > optionalMaintenanceBudget {
+			t.Fatalf("optional linked maintenance remained expensive while the synthetic Teams backlog was observed: queued_after=%d linked=%#v", afterCounts.queued, linkedTranscriptStats)
+		}
+		if len(historyMandatory) > 0 && historyWatchStats.LastDuration > optionalMaintenanceBudget {
+			t.Logf("history-watch backlog phase includes mandatory recovery; retaining measured duration: %s", historyWatchStats.LastDuration)
+		}
+		if len(linkedMandatory) > 0 && linkedTranscriptStats.LastDuration > optionalMaintenanceBudget {
+			t.Logf("linked-transcript backlog phase includes mandatory recovery; retaining measured duration: %s", linkedTranscriptStats.LastDuration)
 		}
 		if afterHistoryOffsets < beforeHistoryOffsets {
 			t.Fatalf("history cursor regressed while the synthetic Teams backlog was observed: before=%d after=%d queued_after=%d", beforeHistoryOffsets, afterHistoryOffsets, afterCounts.queued)

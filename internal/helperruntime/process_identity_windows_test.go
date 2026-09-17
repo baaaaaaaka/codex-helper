@@ -68,11 +68,18 @@ func TestRuntimeProcessIdentityWindows(t *testing.T) {
 		_ = cmd.Wait()
 	})
 	childPID := waitForWindowsReady(t, ready, &stderr)
-	for _, pid := range []int{cmd.Process.Pid, childPID} {
-		exe := windowsProcessImage(t, pid)
-		command, err := proc.CommandLine(pid)
+	processes := []struct {
+		role string
+		pid  int
+	}{
+		{role: "launcher", pid: cmd.Process.Pid},
+		{role: "helper", pid: childPID},
+	}
+	for _, process := range processes {
+		exe := windowsProcessImage(t, process.pid)
+		command, err := proc.CommandLine(process.pid)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("query process command line: role=%s pid=%d launcherPID=%d helperPID=%d executable=%q entry=%q stderr=%q: %v", process.role, process.pid, cmd.Process.Pid, childPID, exe, entry, stderr.String(), err)
 		}
 		if strings.Contains(strings.ToLower(exe+"\n"+command), "codex") {
 			t.Fatalf("runtime process metadata contains forbidden keyword: exe=%q command=%q", exe, command)

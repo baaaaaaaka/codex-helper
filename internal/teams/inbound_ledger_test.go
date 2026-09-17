@@ -41,12 +41,93 @@ func TestGlobalInboundLedgerPathForRegistry(t *testing.T) {
 	}
 }
 
+func TestPrepareGlobalInboundLedgerQuarantinesLegacyProjectionBeforePollClaims(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "teams", "global-inbound-ledger.json")
+	sqlitePath := teamsLedgerSQLitePath(path)
+	if err := os.MkdirAll(filepath.Dir(sqlitePath), 0o700); err != nil {
+		t.Fatalf("mkdir inbound sidecar directory: %v", err)
+	}
+	db, err := openTeamsLedgerSQLite(sqlitePath)
+	if err != nil {
+		t.Fatalf("open inbound sidecar: %v", err)
+	}
+	if err := ensureGlobalInboundSQLite(ctx, db); err != nil {
+		db.Close()
+		t.Fatalf("ensure inbound sidecar schema: %v", err)
+	}
+	now := time.Now().UTC()
+	validKey := globalInboundKey("chat-prepared", "message-valid")
+	valid := globalInboundItem{
+		ChatID: "chat-prepared", MessageID: "message-valid", Owner: "owner-old",
+		Status: "done", ClaimedAt: now, UpdatedAt: now,
+	}
+	validRaw, err := json.Marshal(valid)
+	if err != nil {
+		db.Close()
+		t.Fatalf("marshal valid inbound projection: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO inbound_ledger(key, chat_id, message_id, owner, status, claimed_at, updated_at, json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		validKey, valid.ChatID, valid.MessageID, valid.Owner, valid.Status,
+		globalInboundSQLiteTime(valid.ClaimedAt), globalInboundSQLiteTime(valid.UpdatedAt), validRaw); err != nil {
+		db.Close()
+		t.Fatalf("seed valid inbound projection: %v", err)
+	}
+	invalidKey := globalInboundKey("chat-prepared", "message-invalid")
+	if _, err := db.ExecContext(ctx, `INSERT INTO inbound_ledger(key, chat_id, message_id, owner, status, claimed_at, updated_at, json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+		invalidKey, "chat-prepared", "message-invalid", "owner-old", "done",
+		globalInboundSQLiteTime(now), globalInboundSQLiteTime(now), []byte(`{"chat_id":"chat-prepared","message_id":"message-invalid"}`)); err != nil {
+		db.Close()
+		t.Fatalf("seed invalid inbound projection: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close seeded inbound sidecar: %v", err)
+	}
+
+	if err := prepareGlobalInboundLedger(ctx, path); err != nil {
+		t.Fatalf("prepare global inbound ledger: %v", err)
+	}
+	db, err = openTeamsLedgerSQLite(sqlitePath)
+	if err != nil {
+		t.Fatalf("reopen prepared inbound sidecar: %v", err)
+	}
+	defer db.Close()
+	var marker string
+	if err := db.QueryRowContext(ctx, `SELECT value FROM inbound_meta WHERE key = 'projection_quarantine_v1'`).Scan(&marker); err != nil {
+		t.Fatalf("read projection quarantine marker: %v", err)
+	}
+	if marker != "1" {
+		t.Fatalf("projection quarantine marker = %q, want 1", marker)
+	}
+	var activeInvalid int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM inbound_ledger WHERE key = ?`, invalidKey).Scan(&activeInvalid); err != nil {
+		t.Fatalf("count quarantined active row: %v", err)
+	}
+	if activeInvalid != 0 {
+		t.Fatalf("invalid inbound projection remained active after preparation: %d", activeInvalid)
+	}
+	var quarantinedInvalid int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM inbound_ledger_quarantine WHERE source_key = ?`, invalidKey).Scan(&quarantinedInvalid); err != nil {
+		t.Fatalf("count quarantined row: %v", err)
+	}
+	if quarantinedInvalid != 1 {
+		t.Fatalf("quarantined invalid inbound rows = %d, want 1", quarantinedInvalid)
+	}
+	var activeValid int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM inbound_ledger WHERE key = ?`, validKey).Scan(&activeValid); err != nil {
+		t.Fatalf("count preserved valid row: %v", err)
+	}
+	if activeValid != 1 {
+		t.Fatalf("valid inbound projection was removed during preparation: %d", activeValid)
+	}
+}
+
 func TestGlobalInboundSQLiteWriterReopensReplacedDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "ledger.json")
 	sqlitePath := teamsLedgerSQLitePath(path)
 	writer := &globalInboundSQLiteWriter{}
 	t.Cleanup(func() { _ = writer.close() })
-	first, err := writer.open(sqlitePath)
+	first, err := writer.open(sqlitePath, path)
 	if err != nil {
 		t.Fatalf("open writer database: %v", err)
 	}
@@ -80,7 +161,7 @@ func TestGlobalInboundSQLiteWriterReopensReplacedDatabase(t *testing.T) {
 	if err := replacement.Close(); err != nil {
 		t.Fatalf("close replacement writer database: %v", err)
 	}
-	second, err := writer.open(sqlitePath)
+	second, err := writer.open(sqlitePath, path)
 	if err != nil {
 		t.Fatalf("reopen replaced writer database: %v", err)
 	}
@@ -1023,23 +1104,29 @@ func seedGlobalInboundSQLiteForPrune(t *testing.T, path string, itemFor func(int
 	if err != nil {
 		t.Fatalf("open inbound prune ledger: %v", err)
 	}
-	defer db.Close()
 	if err := ensureGlobalInboundSQLite(ctx, db); err != nil {
+		_ = db.Close()
 		t.Fatalf("ensure inbound prune ledger: %v", err)
 	}
 	tx, err := db.BeginTx(ctx, nil)
 	if err != nil {
+		_ = db.Close()
 		t.Fatalf("begin inbound prune seed: %v", err)
 	}
 	for i := 0; i < maxGlobalInboundLedgerIDs+1; i++ {
 		item := itemFor(i)
 		if err := upsertGlobalInboundSQLiteTx(ctx, tx, globalInboundKey(item.ChatID, item.MessageID), item); err != nil {
 			tx.Rollback()
+			_ = db.Close()
 			t.Fatalf("seed inbound prune row %d: %v", i, err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
+		_ = db.Close()
 		t.Fatalf("commit inbound prune seed: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close inbound prune seed: %v", err)
 	}
 }
 
@@ -1156,6 +1243,88 @@ func TestGlobalInboundSQLiteWriterSerializesConcurrentClaimLifecycle(t *testing.
 		if item.Status != "done" {
 			t.Fatalf("concurrent inbound item %s = %#v, want done", key, item)
 		}
+	}
+}
+
+func TestGlobalInboundSQLiteWriterDefersPruneUntilClose(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "teams", "global-inbound-ledger.json")
+	now := time.Now().UTC()
+	old := now.Add(-globalInboundClaimTTL - time.Second)
+	seedGlobalInboundSQLiteForPrune(t, path, func(i int) globalInboundItem {
+		return globalInboundItem{
+			ChatID:    "chat-deferred-prune",
+			MessageID: fmt.Sprintf("message-%04d", i),
+			Owner:     "owner-old",
+			Status:    "done",
+			ClaimedAt: old,
+			UpdatedAt: old,
+		}
+	})
+
+	writer := &globalInboundSQLiteWriter{}
+	claim, claimed, err := claimGlobalInboundWithWriter(ctx, path, "chat-deferred-prune", "message-new", "owner-new", now, writer)
+	if err != nil || !claimed {
+		_ = writer.close()
+		t.Fatalf("claim with shared writer = %#v claimed=%v err=%v", claim, claimed, err)
+	}
+	writer.stateMu.Lock()
+	db := writer.db
+	pending := writer.prunePending
+	writer.stateMu.Unlock()
+	if !pending {
+		_ = writer.close()
+		t.Fatal("shared writer did not record deferred prune")
+	}
+	var beforeClose int
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM inbound_ledger`).Scan(&beforeClose); err != nil {
+		_ = writer.close()
+		t.Fatalf("count ledger before shared writer close: %v", err)
+	}
+	if beforeClose <= maxGlobalInboundLedgerIDs {
+		_ = writer.close()
+		t.Fatalf("shared writer pruned during claim transaction: count=%d want more than %d", beforeClose, maxGlobalInboundLedgerIDs)
+	}
+	if err := writer.close(); err != nil {
+		t.Fatalf("close shared writer after deferred prune: %v", err)
+	}
+
+	var afterClose int
+	// Close-time pruning is deliberately best effort: a hosted runner can make
+	// the 250ms retention-only window expire even after the durable claim has
+	// committed. Do not repeat the expensive 2000-row scan under that same short
+	// budget; verify eventual maintenance convergence once with a controlled
+	// lifecycle budget instead. This keeps a slow filesystem from looking like
+	// a data-loss failure while still exercising the file-locking path.
+	db, err = openTeamsLedgerSQLite(teamsLedgerSQLitePath(path))
+	if err != nil {
+		t.Fatalf("reopen deferred-prune ledger: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM inbound_ledger`).Scan(&afterClose); err != nil {
+		_ = db.Close()
+		t.Fatalf("count ledger after shared writer close: %v", err)
+	}
+	if afterClose > maxGlobalInboundLedgerIDs {
+		if err := pruneGlobalInboundSQLiteWithFileLockBudget(ctx, path, db, time.Now(), 5*time.Second); err != nil {
+			_ = db.Close()
+			t.Fatalf("eventual deferred-prune maintenance: %v", err)
+		}
+		if err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM inbound_ledger`).Scan(&afterClose); err != nil {
+			_ = db.Close()
+			t.Fatalf("count ledger after eventual deferred-prune maintenance: %v", err)
+		}
+	}
+	if afterClose > maxGlobalInboundLedgerIDs {
+		_ = db.Close()
+		t.Fatalf("deferred prune did not converge: count=%d want <=%d", afterClose, maxGlobalInboundLedgerIDs)
+	}
+	defer db.Close()
+	var status string
+	if err := db.QueryRowContext(ctx, `SELECT status FROM inbound_ledger WHERE key = ?`, claim.Key).Scan(&status); err != nil {
+		t.Fatalf("read newly claimed row after deferred prune: %v", err)
+	}
+	if status != "claimed" {
+		t.Fatalf("newly claimed row status after deferred prune = %q, want claimed", status)
 	}
 }
 

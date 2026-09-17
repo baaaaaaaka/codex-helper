@@ -72,6 +72,75 @@ func TestValidateTestJSONOutputAcceptsBooleanBackendSubtests(t *testing.T) {
 	}
 }
 
+func TestValidateTestJSONOutputAcceptsNestedBackendSubtests(t *testing.T) {
+	data := []byte(`{"Action":"run","Package":"example.test","Test":"TestRecovery"}
+{"Action":"run","Package":"example.test","Test":"TestRecovery/json/account"}
+{"Action":"pass","Package":"example.test","Test":"TestRecovery/json/account"}
+{"Action":"run","Package":"example.test","Test":"TestRecovery/json/global"}
+{"Action":"pass","Package":"example.test","Test":"TestRecovery/json/global"}
+{"Action":"run","Package":"example.test","Test":"TestRecovery/sqlite/account"}
+{"Action":"pass","Package":"example.test","Test":"TestRecovery/sqlite/account"}
+{"Action":"run","Package":"example.test","Test":"TestRecovery/sqlite/global"}
+{"Action":"pass","Package":"example.test","Test":"TestRecovery/sqlite/global"}
+{"Action":"pass","Package":"example.test","Test":"TestRecovery"}
+`)
+	if err := validateTestJSONOutput(data, "TestRecovery", []string{"json", "sqlite"}); err != nil {
+		t.Fatalf("validateTestJSONOutput() rejected nested backend subtests: %v", err)
+	}
+}
+
+func TestValidateTestJSONOutputStrictlyRequiresSingletonBackendSubtest(t *testing.T) {
+	data := []byte(`{"Action":"run","Package":"example.test","Test":"TestRecovery"}
+{"Action":"pass","Package":"example.test","Test":"TestRecovery"}
+`)
+	if err := validateTestJSONOutputRequiringBackendSubtests(data, "TestRecovery", []string{"json"}); err == nil {
+		t.Fatal("strict validator accepted a singleton backend without a backend subtest")
+	}
+}
+
+func TestValidateTestJSONOutputStrictlyAcceptsSingletonBackendSubtest(t *testing.T) {
+	data := []byte(`{"Action":"run","Package":"example.test","Test":"TestRecovery"}
+{"Action":"run","Package":"example.test","Test":"TestRecovery/json"}
+{"Action":"pass","Package":"example.test","Test":"TestRecovery/json"}
+{"Action":"pass","Package":"example.test","Test":"TestRecovery"}
+`)
+	if err := validateTestJSONOutputRequiringBackendSubtests(data, "TestRecovery", []string{"json"}); err != nil {
+		t.Fatalf("strict validator rejected singleton backend evidence: %v", err)
+	}
+}
+
+func TestValidateManifestBackendSubtestsMustBeDeclaredAndUnique(t *testing.T) {
+	base := manifestTest{Name: "TestRecovery", Backends: []string{"json", "sqlite"}}
+	if err := validateManifestBackendSubtests(manifestTest{
+		Name:            base.Name,
+		Backends:        base.Backends,
+		BackendSubtests: []string{"json", "json"},
+	}); err == nil {
+		t.Fatal("manifest accepted duplicate backend_subtests")
+	}
+	if err := validateManifestBackendSubtests(manifestTest{
+		Name:            base.Name,
+		Backends:        base.Backends,
+		BackendSubtests: []string{"runtime"},
+	}); err == nil {
+		t.Fatal("manifest accepted undeclared backend_subtests")
+	}
+	if err := validateManifestBackendSubtests(manifestTest{
+		Name:            base.Name,
+		Backends:        base.Backends,
+		BackendSubtests: []string{"json", "sqlite"},
+	}); err != nil {
+		t.Fatalf("manifest rejected declared backend_subtests: %v", err)
+	}
+	if err := validateManifestBackendSubtests(manifestTest{
+		Name:            base.Name,
+		Backends:        base.Backends,
+		BackendSubtests: []string{"json"},
+	}); err == nil {
+		t.Fatal("manifest accepted backend_subtests that omitted a declared backend")
+	}
+}
+
 func TestRunManifestTestsForcesOwnershipStressStrictMode(t *testing.T) {
 	previous, wasSet := os.LookupEnv(teamsOwnershipStressStrictEnv)
 	t.Cleanup(func() {

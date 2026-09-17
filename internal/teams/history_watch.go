@@ -71,8 +71,19 @@ func (b *Bridge) runHistoryWatchSyncJobs(ctx context.Context, paths []string, no
 				if b.historyWatchPathHook != nil {
 					err = b.historyWatchPathHook(jobCtx, path)
 				}
+				jobStarted := time.Now()
 				if err == nil {
 					err = b.syncCodexHistoryWatchPath(jobCtx, path, now)
+				}
+				if b.historyWatchJobTraceHook != nil {
+					b.historyWatchJobTraceHook(path, time.Since(jobStarted), err)
+				}
+				// A path-local child budget is a retry point, not a history phase
+				// failure. The next watcher cycle keeps the dirty path selected. Do
+				// not classify a canceled parent or a process-wide lease/store error
+				// this way: those remain visible and stop further durable work.
+				if err != nil && teamsBoundedJobBudgetDeferral(err, jobCtx, workCtx) {
+					err = &historyWatchJobDeferredError{Path: path, Err: err}
 				}
 				jobCancel()
 				results <- result{index: index, err: err}
@@ -382,7 +393,14 @@ func (b *Bridge) syncCodexHistoryFinalsForBacklogWithDiscovery(ctx context.Conte
 	if err != nil {
 		return err
 	}
-	recoveryPaths := b.historyWatchPendingDirtyPaths()
+	// The event stream is shared with the normal watcher and can contain an
+	// ordinary appended tail, a newly discovered file, or an explicit recovery
+	// fence. Backlog mode must not mistake the first two for mandatory work:
+	// scanning an ordinary dirty path here reintroduces the very history phase
+	// starvation that this lane is meant to prevent. Only dirty paths whose
+	// durable checkpoint already proves a recovery condition are eligible; an
+	// unindexed path waits for the bounded fairness discovery lane.
+	recoveryPaths := historyWatchMandatoryRecoveryPaths(state, b.historyWatchPendingDirtyPaths())
 	for _, checkpoint := range state.HistoryWatch {
 		if historyWatchCheckpointNeedsMandatoryMaintenance(checkpoint) {
 			recoveryPaths = append(recoveryPaths, checkpoint.Path)
@@ -392,7 +410,14 @@ func (b *Bridge) syncCodexHistoryFinalsForBacklogWithDiscovery(ctx context.Conte
 	recoveryLimit := maxBacklogHistoryRecoveryJobs
 	var firstErr error
 	var optional []string
-	if allowDiscovery && !state.HistoryWatchReady.IsZero() {
+	if allowDiscovery {
+		// A zero ready timestamp means the normal full-history baseline has not
+		// completed yet. During a durable Teams backlog we still need one bounded
+		// recent-file discovery slot: otherwise a fresh local conversation can be
+		// hidden forever while every cycle correctly skips ordinary history work.
+		// This is discovery only, not baseline adoption; each selected unknown path
+		// still goes through the normal source-proof, session-identity, and durable
+		// outbox/CAS path below.
 		root, rootErr := codexhistory.ResolveCodexDir(b.scope.CodexHome)
 		if rootErr != nil {
 			firstErr = fmt.Errorf("resolve Codex history directory for backlog fairness: %w", rootErr)
@@ -417,11 +442,10 @@ func (b *Bridge) syncCodexHistoryFinalsForBacklogWithDiscovery(ctx context.Conte
 		}
 	}
 	if len(optional) > 0 {
-		usedRecovery := len(recoveryPaths)
-		if usedRecovery > recoveryLimit {
-			usedRecovery = recoveryLimit
-		}
-		slots := maxBacklogHistoryRecoveryJobs - usedRecovery
+		slots := maxBacklogOptionalMaintenanceJobs
+		// The optional lane has one fixed slot even when the mandatory lane is
+		// empty. It is a fairness escape hatch, not permission to run a second
+		// cold worker batch alongside the live Teams backlog.
 		if slots > 0 && len(optional) > slots {
 			if err := b.restoreBacklogFairCursor(ctx, teamstore.BacklogFairLaneHistoryDiscovery, optional); err != nil {
 				return errors.Join(firstErr, err)
@@ -430,7 +454,7 @@ func (b *Bridge) syncCodexHistoryFinalsForBacklogWithDiscovery(ctx context.Conte
 	}
 	paths := b.selectBacklogHistoryRecoveryPathsWithLimit(recoveryPaths, recoveryLimit)
 	if allowDiscovery && len(optional) > 0 {
-		slots := maxBacklogHistoryRecoveryJobs - len(paths)
+		slots := maxBacklogOptionalMaintenanceJobs
 		if slots > 0 {
 			paths = append(paths, b.selectBacklogHistoryDiscoveryPaths(optional, slots)...)
 		}
@@ -480,6 +504,29 @@ func (b *Bridge) syncCodexHistoryFinalsForBacklogWithDiscovery(ctx context.Conte
 		return scanErr
 	}
 	return syncErr
+}
+
+func historyWatchMandatoryRecoveryPaths(state teamstore.State, dirtyPaths []string) []string {
+	mandatory := make(map[string]struct{})
+	for _, checkpoint := range state.HistoryWatch {
+		if !historyWatchCheckpointNeedsMandatoryMaintenance(checkpoint) {
+			continue
+		}
+		if path := cleanComparablePath(checkpoint.Path); path != "" {
+			mandatory[path] = struct{}{}
+		}
+	}
+	paths := make([]string, 0, len(dirtyPaths))
+	for _, path := range dirtyPaths {
+		path = cleanComparablePath(path)
+		if path == "" {
+			continue
+		}
+		if _, ok := mandatory[path]; ok {
+			paths = append(paths, path)
+		}
+	}
+	return uniqueSortedCleanPaths(paths)
 }
 
 func (b *Bridge) syncCodexHistoryFinalsIfDue(ctx context.Context, now time.Time) error {
@@ -1922,7 +1969,9 @@ func (b *Bridge) publishHistoryWatchFinal(ctx context.Context, path string, fina
 			return false, err
 		}
 		if opts.ForceDetectedNotification && !b.sessionHasTeamsManagedTurns(ctx, existing.ID) {
-			b.queueWorkflowNotificationForDetectedCodexAnswer(ctx, existing, final.Key)
+			if err := b.queueWorkflowNotificationForDetectedCodexAnswerWithError(ctx, existing, final.Key); err != nil {
+				return false, err
+			}
 			return true, nil
 		}
 		if !b.sessionHasTeamsManagedTurns(ctx, existing.ID) {
@@ -1940,7 +1989,9 @@ func (b *Bridge) publishHistoryWatchFinal(ctx context.Context, path string, fina
 		return false, err
 	}
 	if session := b.reg.SessionByCodexThreadID(local.SessionID); session != nil {
-		b.queueWorkflowNotificationForDetectedCodexAnswer(ctx, session, final.Key)
+		if err := b.queueWorkflowNotificationForDetectedCodexAnswerWithError(ctx, session, final.Key); err != nil {
+			return false, err
+		}
 	}
 	return true, nil
 }

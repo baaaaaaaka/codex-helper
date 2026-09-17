@@ -1,6 +1,7 @@
 package teams
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"testing"
@@ -244,6 +245,40 @@ func TestInboundPollDecisionCatchupAndBlocked(t *testing.T) {
 	if !forceCatchup.Due || forceCatchup.State != inboundPollStateCatchup || forceCatchup.Interval != inboundPollCatchupInterval || !forceCatchup.NextPollAt.Equal(now) {
 		t.Fatalf("force catchup decision = %#v, want due catchup", forceCatchup)
 	}
+	blockedForceCatchup := decideInboundPoll(inboundPollInput{
+		ChatID:       "chat-429",
+		Role:         inboundPollRoleWork,
+		HasPoll:      true,
+		ForceCatchup: true,
+		Poll: teamstore.ChatPollState{
+			ChatID:       "chat-429",
+			Seeded:       true,
+			PollState:    inboundPollStateBlocked,
+			BlockedUntil: now.Add(time.Minute),
+			NextPollAt:   now,
+		},
+		Now: now,
+	})
+	if blockedForceCatchup.Due || blockedForceCatchup.State != inboundPollStateBlocked || !blockedForceCatchup.NextPollAt.Equal(now.Add(time.Minute)) {
+		t.Fatalf("force catchup bypassed durable retry gate: %#v", blockedForceCatchup)
+	}
+	legacy429ForceCatchup := decideInboundPoll(inboundPollInput{
+		ChatID:       "chat-legacy-429",
+		Role:         inboundPollRoleWork,
+		HasPoll:      true,
+		ForceCatchup: true,
+		Poll: teamstore.ChatPollState{
+			ChatID:       "chat-legacy-429",
+			Seeded:       true,
+			FailureCount: 1,
+			LastError:    "Graph request failed: HTTP 429",
+			NextPollAt:   now.Add(2 * time.Minute),
+		},
+		Now: now,
+	})
+	if legacy429ForceCatchup.Due || legacy429ForceCatchup.State != inboundPollStateBlocked || !legacy429ForceCatchup.NextPollAt.Equal(now.Add(2*time.Minute)) {
+		t.Fatalf("force catchup bypassed legacy NextPollAt-only 429 gate: %#v", legacy429ForceCatchup)
+	}
 	unseededCatchup := decideInboundPoll(inboundPollInput{
 		ChatID:  "chat-1",
 		Role:    inboundPollRoleWork,
@@ -401,6 +436,170 @@ func TestInboundPollPendingPageBypassesGraph429Deadline(t *testing.T) {
 	}
 }
 
+func TestInboundPollPendingExceptionalRecordRespectsGraph429Deadline(t *testing.T) {
+	now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+	blockedUntil := now.Add(10 * time.Minute)
+	decision := decideInboundPoll(inboundPollInput{
+		ChatID:  "chat-pending-refetch-429",
+		Role:    inboundPollRoleWork,
+		HasPoll: true,
+		Poll: teamstore.ChatPollState{
+			ChatID:         "chat-pending-refetch-429",
+			Seeded:         true,
+			PollState:      inboundPollStateBlocked,
+			LastActivityAt: now.Add(-time.Minute),
+			NextPollAt:     blockedUntil,
+			BlockedUntil:   blockedUntil,
+			FailureCount:   4,
+			LastError:      "Graph message refetch failed: HTTP 429 Too Many Requests",
+			PendingPage: &teamstore.ChatPollPendingPage{
+				ChatID:          "chat-pending-refetch-429",
+				RequestPath:     "/chats/chat-pending-refetch-429/messages?$top=20",
+				ReceiptID:       "receipt-pending-refetch-429",
+				Frontier:        "head",
+				PollRole:        "work",
+				Dispositions:    []string{"invalid_record"},
+				RefetchFailures: []int{1},
+			},
+		},
+		Now: now,
+	})
+	if decision.Due || !decision.NextPollAt.Equal(blockedUntil) || !decision.BlockedUntil.Equal(blockedUntil) || decision.State == inboundPollStateBlocked {
+		t.Fatalf("Graph-dependent pending page must respect 429 deadline: %#v", decision)
+	}
+}
+
+func TestPendingPageRequiresGraphReplayTreatsLegacyRefetchFailuresAsGraphBound(t *testing.T) {
+	page := &teamstore.ChatPollPendingPage{
+		Records:         []json.RawMessage{{}},
+		RefetchFailures: []int{1},
+		// Older writers did not persist Dispositions. A positive refetch count
+		// is nevertheless proof that the record still needs Graph, not a local
+		// receipt replay that may bypass its retry gate.
+	}
+	if !pendingPageRequiresGraphReplay(page) {
+		t.Fatal("legacy pending page with a refetch failure was treated as local replay")
+	}
+	page.RefetchFailures = nil
+	if pendingPageRequiresGraphReplay(page) {
+		t.Fatal("legacy pending page without refetch failures was unexpectedly Graph-bound")
+	}
+}
+
+func TestPendingPageRequiresGraphReplayFailsClosedOnDispositionLengthMismatch(t *testing.T) {
+	page := &teamstore.ChatPollPendingPage{
+		Records:      []json.RawMessage{{}, {}},
+		Dispositions: []string{"received"},
+	}
+	if !pendingPageRequiresGraphReplay(page) {
+		t.Fatal("pending page with mismatched disposition length was treated as local replay")
+	}
+}
+
+func TestInboundPollPendingUnknownDispositionRespectsGraph429Deadline(t *testing.T) {
+	now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+	blockedUntil := now.Add(10 * time.Minute)
+	decision := decideInboundPoll(inboundPollInput{
+		ChatID:  "chat-pending-unknown-429",
+		Role:    inboundPollRoleWork,
+		HasPoll: true,
+		Poll: teamstore.ChatPollState{
+			ChatID:         "chat-pending-unknown-429",
+			Seeded:         true,
+			PollState:      inboundPollStateBlocked,
+			LastActivityAt: now.Add(-time.Minute),
+			NextPollAt:     blockedUntil,
+			BlockedUntil:   blockedUntil,
+			FailureCount:   4,
+			LastError:      "Graph message refetch failed: HTTP 429 Too Many Requests",
+			PendingPage: &teamstore.ChatPollPendingPage{
+				ChatID:          "chat-pending-unknown-429",
+				RequestPath:     "/chats/chat-pending-unknown-429/messages?$top=20",
+				ReceiptID:       "receipt-pending-unknown-429",
+				Frontier:        "head",
+				PollRole:        "work",
+				Dispositions:    []string{"future-disposition-from-new-writer"},
+				RefetchFailures: []int{0},
+			},
+		},
+		Now: now,
+	})
+	if decision.Due || !decision.NextPollAt.Equal(blockedUntil) || !decision.BlockedUntil.Equal(blockedUntil) || decision.State == inboundPollStateBlocked {
+		t.Fatalf("unknown pending disposition must respect 429 deadline: %#v", decision)
+	}
+}
+
+func TestPollGraphReadBlockedSnapshotPreservesLocalReplayAndHonorsReadGates(t *testing.T) {
+	now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+	accountUntil := now.Add(10 * time.Minute)
+	chatUntil := now.Add(5 * time.Minute)
+	bridge := &Bridge{
+		groupChatGuardEnabled: true,
+		chatAudiences:         make(map[string]chatAudienceSnapshot),
+	}
+
+	if _, blocked := bridge.pollGraphReadBlockedUntilSnapshot(
+		"fresh-account-gated", inboundPollRoleWork,
+		teamstore.ChatPollState{ChatID: "fresh-account-gated"}, accountUntil, now,
+	); !blocked {
+		t.Fatal("fresh Graph read ignored the durable account read gate")
+	}
+
+	exceptional := teamstore.ChatPollState{
+		ChatID:       "exceptional-chat-gated",
+		BlockedUntil: chatUntil,
+		PendingPage: &teamstore.ChatPollPendingPage{
+			ChatID:          "exceptional-chat-gated",
+			ReceiptID:       "receipt-exceptional",
+			Frontier:        "head",
+			PollRole:        "work",
+			Records:         []json.RawMessage{{}},
+			Dispositions:    []string{"invalid_record"},
+			RefetchFailures: []int{1},
+		},
+	}
+	if got, blocked := bridge.pollGraphReadBlockedUntilSnapshot(
+		"exceptional-chat-gated", inboundPollRoleWork, exceptional, time.Time{}, now,
+	); !blocked || !got.Equal(chatUntil) {
+		t.Fatalf("exceptional pending page gate = %v, %v; want %v, true", got, blocked, chatUntil)
+	}
+
+	local := teamstore.ChatPollState{
+		ChatID:       "local-replay",
+		BlockedUntil: accountUntil,
+		PendingPage: &teamstore.ChatPollPendingPage{
+			ChatID:       "local-replay",
+			ReceiptID:    "receipt-local",
+			Frontier:     "head",
+			PollRole:     "work",
+			Records:      []json.RawMessage{{}},
+			Dispositions: []string{"received"},
+		},
+	}
+	bridge.groupChatGuardEnabled = false
+	if _, blocked := bridge.pollGraphReadBlockedUntilSnapshot(
+		"local-replay", inboundPollRoleWork, local, accountUntil, now,
+	); blocked {
+		t.Fatal("local pending receipt was blocked even though it needs no Graph read")
+	}
+
+	bridge.groupChatGuardEnabled = true
+	uncachedAudience := local
+	uncachedAudience.ChatID = "uncached-audience"
+	uncachedAudience.BlockedUntil = chatUntil
+	if got, blocked := bridge.pollGraphReadBlockedUntilSnapshot(
+		"uncached-audience", inboundPollRoleWork, uncachedAudience, time.Time{}, now,
+	); !blocked || !got.Equal(chatUntil) {
+		t.Fatalf("uncached audience gate = %v, %v; want %v, true", got, blocked, chatUntil)
+	}
+	bridge.cacheChatAudience("uncached-audience", chatAudienceSnapshot{Mode: chatAudienceMultiMember, CheckedAt: time.Now()})
+	if _, blocked := bridge.pollGraphReadBlockedUntilSnapshot(
+		"uncached-audience", inboundPollRoleWork, uncachedAudience, accountUntil, now,
+	); blocked {
+		t.Fatal("cached audience local replay was blocked by account read gate")
+	}
+}
+
 func TestInboundPollParkProbeRespectsNextPollAt(t *testing.T) {
 	now := time.Date(2026, 5, 2, 12, 0, 0, 0, time.UTC)
 	future := now.Add(time.Minute)
@@ -553,4 +752,197 @@ func TestLimitInboundPollDecisionsReservesOrdinaryBehindOperationalFrontiers(t *
 		}
 	}
 	t.Fatalf("ordinary chat was starved behind operational frontiers: %#v", limited)
+}
+
+func TestLimitInboundPollDecisionsReservesHealthyChatAlongsideDueRetries(t *testing.T) {
+	now := time.Date(2026, 9, 9, 13, 0, 0, 0, time.UTC)
+	decisions := make([]inboundPollDecision, 0, 9)
+	for i := 0; i < 8; i++ {
+		decision := decideInboundPoll(inboundPollInput{
+			ChatID: "retry-" + strconv.Itoa(i), Role: inboundPollRoleWork, HasPoll: true,
+			Poll: teamstore.ChatPollState{
+				ChatID: "retry-" + strconv.Itoa(i), Seeded: true, PollState: inboundPollStateCold,
+				NextPollAt: now.Add(-time.Minute), LastActivityAt: now.Add(-time.Minute),
+				LastSuccessfulPollAt: now.Add(-time.Hour), FailureCount: 1,
+			},
+			Now: now,
+		})
+		if !decision.RetryFailure || !decision.Due {
+			t.Fatalf("retry decision = %#v, want due retry", decision)
+		}
+		decisions = append(decisions, decision)
+	}
+	ordinary := decideInboundPoll(inboundPollInput{
+		ChatID: "healthy-ordinary", Role: inboundPollRoleWork, HasPoll: true,
+		Poll: teamstore.ChatPollState{
+			ChatID: "healthy-ordinary", Seeded: true, PollState: inboundPollStateCold,
+			NextPollAt: now.Add(-2 * time.Minute), LastActivityAt: now.Add(-time.Minute),
+			LastSuccessfulPollAt: now.Add(-2 * time.Hour),
+		},
+		Now: now,
+	})
+	if ordinary.RetryFailure || !ordinary.Due {
+		t.Fatalf("ordinary decision = %#v, want due non-retry", ordinary)
+	}
+	decisions = append(decisions, ordinary)
+
+	sortInboundPollDecisions(decisions)
+	limited := limitInboundPollDecisions(decisions, 8)
+	foundOrdinary := false
+	retryCount := 0
+	for _, decision := range limited {
+		foundOrdinary = foundOrdinary || decision.ChatID == "healthy-ordinary"
+		if decision.RetryFailure {
+			retryCount++
+		}
+	}
+	if !foundOrdinary || retryCount == 0 {
+		t.Fatalf("cycle dropped one lane: ordinary=%v retry_count=%d decisions=%#v", foundOrdinary, retryCount, limited)
+	}
+}
+
+func TestLimitInboundPollDecisionsAgesEvictedRetryBackIntoSelection(t *testing.T) {
+	now := time.Date(2026, 9, 10, 12, 0, 0, 0, time.UTC)
+	decisions := make([]inboundPollDecision, 0, 9)
+	for i := 0; i < 8; i++ {
+		decisions = append(decisions, inboundPollDecision{
+			ChatID:               fmt.Sprintf("retry-age-%02d", i),
+			State:                inboundPollStateCold,
+			Due:                  true,
+			RetryFailure:         true,
+			NextPollAt:           now.Add(-time.Minute),
+			LastSuccessfulPollAt: now.Add(-2 * time.Hour),
+			LastErrorAt:          now.Add(-time.Duration(8-i) * time.Minute),
+		})
+	}
+	decisions = append(decisions, inboundPollDecision{
+		ChatID:               "retry-age-ordinary",
+		State:                inboundPollStateCold,
+		Due:                  true,
+		NextPollAt:           now.Add(-2 * time.Minute),
+		LastSuccessfulPollAt: now.Add(-3 * time.Hour),
+	})
+
+	sortInboundPollDecisions(decisions)
+	first := limitInboundPollDecisions(decisions, 8)
+	foundOrdinary := false
+	foundNewestRetry := false
+	for _, decision := range first {
+		foundOrdinary = foundOrdinary || decision.ChatID == "retry-age-ordinary"
+		foundNewestRetry = foundNewestRetry || decision.ChatID == "retry-age-07"
+	}
+	if !foundOrdinary || foundNewestRetry {
+		t.Fatalf("first retry/ordinary cycle = %#v, want ordinary and newest retry temporarily evicted", first)
+	}
+
+	// The seven admitted retries make another failed attempt. Their durable
+	// LastErrorAt values advance; the retry evicted for the ordinary slot must
+	// therefore age to the front and survive the next ordinary reservation.
+	for index := range decisions {
+		if decisions[index].ChatID == "retry-age-07" || !decisions[index].RetryFailure {
+			continue
+		}
+		decisions[index].LastErrorAt = now.Add(time.Duration(index+1) * time.Second)
+	}
+	sortInboundPollDecisions(decisions)
+	second := limitInboundPollDecisions(decisions, 8)
+	foundNewestRetry = false
+	for _, decision := range second {
+		foundNewestRetry = foundNewestRetry || decision.ChatID == "retry-age-07"
+	}
+	if !foundNewestRetry {
+		t.Fatalf("second retry/ordinary cycle still starved the previously evicted retry: %#v", second)
+	}
+}
+
+func TestLimitInboundPollDecisionsPreservesSoleRetryAgainstOrdinaryReservation(t *testing.T) {
+	now := time.Date(2026, 9, 10, 13, 0, 0, 0, time.UTC)
+	decisions := []inboundPollDecision{
+		{
+			ChatID:               "failed-chat",
+			State:                inboundPollStateHot,
+			Due:                  true,
+			RetryFailure:         true,
+			NextPollAt:           now.Add(-time.Minute),
+			LastErrorAt:          now.Add(-time.Minute),
+			LastSuccessfulPollAt: now.Add(-time.Hour),
+			LastActivityAt:       now.Add(-10 * time.Minute),
+		},
+	}
+	for i := 0; i < 7; i++ {
+		decisions = append(decisions, inboundPollDecision{
+			ChatID:               fmt.Sprintf("healthy-hot-%02d", i),
+			State:                inboundPollStateHot,
+			Due:                  true,
+			NextPollAt:           now.Add(-30 * time.Second),
+			LastSuccessfulPollAt: now,
+			LastActivityAt:       now,
+		})
+	}
+	decisions = append(decisions, inboundPollDecision{
+		ChatID:               "ordinary-tail",
+		State:                inboundPollStateHot,
+		Due:                  true,
+		NextPollAt:           now.Add(-2 * time.Minute),
+		LastSuccessfulPollAt: now.Add(-2 * time.Hour),
+		LastActivityAt:       now.Add(-2 * time.Hour),
+	})
+
+	sortInboundPollDecisions(decisions)
+	limited := limitInboundPollDecisions(decisions, 8)
+	seenFailed := false
+	seenOrdinary := false
+	for _, decision := range limited {
+		seenFailed = seenFailed || decision.ChatID == "failed-chat"
+		seenOrdinary = seenOrdinary || decision.ChatID == "ordinary-tail"
+	}
+	if !seenFailed || !seenOrdinary {
+		t.Fatalf("sole retry was lost while reserving ordinary work: failed=%v ordinary=%v decisions=%#v", seenFailed, seenOrdinary, limited)
+	}
+}
+
+func TestLimitInboundPollDecisionsPreservesSoleOperationalFrontierAgainstOrdinaryReservation(t *testing.T) {
+	now := time.Date(2026, 9, 10, 14, 0, 0, 0, time.UTC)
+	decisions := make([]inboundPollDecision, 0, 10)
+	for i := 0; i < 8; i++ {
+		decisions = append(decisions, inboundPollDecision{
+			ChatID:               fmt.Sprintf("hot-backlog-%02d", i),
+			State:                inboundPollStateHot,
+			Due:                  true,
+			NextPollAt:           now.Add(-time.Minute),
+			LastSuccessfulPollAt: now,
+			LastActivityAt:       now,
+		})
+	}
+	decisions = append(decisions,
+		inboundPollDecision{
+			ChatID:               "expired-continuation",
+			State:                inboundPollStateCold,
+			Due:                  true,
+			NextPollAt:           now.Add(-time.Minute),
+			LastSuccessfulPollAt: now.Add(-time.Hour),
+			LastActivityAt:       now.Add(-time.Hour),
+			OperationalFrontier:  true,
+		},
+		inboundPollDecision{
+			ChatID:               "ordinary-tail",
+			State:                inboundPollStateCold,
+			Due:                  true,
+			NextPollAt:           now.Add(-2 * time.Minute),
+			LastSuccessfulPollAt: now.Add(-2 * time.Hour),
+			LastActivityAt:       now.Add(-2 * time.Hour),
+		},
+	)
+
+	sortInboundPollDecisions(decisions)
+	limited := limitInboundPollDecisions(decisions, 8)
+	seenOperational := false
+	seenOrdinary := false
+	for _, decision := range limited {
+		seenOperational = seenOperational || decision.ChatID == "expired-continuation"
+		seenOrdinary = seenOrdinary || decision.ChatID == "ordinary-tail"
+	}
+	if !seenOperational || !seenOrdinary {
+		t.Fatalf("sole operational frontier was lost while reserving ordinary work: operational=%v ordinary=%v decisions=%#v", seenOperational, seenOrdinary, limited)
+	}
 }

@@ -184,6 +184,19 @@ func (b *Bridge) pollStagedForkChildren(ctx context.Context, top int, graphBudge
 	if b == nil || b.store == nil {
 		return nil
 	}
+	// Staged fork input is durable and retryable, but it is not allowed to
+	// consume the entire listener poll phase. The old loop used the parent phase
+	// context directly and attempted children serially; three slow children at
+	// the normal 5s Graph budget could therefore spend all 15s before ordinary
+	// work chats were even admitted. Give this optional lane one worker-sized
+	// quantum. A timed-out child keeps its staged page/frontier unchanged and is
+	// retried on a later cycle, while the caller's phase context remains alive
+	// for normal work-chat polling.
+	stagedBudget := graphBudget
+	if stagedBudget <= 0 || stagedBudget > mainLoopPollWorkerBudget {
+		stagedBudget = mainLoopPollWorkerBudget
+	}
+	stagedDeadline := time.Now().Add(stagedBudget)
 	state, err := b.store.ForkPollingSnapshot(ctx)
 	if err != nil {
 		return err
@@ -225,11 +238,22 @@ func (b *Bridge) pollStagedForkChildren(ctx context.Context, top int, graphBudge
 		// unbounded scan that delays normal work-chat admission.
 		polled++
 		childSession := registrySessionFromDurable(child)
-		if _, err := b.pollChatWithRoleStateOptions(ctx, child.TeamsChatID, effectiveOwnerPollTop(top), inboundPollRoleWork, false, poll, hasPoll, pollChatWithRoleOptions{
+		remainingGraphBudget := time.Until(stagedDeadline)
+		if remainingGraphBudget <= 0 {
+			break
+		}
+		// A staged child is part of the read-side poll budget.  Carry the same
+		// queue-only fence as ordinary work chats so a mixed-version helper cannot
+		// turn a child poll into an execution, annotation, or other Graph write
+		// before the staged fork has been durably activated.
+		pollCtx := context.WithValue(ctx, workPollQueueOnlyContextKey{}, true)
+		if _, err := b.pollChatWithRoleStateOptions(pollCtx, child.TeamsChatID, effectiveOwnerPollTop(top), inboundPollRoleWork, false, poll, hasPoll, pollChatWithRoleOptions{
 			AllowBacklogDrain:        true,
 			MaxBacklogActions:        1,
 			RecoverStaleContinuation: true,
-			GraphBudget:              graphBudget,
+			SessionID:                strings.TrimSpace(child.ID),
+			AllowStagedSession:       true,
+			GraphBudget:              remainingGraphBudget,
 		}, func(ctx context.Context, msg ChatMessage, text string) error {
 			return b.deferForkChildMessage(ctx, &childSession, msg, text)
 		}); err != nil {

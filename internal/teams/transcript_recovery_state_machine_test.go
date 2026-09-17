@@ -239,7 +239,7 @@ func TestBridgeSyncLinkedTranscriptReleasesPendingRootAcrossSQLiteStoreReopen(t 
 	flushBridgeQueuedNotificationsForTest(t, restarted)
 	if got := countSentPlainContaining(*restartedSent, "new root answer after restart"); got != 1 {
 		state, _ := restartedStore.Load(context.Background())
-		t.Fatalf("post-restart root final deliveries = %d, want exactly one; checkpoint=%#v sent=%#v", got, state.ImportCheckpoints[transcriptCheckpointID(session.ID)], *restartedSent)
+		t.Fatalf("post-restart root final deliveries = %d, want exactly one; checkpoint=%#v outbox=%#v deliveries=%#v sent=%#v", got, state.ImportCheckpoints[transcriptCheckpointID(session.ID)], state.OutboxMessages, state.TranscriptDeliveries, *restartedSent)
 	}
 	state, err = restartedStore.Load(context.Background())
 	if err != nil {

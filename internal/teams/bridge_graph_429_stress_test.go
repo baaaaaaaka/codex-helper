@@ -64,25 +64,35 @@ func TestTeamsGraph429StressOutboxMaintainsAvailabilityAndSuppressesLoopsCI(t *t
 	store := newBridgeTestStore(t)
 	blockedChats := teamsGraph429BlockedChats(scale.Chats)
 	var (
-		mu          sync.Mutex
-		requests    = map[string]int{}
-		sentPlain   = map[string][]string{}
-		blockedMode = true
+		mu             sync.Mutex
+		requests       = map[string]int{}
+		evidenceReads  = map[string]int{}
+		remotePlain    = map[string][]string{}
+		sentPlain      = map[string][]string{}
+		remoteMessages = map[string][]ChatMessage{}
+		blockedMode    = true
 	)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost || !strings.HasPrefix(r.URL.Path, "/chats/") || !strings.HasSuffix(r.URL.Path, "/messages") {
+		if (r.Method != http.MethodPost && r.Method != http.MethodGet) || !strings.HasPrefix(r.URL.Path, "/chats/") || !strings.HasSuffix(r.URL.Path, "/messages") {
 			t.Fatalf("unexpected Graph request: %s %s", r.Method, r.URL.String())
 		}
 		chatID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/chats/"), "/messages")
-		mu.Lock()
-		requests[chatID]++
-		shouldBlock := blockedMode && blockedChats[chatID]
-		mu.Unlock()
-		if shouldBlock {
-			w.Header().Set("Retry-After", teamsGraph429StressRetryAfterSeconds)
-			http.Error(w, `{"error":{"code":"TooManyRequests","message":"stress rate limit"}}`, http.StatusTooManyRequests)
+		if r.Method == http.MethodGet {
+			mu.Lock()
+			evidenceReads[chatID]++
+			messages := append([]ChatMessage(nil), remoteMessages[chatID]...)
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(struct {
+				Value []ChatMessage `json:"value"`
+			}{Value: messages})
 			return
 		}
+		mu.Lock()
+		requests[chatID]++
+		requestNumber := requests[chatID]
+		shouldBlock := blockedMode && blockedChats[chatID]
+		mu.Unlock()
 		var body struct {
 			Body struct {
 				Content string `json:"content"`
@@ -91,9 +101,32 @@ func TestTeamsGraph429StressOutboxMaintainsAvailabilityAndSuppressesLoopsCI(t *t
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			t.Fatalf("decode Graph request: %v", err)
 		}
+		if shouldBlock {
+			message := bridgeTestMessageWithText(fmt.Sprintf("accepted-%s-%d", chatID, requestNumber), body.Body.Content)
+			message.ChatID = chatID
+			message.CreatedDateTime = time.Now().UTC().Format(time.RFC3339Nano)
+			message.LastModifiedDateTime = message.CreatedDateTime
+			mu.Lock()
+			// Model the important provider race: the non-idempotent POST is
+			// committed remotely, but the account gateway answers 429. The
+			// recovery lane must later find this exact marker and never POST it
+			// again.
+			remoteMessages[chatID] = append(remoteMessages[chatID], message)
+			remotePlain[chatID] = append(remotePlain[chatID], PlainTextFromTeamsHTML(body.Body.Content))
+			mu.Unlock()
+			w.Header().Set("Retry-After", teamsGraph429StressRetryAfterSeconds)
+			http.Error(w, `{"error":{"code":"TooManyRequests","message":"stress rate limit"}}`, http.StatusTooManyRequests)
+			return
+		}
 		mu.Lock()
 		sentPlain[chatID] = append(sentPlain[chatID], PlainTextFromTeamsHTML(body.Body.Content))
+		remotePlain[chatID] = append(remotePlain[chatID], PlainTextFromTeamsHTML(body.Body.Content))
 		id := len(sentPlain[chatID])
+		message := bridgeTestMessageWithText(fmt.Sprintf("sent-%s-%d", chatID, id), body.Body.Content)
+		message.ChatID = chatID
+		message.CreatedDateTime = time.Now().UTC().Format(time.RFC3339Nano)
+		message.LastModifiedDateTime = message.CreatedDateTime
+		remoteMessages[chatID] = append(remoteMessages[chatID], message)
 		mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprintf(w, `{"id":"sent-%s-%d","messageType":"message"}`, chatID, id)
@@ -164,11 +197,161 @@ func TestTeamsGraph429StressOutboxMaintainsAvailabilityAndSuppressesLoopsCI(t *t
 			t.Fatalf("ClearChatRateLimit %s: %v", chatID, err)
 		}
 	}
+	// Advance only the durable retry clock in this test. The real listener
+	// waits for the provider's Retry-After; sleeping ten minutes would make the
+	// safety test needlessly slow. The rows remain Sending/ambiguous until the
+	// bounded evidence lane proves the exact remote marker.
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		for id, msg := range state.OutboxMessages {
+			if blockedChats[msg.TeamsChatID] {
+				msg.NextAttemptAt = time.Time{}
+				if teamstore.OutboxSendIsAmbiguous(msg) {
+					msg.LastSendAttempt = time.Now().Add(-10 * time.Minute)
+				}
+				state.OutboxMessages[id] = msg
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("fast-forward blocked outbox retry gates: %v", err)
+	}
+	for pass := 0; pass < scale.Chats+scale.Messages+4; pass++ {
+		if err := bridge.recoverAmbiguousOutboxMainLoop(ctx); err != nil && !isOutboxDeliveryDeferred(err) {
+			t.Fatalf("ambiguous outbox recovery pass %d: %v", pass+1, err)
+		}
+		state, err := store.Load(ctx)
+		if err != nil {
+			t.Fatalf("load after ambiguous recovery pass %d: %v", pass+1, err)
+		}
+		remaining := 0
+		for _, msg := range state.OutboxMessages {
+			if blockedChats[msg.TeamsChatID] && teamstore.OutboxSendIsAmbiguous(msg) {
+				remaining++
+			}
+		}
+		if remaining == 0 {
+			break
+		}
+	}
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		for id, msg := range state.OutboxMessages {
+			if blockedChats[msg.TeamsChatID] {
+				msg.NextAttemptAt = time.Time{}
+				state.OutboxMessages[id] = msg
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("fast-forward queued blocked outbox retry gates: %v", err)
+	}
 	if err := bridge.flushPendingOutbox(ctx, "", ""); err != nil {
 		t.Fatalf("flush after clearing rate limits: %v", err)
 	}
 
-	requireTeamsGraph429OutboxFinalState(t, store, blockedChats, requests, sentPlain, scale)
+	requireTeamsGraph429OutboxFinalState(t, store, blockedChats, requests, sentPlain, remotePlain, scale)
+}
+
+// TestTeamsGraph429SQLiteAdmissionDoesNotLoseTheRetry exercises the production
+// SQLite candidate path after a retryable Graph failure. The first request is
+// deliberately made while the chat is recent so it is admitted normally; the
+// test then ages only the disposable schedule row before the retry. This models
+// a real old/cold chat whose durable FailureCount/NextPollAt says it must retry,
+// and proves that idle admission does not hide that retry after the gate opens.
+func TestTeamsGraph429SQLiteAdmissionDoesNotLoseTheRetry(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC()
+	store := newBridgeTestStore(t)
+	blockedChat := "sqlite-admission-429-blocked"
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/chats/"+blockedChat+"/messages" {
+			t.Fatalf("unexpected SQLite admission Graph request: %s %s", r.Method, r.URL.String())
+		}
+		requests++
+		if requests == 1 {
+			w.Header().Set("Retry-After", "1")
+			http.Error(w, `{"error":{"code":"TooManyRequests","message":"SQLite admission retry"}}`, http.StatusTooManyRequests)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"value":[]}`)
+	}))
+	t.Cleanup(server.Close)
+	readGraph := &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep: func(context.Context, time.Duration) error {
+			t.Fatal("SQLite admission 429 path attempted hidden Graph sleep")
+			return nil
+		},
+		jitter: func(d time.Duration) time.Duration { return d },
+	}
+	writeGraph, _ := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(writeGraph, store, &recordingExecutor{})
+	bridge.readGraph = readGraph
+	bridge.reg.Sessions = nil
+	bridge.maxWorkChatPollsPerCycle = 1
+	bridge.pollWorkerBudget = 5 * time.Second
+	seedTeamsGraph429ControlPoll(t, store, now)
+	session := Session{
+		ID:        "sqlite-admission-429-session",
+		ChatID:    blockedChat,
+		ChatURL:   "https://teams.example/" + blockedChat,
+		Topic:     blockedChat,
+		Status:    "active",
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	bridge.reg.Sessions = append(bridge.reg.Sessions, session)
+	if err := bridge.ensureDurableSession(ctx, &bridge.reg.Sessions[0]); err != nil {
+		t.Fatalf("ensure durable SQLite admission session: %v", err)
+	}
+	if _, err := store.RecordChatPollSuccess(ctx, blockedChat, now.Add(-time.Minute), true, false, 1); err != nil {
+		t.Fatalf("seed SQLite admission poll: %v", err)
+	}
+	if _, err := store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
+		ChatID: blockedChat, PollState: inboundPollStateWarm,
+		NextPollAt: now.Add(-time.Second), LastActivityAt: now,
+	}); err != nil {
+		t.Fatalf("schedule SQLite admission poll: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate SQLite admission fixture: %v", err)
+	}
+
+	if err := bridge.pollOnce(ctx, ownerPollMessageTop); err != nil {
+		t.Fatalf("first SQLite admission poll: %v", err)
+	}
+	poll, ok, err := store.ChatPoll(ctx, blockedChat)
+	if err != nil || !ok {
+		t.Fatalf("read SQLite admission poll after 429: ok=%v err=%v poll=%#v", ok, err, poll)
+	}
+	if requests != 1 || poll.FailureCount != 1 || poll.LastError == "" || !poll.NextPollAt.After(poll.LastErrorAt) {
+		t.Fatalf("SQLite admission state after 429: requests=%d poll=%#v", requests, poll)
+	}
+	// Age only the disposable activity/schedule fields. FailureCount and the
+	// retry error remain durable, matching an old chat that failed after its
+	// last successful activity; no cursor/seen/frontier field is changed.
+	old := now.Add(-49 * time.Hour)
+	if _, err := store.UpdateChatPollSchedule(ctx, teamstore.ChatPollScheduleUpdate{
+		ChatID: blockedChat, PollState: inboundPollStateCold,
+		NextPollAt: time.Now().Add(-time.Second), LastActivityAt: old,
+		ClearBlockedUntil: true,
+	}); err != nil {
+		t.Fatalf("age SQLite admission retry fixture: %v", err)
+	}
+	if err := bridge.pollOnce(ctx, ownerPollMessageTop); err != nil {
+		t.Fatalf("second SQLite admission poll after durable retry gate: %v", err)
+	}
+	poll, ok, err = store.ChatPoll(ctx, blockedChat)
+	if err != nil || !ok {
+		t.Fatalf("read SQLite admission poll after recovery: ok=%v err=%v poll=%#v", ok, err, poll)
+	}
+	if requests != 2 || poll.FailureCount != 0 || poll.LastError != "" || poll.LastSuccessfulPollAt.IsZero() {
+		t.Fatalf("SQLite admission retry was lost: requests=%d poll=%#v", requests, poll)
+	}
 }
 
 func TestTeamsGraph429PollAutomaticallyRecoversWithoutManualUnblock(t *testing.T) {
@@ -469,6 +652,13 @@ func pollTeamsGraph429StressUntilPromptCount(t *testing.T, ctx context.Context, 
 		if err := bridge.pollOnce(ctx, 20); err != nil {
 			t.Fatalf("%s pass %d pollOnce failed: %v; diagnostics=%s", phase, pass+1, err, teamsGraph429StressPollDiagnostics(store, scale, trace, mu))
 		}
+		// pollOnce deliberately keeps the read worker queue-only.  The production
+		// listener flushes ACK/final outbox rows in its following phase; include
+		// that phase so this stress test checks availability and delivery rather
+		// than only durable admission.
+		if err := bridge.flushPendingOutbox(ctx, "", ""); err != nil && !isOutboxDeliveryDeferred(err) {
+			t.Fatalf("%s pass %d outbox flush failed: %v; diagnostics=%s", phase, pass+1, err, teamsGraph429StressPollDiagnostics(store, scale, trace, mu))
+		}
 	}
 	waitTeamsGraph429StressPromptCount(t, executor, want, phase, func() string {
 		return teamsGraph429StressPollDiagnostics(store, scale, trace, mu)
@@ -601,7 +791,7 @@ func requireTeamsGraph429OutboxStressState(t *testing.T, store *teamstore.Store,
 	}
 }
 
-func requireTeamsGraph429OutboxFinalState(t *testing.T, store *teamstore.Store, blockedChats map[string]bool, requests map[string]int, sentPlain map[string][]string, scale teamsGraph429StressScale) {
+func requireTeamsGraph429OutboxFinalState(t *testing.T, store *teamstore.Store, blockedChats map[string]bool, requests map[string]int, sentPlain map[string][]string, remotePlain map[string][]string, scale teamsGraph429StressScale) {
 	t.Helper()
 	state, err := store.Load(context.Background())
 	if err != nil {
@@ -620,13 +810,15 @@ func requireTeamsGraph429OutboxFinalState(t *testing.T, store *teamstore.Store, 
 		wantSent := scale.Messages
 		wantRequests := scale.Messages
 		if blockedChats[chatID] {
-			wantRequests++ // one initial 429, then one successful retry per initial message after unblock.
+			// One initial POST was accepted remotely but answered 429; the
+			// remaining messages are ordinary successful POSTs. Exact evidence
+			// recovery settles the first row without a duplicate POST.
 		} else {
 			wantSent += scale.Rounds
 			wantRequests += scale.Rounds
 		}
-		if len(sentPlain[chatID]) != wantSent {
-			t.Fatalf("%s final sent count = %d, want %d; sent=%#v", chatID, len(sentPlain[chatID]), wantSent, sentPlain[chatID])
+		if len(remotePlain[chatID]) != wantSent {
+			t.Fatalf("%s final remote delivery count = %d, want %d; remote=%#v response_sent=%#v", chatID, len(remotePlain[chatID]), wantSent, remotePlain[chatID], sentPlain[chatID])
 		}
 		if requests[chatID] != wantRequests {
 			t.Fatalf("%s final Graph request count = %d, want %d", chatID, requests[chatID], wantRequests)

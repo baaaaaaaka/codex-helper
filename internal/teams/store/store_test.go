@@ -298,7 +298,10 @@ func TestSQLiteFullAcceptedOutboxCASRecoversAfterCapacityReturns(t *testing.T) {
 		ID:          "outbox:sqlite-full-accepted-cas",
 		TeamsChatID: "chat-full-cas",
 		Kind:        "final",
-		Body:        strings.Repeat("accepted CAS payload ", 256*1024),
+		// The quota boundary only needs one additional SQLite page. Keep the
+		// synthetic payload small so race builds do not spend minutes parsing a
+		// multi-megabyte JSON1 trigger argument.
+		Body: strings.Repeat("accepted CAS payload ", 8*1024),
 	})
 	if err != nil {
 		t.Fatalf("QueueOutbox: %v", err)
@@ -309,9 +312,9 @@ func TestSQLiteFullAcceptedOutboxCASRecoversAfterCapacityReturns(t *testing.T) {
 		t.Fatalf("MarkOutboxSendAttempt: outbox=%#v err=%v", claimed, err)
 	}
 	// The oversized accepted ID makes the CAS require a fresh SQLite page even
-	// when the queued row already occupies its own overflow pages.  It is only
-	// a deterministic quota trigger; production Graph IDs are much smaller.
-	acceptedID := "teams-full-cas-" + strings.Repeat("x", 2*1024*1024)
+	// when the queued row already occupies its own overflow pages. It is only a
+	// deterministic quota trigger; production Graph IDs are much smaller.
+	acceptedID := "teams-full-cas-" + strings.Repeat("x", 32*1024)
 
 	if err := store.withStateLock(ctx, func() error {
 		pointer, ok, err := store.currentSQLitePointerUnlocked()
@@ -2742,6 +2745,57 @@ func TestSQLiteMigrationCrashStageMatrixLeavesLegacyStateRetryable(t *testing.T)
 			}
 			if !stateLogicalEqual(expected, reloaded) {
 				t.Fatalf("retry after injected crash changed state: %s", sqliteStateSummaryDiff(expected, reloaded))
+			}
+		})
+	}
+}
+
+func TestSQLiteMigrationCancellationLeavesLegacySourceAuthoritative(t *testing.T) {
+	stages := []string{
+		sqliteMigrationStageAfterBackup,
+		sqliteMigrationStageAfterTempVerified,
+	}
+	for _, stage := range stages {
+		t.Run(stage, func(t *testing.T) {
+			store := newTestStore(t)
+			seedLegacyStateFileForSQLiteMigrationTest(t, store)
+			before, err := os.ReadFile(store.Path())
+			if err != nil {
+				t.Fatalf("read legacy source before cancellation: %v", err)
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			withSQLiteMigrationTestHook(t, func(got string) error {
+				if got == stage {
+					cancel()
+				}
+				return nil
+			})
+
+			if _, err := store.MigrateLargeStateToSQLite(ctx, 0); !errors.Is(err, context.Canceled) {
+				t.Fatalf("cancelled migration error = %v, want context.Canceled", err)
+			}
+			after, err := os.ReadFile(store.Path())
+			if err != nil {
+				t.Fatalf("read legacy source after cancellation: %v", err)
+			}
+			if !bytes.Equal(before, after) {
+				t.Fatal("cancelled migration changed the legacy source/pointer")
+			}
+			if _, legacy, err := store.LoadLegacyJSONState(context.Background()); err != nil || !legacy {
+				t.Fatalf("legacy source after cancellation = legacy %v err %v, want readable legacy state", legacy, err)
+			}
+
+			// Cancellation before pointer publication must not strand a partial
+			// replacement as the active store. A subsequent uncancelled attempt
+			// remains the recovery path and must still complete normally.
+			sqliteMigrationTestHook = nil
+			result, err := store.MigrateLargeStateToSQLite(context.Background(), 0)
+			if err != nil {
+				t.Fatalf("retry migration after cancellation: %v", err)
+			}
+			if !result.Migrated {
+				t.Fatalf("retry result = %#v, want migrated", result)
 			}
 		})
 	}
@@ -5554,12 +5608,30 @@ func TestMarkOutboxUploadSessionForAttemptPersistsAndFences(t *testing.T) {
 			if err != nil {
 				t.Fatalf("MarkOutboxSendAttempt: %v", err)
 			}
+			started, err := store.MarkOutboxUploadSessionPostStartedForAttempt(ctx, msg.ID, claimed.SendAttemptToken)
+			if err != nil {
+				t.Fatalf("MarkOutboxUploadSessionPostStartedForAttempt: %v", err)
+			}
+			if started.AttachmentUploadSessionPostState != "started" || started.AttachmentUploadURL != "" {
+				t.Fatalf("started upload-session boundary = %#v, want started without URL", started)
+			}
+			if _, err := store.MarkOutboxUploadSessionPostStartedForAttempt(ctx, msg.ID, claimed.SendAttemptToken); !errors.Is(err, ErrOutboxUploadSessionIndeterminate) {
+				t.Fatalf("repeat upload-session boundary error = %v, want ErrOutboxUploadSessionIndeterminate", err)
+			}
+			reset, err := store.ResetOutboxUploadSessionPostPendingForAttempt(ctx, msg.ID, claimed.SendAttemptToken)
+			if err != nil || reset.AttachmentUploadSessionPostState != "pending" {
+				t.Fatalf("reset upload-session boundary = %#v err=%v, want pending", reset, err)
+			}
+			started, err = store.MarkOutboxUploadSessionPostStartedForAttempt(ctx, msg.ID, claimed.SendAttemptToken)
+			if err != nil || started.AttachmentUploadSessionPostState != "started" {
+				t.Fatalf("re-enter upload-session boundary = %#v err=%v, want started", started, err)
+			}
 			expiresAt := time.Now().UTC().Add(time.Hour).Truncate(time.Second)
 			saved, err := store.MarkOutboxUploadSessionForAttempt(ctx, msg.ID, claimed.SendAttemptToken, "https://upload.example/session?sig=secret", expiresAt, 64*1024*1024)
 			if err != nil {
 				t.Fatalf("MarkOutboxUploadSessionForAttempt: %v", err)
 			}
-			if saved.AttachmentUploadURL == "" || saved.AttachmentUploadOffset != 64*1024*1024 || !saved.AttachmentUploadExpiry.Equal(expiresAt) || saved.LastSendAttempt.IsZero() {
+			if saved.AttachmentUploadURL == "" || saved.AttachmentUploadSessionPostState != "ready" || saved.AttachmentUploadOffset != 64*1024*1024 || !saved.AttachmentUploadExpiry.Equal(expiresAt) || saved.LastSendAttempt.IsZero() {
 				t.Fatalf("saved checkpoint = %#v", saved)
 			}
 			if _, err := store.MarkOutboxUploadSessionForAttempt(ctx, msg.ID, "wrong-attempt-token", saved.AttachmentUploadURL, expiresAt, 1); !errors.Is(err, ErrOutboxSendNotClaimed) {
@@ -5574,6 +5646,12 @@ func TestMarkOutboxUploadSessionForAttemptPersistsAndFences(t *testing.T) {
 			}
 			if cleared.AttachmentUploadURL != "" || !cleared.AttachmentUploadExpiry.IsZero() || cleared.AttachmentUploadOffset != 0 {
 				t.Fatalf("cleared checkpoint = %#v", cleared)
+			}
+			if cleared.AttachmentUploadSessionPostState != "unknown" {
+				t.Fatalf("cleared upload-session checkpoint state = %q, want unknown", cleared.AttachmentUploadSessionPostState)
+			}
+			if _, err := store.MarkOutboxUploadSessionPostStartedForAttempt(ctx, msg.ID, claimed.SendAttemptToken); !errors.Is(err, ErrOutboxUploadSessionIndeterminate) {
+				t.Fatalf("recreate after losing URL error = %v, want ErrOutboxUploadSessionIndeterminate", err)
 			}
 		})
 	}
@@ -5701,6 +5779,13 @@ func TestMarkOutboxAttachmentMessagePostStartedForAttemptPersistsAndFences(t *te
 			}
 			if _, err := store.MarkOutboxAttachmentMessagePostStartedForAttempt(ctx, pending.ID, "stale-attempt-token"); !errors.Is(err, ErrOutboxSendNotClaimed) {
 				t.Fatalf("stale attachment POST boundary error = %v, want ErrOutboxSendNotClaimed", err)
+			}
+			rejected, err := store.MarkOutboxAttachmentMessagePostRejectedForAttempt(ctx, pending.ID, claimed.SendAttemptToken, "HTTP 401")
+			if err != nil || rejected.Status != OutboxStatusQueued || rejected.AttachmentMessagePostState != "pending" || rejected.AttachmentMessagePostAttemptToken != "" {
+				t.Fatalf("atomic explicit attachment POST rejection = %#v err=%v, want queued/pending without boundary token", rejected, err)
+			}
+			if _, err := store.MarkOutboxAttachmentMessagePostRejectedForAttempt(ctx, pending.ID, claimed.SendAttemptToken, "stale HTTP 401"); !errors.Is(err, ErrOutboxSendNotClaimed) {
+				t.Fatalf("stale atomic attachment POST rejection error = %v, want ErrOutboxSendNotClaimed", err)
 			}
 
 			legacy, created, err := store.QueueOutbox(ctx, OutboxMessage{
@@ -6255,6 +6340,55 @@ func TestSQLiteHotPollWorkCandidatesReturnsOnlyPositiveDurableCandidates(t *test
 	}
 }
 
+func TestSQLiteHotPollWorkCandidatesDeduplicatesDurableChatFrontier(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := store.Update(ctx, func(state *State) error {
+		// A migration/fork repair can briefly leave two active session rows
+		// referring to the same Teams chat. The chat poll row is still the one
+		// durable frontier, so admission must return one session and issue one
+		// Graph read for that chat.
+		state.Sessions["s-duplicate-a"] = SessionContext{
+			ID: "s-duplicate-a", Status: SessionStatusActive, TeamsChatID: "chat-duplicate", UpdatedAt: now.Add(-2 * time.Minute),
+		}
+		state.Sessions["s-duplicate-b"] = SessionContext{
+			ID: "s-duplicate-b", Status: SessionStatusActive, TeamsChatID: "chat-duplicate", UpdatedAt: now.Add(-time.Minute),
+		}
+		state.Sessions["s-independent"] = SessionContext{
+			ID: "s-independent", Status: SessionStatusActive, TeamsChatID: "chat-independent", UpdatedAt: now,
+		}
+		state.ChatPolls["chat-duplicate"] = ChatPollState{
+			ChatID: "chat-duplicate", Seeded: true, PollState: chatPollStateWarm, NextPollAt: now.Add(-time.Second), UpdatedAt: now,
+		}
+		state.ChatPolls["chat-independent"] = ChatPollState{
+			ChatID: "chat-independent", Seeded: true, PollState: chatPollStateWarm, NextPollAt: now.Add(-time.Second), UpdatedAt: now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed duplicate chat sessions: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+
+	candidates, handled, err := store.HotPollWorkCandidates(ctx, "control-chat")
+	if err != nil {
+		t.Fatalf("HotPollWorkCandidates error: %v", err)
+	}
+	if !handled {
+		t.Fatal("HotPollWorkCandidates was not handled by SQLite")
+	}
+	chatCount := make(map[string]int)
+	for _, session := range candidates {
+		chatCount[strings.TrimSpace(session.TeamsChatID)]++
+	}
+	if got := chatCount["chat-duplicate"]; got != 1 {
+		t.Fatalf("duplicate chat candidate count = %d, want one: %#v", got, candidates)
+	}
+	if got := chatCount["chat-independent"]; got != 1 {
+		t.Fatalf("independent chat candidate count = %d, want one: %#v", got, candidates)
+	}
+}
+
 func TestSQLiteHotPollWorkCandidatesCanExcludeIdleAutoParkCandidates(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -6273,7 +6407,7 @@ func TestSQLiteHotPollWorkCandidatesCanExcludeIdleAutoParkCandidates(t *testing.
 		// the future. Admission must respect the durable retry deadline even for
 		// operational frontiers; the next cycle must not hammer Graph early.
 		state.ChatPolls["chat-frontier"] = ChatPollState{ChatID: "chat-frontier", Seeded: true, PollState: chatPollStateCold, LastActivityAt: oldActivity, NextPollAt: now.Add(time.Hour), ContinuationPath: "/chats/chat-frontier/messages?$skiptoken=backlog", UpdatedAt: now}
-		state.ChatPolls["chat-pending"] = ChatPollState{ChatID: "chat-pending", Seeded: true, PollState: chatPollStateCold, LastActivityAt: oldActivity, NextPollAt: now.Add(-time.Minute), PendingPage: &ChatPollPendingPage{ReceiptID: "receipt-pending", ChatID: "chat-pending", RequestPath: "/chats/chat-pending/messages?$top=1"}, UpdatedAt: now}
+		state.ChatPolls["chat-pending"] = ChatPollState{ChatID: "chat-pending", Seeded: true, PollState: chatPollStateCold, LastActivityAt: oldActivity, NextPollAt: now.Add(-time.Minute), PendingPage: &ChatPollPendingPage{ReceiptID: "receipt-pending", ChatID: "chat-pending", RequestPath: "/chats/chat-pending/messages?$top=1", Frontier: "head", PollRole: "work", RecordIDs: []string{}, RecordHashes: []string{}}, UpdatedAt: now}
 		state.ChatPolls["chat-gap"] = ChatPollState{ChatID: "chat-gap", Seeded: true, PollState: chatPollStateCold, LastActivityAt: oldActivity, NextPollAt: now.Add(-time.Minute), Gap: &ChatPollGap{Epoch: 1, Kind: "unverified-continuation"}, UpdatedAt: now}
 		state.ChatPolls["chat-attempt"] = ChatPollState{ChatID: "chat-attempt", Seeded: true, PollState: chatPollStateCold, LastActivityAt: oldActivity, NextPollAt: now.Add(-time.Minute), Attempt: &ChatPollAttempt{ID: "attempt-1", ExpiresAt: now.Add(time.Hour)}, UpdatedAt: now}
 		state.ChatPolls["chat-running"] = ChatPollState{ChatID: "chat-running", Seeded: true, PollState: chatPollStateCold, LastActivityAt: oldActivity, NextPollAt: now.Add(-time.Minute), UpdatedAt: now}
@@ -6328,11 +6462,11 @@ func TestSQLiteHotPollWorkCandidatesRotateOperationalRowsBeyondLimit(t *testing.
 	store := newTestStore(t)
 	ctx := context.Background()
 	base := time.Now().UTC().Add(-2 * time.Hour)
-	// Two bounded pages plus one omitted row are enough to catch a fixed SQL
-	// LIMIT/order regression.  The smaller deterministic fixture keeps the
-	// repeated schedule-CAS portion fast on Windows and still proves that a row
-	// beyond the admission limit eventually rotates into the candidate set.
-	const total = sqliteHotPollReadyLimit*2 + 1
+	// One bounded page plus one omitted row is enough to catch a fixed SQL
+	// LIMIT/order regression. The deterministic fixture keeps the repeated
+	// schedule-CAS portion bounded on Windows and still proves that a row beyond
+	// the admission limit eventually rotates into the candidate set.
+	const total = sqliteHotPollReadyLimit + 1
 	if err := store.Update(ctx, func(state *State) error {
 		for i := 0; i < total; i++ {
 			chatID := fmt.Sprintf("chat-operational-%03d", i)
@@ -6371,30 +6505,31 @@ func TestSQLiteHotPollWorkCandidatesRotateOperationalRowsBeyondLimit(t *testing.
 	if len(firstIDs) != len(first) {
 		t.Fatalf("first hot-poll candidates contain duplicate sessions: %#v", first)
 	}
-
-	// A successful/partial poll commit updates the durable service-age key. Use
-	// the public schedule CAS to model that commit without invoking Graph; the
-	// next bounded SQL admission must then select the previously omitted rows.
-	for _, session := range first {
-		if _, err := store.UpdateChatPollSchedule(ctx, ChatPollScheduleUpdate{
-			ChatID:     session.TeamsChatID,
-			NextPollAt: time.Now().UTC().Add(-time.Minute),
-		}); err != nil {
-			t.Fatalf("age selected operational row %s: %v", session.ID, err)
+	ageSelected := func(sessions []SessionContext, phase string) {
+		t.Helper()
+		updates := make([]ChatPollScheduleUpdate, 0, len(sessions))
+		for _, session := range sessions {
+			updates = append(updates, ChatPollScheduleUpdate{
+				ChatID:     session.TeamsChatID,
+				NextPollAt: time.Now().UTC().Add(-time.Minute),
+			})
+		}
+		if _, err := store.UpdateChatPollSchedules(ctx, updates); err != nil {
+			t.Fatalf("age selected operational rows in %s: %v", phase, err)
 		}
 	}
+
+	// A successful/partial poll commit updates the durable service-age key. Use
+	// the public schedule batch API to model that commit without invoking Graph;
+	// the next bounded SQL admission must then select the previously omitted
+	// rows. One durable batch also mirrors the production owner-fenced schedule
+	// flush and keeps this regression test bounded on slow Windows SQLite.
+	ageSelected(first, "initial batch")
 	seenIDs := firstIDs
 	current := first
 	maxRounds := total/sqliteHotPollReadyLimit + 3
 	for round := 0; len(seenIDs) < total && round < maxRounds; round++ {
-		for _, session := range current {
-			if _, err := store.UpdateChatPollSchedule(ctx, ChatPollScheduleUpdate{
-				ChatID:     session.TeamsChatID,
-				NextPollAt: time.Now().UTC().Add(-time.Minute),
-			}); err != nil {
-				t.Fatalf("age selected operational row %s in round %d: %v", session.ID, round+1, err)
-			}
-		}
+		ageSelected(current, fmt.Sprintf("round %d", round+1))
 		next, handled, err := store.HotPollWorkCandidates(ctx, "control-chat")
 		if err != nil || !handled {
 			t.Fatalf("hot-poll candidate load round %d = handled:%v err:%v", round+1, handled, err)
@@ -6637,10 +6772,12 @@ func TestSQLiteHotPollAdmissionBoundsSemanticallyMalformedPollLaneAndPreservesHe
 	store := newTestStore(t)
 	ctx := context.Background()
 	now := time.Now().UTC()
-	// More than eight 64-row pages is intentional. A fixed eight-page SQL
+	// The normal build uses more than eight 64-row pages. A fixed eight-page SQL
 	// budget used to leave the healthy row permanently hidden behind this
-	// semantically malformed prefix.
-	const malformedCount = 520
+	// semantically malformed prefix. The race build uses a small equivalent
+	// fixture because its JSON compatibility scan is intentionally bounded by
+	// the same two-second production budget.
+	malformedCount := hotPollSemanticMalformedPollCount()
 	if err := store.Update(ctx, func(state *State) error {
 		state.Sessions["session-semantic-healthy-poll-lane"] = SessionContext{
 			ID: "session-semantic-healthy-poll-lane", Status: SessionStatusActive,
@@ -6669,16 +6806,15 @@ func TestSQLiteHotPollAdmissionBoundsSemanticallyMalformedPollLaneAndPreservesHe
 	}
 	migrateStoreToSQLiteForTest(t, store)
 	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
-		for i := 0; i < malformedCount; i++ {
-			chatID := fmt.Sprintf("chat-semantic-malformed-poll-lane-%03d", i)
-			// This is valid JSON, but the time.Time decoder rejects the numeric
-			// next_poll_at value. It must enter the bounded local-recovery lane;
-			// otherwise 80 decodable-looking rows can consume the SQL LIMIT and
-			// hide the healthy ordinary chat.
-			raw := []byte(fmt.Sprintf(`{"chat_id":%q,"seeded":true,"state":"hot","next_poll_at":17}`, chatID))
-			if _, err := tx.ExecContext(ctx, `UPDATE chat_polls SET json = ?, frontier_active = 0 WHERE chat_id = ?`, raw, chatID); err != nil {
-				return err
-			}
+		// Keep the fixture construction bounded as one statement. This produces
+		// the same valid-but-undecodable JSON for every row while avoiding 520
+		// repeated SQL parses on the Windows race runner. Do not use json_set
+		// here: parsing and rewriting every JSON blob makes the fixture itself
+		// exceed the hot-poll compatibility budget on hosted race runners.
+		if _, err := tx.ExecContext(ctx, `UPDATE chat_polls
+SET json = '{"chat_id":"' || chat_id || '","seeded":true,"state":"hot","next_poll_at":17}', frontier_active = 0
+WHERE chat_id LIKE 'chat-semantic-malformed-poll-lane-%'`); err != nil {
+			return err
 		}
 		return nil
 	})
@@ -6778,7 +6914,11 @@ func TestSQLiteHotPollAdmissionQuarantinesStructurallyEmptyPendingPage(t *testin
 	store := newTestStore(t)
 	ctx := context.Background()
 	now := time.Now().UTC()
-	const malformedCount = sqliteHotPollReadyLimit + 8
+	// The normal build crosses one SQL page to exercise keyset traversal. The
+	// race build keeps the same malformed-row/healthy-tail invariant with the
+	// smallest fixture because this path intentionally uses the bounded JSON
+	// compatibility oracle.
+	malformedCount := hotPollStructurallyEmptyPendingPageCount()
 	if err := store.Update(ctx, func(state *State) error {
 		state.Sessions["session-empty-pending-healthy"] = SessionContext{
 			ID: "session-empty-pending-healthy", Status: SessionStatusActive,
@@ -6799,10 +6939,6 @@ func TestSQLiteHotPollAdmissionQuarantinesStructurallyEmptyPendingPage(t *testin
 			state.ChatPolls[chatID] = ChatPollState{
 				ChatID: chatID, Seeded: true, PollState: chatPollStateHot,
 				NextPollAt: now.Add(-time.Minute), UpdatedAt: updatedAt,
-				PendingPage: &ChatPollPendingPage{
-					ChatID: chatID, RequestPath: "/chats/" + chatID + "/messages",
-					ReceiptID: "fixture-receipt", RecordIDs: []string{}, RecordHashes: []string{},
-				},
 			}
 		}
 		return nil
@@ -6865,7 +7001,7 @@ func TestSQLiteHotPollReadyScheduleSkipsMalformedOperationalPrefix(t *testing.T)
 	store := newTestStore(t)
 	ctx := context.Background()
 	now := time.Now().UTC()
-	const malformedCount = sqliteHotPollReadyLimit + 8
+	malformedCount := hotPollReadyScheduleSemanticMalformedCount()
 	if err := store.Update(ctx, func(state *State) error {
 		state.Sessions["session-ready-semantic-healthy"] = SessionContext{
 			ID: "session-ready-semantic-healthy", Status: SessionStatusActive,
@@ -6980,6 +7116,17 @@ func TestSQLiteSemanticMalformedPollMutationPreservesRawUntilExplicitRepair(t *t
 	if got := readRaw(); !bytes.Equal(got, raw) {
 		t.Fatalf("ordinary malformed-poll mutations overwrote raw evidence: got %q want %q", got, raw)
 	}
+	parkNoticeAt := now.Add(2 * time.Minute)
+	parked, err := store.MarkChatPollParkNoticeSent(ctx, chatID, parkNoticeAt)
+	if err != nil {
+		t.Fatalf("mark opaque poll park notice: %v", err)
+	}
+	if !parked.ParkNoticeSentAt.Equal(parkNoticeAt) || !parked.RecoveryRequired {
+		t.Fatalf("opaque park notice result = %#v", parked)
+	}
+	if got := readRaw(); !bytes.Equal(got, raw) {
+		t.Fatalf("park notice mutation overwrote raw evidence: got %q want %q", got, raw)
+	}
 
 	_, changed, err := store.UpdateChatPoll(ctx, chatID, func(poll *ChatPollState) error {
 		poll.PendingPage = nil
@@ -7001,6 +7148,285 @@ func TestSQLiteSemanticMalformedPollMutationPreservesRawUntilExplicitRepair(t *t
 	}
 	if poll.RecoveryRequired || poll.PendingPage != nil || poll.Gap == nil {
 		t.Fatalf("repaired poll retained malformed disposition: %#v", poll)
+	}
+}
+
+func TestSQLiteOpaquePollRetryGateSurvivesWithoutRewritingRawEvidence(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	chatID := "chat-opaque-retry-gate"
+	sessionID := "session-opaque-retry-gate"
+	if err := store.Update(ctx, func(state *State) error {
+		state.Sessions[sessionID] = SessionContext{
+			ID: sessionID, Status: SessionStatusActive, TeamsChatID: chatID, UpdatedAt: now,
+		}
+		state.ChatPolls[chatID] = ChatPollState{
+			ChatID: chatID, Seeded: true, PollState: chatPollStateHot,
+			NextPollAt: now.Add(-time.Minute), UpdatedAt: now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed opaque retry-gate state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	raw := []byte(fmt.Sprintf(`{"chat_id":%q,"seeded":true,"state":"hot","pending_page":{}}`, chatID))
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE chat_polls SET json = ?, frontier_active = 1 WHERE chat_id = ?`, raw, chatID)
+		return err
+	})
+
+	blockedUntil := now.Add(2 * time.Hour)
+	if err := store.RecordChatPollErrorWithBlock(ctx, chatID, "Graph 429 while recovering opaque poll", blockedUntil); err != nil {
+		t.Fatalf("record opaque poll error: %v", err)
+	}
+	if got := sqliteRawChatPollJSONForTest(t, store, chatID); !bytes.Equal(got, raw) {
+		t.Fatalf("opaque poll raw changed after retry error: got %q want %q", got, raw)
+	}
+	poll, ok, err := store.ChatPoll(ctx, chatID)
+	if err != nil || !ok {
+		t.Fatalf("read opaque retry-gate poll: ok=%v err=%v", ok, err)
+	}
+	if !poll.RecoveryRequired || poll.PollState != chatPollStateBlocked ||
+		!poll.BlockedUntil.Equal(blockedUntil) || !poll.NextPollAt.Equal(blockedUntil) {
+		t.Fatalf("opaque retry gate was not durable: %#v", poll)
+	}
+	beforeGate, handled, err := store.HotPollWorkCandidatesExcludingIdleAt(ctx, "control-chat", time.Time{}, now)
+	if err != nil || !handled {
+		t.Fatalf("opaque candidates before gate: handled=%v err=%v", handled, err)
+	}
+	for _, candidate := range beforeGate {
+		if candidate.ID == sessionID {
+			t.Fatalf("opaque poll was admitted before its durable retry gate: %#v", beforeGate)
+		}
+	}
+	// SQLite's canonical due predicate intentionally evaluates timestamps in
+	// julianday space, whose practical precision is milliseconds. Cross the
+	// precision window explicitly instead of using a one-nanosecond boundary
+	// that can round to the same value under race instrumentation.
+	afterGate, handled, err := store.HotPollWorkCandidatesExcludingIdleAt(ctx, "control-chat", time.Time{}, blockedUntil.Add(10*time.Millisecond))
+	if err != nil || !handled {
+		t.Fatalf("opaque candidates after gate: handled=%v err=%v", handled, err)
+	}
+	found := false
+	for _, candidate := range afterGate {
+		if candidate.ID == sessionID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("opaque poll was not re-admitted after its durable retry gate: %#v", afterGate)
+	}
+}
+
+// A zero-length BLOB is distinct from a missing SQLite row.  It is valid
+// opaque recovery evidence and must receive the same durable retry sidecar as
+// a syntax-invalid non-empty payload; otherwise a restart immediately probes
+// Graph again and can re-enter the same 429/recovery loop forever.
+func TestSQLiteEmptyOpaquePollRetryGateSurvivesReopen(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	const chatID = "chat-empty-opaque-retry-gate"
+	const sessionID = "session-empty-opaque-retry-gate"
+	if err := store.Update(ctx, func(state *State) error {
+		state.Sessions[sessionID] = SessionContext{
+			ID: sessionID, Status: SessionStatusActive, TeamsChatID: chatID, UpdatedAt: now,
+		}
+		state.ChatPolls[chatID] = ChatPollState{
+			ChatID: chatID, Seeded: true, PollState: chatPollStateHot,
+			NextPollAt: now.Add(-time.Minute), UpdatedAt: now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed empty opaque retry-gate state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE chat_polls SET json = zeroblob(0) WHERE chat_id = ?`, chatID)
+		return err
+	})
+
+	blockedUntil := time.Now().UTC().Add(2 * time.Hour)
+	if err := store.RecordChatPollErrorWithBlock(ctx, chatID, "Graph account 429", blockedUntil); err != nil {
+		t.Fatalf("record empty opaque poll error: %v", err)
+	}
+	if raw := sqliteRawChatPollJSONForTest(t, store, chatID); len(raw) != 0 {
+		t.Fatalf("empty opaque poll raw evidence changed: %q", raw)
+	}
+	poll, found, err := store.ChatPoll(ctx, chatID)
+	if err != nil || !found {
+		t.Fatalf("read empty opaque retry gate: found=%v err=%v poll=%#v", found, err, poll)
+	}
+	if !poll.RecoveryRequired || poll.PollState != chatPollStateBlocked || !poll.BlockedUntil.Equal(blockedUntil) || !poll.NextPollAt.Equal(blockedUntil) {
+		t.Fatalf("empty opaque retry gate = %#v, want durable blocked sidecar", poll)
+	}
+
+	path := store.Path()
+	if err := store.Close(); err != nil {
+		t.Fatalf("close before empty opaque retry-gate reopen: %v", err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen empty opaque retry-gate store: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	poll, found, err = reopened.ChatPoll(ctx, chatID)
+	if err != nil || !found || !poll.RecoveryRequired || poll.PollState != chatPollStateBlocked || !poll.BlockedUntil.Equal(blockedUntil) {
+		t.Fatalf("reopened empty opaque retry gate = %#v found=%v err=%v", poll, found, err)
+	}
+	before, handled, err := reopened.HotPollWorkCandidatesExcludingIdleAt(ctx, "control-chat", time.Time{}, time.Now().UTC())
+	if err != nil || !handled {
+		t.Fatalf("reopened empty opaque candidates before gate: handled=%v err=%v", handled, err)
+	}
+	for _, candidate := range before {
+		if candidate.ID == sessionID {
+			t.Fatalf("reopened empty opaque poll was admitted before retry gate: %#v", before)
+		}
+	}
+	after, handled, err := reopened.HotPollWorkCandidatesExcludingIdleAt(ctx, "control-chat", time.Time{}, blockedUntil.Add(10*time.Millisecond))
+	if err != nil || !handled {
+		t.Fatalf("reopened empty opaque candidates after gate: handled=%v err=%v", handled, err)
+	}
+	for _, candidate := range after {
+		if candidate.ID == sessionID {
+			return
+		}
+	}
+	t.Fatalf("reopened empty opaque poll was not re-admitted after retry gate: %#v", after)
+}
+
+func TestJSONOpaquePollRetryGateSurvivesReopen(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	const chatID = "chat-json-opaque-retry-gate"
+	const sessionID = "session-json-opaque-retry-gate"
+	if err := store.Update(ctx, func(state *State) error {
+		state.Sessions[sessionID] = SessionContext{
+			ID: sessionID, Status: SessionStatusActive, TeamsChatID: chatID, UpdatedAt: now,
+		}
+		state.ChatPolls[chatID] = ChatPollState{
+			ChatID: chatID, Seeded: true, PollState: chatPollStateHot,
+			NextPollAt: now.Add(-time.Minute), UpdatedAt: now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed JSON opaque retry-gate state: %v", err)
+	}
+	setRawPoll := func(raw []byte) {
+		t.Helper()
+		data, err := os.ReadFile(store.Path())
+		if err != nil {
+			t.Fatalf("read JSON state before corrupting poll: %v", err)
+		}
+		var root map[string]json.RawMessage
+		if err := json.Unmarshal(data, &root); err != nil {
+			t.Fatalf("decode JSON state before corrupting poll: %v", err)
+		}
+		var polls map[string]json.RawMessage
+		if err := json.Unmarshal(root["chat_polls"], &polls); err != nil {
+			t.Fatalf("decode JSON chat polls before corrupting poll: %v", err)
+		}
+		polls[chatID] = append([]byte(nil), raw...)
+		encodedPolls, err := json.Marshal(polls)
+		if err != nil {
+			t.Fatalf("encode JSON chat polls after corrupting poll: %v", err)
+		}
+		root["chat_polls"] = encodedPolls
+		encoded, err := json.Marshal(root)
+		if err != nil {
+			t.Fatalf("encode JSON state after corrupting poll: %v", err)
+		}
+		writeRawStoreStateForTest(t, store, append(encoded, '\n'))
+	}
+	readRawPoll := func() []byte {
+		t.Helper()
+		data, err := os.ReadFile(store.Path())
+		if err != nil {
+			t.Fatalf("read JSON state: %v", err)
+		}
+		var root map[string]json.RawMessage
+		if err := json.Unmarshal(data, &root); err != nil {
+			t.Fatalf("decode JSON state: %v", err)
+		}
+		var polls map[string]json.RawMessage
+		if err := json.Unmarshal(root["chat_polls"], &polls); err != nil {
+			t.Fatalf("decode JSON chat polls: %v", err)
+		}
+		return append([]byte(nil), polls[chatID]...)
+	}
+	raw := []byte(fmt.Sprintf(`{"chat_id":%q,"seeded":true,"state":123}`, chatID))
+	setRawPoll(raw)
+	blockedUntil := time.Now().UTC().Add(2 * time.Hour)
+	if err := store.RecordChatPollErrorWithBlock(ctx, chatID, "Graph account 429", blockedUntil); err != nil {
+		t.Fatalf("record JSON opaque poll error: %v", err)
+	}
+	if got := readRawPoll(); !bytes.Equal(got, raw) {
+		t.Fatalf("JSON opaque poll raw evidence changed: got %q want %q", got, raw)
+	}
+	poll, found, err := store.ChatPoll(ctx, chatID)
+	if err != nil || !found || !poll.RecoveryRequired || poll.PollState != chatPollStateBlocked || !poll.BlockedUntil.Equal(blockedUntil) {
+		t.Fatalf("JSON opaque retry gate = %#v found=%v err=%v", poll, found, err)
+	}
+
+	path := store.Path()
+	if err := store.Close(); err != nil {
+		t.Fatalf("close before JSON opaque retry-gate reopen: %v", err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen JSON opaque retry-gate store: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+	poll, found, err = reopened.ChatPoll(ctx, chatID)
+	if err != nil || !found || !poll.RecoveryRequired || poll.PollState != chatPollStateBlocked || !poll.BlockedUntil.Equal(blockedUntil) {
+		t.Fatalf("reopened JSON opaque retry gate = %#v found=%v err=%v", poll, found, err)
+	}
+	if got := func() []byte {
+		data, err := os.ReadFile(reopened.Path())
+		if err != nil {
+			t.Fatalf("read reopened JSON state: %v", err)
+		}
+		var root map[string]json.RawMessage
+		if err := json.Unmarshal(data, &root); err != nil {
+			t.Fatalf("decode reopened JSON state: %v", err)
+		}
+		var polls map[string]json.RawMessage
+		if err := json.Unmarshal(root["chat_polls"], &polls); err != nil {
+			t.Fatalf("decode reopened JSON chat polls: %v", err)
+		}
+		return polls[chatID]
+	}(); !bytes.Equal(got, raw) {
+		t.Fatalf("reopened JSON opaque poll raw evidence changed: got %q want %q", got, raw)
+	}
+	before, err := reopened.Load(ctx)
+	if err != nil {
+		t.Fatalf("reopened JSON opaque state before gate: %v", err)
+	}
+	candidate, exists := before.Sessions[sessionID]
+	if !exists {
+		t.Fatalf("reopened JSON opaque session disappeared before retry gate")
+	}
+	pollBefore, exists := before.ChatPolls[candidate.TeamsChatID]
+	if !exists {
+		t.Fatalf("reopened JSON opaque poll disappeared before retry gate: chat=%s", candidate.TeamsChatID)
+	}
+	if !pollBefore.BlockedUntil.After(time.Now().UTC()) {
+		t.Fatalf("reopened JSON opaque poll was not blocked before retry gate: %#v", pollBefore)
+	}
+	after, err := reopened.Load(ctx)
+	if err != nil {
+		t.Fatalf("reopened JSON opaque state after gate: %v", err)
+	}
+	candidate, exists = after.Sessions[sessionID]
+	if !exists {
+		t.Fatalf("reopened JSON opaque session disappeared after gate")
+	}
+	pollAfter, exists := after.ChatPolls[candidate.TeamsChatID]
+	if !exists || !pollAfter.BlockedUntil.Equal(blockedUntil) {
+		t.Fatalf("reopened JSON opaque poll lost its durable retry gate after deadline: sessions=%#v polls=%#v", after.Sessions[sessionID], after.ChatPolls)
 	}
 }
 
@@ -7043,7 +7469,7 @@ func TestSQLiteHotPollAdmissionUsesJSONFrontierHonorsBlockedUntilAndReservesCont
 	if err := store.Update(ctx, func(state *State) error {
 		state.Sessions["session-control"] = SessionContext{ID: "session-control", Status: SessionStatusActive, TeamsChatID: "control-chat", UpdatedAt: now}
 		state.ChatPolls["control-chat"] = ChatPollState{ChatID: "control-chat", Seeded: true, PollState: chatPollStateHot, NextPollAt: now.Add(-time.Minute), UpdatedAt: now}
-		for i := 0; i < 60; i++ {
+		for i := 0; i < hotPollJSONFrontierOperationalCount(); i++ {
 			chatID := fmt.Sprintf("chat-admission-operational-%03d", i)
 			sessionID := fmt.Sprintf("session-admission-operational-%03d", i)
 			state.Sessions[sessionID] = SessionContext{ID: sessionID, Status: SessionStatusActive, TeamsChatID: chatID, UpdatedAt: now.Add(-time.Hour)}
@@ -7090,8 +7516,9 @@ func TestSQLiteHotPollAdmissionUsesJSONFrontierHonorsBlockedUntilAndReservesCont
 	if seen["session-admission-blocked"] {
 		t.Fatalf("future BlockedUntil row was admitted before its retry deadline: %#v", seen)
 	}
-	if len(candidates) != sqliteHotPollReadyLimit-1 {
-		t.Fatalf("control reservation candidate count=%d, want %d", len(candidates), sqliteHotPollReadyLimit-1)
+	wantCandidates := hotPollJSONFrontierOperationalCount() + 3
+	if len(candidates) != wantCandidates {
+		t.Fatalf("control reservation candidate count=%d, want %d", len(candidates), wantCandidates)
 	}
 
 	schedule, err := store.HotPollReadyScheduleState(ctx, "control-chat", now)
@@ -7187,7 +7614,11 @@ func TestSQLiteHotPollAdmissionDoesNotLetStaleOrdinaryHintStarveDueChat(t *testi
 	store := newTestStore(t)
 	ctx := context.Background()
 	now := time.Now().UTC()
-	const staleOperational = 24
+	// Keep the normal build at a page-sized prefix so it exercises hint
+	// reconciliation beyond the scalar admission page. The race build uses a
+	// single row because the compatibility JSON oracle is intentionally bounded
+	// by the production two-second lane budget; the invariant is identical.
+	staleOperational := hotPollOperationalHintPrefixCount()
 	if err := store.Update(ctx, func(state *State) error {
 		for i := 0; i < staleOperational; i++ {
 			chatID := fmt.Sprintf("chat-stale-operational-hint-%03d", i)
@@ -7240,8 +7671,15 @@ func TestSQLiteHotPollAdmissionDoesNotLetStaleOrdinaryHintStarveDueChat(t *testi
 	if !seen["session-due-ordinary-after-stale-hints"] {
 		t.Fatalf("due ordinary chat was starved by stale operational hints: %#v", seen)
 	}
-	if staleSeen != staleOperational {
-		t.Fatalf("stale operational chats were dropped during hint reconciliation: got %d want %d", staleSeen, staleOperational)
+	wantStale := staleOperational
+	// The admission result is deliberately bounded. When the fixture fills
+	// the whole page with stale operational rows, the due ordinary row must
+	// consume one slot rather than being starved by that prefix.
+	if maxStale := sqliteHotPollReadyLimit - 1; wantStale > maxStale {
+		wantStale = maxStale
+	}
+	if staleSeen != wantStale {
+		t.Fatalf("stale operational chats were reconciled incorrectly: got %d want %d (fixture=%d limit=%d)", staleSeen, wantStale, staleOperational, sqliteHotPollReadyLimit)
 	}
 
 	schedule, err := store.HotPollReadyScheduleState(ctx, "control-chat", now)
@@ -7251,7 +7689,7 @@ func TestSQLiteHotPollAdmissionDoesNotLetStaleOrdinaryHintStarveDueChat(t *testi
 	if _, ok := schedule.ChatPolls["chat-due-ordinary-after-stale-hints"]; !ok {
 		t.Fatalf("due ordinary chat was absent from ready schedule behind stale hints: %#v", schedule.ChatPolls)
 	}
-	for i := 0; i < staleOperational; i++ {
+	for i := 0; i < wantStale; i++ {
 		chatID := fmt.Sprintf("chat-stale-operational-hint-%03d", i)
 		if _, ok := schedule.ChatPolls[chatID]; !ok {
 			t.Fatalf("stale operational chat %q was dropped from ready schedule: %#v", chatID, schedule.ChatPolls)
@@ -7263,7 +7701,7 @@ func TestSQLiteHotPollAdmissionReconcilesDueOrdinaryBehindOperationalHintPrefix(
 	store := newTestStore(t)
 	ctx := context.Background()
 	now := time.Now().UTC()
-	const operationalCount = sqliteHotPollReadyLimit
+	operationalCount := hotPollOperationalHintPrefixCount()
 	if err := store.Update(ctx, func(state *State) error {
 		for i := 0; i < operationalCount; i++ {
 			chatID := fmt.Sprintf("chat-operational-hint-prefix-%03d", i)
@@ -8914,6 +9352,7 @@ func TestSQLiteOpenBackfillsLegacyChatSequencesWhenTableAlreadyExists(t *testing
 	}
 	legacy := newState()
 	legacy.ChatSequences["chat-existing-table"] = ChatSequenceState{ChatID: "chat-existing-table", Next: 17, UpdatedAt: time.Date(2026, 6, 10, 8, 30, 0, 0, time.UTC)}
+	legacy.ChatSequences["chat-missing-from-table"] = ChatSequenceState{ChatID: "chat-missing-from-table", Next: 29, UpdatedAt: time.Date(2026, 6, 10, 8, 31, 0, 0, time.UTC)}
 	raw, err := json.Marshal(legacy)
 	if err != nil {
 		_ = db.Close()
@@ -8922,6 +9361,24 @@ func TestSQLiteOpenBackfillsLegacyChatSequencesWhenTableAlreadyExists(t *testing
 	if _, err := db.Exec(`INSERT INTO state_meta(key, value) VALUES ('state_json', ?)`, raw); err != nil {
 		_ = db.Close()
 		t.Fatalf("insert legacy state_json: %v", err)
+	}
+	existingRaw, err := json.Marshal(legacy.ChatSequences["chat-existing-table"])
+	if err != nil {
+		_ = db.Close()
+		t.Fatalf("marshal existing chat sequence: %v", err)
+	}
+	if _, err := db.Exec(`INSERT INTO chat_sequences(chat_id, next_sequence, updated_at, json) VALUES (?, ?, ?, ?)`,
+		"chat-existing-table", 17, sqliteTime(legacy.ChatSequences["chat-existing-table"].UpdatedAt), existingRaw); err != nil {
+		_ = db.Close()
+		t.Fatalf("insert partial chat sequence table: %v", err)
+	}
+	// ensureSQLiteSchema ran before state_json was installed and may have
+	// written the completion marker for the empty table. Remove it to model an
+	// interrupted migration with one durable row already present; the next open
+	// must fill only the missing key and retain the existing value.
+	if _, err := db.Exec(`DELETE FROM state_meta WHERE key = ?`, sqliteChatSequenceProjectionVersionKey); err != nil {
+		_ = db.Close()
+		t.Fatalf("clear chat sequence migration marker: %v", err)
 	}
 	if err := db.Close(); err != nil {
 		t.Fatalf("close legacy sqlite db: %v", err)
@@ -8934,6 +9391,9 @@ func TestSQLiteOpenBackfillsLegacyChatSequencesWhenTableAlreadyExists(t *testing
 	}
 	if next := state.ChatSequences["chat-existing-table"].Next; next != 17 {
 		t.Fatalf("loaded chat sequence next = %d, want 17", next)
+	}
+	if next := state.ChatSequences["chat-missing-from-table"].Next; next != 29 {
+		t.Fatalf("loaded missing chat sequence next = %d, want 29", next)
 	}
 }
 
@@ -9829,6 +10289,53 @@ func TestSetChatRateLimitForOutboxPreservesPoisonAcrossBackends(t *testing.T) {
 	}
 }
 
+func TestRetryDeadlinesNeverMoveBackwardAcrossBackends(t *testing.T) {
+	for _, sqlite := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sqlite=%v", sqlite), func(t *testing.T) {
+			store := newTestStore(t)
+			ctx := context.Background()
+			if sqlite {
+				if _, _, err := store.QueueOutbox(ctx, OutboxMessage{
+					ID: "retry-deadline-migration-seed", TeamsChatID: "retry-deadline-migration-chat",
+					Kind: "helper", Body: "migration seed",
+				}); err != nil {
+					t.Fatalf("QueueOutbox migration seed: %v", err)
+				}
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			now := time.Now().UTC()
+			long := now.Add(2 * time.Hour)
+			short := now.Add(30 * time.Second)
+
+			if err := store.RecordChatPollErrorWithBlock(ctx, "retry-chat", "Graph 429 long", long); err != nil {
+				t.Fatalf("RecordChatPollErrorWithBlock(long): %v", err)
+			}
+			if err := store.RecordChatPollErrorWithBlock(ctx, "retry-chat", "Graph 429 short", short); err != nil {
+				t.Fatalf("RecordChatPollErrorWithBlock(short): %v", err)
+			}
+			poll, ok, err := store.ChatPoll(ctx, "retry-chat")
+			if err != nil || !ok {
+				t.Fatalf("ChatPoll after out-of-order poll errors: ok=%v err=%v", ok, err)
+			}
+			if !poll.BlockedUntil.Equal(long) || !poll.NextPollAt.Equal(long) || poll.FailureCount != 2 {
+				t.Fatalf("poll retry deadline moved backward: %#v, want deadline %s", poll, long)
+			}
+
+			limit, err := store.SetChatRateLimit(ctx, "retry-rate-limit", long, "long")
+			if err != nil {
+				t.Fatalf("SetChatRateLimit(long): %v", err)
+			}
+			limit, err = store.SetChatRateLimit(ctx, "retry-rate-limit", short, "short")
+			if err != nil {
+				t.Fatalf("SetChatRateLimit(short): %v", err)
+			}
+			if !limit.BlockedUntil.Equal(long) {
+				t.Fatalf("rate-limit deadline moved backward: %#v, want deadline %s", limit, long)
+			}
+		})
+	}
+}
+
 func collectPendingOutboxPageIDsForTest(t *testing.T, store *Store, query PendingOutboxQuery) []string {
 	t.Helper()
 	ctx := context.Background()
@@ -10009,13 +10516,11 @@ func TestEarlierUnsentOutboxKeepsSameTurnAmbiguousPredecessor(t *testing.T) {
 			if err != nil || len(all) != 1 || all[0].ID != ambiguous.ID {
 				t.Fatalf("same-turn predecessor list = %#v err=%v, want ambiguous blocker", all, err)
 			}
-			if err := store.Update(ctx, func(state *State) error {
-				row := state.OutboxMessages[sameTurn.ID]
-				row.Status = OutboxStatusSent
-				row.TeamsMessageID = "teams-same-turn-next"
-				state.OutboxMessages[row.ID] = row
-				return nil
-			}); err != nil {
+			claimed, err := store.MarkOutboxSendAttempt(ctx, sameTurn.ID)
+			if err != nil {
+				t.Fatalf("claim same-turn successor for distinct-turn check: %v", err)
+			}
+			if _, err := store.MarkOutboxSentForAttempt(ctx, sameTurn.ID, claimed.SendAttemptToken, "teams-same-turn-next"); err != nil {
 				t.Fatalf("mark same-turn successor sent for distinct-turn check: %v", err)
 			}
 			got, ok, err = store.EarlierUnsentOutbox(ctx, differentTurn)
@@ -10023,6 +10528,55 @@ func TestEarlierUnsentOutboxKeepsSameTurnAmbiguousPredecessor(t *testing.T) {
 				t.Fatalf("different-turn predecessor = %#v ok=%v err=%v, want ambiguous row skipped", got, ok, err)
 			}
 		})
+	}
+}
+
+func TestSQLiteStoreCloseReleasesStateLockForImmediateReopen(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	if err := store.Update(ctx, func(state *State) error {
+		state.Scope = ScopeIdentity{ID: "close-reopen-scope", AccountID: "close-reopen-account", Profile: "default"}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed store: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate store: %v", err)
+	}
+
+	// Exercise the ownership boundary directly. Store.Close must release an
+	// outstanding state-lock handle before another Store instance is opened on
+	// the same durable path; this is especially important on Windows, where a
+	// live handle can make the next schema preflight fail with Access is denied.
+	if err := store.lock.Lock(); err != nil {
+		t.Fatalf("hold state lock for close: %v", err)
+	}
+	path := store.Path()
+	if err := store.Close(); err != nil {
+		t.Fatalf("close store: %v", err)
+	}
+
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen store: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := reopened.Close(); err != nil {
+			t.Errorf("close reopened store: %v", err)
+		}
+	})
+	locked, err := reopened.lock.TryLock()
+	if err != nil {
+		t.Fatalf("acquire reopened state lock: %v", err)
+	}
+	if !locked {
+		t.Fatal("reopened store state lock remained held after Close")
+	}
+	if err := reopened.lock.Unlock(); err != nil {
+		t.Fatalf("release reopened state lock: %v", err)
+	}
+	if err := reopened.PrepareSQLiteSchemaBeforeOwner(ctx); err != nil {
+		t.Fatalf("prepare reopened SQLite schema: %v", err)
 	}
 }
 
@@ -15823,6 +16377,52 @@ func TestOutboxSendAttemptClaimsQueuedMessage(t *testing.T) {
 	}
 }
 
+func TestOutboxSendAttemptHonorsFutureRetryGate(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := newTestStore(t)
+			ctx := context.Background()
+			if _, _, err := store.QueueOutbox(ctx, OutboxMessage{
+				ID: "outbox:future-retry-gate", SessionID: "s1", TeamsChatID: "chat-1",
+				Kind: "final", Body: "must wait", NextAttemptAt: time.Now().Add(time.Hour),
+			}); err != nil {
+				t.Fatalf("QueueOutbox error: %v", err)
+			}
+			if err := store.Update(ctx, func(state *State) error {
+				msg := state.OutboxMessages["outbox:future-retry-gate"]
+				msg.NextAttemptAt = time.Now().Add(time.Hour)
+				state.OutboxMessages[msg.ID] = msg
+				return nil
+			}); err != nil {
+				t.Fatalf("persist future retry gate: %v", err)
+			}
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("MigrateLargeStateToSQLite: %v", err)
+				}
+			}
+			before, err := store.OutboxMessageByID(ctx, "outbox:future-retry-gate")
+			if err != nil {
+				t.Fatalf("load gated outbox: %v", err)
+			}
+			if _, err := store.MarkOutboxSendAttempt(ctx, before.ID); !errors.Is(err, ErrOutboxSendNotClaimed) {
+				t.Fatalf("future-gated claim error = %v, want ErrOutboxSendNotClaimed", err)
+			}
+			after, err := store.OutboxMessageByID(ctx, before.ID)
+			if err != nil {
+				t.Fatalf("reload gated outbox: %v", err)
+			}
+			if after.Status != OutboxStatusQueued || !after.NextAttemptAt.After(time.Now()) {
+				t.Fatalf("future retry gate changed during rejected claim: %#v", after)
+			}
+		})
+	}
+}
+
 func TestPendingOutboxMovesStaleSendingMessageToRecoveryLane(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
@@ -17778,7 +18378,7 @@ func TestRecordOwnerHeartbeatDoesNotWaitBehindFullStateUpdate(t *testing.T) {
 	case <-entered:
 	case err := <-updateDone:
 		t.Fatalf("full state update returned before reaching the blocking hook: %v", err)
-	case <-time.After(time.Second):
+	case <-time.After(storeConcurrentTestTimeout(time.Second)):
 		t.Fatal("full state update did not reach the blocking hook")
 	}
 
@@ -21789,15 +22389,16 @@ func newTestStore(t *testing.T) *Store {
 	return store
 }
 
-// newSQLiteTestStore creates a minimal, current-schema SQLite store without
-// exercising the legacy migration path.  Backend contract tests should not
-// make migration, pointer publication, and owner admission one timing
-// sensitive operation: migration has its own durability and recovery tests,
-// while the contract tests need a stable SQLite backend to exercise their
-// transaction semantics.  Building the fixture in one transaction keeps the
-// backend boundary real (including the SQLite connection and projections)
-// without making every owner-fencing assertion pay the migration's full
-// filesystem flush cost on hosted Windows runners.
+// newSQLiteTestStore creates a minimal current-schema SQLite store without
+// exercising the legacy migration path. Backend contract tests should not make
+// migration, pointer publication, and owner admission one timing-sensitive
+// operation: migration has its own durability and recovery tests, while the
+// contract tests need a stable SQLite backend to exercise transaction
+// semantics. Prepare the empty schema before inserting fixture rows so the
+// compatibility backfill has no legacy rows to scan. Keep the prepared handle
+// attached to the Store: closing and reopening it through Store.Load repeats
+// compatibility validation and turns this short owner-admission contract into
+// a long filesystem-sensitive test, especially under -race.
 func newSQLiteTestStore(t *testing.T) *Store {
 	t.Helper()
 	store := newTestStore(t)
@@ -21816,6 +22417,10 @@ func newSQLiteTestStore(t *testing.T) *Store {
 		_ = db.Close()
 		t.Fatalf("create sqlite test fixture schema: %v", err)
 	}
+	if err := ensureSQLiteSchemaContext(ctx, db); err != nil {
+		_ = db.Close()
+		t.Fatalf("prepare sqlite test fixture schema: %v", err)
+	}
 	if err := insertOfficialReleaseSQLiteStateForTest(db, state); err != nil {
 		_ = db.Close()
 		t.Fatalf("insert sqlite test fixture state: %v", err)
@@ -21824,14 +22429,14 @@ func newSQLiteTestStore(t *testing.T) *Store {
 		_ = db.Close()
 		t.Fatalf("checkpoint sqlite test fixture: %v", err)
 	}
-	if err := db.Close(); err != nil {
-		t.Fatalf("close sqlite test fixture: %v", err)
-	}
 	writeSQLitePointerForTest(t, store, storeSQLiteFileName)
+	store.sqliteRuntimeMu.Lock()
+	store.sqliteDB = db
+	store.sqliteDBPath = dbPath
+	store.sqliteSchemaReadyPath = dbPath
+	store.sqliteSchemaContractPath = dbPath
+	store.sqliteRuntimeMu.Unlock()
 	testphase.Emit("fixture_ready", map[string]string{"backend": "sqlite", "path": dbPath})
-	if _, err := store.Load(ctx); err != nil {
-		t.Fatalf("load sqlite test fixture through store: %v", err)
-	}
 	return store
 }
 

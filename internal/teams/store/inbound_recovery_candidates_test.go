@@ -1,0 +1,184 @@
+package store
+
+import (
+	"context"
+	"fmt"
+	"reflect"
+	"testing"
+	"time"
+)
+
+func TestInboundRecoveryCandidatesAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 11, 12, 0, 0, 0, time.UTC)
+	for _, useSQLite := range []bool{false, true} {
+		useSQLite := useSQLite
+		t.Run(map[bool]string{false: "json", true: "sqlite"}[useSQLite], func(t *testing.T) {
+			store := newTestStore(t)
+			if err := store.Update(ctx, func(state *State) error {
+				state.Turns["turn-linked-terminal"] = Turn{ID: "turn-linked-terminal", Status: TurnStatusCompleted, CreatedAt: now}
+				state.InboundEvents["deferred-linked"] = InboundEvent{
+					ID: "deferred-linked", TeamsChatID: "chat-a", TeamsMessageID: "message-1",
+					Status: InboundStatusDeferred, TurnID: "turn-linked-terminal", CreatedAt: now,
+				}
+				state.InboundEvents["deferred-unlinked"] = InboundEvent{
+					ID: "deferred-unlinked", TeamsChatID: "chat-a", TeamsMessageID: "message-2",
+					Status: InboundStatusDeferred, CreatedAt: now.Add(time.Second),
+				}
+				state.InboundEvents["deferred-due"] = InboundEvent{
+					ID: "deferred-due", TeamsChatID: "chat-a", TeamsMessageID: "message-2b",
+					Status: InboundStatusDeferred, NextAttemptAt: time.Now().Add(-time.Second), CreatedAt: now.Add(1500 * time.Millisecond),
+				}
+				state.InboundEvents["deferred-future"] = InboundEvent{
+					ID: "deferred-future", TeamsChatID: "chat-a", TeamsMessageID: "message-2c",
+					Status: InboundStatusDeferred, NextAttemptAt: time.Now().Add(time.Hour), CreatedAt: now.Add(1500 * time.Millisecond),
+				}
+				state.InboundEvents["persisted-orphan"] = InboundEvent{
+					ID: "persisted-orphan", TeamsChatID: "chat-b", TeamsMessageID: "message-3",
+					Status: InboundStatusPersisted, CreatedAt: now.Add(2 * time.Second),
+				}
+				state.InboundEvents["queued-orphan"] = InboundEvent{
+					ID: "queued-orphan", TeamsChatID: "chat-b", TeamsMessageID: "message-4",
+					Status: InboundStatusQueued, CreatedAt: now.Add(3 * time.Second),
+				}
+				state.InboundEvents["persisted-linked"] = InboundEvent{
+					ID: "persisted-linked", TeamsChatID: "chat-c", TeamsMessageID: "message-5",
+					Status: InboundStatusPersisted, TurnID: "turn-linked-terminal", CreatedAt: now.Add(4 * time.Second),
+				}
+				state.InboundEvents["queued-linked"] = InboundEvent{
+					ID: "queued-linked", TeamsChatID: "chat-c", TeamsMessageID: "message-6",
+					Status: InboundStatusQueued, TurnID: "turn-linked-terminal", CreatedAt: now.Add(5 * time.Second),
+				}
+				state.InboundEvents["ignored-orphan"] = InboundEvent{
+					ID: "ignored-orphan", TeamsChatID: "chat-d", TeamsMessageID: "message-7",
+					Status: InboundStatusIgnored, CreatedAt: now.Add(6 * time.Second),
+				}
+				state.InboundEvents["registry-migration"] = InboundEvent{
+					ID: "registry-migration", TeamsChatID: "chat-e", TeamsMessageID: "message-8",
+					Source: "registry_migration", Status: InboundStatusPersisted, CreatedAt: now.Add(7 * time.Second),
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed inbound recovery candidates: %v", err)
+			}
+			if useSQLite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+
+			fullLoads := 0
+			previousHook := sqliteStateLoadTestHook
+			if useSQLite {
+				sqliteStateLoadTestHook = func() { fullLoads++ }
+				t.Cleanup(func() { sqliteStateLoadTestHook = previousHook })
+			}
+			got, err := store.InboundRecoveryCandidates(ctx)
+			if err != nil {
+				t.Fatalf("InboundRecoveryCandidates: %v", err)
+			}
+			ids := make([]string, 0, len(got))
+			for _, event := range got {
+				ids = append(ids, event.ID)
+			}
+			want := []string{"deferred-linked", "deferred-unlinked", "deferred-due", "persisted-orphan", "queued-orphan"}
+			if !reflect.DeepEqual(ids, want) {
+				t.Fatalf("InboundRecoveryCandidates ids = %#v, want %#v", ids, want)
+			}
+			if useSQLite && fullLoads != 0 {
+				t.Fatalf("SQLite recovery candidate query invoked full loader %d time(s)", fullLoads)
+			}
+		})
+	}
+}
+
+func TestInboundRecoveryCandidateDoesNotAdmitUnknownStatus(t *testing.T) {
+	for _, status := range []InboundStatus{"", "unknown", InboundStatusIgnored} {
+		t.Run(fmt.Sprintf("status=%q", status), func(t *testing.T) {
+			if inboundRecoveryCandidate(InboundEvent{Status: status}) {
+				t.Fatalf("inboundRecoveryCandidate(%q) = true, want false", status)
+			}
+		})
+	}
+}
+
+func TestSQLiteInboundRecoveryFutureGatesDoNotHideDueRows(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := store.Update(ctx, func(state *State) error {
+		state.InboundEvents["inbound:due"] = InboundEvent{
+			ID: "inbound:due", TeamsChatID: "chat-due", TeamsMessageID: "message-due",
+			Status: InboundStatusDeferred, CreatedAt: now, UpdatedAt: now,
+		}
+		for i := 0; i < 256; i++ {
+			id := fmt.Sprintf("inbound:future:%03d", i)
+			state.InboundEvents[id] = InboundEvent{
+				ID: id, TeamsChatID: "chat-future", TeamsMessageID: id,
+				Status: InboundStatusDeferred, NextAttemptAt: now.Add(24 * time.Hour),
+				CreatedAt: now.Add(time.Duration(i+1) * time.Millisecond), UpdatedAt: now,
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed future-gated inbound rows: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+
+	candidates, err := store.InboundRecoveryCandidates(ctx)
+	if err != nil {
+		t.Fatalf("InboundRecoveryCandidates: %v", err)
+	}
+	if len(candidates) != 1 || candidates[0].ID != "inbound:due" {
+		t.Fatalf("future-gated recovery candidates = %#v, want only due row", candidates)
+	}
+}
+
+func TestInboundRecoveryRetryGateSurvivesSQLiteReopen(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	future := time.Now().UTC().Add(time.Hour)
+	event := InboundEvent{
+		ID: "deferred-retry-restart", TeamsChatID: "retry-chat", TeamsMessageID: "retry-message",
+		Status: InboundStatusDeferred, NextAttemptAt: future, FailureCount: 3,
+		LastError: "Graph GET failed: HTTP 429 Too Many Requests", CreatedAt: time.Now().UTC(),
+	}
+	if err := store.Update(ctx, func(state *State) error {
+		state.InboundEvents[event.ID] = event
+		return nil
+	}); err != nil {
+		t.Fatalf("seed deferred retry row: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	path := store.Path()
+	if err := store.Close(); err != nil {
+		t.Fatalf("close before deferred retry restart: %v", err)
+	}
+	reopened, err := Open(path)
+	if err != nil {
+		t.Fatalf("reopen deferred retry store: %v", err)
+	}
+	t.Cleanup(func() { _ = reopened.Close() })
+
+	candidates, err := reopened.InboundRecoveryCandidates(ctx)
+	if err != nil {
+		t.Fatalf("future-gated candidates after reopen: %v", err)
+	}
+	if len(candidates) != 0 {
+		t.Fatalf("future-gated candidates after reopen = %#v, want none", candidates)
+	}
+	if _, _, err := reopened.UpdateInboundEvent(ctx, event.ID, func(current InboundEvent, found bool, now time.Time) (InboundEvent, bool, error) {
+		if !found {
+			t.Fatalf("deferred retry row disappeared after reopen")
+		}
+		current.NextAttemptAt = time.Time{}
+		return current, true, nil
+	}); err != nil {
+		t.Fatalf("open retry gate: %v", err)
+	}
+	candidates, err = reopened.InboundRecoveryCandidates(ctx)
+	if err != nil {
+		t.Fatalf("due candidates after reopen: %v", err)
+	}
+	if len(candidates) != 1 || candidates[0].ID != event.ID || candidates[0].FailureCount != event.FailureCount || candidates[0].LastError != event.LastError {
+		t.Fatalf("due candidates after reopen = %#v, want persisted retry metadata", candidates)
+	}
+}

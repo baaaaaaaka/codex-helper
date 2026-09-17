@@ -100,9 +100,14 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 	recoveryJob := workflowJobBlock(t, workflow, "teams-recovery-test")
 	requireStepContains(t, recoveryJob,
 		"name: Teams transcript recovery (${{ matrix.os }} / ${{ matrix.mode }} / partition ${{ matrix.partition }})",
-		`partition_flags=("-partition-count=1" "-partition-index=0")`,
 		`partition_flags=("-partition-count=2" "-partition-index=${{ matrix.partition }}")`,
 	)
+	if strings.Contains(recoveryJob, `partition_flags=("-partition-count=1" "-partition-index=0")`) {
+		t.Fatal("Teams recovery still contains an unsplit Unix partition fallback")
+	}
+	if strings.Count(recoveryJob, `partition_flags=("-partition-count=2"`) != 2 {
+		t.Fatalf("Teams recovery normal and race steps must both select the matrix partition")
+	}
 
 	windowsLifecycle := workflowJobBlock(t, workflow, "windows-proxy-lifecycle")
 	requireStepContains(t, windowsLifecycle,
@@ -121,11 +126,21 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 	requireStepContains(t, linuxCoverage,
 		"if: runner.os == 'Linux'",
 		"shell: bash",
+		"bash scripts/ci/run_linux_full_go_test_collect.sh",
+	)
+	collectorData, err := os.ReadFile("scripts/ci/run_linux_full_go_test_collect.sh")
+	if err != nil {
+		t.Fatalf("read Linux full-test collector: %v", err)
+	}
+	collector := string(collectorData)
+	requireStepContains(t, collector,
 		"frontier_recovery_pattern='^TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover$'",
 		"migration_process_pattern='^TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup$'",
-		"go test -timeout=20m -parallel=16 -skip \"$isolated_skip_pattern\" -coverprofile=coverage.out ./...",
-		"go test ./internal/teams -timeout=2m -parallel=16 -count=1 -run \"$frontier_recovery_pattern\" -coverprofile=\"$isolated_profile\" -v",
-		"go test ./internal/cli -timeout=2m -parallel=16 -count=1 -run \"$migration_process_pattern\" -coverprofile=\"$migration_profile\" -v",
+		"test -timeout=20m -parallel=16 -skip \"$isolated_skip_pattern\" -coverprofile=\"$coverage_file\" ./...",
+		"test ./internal/teams -timeout=2m -parallel=16 -count=1 -run \"$frontier_recovery_pattern\"",
+		"test ./internal/cli -timeout=2m -parallel=16 -count=1 -run \"$migration_process_pattern\"",
+		"status=${PIPESTATUS[0]}",
+		"failures+=(\"$label\")",
 	)
 
 	nonLinuxTest := workflowStepBlock(t, fullJob, "go test (without coverage, non-Linux)")
@@ -151,9 +166,9 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 	raceJob := workflowJobBlock(t, workflow, "race-test")
 	requireStepContains(t, raceJob,
 		"name: Race test (ubuntu-latest / partition ${{ matrix.partition }})",
-		"partition: [0, 1, 2, 3]",
+		"partition: [0, 1, 2, 3, 4, 5, 6, 7]",
 		"timeout-minutes: 45",
-		"go run ./scripts/ci/run_full_go_test_shards.go -race -timeout=30m -parallel=16 -shards=16 -partition-count=4 -partition-index=\"${{ matrix.partition }}\"",
+		"go run ./scripts/ci/run_full_go_test_shards.go -race -timeout=30m -parallel=16 -shards=16 -partition-count=8 -partition-index=\"${{ matrix.partition }}\"",
 	)
 
 	distroJob := workflowJobBlock(t, workflow, "linux-distro-smoke")

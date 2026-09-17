@@ -197,12 +197,21 @@ func (b *Bridge) queueWorkflowNotificationForSentOutbox(ctx context.Context, out
 }
 
 func (b *Bridge) queueWorkflowNotificationForDetectedCodexAnswer(ctx context.Context, session *Session, sourceKey string) {
+	_ = b.queueWorkflowNotificationForDetectedCodexAnswerWithError(ctx, session, sourceKey)
+}
+
+// queueWorkflowNotificationForDetectedCodexAnswerWithError is the history
+// watcher variant of the detected-final notification path. The legacy wrapper
+// remains best-effort for callers that do not own a history cursor; HistoryWatch
+// itself must observe the error before recording the final checkpoint, or a
+// failed workflow card could be lost forever.
+func (b *Bridge) queueWorkflowNotificationForDetectedCodexAnswerWithError(ctx context.Context, session *Session, sourceKey string) error {
 	if b == nil || b.store == nil || session == nil {
-		return
+		return nil
 	}
 	sourceKey = strings.TrimSpace(sourceKey)
 	if sourceKey == "" || strings.TrimSpace(session.ChatID) == "" {
-		return
+		return nil
 	}
 	outboxID := "detected-codex-answer:" + shortStableID(session.ID+":"+sourceKey)
 	event, ok, err := b.workflowNotificationEventForOutbox(ctx, teamstore.OutboxMessage{
@@ -217,10 +226,10 @@ func (b *Bridge) queueWorkflowNotificationForDetectedCodexAnswer(ctx context.Con
 		if b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams workflow notification planning error: %v\n", err)
 		}
-		return
+		return err
 	}
 	if !ok {
-		return
+		return nil
 	}
 	event.ID = "workflow:detected-codex-answer:" + shortStableID(session.ID)
 	event.OutboxID = ""
@@ -229,8 +238,9 @@ func (b *Bridge) queueWorkflowNotificationForDetectedCodexAnswer(ctx context.Con
 		if b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams workflow notification queue error: %v\n", err)
 		}
-		return
+		return err
 	}
+	return nil
 }
 
 func (b *Bridge) queueDetectedCodexAnswerNotification(ctx context.Context, event WorkflowNotificationEvent) error {

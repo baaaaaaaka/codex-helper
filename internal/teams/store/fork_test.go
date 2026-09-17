@@ -367,6 +367,87 @@ func TestOwnedForkMutationStopsAfterLeaseTakeoverAndActivatedStaysFenced(t *test
 	}
 }
 
+func TestStageForkChatRejectsActiveTargetWithoutStealingAttempts(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		backend := "json"
+		if useSQLite {
+			backend = "sqlite"
+		}
+		t.Run(backend, func(t *testing.T) {
+			ctx := context.Background()
+			store := newTestStore(t)
+			const (
+				operationID  = "stage-fork-chat-fence"
+				childID      = "stage-fork-child"
+				oldChatID    = "stage-fork-old-chat"
+				targetChatID = "stage-fork-target-chat"
+			)
+			now := time.Now().UTC()
+			if err := store.Update(ctx, func(state *State) error {
+				state.Sessions[childID] = SessionContext{
+					ID: childID, Status: SessionStatusStaging, TeamsChatID: oldChatID, UpdatedAt: now,
+				}
+				state.ForkOperations[operationID] = ForkOperation{
+					ID: operationID, ChildSessionID: childID, Phase: ForkPhaseCodexForked, UpdatedAt: now,
+				}
+				state.ChatPolls[oldChatID] = ChatPollState{
+					ChatID: oldChatID, Seeded: true, PollState: chatPollStateWarm, UpdatedAt: now,
+				}
+				state.ChatPolls[targetChatID] = ChatPollState{
+					ChatID: targetChatID, Seeded: true, PollState: chatPollStateWarm, UpdatedAt: now,
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed StageForkChat fixture: %v", err)
+			}
+			if useSQLite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+
+			oldStarted, acquired, err := store.BeginChatPollAttempt(ctx, ChatPollAttemptRequest{
+				ChatID: oldChatID, Owner: "old-owner", ProcessIncarnation: "old-process", Now: now,
+			})
+			if err != nil || !acquired || oldStarted.Attempt == nil {
+				t.Fatalf("begin old attempt: acquired=%v poll=%#v err=%v", acquired, oldStarted, err)
+			}
+			targetStarted, acquired, err := store.BeginChatPollAttempt(ctx, ChatPollAttemptRequest{
+				ChatID: targetChatID, Owner: "target-owner", ProcessIncarnation: "target-process", Now: now,
+			})
+			if err != nil || !acquired || targetStarted.Attempt == nil {
+				t.Fatalf("begin target attempt: acquired=%v poll=%#v err=%v", acquired, targetStarted, err)
+			}
+
+			if _, err := store.StageForkChat(ctx, operationID, targetChatID, "https://teams.example/target", "target", "external", now, now.Add(time.Hour)); err == nil {
+				t.Fatal("StageForkChat stole an active target attempt")
+			}
+			unchangedOld, ok, err := store.ChatPoll(ctx, oldChatID)
+			if err != nil || !ok || unchangedOld.Attempt == nil || unchangedOld.Attempt.ID != oldStarted.Attempt.ID {
+				t.Fatalf("rejected stage changed old poll: ok=%v poll=%#v err=%v", ok, unchangedOld, err)
+			}
+			unchangedTarget, ok, err := store.ChatPoll(ctx, targetChatID)
+			if err != nil || !ok || unchangedTarget.Attempt == nil || unchangedTarget.Attempt.ID != targetStarted.Attempt.ID {
+				t.Fatalf("rejected stage changed target poll: ok=%v poll=%#v err=%v", ok, unchangedTarget, err)
+			}
+
+			if _, released, err := store.AbandonChatPollAttempt(ctx, targetChatID, targetStarted.Attempt.ID, targetStarted.PollRevision); err != nil || !released {
+				t.Fatalf("release target attempt: released=%v err=%v", released, err)
+			}
+			if _, err := store.StageForkChat(ctx, operationID, targetChatID, "https://teams.example/target", "target", "external", now, now.Add(time.Hour)); err != nil {
+				t.Fatalf("StageForkChat after target release: %v", err)
+			}
+			fencedOld, ok, err := store.ChatPoll(ctx, oldChatID)
+			if err != nil || !ok || fencedOld.Attempt != nil || fencedOld.PollRevision <= oldStarted.PollRevision {
+				t.Fatalf("successful stage did not fence old poll: ok=%v poll=%#v old=%#v err=%v", ok, fencedOld, oldStarted, err)
+			}
+			children, err := store.SessionContexts(ctx)
+			child := children[childID]
+			if err != nil || child.TeamsChatID != targetChatID || child.Status != SessionStatusAwaitingHistory {
+				t.Fatalf("staged child = %#v err=%v, want rebound awaiting-history child", child, err)
+			}
+		})
+	}
+}
+
 func TestForkHistoryRequiresSentProofBeforeActivation(t *testing.T) {
 	for _, sqliteMode := range []bool{false, true} {
 		t.Run(fmt.Sprintf("sqlite=%v", sqliteMode), func(t *testing.T) {

@@ -1,25 +1,33 @@
 package teams
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
 const (
-	dockerFixtureDirEnv   = "CXP_TEAMS_DOCKER_FIXTURE_DIR"
-	dockerRuntimeDirEnv   = "CXP_TEAMS_DOCKER_RUNTIME_DIR"
-	dockerRuntimeReuseEnv = "CXP_TEAMS_DOCKER_RUNTIME_REUSE"
-	dockerCodexMountEnv   = "CXP_TEAMS_DOCKER_CODEX_MOUNTED"
-	dockerCodexSourceEnv  = "CXP_TEAMS_DOCKER_CODEX_SOURCE_PREFIX"
-	dockerFixtureCodexDir = "/home/baka/.codex/"
+	dockerFixtureDirEnv          = "CXP_TEAMS_DOCKER_FIXTURE_DIR"
+	dockerRuntimeDirEnv          = "CXP_TEAMS_DOCKER_RUNTIME_DIR"
+	dockerRuntimeReuseEnv        = "CXP_TEAMS_DOCKER_RUNTIME_REUSE"
+	dockerCodexMountEnv          = "CXP_TEAMS_DOCKER_CODEX_MOUNTED"
+	dockerCodexSourceEnv         = "CXP_TEAMS_DOCKER_CODEX_SOURCE_PREFIX"
+	dockerSourceProofManifestEnv = "CXP_TEAMS_DOCKER_SOURCE_PROOF_MANIFEST"
+	dockerFixtureCodexDir        = "/home/baka/.codex/"
 )
 
 // dockerTeamsFixtureRoot is intentionally opt-in. The fixture contains a
@@ -48,6 +56,33 @@ func dockerTeamsFixtureRoot(t *testing.T) string {
 		}
 		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
 			t.Fatalf("Docker fixture file %q is not a regular file", name)
+		}
+	}
+	// A copied Codex session necessarily has a new inode/path.  When the
+	// Docker runner opts into source-proof rebinding, require the immutable
+	// manifest to live inside the same read-only fixture tree.  Accepting an
+	// arbitrary host path here would make a source-proof result depend on a
+	// mutable file outside the snapshot and would turn a missing manifest into
+	// an accidental fail-open diagnostic.
+	if manifestPath := strings.TrimSpace(os.Getenv(dockerSourceProofManifestEnv)); manifestPath != "" {
+		manifestInfo, err := os.Lstat(manifestPath)
+		if err != nil {
+			t.Fatalf("Docker source-proof manifest: %v", err)
+		}
+		if manifestInfo.Mode()&os.ModeSymlink != 0 || !manifestInfo.Mode().IsRegular() {
+			t.Fatalf("Docker source-proof manifest is not a regular file: %q", manifestPath)
+		}
+		rootAbs, err := filepath.Abs(root)
+		if err != nil {
+			t.Fatalf("resolve Docker fixture root: %v", err)
+		}
+		manifestAbs, err := filepath.Abs(manifestPath)
+		if err != nil {
+			t.Fatalf("resolve Docker source-proof manifest: %v", err)
+		}
+		relative, err := filepath.Rel(rootAbs, manifestAbs)
+		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			t.Fatalf("Docker source-proof manifest must be inside fixture root %q: %q", rootAbs, manifestAbs)
 		}
 	}
 	sessionsPath := filepath.Join(root, "codex", "sessions")
@@ -236,6 +271,26 @@ func dockerFixtureRemapCodexPaths(t *testing.T, store *teamstore.Store) {
 		sourcePrefix = dockerFixtureCodexDir
 	}
 	canonicalHome := strings.TrimSuffix(filepath.Clean(filepath.FromSlash(dockerFixtureCodexDir)), string(filepath.Separator))
+	if dockerFixtureCodexHomeIsMounted(sourcePrefix, canonicalHome) {
+		// The runner mounts the copied Codex tree at the exact persisted path.
+		// Rewriting every State row here would only change paths to identical
+		// values, but store.Update would first load and then rewrite the entire
+		// 864MB SQLite projection. Keep the safety mutations narrow and make the
+		// path-preserving case explicit instead of silently weakening the generic
+		// remapper below.
+		dockerFixtureSanitizeMountedStore(t, store)
+		scope, err := store.ReadScope(context.Background())
+		if err != nil {
+			t.Fatalf("read mounted Docker fixture scope: %v", err)
+		}
+		if strings.TrimSpace(scope.ConfigPath) != "" {
+			scope.ConfigPath = ""
+			if err := store.RebindScopeForMigration(context.Background(), scope); err != nil {
+				t.Fatalf("clear mounted Docker fixture scope config path: %v", err)
+			}
+		}
+		return
+	}
 	mapPath := func(path string, allowHome bool) (string, error) {
 		path = strings.TrimSpace(path)
 		if path == "" {
@@ -380,6 +435,637 @@ func dockerFixtureRemapCodexPaths(t *testing.T, store *teamstore.Store) {
 	}
 }
 
+func dockerFixtureCodexHomeIsMounted(sourcePrefix string, canonicalHome string) bool {
+	if os.Getenv(dockerCodexMountEnv) != "1" {
+		return false
+	}
+	return filepath.Clean(filepath.FromSlash(strings.TrimSpace(sourcePrefix))) == filepath.Clean(filepath.FromSlash(canonicalHome))
+}
+
+// dockerFixtureSanitizeMountedStore applies only the disposable safety fences
+// that are still needed when persisted Codex paths already match the container
+// mount. It intentionally avoids Store.Update: that API materializes every
+// split table before writing it back and is unsuitable for a real-data fixture.
+func dockerFixtureSanitizeMountedStore(t *testing.T, store *teamstore.Store) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := store.UpdateWorkflowConfig(ctx, func(current teamstore.WorkflowNotificationConfig, _ teamstore.ControlChatBinding, _ time.Time) (teamstore.WorkflowNotificationConfig, bool, error) {
+		next := current
+		changed := next.Enabled || strings.TrimSpace(next.ControlWebhookURLFile) != ""
+		next.Enabled = false
+		next.ControlWebhookURLFile = ""
+		return next, changed, nil
+	}); err != nil {
+		t.Fatalf("disable workflow in mounted Docker fixture: %v", err)
+	}
+	if err := store.UpdateDashboardRecords(ctx, func(records *teamstore.DashboardStoreRecords, _ time.Time) (bool, error) {
+		changed := false
+		for id, workspace := range records.Workspaces {
+			if workspace.Path == "" {
+				continue
+			}
+			workspace.Path = ""
+			records.Workspaces[id] = workspace
+			changed = true
+		}
+		return changed, nil
+	}); err != nil {
+		t.Fatalf("clear workspaces in mounted Docker fixture: %v", err)
+	}
+
+	dbPath := filepath.Join(filepath.Dir(store.Path()), teamstore.SQLiteFileName)
+	query := url.Values{}
+	query.Set("mode", "rw")
+	db, err := sql.Open("sqlite", teamsSQLiteFileURI(dbPath, query))
+	if err != nil {
+		t.Fatalf("open mounted Docker fixture SQLite session projection: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close mounted Docker fixture SQLite session projection: %v", err)
+		}
+	})
+	if _, err := db.ExecContext(ctx, `PRAGMA busy_timeout = 5000`); err != nil {
+		t.Fatalf("configure mounted Docker fixture SQLite session projection: %v", err)
+	}
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin mounted Docker fixture session sanitization: %v", err)
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT id, json FROM sessions`)
+	if err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("read mounted Docker fixture sessions: %v", err)
+	}
+	type sessionJSONUpdate struct {
+		id  string
+		raw []byte
+	}
+	updates := make([]sessionJSONUpdate, 0)
+	for rows.Next() {
+		var update sessionJSONUpdate
+		if err := rows.Scan(&update.id, &update.raw); err != nil {
+			_ = rows.Close()
+			_ = tx.Rollback()
+			t.Fatalf("scan mounted Docker fixture session: %v", err)
+		}
+		var object map[string]json.RawMessage
+		if err := json.Unmarshal(update.raw, &object); err != nil {
+			_ = rows.Close()
+			_ = tx.Rollback()
+			t.Fatalf("decode mounted Docker fixture session %q: %v", update.id, err)
+		}
+		if _, ok := object["cwd"]; !ok {
+			continue
+		}
+		delete(object, "cwd")
+		update.raw, err = json.Marshal(object)
+		if err != nil {
+			_ = rows.Close()
+			_ = tx.Rollback()
+			t.Fatalf("encode mounted Docker fixture session %q: %v", update.id, err)
+		}
+		updates = append(updates, update)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		_ = tx.Rollback()
+		t.Fatalf("read mounted Docker fixture sessions: %v", err)
+	}
+	if err := rows.Close(); err != nil {
+		_ = tx.Rollback()
+		t.Fatalf("close mounted Docker fixture sessions: %v", err)
+	}
+	for _, update := range updates {
+		if _, err := tx.ExecContext(ctx, `UPDATE sessions SET json = ? WHERE id = ?`, update.raw, update.id); err != nil {
+			_ = tx.Rollback()
+			t.Fatalf("clear mounted Docker fixture session %q workspace: %v", update.id, err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("commit mounted Docker fixture session sanitization: %v", err)
+	}
+}
+
+// dockerFixtureSourceProofContentMatches verifies a bounded proof against the
+// immutable source-proof manifest assembled by the shell runner. Production
+// transcript fingerprints intentionally include physical file identity; a
+// copied Docker fixture necessarily has a different inode, so the manifest
+// proves the source bytes before this test helper replaces the physical
+// identity with the destination identity. If no manifest is configured, the
+// historical strict fingerprint comparison remains in force for unit tests.
+func dockerFixtureSourceProofContentMatches(path string, start, end int64) (bool, error) {
+	manifestPath := strings.TrimSpace(os.Getenv(dockerSourceProofManifestEnv))
+	if manifestPath == "" {
+		return false, nil
+	}
+	if start < 0 || end < start {
+		return false, fmt.Errorf("invalid source proof range [%d,%d)", start, end)
+	}
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return false, fmt.Errorf("read Docker source-proof manifest %q: %w", manifestPath, err)
+	}
+	key := filepath.ToSlash(filepath.Clean(path))
+	var expected string
+	found := false
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		fields := strings.Split(line, "\t")
+		if len(fields) != 4 {
+			return false, fmt.Errorf("invalid Docker source-proof manifest line %q", line)
+		}
+		if filepath.ToSlash(filepath.Clean(fields[0])) != key {
+			continue
+		}
+		manifestStart, startErr := strconv.ParseInt(fields[1], 10, 64)
+		manifestEnd, endErr := strconv.ParseInt(fields[2], 10, 64)
+		if startErr != nil || endErr != nil || manifestStart < 0 || manifestEnd < manifestStart {
+			return false, fmt.Errorf("invalid Docker source-proof manifest range for %q", fields[0])
+		}
+		if manifestStart != start || manifestEnd != end {
+			continue
+		}
+		candidate := strings.TrimSpace(fields[3])
+		candidate = strings.TrimPrefix(candidate, "sha256:")
+		if len(candidate) != sha256.Size*2 {
+			return false, fmt.Errorf("invalid Docker source-proof digest for %q [%d,%d)", key, start, end)
+		}
+		if _, decodeErr := hex.DecodeString(candidate); decodeErr != nil {
+			return false, fmt.Errorf("invalid Docker source-proof digest for %q [%d,%d): %w", key, start, end, decodeErr)
+		}
+		if found && expected != candidate {
+			return false, fmt.Errorf("conflicting Docker source-proof manifest entries for %q [%d,%d)", key, start, end)
+		}
+		expected = candidate
+		found = true
+	}
+	if !found || expected == "" {
+		return false, fmt.Errorf("Docker source-proof manifest has no entry for %q [%d,%d)", key, start, end)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return false, err
+	}
+	if info.IsDir() || info.Size() < end {
+		return false, fmt.Errorf("source proof range [%d,%d) exceeds copied file %q size %d", start, end, path, info.Size())
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	h := sha256.New()
+	_, copyErr := io.Copy(h, io.NewSectionReader(f, start, end-start))
+	closeErr := f.Close()
+	if copyErr != nil {
+		return false, copyErr
+	}
+	if closeErr != nil {
+		return false, closeErr
+	}
+	actual := hex.EncodeToString(h.Sum(nil))
+	return actual == expected, nil
+}
+
+func dockerFixtureSourceProofPrefixRange(offset int64) (int64, int64) {
+	start := offset - transcriptCheckpointFingerprintBytes
+	if start < 0 {
+		start = 0
+	}
+	return start, offset
+}
+
+// dockerFixtureSourceFileProof rebuilds a bounded cursor proof against the
+// copied file. The fixture runner copies the bytes to a new inode, so keeping
+// the source identity from the host would intentionally force a source-rewrite
+// recovery. The immutable manifest is the source-byte witness; the caller
+// still has to verify every range that it rebinds.
+func dockerFixtureSourceFileProof(path string, offset int64) (string, string, os.FileInfo, error) {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return "", "", nil, fmt.Errorf("source path is empty")
+	}
+	if offset < 0 {
+		return "", "", nil, fmt.Errorf("source proof offset is negative: %d", offset)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", "", nil, err
+	}
+	if info.IsDir() || info.Size() < offset {
+		return "", "", nil, fmt.Errorf("source proof offset %d exceeds file %q size %d", offset, path, info.Size())
+	}
+	identity, err := teamstore.SourceFileIdentityFromFileInfo(path, info)
+	if err != nil {
+		return "", "", nil, err
+	}
+	identity = strings.TrimSpace(identity)
+	if identity == "" {
+		return "", "", nil, fmt.Errorf("physical source identity is unavailable for %q", path)
+	}
+	fingerprint := strings.TrimSpace(transcriptCheckpointSourceFingerprint(path, offset))
+	if fingerprint == "" && offset > 0 {
+		return "", "", nil, fmt.Errorf("bounded source proof could not be rebuilt at offset %d for %q", offset, path)
+	}
+	if manifestPath := strings.TrimSpace(os.Getenv(dockerSourceProofManifestEnv)); manifestPath != "" {
+		start, end := dockerFixtureSourceProofPrefixRange(offset)
+		matched, err := dockerFixtureSourceProofContentMatches(path, start, end)
+		if err != nil {
+			return "", "", nil, err
+		}
+		if !matched {
+			return "", "", nil, fmt.Errorf("copied source proof bytes differ from manifest for %q [%d,%d)", path, start, end)
+		}
+	}
+	return identity, fingerprint, info, nil
+}
+
+func dockerFixtureRebindRangeProof(path string, start, end int64, existing string) (string, error) {
+	if strings.TrimSpace(existing) == "" {
+		return existing, nil
+	}
+	if start < 0 || end < start {
+		return "", fmt.Errorf("invalid source proof range [%d,%d)", start, end)
+	}
+	fingerprint := strings.TrimSpace(transcriptSourceRangeFingerprint(path, start, end))
+	if fingerprint == "" {
+		return "", fmt.Errorf("source proof range [%d,%d) is not present in copied file %q", start, end, path)
+	}
+	if existing = strings.TrimSpace(existing); existing != "" && fingerprint != existing {
+		if strings.TrimSpace(os.Getenv(dockerSourceProofManifestEnv)) == "" {
+			return "", fmt.Errorf("copied source proof range [%d,%d) differs from the original proof for %q", start, end, path)
+		}
+		matched, manifestErr := dockerFixtureSourceProofContentMatches(path, start, end)
+		if manifestErr != nil {
+			return "", manifestErr
+		}
+		if !matched {
+			return "", fmt.Errorf("copied source proof range [%d,%d) differs from the immutable manifest for %q", start, end, path)
+		}
+	}
+	return fingerprint, nil
+}
+
+func dockerFixtureRebindHistoryWatchCheckpoint(checkpoint *teamstore.HistoryWatchCheckpoint) error {
+	if checkpoint == nil {
+		return nil
+	}
+	path := strings.TrimSpace(checkpoint.Path)
+	var identity string
+	var info os.FileInfo
+	var err error
+	if path != "" {
+		var fingerprint string
+		identity, fingerprint, info, err = dockerFixtureSourceFileProof(path, maxInt64(0, checkpoint.Offset))
+		if err != nil {
+			return err
+		}
+		if !checkpoint.LegacySourceUnverified {
+			if existing := strings.TrimSpace(checkpoint.SourceFingerprint); existing != "" && fingerprint != existing && strings.TrimSpace(os.Getenv(dockerSourceProofManifestEnv)) == "" {
+				return fmt.Errorf("copied history checkpoint proof differs from the original proof for %q", path)
+			}
+			checkpoint.SourceGeneration = identity
+			if strings.TrimSpace(checkpoint.SourceFingerprint) != "" {
+				checkpoint.SourceFingerprint = fingerprint
+			}
+			checkpoint.SourceChangeTime = teamstore.SourceFileChangeTimeFromFileInfo(info)
+		}
+		if strings.TrimSpace(checkpoint.PartialSourceIdentity) != "" {
+			checkpoint.PartialSourceIdentity = identity
+			checkpoint.PartialSourceChangeTime = teamstore.SourceFileChangeTimeFromFileInfo(info)
+		}
+		if strings.TrimSpace(checkpoint.SourceRewriteRecoveryIdentity) != "" {
+			checkpoint.SourceRewriteRecoveryIdentity = identity
+		}
+	}
+	if checkpoint.PendingHistoryRange != nil {
+		r := checkpoint.PendingHistoryRange
+		rangePath := firstNonEmptyString(r.SourcePath, path)
+		if rangePath == "" {
+			return fmt.Errorf("history pending range has no source path")
+		}
+		rangeIdentity, _, _, rangeErr := dockerFixtureSourceFileProof(rangePath, r.StartOffset)
+		if rangeErr != nil {
+			return rangeErr
+		}
+		r.SourceGeneration = rangeIdentity
+		r.RangeFingerprint, err = dockerFixtureRebindRangeProof(rangePath, r.StartOffset, r.ExclusiveEnd, r.RangeFingerprint)
+		if err != nil {
+			return err
+		}
+	}
+	if checkpoint.ContextGap != nil {
+		if path == "" {
+			return fmt.Errorf("history context gap has no checkpoint source path")
+		}
+		gap := checkpoint.ContextGap
+		gap.SourceGeneration = identity
+		gap.RangeFingerprint, err = dockerFixtureRebindRangeProof(path, gap.StartOffset, gap.ExclusiveEndOffset, gap.RangeFingerprint)
+		if err != nil {
+			return err
+		}
+	}
+	if checkpoint.TranscriptQuarantine != nil {
+		q := checkpoint.TranscriptQuarantine
+		qPath := firstNonEmptyString(q.SourcePath, path)
+		if qPath == "" {
+			return fmt.Errorf("history quarantine has no source path")
+		}
+		qIdentity, qFingerprint, _, qErr := dockerFixtureSourceFileProof(qPath, q.FrontierOffset)
+		if qErr != nil {
+			return qErr
+		}
+		q.SourceGeneration = qIdentity
+		if strings.TrimSpace(q.SourceFingerprint) != "" && strings.TrimSpace(os.Getenv(dockerSourceProofManifestEnv)) == "" {
+			if strings.TrimSpace(q.SourceFingerprint) != qFingerprint {
+				return fmt.Errorf("copied history quarantine proof differs from the original proof for %q", qPath)
+			}
+			q.SourceFingerprint = qFingerprint
+		}
+		q.RangeFingerprint, err = dockerFixtureRebindRangeProof(qPath, q.FrontierOffset, q.ExclusiveEndOffset, q.RangeFingerprint)
+		if err != nil {
+			return err
+		}
+	}
+	if checkpoint.TerminalBoundary != nil {
+		if path == "" {
+			return fmt.Errorf("history terminal boundary has no checkpoint source path")
+		}
+		boundary := checkpoint.TerminalBoundary
+		boundary.SourceGeneration = identity
+		boundary.RangeFingerprint, err = dockerFixtureRebindRangeProof(path, boundary.StartOffset, boundary.ExclusiveEndOffset, boundary.RangeFingerprint)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func dockerFixtureRebindImportCheckpoint(checkpoint *teamstore.ImportCheckpoint) error {
+	if checkpoint == nil {
+		return nil
+	}
+	path := strings.TrimSpace(checkpoint.SourcePath)
+	var identity string
+	if path != "" {
+		var fingerprint string
+		var info os.FileInfo
+		var err error
+		identity, fingerprint, info, err = dockerFixtureSourceFileProof(path, maxInt64(0, checkpoint.LastOffset))
+		if err != nil {
+			return err
+		}
+		if !checkpoint.LegacySourceUnverified {
+			if existing := strings.TrimSpace(checkpoint.SourceFingerprint); existing != "" && fingerprint != existing && strings.TrimSpace(os.Getenv(dockerSourceProofManifestEnv)) == "" {
+				return fmt.Errorf("copied import checkpoint proof differs from the original proof for %q", path)
+			}
+			checkpoint.SourceGeneration = identity
+			if strings.TrimSpace(checkpoint.SourceFingerprint) != "" {
+				checkpoint.SourceFingerprint = fingerprint
+			}
+			checkpoint.SourceChangeTime = teamstore.SourceFileChangeTimeFromFileInfo(info)
+		}
+		if strings.TrimSpace(checkpoint.PartialSourceIdentity) != "" {
+			checkpoint.PartialSourceIdentity = identity
+			checkpoint.PartialSourceChangeTime = teamstore.SourceFileChangeTimeFromFileInfo(info)
+		}
+		if strings.TrimSpace(checkpoint.SourceRewriteRecoveryIdentity) != "" {
+			checkpoint.SourceRewriteRecoveryIdentity = identity
+		}
+	}
+	if checkpoint.PendingHistoryRange != nil {
+		r := checkpoint.PendingHistoryRange
+		rangePath := firstNonEmptyString(r.SourcePath, path)
+		rangeIdentity, _, _, err := dockerFixtureSourceFileProof(rangePath, r.StartOffset)
+		if err != nil {
+			return err
+		}
+		r.SourceGeneration = rangeIdentity
+		r.RangeFingerprint, err = dockerFixtureRebindRangeProof(rangePath, r.StartOffset, r.ExclusiveEnd, r.RangeFingerprint)
+		if err != nil {
+			return err
+		}
+	}
+	if checkpoint.ContextGap != nil {
+		if path == "" {
+			return fmt.Errorf("context gap has no checkpoint source path")
+		}
+		checkpoint.ContextGap.SourceGeneration = identity
+		var err error
+		checkpoint.ContextGap.RangeFingerprint, err = dockerFixtureRebindRangeProof(path, checkpoint.ContextGap.StartOffset, checkpoint.ContextGap.ExclusiveEndOffset, checkpoint.ContextGap.RangeFingerprint)
+		if err != nil {
+			return err
+		}
+	}
+	if checkpoint.TranscriptQuarantine != nil {
+		q := checkpoint.TranscriptQuarantine
+		qPath := firstNonEmptyString(q.SourcePath, path)
+		qIdentity, qFingerprint, _, err := dockerFixtureSourceFileProof(qPath, q.FrontierOffset)
+		if err != nil {
+			return err
+		}
+		q.SourceGeneration = qIdentity
+		if strings.TrimSpace(q.SourceFingerprint) != "" && strings.TrimSpace(os.Getenv(dockerSourceProofManifestEnv)) == "" {
+			if strings.TrimSpace(q.SourceFingerprint) != qFingerprint {
+				return fmt.Errorf("copied import quarantine proof differs from the original proof for %q", qPath)
+			}
+			q.SourceFingerprint = qFingerprint
+		}
+		q.RangeFingerprint, err = dockerFixtureRebindRangeProof(qPath, q.FrontierOffset, q.ExclusiveEndOffset, q.RangeFingerprint)
+		if err != nil {
+			return err
+		}
+	}
+	if checkpoint.TerminalBoundary != nil {
+		if path == "" {
+			return fmt.Errorf("terminal boundary has no checkpoint source path")
+		}
+		checkpoint.TerminalBoundary.SourceGeneration = identity
+		var err error
+		checkpoint.TerminalBoundary.RangeFingerprint, err = dockerFixtureRebindRangeProof(path, checkpoint.TerminalBoundary.StartOffset, checkpoint.TerminalBoundary.ExclusiveEndOffset, checkpoint.TerminalBoundary.RangeFingerprint)
+		if err != nil {
+			return err
+		}
+	}
+	if checkpoint.UnresolvedExecution != nil {
+		anchor := checkpoint.UnresolvedExecution
+		anchorPath := firstNonEmptyString(anchor.SourcePath, path)
+		if strings.TrimSpace(anchor.SourceFingerprint) != "" {
+			if anchorPath == "" {
+				return fmt.Errorf("unresolved execution anchor has no source path")
+			}
+			_, anchorFingerprint, _, err := dockerFixtureSourceFileProof(anchorPath, anchor.CutoffOffset)
+			if err != nil {
+				return err
+			}
+			// A copied Docker fixture cannot retain the production inode/path
+			// fingerprint. dockerFixtureSourceFileProof nevertheless validates the
+			// bounded bytes against the immutable manifest when one is configured.
+			// Without a manifest, retain the strict historical fingerprint check.
+			if strings.TrimSpace(os.Getenv(dockerSourceProofManifestEnv)) == "" && strings.TrimSpace(anchor.SourceFingerprint) != anchorFingerprint {
+				return fmt.Errorf("copied import execution anchor proof differs from the original proof for %q", anchorPath)
+			}
+			if strings.TrimSpace(os.Getenv(dockerSourceProofManifestEnv)) == "" {
+				anchor.SourceFingerprint = anchorFingerprint
+			}
+		}
+	}
+	return nil
+}
+
+// dockerFixtureVerifyOutboxSourceProofs checks source-bound outbox rows after
+// the copied Codex files have been assembled. Outbox proofs contain bounded
+// content fingerprints rather than a physical inode, so a correct copy keeps
+// the JSON unchanged; a sparse hole, truncated range, or wrong path must make
+// the fixture fail closed instead of being silently rebound to invented bytes.
+func dockerFixtureVerifyOutboxSourceProofs(t *testing.T, store *teamstore.Store) {
+	t.Helper()
+	if store == nil {
+		t.Fatal("cannot verify outbox source proofs on a nil Docker fixture store")
+	}
+	dbPath := filepath.Join(filepath.Dir(store.Path()), teamstore.SQLiteFileName)
+	query := url.Values{}
+	query.Set("mode", "ro")
+	db, err := sql.Open("sqlite", teamsSQLiteFileURI(dbPath, query))
+	if err != nil {
+		t.Fatalf("open copied Docker fixture for outbox source-proof verification: %v", err)
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	t.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close copied Docker fixture outbox source-proof reader: %v", err)
+		}
+	})
+	rows, err := db.QueryContext(context.Background(), `SELECT id, json FROM outbox_messages WHERE instr(CAST(json AS TEXT), '"transcript_source_path"') > 0 ORDER BY id`)
+	if err != nil {
+		t.Fatalf("read copied outbox source-proof rows: %v", err)
+	}
+	defer rows.Close()
+	verified := 0
+	for rows.Next() {
+		var id string
+		var raw []byte
+		if err := rows.Scan(&id, &raw); err != nil {
+			t.Fatalf("scan copied outbox source-proof row: %v", err)
+		}
+		var message teamstore.OutboxMessage
+		if err := json.Unmarshal(raw, &message); err != nil {
+			t.Fatalf("decode source-bound copied outbox %q: %v", id, err)
+		}
+		path := strings.TrimSpace(message.TranscriptSourcePath)
+		if path == "" {
+			t.Fatalf("source-bound copied outbox %q has an empty transcript source path", id)
+		}
+		if proof := strings.TrimSpace(message.TranscriptSourceProofFingerprint); proof != "" {
+			if !message.TranscriptSourceProofOffsetKnown || message.TranscriptSourceProofOffset < 0 {
+				t.Fatalf("source-bound copied outbox %q has an unusable prefix proof", id)
+			}
+			_, actual, _, err := dockerFixtureSourceFileProof(path, message.TranscriptSourceProofOffset)
+			if err != nil {
+				t.Fatalf("verify copied outbox %q prefix proof: %v", id, err)
+			}
+			if actual != proof && strings.TrimSpace(os.Getenv(dockerSourceProofManifestEnv)) == "" {
+				t.Fatalf("copied outbox %q prefix proof differs from source: got %q want %q", id, actual, proof)
+			}
+		}
+		if message.TranscriptSourceReadProofFingerprint != "" || message.TranscriptSourceReadProofRangeKnown {
+			if !message.TranscriptSourceReadProofRangeKnown || message.TranscriptSourceReadProofStartOffset < 0 ||
+				message.TranscriptSourceReadProofEndOffset < message.TranscriptSourceReadProofStartOffset ||
+				strings.TrimSpace(message.TranscriptSourceReadProofFingerprint) == "" {
+				t.Fatalf("source-bound copied outbox %q has an unusable read-range proof", id)
+			}
+			actual := strings.TrimSpace(transcriptSourceRangeFingerprint(path, message.TranscriptSourceReadProofStartOffset, message.TranscriptSourceReadProofEndOffset))
+			if actual == "" {
+				t.Fatalf("copied outbox %q read-range proof could not be rebuilt", id)
+			}
+			if actual != strings.TrimSpace(message.TranscriptSourceReadProofFingerprint) && strings.TrimSpace(os.Getenv(dockerSourceProofManifestEnv)) == "" {
+				t.Fatalf("copied outbox %q read-range proof differs from source: got %q want %q", id, actual, message.TranscriptSourceReadProofFingerprint)
+			}
+			if strings.TrimSpace(os.Getenv(dockerSourceProofManifestEnv)) != "" {
+				matched, err := dockerFixtureSourceProofContentMatches(path, message.TranscriptSourceReadProofStartOffset, message.TranscriptSourceReadProofEndOffset)
+				if err != nil || !matched {
+					t.Fatalf("copied outbox %q read-range bytes differ from immutable source manifest: matched=%t err=%v", id, matched, err)
+				}
+			}
+		}
+		verified++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate copied outbox source-proof rows: %v", err)
+	}
+	if verified == 0 {
+		t.Log("copied fixture contains no source-bound outbox rows")
+	}
+}
+
+// dockerFixtureRebindSourceProofs applies the destination file identity to
+// source-bound metadata in the disposable store. All byte ranges were included
+// in the shell fixture inventory before this helper runs; a missing range is an
+// error rather than a reason to manufacture a new proof over sparse zeros.
+func dockerFixtureRebindSourceProofs(t *testing.T, store *teamstore.Store) {
+	t.Helper()
+	if store == nil {
+		t.Fatal("cannot rebind source proofs on a nil Docker fixture store")
+	}
+	ctx := context.Background()
+	if err := store.UpdateHistoryWatch(ctx, func(history map[string]teamstore.HistoryWatchCheckpoint, _ *time.Time) error {
+		for id, checkpoint := range history {
+			if err := dockerFixtureRebindHistoryWatchCheckpoint(&checkpoint); err != nil {
+				return fmt.Errorf("history checkpoint %q: %w", id, err)
+			}
+			history[id] = checkpoint
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("rebind copied HistoryWatch source proofs: %v", err)
+	}
+	sessions, err := store.SessionContexts(ctx)
+	if err != nil {
+		t.Fatalf("load copied session IDs for source-proof rebind: %v", err)
+	}
+	sessionIDs := make([]string, 0, len(sessions))
+	for id := range sessions {
+		sessionIDs = append(sessionIDs, id)
+	}
+	checkpoints, err := store.ImportCheckpointsForSessions(ctx, sessionIDs)
+	if err != nil {
+		t.Fatalf("load copied ImportCheckpoint source proofs: %v", err)
+	}
+	for id, checkpoint := range checkpoints {
+		updated := checkpoint
+		if err := dockerFixtureRebindImportCheckpoint(&updated); err != nil {
+			t.Fatalf("rebind ImportCheckpoint %q source proofs: %v", id, err)
+		}
+		before, err := json.Marshal(checkpoint)
+		if err != nil {
+			t.Fatalf("encode original ImportCheckpoint %q: %v", id, err)
+		}
+		after, err := json.Marshal(updated)
+		if err != nil {
+			t.Fatalf("encode rebound ImportCheckpoint %q: %v", id, err)
+		}
+		if bytes.Equal(before, after) {
+			continue
+		}
+		if _, found, err := store.UpdateImportCheckpoint(ctx, id, func(current teamstore.ImportCheckpoint, found bool, _ time.Time) (teamstore.ImportCheckpoint, bool, error) {
+			if !found {
+				return current, false, nil
+			}
+			return updated, true, nil
+		}); err != nil {
+			t.Fatalf("persist rebound ImportCheckpoint %q: %v", id, err)
+		} else if !found {
+			t.Fatalf("ImportCheckpoint %q disappeared during source-proof rebind", id)
+		}
+	}
+}
+
 func dockerFixtureSanitizeRegistryWorkspacePaths(registry *Registry) {
 	if registry == nil {
 		return
@@ -518,6 +1204,15 @@ func dockerFixtureHistoryLag(t *testing.T, fixtureRoot string, state teamstore.S
 		if checkpoint.Offset < 0 {
 			t.Fatalf("negative durable Codex history offset for %q: %d", filePath, checkpoint.Offset)
 		}
+		if expected := strings.TrimSpace(checkpoint.SourceFingerprint); expected != "" {
+			_, actual, _, proofErr := dockerFixtureSourceFileProof(filePath, checkpoint.Offset)
+			if proofErr != nil {
+				t.Fatalf("verify copied Codex history proof for %q: %v", filePath, proofErr)
+			}
+			if actual != expected {
+				t.Fatalf("copied Codex history proof for %q = %q, want %q", filePath, actual, expected)
+			}
+		}
 		if extra := info.Size() - checkpoint.Offset; extra > 0 {
 			ahead++
 			extraBytes += extra
@@ -601,5 +1296,166 @@ func TestDockerFixtureSourcePathFailsClosedOutsideCopiedSessions(t *testing.T) {
 		if got := dockerFixtureSourcePath(fixtureRoot, path); got != "" {
 			t.Fatalf("unsafe copied session path %q mapped to %q", path, got)
 		}
+	}
+}
+
+func TestDockerFixtureRebindSourceProofRequiresMatchingCopiedBytes(t *testing.T) {
+	root := t.TempDir()
+	original := filepath.Join(root, "original.jsonl")
+	copied := filepath.Join(root, "copied.jsonl")
+	body := []byte("prefix record\nsecond record\n")
+	if err := os.WriteFile(original, body, 0o600); err != nil {
+		t.Fatalf("write original transcript: %v", err)
+	}
+	if err := os.WriteFile(copied, body, 0o600); err != nil {
+		t.Fatalf("write copied transcript: %v", err)
+	}
+	offset := int64(len("prefix record\n"))
+	originalIdentity, err := teamstore.SourceFileIdentity(original)
+	if err != nil {
+		t.Fatalf("read original transcript identity: %v", err)
+	}
+	originalInfo, err := os.Stat(original)
+	if err != nil {
+		t.Fatalf("stat original transcript: %v", err)
+	}
+	checkpoint := teamstore.HistoryWatchCheckpoint{
+		Path:              copied,
+		Offset:            offset,
+		SourceGeneration:  originalIdentity,
+		SourceFingerprint: transcriptCheckpointSourceFingerprint(original, offset),
+		Size:              originalInfo.Size(),
+	}
+	if checkpoint.SourceFingerprint == "" {
+		t.Fatal("original transcript proof is empty")
+	}
+	manifestPath := filepath.Join(root, "source-proof-manifest.tsv")
+	prefixDigest := sha256.Sum256(body[:offset])
+	manifest := fmt.Sprintf("%s\t0\t%d\t%s\n", filepath.ToSlash(filepath.Clean(copied)), offset, hex.EncodeToString(prefixDigest[:]))
+	if err := os.WriteFile(manifestPath, []byte(manifest), 0o600); err != nil {
+		t.Fatalf("write source-proof manifest: %v", err)
+	}
+	previousManifest, manifestWasSet := os.LookupEnv(dockerSourceProofManifestEnv)
+	if err := os.Setenv(dockerSourceProofManifestEnv, manifestPath); err != nil {
+		t.Fatalf("set source-proof manifest: %v", err)
+	}
+	t.Cleanup(func() {
+		if manifestWasSet {
+			_ = os.Setenv(dockerSourceProofManifestEnv, previousManifest)
+		} else {
+			_ = os.Unsetenv(dockerSourceProofManifestEnv)
+		}
+	})
+	if err := dockerFixtureRebindHistoryWatchCheckpoint(&checkpoint); err != nil {
+		t.Fatalf("rebind matching copied transcript proof: %v", err)
+	}
+	copiedIdentity, err := teamstore.SourceFileIdentity(copied)
+	if err != nil {
+		t.Fatalf("read copied transcript identity: %v", err)
+	}
+	if copiedIdentity == "" || checkpoint.SourceGeneration != copiedIdentity {
+		t.Fatalf("rebound source generation = %q, want copied identity %q", checkpoint.SourceGeneration, copiedIdentity)
+	}
+	if !historyWatchSourcePrefixMatches(copied, historyTieredFileStateFromHistoryWatch(checkpoint)) {
+		t.Fatal("rebound checkpoint did not pass the real source-prefix verifier")
+	}
+
+	if err := os.WriteFile(copied, []byte("rewritten prefix\nsecond record\n"), 0o600); err != nil {
+		t.Fatalf("rewrite copied transcript: %v", err)
+	}
+	unchanged := teamstore.HistoryWatchCheckpoint{
+		Path:              copied,
+		Offset:            offset,
+		SourceGeneration:  originalIdentity,
+		SourceFingerprint: checkpoint.SourceFingerprint,
+		Size:              int64(len("rewritten prefix\nsecond record\n")),
+	}
+	if err := dockerFixtureRebindHistoryWatchCheckpoint(&unchanged); err == nil {
+		t.Fatal("rebind accepted copied transcript with a changed bounded prefix")
+	}
+}
+
+func TestDockerFixtureRebindImportExecutionAnchorVerifiesManifestBytes(t *testing.T) {
+	root := t.TempDir()
+	original := filepath.Join(root, "original.jsonl")
+	copied := filepath.Join(root, "copied.jsonl")
+	body := []byte("prefix record\nsecond record\n")
+	if err := os.WriteFile(original, body, 0o600); err != nil {
+		t.Fatalf("write original transcript: %v", err)
+	}
+	if err := os.WriteFile(copied, body, 0o600); err != nil {
+		t.Fatalf("write copied transcript: %v", err)
+	}
+	offset := int64(len("prefix record\n"))
+	originalProof := transcriptCheckpointSourceFingerprint(original, offset)
+	if originalProof == "" {
+		t.Fatal("original execution-anchor proof is empty")
+	}
+	prefixDigest := sha256.Sum256(body[:offset])
+	manifestPath := filepath.Join(root, "source-proof-manifest.tsv")
+	manifest := fmt.Sprintf("%s\t0\t%d\t%s\n", filepath.ToSlash(filepath.Clean(copied)), offset, hex.EncodeToString(prefixDigest[:]))
+	if err := os.WriteFile(manifestPath, []byte(manifest), 0o600); err != nil {
+		t.Fatalf("write source-proof manifest: %v", err)
+	}
+	previousManifest, manifestWasSet := os.LookupEnv(dockerSourceProofManifestEnv)
+	if err := os.Setenv(dockerSourceProofManifestEnv, manifestPath); err != nil {
+		t.Fatalf("set source-proof manifest: %v", err)
+	}
+	t.Cleanup(func() {
+		if manifestWasSet {
+			_ = os.Setenv(dockerSourceProofManifestEnv, previousManifest)
+		} else {
+			_ = os.Unsetenv(dockerSourceProofManifestEnv)
+		}
+	})
+
+	checkpoint := teamstore.ImportCheckpoint{
+		SourcePath:        copied,
+		SourceFingerprint: originalProof,
+		LastOffset:        offset,
+		LastOffsetKnown:   true,
+		UnresolvedExecution: &teamstore.ExecutionAnchor{
+			SourcePath:        copied,
+			SourceFingerprint: originalProof,
+			CutoffOffset:      offset,
+			State:             "unresolved",
+		},
+	}
+	if err := dockerFixtureRebindImportCheckpoint(&checkpoint); err != nil {
+		t.Fatalf("matching copied unresolved execution anchor rejected: %v", err)
+	}
+
+	if err := os.WriteFile(copied, []byte("rewritten prefix\nsecond record\n"), 0o600); err != nil {
+		t.Fatalf("rewrite copied transcript: %v", err)
+	}
+	if err := dockerFixtureRebindImportCheckpoint(&checkpoint); err == nil {
+		t.Fatal("unresolved execution anchor accepted copied bytes that differ from immutable manifest")
+	}
+}
+
+func TestDockerFixtureSourceProofManifestRejectsInvalidDigest(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, "session.jsonl")
+	if err := os.WriteFile(path, []byte("record\n"), 0o600); err != nil {
+		t.Fatalf("write source-proof file: %v", err)
+	}
+	manifestPath := filepath.Join(root, "source-proof-manifest.tsv")
+	line := fmt.Sprintf("%s\t0\t1\tnot-a-sha256-digest\n", filepath.ToSlash(path))
+	if err := os.WriteFile(manifestPath, []byte(line), 0o600); err != nil {
+		t.Fatalf("write invalid source-proof manifest: %v", err)
+	}
+	previous, wasSet := os.LookupEnv(dockerSourceProofManifestEnv)
+	if err := os.Setenv(dockerSourceProofManifestEnv, manifestPath); err != nil {
+		t.Fatalf("set source-proof manifest: %v", err)
+	}
+	t.Cleanup(func() {
+		if wasSet {
+			_ = os.Setenv(dockerSourceProofManifestEnv, previous)
+		} else {
+			_ = os.Unsetenv(dockerSourceProofManifestEnv)
+		}
+	})
+	if matched, err := dockerFixtureSourceProofContentMatches(path, 0, 1); err == nil || matched {
+		t.Fatalf("invalid source-proof digest accepted: matched=%v err=%v", matched, err)
 	}
 }

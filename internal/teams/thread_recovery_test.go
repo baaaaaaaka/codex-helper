@@ -506,6 +506,90 @@ func TestRunQueuedTurnIsolatesLiveBranchFromUnresolvedHistoryOwner(t *testing.T)
 	}
 }
 
+func TestRunQueuedTurnContinuesOnDurableLiveBranchWithHistoricalCandidateAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			graph, _ := newBridgeTestGraph(t)
+			store := newBridgeTestStore(t)
+			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+			session := bridge.reg.SessionByID("s001")
+			seedThreadRecoverySession(t, store, session, "thread-old", "")
+			now := time.Now().UTC()
+			checkpointID := transcriptCheckpointID(session.ID)
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				state.ImportCheckpoints[checkpointID] = teamstore.ImportCheckpoint{
+					ID: checkpointID, SessionID: session.ID,
+					UnresolvedExecution: &teamstore.ExecutionAnchor{
+						SessionID: session.ID, ThreadID: "thread-old", OuterTurnID: "turn-old", CodexTurnID: "codex-old",
+						State: "unresolved", Generation: 13, CreatedAt: now, UpdatedAt: now,
+					},
+				}
+				state.Turns["turn-old"] = teamstore.Turn{
+					ID: "turn-old", SessionID: session.ID, Status: teamstore.TurnStatusInterrupted,
+					CodexThreadID: "thread-old", CodexTurnID: "codex-old", InterruptedAt: now,
+					RecoveryReason: recoveryReasonAmbiguousCodexExecutionPrefix + " old owner",
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed unresolved history owner: %v", err)
+			}
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate store to SQLite: %v", err)
+				}
+			}
+
+			first := seedQueuedThreadRecoveryTurn(t, store, session.ID, "turn-new-branch")
+			first.StartNewCodexThread = true
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				queued := state.Turns[first.ID]
+				queued.StartNewCodexThread = true
+				queued.CodexThreadID = ""
+				state.Turns[first.ID] = queued
+				return nil
+			}); err != nil {
+				t.Fatalf("mark first queued turn for isolated branch: %v", err)
+			}
+			firstExecutor := &recordingExecutor{result: ExecutionResult{
+				Text: "new branch answer", CodexThreadID: "thread-new", CodexTurnID: "codex-new",
+			}}
+			if err := bridge.runQueuedTurnInputWithExecutor(ctx, firstExecutor, session, first, session.ChatID, ExecutionInput{Prompt: "start isolated branch"}); err != nil {
+				t.Fatalf("run first isolated turn: %v", err)
+			}
+
+			second := seedQueuedThreadRecoveryTurn(t, store, session.ID, "turn-live-branch-followup")
+			secondExecutor := &recordingExecutor{result: ExecutionResult{
+				Text: "follow-up answer", CodexThreadID: "thread-new", CodexTurnID: "codex-followup",
+			}}
+			if err := bridge.runQueuedTurnInputWithExecutor(ctx, secondExecutor, session, second, session.ChatID, ExecutionInput{Prompt: "continue live branch"}); err != nil {
+				t.Fatalf("run follow-up on durable live branch: %v", err)
+			}
+			if len(secondExecutor.sessions) != 1 || secondExecutor.sessions[0].CodexThreadID != "thread-new" {
+				t.Fatalf("follow-up executor session = %#v, want durable live thread-new", secondExecutor.sessions)
+			}
+			state, err := store.Load(ctx)
+			if err != nil {
+				t.Fatalf("load final state: %v", err)
+			}
+			if got := state.Turns[second.ID].Status; got != teamstore.TurnStatusCompleted {
+				t.Fatalf("follow-up status = %q, want completed; turn=%#v", got, state.Turns[second.ID])
+			}
+			if reason := state.Turns[second.ID].RecoveryReason; strings.Contains(reason, "multiple candidate threads") {
+				t.Fatalf("follow-up was blocked by quarantined historical candidate: %q", reason)
+			}
+			anchor := state.ImportCheckpoints[checkpointID].UnresolvedExecution
+			if anchor == nil || anchor.LiveBranchThreadID != "thread-new" {
+				t.Fatalf("durable live branch after follow-up = %#v, want thread-new", anchor)
+			}
+		})
+	}
+}
+
 func TestBridgeAcceptsTeamsTurnOnFreshBranchAfterUnresolvedHistoryOwner(t *testing.T) {
 	ctx := context.Background()
 	graph, _ := newBridgeTestGraph(t)

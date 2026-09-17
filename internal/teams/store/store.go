@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -29,13 +30,13 @@ import (
 )
 
 const (
-	// SchemaVersion 10 is an intentional upgrade-only boundary. The durable
+	// SchemaVersion 11 is an intentional upgrade-only boundary. The durable
 	// Graph frontier, immutable pending-page receipt, poll attempt capability,
-	// revision fields, and post-send side-effect replay marker are safety data;
-	// helpers built against schema 9 or earlier do not know how to preserve all
-	// of them. A schema-10 store must therefore never be written by an older
-	// helper.
-	SchemaVersion = 10
+	// revision fields, post-send side-effect replay marker, and deferred inbound
+	// retry schedule are safety data; helpers built against schema 10 or earlier
+	// do not know how to preserve all of them. A schema-11 store must therefore
+	// never be written by an older helper.
+	SchemaVersion = 11
 
 	dirMode  os.FileMode = 0o700
 	fileMode os.FileMode = 0o600
@@ -91,6 +92,18 @@ var ErrUnresolvedExecution = errors.New("Codex execution ownership is unresolved
 
 var ErrTranscriptObservationConflict = errors.New("transcript observation conflict")
 
+// ErrTranscriptDeliveryPending means an explicit replay found an automatic
+// transcript delivery that has not reached a terminal durable disposition yet.
+// Reusing it would either advance the explicit checkpoint before the original
+// send settles or issue a second POST while the first result is unknown.
+var ErrTranscriptDeliveryPending = errors.New("transcript delivery is still pending")
+
+// ErrTranscriptDeliveryNeedsAttention means an automatic replay encountered a
+// transcript row whose provider rejection is durable but not repairable by an
+// implicit retry.  The caller must leave the source checkpoint untouched and
+// wait for an explicit history repair.
+var ErrTranscriptDeliveryNeedsAttention = errors.New("transcript delivery needs explicit attention")
+
 type InboundStatus string
 
 const (
@@ -117,6 +130,10 @@ const (
 	TranscriptDeliveryStatusAccepted TranscriptDeliveryStatus = "accepted"
 	TranscriptDeliveryStatusSent     TranscriptDeliveryStatus = "sent"
 	TranscriptDeliveryStatusSkipped  TranscriptDeliveryStatus = "skipped"
+	// NeedsAttention is a durable provider-rejection disposition. It is not
+	// equivalent to Sent or an intentional local skip: automatic import must
+	// not silently dedupe the source record after a permanent Graph 4xx.
+	TranscriptDeliveryStatusNeedsAttention TranscriptDeliveryStatus = "needs_attention"
 )
 
 type HelperDeliveryStatus string
@@ -134,15 +151,81 @@ const (
 	MessageOriginHelperOutbox    = "helper_outbox"
 	MessageOriginUserInbound     = "user_inbound"
 	MessageOriginQuarantinedEcho = "quarantined_helper_echo"
+	// GraphWriteAccountRateLimitKey is a reserved chat-rate-limit row used for
+	// an explicitly account/global-scoped Graph write throttle. It is kept
+	// separate from the read gate: a read 429 must not block independent
+	// outbox writes, while a provider-confirmed account-wide write 429 must
+	// protect every sibling chat from another non-idempotent POST.
+	GraphWriteAccountRateLimitKey = "__cxp_account_graph_write__"
 )
 
 var ErrOutboxSendNotClaimed = errors.New("outbox send not claimed")
+
+// ErrOutboxUploadSessionIndeterminate means a resumable-upload session POST
+// may have reached Graph but did not yield a durable session URL.  The row must
+// remain in the no-new-POST recovery lane until an operator or an exact remote
+// reconciliation path settles it.
+var ErrOutboxUploadSessionIndeterminate = errors.New("outbox upload-session outcome is indeterminate")
 
 // ErrSQLiteOutboxProjectionUntrusted means the canonical outbox JSON and its
 // indexed compatibility projection cannot be reconciled safely.  Hot queries
 // may skip such a row so healthy work remains visible; point updates and FIFO
 // proofs must return this error instead of treating the row as absent.
 var ErrSQLiteOutboxProjectionUntrusted = errors.New("SQLite outbox projection is untrusted")
+
+// ErrSQLiteOutboxProjectionAuditDeferred means a complete local projection
+// audit finished against a snapshot that changed before publication.  The
+// result is deliberately not trusted, but the durable marker remains
+// deferred so an owner can retry after the writer burst settles.  Callers
+// must treat this as a retryable maintenance condition, never as permission
+// to use an unverified native projection.
+var ErrSQLiteOutboxProjectionAuditDeferred = errors.New("SQLite outbox projection audit deferred after concurrent change")
+
+// ErrSQLiteOutboxProjectionAuditInProgress means another owner generation (or
+// another in-process maintenance call) currently owns the durable projection
+// audit.  It is a coordination result, not permission to use the native lane.
+// Callers must leave the markers untouched and let the current audit publish or
+// let a newer lease generation reclaim them after takeover.
+var ErrSQLiteOutboxProjectionAuditInProgress = errors.New("SQLite outbox projection audit is already in progress")
+
+// ErrSQLiteOutboxProjectionAuditOwnerRequired means an online Teams owner is
+// present and an unscoped maintenance call cannot safely publish an audit
+// result. The listener must use the owner-fenced API; offline maintenance may
+// use the unscoped API only after the lease has been released.
+var ErrSQLiteOutboxProjectionAuditOwnerRequired = errors.New("SQLite outbox projection audit requires the current owner")
+
+// ErrSQLiteOutboxProjectionAuditPermanent means the audit could not even
+// inspect its snapshot because of a non-transient local failure (for example
+// a missing path, closed handle, or incompatible schema). The durable marker
+// remains fail-closed and a later owner may retry after the local condition is
+// repaired, but the current listener must not spin forever on the same error.
+var ErrSQLiteOutboxProjectionAuditPermanent = errors.New("SQLite outbox projection audit stopped after a permanent local error")
+
+// ErrSQLiteSchemaPreparationRequired means an owner-scoped operation reached
+// a process-local SQLite handle before the structural schema boundary was
+// completed. It is deliberately fail-closed: the caller must run the
+// pre-owner schema preparation path instead of allowing an unowned helper to
+// mutate triggers or metadata after a lease has been acquired.
+var ErrSQLiteSchemaPreparationRequired = errors.New("SQLite schema preparation is required before owner-scoped operation")
+
+// ErrSQLiteSchemaPreparationInProgress means an offline structural schema
+// preparation currently holds the durable preparation fence. Owner heartbeats
+// must stop rather than renew a lease while that fence is active; a later
+// startup can reclaim a stale fence after a crash.
+var ErrSQLiteSchemaPreparationInProgress = errors.New("SQLite schema preparation is already in progress")
+
+// ErrSQLiteMigrationOpaqueLegacyState means the legacy JSON document contains
+// a row whose typed representation is not lossless.  Migration deliberately
+// refuses to publish a new SQLite authority in this case: silently omitting or
+// normalizing that row would make an unrelated upgrade destructive.  An
+// explicit repair can make the row typed before retrying migration.
+var ErrSQLiteMigrationOpaqueLegacyState = errors.New("SQLite migration found opaque legacy state")
+
+// ErrSQLiteMigrationSourceChanged means an online, owner-fenced legacy
+// migration built a sidecar from a snapshot that was changed before the final
+// pointer publication boundary. The sidecar is not authoritative and must not
+// be published; a later attempt can retry from a fresh JSON snapshot.
+var ErrSQLiteMigrationSourceChanged = errors.New("SQLite migration source changed during online migration")
 
 var ErrOutboxPredecessorIndeterminate = errors.New("outbox FIFO predecessor is indeterminate")
 
@@ -164,10 +247,31 @@ var ErrStaleExecutionCallback = errors.New("stale Codex execution callback")
 // path and must not be retried or turned into another user-visible failure.
 var ErrCompletionOwnerLost = errors.New("completion lost terminal owner")
 
+// ErrStaleSessionBinding is returned when a lifecycle command was prepared
+// from an older Teams-chat binding than the one currently stored. The caller
+// must not apply the command to the replacement binding.
+var ErrStaleSessionBinding = errors.New("stale Teams session binding")
+
 // ErrTerminalOutboxConflict means that a deterministic final outbox ID is
 // already occupied by a different rendered message.  The transaction must
 // roll back instead of replacing a message that may already have been sent.
 var ErrTerminalOutboxConflict = errors.New("terminal outbox identity conflict")
+
+// ErrInboundTurnConflict means that more than one durable Turn claims the
+// same inbound event.  Queue recovery must fail closed in this situation: it
+// must not guess which execution is authoritative or create a third turn.
+var ErrInboundTurnConflict = errors.New("inbound event has conflicting turns")
+
+// ErrInboundIgnored means that QueueTurn was asked to execute an inbound event
+// whose durable disposition is already terminally ignored. Queue recovery must
+// not revive that event or manufacture a new Turn for it.
+var ErrInboundIgnored = errors.New("inbound event is terminally ignored")
+
+// ErrInboundNotFound means that a caller supplied an inbound event identity
+// that is not present in durable storage. QueueTurn must not manufacture an
+// orphan Turn for that identity; recovery can only safely handle an already
+// durable Turn whose missing inbound is treated as a corruption case.
+var ErrInboundNotFound = errors.New("inbound event not found")
 
 // ErrSessionStateProvenanceMismatch is returned when a scoped state lookup
 // finds a checkpoint owned by a different durable Teams session. Such state
@@ -203,7 +307,34 @@ var ErrProofBackedCheckpointPromotionConflict = errors.New("proof-backed checkpo
 var ErrHistoryWatchCheckpointConflict = errors.New("history-watch checkpoint changed")
 
 var errStoreNoChange = errors.New("teams store no change")
+
+// errStoreOwnerCapabilityMismatch is kept private so the historical
+// UpdateChatPollForOwner API can retain its no-op-on-stale-owner contract,
+// while owner-bound wrapper operations can distinguish a lease loss from a
+// legitimate callback no-op and abort their post-mutation side effects.
+var errStoreOwnerCapabilityMismatch = errors.New("teams store owner capability mismatch")
 var loadUnlockedTestHook func()
+
+// outboxFIFOSnapshotClaimTestHook is nil in production. It creates a
+// deterministic lookup-to-claim mutation window for the legacy JSON backend;
+// the hook runs after the SQLite compatibility probe has declined the request
+// and before the JSON state is loaded for the fenced claim.
+var outboxFIFOSnapshotClaimTestHook func()
+
+// StoreTimingEvent is an opt-in diagnostic event for measuring durable-store
+// contention. It is intentionally observation-only: installing an observer
+// must not change lock ordering, transaction boundaries, or the state that a
+// caller is allowed to mutate. Observers must not call back into Store.
+type StoreTimingEvent struct {
+	Operation string
+	Stage     string
+	Duration  time.Duration
+	Err       error
+}
+
+type storeTimingObserver struct {
+	fn func(StoreTimingEvent)
+}
 
 var (
 	currentOwnerExecutable = helperpath.RawExecutable
@@ -299,6 +430,22 @@ func normalizeLoadedTurnStatus(turn *Turn) {
 	}
 }
 
+// normalizeLoadedTurnStatusWithIndexedFallback reconciles a JSON payload with
+// the scalar status projection used by the SQLite compatibility loader. An
+// omitted/null/empty JSON status is not evidence that a turn is terminal: old
+// writers could update the indexed column before the JSON field existed. Keep
+// the scalar value in that narrow case, while a non-empty JSON status remains
+// authoritative and unknown values still become a running safety fence.
+func normalizeLoadedTurnStatusWithIndexedFallback(turn *Turn, indexed TurnStatus) {
+	if turn == nil {
+		return
+	}
+	if strings.TrimSpace(string(turn.Status)) == "" && strings.TrimSpace(string(indexed)) != "" {
+		turn.Status = TurnStatus(strings.TrimSpace(string(indexed)))
+	}
+	normalizeLoadedTurnStatus(turn)
+}
+
 type State struct {
 	SchemaVersion          int                                 `json:"schema_version"`
 	CreatedAt              time.Time                           `json:"created_at,omitempty"`
@@ -362,7 +509,37 @@ const (
 	legacyOpaqueChatPolls
 	legacyOpaqueOutbox
 	legacyOpaqueHistoryWatch
+	legacyOpaqueSessions
+	legacyOpaqueTurns
+	// legacyOpaqueOptionalRecoveryProof identifies a syntactically valid,
+	// identity-bound checkpoint whose optional recovery proof was downgraded to
+	// RecoveryProofUnusable.  The exact legacy JSON is still preserved during a
+	// JSON rewrite, but the typed row is losslessly representable in SQLite and
+	// therefore must not block an otherwise safe migration.
+	legacyOpaqueOptionalRecoveryProof
 )
+
+// legacyChatPollRetryGate is a small JSON-backend sidecar for an opaque poll
+// row.  The original row bytes remain forensic evidence and are never
+// replaced by an ordinary retry/error update, so the retry deadline cannot be
+// stored in that row. SQLite has equivalent scalar columns; keeping the same
+// narrow fields here makes the legacy backend restart-safe without adding
+// executable frontier data to the sidecar.
+type legacyChatPollRetryGate struct {
+	SourceHash       string    `json:"source_hash"`
+	RecoveryRequired bool      `json:"recovery_required,omitempty"`
+	NextPollAt       time.Time `json:"next_poll_at,omitempty"`
+	BlockedUntil     time.Time `json:"blocked_until,omitempty"`
+	PollState        string    `json:"poll_state,omitempty"`
+	LastActivityAt   time.Time `json:"last_activity_at,omitempty"`
+	ParkNoticeSentAt time.Time `json:"park_notice_sent_at,omitempty"`
+	LastError        string    `json:"last_error,omitempty"`
+	LastErrorAt      time.Time `json:"last_error_at,omitempty"`
+	FailureCount     int       `json:"failure_count,omitempty"`
+	UpdatedAt        time.Time `json:"updated_at,omitempty"`
+}
+
+const legacyChatPollRetryGatesField = "chat_poll_retry_gates"
 
 type ScopeIdentity struct {
 	ID            string    `json:"id,omitempty"`
@@ -640,13 +817,21 @@ type TranscriptDeliveryRecord struct {
 	// CodexTurnID is populated only from explicit transcript provenance.  It is
 	// intentionally separate from the durable Teams TurnID carried by an
 	// outbox row; a missing value must not be treated as the outer turn proof.
-	CodexTurnID    string                   `json:"codex_turn_id,omitempty"`
-	SourcePath     string                   `json:"source_path,omitempty"`
-	SourceLine     int                      `json:"source_line,omitempty"`
-	SourceOffset   int64                    `json:"source_offset,omitempty"`
-	SourceRecordID string                   `json:"source_record_id,omitempty"`
-	Kind           string                   `json:"kind,omitempty"`
-	TextHash       string                   `json:"text_hash,omitempty"`
+	CodexTurnID    string `json:"codex_turn_id,omitempty"`
+	SourcePath     string `json:"source_path,omitempty"`
+	SourceLine     int    `json:"source_line,omitempty"`
+	SourceOffset   int64  `json:"source_offset,omitempty"`
+	SourceRecordID string `json:"source_record_id,omitempty"`
+	Kind           string `json:"kind,omitempty"`
+	TextHash       string `json:"text_hash,omitempty"`
+	// PartIndex/PartCount identify the exact rendered chunk. Older rows omit
+	// them and are normalized from their linked outbox row when possible.
+	PartIndex int `json:"part_index,omitempty"`
+	PartCount int `json:"part_count,omitempty"`
+	// RenderedHash is the digest of the exact Graph body, not the source record
+	// text. It prevents an explicit repair from linking a different chunk that
+	// happens to share the same source ID/text hash.
+	RenderedHash   string                   `json:"rendered_hash,omitempty"`
 	OutboxID       string                   `json:"outbox_id,omitempty"`
 	TeamsMessageID string                   `json:"teams_message_id,omitempty"`
 	Status         TranscriptDeliveryStatus `json:"status,omitempty"`
@@ -731,9 +916,16 @@ type ImportCheckpoint struct {
 	// not be queued. It is deliberately persisted in the JSON payload so both
 	// the legacy JSON store and the SQLite JSON mirror share the same recovery
 	// semantics.
-	CompletionPending bool      `json:"completion_pending,omitempty"`
-	SourceSize        int64     `json:"source_size,omitempty"`
-	SourceModTime     time.Time `json:"source_mod_time,omitempty"`
+	CompletionPending bool `json:"completion_pending,omitempty"`
+	// DeliveryNeedsAttention is a durable repair fence for an automatic
+	// transcript import that reached a conclusive provider rejection. The source
+	// cursor remains before the rejected record, but the checkpoint must not be
+	// mistaken for an in-flight import forever or be advanced by a generic pause
+	// path. Explicit publish-history clears this bit when it takes ownership of
+	// the repair boundary.
+	DeliveryNeedsAttention bool      `json:"delivery_needs_attention,omitempty"`
+	SourceSize             int64     `json:"source_size,omitempty"`
+	SourceModTime          time.Time `json:"source_mod_time,omitempty"`
 	// SourceChangeTime is a filesystem revision marker captured with the
 	// trusted cursor. It complements the bounded content fingerprint for the
 	// rare same-size, same-mtime in-place rewrite without adding a source read
@@ -911,13 +1103,19 @@ type TranscriptCheckpointProgress struct {
 // validates ownership, inserts the deterministic final outbox chunks, and
 // commits the terminal Turn/checkpoint/anchor transition.
 type CompleteTurnWithFinalRequest struct {
-	SessionID        string
-	TurnID           string
-	MachineID        string
-	LeaseGeneration  int64
-	CodexThreadID    string
-	CodexTurnID      string
-	AnchorGeneration int64
+	SessionID string
+	TurnID    string
+	// ExpectedTeamsChatID is the binding captured when the executor was
+	// admitted. It is an optimistic lifecycle fence: a close/rebind committed
+	// before terminal completion makes the callback a no-op. Empty retains the
+	// compatibility behavior for older direct callers; final outbox rows are
+	// still checked against a known current session binding below.
+	ExpectedTeamsChatID string `json:"-"`
+	MachineID           string
+	LeaseGeneration     int64
+	CodexThreadID       string
+	CodexTurnID         string
+	AnchorGeneration    int64
 	// ResolveInterrupted is set only by ResolveInterruptedTurnWithCompletionProof.
 	// Normal completion must never promote an interrupted turn based on a stale
 	// in-memory result.  It is intentionally not serialized; the store still
@@ -1764,6 +1962,21 @@ func chatPollHasOperationalFrontier(poll ChatPollState) bool {
 		poll.Gap != nil && !(poll.Gap.HeadProbePending && strings.TrimSpace(poll.Gap.RecoveryPath) == "")
 }
 
+// These two scalar values are maintained beside the canonical poll JSON for
+// the trusted SQLite admission projection. They intentionally do not replace
+// the typed predicate above; the JSON-backed predicate remains the oracle for
+// repair and compatibility rows.
+func chatPollHasPendingPage(poll ChatPollState) bool {
+	return poll.PendingPage != nil
+}
+
+func chatPollFailureCount(poll ChatPollState) int {
+	if poll.FailureCount < 0 {
+		return 0
+	}
+	return poll.FailureCount
+}
+
 // chatPollRateLimitedDeferred keeps a provider throttle from holding the
 // global optional-maintenance gate while its durable retry deadline is still in
 // the future. The frontier remains persisted and the scheduler will select it
@@ -1778,7 +1991,14 @@ func chatPollRateLimitedDeferred(poll ChatPollState, now time.Time) bool {
 	// must remain visible to the operational lane even when the preceding page
 	// attempt recorded a provider throttle; otherwise a 429 can also defer the
 	// no-network replay that would complete the receipt and clear the error.
-	return poll.PendingPage == nil && poll.NextPollAt.After(now) && strings.Contains(strings.ToLower(strings.TrimSpace(poll.LastError)), "429")
+	if poll.PendingPage == nil && poll.NextPollAt.After(now) && strings.Contains(strings.ToLower(strings.TrimSpace(poll.LastError)), "429") {
+		return true
+	}
+	// Opaque poll JSON cannot retain a newly observed error without destroying
+	// the forensic bytes. The targeted SQLite writer records the same retry
+	// gate in the scalar schedule projection and marks the placeholder blocked;
+	// honor that explicit local recovery gate here as well.
+	return poll.RecoveryRequired && poll.PollState == "blocked" && poll.BlockedUntil.After(now)
 }
 
 // chatPollAdmissionValid separates a decoded poll row from an executable poll
@@ -1834,11 +2054,72 @@ type ChatPollScheduleUpdate struct {
 	SetDeferredContinuationPath   bool
 	ClearDeferredContinuationPath bool
 	ResetFailures                 bool
+	// SetRecoveryRequired records a durable row-local disposition when the
+	// scheduler can see a chat binding but cannot decode the owning session.
+	// This is deliberately separate from a normal Graph error: it prevents a
+	// stale registry entry from becoming an executable fallback while keeping
+	// the chat visible for explicit repair.
+	SetRecoveryRequired   bool
+	ClearRecoveryRequired bool
+	RecoveryReason        string
+	RecoverySourceHash    string
 	// ExpectedPollRevision is an optional CAS fence for a schedule update
 	// assembled from a durable poll snapshot. It is not persisted as part of
 	// the schedule update; it only rejects a stale batch before any row changes.
 	ExpectedPollRevision    uint64 `json:"-"`
 	HasExpectedPollRevision bool   `json:"-"`
+	// ExpectedPollJSONHash is the exact raw chat-poll identity observed while
+	// assembling a recovery disposition. A revision is not enough for an
+	// opaque/missing poll: a replacement row may legitimately reuse revision 0
+	// or carry a partially decoded revision. This fence is internal evidence,
+	// never part of persisted state or cursor/frontier semantics.
+	ExpectedPollJSONHash    string `json:"-"`
+	HasExpectedPollJSONHash bool   `json:"-"`
+}
+
+// HotPollWorkAdmissionDisposition describes who is authoritative for one
+// bounded work-candidate read.  A boolean handled flag cannot distinguish an
+// empty but valid durable set from a durable row that was present and could
+// not be decoded; the latter must never silently fall back to a stale
+// registry session.
+type HotPollWorkAdmissionDisposition string
+
+const (
+	HotPollWorkAdmissionAuthoritative    HotPollWorkAdmissionDisposition = "authoritative"
+	HotPollWorkAdmissionLegacyCompatible HotPollWorkAdmissionDisposition = "legacy-compatible"
+	HotPollWorkAdmissionDurableCorrupt   HotPollWorkAdmissionDisposition = "durable-corrupt-with-disposition"
+)
+
+// HotPollCorruptSession is bounded diagnostic evidence for a durable session
+// row that matched the cheap chat/schedule boundary but failed canonical
+// session validation. PollRevision is an optional CAS fence for the
+// chat-local recovery marker; it is never used as cursor or frontier proof.
+// PollJSONHash fences the exact raw poll bytes when a row exists, including
+// syntax-invalid bytes. HasPollJSON distinguishes an observed missing row
+// from an existing opaque row whose raw hash is the CAS witness.
+type HotPollCorruptSession struct {
+	SessionID    string
+	TeamsChatID  string
+	Reason       string
+	SourceHash   string
+	PollRevision uint64
+	HasPoll      bool
+	PollJSONHash string
+	HasPollJSON  bool
+	// PollJSONObserved records that the recovery probe completed the lookup,
+	// including the negative result.  A missing row is still a useful CAS
+	// witness: a concurrent repair must not be silently overwritten by the
+	// recovery marker creator.
+	PollJSONObserved bool
+}
+
+// HotPollWorkAdmission is the explicit result of durable work admission. The
+// candidate list remains bounded by the listener quantum; corrupt evidence is
+// separately bounded and must be durably dispositioned by the caller.
+type HotPollWorkAdmission struct {
+	Candidates      []SessionContext
+	Disposition     HotPollWorkAdmissionDisposition
+	CorruptSessions []HotPollCorruptSession
 }
 
 type FinalAnswerPollBoostRequest struct {
@@ -1942,8 +2223,15 @@ type InboundEvent struct {
 	TeamsBodyHTML    string                     `json:"teams_body_html,omitempty"`
 	TeamsAttachments []InboundAttachmentContext `json:"teams_attachments,omitempty"`
 	ReceivedAt       time.Time                  `json:"received_at,omitempty"`
-	CreatedAt        time.Time                  `json:"created_at,omitempty"`
-	UpdatedAt        time.Time                  `json:"updated_at,omitempty"`
+	// NextAttemptAt is a durable per-row retry gate for deferred work. It is
+	// deliberately separate from the chat poll schedule: a deferred control
+	// command or attachment recovery may be retried without making every other
+	// chat wait, while a provider 429 must not cause a hot loop after restart.
+	NextAttemptAt time.Time `json:"next_attempt_at,omitempty"`
+	FailureCount  int       `json:"failure_count,omitempty"`
+	LastError     string    `json:"last_error,omitempty"`
+	CreatedAt     time.Time `json:"created_at,omitempty"`
+	UpdatedAt     time.Time `json:"updated_at,omitempty"`
 }
 
 type InboundAttachmentContext struct {
@@ -2006,7 +2294,12 @@ type OutboxMessage struct {
 	// Transcript provenance lets the unresolved-execution fence distinguish a
 	// queued record from the trusted prefix before an anchor cutoff.  Legacy
 	// rows without these fields remain conservatively blocked.
-	TranscriptCheckpointID      string `json:"transcript_checkpoint_id,omitempty"`
+	TranscriptCheckpointID string `json:"transcript_checkpoint_id,omitempty"`
+	// TranscriptSourceRecordID binds a live terminal answer to the exact
+	// canonical JSONL record it was derived from. It is intentionally separate
+	// from SourceTextHash: identical text in two turns must not suppress either
+	// source record while the final POST is still pending.
+	TranscriptSourceRecordID    string `json:"transcript_source_record_id,omitempty"`
 	TranscriptSourcePath        string `json:"transcript_source_path,omitempty"`
 	TranscriptSourceOffset      int64  `json:"transcript_source_offset,omitempty"`
 	TranscriptSourceOffsetKnown bool   `json:"transcript_source_offset_known,omitempty"`
@@ -2038,11 +2331,22 @@ type OutboxMessage struct {
 	AttachmentUploadURL                  string    `json:"attachment_upload_url,omitempty"`
 	AttachmentUploadExpiry               time.Time `json:"attachment_upload_expiry,omitempty"`
 	AttachmentUploadOffset               int64     `json:"attachment_upload_offset,omitempty"`
-	DriveItemID                          string    `json:"drive_item_id,omitempty"`
-	DriveItemName                        string    `json:"drive_item_name,omitempty"`
-	DriveItemETag                        string    `json:"drive_item_etag,omitempty"`
-	DriveItemWebURL                      string    `json:"drive_item_web_url,omitempty"`
-	DriveItemWebDav                      string    `json:"drive_item_web_dav,omitempty"`
+	// AttachmentUploadSessionPostState is the durable boundary for the initial
+	// resumable-upload POST.  pending may create a session; started/unknown must
+	// never create another one without an exact remote reconciliation; ready
+	// means the session URL is durable; completed means the DriveItem is durable.
+	AttachmentUploadSessionPostState string `json:"attachment_upload_session_post_state,omitempty"`
+	// AttachmentUploadSessionPostAttemptToken identifies the send attempt that
+	// crossed the local create-session boundary. It is intentionally separate
+	// from SendAttemptToken: a takeover may rotate the latter while a stale
+	// preflight callback still needs to prove that its own no-network boundary
+	// can be released safely.
+	AttachmentUploadSessionPostAttemptToken string `json:"attachment_upload_session_post_attempt_token,omitempty"`
+	DriveItemID                             string `json:"drive_item_id,omitempty"`
+	DriveItemName                           string `json:"drive_item_name,omitempty"`
+	DriveItemETag                           string `json:"drive_item_etag,omitempty"`
+	DriveItemWebURL                         string `json:"drive_item_web_url,omitempty"`
+	DriveItemWebDav                         string `json:"drive_item_web_dav,omitempty"`
 	// AttachmentMessagePostState separates a completed Drive upload from the
 	// later Teams chat POST. "pending" means no chat POST has been started and
 	// the row may safely resume after a crash; "started" means this version
@@ -2050,26 +2354,31 @@ type OutboxMessage struct {
 	// Graph-marker recovery. The migration-only "unknown" value means an older
 	// helper persisted a DriveItem without recording whether its Teams POST
 	// started, so compatibility recovery must run before any new POST.
-	AttachmentMessagePostState string           `json:"attachment_message_post_state,omitempty"`
-	AckKind                    string           `json:"ack_kind,omitempty"`
-	QuoteReplyToMessageID      string           `json:"quote_reply_to_message_id,omitempty"`
-	NotificationKind           string           `json:"notification_kind,omitempty"`
-	ForkOperationID            string           `json:"fork_operation_id,omitempty"`
-	ForkHistoryNamespace       string           `json:"fork_history_namespace,omitempty"`
-	ForkOrdinal                int              `json:"fork_ordinal,omitempty"`
-	ForkBodyHash               string           `json:"fork_body_hash,omitempty"`
-	ForkRole                   string           `json:"fork_role,omitempty"`
-	MentionOwner               bool             `json:"mention_owner,omitempty"`
-	MentionUserID              string           `json:"mention_user_id,omitempty"`
-	MentionUserName            string           `json:"mention_user_name,omitempty"`
-	TrustedMath                bool             `json:"trusted_math,omitempty"`
-	MathPlanVersion            int              `json:"math_plan_version,omitempty"`
-	MathSpans                  []OutboxMathSpan `json:"math_spans,omitempty"`
-	MathMediaFallback          bool             `json:"math_media_fallback,omitempty"`
-	UpgradeNonBlocking         bool             `json:"upgrade_non_blocking,omitempty"`
-	ArtifactIDs                []string         `json:"artifact_ids,omitempty"`
-	Status                     OutboxStatus     `json:"status"`
-	TeamsMessageID             string           `json:"teams_message_id,omitempty"`
+	AttachmentMessagePostState string `json:"attachment_message_post_state,omitempty"`
+	// AttachmentMessagePostAttemptToken is the durable attempt identity for a
+	// started final attachment POST boundary. It is separate from the current
+	// send token because recovery may rotate SendAttemptToken before a stale
+	// owner reports that its last preflight stopped before HTTP.
+	AttachmentMessagePostAttemptToken string           `json:"attachment_message_post_attempt_token,omitempty"`
+	AckKind                           string           `json:"ack_kind,omitempty"`
+	QuoteReplyToMessageID             string           `json:"quote_reply_to_message_id,omitempty"`
+	NotificationKind                  string           `json:"notification_kind,omitempty"`
+	ForkOperationID                   string           `json:"fork_operation_id,omitempty"`
+	ForkHistoryNamespace              string           `json:"fork_history_namespace,omitempty"`
+	ForkOrdinal                       int              `json:"fork_ordinal,omitempty"`
+	ForkBodyHash                      string           `json:"fork_body_hash,omitempty"`
+	ForkRole                          string           `json:"fork_role,omitempty"`
+	MentionOwner                      bool             `json:"mention_owner,omitempty"`
+	MentionUserID                     string           `json:"mention_user_id,omitempty"`
+	MentionUserName                   string           `json:"mention_user_name,omitempty"`
+	TrustedMath                       bool             `json:"trusted_math,omitempty"`
+	MathPlanVersion                   int              `json:"math_plan_version,omitempty"`
+	MathSpans                         []OutboxMathSpan `json:"math_spans,omitempty"`
+	MathMediaFallback                 bool             `json:"math_media_fallback,omitempty"`
+	UpgradeNonBlocking                bool             `json:"upgrade_non_blocking,omitempty"`
+	ArtifactIDs                       []string         `json:"artifact_ids,omitempty"`
+	Status                            OutboxStatus     `json:"status"`
+	TeamsMessageID                    string           `json:"teams_message_id,omitempty"`
 	// BlockedByUnresolvedExecution records that Graph accepted this message
 	// concurrently with a newly persisted execution anchor.  The delivery is
 	// reconciled by its stable TeamsMessageID, but transcript checkpoint and
@@ -2356,6 +2665,12 @@ var (
 var ErrUnsupportedSchemaVersion = errors.New("unsupported Teams state schema version")
 var ErrControlLeaseNotHeld = errors.New("Teams control lease is not held by this machine")
 var ErrChatPollRevisionChanged = errors.New("Teams chat poll revision changed")
+
+// ErrChatPollOpaqueRecoveryRequired means that a normal success projection
+// was asked to overwrite a poll row whose original JSON is retained as
+// recovery evidence.  Only the explicit owner-fenced recovery path may clear
+// that evidence; an ordinary success callback must fail closed instead.
+var ErrChatPollOpaqueRecoveryRequired = errors.New("opaque Teams chat poll requires explicit recovery")
 var ErrControlLeaseStatusUnknown = errors.New("Teams control lease status is unknown")
 var ErrAmbiguousOutboxRecoveryCursorChanged = errors.New("Teams ambiguous outbox recovery cursor changed")
 var ErrBacklogFairCursorChanged = errors.New("Teams backlog fairness cursor changed")
@@ -2472,17 +2787,36 @@ func (e CodexThreadBindingConflictError) Error() string {
 }
 
 type Store struct {
-	path          string
-	mu            sync.Mutex
-	lock          *flock.Flock
-	messageLookup messageLookupCache
-	sqliteDB      *sql.DB
-	sqliteDBPath  string
-	// sqliteRuntimeMu protects the SQLite handle pointer while liveness
-	// operations bypass Store.mu. The liveness path shares sqliteDB so
-	// database/sql serializes its short transactions with normal store work,
-	// avoiding cross-handle WAL snapshot conflicts.
+	path           string
+	mu             sync.Mutex
+	lock           *flock.Flock
+	messageLookup  messageLookupCache
+	timingObserver atomic.Pointer[storeTimingObserver]
+	sqliteDB       *sql.DB
+	sqliteDBPath   string
+	// sqliteSchemaReadyPath is set only after the current process has applied
+	// configureSQLiteStore and ensureSQLiteSchema to the shared handle. A
+	// liveness claim may open that handle first through the intentionally
+	// setup-free runtime path; the first normal operation must then close this
+	// compatibility gap before it can run a long read or hot query.
+	sqliteSchemaReadyPath string
+	// sqliteSchemaContractPath records that this process has either completed
+	// the fenced preparation boundary or passed the setup-free readiness
+	// contract for this exact database path. sqliteSchemaReadyPath alone is not
+	// sufficient: a lazy foreground open may have observed only the durable
+	// marker while an inherited file still needs a column/trigger/projection
+	// repair.
+	sqliteSchemaContractPath string
+	// sqliteRuntimeMu protects both SQLite handle pointers while liveness
+	// operations bypass Store.mu. The runtime handle is deliberately separate
+	// from sqliteDB: a long foreground query must not consume the only
+	// database/sql connection needed to renew the owner lease. Heartbeat
+	// transactions still use the same SQLite file and are retried as complete
+	// transactions on BUSY/BUSY_SNAPSHOT, so a concurrent foreground writer
+	// cannot make a stale snapshot win.
 	sqliteRuntimeMu          sync.Mutex
+	sqliteRuntimeDB          *sql.DB
+	sqliteRuntimeDBPath      string
 	sqlitePointerCached      bool
 	sqlitePointerTrusted     bool
 	sqlitePointer            storeSQLitePointer
@@ -2492,6 +2826,144 @@ type Store struct {
 	sqlitePointerFingerprint string
 	ownershipProbeStamp      string
 	ownershipProbeCache      map[string]bool
+	// sqliteOutboxProjectionAuditMu prevents two maintenance goroutines in this
+	// process from scanning the same inherited outbox concurrently. Cross-process
+	// single-flight is provided by the durable state_meta claim written in the
+	// same transaction as the auditing markers.
+	sqliteOutboxProjectionAuditMu sync.Mutex
+	// sqliteOutboxProjectionTrust is a process-local cache of the durable
+	// projection guard.  It is only a fast-path hint: every FIFO lookup still
+	// reads the tiny state_meta marker so a SQLite trigger can revoke trust
+	// after an out-of-band/mixed-version row write.
+	sqliteOutboxProjectionDBPath string
+	sqliteOutboxProjectionTrust  string
+}
+
+// OutboxFIFOSnapshotProof is an opaque, one-shot witness returned by the
+// SQLite FIFO lookup.  It binds the snapshot fence to the exact target row and
+// to the exact lookup invocation.  A caller must pass the same object to the
+// corresponding send-claim method; proofs are never looked up by outbox ID in
+// shared mutable state, because concurrent lookups for one target could then
+// pair an older result with a newer proof.
+//
+// The fields are intentionally private.  A missing, already-consumed, or
+// mismatched proof fails closed at claim time and does not authorize a send.
+type OutboxFIFOSnapshotProof struct {
+	mu sync.Mutex
+
+	snapshot       sqliteOutboxFIFOSnapshot
+	targetID       string
+	targetChatID   string
+	targetSequence int64
+	targetCreated  time.Time
+	// JSON stores do not have SQLite's row-generation CAS.  They use the same
+	// opaque proof object, but carry a fingerprint of the target and every
+	// lower-sequence row in the target chat.  The claim callback validates this
+	// set while the state-file lock is held, so a predecessor inserted or
+	// changed between lookup and claim fails closed instead of being sent past.
+	jsonBackend bool
+	// jsonOpaqueOutbox is set when the legacy loader observed at least one
+	// malformed/type-invalid outbox row. The runnable map intentionally omits
+	// that row, but a later target must not cross an unknown FIFO predecessor
+	// merely because the decoder could not materialize it.
+	jsonOpaqueOutbox bool
+	jsonTargetHash   string
+	jsonPredecessors map[string]string
+	consumed         bool
+}
+
+func outboxFIFOProofHash(message OutboxMessage) string {
+	raw, err := json.Marshal(message)
+	if err != nil {
+		// OutboxMessage contains only JSON-representable fields. Keep a distinct
+		// impossible-looking value if that invariant is ever broken so the proof
+		// fails closed rather than silently treating two rows as equal.
+		return "marshal-error"
+	}
+	return sha256Bytes(raw)
+}
+
+func newJSONOutboxFIFOSnapshotProof(state State, msg OutboxMessage) *OutboxFIFOSnapshotProof {
+	// Callers often hold an admission copy whose defaulted fields (for example
+	// PartIndex/PartCount) were normalized by the durable queue writer after the
+	// copy was assembled.  Hash the canonical target row that the claim will
+	// reload, not that stale caller copy; otherwise a proof can reject a healthy
+	// claim even though no predecessor changed.  Identity changes remain
+	// fail-closed because the predecessor scan was built from the caller's
+	// identity tuple rather than the row we are about to claim.
+	target := msg
+	identityMatches := true
+	if canonical, ok := state.OutboxMessages[strings.TrimSpace(msg.ID)]; ok {
+		identityMatches = strings.TrimSpace(canonical.ID) == strings.TrimSpace(msg.ID) &&
+			strings.TrimSpace(canonical.TeamsChatID) == strings.TrimSpace(msg.TeamsChatID) &&
+			canonical.Sequence == msg.Sequence && canonical.CreatedAt.Equal(msg.CreatedAt)
+		target = canonical
+	}
+	proof := &OutboxFIFOSnapshotProof{
+		targetID:         strings.TrimSpace(target.ID),
+		targetChatID:     strings.TrimSpace(target.TeamsChatID),
+		targetSequence:   target.Sequence,
+		targetCreated:    target.CreatedAt,
+		jsonBackend:      true,
+		jsonOpaqueOutbox: state.legacyOpaqueJSONSections&legacyOpaqueOutbox != 0,
+		jsonTargetHash:   outboxFIFOProofHash(target),
+		jsonPredecessors: make(map[string]string),
+	}
+	if !identityMatches {
+		// An empty target hash makes the claim reject the proof even if the row
+		// happens to be otherwise unchanged.  Never reinterpret a stale caller
+		// as a proof for a different chat/sequence.
+		proof.jsonTargetHash = ""
+	}
+	for id, candidate := range state.OutboxMessages {
+		if strings.TrimSpace(id) == "" || strings.TrimSpace(candidate.ID) == proof.targetID ||
+			strings.TrimSpace(candidate.TeamsChatID) != proof.targetChatID ||
+			candidate.Sequence <= 0 || candidate.Sequence >= proof.targetSequence {
+			continue
+		}
+		proof.jsonPredecessors[id] = outboxFIFOProofHash(candidate)
+	}
+	return proof
+}
+
+func (proof *OutboxFIFOSnapshotProof) jsonSnapshotMatchesState(state *State, msg OutboxMessage) bool {
+	return proof.jsonSnapshotMismatchReason(state, msg) == ""
+}
+
+func (proof *OutboxFIFOSnapshotProof) jsonSnapshotMismatchReason(state *State, msg OutboxMessage) string {
+	if proof == nil || !proof.jsonBackend {
+		return ""
+	}
+	if state == nil {
+		return "state is nil"
+	}
+	if proof.jsonOpaqueOutbox || state.legacyOpaqueJSONSections&legacyOpaqueOutbox != 0 {
+		return "outbox JSON contains opaque recovery evidence"
+	}
+	actualTargetHash := outboxFIFOProofHash(msg)
+	if proof.jsonTargetHash == "" || actualTargetHash != proof.jsonTargetHash {
+		return fmt.Sprintf("target row changed (expected hash %s, actual %s)", proof.jsonTargetHash, actualTargetHash)
+	}
+	current := make(map[string]string)
+	for id, candidate := range state.OutboxMessages {
+		if strings.TrimSpace(id) == "" || strings.TrimSpace(candidate.ID) == strings.TrimSpace(msg.ID) ||
+			strings.TrimSpace(candidate.TeamsChatID) != proof.targetChatID ||
+			candidate.Sequence <= 0 || candidate.Sequence >= msg.Sequence {
+			continue
+		}
+		current[id] = outboxFIFOProofHash(candidate)
+	}
+	if len(current) != len(proof.jsonPredecessors) {
+		return fmt.Sprintf("predecessor count changed from %d to %d", len(proof.jsonPredecessors), len(current))
+	}
+	for id, hash := range proof.jsonPredecessors {
+		if currentHash, ok := current[id]; !ok {
+			return fmt.Sprintf("predecessor %q disappeared", id)
+		} else if currentHash != hash {
+			return fmt.Sprintf("predecessor %q changed", id)
+		}
+	}
+	return ""
 }
 
 func DefaultPath() (string, error) {
@@ -2713,16 +3185,182 @@ func (s *Store) Close() error {
 		closeErr = s.sqliteDB.Close()
 		s.sqliteDB = nil
 		s.sqliteDBPath = ""
+		s.sqliteSchemaReadyPath = ""
+		s.sqliteSchemaContractPath = ""
+	}
+	if s.sqliteRuntimeDB != nil {
+		if runtimeErr := s.sqliteRuntimeDB.Close(); closeErr == nil {
+			closeErr = runtimeErr
+		}
+		s.sqliteRuntimeDB = nil
+		s.sqliteRuntimeDBPath = ""
+	}
+	s.sqliteOutboxProjectionDBPath = ""
+	s.sqliteOutboxProjectionTrust = ""
+	// Store owns the state-lock object as well as its SQLite handles.  Normal
+	// mutations unlock it at the end of each operation, but an interrupted
+	// lifecycle or a caller closing during an externally-held boundary can
+	// otherwise leave the Windows handle live across an immediate Store reopen.
+	// flock.Close is idempotent when the lock is already released.
+	if s.lock != nil {
+		if lockErr := s.lock.Close(); closeErr == nil {
+			closeErr = lockErr
+		}
 	}
 	return closeErr
+}
+
+// SetTimingObserver installs an optional observer for material Store lock
+// waits/holds. It is intended for bounded diagnostics such as the real-data
+// Docker experiment; nil disables observation. The callback must be cheap and
+// must not call Store, because it may run while a Store lock is held.
+func (s *Store) SetTimingObserver(observer func(StoreTimingEvent)) {
+	if s == nil {
+		return
+	}
+	if observer == nil {
+		s.timingObserver.Store(nil)
+		return
+	}
+	s.timingObserver.Store(&storeTimingObserver{fn: observer})
+}
+
+func (s *Store) timingObserverSnapshot() *storeTimingObserver {
+	if s == nil {
+		return nil
+	}
+	return s.timingObserver.Load()
+}
+
+func storeTimingOperation() string {
+	for skip := 2; skip < 8; skip++ {
+		pc, _, _, ok := runtime.Caller(skip)
+		if !ok {
+			continue
+		}
+		name := runtime.FuncForPC(pc).Name()
+		if name == "" || strings.Contains(name, "storeTimingOperation") || strings.Contains(name, "withStateLock") || strings.Contains(name, "withSessionLock") {
+			continue
+		}
+		return name
+	}
+	return "unknown"
+}
+
+func (s *Store) recordTiming(observer *storeTimingObserver, operation, stage string, started time.Time, err error) {
+	if observer == nil || observer.fn == nil {
+		return
+	}
+	observer.fn(StoreTimingEvent{
+		Operation: operation,
+		Stage:     stage,
+		Duration:  time.Since(started),
+		Err:       err,
+	})
 }
 
 func (s *Store) Path() string {
 	return s.path
 }
 
+// PrepareOutboxProjection performs the one-time SQLite outbox projection
+// capability check before a listener enters its foreground loop.  The check
+// is deliberately a no-op for legacy JSON stores.  It never sends Graph
+// requests, changes an outbox row, or relaxes any owner/lease/attempt/FIFO
+// boundary; it only establishes whether the existing scalar projection is
+// safe for the native predecessor lookup.  Keeping this startup boundary
+// explicit prevents the first live outbox flush from spending its entire
+// phase budget on a cold audit of a large inherited outbox.
+func (s *Store) PrepareOutboxProjection(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	if active, err := s.sqliteOutboxProjectionAuditHasActiveLease(ctx); err != nil {
+		return err
+	} else if active {
+		return ErrSQLiteOutboxProjectionAuditOwnerRequired
+	}
+	return s.prepareOutboxProjectionSQLite(ctx, false)
+}
+
+// PrepareSQLiteSchemaBeforeOwner completes the structural SQLite setup before
+// a listener claims the control lease. It uses a durable preparation claim to
+// fence independent owner heartbeats while an offline maintenance connection
+// applies idempotent DDL. When another owner is already live this method leaves
+// the database untouched and the caller proceeds to the normal lease decision.
+func (s *Store) PrepareSQLiteSchemaBeforeOwner(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return s.prepareSQLiteSchemaBeforeOwner(ctx)
+}
+
+// PrepareOutboxProjectionForOwner performs the listener startup capability
+// check under the immutable control-lease generation that admitted the
+// listener. A bounded startup audit may publish a result only for this owner;
+// an oversized audit is durably deferred for the owner-scoped maintenance
+// loop. Callers that do not own the Teams control lease must use the explicit
+// offline PrepareOutboxProjection API instead.
+func (s *Store) PrepareOutboxProjectionForOwner(ctx context.Context, owner OwnerMetadata) error {
+	if s == nil {
+		return nil
+	}
+	if strings.TrimSpace(owner.MachineID) == "" || owner.LeaseGeneration <= 0 {
+		return ErrControlLeaseNotHeld
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return s.prepareOutboxProjectionSQLiteForOwner(ctx, owner)
+}
+
+// RetryDeferredOutboxProjectionAudit explicitly retries a projection audit that
+// startup deferred because the inherited outbox was too large. It is intended
+// for a quiet/maintenance boundary: unlike PrepareOutboxProjection, this
+// method may perform a full local JSON audit. Until it completes, all normal
+// foreground paths continue using the canonical fail-closed fallback.
+func (s *Store) RetryDeferredOutboxProjectionAudit(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if active, err := s.sqliteOutboxProjectionAuditHasActiveLease(ctx); err != nil {
+		return err
+	} else if active {
+		return ErrSQLiteOutboxProjectionAuditOwnerRequired
+	}
+	return s.retryDeferredOutboxProjectionAuditSQLite(ctx)
+}
+
+// RetryDeferredOutboxProjectionAuditForOwner resumes a deferred projection
+// audit on behalf of the listener generation that currently owns the Teams
+// control lease. The long scan remains outside Store.mu and never performs a
+// Graph request; only the short claim and publication transactions mutate
+// durable metadata. A caller without a positive machine/generation capability
+// is rejected instead of turning maintenance into an unowned writer.
+func (s *Store) RetryDeferredOutboxProjectionAuditForOwner(ctx context.Context, owner OwnerMetadata) error {
+	if s == nil {
+		return nil
+	}
+	if strings.TrimSpace(owner.MachineID) == "" || owner.LeaseGeneration <= 0 {
+		return ErrControlLeaseNotHeld
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return s.retryDeferredOutboxProjectionAuditSQLiteForOwner(ctx, owner)
+}
+
 func (s *Store) Load(ctx context.Context) (State, error) {
 	var state State
+	if err := s.ensureSQLiteSchemaPreparedForUse(ctx); err != nil {
+		return state, err
+	}
 	err := s.withStateLock(ctx, func() error {
 		var err error
 		state, err = s.loadUnlocked(ctx)
@@ -3298,15 +3936,25 @@ var (
 		"turns",
 		"inbound_events",
 	)
+	threadResolutionStateSnapshotFields = stateFieldSet(
+		"sessions",
+		"turns",
+		"import_checkpoints",
+	)
 	historyWatchStateFields = stateFieldSet(
 		"history_watch",
 		"history_watch_ready",
+	)
+	dashboardStateSnapshotFields = stateFieldSet(
+		"dashboard_views",
+		"dashboard_numbers",
 	)
 	turnQueueStateSnapshotFields = stateFieldSet(
 		"turns",
 		"inbound_events",
 	)
 	transcriptDedupeSnapshotFields = stateFieldSet(
+		"sessions",
 		"turns",
 		"inbound_events",
 		"outbox_messages",
@@ -3451,12 +4099,16 @@ func filterTranscriptDedupeSnapshotForSession(state State, sessionID string, che
 	out := State{
 		SchemaVersion:        SchemaVersion,
 		ServiceOwner:         state.ServiceOwner,
+		Sessions:             map[string]SessionContext{},
 		Turns:                map[string]Turn{},
 		InboundEvents:        map[string]InboundEvent{},
 		OutboxMessages:       map[string]OutboxMessage{},
 		TranscriptDeliveries: map[string]TranscriptDeliveryRecord{},
 		HelperDeliveries:     map[string]HelperDeliveryRecord{},
 		ImportCheckpoints:    map[string]ImportCheckpoint{},
+	}
+	if session, ok := state.Sessions[sessionID]; ok {
+		out.Sessions[sessionID] = session
 	}
 	for id, turn := range state.Turns {
 		if strings.TrimSpace(turn.SessionID) == sessionID {
@@ -3549,9 +4201,10 @@ func filterWorkflowEventSnapshotForTurn(state State, sessionID string, turnID st
 func filterThreadResolutionSnapshotForSession(state State, sessionID string) State {
 	sessionID = strings.TrimSpace(sessionID)
 	out := State{
-		SchemaVersion: SchemaVersion,
-		Sessions:      map[string]SessionContext{},
-		Turns:         map[string]Turn{},
+		SchemaVersion:     SchemaVersion,
+		Sessions:          map[string]SessionContext{},
+		Turns:             map[string]Turn{},
+		ImportCheckpoints: map[string]ImportCheckpoint{},
 	}
 	if sessionID != "" {
 		if session, ok := state.Sessions[sessionID]; ok {
@@ -3563,12 +4216,68 @@ func filterThreadResolutionSnapshotForSession(state State, sessionID string) Sta
 			out.Turns[id] = turn
 		}
 	}
+	if checkpointID := sessionTranscriptCheckpointID(sessionID); checkpointID != "" {
+		if checkpoint, ok := state.ImportCheckpoints[checkpointID]; ok {
+			out.ImportCheckpoints[checkpointID] = checkpoint
+		}
+	}
 	out.ensure(time.Time{})
 	return out
 }
 
 func (s *Store) PollStateSnapshot(ctx context.Context) (State, error) {
 	return s.loadStateFieldsOrFull(ctx, pollStateSnapshotFields)
+}
+
+// DashboardStateSnapshot returns only the durable dashboard records needed to
+// render a control fallback prompt. In particular, it must not decode the
+// historical inbound/outbox ledgers merely because a queued control turn is
+// being resumed.
+func (s *Store) DashboardStateSnapshot(ctx context.Context) (State, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var state State
+	err := s.withStateLock(ctx, func() error {
+		if pointer, ok, err := s.currentSQLitePointerUnlocked(); err != nil || ok {
+			if err != nil {
+				return err
+			}
+			var loadErr error
+			state, loadErr = s.loadSQLiteDashboardStateUnlocked(ctx, pointer)
+			return loadErr
+		}
+		selected, ok, err := s.loadSelectedStateFieldsUnlocked(ctx, dashboardStateSnapshotFields)
+		if err != nil {
+			return err
+		}
+		if ok {
+			state = selected
+			return nil
+		}
+		var loadErr error
+		state, loadErr = s.loadUnlocked(ctx)
+		return loadErr
+	})
+	if err != nil {
+		return State{}, err
+	}
+	state.ensure(time.Time{})
+	return state, nil
+}
+
+// TurnRecoveryStateSnapshot returns only the durable state needed by startup
+// turn recovery: all session bindings, unresolved turns, and the inbound rows
+// referenced by those turns.  SQLite keeps the inbound ledger unbounded, so a
+// generic poll snapshot would make a restart decode every historical inbound
+// event before it could resume one queued turn.  The SQLite implementation
+// selects active turns first and then fetches only their referenced inbound
+// rows.  Legacy JSON keeps the exact selected-field compatibility loader.
+func (s *Store) TurnRecoveryStateSnapshot(ctx context.Context) (State, error) {
+	if state, handled, err := s.turnRecoveryStateSnapshotSQLite(ctx); handled || err != nil {
+		return state, err
+	}
+	return s.loadStateFieldsOrFull(ctx, stateFieldSet("sessions", "turns", "inbound_events"))
 }
 
 func (s *Store) PollScheduleSnapshot(ctx context.Context) (State, error) {
@@ -3597,6 +4306,87 @@ func (s *Store) HotPollReadyScheduleState(ctx context.Context, controlChatID str
 		return state, err
 	}
 	return s.HotPollScheduleState(ctx)
+}
+
+// HotPollScheduleAndWorkCandidatesExcludingIdleAt performs the bounded
+// schedule and durable-session admission in one SQLite lock scope. The
+// listener uses this to avoid paying for two equivalent hot reads (and a
+// possible schedule reload) on every cycle. handled is false only when the
+// SQLite compatibility projection cannot be used; callers must then retain
+// their legacy fallback.
+func (s *Store) HotPollScheduleAndWorkCandidatesExcludingIdleAt(ctx context.Context, controlChatID string, idleBefore time.Time, now time.Time) (State, []SessionContext, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	return s.hotPollScheduleAndWorkCandidatesSQLite(ctx, controlChatID, idleBefore, now)
+}
+
+// HotPollScheduleAndWorkCandidatesOptimizedExcludingIdleAt is the listener
+// variant of the bounded admission API. It preserves the historical combined
+// method above for callers that compare a complete ready snapshot, while the
+// listener receives scalar work-chat hints and hydrates canonical JSON only
+// after its smaller worker quantum has been selected.
+func (s *Store) HotPollScheduleAndWorkCandidatesOptimizedExcludingIdleAt(ctx context.Context, controlChatID string, idleBefore time.Time, now time.Time) (State, []SessionContext, bool, error) {
+	state, admission, err := s.HotPollScheduleAndWorkCandidatesOptimizedWithDispositionExcludingIdleAt(ctx, controlChatID, idleBefore, now)
+	if err != nil {
+		return state, nil, false, err
+	}
+	handled := admission.Disposition != HotPollWorkAdmissionLegacyCompatible
+	return state, admission.Candidates, handled, nil
+}
+
+// HotPollScheduleAndWorkCandidatesOptimizedWithDispositionExcludingIdleAt is
+// the disposition-aware listener variant of bounded admission. It retains the
+// scalar fast path but exposes a durable-corrupt result instead of collapsing
+// a bad session into an authoritative empty candidate list.
+func (s *Store) HotPollScheduleAndWorkCandidatesOptimizedWithDispositionExcludingIdleAt(ctx context.Context, controlChatID string, idleBefore time.Time, now time.Time) (State, HotPollWorkAdmission, error) {
+	return s.HotPollScheduleAndWorkCandidatesOptimizedWithDispositionExcludingIdleAtLimit(ctx, controlChatID, idleBefore, now, 0)
+}
+
+// HotPollScheduleAndWorkCandidatesOptimizedWithDispositionExcludingIdleAtLimit
+// is the bounded-headroom variant used by the listener when it must discard
+// candidates behind a durable Graph-read gate.  The extra rows are still only
+// scalar admission hints; canonical session JSON is hydrated after the bridge
+// applies its smaller worker quantum. A zero limit retains the historical
+// 64-row admission bound.
+func (s *Store) HotPollScheduleAndWorkCandidatesOptimizedWithDispositionExcludingIdleAtLimit(ctx context.Context, controlChatID string, idleBefore time.Time, now time.Time, limit int) (State, HotPollWorkAdmission, error) {
+	return s.HotPollScheduleAndWorkCandidatesOptimizedWithDispositionExcludingIdleAtLimitAndReadGate(ctx, controlChatID, idleBefore, now, limit, false)
+}
+
+// HotPollScheduleAndWorkCandidatesOptimizedWithDispositionExcludingIdleAtLimitAndReadGate
+// is the account-read-gated variant used while an explicit account/global
+// Graph throttle is active. It admits only pending receipts whose metadata
+// proves that replay is local; Graph-dependent candidates are left durable for
+// the next wake edge instead of occupying the bounded candidate page and
+// hiding local work behind an arbitrarily large throttled prefix.
+func (s *Store) HotPollScheduleAndWorkCandidatesOptimizedWithDispositionExcludingIdleAtLimitAndReadGate(ctx context.Context, controlChatID string, idleBefore time.Time, now time.Time, limit int, graphReadBlocked bool) (State, HotPollWorkAdmission, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	return s.hotPollScheduleAndWorkCandidatesOptimizedSQLiteWithDispositionAndReadGate(ctx, controlChatID, idleBefore, now, limit, graphReadBlocked)
+}
+
+// HotPollSelectedStateForChatsAndSessions refreshes only the durable rows that
+// the current poll cycle has already admitted. It is intentionally a partial
+// state: ChatPolls contains the requested chats, while Turns and
+// ImportCheckpoints contain only active/importing rows for the requested
+// sessions/chats. The listener uses it after a control poll may have changed a
+// selected work chat; refreshing the whole schedule there would make a small
+// control command pay the O(number-of-chats) JSON admission cost again.
+//
+// handled is false when the SQLite projection is unavailable. Callers must
+// retain their existing full-refresh compatibility path in that case.
+func (s *Store) HotPollSelectedStateForChatsAndSessions(ctx context.Context, chatIDs, sessionIDs []string) (State, bool, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return s.hotPollSelectedStateForChatsAndSessionsSQLite(ctx, chatIDs, sessionIDs)
 }
 
 func (s *Store) HotPollScheduleSnapshot(ctx context.Context) (State, map[string]bool, error) {
@@ -3634,13 +4424,42 @@ func (s *Store) HotPollWorkCandidatesExcludingIdle(ctx context.Context, controlC
 // misleading empty work set.  The old method remains for diagnostics and
 // callers that do not already own a scheduling timestamp.
 func (s *Store) HotPollWorkCandidatesExcludingIdleAt(ctx context.Context, controlChatID string, idleBefore time.Time, now time.Time) ([]SessionContext, bool, error) {
+	admission, err := s.HotPollWorkCandidatesWithDispositionExcludingIdleAt(ctx, controlChatID, idleBefore, now)
+	if err != nil {
+		return nil, false, err
+	}
+	return admission.Candidates, admission.Disposition != HotPollWorkAdmissionLegacyCompatible, nil
+}
+
+// HotPollWorkCandidatesWithDispositionExcludingIdleAt exposes the explicit
+// durable admission disposition for the listener and diagnostics. Existing
+// callers should continue using HotPollWorkCandidatesExcludingIdleAt unless
+// they need to persist a corrupt-row recovery marker.
+func (s *Store) HotPollWorkCandidatesWithDispositionExcludingIdleAt(ctx context.Context, controlChatID string, idleBefore time.Time, now time.Time) (HotPollWorkAdmission, error) {
+	return s.HotPollWorkCandidatesWithDispositionExcludingIdleAtLimit(ctx, controlChatID, idleBefore, now, 0)
+}
+
+// HotPollWorkCandidatesWithDispositionExcludingIdleAtLimit is the standalone
+// bounded-headroom form of HotPollWorkCandidatesWithDispositionExcludingIdleAt.
+// It is intentionally explicit so ordinary callers and compatibility tests
+// retain the historical 64-row result while the listener can fetch enough
+// scalar rows to skip read-gated prefixes without hydrating them.
+func (s *Store) HotPollWorkCandidatesWithDispositionExcludingIdleAtLimit(ctx context.Context, controlChatID string, idleBefore time.Time, now time.Time, limit int) (HotPollWorkAdmission, error) {
+	return s.HotPollWorkCandidatesWithDispositionExcludingIdleAtLimitAndReadGate(ctx, controlChatID, idleBefore, now, limit, false)
+}
+
+// HotPollWorkCandidatesWithDispositionExcludingIdleAtLimitAndReadGate is the
+// standalone form of the account/global read-gated admission path. See the
+// combined method above for why this is a filter in SQL rather than a larger
+// unbounded headroom allocation.
+func (s *Store) HotPollWorkCandidatesWithDispositionExcludingIdleAtLimitAndReadGate(ctx context.Context, controlChatID string, idleBefore time.Time, now time.Time, limit int, graphReadBlocked bool) (HotPollWorkAdmission, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
 	if now.IsZero() {
 		now = time.Now()
 	}
-	return s.hotPollWorkCandidatesSQLite(ctx, controlChatID, idleBefore, now)
+	return s.hotPollWorkCandidatesSQLiteWithDispositionAndReadGate(ctx, controlChatID, idleBefore, now, limit, graphReadBlocked)
 }
 
 func (s *Store) IdleWorkChatParkCandidates(ctx context.Context, controlChatID string, idleBefore time.Time, limit int) ([]IdleWorkChatParkCandidate, bool, error) {
@@ -3748,6 +4567,61 @@ func (s *Store) HasQueuedTurns(ctx context.Context) (bool, error) {
 	return false, nil
 }
 
+// QueuedTurnSessionIDs returns a stable, bounded page of sessions that have
+// queued turns and no currently running turn. The session ID is deliberately
+// the only candidate payload: ClaimNextQueuedTurn remains the durable
+// per-session FIFO/CAS boundary, so this method is an acceleration hint and
+// must never be treated as a claim.
+//
+// afterSessionID is an exclusive keyset cursor. Native SQLite uses the typed
+// turn projection only after its durable marker and every row-local trust
+// fence prove that the scalar columns are current. Legacy and mixed-version
+// stores retain the canonical JSON fallback.
+func (s *Store) QueuedTurnSessionIDs(ctx context.Context, afterSessionID string, limit int) (ids []string, more bool, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if limit <= 0 {
+		limit = 64
+	}
+	if nativeIDs, nativeMore, handled, nativeErr := s.queuedTurnSessionIDsSQLite(ctx, afterSessionID, limit); handled || nativeErr != nil {
+		return nativeIDs, nativeMore, nativeErr
+	}
+	state, err := s.loadStateFieldsOrFull(ctx, stateFieldSet("turns"))
+	if err != nil {
+		return nil, false, err
+	}
+	afterSessionID = strings.TrimSpace(afterSessionID)
+	queuedBySession := make(map[string]struct{})
+	runningBySession := make(map[string]struct{})
+	for _, turn := range state.Turns {
+		sessionID := strings.TrimSpace(turn.SessionID)
+		if sessionID == "" {
+			continue
+		}
+		switch turn.Status {
+		case TurnStatusQueued:
+			queuedBySession[sessionID] = struct{}{}
+		case TurnStatusRunning:
+			runningBySession[sessionID] = struct{}{}
+		}
+	}
+	for sessionID := range queuedBySession {
+		if sessionID <= afterSessionID {
+			continue
+		}
+		if _, running := runningBySession[sessionID]; running {
+			continue
+		}
+		ids = append(ids, sessionID)
+	}
+	sort.Strings(ids)
+	if len(ids) > limit {
+		return ids[:limit], true, nil
+	}
+	return ids, false, nil
+}
+
 // TeamsOperationalBacklog returns the small durable work predicate used to
 // decide whether cold history/transcript discovery may run. SQLite answers it
 // from indexed projections and a bounded poll-frontier check; legacy JSON uses
@@ -3801,6 +4675,16 @@ func (s *Store) TeamsOperationalBacklog(ctx context.Context) (TeamsOperationalBa
 // orphaned or malformed queued row remains operational so a compatibility
 // repair/recovery path cannot be hidden by this fast probe.
 func inboundEventHasOperationalBacklog(event InboundEvent, turns map[string]Turn) bool {
+	// Registry migration projects the old SeenMessageIDs set into the inbound
+	// ledger as durable dedupe provenance.  Those rows intentionally have no
+	// turn and can never be admitted for execution; treating them as pending
+	// work keeps the optional-maintenance gate open forever on a migrated store.
+	// Keep the exclusion narrow: a migration row that was subsequently linked to
+	// a turn remains subject to the normal terminal-turn rules below.
+	if strings.TrimSpace(event.TurnID) == "" &&
+		strings.EqualFold(strings.TrimSpace(event.Source), "registry_migration") {
+		return false
+	}
 	// PersistInbound records provenance before QueueTurn links the event to a
 	// turn.  A later recovery/compatibility path can also leave a persisted or
 	// deferred row linked to a terminal turn.  Once that terminal durable turn
@@ -4767,6 +5651,20 @@ func (s *Store) SessionTranscriptDedupeSnapshot(ctx context.Context, sessionID s
 	if sessionID == "" {
 		return State{SchemaVersion: SchemaVersion}, nil
 	}
+	// A SQLite transcript snapshot is a read-only preflight. In particular, a
+	// legacy/untrusted outbox projection may require decoding the whole outbox
+	// JSON table. Do not hold Store.mu for that scan: the returned snapshot is
+	// only advisory and the subsequent durable transcript-delivery transaction
+	// rechecks its delivery/checkpoint/outbox rows and fences concurrent changes.
+	// If the SQLite pointer is replaced while the independent read is active,
+	// the helper fails closed and the caller can retry against the new store.
+	if state, handled, err := s.loadSQLiteSessionTranscriptDedupeState(ctx, sessionID, checkpointID); handled || err != nil {
+		if err != nil {
+			return State{}, err
+		}
+		state.ensure(time.Time{})
+		return state, nil
+	}
 	var state State
 	err := s.withStateLock(ctx, func() error {
 		if pointer, ok, err := s.currentSQLitePointerUnlocked(); err != nil || ok {
@@ -4774,7 +5672,7 @@ func (s *Store) SessionTranscriptDedupeSnapshot(ctx context.Context, sessionID s
 				return err
 			}
 			var loadErr error
-			state, loadErr = s.loadSQLiteSessionTranscriptDedupeStateUnlocked(pointer, sessionID, checkpointID)
+			state, loadErr = s.loadSQLiteSessionTranscriptDedupeStateUnlocked(ctx, pointer, sessionID, checkpointID)
 			return loadErr
 		}
 		selected, ok, err := s.loadSelectedStateFieldsUnlocked(ctx, transcriptDedupeSnapshotFields)
@@ -5197,6 +6095,7 @@ func applyRecordTranscriptCheckpointLocked(state *State, checkpoint ImportCheckp
 		SourceRewriteRecoveryModTime:    firstStoreNonZeroTime(checkpoint.SourceRewriteRecoveryModTime, previous.SourceRewriteRecoveryModTime),
 		SourceRewriteRecoveryChangeTime: firstStoreNonZeroInt64(checkpoint.SourceRewriteRecoveryChangeTime, previous.SourceRewriteRecoveryChangeTime),
 		CompletionPending:               previous.CompletionPending || checkpoint.CompletionPending,
+		DeliveryNeedsAttention:          previous.DeliveryNeedsAttention && !importCheckpointIsExplicitHistoryRun(previous),
 		LegacyProbeRevision:             firstStoreNonEmptyString(checkpoint.LegacyProbeRevision, previous.LegacyProbeRevision),
 		// Preserve the monotonic generation even when a normal transcript
 		// checkpoint update does not carry an anchor.  A late callback must not
@@ -5321,7 +6220,7 @@ func (s *Store) SessionWorkflowEventSnapshot(ctx context.Context, sessionID stri
 				return err
 			}
 			var loadErr error
-			state, loadErr = s.loadSQLiteSessionTurnQueueStateUnlocked(pointer, sessionID, true)
+			state, loadErr = s.loadSQLiteSessionTurnQueueStateUnlocked(ctx, pointer, sessionID, true)
 			return loadErr
 		}
 		selected, ok, err := s.loadSelectedStateFieldsUnlocked(ctx, workflowEventStateSnapshotFields)
@@ -5363,7 +6262,7 @@ func (s *Store) SessionWorkflowEventSnapshotForTurn(ctx context.Context, session
 				return err
 			}
 			var loadErr error
-			state, loadErr = s.loadSQLiteSessionWorkflowEventForTurnUnlocked(pointer, sessionID, turnID)
+			state, loadErr = s.loadSQLiteSessionWorkflowEventForTurnUnlocked(ctx, pointer, sessionID, turnID)
 			return loadErr
 		}
 		selected, ok, err := s.loadSelectedStateFieldsUnlocked(ctx, workflowEventStateSnapshotFields)
@@ -5401,10 +6300,10 @@ func (s *Store) SessionThreadResolutionSnapshot(ctx context.Context, sessionID s
 				return err
 			}
 			var loadErr error
-			state, loadErr = s.loadSQLiteSessionThreadResolutionStateUnlocked(pointer, sessionID)
+			state, loadErr = s.loadSQLiteSessionThreadResolutionStateUnlocked(ctx, pointer, sessionID)
 			return loadErr
 		}
-		selected, ok, err := s.loadSelectedStateFieldsUnlocked(ctx, workflowEventStateSnapshotFields)
+		selected, ok, err := s.loadSelectedStateFieldsUnlocked(ctx, threadResolutionStateSnapshotFields)
 		if err != nil {
 			return err
 		}
@@ -5443,7 +6342,7 @@ func (s *Store) SessionTurnQueueSnapshot(ctx context.Context, sessionID string) 
 				return err
 			}
 			var loadErr error
-			state, loadErr = s.loadSQLiteSessionTurnQueueStateUnlocked(pointer, sessionID, false)
+			state, loadErr = s.loadSQLiteSessionTurnQueueStateUnlocked(ctx, pointer, sessionID, false)
 			return loadErr
 		}
 		selected, ok, err := s.loadSelectedStateFieldsUnlocked(ctx, turnQueueStateSnapshotFields)
@@ -5481,7 +6380,7 @@ func (s *Store) RecentSessionInboundTurnSnapshot(ctx context.Context, sessionID 
 				return err
 			}
 			var loadErr error
-			state, loadErr = s.loadSQLiteRecentSessionInboundTurnStateUnlocked(pointer, sessionID, since)
+			state, loadErr = s.loadSQLiteRecentSessionInboundTurnStateUnlocked(ctx, pointer, sessionID, since)
 			return loadErr
 		}
 		selected, ok, err := s.loadSelectedStateFieldsUnlocked(ctx, turnQueueStateSnapshotFields)
@@ -5559,8 +6458,133 @@ func (s *Store) TurnByID(ctx context.Context, turnID string) (Turn, bool, error)
 	return turn, ok, nil
 }
 
+// HasTeamsInboundTurnProof verifies the narrow durable proof used when a
+// linked transcript root was produced by a Teams turn.  This is deliberately
+// a point/row-scoped read: root-release recovery must not call Load and decode
+// the unrelated outbox, history, and delivery ledgers just to decide whether
+// one marker turn is safe to consume.
+//
+// The proof matches the historical semantics exactly: a turn must belong to
+// the requested session and Codex thread, its Codex turn ID must match, and
+// its linked inbound event must be a Teams event from the same session.  An
+// empty inbound Teams chat remains accepted for legacy rows; a non-empty chat
+// must match the session binding.
+func (s *Store) HasTeamsInboundTurnProof(ctx context.Context, sessionID string, codexThreadID string, codexTurnID string, teamsChatID string) (bool, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	codexThreadID = strings.TrimSpace(codexThreadID)
+	codexTurnID = strings.TrimSpace(codexTurnID)
+	teamsChatID = strings.TrimSpace(teamsChatID)
+	if sessionID == "" || codexThreadID == "" || codexTurnID == "" {
+		return false, nil
+	}
+	if found, handled, err := s.hasTeamsInboundTurnProofSQLite(ctx, sessionID, codexThreadID, codexTurnID, teamsChatID); handled || err != nil {
+		return found, err
+	}
+	state, err := s.loadStateFieldsOrFull(ctx, turnQueueStateSnapshotFields)
+	if err != nil {
+		return false, err
+	}
+	return hasTeamsInboundTurnProofInState(state, sessionID, codexThreadID, codexTurnID, teamsChatID), nil
+}
+
+func hasTeamsInboundTurnProofInState(state State, sessionID string, codexThreadID string, codexTurnID string, teamsChatID string) bool {
+	for _, turn := range state.Turns {
+		if strings.TrimSpace(turn.SessionID) != sessionID ||
+			strings.TrimSpace(turn.CodexThreadID) != codexThreadID ||
+			strings.TrimSpace(turn.CodexTurnID) != codexTurnID ||
+			strings.TrimSpace(turn.InboundEventID) == "" {
+			continue
+		}
+		inbound, ok := state.InboundEvents[turn.InboundEventID]
+		if ok && teamsInboundTurnProofMatches(inbound, sessionID, teamsChatID) {
+			return true
+		}
+	}
+	return false
+}
+
+func teamsInboundTurnProofMatches(inbound InboundEvent, sessionID string, teamsChatID string) bool {
+	return strings.EqualFold(strings.TrimSpace(inbound.Source), "teams") &&
+		strings.TrimSpace(inbound.SessionID) == sessionID &&
+		(strings.TrimSpace(inbound.TeamsChatID) == "" || strings.TrimSpace(inbound.TeamsChatID) == teamsChatID)
+}
+
 func (s *Store) OutboxStateSnapshot(ctx context.Context) (State, error) {
 	return s.loadStateFieldsOrFull(ctx, outboxStateSnapshotFields)
+}
+
+// ReadControlChat returns only the durable control-chat binding.  Listener
+// startup uses this as a compatibility fallback when the registry projection
+// is empty; it must not pull the outbox or inbound tables into memory.
+func (s *Store) ReadControlChat(ctx context.Context) (ControlChatBinding, error) {
+	state, err := s.loadStateFieldsOrFull(ctx, stateFieldSet("control_chat"))
+	if err != nil {
+		return ControlChatBinding{}, err
+	}
+	return state.ControlChat, nil
+}
+
+// FindOutboxMessageByChatKindBodyAfter finds one historical outbox row using
+// its durable destination/kind/body identity.  This is intentionally a
+// targeted compatibility lookup for startup recovery; callers must not use it
+// as a general delivery queue.  SQLite evaluates the predicates in the
+// database and decodes only a matching row, while the legacy JSON backend
+// retains its existing outbox-only compatibility snapshot.
+func (s *Store) FindOutboxMessageByChatKindBodyAfter(ctx context.Context, chatID string, kind string, body string, createdAfter time.Time) (OutboxMessage, bool, error) {
+	chatID = strings.TrimSpace(chatID)
+	kind = strings.TrimSpace(kind)
+	body = strings.TrimSpace(body)
+	if chatID == "" || kind == "" {
+		return OutboxMessage{}, false, nil
+	}
+	if message, found, handled, err := s.findOutboxMessageByChatKindBodyAfterSQLite(ctx, chatID, kind, body, createdAfter); handled || err != nil {
+		return message, found, err
+	}
+	state, err := s.OutboxStateSnapshot(ctx)
+	if err != nil {
+		return OutboxMessage{}, false, err
+	}
+	var best OutboxMessage
+	found := false
+	for _, message := range state.OutboxMessages {
+		if strings.TrimSpace(message.TeamsChatID) != chatID ||
+			!strings.EqualFold(strings.TrimSpace(message.Kind), kind) ||
+			strings.TrimSpace(message.Body) != body {
+			continue
+		}
+		if !createdAfter.IsZero() && !message.CreatedAt.IsZero() && message.CreatedAt.Before(createdAfter) {
+			continue
+		}
+		if !found || message.CreatedAt.After(best.CreatedAt) {
+			best = message
+			found = true
+		}
+	}
+	return best, found, nil
+}
+
+// ActiveOutboxAttachmentPaths returns paths that must be retained while an
+// outbox row can still perform a Graph send.  Startup cleanup only needs this
+// narrow protection set; loading every inbound, turn, and history row here
+// can starve the owner heartbeat on a large SQLite store.
+func (s *Store) ActiveOutboxAttachmentPaths(ctx context.Context) ([]string, error) {
+	if paths, handled, err := s.activeOutboxAttachmentPathsSQLite(ctx); handled || err != nil {
+		return paths, err
+	}
+	state, err := s.OutboxStateSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	paths := make([]string, 0)
+	for _, message := range state.OutboxMessages {
+		switch message.Status {
+		case OutboxStatusQueued, OutboxStatusSending, OutboxStatusAccepted:
+			if path := strings.TrimSpace(message.AttachmentPath); path != "" {
+				paths = append(paths, path)
+			}
+		}
+	}
+	return paths, nil
 }
 
 // RecentOutboxEchoCandidates returns a strictly bounded set of outbox rows for
@@ -5841,8 +6865,11 @@ func jsonSelectedStateFieldSetSupported(fields map[string]struct{}) bool {
 		exactStateFieldSet(fields, "control_chat", "turns", "chat_polls", "import_checkpoints", "service_owner") ||
 		exactStateFieldSet(fields, "sessions", "turns", "import_checkpoints", "service_owner") ||
 		exactStateFieldSet(fields, "turns", "inbound_events", "chat_polls") ||
+		exactStateFieldSet(fields, "sessions", "turns", "inbound_events") ||
 		exactStateFieldSet(fields, "turns", "inbound_events") ||
+		exactStateFieldSet(fields, "inbound_events") ||
 		exactStateFieldSet(fields, "history_watch", "history_watch_ready") ||
+		exactStateFieldSet(fields, "dashboard_views", "dashboard_numbers") ||
 		exactStateFieldSet(fields, "outbox_messages", "chat_rate_limits") ||
 		exactStateFieldSet(fields, "outbox_messages") ||
 		exactStateFieldSet(fields, "chat_rate_limits") ||
@@ -6001,7 +7028,7 @@ func loadSelectedStateFieldsData(data []byte, wantedFields map[string]struct{}) 
 				rawValue := data[valueStart:valueEnd]
 				var decodeErr error
 				switch key {
-				case "import_checkpoints", "chat_polls", "sessions", "turns":
+				case "import_checkpoints", "chat_polls", "sessions", "turns", "outbox_messages":
 					var rows map[string]json.RawMessage
 					if err := json.Unmarshal(rawValue, &rows); err != nil {
 						decodeErr = err
@@ -6020,6 +7047,12 @@ func loadSelectedStateFieldsData(data []byte, wantedFields map[string]struct{}) 
 					case "turns":
 						state.Turns = make(map[string]Turn, len(rows))
 						decodeErr = decodeJSONTurnRows(rows, state.Turns, true)
+					case "outbox_messages":
+						state.OutboxMessages = make(map[string]OutboxMessage, len(rows))
+						decodeErr = decodeJSONOutboxRows(rows, state.OutboxMessages)
+						if legacyOpaqueJSONSectionsForRows(nil, nil, nil, nil, rows, nil)&legacyOpaqueOutbox != 0 {
+							state.legacyOpaqueJSONSections |= legacyOpaqueOutbox
+						}
 					}
 				default:
 					decodeErr = json.Unmarshal(rawValue, fieldValue.Addr().Interface())
@@ -6052,6 +7085,9 @@ func loadSelectedStateFieldsData(data []byte, wantedFields map[string]struct{}) 
 		return State{}, false, nil
 	}
 	state.SchemaVersion = schemaVersion
+	if _, wantsPolls := wantedFields["chat_polls"]; wantsPolls {
+		applyLegacyChatPollRetryGates(data, &state)
+	}
 	normalizeLoadedState(&state)
 	return state, true, nil
 }
@@ -6379,6 +7415,9 @@ func scanJSONValueEnd(data []byte, start int) (int, bool) {
 }
 
 func (s *Store) Update(ctx context.Context, fn func(*State) error) error {
+	if err := s.ensureSQLiteSchemaPreparedForUse(ctx); err != nil {
+		return err
+	}
 	return s.withStateLock(ctx, func() error {
 		state, err := s.loadUnlocked(ctx)
 		if err != nil {
@@ -6403,13 +7442,50 @@ func (s *Store) Update(ctx context.Context, fn func(*State) error) error {
 }
 
 func (s *Store) UpdateIfChanged(ctx context.Context, fn func(*State) (bool, error)) error {
-	return s.Update(ctx, func(state *State) error {
-		changed, err := fn(state)
+	return s.updateIfChangedWithCapability(ctx, storeOwnerCapability{}, fn)
+}
+
+// UpdateIfChangedForOwner applies a full-state compatibility update only while
+// the supplied control-lease capability is current. The state/file lock keeps
+// the capability check and the save in one critical section, so a takeover
+// cannot be followed by a stale JSON write from the previous owner.
+func (s *Store) UpdateIfChangedForOwner(ctx context.Context, machineID string, leaseGeneration int64, fn func(*State) (bool, error)) error {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return err
+	}
+	return s.updateIfChangedWithCapability(ctx, capability, fn)
+}
+
+func (s *Store) updateIfChangedWithCapability(ctx context.Context, capability storeOwnerCapability, fn func(*State) (bool, error)) error {
+	if err := s.ensureSQLiteSchemaPreparedForUse(ctx); err != nil {
+		return err
+	}
+	return s.withStateLock(ctx, func() error {
+		state, err := s.loadUnlocked(ctx)
+		if err != nil {
+			return err
+		}
+		if err := validateStoreOwnerCapability(&state, capability); err != nil {
+			return err
+		}
+		changed, err := fn(&state)
 		if err != nil {
 			return err
 		}
 		if !changed {
-			return errStoreNoChange
+			return nil
+		}
+		if err := validateStoreOwnerCapability(&state, capability); err != nil {
+			return err
+		}
+		state.ensure(time.Now())
+		if err := s.saveUnlocked(ctx, state); err != nil {
+			s.invalidateMessageLookupCacheLocked()
+			return err
+		}
+		if s.messageLookup.Valid {
+			s.replaceMessageLookupCacheFromStateLocked(state)
 		}
 		return nil
 	})
@@ -7314,7 +8390,6 @@ func claimControlLeaseInState(state *State, claim ControlLeaseClaim) (ControlLea
 		claim.Scope.CreatedAt = state.Scope.CreatedAt
 	}
 	claim.Scope.UpdatedAt = now
-	state.Scope = claim.Scope
 
 	machine := claim.Machine
 	existingMachine := state.Machines[machine.ID]
@@ -7350,7 +8425,14 @@ func claimControlLeaseInState(state *State, claim ControlLeaseClaim) (ControlLea
 		!existing.LeaseUntil.IsZero() ||
 		!existing.LastHeartbeat.IsZero() ||
 		!existing.UpdatedAt.IsZero()
-	existingLive := existing.HolderMachineID != "" && existing.ScopeID == claim.Scope.ID && existing.LeaseUntil.After(now)
+	// ScopeID was added after the original holder/expiry lease tuple.  A
+	// complete legacy tuple with a missing scope is still evidence of a live
+	// owner until its expiry; treating the empty field as a mismatch would let
+	// the first post-upgrade claimant overwrite that owner while it is alive.
+	// A non-empty scope was checked above and must match exactly.
+	existingScopeMatches := strings.TrimSpace(existing.ScopeID) == "" ||
+		strings.TrimSpace(existing.ScopeID) == strings.TrimSpace(claim.Scope.ID)
+	existingLive := existing.HolderMachineID != "" && existingScopeMatches && existing.LeaseUntil.After(now)
 	sameHolder := existingLive && existing.HolderMachineID == machine.ID
 	liveLeaseOwner := false
 	sameOwner := false
@@ -7390,6 +8472,11 @@ func claimControlLeaseInState(state *State, claim ControlLeaseClaim) (ControlLea
 	}
 	canClaim := (!existingLive || sameHolder && (!liveLeaseOwner || sameOwner) || machine.Priority > existing.Priority && !liveLeaseOwner && !protectedActiveTurn) && !legacyOwnerLive && !activeOwnerUntrusted
 	if canClaim {
+		// Do not publish a claimant's scope while it is in standby.  The outer
+		// State.Update persists every mutation even when this reducer returns a
+		// standby decision; replacing a missing/legacy scope before the lease
+		// decision would detach the live owner's lease from its durable scope.
+		state.Scope = claim.Scope
 		if priorLeaseKnown && !sameOwner {
 			// Claiming a replacement generation is the durable hand-off point.
 			// Clear both compatibility owner projections here so the subsequent
@@ -8236,6 +9323,29 @@ func recordOwnerHeartbeatInState(state *State, owner OwnerMetadata, staleAfter t
 	if now.IsZero() {
 		now = time.Now()
 	}
+	// RecordOwnerHeartbeat is retained as a compatibility API, but it must not
+	// resurrect an old owner after a generation takeover.  The legacy method is
+	// intentionally allowed to create an owner when there is no active lease;
+	// once a live lease exists, however, only the matching machine/generation is
+	// allowed to write the owner projection.  Keep the traditional conflict
+	// error when a different current owner is visible, and use the lease error
+	// when the old projection was already cleared.
+	activeLease := strings.TrimSpace(state.ControlLease.HolderMachineID) != "" && state.ControlLease.LeaseUntil.After(now)
+	// The generic capability matcher intentionally treats generation zero as an
+	// unbound legacy operation when no active lease is being fenced.  A live
+	// control lease is different: an unscoped compatibility heartbeat must never
+	// recreate an owner row over that lease after a generation hand-off.
+	if activeLease && (owner.LeaseGeneration <= 0 ||
+		!controlLeaseMatchesCapabilityAt(state, owner.MachineID, owner.LeaseGeneration, now)) {
+		if existing, ok := state.readOwner(); ok && ownerMatchesControlLease(existing, state.ControlLease) && !sameOwnerProcess(existing, owner) {
+			return OwnerMetadata{}, &OwnerConflictError{
+				Existing:   existing,
+				Now:        now,
+				StaleAfter: staleAfter,
+			}
+		}
+		return OwnerMetadata{}, ErrControlLeaseNotHeld
+	}
 	next, err := owner.withHeartbeat(now)
 	if err != nil {
 		return OwnerMetadata{}, err
@@ -8284,7 +9394,7 @@ func (s *Store) ClearOwnerIfSame(ctx context.Context, owner OwnerMetadata) (bool
 	cleared := false
 	update := func(state *State) error {
 		existing, ok := state.readOwner()
-		if !ok || !sameOwnerInstance(existing, owner) {
+		if !ok || !sameOwnerForLeaseCleanup(existing, owner) {
 			return errStoreNoChange
 		}
 		state.ServiceOwner = nil
@@ -8406,7 +9516,15 @@ func (s *Store) UpdateSession(ctx context.Context, sessionID string, fn func(*St
 		return fmt.Errorf("session id is required")
 	}
 	return s.withSessionLock(ctx, sessionID, func() error {
-		return s.Update(ctx, fn)
+		return s.Update(ctx, func(state *State) error {
+			before, beforeFound := state.Sessions[sessionID]
+			if err := fn(state); err != nil {
+				return err
+			}
+			after, afterFound := state.Sessions[sessionID]
+			fenceSessionBindingPollAttempt(state, before, beforeFound, after, afterFound, time.Now())
+			return nil
+		})
 	})
 }
 
@@ -8465,12 +9583,62 @@ func (s *Store) updateSessionContextWithCapability(ctx context.Context, sessionI
 				next.UpdatedAt = now
 			}
 			state.Sessions[sessionID] = next
+			fenceSessionBindingPollAttempt(state, current, found, next, true, now)
 			out = next
 			changed = true
 			return nil
 		})
 	})
 	return out, changed, err
+}
+
+// fenceSessionBindingPollAttempt makes a session lifecycle/binding change a
+// durable poll frontier boundary.  Poll attempts are chat-scoped, so the old
+// chat row is the narrowest durable fence available without adding a second
+// session frontier: a delayed callback must observe the advanced poll
+// revision (or the cleared attempt) and become a no-op.  Only the previous
+// binding is fenced; binding a session to a new/shared chat must not cancel an
+// unrelated poll owner already serving that chat.
+func fenceSessionBindingPollAttempt(state *State, before SessionContext, beforeFound bool, after SessionContext, afterFound bool, now time.Time) {
+	if state == nil || !beforeFound || !sessionBindingChanged(before, after, afterFound) {
+		return
+	}
+	chatID := strings.TrimSpace(before.TeamsChatID)
+	if chatID == "" || state.ChatPolls == nil {
+		return
+	}
+	poll, ok := state.ChatPolls[chatID]
+	if !ok {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	poll.PollRevision++
+	poll.ScheduleRevision++
+	poll.Attempt = nil
+	poll.UpdatedAt = now
+	state.ChatPolls[chatID] = poll
+}
+
+func sessionBindingChanged(before, after SessionContext, afterFound bool) bool {
+	if !afterFound {
+		return true
+	}
+	if strings.TrimSpace(before.TeamsChatID) != strings.TrimSpace(after.TeamsChatID) {
+		return true
+	}
+	// Empty status is the legacy spelling of active.  Treating that
+	// normalization as a lifecycle change would fence every old row during
+	// migration, while closed/quarantined/rebound transitions must fence.
+	normalize := func(status SessionStatus) string {
+		value := strings.TrimSpace(string(status))
+		if value == "" {
+			return string(SessionStatusActive)
+		}
+		return value
+	}
+	return normalize(before.Status) != normalize(after.Status)
 }
 
 func (s *Store) UpdateInboundEvent(ctx context.Context, inboundID string, fn func(InboundEvent, bool, time.Time) (InboundEvent, bool, error)) (InboundEvent, bool, error) {
@@ -9043,6 +10211,74 @@ func (s *Store) DeferredInbound(ctx context.Context) ([]InboundEvent, error) {
 	return out, nil
 }
 
+// InboundRecoveryCandidates returns durable inbound rows that can still be
+// admitted after a process interruption.  PersistInbound and QueueTurn are
+// deliberately separate durable boundaries: a poll worker may commit the
+// inbound row and then lose its short phase context before it can link a turn.
+// Such a row is not safe to rediscover from Graph, but it is safe to repair by
+// replaying the ordinary owner/fence-checked QueueTurn path.
+//
+// Deferred rows retain their historical behavior, including rows that already
+// carry a turn link (QueueTurn is idempotent for those), except that a durable
+// NextAttemptAt gate keeps a failed row out of recovery until its retry window.
+// Persisted/queued rows are candidates only while their turn link is empty.
+// Registry migration rows are dedupe provenance rather than executable user
+// input and are excluded.
+func (s *Store) InboundRecoveryCandidates(ctx context.Context) ([]InboundEvent, error) {
+	if out, handled, err := s.inboundRecoveryCandidatesSQLite(ctx); handled || err != nil {
+		return out, err
+	}
+	state, err := s.loadStateFieldsOrFull(ctx, deferredInboundStateFields)
+	if err != nil {
+		return nil, err
+	}
+	var out []InboundEvent
+	now := time.Now()
+	for _, event := range state.InboundEvents {
+		if inboundRecoveryCandidateReady(event, now) {
+			out = append(out, event)
+		}
+	}
+	sortInboundEvents(out)
+	return out, nil
+}
+
+func inboundRecoveryCandidateReady(event InboundEvent, now time.Time) bool {
+	if !inboundRecoveryCandidate(event) {
+		return false
+	}
+	if event.Status != InboundStatusDeferred || event.NextAttemptAt.IsZero() {
+		return true
+	}
+	return !event.NextAttemptAt.After(now)
+}
+
+func inboundRecoveryCandidate(event InboundEvent) bool {
+	if strings.EqualFold(strings.TrimSpace(event.Source), "registry_migration") && strings.TrimSpace(event.TurnID) == "" {
+		return false
+	}
+	switch event.Status {
+	case InboundStatusDeferred:
+		return true
+	case InboundStatusPersisted, InboundStatusQueued:
+		return strings.TrimSpace(event.TurnID) == ""
+	default:
+		return false
+	}
+}
+
+func sortInboundEvents(events []InboundEvent) {
+	sort.Slice(events, func(i, j int) bool {
+		if events[i].TeamsChatID != events[j].TeamsChatID {
+			return events[i].TeamsChatID < events[j].TeamsChatID
+		}
+		if !events[i].CreatedAt.Equal(events[j].CreatedAt) {
+			return events[i].CreatedAt.Before(events[j].CreatedAt)
+		}
+		return events[i].TeamsMessageID < events[j].TeamsMessageID
+	})
+}
+
 func HasUpgradeBlockingWork(state State, now time.Time) bool {
 	return len(UpgradeBlockers(state, now)) > 0
 }
@@ -9188,7 +10424,12 @@ func IsLegacyHistoryGateNoticeForSend(msg OutboxMessage) bool {
 	case "sync-status-backlog-blocked", "sync-status-source-rewritten", "sync-status-tail-too-large":
 		return true
 	case "import-needs-attention", "import-bg-needs-attention":
-		return strings.HasPrefix(strings.TrimSpace(msg.TurnID), "import-bg:")
+		// The kind and import turn prefix alone are not sufficient: a real
+		// import-needs-attention notice is user-visible work and must still be
+		// sent. Reuse the exact legacy body marker used by the migration
+		// classifier while keeping this sender-side check bounded to the two
+		// known compatibility kinds.
+		return IsLegacyHistoryGateNotice(msg)
 	default:
 		return false
 	}
@@ -9293,7 +10534,8 @@ func isRecoverableTranscriptOutboxSkip(msg OutboxMessage) bool {
 	}
 	reason := strings.ToLower(strings.TrimSpace(msg.LastSendError))
 	return reason == "obsolete pre-source-proof transcript row" ||
-		strings.HasPrefix(reason, "transcript source provenance was rewritten before graph ")
+		strings.HasPrefix(reason, "transcript source provenance was rewritten before graph ") ||
+		strings.HasPrefix(reason, "permanent graph rejection: ")
 }
 
 func legacyHistoryGateNoticeRetirable(msg OutboxMessage, now time.Time, includeActiveSending bool) bool {
@@ -9399,6 +10641,25 @@ func OutboxSendRecoveryEligible(msg OutboxMessage, now time.Time) bool {
 	return outboxSendUnknownOutcome(msg, now)
 }
 
+// OutboxSendRecoveryEligibleForOwner also admits a tokenful, markerless
+// Sending row left by a different control-lease generation.  The control
+// lease proves that the old writer is no longer allowed to commit; the
+// replacement still only binds the attempt and performs a read-only Graph
+// reconciliation, never a new POST.  Fresh markerless rows without an owner
+// token remain lease-expiry gated because their external writer cannot be
+// safely distinguished from a live sender.
+func OutboxSendRecoveryEligibleForOwner(msg OutboxMessage, now time.Time, machineID string, leaseGeneration int64) bool {
+	if outboxSendUnknownOutcome(msg, now) {
+		return true
+	}
+	return msg.Status == OutboxStatusSending &&
+		strings.TrimSpace(msg.TeamsMessageID) == "" &&
+		strings.TrimSpace(msg.SendAttemptToken) != "" &&
+		strings.TrimSpace(msg.MachineID) != "" &&
+		leaseGeneration > 0 &&
+		(strings.TrimSpace(msg.MachineID) != strings.TrimSpace(machineID) || msg.LeaseGeneration != leaseGeneration)
+}
+
 func (s *Store) QueueTurn(ctx context.Context, turn Turn) (Turn, bool, error) {
 	if strings.TrimSpace(turn.SessionID) == "" {
 		return Turn{}, false, fmt.Errorf("session id is required")
@@ -9415,18 +10676,67 @@ func (s *Store) QueueTurn(ctx context.Context, turn Turn) (Turn, bool, error) {
 		if strings.TrimSpace(turn.ID) == "" {
 			return fmt.Errorf("turn id or inbound event id is required")
 		}
+		reconcileExisting := func(existing Turn) error {
+			if err := validateQueueTurnSession(turn.SessionID, existing, nil); err != nil {
+				return err
+			}
+			inboundID := strings.TrimSpace(turn.InboundEventID)
+			if inboundID == "" {
+				return nil
+			}
+			inbound, found := state.InboundEvents[inboundID]
+			if found {
+				if err := validateQueueTurnSession(turn.SessionID, existing, &inbound); err != nil {
+					return err
+				}
+			}
+			if !found || !inboundCanBeReconciledWithTurn(inbound, inboundID, existing) {
+				return nil
+			}
+			nextInbound := inbound
+			if !reconcileInboundWithExistingTurn(&nextInbound, inboundID, existing, time.Time{}) {
+				// The duplicate lookup is read-only when the durable inbound is already
+				// queued and linked. Do not require a live owner capability for that
+				// no-op: direct/unit callers and legacy rows may intentionally have no
+				// lease, while a real repair below remains owner-fenced.
+				return nil
+			}
+			capability := storeOwnerCapability{machineID: strings.TrimSpace(turn.MachineID), leaseGeneration: turn.LeaseGeneration}
+			if err := validateStoreOwnerCapability(state, capability); err != nil {
+				return err
+			}
+			if err := validateInboundOwnerCapability(state, inbound, true, capability); err != nil {
+				return err
+			}
+			now := time.Now()
+			reconcileInboundWithExistingTurn(&nextInbound, inboundID, existing, now)
+			state.InboundEvents[nextInbound.ID] = nextInbound
+			return nil
+		}
 		if existing, ok := state.Turns[turn.ID]; ok {
 			out = existing
-			return nil
+			return reconcileExisting(existing)
 		}
 		if turn.InboundEventID != "" {
 			if inbound, ok := state.InboundEvents[turn.InboundEventID]; ok {
+				if err := validateQueueTurnSession(turn.SessionID, Turn{}, &inbound); err != nil {
+					return err
+				}
 				if inbound.TurnID != "" {
 					if existing, ok := state.Turns[inbound.TurnID]; ok {
 						out = existing
-						return nil
+						return reconcileExisting(existing)
 					}
 				}
+			}
+			if existing, ok, err := findTurnByInboundEventIDLocked(state, turn.InboundEventID); err != nil {
+				return err
+			} else if ok {
+				out = existing
+				return reconcileExisting(existing)
+			}
+			if _, ok := state.InboundEvents[turn.InboundEventID]; !ok {
+				return fmt.Errorf("%w: %q", ErrInboundNotFound, strings.TrimSpace(turn.InboundEventID))
 			}
 		}
 		if !storeOwnerCapabilityMatchesState(state, turn.MachineID, turn.LeaseGeneration) {
@@ -9441,6 +10751,13 @@ func (s *Store) QueueTurn(ctx context.Context, turn Turn) (Turn, bool, error) {
 		}
 		if !sessionStatusIsActive(session.Status) {
 			return fmt.Errorf("session %q is not active", turn.SessionID)
+		}
+		if inboundID := strings.TrimSpace(turn.InboundEventID); inboundID != "" {
+			if inbound, ok := state.InboundEvents[inboundID]; !ok {
+				return fmt.Errorf("%w: %q", ErrInboundNotFound, inboundID)
+			} else if err := validateInboundSessionChat(session, inbound); err != nil {
+				return err
+			}
 		}
 		if _, fenced := activeForkForSessionLocked(state, turn.SessionID); fenced {
 			return ErrForkParentFenced
@@ -9476,6 +10793,7 @@ func (s *Store) QueueTurn(ctx context.Context, turn Turn) (Turn, bool, error) {
 			if inbound, ok := state.InboundEvents[turn.InboundEventID]; ok {
 				inbound.TurnID = turn.ID
 				inbound.Status = InboundStatusQueued
+				clearInboundRetryMetadata(&inbound)
 				inbound.UpdatedAt = now
 				state.InboundEvents[inbound.ID] = inbound
 			}
@@ -9485,6 +10803,105 @@ func (s *Store) QueueTurn(ctx context.Context, turn Turn) (Turn, bool, error) {
 		return nil
 	})
 	return out, created, err
+}
+
+// inboundCanBeReconciledWithTurn is deliberately stricter than a plain ID
+// lookup.  An existing Turn may have been addressed by an explicit caller
+// with a colliding ID; only the durable inbound link, an existing inbound
+// link back to that Turn, or the deterministic turn ID generated from this
+// inbound can authorize repairing the inbound row.
+func inboundCanBeReconciledWithTurn(inbound InboundEvent, inboundID string, turn Turn) bool {
+	inboundID = strings.TrimSpace(inboundID)
+	if inboundID == "" || strings.TrimSpace(turn.ID) == "" || inbound.Status == InboundStatusIgnored {
+		return false
+	}
+	if strings.TrimSpace(turn.InboundEventID) == inboundID {
+		return true
+	}
+	if strings.TrimSpace(inbound.TurnID) == strings.TrimSpace(turn.ID) {
+		return true
+	}
+	return strings.TrimSpace(turn.InboundEventID) == "" && strings.TrimSpace(turn.ID) == turnID(inboundID)
+}
+
+// validateQueueTurnSession keeps the idempotent lookup scoped to the requested
+// durable session. Empty inbound session IDs are accepted for old legacy rows
+// that predate the field; a populated foreign session ID, or a populated Turn
+// belonging to another session, is never guessed across.
+func validateQueueTurnSession(requestedSessionID string, turn Turn, inbound *InboundEvent) error {
+	requestedSessionID = strings.TrimSpace(requestedSessionID)
+	if requestedSessionID == "" {
+		return fmt.Errorf("session id is required")
+	}
+	if observed := strings.TrimSpace(turn.SessionID); observed != "" && observed != requestedSessionID {
+		return fmt.Errorf("%w: turn %q belongs to session %q, requested %q", ErrSessionStateProvenanceMismatch, strings.TrimSpace(turn.ID), observed, requestedSessionID)
+	}
+	if inbound == nil {
+		return nil
+	}
+	if inbound.Status == InboundStatusIgnored {
+		return fmt.Errorf("%w: inbound %q", ErrInboundIgnored, strings.TrimSpace(inbound.ID))
+	}
+	if observed := strings.TrimSpace(inbound.SessionID); observed != "" && observed != requestedSessionID {
+		return fmt.Errorf("%w: inbound %q belongs to session %q, requested %q", ErrSessionStateProvenanceMismatch, strings.TrimSpace(inbound.ID), observed, requestedSessionID)
+	}
+	return nil
+}
+
+func validateInboundSessionChat(session SessionContext, inbound InboundEvent) error {
+	chatID := strings.TrimSpace(session.TeamsChatID)
+	inboundChatID := strings.TrimSpace(inbound.TeamsChatID)
+	if chatID != "" && inboundChatID != "" && chatID != inboundChatID {
+		return fmt.Errorf("%w: inbound %q belongs to chat %q, requested session chat %q", ErrSessionStateProvenanceMismatch, strings.TrimSpace(inbound.ID), inboundChatID, chatID)
+	}
+	return nil
+}
+
+// reconcileInboundWithExistingTurn settles the durable boundary left behind
+// when PersistInbound committed before QueueTurn, but a later recovery found
+// that another attempt had already created the Turn.  It does not touch the
+// Turn or any executor/outbox state.  The caller has already validated the
+// owner capability and performs this update in the same durable critical
+// section as the idempotent lookup.
+func reconcileInboundWithExistingTurn(inbound *InboundEvent, inboundID string, turn Turn, now time.Time) bool {
+	if inbound == nil || !inboundCanBeReconciledWithTurn(*inbound, inboundID, turn) {
+		return false
+	}
+	changed := strings.TrimSpace(inbound.TurnID) != strings.TrimSpace(turn.ID) || inbound.Status != InboundStatusQueued || !inbound.NextAttemptAt.IsZero() || inbound.FailureCount != 0 || strings.TrimSpace(inbound.LastError) != ""
+	inbound.TurnID = strings.TrimSpace(turn.ID)
+	inbound.Status = InboundStatusQueued
+	clearInboundRetryMetadata(inbound)
+	if !now.IsZero() {
+		inbound.UpdatedAt = now
+	}
+	return changed
+}
+
+func clearInboundRetryMetadata(inbound *InboundEvent) {
+	if inbound == nil {
+		return
+	}
+	inbound.NextAttemptAt = time.Time{}
+	inbound.FailureCount = 0
+	inbound.LastError = ""
+}
+
+func findTurnByInboundEventIDLocked(state *State, inboundID string) (Turn, bool, error) {
+	inboundID = strings.TrimSpace(inboundID)
+	if state == nil || inboundID == "" {
+		return Turn{}, false, nil
+	}
+	var found Turn
+	for _, candidate := range state.Turns {
+		if strings.TrimSpace(candidate.InboundEventID) != inboundID {
+			continue
+		}
+		if found.ID != "" && strings.TrimSpace(found.ID) != strings.TrimSpace(candidate.ID) {
+			return Turn{}, false, fmt.Errorf("%w: inbound %q is claimed by %q and %q", ErrInboundTurnConflict, inboundID, found.ID, candidate.ID)
+		}
+		found = candidate
+	}
+	return found, found.ID != "", nil
 }
 
 func (s *Store) MarkTurnRunning(ctx context.Context, turnID string, codexThreadID string, codexTurnID string) (Turn, error) {
@@ -9571,9 +10988,14 @@ func (s *Store) ClaimNextQueuedTurn(ctx context.Context, sessionID string) (Turn
 }
 
 // ClaimNextQueuedTurnForOwner claims and binds a queued live turn to the
-// current control lease in the same durable mutation.  A zero-capability
-// queued legacy row is bound here for upgrade compatibility; a row already
-// bound to another owner is rejected instead of being silently adopted.
+// current control lease in the same durable mutation. A zero-capability queued
+// legacy row is bound here for upgrade compatibility. A row bound to the
+// current generation is claimed normally; a row bound to a strictly older
+// generation is also safely adopted because the current control-lease CAS
+// proves that the old capability is no longer authoritative. A queued row is
+// the only state that may cross that generation boundary: it has not started
+// execution, and the old owner cannot pass the current lease check. Rows with
+// a future generation, or running rows, remain fenced.
 func (s *Store) ClaimNextQueuedTurnForOwner(ctx context.Context, sessionID string, machineID string, leaseGeneration int64) (Turn, bool, error) {
 	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
 	if err != nil {
@@ -9713,6 +11135,34 @@ func requeueTurnLocked(state *State, turn Turn, now time.Time) (Turn, error) {
 	if turn.Status != TurnStatusRunning {
 		return turn, nil
 	}
+	if inboundID := strings.TrimSpace(turn.InboundEventID); inboundID != "" {
+		inbound, ok := state.InboundEvents[inboundID]
+		if ok {
+			if err := validateQueueTurnSession(turn.SessionID, turn, nil); err != nil {
+				return turn, err
+			}
+			if observed := strings.TrimSpace(inbound.SessionID); observed != "" && observed != strings.TrimSpace(turn.SessionID) {
+				return turn, fmt.Errorf("%w: inbound %q belongs to session %q, requested %q", ErrSessionStateProvenanceMismatch, inboundID, observed, strings.TrimSpace(turn.SessionID))
+			}
+			if strings.TrimSpace(inbound.TurnID) != "" && strings.TrimSpace(inbound.TurnID) != strings.TrimSpace(turn.ID) {
+				return turn, fmt.Errorf("%w: inbound %q is linked to turn %q, not %q", ErrInboundTurnConflict, inboundID, strings.TrimSpace(inbound.TurnID), strings.TrimSpace(turn.ID))
+			}
+			if inbound.Status == InboundStatusIgnored {
+				// The inbound disposition is terminal. Requeueing the claimed
+				// Turn must not make it executable again; convert the Turn to the
+				// same durable interrupted state while retaining the ignored status.
+				// Clear stale retry evidence as part of that terminal convergence so
+				// an old deferred schedule cannot make the row look runnable later.
+				clearInboundRetryMetadata(&inbound)
+				inbound.UpdatedAt = now
+				state.InboundEvents[inbound.ID] = inbound
+				return markTurnInterruptedLocked(state, turn, "inbound event is terminally ignored", now)
+			}
+			if err := validateInboundSessionChatFromState(state, turn.SessionID, inbound); err != nil {
+				return turn, err
+			}
+		}
+	}
 	turn.Status = TurnStatusQueued
 	turn.StartedAt = time.Time{}
 	turn.UpdatedAt = now
@@ -9723,6 +11173,17 @@ func requeueTurnLocked(state *State, turn Turn, now time.Time) (Turn, error) {
 	}
 	updateSessionFromTurn(state, turn, now)
 	return turn, nil
+}
+
+func validateInboundSessionChatFromState(state *State, sessionID string, inbound InboundEvent) error {
+	if state == nil {
+		return nil
+	}
+	session, ok := state.Sessions[strings.TrimSpace(sessionID)]
+	if !ok {
+		return nil
+	}
+	return validateInboundSessionChat(session, inbound)
 }
 
 // MarkTurnForIsolatedCodexThread upgrades a legacy queued turn that was
@@ -9888,6 +11349,42 @@ func outboxKindIsTranscriptLike(kind string, notificationKind string) bool {
 		strings.HasPrefix(kind, "import-batch-") || strings.HasPrefix(kind, "import-bg-batch-") ||
 		strings.HasPrefix(kind, "sync-batch-") || strings.HasPrefix(kind, "publish-full-batch-") ||
 		strings.EqualFold(strings.TrimSpace(notificationKind), "turn_completed")
+}
+
+// outboxRequiresExecutionFence reports whether an outbox mutation needs the
+// session transcript checkpoint and legacy interrupted-turn probe. Ordinary
+// helper/status rows have their own durable outbox claim and delivery barrier;
+// they do not carry an execution identity that can be fenced by that
+// checkpoint. Probing the checkpoint for those rows made every normal flush
+// decode and rewrite compatibility state even when no transcript operation was
+// involved.
+//
+// Keep this predicate conservative for automatic transcript namespaces,
+// explicit turn-completion rows, rows with an execution identity, and rows
+// carrying an already-established fence. A source-less legacy transcript row
+// therefore remains fail-closed; only unscoped ordinary output takes the cheap
+// path.
+func outboxRequiresExecutionFence(msg OutboxMessage) bool {
+	if msg.BlockedBySourceRewrite || msg.BlockedByUnresolvedExecution || msg.BlockedByTerminalFailure {
+		return true
+	}
+	if strings.TrimSpace(msg.TranscriptCheckpointID) != "" ||
+		strings.TrimSpace(msg.TranscriptSourcePath) != "" ||
+		strings.TrimSpace(msg.TranscriptSourceProofFingerprint) != "" ||
+		msg.TranscriptSourceProofOffsetKnown ||
+		transcriptDeliveryParentFenceSessionID(msg) != "" {
+		return true
+	}
+	kind := strings.ToLower(strings.TrimSpace(msg.Kind))
+	if strings.HasPrefix(kind, "sync-") || strings.HasPrefix(kind, "import-") ||
+		(strings.HasPrefix(kind, "codex-status-") && strings.TrimSpace(msg.TurnID) != "") ||
+		strings.EqualFold(strings.TrimSpace(msg.NotificationKind), "turn_completed") {
+		return true
+	}
+	// A turn-bound final/assistant row is part of the execution fence. The
+	// no-TurnID case is intentionally excluded for compatibility helper output:
+	// old unscoped helper rows are common and have no execution owner to prove.
+	return strings.TrimSpace(msg.TurnID) != "" && outboxKindIsTranscriptLike(msg.Kind, msg.NotificationKind)
 }
 
 func outboxBelongsToIsolatedLiveBranchLocked(state *State, msg OutboxMessage) bool {
@@ -10913,6 +12410,9 @@ func completeTurnWithFinalLocked(state *State, req CompleteTurnWithFinalRequest,
 		}
 		return current, ErrCompletionOwnerLost
 	}
+	if err := validateCompletionSessionBinding(state, req); err != nil {
+		return current, err
+	}
 	if current.Status == TurnStatusInterrupted && !req.ResolveInterrupted {
 		return current, ErrUnresolvedExecution
 	}
@@ -11018,6 +12518,39 @@ func completeTurnWithFinalLocked(state *State, req CompleteTurnWithFinalRequest,
 		state.ImportCheckpoints[checkpointID] = nextCheckpoint
 	}
 	return completed, nil
+}
+
+// validateCompletionSessionBinding keeps a terminal callback tied to the
+// session binding it observed before running the executor. Session lifecycle
+// changes are durable and may race a long-running execution; accepting the
+// callback after a rebind would enqueue a final for the old Teams chat, while
+// accepting it after close would complete work that the user explicitly
+// retired. The unscoped compatibility path still protects any final plan when
+// a current session binding is available.
+func validateCompletionSessionBinding(state *State, req CompleteTurnWithFinalRequest) error {
+	if state == nil {
+		return nil
+	}
+	session, found := state.Sessions[strings.TrimSpace(req.SessionID)]
+	if !found {
+		return nil
+	}
+	currentChatID := strings.TrimSpace(session.TeamsChatID)
+	expectedChatID := strings.TrimSpace(req.ExpectedTeamsChatID)
+	if expectedChatID != "" {
+		if !sessionStatusIsActive(session.Status) || currentChatID != expectedChatID {
+			return ErrCompletionOwnerLost
+		}
+	}
+	if currentChatID == "" {
+		return nil
+	}
+	for _, msg := range req.FinalOutbox {
+		if strings.TrimSpace(msg.TeamsChatID) != currentChatID {
+			return ErrCompletionOwnerLost
+		}
+	}
+	return nil
 }
 
 func validateTerminalFinalOutboxPlan(state *State, planned []OutboxMessage, sessionID string, turnID string) error {
@@ -11259,7 +12792,30 @@ func (s *Store) markTurnFailedWithCodexIDs(ctx context.Context, turnID string, m
 	if out, handled, err := s.updateTurnSQLiteWithCapability(ctx, strings.TrimSpace(turnID), true, capability, apply); handled || err != nil {
 		return out, err
 	}
-	return s.updateTurnWithCapability(ctx, turnID, capability, apply)
+	// Unlike the ordinary turn mutation path, this recovery disposition must
+	// also work when the session row itself is missing. Use the store-wide JSON
+	// mutation as the compatibility fallback instead of UpdateSession, which
+	// would reject the exact malformed row that this method is meant to retire.
+	var out Turn
+	err := s.Update(ctx, func(state *State) error {
+		current, ok := state.Turns[strings.TrimSpace(turnID)]
+		if !ok {
+			return fmt.Errorf("turn %q not found", turnID)
+		}
+		next, applyErr := apply(state, current, time.Now())
+		if applyErr != nil {
+			if errors.Is(applyErr, errStoreNoChange) {
+				out = current
+				return nil
+			}
+			return applyErr
+		}
+		next.UpdatedAt = time.Now()
+		state.Turns[next.ID] = next
+		out = next
+		return nil
+	})
+	return out, err
 }
 
 // markTurnFailedWithExecutionProofLocked consumes an exact app-server failure
@@ -11987,6 +13543,44 @@ func (s *Store) MarkTurnInterruptedForOwner(ctx context.Context, turnID string, 
 	return s.updateTurnWithCapability(ctx, turnID, capability, apply)
 }
 
+// MarkQueuedTurnInterruptedForOwner is the narrow recovery/disposition path
+// for a queued row whose input can no longer be trusted or whose session
+// binding is missing. The current control-lease holder may adopt only a row
+// that has not started execution, then bind and interrupt it in the same
+// durable mutation. Running rows never enter this path: their execution
+// ownership remains subject to the exact turn capability and unresolved-anchor
+// rules used by MarkTurnInterruptedForOwner.
+func (s *Store) MarkQueuedTurnInterruptedForOwner(ctx context.Context, turnID string, reason string, machineID string, leaseGeneration int64) (Turn, error) {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return Turn{}, err
+	}
+	capability.allowQueuedTurnTakeover = true
+	apply := func(state *State, turn Turn, now time.Time) (Turn, error) {
+		if turn.Status != TurnStatusQueued {
+			// The caller's queued snapshot may race a concurrent claim. Never
+			// reinterpret a now-running row as a recoverable queued disposition.
+			return turn, errStoreNoChange
+		}
+		if err := validateQueuedTurnOwnerForClaim(turn, capability); err != nil {
+			return turn, err
+		}
+		// A queued row has not crossed the Codex execution boundary. Bind it
+		// to the current owner before applying the terminal disposition so a
+		// later stale callback cannot reinterpret the transition.
+		turn.MachineID = capability.machineID
+		turn.LeaseGeneration = capability.leaseGeneration
+		if err := validateTurnOwnerCapability(state, turn, capability); err != nil {
+			return turn, err
+		}
+		return markTurnInterruptedLocked(state, turn, reason, now)
+	}
+	if out, handled, err := s.updateTurnSQLiteWithCapability(ctx, strings.TrimSpace(turnID), true, capability, apply); handled || err != nil {
+		return out, err
+	}
+	return s.updateTurnWithCapability(ctx, turnID, capability, apply)
+}
+
 // markTurnInterruptedLocked is deliberately terminal-state preserving.  An
 // executor callback can arrive after the successful owner has committed a
 // completed/failed turn; allowing that stale callback to overwrite the
@@ -12267,6 +13861,9 @@ func queueOutboxLocked(state *State, msg OutboxMessage, now time.Time) (OutboxMe
 		// later Teams POST state was lost.
 		msg.AttachmentMessagePostState = legacyAttachmentMessagePostState(msg)
 	}
+	if strings.TrimSpace(msg.AttachmentPath) != "" && strings.TrimSpace(msg.AttachmentUploadSessionPostState) == "" {
+		msg.AttachmentUploadSessionPostState = legacyAttachmentUploadSessionPostState(msg)
+	}
 	if msg.CreatedAt.IsZero() {
 		msg.CreatedAt = now
 	}
@@ -12404,7 +14001,17 @@ func applyQueueTranscriptDeliveryOutboxLocked(state *State, msg OutboxMessage, d
 	}
 	existingOutbox, existingOutboxFound := state.OutboxMessages[strings.TrimSpace(msg.ID)]
 	if _, deliveryFound := state.TranscriptDeliveries[delivery.ID]; !deliveryFound {
-		if existing, ok := equivalentAutomaticTranscriptOutboxForExplicitHistoryLocked(state, msg, delivery); ok {
+		if pending, ok := pendingAutomaticTranscriptOutboxForExplicitHistoryLocked(state, msg, delivery); ok {
+			return OutboxMessage{}, false, false, fmt.Errorf("%w: automatic outbox=%q source=%q part=%d/%d", ErrTranscriptDeliveryPending, pending.ID, delivery.SourceRecordID, delivery.PartIndex, delivery.PartCount)
+		}
+		if existing, previousDelivery, ok := equivalentAutomaticTranscriptOutboxForExplicitHistoryLocked(state, msg, delivery); ok {
+			if isRecoverableTranscriptOutboxSkip(existing) {
+				// A permanent Graph rejection is a durable manual-repair fence,
+				// not proof that the source record was delivered. Explicit history
+				// must be able to reuse that exact outbox identity even though the
+				// automatic and explicit delivery namespaces differ.
+				return requeueSkippedTranscriptOutboxLocked(state, existing, msg, delivery, previousDelivery, now), false, false, nil
+			}
 			linked := normalizeTranscriptDeliveryRecord(delivery, time.Now())
 			linked.OutboxID = existing.ID
 			linked.TeamsMessageID = existing.TeamsMessageID
@@ -12436,7 +14043,15 @@ func applyQueueTranscriptDeliveryOutboxLocked(state *State, msg OutboxMessage, d
 			return requeueSkippedTranscriptOutboxLocked(state, requeueCandidate, msg, delivery, existingDelivery, now), false, false, nil
 		}
 		if transcriptDeliverySuppressesQueue(existingDelivery) {
-			applyTranscriptCheckpointLocked(state, checkpoint, now)
+			// A durable provider rejection is a repair fence, not evidence that
+			// the source record was delivered. Do not let a later replay of the
+			// same delivery advance the canonical cursor past NeedsAttention.
+			if existingDelivery.Status == TranscriptDeliveryStatusNeedsAttention {
+				return OutboxMessage{}, false, false, ErrTranscriptDeliveryNeedsAttention
+			}
+			if transcriptDeliveryStatusAdvancesCheckpoint(existingDelivery) {
+				applyTranscriptCheckpointLocked(state, checkpoint, now)
+			}
 			return OutboxMessage{}, false, true, nil
 		}
 		if out.ID != "" {
@@ -12483,17 +14098,18 @@ func applyQueueTranscriptDeliveryOutboxLocked(state *State, msg OutboxMessage, d
 // by design, so the delivery ID cannot be the only dedupe key here. This scan
 // is restricted to the cold explicit-recovery path; ordinary linked-history
 // queueing retains its O(1) delivery lookup.
-func equivalentAutomaticTranscriptOutboxForExplicitHistoryLocked(state *State, requested OutboxMessage, delivery TranscriptDeliveryRecord) (OutboxMessage, bool) {
+func equivalentAutomaticTranscriptOutboxForExplicitHistoryLocked(state *State, requested OutboxMessage, delivery TranscriptDeliveryRecord) (OutboxMessage, TranscriptDeliveryRecord, bool) {
 	if state == nil || !outboxTurnIsUserExplicitHistory(requested.TurnID) {
-		return OutboxMessage{}, false
+		return OutboxMessage{}, TranscriptDeliveryRecord{}, false
 	}
 	sourcePath := filepath.Clean(strings.TrimSpace(delivery.SourcePath))
 	sourceRecordID := strings.TrimSpace(delivery.SourceRecordID)
 	textHash := strings.TrimSpace(delivery.TextHash)
 	if sourcePath == "" || sourceRecordID == "" || textHash == "" {
-		return OutboxMessage{}, false
+		return OutboxMessage{}, TranscriptDeliveryRecord{}, false
 	}
 	var best OutboxMessage
+	var bestDelivery TranscriptDeliveryRecord
 	bestRank := -1
 	for _, existingDelivery := range state.TranscriptDeliveries {
 		if existingDelivery.ID == delivery.ID || strings.TrimSpace(existingDelivery.SessionID) != strings.TrimSpace(requested.SessionID) ||
@@ -12506,8 +14122,30 @@ func equivalentAutomaticTranscriptOutboxForExplicitHistoryLocked(state *State, r
 		if !ok || !automaticTranscriptTurnID(existing.TurnID) || strings.TrimSpace(existing.TeamsChatID) != strings.TrimSpace(requested.TeamsChatID) {
 			continue
 		}
-		if existing.Status != OutboxStatusQueued && existing.Status != OutboxStatusSending &&
-			existing.Status != OutboxStatusAccepted && existing.Status != OutboxStatusSent {
+		if existing.Status != OutboxStatusAccepted && existing.Status != OutboxStatusSent &&
+			!isRecoverableTranscriptOutboxSkip(existing) {
+			continue
+		}
+		// A delivery ledger that is already fenced as NeedsAttention must not
+		// be treated as delivered merely because a contradictory outbox row says
+		// Sent/Accepted.  The outbox identity is the source of truth for a normal
+		// terminal send, but the stronger repair fence wins on inconsistency so an
+		// explicit replay cannot turn a state-corruption race into a duplicate.
+		if existingDelivery.Status == TranscriptDeliveryStatusNeedsAttention &&
+			!isRecoverableTranscriptOutboxSkip(existing) {
+			continue
+		}
+		existingPartIndex, existingPartCount := transcriptDeliveryPartIdentity(existingDelivery, existing)
+		requestedPartIndex, requestedPartCount := transcriptDeliveryPartIdentity(delivery, requested)
+		if existingPartIndex != requestedPartIndex || existingPartCount != requestedPartCount {
+			continue
+		}
+		if strings.TrimSpace(requested.Body) != "" && existing.Body != requested.Body {
+			continue
+		}
+		requestedRenderedHash := firstStoreNonEmptyString(requested.RenderedHash, bodyHash(requested.Body))
+		existingRenderedHash := firstStoreNonEmptyString(existingDelivery.RenderedHash, existing.RenderedHash, bodyHash(existing.Body))
+		if requestedRenderedHash != "" && existingRenderedHash != "" && requestedRenderedHash != existingRenderedHash {
 			continue
 		}
 		if outboxSourceProofRequired(existing) && !outboxSourceProofValid(existing) {
@@ -12520,19 +14158,79 @@ func equivalentAutomaticTranscriptOutboxForExplicitHistoryLocked(state *State, r
 		}
 		rank := 0
 		switch existing.Status {
-		case OutboxStatusSending:
-			rank = 1
 		case OutboxStatusAccepted:
-			rank = 2
+			rank = 1
 		case OutboxStatusSent:
-			rank = 3
+			rank = 2
 		}
 		if rank > bestRank || rank == bestRank && (best.ID == "" || existing.CreatedAt.Before(best.CreatedAt)) {
 			best = existing
+			bestDelivery = existingDelivery
 			bestRank = rank
 		}
 	}
-	return best, best.ID != ""
+	return best, bestDelivery, best.ID != ""
+}
+
+// pendingAutomaticTranscriptOutboxForExplicitHistoryLocked prevents an
+// explicit namespace from creating a second POST while the automatic
+// namespace still owns the same source record/chunk.  A queued or sending row
+// is not delivery proof; an accepted row without a Teams identity is equally
+// indeterminate and must remain fenced until reconciliation settles it.
+func pendingAutomaticTranscriptOutboxForExplicitHistoryLocked(state *State, requested OutboxMessage, delivery TranscriptDeliveryRecord) (OutboxMessage, bool) {
+	if state == nil || !outboxTurnIsUserExplicitHistory(requested.TurnID) {
+		return OutboxMessage{}, false
+	}
+	sourcePath := filepath.Clean(strings.TrimSpace(delivery.SourcePath))
+	sourceRecordID := strings.TrimSpace(delivery.SourceRecordID)
+	textHash := strings.TrimSpace(delivery.TextHash)
+	if sourcePath == "" || sourceRecordID == "" || textHash == "" {
+		return OutboxMessage{}, false
+	}
+	requestedPartIndex, requestedPartCount := transcriptDeliveryPartIdentity(delivery, requested)
+	for _, existingDelivery := range state.TranscriptDeliveries {
+		if strings.TrimSpace(existingDelivery.SessionID) != strings.TrimSpace(requested.SessionID) ||
+			!sameTranscriptSourcePath(existingDelivery.SourcePath, sourcePath) ||
+			strings.TrimSpace(existingDelivery.SourceRecordID) != sourceRecordID ||
+			strings.TrimSpace(existingDelivery.TextHash) != textHash {
+			continue
+		}
+		existing, ok := state.OutboxMessages[strings.TrimSpace(existingDelivery.OutboxID)]
+		if !ok || !automaticTranscriptTurnID(existing.TurnID) || strings.TrimSpace(existing.TeamsChatID) != strings.TrimSpace(requested.TeamsChatID) {
+			continue
+		}
+		existingPartIndex, existingPartCount := transcriptDeliveryPartIdentity(existingDelivery, existing)
+		if existingPartIndex != requestedPartIndex || existingPartCount != requestedPartCount {
+			continue
+		}
+		switch existing.Status {
+		case OutboxStatusQueued, OutboxStatusSending:
+			return existing, true
+		case OutboxStatusAccepted:
+			if strings.TrimSpace(existing.TeamsMessageID) == "" {
+				return existing, true
+			}
+		}
+	}
+	return OutboxMessage{}, false
+}
+
+func transcriptDeliveryPartIdentity(delivery TranscriptDeliveryRecord, outbox OutboxMessage) (int, int) {
+	partIndex := delivery.PartIndex
+	partCount := delivery.PartCount
+	if partIndex <= 0 {
+		partIndex = outbox.PartIndex
+	}
+	if partCount <= 0 {
+		partCount = outbox.PartCount
+	}
+	if partCount <= 0 {
+		partCount = 1
+	}
+	if partIndex <= 0 {
+		partIndex = 1
+	}
+	return partIndex, partCount
 }
 
 func transcriptDeliveryCanBeRequeuedForExplicitHistory(existingDelivery TranscriptDeliveryRecord, existingOutbox OutboxMessage, deliveryFound bool, requested OutboxMessage) bool {
@@ -12721,7 +14419,7 @@ func sameTranscriptSourcePath(left string, right string) bool {
 
 func transcriptDeliverySuppressesQueue(record TranscriptDeliveryRecord) bool {
 	switch record.Status {
-	case TranscriptDeliveryStatusSent, TranscriptDeliveryStatusSkipped:
+	case TranscriptDeliveryStatusSent, TranscriptDeliveryStatusSkipped, TranscriptDeliveryStatusNeedsAttention:
 		return true
 	case TranscriptDeliveryStatusAccepted:
 		return strings.TrimSpace(record.TeamsMessageID) != ""
@@ -12814,13 +14512,33 @@ func applyRecordTranscriptDeliveryLocked(state *State, delivery TranscriptDelive
 		state.ImportCheckpoints = make(map[string]ImportCheckpoint)
 	}
 	if existing, ok := state.TranscriptDeliveries[delivery.ID]; ok {
-		applyTranscriptCheckpointLocked(state, checkpoint, now)
+		if transcriptDeliveryStatusAdvancesCheckpoint(existing) {
+			applyTranscriptCheckpointLocked(state, checkpoint, now)
+		}
 		return existing, false
 	}
 	out := normalizeTranscriptDeliveryRecord(delivery, now)
 	state.TranscriptDeliveries[out.ID] = out
-	applyTranscriptCheckpointLocked(state, checkpoint, now)
+	if transcriptDeliveryStatusAdvancesCheckpoint(out) {
+		applyTranscriptCheckpointLocked(state, checkpoint, now)
+	}
 	return out, true
+}
+
+// transcriptDeliveryStatusAdvancesCheckpoint separates a durable terminal
+// disposition from a durable provider rejection. NeedsAttention means the
+// corresponding Graph operation was conclusively rejected and must be
+// explicitly repaired; advancing the source cursor in that state would make
+// the record disappear from automatic replay forever.
+func transcriptDeliveryStatusAdvancesCheckpoint(record TranscriptDeliveryRecord) bool {
+	switch record.Status {
+	case TranscriptDeliveryStatusSent, TranscriptDeliveryStatusSkipped:
+		return true
+	case TranscriptDeliveryStatusAccepted:
+		return strings.TrimSpace(record.TeamsMessageID) != ""
+	default:
+		return false
+	}
 }
 
 func normalizeTranscriptDeliveryRecord(record TranscriptDeliveryRecord, now time.Time) TranscriptDeliveryRecord {
@@ -12832,6 +14550,13 @@ func normalizeTranscriptDeliveryRecord(record TranscriptDeliveryRecord, now time
 	record.SourceRecordID = strings.TrimSpace(record.SourceRecordID)
 	record.Kind = strings.TrimSpace(record.Kind)
 	record.TextHash = strings.TrimSpace(record.TextHash)
+	if record.PartCount <= 0 {
+		record.PartCount = 1
+	}
+	if record.PartIndex <= 0 {
+		record.PartIndex = 1
+	}
+	record.RenderedHash = strings.TrimSpace(record.RenderedHash)
 	record.OutboxID = strings.TrimSpace(record.OutboxID)
 	record.TeamsMessageID = strings.TrimSpace(record.TeamsMessageID)
 	if now.IsZero() {
@@ -13078,6 +14803,9 @@ func applyTranscriptCheckpointLocked(state *State, checkpoint ImportCheckpoint, 
 	if !checkpoint.CompletionPending && status != importCheckpointStatusComplete {
 		checkpoint.CompletionPending = previous.CompletionPending
 	}
+	if !importCheckpointIsExplicitHistoryRun(checkpoint) {
+		checkpoint.DeliveryNeedsAttention = checkpoint.DeliveryNeedsAttention || previous.DeliveryNeedsAttention
+	}
 	if now.IsZero() {
 		now = time.Now()
 	}
@@ -13087,12 +14815,36 @@ func applyTranscriptCheckpointLocked(state *State, checkpoint ImportCheckpoint, 
 }
 
 func (s *Store) MarkOutboxSendAttempt(ctx context.Context, outboxID string) (OutboxMessage, error) {
-	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), false, true, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+	return s.markOutboxSendAttemptWithFIFOSnapshotProof(ctx, outboxID, nil)
+}
+
+// MarkOutboxSendAttemptWithFIFOSnapshotProof claims a row after the caller's
+// FIFO lookup. The proof is an opaque one-shot object returned by
+// EarlierUnsentOutboxWithProof; accepting it explicitly prevents concurrent
+// lookups for the same target from pairing one result with another result's
+// durable generation witness.
+func (s *Store) MarkOutboxSendAttemptWithFIFOSnapshotProof(ctx context.Context, outboxID string, fifoProof *OutboxFIFOSnapshotProof) (OutboxMessage, error) {
+	return s.markOutboxSendAttemptWithFIFOSnapshotProof(ctx, outboxID, fifoProof)
+}
+
+func (s *Store) markOutboxSendAttemptWithFIFOSnapshotProof(ctx context.Context, outboxID string, fifoProof *OutboxFIFOSnapshotProof) (OutboxMessage, error) {
+	if out, handled, err := s.updateOutboxSQLiteWithFIFOSnapshotProof(ctx, strings.TrimSpace(outboxID), false, true, fifoProof, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
 		return claimOutboxSendAttemptLocked(state, msg, now)
 	}); handled || err != nil {
 		return out, err
 	}
+	if fifoProof != nil && fifoProof.jsonBackend && outboxFIFOSnapshotClaimTestHook != nil {
+		outboxFIFOSnapshotClaimTestHook()
+	}
 	return s.updateOutbox(ctx, outboxID, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		if fifoProof != nil && fifoProof.jsonBackend {
+			if !fifoProof.consumeForTarget(outboxID) {
+				return msg, fmt.Errorf("%w: JSON FIFO proof was already consumed or bound to another target", ErrOutboxPredecessorIndeterminate)
+			}
+			if reason := fifoProof.jsonSnapshotMismatchReason(state, msg); reason != "" {
+				return msg, fmt.Errorf("%w: JSON FIFO snapshot changed before durable claim: %s", ErrOutboxPredecessorIndeterminate, reason)
+			}
+		}
 		return claimOutboxSendAttemptLocked(state, msg, now)
 	})
 }
@@ -13104,6 +14856,16 @@ func (s *Store) MarkOutboxSendAttempt(ctx context.Context, outboxID string) (Out
 // so a delayed callback from a replaced owner cannot commit Accepted/Sent
 // after a takeover.
 func (s *Store) MarkOutboxSendAttemptForOwner(ctx context.Context, outboxID string, machineID string, leaseGeneration int64) (OutboxMessage, error) {
+	return s.markOutboxSendAttemptForOwnerWithFIFOSnapshotProof(ctx, outboxID, machineID, leaseGeneration, nil)
+}
+
+// MarkOutboxSendAttemptForOwnerWithFIFOSnapshotProof is the owner-fenced
+// variant of MarkOutboxSendAttemptWithFIFOSnapshotProof.
+func (s *Store) MarkOutboxSendAttemptForOwnerWithFIFOSnapshotProof(ctx context.Context, outboxID string, machineID string, leaseGeneration int64, fifoProof *OutboxFIFOSnapshotProof) (OutboxMessage, error) {
+	return s.markOutboxSendAttemptForOwnerWithFIFOSnapshotProof(ctx, outboxID, machineID, leaseGeneration, fifoProof)
+}
+
+func (s *Store) markOutboxSendAttemptForOwnerWithFIFOSnapshotProof(ctx context.Context, outboxID string, machineID string, leaseGeneration int64, fifoProof *OutboxFIFOSnapshotProof) (OutboxMessage, error) {
 	machineID = strings.TrimSpace(machineID)
 	if machineID == "" || leaseGeneration <= 0 {
 		return OutboxMessage{}, ErrControlLeaseNotHeld
@@ -13121,10 +14883,23 @@ func (s *Store) MarkOutboxSendAttemptForOwner(ctx context.Context, outboxID stri
 		claimed.LeaseGeneration = leaseGeneration
 		return claimed, nil
 	}
-	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), false, true, update); handled || err != nil {
+	if out, handled, err := s.updateOutboxSQLiteWithFIFOSnapshotProof(ctx, strings.TrimSpace(outboxID), false, true, fifoProof, update); handled || err != nil {
 		return out, err
 	}
-	return s.updateOutbox(ctx, outboxID, update)
+	if fifoProof != nil && fifoProof.jsonBackend && outboxFIFOSnapshotClaimTestHook != nil {
+		outboxFIFOSnapshotClaimTestHook()
+	}
+	return s.updateOutbox(ctx, outboxID, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		if fifoProof != nil && fifoProof.jsonBackend {
+			if !fifoProof.consumeForTarget(outboxID) {
+				return msg, fmt.Errorf("%w: JSON FIFO proof was already consumed or bound to another target", ErrOutboxPredecessorIndeterminate)
+			}
+			if reason := fifoProof.jsonSnapshotMismatchReason(state, msg); reason != "" {
+				return msg, fmt.Errorf("%w: JSON FIFO snapshot changed before durable claim: %s", ErrOutboxPredecessorIndeterminate, reason)
+			}
+		}
+		return update(state, msg, now)
+	})
 }
 
 // BindOutboxRecoveryAttemptForOwner transfers an expired/ambiguous Sending
@@ -13222,6 +14997,15 @@ func (s *Store) DeferOutboxDeliveryUntilForOwner(ctx context.Context, outboxID s
 			if err := validateOutboxOwnerCapability(state, msg); err != nil {
 				return msg, err
 			}
+		} else if msg.Status == OutboxStatusQueued {
+			// A queued row has not crossed the Graph side-effect boundary.  A
+			// replacement owner may therefore adopt its durable retry gate even
+			// when the row still carries the previous owner's generation.  Keep
+			// Sending/ambiguous rows strict below: their attempt token remains
+			// the external-outcome fence and cannot be adopted by this helper.
+			if err := validateQueuedOutboxOwnerForMutation(state, &msg, machineID, leaseGeneration, time.Now()); err != nil {
+				return msg, err
+			}
 		} else if msg.Status != OutboxStatusQueued && !acceptedWithTeamsID {
 			return msg, errStoreNoChange
 		} else if err := validateOutboxOwnerCapability(state, msg); err != nil {
@@ -13299,6 +15083,12 @@ func (s *Store) MarkOutboxGraphRecoveryProgressForAttempt(ctx context.Context, o
 }
 
 func claimOutboxSendAttemptLocked(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+	if state != nil && state.legacyOpaqueJSONSections&legacyOpaqueOutbox != 0 {
+		// A malformed legacy outbox row is absent from the typed map, but it may
+		// be an earlier message in this chat. Do not let either the normal claim
+		// API or the proof-aware API turn decoder failure into a FIFO bypass.
+		return msg, ErrOutboxPredecessorIndeterminate
+	}
 	if msg.BlockedBySourceRewrite || outboxLegacyTranscriptSourceRewriteBlocked(state, msg) {
 		return msg, ErrOutboxSendNotClaimed
 	}
@@ -13321,6 +15111,14 @@ func claimOutboxSendAttemptLocked(state *State, msg OutboxMessage, now time.Time
 	}
 	switch msg.Status {
 	case OutboxStatusQueued:
+		// The sender normally filters NextAttemptAt before calling the claim
+		// reducer, but direct/targeted callers and a stale candidate snapshot can
+		// bypass that read.  Keep the retry deadline in the same durable claim
+		// boundary as the status transition; otherwise a concurrent caller can
+		// turn a 429 backoff into an immediate second POST.
+		if !msg.NextAttemptAt.IsZero() && now.Before(msg.NextAttemptAt) {
+			return msg, ErrOutboxSendNotClaimed
+		}
 	case OutboxStatusSending:
 		// A markerless or expired Sending row has an unknown external outcome,
 		// not a new send opportunity. Only BindOutboxRecoveryAttemptForOwner may
@@ -13364,6 +15162,42 @@ func LegacyAttachmentMessagePostStateNeedsRecovery(msg OutboxMessage) bool {
 		strings.EqualFold(strings.TrimSpace(msg.AttachmentMessagePostState), "unknown")
 }
 
+func legacyAttachmentUploadSessionPostState(msg OutboxMessage) string {
+	if strings.TrimSpace(msg.AttachmentPath) == "" {
+		return ""
+	}
+	if strings.TrimSpace(msg.DriveItemID) != "" {
+		return "completed"
+	}
+	if strings.TrimSpace(msg.AttachmentUploadURL) != "" {
+		return "ready"
+	}
+	if msg.Status == OutboxStatusQueued &&
+		strings.TrimSpace(msg.AttachmentMessagePostState) == "pending" &&
+		strings.TrimSpace(msg.SendAttemptToken) == "" &&
+		msg.LastSendAttempt.IsZero() &&
+		strings.TrimSpace(msg.LastSendError) == "" &&
+		strings.TrimSpace(msg.GraphRecoveryCandidateID) == "" {
+		return "pending"
+	}
+	// A legacy row without a durable session URL may already have crossed the
+	// createUploadSession boundary.  It is safer to require explicit recovery
+	// than to manufacture a second remote upload session.
+	return "unknown"
+}
+
+// LegacyAttachmentUploadSessionNeedsRecovery identifies an attachment that
+// cannot safely start a new resumable-upload POST.  A durable URL is a safe
+// resume point; a durable DriveItem means the upload is complete.  Empty/old
+// rows without either proof stay fail-closed.
+func LegacyAttachmentUploadSessionNeedsRecovery(msg OutboxMessage) bool {
+	state := strings.ToLower(strings.TrimSpace(msg.AttachmentUploadSessionPostState))
+	return strings.TrimSpace(msg.AttachmentPath) != "" &&
+		strings.TrimSpace(msg.DriveItemID) == "" &&
+		strings.TrimSpace(msg.AttachmentUploadURL) == "" &&
+		(state == "started" || state == "unknown")
+}
+
 func transcriptDeliveryParentFenceSessionID(msg OutboxMessage) string {
 	if parentSessionID := strings.TrimSpace(msg.ParentFenceSessionID); parentSessionID != "" {
 		return parentSessionID
@@ -13399,6 +15233,38 @@ func (s *Store) SuppressOutboxOwnerMention(ctx context.Context, outboxID string)
 		msg.MentionOwner = false
 		return msg, nil
 	})
+}
+
+// SuppressOutboxOwnerMentionForOwner changes a queued/accepted row only while
+// the supplied control lease is current.  It is the owner-fenced counterpart
+// for callbacks that have a listener lease but no per-send attempt token (for
+// example, before a Graph claim is created).  A sending row still requires its
+// exact attempt token through SuppressOutboxOwnerMentionForAttempt; this API
+// must never weaken that fence.
+func (s *Store) SuppressOutboxOwnerMentionForOwner(ctx context.Context, outboxID string, machineID string, leaseGeneration int64) (OutboxMessage, error) {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return OutboxMessage{}, err
+	}
+	update := func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		if err := validateStoreOwnerCapability(state, capability); err != nil {
+			return msg, err
+		}
+		if msg.Status == OutboxStatusSending || strings.TrimSpace(msg.SendAttemptToken) != "" {
+			return msg, ErrOutboxSendNotClaimed
+		}
+		if msg.Status == OutboxStatusQueued {
+			if err := validateQueuedOutboxOwnerForMutation(state, &msg, capability.machineID, capability.leaseGeneration, now); err != nil {
+				return msg, err
+			}
+		}
+		msg.MentionOwner = false
+		return msg, nil
+	}
+	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), false, false, update); handled || err != nil {
+		return out, err
+	}
+	return s.updateOutbox(ctx, outboxID, update)
 }
 
 // SuppressOutboxOwnerMentionForAttempt changes a claimed row only while the
@@ -13454,16 +15320,26 @@ func (s *Store) MarkOutboxMathMediaFallbackForAttempt(ctx context.Context, outbo
 }
 
 func (s *Store) EarlierUnsentOutbox(ctx context.Context, msg OutboxMessage) (OutboxMessage, bool, error) {
+	earlier, found, _, err := s.EarlierUnsentOutboxWithProof(ctx, msg)
+	return earlier, found, err
+}
+
+// EarlierUnsentOutboxWithProof is the SQLite-optimized FIFO lookup for a
+// sender that will immediately claim the same target. The returned proof is
+// bound to msg and must be passed to one of the explicit proof-aware claim
+// methods. Callers that only need an observation should use EarlierUnsentOutbox
+// and discard the proof.
+func (s *Store) EarlierUnsentOutboxWithProof(ctx context.Context, msg OutboxMessage) (OutboxMessage, bool, *OutboxFIFOSnapshotProof, error) {
 	chatID := strings.TrimSpace(msg.TeamsChatID)
 	if chatID == "" || msg.Sequence <= 0 {
-		return OutboxMessage{}, false, nil
+		return OutboxMessage{}, false, nil, nil
 	}
-	if earlier, found, handled, err := s.earlierUnsentOutboxSQLite(ctx, msg); handled || err != nil {
-		return earlier, found, err
+	if earlier, found, handled, proof, err := s.earlierUnsentOutboxSQLite(ctx, msg); handled || err != nil {
+		return earlier, found, proof, err
 	}
 	state, err := s.OutboxStateSnapshot(ctx)
 	if err != nil {
-		return OutboxMessage{}, false, err
+		return OutboxMessage{}, false, nil, err
 	}
 	var earlier OutboxMessage
 	found := false
@@ -13500,7 +15376,7 @@ func (s *Store) EarlierUnsentOutbox(ctx context.Context, msg OutboxMessage) (Out
 			found = true
 		}
 	}
-	return earlier, found, nil
+	return earlier, found, newJSONOutboxFIFOSnapshotProof(state, msg), nil
 }
 
 // EarlierUnsentOutboxes returns all pending predecessors in send order. It is
@@ -13509,16 +15385,24 @@ func (s *Store) EarlierUnsentOutbox(ctx context.Context, msg OutboxMessage) (Out
 // obsolete policy notices but must still stop at the first protected message.
 // Callers should use it only on that cold recovery path.
 func (s *Store) EarlierUnsentOutboxes(ctx context.Context, msg OutboxMessage) ([]OutboxMessage, error) {
+	out, _, err := s.EarlierUnsentOutboxesWithProof(ctx, msg)
+	return out, err
+}
+
+// EarlierUnsentOutboxesWithProof is the batch form used by explicit history
+// recovery. It follows the same proof contract as
+// EarlierUnsentOutboxWithProof.
+func (s *Store) EarlierUnsentOutboxesWithProof(ctx context.Context, msg OutboxMessage) ([]OutboxMessage, *OutboxFIFOSnapshotProof, error) {
 	chatID := strings.TrimSpace(msg.TeamsChatID)
 	if chatID == "" || msg.Sequence <= 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
-	if earlier, handled, err := s.earlierUnsentOutboxesSQLite(ctx, msg); handled || err != nil {
-		return earlier, err
+	if earlier, handled, proof, err := s.earlierUnsentOutboxesSQLite(ctx, msg); handled || err != nil {
+		return earlier, proof, err
 	}
 	state, err := s.OutboxStateSnapshot(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	out := make([]OutboxMessage, 0)
 	for _, candidate := range state.OutboxMessages {
@@ -13549,7 +15433,7 @@ func (s *Store) EarlierUnsentOutboxes(ctx context.Context, msg OutboxMessage) ([
 		}
 		return out[i].ID < out[j].ID
 	})
-	return out, nil
+	return out, newJSONOutboxFIFOSnapshotProof(state, msg), nil
 }
 
 // AcceptedSourceRewriteOutboxIsStable identifies the only source-fenced row
@@ -13571,6 +15455,149 @@ func (s *Store) MarkOutboxSendErrorForAttempt(ctx context.Context, outboxID stri
 		return OutboxMessage{}, ErrOutboxSendNotClaimed
 	}
 	return s.markOutboxSendError(ctx, outboxID, attemptToken, message, true, false)
+}
+
+// MarkOutboxGraphPreflightFailureForAttempt releases a send attempt when a
+// local durable fence proves that no Graph request was issued. This is a
+// narrower recovery boundary than MarkOutboxSendErrorForAttempt: the callback
+// may arrive after an owner takeover, so the attempt token is the only required
+// witness and the old owner/generation is deliberately not revalidated. Since
+// the request never crossed the network, resetting a started attachment POST or
+// upload-session-create marker cannot create a duplicate external side effect.
+func (s *Store) MarkOutboxGraphPreflightFailureForAttempt(ctx context.Context, outboxID string, attemptToken string, message string) (OutboxMessage, error) {
+	outboxID = strings.TrimSpace(outboxID)
+	attemptToken = strings.TrimSpace(attemptToken)
+	if outboxID == "" || attemptToken == "" {
+		return OutboxMessage{}, ErrOutboxSendNotClaimed
+	}
+	update := func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		return markOutboxGraphPreflightFailureLocked(state, msg, attemptToken, message, now)
+	}
+	if out, handled, err := s.updateOutboxSQLite(ctx, outboxID, false, true, update); handled {
+		if err == nil || !errors.Is(err, ErrOutboxSendNotClaimed) {
+			return out, err
+		}
+		// The old owner may have lost the control lease before this callback
+		// reached the durable row. Its send token may already have been rotated by
+		// BindOutboxRecoveryAttemptForOwner, but an exact attachment-boundary token
+		// still proves which started marker belongs to the no-network preflight.
+		return s.markOutboxGraphPreflightFailureByBoundaryToken(ctx, outboxID, attemptToken, message)
+	}
+	if out, err := s.updateOutbox(ctx, outboxID, update); err == nil || !errors.Is(err, ErrOutboxSendNotClaimed) {
+		return out, err
+	}
+	return s.markOutboxGraphPreflightFailureByBoundaryToken(ctx, outboxID, attemptToken, message)
+}
+
+func markOutboxGraphPreflightFailureLocked(state *State, msg OutboxMessage, attemptToken string, message string, now time.Time) (OutboxMessage, error) {
+	if msg.Status != OutboxStatusSending || strings.TrimSpace(msg.SendAttemptToken) != strings.TrimSpace(attemptToken) {
+		return msg, ErrOutboxSendNotClaimed
+	}
+	// A preflight callback may clear a started external-operation boundary only
+	// when every started attachment boundary carries this exact witness.  A
+	// legacy started marker without a witness, or a marker from another
+	// attempt, must remain ambiguous; changing the row to queued there could
+	// allow a second worker to issue a duplicate POST.
+	if (strings.EqualFold(strings.TrimSpace(msg.AttachmentMessagePostState), "started") &&
+		strings.TrimSpace(msg.AttachmentMessagePostAttemptToken) != strings.TrimSpace(attemptToken)) ||
+		(strings.EqualFold(strings.TrimSpace(msg.AttachmentUploadSessionPostState), "started") &&
+			strings.TrimSpace(msg.AttachmentUploadSessionPostAttemptToken) != strings.TrimSpace(attemptToken)) {
+		return msg, ErrOutboxSendNotClaimed
+	}
+	// The local fence ran before the HTTP attempt. Any started marker produced by
+	// this attempt therefore has a provably absent provider side effect and may
+	// return to its replayable pending state. A durable upload URL is retained:
+	// it is a resume witness, not an unknown create-session result.
+	if strings.EqualFold(strings.TrimSpace(msg.AttachmentMessagePostState), "started") &&
+		strings.TrimSpace(msg.AttachmentMessagePostAttemptToken) == strings.TrimSpace(attemptToken) {
+		msg.AttachmentMessagePostState = "pending"
+		msg.AttachmentMessagePostAttemptToken = ""
+	}
+	if strings.EqualFold(strings.TrimSpace(msg.AttachmentUploadSessionPostState), "started") &&
+		strings.TrimSpace(msg.AttachmentUploadSessionPostAttemptToken) == strings.TrimSpace(attemptToken) &&
+		strings.TrimSpace(msg.AttachmentUploadURL) == "" {
+		msg.AttachmentUploadSessionPostState = "pending"
+		msg.AttachmentUploadSessionPostAttemptToken = ""
+		msg.AttachmentUploadExpiry = time.Time{}
+		msg.AttachmentUploadOffset = 0
+	}
+	reason := trimDiagnostic(firstStoreNonEmptyString(message, "Graph request rejected by local preflight"), 240)
+	if msg.BlockedByTerminalFailure || (strings.TrimSpace(msg.SessionID) != "" && state != nil && state.Sessions[msg.SessionID].Status == SessionStatusQuarantined) {
+		// No external request exists to reconcile, so terminal lifecycle fences can
+		// safely retire the row instead of preserving the ambiguous-send behavior
+		// used for provider/transport failures.
+		msg.Status = OutboxStatusSkipped
+		msg.LastSendError = trimDiagnostic("preflight fence: "+reason, 240)
+		updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusSkipped, now)
+		markTranscriptDeliveryForOutboxLocked(state, msg, TranscriptDeliveryStatusSkipped, now)
+		updateArtifactRecordsForOutboxLocked(state, msg, now, "skipped", msg.LastSendError, "")
+	} else {
+		msg.Status = OutboxStatusQueued
+		msg.LastSendError = reason
+		updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusFailed, now)
+		updateArtifactRecordsForOutboxLocked(state, msg, now, artifactStatusForSendError(msg), "", msg.LastSendError)
+	}
+	msg.LastSendAttempt = now
+	msg.UpdatedAt = now
+	return msg, nil
+}
+
+// markOutboxGraphPreflightFailureByBoundaryToken is the narrow takeover
+// cleanup path for a request rejected by the local owner fence before HTTP. It
+// may run after SendAttemptToken has rotated, but only when an exact started
+// attachment boundary still carries the stale token. A replacement attempt
+// cannot write that token: the marker methods retain the original boundary
+// witness and never overwrite a started state. This keeps the cleanup safe
+// without weakening the ordinary unknown-provider-outcome CAS.
+func (s *Store) markOutboxGraphPreflightFailureByBoundaryToken(ctx context.Context, outboxID string, boundaryToken string, message string) (OutboxMessage, error) {
+	boundaryToken = strings.TrimSpace(boundaryToken)
+	if boundaryToken == "" {
+		return OutboxMessage{}, ErrOutboxSendNotClaimed
+	}
+	update := func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		messageBoundary := strings.EqualFold(strings.TrimSpace(msg.AttachmentMessagePostState), "started") &&
+			strings.TrimSpace(msg.AttachmentMessagePostAttemptToken) == boundaryToken
+		sessionBoundary := strings.EqualFold(strings.TrimSpace(msg.AttachmentUploadSessionPostState), "started") &&
+			strings.TrimSpace(msg.AttachmentUploadSessionPostAttemptToken) == boundaryToken
+		messageStartedByOtherAttempt := strings.EqualFold(strings.TrimSpace(msg.AttachmentMessagePostState), "started") && !messageBoundary
+		sessionStartedByOtherAttempt := strings.EqualFold(strings.TrimSpace(msg.AttachmentUploadSessionPostState), "started") && !sessionBoundary
+		if msg.Status != OutboxStatusSending || (!messageBoundary && !sessionBoundary) || messageStartedByOtherAttempt || sessionStartedByOtherAttempt {
+			return msg, ErrOutboxSendNotClaimed
+		}
+		if messageBoundary {
+			msg.AttachmentMessagePostState = "pending"
+			msg.AttachmentMessagePostAttemptToken = ""
+		}
+		if sessionBoundary && strings.TrimSpace(msg.AttachmentUploadURL) == "" {
+			msg.AttachmentUploadSessionPostState = "pending"
+			msg.AttachmentUploadSessionPostAttemptToken = ""
+			msg.AttachmentUploadExpiry = time.Time{}
+			msg.AttachmentUploadOffset = 0
+		}
+		// A durable upload URL is a resume witness. This callback proves that the
+		// current local request was stopped before HTTP, not that a prior session
+		// was deleted, so retain the URL and its ready state.
+		reason := trimDiagnostic(firstStoreNonEmptyString(message, "Graph request rejected by local preflight"), 240)
+		if msg.BlockedByTerminalFailure || (strings.TrimSpace(msg.SessionID) != "" && state != nil && state.Sessions[msg.SessionID].Status == SessionStatusQuarantined) {
+			msg.Status = OutboxStatusSkipped
+			msg.LastSendError = trimDiagnostic("preflight fence: "+reason, 240)
+			updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusSkipped, now)
+			markTranscriptDeliveryForOutboxLocked(state, msg, TranscriptDeliveryStatusSkipped, now)
+			updateArtifactRecordsForOutboxLocked(state, msg, now, "skipped", msg.LastSendError, "")
+		} else {
+			msg.Status = OutboxStatusQueued
+			msg.LastSendError = reason
+			updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusFailed, now)
+			updateArtifactRecordsForOutboxLocked(state, msg, now, artifactStatusForSendError(msg), "", msg.LastSendError)
+		}
+		msg.LastSendAttempt = now
+		msg.UpdatedAt = now
+		return msg, nil
+	}
+	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), false, true, update); handled || err != nil {
+		return out, err
+	}
+	return s.updateOutbox(ctx, outboxID, update)
 }
 
 // MarkOutboxRetryableSendErrorForAttempt retains the ordinary queued/backoff
@@ -13615,6 +15642,24 @@ func (s *Store) MarkOutboxSkippedForAttempt(ctx context.Context, outboxID string
 	}
 	return s.updateOutbox(ctx, outboxID, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
 		return markOutboxSkippedForAttemptLocked(state, msg, attemptToken, reason, now)
+	})
+}
+
+// MarkOutboxPermanentSendFailureForAttempt retires a conclusively rejected
+// send without presenting a linked transcript as successfully delivered. The
+// outbox remains terminal so the same chat FIFO can make progress, while a
+// transcript delivery is durably marked needs_attention and can only be
+// requeued by an explicit history repair. The attempt and owner fences are the
+// same as the ordinary skipped reducer; a stale worker cannot quarantine a
+// replacement attempt.
+func (s *Store) MarkOutboxPermanentSendFailureForAttempt(ctx context.Context, outboxID string, attemptToken string, reason string) (OutboxMessage, error) {
+	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), false, true, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		return markOutboxPermanentSendFailureLocked(state, msg, attemptToken, reason, now)
+	}); handled || err != nil {
+		return out, err
+	}
+	return s.updateOutbox(ctx, outboxID, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		return markOutboxPermanentSendFailureLocked(state, msg, attemptToken, reason, now)
 	})
 }
 
@@ -13820,11 +15865,13 @@ func markOutboxSkippedLocked(state *State, msg OutboxMessage, reason string, now
 // RetireLegacyHistoryGateOutbox removes obsolete automatic history-policy
 // notices after the caller has quiesced the sender. It includes active
 // sending rows because a stopped service has no legitimate sender left for
-// those rows; accepted/sent rows remain untouched. The migration is exhaustive
-// and idempotent: a large unrelated outbox prefix must not leave an old gate
-// notice behind for the post-upgrade readiness check to rediscover.
+// those rows; accepted/sent rows remain untouched. SQLite performs at most
+// maxPages short keyset transactions so a large unrelated outbox prefix does
+// not hold the database connection or liveness path for an unbounded scan.
+// Callers that require an exact post-cleanup answer must use
+// HasPendingLegacyHistoryGateOutbox after cleanup.
 func (s *Store) RetireLegacyHistoryGateOutbox(ctx context.Context, pageSize int, maxPages int) (int, error) {
-	return s.retireLegacyHistoryGateOutbox(ctx, pageSize, maxPages, true)
+	return s.retireLegacyHistoryGateOutbox(ctx, pageSize, maxPages, true, storeOwnerCapability{})
 }
 
 // RetireLegacyHistoryGateOutboxForStartup retires queued and lease-expired
@@ -13832,29 +15879,42 @@ func (s *Store) RetireLegacyHistoryGateOutbox(ctx context.Context, pageSize int,
 // takeover does not prove that a previous process's Graph POST has returned;
 // startup cleanup must leave that ambiguous external side effect recoverable.
 func (s *Store) RetireLegacyHistoryGateOutboxForStartup(ctx context.Context, pageSize int, maxPages int) (int, error) {
-	return s.retireLegacyHistoryGateOutbox(ctx, pageSize, maxPages, false)
+	return s.retireLegacyHistoryGateOutbox(ctx, pageSize, maxPages, false, storeOwnerCapability{})
 }
 
-func (s *Store) retireLegacyHistoryGateOutbox(ctx context.Context, pageSize int, maxPages int, includeActiveSending bool) (int, error) {
+// RetireLegacyHistoryGateOutboxForStartupForOwner is the live-listener variant
+// of RetireLegacyHistoryGateOutboxForStartup. The compatibility migration is
+// still bounded, but every SQLite page and the JSON fallback is fenced by the
+// control lease captured by the listener. A takeover therefore cannot commit
+// a stale cleanup page after the old owner has lost its lease.
+func (s *Store) RetireLegacyHistoryGateOutboxForStartupForOwner(ctx context.Context, pageSize int, maxPages int, machineID string, leaseGeneration int64) (int, error) {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return 0, err
+	}
+	return s.retireLegacyHistoryGateOutbox(ctx, pageSize, maxPages, false, capability)
+}
+
+func (s *Store) retireLegacyHistoryGateOutbox(ctx context.Context, pageSize int, maxPages int, includeActiveSending bool, capability storeOwnerCapability) (int, error) {
 	if pageSize <= 0 {
 		pageSize = 128
 	}
 	if maxPages <= 0 {
 		maxPages = 16
 	}
-	if retired, handled, err := s.retireLegacyHistoryGateOutboxSQLite(ctx, pageSize, maxPages, includeActiveSending); handled || err != nil {
+	if retired, handled, err := s.retireLegacyHistoryGateOutboxSQLite(ctx, pageSize, maxPages, includeActiveSending, capability); handled || err != nil {
 		return retired, err
 	}
 	// JSON stores have one state document. Updating each candidate through the
 	// generic outbox mutator would reload and atomically rewrite that document
 	// once per notice, turning compatibility cleanup into an O(n) full-file I/O
 	// storm. Scan all candidates, but perform one locked read/modify/write.
-	return s.retireLegacyHistoryGateOutboxJSON(ctx, pageSize, maxPages, includeActiveSending)
+	return s.retireLegacyHistoryGateOutboxJSON(ctx, pageSize, maxPages, includeActiveSending, capability)
 }
 
-func (s *Store) retireLegacyHistoryGateOutboxJSON(ctx context.Context, _ int, _ int, includeActiveSending bool) (int, error) {
+func (s *Store) retireLegacyHistoryGateOutboxJSON(ctx context.Context, _ int, _ int, includeActiveSending bool, capability storeOwnerCapability) (int, error) {
 	retired := 0
-	err := s.UpdateIfChanged(ctx, func(state *State) (bool, error) {
+	err := s.updateIfChangedWithCapability(ctx, capability, func(state *State) (bool, error) {
 		changed := false
 		now := time.Now()
 		for id, msg := range state.OutboxMessages {
@@ -13931,6 +15991,38 @@ func markOutboxSkippedForAttemptLocked(state *State, msg OutboxMessage, attemptT
 	updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusSkipped, now)
 	markTranscriptDeliveryForOutboxLocked(state, msg, TranscriptDeliveryStatusSkipped, now)
 	updateArtifactRecordsForOutboxLocked(state, msg, now, "skipped", msg.LastSendError, "")
+	return msg, nil
+}
+
+func markOutboxPermanentSendFailureLocked(state *State, msg OutboxMessage, attemptToken string, reason string, now time.Time) (OutboxMessage, error) {
+	attemptToken = strings.TrimSpace(attemptToken)
+	if msg.Status != OutboxStatusSending || attemptToken == "" || strings.TrimSpace(msg.SendAttemptToken) != attemptToken {
+		return msg, ErrOutboxSendNotClaimed
+	}
+	if err := validateOutboxOwnerCapability(state, msg); err != nil {
+		return msg, err
+	}
+	msg.Status = OutboxStatusSkipped
+	msg.LastSendError = trimDiagnostic(firstStoreNonEmptyString(reason, "permanent Graph rejection"), 240)
+	msg.UpdatedAt = now
+	hasTranscriptDelivery := false
+	for _, delivery := range state.TranscriptDeliveries {
+		if strings.TrimSpace(delivery.OutboxID) == strings.TrimSpace(msg.ID) {
+			hasTranscriptDelivery = true
+			break
+		}
+	}
+	if hasTranscriptDelivery {
+		updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusFailed, now)
+		markTranscriptDeliveryForOutboxLocked(state, msg, TranscriptDeliveryStatusNeedsAttention, now)
+		updateArtifactRecordsForOutboxLocked(state, msg, now, "needs_attention", "permanent Graph rejection", msg.LastSendError)
+	} else {
+		// Preserve the established terminal semantics for ordinary outbox rows;
+		// only a linked transcript needs the stronger three-state disposition.
+		updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusSkipped, now)
+		markTranscriptDeliveryForOutboxLocked(state, msg, TranscriptDeliveryStatusSkipped, now)
+		updateArtifactRecordsForOutboxLocked(state, msg, now, "skipped", msg.LastSendError, "")
+	}
 	return msg, nil
 }
 
@@ -14096,6 +16188,7 @@ func (s *Store) MarkOutboxAttachmentMessagePostStartedForAttempt(ctx context.Con
 			return msg, ErrOutboxSendNotClaimed
 		}
 		msg.AttachmentMessagePostState = "started"
+		msg.AttachmentMessagePostAttemptToken = attemptToken
 		msg.UpdatedAt = now
 		return msg, nil
 	}
@@ -14126,8 +16219,41 @@ func (s *Store) ResetOutboxAttachmentMessagePostPendingForAttempt(ctx context.Co
 			return msg, err
 		}
 		msg.AttachmentMessagePostState = "pending"
+		msg.AttachmentMessagePostAttemptToken = ""
 		msg.UpdatedAt = now
 		return msg, nil
+	}
+	if out, handled, err := s.updateOutboxSQLite(ctx, outboxID, false, true, update); handled || err != nil {
+		return out, err
+	}
+	return s.updateOutbox(ctx, outboxID, update)
+}
+
+// MarkOutboxAttachmentMessagePostRejectedForAttempt atomically records an
+// explicit rejection of a fresh attachment POST and returns the row to the
+// ordinary queued lane. The exact started-boundary token is required: a stale
+// callback must not reset a replacement attempt, and a response whose outcome
+// is not explicitly rejected must continue through the ambiguous recovery
+// fence. Keeping the marker reset and queued transition in one CAS also avoids
+// a takeover window between two local mutations.
+func (s *Store) MarkOutboxAttachmentMessagePostRejectedForAttempt(ctx context.Context, outboxID string, attemptToken string, reason string) (OutboxMessage, error) {
+	outboxID = strings.TrimSpace(outboxID)
+	attemptToken = strings.TrimSpace(attemptToken)
+	if outboxID == "" || attemptToken == "" {
+		return OutboxMessage{}, ErrOutboxSendNotClaimed
+	}
+	update := func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		if msg.Status != OutboxStatusSending || strings.TrimSpace(msg.SendAttemptToken) != attemptToken ||
+			!strings.EqualFold(strings.TrimSpace(msg.AttachmentMessagePostState), "started") ||
+			strings.TrimSpace(msg.AttachmentMessagePostAttemptToken) != attemptToken {
+			return msg, ErrOutboxSendNotClaimed
+		}
+		if err := validateOutboxOwnerCapability(state, msg); err != nil {
+			return msg, err
+		}
+		msg.AttachmentMessagePostState = "pending"
+		msg.AttachmentMessagePostAttemptToken = ""
+		return markOutboxSendErrorLocked(state, msg, attemptToken, reason, now, true, false)
 	}
 	if out, handled, err := s.updateOutboxSQLite(ctx, outboxID, false, true, update); handled || err != nil {
 		return out, err
@@ -14164,6 +16290,46 @@ func (s *Store) ClearOutboxDriveItemForAttempt(ctx context.Context, outboxID str
 	return s.updateOutbox(ctx, outboxID, update)
 }
 
+// RequeueOutboxAfterMissingDriveItemForAttempt atomically forgets a stale
+// DriveItem and returns an attachment to the replayable upload lane after a
+// metadata GET has conclusively reported that the item is gone.  The final
+// Teams POST must still be pending: a missing DriveItem cannot prove that an
+// earlier chat POST was rejected, so an already-started or legacy-unknown
+// attachment remains in the ambiguous recovery lane.
+func (s *Store) RequeueOutboxAfterMissingDriveItemForAttempt(ctx context.Context, outboxID string, attemptToken string, reason string) (OutboxMessage, error) {
+	outboxID = strings.TrimSpace(outboxID)
+	attemptToken = strings.TrimSpace(attemptToken)
+	if outboxID == "" || attemptToken == "" {
+		return OutboxMessage{}, ErrOutboxSendNotClaimed
+	}
+	update := func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		if msg.Status != OutboxStatusSending || strings.TrimSpace(msg.SendAttemptToken) != attemptToken ||
+			strings.TrimSpace(msg.DriveItemID) == "" || strings.TrimSpace(msg.AttachmentPath) == "" ||
+			!strings.EqualFold(strings.TrimSpace(msg.AttachmentMessagePostState), "pending") {
+			return msg, ErrOutboxSendNotClaimed
+		}
+		if err := validateOutboxOwnerCapability(state, msg); err != nil {
+			return msg, err
+		}
+		clearOutboxDriveItemLocked(state, &msg, now)
+		msg.LastSendError = trimDiagnostic(firstStoreNonEmptyString(reason, "durable DriveItem is no longer available; attachment upload will be retried"), 240)
+		msg.LastSendAttempt = now
+		msg.NextAttemptAt = time.Time{}
+		msg.Status = OutboxStatusQueued
+		msg.SendAttemptToken = ""
+		msg.MachineID = ""
+		msg.LeaseGeneration = 0
+		msg.UpdatedAt = now
+		updateHelperDeliveryForOutboxLocked(state, msg, HelperDeliveryStatusFailed, now)
+		updateArtifactRecordsForOutboxLocked(state, msg, now, "failed", "DriveItem missing; upload reset", msg.LastSendError)
+		return msg, nil
+	}
+	if out, handled, err := s.updateOutboxSQLite(ctx, outboxID, false, true, update); handled || err != nil {
+		return out, err
+	}
+	return s.updateOutbox(ctx, outboxID, update)
+}
+
 func clearOutboxDriveItemLocked(state *State, msg *OutboxMessage, now time.Time) {
 	if msg == nil {
 		return
@@ -14176,7 +16342,10 @@ func clearOutboxDriveItemLocked(state *State, msg *OutboxMessage, now time.Time)
 	msg.AttachmentUploadURL = ""
 	msg.AttachmentUploadExpiry = time.Time{}
 	msg.AttachmentUploadOffset = 0
+	msg.AttachmentUploadSessionPostState = "pending"
+	msg.AttachmentUploadSessionPostAttemptToken = ""
 	msg.AttachmentMessagePostState = "pending"
+	msg.AttachmentMessagePostAttemptToken = ""
 	msg.LastSendError = ""
 	if state == nil || len(msg.ArtifactIDs) == 0 {
 		return
@@ -14216,11 +16385,93 @@ func (s *Store) markOutboxDriveItem(ctx context.Context, outboxID string, attemp
 		msg.DriveItemETag = strings.TrimSpace(eTag)
 		msg.DriveItemWebURL = strings.TrimSpace(webURL)
 		msg.DriveItemWebDav = strings.TrimSpace(webDavURL)
+		if strings.TrimSpace(msg.AttachmentPath) != "" && strings.TrimSpace(msg.DriveItemID) != "" {
+			msg.AttachmentUploadSessionPostState = "completed"
+			msg.AttachmentUploadSessionPostAttemptToken = ""
+		}
 		msg.LastSendError = ""
 		updateArtifactRecordsForOutboxLocked(state, msg, now, "drive_uploaded", "", "")
 		return msg, nil
 	}
 	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), false, true, update); handled || err != nil {
+		return out, err
+	}
+	return s.updateOutbox(ctx, outboxID, update)
+}
+
+// MarkOutboxUploadSessionPostStartedForAttempt records the durable boundary
+// immediately before a resumable-upload createUploadSession POST.  It clears
+// an older expired/invalid URL before a new session is requested.  If a prior
+// attempt already crossed that boundary without a durable URL, the method
+// fails closed so a caller cannot replay an unknown POST.
+func (s *Store) MarkOutboxUploadSessionPostStartedForAttempt(ctx context.Context, outboxID string, attemptToken string) (OutboxMessage, error) {
+	outboxID = strings.TrimSpace(outboxID)
+	attemptToken = strings.TrimSpace(attemptToken)
+	if outboxID == "" || attemptToken == "" {
+		return OutboxMessage{}, ErrOutboxSendNotClaimed
+	}
+	update := func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		if msg.Status != OutboxStatusSending || strings.TrimSpace(msg.SendAttemptToken) != attemptToken || strings.TrimSpace(msg.AttachmentPath) == "" {
+			return msg, ErrOutboxSendNotClaimed
+		}
+		if err := validateOutboxOwnerCapability(state, msg); err != nil {
+			return msg, err
+		}
+		postState := strings.ToLower(strings.TrimSpace(msg.AttachmentUploadSessionPostState))
+		if postState == "" {
+			postState = legacyAttachmentUploadSessionPostState(msg)
+		}
+		switch postState {
+		case "pending", "ready":
+			msg.AttachmentUploadSessionPostState = "started"
+			msg.AttachmentUploadSessionPostAttemptToken = attemptToken
+			msg.AttachmentUploadURL = ""
+			msg.AttachmentUploadExpiry = time.Time{}
+			msg.AttachmentUploadOffset = 0
+			msg.LastSendAttempt = now
+			msg.LastSendError = ""
+			return msg, nil
+		case "started", "unknown":
+			return msg, ErrOutboxUploadSessionIndeterminate
+		case "completed":
+			return msg, ErrOutboxSendNotClaimed
+		default:
+			return msg, ErrOutboxUploadSessionIndeterminate
+		}
+	}
+	if out, handled, err := s.updateOutboxSQLite(ctx, outboxID, false, true, update); handled || err != nil {
+		return out, err
+	}
+	return s.updateOutbox(ctx, outboxID, update)
+}
+
+// ResetOutboxUploadSessionPostPendingForAttempt is allowed only for an
+// explicit provider rejection that proves the createUploadSession request was
+// not accepted.  Transport errors, malformed successful responses and 5xx
+// responses must leave the started boundary intact.
+func (s *Store) ResetOutboxUploadSessionPostPendingForAttempt(ctx context.Context, outboxID string, attemptToken string) (OutboxMessage, error) {
+	outboxID = strings.TrimSpace(outboxID)
+	attemptToken = strings.TrimSpace(attemptToken)
+	if outboxID == "" || attemptToken == "" {
+		return OutboxMessage{}, ErrOutboxSendNotClaimed
+	}
+	update := func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
+		if msg.Status != OutboxStatusSending || strings.TrimSpace(msg.SendAttemptToken) != attemptToken ||
+			!strings.EqualFold(strings.TrimSpace(msg.AttachmentUploadSessionPostState), "started") {
+			return msg, ErrOutboxSendNotClaimed
+		}
+		if err := validateOutboxOwnerCapability(state, msg); err != nil {
+			return msg, err
+		}
+		msg.AttachmentUploadSessionPostState = "pending"
+		msg.AttachmentUploadSessionPostAttemptToken = ""
+		msg.AttachmentUploadURL = ""
+		msg.AttachmentUploadExpiry = time.Time{}
+		msg.AttachmentUploadOffset = 0
+		msg.LastSendAttempt = now
+		return msg, nil
+	}
+	if out, handled, err := s.updateOutboxSQLite(ctx, outboxID, false, true, update); handled || err != nil {
 		return out, err
 	}
 	return s.updateOutbox(ctx, outboxID, update)
@@ -14251,10 +16502,19 @@ func (s *Store) MarkOutboxUploadSessionForAttempt(ctx context.Context, outboxID 
 			msg.AttachmentUploadURL = ""
 			msg.AttachmentUploadExpiry = time.Time{}
 			msg.AttachmentUploadOffset = 0
+			if strings.EqualFold(strings.TrimSpace(msg.AttachmentUploadSessionPostState), "ready") && strings.TrimSpace(msg.DriveItemID) == "" {
+				// Dropping the only durable URL without a completed DriveItem
+				// destroys the resume witness.  Do not let a later attempt create a
+				// second session unless an explicit missing-item repair resets it.
+				msg.AttachmentUploadSessionPostState = "unknown"
+			}
+			msg.AttachmentUploadSessionPostAttemptToken = ""
 		} else {
 			msg.AttachmentUploadURL = strings.TrimSpace(uploadURL)
 			msg.AttachmentUploadExpiry = expiresAt
 			msg.AttachmentUploadOffset = offset
+			msg.AttachmentUploadSessionPostState = "ready"
+			msg.AttachmentUploadSessionPostAttemptToken = ""
 		}
 		msg.LastSendAttempt = now
 		msg.LastSendError = ""
@@ -15073,6 +17333,11 @@ type storeOwnerCapability struct {
 	// permits the current lease holder to adopt a generation-zero queued row.
 	// It never permits a running row or a callback from an old capability.
 	allowLegacyQueuedIsolation bool
+	// allowQueuedTurnTakeover is used only by the explicit recovery disposition
+	// above. It still requires the current control lease and is narrowed by the
+	// queued-row generation check in validateQueuedTurnOwnerForClaim; it never
+	// permits a running callback to cross an owner boundary.
+	allowQueuedTurnTakeover bool
 }
 
 func newStoreOwnerCapability(machineID string, leaseGeneration int64) (storeOwnerCapability, error) {
@@ -15123,6 +17388,9 @@ func validateTurnOwnerCapability(state *State, turn Turn, capability storeOwnerC
 	if capability.allowTurnTakeover {
 		return nil
 	}
+	if capability.allowQueuedTurnTakeover && turn.Status == TurnStatusQueued {
+		return validateQueuedTurnOwnerForClaim(turn, capability)
+	}
 	if capability.allowLegacyQueuedIsolation && turn.Status == TurnStatusQueued && turn.LeaseGeneration <= 0 {
 		return nil
 	}
@@ -15140,8 +17408,15 @@ func validateQueuedTurnOwnerForClaim(turn Turn, capability storeOwnerCapability)
 	// has no process-level proof and may be adopted atomically by the current
 	// lease holder; ClaimNextQueuedTurnForOwner binds the new capability before
 	// changing the status to running. A positive generation, however, is an
-	// explicit capability and must match exactly.
+	// explicit capability. The current holder may adopt a strictly older
+	// generation in the same queued->running CAS: the single current control
+	// lease is the authority, and the old generation can no longer pass its
+	// owner fence. A future generation is not a recoverable restart boundary and
+	// must fail closed.
 	if turn.LeaseGeneration > 0 {
+		if turn.LeaseGeneration < capability.leaseGeneration && strings.TrimSpace(turn.MachineID) != "" {
+			return nil
+		}
 		if strings.TrimSpace(turn.MachineID) != capability.machineID || turn.LeaseGeneration != capability.leaseGeneration {
 			return ErrControlLeaseNotHeld
 		}
@@ -15779,6 +18054,16 @@ func pendingOutboxMatchesQuery(msg OutboxMessage, state State, query PendingOutb
 	if !knownOutboxStatus(msg.Status) {
 		return false
 	}
+	// A queued row without a canonical Teams destination is an internal/unbound
+	// durable record, not Graph work.  Keep it out of every pending admission
+	// lane, including the unscoped JSON compatibility lane; otherwise a direct
+	// sender caller could reach Graph with an empty or padded chat identity and
+	// retry the same unusable row forever.  Repair/rebinding remains an explicit
+	// durable operation and does not infer a destination here.
+	chatID := strings.TrimSpace(msg.TeamsChatID)
+	if chatID == "" || msg.TeamsChatID != chatID {
+		return false
+	}
 	if AcceptedSourceRewriteOutboxIsStable(msg) {
 		// Graph already accepted the message and the durable source-rewrite fence
 		// makes it permanently non-retryable. Reconcile it only through explicit
@@ -15787,8 +18072,14 @@ func pendingOutboxMatchesQuery(msg OutboxMessage, state State, query PendingOutb
 	}
 	ambiguous := OutboxSendIsAmbiguous(msg)
 	unknownOutcome := outboxSendUnknownOutcome(msg, query.Now)
-	if query.AmbiguousOnly && !unknownOutcome {
-		return false
+	if query.AmbiguousOnly {
+		// The normal ambiguous view is lease-expiry gated. A live owner-bound
+		// recovery pass may additionally inspect a tokenful row from an older
+		// control-lease generation: takeover has fenced the old writer, and the
+		// recovery path only probes Graph before marking the row ambiguous.
+		if msg.Status != OutboxStatusSending || strings.TrimSpace(msg.TeamsMessageID) != "" || (!unknownOutcome && !query.IncludeActiveSending) {
+			return false
+		}
 	}
 	if unknownOutcome {
 		// Every expired Sending row without a durable Teams ID has an unknown
@@ -15818,7 +18109,11 @@ func pendingOutboxMatchesQuery(msg OutboxMessage, state State, query PendingOutb
 		return false
 	}
 	if !query.IgnoreRateLimit && !acceptedWithTeamsID {
-		if blocked := state.ChatRateLimits[msg.TeamsChatID]; blocked.BlockedUntil.After(query.Now) {
+		blocked := state.ChatRateLimits[msg.TeamsChatID]
+		if global := state.ChatRateLimits[GraphWriteAccountRateLimitKey]; global.BlockedUntil.After(blocked.BlockedUntil) {
+			blocked = global
+		}
+		if blocked.BlockedUntil.After(query.Now) {
 			return false
 		}
 	}
@@ -15857,25 +18152,90 @@ func (s *Store) ChatRateLimit(ctx context.Context, chatID string) (ChatRateLimit
 	return limit, ok, nil
 }
 
+// OutboxChatRateLimit returns the strongest durable write gate that applies to
+// one outbox chat: its local gate and an explicitly account/global gate. Read
+// throttles use ChatRateLimit directly and are intentionally not included.
+// Returning the winning row's ChatID lets callers clear an expired global row
+// without accidentally treating it as a local chat repair.
+func (s *Store) OutboxChatRateLimit(ctx context.Context, chatID string) (ChatRateLimitState, bool, error) {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return ChatRateLimitState{}, false, fmt.Errorf("chat id is required")
+	}
+	if limit, ok, handled, err := s.outboxChatRateLimitSQLite(ctx, chatID); handled || err != nil {
+		return limit, ok, err
+	}
+	state, err := s.loadStateFieldsOrFull(ctx, chatRateLimitStateFields)
+	if err != nil {
+		return ChatRateLimitState{}, false, err
+	}
+	local, localOK := state.ChatRateLimits[chatID]
+	global, globalOK := state.ChatRateLimits[GraphWriteAccountRateLimitKey]
+	return strongerOutboxChatRateLimit(local, localOK, global, globalOK), localOK || globalOK, nil
+}
+
+func strongerOutboxChatRateLimit(local ChatRateLimitState, localOK bool, global ChatRateLimitState, globalOK bool) ChatRateLimitState {
+	if !localOK {
+		return global
+	}
+	if !globalOK || !global.BlockedUntil.After(local.BlockedUntil) {
+		return local
+	}
+	return global
+}
+
 func (s *Store) SetChatRateLimit(ctx context.Context, chatID string, blockedUntil time.Time, reason string) (ChatRateLimitState, error) {
 	return s.SetChatRateLimitForOutbox(ctx, chatID, blockedUntil, reason, "")
 }
 
 func (s *Store) SetChatRateLimitForOutbox(ctx context.Context, chatID string, blockedUntil time.Time, reason string, outboxID string) (ChatRateLimitState, error) {
+	return s.setChatRateLimitWithCapability(ctx, chatID, blockedUntil, reason, outboxID, storeOwnerCapability{})
+}
+
+// SetChatRateLimitForOwner records a read/write throttle only while the
+// supplied control-lease capability is current.  Read-rate-limit callbacks
+// can finish after a listener takeover; binding this update to the immutable
+// callback capability prevents a stale owner from writing a gate as the new
+// owner.  The unscoped SetChatRateLimit APIs remain available for startup and
+// offline repair paths that intentionally do not hold a live lease.
+func (s *Store) SetChatRateLimitForOwner(ctx context.Context, chatID string, blockedUntil time.Time, reason, machineID string, leaseGeneration int64) (ChatRateLimitState, error) {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return ChatRateLimitState{}, err
+	}
+	return s.setChatRateLimitWithCapability(ctx, chatID, blockedUntil, reason, "", capability)
+}
+
+func (s *Store) SetChatRateLimitForOutboxWithOwner(ctx context.Context, chatID string, blockedUntil time.Time, reason, outboxID, machineID string, leaseGeneration int64) (ChatRateLimitState, error) {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return ChatRateLimitState{}, err
+	}
+	return s.setChatRateLimitWithCapability(ctx, chatID, blockedUntil, reason, outboxID, capability)
+}
+
+func (s *Store) setChatRateLimitWithCapability(ctx context.Context, chatID string, blockedUntil time.Time, reason, outboxID string, capability storeOwnerCapability) (ChatRateLimitState, error) {
 	chatID = strings.TrimSpace(chatID)
 	if chatID == "" {
 		return ChatRateLimitState{}, fmt.Errorf("chat id is required")
 	}
 	outboxID = strings.TrimSpace(outboxID)
-	if out, handled, err := s.setChatRateLimitSQLite(ctx, chatID, blockedUntil, reason, outboxID); handled || err != nil {
+	if out, handled, err := s.setChatRateLimitSQLiteWithCapability(ctx, chatID, blockedUntil, reason, outboxID, capability); handled || err != nil {
 		return out, err
 	}
 	var out ChatRateLimitState
-	err := s.Update(ctx, func(state *State) error {
+	err := s.updateIfChangedWithCapability(ctx, capability, func(state *State) (bool, error) {
 		now := time.Now()
 		next := state.ChatRateLimits[chatID]
 		next.ChatID = chatID
-		next.BlockedUntil = blockedUntil
+		// Rate-limit callbacks can arrive out of order when several workers
+		// observe the same account/chat throttle.  A late response with a
+		// shorter Retry-After must never reopen the lane before the longer,
+		// already durable deadline.  An explicit ClearChatRateLimit remains the
+		// operator/application wake-up path.
+		if blockedUntil.After(next.BlockedUntil) {
+			next.BlockedUntil = blockedUntil
+		}
 		next.Reason = trimDiagnostic(reason, 240)
 		if outboxID != "" {
 			next.PoisonOutboxID = outboxID
@@ -15883,7 +18243,7 @@ func (s *Store) SetChatRateLimitForOutbox(ctx context.Context, chatID string, bl
 		next.UpdatedAt = now
 		state.ChatRateLimits[chatID] = next
 		out = next
-		return nil
+		return true, nil
 	})
 	return out, err
 }
@@ -15909,6 +18269,42 @@ func (s *Store) ClearChatRateLimit(ctx context.Context, chatID string) error {
 			}
 		}
 		return nil
+	})
+}
+
+// ClearChatRateLimitIfExpired removes a rate-limit row only when it is still
+// the exact expired deadline observed by the caller.  A sender can read an
+// expired gate, lose the owner lease, and resume after a replacement owner
+// has installed a newer deadline; an unconditional clear in that window
+// would reopen the newer gate and release queued work too early.
+func (s *Store) ClearChatRateLimitIfExpired(ctx context.Context, chatID string, observedUntil time.Time) error {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return fmt.Errorf("chat id is required")
+	}
+	if observedUntil.IsZero() || observedUntil.After(time.Now()) {
+		return nil
+	}
+	if handled, err := s.clearChatRateLimitIfExpiredSQLite(ctx, chatID, observedUntil); handled || err != nil {
+		return err
+	}
+	return s.updateIfChangedWithCapability(ctx, storeOwnerCapability{}, func(state *State) (bool, error) {
+		current, ok := state.ChatRateLimits[chatID]
+		if !ok || !current.BlockedUntil.Equal(observedUntil) || current.BlockedUntil.After(time.Now()) {
+			return false, nil
+		}
+		delete(state.ChatRateLimits, chatID)
+		for id, msg := range state.OutboxMessages {
+			if msg.TeamsChatID != chatID || msg.Status != OutboxStatusQueued || msg.NextAttemptAt.IsZero() {
+				continue
+			}
+			// Do not clear a newer, independently durable outbox retry gate.
+			if !msg.NextAttemptAt.After(observedUntil) {
+				msg.NextAttemptAt = time.Time{}
+				state.OutboxMessages[id] = msg
+			}
+		}
+		return true, nil
 	})
 }
 
@@ -15975,6 +18371,10 @@ func (s *Store) RecordChatPollSuccessWithContinuation(ctx context.Context, chatI
 	}
 	var out ChatPollState
 	err := s.Update(ctx, func(state *State) error {
+		if current, found := state.ChatPolls[chatID]; found && chatPollHasOpaqueRecoveryEvidence(current) {
+			out = current
+			return ErrChatPollOpaqueRecoveryRequired
+		}
 		now := time.Now()
 		poll, changed := applyChatPollSuccessLocked(state, chatID, lastModifiedCursor, seeded, windowFull, fetched, continuationPath, now)
 		if changed {
@@ -16005,6 +18405,10 @@ func (s *Store) RecordChatPollSuccessWithContinuationAndSchedule(ctx context.Con
 	}
 	var out ChatPollState
 	err := s.Update(ctx, func(state *State) error {
+		if current, found := state.ChatPolls[chatID]; found && chatPollHasOpaqueRecoveryEvidence(current) {
+			out = current
+			return ErrChatPollOpaqueRecoveryRequired
+		}
 		now := time.Now()
 		poll, changed := applyChatPollSuccessLocked(state, chatID, lastModifiedCursor, seeded, windowFull, fetched, continuationPath, now)
 		if schedule != nil {
@@ -16019,6 +18423,14 @@ func (s *Store) RecordChatPollSuccessWithContinuationAndSchedule(ctx context.Con
 			case update.ChatID != chatID:
 				return fmt.Errorf("chat poll schedule chat id %q does not match success chat id %q", update.ChatID, chatID)
 			}
+			if err := s.validateLegacyChatPollJSONHashLocked(update); err != nil {
+				return err
+			}
+			// applyChatPollScheduleUpdateLocked is backend-neutral and deliberately
+			// rejects an unvalidated raw witness. The JSON path validates against the
+			// exact nested bytes while the state lock is held, then clears the
+			// transport-only fence before applying the logical update.
+			update.HasExpectedPollJSONHash = false
 			var scheduleChanged bool
 			poll, scheduleChanged, err = applyChatPollScheduleUpdateLocked(state, update, time.Now())
 			if err != nil {
@@ -16139,6 +18551,13 @@ func applyChatPollErrorWithBlockLocked(state *State, chatID string, message stri
 	poll.LastError = message
 	poll.LastErrorAt = now
 	poll.FailureCount++
+	// Multiple poll workers may finish out of order.  Preserve the furthest
+	// retry deadline already recorded for this chat; otherwise a stale short
+	// Retry-After can make the next scheduler tick probe Graph again while the
+	// original longer backoff is still in force.
+	if blockedUntil.Before(poll.BlockedUntil) {
+		blockedUntil = poll.BlockedUntil
+	}
 	if blockedUntil.After(now) {
 		if poll.PollState != "" && poll.PollState != chatPollStateBlocked {
 			poll.PreviousPollState = poll.PollState
@@ -16159,6 +18578,10 @@ func (s *Store) UpdateChatPollSchedule(ctx context.Context, update ChatPollSched
 	}
 	var out ChatPollState
 	err := s.Update(ctx, func(state *State) error {
+		if err := s.validateLegacyChatPollJSONHashLocked(update); err != nil {
+			return err
+		}
+		update.HasExpectedPollJSONHash = false
 		now := time.Now()
 		poll, changed, err := applyChatPollScheduleUpdateLocked(state, update, now)
 		if err != nil {
@@ -16185,10 +18608,19 @@ func (s *Store) UpdateChatPollSchedules(ctx context.Context, updates []ChatPollS
 	}
 	out := make(map[string]ChatPollState, len(updates))
 	err := s.Update(ctx, func(state *State) error {
+		for _, update := range updates {
+			if err := s.validateLegacyChatPollJSONHashLocked(update); err != nil {
+				return err
+			}
+		}
+		normalizedUpdates := append([]ChatPollScheduleUpdate(nil), updates...)
+		for i := range normalizedUpdates {
+			normalizedUpdates[i].HasExpectedPollJSONHash = false
+		}
 		now := time.Now()
 		nextOut := make(map[string]ChatPollState, len(updates))
 		changed := false
-		for _, update := range updates {
+		for _, update := range normalizedUpdates {
 			poll, updateChanged, err := applyChatPollScheduleUpdateLocked(state, update, now)
 			if err != nil {
 				return err
@@ -16233,10 +18665,19 @@ func (s *Store) UpdateChatPollSchedulesForOwner(ctx context.Context, updates []C
 		if err := validateStoreOwnerCapability(state, capability); err != nil {
 			return err
 		}
+		for _, update := range updates {
+			if err := s.validateLegacyChatPollJSONHashLocked(update); err != nil {
+				return err
+			}
+		}
+		normalizedUpdates := append([]ChatPollScheduleUpdate(nil), updates...)
+		for i := range normalizedUpdates {
+			normalizedUpdates[i].HasExpectedPollJSONHash = false
+		}
 		now := time.Now()
 		nextOut := make(map[string]ChatPollState, len(updates))
 		changed := false
-		for _, update := range updates {
+		for _, update := range normalizedUpdates {
 			poll, updateChanged, err := applyChatPollScheduleUpdateLocked(state, update, now)
 			if err != nil {
 				return err
@@ -16355,7 +18796,7 @@ func transcriptCheckpointIDForSession(sessionID string) string {
 }
 
 func transcriptImportCheckpointIsActive(state *State, checkpoint ImportCheckpoint) bool {
-	return checkpoint.Status == importCheckpointStatusImporting && !transcriptImportCheckpointIsOrphaned(state, checkpoint)
+	return checkpoint.Status == importCheckpointStatusImporting && !checkpoint.DeliveryNeedsAttention && !transcriptImportCheckpointIsOrphaned(state, checkpoint)
 }
 
 func transcriptImportCheckpointIsOrphaned(state *State, checkpoint ImportCheckpoint) bool {
@@ -16371,12 +18812,61 @@ func transcriptImportCheckpointIsOrphaned(state *State, checkpoint ImportCheckpo
 	return state.ServiceOwner.StartedAt.After(checkpoint.UpdatedAt)
 }
 
+// validateLegacyChatPollJSONHashLocked validates the raw nested poll bytes
+// while Store.Update already owns the legacy JSON state lock. The typed State
+// is not sufficient for this fence: encoding/json normalizes whitespace,
+// malformed legacy values, and duplicate-key representations. A missing row
+// has the empty hash, matching the SQLite backend's exact absence check.
+func (s *Store) validateLegacyChatPollJSONHashLocked(update ChatPollScheduleUpdate) error {
+	if !update.HasExpectedPollJSONHash {
+		return nil
+	}
+	chatID := strings.TrimSpace(update.ChatID)
+	if chatID == "" {
+		return fmt.Errorf("chat id is required")
+	}
+	data, err := os.ReadFile(s.path)
+	if errors.Is(err, os.ErrNotExist) {
+		if strings.TrimSpace(update.ExpectedPollJSONHash) == "" {
+			return nil
+		}
+		return ErrChatPollRevisionChanged
+	}
+	if err != nil {
+		return err
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(data, &root); err != nil {
+		return err
+	}
+	var polls map[string]json.RawMessage
+	if raw, ok := root["chat_polls"]; ok && len(raw) > 0 && string(raw) != "null" {
+		if err := json.Unmarshal(raw, &polls); err != nil {
+			return err
+		}
+	}
+	actualHash := ""
+	if raw, ok := polls[chatID]; ok {
+		actualHash = sha256Bytes(raw)
+	}
+	if actualHash != strings.TrimSpace(update.ExpectedPollJSONHash) {
+		return ErrChatPollRevisionChanged
+	}
+	return nil
+}
+
 func applyChatPollScheduleUpdateLocked(state *State, update ChatPollScheduleUpdate, now time.Time) (ChatPollState, bool, error) {
 	chatID := strings.TrimSpace(update.ChatID)
 	if chatID == "" {
 		return ChatPollState{}, false, fmt.Errorf("chat id is required")
 	}
 	poll := state.ChatPolls[chatID]
+	if update.HasExpectedPollJSONHash {
+		// Raw JSON fences must be checked by the backend-specific caller while
+		// holding its durable lock. Applying an unchecked witness would make the
+		// JSON compatibility backend vulnerable to stale recovery mutation.
+		return poll, false, ErrChatPollRevisionChanged
+	}
 	if update.HasExpectedPollRevision && poll.PollRevision != update.ExpectedPollRevision {
 		return poll, false, ErrChatPollRevisionChanged
 	}
@@ -16475,6 +18965,40 @@ func applyChatPollScheduleUpdateLocked(state *State, update ChatPollScheduleUpda
 			changed = true
 		}
 	}
+	if update.SetRecoveryRequired {
+		if !poll.RecoveryRequired {
+			poll.RecoveryRequired = true
+			changed = true
+		}
+		if !poll.Seeded {
+			// A row-local recovery disposition must not allow a later Graph
+			// response to be treated as a first-observation baseline.
+			poll.Seeded = true
+			changed = true
+		}
+		if reason := trimDiagnostic(update.RecoveryReason, 240); reason != "" && poll.RecoveryReason != reason {
+			poll.RecoveryReason = reason
+			changed = true
+		}
+		if sourceHash := strings.TrimSpace(update.RecoverySourceHash); sourceHash != "" && poll.RecoverySourceHash != sourceHash {
+			poll.RecoverySourceHash = sourceHash
+			changed = true
+		}
+	}
+	if update.ClearRecoveryRequired {
+		if poll.RecoveryRequired {
+			poll.RecoveryRequired = false
+			changed = true
+		}
+		if poll.RecoveryReason != "" {
+			poll.RecoveryReason = ""
+			changed = true
+		}
+		if poll.RecoverySourceHash != "" {
+			poll.RecoverySourceHash = ""
+			changed = true
+		}
+	}
 	if !changed {
 		return poll, false, nil
 	}
@@ -16515,47 +19039,89 @@ func (s *Store) MarkChatPollParkNoticeSent(ctx context.Context, chatID string, a
 func (s *Store) Recover(ctx context.Context) (RecoveryReport, error) {
 	var report RecoveryReport
 	err := s.UpdateIfChanged(ctx, func(state *State) (bool, error) {
-		now := time.Now()
-		changed := false
-		for id, turn := range state.Turns {
-			if turn.Status != TurnStatusQueued && turn.Status != TurnStatusRunning {
-				continue
-			}
-			turn.Status = TurnStatusInterrupted
-			turn.InterruptedAt = now
-			turn.RecoveryReason = "ambiguous after restart"
-			turn.UpdatedAt = now
-			state.Turns[id] = turn
-			markInboundIgnoredForInterruptedTurn(state, turn, now)
-			report.InterruptedTurnIDs = append(report.InterruptedTurnIDs, id)
-			changed = true
-		}
-		for id, msg := range state.OutboxMessages {
-			if outboxDeliveryProtected(msg) {
-				if OutboxBlocksUpgrade(*state, msg, now) {
-					report.PreservedOutboxBlockerIDs = append(report.PreservedOutboxBlockerIDs, id)
-				}
-				continue
-			}
-			if !outboxDeliveryTransient(msg) {
-				continue
-			}
-			switch msg.Status {
-			case OutboxStatusQueued, OutboxStatusSending:
-				msg.Status = OutboxStatusSkipped
-				msg.LastSendError = "superseded by teams recover"
-				msg.UpdatedAt = now
-				state.OutboxMessages[id] = msg
-				report.SupersededOutboxIDs = append(report.SupersededOutboxIDs, id)
-				changed = true
-			}
-		}
-		sort.Strings(report.InterruptedTurnIDs)
-		sort.Strings(report.SupersededOutboxIDs)
-		sort.Strings(report.PreservedOutboxBlockerIDs)
-		return changed, nil
+		return recoverStateLocked(state, &report, time.Now()), nil
 	})
 	return report, err
+}
+
+// recoverStateLocked applies the restart disposition while the caller holds
+// the Store state/file lock. Keeping the disposition separate lets the CLI
+// combine owner validation, owner clearing, and recovery in one atomic
+// critical section instead of clearing an observed owner and then performing
+// an unscoped mutation after a replacement listener may have claimed it.
+func recoverStateLocked(state *State, report *RecoveryReport, now time.Time) bool {
+	if state == nil || report == nil {
+		return false
+	}
+	changed := false
+	for id, turn := range state.Turns {
+		if turn.Status != TurnStatusQueued && turn.Status != TurnStatusRunning {
+			continue
+		}
+		turn.Status = TurnStatusInterrupted
+		turn.InterruptedAt = now
+		turn.RecoveryReason = "ambiguous after restart"
+		turn.UpdatedAt = now
+		state.Turns[id] = turn
+		markInboundIgnoredForInterruptedTurn(state, turn, now)
+		report.InterruptedTurnIDs = append(report.InterruptedTurnIDs, id)
+		changed = true
+	}
+	for id, msg := range state.OutboxMessages {
+		if outboxDeliveryProtected(msg) {
+			if OutboxBlocksUpgrade(*state, msg, now) {
+				report.PreservedOutboxBlockerIDs = append(report.PreservedOutboxBlockerIDs, id)
+			}
+			continue
+		}
+		if !outboxDeliveryTransient(msg) {
+			continue
+		}
+		switch msg.Status {
+		case OutboxStatusQueued, OutboxStatusSending:
+			msg.Status = OutboxStatusSkipped
+			msg.LastSendError = "superseded by teams recover"
+			msg.UpdatedAt = now
+			state.OutboxMessages[id] = msg
+			report.SupersededOutboxIDs = append(report.SupersededOutboxIDs, id)
+			changed = true
+		}
+	}
+	sort.Strings(report.InterruptedTurnIDs)
+	sort.Strings(report.SupersededOutboxIDs)
+	sort.Strings(report.PreservedOutboxBlockerIDs)
+	return changed
+}
+
+// RecoverIfOwnerSame atomically validates the owner observation and applies
+// restart recovery. expectOwner=true requires the exact observed owner to be
+// present; expectOwner=false requires the store to remain ownerless. The
+// result is false when another process changed ownership between ReadOwner and
+// this call, and in that case no turn/outbox mutation is performed.
+func (s *Store) RecoverIfOwnerSame(ctx context.Context, expected OwnerMetadata, expectOwner bool) (RecoveryReport, bool, error) {
+	if report, applied, handled, err := s.recoverIfOwnerSameSQLite(ctx, expected, expectOwner); handled || err != nil {
+		return report, applied, err
+	}
+	var report RecoveryReport
+	applied := false
+	err := s.UpdateIfChanged(ctx, func(state *State) (bool, error) {
+		existing, ok := state.readOwner()
+		if expectOwner {
+			if !ok || !sameOwnerForLeaseCleanup(existing, expected) {
+				return false, nil
+			}
+			state.ServiceOwner = nil
+			state.LockOwner = nil
+			applied = true
+		} else if ok {
+			return false, nil
+		} else {
+			applied = true
+		}
+		changed := recoverStateLocked(state, &report, time.Now())
+		return changed || expectOwner, nil
+	})
+	return report, applied, err
 }
 
 func (s *Store) QuarantineSession(ctx context.Context, req SessionQuarantineRequest) (SessionQuarantineReport, error) {
@@ -16581,6 +19147,53 @@ func (s *Store) QuarantineSession(ctx context.Context, req SessionQuarantineRequ
 		})
 	})
 	return report, err
+}
+
+// QuarantineSessionIfOwnerSame applies the operator lifecycle mutation only
+// when the owner observed by the caller is still the durable owner (or when
+// the caller observed an ownerless store and it is still ownerless).  The
+// check, optional stale-owner clear, and session mutation share one
+// state/file-lock critical section.  This is intentionally a conservative
+// maintenance API: a takeover returns applied=false rather than allowing a
+// command that opened a stale store to mutate the replacement owner's state.
+// The normal listener self-echo breaker keeps using QuarantineSession because
+// it already owns the current lease capability in its durable callback path.
+func (s *Store) QuarantineSessionIfOwnerSame(ctx context.Context, expected OwnerMetadata, expectOwner bool, req SessionQuarantineRequest) (SessionQuarantineReport, bool, error) {
+	req.SessionID = strings.TrimSpace(req.SessionID)
+	if req.SessionID == "" {
+		return SessionQuarantineReport{}, false, fmt.Errorf("session id is required")
+	}
+	req.Reason = trimDiagnostic(firstStoreNonEmptyString(req.Reason, "helper self-echo circuit breaker"), 240)
+	req.Source = trimDiagnostic(firstStoreNonEmptyString(req.Source, "teams_helper"), 80)
+	if req.Now.IsZero() {
+		req.Now = time.Now()
+	}
+	var report SessionQuarantineReport
+	applied := false
+	err := s.withSessionLock(ctx, req.SessionID, func() error {
+		return s.updateSessionLifecycleIfOwnerSame(ctx, expected, expectOwner, func(state *State) (bool, error) {
+			existing, present := state.readOwner()
+			if expectOwner {
+				if !present || !sameOwnerForLeaseCleanup(existing, expected) {
+					return false, nil
+				}
+			} else if present {
+				return false, nil
+			}
+			if expectOwner {
+				state.ServiceOwner = nil
+				state.LockOwner = nil
+			}
+			var err error
+			report, err = applySessionQuarantine(state, req)
+			if err != nil {
+				return false, err
+			}
+			applied = true
+			return report.Changed, nil
+		})
+	})
+	return report, applied, err
 }
 
 func applySessionQuarantine(state *State, req SessionQuarantineRequest) (SessionQuarantineReport, error) {
@@ -16623,8 +19236,7 @@ func applySessionQuarantine(state *State, req SessionQuarantineRequest) (Session
 		if strings.TrimSpace(inbound.SessionID) != req.SessionID || inbound.Status != InboundStatusQueued && inbound.Status != InboundStatusDeferred && inbound.Status != InboundStatusPersisted {
 			continue
 		}
-		inbound.Status = InboundStatusIgnored
-		inbound.UpdatedAt = now
+		markInboundIgnored(&inbound, now)
 		state.InboundEvents[id] = inbound
 		report.IgnoredInboundIDs = append(report.IgnoredInboundIDs, id)
 	}
@@ -16705,6 +19317,100 @@ func (s *Store) UnquarantineSession(ctx context.Context, req SessionUnquarantine
 	return report, err
 }
 
+// UnquarantineSessionIfOwnerSame is the owner-fenced counterpart of
+// UnquarantineSession used by offline CLI maintenance.  It keeps the
+// read/owner check and lifecycle transition atomic across JSON and SQLite
+// stores, so a replacement listener cannot be changed after the command's
+// initial read.
+func (s *Store) UnquarantineSessionIfOwnerSame(ctx context.Context, expected OwnerMetadata, expectOwner bool, req SessionUnquarantineRequest) (SessionUnquarantineReport, bool, error) {
+	req.SessionID = strings.TrimSpace(req.SessionID)
+	if req.SessionID == "" {
+		return SessionUnquarantineReport{}, false, fmt.Errorf("session id is required")
+	}
+	if req.Now.IsZero() {
+		req.Now = time.Now()
+	}
+	var report SessionUnquarantineReport
+	applied := false
+	err := s.withSessionLock(ctx, req.SessionID, func() error {
+		return s.updateSessionLifecycleIfOwnerSame(ctx, expected, expectOwner, func(state *State) (bool, error) {
+			existing, present := state.readOwner()
+			if expectOwner {
+				if !present || !sameOwnerForLeaseCleanup(existing, expected) {
+					return false, nil
+				}
+			} else if present {
+				return false, nil
+			}
+			if expectOwner {
+				state.ServiceOwner = nil
+				state.LockOwner = nil
+			}
+			var err error
+			report, err = applySessionUnquarantine(state, req)
+			if err != nil {
+				return false, err
+			}
+			applied = true
+			return report.Changed, nil
+		})
+	})
+	return report, applied, err
+}
+
+// updateSessionLifecycleIfOwnerSame owns the state/file lock for the complete
+// owner check and lifecycle write.  SQLite's generic full-state writer is used
+// here deliberately: these are operator maintenance commands, not the hot
+// listener path, and writeSQLiteStateWithOptions is needed to keep the stale
+// owner clear from being reintroduced by the liveness-row preservation merge.
+func (s *Store) updateSessionLifecycleIfOwnerSame(ctx context.Context, expected OwnerMetadata, expectOwner bool, fn func(*State) (bool, error)) error {
+	return s.withStateLock(ctx, func() error {
+		state, err := s.loadUnlocked(ctx)
+		if err != nil {
+			return err
+		}
+		existing, present := state.readOwner()
+		if expectOwner {
+			if !present || !sameOwnerForLeaseCleanup(existing, expected) {
+				return nil
+			}
+		} else if present {
+			return nil
+		}
+		changed, err := fn(&state)
+		if err != nil {
+			return err
+		}
+		if !changed && !expectOwner {
+			return nil
+		}
+		if expectOwner {
+			state.ServiceOwner = nil
+			state.LockOwner = nil
+		}
+		state.ensure(time.Now())
+		if pointer, ok, err := s.currentSQLitePointerUnlocked(); err != nil {
+			return err
+		} else if ok {
+			db, err := s.sqliteDBUnlocked(pointer)
+			if err != nil {
+				return err
+			}
+			if err := writeSQLiteStateWithOptions(ctx, db, state, expectOwner); err != nil {
+				s.invalidateMessageLookupCacheLocked()
+				return err
+			}
+		} else if err := s.saveUnlocked(ctx, state); err != nil {
+			s.invalidateMessageLookupCacheLocked()
+			return err
+		}
+		if s.messageLookup.Valid {
+			s.replaceMessageLookupCacheFromStateLocked(state)
+		}
+		return nil
+	})
+}
+
 func applySessionUnquarantine(state *State, req SessionUnquarantineRequest) (SessionUnquarantineReport, error) {
 	var report SessionUnquarantineReport
 	session, ok := state.Sessions[req.SessionID]
@@ -16776,10 +19482,29 @@ func markInboundIgnoredForInterruptedTurn(state *State, turn Turn, now time.Time
 	if !ok {
 		return
 	}
+	if observed := strings.TrimSpace(inbound.SessionID); observed != "" && strings.TrimSpace(turn.SessionID) != "" && observed != strings.TrimSpace(turn.SessionID) {
+		return
+	}
+	if strings.TrimSpace(inbound.TurnID) != "" && strings.TrimSpace(inbound.TurnID) != strings.TrimSpace(turn.ID) {
+		return
+	}
+	if err := validateInboundSessionChatFromState(state, turn.SessionID, inbound); err != nil {
+		return
+	}
 	if inbound.Status == InboundStatusQueued || inbound.Status == InboundStatusDeferred {
-		inbound.Status = InboundStatusIgnored
-		inbound.UpdatedAt = now
+		markInboundIgnored(&inbound, now)
 		state.InboundEvents[inbound.ID] = inbound
+	}
+}
+
+func markInboundIgnored(inbound *InboundEvent, now time.Time) {
+	if inbound == nil {
+		return
+	}
+	inbound.Status = InboundStatusIgnored
+	clearInboundRetryMetadata(inbound)
+	if !now.IsZero() {
+		inbound.UpdatedAt = now
 	}
 }
 
@@ -16960,6 +19685,15 @@ func loadStateData(data []byte) (State, error) {
 		}
 		state = isolated
 	}
+	// Legacy JSON keeps opaque poll bytes intact across ordinary saves. Apply
+	// the separate retry sidecar before any caller evaluates poll admission so
+	// a restart cannot forget a durable 429 gate.
+	applyLegacyChatPollRetryGates(data, &state)
+	// Preserve evidence of status/shape values that encoding/json can decode
+	// into a typed State but that this helper cannot safely interpret.  The
+	// marker is process-local and is consumed by saveUnlocked and the legacy
+	// SQLite migration preflight; it is never serialized as application state.
+	state.legacyOpaqueJSONSections |= legacyOpaqueJSONSectionsForTypedState(state)
 	// json.Unmarshal maps a top-level null control_lease to the same zero value
 	// as an omitted legacy field.  The latter is a valid never-claimed store,
 	// while the former is an explicit, non-interpretable replacement of the
@@ -16970,6 +19704,13 @@ func loadStateData(data []byte) (State, error) {
 	}
 	if state.SchemaVersion >= 0 && state.SchemaVersion < SchemaVersion {
 		state = migrateStateToCurrent(state)
+		// Keep the migration path subject to the same safety normalization as
+		// current-schema loads.  Older JSON schemas can contain a status value
+		// introduced by a newer/mixed-version writer; returning that value
+		// untouched lets an unknown turn status take an inactive branch before
+		// the first write.  Unknown turns must remain a running safety fence and
+		// unknown sessions must remain explicitly quarantined on every load path.
+		normalizeLoadedState(&state)
 		return state, nil
 	}
 	if state.SchemaVersion != SchemaVersion {
@@ -17113,13 +19854,13 @@ func loadStateDataWithCheckpointIsolation(data []byte) (State, bool, error) {
 		state.HistoryWatchReady = historyReady
 	}
 	state.legacyOpaqueJSONSections = legacyOpaqueJSONSectionsForRows(
-		checkpointRows, pollRows, outboxRows, historyRows,
+		checkpointRows, pollRows, sessionRows, turnRows, outboxRows, historyRows,
 	)
 	return state, true, nil
 }
 
 func legacyOpaqueJSONSectionsForRows(
-	checkpoints, polls, outbox, history map[string]json.RawMessage,
+	checkpoints, polls, sessions, turns, outbox, history map[string]json.RawMessage,
 ) legacyOpaqueJSONSection {
 	var sections legacyOpaqueJSONSection
 	for id, raw := range checkpoints {
@@ -17129,19 +19870,42 @@ func legacyOpaqueJSONSectionsForRows(
 		var checkpoint ImportCheckpoint
 		if err := json.Unmarshal(raw, &checkpoint); err != nil {
 			sections |= legacyOpaqueCheckpoints
+		} else if !importCheckpointOptionalProofUsable(checkpoint) {
+			if checkpoint.RecoveryProofUnusable && strings.TrimSpace(checkpoint.ID) == strings.TrimSpace(id) {
+				sections |= legacyOpaqueOptionalRecoveryProof
+			} else {
+				sections |= legacyOpaqueCheckpoints
+			}
 			break
 		}
 	}
 	for id, raw := range polls {
 		var poll ChatPollState
-		if err := json.Unmarshal(raw, &poll); err != nil || strings.TrimSpace(poll.ChatID) != strings.TrimSpace(id) {
+		if !jsonValueHasNoDuplicateKeys(raw) || json.Unmarshal(raw, &poll) != nil || strings.TrimSpace(poll.ChatID) != strings.TrimSpace(id) || !chatPollAdmissionValid(poll) {
 			sections |= legacyOpaqueChatPolls
+			break
+		}
+	}
+	for id, raw := range sessions {
+		var session SessionContext
+		if !jsonValueHasNoDuplicateKeys(raw) || json.Unmarshal(raw, &session) != nil ||
+			strings.TrimSpace(session.ID) != strings.TrimSpace(id) || !knownSessionStatus(session.Status) {
+			sections |= legacyOpaqueSessions
+			break
+		}
+	}
+	for id, raw := range turns {
+		var turn Turn
+		if !jsonValueHasNoDuplicateKeys(raw) || json.Unmarshal(raw, &turn) != nil ||
+			strings.TrimSpace(turn.ID) != strings.TrimSpace(id) || !knownTurnStatus(turn.Status) {
+			sections |= legacyOpaqueTurns
 			break
 		}
 	}
 	for id, raw := range outbox {
 		var message OutboxMessage
-		if err := json.Unmarshal(raw, &message); err != nil || strings.TrimSpace(message.ID) != strings.TrimSpace(id) {
+		if !jsonValueHasNoDuplicateKeys(raw) || json.Unmarshal(raw, &message) != nil ||
+			strings.TrimSpace(message.ID) != strings.TrimSpace(id) || !knownOutboxStatus(message.Status) {
 			sections |= legacyOpaqueOutbox
 			break
 		}
@@ -17150,10 +19914,75 @@ func legacyOpaqueJSONSectionsForRows(
 		var checkpoint HistoryWatchCheckpoint
 		if err := json.Unmarshal(raw, &checkpoint); err != nil {
 			sections |= legacyOpaqueHistoryWatch
+		} else if !historyWatchOptionalProofUsable(checkpoint) {
+			embeddedID := strings.TrimSpace(checkpoint.ID)
+			if checkpoint.RecoveryProofUnusable && (embeddedID == "" || embeddedID == strings.TrimSpace(id)) {
+				sections |= legacyOpaqueOptionalRecoveryProof
+			} else {
+				sections |= legacyOpaqueHistoryWatch
+			}
 			break
 		}
 		if embeddedID := strings.TrimSpace(checkpoint.ID); embeddedID != "" && embeddedID != strings.TrimSpace(id) {
 			sections |= legacyOpaqueHistoryWatch
+			break
+		}
+	}
+	return sections
+}
+
+// legacyOpaqueJSONSectionsForTypedState catches values that survive a normal
+// top-level JSON decode.  Syntax-invalid rows are found by the isolation
+// loader above; these checks cover mixed-version status strings and semantic
+// identity mismatches before normalization can turn them into a lossy typed
+// value during migration or an unrelated JSON save.
+func legacyOpaqueJSONSectionsForTypedState(state State) legacyOpaqueJSONSection {
+	var sections legacyOpaqueJSONSection
+	for id, session := range state.Sessions {
+		if strings.TrimSpace(id) == "" || strings.TrimSpace(session.ID) != strings.TrimSpace(id) || !knownSessionStatus(session.Status) {
+			sections |= legacyOpaqueSessions
+			break
+		}
+	}
+	for id, turn := range state.Turns {
+		if strings.TrimSpace(id) == "" || strings.TrimSpace(turn.ID) != strings.TrimSpace(id) || !knownTurnStatus(turn.Status) {
+			sections |= legacyOpaqueTurns
+			break
+		}
+	}
+	for id, message := range state.OutboxMessages {
+		if strings.TrimSpace(id) == "" || strings.TrimSpace(message.ID) != strings.TrimSpace(id) || !knownOutboxStatus(message.Status) {
+			sections |= legacyOpaqueOutbox
+			break
+		}
+	}
+	for id, poll := range state.ChatPolls {
+		if strings.TrimSpace(id) == "" || strings.TrimSpace(poll.ChatID) != strings.TrimSpace(id) || !chatPollAdmissionValid(poll) {
+			sections |= legacyOpaqueChatPolls
+			break
+		}
+	}
+	for _, checkpoint := range state.ImportCheckpoints {
+		if !importCheckpointOptionalProofUsable(checkpoint) {
+			if checkpoint.RecoveryProofUnusable {
+				sections |= legacyOpaqueOptionalRecoveryProof
+			} else {
+				sections |= legacyOpaqueCheckpoints
+			}
+			break
+		}
+	}
+	for id, checkpoint := range state.HistoryWatch {
+		if embeddedID := strings.TrimSpace(checkpoint.ID); embeddedID != "" && embeddedID != strings.TrimSpace(id) {
+			sections |= legacyOpaqueHistoryWatch
+			break
+		}
+		if !historyWatchOptionalProofUsable(checkpoint) {
+			if checkpoint.RecoveryProofUnusable {
+				sections |= legacyOpaqueOptionalRecoveryProof
+			} else {
+				sections |= legacyOpaqueHistoryWatch
+			}
 			break
 		}
 	}
@@ -17230,6 +20059,133 @@ func decodeJSONChatPollRows(rows map[string]json.RawMessage, out map[string]Chat
 	return nil
 }
 
+func legacyOpaqueChatPollRaw(id string, raw []byte) bool {
+	var poll ChatPollState
+	return !jsonValueHasNoDuplicateKeys(raw) || json.Unmarshal(raw, &poll) != nil ||
+		strings.TrimSpace(poll.ChatID) != strings.TrimSpace(id) || !chatPollAdmissionValid(poll)
+}
+
+func applyLegacyChatPollRetryGates(data []byte, state *State) {
+	if state == nil || len(state.ChatPolls) == 0 {
+		return
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(data, &root); err != nil {
+		return
+	}
+	var rawRows map[string]json.RawMessage
+	if raw, ok := root["chat_polls"]; !ok || json.Unmarshal(raw, &rawRows) != nil {
+		return
+	}
+	var gates map[string]legacyChatPollRetryGate
+	rawGates, ok := root[legacyChatPollRetryGatesField]
+	if !ok || json.Unmarshal(rawGates, &gates) != nil {
+		return
+	}
+	for id, gate := range gates {
+		id = strings.TrimSpace(id)
+		if id == "" || !gate.RecoveryRequired || strings.TrimSpace(gate.SourceHash) == "" {
+			continue
+		}
+		raw, exists := rawRows[id]
+		if !exists || sha256Bytes(raw) != strings.TrimSpace(gate.SourceHash) || !legacyOpaqueChatPollRaw(id, raw) {
+			continue
+		}
+		poll, exists := state.ChatPolls[id]
+		if !exists || !chatPollHasOpaqueRecoveryEvidence(poll) {
+			continue
+		}
+		if sourceHash := strings.TrimSpace(poll.RecoverySourceHash); sourceHash != "" && sourceHash != sha256Bytes(raw) {
+			continue
+		}
+		poll.RecoveryRequired = true
+		if !gate.NextPollAt.IsZero() {
+			poll.NextPollAt = gate.NextPollAt
+		}
+		if gate.BlockedUntil.IsZero() == false {
+			poll.BlockedUntil = gate.BlockedUntil
+		}
+		if strings.TrimSpace(gate.PollState) != "" {
+			poll.PollState = strings.TrimSpace(gate.PollState)
+		}
+		if !gate.LastActivityAt.IsZero() {
+			poll.LastActivityAt = gate.LastActivityAt
+		}
+		if !gate.ParkNoticeSentAt.IsZero() {
+			poll.ParkNoticeSentAt = gate.ParkNoticeSentAt
+		}
+		if strings.TrimSpace(gate.LastError) != "" {
+			poll.LastError = gate.LastError
+		}
+		if !gate.LastErrorAt.IsZero() {
+			poll.LastErrorAt = gate.LastErrorAt
+		}
+		if gate.FailureCount > 0 {
+			poll.FailureCount = gate.FailureCount
+		}
+		if !gate.UpdatedAt.IsZero() {
+			poll.UpdatedAt = gate.UpdatedAt
+		}
+		state.ChatPolls[id] = poll
+	}
+}
+
+func mergeLegacyChatPollRetryGates(oldRoot, newRoot map[string]json.RawMessage, chatPolls map[string]ChatPollState) error {
+	var oldRows map[string]json.RawMessage
+	if raw, ok := oldRoot["chat_polls"]; ok {
+		if err := json.Unmarshal(raw, &oldRows); err != nil {
+			return nil
+		}
+	}
+	var newRows map[string]json.RawMessage
+	if raw, ok := newRoot["chat_polls"]; ok {
+		if err := json.Unmarshal(raw, &newRows); err != nil {
+			return err
+		}
+	}
+	gates := make(map[string]legacyChatPollRetryGate)
+	for id, poll := range chatPolls {
+		id = strings.TrimSpace(id)
+		if id == "" || !chatPollHasOpaqueRecoveryEvidence(poll) {
+			continue
+		}
+		raw, ok := oldRows[id]
+		if !ok {
+			raw, ok = newRows[id]
+		}
+		if !ok || !legacyOpaqueChatPollRaw(id, raw) {
+			continue
+		}
+		sourceHash := sha256Bytes(raw)
+		if source := strings.TrimSpace(poll.RecoverySourceHash); source != "" && source != sourceHash {
+			continue
+		}
+		gates[id] = legacyChatPollRetryGate{
+			SourceHash:       sourceHash,
+			RecoveryRequired: true,
+			NextPollAt:       poll.NextPollAt,
+			BlockedUntil:     poll.BlockedUntil,
+			PollState:        strings.TrimSpace(poll.PollState),
+			LastActivityAt:   poll.LastActivityAt,
+			ParkNoticeSentAt: poll.ParkNoticeSentAt,
+			LastError:        poll.LastError,
+			LastErrorAt:      poll.LastErrorAt,
+			FailureCount:     poll.FailureCount,
+			UpdatedAt:        poll.UpdatedAt,
+		}
+	}
+	if len(gates) == 0 {
+		delete(newRoot, legacyChatPollRetryGatesField)
+		return nil
+	}
+	encoded, err := json.Marshal(gates)
+	if err != nil {
+		return err
+	}
+	newRoot[legacyChatPollRetryGatesField] = encoded
+	return nil
+}
+
 const chatPollRecoveryReason = "malformed persisted chat poll projection"
 const chatPollOpaqueRecoveryReason = "semantically malformed persisted chat poll projection"
 
@@ -17253,6 +20209,13 @@ func markChatPollRecoveryEvidence(poll *ChatPollState, raw []byte) {
 	if poll == nil || chatPollAdmissionValid(*poll) {
 		return
 	}
+	markChatPollOpaqueRecoveryEvidence(poll, raw)
+}
+
+func markChatPollOpaqueRecoveryEvidence(poll *ChatPollState, raw []byte) {
+	if poll == nil {
+		return
+	}
 	sum := sha256.Sum256(raw)
 	poll.Seeded = true
 	poll.RecoveryRequired = true
@@ -17266,16 +20229,133 @@ func chatPollHasOpaqueRecoveryEvidence(poll ChatPollState) bool {
 		strings.TrimSpace(poll.RecoveryReason) == chatPollOpaqueRecoveryReason
 }
 
+// chatPollRecoveryAlreadyFenced reports whether a corrupt-session probe has
+// already left a durable, chat-local recovery disposition.  A normal poll can
+// retain the malformed session's source hash.  An opaque poll is different:
+// its raw JSON must be preserved byte-for-byte, so the SQLite sidecar update
+// can only retain the poll's own opaque hash.  That poll-local hash is still a
+// sufficient fence for the exact durable pair: it keeps the pair out of the
+// bounded recovery lane without treating either row as executable or
+// authorizing a Graph read.  The durableRecoveryRequired bit is deliberately
+// supplied by the scalar row rather than inferred from the decoded placeholder:
+// decodeChatPollState marks an opaque raw value as recovery-required in memory,
+// but that alone is not a persisted disposition. A changed poll raw value fails
+// this comparison and is reconsidered under the new evidence.
+func chatPollRecoveryAlreadyFenced(poll ChatPollState, pollJSONHash, sessionSourceHash string, durableRecoveryRequired bool) bool {
+	if !poll.RecoveryRequired {
+		return false
+	}
+	if sourceHash := strings.TrimSpace(sessionSourceHash); sourceHash != "" && strings.TrimSpace(poll.RecoverySourceHash) == sourceHash {
+		return true
+	}
+	return durableRecoveryRequired && chatPollHasOpaqueRecoveryEvidence(poll) &&
+		strings.TrimSpace(pollJSONHash) != "" &&
+		strings.TrimSpace(poll.RecoverySourceHash) == strings.TrimSpace(pollJSONHash)
+}
+
 func decodeChatPollState(chatID string, raw []byte) (ChatPollState, bool) {
 	chatID = strings.TrimSpace(chatID)
 	if chatID == "" {
 		return ChatPollState{}, false
 	}
 	var poll ChatPollState
-	if err := json.Unmarshal(raw, &poll); err == nil && strings.TrimSpace(poll.ChatID) == chatID {
-		return poll, true
+	uniqueKeys := jsonValueHasNoDuplicateKeys(raw)
+	if uniqueKeys {
+		if err := json.Unmarshal(raw, &poll); err == nil && strings.TrimSpace(poll.ChatID) == chatID {
+			return poll, true
+		}
 	}
-	return chatPollRecoveryPlaceholder(chatID, raw), true
+	if !uniqueKeys {
+		// SQLite JSON1 and encoding/json resolve duplicate object names
+		// differently. Do not recover fields from a duplicate-key payload: a
+		// last-key-wins partial decode could turn a durable frontier into a
+		// different one. Keep only the opaque evidence and let owner-fenced repair
+		// handle the raw row.
+		placeholder := chatPollRecoveryPlaceholder(chatID, raw)
+		markChatPollOpaqueRecoveryEvidence(&placeholder, raw)
+		return placeholder, true
+	}
+	// A type error in one top-level field must not discard an independently
+	// parseable pending receipt. Decode fields one at a time so a malformed
+	// diagnostic/schedule member cannot turn a staged Graph page into a new
+	// baseline. The result is still explicitly opaque: callers must repair the
+	// row before acquiring a poll capability, and an unparseable nested receipt
+	// remains absent and therefore follows the conservative gap path.
+	if recovered, ok := decodeChatPollStateFields(chatID, raw); ok {
+		markChatPollOpaqueRecoveryEvidence(&recovered, raw)
+		return recovered, true
+	}
+	placeholder := chatPollRecoveryPlaceholder(chatID, raw)
+	// A syntax-invalid row has no typed fields that can establish a safe
+	// frontier.  The placeholder is intentionally structurally minimal, so it
+	// must not be mistaken for an ordinary empty poll by chatPollAdmissionValid.
+	// Mark it opaque before returning; the bridge will perform the explicit
+	// owner-fenced repair path and will not issue a baseline/head Graph request
+	// from the malformed bytes.
+	markChatPollOpaqueRecoveryEvidence(&placeholder, raw)
+	return placeholder, true
+}
+
+func decodeChatPollStateFields(chatID string, raw []byte) (ChatPollState, bool) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil || fields == nil {
+		return ChatPollState{}, false
+	}
+	poll := ChatPollState{ChatID: strings.TrimSpace(chatID)}
+	decode := func(name string, dst any) {
+		value, ok := fields[name]
+		if !ok || json.Unmarshal(value, dst) != nil {
+			return
+		}
+	}
+	decode("seeded", &poll.Seeded)
+	decode("recovery_required", &poll.RecoveryRequired)
+	decode("recovery_reason", &poll.RecoveryReason)
+	decode("recovery_source_hash", &poll.RecoverySourceHash)
+	decode("state", &poll.PollState)
+	decode("previous_state", &poll.PreviousPollState)
+	decode("next_poll_at", &poll.NextPollAt)
+	decode("last_activity_at", &poll.LastActivityAt)
+	decode("blocked_until", &poll.BlockedUntil)
+	decode("failure_count", &poll.FailureCount)
+	decode("parked_at", &poll.ParkedAt)
+	decode("park_notice_sent_at", &poll.ParkNoticeSentAt)
+	decode("last_modified_cursor", &poll.LastModifiedCursor)
+	decode("continuation_safe_cursor", &poll.ContinuationSafeCursor)
+	decode("continuation_safe_cursor_known", &poll.ContinuationSafeCursorKnown)
+	decode("continuation_path", &poll.ContinuationPath)
+	decode("deferred_continuation_path", &poll.DeferredContinuationPath)
+	decode("last_successful_poll_at", &poll.LastSuccessfulPollAt)
+	decode("last_error", &poll.LastError)
+	decode("last_error_at", &poll.LastErrorAt)
+	decode("last_window_full_at", &poll.LastWindowFullAt)
+	decode("last_window_full_message", &poll.LastWindowFullMessage)
+	decode("poll_revision", &poll.PollRevision)
+	decode("schedule_revision", &poll.ScheduleRevision)
+	decode("frontier_epoch", &poll.FrontierEpoch)
+	decode("continuation_failure_count", &poll.ContinuationFailureCount)
+	decode("continuation_first_failure_at", &poll.ContinuationFirstFailureAt)
+	decode("continuation_last_failure_at", &poll.ContinuationLastFailureAt)
+	decode("continuation_last_path", &poll.ContinuationLastPath)
+	decode("continuation_no_progress_count", &poll.ContinuationNoProgressCount)
+	decode("continuation_page_count", &poll.ContinuationPageCount)
+	decode("continuation_path_history", &poll.ContinuationPathHistory)
+	decode("continuation_page_fingerprint_history", &poll.ContinuationPageFingerprintHistory)
+	decode("quarantined_record_ids", &poll.QuarantinedRecordIDs)
+	decode("attempt", &poll.Attempt)
+	decode("pending_page", &poll.PendingPage)
+	decode("gap", &poll.Gap)
+	decode("updated_at", &poll.UpdatedAt)
+	return poll, true
+}
+
+// ChatPollHasOpaqueRecoveryEvidence is the public read-only predicate used by
+// the Teams bridge to perform one explicit, owner-fenced repair before it can
+// acquire a capability. Ordinary recovery markers (for example, a missing
+// frontier with independent durable history) intentionally do not use this
+// path.
+func ChatPollHasOpaqueRecoveryEvidence(poll ChatPollState) bool {
+	return chatPollHasOpaqueRecoveryEvidence(poll)
 }
 
 // decodeChatPollStateForAdmission adds the small structural checks required by
@@ -17296,7 +20376,7 @@ func decodeChatPollStateForAdmission(chatID string, raw []byte) (ChatPollState, 
 func decodeJSONSessionRows(rows map[string]json.RawMessage, out map[string]SessionContext) error {
 	for id, raw := range rows {
 		var session SessionContext
-		if strings.TrimSpace(id) == "" || json.Unmarshal(raw, &session) != nil || strings.TrimSpace(session.ID) != strings.TrimSpace(id) {
+		if strings.TrimSpace(id) == "" || !jsonValueHasNoDuplicateKeys(raw) || json.Unmarshal(raw, &session) != nil || strings.TrimSpace(session.ID) != strings.TrimSpace(id) {
 			continue
 		}
 		annotateUnknownLoadedSession(&session)
@@ -17308,7 +20388,7 @@ func decodeJSONSessionRows(rows map[string]json.RawMessage, out map[string]Sessi
 func decodeJSONTurnRows(rows map[string]json.RawMessage, out map[string]Turn, holdMalformedActive bool) error {
 	for id, raw := range rows {
 		var turn Turn
-		if json.Unmarshal(raw, &turn) == nil && strings.TrimSpace(id) != "" &&
+		if jsonValueHasNoDuplicateKeys(raw) && json.Unmarshal(raw, &turn) == nil && strings.TrimSpace(id) != "" &&
 			strings.TrimSpace(turn.ID) == strings.TrimSpace(id) {
 			normalizeLoadedTurnStatus(&turn)
 			out[id] = turn
@@ -17330,7 +20410,7 @@ func decodeJSONOutboxRows(rows map[string]json.RawMessage, out map[string]Outbox
 			continue
 		}
 		var message OutboxMessage
-		if json.Unmarshal(raw, &message) != nil || strings.TrimSpace(message.ID) != id {
+		if !jsonValueHasNoDuplicateKeys(raw) || json.Unmarshal(raw, &message) != nil || strings.TrimSpace(message.ID) != id {
 			// A malformed outbox row is held out of the runnable projection. The
 			// exact bytes remain in the legacy JSON document through the opaque
 			// preservation pass in saveUnlocked.
@@ -17439,7 +20519,7 @@ func (s *Store) saveUnlocked(ctx context.Context, state State) error {
 		return err
 	}
 	if state.legacyOpaqueJSONSections != 0 {
-		data, err = preserveOpaqueJSONSections(s.path, data, state.legacyOpaqueJSONSections)
+		data, err = preserveOpaqueJSONSections(s.path, data, state.legacyOpaqueJSONSections, state.ChatPolls)
 		if err != nil {
 			return err
 		}
@@ -17452,7 +20532,7 @@ func (s *Store) saveUnlocked(ctx context.Context, state State) error {
 // while a legacy state is rewritten.  It is called only when the load that
 // produced the current State observed an opaque row; healthy legacy saves do
 // not reread the state file or run these decoders on the hot path.
-func preserveOpaqueJSONSections(path string, data []byte, sections legacyOpaqueJSONSection) ([]byte, error) {
+func preserveOpaqueJSONSections(path string, data []byte, sections legacyOpaqueJSONSection, chatPolls map[string]ChatPollState) ([]byte, error) {
 	if sections == 0 {
 		return data, nil
 	}
@@ -17470,7 +20550,7 @@ func preserveOpaqueJSONSections(path string, data []byte, sections legacyOpaqueJ
 	if err := json.Unmarshal(data, &newRoot); err != nil {
 		return nil, err
 	}
-	merge := func(field string, oldOpaque func(string, []byte) bool, newTyped func(string, []byte) bool) error {
+	merge := func(field string, oldOpaque func(string, []byte) bool, newTyped func(string, []byte, []byte) bool) error {
 		oldRawRows, ok := oldRoot[field]
 		if !ok {
 			return nil
@@ -17490,7 +20570,7 @@ func preserveOpaqueJSONSections(path string, data []byte, sections legacyOpaqueJ
 			if !oldOpaque(id, oldRaw) {
 				continue
 			}
-			if newRaw, exists := newRows[id]; exists && newTyped(id, newRaw) {
+			if newRaw, exists := newRows[id]; exists && newTyped(id, oldRaw, newRaw) {
 				continue
 			}
 			newRows[id] = oldRaw
@@ -17506,12 +20586,12 @@ func preserveOpaqueJSONSections(path string, data []byte, sections legacyOpaqueJ
 		newRoot[field] = encodedRows
 		return nil
 	}
-	if sections&legacyOpaqueCheckpoints != 0 {
+	if sections&(legacyOpaqueCheckpoints|legacyOpaqueOptionalRecoveryProof) != 0 {
 		if err := merge("import_checkpoints", func(id string, raw []byte) bool {
 			var checkpoint ImportCheckpoint
 			_, canonical := canonicalCheckpointSessionID(id)
-			return canonical && json.Unmarshal(raw, &checkpoint) != nil
-		}, func(id string, raw []byte) bool {
+			return canonical && (json.Unmarshal(raw, &checkpoint) != nil || !importCheckpointOptionalProofUsable(checkpoint))
+		}, func(id string, oldRaw []byte, raw []byte) bool {
 			var checkpoint ImportCheckpoint
 			sessionID, canonical := canonicalCheckpointSessionID(id)
 			if !canonical || json.Unmarshal(raw, &checkpoint) != nil {
@@ -17527,6 +20607,26 @@ func preserveOpaqueJSONSections(path string, data []byte, sections legacyOpaqueJ
 				strings.EqualFold(strings.TrimSpace(checkpoint.TranscriptQuarantine.Kind), malformedCanonicalCheckpointKind) {
 				return false
 			}
+			if !importCheckpointOptionalProofUsable(checkpoint) {
+				// A readable row with an invalid optional proof remains an
+				// automatic-inert history record, but it must still be mutable.  An
+				// unrelated save should retain the exact legacy bytes; a callback
+				// that actually changed the typed checkpoint must not be discarded
+				// behind that preservation rule (otherwise branch binding and
+				// explicit recovery silently roll back).  Compare the typed views
+				// with UpdatedAt ignored: unknown legacy fields are retained only
+				// while the application-visible row is unchanged, and the durable
+				// RecoveryProofUnusable marker remains on any changed invalid row.
+				var previous ImportCheckpoint
+				if json.Unmarshal(oldRaw, &previous) != nil ||
+					strings.TrimSpace(previous.ID) != strings.TrimSpace(id) ||
+					strings.TrimSpace(previous.SessionID) != strings.TrimSpace(sessionID) {
+					return false
+				}
+				previous.UpdatedAt = time.Time{}
+				checkpoint.UpdatedAt = time.Time{}
+				return !reflect.DeepEqual(previous, checkpoint)
+			}
 			return strings.TrimSpace(checkpoint.ID) == strings.TrimSpace(id) &&
 				strings.TrimSpace(checkpoint.SessionID) == strings.TrimSpace(sessionID)
 		}); err != nil {
@@ -17536,10 +20636,42 @@ func preserveOpaqueJSONSections(path string, data []byte, sections legacyOpaqueJ
 	if sections&legacyOpaqueChatPolls != 0 {
 		if err := merge("chat_polls", func(id string, raw []byte) bool {
 			var poll ChatPollState
-			return json.Unmarshal(raw, &poll) != nil || strings.TrimSpace(poll.ChatID) != strings.TrimSpace(id)
-		}, func(id string, raw []byte) bool {
+			return !jsonValueHasNoDuplicateKeys(raw) || json.Unmarshal(raw, &poll) != nil || strings.TrimSpace(poll.ChatID) != strings.TrimSpace(id) || !chatPollAdmissionValid(poll)
+		}, func(id string, _ []byte, raw []byte) bool {
 			var poll ChatPollState
-			return json.Unmarshal(raw, &poll) == nil && strings.TrimSpace(poll.ChatID) == strings.TrimSpace(id) && !poll.RecoveryRequired
+			return jsonValueHasNoDuplicateKeys(raw) && json.Unmarshal(raw, &poll) == nil && strings.TrimSpace(poll.ChatID) == strings.TrimSpace(id) && !poll.RecoveryRequired
+		}); err != nil {
+			return nil, err
+		}
+		if err := mergeLegacyChatPollRetryGates(oldRoot, newRoot, chatPolls); err != nil {
+			return nil, err
+		}
+	}
+	if sections&legacyOpaqueSessions != 0 {
+		if err := merge("sessions", func(id string, raw []byte) bool {
+			var session SessionContext
+			return !jsonValueHasNoDuplicateKeys(raw) || json.Unmarshal(raw, &session) != nil || strings.TrimSpace(session.ID) != strings.TrimSpace(id) || !knownSessionStatus(session.Status)
+		}, func(id string, _ []byte, raw []byte) bool {
+			var session SessionContext
+			return jsonValueHasNoDuplicateKeys(raw) && json.Unmarshal(raw, &session) == nil && strings.TrimSpace(session.ID) == strings.TrimSpace(id) && knownSessionStatus(session.Status)
+		}); err != nil {
+			return nil, err
+		}
+	}
+	if sections&legacyOpaqueTurns != 0 {
+		if err := merge("turns", func(id string, raw []byte) bool {
+			var turn Turn
+			return !jsonValueHasNoDuplicateKeys(raw) || json.Unmarshal(raw, &turn) != nil || strings.TrimSpace(turn.ID) != strings.TrimSpace(id) || !knownTurnStatus(turn.Status)
+		}, func(id string, _ []byte, raw []byte) bool {
+			var turn Turn
+			if !jsonValueHasNoDuplicateKeys(raw) || json.Unmarshal(raw, &turn) != nil || strings.TrimSpace(turn.ID) != strings.TrimSpace(id) || !knownTurnStatus(turn.Status) {
+				return false
+			}
+			// normalizeLoadedTurnStatus leaves this diagnostic marker on the
+			// ordinary-load path. Replacing the raw unknown status with the
+			// synthetic running fence would still be a lossy unrelated save;
+			// explicit repair clears the marker before choosing a status.
+			return turn.Status != TurnStatusRunning || !strings.Contains(turn.RecoveryReason, "unknown persisted turn status")
 		}); err != nil {
 			return nil, err
 		}
@@ -17547,29 +20679,29 @@ func preserveOpaqueJSONSections(path string, data []byte, sections legacyOpaqueJ
 	if sections&legacyOpaqueOutbox != 0 {
 		if err := merge("outbox_messages", func(id string, raw []byte) bool {
 			var message OutboxMessage
-			return json.Unmarshal(raw, &message) != nil || strings.TrimSpace(message.ID) != strings.TrimSpace(id)
-		}, func(id string, raw []byte) bool {
+			return !jsonValueHasNoDuplicateKeys(raw) || json.Unmarshal(raw, &message) != nil || strings.TrimSpace(message.ID) != strings.TrimSpace(id) || !knownOutboxStatus(message.Status)
+		}, func(id string, _ []byte, raw []byte) bool {
 			var message OutboxMessage
-			return json.Unmarshal(raw, &message) == nil && strings.TrimSpace(message.ID) == strings.TrimSpace(id)
+			return jsonValueHasNoDuplicateKeys(raw) && json.Unmarshal(raw, &message) == nil && strings.TrimSpace(message.ID) == strings.TrimSpace(id) && knownOutboxStatus(message.Status)
 		}); err != nil {
 			return nil, err
 		}
 	}
-	if sections&legacyOpaqueHistoryWatch != 0 {
+	if sections&(legacyOpaqueHistoryWatch|legacyOpaqueOptionalRecoveryProof) != 0 {
 		if err := merge("history_watch", func(id string, raw []byte) bool {
 			var checkpoint HistoryWatchCheckpoint
 			if json.Unmarshal(raw, &checkpoint) != nil {
 				return true
 			}
 			embeddedID := strings.TrimSpace(checkpoint.ID)
-			return embeddedID != "" && embeddedID != strings.TrimSpace(id)
-		}, func(id string, raw []byte) bool {
+			return (embeddedID != "" && embeddedID != strings.TrimSpace(id)) || !historyWatchOptionalProofUsable(checkpoint)
+		}, func(id string, _ []byte, raw []byte) bool {
 			var checkpoint HistoryWatchCheckpoint
 			if json.Unmarshal(raw, &checkpoint) != nil {
 				return false
 			}
 			embeddedID := strings.TrimSpace(checkpoint.ID)
-			return embeddedID == "" || embeddedID == strings.TrimSpace(id)
+			return (embeddedID == "" || embeddedID == strings.TrimSpace(id)) && historyWatchOptionalProofUsable(checkpoint)
 		}); err != nil {
 			return nil, err
 		}
@@ -17623,6 +20755,17 @@ func normalizeLoadedState(state *State) {
 	for id, turn := range state.Turns {
 		normalizeLoadedTurnStatus(&turn)
 		state.Turns[id] = turn
+	}
+	for id, msg := range state.OutboxMessages {
+		if strings.TrimSpace(msg.AttachmentPath) != "" {
+			if strings.TrimSpace(msg.AttachmentMessagePostState) == "" {
+				msg.AttachmentMessagePostState = legacyAttachmentMessagePostState(msg)
+			}
+			if strings.TrimSpace(msg.AttachmentUploadSessionPostState) == "" {
+				msg.AttachmentUploadSessionPostState = legacyAttachmentUploadSessionPostState(msg)
+			}
+		}
+		state.OutboxMessages[id] = msg
 	}
 	backfillMessageProvenance(state)
 	backfillHelperDeliveries(state)
@@ -17831,28 +20974,45 @@ func (s *Store) withStateLock(ctx context.Context, fn func() error) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	observer := s.timingObserverSnapshot()
+	operation := ""
+	if observer != nil {
+		operation = storeTimingOperation()
+	}
+	mutexStarted := time.Now()
 	if err := lockMutexContext(ctx, &s.mu); err != nil {
+		s.recordTiming(observer, operation, "state-mutex-wait", mutexStarted, err)
 		return err
 	}
 	defer s.mu.Unlock()
+	s.recordTiming(observer, operation, "state-mutex-wait", mutexStarted, nil)
 	if err := ensurePrivateDir(filepath.Dir(s.path)); err != nil {
 		return err
 	}
+	fileLockStarted := time.Now()
 	ok, err := s.lock.TryLockContext(ctx, 10*time.Millisecond)
 	if err != nil {
+		s.recordTiming(observer, operation, "state-file-lock-wait", fileLockStarted, err)
 		return err
 	}
 	if !ok {
 		if err := ctx.Err(); err != nil {
+			s.recordTiming(observer, operation, "state-file-lock-wait", fileLockStarted, err)
 			return err
 		}
-		return fmt.Errorf("Teams state lock was not acquired")
+		err := fmt.Errorf("Teams state lock was not acquired")
+		s.recordTiming(observer, operation, "state-file-lock-wait", fileLockStarted, err)
+		return err
 	}
+	s.recordTiming(observer, operation, "state-file-lock-wait", fileLockStarted, nil)
 	defer func() {
 		_ = s.lock.Unlock()
 	}()
 	_ = os.Chmod(s.path+".lock", fileMode)
-	return fn()
+	holdStarted := time.Now()
+	err = fn()
+	s.recordTiming(observer, operation, "state-lock-hold", holdStarted, err)
+	return err
 }
 
 // lockMutexContext keeps cancellation meaningful even for the in-process
@@ -17889,26 +21049,40 @@ func (s *Store) withSessionLock(ctx context.Context, sessionID string, fn func()
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	observer := s.timingObserverSnapshot()
+	operation := ""
+	if observer != nil {
+		operation = storeTimingOperation()
+	}
 	lockDir := filepath.Join(filepath.Dir(s.path), "session-locks")
 	if err := ensurePrivateDir(lockDir); err != nil {
 		return err
 	}
 	lock := flock.New(filepath.Join(lockDir, safeLockName(sessionID)+".lock"))
+	waitStarted := time.Now()
 	ok, err := lock.TryLockContext(ctx, 10*time.Millisecond)
 	if err != nil {
+		s.recordTiming(observer, operation, "session-lock-wait", waitStarted, err)
 		return err
 	}
 	if !ok {
 		if err := ctx.Err(); err != nil {
+			s.recordTiming(observer, operation, "session-lock-wait", waitStarted, err)
 			return err
 		}
-		return fmt.Errorf("Teams session lock %q was not acquired", sessionID)
+		err := fmt.Errorf("Teams session lock %q was not acquired", sessionID)
+		s.recordTiming(observer, operation, "session-lock-wait", waitStarted, err)
+		return err
 	}
+	s.recordTiming(observer, operation, "session-lock-wait", waitStarted, nil)
 	defer func() {
 		_ = lock.Unlock()
 	}()
 	_ = os.Chmod(lock.Path(), fileMode)
-	return fn()
+	holdStarted := time.Now()
+	err = fn()
+	s.recordTiming(observer, operation, "session-lock-hold", holdStarted, err)
+	return err
 }
 
 func newState() State {
@@ -18072,6 +21246,9 @@ func migrateStateToCurrent(state State) State {
 		if strings.TrimSpace(msg.AttachmentPath) != "" && strings.TrimSpace(msg.AttachmentMessagePostState) == "" {
 			msg.AttachmentMessagePostState = legacyAttachmentMessagePostState(msg)
 		}
+		if strings.TrimSpace(msg.AttachmentPath) != "" && strings.TrimSpace(msg.AttachmentUploadSessionPostState) == "" {
+			msg.AttachmentUploadSessionPostState = legacyAttachmentUploadSessionPostState(msg)
+		}
 		state.OutboxMessages[id] = msg
 	}
 	backfillMessageProvenance(&state)
@@ -18211,7 +21388,7 @@ func backfillHelperDeliveries(state *State) {
 		createdID := updateHelperDeliveryForOutboxIDsLocked(
 			state,
 			msg,
-			helperDeliveryStatusFromOutboxStatus(msg.Status),
+			helperDeliveryStatusForOutboxLocked(state, msg),
 			firstStoreNonZeroTime(msg.UpdatedAt, msg.CreatedAt),
 			deliveryIDsByOutboxID[messageOutboxID],
 		)
@@ -18293,6 +21470,24 @@ func backfillHelperDeliveries(state *State) {
 	}
 }
 
+// helperDeliveryStatusForOutboxLocked keeps a durable provider rejection
+// visible after the outbox itself is retired.  A permanent Graph 4xx must
+// unblock the FIFO (the outbox is skipped), but a linked transcript remains a
+// failed/needs-attention item until an explicit repair.  Backfill runs after
+// every full JSON save and therefore must not collapse that distinction back
+// to HelperDeliveryStatusSkipped.
+func helperDeliveryStatusForOutboxLocked(state *State, msg OutboxMessage) HelperDeliveryStatus {
+	if state != nil {
+		for _, delivery := range state.TranscriptDeliveries {
+			if strings.TrimSpace(delivery.OutboxID) == strings.TrimSpace(msg.ID) &&
+				delivery.Status == TranscriptDeliveryStatusNeedsAttention {
+				return HelperDeliveryStatusFailed
+			}
+		}
+	}
+	return helperDeliveryStatusFromOutboxStatus(msg.Status)
+}
+
 func sortedMapKeys[T any](values map[string]T) []string {
 	if len(values) == 0 {
 		return nil
@@ -18313,6 +21508,8 @@ func helperDeliveryStatusFromTranscriptDeliveryStatus(status TranscriptDeliveryS
 		return HelperDeliveryStatusSent
 	case TranscriptDeliveryStatusSkipped:
 		return HelperDeliveryStatusSkipped
+	case TranscriptDeliveryStatusNeedsAttention:
+		return HelperDeliveryStatusFailed
 	case TranscriptDeliveryStatusQueued:
 		return HelperDeliveryStatusQueued
 	default:
@@ -18544,6 +21741,31 @@ func sameOwnerInstance(a OwnerMetadata, b OwnerMetadata) bool {
 	}
 	if !a.StartedAt.IsZero() && !b.StartedAt.IsZero() {
 		return a.StartedAt.Equal(b.StartedAt)
+	}
+	return true
+}
+
+// sameOwnerForLeaseCleanup fences a delayed cleanup callback by the durable
+// lease generation as well as by process identity.  A process can reclaim a
+// released/stale lease before an older listener generation has finished
+// unwinding.  In that case both callbacks have the same process identity, but
+// the older callback must not clear the replacement owner's witness.
+func sameOwnerForLeaseCleanup(existing OwnerMetadata, expected OwnerMetadata) bool {
+	if !sameOwnerInstance(existing, expected) {
+		return false
+	}
+	if strings.TrimSpace(expected.MachineID) != "" && existing.MachineID != expected.MachineID {
+		return false
+	}
+	// A legacy/unscoped cleanup callback carries no durable generation.  It may
+	// only clear an owner that is also generation-less.  Once a lease has been
+	// claimed, treating generation zero as a wildcard would let a delayed
+	// callback from the old process erase a replacement owner.
+	if existing.LeaseGeneration > 0 && expected.LeaseGeneration <= 0 {
+		return false
+	}
+	if expected.LeaseGeneration > 0 && existing.LeaseGeneration != expected.LeaseGeneration {
+		return false
 	}
 	return true
 }
@@ -18987,10 +22209,7 @@ func suppressInboundExecutionForHelperOutboxLocked(state *State, record MessageP
 		if inbound.ID == "" {
 			continue
 		}
-		inbound.Status = InboundStatusIgnored
-		if !now.IsZero() {
-			inbound.UpdatedAt = now
-		}
+		markInboundIgnored(&inbound, now)
 		state.InboundEvents[id] = inbound
 	}
 	turnUpdated := false

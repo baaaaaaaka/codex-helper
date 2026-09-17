@@ -375,7 +375,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          required_shells='sh bash zsh fish csh tcsh pwsh'
+          # Exercise only shells deliberately installed/prepared by the
+          # platform matrix. Ubuntu images may contain pwsh, but PowerShell's
+          # Unix -Login startup can hang in the hosted non-interactive runner;
+          # its adapter/protocol contracts remain covered by focused tests.
+          required_shells='sh bash zsh fish csh tcsh'
           if [ "$RUNNER_OS" = macOS ]; then
             required_shells="$required_shells nu"
           fi
@@ -1618,6 +1622,47 @@ jobs:
           go test ./internal/teams -count=1 -run 'TestSendQueuedOutboxFallsBackToControlMentionAfterDefiniteWebhookFailureSQLite$' -v
           go test ./internal/cli -count=1 -run "$workflow_cli_pattern" -v
 
+      - name: Teams scalar hot admission regressions
+        if: matrix.shard == 'core-b'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Keep the projection contract in an explicit, non-empty selector.
+          # The broad store test remains supplemental; this gate protects the
+          # trust/revision fence, JSON fallback, selected hydration, and the
+          # single-connection quarantine path from silently disappearing when
+          # a test is renamed or moved.
+          hot_admission_pattern='^Test(SQLiteHotPollScalarProjectionTrustIsFencedAndFallsBack|SQLiteHotPollTrustedWorkCandidatesMatchJSONOracle|SQLiteHotPollSelectedRefreshHydratesFreshSession|SQLiteTurnProjectionBackfillStopsAtDurablePageBoundary|SQLiteHotPollScalarProjectionTriggerDefinitionsAreCurrent|SQLiteHotPollScalarTrustRevokesContradictoryJSONWithMatchingRevision|SQLiteHotPollTrustedReadyUsesCanonicalTimeForDueGate|SQLiteHotPollAdmissionFallbackKeepsHealthyRowsOnScalarLane|SQLiteHotPollTrustedWorkCandidatesQuarantinesBadRowsWithoutDeadlock|SQLiteHotPollTrustedWorkCandidatesContinuesPastInvalidPage|SQLiteHotPollAdmissionFallbackProbeUsesPartialIndexes|SQLiteHotPollScheduleAndWorkCandidatesMatchesSeparateAdmission|SQLiteHotPollSelectedStateForChatsAndSessionsIsBoundedAndFresh|SQLiteOpenBackfillsLegacyChatSequencesWhenTableAlreadyExists)$'
+          listed="$(go test ./internal/teams/store -run '^$' -list "$hot_admission_pattern")"
+          if ! grep -q '^Test' <<<"$listed"; then
+            echo "scalar hot admission selector matched no tests" >&2
+            exit 1
+          fi
+          go test ./internal/teams/store -count=1 -run "$hot_admission_pattern" -v
+
+      - name: Teams durable deferred-retry and unknown-result regressions
+        if: matrix.shard == 'core-b'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # These tests are kept in a dedicated selector because the broad
+          # Teams patterns are intentionally partitioned and could otherwise
+          # omit the per-row retry gate or unknown-POST fence silently.
+          recovery_store_pattern='^Test(InboundRecoveryCandidatesAcrossBackends|QueueTurnReconcilesExistingDeferredInboundAcrossBackends|QueueTurnFindsLegacyTurnByInboundEventIDWithoutCreatingDuplicate|QueueTurnFailsClosedWhenInboundHasConflictingLegacyTurns|QueueTurnRejectsForeignInboundAndTurnAcrossBackends|QueueTurnRejectsIgnoredInboundWithoutRevivingAcrossBackends|TerminalIgnoredInboundClearsRetryMetadataAcrossLifecyclePaths)$'
+          listed_store="$(go test ./internal/teams/store -count=1 -run '^$' -list "$recovery_store_pattern")"
+          if ! grep -q '^Test' <<<"$listed_store"; then
+            echo "deferred-retry store selector matched no tests" >&2
+            exit 1
+          fi
+          go test ./internal/teams/store -count=1 -run "$recovery_store_pattern" -v
+          recovery_bridge_pattern='^TestBridge(DeferredControlNewUnknownCreateResultUsesStableCreateOrGetKey|DeferredInboundGraphFailureDoesNotBlockLaterRow|DeferredAttachmentNotFoundUsesExplicitPermanentDisposition|DeferredAttachmentContentNotFoundUsesExplicitPermanentDisposition|AttachmentUploadSessionUnknownPOSTIsDurablyNonReplayable|SQLiteSyntaxCorruptPollRepairsWithoutGraphHead)$'
+          listed_bridge="$(go test ./internal/teams -count=1 -run '^$' -list "$recovery_bridge_pattern")"
+          if ! grep -q '^Test' <<<"$listed_bridge"; then
+            echo "deferred-retry bridge selector matched no tests" >&2
+            exit 1
+          fi
+          go test ./internal/teams -count=1 -run "$recovery_bridge_pattern" -v
+
       - name: Teams ambiguous execution diagnostic regressions
         if: matrix.shard == 'core'
         shell: bash
@@ -1663,7 +1708,12 @@ jobs:
         run: |
           set -euo pipefail
           teams_runtime_keepalive='Test(TeamsBackgroundKeepalive|TeamsStartupFallback|GlobalInbound|InboundPoll|Bridge(LongRunningTurnKeepsOwnerHeartbeatActive|IdleOwnerHeartbeatPreservesActiveTurnFields|ListenStandbyDoesNotCreateControlChatOrPoll|PollChatReadRateLimitBlocksOnlyThatChat|ControlPollRateLimitDoesNotBlockWorkPollingWithoutRetrySleep|PollOnceContinuesOtherDueChatsAfterReadRateLimit|AckSendFailureDoesNotBlockCodexTurn|OutboxUploadRateLimitRecordsBlockWithoutRetrySleep|AcceptedOutboxRecoveryRateLimitRecordsBlockWithoutRetrySleep|SkippedOutboxDoesNotBlockQueuedTurnWaitNotice|QueuedTurnWaitNoticeFailureDoesNotStarveLaterSessions|QueuedTurnGateErrorDoesNotStarveLaterSessions|Flush(PendingOutboxContinuesOtherChatsAfterSendFailure|PromotesAcceptedOutboxDuringRateLimitWithoutPosting)|ReloadDraining(SessionMessage|ControlNew)IsDeferredAndReplayed)|BridgeControlRestart(DoesNotRunDuringHelperReloadCodexUpgradeOrManualDrain|RunsAfterExpiredHelperUpgradeDrain|DoesNotRecoverExpiredHelperUpgradeOwnedByRemoteMachine|NowBlocksExpiredHelperUpgradeWithActiveTurn|ForceRunsAfterExpiredHelperUpgradeWithActiveTurn|RunsAfterStaleHelperReloadDrain|DoesNotRecoverStaleHelperReloadOwnedByRemoteMachine|NowBlocksStaleHelperReloadWithActiveTurn|ForceRunsAfterStaleHelperReloadWithActiveTurn)|BridgeControlReload(RetriesStaleHelperReloadDrain|DoesNotRecoverStaleHelperReloadOwnedByRemoteMachine|NowBlocksStaleHelperReloadWithActiveTurn)|Bridge(CompletesExpiredHelperUpgradeDrainOnStart|DoesNotCompleteExpiredHelperUpgradeDrainOwnedByRemoteMachine)|ClaimControlLease(PrimaryBeatsEphemeralAndEphemeralStaysStandby|DoesNotPreemptActiveTurn|ConcurrentManyMachinesSingleActive)|ControlLeaseForwardJumpAllowsTakeoverAfterSleep|IsStaleHandlesFutureHeartbeatAndThresholdBoundary|ValidateAndReleaseControlLease|RecordOwnerHeartbeat(WritesAndReadsOwner|UpdatesExistingOwner|TreatsExecRestartAsSameOwner|RefusesLiveOwnerWithDiagnostic|ReplacesDeadLocalOwnerBeforeStale)|RecoverStaleOwner(ReplacesStaleOwner|TreatsExecRestartAsSameOwner|ReplacesDeadLocalOwnerBeforeStale|RefusesLiveOwner)|ClearOwner(IsIdempotent|IfSameDoesNotClearDifferentOwner|IfSameDoesNotClearSameProcessDifferentInstance)|Graph(DoesNotRetryPostServerErrors|RetriesPostTooManyRequestsAfterRetryAfter)|UpgradeRescue(InterruptsRunningPreservesQueuedAndSkipsTransientOutbox|PreservesProtectedOutboxBlocker|FencesStaleOwnerButRefusesLiveOwner)|Helper(UpgradeDrainExpired|ReloadDrainStale)|OwnerAppearsLocal|EarlierUnsentOutboxStatusMatrix|PendingOutbox(CrashRecoveryPromotesAcceptedDespiteRateLimitedChat|StatusMatrix)|OutboxBlocksUpgradeStatusMatrix|BridgeAsyncQueuedTurnsRunAcrossSessionsButSerializeEachSession|BridgePollBatchQueuesLaterMessageAfterStartingFirst)'
-          go test -race ./internal/teams ./internal/teams/store -count=1 -run "$teams_runtime_keepalive" -v
+          # The inbound prune/reopen fixture observes a hosted-runner SQLite
+          # lock boundary. Keep it out of this broad race process and run it
+          # immediately below in its own serial process, preserving coverage
+          # without letting unrelated race fixtures perturb the observation.
+          go test -race ./internal/teams ./internal/teams/store -count=1 -skip '^TestGlobalInboundSQLiteWriterDefersPruneUntilClose$' -run "$teams_runtime_keepalive" -v
+          go test -race ./internal/teams -count=1 -parallel=1 -run '^TestGlobalInboundSQLiteWriterDefersPruneUntilClose$' -v
 
       - name: Teams supervisor smoke (Linux/macOS)
         if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
@@ -1777,6 +1827,13 @@ jobs:
           go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteNewChatCompleteTurnBreakdown$' -benchtime=1x -count=1
           go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLite(LongTranscriptFinalArrival|StatusOnlyFinalArrival)$' -benchtime=1x -count=1
           go test ./internal/teams -run '^$' -bench '^BenchmarkCXPPerfModelSQLiteTargetedSessionQuarantine$' -benchtime=1x -count=1 -benchmem
+          go test ./internal/teams/store -run '^$' -bench '^BenchmarkSQLiteHotPollAdmissionScalarVsLegacy$' -benchtime=1x -count=1 -benchmem
+          # The 2100-chat RealisticMixedUser idle benchmark is an intentionally
+          # large profiling fixture. A single iteration can exceed the owner
+          # lease and take tens of minutes, so it belongs in a dedicated
+          # profiling run rather than this bounded PR smoke lane. The selected
+          # snapshot benchmark above still exercises the large-state SQLite
+          # admission path here.
           go test ./internal/teams -run '^$' -bench '^BenchmarkLinkedTranscriptProvenanceMatrix$' -benchtime=10ms -count=1 -benchmem
           go test ./internal/teams -run '^$' -bench '^BenchmarkHistoryWatchUnchangedPartialTail(Poll|CheckpointPersistence)$' -benchtime=100ms -count=1 -benchmem
 
@@ -2224,14 +2281,12 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
         mode: [normal, race]
         partition: [0, 1]
-        exclude:
-          # Unix recovery is already short. Windows serializes manifest
-          # entries for file-backed SQLite safety; split only that host across
-          # independent runners instead of introducing same-host contention.
-          - os: ubuntu-latest
-            partition: 1
-          - os: macos-latest
-            partition: 1
+        # Every hosted OS gets both independent partitions. The Unix race
+        # corpus now has the same long listener/SQLite tail as Windows; keeping
+        # a single Unix partition makes a healthy job wait behind unrelated
+        # manifest entries for 30–45 minutes. Each partition uses its own
+        # runner filesystem, and the manifest runner still serializes the
+        # resource-sensitive entries within that runner.
 
     steps:
       - name: Checkout
@@ -2267,10 +2322,7 @@ jobs:
           TEMP: ${{ runner.temp }}
         run: |
           set -euo pipefail
-          partition_flags=("-partition-count=1" "-partition-index=0")
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            partition_flags=("-partition-count=2" "-partition-index=${{ matrix.partition }}")
-          fi
+          partition_flags=("-partition-count=2" "-partition-index=${{ matrix.partition }}")
           go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery "${partition_flags[@]}"
 
       - name: Run Teams recovery manifest (race)
@@ -2286,10 +2338,7 @@ jobs:
           TEMP: ${{ runner.temp }}
         run: |
           set -euo pipefail
-          partition_flags=("-partition-count=1" "-partition-index=0")
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            partition_flags=("-partition-count=2" "-partition-index=${{ matrix.partition }}")
-          fi
+          partition_flags=("-partition-count=2" "-partition-index=${{ matrix.partition }}")
           go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery -race "${partition_flags[@]}"
 
       - name: Upload Teams recovery phase diagnostics
@@ -2416,46 +2465,7 @@ jobs:
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          set -euo pipefail
-          log="$RUNNER_TEMP/full-go-test.log"
-          # These fixtures are intentionally isolated from the package-wide
-          # coverage process. The listener case exercises a real
-          # store-reopen/owner-takeover boundary, while the CLI case starts a
-          # real process tree and observes signal cleanup. Running either
-          # beside the full package corpus can make its finite liveness
-          # observation inherit unrelated scheduler and process pressure.
-          # Run them separately below so both regressions remain mandatory
-          # while the coverage profile still covers every other package test.
-          frontier_recovery_pattern='^TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover$'
-          migration_process_pattern='^TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup$'
-          isolated_skip_pattern='^(?:TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover|TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup)$'
-          if ! go test -timeout=20m -parallel=16 -skip "$isolated_skip_pattern" -coverprofile=coverage.out ./... 2>&1 | tee "$log"; then
-            summary="$(grep -E -A8 '^--- FAIL:|^FAIL[[:space:]]|^panic:|^fatal error:' "$log" | tail -80 | tr '\n' ' ' || true)"
-            if ! grep -Eq '^--- FAIL:|^panic:|^fatal error:' "$log"; then
-              summary="$(tail -40 "$log" | tr '\n' ' ')"
-            fi
-            echo "::error title=Full Go test failure::${summary:-go test failed without a recognized summary; inspect the retained step log}"
-            exit 1
-          fi
-          isolated_log="$RUNNER_TEMP/frontier-recovery-isolated.log"
-          isolated_profile="$RUNNER_TEMP/frontier-recovery-coverage.out"
-          if ! go test ./internal/teams -timeout=2m -parallel=16 -count=1 -run "$frontier_recovery_pattern" -coverprofile="$isolated_profile" -v 2>&1 | tee "$isolated_log"; then
-            summary="$(grep -E -A8 '^--- FAIL:|^FAIL[[:space:]]|^panic:|^fatal error:' "$isolated_log" | tail -80 | tr '\n' ' ' || true)"
-            echo "::error title=Isolated frontier recovery failure::${summary:-isolated recovery test failed; inspect the retained step log}"
-            exit 1
-          fi
-          # Keep the fixture isolated for liveness, but do not silently remove
-          # its statements from the coverage gate. Profiles with the same mode
-          # can be concatenated; go tool cover merges duplicate blocks.
-          tail -n +2 "$isolated_profile" >> coverage.out
-          migration_log="$RUNNER_TEMP/migration-process-isolated.log"
-          migration_profile="$RUNNER_TEMP/migration-process-coverage.out"
-          if ! go test ./internal/cli -timeout=2m -parallel=16 -count=1 -run "$migration_process_pattern" -coverprofile="$migration_profile" -v 2>&1 | tee "$migration_log"; then
-            summary="$(grep -E -A8 '^--- FAIL:|^FAIL[[:space:]]|^panic:|^fatal error:' "$migration_log" | tail -80 | tr '\n' ' ' || true)"
-            echo "::error title=Isolated migration process failure::${summary:-isolated migration process test failed; inspect the retained step log}"
-            exit 1
-          fi
-          tail -n +2 "$migration_profile" >> coverage.out
+          bash scripts/ci/run_linux_full_go_test_collect.sh
 
       - name: go test (without coverage, non-Linux)
         if: runner.os != 'Linux'
@@ -2473,6 +2483,10 @@ jobs:
               summary="$(tail -40 "$log" | tr '\n' ' ')"
             fi
             echo "::error title=Full Go test failure::${summary:-go test failed without a recognized summary; inspect the retained step log}"
+            # A passing retry of internal/cli cannot diagnose a failure in
+            # another package, or establish contention as its cause. Keep the
+            # original shard failure authoritative; reproduce that exact
+            # package/test and mode separately when investigating it.
             exit 1
           fi
 
@@ -2485,6 +2499,9 @@ jobs:
             ${{ runner.temp }}/full-go-test*.log
             ${{ runner.temp }}/frontier-recovery-isolated.log
             ${{ runner.temp }}/migration-process-isolated.log
+            ${{ runner.temp }}/external-perf-isolated.log
+            ${{ runner.temp }}/teams-durable-isolated.log
+            ${{ runner.temp }}/store-durable-isolated.log
           if-no-files-found: ignore
 
       - name: Coverage gate (Linux only)
@@ -2510,10 +2527,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Race shards are independent hosted runners. Four partitions keep
-        # the exclusive phase balanced and leave only the mathematically
-        # unavoidable second wave for one of the 17 heavy parallel jobs.
-        partition: [0, 1, 2, 3]
+        # Race shards are independent hosted runners. Eight partitions keep
+        # the long exact-test/exclusive tail below the 45-minute job budget;
+        # each partition still receives complete test processes and the
+        # runner validates exact-once coverage before execution.
+        partition: [0, 1, 2, 3, 4, 5, 6, 7]
 
     steps:
       - name: Checkout
@@ -2529,7 +2547,7 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          go run ./scripts/ci/run_full_go_test_shards.go -race -timeout=30m -parallel=16 -shards=16 -partition-count=4 -partition-index="${{ matrix.partition }}" 2>&1 | tee "$RUNNER_TEMP/race-test.log"
+          go run ./scripts/ci/run_full_go_test_shards.go -race -timeout=30m -parallel=16 -shards=16 -partition-count=8 -partition-index="${{ matrix.partition }}" 2>&1 | tee "$RUNNER_TEMP/race-test.log"
 
       - name: Upload race diagnostics
         if: ${{ failure() }}

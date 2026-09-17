@@ -268,6 +268,11 @@ type GraphStatusError struct {
 	Code       string
 	Message    string
 	RetryAfter time.Duration
+	// RateLimitScope is populated only when the provider (or an explicit test
+	// transport) identifies the 429 as account/global rather than resource/chat
+	// local. A bare Graph 429 has no reliable scope signal, so callers must keep
+	// it chat-local instead of guessing that every sibling is throttled.
+	RateLimitScope string
 }
 
 type GraphResponseTooLargeError struct {
@@ -1577,11 +1582,118 @@ func trimGraphBasePath(requestURI string, baseURL string) string {
 type graphRequestOptions struct {
 	returnRateLimitWithoutRetry bool
 	responseMaxBytes            int64
+	// beforeFirstRequest is used by a durable caller to record a local
+	// side-effect boundary after authentication succeeds and immediately before
+	// the first HTTP request. It is called at most once for this operation.
+	beforeFirstRequest func() error
+	// beforeEachRequest is a last-moment capability fence. It runs immediately
+	// before every HTTP attempt, including retries. Unlike beforeFirstRequest it
+	// must not record a durable side effect; it is only allowed to reject an
+	// attempt whose owner/lease is no longer current.
+	beforeEachRequest func() error
 	// noReplayAfterFirstRequest is used for requests whose external outcome
 	// cannot safely be replayed. It is also implied for every method that is
 	// not in graphRequestMethodMayReplay, so a caller cannot accidentally make
 	// a non-idempotent POST retry after the request has reached the network.
 	noReplayAfterFirstRequest bool
+}
+
+// graphBeforeFirstRequestContextKey carries a last-moment local fence from a
+// durable caller that uses one of the public Graph helpers.  Keeping this in
+// the context avoids widening every public send method just to pass a private
+// owner check.  The callback runs after authentication succeeds and before a
+// request is constructed; a callback failure therefore proves that no HTTP
+// request was issued by that operation.
+type graphBeforeFirstRequestContextKey struct{}
+
+// graphBeforeEachRequestContextKey carries a read/admission fence that must be
+// rechecked before every HTTP attempt, including a retry after a transient
+// provider response.  It is separate from the historical before-first hook so
+// callers that only need a one-time preflight do not accidentally pay for a
+// durable lookup on every retry.
+type graphBeforeEachRequestContextKey struct{}
+
+// graphRequestPreflightError marks a local durable fence failure that occurs
+// after authentication but before an HTTP request is issued.  Senders use
+// this distinction to release only their own pre-POST attempt; treating an
+// owner-loss check as an ambiguous provider result would unnecessarily park a
+// message that was never sent.
+type graphRequestPreflightError struct {
+	cause error
+}
+
+func (e *graphRequestPreflightError) Error() string {
+	if e == nil || e.cause == nil {
+		return "Graph request preflight failed"
+	}
+	return "Graph request preflight failed: " + e.cause.Error()
+}
+
+func (e *graphRequestPreflightError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
+func withGraphBeforeFirstRequest(ctx context.Context, fn func() error) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if fn == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, graphBeforeFirstRequestContextKey{}, fn)
+}
+
+func withGraphBeforeEachRequest(ctx context.Context, fn func() error) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if fn == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, graphBeforeEachRequestContextKey{}, fn)
+}
+
+func graphBeforeFirstRequestFromContext(ctx context.Context) func() error {
+	if ctx == nil {
+		return nil
+	}
+	fn, _ := ctx.Value(graphBeforeFirstRequestContextKey{}).(func() error)
+	return fn
+}
+
+func graphRequestBeforeFirstRequest(ctx context.Context, opts graphRequestOptions) func() error {
+	if opts.beforeFirstRequest != nil {
+		return opts.beforeFirstRequest
+	}
+	return graphBeforeFirstRequestFromContext(ctx)
+}
+
+func graphRequestBeforeEachRequest(ctx context.Context, opts graphRequestOptions) func() error {
+	if opts.beforeEachRequest != nil {
+		return opts.beforeEachRequest
+	}
+	if ctx == nil {
+		return nil
+	}
+	fn, _ := ctx.Value(graphBeforeEachRequestContextKey{}).(func() error)
+	return fn
+}
+
+func runGraphRequestBeforeEachRequest(fn func() error) error {
+	if fn == nil {
+		return nil
+	}
+	if err := fn(); err != nil {
+		var preflightErr *graphRequestPreflightError
+		if errors.As(err, &preflightErr) {
+			return err
+		}
+		return &graphRequestPreflightError{cause: err}
+	}
+	return nil
 }
 
 // graphRequestMethodMayReplay is deliberately narrower than the set of HTTP
@@ -1646,7 +1758,19 @@ func (g *GraphClient) doWithOptions(ctx context.Context, method string, path str
 	retries := 0
 	refreshedAfterUnauthorized := false
 	noReplayAfterFirstRequest := graphRequestNoReplay(method, opts)
+	beforeFirstRequest := graphRequestBeforeFirstRequest(ctx, opts)
+	beforeEachRequest := graphRequestBeforeEachRequest(ctx, opts)
+	firstRequestPrepared := false
 	for {
+		if !firstRequestPrepared && beforeFirstRequest != nil {
+			if err := beforeFirstRequest(); err != nil {
+				return err
+			}
+			firstRequestPrepared = true
+		}
+		if err := runGraphRequestBeforeEachRequest(beforeEachRequest); err != nil {
+			return err
+		}
 		req, err := http.NewRequestWithContext(ctx, method, g.graphURL(path), bytes.NewReader(payload))
 		if err != nil {
 			return err
@@ -1743,7 +1867,19 @@ func (g *GraphClient) doRawWithOptions(ctx context.Context, method string, path 
 	retries := 0
 	refreshedAfterUnauthorized := false
 	noReplayAfterFirstRequest := graphRequestNoReplay(method, opts)
+	beforeFirstRequest := graphRequestBeforeFirstRequest(ctx, opts)
+	beforeEachRequest := graphRequestBeforeEachRequest(ctx, opts)
+	firstRequestPrepared := false
 	for {
+		if !firstRequestPrepared && beforeFirstRequest != nil {
+			if err := beforeFirstRequest(); err != nil {
+				return nil, "", err
+			}
+			firstRequestPrepared = true
+		}
+		if err := runGraphRequestBeforeEachRequest(beforeEachRequest); err != nil {
+			return nil, "", err
+		}
 		req, err := http.NewRequestWithContext(ctx, method, g.graphURL(path), nil)
 		if err != nil {
 			return nil, "", err
@@ -1806,7 +1942,19 @@ func (g *GraphClient) doBytesWithOptions(ctx context.Context, method string, pat
 	retries := 0
 	refreshedAfterUnauthorized := false
 	noReplayAfterFirstRequest := graphRequestNoReplay(method, opts)
+	beforeFirstRequest := graphRequestBeforeFirstRequest(ctx, opts)
+	beforeEachRequest := graphRequestBeforeEachRequest(ctx, opts)
+	firstRequestPrepared := false
 	for {
+		if !firstRequestPrepared && beforeFirstRequest != nil {
+			if err := beforeFirstRequest(); err != nil {
+				return nil, err
+			}
+			firstRequestPrepared = true
+		}
+		if err := runGraphRequestBeforeEachRequest(beforeEachRequest); err != nil {
+			return nil, err
+		}
 		req, err := http.NewRequestWithContext(ctx, method, g.graphURL(path), bytes.NewReader(data))
 		if err != nil {
 			return nil, err
@@ -2009,15 +2157,31 @@ func redactGraphPath(path string) string {
 }
 
 func retryAfter(value string) time.Duration {
+	// Retry-After is provider-controlled input. Keep ordinary provider values
+	// intact, but cap malformed/far-future values so one response cannot create
+	// a multi-century in-memory sleep or durable deadline. The caller still
+	// records the bounded value and can re-evaluate the durable gate later.
+	const maxGraphRetryAfter = time.Hour
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return 0
 	}
-	if seconds, err := strconv.Atoi(value); err == nil && seconds > 0 {
+	if seconds, err := strconv.ParseInt(value, 10, 64); err == nil && seconds > 0 {
+		// time.Duration is an int64 nanosecond count.  Multiplying an attacker- or
+		// provider-controlled Retry-After by time.Second without checking can
+		// overflow into a negative duration and make the caller retry immediately.
+		// Saturate instead; the durable scheduler will retain the deadline and a
+		// later operator/provider change can still wake the row.
+		if seconds > int64(maxGraphRetryAfter/time.Second) {
+			return maxGraphRetryAfter
+		}
 		return time.Duration(seconds) * time.Second
 	}
 	if t, err := http.ParseTime(value); err == nil {
 		if d := time.Until(t); d > 0 {
+			if d > maxGraphRetryAfter {
+				return maxGraphRetryAfter
+			}
 			return d
 		}
 	}
@@ -2144,16 +2308,34 @@ func readLimited(body io.Reader, maxBytes int64) ([]byte, error) {
 
 func graphStatusError(method string, path string, resp *http.Response, raw []byte) error {
 	err := &GraphStatusError{
-		Method:     method,
-		Path:       path,
-		StatusCode: resp.StatusCode,
-		Code:       safeGraphErrorCode(raw),
-		Message:    safeGraphErrorMessage(raw),
+		Method:         method,
+		Path:           path,
+		StatusCode:     resp.StatusCode,
+		Code:           safeGraphErrorCode(raw),
+		Message:        safeGraphErrorMessage(raw),
+		RateLimitScope: graphRateLimitScope(resp.Header),
 	}
 	if resp.StatusCode == http.StatusTooManyRequests {
 		err.RetryAfter = retryAfter(resp.Header.Get("Retry-After"))
 	}
 	return err
+}
+
+func graphRateLimitScope(header http.Header) string {
+	if header == nil {
+		return ""
+	}
+	// Microsoft Graph does not consistently expose a scope for a 429. Keep the
+	// internal header useful for deterministic tests and compatible proxies,
+	// while accepting the commonly used provider spelling when it is present.
+	for _, key := range []string{"X-CXP-RateLimit-Scope", "X-MS-Throttle-Scope"} {
+		scope := strings.ToLower(strings.TrimSpace(header.Get(key)))
+		switch scope {
+		case "account", "global":
+			return scope
+		}
+	}
+	return ""
 }
 
 func safeGraphErrorCode(raw []byte) string {

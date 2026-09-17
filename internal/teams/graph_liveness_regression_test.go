@@ -68,6 +68,20 @@ func TestGraphOversizedErrorPreservesHTTPStatusAndRetryAfter(t *testing.T) {
 	}
 }
 
+func TestRetryAfterSaturatesDurationOverflow(t *testing.T) {
+	if got := retryAfter("9223372036854775807"); got != time.Hour {
+		t.Fatalf("huge numeric Retry-After = %v, want bounded one-hour delay", got)
+	}
+	if got := retryAfter("999999999999999999999999999999"); got != 0 {
+		t.Fatalf("unrepresentable Retry-After = %v, want invalid zero", got)
+	}
+	for _, value := range []string{"0", "-1", "not-a-date"} {
+		if got := retryAfter(value); got != 0 {
+			t.Fatalf("invalid Retry-After %q = %v, want zero", value, got)
+		}
+	}
+}
+
 func TestGraphMessagePageRejectsMissingOrNullValue(t *testing.T) {
 	for _, tc := range []struct {
 		name string

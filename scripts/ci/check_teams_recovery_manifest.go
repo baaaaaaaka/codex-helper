@@ -45,21 +45,22 @@ type manifest struct {
 }
 
 type manifestTest struct {
-	Name          string   `json:"name"`
-	Package       string   `json:"package"`
-	Job           string   `json:"job"`
-	Tier          string   `json:"tier"`
-	Backends      []string `json:"backends"`
-	Vertical      string   `json:"vertical"`
-	RealListener  bool     `json:"real_listener"`
-	ListenerMode  string   `json:"listener_mode"`
-	Once          *bool    `json:"once"`
-	FakeGraph     bool     `json:"fake_graph"`
-	Exclusive     bool     `json:"exclusive"`
-	ResourceClass string   `json:"resource_class,omitempty"`
-	MaxSeconds    int      `json:"max_seconds"`
-	Oracle        string   `json:"oracle"`
-	Baseline      string   `json:"baseline"`
+	Name            string   `json:"name"`
+	Package         string   `json:"package"`
+	Job             string   `json:"job"`
+	Tier            string   `json:"tier"`
+	Backends        []string `json:"backends"`
+	BackendSubtests []string `json:"backend_subtests,omitempty"`
+	Vertical        string   `json:"vertical"`
+	RealListener    bool     `json:"real_listener"`
+	ListenerMode    string   `json:"listener_mode"`
+	Once            *bool    `json:"once"`
+	FakeGraph       bool     `json:"fake_graph"`
+	Exclusive       bool     `json:"exclusive"`
+	ResourceClass   string   `json:"resource_class,omitempty"`
+	MaxSeconds      int      `json:"max_seconds"`
+	Oracle          string   `json:"oracle"`
+	Baseline        string   `json:"baseline"`
 }
 
 type goTestJSONEvent struct {
@@ -211,6 +212,9 @@ func validateSelectors(tests []manifestTest) error {
 		}
 		if len(item.Backends) == 0 {
 			return fmt.Errorf("recovery test %q has no backend metadata", item.Name)
+		}
+		if err := validateManifestBackendSubtests(item); err != nil {
+			return err
 		}
 		if strings.TrimSpace(item.Oracle) == "" || strings.TrimSpace(item.Baseline) == "" {
 			return fmt.Errorf("recovery test %q must document oracle and baseline", item.Name)
@@ -793,8 +797,14 @@ func runManifestTest(item manifestTest, binaryPath string, packageDir string, ou
 	if err != nil {
 		return fmt.Errorf("run recovery test %s (%s): %w; output:\n%s", item.Name, item.Package, err, strings.TrimSpace(output.String()))
 	}
-	if err := validateTestJSONOutput(output.Bytes(), item.Name, item.Backends); err != nil {
-		return fmt.Errorf("validate recovery test %s (%s): %w; output:\n%s", item.Name, item.Package, err, strings.TrimSpace(output.String()))
+	var validationErr error
+	if len(item.BackendSubtests) > 0 {
+		validationErr = validateTestJSONOutputRequiringBackendSubtests(output.Bytes(), item.Name, item.BackendSubtests)
+	} else {
+		validationErr = validateTestJSONOutput(output.Bytes(), item.Name, item.Backends)
+	}
+	if validationErr != nil {
+		return fmt.Errorf("validate recovery test %s (%s): %w; output:\n%s", item.Name, item.Package, validationErr, strings.TrimSpace(output.String()))
 	}
 	return nil
 }
@@ -979,6 +989,19 @@ func manifestChildEnvironment() []string {
 }
 
 func validateTestJSONOutput(data []byte, name string, expectedBackends ...[]string) error {
+	return validateTestJSONOutputMode(data, name, false, expectedBackends...)
+}
+
+// validateTestJSONOutputRequiringBackendSubtests is the opt-in strict form
+// used by manifest entries whose backend evidence must be present even when
+// only one backend is declared. The ordinary validator keeps compatibility
+// with historical entries whose "backends" value is descriptive rather than
+// a subtest contract.
+func validateTestJSONOutputRequiringBackendSubtests(data []byte, name string, expectedBackends ...[]string) error {
+	return validateTestJSONOutputMode(data, name, true, expectedBackends...)
+}
+
+func validateTestJSONOutputMode(data []byte, name string, requireSingletonBackend bool, expectedBackends ...[]string) error {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		return errors.New("required test name is empty")
@@ -1029,7 +1052,7 @@ func validateTestJSONOutput(data []byte, name string, expectedBackends ...[]stri
 		return fmt.Errorf("required test %q did not emit a pass event", name)
 	}
 	if len(expectedBackends) > 0 {
-		if err := validateExpectedBackendSubtests(events, name, expectedBackends[0]); err != nil {
+		if err := validateExpectedBackendSubtestsMode(events, name, expectedBackends[0], requireSingletonBackend); err != nil {
 			return err
 		}
 	}
@@ -1044,7 +1067,11 @@ func validateTestJSONOutput(data []byte, name string, expectedBackends ...[]stri
 // both are accepted, but every declared backend must emit its own RUN and
 // PASS event.
 func validateExpectedBackendSubtests(events []goTestJSONEvent, name string, backends []string) error {
-	if len(backends) <= 1 {
+	return validateExpectedBackendSubtestsMode(events, name, backends, false)
+}
+
+func validateExpectedBackendSubtestsMode(events []goTestJSONEvent, name string, backends []string, requireSingleton bool) error {
+	if len(backends) <= 1 && !requireSingleton {
 		return nil
 	}
 	seen := make(map[string]map[string]bool, len(backends))
@@ -1080,7 +1107,54 @@ func validateExpectedBackendSubtests(events []goTestJSONEvent, name string, back
 	return nil
 }
 
+func validateManifestBackendSubtests(item manifestTest) error {
+	if len(item.BackendSubtests) == 0 {
+		return nil
+	}
+	declared := make(map[string]struct{}, len(item.Backends))
+	for _, backend := range item.Backends {
+		backend = strings.TrimSpace(strings.ToLower(backend))
+		if backend == "" {
+			return fmt.Errorf("recovery test %q declares an empty backend", item.Name)
+		}
+		declared[backend] = struct{}{}
+	}
+	seen := make(map[string]struct{}, len(item.BackendSubtests))
+	for _, backend := range item.BackendSubtests {
+		backend = strings.TrimSpace(strings.ToLower(backend))
+		if backend == "" {
+			return fmt.Errorf("recovery test %q declares an empty backend_subtests entry", item.Name)
+		}
+		if _, duplicate := seen[backend]; duplicate {
+			return fmt.Errorf("recovery test %q declares duplicate backend_subtests entry %q", item.Name, backend)
+		}
+		seen[backend] = struct{}{}
+		if _, ok := declared[backend]; !ok {
+			return fmt.Errorf("recovery test %q backend_subtests entry %q is not declared in backends", item.Name, backend)
+		}
+	}
+	if len(seen) != len(declared) {
+		missing := make([]string, 0, len(declared)-len(seen))
+		for backend := range declared {
+			if _, ok := seen[backend]; !ok {
+				missing = append(missing, backend)
+			}
+		}
+		sort.Strings(missing)
+		return fmt.Errorf("recovery test %q backend_subtests is missing declared backends: %s", item.Name, strings.Join(missing, ", "))
+	}
+	return nil
+}
+
 func backendSubtestSuffixMatches(backend, suffix string) bool {
+	// Backend-first tests may add a second dimension below the backend, for
+	// example TestRecovery/json/account.  The manifest still declares the
+	// durable backend as "json"; require it to be the first subtest component
+	// rather than rejecting the additional scope dimension or accidentally
+	// matching an unrelated nested name.
+	if slash := strings.IndexByte(suffix, '/'); slash >= 0 {
+		suffix = suffix[:slash]
+	}
 	switch backend {
 	case "json":
 		return suffix == "json" || suffix == "sqlite=false" || suffix == "sqlite=0"
