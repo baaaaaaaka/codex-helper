@@ -1048,6 +1048,7 @@ type Bridge struct {
 	pollProcessInstanceID              string
 	fastPollUntil                      time.Time
 	pollForegroundPressure             bool
+	pollForegroundPressureCycles       uint64
 	lastPollErrorLog                   string
 	lastPollErrorLogAt                 time.Time
 	persistentPollFailureFirstAt       time.Time
@@ -3034,7 +3035,38 @@ func (b *Bridge) setPollForegroundPressure(active bool) {
 	}
 	b.pollMu.Lock()
 	b.pollForegroundPressure = active
+	if active {
+		b.pollForegroundPressureCycles++
+	} else {
+		b.pollForegroundPressureCycles = 0
+	}
 	b.pollMu.Unlock()
+}
+
+// beginPollForegroundPressureCycle clears the current-cycle bit without
+// resetting the consecutive-pressure count. A work chat that is due on every
+// poll must not turn the one-cycle cold-maintenance deferral into starvation.
+func (b *Bridge) beginPollForegroundPressureCycle() {
+	if b == nil {
+		return
+	}
+	b.pollMu.Lock()
+	b.pollForegroundPressure = false
+	b.pollMu.Unlock()
+}
+
+func (b *Bridge) pollForegroundPressureBlocksColdMaintenance() bool {
+	if b == nil {
+		return false
+	}
+	b.pollMu.Lock()
+	// The pressure bit protects only the immediate handoff from a completed
+	// Graph poll to the cold phases. If the scheduler keeps producing due chats,
+	// yield cold maintenance after that first protected cycle; durable backlog
+	// and the phase-local recheck remain the authoritative safety fences.
+	blocked := b.pollForegroundPressure && b.pollForegroundPressureCycles <= 1
+	b.pollMu.Unlock()
+	return blocked
 }
 
 func (b *Bridge) pollForegroundPressureActive() bool {
@@ -3090,7 +3122,7 @@ func (b *Bridge) normalOptionalMaintenanceStillAllowed(ctx context.Context) (boo
 	if b == nil || b.store == nil {
 		return true, nil
 	}
-	if b.pollForegroundPressureActive() {
+	if b.pollForegroundPressureBlocksColdMaintenance() {
 		return false, nil
 	}
 	backlog, err := b.store.TeamsOperationalBacklog(ctx)
@@ -3120,7 +3152,7 @@ func (b *Bridge) optionalMaintenancePlanForOwner(ctx context.Context, now time.T
 		return optionalMaintenancePlan{}, err
 	}
 	if !backlog.Active() {
-		if b.pollForegroundPressureActive() {
+		if b.pollForegroundPressureBlocksColdMaintenance() {
 			// Foreground pressure suppresses optional cold work, but it must not
 			// suppress an already-durable source-proof/rewrite recovery fence.
 			// Probe that mandatory lane before returning the pressure decision.
@@ -3699,7 +3731,7 @@ func (b *Bridge) pollOnce(ctx context.Context, top int) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	b.setPollForegroundPressure(false)
+	b.beginPollForegroundPressureCycle()
 	tracePollStep := func(name string, started time.Time, err error) {
 		if b != nil && b.pollPhaseTraceHook != nil {
 			b.pollPhaseTraceHook(name, time.Since(started), err)

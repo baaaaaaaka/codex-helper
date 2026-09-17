@@ -57,6 +57,35 @@ func TestTeamsPollForegroundPressureSkipsColdMaintenanceForOneCycle(t *testing.T
 	}
 }
 
+func TestTeamsPollForegroundPressureEventuallyYieldsColdMaintenance(t *testing.T) {
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+	ctx := context.Background()
+
+	// Simulate a chat whose scheduler row remains due on every poll. The first
+	// cycle protects the handoff from the Graph read lane, but repeated due
+	// polls must not starve history/linked maintenance forever.
+	bridge.beginPollForegroundPressureCycle()
+	bridge.setPollForegroundPressure(true)
+	plan, err := bridge.optionalMaintenancePlanForOwner(ctx, time.Now())
+	if err != nil {
+		t.Fatalf("first pressured optional-maintenance plan: %v", err)
+	}
+	if plan.runNormal || !plan.backlogActive {
+		t.Fatalf("first pressured plan = %#v, want cold work deferred", plan)
+	}
+
+	bridge.beginPollForegroundPressureCycle()
+	bridge.setPollForegroundPressure(true)
+	plan, err = bridge.optionalMaintenancePlanForOwner(ctx, time.Now())
+	if err != nil {
+		t.Fatalf("repeated pressured optional-maintenance plan: %v", err)
+	}
+	if !plan.runNormal || plan.runMandatory || plan.backlogActive {
+		t.Fatalf("repeated pressured plan = %#v, want cold work admitted", plan)
+	}
+}
+
 func TestTeamsPollForegroundPressureDoesNotHideMandatoryMaintenance(t *testing.T) {
 	store := newBridgeTestStore(t)
 	bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})

@@ -174,6 +174,7 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		"TestSQLiteHotPollStandaloneCanonicalFallbackReleasesStoreLockDuringRead":              true,
 		"TestSQLiteInterruptedOutboxProjectionAuditLeavesAuditingAndCanResume":                 true,
 		"TestSQLiteHotPollAdmissionBoundsSemanticallyMalformedPollLaneAndPreservesHealthyChat": true,
+		"TestSQLiteHotPollAdmissionBoundsMalformedPollLaneAndPreservesHealthyChat":             true,
 		"TestSQLiteSemanticallyMalformedOutboxRowsDoNotHideHealthyWork":                        true,
 		"TestSQLiteHotPollWorkCandidatesRotateOperationalRowsBeyondLimit":                      true,
 		// These tests observe page-boundary SQLite scheduling/heartbeat behavior;
@@ -312,6 +313,7 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestSQLiteHotPollStandaloneCanonicalFallbackReleasesStoreLockDuringRead":              true,
 		"TestSQLiteInterruptedOutboxProjectionAuditLeavesAuditingAndCanResume":                 true,
 		"TestSQLiteHotPollAdmissionBoundsSemanticallyMalformedPollLaneAndPreservesHealthyChat": true,
+		"TestSQLiteHotPollAdmissionBoundsMalformedPollLaneAndPreservesHealthyChat":             true,
 		"TestSQLiteSemanticallyMalformedOutboxRowsDoNotHideHealthyWork":                        true,
 		"TestSQLiteHotPollWorkCandidatesRotateOperationalRowsBeyondLimit":                      true,
 		"TestStoreHistoryWatchOwnerCapabilityFencesTakeoverAcrossBackends":                     true,
