@@ -118,7 +118,11 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		"TestBridgeAttachmentUploadSession429RecordsWriteGateWithoutReplay": true,
 		// This two-wave rotation fixture observes a small SQLite-backed send
 		// window. Keep the fairness order independent of hosted runner pressure.
-		"TestTeamsMainLoopOutboxRotatesBeyondFirstTwoChats":                              true,
+		"TestTeamsMainLoopOutboxRotatesBeyondFirstTwoChats": true,
+		// This concurrent flush fixture intentionally races two senders against
+		// one FIFO snapshot. Keep its short JSON CAS observation out of the
+		// broad package process and hosted runner I/O pressure.
+		"TestBridgeFlushPendingOutboxSerializesConcurrentFlushes":                        true,
 		"TestTeamsListenFalseHistoryWatchFullPoolDoesNotStarveHealthyTail":               true,
 		"TestTeamsListenFalseUsesConfiguredRunnerStreaming":                              true,
 		"TestTeamsListenFalseLinkedTranscriptSessionErrorDoesNotStarveHealthyTail":       true,
@@ -313,6 +317,7 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestTeamsMainLoopOutboxRotatesBeyondFirstTwoChats":                              true,
 		"TestTeamsMainLoopOutboxLedgerFailureDoesNotStarveHealthyTail":                   true,
 		"TestBridgeAttachmentUploadSession429RecordsWriteGateWithoutReplay":              true,
+		"TestBridgeFlushPendingOutboxSerializesConcurrentFlushes":                        true,
 		"TestTeamsUnresolvedTranscriptOutboxDoesNotLivelockHealthyTail":                  true,
 		"TestTeamsSameChatDefinitiveSendFailureDoesNotStarveLaterOutbox":                 true,
 		"TestSendQueuedOutboxFallsBackToControlMentionAfterDefiniteWebhookFailureSQLite": true,
