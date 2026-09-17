@@ -4,6 +4,7 @@ Auto-updated by `.github/workflows/codex-release-monitor.yml`.
 
 | Codex version | linux | mac | windows | centos7 | rockylinux8 | ubuntu20.04 | last_tested_utc |
 | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0.155.0-alpha.16 | pass | pass | pass | pass | pass | pass | 2026-09-17T08:05:57Z |
 | 0.155.0-alpha.15 | pass | pass | pass | pass | pass | pass | 2026-09-17T02:36:46Z |
 | 0.155.0-alpha.14 | pass | pass | pass | pass | pass | pass | 2026-09-17T00:08:40Z |
 | 0.155.0-alpha.13 | pass | pass | fail | pass | pass | pass | 2026-09-16T22:00:43Z |
@@ -30,7 +31,7 @@ Auto-updated by `.github/workflows/codex-release-monitor.yml`.
 | 0.154.0-alpha.3 | pass | pass | pass | pass | pass | pass | 2026-09-07T10:35:14Z |
 | 0.154.0-alpha.2 | pass | pass | pass | pass | pass | pass | 2026-09-03T23:24:25Z |
 | 0.154.0-alpha.1 | pass | pass | pass | pass | pass | pass | 2026-09-03T10:35:41Z |
-| 0.153.4 | pass | pass | pass | pass | pass | pass | 2026-09-14T06:34:08Z |
+| 0.153.4 | pass | pass | pass | pass | pass | pass | 2026-09-17T08:05:57Z |
 | 0.153.3 | pass | pass | pass | pass | pass | pass | 2026-09-17T02:36:46Z |
 | 0.153.2 | pass | pass | pass | pass | pass | pass | 2026-09-07T05:25:55Z |
 | 0.153.1 | pass | pass | pass | pass | pass | pass | 2026-09-03T23:24:25Z |
