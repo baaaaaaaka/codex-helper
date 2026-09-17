@@ -151,6 +151,7 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		// store.  Keep startup/recovery timing independent from unrelated
 		// package tests; the test's own Graph fixture already covers the
 		// concurrency boundary it needs.
+		"TestTeamsListenFalseUntrustedSQLiteLeaseHoldsAndRecovers":      true,
 		"TestTeamsListenFalseRecoversExpiredAmbiguousOutboxWithoutPost": true,
 		// This test observes asynchronous durable completion. A broad package
 		// shard can delay the final JSON writer past the test's safety budget even
@@ -255,6 +256,7 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage":            true,
 		"TestTeamsListenFalseHistoryWatchFullPoolDoesNotStarveHealthyTail":               true,
 		"TestTeamsListenFalseLinkedTranscriptFullPoolDoesNotStarveHealthyTail":           true,
+		"TestTeamsListenFalseUntrustedSQLiteLeaseHoldsAndRecovers":                       true,
 		"TestTeamsListenFalseUsesConfiguredRunnerStreaming":                              true,
 		"TestTeamsListenFalseSQLiteTranscriptBacklogProgresses":                          true,
 		"TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover":            true,

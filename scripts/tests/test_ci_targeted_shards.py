@@ -525,6 +525,7 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             "TestTeamsListenFalseGraphHeadFailureDoesNotStarveHealthyTail",
             "TestTeamsListenFalseLinkedTranscriptFullPoolDoesNotStarveHealthyTail",
             "TestTeamsListenFalseStartupHeartbeatProtectsSlowInitialization",
+            "TestTeamsListenFalseUntrustedSQLiteLeaseHoldsAndRecovers",
         )
         for fixture_name in fixtures:
             fixture = f'"{fixture_name}"'

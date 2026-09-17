@@ -1105,6 +1105,11 @@ type Bridge struct {
 	// completed phases instead of canceling an in-flight phase and mistaking
 	// shutdown context cancellation for a recovery error.
 	mainLoopCycleDoneHook func()
+	// startupReadyHook is a test-only lifecycle seam. Production bridges leave
+	// it nil; asynchronous listener fixtures use it to start their progress
+	// watchdog after owner admission and startup reconciliation have completed.
+	// It does not participate in startup decisions or durable state.
+	startupReadyHook func()
 	// controlLeaseClaimHook is a test-only lease diagnostic seam. Production
 	// bridges leave it nil; lifecycle experiments use it to distinguish a real
 	// takeover from an intentional teardown race without changing lease logic.
@@ -2576,6 +2581,9 @@ func (b *Bridge) listenOwnerGeneration(ctx context.Context, opts BridgeOptions) 
 		_, _ = fmt.Fprintln(b.out, "Listening. Send `help`, `p`, or `n <directory>` in the control chat.")
 	}
 	testphase.Emit("bridge_startup_ready", nil)
+	if b.startupReadyHook != nil {
+		b.startupReadyHook()
+	}
 	for {
 		if teamsStartupFallbackStopRequested() {
 			if b.out != nil {

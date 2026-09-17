@@ -1218,7 +1218,6 @@ func TestTeamsListenFalseUntrustedSQLiteLeaseHoldsAndRecovers(t *testing.T) {
 	// the production hold timer deliberately has a one-second floor.
 	select {
 	case err := <-listener.done:
-		listener.err = err
 		t.Fatalf("listener exited while control lease was untrusted: %v", err)
 	case <-time.After(200 * time.Millisecond):
 	}
@@ -1249,7 +1248,6 @@ func TestTeamsListenFalseUntrustedSQLiteLeaseHoldsAndRecovers(t *testing.T) {
 		state, loadErr := reopened.Load(ctx)
 		select {
 		case err := <-listener.done:
-			listener.err = err
 			t.Fatalf("listener exited before repaired lease recovery: %v; load=%v state=%#v lease=%#v requests=%#v", err, loadErr, state, bridge.currentLease(), graphState.requestsSnapshot())
 		default:
 			t.Fatalf("listener did not resume after explicit control-lease repair; load=%v state=%#v lease=%#v requests=%#v", loadErr, state, bridge.currentLease(), graphState.requestsSnapshot())
@@ -1267,7 +1265,6 @@ func TestTeamsListenFalseUntrustedSQLiteLeaseHoldsAndRecovers(t *testing.T) {
 		state, loadErr := reopened.Load(ctx)
 		select {
 		case err := <-listener.done:
-			listener.err = err
 			t.Fatalf("listener exited after repaired lease claim: %v; load=%v state=%#v lease=%#v", err, loadErr, state, bridge.currentLease())
 		default:
 			t.Fatalf("listener claimed repaired lease but did not resume Graph loop; load=%v state=%#v lease=%#v", loadErr, state, bridge.currentLease())
@@ -2336,18 +2333,37 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 		cycleBoundaryOnce.Do(func() { close(cycleBoundary) })
 		<-cycleRelease
 	}
+	startupReady := make(chan struct{})
+	var startupReadyOnce sync.Once
+	bridge.startupReadyHook = func() {
+		startupReadyOnce.Do(func() { close(startupReady) })
+	}
 	listener := startListenerRecovery(t, bridge, options)
 	// Register this after startListenerRecovery so cleanup releases the hook
 	// before the listener's own stop cleanup waits for the goroutine.
 	t.Cleanup(releaseCycle)
 	select {
+	case <-startupReady:
+	case <-listener.finished:
+		err, _ := listener.finishedError()
+		t.Fatalf("stateful listener exited before startup became ready: %v", err)
+	case <-time.After(listenerRecoveryDurableIOProgressTimeout):
+		t.Fatalf("stateful listener did not become startup-ready")
+	}
+	select {
 	case <-executor.called:
+	case <-listener.finished:
+		err, _ := listener.finishedError()
+		t.Fatalf("stateful listener exited before head prompt reached executor: %v", err)
 	case <-time.After(listenerRecoveryExtendedProgressTimeout):
 		state, _ := store.Load(context.Background())
 		t.Fatalf("stateful head prompt did not reach executor: calls=%#v; state=%+v; requests=%v", executor.callsSnapshot(), state, graphState.requestsSnapshot())
 	}
 	select {
 	case <-graphState.continuationEntered:
+	case <-listener.finished:
+		err, _ := listener.finishedError()
+		t.Fatalf("stateful listener exited before continuation request: %v", err)
 	case <-time.After(listenerRecoveryExtendedProgressTimeout):
 		t.Fatal("stateful continuation request did not start")
 	}
@@ -2374,6 +2390,9 @@ func TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage(t *test
 	// revision assertion above is therefore the correct pre-release boundary.
 	select {
 	case <-terminalCommitEntered:
+	case <-listener.finished:
+		err, _ := listener.finishedError()
+		t.Fatalf("stateful listener exited before terminal CAS barrier: %v", err)
 	case <-time.After(listenerRecoveryExtendedProgressTimeout):
 		t.Fatal("stateful terminal CAS barrier was not reached")
 	}
@@ -5998,7 +6017,6 @@ func runListenerRecoveryPollContinuationSurvivesReopenBeforeDrain(t *testing.T, 
 		}
 		select {
 		case err := <-listener.done:
-			listener.err = err
 			t.Fatalf("replacement continuation listener exited before final: %v; load=%v outbox=%v lastRequests=%#v errors=%#v outboxPhase=%#v pollPhase=%#v", err, loadErr, outboxSummary, requests, graphState.errorsSnapshot(), recoveredBridge.mainLoopPhaseStatsSnapshot("outbox"), recoveredBridge.mainLoopPhaseStatsSnapshot("poll"))
 		default:
 			t.Fatalf("timed out waiting for replacement continuation final; load=%v outbox=%v lastRequests=%#v errors=%#v outboxPhase=%#v pollPhase=%#v", loadErr, outboxSummary, requests, graphState.errorsSnapshot(), recoveredBridge.mainLoopPhaseStatsSnapshot("outbox"), recoveredBridge.mainLoopPhaseStatsSnapshot("poll"))
