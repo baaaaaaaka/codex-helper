@@ -634,6 +634,7 @@ echo 'ok'
             "TestBridgeMainLoopOutboxFlushUsesSmallBudget",
             "TestTeamsMainLoopOutboxRotatesBeyondFirstTwoChats",
             "TestBridgeAttachmentUploadSession429RecordsWriteGateWithoutReplay",
+            "TestBridgeFlushPendingOutboxSerializesConcurrentFlushes",
         )
         for fixture_name in fixtures:
             fixture = f'"{fixture_name}"'
