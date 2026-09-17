@@ -7671,8 +7671,15 @@ func TestSQLiteHotPollAdmissionDoesNotLetStaleOrdinaryHintStarveDueChat(t *testi
 	if !seen["session-due-ordinary-after-stale-hints"] {
 		t.Fatalf("due ordinary chat was starved by stale operational hints: %#v", seen)
 	}
-	if staleSeen != staleOperational {
-		t.Fatalf("stale operational chats were dropped during hint reconciliation: got %d want %d", staleSeen, staleOperational)
+	wantStale := staleOperational
+	// The admission result is deliberately bounded. When the fixture fills
+	// the whole page with stale operational rows, the due ordinary row must
+	// consume one slot rather than being starved by that prefix.
+	if maxStale := sqliteHotPollReadyLimit - 1; wantStale > maxStale {
+		wantStale = maxStale
+	}
+	if staleSeen != wantStale {
+		t.Fatalf("stale operational chats were reconciled incorrectly: got %d want %d (fixture=%d limit=%d)", staleSeen, wantStale, staleOperational, sqliteHotPollReadyLimit)
 	}
 
 	schedule, err := store.HotPollReadyScheduleState(ctx, "control-chat", now)
@@ -7682,7 +7689,7 @@ func TestSQLiteHotPollAdmissionDoesNotLetStaleOrdinaryHintStarveDueChat(t *testi
 	if _, ok := schedule.ChatPolls["chat-due-ordinary-after-stale-hints"]; !ok {
 		t.Fatalf("due ordinary chat was absent from ready schedule behind stale hints: %#v", schedule.ChatPolls)
 	}
-	for i := 0; i < staleOperational; i++ {
+	for i := 0; i < wantStale; i++ {
 		chatID := fmt.Sprintf("chat-stale-operational-hint-%03d", i)
 		if _, ok := schedule.ChatPolls[chatID]; !ok {
 			t.Fatalf("stale operational chat %q was dropped from ready schedule: %#v", chatID, schedule.ChatPolls)
