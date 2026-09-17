@@ -542,6 +542,7 @@ class TargetedShardWorkflowTests(unittest.TestCase):
                 f"{fixture_name} must be both process-isolated and host-exclusive",
             )
 
+    @unittest.skipIf(os.name == "nt", "Linux Bash CI collector")
     def test_linux_coverage_runner_collects_all_suites_after_failure(self):
         with tempfile.TemporaryDirectory(prefix="cxp-ci-linux-coverage-collect-") as temp_dir:
             temp = pathlib.Path(temp_dir)
