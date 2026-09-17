@@ -614,6 +614,7 @@ echo 'ok'
         fixtures = (
             "TestBridgePollOnceDispositionsOnlyCorruptDurableSession",
             "TestSQLiteHotPollCorruptProbeRejectsNonRFC3339Times",
+            "TestSQLiteHotPollCorruptSessionWithOpaquePollIsFencedAcrossReopen",
             "TestSQLiteHotPollCanonicalFallbackReleasesStoreLockDuringRead",
             "TestSQLiteHotPollStandaloneCanonicalFallbackReleasesStoreLockDuringRead",
             "TestSQLiteInterruptedOutboxProjectionAuditLeavesAuditingAndCanResume",
@@ -630,6 +631,7 @@ echo 'ok'
             "TestTeamsSameChatDefinitiveSendFailureDoesNotStarveLaterOutbox",
             "TestSendQueuedOutboxFallsBackToControlMentionAfterDefiniteWebhookFailureSQLite",
             "TestTeamsOutboxPredecessorMutationRefreshesFIFOSnapshotSQLite",
+            "TestBridgeMainLoopOutboxFlushUsesSmallBudget",
         )
         for fixture_name in fixtures:
             fixture = f'"{fixture_name}"'

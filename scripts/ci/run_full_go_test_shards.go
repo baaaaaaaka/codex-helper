@@ -106,8 +106,12 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		// This liveness fixture must observe an actual listener scheduling
 		// window. Keep it out of the broad shard pool, where unrelated race and
 		// SQLite processes can consume the hosted runner before its first poll.
-		"TestTeamsListenFalseGraphHeadFailureDoesNotStarveHealthyTail":                   true,
-		"TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage":            true,
+		"TestTeamsListenFalseGraphHeadFailureDoesNotStarveHealthyTail":        true,
+		"TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage": true,
+		// This main-loop budget fixture observes a small asynchronous flush
+		// window. Keep it out of broad race shards so host scheduling cannot make
+		// a healthy two-row flush look like a production budget regression.
+		"TestBridgeMainLoopOutboxFlushUsesSmallBudget":                                   true,
 		"TestTeamsListenFalseHistoryWatchFullPoolDoesNotStarveHealthyTail":               true,
 		"TestTeamsListenFalseUsesConfiguredRunnerStreaming":                              true,
 		"TestTeamsListenFalseLinkedTranscriptSessionErrorDoesNotStarveHealthyTail":       true,
@@ -169,7 +173,12 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		// compatibility/fallback operation.  Their correctness depends on a
 		// short hook/legacy-lane window, so broad race-shard I/O must not turn a
 		// healthy operation into a false readiness or budget failure.
-		"TestSQLiteHotPollCorruptProbeRejectsNonRFC3339Times":                                  true,
+		"TestSQLiteHotPollCorruptProbeRejectsNonRFC3339Times": true,
+		// This corrupt-session witness must reach the bounded compatibility
+		// fallback before its two-second admission budget expires. A broad race
+		// shard can consume that budget in SQLite setup/I/O even though the
+		// production path is correctly fenced.
+		"TestSQLiteHotPollCorruptSessionWithOpaquePollIsFencedAcrossReopen":                    true,
 		"TestSQLiteHotPollCanonicalFallbackReleasesStoreLockDuringRead":                        true,
 		"TestSQLiteHotPollStandaloneCanonicalFallbackReleasesStoreLockDuringRead":              true,
 		"TestSQLiteInterruptedOutboxProjectionAuditLeavesAuditingAndCanResume":                 true,
@@ -265,6 +274,7 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestTeamsListenFalseGraphWorkerSaturationPreservesHealthyPoll":                  true,
 		"TestTeamsListenFalseGraphHeadFailureDoesNotStarveHealthyTail":                   true,
 		"TestTeamsListenFalseGraphStatefulHeadContinuationDrainsTerminalPage":            true,
+		"TestBridgeMainLoopOutboxFlushUsesSmallBudget":                                   true,
 		"TestTeamsListenFalseHistoryWatchFullPoolDoesNotStarveHealthyTail":               true,
 		"TestTeamsListenFalseLinkedTranscriptFullPoolDoesNotStarveHealthyTail":           true,
 		"TestTeamsListenFalseUntrustedSQLiteLeaseHoldsAndRecovers":                       true,
@@ -309,6 +319,7 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 	},
 	"./internal/teams/store": {
 		"TestSQLiteHotPollCorruptProbeRejectsNonRFC3339Times":                                  true,
+		"TestSQLiteHotPollCorruptSessionWithOpaquePollIsFencedAcrossReopen":                    true,
 		"TestSQLiteHotPollCanonicalFallbackReleasesStoreLockDuringRead":                        true,
 		"TestSQLiteHotPollStandaloneCanonicalFallbackReleasesStoreLockDuringRead":              true,
 		"TestSQLiteInterruptedOutboxProjectionAuditLeavesAuditingAndCanResume":                 true,
