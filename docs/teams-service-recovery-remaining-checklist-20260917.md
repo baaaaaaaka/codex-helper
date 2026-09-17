@@ -95,6 +95,10 @@ the implementation and test work.
 - [x] Verify schema preparation and migration markers before any owner-scoped
       operation; stale preparation must fail with an actionable repair path,
       not enter a retry loop.
+- [x] Make WSL Startup fallback retirement idempotent when the current task
+      suffix has no launcher or watchdog process.  Keep process-discovery and
+      post-cleanup verification fail-closed so historical residue cannot hide
+      a second writer.
 - [ ] Add Docker tests using a point-in-time copy of SQLite/WAL, registry,
       ledger, and Codex history; source fixture is read-only, Graph is fake,
       network is disabled, and no Teams token is read.
@@ -154,3 +158,10 @@ the implementation and test work.
   that explicit session-local condition is now durably deferred for the next
   poll; parent cancellation is still propagated.  The targeted race regression
   passed locally.
+- 2026-09-17: the live WSL start failure was narrowed to the Windows-side
+  Startup fallback cleanup command returning exit status 1 even though the
+  current suffix had no active launcher or process.  Cleanup now performs a
+  read-only presence/process check before mutating fallback files, and verifies
+  that any cleanup leaves no matching file or process.  The focused lifecycle
+  suite and a controlled live WSL probe passed without changing SQLite or Teams
+  messages.

@@ -4455,8 +4455,24 @@ func buildTeamsServiceWSLRemoveStartupFallbackCommand(taskName string, suffixes 
 		"$scriptPath = Join-Path $appDir ($scriptPrefix + $suffix + '.ps1'); " +
 		"$launcherPath = if (-not [string]::IsNullOrWhiteSpace($startup)) { Join-Path $startup ($scriptPrefix + $suffix + '.vbs') } else { '' }; " +
 		"$legacyCmdLauncherPath = if (-not [string]::IsNullOrWhiteSpace($startup)) { Join-Path $startup ($scriptPrefix + $suffix + '.cmd') } else { '' }; " +
+		"$watchdogNeedles = @($scriptPath, $launcherPath, $legacyCmdLauncherPath) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }; " +
+		"$hasExistingPath = @($paths | Where-Object { Test-Path -LiteralPath $_ -ErrorAction Stop }).Count -gt 0; " +
+		"try { $matchingProcesses = @(Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object { " +
+		"$proc = $_; $cmd = [string]$proc.CommandLine; " +
+		"if ($proc.ProcessId -ne $PID -and -not [string]::IsNullOrWhiteSpace($cmd)) { " +
+		"foreach ($needle in $watchdogNeedles) { if ($cmd.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $proc; break } } " +
+		"} " +
+		"}); $hasMatchingProcess = $matchingProcesses.Count -gt 0 } catch { throw ('WSL Startup fallback process discovery failed: ' + $_.Exception.Message) }; " +
+		"if (-not $hasExistingPath -and -not $hasMatchingProcess) { continue }; " +
 		teamsServiceWSLStopStartupFallbackProcessesPowerShell("$scriptPath", "$launcherPath", "$legacyCmdLauncherPath") +
-		"foreach ($path in $paths) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue } " +
+		"foreach ($path in $paths) { if (Test-Path -LiteralPath $path -ErrorAction Stop) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue } } " +
+		"$remainingPaths = @($paths | Where-Object { Test-Path -LiteralPath $_ -ErrorAction Stop }); if ($remainingPaths.Count -gt 0) { throw ('WSL Startup fallback files remain after cleanup: ' + ($remainingPaths -join ', ')) } " +
+		"try { $remainingProcesses = @(Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object { " +
+		"$proc = $_; $cmd = [string]$proc.CommandLine; " +
+		"if ($proc.ProcessId -ne $PID -and -not [string]::IsNullOrWhiteSpace($cmd)) { " +
+		"foreach ($needle in $watchdogNeedles) { if ($cmd.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $proc; break } } " +
+		"} " +
+		"}); if ($remainingProcesses.Count -gt 0) { throw ('WSL Startup fallback processes remain after cleanup: ' + (($remainingProcesses | ForEach-Object { $_.ProcessId }) -join ', ')) } } catch { if ($_.Exception.Message -like 'WSL Startup fallback processes remain after cleanup:*') { throw }; throw ('WSL Startup fallback process verification failed: ' + $_.Exception.Message) } " +
 		"}"
 }
 
