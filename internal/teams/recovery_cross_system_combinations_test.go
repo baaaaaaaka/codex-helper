@@ -657,7 +657,7 @@ func TestBridgeLinkedTranscriptConcurrentSQLiteSyncPublishesExactlyOnce(t *testi
 			t.Fatalf("restarted owner sync did not finish: %v", ctx.Err())
 		}
 	}
-	if newErr != nil && !isOutboxDeliveryDeferred(newErr) {
+	if newErr != nil && !isOutboxDeliveryDeferred(newErr) && !isLinkedTranscriptJobDeferred(newErr) {
 		t.Fatalf("concurrent restarted owner sync: %v", newErr)
 	}
 	flushBridgeQueuedNotificationsForTest(t, oldOwner)

@@ -725,6 +725,13 @@ func suppressLinkedTranscriptJobDeferrals(err error) error {
 }
 
 func linkedTranscriptJobBudgetDeferral(err error, jobCtx context.Context, parent context.Context) bool {
+	// A concurrent durable commit invalidates the read snapshot by design. It
+	// is not a process-wide store failure and it is not safe to consume the
+	// partial state, so isolate this session until the next poll instead of
+	// turning a normal owner handoff into a phase error.
+	if teamstore.IsSQLiteSessionTranscriptDedupeSnapshotChanged(err) && parent != nil && parent.Err() == nil {
+		return true
+	}
 	return teamsBoundedJobBudgetDeferral(err, jobCtx, parent)
 }
 

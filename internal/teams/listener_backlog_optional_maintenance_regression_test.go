@@ -358,6 +358,25 @@ func TestTeamsLinkedTranscriptBudgetDeferralRequiresLiveParent(t *testing.T) {
 	if linkedTranscriptJobBudgetDeferral(context.Canceled, jobCtx, canceledParent) {
 		t.Fatal("owner/phase cancellation was incorrectly classified as an optional child deferral")
 	}
+
+	if !linkedTranscriptJobBudgetDeferral(teamstore.ErrSQLiteSessionTranscriptDedupeSnapshotChanged, context.Background(), parent) {
+		t.Fatal("concurrent SQLite transcript snapshot change was not classified as a retryable deferral")
+	}
+	if linkedTranscriptJobBudgetDeferral(teamstore.ErrSQLiteSessionTranscriptDedupeSnapshotChanged, context.Background(), canceledParent) {
+		t.Fatal("SQLite transcript snapshot change was classified as deferred after parent cancellation")
+	}
+}
+
+func TestTeamsLinkedTranscriptSQLiteSnapshotChangeIsSessionDeferred(t *testing.T) {
+	bridge := &Bridge{transcriptSyncWorkerCount: 1}
+	err := bridge.runLinkedTranscriptSyncJobs(context.Background(), []linkedTranscriptSyncJob{
+		{session: Session{ID: "sqlite-snapshot-race"}},
+	}, func(context.Context, Session, teamstore.ImportCheckpoint) (teamstore.State, error) {
+		return teamstore.State{}, teamstore.ErrSQLiteSessionTranscriptDedupeSnapshotChanged
+	})
+	if err == nil || !isLinkedTranscriptJobDeferred(err) {
+		t.Fatalf("SQLite snapshot race error = %v, want linked-transcript deferral", err)
+	}
 }
 
 func TestTeamsLinkedTranscriptBudgetTimeoutIsDeferredForMandatoryJob(t *testing.T) {

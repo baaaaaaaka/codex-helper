@@ -148,3 +148,9 @@ the implementation and test work.
   (93.978s / 358.943s / 808.747s), followed by focused control suppression and
   idempotence tests, `go vet ./...`, shell syntax, manifest validation, and
   `git diff --check`.  No live service command was run.
+- 2026-09-17: prerelease CI exposed a hosted race in the concurrent linked-
+  transcript handoff: a safe SQLite snapshot invalidation was returned as a
+  phase error after its bounded retries.  The reader remains fail-closed, while
+  that explicit session-local condition is now durably deferred for the next
+  poll; parent cancellation is still propagated.  The targeted race regression
+  passed locally.

@@ -21209,7 +21209,22 @@ func (s *Store) loadSQLiteSessionTranscriptDedupeStateWithDB(ctx context.Context
 	return state, nil
 }
 
-var errSQLiteSessionTranscriptDedupeSnapshotChanged = errors.New("sqlite session transcript dedupe snapshot changed during read")
+// ErrSQLiteSessionTranscriptDedupeSnapshotChanged means the reader crossed a
+// concurrent durable commit and therefore discarded its partial snapshot.
+// It is a retryable, session-local condition; callers must not treat the
+// rejected snapshot as dedupe evidence.
+var ErrSQLiteSessionTranscriptDedupeSnapshotChanged = errors.New("sqlite session transcript dedupe snapshot changed during read")
+
+var errSQLiteSessionTranscriptDedupeSnapshotChanged = ErrSQLiteSessionTranscriptDedupeSnapshotChanged
+
+// IsSQLiteSessionTranscriptDedupeSnapshotChanged identifies a safe retry
+// point for a session-scoped transcript reader.  The reader deliberately
+// rejects a snapshot that crosses a concurrent durable commit; callers may
+// defer that one session and retry it on a later poll, but must never consume
+// the partial snapshot as dedupe evidence.
+func IsSQLiteSessionTranscriptDedupeSnapshotChanged(err error) bool {
+	return errors.Is(err, ErrSQLiteSessionTranscriptDedupeSnapshotChanged)
+}
 
 // loadSQLiteSessionTranscriptDedupeState performs the SQLite branch of
 // SessionTranscriptDedupeSnapshot without retaining Store.mu during the
