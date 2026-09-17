@@ -635,6 +635,7 @@ echo 'ok'
             "TestTeamsMainLoopOutboxRotatesBeyondFirstTwoChats",
             "TestBridgeAttachmentUploadSession429RecordsWriteGateWithoutReplay",
             "TestBridgeFlushPendingOutboxSerializesConcurrentFlushes",
+            "TestCXPPerfModelSQLiteProfilesCoverUpgradeOperations",
         )
         for fixture_name in fixtures:
             fixture = f'"{fixture_name}"'

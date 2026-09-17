@@ -158,8 +158,14 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		"TestTeamsOwnershipStressPagedBacklogAfterServiceOutageCI":                    true,
 		"TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI":      true,
 		"TestCXPPerfModelSQLiteExternalScenariosCoverCommonPaths":                     true,
-		"TestCXPPerfModelProfilesCanSeedStoreAndPoll":                                 true,
-		"TestTeamsUnresolvedTranscriptOutboxDoesNotLivelockHealthyTail":               true,
+		// This matrix runs eight SQLite profiles across several upgrade
+		// operations, with parallel subtests. Under -race it can legitimately
+		// outlive a broad shard's timeout and monopolize the runner's disk.
+		// Keep the whole matrix in one clean, host-exclusive process so its
+		// observation is not distorted by unrelated shard I/O.
+		"TestCXPPerfModelSQLiteProfilesCoverUpgradeOperations":          true,
+		"TestCXPPerfModelProfilesCanSeedStoreAndPoll":                   true,
+		"TestTeamsUnresolvedTranscriptOutboxDoesNotLivelockHealthyTail": true,
 		// These targeted outbox sender fixtures perform bounded durable state
 		// transitions. A broad race shard can delay the SQLite claim/complete
 		// boundary until the test's finite retry window expires, so compile each
@@ -327,6 +333,7 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		// readiness assertion into a false failure.
 		"TestCXPPerfModelExternalScenariosCoverCommonPaths":       true,
 		"TestCXPPerfModelSQLiteExternalScenariosCoverCommonPaths": true,
+		"TestCXPPerfModelSQLiteProfilesCoverUpgradeOperations":    true,
 		// This asynchronous durable completion check must run without other
 		// package processes consuming the hosted runner's short observation window.
 		"TestBridgeMachineDelegationWorkerCancelsRunningExecution": true,
