@@ -13,6 +13,7 @@ RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 TEAMS_RUNTIME_SHARD = ROOT / "scripts" / "tests" / "run_teams_runtime_safety_shard.sh"
 OWNERSHIP_STRESS_TESTS = ROOT / "internal" / "teams" / "ownership_stress_ci_test.go"
 FULL_GO_TEST_SHARDS = ROOT / "scripts" / "ci" / "run_full_go_test_shards.go"
+LINUX_FULL_GO_TEST_COLLECT = ROOT / "scripts" / "ci" / "run_linux_full_go_test_collect.sh"
 
 
 def targeted_job() -> str:
@@ -479,10 +480,14 @@ class TargetedShardWorkflowTests(unittest.TestCase):
         full_start = workflow.index("  full-go-test:\n")
         full_end = workflow.index("  race-test:\n", full_start)
         full = workflow[full_start:full_end]
-        self.assertIn('tail -n +2 "$isolated_profile" >> coverage.out', full)
-        self.assertIn("migration_process_pattern='^TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup$'", full)
-        self.assertIn("-skip \"$isolated_skip_pattern\"", full)
-        self.assertIn('go test ./internal/cli -timeout=2m -parallel=16 -count=1 -run "$migration_process_pattern"', full)
+        collector = LINUX_FULL_GO_TEST_COLLECT.read_text(encoding="utf-8")
+        self.assertIn("bash scripts/ci/run_linux_full_go_test_collect.sh", full)
+        self.assertIn('tail -n +2 "$profile" >> "$coverage_file"', collector)
+        self.assertIn("migration_process_pattern='^TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup$'", collector)
+        self.assertIn("-skip \"$isolated_skip_pattern\"", collector)
+        self.assertIn('test ./internal/cli -timeout=2m -parallel=16 -count=1 -run "$migration_process_pattern"', collector)
+        self.assertIn('status=${PIPESTATUS[0]}', collector)
+        self.assertIn('failures+=("$label")', collector)
         self.assertIn("Upload full-suite diagnostics", full)
         self.assertNotIn("full-go-test-cli-retry", full)
         self.assertNotIn("isolated internal/cli retry", full)
@@ -526,6 +531,8 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             "TestTeamsListenFalseLinkedTranscriptFullPoolDoesNotStarveHealthyTail",
             "TestTeamsListenFalseStartupHeartbeatProtectsSlowInitialization",
             "TestTeamsListenFalseUntrustedSQLiteLeaseHoldsAndRecovers",
+            "TestSQLiteActiveJSONSessionSurvivesStaleSQLStatus",
+            "TestRuntimeProcessIdentityWindows",
         )
         for fixture_name in fixtures:
             fixture = f'"{fixture_name}"'
@@ -534,6 +541,72 @@ class TargetedShardWorkflowTests(unittest.TestCase):
                 2,
                 f"{fixture_name} must be both process-isolated and host-exclusive",
             )
+
+    def test_linux_coverage_runner_collects_all_suites_after_failure(self):
+        with tempfile.TemporaryDirectory(prefix="cxp-ci-linux-coverage-collect-") as temp_dir:
+            temp = pathlib.Path(temp_dir)
+            fake_go = temp / "fake-go"
+            calls = temp / "calls"
+            fail_once = temp / "fail-once"
+            fake_go.write_text(
+                """#!/usr/bin/env bash
+set -u
+profile=""
+for arg in "$@"; do
+  case "$arg" in
+    -coverprofile=*) profile="${arg#-coverprofile=}" ;;
+  esac
+done
+printf '%s\n' "$*" >> "$CXP_FAKE_GO_CALLS"
+if [[ -n "$profile" ]]; then
+  mkdir -p "$(dirname "$profile")"
+  printf 'mode: set\nfake.go:1.1,1.2 1 1\n' > "$profile"
+fi
+if [[ ! -e "$CXP_FAKE_GO_FAIL_ONCE" ]]; then
+  : > "$CXP_FAKE_GO_FAIL_ONCE"
+  echo 'fake go failure' >&2
+  exit 17
+fi
+echo 'ok'
+""",
+                encoding="utf-8",
+            )
+            fake_go.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "CXP_CI_GO_BIN": str(fake_go),
+                    "CXP_FAKE_GO_CALLS": str(calls),
+                    "CXP_FAKE_GO_FAIL_ONCE": str(fail_once),
+                    "RUNNER_TEMP": str(temp / "runner-temp"),
+                }
+            )
+            completed = subprocess.run(
+                ["bash", str(LINUX_FULL_GO_TEST_COLLECT)],
+                cwd=temp,
+                env=environment,
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertNotEqual(completed.returncode, 0, completed.stdout + completed.stderr)
+            invocations = calls.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(len(invocations), 6, invocations)
+            self.assertIn("./...", invocations[0])
+            self.assertIn("./internal/teams/store", invocations[-1])
+            for log_name in (
+                "full-go-test.log",
+                "frontier-recovery-isolated.log",
+                "migration-process-isolated.log",
+                "external-perf-isolated.log",
+                "teams-durable-isolated.log",
+                "store-durable-isolated.log",
+            ):
+                self.assertTrue((temp / "runner-temp" / log_name).is_file(), log_name)
+            coverage = (temp / "coverage.out").read_text(encoding="utf-8").splitlines()
+            self.assertEqual(coverage.count("mode: set"), 1)
+            self.assertEqual(len(coverage), 7)
+            self.assertIn("Isolated store durable", completed.stdout)
 
     def test_full_go_runner_isolates_sqlite_compatibility_window_fixtures(self):
         runner = FULL_GO_TEST_SHARDS.read_text(encoding="utf-8")

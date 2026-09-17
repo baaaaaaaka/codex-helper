@@ -63,6 +63,12 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		"TestProxyStartBackgroundReapsExitedDetachedChild":     true,
 		"TestStartCodexAppProxyDaemonReapsExitedDetachedChild": true,
 	},
+	"./internal/helperruntime": {
+		// This Windows-only test starts a copied executable and queries the
+		// resulting process tree. Keep the host observation out of the ordinary
+		// package job so process enumeration cannot inherit unrelated shard load.
+		"TestRuntimeProcessIdentityWindows": true,
+	},
 	"./internal/tui": {
 		// This test drives a real refresh ticker and has a short semantic
 		// context. Keep its scheduler observation independent from the large
@@ -202,6 +208,7 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		"TestSQLiteHotPollAdmissionDoesNotLetStaleOrdinaryHintStarveDueChat":             true,
 		"TestSQLiteHotPollAdmissionReconcilesDueOrdinaryBehindOperationalHintPrefix":     true,
 		"TestSQLiteHotPollWorkAdmissionRecoversStaleProjectionGeneration":                true,
+		"TestSQLiteActiveJSONSessionSurvivesStaleSQLStatus":                              true,
 		// These tests observe a bounded compatibility fallback or an explicit
 		// audit/heartbeat handoff. Keep their short wall-clock assertions away
 		// from broad race-shard I/O.
@@ -231,6 +238,9 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestRunAppGatewayDaemonRestartReusesStablePort":                        true,
 		"TestProxyStartBackgroundReapsExitedDetachedChild":                      true,
 		"TestStartCodexAppProxyDaemonReapsExitedDetachedChild":                  true,
+	},
+	"./internal/helperruntime": {
+		"TestRuntimeProcessIdentityWindows": true,
 	},
 	"./internal/tui": {
 		"TestSelectSessionAutoRefreshUpdatesThreadNameTitle": true,
@@ -331,6 +341,7 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestSQLiteOwnerMigrationRejectsSourceChangeBeforePointerPublication":                  true,
 		"TestSQLiteOwnerOutboxProjectionAuditClaimTokenFencesTakeoverOverlap":                  true,
 		"TestSQLiteFullAcceptedOutboxCASRecoversAfterCapacityReturns":                          true,
+		"TestSQLiteActiveJSONSessionSurvivesStaleSQLStatus":                                    true,
 		"TestEarlierUnsentOutboxKeepsSameTurnAmbiguousPredecessor":                             true,
 		"TestSQLiteStoreCloseReleasesStateLockForImmediateReopen":                              true,
 	},
@@ -787,6 +798,9 @@ func isolatedRunnableNamesForPackage(packageName string) map[string]bool {
 	if strings.HasSuffix(packageName, "/internal/cli") {
 		return isolatedRunnableNames["./internal/cli"]
 	}
+	if strings.HasSuffix(packageName, "/internal/helperruntime") {
+		return isolatedRunnableNames["./internal/helperruntime"]
+	}
 	if strings.HasSuffix(packageName, "/internal/teams/store") {
 		return isolatedRunnableNames["./internal/teams/store"]
 	}
@@ -884,6 +898,9 @@ func exclusiveRunnableNamesForPackage(packageName string) map[string]bool {
 	}
 	if strings.HasSuffix(packageName, "/internal/cli") {
 		return exclusiveRunnableNames["./internal/cli"]
+	}
+	if strings.HasSuffix(packageName, "/internal/helperruntime") {
+		return exclusiveRunnableNames["./internal/helperruntime"]
 	}
 	if strings.HasSuffix(packageName, "/internal/teams/store") {
 		return exclusiveRunnableNames["./internal/teams/store"]
