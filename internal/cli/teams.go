@@ -2146,6 +2146,17 @@ func recoverTeamsStore(ctx context.Context, path string, force bool, staleAfter 
 			err = closeErr
 		}
 	}()
+	// ReadOwner and RecoverIfOwnerSame are owner-scoped SQLite operations.  A
+	// migrated database can still be structurally unprepared after an upgrade
+	// or an interrupted migration, so repair the schema at the explicit offline
+	// boundary before the first owner read.  This is a no-op for JSON stores and
+	// remains fail-closed when a live owner or another preparation claim is
+	// present; in that case recovery reports the durable preparation blocker
+	// instead of entering a retry loop or mutating owner state through a lazy
+	// load.
+	if err := st.PrepareSQLiteSchemaBeforeOwner(ctx); err != nil {
+		return fmt.Errorf("prepare Teams SQLite schema before recovery: %w", err)
+	}
 	owner, ok, err := st.ReadOwner(ctx)
 	if err != nil {
 		return err
@@ -2942,6 +2953,15 @@ func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
 			_, _ = fmt.Fprintf(out, "- %s\n", formatTeamsRunningTurnStatus(turn, now))
 		}
 	}
+	if len(statusSummary.UnresolvedExecutions) > 0 {
+		_, _ = fmt.Fprintf(out, "Unresolved execution fences: %d (automatic retry disabled)\n", len(statusSummary.UnresolvedExecutions))
+		for _, execution := range statusSummary.UnresolvedExecutions {
+			_, _ = fmt.Fprintf(out, "- %s\n", formatTeamsUnresolvedExecutionStatus(execution))
+		}
+	}
+	if statusSummary.AmbiguousOutbox > 0 {
+		_, _ = fmt.Fprintf(out, "Ambiguous outbox: %d rows across %d chat(s) (exact Graph evidence required; no automatic replay)\n", statusSummary.AmbiguousOutbox, statusSummary.AmbiguousOutboxChats)
+	}
 	if len(owners) == 0 {
 		_, _ = fmt.Fprintln(out, "Owner: none")
 	} else {
@@ -3301,7 +3321,10 @@ type teamsStatusSummary struct {
 	StoppedScopes    int
 	DeadOwnerScopes  int
 
-	RunningTurns []teamsStatusRunningTurn
+	RunningTurns         []teamsStatusRunningTurn
+	UnresolvedExecutions []teamsStatusUnresolvedExecution
+	AmbiguousOutbox      int
+	AmbiguousOutboxChats int
 }
 
 type teamsStatusRunningTurn struct {
@@ -3316,6 +3339,23 @@ type teamsStatusRunningTurn struct {
 	StartedAt    time.Time
 	UpdatedAt    time.Time
 	ChildCommand string
+}
+
+// teamsStatusUnresolvedExecution is deliberately a metadata-only diagnostic.
+// It identifies the durable execution fence and its related chat, but never
+// includes the Teams/Codex message body. An unresolved execution must remain
+// fail-closed until an operator or a source-proofed recovery path establishes
+// exactly what happened to the old Codex process.
+type teamsStatusUnresolvedExecution struct {
+	StatePath    string
+	ScopeID      string
+	CheckpointID string
+	SessionID    string
+	TeamsChatID  string
+	TurnID       string
+	TurnStatus   string
+	Reason       string
+	Generation   int64
 }
 
 func teamsStatusOwner(state teamsstore.State, now time.Time) (teamsstore.OwnerMetadata, string) {
@@ -3345,6 +3385,7 @@ func teamsStatusRawOwner(state teamsstore.State) (teamsstore.OwnerMetadata, bool
 func buildTeamsStatusSummary(stores []teamsStatusStoreSnapshot, controlChatID string, defaultStatePath string, now time.Time) teamsStatusSummary {
 	var summary teamsStatusSummary
 	activeCatchupPolls := make(map[string]bool)
+	ambiguousOutboxChats := make(map[string]bool)
 	totalContinuations := 0
 	for _, snapshot := range stores {
 		switch snapshot.OwnerKind {
@@ -3415,6 +3456,50 @@ func buildTeamsStatusSummary(stores []teamsStatusStoreSnapshot, controlChatID st
 			}
 			summary.RunningTurns = append(summary.RunningTurns, teamsStatusRunningTurnFromState(snapshot, turn))
 		}
+		for checkpointID, checkpoint := range snapshot.State.ImportCheckpoints {
+			anchor := checkpoint.UnresolvedExecution
+			if anchor == nil || strings.EqualFold(strings.TrimSpace(anchor.State), "resolved") {
+				continue
+			}
+			sessionID := firstNonEmptyCLI(anchor.SessionID, checkpoint.SessionID)
+			turnID := strings.TrimSpace(anchor.OuterTurnID)
+			turnStatus := "unknown"
+			turnRecoveryReason := ""
+			if turnID != "" {
+				if turn, ok := snapshot.State.Turns[turnID]; ok {
+					if sessionID == "" {
+						sessionID = strings.TrimSpace(turn.SessionID)
+					}
+					turnStatus = firstNonEmptyCLI(string(turn.Status), "unknown")
+					turnRecoveryReason = strings.TrimSpace(turn.RecoveryReason)
+				}
+			}
+			chatID := ""
+			if session := snapshot.State.Sessions[sessionID]; session.ID != "" {
+				chatID = strings.TrimSpace(session.TeamsChatID)
+			}
+			reason := firstNonEmptyCLI(anchor.Reason, turnRecoveryReason, "execution ownership unresolved")
+			summary.UnresolvedExecutions = append(summary.UnresolvedExecutions, teamsStatusUnresolvedExecution{
+				StatePath:    snapshot.Path,
+				ScopeID:      firstNonEmptyCLI(snapshot.State.Scope.ID, snapshot.Owner.ScopeID),
+				CheckpointID: strings.TrimSpace(firstNonEmptyCLI(checkpoint.ID, checkpointID)),
+				SessionID:    sessionID,
+				TeamsChatID:  chatID,
+				TurnID:       turnID,
+				TurnStatus:   turnStatus,
+				Reason:       reason,
+				Generation:   anchor.Generation,
+			})
+		}
+		for _, msg := range snapshot.State.OutboxMessages {
+			if !teamsstore.OutboxSendIsAmbiguous(msg) {
+				continue
+			}
+			summary.AmbiguousOutbox++
+			if chatID := strings.TrimSpace(msg.TeamsChatID); chatID != "" {
+				ambiguousOutboxChats[chatID] = true
+			}
+		}
 	}
 	summary.BacklogContinuations = totalContinuations - len(activeCatchupPolls)
 	if summary.BacklogContinuations < 0 {
@@ -3427,6 +3512,18 @@ func buildTeamsStatusSummary(stores []teamsStatusStoreSnapshot, controlChatID st
 			return left.After(right)
 		}
 		return summary.RunningTurns[i].TurnID < summary.RunningTurns[j].TurnID
+	})
+	summary.AmbiguousOutboxChats = len(ambiguousOutboxChats)
+	sort.Slice(summary.UnresolvedExecutions, func(i, j int) bool {
+		left := summary.UnresolvedExecutions[i]
+		right := summary.UnresolvedExecutions[j]
+		if left.StatePath != right.StatePath {
+			return left.StatePath < right.StatePath
+		}
+		if left.SessionID != right.SessionID {
+			return left.SessionID < right.SessionID
+		}
+		return left.CheckpointID < right.CheckpointID
 	})
 	return summary
 }
@@ -3630,6 +3727,39 @@ func formatTeamsRunningTurnStatus(turn teamsStatusRunningTurn, now time.Time) st
 		parts = append(parts, "child_command="+strconvQuoteCLI(turn.ChildCommand))
 	}
 	return strings.Join(parts, " ")
+}
+
+func formatTeamsUnresolvedExecutionStatus(execution teamsStatusUnresolvedExecution) string {
+	parts := []string{
+		"checkpoint=" + firstNonEmptyCLI(execution.CheckpointID, "unknown"),
+		"session=" + firstNonEmptyCLI(execution.SessionID, "unknown"),
+		"turn=" + firstNonEmptyCLI(execution.TurnID, "unknown"),
+		"turn_status=" + firstNonEmptyCLI(execution.TurnStatus, "unknown"),
+	}
+	if execution.TeamsChatID != "" {
+		parts = append(parts, "chat="+execution.TeamsChatID)
+	}
+	if execution.ScopeID != "" {
+		parts = append(parts, "scope="+execution.ScopeID)
+	}
+	if execution.Generation > 0 {
+		parts = append(parts, fmt.Sprintf("generation=%d", execution.Generation))
+	}
+	parts = append(parts, "reason="+strconvQuoteCLI(teamsStatusDiagnosticText(execution.Reason)))
+	return strings.Join(parts, " ")
+}
+
+func teamsStatusDiagnosticText(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "unknown"
+	}
+	const maxDiagnosticRunes = 240
+	runes := []rune(value)
+	if len(runes) > maxDiagnosticRunes {
+		return string(runes[:maxDiagnosticRunes]) + "..."
+	}
+	return value
 }
 
 func firstNonZeroCLITime(values ...time.Time) time.Time {

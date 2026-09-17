@@ -507,7 +507,7 @@ func teamsServiceConfigAlreadyMatchesForQuietUpgrade(ctx context.Context, regist
 	if _, err := wslBackend.writeTaskConfig(buildTeamsServiceWSLArguments(spec)); err != nil {
 		return false, err
 	}
-	_ = wslBackend.RemoveStartupFallbackMarker()
+	_ = wslBackend.removeStartupFallbackMarker(ctx)
 	return true, nil
 }
 
@@ -537,7 +537,7 @@ func recoverWSLTeamsServiceRefreshAccessDenied(ctx context.Context, registryPath
 	if userErr != nil {
 		elevatedReason = "Could not identify the current Windows user for UAC setup: " + teamsServiceBootstrapErrorSummary(userErr)
 	} else if _, elevatedErr := wslBackend.RepairElevated(ctx, spec, teamsServiceRepairOptions{Enable: true, Start: false}, principalUser); elevatedErr == nil {
-		_ = wslBackend.RemoveStartupFallbackMarker()
+		_ = wslBackend.removeStartupFallbackMarker(ctx)
 		return teamsUpgradeServiceRefreshResult{}, nil
 	} else {
 		elevatedReason = "UAC Scheduled Task setup failed: " + teamsServiceBootstrapErrorSummary(elevatedErr)

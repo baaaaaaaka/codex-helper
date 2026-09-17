@@ -13139,7 +13139,7 @@ func (b *Bridge) createSession(ctx context.Context, msg ChatMessage, request str
 	if duplicate, err := b.controlCommandAlreadyHandled(ctx, msg, "teams_control_new"); err != nil {
 		return err
 	} else if duplicate {
-		return b.sendControl(ctx, "I already handled this `new` request. Send `st` to see current Work chats, or send a fresh `new <directory>` message to create another one.")
+		return b.sendControlNewDuplicateNotice(ctx, msg)
 	}
 	parsed, err := b.parseNewSessionRequest(ctx, request)
 	if err != nil {
@@ -19044,6 +19044,14 @@ func (b *Bridge) queueAndBestEffortQueuedTurnStartNotice(ctx context.Context, se
 	if b == nil || b.store == nil || session == nil || strings.TrimSpace(session.ChatID) == "" {
 		return nil
 	}
+	// A control-fallback turn is already acknowledged by the durable control
+	// request path.  Its queued-start line is only an intermediate status and
+	// can accumulate indefinitely when the control chat is being drained.  Do
+	// not create that low-value row at all; terminal control replies and all
+	// work-chat output use separate kinds and remain deliverable.
+	if isControlFallbackSessionID(session.ID) {
+		return nil
+	}
 	if b.suppressIntermediateWorkChatOutbox(session.ChatID) {
 		return nil
 	}
@@ -20529,6 +20537,62 @@ func (b *Bridge) clearOwnerIfSame(ctx context.Context) {
 
 func (b *Bridge) sendControl(ctx context.Context, text string) error {
 	return b.sendToChat(ctx, b.reg.ControlChatID, text)
+}
+
+// sendControlNewDuplicateNotice is keyed by the original Teams message ID.
+// A replayed /new command must remain observable, but it must not create a new
+// outbox row on every poll/recovery pass.  The generic direct-control helper
+// intentionally uses a fresh ID for each call because most of its callers are
+// distinct notifications; using it here turned an idempotent duplicate check
+// into an unbounded control-chat notification stream.
+func (b *Bridge) sendControlNewDuplicateNotice(ctx context.Context, msg ChatMessage) error {
+	if b == nil {
+		return fmt.Errorf("Teams bridge is not configured")
+	}
+	messageID := strings.TrimSpace(msg.ID)
+	if messageID == "" {
+		return fmt.Errorf("cannot send duplicate /new notice without a durable Teams message id")
+	}
+	chatID := strings.TrimSpace(b.reg.ControlChatID)
+	if chatID == "" {
+		return nil
+	}
+	text := "I already handled this `new` request. Send `st` to see current Work chats, or send a fresh `new <directory>` message to create another one."
+	chunks := PlanTeamsHTMLChunks(TeamsRenderInput{
+		Surface: TeamsRenderSurfaceOutbox,
+		Kind:    TeamsRenderHelper,
+		Text:    text,
+	}, TeamsRenderOptions{
+		HardLimitBytes:   safeTeamsHTMLContentBytes,
+		TargetLimitBytes: teamsChunkHTMLContentBytes,
+	})
+	queueOnly := teamsPollQueueOnly(ctx)
+	for i, chunk := range chunks {
+		kind := "helper-duplicate-new"
+		if len(chunks) > 1 {
+			kind = fmt.Sprintf("helper-duplicate-new-%03d", i+1)
+		}
+		outbox := teamstore.OutboxMessage{
+			ID:            "outbox:control:duplicate-new:" + shortStableID(strings.Join([]string{b.scope.ID, chatID, messageID, kind}, "\x00")),
+			TeamsChatID:   chatID,
+			Kind:          kind,
+			Body:          chunk.Text,
+			PartIndex:     chunk.PartIndex,
+			PartCount:     chunk.PartCount,
+			RenderedBytes: chunk.ByteLength,
+		}
+		queued, err := b.queueOutbox(ctx, outbox)
+		if err != nil {
+			return err
+		}
+		if queued.Status == teamstore.OutboxStatusSent || queueOnly {
+			continue
+		}
+	}
+	if queueOnly {
+		return nil
+	}
+	return b.flushPendingOutboxForChat(ctx, chatID)
 }
 
 func (b *Bridge) sendDeferredUpgradeNotice(ctx context.Context, chatID string, inbound teamstore.InboundEvent) error {
@@ -23197,6 +23261,17 @@ func isTranscriptAnswerOutbox(msg teamstore.OutboxMessage) bool {
 		strings.EqualFold(strings.TrimSpace(msg.NotificationKind), "turn_completed")
 }
 
+func isObsoleteControlFallbackQueuedStatus(b *Bridge, msg teamstore.OutboxMessage) bool {
+	if b == nil || msg.Status != teamstore.OutboxStatusQueued {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(msg.Kind), "queued-status") || !isControlFallbackSessionID(msg.SessionID) {
+		return false
+	}
+	controlChatID := strings.TrimSpace(b.reg.ControlChatID)
+	return controlChatID != "" && strings.TrimSpace(msg.TeamsChatID) == controlChatID
+}
+
 func (b *Bridge) flushPendingOutboxFilteredWithOptions(ctx context.Context, sessionID string, turnID string, chatID string, opts outboxFlushOptions) error {
 	// Queue-only poll handlers may call a legacy helper that still asks for an
 	// outbox flush (for example a duplicate inbound or a helper-file command).
@@ -23270,6 +23345,31 @@ func (b *Bridge) flushPendingOutboxFilteredWithOptions(ctx context.Context, sess
 				if opts.MaxBytes > 0 && sent > 0 && sentBytes+len(msg.Body) > opts.MaxBytes {
 					budgetExhausted = true
 					break
+				}
+				if isObsoleteControlFallbackQueuedStatus(b, msg) {
+					// This row is a non-terminal progress notice from the ephemeral
+					// control-fallback session.  It has no useful delivery contract,
+					// and a stopped/restarted service may otherwise replay a historical
+					// status backlog before reaching real control or work output.  Only
+					// a still-Queued row is eligible here; Sending/Accepted rows retain
+					// the normal unknown-POST protection and are never rewritten.
+					skipCtx, cancelSkip := b.pollAttemptDurableContext(ctx)
+					_, _, skipErr := b.markOutboxSkippedIfQueuedForCurrentOwner(skipCtx, msg.ID, "obsolete control-fallback queued status")
+					cancelSkip()
+					if teamstore.IsProcessWideStateError(skipErr) {
+						return skipErr
+					}
+					if skipErr != nil {
+						if firstErr == nil && !errors.Is(skipErr, context.Canceled) && !errors.Is(skipErr, context.DeadlineExceeded) {
+							firstErr = skipErr
+						}
+						continue
+					}
+					// Whether this call won the CAS or another sender changed the
+					// row first, the snapshot is no longer ours to send.  Re-read on
+					// the next bounded page/cycle instead of issuing a POST from a
+					// stale queued snapshot.
+					continue
 				}
 				if opts.SkipUnresolvedTranscript && isTranscriptAnswerOutbox(msg) {
 					if anchorCache == nil {

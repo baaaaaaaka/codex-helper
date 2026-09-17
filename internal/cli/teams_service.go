@@ -2320,7 +2320,7 @@ func (b teamsServiceWSLWindowsTaskBackend) VerifyAndCleanAfterRepair(ctx context
 	if err := b.RetireLegacyScheduledTasks(ctx); err != nil {
 		return fmt.Errorf("Windows Scheduled Task setup completed, but old WSL Scheduled Tasks could not be disabled: %w", err)
 	}
-	if cleanupErr := b.RemoveStartupFallbackMarker(); cleanupErr != nil {
+	if cleanupErr := b.removeStartupFallbackMarker(ctx); cleanupErr != nil {
 		return fmt.Errorf("Windows Scheduled Task setup completed, but old Startup watchdog cleanup failed: %w", cleanupErr)
 	}
 	return nil
@@ -2519,7 +2519,16 @@ func (b teamsServiceWSLWindowsTaskBackend) restartStartupFallback(ctx context.Co
 	return appendLaunchctlOutput(stopData, startData), err
 }
 
+// RemoveStartupFallbackMarker is the legacy context-free entry point used by
+// upgrade cleanup paths that do not have a caller deadline.
 func (b teamsServiceWSLWindowsTaskBackend) RemoveStartupFallbackMarker() error {
+	return b.removeStartupFallbackMarker(context.Background())
+}
+
+func (b teamsServiceWSLWindowsTaskBackend) removeStartupFallbackMarker(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	markerPaths, err := b.startupFallbackMarkerPathsForCurrentTaskPrefix()
 	if err != nil {
 		return err
@@ -2542,7 +2551,7 @@ func (b teamsServiceWSLWindowsTaskBackend) RemoveStartupFallbackMarker() error {
 		}
 		installedMarkers = append(installedMarkers, markerPath)
 	}
-	if _, err = teamsServiceRunPowerShell(context.Background(), buildTeamsServiceWSLRemoveStartupFallbackCommand(b.Name(), suffixes)); err != nil {
+	if _, err = teamsServiceRunPowerShell(ctx, buildTeamsServiceWSLRemoveStartupFallbackCommand(b.Name(), suffixes)); err != nil {
 		return err
 	}
 	for _, markerPath := range installedMarkers {
@@ -2565,10 +2574,16 @@ func (b teamsServiceWSLWindowsTaskBackend) Uninstall(ctx context.Context) (strin
 	if _, err := teamsServiceRunPowerShell(ctx, cmd); err != nil {
 		return "", err
 	}
+	// Keep the task config when fallback cleanup fails so the operator can
+	// retry a complete uninstall. Silently ignoring this error leaves a second
+	// Windows Startup writer behind and can repeatedly fence the active owner
+	// generation.
+	if err := b.removeStartupFallbackMarker(ctx); err != nil {
+		return "", fmt.Errorf("remove WSL Startup fallback during uninstall: %w", err)
+	}
 	if err := os.Remove(configPath); err != nil && !os.IsNotExist(err) {
 		return "", err
 	}
-	_ = b.RemoveStartupFallbackMarker()
 	return configPath, nil
 }
 

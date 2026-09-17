@@ -1247,8 +1247,9 @@ func TestTeamsServiceLocalSupervisorWSLStartRetiresScheduledTasks(t *testing.T) 
 	if _, err := (teamsServiceLocalSupervisorBackend{}).Run(context.Background(), "start"); err != nil {
 		t.Fatalf("start local supervisor: %v", err)
 	}
-	if len(events) < 2 || !strings.Contains(events[0], "Disable-ScheduledTask") || events[1] != "start-local" {
-		t.Fatalf("events = %#v, want WSL Scheduled Task retire before local start", events)
+	if len(events) < 3 || !strings.Contains(events[0], "Disable-ScheduledTask") ||
+		!strings.Contains(events[1], "Remove-Item") || events[2] != "start-local" {
+		t.Fatalf("events = %#v, want WSL Scheduled Task and Startup fallback retirement before local start", events)
 	}
 }
 

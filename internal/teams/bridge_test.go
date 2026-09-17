@@ -19427,6 +19427,92 @@ func TestBridgeGroupWorkChatSuppressesQueuedStartStatus(t *testing.T) {
 	}
 }
 
+func TestBridgeControlFallbackSuppressesQueuedStartStatus(t *testing.T) {
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := &Session{ID: controlFallbackSessionID, ChatID: bridge.reg.ControlChatID, Status: "active"}
+
+	if err := bridge.queueAndBestEffortQueuedTurnStartNotice(context.Background(), session, teamstore.Turn{
+		ID:        "turn:control-fallback-queued-status",
+		SessionID: session.ID,
+		Status:    teamstore.TurnStatusRunning,
+	}); err != nil {
+		t.Fatalf("queueAndBestEffortQueuedTurnStartNotice error: %v", err)
+	}
+	pending, err := store.PendingOutbox(context.Background())
+	if err != nil {
+		t.Fatalf("PendingOutbox error: %v", err)
+	}
+	if len(pending) != 0 {
+		t.Fatalf("control fallback queued-start status rows = %#v, want none", pending)
+	}
+}
+
+func TestBridgeFlushSkipsOnlyObsoleteControlFallbackQueuedStatus(t *testing.T) {
+	graph, sent := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	ctx := context.Background()
+
+	for _, msg := range []teamstore.OutboxMessage{
+		{
+			ID:          "outbox:obsolete-control-queued-status",
+			SessionID:   controlFallbackSessionID,
+			TeamsChatID: bridge.reg.ControlChatID,
+			Kind:        "queued-status",
+			Body:        "obsolete control fallback status",
+		},
+		{
+			ID:          "outbox:ordinary-control-reply",
+			SessionID:   controlFallbackSessionID,
+			TeamsChatID: bridge.reg.ControlChatID,
+			Kind:        "helper",
+			Body:        "ordinary control reply",
+		},
+		{
+			ID:          "outbox:work-final",
+			SessionID:   "s001",
+			TeamsChatID: "chat-1",
+			Kind:        "final",
+			Body:        "normal work-chat answer",
+		},
+	} {
+		if _, _, err := store.QueueOutbox(ctx, msg); err != nil {
+			t.Fatalf("QueueOutbox %s error: %v", msg.ID, err)
+		}
+	}
+
+	if err := bridge.flushPendingOutbox(ctx, "", ""); err != nil && !isOutboxDeliveryDeferred(err) {
+		t.Fatalf("flushPendingOutbox error: %v", err)
+	}
+	if err := bridge.flushPendingOutbox(ctx, "", ""); err != nil && !isOutboxDeliveryDeferred(err) {
+		t.Fatalf("idempotent flushPendingOutbox error: %v", err)
+	}
+
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load error: %v", err)
+	}
+	obsolete := state.OutboxMessages["outbox:obsolete-control-queued-status"]
+	if obsolete.Status != teamstore.OutboxStatusSkipped || !strings.Contains(obsolete.LastSendError, "obsolete control-fallback queued status") {
+		t.Fatalf("obsolete control status = %#v, want skipped with auditable reason", obsolete)
+	}
+	for _, id := range []string{"outbox:ordinary-control-reply", "outbox:work-final"} {
+		if got := state.OutboxMessages[id].Status; got != teamstore.OutboxStatusSent {
+			t.Fatalf("outbox %s status = %q, want sent", id, got)
+		}
+	}
+	if len(*sent) != 2 {
+		t.Fatalf("Graph sends = %#v, want ordinary control reply plus work output", *sent)
+	}
+	for _, message := range *sent {
+		if strings.Contains(PlainTextFromTeamsHTML(message.Content), "obsolete control fallback status") {
+			t.Fatalf("obsolete control status was sent: %#v", message)
+		}
+	}
+}
+
 func TestBridgeGroupWorkChatQuotedAckFallsBackToPlainAck(t *testing.T) {
 	msg := bridgePollMessage("group-codex-fallback", "2026-04-30T01:05:00Z", "@codex debug this failure")
 	graph, sent := newBridgeGroupGuardGraph(t, bridgeGroupGuardGraphOptions{
@@ -22812,8 +22898,17 @@ func TestBridgeControlNewDuplicateMessageDoesNotCreateSecondChat(t *testing.T) {
 	if err := bridge.handleControlMessage(context.Background(), msg, text); err != nil {
 		t.Fatalf("first new error: %v", err)
 	}
-	if err := bridge.handleControlMessage(context.Background(), msg, text); err != nil {
-		t.Fatalf("duplicate new error: %v", err)
+	for i := 0; i < 2; i++ {
+		if err := bridge.handleControlMessage(context.Background(), msg, text); err != nil {
+			t.Fatalf("duplicate new attempt %d error: %v", i+1, err)
+		}
+	}
+	// Recreate the Bridge around the same durable store to cover the actual
+	// restart boundary; the stable notice key must survive process-local state.
+	restarted := newBridgeTestBridge(bridge.graph, store, &recordingExecutor{})
+	restarted.reg.Sessions = nil
+	if err := restarted.handleControlMessage(context.Background(), msg, text); err != nil {
+		t.Fatalf("duplicate new attempt after bridge restart error: %v", err)
 	}
 	if created != 1 {
 		t.Fatalf("created chats = %d, want 1", created)
@@ -22827,6 +22922,28 @@ func TestBridgeControlNewDuplicateMessageDoesNotCreateSecondChat(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(plain, "\n---\n"), "already handled this new request") {
 		t.Fatalf("duplicate response did not explain idempotency:\n%s", strings.Join(plain, "\n---\n"))
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load duplicate state: %v", err)
+	}
+	duplicateRows := 0
+	for _, outbox := range state.OutboxMessages {
+		if outbox.TeamsChatID == bridge.reg.ControlChatID && strings.Contains(outbox.Body, "already handled this") {
+			duplicateRows++
+		}
+	}
+	if duplicateRows != 1 {
+		t.Fatalf("duplicate notice outbox rows = %d, want exactly one: %#v", duplicateRows, state.OutboxMessages)
+	}
+	duplicateSends := 0
+	for _, message := range sent {
+		if strings.Contains(PlainTextFromTeamsHTML(message.Content), "already handled this new request") {
+			duplicateSends++
+		}
+	}
+	if duplicateSends != 1 {
+		t.Fatalf("duplicate notice Graph sends = %d, want exactly one: %#v", duplicateSends, sent)
 	}
 }
 

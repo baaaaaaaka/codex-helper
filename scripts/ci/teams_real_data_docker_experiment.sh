@@ -214,10 +214,13 @@ write_source_core_manifest() {
 		fi
 	done
 	# SQLite .backup calls below take a transaction-consistent snapshot. Include
-	# the source -wal/-shm bytes in the pre/post manifest even though they are not
+	# the source -wal bytes in the pre/post manifest even though they are not
 	# copied or mounted into the container: a WAL-only commit or checkpoint must
 	# invalidate this cross-file snapshot attempt rather than look unchanged just
-	# because the main database file did not move. Session files are
+	# because the main database file did not move. Do not include -shm here. It is
+	# an ephemeral reader index that SQLite may create while this read-only
+	# snapshot is assembled; it contains no durable database content, and treating
+	# its creation as source drift rejects an otherwise stable fixture. Session files are
 	# immutable/atomically replaced by the Codex writer. The
 	# manifest records path, inode, size, mtime, and ctime so an append, replace,
 	# or same-size rewrite with restored mtime during the copy is rejected
@@ -228,7 +231,10 @@ write_source_core_manifest() {
 	for input in "${source_core_inputs[@]}"; do
 		case "$input" in
 			*.sqlite)
-				for suffix in -wal -shm; do
+				# Only the WAL carries committed content outside the main file.
+				# SQLite may create/rebuild -shm as a side effect of opening a WAL
+				# database for read-only backup, so it is deliberately excluded.
+				for suffix in -wal; do
 					sidecar="$input$suffix"
 					if [[ -L "$sidecar" ]]; then
 						echo "refusing symlink SQLite sidecar: $sidecar" >&2
@@ -492,7 +498,12 @@ outbox_needed(path, projected_size, required_start) AS (
 	  AND json_extract(json, '$.transcript_source_path') IS NOT NULL
 ),
 needed(path, projected_size, required_start) AS (
-	SELECT path, projected_size, 0
+	SELECT path, projected_size,
+	       CASE
+	       WHEN json_type(object, '$.offset') IN ('integer', 'real')
+	       THEN max(0, CAST(json_extract(object, '$.offset') AS INTEGER) - 8192)
+	       ELSE 0
+	       END
 	FROM refs
 	UNION ALL
 	SELECT path, projected_size, required_start
@@ -825,7 +836,7 @@ assemble_fixture_snapshot() {
 	if ! cmp -s "$source_core_manifest_before" "$source_core_manifest_after"; then
 		echo "source inputs changed while the point-in-time fixture was being assembled; this attempt is not cross-file stable" >&2
 		diff -u "$source_core_manifest_before" "$source_core_manifest_after" >&2 || true
-		echo "SQLite .backup snapshots include committed WAL content; source SQLite -wal/-shm drift invalidated this cross-file snapshot attempt" >&2
+		echo "SQLite .backup snapshots include committed WAL content; source SQLite/main or -wal drift invalidated this cross-file snapshot attempt" >&2
 		# Return a distinct status so the caller can retry. A candidate whose
 		# source manifest moved is never silently treated as a validated fixture.
 		return 2

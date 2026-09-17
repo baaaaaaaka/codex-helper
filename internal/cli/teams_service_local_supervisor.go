@@ -206,6 +206,13 @@ func (b teamsServiceLocalSupervisorBackend) Uninstall(ctx context.Context) (stri
 	if _, err := b.Run(ctx, "stop"); err != nil {
 		return "", err
 	}
+	// The local supervisor is the authoritative backend once its config is
+	// selected. Retire every older launcher before removing that config; a
+	// leftover WSL Startup fallback (or systemd unit) could otherwise become the
+	// next writer after uninstall and contend for the Teams control lease.
+	if err := retireTeamsServiceConflictingBackendsForLocalSupervisor(ctx, teamsServiceSpec{}); err != nil {
+		return "", fmt.Errorf("retire conflicting Teams service backend before local-supervisor uninstall: %w", err)
+	}
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return "", err
 	}
@@ -1212,8 +1219,17 @@ func teamsServiceLocalSupervisorChildSpecForStatus(status teamsServiceLocalSuper
 
 func retireTeamsServiceConflictingBackendsForLocalSupervisor(ctx context.Context, _ teamsServiceSpec) error {
 	if teamsServiceGOOS() == "linux" && teamsServiceIsWSL() {
-		if err := (teamsServiceWSLWindowsTaskBackend{}).RetireScheduledTasks(ctx); err != nil {
+		backend := teamsServiceWSLWindowsTaskBackend{}
+		if err := backend.RetireScheduledTasks(ctx); err != nil {
 			return fmt.Errorf("disable old WSL Scheduled Tasks before local-supervisor start: %w", err)
+		}
+		// Scheduled Tasks and the Startup watchdog are independent launch
+		// mechanisms. Retiring only the former leaves two possible Teams
+		// writers, which caused repeated owner-generation fencing in the live
+		// service. RemoveStartupFallbackMarker is fail-closed: if Windows
+		// cleanup cannot be confirmed, do not start a new local supervisor.
+		if err := backend.removeStartupFallbackMarker(ctx); err != nil {
+			return fmt.Errorf("remove old WSL Startup fallback before local-supervisor start: %w", err)
 		}
 		return nil
 	}
