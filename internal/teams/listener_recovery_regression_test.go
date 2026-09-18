@@ -1020,6 +1020,24 @@ func listenerRecoverySeedDuePoll(t *testing.T, store *teamstore.Store, chatID st
 	}
 }
 
+func listenerRecoverySeedQuietPoll(t *testing.T, store *teamstore.Store, chatID string, now time.Time) {
+	t.Helper()
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	if _, err := store.RecordChatPollSuccess(context.Background(), chatID, now, true, false, 0); err != nil {
+		t.Fatalf("seed %s quiet poll cursor: %v", chatID, err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         chatID,
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(time.Hour),
+		LastActivityAt: now,
+	}); err != nil {
+		t.Fatalf("seed %s quiet poll schedule: %v", chatID, err)
+	}
+}
+
 func waitListenerRecovery(t *testing.T, waitFor func() bool, timeout time.Duration, description string) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -3108,6 +3126,7 @@ func TestTeamsListenFalseHistoryWatchSlowHeadDoesNotStarveHealthyTail(t *testing
 	// Keep the first listener cycle out of the five-minute reconciliation path;
 	// this test is about changed-path fairness, not project discovery.
 	bridge.lastHistoryWatchReconcile = time.Now().UTC()
+	listenerRecoverySeedQuietPoll(t, store, "chat-1", time.Now().UTC())
 	listenerRecoverySeedDuePoll(t, store, bridge.reg.ControlChatID, time.Now().UTC().Add(-time.Minute))
 
 	listener := startListenerRecovery(t, bridge, listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), bridge.executor))
@@ -3194,6 +3213,7 @@ func TestTeamsListenFalseHistoryWatchFullPoolDoesNotStarveHealthyTail(t *testing
 		return ctx.Err()
 	}
 	bridge.lastHistoryWatchReconcile = time.Now().UTC()
+	listenerRecoverySeedQuietPoll(t, store, "chat-1", time.Now().UTC())
 	listenerRecoverySeedDuePoll(t, store, bridge.reg.ControlChatID, time.Now().UTC().Add(-time.Minute))
 	// History-watch fairness is independent of the startup migration path. Start
 	// from SQLite so the owner heartbeat and the four cooperative workers only
