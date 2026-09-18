@@ -5379,6 +5379,7 @@ func listenerRecoveryHistoryCheckpoint(path string, sessionID string, threadID s
 		ModTime:           info.ModTime(),
 		SourceGeneration:  historyTieredSourceIdentity(path, info),
 		SourceFingerprint: transcriptCheckpointSourceFingerprint(path, offset),
+		SourceChangeTime:  teamstore.SourceFileChangeTime(path, info),
 		Offset:            offset,
 		Line:              1,
 		SessionID:         sessionID,
