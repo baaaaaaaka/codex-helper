@@ -776,12 +776,12 @@ func TestRecordOwnerHeartbeatUsesDedicatedRuntimeConnectionDuringForegroundRead(
 
 // A foreground write transaction can legitimately hold SQLite's single-writer
 // slot while a poll worker is finishing durable admission.  The independent
-// liveness handle must not enter BEGIN IMMEDIATE and remain inside the driver
-// until that writer happens to release the slot: doing so also holds
-// sqliteRuntimeMu and makes every poll worker wait behind the heartbeat.  The
-// runtime handle uses a deferred transaction plus a short busy timeout, so the
-// heartbeat returns a retryable busy result and the bridge's existing complete
-// transaction retry can make progress after the writer yields.
+// liveness handle must not remain inside BEGIN IMMEDIATE for the full default
+// SQLite busy period: doing so also holds sqliteRuntimeMu and makes every poll
+// worker wait behind the heartbeat.  The runtime handle uses a short busy
+// timeout, so the heartbeat returns a retryable busy result and the bridge's
+// existing complete transaction retry can make progress after the writer
+// yields.
 func TestRecordOwnerHeartbeatDoesNotHangBehindForegroundWriter(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)

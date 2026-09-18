@@ -7255,7 +7255,7 @@ func openExistingSQLiteRuntimeStore(path string) (*sql.DB, error) {
 	if err := validateExistingSQLiteStorePath(path); err != nil {
 		return nil, err
 	}
-	db, err := openSQLiteHandleWithTxLock(path, false, "deferred")
+	db, err := openSQLiteHandle(path, false)
 	if err != nil {
 		return nil, err
 	}
@@ -7374,12 +7374,11 @@ func openSQLiteHandle(path string, create bool) (*sql.DB, error) {
 }
 
 // openSQLiteHandleWithTxLock opens a single-connection SQLite handle with an
-// explicit transaction mode.  Ordinary foreground transactions use IMMEDIATE
-// so a read-then-write callback cannot lose its snapshot before the write.
-// Liveness has a separate handle and retries its complete short transaction on
-// SQLITE_BUSY/SNAPSHOT, so it deliberately uses DEFERRED: BEGIN must not wait
-// for a foreground writer while the owner heartbeat is trying to prove
-// liveness.
+// explicit transaction mode.  Ordinary foreground and liveness transactions
+// use IMMEDIATE so a read-then-write callback cannot lose its snapshot before
+// the write.  The liveness handle has its own short busy timeout and retries
+// its complete transaction on SQLITE_BUSY/SNAPSHOT, so a competing writer is
+// reported as a bounded retry instead of an unbounded driver wait.
 func openSQLiteHandleWithTxLock(path string, create bool, txLock string) (*sql.DB, error) {
 	query := url.Values{}
 	if create {
