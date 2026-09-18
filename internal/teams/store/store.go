@@ -22064,7 +22064,10 @@ func SourceFileIdentityFromFileInfo(path string, info os.FileInfo) (string, erro
 // A zero result means that this platform/filesystem does not expose a usable
 // change time and callers must retain their existing conservative proof.
 func SourceFileChangeTimeFromFileInfo(info os.FileInfo) int64 {
-	return fileInfoChangeTimeUnixNano(info)
+	if changeTime := fileInfoChangeTimeUnixNano(info); changeTime != 0 {
+		return changeTime
+	}
+	return sourceFileChangeTimeFromFileInfo(info)
 }
 
 func sourceFileIdentityFromRevision(revision stateFileRevision) string {

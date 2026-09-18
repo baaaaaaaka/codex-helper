@@ -483,6 +483,11 @@ restarted or mutated by this work.
       selectors, and the no-credential bounded Docker acceptance passed.
 - [x] The CI core-b shard now explicitly selects the new deferred recovery,
       SQLite outbox hot-path, and bounded Docker acceptance tests.
+- [x] The first CI attempt exposed and the follow-up patch fixed a Windows-only
+      source-rewrite proof gap: `FileInfo.Sys()` exposes
+      `Win32FileAttributeData.LastWriteTime`, while the generic adapter only
+      recognized Unix `Ctim/Ctimespec`; the Windows adapter now uses the same
+      native revision as the handle-based file stamp path.
 - [ ] Strict point-in-time real-data Docker acceptance and live per-row
       recovery remain separate from this prerelease; no live service or
       database was restarted or mutated during validation.

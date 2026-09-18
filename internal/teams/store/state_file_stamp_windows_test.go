@@ -33,4 +33,7 @@ func TestSourceFileIdentityWindows(t *testing.T) {
 	if fromInfo != identity {
 		t.Fatalf("source identity from file info = %q, want %q", fromInfo, identity)
 	}
+	if changeTime := SourceFileChangeTimeFromFileInfo(info); changeTime == 0 {
+		t.Fatal("source change time from file info is zero")
+	}
 }
