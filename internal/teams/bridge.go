@@ -22840,7 +22840,14 @@ func (b *Bridge) flushPendingOutboxMainLoop(ctx context.Context) error {
 			traceStep("targeted-flush-2:"+chatIDs[1], started, secondChatErr)
 			flushErr = errors.Join(firstChatErr, secondChatErr)
 		}
-	} else {
+	} else if chatErr != nil {
+		// A failed fairness preflight cannot prove that the queue is empty, so
+		// retain the bounded global compatibility flush in that case. A
+		// successful empty preflight is authoritative for this cycle: running a
+		// second global page query would only repeat an empty SQLite read, add
+		// durable-lock contention, and can make a slow SQLite driver block the
+		// listener before it reaches inbound polling. A row queued concurrently
+		// will be observed by the next cycle.
 		started = time.Now()
 		flushErr = b.flushPendingOutboxFilteredWithOptions(ctx, "", "", "", outboxFlushOptions{
 			MaxMessages:                   mainLoopOutboxFlushMaxMessages,
@@ -22850,6 +22857,8 @@ func (b *Bridge) flushPendingOutboxMainLoop(ctx context.Context) error {
 			SkipUnresolvedTranscript:      true,
 		})
 		traceStep("global-flush", started, flushErr)
+	} else {
+		traceStep("global-flush-skipped-empty", time.Now(), nil)
 	}
 	if flushErr != nil {
 		return flushErr

@@ -39103,6 +39103,27 @@ func TestBridgeMainLoopOutboxFlushUsesSmallBudget(t *testing.T) {
 	}
 }
 
+func TestBridgeMainLoopOutboxSkipsGlobalFlushAfterEmptyPreflight(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("MigrateLargeStateToSQLite error: %v", err)
+	}
+	bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+	var phases []string
+	bridge.outboxPhaseTraceHook = func(name string, _ time.Duration, _ error) {
+		phases = append(phases, name)
+	}
+	if err := bridge.flushPendingOutboxMainLoop(ctx); err != nil {
+		t.Fatalf("flushPendingOutboxMainLoop error: %v", err)
+	}
+	for _, phase := range phases {
+		if phase == "global-flush" {
+			t.Fatalf("empty outbox preflight still ran global flush; phases=%v", phases)
+		}
+	}
+}
+
 func TestBridgeMainLoopOutboxStopsAfterDeferredHead(t *testing.T) {
 	store := newBridgeTestStore(t)
 	ctx := context.Background()
