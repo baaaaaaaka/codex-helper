@@ -529,6 +529,9 @@ func (s *Store) ForkOperation(ctx context.Context, operationID string) (ForkOper
 }
 
 func (s *Store) ForkOperations(ctx context.Context) ([]ForkOperation, error) {
+	if operations, handled, err := s.forkOperationsSQLite(ctx); handled || err != nil {
+		return operations, err
+	}
 	state, err := s.loadStateFieldsOrFull(ctx, forkOperationStateFields)
 	if err != nil {
 		return nil, err

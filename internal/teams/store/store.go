@@ -6816,6 +6816,45 @@ func (s *Store) ForkPollingSnapshot(ctx context.Context) (State, error) {
 	return s.loadStateFieldsOrFull(ctx, forkPollingStateFields)
 }
 
+// forkOperationsSQLite keeps ForkOperations on the small exceptional table
+// when the durable backend is SQLite. The legacy selected-state loader also
+// knows how to read this map, but it first materializes cold/runtime metadata
+// that the owner loop does not need. That extra work holds Store.mu and can
+// starve inbound polling while the first SQLite/WAL read is settling.
+func (s *Store) forkOperationsSQLite(ctx context.Context) ([]ForkOperation, bool, error) {
+	var out []ForkOperation
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		handled = true
+		rows, err := db.QueryContext(ctx, `SELECT json FROM fork_operations ORDER BY updated_at, id`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var raw []byte
+			if err := rows.Scan(&raw); err != nil {
+				return err
+			}
+			var operation ForkOperation
+			if err := json.Unmarshal(raw, &operation); err != nil {
+				return err
+			}
+			out = append(out, operation)
+		}
+		return rows.Err()
+	})
+	return out, handled, err
+}
+
 // forkPollingSnapshotSQLite avoids decoding every session and chat poll on
 // every listener tick when no fork is staged. Forks are exceptional and have
 // their own indexed phase column; the common no-fork path therefore needs only
