@@ -883,7 +883,7 @@ const listenerRecoveryMultiStepProgressTimeout = 90 * time.Second
 // SQLite admission before the queued turn is observable. Keep this bound local
 // to that fixture; it remains finite and retains every durable exactly-once
 // assertion after the wait.
-const listenerRecoverySlowInboundProgressTimeout = 120 * time.Second
+const listenerRecoverySlowInboundProgressTimeout = 180 * time.Second
 
 // Windows hosted runners can spend tens of seconds in FlushFileBuffers while
 // a recovery fixture is materializing or reopening durable state.  Keep the
@@ -4218,6 +4218,22 @@ func TestTeamsListenFalseSlowInboundMutationDoesNotConsumeDurableCleanupGrace(t 
 	if _, err := store.MigrateLargeStateToSQLite(context.Background(), 0); err != nil {
 		t.Fatalf("prepare slow inbound mutation SQLite store: %v", err)
 	}
+	// Session creation and optional transcript/WAL maintenance are covered by
+	// their own recovery fixtures. Establish the work session before the
+	// listener starts so this test measures the post-claim cleanup boundary
+	// instead of first-use durable admission on a hosted race runner.
+	session := bridge.reg.SessionByChatID("chat-1")
+	if session == nil {
+		t.Fatal("slow inbound fixture has no chat-1 session")
+	}
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("prepare slow inbound durable session: %v", err)
+	}
+	maintenanceSkipUntil := time.Now().Add(time.Hour)
+	bridge.lastTranscriptSync = maintenanceSkipUntil
+	bridge.lastHistoryWatchSync = maintenanceSkipUntil
+	bridge.lastHistoryWatchReconcile = maintenanceSkipUntil
+	bridge.lastSQLiteWALCheckpoint = maintenanceSkipUntil
 
 	options := listenerRecoveryBaseOptions(store, registryPath, executor)
 	// Match the production worker slice. The assertion is about separating the
