@@ -202,6 +202,113 @@ func TestPendingLiveFinalDedupeRequiresExactSourceWitness(t *testing.T) {
 	}
 }
 
+func TestTranscriptDedupeRequiresDurableProviderIdentity(t *testing.T) {
+	now := time.Now().UTC()
+	const (
+		sessionID = "session-dedupe-identity"
+		body      = "markerless delivery must not suppress this"
+	)
+
+	for _, tc := range []struct {
+		name       string
+		status     teamstore.OutboxStatus
+		messageID  string
+		wantDedupe bool
+	}{
+		{name: "accepted markerless", status: teamstore.OutboxStatusAccepted},
+		{name: "accepted whitespace identity", status: teamstore.OutboxStatusAccepted, messageID: "  "},
+		{name: "accepted with Teams identity", status: teamstore.OutboxStatusAccepted, messageID: "teams-accepted", wantDedupe: true},
+		{name: "sent markerless", status: teamstore.OutboxStatusSent},
+		{name: "sent with Teams identity", status: teamstore.OutboxStatusSent, messageID: "teams-sent", wantDedupe: true},
+	} {
+		t.Run("outbox/"+tc.name, func(t *testing.T) {
+			state := teamstore.State{OutboxMessages: map[string]teamstore.OutboxMessage{
+				"outbox:dedupe": {
+					ID:             "outbox:dedupe",
+					SessionID:      sessionID,
+					TeamsChatID:    "chat-dedupe-identity",
+					Kind:           "codex-status-dedupe",
+					Body:           body,
+					Status:         tc.status,
+					TeamsMessageID: tc.messageID,
+					CreatedAt:      now,
+				},
+			}}
+			known := newKnownTranscriptOutboxDedupeState(state, sessionID, now.Add(-time.Minute))
+			if got := known.shouldSkip(TranscriptRecord{Kind: TranscriptKindStatus}, body); got != tc.wantDedupe {
+				t.Fatalf("marker status dedupe = %v, want %v", got, tc.wantDedupe)
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name       string
+		status     teamstore.HelperDeliveryStatus
+		messageID  string
+		wantDedupe bool
+	}{
+		{name: "accepted markerless", status: teamstore.HelperDeliveryStatusAccepted},
+		{name: "accepted with Teams identity", status: teamstore.HelperDeliveryStatusAccepted, messageID: "teams-accepted", wantDedupe: true},
+		{name: "sent markerless", status: teamstore.HelperDeliveryStatusSent},
+		{name: "sent with Teams identity", status: teamstore.HelperDeliveryStatusSent, messageID: "teams-sent", wantDedupe: true},
+	} {
+		t.Run("helper-ledger/"+tc.name, func(t *testing.T) {
+			state := teamstore.State{HelperDeliveries: map[string]teamstore.HelperDeliveryRecord{
+				"delivery:dedupe": {
+					ID:             "delivery:dedupe",
+					SessionID:      sessionID,
+					TeamsChatID:    "chat-dedupe-identity",
+					KindFamily:     "status",
+					SourceTextHash: normalizedTextHash(body),
+					Status:         tc.status,
+					TeamsMessageID: tc.messageID,
+					CreatedAt:      now,
+				},
+			}}
+			known := newKnownTranscriptOutboxDedupeState(state, sessionID, now.Add(-time.Minute))
+			if got := known.shouldSkip(TranscriptRecord{Kind: TranscriptKindStatus}, body); got != tc.wantDedupe {
+				t.Fatalf("helper ledger status dedupe = %v, want %v", got, tc.wantDedupe)
+			}
+		})
+	}
+}
+
+func TestMarkerlessAcceptedOutboxIsNotReposted(t *testing.T) {
+	for _, messageID := range []string{"", "  "} {
+		t.Run(fmt.Sprintf("message-id=%q", messageID), func(t *testing.T) {
+			ctx := context.Background()
+			graph, sent := newBridgeTestGraph(t)
+			store := newBridgeTestStore(t)
+			outbox, created, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
+				ID:             "outbox:markerless-accepted",
+				SessionID:      "s001",
+				TeamsChatID:    "chat-1",
+				Kind:           "helper",
+				Body:           "markerless accepted must not be posted again",
+				Status:         teamstore.OutboxStatusAccepted,
+				TeamsMessageID: messageID,
+			})
+			if err != nil || !created {
+				t.Fatalf("seed markerless Accepted outbox created=%v err=%v", created, err)
+			}
+			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+			if err := bridge.sendQueuedOutboxWithOptions(ctx, outbox, outboxSendOptions{IgnoreEarlierOutbox: true}); err != nil {
+				t.Fatalf("markerless Accepted send attempt: %v", err)
+			}
+			if len(*sent) != 0 {
+				t.Fatalf("markerless Accepted issued %d Graph POST(s), want none", len(*sent))
+			}
+			persisted, err := store.OutboxMessageByID(ctx, outbox.ID)
+			if err != nil {
+				t.Fatalf("reload markerless Accepted outbox: %v", err)
+			}
+			if persisted.Status != teamstore.OutboxStatusAccepted || strings.TrimSpace(persisted.TeamsMessageID) != "" {
+				t.Fatalf("markerless Accepted outbox after send attempt = %#v, want unchanged", persisted)
+			}
+		})
+	}
+}
+
 func TestLiveTranscriptBackfillDeliveryTerminalRequiresCompleteDurableWitness(t *testing.T) {
 	now := time.Now().UTC()
 	record := TranscriptRecord{ItemID: "record-live-status", Kind: TranscriptKindStatus}

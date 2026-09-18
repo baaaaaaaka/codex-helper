@@ -1,0 +1,3 @@
+FROM scratch
+
+COPY teams-bounded-acceptance.test /teams-bounded-acceptance.test

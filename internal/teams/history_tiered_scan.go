@@ -87,14 +87,25 @@ type historyTieredFileState struct {
 	// SourceRewriteRecoveryScan* is a durable, source-bound cursor for a
 	// bounded rebase pass. It prevents a large same-inode repair from starting
 	// at byte zero after every listener cycle or process restart.
-	SourceRewriteRecoveryScanPending   bool
-	SourceRewriteRecoveryScanOffset    int64
-	SourceRewriteRecoveryScanLine      int
-	SourceRewriteRecoveryScanSessionID string
-	SourceRewriteRecoveryScanThreadID  string
-	SourceRewriteRecoveryScanTurnID    string
-	Offset                             int64
-	Line                               int
+	SourceRewriteRecoveryScanPending           bool
+	SourceRewriteRecoveryScanOffset            int64
+	SourceRewriteRecoveryScanLine              int
+	SourceRewriteRecoveryScanSessionID         string
+	SourceRewriteRecoveryScanThreadID          string
+	SourceRewriteRecoveryScanTurnID            string
+	SourceRewriteRecoveryScanMatchFound        bool
+	SourceRewriteRecoveryScanMatchLine         int
+	SourceRewriteRecoveryScanMatchOffset       int64
+	SourceRewriteRecoveryScanMatchSourceItemID string
+	SourceRewriteRecoveryScanMatchThreadID     string
+	SourceRewriteRecoveryScanMatchTurnID       string
+	SourceRewriteRecoveryScanMatchTextHash     string
+	SourceRewriteRecoveryScanMatchSourceLine   int
+	SourceRewriteRecoveryScanMatchStartOffset  int64
+	SourceRewriteRecoveryScanMatchEndOffset    int64
+	SourceRewriteRecoveryReason                string
+	Offset                                     int64
+	Line                                       int
 	// Partial* represent a record that has not reached a newline. Offset and
 	// Line remain the last complete JSONL boundary; these fields are only a
 	// resumable read hint and never a publishable cursor.

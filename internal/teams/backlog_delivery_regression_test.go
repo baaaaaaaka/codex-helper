@@ -294,6 +294,23 @@ func TestOutboxRetryGateHonorsGraph429RetryAfter(t *testing.T) {
 	}
 }
 
+func TestOutboxRetryGateSlowsPermanentAuthFailureWithoutDroppingWork(t *testing.T) {
+	now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+	reauth := &graphRequestPreflightError{cause: &ReauthRequiredError{Action: "Teams auth", Reason: "cached token is missing"}}
+	got := outboxRetryGateUntil(reauth, now)
+	if !got.Equal(now.Add(outboxAuthRecoveryRetryBackoff)) {
+		t.Fatalf("reauth outbox retry gate = %s, want %s", got, now.Add(outboxAuthRecoveryRetryBackoff))
+	}
+	cacheErr := &graphRequestPreflightError{cause: &AuthCacheError{Action: "Teams auth", Err: errors.New("invalid cache")}}
+	if got := outboxRetryGateUntil(cacheErr, now); !got.Equal(now.Add(outboxAuthRecoveryRetryBackoff)) {
+		t.Fatalf("auth-cache outbox retry gate = %s, want %s", got, now.Add(outboxAuthRecoveryRetryBackoff))
+	}
+	temporary := &graphRequestPreflightError{cause: &TemporaryAuthError{Action: "Teams auth", Err: errors.New("oauth endpoint unavailable")}}
+	if got := outboxRetryGateUntil(temporary, now); !got.Equal(now.Add(outboxRecoveryRetryBackoff)) {
+		t.Fatalf("temporary-auth outbox retry gate = %s, want transient gate %s", got, now.Add(outboxRecoveryRetryBackoff))
+	}
+}
+
 // seedBridgeTestOutboxRows persists sender/recovery fixtures in one state
 // transaction. These tests exercise outbox ordering and delivery, not the
 // QueueOutbox admission path. Seeding after SQLite migration (or calling

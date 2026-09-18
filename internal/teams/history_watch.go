@@ -1301,6 +1301,7 @@ func (b *Bridge) syncCodexHistoryWatchPath(ctx context.Context, path string, now
 			partial.Path = path
 			partial.Size = result.State.Size
 			partial.ModTime = result.State.ModTime
+			partial.SourceChangeTime = result.State.SourceChangeTime
 			// HistoryWatch does not publish the complete records observed before
 			// the partial line.  Reuse the existing partial-read hint, but make its
 			// replay origin the last durable newline; otherwise completion would
@@ -1581,7 +1582,16 @@ func historyWatchSourcePrefixMatches(path string, previous historyTieredFileStat
 		return false
 	}
 	pathInfo, err := os.Stat(path)
-	if err != nil || pathInfo.IsDir() || pathInfo.Size() < previous.Offset {
+	if err != nil || pathInfo.IsDir() || pathInfo.Size() < previous.Offset ||
+		previous.Size > 0 && pathInfo.Size() < previous.Size {
+		return false
+	}
+	// A same-size source with a changed ctime may have been rewritten in place
+	// while preserving both length and mtime. The bounded prefix fingerprint is
+	// still useful for ordinary append-only growth, but it is not enough to
+	// prove a same-size rewrite outside its 8 KiB window.
+	if previous.Size > 0 && pathInfo.Size() == previous.Size && previous.SourceChangeTime != 0 &&
+		teamstore.SourceFileChangeTimeFromFileInfo(pathInfo) != previous.SourceChangeTime {
 		return false
 	}
 	f, err := os.Open(path)
@@ -1590,7 +1600,8 @@ func historyWatchSourcePrefixMatches(path string, previous historyTieredFileStat
 	}
 	defer f.Close()
 	fdInfo, err := f.Stat()
-	if err != nil || fdInfo.IsDir() || fdInfo.Size() < previous.Offset || !os.SameFile(pathInfo, fdInfo) {
+	if err != nil || fdInfo.IsDir() || fdInfo.Size() < previous.Offset ||
+		previous.Size > 0 && fdInfo.Size() < previous.Size || !os.SameFile(pathInfo, fdInfo) {
 		return false
 	}
 	actual := strings.TrimSpace(transcriptCheckpointSourceFingerprintFromReader(f, path, fdInfo.Size(), previous.Offset))
@@ -1598,7 +1609,15 @@ func historyWatchSourcePrefixMatches(path string, previous historyTieredFileStat
 		return false
 	}
 	postInfo, err := os.Stat(path)
-	return err == nil && !postInfo.IsDir() && os.SameFile(pathInfo, postInfo) && postInfo.Size() >= previous.Offset
+	if err != nil || postInfo.IsDir() || !os.SameFile(pathInfo, postInfo) || postInfo.Size() < previous.Offset ||
+		previous.Size > 0 && postInfo.Size() < previous.Size {
+		return false
+	}
+	if previous.Size > 0 && postInfo.Size() == previous.Size && previous.SourceChangeTime != 0 &&
+		teamstore.SourceFileChangeTimeFromFileInfo(postInfo) != previous.SourceChangeTime {
+		return false
+	}
+	return true
 }
 
 // historyWatchReadProofMatches verifies the exact bounded range consumed by
@@ -1615,56 +1634,67 @@ func historyWatchReadProofMatches(path string, result historyTieredTailResult) b
 
 func historyTieredFileStateFromHistoryWatch(checkpoint teamstore.HistoryWatchCheckpoint) historyTieredFileState {
 	return historyTieredFileState{
-		Path:                               strings.TrimSpace(checkpoint.Path),
-		Size:                               checkpoint.Size,
-		ModTime:                            checkpoint.ModTime,
-		SourceGeneration:                   strings.TrimSpace(checkpoint.SourceGeneration),
-		SourceFingerprint:                  strings.TrimSpace(checkpoint.SourceFingerprint),
-		SourceChangeTime:                   checkpoint.SourceChangeTime,
-		SourceRewriteBlocked:               checkpoint.SourceRewriteBlocked,
-		LegacySourceUnverified:             checkpoint.LegacySourceUnverified,
-		RecoveryProofUnusable:              checkpoint.RecoveryProofUnusable,
-		OversizedRecordBlocked:             checkpoint.OversizedRecordBlocked,
-		SourceRewriteRecoveryIdentity:      strings.TrimSpace(checkpoint.SourceRewriteRecoveryIdentity),
-		SourceRewriteRecoverySize:          checkpoint.SourceRewriteRecoverySize,
-		SourceRewriteRecoveryModTime:       checkpoint.SourceRewriteRecoveryModTime,
-		SourceRewriteRecoveryChangeTime:    checkpoint.SourceRewriteRecoveryChangeTime,
-		SourceRewriteRecoveryScanPending:   checkpoint.SourceRewriteRecoveryScanPending,
-		SourceRewriteRecoveryScanOffset:    checkpoint.SourceRewriteRecoveryScanOffset,
-		SourceRewriteRecoveryScanLine:      checkpoint.SourceRewriteRecoveryScanLine,
-		SourceRewriteRecoveryScanSessionID: strings.TrimSpace(checkpoint.SourceRewriteRecoveryScanSessionID),
-		SourceRewriteRecoveryScanThreadID:  strings.TrimSpace(checkpoint.SourceRewriteRecoveryScanThreadID),
-		SourceRewriteRecoveryScanTurnID:    strings.TrimSpace(checkpoint.SourceRewriteRecoveryScanTurnID),
-		Offset:                             checkpoint.Offset,
-		Line:                               checkpoint.Line,
-		PartialLineStartOffset:             checkpoint.PartialLineStartOffset,
-		PartialReadOffset:                  checkpoint.PartialReadOffset,
-		PartialObservedSize:                checkpoint.PartialObservedSize,
-		PartialLine:                        checkpoint.PartialLine,
-		PartialStartedAt:                   checkpoint.PartialStartedAt,
-		PartialSourceIdentity:              strings.TrimSpace(checkpoint.PartialSourceIdentity),
-		PartialSourceChangeTime:            checkpoint.PartialSourceChangeTime,
-		PartialReplayOffset:                checkpoint.PartialReplayOffset,
-		PartialReplayLine:                  checkpoint.PartialReplayLine,
-		PartialLastProgressAt:              checkpoint.PartialLastProgressAt,
-		PartialPrefixReleased:              checkpoint.PartialPrefixReleased,
-		PendingOpaqueRecordStartOffset:     checkpoint.PendingOpaqueRecordStartOffset,
-		PendingOpaqueRecordEndOffset:       checkpoint.PendingOpaqueRecordEndOffset,
-		PendingOpaqueRecordLine:            checkpoint.PendingOpaqueRecordLine,
-		PendingOpaqueRecordID:              strings.TrimSpace(checkpoint.PendingOpaqueRecordID),
-		SessionID:                          strings.TrimSpace(checkpoint.SessionID),
-		ThreadID:                           strings.TrimSpace(checkpoint.ThreadID),
-		TeamsOriginThreadID:                strings.TrimSpace(checkpoint.TeamsOriginThreadID),
-		TurnID:                             strings.TrimSpace(checkpoint.TurnID),
-		TeamsOriginTurnID:                  strings.TrimSpace(checkpoint.TeamsOriginTurnID),
-		ExternalUserPromptSeen:             checkpoint.ExternalUserPromptSeen,
-		LastFinalID:                        strings.TrimSpace(checkpoint.LastFinalID),
-		LastFinalLine:                      checkpoint.LastFinalLine,
-		LastFinalStartOffset:               checkpoint.LastFinalStartOffset,
-		LastFinalStartOffsetKnown:          checkpoint.LastFinalStartOffsetKnown,
-		LastFinalThreadID:                  strings.TrimSpace(checkpoint.LastFinalThreadID),
-		LastFinalTurnID:                    strings.TrimSpace(checkpoint.LastFinalTurnID),
-		LastFinalTextHash:                  strings.TrimSpace(checkpoint.LastFinalTextHash),
+		Path:                                       strings.TrimSpace(checkpoint.Path),
+		Size:                                       checkpoint.Size,
+		ModTime:                                    checkpoint.ModTime,
+		SourceGeneration:                           strings.TrimSpace(checkpoint.SourceGeneration),
+		SourceFingerprint:                          strings.TrimSpace(checkpoint.SourceFingerprint),
+		SourceChangeTime:                           checkpoint.SourceChangeTime,
+		SourceRewriteBlocked:                       checkpoint.SourceRewriteBlocked,
+		LegacySourceUnverified:                     checkpoint.LegacySourceUnverified,
+		RecoveryProofUnusable:                      checkpoint.RecoveryProofUnusable,
+		OversizedRecordBlocked:                     checkpoint.OversizedRecordBlocked,
+		SourceRewriteRecoveryIdentity:              strings.TrimSpace(checkpoint.SourceRewriteRecoveryIdentity),
+		SourceRewriteRecoverySize:                  checkpoint.SourceRewriteRecoverySize,
+		SourceRewriteRecoveryModTime:               checkpoint.SourceRewriteRecoveryModTime,
+		SourceRewriteRecoveryChangeTime:            checkpoint.SourceRewriteRecoveryChangeTime,
+		SourceRewriteRecoveryScanPending:           checkpoint.SourceRewriteRecoveryScanPending,
+		SourceRewriteRecoveryScanOffset:            checkpoint.SourceRewriteRecoveryScanOffset,
+		SourceRewriteRecoveryScanLine:              checkpoint.SourceRewriteRecoveryScanLine,
+		SourceRewriteRecoveryScanSessionID:         strings.TrimSpace(checkpoint.SourceRewriteRecoveryScanSessionID),
+		SourceRewriteRecoveryScanThreadID:          strings.TrimSpace(checkpoint.SourceRewriteRecoveryScanThreadID),
+		SourceRewriteRecoveryScanTurnID:            strings.TrimSpace(checkpoint.SourceRewriteRecoveryScanTurnID),
+		SourceRewriteRecoveryScanMatchFound:        checkpoint.SourceRewriteRecoveryScanMatchFound,
+		SourceRewriteRecoveryScanMatchLine:         checkpoint.SourceRewriteRecoveryScanMatchLine,
+		SourceRewriteRecoveryScanMatchOffset:       checkpoint.SourceRewriteRecoveryScanMatchOffset,
+		SourceRewriteRecoveryScanMatchSourceItemID: strings.TrimSpace(checkpoint.SourceRewriteRecoveryScanMatchSourceItemID),
+		SourceRewriteRecoveryScanMatchThreadID:     strings.TrimSpace(checkpoint.SourceRewriteRecoveryScanMatchThreadID),
+		SourceRewriteRecoveryScanMatchTurnID:       strings.TrimSpace(checkpoint.SourceRewriteRecoveryScanMatchTurnID),
+		SourceRewriteRecoveryScanMatchTextHash:     strings.TrimSpace(checkpoint.SourceRewriteRecoveryScanMatchTextHash),
+		SourceRewriteRecoveryScanMatchSourceLine:   checkpoint.SourceRewriteRecoveryScanMatchSourceLine,
+		SourceRewriteRecoveryScanMatchStartOffset:  checkpoint.SourceRewriteRecoveryScanMatchStartOffset,
+		SourceRewriteRecoveryScanMatchEndOffset:    checkpoint.SourceRewriteRecoveryScanMatchEndOffset,
+		SourceRewriteRecoveryReason:                strings.TrimSpace(checkpoint.SourceRewriteRecoveryReason),
+		Offset:                                     checkpoint.Offset,
+		Line:                                       checkpoint.Line,
+		PartialLineStartOffset:                     checkpoint.PartialLineStartOffset,
+		PartialReadOffset:                          checkpoint.PartialReadOffset,
+		PartialObservedSize:                        checkpoint.PartialObservedSize,
+		PartialLine:                                checkpoint.PartialLine,
+		PartialStartedAt:                           checkpoint.PartialStartedAt,
+		PartialSourceIdentity:                      strings.TrimSpace(checkpoint.PartialSourceIdentity),
+		PartialSourceChangeTime:                    checkpoint.PartialSourceChangeTime,
+		PartialReplayOffset:                        checkpoint.PartialReplayOffset,
+		PartialReplayLine:                          checkpoint.PartialReplayLine,
+		PartialLastProgressAt:                      checkpoint.PartialLastProgressAt,
+		PartialPrefixReleased:                      checkpoint.PartialPrefixReleased,
+		PendingOpaqueRecordStartOffset:             checkpoint.PendingOpaqueRecordStartOffset,
+		PendingOpaqueRecordEndOffset:               checkpoint.PendingOpaqueRecordEndOffset,
+		PendingOpaqueRecordLine:                    checkpoint.PendingOpaqueRecordLine,
+		PendingOpaqueRecordID:                      strings.TrimSpace(checkpoint.PendingOpaqueRecordID),
+		SessionID:                                  strings.TrimSpace(checkpoint.SessionID),
+		ThreadID:                                   strings.TrimSpace(checkpoint.ThreadID),
+		TeamsOriginThreadID:                        strings.TrimSpace(checkpoint.TeamsOriginThreadID),
+		TurnID:                                     strings.TrimSpace(checkpoint.TurnID),
+		TeamsOriginTurnID:                          strings.TrimSpace(checkpoint.TeamsOriginTurnID),
+		ExternalUserPromptSeen:                     checkpoint.ExternalUserPromptSeen,
+		LastFinalID:                                strings.TrimSpace(checkpoint.LastFinalID),
+		LastFinalLine:                              checkpoint.LastFinalLine,
+		LastFinalStartOffset:                       checkpoint.LastFinalStartOffset,
+		LastFinalStartOffsetKnown:                  checkpoint.LastFinalStartOffsetKnown,
+		LastFinalThreadID:                          strings.TrimSpace(checkpoint.LastFinalThreadID),
+		LastFinalTurnID:                            strings.TrimSpace(checkpoint.LastFinalTurnID),
+		LastFinalTextHash:                          strings.TrimSpace(checkpoint.LastFinalTextHash),
 		// Older history-watch checkpoints persisted only LastFinalID.  In this
 		// watcher namespace that ID is a real final boundary (unlike linked
 		// transcript checkpoints, whose LastRecordID may be any record), so
@@ -1732,60 +1762,71 @@ func historyWatchCheckpointFromState(id string, state historyTieredFileState, no
 		RecoveryProofUnusable:  state.RecoveryProofUnusable,
 		// Complete oversized JSONL records are now advanced as opaque ignored
 		// dispositions; retain the field only for old on-disk compatibility.
-		OversizedRecordBlocked:             false,
-		SourceRewriteRecoveryIdentity:      strings.TrimSpace(state.SourceRewriteRecoveryIdentity),
-		SourceRewriteRecoverySize:          state.SourceRewriteRecoverySize,
-		SourceRewriteRecoveryModTime:       state.SourceRewriteRecoveryModTime,
-		SourceRewriteRecoveryChangeTime:    state.SourceRewriteRecoveryChangeTime,
-		SourceRewriteRecoveryScanPending:   state.SourceRewriteRecoveryScanPending,
-		SourceRewriteRecoveryScanOffset:    state.SourceRewriteRecoveryScanOffset,
-		SourceRewriteRecoveryScanLine:      state.SourceRewriteRecoveryScanLine,
-		SourceRewriteRecoveryScanSessionID: strings.TrimSpace(state.SourceRewriteRecoveryScanSessionID),
-		SourceRewriteRecoveryScanThreadID:  strings.TrimSpace(state.SourceRewriteRecoveryScanThreadID),
-		SourceRewriteRecoveryScanTurnID:    strings.TrimSpace(state.SourceRewriteRecoveryScanTurnID),
-		Offset:                             state.Offset,
-		Line:                               state.Line,
-		PartialLineStartOffset:             state.PartialLineStartOffset,
-		PartialReadOffset:                  state.PartialReadOffset,
-		PartialObservedSize:                state.PartialObservedSize,
-		PartialLine:                        state.PartialLine,
-		PartialStartedAt:                   state.PartialStartedAt,
-		PartialSourceIdentity:              strings.TrimSpace(state.PartialSourceIdentity),
-		PartialSourceChangeTime:            state.PartialSourceChangeTime,
-		PartialReplayOffset:                state.PartialReplayOffset,
-		PartialReplayLine:                  state.PartialReplayLine,
-		PartialLastProgressAt:              state.PartialLastProgressAt,
-		PartialPrefixReleased:              state.PartialPrefixReleased,
-		PendingOpaqueRecordStartOffset:     state.PendingOpaqueRecordStartOffset,
-		PendingOpaqueRecordEndOffset:       state.PendingOpaqueRecordEndOffset,
-		PendingOpaqueRecordLine:            state.PendingOpaqueRecordLine,
-		PendingOpaqueRecordID:              strings.TrimSpace(state.PendingOpaqueRecordID),
-		SessionID:                          strings.TrimSpace(state.SessionID),
-		ThreadID:                           strings.TrimSpace(state.ThreadID),
-		TeamsOriginThreadID:                strings.TrimSpace(state.TeamsOriginThreadID),
-		TurnID:                             strings.TrimSpace(state.TurnID),
-		TeamsOriginTurnID:                  strings.TrimSpace(state.TeamsOriginTurnID),
-		ExternalUserPromptSeen:             state.ExternalUserPromptSeen,
-		LastFinalID:                        strings.TrimSpace(state.LastFinalID),
-		LastFinalLine:                      state.LastFinalLine,
-		LastFinalStartOffset:               state.LastFinalStartOffset,
-		LastFinalStartOffsetKnown:          state.LastFinalStartOffsetKnown,
-		LastFinalThreadID:                  strings.TrimSpace(state.LastFinalThreadID),
-		LastFinalTurnID:                    strings.TrimSpace(state.LastFinalTurnID),
-		LastFinalTextHash:                  strings.TrimSpace(state.LastFinalTextHash),
-		TerminalBoundarySeen:               state.TerminalBoundarySeen || state.TerminalBoundary != nil,
-		TerminalBoundaryLine:               state.TerminalBoundaryLine,
-		TerminalBoundary:                   state.TerminalBoundary,
-		UnresolvedContinuation:             state.UnresolvedContinuation,
-		UnresolvedContinuationLine:         state.UnresolvedContinuationLine,
-		UnresolvedContinuationOffset:       state.UnresolvedContinuationOffset,
-		PendingRootTaskStarted:             state.PendingRootTaskStarted,
-		PendingRootTaskStartedLine:         state.PendingRootTaskStartedLine,
-		PendingRootTaskStartedOffset:       state.PendingRootTaskStartedOffset,
-		TranscriptQuarantine:               state.TranscriptQuarantine,
-		ContextGap:                         state.ContextGap,
-		PendingHistoryRange:                state.PendingHistoryRange,
-		UpdatedAt:                          now,
+		OversizedRecordBlocked:                     false,
+		SourceRewriteRecoveryIdentity:              strings.TrimSpace(state.SourceRewriteRecoveryIdentity),
+		SourceRewriteRecoverySize:                  state.SourceRewriteRecoverySize,
+		SourceRewriteRecoveryModTime:               state.SourceRewriteRecoveryModTime,
+		SourceRewriteRecoveryChangeTime:            state.SourceRewriteRecoveryChangeTime,
+		SourceRewriteRecoveryScanPending:           state.SourceRewriteRecoveryScanPending,
+		SourceRewriteRecoveryScanOffset:            state.SourceRewriteRecoveryScanOffset,
+		SourceRewriteRecoveryScanLine:              state.SourceRewriteRecoveryScanLine,
+		SourceRewriteRecoveryScanSessionID:         strings.TrimSpace(state.SourceRewriteRecoveryScanSessionID),
+		SourceRewriteRecoveryScanThreadID:          strings.TrimSpace(state.SourceRewriteRecoveryScanThreadID),
+		SourceRewriteRecoveryScanTurnID:            strings.TrimSpace(state.SourceRewriteRecoveryScanTurnID),
+		SourceRewriteRecoveryScanMatchFound:        state.SourceRewriteRecoveryScanMatchFound,
+		SourceRewriteRecoveryScanMatchLine:         state.SourceRewriteRecoveryScanMatchLine,
+		SourceRewriteRecoveryScanMatchOffset:       state.SourceRewriteRecoveryScanMatchOffset,
+		SourceRewriteRecoveryScanMatchSourceItemID: strings.TrimSpace(state.SourceRewriteRecoveryScanMatchSourceItemID),
+		SourceRewriteRecoveryScanMatchThreadID:     strings.TrimSpace(state.SourceRewriteRecoveryScanMatchThreadID),
+		SourceRewriteRecoveryScanMatchTurnID:       strings.TrimSpace(state.SourceRewriteRecoveryScanMatchTurnID),
+		SourceRewriteRecoveryScanMatchTextHash:     strings.TrimSpace(state.SourceRewriteRecoveryScanMatchTextHash),
+		SourceRewriteRecoveryScanMatchSourceLine:   state.SourceRewriteRecoveryScanMatchSourceLine,
+		SourceRewriteRecoveryScanMatchStartOffset:  state.SourceRewriteRecoveryScanMatchStartOffset,
+		SourceRewriteRecoveryScanMatchEndOffset:    state.SourceRewriteRecoveryScanMatchEndOffset,
+		SourceRewriteRecoveryReason:                strings.TrimSpace(state.SourceRewriteRecoveryReason),
+		Offset:                                     state.Offset,
+		Line:                                       state.Line,
+		PartialLineStartOffset:                     state.PartialLineStartOffset,
+		PartialReadOffset:                          state.PartialReadOffset,
+		PartialObservedSize:                        state.PartialObservedSize,
+		PartialLine:                                state.PartialLine,
+		PartialStartedAt:                           state.PartialStartedAt,
+		PartialSourceIdentity:                      strings.TrimSpace(state.PartialSourceIdentity),
+		PartialSourceChangeTime:                    state.PartialSourceChangeTime,
+		PartialReplayOffset:                        state.PartialReplayOffset,
+		PartialReplayLine:                          state.PartialReplayLine,
+		PartialLastProgressAt:                      state.PartialLastProgressAt,
+		PartialPrefixReleased:                      state.PartialPrefixReleased,
+		PendingOpaqueRecordStartOffset:             state.PendingOpaqueRecordStartOffset,
+		PendingOpaqueRecordEndOffset:               state.PendingOpaqueRecordEndOffset,
+		PendingOpaqueRecordLine:                    state.PendingOpaqueRecordLine,
+		PendingOpaqueRecordID:                      strings.TrimSpace(state.PendingOpaqueRecordID),
+		SessionID:                                  strings.TrimSpace(state.SessionID),
+		ThreadID:                                   strings.TrimSpace(state.ThreadID),
+		TeamsOriginThreadID:                        strings.TrimSpace(state.TeamsOriginThreadID),
+		TurnID:                                     strings.TrimSpace(state.TurnID),
+		TeamsOriginTurnID:                          strings.TrimSpace(state.TeamsOriginTurnID),
+		ExternalUserPromptSeen:                     state.ExternalUserPromptSeen,
+		LastFinalID:                                strings.TrimSpace(state.LastFinalID),
+		LastFinalLine:                              state.LastFinalLine,
+		LastFinalStartOffset:                       state.LastFinalStartOffset,
+		LastFinalStartOffsetKnown:                  state.LastFinalStartOffsetKnown,
+		LastFinalThreadID:                          strings.TrimSpace(state.LastFinalThreadID),
+		LastFinalTurnID:                            strings.TrimSpace(state.LastFinalTurnID),
+		LastFinalTextHash:                          strings.TrimSpace(state.LastFinalTextHash),
+		TerminalBoundarySeen:                       state.TerminalBoundarySeen || state.TerminalBoundary != nil,
+		TerminalBoundaryLine:                       state.TerminalBoundaryLine,
+		TerminalBoundary:                           state.TerminalBoundary,
+		UnresolvedContinuation:                     state.UnresolvedContinuation,
+		UnresolvedContinuationLine:                 state.UnresolvedContinuationLine,
+		UnresolvedContinuationOffset:               state.UnresolvedContinuationOffset,
+		PendingRootTaskStarted:                     state.PendingRootTaskStarted,
+		PendingRootTaskStartedLine:                 state.PendingRootTaskStartedLine,
+		PendingRootTaskStartedOffset:               state.PendingRootTaskStartedOffset,
+		TranscriptQuarantine:                       state.TranscriptQuarantine,
+		ContextGap:                                 state.ContextGap,
+		PendingHistoryRange:                        state.PendingHistoryRange,
+		UpdatedAt:                                  now,
 	}
 	applyHistoryWatchPendingAssistant(&checkpoint, state.pendingAssistant)
 	return checkpoint

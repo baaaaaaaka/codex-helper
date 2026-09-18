@@ -1,6 +1,7 @@
 package teams
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -770,6 +771,48 @@ func TestFindTranscriptCheckpointPositionSupportsFallbackCheckpoint(t *testing.T
 	}
 }
 
+func TestTranscriptCheckpointPositionRewindsExpandedTurnCompletedLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "turn-completed.jsonl")
+	sessionMeta := `{"type":"session_meta","payload":{"id":"thread-expanded"}}`
+	completed := `{"method":"turn/completed","params":{"turnId":"turn-expanded","turn":{"items":[{"id":"first-item","type":"message","role":"assistant","content":[{"type":"output_text","text":"first answer"}]},{"id":"second-item","type":"message","role":"assistant","content":[{"type":"output_text","text":"second answer"}]}]}}}`
+	after := `{"type":"response_item","payload":{"id":"after-item","type":"message","role":"assistant","turn_id":"turn-after","content":[{"type":"output_text","text":"after answer"}]}}`
+	input := strings.Join([]string{sessionMeta, completed, after, ""}, "\n")
+	if err := os.WriteFile(path, []byte(input), 0o600); err != nil {
+		t.Fatalf("write expanded turn transcript: %v", err)
+	}
+
+	full, err := ReadSessionTranscript(path)
+	if err != nil {
+		t.Fatalf("ReadSessionTranscript error: %v", err)
+	}
+	if len(full.Records) != 3 || full.Records[0].SourceItemID != "first-item" || full.Records[1].SourceItemID != "second-item" {
+		t.Fatalf("expanded turn records = %#v, want both same-line items", full.Records)
+	}
+	if full.Records[0].SourceLine != full.Records[1].SourceLine {
+		t.Fatalf("expanded turn items have different source lines: %#v", full.Records)
+	}
+
+	position, ok, err := findTranscriptCheckpointPosition(path, "source:first-item")
+	if err != nil {
+		t.Fatalf("findTranscriptCheckpointPosition error: %v", err)
+	}
+	if !ok {
+		t.Fatal("expanded turn checkpoint was not found")
+	}
+	wantOffset := int64(len(sessionMeta) + 1)
+	if position.Line != 1 || position.Offset != wantOffset {
+		t.Fatalf("expanded turn position = line %d offset %d, want line 1 offset %d before the physical line", position.Line, position.Offset, wantOffset)
+	}
+
+	tail, err := ReadSessionTranscriptSince(path, "source:first-item")
+	if err != nil {
+		t.Fatalf("ReadSessionTranscriptSince error: %v", err)
+	}
+	if len(tail.Records) != 2 || tail.Records[0].SourceItemID != "second-item" || tail.Records[1].SourceItemID != "after-item" {
+		t.Fatalf("expanded turn tail = %#v, want second same-line item followed by after-item", tail.Records)
+	}
+}
+
 func TestReadSessionTranscriptSinceRefusesInvalidLineLikeCheckpoint(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "session.jsonl")
@@ -824,6 +867,27 @@ func TestReadSessionTranscriptSinceFallsBackForPrefixDuplicateSourceIDs(t *testi
 		if got.Records[i] != want[i] {
 			t.Fatalf("record %d = %#v, want %#v", i, got.Records[i], want[i])
 		}
+	}
+}
+
+func TestCheckpointSearchRejectsAmbiguousLogicalID(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ambiguous-checkpoint.jsonl")
+	input := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"session-ambiguous","history_mode":"paginated"}}`,
+		`{"type":"response_item","payload":{"id":"duplicate-anchor","type":"message","role":"assistant","turn_id":"turn-1","content":[{"type":"output_text","text":"first"}]}}`,
+		`{"type":"response_item","payload":{"id":"after","type":"message","role":"assistant","turn_id":"turn-1","content":[{"type":"output_text","text":"after"}]}}`,
+		`{"type":"response_item","payload":{"id":"duplicate-anchor","type":"message","role":"assistant","turn_id":"turn-2","content":[{"type":"output_text","text":"second"}]}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(input), 0o600); err != nil {
+		t.Fatalf("write ambiguous checkpoint source: %v", err)
+	}
+	_, _, err := findTranscriptCheckpointPosition(path, "source:duplicate-anchor")
+	var ambiguous *TranscriptCheckpointAmbiguousError
+	if !errors.As(err, &ambiguous) || ambiguous.MatchCount != 2 {
+		t.Fatalf("checkpoint search error = %v, want two-match ambiguity", err)
+	}
+	if _, err := ReadSessionTranscriptSince(path, "source:duplicate-anchor"); !errors.As(err, &ambiguous) {
+		t.Fatalf("suffix read error = %v, want checkpoint ambiguity", err)
 	}
 }
 

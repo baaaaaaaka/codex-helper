@@ -522,6 +522,20 @@ func TestJSONMalformedOutboxAndHistoryRowsAreIsolatedAndPreserved(t *testing.T) 
 	}
 }
 
+func TestHistoryWatchIncompleteQuarantineIsMarkedUnusable(t *testing.T) {
+	var checkpoint HistoryWatchCheckpoint
+	raw := []byte(`{"id":"history-watch:incomplete-quarantine","source_generation":"generation-1","transcript_quarantine":{"kind":"incomplete-range","source_generation":"generation-1","frontier_record_id":"record-1","frontier_line":7,"frontier_offset":42,"range_fingerprint":"stale-or-incomplete"}}`)
+	if err := json.Unmarshal(raw, &checkpoint); err != nil {
+		t.Fatalf("decode incomplete history quarantine: %v", err)
+	}
+	if !checkpoint.RecoveryProofUnusable {
+		t.Fatalf("incomplete history quarantine was not marked unusable: %#v", checkpoint)
+	}
+	if checkpoint.TranscriptQuarantine == nil || checkpoint.TranscriptQuarantine.FrontierOffset != 42 || checkpoint.TranscriptQuarantine.RangeFingerprint != "stale-or-incomplete" {
+		t.Fatalf("incomplete history quarantine was not preserved as diagnostic metadata: %#v", checkpoint.TranscriptQuarantine)
+	}
+}
+
 func TestSQLiteMalformedChatPollIsIsolatedAtFullLoadAndPreserved(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)

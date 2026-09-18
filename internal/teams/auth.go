@@ -518,7 +518,7 @@ func (a nonInteractiveAuth) AccessToken(ctx context.Context, out io.Writer, forc
 		return "", a.reauthRequiredError("auth cache is missing")
 	}
 	if err != nil {
-		return "", err
+		return "", &AuthCacheError{Action: a.displayAction(), Err: err, LoginCommand: a.loginInstruction()}
 	}
 	if !forceLogin && tok.AccessToken != "" && tok.ExpiresAt > time.Now().Add(2*time.Minute).Unix() {
 		return tok.AccessToken, nil
@@ -539,14 +539,17 @@ func (a nonInteractiveAuth) RefreshAccessToken(ctx context.Context) (string, err
 		return "", a.reauthRequiredError("auth cache is missing")
 	}
 	if err != nil {
-		return "", err
+		return "", &AuthCacheError{Action: a.displayAction(), Err: err, LoginCommand: a.loginInstruction()}
 	}
 	if tok.RefreshToken == "" {
 		return "", a.reauthRequiredError("auth cache has no refresh token")
 	}
 	refreshed, err := a.refreshCachedToken(ctx, tok)
 	if err != nil {
-		return "", a.tokenRefreshError(err)
+		if isTemporaryOAuthError(err) {
+			return "", &TemporaryAuthError{Action: a.displayAction(), Err: err, LoginCommand: a.loginInstruction()}
+		}
+		return "", &ReauthRequiredError{Action: a.displayAction(), Reason: "token refresh failed: " + err.Error(), LoginCommand: a.loginInstruction()}
 	}
 	return refreshed.AccessToken, nil
 }
@@ -559,11 +562,11 @@ func (a nonInteractiveAuth) tokenRefreshError(err error) error {
 			LoginCommand: a.loginInstruction(),
 		}
 	}
-	return fmt.Errorf("%s token refresh failed: %w; run `%s` locally", a.displayAction(), err, a.loginInstruction())
+	return &ReauthRequiredError{Action: a.displayAction(), Reason: "token refresh failed: " + err.Error(), LoginCommand: a.loginInstruction()}
 }
 
 func (a nonInteractiveAuth) reauthRequiredError(reason string) error {
-	return fmt.Errorf("%s %s; run `%s` locally", a.displayAction(), reason, a.loginInstruction())
+	return &ReauthRequiredError{Action: a.displayAction(), Reason: reason, LoginCommand: a.loginInstruction()}
 }
 
 func (a nonInteractiveAuth) displayAction() string {
@@ -614,10 +617,10 @@ func (a *AuthManager) AccessToken(ctx context.Context, out io.Writer, forceLogin
 		if serviceMode {
 			loginCommand := loginCommandForAuthCache(a.cfg.CachePath, "codex-proxy teams auth")
 			if errors.Is(err, os.ErrNotExist) {
-				return "", fmt.Errorf("Teams chat access auth cache is missing; run `%s` in a foreground terminal before starting the service", loginCommand)
+				return "", &ReauthRequiredError{Action: "Teams chat access", Reason: "auth cache is missing", LoginCommand: loginCommand}
 			}
 			if err != nil {
-				return "", err
+				return "", &AuthCacheError{Action: "Teams chat access", Err: err, LoginCommand: loginCommand}
 			}
 			if refreshFailed != nil {
 				if isTemporaryOAuthError(refreshFailed) {
@@ -627,9 +630,9 @@ func (a *AuthManager) AccessToken(ctx context.Context, out io.Writer, forceLogin
 						LoginCommand: loginCommand,
 					}
 				}
-				return "", fmt.Errorf("Teams chat access token refresh failed: %w; run `%s` in a foreground terminal", refreshFailed, loginCommand)
+				return "", &ReauthRequiredError{Action: "Teams chat access", Reason: "token refresh failed: " + refreshFailed.Error(), LoginCommand: loginCommand}
 			}
-			return "", fmt.Errorf("Teams chat access auth cache is expired and has no refresh token; run `%s` in a foreground terminal before starting the service", loginCommand)
+			return "", &ReauthRequiredError{Action: "Teams chat access", Reason: "auth cache is expired and has no refresh token", LoginCommand: loginCommand}
 		}
 	}
 	tok, err := a.deviceLogin(ctx, out)
@@ -647,12 +650,22 @@ func (a *AuthManager) AccessToken(ctx context.Context, out io.Writer, forceLogin
 
 func (a *AuthManager) RefreshAccessToken(ctx context.Context) (string, error) {
 	tok, err := readTokenCache(a.cfg.CachePath)
+	loginCommand := loginCommandForAuthCache(a.cfg.CachePath, "codex-proxy teams auth")
+	if errors.Is(err, os.ErrNotExist) {
+		return "", &ReauthRequiredError{Action: "Teams chat access", Reason: "auth cache is missing", LoginCommand: loginCommand}
+	}
 	if err != nil {
-		return "", err
+		return "", &AuthCacheError{Action: "Teams chat access", Err: err, LoginCommand: loginCommand}
+	}
+	if tok.RefreshToken == "" {
+		return "", &ReauthRequiredError{Action: "Teams chat access", Reason: "auth cache has no refresh token", LoginCommand: loginCommand}
 	}
 	refreshed, err := a.refreshCachedToken(ctx, tok)
 	if err != nil {
-		return "", err
+		if isTemporaryOAuthError(err) {
+			return "", &TemporaryAuthError{Action: "Teams chat access", Err: err, LoginCommand: loginCommand}
+		}
+		return "", &ReauthRequiredError{Action: "Teams chat access", Reason: "token refresh failed: " + err.Error(), LoginCommand: loginCommand}
 	}
 	return refreshed.AccessToken, nil
 }
@@ -809,6 +822,81 @@ func (e *TemporaryAuthError) Unwrap() error {
 func IsTemporaryAuthError(err error) bool {
 	var temporary *TemporaryAuthError
 	return errors.As(err, &temporary)
+}
+
+// ReauthRequiredError is a durable, operator-actionable authentication
+// failure. A background Teams recovery row must not hot-loop on this class:
+// the cache is missing/invalid or the identity provider rejected the refresh,
+// so automatic replay cannot make progress until a foreground login repairs
+// the credential.
+type ReauthRequiredError struct {
+	Action       string
+	Reason       string
+	LoginCommand string
+}
+
+func (e *ReauthRequiredError) Error() string {
+	if e == nil {
+		return "Teams authentication requires foreground reauthorization"
+	}
+	action := strings.TrimSpace(e.Action)
+	if action == "" {
+		action = "Teams auth"
+	}
+	reason := strings.TrimSpace(e.Reason)
+	if reason == "" {
+		reason = "reauthorization is required"
+	}
+	command := strings.TrimSpace(e.LoginCommand)
+	if command == "" {
+		command = "codex-proxy teams auth"
+	}
+	return fmt.Sprintf("%s %s; run `%s` in a foreground terminal", action, reason, command)
+}
+
+func IsReauthRequiredError(err error) bool {
+	var reauth *ReauthRequiredError
+	return errors.As(err, &reauth)
+}
+
+// AuthCacheError marks a local cache/configuration failure which is safe to
+// hold but cannot be repaired by repeating a Teams Graph request. It is kept
+// distinct from ReauthRequiredError so callers can expose a more precise
+// diagnostic while sharing the same no-hot-loop disposition.
+type AuthCacheError struct {
+	Action       string
+	Err          error
+	LoginCommand string
+}
+
+func (e *AuthCacheError) Error() string {
+	if e == nil {
+		return "Teams authentication cache is unavailable"
+	}
+	action := strings.TrimSpace(e.Action)
+	if action == "" {
+		action = "Teams auth"
+	}
+	command := strings.TrimSpace(e.LoginCommand)
+	if command == "" {
+		command = "codex-proxy teams auth"
+	}
+	if e.Err == nil {
+		return fmt.Sprintf("%s authentication cache is unavailable; run `%s` in a foreground terminal", action, command)
+	}
+	return fmt.Sprintf("%s authentication cache is unavailable: %v; run `%s` in a foreground terminal", action, e.Err, command)
+}
+
+func (e *AuthCacheError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func IsAuthCacheError(err error) bool {
+	var cacheErr *AuthCacheError
+	return errors.As(err, &cacheErr)
 }
 
 func isTemporaryOAuthError(err error) bool {

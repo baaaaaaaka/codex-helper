@@ -303,9 +303,11 @@ func readSessionTranscriptSinceFast(filePath string, afterKey string) (Transcrip
 	var offset int64
 	var checkpointOffset int64 = -1
 	checkpointLine := 0
+	checkpointRewound := false
+	checkpointState := transcriptParseState{}
 	for {
 		read, err := historyTieredReadJSONLRecord(reader, historyTieredMaxRecordBytes, historyTieredMaxRecordReadBytes)
-		complete := read.Complete
+		complete := read.Complete || (err == io.EOF && read.BytesRead > 0)
 		if read.BytesRead > 0 {
 			line := read.Line
 			lineNo++
@@ -313,13 +315,22 @@ func readSessionTranscriptSinceFast(filePath string, afterKey string) (Transcrip
 			if complete && !read.Oversized {
 				trimmed := bytes.TrimSpace(line)
 				if len(trimmed) > 0 {
-					if checkpointLineMatches(trimmed, lineNo, afterKey, state, sourceName) {
-						advanceTranscriptScanState(trimmed, lineNo, &state)
-						checkpointOffset = nextOffset
-						checkpointLine = lineNo
-						break
+					stateBefore := state
+					records, indices := checkpointLineMatchIndices(trimmed, lineNo, afterKey, state, sourceName)
+					if len(indices) > 1 || len(indices) == 1 && checkpointOffset >= 0 {
+						return Transcript{}, false, &TranscriptCheckpointAmbiguousError{AfterKey: afterKey, MatchCount: len(indices) + boolInt(checkpointOffset >= 0)}
 					}
 					advanceTranscriptScanState(trimmed, lineNo, &state)
+					if len(indices) == 1 {
+						checkpointLine = lineNo
+						checkpointOffset = nextOffset
+						checkpointLine, checkpointOffset = transcriptCheckpointPositionAfterMatch(records, indices[0], lineNo, offset, nextOffset)
+						checkpointRewound = checkpointOffset == offset && checkpointLine < lineNo
+						checkpointState = state
+						if checkpointRewound {
+							checkpointState = stateBefore
+						}
+					}
 				}
 			}
 			offset = nextOffset
@@ -339,15 +350,29 @@ func readSessionTranscriptSinceFast(filePath string, afterKey string) (Transcrip
 	}
 	transcript, err := ParseCodexTranscript(f, TranscriptParseOptions{
 		SourceName:          sourceName,
-		InitialSessionID:    state.sessionID,
-		InitialThreadID:     state.threadID,
-		InitialTurnID:       state.turnID,
+		InitialSessionID:    checkpointState.sessionID,
+		InitialThreadID:     checkpointState.threadID,
+		InitialTurnID:       checkpointState.turnID,
 		InitialLineNo:       checkpointLine,
 		InitialOffset:       checkpointOffset,
 		RequireFinalNewline: false,
 	})
 	if err != nil {
 		return transcript, false, err
+	}
+	if checkpointRewound {
+		if len(transcript.Records) == 0 {
+			return Transcript{}, false, nil
+		}
+		for i, record := range transcript.Records {
+			if transcriptRecordMatchesCheckpoint(record, afterKey, transcript.FileFingerprint) {
+				transcript.Records = append([]TranscriptRecord(nil), transcript.Records[i+1:]...)
+				break
+			}
+			if i == len(transcript.Records)-1 {
+				return Transcript{}, false, nil
+			}
+		}
 	}
 	if transcriptSuffixMayNeedPrefixSourceCounts(filePath, checkpointOffset, transcript.Records) {
 		return Transcript{}, false, nil
@@ -361,35 +386,82 @@ func checkpointLineMatches(line []byte, lineNo int, afterKey string, state trans
 }
 
 func checkpointLineMatchRecords(line []byte, lineNo int, afterKey string, state transcriptParseState, sourceName string) ([]TranscriptRecord, int, bool) {
+	records, indices := checkpointLineMatchIndices(line, lineNo, afterKey, state, sourceName)
+	if len(indices) != 1 {
+		return records, -1, false
+	}
+	return records, indices[0], true
+}
+
+// checkpointLineMatchIndices returns every logical record on one physical
+// JSONL line that could satisfy the checkpoint key.  A source ID is normally
+// unique, but a turn/completed envelope can expand into several logical items
+// and legacy writers have also emitted duplicate source IDs.  Returning all
+// matches lets the cold recovery scanner fail closed instead of choosing the
+// first item and potentially moving a cursor past an ambiguous boundary.
+func checkpointLineMatchIndices(line []byte, lineNo int, afterKey string, state transcriptParseState, sourceName string) ([]TranscriptRecord, []int) {
 	afterKey = strings.TrimSpace(afterKey)
 	if afterKey == "" {
-		return nil, -1, false
+		return nil, nil
 	}
 	lineKey, hasLineKey := transcriptCheckpointLineNumber(afterKey)
 	if hasLineKey && lineNo != lineKey {
-		return nil, -1, false
+		return nil, nil
 	}
 	probeKey := strings.TrimPrefix(afterKey, "source:")
 	if probeKey == "" {
-		return nil, -1, false
+		return nil, nil
 	}
 	if !hasLineKey && !bytes.Contains(line, []byte(afterKey)) && !bytes.Contains(line, []byte(probeKey)) {
-		return nil, -1, false
+		return nil, nil
 	}
 	probeState := state
 	records, _ := parseTranscriptLine(line, lineNo, &probeState)
+	indices := make([]int, 0, 1)
 	for i, record := range records {
 		sourceID := strings.TrimSpace(record.SourceItemID)
 		if sourceID != "" {
 			if afterKey == sourceID || afterKey == "source:"+sourceID || afterKey == sourceID+"#line:"+strconv.Itoa(record.SourceLine) {
-				return records, i, true
+				indices = append(indices, i)
+				continue
 			}
 		}
 		if fallbackTranscriptItemID(transcriptFileFingerprint(sourceName, state.sessionID, nil), record.SourceLine, record.Kind) == afterKey {
-			return records, i, true
+			indices = append(indices, i)
 		}
 	}
-	return records, -1, false
+	return records, indices
+}
+
+// transcriptCheckpointPositionAfterMatch returns a cursor that can safely be
+// resumed after the matched logical record. parseTranscriptLine may expand one
+// physical JSONL line into several logical records, and those records do not
+// necessarily have a finalized checkpoint key yet. When another logical item
+// follows the match, the only safe cursor is the start of the physical line so
+// the suffix cannot be skipped.
+func transcriptCheckpointPositionAfterMatch(records []TranscriptRecord, index int, lineNo int, lineStartOffset int64, nextOffset int64) (int, int64) {
+	if index >= 0 && index+1 < len(records) && records[index+1].SourceLine == records[index].SourceLine {
+		if lineNo > 0 {
+			lineNo--
+		}
+		return lineNo, lineStartOffset
+	}
+	return lineNo, nextOffset
+}
+
+func transcriptRecordMatchesCheckpoint(record TranscriptRecord, afterKey string, fileFingerprint string) bool {
+	afterKey = strings.TrimSpace(afterKey)
+	if afterKey == "" {
+		return false
+	}
+	if record.DedupeKey == afterKey || record.ItemID == afterKey {
+		return true
+	}
+	if sourceID := strings.TrimSpace(record.SourceItemID); sourceID != "" {
+		return afterKey == sourceID || afterKey == "source:"+sourceID ||
+			afterKey == sourceID+"#line:"+strconv.Itoa(record.SourceLine)
+	}
+	return fallbackTranscriptItemID(fileFingerprint, record.SourceLine, record.Kind) == afterKey
 }
 
 type transcriptCheckpointPosition struct {
@@ -399,8 +471,218 @@ type transcriptCheckpointPosition struct {
 	SourceModTime time.Time
 }
 
+// TranscriptCheckpointAmbiguousError is returned when one logical checkpoint
+// key appears more than once in the source.  A recovery cursor is a delivery
+// boundary, not merely a search hint; selecting the first occurrence could
+// replay or skip an arbitrary suffix.  Callers must leave the checkpoint held
+// for an explicit, source-specific repair.
+type TranscriptCheckpointAmbiguousError struct {
+	AfterKey   string
+	MatchCount int
+}
+
+func (e *TranscriptCheckpointAmbiguousError) Error() string {
+	if e == nil {
+		return "transcript checkpoint is ambiguous"
+	}
+	return fmt.Sprintf("transcript checkpoint %q matched %d logical records", strings.TrimSpace(e.AfterKey), e.MatchCount)
+}
+
+type transcriptCheckpointScanProgress struct {
+	SourceIdentity string
+	Offset         int64
+	Line           int
+	State          transcriptParseState
+	MatchFound     bool
+	MatchLine      int
+	MatchOffset    int64
+}
+
+type transcriptCheckpointScanResult struct {
+	Position transcriptCheckpointPosition
+	Found    bool
+	Complete bool
+	Progress transcriptCheckpointScanProgress
+}
+
 func findTranscriptCheckpointPosition(filePath string, afterKey string) (transcriptCheckpointPosition, bool, error) {
 	return findTranscriptCheckpointPositionWithContext(context.Background(), filePath, afterKey)
+}
+
+// scanTranscriptCheckpointWithContext scans a checkpoint source in bounded
+// passes.  It keeps the first matching position in the durable progress value
+// but does not declare success until the complete source has been inspected;
+// that second condition is what makes duplicate/ambiguous logical IDs safe.
+// The source identity and open-file identity are checked at every pass.  A
+// caller may therefore persist Progress and resume after a phase timeout or
+// process restart without treating a different inode as the same transcript.
+func scanTranscriptCheckpointWithContext(ctx context.Context, filePath string, afterKey string, expected os.FileInfo, expectedIdentity string, progress transcriptCheckpointScanProgress, maxBytes int64) (transcriptCheckpointScanResult, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return transcriptCheckpointScanResult{Progress: progress}, err
+	}
+	filePath = strings.TrimSpace(filePath)
+	afterKey = strings.TrimSpace(afterKey)
+	if filePath == "" || afterKey == "" {
+		return transcriptCheckpointScanResult{Complete: true, Progress: progress}, nil
+	}
+
+	f, err := os.Open(filePath)
+	if err != nil {
+		return transcriptCheckpointScanResult{Progress: progress}, err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return transcriptCheckpointScanResult{Progress: progress}, err
+	}
+	if info.IsDir() {
+		return transcriptCheckpointScanResult{Progress: progress}, fmt.Errorf("transcript path %q is a directory", filePath)
+	}
+	if expected != nil && !os.SameFile(expected, info) {
+		return transcriptCheckpointScanResult{Progress: progress}, fmt.Errorf("transcript source %q changed before checkpoint scan", filePath)
+	}
+	identity := strings.TrimSpace(expectedIdentity)
+	if identity != "" {
+		currentIdentity, identityErr := teamstore.SourceFileIdentityFromFileInfo(filePath, info)
+		if identityErr != nil {
+			return transcriptCheckpointScanResult{Progress: progress}, identityErr
+		}
+		if strings.TrimSpace(currentIdentity) == "" || strings.TrimSpace(currentIdentity) != identity {
+			return transcriptCheckpointScanResult{Progress: progress}, fmt.Errorf("transcript source %q identity changed before checkpoint scan", filePath)
+		}
+	}
+	if strings.TrimSpace(progress.SourceIdentity) != "" && identity != "" && strings.TrimSpace(progress.SourceIdentity) != identity {
+		progress = transcriptCheckpointScanProgress{SourceIdentity: identity}
+	}
+	if identity != "" {
+		progress.SourceIdentity = identity
+	}
+	if progress.Offset < 0 || progress.Offset > info.Size() {
+		return transcriptCheckpointScanResult{Progress: progress}, fmt.Errorf("transcript checkpoint scan cursor is outside source %q", filePath)
+	}
+	if progress.Offset > 0 {
+		if _, err := f.Seek(progress.Offset, io.SeekStart); err != nil {
+			return transcriptCheckpointScanResult{Progress: progress}, err
+		}
+	}
+
+	sourceName := filePath
+	if abs, absErr := filepath.Abs(filePath); absErr == nil {
+		sourceName = abs
+	}
+	reader := bufio.NewReaderSize(f, 64*1024)
+	state := progress.State
+	offset := progress.Offset
+	lineNo := progress.Line
+	scanStart := offset
+	matchFound := progress.MatchFound
+	matchLine := progress.MatchLine
+	matchOffset := progress.MatchOffset
+	setProgress := func() transcriptCheckpointScanProgress {
+		return transcriptCheckpointScanProgress{
+			SourceIdentity: identity,
+			Offset:         offset,
+			Line:           lineNo,
+			State:          state,
+			MatchFound:     matchFound,
+			MatchLine:      matchLine,
+			MatchOffset:    matchOffset,
+		}
+	}
+	stable := func() error {
+		current, statErr := os.Stat(filePath)
+		if statErr != nil {
+			return statErr
+		}
+		if current.IsDir() || expected != nil && !os.SameFile(expected, current) {
+			return fmt.Errorf("transcript source %q changed during checkpoint scan", filePath)
+		}
+		if expected != nil && (current.Size() != expected.Size() || !current.ModTime().Equal(expected.ModTime()) ||
+			teamstore.SourceFileChangeTimeFromFileInfo(current) != teamstore.SourceFileChangeTimeFromFileInfo(expected)) {
+			return fmt.Errorf("transcript source %q changed during checkpoint scan", filePath)
+		}
+		if identity != "" {
+			currentIdentity, identityErr := teamstore.SourceFileIdentityFromFileInfo(filePath, current)
+			if identityErr != nil {
+				return identityErr
+			}
+			if strings.TrimSpace(currentIdentity) == "" || strings.TrimSpace(currentIdentity) != identity {
+				return fmt.Errorf("transcript source %q identity changed during checkpoint scan", filePath)
+			}
+		}
+		return nil
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return transcriptCheckpointScanResult{Progress: setProgress()}, err
+		}
+		if maxBytes > 0 && offset > scanStart && offset-scanStart >= maxBytes {
+			if err := stable(); err != nil {
+				return transcriptCheckpointScanResult{Progress: setProgress()}, err
+			}
+			return transcriptCheckpointScanResult{Progress: setProgress()}, nil
+		}
+		read, readErr := historyTieredReadJSONLRecord(reader, historyTieredMaxRecordBytes, historyTieredMaxRecordReadBytes)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return transcriptCheckpointScanResult{Progress: setProgress()}, ctxErr
+		}
+		complete := read.Complete || (readErr == io.EOF && read.BytesRead > 0)
+		if read.BytesRead > 0 {
+			line := read.Line
+			lineNo++
+			lineStartOffset := offset
+			nextOffset := offset + read.BytesRead
+			if complete && !read.Oversized {
+				trimmed := bytes.TrimSpace(line)
+				if len(trimmed) > 0 {
+					records, indices := checkpointLineMatchIndices(trimmed, lineNo, afterKey, state, sourceName)
+					if len(indices) > 1 || len(indices) == 1 && matchFound {
+						return transcriptCheckpointScanResult{Progress: setProgress()}, &TranscriptCheckpointAmbiguousError{AfterKey: afterKey, MatchCount: len(indices) + boolInt(matchFound)}
+					}
+					if len(indices) == 1 {
+						positionLine, positionOffset := transcriptCheckpointPositionAfterMatch(records, indices[0], lineNo, lineStartOffset, nextOffset)
+						matchFound = true
+						matchLine = positionLine
+						matchOffset = positionOffset
+					}
+					advanceTranscriptScanState(trimmed, lineNo, &state)
+				}
+			}
+			offset = nextOffset
+		}
+		if readErr != nil {
+			if readErr != io.EOF {
+				return transcriptCheckpointScanResult{Progress: setProgress()}, readErr
+			}
+			if err := stable(); err != nil {
+				return transcriptCheckpointScanResult{Progress: setProgress()}, err
+			}
+			result := transcriptCheckpointScanResult{
+				Complete: true,
+				Found:    matchFound,
+				Progress: setProgress(),
+			}
+			if matchFound {
+				result.Position = transcriptCheckpointPosition{
+					Line:          matchLine,
+					Offset:        matchOffset,
+					SourceSize:    info.Size(),
+					SourceModTime: info.ModTime(),
+				}
+			}
+			return result, nil
+		}
+	}
+}
+
+func boolInt(value bool) int {
+	if value {
+		return 1
+	}
+	return 0
 }
 
 // findTranscriptCheckpointPositionWithContext is the cancellation-aware form
@@ -410,91 +692,11 @@ func findTranscriptCheckpointPosition(filePath string, afterKey string) (transcr
 // context cannot interrupt a single kernel/file read, so callers that need a
 // hard process boundary must still use an external watchdog.
 func findTranscriptCheckpointPositionWithContext(ctx context.Context, filePath string, afterKey string) (transcriptCheckpointPosition, bool, error) {
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	if err := ctx.Err(); err != nil {
-		return transcriptCheckpointPosition{}, false, err
-	}
-	afterKey = strings.TrimSpace(afterKey)
-	if strings.TrimSpace(filePath) == "" || afterKey == "" {
-		return transcriptCheckpointPosition{}, false, nil
-	}
-	f, err := os.Open(filePath)
+	result, err := scanTranscriptCheckpointWithContext(ctx, filePath, afterKey, nil, "", transcriptCheckpointScanProgress{}, 0)
 	if err != nil {
 		return transcriptCheckpointPosition{}, false, err
 	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil {
-		return transcriptCheckpointPosition{}, false, err
-	}
-	if info.IsDir() {
-		return transcriptCheckpointPosition{}, false, fmt.Errorf("transcript path %q is a directory", filePath)
-	}
-
-	sourceName := filePath
-	if abs, err := filepath.Abs(filePath); err == nil {
-		sourceName = abs
-	}
-
-	reader := bufio.NewReaderSize(f, 64*1024)
-	var state transcriptParseState
-	lineNo := 0
-	var offset int64
-	for {
-		if err := ctx.Err(); err != nil {
-			return transcriptCheckpointPosition{}, false, err
-		}
-		read, err := historyTieredReadJSONLRecord(reader, historyTieredMaxRecordBytes, historyTieredMaxRecordReadBytes)
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return transcriptCheckpointPosition{}, false, ctxErr
-		}
-		complete := read.Complete
-		if read.BytesRead > 0 {
-			line := read.Line
-			lineNo++
-			lineStartOffset := offset
-			nextOffset := offset + read.BytesRead
-			if complete && !read.Oversized {
-				trimmed := bytes.TrimSpace(line)
-				if len(trimmed) > 0 {
-					records, index, ok := checkpointLineMatchRecords(trimmed, lineNo, afterKey, state, sourceName)
-					if ok {
-						pos := transcriptCheckpointPosition{
-							Line:          lineNo,
-							Offset:        nextOffset,
-							SourceSize:    info.Size(),
-							SourceModTime: info.ModTime(),
-						}
-						for i := index + 1; i < len(records); i++ {
-							if records[i].SourceLine != records[index].SourceLine {
-								break
-							}
-							if strings.TrimSpace(transcriptRecordCheckpointKey(records[i])) != "" {
-								pos.Line = lineNo
-								if pos.Line > 0 {
-									pos.Line--
-								}
-								pos.Offset = lineStartOffset
-								break
-							}
-						}
-						return pos, true, nil
-					}
-					advanceTranscriptScanState(trimmed, lineNo, &state)
-				}
-			}
-			offset = nextOffset
-		}
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return transcriptCheckpointPosition{}, false, err
-		}
-	}
-	return transcriptCheckpointPosition{}, false, nil
+	return result.Position, result.Found, nil
 }
 
 func transcriptCheckpointLineNumber(key string) (int, bool) {

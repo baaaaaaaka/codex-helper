@@ -96,6 +96,10 @@ func TestTeamsQueueOnlyControlNewDefersGraphCreation(t *testing.T) {
 	if found.Status != teamstore.InboundStatusDeferred || found.Source != "teams_control_new" {
 		t.Fatalf("queue-only control new inbound = %#v, want deferred teams_control_new", *found)
 	}
+	wantKey := bridge.deferredControlOperationKey("teams_control_new", found.ID, msg.ID)
+	if found.OperationState != "deferred" || found.OperationKey != wantKey {
+		t.Fatalf("queue-only control new operation metadata = state=%q key=%q, want deferred/%q", found.OperationState, found.OperationKey, wantKey)
+	}
 }
 
 func TestTeamsQueueOnlyControlSelectUsesGenericReplayLane(t *testing.T) {

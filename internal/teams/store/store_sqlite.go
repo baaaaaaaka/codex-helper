@@ -1741,6 +1741,11 @@ var sqliteOutboxPostSendEffectsBackfillRowTestHook func()
 // that the setup-free runtime handle remains available to owner liveness.
 var sqliteSchemaPreparationTestHook func(stage string)
 
+// sqliteHistoryWatchProjectionLoadTestHook is nil in production. The outbox
+// queue regression uses it to prove ordinary message admission does not
+// hydrate the cold history-watch projection under the SQLite state lock.
+var sqliteHistoryWatchProjectionLoadTestHook func()
+
 // sqliteCompatibilityProjectionPageTestHook is nil in production. Tests use
 // it to cancel preparation between durable keyset pages and verify that a
 // restart resumes from the cursor without publishing a partial capability.
@@ -14481,6 +14486,9 @@ func loadSQLiteColdStateWithChatSequences(ctx context.Context, q interface {
 func loadSQLiteHistoryWatchProjection(ctx context.Context, q interface {
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 }) (map[string]HistoryWatchCheckpoint, time.Time, int64, int64, bool, error) {
+	if sqliteHistoryWatchProjectionLoadTestHook != nil {
+		sqliteHistoryWatchProjectionLoadTestHook()
+	}
 	var raw []byte
 	var stateJSONRevision int64
 	// Read the projection and the epoch in one scoped query.  The epoch is
@@ -18610,6 +18618,51 @@ func loadSQLiteOutboxLinkedRecordsTx(ctx context.Context, tx *sql.Tx, state *Sta
 	return nil
 }
 
+// mergeSQLiteExistingHelperDeliveryRowsTx preserves the small amount of
+// helper-delivery history that the in-memory reducer would have observed when
+// the old queue path loaded the complete cold state. The normal queue path has
+// at most one newly generated deterministic helper ID, so probing by primary
+// key is bounded and avoids rereading every helper row (or state_json).
+func mergeSQLiteExistingHelperDeliveryRowsTx(ctx context.Context, tx *sql.Tx, state *State) error {
+	if state == nil || len(state.HelperDeliveries) == 0 {
+		return nil
+	}
+	for id, generated := range state.HelperDeliveries {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		existingState := State{HelperDeliveries: map[string]HelperDeliveryRecord{}}
+		if err := loadSQLiteOutboxLinkedJSONMapTx(ctx, tx, &existingState, "helper_deliveries", `SELECT id, json FROM helper_deliveries WHERE id = ?`, []any{id}, existingState.HelperDeliveries, func(v HelperDeliveryRecord) string { return v.ID }, nil); err != nil {
+			return err
+		}
+		if _, opaque := existingState.opaqueOutboxLinkedRecords["helper_deliveries:"+id]; opaque {
+			// Keep an opaque optional linked row forensic. The new outbox row is
+			// still durable, but must not overwrite a malformed helper record.
+			delete(state.HelperDeliveries, id)
+			continue
+		}
+		existing, ok := existingState.HelperDeliveries[id]
+		if !ok {
+			continue
+		}
+		if !existing.CreatedAt.IsZero() {
+			generated.CreatedAt = existing.CreatedAt
+		}
+		if generated.CodexThreadID == "" {
+			generated.CodexThreadID = existing.CodexThreadID
+		}
+		if generated.TeamsMessageID == "" {
+			generated.TeamsMessageID = existing.TeamsMessageID
+		}
+		if generated.SentAt.IsZero() {
+			generated.SentAt = existing.SentAt
+		}
+		state.HelperDeliveries[id] = generated
+	}
+	return nil
+}
+
 // sqliteOutboxLinkedRowsExistTx is the cheap guard for the JSON compatibility
 // payloads attached to an outbox row. Most ordinary helper/status messages do
 // not have transcript, helper-delivery, or artifact rows at all. Loading three
@@ -19100,13 +19153,26 @@ func (s *Store) inboundRecoveryCandidatesSQLite(ctx context.Context) ([]InboundE
 			return err
 		}
 		turnID := sqliteSafeJSONExtract("json", "$.turn_id")
-		deferredDue := sqliteInboundDeferredDueSQL("json")
+		sourceType := sqliteSafeJSONType("json", "$.source")
+		source := sqliteSafeJSONExtract("json", "$.source")
+		recoveryDue := sqliteInboundDeferredDueSQL("json")
+		// Registry-migration rows are durable audit evidence, not executable
+		// inbound work when they have not been linked to a turn.  The canonical
+		// candidate predicate excludes this exact case too.  Apply the same
+		// narrow, case-insensitive source filter in SQL so a large migrated store
+		// does not unmarshal tens of thousands of audit rows on every listener
+		// cycle.  Non-text/malformed source values remain eligible for the Go
+		// decoder, preserving the fail-closed fallback for damaged rows.
+		registryMigrationWithoutTurn := `(` + sourceType + ` = 'text'
+			AND lower(trim(COALESCE(` + source + `, ''))) = 'registry_migration'
+			AND trim(COALESCE(` + turnID + `, '')) = '')`
 		now := time.Now()
 		rows, err := db.QueryContext(ctx, `SELECT json FROM inbound_events
-			WHERE (`+statusColumn+` = ? AND `+deferredDue+`)
-			   OR (`+statusColumn+` IN (?, ?) AND trim(COALESCE(`+turnID+`, '')) = '')
+			WHERE ((`+statusColumn+` = ? AND `+recoveryDue+`)
+			   OR (`+statusColumn+` IN (?, ?) AND trim(COALESCE(`+turnID+`, '')) = '' AND `+recoveryDue+`))
+			  AND NOT `+registryMigrationWithoutTurn+`
 			ORDER BY teams_chat_id, created_at, teams_message_id`,
-			string(InboundStatusDeferred), now.UTC().Format(time.RFC3339Nano), string(InboundStatusPersisted), string(InboundStatusQueued))
+			string(InboundStatusDeferred), now.UTC().Format(time.RFC3339Nano), string(InboundStatusPersisted), string(InboundStatusQueued), now.UTC().Format(time.RFC3339Nano))
 		if err != nil {
 			return err
 		}
@@ -20561,7 +20627,7 @@ func (s *Store) updateInboundEventSQLiteWithCapability(ctx context.Context, inbo
 		if next.UpdatedAt.IsZero() {
 			next.UpdatedAt = now
 		}
-		if capability.bound() && (!found || strings.TrimSpace(current.MachineID) == "" && current.LeaseGeneration <= 0 || current.Status == InboundStatusDeferred && (strings.TrimSpace(current.MachineID) != capability.machineID || current.LeaseGeneration != capability.leaseGeneration)) {
+		if capability.bound() && (!found || strings.TrimSpace(current.MachineID) == "" && current.LeaseGeneration <= 0 || inboundEventCanBeAdoptedByOwner(current) && (strings.TrimSpace(current.MachineID) != capability.machineID || current.LeaseGeneration != capability.leaseGeneration)) {
 			next.MachineID = capability.machineID
 			next.LeaseGeneration = capability.leaseGeneration
 		}
@@ -23123,9 +23189,21 @@ func (s *Store) queueOutboxSQLiteWithCapability(ctx context.Context, msg OutboxM
 				handled = true
 				return tx.Commit()
 			}
-			state, err := loadSQLiteColdState(ctx, tx)
-			if err != nil {
-				return err
+			// Queueing an ordinary outbox row does not need the cold state
+			// document. The reducer below only consults the selected turn/session,
+			// the target chat sequence, and helper-delivery rows linked to this
+			// outbox. Loading state_json here also overlays the complete
+			// history_watch_projection; on a production-sized store that made every
+			// prompt ACK pay for megabytes of JSON parsing while holding the single
+			// SQLite state lock. Keep this transaction's state intentionally narrow;
+			// the split tables remain the durable source for the fields it needs.
+			state := State{
+				SchemaVersion:    SchemaVersion,
+				Sessions:         map[string]SessionContext{},
+				Turns:            map[string]Turn{},
+				OutboxMessages:   map[string]OutboxMessage{},
+				HelperDeliveries: map[string]HelperDeliveryRecord{},
+				ChatSequences:    map[string]ChatSequenceState{},
 			}
 			if capability.bound() {
 				state.ControlLease, err = loadSQLiteControlLease(ctx, tx)
@@ -23138,8 +23216,9 @@ func (s *Store) queueOutboxSQLiteWithCapability(ctx context.Context, msg OutboxM
 				msg.MachineID = capability.machineID
 				msg.LeaseGeneration = capability.leaseGeneration
 			}
-			state.Sessions = map[string]SessionContext{}
-			state.Turns = map[string]Turn{}
+			if err := loadSQLiteOutboxLinkedJSONMapTx(ctx, tx, &state, "helper_deliveries", `SELECT id, json FROM helper_deliveries WHERE outbox_id = ?`, []any{msg.ID}, state.HelperDeliveries, func(v HelperDeliveryRecord) string { return v.ID }, func(v HelperDeliveryRecord) bool { return strings.TrimSpace(v.OutboxID) == strings.TrimSpace(msg.ID) }); err != nil {
+				return err
+			}
 			if turnID := strings.TrimSpace(msg.TurnID); turnID != "" {
 				if turn, ok, err := loadSQLiteJSONRow[Turn](ctx, tx, `SELECT json FROM turns WHERE id = ?`, turnID); err != nil {
 					return err
@@ -23173,6 +23252,9 @@ func (s *Store) queueOutboxSQLiteWithCapability(ctx context.Context, msg OutboxM
 			handled = true
 			if !created {
 				return tx.Commit()
+			}
+			if err := mergeSQLiteExistingHelperDeliveryRowsTx(ctx, tx, &state); err != nil {
+				return err
 			}
 			if err := upsertSQLiteOutboxTx(ctx, tx, out); err != nil {
 				return err

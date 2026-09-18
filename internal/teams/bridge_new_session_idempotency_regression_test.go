@@ -16,7 +16,7 @@ import (
 // A create-or-get POST can succeed at Graph and lose its response on the
 // network.  Replaying the durable /new inbound must address the same remote
 // operation rather than creating a second Work chat.
-func TestBridgeDeferredControlNewUnknownCreateResultUsesStableCreateOrGetKey(t *testing.T) {
+func TestBridgeDeferredControlNewUnknownCreateResultIsHeldWithoutAutomaticReplay(t *testing.T) {
 	ctx := context.Background()
 	workDir := t.TempDir()
 	var externalIDs []string
@@ -93,53 +93,35 @@ func TestBridgeDeferredControlNewUnknownCreateResultUsesStableCreateOrGetKey(t *
 		jitter:     func(d time.Duration) time.Duration { return d },
 	}, store, &recordingExecutor{})
 	bridge.reg.Sessions = nil
+	seedDeferredControlOperationMetadata(t, store, bridge, messageID)
 
-	if err := bridge.processDeferredInbound(ctx); err == nil {
-		t.Fatal("first replay unexpectedly succeeded after unknown create-or-get result")
+	if err := bridge.processDeferredInbound(ctx); err != nil {
+		t.Fatalf("first replay should durably hold the unknown result: %v", err)
 	}
 	state, err := store.Load(ctx)
 	if err != nil {
 		t.Fatalf("Load after unknown result: %v", err)
 	}
-	deferred, err := store.DeferredInbound(ctx)
-	if err != nil || len(deferred) != 1 {
-		t.Fatalf("DeferredInbound after unknown result = %#v, err=%v", deferred, err)
+	inboundID := "inbound:control-chat:" + messageID
+	inbound := state.InboundEvents[inboundID]
+	if inbound.Status != teamstore.InboundStatusUncertain || inbound.OperationState != "request_started_unknown" || inbound.OperationKey == "" {
+		t.Fatalf("inbound status after unknown result = %#v, want durable uncertainty", inbound)
 	}
-	inboundID := deferred[0].ID
-	if got := state.InboundEvents[inboundID].Status; got != teamstore.InboundStatusDeferred {
-		t.Fatalf("inbound status after unknown result = %s, want deferred", got)
+	if len(externalIDs) != 1 || createdResources != 1 {
+		t.Fatalf("create-or-get evidence = externalIDs=%#v resources=%d, want one remote operation", externalIDs, createdResources)
 	}
-	if !state.InboundEvents[inboundID].NextAttemptAt.After(time.Now()) || state.InboundEvents[inboundID].FailureCount != 1 {
-		t.Fatalf("deferred retry metadata after unknown result = %#v, want one future-gated failure", state.InboundEvents[inboundID])
-	}
-	if _, _, err := store.UpdateInboundEvent(ctx, inboundID, func(current teamstore.InboundEvent, found bool, now time.Time) (teamstore.InboundEvent, bool, error) {
-		if !found {
-			t.Fatalf("unknown-result inbound disappeared before forced wake")
-		}
-		current.NextAttemptAt = time.Time{}
-		return current, true, nil
-	}); err != nil {
-		t.Fatalf("force unknown-result retry due: %v", err)
-	}
-
-	if err := bridge.processDeferredInbound(ctx); err != nil {
-		t.Fatalf("replay after unknown result: %v", err)
-	}
-	if len(externalIDs) != 2 || externalIDs[0] != externalIDs[1] {
-		t.Fatalf("create-or-get external ids = %#v, want the same durable key on replay", externalIDs)
-	}
-	if createdResources != 1 {
-		t.Fatalf("remote Work chat resources = %d, want exactly one", createdResources)
-	}
-	if len(bridge.reg.Sessions) != 1 || bridge.reg.Sessions[0].ChatID != "work-chat-1" {
-		t.Fatalf("local session projection = %#v, want one session bound to the recovered chat", bridge.reg.Sessions)
-	}
-	state, err = store.Load(ctx)
+	candidates, err := store.InboundRecoveryCandidates(ctx)
 	if err != nil {
-		t.Fatalf("Load after successful replay: %v", err)
+		t.Fatalf("recovery candidates after unknown result: %v", err)
 	}
-	if got := state.InboundEvents[inboundID].Status; got != teamstore.InboundStatusIgnored {
-		t.Fatalf("inbound status after replay = %s, want ignored", got)
+	if len(candidates) != 0 {
+		t.Fatalf("uncertain inbound remained an automatic candidate: %#v", candidates)
+	}
+	if err := bridge.processDeferredInbound(ctx); err != nil {
+		t.Fatalf("second recovery sweep after unknown result: %v", err)
+	}
+	if len(externalIDs) != 1 || createdResources != 1 {
+		t.Fatalf("unknown result was reposted on second sweep: externalIDs=%#v resources=%d", externalIDs, createdResources)
 	}
 }
 
@@ -221,39 +203,61 @@ func TestBridgeDeferredInboundGraphFailureDoesNotBlockLaterRow(t *testing.T) {
 		jitter:     func(d time.Duration) time.Duration { return d },
 	}, store, &recordingExecutor{})
 	bridge.reg.Sessions = nil
+	seedDeferredControlOperationMetadata(t, store, bridge, firstMessageID)
+	seedDeferredControlOperationMetadata(t, store, bridge, secondMessageID)
 
-	if err := bridge.processDeferredInbound(ctx); err == nil {
-		t.Fatal("deferred recovery unexpectedly hid the first row's Graph 429")
+	if err := bridge.processDeferredInbound(ctx); err != nil {
+		t.Fatalf("deferred recovery should isolate the first row's Graph 429: %v", err)
 	}
-	if createAttempts < 2 {
-		t.Fatalf("create-or-get attempts = %d, want the throttled first row and a later healthy row", createAttempts)
+	if createAttempts != 2 {
+		t.Fatalf("create-or-get attempts = %d, want one attempt for each row", createAttempts)
 	}
 	deferred, err := store.DeferredInbound(ctx)
 	if err != nil {
 		t.Fatalf("DeferredInbound after mixed recovery: %v", err)
 	}
-	if len(deferred) != 1 || deferred[0].TeamsMessageID != firstMessageID {
-		t.Fatalf("deferred rows after mixed recovery = %#v, want only the throttled first row", deferred)
+	if len(deferred) != 0 {
+		t.Fatalf("deferred rows after mixed recovery = %#v, want no automatic candidate after POST 429", deferred)
 	}
-	first, ok, err := store.InboundEventByID(ctx, deferred[0].ID)
+	first, ok, err := store.InboundEventByID(ctx, "inbound:control-chat:"+firstMessageID)
 	if err != nil || !ok {
 		t.Fatalf("throttled inbound after mixed recovery: %#v ok=%v err=%v", first, ok, err)
 	}
-	if !first.NextAttemptAt.After(time.Now()) || first.FailureCount != 1 {
-		t.Fatalf("throttled inbound retry metadata = %#v, want a future durable gate", first)
+	if first.Status != teamstore.InboundStatusUncertain || first.OperationState != "request_started_unknown" || first.OperationKey == "" {
+		t.Fatalf("throttled inbound disposition = %#v, want durable uncertainty", first)
 	}
 	attemptsAfterFirstPass := createAttempts
 	if err := bridge.processDeferredInbound(ctx); err != nil {
-		t.Fatalf("future-gated deferred recovery returned error: %v", err)
+		t.Fatalf("second deferred recovery returned error: %v", err)
 	}
 	if createAttempts != attemptsAfterFirstPass {
-		t.Fatalf("future-gated deferred row was retried immediately: attempts=%d want=%d", createAttempts, attemptsAfterFirstPass)
+		t.Fatalf("uncertain deferred row was retried automatically: attempts=%d want=%d", createAttempts, attemptsAfterFirstPass)
 	}
 	if len(bridge.reg.Sessions) != 1 || bridge.reg.Sessions[0].ChatID != "healthy-work-chat" {
 		t.Fatalf("later deferred row did not create its Work chat: %#v", bridge.reg.Sessions)
 	}
 	if sent == 0 {
 		t.Fatal("later deferred row made no durable/outbound progress")
+	}
+}
+
+func seedDeferredControlOperationMetadata(t *testing.T, store *teamstore.Store, bridge *Bridge, messageID string) {
+	t.Helper()
+	key := bridge.deferredControlOperationKey("teams_control_new", "", messageID)
+	if key == "" {
+		t.Fatalf("deferred operation key for %q is empty", messageID)
+	}
+	inboundID := teamstoreInboundIDForChatMessage("control-chat", messageID)
+	if _, _, err := store.UpdateInboundEvent(context.Background(), inboundID, func(inbound teamstore.InboundEvent, found bool, now time.Time) (teamstore.InboundEvent, bool, error) {
+		if !found {
+			t.Fatalf("inbound %q was not found while seeding operation metadata", inboundID)
+		}
+		inbound.OperationState = "deferred"
+		inbound.OperationKey = key
+		inbound.UpdatedAt = now
+		return inbound, true, nil
+	}); err != nil {
+		t.Fatalf("seed operation metadata for %q: %v", messageID, err)
 	}
 }
 

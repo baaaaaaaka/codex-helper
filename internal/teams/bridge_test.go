@@ -15157,7 +15157,7 @@ func TestBridgePublishHistoryRetryAfterTitleFailureIsNotSkippedByBackgroundSync(
 	}
 }
 
-func TestBridgePublishDefersDuringHelperUpgradeDrain(t *testing.T) {
+func TestBridgePublishDefersDuringHelperUpgradeDrainRequiresExplicitRecovery(t *testing.T) {
 	prevDiscover := discoverCodexProjectsForTeams
 	discoverCodexProjectsForTeams = func(_ context.Context, _ string) ([]codexhistory.Project, error) {
 		return []codexhistory.Project{{
@@ -15238,13 +15238,22 @@ func TestBridgePublishDefersDuringHelperUpgradeDrain(t *testing.T) {
 		t.Fatalf("ClearDrain error: %v", err)
 	}
 	if err := bridge.processDeferredInbound(context.Background()); err != nil {
-		t.Fatalf("processDeferredInbound should use resolved session id instead of expired dashboard number, got: %v", err)
+		t.Fatalf("processDeferredInbound should hold publish without implicit replay, got: %v", err)
 	}
-	if createCalls != 1 {
-		t.Fatalf("createCalls after replay = %d, want 1", createCalls)
+	if createCalls != 0 {
+		t.Fatalf("deferred publish created work chat during automatic recovery: %d", createCalls)
 	}
-	if got := bridge.reg.SessionByCodexThreadID("thread-alpha"); got == nil || got.ChatID != "work-chat" {
-		t.Fatalf("published session after replay not registered: %#v", bridge.reg.Sessions)
+	got, found, err := store.InboundEventByID(context.Background(), deferred[0].ID)
+	if err != nil || !found {
+		t.Fatalf("held deferred publish lookup: found=%v err=%v row=%#v", found, err, got)
+	}
+	if got.Status != teamstore.InboundStatusManualHold || got.OperationState != "manual_hold" || got.OperationKey == "" || got.HoldRequiredEvidence == "" || got.HoldNextAction == "" || got.HoldWakeCondition == "" {
+		t.Fatalf("deferred publish disposition = %#v, want explicit manual hold", got)
+	}
+	if candidates, err := store.InboundRecoveryCandidates(context.Background()); err != nil {
+		t.Fatalf("recovery candidates after held publish: %v", err)
+	} else if len(candidates) != 0 {
+		t.Fatalf("held publish remained an automatic candidate: %#v", candidates)
 	}
 }
 
@@ -22540,8 +22549,8 @@ func TestBridgeUpgradeDrainingControlNewIsDeferredAndReplayed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load error: %v", err)
 	}
-	if got := state.InboundEvents[deferred[0].ID].Status; got != teamstore.InboundStatusIgnored {
-		t.Fatalf("deferred control inbound status = %s, want ignored after replay", got)
+	if got := state.InboundEvents[deferred[0].ID]; got.Status != teamstore.InboundStatusIgnored || got.OperationState != "completed" {
+		t.Fatalf("deferred control inbound after replay = %#v, want ignored/completed", got)
 	}
 }
 
@@ -22623,8 +22632,8 @@ func TestBridgeReloadDrainingControlNewIsDeferredAndReplayed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load error: %v", err)
 	}
-	if got := state.InboundEvents[deferred[0].ID].Status; got != teamstore.InboundStatusIgnored {
-		t.Fatalf("deferred control inbound status = %s, want ignored after replay", got)
+	if got := state.InboundEvents[deferred[0].ID]; got.Status != teamstore.InboundStatusIgnored || got.OperationState != "completed" {
+		t.Fatalf("deferred control inbound after replay = %#v, want ignored/completed", got)
 	}
 }
 
@@ -30867,6 +30876,7 @@ func TestBridgeSyncLinkedTranscriptDedupesLiveStreamedCommentary(t *testing.T) {
 		Kind:           "codex-progress-001",
 		Body:           commentary,
 		Status:         teamstore.OutboxStatusSent,
+		TeamsMessageID: "teams-live-progress",
 		SourceTextHash: normalizedTextHash(commentary),
 	}); err != nil {
 		t.Fatalf("queue live progress outbox error: %v", err)
@@ -32051,6 +32061,7 @@ func TestBridgeSyncLinkedTranscriptStressSkipsLiveStatusesBeforeCheckpointWindow
 				SourceTextHash: normalizedTextHash(text),
 				VisibleHash:    normalizedTextHash(text),
 				Status:         teamstore.HelperDeliveryStatusSent,
+				TeamsMessageID: fmt.Sprintf("teams-live-status-%03d", i),
 				CreatedAt:      now.Add(-30 * time.Minute),
 				UpdatedAt:      now.Add(-30 * time.Minute),
 				SentAt:         now.Add(-30 * time.Minute),
@@ -33601,7 +33612,7 @@ func TestBridgeSyncLinkedTranscriptRecoversOldBlockedBackgroundBacklog(t *testin
 	}
 }
 
-func TestBridgeWorkPublishHistoryCompletesPacedBacklogAndRunsQueuedTurn(t *testing.T) {
+func TestBridgeWorkPublishHistoryCompletesPacedBacklogWithoutRunningQueuedTurnInline(t *testing.T) {
 	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
 	initial := `{"id":"old","role":"assistant","text":"old answer"}` + "\n"
 	if err := os.WriteFile(transcriptPath, []byte(initial), 0o600); err != nil {
@@ -33611,10 +33622,7 @@ func TestBridgeWorkPublishHistoryCompletesPacedBacklogAndRunsQueuedTurn(t *testi
 	defer restoreDiscover()
 	graph, sent := newBridgeAsyncQueueGraph(t)
 	store := newBridgeTestStore(t)
-	executor := &serialStreamingExecutor{
-		started: make(chan string, 1),
-		release: make(chan struct{}),
-	}
+	executor := &recordingExecutor{}
 	bridge := newBridgeTestBridge(graph, store, executor)
 	bridge.asyncTurns = true
 	session := seedLinkedTranscriptForTest(t, bridge, transcriptPath, "thread-1")
@@ -33650,30 +33658,29 @@ func TestBridgeWorkPublishHistoryCompletesPacedBacklogAndRunsQueuedTurn(t *testi
 	if err != nil {
 		t.Fatalf("PersistInbound error: %v", err)
 	}
-	if _, _, err := store.QueueTurn(context.Background(), teamstore.Turn{SessionID: session.ID, InboundEventID: inbound.ID}); err != nil {
+	queuedTurn, _, err := store.QueueTurn(context.Background(), teamstore.Turn{SessionID: session.ID, InboundEventID: inbound.ID})
+	if err != nil {
 		t.Fatalf("QueueTurn error: %v", err)
 	}
 
 	if err := bridge.handleSessionMessage(context.Background(), session.ChatID, bridgePollMessage("publish-history", "2026-05-03T01:06:00Z", "helper publish-history"), "helper publish-history"); err != nil {
 		t.Fatalf("helper publish-history error: %v", err)
 	}
-	select {
-	case got := <-executor.started:
-		if !strings.Contains(got, "teams prompt after catchup") {
-			t.Fatalf("started prompt = %q", got)
-		}
-	case <-time.After(bridgeAsyncTestTimeout):
-		t.Fatal("queued Teams prompt did not start after helper publish-history")
+	if got := executor.promptCount(); got != 0 {
+		t.Fatalf("history-only command started %d queued prompts inline", got)
 	}
-	executor.release <- struct{}{}
-	waitForCompletedTurnCount(t, store, session.ID, 1)
-	waitForNoActiveTurnsOrOutbox(t, store, session.ID)
+	turn, found, err := store.TurnByID(context.Background(), queuedTurn.ID)
+	if err != nil {
+		t.Fatalf("load queued turn after history-only command: %v", err)
+	}
+	if !found || turn.Status != teamstore.TurnStatusQueued {
+		t.Fatalf("queued turn after history-only command = %#v, found=%v; want queued and untouched", turn, found)
+	}
 
 	joined := sentPlainJoined(*sent)
 	for _, want := range []string{
 		"blocked backlog answer 000",
 		"Import complete",
-		"done 1: teams prompt after catchup",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("publish-history output missing %q in:\n%s", want, joined)
@@ -33692,7 +33699,6 @@ func TestBridgeWorkPublishHistoryCompletesPacedBacklogAndRunsQueuedTurn(t *testi
 		"blocked backlog answer 000",
 		fmt.Sprintf("blocked backlog answer %03d", transcriptSyncMaxAutoBacklogRecords),
 		"Import complete",
-		"done 1: teams prompt after catchup",
 	)
 	state, err = store.Load(context.Background())
 	if err != nil {

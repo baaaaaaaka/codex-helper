@@ -48,6 +48,12 @@ const (
 	outboxRecoveryMaxPages         = 32
 	outboxRecoveryMaxPagesPerFlush = 8
 	outboxRecoveryRetryBackoff     = 30 * time.Second
+	// A missing/invalid cached credential cannot be repaired by repeating the
+	// same Graph request. Keep the row durable and retryable, but use a slower
+	// wake than transient transport/auth-provider failures so a large outbox does
+	// not produce a permanent auth-error hot loop. An explicit auth repair is
+	// still picked up on the next wake without changing the no-replay boundary.
+	outboxAuthRecoveryRetryBackoff = 5 * time.Minute
 	// A full projection audit is a maintenance operation. If foreground
 	// outbox writes race its snapshot, wait for a quieter interval before
 	// retrying instead of repeatedly reparsing a large inherited outbox.
@@ -130,6 +136,11 @@ const (
 	// provider's Retry-After is honored exactly when present; other row-local
 	// failures use bounded exponential backoff so a bad row cannot turn every
 	// listener cycle into the same Graph/SQLite operation.
+	// Keep one recovery sweep from spending the entire phase budget on an
+	// inherited control/deferred backlog. Rows not admitted in this quantum stay
+	// durable and are selected by the next wake; per-row retry/hold gates still
+	// provide the ordering and poison-row isolation inside the quantum.
+	maxDeferredInboundRecoveryPerPhase   = 8
 	deferredInboundRetryInitialDelay     = 5 * time.Second
 	deferredInboundRetryMaxDelay         = 30 * time.Minute
 	deferredInboundRetryRateLimitDefault = 30 * time.Second
@@ -616,6 +627,13 @@ type teamsListenerPollContextKey struct{}
 // queue-and-flush behavior.
 type controlPollQueueOnlyContextKey struct{}
 
+// deferredInboundReplayContextKey marks the foreground recovery path.  Some
+// normal command handlers intentionally turn parse/configuration errors into
+// a user-facing control reply and return nil.  Recovery must preserve the
+// typed resolver error instead so the durable inbound row receives a retry
+// gate rather than being falsely retired as Ignored.
+type deferredInboundReplayContextKey struct{}
+
 // workPollQueueOnlyContextKey marks the normal work-chat poll callback. Work
 // polling must only durably admit the inbound message, turn, and ACK; starting
 // Codex or POSTing the ACK synchronously would let one short Graph-read worker
@@ -812,6 +830,21 @@ func teamsPollQueueOnly(ctx context.Context) bool {
 	}
 	queueOnly, _ := ctx.Value(workPollQueueOnlyContextKey{}).(bool)
 	return queueOnly
+}
+
+func withDeferredInboundReplayContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, deferredInboundReplayContextKey{}, true)
+}
+
+func deferredInboundReplayContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	replay, _ := ctx.Value(deferredInboundReplayContextKey{}).(bool)
+	return replay
 }
 
 func teamsListenerPollContextEnabled(ctx context.Context) bool {
@@ -10502,7 +10535,10 @@ func (b *Bridge) ensureControlFallbackSession(ctx context.Context) (*Session, er
 	model := b.effectiveControlFallbackModel()
 	snapshot, err := b.resolveNewSessionModelProfile(ctx, "")
 	if err != nil {
-		return nil, err
+		// Profile resolution is a row-local, no-side-effect dependency for a
+		// deferred control fallback. Keep it distinguishable from store/lease
+		// failures so one broken profile does not freeze every recovery row.
+		return nil, &deferredInboundResolverError{err: err}
 	}
 	effort, effortSource, err := b.reasoningEffortFromGlobalDefault(ctx, snapshot)
 	if err != nil {
@@ -13150,6 +13186,10 @@ func (b *Bridge) createSession(ctx context.Context, msg ChatMessage, request str
 	}
 	parsed, err := b.parseNewSessionRequest(ctx, request)
 	if err != nil {
+		var resolverErr *deferredInboundResolverError
+		if deferredInboundReplayContext(ctx) && errors.As(err, &resolverErr) {
+			return err
+		}
 		return b.sendControl(ctx, err.Error())
 	}
 	if err := b.validateBeaconNewSession(parsed); err != nil {
@@ -13197,6 +13237,15 @@ func (b *Bridge) createSession(ctx context.Context, msg ChatMessage, request str
 	if err := b.ensureDurableSession(ctx, &session); err != nil {
 		return err
 	}
+	// The create-or-get operation has crossed its external boundary and the
+	// resulting local session binding is now durable. Close only this inbound
+	// command's operation record; the creation notice, anchor, and control
+	// response remain independent outbox rows with their own delivery fences.
+	if inboundID := teamstoreInboundIDForChatMessage(b.reg.ControlChatID, msg.ID); inboundID != "" {
+		if err := b.markDeferredInboundOperationCompleted(ctx, inboundID); err != nil {
+			return err
+		}
+	}
 	if err := b.activateBeaconNewSession(session.ID, parsed); err != nil {
 		return err
 	}
@@ -13231,14 +13280,250 @@ func (b *Bridge) createNewSessionMeetingChat(ctx context.Context, msg ChatMessag
 	if messageID == "" {
 		return Chat{}, fmt.Errorf("cannot create Work chat without a durable Teams message id")
 	}
-	externalID := "cxp-new-" + shortStableID(strings.Join([]string{
+	externalID := newSessionMeetingChatOperationKey(b, messageID)
+	graphCtx := ctx
+	controlInboundID := teamstoreInboundIDForChatMessage(b.reg.ControlChatID, messageID)
+	if controlInboundID != "" {
+		graphCtx = withGraphBeforeMethodFirstRequest(ctx, http.MethodPost, func() error {
+			return b.markDeferredInboundOperationStarted(ctx, controlInboundID, externalID)
+		})
+	}
+	chat, _, err := b.graph.CreateOrGetMeetingChat(graphCtx, topic, externalID)
+	if err == nil && controlInboundID != "" {
+		if markErr := b.markDeferredInboundOperationAccepted(ctx, controlInboundID, externalID); markErr != nil {
+			return Chat{}, markErr
+		}
+	}
+	return chat, err
+}
+
+func newSessionMeetingChatOperationKey(b *Bridge, messageID string) string {
+	if b == nil || strings.TrimSpace(messageID) == "" {
+		return ""
+	}
+	return "cxp-new-" + shortStableID(strings.Join([]string{
 		"teams-control-new",
 		strings.TrimSpace(b.scope.ID),
 		strings.TrimSpace(b.reg.ControlChatID),
-		messageID,
+		strings.TrimSpace(messageID),
 	}, "\x00"))
-	chat, _, err := b.graph.CreateOrGetMeetingChat(ctx, topic, externalID)
-	return chat, err
+}
+
+func teamstoreInboundIDForChatMessage(chatID string, messageID string) string {
+	chatID = strings.TrimSpace(chatID)
+	messageID = strings.TrimSpace(messageID)
+	if chatID == "" || messageID == "" {
+		return ""
+	}
+	return "inbound:" + chatID + ":" + messageID
+}
+
+// deferredControlOperationKey returns the stable local identity for a control
+// operation whose replay contract is explicitly supported.  The key is
+// derived from the immutable Teams inbound identity, never from a poll time or
+// a newly generated session ID.  Legacy deferred rows without this key remain
+// report-only/held because an older writer may have crossed a side-effect
+// boundary without recording it.
+func (b *Bridge) deferredControlOperationKey(source string, inboundID string, messageID string) string {
+	source = strings.TrimSpace(source)
+	inboundID = strings.TrimSpace(inboundID)
+	messageID = strings.TrimSpace(messageID)
+	if b == nil || messageID == "" {
+		return ""
+	}
+	switch source {
+	case "teams_control_new":
+		return newSessionMeetingChatOperationKey(b, messageID)
+	case "teams_control_fallback":
+		return "cxp-control-fallback-" + shortStableID(strings.Join([]string{
+			source,
+			strings.TrimSpace(b.scope.ID),
+			strings.TrimSpace(b.reg.ControlChatID),
+			// The Teams message identity is available before PersistInbound assigns
+			// the local row id.  Use it for both the writer and replay paths so a
+			// newly-created row cannot acquire a different key during recovery.
+			messageID,
+		}, "\x00"))
+	default:
+		return ""
+	}
+}
+
+// deferredInboundRecoveryRowMutable is the narrow set of rows that may still
+// be adopted by the foreground recovery lane.  A queued row is safe here only
+// when QueueTurn has not linked it to a turn; a linked row belongs to the turn
+// recovery protocol and must not be rewritten by this operation state machine.
+func deferredInboundRecoveryRowMutable(inbound teamstore.InboundEvent) bool {
+	switch inbound.Status {
+	case teamstore.InboundStatusDeferred, teamstore.InboundStatusPersisted:
+		return true
+	case teamstore.InboundStatusQueued:
+		return strings.TrimSpace(inbound.TurnID) == ""
+	default:
+		return false
+	}
+}
+
+// prepareDeferredControlOperation advances a supported deferred row to the
+// before-request boundary.  It is an owner-fenced expected-row CAS: a
+// replacement owner may adopt only an unlinked row that is still before the
+// request boundary, while a stale callback cannot overwrite a
+// prepared/request-started row.
+func (b *Bridge) prepareDeferredControlOperation(ctx context.Context, inbound teamstore.InboundEvent, operationKey string) (bool, error) {
+	if b == nil || b.store == nil || strings.TrimSpace(inbound.ID) == "" || strings.TrimSpace(operationKey) == "" {
+		return false, nil
+	}
+	update := b.store.UpdateInboundEvent
+	if machineID, generation, ownerBound := b.transcriptCheckpointOwnerCapabilityForContext(ctx); ownerBound {
+		update = func(ctx context.Context, id string, fn func(teamstore.InboundEvent, bool, time.Time) (teamstore.InboundEvent, bool, error)) (teamstore.InboundEvent, bool, error) {
+			return b.store.UpdateInboundEventForOwner(ctx, id, machineID, generation, fn)
+		}
+	}
+	updated, _, err := update(ctx, inbound.ID, func(current teamstore.InboundEvent, found bool, now time.Time) (teamstore.InboundEvent, bool, error) {
+		if !found || !deferredInboundRecoveryRowMutable(current) {
+			return current, false, nil
+		}
+		state := strings.TrimSpace(current.OperationState)
+		if state != "" && state != "deferred" && state != "prepared" {
+			return current, false, errDeferredInboundOperationAlreadyStarted
+		}
+		if key := strings.TrimSpace(current.OperationKey); key != "" && key != strings.TrimSpace(operationKey) {
+			return current, false, fmt.Errorf("deferred inbound operation key changed from %q to %q", key, operationKey)
+		}
+		if state == "prepared" && strings.TrimSpace(current.OperationKey) == strings.TrimSpace(operationKey) {
+			return current, false, nil
+		}
+		current.OperationState = "prepared"
+		current.OperationKey = strings.TrimSpace(operationKey)
+		current.OperationAttemptToken = "prepare:" + shortStableID(current.ID+"\x00"+operationKey)
+		current.LastError = ""
+		current.NextAttemptAt = time.Time{}
+		current.UpdatedAt = now
+		return current, true, nil
+	})
+	if err != nil {
+		return false, err
+	}
+	if !deferredInboundRecoveryRowMutable(updated) || strings.TrimSpace(updated.OperationKey) != strings.TrimSpace(operationKey) || (strings.TrimSpace(updated.OperationState) != "prepared" && strings.TrimSpace(updated.OperationState) != "deferred") {
+		return false, nil
+	}
+	return true, nil
+}
+
+var errDeferredInboundOperationAlreadyStarted = errors.New("deferred inbound operation already crossed the request boundary")
+var errDeferredInboundOperationNotReady = errors.New("deferred inbound operation is no longer safe to execute")
+
+func (b *Bridge) markDeferredInboundOperationStarted(ctx context.Context, inboundID string, operationKey string) error {
+	if b == nil || b.store == nil || strings.TrimSpace(inboundID) == "" || strings.TrimSpace(operationKey) == "" {
+		return nil
+	}
+	update := b.store.UpdateInboundEvent
+	if machineID, generation, ownerBound := b.transcriptCheckpointOwnerCapabilityForContext(ctx); ownerBound {
+		update = func(ctx context.Context, id string, fn func(teamstore.InboundEvent, bool, time.Time) (teamstore.InboundEvent, bool, error)) (teamstore.InboundEvent, bool, error) {
+			return b.store.UpdateInboundEventForOwner(ctx, id, machineID, generation, fn)
+		}
+	}
+	updated, _, err := update(ctx, inboundID, func(inbound teamstore.InboundEvent, found bool, now time.Time) (teamstore.InboundEvent, bool, error) {
+		if !found || !deferredInboundRecoveryRowMutable(inbound) {
+			return inbound, false, errDeferredInboundOperationNotReady
+		}
+		if state := strings.TrimSpace(inbound.OperationState); state != "" && state != "deferred" && state != "prepared" {
+			return inbound, false, errDeferredInboundOperationAlreadyStarted
+		}
+		inbound.OperationState = "request_started"
+		if strings.TrimSpace(inbound.OperationKey) != "" && strings.TrimSpace(inbound.OperationKey) != strings.TrimSpace(operationKey) {
+			return inbound, false, fmt.Errorf("deferred inbound operation key changed from %q to %q", inbound.OperationKey, operationKey)
+		}
+		inbound.OperationKey = strings.TrimSpace(operationKey)
+		inbound.OperationAttemptToken = "attempt:" + shortStableID(inbound.ID+"\x00"+operationKey)
+		inbound.OperationStartedAt = now
+		inbound.LastError = ""
+		inbound.UpdatedAt = now
+		return inbound, true, nil
+	})
+	if err != nil {
+		return err
+	}
+	if !deferredInboundRecoveryRowMutable(updated) || strings.TrimSpace(updated.OperationKey) != strings.TrimSpace(operationKey) || strings.TrimSpace(updated.OperationState) != "request_started" {
+		return errDeferredInboundOperationNotReady
+	}
+	return nil
+}
+
+func (b *Bridge) markDeferredInboundOperationAccepted(ctx context.Context, inboundID string, operationKey string) error {
+	if b == nil || b.store == nil || strings.TrimSpace(inboundID) == "" || strings.TrimSpace(operationKey) == "" {
+		return nil
+	}
+	update := b.store.UpdateInboundEvent
+	if machineID, generation, ownerBound := b.transcriptCheckpointOwnerCapabilityForContext(ctx); ownerBound {
+		update = func(ctx context.Context, id string, fn func(teamstore.InboundEvent, bool, time.Time) (teamstore.InboundEvent, bool, error)) (teamstore.InboundEvent, bool, error) {
+			return b.store.UpdateInboundEventForOwner(ctx, id, machineID, generation, fn)
+		}
+	}
+	updated, _, err := update(ctx, inboundID, func(inbound teamstore.InboundEvent, found bool, now time.Time) (teamstore.InboundEvent, bool, error) {
+		if !found || !deferredInboundRecoveryRowMutable(inbound) {
+			return inbound, false, errDeferredInboundOperationNotReady
+		}
+		if strings.TrimSpace(inbound.OperationKey) != strings.TrimSpace(operationKey) {
+			return inbound, false, errDeferredInboundOperationNotReady
+		}
+		if strings.TrimSpace(inbound.OperationState) == "accepted" {
+			return inbound, false, nil
+		}
+		if strings.TrimSpace(inbound.OperationState) != "request_started" {
+			return inbound, false, errDeferredInboundOperationNotReady
+		}
+		inbound.OperationState = "accepted"
+		inbound.UpdatedAt = now
+		return inbound, true, nil
+	})
+	if err != nil {
+		return err
+	}
+	if !deferredInboundRecoveryRowMutable(updated) || strings.TrimSpace(updated.OperationKey) != strings.TrimSpace(operationKey) || (strings.TrimSpace(updated.OperationState) != "accepted" && strings.TrimSpace(updated.OperationState) != "request_started") {
+		return errDeferredInboundOperationNotReady
+	}
+	return nil
+}
+
+// markDeferredInboundOperationCompleted closes the durable /new operation only
+// after both Graph create-or-get acceptance and the local session binding have
+// been committed. It is intentionally a terminal inbound disposition: the
+// remaining notifications are independent outbox work and must not cause the
+// original non-idempotent command to become an automatic recovery candidate.
+func (b *Bridge) markDeferredInboundOperationCompleted(ctx context.Context, inboundID string) error {
+	if b == nil || b.store == nil || strings.TrimSpace(inboundID) == "" {
+		return nil
+	}
+	update := b.store.UpdateInboundEvent
+	if machineID, generation, ownerBound := b.transcriptCheckpointOwnerCapabilityForContext(ctx); ownerBound {
+		update = func(ctx context.Context, id string, fn func(teamstore.InboundEvent, bool, time.Time) (teamstore.InboundEvent, bool, error)) (teamstore.InboundEvent, bool, error) {
+			return b.store.UpdateInboundEventForOwner(ctx, id, machineID, generation, fn)
+		}
+	}
+	_, _, err := update(ctx, inboundID, func(inbound teamstore.InboundEvent, found bool, now time.Time) (teamstore.InboundEvent, bool, error) {
+		if !found || inbound.Status == teamstore.InboundStatusIgnored && strings.TrimSpace(inbound.OperationState) == "completed" {
+			return inbound, false, nil
+		}
+		if !deferredInboundRecoveryRowMutable(inbound) {
+			return inbound, false, errDeferredInboundOperationNotReady
+		}
+		if strings.TrimSpace(inbound.OperationKey) == "" || strings.TrimSpace(inbound.OperationState) != "accepted" {
+			return inbound, false, errDeferredInboundOperationNotReady
+		}
+		inbound.Status = teamstore.InboundStatusIgnored
+		inbound.OperationState = "completed"
+		inbound.NextAttemptAt = time.Time{}
+		inbound.FailureCount = 0
+		inbound.LastError = ""
+		inbound.HoldReason = ""
+		inbound.HoldRequiredEvidence = ""
+		inbound.HoldNextAction = ""
+		inbound.HoldWakeCondition = ""
+		inbound.UpdatedAt = now
+		return inbound, true, nil
+	})
+	return err
 }
 
 func boolModelSelectionSource(explicit bool) string {
@@ -13390,14 +13675,14 @@ func (b *Bridge) resolveNewSessionModelProfile(ctx context.Context, ref string) 
 		if ref == "" {
 			return modelprofile.Snapshot{}, nil
 		}
-		return modelprofile.Snapshot{}, fmt.Errorf("cannot create model-profile work chat: model profile resolver is not configured")
+		return modelprofile.Snapshot{}, &deferredInboundResolverError{err: fmt.Errorf("cannot create model-profile work chat: model profile resolver is not configured")}
 	}
 	snapshot, err := b.modelProfileResolver(ctx, ref)
 	if err != nil {
 		if ref == "" {
-			return modelprofile.Snapshot{}, fmt.Errorf("cannot resolve default model profile: %w", err)
+			return modelprofile.Snapshot{}, &deferredInboundResolverError{err: fmt.Errorf("cannot resolve default model profile: %w", err)}
 		}
-		return modelprofile.Snapshot{}, fmt.Errorf("cannot create model-profile work chat for %q: %w", ref, err)
+		return modelprofile.Snapshot{}, &deferredInboundResolverError{err: fmt.Errorf("cannot create model-profile work chat for %q: %w", ref, err)}
 	}
 	return snapshot, nil
 }
@@ -14627,6 +14912,155 @@ func (b *Bridge) markInterruptedAfterRestartNoticeSent(ctx context.Context, turn
 	return err
 }
 
+type deferredInboundResolverError struct {
+	err error
+}
+
+func (e *deferredInboundResolverError) Error() string {
+	if e == nil || e.err == nil {
+		return "deferred inbound model-profile resolution failed"
+	}
+	return e.err.Error()
+}
+
+func (e *deferredInboundResolverError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
+type deferredInboundFailureDisposition uint8
+
+const (
+	deferredInboundFailureFatal deferredInboundFailureDisposition = iota
+	deferredInboundFailureRetry
+	deferredInboundFailureHold
+	deferredInboundFailureUncertain
+)
+
+func graphReadMethod(method string) bool {
+	switch strings.ToUpper(strings.TrimSpace(method)) {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return true
+	default:
+		return false
+	}
+}
+
+// classifyDeferredInboundFailure is deliberately stricter than the poll
+// failure classifier. It is used after a durable inbound row has been selected
+// for replay, where retrying a write after the provider boundary is unsafe.
+func classifyDeferredInboundFailure(err error) deferredInboundFailureDisposition {
+	if err == nil || teamstore.IsProcessWideStateError(err) {
+		return deferredInboundFailureFatal
+	}
+	// Authentication is fetched before a Graph request crosses the external
+	// side-effect boundary. Temporary OAuth/proxy failures are therefore safe to
+	// retry, but they must use the same durable row-local backoff as other safe
+	// reads. Missing/invalid credentials cannot be repaired by repeating the
+	// request; hold that row explicitly so it cannot poison the deferred queue.
+	if IsTemporaryAuthError(err) {
+		return deferredInboundFailureRetry
+	}
+	if IsReauthRequiredError(err) || IsAuthCacheError(err) {
+		return deferredInboundFailureHold
+	}
+	var resolverErr *deferredInboundResolverError
+	if errors.As(err, &resolverErr) {
+		return deferredInboundFailureRetry
+	}
+	var gateErr *graphReadGateActiveError
+	if errors.As(err, &gateErr) {
+		return deferredInboundFailureRetry
+	}
+	var preflightErr *graphRequestPreflightError
+	if errors.As(err, &preflightErr) {
+		// A local preflight can wrap token acquisition as well as the owner
+		// capability check. Authentication failures are still before HTTP and
+		// therefore safe to classify row-locally; owner/store failures remain
+		// process-wide so an invalid capability cannot process later rows.
+		if IsTemporaryAuthError(preflightErr) {
+			return deferredInboundFailureRetry
+		}
+		if IsReauthRequiredError(preflightErr) || IsAuthCacheError(preflightErr) {
+			return deferredInboundFailureHold
+		}
+		return deferredInboundFailureFatal
+	}
+	var statusErr *GraphStatusError
+	if errors.As(err, &statusErr) {
+		method := strings.ToUpper(strings.TrimSpace(statusErr.Method))
+		if graphReadMethod(method) {
+			if isRetryableGraphReadFailure(err) {
+				return deferredInboundFailureRetry
+			}
+			// A deterministic read rejection (for example an invalid endpoint or
+			// filter) proves that no write occurred, but retrying it forever is
+			// still wrong. Keep it in an explicit hold for repair.
+			return deferredInboundFailureHold
+		}
+		if method == "" {
+			// Missing method provenance cannot prove that this was a safe read.
+			return deferredInboundFailureFatal
+		}
+		if statusErr.StatusCode == http.StatusRequestTimeout || statusErr.StatusCode == http.StatusConflict ||
+			statusErr.StatusCode == http.StatusTooEarly || statusErr.StatusCode == http.StatusTooManyRequests ||
+			statusErr.StatusCode >= http.StatusInternalServerError {
+			return deferredInboundFailureUncertain
+		}
+		// A provider 4xx rejection is not an invitation to repost. It remains
+		// visible as a manual hold until an explicit operation-specific repair.
+		return deferredInboundFailureHold
+	}
+	var transportErr *GraphTransportError
+	if errors.As(err, &transportErr) {
+		if graphReadMethod(transportErr.Method) {
+			return deferredInboundFailureRetry
+		}
+		return deferredInboundFailureUncertain
+	}
+	var responseErr *GraphResponseError
+	if errors.As(err, &responseErr) {
+		// The response reached the client, but it violated the endpoint
+		// contract.  Retrying the same deferred operation indefinitely would
+		// hide a deterministic provider/query or source-shape defect.  A read
+		// response cannot have caused a write, so it is a repairable hold; a
+		// response attached to a write remains uncertain.
+		if graphReadMethod(responseErr.Method) {
+			return deferredInboundFailureHold
+		}
+		return deferredInboundFailureUncertain
+	}
+	return deferredInboundFailureFatal
+}
+
+func isDeferredInboundExternalOutcomeUnknown(err error) bool {
+	return classifyDeferredInboundFailure(err) == deferredInboundFailureUncertain
+}
+
+func (b *Bridge) handleDeferredInboundRowFailure(ctx context.Context, inbound teamstore.InboundEvent, rowErr error) (bool, error) {
+	switch classifyDeferredInboundFailure(rowErr) {
+	case deferredInboundFailureRetry:
+		return true, b.recordDeferredInboundRetry(ctx, inbound, rowErr)
+	case deferredInboundFailureHold:
+		return true, b.markDeferredInboundManualHold(ctx, inbound.ID, rowErr.Error(), "operator review of the provider/local diagnostic", "repair the operation or resend explicitly", "explicit operator recovery")
+	case deferredInboundFailureUncertain:
+		return true, b.markDeferredInboundUncertain(ctx, inbound.ID, rowErr.Error(), "exact provider reconciliation for the durable operation key", "reconcile the remote result before any retry", "provider reconciliation or explicit operator recovery")
+	default:
+		// Unknown row-local errors must not leave a due deferred row unchanged:
+		// the next poll would select it again and repeat the same operation without
+		// a durable wake or backoff.  Keep errors that invalidate the listener's
+		// capability (including cancellation and process-wide store/lease errors)
+		// on the fatal path; every other untyped error is an explicit hold until an
+		// operator can identify its operation contract.
+		if rowErr == nil || errors.Is(rowErr, context.Canceled) || errors.Is(rowErr, context.DeadlineExceeded) || teamstore.IsProcessWideStateError(rowErr) {
+			return false, rowErr
+		}
+		return true, b.markDeferredInboundManualHold(ctx, inbound.ID, rowErr.Error(), "classify the untyped deferred-operation failure before retry", "repair the operation or perform an explicit operation-specific recovery", "explicit operator recovery")
+	}
+}
+
 func (b *Bridge) processDeferredInbound(ctx context.Context) error {
 	if err := b.ensureStore(); err != nil {
 		return err
@@ -14642,31 +15076,23 @@ func (b *Bridge) processDeferredInbound(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	var firstRowErr error
-	recordRowError := func(inbound teamstore.InboundEvent, rowErr error) {
-		// Keep the retry gate in the same durable row as the recovery work. If
-		// this write fails, surface the store error as the cycle error: continuing
-		// after an unrecorded retry would turn the next cycle into a hot loop.
-		if retryErr := b.recordDeferredInboundRetry(ctx, inbound, rowErr); retryErr != nil {
-			if firstRowErr == nil {
-				firstRowErr = retryErr
-			}
-			if b.out != nil {
-				_, _ = fmt.Fprintf(b.out, "Teams deferred inbound %s retry gate error: %v\n", inbound.ID, retryErr)
-			}
-		} else if firstRowErr == nil {
-			firstRowErr = rowErr
-		}
-		if b.out != nil {
-			_, _ = fmt.Fprintf(b.out, "Teams deferred inbound %s error: %v\n", inbound.ID, rowErr)
-		}
+	if len(deferred) > maxDeferredInboundRecoveryPerPhase {
+		// This is deliberately a durable admission quantum, not a discard. The
+		// unselected rows remain Persisted/Queued/Deferred and will be returned by
+		// the next phase after the selected rows either complete or acquire their
+		// own retry/hold disposition. In particular, a large inherited control
+		// backlog cannot monopolize the same cycle as ordinary Work polling.
+		deferred = deferred[:maxDeferredInboundRecoveryPerPhase]
 	}
+	var firstRowErr error
 	for _, inbound := range deferred {
 		switch inbound.Source {
 		case "teams_control_new", "teams_control_fallback", "teams_control_publish":
 			if err := b.processDeferredControlInbound(ctx, inbound); err != nil {
-				if isDeferredInboundRowLocalFailure(err) {
-					recordRowError(inbound, err)
+				if handled, handleErr := b.handleDeferredInboundRowFailure(ctx, inbound, err); handled {
+					if handleErr != nil {
+						return handleErr
+					}
 					continue
 				}
 				return err
@@ -14674,8 +15100,10 @@ func (b *Bridge) processDeferredInbound(ctx context.Context) error {
 			continue
 		case "teams_control_poll_deferred":
 			if err := b.processDeferredControlPollInbound(ctx, inbound); err != nil {
-				if isDeferredInboundRowLocalFailure(err) {
-					recordRowError(inbound, err)
+				if handled, handleErr := b.handleDeferredInboundRowFailure(ctx, inbound, err); handled {
+					if handleErr != nil {
+						return handleErr
+					}
 					continue
 				}
 				return err
@@ -14683,8 +15111,10 @@ func (b *Bridge) processDeferredInbound(ctx context.Context) error {
 			continue
 		case queueOnlySessionCommandSource:
 			if err := b.processDeferredQueueOnlySessionCommand(ctx, inbound); err != nil {
-				if isDeferredInboundRowLocalFailure(err) {
-					recordRowError(inbound, err)
+				if handled, handleErr := b.handleDeferredInboundRowFailure(ctx, inbound, err); handled {
+					if handleErr != nil {
+						return handleErr
+					}
 					continue
 				}
 				return err
@@ -14692,8 +15122,10 @@ func (b *Bridge) processDeferredInbound(ctx context.Context) error {
 			continue
 		case "teams_session_attachment_deferred", "teams_session_command_deferred":
 			if err := b.rejectDeferredSessionInboundAfterUpgrade(ctx, inbound); err != nil {
-				if isDeferredInboundRowLocalFailure(err) {
-					recordRowError(inbound, err)
+				if handled, handleErr := b.handleDeferredInboundRowFailure(ctx, inbound, err); handled {
+					if handleErr != nil {
+						return handleErr
+					}
 					continue
 				}
 				return err
@@ -14841,14 +15273,16 @@ func (b *Bridge) processDeferredInbound(ctx context.Context) error {
 					return err
 				}
 				continue
-			} else if isDeferredInboundRowLocalFailure(fetchErr) {
-				// Do not mark a permission, malformed-response, or other unknown
-				// read failure as ignored. The inbound remains deferred, gets a
-				// durable per-row retry gate, and the caller keeps the diagnostic for
-				// a later explicit retry.
-				recordRowError(inbound, fetchErr)
-				continue
 			} else {
+				// A refetch is a read-only operation, but its disposition still has
+				// to be explicit: transient transport/read failures get a row gate;
+				// deterministic provider rejection is held instead of hot-looping.
+				if handled, handleErr := b.handleDeferredInboundRowFailure(ctx, inbound, fetchErr); handled {
+					if handleErr != nil {
+						return handleErr
+					}
+					continue
+				}
 				return fetchErr
 			}
 		}
@@ -14911,20 +15345,21 @@ func (b *Bridge) processDeferredInbound(ctx context.Context) error {
 }
 
 func (b *Bridge) processDeferredControlPollInbound(ctx context.Context, inbound teamstore.InboundEvent) error {
-	text := strings.TrimSpace(inbound.Text)
-	msg, hasContext := chatMessageFromInboundContext(inbound)
-	if !hasContext {
-		if text == "" {
-			return b.markDeferredInboundIgnored(ctx, inbound.ID, "deferred control input text is unavailable")
-		}
-		msg = ChatMessage{ID: inbound.TeamsMessageID, ChatID: inbound.TeamsChatID}
-		msg.Body.ContentType = "html"
-		msg.Body.Content = html.EscapeString(text)
-	}
-	if err := b.handleControlMessage(ctx, msg, text); err != nil {
-		return err
-	}
-	return b.markDeferredInboundIgnored(ctx, inbound.ID, "replayed queue-only control command")
+	// This source was created by the bounded read poll for commands that were
+	// deliberately not safe to execute in that phase.  Re-entering the generic
+	// control handler here used to turn a durable hand-off into an implicit
+	// replay of restart/reload/update/publish/select/fallback commands.  Some of
+	// those paths can perform Graph POSTs or start Codex before the inbound row
+	// reaches a terminal state, so a phase timeout could repeat the side effect.
+	// There is currently no operation-specific idempotency contract for this
+	// legacy source. Hold it until an explicit operator/reconciliation path
+	// supplies one; the dedicated teams_control_new/fallback paths have their
+	// own narrower replay code.
+	return b.markDeferredInboundManualHold(ctx, inbound.ID,
+		"queue-only control command has no proven replay contract",
+		"operation key and provider-side reconciliation evidence",
+		"inspect the command and explicitly replay or resend it",
+		"explicit operator recovery")
 }
 
 func (b *Bridge) processDeferredQueueOnlySessionCommand(ctx context.Context, inbound teamstore.InboundEvent) error {
@@ -15324,6 +15759,69 @@ func (b *Bridge) sessionForInboundEvent(ctx context.Context, inbound teamstore.I
 }
 
 func (b *Bridge) processDeferredControlInbound(ctx context.Context, inbound teamstore.InboundEvent) error {
+	// Only the two narrowly specified control operations below have a durable
+	// replay contract.  In particular, a publish command can create or mutate
+	// a session and emit several independent Graph messages; its old deferred
+	// representation has no provider idempotency key or complete operation
+	// boundary.  Re-entering that command after a phase timeout would therefore
+	// be an unsafe implicit replay.  Keep it visible for explicit repair.
+	if inbound.Source != "teams_control_new" && inbound.Source != "teams_control_fallback" {
+		return b.markDeferredInboundManualHold(ctx, inbound.ID,
+			"deferred control operation has no proven replay contract",
+			"operation key and provider-side reconciliation evidence",
+			"inspect the command and explicitly replay or resend it",
+			"explicit operator recovery")
+	}
+	operationKey := b.deferredControlOperationKey(inbound.Source, inbound.ID, inbound.TeamsMessageID)
+	if operationKey == "" || strings.TrimSpace(inbound.OperationKey) == "" {
+		return b.markDeferredInboundManualHold(ctx, inbound.ID,
+			"deferred control row has no durable operation key",
+			"the immutable Teams message identity and an operation-specific replay contract",
+			"reconcile the command and explicitly replay or resend it",
+			"explicit operator recovery")
+	}
+	if strings.TrimSpace(inbound.OperationKey) != operationKey {
+		return b.markDeferredInboundManualHold(ctx, inbound.ID,
+			"deferred control operation key does not match its Teams message identity",
+			"provider reconciliation for the recorded operation key",
+			"repair the durable row before any replay",
+			"explicit operator recovery")
+	}
+	operationState := strings.TrimSpace(inbound.OperationState)
+	if operationState == "" {
+		return b.markDeferredInboundManualHold(ctx, inbound.ID,
+			"deferred control row has no durable operation state",
+			"the before-request operation boundary and provider result",
+			"repair the durable row before any replay",
+			"explicit operator recovery")
+	}
+	if operationState != "deferred" && operationState != "prepared" {
+		if operationState == "accepted" || operationState == "completed" {
+			return b.markDeferredInboundManualHold(ctx, inbound.ID,
+				"deferred control operation was accepted but local completion is missing",
+				"provider reconciliation and local session binding for "+operationKey,
+				"reconcile the created operation before retrying",
+				"explicit operator recovery")
+		}
+		return b.markDeferredInboundUncertain(ctx, inbound.ID,
+			"deferred control operation crossed an external boundary before restart",
+			"provider reconciliation for "+operationKey,
+			"reconcile the remote result before retrying",
+			"provider reconciliation or explicit operator recovery")
+	}
+	prepared, err := b.prepareDeferredControlOperation(ctx, inbound, operationKey)
+	if err != nil {
+		return err
+	}
+	if !prepared {
+		// Another owner or a concurrent recovery pass changed the row after the
+		// candidate snapshot.  The expected-row CAS did not prove that this
+		// callback still owns a before-request row, so it must not perform a
+		// Graph POST or start a turn from the stale snapshot.
+		return nil
+	}
+	inbound.OperationState = "prepared"
+	inbound.OperationKey = operationKey
 	text := strings.TrimSpace(inbound.Text)
 	msg, hasContext := chatMessageFromInboundContext(inbound)
 	if !hasContext {
@@ -15336,6 +15834,20 @@ func (b *Bridge) processDeferredControlInbound(ctx context.Context, inbound team
 	}
 	switch inbound.Source {
 	case "teams_control_new":
+		if state := strings.TrimSpace(inbound.OperationState); state != "" && state != "deferred" && state != "prepared" {
+			if state == "accepted" || state == "completed" {
+				return b.markDeferredInboundManualHold(ctx, inbound.ID,
+					"Work-chat create operation was accepted but local completion is missing",
+					"provider reconciliation and local session binding for "+inbound.OperationKey,
+					"reconcile the created chat before retrying",
+					"explicit operator recovery")
+			}
+			return b.markDeferredInboundUncertain(ctx, inbound.ID,
+				"Work-chat create operation crossed the Graph request boundary before restart",
+				"provider reconciliation for "+inbound.OperationKey,
+				"reconcile the remote chat before retrying",
+				"provider reconciliation or explicit operator recovery")
+		}
 		arg, err := controlNewSessionArgument(text)
 		if err != nil {
 			if markErr := b.markDeferredInboundIgnored(ctx, inbound.ID, err.Error()); markErr != nil {
@@ -15343,26 +15855,10 @@ func (b *Bridge) processDeferredControlInbound(ctx context.Context, inbound team
 			}
 			return b.sendControl(ctx, err.Error())
 		}
-		if err := b.createSession(ctx, msg, arg); err != nil {
+		if err := b.createSession(withDeferredInboundReplayContext(ctx), msg, arg); err != nil {
 			return err
 		}
 		return b.markDeferredInboundIgnored(ctx, inbound.ID, "replayed control new command")
-	case "teams_control_publish":
-		target, err := controlPublishTarget(text)
-		if err != nil {
-			if markErr := b.markDeferredInboundIgnored(ctx, inbound.ID, err.Error()); markErr != nil {
-				return markErr
-			}
-			return b.sendControl(ctx, err.Error())
-		}
-		message, err := b.publishCodexSession(ctx, target)
-		if err != nil {
-			return err
-		}
-		if err := b.sendControl(ctx, message); err != nil {
-			return err
-		}
-		return b.markDeferredInboundIgnored(ctx, inbound.ID, "replayed control publish command")
 	case "teams_control_fallback":
 		if hasSupportedTeamsMediaCardAttachment(msg.Attachments) && !teamsASRTranscriberConfigured(b.asrTranscriber) {
 			message := teamsASRFailureUserMessage(errASRCommandNotConfigured)
@@ -15435,6 +15931,49 @@ func controlPublishTarget(text string) (DashboardCommandTarget, error) {
 	return DashboardCommandTarget{}, fmt.Errorf("deferred control input is no longer a publish command")
 }
 
+// updateDeferredInboundDisposition records a non-terminal recovery fence in
+// the inbound ledger.  It is intentionally a row-local status: held or
+// uncertain control input must not keep unrelated Work chats out of the
+// admission lane, but it must remain discoverable for explicit repair.
+func (b *Bridge) updateDeferredInboundDisposition(ctx context.Context, inboundID string, status teamstore.InboundStatus, operationState string, reason string, requiredEvidence string, nextAction string, wakeCondition string) error {
+	if b == nil || b.store == nil || strings.TrimSpace(inboundID) == "" {
+		return nil
+	}
+	update := b.store.UpdateInboundEvent
+	if machineID, generation, ownerBound := b.transcriptCheckpointOwnerCapabilityForContext(ctx); ownerBound {
+		update = func(ctx context.Context, inboundID string, fn func(teamstore.InboundEvent, bool, time.Time) (teamstore.InboundEvent, bool, error)) (teamstore.InboundEvent, bool, error) {
+			return b.store.UpdateInboundEventForOwner(ctx, inboundID, machineID, generation, fn)
+		}
+	}
+	_, _, err := update(ctx, inboundID, func(inbound teamstore.InboundEvent, found bool, now time.Time) (teamstore.InboundEvent, bool, error) {
+		if !found || !deferredInboundRecoveryRowMutable(inbound) {
+			return inbound, false, nil
+		}
+		inbound.Status = status
+		inbound.OperationState = strings.TrimSpace(operationState)
+		if inbound.OperationKey == "" {
+			inbound.OperationKey = "inbound:" + strings.TrimSpace(inbound.ID)
+		}
+		inbound.LastError = trimPollDiagnostic(reason)
+		inbound.HoldReason = trimPollDiagnostic(reason)
+		inbound.HoldRequiredEvidence = trimPollDiagnostic(requiredEvidence)
+		inbound.HoldNextAction = trimPollDiagnostic(nextAction)
+		inbound.HoldWakeCondition = trimPollDiagnostic(wakeCondition)
+		inbound.NextAttemptAt = time.Time{}
+		inbound.UpdatedAt = now
+		return inbound, true, nil
+	})
+	return err
+}
+
+func (b *Bridge) markDeferredInboundManualHold(ctx context.Context, inboundID string, reason string, requiredEvidence string, nextAction string, wakeCondition string) error {
+	return b.updateDeferredInboundDisposition(ctx, inboundID, teamstore.InboundStatusManualHold, "manual_hold", reason, requiredEvidence, nextAction, wakeCondition)
+}
+
+func (b *Bridge) markDeferredInboundUncertain(ctx context.Context, inboundID string, reason string, requiredEvidence string, nextAction string, wakeCondition string) error {
+	return b.updateDeferredInboundDisposition(ctx, inboundID, teamstore.InboundStatusUncertain, "request_started_unknown", reason, requiredEvidence, nextAction, wakeCondition)
+}
+
 func (b *Bridge) markDeferredInboundIgnored(ctx context.Context, inboundID string, reason string) error {
 	update := b.store.UpdateInboundEvent
 	if machineID, generation, ownerBound := b.transcriptCheckpointOwnerCapabilityForContext(ctx); ownerBound {
@@ -15443,7 +15982,7 @@ func (b *Bridge) markDeferredInboundIgnored(ctx context.Context, inboundID strin
 		}
 	}
 	_, _, err := update(ctx, inboundID, func(inbound teamstore.InboundEvent, found bool, now time.Time) (teamstore.InboundEvent, bool, error) {
-		if !found || inbound.Status != teamstore.InboundStatusDeferred {
+		if !found || !deferredInboundRecoveryRowMutable(inbound) {
 			return inbound, false, nil
 		}
 		inbound.Status = teamstore.InboundStatusIgnored
@@ -16373,7 +16912,7 @@ func (b *Bridge) recordDeferredInboundRetry(ctx context.Context, inbound teamsto
 		}
 	}
 	_, _, err := update(ctx, inbound.ID, func(current teamstore.InboundEvent, found bool, now time.Time) (teamstore.InboundEvent, bool, error) {
-		if !found || current.Status != teamstore.InboundStatusDeferred {
+		if !found || !deferredInboundRecoveryRowMutable(current) {
 			return current, false, nil
 		}
 		if current.FailureCount < 1<<30 {
@@ -16395,21 +16934,13 @@ func (b *Bridge) recordDeferredInboundRetry(ctx context.Context, inbound teamsto
 	return err
 }
 
-// isDeferredInboundRowLocalFailure identifies failures that belong to one
-// deferred inbound row.  A Graph 429/5xx or an unknown transport result must
-// leave that row durable and retryable, but it must not prevent later chats'
-// deferred work from being attempted in the same cycle.  Durable store,
-// ownership, and lease errors remain fail-fast because continuing after those
-// errors could cross a global safety boundary.
+// isDeferredInboundRowLocalFailure is retained for narrow callers that only
+// need to ask whether a retry gate is appropriate.  It must not classify an
+// arbitrary GraphStatusError or EOF as row-local: a POST/PATCH response loss
+// is an unknown external outcome, and an untyped EOF may come from the
+// executor rather than a safe Graph read.
 func isDeferredInboundRowLocalFailure(err error) bool {
-	if err == nil {
-		return false
-	}
-	if isRetryableGraphReadFailure(err) || errors.Is(err, io.EOF) {
-		return true
-	}
-	var graphErr *GraphStatusError
-	return errors.As(err, &graphErr)
+	return classifyDeferredInboundFailure(err) == deferredInboundFailureRetry
 }
 
 func isPermanentMissingDeferredTeamsMessage(err error) bool {
@@ -21358,6 +21889,13 @@ func (b *Bridge) persistInboundWithStatusAndSource(ctx context.Context, session 
 		Source:          source,
 		Status:          status,
 	}
+	if operationKey := b.deferredControlOperationKey(source, "", msg.ID); operationKey != "" {
+		// Supported control operations enter recovery with a stable local and
+		// provider identity.  This metadata is written with the inbound row, so a
+		// restart never has to infer whether an old callback crossed Graph.
+		event.OperationState = "deferred"
+		event.OperationKey = operationKey
+	}
 	if shouldPersistInboundAttachmentContext(session, msg) {
 		event.TeamsBodyType = strings.TrimSpace(msg.Body.ContentType)
 		event.TeamsBodyHTML = msg.Body.Content
@@ -21988,6 +22526,7 @@ func (b *Bridge) queueTranscriptDeliveryChunksWithNamespace(ctx context.Context,
 		}
 		applyTranscriptSourceProofToOutbox(&msg, opts)
 		msg = b.prepareOutboxForQueue(ctx, msg)
+		sourceSize, sourceModTime, sourceChangeTime := transcriptSourceFileStateWithChangeTime(local.FilePath)
 		queuedMsg, _, _, err := b.store.QueueTranscriptDeliveryOutbox(ctx, teamstore.TranscriptDeliveryQueueRequest{
 			Message:  msg,
 			Delivery: delivery,
@@ -21998,6 +22537,9 @@ func (b *Bridge) queueTranscriptDeliveryChunksWithNamespace(ctx context.Context,
 				SourceFingerprint: opts.ExpectedSourceFingerprint,
 				LastOffset:        opts.ExpectedSourceOffset,
 				LastOffsetKnown:   opts.ExpectedSourceOffsetKnown,
+				SourceSize:        sourceSize,
+				SourceModTime:     sourceModTime,
+				SourceChangeTime:  sourceChangeTime,
 			},
 			ParentFenceSessionID: strings.TrimSpace(opts.ParentFenceSessionID),
 		})
@@ -23549,6 +24091,9 @@ func outboxRetryGateUntil(err error, now time.Time) time.Time {
 	if errors.As(err, &graphErr) && graphErr.StatusCode == http.StatusTooManyRequests && graphErr.RetryAfter > 0 {
 		return now.Add(graphErr.RetryAfter).UTC()
 	}
+	if IsReauthRequiredError(err) || IsAuthCacheError(err) {
+		return now.Add(outboxAuthRecoveryRetryBackoff).UTC()
+	}
 	return now.Add(outboxRecoveryRetryBackoff).UTC()
 }
 
@@ -24218,7 +24763,8 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 		b.recordSentOutboxSideEffectWithOptions(durableCtx, sent, ChatMessage{ID: outbox.TeamsMessageID}, opts, sentOutboxSideEffectOptions{GlobalOutboundRecorded: true})
 		return nil
 	}
-	if outbox.Status == teamstore.OutboxStatusAccepted && outbox.TeamsMessageID != "" {
+	if outbox.Status == teamstore.OutboxStatusAccepted && strings.TrimSpace(outbox.TeamsMessageID) != "" {
+		teamsMessageID := strings.TrimSpace(outbox.TeamsMessageID)
 		// The Graph identity is already durable. The remaining ledger/final
 		// status mutations must not be abandoned merely because this outbox phase
 		// reached its short maintenance deadline; otherwise an Accepted row can
@@ -24227,10 +24773,10 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 		// bounded grace window, just as claimed poll attempts do.
 		durableCtx, cancelDurable := b.pollAttemptDurableContext(ctx)
 		defer cancelDurable()
-		if err := b.ensureGlobalOutboundRecorded(durableCtx, outbox, ChatMessage{ID: outbox.TeamsMessageID}); err != nil {
+		if err := b.ensureGlobalOutboundRecorded(durableCtx, outbox, ChatMessage{ID: teamsMessageID}); err != nil {
 			return err
 		}
-		sent, err := b.markOutboxSentForCurrentOwner(durableCtx, outbox, outbox.TeamsMessageID)
+		sent, err := b.markOutboxSentForCurrentOwner(durableCtx, outbox, teamsMessageID)
 		if err == nil {
 			if sent.Status != teamstore.OutboxStatusSent || sent.BlockedByUnresolvedExecution || sent.BlockedByTerminalFailure {
 				// The Graph identity is durable, but the ownership anchor won the
@@ -28431,7 +28977,12 @@ func (b *Bridge) publishWorkSessionHistory(ctx context.Context, session *Session
 	if err := b.finishExplicitTranscriptImport(ctx, *session, local, result, transcriptCheckpointID(session.ID), importTurnID, "sync"); err != nil {
 		return err
 	}
-	return b.processQueuedTurns(ctx)
+	// History publication is a maintenance operation.  It must not inline the
+	// executor/admission phase: doing so lets a slow or ambiguous history
+	// recovery hold the session's normal Teams turn behind a second state
+	// machine.  The regular poll/queued-turn phase will observe the durable
+	// queued turn after this operation returns.
+	return nil
 }
 
 func (b *Bridge) publishWorkSessionFullHistory(ctx context.Context, session *Session) error {
@@ -28481,7 +29032,10 @@ func (b *Bridge) publishWorkSessionFullHistory(ctx context.Context, session *Ses
 	if err := b.sendToChat(ctx, session.ChatID, "Full local Codex history is now up to date in this chat."); err != nil {
 		return err
 	}
-	return b.processQueuedTurns(ctx)
+	// Full-history publication is likewise history-only.  Do not start a
+	// queued Teams turn from this command's completion path; normal dispatch
+	// owns that transition and will run it on its next scheduled phase.
+	return nil
 }
 
 // PublishSessionFullHistory publishes the complete local Codex transcript to
@@ -33198,7 +33752,8 @@ func linkedCheckpointFileUnchanged(filePath string, checkpoint teamstore.ImportC
 	}
 	defer f.Close()
 	fdInfo, err := f.Stat()
-	if err != nil || fdInfo.IsDir() || !os.SameFile(pathInfo, fdInfo) || fdInfo.Size() != checkpoint.SourceSize || !fdInfo.ModTime().Equal(checkpoint.SourceModTime) {
+	if err != nil || fdInfo.IsDir() || !os.SameFile(pathInfo, fdInfo) || fdInfo.Size() != checkpoint.SourceSize || !fdInfo.ModTime().Equal(checkpoint.SourceModTime) ||
+		checkpoint.SourceChangeTime != 0 && teamstore.SourceFileChangeTimeFromFileInfo(fdInfo) != checkpoint.SourceChangeTime {
 		return false
 	}
 	// The content fingerprint is deliberately read on every check.  File
@@ -33213,7 +33768,8 @@ func linkedCheckpointFileUnchanged(filePath string, checkpoint teamstore.ImportC
 	// read. Re-stat it after hashing and require both identity and metadata to
 	// still match the opened descriptor before taking the fast path.
 	postInfo, err := os.Stat(filePath)
-	if err != nil || postInfo.IsDir() || !os.SameFile(pathInfo, postInfo) || postInfo.Size() != checkpoint.SourceSize || !postInfo.ModTime().Equal(checkpoint.SourceModTime) {
+	if err != nil || postInfo.IsDir() || !os.SameFile(pathInfo, postInfo) || postInfo.Size() != checkpoint.SourceSize || !postInfo.ModTime().Equal(checkpoint.SourceModTime) ||
+		checkpoint.SourceChangeTime != 0 && teamstore.SourceFileChangeTimeFromFileInfo(postInfo) != checkpoint.SourceChangeTime {
 		return false
 	}
 	return true
@@ -33251,7 +33807,8 @@ func linkedCheckpointPrefixMatches(filePath string, checkpoint teamstore.ImportC
 	}
 	defer f.Close()
 	fdInfo, err := f.Stat()
-	if err != nil || fdInfo.IsDir() || fdInfo.Size() < checkpoint.LastOffset || !os.SameFile(pathInfo, fdInfo) {
+	if err != nil || fdInfo.IsDir() || fdInfo.Size() < checkpoint.LastOffset || !os.SameFile(pathInfo, fdInfo) ||
+		checkpoint.SourceChangeTime != 0 && checkpoint.SourceSize > 0 && fdInfo.Size() == checkpoint.SourceSize && teamstore.SourceFileChangeTimeFromFileInfo(fdInfo) != checkpoint.SourceChangeTime {
 		return false
 	}
 	expected := strings.TrimSpace(checkpoint.SourceFingerprint)
@@ -33269,7 +33826,8 @@ func linkedCheckpointPrefixMatches(filePath string, checkpoint teamstore.ImportC
 			return false
 		}
 		postInfo, err := os.Stat(filePath)
-		return err == nil && !postInfo.IsDir() && os.SameFile(pathInfo, postInfo) && postInfo.Size() >= 0
+		return err == nil && !postInfo.IsDir() && os.SameFile(pathInfo, postInfo) && postInfo.Size() >= 0 &&
+			(checkpoint.SourceChangeTime == 0 || teamstore.SourceFileChangeTimeFromFileInfo(postInfo) == checkpoint.SourceChangeTime)
 	}
 	if expected == "" {
 		// Old EOF checkpoints predate the bounded proof. The automatic sync path
@@ -33287,7 +33845,8 @@ func linkedCheckpointPrefixMatches(filePath string, checkpoint teamstore.ImportC
 	// The pathname must still resolve to the descriptor that was verified and
 	// hashed. A content-preserving atomic replace is not ownership proof: the
 	// replacement may carry a plausible new suffix from another execution.
-	if err != nil || postInfo.IsDir() || !os.SameFile(pathInfo, postInfo) || postInfo.Size() < checkpoint.LastOffset {
+	if err != nil || postInfo.IsDir() || !os.SameFile(pathInfo, postInfo) || postInfo.Size() < checkpoint.LastOffset ||
+		checkpoint.SourceChangeTime != 0 && checkpoint.SourceSize > 0 && postInfo.Size() == checkpoint.SourceSize && teamstore.SourceFileChangeTimeFromFileInfo(postInfo) != checkpoint.SourceChangeTime {
 		return false
 	}
 	return true
@@ -35009,7 +35568,10 @@ func (s *knownTranscriptOutboxDedupeState) shouldDeferPendingFinal(record Transc
 func outboxCanDedupeTranscript(outbox teamstore.OutboxMessage) bool {
 	switch outbox.Status {
 	case teamstore.OutboxStatusAccepted, teamstore.OutboxStatusSent:
-		return true
+		// A terminal-looking status without the provider identity is not
+		// delivery proof. In particular, legacy markerless Accepted rows must
+		// not suppress a transcript record that still needs a safe send.
+		return strings.TrimSpace(outbox.TeamsMessageID) != ""
 	default:
 		return false
 	}
@@ -35018,7 +35580,10 @@ func outboxCanDedupeTranscript(outbox teamstore.OutboxMessage) bool {
 func helperDeliveryCanDedupeTranscript(delivery teamstore.HelperDeliveryRecord) bool {
 	switch delivery.Status {
 	case teamstore.HelperDeliveryStatusAccepted, teamstore.HelperDeliveryStatusSent:
-		return true
+		// The helper ledger is only delivery proof when it carries the durable
+		// provider identity as well. A markerless legacy row remains
+		// indeterminate and must not hide transcript recovery.
+		return strings.TrimSpace(delivery.TeamsMessageID) != ""
 	default:
 		return false
 	}
@@ -35506,7 +36071,7 @@ func (b *Bridge) recordTranscriptCheckpointDetailedWithParentFence(ctx context.C
 	if strings.TrimSpace(checkpointID) == "" {
 		checkpointID = transcriptCheckpointID(session.ID)
 	}
-	sourceSize, sourceModTime := transcriptSourceFileStateAtCheckpoint(sourcePath, lastOffset)
+	sourceSize, sourceModTime, sourceChangeTime := transcriptSourceFileStateAtCheckpointWithChangeTime(sourcePath, lastOffset)
 	sourceGeneration := ""
 	if info, err := os.Stat(sourcePath); err == nil && !info.IsDir() {
 		sourceGeneration = historyTieredSourceIdentity(sourcePath, info)
@@ -35524,6 +36089,7 @@ func (b *Bridge) recordTranscriptCheckpointDetailedWithParentFence(ctx context.C
 		LastOffsetKnown:   true,
 		SourceSize:        sourceSize,
 		SourceModTime:     sourceModTime,
+		SourceChangeTime:  sourceChangeTime,
 	}
 	ledger := teamstore.TranscriptLedgerRecord{
 		ID:             ledgerID,

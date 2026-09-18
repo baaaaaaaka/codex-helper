@@ -275,6 +275,78 @@ type GraphStatusError struct {
 	RateLimitScope string
 }
 
+// GraphTransportError records that an HTTP operation reached the transport
+// boundary but no trustworthy response was obtained.  Keeping the method and
+// path attached is important for recovery: a failed GET can be retried without
+// duplicating a side effect, while a failed POST/PATCH must remain uncertain
+// until the remote object is reconciled.
+type GraphTransportError struct {
+	Method string
+	Path   string
+	Err    error
+}
+
+func (e *GraphTransportError) Error() string {
+	if e == nil || e.Err == nil {
+		return "Graph transport failed"
+	}
+	return fmt.Sprintf("Graph %s %s transport failed: %v", e.Method, redactGraphPath(pathWithoutQuery(e.Path)), e.Err)
+}
+
+func (e *GraphTransportError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func wrapGraphTransportError(method string, path string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var transportErr *GraphTransportError
+	if errors.As(err, &transportErr) {
+		return err
+	}
+	return &GraphTransportError{Method: method, Path: path, Err: err}
+}
+
+// GraphResponseError records a complete HTTP response that could not be
+// decoded or failed the response contract.  It is intentionally distinct from
+// GraphTransportError: a read whose bytes arrived but are malformed is a
+// deterministic provider/source failure and may be held for repair, whereas a
+// transport failure may be retried without a side effect.
+type GraphResponseError struct {
+	Method string
+	Path   string
+	Err    error
+}
+
+func (e *GraphResponseError) Error() string {
+	if e == nil || e.Err == nil {
+		return "Graph response was invalid"
+	}
+	return fmt.Sprintf("Graph %s %s response was invalid: %v", e.Method, redactGraphPath(pathWithoutQuery(e.Path)), e.Err)
+}
+
+func (e *GraphResponseError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func wrapGraphResponseError(method string, path string, err error) error {
+	if err == nil {
+		return nil
+	}
+	var responseErr *GraphResponseError
+	if errors.As(err, &responseErr) {
+		return err
+	}
+	return &GraphResponseError{Method: method, Path: path, Err: err}
+}
+
 type GraphResponseTooLargeError struct {
 	Limit int64
 }
@@ -407,7 +479,7 @@ func (g *GraphClient) CreateMeetingChat(ctx context.Context, topic string) (Chat
 	}
 	threadID := strings.TrimSpace(meeting.ChatInfo.ThreadID)
 	if threadID == "" {
-		return Chat{}, fmt.Errorf("onlineMeeting response did not include chatInfo.threadId")
+		return Chat{}, wrapGraphResponseError(http.MethodPost, "/me/onlineMeetings", fmt.Errorf("onlineMeeting response did not include chatInfo.threadId"))
 	}
 	webURL := TeamsChatURL(threadID, g.tenantID())
 	if webURL == "" {
@@ -468,7 +540,7 @@ func (g *GraphClient) CreateOrGetMeetingChatWindow(ctx context.Context, topic st
 	}
 	threadID := strings.TrimSpace(meeting.ChatInfo.ThreadID)
 	if threadID == "" {
-		return Chat{}, meeting, fmt.Errorf("onlineMeeting response did not include chatInfo.threadId")
+		return Chat{}, meeting, wrapGraphResponseError(http.MethodPost, "/me/onlineMeetings/createOrGet", fmt.Errorf("onlineMeeting response did not include chatInfo.threadId"))
 	}
 	webURL := TeamsChatURL(threadID, g.tenantID())
 	if webURL == "" {
@@ -1606,6 +1678,12 @@ type graphRequestOptions struct {
 // request was issued by that operation.
 type graphBeforeFirstRequestContextKey struct{}
 
+// graphBeforeMethodFirstRequestContextKey carries a boundary hook for one
+// method only. Composite helpers such as CreateOrGetMeetingChat perform a
+// preparatory GET before their POST; an operation-start marker must not be
+// consumed by that harmless GET.
+type graphBeforeMethodFirstRequestContextKey struct{}
+
 // graphBeforeEachRequestContextKey carries a read/admission fence that must be
 // rechecked before every HTTP attempt, including a retry after a transient
 // provider response.  It is separate from the historical before-first hook so
@@ -1636,6 +1714,18 @@ func (e *graphRequestPreflightError) Unwrap() error {
 	return e.cause
 }
 
+// accessTokenForRequest keeps token acquisition on the local side of the
+// external-operation boundary.  A caller may already have claimed a durable
+// outbox row when it asks Graph for a token; failure here proves that no HTTP
+// request was issued and therefore must not be reduced as an unknown POST.
+func (g *GraphClient) accessTokenForRequest(ctx context.Context) (string, error) {
+	token, err := g.auth.AccessToken(ctx, g.out, false)
+	if err != nil {
+		return "", &graphRequestPreflightError{cause: err}
+	}
+	return token, nil
+}
+
 func withGraphBeforeFirstRequest(ctx context.Context, fn func() error) context.Context {
 	if ctx == nil {
 		ctx = context.Background()
@@ -1644,6 +1734,19 @@ func withGraphBeforeFirstRequest(ctx context.Context, fn func() error) context.C
 		return ctx
 	}
 	return context.WithValue(ctx, graphBeforeFirstRequestContextKey{}, fn)
+}
+
+func withGraphBeforeMethodFirstRequest(ctx context.Context, method string, fn func() error) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if fn == nil || strings.TrimSpace(method) == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, graphBeforeMethodFirstRequestContextKey{}, struct {
+		method string
+		fn     func() error
+	}{method: strings.ToUpper(strings.TrimSpace(method)), fn: fn})
 }
 
 func withGraphBeforeEachRequest(ctx context.Context, fn func() error) context.Context {
@@ -1664,9 +1767,17 @@ func graphBeforeFirstRequestFromContext(ctx context.Context) func() error {
 	return fn
 }
 
-func graphRequestBeforeFirstRequest(ctx context.Context, opts graphRequestOptions) func() error {
+func graphRequestBeforeFirstRequest(ctx context.Context, method string, opts graphRequestOptions) func() error {
 	if opts.beforeFirstRequest != nil {
 		return opts.beforeFirstRequest
+	}
+	if ctx != nil {
+		if hook, ok := ctx.Value(graphBeforeMethodFirstRequestContextKey{}).(struct {
+			method string
+			fn     func() error
+		}); ok && strings.EqualFold(strings.TrimSpace(hook.method), strings.TrimSpace(method)) {
+			return hook.fn
+		}
 	}
 	return graphBeforeFirstRequestFromContext(ctx)
 }
@@ -1683,6 +1794,20 @@ func graphRequestBeforeEachRequest(ctx context.Context, opts graphRequestOptions
 }
 
 func runGraphRequestBeforeEachRequest(fn func() error) error {
+	if fn == nil {
+		return nil
+	}
+	if err := fn(); err != nil {
+		var preflightErr *graphRequestPreflightError
+		if errors.As(err, &preflightErr) {
+			return err
+		}
+		return &graphRequestPreflightError{cause: err}
+	}
+	return nil
+}
+
+func runGraphRequestBeforeFirstRequest(fn func() error) error {
 	if fn == nil {
 		return nil
 	}
@@ -1750,7 +1875,7 @@ func (g *GraphClient) doWithOptions(ctx context.Context, method string, path str
 		}
 		payload = raw
 	}
-	token, err := g.auth.AccessToken(ctx, g.out, false)
+	token, err := g.accessTokenForRequest(ctx)
 	if err != nil {
 		return err
 	}
@@ -1758,12 +1883,12 @@ func (g *GraphClient) doWithOptions(ctx context.Context, method string, path str
 	retries := 0
 	refreshedAfterUnauthorized := false
 	noReplayAfterFirstRequest := graphRequestNoReplay(method, opts)
-	beforeFirstRequest := graphRequestBeforeFirstRequest(ctx, opts)
+	beforeFirstRequest := graphRequestBeforeFirstRequest(ctx, method, opts)
 	beforeEachRequest := graphRequestBeforeEachRequest(ctx, opts)
 	firstRequestPrepared := false
 	for {
 		if !firstRequestPrepared && beforeFirstRequest != nil {
-			if err := beforeFirstRequest(); err != nil {
+			if err := runGraphRequestBeforeFirstRequest(beforeFirstRequest); err != nil {
 				return err
 			}
 			firstRequestPrepared = true
@@ -1781,7 +1906,7 @@ func (g *GraphClient) doWithOptions(ctx context.Context, method string, path str
 		}
 		resp, err := g.httpClient().Do(req)
 		if err != nil {
-			return err
+			return wrapGraphTransportError(method, path, err)
 		}
 		if resp.StatusCode == http.StatusUnauthorized && !refreshedAfterUnauthorized && !noReplayAfterFirstRequest {
 			discardAndClose(resp.Body)
@@ -1819,19 +1944,19 @@ func (g *GraphClient) doWithOptions(ctx context.Context, method string, path str
 			return graphStatusError(method, path, resp, raw)
 		}
 		if err != nil {
-			return err
+			return wrapGraphTransportError(method, path, err)
 		}
 		if closeErr != nil {
-			return closeErr
+			return wrapGraphTransportError(method, path, closeErr)
 		}
 		if out == nil {
 			return nil
 		}
 		if len(bytes.TrimSpace(raw)) == 0 {
 			if _, ok := out.(*graphMessagePage); ok {
-				return fmt.Errorf("%w: empty response body", errGraphMessagePageInvalid)
+				return wrapGraphResponseError(method, path, fmt.Errorf("%w: empty response body", errGraphMessagePageInvalid))
 			}
-			return validateGraphMessageResponse(out, path)
+			return wrapGraphResponseError(method, path, validateGraphMessageResponse(out, path))
 		}
 		if err := json.Unmarshal(raw, out); err != nil {
 			// encoding/json validates the top-level JSON before invoking a
@@ -1842,12 +1967,12 @@ func (g *GraphClient) doWithOptions(ctx context.Context, method string, path str
 				var typeErr *json.UnmarshalTypeError
 				var syntaxErr *json.SyntaxError
 				if errors.As(err, &typeErr) || errors.As(err, &syntaxErr) {
-					return fmt.Errorf("%w: %v", errGraphMessagePageInvalid, err)
+					return wrapGraphResponseError(method, path, fmt.Errorf("%w: %v", errGraphMessagePageInvalid, err))
 				}
 			}
-			return err
+			return wrapGraphResponseError(method, path, err)
 		}
-		return validateGraphMessageResponse(out, path)
+		return wrapGraphResponseError(method, path, validateGraphMessageResponse(out, path))
 	}
 }
 
@@ -1859,7 +1984,7 @@ func (g *GraphClient) doRawWithOptions(ctx context.Context, method string, path 
 	if !isAllowedGraphRequest(method, path) {
 		return nil, "", fmt.Errorf("refusing non-allowlisted Graph request: %s %s", method, path)
 	}
-	token, err := g.auth.AccessToken(ctx, g.out, false)
+	token, err := g.accessTokenForRequest(ctx)
 	if err != nil {
 		return nil, "", err
 	}
@@ -1867,12 +1992,12 @@ func (g *GraphClient) doRawWithOptions(ctx context.Context, method string, path 
 	retries := 0
 	refreshedAfterUnauthorized := false
 	noReplayAfterFirstRequest := graphRequestNoReplay(method, opts)
-	beforeFirstRequest := graphRequestBeforeFirstRequest(ctx, opts)
+	beforeFirstRequest := graphRequestBeforeFirstRequest(ctx, method, opts)
 	beforeEachRequest := graphRequestBeforeEachRequest(ctx, opts)
 	firstRequestPrepared := false
 	for {
 		if !firstRequestPrepared && beforeFirstRequest != nil {
-			if err := beforeFirstRequest(); err != nil {
+			if err := runGraphRequestBeforeFirstRequest(beforeFirstRequest); err != nil {
 				return nil, "", err
 			}
 			firstRequestPrepared = true
@@ -1887,7 +2012,7 @@ func (g *GraphClient) doRawWithOptions(ctx context.Context, method string, path 
 		req.Header.Set("Authorization", "Bearer "+token)
 		resp, err := g.httpClient().Do(req)
 		if err != nil {
-			return nil, "", err
+			return nil, "", wrapGraphTransportError(method, path, err)
 		}
 		if resp.StatusCode == http.StatusUnauthorized && !refreshedAfterUnauthorized && !noReplayAfterFirstRequest {
 			discardAndClose(resp.Body)
@@ -1917,10 +2042,10 @@ func (g *GraphClient) doRawWithOptions(ctx context.Context, method string, path 
 			return nil, "", graphStatusError(method, path, resp, raw)
 		}
 		if err != nil {
-			return nil, "", err
+			return nil, "", wrapGraphTransportError(method, path, err)
 		}
 		if closeErr != nil {
-			return nil, "", closeErr
+			return nil, "", wrapGraphTransportError(method, path, closeErr)
 		}
 		return raw, resp.Header.Get("Content-Type"), nil
 	}
@@ -1934,7 +2059,7 @@ func (g *GraphClient) doBytesWithOptions(ctx context.Context, method string, pat
 	if !isAllowedGraphRequest(method, path) {
 		return nil, fmt.Errorf("refusing non-allowlisted Graph request: %s %s", method, path)
 	}
-	token, err := g.auth.AccessToken(ctx, g.out, false)
+	token, err := g.accessTokenForRequest(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -1942,12 +2067,12 @@ func (g *GraphClient) doBytesWithOptions(ctx context.Context, method string, pat
 	retries := 0
 	refreshedAfterUnauthorized := false
 	noReplayAfterFirstRequest := graphRequestNoReplay(method, opts)
-	beforeFirstRequest := graphRequestBeforeFirstRequest(ctx, opts)
+	beforeFirstRequest := graphRequestBeforeFirstRequest(ctx, method, opts)
 	beforeEachRequest := graphRequestBeforeEachRequest(ctx, opts)
 	firstRequestPrepared := false
 	for {
 		if !firstRequestPrepared && beforeFirstRequest != nil {
-			if err := beforeFirstRequest(); err != nil {
+			if err := runGraphRequestBeforeFirstRequest(beforeFirstRequest); err != nil {
 				return nil, err
 			}
 			firstRequestPrepared = true
@@ -1965,7 +2090,7 @@ func (g *GraphClient) doBytesWithOptions(ctx context.Context, method string, pat
 		}
 		resp, err := g.httpClient().Do(req)
 		if err != nil {
-			return nil, err
+			return nil, wrapGraphTransportError(method, path, err)
 		}
 		if resp.StatusCode == http.StatusUnauthorized && !refreshedAfterUnauthorized && !noReplayAfterFirstRequest {
 			discardAndClose(resp.Body)
@@ -1995,10 +2120,10 @@ func (g *GraphClient) doBytesWithOptions(ctx context.Context, method string, pat
 			return nil, graphStatusError(method, path, resp, raw)
 		}
 		if err != nil {
-			return nil, err
+			return nil, wrapGraphTransportError(method, path, err)
 		}
 		if closeErr != nil {
-			return nil, closeErr
+			return nil, wrapGraphTransportError(method, path, closeErr)
 		}
 		return raw, nil
 	}
