@@ -4199,6 +4199,7 @@ func cxpPerfSeedLinkedTranscriptFiles(tb testing.TB, store *teamstore.Store, bri
 				Size:              info.Size(),
 				ModTime:           info.ModTime(),
 				SourceFingerprint: transcriptCheckpointSourceFingerprint(path, int64(len(data))),
+				SourceChangeTime:  teamstore.SourceFileChangeTime(path, info),
 				Offset:            int64(len(data)),
 				Line:              lineCount + 1,
 				SessionID:         sessionID,

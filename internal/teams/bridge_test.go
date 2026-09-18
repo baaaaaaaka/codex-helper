@@ -36543,6 +36543,7 @@ func TestBridgeHistoryWatchClearsTeamsOriginMarkerForLocalPrompt(t *testing.T) {
 			Size:                info.Size(),
 			ModTime:             info.ModTime(),
 			SourceFingerprint:   transcriptCheckpointSourceFingerprint(transcriptPath, info.Size()),
+			SourceChangeTime:    teamstore.SourceFileChangeTime(transcriptPath, info),
 			Offset:              info.Size(),
 			Line:                strings.Count(initial, "\n"),
 			ThreadID:            threadID,
