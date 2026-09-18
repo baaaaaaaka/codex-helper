@@ -4178,9 +4178,15 @@ func TestTeamsListenFalseSlowInboundMutationDoesNotConsumeDurableCleanupGrace(t 
 	options.PhaseBudget = 10 * time.Second
 	options.PollWorkerBudget = mainLoopPollWorkerBudget
 	listener := startListenerRecovery(t, bridge, options)
+	progressTimeout := listenerRecoveryMultiStepProgressTimeout
+	// On a hosted Windows race runner, the first post-migration durable poll
+	// can finish just before the schedule wake and leave the inbound turn
+	// queued until the next cycle.  The assertion is about the eventual
+	// cleanup/dispatch contract, so allow one full retry cycle instead of
+	// treating that scheduler latency as a mutation-context failure.
 	if !waitListenerRecoveryResult(func() bool {
 		return len(executor.callsSnapshot()) == 1
-	}, listenerRecoveryProgressTimeout) {
+	}, progressTimeout) {
 		state, _ := store.Load(context.Background())
 		listener.stop(t)
 		t.Fatalf("slow inbound mutation did not dispatch: gets=%d calls=%#v state=%#v phase=%#v", graphState.getCount("chat-1"), executor.callsSnapshot(), state, bridge.mainLoopPhaseStatsSnapshot("poll"))
@@ -4192,7 +4198,7 @@ func TestTeamsListenFalseSlowInboundMutationDoesNotConsumeDurableCleanupGrace(t 
 			}
 		}
 		return false
-	}, listenerRecoveryExtendedProgressTimeout, "slow inbound final delivery")
+	}, progressTimeout, "slow inbound final delivery")
 	// The real Graph query would exclude this message after the durable cursor
 	// advances. Stop returning it from the mutable fake now so the 1ms listener
 	// interval cannot admit an unrelated second attempt while this test waits for
@@ -4215,7 +4221,7 @@ func TestTeamsListenFalseSlowInboundMutationDoesNotConsumeDurableCleanupGrace(t 
 		}
 		poll := state.ChatPolls["chat-1"]
 		return !poll.LastModifiedCursor.Before(messageModifiedAt)
-	}, listenerRecoveryExtendedProgressTimeout) {
+	}, progressTimeout) {
 		state, _ := store.Load(context.Background())
 		listener.stop(t)
 		t.Fatalf("slow inbound durable poll cursor did not advance; gets=%d calls=%#v state=%#v phase=%#v sent=%#v", graphState.getCount("chat-1"), executor.callsSnapshot(), state.ChatPolls["chat-1"], bridge.mainLoopPhaseStatsSnapshot("poll"), graphState.sentSnapshot())
