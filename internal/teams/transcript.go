@@ -601,7 +601,7 @@ func scanTranscriptCheckpointWithContext(ctx context.Context, filePath string, a
 			return fmt.Errorf("transcript source %q changed during checkpoint scan", filePath)
 		}
 		if expected != nil && (current.Size() != expected.Size() || !current.ModTime().Equal(expected.ModTime()) ||
-			teamstore.SourceFileChangeTimeFromFileInfo(current) != teamstore.SourceFileChangeTimeFromFileInfo(expected)) {
+			teamstore.SourceFileChangeTime(filePath, current) != teamstore.SourceFileChangeTime(filePath, expected)) {
 			return fmt.Errorf("transcript source %q changed during checkpoint scan", filePath)
 		}
 		if identity != "" {

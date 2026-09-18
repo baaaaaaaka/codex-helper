@@ -77,7 +77,7 @@ type historyWatchRebaseAnchorScanResult struct {
 // recovery marker containing only the inode would permanently hide a newly
 // repairable source. Conversely, an unchanged marker must keep blocked legacy
 // rows out of the cold rebase scanner on every poll.
-func historyRewriteRecoverySnapshotMatches(state historyTieredFileState, info os.FileInfo) bool {
+func historyRewriteRecoverySnapshotMatches(state historyTieredFileState, path string, info os.FileInfo) bool {
 	if info == nil || info.IsDir() || strings.TrimSpace(state.SourceRewriteRecoveryIdentity) == "" {
 		return false
 	}
@@ -86,7 +86,7 @@ func historyRewriteRecoverySnapshotMatches(state historyTieredFileState, info os
 		return false
 	}
 	if state.SourceRewriteRecoveryChangeTime != 0 &&
-		teamstore.SourceFileChangeTimeFromFileInfo(info) != state.SourceRewriteRecoveryChangeTime {
+		teamstore.SourceFileChangeTime(path, info) != state.SourceRewriteRecoveryChangeTime {
 		return false
 	}
 	return true
@@ -98,8 +98,8 @@ func historyRewriteRecoverySnapshotMatches(state historyTieredFileState, info os
 // check and make an old cursor look portable.  Such platforms remain usable for
 // normal incremental reads; only automatic source-rewrite rebase is held for
 // explicit recovery.
-func historyRebaseChangeTimeAvailable(info os.FileInfo) bool {
-	return info != nil && teamstore.SourceFileChangeTimeFromFileInfo(info) != 0
+func historyRebaseChangeTimeAvailable(path string, info os.FileInfo) bool {
+	return info != nil && teamstore.SourceFileChangeTime(path, info) != 0
 }
 
 // readCodexHistoryHeader only reads the first JSONL record. Invalid or
@@ -396,8 +396,8 @@ func historyRebaseStableSource(path string, expected os.FileInfo, expectedIdenti
 	if current.Size() != expected.Size() || !current.ModTime().Equal(expected.ModTime()) {
 		return fmt.Errorf("history source %q changed during rebase", path)
 	}
-	expectedChange := teamstore.SourceFileChangeTimeFromFileInfo(expected)
-	currentChange := teamstore.SourceFileChangeTimeFromFileInfo(current)
+	expectedChange := teamstore.SourceFileChangeTime(path, expected)
+	currentChange := teamstore.SourceFileChangeTime(path, current)
 	if expectedChange == 0 || currentChange == 0 || currentChange != expectedChange {
 		return fmt.Errorf("history source %q changed during rebase", path)
 	}
@@ -473,8 +473,8 @@ func historyRebaseSourceProof(path string, expected os.FileInfo, offset int64) (
 	}
 	defer f.Close()
 	info, err := f.Stat()
-	expectedChange := teamstore.SourceFileChangeTimeFromFileInfo(expected)
-	currentChange := teamstore.SourceFileChangeTimeFromFileInfo(info)
+	expectedChange := teamstore.SourceFileChangeTime(path, expected)
+	currentChange := teamstore.SourceFileChangeTime(path, info)
 	if err != nil || expected == nil || info.IsDir() || !os.SameFile(expected, info) ||
 		info.Size() != expected.Size() || !info.ModTime().Equal(expected.ModTime()) ||
 		expectedChange == 0 || currentChange == 0 || currentChange != expectedChange ||
@@ -564,7 +564,7 @@ func (b *Bridge) recordHistoryWatchRebaseAttempt(ctx context.Context, id string,
 	previous.SourceRewriteRecoveryIdentity = strings.TrimSpace(source.Identity)
 	previous.SourceRewriteRecoverySize = source.Info.Size()
 	previous.SourceRewriteRecoveryModTime = source.Info.ModTime()
-	previous.SourceRewriteRecoveryChangeTime = teamstore.SourceFileChangeTimeFromFileInfo(source.Info)
+	previous.SourceRewriteRecoveryChangeTime = teamstore.SourceFileChangeTime(path, source.Info)
 	previous.SourceRewriteRecoveryScanPending = false
 	previous.SourceRewriteRecoveryScanOffset = 0
 	previous.SourceRewriteRecoveryScanLine = 0
@@ -664,7 +664,7 @@ func (b *Bridge) recordHistoryWatchRebaseScanProgress(ctx context.Context, id st
 	next.SourceRewriteRecoveryIdentity = strings.TrimSpace(source.Identity)
 	next.SourceRewriteRecoverySize = source.Info.Size()
 	next.SourceRewriteRecoveryModTime = source.Info.ModTime()
-	next.SourceRewriteRecoveryChangeTime = teamstore.SourceFileChangeTimeFromFileInfo(source.Info)
+	next.SourceRewriteRecoveryChangeTime = teamstore.SourceFileChangeTime(path, source.Info)
 	next.SourceRewriteRecoveryScanPending = true
 	next.SourceRewriteRecoveryScanOffset = progress.Offset
 	next.SourceRewriteRecoveryScanLine = progress.Line
@@ -731,17 +731,17 @@ func (b *Bridge) rebaseHistoryWatchSourceRewrite(ctx context.Context, id string,
 	if err != nil || !ok {
 		return false, err
 	}
-	if !historyRebaseChangeTimeAvailable(source.Info) {
+	if !historyRebaseChangeTimeAvailable(path, source.Info) {
 		return false, b.recordHistoryWatchRebaseAttempt(ctx, id, expected, previous, path, source, "automatic source rebase requires a native file change-time revision", now)
 	}
 	sameIdentity := strings.TrimSpace(source.Identity) == strings.TrimSpace(previous.SourceRewriteRecoveryIdentity)
-	if sameIdentity && historyRewriteRecoverySnapshotMatches(previous, source.Info) && !previous.SourceRewriteRecoveryScanPending {
+	if sameIdentity && historyRewriteRecoverySnapshotMatches(previous, path, source.Info) && !previous.SourceRewriteRecoveryScanPending {
 		return false, nil
 	}
 	// A same-inode source may have been repaired in place. Do not resume a
 	// completed scan from the old EOF in that case; the repaired anchor can be
 	// anywhere in the source. Appends also reset the cold cursor harmlessly.
-	if sameIdentity && !historyRewriteRecoverySnapshotMatches(previous, source.Info) {
+	if sameIdentity && !historyRewriteRecoverySnapshotMatches(previous, path, source.Info) {
 		b.forgetHistoryWatchRebaseScanProgress(id)
 		clearHistoryWatchRebaseScan(&previous)
 	}
@@ -798,7 +798,7 @@ func (b *Bridge) rebaseHistoryWatchSourceRewrite(ctx context.Context, id string,
 	next.Path = path
 	next.Size = anchor.CursorOffset
 	next.ModTime = info.ModTime()
-	next.SourceChangeTime = teamstore.SourceFileChangeTimeFromFileInfo(info)
+	next.SourceChangeTime = teamstore.SourceFileChangeTime(path, info)
 	next.SourceFingerprint = fingerprint
 	next.SourceGeneration = source.Identity
 	next.SourceRewriteBlocked = false
@@ -894,7 +894,7 @@ func clearLinkedTranscriptRebaseScan(checkpoint *teamstore.ImportCheckpoint) {
 	checkpoint.SourceRewriteRecoveryScanMatchOffset = 0
 }
 
-func (b *Bridge) recordLinkedTranscriptRebaseScanProgress(ctx context.Context, checkpoint teamstore.ImportCheckpoint, source codexHistoryFile, progress transcriptCheckpointScanProgress) error {
+func (b *Bridge) recordLinkedTranscriptRebaseScanProgress(ctx context.Context, checkpoint teamstore.ImportCheckpoint, path string, source codexHistoryFile, progress transcriptCheckpointScanProgress) error {
 	if b == nil || b.store == nil || strings.TrimSpace(checkpoint.ID) == "" || strings.TrimSpace(source.Identity) == "" {
 		return nil
 	}
@@ -916,7 +916,7 @@ func (b *Bridge) recordLinkedTranscriptRebaseScanProgress(ctx context.Context, c
 		next.SourceRewriteRecoveryIdentity = strings.TrimSpace(source.Identity)
 		next.SourceRewriteRecoverySize = source.Info.Size()
 		next.SourceRewriteRecoveryModTime = source.Info.ModTime()
-		next.SourceRewriteRecoveryChangeTime = teamstore.SourceFileChangeTimeFromFileInfo(source.Info)
+		next.SourceRewriteRecoveryChangeTime = teamstore.SourceFileChangeTime(path, source.Info)
 		next.SourceRewriteRecoveryScanPending = true
 		next.SourceRewriteRecoveryScanOffset = progress.Offset
 		next.SourceRewriteRecoveryScanLine = progress.Line
@@ -933,7 +933,7 @@ func (b *Bridge) recordLinkedTranscriptRebaseScanProgress(ctx context.Context, c
 	return err
 }
 
-func (b *Bridge) recordLinkedTranscriptRebaseAttempt(ctx context.Context, checkpoint teamstore.ImportCheckpoint, source codexHistoryFile, reason string) error {
+func (b *Bridge) recordLinkedTranscriptRebaseAttempt(ctx context.Context, checkpoint teamstore.ImportCheckpoint, path string, source codexHistoryFile, reason string) error {
 	if b == nil || b.store == nil || strings.TrimSpace(checkpoint.ID) == "" || strings.TrimSpace(source.Identity) == "" {
 		return nil
 	}
@@ -945,7 +945,7 @@ func (b *Bridge) recordLinkedTranscriptRebaseAttempt(ctx context.Context, checkp
 		next.SourceRewriteRecoveryIdentity = strings.TrimSpace(source.Identity)
 		next.SourceRewriteRecoverySize = source.Info.Size()
 		next.SourceRewriteRecoveryModTime = source.Info.ModTime()
-		next.SourceRewriteRecoveryChangeTime = teamstore.SourceFileChangeTimeFromFileInfo(source.Info)
+		next.SourceRewriteRecoveryChangeTime = teamstore.SourceFileChangeTime(path, source.Info)
 		clearLinkedTranscriptRebaseScan(&next)
 		next.SourceRewriteRecoveryReason = strings.TrimSpace(reason)
 		next.UpdatedAt = now
@@ -970,8 +970,8 @@ func (b *Bridge) rebaseLinkedTranscriptSourceRewrite(ctx context.Context, sessio
 	if err != nil || !ok {
 		return false, err
 	}
-	if !historyRebaseChangeTimeAvailable(source.Info) {
-		return false, b.recordLinkedTranscriptRebaseAttempt(ctx, checkpoint, source, "automatic source rebase requires a native file change-time revision")
+	if !historyRebaseChangeTimeAvailable(path, source.Info) {
+		return false, b.recordLinkedTranscriptRebaseAttempt(ctx, checkpoint, path, source, "automatic source rebase requires a native file change-time revision")
 	}
 	recoverySnapshot := historyTieredFileState{
 		SourceRewriteRecoveryIdentity:   strings.TrimSpace(checkpoint.SourceRewriteRecoveryIdentity),
@@ -980,7 +980,7 @@ func (b *Bridge) rebaseLinkedTranscriptSourceRewrite(ctx context.Context, sessio
 		SourceRewriteRecoveryChangeTime: checkpoint.SourceRewriteRecoveryChangeTime,
 	}
 	if strings.TrimSpace(source.Identity) == strings.TrimSpace(checkpoint.SourceRewriteRecoveryIdentity) &&
-		historyRewriteRecoverySnapshotMatches(recoverySnapshot, source.Info) {
+		historyRewriteRecoverySnapshotMatches(recoverySnapshot, path, source.Info) {
 		if !checkpoint.SourceRewriteRecoveryScanPending {
 			return false, nil
 		}
@@ -994,7 +994,7 @@ func (b *Bridge) rebaseLinkedTranscriptSourceRewrite(ctx context.Context, sessio
 	expectedCheckpoint := checkpoint
 	scanCheckpoint := checkpoint
 	if strings.TrimSpace(source.Identity) != strings.TrimSpace(checkpoint.SourceRewriteRecoveryIdentity) ||
-		!historyRewriteRecoverySnapshotMatches(recoverySnapshot, source.Info) {
+		!historyRewriteRecoverySnapshotMatches(recoverySnapshot, path, source.Info) {
 		clearLinkedTranscriptRebaseScan(&scanCheckpoint)
 	}
 	progress := linkedTranscriptRebaseScanProgress(scanCheckpoint, source.Identity, expectedThreadID, expectedThreadID, "")
@@ -1005,18 +1005,18 @@ func (b *Bridge) rebaseLinkedTranscriptSourceRewrite(ctx context.Context, sessio
 	if scanErr != nil {
 		var ambiguous *TranscriptCheckpointAmbiguousError
 		if errors.As(scanErr, &ambiguous) {
-			return false, b.recordLinkedTranscriptRebaseAttempt(ctx, expectedCheckpoint, source, scanErr.Error())
+			return false, b.recordLinkedTranscriptRebaseAttempt(ctx, expectedCheckpoint, path, source, scanErr.Error())
 		}
 		if ctx != nil && ctx.Err() != nil {
-			return false, b.recordLinkedTranscriptRebaseScanProgress(ctx, expectedCheckpoint, source, scan.Progress)
+			return false, b.recordLinkedTranscriptRebaseScanProgress(ctx, expectedCheckpoint, path, source, scan.Progress)
 		}
 		return false, nil
 	}
 	if !scan.Complete {
-		return false, b.recordLinkedTranscriptRebaseScanProgress(ctx, expectedCheckpoint, source, scan.Progress)
+		return false, b.recordLinkedTranscriptRebaseScanProgress(ctx, expectedCheckpoint, path, source, scan.Progress)
 	}
 	if !scan.Found {
-		return false, b.recordLinkedTranscriptRebaseAttempt(ctx, expectedCheckpoint, source, "checkpoint anchor was not found in the complete source")
+		return false, b.recordLinkedTranscriptRebaseAttempt(ctx, expectedCheckpoint, path, source, "checkpoint anchor was not found in the complete source")
 	}
 	position := scan.Position
 	currentInfo, err := os.Stat(path)
@@ -1035,7 +1035,7 @@ func (b *Bridge) rebaseLinkedTranscriptSourceRewrite(ctx context.Context, sessio
 			current.SourceRewriteRecoveryIdentity = source.Identity
 			current.SourceRewriteRecoverySize = source.Info.Size()
 			current.SourceRewriteRecoveryModTime = source.Info.ModTime()
-			current.SourceRewriteRecoveryChangeTime = teamstore.SourceFileChangeTimeFromFileInfo(source.Info)
+			current.SourceRewriteRecoveryChangeTime = teamstore.SourceFileChangeTime(path, source.Info)
 			current.UpdatedAt = now
 			return current, true, nil
 		})
@@ -1054,7 +1054,7 @@ func (b *Bridge) rebaseLinkedTranscriptSourceRewrite(ctx context.Context, sessio
 		next.LastOffsetKnown = true
 		next.SourceSize = info.Size()
 		next.SourceModTime = info.ModTime()
-		next.SourceChangeTime = teamstore.SourceFileChangeTimeFromFileInfo(info)
+		next.SourceChangeTime = teamstore.SourceFileChangeTime(path, info)
 		next.SourceRewriteBlocked = false
 		next.SourceRewriteRecoveryIdentity = ""
 		next.SourceRewriteRecoverySize = 0

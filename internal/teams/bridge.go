@@ -23424,7 +23424,7 @@ func transcriptOutboxSourceProofMatchesWithCache(msg teamstore.OutboxMessage, ca
 					ReadEnd:             msg.TranscriptSourceReadProofEndOffset,
 					ReadRangeKnown:      msg.TranscriptSourceReadProofRangeKnown,
 					Info:                info,
-					ChangeTime:          teamstore.SourceFileChangeTimeFromFileInfo(info),
+					ChangeTime:          teamstore.SourceFileChangeTime(strings.TrimSpace(msg.TranscriptSourcePath), info),
 				}
 			}
 		}
@@ -23458,7 +23458,7 @@ func transcriptSourceProofCacheEntryMatches(entry transcriptSourceProofCacheEntr
 		return false
 	}
 	if entry.ChangeTime != 0 {
-		currentChangeTime := teamstore.SourceFileChangeTimeFromFileInfo(info)
+		currentChangeTime := teamstore.SourceFileChangeTime(entry.Path, info)
 		if currentChangeTime == 0 || currentChangeTime != entry.ChangeTime {
 			return false
 		}
@@ -33753,7 +33753,7 @@ func linkedCheckpointFileUnchanged(filePath string, checkpoint teamstore.ImportC
 	defer f.Close()
 	fdInfo, err := f.Stat()
 	if err != nil || fdInfo.IsDir() || !os.SameFile(pathInfo, fdInfo) || fdInfo.Size() != checkpoint.SourceSize || !fdInfo.ModTime().Equal(checkpoint.SourceModTime) ||
-		checkpoint.SourceChangeTime != 0 && teamstore.SourceFileChangeTimeFromFileInfo(fdInfo) != checkpoint.SourceChangeTime {
+		checkpoint.SourceChangeTime != 0 && teamstore.SourceFileChangeTime(filePath, fdInfo) != checkpoint.SourceChangeTime {
 		return false
 	}
 	// The content fingerprint is deliberately read on every check.  File
@@ -33769,7 +33769,7 @@ func linkedCheckpointFileUnchanged(filePath string, checkpoint teamstore.ImportC
 	// still match the opened descriptor before taking the fast path.
 	postInfo, err := os.Stat(filePath)
 	if err != nil || postInfo.IsDir() || !os.SameFile(pathInfo, postInfo) || postInfo.Size() != checkpoint.SourceSize || !postInfo.ModTime().Equal(checkpoint.SourceModTime) ||
-		checkpoint.SourceChangeTime != 0 && teamstore.SourceFileChangeTimeFromFileInfo(postInfo) != checkpoint.SourceChangeTime {
+		checkpoint.SourceChangeTime != 0 && teamstore.SourceFileChangeTime(filePath, postInfo) != checkpoint.SourceChangeTime {
 		return false
 	}
 	return true
@@ -33808,7 +33808,7 @@ func linkedCheckpointPrefixMatches(filePath string, checkpoint teamstore.ImportC
 	defer f.Close()
 	fdInfo, err := f.Stat()
 	if err != nil || fdInfo.IsDir() || fdInfo.Size() < checkpoint.LastOffset || !os.SameFile(pathInfo, fdInfo) ||
-		checkpoint.SourceChangeTime != 0 && checkpoint.SourceSize > 0 && fdInfo.Size() == checkpoint.SourceSize && teamstore.SourceFileChangeTimeFromFileInfo(fdInfo) != checkpoint.SourceChangeTime {
+		checkpoint.SourceChangeTime != 0 && checkpoint.SourceSize > 0 && fdInfo.Size() == checkpoint.SourceSize && teamstore.SourceFileChangeTime(filePath, fdInfo) != checkpoint.SourceChangeTime {
 		return false
 	}
 	expected := strings.TrimSpace(checkpoint.SourceFingerprint)
@@ -33827,7 +33827,7 @@ func linkedCheckpointPrefixMatches(filePath string, checkpoint teamstore.ImportC
 		}
 		postInfo, err := os.Stat(filePath)
 		return err == nil && !postInfo.IsDir() && os.SameFile(pathInfo, postInfo) && postInfo.Size() >= 0 &&
-			(checkpoint.SourceChangeTime == 0 || teamstore.SourceFileChangeTimeFromFileInfo(postInfo) == checkpoint.SourceChangeTime)
+			(checkpoint.SourceChangeTime == 0 || teamstore.SourceFileChangeTime(filePath, postInfo) == checkpoint.SourceChangeTime)
 	}
 	if expected == "" {
 		// Old EOF checkpoints predate the bounded proof. The automatic sync path
@@ -33846,7 +33846,7 @@ func linkedCheckpointPrefixMatches(filePath string, checkpoint teamstore.ImportC
 	// hashed. A content-preserving atomic replace is not ownership proof: the
 	// replacement may carry a plausible new suffix from another execution.
 	if err != nil || postInfo.IsDir() || !os.SameFile(pathInfo, postInfo) || postInfo.Size() < checkpoint.LastOffset ||
-		checkpoint.SourceChangeTime != 0 && checkpoint.SourceSize > 0 && postInfo.Size() == checkpoint.SourceSize && teamstore.SourceFileChangeTimeFromFileInfo(postInfo) != checkpoint.SourceChangeTime {
+		checkpoint.SourceChangeTime != 0 && checkpoint.SourceSize > 0 && postInfo.Size() == checkpoint.SourceSize && teamstore.SourceFileChangeTime(filePath, postInfo) != checkpoint.SourceChangeTime {
 		return false
 	}
 	return true
@@ -33994,7 +33994,7 @@ func linkedCheckpointIdleNoGrowth(filePath string, checkpoint teamstore.ImportCh
 	if checkpoint.SourceChangeTime == 0 {
 		return true
 	}
-	changeTime := teamstore.SourceFileChangeTimeFromFileInfo(info)
+	changeTime := teamstore.SourceFileChangeTime(filePath, info)
 	return changeTime != 0 && changeTime == checkpoint.SourceChangeTime
 }
 
@@ -36531,7 +36531,7 @@ func transcriptSourceFileStateWithChangeTime(sourcePath string) (int64, time.Tim
 	if err != nil || info.IsDir() {
 		return 0, time.Time{}, 0
 	}
-	return info.Size(), info.ModTime(), teamstore.SourceFileChangeTimeFromFileInfo(info)
+	return info.Size(), info.ModTime(), teamstore.SourceFileChangeTime(sourcePath, info)
 }
 
 // sourceFileRevisionStable treats a missing native change-time as an

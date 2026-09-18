@@ -380,7 +380,7 @@ func TestHistoryWatchSourcePrefixRejectsSameSizeRewriteOutsideFingerprintWindow(
 	if err != nil {
 		t.Fatalf("stat same-size prefix fixture: %v", err)
 	}
-	changeTime := teamstore.SourceFileChangeTimeFromFileInfo(info)
+	changeTime := teamstore.SourceFileChangeTime(path, info)
 	if changeTime == 0 {
 		t.Skip("filesystem does not expose a native change time")
 	}
@@ -420,7 +420,7 @@ func TestHistoryWatchSourcePrefixRejectsTailShrinkWithoutClearingCursor(t *testi
 		Size:              info.Size(),
 		Offset:            offset,
 		SourceFingerprint: transcriptCheckpointSourceFingerprint(path, offset),
-		SourceChangeTime:  teamstore.SourceFileChangeTimeFromFileInfo(info),
+		SourceChangeTime:  teamstore.SourceFileChangeTime(path, info),
 		LastFinalID:       "codex-final:v1:thread-tail-shrink:turn-tail-shrink:final",
 		LastFinalTurnID:   "turn-tail-shrink",
 		LastFinalThreadID: "thread-tail-shrink",
@@ -618,7 +618,7 @@ func TestHistoryWatchRebasesPaginatedRolloutFromStableFinalWithoutDeliveryReplay
 	if checkpoint.SourceFingerprint == "" {
 		t.Fatalf("rebase did not establish source fingerprint")
 	}
-	if changeTime := teamstore.SourceFileChangeTimeFromFileInfo(info); changeTime != 0 && checkpoint.SourceChangeTime != changeTime {
+	if changeTime := teamstore.SourceFileChangeTime(path, info); changeTime != 0 && checkpoint.SourceChangeTime != changeTime {
 		t.Fatalf("rebase source change time = %d, want snapshot change time %d", checkpoint.SourceChangeTime, changeTime)
 	}
 	if checkpoint.SourceGeneration == "" || checkpoint.SourceGeneration == "old-source-generation" {
@@ -689,7 +689,7 @@ func TestHistoryWatchChangedPathsRechecksOnlyNewPaginatedIdentity(t *testing.T) 
 		SourceRewriteRecoveryIdentity:   identity,
 		SourceRewriteRecoverySize:       info.Size(),
 		SourceRewriteRecoveryModTime:    info.ModTime(),
-		SourceRewriteRecoveryChangeTime: teamstore.SourceFileChangeTimeFromFileInfo(info),
+		SourceRewriteRecoveryChangeTime: teamstore.SourceFileChangeTime(path, info),
 	}
 	changes, err = historyWatchChangedPaths([]string{path}, state, false)
 	if err != nil {
@@ -769,7 +769,7 @@ func TestLinkedTranscriptRebasePreservesCompletionAndExecutionState(t *testing.T
 	if updated.SourceGeneration == "" || updated.SourceGeneration == "old-source-generation" {
 		t.Fatalf("linked rebase did not establish the new source generation: %#v", updated)
 	}
-	if changeTime := teamstore.SourceFileChangeTimeFromFileInfo(info); changeTime != 0 && updated.SourceChangeTime != changeTime {
+	if changeTime := teamstore.SourceFileChangeTime(path, info); changeTime != 0 && updated.SourceChangeTime != changeTime {
 		t.Fatalf("linked rebase source change time = %d, want snapshot change time %d", updated.SourceChangeTime, changeTime)
 	}
 	if updated.Status != importCheckpointStatusImporting || !updated.CompletionPending {

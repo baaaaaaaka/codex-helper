@@ -486,8 +486,10 @@ restarted or mutated by this work.
 - [x] The first CI attempt exposed and the follow-up patch fixed a Windows-only
       source-rewrite proof gap: `FileInfo.Sys()` exposes
       `Win32FileAttributeData.LastWriteTime`, while the generic adapter only
-      recognized Unix `Ctim/Ctimespec`; the Windows adapter now uses the same
-      native revision as the handle-based file stamp path.
+      recognized Unix `Ctim/Ctimespec`; the Windows adapter now queries the
+      stronger handle-based `FILE_BASIC_INFO.ChangeTime` revision; if that
+      query is unavailable, the automatic proof remains disabled rather than
+      treating writable `LastWriteTime` as ctime.
 - [ ] Strict point-in-time real-data Docker acceptance and live per-row
       recovery remain separate from this prerelease; no live service or
       database was restarted or mutated during validation.

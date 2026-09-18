@@ -65,7 +65,7 @@ func TestTranscriptSourceProofCacheRejectsSameSizeSameMtimeRewrite(t *testing.T)
 	if err != nil {
 		t.Fatalf("stat source: %v", err)
 	}
-	changeTime := teamstore.SourceFileChangeTimeFromFileInfo(info)
+	changeTime := teamstore.SourceFileChangeTime(path, info)
 	if changeTime == 0 {
 		t.Skip("filesystem does not expose a native change-time marker")
 	}

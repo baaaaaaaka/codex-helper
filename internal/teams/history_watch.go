@@ -915,7 +915,7 @@ func historyWatchChangedPaths(paths []string, state teamstore.State, verifyUncha
 			fileState := states[path]
 			if marker := strings.TrimSpace(fileState.SourceRewriteRecoveryIdentity); marker != "" {
 				if identity, ok := codexPaginatedHistoryIdentity(path, firstNonEmptyString(fileState.ThreadID, fileState.SessionID)); ok &&
-					identity == marker && !historyRewriteRecoverySnapshotMatches(fileState, info) {
+					identity == marker && !historyRewriteRecoverySnapshotMatches(fileState, path, info) {
 					rebasePaths[path] = true
 				}
 			}
@@ -1066,7 +1066,7 @@ func (b *Bridge) baselineCodexHistoryWatch(ctx context.Context, paths []string, 
 				ModTime:              info.ModTime(),
 				SourceGeneration:     generation,
 				SourceFingerprint:    fingerprint,
-				SourceChangeTime:     teamstore.SourceFileChangeTimeFromFileInfo(info),
+				SourceChangeTime:     teamstore.SourceFileChangeTime(path, info),
 				SourceRewriteBlocked: info.Size() > 0 && fingerprint == "",
 				Offset:               boundary.Offset,
 				Line:                 boundary.Line,
@@ -1079,7 +1079,7 @@ func (b *Bridge) baselineCodexHistoryWatch(ctx context.Context, paths []string, 
 				checkpoint.PartialLine = boundary.Line + 1
 				checkpoint.PartialStartedAt = info.ModTime()
 				checkpoint.PartialSourceIdentity = generation
-				checkpoint.PartialSourceChangeTime = teamstore.SourceFileChangeTimeFromFileInfo(info)
+				checkpoint.PartialSourceChangeTime = teamstore.SourceFileChangeTime(path, info)
 				checkpoint.PartialReplayOffset = boundary.Offset
 				checkpoint.PartialReplayLine = boundary.Line
 				checkpoint.PartialLastProgressAt = now
@@ -1591,7 +1591,7 @@ func historyWatchSourcePrefixMatches(path string, previous historyTieredFileStat
 	// still useful for ordinary append-only growth, but it is not enough to
 	// prove a same-size rewrite outside its 8 KiB window.
 	if previous.Size > 0 && pathInfo.Size() == previous.Size && previous.SourceChangeTime != 0 &&
-		teamstore.SourceFileChangeTimeFromFileInfo(pathInfo) != previous.SourceChangeTime {
+		teamstore.SourceFileChangeTime(path, pathInfo) != previous.SourceChangeTime {
 		return false
 	}
 	f, err := os.Open(path)
@@ -1614,7 +1614,7 @@ func historyWatchSourcePrefixMatches(path string, previous historyTieredFileStat
 		return false
 	}
 	if previous.Size > 0 && postInfo.Size() == previous.Size && previous.SourceChangeTime != 0 &&
-		teamstore.SourceFileChangeTimeFromFileInfo(postInfo) != previous.SourceChangeTime {
+		teamstore.SourceFileChangeTime(path, postInfo) != previous.SourceChangeTime {
 		return false
 	}
 	return true

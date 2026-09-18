@@ -889,11 +889,11 @@ func dockerFixtureRebindHistoryWatchCheckpoint(checkpoint *teamstore.HistoryWatc
 			if strings.TrimSpace(checkpoint.SourceFingerprint) != "" {
 				checkpoint.SourceFingerprint = fingerprint
 			}
-			checkpoint.SourceChangeTime = teamstore.SourceFileChangeTimeFromFileInfo(info)
+			checkpoint.SourceChangeTime = teamstore.SourceFileChangeTime(path, info)
 		}
 		if strings.TrimSpace(checkpoint.PartialSourceIdentity) != "" {
 			checkpoint.PartialSourceIdentity = identity
-			checkpoint.PartialSourceChangeTime = teamstore.SourceFileChangeTimeFromFileInfo(info)
+			checkpoint.PartialSourceChangeTime = teamstore.SourceFileChangeTime(path, info)
 		}
 		if strings.TrimSpace(checkpoint.SourceRewriteRecoveryIdentity) != "" {
 			checkpoint.SourceRewriteRecoveryIdentity = identity
@@ -991,11 +991,11 @@ func dockerFixtureRebindImportCheckpoint(checkpoint *teamstore.ImportCheckpoint)
 			if strings.TrimSpace(checkpoint.SourceFingerprint) != "" {
 				checkpoint.SourceFingerprint = fingerprint
 			}
-			checkpoint.SourceChangeTime = teamstore.SourceFileChangeTimeFromFileInfo(info)
+			checkpoint.SourceChangeTime = teamstore.SourceFileChangeTime(path, info)
 		}
 		if strings.TrimSpace(checkpoint.PartialSourceIdentity) != "" {
 			checkpoint.PartialSourceIdentity = identity
-			checkpoint.PartialSourceChangeTime = teamstore.SourceFileChangeTimeFromFileInfo(info)
+			checkpoint.PartialSourceChangeTime = teamstore.SourceFileChangeTime(path, info)
 		}
 		if strings.TrimSpace(checkpoint.SourceRewriteRecoveryIdentity) != "" {
 			checkpoint.SourceRewriteRecoveryIdentity = identity
