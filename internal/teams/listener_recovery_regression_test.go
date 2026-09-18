@@ -4163,6 +4163,13 @@ func TestTeamsListenFalseSlowInboundMutationDoesNotConsumeDurableCleanupGrace(t 
 	bridge.pollAttemptDurableGrace = 500 * time.Millisecond
 	listenerRecoverySeedDuePoll(t, store, bridge.reg.ControlChatID, now)
 	listenerRecoverySeedDuePoll(t, store, "chat-1", now)
+	// This regression covers the slow post-claim mutation boundary, not the
+	// online JSON-to-SQLite migration. Prepare the durable backend before the
+	// listener starts so a hosted Windows runner cannot spend the assertion
+	// window in migration materialization or its legacy fallback notice.
+	if _, err := store.MigrateLargeStateToSQLite(context.Background(), 0); err != nil {
+		t.Fatalf("prepare slow inbound mutation SQLite store: %v", err)
+	}
 
 	options := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), executor)
 	// Match the production worker slice. The assertion is about separating the

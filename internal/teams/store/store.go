@@ -22056,15 +22056,15 @@ func SourceFileIdentityFromFileInfo(path string, info os.FileInfo) (string, erro
 	return sourceFileIdentityFromRevision(revision), nil
 }
 
-// SourceFileChangeTime returns the native file change-time revision when the
+// SourceFileChangeTime returns the native file revision marker when the
 // platform exposes one. It is intentionally separate from SourceFileIdentity:
-// append-only transcript writers change ctime while retaining the same inode,
-// so ctime is useful for validating a paused partial record but must not be
-// used as the transcript generation identity. The path is required on Windows
-// because FileInfo.Sys exposes LastWriteTime but not the stronger NTFS
-// FILE_BASIC_INFO.ChangeTime. A zero result means that this platform/filesystem
-// does not expose a usable change time and callers must retain their existing
-// conservative proof.
+// append-only transcript writers change ctime/USN while retaining the same
+// inode, so the marker is useful for validating a paused partial record but
+// must not be used as the transcript generation identity. On Windows the
+// adapter uses the per-file USN revision because writable timestamps can be
+// restored after an in-place rewrite. A zero result means that this
+// platform/filesystem does not expose a usable revision and callers that need
+// source proof must fail closed.
 func SourceFileChangeTime(path string, info os.FileInfo) int64 {
 	if changeTime := fileInfoChangeTimeUnixNano(info); changeTime != 0 {
 		return changeTime

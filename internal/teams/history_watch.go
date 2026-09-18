@@ -1594,6 +1594,15 @@ func historyWatchSourcePrefixMatches(path string, previous historyTieredFileStat
 		teamstore.SourceFileChangeTime(path, pathInfo) != previous.SourceChangeTime {
 		return false
 	}
+	// A bounded fingerprint is only a window at the trusted cursor; it cannot
+	// prove that an earlier same-size prefix was not rewritten. A source
+	// revision is therefore mandatory for an existing non-empty cursor. This
+	// is deliberately fail-closed on filesystems without ctime/USN support:
+	// accepting the bounded window there could silently skip a replacement
+	// prefix, while an explicit recovery can establish a new boundary.
+	if previous.Size > 0 && previous.SourceChangeTime == 0 {
+		return false
+	}
 	f, err := os.Open(path)
 	if err != nil {
 		return false

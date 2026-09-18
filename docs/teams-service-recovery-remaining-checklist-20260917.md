@@ -487,9 +487,10 @@ restarted or mutated by this work.
       source-rewrite proof gap: `FileInfo.Sys()` exposes
       `Win32FileAttributeData.LastWriteTime`, while the generic adapter only
       recognized Unix `Ctim/Ctimespec`; the Windows adapter now queries the
-      stronger handle-based `FILE_BASIC_INFO.ChangeTime` revision; if that
-      query is unavailable, the automatic proof remains disabled rather than
-      treating writable `LastWriteTime` as ctime.
+      per-file USN revision, which still changes when a same-size rewrite
+      restores the visible timestamps.  If the volume has no usable USN
+      journal, the automatic proof remains disabled rather than treating
+      `LastWriteTime` or basic-info time as ctime.
 - [ ] Strict point-in-time real-data Docker acceptance and live per-row
       recovery remain separate from this prerelease; no live service or
       database was restarted or mutated during validation.

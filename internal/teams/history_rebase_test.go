@@ -405,6 +405,29 @@ func TestHistoryWatchSourcePrefixRejectsSameSizeRewriteOutsideFingerprintWindow(
 	}
 }
 
+func TestHistoryWatchSourcePrefixRequiresSourceRevision(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing-source-revision.jsonl")
+	content := []byte(strings.Repeat("a", 24*1024))
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatalf("write source-revision fixture: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat source-revision fixture: %v", err)
+	}
+	previous := historyTieredFileState{
+		Size:              info.Size(),
+		Offset:            info.Size(),
+		SourceFingerprint: transcriptCheckpointSourceFingerprint(path, info.Size()),
+	}
+	if previous.SourceFingerprint == "" {
+		t.Fatalf("source-revision fixture did not produce a fingerprint")
+	}
+	if historyWatchSourcePrefixMatches(path, previous) {
+		t.Fatal("bounded fingerprint was accepted without a source revision")
+	}
+}
+
 func TestHistoryWatchSourcePrefixRejectsTailShrinkWithoutClearingCursor(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "tail-shrink-prefix.jsonl")
 	content := []byte(strings.Repeat("prefix", 4096))
