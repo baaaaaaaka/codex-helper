@@ -877,6 +877,14 @@ const listenerRecoveryExtendedProgressTimeout = 20 * time.Second
 // tests retain their shorter liveness windows.
 const listenerRecoveryMultiStepProgressTimeout = 90 * time.Second
 
+// The slow inbound mutation fixture deliberately exercises a real continuous
+// listener with a race-instrumented, file-backed store and a 600ms Graph POST.
+// Hosted macOS runners can spend just over the general multi-step window in
+// SQLite admission before the queued turn is observable. Keep this bound local
+// to that fixture; it remains finite and retains every durable exactly-once
+// assertion after the wait.
+const listenerRecoverySlowInboundProgressTimeout = 120 * time.Second
+
 // Windows hosted runners can spend tens of seconds in FlushFileBuffers while
 // a recovery fixture is materializing or reopening durable state.  Keep the
 // affected listener tests bounded, but give those durable-I/O transitions a
@@ -4218,7 +4226,7 @@ func TestTeamsListenFalseSlowInboundMutationDoesNotConsumeDurableCleanupGrace(t 
 	options.PhaseBudget = 10 * time.Second
 	options.PollWorkerBudget = mainLoopPollWorkerBudget
 	listener := startListenerRecovery(t, bridge, options)
-	progressTimeout := listenerRecoveryMultiStepProgressTimeout
+	progressTimeout := listenerRecoverySlowInboundProgressTimeout
 	// On a hosted Windows race runner, the first post-migration durable poll
 	// can finish just before the schedule wake and leave the inbound turn
 	// queued until the next cycle.  The assertion is about the eventual
