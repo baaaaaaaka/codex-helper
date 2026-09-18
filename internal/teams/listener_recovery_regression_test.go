@@ -4189,6 +4189,20 @@ func TestTeamsListenFalseSlowInboundMutationDoesNotConsumeDurableCleanupGrace(t 
 	bridge.pollAttemptDurableGrace = 500 * time.Millisecond
 	listenerRecoverySeedDuePoll(t, store, bridge.reg.ControlChatID, now)
 	listenerRecoverySeedDuePoll(t, store, "chat-1", now)
+	registryPath := filepath.Join(t.TempDir(), "registry.json")
+	// The inbound handler also consults the process-wide outbound provenance
+	// ledger before it can claim a user message. Prepare both sidecars before
+	// starting the listener so hosted race runners spend the assertion window
+	// on the slow-ACK boundary, not first-use SQLite/WAL materialization.
+	bridge.registryPath = registryPath
+	prepareBridgeTestGlobalOutboundLedger(t, context.Background(), bridge)
+	inboundPath, ok := globalInboundLedgerPathForRegistry(registryPath)
+	if !ok {
+		t.Fatal("slow inbound fixture has no global inbound ledger path")
+	}
+	if err := prepareGlobalInboundLedger(context.Background(), inboundPath); err != nil {
+		t.Fatalf("prepare slow inbound global inbound ledger: %v", err)
+	}
 	// This regression covers the slow post-claim mutation boundary, not the
 	// online JSON-to-SQLite migration. Prepare the durable backend before the
 	// listener starts so a hosted Windows runner cannot spend the assertion
@@ -4197,7 +4211,7 @@ func TestTeamsListenFalseSlowInboundMutationDoesNotConsumeDurableCleanupGrace(t 
 		t.Fatalf("prepare slow inbound mutation SQLite store: %v", err)
 	}
 
-	options := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), executor)
+	options := listenerRecoveryBaseOptions(store, registryPath, executor)
 	// Match the production worker slice. The assertion is about separating the
 	// post-claim cleanup grace from the phase context; keep the finite worker
 	// budget large enough for SQLite admission on a busy Windows runner.
