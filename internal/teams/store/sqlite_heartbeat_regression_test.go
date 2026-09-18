@@ -774,6 +774,94 @@ func TestRecordOwnerHeartbeatUsesDedicatedRuntimeConnectionDuringForegroundRead(
 	}
 }
 
+// A foreground write transaction can legitimately hold SQLite's single-writer
+// slot while a poll worker is finishing durable admission.  The independent
+// liveness handle must not enter BEGIN IMMEDIATE and remain inside the driver
+// until that writer happens to release the slot: doing so also holds
+// sqliteRuntimeMu and makes every poll worker wait behind the heartbeat.  The
+// runtime handle uses a deferred transaction plus a short busy timeout, so the
+// heartbeat returns a retryable busy result and the bridge's existing complete
+// transaction retry can make progress after the writer yields.
+func TestRecordOwnerHeartbeatDoesNotHangBehindForegroundWriter(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Now().UTC()
+	owner := testOwner("foreground-writer-owner", "", now)
+	if err := store.Update(ctx, func(state *State) error {
+		state.writeOwner(owner)
+		return nil
+	}); err != nil {
+		t.Fatalf("seed owner: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+
+	var foregroundDB *sql.DB
+	if err := store.withStateLock(ctx, func() error {
+		pointer, ok, err := store.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return fmt.Errorf("SQLite pointer: ok=%t err=%v", ok, err)
+		}
+		foregroundDB, err = store.sqliteDBUnlocked(pointer)
+		return err
+	}); err != nil {
+		t.Fatalf("open foreground SQLite handle: %v", err)
+	}
+	// Prime the dedicated runtime handle before taking the foreground writer
+	// reservation. This isolates the assertion to transaction contention rather
+	// than first-use validation or schema preparation.
+	if _, err := store.RecordOwnerHeartbeat(ctx, owner, time.Minute, now); err != nil {
+		t.Fatalf("prime owner heartbeat: %v", err)
+	}
+
+	tx, err := foregroundDB.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("begin foreground writer: %v", err)
+	}
+	released := false
+	releaseWriter := func() {
+		if released {
+			return
+		}
+		released = true
+		_ = tx.Rollback()
+	}
+	t.Cleanup(releaseWriter)
+	if _, err := tx.ExecContext(ctx, `UPDATE state_meta SET value = value WHERE key = 'state_json'`); err != nil {
+		t.Fatalf("hold foreground writer reservation: %v", err)
+	}
+
+	heartbeatCtx, cancel := context.WithTimeout(ctx, 350*time.Millisecond)
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		_, heartbeatErr := store.RecordOwnerHeartbeat(heartbeatCtx, owner, time.Minute, now.Add(time.Second))
+		done <- heartbeatErr
+	}()
+
+	select {
+	case heartbeatErr := <-done:
+		if heartbeatErr == nil {
+			t.Fatal("heartbeat unexpectedly committed while foreground writer was held")
+		}
+		if !IsSQLiteBusyError(heartbeatErr) && !errors.Is(heartbeatErr, context.DeadlineExceeded) {
+			t.Fatalf("heartbeat under foreground writer = %v, want bounded SQLite busy/cancellation error", heartbeatErr)
+		}
+	case <-time.After(1500 * time.Millisecond):
+		releaseWriter()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("heartbeat remained blocked after foreground writer was released")
+		}
+		t.Fatal("heartbeat remained blocked behind foreground writer")
+	}
+
+	releaseWriter()
+	if _, err := store.RecordOwnerHeartbeat(context.Background(), owner, time.Minute, now.Add(2*time.Second)); err != nil {
+		t.Fatalf("heartbeat after foreground writer release: %v", err)
+	}
+}
+
 // A guard-triggered revocation must win over startup preparation. Preparation
 // is allowed to publish only the conservative untrusted marker and must never
 // replace an existing revocation with a stale trusted result.

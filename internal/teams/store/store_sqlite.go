@@ -7255,12 +7255,17 @@ func openExistingSQLiteRuntimeStore(path string) (*sql.DB, error) {
 	if err := validateExistingSQLiteStorePath(path); err != nil {
 		return nil, err
 	}
-	db, err := openSQLiteHandle(path, false)
+	db, err := openSQLiteHandleWithTxLock(path, false, "deferred")
 	if err != nil {
 		return nil, err
 	}
 	for _, stmt := range []string{
-		`PRAGMA busy_timeout = 5000`,
+		// Liveness must not hold sqliteRuntimeMu for the full foreground
+		// writer timeout.  Heartbeat callers retry the complete operation on
+		// SQLITE_BUSY, so a short connection-local timeout turns a competing
+		// writer into a bounded retry instead of making poll workers wait
+		// behind a stuck runtime callback.
+		`PRAGMA busy_timeout = 500`,
 		// The foreground handle owns the explicit, optional WAL checkpoint
 		// policy. A separate liveness connection must not inherit SQLite's
 		// default per-connection auto-checkpoint: a heartbeat commit can then
@@ -7365,20 +7370,26 @@ func openSQLiteStoreContext(ctx context.Context, path string, create bool) (*sql
 }
 
 func openSQLiteHandle(path string, create bool) (*sql.DB, error) {
+	return openSQLiteHandleWithTxLock(path, create, "immediate")
+}
+
+// openSQLiteHandleWithTxLock opens a single-connection SQLite handle with an
+// explicit transaction mode.  Ordinary foreground transactions use IMMEDIATE
+// so a read-then-write callback cannot lose its snapshot before the write.
+// Liveness has a separate handle and retries its complete short transaction on
+// SQLITE_BUSY/SNAPSHOT, so it deliberately uses DEFERRED: BEGIN must not wait
+// for a foreground writer while the owner heartbeat is trying to prove
+// liveness.
+func openSQLiteHandleWithTxLock(path string, create bool, txLock string) (*sql.DB, error) {
 	query := url.Values{}
 	if create {
 		query.Set("mode", "rwc")
 	} else {
 		query.Set("mode", "rw")
 	}
-	// Store transactions commonly read a row before updating it.  With SQLite's
-	// default deferred BEGIN, a concurrent owner-heartbeat commit can invalidate
-	// that read snapshot and make the later write fail with SQLITE_BUSY_SNAPSHOT
-	// (517).  Immediate mode acquires the write reservation before the first
-	// read, so the short transaction waits and then reads a fresh snapshot.  The
-	// driver still uses a deferred BEGIN for explicit ReadOnly transactions;
-	// ordinary indexed reads therefore do not become writer reservations.
-	query.Set("_txlock", "immediate")
+	if strings.TrimSpace(txLock) != "" {
+		query.Set("_txlock", txLock)
+	}
 	dsn := sqliteFileURI(path, query)
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
