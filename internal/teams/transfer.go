@@ -446,7 +446,7 @@ func (g *GraphClient) uploadDriveItemSingleFileWithOptions(ctx context.Context, 
 	if err != nil {
 		return DriveItem{}, err
 	}
-	token, err := g.auth.AccessToken(ctx, g.out, false)
+	token, err := g.accessTokenForRequest(ctx)
 	if err != nil {
 		return DriveItem{}, err
 	}
@@ -909,7 +909,7 @@ func (g *GraphClient) downloadSharedDriveItemContentToFileWithOptions(ctx contex
 			_ = os.Remove(partMetaPath)
 		}
 	}()
-	token, err := g.auth.AccessToken(ctx, g.out, false)
+	token, err := g.accessTokenForRequest(ctx)
 	if err != nil {
 		return "", 0, err
 	}

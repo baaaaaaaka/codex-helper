@@ -1632,7 +1632,7 @@ jobs:
           # trust/revision fence, JSON fallback, selected hydration, and the
           # single-connection quarantine path from silently disappearing when
           # a test is renamed or moved.
-          hot_admission_pattern='^Test(SQLiteHotPollScalarProjectionTrustIsFencedAndFallsBack|SQLiteHotPollTrustedWorkCandidatesMatchJSONOracle|SQLiteHotPollSelectedRefreshHydratesFreshSession|SQLiteTurnProjectionBackfillStopsAtDurablePageBoundary|SQLiteHotPollScalarProjectionTriggerDefinitionsAreCurrent|SQLiteHotPollScalarTrustRevokesContradictoryJSONWithMatchingRevision|SQLiteHotPollTrustedReadyUsesCanonicalTimeForDueGate|SQLiteHotPollAdmissionFallbackKeepsHealthyRowsOnScalarLane|SQLiteHotPollTrustedWorkCandidatesQuarantinesBadRowsWithoutDeadlock|SQLiteHotPollTrustedWorkCandidatesContinuesPastInvalidPage|SQLiteHotPollAdmissionFallbackProbeUsesPartialIndexes|SQLiteHotPollScheduleAndWorkCandidatesMatchesSeparateAdmission|SQLiteHotPollSelectedStateForChatsAndSessionsIsBoundedAndFresh|SQLiteOpenBackfillsLegacyChatSequencesWhenTableAlreadyExists)$'
+          hot_admission_pattern='^Test(SQLiteHotPollScalarProjectionTrustIsFencedAndFallsBack|SQLiteHotPollTrustedWorkCandidatesMatchJSONOracle|SQLiteHotPollSelectedRefreshHydratesFreshSession|SQLiteTurnProjectionBackfillStopsAtDurablePageBoundary|SQLiteHotPollScalarProjectionTriggerDefinitionsAreCurrent|SQLiteHotPollScalarTrustRevokesContradictoryJSONWithMatchingRevision|SQLiteHotPollTrustedReadyUsesCanonicalTimeForDueGate|SQLiteHotPollAdmissionFallbackKeepsHealthyRowsOnScalarLane|SQLiteHotPollTrustedWorkCandidatesQuarantinesBadRowsWithoutDeadlock|SQLiteHotPollTrustedWorkCandidatesContinuesPastInvalidPage|SQLiteHotPollAdmissionFallbackProbeUsesPartialIndexes|SQLiteHotPollScheduleAndWorkCandidatesMatchesSeparateAdmission|SQLiteHotPollSelectedStateForChatsAndSessionsIsBoundedAndFresh|SQLiteOpenBackfillsLegacyChatSequencesWhenTableAlreadyExists|SQLiteQueueOutboxAvoidsColdHistoryWatchHydration)$'
           listed="$(go test ./internal/teams/store -run '^$' -list "$hot_admission_pattern")"
           if ! grep -q '^Test' <<<"$listed"; then
             echo "scalar hot admission selector matched no tests" >&2
@@ -1662,6 +1662,21 @@ jobs:
             exit 1
           fi
           go test ./internal/teams -count=1 -run "$recovery_bridge_pattern" -v
+          deferred_safety_pattern='^(TestClassifyDeferredInboundFailureKeepsExternalBoundarySafe|TestDeferred.*)$'
+          listed_deferred_safety="$(go test ./internal/teams -count=1 -run '^$' -list "$deferred_safety_pattern")"
+          if ! grep -q '^Test' <<<"$listed_deferred_safety"; then
+            echo "deferred safety selector matched no tests" >&2
+            exit 1
+          fi
+          go test ./internal/teams -count=1 -run "$deferred_safety_pattern" -v
+
+      - name: Teams bounded Graph fault acceptance
+        if: matrix.shard == 'core-b' && runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test ./scripts/ci -count=1 -run '^TestTeams(BoundedAcceptanceDockerWrapper|RealDataDockerWrapper)' -v
+          bash scripts/ci/teams_bounded_acceptance_docker.sh
 
       - name: Teams ambiguous execution diagnostic regressions
         if: matrix.shard == 'core'

@@ -41,6 +41,22 @@ func TestInboundRecoveryCandidatesAcrossBackends(t *testing.T) {
 					ID: "queued-orphan", TeamsChatID: "chat-b", TeamsMessageID: "message-4",
 					Status: InboundStatusQueued, CreatedAt: now.Add(3 * time.Second),
 				}
+				state.InboundEvents["persisted-due"] = InboundEvent{
+					ID: "persisted-due", TeamsChatID: "chat-f", TeamsMessageID: "message-9",
+					Status: InboundStatusPersisted, NextAttemptAt: time.Now().UTC().Add(-time.Second), CreatedAt: now.Add(8 * time.Second),
+				}
+				state.InboundEvents["queued-due"] = InboundEvent{
+					ID: "queued-due", TeamsChatID: "chat-f", TeamsMessageID: "message-10",
+					Status: InboundStatusQueued, NextAttemptAt: time.Now().UTC().Add(-time.Second), CreatedAt: now.Add(9 * time.Second),
+				}
+				state.InboundEvents["persisted-future"] = InboundEvent{
+					ID: "persisted-future", TeamsChatID: "chat-g", TeamsMessageID: "message-11",
+					Status: InboundStatusPersisted, NextAttemptAt: time.Now().UTC().Add(time.Hour), CreatedAt: now.Add(10 * time.Second),
+				}
+				state.InboundEvents["queued-future"] = InboundEvent{
+					ID: "queued-future", TeamsChatID: "chat-g", TeamsMessageID: "message-12",
+					Status: InboundStatusQueued, NextAttemptAt: time.Now().UTC().Add(time.Hour), CreatedAt: now.Add(11 * time.Second),
+				}
 				state.InboundEvents["persisted-linked"] = InboundEvent{
 					ID: "persisted-linked", TeamsChatID: "chat-c", TeamsMessageID: "message-5",
 					Status: InboundStatusPersisted, TurnID: "turn-linked-terminal", CreatedAt: now.Add(4 * time.Second),
@@ -79,7 +95,7 @@ func TestInboundRecoveryCandidatesAcrossBackends(t *testing.T) {
 			for _, event := range got {
 				ids = append(ids, event.ID)
 			}
-			want := []string{"deferred-linked", "deferred-unlinked", "deferred-due", "persisted-orphan", "queued-orphan"}
+			want := []string{"deferred-linked", "deferred-unlinked", "deferred-due", "persisted-orphan", "queued-orphan", "persisted-due", "queued-due"}
 			if !reflect.DeepEqual(ids, want) {
 				t.Fatalf("InboundRecoveryCandidates ids = %#v, want %#v", ids, want)
 			}

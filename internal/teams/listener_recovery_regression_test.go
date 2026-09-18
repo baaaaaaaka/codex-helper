@@ -877,6 +877,14 @@ const listenerRecoveryExtendedProgressTimeout = 20 * time.Second
 // tests retain their shorter liveness windows.
 const listenerRecoveryMultiStepProgressTimeout = 90 * time.Second
 
+// The slow inbound mutation fixture deliberately exercises a real continuous
+// listener with a race-instrumented, file-backed store and a 600ms Graph POST.
+// Hosted race runners can spend well over the general multi-step window in
+// SQLite admission and outbox observation before the queued turn is fully
+// durable. Keep this bound local to that fixture; it remains finite and retains
+// every durable exactly-once assertion after the wait.
+const listenerRecoverySlowInboundProgressTimeout = 180 * time.Second
+
 // Windows hosted runners can spend tens of seconds in FlushFileBuffers while
 // a recovery fixture is materializing or reopening durable state.  Keep the
 // affected listener tests bounded, but give those durable-I/O transitions a
@@ -1017,6 +1025,24 @@ func listenerRecoverySeedDuePoll(t *testing.T, store *teamstore.Store, chatID st
 		LastActivityAt: now,
 	}); err != nil {
 		t.Fatalf("seed %s poll schedule: %v", chatID, err)
+	}
+}
+
+func listenerRecoverySeedQuietPoll(t *testing.T, store *teamstore.Store, chatID string, now time.Time) {
+	t.Helper()
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	if _, err := store.RecordChatPollSuccess(context.Background(), chatID, now, true, false, 0); err != nil {
+		t.Fatalf("seed %s quiet poll cursor: %v", chatID, err)
+	}
+	if _, err := store.UpdateChatPollSchedule(context.Background(), teamstore.ChatPollScheduleUpdate{
+		ChatID:         chatID,
+		PollState:      inboundPollStateWarm,
+		NextPollAt:     now.Add(time.Hour),
+		LastActivityAt: now,
+	}); err != nil {
+		t.Fatalf("seed %s quiet poll schedule: %v", chatID, err)
 	}
 }
 
@@ -3066,7 +3092,10 @@ func TestTeamsListenFalseHistoryWatchSlowHeadDoesNotStarveHealthyTail(t *testing
 	}
 	initialOffsets := make(map[string]int64, len(paths))
 	for index, path := range paths {
-		initial := listenerRecoveryTranscriptLine(fmt.Sprintf("history-initial-%d", index), fmt.Sprintf("history-baseline-%d", index))
+		// Keep this fairness fixture independent of ctime/USN support.  The
+		// source-proof tests cover non-empty legacy cursors; here an empty
+		// baseline gives the watcher a safe zero cursor on every filesystem.
+		initial := ""
 		if err := os.WriteFile(path, []byte(initial), 0o600); err != nil {
 			t.Fatalf("write history transcript %s: %v", path, err)
 		}
@@ -3108,6 +3137,7 @@ func TestTeamsListenFalseHistoryWatchSlowHeadDoesNotStarveHealthyTail(t *testing
 	// Keep the first listener cycle out of the five-minute reconciliation path;
 	// this test is about changed-path fairness, not project discovery.
 	bridge.lastHistoryWatchReconcile = time.Now().UTC()
+	listenerRecoverySeedQuietPoll(t, store, "chat-1", time.Now().UTC())
 	listenerRecoverySeedDuePoll(t, store, bridge.reg.ControlChatID, time.Now().UTC().Add(-time.Minute))
 
 	listener := startListenerRecovery(t, bridge, listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), bridge.executor))
@@ -3155,7 +3185,10 @@ func TestTeamsListenFalseHistoryWatchFullPoolDoesNotStarveHealthyTail(t *testing
 	initialOffsets := make(map[string]int64, pathCount)
 	for index := 0; index < pathCount; index++ {
 		path := filepath.Join(root, "sessions", fmt.Sprintf("%c-history.jsonl", 'a'+index))
-		initial := listenerRecoveryTranscriptLine(fmt.Sprintf("full-pool-history-initial-%d", index), fmt.Sprintf("full-pool-history-baseline-%d", index))
+		// Keep this fairness fixture independent of ctime/USN support.  The
+		// source-proof tests cover non-empty legacy cursors; here an empty
+		// baseline gives the watcher a safe zero cursor on every filesystem.
+		initial := ""
 		if err := os.WriteFile(path, []byte(initial), 0o600); err != nil {
 			t.Fatalf("write history transcript %s: %v", path, err)
 		}
@@ -3194,6 +3227,7 @@ func TestTeamsListenFalseHistoryWatchFullPoolDoesNotStarveHealthyTail(t *testing
 		return ctx.Err()
 	}
 	bridge.lastHistoryWatchReconcile = time.Now().UTC()
+	listenerRecoverySeedQuietPoll(t, store, "chat-1", time.Now().UTC())
 	listenerRecoverySeedDuePoll(t, store, bridge.reg.ControlChatID, time.Now().UTC().Add(-time.Minute))
 	// History-watch fairness is independent of the startup migration path. Start
 	// from SQLite so the owner heartbeat and the four cooperative workers only
@@ -4163,17 +4197,60 @@ func TestTeamsListenFalseSlowInboundMutationDoesNotConsumeDurableCleanupGrace(t 
 	bridge.pollAttemptDurableGrace = 500 * time.Millisecond
 	listenerRecoverySeedDuePoll(t, store, bridge.reg.ControlChatID, now)
 	listenerRecoverySeedDuePoll(t, store, "chat-1", now)
+	registryPath := filepath.Join(t.TempDir(), "registry.json")
+	// The inbound handler also consults the process-wide outbound provenance
+	// ledger before it can claim a user message. Prepare both sidecars before
+	// starting the listener so hosted race runners spend the assertion window
+	// on the slow-ACK boundary, not first-use SQLite/WAL materialization.
+	bridge.registryPath = registryPath
+	prepareBridgeTestGlobalOutboundLedger(t, context.Background(), bridge)
+	inboundPath, ok := globalInboundLedgerPathForRegistry(registryPath)
+	if !ok {
+		t.Fatal("slow inbound fixture has no global inbound ledger path")
+	}
+	if err := prepareGlobalInboundLedger(context.Background(), inboundPath); err != nil {
+		t.Fatalf("prepare slow inbound global inbound ledger: %v", err)
+	}
+	// This regression covers the slow post-claim mutation boundary, not the
+	// online JSON-to-SQLite migration. Prepare the durable backend before the
+	// listener starts so a hosted Windows runner cannot spend the assertion
+	// window in migration materialization or its legacy fallback notice.
+	if _, err := store.MigrateLargeStateToSQLite(context.Background(), 0); err != nil {
+		t.Fatalf("prepare slow inbound mutation SQLite store: %v", err)
+	}
+	// Session creation and optional transcript/WAL maintenance are covered by
+	// their own recovery fixtures. Establish the work session before the
+	// listener starts so this test measures the post-claim cleanup boundary
+	// instead of first-use durable admission on a hosted race runner.
+	session := bridge.reg.SessionByChatID("chat-1")
+	if session == nil {
+		t.Fatal("slow inbound fixture has no chat-1 session")
+	}
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("prepare slow inbound durable session: %v", err)
+	}
+	maintenanceSkipUntil := time.Now().Add(time.Hour)
+	bridge.lastTranscriptSync = maintenanceSkipUntil
+	bridge.lastHistoryWatchSync = maintenanceSkipUntil
+	bridge.lastHistoryWatchReconcile = maintenanceSkipUntil
+	bridge.lastSQLiteWALCheckpoint = maintenanceSkipUntil
 
-	options := listenerRecoveryBaseOptions(store, filepath.Join(t.TempDir(), "registry.json"), executor)
+	options := listenerRecoveryBaseOptions(store, registryPath, executor)
 	// Match the production worker slice. The assertion is about separating the
 	// post-claim cleanup grace from the phase context; keep the finite worker
 	// budget large enough for SQLite admission on a busy Windows runner.
 	options.PhaseBudget = 10 * time.Second
 	options.PollWorkerBudget = mainLoopPollWorkerBudget
 	listener := startListenerRecovery(t, bridge, options)
+	progressTimeout := listenerRecoverySlowInboundProgressTimeout
+	// On a hosted Windows race runner, the first post-migration durable poll
+	// can finish just before the schedule wake and leave the inbound turn
+	// queued until the next cycle.  The assertion is about the eventual
+	// cleanup/dispatch contract, so allow one full retry cycle instead of
+	// treating that scheduler latency as a mutation-context failure.
 	if !waitListenerRecoveryResult(func() bool {
 		return len(executor.callsSnapshot()) == 1
-	}, listenerRecoveryProgressTimeout) {
+	}, progressTimeout) {
 		state, _ := store.Load(context.Background())
 		listener.stop(t)
 		t.Fatalf("slow inbound mutation did not dispatch: gets=%d calls=%#v state=%#v phase=%#v", graphState.getCount("chat-1"), executor.callsSnapshot(), state, bridge.mainLoopPhaseStatsSnapshot("poll"))
@@ -4185,7 +4262,7 @@ func TestTeamsListenFalseSlowInboundMutationDoesNotConsumeDurableCleanupGrace(t 
 			}
 		}
 		return false
-	}, listenerRecoveryExtendedProgressTimeout, "slow inbound final delivery")
+	}, progressTimeout, "slow inbound final delivery")
 	// The real Graph query would exclude this message after the durable cursor
 	// advances. Stop returning it from the mutable fake now so the 1ms listener
 	// interval cannot admit an unrelated second attempt while this test waits for
@@ -4196,19 +4273,20 @@ func TestTeamsListenFalseSlowInboundMutationDoesNotConsumeDurableCleanupGrace(t 
 	if err != nil {
 		t.Fatalf("parse slow inbound message timestamp: %v", err)
 	}
-	// The final POST can complete before the terminal poll CAS. Wait for the
-	// cursor itself, so a cleanup-context regression still fails here, then
-	// stop the listener before inspecting Attempt. Without stopping first, the
-	// healthy listener may already have claimed the next valid poll cycle and
-	// make a live attempt look like stale cleanup state.
+	// The final POST can complete before the terminal poll CAS. Wait for both
+	// the cursor and the attempt cleanup before stopping the listener. A race
+	// runner may observe the cursor from the final outbox side effect while the
+	// fenced terminal CAS is still in flight; canceling in that narrow window
+	// would make the test itself manufacture a stale Attempt. If cleanup really
+	// fails, this bounded wait still reports the regression.
 	if !waitListenerRecoveryResult(func() bool {
 		state, loadErr := store.Load(context.Background())
 		if loadErr != nil {
 			return false
 		}
 		poll := state.ChatPolls["chat-1"]
-		return !poll.LastModifiedCursor.Before(messageModifiedAt)
-	}, listenerRecoveryExtendedProgressTimeout) {
+		return !poll.LastModifiedCursor.Before(messageModifiedAt) && poll.Attempt == nil
+	}, progressTimeout) {
 		state, _ := store.Load(context.Background())
 		listener.stop(t)
 		t.Fatalf("slow inbound durable poll cursor did not advance; gets=%d calls=%#v state=%#v phase=%#v sent=%#v", graphState.getCount("chat-1"), executor.callsSnapshot(), state.ChatPolls["chat-1"], bridge.mainLoopPhaseStatsSnapshot("poll"), graphState.sentSnapshot())
@@ -5372,6 +5450,7 @@ func listenerRecoveryHistoryCheckpoint(path string, sessionID string, threadID s
 		ModTime:           info.ModTime(),
 		SourceGeneration:  historyTieredSourceIdentity(path, info),
 		SourceFingerprint: transcriptCheckpointSourceFingerprint(path, offset),
+		SourceChangeTime:  teamstore.SourceFileChangeTime(path, info),
 		Offset:            offset,
 		Line:              1,
 		SessionID:         sessionID,

@@ -111,6 +111,14 @@ const (
 	InboundStatusQueued    InboundStatus = "queued"
 	InboundStatusIgnored   InboundStatus = "ignored"
 	InboundStatusDeferred  InboundStatus = "deferred"
+	// InboundStatusManualHold is a non-terminal operator-visible disposition.
+	// The row is excluded from automatic recovery candidates until an explicit
+	// recovery operation supplies the missing proof.
+	InboundStatusManualHold InboundStatus = "manual_hold"
+	// InboundStatusUncertain records that an external operation crossed its
+	// request boundary but its outcome was not durably observed. It must never
+	// be treated as queued work or silently reposted.
+	InboundStatusUncertain InboundStatus = "uncertain"
 )
 
 type OutboxStatus string
@@ -386,6 +394,16 @@ func knownTurnStatus(status TurnStatus) bool {
 	switch TurnStatus(strings.TrimSpace(string(status))) {
 	case "", TurnStatusQueued, TurnStatusRunning, TurnStatusCompleted,
 		TurnStatusFailed, TurnStatusInterrupted:
+		return true
+	default:
+		return false
+	}
+}
+
+func knownInboundStatus(status InboundStatus) bool {
+	switch InboundStatus(strings.TrimSpace(string(status))) {
+	case "", InboundStatusPersisted, InboundStatusQueued, InboundStatusIgnored,
+		InboundStatusDeferred, InboundStatusManualHold, InboundStatusUncertain:
 		return true
 	default:
 		return false
@@ -1007,6 +1025,21 @@ type ImportCheckpoint struct {
 	SourceRewriteRecoverySize       int64     `json:"source_rewrite_recovery_size,omitempty"`
 	SourceRewriteRecoveryModTime    time.Time `json:"source_rewrite_recovery_mod_time,omitempty"`
 	SourceRewriteRecoveryChangeTime int64     `json:"source_rewrite_recovery_change_time,omitempty"`
+	SourceRewriteRecoveryReason     string    `json:"source_rewrite_recovery_reason,omitempty"`
+	// SourceRewriteRecoveryScan* is a durable, source-bound cursor for a
+	// linked-transcript anchor scan. The scan remains blocked until the whole
+	// source proves that the anchor is unique; Match* retains the first
+	// candidate across a phase timeout so the next pass can continue without
+	// rescanning the prefix.
+	SourceRewriteRecoveryScanPending     bool   `json:"source_rewrite_recovery_scan_pending,omitempty"`
+	SourceRewriteRecoveryScanOffset      int64  `json:"source_rewrite_recovery_scan_offset,omitempty"`
+	SourceRewriteRecoveryScanLine        int    `json:"source_rewrite_recovery_scan_line,omitempty"`
+	SourceRewriteRecoveryScanSessionID   string `json:"source_rewrite_recovery_scan_session_id,omitempty"`
+	SourceRewriteRecoveryScanThreadID    string `json:"source_rewrite_recovery_scan_thread_id,omitempty"`
+	SourceRewriteRecoveryScanTurnID      string `json:"source_rewrite_recovery_scan_turn_id,omitempty"`
+	SourceRewriteRecoveryScanMatchFound  bool   `json:"source_rewrite_recovery_scan_match_found,omitempty"`
+	SourceRewriteRecoveryScanMatchLine   int    `json:"source_rewrite_recovery_scan_match_line,omitempty"`
+	SourceRewriteRecoveryScanMatchOffset int64  `json:"source_rewrite_recovery_scan_match_offset,omitempty"`
 	// ExecutionAnchorGeneration is retained after an anchor is cleared so a
 	// late callback cannot accidentally clear a subsequently recreated anchor
 	// with the same outer turn ID.
@@ -1409,14 +1442,25 @@ type HistoryWatchCheckpoint struct {
 	// SourceRewriteRecoveryScan* is a durable, source-bound cursor for an
 	// incomplete bounded rebase pass. It is only a scan hint; the checkpoint
 	// remains blocked until the old anchor is proven and the cursor is replaced.
-	SourceRewriteRecoveryScanPending   bool   `json:"source_rewrite_recovery_scan_pending,omitempty"`
-	SourceRewriteRecoveryScanOffset    int64  `json:"source_rewrite_recovery_scan_offset,omitempty"`
-	SourceRewriteRecoveryScanLine      int    `json:"source_rewrite_recovery_scan_line,omitempty"`
-	SourceRewriteRecoveryScanSessionID string `json:"source_rewrite_recovery_scan_session_id,omitempty"`
-	SourceRewriteRecoveryScanThreadID  string `json:"source_rewrite_recovery_scan_thread_id,omitempty"`
-	SourceRewriteRecoveryScanTurnID    string `json:"source_rewrite_recovery_scan_turn_id,omitempty"`
-	Offset                             int64  `json:"offset,omitempty"`
-	Line                               int    `json:"line,omitempty"`
+	SourceRewriteRecoveryScanPending           bool   `json:"source_rewrite_recovery_scan_pending,omitempty"`
+	SourceRewriteRecoveryScanOffset            int64  `json:"source_rewrite_recovery_scan_offset,omitempty"`
+	SourceRewriteRecoveryScanLine              int    `json:"source_rewrite_recovery_scan_line,omitempty"`
+	SourceRewriteRecoveryScanSessionID         string `json:"source_rewrite_recovery_scan_session_id,omitempty"`
+	SourceRewriteRecoveryScanThreadID          string `json:"source_rewrite_recovery_scan_thread_id,omitempty"`
+	SourceRewriteRecoveryScanTurnID            string `json:"source_rewrite_recovery_scan_turn_id,omitempty"`
+	SourceRewriteRecoveryScanMatchFound        bool   `json:"source_rewrite_recovery_scan_match_found,omitempty"`
+	SourceRewriteRecoveryScanMatchLine         int    `json:"source_rewrite_recovery_scan_match_line,omitempty"`
+	SourceRewriteRecoveryScanMatchOffset       int64  `json:"source_rewrite_recovery_scan_match_offset,omitempty"`
+	SourceRewriteRecoveryScanMatchSourceItemID string `json:"source_rewrite_recovery_scan_match_source_item_id,omitempty"`
+	SourceRewriteRecoveryScanMatchThreadID     string `json:"source_rewrite_recovery_scan_match_thread_id,omitempty"`
+	SourceRewriteRecoveryScanMatchTurnID       string `json:"source_rewrite_recovery_scan_match_turn_id,omitempty"`
+	SourceRewriteRecoveryScanMatchTextHash     string `json:"source_rewrite_recovery_scan_match_text_hash,omitempty"`
+	SourceRewriteRecoveryScanMatchSourceLine   int    `json:"source_rewrite_recovery_scan_match_source_line,omitempty"`
+	SourceRewriteRecoveryScanMatchStartOffset  int64  `json:"source_rewrite_recovery_scan_match_start_offset,omitempty"`
+	SourceRewriteRecoveryScanMatchEndOffset    int64  `json:"source_rewrite_recovery_scan_match_end_offset,omitempty"`
+	SourceRewriteRecoveryReason                string `json:"source_rewrite_recovery_reason,omitempty"`
+	Offset                                     int64  `json:"offset,omitempty"`
+	Line                                       int    `json:"line,omitempty"`
 	// Partial* mirror ImportCheckpoint's resumable unterminated-record state.
 	// They are intentionally not folded into Offset: only a newline may advance
 	// the durable history cursor.
@@ -2230,8 +2274,19 @@ type InboundEvent struct {
 	NextAttemptAt time.Time `json:"next_attempt_at,omitempty"`
 	FailureCount  int       `json:"failure_count,omitempty"`
 	LastError     string    `json:"last_error,omitempty"`
-	CreatedAt     time.Time `json:"created_at,omitempty"`
-	UpdatedAt     time.Time `json:"updated_at,omitempty"`
+	// OperationState and OperationKey make the external side-effect boundary
+	// inspectable without inferring it from a free-form error string. These are
+	// additive metadata fields so older JSON/SQLite stores remain readable.
+	OperationState        string    `json:"operation_state,omitempty"`
+	OperationKey          string    `json:"operation_key,omitempty"`
+	OperationAttemptToken string    `json:"operation_attempt_token,omitempty"`
+	OperationStartedAt    time.Time `json:"operation_started_at,omitempty"`
+	HoldReason            string    `json:"hold_reason,omitempty"`
+	HoldRequiredEvidence  string    `json:"hold_required_evidence,omitempty"`
+	HoldNextAction        string    `json:"hold_next_action,omitempty"`
+	HoldWakeCondition     string    `json:"hold_wake_condition,omitempty"`
+	CreatedAt             time.Time `json:"created_at,omitempty"`
+	UpdatedAt             time.Time `json:"updated_at,omitempty"`
 }
 
 type InboundAttachmentContext struct {
@@ -4706,6 +4761,11 @@ func inboundEventHasOperationalBacklog(event InboundEvent, turns map[string]Turn
 		return true
 	case InboundStatusQueued:
 		return true
+	case InboundStatusManualHold, InboundStatusUncertain, InboundStatusIgnored:
+		// A held/uncertain row remains visible to explicit reconciliation, but
+		// must not become a process-wide optional-maintenance gate. Its dependent
+		// suffix is protected by the chat/frontier fence; unrelated chats continue.
+		return false
 	default:
 		// Unknown non-empty inbound states are conservatively operational.  The
 		// only known terminal inbound state is ignored.
@@ -6756,6 +6816,45 @@ func (s *Store) ForkPollingSnapshot(ctx context.Context) (State, error) {
 	return s.loadStateFieldsOrFull(ctx, forkPollingStateFields)
 }
 
+// forkOperationsSQLite keeps ForkOperations on the small exceptional table
+// when the durable backend is SQLite. The legacy selected-state loader also
+// knows how to read this map, but it first materializes cold/runtime metadata
+// that the owner loop does not need. That extra work holds Store.mu and can
+// starve inbound polling while the first SQLite/WAL read is settling.
+func (s *Store) forkOperationsSQLite(ctx context.Context) ([]ForkOperation, bool, error) {
+	var out []ForkOperation
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		handled = true
+		rows, err := db.QueryContext(ctx, `SELECT json FROM fork_operations ORDER BY updated_at, id`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var raw []byte
+			if err := rows.Scan(&raw); err != nil {
+				return err
+			}
+			var operation ForkOperation
+			if err := json.Unmarshal(raw, &operation); err != nil {
+				return err
+			}
+			out = append(out, operation)
+		}
+		return rows.Err()
+	})
+	return out, handled, err
+}
+
 // forkPollingSnapshotSQLite avoids decoding every session and chat poll on
 // every listener tick when no fork is staged. Forks are exceptional and have
 // their own indexed phase column; the common no-fork path therefore needs only
@@ -7520,6 +7619,8 @@ func (s *Store) updateHistoryWatchWithCapability(ctx context.Context, capability
 			return err
 		}
 		for id, checkpoint := range history {
+			normalizeHistoryWatchOptionalProof(&checkpoint)
+			history[id] = checkpoint
 			if err := validateHistoryWatchCheckpointState(checkpoint, id); err != nil {
 				return err
 			}
@@ -7572,6 +7673,7 @@ func (s *Store) updateHistoryWatchCheckpointIfCurrentWithCapability(ctx context.
 		return ErrHistoryWatchCheckpointConflict
 	}
 	next.ID = id
+	normalizeHistoryWatchOptionalProof(&next)
 	if err := validateHistoryWatchCheckpointState(next, id); err != nil {
 		return err
 	}
@@ -8813,7 +8915,7 @@ func (s *Store) RescueForUpgrade(ctx context.Context, opts UpgradeRescueOptions)
 				continue
 			}
 			switch msg.Status {
-			case OutboxStatusQueued, OutboxStatusSending:
+			case OutboxStatusQueued:
 				msg.Status = OutboxStatusSkipped
 				msg.LastSendError = "superseded by helper upgrade rescue"
 				msg.UpdatedAt = now
@@ -8827,6 +8929,11 @@ func (s *Store) RescueForUpgrade(ctx context.Context, opts UpgradeRescueOptions)
 					Detail:    msg.Kind,
 					CreatedAt: now,
 				})
+			case OutboxStatusSending:
+				// A Sending row has crossed the Graph boundary, but its provider
+				// outcome may still be unknown. Preserve it for the recovery lane;
+				// turning it into Skipped would discard a late message ID and make a
+				// later restart eligible to POST the same payload again.
 			}
 		}
 		req.Phase = UpgradePhaseDraining
@@ -9696,7 +9803,7 @@ func (s *Store) updateInboundEventWithCapability(ctx context.Context, inboundID 
 		if next.UpdatedAt.IsZero() {
 			next.UpdatedAt = now
 		}
-		if capability.bound() && (!found || strings.TrimSpace(current.MachineID) == "" && current.LeaseGeneration <= 0 || current.Status == InboundStatusDeferred && (strings.TrimSpace(current.MachineID) != capability.machineID || current.LeaseGeneration != capability.leaseGeneration)) {
+		if capability.bound() && (!found || strings.TrimSpace(current.MachineID) == "" && current.LeaseGeneration <= 0 || inboundEventCanBeAdoptedByOwner(current) && (strings.TrimSpace(current.MachineID) != capability.machineID || current.LeaseGeneration != capability.leaseGeneration)) {
 			next.MachineID = capability.machineID
 			next.LeaseGeneration = capability.leaseGeneration
 		}
@@ -10247,10 +10354,15 @@ func inboundRecoveryCandidateReady(event InboundEvent, now time.Time) bool {
 	if !inboundRecoveryCandidate(event) {
 		return false
 	}
-	if event.Status != InboundStatusDeferred || event.NextAttemptAt.IsZero() {
+	if event.NextAttemptAt.IsZero() {
 		return true
 	}
-	return !event.NextAttemptAt.After(now)
+	switch event.Status {
+	case InboundStatusDeferred, InboundStatusPersisted, InboundStatusQueued:
+		return !event.NextAttemptAt.After(now)
+	default:
+		return true
+	}
 }
 
 func inboundRecoveryCandidate(event InboundEvent) bool {
@@ -10261,6 +10373,21 @@ func inboundRecoveryCandidate(event InboundEvent) bool {
 	case InboundStatusDeferred:
 		return true
 	case InboundStatusPersisted, InboundStatusQueued:
+		return strings.TrimSpace(event.TurnID) == ""
+	default:
+		return false
+	}
+}
+
+// inboundEventCanBeAdoptedByOwner is deliberately narrower than “not
+// terminal”.  A replacement listener may adopt a durable inbound only before
+// it has been linked to a turn; a linked queued row belongs to turn recovery
+// and must remain under that protocol's owner/CAS fence.
+func inboundEventCanBeAdoptedByOwner(event InboundEvent) bool {
+	switch event.Status {
+	case InboundStatusDeferred, InboundStatusPersisted:
+		return true
+	case InboundStatusQueued:
 		return strings.TrimSpace(event.TurnID) == ""
 	default:
 		return false
@@ -17554,17 +17681,17 @@ func validateInboundOwnerCapability(state *State, inbound InboundEvent, found bo
 	}
 	if inbound.LeaseGeneration > 0 {
 		if strings.TrimSpace(inbound.MachineID) != capability.machineID || inbound.LeaseGeneration != capability.leaseGeneration {
-			// Deferred inbound is durable user input, not an execution result. A
+			// An unlinked inbound is durable user input, not an execution result. A
 			// replacement owner may adopt it after takeover, but only while it is
-			// still deferred; the active lease check above already rejects a stale
-			// owner's capability.
-			if inbound.Status != InboundStatusDeferred {
+			// still before QueueTurn; the active lease check above already rejects a
+			// stale owner's capability.
+			if !inboundEventCanBeAdoptedByOwner(inbound) {
 				return ErrControlLeaseNotHeld
 			}
 		}
 		return nil
 	}
-	if legacyBound && inbound.Status != InboundStatusDeferred {
+	if legacyBound && !inboundEventCanBeAdoptedByOwner(inbound) {
 		return ErrControlLeaseNotHeld
 	}
 	return nil
@@ -19078,13 +19205,18 @@ func recoverStateLocked(state *State, report *RecoveryReport, now time.Time) boo
 			continue
 		}
 		switch msg.Status {
-		case OutboxStatusQueued, OutboxStatusSending:
+		case OutboxStatusQueued:
 			msg.Status = OutboxStatusSkipped
 			msg.LastSendError = "superseded by teams recover"
 			msg.UpdatedAt = now
 			state.OutboxMessages[id] = msg
 			report.SupersededOutboxIDs = append(report.SupersededOutboxIDs, id)
 			changed = true
+		case OutboxStatusSending:
+			// A Sending row has crossed the Graph boundary, but its provider
+			// outcome may still be unknown. Preserve it for the recovery lane;
+			// turning it into Skipped would discard a late message ID and make a
+			// later restart eligible to POST the same payload again.
 		}
 	}
 	sort.Strings(report.InterruptedTurnIDs)
@@ -21963,15 +22095,20 @@ func SourceFileIdentityFromFileInfo(path string, info os.FileInfo) (string, erro
 	return sourceFileIdentityFromRevision(revision), nil
 }
 
-// SourceFileChangeTimeFromFileInfo returns the native file change-time
-// revision when the platform exposes one. It is intentionally separate from
-// SourceFileIdentity: append-only transcript writers change ctime while
-// retaining the same inode, so ctime is useful for validating a paused
-// partial record but must not be used as the transcript generation identity.
-// A zero result means that this platform/filesystem does not expose a usable
-// change time and callers must retain their existing conservative proof.
-func SourceFileChangeTimeFromFileInfo(info os.FileInfo) int64 {
-	return fileInfoChangeTimeUnixNano(info)
+// SourceFileChangeTime returns the native file revision marker when the
+// platform exposes one. It is intentionally separate from SourceFileIdentity:
+// append-only transcript writers change ctime/USN while retaining the same
+// inode, so the marker is useful for validating a paused partial record but
+// must not be used as the transcript generation identity. On Windows the
+// adapter uses the per-file USN revision because writable timestamps can be
+// restored after an in-place rewrite. A zero result means that this
+// platform/filesystem does not expose a usable revision and callers that need
+// source proof must fail closed.
+func SourceFileChangeTime(path string, info os.FileInfo) int64 {
+	if changeTime := fileInfoChangeTimeUnixNano(info); changeTime != 0 {
+		return changeTime
+	}
+	return sourceFileChangeTime(path, info)
 }
 
 func sourceFileIdentityFromRevision(revision stateFileRevision) string {

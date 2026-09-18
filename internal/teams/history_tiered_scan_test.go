@@ -327,7 +327,7 @@ func TestHistoryTieredStatFastModeDetectsSameSizeRewriteUsingChangeTime(t *testi
 	if err != nil {
 		t.Fatalf("stat original: %v", err)
 	}
-	changeTime := teamstore.SourceFileChangeTimeFromFileInfo(info)
+	changeTime := teamstore.SourceFileChangeTime(path, info)
 	if changeTime == 0 {
 		t.Skip("platform does not expose a usable file change time")
 	}
@@ -345,7 +345,7 @@ func TestHistoryTieredStatFastModeDetectsSameSizeRewriteUsingChangeTime(t *testi
 	if err != nil {
 		t.Fatalf("stat rewritten file: %v", err)
 	}
-	if got := teamstore.SourceFileChangeTimeFromFileInfo(newInfo); got == changeTime {
+	if got := teamstore.SourceFileChangeTime(path, newInfo); got == changeTime {
 		t.Skip("filesystem did not expose a changed ctime for the rewrite")
 	}
 	changes, err := historyTieredDetectStatChanges([]string{path}, map[string]historyTieredFileState{path: state})

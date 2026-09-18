@@ -40,6 +40,7 @@ rate_limit_experiment="${CXP_TEAMS_DOCKER_REAL_DATA_429:-0}"
 rate_limit_scope="${CXP_TEAMS_DOCKER_REAL_DATA_429_SCOPE:-chat}"
 poll_interval="${CXP_TEAMS_DOCKER_REAL_DATA_POLL_INTERVAL:-}"
 recent_session_hours="${CXP_TEAMS_DOCKER_RECENT_SESSION_HOURS:-24}"
+include_recent_history="${CXP_TEAMS_DOCKER_INCLUDE_RECENT_HISTORY:-0}"
 if [[ -n "${CXP_TEAMS_DOCKER_PROCESS_RESTART+x}" ]]; then
 	process_restart="$CXP_TEAMS_DOCKER_PROCESS_RESTART"
 elif [[ "$rate_limit_experiment" == "1" ]]; then
@@ -97,6 +98,14 @@ if [[ ! "$recent_session_hours" =~ ^[0-9]+$ ]] || [[ "$recent_session_hours" -lt
 	echo "CXP_TEAMS_DOCKER_RECENT_SESSION_HOURS must be a positive integer" >&2
 	exit 2
 fi
+
+case "$include_recent_history" in
+	0|1) ;;
+	*)
+		echo "CXP_TEAMS_DOCKER_INCLUDE_RECENT_HISTORY must be 0 or 1" >&2
+		exit 2
+		;;
+esac
 
 if [[ ! "$fixture_min_free_bytes" =~ ^[1-9][0-9]*$ ]]; then
 	echo "CXP_TEAMS_DOCKER_FIXTURE_MIN_FREE_BYTES must be a positive integer" >&2
@@ -213,14 +222,12 @@ write_source_core_manifest() {
 			printf 'missing  %s\n' "$input" >> "$output" || return 1
 		fi
 	done
-	# SQLite .backup calls below take a transaction-consistent snapshot. Include
-	# the source -wal bytes in the pre/post manifest even though they are not
-	# copied or mounted into the container: a WAL-only commit or checkpoint must
-	# invalidate this cross-file snapshot attempt rather than look unchanged just
-	# because the main database file did not move. Do not include -shm here. It is
-	# an ephemeral reader index that SQLite may create while this read-only
-	# snapshot is assembled; it contains no durable database content, and treating
-	# its creation as source drift rejects an otherwise stable fixture. Session files are
+	# SQLite snapshots below are assembled from a private copy of the database
+	# family. Include every SQLite sidecar in the pre/post manifest: a WAL-only
+	# commit, rollback journal, or shared-memory index change must invalidate this
+	# cross-file snapshot attempt rather than look unchanged just because the main
+	# database file did not move. The private copy prevents the snapshot operation
+	# itself from creating or updating a sidecar beside the live database. Session files are
 	# immutable/atomically replaced by the Codex writer. The
 	# manifest records path, inode, size, mtime, and ctime so an append, replace,
 	# or same-size rewrite with restored mtime during the copy is rejected
@@ -231,10 +238,7 @@ write_source_core_manifest() {
 	for input in "${source_core_inputs[@]}"; do
 		case "$input" in
 			*.sqlite)
-				# Only the WAL carries committed content outside the main file.
-				# SQLite may create/rebuild -shm as a side effect of opening a WAL
-				# database for read-only backup, so it is deliberately excluded.
-				for suffix in -wal; do
+				for suffix in -wal -shm -journal; do
 					sidecar="$input$suffix"
 					if [[ -L "$sidecar" ]]; then
 						echo "refusing symlink SQLite sidecar: $sidecar" >&2
@@ -294,6 +298,10 @@ sqlite_backup_readonly() {
 	local destination_path="$2"
 	local source_journal_mode
 	local source_size
+	local staging_dir
+	local staging_path
+	local suffix
+	local sidecar
 	source_size="$(stat -c '%s' -- "$source_path")"
 	if [[ ! "$source_size" =~ ^[0-9]+$ ]]; then
 		echo "unable to determine source SQLite size: $source_path" >&2
@@ -302,17 +310,47 @@ sqlite_backup_readonly() {
 	if ! require_fixture_free_space "$source_size" "SQLite backup $source_path"; then
 		return 1
 	fi
-	source_journal_mode="$(sqlite3 "file:$source_path?mode=ro" 'PRAGMA journal_mode;' | tail -n 1 | tr '[:upper:]' '[:lower:]')"
-	if [[ -z "$source_journal_mode" ]]; then
-		echo "unable to determine source SQLite journal mode: $source_path" >&2
+	if [[ -L "$source_path" || ! -f "$source_path" ]]; then
+		echo "refusing to snapshot non-regular SQLite input: $source_path" >&2
 		return 1
 	fi
-	# The live helper can hold a short SQLite write/schema lock while this
-	# disposable snapshot is assembled.  The sqlite3 CLI default timeout is
-	# effectively zero for .backup, which made a transient source lock abort an
-	# otherwise safe experiment before Docker even started.  Wait on the source
-	# lock, but never open the source for writing or copy its WAL/SHM files.
-	if ! sqlite3 -cmd ".timeout 30000" "file:$source_path?mode=ro" ".backup '$destination_path'"; then
+	# Never open the live database with SQLite. Even a read-only WAL connection
+	# can create or update its -shm reader index on some SQLite/filesystem
+	# combinations. Copy the whole database family first, then perform .backup
+	# only against that private staging copy. The before/after source manifest
+	# still verifies that main/WAL/SHM/journal bytes belonged to one stable view.
+	staging_dir="$(mktemp -d "$build_dir/sqlite-source-XXXXXX")"
+	staging_path="$staging_dir/$(basename -- "$source_path")"
+	if ! cp --no-dereference -- "$source_path" "$staging_path"; then
+		rm -rf -- "$staging_dir"
+		return 1
+	fi
+	for suffix in -wal -shm -journal; do
+		sidecar="$source_path$suffix"
+		if [[ ! -e "$sidecar" ]]; then
+			continue
+		fi
+		if [[ -L "$sidecar" || ! -f "$sidecar" ]]; then
+			echo "refusing non-regular SQLite sidecar: $sidecar" >&2
+			rm -rf -- "$staging_dir"
+			return 1
+		fi
+		if ! cp --no-dereference -- "$sidecar" "$staging_path$suffix"; then
+			rm -rf -- "$staging_dir"
+			return 1
+		fi
+	done
+	source_journal_mode="$(sqlite3 "file:$staging_path?mode=ro" 'PRAGMA journal_mode;' | tail -n 1 | tr '[:upper:]' '[:lower:]')"
+	if [[ -z "$source_journal_mode" ]]; then
+		echo "unable to determine source SQLite journal mode: $source_path" >&2
+		rm -rf -- "$staging_dir"
+		return 1
+	fi
+	# The live helper can hold a short SQLite write/schema lock while the source
+	# files are copied. The source manifest turns that into a retry; this timeout
+	# only protects the private staging copy from a transient local lock.
+	if ! sqlite3 -cmd ".timeout 30000" "file:$staging_path?mode=ro" ".backup '$destination_path'"; then
+		rm -rf -- "$staging_dir"
 		return 1
 	fi
 	# The SQLite backup API does not reliably carry the source journal mode to
@@ -325,6 +363,7 @@ sqlite_backup_readonly() {
 	wal)
 		if [[ "$(sqlite3 "$destination_path" 'PRAGMA journal_mode=WAL;' | tail -n 1 | tr '[:upper:]' '[:lower:]')" != "wal" ]]; then
 			echo "failed to preserve WAL journal mode in SQLite fixture: $destination_path" >&2
+			rm -rf -- "$staging_dir"
 			return 1
 		fi
 		;;
@@ -334,10 +373,15 @@ sqlite_backup_readonly() {
 		;;
 	*)
 		echo "unsupported source SQLite journal mode $source_journal_mode: $source_path" >&2
+		rm -rf -- "$staging_dir"
 		return 1
 		;;
 	esac
-	sqlite3 "file:$destination_path?mode=ro" "PRAGMA quick_check;" | grep -Fx ok >/dev/null
+	if ! sqlite3 "file:$destination_path?mode=ro" "PRAGMA quick_check;" | grep -Fx ok >/dev/null; then
+		rm -rf -- "$staging_dir"
+		return 1
+	fi
+	rm -rf -- "$staging_dir"
 }
 
 copy_optional_sqlite_backup() {
@@ -446,10 +490,12 @@ copy_sparse_history_file() {
 copy_referenced_history_files() {
 	local candidate="$1"
 	local snapshot_store="$2"
-	local sessions_root history_inventory source_path checkpoint_offset projected_size
-	local canonical_source relative destination
+	local sessions_root history_inventory sparse_proof_inventory source_path checkpoint_offset projected_size
+	local canonical_source relative destination source_size copy_start aligned_start
 	sessions_root="$(realpath -e -- "$codex_home/sessions")"
 	history_inventory="$candidate/.history-selection.tsv"
+	sparse_proof_inventory="$candidate/.sparse-history-proof-files"
+	: > "$sparse_proof_inventory"
 	if [[ -z "$snapshot_store" || ! -f "$snapshot_store" ]]; then
 		echo "history inventory requires the transaction-consistent scope SQLite snapshot" >&2
 		return 1
@@ -462,6 +508,17 @@ WITH refs(path, object, projected_size) AS (
 	FROM state_meta AS s,
 	     json_each(CASE WHEN json_valid(s.value) THEN json_extract(s.value, '$.history_watch') ELSE '[]' END) AS j
 	WHERE s.key = 'history_watch_projection'
+	  AND json_extract(j.value, '$.path') IS NOT NULL
+	UNION ALL
+	-- A mixed-version store can expose a checkpoint through the canonical
+	-- cold state before the dedicated history projection catches up.  Keep
+	-- both observations in the copied source inventory.
+	SELECT json_extract(j.value, '$.path'),
+	       CASE WHEN json_valid(j.value) THEN j.value ELSE '{}' END,
+	       CAST(CASE WHEN json_valid(j.value) THEN COALESCE(json_extract(j.value, '$.size'), 0) ELSE 0 END AS INTEGER)
+	FROM state_meta AS s,
+	     json_each(CASE WHEN json_valid(s.value) THEN json_extract(s.value, '$.history_watch') ELSE '[]' END) AS j
+	WHERE s.key = 'state_json'
 	  AND json_extract(j.value, '$.path') IS NOT NULL
 	UNION ALL
 	SELECT json_extract(j.value, '$.pending_history_range.source_path'),
@@ -489,10 +546,13 @@ outbox_needed(path, projected_size, required_start) AS (
 			CASE WHEN json_type(json, '$.transcript_source_proof_offset') IN ('integer', 'real')
 			     THEN max(0, CAST(json_extract(json, '$.transcript_source_proof_offset') AS INTEGER) - 8192)
 			     ELSE 9223372036854775807 END,
-			CASE WHEN json_type(json, '$.transcript_source_read_proof_start_offset') IN ('integer', 'real')
-			     THEN max(0, CAST(json_extract(json, '$.transcript_source_read_proof_start_offset') AS INTEGER))
+			CASE WHEN json_extract(json, '$.transcript_source_read_proof_range_known') = 1
+			          AND (json_type(json, '$.transcript_source_read_proof_start_offset') IN ('integer', 'real')
+			               OR json_type(json, '$.transcript_source_read_proof_start_offset') IS NULL)
+			          AND json_type(json, '$.transcript_source_read_proof_end_offset') IN ('integer', 'real')
+			     THEN max(0, CAST(COALESCE(json_extract(json, '$.transcript_source_read_proof_start_offset'), 0) AS INTEGER))
 			     ELSE 9223372036854775807 END
-	       )
+		       )
 	FROM outbox_messages
 	WHERE json_valid(json)
 	  AND json_extract(json, '$.transcript_source_path') IS NOT NULL
@@ -553,19 +613,29 @@ SQL
 			echo "history source escaped the validated sessions tree: $source_path" >&2
 			return 1
 		fi
-		relative="${canonical_source#"$sessions_root/"}"
+	relative="${canonical_source#"$sessions_root/"}"
 		destination="$candidate/codex/sessions/$relative"
 		if ! copy_sparse_history_file "$canonical_source" "$destination" "$checkpoint_offset" "$projected_size"; then return 1; fi
+		source_size="$(stat -c '%s' -- "$destination")"
+		copy_start=$((checkpoint_offset > 8192 ? checkpoint_offset - 8192 : 0))
+		aligned_start=$((copy_start / 1024 / 1024 * 1024 * 1024))
+		# The sparse copy contains every byte from aligned_start through EOF.
+		# Record that covering range so a resumed listener can validate a new
+		# bounded checkpoint discovered after the first process advanced the
+		# cursor, without copying the already-consumed prefix.
+		printf '%s\t%s\t%s\t%s\n' "$canonical_source" "$relative" "$aligned_start" "$source_size" >> "$sparse_proof_inventory"
 	done < "$history_inventory"
 	rm -f -- "$history_inventory"
 }
 
 copy_recent_history_files() {
 	local candidate="$1"
-	local sessions_root recent_inventory recent_minutes source_path canonical_source relative destination session_size
+	local sessions_root recent_inventory recent_minutes source_path canonical_source relative destination session_size proof_inventory
 	sessions_root="$(realpath -e -- "$codex_home/sessions")"
 	recent_minutes=$((recent_session_hours * 60))
 	recent_inventory="$candidate/.recent-session-selection"
+	proof_inventory="$candidate/.recent-session-proof-files"
+	: > "$proof_inventory"
 	if ! find "$sessions_root" -type f -name '*.jsonl' -mmin "-$recent_minutes" -print0 > "$recent_inventory"; then
 		return 1
 	fi
@@ -594,6 +664,10 @@ copy_recent_history_files() {
 			echo "refusing copied recent session that is not a regular file: $destination" >&2
 			return 1
 		fi
+		# Recent files are copied in full. Keep their source and relative name so
+		# a resumed listener can validate a checkpoint that advanced into a file
+		# which was not part of the original durable checkpoint inventory.
+		printf '%s\t%s\n' "$canonical_source" "$relative" >> "$proof_inventory"
 	done < "$recent_inventory"
 	rm -f -- "$recent_inventory"
 }
@@ -618,11 +692,44 @@ WITH history_rows AS (
   FROM state_meta AS s,
        json_each(CASE WHEN json_valid(s.value) THEN json_extract(s.value, '$.history_watch') ELSE '{}' END) AS j
   WHERE s.key = 'history_watch_projection'
+  UNION
+  -- Keep the proof inventory complete when a legacy/full-state writer has
+  -- advanced state_json but the dedicated history projection has not yet
+  -- caught up (or vice versa).  The content manifest is immutable; duplicate
+  -- ranges are harmless and are accepted only when their digest agrees.
+  SELECT json_extract(j.value, '$.path') AS root_path, j.value AS object
+  FROM state_meta AS s,
+       json_each(CASE WHEN json_valid(s.value) THEN json_extract(s.value, '$.history_watch') ELSE '{}' END) AS j
+  WHERE s.key = 'state_json'
 ),
 import_rows AS (
   SELECT json AS object
   FROM import_checkpoints
   WHERE json_valid(json)
+),
+checkpoint_offsets(path, offset) AS (
+  SELECT root_path, CAST(json_extract(object, '$.offset') AS INTEGER)
+  FROM history_rows
+  WHERE trim(COALESCE(root_path, '')) <> ''
+    AND json_type(object, '$.offset') IN ('integer', 'real')
+    AND CAST(json_extract(object, '$.offset') AS INTEGER) >= 0
+  UNION ALL
+  SELECT row.root_path, CAST(tree.value AS INTEGER)
+  FROM history_rows AS row, json_tree(row.object) AS tree
+  WHERE trim(COALESCE(row.root_path, '')) <> ''
+    AND tree.type IN ('integer', 'real')
+    AND tree.key IN (
+      'offset',
+      'partial_line_start_offset',
+      'partial_replay_offset',
+      'pending_opaque_record_start_offset',
+      'source_rewrite_recovery_scan_offset',
+      'last_final_start_offset',
+      'unresolved_continuation_offset',
+      'start_offset',
+      'frontier_offset'
+    )
+    AND CAST(tree.value AS INTEGER) >= 0
 ),
 ranges(path, start_offset, end_offset) AS (
   SELECT root_path,
@@ -660,6 +767,12 @@ ranges(path, start_offset, end_offset) AS (
   FROM history_rows
   WHERE json_type(object, '$.terminal_boundary.start_offset') IN ('integer', 'real')
     AND json_type(object, '$.terminal_boundary.exclusive_end_offset') IN ('integer', 'real')
+  UNION ALL
+  SELECT path,
+         max(0, offset - 8192),
+         offset
+  FROM checkpoint_offsets
+  WHERE offset >= 0
   UNION ALL
   SELECT json_extract(object, '$.source_path'),
          max(0, CAST(json_extract(object, '$.last_offset') AS INTEGER) - 8192),
@@ -715,12 +828,14 @@ ranges(path, start_offset, end_offset) AS (
     AND CAST(json_extract(json, '$.transcript_source_proof_offset') AS INTEGER) >= 0
   UNION ALL
   SELECT json_extract(json, '$.transcript_source_path'),
-         CAST(json_extract(json, '$.transcript_source_read_proof_start_offset') AS INTEGER),
+         CAST(COALESCE(json_extract(json, '$.transcript_source_read_proof_start_offset'), 0) AS INTEGER),
          CAST(json_extract(json, '$.transcript_source_read_proof_end_offset') AS INTEGER)
   FROM outbox_messages
   WHERE json_valid(json)
     AND trim(COALESCE(json_extract(json, '$.transcript_source_path'), '')) <> ''
-    AND json_type(json, '$.transcript_source_read_proof_start_offset') IN ('integer', 'real')
+    AND json_extract(json, '$.transcript_source_read_proof_range_known') = 1
+    AND (json_type(json, '$.transcript_source_read_proof_start_offset') IN ('integer', 'real')
+         OR json_type(json, '$.transcript_source_read_proof_start_offset') IS NULL)
     AND json_type(json, '$.transcript_source_read_proof_end_offset') IN ('integer', 'real')
 )
 SELECT path, start_offset, end_offset
@@ -765,6 +880,77 @@ SQL
 		printf '%s\t%s\t%s\t%s\n' "${logical_path}" "$start" "$end" "$digest" >> "$candidate/source-proof-manifest.tsv" || return 1
 	done < "$inventory"
 	rm -f -- "$inventory"
+	# A full recent-session copy can become the source of a newly discovered
+	# history checkpoint during the first listener process. Its exact cursor
+	# range is unknowable at fixture-assembly time, so add a whole-file witness.
+	# The fixture-side rebind accepts this row only after hashing the entire
+	# copied regular file and matching its recorded size/digest; sparse proof-tail
+	# files are intentionally not listed here.
+	local recent_proof_inventory="$candidate/.recent-session-proof-files"
+	if [[ -f "$recent_proof_inventory" ]]; then
+		while IFS=$'\t' read -r source_path relative; do
+			[[ -z "$source_path" || -z "$relative" ]] && continue
+			if ! canonical_source="$(realpath -e -- "$source_path")"; then
+				echo "recent transcript source disappeared while building full-file proof manifest: $source_path" >&2
+				return 1
+			fi
+			if [[ "$canonical_source" != "$sessions_root"/* ]]; then
+				echo "recent transcript proof escaped the sessions tree: $source_path" >&2
+				return 1
+			fi
+			if [[ ! -f "$canonical_source" || -L "$canonical_source" ]]; then
+				echo "recent transcript proof source is not a regular file: $canonical_source" >&2
+				return 1
+			fi
+			source_size="$(stat -c '%s' -- "$canonical_source")"
+			if [[ ! "$source_size" =~ ^[0-9]+$ ]]; then
+				echo "unable to determine recent transcript source size: $canonical_source" >&2
+				return 1
+			fi
+			digest="$(sha256sum -- "$canonical_source")"
+			digest="${digest%% *}"
+			if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+				echo "unable to hash recent transcript source: $canonical_source" >&2
+				return 1
+			fi
+			logical_path="${fixture_codex_dir%/}/sessions/$relative"
+			printf '%s\t0\t%s\t%s\n' "$logical_path" "$source_size" "$digest" >> "$candidate/source-proof-manifest.tsv" || return 1
+		done < "$recent_proof_inventory"
+	fi
+	rm -f -- "$recent_proof_inventory"
+	local sparse_proof_inventory="$candidate/.sparse-history-proof-files"
+	if [[ -f "$sparse_proof_inventory" ]]; then
+		while IFS=$'\t' read -r source_path relative start end; do
+			[[ -z "$source_path" || -z "$relative" ]] && continue
+			if ! canonical_source="$(realpath -e -- "$source_path")"; then
+				echo "sparse transcript source disappeared while building proof manifest: $source_path" >&2
+				return 1
+			fi
+			if [[ "$canonical_source" != "$sessions_root"/* ]]; then
+				echo "sparse transcript proof escaped the sessions tree: $source_path" >&2
+				return 1
+			fi
+			if ! [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ && "$end" -ge "$start" ]]; then
+				echo "invalid sparse transcript proof range: path=$source_path start=$start end=$end" >&2
+				return 1
+			fi
+			source_size="$(stat -c '%s' -- "$canonical_source")"
+			if [[ "$end" -gt "$source_size" ]]; then
+				echo "sparse transcript proof exceeds source size: path=$source_path end=$end size=$source_size" >&2
+				return 1
+			fi
+			length=$((end - start))
+			digest="$(dd if="$canonical_source" iflag=skip_bytes,count_bytes skip="$start" count="$length" bs=1M status=none | sha256sum)"
+			digest="${digest%% *}"
+			if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+				echo "unable to hash sparse transcript source proof range: path=$source_path start=$start end=$end" >&2
+				return 1
+			fi
+			logical_path="${fixture_codex_dir%/}/sessions/$relative"
+			printf '%s\t%s\t%s\t%s\n' "${logical_path}" "$start" "$end" "$digest" >> "$candidate/source-proof-manifest.tsv" || return 1
+		done < "$sparse_proof_inventory"
+	fi
+	rm -f -- "$sparse_proof_inventory"
 }
 
 assemble_fixture_snapshot() {
@@ -819,7 +1005,16 @@ assemble_fixture_snapshot() {
 		return 1
 	fi
 	if ! copy_referenced_history_files "$candidate" "$candidate/teams/store.sqlite"; then return 1; fi
-	if ! copy_recent_history_files "$candidate"; then return 1; fi
+	# The replay corpus and the durable history/import projections select the
+	# source files that can affect this snapshot.  Do not copy every JSONL file
+	# modified in the last day by default: on a real Codex home that can be tens
+	# of gigabytes of unrelated history and makes fixture assembly dominate the
+	# experiment.  Keep the broad recent-file mode as an explicit diagnostic
+	# option for callers that specifically need session discovery beyond the
+	# durable scope state.
+	if [[ "$include_recent_history" == "1" ]]; then
+		if ! copy_recent_history_files "$candidate"; then return 1; fi
+	fi
 	if ! write_source_proof_manifest "$candidate" "$candidate/teams/store.sqlite"; then return 1; fi
 	if ! session_symlinks="$(find "$candidate/codex/sessions" -type l -print -quit)"; then return 1; fi
 	if [[ -n "$session_symlinks" ]]; then
@@ -836,7 +1031,7 @@ assemble_fixture_snapshot() {
 	if ! cmp -s "$source_core_manifest_before" "$source_core_manifest_after"; then
 		echo "source inputs changed while the point-in-time fixture was being assembled; this attempt is not cross-file stable" >&2
 		diff -u "$source_core_manifest_before" "$source_core_manifest_after" >&2 || true
-		echo "SQLite .backup snapshots include committed WAL content; source SQLite/main or -wal drift invalidated this cross-file snapshot attempt" >&2
+		echo "SQLite .backup snapshots include the copied database family; source SQLite/main, -wal, -shm, or -journal drift invalidated this cross-file snapshot attempt" >&2
 		# Return a distinct status so the caller can retry. A candidate whose
 		# source manifest moved is never silently treated as a validated fixture.
 		return 2
@@ -933,6 +1128,7 @@ run_experiment_process() {
 		--tmpfs /tmp:rw,nosuid,nodev,size=256m \
 		--env HOME=/runtime/home \
 		--env TMPDIR=/tmp \
+		--env CXP_RUNTIME_DISABLE=1 \
 		--env CXP_TEAMS_DOCKER_FIXTURE_DIR=/fixture \
 		--env CXP_TEAMS_DOCKER_RUNTIME_DIR=/runtime \
 		--env CXP_TEAMS_DOCKER_RUNTIME_REUSE="$reuse_runtime" \
@@ -941,7 +1137,7 @@ run_experiment_process() {
 		--env CXP_TEAMS_DOCKER_PROCESS_RESTART="$process_restart" \
 		--env CXP_TEAMS_DOCKER_REAL_DATA_MODE="$experiment_mode" \
 		--env CXP_TEAMS_DOCKER_REAL_DATA_DURATION="$experiment_duration" \
-			--env CXP_TEAMS_DOCKER_STARTUP_DEADLINE="${CXP_TEAMS_DOCKER_STARTUP_DEADLINE:-}" \
+		--env CXP_TEAMS_DOCKER_STARTUP_DEADLINE="${CXP_TEAMS_DOCKER_STARTUP_DEADLINE:-}" \
 		--env CXP_TEAMS_DOCKER_REAL_DATA_429="$rate_limit_experiment" \
 		--env CXP_TEAMS_DOCKER_REAL_DATA_429_SCOPE="$rate_limit_scope" \
 		--env CXP_TEAMS_DOCKER_REAL_DATA_429_POLL_ONLY="${CXP_TEAMS_DOCKER_REAL_DATA_429_POLL_ONLY:-0}" \

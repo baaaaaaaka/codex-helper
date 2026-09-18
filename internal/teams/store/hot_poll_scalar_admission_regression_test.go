@@ -1763,6 +1763,31 @@ func TestSQLiteHotPollScalarProjectionTriggerDefinitionsAreCurrent(t *testing.T)
 	}
 }
 
+func TestSQLiteHotPollChatPollTriggerStaysOutOfNestedJSONScan(t *testing.T) {
+	var chatPollUpdate string
+	for _, definition := range sqliteAdmissionProjectionTriggerDefinitions() {
+		if strings.Contains(definition, "chat_polls_admission_projection_v1") && strings.Contains(definition, "AFTER UPDATE") {
+			chatPollUpdate = definition
+			break
+		}
+	}
+	if chatPollUpdate == "" {
+		t.Fatal("chat-polls admission update trigger definition is missing")
+	}
+	definition := strings.ToLower(chatPollUpdate)
+	if strings.Contains(definition, "json_tree(") || strings.Contains(definition, "json_each(") {
+		t.Fatal("chat-polls hot update trigger must not compile nested JSON table scans")
+	}
+	if len(chatPollUpdate) > 32000 {
+		t.Fatalf("chat-polls hot update trigger is %d bytes; want <= 32000", len(chatPollUpdate))
+	}
+	for _, required := range []string{"canonical_revision", "projection_revision", "projection_trusted", "admission_valid"} {
+		if !strings.Contains(definition, required) {
+			t.Fatalf("chat-polls hot update trigger is missing %q", required)
+		}
+	}
+}
+
 func TestSQLiteHotPollScalarProjectionRepairsWrongTriggerBody(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)

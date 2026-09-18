@@ -87,14 +87,25 @@ type historyTieredFileState struct {
 	// SourceRewriteRecoveryScan* is a durable, source-bound cursor for a
 	// bounded rebase pass. It prevents a large same-inode repair from starting
 	// at byte zero after every listener cycle or process restart.
-	SourceRewriteRecoveryScanPending   bool
-	SourceRewriteRecoveryScanOffset    int64
-	SourceRewriteRecoveryScanLine      int
-	SourceRewriteRecoveryScanSessionID string
-	SourceRewriteRecoveryScanThreadID  string
-	SourceRewriteRecoveryScanTurnID    string
-	Offset                             int64
-	Line                               int
+	SourceRewriteRecoveryScanPending           bool
+	SourceRewriteRecoveryScanOffset            int64
+	SourceRewriteRecoveryScanLine              int
+	SourceRewriteRecoveryScanSessionID         string
+	SourceRewriteRecoveryScanThreadID          string
+	SourceRewriteRecoveryScanTurnID            string
+	SourceRewriteRecoveryScanMatchFound        bool
+	SourceRewriteRecoveryScanMatchLine         int
+	SourceRewriteRecoveryScanMatchOffset       int64
+	SourceRewriteRecoveryScanMatchSourceItemID string
+	SourceRewriteRecoveryScanMatchThreadID     string
+	SourceRewriteRecoveryScanMatchTurnID       string
+	SourceRewriteRecoveryScanMatchTextHash     string
+	SourceRewriteRecoveryScanMatchSourceLine   int
+	SourceRewriteRecoveryScanMatchStartOffset  int64
+	SourceRewriteRecoveryScanMatchEndOffset    int64
+	SourceRewriteRecoveryReason                string
+	Offset                                     int64
+	Line                                       int
 	// Partial* represent a record that has not reached a newline. Offset and
 	// Line remain the last complete JSONL boundary; these fields are only a
 	// resumable read hint and never a publishable cursor.
@@ -483,7 +494,7 @@ func historyTieredDetectStatChanges(paths []string, states map[string]historyTie
 		}
 		if state.Size == info.Size() && state.ModTime.Equal(info.ModTime()) {
 			if info.Size() != 0 {
-				currentChangeTime := teamstore.SourceFileChangeTimeFromFileInfo(info)
+				currentChangeTime := teamstore.SourceFileChangeTime(path, info)
 				if state.SourceChangeTime != 0 && (currentChangeTime == 0 || currentChangeTime != state.SourceChangeTime) {
 					// ctime is a cheap change hint, not a generation identity. A
 					// mismatch forces the bounded proof path, which can still accept
@@ -586,7 +597,7 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 	next.Path = path
 	next.Size = info.Size()
 	next.ModTime = info.ModTime()
-	next.SourceChangeTime = teamstore.SourceFileChangeTimeFromFileInfo(info)
+	next.SourceChangeTime = teamstore.SourceFileChangeTime(path, info)
 	sourceGeneration := historyTieredSourceIdentity(path, info)
 	next.SourceGeneration = firstNonEmptyString(next.SourceGeneration, sourceGeneration)
 	if previous.Offset > info.Size() || (previous.Size > 0 && info.Size() < previous.Size) {
@@ -614,7 +625,7 @@ func historyTieredScanTail(path string, previous historyTieredFileState, maxTail
 		return historyTieredTailResult{State: historyTieredFileState{Path: path, SourceChangeTime: next.SourceChangeTime}, Truncated: true}, nil
 	}
 	fdIdentity, identityErr := teamstore.SourceFileIdentityFromFileInfo(path, fdInfo)
-	fdChangeTime := teamstore.SourceFileChangeTimeFromFileInfo(fdInfo)
+	fdChangeTime := teamstore.SourceFileChangeTime(path, fdInfo)
 	next.SourceChangeTime = fdChangeTime
 	if strings.TrimSpace(previous.SourceFingerprint) != "" && previous.Offset >= 0 && previous.Offset == previous.Size {
 		currentFingerprint := ""

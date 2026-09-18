@@ -29,6 +29,8 @@ type fakeGraphAuth struct {
 	mu             sync.Mutex
 	token          string
 	refreshedToken string
+	accessErr      error
+	refreshErr     error
 	accessCalls    int
 	refreshCalls   int
 	tenantID       string
@@ -38,6 +40,9 @@ func (a *fakeGraphAuth) AccessToken(context.Context, io.Writer, bool) (string, e
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.accessCalls++
+	if a.accessErr != nil {
+		return "", a.accessErr
+	}
 	return a.token, nil
 }
 
@@ -45,8 +50,65 @@ func (a *fakeGraphAuth) RefreshAccessToken(context.Context) (string, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.refreshCalls++
+	if a.refreshErr != nil {
+		return "", a.refreshErr
+	}
 	a.token = a.refreshedToken
 	return a.token, nil
+}
+
+func TestGraphTokenAcquisitionFailureIsPreflightAndIssuesNoHTTP(t *testing.T) {
+	reauthErr := &ReauthRequiredError{Action: "Teams auth", Reason: "cached token is missing"}
+	auth := &fakeGraphAuth{token: "unused", accessErr: reauthErr}
+	var requests int
+	graph := &GraphClient{
+		auth: auth,
+		client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			requests++
+			return jsonResponse(http.StatusOK, `{"id":"unexpected"}`), nil
+		})},
+		baseURL:    "https://graph.example.test",
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+
+	_, err := graph.SendHTMLWithoutRateLimitRetry(context.Background(), "chat-auth-preflight", "must not post")
+	var preflightErr *graphRequestPreflightError
+	if !errors.As(err, &preflightErr) {
+		t.Fatalf("token acquisition error = %T %v, want graphRequestPreflightError", err, err)
+	}
+	if !errors.Is(err, reauthErr) {
+		t.Fatalf("token acquisition error = %v, want original auth error", err)
+	}
+	if got := classifyDeferredInboundFailure(err); got != deferredInboundFailureHold {
+		t.Fatalf("preflight reauth disposition = %d, want durable hold", got)
+	}
+	if requests != 0 {
+		t.Fatalf("auth preflight issued %d HTTP request(s), want zero", requests)
+	}
+}
+
+func TestGraphTokenAcquisitionTemporaryFailureIsRetryablePreflight(t *testing.T) {
+	temporaryErr := &TemporaryAuthError{Action: "Teams auth", Err: errors.New("oauth endpoint unavailable")}
+	auth := &fakeGraphAuth{accessErr: temporaryErr}
+	graph := &GraphClient{
+		auth:       auth,
+		client:     http.DefaultClient,
+		baseURL:    "https://graph.example.test",
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+
+	_, err := graph.Me(context.Background())
+	var preflightErr *graphRequestPreflightError
+	if !errors.As(err, &preflightErr) || !errors.Is(err, temporaryErr) {
+		t.Fatalf("temporary token acquisition error = %T %v, want wrapped preflight auth error", err, err)
+	}
+	if got := classifyDeferredInboundFailure(err); got != deferredInboundFailureRetry {
+		t.Fatalf("temporary preflight disposition = %d, want retry", got)
+	}
 }
 
 func (a *fakeGraphAuth) TenantID() string {
@@ -211,6 +273,68 @@ func TestGraphStatusErrorDropsSensitiveMessage(t *testing.T) {
 	}
 	if got := err.Error(); strings.Contains(got, "secret") || strings.Contains(got, "raw-token") || strings.Contains(got, "bearer") {
 		t.Fatalf("Graph error leaked sensitive message: %s", got)
+	}
+}
+
+func TestGraphMalformedResponseRetainsReadProvenance(t *testing.T) {
+	auth := &fakeGraphAuth{token: "access"}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.String() != "/me?$select=id,displayName,userPrincipalName" {
+			t.Fatalf("unexpected request path: %s", req.URL.String())
+		}
+		_, _ = io.WriteString(w, `{"id":`)
+	}))
+	defer server.Close()
+
+	graph := newTestGraphClient(auth, server, nil)
+	_, err := graph.Me(context.Background())
+	var responseErr *GraphResponseError
+	if !errors.As(err, &responseErr) {
+		t.Fatalf("malformed Graph response = %T %v, want GraphResponseError", err, err)
+	}
+	if responseErr.Method != http.MethodGet || responseErr.Path != "/me?$select=id,displayName,userPrincipalName" {
+		t.Fatalf("malformed Graph response provenance = %#v", responseErr)
+	}
+	if got := classifyDeferredInboundFailure(err); got != deferredInboundFailureHold {
+		t.Fatalf("malformed read response disposition = %d, want durable hold", got)
+	}
+}
+
+func TestGraphTransportErrorRetainsMethodAndPathProvenance(t *testing.T) {
+	auth := &fakeGraphAuth{token: "access"}
+	graph := &GraphClient{
+		auth: auth,
+		client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return nil, io.ErrUnexpectedEOF
+		})},
+		baseURL:    "https://graph.example.test",
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+
+	_, err := graph.Me(context.Background())
+	var readTransportErr *GraphTransportError
+	if !errors.As(err, &readTransportErr) {
+		t.Fatalf("read transport error = %T %v, want GraphTransportError", err, err)
+	}
+	if readTransportErr.Method != http.MethodGet || readTransportErr.Path != "/me?$select=id,displayName,userPrincipalName" {
+		t.Fatalf("read transport provenance = %#v", readTransportErr)
+	}
+	if got := classifyDeferredInboundFailure(err); got != deferredInboundFailureRetry {
+		t.Fatalf("read transport disposition = %d, want retry", got)
+	}
+
+	err = graph.do(context.Background(), http.MethodPost, "/chats/chat/messages", map[string]any{"body": "payload"}, &ChatMessage{})
+	var writeTransportErr *GraphTransportError
+	if !errors.As(err, &writeTransportErr) {
+		t.Fatalf("write transport error = %T %v, want GraphTransportError", err, err)
+	}
+	if writeTransportErr.Method != http.MethodPost || writeTransportErr.Path != "/chats/chat/messages" {
+		t.Fatalf("write transport provenance = %#v", writeTransportErr)
+	}
+	if got := classifyDeferredInboundFailure(err); got != deferredInboundFailureUncertain {
+		t.Fatalf("write transport disposition = %d, want uncertain", got)
 	}
 }
 
@@ -1166,6 +1290,37 @@ func TestGraphCreateOrGetMeetingChatUsesStableExternalID(t *testing.T) {
 	}
 	if !strings.Contains(chat.WebURL, "tenantId=tenant-1") {
 		t.Fatalf("chat WebURL = %q, want tenant link", chat.WebURL)
+	}
+}
+
+func TestGraphCreateOrGetMeetingChatMissingThreadIsResponseError(t *testing.T) {
+	auth := &fakeGraphAuth{token: "access"}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && r.URL.String() == "/me?$select=id,displayName,userPrincipalName":
+			_, _ = fmt.Fprint(w, `{"id":"user-1","displayName":"User One","userPrincipalName":"user@example.test"}`)
+		case r.Method == http.MethodPost && r.URL.Path == "/me/onlineMeetings/createOrGet":
+			// The response arrived successfully, but omits the durable chat
+			// identity. The remote create result is not safe to infer as rejected.
+			_, _ = fmt.Fprint(w, `{"id":"meeting-1"}`)
+		default:
+			t.Fatalf("unexpected request: %s %s", r.Method, r.URL.String())
+		}
+	}))
+	defer server.Close()
+
+	graph := newTestGraphClient(auth, server, nil)
+	_, _, err := graph.CreateOrGetMeetingChat(context.Background(), "CXP Registry Probe", "external-id")
+	var responseErr *GraphResponseError
+	if !errors.As(err, &responseErr) {
+		t.Fatalf("missing meeting thread error = %T %v, want GraphResponseError", err, err)
+	}
+	if responseErr.Method != http.MethodPost || responseErr.Path != "/me/onlineMeetings/createOrGet" {
+		t.Fatalf("missing meeting thread provenance = %#v", responseErr)
+	}
+	if got := classifyDeferredInboundFailure(err); got != deferredInboundFailureUncertain {
+		t.Fatalf("missing meeting thread disposition = %d, want uncertain", got)
 	}
 }
 

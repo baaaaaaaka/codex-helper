@@ -133,6 +133,7 @@ func importCheckpointOptionalProofUsable(checkpoint ImportCheckpoint) bool {
 func historyWatchOptionalProofUsable(checkpoint HistoryWatchCheckpoint) bool {
 	if !ContextGapStateValid(checkpoint.ContextGap) ||
 		!HistoryPendingRangeValid(checkpoint.PendingHistoryRange) ||
+		!TranscriptQuarantineValid(checkpoint.TranscriptQuarantine) ||
 		!TerminalBoundaryValid(checkpoint.TerminalBoundary) {
 		return false
 	}
@@ -146,10 +147,28 @@ func historyWatchOptionalProofUsable(checkpoint HistoryWatchCheckpoint) bool {
 	if checkpoint.PendingHistoryRange != nil && strings.TrimSpace(checkpoint.PendingHistoryRange.SourceGeneration) != sourceGeneration {
 		return false
 	}
+	if quarantine := checkpoint.TranscriptQuarantine; quarantine != nil && strings.TrimSpace(quarantine.SourceGeneration) != "" && strings.TrimSpace(quarantine.SourceGeneration) != sourceGeneration {
+		return false
+	}
 	if checkpoint.TerminalBoundary != nil && strings.TrimSpace(checkpoint.TerminalBoundary.SourceGeneration) != sourceGeneration {
 		return false
 	}
 	return true
+}
+
+// normalizeHistoryWatchOptionalProof preserves the durable row while making an
+// invalid optional frontier explicitly history-only.  Typed callers (including
+// migration/recovery code) can bypass JSON unmarshalling, so relying on
+// HistoryWatchCheckpoint.UnmarshalJSON to set RecoveryProofUnusable is not
+// sufficient.  The identity/cursor checks remain strict; only the optional
+// source-bound proof is downgraded and must not be used for automatic scanning.
+func normalizeHistoryWatchOptionalProof(checkpoint *HistoryWatchCheckpoint) {
+	if checkpoint == nil || checkpoint.RecoveryProofUnusable {
+		return
+	}
+	if !historyWatchOptionalProofUsable(*checkpoint) {
+		checkpoint.RecoveryProofUnusable = true
+	}
 }
 
 func TerminalBoundaryValid(boundary *TerminalBoundary) bool {

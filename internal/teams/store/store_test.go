@@ -662,6 +662,9 @@ func TestTranscriptQuarantineSurvivesHistoryWatchBackendRoundTrip(t *testing.T) 
 				if !reflect.DeepEqual(got.TranscriptQuarantine, want.TranscriptQuarantine) {
 					t.Fatalf("%s quarantine = %#v, want %#v", tag, got.TranscriptQuarantine, want.TranscriptQuarantine)
 				}
+				if !got.RecoveryProofUnusable {
+					t.Fatalf("%s invalid optional recovery proof was not fenced: %#v", tag, got)
+				}
 				if got.LastFinalStartOffset != want.LastFinalStartOffset || !got.LastFinalStartOffsetKnown {
 					t.Fatalf("%s zero-offset final boundary = %#v, want %#v", tag, got, want)
 				}
@@ -8839,6 +8842,16 @@ func TestPendingOutboxStatusMatrix(t *testing.T) {
 	if got := outboxIDsForTest(recovery.Messages); !reflect.DeepEqual(got, []string{"stale-sending"}) {
 		t.Fatalf("recovery pending status matrix = %#v, want stale-sending only", got)
 	}
+	if _, err := store.MarkOutboxSendAttempt(ctx, "accepted-without-teams-id"); !errors.Is(err, ErrOutboxSendNotClaimed) {
+		t.Fatalf("markerless Accepted claim error = %v, want ErrOutboxSendNotClaimed", err)
+	}
+	accepted, err := store.OutboxMessageByID(ctx, "accepted-without-teams-id")
+	if err != nil {
+		t.Fatalf("reload markerless Accepted outbox: %v", err)
+	}
+	if accepted.Status != OutboxStatusAccepted || strings.TrimSpace(accepted.TeamsMessageID) != "" {
+		t.Fatalf("markerless Accepted outbox after rejected claim = %#v, want unchanged", accepted)
+	}
 }
 
 func TestPendingOutboxAcceptedLedgerRetryGateMatchesAcrossBackends(t *testing.T) {
@@ -11225,7 +11238,7 @@ func cloneUpgradeForTest(req *UpgradeRequest) *UpgradeRequest {
 	return &out
 }
 
-func TestUpgradeRescueInterruptsRunningPreservesQueuedAndSkipsTransientOutbox(t *testing.T) {
+func TestUpgradeRescueInterruptsRunningPreservesQueuedAndSkipsOnlyQueuedTransientOutbox(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 
@@ -11246,6 +11259,16 @@ func TestUpgradeRescueInterruptsRunningPreservesQueuedAndSkipsTransientOutbox(t 
 		Status:      OutboxStatusQueued,
 	}); err != nil {
 		t.Fatalf("QueueOutbox status error: %v", err)
+	}
+	if _, _, err := store.QueueOutbox(ctx, OutboxMessage{
+		ID:              "outbox:status-in-flight",
+		SessionID:       "s1",
+		TeamsChatID:     "chat-1",
+		Kind:            "codex-status-002",
+		Status:          OutboxStatusSending,
+		LastSendAttempt: time.Now().Add(-outboxSendLease - time.Second),
+	}); err != nil {
+		t.Fatalf("QueueOutbox in-flight status error: %v", err)
 	}
 
 	report, err := store.RescueForUpgrade(ctx, UpgradeRescueOptions{Reason: HelperUpgradeReason})
@@ -11277,6 +11300,13 @@ func TestUpgradeRescueInterruptsRunningPreservesQueuedAndSkipsTransientOutbox(t 
 	}
 	if got := state.OutboxMessages["outbox:status"].Status; got != OutboxStatusSkipped {
 		t.Fatalf("transient outbox status = %q, want skipped", got)
+	}
+	inFlight := state.OutboxMessages["outbox:status-in-flight"]
+	if inFlight.Status != OutboxStatusSending || strings.TrimSpace(inFlight.TeamsMessageID) != "" {
+		t.Fatalf("in-flight transient outbox after rescue = %#v, want markerless Sending", inFlight)
+	}
+	if !OutboxSendRecoveryEligible(inFlight, time.Now()) {
+		t.Fatalf("in-flight transient outbox lost recovery eligibility: %#v", inFlight)
 	}
 }
 
@@ -14148,7 +14178,7 @@ func TestSQLiteQueueTranscriptDeliveryOutboxSuppressesDeliveredWithoutColdLoad(t
 	}
 }
 
-func TestRecoverSupersedesTransientOutboxButPreservesProtectedDelivery(t *testing.T) {
+func TestRecoverSupersedesQueuedTransientOutboxButPreservesSendingAndProtectedDelivery(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
 	if _, _, err := store.CreateSession(ctx, testSession()); err != nil {
@@ -14156,7 +14186,7 @@ func TestRecoverSupersedesTransientOutboxButPreservesProtectedDelivery(t *testin
 	}
 	for _, msg := range []OutboxMessage{
 		{ID: "outbox:status", SessionID: "s1", TeamsChatID: "chat-1", Kind: "codex-status-001", Status: OutboxStatusQueued},
-		{ID: "outbox:interrupted", SessionID: "s1", TeamsChatID: "chat-1", Kind: "interrupted", Status: OutboxStatusSending},
+		{ID: "outbox:interrupted", SessionID: "s1", TeamsChatID: "chat-1", Kind: "interrupted", Status: OutboxStatusSending, LastSendAttempt: time.Now().Add(-outboxSendLease - time.Second)},
 		{ID: "outbox:final", SessionID: "s1", TeamsChatID: "chat-1", Kind: "final", Status: OutboxStatusQueued, UpgradeNonBlocking: true},
 		{ID: "outbox:artifact", SessionID: "s1", TeamsChatID: "chat-1", Kind: "helper", AttachmentPath: "/tmp/report.txt", Status: OutboxStatusQueued, UpgradeNonBlocking: true},
 	} {
@@ -14169,7 +14199,7 @@ func TestRecoverSupersedesTransientOutboxButPreservesProtectedDelivery(t *testin
 	if err != nil {
 		t.Fatalf("Recover error: %v", err)
 	}
-	if got, want := report.SupersededOutboxIDs, []string{"outbox:interrupted", "outbox:status"}; !reflect.DeepEqual(got, want) {
+	if got, want := report.SupersededOutboxIDs, []string{"outbox:status"}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("SupersededOutboxIDs = %#v, want %#v", got, want)
 	}
 	if got, want := report.PreservedOutboxBlockerIDs, []string{"outbox:artifact", "outbox:final"}; !reflect.DeepEqual(got, want) {
@@ -14179,13 +14209,18 @@ func TestRecoverSupersedesTransientOutboxButPreservesProtectedDelivery(t *testin
 	if err != nil {
 		t.Fatalf("Load error: %v", err)
 	}
-	for _, id := range []string{"outbox:status", "outbox:interrupted"} {
-		if got := state.OutboxMessages[id].Status; got != OutboxStatusSkipped {
-			t.Fatalf("%s status = %q, want %q", id, got, OutboxStatusSkipped)
-		}
-		if OutboxBlocksUpgrade(state, state.OutboxMessages[id], time.Now()) {
-			t.Fatalf("%s should not block upgrade after recover", id)
-		}
+	if got := state.OutboxMessages["outbox:status"].Status; got != OutboxStatusSkipped {
+		t.Fatalf("outbox:status status = %q, want %q", got, OutboxStatusSkipped)
+	}
+	if OutboxBlocksUpgrade(state, state.OutboxMessages["outbox:status"], time.Now()) {
+		t.Fatal("outbox:status should not block upgrade after recover")
+	}
+	inFlight := state.OutboxMessages["outbox:interrupted"]
+	if inFlight.Status != OutboxStatusSending || strings.TrimSpace(inFlight.TeamsMessageID) != "" {
+		t.Fatalf("outbox:interrupted after recover = %#v, want markerless Sending", inFlight)
+	}
+	if !OutboxSendRecoveryEligible(inFlight, time.Now()) {
+		t.Fatalf("outbox:interrupted lost recovery eligibility after recover: %#v", inFlight)
 	}
 	for _, id := range []string{"outbox:final", "outbox:artifact"} {
 		if got := state.OutboxMessages[id].Status; got != OutboxStatusQueued {

@@ -42,6 +42,7 @@ func TestHistoryWatchRebaseScanYieldsAcrossLargeSource(t *testing.T) {
 			Path:                 path,
 			Size:                 info.Size(),
 			ModTime:              info.ModTime(),
+			SourceGeneration:     "old-source-generation",
 			Offset:               info.Size(),
 			SessionID:            "thread-large-rebase",
 			ThreadID:             "thread-large-rebase",
@@ -95,6 +96,475 @@ func TestHistoryWatchRebaseScanHonorsCanceledContext(t *testing.T) {
 	_, err = historyWatchRebaseAnchorScan(ctx, path, historyTieredFileState{SessionID: "thread-canceled-rebase", ThreadID: "thread-canceled-rebase"}, source, historyWatchRebaseScanProgress{SourceIdentity: source.Identity})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled rebase scan error = %v, want context.Canceled", err)
+	}
+}
+
+func TestHistoryRebaseStableSourceRejectsSameInodeStatChanges(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(t *testing.T, path string, before os.FileInfo)
+	}{
+		{
+			name: "append",
+			mutate: func(t *testing.T, path string, _ os.FileInfo) {
+				t.Helper()
+				file, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+				if err != nil {
+					t.Fatalf("open source for append: %v", err)
+				}
+				if _, err := file.WriteString("append\n"); err != nil {
+					_ = file.Close()
+					t.Fatalf("append source: %v", err)
+				}
+				if err := file.Close(); err != nil {
+					t.Fatalf("close appended source: %v", err)
+				}
+			},
+		},
+		{
+			name: "same-size-mtime-change",
+			mutate: func(t *testing.T, path string, before os.FileInfo) {
+				t.Helper()
+				file, err := os.OpenFile(path, os.O_WRONLY, 0)
+				if err != nil {
+					t.Fatalf("open source for same-size repair: %v", err)
+				}
+				if _, err := file.WriteAt([]byte("Y"), 0); err != nil {
+					_ = file.Close()
+					t.Fatalf("rewrite same-size source: %v", err)
+				}
+				if err := file.Sync(); err != nil {
+					_ = file.Close()
+					t.Fatalf("sync same-size source: %v", err)
+				}
+				if err := file.Close(); err != nil {
+					t.Fatalf("close same-size source: %v", err)
+				}
+				if err := os.Chtimes(path, before.ModTime().Add(time.Second), before.ModTime().Add(time.Second)); err != nil {
+					t.Fatalf("change same-size source mtime: %v", err)
+				}
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "source.jsonl")
+			if err := os.WriteFile(path, []byte("source\n"), 0o600); err != nil {
+				t.Fatalf("write source: %v", err)
+			}
+			before, err := os.Stat(path)
+			if err != nil {
+				t.Fatalf("stat source: %v", err)
+			}
+			identity, err := teamstore.SourceFileIdentityFromFileInfo(path, before)
+			if err != nil {
+				t.Fatalf("source identity: %v", err)
+			}
+			if strings.TrimSpace(identity) == "" {
+				t.Skip("filesystem does not expose a source identity")
+			}
+			test.mutate(t, path, before)
+			if err := historyRebaseStableSource(path, before, identity); err == nil {
+				t.Fatalf("stable-source check accepted a changed same-inode source")
+			}
+		})
+	}
+}
+
+func TestHistoryWatchRebaseHoldsSameSourceGeneration(t *testing.T) {
+	previous := historyTieredFileState{SourceGeneration: "file:same-generation"}
+	if !historyWatchRebaseNeedsProofHold(previous, "file:same-generation") {
+		t.Fatal("history-watch rebase crossed a same-generation source without writer proof")
+	}
+	if historyWatchRebaseNeedsProofHold(previous, "file:new-generation") {
+		t.Fatal("history-watch rebase held an observed generation change without another semantic fence")
+	}
+}
+
+func TestHistoryWatchLegacyRebaseRequiresNoSemanticFence(t *testing.T) {
+	if historyWatchRebaseNeedsProofHold(historyTieredFileState{}, "file:legacy-bootstrap") {
+		t.Fatal("legacy history-watch checkpoint with a stable anchor was held without a semantic fence")
+	}
+	cases := map[string]historyTieredFileState{
+		"context gap":             {ContextGap: &teamstore.ContextGapState{}},
+		"pending range":           {PendingHistoryRange: &teamstore.HistoryPendingRange{}},
+		"unresolved continuation": {UnresolvedContinuation: true},
+		"pending root marker":     {PendingRootTaskStarted: true},
+		"partial record":          {PartialReadOffset: 1},
+		"terminal proof":          {TerminalBoundary: &teamstore.TerminalBoundary{}},
+	}
+	for name, previous := range cases {
+		name, previous := name, previous
+		t.Run(name, func(t *testing.T) {
+			if !historyWatchRebaseNeedsProofHold(previous, "file:legacy-bootstrap") {
+				t.Fatalf("legacy history-watch checkpoint crossed %s without source proof", name)
+			}
+		})
+	}
+}
+
+func TestHistoryWatchRebaseAnchorRewindsExpandedTurnCompletedLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "expanded-rebase-rollout.jsonl")
+	sessionMeta := `{"type":"session_meta","payload":{"id":"thread-expanded-rebase","history_mode":"paginated"}}`
+	completed := `{"method":"turn/completed","params":{"turnId":"turn-expanded-rebase","turn":{"items":[{"id":"first-final","type":"message","role":"assistant","content":[{"type":"output_text","text":"first final"}]},{"id":"second-item","type":"message","role":"assistant","content":[{"type":"output_text","text":"second item"}]}]}}}`
+	content := strings.Join([]string{sessionMeta, completed, ""}, "\n")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write expanded rebase rollout: %v", err)
+	}
+	source, ok, err := codexPaginatedHistoryFile(path, "thread-expanded-rebase")
+	if err != nil || !ok {
+		t.Fatalf("load expanded rebase source: ok=%v err=%v", ok, err)
+	}
+
+	result, err := historyWatchRebaseAnchorScan(
+		context.Background(),
+		path,
+		historyTieredFileState{
+			SessionID:   "thread-expanded-rebase",
+			ThreadID:    "thread-expanded-rebase",
+			LastFinalID: "codex-final:v1:thread-expanded-rebase:turn-expanded-rebase:first-final",
+		},
+		source,
+		historyWatchRebaseScanProgress{SourceIdentity: source.Identity},
+	)
+	if err != nil {
+		t.Fatalf("scan expanded rebase rollout: %v", err)
+	}
+	if !result.Found || !result.Complete || result.Anchor.Record.SourceItemID != "first-final" {
+		t.Fatalf("expanded rebase scan = %#v, want first item anchor", result)
+	}
+	wantOffset := int64(len(sessionMeta) + 1)
+	if result.Anchor.CursorLine != 1 || result.Anchor.CursorOffset != wantOffset {
+		t.Fatalf("expanded rebase cursor = line %d offset %d, want line 1 offset %d before the physical line", result.Anchor.CursorLine, result.Anchor.CursorOffset, wantOffset)
+	}
+}
+
+func TestHistoryWatchRebaseHoldsAmbiguousAnchor(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history-ambiguous-rebase.jsonl")
+	content := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-history-ambiguous","history_mode":"paginated"}}`,
+		`{"type":"response_item","payload":{"id":"duplicate-final","type":"message","role":"assistant","turn_id":"turn-history-ambiguous","phase":"final_answer","content":[{"type":"output_text","text":"duplicate answer"}]}}`,
+		`{"type":"response_item","payload":{"id":"duplicate-final","type":"message","role":"assistant","turn_id":"turn-history-ambiguous","phase":"final_answer","content":[{"type":"output_text","text":"duplicate answer"}]}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write ambiguous history rollout: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat ambiguous history rollout: %v", err)
+	}
+	store := newBridgeTestStore(t)
+	id := historyWatchCheckpointID(path)
+	oldFinalID := "codex-final:v1:thread-history-ambiguous:turn-history-ambiguous:duplicate-final"
+	if err := store.UpdateHistoryWatch(context.Background(), func(history map[string]teamstore.HistoryWatchCheckpoint, _ *time.Time) error {
+		history[id] = teamstore.HistoryWatchCheckpoint{
+			ID:                   id,
+			Path:                 path,
+			Size:                 info.Size(),
+			ModTime:              info.ModTime(),
+			Offset:               info.Size(),
+			SessionID:            "thread-history-ambiguous",
+			ThreadID:             "thread-history-ambiguous",
+			SourceGeneration:     "old-history-generation",
+			SourceRewriteBlocked: true,
+			LastFinalID:          oldFinalID,
+			LastFinalThreadID:    "thread-history-ambiguous",
+			LastFinalTurnID:      "turn-history-ambiguous",
+			LastFinalTextHash:    normalizedTextHash("duplicate answer"),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed ambiguous history checkpoint: %v", err)
+	}
+
+	bridge := &Bridge{store: store}
+	if err := bridge.syncCodexHistoryWatchPath(context.Background(), path, time.Now()); err != nil {
+		t.Fatalf("ambiguous history rebase: %v", err)
+	}
+	state, err := store.HistoryWatchState(context.Background())
+	if err != nil {
+		t.Fatalf("load ambiguous history checkpoint: %v", err)
+	}
+	checkpoint := state.HistoryWatch[id]
+	if !checkpoint.SourceRewriteBlocked || checkpoint.SourceRewriteRecoveryScanPending {
+		t.Fatalf("ambiguous history anchor crossed or left a live scan: %#v", checkpoint)
+	}
+	if !strings.Contains(checkpoint.SourceRewriteRecoveryReason, "matched 2") {
+		t.Fatalf("ambiguous history checkpoint reason = %q, want match-count proof", checkpoint.SourceRewriteRecoveryReason)
+	}
+	if checkpoint.SourceRewriteRecoveryIdentity == "" || checkpoint.LastFinalID != oldFinalID || checkpoint.Offset != info.Size() {
+		t.Fatalf("ambiguous history rebase changed the old boundary: %#v", checkpoint)
+	}
+	if len(state.OutboxMessages) != 0 {
+		t.Fatalf("ambiguous history rebase created delivery rows: %#v", state.OutboxMessages)
+	}
+}
+
+func TestHistoryWatchRebasePersistsOnlyMatchHashAcrossBoundedRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "history-hash-rebase.jsonl")
+	padding := `{"type":"noop","padding":"` + strings.Repeat("x", 128) + `"}` + "\n"
+	filler := strings.Repeat(padding, int(historyRebaseMaxScanBytesPerPass/int64(len(padding)))+1024)
+	content := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-history-hash","history_mode":"paginated"}}`,
+		strings.TrimSuffix(filler, "\n"),
+		`{"type":"response_item","payload":{"id":"hash-final","type":"message","role":"assistant","turn_id":"turn-history-hash","phase":"final_answer","content":[{"type":"output_text","text":"hash-only rebase answer"}]}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write hash-only history rollout: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat hash-only history rollout: %v", err)
+	}
+	store := newBridgeTestStore(t)
+	id := historyWatchCheckpointID(path)
+	if err := store.UpdateHistoryWatch(context.Background(), func(history map[string]teamstore.HistoryWatchCheckpoint, _ *time.Time) error {
+		history[id] = teamstore.HistoryWatchCheckpoint{
+			ID:                   id,
+			Path:                 path,
+			Size:                 info.Size(),
+			ModTime:              info.ModTime(),
+			Offset:               info.Size(),
+			SessionID:            "thread-history-hash",
+			ThreadID:             "thread-history-hash",
+			SourceGeneration:     "old-history-generation",
+			SourceRewriteBlocked: true,
+			LastFinalID:          "codex-final:v1:thread-history-hash:turn-history-hash:hash-final",
+			LastFinalThreadID:    "thread-history-hash",
+			LastFinalTurnID:      "turn-history-hash",
+			LastFinalTextHash:    normalizedTextHash("hash-only rebase answer"),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed hash-only history checkpoint: %v", err)
+	}
+	for attempt := 0; attempt < 8; attempt++ {
+		bridge := &Bridge{store: store}
+		if err := bridge.syncCodexHistoryWatchPath(context.Background(), path, time.Now().Add(time.Duration(attempt+1)*time.Second)); err != nil {
+			t.Fatalf("hash-only history rebase attempt %d: %v", attempt+1, err)
+		}
+		state, err := store.HistoryWatchState(context.Background())
+		if err != nil {
+			t.Fatalf("load hash-only history checkpoint after attempt %d: %v", attempt+1, err)
+		}
+		checkpoint := state.HistoryWatch[id]
+		if checkpoint.SourceRewriteRecoveryScanMatchFound {
+			if checkpoint.SourceRewriteRecoveryScanMatchTextHash != normalizedTextHash("hash-only rebase answer") {
+				t.Fatalf("persisted match hash after attempt %d = %q, want answer hash", attempt+1, checkpoint.SourceRewriteRecoveryScanMatchTextHash)
+			}
+			if strings.Contains(checkpoint.SourceRewriteRecoveryScanMatchTextHash, "hash-only rebase answer") {
+				t.Fatalf("persisted match proof contains answer text instead of only a hash: %q", checkpoint.SourceRewriteRecoveryScanMatchTextHash)
+			}
+		}
+		if !checkpoint.SourceRewriteBlocked {
+			if checkpoint.LastFinalTextHash != normalizedTextHash("hash-only rebase answer") || checkpoint.Offset <= 0 {
+				t.Fatalf("hash-only history rebase lost the final proof: %#v", checkpoint)
+			}
+			return
+		}
+	}
+	state, err := store.HistoryWatchState(context.Background())
+	if err != nil {
+		t.Fatalf("load final hash-only history checkpoint: %v", err)
+	}
+	t.Fatalf("hash-only history rebase did not complete: %#v", state.HistoryWatch[id])
+}
+
+func TestHistoryWatchSourcePrefixRejectsSameSizeRewriteOutsideFingerprintWindow(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "same-size-prefix-rewrite.jsonl")
+	content := []byte(strings.Repeat("a", 24*1024))
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatalf("write same-size prefix fixture: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat same-size prefix fixture: %v", err)
+	}
+	changeTime := teamstore.SourceFileChangeTime(path, info)
+	if changeTime == 0 {
+		t.Skip("filesystem does not expose a native change time")
+	}
+	previous := historyTieredFileState{
+		Size:              info.Size(),
+		Offset:            info.Size(),
+		SourceFingerprint: transcriptCheckpointSourceFingerprint(path, info.Size()),
+		SourceChangeTime:  changeTime,
+	}
+	if previous.SourceFingerprint == "" {
+		t.Fatalf("source prefix fixture did not produce a fingerprint")
+	}
+	content[0] = 'b'
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatalf("rewrite same-size prefix fixture: %v", err)
+	}
+	if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatalf("restore same-size fixture mtime: %v", err)
+	}
+	if historyWatchSourcePrefixMatches(path, previous) {
+		t.Fatal("same-size rewrite outside the bounded fingerprint window was accepted")
+	}
+}
+
+func TestHistoryWatchSourcePrefixRequiresSourceRevision(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing-source-revision.jsonl")
+	content := []byte(strings.Repeat("a", 24*1024))
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatalf("write source-revision fixture: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat source-revision fixture: %v", err)
+	}
+	previous := historyTieredFileState{
+		Size:              info.Size(),
+		Offset:            info.Size(),
+		SourceFingerprint: transcriptCheckpointSourceFingerprint(path, info.Size()),
+	}
+	if previous.SourceFingerprint == "" {
+		t.Fatalf("source-revision fixture did not produce a fingerprint")
+	}
+	if historyWatchSourcePrefixMatches(path, previous) {
+		t.Fatal("bounded fingerprint was accepted without a source revision")
+	}
+}
+
+func TestHistoryWatchSourcePrefixRejectsTailShrinkWithoutClearingCursor(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "tail-shrink-prefix.jsonl")
+	content := []byte(strings.Repeat("prefix", 4096))
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatalf("write tail-shrink fixture: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat tail-shrink fixture: %v", err)
+	}
+	offset := info.Size() - 64
+	previous := historyTieredFileState{
+		Size:              info.Size(),
+		Offset:            offset,
+		SourceFingerprint: transcriptCheckpointSourceFingerprint(path, offset),
+		SourceChangeTime:  teamstore.SourceFileChangeTime(path, info),
+		LastFinalID:       "codex-final:v1:thread-tail-shrink:turn-tail-shrink:final",
+		LastFinalTurnID:   "turn-tail-shrink",
+		LastFinalThreadID: "thread-tail-shrink",
+	}
+	if previous.SourceFingerprint == "" {
+		t.Fatalf("tail-shrink fixture did not produce a fingerprint")
+	}
+	if err := os.Truncate(path, offset+16); err != nil {
+		t.Fatalf("truncate tail-shrink fixture: %v", err)
+	}
+	if historyWatchSourcePrefixMatches(path, previous) {
+		t.Fatal("tail shrink was accepted when the current file still covered the cursor")
+	}
+}
+
+func TestHistoryRebaseSourceProofRejectsAppendAfterScanSnapshot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rebase-proof-snapshot.jsonl")
+	content := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-proof-snapshot","history_mode":"paginated"}}`,
+		`{"type":"response_item","payload":{"id":"proof-final","type":"message","role":"assistant","turn_id":"turn-proof","phase":"final_answer","content":[{"type":"output_text","text":"proof answer"}]}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write proof snapshot fixture: %v", err)
+	}
+	expected, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat proof snapshot fixture: %v", err)
+	}
+	if file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0); err != nil {
+		t.Fatalf("open proof snapshot fixture for append: %v", err)
+	} else {
+		if _, err := file.WriteString(`{"type":"response_item","payload":{"id":"duplicate-after-scan","type":"message","role":"assistant","turn_id":"turn-proof","phase":"final_answer","content":[{"type":"output_text","text":"proof answer"}]}}` + "\n"); err != nil {
+			_ = file.Close()
+			t.Fatalf("append proof snapshot fixture: %v", err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatalf("close proof snapshot fixture: %v", err)
+		}
+	}
+	if _, _, _, ok := historyRebaseSourceProof(path, expected, expected.Size()); ok {
+		t.Fatal("source proof accepted bytes appended after the scan snapshot")
+	}
+}
+
+func TestHistoryWatchRebaseAnchorRequiresSourceIDTextHashMatch(t *testing.T) {
+	previous := historyTieredFileState{
+		LastFinalID:       "codex-final:v1:thread-hash-proof:turn-hash-proof:final-hash-proof",
+		LastFinalThreadID: "thread-hash-proof",
+		LastFinalTurnID:   "turn-hash-proof",
+		LastFinalTextHash: normalizedTextHash("old answer"),
+	}
+	record := TranscriptRecord{
+		SourceItemID: "final-hash-proof",
+		ThreadID:     "thread-hash-proof",
+		TurnID:       "turn-hash-proof",
+		Kind:         TranscriptKindAssistant,
+		Text:         "new answer",
+	}
+	if historyWatchRebaseAnchorMatches(record, previous) {
+		t.Fatal("source-ID match with conflicting final text was accepted")
+	}
+	record.Text = "old answer"
+	if !historyWatchRebaseAnchorMatches(record, previous) {
+		t.Fatal("source-ID match with matching final text was rejected")
+	}
+	if historyWatchRebaseMatchProofValid(TranscriptRecord{
+		SourceItemID: "final-hash-proof",
+		ThreadID:     "thread-hash-proof",
+		TurnID:       "turn-hash-proof",
+		Kind:         TranscriptKindAssistant,
+		Text:         "new answer",
+	}, normalizedTextHash("new answer"), previous) {
+		t.Fatal("source proof accepted conflicting text hash")
+	}
+}
+
+func TestHistoryWatchRebaseScanProgressDoesNotRegressDurableCursor(t *testing.T) {
+	const id = "history-watch:durable-progress"
+	const identity = "file:durable-progress"
+	bridge := &Bridge{historyRebaseScans: map[string]historyWatchRebaseScanProgress{
+		id: {SourceIdentity: identity, Offset: 12, Line: 2, MatchFound: false},
+	}}
+	previous := historyTieredFileState{
+		SourceRewriteRecoveryScanPending:     true,
+		SourceRewriteRecoveryIdentity:        identity,
+		SourceRewriteRecoveryScanOffset:      48,
+		SourceRewriteRecoveryScanLine:        8,
+		SourceRewriteRecoveryScanMatchFound:  true,
+		SourceRewriteRecoveryScanMatchOffset: 32,
+	}
+	progress := bridge.historyWatchRebaseScanProgress(id, identity, previous)
+	if progress.Offset != previous.SourceRewriteRecoveryScanOffset || !progress.MatchFound {
+		t.Fatalf("stale in-memory rebase progress regressed durable state: got=%#v durable=%#v", progress, previous)
+	}
+}
+
+func TestHistoryWatchModernRebaseCarriesEverySourceBoundFence(t *testing.T) {
+	cases := map[string]historyTieredFileState{
+		"legacy source unverified": {LegacySourceUnverified: true},
+		"recovery proof unusable":  {RecoveryProofUnusable: true},
+		"oversized record":         {OversizedRecordBlocked: true},
+		"history root released":    {HistoryRootReleased: true},
+		"unresolved continuation":  {UnresolvedContinuation: true},
+		"pending root":             {PendingRootTaskStarted: true},
+		"external prompt":          {ExternalUserPromptSeen: true},
+		"partial line":             {PartialReadOffset: 1},
+		"partial prefix":           {PartialPrefixReleased: true},
+		"opaque record":            {PendingOpaqueRecordID: "opaque"},
+		"quarantine":               {TranscriptQuarantine: &teamstore.TranscriptQuarantine{Kind: "mirror"}},
+		"context gap":              {ContextGap: &teamstore.ContextGapState{SourceGeneration: "old"}},
+		"pending range":            {PendingHistoryRange: &teamstore.HistoryPendingRange{SourceGeneration: "old"}},
+		"pending assistant":        {pendingAssistant: historyTieredAssistantCandidate{Record: TranscriptRecord{Text: "pending"}}},
+	}
+	for name, previous := range cases {
+		name, previous := name, previous
+		t.Run(name, func(t *testing.T) {
+			previous.SourceGeneration = "old-generation"
+			if !historyWatchRebaseNeedsProofHold(previous, "new-generation") {
+				t.Fatalf("modern rebase crossed source-bound fence %s", name)
+			}
+		})
 	}
 }
 
@@ -171,6 +641,9 @@ func TestHistoryWatchRebasesPaginatedRolloutFromStableFinalWithoutDeliveryReplay
 	if checkpoint.SourceFingerprint == "" {
 		t.Fatalf("rebase did not establish source fingerprint")
 	}
+	if changeTime := teamstore.SourceFileChangeTime(path, info); changeTime != 0 && checkpoint.SourceChangeTime != changeTime {
+		t.Fatalf("rebase source change time = %d, want snapshot change time %d", checkpoint.SourceChangeTime, changeTime)
+	}
 	if checkpoint.SourceGeneration == "" || checkpoint.SourceGeneration == "old-source-generation" {
 		t.Fatalf("rebase did not establish the new source generation: %#v", checkpoint)
 	}
@@ -239,7 +712,7 @@ func TestHistoryWatchChangedPathsRechecksOnlyNewPaginatedIdentity(t *testing.T) 
 		SourceRewriteRecoveryIdentity:   identity,
 		SourceRewriteRecoverySize:       info.Size(),
 		SourceRewriteRecoveryModTime:    info.ModTime(),
-		SourceRewriteRecoveryChangeTime: teamstore.SourceFileChangeTimeFromFileInfo(info),
+		SourceRewriteRecoveryChangeTime: teamstore.SourceFileChangeTime(path, info),
 	}
 	changes, err = historyWatchChangedPaths([]string{path}, state, false)
 	if err != nil {
@@ -259,6 +732,10 @@ func TestLinkedTranscriptRebasePreservesCompletionAndExecutionState(t *testing.T
 	}, "\n") + "\n"
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatalf("write linked rollout: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat linked rollout: %v", err)
 	}
 	store := newBridgeTestStore(t)
 	checkpointID := transcriptCheckpointID("session-import")
@@ -315,6 +792,9 @@ func TestLinkedTranscriptRebasePreservesCompletionAndExecutionState(t *testing.T
 	if updated.SourceGeneration == "" || updated.SourceGeneration == "old-source-generation" {
 		t.Fatalf("linked rebase did not establish the new source generation: %#v", updated)
 	}
+	if changeTime := teamstore.SourceFileChangeTime(path, info); changeTime != 0 && updated.SourceChangeTime != changeTime {
+		t.Fatalf("linked rebase source change time = %d, want snapshot change time %d", updated.SourceChangeTime, changeTime)
+	}
 	if updated.Status != importCheckpointStatusImporting || !updated.CompletionPending {
 		t.Fatalf("completion recovery phase changed unexpectedly: %#v", updated)
 	}
@@ -335,6 +815,335 @@ func TestLinkedTranscriptRebasePreservesCompletionAndExecutionState(t *testing.T
 		t.Fatalf("repeat linked rebase: %v", err)
 	} else if rebased {
 		t.Fatal("repeat linked rebase should be a no-op")
+	}
+}
+
+func TestLinkedTranscriptRebaseRewindsExpandedTurnCompletedLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "linked-expanded-rebase.jsonl")
+	sessionMeta := `{"type":"session_meta","payload":{"id":"thread-linked-expanded","history_mode":"paginated"}}`
+	completed := `{"method":"turn/completed","params":{"turnId":"turn-linked-expanded","turn":{"items":[{"id":"first-item","type":"message","role":"assistant","content":[{"type":"output_text","text":"first item"}]},{"id":"second-item","type":"message","role":"assistant","content":[{"type":"output_text","text":"second item"}]}]}}}`
+	content := strings.Join([]string{sessionMeta, completed, ""}, "\n")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write linked expanded rollout: %v", err)
+	}
+	store := newBridgeTestStore(t)
+	checkpointID := transcriptCheckpointID("session-linked-expanded")
+	checkpoint := teamstore.ImportCheckpoint{
+		ID:                   checkpointID,
+		SessionID:            "session-linked-expanded",
+		SourcePath:           path,
+		SourceGeneration:     "old-source-generation",
+		LastRecordID:         "source:first-item",
+		LastOffsetKnown:      true,
+		SourceRewriteBlocked: true,
+		Status:               importCheckpointStatusBlocked,
+	}
+	if _, _, err := store.UpdateImportCheckpoint(context.Background(), checkpointID, func(_ teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+		checkpoint.UpdatedAt = now
+		return checkpoint, true, nil
+	}); err != nil {
+		t.Fatalf("seed linked expanded checkpoint: %v", err)
+	}
+
+	bridge := &Bridge{store: store}
+	session := Session{ID: "session-linked-expanded", CodexThreadID: "thread-linked-expanded"}
+	local := codexhistory.Session{SessionID: "thread-linked-expanded", FilePath: path}
+	rebased, err := bridge.rebaseLinkedTranscriptSourceRewrite(context.Background(), session, local, checkpoint)
+	if err != nil {
+		t.Fatalf("rebase linked expanded checkpoint: %v", err)
+	}
+	if !rebased {
+		t.Fatal("linked expanded checkpoint was not rebased")
+	}
+	updated, found, err := store.ImportCheckpoint(context.Background(), checkpointID)
+	if err != nil || !found {
+		t.Fatalf("load linked expanded checkpoint: found=%v err=%v", found, err)
+	}
+	wantOffset := int64(len(sessionMeta) + 1)
+	if updated.SourceRewriteBlocked || updated.LastSourceLine != 1 || updated.LastOffset != wantOffset {
+		t.Fatalf("linked expanded rebase cursor = %#v, want line 1 offset %d before the physical line", updated, wantOffset)
+	}
+}
+
+func TestLinkedTranscriptRebaseScanResumesAcrossRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "linked-bounded-rebase.jsonl")
+	paddingLine := `{"type":"noop","padding":"` + strings.Repeat("x", 128) + `"}` + "\n"
+	filler := strings.Repeat(paddingLine, int(historyRebaseMaxScanBytesPerPass/int64(len(paddingLine)))+1024)
+	content := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-linked-bounded","history_mode":"paginated"}}`,
+		strings.TrimSuffix(filler, "\n"),
+		`{"type":"response_item","payload":{"id":"linked-bounded-final","type":"message","role":"assistant","turn_id":"turn-linked-bounded","phase":"final_answer","content":[{"type":"output_text","text":"bounded linked answer"}]}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write bounded linked rollout: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat bounded linked rollout: %v", err)
+	}
+	if info.Size() <= historyRebaseMaxScanBytesPerPass {
+		t.Fatalf("bounded linked fixture size = %d, want greater than per-pass budget %d", info.Size(), historyRebaseMaxScanBytesPerPass)
+	}
+	store := newBridgeTestStore(t)
+	checkpointID := transcriptCheckpointID("session-linked-bounded")
+	checkpoint := teamstore.ImportCheckpoint{
+		ID:                   checkpointID,
+		SessionID:            "session-linked-bounded",
+		SourcePath:           path,
+		SourceGeneration:     "old-source-generation",
+		LastRecordID:         "source:linked-bounded-final",
+		LastOffsetKnown:      true,
+		SourceRewriteBlocked: true,
+		Status:               importCheckpointStatusBlocked,
+	}
+	if _, _, err := store.UpdateImportCheckpoint(context.Background(), checkpointID, func(_ teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+		checkpoint.UpdatedAt = now
+		return checkpoint, true, nil
+	}); err != nil {
+		t.Fatalf("seed bounded linked checkpoint: %v", err)
+	}
+	session := Session{ID: "session-linked-bounded", CodexThreadID: "thread-linked-bounded"}
+	local := codexhistory.Session{SessionID: "thread-linked-bounded", FilePath: path}
+	for attempt := 0; attempt < 8; attempt++ {
+		bridge := &Bridge{store: store}
+		current, found, err := store.ImportCheckpoint(context.Background(), checkpointID)
+		if err != nil || !found {
+			t.Fatalf("load bounded linked checkpoint on attempt %d: found=%v err=%v", attempt+1, found, err)
+		}
+		rebased, err := bridge.rebaseLinkedTranscriptSourceRewrite(context.Background(), session, local, current)
+		if err != nil {
+			t.Fatalf("bounded linked rebase attempt %d: %v", attempt+1, err)
+		}
+		updated, found, err := store.ImportCheckpoint(context.Background(), checkpointID)
+		if err != nil || !found {
+			t.Fatalf("reload bounded linked checkpoint on attempt %d: found=%v err=%v", attempt+1, found, err)
+		}
+		if !updated.SourceRewriteBlocked {
+			if !rebased || updated.SourceRewriteRecoveryScanPending || updated.SourceRewriteRecoveryReason != "" {
+				t.Fatalf("bounded linked rebase completed with stale scan state: rebased=%v checkpoint=%#v", rebased, updated)
+			}
+			return
+		}
+		if attempt == 0 && (!updated.SourceRewriteRecoveryScanPending || updated.SourceRewriteRecoveryScanOffset <= 0) {
+			t.Fatalf("first bounded linked pass did not persist a scan cursor: %#v", updated)
+		}
+		if attempt > 0 && updated.SourceRewriteRecoveryScanOffset <= checkpoint.SourceRewriteRecoveryScanOffset {
+			// A restart must continue from the durable cursor rather than silently
+			// restarting at byte zero. The comparison is against the last checkpoint
+			// observed by this test and is updated below.
+			t.Fatalf("bounded linked scan cursor did not advance: previous=%d current=%d", checkpoint.SourceRewriteRecoveryScanOffset, updated.SourceRewriteRecoveryScanOffset)
+		}
+		checkpoint = updated
+	}
+	current, _, _ := store.ImportCheckpoint(context.Background(), checkpointID)
+	t.Fatalf("bounded linked rebase did not complete in bounded restartable passes: %#v", current)
+}
+
+func TestLinkedTranscriptRebaseHoldsAmbiguousAnchor(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "linked-ambiguous-rebase.jsonl")
+	content := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-linked-ambiguous","history_mode":"paginated"}}`,
+		`{"type":"response_item","payload":{"id":"ambiguous-anchor","type":"message","role":"assistant","turn_id":"turn-1","content":[{"type":"output_text","text":"first"}]}}`,
+		`{"type":"response_item","payload":{"id":"ambiguous-anchor","type":"message","role":"assistant","turn_id":"turn-2","content":[{"type":"output_text","text":"second"}]}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write ambiguous linked rollout: %v", err)
+	}
+	store := newBridgeTestStore(t)
+	checkpointID := transcriptCheckpointID("session-linked-ambiguous")
+	checkpoint := teamstore.ImportCheckpoint{
+		ID:                   checkpointID,
+		SessionID:            "session-linked-ambiguous",
+		SourcePath:           path,
+		SourceGeneration:     "old-source-generation",
+		LastRecordID:         "source:ambiguous-anchor",
+		LastOffsetKnown:      true,
+		SourceRewriteBlocked: true,
+		Status:               importCheckpointStatusBlocked,
+	}
+	if _, _, err := store.UpdateImportCheckpoint(context.Background(), checkpointID, func(_ teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+		checkpoint.UpdatedAt = now
+		return checkpoint, true, nil
+	}); err != nil {
+		t.Fatalf("seed ambiguous linked checkpoint: %v", err)
+	}
+	bridge := &Bridge{store: store}
+	rebased, err := bridge.rebaseLinkedTranscriptSourceRewrite(context.Background(), Session{ID: "session-linked-ambiguous", CodexThreadID: "thread-linked-ambiguous"}, codexhistory.Session{SessionID: "thread-linked-ambiguous", FilePath: path}, checkpoint)
+	if err != nil {
+		t.Fatalf("ambiguous linked rebase: %v", err)
+	}
+	if rebased {
+		t.Fatal("ambiguous linked anchor was automatically rebased")
+	}
+	updated, found, err := store.ImportCheckpoint(context.Background(), checkpointID)
+	if err != nil || !found {
+		t.Fatalf("load ambiguous linked checkpoint: found=%v err=%v", found, err)
+	}
+	if !updated.SourceRewriteBlocked || updated.SourceRewriteRecoveryScanPending || !strings.Contains(updated.SourceRewriteRecoveryReason, "matched 2") {
+		t.Fatalf("ambiguous linked checkpoint was not held with a typed reason: %#v", updated)
+	}
+}
+
+func TestLinkedTranscriptRebaseUsesCompleteCheckpointCAS(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "linked-rebase-cas.jsonl")
+	content := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-rebase-cas","history_mode":"paginated"}}`,
+		`{"type":"response_item","payload":{"id":"anchor-record","type":"message","role":"assistant","turn_id":"turn-rebase-cas","phase":"final_answer","content":[{"type":"output_text","text":"rebase CAS anchor"}]}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write linked CAS rollout: %v", err)
+	}
+	store := newBridgeTestStore(t)
+	checkpointID := transcriptCheckpointID("session-rebase-cas")
+	checkpoint := teamstore.ImportCheckpoint{
+		ID:                   checkpointID,
+		SessionID:            "session-rebase-cas",
+		SourcePath:           path,
+		SourceGeneration:     "old-source-generation",
+		LastRecordID:         "source:anchor-record",
+		LastOffsetKnown:      true,
+		SourceRewriteBlocked: true,
+		Status:               importCheckpointStatusBlocked,
+	}
+	if _, _, err := store.UpdateImportCheckpoint(context.Background(), checkpointID, func(_ teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+		checkpoint.UpdatedAt = now
+		return checkpoint, true, nil
+	}); err != nil {
+		t.Fatalf("seed linked CAS checkpoint: %v", err)
+	}
+	staleCheckpoint := checkpoint
+	if _, _, err := store.UpdateImportCheckpoint(context.Background(), checkpointID, func(current teamstore.ImportCheckpoint, found bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+		if !found {
+			t.Fatal("seeded linked CAS checkpoint disappeared")
+		}
+		current.CompletionPending = true
+		current.UpdatedAt = now
+		return current, true, nil
+	}); err != nil {
+		t.Fatalf("mutate linked CAS checkpoint concurrently: %v", err)
+	}
+
+	bridge := &Bridge{store: store}
+	session := Session{ID: "session-rebase-cas", CodexThreadID: "thread-rebase-cas"}
+	local := codexhistory.Session{SessionID: "thread-rebase-cas", FilePath: path}
+	rebased, err := bridge.rebaseLinkedTranscriptSourceRewrite(context.Background(), session, local, staleCheckpoint)
+	if err != nil {
+		t.Fatalf("rebase stale linked CAS checkpoint: %v", err)
+	}
+	if rebased {
+		t.Fatal("rebase overwrote a checkpoint changed after the source scan")
+	}
+	current, found, err := store.ImportCheckpoint(context.Background(), checkpointID)
+	if err != nil || !found {
+		t.Fatalf("load linked CAS checkpoint: found=%v err=%v", found, err)
+	}
+	if !current.SourceRewriteBlocked || !current.CompletionPending || current.SourceFingerprint != "" {
+		t.Fatalf("stale linked rebase changed the current checkpoint: %#v", current)
+	}
+}
+
+func TestLinkedTranscriptRebaseHoldsSameSourceGeneration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "linked-same-generation.jsonl")
+	content := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-same-generation","history_mode":"paginated"}}`,
+		`{"type":"response_item","payload":{"id":"same-generation-anchor","type":"message","role":"assistant","turn_id":"turn-same-generation","phase":"final_answer","content":[{"type":"output_text","text":"same generation"}]}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write same-generation rollout: %v", err)
+	}
+	identity, ok := codexPaginatedHistoryIdentity(path, "thread-same-generation")
+	if !ok || identity == "" {
+		t.Fatalf("load same-generation identity: identity=%q ok=%v", identity, ok)
+	}
+	store := newBridgeTestStore(t)
+	checkpointID := transcriptCheckpointID("session-same-generation")
+	checkpoint := teamstore.ImportCheckpoint{
+		ID:                   checkpointID,
+		SessionID:            "session-same-generation",
+		SourcePath:           path,
+		SourceGeneration:     identity,
+		LastRecordID:         "source:same-generation-anchor",
+		LastOffsetKnown:      true,
+		SourceRewriteBlocked: true,
+		Status:               importCheckpointStatusBlocked,
+	}
+	if _, _, err := store.UpdateImportCheckpoint(context.Background(), checkpointID, func(_ teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+		checkpoint.UpdatedAt = now
+		return checkpoint, true, nil
+	}); err != nil {
+		t.Fatalf("seed same-generation checkpoint: %v", err)
+	}
+
+	bridge := &Bridge{store: store}
+	session := Session{ID: "session-same-generation", CodexThreadID: "thread-same-generation"}
+	local := codexhistory.Session{SessionID: "thread-same-generation", FilePath: path}
+	rebased, err := bridge.rebaseLinkedTranscriptSourceRewrite(context.Background(), session, local, checkpoint)
+	if err != nil {
+		t.Fatalf("same-generation rebase: %v", err)
+	}
+	if rebased {
+		t.Fatal("same-generation rebase crossed an unproven source boundary")
+	}
+	updated, found, err := store.ImportCheckpoint(context.Background(), checkpointID)
+	if err != nil || !found {
+		t.Fatalf("load same-generation checkpoint: found=%v err=%v", found, err)
+	}
+	if !updated.SourceRewriteBlocked || updated.SourceGeneration != identity || updated.SourceRewriteRecoveryIdentity != identity {
+		t.Fatalf("same-generation checkpoint was not held with candidate identity: %#v", updated)
+	}
+}
+
+func TestLinkedTranscriptLegacyRebaseRequiresNoSemanticFence(t *testing.T) {
+	if linkedTranscriptRebaseNeedsProofHold(teamstore.ImportCheckpoint{}, "file:legacy-bootstrap") {
+		t.Fatal("legacy linked checkpoint with a stable anchor was held without a semantic fence")
+	}
+	cases := map[string]teamstore.ImportCheckpoint{
+		"context gap":           {ContextGap: &teamstore.ContextGapState{}},
+		"pending range":         {PendingHistoryRange: &teamstore.HistoryPendingRange{}},
+		"transcript quarantine": {TranscriptQuarantine: &teamstore.TranscriptQuarantine{}},
+		"unresolved execution":  {UnresolvedExecution: &teamstore.ExecutionAnchor{}},
+		"completion pending":    {CompletionPending: true},
+		"terminal proof":        {TerminalBoundary: &teamstore.TerminalBoundary{}},
+		"terminal seen":         {TerminalBoundarySeen: true},
+		"legacy source":         {LegacySourceUnverified: true},
+		"unusable proof":        {RecoveryProofUnusable: true},
+		"oversized record":      {OversizedRecordBlocked: true},
+		"delivery attention":    {DeliveryNeedsAttention: true},
+		"released root":         {HistoryRootReleased: true},
+		"partial first line":    {PartialSourceIdentity: "file:partial"},
+		"opaque first record":   {PendingOpaqueRecordID: "opaque-1"},
+	}
+	for name, checkpoint := range cases {
+		name, checkpoint := name, checkpoint
+		t.Run(name, func(t *testing.T) {
+			if !linkedTranscriptRebaseNeedsProofHold(checkpoint, "file:legacy-bootstrap") {
+				t.Fatalf("legacy linked checkpoint crossed %s without source proof", name)
+			}
+		})
+	}
+}
+
+func TestLinkedTranscriptRebaseKeepsSemanticFencesAcrossGenerationChange(t *testing.T) {
+	cases := map[string]teamstore.ImportCheckpoint{
+		"legacy source":       {LegacySourceUnverified: true},
+		"unusable proof":      {RecoveryProofUnusable: true},
+		"oversized record":    {OversizedRecordBlocked: true},
+		"delivery attention":  {DeliveryNeedsAttention: true},
+		"released root":       {HistoryRootReleased: true},
+		"partial first line":  {PartialSourceIdentity: "file:partial"},
+		"opaque first record": {PendingOpaqueRecordID: "opaque-1"},
+	}
+	for name, checkpoint := range cases {
+		name, checkpoint := name, checkpoint
+		t.Run(name, func(t *testing.T) {
+			checkpoint.SourceGeneration = "file:old"
+			if !linkedTranscriptRebaseNeedsProofHold(checkpoint, "file:new") {
+				t.Fatalf("linked rebase crossed %s across a source-generation change", name)
+			}
+		})
+	}
+	if linkedTranscriptRebaseNeedsProofHold(teamstore.ImportCheckpoint{SourceGeneration: "file:old"}, "file:new") {
+		t.Fatal("clean linked checkpoint was held across a changed source generation")
 	}
 }
 

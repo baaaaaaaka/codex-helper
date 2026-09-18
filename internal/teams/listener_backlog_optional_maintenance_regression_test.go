@@ -981,7 +981,7 @@ func runTeamsListenFalseBacklogSkipsOptionalHistoryMaintenance(t *testing.T, use
 			SourceRewriteRecoveryIdentity:   mandatoryLinkedSource.Identity,
 			SourceRewriteRecoverySize:       mandatoryLinkedInfo.Size(),
 			SourceRewriteRecoveryModTime:    mandatoryLinkedInfo.ModTime(),
-			SourceRewriteRecoveryChangeTime: teamstore.SourceFileChangeTimeFromFileInfo(mandatoryLinkedInfo),
+			SourceRewriteRecoveryChangeTime: teamstore.SourceFileChangeTime(mandatoryLinkedPath, mandatoryLinkedInfo),
 			Status:                          importCheckpointStatusBlocked,
 			UnresolvedExecution:             &teamstore.ExecutionAnchor{SessionID: mandatorySession.ID, ThreadID: mandatorySession.CodexThreadID, OuterTurnID: "turn-mandatory-linked"},
 			UpdatedAt:                       updatedAt,
