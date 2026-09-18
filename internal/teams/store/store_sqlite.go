@@ -95,6 +95,15 @@ const (
 	sqliteOutboxProjectionProvenanceKey        = "outbox_projection_provenance"
 	sqliteOutboxSessionProjectionProvenanceKey = "outbox_session_projection_provenance"
 	sqliteOutboxTurnProjectionProvenanceKey    = "outbox_turn_projection_provenance"
+	// Current typed writers set this marker only for the duration of the
+	// transaction that publishes an outbox JSON/scalar pair.  The invalidation
+	// triggers use it as a cheap write fence: an older/raw writer does not know
+	// the marker and therefore falls back to the compact projection predicate.
+	// This avoids compiling the full JSON decoder in every trigger while
+	// retaining a fail-closed boundary for contradictory mixed-version/manual
+	// writes.
+	sqliteOutboxProjectionWriteFenceKey   = "outbox_projection_write_fence"
+	sqliteOutboxProjectionWriteFenceValue = "typed-v1"
 	// Version 2 binds a trusted projection to SQLite's schema cookie.  A raw
 	// DROP/CREATE of one of the helper-owned invalidation triggers increments the
 	// cookie even when the durable marker and row generation are left untouched;
@@ -1202,6 +1211,19 @@ func sqliteOutboxJSONDecodeAdmissionSQL(alias string) string {
 		"("+sqliteSafeJSONType(spanJSON, "$.source")+" IS NOT NULL AND "+sqliteSafeJSONType(spanJSON, "$.source")+" NOT IN ('null', 'text'))"+
 		")))")
 	return strings.Join(parts, "\n  AND ")
+}
+
+// sqliteOutboxTriggerPrimitiveShapeSQL is the deliberately tiny decoder shape
+// fence retained in the write trigger.  The native projection predicates
+// already protect every indexed identity/schedule field (and nested duplicate
+// keys); the body is the one non-indexed primitive whose type error can make a
+// selected outbox row fail Go decoding before the caller reaches its bounded
+// fallback.  Full field/collection validation remains in
+// sqliteOutboxJSONDecodeAdmissionSQL on the audit and selected-read paths.
+func sqliteOutboxTriggerPrimitiveShapeSQL(alias string) string {
+	jsonColumn := alias + ".json"
+	bodyType := sqliteSafeJSONType(jsonColumn, "$.body")
+	return "(" + bodyType + " IS NULL OR " + bodyType + " IN ('null', 'text'))"
 }
 
 // sqliteOutboxNextAttemptDueSQL reads the canonical JSON schedule whenever it
@@ -8396,19 +8418,19 @@ func backfillSQLiteOutboxPostSendEffectsColumns(ctx context.Context, db *sql.DB)
 		if err != nil {
 			return err
 		}
-		stmt, err := tx.PrepareContext(ctx, `UPDATE outbox_messages SET post_send_effects_pending = ? WHERE id = ? AND post_send_effects_pending IS NULL AND json = ?`)
-		if err != nil {
-			_ = tx.Rollback()
-			return err
-		}
-		for _, item := range updates {
-			if _, err := stmt.ExecContext(ctx, item.pending, item.id, item.raw); err != nil {
-				_ = stmt.Close()
-				_ = tx.Rollback()
+		if err := withSQLiteOutboxProjectionWriteFenceTx(ctx, tx, func() error {
+			stmt, err := tx.PrepareContext(ctx, `UPDATE outbox_messages SET post_send_effects_pending = ? WHERE id = ? AND post_send_effects_pending IS NULL AND json = ?`)
+			if err != nil {
 				return err
 			}
-		}
-		if err := stmt.Close(); err != nil {
+			defer stmt.Close()
+			for _, item := range updates {
+				if _, err := stmt.ExecContext(ctx, item.pending, item.id, item.raw); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
 			_ = tx.Rollback()
 			return err
 		}
@@ -8656,23 +8678,29 @@ func ensureSQLiteOutboxProjectionGuardContextWithOwnerFence(ctx context.Context,
 	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO state_meta(key, value) VALUES (?, ?)`, sqliteOutboxTurnProjectionTrustKey, sqliteOutboxTurnProjectionTrustUnknown); err != nil {
 		return err
 	}
-	// The wide decode-admission predicate is intentionally evaluated only by
-	// these row-local write triggers. Keeping it out of normal SELECTs preserves
-	// the scalar hot path, while using it here prevents a later trusted audit
-	// from accepting a row whose body/enum/collection types the Go decoder would
-	// silently reject.
-	decodeGuard := sqliteOutboxJSONDecodeAdmissionSQL("NEW")
-	guard := sqliteOutboxNativeProjectionReadySQL("NEW") + " AND (" + decodeGuard + ")"
-	sessionGuard := sqliteOutboxSessionProjectionReadySQL("NEW") + " AND (" + decodeGuard + ")"
-	// Turn completion uses the full projection-valid predicate in addition to
-	// the turn identity predicate.  If a raw writer changes status, sequence,
-	// created_at, or another indexed field without changing turn_id, the native
-	// query would still omit the row unless this marker is revoked too.
-	turnGuard := sqliteOutboxProjectionValidSQL("NEW") + " AND (" + sqliteOutboxTurnProjectionReadySQL("NEW") + ") AND (" + decodeGuard + ")"
+	// Do not embed the full JSON decoder in these triggers.  modernc SQLite
+	// compiles trigger bodies while initializing every new connection; the old
+	// JSON1-heavy bodies made a Windows race worker spend the complete test
+	// timeout in sqlite3Init before it could execute a one-row query.  Current
+	// typed writers set the fence while publishing a JSON/scalar pair and can
+	// skip even the compact predicate.  Raw/older writers use the compact
+	// native projection predicate, which preserves the established compatibility
+	// behavior for scalar-only schedule/timestamp repairs.  The complete
+	// projection/decode predicates remain on the bounded audit and selected-read
+	// paths below.
+	writeFence := `EXISTS (
+  SELECT 1 FROM state_meta
+   WHERE key = '` + sqliteOutboxProjectionWriteFenceKey + `'
+     AND value = '` + sqliteOutboxProjectionWriteFenceValue + `'
+)`
+	shapeGuard := sqliteOutboxTriggerPrimitiveShapeSQL("NEW")
+	guard := "(" + writeFence + ") OR COALESCE((" + sqliteOutboxNativeProjectionReadySQL("NEW") + " AND " + shapeGuard + "), 0)"
+	sessionGuard := "(" + writeFence + ") OR COALESCE((" + sqliteOutboxSessionProjectionReadySQL("NEW") + " AND " + shapeGuard + "), 0)"
+	turnGuard := "(" + writeFence + ") OR COALESCE((" + sqliteOutboxProjectionValidSQL("NEW") + " AND (" + sqliteOutboxTurnProjectionReadySQL("NEW") + ") AND " + shapeGuard + "), 0)"
 	definitions := []string{
 		`CREATE TRIGGER outbox_projection_guard_insert
 AFTER INSERT ON outbox_messages
-WHEN NOT COALESCE((` + guard + `), 0)
+WHEN NOT (` + guard + `)
 BEGIN
   INSERT INTO state_meta(key, value) VALUES ('` + sqliteOutboxProjectionTrustKey + `', '` + sqliteOutboxProjectionTrustUntrusted + `')
   ON CONFLICT(key) DO UPDATE SET value = '` + sqliteOutboxProjectionTrustUntrusted + `';
@@ -8680,7 +8708,7 @@ BEGIN
 END`,
 		`CREATE TRIGGER outbox_projection_guard_update
 AFTER UPDATE OF id, session_id, turn_id, teams_chat_id, teams_message_id, status, sequence, created_at, deliver_after, post_send_effects_pending, json ON outbox_messages
-WHEN NOT COALESCE((` + guard + `), 0)
+WHEN NOT (` + guard + `)
 BEGIN
   INSERT INTO state_meta(key, value) VALUES ('` + sqliteOutboxProjectionTrustKey + `', '` + sqliteOutboxProjectionTrustUntrusted + `')
   ON CONFLICT(key) DO UPDATE SET value = '` + sqliteOutboxProjectionTrustUntrusted + `';
@@ -8688,7 +8716,7 @@ BEGIN
 END`,
 		`CREATE TRIGGER outbox_session_projection_guard_insert
 AFTER INSERT ON outbox_messages
-WHEN NOT COALESCE((` + sessionGuard + `), 0)
+WHEN NOT (` + sessionGuard + `)
 BEGIN
   INSERT INTO state_meta(key, value) VALUES ('` + sqliteOutboxSessionProjectionTrustKey + `', '` + sqliteOutboxSessionProjectionTrustUntrusted + `')
   ON CONFLICT(key) DO UPDATE SET value = '` + sqliteOutboxSessionProjectionTrustUntrusted + `';
@@ -8696,7 +8724,7 @@ BEGIN
 END`,
 		`CREATE TRIGGER outbox_session_projection_guard_update
 AFTER UPDATE OF id, session_id, turn_id, teams_chat_id, teams_message_id, status, sequence, created_at, deliver_after, post_send_effects_pending, json ON outbox_messages
-WHEN NOT COALESCE((` + sessionGuard + `), 0)
+WHEN NOT (` + sessionGuard + `)
 BEGIN
   INSERT INTO state_meta(key, value) VALUES ('` + sqliteOutboxSessionProjectionTrustKey + `', '` + sqliteOutboxSessionProjectionTrustUntrusted + `')
   ON CONFLICT(key) DO UPDATE SET value = '` + sqliteOutboxSessionProjectionTrustUntrusted + `';
@@ -8704,7 +8732,7 @@ BEGIN
 END`,
 		`CREATE TRIGGER outbox_turn_projection_guard_insert
 AFTER INSERT ON outbox_messages
-WHEN NOT COALESCE((` + turnGuard + `), 0)
+WHEN NOT (` + turnGuard + `)
 BEGIN
   INSERT INTO state_meta(key, value) VALUES ('` + sqliteOutboxTurnProjectionTrustKey + `', '` + sqliteOutboxTurnProjectionTrustUntrusted + `')
   ON CONFLICT(key) DO UPDATE SET value = '` + sqliteOutboxTurnProjectionTrustUntrusted + `';
@@ -8712,7 +8740,7 @@ BEGIN
 END`,
 		`CREATE TRIGGER outbox_turn_projection_guard_update
 AFTER UPDATE OF id, session_id, turn_id, teams_chat_id, teams_message_id, status, sequence, created_at, deliver_after, post_send_effects_pending, json ON outbox_messages
-WHEN NOT COALESCE((` + turnGuard + `), 0)
+WHEN NOT (` + turnGuard + `)
 BEGIN
   INSERT INTO state_meta(key, value) VALUES ('` + sqliteOutboxTurnProjectionTrustKey + `', '` + sqliteOutboxTurnProjectionTrustUntrusted + `')
   ON CONFLICT(key) DO UPDATE SET value = '` + sqliteOutboxTurnProjectionTrustUntrusted + `';
@@ -10639,21 +10667,26 @@ func writeSQLiteOutboxPreservingOpaque(ctx context.Context, tx *sql.Tx, values m
 		return err
 	}
 	defer stmt.Close()
-	for _, value := range values {
-		if _, keep := opaqueByID[strings.TrimSpace(value.ID)]; keep {
-			// Outbox rows can carry an unknown remote POST outcome. Never let a
-			// compatibility full-state rewrite replace or silently discard such
-			// evidence. Callers that intentionally repair one must use a targeted
-			// repair API; the generic State.Update fails closed instead.
-			return fmt.Errorf("%w: typed update for opaque outbox row %q requires explicit repair", ErrSQLiteOutboxProjectionUntrusted, strings.TrimSpace(value.ID))
+	if err := withSQLiteOutboxProjectionWriteFenceTx(ctx, tx, func() error {
+		for _, value := range values {
+			if _, keep := opaqueByID[strings.TrimSpace(value.ID)]; keep {
+				// Outbox rows can carry an unknown remote POST outcome. Never let a
+				// compatibility full-state rewrite replace or silently discard such
+				// evidence. Callers that intentionally repair one must use a targeted
+				// repair API; the generic State.Update fails closed instead.
+				return fmt.Errorf("%w: typed update for opaque outbox row %q requires explicit repair", ErrSQLiteOutboxProjectionUntrusted, strings.TrimSpace(value.ID))
+			}
+			data, err := json.Marshal(value)
+			if err != nil {
+				return err
+			}
+			if _, err := stmt.ExecContext(ctx, value.ID, value.SessionID, value.TurnID, strings.TrimSpace(value.TeamsChatID), strings.TrimSpace(value.TeamsMessageID), string(value.Status), value.Sequence, sqliteTime(value.CreatedAt), sqliteTime(value.NextAttemptAt), sqliteBool(value.PostSendEffectsPending), data); err != nil {
+				return err
+			}
 		}
-		data, err := json.Marshal(value)
-		if err != nil {
-			return err
-		}
-		if _, err := stmt.ExecContext(ctx, value.ID, value.SessionID, value.TurnID, strings.TrimSpace(value.TeamsChatID), strings.TrimSpace(value.TeamsMessageID), string(value.Status), value.Sequence, sqliteTime(value.CreatedAt), sqliteTime(value.NextAttemptAt), sqliteBool(value.PostSendEffectsPending), data); err != nil {
-			return err
-		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	for _, row := range opaque {
 		if _, err := stmt.ExecContext(ctx, nullableSQLiteString(row.ID), nullableSQLiteString(row.SessionID), nullableSQLiteString(row.TurnID), nullableSQLiteString(row.TeamsChatID), nullableSQLiteString(row.TeamsMessageID), nullableSQLiteString(row.Status), nullableSQLiteInt64(row.Sequence), nullableSQLiteInt64(row.CreatedAt), nullableSQLiteInt64(row.DeliverAfter), nullableSQLiteInt64(row.PostSendEffectsPending), row.Raw); err != nil {
@@ -18413,15 +18446,38 @@ ON CONFLICT(id) DO UPDATE SET session_id = excluded.session_id, status = exclude
 	return err
 }
 
+// withSQLiteOutboxProjectionWriteFenceTx marks a transaction as an internal
+// typed outbox publication for exactly the duration of its write.  The
+// outbox invalidation triggers intentionally use only this tiny metadata probe
+// instead of reparsing the complete JSON envelope.  If the callback fails, or
+// the caller later rolls the transaction back, the fence cannot survive as a
+// durable capability.  A raw/older writer that does not use this helper is
+// checked by the compact trigger predicate and loses native trust when it
+// publishes a contradiction.
+func withSQLiteOutboxProjectionWriteFenceTx(ctx context.Context, tx *sql.Tx, fn func() error) (err error) {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO state_meta(key, value) VALUES (?, ?)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value`, sqliteOutboxProjectionWriteFenceKey, sqliteOutboxProjectionWriteFenceValue); err != nil {
+		return err
+	}
+	defer func() {
+		if _, cleanupErr := tx.ExecContext(ctx, `DELETE FROM state_meta WHERE key = ?`, sqliteOutboxProjectionWriteFenceKey); err == nil && cleanupErr != nil {
+			err = cleanupErr
+		}
+	}()
+	return fn()
+}
+
 func upsertSQLiteOutboxTx(ctx context.Context, tx *sql.Tx, v OutboxMessage) error {
 	data, err := json.Marshal(v)
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO outbox_messages(id, session_id, turn_id, teams_chat_id, teams_message_id, status, sequence, created_at, deliver_after, post_send_effects_pending, json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	return withSQLiteOutboxProjectionWriteFenceTx(ctx, tx, func() error {
+		_, err = tx.ExecContext(ctx, `INSERT INTO outbox_messages(id, session_id, turn_id, teams_chat_id, teams_message_id, status, sequence, created_at, deliver_after, post_send_effects_pending, json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET session_id = excluded.session_id, turn_id = excluded.turn_id, teams_chat_id = excluded.teams_chat_id, teams_message_id = excluded.teams_message_id, status = excluded.status, sequence = excluded.sequence, created_at = excluded.created_at, deliver_after = excluded.deliver_after, post_send_effects_pending = excluded.post_send_effects_pending, json = excluded.json`,
-		v.ID, v.SessionID, v.TurnID, strings.TrimSpace(v.TeamsChatID), strings.TrimSpace(v.TeamsMessageID), string(v.Status), v.Sequence, sqliteTime(v.CreatedAt), sqliteTime(v.NextAttemptAt), sqliteBool(v.PostSendEffectsPending), data)
-	return err
+			v.ID, v.SessionID, v.TurnID, strings.TrimSpace(v.TeamsChatID), strings.TrimSpace(v.TeamsMessageID), string(v.Status), v.Sequence, sqliteTime(v.CreatedAt), sqliteTime(v.NextAttemptAt), sqliteBool(v.PostSendEffectsPending), data)
+		return err
+	})
 }
 
 func upsertSQLiteProvenanceTx(ctx context.Context, tx *sql.Tx, v MessageProvenanceRecord) error {
