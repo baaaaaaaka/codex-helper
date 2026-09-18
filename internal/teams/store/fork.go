@@ -530,6 +530,9 @@ func (s *Store) ForkOperation(ctx context.Context, operationID string) (ForkOper
 
 func (s *Store) ForkOperations(ctx context.Context) ([]ForkOperation, error) {
 	if operations, handled, err := s.forkOperationsSQLite(ctx); handled || err != nil {
+		if err == nil {
+			sortForkOperations(operations)
+		}
 		return operations, err
 	}
 	state, err := s.loadStateFieldsOrFull(ctx, forkOperationStateFields)
@@ -540,13 +543,17 @@ func (s *Store) ForkOperations(ctx context.Context) ([]ForkOperation, error) {
 	for _, op := range state.ForkOperations {
 		out = append(out, op)
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
-			return out[i].CreatedAt.Before(out[j].CreatedAt)
-		}
-		return out[i].ID < out[j].ID
-	})
+	sortForkOperations(out)
 	return out, nil
+}
+
+func sortForkOperations(operations []ForkOperation) {
+	sort.Slice(operations, func(i, j int) bool {
+		if !operations[i].CreatedAt.Equal(operations[j].CreatedAt) {
+			return operations[i].CreatedAt.Before(operations[j].CreatedAt)
+		}
+		return operations[i].ID < operations[j].ID
+	})
 }
 
 func (s *Store) UpdateForkOperation(ctx context.Context, operationID string, fn func(*ForkOperation) error) (ForkOperation, error) {
