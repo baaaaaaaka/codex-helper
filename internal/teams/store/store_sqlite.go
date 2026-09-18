@@ -850,15 +850,52 @@ func sqliteTurnAdmissionProjectionMatchesJSONSQL(jsonColumn, idColumn, sessionCo
 		" AND " + sqliteProjectionOptionalTimeValidSQL(jsonColumn, "$.updated_at") + ")"
 }
 
-// sqliteChatPollAdmissionProjectionMatchesJSONSQL proves the scalar fields
-// used by the trusted scheduler are derived from the same canonical poll
-// object. The complete admission validator is deliberately reused here so a
-// malformed pending receipt or attempt cannot consume a trusted operational
-// slot. Time equality is checked in the read predicate's canonical Julian
-// domain; this write-side predicate only requires parseability.
+// sqliteChatPollAdmissionProjectionMatchesJSONSQL is the compact write-side
+// projection fence for chat_polls.  It intentionally does not reuse the full
+// admission validator: that validator walks nested receipt arrays and is
+// appropriate for bounded read admission, but embedding it in an UPDATE
+// trigger makes SQLite compile a very large expression for every hot poll
+// mutation (especially under the race-instrumented macOS build).
+//
+// The durable safety contract remains split deliberately:
+//   - this trigger rejects invalid identity/schedule types and contradictory
+//     scalar projections, and requires a new row-local publication generation;
+//   - selected hydration decodes the canonical JSON and runs the complete Go
+//     admission check before any Graph request;
+//   - the full JSON admission validator remains on the compatibility lane.
+//
+// The parked-skip hint is intentionally treated like the other schedule
+// hints: typed writers recompute it from the canonical value, selected
+// hydration remains the final authority, and an unadvanced raw rewrite is
+// still fenced by the publication generation.
+//
+// A raw JSON-first writer that does not advance the projection generation is
+// therefore still revoked here, while the normal typed writer can publish a
+// trusted row without asking SQLite to re-parse every nested receipt.
 func sqliteChatPollAdmissionProjectionMatchesJSONSQL(jsonColumn, chatColumn string) string {
+	typeAllowed := func(path string, allowed ...string) string {
+		typeExpr := sqliteSafeJSONType(jsonColumn, path)
+		parts := []string{typeExpr + " IS NULL", typeExpr + " = 'null'"}
+		for _, typ := range allowed {
+			parts = append(parts, typeExpr+" = '"+typ+"'")
+		}
+		return "(" + strings.Join(parts, " OR ") + ")"
+	}
+	identity := "(json_valid(" + jsonColumn + ") AND " +
+		"" + sqliteSafeJSONType(jsonColumn, "$") + " = 'object' AND " +
+		"" + sqliteSafeJSONType(jsonColumn, "$.chat_id") + " = 'text' AND " +
+		"trim(COALESCE(" + sqliteSafeJSONExtract(jsonColumn, "$.chat_id") + ", '')) = trim(COALESCE(" + chatColumn + ", '')))"
 	parts := []string{
-		sqliteChatPollAdmissionValidJSONSQL(jsonColumn, chatColumn),
+		identity,
+		typeAllowed("$.state", "text"),
+		typeAllowed("$.previous_state", "text"),
+		typeAllowed("$.last_error", "text"),
+		typeAllowed("$.seeded", "true", "false"),
+		typeAllowed("$.recovery_required", "true", "false"),
+		typeAllowed("$.failure_count", "integer"),
+		typeAllowed("$.pending_page", "object"),
+		typeAllowed("$.gap", "object"),
+		typeAllowed("$.attempt", "object"),
 		sqliteProjectionOptionalBoolMatchesJSONSQL(jsonColumn, "$.seeded", "NEW.seeded"),
 		sqliteProjectionOptionalBoolMatchesJSONSQL(jsonColumn, "$.recovery_required", "NEW.recovery_required"),
 		sqliteProjectionOptionalTextMatchesJSONSQL(jsonColumn, "$.state", "NEW.poll_state"),
@@ -868,7 +905,7 @@ func sqliteChatPollAdmissionProjectionMatchesJSONSQL(jsonColumn, chatColumn stri
 		"COALESCE(NEW.pending_page_active, 0) = " + sqliteChatPollPendingPageSQL(jsonColumn),
 		"COALESCE(NEW.attempt_active, 0) = (CASE WHEN " + sqliteSafeJSONType(jsonColumn, "$.attempt") + " = 'object' THEN 1 ELSE 0 END)",
 		"COALESCE(NEW.frontier_active, 0) = " + sqliteChatPollOperationalFrontierSQL(jsonColumn),
-		"COALESCE(NEW.parked_skip_eligible, 0) = " + sqliteCanonicalParkedSkipProjectionSQL(jsonColumn, "NEW.parked_skip_eligible", "NEW.poll_state"),
+		"COALESCE(NEW.parked_skip_eligible, 0) = " + sqliteChatPollParkedSkipProjectionTriggerSQL(jsonColumn),
 	}
 	for _, path := range []string{
 		"$.next_poll_at", "$.last_activity_at", "$.blocked_until", "$.parked_at",
@@ -878,6 +915,34 @@ func sqliteChatPollAdmissionProjectionMatchesJSONSQL(jsonColumn, chatColumn stri
 		parts = append(parts, sqliteProjectionOptionalTimeValidSQL(jsonColumn, path))
 	}
 	return "(" + strings.Join(parts, "\n  AND ") + ")"
+}
+
+// sqliteChatPollParkedSkipProjectionTriggerSQL is the compact form of the
+// parked hint used by the write-side trigger.  It keeps the canonical
+// JSON-first fallback for omitted scalar fields but avoids the historical
+// validator's repeated presence/type scaffolding.  The complete parked
+// decision is still recomputed by the typed writer and checked after selected
+// hydration.
+func sqliteChatPollParkedSkipProjectionTriggerSQL(jsonColumn string) string {
+	state := sqliteCanonicalTextProjectionSQL(jsonColumn, "$.state", "NEW.poll_state")
+	notice := sqliteCanonicalTimeProjectionSQL(jsonColumn, "$.park_notice_sent_at", "NEW.park_notice_sent_at")
+	parkedAt := sqliteCanonicalTimeProjectionSQL(jsonColumn, "$.parked_at", "NEW.parked_at")
+	blocked := sqliteCanonicalTimeProjectionSQL(jsonColumn, "$.blocked_until", "NEW.blocked_until")
+	continuation := sqliteCanonicalTextProjectionSQL(jsonColumn, "$.continuation_path", "''")
+	deferred := sqliteCanonicalTextProjectionSQL(jsonColumn, "$.deferred_continuation_path", "''")
+	pendingType := sqliteSafeJSONType(jsonColumn, "$.pending_page")
+	gapType := sqliteSafeJSONType(jsonColumn, "$.gap")
+	attemptType := sqliteSafeJSONType(jsonColumn, "$.attempt")
+	failure := sqliteChatPollFailureCountSQL(jsonColumn)
+	lastErrorType := sqliteSafeJSONType(jsonColumn, "$.last_error")
+	lastError := "(CASE WHEN " + lastErrorType + " = 'text' THEN trim(COALESCE(" + sqliteSafeJSONExtract(jsonColumn, "$.last_error") + ", '')) WHEN " + lastErrorType + " IS NULL OR " + lastErrorType + " = 'null' THEN '' ELSE '__invalid__' END)"
+	return "(CASE WHEN " + state + " = 'parked'" +
+		" AND " + notice + " > 0 AND " + parkedAt + " > 0 AND " + blocked + " = 0" +
+		" AND trim(" + continuation + ") = '' AND trim(" + deferred + ") = ''" +
+		" AND (" + pendingType + " IS NULL OR " + pendingType + " = 'null')" +
+		" AND (" + gapType + " IS NULL OR " + gapType + " = 'null')" +
+		" AND (" + attemptType + " IS NULL OR " + attemptType + " = 'null')" +
+		" AND " + failure + " = 0 AND " + lastError + " = '' THEN 1 ELSE 0 END)"
 }
 
 // sqliteCanonicalParkedSkipProjectionSQL recomputes the derived parked notice
@@ -9476,7 +9541,6 @@ func sqliteAdmissionProjectionTriggerDefinitions() []string {
 	sessionProjection := sqliteSessionAdmissionProjectionMatchesJSONSQL("NEW.json", "NEW.id", "NEW.teams_chat_id", "NEW.status")
 	turnProjection := sqliteTurnAdmissionProjectionMatchesJSONSQL("NEW.json", "NEW.id", "NEW.session_id", "NEW.status")
 	chatPollProjection := sqliteChatPollAdmissionProjectionMatchesJSONSQL("NEW.json", "NEW.chat_id")
-	chatPollAdmissionValid := sqliteChatPollAdmissionValidJSONSQL("NEW.json", "NEW.chat_id")
 	return []string{
 		`CREATE TRIGGER sessions_admission_projection_insert_v1
 AFTER INSERT ON sessions
@@ -9496,7 +9560,7 @@ WHEN COALESCE(NEW.projection_trusted, 0) != 0
 BEGIN
   UPDATE chat_polls
      SET projection_trusted = 0,
-         admission_valid = CASE WHEN ` + chatPollAdmissionValid + ` THEN NEW.admission_valid ELSE 0 END
+         admission_valid = CASE WHEN json_valid(NEW.json) THEN COALESCE(NEW.admission_valid, 0) ELSE 0 END
    WHERE chat_id = NEW.chat_id;
 END`,
 		`CREATE TRIGGER turns_admission_projection_insert_v1
@@ -9535,7 +9599,7 @@ WHEN COALESCE(NEW.projection_trusted, 0) != 0
 BEGIN
   UPDATE chat_polls
      SET projection_trusted = 0,
-         admission_valid = CASE WHEN ` + chatPollAdmissionValid + ` THEN NEW.admission_valid ELSE 0 END
+         admission_valid = CASE WHEN json_valid(NEW.json) THEN COALESCE(NEW.admission_valid, 0) ELSE 0 END
    WHERE chat_id = NEW.chat_id;
 END`,
 		`CREATE TRIGGER turns_admission_projection_v1
