@@ -3084,7 +3084,10 @@ func TestTeamsListenFalseHistoryWatchSlowHeadDoesNotStarveHealthyTail(t *testing
 	}
 	initialOffsets := make(map[string]int64, len(paths))
 	for index, path := range paths {
-		initial := listenerRecoveryTranscriptLine(fmt.Sprintf("history-initial-%d", index), fmt.Sprintf("history-baseline-%d", index))
+		// Keep this fairness fixture independent of ctime/USN support.  The
+		// source-proof tests cover non-empty legacy cursors; here an empty
+		// baseline gives the watcher a safe zero cursor on every filesystem.
+		initial := ""
 		if err := os.WriteFile(path, []byte(initial), 0o600); err != nil {
 			t.Fatalf("write history transcript %s: %v", path, err)
 		}
@@ -3174,7 +3177,10 @@ func TestTeamsListenFalseHistoryWatchFullPoolDoesNotStarveHealthyTail(t *testing
 	initialOffsets := make(map[string]int64, pathCount)
 	for index := 0; index < pathCount; index++ {
 		path := filepath.Join(root, "sessions", fmt.Sprintf("%c-history.jsonl", 'a'+index))
-		initial := listenerRecoveryTranscriptLine(fmt.Sprintf("full-pool-history-initial-%d", index), fmt.Sprintf("full-pool-history-baseline-%d", index))
+		// Keep this fairness fixture independent of ctime/USN support.  The
+		// source-proof tests cover non-empty legacy cursors; here an empty
+		// baseline gives the watcher a safe zero cursor on every filesystem.
+		initial := ""
 		if err := os.WriteFile(path, []byte(initial), 0o600); err != nil {
 			t.Fatalf("write history transcript %s: %v", path, err)
 		}
