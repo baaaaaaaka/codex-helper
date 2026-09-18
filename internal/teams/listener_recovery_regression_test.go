@@ -879,10 +879,10 @@ const listenerRecoveryMultiStepProgressTimeout = 90 * time.Second
 
 // The slow inbound mutation fixture deliberately exercises a real continuous
 // listener with a race-instrumented, file-backed store and a 600ms Graph POST.
-// Hosted macOS runners can spend just over the general multi-step window in
-// SQLite admission before the queued turn is observable. Keep this bound local
-// to that fixture; it remains finite and retains every durable exactly-once
-// assertion after the wait.
+// Hosted race runners can spend well over the general multi-step window in
+// SQLite admission and outbox observation before the queued turn is fully
+// durable. Keep this bound local to that fixture; it remains finite and retains
+// every durable exactly-once assertion after the wait.
 const listenerRecoverySlowInboundProgressTimeout = 180 * time.Second
 
 // Windows hosted runners can spend tens of seconds in FlushFileBuffers while
@@ -4273,18 +4273,19 @@ func TestTeamsListenFalseSlowInboundMutationDoesNotConsumeDurableCleanupGrace(t 
 	if err != nil {
 		t.Fatalf("parse slow inbound message timestamp: %v", err)
 	}
-	// The final POST can complete before the terminal poll CAS. Wait for the
-	// cursor itself, so a cleanup-context regression still fails here, then
-	// stop the listener before inspecting Attempt. Without stopping first, the
-	// healthy listener may already have claimed the next valid poll cycle and
-	// make a live attempt look like stale cleanup state.
+	// The final POST can complete before the terminal poll CAS. Wait for both
+	// the cursor and the attempt cleanup before stopping the listener. A race
+	// runner may observe the cursor from the final outbox side effect while the
+	// fenced terminal CAS is still in flight; canceling in that narrow window
+	// would make the test itself manufacture a stale Attempt. If cleanup really
+	// fails, this bounded wait still reports the regression.
 	if !waitListenerRecoveryResult(func() bool {
 		state, loadErr := store.Load(context.Background())
 		if loadErr != nil {
 			return false
 		}
 		poll := state.ChatPolls["chat-1"]
-		return !poll.LastModifiedCursor.Before(messageModifiedAt)
+		return !poll.LastModifiedCursor.Before(messageModifiedAt) && poll.Attempt == nil
 	}, progressTimeout) {
 		state, _ := store.Load(context.Background())
 		listener.stop(t)
