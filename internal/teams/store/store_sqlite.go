@@ -7446,7 +7446,12 @@ func withSQLiteSchemaPreparationLock(ctx context.Context, path string, fn func()
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	lock := flock.New(path + sqliteSchemaPreparationLockSuffix)
+	// The flock package defaults to O_CREATE|O_RDONLY. POSIX accepts that
+	// combination for creating a lock file, but Windows can report
+	// ERROR_FILE_NOT_FOUND when the file does not exist yet. Explicitly request
+	// a read/write descriptor so the first owner can create the preparation lock
+	// portably; the descriptor is still used only for the OS-level lock.
+	lock := flock.New(path+sqliteSchemaPreparationLockSuffix, flock.SetFlag(os.O_CREATE|os.O_RDWR))
 	locked, err := lock.TryLockContext(ctx, 10*time.Millisecond)
 	if err != nil {
 		return err
