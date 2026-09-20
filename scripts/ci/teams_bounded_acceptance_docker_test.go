@@ -25,6 +25,8 @@ func TestTeamsBoundedAcceptanceDockerWrapperIsCredentialFreeAndIsolated(t *testi
 		"--cap-drop=ALL",
 		"CXP_RUNTIME_DISABLE=1",
 		"TestDockerBoundedAcceptanceScenario",
+		"TestHistoryWatchRebaseContinuesAcrossSameInodeAppend",
+		"TestLinkedTranscriptRebaseContinuesAcrossSameInodeAppend",
 		"Dockerfile.teams-bounded-acceptance",
 	} {
 		if !strings.Contains(source, required) {

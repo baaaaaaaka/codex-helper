@@ -32,44 +32,46 @@ import (
 )
 
 const (
-	dockerRealDataExperimentEnv      = "CXP_TEAMS_DOCKER_REAL_DATA_EXPERIMENT"
-	dockerRealDataModeEnv            = "CXP_TEAMS_DOCKER_REAL_DATA_MODE"
-	dockerRealDataDurationEnv        = "CXP_TEAMS_DOCKER_REAL_DATA_DURATION"
-	dockerRealDataResumeEnv          = "CXP_TEAMS_DOCKER_REAL_DATA_RESUME"
-	dockerRealDataProcessRestartEnv  = "CXP_TEAMS_DOCKER_PROCESS_RESTART"
-	dockerRealData429ExperimentEnv   = "CXP_TEAMS_DOCKER_REAL_DATA_429"
-	dockerRealData429ScopeEnv        = "CXP_TEAMS_DOCKER_REAL_DATA_429_SCOPE"
-	dockerRealData429PollOnlyEnv     = "CXP_TEAMS_DOCKER_REAL_DATA_429_POLL_ONLY"
-	dockerRealDataPollIntervalEnv    = "CXP_TEAMS_DOCKER_REAL_DATA_POLL_INTERVAL"
-	dockerRealDataStartupDeadlineEnv = "CXP_TEAMS_DOCKER_STARTUP_DEADLINE"
-	dockerRealDataPageSize           = 20
-	dockerRealDataMessageIDPrefix    = "docker-real-data:"
-	dockerRealDataDefaultDuration    = 5 * time.Minute
-	dockerRealDataMinimumDuration    = time.Minute
-	dockerRealData429DefaultDuration = 12 * time.Second
-	dockerRealData429MinimumDuration = 2 * time.Second
-	dockerRealData429DefaultInterval = 100 * time.Millisecond
-	dockerRealData429MinimumInterval = 10 * time.Millisecond
-	dockerRealData429Failures        = 4
-	dockerRealData429Chats           = 1
-	dockerRealData429HealthyChats    = 1
-	dockerRealData429ScopeChat       = "chat"
-	dockerRealData429ScopeAccount    = "account"
-	dockerRealData429ScopeGlobal     = "global"
-	dockerRealDataDefaultTop         = ownerPollMessageTop
-	dockerRealDataMinimumReplay      = 100
-	dockerRealDataModeThroughput     = "throughput"
-	dockerRealDataModeComplete       = "complete"
-	dockerRealDataExecutionPrefix    = "docker real-data execution result #"
-	dockerRealDataAnyExecutionMarker = "__docker_real_data_any_execution_result__"
-	dockerRealDataGraphOpMessageList = "message-list-get"
-	dockerRealDataGraphOpMessageItem = "message-item-get"
-	dockerRealDataGraphOpMembers     = "members-get"
-	dockerRealDataGraphOpMe          = "me-get"
-	dockerRealDataGraphOpMessagePost = "message-post"
-	dockerRealDataGraphOpMarkUnread  = "mark-unread-post"
-	dockerRealDataGraphOpMeetingPost = "meeting-post"
-	dockerRealDataGraphOpPatch       = "chat-patch"
+	dockerRealDataExperimentEnv        = "CXP_TEAMS_DOCKER_REAL_DATA_EXPERIMENT"
+	dockerRealDataModeEnv              = "CXP_TEAMS_DOCKER_REAL_DATA_MODE"
+	dockerRealDataChatCoverageEnv      = "CXP_TEAMS_DOCKER_REAL_DATA_CHAT_COVERAGE"
+	dockerRealDataRequireAllLaggingEnv = "CXP_TEAMS_DOCKER_REAL_DATA_REQUIRE_ALL_LAGGING"
+	dockerRealDataDurationEnv          = "CXP_TEAMS_DOCKER_REAL_DATA_DURATION"
+	dockerRealDataResumeEnv            = "CXP_TEAMS_DOCKER_REAL_DATA_RESUME"
+	dockerRealDataProcessRestartEnv    = "CXP_TEAMS_DOCKER_PROCESS_RESTART"
+	dockerRealData429ExperimentEnv     = "CXP_TEAMS_DOCKER_REAL_DATA_429"
+	dockerRealData429ScopeEnv          = "CXP_TEAMS_DOCKER_REAL_DATA_429_SCOPE"
+	dockerRealData429PollOnlyEnv       = "CXP_TEAMS_DOCKER_REAL_DATA_429_POLL_ONLY"
+	dockerRealDataPollIntervalEnv      = "CXP_TEAMS_DOCKER_REAL_DATA_POLL_INTERVAL"
+	dockerRealDataStartupDeadlineEnv   = "CXP_TEAMS_DOCKER_STARTUP_DEADLINE"
+	dockerRealDataPageSize             = 20
+	dockerRealDataMessageIDPrefix      = "docker-real-data:"
+	dockerRealDataDefaultDuration      = 5 * time.Minute
+	dockerRealDataMinimumDuration      = time.Minute
+	dockerRealData429DefaultDuration   = 12 * time.Second
+	dockerRealData429MinimumDuration   = 2 * time.Second
+	dockerRealData429DefaultInterval   = 100 * time.Millisecond
+	dockerRealData429MinimumInterval   = 10 * time.Millisecond
+	dockerRealData429Failures          = 4
+	dockerRealData429Chats             = 1
+	dockerRealData429HealthyChats      = 1
+	dockerRealData429ScopeChat         = "chat"
+	dockerRealData429ScopeAccount      = "account"
+	dockerRealData429ScopeGlobal       = "global"
+	dockerRealDataDefaultTop           = ownerPollMessageTop
+	dockerRealDataMinimumReplay        = 100
+	dockerRealDataModeThroughput       = "throughput"
+	dockerRealDataModeComplete         = "complete"
+	dockerRealDataExecutionPrefix      = "docker real-data execution result #"
+	dockerRealDataAnyExecutionMarker   = "__docker_real_data_any_execution_result__"
+	dockerRealDataGraphOpMessageList   = "message-list-get"
+	dockerRealDataGraphOpMessageItem   = "message-item-get"
+	dockerRealDataGraphOpMembers       = "members-get"
+	dockerRealDataGraphOpMe            = "me-get"
+	dockerRealDataGraphOpMessagePost   = "message-post"
+	dockerRealDataGraphOpMarkUnread    = "mark-unread-post"
+	dockerRealDataGraphOpMeetingPost   = "meeting-post"
+	dockerRealDataGraphOpPatch         = "chat-patch"
 )
 
 func dockerRealDataProductionPhaseNames() []string {
@@ -206,6 +208,161 @@ type dockerRealDataReplayReport struct {
 	ExcludedAttachments     int
 	ExcludedHostedContent   int
 	ExcludedUnsupported     int
+}
+
+// dockerRealDataLaggingChatManifest is the inventory boundary for the
+// exhaustive acceptance run.  A queued Teams inbound row is already a
+// durable promise that this chat needs work; whether it has an active CXP
+// session is a separate recovery condition and must not silently shrink the
+// proof set.
+type dockerRealDataLaggingChatManifest struct {
+	AllChatIDs              []string
+	ActiveChatIDs           []string
+	OrphanChatIDs           []string
+	ActionableOrphanChatIDs []string
+	TerminalQueuedChatIDs   []string
+}
+
+func dockerRealDataQueuedWorkChatManifest(state teamstore.State, controlChatID string) dockerRealDataLaggingChatManifest {
+	controlChatID = strings.TrimSpace(controlChatID)
+	activeChats := make(map[string]struct{}, len(state.Sessions))
+	for _, session := range state.Sessions {
+		chatID := strings.TrimSpace(session.TeamsChatID)
+		if chatID == "" || chatID == controlChatID || !isActiveSessionStatus(string(session.Status)) {
+			continue
+		}
+		activeChats[chatID] = struct{}{}
+	}
+	all := make(map[string]struct{})
+	terminalQueued := make(map[string]struct{})
+	actionableQueued := make(map[string]struct{})
+	for _, inbound := range state.InboundEvents {
+		if !strings.EqualFold(strings.TrimSpace(inbound.Source), "teams") || inbound.Status != teamstore.InboundStatusQueued {
+			continue
+		}
+		chatID := strings.TrimSpace(inbound.TeamsChatID)
+		if chatID == "" || chatID == controlChatID {
+			continue
+		}
+		// A production snapshot can retain queued inbound provenance after its
+		// turn has completed.  That terminal row must be reported separately,
+		// but it must not erase the chat from the exhaustive proof set: the same
+		// chat may also have ordinary queued rows that the replay corpus must
+		// cover.
+		all[chatID] = struct{}{}
+		if turn, found := state.Turns[strings.TrimSpace(inbound.TurnID)]; found && dockerRealDataTerminalTurn(turn.Status) {
+			// This is stale queued provenance, not executable backlog: its
+			// durable turn is already terminal. Keep it visible in the audit,
+			// but do not count it as a new executable turn.
+			terminalQueued[chatID] = struct{}{}
+		} else {
+			actionableQueued[chatID] = struct{}{}
+		}
+	}
+	manifest := dockerRealDataLaggingChatManifest{
+		AllChatIDs:              make([]string, 0, len(all)),
+		ActiveChatIDs:           make([]string, 0, len(all)),
+		OrphanChatIDs:           make([]string, 0),
+		ActionableOrphanChatIDs: make([]string, 0),
+		TerminalQueuedChatIDs:   make([]string, 0, len(terminalQueued)),
+	}
+	for chatID := range all {
+		manifest.AllChatIDs = append(manifest.AllChatIDs, chatID)
+		if _, ok := activeChats[chatID]; ok {
+			manifest.ActiveChatIDs = append(manifest.ActiveChatIDs, chatID)
+		} else {
+			manifest.OrphanChatIDs = append(manifest.OrphanChatIDs, chatID)
+			if _, ok := actionableQueued[chatID]; ok {
+				manifest.ActionableOrphanChatIDs = append(manifest.ActionableOrphanChatIDs, chatID)
+			}
+		}
+	}
+	for chatID := range terminalQueued {
+		manifest.TerminalQueuedChatIDs = append(manifest.TerminalQueuedChatIDs, chatID)
+	}
+	sort.Strings(manifest.AllChatIDs)
+	sort.Strings(manifest.ActiveChatIDs)
+	sort.Strings(manifest.OrphanChatIDs)
+	sort.Strings(manifest.ActionableOrphanChatIDs)
+	sort.Strings(manifest.TerminalQueuedChatIDs)
+	return manifest
+}
+
+func TestDockerRealDataQueuedWorkChatManifest(t *testing.T) {
+	state := teamstore.State{
+		Sessions: map[string]teamstore.SessionContext{
+			"active":          {ID: "active", Status: teamstore.SessionStatusActive, TeamsChatID: "active-chat"},
+			"active-terminal": {ID: "active-terminal", Status: teamstore.SessionStatusActive, TeamsChatID: "active-terminal-chat"},
+			"closed":          {ID: "closed", Status: teamstore.SessionStatusClosed, TeamsChatID: "closed-chat"},
+		},
+		InboundEvents: map[string]teamstore.InboundEvent{
+			"active-inbound":   {ID: "active-inbound", Source: "teams", Status: teamstore.InboundStatusQueued, TeamsChatID: "active-chat"},
+			"active-terminal":  {ID: "active-terminal", Source: "teams", Status: teamstore.InboundStatusQueued, TeamsChatID: "active-terminal-chat", TurnID: "terminal-turn"},
+			"orphan-inbound":   {ID: "orphan-inbound", Source: "teams", Status: teamstore.InboundStatusQueued, TeamsChatID: "orphan-chat"},
+			"closed-inbound":   {ID: "closed-inbound", Source: "teams", Status: teamstore.InboundStatusQueued, TeamsChatID: "closed-chat"},
+			"control-inbound":  {ID: "control-inbound", Source: "teams", Status: teamstore.InboundStatusQueued, TeamsChatID: "control-chat"},
+			"terminal-inbound": {ID: "terminal-inbound", Source: "teams", Status: teamstore.InboundStatusQueued, TeamsChatID: "terminal-chat", TurnID: "terminal-turn"},
+			"other-source":     {ID: "other-source", Source: "codex", Status: teamstore.InboundStatusQueued, TeamsChatID: "other-chat"},
+		},
+		Turns: map[string]teamstore.Turn{
+			"terminal-turn": {ID: "terminal-turn", Status: teamstore.TurnStatusCompleted},
+		},
+	}
+	got := dockerRealDataQueuedWorkChatManifest(state, "control-chat")
+	wantAll := []string{"active-chat", "active-terminal-chat", "closed-chat", "orphan-chat", "terminal-chat"}
+	wantActive := []string{"active-chat", "active-terminal-chat"}
+	wantOrphans := []string{"closed-chat", "orphan-chat", "terminal-chat"}
+	wantTerminal := []string{"active-terminal-chat", "terminal-chat"}
+	if !reflect.DeepEqual(got.AllChatIDs, wantAll) || !reflect.DeepEqual(got.ActiveChatIDs, wantActive) || !reflect.DeepEqual(got.OrphanChatIDs, wantOrphans) || !reflect.DeepEqual(got.ActionableOrphanChatIDs, wantOrphans[:2]) || !reflect.DeepEqual(got.TerminalQueuedChatIDs, wantTerminal) {
+		t.Fatalf("queued work chat manifest = %#v, want all=%v active=%v orphans=%v actionable_orphans=%v terminal=%v", got, wantAll, wantActive, wantOrphans, wantOrphans[:2], wantTerminal)
+	}
+}
+
+// dockerRealDataChatOnlyTerminalEmptyQueuedRows identifies a queued chat that
+// has no replayable message at all because every queued row is an empty
+// terminal provenance row.  Such a row must not be replayed or treated as a
+// missing ordinary-message proof, but it remains visible in the source audit.
+func dockerRealDataChatOnlyTerminalEmptyQueuedRows(state teamstore.State, chatID string) bool {
+	chatID = strings.TrimSpace(chatID)
+	if chatID == "" {
+		return false
+	}
+	found := false
+	for _, inbound := range state.InboundEvents {
+		if !strings.EqualFold(strings.TrimSpace(inbound.Source), "teams") || inbound.Status != teamstore.InboundStatusQueued || strings.TrimSpace(inbound.TeamsChatID) != chatID {
+			continue
+		}
+		found = true
+		if strings.TrimSpace(inbound.Text) != "" || strings.TrimSpace(inbound.TeamsBodyHTML) != "" || len(inbound.TeamsAttachments) != 0 {
+			return false
+		}
+		turn, ok := state.Turns[strings.TrimSpace(inbound.TurnID)]
+		if !ok || !dockerRealDataTerminalTurn(turn.Status) {
+			return false
+		}
+	}
+	return found
+}
+
+func TestDockerRealDataChatOnlyTerminalEmptyQueuedRows(t *testing.T) {
+	state := teamstore.State{
+		InboundEvents: map[string]teamstore.InboundEvent{
+			"terminal-empty":   {ID: "terminal-empty", Source: "teams", Status: teamstore.InboundStatusQueued, TeamsChatID: "terminal-empty-chat", TurnID: "terminal-empty-turn"},
+			"terminal-message": {ID: "terminal-message", Source: "teams", Status: teamstore.InboundStatusQueued, TeamsChatID: "terminal-message-chat", TurnID: "terminal-message-turn", Text: "message"},
+			"actionable-empty": {ID: "actionable-empty", Source: "teams", Status: teamstore.InboundStatusQueued, TeamsChatID: "actionable-empty-chat", TurnID: "actionable-empty-turn"},
+		},
+		Turns: map[string]teamstore.Turn{
+			"terminal-empty-turn":   {ID: "terminal-empty-turn", Status: teamstore.TurnStatusCompleted},
+			"terminal-message-turn": {ID: "terminal-message-turn", Status: teamstore.TurnStatusCompleted},
+			"actionable-empty-turn": {ID: "actionable-empty-turn", Status: teamstore.TurnStatusQueued},
+		},
+	}
+	if !dockerRealDataChatOnlyTerminalEmptyQueuedRows(state, "terminal-empty-chat") {
+		t.Fatal("terminal empty provenance chat was not recognized")
+	}
+	if dockerRealDataChatOnlyTerminalEmptyQueuedRows(state, "terminal-message-chat") || dockerRealDataChatOnlyTerminalEmptyQueuedRows(state, "actionable-empty-chat") || dockerRealDataChatOnlyTerminalEmptyQueuedRows(state, "missing-chat") {
+		t.Fatal("non-empty, actionable, or missing chat was misclassified as terminal empty provenance")
+	}
 }
 
 // dockerRealDataInheritedOperationalRows identifies durable work that was
@@ -707,6 +864,65 @@ func dockerRealDataReplayCorpus(state teamstore.State, controlChatID string) (ma
 		total += len(messages)
 	}
 	return corpus, total, report
+}
+
+// dockerRealDataOneMessagePerChat is an opt-in coverage corpus for a copied
+// production snapshot. The normal throughput corpus intentionally retains all
+// eligible queued messages; this reduced corpus is only for proving that every
+// lagging active work chat reaches the real durable Graph -> inbound -> turn
+// path within a bounded Docker run. It preserves the first source message,
+// including its body, author, chat, and replay identity, and never invents a
+// chat that was absent from the real snapshot.
+func dockerRealDataOneMessagePerChat(corpus map[string][]ChatMessage) map[string][]ChatMessage {
+	coverage := make(map[string][]ChatMessage, len(corpus))
+	for chatID, messages := range corpus {
+		if len(messages) == 0 {
+			continue
+		}
+		coverage[chatID] = []ChatMessage{messages[0]}
+	}
+	return coverage
+}
+
+func TestDockerRealDataOneMessagePerChat(t *testing.T) {
+	corpus := map[string][]ChatMessage{
+		"chat-a":     {{ID: "a-1"}, {ID: "a-2"}},
+		"chat-b":     {{ID: "b-1"}},
+		"chat-empty": nil,
+	}
+	want := map[string][]ChatMessage{
+		"chat-a": {{ID: "a-1"}},
+		"chat-b": {{ID: "b-1"}},
+	}
+	got := dockerRealDataOneMessagePerChat(corpus)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("one-message-per-chat coverage = %#v, want %#v", got, want)
+	}
+}
+
+func TestDockerRealDataNewPollRecoveryChatsIgnoresInheritedRecovery(t *testing.T) {
+	corpus := map[string][]ChatMessage{
+		"inherited": {{ID: "inherited-message"}},
+		"new":       {{ID: "new-message"}},
+		"clean":     {{ID: "clean-message"}},
+	}
+	before := teamstore.State{
+		ChatPolls: map[string]teamstore.ChatPollState{
+			"inherited": {ChatID: "inherited", Gap: &teamstore.ChatPollGap{HeadProbePending: true}},
+			"new":       {ChatID: "new"},
+			"clean":     {ChatID: "clean"},
+		},
+	}
+	after := teamstore.State{
+		ChatPolls: map[string]teamstore.ChatPollState{
+			"inherited": {ChatID: "inherited", Gap: &teamstore.ChatPollGap{HeadProbePending: true}},
+			"new":       {ChatID: "new", RecoveryRequired: true},
+			"clean":     {ChatID: "clean"},
+		},
+	}
+	if got, want := dockerRealDataNewPollRecoveryChats(before, after, corpus), []string{"new"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("new recovery chats = %v, want %v", got, want)
+	}
 }
 
 func TestDockerRealDataReplayCorpusAuditsEveryQueuedRow(t *testing.T) {
@@ -1438,6 +1654,7 @@ type dockerRealDataGraphServer struct {
 	unknownPath               []string
 	postAttempts              map[string]int
 	acceptedPostKeys          map[string]int
+	messagePostOutboxAttempts map[string]int
 	pollServedMessageIDs      map[string]int
 	pollServedMessageRequests map[string][]string
 	providerTokens            map[string]dockerRealDataProviderContinuation
@@ -1600,6 +1817,7 @@ func newDockerRealDataGraphServerAt(token string, user User, replay map[string][
 		knownChats:                knownChats,
 		postAttempts:              make(map[string]int),
 		acceptedPostKeys:          make(map[string]int),
+		messagePostOutboxAttempts: make(map[string]int),
 		pollServedMessageIDs:      make(map[string]int),
 		pollServedMessageRequests: make(map[string][]string),
 		providerTokens:            make(map[string]dockerRealDataProviderContinuation),
@@ -1768,7 +1986,15 @@ func dockerRealDataAllowsGracefulAdmissionBoundary(mode string) bool {
 	return mode == dockerRealDataModeThroughput
 }
 
-func dockerRealDataExpectedPhaseErrorBudget(phaseName string, unknownFaultEnabled bool, unknownPosts, unknownPostRepeats, unknownPostMismatches int64) uint64 {
+func dockerRealDataExpectedPhaseErrorBudget(phaseName string, unknownFaultEnabled bool, unknownPosts, unknownPostRepeats, unknownPostMismatches int64, resumeAmbiguousWitness bool) uint64 {
+	if resumeAmbiguousWitness && phaseName == "outbox" && unknownPosts == 0 && unknownPostRepeats == 0 && unknownPostMismatches == 0 {
+		// A resumed disposable process deliberately retains the previous
+		// process's ambiguous outbox row.  Its marker-only recovery is allowed to
+		// report one durable deferral, but it must never issue another POST.  This
+		// budget is scoped to that one known witness and to the outbox phase;
+		// all other phase errors remain failures below.
+		return 1
+	}
 	if !unknownFaultEnabled || phaseName != "outbox" || unknownPosts != 1 || unknownPostRepeats != 0 || unknownPostMismatches != 0 {
 		return 0
 	}
@@ -1776,6 +2002,11 @@ func dockerRealDataExpectedPhaseErrorBudget(phaseName string, unknownFaultEnable
 	// an EOF/unknown outcome. That error is expected only when the durable row is
 	// fenced; every additional outbox error remains a test failure.
 	return 1
+}
+
+func dockerRealDataIntentionalTeardownPhaseCancellation(stats mainLoopPhaseStats, gracefulStop time.Time) bool {
+	return !gracefulStop.IsZero() && stats.LastFinishedAt.After(gracefulStop) &&
+		(strings.Contains(stats.LastError, "context canceled") || strings.Contains(stats.LastError, "context deadline exceeded"))
 }
 
 func dockerRealDataExpiredProviderTokens(server *dockerRealDataGraphServer, state teamstore.State) int {
@@ -1830,6 +2061,71 @@ func dockerRealDataExpiredProviderTokens(server *dockerRealDataGraphServer, stat
 		}
 	}
 	return len(seen)
+}
+
+// dockerRealDataExpiredProviderTokensFromSQLite covers the outbox recovery
+// lane, which is intentionally omitted from PollStateSnapshot so production
+// startup/admission does not decode the unbounded outbox JSON. A real-data
+// Docker fixture must nevertheless model those copied opaque cursors as
+// expired provider state; otherwise the fake Graph turns an expected
+// recoverable 410 into an artificial unknown-token 400 and the experiment
+// measures a fixture omission instead of the listener's recovery behavior.
+// This helper reads only the scalar recovery path and never materializes the
+// outbox rows or writes the database.
+func dockerRealDataExpiredProviderTokensFromSQLite(ctx context.Context, server *dockerRealDataGraphServer, dbPath string) (int, error) {
+	if server == nil || strings.TrimSpace(dbPath) == "" {
+		return 0, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	query := url.Values{}
+	query.Set("mode", "ro")
+	db, err := sql.Open("sqlite", teamsSQLiteFileURI(dbPath, query))
+	if err != nil {
+		return 0, err
+	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	defer db.Close()
+	rows, err := db.QueryContext(ctx, `SELECT json_extract(json, '$.graph_recovery_next_path')
+FROM outbox_messages
+WHERE json_valid(json)
+  AND trim(COALESCE(json_extract(json, '$.graph_recovery_next_path'), '')) <> ''`)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	seen := make(map[string]struct{})
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return 0, err
+		}
+		variants := dockerRealDataProviderTokenVariants(path)
+		if len(variants) == 0 {
+			continue
+		}
+		canonical := variants[0]
+		for _, variant := range variants {
+			if !strings.Contains(variant, "%") {
+				canonical = variant
+				break
+			}
+		}
+		if canonical != "" {
+			seen[canonical] = struct{}{}
+		}
+		for _, variant := range variants {
+			for _, alias := range dockerRealDataProviderTokenAliases(variant) {
+				server.setExpiredProviderContinuation(alias)
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	return len(seen), nil
 }
 
 // dockerRealDataExpiredProviderContinuationChats returns copied, active work
@@ -2013,8 +2309,11 @@ func TestDockerRealDataAllowsGracefulAdmissionBoundary(t *testing.T) {
 }
 
 func TestDockerRealDataExpectedPhaseErrorBudget(t *testing.T) {
-	if got := dockerRealDataExpectedPhaseErrorBudget("outbox", true, 1, 0, 0); got != 1 {
+	if got := dockerRealDataExpectedPhaseErrorBudget("outbox", true, 1, 0, 0, false); got != 1 {
 		t.Fatalf("unknown POST budget = %d, want 1", got)
+	}
+	if got := dockerRealDataExpectedPhaseErrorBudget("outbox", false, 0, 0, 0, true); got != 1 {
+		t.Fatalf("resumed ambiguous witness budget = %d, want 1", got)
 	}
 	for _, test := range []struct {
 		name       string
@@ -2023,18 +2322,44 @@ func TestDockerRealDataExpectedPhaseErrorBudget(t *testing.T) {
 		posts      int64
 		repeats    int64
 		mismatches int64
+		resume     bool
 	}{
 		{name: "disabled", phase: "outbox", enabled: false, posts: 1},
 		{name: "wrong phase", phase: "poll", enabled: true, posts: 1},
 		{name: "repeat", phase: "outbox", enabled: true, posts: 1, repeats: 1},
 		{name: "mismatch", phase: "outbox", enabled: true, posts: 1, mismatches: 1},
 		{name: "multiple posts", phase: "outbox", enabled: true, posts: 2},
+		{name: "resume witness wrong phase", phase: "poll", resume: true},
+		{name: "resume witness with replay", phase: "outbox", resume: true, posts: 1},
+		{name: "resume witness repeated", phase: "outbox", resume: true, repeats: 1},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			if got := dockerRealDataExpectedPhaseErrorBudget(test.phase, test.enabled, test.posts, test.repeats, test.mismatches); got != 0 {
+			if got := dockerRealDataExpectedPhaseErrorBudget(test.phase, test.enabled, test.posts, test.repeats, test.mismatches, test.resume); got != 0 {
 				t.Fatalf("unexpected phase error budget = %d, want 0", got)
 			}
 		})
+	}
+}
+
+func TestDockerRealDataIntentionalTeardownPhaseCancellation(t *testing.T) {
+	stop := time.Unix(100, 0)
+	if !dockerRealDataIntentionalTeardownPhaseCancellation(mainLoopPhaseStats{
+		LastFinishedAt: stop.Add(time.Second),
+		LastError:      "context canceled",
+	}, stop) {
+		t.Fatal("teardown context cancellation was not recognized")
+	}
+	if dockerRealDataIntentionalTeardownPhaseCancellation(mainLoopPhaseStats{
+		LastFinishedAt: stop.Add(time.Second),
+		LastError:      "SQLite busy",
+	}, stop) {
+		t.Fatal("non-cancellation teardown error was misclassified")
+	}
+	if dockerRealDataIntentionalTeardownPhaseCancellation(mainLoopPhaseStats{
+		LastFinishedAt: stop.Add(-time.Second),
+		LastError:      "context canceled",
+	}, stop) {
+		t.Fatal("workload cancellation before graceful stop was misclassified")
 	}
 }
 
@@ -2054,6 +2379,49 @@ func TestDockerRealDataExpiredProviderTokensIncludesOutboxRecoveryPath(t *testin
 	var expiredErr dockerRealDataExpiredContinuationError
 	if _, err := server.skipOffset("chat", values, 20); !errors.As(err, &expiredErr) {
 		t.Fatalf("outbox historical provider token error = %v, want expired continuation", err)
+	}
+}
+
+func TestDockerRealDataExpiredProviderTokensFromSQLiteReadsScalarRecoveryPath(t *testing.T) {
+	ctx := context.Background()
+	statePath := filepath.Join(t.TempDir(), "state", "state.json")
+	store, err := teamstore.Open(statePath)
+	if err != nil {
+		t.Fatalf("open outbox recovery fixture store: %v", err)
+	}
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.OutboxMessages["outbox:scalar-recovery"] = teamstore.OutboxMessage{
+			ID:                    "outbox:scalar-recovery",
+			TeamsChatID:           "scalar-recovery-chat",
+			GraphRecoveryNextPath: "/chats/scalar-recovery-chat/messages?$top=20&$skiptoken=" + url.QueryEscape("Source=MessagingFrontEnd##ContinuationToken=scalar-recovery"),
+			Status:                teamstore.OutboxStatusSending,
+		}
+		return nil
+	}); err != nil {
+		_ = store.Close()
+		t.Fatalf("seed scalar outbox recovery path: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		_ = store.Close()
+		t.Fatalf("migrate scalar outbox recovery fixture: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close scalar outbox recovery fixture: %v", err)
+	}
+
+	server := newDockerRealDataGraphServer("docker-token", User{}, nil)
+	count, err := dockerRealDataExpiredProviderTokensFromSQLite(ctx, server, filepath.Join(filepath.Dir(statePath), teamstore.SQLiteFileName))
+	if err != nil {
+		t.Fatalf("read scalar outbox recovery path: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("scalar outbox recovery token count = %d, want 1", count)
+	}
+	values := url.Values{}
+	values.Set("$skiptoken", "Source=MessagingFrontEnd##ContinuationToken=scalar-recovery")
+	var expiredErr dockerRealDataExpiredContinuationError
+	if _, err := server.skipOffset("scalar-recovery-chat", values, 20); !errors.As(err, &expiredErr) {
+		t.Fatalf("scalar outbox recovery token = %v, want expired continuation", err)
 	}
 }
 
@@ -2801,6 +3169,28 @@ func (g *dockerRealDataGraphServer) unknownPostAcceptedAttempts() int {
 	return g.acceptedPostKeys[g.unknownPostKey]
 }
 
+// duplicateMessagePostOutboxIDs returns durable outbox identities that crossed
+// the fake Graph POST boundary more than once. Re-reading a poll page is safe
+// when inbound admission is idempotent, but replaying the same durable outbox
+// operation would create a duplicate Teams message. Keep this assertion
+// separate from the inbound/turn correlation audit so a test cannot pass just
+// because the duplicate POST happened before the second inbound was persisted.
+func (g *dockerRealDataGraphServer) duplicateMessagePostOutboxIDs() []string {
+	if g == nil {
+		return nil
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	duplicates := make([]string, 0)
+	for outboxID, count := range g.messagePostOutboxAttempts {
+		if strings.TrimSpace(outboxID) != "" && count > 1 {
+			duplicates = append(duplicates, outboxID)
+		}
+	}
+	sort.Strings(duplicates)
+	return duplicates
+}
+
 func (g *dockerRealDataGraphServer) opaqueContinuationCount() int64 {
 	if g == nil {
 		return 0
@@ -3285,6 +3675,14 @@ func (g *dockerRealDataGraphServer) ServeHTTP(w http.ResponseWriter, req *http.R
 			if consumeOperation429() {
 				return
 			}
+			if outboxID := dockerRealDataPostPayloadOutboxID(rawPayload); outboxID != "" {
+				g.mu.Lock()
+				if g.messagePostOutboxAttempts == nil {
+					g.messagePostOutboxAttempts = make(map[string]int)
+				}
+				g.messagePostOutboxAttempts[outboxID]++
+				g.mu.Unlock()
+			}
 			// On a resumed Docker process the prior fake Graph may already have
 			// accepted this exact outbox operation before its response was lost.
 			// Keep that witness across the process boundary: a buggy sender that
@@ -3437,10 +3835,18 @@ type dockerRealDataCounts struct {
 }
 
 type dockerRealDataSyntheticTurnObservation struct {
-	ID        string
-	InboundID string
-	Status    teamstore.TurnStatus
-	UpdatedAt time.Time
+	ID              string
+	InboundID       string
+	SessionID       string
+	Status          teamstore.TurnStatus
+	MachineID       string
+	LeaseGeneration int64
+	RecoveryReason  string
+	CodexThreadID   string
+	CodexTurnID     string
+	QueuedAt        time.Time
+	StartedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 func dockerRealDataTurnIsNonTerminal(status teamstore.TurnStatus) bool {
@@ -3502,10 +3908,18 @@ func dockerRealDataSyntheticTurnSnapshot(ctx context.Context, path string) (map[
 			return nil, fmt.Errorf("synthetic turn snapshot identity mismatch: sql=%q json=%q", rowID, turn.ID)
 		}
 		observations[rowID] = dockerRealDataSyntheticTurnObservation{
-			ID:        rowID,
-			InboundID: strings.TrimSpace(inboundID.String),
-			Status:    teamstore.TurnStatus(strings.TrimSpace(status)),
-			UpdatedAt: turn.UpdatedAt,
+			ID:              rowID,
+			InboundID:       strings.TrimSpace(inboundID.String),
+			SessionID:       strings.TrimSpace(turn.SessionID),
+			Status:          teamstore.TurnStatus(strings.TrimSpace(status)),
+			MachineID:       strings.TrimSpace(turn.MachineID),
+			LeaseGeneration: turn.LeaseGeneration,
+			RecoveryReason:  strings.TrimSpace(turn.RecoveryReason),
+			CodexThreadID:   strings.TrimSpace(turn.CodexThreadID),
+			CodexTurnID:     strings.TrimSpace(turn.CodexTurnID),
+			QueuedAt:        turn.QueuedAt,
+			StartedAt:       turn.StartedAt,
+			UpdatedAt:       turn.UpdatedAt,
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -3752,6 +4166,61 @@ func dockerRealDataPollHasRecovery(poll teamstore.ChatPollState) bool {
 		poll.PendingPage != nil ||
 		(poll.Gap != nil && strings.TrimSpace(poll.Gap.HeadProbeContinuationPath) != "") ||
 		(poll.Gap != nil && !(poll.Gap.HeadProbePending && strings.TrimSpace(poll.Gap.RecoveryPath) == ""))
+}
+
+// dockerRealDataPollHasRecoveryBoundary identifies a durable recovery domain,
+// including a dormant gap whose next action is only a periodic head probe. A
+// copied production chat can legitimately move between dormant and actionable
+// states during the experiment; that transition is inherited history, not a
+// newly created blocker. A completely clean chat acquiring any gap/receipt is
+// still a synthetic regression.
+func dockerRealDataPollHasRecoveryBoundary(poll teamstore.ChatPollState) bool {
+	return poll.RecoveryRequired || poll.Attempt != nil ||
+		strings.TrimSpace(poll.ContinuationPath) != "" ||
+		strings.TrimSpace(poll.DeferredContinuationPath) != "" ||
+		poll.PendingPage != nil || poll.Gap != nil
+}
+
+func dockerRealDataPollRecoveryChats(state teamstore.State, corpus map[string][]ChatMessage) []string {
+	chatIDs := make([]string, 0)
+	for chatID := range corpus {
+		chatID = strings.TrimSpace(chatID)
+		if chatID == "" {
+			continue
+		}
+		poll, found := state.ChatPolls[chatID]
+		if found && dockerRealDataPollHasRecovery(poll) {
+			chatIDs = append(chatIDs, chatID)
+		}
+	}
+	sort.Strings(chatIDs)
+	return chatIDs
+}
+
+// dockerRealDataNewPollRecoveryChats returns only recovery states introduced
+// by the disposable experiment. A copied production database may already have
+// a bounded continuation/head-probe recovery lane; that inherited state is
+// evidence about the source environment, but it is not synthetic work left by
+// the representative-message drain. New recovery on a previously clean chat
+// remains a hard complete-mode failure.
+func dockerRealDataNewPollRecoveryChats(before, after teamstore.State, corpus map[string][]ChatMessage) []string {
+	newRecovery := make([]string, 0)
+	for chatID := range corpus {
+		chatID = strings.TrimSpace(chatID)
+		if chatID == "" {
+			continue
+		}
+		afterPoll, foundAfterPoll := after.ChatPolls[chatID]
+		if !foundAfterPoll || !dockerRealDataPollHasRecoveryBoundary(afterPoll) {
+			continue
+		}
+		beforePoll, hadBeforePoll := before.ChatPolls[chatID]
+		if !hadBeforePoll || !dockerRealDataPollHasRecoveryBoundary(beforePoll) {
+			newRecovery = append(newRecovery, chatID)
+		}
+	}
+	sort.Strings(newRecovery)
+	return newRecovery
 }
 
 // dockerRealDataPostStateFromSQLite reconstructs only the synthetic rows that
@@ -4006,11 +4475,7 @@ func dockerRealDataSyntheticResiduals(state teamstore.State, corpus map[string][
 			}
 		}
 	}
-	for chatID := range corpus {
-		if poll, found := state.ChatPolls[strings.TrimSpace(chatID)]; found && dockerRealDataPollHasRecovery(poll) {
-			residual.PollRecovery++
-		}
-	}
+	residual.PollRecovery = len(dockerRealDataPollRecoveryChats(state, corpus))
 	return residual
 }
 
@@ -4020,6 +4485,112 @@ type dockerRealDataCorrelationAudit struct {
 	DuplicateTurn       int64
 	MissingMessageIDs   []string
 	DuplicateMessageIDs []string
+}
+
+// dockerRealDataChatDrainAudit closes the gap between a global message count
+// and an exhaustive chat proof.  A complete run must account for every
+// replayed message under the same TeamsChatID it came from; otherwise one
+// healthy chat could compensate for an omitted or misrouted chat elsewhere.
+type dockerRealDataChatDrainAudit struct {
+	ExpectedChats     int
+	ExpectedMessages  int
+	ServedMessages    int
+	InboundMessages   int
+	CompletedMessages int
+	Mismatches        []string
+}
+
+func auditDockerRealDataChatDrain(state teamstore.State, corpus map[string][]ChatMessage, served map[string]int) dockerRealDataChatDrainAudit {
+	audit := dockerRealDataChatDrainAudit{ExpectedChats: len(corpus)}
+	expectedChatByMessage := make(map[string]string)
+	expectedByChat := make(map[string]int, len(corpus))
+	for chatID, messages := range corpus {
+		chatID = strings.TrimSpace(chatID)
+		for _, message := range messages {
+			messageID := strings.TrimSpace(message.ID)
+			if messageID == "" {
+				continue
+			}
+			audit.ExpectedMessages++
+			expectedByChat[chatID]++
+			if prior, exists := expectedChatByMessage[messageID]; exists && prior != chatID {
+				audit.Mismatches = append(audit.Mismatches, fmt.Sprintf("message %q appears in chats %q and %q", messageID, prior, chatID))
+				continue
+			}
+			expectedChatByMessage[messageID] = chatID
+		}
+	}
+	servedByChat := make(map[string]int, len(corpus))
+	inboundByMessage := make(map[string]int)
+	completedByMessage := make(map[string]int)
+	inboundByChat := make(map[string]int, len(corpus))
+	completedByChat := make(map[string]int, len(corpus))
+	for messageID, chatID := range expectedChatByMessage {
+		if served[messageID] > 0 {
+			audit.ServedMessages++
+			servedByChat[chatID]++
+		}
+	}
+	for _, inbound := range state.InboundEvents {
+		messageID := strings.TrimSpace(inbound.TeamsMessageID)
+		chatID, expected := expectedChatByMessage[messageID]
+		if !strings.HasPrefix(messageID, dockerRealDataMessageIDPrefix) || !expected {
+			continue
+		}
+		inboundByMessage[messageID]++
+		audit.InboundMessages++
+		inboundByChat[chatID]++
+		if strings.TrimSpace(inbound.TeamsChatID) != chatID {
+			audit.Mismatches = append(audit.Mismatches, fmt.Sprintf("message %q durable chat=%q, expected chat=%q", messageID, strings.TrimSpace(inbound.TeamsChatID), chatID))
+		}
+		turn, found := state.Turns[strings.TrimSpace(inbound.TurnID)]
+		if found && turn.Status == teamstore.TurnStatusCompleted {
+			completedByMessage[messageID]++
+			completedByChat[chatID]++
+			audit.CompletedMessages++
+		}
+	}
+	for messageID, chatID := range expectedChatByMessage {
+		if served[messageID] <= 0 || inboundByMessage[messageID] != 1 || completedByMessage[messageID] != 1 {
+			audit.Mismatches = append(audit.Mismatches, fmt.Sprintf("message %q chat=%q served=%d inbound=%d completed=%d", messageID, chatID, served[messageID], inboundByMessage[messageID], completedByMessage[messageID]))
+		}
+	}
+	for chatID, expected := range expectedByChat {
+		if servedByChat[chatID] != expected || inboundByChat[chatID] != expected || completedByChat[chatID] != expected {
+			audit.Mismatches = append(audit.Mismatches, fmt.Sprintf("chat %q expected=%d served=%d inbound=%d completed=%d", chatID, expected, servedByChat[chatID], inboundByChat[chatID], completedByChat[chatID]))
+		}
+	}
+	if len(audit.Mismatches) > 32 {
+		audit.Mismatches = audit.Mismatches[:32]
+	}
+	return audit
+}
+
+func TestDockerRealDataChatDrainAudit(t *testing.T) {
+	corpus := map[string][]ChatMessage{
+		"chat-a": {{ID: "docker-real-data:a-1"}, {ID: "docker-real-data:a-2"}},
+		"chat-b": {{ID: "docker-real-data:b-1"}},
+	}
+	state := teamstore.State{
+		InboundEvents: map[string]teamstore.InboundEvent{
+			"in-a-1": {ID: "in-a-1", TeamsChatID: "chat-a", TeamsMessageID: "docker-real-data:a-1", TurnID: "turn-a-1"},
+			"in-a-2": {ID: "in-a-2", TeamsChatID: "chat-a", TeamsMessageID: "docker-real-data:a-2", TurnID: "turn-a-2"},
+			"in-b-1": {ID: "in-b-1", TeamsChatID: "chat-b", TeamsMessageID: "docker-real-data:b-1", TurnID: "turn-b-1"},
+		},
+		Turns: map[string]teamstore.Turn{
+			"turn-a-1": {ID: "turn-a-1", Status: teamstore.TurnStatusCompleted},
+			"turn-a-2": {ID: "turn-a-2", Status: teamstore.TurnStatusCompleted},
+			"turn-b-1": {ID: "turn-b-1", Status: teamstore.TurnStatusCompleted},
+		},
+	}
+	audit := auditDockerRealDataChatDrain(state, corpus, map[string]int{
+		"docker-real-data:a-1": 1,
+		"docker-real-data:a-2": 2,
+		"docker-real-data:b-1": 1,
+	})
+	if audit.ExpectedChats != 2 || audit.ExpectedMessages != 3 || audit.ServedMessages != 3 || audit.InboundMessages != 3 || audit.CompletedMessages != 3 || len(audit.Mismatches) != 0 {
+		t.Fatalf("chat drain audit = %#v, want all messages/chats closed without mismatch", audit)
+	}
 }
 
 // dockerRealDataDurableCorrelationAudit verifies the stronger invariant that
@@ -4317,6 +4888,32 @@ func dockerRealDataMode(t *testing.T) string {
 		t.Fatalf("invalid %s=%q; want %q or %q", dockerRealDataModeEnv, mode, dockerRealDataModeThroughput, dockerRealDataModeComplete)
 	}
 	return mode
+}
+
+func dockerRealDataChatCoverage(t *testing.T) bool {
+	t.Helper()
+	switch strings.TrimSpace(os.Getenv(dockerRealDataChatCoverageEnv)) {
+	case "", "0":
+		return false
+	case "1":
+		return true
+	default:
+		t.Fatalf("invalid %s=%q; want 0 or 1", dockerRealDataChatCoverageEnv, os.Getenv(dockerRealDataChatCoverageEnv))
+		return false
+	}
+}
+
+func dockerRealDataRequireAllLagging(t *testing.T) bool {
+	t.Helper()
+	switch strings.TrimSpace(os.Getenv(dockerRealDataRequireAllLaggingEnv)) {
+	case "", "0":
+		return false
+	case "1":
+		return true
+	default:
+		t.Fatalf("invalid %s=%q; want 0 or 1", dockerRealDataRequireAllLaggingEnv, os.Getenv(dockerRealDataRequireAllLaggingEnv))
+		return false
+	}
 }
 
 func dockerRealDataResume(t *testing.T) bool {
@@ -5479,6 +6076,18 @@ func TestDockerRealDataPostMarkerRequiresExactRenderedBody(t *testing.T) {
 	}
 }
 
+func TestDockerRealDataDuplicateMessagePostAudit(t *testing.T) {
+	server := newDockerRealDataGraphServer("token", User{}, nil)
+	server.mu.Lock()
+	server.messagePostOutboxAttempts["outbox:duplicate"] = 2
+	server.messagePostOutboxAttempts["outbox:single"] = 1
+	server.messagePostOutboxAttempts[""] = 9
+	server.mu.Unlock()
+	if got, want := server.duplicateMessagePostOutboxIDs(), []string{"outbox:duplicate"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("duplicate message POST outbox IDs = %v, want %v", got, want)
+	}
+}
+
 func TestDockerRealDataUnknownPostDispositionRejectsSkippedCompletion(t *testing.T) {
 	base := teamstore.OutboxMessage{Status: teamstore.OutboxStatusSkipped, TeamsChatID: "chat-disposition"}
 	for name, msg := range map[string]teamstore.OutboxMessage{
@@ -5641,8 +6250,22 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 		t.Skipf("set %s=1 to run the real-data Docker experiment", dockerRealDataExperimentEnv)
 	}
 	mode := dockerRealDataMode(t)
+	chatCoverage := dockerRealDataChatCoverage(t)
+	requireAllLagging := dockerRealDataRequireAllLagging(t)
 	resume := dockerRealDataResume(t)
+	if chatCoverage && mode != dockerRealDataModeComplete {
+		t.Fatalf("%s=1 requires %s=%q so every selected chat must close its durable representative message", dockerRealDataChatCoverageEnv, dockerRealDataModeEnv, dockerRealDataModeComplete)
+	}
+	if chatCoverage && resume {
+		t.Fatalf("%s=1 cannot be combined with %s=1; chat coverage must start from a fresh disposable runtime", dockerRealDataChatCoverageEnv, dockerRealDataResumeEnv)
+	}
 	rateLimitExperiment := os.Getenv(dockerRealData429ExperimentEnv) == "1"
+	if chatCoverage && rateLimitExperiment {
+		t.Fatalf("%s=1 cannot be combined with the 429 experiment; run the all-chat completion and rate-limit liveness gates separately", dockerRealDataChatCoverageEnv)
+	}
+	if requireAllLagging && mode != dockerRealDataModeComplete {
+		t.Fatalf("%s=1 requires %s=%q so every lagging message must reach a terminal durable state", dockerRealDataRequireAllLaggingEnv, dockerRealDataModeEnv, dockerRealDataModeComplete)
+	}
 	rateLimitScope := dockerRealData429Scope(t)
 	rateLimitAccountWide := dockerRealData429ScopeIsAccountWide(rateLimitScope)
 	rateLimitPollOnly := rateLimitExperiment && dockerRealData429PollOnly(t)
@@ -5745,6 +6368,11 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	}
 	registry.UserID = user.ID
 	registry.UserPrincipal = user.UserPrincipalName
+	laggingManifest := dockerRealDataQueuedWorkChatManifest(beforeState, beforeState.ControlChat.TeamsChatID)
+	t.Logf("real-data lagging work-chat manifest: queued_work_chats=%d active_session_chats=%d orphan_chats=%d orphan_ids=%v actionable_orphan_chats=%d actionable_orphan_ids=%v terminal_queued_provenance_chats=%d terminal_ids=%v", len(laggingManifest.AllChatIDs), len(laggingManifest.ActiveChatIDs), len(laggingManifest.OrphanChatIDs), laggingManifest.OrphanChatIDs, len(laggingManifest.ActionableOrphanChatIDs), laggingManifest.ActionableOrphanChatIDs, len(laggingManifest.TerminalQueuedChatIDs), laggingManifest.TerminalQueuedChatIDs)
+	if requireAllLagging && len(laggingManifest.ActionableOrphanChatIDs) != 0 {
+		t.Fatalf("exhaustive all-lagging proof found actionable queued work chats without an active durable session: orphan_chats=%v; refusing to call the active-session subset complete", laggingManifest.ActionableOrphanChatIDs)
+	}
 	var replayCorpus map[string][]ChatMessage
 	var replayCount int
 	var replayReport dockerRealDataReplayReport
@@ -5759,6 +6387,38 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 		}
 		if replayReport.Accepted != replayCount || replayReport.Accepted+replayReport.ExcludedMalformed+replayReport.ExcludedDashboard+replayReport.ExcludedEmptyTerminal+replayReport.ExcludedEmptyActionable+replayReport.ExcludedAttachments+replayReport.ExcludedHostedContent+replayReport.ExcludedControlChat+replayReport.ExcludedNoActiveChat != replayReport.QueuedTeams {
 			t.Fatalf("real-data replay source audit does not account for every queued Teams row: %+v", replayReport)
+		}
+		if requireAllLagging {
+			corpusChats := make(map[string]struct{}, len(replayCorpus))
+			for chatID := range replayCorpus {
+				corpusChats[strings.TrimSpace(chatID)] = struct{}{}
+			}
+			missingActionableChats := make([]string, 0)
+			terminalEmptyOnlyChats := make([]string, 0)
+			for _, chatID := range laggingManifest.ActiveChatIDs {
+				if _, found := corpusChats[strings.TrimSpace(chatID)]; !found {
+					if dockerRealDataChatOnlyTerminalEmptyQueuedRows(beforeState, chatID) {
+						terminalEmptyOnlyChats = append(terminalEmptyOnlyChats, chatID)
+					} else {
+						missingActionableChats = append(missingActionableChats, chatID)
+					}
+				}
+			}
+			if len(terminalEmptyOnlyChats) != 0 {
+				t.Logf("real-data active chats with only empty terminal provenance excluded from ordinary replay: chats=%v", terminalEmptyOnlyChats)
+			}
+			if len(missingActionableChats) != 0 {
+				t.Fatalf("exhaustive all-lagging proof found active queued chats with no ordinary replay corpus: chats=%v report=%+v", missingActionableChats, replayReport)
+			}
+		}
+		if chatCoverage {
+			sourceChats, sourceMessages := len(replayCorpus), replayCount
+			replayCorpus = dockerRealDataOneMessagePerChat(replayCorpus)
+			replayCount = 0
+			for _, messages := range replayCorpus {
+				replayCount += len(messages)
+			}
+			t.Logf("real-data all-chat coverage corpus: source chats=%d source queued messages=%d selected chats=%d representative messages=%d", sourceChats, sourceMessages, len(replayCorpus), replayCount)
 		}
 		writeDockerRealDataReplayCorpus(t, statePath, replayCorpus)
 	}
@@ -5867,7 +6527,12 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	graphServerState.setKnownChats(knownChats...)
 	expiredProviderChats := dockerRealDataExpiredProviderContinuationChats(beforeState, beforeState.ControlChat.TeamsChatID)
 	expiredProviderTokens := dockerRealDataExpiredProviderTokens(graphServerState, beforeState)
-	t.Logf("real-data persisted provider continuations marked expired in isolated Graph: %d; executable active work chats with opaque next requests=%d; arbitrary opaque tokens remain invalid", expiredProviderTokens, len(expiredProviderChats))
+	expiredOutboxProviderTokens, expiredOutboxErr := dockerRealDataExpiredProviderTokensFromSQLite(ctx, graphServerState, filepath.Join(filepath.Dir(statePath), teamstore.SQLiteFileName))
+	if expiredOutboxErr != nil {
+		t.Fatalf("read copied outbox provider recovery cursors: %v", expiredOutboxErr)
+	}
+	expiredProviderTokens += expiredOutboxProviderTokens
+	t.Logf("real-data persisted provider continuations marked expired in isolated Graph: chat_poll=%d outbox_recovery=%d total=%d; executable active work chats with opaque next requests=%d; arbitrary opaque tokens remain invalid", expiredProviderTokens-expiredOutboxProviderTokens, expiredOutboxProviderTokens, expiredProviderTokens, len(expiredProviderChats))
 	if len(expiredProviderChats) > 0 {
 		// The copied production schedule can contain many due chats and the
 		// listener intentionally admits only a bounded quantum. Move one actual
@@ -6673,6 +7338,23 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	afterState.HistoryWatch = afterHistoryState.HistoryWatch
 	afterState.HistoryWatchReady = afterHistoryState.HistoryWatchReady
 	residuals := dockerRealDataSyntheticResiduals(afterState, replayCorpus)
+	if chatCoverage {
+		beforeRecoveryChats := dockerRealDataPollRecoveryChats(beforeState, replayCorpus)
+		afterRecoveryChats := dockerRealDataPollRecoveryChats(afterState, replayCorpus)
+		newRecoveryChats := dockerRealDataNewPollRecoveryChats(beforeState, afterState, replayCorpus)
+		baselineRecoveryBoundaries := 0
+		for chatID := range replayCorpus {
+			if poll, found := beforeState.ChatPolls[strings.TrimSpace(chatID)]; found && dockerRealDataPollHasRecoveryBoundary(poll) {
+				baselineRecoveryBoundaries++
+			}
+		}
+		// The copied source may already contain a bounded recovery lane. Do not
+		// call that inherited source condition synthetic unfinished work, but do
+		// fail if this run creates recovery for a previously clean representative
+		// chat.
+		residuals.PollRecovery = len(newRecoveryChats)
+		t.Logf("real-data chat-coverage poll recovery audit: active_before=%d active_after=%d baseline_recovery_boundaries=%d new_clean_chat_recovery=%d new_chats=%v", len(beforeRecoveryChats), len(afterRecoveryChats), baselineRecoveryBoundaries, len(newRecoveryChats), newRecoveryChats)
+	}
 	if mode == dockerRealDataModeComplete && residuals != (dockerRealDataResiduals{}) {
 		t.Fatalf("complete real-data drain left synthetic durable work: %+v", residuals)
 	}
@@ -6705,6 +7387,11 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	unknown := graphServerState.unknownPaths()
 	servedMessages := graphServerState.servedMessages()
 	servedMessageRequests := graphServerState.servedMessageRequests()
+	chatDrainAudit := auditDockerRealDataChatDrain(afterState, replayCorpus, servedMessages)
+	t.Logf("real-data per-chat drain audit: expected_chats=%d expected_messages=%d served_messages=%d inbound_messages=%d completed_messages=%d mismatches=%v", chatDrainAudit.ExpectedChats, chatDrainAudit.ExpectedMessages, chatDrainAudit.ServedMessages, chatDrainAudit.InboundMessages, chatDrainAudit.CompletedMessages, chatDrainAudit.Mismatches)
+	if (mode == dockerRealDataModeComplete || requireAllLagging) && len(chatDrainAudit.Mismatches) != 0 {
+		t.Fatalf("complete real-data drain did not close every replay message in its source chat: audit=%#v", chatDrainAudit)
+	}
 	persistedSyntheticIDs, err := dockerRealDataSyntheticInboundIDs(postCtx, filepath.Join(filepath.Dir(statePath), teamstore.SQLiteFileName))
 	if err != nil {
 		t.Fatalf("read Graph-served synthetic inbound IDs: %v", err)
@@ -6923,6 +7610,9 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	if graphServerState.unknownPostMismatches.Load() != 0 {
 		t.Fatalf("fake Graph observed unknown-POST witness payload mismatches: %d", graphServerState.unknownPostMismatches.Load())
 	}
+	if duplicateOutboxIDs := graphServerState.duplicateMessagePostOutboxIDs(); len(duplicateOutboxIDs) > 0 {
+		t.Fatalf("fake Graph observed duplicate message POSTs for durable outbox IDs: %v", duplicateOutboxIDs)
+	}
 
 	// This is a liveness/measurement experiment, not a fixed-rate benchmark.
 	// The copied corpus must still contain at least dockerRealDataMinimumReplay
@@ -7081,7 +7771,26 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 		sort.Strings(staleBoundaryIDs)
 		sort.Strings(currentBoundaryIDs)
 		if len(staleBoundaryIDs) > 0 {
-			t.Fatalf("real-data restart left queued/running synthetic turn boundaries from before the current process: ids=%v before=%#v after=%#v", staleBoundaryIDs, latestBeforeTurns, finalTurns)
+			beforeStatuses := make([]string, 0, len(staleBoundaryIDs))
+			afterStatuses := make([]string, 0, len(staleBoundaryIDs))
+			beforeDetails := make([]string, 0, len(staleBoundaryIDs))
+			afterDetails := make([]string, 0, len(staleBoundaryIDs))
+			for _, turnID := range staleBoundaryIDs {
+				before := latestBeforeTurns[turnID]
+				after, found := finalTurns[turnID]
+				beforeStatuses = append(beforeStatuses, fmt.Sprintf("%s:%s", turnID, before.Status))
+				beforeDetails = append(beforeDetails, fmt.Sprintf("%s{session=%s status=%s machine=%s gen=%d reason=%q thread=%s codex=%s queued=%s started=%s updated=%s}", turnID, before.SessionID, before.Status, before.MachineID, before.LeaseGeneration, before.RecoveryReason, before.CodexThreadID, before.CodexTurnID, before.QueuedAt.Format(time.RFC3339Nano), before.StartedAt.Format(time.RFC3339Nano), before.UpdatedAt.Format(time.RFC3339Nano)))
+				if found {
+					afterStatuses = append(afterStatuses, fmt.Sprintf("%s:%s", turnID, after.Status))
+					afterDetails = append(afterDetails, fmt.Sprintf("%s{session=%s status=%s machine=%s gen=%d reason=%q thread=%s codex=%s queued=%s started=%s updated=%s}", turnID, after.SessionID, after.Status, after.MachineID, after.LeaseGeneration, after.RecoveryReason, after.CodexThreadID, after.CodexTurnID, after.QueuedAt.Format(time.RFC3339Nano), after.StartedAt.Format(time.RFC3339Nano), after.UpdatedAt.Format(time.RFC3339Nano)))
+				} else {
+					afterStatuses = append(afterStatuses, fmt.Sprintf("%s:<missing>", turnID))
+					afterDetails = append(afterDetails, fmt.Sprintf("%s{missing}", turnID))
+				}
+			}
+			t.Logf("real-data stale boundary details: before=%v after=%v", beforeDetails, afterDetails)
+			t.Logf("real-data stale boundary queued-turn trace: %s", dockerRealDataTraceSummary(traceWriter.queuedTurnsSnapshot()))
+			t.Fatalf("real-data restart left queued/running synthetic turn boundaries from before the current process: ids=%v before_statuses=%v after_statuses=%v before_count=%d after_count=%d", staleBoundaryIDs, beforeStatuses, afterStatuses, len(latestBeforeTurns), len(finalTurns))
 		}
 		if len(currentBoundaryIDs) > 0 {
 			if !allowGracefulAdmissionBoundary {
@@ -7151,7 +7860,11 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 		}
 	}
 	t.Logf("real-data pagination coverage: observed_paginated_chats=%d durable_nextlink_witnesses=%d large_replay_chats=%d unobserved_large_replay_chats=%d", observedPaginatedChats, durablePaginationWitnesses, largeReplayChats, unobservedLargeReplayChats)
-	if requireGraphWork && !rateLimitExperiment && observedPaginatedChats == 0 {
+	// Chat-coverage mode intentionally reduces the real backlog to one
+	// representative message per chat. It therefore cannot contain a
+	// multi-page corpus by construction; the dedicated throughput/all-data mode
+	// keeps the full queue and owns this pagination assertion.
+	if requireGraphWork && !rateLimitExperiment && !chatCoverage && observedPaginatedChats == 0 {
 		t.Fatalf("real-data listener observed no multi-page chat or durable nextLink; pagination_witness=%q pages=%d next_links=%d messages=%d large_replay_chats=%d unobserved_large_replay_chats=%d", paginationWitness, graphServerState.listPageCount(paginationWitness), graphServerState.nextLinkCount(paginationWitness), len(replayCorpus[paginationWitness]), largeReplayChats, unobservedLargeReplayChats)
 	}
 	if rateLimitExperiment {
@@ -7248,7 +7961,8 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	}
 	for phaseName, stats := range phaseStatsByName {
 		allow429PollErrors := rateLimitExperiment && phaseName == "poll"
-		expectedPhaseErrors := dockerRealDataExpectedPhaseErrorBudget(phaseName, unknownFaultEnabled, graphServerState.unknownPosts.Load(), graphServerState.unknownPostRepeats.Load(), graphServerState.unknownPostMismatches.Load())
+		resumeAmbiguousWitness := resume && resumeWitnessOutboxID != "" && graphServerState.durableUnknownPostWitness
+		expectedPhaseErrors := dockerRealDataExpectedPhaseErrorBudget(phaseName, unknownFaultEnabled, graphServerState.unknownPosts.Load(), graphServerState.unknownPostRepeats.Load(), graphServerState.unknownPostMismatches.Load(), resumeAmbiguousWitness)
 		startupErrors := startupPhaseErrors[phaseName]
 		if startupErrors > expectedPhaseErrors && !allow429PollErrors {
 			t.Fatalf("%s phase produced %d error(s) during startup/first cycle before the measured window (expected budget=%d): stats=%#v", phaseName, startupErrors, expectedPhaseErrors, stats)
@@ -7266,7 +7980,18 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 		beforeStop := phaseErrorsAtStop[phaseName]
 		atMeasureStart := phaseErrorsAtMeasureStart[phaseName]
 		measuredErrors := beforeStop - atMeasureStart
-		if measuredErrors > remainingExpectedPhaseErrors && !allow429PollErrors {
+		teardownCancellation := dockerRealDataIntentionalTeardownPhaseCancellation(stats, latestGracefulStop)
+		teardownErrorBudget := uint64(0)
+		if teardownCancellation && measuredErrors > 0 {
+			// The phase stats snapshot is taken at the measured timer boundary,
+			// while graceful teardown continues afterward. A phase that was
+			// already waiting on its child context can finish with the intentional
+			// cancellation before Listen returns, so it lands in measuredErrors
+			// even though it is not workload failure. Allow only that one final
+			// cancellation; any additional error remains fatal.
+			teardownErrorBudget = 1
+		}
+		if measuredErrors > remainingExpectedPhaseErrors+teardownErrorBudget && !allow429PollErrors {
 			t.Fatalf("%s phase produced an error during the measured listener window: start_errors=%d stop_errors=%d measured_errors=%d expected_remaining=%d stats=%#v", phaseName, atMeasureStart, beforeStop, measuredErrors, remainingExpectedPhaseErrors, stats)
 		}
 		if stats.Errors < beforeStop {
@@ -7274,10 +7999,11 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 		}
 		postStop := stats.Errors - beforeStop
 		if postStop == 0 {
+			if teardownErrorBudget != 0 && measuredErrors > remainingExpectedPhaseErrors {
+				t.Logf("%s phase cancellation observed during intentional Docker teardown before final listener snapshot: measured_errors=%d last_error=%q", phaseName, measuredErrors, stats.LastError)
+			}
 			continue
 		}
-		teardownCancellation := !latestGracefulStop.IsZero() && stats.LastFinishedAt.After(latestGracefulStop) &&
-			(strings.Contains(stats.LastError, "context canceled") || strings.Contains(stats.LastError, "context deadline exceeded"))
 		if !teardownCancellation {
 			t.Fatalf("%s phase produced a non-teardown error after the measured window: stop_errors=%d final_errors=%d stats=%#v graceful_stop=%s", phaseName, beforeStop, stats.Errors, stats, latestGracefulStop.Format(time.RFC3339Nano))
 		}

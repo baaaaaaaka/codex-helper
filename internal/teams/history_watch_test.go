@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
@@ -18,6 +19,41 @@ type historyWatchEventSourceStub struct {
 	prune     bool
 	dirty     []string
 	uncertain bool
+}
+
+func TestHistoryWatchSessionLookupCachesDiscoveryWithinBatch(t *testing.T) {
+	previousDiscover := discoverCodexProjectsForTeams
+	t.Cleanup(func() { discoverCodexProjectsForTeams = previousDiscover })
+	calls := 0
+	firstPath := filepath.Join(t.TempDir(), "first.jsonl")
+	secondPath := filepath.Join(t.TempDir(), "second.jsonl")
+	discoverCodexProjectsForTeams = func(context.Context, string) ([]codexhistory.Project, error) {
+		calls++
+		return []codexhistory.Project{{
+			Path: "/workspace",
+			Sessions: []codexhistory.Session{
+				{SessionID: "thread-first", FilePath: firstPath, ProjectPath: "/workspace"},
+				{SessionID: "thread-second", FilePath: secondPath, ProjectPath: "/workspace"},
+			},
+		}}, nil
+	}
+	bridge := &Bridge{scope: teamstore.ScopeIdentity{CodexHome: t.TempDir()}}
+	ctx := bridge.historyWatchSessionLookupContext(context.Background())
+	for _, item := range []struct {
+		path   string
+		thread string
+	}{
+		{path: firstPath, thread: "thread-first"},
+		{path: secondPath, thread: "thread-second"},
+	} {
+		local, project, ok, err := bridge.findHistoryWatchCodexSession(ctx, item.path, item.thread)
+		if err != nil || !ok || local.SessionID != item.thread || project.Path != "/workspace" {
+			t.Fatalf("lookup(%q, %q) = local=%#v project=%#v ok=%t err=%v", item.path, item.thread, local, project, ok, err)
+		}
+	}
+	if calls != 1 {
+		t.Fatalf("Codex discovery calls = %d, want one immutable batch snapshot", calls)
+	}
 }
 
 func (s *historyWatchEventSourceStub) Update(paths []string, prune bool) ([]string, bool, error) {
@@ -174,6 +210,15 @@ func TestHistoryWatchMandatoryRecoveryIncludesUnprovedAndRecoveryFlags(t *testin
 	}
 	if historyWatchCheckpointNeedsMandatoryMaintenance(teamstore.HistoryWatchCheckpoint{Path: "/sessions/clean.jsonl", Size: 100, Offset: 100, SourceFingerprint: "trusted"}) {
 		t.Fatal("trusted caught-up checkpoint was selected for mandatory maintenance")
+	}
+}
+
+func TestHistoryWatchPrioritizePathsPutsRecoveryBeforeColdTail(t *testing.T) {
+	paths := []string{"/history/cold-a.jsonl", "/history/recovery.jsonl", "/history/cold-b.jsonl"}
+	got := historyWatchPrioritizePaths(paths, []string{"/history/recovery.jsonl"}, []string{"/history/cold-b.jsonl"})
+	want := []string{"/history/recovery.jsonl", "/history/cold-b.jsonl", "/history/cold-a.jsonl"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("prioritized history paths = %#v, want %#v", got, want)
 	}
 }
 

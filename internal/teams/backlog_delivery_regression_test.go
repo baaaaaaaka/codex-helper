@@ -107,6 +107,30 @@ func TestTeamsOutboxPhaseSeparatesSafeDeferralFromFailure(t *testing.T) {
 	if stats.Errors != 1 || stats.Deferred != 1 {
 		t.Fatalf("mixed outbox deferral stats = %#v, want errors=1 deferred=1", stats)
 	}
+
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{name: "claim race", err: teamstore.ErrOutboxSendNotClaimed},
+		{name: "fifo proof race", err: teamstore.ErrOutboxPredecessorIndeterminate},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if !isOutboxDeliveryDeferred(test.err) {
+				t.Fatalf("%s error = %v, want safe outbox deferral", test.name, test.err)
+			}
+			bridge := &Bridge{}
+			if err := bridge.runMainLoopPhase(context.Background(), "outbox", func(context.Context) error {
+				return test.err
+			}); !errors.Is(err, test.err) {
+				t.Fatalf("%s phase error = %v, want %v", test.name, err, test.err)
+			}
+			stats := bridge.mainLoopPhaseStatsSnapshot("outbox")
+			if stats.Errors != 0 || stats.Deferred != 1 {
+				t.Fatalf("%s phase stats = %#v, want errors=0 deferred=1", test.name, stats)
+			}
+		})
+	}
 }
 
 func TestBoundedTeamsPhaseJobContextCutsWorkerBudgetFromPhaseDeadline(t *testing.T) {

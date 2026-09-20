@@ -78,16 +78,20 @@ const (
 	// A later row may observe a normal predecessor while another flush is
 	// finishing its send lease.  Keep FIFO ordering, but do not convert that
 	// short-lived in-process race into the general recovery backoff.
-	outboxActivePredecessorRetryBackoff     = time.Second
-	transcriptSourceProofCacheMaxEntries    = 256
-	historyWatchDeletedProbeInterval        = 5 * time.Minute
-	transcriptSyncMinInterval               = 10 * time.Second
-	transcriptDiscoveryMinInterval          = 5 * time.Minute
-	transcriptDiscoveryFailureMinInterval   = 30 * time.Second
-	historyWatchSyncMinInterval             = 10 * time.Second
-	historyWatchReconcileInterval           = 5 * time.Minute
-	historyWatchReconcileRetryInterval      = 30 * time.Second
-	historyWatchRecentDays                  = 3
+	outboxActivePredecessorRetryBackoff   = time.Second
+	transcriptSourceProofCacheMaxEntries  = 256
+	historyWatchDeletedProbeInterval      = 5 * time.Minute
+	transcriptSyncMinInterval             = 10 * time.Second
+	transcriptDiscoveryMinInterval        = 5 * time.Minute
+	transcriptDiscoveryFailureMinInterval = 30 * time.Second
+	historyWatchSyncMinInterval           = 10 * time.Second
+	historyWatchReconcileInterval         = 5 * time.Minute
+	historyWatchReconcileRetryInterval    = 30 * time.Second
+	historyWatchRecentDays                = 3
+	// A listener can be unhealthy for longer than the hot discovery window.
+	// Keep a separate bounded recovery window so a session created during that
+	// outage is not mistaken for pre-existing history and baselined at EOF.
+	historyWatchRecoveryDays                = 31
 	historyTieredMaxTailBytes               = 512 * 1024
 	helperAutoUpdateStateRefreshInterval    = time.Minute
 	pendingCodexUpgradeStateRefreshInterval = time.Minute
@@ -113,6 +117,10 @@ const (
 	// poll/owner budget.
 	maxBacklogHistoryRecoveryJobs = 4
 	maxBacklogLinkedRecoveryJobs  = 4
+	// Reconcile is a cold path, but it must still be bounded when a month of
+	// missed sessions is discovered at once. The durable discovery cursor keeps
+	// the remainder reachable on later cycles/restarts.
+	maxHistoryRecoveryDiscoveryJobs = 4
 	// Optional discovery is a fairness escape hatch, not a second backlog
 	// worker pool. Keep it to one cold job per fairness quantum so it cannot
 	// consume the same SQLite/phase budget as the live Teams lane. Mandatory
@@ -1016,13 +1024,18 @@ func (e *PersistentPollFailureError) Unwrap() error {
 }
 
 type Bridge struct {
-	graph                              *GraphClient
-	readGraph                          *GraphClient
-	fileGraph                          *GraphClient
-	httpClient                         *http.Client
-	registryPath                       string
-	reg                                Registry
-	regMu                              sync.Mutex
+	graph        *GraphClient
+	readGraph    *GraphClient
+	fileGraph    *GraphClient
+	httpClient   *http.Client
+	registryPath string
+	reg          Registry
+	regMu        sync.Mutex
+	// Local Codex session publication may create a Teams chat and update the
+	// in-memory registry. Keep that cold operation single-flight so concurrent
+	// history workers cannot allocate the same session ID or race the registry
+	// projection while the Graph/SQLite work is in flight.
+	codexSessionPublishMu              sync.Mutex
 	reasoningEffortMu                  sync.Mutex
 	modelProfileMu                     sync.Mutex
 	registryProjectionLastFingerprint  string
@@ -3478,10 +3491,26 @@ func (b *Bridge) restoreBacklogFairCursor(ctx context.Context, lane string, keys
 	cursor := backlogFairCursorValue(control, lane)
 	start := 0
 	if cursor != "" {
+		found := false
 		for index, key := range keys {
 			if strings.TrimSpace(key) == cursor {
 				start = (index + 1) % len(keys)
+				found = true
 				break
+			}
+		}
+		if !found {
+			// A completed candidate normally disappears from the next keyset.
+			// Starting at zero in that case can replay the lexical prefix after
+			// every batch and starve the remaining tail.  Choose the first key
+			// after the durable cursor, wrapping only when the cursor is beyond
+			// the current keyset.  The cursor remains a scheduling hint and does
+			// not authorize any durable write by itself.
+			for index, key := range keys {
+				if strings.TrimSpace(key) > cursor {
+					start = index
+					break
+				}
 			}
 		}
 	}
@@ -26993,7 +27022,16 @@ func deferIndeterminateOutboxFIFO(chatID string, err error) error {
 
 func isOutboxDeliveryDeferred(err error) bool {
 	var deferred outboxDeliveryDeferredError
-	return errors.As(err, &deferred) || isGraphRateLimitError(err)
+	// A claim/FIFO race is a local, fail-closed retry boundary: the row was
+	// either changed by another owner-bound path or could not be proven to be
+	// behind the same FIFO snapshot. Neither condition authorizes another
+	// Graph POST. Treat these sentinels like the typed deferral so the main loop
+	// records safe waiting instead of a phase failure; the next cycle will
+	// reread the canonical row and re-establish a fresh proof.
+	return errors.As(err, &deferred) ||
+		isGraphRateLimitError(err) ||
+		errors.Is(err, teamstore.ErrOutboxSendNotClaimed) ||
+		errors.Is(err, teamstore.ErrOutboxPredecessorIndeterminate)
 }
 
 func suppressOutboxDeliveryDeferrals(err error) error {
@@ -28313,7 +28351,14 @@ type publishCodexSessionOptions struct {
 }
 
 func (b *Bridge) publishCodexSessionLocalWithOptions(ctx context.Context, local codexhistory.Session, project codexhistory.Project, opts publishCodexSessionOptions) (string, error) {
-	if existing := b.reg.SessionByCodexThreadID(local.SessionID); existing != nil && isActiveSessionStatus(existing.Status) {
+	b.codexSessionPublishMu.Lock()
+	defer b.codexSessionPublishMu.Unlock()
+	return b.publishCodexSessionLocalWithOptionsLocked(ctx, local, project, opts)
+}
+
+func (b *Bridge) publishCodexSessionLocalWithOptionsLocked(ctx context.Context, local codexhistory.Session, project codexhistory.Project, opts publishCodexSessionOptions) (string, error) {
+	registry := b.registrySnapshot()
+	if existing := registry.SessionByCodexThreadID(local.SessionID); existing != nil && isActiveSessionStatus(existing.Status) {
 		if err := b.ensureDurableSession(ctx, existing); err != nil {
 			return "", err
 		}
@@ -28389,7 +28434,7 @@ func (b *Bridge) publishCodexSessionLocalWithOptions(ctx context.Context, local 
 		}
 		return fmt.Sprintf("Already published as %s: %s\n\n%s%s Open this Teams work chat and send a message there to continue.", existing.ID, existing.ChatURL, importStatus, publishedSessionResumeStatus(resumed)), nil
 	}
-	newSessionID := b.reg.NextSessionID()
+	newSessionID := registry.NextSessionID()
 	title := WorkChatTitle(ChatTitleOptions{
 		MachineLabel: firstNonEmptyString(b.machine.Label, machineLabel()),
 		Profile:      b.scope.Profile,
@@ -28426,7 +28471,9 @@ func (b *Bridge) publishCodexSessionLocalWithOptions(ctx context.Context, local 
 		CreatedAt:             now,
 		UpdatedAt:             now,
 	}
+	b.regMu.Lock()
 	b.reg.Sessions = append(b.reg.Sessions, session)
+	b.regMu.Unlock()
 	b.markRegistryProjectionDirty()
 	if err := b.ensureDurableSession(ctx, &session); err != nil {
 		return "", err
@@ -29238,15 +29285,43 @@ func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Ses
 	if filePath == "" {
 		return transcriptImportResult{Complete: true}, nil
 	}
-	state, err := b.store.Load(ctx)
-	if err != nil {
-		return transcriptImportResult{}, err
-	}
 	if checkpointID == "" {
 		checkpointID = transcriptCheckpointID(session.ID)
 	}
+	// Automatic history discovery only needs the selected import checkpoint.
+	// Loading the complete compatibility State here makes one newly discovered
+	// JSONL pay for every inbound/turn/outbox row in the scope; on a production
+	// backlog that can be gigabytes of JSON and can starve the actual history
+	// worker. Explicit publish-history still loads the full state below because
+	// its source-disposition/dedupe policy intentionally examines the complete
+	// durable ledger. The SQLite checkpoint projection is the narrow, native
+	// path for the automatic lane and retains the same checkpoint CAS later.
+	var state teamstore.State
+	var checkpoint teamstore.ImportCheckpoint
+	var err error
+	loadCheckpoint := func() error {
+		var found bool
+		checkpoint, found, err = b.store.ImportCheckpoint(ctx, checkpointID)
+		if err != nil {
+			return err
+		}
+		if !found {
+			checkpoint = teamstore.ImportCheckpoint{}
+		}
+		return nil
+	}
+	if transcriptImportRunAllowsAmbiguous(importTurnID, "") {
+		state, err = b.store.Load(ctx)
+		if err == nil {
+			checkpoint = state.ImportCheckpoints[checkpointID]
+		}
+	} else {
+		err = loadCheckpoint()
+	}
+	if err != nil {
+		return transcriptImportResult{}, err
+	}
 	var transcript Transcript
-	checkpoint := state.ImportCheckpoints[checkpointID]
 	allowAmbiguousImport := transcriptImportRunAllowsAmbiguous(importTurnID, "")
 	if !allowAmbiguousImport && checkpoint.SourceRewriteBlocked {
 		if rebased, err := b.rebaseLinkedTranscriptSourceRewrite(ctx, session, codexhistory.Session{
@@ -29255,11 +29330,17 @@ func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Ses
 		}, checkpoint); err != nil {
 			return transcriptImportResult{}, err
 		} else if rebased {
-			state, err = b.store.Load(ctx)
+			if allowAmbiguousImport {
+				state, err = b.store.Load(ctx)
+				if err == nil {
+					checkpoint = state.ImportCheckpoints[checkpointID]
+				}
+			} else {
+				err = loadCheckpoint()
+			}
 			if err != nil {
 				return transcriptImportResult{}, err
 			}
-			checkpoint = state.ImportCheckpoints[checkpointID]
 		} else {
 			return transcriptImportResult{}, errTranscriptAutomaticSourceProofUnavailable
 		}
@@ -29344,11 +29425,17 @@ func (b *Bridge) importTranscriptRecordsToTeams(ctx context.Context, session Ses
 			if !recovered {
 				return transcriptImportResult{}, errTranscriptCheckpointNotFound
 			}
-			state, err = b.store.Load(ctx)
+			if allowAmbiguousImport {
+				state, err = b.store.Load(ctx)
+				if err == nil {
+					checkpoint = state.ImportCheckpoints[checkpointID]
+				}
+			} else {
+				err = loadCheckpoint()
+			}
 			if err != nil {
 				return transcriptImportResult{}, err
 			}
-			checkpoint = state.ImportCheckpoints[checkpointID]
 			if strings.TrimSpace(checkpoint.LastRecordID) == "" {
 				currentSize, _ := transcriptSourceFileState(filePath)
 				if !allowAmbiguousImport && currentSize > int64(historyTieredMaxTailBytes) {
