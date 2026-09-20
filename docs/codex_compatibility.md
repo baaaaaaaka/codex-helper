@@ -4,8 +4,15 @@ Auto-updated by `.github/workflows/codex-release-monitor.yml`.
 
 | Codex version | linux | mac | windows | centos7 | rockylinux8 | ubuntu20.04 | last_tested_utc |
 | --- | --- | --- | --- | --- | --- | --- | --- |
+| 0.156.0-alpha.9 | pass | pass | pass | pass | pass | pass | 2026-09-20T02:00:33Z |
+| 0.156.0-alpha.8 | pass | pass | pass | pass | pass | pass | 2026-09-19T19:43:59Z |
+| 0.156.0-alpha.7 | pass | pass | pass | pass | pass | pass | 2026-09-19T06:50:19Z |
+| 0.156.0-alpha.5 | pass | pass | pass | pass | pass | pass | 2026-09-19T01:58:07Z |
+| 0.156.0-alpha.4 | pass | pass | pass | pass | pass | pass | 2026-09-18T22:03:08Z |
+| 0.156.0-alpha.3 | pass | pass | pass | pass | pass | pass | 2026-09-18T19:50:30Z |
 | 0.156.0-alpha.2 | pass | pass | pass | pass | pass | pass | 2026-09-18T05:24:07Z |
 | 0.156.0-alpha.1 | pass | pass | pass | pass | pass | pass | 2026-09-18T00:56:48Z |
+| 0.155.1 | pass | pass | pass | pass | pass | pass | 2026-09-18T22:03:08Z |
 | 0.155.0 | pass | pass | pass | pass | pass | pass | 2026-09-18T00:56:48Z |
 | 0.155.0-alpha.18 | pass | pass | pass | pass | pass | pass | 2026-09-17T22:58:51Z |
 | 0.155.0-alpha.16 | pass | pass | pass | pass | pass | pass | 2026-09-17T08:05:57Z |
@@ -26,7 +33,7 @@ Auto-updated by `.github/workflows/codex-release-monitor.yml`.
 | 0.155.0-alpha.2.5 | pass | pass | pass | pass | pass | pass | 2026-09-16T15:07:27Z |
 | 0.155.0-alpha.2 | pass | pass | pass | pass | pass | pass | 2026-09-10T19:54:49Z |
 | 0.155.0-alpha.1 | pass | fail | pass | pass | pass | pass | 2026-09-10T17:30:02Z |
-| 0.154.0 | pass | pass | pass | pass | pass | pass | 2026-09-16T05:27:19Z |
+| 0.154.0 | pass | pass | pass | pass | pass | pass | 2026-09-19T06:50:19Z |
 | 0.154.0-alpha.11 | pass | pass | pass | pass | pass | pass | 2026-09-09T10:00:30Z |
 | 0.154.0-alpha.8 | pass | pass | pass | pass | pass | pass | 2026-09-09T00:49:38Z |
 | 0.154.0-alpha.7 | pass | pass | pass | pass | pass | pass | 2026-09-08T20:26:26Z |
@@ -277,7 +284,7 @@ Auto-updated by `.github/workflows/codex-release-monitor.yml`.
 | 0.133.0-alpha.1 | pass | pass | pass | pass | pass | pass | 2026-05-20T18:40:09Z |
 | 0.132.0 | pass | pass | pass | pass | pass | pass | 2026-05-26T16:36:52Z |
 | 0.132.0-alpha.1 | pass | pass | pass | pass | pass | pass | 2026-05-18T22:54:07Z |
-| 0.131.0 | pass | pass | pass | pass | pass | pass | 2026-09-16T19:19:16Z |
+| 0.131.0 | pass | pass | pass | pass | pass | pass | 2026-09-19T19:43:59Z |
 | 0.131.0-alpha.22 | pass | pass | pass | pass | pass | pass | 2026-05-16T01:48:39Z |
 | 0.131.0-alpha.21 | pass | pass | pass | pass | pass | pass | 2026-05-15T20:38:57Z |
 | 0.131.0-alpha.9 | pass | pass | pass | pass | pass | pass | 2026-05-15T05:47:15Z |
