@@ -5694,13 +5694,13 @@ func runListenerRecoveryPolledTurnOutboxSurvivesReopen(t *testing.T, useSQLite b
 	first := startListenerRecovery(t, bridge, firstOptions)
 	select {
 	case <-executor.called:
-	case <-time.After(listenerRecoveryExtendedProgressTimeout):
+	case <-time.After(listenerRecoveryDurableIOProgressTimeout):
 		first.stop(t)
 		t.Fatalf("polled turn did not reach executor; gets=%d errors=%v", graphState.getCount("chat-1"), graphState.errorsSnapshot())
 	}
 	select {
 	case <-finalSendStarted:
-	case <-time.After(listenerRecoveryExtendedProgressTimeout):
+	case <-time.After(listenerRecoveryDurableIOProgressTimeout):
 		first.stop(t)
 		state, _ := store.Load(ctx)
 		t.Fatalf("generated final did not reach pre-send restart boundary: state=%#v calls=%#v phases outbox=%#v poll=%#v", state, executor.callsSnapshot(), bridge.mainLoopPhaseStatsSnapshot("outbox"), bridge.mainLoopPhaseStatsSnapshot("poll"))
