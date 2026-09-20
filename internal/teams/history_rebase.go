@@ -92,6 +92,34 @@ func historyRewriteRecoverySnapshotMatches(state historyTieredFileState, path st
 	return true
 }
 
+// historyRewriteRecoveryCanResumeAfterAppend distinguishes the one source
+// change that can safely keep a bounded rebase cursor: the same physical
+// paginated rollout grew after a pending scan pass. Codex writes JSONL
+// rollouts append-only while they are live; a same-size edit, truncation, or
+// replacement does not satisfy this predicate and therefore still resets the
+// proof scan. The scan remains blocked until it later proves the anchor and
+// the final source snapshot is stable.
+//
+// This deliberately requires a durable pending cursor. A marker-only retry
+// has not established any new source prefix and must start from byte zero.
+func historyRewriteRecoveryCanResumeAfterAppend(state historyTieredFileState, path string, info os.FileInfo) bool {
+	if info == nil || info.IsDir() || strings.TrimSpace(state.SourceRewriteRecoveryIdentity) == "" ||
+		!state.SourceRewriteRecoveryScanPending || state.SourceRewriteRecoveryScanOffset < 0 {
+		return false
+	}
+	if state.SourceRewriteRecoverySize <= 0 || info.Size() <= state.SourceRewriteRecoverySize ||
+		state.SourceRewriteRecoveryScanOffset > state.SourceRewriteRecoverySize {
+		return false
+	}
+	// Automatic rebase already requires this native revision capability. Keep
+	// the condition explicit here so a legacy marker cannot enter the append
+	// continuation path merely because its file grew.
+	if state.SourceRewriteRecoveryChangeTime == 0 || teamstore.SourceFileChangeTime(path, info) == 0 {
+		return false
+	}
+	return true
+}
+
 // historyRebaseChangeTimeAvailable is a fail-closed capability check.  A
 // bounded anchor scan proves the bytes it saw, but without a native change-time
 // revision a same-inode, same-size, same-mtime rewrite can race the final proof
@@ -735,13 +763,16 @@ func (b *Bridge) rebaseHistoryWatchSourceRewrite(ctx context.Context, id string,
 		return false, b.recordHistoryWatchRebaseAttempt(ctx, id, expected, previous, path, source, "automatic source rebase requires a native file change-time revision", now)
 	}
 	sameIdentity := strings.TrimSpace(source.Identity) == strings.TrimSpace(previous.SourceRewriteRecoveryIdentity)
-	if sameIdentity && historyRewriteRecoverySnapshotMatches(previous, path, source.Info) && !previous.SourceRewriteRecoveryScanPending {
+	snapshotMatches := historyRewriteRecoverySnapshotMatches(previous, path, source.Info)
+	appendGrowth := sameIdentity && historyRewriteRecoveryCanResumeAfterAppend(previous, path, source.Info)
+	if sameIdentity && snapshotMatches && !previous.SourceRewriteRecoveryScanPending {
 		return false, nil
 	}
 	// A same-inode source may have been repaired in place. Do not resume a
 	// completed scan from the old EOF in that case; the repaired anchor can be
-	// anywhere in the source. Appends also reset the cold cursor harmlessly.
-	if sameIdentity && !historyRewriteRecoverySnapshotMatches(previous, path, source.Info) {
+	// anywhere in the source. A strictly growing, pending source is the one
+	// append-only case where the already-proven bounded prefix can continue.
+	if sameIdentity && !snapshotMatches && !appendGrowth {
 		b.forgetHistoryWatchRebaseScanProgress(id)
 		clearHistoryWatchRebaseScan(&previous)
 	}
@@ -979,8 +1010,17 @@ func (b *Bridge) rebaseLinkedTranscriptSourceRewrite(ctx context.Context, sessio
 		SourceRewriteRecoveryModTime:    checkpoint.SourceRewriteRecoveryModTime,
 		SourceRewriteRecoveryChangeTime: checkpoint.SourceRewriteRecoveryChangeTime,
 	}
-	if strings.TrimSpace(source.Identity) == strings.TrimSpace(checkpoint.SourceRewriteRecoveryIdentity) &&
-		historyRewriteRecoverySnapshotMatches(recoverySnapshot, path, source.Info) {
+	sameIdentity := strings.TrimSpace(source.Identity) == strings.TrimSpace(checkpoint.SourceRewriteRecoveryIdentity)
+	snapshotMatches := historyRewriteRecoverySnapshotMatches(recoverySnapshot, path, source.Info)
+	appendGrowth := sameIdentity && historyRewriteRecoveryCanResumeAfterAppend(
+		historyTieredFileState{
+			SourceRewriteRecoveryIdentity:    recoverySnapshot.SourceRewriteRecoveryIdentity,
+			SourceRewriteRecoverySize:        recoverySnapshot.SourceRewriteRecoverySize,
+			SourceRewriteRecoveryChangeTime:  recoverySnapshot.SourceRewriteRecoveryChangeTime,
+			SourceRewriteRecoveryScanPending: checkpoint.SourceRewriteRecoveryScanPending,
+			SourceRewriteRecoveryScanOffset:  checkpoint.SourceRewriteRecoveryScanOffset,
+		}, path, source.Info)
+	if sameIdentity && snapshotMatches {
 		if !checkpoint.SourceRewriteRecoveryScanPending {
 			return false, nil
 		}
@@ -993,8 +1033,7 @@ func (b *Bridge) rebaseLinkedTranscriptSourceRewrite(ctx context.Context, sessio
 	}
 	expectedCheckpoint := checkpoint
 	scanCheckpoint := checkpoint
-	if strings.TrimSpace(source.Identity) != strings.TrimSpace(checkpoint.SourceRewriteRecoveryIdentity) ||
-		!historyRewriteRecoverySnapshotMatches(recoverySnapshot, path, source.Info) {
+	if !sameIdentity || (!snapshotMatches && !appendGrowth) {
 		clearLinkedTranscriptRebaseScan(&scanCheckpoint)
 	}
 	progress := linkedTranscriptRebaseScanProgress(scanCheckpoint, source.Identity, expectedThreadID, expectedThreadID, "")

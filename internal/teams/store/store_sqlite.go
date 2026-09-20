@@ -23469,6 +23469,18 @@ func (s *Store) queueTranscriptDeliveryOutboxSQLite(ctx context.Context, req Tra
 				if err := markSQLiteLegacyUnresolvedSessionTx(ctx, tx, &state, sessionID); err != nil {
 					return err
 				}
+				if automaticTranscriptAssistantDelivery(msg) {
+					// The linked reader may have captured its snapshot before the
+					// live turn was claimed. Re-read only this session's active turn
+					// rows inside the same queue transaction; never let that stale
+					// snapshot authorize a second assistant delivery.
+					turnSessionID := sqliteCanonicalTextProjectionSQL("json", "$.session_id", "session_id")
+					turnArgs := []any{sessionID}
+					turnArgs = append(turnArgs, sqliteTurnActiveStatusArgs()...)
+					if err := loadSQLiteJSONMapTx(ctx, tx, `SELECT json FROM turns WHERE `+turnSessionID+` = ? AND `+sqliteTurnActiveSafetyStatusSQL("json", "status"), turnArgs, state.Turns, func(v Turn) string { return v.ID }); err != nil {
+						return err
+					}
+				}
 			}
 			deliveryID := strings.TrimSpace(delivery.ID)
 			existingDelivery, deliveryFound, err := loadSQLiteJSONRow[TranscriptDeliveryRecord](ctx, tx, `SELECT json FROM transcript_deliveries WHERE id = ?`, deliveryID)

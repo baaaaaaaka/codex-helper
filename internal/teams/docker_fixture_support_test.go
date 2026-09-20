@@ -253,9 +253,11 @@ func prepareDockerFixtureStore(t *testing.T, fixtureRoot string) (*teamstore.Sto
 	// follow the same startup boundary before applying its path/workflow safety
 	// rewrites; otherwise the first owner-scoped update correctly fails closed
 	// with ErrSQLiteSchemaPreparationRequired and hides the actual experiment.
+	t.Log("preparing copied Docker fixture SQLite schema")
 	if err := store.PrepareSQLiteSchemaBeforeOwner(context.Background()); err != nil {
 		t.Fatalf("prepare copied Docker fixture SQLite schema before safety rewrites: %v", err)
 	}
+	t.Log("copied Docker fixture SQLite schema prepared")
 	t.Cleanup(func() {
 		if err := store.Close(); err != nil {
 			t.Errorf("close copied Docker fixture store: %v", err)
@@ -287,12 +289,22 @@ func dockerFixtureRemapCodexPaths(t *testing.T, store *teamstore.Store) {
 		// 864MB SQLite projection. Keep the safety mutations narrow and make the
 		// path-preserving case explicit instead of silently weakening the generic
 		// remapper below.
-		dockerFixtureSanitizeMountedStore(t, store)
+		if strings.TrimSpace(os.Getenv("CXP_TEAMS_DOCKER_MISSING_HISTORY_RECOVERY")) == "1" {
+			// The focused missing-history fixture contains only the three real
+			// witness JSONL files. Avoid cold-state helpers here: their compatibility
+			// save path materializes every inherited inbound/turn row and would make
+			// fixture setup itself a multi-gigabyte write. The direct session-row
+			// cleanup below is the only path-safety mutation needed by this
+			// no-executor, no-workflow acceptance test.
+			dockerFixtureSanitizeMountedSessionPaths(t, store)
+		} else {
+			dockerFixtureSanitizeMountedStore(t, store)
+		}
 		scope, err := store.ReadScope(context.Background())
 		if err != nil {
 			t.Fatalf("read mounted Docker fixture scope: %v", err)
 		}
-		if strings.TrimSpace(scope.ConfigPath) != "" {
+		if strings.TrimSpace(scope.ConfigPath) != "" && strings.TrimSpace(os.Getenv("CXP_TEAMS_DOCKER_MISSING_HISTORY_RECOVERY")) != "1" {
 			scope.ConfigPath = ""
 			if err := store.RebindScopeForMigration(context.Background(), scope); err != nil {
 				t.Fatalf("clear mounted Docker fixture scope config path: %v", err)
@@ -481,7 +493,16 @@ func dockerFixtureSanitizeMountedStore(t *testing.T, store *teamstore.Store) {
 	}); err != nil {
 		t.Fatalf("clear workspaces in mounted Docker fixture: %v", err)
 	}
+	dockerFixtureSanitizeMountedSessionPaths(t, store)
+}
 
+// dockerFixtureSanitizeMountedSessionPaths is the narrow portion of mounted
+// fixture sanitization that removes host workspace paths from session rows.
+// It is deliberately separate from the cold-state cleanup above so a focused
+// real-data test can avoid reserializing every inherited operational row.
+func dockerFixtureSanitizeMountedSessionPaths(t *testing.T, store *teamstore.Store) {
+	t.Helper()
+	ctx := context.Background()
 	dbPath := filepath.Join(filepath.Dir(store.Path()), teamstore.SQLiteFileName)
 	query := url.Values{}
 	query.Set("mode", "rw")
@@ -1172,13 +1193,34 @@ func dockerFixtureVerifyOutboxSourceProofs(t *testing.T, store *teamstore.Store)
 // in the shell fixture inventory before this helper runs; a missing range is an
 // error rather than a reason to manufacture a new proof over sparse zeros.
 func dockerFixtureRebindSourceProofs(t *testing.T, store *teamstore.Store) {
+	dockerFixtureRebindSourceProofsForPaths(t, store, nil)
+}
+
+// dockerFixtureRebindSourceProofsForPaths is the narrow variant used by the
+// missing-history Docker witness.  The focused fixture intentionally omits
+// inherited transcript bodies, so rebinding every historical checkpoint would
+// turn absent, unrelated files into a test failure.  An empty allow-list keeps
+// the original full-fixture behavior; a non-empty list only rebinds checkpoints
+// whose primary source path is in that list.  No production code calls this
+// helper.
+func dockerFixtureRebindSourceProofsForPaths(t *testing.T, store *teamstore.Store, allowedPaths map[string]struct{}) {
 	t.Helper()
 	if store == nil {
 		t.Fatal("cannot rebind source proofs on a nil Docker fixture store")
 	}
+	pathAllowed := func(path string) bool {
+		if len(allowedPaths) == 0 {
+			return true
+		}
+		_, ok := allowedPaths[filepath.Clean(strings.TrimSpace(path))]
+		return ok
+	}
 	ctx := context.Background()
 	if err := store.UpdateHistoryWatch(ctx, func(history map[string]teamstore.HistoryWatchCheckpoint, _ *time.Time) error {
 		for id, checkpoint := range history {
+			if !pathAllowed(checkpoint.Path) {
+				continue
+			}
 			if err := dockerFixtureRebindHistoryWatchCheckpoint(&checkpoint); err != nil {
 				return fmt.Errorf("history checkpoint %q: %w", id, err)
 			}
@@ -1201,6 +1243,9 @@ func dockerFixtureRebindSourceProofs(t *testing.T, store *teamstore.Store) {
 		t.Fatalf("load copied ImportCheckpoint source proofs: %v", err)
 	}
 	for id, checkpoint := range checkpoints {
+		if !pathAllowed(checkpoint.SourcePath) {
+			continue
+		}
 		updated := checkpoint
 		if err := dockerFixtureRebindImportCheckpoint(&updated); err != nil {
 			t.Fatalf("rebind ImportCheckpoint %q source proofs: %v", id, err)

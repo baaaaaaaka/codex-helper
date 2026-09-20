@@ -19,6 +19,53 @@ import (
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
+type historyWatchSessionLookupContextKey struct{}
+
+// historyWatchSessionLookup shares one immutable Codex discovery result across
+// all path workers in a history batch.  A history phase may contain thousands
+// of changed JSONL paths; discovering every project/session again for every
+// path turns that phase into O(paths * all_sessions) work and can exhaust the
+// phase budget before any checkpoint advances.  The lookup is intentionally
+// batch-scoped, not a long-lived cache: a later phase can observe newly-created
+// sessions without stale publication state, while workers in this phase use a
+// single consistent source index.
+type historyWatchSessionLookup struct {
+	once     sync.Once
+	projects []codexhistory.Project
+	err      error
+}
+
+func (b *Bridge) historyWatchSessionLookupContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if _, ok := ctx.Value(historyWatchSessionLookupContextKey{}).(*historyWatchSessionLookup); ok {
+		return ctx
+	}
+	return context.WithValue(ctx, historyWatchSessionLookupContextKey{}, &historyWatchSessionLookup{})
+}
+
+func (b *Bridge) historyWatchSessionProjects(ctx context.Context) ([]codexhistory.Project, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	lookup, _ := ctx.Value(historyWatchSessionLookupContextKey{}).(*historyWatchSessionLookup)
+	if lookup == nil {
+		projects, err := discoverCodexProjectsForTeams(ctx, b.scope.CodexHome)
+		if err != nil {
+			return nil, err
+		}
+		return codexhistory.FilterUserVisibleProjects(projects), nil
+	}
+	lookup.once.Do(func() {
+		lookup.projects, lookup.err = discoverCodexProjectsForTeams(ctx, b.scope.CodexHome)
+		if lookup.err == nil {
+			lookup.projects = codexhistory.FilterUserVisibleProjects(lookup.projects)
+		}
+	})
+	return lookup.projects, lookup.err
+}
+
 // runHistoryWatchSyncJobs gives each changed transcript path its own bounded
 // worker. HistoryWatch is a cold path, so this is intentionally a small pool;
 // its purpose is fairness and fault isolation, not unrestricted parallelism.
@@ -39,6 +86,10 @@ func (b *Bridge) runHistoryWatchSyncJobs(ctx context.Context, paths []string, no
 	}
 	workCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	// All workers must use the same discovery snapshot.  Do not put the lookup
+	// on the Bridge: concurrent listeners/scopes must not share Codex roots or a
+	// result that can outlive this bounded history phase.
+	workCtx = b.historyWatchSessionLookupContext(workCtx)
 	results := make(chan result, len(paths))
 	var nextJobMu sync.Mutex
 	nextJob := 0
@@ -421,8 +472,8 @@ func (b *Bridge) syncCodexHistoryFinalsForBacklogWithDiscovery(ctx context.Conte
 		root, rootErr := codexhistory.ResolveCodexDir(b.scope.CodexHome)
 		if rootErr != nil {
 			firstErr = fmt.Errorf("resolve Codex history directory for backlog fairness: %w", rootErr)
-		} else if recent, recentErr := historyTieredListSessionFilesInDirsContext(ctx, historyWatchRecentSessionDirs(root, now, historyWatchRecentDays)); recentErr != nil {
-			firstErr = fmt.Errorf("list recent Codex history sessions for backlog fairness: %w", recentErr)
+		} else if recent, recentErr := historyTieredListSessionFilesInDirsContext(ctx, historyWatchRecentSessionDirs(root, now, historyWatchRecoveryDays)); recentErr != nil {
+			firstErr = fmt.Errorf("list recovery-window Codex history sessions for backlog fairness: %w", recentErr)
 		} else {
 			optional = removeHistoryWatchPaths(recent, recoveryPaths)
 		}
@@ -576,6 +627,9 @@ func (b *Bridge) syncCodexHistoryFinals(ctx context.Context, now time.Time, reco
 	initialized := !state.HistoryWatchReady.IsZero()
 	paths := historyWatchPathsFromState(state)
 	var recent []string
+	var recoveryRecent []string
+	var selectedRecovery []string
+	recoveryCursorSelected := false
 	sessionsRootMissing := false
 	var firstErr error
 	root, rootErr := codexhistory.ResolveCodexDir(b.scope.CodexHome)
@@ -593,6 +647,16 @@ func (b *Bridge) syncCodexHistoryFinals(ctx context.Context, now time.Time, reco
 			recentSet := historyWatchPathSet(recent)
 			paths = append(paths, recent...)
 			if reconcile {
+				// The hot watcher intentionally looks only at the last few days.
+				// A full reconcile must additionally retain a bounded month-long
+				// recovery window.  Otherwise a service outage longer than the hot
+				// window causes an unindexed session to be mistaken for old history
+				// and baselineCodexHistoryWatch permanently skips its finals.
+				var recoveryErr error
+				recoveryRecent, recoveryErr = historyTieredListSessionFilesInDirsContext(ctx, historyWatchRecentSessionDirs(root, now, historyWatchRecoveryDays))
+				if recoveryErr != nil {
+					firstErr = joinHistoryWatchErrors(firstErr, fmt.Errorf("list recovery-window Codex history sessions: %w", recoveryErr))
+				}
 				reconciled, reconcileErr := b.historyWatchReconcilePaths(ctx)
 				if codexhistory.IsSessionsDirNotFound(reconcileErr) {
 					reconcileErr = nil
@@ -603,7 +667,20 @@ func (b *Bridge) syncCodexHistoryFinals(ctx context.Context, now time.Time, reco
 					firstErr = joinHistoryWatchErrors(firstErr, reconcileErr)
 				} else {
 					if initialized {
-						baseline := historyWatchMissingNonRecentPaths(reconciled, recentSet, state)
+						// Do not baseline any source in the recovery window.  Only
+						// sources older than the explicit recovery window retain the
+						// historical EOF baseline behavior.
+						excludedFromBaseline := make(map[string]bool, len(recentSet)+len(recoveryRecent))
+						for path := range recentSet {
+							excludedFromBaseline[path] = true
+						}
+						for path := range historyWatchPathSet(recoveryRecent) {
+							excludedFromBaseline[path] = true
+						}
+						baseline := []string(nil)
+						if recoveryErr == nil {
+							baseline = historyWatchMissingNonRecentPaths(reconciled, excludedFromBaseline, state)
+						}
 						if len(baseline) > 0 {
 							if baselineErr := b.baselineCodexHistoryWatch(ctx, baseline, now); baselineErr != nil {
 								firstErr = joinHistoryWatchErrors(firstErr, baselineErr)
@@ -615,6 +692,24 @@ func (b *Bridge) syncCodexHistoryFinals(ctx context.Context, now time.Time, reco
 						}
 					}
 					paths = append(paths, reconciled...)
+					paths = append(paths, recoveryRecent...)
+					if recoveryErr == nil {
+						candidates := historyWatchUnindexedPaths(recoveryRecent, state)
+						if len(candidates) > maxHistoryRecoveryDiscoveryJobs {
+							if cursorErr := b.restoreBacklogFairCursor(ctx, teamstore.BacklogFairLaneHistoryDiscovery, candidates); cursorErr != nil {
+								// Do not run an older recovery candidate with an
+								// untrusted starting point. Known/recent paths can still
+								// be scanned below, while this bounded recovery lane
+								// remains reachable on the next successful reconcile.
+								firstErr = joinHistoryWatchErrors(firstErr, cursorErr)
+							} else {
+								selectedRecovery = b.selectBacklogHistoryDiscoveryPaths(candidates, maxHistoryRecoveryDiscoveryJobs)
+								recoveryCursorSelected = true
+							}
+						} else {
+							selectedRecovery = candidates
+						}
+					}
 				}
 			}
 		}
@@ -640,9 +735,25 @@ func (b *Bridge) syncCodexHistoryFinals(ctx context.Context, now time.Time, reco
 	// durable checkpoint); startup, reconciliation, watch registration, queue
 	// overflow, and recreated directories all force the complete indexed set.
 	dirtyPaths, watchUncertain := b.historyWatchDirtyPaths(paths, recent, reconcile)
-	scanPaths := historyWatchScanPaths(paths, recent, dirtyPaths, state, reconcile, watchUncertain)
+	// Watch registration retains the complete discovered set, while the
+	// reconcile scan itself includes only the bounded recovery quantum. Dirty
+	// paths remain an explicit exception: an observed write must not wait for a
+	// later fairness turn merely because it is outside the selected window.
+	scanFullPaths := historyWatchPathsFromState(state)
+	scanFullPaths = append(scanFullPaths, recent...)
+	scanFullPaths = append(scanFullPaths, selectedRecovery...)
+	scanFullPaths = append(scanFullPaths, dirtyPaths...)
+	scanPaths := historyWatchScanPaths(scanFullPaths, recent, dirtyPaths, state, reconcile, watchUncertain)
 	verifyUnchanged := reconcile || watchUncertain || len(dirtyPaths) > 0
 	changes, scanErr := historyWatchChangedPaths(scanPaths, state, verifyUnchanged)
+	// Reconcile scans the complete indexed set to avoid missing a changed
+	// source, but the resulting list can contain thousands of old paths. Put
+	// the bounded month-window discovery quantum first so an untracked recent
+	// conversation cannot wait behind a lexicographically earlier cold tail
+	// until the phase budget is exhausted. Dirty watcher paths remain next in
+	// line; the durable checkpoint/CAS path still decides whether each source
+	// may advance.
+	changes = historyWatchPrioritizePaths(changes, selectedRecovery, dirtyPaths)
 	if scanErr != nil {
 		firstErr = joinHistoryWatchErrors(firstErr, scanErr)
 	}
@@ -658,8 +769,10 @@ func (b *Bridge) syncCodexHistoryFinals(ctx context.Context, now time.Time, reco
 		}
 	}
 	syncErr := b.runHistoryWatchSyncJobs(ctx, changes, now)
-	if syncErr != nil {
-		b.historyWatchRetryDirtyPaths(dirtyPaths)
+	if scanErr != nil || syncErr != nil {
+		retryPaths := append([]string(nil), dirtyPaths...)
+		retryPaths = append(retryPaths, selectedRecovery...)
+		b.historyWatchRetryDirtyPaths(retryPaths)
 		if watchUncertain {
 			// A full scan caused by an uncertain watcher may discover a changed
 			// path without a corresponding event. Keep that path selected until
@@ -668,7 +781,14 @@ func (b *Bridge) syncCodexHistoryFinals(ctx context.Context, now time.Time, reco
 		}
 	}
 	if scanErr == nil && syncErr == nil {
-		b.historyWatchAckDirtyPaths(dirtyPaths)
+		ackPaths := append([]string(nil), dirtyPaths...)
+		ackPaths = append(ackPaths, selectedRecovery...)
+		b.historyWatchAckDirtyPaths(ackPaths)
+	}
+	if recoveryCursorSelected && backlogFairCursorPersistAllowed(ctx, firstErr, scanErr, syncErr) {
+		if cursorErr := b.persistBacklogFairCursor(ctx, teamstore.BacklogFairLaneHistoryDiscovery); cursorErr != nil {
+			syncErr = errors.Join(syncErr, cursorErr)
+		}
 	}
 	if syncErr != nil {
 		if firstErr == nil {
@@ -678,6 +798,42 @@ func (b *Bridge) syncCodexHistoryFinals(ctx context.Context, now time.Time, reco
 		}
 	}
 	return firstErr
+}
+
+func historyWatchPrioritizePaths(paths []string, priority ...[]string) []string {
+	paths = uniqueSortedCleanPaths(paths)
+	if len(paths) == 0 {
+		return nil
+	}
+	available := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		available[path] = struct{}{}
+	}
+	selected := make(map[string]struct{}, len(paths))
+	ordered := make([]string, 0, len(paths))
+	for _, group := range priority {
+		for _, path := range group {
+			path = cleanComparablePath(path)
+			if path == "" {
+				continue
+			}
+			if _, ok := available[path]; !ok {
+				continue
+			}
+			if _, ok := selected[path]; ok {
+				continue
+			}
+			selected[path] = struct{}{}
+			ordered = append(ordered, path)
+		}
+	}
+	for _, path := range paths {
+		if _, ok := selected[path]; ok {
+			continue
+		}
+		ordered = append(ordered, path)
+	}
+	return ordered
 }
 
 func historyWatchScanPaths(fullPaths, recentPaths, dirtyPaths []string, state teamstore.State, reconcile, uncertain bool) []string {
@@ -1155,6 +1311,7 @@ func historyWatchBaselineBoundary(path string, size int64) (historyWatchBaseline
 }
 
 func (b *Bridge) syncCodexHistoryWatchPath(ctx context.Context, path string, now time.Time) error {
+	ctx = b.historyWatchSessionLookupContext(ctx)
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return nil
@@ -1868,6 +2025,8 @@ type historyWatchSessionStartResult struct {
 }
 
 func (b *Bridge) publishHistoryWatchSessionStart(ctx context.Context, path string, result historyTieredTailResult) (historyWatchSessionStartResult, error) {
+	b.codexSessionPublishMu.Lock()
+	defer b.codexSessionPublishMu.Unlock()
 	record, ok := historyTieredFirstVisibleUserPromptRecord(result.Records)
 	if !ok {
 		return historyWatchSessionStartResult{}, nil
@@ -1888,7 +2047,8 @@ func (b *Bridge) publishHistoryWatchSessionStart(ctx context.Context, path strin
 	if err != nil || !ok {
 		return historyWatchSessionStartResult{blocked: true}, err
 	}
-	if existing := b.reg.SessionByCodexThreadID(local.SessionID); existing != nil && isActiveSessionStatus(existing.Status) {
+	registry := b.registrySnapshot()
+	if existing := registry.SessionByCodexThreadID(local.SessionID); existing != nil && isActiveSessionStatus(existing.Status) {
 		if err := b.ensureDurableSession(ctx, existing); err != nil {
 			return historyWatchSessionStartResult{}, err
 		}
@@ -1897,7 +2057,7 @@ func (b *Bridge) publishHistoryWatchSessionStart(ctx context.Context, path strin
 	if strings.TrimSpace(local.FirstPrompt) == "" {
 		local.FirstPrompt = formatTranscriptRecordForTeams(record)
 	}
-	_, err = b.publishCodexSessionLocalWithOptions(ctx, local, project, publishCodexSessionOptions{
+	_, err = b.publishCodexSessionLocalWithOptionsLocked(ctx, local, project, publishCodexSessionOptions{
 		ChatCreatedNotification:         false,
 		ChatCreatedNoticeAfterImport:    true,
 		LocalSessionStartedNotification: true,
@@ -2004,6 +2164,8 @@ type publishHistoryWatchFinalOptions struct {
 }
 
 func (b *Bridge) publishHistoryWatchFinal(ctx context.Context, path string, final historyTieredFinal, opts publishHistoryWatchFinalOptions) (bool, error) {
+	b.codexSessionPublishMu.Lock()
+	defer b.codexSessionPublishMu.Unlock()
 	if isSubagent, err := codexhistory.SessionFileIsSubagentContext(ctx, path); err == nil && isSubagent {
 		return true, nil
 	} else if err != nil && !os.IsNotExist(err) {
@@ -2014,7 +2176,8 @@ func (b *Bridge) publishHistoryWatchFinal(ctx context.Context, path string, fina
 	if err != nil || !ok {
 		return false, err
 	}
-	if existing := b.reg.SessionByCodexThreadID(local.SessionID); existing != nil && isActiveSessionStatus(existing.Status) {
+	registry := b.registrySnapshot()
+	if existing := registry.SessionByCodexThreadID(local.SessionID); existing != nil && isActiveSessionStatus(existing.Status) {
 		if err := b.ensureDurableSession(ctx, existing); err != nil {
 			return false, err
 		}
@@ -2031,14 +2194,15 @@ func (b *Bridge) publishHistoryWatchFinal(ctx context.Context, path string, fina
 		}
 		return true, nil
 	}
-	_, err = b.publishCodexSessionLocalWithOptions(ctx, local, project, publishCodexSessionOptions{
+	_, err = b.publishCodexSessionLocalWithOptionsLocked(ctx, local, project, publishCodexSessionOptions{
 		ChatCreatedNotification: !b.workflowUserAttentionAvailable(ctx),
 		BackgroundImport:        true,
 	})
 	if err != nil {
 		return false, err
 	}
-	if session := b.reg.SessionByCodexThreadID(local.SessionID); session != nil {
+	registry = b.registrySnapshot()
+	if session := registry.SessionByCodexThreadID(local.SessionID); session != nil {
 		if err := b.queueWorkflowNotificationForDetectedCodexAnswerWithError(ctx, session, final.Key); err != nil {
 			return false, err
 		}
@@ -2062,7 +2226,7 @@ func (b *Bridge) sessionHasTeamsManagedTurns(ctx context.Context, sessionID stri
 }
 
 func (b *Bridge) findHistoryWatchCodexSession(ctx context.Context, path string, threadID string) (codexhistory.Session, codexhistory.Project, bool, error) {
-	projects, err := discoverCodexProjectsForTeams(ctx, b.scope.CodexHome)
+	projects, err := b.historyWatchSessionProjects(ctx)
 	if err != nil {
 		// A fresh installation may not have created ~/.codex/sessions yet.  That
 		// is a normal "nothing discoverable" result for HistoryWatch, not a

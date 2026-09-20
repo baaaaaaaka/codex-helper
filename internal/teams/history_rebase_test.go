@@ -939,6 +939,93 @@ func TestLinkedTranscriptRebaseScanResumesAcrossRestart(t *testing.T) {
 	t.Fatalf("bounded linked rebase did not complete in bounded restartable passes: %#v", current)
 }
 
+func TestLinkedTranscriptRebaseContinuesAcrossSameInodeAppend(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "linked-growing-rebase.jsonl")
+	paddingLine := `{"type":"noop","padding":"` + strings.Repeat("x", 128) + `"}` + "\n"
+	filler := strings.Repeat(paddingLine, int(historyRebaseMaxScanBytesPerPass/int64(len(paddingLine)))+4096)
+	content := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-linked-growing","history_mode":"paginated"}}`,
+		strings.TrimSuffix(filler, "\n"),
+		`{"type":"response_item","payload":{"id":"linked-growing-final","type":"message","role":"assistant","turn_id":"turn-linked-growing","phase":"final_answer","content":[{"type":"output_text","text":"linked growing answer"}]}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write linked growing rollout: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat linked growing rollout: %v", err)
+	}
+	store := newBridgeTestStore(t)
+	checkpointID := transcriptCheckpointID("session-linked-growing")
+	checkpoint := teamstore.ImportCheckpoint{
+		ID:                   checkpointID,
+		SessionID:            "session-linked-growing",
+		SourcePath:           path,
+		SourceGeneration:     "old-source-generation",
+		LastRecordID:         "source:linked-growing-final",
+		LastOffsetKnown:      true,
+		SourceRewriteBlocked: true,
+		Status:               importCheckpointStatusBlocked,
+	}
+	if _, _, err := store.UpdateImportCheckpoint(context.Background(), checkpointID, func(_ teamstore.ImportCheckpoint, _ bool, now time.Time) (teamstore.ImportCheckpoint, bool, error) {
+		checkpoint.UpdatedAt = now
+		return checkpoint, true, nil
+	}); err != nil {
+		t.Fatalf("seed linked growing checkpoint: %v", err)
+	}
+	session := Session{ID: "session-linked-growing", CodexThreadID: "thread-linked-growing"}
+	local := codexhistory.Session{SessionID: "thread-linked-growing", FilePath: path}
+	bridge := &Bridge{store: store}
+	if rebased, err := bridge.rebaseLinkedTranscriptSourceRewrite(context.Background(), session, local, checkpoint); err != nil {
+		t.Fatalf("first linked growing rebase pass: %v", err)
+	} else if rebased {
+		t.Fatal("first linked growing rebase pass unexpectedly completed")
+	}
+	first, found, err := store.ImportCheckpoint(context.Background(), checkpointID)
+	if err != nil || !found {
+		t.Fatalf("load first linked growing checkpoint: found=%v err=%v", found, err)
+	}
+	if !first.SourceRewriteBlocked || !first.SourceRewriteRecoveryScanPending || first.SourceRewriteRecoveryScanOffset <= 0 || first.SourceRewriteRecoveryScanOffset >= info.Size() {
+		t.Fatalf("first linked growing rebase pass = %#v, want a pending bounded scan", first)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(context.Background(), 0); err != nil {
+		t.Fatalf("migrate linked growing checkpoint to SQLite: %v", err)
+	}
+
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open linked growing rollout for append: %v", err)
+	}
+	if _, err := file.WriteString(`{"type":"noop","padding":"appended after first linked pass"}` + "\n"); err != nil {
+		_ = file.Close()
+		t.Fatalf("append linked growing rollout: %v", err)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		t.Fatalf("sync linked growing append: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close linked growing append: %v", err)
+	}
+
+	bridge = &Bridge{store: store}
+	current, found, err := store.ImportCheckpoint(context.Background(), checkpointID)
+	if err != nil || !found {
+		t.Fatalf("reload linked growing checkpoint: found=%v err=%v", found, err)
+	}
+	rebased, err := bridge.rebaseLinkedTranscriptSourceRewrite(context.Background(), session, local, current)
+	if err != nil {
+		t.Fatalf("second linked growing rebase pass: %v", err)
+	}
+	updated, found, err := store.ImportCheckpoint(context.Background(), checkpointID)
+	if err != nil || !found {
+		t.Fatalf("load second linked growing checkpoint: found=%v err=%v", found, err)
+	}
+	if !rebased || updated.SourceRewriteBlocked || updated.LastOffset <= first.SourceRewriteRecoveryScanOffset {
+		t.Fatalf("linked same-inode append did not continue the durable scan: rebased=%v first=%d updated=%#v", rebased, first.SourceRewriteRecoveryScanOffset, updated)
+	}
+}
+
 func TestLinkedTranscriptRebaseHoldsAmbiguousAnchor(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "linked-ambiguous-rebase.jsonl")
 	content := strings.Join([]string{
@@ -1490,5 +1577,109 @@ func TestSourceRewriteRecoveryIdentityPersistsInSQLiteProjection(t *testing.T) {
 	}
 	if checkpoint.SourceRewriteRecoveryIdentity != "file:import-recovery-test" {
 		t.Fatalf("SQLite import recovery identity = %q, want persisted marker", checkpoint.SourceRewriteRecoveryIdentity)
+	}
+}
+
+func TestHistoryWatchRebaseContinuesAcrossSameInodeAppend(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "same-inode-growing-rebase.jsonl")
+	paddingLine := `{"type":"noop","padding":"` + strings.Repeat("x", 128) + `"}` + "\n"
+	filler := strings.Repeat(paddingLine, int(historyRebaseMaxScanBytesPerPass/int64(len(paddingLine)))+4096)
+	content := strings.Join([]string{
+		`{"type":"session_meta","payload":{"id":"thread-growing-rebase","history_mode":"paginated"}}`,
+		strings.TrimSuffix(filler, "\n"),
+		`{"type":"response_item","payload":{"id":"growing-rebase-final","type":"message","role":"assistant","turn_id":"turn-growing-rebase","phase":"final_answer","content":[{"type":"output_text","text":"growing rebase answer"}]}}`,
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-growing-rebase"}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write growing rebase rollout: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat growing rebase rollout: %v", err)
+	}
+	if info.Size() <= historyRebaseMaxScanBytesPerPass {
+		t.Fatalf("growing rebase fixture size = %d, want greater than per-pass budget %d", info.Size(), historyRebaseMaxScanBytesPerPass)
+	}
+
+	store := newBridgeTestStore(t)
+	id := historyWatchCheckpointID(path)
+	if err := store.UpdateHistoryWatch(context.Background(), func(history map[string]teamstore.HistoryWatchCheckpoint, _ *time.Time) error {
+		history[id] = teamstore.HistoryWatchCheckpoint{
+			ID:                   id,
+			Path:                 path,
+			Size:                 info.Size(),
+			ModTime:              info.ModTime(),
+			Offset:               info.Size(),
+			SessionID:            "thread-growing-rebase",
+			ThreadID:             "thread-growing-rebase",
+			SourceRewriteBlocked: true,
+			LastFinalID:          "codex-final:v1:thread-growing-rebase:turn-growing-rebase:growing-rebase-final",
+			LastFinalThreadID:    "thread-growing-rebase",
+			LastFinalTurnID:      "turn-growing-rebase",
+			LastFinalTextHash:    normalizedTextHash("growing rebase answer"),
+			TerminalBoundarySeen: true,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed growing rebase checkpoint: %v", err)
+	}
+
+	bridge := &Bridge{store: store}
+	if err := bridge.syncCodexHistoryWatchPath(context.Background(), path, time.Now()); err != nil {
+		t.Fatalf("first growing rebase pass: %v", err)
+	}
+	state, err := store.HistoryWatchState(context.Background())
+	if err != nil {
+		t.Fatalf("load first growing rebase checkpoint: %v", err)
+	}
+	first := state.HistoryWatch[id]
+	if !first.SourceRewriteBlocked || !first.SourceRewriteRecoveryScanPending {
+		t.Fatalf("first growing rebase pass = %#v, want a pending bounded scan", first)
+	}
+	firstOffset := first.SourceRewriteRecoveryScanOffset
+	if firstOffset <= 0 || firstOffset >= info.Size() {
+		t.Fatalf("first growing rebase scan offset = %d, want a strict prefix of %d", firstOffset, info.Size())
+	}
+	if _, err := store.MigrateLargeStateToSQLite(context.Background(), 0); err != nil {
+		t.Fatalf("migrate growing rebase checkpoint to SQLite: %v", err)
+	}
+	// Force the next pass through a fresh Bridge so this proves the durable
+	// cursor survives a process restart, rather than relying on the in-memory
+	// rebase cursor retained by the first bridge.
+	bridge = &Bridge{store: store}
+
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+	if err != nil {
+		t.Fatalf("open growing rebase rollout for append: %v", err)
+	}
+	if _, err := file.WriteString(`{"type":"noop","padding":"appended after first bounded pass"}` + "\n"); err != nil {
+		_ = file.Close()
+		t.Fatalf("append growing rebase rollout: %v", err)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		t.Fatalf("sync growing rebase append: %v", err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatalf("close growing rebase append: %v", err)
+	}
+
+	if err := bridge.syncCodexHistoryWatchPath(context.Background(), path, time.Now().Add(time.Second)); err != nil {
+		t.Fatalf("second growing rebase pass: %v", err)
+	}
+	state, err = store.HistoryWatchState(context.Background())
+	if err != nil {
+		t.Fatalf("load second growing rebase checkpoint: %v", err)
+	}
+	second := state.HistoryWatch[id]
+	secondOffset := second.SourceRewriteRecoveryScanOffset
+	if !second.SourceRewriteBlocked {
+		secondOffset = second.Offset
+	}
+	if secondOffset <= firstOffset {
+		t.Fatalf("same-inode append reset rebase scan from %d to %d; durable progress must be monotonic", firstOffset, secondOffset)
+	}
+	if len(state.OutboxMessages) != 0 {
+		t.Fatalf("rebase recovery created delivery rows: %#v", state.OutboxMessages)
 	}
 }

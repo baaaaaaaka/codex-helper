@@ -34,7 +34,7 @@ docker info >/dev/null 2>&1 || {
 	exit 1
 }
 
-selector='^TestDockerBoundedAcceptanceScenario$'
+selector='^(TestDockerBoundedAcceptanceScenario|TestHistoryWatchRebaseContinuesAcrossSameInodeAppend|TestLinkedTranscriptRebaseContinuesAcrossSameInodeAppend)$'
 listed_tests="$(CXP_RUNTIME_DISABLE=1 go test ./internal/teams -list "$selector")"
 grep -Fxq -- "TestDockerBoundedAcceptanceScenario" <<<"$listed_tests" || {
 	echo "bounded acceptance selector did not list TestDockerBoundedAcceptanceScenario" >&2

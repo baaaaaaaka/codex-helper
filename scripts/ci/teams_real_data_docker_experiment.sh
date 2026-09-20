@@ -26,6 +26,7 @@ fixture_root="$(mktemp -d /tmp/cxp-teams-real-data-XXXXXX)"
 fixture_dir=""
 build_dir="$(mktemp -d /tmp/cxp-teams-real-build-XXXXXX)"
 runtime_dir="$(mktemp -d "$build_dir/runtime-XXXXXX")"
+chat_coverage_runtime_dir="$(mktemp -d "$build_dir/chat-coverage-runtime-XXXXXX")"
 image="cxp-teams-real-data-experiment:${GITHUB_RUN_ID:-local}-$$"
 host_uid="$(id -u)"
 host_gid="$(id -g)"
@@ -36,11 +37,44 @@ fixture_codex_dir="/home/baka/.codex"
 allow_source_drift="${CXP_TEAMS_DOCKER_ALLOW_SOURCE_DRIFT:-0}"
 experiment_mode="${CXP_TEAMS_DOCKER_REAL_DATA_MODE:-throughput}"
 experiment_duration="${CXP_TEAMS_DOCKER_REAL_DATA_DURATION:-5m}"
+chat_coverage_duration="${CXP_TEAMS_DOCKER_CHAT_COVERAGE_DURATION:-20m}"
+require_all_lagging="${CXP_TEAMS_DOCKER_REAL_DATA_REQUIRE_ALL_LAGGING:-0}"
 rate_limit_experiment="${CXP_TEAMS_DOCKER_REAL_DATA_429:-0}"
 rate_limit_scope="${CXP_TEAMS_DOCKER_REAL_DATA_429_SCOPE:-chat}"
 poll_interval="${CXP_TEAMS_DOCKER_REAL_DATA_POLL_INTERVAL:-}"
 recent_session_hours="${CXP_TEAMS_DOCKER_RECENT_SESSION_HOURS:-24}"
 include_recent_history="${CXP_TEAMS_DOCKER_INCLUDE_RECENT_HISTORY:-0}"
+test_selection="${CXP_TEAMS_DOCKER_REAL_DATA_TESTS:-all}"
+missing_history_minimal=0
+run_missing_history=0
+run_chat_coverage=0
+run_throughput=0
+run_all_lagging=0
+case "$test_selection" in
+all)
+	run_missing_history=1
+	run_chat_coverage=1
+	run_throughput=1
+	;;
+missing-history)
+	run_missing_history=1
+	missing_history_minimal=1
+	;;
+chat-coverage)
+	run_chat_coverage=1
+	;;
+throughput)
+	run_throughput=1
+	;;
+all-lagging)
+	run_all_lagging=1
+	experiment_mode=complete
+	;;
+*)
+	echo "CXP_TEAMS_DOCKER_REAL_DATA_TESTS must be all, missing-history, chat-coverage, throughput, or all-lagging" >&2
+	exit 2
+	;;
+esac
 if [[ -n "${CXP_TEAMS_DOCKER_PROCESS_RESTART+x}" ]]; then
 	process_restart="$CXP_TEAMS_DOCKER_PROCESS_RESTART"
 elif [[ "$rate_limit_experiment" == "1" ]]; then
@@ -80,6 +114,23 @@ case "$rate_limit_experiment" in
 		exit 2
 		;;
 esac
+
+case "$require_all_lagging" in
+	0|1) ;;
+	*)
+		echo "CXP_TEAMS_DOCKER_REAL_DATA_REQUIRE_ALL_LAGGING must be 0 or 1" >&2
+		exit 2
+		;;
+esac
+
+if [[ "$run_all_lagging" == "1" ]]; then
+	require_all_lagging=1
+	process_restart=0
+	if [[ "${CXP_TEAMS_DOCKER_REAL_DATA_CHAT_COVERAGE:-0}" == "1" ]]; then
+		echo "all-lagging mode uses the full queued corpus; do not combine it with representative chat coverage" >&2
+		exit 2
+	fi
+fi
 
 case "$rate_limit_scope" in
 	chat|account|global) ;;
@@ -628,6 +679,42 @@ SQL
 	rm -f -- "$history_inventory"
 }
 
+# The missing-history acceptance only needs to prove that real, older Codex
+# sessions can be discovered and imported after their durable history rows are
+# removed.  Copying every inherited history-watch source would turn this
+# focused witness into a 30+ GB fixture and would make the test spend most of
+# its time hashing unrelated transcript bodies.  Keep the witness set explicit
+# and real-data-backed; the all/chat-coverage/throughput selections continue to
+# use copy_referenced_history_files above.
+copy_missing_history_witness_files() {
+	local candidate="$1"
+	local sessions_root relative source_path destination
+	sessions_root="$(realpath -e -- "$codex_home/sessions")"
+	local witness_inventory="$candidate/codex/missing-history-witnesses.tsv"
+	: > "$witness_inventory"
+	local witnesses=(
+		"2026/09/18/rollout-2026-09-18T14-57-10-01a0b34e-0898-78e2-b28f-d01814db435a.jsonl"
+		"2026/09/18/rollout-2026-09-18T16-11-23-01a0b391-f857-7861-a9ba-3a8eec856b00.jsonl"
+		"2026/09/18/rollout-2026-09-18T16-23-05-01a0b39c-b167-7ac2-92e9-e843067d2abb.jsonl"
+	)
+	for relative in "${witnesses[@]}"; do
+		if [[ "$relative" == /* || "$relative" == ../* || "$relative" == */../* || "$relative" == *'/..' ]]; then
+			echo "invalid missing-history witness relative path: $relative" >&2
+			return 1
+		fi
+		source_path="$sessions_root/$relative"
+		if [[ ! -f "$source_path" || -L "$source_path" ]]; then
+			echo "missing real-data history witness: $source_path" >&2
+			return 1
+		fi
+		destination="$candidate/codex/sessions/$relative"
+		if ! copy_sparse_history_file "$source_path" "$destination" 0 0; then
+			return 1
+		fi
+		printf '%s\t%s\n' "$relative" "${relative##*-}" >> "$witness_inventory"
+	done
+}
+
 copy_recent_history_files() {
 	local candidate="$1"
 	local sessions_root recent_inventory recent_minutes source_path canonical_source relative destination session_size proof_inventory
@@ -1004,7 +1091,11 @@ assemble_fixture_snapshot() {
 		echo "refusing to copy a Codex sessions tree containing symlinks" >&2
 		return 1
 	fi
-	if ! copy_referenced_history_files "$candidate" "$candidate/teams/store.sqlite"; then return 1; fi
+	if [[ "$missing_history_minimal" == "1" ]]; then
+		if ! copy_missing_history_witness_files "$candidate"; then return 1; fi
+	else
+		if ! copy_referenced_history_files "$candidate" "$candidate/teams/store.sqlite"; then return 1; fi
+	fi
 	# The replay corpus and the durable history/import projections select the
 	# source files that can affect this snapshot.  Do not copy every JSONL file
 	# modified in the last day by default: on a real Codex home that can be tens
@@ -1015,7 +1106,21 @@ assemble_fixture_snapshot() {
 	if [[ "$include_recent_history" == "1" ]]; then
 		if ! copy_recent_history_files "$candidate"; then return 1; fi
 	fi
-	if ! write_source_proof_manifest "$candidate" "$candidate/teams/store.sqlite"; then return 1; fi
+	if [[ "$missing_history_minimal" == "1" ]]; then
+		witness_inventory="$candidate/codex/missing-history-witnesses.tsv"
+		: > "$candidate/source-proof-manifest.tsv"
+		printf '# cxp-teams-source-proof-v1\n' >> "$candidate/source-proof-manifest.tsv"
+		while IFS=$'\t' read -r relative _thread_id; do
+			[[ -z "$relative" ]] && continue
+			canonical_source="$(realpath -e -- "$codex_home/sessions/$relative")"
+			source_size="$(stat -c '%s' -- "$canonical_source")"
+			digest="$(sha256sum -- "$canonical_source")"
+			digest="${digest%% *}"
+			printf '%s\t0\t%s\t%s\n' "${fixture_codex_dir%/}/sessions/$relative" "$source_size" "$digest" >> "$candidate/source-proof-manifest.tsv"
+		done < "$witness_inventory"
+	else
+		if ! write_source_proof_manifest "$candidate" "$candidate/teams/store.sqlite"; then return 1; fi
+	fi
 	if ! session_symlinks="$(find "$candidate/codex/sessions" -type l -print -quit)"; then return 1; fi
 	if [[ -n "$session_symlinks" ]]; then
 		echo "refusing copied Codex sessions tree containing symlinks: $session_symlinks" >&2
@@ -1103,9 +1208,11 @@ sqlite3 "file:$fixture_dir/teams/store.sqlite?mode=ro" "SELECT 'rows', (SELECT c
 cd "$repo_root"
 CGO_ENABLED=0 go test -c -o "$build_dir/teams-sqlite-history-fixture.test" ./internal/teams
 docker_test_selector='^TestDockerRealDataTeamsProgressThroughput$'
-docker_listed_tests="$($build_dir/teams-sqlite-history-fixture.test -test.list "$docker_test_selector")"
-if ! grep -Fxq -- 'TestDockerRealDataTeamsProgressThroughput' <<<"$docker_listed_tests"; then
-	echo "Docker real-data selector did not list TestDockerRealDataTeamsProgressThroughput" >&2
+docker_history_test_selector='^TestDockerMissingHistoryRecovery$'
+docker_listed_tests="$($build_dir/teams-sqlite-history-fixture.test -test.list "$docker_test_selector|$docker_history_test_selector")"
+if ! grep -Fxq -- 'TestDockerRealDataTeamsProgressThroughput' <<<"$docker_listed_tests" ||
+	! grep -Fxq -- 'TestDockerMissingHistoryRecovery' <<<"$docker_listed_tests"; then
+	echo "Docker real-data selector did not list both throughput and missing-history acceptance tests" >&2
 	exit 1
 fi
 mkdir -p "$build_dir/docker-mountpoints/sessions"
@@ -1137,6 +1244,7 @@ run_experiment_process() {
 		--env CXP_TEAMS_DOCKER_PROCESS_RESTART="$process_restart" \
 		--env CXP_TEAMS_DOCKER_REAL_DATA_MODE="$experiment_mode" \
 		--env CXP_TEAMS_DOCKER_REAL_DATA_DURATION="$experiment_duration" \
+		--env CXP_TEAMS_DOCKER_REAL_DATA_REQUIRE_ALL_LAGGING="$require_all_lagging" \
 		--env CXP_TEAMS_DOCKER_STARTUP_DEADLINE="${CXP_TEAMS_DOCKER_STARTUP_DEADLINE:-}" \
 		--env CXP_TEAMS_DOCKER_REAL_DATA_429="$rate_limit_experiment" \
 		--env CXP_TEAMS_DOCKER_REAL_DATA_429_SCOPE="$rate_limit_scope" \
@@ -1156,10 +1264,108 @@ run_experiment_process() {
 		-test.v
 }
 
+run_missing_history_experiment() {
+	timeout --foreground --kill-after=30s "$docker_watchdog_timeout" docker run --rm --stop-timeout 30 \
+		--network none \
+		--user "$host_uid:$host_gid" \
+		--cap-drop ALL \
+		--security-opt no-new-privileges \
+		--pids-limit 256 \
+		--read-only \
+		--tmpfs /tmp:rw,nosuid,nodev,size=256m \
+		--env HOME=/runtime/home \
+		--env TMPDIR=/tmp \
+		--env CXP_RUNTIME_DISABLE=1 \
+		--env CXP_TEAMS_DOCKER_FIXTURE_DIR=/fixture \
+		--env CXP_TEAMS_DOCKER_RUNTIME_DIR=/runtime \
+		--env CXP_TEAMS_DOCKER_RUNTIME_REUSE=0 \
+		--env CXP_TEAMS_DOCKER_MISSING_HISTORY_RECOVERY=1 \
+		--env CXP_TEAMS_DOCKER_CODEX_SOURCE_PREFIX="${codex_home%/}/" \
+		--env CXP_TEAMS_DOCKER_CODEX_MOUNTED=1 \
+		--env CXP_TEAMS_DOCKER_SOURCE_PROOF_MANIFEST=/fixture/source-proof-manifest.tsv \
+		--mount "type=bind,src=$fixture_dir,dst=/fixture,readonly" \
+		--mount "type=bind,src=$fixture_dir/codex,dst=/home/baka/.codex,readonly" \
+		--mount "type=bind,src=$runtime_dir,dst=/runtime" \
+		"$image" \
+		/teams-sqlite-history-fixture.test \
+		-test.run "$docker_history_test_selector" \
+		-test.count=1 \
+		-test.timeout "$docker_test_timeout" \
+		-test.v
+}
+
+run_chat_coverage_experiment() {
+	timeout --foreground --kill-after=30s "$docker_watchdog_timeout" docker run --rm --stop-timeout 30 \
+		--network none \
+		--user "$host_uid:$host_gid" \
+		--cap-drop ALL \
+		--security-opt no-new-privileges \
+		--pids-limit 256 \
+		--read-only \
+		--tmpfs /tmp:rw,nosuid,nodev,size=256m \
+		--env HOME=/runtime/home \
+		--env TMPDIR=/tmp \
+		--env CXP_RUNTIME_DISABLE=1 \
+		--env CXP_TEAMS_DOCKER_FIXTURE_DIR=/fixture \
+		--env CXP_TEAMS_DOCKER_RUNTIME_DIR=/runtime \
+		--env CXP_TEAMS_DOCKER_RUNTIME_REUSE=0 \
+		--env CXP_TEAMS_DOCKER_REAL_DATA_EXPERIMENT=1 \
+		--env CXP_TEAMS_DOCKER_REAL_DATA_CHAT_COVERAGE=1 \
+		--env CXP_TEAMS_DOCKER_REAL_DATA_RESUME=0 \
+		--env CXP_TEAMS_DOCKER_PROCESS_RESTART=0 \
+		--env CXP_TEAMS_DOCKER_REAL_DATA_MODE=complete \
+		--env CXP_TEAMS_DOCKER_REAL_DATA_DURATION="$chat_coverage_duration" \
+		--env CXP_TEAMS_DOCKER_REAL_DATA_REQUIRE_ALL_LAGGING=1 \
+		--env CXP_TEAMS_DOCKER_STARTUP_DEADLINE="${CXP_TEAMS_DOCKER_STARTUP_DEADLINE:-}" \
+		--env CXP_TEAMS_DOCKER_REAL_DATA_429=0 \
+		--env CXP_TEAMS_DOCKER_REAL_DATA_POLL_INTERVAL="$poll_interval" \
+		--env CXP_TEAMS_DOCKER_CODEX_SOURCE_PREFIX="${codex_home%/}/" \
+		--env CXP_TEAMS_DOCKER_CODEX_MOUNTED=1 \
+		--env CXP_TEAMS_DOCKER_SOURCE_PROOF_MANIFEST=/fixture/source-proof-manifest.tsv \
+		--mount "type=bind,src=$fixture_dir,dst=/fixture,readonly" \
+		--mount "type=bind,src=$fixture_dir/codex,dst=/home/baka/.codex,readonly" \
+		--mount "type=bind,src=$chat_coverage_runtime_dir,dst=/runtime" \
+		"$image" \
+		/teams-sqlite-history-fixture.test \
+		-test.run "$docker_test_selector" \
+		-test.count=1 \
+		-test.timeout "$docker_test_timeout" \
+		-test.v
+}
+
 set +e
-run_experiment_process 0 0
-first_process_status=$?
-run_status=$first_process_status
+run_status=0
+if [[ "$run_missing_history" == "1" ]]; then
+	echo "real-data Docker experiment: running missing-history discovery acceptance in an isolated runtime" >&2
+	run_missing_history_experiment
+	missing_history_status=$?
+	if [[ "$run_status" -eq 0 ]]; then
+		run_status=$missing_history_status
+	fi
+fi
+if [[ "$run_chat_coverage" == "1" ]]; then
+	echo "real-data Docker experiment: running all-lagging-chat durable completion acceptance in an isolated runtime" >&2
+	run_chat_coverage_experiment
+	chat_coverage_status=$?
+	if [[ "$run_status" -eq 0 ]]; then
+		run_status=$chat_coverage_status
+	fi
+fi
+if [[ "$run_all_lagging" == "1" ]]; then
+	echo "real-data Docker experiment: running exhaustive all-lagging-chat completion acceptance in an isolated runtime" >&2
+	run_experiment_process 0 0
+	all_lagging_status=$?
+	if [[ "$run_status" -eq 0 ]]; then
+		run_status=$all_lagging_status
+	fi
+fi
+if [[ "$run_throughput" == "1" ]]; then
+	run_experiment_process 0 0
+	first_process_status=$?
+	if [[ "$run_status" -eq 0 ]]; then
+		run_status=$first_process_status
+	fi
+fi
 
 # A restart-mode acceptance run is a two-process protocol.  Always launch the
 # resume process after the first process exits, including when the first
@@ -1167,7 +1373,7 @@ run_status=$first_process_status
 # can be mistaken for a missing restart check, and a broken first boundary is
 # never exercised by the recovery process. Preserve the first failure while
 # still reporting the second process's diagnostics.
-if [[ "$process_restart" == "1" ]]; then
+if [[ "$run_throughput" == "1" && "$process_restart" == "1" ]]; then
 	echo "real-data Docker experiment: starting a second container process against the same disposable runtime" >&2
 	run_experiment_process 1 1
 	second_process_status=$?
