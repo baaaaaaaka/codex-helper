@@ -104,6 +104,18 @@ var ErrTranscriptDeliveryPending = errors.New("transcript delivery is still pend
 // wait for an explicit history repair.
 var ErrTranscriptDeliveryNeedsAttention = errors.New("transcript delivery needs explicit attention")
 
+// ErrTranscriptDeliveryDeferredByLiveTurn means an automatic transcript
+// reader raced a live turn or its terminal completion.  The caller must keep
+// the source cursor where it is and retry after the live durable boundary has
+// settled; this is not permission to create another Graph POST.
+var ErrTranscriptDeliveryDeferredByLiveTurn = errors.New("transcript delivery deferred by live turn")
+
+// ErrTranscriptDeliverySupersededByCheckpoint means the canonical transcript
+// checkpoint already passed the exact source record in the same durable
+// transaction.  The source has a newer durable owner; the stale reader must
+// not create a second delivery row or advance anything from its old snapshot.
+var ErrTranscriptDeliverySupersededByCheckpoint = errors.New("transcript delivery superseded by durable checkpoint")
+
 type InboundStatus string
 
 const (
@@ -5690,6 +5702,16 @@ func validateQueuedTranscriptCheckpointProvenance(state *State, msg OutboxMessag
 	}
 	if err := validateImportCheckpointProvenance(canonical, sessionID, checkpointID); err != nil {
 		return err
+	}
+	if automaticTranscriptAssistantDelivery(msg) &&
+		canonical.Status == importCheckpointStatusComplete &&
+		!canonical.CompletionPending && !canonical.DeliveryNeedsAttention &&
+		strings.TrimSpace(canonical.LastRecordID) == strings.TrimSpace(msg.TranscriptSourceRecordID) {
+		// CompleteTurnWithFinal commits the live final and its source checkpoint
+		// in one durable CAS. A linked reader may still be holding the previous
+		// checkpoint snapshot; once the canonical row names this exact source
+		// record, its old queue request is stale and must not create a second POST.
+		return ErrTranscriptDeliverySupersededByCheckpoint
 	}
 	if requestSession := strings.TrimSpace(checkpoint.SessionID); requestSession != "" && requestSession != strings.TrimSpace(canonical.SessionID) {
 		return fmt.Errorf("%w: outbox checkpoint %q changed owner from %q to %q", ErrSessionStateProvenanceMismatch, checkpointID, canonical.SessionID, requestSession)
@@ -11460,6 +11482,90 @@ func IsAutomaticTranscriptOutbox(msg OutboxMessage) bool {
 		automaticTranscriptCompletionKind(kind, msg.NotificationKind)
 }
 
+// automaticTranscriptAssistantDelivery identifies the background assistant
+// lane that can race a live terminal answer.  User/status transcript rows are
+// intentionally excluded: they do not claim the live final source identity
+// and must retain their normal import behavior.
+func automaticTranscriptAssistantDelivery(msg OutboxMessage) bool {
+	if strings.TrimSpace(msg.TranscriptSourceRecordID) == "" || !IsAutomaticTranscriptOutbox(msg) {
+		return false
+	}
+	kind := strings.ToLower(strings.TrimSpace(msg.Kind))
+	return strings.Contains(kind, "assistant") || automaticTranscriptCompletionKind(kind, msg.NotificationKind)
+}
+
+// hasActiveTurnForTranscriptAdmissionLocked is deliberately fail-closed for
+// an unknown non-terminal status.  A stale linked-transcript snapshot must
+// never queue a second assistant delivery while a live execution is still
+// owned by the session.
+func hasActiveTurnForTranscriptAdmissionLocked(state *State, sessionID string) bool {
+	if state == nil {
+		return false
+	}
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return false
+	}
+	for _, turn := range state.Turns {
+		if strings.TrimSpace(turn.SessionID) != sessionID {
+			continue
+		}
+		switch turn.Status {
+		case TurnStatusQueued, TurnStatusCompleted, TurnStatusFailed, TurnStatusInterrupted:
+			continue
+		case TurnStatusRunning:
+			return true
+		default:
+			// A non-empty unknown status is an opaque active-owner witness. An
+			// empty status is treated the same way because a malformed turn must
+			// never authorize a second assistant delivery.
+			return true
+		}
+	}
+	return false
+}
+
+// liveFinalCoverageForTranscriptLocked returns the durable live final that
+// owns the same source record. A queued/sending/markerless accepted/sent row
+// is still pending and therefore fences a background reader. A sent row with
+// a provider identity can safely be linked to the reader's delivery record
+// without issuing another POST. Skipped/permanent-failure rows intentionally
+// do not cover the source: transcript fallback must remain possible.
+func liveFinalCoverageForTranscriptLocked(state *State, msg OutboxMessage) (out OutboxMessage, pending bool, delivered bool) {
+	if state == nil || !automaticTranscriptAssistantDelivery(msg) {
+		return OutboxMessage{}, false, false
+	}
+	sessionID := strings.TrimSpace(msg.SessionID)
+	sourceRecordID := strings.TrimSpace(msg.TranscriptSourceRecordID)
+	if sessionID == "" || sourceRecordID == "" {
+		return OutboxMessage{}, false, false
+	}
+	for _, candidate := range state.OutboxMessages {
+		if strings.TrimSpace(candidate.SessionID) != sessionID ||
+			strings.TrimSpace(candidate.TranscriptSourceRecordID) != sourceRecordID ||
+			strings.TrimSpace(candidate.TurnID) == "" || automaticTranscriptTurnID(candidate.TurnID) ||
+			strings.HasPrefix(strings.TrimSpace(candidate.ID), "outbox:transcript-delivery:") ||
+			!automaticTranscriptCompletionKind(candidate.Kind, candidate.NotificationKind) {
+			continue
+		}
+		switch candidate.Status {
+		case OutboxStatusSent:
+			if strings.TrimSpace(candidate.TeamsMessageID) != "" {
+				return candidate, false, true
+			}
+			pending = true
+		case OutboxStatusAccepted:
+			if strings.TrimSpace(candidate.TeamsMessageID) != "" {
+				return candidate, false, true
+			}
+			pending = true
+		case OutboxStatusQueued, OutboxStatusSending:
+			pending = true
+		}
+	}
+	return OutboxMessage{}, pending, false
+}
+
 func outboxKindIsTranscriptLike(kind string, notificationKind string) bool {
 	kind = strings.ToLower(strings.TrimSpace(kind))
 	if strings.EqualFold(strings.TrimSpace(notificationKind), "needs_attention") ||
@@ -14108,6 +14214,12 @@ func applyQueueTranscriptDeliveryOutboxLocked(state *State, msg OutboxMessage, d
 	if err := validateQueuedTranscriptCheckpointProvenance(state, msg, checkpoint); err != nil {
 		return OutboxMessage{}, false, false, err
 	}
+	if automaticTranscriptAssistantDelivery(msg) && hasActiveTurnForTranscriptAdmissionLocked(state, msg.SessionID) {
+		// Check the live owner before the older unresolved-execution fence.  The
+		// latter is intentionally a hard safety error for ordinary callers, while
+		// this background race is a normal retry boundary for linked scanning.
+		return OutboxMessage{}, false, false, ErrTranscriptDeliveryDeferredByLiveTurn
+	}
 	if stateHasUnresolvedExecution(state, msg.SessionID) && !outboxTurnIsUserExplicitHistory(msg.TurnID) &&
 		!transcriptDeliveryUsesExactOuterExecutionProof(state, msg, delivery) &&
 		!transcriptDeliveryTrustedBeforeAnchor(state, msg, delivery, checkpoint) {
@@ -14128,6 +14240,25 @@ func applyQueueTranscriptDeliveryOutboxLocked(state *State, msg OutboxMessage, d
 	}
 	existingOutbox, existingOutboxFound := state.OutboxMessages[strings.TrimSpace(msg.ID)]
 	if _, deliveryFound := state.TranscriptDeliveries[delivery.ID]; !deliveryFound {
+		if automaticTranscriptAssistantDelivery(msg) {
+			liveFinal, pending, delivered := liveFinalCoverageForTranscriptLocked(state, msg)
+			if pending {
+				return OutboxMessage{}, false, false, ErrTranscriptDeliveryDeferredByLiveTurn
+			}
+			if delivered {
+				linked := normalizeTranscriptDeliveryRecord(delivery, now)
+				linked.OutboxID = liveFinal.ID
+				linked.TeamsMessageID = liveFinal.TeamsMessageID
+				if liveFinal.Status == OutboxStatusSent {
+					linked.Status = TranscriptDeliveryStatusSent
+					linked.SentAt = liveFinal.SentAt
+				} else {
+					linked.Status = TranscriptDeliveryStatusAccepted
+				}
+				state.TranscriptDeliveries[linked.ID] = linked
+				return liveFinal, false, liveFinal.Status == OutboxStatusSent, nil
+			}
+		}
 		if pending, ok := pendingAutomaticTranscriptOutboxForExplicitHistoryLocked(state, msg, delivery); ok {
 			return OutboxMessage{}, false, false, fmt.Errorf("%w: automatic outbox=%q source=%q part=%d/%d", ErrTranscriptDeliveryPending, pending.ID, delivery.SourceRecordID, delivery.PartIndex, delivery.PartCount)
 		}

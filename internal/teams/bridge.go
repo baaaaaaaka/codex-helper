@@ -751,6 +751,10 @@ func suppressLinkedTranscriptJobDeferrals(err error) error {
 }
 
 func linkedTranscriptJobBudgetDeferral(err error, jobCtx context.Context, parent context.Context) bool {
+	if errors.Is(err, teamstore.ErrTranscriptDeliveryDeferredByLiveTurn) ||
+		errors.Is(err, teamstore.ErrTranscriptDeliverySupersededByCheckpoint) {
+		return parent != nil && parent.Err() == nil
+	}
 	// A concurrent durable commit invalidates the read snapshot by design. It
 	// is not a process-wide store failure and it is not safe to consume the
 	// partial state, so isolate this session until the next poll instead of
@@ -32953,6 +32957,16 @@ func (b *Bridge) syncSessionTranscriptFromSnapshotWithOptions(ctx context.Contex
 		stage = "queue transcript delivery"
 		pendingDelivery, err := b.queueOrSendTranscriptDeliveryChunksWithPending(ctx, session, local, record, checkpointLine, checkpointOffset, kind, body, opts, "sync:"+session.ID, checkpointID, true, queueOnly, "")
 		if err != nil {
+			if errors.Is(err, teamstore.ErrTranscriptDeliveryDeferredByLiveTurn) ||
+				errors.Is(err, teamstore.ErrTranscriptDeliverySupersededByCheckpoint) {
+				// The durable queue transaction observed a live/terminal owner
+				// newer than this scanner's snapshot. Keep the cursor at the safe
+				// prefix; the next pass will reread the canonical turn/final state
+				// and either link the already-sent final or continue the fallback.
+				b.boostPolling(time.Now())
+				stage = "defer transcript delivery behind live turn"
+				return finishSafePrefix()
+			}
 			if errors.Is(err, teamstore.ErrTranscriptDeliveryNeedsAttention) && transcriptOutboxAutomaticRun("sync:"+session.ID) {
 				// Keep the durable cursor at the blocked source record. The
 				// NeedsAttention row is an explicit-repair fence, not a listener
