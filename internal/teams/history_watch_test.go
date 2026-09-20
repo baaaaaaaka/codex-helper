@@ -214,9 +214,13 @@ func TestHistoryWatchMandatoryRecoveryIncludesUnprovedAndRecoveryFlags(t *testin
 }
 
 func TestHistoryWatchPrioritizePathsPutsRecoveryBeforeColdTail(t *testing.T) {
-	paths := []string{filepath.FromSlash("/history/cold-a.jsonl"), filepath.FromSlash("/history/recovery.jsonl"), filepath.FromSlash("/history/cold-b.jsonl")}
-	got := historyWatchPrioritizePaths(paths, []string{filepath.FromSlash("/history/recovery.jsonl")}, []string{filepath.FromSlash("/history/cold-b.jsonl")})
-	want := []string{filepath.FromSlash("/history/recovery.jsonl"), filepath.FromSlash("/history/cold-b.jsonl"), filepath.FromSlash("/history/cold-a.jsonl")}
+	root := t.TempDir()
+	coldA := filepath.Join(root, "cold-a.jsonl")
+	recovery := filepath.Join(root, "recovery.jsonl")
+	coldB := filepath.Join(root, "cold-b.jsonl")
+	paths := []string{coldA, recovery, coldB}
+	got := historyWatchPrioritizePaths(paths, []string{recovery}, []string{coldB})
+	want := []string{recovery, coldB, coldA}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("prioritized history paths = %#v, want %#v", got, want)
 	}
