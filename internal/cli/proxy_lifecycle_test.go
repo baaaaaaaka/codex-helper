@@ -140,6 +140,22 @@ func TestProxyStartBackgroundPassesResolvedConfigPathToDaemon(t *testing.T) {
 	if !strings.Contains(out.String(), "Started instance ") {
 		t.Fatalf("unexpected output: %q", out.String())
 	}
+	if runtime.GOOS == "windows" {
+		cfg, err := store.Load()
+		if err != nil {
+			t.Fatalf("load launched instance: %v", err)
+		}
+		if len(cfg.Instances) != 1 || cfg.Instances[0].DaemonPID <= 0 {
+			t.Fatalf("expected launched daemon pid for cleanup, got %+v", cfg.Instances)
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for proxyProcessAlive(cfg.Instances[0].DaemonPID) {
+			if time.Now().After(deadline) {
+				t.Fatalf("detached test child pid %d did not exit before TempDir cleanup", cfg.Instances[0].DaemonPID)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
 }
 
 func TestProxyStartBackgroundUsesStableExecutableForTransientRawPath(t *testing.T) {
