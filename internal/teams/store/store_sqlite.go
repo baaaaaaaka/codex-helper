@@ -6825,6 +6825,14 @@ type sqliteOutboxReadSnapshot struct {
 
 var errSQLiteOutboxReadSnapshotChanged = errors.New("sqlite outbox read snapshot changed during canonical admission")
 
+// IsSQLiteOutboxReadSnapshotChanged identifies a safe retry boundary for the
+// bounded JSON compatibility admission path. The reader rejects a snapshot
+// that crossed a concurrent durable commit; callers must retry the read, never
+// treat the partial result as an empty queue or as permission to bypass FIFO.
+func IsSQLiteOutboxReadSnapshotChanged(err error) bool {
+	return errors.Is(err, errSQLiteOutboxReadSnapshotChanged)
+}
+
 var errSQLiteBackfillSourceChanged = errors.New("sqlite compatibility backfill source changed during scan")
 
 func sqliteReadOnlyFileIdentityForPath(path string) (sqliteReadOnlyFileIdentity, error) {
@@ -29838,7 +29846,7 @@ func sqliteOutboxFIFOBudgetError(parentCtx context.Context, queryCtx context.Con
 }
 
 func sqliteOutboxFIFOSnapshotStaleError(reason string) error {
-	return fmt.Errorf("%w: %s", ErrOutboxPredecessorIndeterminate, strings.TrimSpace(reason))
+	return fmt.Errorf("%w: %w: %s", ErrOutboxPredecessorIndeterminate, ErrOutboxFIFOSnapshotStale, strings.TrimSpace(reason))
 }
 
 func (s *Store) earlierUnsentOutboxCandidatesSQLiteSnapshot(ctx context.Context, snapshot sqliteOutboxFIFOSnapshot, msg OutboxMessage, limit int) ([]OutboxMessage, bool, *sqliteOutboxFIFOSnapshot, error) {

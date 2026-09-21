@@ -78,6 +78,7 @@ const (
 	// A later row may observe a normal predecessor while another flush is
 	// finishing its send lease.  Keep FIFO ordering, but do not convert that
 	// short-lived in-process race into the general recovery backoff.
+	outboxFIFOSnapshotRetryBackoff        = time.Second
 	outboxActivePredecessorRetryBackoff   = time.Second
 	transcriptSourceProofCacheMaxEntries  = 256
 	historyWatchDeletedProbeInterval      = 5 * time.Minute
@@ -24291,6 +24292,9 @@ func outboxRetryGateUntil(err error, now time.Time) time.Time {
 	if IsReauthRequiredError(err) || IsAuthCacheError(err) {
 		return now.Add(outboxAuthRecoveryRetryBackoff).UTC()
 	}
+	if teamstore.IsSQLiteOutboxReadSnapshotChanged(err) || errors.Is(err, teamstore.ErrOutboxFIFOSnapshotStale) {
+		return now.Add(outboxFIFOSnapshotRetryBackoff).UTC()
+	}
 	return now.Add(outboxRecoveryRetryBackoff).UTC()
 }
 
@@ -27172,9 +27176,13 @@ func deferIndeterminateOutboxFIFO(chatID string, err error) error {
 	if err == nil || !errors.Is(err, teamstore.ErrOutboxPredecessorIndeterminate) {
 		return err
 	}
+	backoff := outboxRecoveryRetryBackoff
+	if errors.Is(err, teamstore.ErrOutboxFIFOSnapshotStale) {
+		backoff = outboxFIFOSnapshotRetryBackoff
+	}
 	return outboxDeliveryDeferredError{
 		ChatID: strings.TrimSpace(chatID),
-		Until:  time.Now().Add(outboxRecoveryRetryBackoff),
+		Until:  time.Now().Add(backoff),
 		Cause:  err,
 	}
 }
@@ -27189,6 +27197,7 @@ func isOutboxDeliveryDeferred(err error) bool {
 	// reread the canonical row and re-establish a fresh proof.
 	return errors.As(err, &deferred) ||
 		isGraphRateLimitError(err) ||
+		teamstore.IsSQLiteOutboxReadSnapshotChanged(err) ||
 		errors.Is(err, teamstore.ErrOutboxSendNotClaimed) ||
 		errors.Is(err, teamstore.ErrOutboxPredecessorIndeterminate)
 }

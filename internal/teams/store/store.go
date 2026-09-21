@@ -249,6 +249,12 @@ var ErrSQLiteMigrationSourceChanged = errors.New("SQLite migration source change
 
 var ErrOutboxPredecessorIndeterminate = errors.New("outbox FIFO predecessor is indeterminate")
 
+// ErrOutboxFIFOSnapshotStale means that a proof captured before a durable
+// outbox claim no longer matches the canonical store. This is a safe,
+// retryable concurrency race: the caller must discard the proof and obtain a
+// fresh one, never reuse it or issue a Graph POST from the stale snapshot.
+var ErrOutboxFIFOSnapshotStale = errors.New("outbox FIFO snapshot became stale")
+
 // ErrOutboxNotFound lets migration/replay callers distinguish a pruned
 // durable outbox row from a store read failure. Missing rows are safe to skip
 // during idempotent legacy-ledger reconciliation; all other errors must still
@@ -15209,10 +15215,10 @@ func (s *Store) markOutboxSendAttemptWithFIFOSnapshotProof(ctx context.Context, 
 	return s.updateOutbox(ctx, outboxID, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
 		if fifoProof != nil && fifoProof.jsonBackend {
 			if !fifoProof.consumeForTarget(outboxID) {
-				return msg, fmt.Errorf("%w: JSON FIFO proof was already consumed or bound to another target", ErrOutboxPredecessorIndeterminate)
+				return msg, fmt.Errorf("%w: %w: JSON FIFO proof was already consumed or bound to another target", ErrOutboxPredecessorIndeterminate, ErrOutboxFIFOSnapshotStale)
 			}
 			if reason := fifoProof.jsonSnapshotMismatchReason(state, msg); reason != "" {
-				return msg, fmt.Errorf("%w: JSON FIFO snapshot changed before durable claim: %s", ErrOutboxPredecessorIndeterminate, reason)
+				return msg, fmt.Errorf("%w: %w: JSON FIFO snapshot changed before durable claim: %s", ErrOutboxPredecessorIndeterminate, ErrOutboxFIFOSnapshotStale, reason)
 			}
 		}
 		return claimOutboxSendAttemptLocked(state, msg, now)
@@ -15262,10 +15268,10 @@ func (s *Store) markOutboxSendAttemptForOwnerWithFIFOSnapshotProof(ctx context.C
 	return s.updateOutbox(ctx, outboxID, func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
 		if fifoProof != nil && fifoProof.jsonBackend {
 			if !fifoProof.consumeForTarget(outboxID) {
-				return msg, fmt.Errorf("%w: JSON FIFO proof was already consumed or bound to another target", ErrOutboxPredecessorIndeterminate)
+				return msg, fmt.Errorf("%w: %w: JSON FIFO proof was already consumed or bound to another target", ErrOutboxPredecessorIndeterminate, ErrOutboxFIFOSnapshotStale)
 			}
 			if reason := fifoProof.jsonSnapshotMismatchReason(state, msg); reason != "" {
-				return msg, fmt.Errorf("%w: JSON FIFO snapshot changed before durable claim: %s", ErrOutboxPredecessorIndeterminate, reason)
+				return msg, fmt.Errorf("%w: %w: JSON FIFO snapshot changed before durable claim: %s", ErrOutboxPredecessorIndeterminate, ErrOutboxFIFOSnapshotStale, reason)
 			}
 		}
 		return update(state, msg, now)
