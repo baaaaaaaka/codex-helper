@@ -1257,6 +1257,79 @@ func sqliteOutboxCanonicalTextSQL(jsonColumn, path, legacyColumn string) string 
 	return "(CASE WHEN " + typeExpr + " IS NULL THEN trim(COALESCE(" + legacyColumn + ", '')) ELSE trim(COALESCE(" + valueExpr + ", '')) END)"
 }
 
+// outboxOptionalMaintenanceBlockedSQLite is the native hot-path oracle for
+// the listener's optional history/linked admission gate. It intentionally
+// selects no JSON body: the gate only needs status, retry due-ness, provider
+// identity, turn binding, and the small set of fields that make a queued row
+// protected. A malformed or projection-mismatched active row is itself a
+// blocking uncertainty; terminal Sent/Skipped rows are safe to ignore.
+func (s *Store) outboxOptionalMaintenanceBlockedSQLite(ctx context.Context, now time.Time) (blocked bool, handled bool, err error) {
+	err = s.withStateLock(ctx, func() error {
+		pointer, ok, pointerErr := s.currentSQLitePointerUnlocked()
+		if pointerErr != nil || !ok {
+			return pointerErr
+		}
+		db, dbErr := s.sqliteDBUnlocked(pointer)
+		if dbErr != nil {
+			return dbErr
+		}
+		handled = true
+		jsonColumn := "o.json"
+		status := sqliteOutboxCanonicalTextSQL(jsonColumn, "$.status", "o.status")
+		messageID := sqliteOutboxCanonicalTextSQL(jsonColumn, "$.teams_message_id", "o.teams_message_id")
+		turnID := sqliteOutboxCanonicalTextSQL(jsonColumn, "$.turn_id", "o.turn_id")
+		kind := "lower(trim(COALESCE(" + sqliteSafeJSONExtract(jsonColumn, "$.kind") + ", '')))"
+		notificationKind := "lower(trim(COALESCE(" + sqliteSafeJSONExtract(jsonColumn, "$.notification_kind") + ", '')))"
+		attachmentPath := sqliteOutboxCanonicalTextSQL(jsonColumn, "$.attachment_path", "NULL")
+		driveItemID := sqliteOutboxCanonicalTextSQL(jsonColumn, "$.drive_item_id", "NULL")
+		artifactIDsType := sqliteSafeJSONType(jsonColumn, "$.artifact_ids")
+		protected := "((" + notificationKind + " = 'turn_completed') OR (" + attachmentPath + " <> '') OR (" + driveItemID + " <> '') OR (" +
+			kind + " IN ('final', 'answer', 'artifact', 'attachment') OR " +
+			kind + " LIKE '%final%' OR " + kind + " LIKE '%answer%' OR " + kind + " LIKE '%artifact%' OR " + kind + " LIKE '%attachment%') OR (" + artifactIDsType + " = 'array' AND EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(" + jsonColumn + ") THEN " + jsonColumn + " ELSE '{}' END, '$.artifact_ids'))))"
+		nonBlocking := "(" + sqliteSafeJSONType(jsonColumn, "$.upgrade_non_blocking") + " = 'true' AND " + sqliteSafeJSONExtract(jsonColumn, "$.upgrade_non_blocking") + " = 1)"
+		transient := "(" + kind + " IN ('asr-progress', 'canceled', 'interrupted', 'queued-status') OR " +
+			kind + " LIKE 'codex-status-%' OR " + kind + " LIKE 'codex-progress-%' OR " + kind + " LIKE 'codex-compact-%' OR " +
+			kind + " LIKE 'status-%' OR " + kind + " LIKE 'compact-%' OR " + kind + " LIKE 'progress-%' OR " +
+			kind + " LIKE 'interrupted-after-restart%')"
+		trusted := "(json_valid(" + jsonColumn + ") AND " + sqliteSafeJSONType(jsonColumn, "$") + " = 'object' AND " + sqliteOutboxTopLevelKeysUniqueSQL("o") + " AND " + sqliteOutboxProjectionValidSQL("o") + ")"
+		due := sqliteOutboxNextAttemptDueSQL(jsonColumn, "o.deliver_after")
+		query := `WITH outbox_gate AS (
+SELECT ` + status + ` AS status,
+       ` + messageID + ` AS message_id,
+       ` + turnID + ` AS turn_id,
+       CASE WHEN ` + trusted + ` THEN 1 ELSE 0 END AS trusted,
+       CASE WHEN ` + due + ` THEN 1 ELSE 0 END AS due,
+       CASE WHEN ` + protected + ` THEN 1 ELSE 0 END AS protected,
+       CASE WHEN ` + nonBlocking + ` THEN 1 ELSE 0 END AS non_blocking,
+       CASE WHEN ` + transient + ` THEN 1 ELSE 0 END AS transient
+FROM outbox_messages o
+)
+SELECT 1
+FROM outbox_gate
+WHERE (trusted = 0 AND status NOT IN ('sent', 'skipped'))
+   OR (trusted = 1 AND (
+          status NOT IN ('queued', 'sending', 'accepted', 'sent', 'skipped')
+       OR (status IN ('sending', 'accepted') AND message_id = '')
+       OR (status = 'queued' AND due = 1 AND (protected = 1 OR (turn_id <> '' AND non_blocking = 0 AND transient = 0)))
+   ))
+LIMIT 1`
+		args := []any{
+			time.Time{}.UTC().Format(time.RFC3339Nano),
+			now.UTC().Format(time.RFC3339Nano),
+			now.UnixNano(),
+		}
+		var marker int
+		if scanErr := db.QueryRowContext(ctx, query, args...).Scan(&marker); errors.Is(scanErr, sql.ErrNoRows) {
+			return nil
+		} else if scanErr != nil {
+			return scanErr
+		}
+		blocked = marker != 0
+		return nil
+	})
+	return blocked, handled, err
+}
+
 // sqliteOutboxTurnProjectionReadySQL is the exact identity contract needed by
 // a native turn_id lookup. Unlike the general outbox projection contract, a
 // native turn lookup cannot tolerate a blank scalar beside a non-empty JSON
@@ -20825,6 +20898,11 @@ func (s *Store) queueTurnSQLite(ctx context.Context, turn Turn) (Turn, bool, boo
 				if err := validateQueueTurnSession(turn.SessionID, existing, nil); err != nil {
 					return err
 				}
+				if hasInbound {
+					if err := validateQueueTurnInboundIdentity(inbound, strings.TrimSpace(turn.InboundEventID), existing); err != nil {
+						return err
+					}
+				}
 				if !hasInbound || !inboundCanBeReconciledWithTurn(inbound, turn.InboundEventID, existing) {
 					return nil
 				}
@@ -20879,6 +20957,8 @@ func (s *Store) queueTurnSQLite(ctx context.Context, turn Turn) (Turn, bool, boo
 					}
 					return tx.Commit()
 				}
+				handled = true
+				return fmt.Errorf("%w: inbound %q references turn %q", ErrInboundTurnNotFound, strings.TrimSpace(inbound.ID), strings.TrimSpace(inbound.TurnID))
 			}
 			if strings.TrimSpace(turn.InboundEventID) != "" {
 				if existing, ok, err := findSQLiteTurnByInboundEventIDTx(ctx, tx, turn.InboundEventID); err != nil {

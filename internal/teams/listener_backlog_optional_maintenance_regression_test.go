@@ -120,6 +120,218 @@ func TestTeamsFastPollHintDoesNotKeepColdMaintenanceBlockedAfterBacklogDrains(t 
 	}
 }
 
+func TestTeamsOutboxOptionalMaintenanceProbeIsBoundedAndFailClosed(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			store := newBridgeTestStore(t)
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate outbox probe store: %v", err)
+				}
+			}
+			bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+			probe := func(t *testing.T) mainLoopOutboxFlushResult {
+				t.Helper()
+				result, err := bridge.observePendingOutboxForOptionalMaintenance(ctx)
+				if err != nil {
+					t.Fatalf("observe pending outbox: %v", err)
+				}
+				return result
+			}
+			if got := probe(t); got.SuppressOptionalMaintenance || got.PendingBlockingOutbox {
+				t.Fatalf("empty outbox probe = %#v, want no suppression", got)
+			}
+
+			now := time.Now().UTC()
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				state.OutboxMessages["outbox:probe:status"] = teamstore.OutboxMessage{
+					ID: "outbox:probe:status", TeamsChatID: "control", Kind: "status-progress",
+					Status: teamstore.OutboxStatusQueued, CreatedAt: now, UpdatedAt: now,
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed transient outbox: %v", err)
+			}
+			if got := probe(t); got.SuppressOptionalMaintenance || got.PendingBlockingOutbox {
+				t.Fatalf("transient control outbox probe = %#v, want nonblocking", got)
+			}
+
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				state.OutboxMessages["outbox:probe:final"] = teamstore.OutboxMessage{
+					ID: "outbox:probe:final", TeamsChatID: "work", TurnID: "turn-probe", Kind: "final",
+					Status: teamstore.OutboxStatusQueued, CreatedAt: now.Add(time.Second), UpdatedAt: now.Add(time.Second),
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed protected outbox: %v", err)
+			}
+			got := probe(t)
+			if !got.SuppressOptionalMaintenance || !got.PendingBlockingOutbox {
+				t.Fatalf("protected outbox probe = %#v, want suppression", got)
+			}
+
+			// A bounded page cannot prove that the tail contains only transient
+			// status rows. The probe must stay fail-closed instead of reopening
+			// cold work behind an unobserved protected row.
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				for i := 0; i < mainLoopOutboxFlushMaxScannedMessages+1; i++ {
+					id := fmt.Sprintf("outbox:probe:status:%03d", i)
+					state.OutboxMessages[id] = teamstore.OutboxMessage{
+						ID: id, TeamsChatID: "control", Kind: "status-progress",
+						Status: teamstore.OutboxStatusQueued, CreatedAt: now.Add(time.Duration(i+2) * time.Second), UpdatedAt: now,
+					}
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed bounded-page prefix: %v", err)
+			}
+			got = probe(t)
+			if !got.SuppressOptionalMaintenance {
+				t.Fatalf("truncated outbox probe = %#v, want fail-closed suppression", got)
+			}
+		})
+	}
+}
+
+func TestTeamsNormalMaintenanceFairCursorsAreIndependentAndRestartSafe(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			store := newBridgeTestStore(t)
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				state.ControlLease = teamstore.ControlLease{
+					HolderMachineID: "normal-fair-owner", Generation: 17,
+					Status: teamstore.ControlLeaseStatusActive, LeaseUntil: time.Now().Add(time.Hour),
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed normal fairness owner: %v", err)
+			}
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate normal fairness store: %v", err)
+				}
+			}
+			ownerCtx := withTeamsOwnerCapability(ctx, teamstore.OwnerMetadata{MachineID: "normal-fair-owner", LeaseGeneration: 17})
+			root := t.TempDir()
+			history := []string{
+				filepath.Join(root, "history-a"), filepath.Join(root, "history-b"),
+				filepath.Join(root, "history-c"), filepath.Join(root, "history-d"),
+				filepath.Join(root, "history-e"), filepath.Join(root, "history-f"),
+			}
+			linked := make([]linkedTranscriptSyncJob, 0, len(history))
+			for i := range history {
+				linked = append(linked, linkedTranscriptSyncJob{session: Session{ID: fmt.Sprintf("normal-linked-%02d", i)}})
+			}
+			discovery := make([]linkedTranscriptSyncJob, 0, len(history))
+			for i := range history {
+				discovery = append(discovery, linkedTranscriptSyncJob{session: Session{ID: fmt.Sprintf("normal-discovery-%02d", i)}})
+			}
+			bridge := &Bridge{store: store}
+			if err := bridge.restoreBacklogFairCursor(ownerCtx, teamstore.NormalFairLaneHistory, history); err != nil {
+				t.Fatalf("restore normal history cursor: %v", err)
+			}
+			historySelected := bridge.selectNormalHistoryPaths(history, 2)
+			if err := bridge.persistBacklogFairCursor(ownerCtx, teamstore.NormalFairLaneHistory); err != nil {
+				t.Fatalf("persist normal history cursor: %v", err)
+			}
+			linkedKeys := make([]string, 0, len(linked))
+			for _, job := range linked {
+				linkedKeys = append(linkedKeys, linkedTranscriptFairJobKey(job))
+			}
+			if err := bridge.restoreBacklogFairCursor(ownerCtx, teamstore.NormalFairLaneLinked, linkedKeys); err != nil {
+				t.Fatalf("restore normal linked cursor: %v", err)
+			}
+			linkedSelected := bridge.selectNormalLinkedJobs(linked, 2)
+			if err := bridge.persistBacklogFairCursor(ownerCtx, teamstore.NormalFairLaneLinked); err != nil {
+				t.Fatalf("persist normal linked cursor: %v", err)
+			}
+			discoveryKeys := make([]string, 0, len(discovery))
+			for _, job := range discovery {
+				discoveryKeys = append(discoveryKeys, linkedTranscriptFairJobKey(job))
+			}
+			if err := bridge.restoreBacklogFairCursor(ownerCtx, teamstore.NormalFairLaneLinkedDiscovery, discoveryKeys); err != nil {
+				t.Fatalf("restore normal linked discovery cursor: %v", err)
+			}
+			discoverySelected := bridge.selectNormalLinkedDiscoveryJobs(discovery, 2)
+			if err := bridge.persistBacklogFairCursor(ownerCtx, teamstore.NormalFairLaneLinkedDiscovery); err != nil {
+				t.Fatalf("persist normal linked discovery cursor: %v", err)
+			}
+			control, err := store.ReadControl(ctx)
+			if err != nil {
+				t.Fatalf("read normal fairness cursors: %v", err)
+			}
+			if control.NormalHistoryFairCursor != historySelected[len(historySelected)-1] {
+				t.Fatalf("normal history cursor = %q, want %q", control.NormalHistoryFairCursor, historySelected[len(historySelected)-1])
+			}
+			if control.NormalLinkedFairCursor != linkedTranscriptFairJobKey(linkedSelected[len(linkedSelected)-1]) {
+				t.Fatalf("normal linked cursor = %q, want %q", control.NormalLinkedFairCursor, linkedTranscriptFairJobKey(linkedSelected[len(linkedSelected)-1]))
+			}
+			if control.NormalHistoryFairCursor == control.NormalLinkedFairCursor {
+				t.Fatal("normal history and linked cursors unexpectedly share durable state")
+			}
+			if control.NormalLinkedDiscoveryFairCursor != linkedTranscriptFairJobKey(discoverySelected[len(discoverySelected)-1]) {
+				t.Fatalf("normal linked discovery cursor = %q, want %q", control.NormalLinkedDiscoveryFairCursor, linkedTranscriptFairJobKey(discoverySelected[len(discoverySelected)-1]))
+			}
+
+			restarted := &Bridge{store: store}
+			if err := restarted.restoreBacklogFairCursor(ownerCtx, teamstore.NormalFairLaneHistory, history); err != nil {
+				t.Fatalf("restore normal history cursor after restart: %v", err)
+			}
+			if got := restarted.selectNormalHistoryPaths(history, 2); !reflect.DeepEqual(got, history[2:4]) {
+				t.Fatalf("normal history after restart = %v, want %v", got, history[2:4])
+			}
+			if err := restarted.restoreBacklogFairCursor(ownerCtx, teamstore.NormalFairLaneLinked, linkedKeys); err != nil {
+				t.Fatalf("restore normal linked cursor after restart: %v", err)
+			}
+			gotLinked := restarted.selectNormalLinkedJobs(linked, 2)
+			if linkedTranscriptFairJobKey(gotLinked[0]) != linkedTranscriptFairJobKey(linked[2]) || linkedTranscriptFairJobKey(gotLinked[1]) != linkedTranscriptFairJobKey(linked[3]) {
+				t.Fatalf("normal linked after restart = %#v, want jobs 2/3", gotLinked)
+			}
+			if err := restarted.restoreBacklogFairCursor(ownerCtx, teamstore.NormalFairLaneLinkedDiscovery, discoveryKeys); err != nil {
+				t.Fatalf("restore normal linked discovery cursor after restart: %v", err)
+			}
+			gotDiscovery := restarted.selectNormalLinkedDiscoveryJobs(discovery, 2)
+			if linkedTranscriptFairJobKey(gotDiscovery[0]) != linkedTranscriptFairJobKey(discovery[2]) || linkedTranscriptFairJobKey(gotDiscovery[1]) != linkedTranscriptFairJobKey(discovery[3]) {
+				t.Fatalf("normal linked discovery after restart = %#v, want jobs 2/3", gotDiscovery)
+			}
+		})
+	}
+}
+
+func TestTeamsNormalLinkedCandidatesAreStableAndDoNotDuplicateSessions(t *testing.T) {
+	jobs := []linkedTranscriptSyncJob{
+		{session: Session{ID: "session-z"}, local: codexhistory.Session{FilePath: "/z"}},
+		{session: Session{ID: "session-a"}, local: codexhistory.Session{FilePath: "/a-old"}},
+		{session: Session{ID: "session-b"}, local: codexhistory.Session{FilePath: "/b"}},
+		{session: Session{ID: "session-a"}, local: codexhistory.Session{FilePath: "/a-new"}, mandatory: true},
+		{session: Session{ID: "session-z"}, local: codexhistory.Session{FilePath: "/z-duplicate"}},
+	}
+	got := canonicalizeLinkedTranscriptJobs(jobs)
+	if len(got) != 3 {
+		t.Fatalf("canonical linked job count = %d, want 3: %#v", len(got), got)
+	}
+	if got[0].session.ID != "session-a" || !got[0].mandatory || got[0].local.FilePath != "/a-new" {
+		t.Fatalf("canonical linked job did not retain mandatory duplicate: %#v", got[0])
+	}
+	if got[1].session.ID != "session-b" || got[2].session.ID != "session-z" {
+		t.Fatalf("canonical linked job order = %#v, want a,b,z", got)
+	}
+	selected := (&Bridge{}).selectNormalLinkedJobs(jobs, 2)
+	if len(selected) != 2 || selected[0].session.ID != "session-a" || selected[1].session.ID != "session-b" {
+		t.Fatalf("normal linked selection = %#v, want mandatory a then b", selected)
+	}
+}
+
 func TestTeamsBacklogOptionalQuantumLimitsColdDiscoveryToOneJob(t *testing.T) {
 	bridge := &Bridge{}
 	optionalPaths := []string{"optional-a", "optional-b", "optional-c"}

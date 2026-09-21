@@ -125,7 +125,20 @@ const (
 	// worker pool. Keep it to one cold job per fairness quantum so it cannot
 	// consume the same SQLite/phase budget as the live Teams lane. Mandatory
 	// recovery keeps the larger bounded quantum above.
-	maxBacklogOptionalMaintenanceJobs    = 1
+	maxBacklogOptionalMaintenanceJobs = 1
+	// Normal history/linked maintenance also gets a bounded execution quantum.
+	// The durable fair cursors ensure that limiting the worker set cannot strand
+	// a later path/session behind a stable lexical prefix.
+	// Keep more jobs than the normal four-worker pool in flight. A cooperative
+	// slow prefix must not prevent the worker dispatcher from observing a
+	// healthy tail after the phase context is canceled; the worker pool itself
+	// remains the hard concurrency bound.
+	maxNormalHistoryMaintenanceJobs = 8
+	// As with history, queue at least one complete worker-pool tail beyond the
+	// four concurrent workers. The worker pool remains the resource bound; the
+	// larger admission quantum is needed for a cooperative slow prefix to let a
+	// healthy fifth session observe the cancellation/retry edge.
+	maxNormalLinkedMaintenanceJobs       = 8
 	dashboardProjectsCacheTTL            = 30 * time.Second
 	subagentProjectsCacheTTL             = 30 * time.Second
 	persistentPollFailureRestartAfter    = 10 * time.Minute
@@ -1133,6 +1146,9 @@ type Bridge struct {
 	backlogHistoryDiscoveryCursor      int
 	backlogLinkedDiscoveryCursor       int
 	backlogLinkedRecoveryCursor        int
+	normalHistoryCursor                int
+	normalLinkedCursor                 int
+	normalLinkedDiscoveryCursor        int
 	backlogHistoryRecoveryCursorKey    string
 	backlogHistoryDiscoveryCursorKey   string
 	backlogLinkedDiscoveryCursorKey    string
@@ -1141,6 +1157,12 @@ type Bridge struct {
 	backlogHistoryDiscoveryExpectedKey string
 	backlogLinkedDiscoveryExpectedKey  string
 	backlogLinkedRecoveryExpectedKey   string
+	normalHistoryCursorKey             string
+	normalHistoryExpectedKey           string
+	normalLinkedCursorKey              string
+	normalLinkedExpectedKey            string
+	normalLinkedDiscoveryCursorKey     string
+	normalLinkedDiscoveryExpectedKey   string
 	backlogOptionalMaintenanceDueAt    time.Time
 	lastBeaconReconcile                time.Time
 	lastBeaconLeaseMaintenance         time.Time
@@ -2782,7 +2804,12 @@ func (b *Bridge) listenOwnerGeneration(ctx context.Context, opts BridgeOptions) 
 		// newly queued ACK/final rows only after that lane has had a chance to
 		// read and record user messages; an inherited outbox prefix must not delay
 		// the next Graph poll.
-		if err := runPhase("outbox", b.flushPendingOutboxMainLoop); err != nil && b.out != nil && !isOutboxDeliveryDeferred(err) {
+		var outboxPhaseResult mainLoopOutboxFlushResult
+		if err := runPhase("outbox", func(phaseCtx context.Context) error {
+			var err error
+			outboxPhaseResult, err = b.flushPendingOutboxMainLoopWithResult(phaseCtx)
+			return err
+		}); err != nil && b.out != nil && !isOutboxDeliveryDeferred(err) {
 			_, _ = fmt.Fprintf(b.out, "Teams outbox flush error: %v\n", err)
 		}
 		if err := runPhase("workflow", func(phaseCtx context.Context) error {
@@ -2798,7 +2825,7 @@ func (b *Bridge) listenOwnerGeneration(ctx context.Context, opts BridgeOptions) 
 		if !cycleDegraded {
 			maintenanceGateErr = runPhase("optional-maintenance-gate", func(phaseCtx context.Context) error {
 				var err error
-				optionalMaintenance, err = b.optionalMaintenancePlanForOwner(phaseCtx, time.Now())
+				optionalMaintenance, err = b.optionalMaintenancePlanForOwnerWithOutbox(phaseCtx, time.Now(), outboxPhaseResult.SuppressOptionalMaintenance)
 				return err
 			})
 			if maintenanceGateErr != nil {
@@ -3168,6 +3195,11 @@ type optionalMaintenancePlan struct {
 	backlogActive  bool
 }
 
+type mainLoopOutboxFlushResult struct {
+	SuppressOptionalMaintenance bool
+	PendingBlockingOutbox       bool
+}
+
 // normalOptionalMaintenanceStillAllowed closes the small admission race
 // between optionalMaintenancePlanForOwner and the cold phase itself. A poll
 // worker can durably create an inbound/turn backlog after the first probe has
@@ -3186,7 +3218,19 @@ func (b *Bridge) normalOptionalMaintenanceStillAllowed(ctx context.Context) (boo
 	if err != nil {
 		return false, err
 	}
-	return !backlog.Active(), nil
+	if backlog.Active() {
+		return false, nil
+	}
+	// Recheck the complete outbox safety state immediately before each cold
+	// phase. The outbox phase and this phase are separate durable boundaries;
+	// a poll/handler can enqueue a protected row between them. A bounded due
+	// page is not sufficient here because a large transient prefix or a legacy
+	// markerless provider row can hide an unsafe row behind the page limit.
+	outbox, err := b.observePendingOutboxForOptionalMaintenance(ctx)
+	if err != nil {
+		return false, err
+	}
+	return !outbox.SuppressOptionalMaintenance, nil
 }
 
 // optionalMaintenancePlanForOwner is the single admission point for the two
@@ -3194,6 +3238,14 @@ func (b *Bridge) normalOptionalMaintenanceStillAllowed(ctx context.Context) (boo
 // wake hint; the Teams backlog probe is still checked so a drained queue can
 // wake immediately after a restart or a long executor completion.
 func (b *Bridge) optionalMaintenancePlanForOwner(ctx context.Context, now time.Time) (optionalMaintenancePlan, error) {
+	return b.optionalMaintenancePlanForOwnerWithOutbox(ctx, now, false)
+}
+
+// optionalMaintenancePlanForOwnerWithOutbox adds only a cycle-local hint from
+// the preceding outbox phase. It is intentionally not part of the durable
+// TeamsOperationalBacklog schema: a queued outbox is re-read on the next
+// cycle, while the hint cannot create a second frontier or alter outbox CAS.
+func (b *Bridge) optionalMaintenancePlanForOwnerWithOutbox(ctx context.Context, now time.Time, suppressForOutbox bool) (optionalMaintenancePlan, error) {
 	if b == nil || b.store == nil {
 		return optionalMaintenancePlan{runNormal: true}, nil
 	}
@@ -3207,6 +3259,17 @@ func (b *Bridge) optionalMaintenancePlanForOwner(ctx context.Context, now time.T
 	backlog, err := b.store.TeamsOperationalBacklog(ctx)
 	if err != nil {
 		return optionalMaintenancePlan{}, err
+	}
+	if suppressForOutbox && !backlog.Active() {
+		// The outbox phase already ran its ambiguous-result recovery lane. A
+		// remaining due protected row, or an outbox read/send error, is enough to
+		// keep optional history/transcript work out of this cycle. Mandatory
+		// source-proof/rewrite recovery still gets its own bounded path.
+		mandatory, mandatoryErr := b.optionalMaintenanceNeedsMandatory(ctx)
+		if mandatoryErr != nil {
+			return optionalMaintenancePlan{}, mandatoryErr
+		}
+		return optionalMaintenancePlan{runMandatory: mandatory, backlogActive: true}, nil
 	}
 	if !backlog.Active() {
 		if b.pollForegroundPressureBlocksColdMaintenance() {
@@ -3472,6 +3535,12 @@ func backlogFairCursorValue(control teamstore.ServiceControl, lane string) strin
 		return strings.TrimSpace(control.BacklogLinkedDiscoveryFairCursor)
 	case teamstore.BacklogFairLaneLinked:
 		return strings.TrimSpace(control.BacklogLinkedFairCursor)
+	case teamstore.NormalFairLaneHistory:
+		return strings.TrimSpace(control.NormalHistoryFairCursor)
+	case teamstore.NormalFairLaneLinked:
+		return strings.TrimSpace(control.NormalLinkedFairCursor)
+	case teamstore.NormalFairLaneLinkedDiscovery:
+		return strings.TrimSpace(control.NormalLinkedDiscoveryFairCursor)
 	default:
 		return ""
 	}
@@ -3536,6 +3605,18 @@ func (b *Bridge) restoreBacklogFairCursor(ctx context.Context, lane string, keys
 		b.backlogLinkedRecoveryCursor = start
 		b.backlogLinkedRecoveryCursorKey = cursor
 		b.backlogLinkedRecoveryExpectedKey = cursor
+	case teamstore.NormalFairLaneHistory:
+		b.normalHistoryCursor = start
+		b.normalHistoryCursorKey = cursor
+		b.normalHistoryExpectedKey = cursor
+	case teamstore.NormalFairLaneLinked:
+		b.normalLinkedCursor = start
+		b.normalLinkedCursorKey = cursor
+		b.normalLinkedExpectedKey = cursor
+	case teamstore.NormalFairLaneLinkedDiscovery:
+		b.normalLinkedDiscoveryCursor = start
+		b.normalLinkedDiscoveryCursorKey = cursor
+		b.normalLinkedDiscoveryExpectedKey = cursor
 	}
 	b.backlogMaintenanceMu.Unlock()
 	return nil
@@ -3560,6 +3641,15 @@ func (b *Bridge) persistBacklogFairCursor(ctx context.Context, lane string) erro
 	case teamstore.BacklogFairLaneLinked:
 		cursor = b.backlogLinkedRecoveryCursorKey
 		expected = b.backlogLinkedRecoveryExpectedKey
+	case teamstore.NormalFairLaneHistory:
+		cursor = b.normalHistoryCursorKey
+		expected = b.normalHistoryExpectedKey
+	case teamstore.NormalFairLaneLinked:
+		cursor = b.normalLinkedCursorKey
+		expected = b.normalLinkedExpectedKey
+	case teamstore.NormalFairLaneLinkedDiscovery:
+		cursor = b.normalLinkedDiscoveryCursorKey
+		expected = b.normalLinkedDiscoveryExpectedKey
 	}
 	b.backlogMaintenanceMu.Unlock()
 	if cursor == "" {
@@ -3583,6 +3673,12 @@ func (b *Bridge) persistBacklogFairCursor(ctx context.Context, lane string) erro
 		b.backlogLinkedDiscoveryExpectedKey = cursor
 	case teamstore.BacklogFairLaneLinked:
 		b.backlogLinkedRecoveryExpectedKey = cursor
+	case teamstore.NormalFairLaneHistory:
+		b.normalHistoryExpectedKey = cursor
+	case teamstore.NormalFairLaneLinked:
+		b.normalLinkedExpectedKey = cursor
+	case teamstore.NormalFairLaneLinkedDiscovery:
+		b.normalLinkedDiscoveryExpectedKey = cursor
 	}
 	b.backlogMaintenanceMu.Unlock()
 	return nil
@@ -15340,6 +15436,20 @@ func (b *Bridge) processDeferredInbound(ctx context.Context) error {
 		turn, turnCreated, err := b.queueTurn(ctx, session, inbound)
 		if err != nil {
 			cleanupPrompt()
+			if errors.Is(err, teamstore.ErrInboundTurnNotFound) || errors.Is(err, teamstore.ErrInboundTurnConflict) {
+				// A dangling or conflicting inbound/Turn link is durable state
+				// corruption, not a transient admission failure. Leaving the row
+				// deferred would make every phase repeat the same QueueTurn lookup
+				// forever. Hold only this inbound for explicit repair; do not clear
+				// its link, manufacture a replacement Turn, or touch other messages.
+				if holdErr := b.markDeferredInboundManualHold(ctx, inbound.ID, err.Error(), "repair the inbound/Turn provenance before replay", "inspect the linked inbound and Turn, then perform an explicit repair", "explicit owner-fenced state repair"); holdErr != nil {
+					return holdErr
+				}
+				if firstRowErr == nil {
+					firstRowErr = err
+				}
+				continue
+			}
 			return err
 		}
 		if !turnCreated {
@@ -22940,6 +23050,51 @@ func (b *Bridge) flushPendingOutboxMainLoop(ctx context.Context) error {
 		return sideEffectErr
 	}
 	return errors.Join(recoveryErr, sideEffectErr)
+}
+
+// flushPendingOutboxMainLoopWithResult preserves the historical error-only
+// helper for direct callers while exposing one cycle-local scheduling fact to
+// Listen. The fact is advisory: it never claims, completes, retries, or
+// changes an outbox row. Any read uncertainty fails closed for optional cold
+// maintenance, while the next cycle re-runs the normal sender/recovery path.
+func (b *Bridge) flushPendingOutboxMainLoopWithResult(ctx context.Context) (mainLoopOutboxFlushResult, error) {
+	result := mainLoopOutboxFlushResult{}
+	err := b.flushPendingOutboxMainLoop(ctx)
+	if err != nil {
+		result.SuppressOptionalMaintenance = true
+	}
+	observation, observeErr := b.observePendingOutboxForOptionalMaintenance(ctx)
+	if observeErr != nil {
+		result.SuppressOptionalMaintenance = true
+	} else {
+		result.PendingBlockingOutbox = observation.PendingBlockingOutbox
+		result.SuppressOptionalMaintenance = result.SuppressOptionalMaintenance || observation.SuppressOptionalMaintenance
+	}
+	return result, err
+}
+
+// observePendingOutboxForOptionalMaintenance is a read-only scheduling probe.
+// It never claims or mutates a row. The snapshot is deliberately complete:
+// a bounded due page can hide a protected final behind a large transient
+// prefix, and the ordinary pending query does not include every legacy or
+// provider-state shape (for example an Accepted row without a message ID).
+// Unknown and markerless provider states therefore fail closed, while queued
+// transient control output remains eligible for optional maintenance.
+func (b *Bridge) observePendingOutboxForOptionalMaintenance(ctx context.Context) (mainLoopOutboxFlushResult, error) {
+	result := mainLoopOutboxFlushResult{}
+	if b == nil || b.store == nil {
+		return result, nil
+	}
+	blocked, err := b.store.OutboxOptionalMaintenanceBlocked(ctx, time.Now())
+	if err != nil {
+		result.SuppressOptionalMaintenance = true
+		return result, err
+	}
+	if blocked {
+		result.PendingBlockingOutbox = true
+		result.SuppressOptionalMaintenance = true
+	}
+	return result, nil
 }
 
 // pendingMainLoopOutboxChatIDs is a bounded, read-only preflight used only to
@@ -31306,6 +31461,21 @@ func (b *Bridge) syncLinkedTranscriptsWithDiscoveryOptionsAndBacklog(ctx context
 			needsDiscovery = append(needsDiscovery, session)
 		}
 	}
+	normalLinkedCursorSelected := false
+	if !deferOptional {
+		jobs = canonicalizeLinkedTranscriptJobs(jobs)
+	}
+	if !deferOptional && len(jobs) > maxNormalLinkedMaintenanceJobs {
+		keys := make([]string, 0, len(jobs))
+		for _, job := range jobs {
+			keys = append(keys, linkedTranscriptFairJobKey(job))
+		}
+		if err := b.restoreBacklogFairCursor(ctx, teamstore.NormalFairLaneLinked, keys); err != nil {
+			return errors.Join(append(preErrors, err)...)
+		}
+		jobs = b.selectNormalLinkedJobs(jobs, maxNormalLinkedMaintenanceJobs)
+		normalLinkedCursorSelected = true
+	}
 	if deferOptional {
 		mandatoryJobs := make([]linkedTranscriptSyncJob, 0, len(jobs))
 		optionalJobs := make([]linkedTranscriptSyncJob, 0, len(jobs))
@@ -31350,6 +31520,11 @@ func (b *Bridge) syncLinkedTranscriptsWithDiscoveryOptionsAndBacklog(ctx context
 		// quantum; otherwise a restart replays the same prefix and can starve
 		// the tail forever while the backlog remains active.
 		if cursorErr := b.persistBacklogFairCursor(ctx, teamstore.BacklogFairLaneLinked); cursorErr != nil {
+			preErrors = append(preErrors, cursorErr)
+		}
+	}
+	if normalLinkedCursorSelected && backlogFairCursorPersistAllowed(ctx, jobErr) {
+		if cursorErr := b.persistBacklogFairCursor(ctx, teamstore.NormalFairLaneLinked); cursorErr != nil {
 			preErrors = append(preErrors, cursorErr)
 		}
 	}
@@ -31494,8 +31669,28 @@ func (b *Bridge) syncLinkedTranscriptsWithDiscoveryOptionsAndBacklog(ctx context
 			skipNonEssentialSideEffects: queueOnly,
 		})
 	}
+	normalLinkedDiscoveryCursorSelected := false
+	if !deferOptional {
+		discoveredJobs = canonicalizeLinkedTranscriptJobs(discoveredJobs)
+	}
+	if !deferOptional && len(discoveredJobs) > maxNormalLinkedMaintenanceJobs {
+		keys := make([]string, 0, len(discoveredJobs))
+		for _, job := range discoveredJobs {
+			keys = append(keys, linkedTranscriptFairJobKey(job))
+		}
+		if err := b.restoreBacklogFairCursor(ctx, teamstore.NormalFairLaneLinkedDiscovery, keys); err != nil {
+			return errors.Join(append(preErrors, err)...)
+		}
+		discoveredJobs = b.selectNormalLinkedDiscoveryJobs(discoveredJobs, maxNormalLinkedMaintenanceJobs)
+		normalLinkedDiscoveryCursorSelected = true
+	}
 	if err := b.runLinkedTranscriptSyncJobs(ctx, discoveredJobs, loadSessionState); err != nil {
 		preErrors = append(preErrors, err)
+	}
+	if normalLinkedDiscoveryCursorSelected && backlogFairCursorPersistAllowed(ctx, preErrors...) {
+		if cursorErr := b.persistBacklogFairCursor(ctx, teamstore.NormalFairLaneLinkedDiscovery); cursorErr != nil {
+			preErrors = append(preErrors, cursorErr)
+		}
 	}
 	return errors.Join(preErrors...)
 }
@@ -31573,6 +31768,44 @@ func (b *Bridge) selectBacklogLinkedRecoveryJobsWithLimit(jobs []linkedTranscrip
 	return selected
 }
 
+func (b *Bridge) selectNormalLinkedJobs(jobs []linkedTranscriptSyncJob, limit int) []linkedTranscriptSyncJob {
+	jobs = canonicalizeLinkedTranscriptJobs(jobs)
+	if limit <= 0 || len(jobs) <= limit || b == nil {
+		return jobs
+	}
+	b.backlogMaintenanceMu.Lock()
+	start := b.normalLinkedCursor % len(jobs)
+	b.normalLinkedCursor = (start + limit) % len(jobs)
+	b.backlogMaintenanceMu.Unlock()
+	selected := make([]linkedTranscriptSyncJob, 0, limit)
+	for i := 0; i < limit; i++ {
+		selected = append(selected, jobs[(start+i)%len(jobs)])
+	}
+	b.backlogMaintenanceMu.Lock()
+	b.normalLinkedCursorKey = linkedTranscriptFairJobKey(selected[len(selected)-1])
+	b.backlogMaintenanceMu.Unlock()
+	return selected
+}
+
+func (b *Bridge) selectNormalLinkedDiscoveryJobs(jobs []linkedTranscriptSyncJob, limit int) []linkedTranscriptSyncJob {
+	jobs = canonicalizeLinkedTranscriptJobs(jobs)
+	if limit <= 0 || len(jobs) <= limit || b == nil {
+		return jobs
+	}
+	b.backlogMaintenanceMu.Lock()
+	start := b.normalLinkedDiscoveryCursor % len(jobs)
+	b.normalLinkedDiscoveryCursor = (start + limit) % len(jobs)
+	b.backlogMaintenanceMu.Unlock()
+	selected := make([]linkedTranscriptSyncJob, 0, limit)
+	for i := 0; i < limit; i++ {
+		selected = append(selected, jobs[(start+i)%len(jobs)])
+	}
+	b.backlogMaintenanceMu.Lock()
+	b.normalLinkedDiscoveryCursorKey = linkedTranscriptFairJobKey(selected[len(selected)-1])
+	b.backlogMaintenanceMu.Unlock()
+	return selected
+}
+
 // selectBacklogLinkedRecoveryJobsWithOptionalReserve selects one bounded
 // quantum from the combined mandatory/optional candidate space.  The cursor
 // is advanced exactly once, so a mandatory failure cannot reset or overwrite
@@ -31635,6 +31868,55 @@ func linkedTranscriptFairJobKey(job linkedTranscriptSyncJob) string {
 		return sessionID
 	}
 	return strings.TrimSpace(job.local.FilePath)
+}
+
+// canonicalizeLinkedTranscriptJobs makes the normal maintenance candidate
+// set independent of registry/map iteration order. A duplicated session must
+// not consume two fairness slots or run two checkpoint workers in one cycle;
+// when duplicate rows disagree, retain the one carrying the mandatory fence.
+func canonicalizeLinkedTranscriptJobs(jobs []linkedTranscriptSyncJob) []linkedTranscriptSyncJob {
+	if len(jobs) <= 1 {
+		return jobs
+	}
+	byKey := make(map[string]linkedTranscriptSyncJob, len(jobs))
+	for index, job := range jobs {
+		key := linkedTranscriptFairJobKey(job)
+		if key == "" {
+			// An invalid job has no durable fairness identity. Preserve it with a
+			// deterministic private key so it cannot collapse every other invalid
+			// candidate into one slot; the normal worker will report its existing
+			// validation error.
+			key = fmt.Sprintf("\x00invalid-%08d", index)
+		}
+		if previous, ok := byKey[key]; !ok || linkedTranscriptJobPreferred(job, previous) {
+			byKey[key] = job
+		}
+	}
+	keys := make([]string, 0, len(byKey))
+	for key := range byKey {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	out := make([]linkedTranscriptSyncJob, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, byKey[key])
+	}
+	return out
+}
+
+func linkedTranscriptJobPreferred(candidate, previous linkedTranscriptSyncJob) bool {
+	if candidate.mandatory != previous.mandatory {
+		return candidate.mandatory
+	}
+	if candidate.hasCheckpoint != previous.hasCheckpoint {
+		return candidate.hasCheckpoint
+	}
+	candidatePath := strings.TrimSpace(candidate.local.FilePath)
+	previousPath := strings.TrimSpace(previous.local.FilePath)
+	if candidatePath != previousPath {
+		return candidatePath < previousPath
+	}
+	return strings.TrimSpace(candidate.local.SessionID) < strings.TrimSpace(previous.local.SessionID)
 }
 
 func (b *Bridge) recordLinkedTranscriptDiscoverySuccess(now time.Time) {

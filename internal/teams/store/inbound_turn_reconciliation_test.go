@@ -374,3 +374,104 @@ func TestQueueTurnRejectsMissingInboundWithoutCreatingOrphanAcrossBackends(t *te
 		})
 	}
 }
+
+func TestQueueTurnRejectsDanglingInboundTurnAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	for _, useSQLite := range []bool{false, true} {
+		useSQLite := useSQLite
+		backend := "json"
+		if useSQLite {
+			backend = "sqlite"
+		}
+		t.Run(backend, func(t *testing.T) {
+			store := newTestStore(t)
+			if useSQLite {
+				seedLegacyStateFileForSQLiteMigrationTest(t, store)
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			session := testSession()
+			session.ID = "queue-dangling-inbound-session-" + backend
+			session.TeamsChatID = "queue-dangling-inbound-chat-" + backend
+			if _, created, err := store.CreateSession(ctx, session); err != nil || !created {
+				t.Fatalf("CreateSession created=%v err=%v", created, err)
+			}
+			const inboundID = "inbound:queue-dangling-turn"
+			const missingTurnID = "turn:queue-dangling-turn-missing"
+			inbound := InboundEvent{
+				ID: inboundID, SessionID: session.ID, TeamsChatID: session.TeamsChatID,
+				TeamsMessageID: "message-queue-dangling-turn-" + backend,
+				TurnID:         missingTurnID, Status: InboundStatusQueued,
+			}
+			if err := store.Update(ctx, func(state *State) error {
+				state.InboundEvents[inbound.ID] = inbound
+				return nil
+			}); err != nil {
+				t.Fatalf("seed dangling inbound: %v", err)
+			}
+			before, err := store.Load(ctx)
+			if err != nil {
+				t.Fatalf("Load before dangling rejection: %v", err)
+			}
+			if _, created, err := store.QueueTurn(ctx, Turn{SessionID: session.ID, InboundEventID: inbound.ID}); !errors.Is(err, ErrInboundTurnNotFound) || created {
+				t.Fatalf("dangling QueueTurn created=%v err=%v, want fail-closed", created, err)
+			}
+			after, err := store.Load(ctx)
+			if err != nil {
+				t.Fatalf("Load after dangling rejection: %v", err)
+			}
+			beforeInbound := before.InboundEvents[inbound.ID]
+			afterInbound := after.InboundEvents[inbound.ID]
+			if len(after.Turns) != len(before.Turns) || afterInbound.ID != beforeInbound.ID || afterInbound.TurnID != beforeInbound.TurnID || afterInbound.Status != beforeInbound.Status || afterInbound.FailureCount != beforeInbound.FailureCount || afterInbound.LastError != beforeInbound.LastError {
+				t.Fatalf("dangling inbound was mutated: before=%#v after=%#v", before.InboundEvents[inbound.ID], after.InboundEvents[inbound.ID])
+			}
+			if _, created, err := store.QueueTurn(ctx, Turn{SessionID: session.ID, InboundEventID: inbound.ID}); !errors.Is(err, ErrInboundTurnNotFound) || created {
+				t.Fatalf("repeated dangling QueueTurn created=%v err=%v, want same fail-closed result", created, err)
+			}
+		})
+	}
+}
+
+func TestQueueTurnRejectsTurnInboundIdentityCollisionAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	for _, useSQLite := range []bool{false, true} {
+		useSQLite := useSQLite
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := newTestStore(t)
+			if useSQLite {
+				seedLegacyStateFileForSQLiteMigrationTest(t, store)
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			session := testSession()
+			session.ID = "queue-collision-session-" + name
+			session.TeamsChatID = "queue-collision-chat-" + name
+			if _, created, err := store.CreateSession(ctx, session); err != nil || !created {
+				t.Fatalf("CreateSession created=%v err=%v", created, err)
+			}
+			first := InboundEvent{ID: "inbound:collision:first:" + name, SessionID: session.ID, TeamsChatID: session.TeamsChatID, TeamsMessageID: "message-collision-first-" + name, Status: InboundStatusPersisted}
+			second := InboundEvent{ID: "inbound:collision:second:" + name, SessionID: session.ID, TeamsChatID: session.TeamsChatID, TeamsMessageID: "message-collision-second-" + name, Status: InboundStatusPersisted}
+			for _, inbound := range []InboundEvent{first, second} {
+				if _, created, err := store.PersistInbound(ctx, inbound); err != nil || !created {
+					t.Fatalf("PersistInbound %q created=%v err=%v", inbound.ID, created, err)
+				}
+			}
+			queued, created, err := store.QueueTurn(ctx, Turn{SessionID: session.ID, InboundEventID: first.ID})
+			if err != nil || !created {
+				t.Fatalf("initial QueueTurn created=%v err=%v", created, err)
+			}
+			if _, created, err := store.QueueTurn(ctx, Turn{ID: queued.ID, SessionID: session.ID, InboundEventID: second.ID}); !errors.Is(err, ErrInboundTurnConflict) || created {
+				t.Fatalf("colliding QueueTurn created=%v err=%v, want ErrInboundTurnConflict", created, err)
+			}
+			unchanged, ok, err := store.InboundEventByID(ctx, second.ID)
+			if err != nil || !ok {
+				t.Fatalf("second inbound after collision = %#v ok=%v err=%v", unchanged, ok, err)
+			}
+			if unchanged.TurnID != "" || unchanged.Status != InboundStatusPersisted {
+				t.Fatalf("collision mutated second inbound = %#v", unchanged)
+			}
+		})
+	}
+}

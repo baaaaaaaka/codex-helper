@@ -293,6 +293,13 @@ var ErrInboundIgnored = errors.New("inbound event is terminally ignored")
 // durable Turn whose missing inbound is treated as a corruption case.
 var ErrInboundNotFound = errors.New("inbound event not found")
 
+// ErrInboundTurnNotFound means that a durable inbound event already points at
+// a Turn which is missing. QueueTurn must fail closed in this case: clearing
+// the link or creating a replacement Turn could either duplicate an external
+// execution or hide a durable-state corruption. Repair is an explicit,
+// owner-fenced operation, not an admission side effect.
+var ErrInboundTurnNotFound = errors.New("inbound event references a missing turn")
+
 // ErrSessionStateProvenanceMismatch is returned when a scoped state lookup
 // finds a checkpoint owned by a different durable Teams session. Such state
 // must fail closed instead of being treated as a missing checkpoint.
@@ -1626,6 +1633,12 @@ type ServiceControl struct {
 	BacklogHistoryDiscoveryFairCursor string `json:"backlog_history_discovery_fair_cursor,omitempty"`
 	BacklogLinkedDiscoveryFairCursor  string `json:"backlog_linked_discovery_fair_cursor,omitempty"`
 	BacklogLinkedFairCursor           string `json:"backlog_linked_fair_cursor,omitempty"`
+	// Normal*FairCursor fields bound the optional non-backlog history/linked
+	// quantum. They are scheduling hints only and are fenced exactly like the
+	// backlog cursors; they never authorize a checkpoint/frontier write.
+	NormalHistoryFairCursor         string `json:"normal_history_fair_cursor,omitempty"`
+	NormalLinkedFairCursor          string `json:"normal_linked_fair_cursor,omitempty"`
+	NormalLinkedDiscoveryFairCursor string `json:"normal_linked_discovery_fair_cursor,omitempty"`
 	// AmbiguousOutboxRecoveryCursor is a restart-safe message keyset cursor for
 	// the cold reconciliation lane. It never authorizes a resend: the recovery
 	// query still exposes only expired unknown outcomes and the bridge performs
@@ -1639,6 +1652,9 @@ const (
 	BacklogFairLaneHistoryDiscovery = "history-discovery"
 	BacklogFairLaneLinkedDiscovery  = "linked-discovery"
 	BacklogFairLaneLinked           = "linked"
+	NormalFairLaneHistory           = "normal-history"
+	NormalFairLaneLinked            = "normal-linked"
+	NormalFairLaneLinkedDiscovery   = "normal-linked-discovery"
 )
 
 // TeamsOperationalBacklog is the bounded admission view used by the listener
@@ -6595,6 +6611,31 @@ func (s *Store) OutboxStateSnapshot(ctx context.Context) (State, error) {
 	return s.loadStateFieldsOrFull(ctx, outboxStateSnapshotFields)
 }
 
+// OutboxOptionalMaintenanceBlocked answers the optional cold-maintenance gate
+// without hydrating outbox bodies on the SQLite hot path. The SQLite backend
+// proves the small scheduling/identity predicate from native columns and
+// JSON1; the legacy JSON backend retains the exact typed fallback. A false
+// result therefore means either that SQLite proved no blocking row or that
+// the JSON fallback classified the complete outbox snapshot.
+func (s *Store) OutboxOptionalMaintenanceBlocked(ctx context.Context, now time.Time) (bool, error) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if blocked, handled, err := s.outboxOptionalMaintenanceBlockedSQLite(ctx, now); handled || err != nil {
+		return blocked, err
+	}
+	state, err := s.OutboxStateSnapshot(ctx)
+	if err != nil {
+		return true, err
+	}
+	for _, msg := range state.OutboxMessages {
+		if OutboxBlocksOptionalMaintenanceAt(msg, now) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // ReadControlChat returns only the durable control-chat binding.  Listener
 // startup uses this as a compatibility fallback when the registry projection
 // is empty; it must not pull the outbox or inbound tables into memory.
@@ -8074,6 +8115,12 @@ func (s *Store) setBacklogFairCursorForOwner(ctx context.Context, lane string, c
 			current = &next.BacklogLinkedDiscoveryFairCursor
 		case BacklogFairLaneLinked:
 			current = &next.BacklogLinkedFairCursor
+		case NormalFairLaneHistory:
+			current = &next.NormalHistoryFairCursor
+		case NormalFairLaneLinked:
+			current = &next.NormalLinkedFairCursor
+		case NormalFairLaneLinkedDiscovery:
+			current = &next.NormalLinkedDiscoveryFairCursor
 		default:
 			return false, fmt.Errorf("unknown backlog fairness lane %q", lane)
 		}
@@ -10754,6 +10801,53 @@ func OutboxDeliveryTransient(msg OutboxMessage) bool {
 	return outboxDeliveryTransient(msg)
 }
 
+// OutboxBlocksOptionalMaintenance identifies a due, durable delivery that is
+// important enough to keep cold history/transcript work out of the current
+// listener cycle. This is deliberately narrower than "any queued outbox":
+// transient status/ACK rows and low-priority control output must not keep a
+// large inherited control-chat backlog from ever reaching optional history.
+// The sender still owns all FIFO, lease, attempt, rate-limit, and Graph-result
+// rules; this predicate is only a scheduling hint.
+func OutboxBlocksOptionalMaintenance(msg OutboxMessage) bool {
+	if msg.Status != OutboxStatusQueued {
+		return false
+	}
+	// A protected delivery is never downgraded by the legacy
+	// UpgradeNonBlocking hint. That hint is only valid for explicitly
+	// transient status/ACK output; accepting it before this check would let a
+	// final/attachment row disappear behind cold maintenance.
+	if outboxDeliveryProtected(msg) {
+		return true
+	}
+	if msg.UpgradeNonBlocking || outboxDeliveryTransient(msg) {
+		return false
+	}
+	return strings.TrimSpace(msg.TurnID) != ""
+}
+
+// OutboxBlocksOptionalMaintenanceAt is the conservative scheduling predicate
+// used by a full outbox safety probe. Unlike OutboxBlocksOptionalMaintenance,
+// it also treats provider-state rows without a durable Teams message ID as
+// unsafe to run alongside optional cold maintenance. Such rows are not safe
+// to silently skip: a later sender/recovery pass must settle them first, but
+// it must never infer that a missing row means a safe new POST.
+func OutboxBlocksOptionalMaintenanceAt(msg OutboxMessage, now time.Time) bool {
+	if strings.TrimSpace(string(msg.Status)) == "" || !knownOutboxStatus(msg.Status) {
+		return true
+	}
+	switch msg.Status {
+	case OutboxStatusSending, OutboxStatusAccepted:
+		return strings.TrimSpace(msg.TeamsMessageID) == ""
+	case OutboxStatusQueued:
+		if !msg.NextAttemptAt.IsZero() && !now.IsZero() && now.Before(msg.NextAttemptAt) {
+			return false
+		}
+		return OutboxBlocksOptionalMaintenance(msg)
+	default:
+		return false
+	}
+}
+
 func OutboxSendIsAmbiguous(msg OutboxMessage) bool {
 	return msg.Status == OutboxStatusSending && strings.HasPrefix(strings.TrimSpace(msg.LastSendError), "ambiguous Graph send;")
 }
@@ -10835,6 +10929,9 @@ func (s *Store) QueueTurn(ctx context.Context, turn Turn) (Turn, bool, error) {
 			}
 			inbound, found := state.InboundEvents[inboundID]
 			if found {
+				if err := validateQueueTurnInboundIdentity(inbound, inboundID, existing); err != nil {
+					return err
+				}
 				if err := validateQueueTurnSession(turn.SessionID, existing, &inbound); err != nil {
 					return err
 				}
@@ -10876,6 +10973,7 @@ func (s *Store) QueueTurn(ctx context.Context, turn Turn) (Turn, bool, error) {
 						out = existing
 						return reconcileExisting(existing)
 					}
+					return fmt.Errorf("%w: inbound %q references turn %q", ErrInboundTurnNotFound, strings.TrimSpace(inbound.ID), strings.TrimSpace(inbound.TurnID))
 				}
 			}
 			if existing, ok, err := findTurnByInboundEventIDLocked(state, turn.InboundEventID); err != nil {
@@ -10971,6 +11069,20 @@ func inboundCanBeReconciledWithTurn(inbound InboundEvent, inboundID string, turn
 		return true
 	}
 	return strings.TrimSpace(turn.InboundEventID) == "" && strings.TrimSpace(turn.ID) == turnID(inboundID)
+}
+
+func validateQueueTurnInboundIdentity(inbound InboundEvent, inboundID string, existing Turn) error {
+	inboundID = strings.TrimSpace(inboundID)
+	if inboundID == "" {
+		return nil
+	}
+	if existingInboundID := strings.TrimSpace(existing.InboundEventID); existingInboundID != "" && existingInboundID != inboundID {
+		return fmt.Errorf("%w: turn %q already belongs to inbound %q, requested %q", ErrInboundTurnConflict, strings.TrimSpace(existing.ID), existingInboundID, inboundID)
+	}
+	if inboundTurnID := strings.TrimSpace(inbound.TurnID); inboundTurnID != "" && inboundTurnID != strings.TrimSpace(existing.ID) {
+		return fmt.Errorf("%w: inbound %q belongs to turn %q, requested %q", ErrInboundTurnConflict, inboundID, inboundTurnID, strings.TrimSpace(existing.ID))
+	}
+	return nil
 }
 
 // validateQueueTurnSession keeps the idempotent lookup scoped to the requested

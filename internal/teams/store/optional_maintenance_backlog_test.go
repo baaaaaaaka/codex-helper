@@ -100,6 +100,115 @@ func TestTeamsOperationalBacklogAcrossBackends(t *testing.T) {
 	}
 }
 
+func TestOutboxBlocksOptionalMaintenanceKeepsTransientControlOutputNonBlocking(t *testing.T) {
+	tests := []struct {
+		name string
+		msg  OutboxMessage
+		want bool
+	}{
+		{name: "final", msg: OutboxMessage{Status: OutboxStatusQueued, Kind: "final", TurnID: "turn-1"}, want: true},
+		{name: "nonblocking flag cannot downgrade final", msg: OutboxMessage{Status: OutboxStatusQueued, Kind: "final", TurnID: "turn-1", UpgradeNonBlocking: true}, want: true},
+		{name: "turn-bound helper", msg: OutboxMessage{Status: OutboxStatusQueued, Kind: "helper", TurnID: "turn-1"}, want: true},
+		{name: "transient status", msg: OutboxMessage{Status: OutboxStatusQueued, Kind: "codex-status-1", TurnID: "turn-1"}, want: false},
+		{name: "explicit nonblocking", msg: OutboxMessage{Status: OutboxStatusQueued, Kind: "helper", TurnID: "turn-1", UpgradeNonBlocking: true}, want: false},
+		{name: "control output", msg: OutboxMessage{Status: OutboxStatusQueued, Kind: "control"}, want: false},
+		{name: "sending unknown", msg: OutboxMessage{Status: OutboxStatusSending, Kind: "final", TurnID: "turn-1"}, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := OutboxBlocksOptionalMaintenance(test.msg); got != test.want {
+				t.Fatalf("OutboxBlocksOptionalMaintenance(%#v) = %v, want %v", test.msg, got, test.want)
+			}
+		})
+	}
+
+	now := time.Now()
+	for _, test := range []struct {
+		name string
+		msg  OutboxMessage
+		want bool
+	}{
+		{name: "markerless sending", msg: OutboxMessage{Status: OutboxStatusSending, Kind: "helper"}, want: true},
+		{name: "markerless accepted", msg: OutboxMessage{Status: OutboxStatusAccepted, Kind: "helper"}, want: true},
+		{name: "unknown status", msg: OutboxMessage{Status: OutboxStatus("future-provider-state")}, want: true},
+		{name: "future transient retry", msg: OutboxMessage{Status: OutboxStatusQueued, Kind: "status-progress", NextAttemptAt: now.Add(time.Hour)}, want: false},
+		{name: "due protected", msg: OutboxMessage{Status: OutboxStatusQueued, Kind: "final", TurnID: "turn-2"}, want: true},
+	} {
+		t.Run("at/"+test.name, func(t *testing.T) {
+			if got := OutboxBlocksOptionalMaintenanceAt(test.msg, now); got != test.want {
+				t.Fatalf("OutboxBlocksOptionalMaintenanceAt(%#v) = %v, want %v", test.msg, got, test.want)
+			}
+		})
+	}
+}
+
+func TestOutboxOptionalMaintenanceBlockedMatchesConservativePredicateAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 21, 12, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name string
+		msg  OutboxMessage
+		want bool
+	}{
+		{name: "final cannot be downgraded", msg: OutboxMessage{Status: OutboxStatusQueued, Kind: "final", TurnID: "turn-1", UpgradeNonBlocking: true}, want: true},
+		{name: "turn-bound durable output", msg: OutboxMessage{Status: OutboxStatusQueued, Kind: "helper", TurnID: "turn-1"}, want: true},
+		{name: "turn-bound transient output", msg: OutboxMessage{Status: OutboxStatusQueued, Kind: "status-progress", TurnID: "turn-1"}, want: false},
+		{name: "explicit nonblocking turn output", msg: OutboxMessage{Status: OutboxStatusQueued, Kind: "helper", TurnID: "turn-1", UpgradeNonBlocking: true}, want: false},
+		{name: "unbound control output", msg: OutboxMessage{Status: OutboxStatusQueued, Kind: "control"}, want: false},
+		{name: "future retry is not due", msg: OutboxMessage{Status: OutboxStatusQueued, Kind: "final", TurnID: "turn-1", NextAttemptAt: now.Add(time.Hour)}, want: false},
+		{name: "markerless sending", msg: OutboxMessage{Status: OutboxStatusSending, Kind: "helper"}, want: true},
+		{name: "marked accepted", msg: OutboxMessage{Status: OutboxStatusAccepted, Kind: "helper", TeamsMessageID: "teams-message-1"}, want: false},
+		{name: "markerless accepted", msg: OutboxMessage{Status: OutboxStatusAccepted, Kind: "helper"}, want: true},
+		{name: "unknown provider status", msg: OutboxMessage{Status: OutboxStatus("provider-future-state"), Kind: "helper"}, want: true},
+		{name: "terminal sent", msg: OutboxMessage{Status: OutboxStatusSent, Kind: "final", TurnID: "turn-1"}, want: false},
+	}
+	for _, backend := range []string{"json", "sqlite"} {
+		for _, test := range tests {
+			t.Run(backend+"/"+test.name, func(t *testing.T) {
+				st := newTestStore(t)
+				msg := test.msg
+				msg.ID = "outbox-gate-test"
+				msg.CreatedAt = now
+				msg.UpdatedAt = now
+				seedMsg := msg
+				// The migration intentionally quarantines an unknown status before
+				// the native gate can inspect it. Create a valid row first, then
+				// emulate a forward-compatible provider status in the migrated
+				// projection. The gate must still fail closed for that row.
+				if backend == "sqlite" && test.name == "unknown provider status" {
+					seedMsg.Status = OutboxStatusQueued
+				}
+				if err := st.Update(ctx, func(state *State) error {
+					state.OutboxMessages[seedMsg.ID] = seedMsg
+					return nil
+				}); err != nil {
+					t.Fatalf("seed outbox row: %v", err)
+				}
+				if backend == "sqlite" {
+					migrateStoreToSQLiteForTest(t, st)
+					if test.name == "unknown provider status" {
+						withSQLiteTxForTest(t, st, func(tx *sql.Tx) error {
+							_, err := tx.ExecContext(ctx, `UPDATE outbox_messages SET status = ?, json = json_set(json, '$.status', ?) WHERE id = ?`, string(msg.Status), string(msg.Status), msg.ID)
+							return err
+						})
+					}
+				}
+				got, err := st.OutboxOptionalMaintenanceBlocked(ctx, now)
+				if err != nil {
+					t.Fatalf("OutboxOptionalMaintenanceBlocked: %v", err)
+				}
+				want := OutboxBlocksOptionalMaintenanceAt(msg, now)
+				if want != test.want {
+					t.Fatalf("test expectation is inconsistent: predicate = %v, want %v", want, test.want)
+				}
+				if got != test.want {
+					t.Fatalf("OutboxOptionalMaintenanceBlocked = %v, want %v for %#v", got, test.want, msg)
+				}
+			})
+		}
+	}
+}
+
 func TestTeamsOperationalBacklogIgnoresRegistryMigrationProvenanceAcrossBackends(t *testing.T) {
 	ctx := context.Background()
 	for _, backend := range []string{"json", "sqlite"} {

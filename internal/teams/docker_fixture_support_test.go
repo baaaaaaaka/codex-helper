@@ -317,8 +317,27 @@ func dockerFixtureRemapCodexPaths(t *testing.T, store *teamstore.Store) {
 		if path == "" {
 			return "", nil
 		}
-		sourceRoot := filepath.Clean(filepath.FromSlash(sourcePrefix))
 		candidate := filepath.Clean(filepath.FromSlash(path))
+		canonicalRoot := filepath.Clean(filepath.FromSlash(canonicalHome))
+		if os.Getenv(dockerCodexMountEnv) == "1" {
+			// A restart reuses the disposable SQLite runtime after the first
+			// process has already rewritten paths to the container mount.  Treat
+			// that canonical form as an idempotent input, but keep the same strict
+			// sessions-only containment rule as for the frozen host prefix.
+			if candidate == canonicalRoot {
+				if allowHome {
+					return canonicalRoot, nil
+				}
+				return "", fmt.Errorf("Codex source path is the home directory, not a copied session: %q", path)
+			}
+			if canonicalRelative, err := filepath.Rel(canonicalRoot, candidate); err == nil && filepath.IsAbs(candidate) && canonicalRelative != ".." && !strings.HasPrefix(canonicalRelative, ".."+string(filepath.Separator)) {
+				sessionsRoot := filepath.FromSlash("sessions")
+				if canonicalRelative == sessionsRoot || strings.HasPrefix(canonicalRelative, sessionsRoot+string(filepath.Separator)) {
+					return filepath.Join(canonicalRoot, canonicalRelative), nil
+				}
+			}
+		}
+		sourceRoot := filepath.Clean(filepath.FromSlash(sourcePrefix))
 		if candidate == sourceRoot {
 			if allowHome {
 				return canonicalHome, nil
@@ -1322,7 +1341,14 @@ func dockerFixtureSourcePath(fixtureRoot string, persistedPath string) string {
 			return ""
 		}
 		if os.Getenv(dockerCodexMountEnv) == "1" {
-			return dockerFixtureContainedRegularPath(filepath.Dir(sourcePrefix), persistedPath)
+			// The fixture may be assembled from a frozen host Codex root while
+			// the container always mounts that copy at /home/baka/.codex.  Map
+			// both the original source prefix and the already-remapped canonical
+			// prefix into the mounted root; resolving the canonical path against
+			// filepath.Dir(sourcePrefix) would escape to /home/baka when the
+			// source prefix is a temporary host directory.
+			mountedRoot := filepath.Clean(filepath.FromSlash(dockerFixtureCodexDir))
+			return dockerFixtureContainedRegularPath(mountedRoot, filepath.Join(mountedRoot, relative))
 		}
 		return dockerFixtureContainedRegularPath(filepath.Join(fixtureRoot, "codex"), filepath.Join(fixtureRoot, "codex", relative))
 	}
@@ -1505,6 +1531,22 @@ func TestDockerFixtureSourcePathFailsClosedOutsideCopiedSessions(t *testing.T) {
 		if got := dockerFixtureSourcePath(fixtureRoot, path); got != "" {
 			t.Fatalf("unsafe copied session path %q mapped to %q", path, got)
 		}
+	}
+}
+
+func TestDockerFixtureSourcePathMapsFrozenCodexRootIntoMountedPath(t *testing.T) {
+	t.Setenv(dockerCodexMountEnv, "1")
+	t.Setenv(dockerCodexSourceEnv, "/tmp/cxp-real-frozen-codex-test/.codex")
+
+	persisted := "/tmp/cxp-real-frozen-codex-test/.codex/sessions/2026/09/21/thread.jsonl"
+	want := filepath.Join(filepath.FromSlash(dockerFixtureCodexDir), "sessions", "2026", "09", "21", "thread.jsonl")
+	if got := dockerFixtureSourcePath(t.TempDir(), persisted); got != want {
+		t.Fatalf("frozen Codex path = %q, want mounted path %q", got, want)
+	}
+
+	canonicalPersisted := filepath.Join(filepath.FromSlash(dockerFixtureCodexDir), "sessions", "2026", "09", "21", "thread.jsonl")
+	if got := dockerFixtureSourcePath(t.TempDir(), canonicalPersisted); got != want {
+		t.Fatalf("canonical mounted Codex path = %q, want %q", got, want)
 	}
 }
 

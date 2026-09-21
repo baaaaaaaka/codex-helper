@@ -356,6 +356,25 @@ func (b *Bridge) selectBacklogHistoryRecoveryPathsWithLimit(paths []string, limi
 	return uniqueSortedCleanPaths(selected)
 }
 
+func (b *Bridge) selectNormalHistoryPaths(paths []string, limit int) []string {
+	paths = uniqueSortedCleanPaths(paths)
+	if limit <= 0 || len(paths) <= limit || b == nil {
+		return paths
+	}
+	b.backlogMaintenanceMu.Lock()
+	start := b.normalHistoryCursor % len(paths)
+	b.normalHistoryCursor = (start + limit) % len(paths)
+	b.backlogMaintenanceMu.Unlock()
+	selected := make([]string, 0, limit)
+	for i := 0; i < limit; i++ {
+		selected = append(selected, paths[(start+i)%len(paths)])
+	}
+	b.backlogMaintenanceMu.Lock()
+	b.normalHistoryCursorKey = selected[len(selected)-1]
+	b.backlogMaintenanceMu.Unlock()
+	return uniqueSortedCleanPaths(selected)
+}
+
 func (b *Bridge) selectBacklogHistoryDiscoveryPaths(paths []string, limit int) []string {
 	paths = uniqueSortedCleanPaths(paths)
 	if limit <= 0 || len(paths) == 0 || b == nil {
@@ -754,24 +773,100 @@ func (b *Bridge) syncCodexHistoryFinals(ctx context.Context, now time.Time, reco
 	// line; the durable checkpoint/CAS path still decides whether each source
 	// may advance.
 	changes = historyWatchPrioritizePaths(changes, selectedRecovery, dirtyPaths)
+	allChanges := append([]string(nil), changes...)
+	// Recovery and watcher-dirty paths are urgent. Keep them ahead of the
+	// normal fairness lane instead of feeding the already-prioritized combined
+	// list into selectNormalHistoryPaths (which sorts it again and can demote
+	// the very paths that caused this scan). The urgent lane is bounded too;
+	// any remainder stays dirty/retry-visible for the next cycle.
+	urgentSet := make(map[string]struct{}, len(selectedRecovery)+len(dirtyPaths))
+	for _, path := range selectedRecovery {
+		if key := cleanComparablePath(path); key != "" {
+			urgentSet[key] = struct{}{}
+		}
+	}
+	for _, path := range dirtyPaths {
+		if key := cleanComparablePath(path); key != "" {
+			urgentSet[key] = struct{}{}
+		}
+	}
+	urgentChanges := make([]string, 0, len(urgentSet))
+	normalChanges := make([]string, 0, len(changes))
+	for _, path := range changes {
+		if _, urgent := urgentSet[cleanComparablePath(path)]; urgent {
+			urgentChanges = append(urgentChanges, path)
+		} else {
+			normalChanges = append(normalChanges, path)
+		}
+	}
+	if len(urgentChanges) > maxNormalHistoryMaintenanceJobs {
+		urgentChanges = urgentChanges[:maxNormalHistoryMaintenanceJobs]
+	}
+	changes = append([]string(nil), urgentChanges...)
+	normalHistoryCursorSelected := false
+	remainingNormalSlots := maxNormalHistoryMaintenanceJobs - len(urgentChanges)
+	if remainingNormalSlots > 0 && len(normalChanges) > remainingNormalSlots {
+		if cursorErr := b.restoreBacklogFairCursor(ctx, teamstore.NormalFairLaneHistory, normalChanges); cursorErr != nil {
+			firstErr = joinHistoryWatchErrors(firstErr, cursorErr)
+		} else {
+			changes = append(changes, b.selectNormalHistoryPaths(normalChanges, remainingNormalSlots)...)
+			normalHistoryCursorSelected = true
+		}
+	} else if remainingNormalSlots > 0 {
+		changes = append(changes, normalChanges...)
+	}
+	selectedNormal := make(map[string]struct{}, len(changes))
+	for _, path := range changes {
+		selectedNormal[cleanComparablePath(path)] = struct{}{}
+	}
+	deferredNormal := make([]string, 0, len(normalChanges))
+	for _, path := range normalChanges {
+		if _, selected := selectedNormal[cleanComparablePath(path)]; !selected {
+			deferredNormal = append(deferredNormal, path)
+		}
+	}
+	// A full reconcile can discover more ordinary changed paths than the
+	// bounded quantum can execute. Keep those paths in the existing dirty/retry
+	// lane so a successful partial cycle cannot advance the reconcile timer and
+	// strand the unselected tail for five minutes. This is only a scheduling
+	// hint; each retry still re-proves the source and uses its checkpoint CAS.
+	if len(deferredNormal) > 0 {
+		b.historyWatchRetryDirtyPaths(deferredNormal)
+	}
 	if scanErr != nil {
 		firstErr = joinHistoryWatchErrors(firstErr, scanErr)
 	}
 	if scanErr == nil {
-		changed := make(map[string]struct{}, len(changes))
-		for _, path := range changes {
+		changed := make(map[string]struct{}, len(allChanges))
+		selected := make(map[string]struct{}, len(changes))
+		for _, path := range allChanges {
 			changed[cleanComparablePath(path)] = struct{}{}
 		}
+		for _, path := range changes {
+			selected[cleanComparablePath(path)] = struct{}{}
+		}
 		for _, path := range dirtyPaths {
-			if _, ok := changed[cleanComparablePath(path)]; !ok {
+			key := cleanComparablePath(path)
+			if _, ok := changed[key]; !ok {
 				b.historyWatchAckDirtyPath(path)
+			} else if !normalHistoryCursorSelected {
+				// The unbounded normal path retains its historical behavior; the
+				// bounded path below only acknowledges selected work.
+				continue
+			} else if _, ok := selected[key]; ok {
+				// Selected dirty paths are acknowledged after their worker batch.
+				continue
 			}
 		}
+	}
+	if firstErr != nil && normalHistoryCursorSelected {
+		return firstErr
 	}
 	syncErr := b.runHistoryWatchSyncJobs(ctx, changes, now)
 	if scanErr != nil || syncErr != nil {
 		retryPaths := append([]string(nil), dirtyPaths...)
 		retryPaths = append(retryPaths, selectedRecovery...)
+		retryPaths = append(retryPaths, deferredNormal...)
 		b.historyWatchRetryDirtyPaths(retryPaths)
 		if watchUncertain {
 			// A full scan caused by an uncertain watcher may discover a changed
@@ -783,10 +878,37 @@ func (b *Bridge) syncCodexHistoryFinals(ctx context.Context, now time.Time, reco
 	if scanErr == nil && syncErr == nil {
 		ackPaths := append([]string(nil), dirtyPaths...)
 		ackPaths = append(ackPaths, selectedRecovery...)
+		if normalHistoryCursorSelected {
+			selected := make(map[string]struct{}, len(changes))
+			all := make(map[string]struct{}, len(allChanges))
+			for _, path := range changes {
+				selected[cleanComparablePath(path)] = struct{}{}
+			}
+			for _, path := range allChanges {
+				all[cleanComparablePath(path)] = struct{}{}
+			}
+			filtered := ackPaths[:0]
+			deferred := make([]string, 0)
+			for _, path := range ackPaths {
+				key := cleanComparablePath(path)
+				if _, ok := selected[key]; ok {
+					filtered = append(filtered, path)
+				} else if _, ok := all[key]; ok {
+					deferred = append(deferred, path)
+				}
+			}
+			ackPaths = filtered
+			b.historyWatchRetryDirtyPaths(deferred)
+		}
 		b.historyWatchAckDirtyPaths(ackPaths)
 	}
 	if recoveryCursorSelected && backlogFairCursorPersistAllowed(ctx, firstErr, scanErr, syncErr) {
 		if cursorErr := b.persistBacklogFairCursor(ctx, teamstore.BacklogFairLaneHistoryDiscovery); cursorErr != nil {
+			syncErr = errors.Join(syncErr, cursorErr)
+		}
+	}
+	if normalHistoryCursorSelected && backlogFairCursorPersistAllowed(ctx, firstErr, scanErr, syncErr) {
+		if cursorErr := b.persistBacklogFairCursor(ctx, teamstore.NormalFairLaneHistory); cursorErr != nil {
 			syncErr = errors.Join(syncErr, cursorErr)
 		}
 	}
