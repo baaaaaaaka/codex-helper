@@ -58,24 +58,28 @@ exit 64
 	// invariant itself. Give the hosted race binary a finite startup margin;
 	// otherwise race instrumentation can spend the whole two-second window
 	// before the shell publishes its child PID and turn a valid cleanup check
-	// into a false "did not start" failure.
+	// into a false "did not start" failure.  Redirection creates the file before
+	// printf has finished writing it, so existence alone is not a readiness
+	// signal on macOS.
 	deadline := time.Now().Add(5 * time.Second)
+	var pid int
+	var pidReadErr error
+	var pidParseErr error
 	for {
-		if _, err := os.Stat(childPIDPath); err == nil {
-			break
+		pidRaw, readErr := os.ReadFile(childPIDPath)
+		pidReadErr = readErr
+		if readErr == nil {
+			candidate, parseErr := strconv.Atoi(strings.TrimSpace(string(pidRaw)))
+			pidParseErr = parseErr
+			if parseErr == nil && candidate > 0 {
+				pid = candidate
+				break
+			}
 		}
 		if time.Now().After(deadline) {
-			t.Fatal("migration fixture did not start its child process")
+			t.Fatalf("migration fixture did not publish a valid child PID: read_err=%v parse_err=%v", pidReadErr, pidParseErr)
 		}
 		time.Sleep(10 * time.Millisecond)
-	}
-	pidRaw, err := os.ReadFile(childPIDPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(pidRaw)))
-	if err != nil {
-		t.Fatal(err)
 	}
 	childStartTime := ""
 	if runtime.GOOS == "linux" {
