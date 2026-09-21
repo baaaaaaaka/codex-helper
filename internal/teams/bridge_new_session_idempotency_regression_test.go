@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,6 +24,7 @@ func TestBridgeDeferredControlNewUnknownCreateResultIsHeldWithoutAutomaticReplay
 	resources := make(map[string]string)
 	var createdResources int
 	var sent int
+	var evidenceMu sync.Mutex
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch {
@@ -39,6 +41,7 @@ func TestBridgeDeferredControlNewUnknownCreateResultIsHeldWithoutAutomaticReplay
 			if strings.TrimSpace(body.ExternalID) == "" {
 				t.Fatal("create-or-get request did not contain an external id")
 			}
+			evidenceMu.Lock()
 			externalIDs = append(externalIDs, body.ExternalID)
 			chatID, ok := resources[body.ExternalID]
 			if !ok {
@@ -46,7 +49,9 @@ func TestBridgeDeferredControlNewUnknownCreateResultIsHeldWithoutAutomaticReplay
 				chatID = fmt.Sprintf("work-chat-%d", createdResources)
 				resources[body.ExternalID] = chatID
 			}
-			if len(externalIDs) == 1 {
+			requestNumber := len(externalIDs)
+			evidenceMu.Unlock()
+			if requestNumber == 1 {
 				// The remote operation has happened, but the client sees only an
 				// unknown transport result.  This is the failure mode that a plain
 				// POST cannot safely replay.
@@ -94,6 +99,11 @@ func TestBridgeDeferredControlNewUnknownCreateResultIsHeldWithoutAutomaticReplay
 	}, store, &recordingExecutor{})
 	bridge.reg.Sessions = nil
 	seedDeferredControlOperationMetadata(t, store, bridge, messageID)
+	evidence := func() (int, int) {
+		evidenceMu.Lock()
+		defer evidenceMu.Unlock()
+		return len(externalIDs), createdResources
+	}
 
 	if err := bridge.processDeferredInbound(ctx); err != nil {
 		t.Fatalf("first replay should durably hold the unknown result: %v", err)
@@ -107,8 +117,9 @@ func TestBridgeDeferredControlNewUnknownCreateResultIsHeldWithoutAutomaticReplay
 	if inbound.Status != teamstore.InboundStatusUncertain || inbound.OperationState != "request_started_unknown" || inbound.OperationKey == "" {
 		t.Fatalf("inbound status after unknown result = %#v, want durable uncertainty", inbound)
 	}
-	if len(externalIDs) != 1 || createdResources != 1 {
-		t.Fatalf("create-or-get evidence = externalIDs=%#v resources=%d, want one remote operation", externalIDs, createdResources)
+	externalCount, resourceCount := evidence()
+	if externalCount != 1 || resourceCount != 1 {
+		t.Fatalf("create-or-get evidence = externalIDs=%d resources=%d, want one remote operation", externalCount, resourceCount)
 	}
 	candidates, err := store.InboundRecoveryCandidates(ctx)
 	if err != nil {
@@ -120,8 +131,9 @@ func TestBridgeDeferredControlNewUnknownCreateResultIsHeldWithoutAutomaticReplay
 	if err := bridge.processDeferredInbound(ctx); err != nil {
 		t.Fatalf("second recovery sweep after unknown result: %v", err)
 	}
-	if len(externalIDs) != 1 || createdResources != 1 {
-		t.Fatalf("unknown result was reposted on second sweep: externalIDs=%#v resources=%d", externalIDs, createdResources)
+	externalCount, resourceCount = evidence()
+	if externalCount != 1 || resourceCount != 1 {
+		t.Fatalf("unknown result was reposted on second sweep: externalIDs=%d resources=%d", externalCount, resourceCount)
 	}
 }
 
