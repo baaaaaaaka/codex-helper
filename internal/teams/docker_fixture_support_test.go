@@ -1539,7 +1539,11 @@ func TestDockerFixtureSourcePathMapsFrozenCodexRootIntoMountedPath(t *testing.T)
 	t.Setenv(dockerCodexSourceEnv, "/tmp/cxp-real-frozen-codex-test/.codex")
 
 	persisted := "/tmp/cxp-real-frozen-codex-test/.codex/sessions/2026/09/21/thread.jsonl"
-	want := filepath.Join(filepath.FromSlash(dockerFixtureCodexDir), "sessions", "2026", "09", "21", "thread.jsonl")
+	wantRoot, err := filepath.Abs(filepath.FromSlash(dockerFixtureCodexDir))
+	if err != nil {
+		t.Fatalf("resolve mounted Codex root: %v", err)
+	}
+	want := filepath.Join(wantRoot, "sessions", "2026", "09", "21", "thread.jsonl")
 	if got := dockerFixtureSourcePath(t.TempDir(), persisted); got != want {
 		t.Fatalf("frozen Codex path = %q, want mounted path %q", got, want)
 	}
