@@ -576,17 +576,30 @@ func TestHistoryWatchRebaseScanProgressBypassesFinalBatchBuffer(t *testing.T) {
 		State:          transcriptParseState{sessionID: "session", threadID: "thread"},
 	}
 	batch := &historyWatchBatchUpdates{}
-	ctx := context.WithValue(context.Background(), historyWatchBatchUpdateContextKey{}, batch)
+	parent, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ctx := context.WithValue(parent, historyWatchBatchUpdateContextKey{}, batch)
 	bridge := &Bridge{store: store}
 	if err := bridge.recordHistoryWatchRebaseScanProgress(ctx, id, &expected, previous, path, source, progress, time.Now()); err != nil {
 		t.Fatalf("persist rebase progress: %v", err)
 	}
-	if got := len(batch.snapshot()); got != 0 {
-		t.Fatalf("rebase progress queued in final batch: %d updates", got)
+	if updates := batch.snapshot(); len(updates) != 1 || !updates[0].persistAfterCancel {
+		t.Fatalf("rebase progress batch updates = %#v, want one post-cancel update", updates)
 	}
 	state, err := store.HistoryWatchState(context.Background())
 	if err != nil {
 		t.Fatalf("read rebase checkpoint: %v", err)
+	}
+	if checkpoint := state.HistoryWatch[id]; checkpoint.SourceRewriteRecoveryScanPending {
+		t.Fatalf("rebase progress became durable before batch apply: %#v", checkpoint)
+	}
+	cancel()
+	if err := bridge.applyHistoryWatchBatchUpdates(ctx, batch); err != nil {
+		t.Fatalf("apply canceled rebase progress batch: %v", err)
+	}
+	state, err = store.HistoryWatchState(context.Background())
+	if err != nil {
+		t.Fatalf("read applied rebase checkpoint: %v", err)
 	}
 	checkpoint := state.HistoryWatch[id]
 	if !checkpoint.SourceRewriteRecoveryScanPending || checkpoint.SourceRewriteRecoveryScanOffset != progress.Offset {

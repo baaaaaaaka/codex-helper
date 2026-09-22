@@ -24,10 +24,13 @@ type historyWatchSessionLookupContextKey struct{}
 
 type historyWatchBatchUpdateContextKey struct{}
 
+type historyWatchBatchPersistAfterCancelContextKey struct{}
+
 type historyWatchBatchUpdate struct {
-	id       string
-	expected *teamstore.HistoryWatchCheckpoint
-	next     *teamstore.HistoryWatchCheckpoint
+	id                 string
+	expected           *teamstore.HistoryWatchCheckpoint
+	next               *teamstore.HistoryWatchCheckpoint
+	persistAfterCancel bool
 }
 
 // historyWatchBatchUpdates coalesces only the final checkpoint CAS writes of
@@ -230,7 +233,25 @@ func (b *Bridge) applyHistoryWatchBatchUpdates(ctx context.Context, batch *histo
 	if len(updates) == 0 {
 		return nil
 	}
-	return b.updateHistoryWatch(ctx, func(history map[string]teamstore.HistoryWatchCheckpoint, _ *time.Time) error {
+	persistCtx := ctx
+	var cancel context.CancelFunc
+	for _, update := range updates {
+		if !update.persistAfterCancel {
+			continue
+		}
+		// A bounded rebase scan records a resume cursor immediately before its
+		// child budget expires. Preserve that old durability guarantee even when
+		// the parent phase has already been canceled, but keep the write bounded
+		// and owner-fenced rather than allowing a canceled phase to linger.
+		if persistCtx == nil {
+			persistCtx = context.Background()
+		}
+		persistCtx = context.WithoutCancel(persistCtx)
+		persistCtx, cancel = context.WithTimeout(persistCtx, 2*time.Second)
+		defer cancel()
+		break
+	}
+	return b.updateHistoryWatch(persistCtx, func(history map[string]teamstore.HistoryWatchCheckpoint, _ *time.Time) error {
 		for _, update := range updates {
 			id := strings.TrimSpace(update.id)
 			if id == "" {
@@ -2134,12 +2155,13 @@ func (b *Bridge) recordHistoryWatchCheckpoint(ctx context.Context, id string, st
 func (b *Bridge) recordHistoryWatchCheckpointIfCurrent(ctx context.Context, id string, expected *teamstore.HistoryWatchCheckpoint, state historyTieredFileState, now time.Time) error {
 	checkpoint := historyWatchCheckpointFromState(id, state, now)
 	if batch, ok := ctx.Value(historyWatchBatchUpdateContextKey{}).(*historyWatchBatchUpdates); ok {
+		persistAfterCancel, _ := ctx.Value(historyWatchBatchPersistAfterCancelContextKey{}).(bool)
 		var expectedCopy *teamstore.HistoryWatchCheckpoint
 		if expected != nil {
 			copy := *expected
 			expectedCopy = &copy
 		}
-		batch.add(historyWatchBatchUpdate{id: id, expected: expectedCopy, next: &checkpoint})
+		batch.add(historyWatchBatchUpdate{id: id, expected: expectedCopy, next: &checkpoint, persistAfterCancel: persistAfterCancel})
 		return nil
 	}
 	if err := b.updateHistoryWatchCheckpointIfCurrent(ctx, id, expected, checkpoint); errors.Is(err, teamstore.ErrHistoryWatchCheckpointConflict) {

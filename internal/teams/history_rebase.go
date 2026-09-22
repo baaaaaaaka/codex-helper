@@ -726,9 +726,9 @@ func (b *Bridge) recordHistoryWatchRebaseScanProgress(ctx context.Context, id st
 	defer cancel()
 	// Rebase scan progress is an intermediate resume cursor, not the final
 	// checkpoint produced by the worker. It must survive a phase-budget
-	// cancellation before the worker returns; do not defer it into the batch
-	// final-write buffer.
-	persistCtx = context.WithValue(persistCtx, historyWatchBatchUpdateContextKey{}, nil)
+	// cancellation before the worker returns; mark it for the bounded batch
+	// write that uses the same short post-cancellation durability window.
+	persistCtx = context.WithValue(persistCtx, historyWatchBatchPersistAfterCancelContextKey{}, true)
 	return b.recordHistoryWatchCheckpointIfCurrent(persistCtx, id, expected, next, now)
 }
 
