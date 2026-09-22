@@ -22668,16 +22668,16 @@ func loadSQLiteQueueClaimCheckpointTx(ctx context.Context, tx *sql.Tx, sessionID
 }
 
 func (s *Store) claimNextQueuedTurnSQLite(ctx context.Context, sessionID string) (Turn, bool, bool, error) {
-	result, handled, err := s.claimNextQueuedTurnSQLiteWithOwnerAndInbound(ctx, sessionID, storeOwnerCapability{})
+	result, handled, err := s.claimNextQueuedTurnSQLiteWithOwnerAndInbound(ctx, sessionID, storeOwnerCapability{}, false)
 	return result.turn, result.claimed, handled, err
 }
 
 func (s *Store) claimNextQueuedTurnSQLiteWithOwner(ctx context.Context, sessionID string, capability storeOwnerCapability) (Turn, bool, bool, error) {
-	result, handled, err := s.claimNextQueuedTurnSQLiteWithOwnerAndInbound(ctx, sessionID, capability)
+	result, handled, err := s.claimNextQueuedTurnSQLiteWithOwnerAndInbound(ctx, sessionID, capability, false)
 	return result.turn, result.claimed, handled, err
 }
 
-func (s *Store) claimNextQueuedTurnSQLiteWithOwnerAndInbound(ctx context.Context, sessionID string, capability storeOwnerCapability) (queuedTurnClaimResult, bool, error) {
+func (s *Store) claimNextQueuedTurnSQLiteWithOwnerAndInbound(ctx context.Context, sessionID string, capability storeOwnerCapability, includeInbound bool) (queuedTurnClaimResult, bool, error) {
 	var result queuedTurnClaimResult
 	handled := false
 	err := s.withSessionLock(ctx, sessionID, func() error {
@@ -22802,24 +22802,26 @@ func (s *Store) claimNextQueuedTurnSQLiteWithOwnerAndInbound(ctx context.Context
 					return err
 				}
 			}
-			inboundID := strings.TrimSpace(turn.InboundEventID)
-			result.inboundRead = true
-			if inboundID != "" {
-				result.inbound, result.inboundFound, err = loadSQLiteJSONRow[InboundEvent](ctx, tx, `SELECT json FROM inbound_events WHERE id = ?`, inboundID)
-				if err != nil {
-					// Preserve the historical malformed-inbound behavior: the
-					// queued turn must still cross the claim boundary so the bridge
-					// can route the decode error through its existing interrupted/
-					// attention path. The row read is an optimization, not a reason
-					// to roll a valid claim back into a retry loop.
-					result.turn = turn
-					result.claimed = true
-					result.inboundRead = false
-					if commitErr := tx.Commit(); commitErr != nil {
-						result.claimed = false
-						return commitErr
+			if includeInbound {
+				inboundID := strings.TrimSpace(turn.InboundEventID)
+				result.inboundRead = true
+				if inboundID != "" {
+					result.inbound, result.inboundFound, err = loadSQLiteJSONRow[InboundEvent](ctx, tx, `SELECT json FROM inbound_events WHERE id = ?`, inboundID)
+					if err != nil {
+						// Preserve the historical malformed-inbound behavior: the
+						// queued turn must still cross the claim boundary so the bridge
+						// can route the decode error through its existing interrupted/
+						// attention path. The row read is an optimization, not a reason
+						// to roll a valid claim back into a retry loop.
+						result.turn = turn
+						result.claimed = true
+						result.inboundRead = false
+						if commitErr := tx.Commit(); commitErr != nil {
+							result.claimed = false
+							return commitErr
+						}
+						return err
 					}
-					return err
 				}
 			}
 			if err := tx.Commit(); err != nil {

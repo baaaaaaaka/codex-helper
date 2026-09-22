@@ -155,3 +155,32 @@ func TestClaimNextQueuedTurnWithInboundCommitsClaimBeforeMalformedInboundError(t
 		t.Fatalf("reclaim after malformed inbound = claimed:%v found:%v read:%v, want false/false/false", claimedAgain, inboundAgain, inboundReadAgain)
 	}
 }
+
+func TestClaimNextQueuedTurnLegacyPathDoesNotReadInboundSnapshot(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Now().UTC()
+	const sessionID = "claim-legacy-malformed-inbound-session"
+	const inboundID = "claim-legacy-malformed-inbound-event"
+	const turnID = "claim-legacy-malformed-inbound-turn"
+	if err := st.Update(ctx, func(state *State) error {
+		state.Sessions[sessionID] = SessionContext{ID: sessionID, Status: SessionStatusActive}
+		state.InboundEvents[inboundID] = InboundEvent{ID: inboundID, SessionID: sessionID, Status: InboundStatusQueued, TurnID: turnID, CreatedAt: now, UpdatedAt: now}
+		state.Turns[turnID] = Turn{ID: turnID, SessionID: sessionID, InboundEventID: inboundID, Status: TurnStatusQueued, QueuedAt: now, CreatedAt: now, UpdatedAt: now}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, st)
+	withSQLiteTxForTest(t, st, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE inbound_events SET json = ? WHERE id = ?`, []byte(`{"broken"`), inboundID)
+		return err
+	})
+
+	// The legacy API is still used by prepared/preferred paths. It must retain
+	// its old read boundary and claim without decoding inbound provenance.
+	claimed, claimedOK, err := st.ClaimNextQueuedTurn(ctx, sessionID)
+	if err != nil || !claimedOK || claimed.ID != turnID || claimed.Status != TurnStatusRunning {
+		t.Fatalf("legacy claim = turn:%#v claimed:%v err:%v, want running claim without inbound decode", claimed, claimedOK, err)
+	}
+}

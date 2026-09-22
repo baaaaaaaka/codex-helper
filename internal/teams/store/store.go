@@ -11302,16 +11302,20 @@ func (s *Store) ClaimNextQueuedTurnWithInboundForOwner(ctx context.Context, sess
 }
 
 func (s *Store) claimNextQueuedTurn(ctx context.Context, sessionID string, capability storeOwnerCapability) (Turn, bool, error) {
-	turn, _, claimed, _, _, err := s.claimNextQueuedTurnWithInbound(ctx, sessionID, capability)
+	turn, _, claimed, _, _, err := s.claimNextQueuedTurnWithOptions(ctx, sessionID, capability, false)
 	return turn, claimed, err
 }
 
 func (s *Store) claimNextQueuedTurnWithInbound(ctx context.Context, sessionID string, capability storeOwnerCapability) (Turn, InboundEvent, bool, bool, bool, error) {
+	return s.claimNextQueuedTurnWithOptions(ctx, sessionID, capability, true)
+}
+
+func (s *Store) claimNextQueuedTurnWithOptions(ctx context.Context, sessionID string, capability storeOwnerCapability, includeInbound bool) (Turn, InboundEvent, bool, bool, bool, error) {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
 		return Turn{}, InboundEvent{}, false, false, false, fmt.Errorf("session id is required")
 	}
-	if out, handled, err := s.claimNextQueuedTurnSQLiteWithOwnerAndInbound(ctx, sessionID, capability); handled || err != nil {
+	if out, handled, err := s.claimNextQueuedTurnSQLiteWithOwnerAndInbound(ctx, sessionID, capability, includeInbound); handled || err != nil {
 		return out.turn, out.inbound, out.claimed, out.inboundFound, out.inboundRead, err
 	}
 	var out Turn
@@ -11391,9 +11395,11 @@ func (s *Store) claimNextQueuedTurnWithInbound(ctx context.Context, sessionID st
 		updateSessionFromTurn(state, turn, now)
 		out = turn
 		claimed = true
-		inboundRead = true
-		if inboundID := strings.TrimSpace(turn.InboundEventID); inboundID != "" {
-			inbound, inboundFound = state.InboundEvents[inboundID]
+		if includeInbound {
+			inboundRead = true
+			if inboundID := strings.TrimSpace(turn.InboundEventID); inboundID != "" {
+				inbound, inboundFound = state.InboundEvents[inboundID]
+			}
 		}
 		return nil
 	})
