@@ -160,7 +160,11 @@ const (
 	// outbox admission query. Existing files are prepared once after upgrade;
 	// a marker from the older contract must not let the native path issue an
 	// INDEXED BY query before that index exists.
-	sqliteSchemaPreparationVersion  = "3"
+	// Version 4 adds the bounded non-registry recovery ordering index.  The
+	// marker must advance with the DDL: setup-free callers use it as the fence
+	// before issuing INDEXED BY, and a stale "3" marker can otherwise describe
+	// a database that does not contain the required index.
+	sqliteSchemaPreparationVersion  = "4"
 	sqliteSchemaPreparationClaimKey = "sqlite_schema_preparation_claim"
 	// Structural setup no longer contains the old table-sized outbox JSON
 	// backfill, but an interrupted DDL process still needs a bounded recovery
@@ -12484,7 +12488,7 @@ func loadSQLiteSelectedStateWithChatPollQueryMode(ctx context.Context, db *sql.D
 			}
 		}
 	} else {
-		state, err = loadSQLiteColdStateWithoutChatSequences(ctx, db)
+		state, err = loadSQLiteSelectedColdStateWithoutRowMaps(ctx, db, wanted)
 		if err != nil {
 			return State{}, err
 		}
@@ -12575,6 +12579,66 @@ func loadSQLiteSelectedStateWithChatPollQueryMode(ctx context.Context, db *sql.D
 		}
 	}
 	normalizeLoadedState(&state)
+	return state, nil
+}
+
+// sqliteStateRowMapField is stored in a native table after SQLite migration.
+// The state_json copy remains for compatibility and migration, but decoding
+// these maps before immediately replacing them with the table projection is
+// pure read amplification on every selected-state call.
+func sqliteStateRowMapField(field string) bool {
+	switch field {
+	case "sessions", "inbound_events", "turns", "outbox_messages",
+		"message_provenance", "chat_polls", "chat_rate_limits",
+		"import_checkpoints", "transcript_ledger", "transcript_deliveries",
+		"helper_deliveries", "artifact_records", "notifications",
+		"fork_operations", "fork_history_items", "chat_sequences":
+		return true
+	default:
+		return false
+	}
+}
+
+// loadSQLiteSelectedColdStateWithoutRowMaps reads only the non-row-map fields
+// from the compatibility state_json document. The JSON scanner still walks the
+// document to find selected top-level values, but it does not unmarshal large
+// sessions/inbound/turn/outbox maps that the caller will load from native
+// SQLite tables immediately afterwards. A malformed or old state document
+// deliberately falls back to the strict legacy cold loader; this keeps schema
+// compatibility fail-closed instead of returning a partial state as valid.
+func loadSQLiteSelectedColdStateWithoutRowMaps(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}, wanted map[string]struct{}) (State, error) {
+	var raw []byte
+	if err := q.QueryRowContext(ctx, `SELECT value FROM state_meta WHERE key = 'state_json'`).Scan(&raw); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return State{}, errors.New("sqlite teams store is missing state metadata")
+		}
+		return State{}, err
+	}
+	if len(raw) == 0 {
+		return State{}, errors.New("sqlite teams store has empty state metadata")
+	}
+	jsonWanted := make(map[string]struct{}, len(wanted))
+	for field := range wanted {
+		if !sqliteStateRowMapField(field) {
+			jsonWanted[field] = struct{}{}
+		}
+	}
+	state, ok, err := loadSelectedStateFieldsData(raw, jsonWanted)
+	if err != nil {
+		return State{}, err
+	}
+	if !ok {
+		return loadSQLiteColdStateWithoutChatSequences(ctx, q)
+	}
+	state.ensure(time.Time{})
+	if _, wantsHistory := wanted["history_watch"]; wantsHistory {
+		if err := overlaySQLiteHistoryWatchProjection(ctx, q, &state); err != nil {
+			return State{}, err
+		}
+	}
 	return state, nil
 }
 

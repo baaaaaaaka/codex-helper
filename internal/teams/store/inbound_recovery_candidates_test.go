@@ -194,6 +194,72 @@ func TestSQLiteInboundRecoveryCandidatesUsesOrphanOrderIndex(t *testing.T) {
 	})
 }
 
+func TestSQLiteSelectedColdStateDoesNotDecodeNativeRowMaps(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	if err := store.Update(ctx, func(state *State) error {
+		state.ControlChat = ControlChatBinding{TeamsChatID: "control-selected"}
+		for i := 0; i < 64; i++ {
+			id := fmt.Sprintf("selected-inbound-%03d", i)
+			state.InboundEvents[id] = InboundEvent{
+				ID: id, TeamsChatID: "chat-selected", TeamsMessageID: id,
+				Status: InboundStatusPersisted,
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed selected-state fixture: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		selected, err := loadSQLiteSelectedColdStateWithoutRowMaps(ctx, tx, stateFieldSet("control_chat", "inbound_events"))
+		if err != nil {
+			return err
+		}
+		if selected.ControlChat.TeamsChatID != "control-selected" {
+			return fmt.Errorf("selected control chat = %q, want control-selected", selected.ControlChat.TeamsChatID)
+		}
+		if len(selected.InboundEvents) != 0 {
+			return fmt.Errorf("selected cold state decoded %d native inbound rows", len(selected.InboundEvents))
+		}
+		return nil
+	})
+}
+
+func TestSQLiteSchemaPreparationRepairsRecoveryIndexAfterOlderMarker(t *testing.T) {
+	ctx := context.Background()
+	store := newSQLiteTestStore(t)
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `DROP INDEX IF EXISTS inbound_recovery_nonregistry_order_idx`); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `UPDATE state_meta SET value = '3' WHERE key = ?`, sqliteSchemaPreparationVersionKey)
+		return err
+	})
+	if err := store.PrepareSQLiteSchemaBeforeOwner(ctx); err != nil {
+		t.Fatalf("prepare schema after older marker: %v", err)
+	}
+	var marker string
+	if err := withSQLiteRawQueryForTest(store, `SELECT value FROM state_meta WHERE key = ?`, func(raw []byte) error {
+		marker = string(raw)
+		return nil
+	}, sqliteSchemaPreparationVersionKey); err != nil {
+		t.Fatalf("read repaired schema marker: %v", err)
+	}
+	if marker != sqliteSchemaPreparationVersion {
+		t.Fatalf("schema marker = %q, want %q", marker, sqliteSchemaPreparationVersion)
+	}
+	if err := withSQLiteRawQueryForTest(store, `SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'inbound_recovery_nonregistry_order_idx'`, func(raw []byte) error {
+		if string(raw) != "1" {
+			return fmt.Errorf("recovery index query returned %q", raw)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("read repaired recovery index: %v", err)
+	}
+}
+
 func TestInboundRecoveryCandidateDoesNotAdmitUnknownStatus(t *testing.T) {
 	for _, status := range []InboundStatus{"", "unknown", InboundStatusIgnored} {
 		t.Run(fmt.Sprintf("status=%q", status), func(t *testing.T) {
