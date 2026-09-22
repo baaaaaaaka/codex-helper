@@ -317,6 +317,15 @@ func sqliteChatPollPendingPageSQL(column string) string {
 	return "(CASE WHEN " + sqliteSafeJSONType(column, "$.pending_page") + " = 'object' THEN 1 ELSE 0 END)"
 }
 
+// sqliteChatPollRateLimitedDeferredSQL is used only after the scalar poll
+// projection has been revoked or is unavailable. In that lane JSON is the
+// authority, including the retry deadline; consulting next_poll_at alone can
+// hide a due recovery when a mixed-version writer changed the JSON envelope
+// but left an older future scalar behind.
+func sqliteChatPollRateLimitedDeferredSQL(jsonColumn, legacyColumn string) string {
+	return "(json_valid(" + jsonColumn + ") AND trim(COALESCE(" + sqliteSafeJSONExtract(jsonColumn, "$.last_error") + ", '')) LIKE '%429%' AND " + sqliteCanonicalTimeDueSQL(jsonColumn, "$.next_poll_at", legacyColumn) + " > julianday(?))"
+}
+
 // sqliteChatPollLocalOnlyPendingPageSQL is the conservative admission lane
 // used during an account/global Graph-read throttle. A pending page is local
 // only when the durable receipt exists and its bounded disposition metadata
@@ -20273,10 +20282,16 @@ func sqliteTeamsOperationalBacklogScalarMode(ctx context.Context, db *sql.DB, no
 		return TeamsOperationalBacklog{}, false, err
 	}
 	var one int
+	// turnsReady is a proof that every row-local scalar fence is current. Use
+	// those indexed columns directly on this trusted lane; the JSON-first
+	// expression is reserved for the canonical fallback below. Keeping JSON1
+	// out of this LIMIT 1 probe lets SQLite use turns_trusted_session_status_idx
+	// instead of scanning every historical turn payload.
 	turnStatus := `status IN (?, ?) OR (status <> '' AND status NOT IN (?, ?, ?))`
-	turnSessionID := sqliteCanonicalTextProjectionSQL("json", "$.session_id", "session_id")
+	turnSessionID := "session_id"
 	if err := db.QueryRowContext(ctx, `SELECT 1 FROM turns
-WHERE trim(COALESCE(`+turnSessionID+`, '')) != ''
+WHERE projection_trusted = 1
+  AND trim(COALESCE(`+turnSessionID+`, '')) != ''
   AND (`+turnStatus+`)
 LIMIT 1`,
 		string(TurnStatusQueued), string(TurnStatusRunning),
@@ -20385,11 +20400,11 @@ func (s *Store) teamsOperationalBacklogSQLite(ctx context.Context) (TeamsOperati
 		// during that wait. Invalid-but-parseable poll JSON is also conservative:
 		// the Go loader turns it into a recovery placeholder, so SQL must not hide
 		// it merely because its shallow JSON shape looks harmless.
-		rateLimitedDeferred := "(json_valid(json) AND trim(COALESCE(" + sqliteSafeJSONExtract("json", "$.last_error") + ", '')) LIKE '%429%' AND COALESCE(next_poll_at, 0) > ?)"
+		rateLimitedDeferred := sqliteChatPollRateLimitedDeferredSQL("json", "next_poll_at")
 		recoveryRequired := "(COALESCE(" + sqliteSafeJSONExtract("json", "$.recovery_required") + ", 0) = 1 OR " + sqliteSafeJSONType("json", "$.attempt") + " = 'object')"
 		validPoll := sqliteChatPollAdmissionValidJSONSQL("json", "chat_id")
 		pendingPage := sqliteChatPollPendingPageSQL("json")
-		nowSQLite := sqliteTime(time.Now())
+		nowSQLite := time.Now().UTC().Format(time.RFC3339Nano)
 		if err := db.QueryRowContext(ctx, `SELECT 1 FROM chat_polls
 WHERE NOT (`+validPoll+`)
    OR `+recoveryRequired+`
@@ -20444,11 +20459,11 @@ func sqliteTeamsOperationalBacklogCanonicalActive(ctx context.Context, db *sql.D
 		return true, nil
 	}
 
-	rateLimitedDeferred := "(json_valid(json) AND trim(COALESCE(" + sqliteSafeJSONExtract("json", "$.last_error") + ", '')) LIKE '%429%' AND COALESCE(next_poll_at, 0) > ?)"
+	rateLimitedDeferred := sqliteChatPollRateLimitedDeferredSQL("json", "next_poll_at")
 	recoveryRequired := "(COALESCE(" + sqliteSafeJSONExtract("json", "$.recovery_required") + ", 0) = 1 OR " + sqliteSafeJSONType("json", "$.attempt") + " = 'object')"
 	validPoll := sqliteChatPollAdmissionValidJSONSQL("json", "chat_id")
 	pendingPage := sqliteChatPollPendingPageSQL("json")
-	nowSQLite := sqliteTime(now)
+	nowSQLite := now.UTC().Format(time.RFC3339Nano)
 	if err := db.QueryRowContext(ctx, `SELECT 1 FROM chat_polls
 WHERE NOT (`+validPoll+`)
    OR `+recoveryRequired+`

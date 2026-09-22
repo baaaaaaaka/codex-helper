@@ -1720,6 +1720,115 @@ LIMIT 1`)
 	}
 }
 
+func TestSQLiteOperationalBacklogUsesCanonical429DeadlineAfterProjectionRevocation(t *testing.T) {
+	ctx := context.Background()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	st := newTestStore(t)
+	if err := st.Update(ctx, func(state *State) error {
+		state.ChatPolls["chat-canonical-429-deadline"] = ChatPollState{
+			ChatID:           "chat-canonical-429-deadline",
+			Seeded:           true,
+			PollState:        "warm",
+			LastError:        "HTTP 429 Too Many Requests",
+			NextPollAt:       now.Add(time.Hour),
+			LastActivityAt:   now,
+			ContinuationPath: "/chats/chat-canonical-429-deadline/messages?$skiptoken=due",
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed 429 deadline fixture: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, st)
+
+	// Simulate a mixed-version/raw writer that publishes a due JSON deadline but
+	// leaves the old future scalar behind. The trigger revokes the scalar proof;
+	// the canonical fallback must not treat the stale scalar as a future retry.
+	withSQLiteTxForTest(t, st, func(tx *sql.Tx) error {
+		var raw []byte
+		if err := tx.QueryRowContext(ctx, `SELECT json FROM chat_polls WHERE chat_id = ?`, "chat-canonical-429-deadline").Scan(&raw); err != nil {
+			return err
+		}
+		var poll ChatPollState
+		if err := json.Unmarshal(raw, &poll); err != nil {
+			return err
+		}
+		poll.NextPollAt = now.Add(-time.Minute)
+		updated, err := json.Marshal(poll)
+		if err != nil {
+			return err
+		}
+		_, err = tx.ExecContext(ctx, `UPDATE chat_polls SET json = ? WHERE chat_id = ?`, updated, poll.ChatID)
+		return err
+	})
+	active, err := st.TeamsOperationalBacklogActive(ctx)
+	if err != nil {
+		t.Fatalf("canonical 429 deadline backlog probe: %v", err)
+	}
+	if !active {
+		t.Fatal("due JSON 429 recovery was hidden by stale future scalar deadline")
+	}
+}
+
+func TestSQLiteOperationalBacklogTrustedTurnProbeUsesTrustedIndex(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	if err := st.Update(ctx, func(state *State) error {
+		state.Turns["turn-trusted-index"] = Turn{
+			ID: "turn-trusted-index", SessionID: "session-trusted-index", Status: TurnStatusRunning,
+			CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC(),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed trusted turn index fixture: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, st)
+	if err := st.withStateLock(ctx, func() error {
+		pointer, ok, err := st.currentSQLitePointerUnlocked()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return sql.ErrNoRows
+		}
+		db, err := st.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		rows, err := db.QueryContext(ctx, `EXPLAIN QUERY PLAN
+SELECT 1 FROM turns
+WHERE projection_trusted = 1
+  AND trim(COALESCE(session_id, '')) != ''
+  AND (status IN (?, ?) OR (status <> '' AND status NOT IN (?, ?, ?)))
+LIMIT 1`, string(TurnStatusQueued), string(TurnStatusRunning), string(TurnStatusCompleted), string(TurnStatusFailed), string(TurnStatusInterrupted))
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		var plan []string
+		for rows.Next() {
+			var id, parent, detail int
+			var text string
+			if err := rows.Scan(&id, &parent, &detail, &text); err != nil {
+				return err
+			}
+			plan = append(plan, text)
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		joined := strings.Join(plan, "\n")
+		if !strings.Contains(joined, "turns_trusted_session_status_idx") {
+			return fmt.Errorf("trusted turn probe plan = %q, want turns_trusted_session_status_idx", joined)
+		}
+		if strings.Contains(joined, "SCAN turns ") && !strings.Contains(joined, "turns_trusted_session_status_idx") {
+			return fmt.Errorf("trusted turn probe regressed to table scan: %q", joined)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("explain trusted turn backlog probe: %v", err)
+	}
+}
+
 func TestSQLiteChatPollFrontierHintRepairIsVersioned(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
