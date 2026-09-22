@@ -22927,6 +22927,15 @@ func (b *Bridge) traceOutboxSendStage(outboxID string, stage string, started tim
 }
 
 func (b *Bridge) flushPendingOutboxMainLoop(ctx context.Context) error {
+	return b.flushPendingOutboxMainLoopCore(ctx, nil)
+}
+
+// flushPendingOutboxMainLoopCore performs the durable outbox work and returns
+// a cycle-local scheduling hint when it already proved that the foreground
+// Teams backlog must suppress optional maintenance. The error-only wrapper is
+// kept for direct callers; the listener uses the result variant so it does not
+// repeat the expensive full outbox safety probe after a deferred/error path.
+func (b *Bridge) flushPendingOutboxMainLoopCore(ctx context.Context, result *mainLoopOutboxFlushResult) error {
 	traceStep := func(name string, started time.Time, err error) {
 		if b != nil && b.outboxPhaseTraceHook != nil {
 			b.outboxPhaseTraceHook(name, time.Since(started), err)
@@ -23034,6 +23043,12 @@ func (b *Bridge) flushPendingOutboxMainLoop(ctx context.Context) error {
 		return errors.Join(recoveryErr, backlogErr)
 	}
 	if backlog.Active() {
+		if result != nil {
+			// The foreground backlog is already sufficient to suppress optional
+			// history/linked work. Do not run a second full outbox JSON safety
+			// scan merely to arrive at the same fail-closed decision.
+			result.SuppressOptionalMaintenance = true
+		}
 		traceStep("cold-maintenance-deferred", started, nil)
 		return recoveryErr
 	}
@@ -23060,9 +23075,16 @@ func (b *Bridge) flushPendingOutboxMainLoop(ctx context.Context) error {
 // maintenance, while the next cycle re-runs the normal sender/recovery path.
 func (b *Bridge) flushPendingOutboxMainLoopWithResult(ctx context.Context) (mainLoopOutboxFlushResult, error) {
 	result := mainLoopOutboxFlushResult{}
-	err := b.flushPendingOutboxMainLoop(ctx)
+	err := b.flushPendingOutboxMainLoopCore(ctx, &result)
 	if err != nil {
 		result.SuppressOptionalMaintenance = true
+		// A deferred/error outbox cycle is already fail-closed for optional
+		// maintenance. Re-running the complete outbox safety oracle here only
+		// repeats the same durable scan while holding the global state lock.
+		return result, err
+	}
+	if result.SuppressOptionalMaintenance {
+		return result, nil
 	}
 	observation, observeErr := b.observePendingOutboxForOptionalMaintenance(ctx)
 	if observeErr != nil {

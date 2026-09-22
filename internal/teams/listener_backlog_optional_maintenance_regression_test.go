@@ -198,6 +198,84 @@ func TestTeamsOutboxOptionalMaintenanceProbeIsBoundedAndFailClosed(t *testing.T)
 	}
 }
 
+func TestTeamsOutboxDeferredCycleDoesNotRepeatFullSafetyProbe(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	queued, _, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
+		ID: "outbox:optional-maintenance-deferred", TeamsChatID: "chat-1", Kind: "final", Body: "unknown result",
+	})
+	if err != nil {
+		t.Fatalf("QueueOutbox: %v", err)
+	}
+	claimed, err := store.MarkOutboxSendAttempt(ctx, queued.ID)
+	if err != nil {
+		t.Fatalf("MarkOutboxSendAttempt: %v", err)
+	}
+	if _, err := store.MarkOutboxAmbiguousSendErrorForAttempt(ctx, claimed.ID, claimed.SendAttemptToken, "response lost"); err != nil {
+		t.Fatalf("MarkOutboxAmbiguousSendErrorForAttempt: %v", err)
+	}
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		now := time.Now().UTC()
+		state.Sessions["session:foreground-backlog"] = teamstore.SessionContext{
+			ID: "session:foreground-backlog", TeamsChatID: "chat-1", Status: teamstore.SessionStatusActive,
+			CreatedAt: now, UpdatedAt: now,
+		}
+		state.Turns["turn:foreground-backlog"] = teamstore.Turn{
+			ID: "turn:foreground-backlog", SessionID: "session:foreground-backlog",
+			Status: teamstore.TurnStatusQueued, CreatedAt: now, UpdatedAt: now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed foreground backlog: %v", err)
+	}
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate deferred outbox store: %v", err)
+	}
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/chats/chat-1/messages" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Retry-After", "60")
+		http.Error(w, `{"error":{"code":"TooManyRequests","message":"account throttle"}}`, http.StatusTooManyRequests)
+	}))
+	defer server.Close()
+	bridge := newBridgeTestBridge(&GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}, store, &recordingExecutor{})
+
+	probeCalled := make(chan struct{}, 1)
+	store.SetTimingObserver(func(event teamstore.StoreTimingEvent) {
+		if strings.Contains(event.Operation, "outboxOptionalMaintenanceBlockedSQLite") {
+			select {
+			case probeCalled <- struct{}{}:
+			default:
+			}
+		}
+	})
+	result, err := bridge.flushPendingOutboxMainLoopWithResult(ctx)
+	if err != nil {
+		t.Fatalf("foreground-backlog outbox cycle err=%v result=%#v", err, result)
+	}
+	if !result.SuppressOptionalMaintenance {
+		t.Fatalf("deferred outbox result=%#v, want optional maintenance suppressed", result)
+	}
+	if result.PendingBlockingOutbox {
+		t.Fatalf("foreground-backlog result=%#v, want no repeated outbox probe", result)
+	}
+	select {
+	case <-probeCalled:
+		t.Fatal("deferred outbox cycle repeated the full JSON safety probe")
+	default:
+	}
+}
+
 func TestTeamsNormalMaintenanceFairCursorsAreIndependentAndRestartSafe(t *testing.T) {
 	for _, useSQLite := range []bool{false, true} {
 		name := "json"
