@@ -10407,7 +10407,20 @@ func (s *Store) DeferredInbound(ctx context.Context) ([]InboundEvent, error) {
 // Registry migration rows are dedupe provenance rather than executable user
 // input and are excluded.
 func (s *Store) InboundRecoveryCandidates(ctx context.Context) ([]InboundEvent, error) {
-	if out, handled, err := s.inboundRecoveryCandidatesSQLite(ctx); handled || err != nil {
+	return s.inboundRecoveryCandidatesWithLimit(ctx, 0)
+}
+
+// InboundRecoveryCandidatesWithLimit is the bounded admission form used by
+// the listener's recovery quantum.  A non-positive limit preserves the full
+// historical result set; a positive limit bounds both the SQLite query and
+// the returned slice.  Keeping the unbounded API above is intentional: audit
+// and repair callers may still need a complete candidate census.
+func (s *Store) InboundRecoveryCandidatesWithLimit(ctx context.Context, limit int) ([]InboundEvent, error) {
+	return s.inboundRecoveryCandidatesWithLimit(ctx, limit)
+}
+
+func (s *Store) inboundRecoveryCandidatesWithLimit(ctx context.Context, limit int) ([]InboundEvent, error) {
+	if out, handled, err := s.inboundRecoveryCandidatesSQLite(ctx, limit); handled || err != nil {
 		return out, err
 	}
 	state, err := s.loadStateFieldsOrFull(ctx, deferredInboundStateFields)
@@ -10422,6 +10435,9 @@ func (s *Store) InboundRecoveryCandidates(ctx context.Context) ([]InboundEvent, 
 		}
 	}
 	sortInboundEvents(out)
+	if limit > 0 && len(out) > limit {
+		out = out[:limit]
+	}
 	return out, nil
 }
 

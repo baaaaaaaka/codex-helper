@@ -15210,7 +15210,7 @@ func (b *Bridge) processDeferredInbound(ctx context.Context) error {
 	if control.Paused || control.Draining {
 		return nil
 	}
-	deferred, err := b.store.InboundRecoveryCandidates(ctx)
+	deferred, err := b.store.InboundRecoveryCandidatesWithLimit(ctx, maxDeferredInboundRecoveryPerPhase)
 	if err != nil {
 		return err
 	}

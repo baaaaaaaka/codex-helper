@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"reflect"
 	"testing"
@@ -99,10 +100,58 @@ func TestInboundRecoveryCandidatesAcrossBackends(t *testing.T) {
 			if !reflect.DeepEqual(ids, want) {
 				t.Fatalf("InboundRecoveryCandidates ids = %#v, want %#v", ids, want)
 			}
+			limited, err := store.InboundRecoveryCandidatesWithLimit(ctx, 2)
+			if err != nil {
+				t.Fatalf("InboundRecoveryCandidatesWithLimit: %v", err)
+			}
+			limitedIDs := make([]string, 0, len(limited))
+			for _, event := range limited {
+				limitedIDs = append(limitedIDs, event.ID)
+			}
+			if wantLimited := []string{"deferred-linked", "deferred-unlinked"}; !reflect.DeepEqual(limitedIDs, wantLimited) {
+				t.Fatalf("InboundRecoveryCandidatesWithLimit ids = %#v, want %#v", limitedIDs, wantLimited)
+			}
 			if useSQLite && fullLoads != 0 {
 				t.Fatalf("SQLite recovery candidate query invoked full loader %d time(s)", fullLoads)
 			}
 		})
+	}
+}
+
+func TestSQLiteInboundRecoveryCandidatesLimitDoesNotDecodeTail(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	now := time.Now().UTC()
+	if err := store.Update(ctx, func(state *State) error {
+		for i := 0; i < 3; i++ {
+			id := fmt.Sprintf("inbound:bounded:%d", i)
+			state.InboundEvents[id] = InboundEvent{
+				ID: id, TeamsChatID: "bounded-chat", TeamsMessageID: id,
+				Status: InboundStatusPersisted, CreatedAt: now.Add(time.Duration(i) * time.Second),
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed bounded candidates: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE inbound_events SET json = ? WHERE id = ?`, []byte(`{"id":"inbound:bounded:2"`), "inbound:bounded:2")
+		return err
+	})
+
+	candidates, err := store.InboundRecoveryCandidatesWithLimit(ctx, 2)
+	if err != nil {
+		t.Fatalf("bounded InboundRecoveryCandidates: %v", err)
+	}
+	if got := len(candidates); got != 2 {
+		t.Fatalf("bounded candidate count = %d, want 2", got)
+	}
+	for i, candidate := range candidates {
+		wantID := fmt.Sprintf("inbound:bounded:%d", i)
+		if candidate.ID != wantID {
+			t.Fatalf("bounded candidate[%d] = %#v, want id %q", i, candidate, wantID)
+		}
 	}
 }
 

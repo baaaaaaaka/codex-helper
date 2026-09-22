@@ -19346,7 +19346,7 @@ func (s *Store) deferredInboundSQLite(ctx context.Context) ([]InboundEvent, bool
 	return out, handled, err
 }
 
-func (s *Store) inboundRecoveryCandidatesSQLite(ctx context.Context) ([]InboundEvent, bool, error) {
+func (s *Store) inboundRecoveryCandidatesSQLite(ctx context.Context, limit int) ([]InboundEvent, bool, error) {
 	var out []InboundEvent
 	handled := false
 	err := s.withStateLock(ctx, func() error {
@@ -19383,12 +19383,20 @@ func (s *Store) inboundRecoveryCandidatesSQLite(ctx context.Context) ([]InboundE
 			AND lower(trim(COALESCE(` + source + `, ''))) = 'registry_migration'
 			AND trim(COALESCE(` + turnID + `, '')) = '')`
 		now := time.Now()
-		rows, err := db.QueryContext(ctx, `SELECT json FROM inbound_events
-			WHERE ((`+statusColumn+` = ? AND `+recoveryDue+`)
-			   OR (`+statusColumn+` IN (?, ?) AND trim(COALESCE(`+turnID+`, '')) = '' AND `+recoveryDue+`))
-			  AND NOT `+registryMigrationWithoutTurn+`
-			ORDER BY teams_chat_id, created_at, teams_message_id`,
-			string(InboundStatusDeferred), now.UTC().Format(time.RFC3339Nano), string(InboundStatusPersisted), string(InboundStatusQueued), now.UTC().Format(time.RFC3339Nano))
+		query := `SELECT json FROM inbound_events
+			WHERE ((` + statusColumn + ` = ? AND ` + recoveryDue + `)
+			   OR (` + statusColumn + ` IN (?, ?) AND trim(COALESCE(` + turnID + `, '')) = '' AND ` + recoveryDue + `))
+			  AND NOT ` + registryMigrationWithoutTurn + `
+			ORDER BY teams_chat_id, created_at, teams_message_id`
+		args := []any{
+			string(InboundStatusDeferred), now.UTC().Format(time.RFC3339Nano),
+			string(InboundStatusPersisted), string(InboundStatusQueued), now.UTC().Format(time.RFC3339Nano),
+		}
+		if limit > 0 {
+			query += ` LIMIT ?`
+			args = append(args, limit)
+		}
+		rows, err := db.QueryContext(ctx, query, args...)
 		if err != nil {
 			return err
 		}
