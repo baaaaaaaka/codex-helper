@@ -8380,6 +8380,13 @@ func ensureSQLiteSchemaContext(ctx context.Context, db *sql.DB) (err error) {
 		`CREATE INDEX IF NOT EXISTS chat_polls_untrusted_admission_idx ON chat_polls(chat_id) WHERE projection_trusted = 0 OR admission_valid IS NULL OR admission_valid = 0`,
 		`CREATE INDEX IF NOT EXISTS chat_polls_untrusted_generation_v2_idx ON chat_polls(chat_id) WHERE COALESCE(projection_trusted, 0) != 1 OR COALESCE(canonical_revision, 0) <= 0 OR COALESCE(projection_revision, 0) != COALESCE(canonical_revision, 0) OR COALESCE(admission_valid, 0) != 1`,
 		`CREATE INDEX IF NOT EXISTS chat_polls_stale_generation_v2_idx ON chat_polls(updated_at, next_poll_at, last_activity_at, chat_id) WHERE projection_trusted = 1 AND (COALESCE(canonical_revision, 0) <= 0 OR COALESCE(projection_revision, 0) != COALESCE(canonical_revision, 0))`,
+		// Deferred recovery normally admits only a tiny prefix, but inherited
+		// registry-migration rows can dominate inbound_events.  Keep those audit
+		// rows out of the recovery ordering index so the bounded lane does not
+		// parse and discard them on every cycle.  Unknown/malformed JSON remains
+		// in the index (the COALESCE(..., 1) branch) and is still decoded by Go,
+		// preserving fail-closed recovery behavior.
+		`CREATE INDEX IF NOT EXISTS inbound_recovery_nonregistry_order_idx ON inbound_events(status, teams_chat_id, created_at, teams_message_id) WHERE COALESCE(NOT ((CASE WHEN json_valid(json) THEN json_type(json, '$.source') ELSE NULL END) = 'text' AND lower(trim(COALESCE((CASE WHEN json_valid(json) THEN json_extract(json, '$.source') ELSE NULL END), ''))) = 'registry_migration' AND trim(COALESCE((CASE WHEN json_valid(json) THEN json_extract(json, '$.turn_id') ELSE NULL END), '')) = ''), 1)`,
 		`CREATE INDEX IF NOT EXISTS transcript_deliveries_outbox_idx ON transcript_deliveries(outbox_id)`,
 		`CREATE INDEX IF NOT EXISTS helper_deliveries_outbox_idx ON helper_deliveries(outbox_id)`,
 		`CREATE INDEX IF NOT EXISTS artifact_records_outbox_idx ON artifact_records(outbox_id)`,
@@ -19369,8 +19376,6 @@ func (s *Store) inboundRecoveryCandidatesSQLite(ctx context.Context, limit int) 
 			return err
 		}
 		turnID := sqliteSafeJSONExtract("json", "$.turn_id")
-		sourceType := sqliteSafeJSONType("json", "$.source")
-		source := sqliteSafeJSONExtract("json", "$.source")
 		recoveryDue := sqliteInboundDeferredDueSQL("json")
 		// Registry-migration rows are durable audit evidence, not executable
 		// inbound work when they have not been linked to a turn.  The canonical
@@ -19379,9 +19384,7 @@ func (s *Store) inboundRecoveryCandidatesSQLite(ctx context.Context, limit int) 
 		// does not unmarshal tens of thousands of audit rows on every listener
 		// cycle.  Non-text/malformed source values remain eligible for the Go
 		// decoder, preserving the fail-closed fallback for damaged rows.
-		registryMigrationWithoutTurn := `(` + sourceType + ` = 'text'
-			AND lower(trim(COALESCE(` + source + `, ''))) = 'registry_migration'
-			AND trim(COALESCE(` + turnID + `, '')) = '')`
+		registryMigrationWithoutTurn := sqliteInboundRegistryMigrationWithoutTurnSQL("json")
 		now := time.Now()
 		// The durable index is ordered by status, chat, created_at, message ID.
 		// Do not turn the three status lanes into one IN/OR query: SQLite then
@@ -19392,14 +19395,31 @@ func (s *Store) inboundRecoveryCandidatesSQLite(ctx context.Context, limit int) 
 		statuses := []InboundStatus{InboundStatusDeferred, InboundStatusPersisted, InboundStatusQueued}
 		nowText := now.UTC().Format(time.RFC3339Nano)
 		for _, status := range statuses {
-			query := `SELECT json FROM inbound_events
-				WHERE ` + statusColumn + ` = ? AND ` + recoveryDue
+			table := "inbound_events"
+			if statusColumn == "status" {
+				table += " INDEXED BY inbound_recovery_nonregistry_order_idx"
+			}
+			query := `SELECT json FROM ` + table + ` WHERE `
+			args := make([]any, 0, 2)
+			if statusColumn == "status" {
+				// These are fixed enum values, not caller input.  Keeping the
+				// equality literal lets SQLite prove the partial recovery index
+				// predicate; the canonical fallback still uses a bind parameter.
+				query += `status = '` + string(status) + `'`
+			} else {
+				query += statusColumn + ` = ?`
+				args = append(args, string(status))
+			}
+			query += ` AND ` + recoveryDue
 			if status != InboundStatusDeferred {
 				query += ` AND trim(COALESCE(` + turnID + `, '')) = ''`
 			}
-			query += ` AND NOT ` + registryMigrationWithoutTurn + `
-				ORDER BY teams_chat_id, created_at, teams_message_id`
-			args := []any{string(status), nowText}
+			// SQL's NOT(NULL) is NULL and would hide malformed/unknown source
+			// values.  Treat only a proven registry-migration row as excluded;
+			// everything unknown remains visible to the canonical decoder.
+			query += ` AND COALESCE(NOT (` + registryMigrationWithoutTurn + `), 1)`
+			query += ` ORDER BY teams_chat_id, created_at, teams_message_id`
+			args = append(args, nowText)
 			if limit > 0 {
 				query += ` LIMIT ?`
 				args = append(args, limit)
@@ -19662,6 +19682,15 @@ func sqliteInboundDeferredDueSQL(jsonColumn string) string {
  OR trim(COALESCE(` + valueExpr + `, '')) = ''
  OR julianday(` + valueExpr + `) IS NULL
  OR julianday(` + valueExpr + `) <= julianday(?))`
+}
+
+func sqliteInboundRegistryMigrationWithoutTurnSQL(jsonColumn string) string {
+	sourceType := sqliteSafeJSONType(jsonColumn, "$.source")
+	source := sqliteSafeJSONExtract(jsonColumn, "$.source")
+	turnID := sqliteSafeJSONExtract(jsonColumn, "$.turn_id")
+	return `(` + sourceType + ` = 'text'
+		AND lower(trim(COALESCE(` + source + `, ''))) = 'registry_migration'
+		AND trim(COALESCE(` + turnID + `, '')) = '')`
 }
 
 // sqliteTeamsOperationalBacklogScalar is the fast, observation-only lane for

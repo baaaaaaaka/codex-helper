@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -153,6 +154,44 @@ func TestSQLiteInboundRecoveryCandidatesLimitDoesNotDecodeTail(t *testing.T) {
 			t.Fatalf("bounded candidate[%d] = %#v, want id %q", i, candidate, wantID)
 		}
 	}
+}
+
+func TestSQLiteInboundRecoveryCandidatesUsesOrphanOrderIndex(t *testing.T) {
+	store := newSQLiteTestStore(t)
+	ctx := context.Background()
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		turnID := sqliteSafeJSONExtract("json", "$.turn_id")
+		recoveryDue := sqliteInboundDeferredDueSQL("json")
+		registryMigration := sqliteInboundRegistryMigrationWithoutTurnSQL("json")
+		query := `EXPLAIN QUERY PLAN SELECT json FROM inbound_events
+			WHERE status = 'persisted' AND ` + recoveryDue + `
+			  AND trim(COALESCE(` + turnID + `, '')) = ''
+			  AND COALESCE(NOT (` + registryMigration + `), 1)
+			ORDER BY teams_chat_id, created_at, teams_message_id LIMIT 8`
+		rows, err := tx.QueryContext(ctx, query, time.Now().UTC().Format(time.RFC3339Nano))
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		var details []string
+		for rows.Next() {
+			var id int
+			var parent, notUsed, detail string
+			if err := rows.Scan(&id, &parent, &notUsed, &detail); err != nil {
+				return err
+			}
+			details = append(details, detail)
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		for _, detail := range details {
+			if strings.Contains(detail, "inbound_recovery_nonregistry_order_idx") {
+				return nil
+			}
+		}
+		return fmt.Errorf("recovery query plan = %v, want inbound_recovery_nonregistry_order_idx", details)
+	})
 }
 
 func TestInboundRecoveryCandidateDoesNotAdmitUnknownStatus(t *testing.T) {
