@@ -251,10 +251,17 @@ func TestTeamsOutboxDeferredCycleDoesNotRepeatFullSafetyProbe(t *testing.T) {
 	}, store, &recordingExecutor{})
 
 	probeCalled := make(chan struct{}, 1)
+	backlogCalled := make(chan struct{}, 128)
 	store.SetTimingObserver(func(event teamstore.StoreTimingEvent) {
 		if strings.Contains(event.Operation, "outboxOptionalMaintenanceBlockedSQLite") {
 			select {
 			case probeCalled <- struct{}{}:
+			default:
+			}
+		}
+		if strings.Contains(event.Operation, "teamsOperationalBacklogSQLite") {
+			select {
+			case backlogCalled <- struct{}{}:
 			default:
 			}
 		}
@@ -272,6 +279,26 @@ func TestTeamsOutboxDeferredCycleDoesNotRepeatFullSafetyProbe(t *testing.T) {
 	select {
 	case <-probeCalled:
 		t.Fatal("deferred outbox cycle repeated the full JSON safety probe")
+	default:
+	}
+	for {
+		select {
+		case <-backlogCalled:
+		default:
+			goto backlogProbeDrained
+		}
+	}
+backlogProbeDrained:
+	plan, err := bridge.optionalMaintenancePlanForOwnerWithOutbox(ctx, time.Now(), result.SuppressOptionalMaintenance)
+	if err != nil {
+		t.Fatalf("suppressed optional-maintenance plan: %v", err)
+	}
+	if !plan.backlogActive || plan.runNormal {
+		t.Fatalf("suppressed optional-maintenance plan=%#v, want backlog-active/non-normal", plan)
+	}
+	select {
+	case <-backlogCalled:
+		t.Fatal("suppressed optional-maintenance plan repeated Teams backlog scan")
 	default:
 	}
 }

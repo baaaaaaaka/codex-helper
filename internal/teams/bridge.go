@@ -3253,6 +3253,25 @@ func (b *Bridge) optionalMaintenancePlanForOwnerWithOutbox(ctx context.Context, 
 	if now.IsZero() {
 		now = time.Now()
 	}
+	if suppressForOutbox {
+		// The preceding outbox phase already observed a blocking/deferred/error
+		// condition. Optional history/linked work must remain fail-closed for this
+		// cycle; re-reading the full Teams backlog here only repeats the same
+		// durable scan and lock contention. Mandatory recovery is still probed
+		// independently, so this shortcut cannot hide source-proof or rewrite
+		// work. If the outbox condition clears, the next cycle reopens normal work.
+		mandatory, err := b.optionalMaintenanceNeedsMandatory(ctx)
+		if err != nil {
+			return optionalMaintenancePlan{}, err
+		}
+		if machineID, generation, ownerBound := b.transcriptCheckpointOwnerCapabilityForContext(ctx); ownerBound {
+			until := now.Add(optionalMaintenanceBacklogDeferInterval)
+			if _, err := b.store.SetOptionalMaintenanceDeferredForOwner(ctx, until, "Teams backlog: outbox", machineID, generation); err != nil {
+				return optionalMaintenancePlan{}, err
+			}
+		}
+		return optionalMaintenancePlan{runMandatory: mandatory, backlogActive: true}, nil
+	}
 	control, err := b.store.ReadControl(ctx)
 	if err != nil {
 		return optionalMaintenancePlan{}, err
@@ -3260,17 +3279,6 @@ func (b *Bridge) optionalMaintenancePlanForOwnerWithOutbox(ctx context.Context, 
 	backlog, err := b.store.TeamsOperationalBacklog(ctx)
 	if err != nil {
 		return optionalMaintenancePlan{}, err
-	}
-	if suppressForOutbox && !backlog.Active() {
-		// The outbox phase already ran its ambiguous-result recovery lane. A
-		// remaining due protected row, or an outbox read/send error, is enough to
-		// keep optional history/transcript work out of this cycle. Mandatory
-		// source-proof/rewrite recovery still gets its own bounded path.
-		mandatory, mandatoryErr := b.optionalMaintenanceNeedsMandatory(ctx)
-		if mandatoryErr != nil {
-			return optionalMaintenancePlan{}, mandatoryErr
-		}
-		return optionalMaintenancePlan{runMandatory: mandatory, backlogActive: true}, nil
 	}
 	if !backlog.Active() {
 		if b.pollForegroundPressureBlocksColdMaintenance() {
