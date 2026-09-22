@@ -19383,41 +19383,61 @@ func (s *Store) inboundRecoveryCandidatesSQLite(ctx context.Context, limit int) 
 			AND lower(trim(COALESCE(` + source + `, ''))) = 'registry_migration'
 			AND trim(COALESCE(` + turnID + `, '')) = '')`
 		now := time.Now()
-		query := `SELECT json FROM inbound_events
-			WHERE ((` + statusColumn + ` = ? AND ` + recoveryDue + `)
-			   OR (` + statusColumn + ` IN (?, ?) AND trim(COALESCE(` + turnID + `, '')) = '' AND ` + recoveryDue + `))
-			  AND NOT ` + registryMigrationWithoutTurn + `
-			ORDER BY teams_chat_id, created_at, teams_message_id`
-		args := []any{
-			string(InboundStatusDeferred), now.UTC().Format(time.RFC3339Nano),
-			string(InboundStatusPersisted), string(InboundStatusQueued), now.UTC().Format(time.RFC3339Nano),
-		}
-		if limit > 0 {
-			query += ` LIMIT ?`
-			args = append(args, limit)
-		}
-		rows, err := db.QueryContext(ctx, query, args...)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var raw []byte
-			if err := rows.Scan(&raw); err != nil {
+		// The durable index is ordered by status, chat, created_at, message ID.
+		// Do not turn the three status lanes into one IN/OR query: SQLite then
+		// has to build a temporary sort over the entire orphan backlog before it
+		// can honor LIMIT. Query each equality lane independently and merge the
+		// bounded prefixes below. Any row beyond the first `limit` rows of one
+		// lane cannot enter the first `limit` rows of the merged ordering.
+		statuses := []InboundStatus{InboundStatusDeferred, InboundStatusPersisted, InboundStatusQueued}
+		nowText := now.UTC().Format(time.RFC3339Nano)
+		for _, status := range statuses {
+			query := `SELECT json FROM inbound_events
+				WHERE ` + statusColumn + ` = ? AND ` + recoveryDue
+			if status != InboundStatusDeferred {
+				query += ` AND trim(COALESCE(` + turnID + `, '')) = ''`
+			}
+			query += ` AND NOT ` + registryMigrationWithoutTurn + `
+				ORDER BY teams_chat_id, created_at, teams_message_id`
+			args := []any{string(status), nowText}
+			if limit > 0 {
+				query += ` LIMIT ?`
+				args = append(args, limit)
+			}
+			rows, err := db.QueryContext(ctx, query, args...)
+			if err != nil {
 				return err
 			}
-			var event InboundEvent
-			if err := json.Unmarshal(raw, &event); err != nil {
+			for rows.Next() {
+				var raw []byte
+				if err := rows.Scan(&raw); err != nil {
+					_ = rows.Close()
+					return err
+				}
+				var event InboundEvent
+				if err := json.Unmarshal(raw, &event); err != nil {
+					_ = rows.Close()
+					return err
+				}
+				if inboundRecoveryCandidateReady(event, now) {
+					out = append(out, event)
+				}
+			}
+			if err := rows.Err(); err != nil {
+				_ = rows.Close()
 				return err
 			}
-			if inboundRecoveryCandidateReady(event, now) {
-				out = append(out, event)
+			if err := rows.Close(); err != nil {
+				return err
 			}
 		}
-		return rows.Err()
+		return nil
 	})
 	if err == nil {
 		sortInboundEvents(out)
+		if limit > 0 && len(out) > limit {
+			out = out[:limit]
+		}
 	}
 	return out, handled, err
 }
