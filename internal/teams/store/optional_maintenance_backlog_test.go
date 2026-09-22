@@ -1568,6 +1568,13 @@ func TestSQLiteOperationalBacklogUsesTrustedScalarsAndFailsClosedOnRevocation(t 
 	if !got.ActiveTurns || !got.PendingInbound || !got.OperationalPollFrontier {
 		t.Fatalf("revoked scalar backlog=%#v, want canonical active work", got)
 	}
+	active, err := st.TeamsOperationalBacklogActive(ctx)
+	if err != nil {
+		t.Fatalf("revoked scalar TeamsOperationalBacklogActive: %v", err)
+	}
+	if !active {
+		t.Fatalf("revoked scalar active-only backlog = false, want canonical active work")
+	}
 }
 
 func TestSQLiteOperationalBacklogTrustProbeUsesInboundGenerationIndex(t *testing.T) {

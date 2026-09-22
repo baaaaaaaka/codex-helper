@@ -20357,6 +20357,60 @@ LIMIT 1`, nowSQLite).Scan(&canonical); err != nil && !errors.Is(err, sql.ErrNoRo
 	return backlog, handled, err
 }
 
+func sqliteTeamsOperationalBacklogCanonicalActive(ctx context.Context, db *sql.DB, now time.Time) (bool, error) {
+	if now.IsZero() {
+		now = time.Now()
+	}
+	var exists int
+	turnStatus := sqliteTurnSafetyStatusSQL("json", "status")
+	turnSessionID := sqliteCanonicalTextProjectionSQL("json", "$.session_id", "session_id")
+	if err := db.QueryRowContext(ctx, `SELECT 1 FROM turns WHERE `+sqliteTurnActiveStatusSQL(turnStatus)+` AND trim(COALESCE(`+turnSessionID+`, '')) != '' LIMIT 1`, sqliteTurnActiveStatusArgs()...).Scan(&exists); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	} else if err == nil {
+		return true, nil
+	}
+
+	inboundStatusColumn, err := sqliteInboundStatusColumnForRead(ctx, db)
+	if err != nil {
+		return false, err
+	}
+	inboundStatus := sqliteCanonicalTextProjectionSQL("i.json", "$.status", "i.status")
+	if inboundStatusColumn == "status" {
+		inboundStatus = "i.status"
+	}
+	inboundPredicate, inboundArgs := sqliteInboundOperationalBacklogSQL(inboundStatus, "i.json")
+	if err := db.QueryRowContext(ctx, `SELECT 1 FROM inbound_events i WHERE `+inboundPredicate+` LIMIT 1`, inboundArgs...).Scan(&exists); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	} else if err == nil {
+		return true, nil
+	}
+
+	rateLimitedDeferred := "(json_valid(json) AND trim(COALESCE(" + sqliteSafeJSONExtract("json", "$.last_error") + ", '')) LIKE '%429%' AND COALESCE(next_poll_at, 0) > ?)"
+	recoveryRequired := "(COALESCE(" + sqliteSafeJSONExtract("json", "$.recovery_required") + ", 0) = 1 OR " + sqliteSafeJSONType("json", "$.attempt") + " = 'object')"
+	validPoll := sqliteChatPollAdmissionValidJSONSQL("json", "chat_id")
+	pendingPage := sqliteChatPollPendingPageSQL("json")
+	nowSQLite := sqliteTime(now)
+	if err := db.QueryRowContext(ctx, `SELECT 1 FROM chat_polls
+WHERE NOT (`+validPoll+`)
+   OR `+recoveryRequired+`
+   OR (COALESCE(frontier_active, 0) != 0 AND (`+pendingPage+` != 0 OR NOT `+rateLimitedDeferred+`))
+LIMIT 1`, nowSQLite).Scan(&exists); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	} else if err == nil {
+		return true, nil
+	}
+	frontier := sqliteChatPollOperationalFrontierSQL("json")
+	if err := db.QueryRowContext(ctx, `SELECT 1 FROM chat_polls
+WHERE `+validPoll+`
+  AND (`+recoveryRequired+` OR (`+frontier+` != 0 AND (`+pendingPage+` != 0 OR NOT `+rateLimitedDeferred+`)))
+LIMIT 1`, nowSQLite).Scan(&exists); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return false, err
+	} else if err == nil {
+		return true, nil
+	}
+	return false, nil
+}
+
 func (s *Store) teamsOperationalBacklogActiveSQLite(ctx context.Context) (bool, bool, bool, error) {
 	active := false
 	handled := false
@@ -20372,22 +20426,20 @@ func (s *Store) teamsOperationalBacklogActiveSQLite(ctx context.Context) (bool, 
 		}
 		handled = true
 		active, usable, err = sqliteTeamsOperationalBacklogScalarActive(ctx, db, time.Now())
+		if err == nil && !usable {
+			// A revoked/mixed projection must use the canonical fallback, but it
+			// still only needs a boolean. Preserve the same fail-closed predicates
+			// while short-circuiting after the first active lane instead of
+			// materializing all three detailed flags.
+			active, err = sqliteTeamsOperationalBacklogCanonicalActive(ctx, db, time.Now())
+			usable = err == nil
+		}
 		return err
 	})
 	if err != nil {
 		return false, handled, usable, err
 	}
-	if usable {
-		return active, handled, true, nil
-	}
-	// A revoked/mixed projection must use the existing canonical fallback. It
-	// is intentionally rare and remains fully fail-closed; the fast path above
-	// is the only path used by a trusted steady-state database.
-	backlog, fallbackHandled, fallbackErr := s.teamsOperationalBacklogSQLite(ctx)
-	if fallbackErr != nil {
-		return false, fallbackHandled, false, fallbackErr
-	}
-	return backlog.Active(), fallbackHandled, fallbackHandled, nil
+	return active, handled, true, nil
 }
 
 func (s *Store) hasUnfinishedTurnsSQLite(ctx context.Context) (bool, bool, error) {
