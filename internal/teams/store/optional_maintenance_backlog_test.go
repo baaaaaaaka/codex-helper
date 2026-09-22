@@ -1162,6 +1162,84 @@ func TestTeamsOperationalBacklogLinkedTurnLookupUsesIdentityIndex(t *testing.T) 
 	}
 }
 
+func TestTeamsOperationalBacklogUsesNonRegistryRecoveryIndex(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
+	if err := st.Update(ctx, func(state *State) error {
+		state.Turns["turn-terminal-index"] = Turn{
+			ID: "turn-terminal-index", SessionID: "session-terminal-index", Status: TurnStatusCompleted,
+			CreatedAt: now, UpdatedAt: now,
+		}
+		state.InboundEvents["inbound-linked-index"] = InboundEvent{
+			ID: "inbound-linked-index", Status: InboundStatusQueued, TurnID: "turn-terminal-index",
+			TeamsChatID: "chat-linked-index", TeamsMessageID: "message-linked-index", CreatedAt: now, UpdatedAt: now,
+		}
+		state.InboundEvents["inbound-migration-index"] = InboundEvent{
+			ID: "inbound-migration-index", Status: InboundStatusPersisted, Source: "registry_migration",
+			TeamsChatID: "chat-migration-index", TeamsMessageID: "message-migration-index", CreatedAt: now, UpdatedAt: now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed non-registry backlog fixture: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, st)
+
+	if err := st.withStateLock(ctx, func() error {
+		pointer, ok, err := st.currentSQLitePointerUnlocked()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("SQLite pointer is not available")
+		}
+		db, err := st.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		table, err := sqliteInboundOperationalBacklogTable(ctx, db, "i.status")
+		if err != nil {
+			return err
+		}
+		if !strings.Contains(table, "inbound_recovery_nonregistry_order_idx") {
+			return fmt.Errorf("inbound backlog table = %q, want non-registry index", table)
+		}
+		predicate, args := sqliteInboundOperationalBacklogSQL("i.status", "i.json")
+		query := `EXPLAIN QUERY PLAN SELECT 1 FROM ` + table +
+			` WHERE ` + sqliteInboundNonRegistrySQL("i.json") + ` AND ` + predicate + ` LIMIT 1`
+		rows, err := db.QueryContext(ctx, query, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		var plan []string
+		for rows.Next() {
+			var id, parent, notused int
+			var detail string
+			if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+				return err
+			}
+			plan = append(plan, detail)
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		if !strings.Contains(strings.Join(plan, "\n"), "inbound_recovery_nonregistry_order_idx") {
+			return fmt.Errorf("inbound backlog query plan = %q, want non-registry index", strings.Join(plan, "\n"))
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("inspect non-registry backlog query plan: %v", err)
+	}
+	backlog, err := st.TeamsOperationalBacklog(ctx)
+	if err != nil {
+		t.Fatalf("TeamsOperationalBacklog: %v", err)
+	}
+	if backlog.Active() {
+		t.Fatalf("migration-only/terminal inbound fixture reported backlog=%#v", backlog)
+	}
+}
+
 func TestTeamsOperationalBacklogTreatsDormantGapAsNonBlocking(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)

@@ -20127,6 +20127,62 @@ func sqliteInboundRegistryMigrationWithoutTurnSQL(jsonColumn string) string {
 		AND trim(COALESCE(` + turnID + `, '')) = '')`
 }
 
+// sqliteInboundNonRegistrySQL is the exact partial-index predicate used by
+// inbound_recovery_nonregistry_order_idx. Keep the COALESCE around NOT: SQL's
+// three-valued logic would otherwise turn malformed/unknown JSON into NULL
+// and hide it from this fail-closed admission probe.
+func sqliteInboundNonRegistrySQL(jsonColumn string) string {
+	return `COALESCE(NOT (` + sqliteInboundRegistryMigrationWithoutTurnSQL(jsonColumn) + `), 1)`
+}
+
+// sqliteInboundOperationalBacklogTable selects the bounded recovery index only
+// when it is actually present. This is intentionally a schema capability check
+// rather than a version assumption: older stores may be opened before schema
+// preparation has completed. Such stores retain the canonical scan and remain
+// correct, only slower.
+func sqliteInboundOperationalBacklogTable(ctx context.Context, db *sql.DB, statusExpr string) (string, error) {
+	table := "inbound_events i"
+	if strings.TrimSpace(statusExpr) != "i.status" && strings.TrimSpace(statusExpr) != "status" {
+		return table, nil
+	}
+	var present int
+	err := db.QueryRowContext(ctx, `SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?`, "inbound_recovery_nonregistry_order_idx").Scan(&present)
+	if errors.Is(err, sql.ErrNoRows) {
+		return table, nil
+	}
+	if err != nil {
+		return table, err
+	}
+	if present == 1 {
+		return "inbound_events i INDEXED BY inbound_recovery_nonregistry_order_idx", nil
+	}
+	return table, nil
+}
+
+// sqliteInboundOperationalBacklogExists keeps the canonical inbound predicate
+// unchanged while allowing SQLite to walk only non-registry rows when the
+// durable partial index is available. The top-level predicate is redundant
+// with the unlinked branch below, but it is required for SQLite to prove the
+// partial-index contract. Linked registry rows still pass because their
+// non-empty turn_id makes the index predicate true.
+func sqliteInboundOperationalBacklogExists(ctx context.Context, db *sql.DB, statusExpr string, jsonColumn string) (bool, error) {
+	table, err := sqliteInboundOperationalBacklogTable(ctx, db, statusExpr)
+	if err != nil {
+		return false, err
+	}
+	predicate, args := sqliteInboundOperationalBacklogSQL(statusExpr, jsonColumn)
+	query := `SELECT 1 FROM ` + table + ` WHERE ` + sqliteInboundNonRegistrySQL(jsonColumn) + ` AND ` + predicate + ` LIMIT 1`
+	var one int
+	err = db.QueryRowContext(ctx, query, args...).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return one == 1, nil
+}
+
 // sqliteInboundOperationalBacklogSQL mirrors inboundEventHasOperationalBacklog
 // for the observation-only admission probe. A linked inbound row is active
 // until its referenced turn is proven terminal. An unlinked row is active only
@@ -20241,11 +20297,12 @@ LIMIT 1`,
 	// projection trigger proves that the scalar status still matches canonical
 	// JSON; the JSON/turn cross-check below retains the registry-migration and
 	// terminal-turn semantics of the canonical oracle.
-	inboundPredicate, inboundArgs := sqliteInboundOperationalBacklogSQL("status", "i.json")
-	if err := db.QueryRowContext(ctx, `SELECT 1 FROM inbound_events i WHERE `+inboundPredicate+` LIMIT 1`, inboundArgs...).Scan(&one); err == nil {
-		backlog.PendingInbound = true
-	} else if !errors.Is(err, sql.ErrNoRows) {
+	inboundActive, err := sqliteInboundOperationalBacklogExists(ctx, db, "i.status", "i.json")
+	if err != nil {
 		return TeamsOperationalBacklog{}, false, err
+	}
+	if inboundActive {
+		backlog.PendingInbound = true
 	}
 	if activeOnly && backlog.PendingInbound {
 		return backlog, true, nil
@@ -20314,11 +20371,12 @@ func (s *Store) teamsOperationalBacklogSQLite(ctx context.Context) (TeamsOperati
 		if inboundStatusColumn == "status" {
 			inboundStatus = "i.status"
 		}
-		inboundPredicate, inboundArgs := sqliteInboundOperationalBacklogSQL(inboundStatus, "i.json")
-		if err := db.QueryRowContext(ctx, `SELECT 1 FROM inbound_events i WHERE `+inboundPredicate+` LIMIT 1`, inboundArgs...).Scan(&exists); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		inboundActive, err := sqliteInboundOperationalBacklogExists(ctx, db, inboundStatus, "i.json")
+		if err != nil {
 			return err
-		} else if err == nil {
-			backlog.PendingInbound = exists == 1
+		}
+		if inboundActive {
+			backlog.PendingInbound = true
 		}
 		// The materialized hint gives the common path an indexed lookup, but the
 		// JSON row remains authoritative. Keep recovery_required and an in-flight
@@ -20378,10 +20436,11 @@ func sqliteTeamsOperationalBacklogCanonicalActive(ctx context.Context, db *sql.D
 	if inboundStatusColumn == "status" {
 		inboundStatus = "i.status"
 	}
-	inboundPredicate, inboundArgs := sqliteInboundOperationalBacklogSQL(inboundStatus, "i.json")
-	if err := db.QueryRowContext(ctx, `SELECT 1 FROM inbound_events i WHERE `+inboundPredicate+` LIMIT 1`, inboundArgs...).Scan(&exists); err != nil && !errors.Is(err, sql.ErrNoRows) {
+	inboundActive, err := sqliteInboundOperationalBacklogExists(ctx, db, inboundStatus, "i.json")
+	if err != nil {
 		return false, err
-	} else if err == nil {
+	}
+	if inboundActive {
 		return true, nil
 	}
 
