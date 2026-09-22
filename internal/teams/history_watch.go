@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -20,6 +21,45 @@ import (
 )
 
 type historyWatchSessionLookupContextKey struct{}
+
+type historyWatchBatchUpdateContextKey struct{}
+
+type historyWatchBatchUpdate struct {
+	id       string
+	expected *teamstore.HistoryWatchCheckpoint
+	next     *teamstore.HistoryWatchCheckpoint
+}
+
+// historyWatchBatchUpdates coalesces only the final checkpoint CAS writes of
+// one bounded worker batch. Workers still scan and publish independently, and
+// each operation retains the checkpoint it observed as its expected value.
+// This is deliberately not a general durable-write queue: the batch is applied
+// once under the existing owner capability and Store CAS boundary, so a stale
+// worker can never overwrite a newer checkpoint.
+type historyWatchBatchUpdates struct {
+	mu      sync.Mutex
+	updates []historyWatchBatchUpdate
+}
+
+func (b *historyWatchBatchUpdates) add(update historyWatchBatchUpdate) {
+	if b == nil {
+		return
+	}
+	b.mu.Lock()
+	b.updates = append(b.updates, update)
+	b.mu.Unlock()
+}
+
+func (b *historyWatchBatchUpdates) snapshot() []historyWatchBatchUpdate {
+	if b == nil {
+		return nil
+	}
+	b.mu.Lock()
+	updates := append([]historyWatchBatchUpdate(nil), b.updates...)
+	b.mu.Unlock()
+	sort.SliceStable(updates, func(i, j int) bool { return updates[i].id < updates[j].id })
+	return updates
+}
 
 // historyWatchSessionLookup shares one immutable Codex discovery result across
 // all path workers in a history batch.  A history phase may contain thousands
@@ -99,6 +139,8 @@ func (b *Bridge) runHistoryWatchSyncJobsWithState(ctx context.Context, paths []s
 	// on the Bridge: concurrent listeners/scopes must not share Codex roots or a
 	// result that can outlive this bounded history phase.
 	workCtx = b.historyWatchSessionLookupContext(workCtx)
+	batchUpdates := &historyWatchBatchUpdates{}
+	workCtx = context.WithValue(workCtx, historyWatchBatchUpdateContextKey{}, batchUpdates)
 	results := make(chan result, len(paths))
 	var nextJobMu sync.Mutex
 	nextJob := 0
@@ -165,13 +207,61 @@ func (b *Bridge) runHistoryWatchSyncJobsWithState(ctx context.Context, paths []s
 			errs[item.index] = item.err
 		}
 	}
+	batchErr := b.applyHistoryWatchBatchUpdates(ctx, batchUpdates)
 	joined := make([]error, 0, len(errs))
 	for index, err := range errs {
 		if err != nil {
 			joined = append(joined, fmt.Errorf("history watch path %q: %w", strings.TrimSpace(paths[index]), err))
 		}
 	}
+	if batchErr != nil {
+		joined = append(joined, fmt.Errorf("history watch checkpoint batch: %w", batchErr))
+	}
 	return errors.Join(joined...)
+}
+
+// applyHistoryWatchBatchUpdates performs one existing history-watch durable
+// callback for the successful workers in this batch. Checkpoint conflicts are
+// intentionally handled per row, matching UpdateHistoryWatchCheckpointIfCurrent:
+// a concurrent watcher wins that row, while unrelated successful rows still
+// commit. The callback remains owner-scoped when the listener has a lease.
+func (b *Bridge) applyHistoryWatchBatchUpdates(ctx context.Context, batch *historyWatchBatchUpdates) error {
+	updates := batch.snapshot()
+	if len(updates) == 0 {
+		return nil
+	}
+	return b.updateHistoryWatch(ctx, func(history map[string]teamstore.HistoryWatchCheckpoint, _ *time.Time) error {
+		for _, update := range updates {
+			id := strings.TrimSpace(update.id)
+			if id == "" {
+				continue
+			}
+			current, found := history[id]
+			if update.expected == nil {
+				if found {
+					continue
+				}
+			} else if !found || !historyWatchCheckpointEqualForBatch(current, *update.expected) {
+				continue
+			}
+			if update.next == nil {
+				delete(history, id)
+				continue
+			}
+			next := *update.next
+			next.ID = id
+			history[id] = next
+		}
+		return nil
+	})
+}
+
+func historyWatchCheckpointEqualForBatch(a, b teamstore.HistoryWatchCheckpoint) bool {
+	// Keep the same CAS contract as store.UpdateHistoryWatchCheckpointIfCurrent:
+	// UpdatedAt is an audit timestamp, not source progress.
+	a.UpdatedAt = time.Time{}
+	b.UpdatedAt = time.Time{}
+	return reflect.DeepEqual(a, b)
 }
 
 // history-watch scans are performed outside the store transaction and may
@@ -2043,6 +2133,15 @@ func (b *Bridge) recordHistoryWatchCheckpoint(ctx context.Context, id string, st
 
 func (b *Bridge) recordHistoryWatchCheckpointIfCurrent(ctx context.Context, id string, expected *teamstore.HistoryWatchCheckpoint, state historyTieredFileState, now time.Time) error {
 	checkpoint := historyWatchCheckpointFromState(id, state, now)
+	if batch, ok := ctx.Value(historyWatchBatchUpdateContextKey{}).(*historyWatchBatchUpdates); ok {
+		var expectedCopy *teamstore.HistoryWatchCheckpoint
+		if expected != nil {
+			copy := *expected
+			expectedCopy = &copy
+		}
+		batch.add(historyWatchBatchUpdate{id: id, expected: expectedCopy, next: &checkpoint})
+		return nil
+	}
 	if err := b.updateHistoryWatchCheckpointIfCurrent(ctx, id, expected, checkpoint); errors.Is(err, teamstore.ErrHistoryWatchCheckpointConflict) {
 		// Another watcher won the cursor CAS. The newer checkpoint is already
 		// durable; discard this stale scan and let the next poll start fresh.
@@ -2152,6 +2251,11 @@ func (b *Bridge) removeHistoryWatchCheckpoint(ctx context.Context, id string) er
 
 func (b *Bridge) removeHistoryWatchCheckpointIfCurrent(ctx context.Context, id string, expected *teamstore.HistoryWatchCheckpoint) error {
 	if expected == nil {
+		return nil
+	}
+	if batch, ok := ctx.Value(historyWatchBatchUpdateContextKey{}).(*historyWatchBatchUpdates); ok {
+		expectedCopy := *expected
+		batch.add(historyWatchBatchUpdate{id: id, expected: &expectedCopy})
 		return nil
 	}
 	if err := b.deleteHistoryWatchCheckpointIfCurrent(ctx, id, expected); errors.Is(err, teamstore.ErrHistoryWatchCheckpointConflict) {

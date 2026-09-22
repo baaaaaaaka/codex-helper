@@ -540,6 +540,60 @@ func TestHistoryWatchRebaseScanProgressDoesNotRegressDurableCursor(t *testing.T)
 	}
 }
 
+func TestHistoryWatchRebaseScanProgressBypassesFinalBatchBuffer(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "durable-rebase-progress.jsonl")
+	if err := os.WriteFile(path, []byte("rebase progress\n"), 0o600); err != nil {
+		t.Fatalf("write rebase source: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat rebase source: %v", err)
+	}
+	const id = "history-watch:durable-rebase-progress"
+	previous := historyTieredFileState{
+		Path:                            path,
+		Size:                            info.Size(),
+		ModTime:                         info.ModTime(),
+		SourceRewriteBlocked:            true,
+		SourceRewriteRecoveryIdentity:   "file:durable-rebase-progress",
+		SourceRewriteRecoverySize:       info.Size(),
+		SourceRewriteRecoveryModTime:    info.ModTime(),
+		SourceRewriteRecoveryChangeTime: teamstore.SourceFileChangeTime(path, info),
+	}
+	expected := historyWatchCheckpointFromState(id, previous, time.Now())
+	store := newBridgeTestStore(t)
+	if err := store.UpdateHistoryWatch(context.Background(), func(history map[string]teamstore.HistoryWatchCheckpoint, _ *time.Time) error {
+		history[id] = expected
+		return nil
+	}); err != nil {
+		t.Fatalf("seed rebase checkpoint: %v", err)
+	}
+	source := codexHistoryFile{Info: info, Identity: "file:durable-rebase-progress"}
+	progress := historyWatchRebaseScanProgress{
+		SourceIdentity: source.Identity,
+		Offset:         42,
+		Line:           3,
+		State:          transcriptParseState{sessionID: "session", threadID: "thread"},
+	}
+	batch := &historyWatchBatchUpdates{}
+	ctx := context.WithValue(context.Background(), historyWatchBatchUpdateContextKey{}, batch)
+	bridge := &Bridge{store: store}
+	if err := bridge.recordHistoryWatchRebaseScanProgress(ctx, id, &expected, previous, path, source, progress, time.Now()); err != nil {
+		t.Fatalf("persist rebase progress: %v", err)
+	}
+	if got := len(batch.snapshot()); got != 0 {
+		t.Fatalf("rebase progress queued in final batch: %d updates", got)
+	}
+	state, err := store.HistoryWatchState(context.Background())
+	if err != nil {
+		t.Fatalf("read rebase checkpoint: %v", err)
+	}
+	checkpoint := state.HistoryWatch[id]
+	if !checkpoint.SourceRewriteRecoveryScanPending || checkpoint.SourceRewriteRecoveryScanOffset != progress.Offset {
+		t.Fatalf("rebase progress checkpoint = %#v, want durable offset %d", checkpoint, progress.Offset)
+	}
+}
+
 func TestHistoryWatchModernRebaseCarriesEverySourceBoundFence(t *testing.T) {
 	cases := map[string]historyTieredFileState{
 		"legacy source unverified": {LegacySourceUnverified: true},

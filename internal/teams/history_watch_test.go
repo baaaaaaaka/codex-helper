@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -53,6 +54,62 @@ func TestHistoryWatchSessionLookupCachesDiscoveryWithinBatch(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("Codex discovery calls = %d, want one immutable batch snapshot", calls)
+	}
+}
+
+func TestHistoryWatchBatchUpdatesApplyIndependentCheckpointCASRows(t *testing.T) {
+	store := newBridgeTestStore(t)
+	ctx := context.Background()
+	firstID := "history-watch:first"
+	secondID := "history-watch:second"
+	conflictID := "history-watch:conflict"
+	first := teamstore.HistoryWatchCheckpoint{ID: firstID, Path: "/tmp/first.jsonl", Offset: 10}
+	second := teamstore.HistoryWatchCheckpoint{ID: secondID, Path: "/tmp/second.jsonl", Offset: 20}
+	conflict := teamstore.HistoryWatchCheckpoint{ID: conflictID, Path: "/tmp/conflict.jsonl", Offset: 30}
+	if err := store.UpdateHistoryWatch(ctx, func(history map[string]teamstore.HistoryWatchCheckpoint, _ *time.Time) error {
+		history[firstID] = first
+		history[secondID] = second
+		history[conflictID] = conflict
+		return nil
+	}); err != nil {
+		t.Fatalf("seed history-watch checkpoints: %v", err)
+	}
+	var updates int
+	store.SetTimingObserver(func(event teamstore.StoreTimingEvent) {
+		if strings.Contains(event.Operation, "updateSQLiteHistoryWatchIfChanged") && event.Stage == "state-lock-hold" {
+			updates++
+		}
+	})
+	bridge := &Bridge{store: store}
+	batch := &historyWatchBatchUpdates{}
+	firstNext := first
+	firstNext.Offset = 11
+	batch.add(historyWatchBatchUpdate{id: firstID, expected: &first, next: &firstNext})
+	secondExpected := second
+	batch.add(historyWatchBatchUpdate{id: secondID, expected: &secondExpected})
+	staleConflict := conflict
+	staleConflict.Offset = 29
+	conflictNext := conflict
+	conflictNext.Offset = 31
+	batch.add(historyWatchBatchUpdate{id: conflictID, expected: &staleConflict, next: &conflictNext})
+	if err := bridge.applyHistoryWatchBatchUpdates(ctx, batch); err != nil {
+		t.Fatalf("apply history-watch batch: %v", err)
+	}
+	if updates != 1 {
+		t.Fatalf("history-watch durable update calls = %d, want one coalesced callback", updates)
+	}
+	state, err := store.HistoryWatchState(ctx)
+	if err != nil {
+		t.Fatalf("read history-watch state: %v", err)
+	}
+	if got := state.HistoryWatch[firstID].Offset; got != 11 {
+		t.Fatalf("first checkpoint offset = %d, want 11", got)
+	}
+	if _, ok := state.HistoryWatch[secondID]; ok {
+		t.Fatal("second checkpoint was not removed by batch")
+	}
+	if got := state.HistoryWatch[conflictID].Offset; got != 30 {
+		t.Fatalf("conflicting checkpoint offset = %d, want unchanged 30", got)
 	}
 }
 
