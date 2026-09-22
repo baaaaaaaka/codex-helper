@@ -4640,21 +4640,6 @@ func (s *Store) QueuedTurnStateSnapshot(ctx context.Context) (State, error) {
 	return s.loadStateFieldsOrFull(ctx, queuedTurnStateSnapshotFields)
 }
 
-// InterruptedTurnNoticeStateSnapshot returns the narrow durable state needed
-// by the post-restart interrupted-turn notice pass.  The notice pass only
-// inspects interrupted turns with one recovery reason, queued/running turns
-// belonging to those same sessions, and the corresponding session bindings;
-// it does not need checkpoints or unrelated historical turns.  SQLite uses a
-// session/status-filtered reader.  The legacy JSON backend keeps the existing
-// selected snapshot fallback so old stores retain their compatibility
-// semantics until they are migrated.
-func (s *Store) InterruptedTurnNoticeStateSnapshot(ctx context.Context, recoveryReason string) (State, error) {
-	if state, handled, err := s.interruptedTurnNoticeStateSnapshotSQLite(ctx, recoveryReason); handled || err != nil {
-		return state, err
-	}
-	return s.QueuedTurnStateSnapshot(ctx)
-}
-
 func (s *Store) HasQueuedTurns(ctx context.Context) (bool, error) {
 	if hasQueued, handled, err := s.hasQueuedTurnsSQLite(ctx); handled || err != nil {
 		return hasQueued, err

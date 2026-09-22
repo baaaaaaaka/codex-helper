@@ -14969,7 +14969,7 @@ func (b *Bridge) sendDeferredInterruptedTurnNoticesNow(ctx context.Context) erro
 	if b == nil || b.store == nil {
 		return nil
 	}
-	state, err := b.store.InterruptedTurnNoticeStateSnapshot(ctx, recoveryReasonAmbiguousAfterHelperRestart)
+	state, err := b.store.QueuedTurnStateSnapshot(ctx)
 	if err != nil {
 		return err
 	}
@@ -19743,10 +19743,12 @@ func (b *Bridge) startQueuedTurnWithExecutionContext(ctx context.Context, execut
 				_, _ = fmt.Fprintf(b.out, "Teams queued turn session follow-up error: %v\n", err)
 			}
 			traceQueuedTurn("followup-finished", claimed.ID, false, nil)
-			if err := b.sendDeferredInterruptedTurnNotices(runCtx); err != nil && b.out != nil {
-				traceQueuedTurn("followup-notice-error", claimed.ID, false, err)
-				_, _ = fmt.Fprintf(b.out, "Teams interrupted turn notice error: %v\n", err)
-			}
+			// The main loop owns the interrupted-notice phase and runs it once per
+			// cycle.  Do not launch another full durable snapshot from every
+			// executor callback while the pending flag remains true: with many
+			// queued turns this turns an optional notice check into one serialized
+			// store scan per worker.  boostPolling below wakes the owning phase
+			// promptly after the queue becomes idle.
 			traceQueuedTurn("run-terminal", claimed.ID, false, nil)
 			b.boostPolling(time.Now())
 		} else {
