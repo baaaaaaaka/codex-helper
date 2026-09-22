@@ -1448,6 +1448,71 @@ func TestSQLiteOperationalBacklogUsesTrustedScalarsAndFailsClosedOnRevocation(t 
 	}
 }
 
+func TestSQLiteOperationalBacklogTrustProbeUsesInboundGenerationIndex(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	if err := st.Update(ctx, func(state *State) error {
+		state.InboundEvents["inbound-index-plan"] = InboundEvent{
+			ID: "inbound-index-plan", TeamsChatID: "chat-index-plan",
+			Status: InboundStatusIgnored, CreatedAt: time.Unix(1, 0).UTC(),
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed inbound index-plan fixture: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, st)
+	if err := st.withStateLock(ctx, func() error {
+		pointer, ok, err := st.currentSQLitePointerUnlocked()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return sql.ErrNoRows
+		}
+		db, err := st.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		rows, err := db.QueryContext(ctx, `EXPLAIN QUERY PLAN
+SELECT 1 FROM inbound_events
+WHERE COALESCE(projection_trusted, 0) != 1
+   OR COALESCE(canonical_revision, 0) <= 0
+   OR COALESCE(projection_revision, 0) != COALESCE(canonical_revision, 0)
+LIMIT 1`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		used := false
+		for rows.Next() {
+			var id, parent, detail int
+			var plan string
+			if err := rows.Scan(&id, &parent, &detail, &plan); err != nil {
+				return err
+			}
+			if strings.Contains(plan, "inbound_untrusted_generation_v1_idx") {
+				used = true
+			}
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		if !used {
+			return fmt.Errorf("inbound trust probe did not use inbound_untrusted_generation_v1_idx")
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("explain inbound trust probe: %v", err)
+	}
+	backlog, err := st.TeamsOperationalBacklog(ctx)
+	if err != nil {
+		t.Fatalf("TeamsOperationalBacklog: %v", err)
+	}
+	if backlog.Active() {
+		t.Fatalf("clean indexed fixture reported backlog=%#v", backlog)
+	}
+}
+
 func TestSQLiteChatPollFrontierHintRepairIsVersioned(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)

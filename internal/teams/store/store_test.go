@@ -22157,7 +22157,7 @@ func assertOfficialReleaseSQLiteSchemaForTest(t *testing.T, store *Store, tag st
 		t.Fatalf("%s upgraded inbound_events missing column received_at; columns=%v", tag, inboundColumns)
 	}
 	indexes := sqliteIndexSetForTest(t, db)
-	for _, index := range []string{"inbound_session_received_idx", "chat_polls_parked_skip_idx", "chat_polls_auto_park_idx", "outbox_chat_sequence_idx", "transcript_deliveries_outbox_idx", "helper_deliveries_outbox_idx", "artifact_records_outbox_idx"} {
+	for _, index := range []string{"inbound_session_received_idx", "inbound_untrusted_generation_v1_idx", "chat_polls_parked_skip_idx", "chat_polls_auto_park_idx", "outbox_chat_sequence_idx", "transcript_deliveries_outbox_idx", "helper_deliveries_outbox_idx", "artifact_records_outbox_idx"} {
 		if !indexes[index] {
 			t.Fatalf("%s upgraded sqlite missing index %q; indexes=%v", tag, index, indexes)
 		}

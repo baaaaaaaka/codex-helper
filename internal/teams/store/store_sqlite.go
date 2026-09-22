@@ -8469,6 +8469,13 @@ func ensureSQLiteSchemaContext(ctx context.Context, db *sql.DB) (err error) {
 		`CREATE INDEX IF NOT EXISTS sessions_stale_generation_v2_idx ON sessions(updated_at, id) WHERE projection_trusted = 1 AND (COALESCE(canonical_revision, 0) <= 0 OR COALESCE(projection_revision, 0) != COALESCE(canonical_revision, 0))`,
 		`CREATE INDEX IF NOT EXISTS turns_trusted_session_status_idx ON turns(session_id, status, queued_at, id) WHERE projection_trusted = 1`,
 		`CREATE INDEX IF NOT EXISTS turns_untrusted_generation_v1_idx ON turns(session_id, id) WHERE COALESCE(projection_trusted, 0) != 1 OR COALESCE(canonical_revision, 0) <= 0 OR COALESCE(projection_revision, 0) != COALESCE(canonical_revision, 0)`,
+		// TeamsOperationalBacklog verifies row-local generation fences before it
+		// trusts the scalar inbound status. Without this matching partial index,
+		// every optional-maintenance probe scans the entire inbound ledger even
+		// when all 117k+ rows are trusted. The index is only an acceleration of
+		// the existing fail-closed predicate; the canonical JSON fallback remains
+		// authoritative whenever a row is found here.
+		`CREATE INDEX IF NOT EXISTS inbound_untrusted_generation_v1_idx ON inbound_events(id) WHERE COALESCE(projection_trusted, 0) != 1 OR COALESCE(canonical_revision, 0) <= 0 OR COALESCE(projection_revision, 0) != COALESCE(canonical_revision, 0)`,
 		`CREATE INDEX IF NOT EXISTS chat_polls_trusted_operational_idx ON chat_polls(updated_at, next_poll_at, last_activity_at, chat_id) WHERE projection_trusted = 1 AND frontier_active = 1`,
 		`CREATE INDEX IF NOT EXISTS chat_polls_trusted_ordinary_idx ON chat_polls(updated_at, next_poll_at, last_activity_at, chat_id) WHERE projection_trusted = 1 AND frontier_active = 0`,
 		`CREATE INDEX IF NOT EXISTS chat_polls_untrusted_admission_idx ON chat_polls(chat_id) WHERE projection_trusted = 0 OR admission_valid IS NULL OR admission_valid = 0`,
