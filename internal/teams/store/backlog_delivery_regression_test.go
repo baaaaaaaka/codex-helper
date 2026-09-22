@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"testing"
 	"time"
@@ -774,6 +775,104 @@ func TestStoreTakeOverRunningTurnWithAnchorRebindsOnlyExpectedTurnAcrossBackends
 			}
 			if _, err := store.TakeOverRunningTurnWithAnchorForOwner(ctx, request, machineB.ID, leaseB.Lease.Generation, machineA.ID, leaseA.Lease.Generation); !errors.Is(err, ErrStaleExecutionCallback) {
 				t.Fatalf("repeat takeover error = %v, want stale callback for non-running turn", err)
+			}
+		})
+	}
+}
+
+func TestStoreTakeOverRunningTurnWithAnchorPreservesHistoricalAnchorForLiveBranchAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(map[bool]string{false: "json", true: "sqlite"}[useSQLite], func(t *testing.T) {
+			store := newTestStore(t)
+			now := time.Now().UTC().Truncate(time.Microsecond)
+			const (
+				sessionID        = "session:takeover-live-branch"
+				turnID           = "turn:takeover-live-branch"
+				oldOuterTurnID   = "turn:historical-owner"
+				historicalThread = "thread:historical-owner"
+				liveBranchThread = "thread:durable-live-branch"
+				historicalCodex  = "codex:historical-owner"
+			)
+			scope := ScopeIdentity{ID: "scope:takeover-live-branch", AccountID: "user-1", OSUser: "tester", Profile: "default"}
+			machineA := MachineRecord{ID: "machine:takeover-live-branch-a", ScopeID: scope.ID, Kind: MachineKindPrimary, Priority: DefaultMachinePriority(MachineKindPrimary)}
+			machineB := MachineRecord{ID: "machine:takeover-live-branch-b", ScopeID: scope.ID, Kind: MachineKindPrimary, Priority: DefaultMachinePriority(MachineKindPrimary)}
+			leaseA, err := store.ClaimControlLease(ctx, ControlLeaseClaim{Scope: scope, Machine: machineA, Duration: time.Hour, Now: now})
+			if err != nil || leaseA.Mode != LeaseModeActive {
+				t.Fatalf("claim owner A = %#v err=%v", leaseA, err)
+			}
+			checkpointID := sessionTranscriptCheckpointID(sessionID)
+			historicalAnchor := ExecutionAnchor{
+				SessionID: sessionID, ThreadID: historicalThread, LiveBranchThreadID: liveBranchThread,
+				OuterTurnID: oldOuterTurnID, CodexTurnID: historicalCodex,
+				SourcePath: "/tmp/historical.jsonl", SourceFingerprint: "historical-fingerprint",
+				CutoffRecordID: "historical-record", CutoffLine: 17, CutoffOffset: 2048,
+				Reason: "ambiguous historical execution", Provenance: ExecutionAnchorProvenanceRuntime,
+				State: "unresolved", Generation: 7, CreatedAt: now, UpdatedAt: now,
+			}
+			if err := store.Update(ctx, func(state *State) error {
+				state.Sessions[sessionID] = SessionContext{ID: sessionID, TeamsChatID: "chat:takeover-live-branch", Status: SessionStatusActive, CreatedAt: now, UpdatedAt: now}
+				state.Turns[turnID] = Turn{
+					ID: turnID, SessionID: sessionID, ScopeID: scope.ID,
+					MachineID: machineA.ID, LeaseGeneration: leaseA.Lease.Generation,
+					Status: TurnStatusRunning, CodexThreadID: liveBranchThread,
+					StartedAt: now, CreatedAt: now, UpdatedAt: now,
+				}
+				state.ImportCheckpoints[checkpointID] = ImportCheckpoint{
+					ID: checkpointID, SessionID: sessionID, ExecutionAnchorGeneration: historicalAnchor.Generation,
+					UnresolvedExecution: &historicalAnchor, UpdatedAt: now,
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed live-branch running turn: %v", err)
+			}
+			if useSQLite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+			if released, err := store.ReleaseControlLeaseIfHolder(ctx, machineA.ID, leaseA.Lease.Generation); err != nil || !released {
+				t.Fatalf("release owner A = %v err=%v", released, err)
+			}
+			leaseB, err := store.ClaimControlLease(ctx, ControlLeaseClaim{Scope: scope, Machine: machineB, Duration: time.Hour, Now: now.Add(time.Second)})
+			if err != nil || leaseB.Mode != LeaseModeActive || leaseB.Lease.Generation <= leaseA.Lease.Generation {
+				t.Fatalf("claim owner B = %#v err=%v", leaseB, err)
+			}
+
+			request := PersistInterruptedTurnWithAnchorRequest{
+				SessionID: sessionID, TurnID: turnID, CheckpointID: checkpointID,
+				CodexThreadID: liveBranchThread, RecoveryReason: "interrupt stale live-branch execution",
+				Anchor: ExecutionAnchor{ThreadID: liveBranchThread, Reason: "interrupt stale live-branch execution", Provenance: ExecutionAnchorProvenanceRuntime},
+			}
+			result, err := store.TakeOverRunningTurnWithAnchorForOwner(ctx, request, machineB.ID, leaseB.Lease.Generation, machineA.ID, leaseA.Lease.Generation)
+			if err != nil || !result.Changed || result.Turn.Status != TurnStatusInterrupted || result.Turn.MachineID != machineB.ID || result.Turn.LeaseGeneration != leaseB.Lease.Generation {
+				t.Fatalf("live-branch takeover result = %#v err=%v", result, err)
+			}
+			checkpoint, found, err := store.ImportCheckpoint(ctx, checkpointID)
+			if err != nil || !found || checkpoint.UnresolvedExecution == nil {
+				t.Fatalf("live-branch checkpoint = %#v found=%v err=%v", checkpoint, found, err)
+			}
+			if got := *checkpoint.UnresolvedExecution; !reflect.DeepEqual(got, historicalAnchor) {
+				t.Fatalf("live-branch takeover rewrote historical anchor: got=%#v want=%#v", got, historicalAnchor)
+			}
+			if _, err := store.TakeOverRunningTurnWithAnchorForOwner(ctx, request, machineB.ID, leaseB.Lease.Generation, machineA.ID, leaseA.Lease.Generation); !errors.Is(err, ErrStaleExecutionCallback) {
+				t.Fatalf("repeat live-branch takeover error = %v, want stale callback for interrupted turn", err)
+			}
+
+			// A different thread is not an admitted live branch and must remain
+			// fenced by the historical unresolved owner.
+			if err := store.Update(ctx, func(state *State) error {
+				turn := state.Turns[turnID]
+				turn.Status = TurnStatusRunning
+				turn.CodexThreadID = "thread:unadmitted-branch"
+				turn.UpdatedAt = now.Add(2 * time.Second)
+				state.Turns[turnID] = turn
+				return nil
+			}); err != nil {
+				t.Fatalf("reset running turn for wrong-branch check: %v", err)
+			}
+			wrongBranch := request
+			wrongBranch.CodexThreadID = "thread:unadmitted-branch"
+			if _, err := store.TakeOverRunningTurnWithAnchorForOwner(ctx, wrongBranch, machineB.ID, leaseB.Lease.Generation, machineB.ID, leaseB.Lease.Generation); !errors.Is(err, ErrUnresolvedExecution) {
+				t.Fatalf("wrong live branch takeover error = %v, want unresolved execution", err)
 			}
 		})
 	}

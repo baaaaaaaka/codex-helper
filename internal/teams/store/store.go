@@ -13639,31 +13639,43 @@ func persistInterruptedTurnWithAnchorLocked(state *State, current Turn, req Pers
 	} else if strings.TrimSpace(checkpoint.SessionID) != req.SessionID {
 		return current, ErrStaleExecutionCallback
 	}
+	preserveExistingLiveBranchAnchor := false
 	if active := importCheckpointHasUnresolvedExecution(checkpoint); active && checkpoint.UnresolvedExecution != nil {
 		if outer := strings.TrimSpace(checkpoint.UnresolvedExecution.OuterTurnID); outer != "" && outer != req.TurnID {
-			// A different unresolved owner is already the session fence. Do not
-			// attach this callback to it or overwrite its provenance.
-			return current, ErrUnresolvedExecution
+			// A different unresolved owner is already the session fence. The one
+			// startup-recovery exception is a Running turn that belongs to the
+			// durable isolated live branch recorded by that anchor. It is a
+			// separate outer turn on the same explicitly admitted thread: the new
+			// owner may interrupt that stale execution, but must preserve the old
+			// anchor rather than rebasing or merging its identity.
+			liveBranchThread := strings.TrimSpace(checkpoint.UnresolvedExecution.LiveBranchThreadID)
+			currentThread := strings.TrimSpace(firstStoreNonEmptyString(req.CodexThreadID, current.CodexThreadID))
+			if !req.AllowTakeover || current.Status != TurnStatusRunning || liveBranchThread == "" || currentThread == "" || currentThread != liveBranchThread {
+				return current, ErrUnresolvedExecution
+			}
+			preserveExistingLiveBranchAnchor = true
 		}
-		// Never merge a callback identity into an existing anchor when the
-		// current Turn has not yet recorded that identity. The anchor is the
-		// durable owner; accepting a different thread/Codex turn here would
-		// leave Turn and checkpoint provenance permanently inconsistent.
-		anchor := checkpoint.UnresolvedExecution
-		if expected := strings.TrimSpace(anchor.ThreadID); expected != "" {
-			if observed := strings.TrimSpace(req.CodexThreadID); observed != "" && observed != expected {
-				return current, ErrStaleExecutionCallback
+		if !preserveExistingLiveBranchAnchor {
+			// Never merge a callback identity into an existing anchor when the
+			// current Turn has not yet recorded that identity. The anchor is the
+			// durable owner; accepting a different thread/Codex turn here would
+			// leave Turn and checkpoint provenance permanently inconsistent.
+			anchor := checkpoint.UnresolvedExecution
+			if expected := strings.TrimSpace(anchor.ThreadID); expected != "" {
+				if observed := strings.TrimSpace(req.CodexThreadID); observed != "" && observed != expected {
+					return current, ErrStaleExecutionCallback
+				}
+				if observed := strings.TrimSpace(current.CodexThreadID); observed != "" && observed != expected {
+					return current, ErrStaleExecutionCallback
+				}
 			}
-			if observed := strings.TrimSpace(current.CodexThreadID); observed != "" && observed != expected {
-				return current, ErrStaleExecutionCallback
-			}
-		}
-		if expected := strings.TrimSpace(anchor.CodexTurnID); expected != "" {
-			if observed := strings.TrimSpace(req.CodexTurnID); observed != "" && observed != expected {
-				return current, ErrStaleExecutionCallback
-			}
-			if observed := strings.TrimSpace(current.CodexTurnID); observed != "" && observed != expected {
-				return current, ErrStaleExecutionCallback
+			if expected := strings.TrimSpace(anchor.CodexTurnID); expected != "" {
+				if observed := strings.TrimSpace(req.CodexTurnID); observed != "" && observed != expected {
+					return current, ErrStaleExecutionCallback
+				}
+				if observed := strings.TrimSpace(current.CodexTurnID); observed != "" && observed != expected {
+					return current, ErrStaleExecutionCallback
+				}
 			}
 		}
 	}
@@ -13674,39 +13686,45 @@ func persistInterruptedTurnWithAnchorLocked(state *State, current Turn, req Pers
 	var anchor ExecutionAnchor
 	if checkpoint.UnresolvedExecution != nil && importCheckpointHasUnresolvedExecution(checkpoint) {
 		anchor = *checkpoint.UnresolvedExecution
-		if strings.TrimSpace(anchor.State) == "" {
+		if preserveExistingLiveBranchAnchor {
+			// Keep every field of the historical unresolved owner intact. In
+			// particular, do not replace OuterTurnID, CodexTurnID, source proof,
+			// or generation with the stale branch turn being interrupted.
+		} else if strings.TrimSpace(anchor.State) == "" {
 			anchor.State = "unresolved"
 			anchorChanged = true
 		}
-		if anchor.Generation <= 0 {
+		if !preserveExistingLiveBranchAnchor && anchor.Generation <= 0 {
 			anchor.Generation = maxStoreInt64(checkpoint.ExecutionAnchorGeneration, 1)
 			anchorChanged = true
 		}
-		if checkpoint.ExecutionAnchorGeneration < anchor.Generation {
+		if !preserveExistingLiveBranchAnchor && checkpoint.ExecutionAnchorGeneration < anchor.Generation {
 			checkpoint.ExecutionAnchorGeneration = anchor.Generation
 			anchorChanged = true
 		}
-		fields := []struct {
-			dst *string
-			src string
-		}{
-			{&anchor.SessionID, req.SessionID},
-			{&anchor.ThreadID, threadID},
-			{&anchor.OuterTurnID, req.TurnID},
-			{&anchor.CodexTurnID, codexTurnID},
-			{&anchor.SourcePath, req.Anchor.SourcePath},
-			{&anchor.SourceFingerprint, req.Anchor.SourceFingerprint},
-			{&anchor.Reason, firstStoreNonEmptyString(req.RecoveryReason, req.Anchor.Reason)},
-		}
-		for _, field := range fields {
-			if strings.TrimSpace(*field.dst) == "" && strings.TrimSpace(field.src) != "" {
-				*field.dst = strings.TrimSpace(field.src)
+		if !preserveExistingLiveBranchAnchor {
+			fields := []struct {
+				dst *string
+				src string
+			}{
+				{&anchor.SessionID, req.SessionID},
+				{&anchor.ThreadID, threadID},
+				{&anchor.OuterTurnID, req.TurnID},
+				{&anchor.CodexTurnID, codexTurnID},
+				{&anchor.SourcePath, req.Anchor.SourcePath},
+				{&anchor.SourceFingerprint, req.Anchor.SourceFingerprint},
+				{&anchor.Reason, firstStoreNonEmptyString(req.RecoveryReason, req.Anchor.Reason)},
+			}
+			for _, field := range fields {
+				if strings.TrimSpace(*field.dst) == "" && strings.TrimSpace(field.src) != "" {
+					*field.dst = strings.TrimSpace(field.src)
+					anchorChanged = true
+				}
+			}
+			if strings.TrimSpace(anchor.Reason) == "" && strings.TrimSpace(req.RecoveryReason) != "" {
+				anchor.Reason = strings.TrimSpace(req.RecoveryReason)
 				anchorChanged = true
 			}
-		}
-		if strings.TrimSpace(anchor.Reason) == "" && strings.TrimSpace(req.RecoveryReason) != "" {
-			anchor.Reason = strings.TrimSpace(req.RecoveryReason)
-			anchorChanged = true
 		}
 	} else {
 		anchor = req.Anchor
