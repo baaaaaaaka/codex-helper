@@ -50,6 +50,11 @@ const (
 // JSON without repeatedly rewriting the large cold document.
 const (
 	sqliteHistoryWatchProjectionKey = "history_watch_projection"
+	// Dashboard records are only needed by control-prompt rendering.  Keep a
+	// revision-fenced copy beside the cold state so that resuming a queued
+	// control turn does not parse the growing compatibility document under the
+	// global Store lock.
+	sqliteDashboardProjectionKey = "dashboard_projection"
 	// This marker makes the canonical frontier-hint repair an open/migration
 	// action rather than a full chat_polls rewrite on every compatibility save.
 	// Bump the value whenever the canonical frontier predicate changes.
@@ -1754,6 +1759,12 @@ type sqliteHistoryWatchProjection struct {
 	StateJSONRevision int64                             `json:"state_json_revision,omitempty"`
 }
 
+type sqliteDashboardProjection struct {
+	DashboardViews    map[string]DashboardViewRecord   `json:"dashboard_views,omitempty"`
+	DashboardNumbers  map[string]DashboardNumberRecord `json:"dashboard_numbers,omitempty"`
+	StateJSONRevision int64                            `json:"state_json_revision,omitempty"`
+}
+
 const SQLiteFileName = storeSQLiteFileName
 
 const (
@@ -3038,6 +3049,11 @@ func (s *Store) loadSQLiteDashboardStateUnlocked(ctx context.Context, pointer st
 	if err != nil {
 		return State{}, err
 	}
+	if state, found, err := loadSQLiteDashboardProjection(ctx, db); err != nil {
+		return State{}, err
+	} else if found {
+		return state, nil
+	}
 	var valid int
 	var viewsRaw, numbersRaw []byte
 	if err := db.QueryRowContext(ctx, `
@@ -3065,6 +3081,41 @@ FROM state_meta WHERE key = 'state_json'`).Scan(&valid, &viewsRaw, &numbersRaw);
 		return State{}, fmt.Errorf("decode sqlite dashboard numbers: %w", err)
 	}
 	return state, nil
+}
+
+// loadSQLiteDashboardProjection returns the revision-fenced dashboard cache.
+// It is deliberately optional: old SQLite files and mixed-version writers do
+// not have the projection yet, and a stale/corrupt cache must fall back to the
+// canonical state_json reader below rather than becoming authoritative.
+func loadSQLiteDashboardProjection(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}) (State, bool, error) {
+	var raw []byte
+	var stateJSONRevision int64
+	if err := q.QueryRowContext(ctx, `
+SELECT (SELECT value FROM state_meta WHERE key = ?),
+       COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta WHERE key = ?), 0)`,
+		sqliteDashboardProjectionKey, sqliteStateJSONRevisionKey).Scan(&raw, &stateJSONRevision); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return State{}, false, nil
+		}
+		return State{}, false, err
+	}
+	if len(raw) == 0 {
+		return State{}, false, nil
+	}
+	var projection sqliteDashboardProjection
+	if err := json.Unmarshal(raw, &projection); err != nil ||
+		projection.StateJSONRevision <= 0 || projection.StateJSONRevision != stateJSONRevision {
+		return State{}, false, nil
+	}
+	state := State{
+		SchemaVersion:    SchemaVersion,
+		DashboardViews:   projection.DashboardViews,
+		DashboardNumbers: projection.DashboardNumbers,
+	}
+	state.ensure(time.Time{})
+	return state, true, nil
 }
 
 func (s *Store) hotPollScheduleStateSQLite(ctx context.Context) (State, bool, error) {
@@ -9979,6 +10030,9 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value); err != nil 
 	if err := upsertSQLiteHistoryWatchProjectionTx(ctx, tx, state.HistoryWatch, state.HistoryWatchReady, stateJSONRevision); err != nil {
 		return err
 	}
+	if err := upsertSQLiteDashboardProjectionTx(ctx, tx, state, stateJSONRevision); err != nil {
+		return err
+	}
 	if err := saveSQLiteRuntimeStateTx(ctx, tx, state); err != nil {
 		return err
 	}
@@ -16042,6 +16096,13 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value`, cold)
 	if err != nil {
 		return err
 	}
+	stateJSONRevision, err := sqliteStateJSONRevision(ctx, tx)
+	if err != nil {
+		return err
+	}
+	if err := upsertSQLiteDashboardProjectionTx(ctx, tx, state, stateJSONRevision); err != nil {
+		return err
+	}
 	// HistoryWatch has a dedicated projection update path.  Do not rewrite that
 	// projection on every unrelated cold-state/outbox update: it adds a JSON
 	// marshal and state_meta write to the hot queue path and can overwrite a
@@ -16061,6 +16122,27 @@ func upsertSQLiteHistoryWatchProjectionTx(ctx context.Context, tx *sql.Tx, histo
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO state_meta(key, value) VALUES (?, ?)
 ON CONFLICT(key) DO UPDATE SET value = excluded.value`, sqliteHistoryWatchProjectionKey, raw)
+	return err
+}
+
+func upsertSQLiteDashboardProjectionTx(ctx context.Context, tx *sql.Tx, state State, stateJSONRevision int64) error {
+	if stateJSONRevision <= 0 {
+		// Very old SQLite fixtures may not have the revision trigger yet.  Do not
+		// publish an unfenced cache; the canonical state_json fallback remains
+		// correct until normal schema preparation installs the revision.
+		return nil
+	}
+	state.ensure(time.Time{})
+	raw, err := json.Marshal(sqliteDashboardProjection{
+		DashboardViews:    state.DashboardViews,
+		DashboardNumbers:  state.DashboardNumbers,
+		StateJSONRevision: stateJSONRevision,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO state_meta(key, value) VALUES (?, ?)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value`, sqliteDashboardProjectionKey, raw)
 	return err
 }
 

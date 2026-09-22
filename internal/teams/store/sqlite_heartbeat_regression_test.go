@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -138,6 +139,15 @@ func TestSQLiteDashboardSnapshotAvoidsFullStateLoad(t *testing.T) {
 		t.Fatalf("seed dashboard state: %v", err)
 	}
 	migrateStoreToSQLiteForTest(t, store)
+	var dashboardProjection sqliteDashboardProjection
+	if err := withSQLiteRawQueryForTest(store, `SELECT value FROM state_meta WHERE key = ?`, func(raw []byte) error {
+		return json.Unmarshal(raw, &dashboardProjection)
+	}, sqliteDashboardProjectionKey); err != nil {
+		t.Fatalf("read dashboard projection: %v", err)
+	}
+	if dashboardProjection.StateJSONRevision <= 0 || len(dashboardProjection.DashboardViews) != 1 || len(dashboardProjection.DashboardNumbers) != 2 {
+		t.Fatalf("dashboard projection = %#v, want revision-fenced records", dashboardProjection)
+	}
 
 	fullLoads := 0
 	previousHook := sqliteStateLoadTestHook
@@ -159,6 +169,52 @@ func TestSQLiteDashboardSnapshotAvoidsFullStateLoad(t *testing.T) {
 	}
 	if _, ok := state.DashboardNumbers["number-other-chat"]; !ok {
 		t.Fatal("dashboard snapshot omitted unrelated durable number; filtering belongs to the caller")
+	}
+}
+
+func TestSQLiteDashboardSnapshotFallsBackFromStaleProjection(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	if err := store.Update(ctx, func(state *State) error {
+		state.DashboardViews["control-chat"] = DashboardViewRecord{
+			ID:          "view-canonical",
+			ChatID:      "control-chat",
+			Kind:        "workspaces",
+			WorkspaceID: "workspace-canonical",
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed dashboard fallback state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	var revision int64
+	if err := withSQLiteRawQueryForTest(store, `SELECT value FROM state_meta WHERE key = ?`, func(raw []byte) error {
+		var err error
+		revision, err = strconv.ParseInt(string(raw), 10, 64)
+		return err
+	}, sqliteStateJSONRevisionKey); err != nil {
+		t.Fatalf("read dashboard fallback revision: %v", err)
+	}
+	stale, err := json.Marshal(sqliteDashboardProjection{
+		DashboardViews: map[string]DashboardViewRecord{
+			"control-chat": {ID: "view-stale", ChatID: "control-chat", WorkspaceID: "workspace-stale"},
+		},
+		StateJSONRevision: revision - 1,
+	})
+	if err != nil {
+		t.Fatalf("marshal stale dashboard projection: %v", err)
+	}
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE state_meta SET value = ? WHERE key = ?`, stale, sqliteDashboardProjectionKey)
+		return err
+	})
+
+	state, err := store.DashboardStateSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("DashboardStateSnapshot with stale projection: %v", err)
+	}
+	if got := state.DashboardViews["control-chat"].WorkspaceID; got != "workspace-canonical" {
+		t.Fatalf("stale dashboard projection won with workspace %q, want canonical", got)
 	}
 }
 
