@@ -218,6 +218,38 @@ func TestSQLiteDashboardSnapshotFallsBackFromStaleProjection(t *testing.T) {
 	}
 }
 
+func TestSQLiteRuntimeSelectedReadDoesNotRequireColdStateJSON(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	now := time.Date(2026, 9, 22, 13, 0, 0, 0, time.UTC)
+	if err := store.Update(ctx, func(state *State) error {
+		state.ControlChat = ControlChatBinding{TeamsChatID: "control-runtime"}
+		state.ServiceOwner = &OwnerMetadata{MachineID: "machine-runtime", PID: 4242, LastHeartbeat: now}
+		state.Sessions["session-runtime"] = SessionContext{ID: "session-runtime", Status: SessionStatusActive, TeamsChatID: "chat-runtime"}
+		state.Turns["turn-runtime"] = Turn{ID: "turn-runtime", SessionID: "session-runtime", Status: TurnStatusQueued, CreatedAt: now}
+		state.ChatPolls["chat-runtime"] = ChatPollState{ChatID: "chat-runtime", PollState: "warm", NextPollAt: now}
+		state.ImportCheckpoints["checkpoint-runtime"] = ImportCheckpoint{ID: "checkpoint-runtime", SessionID: "session-runtime", Status: "complete"}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed runtime selected fixture: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE state_meta SET value = ? WHERE key = 'state_json'`, []byte(`{"broken`))
+		return err
+	})
+
+	snapshot, err := store.PollScheduleSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("runtime/native selected read with corrupt cold JSON: %v", err)
+	}
+	if snapshot.ControlChat.TeamsChatID != "control-runtime" || snapshot.ServiceOwner == nil ||
+		snapshot.Sessions["session-runtime"].ID == "" || snapshot.Turns["turn-runtime"].ID == "" ||
+		snapshot.ChatPolls["chat-runtime"].ChatID == "" {
+		t.Fatalf("runtime/native selected snapshot = %#v", snapshot)
+	}
+}
+
 func TestJSONDashboardSnapshotUsesSelectedFields(t *testing.T) {
 	ctx := context.Background()
 	store := newTestStore(t)

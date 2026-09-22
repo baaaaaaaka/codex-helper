@@ -12542,12 +12542,27 @@ func loadSQLiteSelectedStateWithChatPollQueryMode(ctx context.Context, db *sql.D
 			}
 		}
 	} else {
-		state, err = loadSQLiteSelectedColdStateWithoutRowMaps(ctx, db, wanted)
-		if err != nil {
-			return State{}, err
+		runtimeOverlayLoaded := false
+		if hasNonNativeSelectedFields(wanted) {
+			runtimeState, seen, runtimeErr := loadSQLiteRuntimeState(ctx, db)
+			if runtimeErr != nil {
+				return State{}, runtimeErr
+			}
+			if sqliteSelectedFieldsCoveredByRuntime(wanted, seen) {
+				state = State{SchemaVersion: SchemaVersion}
+				overlaySQLiteRuntimeStateValues(&state, runtimeState, seen)
+				state.ensure(time.Time{})
+				runtimeOverlayLoaded = true
+			}
 		}
-		if err := overlaySQLiteRuntimeState(ctx, db, &state); err != nil {
-			return State{}, err
+		if !runtimeOverlayLoaded {
+			state, err = loadSQLiteSelectedColdStateWithoutRowMaps(ctx, db, wanted)
+			if err != nil {
+				return State{}, err
+			}
+			if err := overlaySQLiteRuntimeState(ctx, db, &state); err != nil {
+				return State{}, err
+			}
 		}
 	}
 	if _, ok := wanted["sessions"]; ok {
@@ -12634,6 +12649,56 @@ func loadSQLiteSelectedStateWithChatPollQueryMode(ctx context.Context, db *sql.D
 	}
 	normalizeLoadedState(&state)
 	return state, nil
+}
+
+func hasNonNativeSelectedFields(wanted map[string]struct{}) bool {
+	for field := range wanted {
+		if !sqliteStateRowMapField(field) {
+			return true
+		}
+	}
+	return false
+}
+
+func sqliteRuntimeKeyForStateField(field string) string {
+	switch field {
+	case "scope":
+		return sqliteRuntimeKeyScope
+	case "machine_identity":
+		return sqliteRuntimeKeyMachineIdentity
+	case "machines":
+		return sqliteRuntimeKeyMachines
+	case "service_owner":
+		return sqliteRuntimeKeyServiceOwner
+	case "lock_owner":
+		return sqliteRuntimeKeyLockOwner
+	case "service_control":
+		return sqliteRuntimeKeyServiceControl
+	case "upgrade":
+		return sqliteRuntimeKeyUpgrade
+	case "auto_update":
+		return sqliteRuntimeKeyAutoUpdate
+	case "control_chat":
+		return sqliteRuntimeKeyControlChat
+	default:
+		return ""
+	}
+}
+
+func sqliteSelectedFieldsCoveredByRuntime(wanted map[string]struct{}, seen map[string]bool) bool {
+	if !sqliteRuntimeStateUsable(seen) {
+		return false
+	}
+	for field := range wanted {
+		if sqliteStateRowMapField(field) {
+			continue
+		}
+		key := sqliteRuntimeKeyForStateField(field)
+		if key == "" || !seen[key] {
+			return false
+		}
+	}
+	return true
 }
 
 // sqliteStateRowMapField is stored in a native table after SQLite migration.
