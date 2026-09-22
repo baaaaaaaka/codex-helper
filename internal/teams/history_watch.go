@@ -70,6 +70,15 @@ func (b *Bridge) historyWatchSessionProjects(ctx context.Context) ([]codexhistor
 // worker. HistoryWatch is a cold path, so this is intentionally a small pool;
 // its purpose is fairness and fault isolation, not unrestricted parallelism.
 func (b *Bridge) runHistoryWatchSyncJobs(ctx context.Context, paths []string, now time.Time) error {
+	return b.runHistoryWatchSyncJobsWithState(ctx, paths, now, nil)
+}
+
+// runHistoryWatchSyncJobsWithState reuses the read-only HistoryWatch snapshot
+// that selected this bounded batch.  Each worker still uses the checkpoint
+// from that snapshot as the expected value for the existing durable CAS; a
+// concurrent writer therefore turns a stale selection into a safe retry rather
+// than allowing it to overwrite newer progress.
+func (b *Bridge) runHistoryWatchSyncJobsWithState(ctx context.Context, paths []string, now time.Time, state *teamstore.State) error {
 	if len(paths) == 0 {
 		return nil
 	}
@@ -124,7 +133,11 @@ func (b *Bridge) runHistoryWatchSyncJobs(ctx context.Context, paths []string, no
 				}
 				jobStarted := time.Now()
 				if err == nil {
-					err = b.syncCodexHistoryWatchPath(jobCtx, path, now)
+					if state == nil {
+						err = b.syncCodexHistoryWatchPath(jobCtx, path, now)
+					} else {
+						err = b.syncCodexHistoryWatchPathWithState(jobCtx, path, now, state)
+					}
 				}
 				if b.historyWatchJobTraceHook != nil {
 					b.historyWatchJobTraceHook(path, time.Since(jobStarted), err)
@@ -534,7 +547,7 @@ func (b *Bridge) syncCodexHistoryFinalsForBacklogWithDiscovery(ctx context.Conte
 		return firstErr
 	}
 	changes, scanErr := historyWatchChangedPaths(paths, state, true)
-	syncErr := b.runHistoryWatchSyncJobs(ctx, changes, now)
+	syncErr := b.runHistoryWatchSyncJobsWithState(ctx, changes, now, &state)
 	// The selection cursor is a scheduling fact, not a success marker. Once a
 	// bounded quantum has been selected, ordinary path/scan/handler failures
 	// must still persist the consumed prefix while the dirty path remains queued;
@@ -862,7 +875,7 @@ func (b *Bridge) syncCodexHistoryFinals(ctx context.Context, now time.Time, reco
 	if firstErr != nil && normalHistoryCursorSelected {
 		return firstErr
 	}
-	syncErr := b.runHistoryWatchSyncJobs(ctx, changes, now)
+	syncErr := b.runHistoryWatchSyncJobsWithState(ctx, changes, now, &state)
 	if scanErr != nil || syncErr != nil {
 		retryPaths := append([]string(nil), dirtyPaths...)
 		retryPaths = append(retryPaths, selectedRecovery...)
@@ -1433,15 +1446,25 @@ func historyWatchBaselineBoundary(path string, size int64) (historyWatchBaseline
 }
 
 func (b *Bridge) syncCodexHistoryWatchPath(ctx context.Context, path string, now time.Time) error {
+	return b.syncCodexHistoryWatchPathWithState(ctx, path, now, nil)
+}
+
+func (b *Bridge) syncCodexHistoryWatchPathWithState(ctx context.Context, path string, now time.Time, snapshot *teamstore.State) error {
 	ctx = b.historyWatchSessionLookupContext(ctx)
 	path = strings.TrimSpace(path)
 	if path == "" {
 		return nil
 	}
 	id := historyWatchCheckpointID(path)
-	state, err := b.store.HistoryWatchState(ctx)
-	if err != nil {
-		return err
+	var state teamstore.State
+	if snapshot == nil {
+		var err error
+		state, err = b.store.HistoryWatchState(ctx)
+		if err != nil {
+			return err
+		}
+	} else {
+		state = *snapshot
 	}
 	checkpoint := state.HistoryWatch[id]
 	var expectedCheckpoint *teamstore.HistoryWatchCheckpoint
