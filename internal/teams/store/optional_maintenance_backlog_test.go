@@ -1040,6 +1040,58 @@ func TestTeamsOperationalBacklogIgnoresQueuedInboundForTerminalTurn(t *testing.T
 	}
 }
 
+func TestTeamsOperationalBacklogInboundStatusParityAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	now := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name       string
+		status     InboundStatus
+		turnID     string
+		turnStatus TurnStatus
+		want       bool
+	}{
+		{name: "orphan manual hold", status: InboundStatusManualHold, want: false},
+		{name: "orphan uncertain", status: InboundStatusUncertain, want: false},
+		{name: "orphan unknown", status: InboundStatus("future-provider-state"), want: true},
+		{name: "terminal linked manual hold", status: InboundStatusManualHold, turnID: "turn-terminal", turnStatus: TurnStatusCompleted, want: false},
+		{name: "terminal linked ignored", status: InboundStatusIgnored, turnID: "turn-terminal", turnStatus: TurnStatusCompleted, want: false},
+		{name: "terminal linked empty", status: InboundStatus(""), turnID: "turn-terminal", turnStatus: TurnStatusCompleted, want: false},
+		{name: "active linked manual hold", status: InboundStatusManualHold, turnID: "turn-active", turnStatus: TurnStatusRunning, want: true},
+		{name: "active linked ignored", status: InboundStatusIgnored, turnID: "turn-active", turnStatus: TurnStatusRunning, want: true},
+		{name: "active linked empty", status: InboundStatus(""), turnID: "turn-active", turnStatus: TurnStatusRunning, want: true},
+	}
+	for _, backend := range []string{"json", "sqlite"} {
+		for _, tc := range cases {
+			t.Run(backend+"/"+tc.name, func(t *testing.T) {
+				st := newTestStore(t)
+				if err := st.Update(ctx, func(state *State) error {
+					if tc.turnID != "" {
+						state.Turns[tc.turnID] = Turn{ID: tc.turnID, Status: tc.turnStatus, CreatedAt: now, UpdatedAt: now}
+					}
+					state.InboundEvents["inbound-status-parity"] = InboundEvent{
+						ID: "inbound-status-parity", Status: tc.status, TurnID: tc.turnID,
+						TeamsChatID: "chat-status-parity", TeamsMessageID: "message-status-parity",
+						Source: "teams", CreatedAt: now, UpdatedAt: now,
+					}
+					return nil
+				}); err != nil {
+					t.Fatalf("seed inbound status parity fixture: %v", err)
+				}
+				if backend == "sqlite" {
+					migrateStoreToSQLiteForTest(t, st)
+				}
+				backlog, err := st.TeamsOperationalBacklog(ctx)
+				if err != nil {
+					t.Fatalf("TeamsOperationalBacklog: %v", err)
+				}
+				if backlog.PendingInbound != tc.want {
+					t.Fatalf("PendingInbound = %t for %#v, want %t (backlog=%#v)", backlog.PendingInbound, tc, tc.want, backlog)
+				}
+			})
+		}
+	}
+}
+
 func TestTeamsOperationalBacklogTreatsDormantGapAsNonBlocking(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)

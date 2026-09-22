@@ -20127,6 +20127,48 @@ func sqliteInboundRegistryMigrationWithoutTurnSQL(jsonColumn string) string {
 		AND trim(COALESCE(` + turnID + `, '')) = '')`
 }
 
+// sqliteInboundOperationalBacklogSQL mirrors inboundEventHasOperationalBacklog
+// for the observation-only admission probe. A linked inbound row is active
+// until its referenced turn is proven terminal. An unlinked row is active only
+// for actionable/unknown statuses, excluding migration provenance and the
+// explicit manual-hold/uncertain dispositions. Keep the turn JSON parity
+// checks in the linked branch: this query may run after a mixed-version writer
+// has revoked an inbound scalar, and must fail closed rather than hide work.
+func sqliteInboundOperationalBacklogSQL(statusExpr, jsonColumn string) (string, []any) {
+	turnID := sqliteSafeJSONExtract(jsonColumn, "$.turn_id")
+	source := sqliteSafeJSONExtract(jsonColumn, "$.source")
+	turnTerminal := `NOT EXISTS (
+            SELECT 1 FROM turns t
+            WHERE trim(t.id) = trim(` + turnID + `)
+              AND t.status IN (?, ?, ?)
+              AND json_valid(t.json)
+              AND ` + sqliteSafeJSONType("t.json", "$.id") + ` = 'text'
+              AND trim(COALESCE(` + sqliteSafeJSONExtract("t.json", "$.id") + `, '')) = trim(t.id)
+              AND ` + sqliteSafeJSONType("t.json", "$.status") + ` = 'text'
+              AND ` + sqliteSafeJSONExtract("t.json", "$.status") + ` IN (?, ?, ?)
+        )`
+	predicate := `(
+    (trim(COALESCE(` + turnID + `, '')) <> '' AND ` + turnTerminal + `)
+    OR (trim(COALESCE(` + turnID + `, '')) = ''
+        AND NOT (
+            lower(trim(COALESCE(` + source + `, ''))) = 'registry_migration'
+        )
+        AND (
+            ` + statusExpr + ` IN (?, ?, ?)
+            OR (` + statusExpr + ` <> '' AND ` + statusExpr + ` NOT IN (?, ?, ?, ?, ?, ?))
+        )
+    )
+)`
+	args := []any{
+		string(TurnStatusCompleted), string(TurnStatusFailed), string(TurnStatusInterrupted),
+		string(TurnStatusCompleted), string(TurnStatusFailed), string(TurnStatusInterrupted),
+		string(InboundStatusPersisted), string(InboundStatusDeferred), string(InboundStatusQueued),
+		string(InboundStatusIgnored), string(InboundStatusPersisted), string(InboundStatusDeferred),
+		string(InboundStatusQueued), string(InboundStatusManualHold), string(InboundStatusUncertain),
+	}
+	return predicate, args
+}
+
 // sqliteTeamsOperationalBacklogScalar is the fast, observation-only lane for
 // the optional-maintenance gate.  It intentionally returns usable=false when
 // the projection cannot prove canonical parity; the caller then executes the
@@ -20183,33 +20225,8 @@ LIMIT 1`,
 	// projection trigger proves that the scalar status still matches canonical
 	// JSON; the JSON/turn cross-check below retains the registry-migration and
 	// terminal-turn semantics of the canonical oracle.
-	queuedTurnID := sqliteSafeJSONExtract("i.json", "$.turn_id")
-	inboundSource := sqliteSafeJSONExtract("i.json", "$.source")
-	if err := db.QueryRowContext(ctx, `SELECT 1 FROM inbound_events i
-WHERE (
-        status IN (?, ?, ?) AND NOT (
-        trim(COALESCE(`+queuedTurnID+`, '')) = ''
-        AND lower(trim(COALESCE(`+inboundSource+`, ''))) = 'registry_migration'
-        ) AND (
-        trim(COALESCE(`+queuedTurnID+`, '')) = ''
-        OR NOT EXISTS (
-            SELECT 1 FROM turns t
-            WHERE trim(t.id) = trim(`+queuedTurnID+`)
-              AND t.status IN (?, ?, ?)
-              AND json_valid(t.json)
-              AND `+sqliteSafeJSONType("t.json", "$.id")+` = 'text'
-              AND trim(COALESCE(`+sqliteSafeJSONExtract("t.json", "$.id")+`, '')) = trim(t.id)
-              AND `+sqliteSafeJSONType("t.json", "$.status")+` = 'text'
-              AND `+sqliteSafeJSONExtract("t.json", "$.status")+` IN (?, ?, ?)
-        )
-        )
-   )
-   OR (status <> '' AND status NOT IN (?, ?, ?, ?))
-LIMIT 1`,
-		string(InboundStatusPersisted), string(InboundStatusDeferred), string(InboundStatusQueued),
-		string(TurnStatusCompleted), string(TurnStatusFailed), string(TurnStatusInterrupted),
-		string(TurnStatusCompleted), string(TurnStatusFailed), string(TurnStatusInterrupted),
-		string(InboundStatusIgnored), string(InboundStatusPersisted), string(InboundStatusDeferred), string(InboundStatusQueued)).Scan(&one); err == nil {
+	inboundPredicate, inboundArgs := sqliteInboundOperationalBacklogSQL("status", "i.json")
+	if err := db.QueryRowContext(ctx, `SELECT 1 FROM inbound_events i WHERE `+inboundPredicate+` LIMIT 1`, inboundArgs...).Scan(&one); err == nil {
 		backlog.PendingInbound = true
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return TeamsOperationalBacklog{}, false, err
@@ -20275,33 +20292,8 @@ func (s *Store) teamsOperationalBacklogSQLite(ctx context.Context) (TeamsOperati
 		if inboundStatusColumn == "status" {
 			inboundStatus = "i.status"
 		}
-		queuedTurnID := sqliteSafeJSONExtract("i.json", "$.turn_id")
-		inboundSource := sqliteSafeJSONExtract("i.json", "$.source")
-		if err := db.QueryRowContext(ctx, `SELECT 1 FROM inbound_events i
-WHERE (
-        `+inboundStatus+` IN (?, ?, ?) AND NOT (
-        trim(COALESCE(`+queuedTurnID+`, '')) = ''
-        AND lower(trim(COALESCE(`+inboundSource+`, ''))) = 'registry_migration'
-        ) AND (
-        trim(COALESCE(`+queuedTurnID+`, '')) = ''
-        OR NOT EXISTS (
-            SELECT 1 FROM turns t
-            WHERE trim(t.id) = trim(`+queuedTurnID+`)
-              AND t.status IN (?, ?, ?)
-              AND json_valid(t.json)
-              AND `+sqliteSafeJSONType("t.json", "$.id")+` = 'text'
-              AND trim(COALESCE(`+sqliteSafeJSONExtract("t.json", "$.id")+`, '')) = trim(t.id)
-              AND `+sqliteSafeJSONType("t.json", "$.status")+` = 'text'
-              AND `+sqliteSafeJSONExtract("t.json", "$.status")+` IN (?, ?, ?)
-        )
-        )
-   )
-   OR (`+inboundStatus+` <> '' AND `+inboundStatus+` NOT IN (?, ?, ?, ?))
-LIMIT 1`,
-			string(InboundStatusPersisted), string(InboundStatusDeferred), string(InboundStatusQueued),
-			string(TurnStatusCompleted), string(TurnStatusFailed), string(TurnStatusInterrupted),
-			string(TurnStatusCompleted), string(TurnStatusFailed), string(TurnStatusInterrupted),
-			string(InboundStatusIgnored), string(InboundStatusPersisted), string(InboundStatusDeferred), string(InboundStatusQueued)).Scan(&exists); err != nil && !errors.Is(err, sql.ErrNoRows) {
+		inboundPredicate, inboundArgs := sqliteInboundOperationalBacklogSQL(inboundStatus, "i.json")
+		if err := db.QueryRowContext(ctx, `SELECT 1 FROM inbound_events i WHERE `+inboundPredicate+` LIMIT 1`, inboundArgs...).Scan(&exists); err != nil && !errors.Is(err, sql.ErrNoRows) {
 			return err
 		} else if err == nil {
 			backlog.PendingInbound = exists == 1
