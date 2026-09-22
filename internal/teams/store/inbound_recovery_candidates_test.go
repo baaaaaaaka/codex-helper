@@ -227,6 +227,43 @@ func TestSQLiteSelectedColdStateDoesNotDecodeNativeRowMaps(t *testing.T) {
 	})
 }
 
+func TestSQLiteNativeOnlySelectedReadDoesNotRequireColdStateJSON(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	createdAt := time.Date(2026, 9, 22, 12, 0, 0, 0, time.UTC)
+	if err := store.Update(ctx, func(state *State) error {
+		state.OutboxMessages["native-only-outbox"] = OutboxMessage{
+			ID:          "native-only-outbox",
+			TeamsChatID: "chat-native-only",
+			Kind:        "final",
+			Body:        "durable native row",
+			Status:      OutboxStatusQueued,
+			CreatedAt:   createdAt,
+			UpdatedAt:   createdAt,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed native-only selected fixture: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE state_meta SET value = ? WHERE key = 'state_json'`, []byte(`{"broken`))
+		return err
+	})
+
+	// OutboxStateSnapshot requests only a native row-map.  It must not scan the
+	// compatibility document merely to validate fields that this path does not
+	// consume; the native projection remains the authoritative selected read.
+	snapshot, err := store.OutboxStateSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("native-only selected read with corrupt cold JSON: %v", err)
+	}
+	if got := snapshot.OutboxMessages["native-only-outbox"].Body; got != "durable native row" {
+		t.Fatalf("native outbox row = %q, want durable native row", got)
+	}
+}
+
 func TestSQLiteSchemaPreparationRepairsRecoveryIndexAfterOlderMarker(t *testing.T) {
 	ctx := context.Background()
 	store := newSQLiteTestStore(t)

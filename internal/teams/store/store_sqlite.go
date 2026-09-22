@@ -12610,6 +12610,25 @@ func loadSQLiteSelectedColdStateWithoutRowMaps(ctx context.Context, q interface 
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }, wanted map[string]struct{}) (State, error) {
+	jsonWanted := make(map[string]struct{}, len(wanted))
+	for field := range wanted {
+		if !sqliteStateRowMapField(field) {
+			jsonWanted[field] = struct{}{}
+		}
+	}
+	// Every requested field is supplied by a trusted native SQLite table or a
+	// separate projection.  Reading state_json here would only scan the large
+	// compatibility document so the caller can immediately discard it before
+	// hydrating those native rows.  More importantly, keeping that scan inside
+	// Store.s.mu turns every selected durable read into an O(size-of-history)
+	// critical section.  The native callers retain their own row/projection
+	// trust and CAS checks; the cold document remains the fallback whenever even
+	// one requested field still needs it.
+	if len(jsonWanted) == 0 {
+		state := State{SchemaVersion: SchemaVersion}
+		state.ensure(time.Time{})
+		return state, nil
+	}
 	var raw []byte
 	if err := q.QueryRowContext(ctx, `SELECT value FROM state_meta WHERE key = 'state_json'`).Scan(&raw); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
@@ -12619,12 +12638,6 @@ func loadSQLiteSelectedColdStateWithoutRowMaps(ctx context.Context, q interface 
 	}
 	if len(raw) == 0 {
 		return State{}, errors.New("sqlite teams store has empty state metadata")
-	}
-	jsonWanted := make(map[string]struct{}, len(wanted))
-	for field := range wanted {
-		if !sqliteStateRowMapField(field) {
-			jsonWanted[field] = struct{}{}
-		}
 	}
 	state, ok, err := loadSelectedStateFieldsData(raw, jsonWanted)
 	if err != nil {
