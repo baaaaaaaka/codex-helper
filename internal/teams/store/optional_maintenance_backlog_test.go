@@ -75,6 +75,13 @@ func TestTeamsOperationalBacklogAcrossBackends(t *testing.T) {
 			if !got.ActiveTurns || !got.PendingInbound || !got.OperationalPollFrontier || !got.Active() {
 				t.Fatalf("backlog = %#v, want all durable work lanes active", got)
 			}
+			active, err := st.TeamsOperationalBacklogActive(ctx)
+			if err != nil {
+				t.Fatalf("TeamsOperationalBacklogActive: %v", err)
+			}
+			if active != got.Active() {
+				t.Fatalf("active-only backlog = %t, full backlog=%#v", active, got)
+			}
 			if backend == "sqlite" && fullLoads != 0 {
 				t.Fatalf("bounded SQLite backlog probe invoked full loader %d time(s)", fullLoads)
 			}
@@ -95,6 +102,13 @@ func TestTeamsOperationalBacklogAcrossBackends(t *testing.T) {
 			}
 			if got.Active() {
 				t.Fatalf("clean-store backlog = %#v, want inactive", got)
+			}
+			active, err = clean.TeamsOperationalBacklogActive(ctx)
+			if err != nil {
+				t.Fatalf("TeamsOperationalBacklogActive on clean store: %v", err)
+			}
+			if active {
+				t.Fatalf("clean-store active-only backlog = true, want inactive")
 			}
 		})
 	}

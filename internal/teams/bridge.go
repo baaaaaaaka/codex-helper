@@ -3215,11 +3215,11 @@ func (b *Bridge) normalOptionalMaintenanceStillAllowed(ctx context.Context) (boo
 	if b.pollForegroundPressureBlocksColdMaintenance() {
 		return false, nil
 	}
-	backlog, err := b.store.TeamsOperationalBacklog(ctx)
+	backlogActive, err := b.store.TeamsOperationalBacklogActive(ctx)
 	if err != nil {
 		return false, err
 	}
-	if backlog.Active() {
+	if backlogActive {
 		return false, nil
 	}
 	// Recheck the complete outbox safety state immediately before each cold
@@ -3276,11 +3276,11 @@ func (b *Bridge) optionalMaintenancePlanForOwnerWithOutbox(ctx context.Context, 
 	if err != nil {
 		return optionalMaintenancePlan{}, err
 	}
-	backlog, err := b.store.TeamsOperationalBacklog(ctx)
+	backlogActive, err := b.store.TeamsOperationalBacklogActive(ctx)
 	if err != nil {
 		return optionalMaintenancePlan{}, err
 	}
-	if !backlog.Active() {
+	if !backlogActive {
 		if b.pollForegroundPressureBlocksColdMaintenance() {
 			// Foreground pressure suppresses optional cold work, but it must not
 			// suppress an already-durable source-proof/rewrite recovery fence.
@@ -3348,7 +3348,10 @@ func (b *Bridge) optionalMaintenancePlanForOwnerWithOutbox(ctx context.Context, 
 		return optionalMaintenancePlan{}, err
 	}
 	until := now.Add(optionalMaintenanceBacklogDeferInterval)
-	reason := optionalMaintenanceBacklogReason(backlog)
+	// This admission path intentionally asks only whether any lane is active;
+	// the detailed reason is diagnostic-only and must not force a second full
+	// backlog scan while the durable queue is hot.
+	reason := "Teams backlog"
 	if machineID, generation, ownerBound := b.transcriptCheckpointOwnerCapabilityForContext(ctx); ownerBound {
 		if _, err := b.store.SetOptionalMaintenanceDeferredForOwner(ctx, until, reason, machineID, generation); err != nil {
 			return optionalMaintenancePlan{}, err
@@ -23143,12 +23146,12 @@ func (b *Bridge) flushPendingOutboxMainLoopCore(ctx context.Context, result *mai
 		return recoveryErr
 	}
 	started = time.Now()
-	backlog, backlogErr := b.store.TeamsOperationalBacklog(ctx)
+	backlogActive, backlogErr := b.store.TeamsOperationalBacklogActive(ctx)
 	traceStep("backlog-preflight", started, backlogErr)
 	if backlogErr != nil {
 		return errors.Join(recoveryErr, backlogErr)
 	}
-	if backlog.Active() {
+	if backlogActive {
 		if result != nil {
 			// The foreground backlog is already sufficient to suppress optional
 			// history/linked work. Do not run a second full outbox JSON safety

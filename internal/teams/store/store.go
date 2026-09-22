@@ -4757,6 +4757,48 @@ func (s *Store) TeamsOperationalBacklog(ctx context.Context) (TeamsOperationalBa
 	return backlog, nil
 }
 
+// TeamsOperationalBacklogActive is the boolean-only admission form of
+// TeamsOperationalBacklog. It preserves the same fail-closed JSON/SQLite
+// semantics, but stops after the first active durable lane; callers that only
+// need to decide whether optional maintenance may run must not pay to compute
+// three independent flags.
+func (s *Store) TeamsOperationalBacklogActive(ctx context.Context) (bool, error) {
+	if active, handled, usable, err := s.teamsOperationalBacklogActiveSQLite(ctx); handled || err != nil {
+		if err != nil {
+			return false, err
+		}
+		if usable {
+			return active, nil
+		}
+	}
+	state, err := s.loadStateFieldsOrFull(ctx, stateFieldSet("turns", "inbound_events", "chat_polls"))
+	if err != nil {
+		return false, err
+	}
+	for _, turn := range state.Turns {
+		if strings.TrimSpace(turn.SessionID) == "" {
+			continue
+		}
+		if turn.Status == TurnStatusQueued || turn.Status == TurnStatusRunning ||
+			(strings.TrimSpace(string(turn.Status)) != "" && !knownTurnStatus(turn.Status)) {
+			return true, nil
+		}
+	}
+	for _, event := range state.InboundEvents {
+		if inboundEventHasOperationalBacklog(event, state.Turns) {
+			return true, nil
+		}
+	}
+	now := time.Now()
+	for _, poll := range state.ChatPolls {
+		if poll.RecoveryRequired || poll.Attempt != nil ||
+			(!chatPollRateLimitedDeferred(poll, now) && chatPollHasOperationalFrontier(poll)) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // inboundEventHasOperationalBacklog distinguishes the durable inbound ledger
 // from work that can still be admitted.  QueueTurn intentionally leaves an
 // inbound row in InboundStatusQueued after its turn reaches a terminal state;

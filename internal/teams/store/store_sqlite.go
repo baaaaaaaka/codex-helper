@@ -20174,7 +20174,20 @@ func sqliteInboundOperationalBacklogSQL(statusExpr, jsonColumn string) (string, 
 // the projection cannot prove canonical parity; the caller then executes the
 // historical JSON query.  This helper must never mutate a row or turn an
 // unknown projection into an inactive result.
-func sqliteTeamsOperationalBacklogScalar(ctx context.Context, db *sql.DB, now time.Time) (backlog TeamsOperationalBacklog, usable bool, err error) {
+func sqliteTeamsOperationalBacklogScalar(ctx context.Context, db *sql.DB, now time.Time) (TeamsOperationalBacklog, bool, error) {
+	return sqliteTeamsOperationalBacklogScalarMode(ctx, db, now, false)
+}
+
+func sqliteTeamsOperationalBacklogScalarActive(ctx context.Context, db *sql.DB, now time.Time) (bool, bool, error) {
+	backlog, usable, err := sqliteTeamsOperationalBacklogScalarMode(ctx, db, now, true)
+	return backlog.Active(), usable, err
+}
+
+// sqliteTeamsOperationalBacklogScalarMode evaluates the trusted projection in
+// turn/inbound/poll order. The active-only caller is used by admission gates
+// that need only a boolean; once one durable lane is proven active it must not
+// scan the other lanes just to populate flags nobody will read.
+func sqliteTeamsOperationalBacklogScalarMode(ctx context.Context, db *sql.DB, now time.Time, activeOnly bool) (backlog TeamsOperationalBacklog, usable bool, err error) {
 	if now.IsZero() {
 		now = time.Now()
 	}
@@ -20216,6 +20229,9 @@ LIMIT 1`,
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return TeamsOperationalBacklog{}, false, err
 	}
+	if activeOnly && backlog.ActiveTurns {
+		return backlog, true, nil
+	}
 	inboundReady, err := sqliteOperationalBacklogRowsTrusted(ctx, db, "inbound_events",
 		`COALESCE(projection_trusted, 0) != 1 OR COALESCE(canonical_revision, 0) <= 0 OR COALESCE(projection_revision, 0) != COALESCE(canonical_revision, 0)`)
 	if err != nil || !inboundReady {
@@ -20230,6 +20246,9 @@ LIMIT 1`,
 		backlog.PendingInbound = true
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return TeamsOperationalBacklog{}, false, err
+	}
+	if activeOnly && backlog.PendingInbound {
+		return backlog, true, nil
 	}
 
 	pollsReady, err := sqliteOperationalBacklogRowsTrusted(ctx, db, "chat_polls",
@@ -20252,6 +20271,9 @@ LIMIT 1`, sqliteTime(now)).Scan(&one); err == nil {
 		backlog.OperationalPollFrontier = true
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return TeamsOperationalBacklog{}, false, err
+	}
+	if activeOnly && backlog.OperationalPollFrontier {
+		return backlog, true, nil
 	}
 	return backlog, true, nil
 }
@@ -20333,6 +20355,39 @@ LIMIT 1`, nowSQLite).Scan(&canonical); err != nil && !errors.Is(err, sql.ErrNoRo
 		return nil
 	})
 	return backlog, handled, err
+}
+
+func (s *Store) teamsOperationalBacklogActiveSQLite(ctx context.Context) (bool, bool, bool, error) {
+	active := false
+	handled := false
+	usable := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		handled = true
+		active, usable, err = sqliteTeamsOperationalBacklogScalarActive(ctx, db, time.Now())
+		return err
+	})
+	if err != nil {
+		return false, handled, usable, err
+	}
+	if usable {
+		return active, handled, true, nil
+	}
+	// A revoked/mixed projection must use the existing canonical fallback. It
+	// is intentionally rare and remains fully fail-closed; the fast path above
+	// is the only path used by a trusted steady-state database.
+	backlog, fallbackHandled, fallbackErr := s.teamsOperationalBacklogSQLite(ctx)
+	if fallbackErr != nil {
+		return false, fallbackHandled, false, fallbackErr
+	}
+	return backlog.Active(), fallbackHandled, fallbackHandled, nil
 }
 
 func (s *Store) hasUnfinishedTurnsSQLite(ctx context.Context) (bool, bool, error) {
