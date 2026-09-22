@@ -14969,7 +14969,7 @@ func (b *Bridge) sendDeferredInterruptedTurnNoticesNow(ctx context.Context) erro
 	if b == nil || b.store == nil {
 		return nil
 	}
-	state, err := b.store.QueuedTurnStateSnapshot(ctx)
+	state, err := b.store.InterruptedTurnNoticeStateSnapshot(ctx, recoveryReasonAmbiguousAfterHelperRestart)
 	if err != nil {
 		return err
 	}
