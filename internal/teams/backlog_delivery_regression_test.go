@@ -14,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1916,6 +1917,75 @@ func TestTeamsQueuedAdmissionBoundedStart(t *testing.T) {
 	waitForBridgeAsyncTurns(t, bridge)
 	waitForCompletedTurnCount(t, store, first.ID, 1)
 	waitForCompletedTurnCount(t, store, second.ID, 0)
+}
+
+func TestTeamsQueuedAdmissionUsesDurablePlainTextDuringReadGate(t *testing.T) {
+	var graphGets atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			graphGets.Add(1)
+			http.Error(w, "queued plain-text recovery must not read Graph", http.StatusInternalServerError)
+			return
+		}
+		if r.Method == http.MethodPost {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"id":"gated-local-final","messageType":"message"}`)
+			return
+		}
+		http.Error(w, "unexpected Graph method", http.StatusBadRequest)
+	}))
+	t.Cleanup(server.Close)
+	graph := &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	store := newBridgeTestStore(t)
+	executor := &recordingExecutor{result: ExecutionResult{
+		Text:                     "durable local completion",
+		CodexThreadID:            "thread-local-recovery",
+		CodexTurnID:              "codex-turn-local-recovery",
+		canonicalTranscriptFinal: true,
+	}}
+	bridge := newBridgeTestBridge(graph, store, executor)
+	bridge.asyncTurns = true
+	session := bridge.reg.SessionByID("s001")
+	if session == nil {
+		t.Fatal("missing base session")
+	}
+	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
+		t.Fatalf("ensure durable session: %v", err)
+	}
+	turn := queueBridgeTurnForTest(t, bridge, session, "queued-local-read-gate", "already durable plain text", time.Now())
+	if _, _, err := store.UpdateInboundEvent(context.Background(), turn.InboundEventID, func(current teamstore.InboundEvent, found bool, now time.Time) (teamstore.InboundEvent, bool, error) {
+		if !found {
+			return current, false, fmt.Errorf("inbound %s not found", turn.InboundEventID)
+		}
+		current.TeamsBodyType = "text"
+		current.UpdatedAt = now
+		return current, true, nil
+	}); err != nil {
+		t.Fatalf("mark inbound as locally complete: %v", err)
+	}
+	if _, err := store.SetChatRateLimit(context.Background(), graphReadAccountRateLimitKey, time.Now().Add(time.Hour), "account read gate"); err != nil {
+		t.Fatalf("seed account read gate: %v", err)
+	}
+
+	started, err := bridge.processQueuedTurnsWithStartBudget(context.Background(), 1, true)
+	if err != nil || started != 1 {
+		t.Fatalf("gated local admission started=%d err=%v, want one", started, err)
+	}
+	waitForCompletedTurnCount(t, store, session.ID, 1)
+	waitForBridgeAsyncTurns(t, bridge)
+	if got := executor.promptCount(); got != 1 {
+		t.Fatalf("durable plain-text executor runs=%d, want one", got)
+	}
+	if got := graphGets.Load(); got != 0 {
+		t.Fatalf("durable plain-text recovery issued %d Graph requests while read gate was active, want zero", got)
+	}
 }
 
 func TestTeamsQueuedTurnStartNoticeDoesNotFlushOutboxBeforeExecutor(t *testing.T) {

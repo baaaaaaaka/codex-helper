@@ -16315,7 +16315,7 @@ func (b *Bridge) recoverQueuedTurn(ctx context.Context, session *Session, turn t
 	if observed := strings.TrimSpace(inbound.TurnID); observed != "" && observed != strings.TrimSpace(turn.ID) {
 		return b.interruptQueuedTurnForRecoveryProvenance(ctx, session, turn, fmt.Sprintf("queued turn %s is not the durable owner of inbound %s", turn.ID, inbound.ID))
 	}
-	if strings.EqualFold(strings.TrimSpace(inbound.TeamsBodyType), "text") && len(inbound.TeamsAttachments) == 0 && strings.TrimSpace(inbound.Text) != "" {
+	if inboundEventHasDurablePlainTextContext(inbound) {
 		// This is a new plain-text inbound captured with a complete local context
 		// marker. It is safe to prepare directly from the durable text; unlike a
 		// rich/attachment message, no Graph read is needed to recover the prompt.
@@ -19586,15 +19586,24 @@ func (b *Bridge) startQueuedTurnWithExecutionContext(ctx context.Context, execut
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	// A claimed turn without a prepared runner must refetch its original Teams
-	// message before dispatch. If that chat already has a durable read retry
-	// gate, leave the turn queued instead of claiming it only to fail on the
-	// same Graph read again. A preferred runner already owns prepared input, so
-	// a read-side gate must not delay that safe, non-Graph execution path.
+	// A claimed turn without a prepared runner normally refetches its original
+	// Teams message before dispatch. A read-side retry gate must not delay that
+	// Graph-dependent path, but it also must not block an inbound row whose
+	// complete plain-text context is already durable: recoverQueuedTurn can run
+	// that case without Graph and still revalidate provenance/owner/CAS at the
+	// normal durable boundaries below. The local-input check is an admission
+	// hint only; it never authorizes a turn or bypasses the recovery checks.
 	if preferred == nil {
 		if _, blocked := b.chatReadBlockedUntil(ctx, session.ChatID); blocked {
-			traceQueuedTurn("read-gate-block", "", false, nil)
-			return false, nil
+			localInput, err := b.queuedTurnHasDurablePlainTextInput(ctx, session.ID)
+			if err != nil {
+				traceQueuedTurn("read-gate-state", "", false, err)
+				return false, err
+			}
+			if !localInput {
+				traceQueuedTurn("read-gate-block", "", false, nil)
+				return false, nil
+			}
 		}
 	}
 	if executionCtx == nil {
@@ -19752,6 +19761,32 @@ func (b *Bridge) startQueuedTurnWithExecutionContext(ctx context.Context, execut
 		}
 	}()
 	return true, nil
+}
+
+// queuedTurnHasDurablePlainTextInput is a read-only exception to the Graph
+// read gate. It answers only whether the oldest queued turn can be prepared
+// from the immutable inbound receipt already stored locally. It deliberately
+// does not claim the turn or inspect any execution/frontier state; the claim
+// transaction and recoverQueuedTurn perform those checks again. A false or
+// unknown answer remains fail-closed and leaves the turn queued for the next
+// retry window.
+func (b *Bridge) queuedTurnHasDurablePlainTextInput(ctx context.Context, sessionID string) (bool, error) {
+	if b == nil || b.store == nil || strings.TrimSpace(sessionID) == "" {
+		return false, nil
+	}
+	state, err := b.store.SessionActiveTurnQueueSnapshot(ctx, sessionID)
+	if err != nil {
+		return false, err
+	}
+	turn, ok := oldestQueuedTurnForSessionState(state, sessionID)
+	if !ok || strings.TrimSpace(turn.InboundEventID) == "" {
+		return false, nil
+	}
+	inbound, found, err := b.store.InboundEventByID(ctx, turn.InboundEventID)
+	if err != nil {
+		return false, err
+	}
+	return found && inboundEventHasDurablePlainTextContext(inbound), nil
 }
 
 func queuedTurnStartOutboxID(turnID string) string {
@@ -22158,6 +22193,17 @@ func chatMessageFromInboundContext(inbound teamstore.InboundEvent) (ChatMessage,
 		msg.Body.Content = html.EscapeString(inbound.Text)
 	}
 	return msg, strings.TrimSpace(msg.Body.Content) != "" || len(msg.Attachments) > 0
+}
+
+// inboundEventHasDurablePlainTextContext identifies the narrow receipt shape
+// that can be recovered without Graph. The message ID remains required because
+// recoverQueuedTurn uses it as the durable object identity before any local
+// execution is admitted.
+func inboundEventHasDurablePlainTextContext(inbound teamstore.InboundEvent) bool {
+	return strings.TrimSpace(inbound.TeamsMessageID) != "" &&
+		strings.EqualFold(strings.TrimSpace(inbound.TeamsBodyType), "text") &&
+		len(inbound.TeamsAttachments) == 0 &&
+		strings.TrimSpace(inbound.Text) != ""
 }
 
 func inboundTextHashForTeamsMessage(text string, msg ChatMessage) string {
