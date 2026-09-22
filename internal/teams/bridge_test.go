@@ -40304,7 +40304,9 @@ func TestBridgeAmbiguousRecovery429PersistsChatReadGate(t *testing.T) {
 		jitter:     func(d time.Duration) time.Duration { return d },
 	}, store, &recordingExecutor{})
 	bridge.pollWorkerBudget = 50 * time.Millisecond
-	if err := bridge.recoverAmbiguousOutboxMainLoop(ctx); err == nil {
+	err = bridge.recoverAmbiguousOutboxMainLoop(ctx)
+	var deferred outboxDeliveryDeferredError
+	if err == nil || !errors.As(err, &deferred) {
 		t.Fatal("ambiguous 429 recovery unexpectedly succeeded")
 	}
 	poll, found, err := store.ChatPoll(ctx, chatID)
@@ -40320,6 +40322,95 @@ func TestBridgeAmbiguousRecovery429PersistsChatReadGate(t *testing.T) {
 	_ = bridge.recoverAmbiguousOutboxMainLoop(ctx)
 	if got := gets.Load(); got != 1 {
 		t.Fatalf("recovery retried Graph during durable 429 gate: GETs=%d", got)
+	}
+}
+
+func TestBridgeAmbiguousRecoveryRetryableReadFailuresAreDurablyDeferred(t *testing.T) {
+	for _, status := range []int{http.StatusBadGateway, http.StatusServiceUnavailable} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			store := newBridgeTestStore(t)
+			ctx := context.Background()
+			chatID := "chat-recovery-retryable-" + strconv.Itoa(status)
+			queued, _, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
+				ID:          "outbox:recovery-retryable-" + strconv.Itoa(status),
+				TeamsChatID: chatID,
+				Kind:        "final",
+				Body:        "recovery read failure must be deferred",
+			})
+			if err != nil {
+				t.Fatalf("QueueOutbox error: %v", err)
+			}
+			claimed, err := store.MarkOutboxSendAttempt(ctx, queued.ID)
+			if err != nil {
+				t.Fatalf("MarkOutboxSendAttempt error: %v", err)
+			}
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				current := state.OutboxMessages[claimed.ID]
+				current.LastSendAttempt = time.Now().Add(-3 * time.Minute)
+				current.LastSendError = "ambiguous Graph send; previous owner stopped before durable Graph identity"
+				state.OutboxMessages[claimed.ID] = current
+				return nil
+			}); err != nil {
+				t.Fatalf("age ambiguous outbox attempt: %v", err)
+			}
+
+			var gets, posts atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodGet:
+					gets.Add(1)
+					http.Error(w, `{"error":{"code":"temporary","message":"retryable read failure"}}`, status)
+				case http.MethodPost:
+					posts.Add(1)
+					http.Error(w, "unexpected POST", http.StatusInternalServerError)
+				}
+			}))
+			defer server.Close()
+			bridge := newBridgeTestBridge(&GraphClient{
+				auth:       &fakeGraphAuth{token: "access"},
+				client:     server.Client(),
+				baseURL:    server.URL,
+				maxRetries: 0,
+				sleep:      sleepContext,
+				jitter:     func(d time.Duration) time.Duration { return d },
+			}, store, &recordingExecutor{})
+			bridge.pollWorkerBudget = 2 * time.Second
+
+			err = bridge.recoverAmbiguousOutboxMainLoop(ctx)
+			var deferred outboxDeliveryDeferredError
+			if err == nil || !errors.As(err, &deferred) {
+				t.Fatalf("ambiguous %d recovery error = %v, want typed durable deferral", status, err)
+			}
+			var graphErr *GraphStatusError
+			if !errors.As(err, &graphErr) || graphErr.StatusCode != status {
+				t.Fatalf("ambiguous %d recovery error = %v, want original GraphStatusError", status, err)
+			}
+			if got := gets.Load(); got < 1 {
+				t.Fatalf("ambiguous %d recovery GETs = %d, want at least one evidence request", status, got)
+			}
+			if got := posts.Load(); got != 0 {
+				t.Fatalf("ambiguous %d recovery POSTs = %d, want zero", status, got)
+			}
+			beforeSecondSweep := gets.Load()
+			if err := bridge.recoverAmbiguousOutboxMainLoop(ctx); err != nil {
+				t.Fatalf("ambiguous %d second recovery sweep: %v", status, err)
+			}
+			if got := gets.Load(); got != beforeSecondSweep {
+				t.Fatalf("ambiguous %d second sweep repeated Graph evidence GET: before=%d after=%d", status, beforeSecondSweep, got)
+			}
+			poll, found, err := store.ChatPoll(ctx, chatID)
+			if err != nil || !found || !poll.NextPollAt.After(poll.LastErrorAt) {
+				t.Fatalf("ambiguous %d read gate = poll=%#v found=%v err=%v", status, poll, found, err)
+			}
+			state, err := store.Load(ctx)
+			if err != nil {
+				t.Fatalf("load ambiguous %d state: %v", status, err)
+			}
+			outbox := state.OutboxMessages[claimed.ID]
+			if outbox.Status != teamstore.OutboxStatusSending || outbox.TeamsMessageID != "" || outbox.SendAttemptToken != claimed.SendAttemptToken {
+				t.Fatalf("ambiguous %d outbox safety state = %#v, want Sending/no message ID/same attempt", status, outbox)
+			}
+		})
 	}
 }
 

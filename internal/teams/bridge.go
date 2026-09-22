@@ -23477,9 +23477,19 @@ func (b *Bridge) recoverAmbiguousOutboxMainLoop(ctx context.Context) error {
 			// ambiguous row in this chat does not issue an identical read during
 			// the provider backoff window. This gate affects recovery reads only;
 			// known queued writes use the independent outbox send gate.
-			if gateErr := b.recordGraphReadRetryableFailure(ctx, outbox.TeamsChatID, recoveryErr); gateErr != nil && firstErr == nil {
-				firstErr = fmt.Errorf("%w: persist Teams Graph read retry gate: %v", teamstore.ErrStatePersistence, gateErr)
+			retryableReadFailure := isRetryableGraphReadFailure(recoveryErr) && !graphStatusErrorHasExplicitNonReadMethod(recoveryErr)
+			readGatePersisted := false
+			if gateErr := b.recordGraphReadRetryableFailure(ctx, outbox.TeamsChatID, recoveryErr); gateErr != nil {
+				if firstErr == nil {
+					firstErr = fmt.Errorf("%w: persist Teams Graph read retry gate: %v", teamstore.ErrStatePersistence, gateErr)
+				}
+			} else if retryableReadFailure {
+				// recordGraphReadRetryableFailure is idempotent for an already
+				// recorded gate, so a nil result is sufficient evidence that the
+				// read-side durable fence is in place.
+				readGatePersisted = true
 			}
+			outboxGatePersisted := false
 			if !errors.Is(recoveryErr, teamstore.ErrControlLeaseNotHeld) && !errors.Is(recoveryErr, teamstore.ErrOutboxSendNotClaimed) {
 				until := outboxRetryGateUntil(recoveryErr, time.Now())
 				gateCtx, cancelGate := b.pollAttemptDurableContext(ctx)
@@ -23487,6 +23497,20 @@ func (b *Bridge) recoverAmbiguousOutboxMainLoop(ctx context.Context) error {
 				cancelGate()
 				if deferErr != nil && firstErr == nil && !errors.Is(deferErr, context.Canceled) && !errors.Is(deferErr, context.DeadlineExceeded) {
 					firstErr = deferErr
+				} else if deferErr == nil {
+					outboxGatePersisted = true
+				}
+			}
+			if retryableReadFailure && readGatePersisted && outboxGatePersisted {
+				// The evidence GET crossed no write boundary. Once both durable
+				// retry fences are committed, classify this as a phase deferral so
+				// one provider failure cannot turn the whole outbox phase into an
+				// error. Keep the original Graph error wrapped for diagnostics and
+				// errors.Is/errors.As callers.
+				recoveryErr = outboxDeliveryDeferredError{
+					ChatID: strings.TrimSpace(outbox.TeamsChatID),
+					Until:  outboxRetryGateUntil(recoveryErr, time.Now()),
+					Cause:  recoveryErr,
 				}
 			}
 			if firstErr == nil {
@@ -24487,6 +24511,33 @@ func (b *Bridge) deferOutboxDeliveryUntil(ctx context.Context, msg teamstore.Out
 	return b.store.DeferOutboxDeliveryUntil(ctx, msg.ID, until)
 }
 
+// deferAmbiguousOutboxReadFailure is the direct-sender counterpart of the
+// main-loop recovery gate.  An evidence GET that fails with a retryable Graph
+// read error must not turn the whole outbox phase into a raw error after both
+// durable retry fences were committed.  This helper is deliberately limited
+// to read failures; it must never classify an unknown POST result as a safe
+// retry or alter its Sending/attempt state.
+func (b *Bridge) deferAmbiguousOutboxReadFailure(ctx context.Context, outbox teamstore.OutboxMessage, recoveryErr error, recordGate bool) error {
+	if recoveryErr == nil || !recordGate || !isRetryableGraphReadFailure(recoveryErr) || graphStatusErrorHasExplicitNonReadMethod(recoveryErr) {
+		return recoveryErr
+	}
+	if gateErr := b.recordGraphReadRetryableFailure(ctx, outbox.TeamsChatID, recoveryErr); gateErr != nil {
+		return fmt.Errorf("%w: persist Teams Graph read retry gate: %v", teamstore.ErrStatePersistence, gateErr)
+	}
+	until := outboxRetryGateUntil(recoveryErr, time.Now())
+	gateCtx, cancelGate := b.pollAttemptDurableContext(ctx)
+	_, deferErr := b.deferOutboxDeliveryUntil(gateCtx, outbox, until)
+	cancelGate()
+	if deferErr != nil {
+		return deferErr
+	}
+	return outboxDeliveryDeferredError{
+		ChatID: strings.TrimSpace(outbox.TeamsChatID),
+		Until:  until,
+		Cause:  recoveryErr,
+	}
+}
+
 func (b *Bridge) markOutboxSkippedIfQueuedForCurrentOwner(ctx context.Context, outboxID string, reason string) (teamstore.OutboxMessage, bool, error) {
 	if b == nil || b.store == nil {
 		return teamstore.OutboxMessage{}, false, teamstore.ErrControlLeaseNotHeld
@@ -24911,12 +24962,7 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 			return err
 		}
 		if recovered, err := b.recoverAcceptedOutboxFromGraph(ctx, outbox, opts); recovered || err != nil {
-			if err != nil && opts.RecordRateLimit {
-				if gateErr := b.recordGraphReadRetryableFailure(ctx, outbox.TeamsChatID, err); gateErr != nil {
-					return fmt.Errorf("%w: persist Teams Graph read retry gate: %v", teamstore.ErrStatePersistence, gateErr)
-				}
-			}
-			return err
+			return b.deferAmbiguousOutboxReadFailure(ctx, outbox, err, opts.RecordRateLimit)
 		}
 	}
 	// A legacy history-gate diagnostic is never user work. Startup migration
@@ -25581,12 +25627,7 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 		}
 		if legacyAttachmentNeedsRecovery || postState == "started" {
 			if recovered, recoveryErr := b.recoverAcceptedOutboxFromGraph(ctx, outbox, opts); recovered || recoveryErr != nil {
-				if recoveryErr != nil && opts.RecordRateLimit {
-					if gateErr := b.recordGraphReadRetryableFailure(ctx, outbox.TeamsChatID, recoveryErr); gateErr != nil {
-						return fmt.Errorf("%w: persist Teams Graph read retry gate: %v", teamstore.ErrStatePersistence, gateErr)
-					}
-				}
-				return recoveryErr
+				return b.deferAmbiguousOutboxReadFailure(ctx, outbox, recoveryErr, opts.RecordRateLimit)
 			}
 			return outboxDeliveryDeferredError{ChatID: outbox.TeamsChatID, Until: time.Now().Add(2 * time.Minute)}
 		}
@@ -25728,13 +25769,8 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 				// and waiting for the send lease to expire. A failed or inconclusive
 				// read remains deferred; it must never turn into a duplicate POST.
 				if recovered, recoveryErr := b.recoverAcceptedOutboxFromGraph(ctx, ambiguous, opts); recovered || recoveryErr != nil {
-					if recoveryErr != nil && opts.RecordRateLimit {
-						if gateErr := b.recordGraphReadRetryableFailure(ctx, ambiguous.TeamsChatID, recoveryErr); gateErr != nil {
-							return fmt.Errorf("%w: persist Teams Graph read retry gate: %v", teamstore.ErrStatePersistence, gateErr)
-						}
-					}
 					if recoveryErr != nil {
-						return recoveryErr
+						return b.deferAmbiguousOutboxReadFailure(ctx, ambiguous, recoveryErr, opts.RecordRateLimit)
 					}
 					return nil
 				}

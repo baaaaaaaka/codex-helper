@@ -55,6 +55,11 @@ const (
 	// control turn does not parse the growing compatibility document under the
 	// global Store lock.
 	sqliteDashboardProjectionKey = "dashboard_projection"
+	// Workflow notification configuration is read for every final outbox row,
+	// but it is part of the compatibility cold document rather than a native
+	// row map.  Keep a revision-fenced narrow copy beside that document so the
+	// notification path does not rescan all historical JSON on every send.
+	sqliteWorkflowProjectionKey = "workflow_projection"
 	// This marker makes the canonical frontier-hint repair an open/migration
 	// action rather than a full chat_polls rewrite on every compatibility save.
 	// Bump the value whenever the canonical frontier predicate changes.
@@ -1765,6 +1770,11 @@ type sqliteDashboardProjection struct {
 	StateJSONRevision int64                            `json:"state_json_revision,omitempty"`
 }
 
+type sqliteWorkflowProjection struct {
+	Workflow          WorkflowNotificationConfig `json:"workflow,omitempty"`
+	StateJSONRevision int64                      `json:"state_json_revision,omitempty"`
+}
+
 const SQLiteFileName = storeSQLiteFileName
 
 const (
@@ -3116,6 +3126,35 @@ SELECT (SELECT value FROM state_meta WHERE key = ?),
 	}
 	state.ensure(time.Time{})
 	return state, true, nil
+}
+
+// loadSQLiteWorkflowProjection returns the revision-fenced workflow cache.
+// The projection is optional so an inherited SQLite pointer can be opened by a
+// mixed-version helper; callers fall back to the canonical cold document when
+// it is absent, malformed, or based on an older state_json revision.
+func loadSQLiteWorkflowProjection(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}) (WorkflowNotificationConfig, bool, error) {
+	var raw []byte
+	var stateJSONRevision int64
+	if err := q.QueryRowContext(ctx, `
+SELECT (SELECT value FROM state_meta WHERE key = ?),
+       COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta WHERE key = ?), 0)`,
+		sqliteWorkflowProjectionKey, sqliteStateJSONRevisionKey).Scan(&raw, &stateJSONRevision); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return WorkflowNotificationConfig{}, false, nil
+		}
+		return WorkflowNotificationConfig{}, false, err
+	}
+	if len(raw) == 0 {
+		return WorkflowNotificationConfig{}, false, nil
+	}
+	var projection sqliteWorkflowProjection
+	if err := json.Unmarshal(raw, &projection); err != nil ||
+		projection.StateJSONRevision <= 0 || projection.StateJSONRevision != stateJSONRevision {
+		return WorkflowNotificationConfig{}, false, nil
+	}
+	return projection.Workflow, true, nil
 }
 
 func (s *Store) hotPollScheduleStateSQLite(ctx context.Context) (State, bool, error) {
@@ -10033,6 +10072,9 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, value); err != nil 
 	if err := upsertSQLiteDashboardProjectionTx(ctx, tx, state, stateJSONRevision); err != nil {
 		return err
 	}
+	if err := upsertSQLiteWorkflowProjectionTx(ctx, tx, state, stateJSONRevision); err != nil {
+		return err
+	}
 	if err := saveSQLiteRuntimeStateTx(ctx, tx, state); err != nil {
 		return err
 	}
@@ -12558,9 +12600,20 @@ func loadSQLiteSelectedStateWithChatPollQueryMode(ctx context.Context, db *sql.D
 				if runtimeErr != nil {
 					return State{}, runtimeErr
 				}
-				if sqliteSelectedFieldsCoveredByRuntime(wanted, seen) {
+				workflow, workflowFound := WorkflowNotificationConfig{}, false
+				if _, wantsWorkflow := wanted["workflow"]; wantsWorkflow {
+					workflow, workflowFound, runtimeErr = loadSQLiteWorkflowProjection(ctx, db)
+					if runtimeErr != nil {
+						return State{}, runtimeErr
+					}
+				}
+				if sqliteSelectedFieldsCoveredByRuntime(wanted, seen) ||
+					sqliteSelectedFieldsCoveredByRuntimeOrWorkflowProjection(wanted, seen, workflowFound) {
 					state = State{SchemaVersion: SchemaVersion}
 					overlaySQLiteRuntimeStateValues(&state, runtimeState, seen)
+					if workflowFound {
+						state.Workflow = workflow
+					}
 					state.ensure(time.Time{})
 					runtimeOverlayLoaded = true
 				}
@@ -12717,6 +12770,28 @@ func sqliteSelectedFieldsCoveredByRuntime(wanted map[string]struct{}, seen map[s
 	return true
 }
 
+func sqliteSelectedFieldsCoveredByRuntimeOrWorkflowProjection(wanted map[string]struct{}, seen map[string]bool, workflowFound bool) bool {
+	if !sqliteRuntimeStateUsable(seen) {
+		return false
+	}
+	for field := range wanted {
+		if sqliteStateRowMapField(field) {
+			continue
+		}
+		if field == "workflow" {
+			if !workflowFound {
+				return false
+			}
+			continue
+		}
+		key := sqliteRuntimeKeyForStateField(field)
+		if key == "" || !seen[key] {
+			return false
+		}
+	}
+	return true
+}
+
 // sqliteStateRowMapField is stored in a native table after SQLite migration.
 // The state_json copy remains for compatibility and migration, but decoding
 // these maps before immediately replacing them with the table projection is
@@ -12745,10 +12820,29 @@ func loadSQLiteSelectedColdStateWithoutRowMaps(ctx context.Context, q interface 
 	QueryRowContext(context.Context, string, ...any) *sql.Row
 	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
 }, wanted map[string]struct{}) (State, error) {
+	return loadSQLiteSelectedColdStateWithoutRowMapsAttempt(ctx, q, wanted, 1)
+}
+
+func loadSQLiteSelectedColdStateWithoutRowMapsAttempt(ctx context.Context, q interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+	QueryContext(context.Context, string, ...any) (*sql.Rows, error)
+}, wanted map[string]struct{}, retries int) (State, error) {
 	jsonWanted := make(map[string]struct{}, len(wanted))
+	workflowProjectionFound := false
 	for field := range wanted {
 		if !sqliteStateRowMapField(field) {
 			jsonWanted[field] = struct{}{}
+		}
+	}
+	if _, wantsWorkflow := wanted["workflow"]; wantsWorkflow {
+		if _, found, err := loadSQLiteWorkflowProjection(ctx, q); err != nil {
+			return State{}, err
+		} else if found {
+			// The caller may still need another non-native field (for example a
+			// legacy runtime value), but workflow itself is now supplied by the
+			// revision-fenced projection and must not force a cold JSON scan.
+			workflowProjectionFound = true
+			delete(jsonWanted, "workflow")
 		}
 	}
 	// Every requested field is supplied by a trusted native SQLite table or a
@@ -12760,6 +12854,16 @@ func loadSQLiteSelectedColdStateWithoutRowMaps(ctx context.Context, q interface 
 	// trust and CAS checks; the cold document remains the fallback whenever even
 	// one requested field still needs it.
 	if len(jsonWanted) == 0 {
+		if workflowProjectionFound {
+			state := State{SchemaVersion: SchemaVersion}
+			if projected, found, err := loadSQLiteWorkflowProjection(ctx, q); err != nil {
+				return State{}, err
+			} else if found {
+				state.Workflow = projected
+			}
+			state.ensure(time.Time{})
+			return state, nil
+		}
 		// A native-only selected read may skip the compatibility document only
 		// after the fenced schema-preparation marker proves that this SQLite
 		// pointer has crossed the current publication boundary.  Old or
@@ -12776,7 +12880,11 @@ func loadSQLiteSelectedColdStateWithoutRowMaps(ctx context.Context, q interface 
 		}
 	}
 	var raw []byte
-	if err := q.QueryRowContext(ctx, `SELECT value FROM state_meta WHERE key = 'state_json'`).Scan(&raw); err != nil {
+	var stateJSONRevision int64
+	if err := q.QueryRowContext(ctx, `
+SELECT value,
+       COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta WHERE key = ?), 0)
+FROM state_meta WHERE key = 'state_json'`, sqliteStateJSONRevisionKey).Scan(&raw, &stateJSONRevision); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return State{}, errors.New("sqlite teams store is missing state metadata")
 		}
@@ -12793,6 +12901,52 @@ func loadSQLiteSelectedColdStateWithoutRowMaps(ctx context.Context, q interface 
 		return loadSQLiteColdStateWithoutChatSequences(ctx, q)
 	}
 	state.ensure(time.Time{})
+	if workflowProjectionFound {
+		// This branch is reached only when another selected cold field still
+		// requires JSON.  The projection will be overlaid by the caller's
+		// runtime/projection path; do not let this compatibility decode replace
+		// a valid projected workflow with an older cold value.
+		if projected, found, err := loadSQLiteWorkflowProjection(ctx, q); err != nil {
+			return State{}, err
+		} else if found {
+			state.Workflow = projected
+		}
+	}
+	if _, wantsWorkflow := wanted["workflow"]; wantsWorkflow && !workflowProjectionFound && stateJSONRevision > 0 {
+		if exec, ok := q.(interface {
+			ExecContext(context.Context, string, ...any) (sql.Result, error)
+		}); ok {
+			rawProjection, err := json.Marshal(sqliteWorkflowProjection{
+				Workflow:          state.Workflow,
+				StateJSONRevision: stateJSONRevision,
+			})
+			if err != nil {
+				return State{}, err
+			}
+			// Publish only if the exact state_json revision read above is still
+			// current.  An older/mixed-version writer may change the canonical
+			// document outside this Store lock; in that case this cache write is a
+			// harmless no-op and the next read falls back again.
+			result, err := exec.ExecContext(ctx, `
+INSERT INTO state_meta(key, value) VALUES (?, ?)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value
+WHERE COALESCE((SELECT CAST(value AS INTEGER) FROM state_meta WHERE key = ?), 0) = ?`,
+				sqliteWorkflowProjectionKey, rawProjection, sqliteStateJSONRevisionKey, stateJSONRevision)
+			if err != nil {
+				return State{}, err
+			}
+			rowsAffected, err := result.RowsAffected()
+			if err != nil {
+				return State{}, err
+			}
+			if rowsAffected == 0 {
+				if retries > 0 {
+					return loadSQLiteSelectedColdStateWithoutRowMapsAttempt(ctx, q, wanted, retries-1)
+				}
+				return State{}, fmt.Errorf("SQLite workflow projection changed during selected read")
+			}
+		}
+	}
 	if _, wantsHistory := wanted["history_watch"]; wantsHistory {
 		if err := overlaySQLiteHistoryWatchProjection(ctx, q, &state); err != nil {
 			return State{}, err
@@ -16195,6 +16349,9 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value`, cold)
 	if err := upsertSQLiteDashboardProjectionTx(ctx, tx, state, stateJSONRevision); err != nil {
 		return err
 	}
+	if err := upsertSQLiteWorkflowProjectionTx(ctx, tx, state, stateJSONRevision); err != nil {
+		return err
+	}
 	// HistoryWatch has a dedicated projection update path.  Do not rewrite that
 	// projection on every unrelated cold-state/outbox update: it adds a JSON
 	// marshal and state_meta write to the hot queue path and can overwrite a
@@ -16235,6 +16392,25 @@ func upsertSQLiteDashboardProjectionTx(ctx context.Context, tx *sql.Tx, state St
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO state_meta(key, value) VALUES (?, ?)
 ON CONFLICT(key) DO UPDATE SET value = excluded.value`, sqliteDashboardProjectionKey, raw)
+	return err
+}
+
+func upsertSQLiteWorkflowProjectionTx(ctx context.Context, tx *sql.Tx, state State, stateJSONRevision int64) error {
+	if stateJSONRevision <= 0 {
+		// Very old SQLite fixtures may not have the revision trigger yet.  Do not
+		// publish an unfenced cache; the canonical state_json fallback remains
+		// correct until normal schema preparation installs the revision.
+		return nil
+	}
+	raw, err := json.Marshal(sqliteWorkflowProjection{
+		Workflow:          state.Workflow,
+		StateJSONRevision: stateJSONRevision,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO state_meta(key, value) VALUES (?, ?)
+ON CONFLICT(key) DO UPDATE SET value = excluded.value`, sqliteWorkflowProjectionKey, raw)
 	return err
 }
 

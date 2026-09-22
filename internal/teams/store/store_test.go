@@ -20244,6 +20244,106 @@ func TestSQLiteHistoryWatchMissingProjectionMaterializesCurrentRevision(t *testi
 	}
 }
 
+func TestSQLiteWorkflowProjectionMissingMaterializesCurrentRevision(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	wantWorkflow := WorkflowNotificationConfig{
+		Enabled:               true,
+		ControlWebhookURLFile: "/tmp/workflow-hook",
+		ControlChatID:         "workflow-control-chat",
+		UpdatedAt:             time.Date(2026, 8, 10, 14, 0, 0, 0, time.UTC),
+	}
+	if err := store.Update(ctx, func(state *State) error {
+		state.ControlChat = ControlChatBinding{TeamsChatID: wantWorkflow.ControlChatID}
+		state.Workflow = wantWorkflow
+		return nil
+	}); err != nil {
+		t.Fatalf("seed workflow state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `DELETE FROM state_meta WHERE key = ?`, sqliteWorkflowProjectionKey)
+		return err
+	})
+
+	got, err := store.WorkflowNotificationStateSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("WorkflowNotificationStateSnapshot after deleting projection: %v", err)
+	}
+	if !reflect.DeepEqual(got.Workflow, wantWorkflow) || got.ControlChat.TeamsChatID != wantWorkflow.ControlChatID {
+		t.Fatalf("workflow snapshot = %#v, want workflow=%#v control_chat=%q", got.Workflow, wantWorkflow, wantWorkflow.ControlChatID)
+	}
+	var projection sqliteWorkflowProjection
+	var revision int64
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		var raw []byte
+		if err := tx.QueryRowContext(ctx, `SELECT value FROM state_meta WHERE key = ?`, sqliteWorkflowProjectionKey).Scan(&raw); err != nil {
+			return err
+		}
+		if err := json.Unmarshal(raw, &projection); err != nil {
+			return err
+		}
+		return tx.QueryRowContext(ctx, `SELECT CAST(value AS INTEGER) FROM state_meta WHERE key = ?`, sqliteStateJSONRevisionKey).Scan(&revision)
+	})
+	if projection.StateJSONRevision <= 0 || projection.StateJSONRevision != revision {
+		t.Fatalf("workflow projection revision = %d, state_json revision = %d; want equal positive revisions", projection.StateJSONRevision, revision)
+	}
+	if !reflect.DeepEqual(projection.Workflow, wantWorkflow) {
+		t.Fatalf("materialized workflow projection = %#v, want %#v", projection.Workflow, wantWorkflow)
+	}
+}
+
+func TestSQLiteWorkflowProjectionDoesNotMaskMixedVersionStateJSON(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+	initial := WorkflowNotificationConfig{Enabled: true, ControlWebhookURLFile: "/tmp/initial-hook", ControlChatID: "initial-chat"}
+	updated := WorkflowNotificationConfig{Enabled: true, ControlWebhookURLFile: "/tmp/updated-hook", ControlChatID: "updated-chat"}
+	if err := store.Update(ctx, func(state *State) error {
+		state.ControlChat = ControlChatBinding{TeamsChatID: initial.ControlChatID}
+		state.Workflow = initial
+		return nil
+	}); err != nil {
+		t.Fatalf("seed workflow state: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+
+	raw := sqliteRawStateJSONForTest(t, store)
+	var legacy State
+	if err := json.Unmarshal(raw, &legacy); err != nil {
+		t.Fatalf("decode cold state: %v", err)
+	}
+	legacy.ControlChat.TeamsChatID = updated.ControlChatID
+	legacy.Workflow = updated
+	legacyRaw, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatalf("encode mixed-version state: %v", err)
+	}
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx, `UPDATE state_meta SET value = ? WHERE key = 'state_json'`, legacyRaw)
+		return err
+	})
+
+	got, err := store.WorkflowNotificationStateSnapshot(ctx)
+	if err != nil {
+		t.Fatalf("WorkflowNotificationStateSnapshot after mixed-version write: %v", err)
+	}
+	if !reflect.DeepEqual(got.Workflow, updated) {
+		t.Fatalf("stale workflow projection masked canonical state: workflow=%#v control_chat=%#v", got.Workflow, got.ControlChat)
+	}
+
+	var projection sqliteWorkflowProjection
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		var raw []byte
+		if err := tx.QueryRowContext(ctx, `SELECT value FROM state_meta WHERE key = ?`, sqliteWorkflowProjectionKey).Scan(&raw); err != nil {
+			return err
+		}
+		return json.Unmarshal(raw, &projection)
+	})
+	if !reflect.DeepEqual(projection.Workflow, updated) {
+		t.Fatalf("workflow projection was not refreshed: %#v, want %#v", projection.Workflow, updated)
+	}
+}
+
 func TestHistoryWatchUnchangedCheckpointIsNoopAcrossBackends(t *testing.T) {
 	for _, backend := range []string{"json", "sqlite"} {
 		t.Run(backend, func(t *testing.T) {
