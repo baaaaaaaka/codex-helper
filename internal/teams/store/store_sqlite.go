@@ -12544,15 +12544,26 @@ func loadSQLiteSelectedStateWithChatPollQueryMode(ctx context.Context, db *sql.D
 	} else {
 		runtimeOverlayLoaded := false
 		if hasNonNativeSelectedFields(wanted) {
-			runtimeState, seen, runtimeErr := loadSQLiteRuntimeState(ctx, db)
-			if runtimeErr != nil {
-				return State{}, runtimeErr
+			// Runtime rows are only an authoritative replacement for the cold
+			// document after the same fenced schema-preparation boundary.  A
+			// legacy/partially prepared store may have some runtime rows while
+			// its native materialization is still incomplete; retain the strict
+			// cold path in that interval.
+			schemaReady, schemaErr := sqliteSchemaPreparationReadyContext(ctx, db)
+			if schemaErr != nil {
+				return State{}, schemaErr
 			}
-			if sqliteSelectedFieldsCoveredByRuntime(wanted, seen) {
-				state = State{SchemaVersion: SchemaVersion}
-				overlaySQLiteRuntimeStateValues(&state, runtimeState, seen)
-				state.ensure(time.Time{})
-				runtimeOverlayLoaded = true
+			if schemaReady {
+				runtimeState, seen, runtimeErr := loadSQLiteRuntimeState(ctx, db)
+				if runtimeErr != nil {
+					return State{}, runtimeErr
+				}
+				if sqliteSelectedFieldsCoveredByRuntime(wanted, seen) {
+					state = State{SchemaVersion: SchemaVersion}
+					overlaySQLiteRuntimeStateValues(&state, runtimeState, seen)
+					state.ensure(time.Time{})
+					runtimeOverlayLoaded = true
+				}
 			}
 		}
 		if !runtimeOverlayLoaded {
@@ -12600,6 +12611,11 @@ func loadSQLiteSelectedStateWithChatPollQueryMode(ctx context.Context, db *sql.D
 	}
 	if _, ok := wanted["chat_rate_limits"]; ok {
 		if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM chat_rate_limits`, state.ChatRateLimits, func(v ChatRateLimitState) string { return v.ChatID }); err != nil {
+			return State{}, err
+		}
+	}
+	if _, ok := wanted["chat_sequences"]; ok {
+		if err := loadSQLiteJSONMap(ctx, db, `SELECT json FROM chat_sequences`, state.ChatSequences, func(v ChatSequenceState) string { return v.ChatID }); err != nil {
 			return State{}, err
 		}
 	}
@@ -12744,9 +12760,20 @@ func loadSQLiteSelectedColdStateWithoutRowMaps(ctx context.Context, q interface 
 	// trust and CAS checks; the cold document remains the fallback whenever even
 	// one requested field still needs it.
 	if len(jsonWanted) == 0 {
-		state := State{SchemaVersion: SchemaVersion}
-		state.ensure(time.Time{})
-		return state, nil
+		// A native-only selected read may skip the compatibility document only
+		// after the fenced schema-preparation marker proves that this SQLite
+		// pointer has crossed the current publication boundary.  Old or
+		// partially prepared stores must retain the strict cold JSON validation;
+		// otherwise a missing native row could be mistaken for an empty queue.
+		ready, err := sqliteSchemaPreparationReadyContext(ctx, q)
+		if err != nil {
+			return State{}, err
+		}
+		if ready {
+			state := State{SchemaVersion: SchemaVersion}
+			state.ensure(time.Time{})
+			return state, nil
+		}
 	}
 	var raw []byte
 	if err := q.QueryRowContext(ctx, `SELECT value FROM state_meta WHERE key = 'state_json'`).Scan(&raw); err != nil {

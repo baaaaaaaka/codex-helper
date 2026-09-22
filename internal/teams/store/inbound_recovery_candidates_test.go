@@ -264,6 +264,53 @@ func TestSQLiteNativeOnlySelectedReadDoesNotRequireColdStateJSON(t *testing.T) {
 	}
 }
 
+func TestSQLiteNativeOnlySelectedReadKeepsColdFallbackBeforeSchemaFence(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	if err := store.Update(ctx, func(state *State) error {
+		state.OutboxMessages["native-only-fenced"] = OutboxMessage{
+			ID: "native-only-fenced", TeamsChatID: "chat-native-fenced", Kind: "final",
+			Body: "must not hide an unprepared store", Status: OutboxStatusQueued,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed native-only fence fixture: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `UPDATE state_meta SET value = '3' WHERE key = ?`, sqliteSchemaPreparationVersionKey); err != nil {
+			return err
+		}
+		_, err := tx.ExecContext(ctx, `UPDATE state_meta SET value = ? WHERE key = 'state_json'`, []byte(`{"broken`))
+		return err
+	})
+
+	if _, err := store.OutboxStateSnapshot(ctx); err == nil {
+		t.Fatal("native-only selected read hid an unprepared/corrupt cold store")
+	}
+}
+
+func TestSQLiteSelectedStateHydratesChatSequences(t *testing.T) {
+	ctx := context.Background()
+	store := newTestStore(t)
+	if err := store.Update(ctx, func(state *State) error {
+		state.ChatSequences["chat-sequence-selected"] = ChatSequenceState{
+			ChatID: "chat-sequence-selected", Next: 7,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed selected chat sequence: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, store)
+	state, err := store.loadStateFieldsOrFull(ctx, stateFieldSet("chat_sequences"))
+	if err != nil {
+		t.Fatalf("selected chat sequence read: %v", err)
+	}
+	if got := state.ChatSequences["chat-sequence-selected"].Next; got != 7 {
+		t.Fatalf("selected chat sequence next=%d, want 7", got)
+	}
+}
+
 func TestSQLiteSchemaPreparationRepairsRecoveryIndexAfterOlderMarker(t *testing.T) {
 	ctx := context.Background()
 	store := newSQLiteTestStore(t)
