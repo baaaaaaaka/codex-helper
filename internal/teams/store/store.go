@@ -11250,8 +11250,27 @@ func markTurnRunningLocked(state *State, turn Turn, codexThreadID string, codexT
 	return turn, nil
 }
 
+type queuedTurnClaimResult struct {
+	turn         Turn
+	inbound      InboundEvent
+	claimed      bool
+	inboundFound bool
+	inboundRead  bool
+}
+
 func (s *Store) ClaimNextQueuedTurn(ctx context.Context, sessionID string) (Turn, bool, error) {
 	return s.claimNextQueuedTurn(ctx, sessionID, storeOwnerCapability{})
+}
+
+// ClaimNextQueuedTurnWithInbound claims one queued turn and returns the
+// inbound provenance row observed by the same durable claim operation.  This
+// is intentionally a single-turn optimization: it does not batch claims,
+// complete turns, or weaken the existing owner/FIFO/execution fences.  The
+// returned inbound row is a read-side snapshot used to prepare the claimed
+// turn; all later turn completion and inbound transitions retain their own
+// owner/CAS boundaries.
+func (s *Store) ClaimNextQueuedTurnWithInbound(ctx context.Context, sessionID string) (Turn, InboundEvent, bool, bool, bool, error) {
+	return s.claimNextQueuedTurnWithInbound(ctx, sessionID, storeOwnerCapability{})
 }
 
 // ClaimNextQueuedTurnForOwner claims and binds a queued live turn to the
@@ -11271,16 +11290,35 @@ func (s *Store) ClaimNextQueuedTurnForOwner(ctx context.Context, sessionID strin
 	return s.claimNextQueuedTurn(ctx, sessionID, capability)
 }
 
+// ClaimNextQueuedTurnWithInboundForOwner is the owner-fenced counterpart of
+// ClaimNextQueuedTurnWithInbound.  The inbound row is returned only after the
+// same transaction has crossed the existing queued->running claim boundary.
+func (s *Store) ClaimNextQueuedTurnWithInboundForOwner(ctx context.Context, sessionID string, machineID string, leaseGeneration int64) (Turn, InboundEvent, bool, bool, bool, error) {
+	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
+	if err != nil {
+		return Turn{}, InboundEvent{}, false, false, false, err
+	}
+	return s.claimNextQueuedTurnWithInbound(ctx, sessionID, capability)
+}
+
 func (s *Store) claimNextQueuedTurn(ctx context.Context, sessionID string, capability storeOwnerCapability) (Turn, bool, error) {
+	turn, _, claimed, _, _, err := s.claimNextQueuedTurnWithInbound(ctx, sessionID, capability)
+	return turn, claimed, err
+}
+
+func (s *Store) claimNextQueuedTurnWithInbound(ctx context.Context, sessionID string, capability storeOwnerCapability) (Turn, InboundEvent, bool, bool, bool, error) {
 	sessionID = strings.TrimSpace(sessionID)
 	if sessionID == "" {
-		return Turn{}, false, fmt.Errorf("session id is required")
+		return Turn{}, InboundEvent{}, false, false, false, fmt.Errorf("session id is required")
 	}
-	if out, claimed, handled, err := s.claimNextQueuedTurnSQLiteWithOwner(ctx, sessionID, capability); handled || err != nil {
-		return out, claimed, err
+	if out, handled, err := s.claimNextQueuedTurnSQLiteWithOwnerAndInbound(ctx, sessionID, capability); handled || err != nil {
+		return out.turn, out.inbound, out.claimed, out.inboundFound, out.inboundRead, err
 	}
 	var out Turn
+	var inbound InboundEvent
 	claimed := false
+	inboundFound := false
+	inboundRead := false
 	err := s.UpdateSession(ctx, sessionID, func(state *State) error {
 		if err := validateStoreOwnerCapability(state, capability); err != nil {
 			return err
@@ -11353,9 +11391,13 @@ func (s *Store) claimNextQueuedTurn(ctx context.Context, sessionID string, capab
 		updateSessionFromTurn(state, turn, now)
 		out = turn
 		claimed = true
+		inboundRead = true
+		if inboundID := strings.TrimSpace(turn.InboundEventID); inboundID != "" {
+			inbound, inboundFound = state.InboundEvents[inboundID]
+		}
 		return nil
 	})
-	return out, claimed, err
+	return out, inbound, claimed, inboundFound, inboundRead, err
 }
 
 // RequeueTurn returns a claimed turn to the durable queue without creating a

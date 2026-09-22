@@ -22668,12 +22668,17 @@ func loadSQLiteQueueClaimCheckpointTx(ctx context.Context, tx *sql.Tx, sessionID
 }
 
 func (s *Store) claimNextQueuedTurnSQLite(ctx context.Context, sessionID string) (Turn, bool, bool, error) {
-	return s.claimNextQueuedTurnSQLiteWithOwner(ctx, sessionID, storeOwnerCapability{})
+	result, handled, err := s.claimNextQueuedTurnSQLiteWithOwnerAndInbound(ctx, sessionID, storeOwnerCapability{})
+	return result.turn, result.claimed, handled, err
 }
 
 func (s *Store) claimNextQueuedTurnSQLiteWithOwner(ctx context.Context, sessionID string, capability storeOwnerCapability) (Turn, bool, bool, error) {
-	var out Turn
-	claimed := false
+	result, handled, err := s.claimNextQueuedTurnSQLiteWithOwnerAndInbound(ctx, sessionID, capability)
+	return result.turn, result.claimed, handled, err
+}
+
+func (s *Store) claimNextQueuedTurnSQLiteWithOwnerAndInbound(ctx context.Context, sessionID string, capability storeOwnerCapability) (queuedTurnClaimResult, bool, error) {
+	var result queuedTurnClaimResult
 	handled := false
 	err := s.withSessionLock(ctx, sessionID, func() error {
 		return s.withStateLock(ctx, func() error {
@@ -22797,15 +22802,35 @@ func (s *Store) claimNextQueuedTurnSQLiteWithOwner(ctx context.Context, sessionI
 					return err
 				}
 			}
+			inboundID := strings.TrimSpace(turn.InboundEventID)
+			result.inboundRead = true
+			if inboundID != "" {
+				result.inbound, result.inboundFound, err = loadSQLiteJSONRow[InboundEvent](ctx, tx, `SELECT json FROM inbound_events WHERE id = ?`, inboundID)
+				if err != nil {
+					// Preserve the historical malformed-inbound behavior: the
+					// queued turn must still cross the claim boundary so the bridge
+					// can route the decode error through its existing interrupted/
+					// attention path. The row read is an optimization, not a reason
+					// to roll a valid claim back into a retry loop.
+					result.turn = turn
+					result.claimed = true
+					result.inboundRead = false
+					if commitErr := tx.Commit(); commitErr != nil {
+						result.claimed = false
+						return commitErr
+					}
+					return err
+				}
+			}
 			if err := tx.Commit(); err != nil {
 				return err
 			}
-			out = turn
-			claimed = true
+			result.turn = turn
+			result.claimed = true
 			return nil
 		})
 	})
-	return out, claimed, handled, err
+	return result, handled, err
 }
 
 func (s *Store) updateTurnSQLite(ctx context.Context, turnID string, includeOutbox bool, fn func(*State, Turn, time.Time) (Turn, error)) (Turn, bool, error) {

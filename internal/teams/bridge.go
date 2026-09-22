@@ -19665,11 +19665,39 @@ func (b *Bridge) startQueuedTurnWithExecutionContext(ctx context.Context, execut
 		traceQueuedTurn("capacity", "", false, nil)
 		return false, nil
 	}
-	claimed, ok, err := b.claimNextQueuedTurnForCurrentOwner(ctx, session.ID)
-	if err != nil || !ok {
+	var claimedInbound teamstore.InboundEvent
+	var claimedInboundFound bool
+	var claimedInboundRead bool
+	var claimed teamstore.Turn
+	var ok bool
+	var err error
+	if preferred == nil {
+		claimed, claimedInbound, ok, claimedInboundFound, claimedInboundRead, err = b.claimNextQueuedTurnWithInboundForCurrentOwner(ctx, session.ID)
+	} else {
+		claimed, ok, err = b.claimNextQueuedTurnForCurrentOwner(ctx, session.ID)
+	}
+	if err != nil && (!ok || claimedInboundRead) {
 		traceQueuedTurn("claim", "", false, err)
 		b.releaseAsyncTurnReservation()
 		return ok, err
+	}
+	if !ok {
+		traceQueuedTurn("claim", "", false, nil)
+		b.releaseAsyncTurnReservation()
+		return false, nil
+	}
+	if err != nil {
+		// SQLite committed the valid claim before reporting an inbound decode
+		// error. Route that error through the existing turn disposition directly;
+		// do not issue a second inbound lookup and do not start a worker with an
+		// unverified input. JSON persistence errors and ordinary claim failures
+		// were returned above before any worker could start.
+		traceQueuedTurn("claim-inbound-read", claimed.ID, true, err)
+		if !claimedInboundRead {
+			b.handleClaimedQueuedTurnError(ctx, session, claimed, err)
+			b.releaseAsyncTurnReservation()
+			return true, err
+		}
 	}
 	traceQueuedTurn("claimed", claimed.ID, true, nil)
 	if strings.TrimSpace(preferredTurnID) == "" || claimed.ID != preferredTurnID {
@@ -19686,7 +19714,7 @@ func (b *Bridge) startQueuedTurnWithExecutionContext(ctx context.Context, execut
 		}()
 		runSession := &sessionSnapshot
 		traceQueuedTurn("run-start", claimed.ID, true, nil)
-		err := b.runClaimedQueuedTurn(runCtx, runSession, claimed, preferredTurnID, preferred)
+		err := b.runClaimedQueuedTurn(runCtx, runSession, claimed, claimedInbound, claimedInboundFound, claimedInboundRead, preferredTurnID, preferred)
 		traceQueuedTurn("run-finished", claimed.ID, false, err)
 		followupsAllowed := b.asyncTurnFollowupsAllowed(generation)
 		ownerStillCurrent := b.asyncTurnOwnerStillCurrent(claimed)
@@ -19795,9 +19823,16 @@ func (b *Bridge) formatQueuedTurnStartNotice(ctx context.Context, sessionID stri
 	return strings.Join(lines, "\n"), true, nil
 }
 
-func (b *Bridge) runClaimedQueuedTurn(ctx context.Context, session *Session, claimed teamstore.Turn, preferredTurnID string, preferred queuedTurnRunner) error {
+func (b *Bridge) runClaimedQueuedTurn(ctx context.Context, session *Session, claimed teamstore.Turn, claimedInbound teamstore.InboundEvent, claimedInboundFound bool, claimedInboundRead bool, preferredTurnID string, preferred queuedTurnRunner) error {
 	if strings.TrimSpace(preferredTurnID) != "" && claimed.ID == preferredTurnID && preferred != nil {
 		return preferred(ctx, session, claimed)
+	}
+	if claimedInboundRead {
+		state := teamstore.State{SchemaVersion: teamstore.SchemaVersion, InboundEvents: map[string]teamstore.InboundEvent{}}
+		if claimedInboundFound {
+			state.InboundEvents[claimedInbound.ID] = claimedInbound
+		}
+		return b.recoverQueuedTurn(ctx, session, claimed, state)
 	}
 	inbound, ok, err := b.store.InboundEventByID(ctx, claimed.InboundEventID)
 	if err != nil {
@@ -20796,6 +20831,13 @@ func (b *Bridge) claimNextQueuedTurnForCurrentOwner(ctx context.Context, session
 		return b.store.ClaimNextQueuedTurnForOwner(ctx, sessionID, machineID, generation)
 	}
 	return b.store.ClaimNextQueuedTurn(ctx, sessionID)
+}
+
+func (b *Bridge) claimNextQueuedTurnWithInboundForCurrentOwner(ctx context.Context, sessionID string) (teamstore.Turn, teamstore.InboundEvent, bool, bool, bool, error) {
+	if machineID, generation, ownerBound := b.transcriptCheckpointOwnerCapabilityForContext(ctx); ownerBound {
+		return b.store.ClaimNextQueuedTurnWithInboundForOwner(ctx, sessionID, machineID, generation)
+	}
+	return b.store.ClaimNextQueuedTurnWithInbound(ctx, sessionID)
 }
 
 func (b *Bridge) markTurnForIsolatedCodexThread(ctx context.Context, turnID string) (teamstore.Turn, error) {
