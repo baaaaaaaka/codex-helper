@@ -23385,12 +23385,37 @@ func (b *Bridge) recoverAmbiguousOutboxMainLoop(ctx context.Context) error {
 	if err := b.ensureStore(); err != nil {
 		return err
 	}
+	// Ambiguous recovery is a read-only safety lane, but it still consumes
+	// durable pages, owner-bind attempts, and phase time before the per-row
+	// probe can observe the same account-wide read gate.  Fail closed at the
+	// sweep boundary when the account gate is already active.  This does not
+	// affect known queued writes: the caller runs those before this recovery
+	// lane and keeps the read/write gates independent.
+	deferForAccountReadGate := func() error {
+		until, blocked := b.graphReadAccountBlockedUntil(ctx)
+		if !blocked {
+			return nil
+		}
+		return outboxDeliveryDeferredError{
+			ChatID: graphReadAccountRateLimitKey,
+			Until:  until,
+			Cause:  &graphReadGateActiveError{ChatID: graphReadAccountRateLimitKey, Until: until},
+		}
+	}
+	if err := deferForAccountReadGate(); err != nil {
+		return err
+	}
 	// Keep one recovery cursor owner per Bridge instance. The durable expected
 	// cursor CAS below also fences another process or an unusual same-generation
 	// overlap, while this local mutex avoids needless duplicate Graph history
 	// reads during a busy main loop.
 	b.outboxRecoveryMu.Lock()
 	defer b.outboxRecoveryMu.Unlock()
+	// Recheck after taking the local sweep lock: another lane may have
+	// discovered an account-wide throttle while this call was waiting.
+	if err := deferForAccountReadGate(); err != nil {
+		return err
+	}
 	control, err := b.store.ReadControl(ctx)
 	if err != nil {
 		return err
@@ -23520,6 +23545,14 @@ func (b *Bridge) recoverAmbiguousOutboxMainLoop(ctx context.Context) error {
 			}
 			if firstErr == nil {
 				firstErr = recoveryErr
+			}
+			// A candidate can be the operation that installed an account-wide
+			// read gate. Do not scan/bind/defer sibling candidates or advance the
+			// sweep cursor after that point; the current row's durable retry fence
+			// is already recorded above, and the next pass can safely revisit the
+			// unchanged page.
+			if accountGateErr := deferForAccountReadGate(); accountGateErr != nil {
+				return firstErr
 			}
 		}
 		if !page.NextCursor.IsZero() {
