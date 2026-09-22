@@ -16315,7 +16315,7 @@ func (b *Bridge) recoverQueuedTurn(ctx context.Context, session *Session, turn t
 	if observed := strings.TrimSpace(inbound.TurnID); observed != "" && observed != strings.TrimSpace(turn.ID) {
 		return b.interruptQueuedTurnForRecoveryProvenance(ctx, session, turn, fmt.Sprintf("queued turn %s is not the durable owner of inbound %s", turn.ID, inbound.ID))
 	}
-	if inboundEventHasDurablePlainTextContext(inbound) {
+	if inboundEventHasDurablePlainTextContext(inbound, session.ID) {
 		// This is a new plain-text inbound captured with a complete local context
 		// marker. It is safe to prepare directly from the durable text; unlike a
 		// rich/attachment message, no Graph read is needed to recover the prompt.
@@ -19786,7 +19786,7 @@ func (b *Bridge) queuedTurnHasDurablePlainTextInput(ctx context.Context, session
 	if err != nil {
 		return false, err
 	}
-	return found && inboundEventHasDurablePlainTextContext(inbound), nil
+	return found && inboundEventHasDurablePlainTextContext(inbound, sessionID), nil
 }
 
 func queuedTurnStartOutboxID(turnID string) string {
@@ -22196,12 +22196,20 @@ func chatMessageFromInboundContext(inbound teamstore.InboundEvent) (ChatMessage,
 }
 
 // inboundEventHasDurablePlainTextContext identifies the narrow receipt shape
-// that can be recovered without Graph. The message ID remains required because
-// recoverQueuedTurn uses it as the durable object identity before any local
-// execution is admitted.
-func inboundEventHasDurablePlainTextContext(inbound teamstore.InboundEvent) bool {
+// that can be recovered without Graph. New rows carry an explicit text body
+// marker. The legacy control-fallback exception is limited to the old shape
+// that already has a message ID and normalized Text but no body marker; it is
+// the same local fallback used after a failed control-message GET. Work-chat
+// rows without the explicit marker remain behind the conservative Graph path.
+// The message ID remains required because recoverQueuedTurn uses it as the
+// durable object identity before any local execution is admitted.
+func inboundEventHasDurablePlainTextContext(inbound teamstore.InboundEvent, sessionID string) bool {
+	bodyType := strings.TrimSpace(inbound.TeamsBodyType)
+	if !strings.EqualFold(bodyType, "text") &&
+		!(strings.TrimSpace(sessionID) == controlFallbackSessionID && bodyType == "") {
+		return false
+	}
 	return strings.TrimSpace(inbound.TeamsMessageID) != "" &&
-		strings.EqualFold(strings.TrimSpace(inbound.TeamsBodyType), "text") &&
 		len(inbound.TeamsAttachments) == 0 &&
 		strings.TrimSpace(inbound.Text) != ""
 }

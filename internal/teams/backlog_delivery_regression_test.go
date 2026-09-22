@@ -1988,6 +1988,23 @@ func TestTeamsQueuedAdmissionUsesDurablePlainTextDuringReadGate(t *testing.T) {
 	}
 }
 
+func TestLegacyControlFallbackTextIsTheOnlyUnmarkedLocalRecoveryException(t *testing.T) {
+	legacy := teamstore.InboundEvent{
+		TeamsMessageID: "legacy-control-message",
+		Text:           "durable control prompt",
+	}
+	if !inboundEventHasDurablePlainTextContext(legacy, controlFallbackSessionID) {
+		t.Fatal("legacy control fallback text was not recognized as local recovery input")
+	}
+	if inboundEventHasDurablePlainTextContext(legacy, "work-session") {
+		t.Fatal("unmarked work-chat text was incorrectly admitted as local recovery input")
+	}
+	legacy.TeamsAttachments = []teamstore.InboundAttachmentContext{{ID: "attachment-1"}}
+	if inboundEventHasDurablePlainTextContext(legacy, controlFallbackSessionID) {
+		t.Fatal("legacy control fallback with an attachment was admitted without Graph")
+	}
+}
+
 func TestTeamsQueuedTurnStartNoticeDoesNotFlushOutboxBeforeExecutor(t *testing.T) {
 	graph, _ := newBridgeQueuedTurnGraph(t, map[string]string{
 		"queued-start-no-flush": "run without waiting for the old outbox prefix",
