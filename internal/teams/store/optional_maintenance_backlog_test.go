@@ -1092,6 +1092,62 @@ func TestTeamsOperationalBacklogInboundStatusParityAcrossBackends(t *testing.T) 
 	}
 }
 
+func TestTeamsOperationalBacklogLinkedTurnLookupUsesIdentityIndex(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+	now := time.Date(2026, 9, 23, 12, 0, 0, 0, time.UTC)
+	if err := st.Update(ctx, func(state *State) error {
+		state.Turns["turn-terminal"] = Turn{ID: "turn-terminal", SessionID: "session-terminal", Status: TurnStatusCompleted, CreatedAt: now}
+		state.InboundEvents["inbound-linked"] = InboundEvent{
+			ID: "inbound-linked", Status: InboundStatusQueued, TurnID: "turn-terminal",
+			TeamsChatID: "chat-linked", TeamsMessageID: "message-linked", CreatedAt: now, UpdatedAt: now,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed linked backlog fixture: %v", err)
+	}
+	migrateStoreToSQLiteForTest(t, st)
+
+	var plan []string
+	if err := st.withStateLock(ctx, func() error {
+		pointer, ok, err := st.currentSQLitePointerUnlocked()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return fmt.Errorf("SQLite pointer is not available")
+		}
+		db, err := st.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		predicate, args := sqliteInboundOperationalBacklogSQL("i.status", "i.json")
+		rows, err := db.QueryContext(ctx, `EXPLAIN QUERY PLAN SELECT 1 FROM inbound_events i WHERE `+predicate+` LIMIT 1`, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id, parent, notused int
+			var detail string
+			if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+				return err
+			}
+			plan = append(plan, detail)
+		}
+		return rows.Err()
+	}); err != nil {
+		t.Fatalf("inspect linked turn lookup plan: %v", err)
+	}
+	joined := strings.Join(plan, "\n")
+	if !strings.Contains(joined, "USING INDEX sqlite_autoindex_turns_1 (id=?)") {
+		t.Fatalf("linked turn lookup plan = %q, want identity index lookup", joined)
+	}
+	if strings.Contains(joined, "USING INDEX turns_ready_idx (status=?)") {
+		t.Fatalf("linked turn lookup plan regressed to status scans: %q", joined)
+	}
+}
+
 func TestTeamsOperationalBacklogTreatsDormantGapAsNonBlocking(t *testing.T) {
 	ctx := context.Background()
 	now := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)

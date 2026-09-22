@@ -20139,11 +20139,11 @@ func sqliteInboundOperationalBacklogSQL(statusExpr, jsonColumn string) (string, 
 	source := sqliteSafeJSONExtract(jsonColumn, "$.source")
 	turnTerminal := `NOT EXISTS (
             SELECT 1 FROM turns t
-            WHERE trim(t.id) = trim(` + turnID + `)
+            WHERE t.id = trim(` + turnID + `)
               AND t.status IN (?, ?, ?)
               AND json_valid(t.json)
               AND ` + sqliteSafeJSONType("t.json", "$.id") + ` = 'text'
-              AND trim(COALESCE(` + sqliteSafeJSONExtract("t.json", "$.id") + `, '')) = trim(t.id)
+              AND ` + sqliteSafeJSONExtract("t.json", "$.id") + ` = t.id
               AND ` + sqliteSafeJSONType("t.json", "$.status") + ` = 'text'
               AND ` + sqliteSafeJSONExtract("t.json", "$.status") + ` IN (?, ?, ?)
         )`
