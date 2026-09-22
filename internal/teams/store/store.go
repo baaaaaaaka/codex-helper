@@ -6968,20 +6968,44 @@ LIMIT 1`,
 
 func (s *Store) loadStateFieldsOrFull(ctx context.Context, wantedFields map[string]struct{}) (State, error) {
 	var state State
+	observer := s.timingObserverSnapshot()
+	operation := "loadStateFieldsOrFull." + stateFieldSetLabel(wantedFields)
 	err := s.withStateLock(ctx, func() error {
+		started := time.Now()
 		selected, ok, err := s.loadSelectedStateFieldsUnlocked(ctx, wantedFields)
 		if err != nil {
+			s.recordTiming(observer, operation, "selected-read", started, err)
 			return err
 		}
 		if ok {
 			state = selected
+			s.recordTiming(observer, operation, "selected-read", started, nil)
 			return nil
 		}
 		var loadErr error
 		state, loadErr = s.loadUnlocked(ctx)
+		s.recordTiming(observer, operation, "selected-read", started, loadErr)
 		return loadErr
 	})
 	return state, err
+}
+
+func stateFieldSetLabel(fields map[string]struct{}) string {
+	if len(fields) == 0 {
+		return "full"
+	}
+	labels := make([]string, 0, len(fields))
+	for field := range fields {
+		field = strings.TrimSpace(field)
+		if field != "" {
+			labels = append(labels, field)
+		}
+	}
+	if len(labels) == 0 {
+		return "full"
+	}
+	sort.Strings(labels)
+	return strings.Join(labels, "+")
 }
 
 func (s *Store) loadSelectedStateFieldsUnlocked(ctx context.Context, wantedFields map[string]struct{}) (State, bool, error) {
