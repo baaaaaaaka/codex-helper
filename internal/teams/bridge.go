@@ -13490,6 +13490,26 @@ func (b *Bridge) deferredControlOperationKey(source string, inboundID string, me
 	}
 }
 
+// isNonReplayableDeferredControlSource keeps control-plane input out of the
+// ordinary Work/Codex recovery path.  Only teams_control_new and
+// teams_control_fallback have an operation-specific durable replay contract;
+// every other teams_control_* source must be held or explicitly quarantined.
+// Keeping this predicate prefix-based also makes a future control command fail
+// closed until its replay contract is implemented, instead of silently gaining
+// an unsafe Codex fallback through the generic deferred-inbound path.
+func isNonReplayableDeferredControlSource(source string) bool {
+	source = strings.TrimSpace(source)
+	if !strings.HasPrefix(source, "teams_control_") {
+		return false
+	}
+	switch source {
+	case "teams_control_new", "teams_control_fallback":
+		return false
+	default:
+		return true
+	}
+}
+
 // deferredInboundRecoveryRowMutable is the narrow set of rows that may still
 // be adopted by the foreground recovery lane.  A queued row is safe here only
 // when QueueTurn has not linked it to a turn; a linked row belongs to the turn
@@ -15281,6 +15301,25 @@ func (b *Bridge) processDeferredInbound(ctx context.Context) error {
 			} else if fenced {
 				continue
 			}
+		default:
+			// Every teams_control_* row is control-plane input.  Unknown or
+			// newly-added control sources must fail closed here rather than fall
+			// through to the ordinary Work/Codex turn path.  The dedicated
+			// teams_control_new/fallback paths above are the only sources with a
+			// replay contract; processDeferredControlInbound holds all other
+			// control operations for explicit recovery.
+			if isNonReplayableDeferredControlSource(inbound.Source) {
+				if err := b.processDeferredControlInbound(ctx, inbound); err != nil {
+					if handled, handleErr := b.handleDeferredInboundRowFailure(ctx, inbound, err); handled {
+						if handleErr != nil {
+							return handleErr
+						}
+						continue
+					}
+					return err
+				}
+				continue
+			}
 		}
 		session, err := b.sessionForInboundEvent(ctx, inbound)
 		if err != nil {
@@ -16317,6 +16356,18 @@ func (b *Bridge) recoverQueuedTurn(ctx context.Context, session *Session, turn t
 	}
 	if observed := strings.TrimSpace(inbound.TurnID); observed != "" && observed != strings.TrimSpace(turn.ID) {
 		return b.interruptQueuedTurnForRecoveryProvenance(ctx, session, turn, fmt.Sprintf("queued turn %s is not the durable owner of inbound %s", turn.ID, inbound.ID))
+	}
+	if isNonReplayableDeferredControlSource(inbound.Source) {
+		// Older listeners could incorrectly turn a deferred helper command into
+		// a normal control-fallback turn.  That turn must not be handed to Codex
+		// after an upgrade: restart/reload/update/webhook operations have no
+		// provider-side replay witness, and the original helper side effect may
+		// already have happened before the process stopped.  This path is before
+		// any Graph refetch or executor call, so interrupting it is safe for both
+		// queued startup recovery and an already-claimed async worker.
+		_, err := b.markQueuedTurnInterruptedForRecovery(ctx, turn,
+			"historical deferred control operation was not replayed automatically: "+strings.TrimSpace(inbound.Source))
+		return err
 	}
 	if inboundEventHasDurablePlainTextContext(inbound, session.ID) {
 		// This is a new plain-text inbound captured with a complete local context

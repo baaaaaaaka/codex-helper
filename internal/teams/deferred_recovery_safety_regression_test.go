@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -108,6 +109,173 @@ func TestDeferredUnknownRowFailureIsHeldInsteadOfHotLooping(t *testing.T) {
 		t.Fatalf("second InboundRecoveryCandidates: %v", err)
 	} else if len(candidates) != 0 {
 		t.Fatalf("repeated held unknown row became an automatic candidate: %#v", candidates)
+	}
+}
+
+func TestDeferredControlSourcesFailClosedInsteadOfEnteringCodex(t *testing.T) {
+	sources := []string{
+		"teams_control_restart",
+		"teams_control_reload",
+		"teams_control_update",
+		"teams_control_codex_update",
+		"teams_control_webhook_disable",
+		"teams_control_webhook_test",
+		"teams_control_webhook_configure",
+		"teams_control_future",
+	}
+
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			store := newBridgeTestStore(t)
+			executor := &recordingExecutor{}
+			bridge := newBridgeTestBridge(nil, store, executor)
+			now := time.Now().UTC()
+			for i, source := range sources {
+				inbound := teamstore.InboundEvent{
+					ID:             fmt.Sprintf("inbound:control-fail-closed-%02d", i),
+					SessionID:      controlFallbackSessionID,
+					TeamsChatID:    "control-chat",
+					TeamsMessageID: fmt.Sprintf("control-fail-closed-%02d", i),
+					Text:           "helper upgrade prerelease",
+					Source:         source,
+					Status:         teamstore.InboundStatusDeferred,
+					CreatedAt:      now.Add(time.Duration(i) * time.Second),
+					UpdatedAt:      now.Add(time.Duration(i) * time.Second),
+				}
+				if _, _, err := store.PersistInbound(ctx, inbound); err != nil {
+					t.Fatalf("PersistInbound(%s): %v", source, err)
+				}
+			}
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("MigrateLargeStateToSQLite: %v", err)
+				}
+			}
+
+			if err := bridge.processDeferredInbound(ctx); err != nil {
+				t.Fatalf("processDeferredInbound: %v", err)
+			}
+			if got := executor.promptCount(); got != 0 {
+				t.Fatalf("deferred control commands entered Codex: %d executor calls", got)
+			}
+			for i, source := range sources {
+				id := fmt.Sprintf("inbound:control-fail-closed-%02d", i)
+				inbound, found, err := store.InboundEventByID(ctx, id)
+				if err != nil || !found {
+					t.Fatalf("read %s: found=%v err=%v row=%#v", source, found, err, inbound)
+				}
+				if inbound.Status != teamstore.InboundStatusManualHold {
+					t.Fatalf("source %s status=%q, want manual hold: %#v", source, inbound.Status, inbound)
+				}
+			}
+			candidates, err := store.InboundRecoveryCandidates(ctx)
+			if err != nil {
+				t.Fatalf("InboundRecoveryCandidates: %v", err)
+			}
+			if len(candidates) != 0 {
+				t.Fatalf("held control commands remained automatic candidates: %#v", candidates)
+			}
+		})
+	}
+}
+
+func TestQueuedNonReplayableControlSourceIsQuarantinedBeforeCodex(t *testing.T) {
+	sources := []string{
+		"teams_control_restart",
+		"teams_control_reload",
+		"teams_control_update",
+		"teams_control_future",
+	}
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			for _, source := range sources {
+				t.Run(source, func(t *testing.T) {
+					ctx := context.Background()
+					store := newBridgeTestStore(t)
+					executor := &recordingExecutor{}
+					bridge := newBridgeTestBridge(nil, store, executor)
+					if _, _, err := store.CreateSession(ctx, teamstore.SessionContext{
+						ID:         controlFallbackSessionID,
+						Status:     teamstore.SessionStatusActive,
+						RunnerKind: "control_fallback",
+						Model:      DefaultControlFallbackModel,
+					}); err != nil {
+						t.Fatalf("CreateSession: %v", err)
+					}
+					now := time.Now().UTC()
+					inbound, created, err := store.PersistInbound(ctx, teamstore.InboundEvent{
+						ID:             "inbound:queued-control-fail-closed",
+						SessionID:      controlFallbackSessionID,
+						TeamsChatID:    "control-chat",
+						TeamsMessageID: "queued-control-fail-closed",
+						Text:           "helper upgrade prerelease",
+						Source:         source,
+						Status:         teamstore.InboundStatusPersisted,
+						CreatedAt:      now,
+						UpdatedAt:      now,
+					})
+					if err != nil || !created {
+						t.Fatalf("PersistInbound created=%v err=%v", created, err)
+					}
+					turn, created, err := store.QueueTurn(ctx, teamstore.Turn{
+						ID:             "turn:queued-control-fail-closed",
+						SessionID:      controlFallbackSessionID,
+						InboundEventID: inbound.ID,
+						Status:         teamstore.TurnStatusQueued,
+						CreatedAt:      now,
+						UpdatedAt:      now,
+					})
+					if err != nil || !created {
+						t.Fatalf("QueueTurn created=%v err=%v", created, err)
+					}
+					if useSQLite {
+						if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+							t.Fatalf("MigrateLargeStateToSQLite: %v", err)
+						}
+					}
+					claimed, claimedInbound, claimedOK, inboundFound, inboundRead, err := store.ClaimNextQueuedTurnWithInbound(ctx, controlFallbackSessionID)
+					if err != nil || !claimedOK || !inboundFound || !inboundRead {
+						t.Fatalf("ClaimNextQueuedTurnWithInbound claimed=%v inboundFound=%v inboundRead=%v err=%v turn=%#v", claimedOK, inboundFound, inboundRead, err, claimed)
+					}
+					if claimed.ID != turn.ID || claimed.Status != teamstore.TurnStatusRunning {
+						t.Fatalf("claimed turn=%#v, want running %s", claimed, turn.ID)
+					}
+
+					state := teamstore.State{SchemaVersion: teamstore.SchemaVersion, InboundEvents: map[string]teamstore.InboundEvent{
+						claimedInbound.ID: claimedInbound,
+					}}
+					if err := bridge.recoverQueuedTurn(ctx, &Session{ID: controlFallbackSessionID, ChatID: "control-chat", Status: "active"}, claimed, state); err != nil {
+						t.Fatalf("recoverQueuedTurn: %v", err)
+					}
+					if got := executor.promptCount(); got != 0 {
+						t.Fatalf("source %s entered Codex: %d executor calls", source, got)
+					}
+					storedTurn, found, err := store.TurnByID(ctx, claimed.ID)
+					if err != nil || !found {
+						t.Fatalf("read quarantined turn: found=%v err=%v turn=%#v", found, err, storedTurn)
+					}
+					if storedTurn.Status != teamstore.TurnStatusInterrupted || !strings.Contains(storedTurn.RecoveryReason, source) {
+						t.Fatalf("quarantined turn=%#v, want interrupted reason containing %s", storedTurn, source)
+					}
+					storedInbound, found, err := store.InboundEventByID(ctx, claimedInbound.ID)
+					if err != nil || !found {
+						t.Fatalf("read quarantined inbound: found=%v err=%v inbound=%#v", found, err, storedInbound)
+					}
+					if storedInbound.Status != teamstore.InboundStatusIgnored {
+						t.Fatalf("quarantined inbound=%#v, want ignored", storedInbound)
+					}
+				})
+			}
+		})
 	}
 }
 
