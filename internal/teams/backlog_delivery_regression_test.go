@@ -1903,6 +1903,105 @@ func TestTeamsOutboxSendsDurableIsolatedLiveBranchFinal(t *testing.T) {
 	}
 }
 
+// The bridge-side live-branch fast path is only a liveness hint.  The durable
+// store CAS remains authoritative, so rows with no matching durable turn,
+// mismatched execution identity, or automatic transcript provenance must not
+// reach Graph even if an outbox row is crafted with the admitted thread ID.
+func TestTeamsOutboxDoesNotSendUnprovenLiveBranchRows(t *testing.T) {
+	cases := []struct {
+		name           string
+		turnID         string
+		hasTurn        bool
+		turnThreadID   string
+		outboxThreadID string
+	}{
+		{
+			name:           "missing durable turn",
+			turnID:         "turn:missing-durable-turn",
+			hasTurn:        false,
+			outboxThreadID: "thread:isolated-live-branch",
+		},
+		{
+			name:           "mismatched thread",
+			turnID:         "turn:mismatched-thread",
+			hasTurn:        true,
+			turnThreadID:   "thread:historical-owner",
+			outboxThreadID: "thread:historical-owner",
+		},
+		{
+			name:           "automatic sync row",
+			turnID:         "sync:turn:automatic-import",
+			hasTurn:        true,
+			turnThreadID:   "thread:isolated-live-branch",
+			outboxThreadID: "thread:isolated-live-branch",
+		},
+	}
+	for _, test := range cases {
+		for _, useSQLite := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/%s", test.name, map[bool]string{false: "json", true: "sqlite"}[useSQLite]), func(t *testing.T) {
+				ctx := context.Background()
+				graph, sent := newBridgeTestGraph(t)
+				store := newBridgeTestStore(t)
+				const (
+					sessionID    = "unproven-live-branch-session"
+					chatID       = "unproven-live-branch-chat"
+					oldTurnID    = "turn:historical-owner"
+					oldThreadID  = "thread:historical-owner"
+					liveThreadID = "thread:isolated-live-branch"
+				)
+				checkpointID := "transcript:" + sessionID
+				outboxID := "outbox:" + test.turnID + ":final"
+				anchor := teamstore.ExecutionAnchor{
+					SessionID: sessionID, ThreadID: oldThreadID, OuterTurnID: oldTurnID,
+					LiveBranchThreadID: liveThreadID, State: executionAnchorStateUnresolved,
+					Generation: 9,
+				}
+				if err := store.Update(ctx, func(state *teamstore.State) error {
+					now := time.Now().UTC()
+					state.Sessions[sessionID] = teamstore.SessionContext{ID: sessionID, Status: teamstore.SessionStatusActive, TeamsChatID: chatID}
+					if test.hasTurn {
+						state.Turns[test.turnID] = teamstore.Turn{ID: test.turnID, SessionID: sessionID, Status: teamstore.TurnStatusCompleted, CodexThreadID: test.turnThreadID, CompletedAt: now}
+					}
+					state.ImportCheckpoints[checkpointID] = teamstore.ImportCheckpoint{ID: checkpointID, SessionID: sessionID, UnresolvedExecution: &anchor, ExecutionAnchorGeneration: anchor.Generation}
+					state.OutboxMessages[outboxID] = teamstore.OutboxMessage{
+						ID: outboxID, SessionID: sessionID, TurnID: test.turnID, CodexThreadID: test.outboxThreadID,
+						TeamsChatID: chatID, Kind: "final", NotificationKind: "turn_completed", Body: test.name,
+						Status: teamstore.OutboxStatusQueued, Sequence: 1, PartIndex: 1, PartCount: 1, CreatedAt: now, UpdatedAt: now,
+					}
+					return nil
+				}); err != nil {
+					t.Fatalf("seed %s: %v", test.name, err)
+				}
+				if useSQLite {
+					if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+						t.Fatalf("migrate store to SQLite: %v", err)
+					}
+				}
+
+				bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+				row, err := store.OutboxMessageByID(ctx, outboxID)
+				if err != nil {
+					t.Fatalf("load %s: %v", test.name, err)
+				}
+				err = bridge.sendQueuedOutboxWithOptions(ctx, row, outboxSendOptions{SkipUnresolvedTranscript: true})
+				if err != nil && !isOutboxDeliveryDeferred(err) {
+					t.Fatalf("send %s error = %v, want safe deferral or no-op", test.name, err)
+				}
+				if len(*sent) != 0 {
+					t.Fatalf("%s issued %d Graph POST(s), want none", test.name, len(*sent))
+				}
+				final, err := store.OutboxMessageByID(ctx, outboxID)
+				if err != nil {
+					t.Fatalf("reload %s: %v", test.name, err)
+				}
+				if final.Status == teamstore.OutboxStatusSent || final.TeamsMessageID != "" {
+					t.Fatalf("unproven %s was durably sent: %#v", test.name, final)
+				}
+			})
+		}
+	}
+}
+
 // A legacy markerless Sending helper may have an unknown Graph result, so it
 // must remain durable and must never be retried or skipped automatically.  It
 // is nevertheless low-value, and must not permanently block a later distinct
