@@ -1836,6 +1836,128 @@ func TestTeamsUnresolvedTranscriptOutboxUsesFutureRetryGate(t *testing.T) {
 	}
 }
 
+// A durable isolated live branch is already admitted by the store's execution
+// fence.  The bridge-side preflight must make the same decision; otherwise a
+// historical unresolved owner can quarantine every legitimate follow-up final
+// even though the terminal CAS and the store sender both recognize the branch.
+func TestTeamsOutboxSendsDurableIsolatedLiveBranchFinal(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(map[bool]string{false: "json", true: "sqlite"}[useSQLite], func(t *testing.T) {
+			ctx := context.Background()
+			graph, sent := newBridgeTestGraph(t)
+			store := newBridgeTestStore(t)
+			const (
+				sessionID    = "isolated-live-final-session"
+				chatID       = "isolated-live-final-chat"
+				oldTurnID    = "turn:historical-owner"
+				liveTurnID   = "turn:isolated-live-final"
+				oldThreadID  = "thread:historical-owner"
+				liveThreadID = "thread:isolated-live-branch"
+				checkpointID = "transcript:" + sessionID
+				outboxID     = "outbox:" + liveTurnID + ":final"
+			)
+			anchor := teamstore.ExecutionAnchor{
+				SessionID: sessionID, ThreadID: oldThreadID, OuterTurnID: oldTurnID,
+				LiveBranchThreadID: liveThreadID, State: executionAnchorStateUnresolved,
+				Generation: 9,
+			}
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				now := time.Now().UTC()
+				state.Sessions[sessionID] = teamstore.SessionContext{ID: sessionID, Status: teamstore.SessionStatusActive, TeamsChatID: chatID}
+				state.Turns[liveTurnID] = teamstore.Turn{ID: liveTurnID, SessionID: sessionID, Status: teamstore.TurnStatusCompleted, CodexThreadID: liveThreadID, CompletedAt: now}
+				state.ImportCheckpoints[checkpointID] = teamstore.ImportCheckpoint{ID: checkpointID, SessionID: sessionID, UnresolvedExecution: &anchor, ExecutionAnchorGeneration: anchor.Generation}
+				state.OutboxMessages[outboxID] = teamstore.OutboxMessage{
+					ID: outboxID, SessionID: sessionID, TurnID: liveTurnID, CodexThreadID: liveThreadID,
+					TeamsChatID: chatID, Kind: "final", NotificationKind: "turn_completed", Body: "isolated live branch final",
+					Status: teamstore.OutboxStatusQueued, Sequence: 1, PartIndex: 1, PartCount: 1, CreatedAt: now, UpdatedAt: now,
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed isolated live branch final: %v", err)
+			}
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate store to SQLite: %v", err)
+				}
+			}
+
+			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+			row, err := store.OutboxMessageByID(ctx, outboxID)
+			if err != nil {
+				t.Fatalf("load isolated live branch final: %v", err)
+			}
+			if transcriptOutboxBlockedByUnresolvedAnchor(ctx, store, row, map[string]teamstore.ExecutionAnchor{}, map[string]bool{}) {
+				t.Fatal("isolated live branch final was blocked by historical unresolved owner")
+			}
+			if err := bridge.sendQueuedOutboxWithOptions(ctx, row, outboxSendOptions{SkipUnresolvedTranscript: true}); err != nil {
+				t.Fatalf("send isolated live branch final: %v", err)
+			}
+			if len(*sent) != 1 || (*sent)[0].ChatID != chatID {
+				t.Fatalf("Graph sends = %#v, want one isolated live branch final", *sent)
+			}
+			final, err := store.OutboxMessageByID(ctx, outboxID)
+			if err != nil || final.Status != teamstore.OutboxStatusSent || final.TeamsMessageID == "" {
+				t.Fatalf("isolated live branch final = %#v err=%v, want sent with identity", final, err)
+			}
+		})
+	}
+}
+
+// A legacy markerless Sending helper may have an unknown Graph result, so it
+// must remain durable and must never be retried or skipped automatically.  It
+// is nevertheless low-value, and must not permanently block a later distinct
+// terminal answer in the same chat.
+func TestTeamsOutboxBypassesMarkerlessAmbiguousHelperWithoutMutatingIt(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(map[bool]string{false: "json", true: "sqlite"}[useSQLite], func(t *testing.T) {
+			ctx := context.Background()
+			graph, sent := newBridgeTestGraph(t)
+			store := newBridgeTestStore(t)
+			now := time.Now().UTC()
+			const (
+				chatID    = "markerless-helper-chat"
+				earlierID = "outbox:legacy-helper"
+				currentID = "outbox:current-final"
+			)
+			earlier := teamstore.OutboxMessage{
+				ID: earlierID, TeamsChatID: chatID, Kind: "helper-010", Body: "legacy helper output",
+				Status: teamstore.OutboxStatusSending, Sequence: 1, CreatedAt: now.Add(-time.Hour), UpdatedAt: now.Add(-time.Hour),
+				LastSendAttempt: now.Add(-time.Hour),
+				LastSendError:   "ambiguous Graph send; previous owner stopped before durable Graph identity",
+			}
+			current := teamstore.OutboxMessage{
+				ID: currentID, SessionID: "session:current-final", TurnID: "turn:current-final", CodexThreadID: "thread:current-final",
+				TeamsChatID: chatID, Kind: "final", NotificationKind: "turn_completed", Body: "current terminal answer",
+				Status: teamstore.OutboxStatusQueued, Sequence: 2, PartIndex: 1, PartCount: 1, CreatedAt: now, UpdatedAt: now,
+			}
+			seedBridgeTestOutboxRows(t, ctx, store, earlier, current)
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate store to SQLite: %v", err)
+				}
+			}
+			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+			if err := bridge.sendQueuedOutboxWithOptions(ctx, current, outboxSendOptions{}); err != nil {
+				t.Fatalf("send current final past markerless helper: %v", err)
+			}
+			if len(*sent) != 1 || (*sent)[0].ChatID != chatID {
+				t.Fatalf("Graph sends = %#v, want one current final", *sent)
+			}
+			legacy, err := store.OutboxMessageByID(ctx, earlierID)
+			if err != nil {
+				t.Fatalf("load markerless helper: %v", err)
+			}
+			if legacy.Status != teamstore.OutboxStatusSending || legacy.TeamsMessageID != "" || legacy.SendAttemptToken != "" {
+				t.Fatalf("markerless helper mutated = %#v, want original unknown Sending row", legacy)
+			}
+			final, err := store.OutboxMessageByID(ctx, currentID)
+			if err != nil || final.Status != teamstore.OutboxStatusSent || final.TeamsMessageID == "" {
+				t.Fatalf("current final = %#v err=%v, want sent with identity", final, err)
+			}
+		})
+	}
+}
+
 func TestTeamsOutboxPacingReservation(t *testing.T) {
 	var mu sync.Mutex
 	var sleeps []time.Duration

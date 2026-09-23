@@ -23677,6 +23677,13 @@ func transcriptOutboxBlockedByUnresolvedAnchor(ctx context.Context, store *teams
 	if transcriptOutboxTrustedBeforeAnchor(msg, anchor) {
 		return false
 	}
+	if transcriptOutboxBelongsToIsolatedLiveBranch(msg, anchor) {
+		// The store's terminal/send CAS has the same durable live-branch fence:
+		// a new turn on the explicitly admitted branch is independent of the old
+		// unresolved transcript owner.  Keep this bridge-side preflight aligned so
+		// it does not quarantine a row the store is prepared to send.
+		return false
+	}
 	return (strings.TrimSpace(anchor.OuterTurnID) != "" && turnID == strings.TrimSpace(anchor.OuterTurnID)) || isTranscriptAnswerOutbox(msg)
 }
 
@@ -23696,6 +23703,29 @@ func transcriptOutboxTrustedBeforeAnchor(msg teamstore.OutboxMessage, anchor tea
 		return false
 	}
 	return msg.TranscriptSourceOffset >= 0 && msg.TranscriptSourceOffset <= anchor.CutoffOffset
+}
+
+// transcriptOutboxBelongsToIsolatedLiveBranch is intentionally narrower than
+// the store's full turn lookup.  New terminal rows admitted on an isolated
+// branch carry the durable Codex thread on the outbox row itself; requiring
+// that exact identity keeps legacy/source-less rows fail-closed instead of
+// guessing from a turn ID alone.
+func transcriptOutboxBelongsToIsolatedLiveBranch(msg teamstore.OutboxMessage, anchor teamstore.ExecutionAnchor) bool {
+	liveThreadID := strings.TrimSpace(anchor.LiveBranchThreadID)
+	turnID := strings.TrimSpace(msg.TurnID)
+	if liveThreadID == "" || turnID == "" || turnID == strings.TrimSpace(anchor.OuterTurnID) ||
+		strings.TrimSpace(msg.CodexThreadID) != liveThreadID {
+		return false
+	}
+	if transcriptOutboxUserExplicitHistory(turnID) {
+		return false
+	}
+	for _, prefix := range []string{"sync:", "import:", "import-bg:"} {
+		if strings.HasPrefix(turnID, prefix) {
+			return false
+		}
+	}
+	return true
 }
 
 // transcriptOutboxSourceProofMatches verifies the bounded source prefix proof
@@ -24054,6 +24084,31 @@ func outboxDeliverySupersedable(msg teamstore.OutboxMessage) bool {
 	}
 	kind := strings.ToLower(strings.TrimSpace(msg.Kind))
 	return kind == "ack" || kind == "helper" || strings.HasPrefix(kind, "helper-")
+}
+
+// outboxCanBypassAmbiguousSupersedablePredecessor lets a later protected
+// terminal answer pass an old low-value helper/ACK whose Graph result is
+// unknown but whose legacy row has no attempt token to CAS-skip.  The old row
+// is left untouched and remains eligible only for read-only reconciliation;
+// this changes ordering for the later answer without inferring a POST result.
+func outboxCanBypassAmbiguousSupersedablePredecessor(current teamstore.OutboxMessage, earlier teamstore.OutboxMessage) bool {
+	if !teamstore.OutboxSendIsAmbiguous(earlier) || !outboxDeliverySupersedable(earlier) || !teamstore.OutboxDeliveryProtected(current) {
+		return false
+	}
+	if strings.TrimSpace(current.ID) == "" || strings.TrimSpace(current.ID) == strings.TrimSpace(earlier.ID) ||
+		(strings.TrimSpace(current.TurnID) != "" && strings.TrimSpace(current.TurnID) == strings.TrimSpace(earlier.TurnID)) {
+		return false
+	}
+	turnID := strings.TrimSpace(current.TurnID)
+	if turnID == "" || transcriptOutboxUserExplicitHistory(turnID) {
+		return false
+	}
+	for _, prefix := range []string{"sync:", "import:", "import-bg:"} {
+		if strings.HasPrefix(turnID, prefix) {
+			return false
+		}
+	}
+	return true
 }
 
 // outboxCanBypassProtectedAmbiguousPredecessor is the liveness counterpart to
@@ -25416,6 +25471,11 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 					}
 					b.forgetOutboxEchoAttempt(earlier.ID)
 					continue fifoLookup
+				} else if outboxCanBypassAmbiguousSupersedablePredecessor(outbox, earlier) {
+					// A legacy markerless helper cannot be safely CAS-skipped, but it
+					// also must not make a later terminal answer permanently invisible.
+					// Keep the predecessor unchanged and let the current protected row
+					// proceed through its normal claim/POST/identity CAS.
 				} else if opts.AllowProtectedAmbiguousBypass && outboxCanBypassProtectedAmbiguousPredecessor(outbox, earlier) {
 					// Keep the protected predecessor durable and ambiguous.  The
 					// current distinct user/control delivery is allowed through so a
