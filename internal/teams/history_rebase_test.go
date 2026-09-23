@@ -568,6 +568,14 @@ func TestHistoryWatchRebaseScanProgressBypassesFinalBatchBuffer(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed rebase checkpoint: %v", err)
 	}
+	// CAS callers carry the checkpoint read from the durable store. Re-read it
+	// here as well: JSON time decoding can normalize the location (notably UTC
+	// CI runners), and a pre-serialization value is not a faithful CAS token.
+	seeded, err := store.HistoryWatchState(context.Background())
+	if err != nil {
+		t.Fatalf("read seeded rebase checkpoint: %v", err)
+	}
+	expected = seeded.HistoryWatch[id]
 	source := codexHistoryFile{Info: info, Identity: "file:durable-rebase-progress"}
 	progress := historyWatchRebaseScanProgress{
 		SourceIdentity: source.Identity,
