@@ -10,22 +10,82 @@ set -euo pipefail
 # the live session tree after fixture creation. The session corpus is sparse:
 # copying every historical JSONL body would turn fixture creation into a 30+ GB
 # disk experiment instead of a Teams experiment.
-if [[ $# -lt 1 || $# -gt 2 ]]; then
-	echo "usage: $0 TEAMS_SCOPE_DIR [CODEX_HOME]" >&2
-	exit 2
-fi
-
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)"
-scope_dir="$(cd "$1" && pwd -P)"
-if ! codex_home="$(cd "${2:-/home/baka/.codex}" && pwd -P)"; then
-	echo "unable to resolve CODEX_HOME as an existing directory: ${2:-/home/baka/.codex}" >&2
-	exit 1
-fi
-teams_root="$(cd "$scope_dir/../.." && pwd -P)"
-fixture_root="$(mktemp -d /tmp/cxp-teams-real-data-XXXXXX)"
+reuse_fixture_input="${CXP_TEAMS_DOCKER_REUSE_FIXTURE_DIR:-}"
+keep_fixture="${CXP_TEAMS_DOCKER_KEEP_FIXTURE:-0}"
+runtime_dir_input="${CXP_TEAMS_DOCKER_RUNTIME_DIR:-}"
+runtime_reuse_initial="${CXP_TEAMS_DOCKER_RUNTIME_REUSE:-0}"
+resume_experiment="${CXP_TEAMS_DOCKER_REAL_DATA_RESUME:-0}"
+fixture_root=""
 fixture_dir=""
+reused_fixture=0
+runtime_dir_persistent=0
+if [[ -n "$reuse_fixture_input" ]]; then
+	if [[ $# -gt 2 ]]; then
+		echo "usage: $0 [TEAMS_SCOPE_DIR [CODEX_HOME]] (ignored when reusing a fixture)" >&2
+		exit 2
+	fi
+	if [[ -L "$reuse_fixture_input" ]] || ! fixture_dir="$(cd "$reuse_fixture_input" && pwd -P)"; then
+		echo "unable to resolve reusable Docker fixture as a non-symlink directory: $reuse_fixture_input" >&2
+		exit 1
+	fi
+	reused_fixture=1
+	# A reusable immutable fixture is the complete input boundary. Derive every
+	# path from it and never resolve, stat, hash, or otherwise consult a live
+	# scope/Codex tree merely to run another experiment against the snapshot.
+	scope_dir="$fixture_dir/teams"
+	teams_root="$fixture_dir"
+	codex_home="$fixture_dir/codex"
+else
+	if [[ $# -lt 1 || $# -gt 2 ]]; then
+		echo "usage: $0 TEAMS_SCOPE_DIR [CODEX_HOME]" >&2
+		exit 2
+	fi
+	scope_dir="$(cd "$1" && pwd -P)"
+	if ! codex_home="$(cd "${2:-/home/baka/.codex}" && pwd -P)"; then
+		echo "unable to resolve CODEX_HOME as an existing directory: ${2:-/home/baka/.codex}" >&2
+		exit 1
+	fi
+	teams_root="$(cd "$scope_dir/../.." && pwd -P)"
+	fixture_root="$(mktemp -d /tmp/cxp-teams-real-data-XXXXXX)"
+fi
 build_dir="$(mktemp -d /tmp/cxp-teams-real-build-XXXXXX)"
-runtime_dir="$(mktemp -d "$build_dir/runtime-XXXXXX")"
+if [[ -n "$runtime_dir_input" ]]; then
+	if [[ -L "$runtime_dir_input" ]]; then
+		echo "refusing symlink persistent Docker runtime directory: $runtime_dir_input" >&2
+		exit 1
+	fi
+	if ! mkdir -p -- "$runtime_dir_input"; then
+		echo "unable to create persistent Docker runtime directory: $runtime_dir_input" >&2
+		exit 1
+	fi
+	if ! runtime_dir="$(cd "$runtime_dir_input" && pwd -P)"; then
+		echo "unable to resolve persistent Docker runtime directory: $runtime_dir_input" >&2
+		exit 1
+	fi
+	if [[ "$runtime_dir" == "/" || "$runtime_dir" == "/tmp" || "$runtime_dir" == "/var/tmp" || "$runtime_dir" == "/home" || "$runtime_dir" == "/home/baka" || "$runtime_dir" == "${HOME%/}/.local/state" || "$runtime_dir" == "${HOME%/}/.local/state/codex-helper" ]]; then
+		echo "refusing broad persistent Docker runtime directory: $runtime_dir" >&2
+		exit 1
+	fi
+	paths_overlap() {
+		local left="$1"
+		local right="$2"
+		[[ "$left" == "$right" || "$left" == "$right/"* || "$right" == "$left/"* ]]
+	}
+	for protected_path in "$repo_root" "$scope_dir" "$teams_root" "$codex_home" "$fixture_root" "$fixture_dir"; do
+		if [[ -n "$protected_path" ]] && paths_overlap "$runtime_dir" "$protected_path"; then
+			echo "persistent Docker runtime directory must not overlap source/fixture data: runtime=$runtime_dir protected=$protected_path" >&2
+			exit 1
+		fi
+	done
+	if [[ ! -w "$runtime_dir" ]]; then
+		echo "persistent Docker runtime directory is not writable: $runtime_dir" >&2
+		exit 1
+	fi
+	runtime_dir_persistent=1
+else
+	runtime_dir="$(mktemp -d "$build_dir/runtime-XXXXXX")"
+fi
 chat_coverage_runtime_dir="$(mktemp -d "$build_dir/chat-coverage-runtime-XXXXXX")"
 image="cxp-teams-real-data-experiment:${GITHUB_RUN_ID:-local}-$$"
 host_uid="$(id -u)"
@@ -34,6 +94,19 @@ fixture_min_free_bytes="${CXP_TEAMS_DOCKER_FIXTURE_MIN_FREE_BYTES:-4294967296}"
 docker_test_timeout="${CXP_TEAMS_DOCKER_TEST_TIMEOUT:-30m}"
 docker_watchdog_timeout="${CXP_TEAMS_DOCKER_WATCHDOG_TIMEOUT:-35m}"
 fixture_codex_dir="/home/baka/.codex"
+if [[ -n "${CXP_TEAMS_DOCKER_CODEX_SOURCE_PREFIX:-}" ]]; then
+	codex_source_prefix="$CXP_TEAMS_DOCKER_CODEX_SOURCE_PREFIX"
+elif [[ "$reused_fixture" == "1" ]]; then
+	codex_source_prefix="$fixture_codex_dir"
+else
+	codex_source_prefix="${codex_home%/}/"
+fi
+codex_source_prefix="${codex_source_prefix%/}"
+if [[ "$codex_source_prefix" != /* ]]; then
+	echo "CXP_TEAMS_DOCKER_CODEX_SOURCE_PREFIX must be an absolute path prefix" >&2
+	exit 2
+fi
+codex_source_sessions_prefix="${codex_source_prefix%/}/sessions/"
 allow_source_drift="${CXP_TEAMS_DOCKER_ALLOW_SOURCE_DRIFT:-0}"
 experiment_mode="${CXP_TEAMS_DOCKER_REAL_DATA_MODE:-throughput}"
 experiment_duration="${CXP_TEAMS_DOCKER_REAL_DATA_DURATION:-5m}"
@@ -89,12 +162,48 @@ elif [[ "$experiment_mode" == "complete" ]]; then
 else
 	process_restart=1
 fi
+case "$runtime_reuse_initial" in
+	0|1) ;;
+	*)
+		echo "CXP_TEAMS_DOCKER_RUNTIME_REUSE must be 0 or 1" >&2
+		exit 2
+		;;
+esac
+case "$resume_experiment" in
+	0|1) ;;
+	*)
+		echo "CXP_TEAMS_DOCKER_REAL_DATA_RESUME must be 0 or 1" >&2
+		exit 2
+		;;
+esac
+if [[ "$runtime_reuse_initial" == "1" && "$runtime_dir_persistent" != "1" ]]; then
+	echo "CXP_TEAMS_DOCKER_RUNTIME_REUSE=1 requires an explicit persistent CXP_TEAMS_DOCKER_RUNTIME_DIR" >&2
+	exit 2
+fi
+if [[ "$resume_experiment" == "1" ]]; then
+	if [[ "$test_selection" != "all-lagging" || "$experiment_mode" != "complete" || "$runtime_reuse_initial" != "1" || "$runtime_dir_persistent" != "1" ]]; then
+		echo "CXP_TEAMS_DOCKER_REAL_DATA_RESUME=1 requires all-lagging mode and a reusable persistent runtime" >&2
+		exit 2
+	fi
+	process_restart=0
+elif [[ "$runtime_reuse_initial" == "1" ]]; then
+	echo "reusing an existing runtime requires CXP_TEAMS_DOCKER_REAL_DATA_RESUME=1" >&2
+	exit 2
+fi
 source_drift_diagnostic=0
 
 case "$allow_source_drift" in
 	0|1) ;;
 	*)
 		echo "CXP_TEAMS_DOCKER_ALLOW_SOURCE_DRIFT must be 0 or 1" >&2
+		exit 2
+		;;
+esac
+
+case "$keep_fixture" in
+	0|1) ;;
+	*)
+		echo "CXP_TEAMS_DOCKER_KEEP_FIXTURE must be 0 or 1" >&2
 		exit 2
 		;;
 esac
@@ -165,7 +274,17 @@ fi
 
 cleanup() {
 	docker image rm --force "$image" >/dev/null 2>&1 || true
-	rm -rf -- "$fixture_root" "$build_dir" "$runtime_dir"
+	if [[ -n "$fixture_root" ]]; then
+		if [[ "$keep_fixture" == "1" && -n "$fixture_dir" ]]; then
+			echo "reusable Docker fixture retained: $fixture_dir" >&2
+		else
+			rm -rf -- "$fixture_root"
+		fi
+	fi
+	rm -rf -- "$build_dir"
+	if [[ "$runtime_dir_persistent" == "1" ]]; then
+		echo "disposable mutable runtime retained: $runtime_dir" >&2
+	fi
 }
 trap cleanup EXIT
 
@@ -205,46 +324,48 @@ require_fixture_free_space() {
 	fi
 }
 
-for required in \
-	"$scope_dir/state.json" \
-	"$scope_dir/store.sqlite" \
-	"$scope_dir/registry.json" \
-	"$teams_root/global-inbound-ledger.json" \
-	"$teams_root/global-inbound-ledger.sqlite" \
-	"$teams_root/global-outbound-ledger.json" \
-	"$teams_root/global-outbound-ledger.sqlite" \
-	"$codex_home/history.jsonl" \
-	"$codex_home/session_index.jsonl" \
-	"$codex_home/sessions"; do
-	[[ -e "$required" ]] || {
-		echo "missing real-data input: $required" >&2
-		exit 1
-	}
-	if [[ -L "$required" ]]; then
-		echo "refusing symlink real-data input: $required" >&2
-		exit 1
-	fi
-done
+if [[ "$reused_fixture" != "1" ]]; then
+	for required in \
+		"$scope_dir/state.json" \
+		"$scope_dir/store.sqlite" \
+		"$scope_dir/registry.json" \
+		"$teams_root/global-inbound-ledger.json" \
+		"$teams_root/global-inbound-ledger.sqlite" \
+		"$teams_root/global-outbound-ledger.json" \
+		"$teams_root/global-outbound-ledger.sqlite" \
+		"$codex_home/history.jsonl" \
+		"$codex_home/session_index.jsonl" \
+		"$codex_home/sessions"; do
+		[[ -e "$required" ]] || {
+			echo "missing real-data input: $required" >&2
+			exit 1
+		}
+		if [[ -L "$required" ]]; then
+			echo "refusing symlink real-data input: $required" >&2
+			exit 1
+		fi
+	done
 
-for required_file in \
-	"$scope_dir/state.json" \
-	"$scope_dir/store.sqlite" \
-	"$scope_dir/registry.json" \
-	"$teams_root/global-inbound-ledger.json" \
-	"$teams_root/global-inbound-ledger.sqlite" \
-	"$teams_root/global-outbound-ledger.json" \
-	"$teams_root/global-outbound-ledger.sqlite" \
-	"$codex_home/history.jsonl" \
-	"$codex_home/session_index.jsonl"; do
-	[[ -f "$required_file" ]] || {
-		echo "required real-data input is not a regular file: $required_file" >&2
+	for required_file in \
+		"$scope_dir/state.json" \
+		"$scope_dir/store.sqlite" \
+		"$scope_dir/registry.json" \
+		"$teams_root/global-inbound-ledger.json" \
+		"$teams_root/global-inbound-ledger.sqlite" \
+		"$teams_root/global-outbound-ledger.json" \
+		"$teams_root/global-outbound-ledger.sqlite" \
+		"$codex_home/history.jsonl" \
+		"$codex_home/session_index.jsonl"; do
+		[[ -f "$required_file" ]] || {
+			echo "required real-data input is not a regular file: $required_file" >&2
+			exit 1
+		}
+	done
+	[[ -d "$codex_home/sessions" ]] || {
+		echo "required Codex sessions input is not a directory: $codex_home/sessions" >&2
 		exit 1
 	}
-done
-[[ -d "$codex_home/sessions" ]] || {
-	echo "required Codex sessions input is not a directory: $codex_home/sessions" >&2
-	exit 1
-}
+fi
 
 source_core_inputs=(
 	"$scope_dir/state.json"
@@ -453,6 +574,25 @@ copy_optional_sqlite_backup() {
 	sqlite_backup_readonly "$source_path" "$destination_path"
 }
 
+# Map the durable logical Codex path prefix to the physical fixture input tree,
+# then resolve symlinks. Callers still enforce canonical containment, so this
+# cannot grant access outside the read-only sessions tree.
+resolve_codex_session_source() {
+	local source_path="$1"
+	local mapped_path relative
+	case "$source_path" in
+		"$codex_source_sessions_prefix"*)
+			relative="${source_path#"$codex_source_sessions_prefix"}"
+			[[ -n "$relative" ]] || return 1
+			mapped_path="$codex_home/sessions/$relative"
+			;;
+		*)
+			mapped_path="$source_path"
+			;;
+	esac
+	realpath -e -- "$mapped_path" 2>/dev/null
+}
+
 # Reject a scope whose history projection points outside the session tree. The
 # experiment must never need to mount the Codex auth/config area. Lexical
 # prefix checks are insufficient because a path such as sessions-evil/ also
@@ -469,7 +609,7 @@ validate_history_paths() {
 	fi
 	bad_history_path="$(while IFS= read -r candidate; do
 		[[ -z "$candidate" ]] && continue
-		canonical_candidate="$(realpath -e -- "$candidate" 2>/dev/null || true)"
+		canonical_candidate="$(resolve_codex_session_source "$candidate" 2>/dev/null || true)"
 		case "$canonical_candidate" in
 			"$sessions_root"/*) ;;
 			*) printf '%s\n' "$candidate"; break ;;
@@ -656,7 +796,7 @@ SQL
 	fi
 	while IFS=$'\t' read -r source_path checkpoint_offset projected_size; do
 		[[ -z "$source_path" ]] && continue
-		if ! canonical_source="$(realpath -e -- "$source_path")"; then
+		if ! canonical_source="$(resolve_codex_session_source "$source_path")"; then
 			echo "history source disappeared while assembling fixture: $source_path" >&2
 			return 1
 		fi
@@ -727,7 +867,7 @@ copy_recent_history_files() {
 		return 1
 	fi
 	while IFS= read -r -d '' source_path; do
-		if ! canonical_source="$(realpath -e -- "$source_path")"; then
+		if ! canonical_source="$(resolve_codex_session_source "$source_path")"; then
 			echo "recent session disappeared while assembling fixture: $source_path" >&2
 			return 1
 		fi
@@ -942,7 +1082,7 @@ SQL
 			echo "invalid transcript source-proof range: path=$source_path start=$start end=$end" >&2
 			return 1
 		fi
-		if ! canonical_source="$(realpath -e -- "$source_path")"; then
+		if ! canonical_source="$(resolve_codex_session_source "$source_path")"; then
 			echo "transcript source disappeared while building proof manifest: $source_path" >&2
 			return 1
 		fi
@@ -977,7 +1117,7 @@ SQL
 	if [[ -f "$recent_proof_inventory" ]]; then
 		while IFS=$'\t' read -r source_path relative; do
 			[[ -z "$source_path" || -z "$relative" ]] && continue
-			if ! canonical_source="$(realpath -e -- "$source_path")"; then
+			if ! canonical_source="$(resolve_codex_session_source "$source_path")"; then
 				echo "recent transcript source disappeared while building full-file proof manifest: $source_path" >&2
 				return 1
 			fi
@@ -1009,7 +1149,7 @@ SQL
 	if [[ -f "$sparse_proof_inventory" ]]; then
 		while IFS=$'\t' read -r source_path relative start end; do
 			[[ -z "$source_path" || -z "$relative" ]] && continue
-			if ! canonical_source="$(realpath -e -- "$source_path")"; then
+			if ! canonical_source="$(resolve_codex_session_source "$source_path")"; then
 				echo "sparse transcript source disappeared while building proof manifest: $source_path" >&2
 				return 1
 			fi
@@ -1144,11 +1284,56 @@ assemble_fixture_snapshot() {
 	return 0
 }
 
+# Reused fixtures are immutable inputs. Validate their shape and SQLite schema
+# without copying or re-hashing the large Codex corpus on every experiment.
+validate_reusable_fixture() {
+	local relative schema_ok symlink mode owner
+	for relative in \
+		teams/store.sqlite \
+		teams/state.json \
+		teams/registry.json \
+		teams/global-inbound-ledger.json \
+		teams/global-outbound-ledger.json \
+		teams/global-inbound-ledger.sqlite \
+		teams/global-outbound-ledger.sqlite \
+		codex/history.jsonl \
+		codex/session_index.jsonl \
+		source-proof-manifest.tsv; do
+		if [[ ! -f "$fixture_dir/$relative" ]]; then
+			echo "reusable Docker fixture is missing required input: $relative" >&2
+			return 1
+		fi
+	done
+	if [[ ! -d "$fixture_dir/codex/sessions" ]]; then
+		echo "reusable Docker fixture is missing codex/sessions" >&2
+		return 1
+	fi
+	if ! symlink="$(find "$fixture_dir" -type l -print -quit)"; then return 1; fi
+	if [[ -n "$symlink" ]]; then
+		echo "reusable Docker fixture contains a symlink: $symlink" >&2
+		return 1
+	fi
+	owner="$(stat -c '%u' -- "$fixture_dir")"
+	mode="$(stat -c '%a' -- "$fixture_dir")"
+	if [[ "$owner" != "$host_uid" ]] || (( (8#$mode & 077) != 0 )); then
+		echo "reusable Docker fixture must be owned by uid $host_uid and private to that user: $fixture_dir" >&2
+		return 1
+	fi
+	if ! schema_ok="$(sqlite3 "file:$fixture_dir/teams/store.sqlite?mode=ro" "SELECT CASE WHEN EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='sessions') AND EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='chat_polls') THEN 1 ELSE 0 END;")" || [[ "$schema_ok" != "1" ]]; then
+		echo "reusable Docker fixture has an unreadable or incompatible scope SQLite database: $fixture_dir/teams/store.sqlite" >&2
+		return 1
+	fi
+}
+
 # A live Codex writer may atomically add/replace a session while the fixture is
 # being copied. Retry only after the complete before/after manifest rejects
 # that attempt; never combine files from different observations, and never
 # accept an attempt whose source manifest still differs unless the caller has
 # explicitly requested a diagnostic run with source drift allowed.
+if [[ "$reused_fixture" == "1" ]]; then
+	validate_reusable_fixture
+	echo "reusing immutable Docker fixture: $fixture_dir"
+else
 snapshot_attempts=3
 if [[ "$allow_source_drift" == "1" ]]; then
 	# The caller explicitly requested a diagnostic run on a live, mutating
@@ -1170,7 +1355,11 @@ for attempt in $(seq 1 "$snapshot_attempts"); do
 	else
 		assemble_status=$?
 	fi
-	if [[ "$assemble_status" -eq 2 && -s "$candidate/teams/store.sqlite" ]]; then
+	if [[ "$allow_source_drift" == "1" && "$assemble_status" -eq 2 && -s "$candidate/teams/store.sqlite" ]]; then
+		# Keep one rejected candidate only for the explicitly diagnostic mode,
+		# which may use it after all attempts. Strict acceptance never consumes
+		# a drifted fixture, so retaining it while copying the next full corpus
+		# only doubles peak disk use and can crowd out the retry itself.
 		if [[ -n "$fallback_fixture_dir" ]]; then
 			rm -rf -- "$fallback_fixture_dir"
 		fi
@@ -1194,15 +1383,28 @@ if [[ -z "$fixture_dir" ]]; then
 		exit 1
 	fi
 fi
+fi
 
 # Run as the invoking host UID/GID so the disposable private fixture and the
 # private runtime bind mount remain readable only by that user. In particular,
 # do not chmod a real-data snapshot world-readable just to accommodate a root
 # container: the fixture contains copied local history and must keep its normal
 # 0700/0600 boundary.
-chmod u+rwx,go-rwx "$fixture_root" "$fixture_dir" "$runtime_dir"
+if [[ "$runtime_dir_persistent" != "1" ]]; then
+	chmod u+rwx,go-rwx "$runtime_dir"
+fi
+if [[ "$reused_fixture" != "1" ]]; then
+	chmod u+rwx,go-rwx "$fixture_root" "$fixture_dir"
+	if [[ "$keep_fixture" == "1" ]]; then
+		echo "fixture retention enabled for this run" >&2
+	fi
+fi
 
-echo "real-data snapshot: scope=$scope_dir codex_sessions=$codex_home/sessions"
+if [[ "$reused_fixture" == "1" ]]; then
+	echo "real-data snapshot: reused=$fixture_dir"
+else
+	echo "real-data snapshot: scope=$scope_dir codex_sessions=$codex_home/sessions"
+fi
 sqlite3 "file:$fixture_dir/teams/store.sqlite?mode=ro" "SELECT 'rows', (SELECT count(*) FROM sessions),(SELECT count(*) FROM inbound_events),(SELECT count(*) FROM turns),(SELECT count(*) FROM chat_polls); SELECT 'queued_inbound',count(*) FROM inbound_events WHERE status='queued'; SELECT 'frontiers',sum(CASE WHEN json_extract(json,'\$.continuation_path') IS NOT NULL AND json_extract(json,'\$.continuation_path')<>'' THEN 1 ELSE 0 END),sum(CASE WHEN json_extract(json,'\$.gap') IS NOT NULL THEN 1 ELSE 0 END) FROM chat_polls;"
 
 cd "$repo_root"
@@ -1250,7 +1452,7 @@ run_experiment_process() {
 		--env CXP_TEAMS_DOCKER_REAL_DATA_429_SCOPE="$rate_limit_scope" \
 		--env CXP_TEAMS_DOCKER_REAL_DATA_429_POLL_ONLY="${CXP_TEAMS_DOCKER_REAL_DATA_429_POLL_ONLY:-0}" \
 		--env CXP_TEAMS_DOCKER_REAL_DATA_POLL_INTERVAL="$poll_interval" \
-		--env CXP_TEAMS_DOCKER_CODEX_SOURCE_PREFIX="${codex_home%/}/" \
+		--env CXP_TEAMS_DOCKER_CODEX_SOURCE_PREFIX="${codex_source_prefix%/}/" \
 		--env CXP_TEAMS_DOCKER_CODEX_MOUNTED=1 \
 		--env CXP_TEAMS_DOCKER_SOURCE_PROOF_MANIFEST=/fixture/source-proof-manifest.tsv \
 		--mount "type=bind,src=$fixture_dir,dst=/fixture,readonly" \
@@ -1280,7 +1482,7 @@ run_missing_history_experiment() {
 		--env CXP_TEAMS_DOCKER_RUNTIME_DIR=/runtime \
 		--env CXP_TEAMS_DOCKER_RUNTIME_REUSE=0 \
 		--env CXP_TEAMS_DOCKER_MISSING_HISTORY_RECOVERY=1 \
-		--env CXP_TEAMS_DOCKER_CODEX_SOURCE_PREFIX="${codex_home%/}/" \
+		--env CXP_TEAMS_DOCKER_CODEX_SOURCE_PREFIX="${codex_source_prefix%/}/" \
 		--env CXP_TEAMS_DOCKER_CODEX_MOUNTED=1 \
 		--env CXP_TEAMS_DOCKER_SOURCE_PROOF_MANIFEST=/fixture/source-proof-manifest.tsv \
 		--mount "type=bind,src=$fixture_dir,dst=/fixture,readonly" \
@@ -1319,7 +1521,7 @@ run_chat_coverage_experiment() {
 		--env CXP_TEAMS_DOCKER_STARTUP_DEADLINE="${CXP_TEAMS_DOCKER_STARTUP_DEADLINE:-}" \
 		--env CXP_TEAMS_DOCKER_REAL_DATA_429=0 \
 		--env CXP_TEAMS_DOCKER_REAL_DATA_POLL_INTERVAL="$poll_interval" \
-		--env CXP_TEAMS_DOCKER_CODEX_SOURCE_PREFIX="${codex_home%/}/" \
+		--env CXP_TEAMS_DOCKER_CODEX_SOURCE_PREFIX="${codex_source_prefix%/}/" \
 		--env CXP_TEAMS_DOCKER_CODEX_MOUNTED=1 \
 		--env CXP_TEAMS_DOCKER_SOURCE_PROOF_MANIFEST=/fixture/source-proof-manifest.tsv \
 		--mount "type=bind,src=$fixture_dir,dst=/fixture,readonly" \
@@ -1353,7 +1555,7 @@ if [[ "$run_chat_coverage" == "1" ]]; then
 fi
 if [[ "$run_all_lagging" == "1" ]]; then
 	echo "real-data Docker experiment: running exhaustive all-lagging-chat completion acceptance in an isolated runtime" >&2
-	run_experiment_process 0 0
+	run_experiment_process "$resume_experiment" "$runtime_reuse_initial"
 	all_lagging_status=$?
 	if [[ "$run_status" -eq 0 ]]; then
 		run_status=$all_lagging_status
@@ -1383,18 +1585,22 @@ if [[ "$run_throughput" == "1" && "$process_restart" == "1" ]]; then
 fi
 set -e
 
-run_source_manifest="$build_dir/source-core.after-run.sha256"
-write_source_core_manifest "$run_source_manifest"
-if [[ -n "$accepted_source_manifest" ]] && ! cmp -s "$accepted_source_manifest" "$run_source_manifest"; then
-	if [[ "$allow_source_drift" == "1" ]]; then
-		echo "WARNING: source inputs changed while the diagnostic experiment was running; only the disposable fixture was written, and this result is not point-in-time acceptance" >&2
-		source_drift_diagnostic=1
-	else
-		echo "ERROR: source inputs changed while the Docker acceptance experiment was running; refusing to report a point-in-time result" >&2
-		run_status=1
-	fi
+if [[ "$reused_fixture" == "1" ]]; then
+	echo "source integrity check: reused fixture was mounted read-only"
 else
-	echo "source integrity check: all manifest inputs unchanged"
+	run_source_manifest="$build_dir/source-core.after-run.sha256"
+	write_source_core_manifest "$run_source_manifest"
+	if [[ -n "$accepted_source_manifest" ]] && ! cmp -s "$accepted_source_manifest" "$run_source_manifest"; then
+		if [[ "$allow_source_drift" == "1" ]]; then
+			echo "WARNING: source inputs changed while the diagnostic experiment was running; only the disposable fixture was written, and this result is not point-in-time acceptance" >&2
+			source_drift_diagnostic=1
+		else
+			echo "ERROR: source inputs changed while the Docker acceptance experiment was running; refusing to report a point-in-time result" >&2
+			run_status=1
+		fi
+	else
+		echo "source integrity check: all manifest inputs unchanged"
+	fi
 fi
 
 # A drift-tolerant run is useful for diagnosis on a busy workstation, but it

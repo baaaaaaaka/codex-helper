@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -289,7 +290,7 @@ func TestTeamsOutboxDeferredCycleDoesNotRepeatFullSafetyProbe(t *testing.T) {
 		}
 	}
 backlogProbeDrained:
-	plan, err := bridge.optionalMaintenancePlanForOwnerWithOutbox(ctx, time.Now(), result.SuppressOptionalMaintenance)
+	plan, err := bridge.optionalMaintenancePlanForOwnerWithOutboxResult(ctx, time.Now(), result)
 	if err != nil {
 		t.Fatalf("suppressed optional-maintenance plan: %v", err)
 	}
@@ -300,6 +301,169 @@ backlogProbeDrained:
 	case <-backlogCalled:
 		t.Fatal("suppressed optional-maintenance plan repeated Teams backlog scan")
 	default:
+	}
+}
+
+func TestTeamsPersistentPollFrontierEventuallyGetsBacklogFairness(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			store := newBridgeTestStore(t)
+			now := time.Now().UTC()
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				if state.ChatPolls == nil {
+					state.ChatPolls = make(map[string]teamstore.ChatPollState)
+				}
+				state.ServiceControl.OptionalMaintenanceFairDueAt = now.Add(-time.Second)
+				state.ChatPolls["frontier-chat"] = teamstore.ChatPollState{
+					ChatID:           "frontier-chat",
+					Seeded:           true,
+					PollState:        "warm",
+					NextPollAt:       now.Add(-time.Second),
+					ContinuationPath: "/chats/frontier-chat/messages?$skiptoken=durable-frontier",
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed persistent poll frontier: %v", err)
+			}
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate persistent-frontier store: %v", err)
+				}
+			}
+
+			bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+
+			active, err := store.TeamsOperationalBacklogActive(ctx)
+			if err != nil {
+				t.Fatalf("read seeded operational backlog: %v", err)
+			}
+			if !active {
+				t.Fatal("seeded continuation frontier was not visible as operational backlog")
+			}
+			outboxResult, err := bridge.flushPendingOutboxMainLoopWithResult(ctx)
+			if err != nil {
+				t.Fatalf("run outbox phase with persistent frontier: %v", err)
+			}
+			if !outboxResult.SuppressOptionalMaintenance || outboxResult.PendingBlockingOutbox || !outboxResult.OperationalBacklogActive {
+				t.Fatalf("outbox result = %#v, want frontier suppression with the backlog reason and no blocking outbox", outboxResult)
+			}
+
+			plan, err := bridge.optionalMaintenancePlanForOwnerWithOutboxResult(ctx, now, outboxResult)
+			if err != nil {
+				t.Fatalf("plan optional maintenance after repeated frontier cycles: %v", err)
+			}
+			if !plan.backlogActive || !plan.runBacklogFair || plan.runNormal {
+				t.Fatalf("maintenance plan = %#v, want bounded backlog fairness without normal cold work", plan)
+			}
+		})
+	}
+	for _, useSQLite := range []bool{false, true} {
+		name := "outbox-only-json"
+		if useSQLite {
+			name = "outbox-only-sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			store := newBridgeTestStore(t)
+			now := time.Now().UTC()
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				state.ServiceControl.OptionalMaintenanceFairDueAt = now.Add(-time.Second)
+				return nil
+			}); err != nil {
+				t.Fatalf("seed overdue fair schedule: %v", err)
+			}
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate outbox-only store: %v", err)
+				}
+			}
+			bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+			plan, err := bridge.optionalMaintenancePlanForOwnerWithOutboxResult(ctx, now, mainLoopOutboxFlushResult{
+				SuppressOptionalMaintenance: true,
+				PendingBlockingOutbox:       true,
+			})
+			if err != nil {
+				t.Fatalf("plan maintenance for outbox-only suppression: %v", err)
+			}
+			if plan.runNormal || plan.runBacklogFair {
+				t.Fatalf("outbox-only maintenance plan = %#v, want fail-closed suppression", plan)
+			}
+		})
+	}
+}
+
+func TestTeamsOutboxFlushErrorDoesNotHideDurableBacklogFairness(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			store := newBridgeTestStore(t)
+			now := time.Now().UTC()
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				if state.ChatPolls == nil {
+					state.ChatPolls = make(map[string]teamstore.ChatPollState)
+				}
+				state.ServiceControl.OptionalMaintenanceFairDueAt = now.Add(-time.Second)
+				state.ChatPolls["error-frontier-chat"] = teamstore.ChatPollState{
+					ChatID: "error-frontier-chat", Seeded: true, PollState: "warm",
+					NextPollAt:       now.Add(-time.Second),
+					ContinuationPath: "/chats/error-frontier-chat/messages?$skiptoken=durable-frontier",
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed durable frontier: %v", err)
+			}
+			seedBridgeTestOutboxRows(t, ctx, store, teamstore.OutboxMessage{
+				ID: "outbox:fairness-error", TeamsChatID: "outbox-error-chat",
+				Kind: "helper", Body: "injected retryable failure", Sequence: 1,
+				CreatedAt: now.Add(-time.Minute),
+			})
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate error/frontier state: %v", err)
+				}
+			}
+
+			bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+			bridge.outboxSendHook = func(context.Context, teamstore.OutboxMessage) error {
+				return errors.New("injected retryable outbox failure")
+			}
+			var backlogProbes atomic.Int32
+			store.SetTimingObserver(func(event teamstore.StoreTimingEvent) {
+				if strings.Contains(event.Operation, "teamsOperationalBacklog") {
+					backlogProbes.Add(1)
+				}
+			})
+			result, flushErr := bridge.flushPendingOutboxMainLoopWithResult(ctx)
+			if flushErr == nil {
+				t.Fatal("outbox phase error = nil, want injected retryable error")
+			}
+			if !result.SuppressOptionalMaintenance || !result.OperationalBacklogActive {
+				t.Fatalf("outbox result = %#v, want fail-closed suppression with durable backlog evidence", result)
+			}
+			probesBeforePlanner := backlogProbes.Load()
+			if probesBeforePlanner == 0 {
+				t.Fatal("outbox error path did not capture the durable backlog snapshot")
+			}
+			plan, err := bridge.optionalMaintenancePlanForOwnerWithOutboxResult(ctx, now, result)
+			if err != nil {
+				t.Fatalf("plan optional backlog maintenance after outbox error: %v", err)
+			}
+			if !plan.backlogActive || !plan.runBacklogFair || plan.runNormal {
+				t.Fatalf("maintenance plan = %#v, want bounded backlog fairness without normal cold work", plan)
+			}
+			if got := backlogProbes.Load(); got != probesBeforePlanner {
+				t.Fatalf("maintenance gate repeated the durable backlog probe: before=%d after=%d", probesBeforePlanner, got)
+			}
+		})
 	}
 }
 

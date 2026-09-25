@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1300,6 +1301,48 @@ func TestTeamsModelProfileResolverRejectsUnavailableOfficialSlugWhenCatalogIsHea
 	_, err = newTeamsModelProfileResolver(&rootOptions{configPath: store.Path()}, "/test/codex")(context.Background(), "gpt-typo")
 	if err == nil || !strings.Contains(err.Error(), "not available") {
 		t.Fatalf("unavailable official model error = %v", err)
+	}
+}
+
+func TestTeamsModelProfileResolverDoesNotEchoVerifierCredentialDiagnostics(t *testing.T) {
+	previousVerify := verifyConfiguredModelAuthenticationFn
+	t.Cleanup(func() { verifyConfiguredModelAuthenticationFn = previousVerify })
+	const apiKey = "sk-runner-verification-secret-0123456789abcdef0123456789"
+	encodedKey := base64.StdEncoding.EncodeToString([]byte(apiKey))
+	verifyConfiguredModelAuthenticationFn = func(context.Context, modelprofile.Resolved, string) error {
+		return fmt.Errorf("provider response echoed encoded credential %s", encodedKey)
+	}
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	store, err := config.NewStore(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Save(config.Config{
+		Version:            config.CurrentVersion,
+		ModelConfigVersion: 1,
+		ModelCredentials:   map[string]config.ModelCredential{"hub": {APIKeyRef: "env:TEST_RUNNER_PROFILE_KEY"}},
+		ModelProviders:     map[string]config.ModelProvider{"hub": {Protocol: "chat-completions", BaseURL: "https://example.invalid/v1", Credential: "hub"}},
+		Models:             map[string]config.ModelDefinition{"m": {Provider: "hub", UpstreamModel: "vendor/m"}},
+		ModelProfiles:      map[string]config.ModelProfile{"p": {Model: "m", Source: "source", Revision: 1}},
+		ModelSources:       map[string]config.ModelSource{"source": {URL: "https://example.invalid/repo.git", Revision: "one", Profiles: []string{"p"}, Credentials: []string{"hub"}, Providers: []string{"hub"}, Models: []string{"m"}}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TEST_RUNNER_PROFILE_KEY", apiKey)
+	_, err = newTeamsModelProfileResolver(&rootOptions{configPath: configPath}, "/test/codex")(context.Background(), "p")
+	if err == nil || err.Error() != errTeamsModelProfileAuthenticationVerification.Error() {
+		t.Fatalf("resolver error = %v, want fixed verification diagnostic", err)
+	}
+	if strings.Contains(err.Error(), apiKey) || strings.Contains(err.Error(), encodedKey) {
+		t.Fatalf("resolver exposed verifier credential material: %v", err)
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := cfg.ModelProfiles["p"]
+	if profile.VerificationFingerprint != "" || profile.VerificationError != teamsModelProfileVerificationDiagnostic {
+		t.Fatalf("failed source profile verification state = %#v", profile)
 	}
 }
 

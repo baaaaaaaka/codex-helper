@@ -10485,6 +10485,85 @@ func (s *Store) InboundRecoveryCandidatesWithLimit(ctx context.Context, limit in
 	return s.inboundRecoveryCandidatesWithLimit(ctx, limit)
 }
 
+// LegacyManualHoldControlCredentialPage is one bounded page of old generic
+// control-poll manual holds. ScannedThroughID and HasMore describe the raw
+// search page before callers apply the authoritative credential classifier;
+// filtered decoys must not make a later page look complete.
+type LegacyManualHoldControlCredentialPage struct {
+	Candidates       []InboundEvent
+	ScannedThroughID string
+	HasMore          bool
+}
+
+// LegacyManualHoldControlCredentialCandidates returns a bounded page of old
+// generic control-poll manual holds whose durable payload contains a
+// credential-shaped search marker. It exists only to scrub rows written by
+// older versions; callers must still apply the authoritative credential
+// classifier before changing a row. afterID is an in-memory paging cursor, not
+// a durable frontier, because this scan has no replay side effects.
+func (s *Store) LegacyManualHoldControlCredentialCandidates(ctx context.Context, afterID string, limit int) (LegacyManualHoldControlCredentialPage, error) {
+	if limit <= 0 {
+		limit = 64
+	}
+	if limit > 1024 {
+		limit = 1024
+	}
+	if out, handled, err := s.legacyManualHoldControlPollCredentialCandidatesSQLite(ctx, afterID, limit); handled || err != nil {
+		return out, err
+	}
+	state, err := s.loadStateFieldsOrFull(ctx, deferredInboundStateFields)
+	if err != nil {
+		return LegacyManualHoldControlCredentialPage{}, err
+	}
+	ids := make([]string, 0)
+	for id, event := range state.InboundEvents {
+		id = strings.TrimSpace(id)
+		if id == "" || id <= strings.TrimSpace(afterID) {
+			continue
+		}
+		if strings.TrimSpace(event.ID) != id {
+			return LegacyManualHoldControlCredentialPage{}, fmt.Errorf("legacy control credential scan row %q does not match its durable identity", id)
+		}
+		if event.Status != InboundStatusManualHold || strings.TrimSpace(event.Source) != "teams_control_poll_deferred" ||
+			!legacyControlCredentialSearchHint(inboundCredentialSearchText(event)) {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	page := LegacyManualHoldControlCredentialPage{HasMore: len(ids) > limit}
+	if page.HasMore {
+		ids = ids[:limit]
+	}
+	page.Candidates = make([]InboundEvent, 0, len(ids))
+	for _, id := range ids {
+		page.Candidates = append(page.Candidates, state.InboundEvents[id])
+		page.ScannedThroughID = id
+	}
+	return page, nil
+}
+
+func inboundCredentialSearchText(event InboundEvent) string {
+	parts := []string{
+		event.Text, event.TeamsBodyHTML, event.LastError, event.OperationKey, event.OperationAttemptToken,
+		event.HoldReason, event.HoldRequiredEvidence, event.HoldNextAction, event.HoldWakeCondition,
+	}
+	for _, attachment := range event.TeamsAttachments {
+		parts = append(parts, attachment.ID, attachment.ContentType, attachment.ContentURL, attachment.Content, attachment.Name)
+	}
+	return strings.Join(parts, " ")
+}
+
+func legacyControlCredentialSearchHint(text string) bool {
+	lower := strings.ToLower(text)
+	for _, needle := range []string{"sk-", "sk_", "api-key", "api_key", "apikey", "authorization", "bearer", "model"} {
+		if strings.Contains(lower, needle) {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Store) inboundRecoveryCandidatesWithLimit(ctx context.Context, limit int) ([]InboundEvent, error) {
 	if out, handled, err := s.inboundRecoveryCandidatesSQLite(ctx, limit); handled || err != nil {
 		return out, err
@@ -13770,20 +13849,22 @@ func persistInterruptedTurnWithAnchorLocked(state *State, current Turn, req Pers
 		return current, ErrStaleExecutionCallback
 	}
 	preserveExistingLiveBranchAnchor := false
+	invalidateExistingLiveBranch := false
 	if active := importCheckpointHasUnresolvedExecution(checkpoint); active && checkpoint.UnresolvedExecution != nil {
 		if outer := strings.TrimSpace(checkpoint.UnresolvedExecution.OuterTurnID); outer != "" && outer != req.TurnID {
-			// A different unresolved owner is already the session fence. The one
-			// startup-recovery exception is a Running turn that belongs to the
-			// durable isolated live branch recorded by that anchor. It is a
-			// separate outer turn on the same explicitly admitted thread: the new
-			// owner may interrupt that stale execution, but must preserve the old
-			// anchor rather than rebasing or merging its identity.
+			// A different unresolved owner is already the session fence. A Running
+			// turn on its exact durable live branch can be interrupted without
+			// rebasing or merging the historical anchor. Startup takeover preserves
+			// the established branch admission for compatibility; a current-owner
+			// ambiguity revokes it so later work cannot reuse a thread whose latest
+			// execution did not pass its ownership CAS.
 			liveBranchThread := strings.TrimSpace(checkpoint.UnresolvedExecution.LiveBranchThreadID)
-			currentThread := strings.TrimSpace(firstStoreNonEmptyString(req.CodexThreadID, current.CodexThreadID))
-			if !req.AllowTakeover || current.Status != TurnStatusRunning || liveBranchThread == "" || currentThread == "" || currentThread != liveBranchThread {
+			currentThread := strings.TrimSpace(current.CodexThreadID)
+			if current.Status != TurnStatusRunning || liveBranchThread == "" || currentThread == "" || currentThread != liveBranchThread {
 				return current, ErrUnresolvedExecution
 			}
 			preserveExistingLiveBranchAnchor = true
+			invalidateExistingLiveBranch = !req.AllowTakeover
 		}
 		if !preserveExistingLiveBranchAnchor {
 			// Never merge a callback identity into an existing anchor when the
@@ -13819,9 +13900,14 @@ func persistInterruptedTurnWithAnchorLocked(state *State, current Turn, req Pers
 		if preserveExistingLiveBranchAnchor {
 			// Keep every field of the historical unresolved owner intact. In
 			// particular, do not replace OuterTurnID, CodexTurnID, source proof,
-			// or generation with the stale branch turn being interrupted.
+			// or generation with the branch turn being interrupted. A normal
+			// current-owner ambiguity also revokes the live branch below.
 		} else if strings.TrimSpace(anchor.State) == "" {
 			anchor.State = "unresolved"
+			anchorChanged = true
+		}
+		if invalidateExistingLiveBranch && strings.TrimSpace(anchor.LiveBranchThreadID) != "" {
+			anchor.LiveBranchThreadID = ""
 			anchorChanged = true
 		}
 		if !preserveExistingLiveBranchAnchor && anchor.Generation <= 0 {

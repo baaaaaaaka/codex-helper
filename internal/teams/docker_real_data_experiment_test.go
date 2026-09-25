@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -32,46 +33,51 @@ import (
 )
 
 const (
-	dockerRealDataExperimentEnv        = "CXP_TEAMS_DOCKER_REAL_DATA_EXPERIMENT"
-	dockerRealDataModeEnv              = "CXP_TEAMS_DOCKER_REAL_DATA_MODE"
-	dockerRealDataChatCoverageEnv      = "CXP_TEAMS_DOCKER_REAL_DATA_CHAT_COVERAGE"
-	dockerRealDataRequireAllLaggingEnv = "CXP_TEAMS_DOCKER_REAL_DATA_REQUIRE_ALL_LAGGING"
-	dockerRealDataDurationEnv          = "CXP_TEAMS_DOCKER_REAL_DATA_DURATION"
-	dockerRealDataResumeEnv            = "CXP_TEAMS_DOCKER_REAL_DATA_RESUME"
-	dockerRealDataProcessRestartEnv    = "CXP_TEAMS_DOCKER_PROCESS_RESTART"
-	dockerRealData429ExperimentEnv     = "CXP_TEAMS_DOCKER_REAL_DATA_429"
-	dockerRealData429ScopeEnv          = "CXP_TEAMS_DOCKER_REAL_DATA_429_SCOPE"
-	dockerRealData429PollOnlyEnv       = "CXP_TEAMS_DOCKER_REAL_DATA_429_POLL_ONLY"
-	dockerRealDataPollIntervalEnv      = "CXP_TEAMS_DOCKER_REAL_DATA_POLL_INTERVAL"
-	dockerRealDataStartupDeadlineEnv   = "CXP_TEAMS_DOCKER_STARTUP_DEADLINE"
-	dockerRealDataPageSize             = 20
-	dockerRealDataMessageIDPrefix      = "docker-real-data:"
-	dockerRealDataDefaultDuration      = 5 * time.Minute
-	dockerRealDataMinimumDuration      = time.Minute
-	dockerRealData429DefaultDuration   = 12 * time.Second
-	dockerRealData429MinimumDuration   = 2 * time.Second
-	dockerRealData429DefaultInterval   = 100 * time.Millisecond
-	dockerRealData429MinimumInterval   = 10 * time.Millisecond
-	dockerRealData429Failures          = 4
-	dockerRealData429Chats             = 1
-	dockerRealData429HealthyChats      = 1
-	dockerRealData429ScopeChat         = "chat"
-	dockerRealData429ScopeAccount      = "account"
-	dockerRealData429ScopeGlobal       = "global"
-	dockerRealDataDefaultTop           = ownerPollMessageTop
-	dockerRealDataMinimumReplay        = 100
-	dockerRealDataModeThroughput       = "throughput"
-	dockerRealDataModeComplete         = "complete"
-	dockerRealDataExecutionPrefix      = "docker real-data execution result #"
-	dockerRealDataAnyExecutionMarker   = "__docker_real_data_any_execution_result__"
-	dockerRealDataGraphOpMessageList   = "message-list-get"
-	dockerRealDataGraphOpMessageItem   = "message-item-get"
-	dockerRealDataGraphOpMembers       = "members-get"
-	dockerRealDataGraphOpMe            = "me-get"
-	dockerRealDataGraphOpMessagePost   = "message-post"
-	dockerRealDataGraphOpMarkUnread    = "mark-unread-post"
-	dockerRealDataGraphOpMeetingPost   = "meeting-post"
-	dockerRealDataGraphOpPatch         = "chat-patch"
+	dockerRealDataExperimentEnv            = "CXP_TEAMS_DOCKER_REAL_DATA_EXPERIMENT"
+	dockerRealDataModeEnv                  = "CXP_TEAMS_DOCKER_REAL_DATA_MODE"
+	dockerRealDataChatCoverageEnv          = "CXP_TEAMS_DOCKER_REAL_DATA_CHAT_COVERAGE"
+	dockerRealDataRequireAllLaggingEnv     = "CXP_TEAMS_DOCKER_REAL_DATA_REQUIRE_ALL_LAGGING"
+	dockerRealDataDurationEnv              = "CXP_TEAMS_DOCKER_REAL_DATA_DURATION"
+	dockerRealDataResumeEnv                = "CXP_TEAMS_DOCKER_REAL_DATA_RESUME"
+	dockerRealDataProcessRestartEnv        = "CXP_TEAMS_DOCKER_PROCESS_RESTART"
+	dockerRealData429ExperimentEnv         = "CXP_TEAMS_DOCKER_REAL_DATA_429"
+	dockerRealData429ScopeEnv              = "CXP_TEAMS_DOCKER_REAL_DATA_429_SCOPE"
+	dockerRealData429PollOnlyEnv           = "CXP_TEAMS_DOCKER_REAL_DATA_429_POLL_ONLY"
+	dockerRealDataPollIntervalEnv          = "CXP_TEAMS_DOCKER_REAL_DATA_POLL_INTERVAL"
+	dockerRealDataStartupDeadlineEnv       = "CXP_TEAMS_DOCKER_STARTUP_DEADLINE"
+	dockerRealDataPageSize                 = 20
+	dockerRealDataMaxTrackedPollMessageIDs = 10000
+	dockerRealDataMessageIDPrefix          = "docker-real-data:"
+	dockerRealDataDefaultDuration          = 5 * time.Minute
+	dockerRealDataMinimumDuration          = time.Minute
+	dockerRealData429DefaultDuration       = 12 * time.Second
+	dockerRealData429MinimumDuration       = 2 * time.Second
+	dockerRealData429DefaultInterval       = 100 * time.Millisecond
+	dockerRealData429MinimumInterval       = 10 * time.Millisecond
+	dockerRealData429Failures              = 4
+	dockerRealData429Chats                 = 1
+	dockerRealData429HealthyChats          = 1
+	dockerRealData429ScopeChat             = "chat"
+	dockerRealData429ScopeAccount          = "account"
+	dockerRealData429ScopeGlobal           = "global"
+	dockerRealDataDefaultTop               = ownerPollMessageTop
+	dockerRealDataMinimumReplay            = 100
+	dockerRealDataModeThroughput           = "throughput"
+	dockerRealDataModeComplete             = "complete"
+	dockerRealDataCompleteDrainTimeout     = 5 * time.Minute
+	dockerRealDataLivenessPollInterval     = 10 * time.Second
+	dockerRealDataLivenessStallAfter       = 3 * time.Minute
+	dockerRealDataOrphanTurnStallAfter     = 2 * time.Minute
+	dockerRealDataExecutionPrefix          = "docker real-data execution result #"
+	dockerRealDataAnyExecutionMarker       = "__docker_real_data_any_execution_result__"
+	dockerRealDataGraphOpMessageList       = "message-list-get"
+	dockerRealDataGraphOpMessageItem       = "message-item-get"
+	dockerRealDataGraphOpMembers           = "members-get"
+	dockerRealDataGraphOpMe                = "me-get"
+	dockerRealDataGraphOpMessagePost       = "message-post"
+	dockerRealDataGraphOpMarkUnread        = "mark-unread-post"
+	dockerRealDataGraphOpMeetingPost       = "meeting-post"
+	dockerRealDataGraphOpPatch             = "chat-patch"
 )
 
 func dockerRealDataProductionPhaseNames() []string {
@@ -112,6 +118,23 @@ type dockerRealDataExecutor struct {
 	first     time.Time
 }
 
+func dockerRealDataExecutorThreadID(session *Session, runID int64) string {
+	if session != nil {
+		if threadID := strings.TrimSpace(session.CodexThreadID); threadID != "" {
+			return threadID
+		}
+	}
+	sessionID := "anonymous"
+	if session != nil && strings.TrimSpace(session.ID) != "" {
+		sessionID = strings.TrimSpace(session.ID)
+	}
+	// A new Codex thread is scoped to one Teams session. Returning one shared
+	// sentinel for every StartNewCodexThread turn makes unrelated sessions
+	// appear to share a Codex transcript and can fabricate thread-resolution
+	// conflicts that real Codex would never produce.
+	return fmt.Sprintf("docker-real-data-thread-%s-%d", shortStableID(sessionID), runID)
+}
+
 func (e *dockerRealDataExecutor) Run(ctx context.Context, session *Session, _ string) (ExecutionResult, error) {
 	if ctx != nil {
 		select {
@@ -141,16 +164,35 @@ func (e *dockerRealDataExecutor) Run(ctx context.Context, session *Session, _ st
 		case <-timer.C:
 		}
 	}
-	threadID := "docker-real-data-thread"
-	if session != nil && strings.TrimSpace(session.CodexThreadID) != "" {
-		threadID = session.CodexThreadID
-	}
+	threadID := dockerRealDataExecutorThreadID(session, n)
 	return ExecutionResult{
 		Text:                     fmt.Sprintf("%s%d", dockerRealDataExecutionPrefix, n),
 		CodexThreadID:            threadID,
 		CodexTurnID:              fmt.Sprintf("docker-real-data-turn-%d", n),
 		canonicalTranscriptFinal: true,
 	}, nil
+}
+
+func TestDockerRealDataExecutorThreadIDsAreSessionScoped(t *testing.T) {
+	executor := &dockerRealDataExecutor{}
+	first, err := executor.Run(context.Background(), &Session{ID: "session-a"}, "")
+	if err != nil {
+		t.Fatalf("run first synthetic session: %v", err)
+	}
+	second, err := executor.Run(context.Background(), &Session{ID: "session-b"}, "")
+	if err != nil {
+		t.Fatalf("run second synthetic session: %v", err)
+	}
+	if first.CodexThreadID == "" || second.CodexThreadID == "" || first.CodexThreadID == second.CodexThreadID {
+		t.Fatalf("synthetic new-thread IDs must be non-empty and session-unique: first=%q second=%q", first.CodexThreadID, second.CodexThreadID)
+	}
+	existing, err := executor.Run(context.Background(), &Session{ID: "session-a", CodexThreadID: "existing-codex-thread"}, "")
+	if err != nil {
+		t.Fatalf("run existing synthetic thread: %v", err)
+	}
+	if existing.CodexThreadID != "existing-codex-thread" {
+		t.Fatalf("synthetic executor replaced an existing Codex thread: got=%q", existing.CodexThreadID)
+	}
 }
 
 func (e *dockerRealDataExecutor) requestGracefulStop() {
@@ -208,6 +250,13 @@ type dockerRealDataReplayReport struct {
 	ExcludedAttachments     int
 	ExcludedHostedContent   int
 	ExcludedUnsupported     int
+	ReplayMissingSourceTime int
+	ReplaySourceSpan        time.Duration
+	ReplayLead              time.Duration
+	ReplaySpan              time.Duration
+	ReplayEndGuard          time.Duration
+	ReplayStart             time.Time
+	ReplayEnd               time.Time
 }
 
 // dockerRealDataLaggingChatManifest is the inventory boundary for the
@@ -728,9 +777,18 @@ func dockerRealDataTurnInboundIDSQL(alias string) string {
 // selection remain from the real snapshot. Every exclusion is counted in the
 // report; an acceptance run fails for an active row that this ordinary-message
 // lane cannot safely model instead of silently turning a partial corpus into a
-// false-green result.
-func dockerRealDataReplayCorpus(state teamstore.State, controlChatID string) (map[string][]ChatMessage, int, dockerRealDataReplayReport) {
+// false-green result. Source timestamp order and intervals are preserved under
+// one affine mapping into the bounded replay window; a multi-month source
+// backlog must not collapse into a few milliseconds and manufacture a global
+// overlap storm.
+func dockerRealDataReplayCorpus(state teamstore.State, controlChatID string, now time.Time, window time.Duration) (map[string][]ChatMessage, int, dockerRealDataReplayReport) {
 	var report dockerRealDataReplayReport
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	if window < 0 {
+		window = 0
+	}
 	activeChats := make(map[string]struct{}, len(state.Sessions))
 	for _, session := range state.Sessions {
 		chatID := strings.TrimSpace(session.TeamsChatID)
@@ -828,18 +886,77 @@ func dockerRealDataReplayCorpus(state teamstore.State, controlChatID string) (ma
 		if at.IsZero() {
 			at = inbound.CreatedAt
 		}
+		if at.IsZero() {
+			report.ReplayMissingSourceTime++
+		}
 		byChat[chatID] = append(byChat[chatID], replaySource{chatID: chatID, id: inbound.ID, msg: msg, at: at})
 		report.Accepted++
 	}
 
-	// The copied store can spend seconds (or, on a large historical fixture,
-	// minutes) preparing its first durable cycle.  A two-second lead is not a
-	// stable freshness boundary: by the time the listener builds its first
-	// Graph filter, the synthetic page may already be behind the copied cursor
-	// or the current-time lower bound and the experiment would measure an empty
-	// page instead of the real admission path.  Keep the replay timestamps
-	// comfortably ahead of startup while retaining their source order.
-	base := time.Now().UTC().Add(10 * time.Minute)
+	var sourceStart, sourceEnd time.Time
+	var maxCursor time.Time
+	for chatID, sources := range byChat {
+		for _, source := range sources {
+			if source.at.IsZero() {
+				continue
+			}
+			if sourceStart.IsZero() || source.at.Before(sourceStart) {
+				sourceStart = source.at
+			}
+			if sourceEnd.IsZero() || source.at.After(sourceEnd) {
+				sourceEnd = source.at
+			}
+		}
+		if poll, found := state.ChatPolls[chatID]; found {
+			frontiers := []time.Time{poll.LastModifiedCursor, poll.ContinuationSafeCursor}
+			if poll.Gap != nil {
+				frontiers = append(frontiers, poll.Gap.SafeCursor, poll.Gap.RecoveryCursor)
+			}
+			for _, frontier := range frontiers {
+				if frontier.After(maxCursor) {
+					maxCursor = frontier
+				}
+			}
+		}
+	}
+	if !sourceStart.IsZero() && sourceEnd.After(sourceStart) {
+		report.ReplaySourceSpan = sourceEnd.Sub(sourceStart)
+	}
+	report.ReplayEndGuard = window / 20
+	if report.ReplayEndGuard > 30*time.Second {
+		report.ReplayEndGuard = 30 * time.Second
+	}
+	if report.ReplayEndGuard < 100*time.Millisecond && window > 0 {
+		report.ReplayEndGuard = 100 * time.Millisecond
+	}
+	lead := window / 10
+	if lead > 10*time.Minute {
+		lead = 10 * time.Minute
+	}
+	if lead < time.Second && window > 0 {
+		lead = time.Second
+	}
+	if lead+report.ReplayEndGuard >= window && window > 0 {
+		lead = window / 4
+		report.ReplayEndGuard = window / 10
+	}
+	base := now.UTC().Add(lead)
+	// Start after every included chat's copied cursor plus the production
+	// overlap. A cursor far enough in the future is surfaced in ReplayLead so a
+	// complete-mode caller can reject a window that cannot possibly observe the
+	// corpus instead of silently measuring empty polls.
+	if !maxCursor.IsZero() {
+		cursorSafeStart := maxCursor.Add(pollCursorOverlap + time.Minute)
+		if cursorSafeStart.After(base) {
+			base = cursorSafeStart
+		}
+	}
+	report.ReplayLead = base.Sub(now.UTC())
+	if window > report.ReplayLead+report.ReplayEndGuard {
+		report.ReplaySpan = window - report.ReplayLead - report.ReplayEndGuard
+	}
+	report.ReplayStart = base
+	report.ReplayEnd = base.Add(report.ReplaySpan)
 	corpus := make(map[string][]ChatMessage, len(byChat))
 	total := 0
 	for chatID, sources := range byChat {
@@ -850,11 +967,23 @@ func dockerRealDataReplayCorpus(state teamstore.State, controlChatID string) (ma
 			return sources[i].id < sources[j].id
 		})
 		messages := make([]ChatMessage, 0, len(sources))
-		for index, source := range sources {
-			// Keep the real message order while placing the replay after the
-			// copied poll cursor, so the production cursor reducer sees it as a
-			// fresh Graph backlog rather than as a duplicate historical page.
-			at := base.Add(time.Duration(total+index) * time.Millisecond)
+		for _, source := range sources {
+			at := base
+			if !source.at.IsZero() && !sourceStart.IsZero() && report.ReplaySourceSpan > 0 && report.ReplaySpan > 0 {
+				offset := source.at.Sub(sourceStart)
+				if offset < 0 {
+					offset = 0
+				} else if offset > report.ReplaySourceSpan {
+					offset = report.ReplaySourceSpan
+				}
+				mappedOffset := time.Duration(0)
+				if offset == report.ReplaySourceSpan {
+					mappedOffset = report.ReplaySpan
+				} else if offset > 0 {
+					mappedOffset = time.Duration(float64(offset) * float64(report.ReplaySpan) / float64(report.ReplaySourceSpan))
+				}
+				at = base.Add(mappedOffset)
+			}
 			source.msg.ID = fmt.Sprintf("%sreal:%s", dockerRealDataMessageIDPrefix, shortStableID(source.id))
 			source.msg.CreatedDateTime = at.Format(time.RFC3339Nano)
 			source.msg.LastModifiedDateTime = at.Format(time.RFC3339Nano)
@@ -864,6 +993,19 @@ func dockerRealDataReplayCorpus(state teamstore.State, controlChatID string) (ma
 		total += len(messages)
 	}
 	return corpus, total, report
+}
+
+func dockerRealDataReplayTimelineError(report dockerRealDataReplayReport, window time.Duration) error {
+	if report.ReplaySourceSpan > 0 && report.ReplaySpan <= 0 {
+		return fmt.Errorf("nonzero source span %s has no positive replay span", report.ReplaySourceSpan)
+	}
+	if report.ReplayEndGuard < 0 || window < report.ReplayEndGuard {
+		return fmt.Errorf("invalid replay end guard %s for window %s", report.ReplayEndGuard, window)
+	}
+	if report.ReplayLead+report.ReplaySpan > window-report.ReplayEndGuard {
+		return fmt.Errorf("replay lead %s plus span %s exceeds window %s minus guard %s", report.ReplayLead, report.ReplaySpan, window, report.ReplayEndGuard)
+	}
+	return nil
 }
 
 // dockerRealDataOneMessagePerChat is an opt-in coverage corpus for a copied
@@ -925,6 +1067,318 @@ func TestDockerRealDataNewPollRecoveryChatsIgnoresInheritedRecovery(t *testing.T
 	}
 }
 
+func TestDockerRealDataPollRecoveryResidualsCompareIdentityAndActiveFrontiers(t *testing.T) {
+	opened := time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC)
+	safe := opened.Add(-24 * time.Hour)
+	corpus := map[string][]ChatMessage{
+		"inherited-gap":          {{ID: "inherited-message"}},
+		"inherited-continuation": {{ID: "inherited-continuation-message"}},
+		"inherited-pending":      {{ID: "inherited-pending-message"}},
+		"changed-gap-cursor":     {{ID: "changed-gap-cursor-message"}},
+		"changed-continuation":   {{ID: "changed-continuation-message"}},
+		"changed-pending":        {{ID: "changed-pending-message"}},
+		"clean":                  {{ID: "new-message"}},
+	}
+	pendingPage := func(refetchFailures int) *teamstore.ChatPollPendingPage {
+		return &teamstore.ChatPollPendingPage{
+			ReceiptID: "stable-receipt", Records: []json.RawMessage{json.RawMessage(`{"id":"pending-message"}`)},
+			RecordIDs: []string{"pending-message"}, RecordHashes: []string{"stable-hash"},
+			RefetchFailures: []int{refetchFailures},
+		}
+	}
+	before := teamstore.State{ChatPolls: map[string]teamstore.ChatPollState{
+		"inherited-gap": {
+			ChatID: "inherited-gap",
+			Gap: &teamstore.ChatPollGap{
+				Epoch: 2, Kind: "unverified-continuation", Reason: "HTTP 429", Evidence: "bounded-evidence",
+				FrontierPath: "/opaque/frontier", SafeCursor: safe, RecoveryCursor: opened, OpenedAt: opened,
+				HeadProbePending: true,
+			},
+		},
+		"inherited-continuation": {ChatID: "inherited-continuation", ContinuationPath: "/opaque/persisted-token"},
+		"inherited-pending":      {ChatID: "inherited-pending", PendingPage: pendingPage(0)},
+		"changed-gap-cursor": {
+			ChatID: "changed-gap-cursor",
+			Gap:    &teamstore.ChatPollGap{Epoch: 4, Kind: "unverified-continuation", OpenedAt: opened, RecoveryCursor: opened},
+		},
+		"changed-continuation": {ChatID: "changed-continuation", ContinuationPath: "/opaque/old-token"},
+		"changed-pending":      {ChatID: "changed-pending", PendingPage: pendingPage(0)},
+		"clean":                {ChatID: "clean"},
+	}}
+	after := teamstore.State{ChatPolls: map[string]teamstore.ChatPollState{
+		"inherited-gap": {
+			ChatID: "inherited-gap",
+			Gap: &teamstore.ChatPollGap{
+				Epoch: 2, Kind: "unverified-continuation", Reason: "HTTP 429", Evidence: "bounded-evidence",
+				FrontierPath: "/opaque/frontier", SafeCursor: safe, RecoveryCursor: safe.Add(time.Hour), OpenedAt: opened,
+				HeadProbePending: false,
+			},
+			ContinuationPath: "/opaque/new-page",
+		},
+		"inherited-continuation": {ChatID: "inherited-continuation", ContinuationPath: "/opaque/persisted-token"},
+		"inherited-pending":      {ChatID: "inherited-pending", PendingPage: pendingPage(0)},
+		"changed-gap-cursor": {
+			ChatID: "changed-gap-cursor",
+			Gap:    &teamstore.ChatPollGap{Epoch: 4, Kind: "unverified-continuation", OpenedAt: opened, RecoveryCursor: opened.Add(-time.Hour)},
+		},
+		"changed-continuation": {ChatID: "changed-continuation", ContinuationPath: "/opaque/new-token"},
+		"changed-pending":      {ChatID: "changed-pending", PendingPage: pendingPage(1)},
+		"clean":                {ChatID: "clean", Gap: &teamstore.ChatPollGap{Epoch: 1, Kind: "new-gap", OpenedAt: opened}},
+	}}
+	got := dockerRealDataPollRecoveryResiduals(before, after, corpus)
+	want := []string{"changed-continuation:continuation", "changed-gap-cursor:gap-recovery-cursor", "changed-pending:pending-page-refetch-failure", "clean:gap-identity-changed,gap-recovery-pending", "inherited-gap:continuation,gap-recovery-cursor,gap-recovery-pending"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("active durable poll recovery residuals = %v, want %v", got, want)
+	}
+}
+
+func TestDockerRealDataCompleteDrainReadyRequiresTerminalWorkAndNoNewPollRecovery(t *testing.T) {
+	const chatID = "chat"
+	const messageID = dockerRealDataMessageIDPrefix + "one"
+	corpus := map[string][]ChatMessage{chatID: {{ID: messageID}}}
+	counts := dockerRealDataCounts{inbound: 1, completed: 1}
+	const inboundID = "in-one"
+	const turnID = "turn-one"
+	clean := teamstore.State{
+		InboundEvents: map[string]teamstore.InboundEvent{
+			inboundID: {ID: inboundID, TeamsChatID: chatID, TeamsMessageID: messageID, TurnID: turnID, Status: teamstore.InboundStatusQueued},
+		},
+		Turns: map[string]teamstore.Turn{
+			turnID: {ID: turnID, InboundEventID: inboundID, Status: teamstore.TurnStatusCompleted},
+		},
+		ChatPolls: map[string]teamstore.ChatPollState{
+			chatID: {ChatID: chatID, Seeded: true},
+		},
+	}
+	baseline := teamstore.State{ChatPolls: map[string]teamstore.ChatPollState{
+		chatID: {ChatID: chatID, Seeded: true},
+	}}
+	inheritedGapOpenedAt := time.Now().UTC()
+	served := map[string]int{messageID: 1}
+	if !dockerRealDataCompleteDrainReady(1, counts, served, baseline, clean, corpus, 0, 0) {
+		t.Fatal("fully served, terminal, frontier-free corpus was not drain-ready")
+	}
+	credentialIgnored := teamstore.State{
+		InboundEvents: map[string]teamstore.InboundEvent{
+			inboundID: {ID: inboundID, TeamsChatID: chatID, TeamsMessageID: messageID, Status: teamstore.InboundStatusIgnored, Source: rejectedModelAPIKeyInboundSource, Text: rejectedModelAPIKeyInboundText, TeamsBodyType: "text"},
+		},
+		ChatPolls: clean.ChatPolls,
+	}
+	if !dockerRealDataCompleteDrainReady(1, dockerRealDataCounts{inbound: 1}, served, baseline, credentialIgnored, corpus, 0, 0) {
+		t.Fatal("explicitly redacted credential disposition was not accepted as terminal")
+	}
+	helperInterrupted := teamstore.State{
+		InboundEvents: map[string]teamstore.InboundEvent{
+			inboundID: {ID: inboundID, TeamsChatID: chatID, TeamsMessageID: messageID, TurnID: turnID, Status: teamstore.InboundStatusIgnored, Text: "Codex: helper echo"},
+		},
+		Turns: map[string]teamstore.Turn{
+			turnID: {ID: turnID, InboundEventID: inboundID, Status: teamstore.TurnStatusInterrupted, RecoveryReason: "original message text was unavailable"},
+		},
+		ChatPolls: clean.ChatPolls,
+	}
+	if !dockerRealDataCompleteDrainReady(1, dockerRealDataCounts{inbound: 1, interrupted: 1}, served, baseline, helperInterrupted, corpus, 0, 0) {
+		t.Fatal("explicit terminal helper interruption was not accepted as terminal")
+	}
+
+	tests := []struct {
+		name          string
+		counts        dockerRealDataCounts
+		served        map[string]int
+		before        teamstore.State
+		state         teamstore.State
+		pendingOutbox int64
+		unknownGraph  int
+		wantReady     bool
+	}{
+		{name: "inbound row missing despite matching SQL count", counts: counts, served: served, before: baseline, state: teamstore.State{ChatPolls: clean.ChatPolls}},
+		{name: "turn row missing despite matching SQL count", counts: counts, served: served, before: baseline, state: teamstore.State{InboundEvents: clean.InboundEvents, ChatPolls: clean.ChatPolls}},
+		{name: "turn identity does not point back to inbound", counts: counts, served: served, before: baseline, state: teamstore.State{InboundEvents: clean.InboundEvents, Turns: map[string]teamstore.Turn{turnID: {ID: turnID, InboundEventID: "wrong-inbound", Status: teamstore.TurnStatusCompleted}}, ChatPolls: clean.ChatPolls}},
+		{name: "durable chat mismatch", counts: counts, served: served, before: baseline, state: teamstore.State{InboundEvents: map[string]teamstore.InboundEvent{inboundID: {ID: inboundID, TeamsChatID: "other-chat", TeamsMessageID: messageID, TurnID: turnID}}, Turns: clean.Turns, ChatPolls: clean.ChatPolls}},
+		{name: "turn running", counts: dockerRealDataCounts{inbound: 1, running: 1}, served: served, before: baseline, state: clean},
+		{name: "turn failed", counts: dockerRealDataCounts{inbound: 1, failed: 1}, served: served, before: baseline, state: clean},
+		{name: "turn queued", counts: dockerRealDataCounts{inbound: 1, queued: 1}, served: served, before: baseline, state: clean},
+		{name: "served ID differs although cardinality matches", counts: counts, served: map[string]int{dockerRealDataMessageIDPrefix + "different": 1}, before: baseline, state: clean},
+		{name: "new ordinary continuation", counts: counts, served: served, before: baseline, state: teamstore.State{InboundEvents: clean.InboundEvents, Turns: clean.Turns, ChatPolls: map[string]teamstore.ChatPollState{chatID: {ChatID: chatID, ContinuationPath: "/opaque/next"}}}},
+		{name: "unchanged inherited continuation", counts: counts, served: served,
+			before: teamstore.State{ChatPolls: map[string]teamstore.ChatPollState{chatID: {ChatID: chatID, ContinuationPath: "/opaque/inherited"}}},
+			state:  teamstore.State{InboundEvents: clean.InboundEvents, Turns: clean.Turns, ChatPolls: map[string]teamstore.ChatPollState{chatID: {ChatID: chatID, ContinuationPath: "/opaque/inherited"}}}, wantReady: true},
+		{name: "missing served message despite unchanged inherited continuation", counts: counts, served: map[string]int{},
+			before: teamstore.State{ChatPolls: map[string]teamstore.ChatPollState{chatID: {ChatID: chatID, ContinuationPath: "/opaque/inherited"}}},
+			state:  teamstore.State{InboundEvents: clean.InboundEvents, Turns: clean.Turns, ChatPolls: map[string]teamstore.ChatPollState{chatID: {ChatID: chatID, ContinuationPath: "/opaque/inherited"}}}},
+		{name: "durable inbound missing despite matching counts and unchanged inherited continuation", counts: counts, served: served,
+			before: teamstore.State{ChatPolls: map[string]teamstore.ChatPollState{chatID: {ChatID: chatID, ContinuationPath: "/opaque/inherited"}}},
+			state:  teamstore.State{ChatPolls: map[string]teamstore.ChatPollState{chatID: {ChatID: chatID, ContinuationPath: "/opaque/inherited"}}}},
+		{name: "head probe continuation", counts: counts, served: served, before: baseline, state: teamstore.State{InboundEvents: clean.InboundEvents, Turns: clean.Turns, ChatPolls: map[string]teamstore.ChatPollState{chatID: {ChatID: chatID, Gap: &teamstore.ChatPollGap{HeadProbeContinuationPath: "/opaque/head"}}}}},
+		{name: "pending outbox", counts: counts, served: served, before: baseline, state: clean, pendingOutbox: 1},
+		{name: "unknown Graph path", counts: counts, served: served, before: baseline, state: clean, unknownGraph: 1},
+		{name: "unclassified ignored disposition", counts: dockerRealDataCounts{inbound: 1}, served: served, before: baseline, state: teamstore.State{InboundEvents: map[string]teamstore.InboundEvent{inboundID: {ID: inboundID, TeamsChatID: chatID, TeamsMessageID: messageID, Status: teamstore.InboundStatusIgnored, Source: "teams"}}, ChatPolls: clean.ChatPolls}},
+		{name: "new dormant gap", counts: counts, served: served, before: baseline, state: teamstore.State{InboundEvents: clean.InboundEvents, Turns: clean.Turns, ChatPolls: map[string]teamstore.ChatPollState{chatID: {ChatID: chatID, Gap: &teamstore.ChatPollGap{Epoch: 1, Kind: "new-gap", OpenedAt: time.Now(), HeadProbePending: true}}}}},
+		{name: "active inherited gap recovery", counts: counts, served: served,
+			before: teamstore.State{ChatPolls: map[string]teamstore.ChatPollState{chatID: {ChatID: chatID, Gap: &teamstore.ChatPollGap{Epoch: 1, Kind: "unverified-continuation", OpenedAt: inheritedGapOpenedAt, HeadProbePending: true}}}},
+			state:  teamstore.State{InboundEvents: clean.InboundEvents, Turns: clean.Turns, ChatPolls: map[string]teamstore.ChatPollState{chatID: {ChatID: chatID, Gap: &teamstore.ChatPollGap{Epoch: 1, Kind: "unverified-continuation", OpenedAt: inheritedGapOpenedAt, HeadProbePending: false}}}}, wantReady: true},
+		{name: "crossed inherited gap remains visible but does not block corpus closure", counts: counts, served: served,
+			before: teamstore.State{ChatPolls: map[string]teamstore.ChatPollState{chatID: {ChatID: chatID, Gap: &teamstore.ChatPollGap{Epoch: 1, Kind: "unverified-continuation", OpenedAt: inheritedGapOpenedAt, SafeCursor: inheritedGapOpenedAt, RecoveryCursor: inheritedGapOpenedAt.Add(-34 * time.Second)}}}},
+			state:  teamstore.State{InboundEvents: clean.InboundEvents, Turns: clean.Turns, ChatPolls: map[string]teamstore.ChatPollState{chatID: {ChatID: chatID, Gap: &teamstore.ChatPollGap{Epoch: 1, Kind: "unverified-continuation", OpenedAt: inheritedGapOpenedAt, SafeCursor: inheritedGapOpenedAt, RecoveryCursor: inheritedGapOpenedAt.Add(-34 * time.Second)}}}}, wantReady: true},
+		{name: "inherited gap safe cursor advanced", counts: counts, served: served,
+			before: teamstore.State{ChatPolls: map[string]teamstore.ChatPollState{chatID: {ChatID: chatID, Gap: &teamstore.ChatPollGap{Epoch: 1, Kind: "unverified-continuation", OpenedAt: inheritedGapOpenedAt, SafeCursor: inheritedGapOpenedAt}}}},
+			state:  teamstore.State{InboundEvents: clean.InboundEvents, Turns: clean.Turns, ChatPolls: map[string]teamstore.ChatPollState{chatID: {ChatID: chatID, Gap: &teamstore.ChatPollGap{Epoch: 1, Kind: "unverified-continuation", OpenedAt: inheritedGapOpenedAt, SafeCursor: inheritedGapOpenedAt.Add(time.Second)}}}}},
+		{name: "dormant inherited gap", counts: counts, served: served,
+			before: teamstore.State{ChatPolls: map[string]teamstore.ChatPollState{chatID: {ChatID: chatID, Gap: &teamstore.ChatPollGap{Epoch: 1, Kind: "unverified-continuation", OpenedAt: inheritedGapOpenedAt, HeadProbePending: true}}}},
+			state:  teamstore.State{InboundEvents: clean.InboundEvents, Turns: clean.Turns, ChatPolls: map[string]teamstore.ChatPollState{chatID: {ChatID: chatID, Gap: &teamstore.ChatPollGap{Epoch: 1, Kind: "unverified-continuation", OpenedAt: inheritedGapOpenedAt, HeadProbePending: true}}}}, wantReady: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := dockerRealDataCompleteDrainReady(1, test.counts, test.served, test.before, test.state, corpus, test.pendingOutbox, test.unknownGraph)
+			if got != test.wantReady {
+				t.Fatalf("drain readiness = %t, want %t", got, test.wantReady)
+			}
+		})
+	}
+}
+
+func TestDockerRealDataCredentialRejectionAuditRequiresRedactedTerminalInbound(t *testing.T) {
+	const (
+		chatID    = "credential-audit-chat"
+		messageID = dockerRealDataMessageIDPrefix + "credential-audit"
+	)
+	msg := bridgeTestMessageWithText(messageID, "please reject --api-key=sk-test-audit-0123456789abcdef")
+	msg.ChatID = chatID
+	corpus := map[string][]ChatMessage{chatID: {msg}}
+	state := teamstore.State{InboundEvents: map[string]teamstore.InboundEvent{
+		"inbound": {
+			ID: "inbound", TeamsChatID: chatID, TeamsMessageID: messageID,
+			Source: rejectedModelAPIKeyInboundSource, Status: teamstore.InboundStatusIgnored,
+			Text: rejectedModelAPIKeyInboundText, TeamsBodyType: "text",
+		},
+	}}
+	if detected, redacted, missing, mismatches := dockerRealDataCredentialRejectionAudit(corpus, state); detected != 1 || redacted != 1 || missing != 0 || mismatches != 0 {
+		t.Fatalf("redacted credential audit = detected:%d redacted:%d not_yet_durable:%d mismatches:%d, want 1/1/0/0", detected, redacted, missing, mismatches)
+	}
+
+	state.InboundEvents["inbound"] = teamstore.InboundEvent{
+		ID: "inbound", TeamsChatID: chatID, TeamsMessageID: messageID,
+		Source: rejectedModelAPIKeyInboundSource, Status: teamstore.InboundStatusIgnored,
+		Text: "must not persist the rejected source text", TeamsBodyType: "text",
+	}
+	if detected, redacted, missing, mismatches := dockerRealDataCredentialRejectionAudit(corpus, state); detected != 1 || redacted != 0 || missing != 0 || mismatches != 1 {
+		t.Fatalf("unsafe credential audit = detected:%d redacted:%d not_yet_durable:%d mismatches:%d, want 1/0/0/1", detected, redacted, missing, mismatches)
+	}
+
+	state.InboundEvents = map[string]teamstore.InboundEvent{}
+	if detected, redacted, missing, mismatches := dockerRealDataCredentialRejectionAudit(corpus, state); detected != 1 || redacted != 0 || missing != 1 || mismatches != 0 {
+		t.Fatalf("unserved credential audit = detected:%d redacted:%d not_yet_durable:%d mismatches:%d, want 1/0/1/0", detected, redacted, missing, mismatches)
+	}
+}
+
+func TestDockerRealDataDrainSnapshotQueriesSelectedPollAndPendingSyntheticOutboxRows(t *testing.T) {
+	path := filepath.Join(t.TempDir(), teamstore.SQLiteFileName)
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open drain-gate SQLite fixture: %v", err)
+	}
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, `CREATE TABLE chat_polls (chat_id TEXT PRIMARY KEY, json BLOB NOT NULL)`); err != nil {
+		t.Fatalf("create poll fixture table: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `CREATE TABLE outbox_messages (id TEXT PRIMARY KEY, turn_id TEXT, status TEXT, post_send_effects_pending INTEGER)`); err != nil {
+		t.Fatalf("create outbox fixture table: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO chat_polls(chat_id,json) VALUES (?,?), (?,?)`,
+		"chat-selected", `{"chat_id":"chat-selected","continuation_path":"/opaque/pending"}`,
+		"chat-unselected", `{"chat_id":"chat-unselected","continuation_path":"/opaque/other"}`); err != nil {
+		t.Fatalf("insert poll fixture rows: %v", err)
+	}
+	outboxRows := []struct {
+		id      string
+		turnID  string
+		status  teamstore.OutboxStatus
+		pending bool
+	}{
+		{"queued", "docker-real-data-turn-1", teamstore.OutboxStatusQueued, false},
+		{"sending", "docker-real-data-turn-2", teamstore.OutboxStatusSending, false},
+		{"accepted", "docker-real-data-turn-3", teamstore.OutboxStatusAccepted, false},
+		{"sent-effects", "docker-real-data-turn-4", teamstore.OutboxStatusSent, true},
+		{"sent", "docker-real-data-turn-5", teamstore.OutboxStatusSent, false},
+		{"skipped", "docker-real-data-turn-6", teamstore.OutboxStatusSkipped, false},
+		{"unknown", "docker-real-data-turn-7", "future-status", false},
+		{"unrelated", "historical-turn", teamstore.OutboxStatusQueued, false},
+	}
+	for _, row := range outboxRows {
+		pending := 0
+		if row.pending {
+			pending = 1
+		}
+		if _, err := db.ExecContext(ctx, `INSERT INTO outbox_messages(id,turn_id,status,post_send_effects_pending) VALUES (?,?,?,?)`, row.id, row.turnID, row.status, pending); err != nil {
+			t.Fatalf("insert outbox fixture row %q: %v", row.id, err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close drain-gate SQLite fixture: %v", err)
+	}
+
+	corpus := map[string][]ChatMessage{"chat-selected": {{ID: "message"}}}
+	pollState, err := dockerRealDataPollStateSnapshotFromSQLite(ctx, path, corpus)
+	if err != nil {
+		t.Fatalf("read selected poll state: %v", err)
+	}
+	if len(pollState.ChatPolls) != 1 || pollState.ChatPolls["chat-selected"].ContinuationPath != "/opaque/pending" {
+		t.Fatalf("selected poll snapshot = %#v, want only the selected chat frontier", pollState.ChatPolls)
+	}
+	pending, err := dockerRealDataSyntheticOutboxPendingFromSQLite(ctx, path)
+	if err != nil {
+		t.Fatalf("count synthetic pending outbox rows: %v", err)
+	}
+	if pending != 5 {
+		t.Fatalf("synthetic pending outbox rows = %d, want queued/sending/accepted/sent-effects/unknown = 5", pending)
+	}
+}
+
+func TestDockerRealDataCumulativeServedMessagesIncludesPreviouslyDurableIDs(t *testing.T) {
+	current := map[string]int{"new-message": 2, "shared-message": 1}
+	previouslyDurable := map[string]struct{}{
+		"old-message":    {},
+		"shared-message": {},
+	}
+
+	got := dockerRealDataCumulativeServedMessages(current, previouslyDurable)
+	want := map[string]int{"new-message": 2, "shared-message": 1, "old-message": 1}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("cumulative served messages = %#v, want %#v", got, want)
+	}
+	if !reflect.DeepEqual(current, map[string]int{"new-message": 2, "shared-message": 1}) {
+		t.Fatalf("merging cumulative coverage mutated current-process served counts: %#v", current)
+	}
+}
+
+func TestDockerRealDataPriorSyntheticServedIDsIncludesDurableReceipts(t *testing.T) {
+	state := teamstore.State{
+		ChatPolls: map[string]teamstore.ChatPollState{
+			"chat-pending": {
+				PendingPage: &teamstore.ChatPollPendingPage{RecordIDs: []string{
+					dockerRealDataMessageIDPrefix + "pending",
+					"non-synthetic",
+				}},
+			},
+			"chat-gap": {
+				Gap: &teamstore.ChatPollGap{QuarantinedPage: &teamstore.ChatPollPendingPage{RecordIDs: []string{
+					dockerRealDataMessageIDPrefix + "quarantined",
+				}}},
+			},
+		},
+	}
+	inbound := map[string]struct{}{dockerRealDataMessageIDPrefix + "inbound": {}}
+
+	got := dockerRealDataPriorSyntheticServedIDs(state, inbound)
+	want := map[string]struct{}{
+		dockerRealDataMessageIDPrefix + "inbound":     {},
+		dockerRealDataMessageIDPrefix + "pending":     {},
+		dockerRealDataMessageIDPrefix + "quarantined": {},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("prior synthetic served IDs = %#v, want %#v", got, want)
+	}
+}
+
 func TestDockerRealDataReplayCorpusAuditsEveryQueuedRow(t *testing.T) {
 	now := time.Date(2026, 9, 7, 12, 0, 0, 0, time.UTC)
 	state := teamstore.State{
@@ -973,7 +1427,7 @@ func TestDockerRealDataReplayCorpusAuditsEveryQueuedRow(t *testing.T) {
 	}()
 	add("hosted", "active-chat", "image", `<p><img src="https://graph.test/hostedContents/cid-1/$value"></p>`)
 
-	corpus, count, report := dockerRealDataReplayCorpus(state, "control-chat")
+	corpus, count, report := dockerRealDataReplayCorpus(state, "control-chat", now, 4*time.Hour)
 	if count != 1 || report.Accepted != 1 || len(corpus["active-chat"]) != 1 {
 		t.Fatalf("replay acceptance = count=%d corpus=%d report=%+v, want one ordinary message", count, len(corpus["active-chat"]), report)
 	}
@@ -984,6 +1438,98 @@ func TestDockerRealDataReplayCorpusAuditsEveryQueuedRow(t *testing.T) {
 	}
 	if inboundRows, turnRows, outboxRows := dockerRealDataInheritedOperationalRows(state); inboundRows != 1 || turnRows != 1 || outboxRows != 0 {
 		t.Fatalf("inherited operational audit = inbound=%d turns=%d outbox=%d, want terminal provenance excluded and queued turn detected", inboundRows, turnRows, outboxRows)
+	}
+}
+
+func TestDockerRealDataReplayTimelinePreservesSourceIntervals(t *testing.T) {
+	now := time.Date(2026, 9, 24, 12, 0, 0, 0, time.UTC)
+	start := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	state := teamstore.State{
+		Sessions: map[string]teamstore.SessionContext{
+			"a": {ID: "a", Status: teamstore.SessionStatusActive, TeamsChatID: "chat-a"},
+			"b": {ID: "b", Status: teamstore.SessionStatusActive, TeamsChatID: "chat-b"},
+		},
+		ChatPolls: map[string]teamstore.ChatPollState{
+			"chat-a": {
+				ChatID: "chat-a", LastModifiedCursor: now.Add(8 * time.Minute),
+				Gap: &teamstore.ChatPollGap{SafeCursor: now.Add(7 * time.Minute), RecoveryCursor: now.Add(9 * time.Minute)},
+			},
+		},
+		InboundEvents: map[string]teamstore.InboundEvent{},
+	}
+	add := func(id, chatID string, at time.Time) {
+		state.InboundEvents[id] = teamstore.InboundEvent{
+			ID: id, SessionID: chatID, TeamsChatID: chatID, TeamsMessageID: "source-" + id,
+			Text: "task", TeamsBodyType: "html", TeamsBodyHTML: "<p>task</p>", Source: "teams",
+			Status: teamstore.InboundStatusQueued, ReceivedAt: at,
+		}
+	}
+	middle := start.Add(57*time.Hour*24 + 12*time.Hour)
+	end := start.Add(115 * 24 * time.Hour)
+	add("oldest", "chat-a", start)
+	add("middle", "chat-b", middle)
+	add("newest", "chat-a", end)
+
+	corpus, count, report := dockerRealDataReplayCorpus(state, "control-chat", now, 4*time.Hour)
+	if count != 3 || report.ReplaySourceSpan != end.Sub(start) {
+		t.Fatalf("replay source span/count = %s/%d, want %s/3; report=%+v", report.ReplaySourceSpan, count, end.Sub(start), report)
+	}
+	if !report.ReplayStart.After(state.ChatPolls["chat-a"].Gap.RecoveryCursor.Add(pollCursorOverlap)) {
+		t.Fatalf("replay start %s is not strictly beyond copied gap recovery cursor %s plus overlap %s", report.ReplayStart, state.ChatPolls["chat-a"].Gap.RecoveryCursor, pollCursorOverlap)
+	}
+	if got, want := report.ReplayEnd.Sub(report.ReplayStart), report.ReplaySpan; got != want {
+		t.Fatalf("mapped replay span = %s, want %s", got, want)
+	}
+	if err := dockerRealDataReplayTimelineError(report, 4*time.Hour); err != nil {
+		t.Fatalf("mapped source timeline does not fit its 4h window: %v; report=%+v", err, report)
+	}
+	messageTime := func(chatID string, index int) time.Time {
+		t.Helper()
+		messages := corpus[chatID]
+		if index >= len(messages) {
+			t.Fatalf("chat %s has %d replay messages, want index %d", chatID, len(messages), index)
+		}
+		at, err := time.Parse(time.RFC3339Nano, messages[index].LastModifiedDateTime)
+		if err != nil {
+			t.Fatalf("parse replay timestamp: %v", err)
+		}
+		return at
+	}
+	if got, want := messageTime("chat-a", 0), report.ReplayStart; !got.Equal(want) {
+		t.Fatalf("oldest mapped timestamp = %s, want %s", got, want)
+	}
+	if got, want := messageTime("chat-b", 0), report.ReplayStart.Add(report.ReplaySpan/2); got.Sub(want) > time.Millisecond || want.Sub(got) > time.Millisecond {
+		t.Fatalf("middle mapped timestamp = %s, want approximately %s", got, want)
+	}
+	if got, want := messageTime("chat-a", 1), report.ReplayEnd; !got.Equal(want) {
+		t.Fatalf("newest mapped timestamp = %s, want %s", got, want)
+	}
+}
+
+func TestDockerRealDataReplayTimelineRejectsCollapsedOrOutOfWindowSources(t *testing.T) {
+	cases := []struct {
+		name   string
+		report dockerRealDataReplayReport
+	}{
+		{
+			name: "collapsed nonzero source span",
+			report: dockerRealDataReplayReport{
+				ReplaySourceSpan: time.Hour, ReplaySpan: 0, ReplayEndGuard: time.Second,
+			},
+		},
+		{
+			name: "cursor beyond measured window",
+			report: dockerRealDataReplayReport{
+				ReplaySourceSpan: time.Hour, ReplayLead: 2 * time.Hour, ReplaySpan: time.Hour, ReplayEndGuard: time.Second,
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := dockerRealDataReplayTimelineError(tc.report, time.Hour); err == nil {
+				t.Fatalf("invalid replay timeline was accepted: %+v", tc.report)
+			}
+		})
 	}
 }
 
@@ -1009,20 +1555,39 @@ type dockerRealDataTimingAggregate struct {
 	Max    time.Duration
 }
 
+type dockerRealDataQueuedTurnTrace struct {
+	Stage  string
+	At     time.Time
+	Events []string
+}
+
+type dockerRealDataPollMessageTrace struct {
+	At          time.Time
+	ChatID      string
+	MessageID   string
+	Disposition string
+	HadError    bool
+}
+
 type dockerRealDataTraceWriter struct {
-	mu             sync.Mutex
-	listeningAt    time.Time
-	lines          []string
-	events         []string
-	leaseClaims    []string
-	ownerFailures  []string
-	pollChats      []string
-	pollSelections []string
-	queuedTurns    []string
-	pollMessages   []string
-	outboxStages   []string
-	storeTimings   []string
-	timings        map[string]dockerRealDataTimingAggregate
+	mu                      sync.Mutex
+	listeningAt             time.Time
+	lines                   []string
+	events                  []string
+	leaseClaims             []string
+	ownerFailures           []string
+	pollChats               []string
+	pollSelections          []string
+	queuedTurns             []string
+	queuedTurnTraceNext     int
+	queuedTurnByID          map[string]dockerRealDataQueuedTurnTrace
+	pollMessages            []string
+	pollMessageByID         map[string][]dockerRealDataPollMessageTrace
+	pollMessageTraceDropped int
+	outboxStages            []string
+	storeTimings            []string
+	timings                 map[string]dockerRealDataTimingAggregate
+	pollDecisionStages      map[string]map[string]int
 }
 
 // recordTiming retains every observation for the real-data diagnosis. A phase
@@ -1145,6 +1710,58 @@ func (w *dockerRealDataTraceWriter) recordPollSelection(stage, faultChatID strin
 	w.pollSelections = append(w.pollSelections, fmt.Sprintf("stage=%s fault_chat=%s target_present=%t decisions=%d target=%s", strings.TrimSpace(stage), strings.TrimSpace(faultChatID), present, len(decisions), targetSummary))
 }
 
+// recordPollDecisionStage keeps a bounded per-chat count of decisions at the
+// candidate, ordered, and selected boundaries. The all-lagging replay can run
+// for hours; retaining only counts lets a failed drain distinguish a chat that
+// never entered admission from one discarded by the cycle cap without keeping
+// a per-cycle trace or message data.
+func (w *dockerRealDataTraceWriter) recordPollDecisionStage(stage string, decisions []inboundPollDecision) {
+	if w == nil {
+		return
+	}
+	stage = strings.TrimSpace(stage)
+	switch stage {
+	case "candidate", "ordered", "selected":
+	default:
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.pollDecisionStages == nil {
+		w.pollDecisionStages = make(map[string]map[string]int)
+	}
+	for _, decision := range decisions {
+		chatID := strings.TrimSpace(decision.ChatID)
+		if chatID == "" {
+			continue
+		}
+		stages := w.pollDecisionStages[chatID]
+		if stages == nil {
+			if len(w.pollDecisionStages) >= 1024 {
+				continue
+			}
+			stages = make(map[string]int, 3)
+			w.pollDecisionStages[chatID] = stages
+		}
+		stages[stage]++
+	}
+}
+
+func (w *dockerRealDataTraceWriter) pollDecisionStageSummary(chatIDs []string) string {
+	if w == nil || len(chatIDs) == 0 {
+		return "none"
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	parts := make([]string, 0, len(chatIDs))
+	for _, rawChatID := range chatIDs {
+		chatID := strings.TrimSpace(rawChatID)
+		stages := w.pollDecisionStages[chatID]
+		parts = append(parts, fmt.Sprintf("chat=%q candidate=%d ordered=%d selected=%d", chatID, stages["candidate"], stages["ordered"], stages["selected"]))
+	}
+	return strings.Join(parts, " ")
+}
+
 func (w *dockerRealDataTraceWriter) pollSelectionsSnapshot() []string {
 	if w == nil {
 		return nil
@@ -1160,14 +1777,33 @@ func (w *dockerRealDataTraceWriter) recordQueuedTurn(stage, sessionID, turnID st
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if len(w.queuedTurns) >= 512 {
-		return
-	}
+	at := time.Now()
 	diagnostic := ""
 	if err != nil {
 		diagnostic = trimPollDiagnostic(err.Error())
 	}
-	w.queuedTurns = append(w.queuedTurns, fmt.Sprintf("at=%s stage=%s session=%s turn=%s started=%t err=%q", time.Now().UTC().Format(time.RFC3339Nano), stage, strings.TrimSpace(sessionID), strings.TrimSpace(turnID), started, diagnostic))
+	entry := fmt.Sprintf("at=%s stage=%s session=%s turn=%s started=%t err=%q", at.UTC().Format(time.RFC3339Nano), stage, strings.TrimSpace(sessionID), strings.TrimSpace(turnID), started, diagnostic)
+	const maxQueuedTurnTraceEntries = 512
+	if len(w.queuedTurns) < maxQueuedTurnTraceEntries {
+		w.queuedTurns = append(w.queuedTurns, entry)
+	} else {
+		w.queuedTurns[w.queuedTurnTraceNext] = entry
+		w.queuedTurnTraceNext = (w.queuedTurnTraceNext + 1) % maxQueuedTurnTraceEntries
+	}
+	if turnID = strings.TrimSpace(turnID); turnID != "" {
+		if w.queuedTurnByID == nil {
+			w.queuedTurnByID = make(map[string]dockerRealDataQueuedTurnTrace)
+		}
+		trace := w.queuedTurnByID[turnID]
+		trace.Stage = strings.TrimSpace(stage)
+		trace.At = at
+		trace.Events = append(trace.Events, entry)
+		const maxQueuedTurnEventsPerID = 32
+		if len(trace.Events) > maxQueuedTurnEventsPerID {
+			trace.Events = append([]string(nil), trace.Events[len(trace.Events)-maxQueuedTurnEventsPerID:]...)
+		}
+		w.queuedTurnByID[turnID] = trace
+	}
 }
 
 func (w *dockerRealDataTraceWriter) queuedTurnsSnapshot() []string {
@@ -1176,23 +1812,83 @@ func (w *dockerRealDataTraceWriter) queuedTurnsSnapshot() []string {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if len(w.queuedTurns) == 512 && w.queuedTurnTraceNext != 0 {
+		out := make([]string, 0, len(w.queuedTurns))
+		out = append(out, w.queuedTurns[w.queuedTurnTraceNext:]...)
+		out = append(out, w.queuedTurns[:w.queuedTurnTraceNext]...)
+		return out
+	}
 	return append([]string(nil), w.queuedTurns...)
+}
+
+func (w *dockerRealDataTraceWriter) queuedTurnTraceForID(turnID string) (dockerRealDataQueuedTurnTrace, bool) {
+	if w == nil {
+		return dockerRealDataQueuedTurnTrace{}, false
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	trace, ok := w.queuedTurnByID[strings.TrimSpace(turnID)]
+	trace.Events = append([]string(nil), trace.Events...)
+	return trace, ok
+}
+
+func TestDockerRealDataQueuedTurnTraceRetainsRecentEvents(t *testing.T) {
+	trace := &dockerRealDataTraceWriter{}
+	for index := 0; index < 600; index++ {
+		trace.recordQueuedTurn(fmt.Sprintf("stage-%03d", index), "session", "turn", false, nil)
+	}
+	entries := trace.queuedTurnsSnapshot()
+	if len(entries) != 512 {
+		t.Fatalf("queued-turn trace retained %d entries, want capped recent window of 512", len(entries))
+	}
+	if !strings.Contains(entries[0], "stage-088") || !strings.Contains(entries[len(entries)-1], "stage-599") {
+		t.Fatalf("queued-turn trace ring order = first %q, last %q; want stages 088..599", entries[0], entries[len(entries)-1])
+	}
+	latest, ok := trace.queuedTurnTraceForID("turn")
+	if !ok || latest.Stage != "stage-599" || len(latest.Events) != 32 {
+		t.Fatalf("latest per-turn trace = %#v found=%t, want stage-599", latest, ok)
+	}
+	if !strings.Contains(latest.Events[0], "stage-568") || !strings.Contains(latest.Events[len(latest.Events)-1], "stage-599") {
+		t.Fatalf("per-turn trace history = first %q, last %q; want stages 568..599", latest.Events[0], latest.Events[len(latest.Events)-1])
+	}
 }
 
 func (w *dockerRealDataTraceWriter) recordPollMessage(chatID, messageID, disposition string, err error) {
 	if w == nil {
 		return
 	}
+	at := time.Now().UTC()
+	chatID = strings.TrimSpace(chatID)
+	messageID = strings.TrimSpace(messageID)
+	disposition = strings.TrimSpace(disposition)
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	// Retain a small body-free trace per synthetic replay ID independent of the
+	// global chronological ring. A multi-hour replay processes more than 2,048
+	// messages, so a ring alone can silently discard the exact ID needed to
+	// explain a served-but-not-durable acceptance failure.
+	if strings.HasPrefix(messageID, dockerRealDataMessageIDPrefix) {
+		if w.pollMessageByID == nil {
+			w.pollMessageByID = make(map[string][]dockerRealDataPollMessageTrace)
+		}
+		if _, tracked := w.pollMessageByID[messageID]; tracked || len(w.pollMessageByID) < dockerRealDataMaxTrackedPollMessageIDs {
+			trace := dockerRealDataPollMessageTrace{
+				At: at, ChatID: chatID, MessageID: messageID, Disposition: disposition, HadError: err != nil,
+			}
+			traces := append(w.pollMessageByID[messageID], trace)
+			const maxPerSyntheticMessage = 8
+			if len(traces) > maxPerSyntheticMessage {
+				traces = append([]dockerRealDataPollMessageTrace(nil), traces[len(traces)-maxPerSyntheticMessage:]...)
+			}
+			w.pollMessageByID[messageID] = traces
+		} else {
+			w.pollMessageTraceDropped++
+		}
+	}
 	if len(w.pollMessages) >= 2048 {
 		return
 	}
-	diagnostic := ""
-	if err != nil {
-		diagnostic = trimPollDiagnostic(err.Error())
-	}
-	w.pollMessages = append(w.pollMessages, fmt.Sprintf("at=%s chat=%s message=%s disposition=%s err=%q", time.Now().UTC().Format(time.RFC3339Nano), strings.TrimSpace(chatID), strings.TrimSpace(messageID), strings.TrimSpace(disposition), diagnostic))
+	w.pollMessages = append(w.pollMessages, fmt.Sprintf("at=%s chat=%s message=%s disposition=%s had_error=%t", at.Format(time.RFC3339Nano), chatID, messageID, disposition, err != nil))
 }
 
 func (w *dockerRealDataTraceWriter) pollMessagesSnapshot() []string {
@@ -1202,6 +1898,72 @@ func (w *dockerRealDataTraceWriter) pollMessagesSnapshot() []string {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	return append([]string(nil), w.pollMessages...)
+}
+
+func (w *dockerRealDataTraceWriter) pollMessageTracesForIDs(messageIDs []string) []string {
+	if w == nil || len(messageIDs) == 0 {
+		return nil
+	}
+	ids := append([]string(nil), messageIDs...)
+	for i := range ids {
+		ids[i] = strings.TrimSpace(ids[i])
+	}
+	sort.Strings(ids)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var out []string
+	for _, messageID := range ids {
+		traces, found := w.pollMessageByID[messageID]
+		if !found {
+			out = append(out, fmt.Sprintf("message=%s trace=missing", messageID))
+			continue
+		}
+		for _, trace := range traces {
+			out = append(out, fmt.Sprintf("at=%s chat=%s message=%s disposition=%s had_error=%t", trace.At.Format(time.RFC3339Nano), trace.ChatID, trace.MessageID, trace.Disposition, trace.HadError))
+		}
+	}
+	if w.pollMessageTraceDropped > 0 {
+		out = append(out, fmt.Sprintf("trace_capacity_dropped=%d", w.pollMessageTraceDropped))
+	}
+	return out
+}
+
+func TestDockerRealDataPollMessageTraceSurvivesGlobalTraceCap(t *testing.T) {
+	trace := &dockerRealDataTraceWriter{}
+	for index := 0; index < 2048; index++ {
+		trace.recordPollMessage("chat", fmt.Sprintf("ordinary-%d", index), "eligible", nil)
+	}
+	const target = dockerRealDataMessageIDPrefix + "late-target"
+	const privateError = "private error detail must not be retained in poll traces"
+	trace.recordPollMessage("target-chat", target, "global-claim-error", errors.New(privateError))
+	if got := len(trace.pollMessagesSnapshot()); got != 2048 {
+		t.Fatalf("global poll trace length = %d, want bounded cap 2048", got)
+	}
+	perID := trace.pollMessageTracesForIDs([]string{target})
+	if len(perID) != 1 || !strings.Contains(perID[0], "disposition=global-claim-error") || !strings.Contains(perID[0], "had_error=true") {
+		t.Fatalf("late synthetic ID trace = %v, want its body-free disposition despite global cap", perID)
+	}
+	if strings.Contains(strings.Join(perID, " "), "private error detail") {
+		t.Fatalf("per-ID poll trace retained error text: %v", perID)
+	}
+	global := &dockerRealDataTraceWriter{}
+	global.recordPollMessage("target-chat", target, "global-claim-error", errors.New(privateError))
+	if got := strings.Join(global.pollMessagesSnapshot(), " "); strings.Contains(got, privateError) || !strings.Contains(got, "had_error=true") {
+		t.Fatalf("global poll trace leaked error text or omitted safe error presence: %s", got)
+	}
+}
+
+func TestDockerRealDataPollMessageTraceReportsCapacityLoss(t *testing.T) {
+	trace := &dockerRealDataTraceWriter{pollMessageByID: make(map[string][]dockerRealDataPollMessageTrace, dockerRealDataMaxTrackedPollMessageIDs)}
+	for index := 0; index < dockerRealDataMaxTrackedPollMessageIDs; index++ {
+		trace.pollMessageByID[fmt.Sprintf("%s%05d", dockerRealDataMessageIDPrefix, index)] = nil
+	}
+	const target = dockerRealDataMessageIDPrefix + "overflow-target"
+	trace.recordPollMessage("chat", target, "eligible", nil)
+	got := strings.Join(trace.pollMessageTracesForIDs([]string{target}), " ")
+	if !strings.Contains(got, "trace=missing") || !strings.Contains(got, "trace_capacity_dropped=1") {
+		t.Fatalf("per-ID trace capacity loss was not explicit: %s", got)
+	}
 }
 
 func (w *dockerRealDataTraceWriter) recordOutboxSendStage(outboxID, stage string, duration time.Duration, err error) {
@@ -1575,13 +2337,13 @@ func (t *dockerRealDataMaintenanceTrace) observeLinked(ctx context.Context, sess
 	return nil
 }
 
-func (t *dockerRealDataMaintenanceTrace) snapshot() (backlogSamples, ordinaryHistory, ordinaryLinked int) {
+func (t *dockerRealDataMaintenanceTrace) snapshot() (backlogSamples, syntheticBacklogSamples, ordinaryHistory, ordinaryLinked int) {
 	if t == nil {
-		return 0, 0, 0
+		return 0, 0, 0, 0
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	return t.backlogSamples, t.ordinaryHistoryWhileBacklog, t.ordinaryLinkedWhileBacklog
+	return t.backlogSamples, t.syntheticBacklogSamples, t.ordinaryHistoryWhileBacklog, t.ordinaryLinkedWhileBacklog
 }
 
 func (t *dockerRealDataMaintenanceTrace) ordinaryWorkSnapshot() (historyPaths, linkedSessions []string) {
@@ -1631,6 +2393,22 @@ func (t *dockerRealDataMaintenanceTrace) syntheticBacklogObserved() bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return t.syntheticBacklogSamples > 0
+}
+
+// dockerRealDataSyntheticBacklogHasOutstandingWork distinguishes a still
+// queued/running replay turn from a Graph page that has been served but is not
+// yet represented by durable inbound rows. Counting only queued/running turns
+// misses the durable PendingPage receipt between Graph admission and turn
+// creation, which made the real-data fairness oracle report a false negative.
+func dockerRealDataSyntheticBacklogHasOutstandingWork(counts dockerRealDataCounts, baselineInbound int64, servedUnique int) bool {
+	if counts.queued > 0 || counts.running > 0 {
+		return true
+	}
+	durableInboundDelta := counts.inbound - baselineInbound
+	if durableInboundDelta < 0 {
+		durableInboundDelta = 0
+	}
+	return int64(servedUnique) > durableInboundDelta
 }
 
 // dockerRealDataGraphServer replays pages at the Graph boundary only. It
@@ -3870,6 +4648,23 @@ func dockerRealDataTurnNeedsBoundaryRepair(status teamstore.TurnStatus) bool {
 	}
 }
 
+func TestDockerRealDataTurnNeedsBoundaryRepairLeavesInterruptedAttentionStateIntact(t *testing.T) {
+	for _, tc := range []struct {
+		status teamstore.TurnStatus
+		want   bool
+	}{
+		{status: teamstore.TurnStatusQueued, want: true},
+		{status: teamstore.TurnStatusRunning, want: true},
+		{status: teamstore.TurnStatusInterrupted, want: false},
+		{status: teamstore.TurnStatusCompleted, want: false},
+		{status: teamstore.TurnStatusFailed, want: false},
+	} {
+		if got := dockerRealDataTurnNeedsBoundaryRepair(tc.status); got != tc.want {
+			t.Errorf("turn status %q needs boundary repair = %t, want %t", tc.status, got, tc.want)
+		}
+	}
+}
+
 func dockerRealDataSyntheticTurnSnapshot(ctx context.Context, path string) (map[string]dockerRealDataSyntheticTurnObservation, error) {
 	query := url.Values{}
 	query.Set("mode", "ro")
@@ -3880,38 +4675,25 @@ func dockerRealDataSyntheticTurnSnapshot(ctx context.Context, path string) (map[
 	defer db.Close()
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	turnStatus := dockerRealDataTurnStatusSQL("t")
-	turnInboundID := dockerRealDataTurnInboundIDSQL("t")
-	rows, err := db.QueryContext(ctx, `
-		SELECT t.id, `+turnInboundID+`, `+turnStatus+`, t.json
-		FROM turns t
-		JOIN inbound_events i ON `+turnInboundID+` = i.id
-		WHERE i.teams_message_id LIKE ?`, dockerRealDataMessageIDPrefix+"%")
+	refs, err := dockerRealDataSyntheticInboundTurnRefs(ctx, db)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
+	turnsByID, err := dockerRealDataTurnsByInboundTurnID(ctx, db, refs)
+	if err != nil {
+		return nil, err
+	}
 	observations := make(map[string]dockerRealDataSyntheticTurnObservation)
-	for rows.Next() {
-		var rowID string
-		var inboundID sql.NullString
-		var status string
-		var raw []byte
-		if err := rows.Scan(&rowID, &inboundID, &status, &raw); err != nil {
-			return nil, err
+	for _, ref := range refs {
+		turn, found := turnsByID[ref.turnID]
+		if !found || strings.TrimSpace(turn.InboundEventID) != ref.inboundID {
+			continue
 		}
-		var turn teamstore.Turn
-		if err := json.Unmarshal(raw, &turn); err != nil {
-			return nil, fmt.Errorf("decode synthetic turn snapshot %q: %w", rowID, err)
-		}
-		if strings.TrimSpace(turn.ID) == "" || strings.TrimSpace(turn.ID) != strings.TrimSpace(rowID) {
-			return nil, fmt.Errorf("synthetic turn snapshot identity mismatch: sql=%q json=%q", rowID, turn.ID)
-		}
-		observations[rowID] = dockerRealDataSyntheticTurnObservation{
-			ID:              rowID,
-			InboundID:       strings.TrimSpace(inboundID.String),
+		observations[turn.ID] = dockerRealDataSyntheticTurnObservation{
+			ID:              turn.ID,
+			InboundID:       ref.inboundID,
 			SessionID:       strings.TrimSpace(turn.SessionID),
-			Status:          teamstore.TurnStatus(strings.TrimSpace(status)),
+			Status:          turn.Status,
 			MachineID:       strings.TrimSpace(turn.MachineID),
 			LeaseGeneration: turn.LeaseGeneration,
 			RecoveryReason:  strings.TrimSpace(turn.RecoveryReason),
@@ -3922,10 +4704,73 @@ func dockerRealDataSyntheticTurnSnapshot(ctx context.Context, path string) (map[
 			UpdatedAt:       turn.UpdatedAt,
 		}
 	}
-	if err := rows.Err(); err != nil {
+	return observations, nil
+}
+
+// dockerRealDataRunningSyntheticTurnSnapshot is the low-cost liveness view
+// used during long all-lagging runs. It reads the indexed Running status set
+// and decodes only those turns, rather than re-reading every synthetic inbound
+// and its matching turn every few seconds.
+func dockerRealDataRunningSyntheticTurnSnapshot(ctx context.Context, path string) ([]dockerRealDataSyntheticTurnObservation, error) {
+	query := url.Values{}
+	query.Set("mode", "ro")
+	db, err := sql.Open("sqlite", teamsSQLiteFileURI(path, query))
+	if err != nil {
 		return nil, err
 	}
-	return observations, rows.Close()
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	rows, err := db.QueryContext(ctx, `SELECT id, json FROM turns WHERE status = ?`, string(teamstore.TurnStatusRunning))
+	if err != nil {
+		return nil, err
+	}
+	observations := make([]dockerRealDataSyntheticTurnObservation, 0, 4)
+	for rows.Next() {
+		var rowID string
+		var raw []byte
+		if err := rows.Scan(&rowID, &raw); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		var turn teamstore.Turn
+		if err := json.Unmarshal(raw, &turn); err != nil {
+			// This watcher is diagnostic only. The exhaustive boundary audit
+			// reports malformed durable rows; one unrelated historical row must
+			// not disable the fast liveness signal for the other running turns.
+			continue
+		}
+		rowID = strings.TrimSpace(rowID)
+		if rowID == "" || strings.TrimSpace(turn.ID) != rowID || turn.Status != teamstore.TurnStatusRunning {
+			continue
+		}
+		if !strings.Contains(turn.ID, dockerRealDataMessageIDPrefix) && !strings.Contains(turn.InboundEventID, dockerRealDataMessageIDPrefix) {
+			continue
+		}
+		observations = append(observations, dockerRealDataSyntheticTurnObservation{
+			ID:              rowID,
+			InboundID:       strings.TrimSpace(turn.InboundEventID),
+			SessionID:       strings.TrimSpace(turn.SessionID),
+			Status:          turn.Status,
+			MachineID:       strings.TrimSpace(turn.MachineID),
+			LeaseGeneration: turn.LeaseGeneration,
+			RecoveryReason:  strings.TrimSpace(turn.RecoveryReason),
+			CodexThreadID:   strings.TrimSpace(turn.CodexThreadID),
+			CodexTurnID:     strings.TrimSpace(turn.CodexTurnID),
+			QueuedAt:        turn.QueuedAt,
+			StartedAt:       turn.StartedAt,
+			UpdatedAt:       turn.UpdatedAt,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	sort.Slice(observations, func(i, j int) bool { return observations[i].ID < observations[j].ID })
+	return observations, nil
 }
 
 type dockerRealDataMeasuredWindow struct {
@@ -4025,6 +4870,41 @@ func dockerRealDataSyntheticInboundIDs(ctx context.Context, path string) (map[st
 	return ids, rows.Close()
 }
 
+// dockerRealDataPriorSyntheticServedIDs retains proof of Graph-served messages
+// across a process boundary. A synthetic inbound row proves the page was
+// consumed; a durable pending/quarantined poll receipt proves Graph returned
+// the page even if dispatch had not yet created an inbound row when the first
+// process stopped.
+func dockerRealDataPriorSyntheticServedIDs(state teamstore.State, durableInbound map[string]struct{}) map[string]struct{} {
+	prior := make(map[string]struct{}, len(durableInbound))
+	for id := range durableInbound {
+		prior[id] = struct{}{}
+	}
+	for id := range dockerRealDataProtectedPollMessageIDs(state) {
+		if strings.HasPrefix(strings.TrimSpace(id), dockerRealDataMessageIDPrefix) {
+			prior[id] = struct{}{}
+		}
+	}
+	return prior
+}
+
+// dockerRealDataCumulativeServedMessages combines this process's Graph
+// observations with replay IDs already represented by durable inbound rows or
+// poll receipts in a retained runtime. Current-process durability and
+// duplicate-send assertions continue to use the unmerged servedMessages map.
+func dockerRealDataCumulativeServedMessages(current map[string]int, previouslyObserved map[string]struct{}) map[string]int {
+	cumulative := make(map[string]int, len(current)+len(previouslyObserved))
+	for id, count := range current {
+		cumulative[id] = count
+	}
+	for id := range previouslyObserved {
+		if _, found := cumulative[id]; !found {
+			cumulative[id] = 1
+		}
+	}
+	return cumulative
+}
+
 // dockerRealDataProtectedPollMessageIDs returns replay records that were
 // already returned by Graph and are still covered by a durable poll receipt.
 // A throughput run may stop immediately after staging a page (or after moving
@@ -4086,70 +4966,165 @@ func dockerRealDataCountsFromSQLite(ctx context.Context, path string) (dockerRea
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	var out dockerRealDataCounts
-	prefix := dockerRealDataMessageIDPrefix + "%"
-	inboundRows, err := db.QueryContext(ctx, `SELECT id FROM inbound_events WHERE teams_message_id LIKE ?`, prefix)
-	if err != nil {
-		return out, err
-	}
-	syntheticInbound := make(map[string]struct{})
-	for inboundRows.Next() {
-		var id string
-		if err := inboundRows.Scan(&id); err != nil {
-			_ = inboundRows.Close()
-			return out, err
-		}
-		syntheticInbound[id] = struct{}{}
-	}
-	if err := inboundRows.Err(); err != nil {
-		_ = inboundRows.Close()
-		return out, err
-	}
-	if err := inboundRows.Close(); err != nil {
-		return out, err
-	}
-	out.inbound = int64(len(syntheticInbound))
+	// The outer scan is limited to synthetic inbound rows. For each one, resolve
+	// only its persisted turn ID through turns' primary-key index; do not decode
+	// every historical turn JSON on every history/linked maintenance callback.
+	// Trusted scalar status is the normal fast path. Legacy/untrusted projections
+	// fall back to their own JSON, while the final correlation audit separately
+	// verifies the inbound/turn identity before the experiment can pass.
+	const countQuery = `
+		SELECT
+			COUNT(*),
+			COALESCE(SUM(CASE WHEN turn_inbound_id = inbound_id AND status = ? THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN turn_inbound_id = inbound_id AND status = ? THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN turn_inbound_id = inbound_id AND status = ? THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN turn_inbound_id = inbound_id AND status = ? THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN turn_inbound_id = inbound_id AND status = ? THEN 1 ELSE 0 END), 0)
+		FROM (
+			SELECT
+				i.id AS inbound_id,
+				CASE WHEN json_valid(t.json) THEN json_extract(t.json, '$.inbound_event_id') END AS turn_inbound_id,
+				CASE
+					WHEN COALESCE(t.projection_trusted, 0) = 1
+						AND COALESCE(t.canonical_revision, 0) > 0
+						AND COALESCE(t.projection_revision, 0) = COALESCE(t.canonical_revision, 0)
+						THEN COALESCE(t.status, '')
+					WHEN json_valid(t.json) AND json_type(t.json, '$.status') = 'text'
+						THEN trim(COALESCE(json_extract(t.json, '$.status'), ''))
+					ELSE trim(COALESCE(t.status, ''))
+				END AS status
+			FROM inbound_events AS i
+			LEFT JOIN turns AS t
+				ON t.id = CASE WHEN json_valid(i.json) THEN json_extract(i.json, '$.turn_id') END
+			WHERE i.teams_message_id LIKE ?
+		)`
+	return out, db.QueryRowContext(
+		ctx,
+		countQuery,
+		teamstore.TurnStatusCompleted,
+		teamstore.TurnStatusFailed,
+		teamstore.TurnStatusQueued,
+		teamstore.TurnStatusRunning,
+		teamstore.TurnStatusInterrupted,
+		dockerRealDataMessageIDPrefix+"%",
+	).Scan(&out.inbound, &out.completed, &out.failed, &out.queued, &out.running, &out.interrupted)
+}
 
-	// Keep the exact durable completion measurement read-only without a SQL
-	// join on two JSON projections.  The indexed inbound lookup above gives us
-	// the synthetic event IDs; one bounded turns scan then classifies statuses
-	// in Go.  This avoids a query plan that can repeatedly decode every large
-	// turn JSON row for every synthetic inbound row and contend with the
-	// listener's writes.
-	turnRows, err := db.QueryContext(ctx, `SELECT `+dockerRealDataTurnStatusSQL("t")+`, `+dockerRealDataTurnInboundIDSQL("t")+` FROM turns t`)
+func dockerRealDataPollStateSnapshotFromSQLite(ctx context.Context, path string, corpus map[string][]ChatMessage) (teamstore.State, error) {
+	query := url.Values{}
+	query.Set("mode", "ro")
+	db, err := sql.Open("sqlite", teamsSQLiteFileURI(path, query))
 	if err != nil {
-		return out, err
+		return teamstore.State{}, err
 	}
-	for turnRows.Next() {
-		var status string
-		var inboundID sql.NullString
-		if err := turnRows.Scan(&status, &inboundID); err != nil {
-			_ = turnRows.Close()
-			return out, err
-		}
-		if !inboundID.Valid {
-			continue
-		}
-		if _, ok := syntheticInbound[inboundID.String]; !ok {
-			continue
-		}
-		switch teamstore.TurnStatus(status) {
-		case teamstore.TurnStatusCompleted:
-			out.completed++
-		case teamstore.TurnStatusFailed:
-			out.failed++
-		case teamstore.TurnStatusQueued:
-			out.queued++
-		case teamstore.TurnStatusRunning:
-			out.running++
-		case teamstore.TurnStatusInterrupted:
-			out.interrupted++
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+
+	state := teamstore.State{ChatPolls: make(map[string]teamstore.ChatPollState, len(corpus))}
+	chatIDs := make([]string, 0, len(corpus))
+	for chatID := range corpus {
+		if chatID = strings.TrimSpace(chatID); chatID != "" {
+			chatIDs = append(chatIDs, chatID)
 		}
 	}
-	if err := turnRows.Err(); err != nil {
-		_ = turnRows.Close()
-		return out, err
+	sort.Strings(chatIDs)
+	for start := 0; start < len(chatIDs); start += 500 {
+		end := start + 500
+		if end > len(chatIDs) {
+			end = len(chatIDs)
+		}
+		placeholders := make([]string, end-start)
+		args := make([]any, end-start)
+		for index, chatID := range chatIDs[start:end] {
+			placeholders[index] = "?"
+			args[index] = chatID
+		}
+		rows, err := db.QueryContext(ctx, `SELECT chat_id, json FROM chat_polls WHERE chat_id IN (`+strings.Join(placeholders, ",")+")", args...)
+		if err != nil {
+			return teamstore.State{}, err
+		}
+		for rows.Next() {
+			var chatID string
+			var raw []byte
+			if err := rows.Scan(&chatID, &raw); err != nil {
+				_ = rows.Close()
+				return teamstore.State{}, err
+			}
+			var poll teamstore.ChatPollState
+			if err := json.Unmarshal(raw, &poll); err != nil {
+				_ = rows.Close()
+				return teamstore.State{}, fmt.Errorf("decode replay poll snapshot row: %w", err)
+			}
+			if strings.TrimSpace(poll.ChatID) == "" {
+				poll.ChatID = chatID
+			}
+			if strings.TrimSpace(poll.ChatID) != strings.TrimSpace(chatID) {
+				_ = rows.Close()
+				return teamstore.State{}, errors.New("replay poll snapshot row identity mismatch")
+			}
+			state.ChatPolls[poll.ChatID] = poll
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return teamstore.State{}, err
+		}
+		if err := rows.Close(); err != nil {
+			return teamstore.State{}, err
+		}
 	}
-	return out, turnRows.Close()
+	return state, nil
+}
+
+func dockerRealDataSyntheticOutboxPendingFromSQLite(ctx context.Context, path string) (int64, error) {
+	query := url.Values{}
+	query.Set("mode", "ro")
+	db, err := sql.Open("sqlite", teamsSQLiteFileURI(path, query))
+	if err != nil {
+		return 0, err
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	const pendingQuery = `
+		SELECT COUNT(*)
+		FROM outbox_messages
+		WHERE turn_id LIKE ?
+		  AND CASE
+			WHEN status IN (?, ?, ?) THEN 1
+			WHEN status IN (?, ?) THEN COALESCE(post_send_effects_pending, 0)
+			WHEN trim(COALESCE(status, '')) <> '' THEN 1
+			ELSE 0
+		  END = 1`
+	var pending int64
+	err = db.QueryRowContext(ctx, pendingQuery,
+		"docker-real-data-turn-%",
+		teamstore.OutboxStatusQueued,
+		teamstore.OutboxStatusSending,
+		teamstore.OutboxStatusAccepted,
+		teamstore.OutboxStatusSent,
+		teamstore.OutboxStatusSkipped,
+	).Scan(&pending)
+	return pending, err
+}
+
+func dockerRealDataCompleteDrainReady(expected int, counts dockerRealDataCounts, served map[string]int, before, state teamstore.State, corpus map[string][]ChatMessage, pendingOutbox int64, unknownGraphPaths int) bool {
+	// Interrupted turns can be a terminal, explicitly ignored helper-message
+	// disposition. The exhaustive per-message audit after shutdown verifies that
+	// relationship; this fast gate must not mistake a terminal interrupted row
+	// for unfinished execution work.
+	if expected <= 0 || counts.inbound != int64(expected) || counts.failed != 0 || counts.queued != 0 || counts.running != 0 {
+		return false
+	}
+	if pendingOutbox != 0 || unknownGraphPaths != 0 {
+		return false
+	}
+	if len(dockerRealDataNewPollRecoveryChats(before, state, corpus)) != 0 ||
+		len(dockerRealDataPollRecoverySafetyRegressions(before, state, corpus)) != 0 {
+		return false
+	}
+	audit := auditDockerRealDataChatDrain(state, corpus, served)
+	return audit.ExpectedMessages == expected && audit.ServedMessages == expected && len(audit.Mismatches) == 0
 }
 
 type dockerRealDataResiduals struct {
@@ -4221,6 +5196,222 @@ func dockerRealDataNewPollRecoveryChats(before, after teamstore.State, corpus ma
 	}
 	sort.Strings(newRecovery)
 	return newRecovery
+}
+
+// dockerRealDataPollRecoverySafetyRegressions catches a durable safe-boundary
+// advance while the same inherited gap epoch remains open. Recovery metadata
+// may persist or change during a catch-up pass; the gap's safe cursor is the
+// no-skip boundary and must not move forward until that gap is closed.
+func dockerRealDataPollRecoverySafetyRegressions(before, after teamstore.State, corpus map[string][]ChatMessage) []string {
+	regressions := make([]string, 0)
+	for rawChatID := range corpus {
+		chatID := strings.TrimSpace(rawChatID)
+		if chatID == "" {
+			continue
+		}
+		beforePoll, foundBefore := before.ChatPolls[chatID]
+		afterPoll, foundAfter := after.ChatPolls[chatID]
+		if !foundBefore || !foundAfter || beforePoll.Gap == nil || afterPoll.Gap == nil ||
+			beforePoll.Gap.Epoch != afterPoll.Gap.Epoch {
+			continue
+		}
+		if afterPoll.Gap.SafeCursor.After(beforePoll.Gap.SafeCursor) {
+			regressions = append(regressions, chatID+":safe-cursor-advanced")
+		}
+	}
+	sort.Strings(regressions)
+	return regressions
+}
+
+// dockerRealDataPollRecoveryResiduals reports recovery state newly
+// created or changed by the experiment. A copied production database may
+// already contain a continuation, attempt, pending receipt, or active gap; an
+// unchanged inherited frontier is reported separately by the experiment and
+// must not prevent corpus drain acceptance. Opaque Graph paths are never
+// included in diagnostics.
+func dockerRealDataPollRecoveryResiduals(before, after teamstore.State, corpus map[string][]ChatMessage) []string {
+	byChat := make(map[string]map[string]struct{})
+	add := func(chatID, reason string) {
+		if byChat[chatID] == nil {
+			byChat[chatID] = make(map[string]struct{})
+		}
+		byChat[chatID][reason] = struct{}{}
+	}
+	for rawChatID := range corpus {
+		chatID := strings.TrimSpace(rawChatID)
+		if chatID == "" {
+			continue
+		}
+		afterPoll, foundAfter := after.ChatPolls[chatID]
+		if !foundAfter {
+			continue
+		}
+		beforePoll, foundBefore := before.ChatPolls[chatID]
+		if !foundBefore {
+			beforePoll = teamstore.ChatPollState{}
+		}
+		if afterPoll.RecoveryRequired && (!beforePoll.RecoveryRequired ||
+			afterPoll.RecoveryReason != beforePoll.RecoveryReason || afterPoll.RecoverySourceHash != beforePoll.RecoverySourceHash) {
+			add(chatID, "recovery-required")
+		}
+		if afterPoll.Attempt != nil && (beforePoll.Attempt == nil || *afterPoll.Attempt != *beforePoll.Attempt) {
+			add(chatID, "attempt")
+		}
+		if afterPoll.PendingPage != nil {
+			if beforePoll.PendingPage == nil || afterPoll.PendingPage.ReceiptID != beforePoll.PendingPage.ReceiptID {
+				add(chatID, "pending-page")
+			} else if dockerRealDataPendingPageRefetchFailuresChanged(beforePoll.PendingPage, afterPoll.PendingPage) {
+				add(chatID, "pending-page-refetch-failure")
+			}
+		}
+		if afterPath := strings.TrimSpace(afterPoll.ContinuationPath); afterPath != "" && afterPath != strings.TrimSpace(beforePoll.ContinuationPath) {
+			add(chatID, "continuation")
+		}
+		if deferredPath := strings.TrimSpace(afterPoll.DeferredContinuationPath); deferredPath != "" && deferredPath != strings.TrimSpace(beforePoll.DeferredContinuationPath) {
+			add(chatID, "deferred-continuation")
+		}
+		if afterPoll.Gap != nil {
+			beforeGap := beforePoll.Gap
+			gapIdentityChanged := beforeGap == nil || afterPoll.Gap.Epoch != beforeGap.Epoch ||
+				afterPoll.Gap.Kind != beforeGap.Kind || afterPoll.Gap.Reason != beforeGap.Reason ||
+				afterPoll.Gap.Evidence != beforeGap.Evidence || afterPoll.Gap.FrontierPath != beforeGap.FrontierPath ||
+				!afterPoll.Gap.SafeCursor.Equal(beforeGap.SafeCursor) || !afterPoll.Gap.OpenedAt.Equal(beforeGap.OpenedAt)
+			if beforeGap != nil && !afterPoll.Gap.RecoveryCursor.Equal(beforeGap.RecoveryCursor) {
+				add(chatID, "gap-recovery-cursor")
+			}
+			if gapIdentityChanged {
+				add(chatID, "gap-identity-changed")
+			}
+			if recoveryPath := strings.TrimSpace(afterPoll.Gap.RecoveryPath); recoveryPath != "" &&
+				recoveryPath != strings.TrimSpace(beforeGapPath(beforeGap, false)) {
+				add(chatID, "gap-recovery-path")
+			}
+			if headPath := strings.TrimSpace(afterPoll.Gap.HeadProbeContinuationPath); headPath != "" &&
+				headPath != strings.TrimSpace(beforeGapPath(beforeGap, true)) {
+				add(chatID, "gap-head-continuation")
+			}
+			if strings.TrimSpace(afterPoll.Gap.RecoveryPath) == "" &&
+				strings.TrimSpace(afterPoll.Gap.HeadProbeContinuationPath) == "" &&
+				!afterPoll.Gap.HeadProbePending && (gapIdentityChanged || beforeGap == nil || beforeGap.HeadProbePending ||
+				strings.TrimSpace(beforeGap.RecoveryPath) != "" || strings.TrimSpace(beforeGap.HeadProbeContinuationPath) != "") {
+				// With no opaque link or scheduled head probe, the gap's next
+				// action is the bounded recovery query. Keep it in the drain
+				// residual set when the experiment newly made it actionable. An
+				// unchanged active recovery query is inherited state, just like an
+				// unchanged continuation, and is not attributed to this replay.
+				add(chatID, "gap-recovery-pending")
+			}
+			if (afterPoll.Gap.QuarantinedPage == nil) != (beforeGap == nil || beforeGap.QuarantinedPage == nil) {
+				add(chatID, "quarantined-page")
+			} else if afterPoll.Gap.QuarantinedPage != nil && beforeGap != nil && beforeGap.QuarantinedPage != nil &&
+				afterPoll.Gap.QuarantinedPage.ReceiptID != beforeGap.QuarantinedPage.ReceiptID {
+				add(chatID, "quarantined-page")
+			}
+		}
+		if afterPoll.ContinuationFailureCount > beforePoll.ContinuationFailureCount {
+			add(chatID, "continuation-failure")
+		}
+		if afterPoll.ContinuationNoProgressCount > beforePoll.ContinuationNoProgressCount {
+			add(chatID, "continuation-no-progress")
+		}
+		if !dockerRealDataSameStrings(afterPoll.QuarantinedRecordIDs, beforePoll.QuarantinedRecordIDs) {
+			add(chatID, "quarantined-records-changed")
+		}
+	}
+	chatIDs := make([]string, 0, len(byChat))
+	for chatID := range byChat {
+		chatIDs = append(chatIDs, chatID)
+	}
+	sort.Strings(chatIDs)
+	residuals := make([]string, 0, len(chatIDs))
+	for _, chatID := range chatIDs {
+		reasons := make([]string, 0, len(byChat[chatID]))
+		for reason := range byChat[chatID] {
+			reasons = append(reasons, reason)
+		}
+		sort.Strings(reasons)
+		residuals = append(residuals, fmt.Sprintf("%s:%s", chatID, strings.Join(reasons, ",")))
+	}
+	return residuals
+}
+
+func beforeGapPath(gap *teamstore.ChatPollGap, headProbe bool) string {
+	if gap == nil {
+		return ""
+	}
+	if headProbe {
+		return gap.HeadProbeContinuationPath
+	}
+	return gap.RecoveryPath
+}
+
+func dockerRealDataPendingPageRefetchFailuresChanged(before, after *teamstore.ChatPollPendingPage) bool {
+	if before == nil || after == nil {
+		return before != after
+	}
+	count := len(before.RefetchFailures)
+	if len(after.RefetchFailures) > count {
+		count = len(after.RefetchFailures)
+	}
+	for i := 0; i < count; i++ {
+		beforeFailures, afterFailures := 0, 0
+		if i < len(before.RefetchFailures) {
+			beforeFailures = before.RefetchFailures[i]
+		}
+		if i < len(after.RefetchFailures) {
+			afterFailures = after.RefetchFailures[i]
+		}
+		if beforeFailures != afterFailures {
+			return true
+		}
+	}
+	return false
+}
+
+func dockerRealDataCredentialRejectionAudit(corpus map[string][]ChatMessage, state teamstore.State) (detected, redacted, notYetDurable, mismatches int) {
+	inboundByKey := make(map[string]teamstore.InboundEvent, len(state.InboundEvents))
+	for _, inbound := range state.InboundEvents {
+		key := strings.TrimSpace(inbound.TeamsChatID) + "\x00" + strings.TrimSpace(inbound.TeamsMessageID)
+		inboundByKey[key] = inbound
+	}
+	for chatID, messages := range corpus {
+		chatID = strings.TrimSpace(chatID)
+		for _, msg := range messages {
+			text := promptTextFromTeamsMessageHTML(msg.Body.Content)
+			routeText := commandRouteTextFromTeamsMessage(msg, text)
+			if modelAPIKeyPreflightMessage(routeText) == "" {
+				continue
+			}
+			detected++
+			key := chatID + "\x00" + strings.TrimSpace(msg.ID)
+			inbound, found := inboundByKey[key]
+			if !found {
+				notYetDurable++
+				continue
+			}
+			if inbound.Status != teamstore.InboundStatusIgnored || inbound.Source != rejectedModelAPIKeyInboundSource ||
+				inbound.Text != rejectedModelAPIKeyInboundText || inbound.TeamsBodyType != "text" ||
+				strings.TrimSpace(inbound.TeamsBodyHTML) != "" || len(inbound.TeamsAttachments) != 0 ||
+				strings.TrimSpace(inbound.TurnID) != "" {
+				mismatches++
+				continue
+			}
+			redacted++
+		}
+	}
+	return detected, redacted, notYetDurable, mismatches
+}
+
+func dockerRealDataSameStrings(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if strings.TrimSpace(left[index]) != strings.TrimSpace(right[index]) {
+			return false
+		}
+	}
+	return true
 }
 
 // dockerRealDataPostStateFromSQLite reconstructs only the synthetic rows that
@@ -4435,7 +5626,7 @@ func dockerRealDataPostStateFromSQLite(ctx context.Context, path string, corpus 
 // the copied production store is valid history and must not make a successful
 // synthetic drain impossible. Unknown/non-terminal states are counted rather
 // than silently ignored.
-func dockerRealDataSyntheticResiduals(state teamstore.State, corpus map[string][]ChatMessage) dockerRealDataResiduals {
+func dockerRealDataSyntheticResiduals(before, state teamstore.State, corpus map[string][]ChatMessage) dockerRealDataResiduals {
 	var residual dockerRealDataResiduals
 	for _, inbound := range state.InboundEvents {
 		if !strings.HasPrefix(strings.TrimSpace(inbound.TeamsMessageID), dockerRealDataMessageIDPrefix) {
@@ -4475,16 +5666,428 @@ func dockerRealDataSyntheticResiduals(state teamstore.State, corpus map[string][
 			}
 		}
 	}
-	residual.PollRecovery = len(dockerRealDataPollRecoveryChats(state, corpus))
+	residual.PollRecovery = len(dockerRealDataPollRecoveryResiduals(before, state, corpus))
 	return residual
 }
 
+// dockerRealDataSyntheticResidualDiagnostics explains which selected chat
+// still owns synthetic durable work without logging message bodies or opaque
+// Graph continuation URLs. It is deliberately called only on failed complete
+// drains, where aggregate residual counts are not enough to distinguish a
+// stuck turn from an undelivered continuation page.
+func dockerRealDataSyntheticResidualDiagnostics(state teamstore.State, corpus map[string][]ChatMessage, served map[string]int, graphPages func(string) int) []string {
+	type chatDiagnostic struct {
+		chatID          string
+		expected        int
+		served          int
+		inbound         int
+		completed       int
+		failed          int
+		queued          int
+		running         int
+		interrupted     int
+		outboxPending   int
+		missingGraph    []string
+		missingInbound  []string
+		unfinishedTurns []string
+		pendingOutboxes []string
+	}
+	diagnostics := make(map[string]*chatDiagnostic, len(corpus))
+	inboundByMessageID := make(map[string]teamstore.InboundEvent)
+	for chatID, messages := range corpus {
+		chatID = strings.TrimSpace(chatID)
+		if chatID == "" {
+			continue
+		}
+		diagnostics[chatID] = &chatDiagnostic{chatID: chatID, expected: len(messages)}
+	}
+	for _, inbound := range state.InboundEvents {
+		if !strings.HasPrefix(strings.TrimSpace(inbound.TeamsMessageID), dockerRealDataMessageIDPrefix) {
+			continue
+		}
+		inboundByMessageID[strings.TrimSpace(inbound.TeamsMessageID)] = inbound
+		diagnostic := diagnostics[strings.TrimSpace(inbound.TeamsChatID)]
+		if diagnostic == nil {
+			continue
+		}
+		diagnostic.inbound++
+		turn, found := state.Turns[strings.TrimSpace(inbound.TurnID)]
+		if !found {
+			if inbound.Status != teamstore.InboundStatusIgnored {
+				diagnostic.unfinishedTurns = appendBoundedDiagnostic(diagnostic.unfinishedTurns, "missing-turn:"+strings.TrimSpace(inbound.TurnID), 6)
+			}
+			continue
+		}
+		switch turn.Status {
+		case teamstore.TurnStatusCompleted:
+			diagnostic.completed++
+		case teamstore.TurnStatusFailed:
+			diagnostic.failed++
+		case teamstore.TurnStatusQueued:
+			diagnostic.queued++
+			diagnostic.unfinishedTurns = appendBoundedDiagnostic(diagnostic.unfinishedTurns, dockerRealDataTurnDiagnostic(turn), 6)
+		case teamstore.TurnStatusRunning:
+			diagnostic.running++
+			diagnostic.unfinishedTurns = appendBoundedDiagnostic(diagnostic.unfinishedTurns, dockerRealDataTurnDiagnostic(turn), 6)
+		case teamstore.TurnStatusInterrupted:
+			diagnostic.interrupted++
+			diagnostic.unfinishedTurns = appendBoundedDiagnostic(diagnostic.unfinishedTurns, dockerRealDataTurnDiagnostic(turn), 6)
+		default:
+			diagnostic.unfinishedTurns = appendBoundedDiagnostic(diagnostic.unfinishedTurns, dockerRealDataTurnDiagnostic(turn), 6)
+		}
+	}
+	for _, outbox := range state.OutboxMessages {
+		if !strings.HasPrefix(strings.TrimSpace(outbox.TurnID), "docker-real-data-turn-") &&
+			!strings.HasPrefix(strings.TrimSpace(outbox.Body), dockerRealDataExecutionPrefix) {
+			continue
+		}
+		pending := false
+		switch outbox.Status {
+		case teamstore.OutboxStatusQueued, teamstore.OutboxStatusSending, teamstore.OutboxStatusAccepted:
+			pending = true
+		case teamstore.OutboxStatusSent, teamstore.OutboxStatusSkipped:
+			pending = outbox.PostSendEffectsPending
+		default:
+			pending = strings.TrimSpace(string(outbox.Status)) != ""
+		}
+		if !pending {
+			continue
+		}
+		diagnostic := diagnostics[strings.TrimSpace(outbox.TeamsChatID)]
+		if diagnostic == nil {
+			continue
+		}
+		diagnostic.outboxPending++
+		diagnostic.pendingOutboxes = appendBoundedDiagnostic(diagnostic.pendingOutboxes, fmt.Sprintf("%s:%s turn=%s", strings.TrimSpace(outbox.ID), outbox.Status, strings.TrimSpace(outbox.TurnID)), 6)
+	}
+	for chatID, messages := range corpus {
+		diagnostic := diagnostics[strings.TrimSpace(chatID)]
+		if diagnostic == nil {
+			continue
+		}
+		for _, message := range messages {
+			messageID := strings.TrimSpace(message.ID)
+			if served[messageID] > 0 {
+				diagnostic.served++
+			} else {
+				diagnostic.missingGraph = appendBoundedDiagnostic(diagnostic.missingGraph, messageID, 6)
+			}
+			if _, foundInbound := inboundByMessageID[messageID]; !foundInbound {
+				diagnostic.missingInbound = appendBoundedDiagnostic(diagnostic.missingInbound, messageID, 6)
+			}
+		}
+	}
+
+	chatIDs := make([]string, 0, len(diagnostics))
+	for chatID := range diagnostics {
+		chatIDs = append(chatIDs, chatID)
+	}
+	sort.Strings(chatIDs)
+	lines := make([]string, 0)
+	for _, chatID := range chatIDs {
+		diagnostic := diagnostics[chatID]
+		poll, hasPoll := state.ChatPolls[chatID]
+		pollRecovery := hasPoll && dockerRealDataPollHasRecovery(poll)
+		if diagnostic.missingGraph == nil && diagnostic.missingInbound == nil && diagnostic.unfinishedTurns == nil && diagnostic.pendingOutboxes == nil && !pollRecovery {
+			continue
+		}
+		pageCount := 0
+		if graphPages != nil {
+			pageCount = graphPages(chatID)
+		}
+		pollSummary := "missing"
+		if hasPoll {
+			pollSummary = fmt.Sprintf("state=%s failures=%d cursor=%s next=%s last_success=%s blocked=%s recovery_required=%t attempt=%t pending_page=%t gap=%t continuation=%t deferred=%t continuation_pages=%d no_progress=%d revision=%d/%d",
+				poll.PollState,
+				poll.FailureCount,
+				formatDockerRealDataDiagnosticTime(poll.LastModifiedCursor),
+				formatDockerRealDataDiagnosticTime(poll.NextPollAt),
+				formatDockerRealDataDiagnosticTime(poll.LastSuccessfulPollAt),
+				formatDockerRealDataDiagnosticTime(poll.BlockedUntil),
+				poll.RecoveryRequired,
+				poll.Attempt != nil,
+				poll.PendingPage != nil,
+				poll.Gap != nil,
+				strings.TrimSpace(poll.ContinuationPath) != "",
+				strings.TrimSpace(poll.DeferredContinuationPath) != "",
+				poll.ContinuationPageCount,
+				poll.ContinuationNoProgressCount,
+				poll.PollRevision,
+				poll.ScheduleRevision)
+		}
+		lines = append(lines, fmt.Sprintf("chat=%q expected=%d served=%d inbound=%d completed=%d failed=%d queued=%d running=%d interrupted=%d outbox_pending=%d graph_pages=%d missing_graph=%v missing_inbound=%v unfinished_turns=%v pending_outboxes=%v poll_recovery=%t poll={%s}",
+			diagnostic.chatID,
+			diagnostic.expected,
+			diagnostic.served,
+			diagnostic.inbound,
+			diagnostic.completed,
+			diagnostic.failed,
+			diagnostic.queued,
+			diagnostic.running,
+			diagnostic.interrupted,
+			diagnostic.outboxPending,
+			pageCount,
+			diagnostic.missingGraph,
+			diagnostic.missingInbound,
+			diagnostic.unfinishedTurns,
+			diagnostic.pendingOutboxes,
+			pollRecovery,
+			pollSummary))
+	}
+	if len(lines) > 24 {
+		omitted := len(lines) - 24
+		lines = append(lines[:24], fmt.Sprintf("... %d additional residual chats omitted", omitted))
+	}
+	return lines
+}
+
+func dockerRealDataSyntheticLaggingChats(state teamstore.State, corpus map[string][]ChatMessage) []string {
+	inbound := make(map[string]struct{}, len(state.InboundEvents))
+	for _, event := range state.InboundEvents {
+		messageID := strings.TrimSpace(event.TeamsMessageID)
+		if strings.HasPrefix(messageID, dockerRealDataMessageIDPrefix) {
+			inbound[messageID] = struct{}{}
+		}
+	}
+	lagging := make([]string, 0)
+	for rawChatID, messages := range corpus {
+		chatID := strings.TrimSpace(rawChatID)
+		for _, message := range messages {
+			if _, found := inbound[strings.TrimSpace(message.ID)]; !found {
+				lagging = append(lagging, chatID)
+				break
+			}
+		}
+	}
+	sort.Strings(lagging)
+	return lagging
+}
+
+func appendBoundedDiagnostic(values []string, value string, limit int) []string {
+	if limit > 0 && len(values) >= limit {
+		return values
+	}
+	return append(values, value)
+}
+
+func dockerRealDataTurnDiagnostic(turn teamstore.Turn) string {
+	return fmt.Sprintf("%s:%s session=%s machine=%s generation=%d queued=%s started=%s updated=%s",
+		strings.TrimSpace(turn.ID),
+		turn.Status,
+		strings.TrimSpace(turn.SessionID),
+		strings.TrimSpace(turn.MachineID),
+		turn.LeaseGeneration,
+		formatDockerRealDataDiagnosticTime(turn.QueuedAt),
+		formatDockerRealDataDiagnosticTime(turn.StartedAt),
+		formatDockerRealDataDiagnosticTime(turn.UpdatedAt))
+}
+
+func formatDockerRealDataDiagnosticTime(value time.Time) string {
+	if value.IsZero() {
+		return "-"
+	}
+	return value.UTC().Format(time.RFC3339)
+}
+
+func TestDockerRealDataSyntheticResidualDiagnosticsAreBoundedAndRedacted(t *testing.T) {
+	const chatID = "chat-with-residual"
+	const messageID = dockerRealDataMessageIDPrefix + "sample"
+	const turnID = "docker-real-data-turn-sample"
+	const continuationSecret = "opaque-provider-token-must-not-be-logged"
+	state := teamstore.State{
+		InboundEvents: map[string]teamstore.InboundEvent{
+			"inbound-sample": {
+				ID:             "inbound-sample",
+				TeamsChatID:    chatID,
+				TeamsMessageID: messageID,
+				Status:         teamstore.InboundStatusQueued,
+				TurnID:         turnID,
+				TeamsBodyHTML:  "private message body must not be logged",
+			},
+		},
+		Turns: map[string]teamstore.Turn{
+			turnID: {
+				ID:             turnID,
+				SessionID:      "session-sample",
+				Status:         teamstore.TurnStatusQueued,
+				RecoveryReason: "private message body must not be logged",
+			},
+		},
+		ChatPolls: map[string]teamstore.ChatPollState{
+			chatID: {
+				ChatID:           chatID,
+				PollState:        inboundPollStateWarm,
+				ContinuationPath: "/chats/chat/messages?$skiptoken=" + continuationSecret,
+			},
+		},
+	}
+	corpus := map[string][]ChatMessage{
+		chatID: {{ID: messageID}},
+	}
+	lines := dockerRealDataSyntheticResidualDiagnostics(state, corpus, map[string]int{}, func(gotChat string) int {
+		if gotChat != chatID {
+			t.Fatalf("graph page counter received chat %q, want %q", gotChat, chatID)
+		}
+		return 2
+	})
+	if len(lines) != 1 {
+		t.Fatalf("residual diagnostic lines = %v, want one chat", lines)
+	}
+	line := lines[0]
+	for _, expected := range []string{"expected=1", "inbound=1", "queued=1", "graph_pages=2", "continuation=true", turnID} {
+		if !strings.Contains(line, expected) {
+			t.Errorf("residual diagnostic %q does not contain %q", line, expected)
+		}
+	}
+	for _, forbidden := range []string{continuationSecret, "private message body"} {
+		if strings.Contains(line, forbidden) {
+			t.Errorf("residual diagnostic leaked sensitive data %q: %s", forbidden, line)
+		}
+	}
+}
+
 type dockerRealDataCorrelationAudit struct {
-	Unresolved          int64
-	MissingTurn         int64
-	DuplicateTurn       int64
-	MissingMessageIDs   []string
-	DuplicateMessageIDs []string
+	Unresolved            int64
+	MissingTurn           int64
+	DuplicateTurn         int64
+	IgnoredMessages       int64
+	IgnoredNoTurnMessages int64
+	MissingMessageIDs     []string
+	DuplicateMessageIDs   []string
+}
+
+func dockerRealDataAccountedInbound(counts dockerRealDataCounts, ignoredWithoutTurn int64) int64 {
+	return counts.completed + counts.failed + counts.queued + counts.running + counts.interrupted + ignoredWithoutTurn
+}
+
+func TestDockerRealDataAccountedInboundIncludesTerminalNoTurnIgnoresOnce(t *testing.T) {
+	cases := []struct {
+		name               string
+		counts             dockerRealDataCounts
+		ignoredWithoutTurn int64
+	}{
+		{
+			name:               "completed plus explicit ignored inbound",
+			counts:             dockerRealDataCounts{inbound: 2, completed: 1},
+			ignoredWithoutTurn: 1,
+		},
+		{
+			name:   "interrupted ignored turn is already counted by status",
+			counts: dockerRealDataCounts{inbound: 1, interrupted: 1},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := dockerRealDataAccountedInbound(tc.counts, tc.ignoredWithoutTurn); got != tc.counts.inbound {
+				t.Fatalf("accounted inbound=%d, want %d", got, tc.counts.inbound)
+			}
+		})
+	}
+}
+
+type dockerRealDataInboundTurnRef struct {
+	inboundID string
+	messageID string
+	turnID    string
+}
+
+func dockerRealDataSyntheticInboundTurnRefs(ctx context.Context, db *sql.DB) ([]dockerRealDataInboundTurnRef, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT id, teams_message_id, json
+		FROM inbound_events
+		WHERE teams_message_id LIKE ?`, dockerRealDataMessageIDPrefix+"%")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	refs := make([]dockerRealDataInboundTurnRef, 0)
+	for rows.Next() {
+		var rowID, messageID string
+		var raw []byte
+		if err := rows.Scan(&rowID, &messageID, &raw); err != nil {
+			return nil, err
+		}
+		rowID = strings.TrimSpace(rowID)
+		messageID = strings.TrimSpace(messageID)
+		var inbound teamstore.InboundEvent
+		if err := json.Unmarshal(raw, &inbound); err != nil {
+			return nil, fmt.Errorf("decode synthetic inbound %q for turn correlation: %w", rowID, err)
+		}
+		if strings.TrimSpace(inbound.ID) != rowID || strings.TrimSpace(inbound.TeamsMessageID) != messageID {
+			return nil, fmt.Errorf("synthetic inbound identity mismatch: row=%q json_id=%q row_message=%q json_message=%q", rowID, inbound.ID, messageID, inbound.TeamsMessageID)
+		}
+		refs = append(refs, dockerRealDataInboundTurnRef{
+			inboundID: rowID,
+			messageID: messageID,
+			turnID:    strings.TrimSpace(inbound.TurnID),
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return refs, rows.Close()
+}
+
+func dockerRealDataTurnsByInboundTurnID(ctx context.Context, db *sql.DB, refs []dockerRealDataInboundTurnRef) (map[string]teamstore.Turn, error) {
+	turnIDSet := make(map[string]struct{}, len(refs))
+	for _, ref := range refs {
+		if ref.turnID != "" {
+			turnIDSet[ref.turnID] = struct{}{}
+		}
+	}
+	turnIDs := make([]string, 0, len(turnIDSet))
+	for id := range turnIDSet {
+		turnIDs = append(turnIDs, id)
+	}
+	sort.Strings(turnIDs)
+	turnsByID := make(map[string]teamstore.Turn, len(turnIDs))
+	const batchSize = 400
+	for start := 0; start < len(turnIDs); start += batchSize {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		end := start + batchSize
+		if end > len(turnIDs) {
+			end = len(turnIDs)
+		}
+		batch := turnIDs[start:end]
+		placeholders := make([]string, len(batch))
+		args := make([]any, len(batch))
+		for index, id := range batch {
+			placeholders[index] = "?"
+			args[index] = id
+		}
+		rows, err := db.QueryContext(ctx, `SELECT id, json FROM turns WHERE id IN (`+strings.Join(placeholders, ",")+")", args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var rowID string
+			var raw []byte
+			if err := rows.Scan(&rowID, &raw); err != nil {
+				_ = rows.Close()
+				return nil, err
+			}
+			var turn teamstore.Turn
+			if err := json.Unmarshal(raw, &turn); err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("decode synthetic turn %q for inbound correlation: %w", rowID, err)
+			}
+			if strings.TrimSpace(turn.ID) != strings.TrimSpace(rowID) {
+				_ = rows.Close()
+				return nil, fmt.Errorf("synthetic turn identity mismatch: row=%q json_id=%q", rowID, turn.ID)
+			}
+			turnsByID[rowID] = turn
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, err
+		}
+	}
+	return turnsByID, nil
 }
 
 // dockerRealDataChatDrainAudit closes the gap between a global message count
@@ -4492,12 +6095,43 @@ type dockerRealDataCorrelationAudit struct {
 // replayed message under the same TeamsChatID it came from; otherwise one
 // healthy chat could compensate for an omitted or misrouted chat elsewhere.
 type dockerRealDataChatDrainAudit struct {
-	ExpectedChats     int
-	ExpectedMessages  int
-	ServedMessages    int
-	InboundMessages   int
-	CompletedMessages int
-	Mismatches        []string
+	ExpectedChats      int
+	ExpectedMessages   int
+	ServedMessages     int
+	InboundMessages    int
+	CompletedMessages  int
+	IgnoredMessages    int
+	UnclosedMessageIDs []string
+	Mismatches         []string
+}
+
+// dockerRealDataIgnoredInboundHasTerminalDisposition keeps the replay's
+// exhaustive audit aligned with the production handler's explicit no-op
+// policies. The duplicate source is written only after the production code
+// found a recent canonical turn with the same chat/session/text hash;
+// helper-rendered text is acceptable only as ignored input (or the matching
+// pre-execution interruption), never as a completed Codex turn.
+func dockerRealDataIgnoredInboundHasTerminalDisposition(inbound teamstore.InboundEvent, state teamstore.State) bool {
+	if inbound.Status != teamstore.InboundStatusIgnored {
+		return false
+	}
+	source := strings.TrimSpace(inbound.Source)
+	if source == rejectedModelAPIKeyInboundSource {
+		return strings.TrimSpace(inbound.TurnID) == "" && inbound.Text == rejectedModelAPIKeyInboundText &&
+			inbound.TeamsBodyType == "text" && strings.TrimSpace(inbound.TeamsBodyHTML) == "" && len(inbound.TeamsAttachments) == 0
+	}
+	if source == "teams_duplicate_prompt" {
+		return strings.TrimSpace(inbound.TurnID) == "" && inbound.TextHash != ""
+	}
+	if !IsHelperText(inbound.Text) {
+		return false
+	}
+	if strings.TrimSpace(inbound.TurnID) == "" {
+		return true
+	}
+	turn, found := state.Turns[strings.TrimSpace(inbound.TurnID)]
+	return found && strings.TrimSpace(turn.InboundEventID) == strings.TrimSpace(inbound.ID) && turn.Status == teamstore.TurnStatusInterrupted &&
+		strings.Contains(strings.ToLower(turn.RecoveryReason), "original message text was unavailable")
 }
 
 func auditDockerRealDataChatDrain(state teamstore.State, corpus map[string][]ChatMessage, served map[string]int) dockerRealDataChatDrainAudit {
@@ -4523,8 +6157,10 @@ func auditDockerRealDataChatDrain(state teamstore.State, corpus map[string][]Cha
 	servedByChat := make(map[string]int, len(corpus))
 	inboundByMessage := make(map[string]int)
 	completedByMessage := make(map[string]int)
+	ignoredByMessage := make(map[string]int)
 	inboundByChat := make(map[string]int, len(corpus))
 	completedByChat := make(map[string]int, len(corpus))
+	ignoredByChat := make(map[string]int, len(corpus))
 	for messageID, chatID := range expectedChatByMessage {
 		if served[messageID] > 0 {
 			audit.ServedMessages++
@@ -4544,20 +6180,26 @@ func auditDockerRealDataChatDrain(state teamstore.State, corpus map[string][]Cha
 			audit.Mismatches = append(audit.Mismatches, fmt.Sprintf("message %q durable chat=%q, expected chat=%q", messageID, strings.TrimSpace(inbound.TeamsChatID), chatID))
 		}
 		turn, found := state.Turns[strings.TrimSpace(inbound.TurnID)]
-		if found && turn.Status == teamstore.TurnStatusCompleted {
+		if found && strings.TrimSpace(turn.InboundEventID) == strings.TrimSpace(inbound.ID) && turn.Status == teamstore.TurnStatusCompleted {
 			completedByMessage[messageID]++
 			completedByChat[chatID]++
 			audit.CompletedMessages++
+		} else if dockerRealDataIgnoredInboundHasTerminalDisposition(inbound, state) {
+			ignoredByMessage[messageID]++
+			ignoredByChat[chatID]++
+			audit.IgnoredMessages++
 		}
 	}
 	for messageID, chatID := range expectedChatByMessage {
-		if served[messageID] <= 0 || inboundByMessage[messageID] != 1 || completedByMessage[messageID] != 1 {
-			audit.Mismatches = append(audit.Mismatches, fmt.Sprintf("message %q chat=%q served=%d inbound=%d completed=%d", messageID, chatID, served[messageID], inboundByMessage[messageID], completedByMessage[messageID]))
+		if served[messageID] <= 0 || inboundByMessage[messageID] != 1 || completedByMessage[messageID]+ignoredByMessage[messageID] != 1 {
+			audit.UnclosedMessageIDs = append(audit.UnclosedMessageIDs, messageID)
+			audit.Mismatches = append(audit.Mismatches, fmt.Sprintf("message %q chat=%q served=%d inbound=%d completed=%d ignored_terminal=%d", messageID, chatID, served[messageID], inboundByMessage[messageID], completedByMessage[messageID], ignoredByMessage[messageID]))
 		}
 	}
+	sort.Strings(audit.UnclosedMessageIDs)
 	for chatID, expected := range expectedByChat {
-		if servedByChat[chatID] != expected || inboundByChat[chatID] != expected || completedByChat[chatID] != expected {
-			audit.Mismatches = append(audit.Mismatches, fmt.Sprintf("chat %q expected=%d served=%d inbound=%d completed=%d", chatID, expected, servedByChat[chatID], inboundByChat[chatID], completedByChat[chatID]))
+		if servedByChat[chatID] != expected || inboundByChat[chatID] != expected || completedByChat[chatID]+ignoredByChat[chatID] != expected {
+			audit.Mismatches = append(audit.Mismatches, fmt.Sprintf("chat %q expected=%d served=%d inbound=%d completed=%d ignored_terminal=%d", chatID, expected, servedByChat[chatID], inboundByChat[chatID], completedByChat[chatID], ignoredByChat[chatID]))
 		}
 	}
 	if len(audit.Mismatches) > 32 {
@@ -4578,9 +6220,9 @@ func TestDockerRealDataChatDrainAudit(t *testing.T) {
 			"in-b-1": {ID: "in-b-1", TeamsChatID: "chat-b", TeamsMessageID: "docker-real-data:b-1", TurnID: "turn-b-1"},
 		},
 		Turns: map[string]teamstore.Turn{
-			"turn-a-1": {ID: "turn-a-1", Status: teamstore.TurnStatusCompleted},
-			"turn-a-2": {ID: "turn-a-2", Status: teamstore.TurnStatusCompleted},
-			"turn-b-1": {ID: "turn-b-1", Status: teamstore.TurnStatusCompleted},
+			"turn-a-1": {ID: "turn-a-1", InboundEventID: "in-a-1", Status: teamstore.TurnStatusCompleted},
+			"turn-a-2": {ID: "turn-a-2", InboundEventID: "in-a-2", Status: teamstore.TurnStatusCompleted},
+			"turn-b-1": {ID: "turn-b-1", InboundEventID: "in-b-1", Status: teamstore.TurnStatusCompleted},
 		},
 	}
 	audit := auditDockerRealDataChatDrain(state, corpus, map[string]int{
@@ -4593,11 +6235,61 @@ func TestDockerRealDataChatDrainAudit(t *testing.T) {
 	}
 }
 
-// dockerRealDataDurableCorrelationAudit verifies the stronger invariant that
-// every synthetic inbound event has exactly one durable turn. Complete mode
-// also requires that turn to reach completion; throughput mode intentionally
-// allows the measured window to stop with a queued turn, while still rejecting
-// duplicate admission or an inbound row that never acquired a turn.
+func TestDockerRealDataChatDrainDoesNotWaiveMissingIDForInheritedGap(t *testing.T) {
+	const messageID = dockerRealDataMessageIDPrefix + "missing-under-inherited-gap"
+	const chatID = "chat-with-inherited-gap"
+	state := teamstore.State{
+		ChatPolls: map[string]teamstore.ChatPollState{
+			chatID: {ChatID: chatID, Gap: &teamstore.ChatPollGap{Epoch: 4, Kind: "unverified-continuation", Reason: "HTTP 429"}},
+		},
+	}
+	corpus := map[string][]ChatMessage{chatID: {{ID: messageID}}}
+	audit := auditDockerRealDataChatDrain(state, corpus, map[string]int{messageID: 1})
+	if audit.InboundMessages != 0 || len(audit.Mismatches) == 0 || !reflect.DeepEqual(audit.UnclosedMessageIDs, []string{messageID}) {
+		t.Fatalf("missing replay ID was waived by inherited poll gap: audit=%#v", audit)
+	}
+}
+
+func TestDockerRealDataChatDrainAuditAcceptsOnlyExplicitTerminalIgnores(t *testing.T) {
+	corpus := map[string][]ChatMessage{
+		"chat-a": {{ID: "docker-real-data:done"}, {ID: "docker-real-data:duplicate"}, {ID: "docker-real-data:helper"}, {ID: "docker-real-data:unexplained-ignore"}},
+	}
+	state := teamstore.State{
+		InboundEvents: map[string]teamstore.InboundEvent{
+			"in-done":        {ID: "in-done", SessionID: "session-a", TeamsChatID: "chat-a", TeamsMessageID: "docker-real-data:done", TurnID: "turn-done", Status: teamstore.InboundStatusQueued},
+			"in-duplicate":   {ID: "in-duplicate", SessionID: "session-a", TeamsChatID: "chat-a", TeamsMessageID: "docker-real-data:duplicate", Status: teamstore.InboundStatusIgnored, Source: "teams_duplicate_prompt", TextHash: "duplicate-hash"},
+			"in-helper":      {ID: "in-helper", SessionID: "session-a", TeamsChatID: "chat-a", TeamsMessageID: "docker-real-data:helper", TurnID: "turn-helper", Status: teamstore.InboundStatusIgnored, Text: "Codex: helper echo"},
+			"in-unexplained": {ID: "in-unexplained", SessionID: "session-a", TeamsChatID: "chat-a", TeamsMessageID: "docker-real-data:unexplained-ignore", Status: teamstore.InboundStatusIgnored, Source: "teams", Text: "real user request"},
+		},
+		Turns: map[string]teamstore.Turn{
+			"turn-done":   {ID: "turn-done", InboundEventID: "in-done", Status: teamstore.TurnStatusCompleted},
+			"turn-helper": {ID: "turn-helper", InboundEventID: "in-helper", Status: teamstore.TurnStatusInterrupted, RecoveryReason: "deferred Teams input could not be resumed because the original message text was unavailable. Please resend it."},
+		},
+	}
+	audit := auditDockerRealDataChatDrain(state, corpus, map[string]int{
+		"docker-real-data:done":               1,
+		"docker-real-data:duplicate":          1,
+		"docker-real-data:helper":             1,
+		"docker-real-data:unexplained-ignore": 1,
+	})
+	hasUnexplainedMessageMismatch := false
+	hasChatAggregateMismatch := false
+	for _, mismatch := range audit.Mismatches {
+		hasUnexplainedMessageMismatch = hasUnexplainedMessageMismatch || strings.Contains(mismatch, "unexplained-ignore")
+		hasChatAggregateMismatch = hasChatAggregateMismatch || strings.HasPrefix(mismatch, `chat "chat-a"`)
+	}
+	if audit.CompletedMessages != 1 || audit.IgnoredMessages != 2 || len(audit.Mismatches) != 2 ||
+		!hasUnexplainedMessageMismatch || !hasChatAggregateMismatch {
+		t.Fatalf("chat drain audit = %#v, want one completion, two explicit terminal ignores, and both message/chat evidence for the unexplained ignore", audit)
+	}
+}
+
+// dockerRealDataDurableCorrelationAudit verifies that every synthetic inbound
+// event's canonical durable turn exists exactly once and, in complete mode,
+// reached completion. The replay path uses deterministic inbound-derived turn
+// IDs, so resolve only those primary keys; scanning every historical turn's
+// JSON to discover a relationship already recorded on the synthetic inbound
+// would make each resume decode the entire production turns table.
 func dockerRealDataDurableCorrelationAudit(ctx context.Context, path string, requireCompleted bool) (dockerRealDataCorrelationAudit, error) {
 	var audit dockerRealDataCorrelationAudit
 	query := url.Values{}
@@ -4609,42 +6301,61 @@ func dockerRealDataDurableCorrelationAudit(ctx context.Context, path string, req
 	defer db.Close()
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
-	turnStatus := dockerRealDataTurnStatusSQL("t")
-	turnInboundID := dockerRealDataTurnInboundIDSQL("t")
 	rows, err := db.QueryContext(ctx, `
-		SELECT i.teams_message_id, t.id, `+turnStatus+`
-		FROM inbound_events i
-		LEFT JOIN turns t ON `+turnInboundID+` = i.id
-		WHERE i.teams_message_id LIKE ?
-		ORDER BY i.teams_message_id, t.id`, dockerRealDataMessageIDPrefix+"%")
+		SELECT id, teams_message_id, json
+		FROM inbound_events
+		WHERE teams_message_id LIKE ?`, dockerRealDataMessageIDPrefix+"%")
 	if err != nil {
 		return audit, err
 	}
 	type correlation struct {
+		inbounds  int
 		turns     int
 		completed int
+		inbound   teamstore.InboundEvent
 	}
 	byMessage := make(map[string]*correlation)
+	inboundByMessage := make(map[string]teamstore.InboundEvent)
+	type inboundTurnRef struct {
+		inboundID string
+		messageID string
+		turnID    string
+	}
+	refs := make([]inboundTurnRef, 0)
+	turnIDSet := make(map[string]struct{})
 	for rows.Next() {
-		var messageID string
-		var turnID sql.NullString
-		var status sql.NullString
-		if err := rows.Scan(&messageID, &turnID, &status); err != nil {
+		var rowID, messageID string
+		var raw []byte
+		if err := rows.Scan(&rowID, &messageID, &raw); err != nil {
 			_ = rows.Close()
 			return audit, err
+		}
+		messageID = strings.TrimSpace(messageID)
+		var inbound teamstore.InboundEvent
+		if err := json.Unmarshal(raw, &inbound); err != nil {
+			_ = rows.Close()
+			return audit, fmt.Errorf("decode synthetic inbound %q for turn correlation: %w", rowID, err)
+		}
+		if strings.TrimSpace(inbound.ID) != strings.TrimSpace(rowID) || strings.TrimSpace(inbound.TeamsMessageID) != messageID {
+			_ = rows.Close()
+			return audit, fmt.Errorf("synthetic inbound identity mismatch: row=%q json_id=%q row_message=%q json_message=%q", rowID, inbound.ID, messageID, inbound.TeamsMessageID)
 		}
 		entry := byMessage[messageID]
 		if entry == nil {
 			entry = &correlation{}
 			byMessage[messageID] = entry
 		}
-		if !turnID.Valid || strings.TrimSpace(turnID.String) == "" {
+		entry.inbounds++
+		if entry.inbounds == 1 {
+			entry.inbound = inbound
+		}
+		inboundByMessage[messageID] = inbound
+		turnID := strings.TrimSpace(inbound.TurnID)
+		if turnID == "" {
 			continue
 		}
-		entry.turns++
-		if teamstore.TurnStatus(status.String) == teamstore.TurnStatusCompleted {
-			entry.completed++
-		}
+		refs = append(refs, inboundTurnRef{inboundID: strings.TrimSpace(rowID), messageID: messageID, turnID: turnID})
+		turnIDSet[turnID] = struct{}{}
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
@@ -4653,22 +6364,267 @@ func dockerRealDataDurableCorrelationAudit(ctx context.Context, path string, req
 	if err := rows.Close(); err != nil {
 		return audit, err
 	}
+	turnIDs := make([]string, 0, len(turnIDSet))
+	for id := range turnIDSet {
+		turnIDs = append(turnIDs, id)
+	}
+	sort.Strings(turnIDs)
+	turnsByID := make(map[string]teamstore.Turn, len(turnIDs))
+	const turnLookupBatchSize = 400
+	for start := 0; start < len(turnIDs); start += turnLookupBatchSize {
+		if err := ctx.Err(); err != nil {
+			return audit, err
+		}
+		end := start + turnLookupBatchSize
+		if end > len(turnIDs) {
+			end = len(turnIDs)
+		}
+		batch := turnIDs[start:end]
+		placeholders := make([]string, len(batch))
+		args := make([]any, len(batch))
+		for index, id := range batch {
+			placeholders[index] = "?"
+			args[index] = id
+		}
+		turnRows, err := db.QueryContext(ctx, `SELECT id, json FROM turns WHERE id IN (`+strings.Join(placeholders, ",")+")", args...)
+		if err != nil {
+			return audit, err
+		}
+		for turnRows.Next() {
+			var rowID string
+			var raw []byte
+			if err := turnRows.Scan(&rowID, &raw); err != nil {
+				_ = turnRows.Close()
+				return audit, err
+			}
+			var turn teamstore.Turn
+			if err := json.Unmarshal(raw, &turn); err != nil {
+				_ = turnRows.Close()
+				return audit, fmt.Errorf("decode synthetic turn %q for inbound correlation: %w", rowID, err)
+			}
+			if strings.TrimSpace(turn.ID) != strings.TrimSpace(rowID) {
+				_ = turnRows.Close()
+				return audit, fmt.Errorf("synthetic turn identity mismatch: row=%q json_id=%q", rowID, turn.ID)
+			}
+			turnsByID[rowID] = turn
+		}
+		if err := turnRows.Err(); err != nil {
+			_ = turnRows.Close()
+			return audit, err
+		}
+		if err := turnRows.Close(); err != nil {
+			return audit, err
+		}
+	}
+	for _, ref := range refs {
+		turn, found := turnsByID[ref.turnID]
+		if !found || strings.TrimSpace(turn.InboundEventID) != ref.inboundID {
+			continue
+		}
+		entry := byMessage[ref.messageID]
+		entry.turns++
+		if turn.Status == teamstore.TurnStatusCompleted {
+			entry.completed++
+		}
+	}
 	for messageID, entry := range byMessage {
+		ignoredTerminal := entry.inbounds == 1 && dockerRealDataIgnoredInboundHasTerminalDisposition(entry.inbound, teamstore.State{
+			InboundEvents: inboundByMessage,
+			Turns:         turnsByID,
+		})
+		if ignoredTerminal {
+			audit.IgnoredMessages++
+			if strings.TrimSpace(entry.inbound.TurnID) == "" {
+				audit.IgnoredNoTurnMessages++
+			}
+		}
 		switch {
-		case entry.turns == 0:
+		case entry.turns == 0 && !ignoredTerminal:
 			audit.MissingTurn++
 			audit.MissingMessageIDs = append(audit.MissingMessageIDs, messageID)
 		case entry.turns > 1:
 			audit.DuplicateTurn++
 			audit.DuplicateMessageIDs = append(audit.DuplicateMessageIDs, messageID)
 		}
-		if entry.turns != 1 || (requireCompleted && entry.completed != 1) {
+		if entry.inbounds != 1 || (!ignoredTerminal && entry.turns != 1) || (requireCompleted && !ignoredTerminal && entry.completed != 1) {
 			audit.Unresolved++
 		}
 	}
 	sort.Strings(audit.MissingMessageIDs)
 	sort.Strings(audit.DuplicateMessageIDs)
 	return audit, nil
+}
+
+func TestDockerRealDataDurableCorrelationAuditUsesInboundTurnIDs(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "correlation.sqlite")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE inbound_events (id TEXT PRIMARY KEY, teams_message_id TEXT, json BLOB NOT NULL);
+CREATE TABLE turns (id TEXT PRIMARY KEY, json BLOB NOT NULL);`); err != nil {
+		t.Fatal(err)
+	}
+	insertInboundEvent := func(inbound teamstore.InboundEvent) {
+		t.Helper()
+		raw, marshalErr := json.Marshal(inbound)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		if _, insertErr := db.Exec(`INSERT INTO inbound_events(id, teams_message_id, json) VALUES (?, ?, ?)`, inbound.ID, inbound.TeamsMessageID, raw); insertErr != nil {
+			t.Fatal(insertErr)
+		}
+	}
+	insertInbound := func(id, messageID, turnID string) {
+		t.Helper()
+		insertInboundEvent(teamstore.InboundEvent{ID: id, TeamsMessageID: messageID, TurnID: turnID})
+	}
+	insertTurn := func(id, inboundID string, status teamstore.TurnStatus) {
+		t.Helper()
+		turn := teamstore.Turn{ID: id, InboundEventID: inboundID, Status: status}
+		raw, marshalErr := json.Marshal(turn)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		if _, insertErr := db.Exec(`INSERT INTO turns(id, json) VALUES (?, ?)`, id, raw); insertErr != nil {
+			t.Fatal(insertErr)
+		}
+	}
+
+	insertInbound("in-good", dockerRealDataMessageIDPrefix+"good", "turn-good")
+	insertTurn("turn-good", "in-good", teamstore.TurnStatusCompleted)
+	insertInbound("in-missing", dockerRealDataMessageIDPrefix+"missing", "turn-missing")
+	insertInbound("in-mismatch", dockerRealDataMessageIDPrefix+"mismatch", "turn-mismatch")
+	insertTurn("turn-mismatch", "another-inbound", teamstore.TurnStatusCompleted)
+	insertInbound("in-duplicate-a", dockerRealDataMessageIDPrefix+"duplicate", "turn-duplicate-a")
+	insertInbound("in-duplicate-b", dockerRealDataMessageIDPrefix+"duplicate", "turn-duplicate-b")
+	insertTurn("turn-duplicate-a", "in-duplicate-a", teamstore.TurnStatusCompleted)
+	insertTurn("turn-duplicate-b", "in-duplicate-b", teamstore.TurnStatusCompleted)
+	insertInbound("in-queued", dockerRealDataMessageIDPrefix+"queued", "turn-queued")
+	insertTurn("turn-queued", "in-queued", teamstore.TurnStatusQueued)
+	insertInboundEvent(teamstore.InboundEvent{ID: "in-deduped", TeamsMessageID: dockerRealDataMessageIDPrefix + "deduped", Status: teamstore.InboundStatusIgnored, Source: "teams_duplicate_prompt", TextHash: "duplicate-hash"})
+	insertInboundEvent(teamstore.InboundEvent{ID: "in-helper", TeamsMessageID: dockerRealDataMessageIDPrefix + "helper", TurnID: "turn-helper", Status: teamstore.InboundStatusIgnored, Text: "Codex: helper echo"})
+	helperTurn := teamstore.Turn{ID: "turn-helper", InboundEventID: "in-helper", Status: teamstore.TurnStatusInterrupted, RecoveryReason: "deferred Teams input could not be resumed because the original message text was unavailable. Please resend it."}
+	helperTurnJSON, marshalErr := json.Marshal(helperTurn)
+	if marshalErr != nil {
+		t.Fatal(marshalErr)
+	}
+	if _, err := db.Exec(`INSERT INTO turns(id, json) VALUES (?, ?)`, helperTurn.ID, helperTurnJSON); err != nil {
+		t.Fatal(err)
+	}
+	insertInboundEvent(teamstore.InboundEvent{ID: "in-unexplained-ignore", TeamsMessageID: dockerRealDataMessageIDPrefix + "unexplained-ignore", Status: teamstore.InboundStatusIgnored, Source: "teams", Text: "not a helper echo"})
+	// Historical unrelated rows may contain large or legacy payloads. The
+	// targeted audit must not decode them just to check synthetic inbound rows.
+	if _, err := db.Exec(`INSERT INTO turns(id, json) VALUES (?, ?)`, "legacy-unrelated", []byte("not-json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := dockerRealDataDurableCorrelationAudit(context.Background(), path, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.MissingTurn != 3 || got.DuplicateTurn != 1 || got.IgnoredMessages != 2 || got.IgnoredNoTurnMessages != 1 || got.Unresolved != 4 ||
+		!reflect.DeepEqual(got.MissingMessageIDs, []string{dockerRealDataMessageIDPrefix + "mismatch", dockerRealDataMessageIDPrefix + "missing", dockerRealDataMessageIDPrefix + "unexplained-ignore"}) ||
+		!reflect.DeepEqual(got.DuplicateMessageIDs, []string{dockerRealDataMessageIDPrefix + "duplicate"}) {
+		t.Fatalf("inbound/turn audit = %#v, want missing=3 duplicate=1 ignored=2 unresolved=4 with exact IDs", got)
+	}
+	got, err = dockerRealDataDurableCorrelationAudit(context.Background(), path, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.MissingTurn != 3 || got.DuplicateTurn != 1 || got.IgnoredMessages != 2 || got.IgnoredNoTurnMessages != 1 || got.Unresolved != 5 {
+		t.Fatalf("complete inbound/turn audit = %#v, want queued canonical turn and unexplained ignore included as unresolved", got)
+	}
+}
+
+func TestDockerRealDataCountsFromSQLiteHydratesOnlySyntheticTurns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "counts.sqlite")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`
+		CREATE TABLE inbound_events (id TEXT PRIMARY KEY, teams_message_id TEXT, json BLOB NOT NULL);
+		CREATE TABLE turns (
+			id TEXT PRIMARY KEY,
+			status TEXT NOT NULL DEFAULT '',
+			canonical_revision INTEGER NOT NULL DEFAULT 0,
+			projection_revision INTEGER NOT NULL DEFAULT 0,
+			projection_trusted INTEGER NOT NULL DEFAULT 0,
+			json BLOB NOT NULL
+		);`); err != nil {
+		t.Fatal(err)
+	}
+	insertInbound := func(id, messageID, turnID string) {
+		t.Helper()
+		inbound := teamstore.InboundEvent{ID: id, TeamsMessageID: messageID, TurnID: turnID}
+		raw, marshalErr := json.Marshal(inbound)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		if _, insertErr := db.Exec(`INSERT INTO inbound_events(id, teams_message_id, json) VALUES (?, ?, ?)`, id, messageID, raw); insertErr != nil {
+			t.Fatal(insertErr)
+		}
+	}
+	insertTurn := func(id, inboundID string, jsonStatus, scalarStatus teamstore.TurnStatus, trusted bool) {
+		t.Helper()
+		turn := teamstore.Turn{ID: id, InboundEventID: inboundID, Status: jsonStatus}
+		raw, marshalErr := json.Marshal(turn)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		trustedProjection := 0
+		canonicalRevision, projectionRevision := int64(0), int64(0)
+		if trusted {
+			trustedProjection = 1
+			canonicalRevision, projectionRevision = 1, 1
+		}
+		if _, insertErr := db.Exec(`
+			INSERT INTO turns(id, status, canonical_revision, projection_revision, projection_trusted, json)
+			VALUES (?, ?, ?, ?, ?, ?)`, id, scalarStatus, canonicalRevision, projectionRevision, trustedProjection, raw); insertErr != nil {
+			t.Fatal(insertErr)
+		}
+	}
+
+	insertInbound("in-good", dockerRealDataMessageIDPrefix+"good", "turn-good")
+	insertTurn("turn-good", "in-good", teamstore.TurnStatusCompleted, teamstore.TurnStatusCompleted, true)
+	insertInbound("in-missing", dockerRealDataMessageIDPrefix+"missing", "turn-missing")
+	insertInbound("in-mismatch", dockerRealDataMessageIDPrefix+"mismatch", "turn-mismatch")
+	insertTurn("turn-mismatch", "another-inbound", teamstore.TurnStatusCompleted, teamstore.TurnStatusCompleted, true)
+	insertInbound("in-duplicate-a", dockerRealDataMessageIDPrefix+"duplicate", "turn-duplicate-a")
+	insertInbound("in-duplicate-b", dockerRealDataMessageIDPrefix+"duplicate", "turn-duplicate-b")
+	insertTurn("turn-duplicate-a", "in-duplicate-a", teamstore.TurnStatusCompleted, teamstore.TurnStatusCompleted, true)
+	insertTurn("turn-duplicate-b", "in-duplicate-b", teamstore.TurnStatusCompleted, teamstore.TurnStatusCompleted, true)
+	insertInbound("in-queued", dockerRealDataMessageIDPrefix+"queued", "turn-queued")
+	insertTurn("turn-queued", "in-queued", teamstore.TurnStatusQueued, teamstore.TurnStatusQueued, true)
+	insertInbound("in-untrusted", dockerRealDataMessageIDPrefix+"untrusted", "turn-untrusted")
+	insertTurn("turn-untrusted", "in-untrusted", teamstore.TurnStatusRunning, teamstore.TurnStatusCompleted, false)
+	insertInbound("in-non-synthetic", "production-message", "turn-non-synthetic")
+	insertTurn("turn-non-synthetic", "in-non-synthetic", teamstore.TurnStatusCompleted, teamstore.TurnStatusCompleted, true)
+	if _, err := db.Exec(`INSERT INTO inbound_events(id, teams_message_id, json) VALUES (?, ?, ?)`, "in-malformed", dockerRealDataMessageIDPrefix+"malformed", []byte("not-json")); err != nil {
+		t.Fatal(err)
+	}
+	// This historical row must not be decoded while counting the synthetic
+	// workload. Its primary key cannot match any selected inbound turn ID.
+	if _, err := db.Exec(`INSERT INTO turns(id, json) VALUES (?, ?)`, "legacy-unrelated", []byte("not-json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := dockerRealDataCountsFromSQLite(context.Background(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := dockerRealDataCounts{inbound: 8, completed: 3, queued: 1, running: 1}
+	if got != want {
+		t.Fatalf("synthetic SQLite counts = %#v, want %#v", got, want)
+	}
 }
 
 func dockerRealDataDurableCorrelation(ctx context.Context, path string, requireCompleted bool) (int64, error) {
@@ -6144,6 +8100,62 @@ func TestDockerRealDataThroughputGateExcludesGracefulDrain(t *testing.T) {
 	}
 }
 
+func TestDockerRealDataSyntheticBacklogIncludesServedButNotAdmittedMessages(t *testing.T) {
+	tests := []struct {
+		name         string
+		counts       dockerRealDataCounts
+		baseline     int64
+		servedUnique int
+		want         bool
+	}{
+		{
+			name:   "queued turn",
+			counts: dockerRealDataCounts{queued: 1},
+			want:   true,
+		},
+		{
+			name:   "running turn",
+			counts: dockerRealDataCounts{running: 1},
+			want:   true,
+		},
+		{
+			name:         "Graph page awaiting durable inbound admission",
+			counts:       dockerRealDataCounts{inbound: 2},
+			baseline:     2,
+			servedUnique: 1,
+			want:         true,
+		},
+		{
+			name:         "served page fully represented by new durable inbound rows",
+			counts:       dockerRealDataCounts{inbound: 5},
+			baseline:     2,
+			servedUnique: 3,
+			want:         false,
+		},
+		{
+			name:         "resume compares only this process progress",
+			counts:       dockerRealDataCounts{inbound: 12},
+			baseline:     10,
+			servedUnique: 2,
+			want:         false,
+		},
+		{
+			name:         "resume detects a newly served pending receipt",
+			counts:       dockerRealDataCounts{inbound: 12},
+			baseline:     10,
+			servedUnique: 3,
+			want:         true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := dockerRealDataSyntheticBacklogHasOutstandingWork(tt.counts, tt.baseline, tt.servedUnique); got != tt.want {
+				t.Fatalf("synthetic backlog = %t, want %t for counts=%#v baseline=%d served=%d", got, tt.want, tt.counts, tt.baseline, tt.servedUnique)
+			}
+		})
+	}
+}
+
 func TestDockerRealDataMeasuredCompletionUsesDurableTransitionTime(t *testing.T) {
 	started := time.Unix(100, 0).UTC()
 	ended := started.Add(time.Second)
@@ -6310,6 +8322,14 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read copied real-data baseline inbound/turn correlation: %v", err)
 	}
+	priorSyntheticServedIDs := make(map[string]struct{})
+	if resume {
+		priorSyntheticInboundIDs, readErr := dockerRealDataSyntheticInboundIDs(ctx, filepath.Join(filepath.Dir(statePath), teamstore.SQLiteFileName))
+		if readErr != nil {
+			t.Fatalf("read previously durable synthetic inbound IDs for resume coverage: %v", readErr)
+		}
+		priorSyntheticServedIDs = dockerRealDataPriorSyntheticServedIDs(beforeState, priorSyntheticInboundIDs)
+	}
 	if !resume && beforeCounts.inbound != 0 {
 		t.Fatalf("copied runtime already contains synthetic inbound rows before experiment: %d", beforeCounts.inbound)
 	}
@@ -6322,20 +8342,25 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	var resumeWitnessOutboxID string
 	var resumeUnknownPostWitness dockerRealDataUnknownPostWitness
 	if resume {
-		witness := readDockerRealDataUnknownPostWitness(t, statePath)
-		resumeUnknownPostWitness = witness
-		resumeWitnessOutboxID = witness.OutboxID
-		ambiguous, found, witnessErr := dockerRealDataOutboxMessageByIDReadOnly(ctx, filepath.Join(filepath.Dir(statePath), teamstore.SQLiteFileName), witness.OutboxID)
-		if witnessErr != nil {
-			t.Fatalf("read real-data resume outbox witness: %v", witnessErr)
+		witnessPath := dockerRealDataUnknownPostWitnessPath(statePath)
+		if _, statErr := os.Lstat(witnessPath); os.IsNotExist(statErr) && mode == dockerRealDataModeComplete {
+			t.Log("real-data complete-mode resume: no ambiguous-POST witness was created by the prior complete-mode run")
+		} else {
+			witness := readDockerRealDataUnknownPostWitness(t, statePath)
+			resumeUnknownPostWitness = witness
+			resumeWitnessOutboxID = witness.OutboxID
+			ambiguous, found, witnessErr := dockerRealDataOutboxMessageByIDReadOnly(ctx, filepath.Join(filepath.Dir(statePath), teamstore.SQLiteFileName), witness.OutboxID)
+			if witnessErr != nil {
+				t.Fatalf("read real-data resume outbox witness: %v", witnessErr)
+			}
+			if !found {
+				t.Fatalf("real-data resume lost the durable outbox selected by the previous unknown POST: witness=%#v", witness)
+			}
+			if strings.TrimSpace(ambiguous.TeamsChatID) != witness.ChatID || dockerRealDataOutboxBodyHash(ambiguous.Body) != witness.BodyHash || !dockerRealDataUnknownPostDispositionSafe(ambiguous) {
+				t.Fatalf("real-data resume changed the durable unknown-POST witness: witness=%#v row=%#v", witness, ambiguous)
+			}
+			t.Logf("real-data resume audit: retained ambiguous outbox=%q for chat=%q; the process must not POST it again", ambiguous.ID, ambiguous.TeamsChatID)
 		}
-		if !found {
-			t.Fatalf("real-data resume lost the durable outbox selected by the previous unknown POST: witness=%#v", witness)
-		}
-		if strings.TrimSpace(ambiguous.TeamsChatID) != witness.ChatID || dockerRealDataOutboxBodyHash(ambiguous.Body) != witness.BodyHash || !dockerRealDataUnknownPostDispositionSafe(ambiguous) {
-			t.Fatalf("real-data resume changed the durable unknown-POST witness: witness=%#v row=%#v", witness, ambiguous)
-		}
-		t.Logf("real-data resume audit: retained ambiguous outbox=%q for chat=%q; the second process must not POST it again", ambiguous.ID, ambiguous.TeamsChatID)
 	}
 
 	// The source snapshot may contain the live helper's lease. Retire it only in
@@ -6369,7 +8394,7 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	registry.UserID = user.ID
 	registry.UserPrincipal = user.UserPrincipalName
 	laggingManifest := dockerRealDataQueuedWorkChatManifest(beforeState, beforeState.ControlChat.TeamsChatID)
-	t.Logf("real-data lagging work-chat manifest: queued_work_chats=%d active_session_chats=%d orphan_chats=%d orphan_ids=%v actionable_orphan_chats=%d actionable_orphan_ids=%v terminal_queued_provenance_chats=%d terminal_ids=%v", len(laggingManifest.AllChatIDs), len(laggingManifest.ActiveChatIDs), len(laggingManifest.OrphanChatIDs), laggingManifest.OrphanChatIDs, len(laggingManifest.ActionableOrphanChatIDs), laggingManifest.ActionableOrphanChatIDs, len(laggingManifest.TerminalQueuedChatIDs), laggingManifest.TerminalQueuedChatIDs)
+	t.Logf("real-data lagging work-chat manifest: queued_work_chats=%d active_session_chats=%d orphan_chats=%d orphan_ids=%v actionable_orphan_chats=%d actionable_orphan_ids=%v terminal_queued_provenance_chats=%d", len(laggingManifest.AllChatIDs), len(laggingManifest.ActiveChatIDs), len(laggingManifest.OrphanChatIDs), laggingManifest.OrphanChatIDs, len(laggingManifest.ActionableOrphanChatIDs), laggingManifest.ActionableOrphanChatIDs, len(laggingManifest.TerminalQueuedChatIDs))
 	if requireAllLagging && len(laggingManifest.ActionableOrphanChatIDs) != 0 {
 		t.Fatalf("exhaustive all-lagging proof found actionable queued work chats without an active durable session: orphan_chats=%v; refusing to call the active-session subset complete", laggingManifest.ActionableOrphanChatIDs)
 	}
@@ -6380,7 +8405,10 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 		replayCorpus, replayCount = readDockerRealDataReplayCorpus(t, statePath)
 		t.Logf("real-data replay resume: loaded persisted corpus messages=%d chats=%d from disposable runtime", replayCount, len(replayCorpus))
 	} else {
-		replayCorpus, replayCount, replayReport = dockerRealDataReplayCorpus(beforeState, beforeState.ControlChat.TeamsChatID)
+		replayCorpus, replayCount, replayReport = dockerRealDataReplayCorpus(beforeState, beforeState.ControlChat.TeamsChatID, time.Now().UTC(), duration)
+		if timelineErr := dockerRealDataReplayTimelineError(replayReport, duration); timelineErr != nil {
+			t.Fatalf("replay timeline is not valid for the measured window: %v; source_span=%s missing_source_times=%d", timelineErr, replayReport.ReplaySourceSpan, replayReport.ReplayMissingSourceTime)
+		}
 		t.Logf("real-data replay source audit: %+v", replayReport)
 		if replayReport.ExcludedMalformed > 0 || replayReport.ExcludedEmptyActionable > 0 || replayReport.ExcludedUnsupported > 0 {
 			t.Fatalf("copied real-data snapshot contains active queued rows outside the ordinary replay contract: %+v; refusing a partial/false-green experiment", replayReport)
@@ -6425,7 +8453,7 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	if replayCount < dockerRealDataMinimumReplay {
 		t.Fatalf("copied real-data snapshot produced only %d ordinary queued Teams messages for replay; refusing a smoke-sized workload", replayCount)
 	}
-	t.Logf("real-data replay corpus: queued Teams payloads=%d chats=%d; bodies/authors/order copied from durable rows, only IDs/timestamps remapped", replayCount, len(replayCorpus))
+	t.Logf("real-data replay corpus: queued Teams payloads=%d chats=%d; bodies/authors/order copied from durable rows, only IDs/timestamps remapped; source timestamps are durable ReceivedAt/CreatedAt, and the static fake Graph exposes the full backlog on the first eligible request", replayCount, len(replayCorpus))
 	scheduleNow := time.Now()
 	replayChats, emptyChats := prepareDockerRealDataPollSchedules(t, store, beforeState, replayCorpus, beforeState.ControlChat.TeamsChatID, scheduleNow)
 	// The copied production snapshot can contain hundreds of active chats whose
@@ -6478,7 +8506,7 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	const graphToken = "docker-real-data-deterministic-token"
 	graphServerState := newDockerRealDataGraphServer(graphToken, user, replayCorpus)
 	graphServerState.controlChatID = beforeState.ControlChat.TeamsChatID
-	if resume {
+	if resume && resumeWitnessOutboxID != "" {
 		graphServerState.setDurableUnknownPostWitness(resumeUnknownPostWitness)
 	}
 	// Arm the unknown-result fault only for the synthetic final body emitted by
@@ -6654,7 +8682,8 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 			if countErr != nil {
 				return false, countErr
 			}
-			return counts.queued > 0 || counts.running > 0, nil
+			servedUnique := len(graphServerState.servedMessages())
+			return dockerRealDataSyntheticBacklogHasOutstandingWork(counts, beforeCounts.inbound, servedUnique), nil
 		},
 	}
 	t.Logf("real-data linked discovery candidates: unindexed_active_sessions=%d", len(linkedUnindexed))
@@ -6681,8 +8710,10 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	var runStartedAt []time.Time
 	var syntheticTurnsBeforeRun []map[string]dockerRealDataSyntheticTurnObservation
 	var correlationBeforeRun []dockerRealDataCorrelationAudit
+	var postWindowDrainFailure error
 	phaseNames := dockerRealDataProductionPhaseNames()
 	runListener := func(activeStore *teamstore.Store) error {
+		postWindowDrainFailure = nil
 		thisRunStartedAt := time.Now()
 		turnSnapshot, snapshotErr := dockerRealDataSyntheticTurnSnapshot(ctx, filepath.Join(filepath.Dir(statePath), teamstore.SQLiteFileName))
 		if snapshotErr != nil {
@@ -6728,11 +8759,15 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 			traceWriter.recordLeaseClaimWitness(activeStore)
 		}
 		bridge.ownerFailureHook = traceWriter.recordOwnerFailure
+		bridge.ownerGenerationExitHook = func(duration time.Duration, err error) {
+			_, _ = fmt.Fprintf(traceWriter, "Teams owner generation ended duration=%s lease_generation=%d err=%v\n", duration, bridge.currentLeaseGeneration(), err)
+		}
 		bridge.pollChatTraceHook = traceWriter.recordPollChat
 		bridge.mainLoopPhaseTraceHook = func(name string, duration time.Duration, err error) {
 			traceWriter.recordTiming("phase."+strings.TrimSpace(name), duration, err)
 		}
 		bridge.pollDecisionTraceHook = func(stage string, decisions []inboundPollDecision) {
+			traceWriter.recordPollDecisionStage(stage, decisions)
 			traceWriter.recordPollSelection(stage, graphServerState.faultChatSnapshot(), decisions)
 		}
 		bridge.outboxPhaseTraceHook = func(name string, duration time.Duration, err error) {
@@ -6771,10 +8806,12 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 			traceWriter.recordTiming("linked.job", duration, err)
 		}
 		cycleDone := make(chan struct{}, 1)
+		var lastCycleAt atomic.Int64
 		var measuredWindowCompleted atomic.Bool
 		var startupTimedOut atomic.Bool
 		var measuredWindow dockerRealDataMeasuredWindow
 		bridge.mainLoopCycleDoneHook = func() {
+			lastCycleAt.Store(time.Now().UnixNano())
 			select {
 			case cycleDone <- struct{}{}:
 			default:
@@ -6782,6 +8819,87 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 		}
 		ownerTrace := startDockerRealDataOwnerTrace(bridge)
 		listenCtx, listenCancel := context.WithCancel(ctx)
+		livenessWatchStart := make(chan struct{})
+		livenessFailure := make(chan error, 1)
+		var livenessWatchDone chan struct{}
+		if requireAllLagging && mode == dockerRealDataModeComplete {
+			livenessWatchDone = make(chan struct{})
+			go func() {
+				defer close(livenessWatchDone)
+				select {
+				case <-livenessWatchStart:
+				case <-listenCtx.Done():
+					return
+				}
+				ticker := time.NewTicker(dockerRealDataLivenessPollInterval)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ticker.C:
+					case <-listenCtx.Done():
+						return
+					}
+					now := time.Now()
+					lastCycle := time.Unix(0, lastCycleAt.Load())
+					var running []dockerRealDataSyntheticTurnObservation
+					sampleCtx, cancelSample := context.WithTimeout(listenCtx, 5*time.Second)
+					running, _ = dockerRealDataRunningSyntheticTurnSnapshot(sampleCtx, filepath.Join(filepath.Dir(statePath), teamstore.SQLiteFileName))
+					cancelSample()
+
+					reason := ""
+					var stalledTurn *dockerRealDataSyntheticTurnObservation
+					var turnTrace dockerRealDataQueuedTurnTrace
+					if !lastCycle.IsZero() && now.Sub(lastCycle) >= dockerRealDataLivenessStallAfter {
+						reason = fmt.Sprintf("main-loop cycle has not completed for %s", now.Sub(lastCycle).Round(time.Second))
+					}
+					for index := range running {
+						observation := running[index]
+						latest, found := traceWriter.queuedTurnTraceForID(observation.ID)
+						if !found || latest.At.Before(thisRunStartedAt) || now.Sub(latest.At) < dockerRealDataOrphanTurnStallAfter {
+							continue
+						}
+						stalledTurn = &observation
+						turnTrace = latest
+						reason = fmt.Sprintf("synthetic turn %q remains Running without a new lifecycle stage for %s", observation.ID, now.Sub(latest.At).Round(time.Second))
+						break
+					}
+					if reason == "" {
+						continue
+					}
+
+					phaseStats := make(map[string]mainLoopPhaseStats, len(phaseNames))
+					for _, phaseName := range phaseNames {
+						phaseStats[phaseName] = bridge.mainLoopPhaseStatsSnapshot(phaseName)
+					}
+					turnSummary := "none"
+					if stalledTurn != nil {
+						turnSummary = fmt.Sprintf("id=%q inbound=%q session=%q status=%s started=%s updated=%s reason=%q codex_thread=%q codex_turn=%q trace=%#v",
+							stalledTurn.ID, stalledTurn.InboundID, stalledTurn.SessionID, stalledTurn.Status,
+							stalledTurn.StartedAt.UTC().Format(time.RFC3339Nano), stalledTurn.UpdatedAt.UTC().Format(time.RFC3339Nano),
+							stalledTurn.RecoveryReason, stalledTurn.CodexThreadID, stalledTurn.CodexTurnID, turnTrace)
+					}
+					turnEvents := traceWriter.queuedTurnsSnapshot()
+					if len(turnEvents) > 32 {
+						turnEvents = turnEvents[len(turnEvents)-32:]
+					}
+					stack := make([]byte, 1<<20)
+					stackBytes := runtime.Stack(stack, true)
+					stackText := string(stack[:stackBytes])
+					if stackBytes == len(stack) {
+						stackText += "\n[goroutine stack truncated]"
+					}
+					generationIDs, ownerChangeCount := ownerTrace.snapshot()
+					failure := fmt.Errorf("all-lagging liveness watchdog: %s; since_last_cycle=%s active_async_turns=%d active_executor_runs=%d executor_runs=%d running_synthetic_turns=%d graph_list_gets=%d graph_posts=%d owner_generations=%v owner_changes=%d phases=%#v turn=%s recent_turn_events=%v stalled_turn_events=%v goroutines:\n%s",
+						reason, now.Sub(lastCycle).Round(time.Second), bridge.activeAsyncTurnCount(), executor.activeRuns(), executor.runs.Load(), len(running), graphServerState.listGETs.Load(), graphServerState.posts.Load(), generationIDs, ownerChangeCount, phaseStats, turnSummary, turnEvents, turnTrace.Events, stackText)
+					select {
+					case livenessFailure <- failure:
+					default:
+					}
+					listenCancel()
+					return
+				}
+			}()
+		}
 		// Keep listener startup observable.  If initialization returns before the
 		// first cycle, waiting only on cycleDone would hide the real error behind
 		// the five-minute startup watchdog and make a Docker failure look like a
@@ -6833,6 +8951,8 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 				return
 			case <-ctx.Done():
 				return
+			case <-listenCtx.Done():
+				return
 			}
 			measuredWindow.before, measuredWindow.beforeCountsReadError = dockerRealDataCountsFromSQLite(ctx, filepath.Join(filepath.Dir(statePath), teamstore.SQLiteFileName))
 			if measuredWindow.beforeCountsReadError != nil {
@@ -6857,6 +8977,9 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 				measuredWindow.phaseDeadlinesAtMeasureStart[phaseName] = stats.DeadlineExceeded
 			}
 			measuredWindow.startedAt = time.Now()
+			if livenessWatchDone != nil {
+				close(livenessWatchStart)
+			}
 			timer := time.NewTimer(duration)
 			defer timer.Stop()
 			select {
@@ -6879,6 +9002,8 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 				}
 			case <-ctx.Done():
 				return
+			case <-listenCtx.Done():
+				return
 			}
 			// Ask the disposable executor to finish any already-admitted call and
 			// make later calls complete immediately. This gives the real listener a
@@ -6886,16 +9011,97 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 			// a timeout-driven cancel otherwise turns the last legitimate turn into
 			// an artificial Interrupted row.
 			executor.requestGracefulStop()
+			if requireAllLagging && mode == dockerRealDataModeComplete {
+				// Keep the production listener alive for a separate, unmeasured
+				// catch-up drain. A successful truncated page durably publishes its
+				// nextLink; stopping at the measurement timer can therefore leave a
+				// valid continuation even after the last message in the current page
+				// has reached a terminal inbound/turn disposition. Require a later
+				// complete poll cycle to consume those links before calling the
+				// all-lagging experiment complete. This drain is excluded from every
+				// throughput denominator and uses only bounded read-only SQLite
+				// checkpoints for its stop condition.
+				drainBufferedCycleSignals := func() {
+					for {
+						select {
+						case <-cycleDone:
+						default:
+							return
+						}
+					}
+				}
+				drainBufferedCycleSignals()
+				drainStarted := time.Now()
+				drainTimer := time.NewTimer(dockerRealDataCompleteDrainTimeout)
+				defer drainTimer.Stop()
+				var lastDrainCounts dockerRealDataCounts
+				var lastDrainPollFrontiers int
+				var lastDrainPollResiduals int
+				var lastDrainNewCleanRecovery int
+				var lastDrainOutboxPending int64
+				var lastDrainServed int
+				var lastDrainUnknownPaths int
+				var lastDrainReadFailed bool
+				drainComplete := false
+				for !drainComplete {
+					select {
+					case <-cycleDone:
+						checkpointCtx, cancelCheckpoint := context.WithTimeout(ctx, 10*time.Second)
+						sqlitePath := filepath.Join(filepath.Dir(statePath), teamstore.SQLiteFileName)
+						counts, countErr := dockerRealDataCountsFromSQLite(checkpointCtx, sqlitePath)
+						pollState, pollErr := dockerRealDataPollStateSnapshotFromSQLite(checkpointCtx, sqlitePath, replayCorpus)
+						pendingOutbox, outboxErr := dockerRealDataSyntheticOutboxPendingFromSQLite(checkpointCtx, sqlitePath)
+						lastDrainReadFailed = countErr != nil || pollErr != nil || outboxErr != nil
+						if !lastDrainReadFailed {
+							lastDrainCounts = counts
+							lastDrainPollFrontiers = len(dockerRealDataPollRecoveryChats(pollState, replayCorpus))
+							lastDrainPollResiduals = len(dockerRealDataPollRecoveryResiduals(beforeState, pollState, replayCorpus))
+							lastDrainNewCleanRecovery = len(dockerRealDataNewPollRecoveryChats(beforeState, pollState, replayCorpus))
+							lastDrainOutboxPending = pendingOutbox
+							servedForDrain := dockerRealDataCumulativeServedMessages(graphServerState.servedMessages(), priorSyntheticServedIDs)
+							lastDrainServed = len(servedForDrain)
+							lastDrainUnknownPaths = len(graphServerState.unknownPaths())
+							candidate := counts.inbound == int64(replayCount) && counts.failed == 0 && counts.queued == 0 && counts.running == 0 &&
+								lastDrainServed == replayCount && lastDrainNewCleanRecovery == 0 && pendingOutbox == 0 && lastDrainUnknownPaths == 0
+							if candidate {
+								completeState, stateErr := dockerRealDataPostStateFromSQLite(checkpointCtx, sqlitePath, replayCorpus)
+								if stateErr != nil {
+									lastDrainReadFailed = true
+								} else {
+									completeState.ChatPolls = pollState.ChatPolls
+									if dockerRealDataCompleteDrainReady(replayCount, counts, servedForDrain, beforeState, completeState, replayCorpus, pendingOutbox, lastDrainUnknownPaths) {
+										t.Logf("real-data post-measure catch-up drain: elapsed=%s inbound=%d/%d completed=%d failed=%d queued=%d running=%d interrupted=%d served=%d active_poll_frontiers=%d changed_poll_recovery=%d new_clean_chat_recovery=%d pending_outbox=%d unknown_graph_paths=%d", time.Since(drainStarted), counts.inbound, replayCount, counts.completed, counts.failed, counts.queued, counts.running, counts.interrupted, lastDrainServed, lastDrainPollFrontiers, lastDrainPollResiduals, lastDrainNewCleanRecovery, lastDrainOutboxPending, lastDrainUnknownPaths)
+										drainComplete = true
+									}
+								}
+							}
+						}
+						cancelCheckpoint()
+					case <-drainTimer.C:
+						postWindowDrainFailure = fmt.Errorf("post-measure catch-up drain timed out after %s: inbound=%d/%d completed=%d failed=%d queued=%d running=%d interrupted=%d served=%d active_poll_frontiers=%d changed_poll_recovery=%d new_clean_chat_recovery=%d pending_outbox=%d unknown_graph_paths=%d checkpoint_read_failed=%t", dockerRealDataCompleteDrainTimeout, lastDrainCounts.inbound, replayCount, lastDrainCounts.completed, lastDrainCounts.failed, lastDrainCounts.queued, lastDrainCounts.running, lastDrainCounts.interrupted, lastDrainServed, lastDrainPollFrontiers, lastDrainPollResiduals, lastDrainNewCleanRecovery, lastDrainOutboxPending, lastDrainUnknownPaths, lastDrainReadFailed)
+						t.Logf("real-data post-measure catch-up drain did not close: %v", postWindowDrainFailure)
+						drainComplete = true
+					case <-listenCtx.Done():
+						postWindowDrainFailure = errors.New("listener stopped before post-measure catch-up drain completed")
+						t.Logf("real-data post-measure catch-up drain did not close: %v", postWindowDrainFailure)
+						drainComplete = true
+					case <-ctx.Done():
+						postWindowDrainFailure = errors.New("experiment context ended before post-measure catch-up drain completed")
+						t.Logf("real-data post-measure catch-up drain did not close: %v", postWindowDrainFailure)
+						drainComplete = true
+					}
+				}
+			}
 			deadline := time.Now().Add(30 * time.Second)
 			for executor.activeRuns() > 0 && time.Now().Before(deadline) {
 				time.Sleep(10 * time.Millisecond)
 			}
-			// Do not wait for another full main-loop cycle here.  The executor
-			// and async admission boundaries are the durable completion boundary;
-			// allowing a fresh poll wave after the measured window can manufacture
-			// a phase deadline on a large real-data schedule and obscure the
-			// workload result.  Cancellation below still lets Listen finish its
-			// normal owner/lease cleanup path.
+			// Outside the explicit all-lagging catch-up drain above, do not wait for
+			// another full main-loop cycle here. The executor and async admission
+			// boundaries are the durable completion boundary; allowing an extra poll
+			// wave in throughput mode can manufacture a phase deadline on a large
+			// real-data schedule and obscure the workload result. Cancellation below
+			// still lets Listen finish its normal owner/lease cleanup path.
 			asyncTurnIdle := stopDockerRealDataAsyncAdmission(bridge)
 			asyncDeadline := time.Now().Add(30 * time.Second)
 			select {
@@ -6968,9 +9174,36 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 		}()
 		<-stopCoordinatorDone
 		listenCancel()
-		<-listenDone
+		var listenerStopError error
+		select {
+		case <-listenDone:
+		case <-time.After(30 * time.Second):
+			stack := make([]byte, 1<<20)
+			stackBytes := runtime.Stack(stack, true)
+			listenerStopError = fmt.Errorf("real-data listener did not stop within 30s after cancellation; phases=%#v goroutines:\n%s",
+				bridge.mainLoopPhaseStatsSnapshot("outbox"), string(stack[:stackBytes]))
+		}
 		ownerTrace.stopTrace()
+		if livenessWatchDone != nil {
+			select {
+			case <-livenessWatchDone:
+			case <-time.After(6 * time.Second):
+			}
+		}
+		var livenessErr error
+		select {
+		case livenessErr = <-livenessFailure:
+		default:
+		}
+		if livenessErr != nil {
+			return livenessErr
+		}
+		if listenerStopError != nil {
+			return listenerStopError
+		}
 		if startupTimedOut.Load() {
+			generations, changes := ownerTrace.snapshot()
+			t.Logf("real-data startup timeout owner generations=%v changes=%d", generations, changes)
 			if startupFailure != nil {
 				return fmt.Errorf("real-data listener startup did not complete a measured cycle: %w", startupFailure)
 			}
@@ -7088,6 +9321,7 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 		bridge.ownerFailureHook = traceWriter.recordOwnerFailure
 		bridge.pollChatTraceHook = traceWriter.recordPollChat
 		bridge.pollDecisionTraceHook = func(stage string, decisions []inboundPollDecision) {
+			traceWriter.recordPollDecisionStage(stage, decisions)
 			traceWriter.recordPollSelection(stage, graphServerState.faultChatSnapshot(), decisions)
 		}
 		bridge.queuedTurnTraceHook = traceWriter.recordQueuedTurn
@@ -7323,6 +9557,15 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read copied real-data result counters: %v", err)
 	}
+	measurementDuration := measuredElapsed
+	if measurementDuration <= 0 && measuredWindows > 0 {
+		measurementDuration = duration * time.Duration(measuredWindows)
+	}
+	if measurementDuration > 0 {
+		t.Logf("real-data measured-window result (acceptance remains separate): windows=%d duration=%s inbound=%d completed=%d completed_per_sec=%.3f executor_runs=%d; post_window_drain_failed=%t",
+			measuredWindows, measurementDuration, measuredInbound, measuredCompleted,
+			float64(measuredCompleted)/measurementDuration.Seconds(), measuredExecutorRuns, postWindowDrainFailure != nil)
+	}
 	postStateWitnessOutboxID := graphServerState.unknownPostOutboxIDSnapshot()
 	if resume {
 		postStateWitnessOutboxID = resumeWitnessOutboxID
@@ -7337,7 +9580,24 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	}
 	afterState.HistoryWatch = afterHistoryState.HistoryWatch
 	afterState.HistoryWatchReady = afterHistoryState.HistoryWatchReady
-	residuals := dockerRealDataSyntheticResiduals(afterState, replayCorpus)
+	if requireAllLagging && mode == dockerRealDataModeComplete {
+		detected, redacted, notYetDurable, mismatches := dockerRealDataCredentialRejectionAudit(replayCorpus, afterState)
+		t.Logf("real-data credential-rejection durable audit: detected=%d safely_redacted=%d not_yet_durable=%d mismatches=%d", detected, redacted, notYetDurable, mismatches)
+		if detected == 0 || redacted != detected || notYetDurable != 0 || mismatches != 0 {
+			t.Fatalf("complete real-data replay did not durably redact every preflight-rejected credential message: detected=%d safely_redacted=%d not_yet_durable=%d mismatches=%d", detected, redacted, notYetDurable, mismatches)
+		}
+	}
+	residuals := dockerRealDataSyntheticResiduals(beforeState, afterState, replayCorpus)
+	earlyMeasuredElapsed := measuredElapsed
+	if earlyMeasuredElapsed <= 0 {
+		earlyMeasuredElapsed = duration * time.Duration(measuredWindows)
+	}
+	if earlyMeasuredElapsed <= 0 {
+		earlyMeasuredElapsed = time.Since(runStarted)
+	}
+	earlyInboundDelta := afterCounts.inbound - beforeCounts.inbound
+	earlyCompletedDelta := afterCounts.completed - beforeCounts.completed
+	t.Logf("real-data listener result before drain gate: measured_window=%s listener_wall=%s baseline_inbound=%d final_inbound=%d inbound_delta=%d final_completed=%d completed_delta=%d measured_completed=%d measured_completed_per_sec=%.3f failed=%d queued=%d running=%d interrupted=%d graph_list_gets=%d graph_item_gets=%d graph_posts=%d graph_429=%d graph_503=%d graph_served_unique=%d", earlyMeasuredElapsed, time.Since(runStarted), beforeCounts.inbound, afterCounts.inbound, earlyInboundDelta, afterCounts.completed, earlyCompletedDelta, measuredCompleted, float64(measuredCompleted)/earlyMeasuredElapsed.Seconds(), afterCounts.failed, afterCounts.queued, afterCounts.running, afterCounts.interrupted, graphServerState.listGETs.Load(), graphServerState.itemGETs.Load(), graphServerState.posts.Load(), graphServerState.status429.Load(), graphServerState.status503.Load(), len(graphServerState.servedMessages()))
 	if chatCoverage {
 		beforeRecoveryChats := dockerRealDataPollRecoveryChats(beforeState, replayCorpus)
 		afterRecoveryChats := dockerRealDataPollRecoveryChats(afterState, replayCorpus)
@@ -7352,11 +9612,7 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 		// call that inherited source condition synthetic unfinished work, but do
 		// fail if this run creates recovery for a previously clean representative
 		// chat.
-		residuals.PollRecovery = len(newRecoveryChats)
-		t.Logf("real-data chat-coverage poll recovery audit: active_before=%d active_after=%d baseline_recovery_boundaries=%d new_clean_chat_recovery=%d new_chats=%v", len(beforeRecoveryChats), len(afterRecoveryChats), baselineRecoveryBoundaries, len(newRecoveryChats), newRecoveryChats)
-	}
-	if mode == dockerRealDataModeComplete && residuals != (dockerRealDataResiduals{}) {
-		t.Fatalf("complete real-data drain left synthetic durable work: %+v", residuals)
+		t.Logf("real-data chat-coverage poll recovery audit: active_before=%d active_after=%d baseline_recovery_boundaries=%d new_clean_chat_recovery=%d new_chats=%v durable_identity_residuals=%v", len(beforeRecoveryChats), len(afterRecoveryChats), baselineRecoveryBoundaries, len(newRecoveryChats), newRecoveryChats, dockerRealDataPollRecoveryResiduals(beforeState, afterState, replayCorpus))
 	}
 	t.Logf("real-data synthetic residual audit: %+v (complete_mode=%t)", residuals, mode == dockerRealDataModeComplete)
 	afterHistoryOffsets := dockerRealDataHistoryOffsetSum(afterState)
@@ -7387,10 +9643,33 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	unknown := graphServerState.unknownPaths()
 	servedMessages := graphServerState.servedMessages()
 	servedMessageRequests := graphServerState.servedMessageRequests()
-	chatDrainAudit := auditDockerRealDataChatDrain(afterState, replayCorpus, servedMessages)
-	t.Logf("real-data per-chat drain audit: expected_chats=%d expected_messages=%d served_messages=%d inbound_messages=%d completed_messages=%d mismatches=%v", chatDrainAudit.ExpectedChats, chatDrainAudit.ExpectedMessages, chatDrainAudit.ServedMessages, chatDrainAudit.InboundMessages, chatDrainAudit.CompletedMessages, chatDrainAudit.Mismatches)
+	cumulativeServedMessages := dockerRealDataCumulativeServedMessages(servedMessages, priorSyntheticServedIDs)
+	chatDrainAudit := auditDockerRealDataChatDrain(afterState, replayCorpus, cumulativeServedMessages)
+	t.Logf("real-data per-chat drain audit: expected_chats=%d expected_messages=%d served_messages=%d inbound_messages=%d completed_messages=%d explicitly_ignored_terminal_messages=%d mismatches=%v", chatDrainAudit.ExpectedChats, chatDrainAudit.ExpectedMessages, chatDrainAudit.ServedMessages, chatDrainAudit.InboundMessages, chatDrainAudit.CompletedMessages, chatDrainAudit.IgnoredMessages, chatDrainAudit.Mismatches)
 	if (mode == dockerRealDataModeComplete || requireAllLagging) && len(chatDrainAudit.Mismatches) != 0 {
+		t.Logf("real-data per-chat unclosed-message dispositions: %v", traceWriter.pollMessageTracesForIDs(chatDrainAudit.UnclosedMessageIDs))
 		t.Fatalf("complete real-data drain did not close every replay message in its source chat: audit=%#v", chatDrainAudit)
+	}
+	if mode == dockerRealDataModeComplete && (residuals.InboundOperational != 0 || residuals.TurnUnfinished != 0 || residuals.OutboxPending != 0) {
+		phaseDiagnostics := make(map[string]mainLoopPhaseStats, len(phaseNames))
+		if len(bridges) > 0 {
+			for _, phaseName := range phaseNames {
+				phaseDiagnostics[phaseName] = bridges[len(bridges)-1].mainLoopPhaseStatsSnapshot(phaseName)
+			}
+		}
+		laggingChats := dockerRealDataSyntheticLaggingChats(afterState, replayCorpus)
+		activeFrontierResiduals := dockerRealDataPollRecoveryResiduals(beforeState, afterState, replayCorpus)
+		t.Logf("complete real-data lagging-chat poll selection counts: %s", traceWriter.pollDecisionStageSummary(laggingChats))
+		t.Logf("complete real-data residual detail: runtime=%q active_poll_frontier_residuals=%v chats=%v", os.Getenv(dockerRuntimeDirEnv), activeFrontierResiduals, dockerRealDataSyntheticResidualDiagnostics(afterState, replayCorpus, cumulativeServedMessages, graphServerState.listPageCount))
+		t.Logf("complete real-data failure traces: phases=%v listener_lines=%s poll_chats=%s poll_selection=%s queued_turns=%s poll_messages=%s graph_requests=%s store_timings=%s", phaseDiagnostics, dockerRealDataTraceSummary(traceWriter.linesSnapshot()), dockerRealDataTraceSummary(traceWriter.pollChatsSnapshot()), dockerRealDataTraceSummary(traceWriter.pollSelectionsSnapshot()), dockerRealDataTraceSummary(traceWriter.queuedTurnsSnapshot()), dockerRealDataTraceSummary(traceWriter.pollMessagesSnapshot()), dockerRealDataRequestSummary(graphServerState.listRequests()), traceWriter.timingAggregatesSummaryFor("store."))
+		t.Fatalf("complete real-data drain left synthetic durable work: %+v", residuals)
+	}
+	if mode == dockerRealDataModeComplete {
+		newCleanRecovery := dockerRealDataNewPollRecoveryChats(beforeState, afterState, replayCorpus)
+		safetyRegressions := dockerRealDataPollRecoverySafetyRegressions(beforeState, afterState, replayCorpus)
+		if len(newCleanRecovery) != 0 || len(safetyRegressions) != 0 {
+			t.Fatalf("complete real-data corpus closed with unsafe poll recovery state: new_clean_chat_recovery=%v safe_cursor_regressions=%v", newCleanRecovery, safetyRegressions)
+		}
 	}
 	persistedSyntheticIDs, err := dockerRealDataSyntheticInboundIDs(postCtx, filepath.Join(filepath.Dir(statePath), teamstore.SQLiteFileName))
 	if err != nil {
@@ -7460,10 +9739,14 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 				unprotected[messageID] = append(unprotected[messageID], servedMessageRequests[messageID]...)
 			}
 		}
-		t.Logf("real-data durability diagnostic: unprotected_served=%v poll_messages=%s queued_turns=%s list_requests=%s", unprotected, dockerRealDataTraceSummary(traceWriter.pollMessagesSnapshot()), dockerRealDataTraceSummary(traceWriter.queuedTurnsSnapshot()), dockerRealDataRequestSummary(graphServerState.listRequests()))
+		missingIDs := make([]string, 0, len(unprotected))
+		for messageID := range unprotected {
+			missingIDs = append(missingIDs, messageID)
+		}
+		t.Logf("real-data durability diagnostic: unprotected_served=%v target_poll_dispositions=%v poll_messages=%s queued_turns=%s list_requests=%s", unprotected, traceWriter.pollMessageTracesForIDs(missingIDs), dockerRealDataTraceSummary(traceWriter.pollMessagesSnapshot()), dockerRealDataTraceSummary(traceWriter.queuedTurnsSnapshot()), dockerRealDataRequestSummary(graphServerState.listRequests()))
 		t.Fatalf("fake Graph served replay messages without durable inbound events (first %d): %v", len(missingDurableInbound), missingDurableInbound)
 	}
-	backlogSamples, ordinaryHistoryWhileBacklog, ordinaryLinkedWhileBacklog := maintenanceTrace.snapshot()
+	backlogSamples, syntheticBacklogSamples, ordinaryHistoryWhileBacklog, ordinaryLinkedWhileBacklog := maintenanceTrace.snapshot()
 	ordinaryHistoryPaths, ordinaryLinkedSessions := maintenanceTrace.ordinaryWorkSnapshot()
 	ordinaryLinkedSuppressed, ordinaryLinkedUnsuppressed := maintenanceTrace.ordinaryLinkedPolicySnapshot()
 	ordinaryUnindexedLinked := maintenanceTrace.ordinaryUnindexedLinkedSnapshot()
@@ -7507,7 +9790,7 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 	// Emit this before the intentionally verbose aggregate diagnostic so a
 	// command-line log cap cannot hide the per-send bottleneck evidence.
 	t.Logf("real-data outbox send stage timings: %s", dockerRealDataTraceSummary(traceWriter.outboxSendStagesSnapshot()))
-	t.Logf("real-data Teams experiment: resume=%t startup_load=%s listener_wall=%s measured_windows=%d measured_window=%s startup_ready_after=%s first_execution_after=%s baseline_inbound=%d final_inbound=%d inbound_delta=%d final_completed=%d completed_delta=%d failed=%d queued=%d running=%d interrupted=%d executor_runs=%d measured_inbound=%d measured_completed=%d measured_executor_runs=%d wall_inbound_per_sec=%.3f measured_inbound_per_sec=%.3f measured_completed_per_sec=%.3f measured_executor_per_sec=%.3f graph_list_gets=%d graph_item_gets=%d graph_posts_total=%d graph_message_post_attempts=%d graph_message_post_responses=%d graph_message_post_accepts=%d graph_mark_unread_posts=%d graph_429=%d graph_503=%d unknown_posts=%d repeated_unknown_posts=%d graph_served_unique=%d graph_served_duplicates=%d history_offset_delta=%d poll_runs=%d poll_deadlines=%d poll_errors=%d poll_last_duration=%s poll_last_error=%q history_watch_runs=%d history_watch_deadlines=%d history_watch_errors=%d history_watch_last_duration=%s history_watch_last_error=%q linked_transcript_runs=%d linked_transcript_deadlines=%d linked_transcript_errors=%d linked_transcript_last_duration=%s linked_transcript_last_error=%q phase_stats=%v startup_phase_errors=%v startup_phase_deadlines=%v owner_generations=%v owner_changes=%d owner_changes_by_run=%v backlog_samples=%d ordinary_history_while_backlog=%d ordinary_linked_while_backlog=%d ordinary_linked_suppressed=%d ordinary_linked_unsuppressed=%d ordinary_unindexed_linked=%d unindexed_linked_candidates=%d ordinary_history_paths=%v ordinary_linked_sessions=%v ordinary_unindexed_linked_ids=%v baseline_history_offset_sum=%d final_history_offset_sum=%d graph_list_requests=%s unknown_graph_paths=%v listener_error=%v", resume, loadElapsed, runElapsed, measuredWindows, steadyElapsed, startupReadyElapsed, firstExecutionElapsed, beforeCounts.inbound, afterCounts.inbound, inboundDelta, afterCounts.completed, completedDelta, afterCounts.failed, afterCounts.queued, afterCounts.running, afterCounts.interrupted, runs, measuredInbound, measuredCompleted, measuredExecutorRuns, float64(inboundDelta)/runElapsed.Seconds(), float64(measuredInbound)/steadyElapsed.Seconds(), float64(measuredCompleted)/steadyElapsed.Seconds(), float64(measuredExecutorRuns)/steadyElapsed.Seconds(), graphServerState.listGETs.Load(), graphServerState.itemGETs.Load(), graphServerState.posts.Load(), graphServerState.messagePostAttempts.Load(), graphServerState.messagePostResponses.Load(), graphServerState.messagePostAccepts.Load(), graphServerState.markUnreadPosts.Load(), graphServerState.status429.Load(), graphServerState.status503.Load(), graphServerState.unknownPosts.Load(), graphServerState.unknownPostRepeats.Load(), len(servedMessages), duplicateServedMessages, afterHistoryOffsets-beforeHistoryOffsets, pollStats.Runs, pollStats.DeadlineExceeded, pollStats.Errors, pollStats.LastDuration, pollStats.LastError, historyWatchStats.Runs, historyWatchStats.DeadlineExceeded, historyWatchStats.Errors, historyWatchStats.LastDuration, historyWatchStats.LastError, linkedTranscriptStats.Runs, linkedTranscriptStats.DeadlineExceeded, linkedTranscriptStats.Errors, linkedTranscriptStats.LastDuration, linkedTranscriptStats.LastError, phaseStatsByName, startupPhaseErrors, startupPhaseDeadlines, ownerGenerations, ownerChanges, ownerChangesByRun, backlogSamples, ordinaryHistoryWhileBacklog, ordinaryLinkedWhileBacklog, ordinaryLinkedSuppressed, ordinaryLinkedUnsuppressed, ordinaryUnindexedLinked, len(linkedUnindexed), ordinaryHistoryPaths, ordinaryLinkedSessions, ordinaryUnindexedLinkedIDs, beforeHistoryOffsets, afterHistoryOffsets, dockerRealDataRequestSummary(graphServerState.listRequests()), unknown, lastListenerErr)
+	t.Logf("real-data Teams experiment: resume=%t startup_load=%s listener_wall=%s measured_windows=%d measured_window=%s startup_ready_after=%s first_execution_after=%s baseline_inbound=%d final_inbound=%d inbound_delta=%d final_completed=%d completed_delta=%d failed=%d queued=%d running=%d interrupted=%d executor_runs=%d measured_inbound=%d measured_completed=%d measured_executor_runs=%d wall_inbound_per_sec=%.3f measured_inbound_per_sec=%.3f measured_completed_per_sec=%.3f measured_executor_per_sec=%.3f graph_list_gets=%d graph_item_gets=%d graph_posts_total=%d graph_message_post_attempts=%d graph_message_post_responses=%d graph_message_post_accepts=%d graph_mark_unread_posts=%d graph_429=%d graph_503=%d unknown_posts=%d repeated_unknown_posts=%d graph_served_unique=%d graph_served_duplicates=%d history_offset_delta=%d poll_runs=%d poll_deadlines=%d poll_errors=%d poll_last_duration=%s poll_last_error=%q history_watch_runs=%d history_watch_deadlines=%d history_watch_errors=%d history_watch_last_duration=%s history_watch_last_error=%q linked_transcript_runs=%d linked_transcript_deadlines=%d linked_transcript_errors=%d linked_transcript_last_duration=%s linked_transcript_last_error=%q phase_stats=%v startup_phase_errors=%v startup_phase_deadlines=%v owner_generations=%v owner_changes=%d owner_changes_by_run=%v backlog_samples=%d synthetic_backlog_samples=%d ordinary_history_while_backlog=%d ordinary_linked_while_backlog=%d ordinary_linked_suppressed=%d ordinary_linked_unsuppressed=%d ordinary_unindexed_linked=%d unindexed_linked_candidates=%d ordinary_history_paths=%v ordinary_linked_sessions=%v ordinary_unindexed_linked_ids=%v baseline_history_offset_sum=%d final_history_offset_sum=%d graph_list_requests=%s unknown_graph_paths=%v listener_error=%v", resume, loadElapsed, runElapsed, measuredWindows, steadyElapsed, startupReadyElapsed, firstExecutionElapsed, beforeCounts.inbound, afterCounts.inbound, inboundDelta, afterCounts.completed, completedDelta, afterCounts.failed, afterCounts.queued, afterCounts.running, afterCounts.interrupted, runs, measuredInbound, measuredCompleted, measuredExecutorRuns, float64(inboundDelta)/runElapsed.Seconds(), float64(measuredInbound)/steadyElapsed.Seconds(), float64(measuredCompleted)/steadyElapsed.Seconds(), float64(measuredExecutorRuns)/steadyElapsed.Seconds(), graphServerState.listGETs.Load(), graphServerState.itemGETs.Load(), graphServerState.posts.Load(), graphServerState.messagePostAttempts.Load(), graphServerState.messagePostResponses.Load(), graphServerState.messagePostAccepts.Load(), graphServerState.markUnreadPosts.Load(), graphServerState.status429.Load(), graphServerState.status503.Load(), graphServerState.unknownPosts.Load(), graphServerState.unknownPostRepeats.Load(), len(servedMessages), duplicateServedMessages, afterHistoryOffsets-beforeHistoryOffsets, pollStats.Runs, pollStats.DeadlineExceeded, pollStats.Errors, pollStats.LastDuration, pollStats.LastError, historyWatchStats.Runs, historyWatchStats.DeadlineExceeded, historyWatchStats.Errors, historyWatchStats.LastDuration, historyWatchStats.LastError, linkedTranscriptStats.Runs, linkedTranscriptStats.DeadlineExceeded, linkedTranscriptStats.Errors, linkedTranscriptStats.LastDuration, linkedTranscriptStats.LastError, phaseStatsByName, startupPhaseErrors, startupPhaseDeadlines, ownerGenerations, ownerChanges, ownerChangesByRun, backlogSamples, syntheticBacklogSamples, ordinaryHistoryWhileBacklog, ordinaryLinkedWhileBacklog, ordinaryLinkedSuppressed, ordinaryLinkedUnsuppressed, ordinaryUnindexedLinked, len(linkedUnindexed), ordinaryHistoryPaths, ordinaryLinkedSessions, ordinaryUnindexedLinkedIDs, beforeHistoryOffsets, afterHistoryOffsets, dockerRealDataRequestSummary(graphServerState.listRequests()), unknown, lastListenerErr)
 	t.Logf("real-data outbox step timings: %s", dockerRealDataTraceSummary(traceWriter.linesContaining("Teams outbox step")))
 	t.Logf("real-data outbox send stage timings: %s", dockerRealDataTraceSummary(traceWriter.outboxSendStagesSnapshot()))
 	t.Logf("real-data store lock timings: %s", dockerRealDataTraceSummary(traceWriter.storeTimingsSnapshot()))
@@ -7580,18 +9863,20 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 		if graphServerState.unknownPosts.Load() != 0 || graphServerState.unknownPostRepeats.Load() != 0 || graphServerState.unknownPostMismatches.Load() != 0 {
 			t.Fatalf("resumed process replayed an unknown Graph POST result: unknown=%d repeats=%d payload_mismatches=%d", graphServerState.unknownPosts.Load(), graphServerState.unknownPostRepeats.Load(), graphServerState.unknownPostMismatches.Load())
 		}
-		witness := readDockerRealDataUnknownPostWitness(t, statePath)
-		var preserved *teamstore.OutboxMessage
-		for _, row := range afterState.OutboxMessages {
-			if strings.TrimSpace(row.ID) != witness.OutboxID {
-				continue
+		if resumeWitnessOutboxID != "" {
+			witness := readDockerRealDataUnknownPostWitness(t, statePath)
+			var preserved *teamstore.OutboxMessage
+			for _, row := range afterState.OutboxMessages {
+				if strings.TrimSpace(row.ID) != witness.OutboxID {
+					continue
+				}
+				copy := row
+				preserved = &copy
+				break
 			}
-			copy := row
-			preserved = &copy
-			break
-		}
-		if preserved == nil || strings.TrimSpace(preserved.TeamsChatID) != witness.ChatID || dockerRealDataOutboxBodyHash(preserved.Body) != witness.BodyHash || !teamstore.OutboxSendIsAmbiguous(*preserved) {
-			t.Fatalf("resumed process did not preserve the durable ambiguous outbox without retrying it: witness=%#v row=%#v", witness, preserved)
+			if preserved == nil || strings.TrimSpace(preserved.TeamsChatID) != witness.ChatID || dockerRealDataOutboxBodyHash(preserved.Body) != witness.BodyHash || !teamstore.OutboxSendIsAmbiguous(*preserved) {
+				t.Fatalf("resumed process did not preserve the durable ambiguous outbox without retrying it: witness=%#v row=%#v", witness, preserved)
+			}
 		}
 	} else if unknownFaultEnabled {
 		if graphServerState.unknownPosts.Load() != 1 || graphServerState.unknownPostRepeats.Load() != 0 || graphServerState.unknownPostMismatches.Load() != 0 || graphServerState.unknownPostAcceptedAttempts() != 1 {
@@ -7668,12 +9953,13 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 		t.Fatalf("synthetic inbound count=%d exceeded replay corpus=%d", afterCounts.inbound, replayCount)
 	}
 	if mode == dockerRealDataModeComplete {
-		if len(persistedSyntheticIDs) != replayCount || afterCounts.inbound != int64(replayCount) || afterCounts.completed != int64(replayCount) {
-			t.Fatalf("complete real-data acceptance did not close the entire replay corpus: corpus=%d persisted=%d inbound=%d completed=%d", replayCount, len(persistedSyntheticIDs), afterCounts.inbound, afterCounts.completed)
+		terminalMessages := afterCounts.completed + int64(chatDrainAudit.IgnoredMessages)
+		if len(persistedSyntheticIDs) != replayCount || afterCounts.inbound != int64(replayCount) || terminalMessages != int64(replayCount) {
+			t.Fatalf("complete real-data acceptance did not close the entire replay corpus: corpus=%d persisted=%d inbound=%d completed=%d explicit_ignored_terminal=%d terminal=%d", replayCount, len(persistedSyntheticIDs), afterCounts.inbound, afterCounts.completed, chatDrainAudit.IgnoredMessages, terminalMessages)
 		}
 		for _, messages := range replayCorpus {
 			for _, message := range messages {
-				if _, served := servedMessages[message.ID]; !served {
+				if _, served := cumulativeServedMessages[message.ID]; !served {
 					t.Fatalf("complete real-data acceptance never served replay message %q from fake Graph", message.ID)
 				}
 			}
@@ -7725,11 +10011,11 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 		}
 	}
 	sort.Strings(newMissing)
-	accounted := afterCounts.completed + afterCounts.failed + afterCounts.queued + afterCounts.running + afterCounts.interrupted
+	accounted := dockerRealDataAccountedInbound(afterCounts, correlationAudit.IgnoredNoTurnMessages)
 	if accounted != afterCounts.inbound {
 		missingAccounting := afterCounts.inbound - accounted
 		if !allowGracefulAdmissionBoundary || missingAccounting != correlationAudit.MissingTurn || len(newMissing) != int(correlationAudit.MissingTurn) {
-			t.Fatalf("synthetic durable turn accounting is not closed: inbound=%d completed=%d failed=%d queued=%d running=%d interrupted=%d correlation=%+v", afterCounts.inbound, afterCounts.completed, afterCounts.failed, afterCounts.queued, afterCounts.running, afterCounts.interrupted, correlationAudit)
+			t.Fatalf("synthetic durable turn accounting is not closed: inbound=%d completed=%d failed=%d queued=%d running=%d interrupted=%d ignored_without_turn=%d correlation=%+v", afterCounts.inbound, afterCounts.completed, afterCounts.failed, afterCounts.queued, afterCounts.running, afterCounts.interrupted, correlationAudit.IgnoredNoTurnMessages, correlationAudit)
 		}
 		t.Logf("real-data graceful boundary: %d newly-created inbound row(s) have not acquired a turn yet; all previous-boundary orphan rows were repaired", correlationAudit.MissingTurn)
 	}
@@ -7757,11 +10043,15 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 			}
 		}
 		for turnID, afterTurn := range finalTurns {
-			if !dockerRealDataTurnIsNonTerminal(afterTurn.Status) {
+			// Interrupted is a durable attention/terminal disposition, not an
+			// unfinished queued/running boundary. Complete-mode corpus accounting
+			// already counts it exactly once; treating it as a restart boundary here
+			// would reject a correctly preserved "resend" state.
+			if !dockerRealDataTurnNeedsBoundaryRepair(afterTurn.Status) {
 				continue
 			}
 			currentBoundaryIDs = append(currentBoundaryIDs, turnID)
-			if beforeTurn, existed := latestBeforeTurns[turnID]; existed && dockerRealDataTurnIsNonTerminal(beforeTurn.Status) {
+			if beforeTurn, existed := latestBeforeTurns[turnID]; existed && dockerRealDataTurnNeedsBoundaryRepair(beforeTurn.Status) {
 				continue
 			}
 			if afterTurn.UpdatedAt.IsZero() || afterTurn.UpdatedAt.Before(latestRunStart) {
@@ -8042,5 +10332,8 @@ func TestDockerRealDataTeamsProgressThroughput(t *testing.T) {
 		if afterHistoryOffsets < beforeHistoryOffsets {
 			t.Fatalf("history cursor regressed while the synthetic Teams backlog was observed: before=%d after=%d queued_after=%d", beforeHistoryOffsets, afterHistoryOffsets, afterCounts.queued)
 		}
+	}
+	if postWindowDrainFailure != nil {
+		t.Fatalf("complete real-data acceptance did not finish its required post-measure catch-up drain: %v", postWindowDrainFailure)
 	}
 }

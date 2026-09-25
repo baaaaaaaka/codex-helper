@@ -175,11 +175,17 @@ func TestWorkflowNotificationSendsAfterDurableOutboxSent(t *testing.T) {
 	}
 
 	outbox := workflowNotificationTestOutbox("outbox-final", "final", "turn_completed")
-	bridge.queueWorkflowNotificationForSentOutbox(ctx, outbox)
-	bridge.queueWorkflowNotificationForSentOutbox(ctx, outbox)
+	bridge.queueWorkflowNotificationForSentOutboxWithoutImmediateFlush(ctx, outbox)
+	bridge.queueWorkflowNotificationForSentOutboxWithoutImmediateFlush(ctx, outbox)
 
+	if got := atomic.LoadInt32(&calls); got != 0 {
+		t.Fatalf("webhook calls before the bounded workflow phase = %d, want 0", got)
+	}
+	if err := bridge.flushPendingWorkflowNotifications(ctx); err != nil {
+		t.Fatalf("flush durable workflow notification: %v", err)
+	}
 	if got := atomic.LoadInt32(&calls); got != 1 {
-		t.Fatalf("webhook calls = %d, want 1", got)
+		t.Fatalf("webhook calls after normal workflow flush = %d, want 1", got)
 	}
 	raw, _ := json.Marshal(seen)
 	for _, want := range []string{"✅ Codex finished", "💬", "Fix the installer regression", "Open answer", "teams.microsoft.com"} {
@@ -194,6 +200,47 @@ func TestWorkflowNotificationSendsAfterDurableOutboxSent(t *testing.T) {
 	rec := state.Notifications["workflow:"+shortStableID(outbox.ID)]
 	if rec.Status != teamstore.NotificationStatusSent || rec.Attempts != 1 || rec.SentAt.IsZero() {
 		t.Fatalf("notification record = %#v, want sent with one attempt", rec)
+	}
+}
+
+func TestMainLoopSentOutboxQueuesFallbackForNormalOutboxPhase(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, sent := newBridgeTestGraph(t)
+	bridge := newWorkflowNotificationTestBridge(t, graph, store)
+	seedWorkflowNotificationState(t, store, "Keep workflow fallback off the foreground outbox send")
+
+	queued, _, err := store.QueueOutbox(ctx, teamstore.OutboxMessage{
+		ID: "outbox:foreground-final", SessionID: "s001", TurnID: "turn-1",
+		TeamsChatID: "chat-1", Kind: "final", NotificationKind: "turn_completed", Body: "answer",
+	})
+	if err != nil {
+		t.Fatalf("queue foreground final: %v", err)
+	}
+	if err := bridge.flushPendingOutboxFilteredWithOptions(ctx, "", "", "chat-1", outboxFlushOptions{
+		MaxMessages:                       1,
+		DeferWorkflowNotificationDelivery: true,
+	}); err != nil {
+		t.Fatalf("main-loop foreground flush: %v", err)
+	}
+	if len(*sent) != 1 || (*sent)[0].ChatID != "chat-1" {
+		t.Fatalf("foreground send triggered a nested notification delivery: %#v", *sent)
+	}
+
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load queued fallback state: %v", err)
+	}
+	fallbackID := "outbox:workflow-fallback:" + shortStableID("workflow:"+shortStableID(queued.ID))
+	fallback := state.OutboxMessages[fallbackID]
+	if fallback.ID == "" || fallback.Status != teamstore.OutboxStatusQueued || fallback.TeamsChatID != "control-chat" {
+		t.Fatalf("fallback row = %#v, want durable queued control-chat delivery", fallback)
+	}
+	if err := bridge.flushPendingOutboxForChat(ctx, "control-chat"); err != nil {
+		t.Fatalf("normal control-chat outbox flush: %v", err)
+	}
+	if len(*sent) != 2 || (*sent)[1].ChatID != "control-chat" {
+		t.Fatalf("queued fallback was not delivered by its normal outbox phase: %#v", *sent)
 	}
 }
 

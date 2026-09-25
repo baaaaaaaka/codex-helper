@@ -34,12 +34,34 @@ docker info >/dev/null 2>&1 || {
 	exit 1
 }
 
-selector='^(TestDockerBoundedAcceptanceScenario|TestHistoryWatchRebaseContinuesAcrossSameInodeAppend|TestLinkedTranscriptRebaseContinuesAcrossSameInodeAppend)$'
+selector='^(TestDockerBoundedAcceptanceScenario|TestHistoryWatchRebaseContinuesAcrossSameInodeAppend|TestLinkedTranscriptRebaseContinuesAcrossSameInodeAppend|TestTeamsPersistentPollFrontierEventuallyGetsBacklogFairness|TestTeamsOutboxFlushErrorDoesNotHideDurableBacklogFairness|TestTeamsMainLoopOutboxBatchesEightChatsWithTwoHeadsEach|TestTeamsMainLoopOutboxAccount429StopsSiblingPostsInSameBatch|TestTeamsMainLoopOutboxUnscoped429OnlyBlocksFailingChat|TestTeamsMainLoopOutboxAccount429PersistenceFailureFencesCurrentProcess|TestTeamsConcurrentOutboxPostRechecksAccount429FenceAtGraphBoundary|TestGraphBeforeWriteRequestContextFenceLeavesReadsAvailable|TestGraphWriteBoundarySerializesUntilResponseAndPublishes429|TestGraphTransferWriteBoundaryBlocksSiblingPostAfterAccount429|TestGraphWriteBoundaryWaitHonorsRequestCancellation|TestGraphByteUploadReleasesWriteBoundaryOnResponse|TestGraphWriteAdmissionRevalidatesOwnerAfterGateWait|TestTeamsMainLoopOutboxFairnessCursorWalksPastDistinctChatScanPrefix|TestTeamsMainLoopOutboxCursorHandoffEventuallyDrainsReservedChats|TestTeamsMainLoopOutboxStopsSecondChatAfterProcessWideFailure)$'
 listed_tests="$(CXP_RUNTIME_DISABLE=1 go test ./internal/teams -list "$selector")"
 grep -Fxq -- "TestDockerBoundedAcceptanceScenario" <<<"$listed_tests" || {
 	echo "bounded acceptance selector did not list TestDockerBoundedAcceptanceScenario" >&2
 	exit 1
 }
+for required_test in \
+	TestTeamsPersistentPollFrontierEventuallyGetsBacklogFairness \
+	TestTeamsOutboxFlushErrorDoesNotHideDurableBacklogFairness \
+	TestTeamsMainLoopOutboxBatchesEightChatsWithTwoHeadsEach \
+	TestTeamsMainLoopOutboxAccount429StopsSiblingPostsInSameBatch \
+	TestTeamsMainLoopOutboxUnscoped429OnlyBlocksFailingChat \
+	TestTeamsMainLoopOutboxAccount429PersistenceFailureFencesCurrentProcess \
+	TestTeamsConcurrentOutboxPostRechecksAccount429FenceAtGraphBoundary \
+	TestGraphBeforeWriteRequestContextFenceLeavesReadsAvailable \
+	TestGraphWriteBoundarySerializesUntilResponseAndPublishes429 \
+	TestGraphTransferWriteBoundaryBlocksSiblingPostAfterAccount429 \
+	TestGraphWriteBoundaryWaitHonorsRequestCancellation \
+	TestGraphByteUploadReleasesWriteBoundaryOnResponse \
+	TestGraphWriteAdmissionRevalidatesOwnerAfterGateWait \
+	TestTeamsMainLoopOutboxFairnessCursorWalksPastDistinctChatScanPrefix \
+	TestTeamsMainLoopOutboxCursorHandoffEventuallyDrainsReservedChats \
+	TestTeamsMainLoopOutboxStopsSecondChatAfterProcessWideFailure; do
+	grep -Fxq -- "$required_test" <<<"$listed_tests" || {
+		echo "bounded acceptance selector did not list $required_test" >&2
+		exit 1
+	}
+done
 
 CGO_ENABLED=0 CXP_RUNTIME_DISABLE=1 go test -c -o "$binary" ./internal/teams
 docker build --file scripts/ci/Dockerfile.teams-bounded-acceptance --tag "$image" "$build_dir"

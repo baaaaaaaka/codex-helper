@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -17,8 +18,11 @@ import (
 const modelProfileKeyIntakeTTL = 10 * time.Minute
 
 var (
-	modelProfileKeyIntakeNow     = time.Now
-	newModelProfileKeyIntakeCode = randomModelProfileKeyIntakeCode
+	modelProfileKeyIntakeNow                   = time.Now
+	newModelProfileKeyIntakeCode               = randomModelProfileKeyIntakeCode
+	errModelProfileKeyIntakeSaveInProgress     = errors.New("model-key intake save is already in progress; reconcile it before replay")
+	errModelProfileKeyIntakeSaveOutcomeUnknown = errors.New("model-key intake save outcome is unknown; reconcile it before replay")
+	errModelProfileKeyIntakeLegacyScrubFailed  = errors.New("legacy model-key inbound redaction has not been committed")
 )
 
 type modelProfileKeyIntakeSetupOptions struct {
@@ -248,6 +252,30 @@ func isModelProfileKeyIntakeControlRoute(routeText string) bool {
 	}
 }
 
+// modelProfileKeyIntakeRouteContainsSecret recognizes only the explicit
+// `model key <code> <value>` form. Its value is treated as secret before any
+// poll receipt or inbound event is made durable; the foreground handler later
+// re-fetches the message by its immutable Teams identity.
+func modelProfileKeyIntakeRouteContainsSecret(routeText string) bool {
+	arg, ok := modelProfileKeyIntakeControlArgument(routeText)
+	if !ok {
+		return false
+	}
+	sub, rest := modelCommandParts(arg)
+	switch sub {
+	case "key", "api-key", "apikey":
+	default:
+		return false
+	}
+	action, value := splitModelProfileKeyIntakeAction(rest)
+	switch strings.ToLower(strings.TrimSpace(action)) {
+	case "", "confirm", "cancel":
+		return false
+	}
+	apiKey, extra := splitModelProfileKeyIntakeAction(value)
+	return strings.TrimSpace(action) != "" && strings.TrimSpace(apiKey) != "" && strings.TrimSpace(extra) == ""
+}
+
 func modelProfileKeyIntakeControlArgument(routeText string) (string, bool) {
 	parsed := ParseDashboardCommand(ChatScopeControl, routeText)
 	if !parsed.HelperCommand || parsed.Name != DashboardCommandModel {
@@ -300,6 +328,10 @@ func (b *Bridge) handleModelProfileKeyIntakeControlMessage(ctx context.Context, 
 		}
 		message, err := b.completeModelProfileKeyIntake(ctx, msg, code, apiKey)
 		if err != nil {
+			if errors.Is(err, errModelProfileKeyIntakeSaveInProgress) || errors.Is(err, errModelProfileKeyIntakeSaveOutcomeUnknown) {
+				replyErr := b.sendControl(ctx, "The model API key save outcome could not be confirmed. Do not resend the key yet; reconcile the local profile and secret store before starting another intake.")
+				return errors.Join(err, replyErr)
+			}
 			return b.sendControl(ctx, controlCommandErrorMessage(err))
 		}
 		return b.sendControl(ctx, message)
@@ -417,7 +449,7 @@ func (b *Bridge) completeModelProfileKeyIntake(ctx context.Context, msg ChatMess
 	}
 	if !claimed {
 		if intake.Status == teamstore.ModelProfileKeyIntakeSaving {
-			return fmt.Sprintf("Model API key intake for `%s` is already being saved. Wait for the current attempt to finish.", intake.ProfileName), nil
+			return "", errModelProfileKeyIntakeSaveInProgress
 		}
 		return "That model API key intake is no longer active. Start again with `model setup <model>`.", nil
 	}
@@ -432,8 +464,12 @@ func (b *Bridge) completeModelProfileKeyIntake(ctx context.Context, msg ChatMess
 	})
 	var safeSaveErr error
 	if saveErr != nil {
-		safeSaveErr = fmt.Errorf("%s", sanitizeModelProfileKeyIntakeError(saveErr, apiKey))
+		// A manager may fail after writing the secret or profile. The result is
+		// therefore ambiguous: keep Saving and require reconciliation instead of
+		// resetting to Confirmed and automatically repeating a possible mutation.
+		safeSaveErr = errModelProfileKeyIntakeSaveOutcomeUnknown
 	}
+	completed := false
 	updateErr := b.store.UpdateModelProfileKeyIntakes(ctx, func(intakes map[string]teamstore.ModelProfileKeyIntake, _ time.Time) (bool, error) {
 		current := intakes[intake.ID]
 		if current.ID == "" {
@@ -444,21 +480,25 @@ func (b *Bridge) completeModelProfileKeyIntake(ctx context.Context, msg ChatMess
 		}
 		current.UpdatedAt = now
 		if safeSaveErr != nil {
-			current.Status = teamstore.ModelProfileKeyIntakeConfirmed
+			current.Status = teamstore.ModelProfileKeyIntakeSaving
 			current.LastError = safeSaveErr.Error()
 		} else {
 			current.Status = teamstore.ModelProfileKeyIntakeCompleted
 			current.CompletedAt = now
 			current.LastError = ""
+			completed = true
 		}
 		intakes[current.ID] = current
 		return true, nil
 	})
 	if updateErr != nil {
-		return "", updateErr
+		return "", errModelProfileKeyIntakeSaveOutcomeUnknown
 	}
 	if safeSaveErr != nil {
 		return "", safeSaveErr
+	}
+	if !completed {
+		return "", errModelProfileKeyIntakeSaveOutcomeUnknown
 	}
 	lines := []string{
 		fmt.Sprintf("Saved model `%s` as `%s` (api_key=%s, fingerprint=%s, revision=%d).", result.Model, result.ProfileName, modelprofile.MaskRef(result.APIKeyRef), result.Fingerprint, result.Revision),
@@ -547,18 +587,6 @@ func randomModelProfileKeyIntakeCode() (string, error) {
 		b.WriteByte(alphabet[int(v)%len(alphabet)])
 	}
 	return b.String(), nil
-}
-
-func sanitizeModelProfileKeyIntakeError(err error, apiKey string) string {
-	if err == nil {
-		return ""
-	}
-	msg := strings.TrimSpace(err.Error())
-	apiKey = strings.TrimSpace(apiKey)
-	if apiKey != "" {
-		msg = strings.ReplaceAll(msg, apiKey, "<redacted-api-key>")
-	}
-	return msg
 }
 
 func modelProfileKeyIntakeSetupUsage() string {

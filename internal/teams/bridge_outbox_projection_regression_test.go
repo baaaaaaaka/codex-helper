@@ -6,8 +6,10 @@ import (
 	"database/sql"
 	"errors"
 	"io"
+	"net/http"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,6 +20,94 @@ type bridgeTakeoverGraphAuth struct {
 	token    string
 	onAccess func()
 	once     sync.Once
+}
+
+func TestGraphWriteAdmissionRevalidatesOwnerAfterGateWait(t *testing.T) {
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	lease := teamstore.ControlLease{
+		ScopeID: bridge.scope.ID, HolderMachineID: bridge.machine.ID,
+		HolderKind: bridge.machine.Kind, Priority: bridge.machine.Priority,
+		Generation: 1, Status: teamstore.ControlLeaseStatusActive,
+		LeaseUntil: now.Add(time.Hour), LastHeartbeat: now, UpdatedAt: now,
+	}
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.Scope = bridge.scope
+		state.Machines[bridge.machine.ID] = bridge.machine
+		state.ControlLease = lease
+		return nil
+	}); err != nil {
+		t.Fatalf("seed write-boundary lease: %v", err)
+	}
+	bridge.setControlLease(lease)
+	owner := teamstore.OwnerMetadata{ScopeID: bridge.scope.ID, MachineID: bridge.machine.ID, LeaseGeneration: lease.Generation}
+	ownerCtx := withTeamsOwnerCapability(ctx, owner)
+	requestGate, err := bridge.acquireGraphWriteRequest(ctx)
+	if err != nil {
+		t.Fatalf("hold write-boundary gate: %v", err)
+	}
+	var releaseOnce sync.Once
+	releaseGate := func() { releaseOnce.Do(func() { requestGate <- struct{}{} }) }
+	t.Cleanup(releaseGate)
+
+	writeWaiting := make(chan struct{})
+	productionAdmission := bridge.graphWriteRequestAdmission("chat-owner-fenced", true)
+	requestCtx := withGraphBeforeWriteRequest(ownerCtx, func(requestCtx context.Context, method string) (graphWriteRequestRelease, error) {
+		close(writeWaiting)
+		return productionAdmission(requestCtx, method)
+	})
+	var requests atomic.Int32
+	graph := &GraphClient{
+		auth: &fakeGraphAuth{token: "access"},
+		client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			requests.Add(1)
+			return jsonResponse(http.StatusCreated, `{"id":"unexpected-post"}`), nil
+		})},
+		baseURL: "https://graph.example.test", maxRetries: 0,
+		sleep: sleepContext, jitter: func(d time.Duration) time.Duration { return d },
+	}
+	requestDone := make(chan error, 1)
+	go func() {
+		requestDone <- graph.doWithOptions(requestCtx, http.MethodPost, "/chats/chat-owner-fenced/messages", map[string]any{"body": "must stay fenced"}, nil, graphRequestOptions{
+			returnRateLimitWithoutRetry: true,
+			noReplayAfterFirstRequest:   true,
+		})
+	}()
+	select {
+	case <-writeWaiting:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Graph write did not reach the blocked final admission boundary")
+	}
+	takeoverMachine := bridge.machine
+	takeoverMachine.ID += "-takeover"
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		next := state.ControlLease
+		next.HolderMachineID = takeoverMachine.ID
+		next.Generation = lease.Generation + 1
+		next.LeaseUntil = time.Now().UTC().Add(time.Hour)
+		next.LastHeartbeat = time.Now().UTC()
+		next.UpdatedAt = time.Now().UTC()
+		state.Machines[takeoverMachine.ID] = takeoverMachine
+		state.ControlLease = next
+		return nil
+	}); err != nil {
+		releaseGate()
+		t.Fatalf("take over control lease while write waits: %v", err)
+	}
+	releaseGate()
+	select {
+	case err := <-requestDone:
+		if !errors.Is(err, teamstore.ErrControlLeaseNotHeld) {
+			t.Fatalf("write after lease takeover = %v, want fenced lease-loss error", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("write did not leave final admission after gate release")
+	}
+	if got := requests.Load(); got != 0 {
+		t.Fatalf("Graph requests after owner takeover = %d, want zero", got)
+	}
 }
 
 func (a *bridgeTakeoverGraphAuth) AccessToken(context.Context, io.Writer, bool) (string, error) {

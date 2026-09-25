@@ -6960,6 +6960,51 @@ func sqliteReadOnlyFileIdentityForPath(path string) (sqliteReadOnlyFileIdentity,
 	return sqliteReadOnlyFileIdentity{Exists: true, Size: info.Size(), ModTime: info.ModTime().UnixNano(), Revision: revision}, nil
 }
 
+func sqliteReadOnlyFileIdentitySameObject(left, right sqliteReadOnlyFileIdentity) bool {
+	if left.Exists != right.Exists {
+		return false
+	}
+	if !left.Exists {
+		return true
+	}
+	if left.Revision != "" || right.Revision != "" {
+		return left.Revision != "" && left.Revision == right.Revision
+	}
+	// Without a platform file identity, retain the conservative metadata check.
+	return left.Size == right.Size && left.ModTime == right.ModTime
+}
+
+// sqliteOutboxReadDatabaseIdentityStable only fences replacement of the
+// SQLite backing file. A coherent read transaction is allowed to return its
+// point-in-time rows even when ordinary commits update the database or WAL;
+// callers must revalidate those rows in their durable write transaction.
+func (s *Store) sqliteOutboxReadDatabaseIdentityStable(ctx context.Context, snapshot sqliteOutboxReadSnapshot) (bool, error) {
+	if s == nil || strings.TrimSpace(snapshot.path) == "" {
+		return false, nil
+	}
+	stable := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		path, err := s.storeSQLitePath(pointer)
+		if err != nil {
+			return err
+		}
+		if path != snapshot.path {
+			return nil
+		}
+		identity, err := sqliteReadOnlyFileIdentityForPath(path)
+		if err != nil {
+			return err
+		}
+		stable = sqliteReadOnlyFileIdentitySameObject(snapshot.identity, identity)
+		return nil
+	})
+	return stable, err
+}
+
 func (s *Store) sqliteOutboxReadSnapshotStable(ctx context.Context, snapshot sqliteOutboxReadSnapshot) (bool, error) {
 	if s == nil || strings.TrimSpace(snapshot.path) == "" {
 		return false, nil
@@ -19905,6 +19950,78 @@ func (s *Store) inboundRecoveryCandidatesSQLite(ctx context.Context, limit int) 
 	return out, handled, err
 }
 
+func (s *Store) legacyManualHoldControlPollCredentialCandidatesSQLite(ctx context.Context, afterID string, limit int) (LegacyManualHoldControlCredentialPage, bool, error) {
+	var page LegacyManualHoldControlCredentialPage
+	handled := false
+	err := s.withStateLock(ctx, func() error {
+		pointer, ok, err := s.currentSQLitePointerUnlocked()
+		if err != nil || !ok {
+			return err
+		}
+		db, err := s.sqliteDBUnlocked(pointer)
+		if err != nil {
+			return err
+		}
+		handled = true
+		statusColumn, err := sqliteInboundStatusColumnForRead(ctx, db)
+		if err != nil {
+			return err
+		}
+		sourceType := sqliteSafeJSONType("json", "$.source")
+		source := sqliteSafeJSONExtract("json", "$.source")
+		payload := `lower(CAST(json AS TEXT))`
+		query := `SELECT id, json FROM inbound_events WHERE ` + statusColumn + ` = ? AND ` +
+			`json_valid(json) AND ` + sourceType + ` = 'text' AND trim(COALESCE(` + source + `, '')) = ? AND id > ? AND (` +
+			`instr(` + payload + `, 'sk-') > 0 OR instr(` + payload + `, 'sk_') > 0 OR ` +
+			`instr(` + payload + `, 'api-key') > 0 OR instr(` + payload + `, 'api_key') > 0 OR ` +
+			`instr(` + payload + `, 'apikey') > 0 OR instr(` + payload + `, 'authorization') > 0 OR ` +
+			`instr(` + payload + `, 'bearer') > 0 OR instr(` + payload + `, 'model') > 0) ORDER BY id LIMIT ?`
+		rows, err := db.QueryContext(ctx, query, string(InboundStatusManualHold), "teams_control_poll_deferred", strings.TrimSpace(afterID), limit+1)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		type rawInboundRow struct {
+			id   string
+			json []byte
+		}
+		rawRows := make([]rawInboundRow, 0, limit+1)
+		for rows.Next() {
+			var row rawInboundRow
+			if err := rows.Scan(&row.id, &row.json); err != nil {
+				return err
+			}
+			rawRows = append(rawRows, row)
+		}
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		page.HasMore = len(rawRows) > limit
+		if page.HasMore {
+			rawRows = rawRows[:limit]
+		}
+		for _, row := range rawRows {
+			var event InboundEvent
+			if err := json.Unmarshal(row.json, &event); err != nil {
+				return err
+			}
+			if strings.TrimSpace(event.ID) != strings.TrimSpace(row.id) || event.Status != InboundStatusManualHold ||
+				strings.TrimSpace(event.Source) != "teams_control_poll_deferred" {
+				return fmt.Errorf("legacy control credential scan row %q changed or failed canonical validation", strings.TrimSpace(row.id))
+			}
+			page.ScannedThroughID = strings.TrimSpace(row.id)
+			if legacyControlCredentialSearchHint(inboundCredentialSearchText(event)) {
+				page.Candidates = append(page.Candidates, event)
+			}
+		}
+		return nil
+	})
+	if err == nil {
+		sort.Slice(page.Candidates, func(i, j int) bool { return page.Candidates[i].ID < page.Candidates[j].ID })
+	}
+	return page, handled, err
+}
+
 func sqliteTurnProjectionRowsTrusted(ctx context.Context, db *sql.DB) (bool, error) {
 	if db == nil {
 		return false, errors.New("sqlite turn projection database is nil")
@@ -21983,10 +22100,6 @@ func (s *Store) loadSQLiteSessionTranscriptDedupeStateWithDB(ctx context.Context
 		return State{}, err
 	}
 	defer conn.Close()
-	dataVersionBefore, err := sqliteReadDataVersionContext(ctx, conn)
-	if err != nil {
-		return State{}, err
-	}
 	readTx, err := conn.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return State{}, err
@@ -22026,6 +22139,12 @@ func (s *Store) loadSQLiteSessionTranscriptDedupeStateWithDB(ctx context.Context
 		return State{}, err
 	} else if sqliteRuntimeStateUsable(seen) {
 		state.ServiceOwner = runtimeState.ServiceOwner
+	}
+	if hook := sqliteSessionTranscriptDedupeSnapshotTestHook; hook != nil {
+		// This point is after the read transaction has established its SQLite
+		// snapshot. A later commit must not make rows from that coherent snapshot
+		// look invalid merely because PRAGMA data_version changed.
+		hook("runtime-read")
 	}
 	if err := timedStep("sessions", func() error {
 		return loadSQLiteSessionMap(ctx, q, `SELECT id, teams_chat_id, status, updated_at, json FROM sessions WHERE id = ?`, state.Sessions, sessionID)
@@ -22152,29 +22271,23 @@ func (s *Store) loadSQLiteSessionTranscriptDedupeStateWithDB(ctx context.Context
 	if err := readTx.Commit(); err != nil {
 		return State{}, err
 	}
-	dataVersionAfter, err := sqliteReadDataVersionContext(ctx, conn)
-	if err != nil {
-		return State{}, err
-	}
-	if dataVersionAfter != dataVersionBefore {
-		return State{}, errSQLiteSessionTranscriptDedupeSnapshotChanged
-	}
 	return state, nil
 }
 
 // ErrSQLiteSessionTranscriptDedupeSnapshotChanged means the reader crossed a
-// concurrent durable commit and therefore discarded its partial snapshot.
-// It is a retryable, session-local condition; callers must not treat the
-// rejected snapshot as dedupe evidence.
+// projection-trust or database-identity boundary and therefore discarded its
+// snapshot. Ordinary outbox writes do not invalidate the coherent SQLite read
+// transaction; final durable mutations revalidate their current rows and
+// source proofs.
 var ErrSQLiteSessionTranscriptDedupeSnapshotChanged = errors.New("sqlite session transcript dedupe snapshot changed during read")
 
 var errSQLiteSessionTranscriptDedupeSnapshotChanged = ErrSQLiteSessionTranscriptDedupeSnapshotChanged
 
 // IsSQLiteSessionTranscriptDedupeSnapshotChanged identifies a safe retry
-// point for a session-scoped transcript reader.  The reader deliberately
-// rejects a snapshot that crosses a concurrent durable commit; callers may
-// defer that one session and retry it on a later poll, but must never consume
-// the partial snapshot as dedupe evidence.
+// point for a session-scoped transcript reader. The reader rejects a snapshot
+// only when its relevant outbox capability or backing database changed; callers
+// may defer that session and retry later, but must never consume a rejected
+// snapshot as dedupe evidence.
 func IsSQLiteSessionTranscriptDedupeSnapshotChanged(err error) bool {
 	return errors.Is(err, ErrSQLiteSessionTranscriptDedupeSnapshotChanged)
 }
@@ -22227,10 +22340,6 @@ func (s *Store) loadSQLiteSessionTranscriptDedupeStateOnce(ctx context.Context, 
 		if !snapshot.identity.Exists {
 			return fmt.Errorf("sqlite transcript dedupe database %q disappeared", snapshot.path)
 		}
-		snapshot.generation, err = sqliteReadOutboxGenerationContext(ctx, db)
-		if err != nil {
-			return err
-		}
 		snapshot.sessionProjectionTrust, err = sqliteReadMetaValueContext(ctx, db, sqliteOutboxSessionProjectionTrustKey)
 		if err != nil {
 			return err
@@ -22262,7 +22371,7 @@ func (s *Store) loadSQLiteSessionTranscriptDedupeStateOnce(ctx context.Context, 
 	// snapshot boundary, not an ordinary row update. Never return a snapshot
 	// from the old file across that boundary; the bounded caller retries against
 	// the current file instead.
-	stable, err := s.sqliteOutboxReadSnapshotStable(ctx, snapshot)
+	stable, err := s.sqliteOutboxReadDatabaseIdentityStable(ctx, snapshot)
 	if err != nil {
 		return State{}, true, err
 	}
@@ -25899,23 +26008,20 @@ LIMIT ?`
 	// A current JSON writer may update next_attempt_at before refreshing the
 	// legacy deliver_after column. That is a valid canonical override and is
 	// intentionally allowed by the broad projection marker, but the scalar due
-	// predicate above cannot see it. Probe only this bounded exceptional subset
-	// (scalar deliver_after is future) so a due canonical row cannot disappear
-	// from the chat-level fairness page. The selected sender still performs the
-	// final canonical page/lease/FIFO/CAS checks.
+	// predicate above cannot see it. Probe the bounded exceptional subset using
+	// scalar status/delivery columns, then apply canonical scheduling once in Go.
+	// The selected sender still performs the final canonical page/lease/FIFO/CAS
+	// checks.
 	if !query.IgnoreRetryGate && !query.AmbiguousOnly {
-		canonicalDue := sqliteOutboxNextAttemptDueSQL("o.json", "o.deliver_after")
-		canonicalChatID := sqliteOutboxCanonicalTextSQL("o.json", "$.teams_chat_id", "o.teams_chat_id")
-		scheduleWhere := `json_valid(o.json)
-  AND json_type(o.json, '$') = 'object'
-  AND ` + sqliteOutboxTopLevelKeysUniqueSQL("o") + `
-  AND o.status IN (?, ?)
+		// Do not invoke recursive JSON1 validation in this lock-held admission
+		// path. The trusted projection supplies an indexed candidate superset;
+		// decodeSQLiteOutboxProjection/pendingOutboxMatchesQuery below retain the
+		// canonical JSON authority and reject false candidates.
+		scheduleWhere := `o.status IN (?, ?)
   AND o.deliver_after > ?
-  AND ` + canonicalDue + `
-  AND trim(` + canonicalChatID + `) <> ''`
+  AND o.teams_chat_id <> ''`
 		scheduleArgs := []any{
 			string(OutboxStatusQueued), string(OutboxStatusAccepted), query.Now.UnixNano(),
-			time.Time{}.UTC().Format(time.RFC3339Nano), query.Now.UTC().Format(time.RFC3339Nano), query.Now.UnixNano(),
 		}
 		if !query.IgnoreRateLimit {
 			globalBlockedUntil := `(SELECT ` + sqliteStoredInt64SQL("blocked_until") + ` FROM chat_rate_limits WHERE chat_id = ?)`
@@ -25923,11 +26029,11 @@ LIMIT ?`
 			scheduleArgs = append(scheduleArgs, string(OutboxStatusAccepted), query.Now.UnixNano(), GraphWriteAccountRateLimitKey, GraphWriteAccountRateLimitKey, query.Now.UnixNano())
 		}
 		if query.TeamsChatID != "" {
-			scheduleWhere += ` AND ` + canonicalChatID + ` = ?`
+			scheduleWhere += ` AND o.teams_chat_id = ?`
 			scheduleArgs = append(scheduleArgs, query.TeamsChatID)
 		}
 		if query.AfterChatID != "" {
-			scheduleWhere += ` AND ` + canonicalChatID + ` > ?`
+			scheduleWhere += ` AND o.teams_chat_id > ?`
 			scheduleArgs = append(scheduleArgs, query.AfterChatID)
 		}
 		remainingRows := sqliteOutboxNativeAdmissionMaxRows - scannedRows
@@ -25939,7 +26045,7 @@ LIMIT ?`
 FROM outbox_messages o
 LEFT JOIN chat_rate_limits r ON r.chat_id = o.teams_chat_id
 WHERE ` + scheduleWhere + `
-	ORDER BY ` + canonicalChatID + `, o.created_at, o.id
+	ORDER BY o.teams_chat_id, o.created_at, o.id
 LIMIT ?`
 		scheduleArgs = append(scheduleArgs, scheduleLimit)
 		scheduleRows, err := db.QueryContext(ctx, scheduleStmt, scheduleArgs...)
@@ -26248,22 +26354,17 @@ func pendingOutboxPageAtSQLiteFast(ctx context.Context, db *sql.DB, query Pendin
 				return PendingOutboxPage{}, errSQLiteOutboxProjectionFallback
 			}
 		} else {
-			canonicalDue := sqliteOutboxNextAttemptDueSQL("o.json", "o.deliver_after")
-			canonicalChatID := sqliteOutboxCanonicalTextSQL("o.json", "$.teams_chat_id", "o.teams_chat_id")
-			scheduleWhere := `json_valid(o.json)
-	  AND json_type(o.json, '$') = 'object'
-	  AND ` + sqliteOutboxTopLevelKeysUniqueSQL("o") + `
-	  AND ` + statusSQL + `
+			// The durable projection marker certifies the scalar chat/status
+			// admission keys. Read the bounded future-scalar set through those
+			// indexes and let appendRow apply the exact canonical JSON schedule in
+			// Go. Re-evaluating json_tree/json_extract for the same rows here did
+			// duplicate the decoder's work while the Store state lock was held.
+			scheduleWhere := statusSQL + `
 	  AND o.deliver_after > ?
-	  AND ` + canonicalDue + `
-	  AND ` + canonicalChatID + ` = ?`
+	  AND o.teams_chat_id = ?`
 			scheduleArgs := make([]any, 0, 8)
 			scheduleArgs = append(scheduleArgs,
-				query.Now.UnixNano(),
-				time.Time{}.UTC().Format(time.RFC3339Nano),
-				query.Now.UTC().Format(time.RFC3339Nano),
-				query.Now.UnixNano(),
-				strings.TrimSpace(query.TeamsChatID),
+				query.Now.UnixNano(), strings.TrimSpace(query.TeamsChatID),
 			)
 			if !query.IgnoreRateLimit {
 				globalBlockedUntil := `(SELECT ` + sqliteStoredInt64SQL("blocked_until") + ` FROM chat_rate_limits WHERE chat_id = ?)`

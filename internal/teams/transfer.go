@@ -236,6 +236,10 @@ func (g *GraphClient) doTransferRequestWithOptions(ctx context.Context, req *htt
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	releaseWrite, err := runGraphRequestBeforeWriteRequest(ctx, req.Method)
+	if err != nil {
+		return nil, err
+	}
 	idle := g.transferIdle()
 	attemptCtx, cancel := context.WithCancel(ctx)
 	progress := newTransferProgress()
@@ -278,6 +282,9 @@ func (g *GraphClient) doTransferRequestWithOptions(ctx context.Context, req *htt
 	}()
 
 	response, err := g.transferHTTPClient().Do(request)
+	if releaseWrite != nil {
+		releaseWrite(response)
+	}
 	if err != nil {
 		stop()
 		if progress.stalled.Load() {

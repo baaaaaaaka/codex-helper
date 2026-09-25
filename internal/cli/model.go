@@ -24,6 +24,8 @@ type modelSetupOptions struct {
 	noDoctor    bool
 }
 
+var lookupModelChoiceForCLI = modelprofile.MustLookupModelChoice
+
 func newModelCmd(root *rootOptions) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "model",
@@ -195,7 +197,7 @@ func runModelSetup(cmd *cobra.Command, root *rootOptions, modelRef string, opts 
 		return err
 	}
 	if verifyErr != nil {
-		return fmt.Errorf("model %s authentication verification failed and remains hidden: %w", choice.ID, verifyErr)
+		return errTeamsModelProfileAuthenticationVerification
 	}
 	action := "Saved"
 	if existed {
@@ -297,7 +299,7 @@ func canonicalConfiguredProfileName(cfg config.Config, ref string) string {
 func modelChoiceForCLI(cmd *cobra.Command, modelRef string, cfg config.Config, secretStore *modelprofile.SecretStore) (modelprofile.ModelChoice, error) {
 	modelRef = strings.TrimSpace(modelRef)
 	if modelRef != "" {
-		return modelprofile.MustLookupModelChoice(modelRef)
+		return lookupModelChoiceForCLI(modelRef)
 	}
 	printModelChoices(cmd.OutOrStdout(), cfg, secretStore)
 	if !term.IsTerminal(int(os.Stdin.Fd())) {
@@ -312,7 +314,7 @@ func modelChoiceForCLI(cmd *cobra.Command, modelRef string, cfg config.Config, s
 		}
 		return choices[index-1], nil
 	}
-	return modelprofile.MustLookupModelChoice(answer)
+	return lookupModelChoiceForCLI(answer)
 }
 
 func modelAPIKeyRefForSetup(cmd *cobra.Command, cfg config.Config, secretStore *modelprofile.SecretStore, choice modelprofile.ModelChoice, existing config.ModelProfile, opts modelSetupOptions) (string, error) {

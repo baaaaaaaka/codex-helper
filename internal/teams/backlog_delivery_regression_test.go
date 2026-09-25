@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -20,6 +21,28 @@ import (
 
 	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
+
+type barrierGraphAuth struct {
+	accessCalls       atomic.Int32
+	secondCallStarted chan struct{}
+	releaseSecondCall chan struct{}
+}
+
+func (a *barrierGraphAuth) AccessToken(ctx context.Context, _ io.Writer, _ bool) (string, error) {
+	if a.accessCalls.Add(1) == 2 {
+		close(a.secondCallStarted)
+		select {
+		case <-a.releaseSecondCall:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	return "access", nil
+}
+
+func (a *barrierGraphAuth) RefreshAccessToken(context.Context) (string, error) {
+	return "access", nil
+}
 
 func TestTeamsCyclePhaseScopeAndProgress(t *testing.T) {
 	bridge := &Bridge{phaseBudget: 5 * time.Millisecond}
@@ -1307,14 +1330,501 @@ func TestTeamsMainLoopOutboxRotatesBeyondFirstTwoChats(t *testing.T) {
 			if err := bridge.flushPendingOutboxMainLoop(ctx); err != nil {
 				t.Fatalf("first rotating outbox flush: %v", err)
 			}
-			if len(*sent) != 4 || (*sent)[0].ChatID != "chat-a" || (*sent)[1].ChatID != "chat-a" || (*sent)[2].ChatID != "chat-b" || (*sent)[3].ChatID != "chat-b" {
-				t.Fatalf("first rotating send order = %#v, want two messages from chat-a then chat-b", *sent)
+			if len(*sent) != 6 || (*sent)[0].ChatID != "chat-a" || (*sent)[1].ChatID != "chat-a" || (*sent)[2].ChatID != "chat-b" || (*sent)[3].ChatID != "chat-b" || (*sent)[4].ChatID != "chat-c" || (*sent)[5].ChatID != "chat-c" {
+				t.Fatalf("first rotating send order = %#v, want two FIFO messages from each of the three chats", *sent)
 			}
 			if err := bridge.flushPendingOutboxMainLoop(ctx); err != nil {
 				t.Fatalf("second rotating outbox flush: %v", err)
 			}
-			if len(*sent) != 8 || (*sent)[4].ChatID != "chat-a" || (*sent)[5].ChatID != "chat-a" || (*sent)[6].ChatID != "chat-c" || (*sent)[7].ChatID != "chat-c" {
-				t.Fatalf("second rotating send order = %#v, want two messages from chat-a then chat-c", *sent)
+			if len(*sent) != 8 || (*sent)[6].ChatID != "chat-a" || (*sent)[7].ChatID != "chat-a" {
+				t.Fatalf("second rotating send order = %#v, want chat-a's remaining FIFO messages", *sent)
+			}
+		})
+	}
+}
+
+func TestTeamsMainLoopOutboxBatchesEightChatsWithTwoHeadsEach(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			graph, sent := newBridgeTestGraph(t)
+			store := newBridgeTestStore(t)
+			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+			base := time.Now().UTC().Add(-time.Hour)
+			rows := make([]teamstore.OutboxMessage, 0, 10*3)
+			for chatIndex := 0; chatIndex < 10; chatIndex++ {
+				chatID := fmt.Sprintf("chat-%02d", chatIndex)
+				for messageIndex := 1; messageIndex <= 3; messageIndex++ {
+					rows = append(rows, teamstore.OutboxMessage{
+						ID:          fmt.Sprintf("outbox:batch:%02d:%d", chatIndex, messageIndex),
+						TeamsChatID: chatID,
+						Kind:        "helper",
+						Body:        fmt.Sprintf("chat %02d message %d", chatIndex, messageIndex),
+						Sequence:    int64(messageIndex),
+						CreatedAt:   base.Add(time.Duration(chatIndex*3+messageIndex) * time.Second),
+					})
+				}
+			}
+			seedBridgeTestOutboxRows(t, ctx, store, rows...)
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate batched outbox: %v", err)
+				}
+			}
+
+			if err := bridge.flushPendingOutboxMainLoop(ctx); err != nil {
+				t.Fatalf("bounded multi-chat outbox flush: %v", err)
+			}
+			if len(*sent) != mainLoopOutboxFlushMaxChats*mainLoopOutboxFlushMaxMessages {
+				t.Fatalf("main-loop sent %d messages, want bounded quantum %d", len(*sent), mainLoopOutboxFlushMaxChats*mainLoopOutboxFlushMaxMessages)
+			}
+			sentByChat := make(map[string]int, 10)
+			for _, message := range *sent {
+				sentByChat[message.ChatID]++
+			}
+			for chatIndex := 0; chatIndex < 10; chatIndex++ {
+				chatID := fmt.Sprintf("chat-%02d", chatIndex)
+				wantSent := 0
+				if chatIndex < mainLoopOutboxFlushMaxChats {
+					wantSent = mainLoopOutboxFlushMaxMessages
+				}
+				if sentByChat[chatID] != wantSent {
+					t.Errorf("chat %s sent %d rows, want %d", chatID, sentByChat[chatID], wantSent)
+				}
+				for messageIndex := 1; messageIndex <= 3; messageIndex++ {
+					message, err := store.OutboxMessageByID(ctx, fmt.Sprintf("outbox:batch:%02d:%d", chatIndex, messageIndex))
+					if err != nil {
+						t.Fatalf("read outbox row %s/%d: %v", chatID, messageIndex, err)
+					}
+					wantSentRow := chatIndex < mainLoopOutboxFlushMaxChats && messageIndex <= mainLoopOutboxFlushMaxMessages
+					if gotSent := message.Status == teamstore.OutboxStatusSent; gotSent != wantSentRow {
+						t.Errorf("outbox row %s/%d status=%q, want sent=%t", chatID, messageIndex, message.Status, wantSentRow)
+					}
+				}
+			}
+			if err := bridge.flushPendingOutboxMainLoop(ctx); err != nil {
+				t.Fatalf("second multi-chat outbox cycle: %v", err)
+			}
+			if len(*sent) != 26 {
+				t.Fatalf("messages sent after second cycle = %d, want 26 including wraparound tail chats", len(*sent))
+			}
+			sentByChat = make(map[string]int, 10)
+			for _, message := range *sent {
+				sentByChat[message.ChatID]++
+			}
+			for chatIndex := 0; chatIndex < 10; chatIndex++ {
+				chatID := fmt.Sprintf("chat-%02d", chatIndex)
+				wantSent := 2
+				if chatIndex < 6 {
+					wantSent = 3
+				}
+				if sentByChat[chatID] != wantSent {
+					t.Errorf("after second cycle chat %s sent %d rows, want %d", chatID, sentByChat[chatID], wantSent)
+				}
+			}
+			if err := bridge.flushPendingOutboxMainLoop(ctx); err != nil {
+				t.Fatalf("third multi-chat outbox cycle: %v", err)
+			}
+			if len(*sent) != 30 {
+				t.Fatalf("messages sent after third cycle = %d, want all 30 rows drained", len(*sent))
+			}
+			for _, row := range rows {
+				message, err := store.OutboxMessageByID(ctx, row.ID)
+				if err != nil {
+					t.Fatalf("read final outbox row %s: %v", row.ID, err)
+				}
+				if message.Status != teamstore.OutboxStatusSent {
+					t.Errorf("outbox row %s status=%q after three fair cycles, want sent", row.ID, message.Status)
+				}
+			}
+		})
+	}
+}
+
+func TestTeamsMainLoopOutboxAccount429StopsSiblingPostsInSameBatch(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			var posts atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages") {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = fmt.Fprint(w, `{"value":[]}`)
+					return
+				}
+				if r.Method != http.MethodPost {
+					t.Errorf("unexpected Graph request: %s %s", r.Method, r.URL.Path)
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				posts.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("Retry-After", "3600")
+				w.Header().Set("X-CXP-RateLimit-Scope", "account")
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = fmt.Fprint(w, `{"error":{"code":"TooManyRequests","message":"account write gate"}}`)
+			}))
+			t.Cleanup(server.Close)
+			graph := &GraphClient{
+				auth:       &fakeGraphAuth{token: "access"},
+				client:     server.Client(),
+				baseURL:    server.URL,
+				maxRetries: 0,
+				sleep:      sleepContext,
+				jitter:     func(d time.Duration) time.Duration { return d },
+			}
+			store := newBridgeTestStore(t)
+			base := time.Now().UTC().Add(-time.Hour)
+			rows := make([]teamstore.OutboxMessage, 0, mainLoopOutboxFlushMaxChats)
+			for chatIndex := 0; chatIndex < mainLoopOutboxFlushMaxChats; chatIndex++ {
+				chatID := fmt.Sprintf("chat-write-429-%02d", chatIndex)
+				rows = append(rows, teamstore.OutboxMessage{
+					ID: "outbox:write-429:" + chatID, TeamsChatID: chatID,
+					Kind: "helper", Body: "queued", Sequence: 1,
+					CreatedAt: base.Add(time.Duration(chatIndex) * time.Second),
+				})
+			}
+			seedBridgeTestOutboxRows(t, ctx, store, rows...)
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate account-429 outbox: %v", err)
+				}
+			}
+			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+			if err := bridge.flushPendingOutboxMainLoop(ctx); err != nil {
+				t.Fatalf("flush after account-scoped write 429: %v", err)
+			}
+			if got := posts.Load(); got != 1 {
+				t.Fatalf("Graph POST count after first account-scoped 429 = %d, want exactly 1 with no sibling POSTs", got)
+			}
+			for _, row := range rows {
+				message, err := store.OutboxMessageByID(ctx, row.ID)
+				if err != nil {
+					t.Fatalf("read gated outbox row %s: %v", row.ID, err)
+				}
+				wantStatus := teamstore.OutboxStatusQueued
+				if row.TeamsChatID == rows[0].TeamsChatID {
+					// A POST 429 is conservatively ambiguous: it may have been
+					// accepted before the throttle response was emitted. Keep the
+					// exact attempt fenced rather than automatically reposting it.
+					wantStatus = teamstore.OutboxStatusSending
+				}
+				if message.Status != wantStatus {
+					t.Errorf("outbox row %s status=%q, want %q under write gate", row.ID, message.Status, wantStatus)
+				}
+				if _, found, err := store.OutboxChatRateLimit(ctx, row.TeamsChatID); err != nil || !found {
+					t.Errorf("account write gate for %s: found=%t err=%v", row.TeamsChatID, found, err)
+				}
+			}
+		})
+	}
+}
+
+func TestTeamsMainLoopOutboxUnscoped429OnlyBlocksFailingChat(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			var posts atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages") {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = fmt.Fprint(w, `{"value":[]}`)
+					return
+				}
+				if r.Method != http.MethodPost || !strings.HasPrefix(r.URL.Path, "/chats/") || !strings.HasSuffix(r.URL.Path, "/messages") {
+					t.Errorf("unexpected Graph request: %s %s", r.Method, r.URL.Path)
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				posts.Add(1)
+				if strings.Contains(r.URL.Path, "chat-unscoped-429-a") {
+					w.Header().Set("Content-Type", "application/json")
+					w.Header().Set("Retry-After", "3600")
+					w.WriteHeader(http.StatusTooManyRequests)
+					_, _ = fmt.Fprint(w, `{"error":{"code":"TooManyRequests","message":"chat-local throttle"}}`)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusCreated)
+				_, _ = fmt.Fprint(w, `{"id":"sent-sibling","messageType":"message"}`)
+			}))
+			t.Cleanup(server.Close)
+			graph := &GraphClient{
+				auth:       &fakeGraphAuth{token: "access"},
+				client:     server.Client(),
+				baseURL:    server.URL,
+				maxRetries: 0,
+				sleep:      sleepContext,
+				jitter:     func(d time.Duration) time.Duration { return d },
+			}
+			store := newBridgeTestStore(t)
+			rows := []teamstore.OutboxMessage{
+				{ID: "outbox:unscoped-429:a", TeamsChatID: "chat-unscoped-429-a", Kind: "helper", Body: "first", Sequence: 1, CreatedAt: time.Now().UTC().Add(-time.Hour)},
+				{ID: "outbox:unscoped-429:b", TeamsChatID: "chat-unscoped-429-b", Kind: "helper", Body: "sibling", Sequence: 1, CreatedAt: time.Now().UTC().Add(-time.Hour).Add(time.Second)},
+			}
+			seedBridgeTestOutboxRows(t, ctx, store, rows...)
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate unscoped-429 outbox: %v", err)
+				}
+			}
+			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+			if err := bridge.flushPendingOutboxMainLoop(ctx); err != nil {
+				t.Fatalf("flush after chat-local 429: %v", err)
+			}
+			if got := posts.Load(); got != 2 {
+				t.Fatalf("Graph POST count after one chat-local 429 = %d, want the failing chat plus one healthy sibling", got)
+			}
+			first, err := store.OutboxMessageByID(ctx, rows[0].ID)
+			if err != nil {
+				t.Fatalf("read ambiguous 429 row: %v", err)
+			}
+			if first.Status != teamstore.OutboxStatusSending {
+				t.Fatalf("chat-local 429 row status=%q, want ambiguous Sending", first.Status)
+			}
+			sibling, err := store.OutboxMessageByID(ctx, rows[1].ID)
+			if err != nil {
+				t.Fatalf("read sibling row: %v", err)
+			}
+			if sibling.Status != teamstore.OutboxStatusSent {
+				t.Fatalf("healthy sibling status=%q, want Sent despite unrelated unscoped 429", sibling.Status)
+			}
+			if _, found, err := store.ChatRateLimit(ctx, graphWriteAccountRateLimitKey); err != nil || found {
+				t.Fatalf("unscoped chat-local 429 installed account write gate: found=%t err=%v", found, err)
+			}
+		})
+	}
+}
+
+func TestTeamsMainLoopOutboxAccount429PersistenceFailureFencesCurrentProcess(t *testing.T) {
+	ctx := context.Background()
+	var posts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages") {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprint(w, `{"value":[]}`)
+			return
+		}
+		if r.Method != http.MethodPost {
+			t.Errorf("unexpected Graph request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		posts.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "3600")
+		w.Header().Set("X-CXP-RateLimit-Scope", "account")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = fmt.Fprint(w, `{"error":{"code":"TooManyRequests","message":"account write gate"}}`)
+	}))
+	t.Cleanup(server.Close)
+	graph := &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	store := newBridgeTestStore(t)
+	base := time.Now().UTC().Add(-time.Hour)
+	rows := []teamstore.OutboxMessage{
+		{ID: "outbox:account-429-persist-failure:a", TeamsChatID: "chat-account-429-persist-a", Kind: "helper", Body: "first", Sequence: 1, CreatedAt: base},
+		{ID: "outbox:account-429-persist-failure:b", TeamsChatID: "chat-account-429-persist-b", Kind: "helper", Body: "sibling", Sequence: 1, CreatedAt: base.Add(time.Second)},
+	}
+	seedBridgeTestOutboxRows(t, ctx, store, rows...)
+	if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+		t.Fatalf("migrate account-gate persistence-failure fixture: %v", err)
+	}
+	databasePath := filepath.Join(filepath.Dir(store.Path()), teamstore.SQLiteFileName)
+	db, err := sql.Open("sqlite", databasePath)
+	if err != nil {
+		t.Fatalf("open migrated SQLite fixture: %v", err)
+	}
+	defer func() {
+		if err := db.Close(); err != nil {
+			t.Errorf("close SQLite fixture connection: %v", err)
+		}
+	}()
+	if _, err := db.ExecContext(ctx, `CREATE TRIGGER reject_account_write_gate BEFORE INSERT ON chat_rate_limits
+WHEN NEW.chat_id = '__cxp_account_graph_write__'
+BEGIN SELECT RAISE(ABORT, 'injected account gate persistence failure'); END`); err != nil {
+		t.Fatalf("install account-gate persistence failure trigger: %v", err)
+	}
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	if err := bridge.flushPendingOutboxMainLoop(ctx); err != nil {
+		t.Fatalf("first flush after account-scoped write 429: %v", err)
+	}
+	if got := posts.Load(); got != 1 {
+		t.Fatalf("Graph POST count after explicit account 429 with gate persistence failure = %d, want one", got)
+	}
+	if _, found, err := store.ChatRateLimit(ctx, graphWriteAccountRateLimitKey); err != nil || found {
+		t.Fatalf("injected account-gate write unexpectedly persisted: found=%t err=%v", found, err)
+	}
+	if until, blocked, err := bridge.chatBlockedUntil(ctx, rows[1].TeamsChatID); err != nil || !blocked || !until.After(time.Now()) {
+		t.Fatalf("process-local account write fence = (%s, %t, %v), want active fence after failed durable write", until, blocked, err)
+	}
+	if err := bridge.flushPendingOutboxMainLoop(ctx); err != nil {
+		t.Fatalf("second flush while process-local account gate is active: %v", err)
+	}
+	if got := posts.Load(); got != 1 {
+		t.Fatalf("Graph POST count grew to %d on next cycle despite account gate persistence failure", got)
+	}
+	sibling, err := store.OutboxMessageByID(ctx, rows[1].ID)
+	if err != nil {
+		t.Fatalf("read sibling row after fenced retry: %v", err)
+	}
+	if sibling.Status != teamstore.OutboxStatusQueued {
+		t.Fatalf("sibling row status=%q after failed account-gate persistence, want Queued", sibling.Status)
+	}
+}
+
+func TestTeamsConcurrentOutboxPostRechecksAccount429FenceAtGraphBoundary(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			firstPostStarted := make(chan struct{})
+			releaseFirstPost := make(chan struct{})
+			var releaseFirstOnce sync.Once
+			var posts atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/chats/") && strings.HasSuffix(r.URL.Path, "/messages") {
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = fmt.Fprint(w, `{"value":[]}`)
+					return
+				}
+				if r.Method != http.MethodPost {
+					t.Errorf("unexpected Graph request: %s %s", r.Method, r.URL.Path)
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				posts.Add(1)
+				if strings.Contains(r.URL.Path, "chat-concurrent-429-a") {
+					close(firstPostStarted)
+					<-releaseFirstPost
+					w.Header().Set("Content-Type", "application/json")
+					w.Header().Set("Retry-After", "3600")
+					w.Header().Set("X-CXP-RateLimit-Scope", "account")
+					w.WriteHeader(http.StatusTooManyRequests)
+					_, _ = fmt.Fprint(w, `{"error":{"code":"TooManyRequests","message":"account write gate"}}`)
+					return
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusCreated)
+				_, _ = fmt.Fprint(w, `{"id":"unexpected-sibling-post","messageType":"message"}`)
+			}))
+			auth := &barrierGraphAuth{
+				secondCallStarted: make(chan struct{}),
+				releaseSecondCall: make(chan struct{}),
+			}
+			var releaseSecondOnce sync.Once
+			t.Cleanup(func() {
+				releaseFirstOnce.Do(func() { close(releaseFirstPost) })
+				releaseSecondOnce.Do(func() { close(auth.releaseSecondCall) })
+				server.Close()
+			})
+			graph := &GraphClient{
+				auth:       auth,
+				client:     server.Client(),
+				baseURL:    server.URL,
+				maxRetries: 0,
+				sleep:      sleepContext,
+				jitter:     func(d time.Duration) time.Duration { return d },
+			}
+			store := newBridgeTestStore(t)
+			rows := []teamstore.OutboxMessage{
+				{ID: "outbox:concurrent-429:a", TeamsChatID: "chat-concurrent-429-a", Kind: "helper", Body: "first", Sequence: 1, CreatedAt: time.Now().UTC().Add(-time.Hour)},
+				{ID: "outbox:concurrent-429:b", TeamsChatID: "chat-concurrent-429-b", Kind: "helper", Body: "sibling", Sequence: 1, CreatedAt: time.Now().UTC().Add(-time.Hour).Add(time.Second)},
+			}
+			seedBridgeTestOutboxRows(t, ctx, store, rows...)
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate concurrent account-429 outbox: %v", err)
+				}
+			}
+			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+			first, err := store.OutboxMessageByID(ctx, rows[0].ID)
+			if err != nil {
+				t.Fatalf("read first concurrent outbox: %v", err)
+			}
+			sibling, err := store.OutboxMessageByID(ctx, rows[1].ID)
+			if err != nil {
+				t.Fatalf("read sibling concurrent outbox: %v", err)
+			}
+			firstDone := make(chan error, 1)
+			go func() {
+				firstDone <- bridge.sendQueuedOutboxWithOptions(ctx, first, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true})
+			}()
+			select {
+			case <-firstPostStarted:
+			case <-time.After(5 * time.Second):
+				t.Fatal("first outbox POST did not reach the controlled Graph boundary")
+			}
+			siblingDone := make(chan error, 1)
+			go func() {
+				siblingDone <- bridge.sendQueuedOutboxWithOptions(ctx, sibling, outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true})
+			}()
+			select {
+			case <-auth.secondCallStarted:
+			case <-time.After(5 * time.Second):
+				t.Fatal("sibling did not pass initial outbox admission and reach Graph authentication")
+			}
+			releaseFirstOnce.Do(func() { close(releaseFirstPost) })
+			var firstErr error
+			select {
+			case firstErr = <-firstDone:
+			case <-time.After(5 * time.Second):
+				t.Fatal("first concurrent outbox send did not finish after its controlled 429")
+			}
+			if !isGraphAccountWriteRateLimit(firstErr) {
+				t.Fatalf("first concurrent outbox result = %v, want explicit account-scoped POST 429", firstErr)
+			}
+			if until := bridge.localGraphWriteAccountBlockedUntil(time.Now()); !until.After(time.Now()) {
+				t.Fatalf("first account 429 did not install a process-local write fence: %s", until)
+			}
+			releaseSecondOnce.Do(func() { close(auth.releaseSecondCall) })
+			var siblingErr error
+			select {
+			case siblingErr = <-siblingDone:
+			case <-time.After(5 * time.Second):
+				t.Fatal("sibling outbox send did not finish after account gate publication")
+			}
+			var preflightErr *graphRequestPreflightError
+			if !errors.As(siblingErr, &preflightErr) || !isOutboxDeliveryDeferred(siblingErr) {
+				t.Fatalf("in-flight sibling result = %v, want safe pre-HTTP write-gate deferral", siblingErr)
+			}
+			if got := posts.Load(); got != 1 {
+				t.Fatalf("Graph POST count after first explicit account 429 = %d, want no post-429 sibling request", got)
+			}
+			first, err = store.OutboxMessageByID(ctx, rows[0].ID)
+			if err != nil {
+				t.Fatalf("read first outbox after 429: %v", err)
+			}
+			if first.Status != teamstore.OutboxStatusSending {
+				t.Fatalf("first 429 attempt status=%q, want Sending to preserve unknown POST result", first.Status)
+			}
+			sibling, err = store.OutboxMessageByID(ctx, rows[1].ID)
+			if err != nil {
+				t.Fatalf("read sibling after preflight deferral: %v", err)
+			}
+			if sibling.Status != teamstore.OutboxStatusQueued {
+				t.Fatalf("sibling preflight deferral status=%q, want safely reset Queued without POST", sibling.Status)
 			}
 		})
 	}
@@ -1347,14 +1857,14 @@ func TestTeamsMainLoopOutboxFairnessSeesChatsBeyondScanPrefix(t *testing.T) {
 	if err := bridge.flushPendingOutboxMainLoop(ctx); err != nil {
 		t.Fatalf("first deep-prefix outbox flush: %v", err)
 	}
-	if len(*sent) != 4 || (*sent)[0].ChatID != "chat-deep-a" || (*sent)[1].ChatID != "chat-deep-a" || (*sent)[2].ChatID != "chat-deep-b" || (*sent)[3].ChatID != "chat-deep-b" {
-		t.Fatalf("first deep-prefix send order = %#v, want two messages from chat-deep-a then chat-deep-b", *sent)
+	if len(*sent) != 6 || (*sent)[0].ChatID != "chat-deep-a" || (*sent)[1].ChatID != "chat-deep-a" || (*sent)[2].ChatID != "chat-deep-b" || (*sent)[3].ChatID != "chat-deep-b" || (*sent)[4].ChatID != "chat-deep-c" || (*sent)[5].ChatID != "chat-deep-c" {
+		t.Fatalf("first deep-prefix send order = %#v, want two FIFO heads from each distinct chat", *sent)
 	}
 	if err := bridge.flushPendingOutboxMainLoop(ctx); err != nil {
 		t.Fatalf("second deep-prefix outbox flush: %v", err)
 	}
-	if len(*sent) != 8 || (*sent)[4].ChatID != "chat-deep-a" || (*sent)[5].ChatID != "chat-deep-a" || (*sent)[6].ChatID != "chat-deep-c" || (*sent)[7].ChatID != "chat-deep-c" {
-		t.Fatalf("second deep-prefix send order = %#v, want two messages from chat-deep-a then chat-deep-c", *sent)
+	if len(*sent) != 8 || (*sent)[6].ChatID != "chat-deep-a" || (*sent)[7].ChatID != "chat-deep-a" {
+		t.Fatalf("second deep-prefix send order = %#v, want chat-deep-a's next two FIFO heads", *sent)
 	}
 }
 
@@ -1517,7 +2027,7 @@ func TestTeamsMainLoopOutboxFairnessCursorWalksPastDistinctChatScanPrefix(t *tes
 			}
 
 			assertFairnessCursorSelection(ownerCtx, bridge,
-				[]string{"chat-distinct-256", "chat-distinct-257"}, "chat-distinct-257")
+				[]string{"chat-distinct-256", "chat-distinct-257", "chat-distinct-258", "chat-distinct-259", "chat-distinct-000", "chat-distinct-001", "chat-distinct-002", "chat-distinct-003"}, "chat-distinct-003")
 
 			if err := store.Close(); err != nil {
 				t.Fatalf("close fairness cursor store: %v", err)
@@ -1530,9 +2040,9 @@ func TestTeamsMainLoopOutboxFairnessCursorWalksPastDistinctChatScanPrefix(t *tes
 			t.Cleanup(func() { _ = reopened.Close() })
 			bridge = newBridgeTestBridge(nil, reopened, &recordingExecutor{})
 			assertFairnessCursorSelection(ownerCtx, bridge,
-				[]string{"chat-distinct-258", "chat-distinct-259"}, "chat-distinct-259")
+				[]string{"chat-distinct-004", "chat-distinct-005", "chat-distinct-006", "chat-distinct-007", "chat-distinct-008", "chat-distinct-009", "chat-distinct-010", "chat-distinct-011"}, "chat-distinct-011")
 			assertFairnessCursorSelection(ownerCtx, bridge,
-				[]string{"chat-distinct-000", "chat-distinct-001"}, "chat-distinct-001")
+				[]string{"chat-distinct-012", "chat-distinct-013", "chat-distinct-014", "chat-distinct-015", "chat-distinct-016", "chat-distinct-017", "chat-distinct-018", "chat-distinct-019"}, "chat-distinct-019")
 			if err := reopened.Update(ctx, func(state *teamstore.State) error {
 				state.ControlLease.Generation++
 				return nil
@@ -1546,15 +2056,110 @@ func TestTeamsMainLoopOutboxFairnessCursorWalksPastDistinctChatScanPrefix(t *tes
 	}
 }
 
+func TestTeamsMainLoopOutboxCursorHandoffEventuallyDrainsReservedChats(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			graph, sent := newBridgeTestGraph(t)
+			store := newBridgeTestStore(t)
+			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+			now := time.Now().UTC()
+			base := now.Add(-time.Hour)
+			rows := make([]teamstore.OutboxMessage, 0, 10)
+			for chatIndex := 0; chatIndex < 10; chatIndex++ {
+				chatID := fmt.Sprintf("chat-handoff-%02d", chatIndex)
+				rows = append(rows, teamstore.OutboxMessage{
+					ID: "outbox:handoff:" + chatID, TeamsChatID: chatID,
+					Kind: "helper", Body: "handoff", Sequence: 1,
+					CreatedAt: base.Add(time.Duration(chatIndex) * time.Second),
+				})
+			}
+			seedBridgeTestOutboxRows(t, ctx, store, rows...)
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate handoff outbox: %v", err)
+				}
+			}
+			owner := teamstore.OwnerMetadata{ScopeID: bridge.scope.ID, MachineID: bridge.machine.ID, LeaseGeneration: 7}
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				state.ControlLease = teamstore.ControlLease{
+					ScopeID: owner.ScopeID, HolderMachineID: owner.MachineID, Generation: owner.LeaseGeneration,
+					Status: teamstore.ControlLeaseStatusActive, LeaseUntil: now.Add(time.Hour),
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed handoff owner lease: %v", err)
+			}
+			ownerCtx := withTeamsOwnerCapability(ctx, owner)
+			selected, err := bridge.pendingMainLoopOutboxChatIDs(ownerCtx)
+			if err != nil {
+				t.Fatalf("old owner preflight before handoff: %v", err)
+			}
+			if len(selected) != mainLoopOutboxFlushMaxChats || selected[0] != "chat-handoff-00" || selected[len(selected)-1] != "chat-handoff-07" {
+				t.Fatalf("old owner selected chats %v, want first bounded batch 00..07", selected)
+			}
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				state.ControlLease.Generation++
+				return nil
+			}); err != nil {
+				t.Fatalf("simulate owner handoff after cursor commit: %v", err)
+			}
+			if err := bridge.flushPendingOutboxMainLoop(ownerCtx); !errors.Is(err, teamstore.ErrControlLeaseNotHeld) {
+				t.Fatalf("stale owner flush error = %v, want lease rejection before Graph", err)
+			}
+			if len(*sent) != 0 {
+				t.Fatalf("stale owner posted %d messages after takeover, want zero", len(*sent))
+			}
+
+			successor := owner
+			successor.LeaseGeneration++
+			successorCtx := withTeamsOwnerCapability(ctx, successor)
+			for cycle := 0; cycle < 3 && len(*sent) < len(rows); cycle++ {
+				if err := bridge.flushPendingOutboxMainLoop(successorCtx); err != nil {
+					t.Fatalf("successor outbox cycle %d: %v", cycle+1, err)
+				}
+			}
+			if len(*sent) != len(rows) {
+				t.Fatalf("successor sent %d/%d rows after handoff, want all reserved chats drained", len(*sent), len(rows))
+			}
+			sentByChat := make(map[string]int, len(rows))
+			for _, message := range *sent {
+				sentByChat[message.ChatID]++
+			}
+			for _, row := range rows {
+				if sentByChat[row.TeamsChatID] != 1 {
+					t.Errorf("chat %s Graph sends=%d after owner handoff, want exactly one", row.TeamsChatID, sentByChat[row.TeamsChatID])
+				}
+				message, err := store.OutboxMessageByID(ctx, row.ID)
+				if err != nil {
+					t.Fatalf("read handoff row %s: %v", row.ID, err)
+				}
+				if message.Status != teamstore.OutboxStatusSent {
+					t.Errorf("handoff row %s status=%q, want sent", row.ID, message.Status)
+				}
+			}
+		})
+	}
+}
+
 func TestTeamsMainLoopOutboxStopsSecondChatAfterProcessWideFailure(t *testing.T) {
 	ctx := context.Background()
 	store := newBridgeTestStore(t)
 	bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
 	base := time.Now().UTC().Add(-time.Minute)
-	seedBridgeTestOutboxRows(t, ctx, store,
-		teamstore.OutboxMessage{ID: "outbox:process-wide:first", TeamsChatID: "chat-process-wide-a", Kind: "helper", Body: "a", CreatedAt: base},
-		teamstore.OutboxMessage{ID: "outbox:process-wide:second", TeamsChatID: "chat-process-wide-b", Kind: "helper", Body: "b", CreatedAt: base.Add(time.Second)},
-	)
+	rows := make([]teamstore.OutboxMessage, 0, mainLoopOutboxFlushMaxChats)
+	for i := 0; i < mainLoopOutboxFlushMaxChats; i++ {
+		chatID := fmt.Sprintf("chat-process-wide-%02d", i)
+		rows = append(rows, teamstore.OutboxMessage{
+			ID: "outbox:process-wide:" + chatID, TeamsChatID: chatID,
+			Kind: "helper", Body: "queued", CreatedAt: base.Add(time.Duration(i) * time.Second),
+		})
+	}
+	seedBridgeTestOutboxRows(t, ctx, store, rows...)
 	flushes := 0
 	bridge.outboxSendHook = func(context.Context, teamstore.OutboxMessage) error {
 		flushes++
@@ -1565,7 +2170,7 @@ func TestTeamsMainLoopOutboxStopsSecondChatAfterProcessWideFailure(t *testing.T)
 		t.Fatalf("main-loop outbox error = %v, want process-wide lease error", err)
 	}
 	if flushes != 1 {
-		t.Fatalf("targeted outbox flushes after process-wide failure = %d, want 1", flushes)
+		t.Fatalf("targeted outbox flushes after process-wide failure = %d, want 1 of %d selected chats", flushes, mainLoopOutboxFlushMaxChats)
 	}
 }
 

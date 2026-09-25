@@ -18,15 +18,19 @@ import (
 )
 
 const (
-	pollFrontierHead                  = "head"
-	pollFrontierHeadContinuation      = "head-continuation"
-	pollFrontierContinuation          = "continuation"
-	pollFrontierGap                   = "gap-recovery"
-	continuationFailureBudget         = 3
-	continuationFailureMaxAge         = 10 * time.Minute
-	continuationHistoryLimit          = 8
-	continuationPageBudget            = 64
-	maxOversizedRecordRefetchAttempts = 3
+	pollFrontierHead                           = "head"
+	pollFrontierHeadContinuation               = "head-continuation"
+	pollFrontierContinuation                   = "continuation"
+	pollFrontierGap                            = "gap-recovery"
+	continuationFailureBudget                  = 3
+	continuationFailureMaxAge                  = 10 * time.Minute
+	continuationHistoryLimit                   = 8
+	continuationPageBudget                     = 64
+	maxOversizedRecordRefetchAttempts          = 3
+	pollPageDispositionRejectedAPIKey          = "rejected_model_api_key"
+	pollPageDispositionRejectedAPIKeyMentioned = "rejected_model_api_key_mentioned"
+	pollPageDispositionDeferredModelKeyIntake  = "deferred_model_key_intake"
+	deferredModelProfileKeyIntakeInboundText   = "[redacted: pending model API key intake]"
 	// Graph message responses are bounded by maxGraphMessagesResponseBytes. Keep the durable
 	// page receipt at the same bound so a valid response containing several
 	// large (but individually recoverable) records is not turned into a
@@ -34,6 +38,33 @@ const (
 	maxPendingPageBytes   = 64 << 20
 	maxPendingRecordBytes = 12 << 20
 )
+
+func rejectedAPIKeyPageDisposition(msg ChatMessage, _ inboundPollRole) string {
+	// Preserve this routing fact even for a legacy receipt whose poll role was
+	// not persisted. A later owner may replay that receipt in the Work lane; the
+	// explicit bit is safe for Control and prevents redaction from erasing a real
+	// group-chat @codex mention.
+	mentioned := msg.rejectedModelAPIKeyMentionedForPoll
+	if !msg.rejectedModelAPIKeyForPoll {
+		mentioned = teamsMessageHasCodexMention(msg, promptTextFromTeamsMessageHTML(msg.Body.Content))
+	}
+	if mentioned {
+		return pollPageDispositionRejectedAPIKeyMentioned
+	}
+	// The legacy disposition is also the fail-closed representation for an
+	// unmentioned Work message. Older receipts used this value before the
+	// mention bit was preserved, so replay must not invent a group-chat mention.
+	return pollPageDispositionRejectedAPIKey
+}
+
+func isRejectedAPIKeyPageDisposition(disposition string) bool {
+	switch strings.TrimSpace(disposition) {
+	case pollPageDispositionRejectedAPIKey, pollPageDispositionRejectedAPIKeyMentioned:
+		return true
+	default:
+		return false
+	}
+}
 
 var (
 	errPendingPageInvalid          = errors.New("pending Graph page is invalid")
@@ -169,6 +200,10 @@ func validateFetchedMessageIdentity(chatID, expectedMessageID string, msg ChatMe
 }
 
 func pendingPageFromWindow(chatID, requestPath, frontier string, epoch uint64, window MessageWindow, baselineOnly bool) (*teamstore.ChatPollPendingPage, error) {
+	return pendingPageFromWindowForRole(chatID, requestPath, frontier, epoch, window, baselineOnly, inboundPollRoleWork)
+}
+
+func pendingPageFromWindowForRole(chatID, requestPath, frontier string, epoch uint64, window MessageWindow, baselineOnly bool, role inboundPollRole) (*teamstore.ChatPollPendingPage, error) {
 	chatID = strings.TrimSpace(chatID)
 	requestPath = strings.TrimSpace(requestPath)
 	if chatID == "" || requestPath == "" {
@@ -196,25 +231,47 @@ func pendingPageFromWindow(chatID, requestPath, frontier string, epoch uint64, w
 		if id == "" {
 			return nil, fmt.Errorf("%w: Graph message has no stable id", errPendingPageIdentity)
 		}
-		raw, err := json.Marshal(msg)
-		if err != nil {
-			return nil, fmt.Errorf("%w: marshal %s: %v", errPendingPageInvalid, id, err)
-		}
-		if len(raw) > maxPendingRecordBytes {
-			return nil, fmt.Errorf("%w: record %s is %d bytes", errPendingPageTooLarge, id, len(raw))
-		}
 		if !pollMessageBelongsToChat(chatID, msg) {
 			return nil, fmt.Errorf("%w: message %q reports chat %q, want %q", errPollMessageChatMismatch, id, strings.TrimSpace(msg.ChatID), chatID)
 		}
 		if baselineOnly && (msg.quarantinedForPoll || msg.oversizedForPoll || msg.invalidForPoll || messageModifiedTime(msg).IsZero()) {
 			return nil, fmt.Errorf("%w: baseline page contains a non-frontier-safe record %q", errPendingPageInvalid, id)
 		}
-		hash := sha256.Sum256(raw)
-		hashText := hex.EncodeToString(hash[:])
-		if previous, ok := seen[id]; ok && previous != hashText {
+		sourceRaw, err := json.Marshal(msg)
+		if err != nil {
+			return nil, fmt.Errorf("%w: marshal %s: %v", errPendingPageInvalid, id, err)
+		}
+		sourceHash := sha256.Sum256(sourceRaw)
+		sourceHashText := hex.EncodeToString(sourceHash[:])
+		if previous, ok := seen[id]; ok && previous != sourceHashText {
 			return nil, fmt.Errorf("%w: message %s changed payload within one page", errPendingPageIdentity, id)
 		}
-		seen[id] = hashText
+		seen[id] = sourceHashText
+
+		routeText := commandRouteTextFromTeamsMessage(msg, promptTextFromTeamsMessageHTML(msg.Body.Content))
+		deferredModelKeyIntake := modelProfileKeyIntakeDeferredForPoll(role, msg, routeText)
+		record := msg
+		rejectedAPIKey := msg.rejectedModelAPIKeyForPoll || modelAPIKeyPreflightMessageForPoll(role, msg, promptTextFromTeamsMessageHTML(msg.Body.Content)) != ""
+		if deferredModelKeyIntake {
+			// The explicit owner-confirmed key-intake flow is the only accepted
+			// raw credential route. Do not put that Graph body in the pending-page
+			// receipt: the bounded poll persists only identity and re-fetches the
+			// message later in the foreground phase.
+			record = redactDeferredModelProfileKeyIntakeMessage(msg)
+		} else if rejectedAPIKey {
+			// Pending-page receipts are durable before handler dispatch. Redact at
+			// this boundary so a crash/restart cannot persist the raw credential.
+			record = redactRejectedModelAPIKeyMessage(msg)
+		}
+		raw, err := json.Marshal(record)
+		if err != nil {
+			return nil, fmt.Errorf("%w: marshal %s: %v", errPendingPageInvalid, id, err)
+		}
+		if len(raw) > maxPendingRecordBytes {
+			return nil, fmt.Errorf("%w: record %s is %d bytes", errPendingPageTooLarge, id, len(raw))
+		}
+		hash := sha256.Sum256(raw)
+		hashText := hex.EncodeToString(hash[:])
 		page.Records = append(page.Records, json.RawMessage(raw))
 		page.RecordIDs = append(page.RecordIDs, id)
 		page.RecordHashes = append(page.RecordHashes, hashText)
@@ -231,6 +288,10 @@ func pendingPageFromWindow(chatID, requestPath, frontier string, epoch uint64, w
 			// the bounded individual refetch lane instead of allowing a successful
 			// handler to repeat forever without advancing the cursor.
 			disposition = "invalid_record"
+		} else if deferredModelKeyIntake && !baselineOnly {
+			disposition = pollPageDispositionDeferredModelKeyIntake
+		} else if rejectedAPIKey && !baselineOnly {
+			disposition = rejectedAPIKeyPageDisposition(record, role)
 		}
 		page.Dispositions = append(page.Dispositions, disposition)
 		total += int64(len(raw))
@@ -519,6 +580,18 @@ func pendingPageToWindow(page *teamstore.ChatPollPendingPage) (MessageWindow, er
 			disposition = strings.TrimSpace(page.Dispositions[i])
 			switch strings.TrimSpace(page.Dispositions[i]) {
 			case "received":
+			case pollPageDispositionRejectedAPIKey, pollPageDispositionRejectedAPIKeyMentioned:
+				if msg.Body.ContentType != "text" || msg.Body.Content != rejectedModelAPIKeyInboundText || len(msg.Attachments) != 0 || len(msg.Mentions) != 0 {
+					return MessageWindow{}, fmt.Errorf("%w: credential-rejected record %d is not safely redacted", errPendingPageInvalid, i)
+				}
+				msg.rejectedModelAPIKeyForPoll = true
+				msg.rejectedModelAPIKeyMentionedForPoll = disposition == pollPageDispositionRejectedAPIKeyMentioned
+			case pollPageDispositionDeferredModelKeyIntake:
+				if page.PollRole != "" && page.PollRole != string(inboundPollRoleControl) ||
+					msg.Body.ContentType != "text" || msg.Body.Content != deferredModelProfileKeyIntakeInboundText || len(msg.Attachments) != 0 || len(msg.Mentions) != 0 {
+					return MessageWindow{}, fmt.Errorf("%w: deferred model-key intake record %d is not safely redacted or control-scoped", errPendingPageInvalid, i)
+				}
+				msg.deferredModelProfileKeyIntakeForPoll = true
 			case "oversized_record":
 				msg.oversizedForPoll = true
 			case "invalid_record":
@@ -529,7 +602,7 @@ func pendingPageToWindow(page *teamstore.ChatPollPendingPage) (MessageWindow, er
 				return MessageWindow{}, fmt.Errorf("%w: record %d has unknown disposition %q", errPendingPageInvalid, i, page.Dispositions[i])
 			}
 		}
-		if (disposition == "received" || disposition == "") && messageModifiedTime(msg).IsZero() {
+		if (disposition == "received" || disposition == "" || isRejectedAPIKeyPageDisposition(disposition) || disposition == pollPageDispositionDeferredModelKeyIntake) && messageModifiedTime(msg).IsZero() {
 			return MessageWindow{}, fmt.Errorf("%w: record %d has no usable modified timestamp", errPendingPageInvalid, i)
 		}
 		if page.BaselineOnly && disposition != "" && disposition != "received" {
@@ -538,6 +611,92 @@ func pendingPageToWindow(page *teamstore.ChatPollPendingPage) (MessageWindow, er
 		window.Messages = append(window.Messages, msg)
 	}
 	return window, nil
+}
+
+// redactPendingPageModelAPIKeys rewrites credentials captured by an older
+// writer before the receipt is dispatched. The replacement page preserves
+// frontier provenance and record order; only the affected payload/hash and
+// disposition change. Callers must persist this new receipt with the active
+// attempt capability before invoking any handler.
+func redactPendingPageModelAPIKeys(page *teamstore.ChatPollPendingPage, role inboundPollRole) (*teamstore.ChatPollPendingPage, bool, error) {
+	if page == nil {
+		return nil, false, nil
+	}
+	window, err := pendingPageToWindow(page)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(window.Messages) != len(page.Records) {
+		return nil, false, fmt.Errorf("%w: pending page message count changed during credential audit", errPendingPageInvalid)
+	}
+	next := *page
+	next.Records = append([]json.RawMessage(nil), page.Records...)
+	next.RecordHashes = append([]string(nil), page.RecordHashes...)
+	next.Dispositions = append([]string(nil), page.Dispositions...)
+	if len(next.Dispositions) == 0 {
+		next.Dispositions = make([]string, len(page.Records))
+		for i, message := range window.Messages {
+			next.Dispositions[i] = "received"
+			if message.quarantinedForPoll {
+				next.Dispositions[i] = "invalid_record_quarantined"
+			} else if message.oversizedForPoll {
+				next.Dispositions[i] = "oversized_record"
+			} else if message.invalidForPoll {
+				next.Dispositions[i] = "invalid_record"
+			}
+		}
+	}
+	changed := false
+	for i, message := range window.Messages {
+		if isRejectedAPIKeyPageDisposition(next.Dispositions[i]) || next.Dispositions[i] == pollPageDispositionDeferredModelKeyIntake {
+			continue
+		}
+		if modelProfileKeyIntakeDeferredForPoll(role, message,
+			commandRouteTextFromTeamsMessage(message, promptTextFromTeamsMessageHTML(message.Body.Content))) {
+			redacted := redactDeferredModelProfileKeyIntakeMessage(message)
+			raw, err := json.Marshal(redacted)
+			if err != nil {
+				return nil, false, fmt.Errorf("%w: marshal redacted model-key intake record %d: %v", errPendingPageInvalid, i, err)
+			}
+			if len(raw) > maxPendingRecordBytes {
+				return nil, false, fmt.Errorf("%w: redacted model-key intake record %d is %d bytes", errPendingPageTooLarge, i, len(raw))
+			}
+			hash := sha256.Sum256(raw)
+			next.Records[i] = json.RawMessage(raw)
+			next.RecordHashes[i] = hex.EncodeToString(hash[:])
+			if !page.BaselineOnly {
+				next.Dispositions[i] = pollPageDispositionDeferredModelKeyIntake
+			}
+			changed = true
+			continue
+		}
+		if modelAPIKeyPreflightMessageForPoll(role, message, promptTextFromTeamsMessageHTML(message.Body.Content)) == "" {
+			continue
+		}
+		redacted := redactRejectedModelAPIKeyMessage(message)
+		raw, err := json.Marshal(redacted)
+		if err != nil {
+			return nil, false, fmt.Errorf("%w: marshal redacted pending record %d: %v", errPendingPageInvalid, i, err)
+		}
+		if len(raw) > maxPendingRecordBytes {
+			return nil, false, fmt.Errorf("%w: redacted record %d is %d bytes", errPendingPageTooLarge, i, len(raw))
+		}
+		hash := sha256.Sum256(raw)
+		next.Records[i] = json.RawMessage(raw)
+		next.RecordHashes[i] = hex.EncodeToString(hash[:])
+		if !page.BaselineOnly && next.Dispositions[i] == "received" {
+			next.Dispositions[i] = rejectedAPIKeyPageDisposition(redacted, role)
+		}
+		changed = true
+	}
+	if !changed {
+		return page, false, nil
+	}
+	next.ReceiptID = pendingPageReceiptID(&next)
+	if _, err := pendingPageToWindow(&next); err != nil {
+		return nil, false, err
+	}
+	return &next, true, nil
 }
 
 // notePendingPageRefetchFailure records a failure for one already-identified
@@ -610,6 +769,22 @@ func appendPollQuarantinedRecordIDs(poll *teamstore.ChatPollState, ids ...string
 	}
 }
 
+// pollGapRecoveryBounds preserves both durable timestamps while making a
+// legacy crossed interval executable. The low-level Graph path builder fails
+// closed for reversed bounds; at the state-machine boundary, swap the two
+// finite endpoints instead of issuing a permanently empty query or widening
+// the recovery into an unbounded stream.
+func pollGapRecoveryBounds(gap *teamstore.ChatPollGap) (time.Time, time.Time) {
+	if gap == nil {
+		return time.Time{}, time.Time{}
+	}
+	lower, upper := gap.SafeCursor, gap.RecoveryCursor
+	if !lower.IsZero() && !upper.IsZero() && upper.Before(lower) {
+		return upper, lower
+	}
+	return lower, upper
+}
+
 func pollPageRequestForState(chatID string, top int, role inboundPollRole, poll teamstore.ChatPollState) (string, string, time.Time) {
 	if role == inboundPollRoleWork {
 		if poll.Gap != nil {
@@ -659,7 +834,8 @@ func pollPageRequestForState(chatID string, top int, role inboundPollRole, poll 
 		// SafeCursor after a complete page, so an expired opaque continuation can
 		// still be recovered without an unsupported ascending request, repeated
 		// newest pages, or a skipped older suffix.
-		return pollFrontierGap, chatMessagesGapPath(chatID, ownerPollMessageTop, poll.Gap.SafeCursor, poll.Gap.RecoveryCursor), modifiedAfter
+		lower, upper := pollGapRecoveryBounds(poll.Gap)
+		return pollFrontierGap, chatMessagesGapPath(chatID, ownerPollMessageTop, lower, upper), modifiedAfter
 	}
 	return pollFrontierHead, chatMessagesPath(chatID, top, modifiedAfter), modifiedAfter
 }
@@ -1177,7 +1353,17 @@ func persistPollRefetchedMessages(page *teamstore.ChatPollPendingPage, messages 
 		if currentDisposition != "oversized_record" && currentDisposition != "invalid_record" {
 			continue
 		}
-		raw, err := json.Marshal(message)
+		record := message
+		role := inboundPollRole(strings.TrimSpace(page.PollRole))
+		deferredModelKeyIntake := modelProfileKeyIntakeDeferredForPoll(role, message,
+			commandRouteTextFromTeamsMessage(message, promptTextFromTeamsMessageHTML(message.Body.Content)))
+		rejectedAPIKey := message.rejectedModelAPIKeyForPoll || modelAPIKeyPreflightMessageForPoll(role, message, promptTextFromTeamsMessageHTML(message.Body.Content)) != ""
+		if deferredModelKeyIntake {
+			record = redactDeferredModelProfileKeyIntakeMessage(message)
+		} else if rejectedAPIKey {
+			record = redactRejectedModelAPIKeyMessage(message)
+		}
+		raw, err := json.Marshal(record)
 		if err != nil {
 			return fmt.Errorf("%w: marshal refetched message %q: %v", errPendingPageInvalid, messageID, err)
 		}
@@ -1188,6 +1374,11 @@ func persistPollRefetchedMessages(page *teamstore.ChatPollPendingPage, messages 
 		page.Records[index] = json.RawMessage(raw)
 		page.RecordHashes[index] = hex.EncodeToString(hash[:])
 		page.Dispositions[index] = "received"
+		if deferredModelKeyIntake && !page.BaselineOnly {
+			page.Dispositions[index] = pollPageDispositionDeferredModelKeyIntake
+		} else if rejectedAPIKey && !page.BaselineOnly {
+			page.Dispositions[index] = rejectedAPIKeyPageDisposition(record, role)
+		}
 		if len(page.RefetchFailures) == len(page.Records) {
 			page.RefetchFailures[index] = 0
 		}
@@ -1294,7 +1485,7 @@ func (b *Bridge) commitPollAttemptSuccessInternal(ctx context.Context, chatID, a
 			// comparing against that updated value would make every full terminal
 			// page look like an equal-timestamp page and could leave a healthy gap
 			// open forever.
-			previousRecoveryCursor := poll.Gap.RecoveryCursor
+			_, previousRecoveryUpperBound := pollGapRecoveryBounds(poll.Gap)
 			// Recovery pages are fetched newest-first because Graph does not
 			// support ascending order. Move the durable upper bound to the oldest
 			// record in a fully handled page; the next fallback query can then reach
@@ -1320,8 +1511,8 @@ func (b *Bridge) commitPollAttemptSuccessInternal(ctx context.Context, chatID, a
 			// directional gap explicitly quarantined instead of clearing it and
 			// making an equal-timestamp suffix permanently unreachable.
 			equalTimestampBoundary := !result.MinModified.IsZero() &&
-				!previousRecoveryCursor.IsZero() &&
-				!result.MinModified.Before(previousRecoveryCursor) &&
+				!previousRecoveryUpperBound.IsZero() &&
+				!result.MinModified.Before(previousRecoveryUpperBound) &&
 				result.Fetched >= normalizedMessageTop(ownerPollMessageTop) &&
 				(!window.Truncated || strings.TrimSpace(window.NextPath) == "")
 			if equalTimestampBoundary {

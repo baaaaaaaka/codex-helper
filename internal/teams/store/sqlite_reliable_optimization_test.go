@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -153,12 +154,12 @@ func TestSQLiteSessionTranscriptDedupeDiscardsNativePrefixWhenMarkerChanges(t *t
 	}
 }
 
-func bumpSQLiteDedupeOutboxGenerationForTest(t *testing.T, store *Store) {
+func bumpSQLiteDedupeOutboxGenerationForTest(t *testing.T, store *Store, outboxID string) {
 	t.Helper()
 	if err := store.Update(context.Background(), func(state *State) error {
-		message, ok := state.OutboxMessages["outbox-dedupe-target"]
+		message, ok := state.OutboxMessages[outboxID]
 		if !ok {
-			return errors.New("dedupe target outbox is missing")
+			return errors.New("dedupe outbox is missing")
 		}
 		message.UpdatedAt = message.UpdatedAt.Add(time.Nanosecond)
 		state.OutboxMessages[message.ID] = message
@@ -168,55 +169,153 @@ func bumpSQLiteDedupeOutboxGenerationForTest(t *testing.T, store *Store) {
 	}
 }
 
-func TestSQLiteSessionTranscriptDedupeRetriesUnstableSnapshot(t *testing.T) {
+func TestSQLiteSessionTranscriptDedupeKeepsCoherentSnapshotAcrossConcurrentOutboxUpdate(t *testing.T) {
+	ctx := context.Background()
 	store := seedSQLiteDedupeProjectionFixture(t)
+	before, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load pre-race dedupe state: %v", err)
+	}
+	beforeOutbox := before.OutboxMessages["outbox-dedupe-target"]
 	var attempts int
 	previousHook := sqliteSessionTranscriptDedupeSnapshotTestHook
 	sqliteSessionTranscriptDedupeSnapshotTestHook = func(stage string) {
-		if stage != "opened" {
-			return
-		}
-		attempts++
-		if attempts == 1 {
-			bumpSQLiteDedupeOutboxGenerationForTest(t, store)
+		switch stage {
+		case "transaction-opened":
+			attempts++
+		case "runtime-read":
+			if attempts == 1 {
+				bumpSQLiteDedupeOutboxGenerationForTest(t, store, "outbox-dedupe-target")
+			}
 		}
 	}
 	t.Cleanup(func() { sqliteSessionTranscriptDedupeSnapshotTestHook = previousHook })
 
-	state, err := store.SessionTranscriptDedupeSnapshot(context.Background(), "session-dedupe-target", "")
+	state, err := store.SessionTranscriptDedupeSnapshot(ctx, "session-dedupe-target", "")
 	if err != nil {
-		t.Fatalf("SessionTranscriptDedupeSnapshot after one unstable attempt: %v", err)
+		t.Fatalf("SessionTranscriptDedupeSnapshot after concurrent outbox update: %v", err)
 	}
-	if attempts != 2 {
-		t.Fatalf("dedupe snapshot attempts = %d, want 2", attempts)
+	if attempts != 1 {
+		t.Fatalf("dedupe snapshot attempts = %d, want one coherent read transaction", attempts)
 	}
-	if _, ok := state.OutboxMessages["outbox-dedupe-target"]; !ok {
+	gotOutbox, ok := state.OutboxMessages["outbox-dedupe-target"]
+	if !ok {
 		t.Fatalf("stable retry omitted target outbox: %#v", state.OutboxMessages)
+	}
+	if !gotOutbox.UpdatedAt.Equal(beforeOutbox.UpdatedAt) {
+		t.Fatalf("snapshot outbox updated_at = %s, want point-in-time value %s", gotOutbox.UpdatedAt, beforeOutbox.UpdatedAt)
+	}
+	current, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load current dedupe state: %v", err)
+	}
+	if currentOutbox := current.OutboxMessages["outbox-dedupe-target"]; !currentOutbox.UpdatedAt.After(beforeOutbox.UpdatedAt) {
+		t.Fatalf("concurrent durable outbox update was not committed: before=%s after=%s", beforeOutbox.UpdatedAt, currentOutbox.UpdatedAt)
 	}
 }
 
-func TestSQLiteSessionTranscriptDedupeFailsClosedAfterRepeatedUnstableSnapshots(t *testing.T) {
+func TestSQLiteSessionTranscriptDedupeDoesNotRetryForUnrelatedOutboxGenerationChurn(t *testing.T) {
 	store := seedSQLiteDedupeProjectionFixture(t)
 	var attempts int
 	previousHook := sqliteSessionTranscriptDedupeSnapshotTestHook
 	sqliteSessionTranscriptDedupeSnapshotTestHook = func(stage string) {
 		if stage == "opened" {
 			attempts++
-			bumpSQLiteDedupeOutboxGenerationForTest(t, store)
+			bumpSQLiteDedupeOutboxGenerationForTest(t, store, "outbox-dedupe-other")
 		}
 	}
 	t.Cleanup(func() { sqliteSessionTranscriptDedupeSnapshotTestHook = previousHook })
 
-	_, err := store.SessionTranscriptDedupeSnapshot(context.Background(), "session-dedupe-target", "")
-	if !errors.Is(err, errSQLiteSessionTranscriptDedupeSnapshotChanged) {
-		t.Fatalf("repeatedly unstable dedupe snapshot error = %v, want %v", err, errSQLiteSessionTranscriptDedupeSnapshotChanged)
+	state, err := store.SessionTranscriptDedupeSnapshot(context.Background(), "session-dedupe-target", "")
+	if err != nil {
+		t.Fatalf("SessionTranscriptDedupeSnapshot during unrelated outbox churn: %v", err)
 	}
-	if attempts != sqliteOutboxCanonicalSnapshotMaxAttempts {
-		t.Fatalf("dedupe snapshot attempts = %d, want bounded limit %d", attempts, sqliteOutboxCanonicalSnapshotMaxAttempts)
+	if attempts != 1 {
+		t.Fatalf("dedupe snapshot attempts = %d, want one attempt despite unrelated generation churn", attempts)
+	}
+	if _, ok := state.OutboxMessages["outbox-dedupe-target"]; !ok {
+		t.Fatalf("unrelated outbox churn hid target row: %#v", state.OutboxMessages)
+	}
+	if _, ok := state.OutboxMessages["outbox-dedupe-other"]; ok {
+		t.Fatalf("unrelated session outbox leaked into dedupe snapshot: %#v", state.OutboxMessages)
 	}
 }
 
-func TestSQLiteSessionTranscriptDedupeRetriesWhenSessionProjectionChanges(t *testing.T) {
+func TestSQLiteSessionTranscriptDedupeStaleSnapshotCannotDuplicateConcurrentOutbox(t *testing.T) {
+	ctx := context.Background()
+	store := seedSQLiteDedupeProjectionFixture(t)
+	request := TranscriptDeliveryQueueRequest{
+		Message: OutboxMessage{
+			ID: "outbox-dedupe-race", SessionID: "session-dedupe-target",
+			TurnID: "sync:session-dedupe-target", TeamsChatID: "chat-dedupe-target",
+			Kind: "status-progress", Body: "concurrent transcript row",
+			Status: OutboxStatusQueued, Sequence: 7,
+			CreatedAt: time.Date(2026, 9, 12, 12, 1, 0, 0, time.UTC),
+		},
+		Delivery: TranscriptDeliveryRecord{
+			ID: "delivery-dedupe-race", SessionID: "session-dedupe-target",
+			OutboxID: "outbox-dedupe-race", Status: TranscriptDeliveryStatusQueued,
+		},
+	}
+	var attempts int
+	previousHook := sqliteSessionTranscriptDedupeSnapshotTestHook
+	sqliteSessionTranscriptDedupeSnapshotTestHook = func(stage string) {
+		switch stage {
+		case "transaction-opened":
+			attempts++
+		case "runtime-read":
+			if attempts == 1 {
+				if err := store.Update(ctx, func(state *State) error {
+					state.OutboxMessages[request.Message.ID] = request.Message
+					return nil
+				}); err != nil {
+					t.Fatalf("insert concurrent deterministic transcript outbox: %v", err)
+				}
+			}
+		}
+	}
+	t.Cleanup(func() { sqliteSessionTranscriptDedupeSnapshotTestHook = previousHook })
+
+	snapshot, err := store.SessionTranscriptDedupeSnapshot(ctx, "session-dedupe-target", "")
+	if err != nil {
+		t.Fatalf("SessionTranscriptDedupeSnapshot during concurrent insert: %v", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("dedupe snapshot attempts = %d, want one coherent read transaction", attempts)
+	}
+	if _, found := snapshot.OutboxMessages[request.Message.ID]; found {
+		t.Fatalf("snapshot included a row committed after its SQLite read transaction began: %#v", snapshot.OutboxMessages[request.Message.ID])
+	}
+
+	queued, created, alreadyDelivered, err := store.QueueTranscriptDeliveryOutbox(ctx, request)
+	if err != nil {
+		t.Fatalf("QueueTranscriptDeliveryOutbox after stale preflight: %v", err)
+	}
+	if queued.ID != request.Message.ID || created || alreadyDelivered {
+		t.Fatalf("QueueTranscriptDeliveryOutbox = %#v created=%t alreadyDelivered=%t; want existing deterministic row", queued, created, alreadyDelivered)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load after stale-preflight queue: %v", err)
+	}
+	if got := state.OutboxMessages[request.Message.ID]; got.ID != request.Message.ID {
+		t.Fatalf("durable deterministic outbox after queue = %#v", got)
+	}
+	if got := state.TranscriptDeliveries[request.Delivery.ID]; got.OutboxID != request.Message.ID {
+		t.Fatalf("durable delivery after stale-preflight queue = %#v", got)
+	}
+	count := 0
+	for id := range state.OutboxMessages {
+		if id == request.Message.ID {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("deterministic outbox row count = %d, want 1", count)
+	}
+}
+
+func TestSQLiteSessionTranscriptDedupeReadsLatestSessionChangeBeforeSnapshot(t *testing.T) {
 	ctx := context.Background()
 	store := seedSQLiteDedupeProjectionFixture(t)
 	var attempts int
@@ -240,12 +339,127 @@ func TestSQLiteSessionTranscriptDedupeRetriesWhenSessionProjectionChanges(t *tes
 	if err != nil {
 		t.Fatalf("SessionTranscriptDedupeSnapshot after session change: %v", err)
 	}
-	if attempts != 2 {
-		t.Fatalf("dedupe snapshot attempts = %d, want one retry after non-outbox write", attempts)
+	if attempts != 1 {
+		t.Fatalf("dedupe snapshot attempts = %d, want one coherent read after pre-snapshot write", attempts)
 	}
 	if session := state.Sessions["session-dedupe-target"]; session.Status != SessionStatusClosed {
-		t.Fatalf("dedupe snapshot returned pre-change session after retry: %#v", session)
+		t.Fatalf("dedupe snapshot missed session change committed before its first read: %#v", session)
 	}
+}
+
+func TestSQLiteSessionTranscriptDedupeKeepsSnapshotAcrossConcurrentSessionWrite(t *testing.T) {
+	ctx := context.Background()
+	store := seedSQLiteDedupeProjectionFixture(t)
+	var attempts int
+	previousHook := sqliteSessionTranscriptDedupeSnapshotTestHook
+	sqliteSessionTranscriptDedupeSnapshotTestHook = func(stage string) {
+		if stage != "runtime-read" {
+			return
+		}
+		attempts++
+		if attempts != 1 {
+			return
+		}
+		withSQLiteTxForTest(t, store, func(tx *sql.Tx) error {
+			_, err := tx.ExecContext(ctx, `UPDATE sessions SET status = ?, json = json_set(json, '$.status', ?) WHERE id = ?`, SessionStatusClosed, SessionStatusClosed, "session-dedupe-target")
+			return err
+		})
+	}
+	t.Cleanup(func() { sqliteSessionTranscriptDedupeSnapshotTestHook = previousHook })
+
+	snapshot, err := store.SessionTranscriptDedupeSnapshot(ctx, "session-dedupe-target", "")
+	if err != nil {
+		t.Fatalf("SessionTranscriptDedupeSnapshot after concurrent non-outbox write: %v", err)
+	}
+	if attempts != 1 {
+		t.Fatalf("dedupe snapshot attempts = %d, want one stable SQLite snapshot", attempts)
+	}
+	if got := snapshot.Sessions["session-dedupe-target"].Status; got != SessionStatusActive {
+		t.Fatalf("snapshot session status = %q, want the pre-write value from its pinned transaction", got)
+	}
+	current, err := store.SessionsByID(ctx, []string{"session-dedupe-target"})
+	session, ok := current["session-dedupe-target"]
+	if err != nil || !ok || session.Status != SessionStatusClosed {
+		t.Fatalf("durable session after concurrent write = %#v err=%v; want closed", current, err)
+	}
+}
+
+func TestSQLiteSessionTranscriptDedupeRejectsReplacedDatabase(t *testing.T) {
+	ctx := context.Background()
+	store := seedSQLiteDedupeProjectionFixture(t)
+	statePath := store.Path()
+	var snapshot sqliteOutboxReadSnapshot
+	if err := store.withStateLock(ctx, func() error {
+		pointer, ok, err := store.currentSQLitePointerUnlocked()
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return errors.New("store is not backed by sqlite")
+		}
+		snapshot.path, err = store.storeSQLitePath(pointer)
+		if err != nil {
+			return err
+		}
+		snapshot.identity, err = sqliteReadOnlyFileIdentityForPath(snapshot.path)
+		return err
+	}); err != nil {
+		t.Fatalf("capture SQLite dedupe database identity: %v", err)
+	}
+	if !snapshot.identity.Exists {
+		t.Fatalf("captured SQLite dedupe database identity is missing: %#v", snapshot.identity)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("close fixture store before replacing database file: %v", err)
+	}
+
+	store, err := Open(statePath)
+	if err != nil {
+		t.Fatalf("reopen fixture store after closing SQLite handles: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Fatalf("close reopened fixture store: %v", err)
+		}
+	})
+
+	replacementPath := snapshot.path + ".identity-test-replacement"
+	originalPath := snapshot.path + ".identity-test-original"
+	if err := os.WriteFile(replacementPath, []byte("replacement database file"), 0o600); err != nil {
+		t.Fatalf("write replacement SQLite file: %v", err)
+	}
+	if err := os.Rename(snapshot.path, originalPath); err != nil {
+		_ = os.Remove(replacementPath)
+		t.Fatalf("move original SQLite database aside: %v", err)
+	}
+	if err := os.Rename(replacementPath, snapshot.path); err != nil {
+		_ = os.Rename(originalPath, snapshot.path)
+		t.Fatalf("install replacement SQLite database file: %v", err)
+	}
+	restored := false
+	defer func() {
+		if restored {
+			return
+		}
+		_ = os.Remove(snapshot.path)
+		_ = os.Rename(originalPath, snapshot.path)
+	}()
+
+	stable, err := store.sqliteOutboxReadDatabaseIdentityStable(ctx, snapshot)
+	if err != nil {
+		t.Fatalf("check replaced SQLite dedupe database identity: %v", err)
+	}
+	if stable {
+		t.Fatalf("database replacement was accepted as the captured dedupe database: before=%#v", snapshot.identity)
+	}
+
+	if err := os.Remove(snapshot.path); err != nil {
+		t.Fatalf("remove disposable replacement SQLite file: %v", err)
+	}
+	if err := os.Rename(originalPath, snapshot.path); err != nil {
+		t.Fatalf("restore original SQLite database file: %v", err)
+	}
+	restored = true
 }
 
 func TestSQLiteStoredInt64RejectsFractionalReal(t *testing.T) {
@@ -693,6 +907,32 @@ func TestSQLiteSessionTranscriptDedupePropagatesCancellation(t *testing.T) {
 	}
 	if !errors.Is(loadErr, context.Canceled) {
 		t.Fatalf("dedupe loader error = %v, want context.Canceled", loadErr)
+	}
+}
+
+func TestSQLiteSessionTranscriptDedupePropagatesCancellationAfterReadTransactionStarts(t *testing.T) {
+	store := seedSQLiteDedupeProjectionFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var reachedSnapshot bool
+	previousHook := sqliteSessionTranscriptDedupeSnapshotTestHook
+	sqliteSessionTranscriptDedupeSnapshotTestHook = func(stage string) {
+		if stage == "runtime-read" {
+			reachedSnapshot = true
+			cancel()
+		}
+	}
+	t.Cleanup(func() { sqliteSessionTranscriptDedupeSnapshotTestHook = previousHook })
+
+	state, err := store.SessionTranscriptDedupeSnapshot(ctx, "session-dedupe-target", "")
+	if !reachedSnapshot {
+		t.Fatal("dedupe snapshot did not establish its SQLite read transaction before cancellation")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("dedupe snapshot error after in-flight cancellation = %v, want context.Canceled", err)
+	}
+	if len(state.OutboxMessages) != 0 || len(state.Sessions) != 0 || len(state.Turns) != 0 {
+		t.Fatalf("canceled dedupe snapshot returned partial state: sessions=%d turns=%d outbox=%d", len(state.Sessions), len(state.Turns), len(state.OutboxMessages))
 	}
 }
 

@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -47,6 +48,33 @@ func TestChatMessagesGapPathUsesSupportedExclusiveDateOperators(t *testing.T) {
 	crossedFilter := "lastModifiedDateTime gt " + formatGraphDateTimeBound(lower) + " and lastModifiedDateTime lt " + formatGraphDateTimeBound(lower)
 	if got := mustParseTestURL(t, crossed).Query().Get("$filter"); got != crossedFilter {
 		t.Fatalf("crossed gap filter = %q, want impossible bounded interval %q", got, crossedFilter)
+	}
+}
+
+func TestPollPageRequestForStateReordersLegacyCrossedGapWithinBounds(t *testing.T) {
+	const chatID = "chat-crossed-gap-request"
+	safe := time.Date(2026, 8, 19, 4, 47, 0, 19_000_000, time.UTC)
+	recovery := time.Date(2026, 8, 19, 4, 46, 25, 997_000_000, time.UTC)
+	poll := teamstore.ChatPollState{
+		ChatID: chatID,
+		Gap: &teamstore.ChatPollGap{
+			SafeCursor:     safe,
+			RecoveryCursor: recovery,
+		},
+	}
+	frontier, path, _ := pollPageRequestForState(chatID, 20, inboundPollRoleWork, poll)
+	if frontier != pollFrontierGap {
+		t.Fatalf("crossed gap frontier = %q, want %q", frontier, pollFrontierGap)
+	}
+	parsed := mustParseTestURL(t, path)
+	filter := parsed.Query().Get("$filter")
+	wantFilter := "lastModifiedDateTime gt " + formatGraphDateTimeBound(recovery.Add(-pollCursorOverlap)) +
+		" and lastModifiedDateTime lt " + formatGraphDateTimeExclusiveUpper(safe)
+	if filter != wantFilter {
+		t.Fatalf("crossed gap filter = %q, want bounded re-ordered interval %q", filter, wantFilter)
+	}
+	if strings.Contains(filter, " ge ") || strings.Contains(filter, " le ") {
+		t.Fatalf("crossed gap filter uses unsupported Graph operators: %q", filter)
 	}
 }
 
@@ -815,6 +843,235 @@ func TestPollFrontierPendingPagePersistsOversizedDispositionAndReplaysLaterText(
 	page.ReceiptID = pendingPageReceiptID(page)
 	if _, err := pendingPageToWindow(page); err == nil || !strings.Contains(err.Error(), "unknown disposition") {
 		t.Fatalf("unknown page disposition error = %v, want explicit validation failure", err)
+	}
+}
+
+func TestPollFrontierPendingPageRedactsCredentialBeforeReceiptPersistence(t *testing.T) {
+	const fakeKey = "sk-test-page-redaction-0123456789abcdef"
+	message := bridgePollMessage("redacted-before-stage", "2026-09-24T12:00:00Z", "@codex inspect this pasted value ("+fakeKey+"),")
+	message.ChatID = "chat-page-redaction"
+	message.Mentions = []json.RawMessage{json.RawMessage(`{"text":"` + fakeKey + `"}`)}
+	message.Attachments = []MessageAttachment{{ContentType: "reference", Name: fakeKey}}
+	page, err := pendingPageFromWindow("chat-page-redaction", "/chats/chat-page-redaction/messages?$top=1", pollFrontierHead, 1, MessageWindow{Messages: []ChatMessage{message}}, false)
+	if err != nil {
+		t.Fatalf("stage credential page: %v", err)
+	}
+	if len(page.Records) != 1 || strings.Contains(string(page.Records[0]), fakeKey) {
+		t.Fatal("durable pending-page record retained credential material")
+	}
+	if page.Dispositions[0] != pollPageDispositionRejectedAPIKeyMentioned {
+		t.Fatalf("credential page disposition = %q, want redaction disposition preserving the Work mention", page.Dispositions[0])
+	}
+	replayed, err := pendingPageToWindow(page)
+	if err != nil {
+		t.Fatalf("replay redacted credential page: %v", err)
+	}
+	if len(replayed.Messages) != 1 || !replayed.Messages[0].rejectedModelAPIKeyForPoll || !replayed.Messages[0].rejectedModelAPIKeyMentionedForPoll ||
+		replayed.Messages[0].Body.Content != rejectedModelAPIKeyInboundText || len(replayed.Messages[0].Attachments) != 0 || len(replayed.Messages[0].Mentions) != 0 {
+		t.Fatal("redacted credential receipt did not retain its terminal handler marker")
+	}
+	if !teamsMessageHasCodexMention(replayed.Messages[0], rejectedModelAPIKeyInboundText) {
+		t.Fatal("redacted receipt lost the original @codex routing fact")
+	}
+}
+
+func TestPollFrontierCredentialRedactionDoesNotInventWorkMention(t *testing.T) {
+	const fakeKey = "sk-test-unmentioned-redaction-0123456789abcdef"
+	message := bridgePollMessage("redacted-unmentioned", "2026-09-24T12:00:00Z", "inspect this pasted value "+fakeKey)
+	message.ChatID = "chat-unmentioned-redaction"
+	page, err := pendingPageFromWindowForRole(message.ChatID, "/chats/"+message.ChatID+"/messages?$top=1", pollFrontierHead, 1,
+		MessageWindow{Messages: []ChatMessage{message}}, false, inboundPollRoleWork)
+	if err != nil {
+		t.Fatalf("stage unmentioned credential page: %v", err)
+	}
+	if strings.Contains(string(page.Records[0]), fakeKey) || page.Dispositions[0] != pollPageDispositionRejectedAPIKey {
+		t.Fatal("unmentioned credential was not safely redacted with a fail-closed legacy disposition")
+	}
+	replayed, err := pendingPageToWindow(page)
+	if err != nil || len(replayed.Messages) != 1 || !replayed.Messages[0].rejectedModelAPIKeyForPoll || replayed.Messages[0].rejectedModelAPIKeyMentionedForPoll {
+		t.Fatalf("unmentioned redacted receipt replay = %#v, err=%v", replayed, err)
+	}
+	if teamsMessageHasCodexMention(replayed.Messages[0], rejectedModelAPIKeyInboundText) {
+		t.Fatal("redacted receipt invented a Codex mention that was absent from the original message")
+	}
+}
+
+func TestPollFrontierRedactsExplicitModelKeyIntakeBeforeDurableReceipt(t *testing.T) {
+	const fakeKey = "sk-test-intake-page-0123456789abcdef"
+	chatID := "control-chat"
+	message := bridgePollMessage("model-key-intake", "2026-09-24T12:00:00Z", "model key ABCD2345 "+fakeKey)
+	message.ChatID = chatID
+	page, err := pendingPageFromWindowForRole(chatID, "/chats/"+chatID+"/messages?$top=1", pollFrontierHead, 1,
+		MessageWindow{Messages: []ChatMessage{message}}, false, inboundPollRoleControl)
+	if err != nil {
+		t.Fatalf("stage explicit model-key intake page: %v", err)
+	}
+	page.PollRole = string(inboundPollRoleControl)
+	page.ReceiptID = pendingPageReceiptID(page)
+	if strings.Contains(string(page.Records[0]), fakeKey) || page.Dispositions[0] != pollPageDispositionDeferredModelKeyIntake {
+		t.Fatal("durable model-key intake receipt retained the API key or lost its deferred-refetch disposition")
+	}
+	replayed, err := pendingPageToWindow(page)
+	if err != nil {
+		t.Fatalf("replay redacted model-key intake page: %v", err)
+	}
+	if len(replayed.Messages) != 1 || !replayed.Messages[0].deferredModelProfileKeyIntakeForPoll ||
+		replayed.Messages[0].Body.Content != deferredModelProfileKeyIntakeInboundText || len(replayed.Messages[0].Attachments) != 0 {
+		t.Fatalf("redacted model-key receipt replay = %#v, want identity-only deferred marker", replayed)
+	}
+
+	// Older pages did not persist PollRole or Dispositions. Validate that the
+	// legacy receipt hash still opens, then ensure a control-lane audit rewrites
+	// its raw key into the same identity-only marker before replay.
+	legacyBase, err := pendingPageFromWindow(chatID, "/chats/"+chatID+"/messages?$top=1", pollFrontierHead, 2,
+		MessageWindow{Messages: []ChatMessage{bridgePollMessage("legacy-key-intake", message.CreatedDateTime, "safe old text")}}, false)
+	if err != nil {
+		t.Fatalf("build legacy key-intake receipt base: %v", err)
+	}
+	legacyRecord, err := json.Marshal(message)
+	if err != nil {
+		t.Fatalf("marshal legacy key-intake record: %v", err)
+	}
+	legacyHash := sha256.Sum256(legacyRecord)
+	legacyBase.Records[0] = json.RawMessage(legacyRecord)
+	legacyBase.RecordIDs[0] = message.ID
+	legacyBase.RecordHashes[0] = hex.EncodeToString(legacyHash[:])
+	legacyBase.Dispositions = nil
+	legacyBase.PollRole = ""
+	legacyBase.ReceiptID = legacyPendingPageReceiptID(legacyBase)
+	if _, err := pendingPageToWindow(legacyBase); err != nil {
+		t.Fatalf("open legacy key-intake receipt: %v", err)
+	}
+	legacySafe, changed, err := redactPendingPageModelAPIKeys(legacyBase, inboundPollRoleControl)
+	if err != nil || !changed || strings.Contains(string(legacySafe.Records[0]), fakeKey) ||
+		legacySafe.Dispositions[0] != pollPageDispositionDeferredModelKeyIntake {
+		t.Fatalf("sanitize legacy key-intake receipt: changed=%t disposition=%v err=%v", changed, legacySafe.Dispositions, err)
+	}
+
+	attachmentMessage := bridgePollMessage("attachment-key-intake", message.CreatedDateTime, "model key ABCD2345 "+fakeKey)
+	attachmentMessage.ChatID = chatID
+	attachmentMessage.Attachments = []MessageAttachment{{ContentType: "text/plain", Name: "key.txt", Content: fakeKey}}
+	attachmentPage, err := pendingPageFromWindowForRole(chatID, "/chats/"+chatID+"/messages?$top=1", pollFrontierHead, 3,
+		MessageWindow{Messages: []ChatMessage{attachmentMessage}}, false, inboundPollRoleControl)
+	if err != nil {
+		t.Fatalf("stage attachment credential: %v", err)
+	}
+	if strings.Contains(string(attachmentPage.Records[0]), fakeKey) || attachmentPage.Dispositions[0] != pollPageDispositionRejectedAPIKey {
+		t.Fatal("attachment credential bypassed preflight or was incorrectly treated as an inline key-intake value")
+	}
+}
+
+func TestPollFrontierDefersSafeModelKeyCommandsAndRejectsMalformedCredentialRoutes(t *testing.T) {
+	const (
+		chatID = "control-chat"
+		key    = "sk-test-route-classification-0123456789abcdef"
+	)
+	tests := []struct {
+		name         string
+		body         string
+		attachment   bool
+		wantDeferred bool
+	}{
+		{name: "confirm", body: "model key confirm ABCD2345", wantDeferred: true},
+		{name: "cancel", body: "model key cancel ABCD2345", wantDeferred: true},
+		{name: "inline key", body: "model key ABCD2345 " + key, wantDeferred: true},
+		{name: "extra token after inline key", body: "model key ABCD2345 " + key + " extra"},
+		{name: "credential in attachment", body: "model key ABCD2345 " + key, attachment: true},
+	}
+	for i, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			message := bridgePollMessage("route-"+strconv.Itoa(i), "2026-09-24T12:00:00Z", test.body)
+			message.ChatID = chatID
+			if test.attachment {
+				message.Attachments = []MessageAttachment{{ContentType: "text/plain", Name: "key.txt", Content: key}}
+			}
+			page, err := pendingPageFromWindowForRole(chatID, "/chats/"+chatID+"/messages?$top=1", pollFrontierHead, uint64(i+1),
+				MessageWindow{Messages: []ChatMessage{message}}, false, inboundPollRoleControl)
+			if err != nil {
+				t.Fatalf("stage model-key route: %v", err)
+			}
+			page.PollRole = string(inboundPollRoleControl)
+			page.ReceiptID = pendingPageReceiptID(page)
+			if strings.Contains(string(page.Records[0]), key) {
+				t.Fatal("durable poll receipt retained raw API key")
+			}
+			if got := page.Dispositions[0] == pollPageDispositionDeferredModelKeyIntake; got != test.wantDeferred {
+				t.Fatalf("deferred model-key disposition = %t, want %t (stored disposition %q)", got, test.wantDeferred, page.Dispositions[0])
+			}
+			if !test.wantDeferred && page.Dispositions[0] != pollPageDispositionRejectedAPIKey {
+				t.Fatalf("unsafe model-key route disposition = %q, want credential rejection", page.Dispositions[0])
+			}
+		})
+	}
+}
+
+func TestPollFrontierRedactsLegacyCredentialReceiptAndRefetchedRecords(t *testing.T) {
+	const fakeKey = "sk-test-legacy-receipt-0123456789abcdef"
+	chatID := "chat-legacy-credential"
+	message := bridgePollMessage("legacy-credential", "2026-09-24T12:00:00Z", "@codex use "+fakeKey)
+	message.ChatID = chatID
+	page, err := pendingPageFromWindow(chatID, "/chats/"+chatID+"/messages?$top=1", pollFrontierHead, 1, MessageWindow{Messages: []ChatMessage{bridgePollMessage(message.ID, message.CreatedDateTime, "ordinary text")}}, false)
+	if err != nil {
+		t.Fatalf("build legacy receipt base: %v", err)
+	}
+	messageRaw, err := json.Marshal(message)
+	if err != nil {
+		t.Fatalf("marshal legacy receipt: %v", err)
+	}
+	messageHash := sha256.Sum256(messageRaw)
+	page.Records[0] = json.RawMessage(messageRaw)
+	page.RecordHashes[0] = hex.EncodeToString(messageHash[:])
+	page.Dispositions[0] = "received"
+	page.ReceiptID = pendingPageReceiptID(page)
+	redactedPage, changed, err := redactPendingPageModelAPIKeys(page, inboundPollRoleWork)
+	if err != nil || !changed {
+		t.Fatalf("sanitize legacy credential receipt: changed=%v err=%v", changed, err)
+	}
+	if strings.Contains(string(redactedPage.Records[0]), fakeKey) || redactedPage.Dispositions[0] != pollPageDispositionRejectedAPIKeyMentioned {
+		t.Fatal("legacy pending receipt was not durably rewritten to a redacted terminal disposition")
+	}
+	replayed, err := pendingPageToWindow(redactedPage)
+	if err != nil || len(replayed.Messages) != 1 || !replayed.Messages[0].rejectedModelAPIKeyForPoll || !replayed.Messages[0].rejectedModelAPIKeyMentionedForPoll {
+		t.Fatalf("sanitized legacy receipt replay = %#v, err=%v", replayed, err)
+	}
+
+	invalid := bridgePollMessage("refetched-credential", "2026-09-24T12:00:00Z", "")
+	invalid.invalidForPoll = true
+	refetchPage, err := pendingPageFromWindow(chatID, "/chats/"+chatID+"/messages?$top=1", pollFrontierHead, 2, MessageWindow{Messages: []ChatMessage{invalid}}, false)
+	if err != nil {
+		t.Fatalf("build exceptional receipt: %v", err)
+	}
+	refetchPage.PollRole = string(inboundPollRoleWork)
+	refetchPage.ReceiptID = pendingPageReceiptID(refetchPage)
+	refetched := bridgePollMessage(invalid.ID, invalid.CreatedDateTime, "@codex inspect "+fakeKey)
+	refetched.ChatID = chatID
+	if err := persistPollRefetchedMessages(refetchPage, []ChatMessage{refetched}); err != nil {
+		t.Fatalf("persist refetched credential disposition: %v", err)
+	}
+	if strings.Contains(string(refetchPage.Records[0]), fakeKey) || refetchPage.Dispositions[0] != pollPageDispositionRejectedAPIKeyMentioned {
+		t.Fatal("refetched pending-page record retained credential material")
+	}
+	refetchedWindow, err := pendingPageToWindow(refetchPage)
+	if err != nil || len(refetchedWindow.Messages) != 1 || !refetchedWindow.Messages[0].rejectedModelAPIKeyForPoll || !refetchedWindow.Messages[0].rejectedModelAPIKeyMentionedForPoll {
+		t.Fatalf("refetched redacted receipt replay = %#v, err=%v", refetchedWindow, err)
+	}
+
+	// A pre-role receipt refetched after restart still needs to preserve the
+	// routing mention before redaction; otherwise replay in a Work chat
+	// conservatively loses a real @codex message.
+	legacyRoleless, err := pendingPageFromWindowForRole(chatID, "/chats/"+chatID+"/messages?$top=1", pollFrontierHead, 3,
+		MessageWindow{Messages: []ChatMessage{invalid}}, false, inboundPollRoleWork)
+	if err != nil {
+		t.Fatalf("build role-less exceptional receipt: %v", err)
+	}
+	legacyRoleless.PollRole = ""
+	legacyRoleless.ReceiptID = pendingPageReceiptID(legacyRoleless)
+	if err := persistPollRefetchedMessages(legacyRoleless, []ChatMessage{refetched}); err != nil {
+		t.Fatalf("persist refetched role-less credential disposition: %v", err)
+	}
+	rolelessWindow, err := pendingPageToWindow(legacyRoleless)
+	if err != nil || len(rolelessWindow.Messages) != 1 || !rolelessWindow.Messages[0].rejectedModelAPIKeyMentionedForPoll {
+		t.Fatalf("role-less refetched receipt = %#v, err=%v; want preserved mention", rolelessWindow, err)
 	}
 }
 
@@ -1741,6 +1998,279 @@ func TestPollFrontierGapRecoveryWalksOldestBacklogWithoutSkipping(t *testing.T) 
 	}
 	if !poll.LastModifiedCursor.Equal(now.Add(-time.Hour)) {
 		t.Fatalf("normal cursor changed across gap recovery = %#v", poll)
+	}
+}
+
+func TestPollFrontierLegacyCrossedGapRecoversBoundedMessagesWithoutMovingNormalCursor(t *testing.T) {
+	ctx := context.Background()
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := newBridgeTestStore(t)
+			now := time.Now().UTC()
+			const chatID = "chat-legacy-crossed-gap"
+			safe := time.Date(2026, 8, 19, 4, 47, 0, 19_000_000, time.UTC)
+			recovery := time.Date(2026, 8, 19, 4, 46, 25, 997_000_000, time.UTC)
+			message := bridgePollMessage("crossed-gap-delayed", recovery.Add(20*time.Second).Format(time.RFC3339Nano), "delayed gap message")
+			var requests []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests = append(requests, r.URL.RequestURI())
+				filter := r.URL.Query().Get("$filter")
+				wantFilter := "lastModifiedDateTime gt " + formatGraphDateTimeBound(recovery.Add(-pollCursorOverlap)) +
+					" and lastModifiedDateTime lt " + formatGraphDateTimeExclusiveUpper(safe)
+				if filter != wantFilter {
+					t.Errorf("crossed gap request filter = %q, want bounded interval %q", filter, wantFilter)
+				}
+				writePollFrontierPage(t, w, []ChatMessage{message}, "")
+			}))
+			t.Cleanup(server.Close)
+			graph := &GraphClient{
+				auth:       &fakeGraphAuth{token: "access"},
+				client:     server.Client(),
+				baseURL:    server.URL,
+				maxRetries: 0,
+				sleep:      func(context.Context, time.Duration) error { return nil },
+				jitter:     func(d time.Duration) time.Duration { return d },
+			}
+			lastModifiedCursor := safe.Add(5 * time.Minute)
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				state.ChatPolls[chatID] = teamstore.ChatPollState{
+					ChatID:             chatID,
+					Seeded:             true,
+					PollState:          inboundPollStateWarm,
+					NextPollAt:         now,
+					LastActivityAt:     now,
+					LastModifiedCursor: lastModifiedCursor,
+					Gap: &teamstore.ChatPollGap{
+						Epoch:          1,
+						Kind:           "unverified-continuation",
+						SafeCursor:     safe,
+						RecoveryCursor: recovery,
+						OpenedAt:       now,
+					},
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed legacy crossed gap: %v", err)
+			}
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate legacy crossed gap: %v", err)
+				}
+			}
+			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+			var handled []string
+			if _, err := bridge.pollChat(ctx, chatID, 20, func(_ context.Context, got ChatMessage, _ string) error {
+				handled = append(handled, got.ID)
+				return nil
+			}); err != nil {
+				t.Fatalf("poll crossed gap: %v", err)
+			}
+			if got := strings.Join(handled, ","); got != message.ID {
+				t.Fatalf("crossed-gap messages handled = %q, want %q", got, message.ID)
+			}
+			if len(requests) != 1 {
+				t.Fatalf("crossed-gap Graph request count = %d, want 1: %v", len(requests), requests)
+			}
+			poll, ok, err := store.ChatPoll(ctx, chatID)
+			if err != nil || !ok {
+				t.Fatalf("read recovered crossed gap: ok=%v err=%v", ok, err)
+			}
+			if poll.Gap != nil {
+				t.Fatalf("durably progressed terminal crossed-gap scan did not close gap: %#v", poll.Gap)
+			}
+			if !poll.LastModifiedCursor.Equal(lastModifiedCursor) {
+				t.Fatalf("gap recovery changed normal cursor: got=%s want=%s", poll.LastModifiedCursor, lastModifiedCursor)
+			}
+		})
+	}
+}
+
+func TestPollFrontierLegacyCrossedGapEmptyPageRetainsEvidenceAndBacksOff(t *testing.T) {
+	ctx := context.Background()
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := newBridgeTestStore(t)
+			now := time.Now().UTC()
+			const chatID = "chat-crossed-gap-empty"
+			safe := time.Date(2026, 8, 19, 4, 47, 0, 19_000_000, time.UTC)
+			recovery := time.Date(2026, 8, 19, 4, 46, 25, 997_000_000, time.UTC)
+			lastModifiedCursor := safe.Add(5 * time.Minute)
+			const historical429Reason = "Graph GET /chats/{chat-id}/messages failed: HTTP 429 Too Many Requests"
+			const historical429Evidence = "legacy continuation throttled; preserve bounded recovery evidence"
+			var requests []string
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests = append(requests, r.URL.RequestURI())
+				filter := r.URL.Query().Get("$filter")
+				wantFilter := "lastModifiedDateTime gt " + formatGraphDateTimeBound(recovery.Add(-pollCursorOverlap)) +
+					" and lastModifiedDateTime lt " + formatGraphDateTimeExclusiveUpper(safe)
+				if filter != wantFilter {
+					t.Errorf("crossed gap empty-page filter = %q, want bounded interval %q", filter, wantFilter)
+				}
+				writePollFrontierPage(t, w, nil, "")
+			}))
+			t.Cleanup(server.Close)
+			graph := &GraphClient{
+				auth:       &fakeGraphAuth{token: "access"},
+				client:     server.Client(),
+				baseURL:    server.URL,
+				maxRetries: 0,
+				sleep:      func(context.Context, time.Duration) error { return nil },
+				jitter:     func(d time.Duration) time.Duration { return d },
+			}
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				state.ChatPolls[chatID] = teamstore.ChatPollState{
+					ChatID:             chatID,
+					Seeded:             true,
+					PollState:          inboundPollStateWarm,
+					NextPollAt:         now,
+					LastActivityAt:     now,
+					LastModifiedCursor: lastModifiedCursor,
+					Gap: &teamstore.ChatPollGap{
+						Epoch:          1,
+						Kind:           "unverified-continuation",
+						Reason:         historical429Reason,
+						Evidence:       historical429Evidence,
+						SafeCursor:     safe,
+						RecoveryCursor: recovery,
+						OpenedAt:       now,
+					},
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed empty crossed gap: %v", err)
+			}
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate empty crossed gap: %v", err)
+				}
+			}
+			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+			if _, err := bridge.pollChat(ctx, chatID, 20, func(context.Context, ChatMessage, string) error {
+				return nil
+			}); err != nil {
+				t.Fatalf("poll empty crossed gap: %v", err)
+			}
+			if len(requests) != 1 {
+				t.Fatalf("crossed gap empty-page request count = %d, want 1: %v", len(requests), requests)
+			}
+			poll, ok, err := store.ChatPoll(ctx, chatID)
+			if err != nil || !ok {
+				t.Fatalf("read empty crossed gap: ok=%v err=%v", ok, err)
+			}
+			if poll.Gap == nil || !poll.Gap.HeadProbePending {
+				t.Fatalf("empty crossed-gap page dropped durable recovery evidence: %#v", poll.Gap)
+			}
+			if poll.Gap.Reason != historical429Reason || poll.Gap.Evidence != historical429Evidence {
+				t.Fatalf("empty crossed-gap page rewrote historical 429 evidence: reason=%q evidence=%q", poll.Gap.Reason, poll.Gap.Evidence)
+			}
+			if !poll.Gap.SafeCursor.Equal(safe) || !poll.Gap.RecoveryCursor.Equal(recovery) {
+				t.Fatalf("empty crossed-gap page rewrote durable bounds: safe=%s recovery=%s", poll.Gap.SafeCursor, poll.Gap.RecoveryCursor)
+			}
+			if !poll.LastModifiedCursor.Equal(lastModifiedCursor) {
+				t.Fatalf("empty crossed-gap page moved normal cursor: got=%s want=%s", poll.LastModifiedCursor, lastModifiedCursor)
+			}
+			if !poll.NextPollAt.After(now) || poll.Attempt != nil {
+				t.Fatalf("empty crossed-gap page hot-looped or retained its attempt: next=%s start=%s attempt=%#v", poll.NextPollAt, now, poll.Attempt)
+			}
+		})
+	}
+}
+
+func TestPollFrontierLegacyCrossedGapRetainsFullEqualTimestampBoundary(t *testing.T) {
+	ctx := context.Background()
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			store := newBridgeTestStore(t)
+			now := time.Now().UTC()
+			const chatID = "chat-crossed-equal-boundary"
+			safe := time.Date(2026, 8, 19, 4, 47, 0, 19_000_000, time.UTC)
+			recovery := time.Date(2026, 8, 19, 4, 46, 25, 997_000_000, time.UTC)
+			lastModifiedCursor := safe.Add(5 * time.Minute)
+			const historical429Reason = "Graph GET /chats/{chat-id}/messages failed: HTTP 429 Too Many Requests"
+			const historical429Evidence = "legacy continuation throttled; preserve bounded recovery evidence"
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				state.ChatPolls[chatID] = teamstore.ChatPollState{
+					ChatID:             chatID,
+					Seeded:             true,
+					PollState:          inboundPollStateWarm,
+					NextPollAt:         now,
+					LastActivityAt:     now,
+					LastModifiedCursor: lastModifiedCursor,
+					Gap: &teamstore.ChatPollGap{
+						Epoch:          1,
+						Kind:           "unverified-continuation",
+						Reason:         historical429Reason,
+						Evidence:       historical429Evidence,
+						SafeCursor:     safe,
+						RecoveryCursor: recovery,
+						OpenedAt:       now,
+					},
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed crossed equal-timestamp gap: %v", err)
+			}
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate crossed equal-timestamp gap: %v", err)
+				}
+			}
+			poll, ok, err := store.ChatPoll(ctx, chatID)
+			if err != nil || !ok {
+				t.Fatalf("read crossed equal-timestamp gap: ok=%v err=%v", ok, err)
+			}
+			frontier, path, _ := pollPageRequestForState(chatID, ownerPollMessageTop, inboundPollRoleWork, poll)
+			attempt, acquired, err := store.BeginChatPollAttempt(ctx, teamstore.ChatPollAttemptRequest{
+				ChatID: chatID, Owner: "crossed-owner", ProcessIncarnation: "crossed-process",
+				ExpectedPollRevision: poll.PollRevision, HasExpectedPollRevision: true,
+				ExpectedFrontier: pollFrontierIdentity(frontier, path), Now: now,
+			})
+			if err != nil || !acquired || attempt.Attempt == nil {
+				t.Fatalf("begin crossed equal-timestamp recovery: acquired=%v attempt=%#v err=%v", acquired, attempt, err)
+			}
+			bridge := newBridgeTestBridge(nil, store, &recordingExecutor{})
+			committed, err := bridge.commitPollAttemptSuccess(ctx, chatID, attempt.Attempt.ID, attempt.PollRevision, inboundPollRoleWork, false, pollFrontierGap, path, MessageWindow{}, pollMessageWindowResult{
+				PageComplete: true,
+				Progressed:   true,
+				Fetched:      ownerPollMessageTop,
+				MinModified:  safe,
+				MaxModified:  safe,
+			}, false)
+			if err != nil || !committed {
+				t.Fatalf("commit crossed equal-timestamp recovery: committed=%v err=%v", committed, err)
+			}
+			got, ok, err := store.ChatPoll(ctx, chatID)
+			if err != nil || !ok {
+				t.Fatalf("read crossed equal-timestamp recovery result: ok=%v err=%v", ok, err)
+			}
+			if got.Gap == nil || !got.Gap.HeadProbePending {
+				t.Fatalf("full equal-timestamp bucket incorrectly cleared crossed gap evidence: %#v", got.Gap)
+			}
+			if !strings.Contains(got.Gap.Reason, historical429Reason) || got.Gap.Evidence != historical429Evidence {
+				t.Fatalf("full equal-timestamp bucket lost historical 429 evidence: reason=%q evidence=%q", got.Gap.Reason, got.Gap.Evidence)
+			}
+			if !got.Gap.SafeCursor.Equal(safe) || !got.Gap.RecoveryCursor.Equal(recovery) {
+				t.Fatalf("equal-timestamp recovery rewrote durable bounds: safe=%s recovery=%s", got.Gap.SafeCursor, got.Gap.RecoveryCursor)
+			}
+			if !got.LastModifiedCursor.Equal(lastModifiedCursor) {
+				t.Fatalf("equal-timestamp gap recovery moved normal cursor: got=%s want=%s", got.LastModifiedCursor, lastModifiedCursor)
+			}
+			if !got.NextPollAt.After(now) {
+				t.Fatalf("equal-timestamp recovery scheduled an immediate retry: next=%s now=%s", got.NextPollAt, now)
+			}
+		})
 	}
 }
 
