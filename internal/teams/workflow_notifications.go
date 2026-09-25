@@ -171,6 +171,14 @@ func (b *Bridge) ConfigureWorkflowNotifications(ctx context.Context, webhookURLF
 }
 
 func (b *Bridge) queueWorkflowNotificationForSentOutbox(ctx context.Context, outbox teamstore.OutboxMessage) error {
+	return b.queueWorkflowNotificationForSentOutboxWithDelivery(ctx, outbox, false)
+}
+
+func (b *Bridge) queueWorkflowNotificationForSentOutboxWithoutImmediateFlush(ctx context.Context, outbox teamstore.OutboxMessage) error {
+	return b.queueWorkflowNotificationForSentOutboxWithDelivery(ctx, outbox, true)
+}
+
+func (b *Bridge) queueWorkflowNotificationForSentOutboxWithDelivery(ctx context.Context, outbox teamstore.OutboxMessage, deferDelivery bool) error {
 	if b == nil || b.store == nil {
 		return nil
 	}
@@ -187,11 +195,17 @@ func (b *Bridge) queueWorkflowNotificationForSentOutbox(ctx context.Context, out
 	if b.outboxAlreadyMentionedControlOwner(ctx, outbox) && !b.workflowCardAvailable(ctx) {
 		return nil
 	}
-	if err := b.queueUserAttentionNotification(ctx, event, ""); err != nil {
+	var queueErr error
+	if deferDelivery {
+		queueErr = b.queueUserAttentionNotificationWithoutImmediateFlush(ctx, event, "")
+	} else {
+		queueErr = b.queueUserAttentionNotification(ctx, event, "")
+	}
+	if queueErr != nil {
 		if b.out != nil {
-			_, _ = fmt.Fprintf(b.out, "Teams workflow notification queue error: %v\n", err)
+			_, _ = fmt.Fprintf(b.out, "Teams workflow notification queue error: %v\n", queueErr)
 		}
-		return err
+		return queueErr
 	}
 	return nil
 }
@@ -462,6 +476,14 @@ func workflowConfigMatchesCurrentControl(cfg teamstore.WorkflowNotificationConfi
 }
 
 func (b *Bridge) queueUserAttentionNotification(ctx context.Context, event WorkflowNotificationEvent, fallbackReason string) error {
+	return b.queueUserAttentionNotificationWithFlush(ctx, event, fallbackReason, true)
+}
+
+func (b *Bridge) queueUserAttentionNotificationWithoutImmediateFlush(ctx context.Context, event WorkflowNotificationEvent, fallbackReason string) error {
+	return b.queueUserAttentionNotificationWithFlush(ctx, event, fallbackReason, false)
+}
+
+func (b *Bridge) queueUserAttentionNotificationWithFlush(ctx context.Context, event WorkflowNotificationEvent, fallbackReason string, flushImmediately bool) error {
 	if b == nil || b.store == nil {
 		return nil
 	}
@@ -469,22 +491,41 @@ func (b *Bridge) queueUserAttentionNotification(ctx context.Context, event Workf
 	if err != nil {
 		return err
 	}
+	queueFallback := func(reason string) error {
+		if flushImmediately {
+			return b.queueWorkflowNotificationFallbackMention(ctx, state, event, reason)
+		}
+		queued, queueErr := b.queueWorkflowNotificationFallbackMentionOnly(ctx, state, event, reason)
+		if queueErr != nil || !queued {
+			return queueErr
+		}
+		if _, _, mirrorErr := b.queueWorkflowNotificationWorkChatAttentionNotice(ctx, state, event); mirrorErr != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams workflow work-chat attention notice queue error: %v\n", mirrorErr)
+		}
+		return nil
+	}
 	cfg, cfgErr := b.effectiveWorkflowNotificationConfig(state)
 	if cfgErr != nil {
-		return b.queueWorkflowNotificationFallbackMention(ctx, state, event, "Workflow card is unavailable: "+redactWorkflowNotificationError(cfgErr))
+		return queueFallback("Workflow card is unavailable: " + redactWorkflowNotificationError(cfgErr))
 	}
 	if !cfg.Enabled {
-		return b.queueWorkflowNotificationFallbackMention(ctx, state, event, fallbackReason)
+		return queueFallback(fallbackReason)
 	}
 	currentControlChatID := strings.TrimSpace(firstNonEmptyString(b.controlChatIDForPoll(), state.ControlChat.TeamsChatID))
 	if !workflowConfigMatchesCurrentControl(cfg, currentControlChatID) {
-		return b.queueWorkflowNotificationFallbackMention(ctx, state, event, "Workflow card is unavailable because the control chat changed.")
+		return queueFallback("Workflow card is unavailable because the control chat changed.")
 	}
 	if _, err := readWorkflowWebhookURLFile(cfg.ControlWebhookURLFile); err != nil {
-		return b.queueWorkflowNotificationFallbackMention(ctx, state, event, "Workflow card is unavailable: "+redactWorkflowNotificationError(err))
+		return queueFallback("Workflow card is unavailable: " + redactWorkflowNotificationError(err))
 	}
 	if err := b.queueWorkflowNotification(ctx, event); err != nil {
 		return err
+	}
+	if !flushImmediately {
+		if _, _, mirrorErr := b.queueWorkflowNotificationWorkChatAttentionNotice(ctx, state, event); mirrorErr != nil && b.out != nil {
+			_, _ = fmt.Fprintf(b.out, "Teams workflow work-chat attention notice queue error: %v\n", mirrorErr)
+		}
+		return nil
 	}
 	b.queueAndFlushWorkflowNotificationWorkChatAttentionNotice(ctx, state, event)
 	if err := b.flushPendingWorkflowNotifications(ctx); err != nil {

@@ -2052,10 +2052,265 @@
       "real_listener": false,
       "fake_graph": true,
       "max_seconds": 60,
-      "oracle": "bounded main-loop outbox delivery gives two messages per selected chat, retains per-chat FIFO, and rotates a third chat into a later cycle",
+      "oracle": "bounded main-loop outbox delivery visits all available chats in the selected batch, sends at most two FIFO messages per chat, and preserves a remaining same-chat tail for a later cycle",
       "baseline": "pre-fix the first two continuously-active chats could starve every later chat, while the one-message quantum left durable capacity unused",
       "resource_class": "sqlite_fsync",
       "exclusive": true
+    },
+    {
+      "name": "TestTeamsOutboxFlushErrorDoesNotHideDurableBacklogFairness",
+      "package": "./internal/teams",
+      "job": "teams-recovery",
+      "tier": "P0",
+      "backends": [
+        "json",
+        "sqlite"
+      ],
+      "vertical": "outbox-error-backlog-fairness",
+      "real_listener": false,
+      "fake_graph": false,
+      "max_seconds": 60,
+      "oracle": "a non-process-wide outbox error carries a single durable backlog snapshot forward so due bounded fairness still runs without an extra backlog scan",
+      "baseline": "pre-fix any ordinary outbox error suppressed the fairness gate without distinguishing a separate active Teams frontier",
+      "resource_class": "sqlite_fsync",
+      "exclusive": true
+    },
+    {
+      "name": "TestTeamsMainLoopOutboxBatchesEightChatsWithTwoHeadsEach",
+      "package": "./internal/teams",
+      "job": "teams-recovery",
+      "tier": "P0",
+      "backends": [
+        "json",
+        "sqlite"
+      ],
+      "vertical": "outbox-bounded-multi-chat-throughput",
+      "real_listener": false,
+      "fake_graph": true,
+      "max_seconds": 60,
+      "oracle": "three bounded main-loop cycles send at most two FIFO rows per selected chat, wrap fairly, and durably drain all 30 rows without duplicates",
+      "baseline": "pre-fix each cycle could target only two chats and capped total sends at four despite an independent backlog across hundreds of chats",
+      "resource_class": "sqlite_fsync",
+      "exclusive": true
+    },
+    {
+      "name": "TestTeamsMainLoopOutboxAccount429StopsSiblingPostsInSameBatch",
+      "package": "./internal/teams",
+      "job": "teams-recovery",
+      "tier": "P0",
+      "backends": [
+        "json",
+        "sqlite"
+      ],
+      "vertical": "outbox-account-write-429-batch-gate",
+      "real_listener": false,
+      "fake_graph": true,
+      "max_seconds": 60,
+      "oracle": "an explicit account-scoped POST 429 durably gates sibling chats in the same serial batch, makes no extra POST, and leaves the uncertain attempt Sending rather than replaying it",
+      "baseline": "pre-fix no test covered account-scoped write throttling across the multi-chat listener batch",
+      "resource_class": "sqlite_fsync",
+      "exclusive": true
+    },
+    {
+      "name": "TestTeamsMainLoopOutboxUnscoped429OnlyBlocksFailingChat",
+      "package": "./internal/teams",
+      "job": "teams-recovery",
+      "tier": "P0",
+      "backends": [
+        "json",
+        "sqlite"
+      ],
+      "vertical": "outbox-chat-local-429-fairness",
+      "real_listener": false,
+      "fake_graph": true,
+      "max_seconds": 60,
+      "oracle": "a bare chat-local POST 429 leaves only its uncertain attempt gated and still lets an independently selected healthy sibling deliver exactly once",
+      "baseline": "pre-fix the account-wide batch-stop rule could not distinguish an unscoped local 429 from an explicit account/global throttle",
+      "resource_class": "sqlite_fsync",
+      "exclusive": true
+    },
+    {
+      "name": "TestTeamsMainLoopOutboxAccount429PersistenceFailureFencesCurrentProcess",
+      "package": "./internal/teams",
+      "job": "teams-recovery",
+      "tier": "P0",
+      "backends": [
+        "sqlite"
+      ],
+      "vertical": "outbox-account-write-429-local-fence",
+      "real_listener": false,
+      "fake_graph": true,
+      "max_seconds": 60,
+      "oracle": "when an explicit account-scoped POST 429 cannot persist its global gate, the same process makes no sibling POST in the current or next cycle while retaining the ambiguous row as Sending",
+      "baseline": "pre-fix the account gate write failure was logged and swallowed, leaving later cycles without durable or process-local account protection",
+      "resource_class": "sqlite_fsync",
+      "exclusive": true
+    },
+    {
+      "name": "TestTeamsConcurrentOutboxPostRechecksAccount429FenceAtGraphBoundary",
+      "package": "./internal/teams",
+      "job": "teams-recovery",
+      "tier": "P0",
+      "backends": [
+        "json",
+        "sqlite"
+      ],
+      "vertical": "outbox-concurrent-account-429-post-boundary",
+      "real_listener": false,
+      "fake_graph": true,
+      "max_seconds": 60,
+      "oracle": "a sibling outbox send that passed early admission but is held before HTTP cannot start a Graph write after another chat receives an explicit account 429; the ambiguous first row stays Sending and the proven-not-sent sibling returns to Queued",
+      "baseline": "pre-fix concurrent per-chat flushes had no write-only Graph-boundary recheck for a newly installed account gate",
+      "resource_class": "sqlite_fsync",
+      "exclusive": true
+    },
+    {
+      "name": "TestGraphBeforeWriteRequestContextFenceLeavesReadsAvailable",
+      "package": "./internal/teams",
+      "job": "teams-recovery",
+      "tier": "P0",
+      "backends": [
+        "json"
+      ],
+      "vertical": "graph-write-gate-does-not-block-reconciliation-read",
+      "real_listener": false,
+      "fake_graph": true,
+      "max_seconds": 15,
+      "oracle": "the account write preflight prevents a POST before HTTP but permits a Graph GET needed for ordinary read/reconciliation work",
+      "baseline": "pre-fix there was no write-only request-boundary gate to distinguish account write throttling from read availability",
+      "resource_class": "pure_cpu"
+    },
+    {
+      "name": "TestGraphWriteBoundarySerializesUntilResponseAndPublishes429",
+      "package": "./internal/teams",
+      "job": "teams-recovery",
+      "tier": "P0",
+      "backends": [
+        "json"
+      ],
+      "vertical": "graph-write-admission-429-response-ordering",
+      "real_listener": false,
+      "fake_graph": true,
+      "max_seconds": 30,
+      "oracle": "a second non-read Graph request cannot pass the write boundary while the first is unresolved, and an explicit account 429 is published before the next write admission",
+      "baseline": "pre-fix a sibling could pass its local gate check and start a POST after a concurrent sender had received an account-scoped 429",
+      "resource_class": "pure_cpu"
+    },
+    {
+      "name": "TestGraphByteUploadReleasesWriteBoundaryOnResponse",
+      "package": "./internal/teams",
+      "job": "teams-recovery",
+      "tier": "P1",
+      "backends": [
+        "json"
+      ],
+      "vertical": "graph-upload-write-boundary-release",
+      "real_listener": false,
+      "fake_graph": true,
+      "max_seconds": 15,
+      "oracle": "a successful non-replayable Graph byte upload releases the serialized write boundary exactly once after the response",
+      "baseline": "pre-fix Graph request callbacks could not retain an admission lease through upload response headers",
+      "resource_class": "pure_cpu"
+    },
+    {
+      "name": "TestGraphTransferWriteBoundaryBlocksSiblingPostAfterAccount429",
+      "package": "./internal/teams",
+      "job": "teams-recovery",
+      "tier": "P0",
+      "backends": [
+        "json"
+      ],
+      "vertical": "graph-upload-account-429-write-ordering",
+      "real_listener": false,
+      "fake_graph": true,
+      "max_seconds": 30,
+      "oracle": "an in-flight account-throttled upload chunk publishes the local write gate before a concurrent sibling Teams message POST can enter Graph",
+      "baseline": "pre-fix direct transfer HTTP requests bypassed the Graph write-boundary callback and could race sibling outbox sends",
+      "resource_class": "pure_cpu"
+    },
+    {
+      "name": "TestGraphWriteBoundaryWaitHonorsRequestCancellation",
+      "package": "./internal/teams",
+      "job": "teams-recovery",
+      "tier": "P1",
+      "backends": [
+        "json"
+      ],
+      "vertical": "graph-write-boundary-cancellation",
+      "real_listener": false,
+      "fake_graph": true,
+      "max_seconds": 15,
+      "oracle": "a write waiting behind the serialized boundary promptly returns context cancellation and issues no HTTP request",
+      "baseline": "pre-fix the outbox gate callback did not receive the request's derived upload/attempt context",
+      "resource_class": "pure_cpu"
+    },
+    {
+      "name": "TestGraphWriteAdmissionRevalidatesOwnerAfterGateWait",
+      "package": "./internal/teams",
+      "job": "teams-recovery",
+      "tier": "P0",
+      "backends": [
+        "json"
+      ],
+      "vertical": "graph-write-boundary-owner-lease-takeover",
+      "real_listener": false,
+      "fake_graph": true,
+      "max_seconds": 15,
+      "oracle": "an owner-bound write blocked behind the local Graph gate revalidates the durable lease after admission and issues no HTTP request if takeover happened while it waited",
+      "baseline": "pre-fix the serialized write admission could extend the interval between the existing owner preflight and the actual external request",
+      "resource_class": "sqlite_fsync"
+    },
+    {
+      "name": "TestTeamsMainLoopOutboxFairnessCursorWalksPastDistinctChatScanPrefix",
+      "package": "./internal/teams",
+      "job": "teams-recovery",
+      "tier": "P0",
+      "backends": [
+        "json",
+        "sqlite"
+      ],
+      "vertical": "outbox-multi-chat-owner-fenced-cursor",
+      "real_listener": false,
+      "fake_graph": false,
+      "max_seconds": 120,
+      "oracle": "the durable owner-fenced keyset cursor advances eight chats at a time across the scan boundary, wraps without duplicate selection, and rejects stale generations after reopen",
+      "baseline": "pre-fix the cursor test asserted only a two-chat quantum and did not validate filling or wraparound at the larger bound",
+      "resource_class": "sqlite_fsync",
+      "exclusive": true
+    },
+    {
+      "name": "TestTeamsMainLoopOutboxCursorHandoffEventuallyDrainsReservedChats",
+      "package": "./internal/teams",
+      "job": "teams-recovery",
+      "tier": "P0",
+      "backends": [
+        "json",
+        "sqlite"
+      ],
+      "vertical": "outbox-cursor-owner-handoff-drain",
+      "real_listener": false,
+      "fake_graph": true,
+      "max_seconds": 120,
+      "oracle": "if the old owner commits a fairness cursor then loses its lease before sending, it makes zero POSTs and the successor eventually sends each queued chat exactly once",
+      "baseline": "pre-fix no regression proved that a pre-send cursor advance remains recoverable across an owner generation change",
+      "resource_class": "sqlite_fsync",
+      "exclusive": true
+    },
+    {
+      "name": "TestTeamsMainLoopOutboxStopsSecondChatAfterProcessWideFailure",
+      "package": "./internal/teams",
+      "job": "teams-recovery",
+      "tier": "P0",
+      "backends": [
+        "json"
+      ],
+      "vertical": "outbox-batch-owner-failure-fast-stop",
+      "real_listener": false,
+      "fake_graph": false,
+      "max_seconds": 30,
+      "oracle": "a process-wide owner/lease failure on the first selected chat stops the remaining seven chats in the batch",
+      "baseline": "pre-fix the failure-stop regression covered only one remaining chat",
+      "resource_class": "pure_cpu"
     },
     {
       "name": "TestTeamsOperationalBacklogKeepsFuture429RecoveryRequired",
@@ -2384,6 +2639,134 @@
       "max_seconds": 15,
       "oracle": "fake Graph diagnostics never print provider opaque continuation values",
       "baseline": "pre-fix list/unknown route diagnostics could expose raw provider cursors in test output",
+      "resource_class": "pure_cpu"
+    },
+    {
+      "name": "TestDockerRealDataReplayTimelinePreservesSourceIntervals",
+      "package": "./internal/teams",
+      "job": "teams-recovery",
+      "tier": "P0",
+      "backends": [
+        "unit"
+      ],
+      "vertical": "docker-real-data-replay-timeline",
+      "real_listener": false,
+      "fake_graph": false,
+      "max_seconds": 15,
+      "oracle": "synthetic replay timestamps preserve durable receive-time ordering and interval ratios while starting beyond copied normal and gap frontiers",
+      "baseline": "pre-fix multi-month source intervals collapsed into milliseconds and created a large artificial cursor-overlap workload",
+      "resource_class": "pure_cpu"
+    },
+    {
+      "name": "TestDockerRealDataReplayTimelineRejectsCollapsedOrOutOfWindowSources",
+      "package": "./internal/teams",
+      "job": "teams-recovery",
+      "tier": "P0",
+      "backends": [
+        "unit"
+      ],
+      "vertical": "docker-real-data-replay-window-validation",
+      "real_listener": false,
+      "fake_graph": false,
+      "max_seconds": 15,
+      "oracle": "a positive durable source span cannot silently collapse to one replay timestamp or exceed the measured window",
+      "baseline": "pre-fix a cursor beyond the window could map every message to one timestamp and still run as an apparently valid experiment",
+      "resource_class": "pure_cpu"
+    },
+    {
+      "name": "TestDockerRealDataPollRecoveryResidualsCompareIdentityAndActiveFrontiers",
+      "package": "./internal/teams",
+      "job": "teams-recovery",
+      "tier": "P0",
+      "backends": [
+        "unit"
+      ],
+      "vertical": "docker-real-data-recovery-diff",
+      "real_listener": false,
+      "fake_graph": false,
+      "max_seconds": 15,
+      "oracle": "an inherited unchanged gap is distinguished from a newly opened or extended continuation/pending frontier on the same chat",
+      "baseline": "pre-fix any inherited recovery boundary could mask new unsafe recovery state in that chat",
+      "resource_class": "pure_cpu"
+    },
+    {
+      "name": "TestDockerRealDataPollMessageTraceSurvivesGlobalTraceCap",
+      "package": "./internal/teams",
+      "job": "teams-recovery",
+      "tier": "P0",
+      "backends": [
+        "unit"
+      ],
+      "vertical": "docker-real-data-target-disposition-trace",
+      "real_listener": false,
+      "fake_graph": false,
+      "max_seconds": 15,
+      "oracle": "a late synthetic message retains a body-free per-ID disposition after the global chronological trace reaches its cap",
+      "baseline": "pre-fix the global 2,048-entry trace discarded the exact late ID needed to diagnose a no-loss failure",
+      "resource_class": "pure_cpu"
+    },
+    {
+      "name": "TestDockerRealDataPollMessageTraceReportsCapacityLoss",
+      "package": "./internal/teams",
+      "job": "teams-recovery",
+      "tier": "P1",
+      "backends": [
+        "unit"
+      ],
+      "vertical": "docker-real-data-target-trace-capacity",
+      "real_listener": false,
+      "fake_graph": false,
+      "max_seconds": 15,
+      "oracle": "per-ID trace capacity overflow is explicit and never looks like an empty trace",
+      "baseline": "pre-fix a bounded target map could silently drop IDs beyond its capacity",
+      "resource_class": "pure_cpu"
+    },
+    {
+      "name": "TestDockerRealDataChatDrainDoesNotWaiveMissingIDForInheritedGap",
+      "package": "./internal/teams",
+      "job": "teams-recovery",
+      "tier": "P0",
+      "backends": [
+        "unit"
+      ],
+      "vertical": "docker-real-data-no-loss-recovery-independent",
+      "real_listener": false,
+      "fake_graph": false,
+      "max_seconds": 15,
+      "oracle": "every served replay ID still requires exactly one durable inbound and terminal disposition even when its chat has an inherited recovery gap",
+      "baseline": "pre-fix aggregate recovery state could obscure or prematurely fail before the decisive per-message no-loss audit",
+      "resource_class": "pure_cpu"
+    },
+    {
+      "name": "TestDockerRealDataSyntheticResidualDiagnosticsAreBoundedAndRedacted",
+      "package": "./internal/teams",
+      "job": "teams-recovery",
+      "tier": "P1",
+      "backends": [
+        "unit"
+      ],
+      "vertical": "docker-real-data-failure-diagnostic-redaction",
+      "real_listener": false,
+      "fake_graph": false,
+      "max_seconds": 15,
+      "oracle": "residual traces report durable state without message bodies, recovery-reason text, or opaque Graph continuations",
+      "baseline": "pre-fix turn recovery text could be printed verbatim in failed real-data acceptance output",
+      "resource_class": "pure_cpu"
+    },
+    {
+      "name": "TestTeamsRealDataDockerWrapperIsolatedAndRuntimeDisabled",
+      "package": "./scripts/ci",
+      "job": "teams-recovery",
+      "tier": "P1",
+      "backends": [
+        "unit"
+      ],
+      "vertical": "docker-real-data-snapshot-only-reuse",
+      "real_listener": false,
+      "fake_graph": false,
+      "max_seconds": 15,
+      "oracle": "reusing an immutable snapshot derives all inputs from the fixture and skips live scope/Codex path checks while keeping Docker isolated",
+      "baseline": "pre-fix snapshot reuse still required live source paths and failed when only the old immutable snapshot was authorized",
       "resource_class": "pure_cpu"
     },
     {
@@ -3067,6 +3450,117 @@
       "oracle": "one ambiguous recovery sweep shares its bounded Graph evidence-page budget across candidates, preserves unknown rows, and never falls through to POST",
       "baseline": "pre-fix resetting the page budget per candidate multiplied cold Graph reads and could delay known queued delivery without changing durable state",
       "resource_class": "pure_cpu"
+    },
+    {
+      "name": "TestSQLiteSessionTranscriptDedupeRejectsReplacedDatabase",
+      "package": "./internal/teams/store",
+      "job": "teams-recovery",
+      "tier": "P1",
+      "backends": [
+        "sqlite"
+      ],
+      "vertical": "sqlite-dedupe-database-identity-replacement",
+      "real_listener": false,
+      "fake_graph": false,
+      "max_seconds": 15,
+      "oracle": "an atomic replacement of the SQLite file at the captured path invalidates the session dedupe snapshot instead of accepting rows from the old file",
+      "baseline": "pre-fix the backing-file identity check had no regression coverage for replacement during the canonical session dedupe boundary",
+      "resource_class": "sqlite_fsync"
+    },
+    {
+      "name": "TestSQLiteSessionTranscriptDedupePropagatesCancellationAfterReadTransactionStarts",
+      "package": "./internal/teams/store",
+      "job": "teams-recovery",
+      "tier": "P1",
+      "backends": [
+        "sqlite"
+      ],
+      "vertical": "sqlite-dedupe-cancel-after-snapshot-start",
+      "real_listener": false,
+      "fake_graph": false,
+      "max_seconds": 15,
+      "oracle": "cancellation after the coherent SQLite read transaction starts propagates context.Canceled and returns no partial dedupe snapshot",
+      "baseline": "pre-fix cancellation coverage only canceled the context before entering the dedupe read",
+      "resource_class": "sqlite_fsync"
+    },
+    {
+      "name": "TestStorePersistInterruptedLiveBranchTurnPreservesAnchorAndRevokesBranchAcrossBackends",
+      "package": "./internal/teams/store",
+      "job": "teams-recovery",
+      "tier": "P0",
+      "backends": [
+        "json",
+        "sqlite"
+      ],
+      "backend_subtests": [
+        "json",
+        "sqlite"
+      ],
+      "vertical": "execution-anchor-live-branch-revocation",
+      "real_listener": false,
+      "fake_graph": false,
+      "max_seconds": 20,
+      "oracle": "the current owner can interrupt only the exact durable live branch, preserve the historical anchor, revoke uncertain branch admission, reject a stale owner, and isolate the next queued turn on both stores",
+      "baseline": "pre-fix a live-branch ambiguity was rejected by the prior historical anchor and could leave the current turn Running with its inbound Queued",
+      "resource_class": "sqlite_fsync"
+    },
+    {
+      "name": "TestBridgeLiveBranchCompletionDoesNotAdvanceHistoricalTranscriptCheckpoint",
+      "package": "./internal/teams",
+      "job": "teams-recovery",
+      "tier": "P0",
+      "backends": [
+        "json",
+        "sqlite"
+      ],
+      "backend_subtests": [
+        "json",
+        "sqlite"
+      ],
+      "vertical": "execution-anchor-live-branch-completion",
+      "real_listener": false,
+      "fake_graph": true,
+      "max_seconds": 20,
+      "oracle": "a live-branch final is durably delivered exactly once while an unproven historical final after the checkpoint cannot advance or replace the historical cursor/anchor on either backend",
+      "baseline": "pre-fix active-turn transcript backfill attempted to cross the unresolved historical owner before the current branch final could commit",
+      "resource_class": "sqlite_fsync"
+    },
+    {
+      "name": "TestBridgeHistoricalTranscriptGuardStillAppliesOutsideLiveBranch",
+      "package": "./internal/teams",
+      "job": "teams-recovery",
+      "tier": "P0",
+      "backends": [
+        "json"
+      ],
+      "vertical": "execution-anchor-live-branch-negative-control",
+      "real_listener": false,
+      "fake_graph": true,
+      "max_seconds": 10,
+      "oracle": "the pre-final unresolved-history guard still rejects a turn not admitted on the exact durable live branch without moving the cursor",
+      "baseline": "an over-broad bypass could let an unrelated thread publish through another execution owner's anchor",
+      "resource_class": "pure_cpu"
+    },
+    {
+      "name": "TestBridgeUnresolvedLiveBranchErrorInterruptsAndRevokesBranchAcrossBackends",
+      "package": "./internal/teams",
+      "job": "teams-recovery",
+      "tier": "P0",
+      "backends": [
+        "json",
+        "sqlite"
+      ],
+      "backend_subtests": [
+        "json",
+        "sqlite"
+      ],
+      "vertical": "execution-anchor-live-branch-error-handler",
+      "real_listener": false,
+      "fake_graph": true,
+      "max_seconds": 30,
+      "oracle": "an unresolved completion error atomically closes the exact current branch turn/inbound, preserves the old anchor except revoking the branch, publishes one stable attention notice, and cannot duplicate it on either backend",
+      "baseline": "pre-fix the bridge error handler could not persist a new anchor across the older unresolved owner and returned with the live turn/inbound still nonterminal",
+      "resource_class": "sqlite_fsync"
     }
   ]
 }

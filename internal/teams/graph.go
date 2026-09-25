@@ -195,6 +195,18 @@ type ChatMessage struct {
 	// bounded record re-fetch budget is exhausted. It is not a
 	// provider field and must never be sent back to Graph.
 	quarantinedForPoll bool
+	// rejectedModelAPIKeyForPoll marks a receipt whose original text was
+	// redacted before durable staging. The durable page disposition carries this
+	// bit across restart; it is never part of a Graph request/response payload.
+	rejectedModelAPIKeyForPoll bool
+	// rejectedModelAPIKeyMentionedForPoll preserves only the routing fact needed
+	// by the work-chat audience gate after credential redaction removes the
+	// original body. The durable poll disposition carries it across restart.
+	rejectedModelAPIKeyMentionedForPoll bool
+	// deferredModelProfileKeyIntakeForPoll marks an owner-confirmed key intake
+	// receipt whose raw body was redacted before durable staging. The foreground
+	// recovery lane must re-fetch the exact Teams message before saving the key.
+	deferredModelProfileKeyIntakeForPoll bool
 }
 
 type MessageAttachment struct {
@@ -1691,6 +1703,18 @@ type graphBeforeMethodFirstRequestContextKey struct{}
 // durable lookup on every retry.
 type graphBeforeEachRequestContextKey struct{}
 
+// graphBeforeWriteRequestContextKey carries a write-only admission fence for
+// a caller that must recheck state immediately before Graph side effects. It
+// is intentionally separate from the read fence so a write throttle cannot
+// suppress the GETs needed to reconcile ambiguous sends.
+type graphBeforeWriteRequestContextKey struct{}
+
+// graphWriteRequestRelease runs after the HTTP client returns response headers.
+// Callers can publish a scoped write throttle before allowing another side
+// effect request through the same local admission boundary.
+type graphWriteRequestRelease func(*http.Response)
+type graphBeforeWriteRequest func(context.Context, string) (graphWriteRequestRelease, error)
+
 // graphRequestPreflightError marks a local durable fence failure that occurs
 // after authentication but before an HTTP request is issued.  Senders use
 // this distinction to release only their own pre-POST attempt; treating an
@@ -1759,6 +1783,16 @@ func withGraphBeforeEachRequest(ctx context.Context, fn func() error) context.Co
 	return context.WithValue(ctx, graphBeforeEachRequestContextKey{}, fn)
 }
 
+func withGraphBeforeWriteRequest(ctx context.Context, fn graphBeforeWriteRequest) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if fn == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, graphBeforeWriteRequestContextKey{}, fn)
+}
+
 func graphBeforeFirstRequestFromContext(ctx context.Context) func() error {
 	if ctx == nil {
 		return nil
@@ -1791,6 +1825,42 @@ func graphRequestBeforeEachRequest(ctx context.Context, opts graphRequestOptions
 	}
 	fn, _ := ctx.Value(graphBeforeEachRequestContextKey{}).(func() error)
 	return fn
+}
+
+func graphRequestBeforeWriteRequest(ctx context.Context) graphBeforeWriteRequest {
+	if ctx == nil {
+		return nil
+	}
+	fn, _ := ctx.Value(graphBeforeWriteRequestContextKey{}).(graphBeforeWriteRequest)
+	return fn
+}
+
+func graphRequestMethodIsReadOnly(method string) bool {
+	switch strings.ToUpper(strings.TrimSpace(method)) {
+	case http.MethodGet, http.MethodHead, http.MethodOptions:
+		return true
+	default:
+		return false
+	}
+}
+
+func runGraphRequestBeforeWriteRequest(ctx context.Context, method string) (graphWriteRequestRelease, error) {
+	if graphRequestMethodIsReadOnly(method) {
+		return nil, nil
+	}
+	fn := graphRequestBeforeWriteRequest(ctx)
+	if fn == nil {
+		return nil, nil
+	}
+	release, err := fn(ctx, method)
+	if err != nil {
+		var preflightErr *graphRequestPreflightError
+		if errors.As(err, &preflightErr) {
+			return nil, err
+		}
+		return nil, &graphRequestPreflightError{cause: err}
+	}
+	return release, nil
 }
 
 func runGraphRequestBeforeEachRequest(fn func() error) error {
@@ -1896,8 +1966,15 @@ func (g *GraphClient) doWithOptions(ctx context.Context, method string, path str
 		if err := runGraphRequestBeforeEachRequest(beforeEachRequest); err != nil {
 			return err
 		}
+		releaseWrite, err := runGraphRequestBeforeWriteRequest(ctx, method)
+		if err != nil {
+			return err
+		}
 		req, err := http.NewRequestWithContext(ctx, method, g.graphURL(path), bytes.NewReader(payload))
 		if err != nil {
+			if releaseWrite != nil {
+				releaseWrite(nil)
+			}
 			return err
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -1905,6 +1982,9 @@ func (g *GraphClient) doWithOptions(ctx context.Context, method string, path str
 			req.Header.Set("Content-Type", "application/json")
 		}
 		resp, err := g.httpClient().Do(req)
+		if releaseWrite != nil {
+			releaseWrite(resp)
+		}
 		if err != nil {
 			return wrapGraphTransportError(method, path, err)
 		}
@@ -2005,12 +2085,22 @@ func (g *GraphClient) doRawWithOptions(ctx context.Context, method string, path 
 		if err := runGraphRequestBeforeEachRequest(beforeEachRequest); err != nil {
 			return nil, "", err
 		}
+		releaseWrite, err := runGraphRequestBeforeWriteRequest(ctx, method)
+		if err != nil {
+			return nil, "", err
+		}
 		req, err := http.NewRequestWithContext(ctx, method, g.graphURL(path), nil)
 		if err != nil {
+			if releaseWrite != nil {
+				releaseWrite(nil)
+			}
 			return nil, "", err
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
 		resp, err := g.httpClient().Do(req)
+		if releaseWrite != nil {
+			releaseWrite(resp)
+		}
 		if err != nil {
 			return nil, "", wrapGraphTransportError(method, path, err)
 		}
@@ -2080,8 +2170,15 @@ func (g *GraphClient) doBytesWithOptions(ctx context.Context, method string, pat
 		if err := runGraphRequestBeforeEachRequest(beforeEachRequest); err != nil {
 			return nil, err
 		}
+		releaseWrite, err := runGraphRequestBeforeWriteRequest(ctx, method)
+		if err != nil {
+			return nil, err
+		}
 		req, err := http.NewRequestWithContext(ctx, method, g.graphURL(path), bytes.NewReader(data))
 		if err != nil {
+			if releaseWrite != nil {
+				releaseWrite(nil)
+			}
 			return nil, err
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -2089,6 +2186,9 @@ func (g *GraphClient) doBytesWithOptions(ctx context.Context, method string, pat
 			req.Header.Set("Content-Type", contentType)
 		}
 		resp, err := g.httpClient().Do(req)
+		if releaseWrite != nil {
+			releaseWrite(resp)
+		}
 		if err != nil {
 			return nil, wrapGraphTransportError(method, path, err)
 		}

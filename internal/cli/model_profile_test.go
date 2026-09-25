@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
 	"path/filepath"
@@ -399,8 +400,54 @@ func TestTeamsKeyIntakeVerificationFailureStaysHidden(t *testing.T) {
 		t.Fatal(err)
 	}
 	profile := cfg.ModelProfiles["kimi-work"]
-	if profile.VerificationFingerprint != "" || !strings.Contains(profile.VerificationError, "unauthorized") {
+	if profile.VerificationFingerprint != "" || profile.VerificationError != "model profile authentication verification failed; inspect provider and credential configuration" {
 		t.Fatalf("failed profile = %#v", profile)
+	}
+}
+
+func TestModelSetupDoesNotEchoVerifierCredentialDiagnostics(t *testing.T) {
+	const apiKey = "sk-cli-verification-secret-0123456789abcdef0123456789"
+	encodedKey := base64.StdEncoding.EncodeToString([]byte(apiKey))
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	t.Setenv("CXP_TEST_MODEL_SETUP_KEY", apiKey)
+	previous := verifyConfiguredModelAuthenticationFn
+	t.Cleanup(func() { verifyConfiguredModelAuthenticationFn = previous })
+	verifyConfiguredModelAuthenticationFn = func(context.Context, modelprofile.Resolved, string) error {
+		return fmt.Errorf("provider diagnostic echoed encoded credential %s", encodedKey)
+	}
+	previousLookup := lookupModelChoiceForCLI
+	t.Cleanup(func() { lookupModelChoiceForCLI = previousLookup })
+	lookupModelChoiceForCLI = func(string) (modelprofile.ModelChoice, error) {
+		return modelprofile.ModelChoice{
+			ID: "kimi-safe-test", ProviderID: "kimi", ProviderDisplayName: "Kimi", PublicModel: "kimi-k2",
+			DisplayName: "Kimi K2", RecommendedProfile: "kimi-work", RequiresAPIKey: true,
+		}, nil
+	}
+	err, stderr := runRootCommandForModelProfileTestError(
+		"--config", configPath,
+		"model", "setup", "kimi-safe-test",
+		"--api-key-env", "CXP_TEST_MODEL_SETUP_KEY",
+		"--no-doctor",
+	)
+	if err == nil || !strings.Contains(err.Error(), "remains hidden") {
+		t.Fatalf("model setup verification error = %v, want fixed hidden diagnostic", err)
+	}
+	for label, output := range map[string]string{"returned error": err.Error(), "CLI stderr": stderr} {
+		if strings.Contains(output, apiKey) || strings.Contains(output, encodedKey) {
+			t.Fatalf("%s exposed verifier credential material: %q", label, output)
+		}
+	}
+	store, loadErr := config.NewStore(configPath)
+	if loadErr != nil {
+		t.Fatalf("open config after setup failure: %v", loadErr)
+	}
+	cfg, loadErr := store.Load()
+	if loadErr != nil {
+		t.Fatalf("load config after setup failure: %v", loadErr)
+	}
+	profile, ok := cfg.FindModelProfile("kimi-work")
+	if !ok || profile.VerificationFingerprint != "" || profile.VerificationError != teamsModelProfileVerificationDiagnostic {
+		t.Fatalf("failed verification profile = %#v, found=%t", profile, ok)
 	}
 }
 
@@ -542,6 +589,58 @@ func TestTeamsModelProfileManagerSaveModelProfileAPIKey(t *testing.T) {
 	}
 	if got := cfg.ModelProfiles["mimo25"]; got.Revision != 3 || got.Model != "mimo/mimo-v2.5" {
 		t.Fatalf("stored profile after model change = %#v", got)
+	}
+}
+
+func TestTeamsModelProfileManagerDoesNotPersistVerificationErrorCredentialMaterial(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "config.json")
+	store, err := config.NewStore(configPath)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	const apiKey = "sk-verification-secret-0123456789abcdef0123456789"
+	encodedKey := base64.StdEncoding.EncodeToString([]byte(apiKey))
+	apiKeyRef := modelprofile.SecretRefForProfile("compat-work")
+	if err := store.Save(config.Config{
+		Version: config.CurrentVersion,
+		ModelProfiles: map[string]config.ModelProfile{
+			"compat-work": {Provider: "kimi", Model: "kimi-k2", APIKeyRef: apiKeyRef, Revision: 1},
+		},
+	}); err != nil {
+		t.Fatalf("save initial config: %v", err)
+	}
+	secretStore := modelprofile.NewSecretStore(modelprofile.SecretPathForConfig(configPath))
+	if err := secretStore.Put(apiKeyRef, "sk-previous-secret-0123456789abcdef"); err != nil {
+		t.Fatalf("seed previous profile key: %v", err)
+	}
+	previous := verifyConfiguredModelAuthenticationFn
+	t.Cleanup(func() { verifyConfiguredModelAuthenticationFn = previous })
+	verificationCalled := false
+	verifyConfiguredModelAuthenticationFn = func(context.Context, modelprofile.Resolved, string) error {
+		verificationCalled = true
+		return fmt.Errorf("provider diagnostic echoed %s", encodedKey)
+	}
+	manager := newTeamsModelProfileManager(&rootOptions{configPath: configPath})
+	_, err = manager.SaveModelProfileAPIKey(context.Background(), teams.ModelProfileAPIKeySaveRequest{
+		ProfileName: "compat-work", Provider: "kimi", Model: "kimi-k2", APIKey: apiKey,
+	})
+	if err == nil {
+		t.Fatal("SaveModelProfileAPIKey unexpectedly succeeded after verification error")
+	}
+	if strings.Contains(err.Error(), apiKey) || strings.Contains(err.Error(), encodedKey) {
+		t.Fatalf("SaveModelProfileAPIKey returned verifier credential material: %v", err)
+	}
+	if !verificationCalled {
+		t.Fatalf("authentication verification was not invoked; SaveModelProfileAPIKey err=%v", err)
+	}
+	cfg, err := store.Load()
+	if err != nil {
+		t.Fatalf("load config after verification failure: %v", err)
+	}
+	verificationError := cfg.ModelProfiles["compat-work"].VerificationError
+	if strings.Contains(verificationError, apiKey) || strings.Contains(verificationError, encodedKey) ||
+		verificationError != "model profile authentication verification failed; inspect provider and credential configuration" {
+		t.Fatalf("durable verification diagnostic = %q, save err=%v profiles=%#v", verificationError, err, cfg.ModelProfiles)
 	}
 }
 

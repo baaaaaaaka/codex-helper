@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -476,6 +477,376 @@ func TestGraphBeforeEachRequestContextFenceStopsRetryBeforeSecondHTTPAttempt(t *
 	}
 	if attempts != 1 || fenceCalls != 2 {
 		t.Fatalf("HTTP attempts=%d fence calls=%d, want 1 HTTP attempt and 2 context fence calls", attempts, fenceCalls)
+	}
+}
+
+func TestGraphBeforeWriteRequestContextFenceLeavesReadsAvailable(t *testing.T) {
+	var gets, posts, fenceCalls int
+	graph := &GraphClient{
+		auth: &fakeGraphAuth{token: "access"},
+		client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			switch req.Method {
+			case http.MethodGet:
+				gets++
+				return jsonResponse(http.StatusOK, `{"id":"test-user"}`), nil
+			case http.MethodPost:
+				posts++
+				return jsonResponse(http.StatusCreated, `{"id":"unexpected"}`), nil
+			default:
+				return nil, fmt.Errorf("unexpected method %s", req.Method)
+			}
+		})},
+		baseURL:    "https://graph.example.test",
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	ctx := withGraphBeforeWriteRequest(context.Background(), func(context.Context, string) (graphWriteRequestRelease, error) {
+		fenceCalls++
+		return nil, errors.New("account write gate is active")
+	})
+	if err := graph.doWithOptions(ctx, http.MethodGet, "/me", nil, nil, graphRequestOptions{}); err != nil {
+		t.Fatalf("read request during account write gate: %v", err)
+	}
+	err := graph.doWithOptions(ctx, http.MethodPost, "/chats/chat-1/messages", map[string]any{"body": "queued"}, nil, graphRequestOptions{
+		returnRateLimitWithoutRetry: true,
+		noReplayAfterFirstRequest:   true,
+	})
+	var preflightErr *graphRequestPreflightError
+	if !errors.As(err, &preflightErr) || !strings.Contains(err.Error(), "account write gate is active") {
+		t.Fatalf("write request during account write gate = %v, want preflight rejection", err)
+	}
+	if gets != 1 || posts != 0 || fenceCalls != 1 {
+		t.Fatalf("GETs=%d POSTs=%d write-fence calls=%d, want GET=1 POST=0 fence=1", gets, posts, fenceCalls)
+	}
+}
+
+func TestGraphWriteBoundarySerializesUntilResponseAndPublishes429(t *testing.T) {
+	firstPostStarted := make(chan struct{})
+	releaseFirstPost := make(chan struct{})
+	secondWriteAdmission := make(chan struct{})
+	var secondAdmissionOnce sync.Once
+	var posts atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			t.Errorf("unexpected Graph request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		posts.Add(1)
+		if strings.Contains(r.URL.Path, "/chat-a/") {
+			close(firstPostStarted)
+			<-releaseFirstPost
+			w.Header().Set("Retry-After", "3600")
+			w.Header().Set("X-CXP-RateLimit-Scope", "account")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = fmt.Fprint(w, `{"error":{"code":"TooManyRequests","message":"account write gate"}}`)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		_, _ = fmt.Fprint(w, `{"id":"unexpected-sibling-post","messageType":"message"}`)
+	}))
+	var releaseFirstOnce sync.Once
+	releaseFirst := func() { releaseFirstOnce.Do(func() { close(releaseFirstPost) }) }
+	t.Cleanup(func() {
+		releaseFirst()
+		server.Close()
+	})
+	requestGate := make(chan struct{}, 1)
+	requestGate <- struct{}{}
+	var admissions atomic.Int32
+	accountBlocked := false // guarded by requestGate while any write is admitted
+	ctx := withGraphBeforeWriteRequest(context.Background(), func(_ context.Context, _ string) (graphWriteRequestRelease, error) {
+		if admissions.Add(1) == 2 {
+			secondAdmissionOnce.Do(func() { close(secondWriteAdmission) })
+		}
+		<-requestGate
+		if accountBlocked {
+			requestGate <- struct{}{}
+			return nil, errors.New("account-wide Graph write rate limit is active")
+		}
+		return func(resp *http.Response) {
+			if resp != nil && resp.StatusCode == http.StatusTooManyRequests && graphRateLimitScopeIsAccountWide(graphRateLimitScope(resp.Header)) {
+				accountBlocked = true
+			}
+			requestGate <- struct{}{}
+		}, nil
+	})
+	graph := &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	request := func(chatID string) error {
+		return graph.doWithOptions(ctx, http.MethodPost, "/chats/"+chatID+"/messages", map[string]any{"body": "queued"}, nil, graphRequestOptions{
+			returnRateLimitWithoutRetry: true,
+			noReplayAfterFirstRequest:   true,
+		})
+	}
+	firstDone := make(chan error, 1)
+	go func() { firstDone <- request("chat-a") }()
+	select {
+	case <-firstPostStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first Graph POST did not reach the controlled response boundary")
+	}
+	secondDone := make(chan error, 1)
+	go func() { secondDone <- request("chat-b") }()
+	select {
+	case <-secondWriteAdmission:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second write did not reach the serialized admission boundary")
+	}
+	releaseFirst()
+	var firstErr error
+	select {
+	case firstErr = <-firstDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first Graph write did not finish after its controlled response")
+	}
+	if !isGraphAccountWriteRateLimit(firstErr) {
+		t.Fatalf("first POST error = %v, want explicit account-scoped 429", firstErr)
+	}
+	var secondErr error
+	select {
+	case secondErr = <-secondDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("sibling Graph write did not finish after the account 429 was published")
+	}
+	var preflightErr *graphRequestPreflightError
+	if !errors.As(secondErr, &preflightErr) || !strings.Contains(secondErr.Error(), "account-wide Graph write rate limit is active") {
+		t.Fatalf("second POST error = %v, want pre-HTTP account write-gate rejection", secondErr)
+	}
+	if got := posts.Load(); got != 1 {
+		t.Fatalf("Graph POST count = %d, want only the request that received the account 429", got)
+	}
+}
+
+func TestGraphTransferWriteBoundaryBlocksSiblingPostAfterAccount429(t *testing.T) {
+	transferPostStarted := make(chan struct{})
+	releaseTransferPost := make(chan struct{})
+	secondWriteAdmission := make(chan struct{})
+	var secondAdmissionOnce sync.Once
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if r.Method == http.MethodPut && r.URL.Path == "/upload" {
+			close(transferPostStarted)
+			<-releaseTransferPost
+			w.Header().Set("Retry-After", "3600")
+			w.Header().Set("X-CXP-RateLimit-Scope", "account")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = fmt.Fprint(w, `{"error":{"code":"TooManyRequests","message":"account upload throttle"}}`)
+			return
+		}
+		if r.Method == http.MethodPost && r.URL.Path == "/chats/chat-b/messages" {
+			w.WriteHeader(http.StatusCreated)
+			_, _ = fmt.Fprint(w, `{"id":"unexpected-sibling-post","messageType":"message"}`)
+			return
+		}
+		t.Errorf("unexpected Graph request: %s %s", r.Method, r.URL.Path)
+		http.Error(w, "unexpected Graph request", http.StatusBadRequest)
+	}))
+	var releaseTransferOnce sync.Once
+	releaseTransfer := func() { releaseTransferOnce.Do(func() { close(releaseTransferPost) }) }
+	t.Cleanup(func() {
+		releaseTransfer()
+		server.Close()
+	})
+	requestGate := make(chan struct{}, 1)
+	requestGate <- struct{}{}
+	var admissions atomic.Int32
+	accountBlocked := false // guarded by requestGate while any write is admitted
+	ctx := withGraphBeforeWriteRequest(context.Background(), func(_ context.Context, _ string) (graphWriteRequestRelease, error) {
+		if admissions.Add(1) == 2 {
+			secondAdmissionOnce.Do(func() { close(secondWriteAdmission) })
+		}
+		<-requestGate
+		if accountBlocked {
+			requestGate <- struct{}{}
+			return nil, errors.New("account-wide Graph write rate limit is active")
+		}
+		return func(resp *http.Response) {
+			if resp != nil && resp.StatusCode == http.StatusTooManyRequests && graphRateLimitScopeIsAccountWide(graphRateLimitScope(resp.Header)) {
+				accountBlocked = true
+			}
+			requestGate <- struct{}{}
+		}, nil
+	})
+	graph := &GraphClient{
+		auth:       &fakeGraphAuth{token: "access"},
+		client:     server.Client(),
+		baseURL:    server.URL,
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	firstDone := make(chan struct {
+		status int
+		err    error
+	}, 1)
+	go func() {
+		req, err := http.NewRequest(http.MethodPut, server.URL+"/upload", strings.NewReader("chunk"))
+		if err != nil {
+			firstDone <- struct {
+				status int
+				err    error
+			}{err: err}
+			return
+		}
+		resp, err := graph.doTransferRequestWithOptions(ctx, req, graphRequestOptions{})
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+			discardAndClose(resp.Body)
+		}
+		firstDone <- struct {
+			status int
+			err    error
+		}{status: status, err: err}
+	}()
+	select {
+	case <-transferPostStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("transfer PUT did not reach the controlled response boundary")
+	}
+	secondDone := make(chan error, 1)
+	go func() {
+		secondDone <- graph.doWithOptions(ctx, http.MethodPost, "/chats/chat-b/messages", map[string]any{"body": "queued"}, nil, graphRequestOptions{
+			returnRateLimitWithoutRetry: true,
+			noReplayAfterFirstRequest:   true,
+		})
+	}()
+	select {
+	case <-secondWriteAdmission:
+	case <-time.After(5 * time.Second):
+		t.Fatal("sibling Graph write did not reach the serialized admission boundary")
+	}
+	releaseTransfer()
+	var first struct {
+		status int
+		err    error
+	}
+	select {
+	case first = <-firstDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("transfer request did not finish after its controlled response")
+	}
+	if first.err != nil || first.status != http.StatusTooManyRequests {
+		t.Fatalf("transfer response status=%d err=%v, want explicit HTTP 429", first.status, first.err)
+	}
+	var secondErr error
+	select {
+	case secondErr = <-secondDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("sibling Graph write did not finish after the upload account 429")
+	}
+	var preflightErr *graphRequestPreflightError
+	if !errors.As(secondErr, &preflightErr) || !strings.Contains(secondErr.Error(), "account-wide Graph write rate limit is active") {
+		t.Fatalf("sibling POST error = %v, want pre-HTTP account write-gate rejection", secondErr)
+	}
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("Graph request count = %d, want only the upload that received the account 429", got)
+	}
+}
+
+func TestGraphWriteBoundaryWaitHonorsRequestCancellation(t *testing.T) {
+	bridge := &Bridge{}
+	firstGate, err := bridge.acquireGraphWriteRequest(context.Background())
+	if err != nil {
+		t.Fatalf("acquire first write boundary: %v", err)
+	}
+	var releaseFirstOnce sync.Once
+	releaseFirst := func() { releaseFirstOnce.Do(func() { firstGate <- struct{}{} }) }
+	t.Cleanup(releaseFirst)
+	var posts atomic.Int32
+	graph := &GraphClient{
+		auth: &fakeGraphAuth{token: "access"},
+		client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			posts.Add(1)
+			return jsonResponse(http.StatusCreated, `{"id":"unexpected"}`), nil
+		})},
+		baseURL:    "https://graph.example.test",
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	callbackStarted := make(chan struct{})
+	requestCtx := withGraphBeforeWriteRequest(ctx, func(writeCtx context.Context, _ string) (graphWriteRequestRelease, error) {
+		close(callbackStarted)
+		gate, err := bridge.acquireGraphWriteRequest(writeCtx)
+		if err != nil {
+			return nil, err
+		}
+		return func(*http.Response) { gate <- struct{}{} }, nil
+	})
+	done := make(chan error, 1)
+	go func() {
+		done <- graph.doWithOptions(requestCtx, http.MethodPost, "/chats/chat-cancel/messages", map[string]any{"body": "queued"}, nil, graphRequestOptions{
+			returnRateLimitWithoutRetry: true,
+			noReplayAfterFirstRequest:   true,
+		})
+	}()
+	select {
+	case <-callbackStarted:
+	case <-time.After(5 * time.Second):
+		cancel()
+		releaseFirst()
+		t.Fatal("Graph write did not reach the cancellable admission boundary")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("canceled Graph write error = %v, want context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("canceled Graph write remained blocked behind another request")
+	}
+	releaseFirst()
+	if got := posts.Load(); got != 0 {
+		t.Fatalf("Graph POST count after canceled admission = %d, want zero", got)
+	}
+}
+
+func TestGraphByteUploadReleasesWriteBoundaryOnResponse(t *testing.T) {
+	var requests, releases int
+	var releasedStatus int
+	graph := &GraphClient{
+		auth: &fakeGraphAuth{token: "access"},
+		client: &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+			requests++
+			if req.Method != http.MethodPut {
+				return nil, fmt.Errorf("upload method = %s, want PUT", req.Method)
+			}
+			return jsonResponse(http.StatusOK, `{"id":"drive-item"}`), nil
+		})},
+		baseURL:    "https://graph.example.test",
+		maxRetries: 0,
+		sleep:      sleepContext,
+		jitter:     func(d time.Duration) time.Duration { return d },
+	}
+	ctx := withGraphBeforeWriteRequest(context.Background(), func(_ context.Context, method string) (graphWriteRequestRelease, error) {
+		if method != http.MethodPut {
+			return nil, fmt.Errorf("write-boundary method = %s, want PUT", method)
+		}
+		return func(resp *http.Response) {
+			releases++
+			if resp != nil {
+				releasedStatus = resp.StatusCode
+			}
+		}, nil
+	})
+	if _, err := graph.doBytesWithOptions(ctx, http.MethodPut, "/me/drive/root:/test.txt:/content", []byte("payload"), "text/plain", 1024, graphRequestOptions{}); err != nil {
+		t.Fatalf("Graph byte upload: %v", err)
+	}
+	if requests != 1 || releases != 1 || releasedStatus != http.StatusOK {
+		t.Fatalf("HTTP requests=%d boundary releases=%d response status=%d, want 1/1/200", requests, releases, releasedStatus)
 	}
 }
 

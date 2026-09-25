@@ -1110,7 +1110,7 @@ func newTeamsModelProfileResolverInternal(root *rootOptions, codexPath string, r
 					return modelprofile.Snapshot{}, fmt.Errorf("save automatic verification for model profile %q: %w", resolved.Name, saveErr)
 				}
 				if verifyErr != nil {
-					return modelprofile.Snapshot{}, fmt.Errorf("automatic authentication verification failed for model profile %q: %w", resolved.Name, verifyErr)
+					return modelprofile.Snapshot{}, errTeamsModelProfileAuthenticationVerification
 				}
 				resolved, err = modelprofile.Resolve(cfg, resolved.Name)
 				if err != nil {

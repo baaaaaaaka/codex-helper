@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"sort"
@@ -36,6 +37,9 @@ type teamsOfficialModelCacheEntry struct {
 }
 
 const teamsOfficialModelCacheTTL = 30 * time.Minute
+const teamsModelProfileVerificationDiagnostic = "model profile authentication verification failed; inspect provider and credential configuration"
+
+var errTeamsModelProfileAuthenticationVerification = errors.New("model profile authentication verification failed and remains hidden; inspect provider and credential configuration")
 
 func invalidateTeamsOfficialModelCache() {
 	teamsOfficialModelCache.Lock()
@@ -52,7 +56,9 @@ func verifyAndStampTeamsModelProfile(ctx context.Context, cfg *config.Config, na
 		profile := cfg.ModelProfiles[name]
 		profile.VerificationFingerprint = ""
 		profile.VerifiedAt = time.Time{}
-		profile.VerificationError = compactVerificationError(err, apiKey)
+		// Provider error text is untrusted and may echo or transform the API
+		// credential. Keep only a fixed diagnostic in durable config.
+		profile.VerificationError = teamsModelProfileVerificationDiagnostic
 		cfg.ModelProfiles[name] = profile
 		return err
 	}
@@ -515,7 +521,7 @@ func (m teamsModelProfileManager) SetupModelProfile(ctx context.Context, req tea
 			return teams.ModelProfileSetupResult{}, saveErr
 		}
 		if verifyErr != nil {
-			return teams.ModelProfileSetupResult{}, fmt.Errorf("model %s authentication verification failed and remains hidden: %w", choice.ID, verifyErr)
+			return teams.ModelProfileSetupResult{}, errTeamsModelProfileAuthenticationVerification
 		}
 	} else if err := store.Save(cfg); err != nil {
 		return teams.ModelProfileSetupResult{}, err
@@ -677,7 +683,7 @@ func (m teamsModelProfileManager) SaveModelProfileAPIKey(ctx context.Context, re
 		return teams.ModelProfileAPIKeySaveResult{}, err
 	}
 	if verifyErr != nil {
-		return teams.ModelProfileAPIKeySaveResult{}, fmt.Errorf("model profile %q authentication verification failed and remains hidden: %w", name, verifyErr)
+		return teams.ModelProfileAPIKeySaveResult{}, errTeamsModelProfileAuthenticationVerification
 	}
 	return teams.ModelProfileAPIKeySaveResult{
 		ProfileName: name,

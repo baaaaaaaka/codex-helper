@@ -878,6 +878,132 @@ func TestStoreTakeOverRunningTurnWithAnchorPreservesHistoricalAnchorForLiveBranc
 	}
 }
 
+func TestStorePersistInterruptedLiveBranchTurnPreservesAnchorAndRevokesBranchAcrossBackends(t *testing.T) {
+	ctx := context.Background()
+	for _, useSQLite := range []bool{false, true} {
+		t.Run(map[bool]string{false: "json", true: "sqlite"}[useSQLite], func(t *testing.T) {
+			store := newTestStore(t)
+			now := time.Now().UTC().Truncate(time.Microsecond)
+			const (
+				sessionID        = "session:ambiguous-live-branch"
+				chatID           = "chat:ambiguous-live-branch"
+				turnID           = "turn:ambiguous-live-branch"
+				inboundID        = "inbound:ambiguous-live-branch"
+				oldOuterTurnID   = "turn:historical-owner"
+				historicalThread = "thread:historical-owner"
+				liveBranchThread = "thread:durable-live-branch"
+				historicalCodex  = "codex:historical-owner"
+				currentCodex     = "codex:ambiguous-live-branch"
+			)
+			scope := ScopeIdentity{ID: "scope:ambiguous-live-branch", AccountID: "user-1", OSUser: "tester", Profile: "default"}
+			machine := MachineRecord{ID: "machine:ambiguous-live-branch", ScopeID: scope.ID, Kind: MachineKindPrimary, Priority: DefaultMachinePriority(MachineKindPrimary)}
+			lease, err := store.ClaimControlLease(ctx, ControlLeaseClaim{Scope: scope, Machine: machine, Duration: time.Hour, Now: now})
+			if err != nil || lease.Mode != LeaseModeActive {
+				t.Fatalf("claim owner = %#v err=%v", lease, err)
+			}
+			checkpointID := sessionTranscriptCheckpointID(sessionID)
+			historicalAnchor := ExecutionAnchor{
+				SessionID: sessionID, ThreadID: historicalThread, LiveBranchThreadID: liveBranchThread,
+				OuterTurnID: oldOuterTurnID, CodexTurnID: historicalCodex,
+				SourcePath: "/tmp/historical.jsonl", SourceFingerprint: "historical-fingerprint",
+				CutoffRecordID: "historical-record", CutoffLine: 17, CutoffOffset: 2048,
+				Reason: "ambiguous historical execution", Provenance: ExecutionAnchorProvenanceRuntime,
+				State: "unresolved", Generation: 7, CreatedAt: now, UpdatedAt: now,
+			}
+			turn := Turn{
+				ID: turnID, SessionID: sessionID, ScopeID: scope.ID,
+				MachineID: machine.ID, LeaseGeneration: lease.Lease.Generation,
+				InboundEventID: inboundID, Status: TurnStatusRunning,
+				CodexThreadID: liveBranchThread, CodexTurnID: currentCodex,
+				StartedAt: now, CreatedAt: now, UpdatedAt: now,
+			}
+			if err := store.Update(ctx, func(state *State) error {
+				state.Sessions[sessionID] = SessionContext{ID: sessionID, TeamsChatID: chatID, Status: SessionStatusActive, CreatedAt: now, UpdatedAt: now}
+				state.InboundEvents[inboundID] = InboundEvent{
+					ID: inboundID, TeamsChatID: chatID, TeamsMessageID: "teams-message:ambiguous-live-branch",
+					SessionID: sessionID, TurnID: turnID, Status: InboundStatusQueued,
+				}
+				state.Turns[turnID] = turn
+				state.ImportCheckpoints[checkpointID] = ImportCheckpoint{
+					ID: checkpointID, SessionID: sessionID, ExecutionAnchorGeneration: historicalAnchor.Generation,
+					UnresolvedExecution: &historicalAnchor, UpdatedAt: now,
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed running live-branch turn: %v", err)
+			}
+			if useSQLite {
+				migrateStoreToSQLiteForTest(t, store)
+			}
+
+			request := PersistInterruptedTurnWithAnchorRequest{
+				SessionID: sessionID, TurnID: turnID, CheckpointID: checkpointID,
+				CodexThreadID: liveBranchThread, CodexTurnID: currentCodex,
+				RecoveryReason: "ambiguous Codex execution: completion ownership mismatch",
+				Anchor:         ExecutionAnchor{ThreadID: liveBranchThread, CodexTurnID: currentCodex, Reason: "completion ownership mismatch", Provenance: ExecutionAnchorProvenanceRuntime},
+			}
+			wrongBranch := request
+			wrongBranch.CodexThreadID = "thread:unadmitted"
+			if _, err := store.PersistInterruptedTurnWithAnchorForOwner(ctx, wrongBranch, machine.ID, lease.Lease.Generation); !errors.Is(err, ErrStaleExecutionCallback) {
+				t.Fatalf("wrong-branch interruption error = %v, want stale callback", err)
+			}
+			before, found, err := store.TurnByID(ctx, turnID)
+			if err != nil || !found || before.Status != TurnStatusRunning {
+				t.Fatalf("wrong-branch attempt changed turn = %#v found=%v err=%v", before, found, err)
+			}
+
+			result, err := store.PersistInterruptedTurnWithAnchorForOwner(ctx, request, machine.ID, lease.Lease.Generation)
+			if err != nil || !result.Changed || result.Turn.Status != TurnStatusInterrupted || result.Turn.MachineID != machine.ID || result.Turn.LeaseGeneration != lease.Lease.Generation {
+				t.Fatalf("live-branch interruption result = %#v err=%v", result, err)
+			}
+			checkpoint, found, err := store.ImportCheckpoint(ctx, checkpointID)
+			if err != nil || !found || checkpoint.UnresolvedExecution == nil {
+				t.Fatalf("load preserved historical checkpoint: found=%v err=%v checkpoint=%#v", found, err, checkpoint)
+			}
+			gotAnchor := *checkpoint.UnresolvedExecution
+			if gotAnchor.ThreadID != historicalAnchor.ThreadID || gotAnchor.OuterTurnID != historicalAnchor.OuterTurnID ||
+				gotAnchor.CodexTurnID != historicalAnchor.CodexTurnID || gotAnchor.Generation != historicalAnchor.Generation ||
+				gotAnchor.SourcePath != historicalAnchor.SourcePath || gotAnchor.SourceFingerprint != historicalAnchor.SourceFingerprint ||
+				gotAnchor.LiveBranchThreadID != "" {
+				t.Fatalf("interrupted live-branch turn rewrote/reused historical anchor: %#v", gotAnchor)
+			}
+			inbound, found, err := store.InboundEventByID(ctx, inboundID)
+			if err != nil || !found || inbound.Status != InboundStatusIgnored {
+				t.Fatalf("interrupted inbound = %#v found=%v err=%v, want ignored", inbound, found, err)
+			}
+
+			if _, err := store.PersistInterruptedTurnWithAnchorForOwner(ctx, request, "machine:stale-owner", lease.Lease.Generation); !errors.Is(err, ErrControlLeaseNotHeld) {
+				t.Fatalf("stale owner interruption error = %v, want control-lease fence", err)
+			}
+			afterStale, found, err := store.ImportCheckpoint(ctx, checkpointID)
+			if err != nil || !found || afterStale.UnresolvedExecution == nil || afterStale.UnresolvedExecution.LiveBranchThreadID != "" {
+				t.Fatalf("stale owner changed preserved anchor: %#v found=%v err=%v", afterStale.UnresolvedExecution, found, err)
+			}
+
+			nextTurnID := "turn:next-after-ambiguous-live-branch"
+			if err := store.Update(ctx, func(state *State) error {
+				state.Turns[nextTurnID] = Turn{
+					ID: nextTurnID, SessionID: sessionID, ScopeID: scope.ID,
+					MachineID: machine.ID, LeaseGeneration: lease.Lease.Generation,
+					Status: TurnStatusQueued, CodexThreadID: liveBranchThread,
+					QueuedAt: now.Add(time.Second), CreatedAt: now.Add(time.Second),
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed queued successor: %v", err)
+			}
+			prepared, err := store.MarkTurnForIsolatedCodexThreadForOwner(ctx, nextTurnID, machine.ID, lease.Lease.Generation)
+			if err != nil || !prepared.StartNewCodexThread || prepared.CodexThreadID != "" {
+				t.Fatalf("prepare queued successor after branch revocation = %#v err=%v, want isolated new thread", prepared, err)
+			}
+			nextTurn, ok, err := store.ClaimNextQueuedTurnForOwner(ctx, sessionID, machine.ID, lease.Lease.Generation)
+			if err != nil || !ok || nextTurn.ID != nextTurnID || !nextTurn.StartNewCodexThread || nextTurn.CodexThreadID != "" {
+				t.Fatalf("queued successor after branch revocation = %#v ok=%v err=%v, want isolated new thread", nextTurn, ok, err)
+			}
+		})
+	}
+}
+
 func TestStorePollFrontierAndScheduleRevisionRace(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now().UTC()

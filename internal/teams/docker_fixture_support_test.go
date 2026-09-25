@@ -1,6 +1,7 @@
 package teams
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -15,6 +16,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -665,6 +667,91 @@ func TestDockerFixtureSanitizeMountedStorePreservesTrustedSessionAdmission(t *te
 	}
 }
 
+type dockerFixtureSourceProofManifestRow struct {
+	start  string
+	end    string
+	digest string
+}
+
+type dockerFixtureSourceProofManifestCacheEntry struct {
+	size    int64
+	modTime time.Time
+	rows    map[string][]dockerFixtureSourceProofManifestRow
+}
+
+var dockerFixtureSourceProofManifestCache = struct {
+	sync.Mutex
+	path  string
+	entry dockerFixtureSourceProofManifestCacheEntry
+	valid bool
+}{}
+
+// dockerFixtureSourceProofManifestRows indexes the immutable manifest once per
+// file version. The real-data fixture can have thousands of proof checks; the
+// old per-proof ReadFile+Split path reread and reparsed the entire multi-MB
+// manifest for every outbox/checkpoint row.
+func dockerFixtureSourceProofManifestRows(path string) (map[string][]dockerFixtureSourceProofManifestRow, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("read Docker source-proof manifest %q: %w", path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("read Docker source-proof manifest %q: not a regular file", path)
+	}
+	cacheKey := filepath.Clean(path)
+	dockerFixtureSourceProofManifestCache.Lock()
+	defer dockerFixtureSourceProofManifestCache.Unlock()
+	if dockerFixtureSourceProofManifestCache.valid && dockerFixtureSourceProofManifestCache.path == cacheKey &&
+		dockerFixtureSourceProofManifestCache.entry.size == info.Size() &&
+		dockerFixtureSourceProofManifestCache.entry.modTime.Equal(info.ModTime()) {
+		return dockerFixtureSourceProofManifestCache.entry.rows, nil
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("read Docker source-proof manifest %q: %w", path, err)
+	}
+	defer f.Close()
+	info, err = f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("stat Docker source-proof manifest %q: %w", path, err)
+	}
+	rows := make(map[string][]dockerFixtureSourceProofManifestRow)
+	reader := bufio.NewReader(f)
+	for {
+		line, readErr := reader.ReadString('\n')
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			if readErr == io.EOF {
+				break
+			}
+			if readErr != nil {
+				return nil, fmt.Errorf("read Docker source-proof manifest %q: %w", path, readErr)
+			}
+			continue
+		}
+		fields := strings.Split(line, "\t")
+		if len(fields) != 4 {
+			return nil, fmt.Errorf("invalid Docker source-proof manifest line %q", line)
+		}
+		key := filepath.ToSlash(filepath.Clean(fields[0]))
+		rows[key] = append(rows[key], dockerFixtureSourceProofManifestRow{
+			start: fields[1], end: fields[2], digest: fields[3],
+		})
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return nil, fmt.Errorf("read Docker source-proof manifest %q: %w", path, readErr)
+		}
+	}
+	dockerFixtureSourceProofManifestCache.path = cacheKey
+	dockerFixtureSourceProofManifestCache.entry = dockerFixtureSourceProofManifestCacheEntry{
+		size: info.Size(), modTime: info.ModTime(), rows: rows,
+	}
+	dockerFixtureSourceProofManifestCache.valid = true
+	return rows, nil
+}
+
 // dockerFixtureSourceProofContentMatches verifies a bounded proof against the
 // immutable source-proof manifest assembled by the shell runner. Production
 // transcript fingerprints intentionally include physical file identity; a
@@ -680,11 +767,12 @@ func dockerFixtureSourceProofContentMatches(path string, start, end int64) (bool
 	if start < 0 || end < start {
 		return false, fmt.Errorf("invalid source proof range [%d,%d)", start, end)
 	}
-	data, err := os.ReadFile(manifestPath)
+	manifestRows, err := dockerFixtureSourceProofManifestRows(manifestPath)
 	if err != nil {
-		return false, fmt.Errorf("read Docker source-proof manifest %q: %w", manifestPath, err)
+		return false, err
 	}
 	key := filepath.ToSlash(filepath.Clean(path))
+	rows := manifestRows[key]
 	var expected string
 	found := false
 	fullFileDigests := make(map[int64]string)
@@ -694,24 +782,13 @@ func dockerFixtureSourceProofContentMatches(path string, start, end int64) (bool
 		digest string
 	}
 	var coveredRanges []coveredRange
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		fields := strings.Split(line, "\t")
-		if len(fields) != 4 {
-			return false, fmt.Errorf("invalid Docker source-proof manifest line %q", line)
-		}
-		if filepath.ToSlash(filepath.Clean(fields[0])) != key {
-			continue
-		}
-		manifestStart, startErr := strconv.ParseInt(fields[1], 10, 64)
-		manifestEnd, endErr := strconv.ParseInt(fields[2], 10, 64)
+	for _, row := range rows {
+		manifestStart, startErr := strconv.ParseInt(row.start, 10, 64)
+		manifestEnd, endErr := strconv.ParseInt(row.end, 10, 64)
 		if startErr != nil || endErr != nil || manifestStart < 0 || manifestEnd < manifestStart {
-			return false, fmt.Errorf("invalid Docker source-proof manifest range for %q", fields[0])
+			return false, fmt.Errorf("invalid Docker source-proof manifest range for %q", key)
 		}
-		candidate := strings.TrimSpace(fields[3])
+		candidate := strings.TrimSpace(row.digest)
 		candidate = strings.TrimPrefix(candidate, "sha256:")
 		if len(candidate) != sha256.Size*2 {
 			return false, fmt.Errorf("invalid Docker source-proof digest for %q [%d,%d)", key, start, end)
@@ -1703,10 +1780,18 @@ func TestDockerFixtureRebindRangeProofDoesNotSkipEmptyOriginalFingerprint(t *tes
 		t.Fatal("non-empty range with an empty original fingerprint bypassed the immutable manifest")
 	}
 
+	manifestInfo, err := os.Stat(manifestPath)
+	if err != nil {
+		t.Fatalf("stat cached mismatching source-proof manifest: %v", err)
+	}
 	digest := sha256.Sum256(body)
 	manifest = fmt.Sprintf("%s\t0\t%d\t%s\n", filepath.ToSlash(filepath.Clean(path)), len(body), hex.EncodeToString(digest[:]))
 	if err := os.WriteFile(manifestPath, []byte(manifest), 0o600); err != nil {
 		t.Fatalf("rewrite matching source-proof manifest: %v", err)
+	}
+	updatedModTime := manifestInfo.ModTime().Add(time.Hour)
+	if err := os.Chtimes(manifestPath, updatedModTime, updatedModTime); err != nil {
+		t.Fatalf("update rewritten source-proof manifest timestamp: %v", err)
 	}
 	got, err := dockerFixtureRebindRangeProof(path, 0, int64(len(body)), "")
 	if err != nil {

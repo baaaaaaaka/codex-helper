@@ -3,7 +3,9 @@ package teams
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15684,6 +15686,273 @@ func TestBridgeExactCompletionPublishesOnceAndClearsAnchor(t *testing.T) {
 		if msg.TurnID == turn.ID && strings.EqualFold(msg.NotificationKind, "turn_completed") && msg.Status != teamstore.OutboxStatusSent {
 			t.Fatalf("exact final outbox = %#v, want sent", msg)
 		}
+	}
+}
+
+func TestBridgeLiveBranchCompletionDoesNotAdvanceHistoricalTranscriptCheckpoint(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		backend := map[bool]string{false: "json", true: "sqlite"}[useSQLite]
+		t.Run(backend, func(t *testing.T) {
+			ctx := context.Background()
+			graph, sent := newBridgeTestGraph(t)
+			store := newBridgeTestStore(t)
+			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+			session := bridge.reg.SessionByChatID("chat-1")
+			session.CodexThreadID = "thread-live-branch"
+			session.Cwd = t.TempDir()
+			if err := bridge.ensureDurableSession(ctx, session); err != nil {
+				t.Fatalf("ensureDurableSession: %v", err)
+			}
+
+			startedAt := time.Now().UTC().Add(-time.Minute)
+			transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+			oldLine := `{"timestamp":"2026-09-24T08:00:00Z","type":"event_msg","payload":{"type":"agent_message","id":"old-final","thread_id":"thread-historical","turn_id":"old-codex-turn","phase":"final_answer","message":"historical final"}}`
+			internalLine := `{"timestamp":"2026-09-24T08:01:00Z","type":"event_msg","payload":{"type":"context_compacted"}}`
+			historicalFinalLine := `{"timestamp":"2026-09-24T08:02:00Z","type":"event_msg","payload":{"type":"agent_message","id":"unproven-historical-final","thread_id":"thread-historical","turn_id":"old-codex-turn","phase":"final_answer","message":"unproven historical final"}}`
+			if err := os.WriteFile(transcriptPath, []byte(oldLine+"\n"+internalLine+"\n"+historicalFinalLine+"\n"), 0o600); err != nil {
+				t.Fatalf("write transcript: %v", err)
+			}
+			oldOffset := int64(len(oldLine) + 1)
+			info, err := os.Stat(transcriptPath)
+			if err != nil {
+				t.Fatalf("stat transcript: %v", err)
+			}
+
+			const (
+				oldTurnID = "turn:historical-owner"
+				turnID    = "turn:live-branch-completion"
+			)
+			checkpointID := transcriptCheckpointID(session.ID)
+			anchor := teamstore.ExecutionAnchor{
+				SessionID: session.ID, ThreadID: "thread-historical", OuterTurnID: oldTurnID,
+				LiveBranchThreadID: session.CodexThreadID, State: executionAnchorStateUnresolved,
+				Generation: 12, UpdatedAt: startedAt,
+			}
+			turn := teamstore.Turn{
+				ID: turnID, SessionID: session.ID, Status: teamstore.TurnStatusRunning,
+				CodexThreadID: session.CodexThreadID, CodexTurnID: "codex-live-branch-turn", StartedAt: startedAt,
+			}
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				state.Turns[turn.ID] = turn
+				state.ImportCheckpoints[checkpointID] = teamstore.ImportCheckpoint{
+					ID: checkpointID, SessionID: session.ID, SourcePath: transcriptPath,
+					LastRecordID: "old-final", LastSourceLine: 1, LastOffset: oldOffset,
+					LastOffsetKnown: true, SourceSize: info.Size(), SourceModTime: info.ModTime(),
+					SourceFingerprint: transcriptCheckpointSourceFingerprint(transcriptPath, oldOffset),
+					Status:            importCheckpointStatusComplete, UnresolvedExecution: &anchor,
+					ExecutionAnchorGeneration: anchor.Generation,
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed live-branch checkpoint: %v", err)
+			}
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate store to SQLite: %v", err)
+				}
+			}
+
+			result := ExecutionResult{
+				Text: "live branch answer", CodexThreadID: session.CodexThreadID,
+				CodexTurnID: turn.CodexTurnID, canonicalTranscriptFinal: true,
+			}
+			if err := bridge.completeQueuedTurnWithResult(ctx, session, turn, session.ChatID, beacon.TurnExecutionPlan{}, result); err != nil {
+				t.Fatalf("complete live-branch turn: %v", err)
+			}
+			completed, found, err := store.TurnByID(ctx, turn.ID)
+			if err != nil || !found || completed.Status != teamstore.TurnStatusCompleted {
+				t.Fatalf("live-branch turn = %#v found=%v err=%v, want completed", completed, found, err)
+			}
+
+			checkpoint, found, err := store.ImportCheckpoint(ctx, checkpointID)
+			if err != nil || !found {
+				t.Fatalf("load checkpoint: found=%v err=%v", found, err)
+			}
+			if checkpoint.LastRecordID != "old-final" || checkpoint.LastSourceLine != 1 || checkpoint.LastOffset != oldOffset {
+				t.Fatalf("historical transcript cursor changed: %#v", checkpoint)
+			}
+			if checkpoint.UnresolvedExecution == nil || checkpoint.UnresolvedExecution.Generation != anchor.Generation ||
+				checkpoint.UnresolvedExecution.ThreadID != anchor.ThreadID || checkpoint.UnresolvedExecution.LiveBranchThreadID != session.CodexThreadID {
+				t.Fatalf("historical unresolved anchor was changed: %#v", checkpoint.UnresolvedExecution)
+			}
+
+			if err := bridge.flushPendingOutboxForChat(ctx, session.ChatID); err != nil {
+				t.Fatalf("flush live-branch final: %v", err)
+			}
+			if len(*sent) != 1 || !strings.Contains((*sent)[0].Content, "live branch answer") {
+				t.Fatalf("Graph finals = %#v, want one live-branch answer", *sent)
+			}
+			if err := bridge.completeQueuedTurnWithResult(ctx, session, turn, session.ChatID, beacon.TurnExecutionPlan{}, result); err != nil {
+				t.Fatalf("repeat idempotent completion: %v", err)
+			}
+			if err := bridge.flushPendingOutboxForChat(ctx, session.ChatID); err != nil {
+				t.Fatalf("flush after repeated completion: %v", err)
+			}
+			if len(*sent) != 1 {
+				t.Fatalf("repeated completion posted duplicate final: %#v", *sent)
+			}
+		})
+	}
+}
+
+func TestBridgeHistoricalTranscriptGuardStillAppliesOutsideLiveBranch(t *testing.T) {
+	ctx := context.Background()
+	graph, _ := newBridgeTestGraph(t)
+	store := newBridgeTestStore(t)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	session := bridge.reg.SessionByChatID("chat-1")
+	session.CodexThreadID = "thread-not-live-branch"
+	session.Cwd = t.TempDir()
+	if err := bridge.ensureDurableSession(ctx, session); err != nil {
+		t.Fatalf("ensureDurableSession: %v", err)
+	}
+	transcriptPath := filepath.Join(t.TempDir(), "session.jsonl")
+	oldLine := `{"timestamp":"2026-09-24T08:00:00Z","type":"event_msg","payload":{"type":"agent_message","id":"old-final","thread_id":"thread-historical","turn_id":"old-codex-turn","phase":"final_answer","message":"historical final"}}`
+	internalLine := `{"timestamp":"2026-09-24T08:01:00Z","type":"event_msg","payload":{"type":"context_compacted"}}`
+	historicalFinalLine := `{"timestamp":"2026-09-24T08:02:00Z","type":"event_msg","payload":{"type":"agent_message","id":"unproven-historical-final","thread_id":"thread-historical","turn_id":"old-codex-turn","phase":"final_answer","message":"unproven historical final"}}`
+	if err := os.WriteFile(transcriptPath, []byte(oldLine+"\n"+internalLine+"\n"+historicalFinalLine+"\n"), 0o600); err != nil {
+		t.Fatalf("write transcript: %v", err)
+	}
+	oldOffset := int64(len(oldLine) + 1)
+	info, err := os.Stat(transcriptPath)
+	if err != nil {
+		t.Fatalf("stat transcript: %v", err)
+	}
+	turn := teamstore.Turn{ID: "turn:not-live-branch", SessionID: session.ID, Status: teamstore.TurnStatusRunning, CodexThreadID: session.CodexThreadID, CodexTurnID: "codex-not-live-branch"}
+	checkpointID := transcriptCheckpointID(session.ID)
+	anchor := teamstore.ExecutionAnchor{
+		SessionID: session.ID, ThreadID: "thread-historical", OuterTurnID: "turn:historical-owner",
+		LiveBranchThreadID: "thread-other-branch", State: executionAnchorStateUnresolved, Generation: 13,
+	}
+	if err := store.Update(ctx, func(state *teamstore.State) error {
+		state.Turns[turn.ID] = turn
+		state.ImportCheckpoints[checkpointID] = teamstore.ImportCheckpoint{
+			ID: checkpointID, SessionID: session.ID, SourcePath: transcriptPath,
+			LastRecordID: "old-final", LastSourceLine: 1, LastOffset: oldOffset, LastOffsetKnown: true,
+			SourceSize: info.Size(), SourceModTime: info.ModTime(),
+			SourceFingerprint: transcriptCheckpointSourceFingerprint(transcriptPath, oldOffset),
+			Status:            importCheckpointStatusComplete, UnresolvedExecution: &anchor,
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("seed non-live-branch checkpoint: %v", err)
+	}
+
+	_, err = bridge.queueActiveTurnTranscriptStatusBeforeFinal(ctx, session, turn)
+	if !errors.Is(err, teamstore.ErrUnresolvedExecution) {
+		t.Fatalf("non-live-branch pre-final error = %v, want ErrUnresolvedExecution", err)
+	}
+	checkpoint, found, err := store.ImportCheckpoint(ctx, checkpointID)
+	if err != nil || !found || checkpoint.LastRecordID != "old-final" || checkpoint.LastOffset != oldOffset {
+		t.Fatalf("non-live-branch checkpoint = %#v found=%v err=%v, want unchanged", checkpoint, found, err)
+	}
+}
+
+func TestBridgeUnresolvedLiveBranchErrorInterruptsAndRevokesBranchAcrossBackends(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		backend := map[bool]string{false: "json", true: "sqlite"}[useSQLite]
+		t.Run(backend, func(t *testing.T) {
+			ctx := context.Background()
+			graph, sent := newBridgeTestGraph(t)
+			store := newBridgeTestStore(t)
+			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+			session := bridge.reg.SessionByChatID("chat-1")
+			session.CodexThreadID = "thread-live-branch"
+			if err := bridge.ensureDurableSession(ctx, session); err != nil {
+				t.Fatalf("ensureDurableSession: %v", err)
+			}
+
+			owner, err := teamstore.CurrentOwner("v-test", "", "", time.Now())
+			if err != nil {
+				t.Fatalf("CurrentOwner: %v", err)
+			}
+			lease, err := store.ClaimControlLease(ctx, teamstore.ControlLeaseClaim{
+				Scope: bridge.scope, Machine: bridge.machine, Owner: owner, Duration: time.Minute, Now: time.Now(),
+			})
+			if err != nil || lease.Mode != teamstore.LeaseModeActive {
+				t.Fatalf("ClaimControlLease = %#v err=%v", lease, err)
+			}
+			bridge.setControlLease(lease.Lease)
+			owner.ScopeID = bridge.scope.ID
+			owner.MachineID = bridge.machine.ID
+			owner.LeaseGeneration = lease.Lease.Generation
+			bridge.setOwner(owner, time.Minute)
+			ownerCtx := withTeamsOwnerCapability(ctx, owner)
+
+			const (
+				turnID           = "turn:ambiguous-live-branch-handler"
+				inboundID        = "inbound:ambiguous-live-branch-handler"
+				oldOuterTurnID   = "turn:historical-owner"
+				historicalThread = "thread:historical-owner"
+				liveBranchThread = "thread-live-branch"
+			)
+			checkpointID := transcriptCheckpointID(session.ID)
+			now := time.Now().UTC()
+			anchor := teamstore.ExecutionAnchor{
+				SessionID: session.ID, ThreadID: historicalThread, LiveBranchThreadID: liveBranchThread,
+				OuterTurnID: oldOuterTurnID, CodexTurnID: "codex:historical-owner",
+				SourcePath: "/tmp/historical-session.jsonl", SourceFingerprint: "historical-fingerprint",
+				Generation: 7, State: executionAnchorStateUnresolved, UpdatedAt: now,
+			}
+			turn := teamstore.Turn{
+				ID: turnID, SessionID: session.ID, ScopeID: bridge.scope.ID,
+				MachineID: bridge.machine.ID, LeaseGeneration: lease.Lease.Generation,
+				InboundEventID: inboundID, Status: teamstore.TurnStatusRunning,
+				CodexThreadID: liveBranchThread, CodexTurnID: "codex:ambiguous-live-branch",
+				StartedAt: now, CreatedAt: now, UpdatedAt: now,
+			}
+			if err := store.Update(ctx, func(state *teamstore.State) error {
+				state.Turns[turnID] = turn
+				state.InboundEvents[inboundID] = teamstore.InboundEvent{
+					ID: inboundID, SessionID: session.ID, TeamsChatID: session.ChatID,
+					TeamsMessageID: "teams-message:ambiguous-live-branch", TurnID: turnID,
+					Status: teamstore.InboundStatusQueued, CreatedAt: now, UpdatedAt: now,
+				}
+				state.ImportCheckpoints[checkpointID] = teamstore.ImportCheckpoint{
+					ID: checkpointID, SessionID: session.ID, ExecutionAnchorGeneration: anchor.Generation,
+					UnresolvedExecution: &anchor, UpdatedAt: now,
+				}
+				return nil
+			}); err != nil {
+				t.Fatalf("seed running live-branch turn: %v", err)
+			}
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate store to SQLite: %v", err)
+				}
+			}
+
+			bridge.handleUnresolvedQueuedTurnError(ownerCtx, session, turn, teamstore.ErrUnresolvedExecution)
+			interrupted, found, err := store.TurnByID(ctx, turnID)
+			if err != nil || !found || interrupted.Status != teamstore.TurnStatusInterrupted {
+				t.Fatalf("ambiguous live-branch turn = %#v found=%v err=%v, want interrupted", interrupted, found, err)
+			}
+			inbound, found, err := store.InboundEventByID(ctx, inboundID)
+			if err != nil || !found || inbound.Status != teamstore.InboundStatusIgnored {
+				t.Fatalf("ambiguous live-branch inbound = %#v found=%v err=%v, want ignored", inbound, found, err)
+			}
+			checkpoint, found, err := store.ImportCheckpoint(ctx, checkpointID)
+			if err != nil || !found || checkpoint.UnresolvedExecution == nil {
+				t.Fatalf("load historical checkpoint: found=%v err=%v checkpoint=%#v", found, err, checkpoint)
+			}
+			if checkpoint.UnresolvedExecution.ThreadID != historicalThread || checkpoint.UnresolvedExecution.OuterTurnID != oldOuterTurnID ||
+				checkpoint.UnresolvedExecution.CodexTurnID != "codex:historical-owner" || checkpoint.UnresolvedExecution.Generation != anchor.Generation ||
+				checkpoint.UnresolvedExecution.SourceFingerprint != anchor.SourceFingerprint || checkpoint.UnresolvedExecution.LiveBranchThreadID != "" {
+				t.Fatalf("error handler rewrote historical anchor or retained ambiguous branch: %#v", checkpoint.UnresolvedExecution)
+			}
+			attention, err := store.OutboxMessageByID(ctx, "outbox:"+turnID+":queued-turn-unresolved")
+			if err != nil || attention.Status != teamstore.OutboxStatusSent {
+				t.Fatalf("unresolved attention outbox = %#v err=%v, want sent", attention, err)
+			}
+			if len(*sent) != 1 || !strings.Contains((*sent)[0].Content, "ownership is still unresolved") {
+				t.Fatalf("Graph attention posts = %#v, want exactly one stable notice", *sent)
+			}
+
+			bridge.handleUnresolvedQueuedTurnError(ownerCtx, session, turn, teamstore.ErrUnresolvedExecution)
+			if len(*sent) != 1 {
+				t.Fatalf("repeated unresolved handling posted duplicate attention: %#v", *sent)
+			}
+		})
 	}
 }
 
@@ -42838,9 +43107,14 @@ func TestBridgeTurnExecutionConfigOverridesSessionSnapshot(t *testing.T) {
 func TestModelAPIKeyPreflightRejectsRawKeysButAllowsRefs(t *testing.T) {
 	reject := []string{
 		"model setup mimo --api-key sk-test",
+		"cxp model-profile setup mimo25 --provider mimo --model pro --api-keymimo-test-key-without-provider-prefix",
+		"cxp model-profile setup mimo25 --provider mimo --model pro --api-keymimo_test_key_without_provider_prefix_012345",
 		"model setup mimo api_key=sk-test",
 		"Authorization: Bearer sk-test",
 		"sk-1234567890abcdef1234567890abcdef",
+		"model setup mimo --api-key-env=sk-test-0123456789abcdef.",
+		"OPENAI_API_KEY=sk-test-0123456789abcdef,",
+		"pasted value (sk-test-0123456789abcdef).",
 	}
 	for _, text := range reject {
 		if !containsRawModelAPIKey(text) {
@@ -42849,7 +43123,9 @@ func TestModelAPIKeyPreflightRejectsRawKeysButAllowsRefs(t *testing.T) {
 	}
 	allow := []string{
 		"model setup mimo --api-key-env MIMO_API_KEY",
+		"model setup mimo --api-key-env=OPENAI_API_KEY",
 		"model setup mimo --api-key-stdin",
+		"model setup mimo --api-key-stdin=prompt",
 		"new /tmp/work --model mimo25",
 	}
 	for _, text := range allow {
@@ -43039,6 +43315,527 @@ func TestBridgeModelProfileTeamsKeyIntakeConsumesRawKeyWithoutLocalTeamsLeak(t *
 	assertFileDoesNotContain(t, controlChatHistoryPathForStore(store), rawKey)
 }
 
+func TestBridgeModelProfileTeamsKeyIntakePollDefersRedactedReceiptAcrossRestart(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			const (
+				messageID = "polled-model-key-intake"
+				code      = "ABCD2345"
+				rawKey    = "sk-poll-intake-0123456789abcdef0123456789"
+			)
+			ctx := context.Background()
+			storePath := filepath.Join(t.TempDir(), "state.json")
+			store, err := teamstore.Open(storePath)
+			if err != nil {
+				t.Fatalf("open %s store: %v", name, err)
+			}
+			t.Cleanup(func() {
+				if err := store.Close(); err != nil {
+					t.Errorf("close %s store: %v", name, err)
+				}
+			})
+			intake := teamstore.ModelProfileKeyIntake{
+				ID: "intake-poll", TeamsChatID: "control-chat", AuthorUserID: "user-1",
+				ProfileName: "compat-work", Provider: "responses-compatible", Model: "example/reasoning-model",
+				Status: teamstore.ModelProfileKeyIntakeConfirmed, ExpiresAt: time.Now().Add(time.Hour),
+			}
+			intake.CodeHash = modelProfileKeyIntakeCodeHash(code, intake)
+			if err := store.UpdateModelProfileKeyIntakes(ctx, func(intakes map[string]teamstore.ModelProfileKeyIntake, _ time.Time) (bool, error) {
+				intakes[intake.ID] = intake
+				return true, nil
+			}); err != nil {
+				t.Fatalf("seed confirmed model-key intake: %v", err)
+			}
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate test store to SQLite: %v", err)
+				}
+				if err := store.PrepareSQLiteSchemaBeforeOwner(ctx); err != nil {
+					t.Fatalf("prepare SQLite schema: %v", err)
+				}
+				if isSQLite, err := store.IsSQLite(ctx); err != nil || !isSQLite {
+					t.Fatalf("test backend is SQLite=%t, err=%v", isSQLite, err)
+				}
+			}
+
+			bridgeMessage := bridgeTestMessageWithText(messageID, "model key "+code+" "+rawKey)
+			bridgeMessage.ChatID = "control-chat"
+			bridgeMessage.CreatedDateTime = "2026-09-24T12:00:00Z"
+			bridgeMessage.LastModifiedDateTime = bridgeMessage.CreatedDateTime
+			graph, _ := newBridgeRetryGraphForChat(t, "control-chat", bridgeMessage)
+			bridge := newBridgeTestBridge(graph, store, nil)
+			manager := &fakeModelProfileManager{saveResult: ModelProfileAPIKeySaveResult{ProfileName: "compat-work", Model: "example/reasoning-model", APIKeyRef: "secret-ref"}}
+			bridge.modelProfileManager = manager
+
+			page, err := pendingPageFromWindowForRole("control-chat", "/chats/control-chat/messages?$top=1", pollFrontierHead, 1,
+				MessageWindow{Messages: []ChatMessage{bridgeMessage}}, false, inboundPollRoleControl)
+			if err != nil {
+				t.Fatalf("stage model-key poll page: %v", err)
+			}
+			page.PollRole = string(inboundPollRoleControl)
+			page.ReceiptID = pendingPageReceiptID(page)
+			window, err := pendingPageToWindow(page)
+			if err != nil {
+				t.Fatalf("decode model-key poll receipt: %v", err)
+			}
+			queueOnly := context.WithValue(ctx, controlPollQueueOnlyContextKey{}, true)
+			result, err := bridge.handlePollMessageWindow(queueOnly, "control-chat", inboundPollRoleControl,
+				teamstore.ChatPollState{ChatID: "control-chat", Seeded: true}, true, window, 10, 0,
+				func(ctx context.Context, msg ChatMessage, text string) error {
+					return bridge.handleControlMessage(ctx, msg, text)
+				})
+			if err != nil || !result.Handled || !result.Progressed {
+				t.Fatalf("queue-only key-intake poll = %#v, err=%v", result, err)
+			}
+			if got := manager.saveRequestCount(); got != 0 {
+				t.Fatalf("queue-only poll saved the key %d times; secret-store mutation must wait for foreground recovery", got)
+			}
+			state, err := store.Load(ctx)
+			if err != nil {
+				t.Fatalf("load deferred key-intake state: %v", err)
+			}
+			var deferred teamstore.InboundEvent
+			for _, inbound := range state.InboundEvents {
+				if inbound.TeamsChatID == "control-chat" && inbound.TeamsMessageID == messageID {
+					deferred = inbound
+				}
+			}
+			if deferred.ID == "" || deferred.Status != teamstore.InboundStatusDeferred || deferred.Source != deferredModelProfileKeyIntakeInboundSource ||
+				deferred.Text != deferredModelProfileKeyIntakeInboundText || strings.Contains(deferred.TeamsBodyHTML, rawKey) {
+				t.Fatalf("deferred inbound is not a redacted durable hand-off: %#v", deferred)
+			}
+			assertFileDoesNotContain(t, store.Path(), rawKey)
+			if useSQLite {
+				sqlitePath := filepath.Join(filepath.Dir(store.Path()), teamstore.SQLiteFileName)
+				assertFileDoesNotContain(t, sqlitePath, rawKey)
+				assertFileDoesNotContain(t, sqlitePath+"-wal", rawKey)
+				controlHistorySQLitePath := teamsLedgerSQLitePath(controlChatHistoryPathForStore(store))
+				assertFileDoesNotContain(t, controlHistorySQLitePath, rawKey)
+				assertFileDoesNotContain(t, controlHistorySQLitePath+"-wal", rawKey)
+			}
+
+			// Reopen the durable store before foreground replay to prove the
+			// hand-off does not rely on the in-memory Graph page or message body.
+			if err := store.Close(); err != nil {
+				t.Fatalf("close store before restart replay: %v", err)
+			}
+			store, err = teamstore.Open(storePath)
+			if err != nil {
+				t.Fatalf("reopen %s store: %v", name, err)
+			}
+			bridge.store = store
+			if err := bridge.processDeferredInbound(ctx); err != nil {
+				t.Fatalf("foreground deferred model-key replay: %v", err)
+			}
+			if got := manager.saveRequestCount(); got != 1 || manager.saveRequestAt(0).APIKey != rawKey {
+				t.Fatalf("foreground key save calls=%d, key matched=%v; want one exact secret-store write", got, got == 1 && manager.saveRequestAt(0).APIKey == rawKey)
+			}
+			state, err = store.Load(ctx)
+			if err != nil {
+				t.Fatalf("load completed key-intake state: %v", err)
+			}
+			for _, inbound := range state.InboundEvents {
+				if inbound.TeamsChatID == "control-chat" && inbound.TeamsMessageID == messageID {
+					if inbound.Status != teamstore.InboundStatusIgnored || strings.Contains(inbound.Text, rawKey) || strings.Contains(inbound.TeamsBodyHTML, rawKey) {
+						t.Fatalf("completed key-intake inbound retained secret or is nonterminal: %#v", inbound)
+					}
+				}
+			}
+			assertFileDoesNotContain(t, store.Path(), rawKey)
+			assertFileDoesNotContain(t, controlChatHistoryPathForStore(store), rawKey)
+			if useSQLite {
+				sqlitePath := filepath.Join(filepath.Dir(store.Path()), teamstore.SQLiteFileName)
+				assertFileDoesNotContain(t, sqlitePath, rawKey)
+				assertFileDoesNotContain(t, sqlitePath+"-wal", rawKey)
+				controlHistorySQLitePath := teamsLedgerSQLitePath(controlChatHistoryPathForStore(store))
+				assertFileDoesNotContain(t, controlHistorySQLitePath, rawKey)
+				assertFileDoesNotContain(t, controlHistorySQLitePath+"-wal", rawKey)
+			}
+		})
+	}
+}
+
+func TestBridgeQueueOnlyControlRejectsMalformedModelKeyRouteWithoutPersistingSecret(t *testing.T) {
+	const (
+		messageID           = "malformed-model-key-command"
+		attachmentMessageID = "attachment-model-key-command"
+		rawKey              = "sk-malformed-route-0123456789abcdef0123456789"
+	)
+	ctx := context.WithValue(context.Background(), controlPollQueueOnlyContextKey{}, true)
+	store := newBridgeTestStore(t)
+	graph, _ := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, store, nil)
+	bridge.reg.ControlChatID = "control-chat"
+	message := bridgeTestMessageWithText(messageID, "model key ABCD2345 "+rawKey+" extra")
+	message.ChatID = "control-chat"
+	if err := bridge.handleControlMessage(ctx, message, promptTextFromTeamsMessageHTML(message.Body.Content)); err != nil {
+		t.Fatalf("queue-only malformed model-key command: %v", err)
+	}
+	withCredentialAttachment := bridgeTestMessageWithText(attachmentMessageID, "model key ABCD2345 "+rawKey)
+	withCredentialAttachment.ChatID = "control-chat"
+	withCredentialAttachment.Attachments = []MessageAttachment{{ContentType: "text/plain", Name: "key.txt", Content: rawKey}}
+	if err := bridge.handleControlMessage(ctx, withCredentialAttachment, promptTextFromTeamsMessageHTML(withCredentialAttachment.Body.Content)); err != nil {
+		t.Fatalf("queue-only model-key command with credential attachment: %v", err)
+	}
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load rejected model-key state: %v", err)
+	}
+	found := map[string]bool{}
+	for _, inbound := range state.InboundEvents {
+		if inbound.TeamsChatID != "control-chat" || (inbound.TeamsMessageID != messageID && inbound.TeamsMessageID != attachmentMessageID) {
+			continue
+		}
+		found[inbound.TeamsMessageID] = true
+		if inbound.Status != teamstore.InboundStatusIgnored || inbound.Source != rejectedModelAPIKeyInboundSource ||
+			strings.Contains(inbound.Text, rawKey) || strings.Contains(inbound.TeamsBodyHTML, rawKey) || len(inbound.TeamsAttachments) != 0 {
+			t.Fatalf("malformed model-key inbound was not terminally redacted: %#v", inbound)
+		}
+	}
+	if !found[messageID] || !found[attachmentMessageID] {
+		t.Fatalf("model-key rejection durable rows found = %v, want both malformed body and credential attachment", found)
+	}
+	assertFileDoesNotContain(t, store.Path(), rawKey)
+	assertFileDoesNotContain(t, controlChatHistoryPathForStore(store), rawKey)
+}
+
+func TestBridgeLegacyDeferredControlKeyIsRedactedBeforeManualHold(t *testing.T) {
+	const (
+		messageID = "legacy-deferred-model-key"
+		rawKey    = "sk-legacy-deferred-0123456789abcdef0123456789"
+	)
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	graph, _ := newBridgeTestGraph(t)
+	bridge := newBridgeTestBridge(graph, store, nil)
+	bridge.reg.ControlChatID = "control-chat"
+	message := bridgeTestMessageWithText(messageID, "model key ABCD2345 "+rawKey)
+	message.ChatID = "control-chat"
+	legacy, created, err := bridge.persistControlInboundWithStatus(ctx, message, teamstore.InboundStatusDeferred, "teams_control_poll_deferred")
+	if err != nil || !created {
+		t.Fatalf("seed legacy deferred control row: created=%t err=%v", created, err)
+	}
+	if !strings.Contains(legacy.Text, rawKey) {
+		t.Fatal("legacy fixture did not contain the test credential")
+	}
+	if err := bridge.processDeferredControlPollInbound(ctx, legacy); err != nil {
+		t.Fatalf("redact and reclassify legacy deferred key: %v", err)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load sanitized legacy deferred row: %v", err)
+	}
+	var found bool
+	for _, inbound := range state.InboundEvents {
+		if inbound.ID != legacy.ID {
+			continue
+		}
+		found = true
+		if inbound.Status != teamstore.InboundStatusDeferred || inbound.Source != deferredModelProfileKeyIntakeInboundSource ||
+			inbound.Text != deferredModelProfileKeyIntakeInboundText || strings.Contains(inbound.TeamsBodyHTML, rawKey) || len(inbound.TeamsAttachments) != 0 {
+			t.Fatalf("legacy key intake was not converted to a redacted refetch receipt: %#v", inbound)
+		}
+	}
+	if !found {
+		t.Fatal("sanitized legacy inbound disappeared")
+	}
+	assertFileDoesNotContain(t, store.Path(), rawKey)
+}
+
+func TestBridgeScrubsLegacyCredentialPayloadsOnlyFromHeldControlPollRows(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			const rawKey = "sk-legacy-held-0123456789abcdef0123456789"
+			ctx := context.Background()
+			store, err := teamstore.Open(filepath.Join(t.TempDir(), "state.json"))
+			if err != nil {
+				t.Fatalf("open %s store: %v", name, err)
+			}
+			t.Cleanup(func() {
+				if err := store.Close(); err != nil {
+					t.Errorf("close %s store: %v", name, err)
+				}
+			})
+			bridge := newBridgeTestBridge(nil, store, nil)
+			bridge.reg.ControlChatID = "control-chat"
+			credential := bridgeTestMessageWithText("legacy-held-credential", "model key ABCD2345 "+rawKey)
+			credential.ChatID = "control-chat"
+			credential.Attachments = []MessageAttachment{{ContentType: "text/plain", Name: "key.txt", Content: rawKey}}
+			legacy, created, err := bridge.persistControlInboundWithStatus(ctx, credential, teamstore.InboundStatusManualHold, "teams_control_poll_deferred")
+			if err != nil || !created {
+				t.Fatalf("seed held legacy credential row: created=%t err=%v", created, err)
+			}
+			credentialRows := []teamstore.InboundEvent{legacy}
+			credentialByMessage := map[string]string{legacy.TeamsMessageID: rawKey}
+			decoy := bridgeTestMessageWithText("legacy-held-credential-00-decoy", "ordinary note: --api-key placeholder")
+			decoy.ChatID = "control-chat"
+			decoyInbound, created, err := bridge.persistControlInboundWithStatus(ctx, decoy, teamstore.InboundStatusManualHold, "teams_control_poll_deferred")
+			if err != nil || !created {
+				t.Fatalf("seed non-credential search decoy: created=%t err=%v", created, err)
+			}
+			for i := 1; i < legacyControlCredentialScrubBatchSize+3; i++ {
+				messageID := fmt.Sprintf("legacy-held-credential-%02d", i)
+				key := fmt.Sprintf("sk-legacy-held-%02d-0123456789abcdef0123456789", i)
+				body := "model key ABCD2345 " + key
+				if i == 1 {
+					// Explicit model-key intake accepts flexible whitespace and treats
+					// any inline value as secret, even when it does not use the common
+					// sk-* token shape. Candidate search must conservatively include it.
+					key = "vendor-secret-token-0123456789abcdef"
+					body = "model  key ABCD2345 " + key
+				}
+				message := bridgeTestMessageWithText(messageID, body)
+				message.ChatID = "control-chat"
+				inbound, created, err := bridge.persistControlInboundWithStatus(ctx, message, teamstore.InboundStatusManualHold, "teams_control_poll_deferred")
+				if err != nil || !created {
+					t.Fatalf("seed held legacy credential row %d: created=%t err=%v", i, created, err)
+				}
+				credentialRows = append(credentialRows, inbound)
+				credentialByMessage[messageID] = key
+			}
+			plain := bridgeTestMessageWithText("legacy-held-plain", "ordinary held control command")
+			plain.ChatID = "control-chat"
+			plainInbound, created, err := bridge.persistControlInboundWithStatus(ctx, plain, teamstore.InboundStatusManualHold, "teams_control_poll_deferred")
+			if err != nil || !created {
+				t.Fatalf("seed ordinary held control row: created=%t err=%v", created, err)
+			}
+			unrelated := bridgeTestMessageWithText("unrelated-held-credential", "do not alter "+rawKey)
+			unrelated.ChatID = "control-chat"
+			unrelatedInbound, created, err := bridge.persistControlInboundWithStatus(ctx, unrelated, teamstore.InboundStatusManualHold, "teams_control_new")
+			if err != nil || !created {
+				t.Fatalf("seed unrelated held credential row: created=%t err=%v", created, err)
+			}
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate test store to SQLite: %v", err)
+				}
+				if err := store.PrepareSQLiteSchemaBeforeOwner(ctx); err != nil {
+					t.Fatalf("prepare SQLite schema: %v", err)
+				}
+			}
+			if err := bridge.scrubLegacyManualHoldControlCredentials(ctx); err != nil {
+				t.Fatalf("scrub legacy credential rows: %v", err)
+			}
+			state, err := store.Load(ctx)
+			if err != nil {
+				t.Fatalf("load first scrub page: %v", err)
+			}
+			scrubbedCount := 0
+			for _, candidate := range credentialRows {
+				scrubbed := state.InboundEvents[candidate.ID]
+				if scrubbed.Source == legacyRedactedControlPollInboundSource {
+					scrubbedCount++
+					if scrubbed.Status != teamstore.InboundStatusManualHold || scrubbed.Text != legacyRedactedControlPollInboundText ||
+						strings.Contains(legacyControlCredentialPayload(scrubbed), credentialByMessage[scrubbed.TeamsMessageID]) || len(scrubbed.TeamsAttachments) != 0 {
+						t.Fatalf("legacy credential row was not redacted without changing its hold: %#v", scrubbed)
+					}
+				} else if scrubbed.Status != teamstore.InboundStatusManualHold || scrubbed.Source != "teams_control_poll_deferred" {
+					t.Fatalf("legacy credential page lost its durable manual hold: %#v", scrubbed)
+				}
+			}
+			if scrubbedCount != legacyControlCredentialScrubBatchSize-1 {
+				t.Fatalf("first scrub page changed %d credential rows, want page size %d after filtering one decoy", scrubbedCount, legacyControlCredentialScrubBatchSize)
+			}
+			if err := bridge.scrubLegacyManualHoldControlCredentials(ctx); err != nil {
+				t.Fatalf("scrub remaining credential rows: %v", err)
+			}
+			state, err = store.Load(ctx)
+			if err != nil {
+				t.Fatalf("load fully scrubbed state: %v", err)
+			}
+			for _, candidate := range credentialRows {
+				scrubbed := state.InboundEvents[candidate.ID]
+				if scrubbed.Status != teamstore.InboundStatusManualHold || scrubbed.Source != legacyRedactedControlPollInboundSource ||
+					scrubbed.Text != legacyRedactedControlPollInboundText || strings.Contains(legacyControlCredentialPayload(scrubbed), credentialByMessage[scrubbed.TeamsMessageID]) ||
+					len(scrubbed.TeamsAttachments) != 0 {
+					t.Fatalf("credential row was skipped by bounded scrub pagination: %#v", scrubbed)
+				}
+			}
+			if got := state.InboundEvents[plainInbound.ID]; got.Text != "ordinary held control command" ||
+				got.Status != teamstore.InboundStatusManualHold || got.Source != "teams_control_poll_deferred" {
+				t.Fatalf("ordinary held control row changed during credential scrub: %#v", got)
+			}
+			if got := state.InboundEvents[unrelatedInbound.ID]; !strings.Contains(got.Text, rawKey) || got.Source != "teams_control_new" {
+				t.Fatalf("scrub escaped the legacy source scope: %#v", got)
+			}
+			if got := state.InboundEvents[decoyInbound.ID]; got.Text != "ordinary note: --api-key placeholder" ||
+				got.Status != teamstore.InboundStatusManualHold || got.Source != "teams_control_poll_deferred" {
+				t.Fatalf("non-credential search decoy was redacted: %#v", got)
+			}
+			if err := bridge.scrubLegacyManualHoldControlCredentials(ctx); err != nil {
+				t.Fatalf("finish legacy credential scan: %v", err)
+			}
+		})
+	}
+}
+
+func TestBridgeDeferredModelKeyRefetchRejectsCredentialAttachment(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			const (
+				messageID = "deferred-model-key-with-attachment"
+				code      = "ABCD2345"
+				bodyKey   = "sk-body-key-0123456789abcdef0123456789"
+				fileKey   = "sk-attachment-key-0123456789abcdef0123456789"
+			)
+			ctx := context.Background()
+			store, err := teamstore.Open(filepath.Join(t.TempDir(), "state.json"))
+			if err != nil {
+				t.Fatalf("open %s store: %v", name, err)
+			}
+			t.Cleanup(func() {
+				if err := store.Close(); err != nil {
+					t.Errorf("close %s store: %v", name, err)
+				}
+			})
+			intake := teamstore.ModelProfileKeyIntake{
+				ID: "intake-refetch-attachment", TeamsChatID: "control-chat", AuthorUserID: "user-1",
+				ProfileName: "compat-work", Provider: "responses-compatible", Model: "example/reasoning-model",
+				Status: teamstore.ModelProfileKeyIntakeConfirmed, ExpiresAt: time.Now().Add(time.Hour),
+			}
+			intake.CodeHash = modelProfileKeyIntakeCodeHash(code, intake)
+			if err := store.UpdateModelProfileKeyIntakes(ctx, func(intakes map[string]teamstore.ModelProfileKeyIntake, _ time.Time) (bool, error) {
+				intakes[intake.ID] = intake
+				return true, nil
+			}); err != nil {
+				t.Fatalf("seed confirmed key intake: %v", err)
+			}
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate test store to SQLite: %v", err)
+				}
+				if err := store.PrepareSQLiteSchemaBeforeOwner(ctx); err != nil {
+					t.Fatalf("prepare SQLite schema: %v", err)
+				}
+			}
+			bridge := bridgeTestMessageWithText(messageID, "model key "+code+" "+bodyKey)
+			bridge.ChatID = "control-chat"
+			seedBridge := newBridgeTestBridge(nil, store, nil)
+			seedBridge.reg.ControlChatID = "control-chat"
+			if err := seedBridge.persistDeferredModelProfileKeyIntakeInbound(ctx, bridge); err != nil {
+				t.Fatalf("persist redacted deferred receipt: %v", err)
+			}
+			refetched := bridge
+			refetched.Attachments = []MessageAttachment{{ContentType: "text/plain", Name: "key.txt", Content: fileKey}}
+			graph, _ := newBridgeRetryGraphForChat(t, "control-chat", refetched)
+			processor := newBridgeTestBridge(graph, store, nil)
+			processor.reg.ControlChatID = "control-chat"
+			processor.user = User{ID: "user-1"}
+			manager := &fakeModelProfileManager{}
+			processor.modelProfileManager = manager
+			if err := processor.processDeferredInbound(ctx); err != nil {
+				t.Fatalf("process deferred message with credential attachment: %v", err)
+			}
+			if got := manager.saveRequestCount(); got != 0 {
+				t.Fatalf("credential attachment reached secret manager %d times; want rejection before mutation", got)
+			}
+			state, err := store.Load(ctx)
+			if err != nil {
+				t.Fatalf("load redacted inbound: %v", err)
+			}
+			var found bool
+			for _, inbound := range state.InboundEvents {
+				if inbound.TeamsChatID != "control-chat" || inbound.TeamsMessageID != messageID {
+					continue
+				}
+				found = true
+				if inbound.Status != teamstore.InboundStatusIgnored || inbound.Source != rejectedModelAPIKeyInboundSource ||
+					strings.Contains(inbound.Text, bodyKey) || strings.Contains(inbound.Text, fileKey) ||
+					strings.Contains(inbound.TeamsBodyHTML, bodyKey) || strings.Contains(inbound.TeamsBodyHTML, fileKey) || len(inbound.TeamsAttachments) != 0 {
+					t.Fatalf("credential-bearing refetch was not durably rejected and redacted: %#v", inbound)
+				}
+			}
+			if !found {
+				t.Fatal("deferred inbound disappeared after credential rejection")
+			}
+			assertFileDoesNotContain(t, store.Path(), bodyKey)
+			assertFileDoesNotContain(t, store.Path(), fileKey)
+			assertFileDoesNotContain(t, controlChatHistoryPathForStore(store), bodyKey)
+			assertFileDoesNotContain(t, controlChatHistoryPathForStore(store), fileKey)
+			if useSQLite {
+				sqlitePath := filepath.Join(filepath.Dir(store.Path()), teamstore.SQLiteFileName)
+				for _, secret := range []string{bodyKey, fileKey} {
+					assertFileDoesNotContain(t, sqlitePath, secret)
+					assertFileDoesNotContain(t, sqlitePath+"-wal", secret)
+				}
+			}
+		})
+	}
+}
+
+func TestBridgeDeferredModelKeySavingStateIsNotMarkedTerminal(t *testing.T) {
+	const (
+		messageID = "deferred-model-key-saving"
+		code      = "ABCD2345"
+		rawKey    = "sk-saving-state-0123456789abcdef0123456789"
+	)
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	intake := teamstore.ModelProfileKeyIntake{
+		ID: "intake-saving", TeamsChatID: "control-chat", AuthorUserID: "user-1",
+		ProfileName: "compat-work", Provider: "responses-compatible", Model: "example/reasoning-model",
+		Status: teamstore.ModelProfileKeyIntakeSaving, UpdatedAt: time.Now().UTC(), ExpiresAt: time.Now().Add(time.Hour),
+	}
+	intake.CodeHash = modelProfileKeyIntakeCodeHash(code, intake)
+	if err := store.UpdateModelProfileKeyIntakes(ctx, func(intakes map[string]teamstore.ModelProfileKeyIntake, _ time.Time) (bool, error) {
+		intakes[intake.ID] = intake
+		return true, nil
+	}); err != nil {
+		t.Fatalf("seed interrupted saving intake: %v", err)
+	}
+	message := bridgeTestMessageWithText(messageID, "model key "+code+" "+rawKey)
+	message.ChatID = "control-chat"
+	graph, _ := newBridgeRetryGraphForChat(t, "control-chat", message)
+	bridge := newBridgeTestBridge(graph, store, nil)
+	bridge.reg.ControlChatID = "control-chat"
+	manager := &fakeModelProfileManager{}
+	bridge.modelProfileManager = manager
+	if err := bridge.persistDeferredModelProfileKeyIntakeInbound(ctx, message); err != nil {
+		t.Fatalf("persist redacted deferred key receipt: %v", err)
+	}
+	if err := bridge.processDeferredInbound(ctx); err != nil {
+		t.Fatalf("hold ambiguous interrupted save: %v", err)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load interrupted-save disposition: %v", err)
+	}
+	var found bool
+	for _, inbound := range state.InboundEvents {
+		if inbound.TeamsChatID != "control-chat" || inbound.TeamsMessageID != messageID {
+			continue
+		}
+		found = true
+		if inbound.Status != teamstore.InboundStatusManualHold || strings.Contains(inbound.Text, rawKey) || strings.Contains(inbound.TeamsBodyHTML, rawKey) {
+			t.Fatalf("ambiguous save was incorrectly retired or retained its secret: %#v", inbound)
+		}
+	}
+	if !found {
+		t.Fatal("interrupted save has no durable inbound disposition")
+	}
+	if got := manager.saveRequestCount(); got != 0 {
+		t.Fatalf("ambiguous Saving state triggered %d unproven duplicate secret writes", got)
+	}
+	for _, persisted := range state.ModelProfileKeyIntakes {
+		if persisted.ID == intake.ID && persisted.Status != teamstore.ModelProfileKeyIntakeSaving {
+			t.Fatalf("ambiguous model-key state changed to %q without reconciliation", persisted.Status)
+		}
+	}
+	assertFileDoesNotContain(t, store.Path(), rawKey)
+}
+
 func TestBridgeModelProfileTeamsKeyIntakeRejectsWrongUnconfirmedAndExpiredCodes(t *testing.T) {
 	ctx := context.Background()
 	store := newBridgeTestStore(t)
@@ -43094,7 +43891,7 @@ func TestBridgeModelProfileTeamsKeyIntakeRejectsWrongUnconfirmedAndExpiredCodes(
 	}
 }
 
-func TestBridgeModelProfileTeamsKeyIntakeSanitizesSaveErrors(t *testing.T) {
+func TestBridgeModelProfileTeamsKeyIntakeSaveErrorsRemainInRedactedSavingHold(t *testing.T) {
 	ctx := context.Background()
 	store := newBridgeTestStore(t)
 	graph, sent := newBridgeTestGraph(t)
@@ -43118,11 +43915,28 @@ func TestBridgeModelProfileTeamsKeyIntakeSanitizesSaveErrors(t *testing.T) {
 	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("confirm-error"), "model key confirm ERR23456"); err != nil {
 		t.Fatalf("confirm key intake: %v", err)
 	}
-	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("save-error"), "model key ERR23456 "+rawKey); err != nil {
-		t.Fatalf("save key intake with sanitized manager error: %v", err)
+	if err := bridge.handleControlMessage(ctx, bridgeTestMessage("save-error"), "model key ERR23456 "+rawKey); !errors.Is(err, errModelProfileKeyIntakeSaveOutcomeUnknown) {
+		t.Fatalf("save key intake error = %v, want an explicit unknown-outcome hold", err)
 	}
 	if got := manager.saveRequestCount(); got != 1 {
 		t.Fatalf("SaveModelProfileAPIKey calls = %d, want 1", got)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load ambiguous model-key save: %v", err)
+	}
+	var savingFound bool
+	for _, intake := range state.ModelProfileKeyIntakes {
+		if intake.ProfileName != "compat-work" {
+			continue
+		}
+		savingFound = true
+		if intake.Status != teamstore.ModelProfileKeyIntakeSaving || intake.LastError != errModelProfileKeyIntakeSaveOutcomeUnknown.Error() || strings.Contains(intake.LastError, rawKey) {
+			t.Fatalf("manager error was not kept in a redacted ambiguous Saving state: %#v", intake)
+		}
+	}
+	if !savingFound {
+		t.Fatal("ambiguous Saving state was not persisted")
 	}
 	assertFileDoesNotContain(t, store.Path(), rawKey)
 	assertFileDoesNotContain(t, controlChatHistoryPathForStore(store), rawKey)
@@ -43174,11 +43988,8 @@ func TestBridgeModelProfileTeamsKeyIntakeClaimsConcurrentSave(t *testing.T) {
 	}
 
 	secondMessage, err := bridge.completeModelProfileKeyIntake(ctx, bridgeTestMessage("save-claim-2"), "CLAIM123", "sk-second-concurrent-secret")
-	if err != nil {
-		t.Fatalf("second concurrent save returned error: %v", err)
-	}
-	if !strings.Contains(secondMessage, "already being saved") {
-		t.Fatalf("second concurrent save message = %q, want already-being-saved response", secondMessage)
+	if !errors.Is(err, errModelProfileKeyIntakeSaveInProgress) || secondMessage != "" {
+		t.Fatalf("second concurrent save = (%q, %v), want an explicit in-progress hold", secondMessage, err)
 	}
 	if got := manager.saveRequestCount(); got != 1 {
 		t.Fatalf("SaveModelProfileAPIKey calls while first save blocked = %d, want 1", got)
@@ -43331,6 +44142,477 @@ func bridgeTestMessageWithText(id string, text string) ChatMessage {
 	msg.Body.ContentType = "html"
 	msg.Body.Content = text
 	return msg
+}
+
+func TestBridgePollPersistsRedactedIgnoredInboundBeforeCompletingCredentialRejectionEvenWhenRegistryAlreadySeen(t *testing.T) {
+	const (
+		messageID = "message-rejected-credential"
+		fakeKey   = "mimo_key_redacted_without_provider_prefix_0123456789"
+	)
+	store := newBridgeTestStore(t)
+	graph, sent := newBridgePollAndSendGraph(t, nil)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	bridge.registryPath = filepath.Join(t.TempDir(), "teams", "scopes", "scope-current", "registry.json")
+	bridge.groupChatGuardEnabled = true
+	if err := os.MkdirAll(filepath.Dir(bridge.registryPath), 0o700); err != nil {
+		t.Fatalf("create scoped registry directory: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(filepath.Dir(store.Path()), "teams"), 0o700); err != nil {
+		t.Fatalf("create global outbound ledger directory: %v", err)
+	}
+	session := bridge.reg.Sessions[0]
+	chatID := session.ChatID
+	bridge.cacheChatAudience(chatID, chatAudienceSnapshot{Mode: chatAudienceMultiMember})
+	msg := bridgePollMessage(messageID, "2026-09-24T12:00:00Z", "@codex cxp model-profile setup mimo25 --provider mimo --model pro --api-key"+fakeKey)
+	msg.ChatID = chatID
+	page, err := pendingPageFromWindowForRole(chatID, "/chats/"+chatID+"/messages?$top=1", pollFrontierHead, 1,
+		MessageWindow{Messages: []ChatMessage{msg}}, false, inboundPollRoleWork)
+	if err != nil {
+		t.Fatalf("stage redacted credential page: %v", err)
+	}
+	if strings.Contains(string(page.Records[0]), fakeKey) || page.Dispositions[0] != pollPageDispositionRejectedAPIKeyMentioned {
+		t.Fatal("durable credential receipt retained the key or lost its Codex mention disposition")
+	}
+	window, err := pendingPageToWindow(page)
+	if err != nil || len(window.Messages) != 1 || !window.Messages[0].rejectedModelAPIKeyMentionedForPoll {
+		t.Fatalf("replay redacted credential page = %#v, err=%v", window, err)
+	}
+	poll := teamstore.ChatPollState{ChatID: chatID, Seeded: true}
+	handle := func(ctx context.Context, msg ChatMessage, text string) error {
+		return bridge.handleResolvedSessionMessageWithQueueState(ctx, &session, chatID, msg, text, nil, nil)
+	}
+
+	// The registry can be ahead of the durable inbound disposition after an
+	// earlier cursor-only observation. A cache hit must not suppress writing the
+	// redacted terminal record for this credential message.
+	bridge.markRegistrySeen(chatID, messageID)
+	result, err := bridge.handlePollMessageWindow(context.Background(), chatID, inboundPollRoleWork, poll, true, window, 20, 0, handle)
+	if err != nil {
+		t.Fatalf("poll credential rejection: %v", err)
+	}
+	if !result.Handled || !result.Progressed {
+		t.Fatalf("poll credential rejection result = %#v, want handled durable terminal disposition", result)
+	}
+	if !bridge.registryHasSeenOrSentForPoll(chatID, messageID) {
+		t.Fatal("terminally rejected message was not added to the local seen projection")
+	}
+
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load rejected inbound state: %v", err)
+	}
+	var rejected teamstore.InboundEvent
+	for _, inbound := range state.InboundEvents {
+		if inbound.TeamsChatID == chatID && inbound.TeamsMessageID == messageID {
+			rejected = inbound
+			break
+		}
+	}
+	if rejected.ID == "" {
+		t.Fatal("credential-rejected message has no durable inbound disposition")
+	}
+	if rejected.Status != teamstore.InboundStatusIgnored || rejected.Source != rejectedModelAPIKeyInboundSource {
+		t.Fatalf("rejected inbound disposition = status %q source %q, want ignored Teams terminal", rejected.Status, rejected.Source)
+	}
+	if rejected.Text != rejectedModelAPIKeyInboundText || strings.Contains(rejected.Text, fakeKey) || strings.Contains(rejected.TeamsBodyHTML, fakeKey) {
+		t.Fatalf("rejected inbound was not safely redacted: text=%q body_type=%q", rejected.Text, rejected.TeamsBodyType)
+	}
+	if len(state.Turns) != 0 {
+		t.Fatalf("credential-rejected message unexpectedly created turns: %#v", state.Turns)
+	}
+	assertFileDoesNotContain(t, store.Path(), fakeKey)
+
+	ledgerPath, ok := globalInboundLedgerPathForRegistry(bridge.registryPath)
+	if !ok {
+		t.Fatal("test registry path did not enable the durable global inbound ledger")
+	}
+	ledger, err := readGlobalInboundLedger(ledgerPath)
+	if err != nil {
+		t.Fatalf("read global inbound completion: %v", err)
+	}
+	if item := ledger.Items[globalInboundKey(chatID, messageID)]; item.Status != "done" {
+		t.Fatalf("global inbound disposition = %#v, want done after redacted terminal inbound is durable", item)
+	}
+	if len(*sent) != 1 || !strings.Contains((*sent)[0].Content, "I cannot accept raw API keys") || strings.Contains((*sent)[0].Content, fakeKey) {
+		t.Fatalf("credential rejection response = %#v, want one safe warning", *sent)
+	}
+
+	// A later Graph page replay must observe the durable ignored event/local
+	// seen projection rather than create another inbound, turn, or warning.
+	if _, err := bridge.handlePollMessageWindow(context.Background(), chatID, inboundPollRoleWork, poll, true, window, 20, 0, handle); err != nil {
+		t.Fatalf("replay credential-rejected page: %v", err)
+	}
+	if len(*sent) != 1 {
+		t.Fatalf("credential rejection replay sent %d warnings, want exactly one", len(*sent))
+	}
+}
+
+func TestBridgePollRedactsLegacyPendingReceiptBeforeHandlerDispatch(t *testing.T) {
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			testBridgePollRedactsLegacyPendingReceiptBeforeHandlerDispatch(t, useSQLite)
+		})
+	}
+}
+
+func testBridgePollRedactsLegacyPendingReceiptBeforeHandlerDispatch(t *testing.T, useSQLite bool) {
+	const (
+		chatID    = "chat-1"
+		messageID = "legacy-pending-credential"
+		fakeKey   = "mimo_key_pending_cas_without_provider_prefix_0123456789"
+	)
+	ctx := context.Background()
+	store := newBridgeTestStore(t)
+	if _, _, err := store.CreateSession(ctx, teamstore.SessionContext{ID: "s001", Status: teamstore.SessionStatusActive, TeamsChatID: chatID}); err != nil {
+		t.Fatalf("create work session: %v", err)
+	}
+	bridge := newBridgeTestBridge(newBridgePollGraph(t, nil), store, &recordingExecutor{})
+	bridge.registryPath = filepath.Join(t.TempDir(), "registry.json")
+	bridge.reg.ControlChatID = ""
+	bridge.reg.Sessions = []Session{{ID: "s001", ChatID: chatID, Status: string(teamstore.SessionStatusActive)}}
+	message := bridgePollMessage(messageID, "2026-09-24T12:00:00Z", "@codex cxp model-profile setup mimo25 --provider mimo --model pro --api-key"+fakeKey)
+	message.ChatID = chatID
+	initialPoll := teamstore.ChatPollState{ChatID: chatID, Seeded: true, PollState: inboundPollStateWarm, FrontierEpoch: 1}
+	frontier, requestPath, _ := pollPageRequestForState(chatID, 20, inboundPollRoleWork, initialPoll)
+	page, err := pendingPageFromWindowForRole(chatID, requestPath, frontier, 1, MessageWindow{Messages: []ChatMessage{bridgePollMessage(messageID, message.CreatedDateTime, "ordinary placeholder")}}, false, inboundPollRoleWork)
+	if err != nil {
+		t.Fatalf("build legacy pending receipt: %v", err)
+	}
+	legacyRaw, err := json.Marshal(message)
+	if err != nil {
+		t.Fatalf("marshal legacy pending record: %v", err)
+	}
+	legacyHash := sha256.Sum256(legacyRaw)
+	page.Records[0] = json.RawMessage(legacyRaw)
+	page.RecordHashes[0] = hex.EncodeToString(legacyHash[:])
+	page.Dispositions[0] = "received"
+	page.PollRole = string(inboundPollRoleWork)
+	page.ReceiptID = pendingPageReceiptID(page)
+	if _, _, err := store.UpdateChatPoll(ctx, chatID, func(poll *teamstore.ChatPollState) error {
+		poll.ChatID = chatID
+		poll.Seeded = true
+		poll.PollState = inboundPollStateWarm
+		poll.FrontierEpoch = 1
+		poll.PendingPage = page
+		return nil
+	}); err != nil {
+		t.Fatalf("seed legacy pending receipt: %v", err)
+	}
+	if useSQLite {
+		if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+			t.Fatalf("migrate legacy receipt fixture to SQLite: %v", err)
+		}
+	}
+
+	called := false
+	handled, err := bridge.pollChat(ctx, chatID, 20, func(_ context.Context, got ChatMessage, text string) error {
+		called = true
+		if !got.rejectedModelAPIKeyForPoll || got.Body.Content != rejectedModelAPIKeyInboundText || text != rejectedModelAPIKeyInboundText {
+			return errors.New("legacy credential receipt reached handler without its redacted terminal marker")
+		}
+		state, loadErr := store.Load(ctx)
+		if loadErr != nil {
+			return loadErr
+		}
+		staged := state.ChatPolls[chatID]
+		if staged.PendingPage == nil || strings.Contains(string(staged.PendingPage.Records[0]), fakeKey) ||
+			staged.Attempt == nil || staged.Attempt.ExpectedReceiptID != staged.PendingPage.ReceiptID {
+			return errors.New("redacted pending receipt was not committed with the active attempt receipt fence before dispatch")
+		}
+		return nil
+	})
+	if err != nil || !handled || !called {
+		t.Fatalf("legacy pending credential replay: handled=%v called=%v err=%v", handled, called, err)
+	}
+	if useSQLite {
+		db, err := sql.Open("sqlite", filepath.Join(filepath.Dir(store.Path()), teamstore.SQLiteFileName))
+		if err != nil {
+			t.Fatalf("open canonical SQLite store: %v", err)
+		}
+		defer db.Close()
+		var raw []byte
+		if err := db.QueryRowContext(ctx, `SELECT json FROM chat_polls WHERE chat_id = ?`, chatID).Scan(&raw); err != nil {
+			t.Fatalf("read canonical SQLite poll state: %v", err)
+		}
+		if strings.Contains(string(raw), fakeKey) {
+			t.Fatal("canonical SQLite poll state retained raw credential material")
+		}
+	} else {
+		assertFileDoesNotContain(t, store.Path(), fakeKey)
+	}
+	state, err := store.Load(ctx)
+	if err != nil {
+		t.Fatalf("load completed credential receipt: %v", err)
+	}
+	if state.ChatPolls[chatID].PendingPage != nil {
+		t.Fatal("completed legacy credential receipt remained pending")
+	}
+}
+
+func TestBridgeControlCredentialRejectionRecordsOnlyRedactedInbound(t *testing.T) {
+	const (
+		messageID = "control-rejected-credential"
+		fakeKey   = "sk-test-control-redacted-0123456789abcdef"
+	)
+	store := newBridgeTestStore(t)
+	graph, sent := newBridgePollAndSendGraph(t, nil)
+	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+	if err := os.MkdirAll(filepath.Join(filepath.Dir(store.Path()), "teams"), 0o700); err != nil {
+		t.Fatalf("create global outbound ledger directory: %v", err)
+	}
+	msg := bridgePollMessage(messageID, "2026-09-24T12:00:00Z", "configure this key "+fakeKey)
+	msg.ChatID = bridge.reg.ControlChatID
+	if err := bridge.handleControlMessage(context.Background(), msg, msg.Body.Content); err != nil {
+		t.Fatalf("handle rejected control credential: %v", err)
+	}
+
+	state, err := store.Load(context.Background())
+	if err != nil {
+		t.Fatalf("load rejected control inbound state: %v", err)
+	}
+	var rejected teamstore.InboundEvent
+	for _, inbound := range state.InboundEvents {
+		if inbound.TeamsChatID == bridge.reg.ControlChatID && inbound.TeamsMessageID == messageID {
+			rejected = inbound
+			break
+		}
+	}
+	if rejected.ID == "" || rejected.Status != teamstore.InboundStatusIgnored || rejected.Text != rejectedModelAPIKeyInboundText {
+		t.Fatalf("control credential rejection lacks redacted ignored inbound: %#v", rejected)
+	}
+	assertFileDoesNotContain(t, store.Path(), fakeKey)
+	assertFileDoesNotContain(t, bridge.controlChatHistoryPath(), fakeKey)
+	if len(*sent) != 1 || !strings.Contains((*sent)[0].Content, "I cannot accept raw API keys") || strings.Contains((*sent)[0].Content, fakeKey) {
+		t.Fatalf("control credential rejection response = %#v, want one safe warning", *sent)
+	}
+}
+
+func TestBridgeCredentialRejectionRedactsExistingDeduplicatedInbound(t *testing.T) {
+	const (
+		messageID = "credential-rejection-existing-inbound"
+		fakeKey   = "sk-test-existing-0123456789abcdef"
+	)
+	for _, useSQLite := range []bool{false, true} {
+		name := "json"
+		if useSQLite {
+			name = "sqlite"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := context.Background()
+			store := newBridgeTestStore(t)
+			legacy, created, err := store.PersistInbound(ctx, teamstore.InboundEvent{
+				TeamsChatID: "control-chat", TeamsMessageID: messageID,
+				Text: "configure this credential " + fakeKey, TeamsBodyType: "html",
+				TeamsBodyHTML: "<p>configure this credential " + fakeKey + "</p>",
+				Status:        teamstore.InboundStatusPersisted,
+			})
+			if err != nil || !created {
+				t.Fatalf("seed pre-existing inbound: created=%v err=%v", created, err)
+			}
+			if useSQLite {
+				if _, err := store.MigrateLargeStateToSQLite(ctx, 0); err != nil {
+					t.Fatalf("migrate dedupe fixture to SQLite: %v", err)
+				}
+			}
+			graph, _ := newBridgePollAndSendGraph(t, nil)
+			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+			msg := bridgePollMessage(messageID, "2026-09-24T12:00:00Z", "configure this credential "+fakeKey)
+			msg.ChatID = bridge.reg.ControlChatID
+			if err := bridge.persistRejectedModelAPIKeyInbound(ctx, nil, msg); err != nil {
+				t.Fatalf("redact deduplicated credential inbound: %v", err)
+			}
+			updated, found, err := store.InboundEventByID(ctx, legacy.ID)
+			if err != nil || !found {
+				t.Fatalf("load redacted existing inbound: found=%v err=%v", found, err)
+			}
+			if updated.Status != teamstore.InboundStatusIgnored || updated.Source != rejectedModelAPIKeyInboundSource ||
+				updated.Text != rejectedModelAPIKeyInboundText || updated.TeamsBodyType != "text" ||
+				strings.TrimSpace(updated.TeamsBodyHTML) != "" || len(updated.TeamsAttachments) != 0 {
+				t.Fatal("deduplicated credential inbound was not converted to the redacted terminal disposition")
+			}
+			if useSQLite {
+				db, err := sql.Open("sqlite", filepath.Join(filepath.Dir(store.Path()), teamstore.SQLiteFileName))
+				if err != nil {
+					t.Fatalf("open canonical SQLite store: %v", err)
+				}
+				defer db.Close()
+				var raw []byte
+				if err := db.QueryRowContext(ctx, `SELECT json FROM inbound_events WHERE id = ?`, legacy.ID).Scan(&raw); err != nil {
+					t.Fatalf("read canonical SQLite inbound: %v", err)
+				}
+				if strings.Contains(string(raw), fakeKey) {
+					t.Fatal("canonical SQLite inbound retained raw credential material")
+				}
+			} else {
+				assertFileDoesNotContain(t, store.Path(), fakeKey)
+			}
+		})
+	}
+}
+
+func TestBridgePollCredentialRejectionRetriesAfterOwnerFencedPersistenceFailure(t *testing.T) {
+	const (
+		messageID = "credential-rejection-owner-retry"
+		fakeKey   = "sk-test-owner-retry-0123456789abcdef"
+	)
+	for _, tc := range []struct {
+		name string
+		role inboundPollRole
+	}{
+		{name: "work", role: inboundPollRoleWork},
+		{name: "control", role: inboundPollRoleControl},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newBridgeTestStore(t)
+			graph, sent := newBridgePollAndSendGraph(t, nil)
+			bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
+			bridge.registryPath = filepath.Join(t.TempDir(), "teams", "scopes", "scope-current", "registry.json")
+			if err := os.MkdirAll(filepath.Dir(bridge.registryPath), 0o700); err != nil {
+				t.Fatalf("create scoped registry directory: %v", err)
+			}
+			if err := os.MkdirAll(filepath.Join(filepath.Dir(store.Path()), "teams"), 0o700); err != nil {
+				t.Fatalf("create global inbound ledger directory: %v", err)
+			}
+
+			now := time.Now().UTC().Truncate(time.Microsecond)
+			lease := teamstore.ControlLease{
+				ScopeID: bridge.scope.ID, HolderMachineID: bridge.machine.ID,
+				HolderKind: bridge.machine.Kind, Priority: bridge.machine.Priority,
+				Generation: 1, Status: teamstore.ControlLeaseStatusActive,
+				LeaseUntil: now.Add(time.Hour), LastHeartbeat: now, UpdatedAt: now,
+			}
+			if err := store.Update(context.Background(), func(state *teamstore.State) error {
+				state.Scope = bridge.scope
+				state.Machines[bridge.machine.ID] = bridge.machine
+				state.ControlLease = lease
+				return nil
+			}); err != nil {
+				t.Fatalf("seed owner lease: %v", err)
+			}
+			bridge.setControlLease(lease)
+			owner := teamstore.OwnerMetadata{ScopeID: bridge.scope.ID, MachineID: bridge.machine.ID, LeaseGeneration: lease.Generation}
+			ownerCtx := withTeamsOwnerCapability(context.Background(), owner)
+
+			chatID := bridge.reg.ControlChatID
+			var session *Session
+			if tc.role == inboundPollRoleWork {
+				session = &bridge.reg.Sessions[0]
+				chatID = session.ChatID
+			}
+			msg := bridgePollMessage(messageID, "2026-09-24T12:00:00Z", "reject this credential "+fakeKey)
+			msg.ChatID = chatID
+			window := MessageWindow{Messages: []ChatMessage{msg}}
+			poll := teamstore.ChatPollState{ChatID: chatID, Seeded: true}
+			handle := func(ctx context.Context, current ChatMessage, text string) error {
+				if tc.role == inboundPollRoleControl {
+					return bridge.handleControlMessage(ctx, current, text)
+				}
+				return bridge.handleResolvedSessionMessageWithQueueState(ctx, session, chatID, current, text, nil, nil)
+			}
+
+			// Simulate a lease takeover after the global claim has been acquired,
+			// but before the redacted inbound disposition can commit. The stale
+			// handler must fail closed: no warning, no done claim, and no seen bit.
+			staleHandler := func(ctx context.Context, current ChatMessage, text string) error {
+				next := lease
+				next.Generation++
+				next.LeaseUntil = time.Now().UTC().Add(time.Hour)
+				next.LastHeartbeat = time.Now().UTC()
+				next.UpdatedAt = next.LastHeartbeat
+				if err := store.Update(context.Background(), func(state *teamstore.State) error {
+					state.ControlLease = next
+					return nil
+				}); err != nil {
+					return err
+				}
+				return handle(ctx, current, text)
+			}
+			_, err := bridge.handlePollMessageWindow(ownerCtx, chatID, tc.role, poll, true, window, 20, 0, staleHandler)
+			if !errors.Is(err, teamstore.ErrControlLeaseNotHeld) {
+				t.Fatalf("stale-owner credential persistence error = %v, want lease-fenced failure", err)
+			}
+			if bridge.registryHasSeenOrSentForPoll(chatID, messageID) {
+				t.Fatal("failed redacted persistence marked the credential message seen")
+			}
+			if len(*sent) != 0 {
+				t.Fatalf("failed redacted persistence sent a warning: %#v", *sent)
+			}
+			state, err := store.Load(context.Background())
+			if err != nil {
+				t.Fatalf("load state after fenced persistence: %v", err)
+			}
+			for _, inbound := range state.InboundEvents {
+				if inbound.TeamsChatID == chatID && inbound.TeamsMessageID == messageID {
+					t.Fatalf("stale owner persisted credential inbound: %#v", inbound)
+				}
+			}
+			ledgerPath, ok := globalInboundLedgerPathForRegistry(bridge.registryPath)
+			if !ok {
+				t.Fatal("test registry path did not enable the durable global inbound ledger")
+			}
+			ledger, err := readGlobalInboundLedger(ledgerPath)
+			if err != nil {
+				t.Fatalf("read released global inbound claim: %v", err)
+			}
+			if _, exists := ledger.Items[globalInboundKey(chatID, messageID)]; exists {
+				t.Fatal("failed persistence left a completed or stale global inbound claim")
+			}
+
+			// The successor retries the same Graph page and commits the redacted
+			// terminal record before the claim becomes done.
+			nextLease := lease
+			nextLease.Generation++
+			nextLease.LeaseUntil = time.Now().UTC().Add(time.Hour)
+			nextLease.LastHeartbeat = time.Now().UTC()
+			nextLease.UpdatedAt = nextLease.LastHeartbeat
+			bridge.setControlLease(nextLease)
+			nextOwner := owner
+			nextOwner.LeaseGeneration = nextLease.Generation
+			nextCtx := withTeamsOwnerCapability(context.Background(), nextOwner)
+			result, err := bridge.handlePollMessageWindow(nextCtx, chatID, tc.role, poll, true, window, 20, 0, handle)
+			if err != nil {
+				t.Fatalf("successor retry of credential rejection: %v", err)
+			}
+			if !result.Handled || !result.Progressed {
+				t.Fatalf("successor retry result = %#v, want durable terminal disposition", result)
+			}
+			state, err = store.Load(context.Background())
+			if err != nil {
+				t.Fatalf("load successor disposition: %v", err)
+			}
+			var rejected teamstore.InboundEvent
+			for _, inbound := range state.InboundEvents {
+				if inbound.TeamsChatID == chatID && inbound.TeamsMessageID == messageID {
+					rejected = inbound
+					break
+				}
+			}
+			if rejected.ID == "" || rejected.Status != teamstore.InboundStatusIgnored || rejected.Text != rejectedModelAPIKeyInboundText {
+				t.Fatalf("successor did not persist redacted terminal inbound: %#v", rejected)
+			}
+			if len(state.Turns) != 0 {
+				t.Fatalf("credential rejection unexpectedly created turns: %#v", state.Turns)
+			}
+			ledger, err = readGlobalInboundLedger(ledgerPath)
+			if err != nil {
+				t.Fatalf("read successor global inbound completion: %v", err)
+			}
+			if item := ledger.Items[globalInboundKey(chatID, messageID)]; item.Status != "done" {
+				t.Fatalf("successor global inbound disposition = %#v, want done", item)
+			}
+			if len(*sent) != 1 || !strings.Contains((*sent)[0].Content, "I cannot accept raw API keys") || strings.Contains((*sent)[0].Content, fakeKey) {
+				t.Fatalf("successor rejection warning = %#v, want exactly one safe response", *sent)
+			}
+			assertFileDoesNotContain(t, store.Path(), fakeKey)
+			if tc.role == inboundPollRoleControl {
+				assertFileDoesNotContain(t, bridge.controlChatHistoryPath(), fakeKey)
+			}
+		})
+	}
 }
 
 func TestBridgeProvenanceMarkerRequiresDurableMatchingOutbox(t *testing.T) {

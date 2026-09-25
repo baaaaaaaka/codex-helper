@@ -186,11 +186,36 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		"TestBridgeMachineDelegationWorkerCancelsRunningExecution": true,
 	},
 	"./internal/teams/store": {
+		// These hot-poll recovery fixtures deliberately exercise the bounded
+		// JSON compatibility lane for malformed, contradictory, or untrusted
+		// canonical rows. Keep them out of broad race shards so unrelated SQLite
+		// I/O cannot consume the production two-second fail-closed admission
+		// budget before their recovery assertions run.
+		"TestSQLiteHotPollAdmissionReportsOnlyCorruptDueSession":                   true,
+		"TestSQLiteHotPollAdmissionReportsTypedCorruptSessionField":                true,
+		"TestSQLiteHotPollAdmissionReportsCorruptSessionAlongsideHealthyCandidate": true,
+		"TestSQLiteHotPollAdmissionReportsContradictorySessionIdentity":            true,
+		"TestSQLiteHotPollCorruptWorkProbeIgnoresStaleScalarGates":                 true,
+		"TestSQLiteHotPollCorruptProbeFailsClosedOnNullScalarAndInvalidTime":       true,
+		"TestSQLiteHotPollCorruptProbeAdvancesPastControlAndFencedPrefix":          true,
+		"TestSQLiteHotPollWorkAdmissionKeepsRoutableUntrustedSessionFallback":      true,
+		"TestSQLiteHotPollReadyCanonicalFallbackReleasesStoreLockDuringRead":       true,
+		"TestSQLiteMalformedSessionDoesNotDisableHealthyHotPollAdmission":          true,
 		// These tests deliberately observe the first phase of a SQLite
 		// compatibility/fallback operation.  Their correctness depends on a
 		// short hook/legacy-lane window, so broad race-shard I/O must not turn a
 		// healthy operation into a false readiness or budget failure.
 		"TestSQLiteHotPollCorruptProbeRejectsNonRFC3339Times": true,
+		// This hash-fence regression also enters the two-second compatibility
+		// admission path. Keep it out of parallel race shards; CPU/filesystem
+		// pressure can expire the intentional fail-closed budget before the CAS
+		// assertion is reached.
+		"TestSQLiteHotPollRecoveryHashFenceRejectsMissingAndReplacedPoll": true,
+		// This mixed trusted/legacy fixture intentionally enters the two-second
+		// compatibility admission lane. Keep it out of parallel race shards so
+		// runner contention cannot expire the fail-closed budget before healthy
+		// scalar-lane rows are observed.
+		"TestSQLiteHotPollAdmissionFallbackKeepsHealthyRowsOnScalarLane": true,
 		// This corrupt-session witness must reach the bounded compatibility
 		// fallback before its two-second admission budget expires. A broad race
 		// shard can consume that budget in SQLite setup/I/O even though the
@@ -339,7 +364,19 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestBridgeMachineDelegationWorkerCancelsRunningExecution": true,
 	},
 	"./internal/teams/store": {
+		"TestSQLiteHotPollAdmissionReportsOnlyCorruptDueSession":                               true,
+		"TestSQLiteHotPollAdmissionReportsTypedCorruptSessionField":                            true,
+		"TestSQLiteHotPollAdmissionReportsCorruptSessionAlongsideHealthyCandidate":             true,
+		"TestSQLiteHotPollAdmissionReportsContradictorySessionIdentity":                        true,
+		"TestSQLiteHotPollCorruptWorkProbeIgnoresStaleScalarGates":                             true,
+		"TestSQLiteHotPollCorruptProbeFailsClosedOnNullScalarAndInvalidTime":                   true,
+		"TestSQLiteHotPollCorruptProbeAdvancesPastControlAndFencedPrefix":                      true,
+		"TestSQLiteHotPollWorkAdmissionKeepsRoutableUntrustedSessionFallback":                  true,
+		"TestSQLiteHotPollReadyCanonicalFallbackReleasesStoreLockDuringRead":                   true,
+		"TestSQLiteMalformedSessionDoesNotDisableHealthyHotPollAdmission":                      true,
 		"TestSQLiteHotPollCorruptProbeRejectsNonRFC3339Times":                                  true,
+		"TestSQLiteHotPollRecoveryHashFenceRejectsMissingAndReplacedPoll":                      true,
+		"TestSQLiteHotPollAdmissionFallbackKeepsHealthyRowsOnScalarLane":                       true,
 		"TestSQLiteHotPollCorruptSessionWithOpaquePollIsFencedAcrossReopen":                    true,
 		"TestSQLiteHotPollCanonicalFallbackReleasesStoreLockDuringRead":                        true,
 		"TestSQLiteHotPollStandaloneCanonicalFallbackReleasesStoreLockDuringRead":              true,

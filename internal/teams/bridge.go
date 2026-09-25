@@ -219,14 +219,20 @@ const (
 	transcriptImportMaxBatchesPerCycle  = 1
 	transcriptImportBatchSeparatorHTML  = "<p>&nbsp;</p>"
 	mainLoopOutboxFlushMaxMessages      = 2
+	// Bound one listener outbox quantum across chats as well as within each
+	// chat. Keeping the per-chat FIFO quantum at two preserves local fairness;
+	// admitting several distinct chats lets a large multi-chat backlog use the
+	// listener's existing post-poll write phase instead of taking one extra
+	// cycle per pair of chats.
+	mainLoopOutboxFlushMaxChats = 8
 	// A failed/deferred row must consume a bounded amount of work just like a
 	// successful send. Otherwise a large prefix of rows that all fail can be
 	// scanned on every Listen tick and starve polling/transcript work.
 	mainLoopOutboxFlushMaxScannedMessages = 64
 	// The read-only fairness preflight may inspect a wider bounded prefix than
 	// the sender itself. This prevents one chat with a continuously replenished
-	// prefix from hiding other chats, while the actual flush still sends at most
-	// two rows.
+	// prefix from hiding other chats. The actual sender remains capped at two
+	// FIFO rows per selected chat and eight chats per cycle.
 	mainLoopOutboxFairnessScanLimit = mainLoopOutboxFlushMaxScannedMessages * 4
 	mainLoopOutboxFlushMaxPages     = 4
 	// A synchronous chat-triggered flush must make progress for the new live
@@ -1053,63 +1059,72 @@ type Bridge struct {
 	// in-memory registry. Keep that cold operation single-flight so concurrent
 	// history workers cannot allocate the same session ID or race the registry
 	// projection while the Graph/SQLite work is in flight.
-	codexSessionPublishMu              sync.Mutex
-	reasoningEffortMu                  sync.Mutex
-	modelProfileMu                     sync.Mutex
-	registryProjectionLastFingerprint  string
-	registryProjectionLastSavedAt      time.Time
-	registryProjectionDirty            bool
-	maintenanceStorePinned             bool
-	durableProjectionVersionBySession  map[string]durableSessionProjectionVersion
-	user                               User
-	scope                              teamstore.ScopeIdentity
-	machine                            teamstore.MachineRecord
-	lease                              teamstore.ControlLease
-	leaseDuration                      time.Duration
-	out                                io.Writer
-	executor                           Executor
-	asrTranscriber                     ASRTranscriber
-	mathRenderer                       teamsMathPNGRenderer
-	controlFallbackExecutor            Executor
-	controlFallbackModel               string
-	helperRestarter                    HelperRestarter
-	modelProfileResolver               ModelProfileResolver
-	modelProfileManager                ModelProfileManager
-	defaultManager                     GlobalDefaultManager
-	helperPendingRestarter             HelperPendingRestarter
-	helperReloader                     HelperReloader
-	helperAutoUpdater                  HelperAutoUpdater
-	helperVersion                      string
-	helperAutoUpdatePrerelease         bool
-	helperAutoUpdateMu                 sync.Mutex
-	helperAutoUpdateNextProbeAt        time.Time
-	pendingCodexUpgradeMu              sync.Mutex
-	pendingCodexUpgradeNextProbeAt     time.Time
-	codexUpgrader                      CodexUpgrader
-	controlFallbackHelpContext         string
-	store                              *teamstore.Store
-	asyncTurns                         bool
-	groupChatGuardEnabled              bool
-	ownerMu                            sync.Mutex
-	owner                              teamstore.OwnerMetadata
-	ownerStaleAfter                    time.Duration
-	ownerHeartbeatInterval             time.Duration
-	outboxRecoveryMu                   sync.Mutex
-	outboxRecoveryNextProbeAt          map[string]time.Time
-	outboxChatFlushMu                  sync.Mutex
-	outboxChatFlushLocks               map[string]chan struct{}
-	outboxFairMu                       sync.Mutex
-	outboxFairCursor                   string
-	queuedTurnScanMu                   sync.Mutex
-	queuedTurnScanAfterSessionID       string
-	forkReconcileMu                    sync.Mutex
-	forkReconcileAfterID               string
-	outboxSendPaceMu                   sync.Mutex
-	outboxSendPaceLast                 map[string]time.Time
-	pollMu                             sync.Mutex
-	graphReadGateMu                    sync.Mutex
-	graphReadAccountPersistMu          sync.Mutex
-	graphReadChatPersistMu             sync.Mutex
+	codexSessionPublishMu               sync.Mutex
+	reasoningEffortMu                   sync.Mutex
+	modelProfileMu                      sync.Mutex
+	registryProjectionLastFingerprint   string
+	registryProjectionLastSavedAt       time.Time
+	registryProjectionDirty             bool
+	maintenanceStorePinned              bool
+	durableProjectionVersionBySession   map[string]durableSessionProjectionVersion
+	user                                User
+	scope                               teamstore.ScopeIdentity
+	machine                             teamstore.MachineRecord
+	lease                               teamstore.ControlLease
+	leaseDuration                       time.Duration
+	out                                 io.Writer
+	executor                            Executor
+	asrTranscriber                      ASRTranscriber
+	mathRenderer                        teamsMathPNGRenderer
+	controlFallbackExecutor             Executor
+	controlFallbackModel                string
+	helperRestarter                     HelperRestarter
+	modelProfileResolver                ModelProfileResolver
+	modelProfileManager                 ModelProfileManager
+	defaultManager                      GlobalDefaultManager
+	helperPendingRestarter              HelperPendingRestarter
+	helperReloader                      HelperReloader
+	helperAutoUpdater                   HelperAutoUpdater
+	helperVersion                       string
+	helperAutoUpdatePrerelease          bool
+	helperAutoUpdateMu                  sync.Mutex
+	helperAutoUpdateNextProbeAt         time.Time
+	pendingCodexUpgradeMu               sync.Mutex
+	pendingCodexUpgradeNextProbeAt      time.Time
+	codexUpgrader                       CodexUpgrader
+	controlFallbackHelpContext          string
+	store                               *teamstore.Store
+	asyncTurns                          bool
+	groupChatGuardEnabled               bool
+	ownerMu                             sync.Mutex
+	owner                               teamstore.OwnerMetadata
+	ownerStaleAfter                     time.Duration
+	ownerHeartbeatInterval              time.Duration
+	outboxRecoveryMu                    sync.Mutex
+	outboxRecoveryNextProbeAt           map[string]time.Time
+	outboxChatFlushMu                   sync.Mutex
+	outboxChatFlushLocks                map[string]chan struct{}
+	outboxFairMu                        sync.Mutex
+	outboxFairCursor                    string
+	queuedTurnScanMu                    sync.Mutex
+	queuedTurnScanAfterSessionID        string
+	legacyControlCredentialScrubMu      sync.Mutex
+	legacyControlCredentialScrubAfterID string
+	legacyControlCredentialScrubDone    bool
+	forkReconcileMu                     sync.Mutex
+	forkReconcileAfterID                string
+	outboxSendPaceMu                    sync.Mutex
+	outboxSendPaceLast                  map[string]time.Time
+	pollMu                              sync.Mutex
+	graphReadGateMu                     sync.Mutex
+	graphReadAccountPersistMu           sync.Mutex
+	graphReadChatPersistMu              sync.Mutex
+	graphWriteGateMu                    sync.Mutex
+	graphWriteAccountLocalUntil         time.Time
+	// One in-flight outbox Graph side effect at a time, including transfer
+	// requests. Its response boundary publishes account 429 before releasing the
+	// next sender; read/reconciliation requests do not use this gate.
+	graphWriteRequestGate              chan struct{}
 	graphReadAccountLocalUntil         time.Time
 	graphReadAccountPendingUntil       time.Time
 	graphReadAccountPendingReason      string
@@ -1195,6 +1210,11 @@ type Bridge struct {
 	// bridges leave it nil; lifecycle experiments use it to distinguish a real
 	// takeover from an intentional teardown race without changing lease logic.
 	controlLeaseClaimHook func(teamstore.ControlLeaseDecision, error)
+	// ownerGenerationExitHook is a test-only diagnostic seam for the iterative
+	// Listen owner loop. It records why one owner generation returned so Docker
+	// recovery experiments can distinguish a real lease handoff from a startup
+	// retry without changing the listener's retry policy.
+	ownerGenerationExitHook func(time.Duration, error)
 	// ownerFailureHook is a test-only diagnostic seam for the lease heartbeat.
 	// Production bridges leave it nil; real-data experiments use it to retain
 	// the exact bounded heartbeat failure that caused an owner handoff.
@@ -2239,7 +2259,11 @@ func (b *Bridge) Listen(ctx context.Context, opts BridgeOptions) error {
 		}
 	}()
 	for {
+		generationStarted := time.Now()
 		err := b.listenOwnerGeneration(ctx, opts)
+		if b.ownerGenerationExitHook != nil {
+			b.ownerGenerationExitHook(time.Since(generationStarted), err)
+		}
 		// A store transaction canceled by the listener can surface the driver's
 		// sql.ErrTxDone instead of context.Canceled.  Once the caller context is
 		// canceled, the only meaningful result is the caller's cancellation; do
@@ -2826,7 +2850,7 @@ func (b *Bridge) listenOwnerGeneration(ctx context.Context, opts BridgeOptions) 
 		if !cycleDegraded {
 			maintenanceGateErr = runPhase("optional-maintenance-gate", func(phaseCtx context.Context) error {
 				var err error
-				optionalMaintenance, err = b.optionalMaintenancePlanForOwnerWithOutbox(phaseCtx, time.Now(), outboxPhaseResult.SuppressOptionalMaintenance)
+				optionalMaintenance, err = b.optionalMaintenancePlanForOwnerWithOutboxResult(phaseCtx, time.Now(), outboxPhaseResult)
 				return err
 			})
 			if maintenanceGateErr != nil {
@@ -3199,6 +3223,9 @@ type optionalMaintenancePlan struct {
 type mainLoopOutboxFlushResult struct {
 	SuppressOptionalMaintenance bool
 	PendingBlockingOutbox       bool
+	// OperationalBacklogActive is the same-cycle result of the durable Teams
+	// backlog probe. Carry it forward so a fair quantum does not repeat the scan.
+	OperationalBacklogActive bool
 }
 
 // normalOptionalMaintenanceStillAllowed closes the small admission race
@@ -3239,7 +3266,7 @@ func (b *Bridge) normalOptionalMaintenanceStillAllowed(ctx context.Context) (boo
 // wake hint; the Teams backlog probe is still checked so a drained queue can
 // wake immediately after a restart or a long executor completion.
 func (b *Bridge) optionalMaintenancePlanForOwner(ctx context.Context, now time.Time) (optionalMaintenancePlan, error) {
-	return b.optionalMaintenancePlanForOwnerWithOutbox(ctx, now, false)
+	return b.optionalMaintenancePlanForOwnerWithOutboxResult(ctx, now, mainLoopOutboxFlushResult{})
 }
 
 // optionalMaintenancePlanForOwnerWithOutbox adds only a cycle-local hint from
@@ -3247,19 +3274,23 @@ func (b *Bridge) optionalMaintenancePlanForOwner(ctx context.Context, now time.T
 // TeamsOperationalBacklog schema: a queued outbox is re-read on the next
 // cycle, while the hint cannot create a second frontier or alter outbox CAS.
 func (b *Bridge) optionalMaintenancePlanForOwnerWithOutbox(ctx context.Context, now time.Time, suppressForOutbox bool) (optionalMaintenancePlan, error) {
+	return b.optionalMaintenancePlanForOwnerWithOutboxResult(ctx, now, mainLoopOutboxFlushResult{
+		SuppressOptionalMaintenance: suppressForOutbox,
+	})
+}
+
+func (b *Bridge) optionalMaintenancePlanForOwnerWithOutboxResult(ctx context.Context, now time.Time, outboxResult mainLoopOutboxFlushResult) (optionalMaintenancePlan, error) {
 	if b == nil || b.store == nil {
 		return optionalMaintenancePlan{runNormal: true}, nil
 	}
 	if now.IsZero() {
 		now = time.Now()
 	}
-	if suppressForOutbox {
-		// The preceding outbox phase already observed a blocking/deferred/error
-		// condition. Optional history/linked work must remain fail-closed for this
-		// cycle; re-reading the full Teams backlog here only repeats the same
-		// durable scan and lock contention. Mandatory recovery is still probed
-		// independently, so this shortcut cannot hide source-proof or rewrite
-		// work. If the outbox condition clears, the next cycle reopens normal work.
+	if outboxResult.SuppressOptionalMaintenance && !outboxResult.OperationalBacklogActive {
+		// A pure outbox block/error remains fail-closed for this cycle. If the
+		// outbox phase also observed a durable Teams backlog, continue below so a
+		// due bounded fairness quantum cannot be starved forever. Mandatory
+		// recovery is still probed independently in either case.
 		mandatory, err := b.optionalMaintenanceNeedsMandatory(ctx)
 		if err != nil {
 			return optionalMaintenancePlan{}, err
@@ -3276,9 +3307,12 @@ func (b *Bridge) optionalMaintenancePlanForOwnerWithOutbox(ctx context.Context, 
 	if err != nil {
 		return optionalMaintenancePlan{}, err
 	}
-	backlogActive, err := b.store.TeamsOperationalBacklogActive(ctx)
-	if err != nil {
-		return optionalMaintenancePlan{}, err
+	backlogActive := outboxResult.OperationalBacklogActive
+	if !backlogActive {
+		backlogActive, err = b.store.TeamsOperationalBacklogActive(ctx)
+		if err != nil {
+			return optionalMaintenancePlan{}, err
+		}
 	}
 	if !backlogActive {
 		if b.pollForegroundPressureBlocksColdMaintenance() {
@@ -5874,6 +5908,64 @@ func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string
 			}
 			return false, err
 		}
+		safePage, changed, sanitizeErr := redactPendingPageModelAPIKeys(poll.PendingPage, role)
+		if sanitizeErr != nil {
+			return false, pollStoreFailure(sanitizeErr)
+		}
+		if changed {
+			oldReceiptID := strings.TrimSpace(poll.PendingPage.ReceiptID)
+			const maxReceiptRedactionAttempts = 3
+			applied := false
+			for attempt := 0; attempt < maxReceiptRedactionAttempts; attempt++ {
+				refreshed, live, refreshErr := b.refreshChatPollAttemptRevision(durableCtx, chatID, attemptCapability, expectedRevision)
+				if refreshErr != nil {
+					return false, pollStoreFailure(refreshErr)
+				}
+				if !live {
+					return false, nil
+				}
+				expectedRevision = refreshed
+				updatedPoll, updated, mutateErr := b.store.MutateChatPollAttemptWithCapability(durableCtx, chatID, attemptCapability, expectedRevision, func(current *teamstore.ChatPollState) error {
+					if current.PendingPage == nil || strings.TrimSpace(current.PendingPage.ReceiptID) != oldReceiptID ||
+						current.Attempt == nil || strings.TrimSpace(current.Attempt.ExpectedReceiptID) != oldReceiptID {
+						return fmt.Errorf("%w: pending receipt changed during credential redaction", errPendingPageIdentity)
+					}
+					current.PendingPage = safePage
+					current.Attempt.ExpectedReceiptID = safePage.ReceiptID
+					return nil
+				})
+				if mutateErr != nil {
+					if errors.Is(mutateErr, teamstore.ErrControlLeaseNotHeld) {
+						return false, pollLeaseFailure(mutateErr)
+					}
+					return false, pollStoreFailure(mutateErr)
+				}
+				if updated {
+					poll = updatedPoll
+					expectedRevision = updatedPoll.PollRevision
+					window, err = pendingPageToWindow(poll.PendingPage)
+					if err != nil {
+						return false, pollStoreFailure(err)
+					}
+					applied = true
+					break
+				}
+				refreshed, live, refreshErr = b.refreshChatPollAttemptRevision(durableCtx, chatID, attemptCapability, expectedRevision)
+				if refreshErr != nil {
+					return false, pollStoreFailure(refreshErr)
+				}
+				if !live {
+					return false, nil
+				}
+				if refreshed == expectedRevision {
+					return false, nil
+				}
+				expectedRevision = refreshed
+			}
+			if !applied {
+				return false, nil
+			}
+		}
 	} else {
 		readCtx, cancelRead := withInboundPollGraphBudget(ctx, opts.GraphBudget)
 		// The account gate snapshot used for candidate admission is intentionally
@@ -5971,7 +6063,7 @@ func (b *Bridge) pollChatWithRoleStateOptions(ctx context.Context, chatID string
 				!poll.RecoveryRequired && strings.TrimSpace(window.boundaryReason) == "" &&
 				pollWindowHasUsableModifiedTimes(window)
 		}
-		page, pageErr := pendingPageFromWindow(chatID, requestPath, frontier, normalizeFrontierEpochForPoll(poll), window, baselineOnly)
+		page, pageErr := pendingPageFromWindowForRole(chatID, requestPath, frontier, normalizeFrontierEpochForPoll(poll), window, baselineOnly, role)
 		if pageErr != nil {
 			committed, commitErr := commitFailure(pageErr, true, false)
 			if committed {
@@ -6478,6 +6570,17 @@ func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, rol
 		if !pollMessageBelongsToChat(chatID, msg) {
 			return result, fmt.Errorf("%w: message %q reports chat %q, want %q", errPollMessageChatMismatch, msg.ID, strings.TrimSpace(msg.ChatID), strings.TrimSpace(chatID))
 		}
+		if !msg.deferredModelProfileKeyIntakeForPoll && modelProfileKeyIntakeDeferredForPoll(role, msg,
+			commandRouteTextFromTeamsMessage(msg, promptTextFromTeamsMessageHTML(msg.Body.Content))) {
+			// Direct window callers must follow the same privacy boundary as the
+			// durable page builder: convert the raw body to an identity-only
+			// foreground refetch marker before any receipt, inbound, or handler
+			// path can persist it.
+			msg = redactDeferredModelProfileKeyIntakeMessage(msg)
+		}
+		if msg.deferredModelProfileKeyIntakeForPoll && role != inboundPollRoleControl {
+			return result, fmt.Errorf("%w: model-key intake receipt entered the non-control poll lane", errPendingPageInvalid)
+		}
 		if session := b.sessionByChatIDForPollContext(ctx, chatID); session != nil && b.sessionQuarantineFenced(session.ID) {
 			// Containment must isolate unprovenanced helper echoes without
 			// discarding a real user message that happens to share the fetched
@@ -6563,6 +6666,9 @@ func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, rol
 				err := fmt.Errorf("Graph message re-fetch has no usable modified timestamp for %q", msg.ID)
 				traceMessage(msg.ID, "refetch-error", err)
 				return result, err
+			}
+			if modelAPIKeyPreflightMessageForPoll(role, fullMessage, promptTextFromTeamsMessageHTML(fullMessage.Body.Content)) != "" {
+				fullMessage = redactRejectedModelAPIKeyMessage(fullMessage)
 			}
 			msg = fullMessage
 			result.RefetchedMessages = append(result.RefetchedMessages, fullMessage)
@@ -6650,7 +6756,14 @@ func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, rol
 				return result, err
 			}
 		}
-		if err := handle(ctx, msg, text); err != nil {
+		var handleErr error
+		if msg.deferredModelProfileKeyIntakeForPoll {
+			handleErr = b.persistDeferredModelProfileKeyIntakeInbound(ctx, msg)
+		} else {
+			handleErr = handle(ctx, msg, text)
+		}
+		if handleErr != nil {
+			err := handleErr
 			if teamstore.IsProcessWideStateError(err) {
 				// Do not turn a store/lease failure into a chat-local poll failure:
 				// the local failure commit itself depends on the same durable writer,
@@ -8568,7 +8681,19 @@ func (b *Bridge) shouldIgnoreMessage(ctx context.Context, chatID string, msg Cha
 		}
 		b.pollMessageTraceHook(strings.TrimSpace(chatID), strings.TrimSpace(msg.ID), disposition, err)
 	}()
-	if msg.ID == "" || b.registryHasSeenOrSentForPoll(chatID, msg.ID) {
+	if msg.ID == "" {
+		disposition = "ignored-registry-seen"
+		return true, nil
+	}
+	registrySeen := b.registryHasSeenOrSentForPoll(chatID, msg.ID)
+	// A credential-rejection receipt is intentionally staged with a redacted
+	// payload, then given a durable terminal inbound disposition by the normal
+	// handler. The registry is only a cache and may already say "seen" (for
+	// example, after a prior cursor-only observation); do not let that cache
+	// suppress the durable privacy disposition. The durable message lookup below
+	// still suppresses a replay after that disposition has been written.
+	needsDurableCredentialDisposition := msg.rejectedModelAPIKeyForPoll || msg.deferredModelProfileKeyIntakeForPoll
+	if registrySeen && !needsDurableCredentialDisposition {
 		disposition = "ignored-registry-seen"
 		return true, nil
 	}
@@ -9039,6 +9164,9 @@ func redactChatIDForLog(chatID string) string {
 }
 
 func teamsMessageHasCodexMention(msg ChatMessage, fallbackText string) bool {
+	if msg.rejectedModelAPIKeyForPoll {
+		return msg.rejectedModelAPIKeyMentionedForPoll
+	}
 	if codexAtHTMLPattern.MatchString(msg.Body.Content) || codexPlainMentionPattern.MatchString(PlainTextFromTeamsHTML(msg.Body.Content)) || codexPlainMentionPattern.MatchString(fallbackText) {
 		return true
 	}
@@ -10110,7 +10238,16 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 	}
 	routeText := commandRouteTextFromTeamsMessage(msg, text)
 	if isModelProfileKeyIntakeControlRoute(routeText) {
+		if preflight := modelAPIKeyPreflightMessageForPoll(inboundPollRoleControl, msg, text); preflight != "" {
+			if err := b.persistRejectedModelAPIKeyInbound(ctx, nil, msg); err != nil {
+				return err
+			}
+			return b.sendControl(ctx, preflight)
+		}
 		if teamsPollQueueOnly(ctx) {
+			if modelProfileKeyIntakeDeferredForPoll(inboundPollRoleControl, msg, routeText) {
+				return b.persistDeferredModelProfileKeyIntakeInbound(ctx, msg)
+			}
 			// Model-key intake changes durable model configuration and must not run
 			// from the bounded Graph-read worker. Preserve the exact command for the
 			// foreground replay lane; sendControl itself is queue-only, but the
@@ -10120,7 +10257,10 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 		}
 		return b.handleModelProfileKeyIntakeControlMessage(ctx, msg, routeText)
 	}
-	if message := modelAPIKeyPreflightMessage(routeText); message != "" {
+	if message := modelAPIKeyPreflightMessageForTeamsMessage(msg, text); message != "" {
+		if err := b.persistRejectedModelAPIKeyInbound(ctx, nil, msg); err != nil {
+			return err
+		}
 		return b.sendControl(ctx, message)
 	}
 	b.recordControlChatUserMessage(ctx, msg, text)
@@ -10340,17 +10480,236 @@ func modelAPIKeyPreflightMessage(text string) string {
 	if !containsRawModelAPIKey(text) {
 		return ""
 	}
-	return "I cannot accept raw API keys in normal Teams messages. Use `model setup <model>` to start the explicit one-time Teams key intake flow, or configure a model from a local terminal with `cxp model setup <model> --api-key-stdin`."
+	return modelAPIKeyPreflightMessageText
+}
+
+const rejectedModelAPIKeyInboundText = "[redacted: raw model API credential rejected]"
+const rejectedModelAPIKeyInboundSource = "teams_model_api_key_rejected"
+const deferredModelProfileKeyIntakeInboundSource = "teams_control_model_key_intake_deferred"
+const legacyRedactedControlPollInboundText = "[redacted: legacy credential-bearing control message]"
+const legacyRedactedControlPollInboundSource = "teams_control_poll_deferred_legacy_credential_redacted"
+const modelAPIKeyPreflightMessageText = "I cannot accept raw API keys in normal Teams messages. Use `model setup <model>` to start the explicit one-time Teams key intake flow, or configure a model from a local terminal with `cxp model setup <model> --api-key-stdin`."
+
+func modelAPIKeyPreflightMessageForTeamsMessage(msg ChatMessage, text string) string {
+	if msg.rejectedModelAPIKeyForPoll {
+		return modelAPIKeyPreflightMessageText
+	}
+	if teamsMessageAttachmentsContainRawModelAPIKey(msg) {
+		return modelAPIKeyPreflightMessageText
+	}
+	return modelAPIKeyPreflightMessage(commandRouteTextFromTeamsMessage(msg, text))
+}
+
+func modelAPIKeyPreflightMessageForPoll(role inboundPollRole, msg ChatMessage, text string) string {
+	routeText := commandRouteTextFromTeamsMessage(msg, text)
+	if modelProfileKeyIntakeDeferredForPoll(role, msg, routeText) {
+		// Model-key control commands are executed only after the bounded poll
+		// phase. Secret-bearing forms are represented by a redacted marker and
+		// re-fetched by identity; safe confirm/cancel forms are also re-fetched so
+		// they do not fall into the generic non-replayable control hold.
+		return ""
+	}
+	return modelAPIKeyPreflightMessageForTeamsMessage(msg, text)
+}
+
+func modelProfileKeyIntakeDeferredForPoll(role inboundPollRole, msg ChatMessage, routeText string) bool {
+	if role != inboundPollRoleControl || !isModelProfileKeyIntakeControlRoute(routeText) ||
+		msg.rejectedModelAPIKeyForPoll || teamsMessageAttachmentsContainRawModelAPIKey(msg) {
+		return false
+	}
+	if modelProfileKeyIntakeRouteContainsSecret(routeText) {
+		return true
+	}
+	// Confirmation, cancellation, and usage-form commands contain no inline
+	// credential. Malformed key-bearing commands must not enter this exception.
+	return modelAPIKeyPreflightMessage(routeText) == ""
+}
+
+func teamsMessageAttachmentsContainRawModelAPIKey(msg ChatMessage) bool {
+	for _, attachment := range msg.Attachments {
+		if containsRawModelAPIKey(strings.Join([]string{attachment.ID, attachment.ContentType, attachment.ContentURL, attachment.Content, attachment.Name}, " ")) {
+			return true
+		}
+	}
+	return false
+}
+
+func redactRejectedModelAPIKeyMessage(msg ChatMessage) ChatMessage {
+	if !msg.rejectedModelAPIKeyForPoll {
+		msg.rejectedModelAPIKeyMentionedForPoll = teamsMessageHasCodexMention(msg, promptTextFromTeamsMessageHTML(msg.Body.Content))
+	}
+	msg.Body.ContentType = "text"
+	msg.Body.Content = rejectedModelAPIKeyInboundText
+	msg.Attachments = nil
+	msg.Mentions = nil
+	msg.rejectedModelAPIKeyForPoll = true
+	return msg
+}
+
+func redactDeferredModelProfileKeyIntakeMessage(msg ChatMessage) ChatMessage {
+	msg.Body.ContentType = "text"
+	msg.Body.Content = deferredModelProfileKeyIntakeInboundText
+	msg.Attachments = nil
+	msg.Mentions = nil
+	msg.rejectedModelAPIKeyForPoll = false
+	msg.rejectedModelAPIKeyMentionedForPoll = false
+	msg.deferredModelProfileKeyIntakeForPoll = true
+	return msg
+}
+
+// persistDeferredModelProfileKeyIntakeInbound stores only the stable Teams
+// identity and a redacted marker. The actual credential is fetched by the
+// foreground recovery phase after the bounded Graph-read poll has completed.
+func (b *Bridge) persistDeferredModelProfileKeyIntakeInbound(ctx context.Context, msg ChatMessage) error {
+	if b == nil || b.store == nil {
+		return fmt.Errorf("Teams durable state is required for model key intake")
+	}
+	chatID := strings.TrimSpace(msg.ChatID)
+	if chatID == "" {
+		chatID = strings.TrimSpace(b.reg.ControlChatID)
+		msg.ChatID = chatID
+	}
+	if chatID == "" || chatID != strings.TrimSpace(b.reg.ControlChatID) || strings.TrimSpace(msg.ID) == "" {
+		return fmt.Errorf("model-key intake message has an invalid control-chat identity")
+	}
+	redacted := redactDeferredModelProfileKeyIntakeMessage(msg)
+	inbound, created, err := b.persistControlInboundWithStatus(ctx, redacted, teamstore.InboundStatusDeferred, deferredModelProfileKeyIntakeInboundSource)
+	if err != nil {
+		return err
+	}
+	if created {
+		return nil
+	}
+	update := b.store.UpdateInboundEvent
+	if _, machineID, generation := b.ownerFieldsForContext(ctx); strings.TrimSpace(machineID) != "" && generation > 0 {
+		update = func(ctx context.Context, id string, fn func(teamstore.InboundEvent, bool, time.Time) (teamstore.InboundEvent, bool, error)) (teamstore.InboundEvent, bool, error) {
+			return b.store.UpdateInboundEventForOwner(ctx, id, machineID, generation, fn)
+		}
+	}
+	_, _, err = update(ctx, inbound.ID, func(current teamstore.InboundEvent, found bool, now time.Time) (teamstore.InboundEvent, bool, error) {
+		if !found || current.TeamsChatID != chatID || current.TeamsMessageID != msg.ID {
+			return current, false, fmt.Errorf("deferred model-key intake identity changed before redaction")
+		}
+		current.Text = deferredModelProfileKeyIntakeInboundText
+		current.TextHash = inboundTextHashForTeamsMessage(current.Text, redacted)
+		current.TeamsBodyType = "text"
+		current.TeamsBodyHTML = ""
+		current.TeamsAttachments = nil
+		if deferredInboundRecoveryRowMutable(current) {
+			current.Status = teamstore.InboundStatusDeferred
+			current.Source = deferredModelProfileKeyIntakeInboundSource
+			current.TurnID = ""
+			current.OperationState = "deferred"
+			current.OperationKey = ""
+			current.OperationAttemptToken = ""
+			current.OperationStartedAt = time.Time{}
+			current.NextAttemptAt = time.Time{}
+			current.FailureCount = 0
+			current.LastError = ""
+			current.HoldReason = ""
+			current.HoldRequiredEvidence = ""
+			current.HoldNextAction = ""
+			current.HoldWakeCondition = ""
+		}
+		current.UpdatedAt = now
+		return current, true, nil
+	})
+	return err
+}
+
+// persistRejectedModelAPIKeyInbound records a terminal, redacted disposition
+// before the poll claim can complete. The rejected message must not be sent to
+// Codex or retained in the Teams store/control history, but returning success
+// without a durable disposition would let the poll layer mark it seen and
+// permanently lose the only evidence that the message was consumed.
+func (b *Bridge) persistRejectedModelAPIKeyInbound(ctx context.Context, session *Session, msg ChatMessage) error {
+	if b == nil {
+		return fmt.Errorf("Teams bridge is not configured")
+	}
+	redacted := redactRejectedModelAPIKeyMessage(msg)
+	if session == nil {
+		inbound, created, err := b.persistControlInboundWithStatus(ctx, redacted, teamstore.InboundStatusIgnored, rejectedModelAPIKeyInboundSource)
+		if err != nil {
+			return err
+		}
+		if !created {
+			if err := b.redactExistingRejectedModelAPIKeyInbound(ctx, inbound, b.reg.ControlChatID, redacted); err != nil {
+				return err
+			}
+		}
+		b.recordControlChatUserMessage(ctx, redacted, rejectedModelAPIKeyInboundText)
+		return nil
+	}
+	if err := b.ensureDurableSession(ctx, session); err != nil {
+		return err
+	}
+	inbound, created, err := b.persistInboundWithStatusAndSource(ctx, session, redacted, teamstore.InboundStatusIgnored, rejectedModelAPIKeyInboundSource)
+	if err != nil {
+		return err
+	}
+	if !created {
+		return b.redactExistingRejectedModelAPIKeyInbound(ctx, inbound, session.ChatID, redacted)
+	}
+	return nil
+}
+
+func (b *Bridge) redactExistingRejectedModelAPIKeyInbound(ctx context.Context, existing teamstore.InboundEvent, chatID string, redacted ChatMessage) error {
+	if b == nil || b.store == nil {
+		return fmt.Errorf("Teams store is not configured")
+	}
+	if strings.TrimSpace(existing.ID) == "" || strings.TrimSpace(existing.TeamsChatID) == "" ||
+		strings.TrimSpace(existing.TeamsChatID) != strings.TrimSpace(chatID) ||
+		strings.TrimSpace(existing.TeamsMessageID) != strings.TrimSpace(redacted.ID) {
+		return fmt.Errorf("existing credential inbound identity does not match its redacted receipt")
+	}
+	update := b.store.UpdateInboundEvent
+	if _, machineID, generation := b.ownerFieldsForContext(ctx); strings.TrimSpace(machineID) != "" && generation > 0 {
+		update = func(ctx context.Context, id string, fn func(teamstore.InboundEvent, bool, time.Time) (teamstore.InboundEvent, bool, error)) (teamstore.InboundEvent, bool, error) {
+			return b.store.UpdateInboundEventForOwner(ctx, id, machineID, generation, fn)
+		}
+	}
+	_, _, err := update(ctx, existing.ID, func(current teamstore.InboundEvent, found bool, now time.Time) (teamstore.InboundEvent, bool, error) {
+		if !found {
+			return current, false, fmt.Errorf("existing credential inbound disappeared before redaction")
+		}
+		if strings.TrimSpace(current.TeamsChatID) != strings.TrimSpace(chatID) ||
+			strings.TrimSpace(current.TeamsMessageID) != strings.TrimSpace(redacted.ID) {
+			return current, false, fmt.Errorf("existing credential inbound identity changed before redaction")
+		}
+		if current.Source == rejectedModelAPIKeyInboundSource && current.Text == rejectedModelAPIKeyInboundText && current.TeamsBodyType == "text" &&
+			strings.TrimSpace(current.TeamsBodyHTML) == "" && len(current.TeamsAttachments) == 0 {
+			return current, false, nil
+		}
+		current.Text = rejectedModelAPIKeyInboundText
+		current.TeamsBodyType = "text"
+		current.TeamsBodyHTML = ""
+		current.TeamsAttachments = nil
+		current.Source = rejectedModelAPIKeyInboundSource
+		if strings.TrimSpace(current.TurnID) == "" {
+			current.Status = teamstore.InboundStatusIgnored
+			current.OperationState = ""
+			current.OperationKey = ""
+		}
+		current.UpdatedAt = now
+		return current, true, nil
+	})
+	return err
 }
 
 func containsRawModelAPIKey(text string) bool {
 	fields := strings.Fields(strings.TrimSpace(text))
 	for i, field := range fields {
-		normalized := strings.ToLower(strings.Trim(field, "`'\""))
+		normalized := strings.ToLower(strings.Trim(field, "`'\"()[]{}<>,.;:!?"))
 		normalized = strings.ReplaceAll(normalized, "_", "-")
-		if strings.HasPrefix(normalized, "--api-key-env") || strings.HasPrefix(normalized, "api-key-env") ||
-			strings.HasPrefix(normalized, "--api-key-stdin") || strings.HasPrefix(normalized, "api-key-stdin") {
+		option, value, hasValue := strings.Cut(normalized, "=")
+		if option == "--api-key-env" || option == "api-key-env" || option == "--api-key-stdin" || option == "api-key-stdin" {
+			if hasValue && looksLikeRawModelAPIKeyToken(value) {
+				return true
+			}
 			continue
+		}
+		if hasValue && looksLikeRawModelAPIKeyToken(value) {
+			return true
 		}
 		switch {
 		case strings.HasPrefix(normalized, "--api-key="), strings.HasPrefix(normalized, "api-key="):
@@ -10359,6 +10718,12 @@ func containsRawModelAPIKey(text string) bool {
 			if i+1 < len(fields) && strings.TrimSpace(fields[i+1]) != "" {
 				return true
 			}
+		case strings.HasPrefix(normalized, "--api-key"), strings.HasPrefix(normalized, "api-key"):
+			// Teams HTML/plain-text normalization can concatenate adjacent text
+			// nodes around an option and its value. Fail closed on an attached
+			// value too; only the explicitly supported -env/-stdin spellings
+			// above are exempted.
+			return true
 		case strings.EqualFold(strings.TrimSuffix(normalized, ":"), "authorization") && i+1 < len(fields) && strings.EqualFold(strings.Trim(fields[i+1], "`'\""), "bearer"):
 			return true
 		case looksLikeRawModelAPIKeyToken(strings.Trim(field, "`'\"")):
@@ -10369,7 +10734,7 @@ func containsRawModelAPIKey(text string) bool {
 }
 
 func looksLikeRawModelAPIKeyToken(token string) bool {
-	token = strings.TrimSpace(strings.Trim(token, "`'\""))
+	token = strings.TrimSpace(strings.Trim(token, "`'\"()[]{}<>,.;:!?"))
 	if len(token) < 16 {
 		return false
 	}
@@ -14100,7 +14465,10 @@ func (b *Bridge) handleResolvedSessionMessageWithQueueState(ctx context.Context,
 		return nil
 	}
 	routeText := commandRouteTextFromTeamsMessage(msg, text)
-	if message := modelAPIKeyPreflightMessage(routeText); message != "" {
+	if message := modelAPIKeyPreflightMessageForTeamsMessage(msg, text); message != "" {
+		if err := b.persistRejectedModelAPIKeyInbound(ctx, session, msg); err != nil {
+			return err
+		}
 		return b.sendToChat(ctx, chatID, message)
 	}
 	if parsed := ParseDashboardCommand(ChatScopeWork, routeText); parsed.HelperCommand {
@@ -15116,6 +15484,18 @@ func classifyDeferredInboundFailure(err error) deferredInboundFailureDisposition
 	if err == nil || teamstore.IsProcessWideStateError(err) {
 		return deferredInboundFailureFatal
 	}
+	if errors.Is(err, errModelProfileKeyIntakeLegacyScrubFailed) {
+		// A failed redaction must not fall through to generic control handling or
+		// manual hold while the row can still contain a credential. Retry only the
+		// durable scrub/admission step; no Graph side effect has occurred.
+		return deferredInboundFailureRetry
+	}
+	if errors.Is(err, errModelProfileKeyIntakeSaveInProgress) || errors.Is(err, errModelProfileKeyIntakeSaveOutcomeUnknown) {
+		// A persisted Saving marker has an unknown outcome after restart. Do not
+		// mark the Teams inbound terminal or repeat the model secret/config write
+		// without an operation-specific reconciliation.
+		return deferredInboundFailureHold
+	}
 	// Authentication is fetched before a Graph request crosses the external
 	// side-effect boundary. Temporary OAuth/proxy failures are therefore safe to
 	// retry, but they must use the same durable row-local backoff as other safe
@@ -15230,6 +15610,9 @@ func (b *Bridge) processDeferredInbound(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	if err := b.scrubLegacyManualHoldControlCredentials(ctx); err != nil {
+		return fmt.Errorf("scrub legacy held control credential payload: %w", err)
+	}
 	if control.Paused || control.Draining {
 		return nil
 	}
@@ -15261,6 +15644,17 @@ func (b *Bridge) processDeferredInbound(ctx context.Context) error {
 			continue
 		case "teams_control_poll_deferred":
 			if err := b.processDeferredControlPollInbound(ctx, inbound); err != nil {
+				if handled, handleErr := b.handleDeferredInboundRowFailure(ctx, inbound, err); handled {
+					if handleErr != nil {
+						return handleErr
+					}
+					continue
+				}
+				return err
+			}
+			continue
+		case deferredModelProfileKeyIntakeInboundSource:
+			if err := b.processDeferredModelProfileKeyIntakeInbound(ctx, inbound); err != nil {
 				if handled, handleErr := b.handleDeferredInboundRowFailure(ctx, inbound, err); handled {
 					if handleErr != nil {
 						return handleErr
@@ -15538,7 +15932,178 @@ func (b *Bridge) processDeferredInbound(ctx context.Context) error {
 	return firstRowErr
 }
 
+const legacyControlCredentialScrubBatchSize = 32
+
+func (b *Bridge) scrubLegacyManualHoldControlCredentials(ctx context.Context) error {
+	if b == nil || b.store == nil {
+		return nil
+	}
+	b.legacyControlCredentialScrubMu.Lock()
+	defer b.legacyControlCredentialScrubMu.Unlock()
+	if b.legacyControlCredentialScrubDone {
+		return nil
+	}
+	page, err := b.store.LegacyManualHoldControlCredentialCandidates(ctx,
+		b.legacyControlCredentialScrubAfterID, legacyControlCredentialScrubBatchSize)
+	if err != nil {
+		return err
+	}
+	for _, inbound := range page.Candidates {
+		if legacyManualHoldControlCredentialDetected(inbound) {
+			if err := b.redactLegacyManualHoldControlCredential(ctx, inbound); err != nil {
+				return err
+			}
+		}
+	}
+	b.legacyControlCredentialScrubAfterID = strings.TrimSpace(page.ScannedThroughID)
+	if !page.HasMore {
+		b.legacyControlCredentialScrubDone = true
+	}
+	return nil
+}
+
+func legacyControlCredentialPayload(inbound teamstore.InboundEvent) string {
+	parts := []string{
+		inbound.Text, inbound.TeamsBodyHTML, inbound.LastError, inbound.OperationKey,
+		inbound.OperationAttemptToken, inbound.HoldReason, inbound.HoldRequiredEvidence,
+		inbound.HoldNextAction, inbound.HoldWakeCondition,
+	}
+	for _, attachment := range inbound.TeamsAttachments {
+		parts = append(parts, attachment.ID, attachment.ContentType, attachment.ContentURL, attachment.Content, attachment.Name)
+	}
+	return strings.Join(parts, " ")
+}
+
+func legacyManualHoldControlCredentialDetected(inbound teamstore.InboundEvent) bool {
+	payload := legacyControlCredentialPayload(inbound)
+	if legacyCredentialTextHasRawKey(payload) {
+		return true
+	}
+	message, ok := chatMessageFromInboundContext(inbound)
+	if !ok {
+		return false
+	}
+	routeText := commandRouteTextFromTeamsMessage(message, promptTextFromTeamsMessageHTML(message.Body.Content))
+	return modelProfileKeyIntakeRouteContainsSecret(routeText)
+}
+
+func legacyCredentialTextHasRawKey(text string) bool {
+	fields := strings.Fields(text)
+	for i, field := range fields {
+		token := strings.Trim(field, "`'\"()[]{}<>,.;:!?")
+		if looksLikeRawModelAPIKeyToken(token) {
+			return true
+		}
+		normalizedField := strings.ToLower(token)
+		if strings.EqualFold(normalizedField, "authorization") && i+2 < len(fields) &&
+			strings.EqualFold(strings.Trim(fields[i+1], "`'\"()[]{}<>,.;:!?"), "bearer") &&
+			legacyAPIKeyArgumentLooksSecret(fields[i+2]) {
+			return true
+		}
+		normalized := strings.ReplaceAll(strings.ToLower(token), "_", "-")
+		option, value, hasValue := strings.Cut(normalized, "=")
+		if option != "--api-key" && option != "api-key" {
+			continue
+		}
+		if !hasValue && i+1 < len(fields) {
+			value = fields[i+1]
+		}
+		if legacyAPIKeyArgumentLooksSecret(value) {
+			return true
+		}
+	}
+	return false
+}
+
+func legacyAPIKeyArgumentLooksSecret(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.ContainsAny(value, "<>$") || strings.Contains(value, "...") {
+		return false
+	}
+	value = strings.Trim(value, "`'\"()[]{}<>,.;:!?")
+	if looksLikeRawModelAPIKeyToken(value) {
+		return true
+	}
+	lower := strings.ToLower(value)
+	for _, placeholder := range []string{"placeholder", "redacted", "example", "changeme", "replace-me", "your-key"} {
+		if strings.Contains(lower, placeholder) {
+			return false
+		}
+	}
+	if len(value) < 24 {
+		return false
+	}
+	for _, r := range value {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func (b *Bridge) redactLegacyManualHoldControlCredential(ctx context.Context, candidate teamstore.InboundEvent) error {
+	update := b.store.UpdateInboundEvent
+	if machineID, generation, ownerBound := b.transcriptCheckpointOwnerCapabilityForContext(ctx); ownerBound {
+		update = func(ctx context.Context, id string, fn func(teamstore.InboundEvent, bool, time.Time) (teamstore.InboundEvent, bool, error)) (teamstore.InboundEvent, bool, error) {
+			return b.store.UpdateInboundEventForOwner(ctx, id, machineID, generation, fn)
+		}
+	}
+	_, _, err := update(ctx, candidate.ID, func(current teamstore.InboundEvent, found bool, now time.Time) (teamstore.InboundEvent, bool, error) {
+		if !found || current.ID != candidate.ID || current.TeamsChatID != candidate.TeamsChatID ||
+			current.TeamsMessageID != candidate.TeamsMessageID {
+			return current, false, fmt.Errorf("legacy held control credential identity changed before redaction")
+		}
+		if current.Status != teamstore.InboundStatusManualHold || current.Source != "teams_control_poll_deferred" ||
+			!legacyManualHoldControlCredentialDetected(current) {
+			return current, false, nil
+		}
+		// Preserve the durable identity, ManualHold disposition and any turn
+		// relationship. Replace every free-form payload/diagnostic field so this
+		// legacy queue-only row cannot be replayed or expose the credential.
+		current.Text = legacyRedactedControlPollInboundText
+		current.TextHash = ""
+		current.TeamsBodyType = "text"
+		current.TeamsBodyHTML = ""
+		current.TeamsAttachments = nil
+		current.Source = legacyRedactedControlPollInboundSource
+		current.LastError = "legacy credential-bearing control payload was redacted; explicit reconciliation is required"
+		current.OperationState = "manual_hold"
+		current.OperationKey = ""
+		current.OperationAttemptToken = ""
+		current.OperationStartedAt = time.Time{}
+		current.NextAttemptAt = time.Time{}
+		current.HoldReason = "legacy credential-bearing control payload was redacted"
+		current.HoldRequiredEvidence = "the original Teams identity and local profile state"
+		current.HoldNextAction = "reconcile locally; do not replay this held command automatically"
+		current.HoldWakeCondition = "explicit operator recovery"
+		current.UpdatedAt = now
+		return current, true, nil
+	})
+	return err
+}
+
 func (b *Bridge) processDeferredControlPollInbound(ctx context.Context, inbound teamstore.InboundEvent) error {
+	// Older versions could persist a raw model credential in the generic
+	// queue-only control receipt before the dedicated redacted hand-off existed.
+	// Scrub that durable row before placing it on manual hold. Valid explicit
+	// intake is reclassified to the identity-only recovery path; malformed or
+	// otherwise unsupported credentials get a terminal redacted rejection.
+	if msg, ok := chatMessageFromInboundContext(inbound); ok {
+		routeText := commandRouteTextFromTeamsMessage(msg, promptTextFromTeamsMessageHTML(msg.Body.Content))
+		if modelProfileKeyIntakeDeferredForPoll(inboundPollRoleControl, msg, routeText) {
+			if err := b.persistDeferredModelProfileKeyIntakeInbound(ctx, msg); err != nil {
+				return errors.Join(errModelProfileKeyIntakeLegacyScrubFailed, err)
+			}
+			return nil
+		}
+		if modelAPIKeyPreflightMessageForTeamsMessage(msg, promptTextFromTeamsMessageHTML(msg.Body.Content)) != "" {
+			if err := b.persistRejectedModelAPIKeyInbound(ctx, nil, msg); err != nil {
+				return errors.Join(errModelProfileKeyIntakeLegacyScrubFailed, err)
+			}
+			return nil
+		}
+	}
 	// This source was created by the bounded read poll for commands that were
 	// deliberately not safe to execute in that phase.  Re-entering the generic
 	// control handler here used to turn a durable hand-off into an implicit
@@ -15554,6 +16119,46 @@ func (b *Bridge) processDeferredControlPollInbound(ctx context.Context, inbound 
 		"operation key and provider-side reconciliation evidence",
 		"inspect the command and explicitly replay or resend it",
 		"explicit operator recovery")
+}
+
+func (b *Bridge) processDeferredModelProfileKeyIntakeInbound(ctx context.Context, inbound teamstore.InboundEvent) error {
+	if b == nil || b.store == nil || b.graph == nil {
+		return fmt.Errorf("model-key intake recovery is not configured")
+	}
+	chatID := strings.TrimSpace(inbound.TeamsChatID)
+	messageID := strings.TrimSpace(inbound.TeamsMessageID)
+	if inbound.Source != deferredModelProfileKeyIntakeInboundSource || chatID == "" ||
+		chatID != strings.TrimSpace(b.reg.ControlChatID) || messageID == "" {
+		return fmt.Errorf("deferred model-key intake identity is invalid")
+	}
+	if teamsPollQueueOnly(ctx) {
+		return fmt.Errorf("model-key intake recovery cannot run from a queue-only poll")
+	}
+	msg, err := b.readClient().GetMessageForPoll(ctx, chatID, messageID)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(msg.ID) != messageID {
+		return fmt.Errorf("deferred model-key Graph refetch returned message %q, want %q", strings.TrimSpace(msg.ID), messageID)
+	}
+	if fetchedChatID := strings.TrimSpace(msg.ChatID); fetchedChatID != "" && fetchedChatID != chatID {
+		return fmt.Errorf("deferred model-key Graph refetch returned chat %q, want %q", fetchedChatID, chatID)
+	}
+	routeText := commandRouteTextFromTeamsMessage(msg, promptTextFromTeamsMessageHTML(msg.Body.Content))
+	if modelAPIKeyPreflightMessageForPoll(inboundPollRoleControl, msg, promptTextFromTeamsMessageHTML(msg.Body.Content)) != "" {
+		// Re-run the same body/attachment classifier on the foreground refetch.
+		// Older dedicated receipts, or a message whose attachments changed after
+		// admission, must not reach the secret-store manager just because its body
+		// still resembles a valid key-intake route.
+		return b.persistRejectedModelAPIKeyInbound(ctx, nil, msg)
+	}
+	if !isModelProfileKeyIntakeControlRoute(routeText) {
+		return fmt.Errorf("deferred Teams message no longer matches a model-key control route")
+	}
+	if err := b.handleModelProfileKeyIntakeControlMessage(ctx, msg, routeText); err != nil {
+		return err
+	}
+	return b.markDeferredInboundIgnored(ctx, inbound.ID, "processed deferred model API key intake")
 }
 
 func (b *Bridge) processDeferredQueueOnlySessionCommand(ctx context.Context, inbound teamstore.InboundEvent) error {
@@ -23115,12 +23720,12 @@ func (b *Bridge) flushPendingOutboxMainLoopCore(ctx context.Context, result *mai
 	}
 	var flushErr error
 	if len(chatIDs) > 0 {
-		// Give two distinct chats the normal two-message per-chat quantum. A
-		// single-chat backlog still sends at most two messages, while a healthy
-		// later chat no longer waits behind an arbitrary number of older rows from
-		// one chat. Each targeted flush remains per-chat FIFO and uses the same
-		// unknown-result fail-closed sender path; the combined multi-chat quantum
-		// is therefore at most four messages per cycle.
+		// Give each selected chat the normal two-message per-chat quantum. A
+		// single-chat backlog still sends at most two messages, while a large
+		// multi-chat backlog can make bounded progress in up to eight chats per
+		// cycle. Each targeted flush remains per-chat FIFO and uses the same
+		// unknown-result fail-closed sender path; the combined quantum is at most
+		// sixteen messages per cycle.
 		flushChat := func(chatID string, maxMessages int) error {
 			return b.flushPendingOutboxFilteredWithOptions(ctx, "", "", chatID, outboxFlushOptions{
 				MaxMessages:         maxMessages,
@@ -23131,28 +23736,37 @@ func (b *Bridge) flushPendingOutboxMainLoopCore(ctx context.Context, result *mai
 				// per row. Enabling this bounded main-loop option lets a later
 				// distinct user turn make progress past an unknown protected POST;
 				// it never retries or retires that predecessor.
-				AllowProtectedAmbiguousBypass: true,
-				SkipUnresolvedTranscript:      true,
+				AllowProtectedAmbiguousBypass:     true,
+				SkipUnresolvedTranscript:          true,
+				DeferWorkflowNotificationDelivery: true,
 			})
 		}
 		// A deferred head is a normal durable outcome for one chat, not a phase
-		// failure that should hide a successful delivery from the other selected
-		// chat. Preserve process-wide/store errors, but suppress only the typed
-		// per-chat deferral wrappers from this two-chat fairness path.
-		firstMaxMessages := mainLoopOutboxFlushMaxMessages
-		started = time.Now()
-		firstChatErr := suppressOutboxDeliveryDeferrals(flushChat(chatIDs[0], firstMaxMessages))
-		traceStep("targeted-flush-1:"+chatIDs[0], started, firstChatErr)
-		if teamstore.IsProcessWideStateError(firstChatErr) {
-			return firstChatErr
-		}
-		flushErr = firstChatErr
-		if len(chatIDs) >= 2 {
+		// failure that should hide a successful delivery from another selected
+		// chat. Preserve process-wide/store errors, but suppress only typed
+		// per-chat delivery deferrals. The serial loop also lets a newly persisted
+		// account-wide write-429 gate prevent subsequent Graph POSTs in this same
+		// cycle; do not fan these requests out concurrently.
+		flushErrors := make([]error, 0, len(chatIDs))
+		for index, chatID := range chatIDs {
 			started = time.Now()
-			secondChatErr := suppressOutboxDeliveryDeferrals(flushChat(chatIDs[1], mainLoopOutboxFlushMaxMessages))
-			traceStep("targeted-flush-2:"+chatIDs[1], started, secondChatErr)
-			flushErr = errors.Join(firstChatErr, secondChatErr)
+			rawChatErr := flushChat(chatID, mainLoopOutboxFlushMaxMessages)
+			chatErr := suppressOutboxDeliveryDeferrals(rawChatErr)
+			traceStep(fmt.Sprintf("targeted-flush-%d:%s", index+1, chatID), started, chatErr)
+			if teamstore.IsProcessWideStateError(chatErr) {
+				return chatErr
+			}
+			if isGraphAccountWriteRateLimit(rawChatErr) {
+				// The scope may be explicit while persistence of the account gate
+				// itself is failing. Do not issue more writes from this already-
+				// selected batch; the next cycle will re-read durable gate state.
+				break
+			}
+			if chatErr != nil {
+				flushErrors = append(flushErrors, chatErr)
+			}
 		}
+		flushErr = errors.Join(flushErrors...)
 	} else if chatErr != nil {
 		// A failed fairness preflight cannot prove that the queue is empty, so
 		// retain the bounded global compatibility flush in that case. A
@@ -23163,17 +23777,32 @@ func (b *Bridge) flushPendingOutboxMainLoopCore(ctx context.Context, result *mai
 		// will be observed by the next cycle.
 		started = time.Now()
 		flushErr = b.flushPendingOutboxFilteredWithOptions(ctx, "", "", "", outboxFlushOptions{
-			MaxMessages:                   mainLoopOutboxFlushMaxMessages,
-			MaxScanned:                    mainLoopOutboxFlushMaxScannedMessages,
-			MaxPages:                      mainLoopOutboxFlushMaxPages,
-			AllowProtectedAmbiguousBypass: true,
-			SkipUnresolvedTranscript:      true,
+			MaxMessages:                       mainLoopOutboxFlushMaxMessages,
+			MaxScanned:                        mainLoopOutboxFlushMaxScannedMessages,
+			MaxPages:                          mainLoopOutboxFlushMaxPages,
+			AllowProtectedAmbiguousBypass:     true,
+			SkipUnresolvedTranscript:          true,
+			DeferWorkflowNotificationDelivery: true,
 		})
 		traceStep("global-flush", started, flushErr)
 	} else {
 		traceStep("global-flush-skipped-empty", time.Now(), nil)
 	}
 	if flushErr != nil {
+		if result != nil && !teamstore.IsProcessWideStateError(flushErr) {
+			// An ordinary per-chat failure still suppresses optional cold work,
+			// but it must not hide a separate durable Teams backlog from the fair
+			// maintenance quantum. Probe it once here and carry the result forward;
+			// a failed probe remains fail-closed in the planner.
+			started = time.Now()
+			backlogActive, backlogErr := b.store.TeamsOperationalBacklogActive(ctx)
+			traceStep("backlog-preflight-after-flush-error", started, backlogErr)
+			result.SuppressOptionalMaintenance = true
+			if backlogErr != nil {
+				return errors.Join(flushErr, backlogErr)
+			}
+			result.OperationalBacklogActive = backlogActive
+		}
 		return flushErr
 	}
 	// The two cold outbox lanes below perform Graph history reconciliation and
@@ -23208,6 +23837,7 @@ func (b *Bridge) flushPendingOutboxMainLoopCore(ctx context.Context, result *mai
 			// history/linked work. Do not run a second full outbox JSON safety
 			// scan merely to arrive at the same fail-closed decision.
 			result.SuppressOptionalMaintenance = true
+			result.OperationalBacklogActive = true
 		}
 		traceStep("cold-maintenance-deferred", started, nil)
 		return recoveryErr
@@ -23281,7 +23911,7 @@ func (b *Bridge) observePendingOutboxForOptionalMaintenance(ctx context.Context)
 }
 
 // pendingMainLoopOutboxChatIDs is a bounded, read-only preflight used only to
-// choose between the legacy global flush and the two-chat fairness path. It
+// choose between the legacy global flush and the bounded multi-chat fairness path. It
 // deliberately does not claim rows or infer send success; the subsequent
 // targeted flush re-reads the canonical page and performs the normal owner,
 // lease, attempt, FIFO, and external-result checks.
@@ -23307,54 +23937,43 @@ func (b *Bridge) pendingMainLoopOutboxChatIDs(ctx context.Context) ([]string, er
 	if err != nil {
 		return nil, err
 	}
-	if len(chatIDs) == 0 && afterChatID != "" {
-		// The keyset cursor reached the end of the current distinct-chat set.
-		// Wrap once to the oldest page; a newly queued chat will then enter the
-		// same bounded scan without requiring a process restart.
-		chatIDs, err = b.store.PendingOutboxChatIDsAt(ctx, teamstore.PendingOutboxQuery{
-			Now: time.Now(),
-		}, mainLoopOutboxFairnessScanLimit)
-		if err != nil {
-			return nil, err
+	selected := make([]string, 0, mainLoopOutboxFlushMaxChats)
+	selectedSet := make(map[string]struct{}, mainLoopOutboxFlushMaxChats)
+	appendCandidates := func(candidates []string) {
+		for _, candidate := range candidates {
+			if len(selected) >= mainLoopOutboxFlushMaxChats {
+				return
+			}
+			if _, exists := selectedSet[candidate]; exists {
+				continue
+			}
+			selectedSet[candidate] = struct{}{}
+			selected = append(selected, candidate)
 		}
 	}
-	if len(chatIDs) == 1 && afterChatID != "" {
-		// A keyset page can contain one tail chat even though older chats are
-		// still pending. Keep the tail targeted, then add one wrapped chat (also
-		// targeted) to retain the two-message quantum without falling back to a
-		// global FIFO scan that could consume the same poison prefix forever.
+	appendCandidates(chatIDs)
+	if len(selected) < mainLoopOutboxFlushMaxChats && afterChatID != "" {
+		// The tail page ended before filling the quantum. Wrap to the oldest
+		// pending chats and append only IDs not already selected, preserving
+		// cyclic order and advancing the durable cursor to the last chat actually
+		// admitted. This prevents tail chats from being reselected forever while
+		// a larger batch is being filled across the keyset boundary.
 		wrapped, wrapErr := b.store.PendingOutboxChatIDsAt(ctx, teamstore.PendingOutboxQuery{
 			Now: time.Now(),
 		}, mainLoopOutboxFairnessScanLimit)
 		if wrapErr != nil {
 			return nil, wrapErr
 		}
-		for _, candidate := range wrapped {
-			if candidate == chatIDs[0] {
-				continue
-			}
-			selected := []string{candidate, chatIDs[0]}
-			if err := b.persistOutboxFairCursor(ctx, chatIDs[0]); err != nil {
-				return nil, err
-			}
-			return selected, nil
-		}
+		appendCandidates(wrapped)
 	}
-	if len(chatIDs) <= 2 {
-		if len(chatIDs) > 0 {
-			if err := b.persistOutboxFairCursor(ctx, chatIDs[len(chatIDs)-1]); err != nil {
-				return nil, err
-			}
-		}
-		return chatIDs, nil
+	if len(selected) == 0 {
+		return selected, nil
 	}
 	// The old implementation rotated only inside the first bounded page. That
-	// could permanently hide chat 257 when the first 256 chats stayed pending.
-	// AfterChatID makes the page itself advance across the complete distinct-chat
-	// set while retaining the same two-chat send quantum and all canonical
-	// per-chat FIFO/CAS checks in the targeted flush.
-	selected := []string{chatIDs[0], chatIDs[1]}
-	if err := b.persistOutboxFairCursor(ctx, selected[1]); err != nil {
+	// could permanently hide chats after the scan prefix while earlier chats
+	// stayed pending. The durable keyset cursor walks the full distinct-chat set
+	// over cycles; the targeted sender still owns canonical FIFO/CAS checks.
+	if err := b.persistOutboxFairCursor(ctx, selected[len(selected)-1]); err != nil {
 		return nil, err
 	}
 	return selected, nil
@@ -23681,6 +24300,11 @@ type outboxFlushOptions struct {
 	SkipUnresolvedTranscript      bool
 	IgnoreEarlierOutbox           bool
 	IgnoreRetryGate               bool
+	// DeferWorkflowNotificationDelivery keeps post-send notification delivery
+	// out of the foreground outbox flush. The notification/fallback is still
+	// durable before the Sent side-effect marker is cleared; bounded listener
+	// phases own its eventual delivery.
+	DeferWorkflowNotificationDelivery bool
 }
 
 func transcriptOutboxBlockedByUnresolvedAnchor(ctx context.Context, store *teamstore.Store, msg teamstore.OutboxMessage, anchorCache map[string]teamstore.ExecutionAnchor, anchorKnown map[string]bool) bool {
@@ -24467,7 +25091,7 @@ func (b *Bridge) flushPendingOutboxFilteredWithOptions(ctx context.Context, sess
 					}
 					continue
 				}
-				sendOpts := outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true, AllowAmbiguousRetry: opts.AllowAmbiguousRetry, AllowProtectedAmbiguousBypass: opts.AllowProtectedAmbiguousBypass, IgnoreEarlierOutbox: opts.IgnoreEarlierOutbox, SkipUnresolvedTranscript: opts.SkipUnresolvedTranscript, AnchorCache: anchorCache, AnchorKnown: anchorKnown, RecoveryProbeBudget: &recoveryProbeBudget, RecoveryPageBudget: &recoveryPageBudget, SentSideEffects: &sentSideEffects}
+				sendOpts := outboxSendOptions{RespectRateLimitBlock: true, RecordRateLimit: true, AllowAmbiguousRetry: opts.AllowAmbiguousRetry, AllowProtectedAmbiguousBypass: opts.AllowProtectedAmbiguousBypass, IgnoreEarlierOutbox: opts.IgnoreEarlierOutbox, SkipUnresolvedTranscript: opts.SkipUnresolvedTranscript, DeferWorkflowNotificationDelivery: opts.DeferWorkflowNotificationDelivery, AnchorCache: anchorCache, AnchorKnown: anchorKnown, RecoveryProbeBudget: &recoveryProbeBudget, RecoveryPageBudget: &recoveryPageBudget, SentSideEffects: &sentSideEffects}
 				if transcriptOutboxHasSourceProof(msg) {
 					if sourceProofCache == nil {
 						sourceProofCache = make(map[string]transcriptSourceProofCacheEntry)
@@ -24548,13 +25172,13 @@ func (b *Bridge) flushPendingOutboxFilteredWithOptions(ctx context.Context, sess
 		}
 		return firstBlockedErr
 	}()
-	// Sent-outbox side effects may queue a workflow/fallback notification and
-	// flush the same chat synchronously. Release the chat lane before invoking
-	// them; holding it here would make that legitimate re-entrant path deadlock.
+	// Sent-outbox side effects may queue a workflow/fallback notification. The
+	// foreground main-loop lane asks those notifications to remain queued for
+	// their own bounded phase, so no nested chat flush can delay other chats.
 	unlockChat()
 	for _, effect := range sentSideEffects {
 		effectCtx, cancelEffect := b.pollAttemptDurableContext(ctx)
-		if err := b.completeSentOutboxSideEffects(effectCtx, effect.Outbox, effect.TeamsMessage, effect.GlobalOutboundRecorded); err != nil && b.out != nil {
+		if err := b.completeSentOutboxSideEffectsWithWorkflowDelivery(effectCtx, effect.Outbox, effect.TeamsMessage, effect.GlobalOutboundRecorded, effect.DeferWorkflowNotificationDelivery); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams sent-outbox side effects deferred: %v\n", err)
 		}
 		cancelEffect()
@@ -24741,14 +25365,15 @@ func (b *Bridge) sendQueuedOutbox(ctx context.Context, outbox teamstore.OutboxMe
 }
 
 type outboxSendOptions struct {
-	RespectRateLimitBlock         bool
-	RecordRateLimit               bool
-	AllowAmbiguousRetry           bool
-	AllowProtectedAmbiguousBypass bool
-	IgnoreEarlierOutbox           bool
-	SkipUnresolvedTranscript      bool
-	AnchorCache                   map[string]teamstore.ExecutionAnchor
-	AnchorKnown                   map[string]bool
+	RespectRateLimitBlock             bool
+	RecordRateLimit                   bool
+	AllowAmbiguousRetry               bool
+	AllowProtectedAmbiguousBypass     bool
+	IgnoreEarlierOutbox               bool
+	SkipUnresolvedTranscript          bool
+	DeferWorkflowNotificationDelivery bool
+	AnchorCache                       map[string]teamstore.ExecutionAnchor
+	AnchorKnown                       map[string]bool
 	// RecoveryProbeBudget limits expensive Graph history reconciliation within
 	// one global outbox flush. A single ambiguous row must not monopolize the
 	// flush mutex, and repeated no-match probes are separately backed off per
@@ -24761,9 +25386,10 @@ type outboxSendOptions struct {
 }
 
 type sentOutboxSideEffect struct {
-	Outbox                 teamstore.OutboxMessage
-	TeamsMessage           ChatMessage
-	GlobalOutboundRecorded bool
+	Outbox                            teamstore.OutboxMessage
+	TeamsMessage                      ChatMessage
+	GlobalOutboundRecorded            bool
+	DeferWorkflowNotificationDelivery bool
 }
 
 type sentOutboxSideEffectOptions struct {
@@ -25028,6 +25654,11 @@ func (b *Bridge) sendQueuedOutboxWithOptions(ctx context.Context, outbox teamsto
 			return nil
 		}
 		graphCtx = withGraphBeforeFirstRequest(ctx, graphOwnerPreflight)
+	}
+	if b != nil && b.store != nil {
+		writeAdmission := b.graphWriteRequestAdmission(outbox.TeamsChatID, ownerBound)
+		ctx = withGraphBeforeWriteRequest(ctx, writeAdmission)
+		graphCtx = withGraphBeforeWriteRequest(graphCtx, writeAdmission)
 	}
 	if ownerBound || b.currentLeaseGeneration() > 0 {
 		if err := b.ensureActiveControlLease(ctx); err != nil {
@@ -26393,9 +27024,10 @@ func (b *Bridge) recordSentOutboxSideEffectWithOptions(ctx context.Context, outb
 	}
 	if opts.SentSideEffects != nil {
 		*opts.SentSideEffects = append(*opts.SentSideEffects, sentOutboxSideEffect{
-			Outbox:                 outbox,
-			TeamsMessage:           msg,
-			GlobalOutboundRecorded: sideOpts.GlobalOutboundRecorded,
+			Outbox:                            outbox,
+			TeamsMessage:                      msg,
+			GlobalOutboundRecorded:            sideOpts.GlobalOutboundRecorded,
+			DeferWorkflowNotificationDelivery: opts.DeferWorkflowNotificationDelivery,
 		})
 		return
 	}
@@ -26412,12 +27044,16 @@ func (b *Bridge) recordSentOutboxSideEffectWithOptions(ctx context.Context, outb
 // message provenance are already part of the pre-Sent durable boundary; doing
 // them again here would add lock/JSON/SQLite work to every successful send.
 func (b *Bridge) completeSentOutboxSideEffects(ctx context.Context, outbox teamstore.OutboxMessage, msg ChatMessage, _ bool) error {
+	return b.completeSentOutboxSideEffectsWithWorkflowDelivery(ctx, outbox, msg, false, false)
+}
+
+func (b *Bridge) completeSentOutboxSideEffectsWithWorkflowDelivery(ctx context.Context, outbox teamstore.OutboxMessage, msg ChatMessage, _ bool, deferWorkflowNotificationDelivery bool) error {
 	if b == nil || b.store == nil {
 		return nil
 	}
 	var errs []error
 	if !outbox.BlockedByUnresolvedExecution && !outbox.BlockedByTerminalFailure && !outbox.BlockedBySourceRewrite {
-		if err := b.handleSentOutboxSideEffects(ctx, outbox, msg); err != nil {
+		if err := b.handleSentOutboxSideEffectsWithWorkflowDelivery(ctx, outbox, msg, deferWorkflowNotificationDelivery); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -26556,9 +27192,19 @@ func (b *Bridge) recordOutboxMessageProvenance(ctx context.Context, outbox teams
 }
 
 func (b *Bridge) handleSentOutboxSideEffects(ctx context.Context, outbox teamstore.OutboxMessage, msg ChatMessage) error {
+	return b.handleSentOutboxSideEffectsWithWorkflowDelivery(ctx, outbox, msg, false)
+}
+
+func (b *Bridge) handleSentOutboxSideEffectsWithWorkflowDelivery(ctx context.Context, outbox teamstore.OutboxMessage, msg ChatMessage, deferWorkflowNotificationDelivery bool) error {
 	var errs []error
-	if err := b.queueWorkflowNotificationForSentOutbox(ctx, outbox); err != nil {
-		errs = append(errs, fmt.Errorf("workflow notification: %w", err))
+	var workflowErr error
+	if deferWorkflowNotificationDelivery {
+		workflowErr = b.queueWorkflowNotificationForSentOutboxWithoutImmediateFlush(ctx, outbox)
+	} else {
+		workflowErr = b.queueWorkflowNotificationForSentOutbox(ctx, outbox)
+	}
+	if workflowErr != nil {
+		errs = append(errs, fmt.Errorf("workflow notification: %w", workflowErr))
 	}
 	if err := b.markChatUnreadForSentAnswer(ctx, outbox, msg); err != nil {
 		errs = append(errs, fmt.Errorf("mark chat unread: %w", err))
@@ -27537,6 +28183,12 @@ func isGraphRateLimitError(err error) bool {
 	return errors.As(err, &graphErr) && graphErr.StatusCode == 429
 }
 
+func isGraphAccountWriteRateLimit(err error) bool {
+	var graphErr *GraphStatusError
+	return errors.As(err, &graphErr) && graphErr.StatusCode == http.StatusTooManyRequests &&
+		graphRateLimitScopeIsAccountWide(graphErr.RateLimitScope) && graphStatusErrorHasExplicitNonReadMethod(err)
+}
+
 func isGraphTransientServerError(err error) bool {
 	var graphErr *GraphStatusError
 	return errors.As(err, &graphErr) && graphErr.StatusCode >= 500 && graphErr.StatusCode <= 599
@@ -27561,6 +28213,10 @@ func (b *Bridge) ensureMessageGraphReadAllowed(ctx context.Context, chatID strin
 func (b *Bridge) chatBlockedUntil(ctx context.Context, chatID string) (time.Time, bool, error) {
 	if b.store == nil || strings.TrimSpace(chatID) == "" {
 		return time.Time{}, false, nil
+	}
+	now := time.Now()
+	if accountUntil := b.localGraphWriteAccountBlockedUntil(now); accountUntil.After(now) {
+		return accountUntil, true, nil
 	}
 	limit, ok, err := b.store.OutboxChatRateLimit(ctx, chatID)
 	if err != nil {
@@ -27587,6 +28243,113 @@ func (b *Bridge) chatBlockedUntil(ctx context.Context, chatID string) (time.Time
 		return time.Now().Add(graphReadGateStoreFailureBackoff), false, clearErr
 	}
 	return time.Time{}, false, nil
+}
+
+func (b *Bridge) localGraphWriteAccountBlockedUntil(now time.Time) time.Time {
+	if b == nil {
+		return time.Time{}
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	b.graphWriteGateMu.Lock()
+	defer b.graphWriteGateMu.Unlock()
+	if !b.graphWriteAccountLocalUntil.After(now) {
+		b.graphWriteAccountLocalUntil = time.Time{}
+		return time.Time{}
+	}
+	return b.graphWriteAccountLocalUntil
+}
+
+// acquireGraphWriteRequest is context-aware because upload chunks and targeted
+// sends can have shorter lifetimes than the owning listener.
+func (b *Bridge) acquireGraphWriteRequest(ctx context.Context) (chan struct{}, error) {
+	if b == nil {
+		return nil, teamstore.ErrControlLeaseNotHeld
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	b.graphWriteGateMu.Lock()
+	requestGate := b.graphWriteRequestGate
+	if requestGate == nil {
+		requestGate = make(chan struct{}, 1)
+		requestGate <- struct{}{}
+		b.graphWriteRequestGate = requestGate
+	}
+	b.graphWriteGateMu.Unlock()
+	select {
+	case <-requestGate:
+		return requestGate, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (b *Bridge) graphWriteRequestAdmission(chatID string, ownerBound bool) graphBeforeWriteRequest {
+	if b == nil || b.store == nil {
+		return nil
+	}
+	writeChatID := strings.TrimSpace(chatID)
+	return func(requestCtx context.Context, method string) (graphWriteRequestRelease, error) {
+		requestGate, err := b.acquireGraphWriteRequest(requestCtx)
+		if err != nil {
+			return nil, err
+		}
+		releaseGate := func() { requestGate <- struct{}{} }
+		now := time.Now()
+		if until := b.localGraphWriteAccountBlockedUntil(now); until.After(now) {
+			releaseGate()
+			return nil, outboxDeliveryDeferredError{
+				ChatID: writeChatID,
+				Until:  until,
+				Cause:  errors.New("account-wide Graph write rate limit is active"),
+			}
+		}
+		// A sibling send can wait behind the local write gate long enough for
+		// this sender's lease to expire or be taken over. Revalidate only after
+		// obtaining the gate, immediately before the request boundary.
+		if ownerBound {
+			if err := b.ensureActiveControlLease(requestCtx); err != nil {
+				releaseGate()
+				return nil, &graphRequestPreflightError{cause: err}
+			}
+		}
+		return func(resp *http.Response) {
+			if until := graphAccountWriteRateLimitUntil(method, resp, time.Now()); until.After(time.Now()) {
+				b.setLocalGraphWriteAccountBlockedUntil(until)
+			}
+			releaseGate()
+		}, nil
+	}
+}
+
+func graphAccountWriteRateLimitUntil(method string, resp *http.Response, now time.Time) time.Time {
+	if resp == nil || resp.StatusCode != http.StatusTooManyRequests || graphRequestMethodIsReadOnly(method) {
+		return time.Time{}
+	}
+	if !graphRateLimitScopeIsAccountWide(graphRateLimitScope(resp.Header)) {
+		return time.Time{}
+	}
+	delay := retryAfter(resp.Header.Get("Retry-After"))
+	if delay <= 0 {
+		delay = 30 * time.Second
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	return now.Add(delay)
+}
+
+func (b *Bridge) setLocalGraphWriteAccountBlockedUntil(until time.Time) {
+	if b == nil || until.IsZero() {
+		return
+	}
+	b.graphWriteGateMu.Lock()
+	if until.After(b.graphWriteAccountLocalUntil) {
+		b.graphWriteAccountLocalUntil = until
+	}
+	b.graphWriteGateMu.Unlock()
 }
 
 func (b *Bridge) chatReadBlockedUntil(ctx context.Context, chatID string) (time.Time, bool) {
@@ -28324,8 +29087,15 @@ func (b *Bridge) recordGraphRateLimit(ctx context.Context, chatID string, outbox
 	// separate account/global gate only when Graph explicitly identifies the
 	// response as a write throttle. A read 429, or a bare 429 without a method,
 	// must never stop sibling outbox work by inference.
+	accountWideWriteThrottle := graphRateLimitScopeIsAccountWide(graphErr.RateLimitScope) && graphStatusErrorHasExplicitNonReadMethod(err)
+	if accountWideWriteThrottle {
+		// Fence sibling writes immediately, including when the durable account
+		// gate write below fails. This in-memory fence is process-local; the
+		// persisted rate-limit row remains the restart-surviving source of truth.
+		b.setLocalGraphWriteAccountBlockedUntil(blockedUntil)
+	}
 	persist(chatID)
-	if graphRateLimitScopeIsAccountWide(graphErr.RateLimitScope) && graphStatusErrorHasExplicitNonReadMethod(err) {
+	if accountWideWriteThrottle {
 		persist(graphWriteAccountRateLimitKey)
 	}
 }
@@ -32299,6 +33069,20 @@ func (b *Bridge) queueActiveTurnTranscriptStatusBeforeFinal(ctx context.Context,
 	}
 	if strings.TrimSpace(checkpoint.SessionID) != "" && strings.TrimSpace(checkpoint.SessionID) != strings.TrimSpace(session.ID) {
 		return preparation, fmt.Errorf("%w: checkpoint %q belongs to session %q, not %q", teamstore.ErrSessionStateProvenanceMismatch, checkpointID, checkpoint.SessionID, session.ID)
+	}
+	if anchor := checkpoint.UnresolvedExecution; executionAnchorActive(anchor) && anchor != nil {
+		anchorThreadID := strings.TrimSpace(anchor.ThreadID)
+		liveBranchThreadID := strings.TrimSpace(anchor.LiveBranchThreadID)
+		turnThreadID := strings.TrimSpace(turn.CodexThreadID)
+		if liveBranchThreadID != "" && liveBranchThreadID != anchorThreadID &&
+			liveBranchThreadID == turnThreadID && strings.TrimSpace(anchor.OuterTurnID) != strings.TrimSpace(turn.ID) {
+			// This checkpoint still belongs to the quarantined historical owner.
+			// The current turn is on the separately admitted durable live branch;
+			// scanning or advancing the shared transcript cursor here could cross
+			// records whose ownership is still unresolved. The caller's subsequent
+			// completion CAS remains authoritative for this exact branch and final.
+			return preparation, nil
+		}
 	}
 	if strings.TrimSpace(checkpoint.LastRecordID) == "" {
 		return preparation, nil
