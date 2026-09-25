@@ -191,6 +191,11 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		// short hook/legacy-lane window, so broad race-shard I/O must not turn a
 		// healthy operation into a false readiness or budget failure.
 		"TestSQLiteHotPollCorruptProbeRejectsNonRFC3339Times": true,
+		// This hash-fence regression also enters the two-second compatibility
+		// admission path. Keep it out of parallel race shards; CPU/filesystem
+		// pressure can expire the intentional fail-closed budget before the CAS
+		// assertion is reached.
+		"TestSQLiteHotPollRecoveryHashFenceRejectsMissingAndReplacedPoll": true,
 		// This corrupt-session witness must reach the bounded compatibility
 		// fallback before its two-second admission budget expires. A broad race
 		// shard can consume that budget in SQLite setup/I/O even though the
@@ -340,6 +345,7 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 	},
 	"./internal/teams/store": {
 		"TestSQLiteHotPollCorruptProbeRejectsNonRFC3339Times":                                  true,
+		"TestSQLiteHotPollRecoveryHashFenceRejectsMissingAndReplacedPoll":                      true,
 		"TestSQLiteHotPollCorruptSessionWithOpaquePollIsFencedAcrossReopen":                    true,
 		"TestSQLiteHotPollCanonicalFallbackReleasesStoreLockDuringRead":                        true,
 		"TestSQLiteHotPollStandaloneCanonicalFallbackReleasesStoreLockDuringRead":              true,
