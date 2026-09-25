@@ -186,6 +186,21 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		"TestBridgeMachineDelegationWorkerCancelsRunningExecution": true,
 	},
 	"./internal/teams/store": {
+		// These hot-poll recovery fixtures deliberately exercise the bounded
+		// JSON compatibility lane for malformed, contradictory, or untrusted
+		// canonical rows. Keep them out of broad race shards so unrelated SQLite
+		// I/O cannot consume the production two-second fail-closed admission
+		// budget before their recovery assertions run.
+		"TestSQLiteHotPollAdmissionReportsOnlyCorruptDueSession":                   true,
+		"TestSQLiteHotPollAdmissionReportsTypedCorruptSessionField":                true,
+		"TestSQLiteHotPollAdmissionReportsCorruptSessionAlongsideHealthyCandidate": true,
+		"TestSQLiteHotPollAdmissionReportsContradictorySessionIdentity":            true,
+		"TestSQLiteHotPollCorruptWorkProbeIgnoresStaleScalarGates":                 true,
+		"TestSQLiteHotPollCorruptProbeFailsClosedOnNullScalarAndInvalidTime":       true,
+		"TestSQLiteHotPollCorruptProbeAdvancesPastControlAndFencedPrefix":          true,
+		"TestSQLiteHotPollWorkAdmissionKeepsRoutableUntrustedSessionFallback":      true,
+		"TestSQLiteHotPollReadyCanonicalFallbackReleasesStoreLockDuringRead":       true,
+		"TestSQLiteMalformedSessionDoesNotDisableHealthyHotPollAdmission":          true,
 		// These tests deliberately observe the first phase of a SQLite
 		// compatibility/fallback operation.  Their correctness depends on a
 		// short hook/legacy-lane window, so broad race-shard I/O must not turn a
@@ -349,6 +364,16 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestBridgeMachineDelegationWorkerCancelsRunningExecution": true,
 	},
 	"./internal/teams/store": {
+		"TestSQLiteHotPollAdmissionReportsOnlyCorruptDueSession":                               true,
+		"TestSQLiteHotPollAdmissionReportsTypedCorruptSessionField":                            true,
+		"TestSQLiteHotPollAdmissionReportsCorruptSessionAlongsideHealthyCandidate":             true,
+		"TestSQLiteHotPollAdmissionReportsContradictorySessionIdentity":                        true,
+		"TestSQLiteHotPollCorruptWorkProbeIgnoresStaleScalarGates":                             true,
+		"TestSQLiteHotPollCorruptProbeFailsClosedOnNullScalarAndInvalidTime":                   true,
+		"TestSQLiteHotPollCorruptProbeAdvancesPastControlAndFencedPrefix":                      true,
+		"TestSQLiteHotPollWorkAdmissionKeepsRoutableUntrustedSessionFallback":                  true,
+		"TestSQLiteHotPollReadyCanonicalFallbackReleasesStoreLockDuringRead":                   true,
+		"TestSQLiteMalformedSessionDoesNotDisableHealthyHotPollAdmission":                      true,
 		"TestSQLiteHotPollCorruptProbeRejectsNonRFC3339Times":                                  true,
 		"TestSQLiteHotPollRecoveryHashFenceRejectsMissingAndReplacedPoll":                      true,
 		"TestSQLiteHotPollAdmissionFallbackKeepsHealthyRowsOnScalarLane":                       true,
