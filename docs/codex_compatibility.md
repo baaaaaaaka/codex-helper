@@ -9,6 +9,7 @@ Auto-updated by `.github/workflows/codex-release-monitor.yml`.
 | 0.160.0-alpha.6 | pass | pass | pass | pass | pass | pass | 2026-09-29T11:47:40Z |
 | 0.160.0-alpha.3 | pass | pass | pass | pass | pass | pass | 2026-09-29T05:56:56Z |
 | 0.160.0-alpha.2 | pass | pass | pass | pass | pass | pass | 2026-09-29T00:03:55Z |
+| 0.159.2 | pass | pass | pass | pass | pass | pass | 2026-09-30T00:41:34Z |
 | 0.159.1 | pass | pass | pass | pass | pass | pass | 2026-09-29T21:32:45Z |
 | 0.159.0 | pass | pass | pass | pass | pass | pass | 2026-09-29T11:47:40Z |
 | 0.159.0-alpha.13 | pass | pass | pass | pass | pass | pass | 2026-09-28T19:47:04Z |
