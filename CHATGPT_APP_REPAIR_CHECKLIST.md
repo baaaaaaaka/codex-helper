@@ -45,7 +45,7 @@ The pre-existing Windows launch investigation changes and `research-artifacts/ap
 ## Validation and CI
 
 - [x] Add focused Windows/macOS regression selectors to CI and update Linux-only unsupported-platform checks.
-- [x] Run Windows install smokes with the existing runner user's linked limited token rather than bypassing the production elevation guard on elevated GitHub runners.
+- [x] Implement Windows smoke launch using the runner user's linked limited token when available, with a same-user restricted medium-integrity LUA-token fallback when the runner exposes no linked token.
 - [ ] Verify the standard-account Windows app install/managed-launch smokes pass in GitHub CI.
 - [x] Run focused Linux Go tests and the 32-test CI shard-contract suite.
 - [x] Cross-compile Windows/amd64 and macOS/amd64 + arm64 test binaries.
@@ -57,6 +57,6 @@ The pre-existing Windows launch investigation changes and `research-artifacts/ap
 
 - `CXP_RUNTIME_DISABLE=1 go test ./... -count=1` completed but was not green: the Windows PowerShell script-parse tests could not reach PowerShell from WSL (`UtilBindVsockAnyPort`), and `internal/helperruntime/TestLaunchKeepsExplicitSameBasePrereleaseActive` failed. The changed packages' focused regression tests passed.
 - Windows checksum/concurrency tests, Windows elevation/managed-launch tests, and a CIM process-path smoke passed through host PowerShell. The full managed-app install/launch smoke was not run to completion because a pre-existing ChatGPT/Codex process was detected; it was left untouched.
-- GitHub CI confirmed Windows hosted jobs use elevated tokens. An isolated local account lost the Store logon-session context (`0x80070520`), and Task Scheduler's `Interactive`/`Limited` configuration still returned an elevated token. The smoke now launches with the existing runner user's linked limited token, verifies it is not an effective Administrator, and keeps the production guard enabled; this revised mechanism still requires a green Windows CI run.
+- GitHub CI confirmed Windows hosted jobs use elevated tokens. An isolated local account lost the Store logon-session context (`0x80070520`), Task Scheduler's `Interactive`/`Limited` configuration still returned an elevated token, and the runner's current token did not expose a linked limited token. The smoke prefers that linked token, then derives a same-user restricted token with Administrators disabled and medium integrity; both paths retain the production guard and verify the child is not an effective Administrator. The local WSL-host check derived the restricted token but could not create its child because the caller lacks `SeImpersonatePrivilege` (`CreateProcessWithTokenW` returned `ERROR_PRIVILEGE_NOT_HELD` 1314); only native Windows CI can prove the hosted runner's privilege and Store/managed-launch behavior.
 - macOS Intel/Apple Silicon test binaries cross-compiled successfully. The native macOS DMG install/update network smoke is configured in GitHub CI but could not run on this Linux/WSL host; live LaunchServices and OpenAI background-updater behavior remain unverified.
 - `python3 scripts/tests/test_ci_targeted_shards.py` passed (32 tests); the macOS network smoke passed `bash -n`; `git diff --check` passed.

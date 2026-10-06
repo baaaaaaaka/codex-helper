@@ -108,11 +108,33 @@ using System.Text;
 public static class CxpLimitedTokenProcess
 {
     private const uint TokenQuery = 0x0008;
+    private const uint TokenAssignPrimary = 0x0001;
+    private const uint TokenDuplicate = 0x0002;
+    private const uint TokenAdjustDefault = 0x0080;
+    private const uint DisableMaxPrivilege = 0x0001;
+    private const uint LuaToken = 0x0004;
     private const int TokenLinkedToken = 19;
+    private const int TokenElevation = 20;
+    private const int TokenIntegrityLevel = 25;
     private const uint CreateUnicodeEnvironment = 0x00000400;
     private const uint WaitObject0 = 0x00000000;
     private const uint WaitTimeout = 0x00000102;
     private const uint Infinite = 0xFFFFFFFF;
+    private const uint SeGroupIntegrity = 0x00000020;
+    private const int MediumIntegrityRid = 8192;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct SidAndAttributes
+    {
+        public IntPtr Sid;
+        public uint Attributes;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct TokenMandatoryLabel
+    {
+        public SidAndAttributes Label;
+    }
 
     [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
     private struct StartupInfo
@@ -165,10 +187,135 @@ public static class CxpLimitedTokenProcess
     private static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
 
     [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool CreateRestrictedToken(IntPtr existingToken, uint flags, uint disableSidCount, ref SidAndAttributes sidsToDisable, uint deletePrivilegeCount, IntPtr privilegesToDelete, uint restrictedSidCount, IntPtr sidsToRestrict, out IntPtr newToken);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
     private static extern bool GetTokenInformation(IntPtr token, int informationClass, out IntPtr information, uint informationLength, out uint returnedLength);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool GetTokenInformation(IntPtr token, int informationClass, IntPtr information, uint informationLength, out uint returnedLength);
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool ConvertStringSidToSidW(string stringSid, out IntPtr sid);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern uint GetLengthSid(IntPtr sid);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool SetTokenInformation(IntPtr token, int informationClass, IntPtr information, uint informationLength);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr LocalFree(IntPtr memory);
 
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern bool CreateProcessWithTokenW(IntPtr token, uint logonFlags, string applicationName, StringBuilder commandLine, uint creationFlags, IntPtr environment, string currentDirectory, ref StartupInfo startupInfo, out ProcessInformation processInformation);
+
+    private static void SetMediumIntegrity(IntPtr token)
+    {
+        IntPtr mediumSid = IntPtr.Zero;
+        IntPtr labelBuffer = IntPtr.Zero;
+        try
+        {
+            if (!ConvertStringSidToSidW("S-1-16-" + MediumIntegrityRid, out mediumSid))
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "create the standard-user integrity SID");
+            uint sidLength = GetLengthSid(mediumSid);
+            if (sidLength == 0)
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "measure the standard-user integrity SID");
+
+            int labelSize = Marshal.SizeOf(typeof(TokenMandatoryLabel));
+            labelBuffer = Marshal.AllocHGlobal(labelSize + (int)sidLength);
+            IntPtr embeddedSid = IntPtr.Add(labelBuffer, labelSize);
+            byte[] sidBytes = new byte[sidLength];
+            Marshal.Copy(mediumSid, sidBytes, 0, (int)sidLength);
+            Marshal.Copy(sidBytes, 0, embeddedSid, (int)sidLength);
+            TokenMandatoryLabel label = new TokenMandatoryLabel();
+            label.Label.Sid = embeddedSid;
+            label.Label.Attributes = SeGroupIntegrity;
+            Marshal.StructureToPtr(label, labelBuffer, false);
+            if (!SetTokenInformation(token, TokenIntegrityLevel, labelBuffer, (uint)(labelSize + sidLength)))
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "set the smoke process to medium integrity");
+        }
+        finally
+        {
+            if (labelBuffer != IntPtr.Zero) Marshal.FreeHGlobal(labelBuffer);
+            if (mediumSid != IntPtr.Zero) LocalFree(mediumSid);
+        }
+    }
+
+    private static bool IsElevated(IntPtr token)
+    {
+        uint returnedLength;
+        IntPtr buffer = Marshal.AllocHGlobal(sizeof(uint));
+        try
+        {
+            if (!GetTokenInformation(token, TokenElevation, buffer, sizeof(uint), out returnedLength))
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "query limited-token elevation");
+            if (returnedLength < sizeof(uint))
+                throw new InvalidOperationException("Windows returned an incomplete token elevation value");
+            return Marshal.ReadInt32(buffer) != 0;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buffer);
+        }
+    }
+
+    private static IntPtr GetLimitedToken(IntPtr currentToken)
+    {
+        IntPtr limitedToken = IntPtr.Zero;
+        uint returnedLength;
+        bool linkedTokenQuerySucceeded = GetTokenInformation(currentToken, TokenLinkedToken, out limitedToken, (uint)IntPtr.Size, out returnedLength);
+        int linkedTokenError = linkedTokenQuerySucceeded ? 0 : Marshal.GetLastWin32Error();
+        string linkedTokenStatus = linkedTokenQuerySucceeded ? "the linked token was unavailable or elevated" : "linked-token query failed with Win32 error " + linkedTokenError;
+        if (linkedTokenQuerySucceeded && limitedToken != IntPtr.Zero)
+        {
+            try
+            {
+                if (!IsElevated(limitedToken)) return limitedToken;
+            }
+            catch
+            {
+                CloseHandle(limitedToken);
+                throw;
+            }
+            CloseHandle(limitedToken);
+            limitedToken = IntPtr.Zero;
+            linkedTokenStatus = "the linked token was elevated";
+        }
+
+        IntPtr administratorsSid = IntPtr.Zero;
+        try
+        {
+            if (!ConvertStringSidToSidW("S-1-5-32-544", out administratorsSid))
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "create the Administrators SID");
+            SidAndAttributes disabledSid = new SidAndAttributes();
+            disabledSid.Sid = administratorsSid;
+            if (!CreateRestrictedToken(currentToken, DisableMaxPrivilege | LuaToken, 1, ref disabledSid, 0, IntPtr.Zero, 0, IntPtr.Zero, out limitedToken))
+            {
+                int error = Marshal.GetLastWin32Error();
+                throw new Win32Exception(error, "create LUA token after " + linkedTokenStatus);
+            }
+            if (limitedToken == IntPtr.Zero)
+                throw new InvalidOperationException("CreateRestrictedToken returned no token after " + linkedTokenStatus);
+        }
+        finally
+        {
+            if (administratorsSid != IntPtr.Zero) LocalFree(administratorsSid);
+        }
+
+        try
+        {
+            SetMediumIntegrity(limitedToken);
+            if (IsElevated(limitedToken))
+                throw new InvalidOperationException("the restricted Windows token is still elevated after " + linkedTokenStatus);
+            return limitedToken;
+        }
+        catch
+        {
+            CloseHandle(limitedToken);
+            throw;
+        }
+    }
 
     public static int Run(string application, string arguments, string currentDirectory, uint timeoutMilliseconds)
     {
@@ -177,19 +324,15 @@ public static class CxpLimitedTokenProcess
         ProcessInformation process = new ProcessInformation();
         try
         {
-            if (!OpenProcessToken(GetCurrentProcess(), TokenQuery, out currentToken))
+            if (!OpenProcessToken(GetCurrentProcess(), TokenQuery | TokenAssignPrimary | TokenDuplicate | TokenAdjustDefault, out currentToken))
                 throw new Win32Exception(Marshal.GetLastWin32Error(), "open current Windows token");
-            uint returnedLength;
-            if (!GetTokenInformation(currentToken, TokenLinkedToken, out limitedToken, (uint)IntPtr.Size, out returnedLength))
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "query the current user's linked limited token");
-            if (limitedToken == IntPtr.Zero)
-                throw new InvalidOperationException("the current Windows token has no linked limited token");
+            limitedToken = GetLimitedToken(currentToken);
 
             StartupInfo startup = new StartupInfo();
             startup.cb = Marshal.SizeOf(typeof(StartupInfo));
             StringBuilder commandLine = new StringBuilder("\"" + application + "\" " + arguments);
             if (!CreateProcessWithTokenW(limitedToken, 0, application, commandLine, CreateUnicodeEnvironment, IntPtr.Zero, currentDirectory, ref startup, out process))
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "start the desktop smoke with the linked limited token");
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "start the desktop smoke with the selected limited token");
 
             uint waitResult = WaitForSingleObject(process.hProcess, timeoutMilliseconds);
             if (waitResult == WaitTimeout)
