@@ -59,7 +59,12 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 	windowsDesktop := workflowStepBlock(t, targetedJob, "Codex desktop app network install smoke (Windows)")
 	requireStepContains(t, windowsDesktop,
 		"if: matrix.shard == 'windows-skills-desktop-b' && runner.os == 'Windows'",
-		`.\scripts\ci\codex_app_network_install_smoke.ps1 -Helper $helper`,
+		`.\scripts\ci\codex_app_smoke_as_standard_user.ps1 -Helper $helper -NetworkInstall`,
+	)
+	managedDesktop := workflowStepBlock(t, targetedJob, "Codex desktop app managed runtime smoke (Windows)")
+	requireStepContains(t, managedDesktop,
+		"if: matrix.shard == 'windows-skills-desktop-b' && runner.os == 'Windows'",
+		`.\scripts\ci\codex_app_smoke_as_standard_user.ps1 -Helper $helper -ManagedInstall`,
 	)
 	for _, name := range []string{
 		"Install Codex for integration (Windows)",

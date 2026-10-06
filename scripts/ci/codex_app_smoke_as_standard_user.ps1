@@ -59,6 +59,19 @@ if ($Child) {
     try {
       if ($settings.NetworkInstall) {
         $env:CXP_WINDOWS_APP_BACKEND = "legacy"
+        if (!(Get-Command winget -ErrorAction SilentlyContinue)) {
+          $manifest = ([string]$settings.AppInstallerManifest).Replace("'", "''")
+          if ([string]::IsNullOrWhiteSpace($manifest) -or !(Test-Path -LiteralPath $manifest -PathType Leaf)) {
+            throw "the hosted runner's App Installer manifest is unavailable for the standard-user smoke"
+          }
+          $registrationCommand = "Add-AppxPackage -Path '$manifest' -Register -DisableDevelopmentMode -ErrorAction Stop"
+          $windowsPowerShell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+          & $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $registrationCommand
+          if ($LASTEXITCODE -ne 0) { throw "registering App Installer for the standard-user smoke failed with exit code $LASTEXITCODE" }
+          if (!(Get-Command winget -ErrorAction SilentlyContinue)) {
+            throw "App Installer registration did not expose winget to the standard-user smoke"
+          }
+        }
         & (Join-Path $PSScriptRoot "codex_app_network_install_smoke.ps1") -Helper $settings.Helper
       } else {
         & (Join-Path $PSScriptRoot "codex_app_managed_install_smoke.ps1") `
@@ -79,7 +92,7 @@ if ($Child) {
 if ($NetworkInstall -eq $ManagedInstall) {
   throw "select exactly one of -NetworkInstall or -ManagedInstall"
 }
-if (!(Test-Path -LiteralPath $Helper -PathType Leaf)) {
+  if (!(Test-Path -LiteralPath $Helper -PathType Leaf)) {
   throw "helper does not exist: $Helper"
 }
 if ($ManagedInstall -and (!(Test-Path -LiteralPath $RecordingProxy -PathType Leaf) -or !(Test-Path -LiteralPath $FakeChatGPT -PathType Leaf))) {
@@ -87,6 +100,19 @@ if ($ManagedInstall -and (!(Test-Path -LiteralPath $RecordingProxy -PathType Lea
 }
 
 $runnerTemp = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [IO.Path]::GetTempPath() }
+$appInstallerManifest = ""
+if ($NetworkInstall) {
+  $appInstallerPackage = Get-AppxPackage -Name Microsoft.DesktopAppInstaller -ErrorAction SilentlyContinue |
+    Sort-Object Version -Descending |
+    Select-Object -First 1
+  if ($null -eq $appInstallerPackage) {
+    throw "the hosted runner does not have the App Installer package needed to register winget for the standard-user smoke"
+  }
+  $appInstallerManifest = Join-Path $appInstallerPackage.InstallLocation "AppxManifest.xml"
+  if (!(Test-Path -LiteralPath $appInstallerManifest -PathType Leaf)) {
+    throw "the hosted runner's App Installer manifest does not exist: $appInstallerManifest"
+  }
+}
 $smokeRoot = Join-Path $runnerTemp ("cxp-desktop-standard-user-" + [guid]::NewGuid().ToString("N"))
 $accountName = "CxpSmk" + [guid]::NewGuid().ToString("N").Substring(0, 12)
 $account = $null
@@ -133,6 +159,7 @@ try {
     ProfileRoot = Join-Path $env:SystemDrive ("Users\" + $accountName)
     Helper = $smokeHelper
     NetworkInstall = [bool]$NetworkInstall
+    AppInstallerManifest = $appInstallerManifest
     RecordingProxy = $smokeProxy
     FakeChatGPT = $smokeFake
   } | ConvertTo-Json | Set-Content -LiteralPath $settingsPath -Encoding UTF8
