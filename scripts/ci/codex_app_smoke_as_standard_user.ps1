@@ -113,6 +113,7 @@ public static class CxpLimitedTokenProcess
     private const uint TokenAdjustDefault = 0x0080;
     private const uint DisableMaxPrivilege = 0x0001;
     private const uint LuaToken = 0x0004;
+    private const int ErrorPrivilegeNotHeld = 1314;
     private const int TokenLinkedToken = 19;
     private const int TokenElevation = 20;
     private const int TokenIntegrityLevel = 25;
@@ -209,6 +210,9 @@ public static class CxpLimitedTokenProcess
 
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern bool CreateProcessWithTokenW(IntPtr token, uint logonFlags, string applicationName, StringBuilder commandLine, uint creationFlags, IntPtr environment, string currentDirectory, ref StartupInfo startupInfo, out ProcessInformation processInformation);
+
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool CreateProcessAsUserW(IntPtr token, string applicationName, StringBuilder commandLine, IntPtr processAttributes, IntPtr threadAttributes, bool inheritHandles, uint creationFlags, IntPtr environment, string currentDirectory, ref StartupInfo startupInfo, out ProcessInformation processInformation);
 
     private static void SetMediumIntegrity(IntPtr token)
     {
@@ -332,7 +336,21 @@ public static class CxpLimitedTokenProcess
             startup.cb = Marshal.SizeOf(typeof(StartupInfo));
             StringBuilder commandLine = new StringBuilder("\"" + application + "\" " + arguments);
             if (!CreateProcessWithTokenW(limitedToken, 0, application, commandLine, CreateUnicodeEnvironment, IntPtr.Zero, currentDirectory, ref startup, out process))
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "start the desktop smoke with the selected limited token");
+            {
+                int error = Marshal.GetLastWin32Error();
+                if (error != ErrorPrivilegeNotHeld)
+                    throw new Win32Exception(error, "start the desktop smoke with the selected limited token (Win32 error " + error + ")");
+
+                startup = new StartupInfo();
+                startup.cb = Marshal.SizeOf(typeof(StartupInfo));
+                commandLine = new StringBuilder("\"" + application + "\" " + arguments);
+                process = new ProcessInformation();
+                if (!CreateProcessAsUserW(limitedToken, application, commandLine, IntPtr.Zero, IntPtr.Zero, false, CreateUnicodeEnvironment, IntPtr.Zero, currentDirectory, ref startup, out process))
+                {
+                    int fallbackError = Marshal.GetLastWin32Error();
+                    throw new Win32Exception(fallbackError, "CreateProcessWithTokenW failed with Win32 error " + error + "; CreateProcessAsUserW fallback failed with Win32 error " + fallbackError);
+                }
+            }
 
             uint waitResult = WaitForSingleObject(process.hProcess, timeoutMilliseconds);
             if (waitResult == WaitTimeout)
