@@ -1,6 +1,8 @@
 param(
   [Parameter(Mandatory = $true)]
-  [string]$Helper
+  [string]$Helper,
+  [string]$RecordingProxy = "",
+  [string]$FakeChatGPT = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -57,8 +59,8 @@ $config = Join-Path $base "config.json"
 $out = Join-Path $base "app-launch.out"
 $proxyPortFile = Join-Path $base "proxy.port"
 $proxyLog = Join-Path $base "proxy.log"
-$proxyExe = Join-Path $base "recording-proxy.exe"
-$fakeExe = Join-Path $base "fake-chatgpt.exe"
+$proxyExe = if ($RecordingProxy) { $RecordingProxy } else { Join-Path $base "recording-proxy.exe" }
+$fakeExe = if ($FakeChatGPT) { $FakeChatGPT } else { Join-Path $base "fake-chatgpt.exe" }
 $fakeLog = Join-Path $base "fake-child.log"
 $instanceId = "ci-recording"
 $profileId = "ci-recording-profile"
@@ -84,8 +86,12 @@ try {
 
   # The fixture is a local process. No SSH, GitHub token, ChatGPT auth, or
   # third-party credential is involved in reusing this proxy instance.
-  & go build -o $proxyExe .\scripts\ci\windows_managed_recording_proxy
-  if ($LASTEXITCODE -ne 0) { throw "building recording proxy fixture failed" }
+  if ($RecordingProxy) {
+    if (!(Test-Path -LiteralPath $proxyExe -PathType Leaf)) { throw "recording proxy fixture does not exist: $proxyExe" }
+  } else {
+    & go build -o $proxyExe .\scripts\ci\windows_managed_recording_proxy
+    if ($LASTEXITCODE -ne 0) { throw "building recording proxy fixture failed" }
+  }
   $proxyProcess = Start-Process -FilePath $proxyExe -ArgumentList @("--port-file", $proxyPortFile, "--log", $proxyLog, "--instance-id", $instanceId) -PassThru -WindowStyle Hidden
   Wait-File $proxyPortFile $proxyProcess
   $proxyPort = [int](Get-Content -Raw -LiteralPath $proxyPortFile)
@@ -177,8 +183,12 @@ try {
   }
 
   $env:CXP_TEST_CHILD_LOG = $fakeLog
-  & go build -o $fakeExe .\scripts\ci\windows_managed_fake_chatgpt
-  if ($LASTEXITCODE -ne 0) { throw "building fake ChatGPT child failed" }
+  if ($FakeChatGPT) {
+    if (!(Test-Path -LiteralPath $fakeExe -PathType Leaf)) { throw "fake ChatGPT fixture does not exist: $fakeExe" }
+  } else {
+    & go build -o $fakeExe .\scripts\ci\windows_managed_fake_chatgpt
+    if ($LASTEXITCODE -ne 0) { throw "building fake ChatGPT child failed" }
+  }
   Copy-Item -LiteralPath $fakeExe -Destination $managedExe -Force
   $state.executableSha256 = (Get-FileHash -LiteralPath $managedExe -Algorithm SHA256).Hash.ToLowerInvariant()
   $state | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $statePath -Encoding UTF8

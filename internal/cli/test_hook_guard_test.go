@@ -34,6 +34,7 @@ func lockCLITestHooks(t testing.TB) {
 	prevTeamsServiceArgv0 := teamsServiceArgv0
 	prevTeamsUpdatePendingHelperActivationOwned := teamsUpdatePendingHelperActivationOwned
 	prevTeamsUserPathResolver := teamsUserPathResolver
+	prevCodexAppTokenElevationFn := codexAppTokenElevationFn
 	type envValue struct {
 		value string
 		set   bool
@@ -60,6 +61,7 @@ func lockCLITestHooks(t testing.TB) {
 	restartArgv0 = func() string { return installPath }
 	teamsServiceArgv0 = func() string { return installPath }
 	teamsUpdatePendingHelperActivationOwned = func(string, string) bool { return true }
+	codexAppTokenElevationFn = func() (bool, error) { return false, nil }
 	teamsUserPathResolver = cliTestUserPathResolverFunc(func(_ context.Context, request userpath.Request) (userpath.Result, error) {
 		pathValue, _ := userpath.EnvironmentValue(request.ServiceEnvironment, "PATH", false)
 		return userpath.Result{Path: pathValue, Mode: userpath.ModeService, Source: "test-service-environment"}, nil
@@ -70,6 +72,7 @@ func lockCLITestHooks(t testing.TB) {
 		teamsServiceArgv0 = prevTeamsServiceArgv0
 		teamsUpdatePendingHelperActivationOwned = prevTeamsUpdatePendingHelperActivationOwned
 		teamsUserPathResolver = prevTeamsUserPathResolver
+		codexAppTokenElevationFn = prevCodexAppTokenElevationFn
 		for _, key := range []string{
 			update.EnvInstallPath,
 			update.EnvInstallDir,

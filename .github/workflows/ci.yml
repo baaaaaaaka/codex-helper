@@ -1944,22 +1944,7 @@ jobs:
           $helper = Join-Path $env:RUNNER_TEMP "codex-proxy-desktop-network-smoke.exe"
           go build -o $helper .\cmd\codex-proxy
           go test ./internal/cli -run 'TestCodexDesktopWindows(AppXEntrySelectionIntegration|ManifestExecutableCandidateIntegration|Script)' -count=1 -v
-          $oldBackend = $env:CXP_WINDOWS_APP_BACKEND
-          $env:CXP_WINDOWS_APP_BACKEND = "legacy"
-          try {
-            for ($attempt = 1; $attempt -le 2; $attempt++) {
-              try {
-                .\scripts\ci\codex_app_network_install_smoke.ps1 -Helper $helper
-                break
-              } catch {
-                if ($attempt -eq 2) { throw }
-                Write-Warning "Codex desktop app smoke failed on attempt $attempt; retrying in 10 seconds: $($_.Exception.Message)"
-                Start-Sleep -Seconds 10
-              }
-            }
-          } finally {
-            if ($null -eq $oldBackend) { Remove-Item Env:CXP_WINDOWS_APP_BACKEND -ErrorAction SilentlyContinue } else { $env:CXP_WINDOWS_APP_BACKEND = $oldBackend }
-          }
+          .\scripts\ci\codex_app_smoke_as_standard_user.ps1 -Helper $helper -NetworkInstall
 
       - name: Codex desktop app managed runtime smoke (Windows)
         if: matrix.shard == 'windows-skills-desktop-b' && runner.os == 'Windows'
@@ -1980,22 +1965,17 @@ jobs:
           }
           $helper = Join-Path $env:RUNNER_TEMP "codex-proxy-managed-chatgpt-smoke.exe"
           go build -o $helper .\cmd\codex-proxy
+          $recordingProxy = Join-Path $env:RUNNER_TEMP "codex-proxy-managed-chatgpt-recording-proxy.exe"
+          $fakeChatGPT = Join-Path $env:RUNNER_TEMP "codex-proxy-managed-chatgpt-fake.exe"
+          go build -o $recordingProxy .\scripts\ci\windows_managed_recording_proxy
+          go build -o $fakeChatGPT .\scripts\ci\windows_managed_fake_chatgpt
           $pattern = '^Test(RootUpgradeCodexApp|WindowsManagedApp)'
           $listed = @(go test ./internal/cli -list $pattern | Select-String $pattern)
           if ($listed.Count -lt 1) {
             throw "Windows managed app/update test selector matched no tests; refusing a silent fake pass"
           }
           go test ./internal/cli -run $pattern -count=1 -v
-          for ($attempt = 1; $attempt -le 2; $attempt++) {
-            try {
-              .\scripts\ci\codex_app_managed_install_smoke.ps1 -Helper $helper
-              break
-            } catch {
-              if ($attempt -eq 2) { throw }
-              Write-Warning "Managed ChatGPT app smoke failed on attempt $attempt; retrying in 10 seconds: $($_.Exception.Message)"
-              Start-Sleep -Seconds 10
-            }
-          }
+          .\scripts\ci\codex_app_smoke_as_standard_user.ps1 -Helper $helper -ManagedInstall -RecordingProxy $recordingProxy -FakeChatGPT $fakeChatGPT
 
       - name: Install Codex for integration (Linux/macOS)
         if: matrix.shard == 'platform-integration' && runner.os != 'Windows'

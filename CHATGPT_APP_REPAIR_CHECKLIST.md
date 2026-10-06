@@ -45,6 +45,8 @@ The pre-existing Windows launch investigation changes and `research-artifacts/ap
 ## Validation and CI
 
 - [x] Add focused Windows/macOS regression selectors to CI and update Linux-only unsupported-platform checks.
+- [x] Make Windows install smokes use an ephemeral standard local account rather than bypassing the production elevation guard on elevated GitHub runners.
+- [ ] Verify the standard-account Windows app install/managed-launch smokes pass in GitHub CI.
 - [x] Run focused Linux Go tests and the 32-test CI shard-contract suite.
 - [x] Cross-compile Windows/amd64 and macOS/amd64 + arm64 test binaries.
 - [x] Run Windows installer checksum/concurrency tests and Windows token/elevation/managed-launch unit tests through host PowerShell.
@@ -55,5 +57,6 @@ The pre-existing Windows launch investigation changes and `research-artifacts/ap
 
 - `CXP_RUNTIME_DISABLE=1 go test ./... -count=1` completed but was not green: the Windows PowerShell script-parse tests could not reach PowerShell from WSL (`UtilBindVsockAnyPort`), and `internal/helperruntime/TestLaunchKeepsExplicitSameBasePrereleaseActive` failed. The changed packages' focused regression tests passed.
 - Windows checksum/concurrency tests, Windows elevation/managed-launch tests, and a CIM process-path smoke passed through host PowerShell. The full managed-app install/launch smoke was not run to completion because a pre-existing ChatGPT/Codex process was detected; it was left untouched.
+- The first GitHub CI run confirmed Windows hosted jobs use elevated tokens: elevation-specific policy correctly rejected their app installation smokes, and ambient token state caused tests that relied on runner privileges to fail. The test hook now defaults to a non-elevated stub; install smokes launch under a temporary standard account, retaining the production guard.
 - macOS Intel/Apple Silicon test binaries cross-compiled successfully. The native macOS DMG install/update network smoke is configured in GitHub CI but could not run on this Linux/WSL host; live LaunchServices and OpenAI background-updater behavior remain unverified.
 - `python3 scripts/tests/test_ci_targeted_shards.py` passed (32 tests); the macOS network smoke passed `bash -n`; `git diff --check` passed.
