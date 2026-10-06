@@ -835,6 +835,9 @@ echo 'ok'
         self.assertNotIn("CreateProcessWithTokenW", standard_user_smoke)
         self.assertIn("selected token's session (Win32 error ", standard_user_smoke)
         self.assertIn("IsInRole($administratorsSID)", standard_user_smoke)
+        self.assertIn("FileSystemAccessRule", standard_user_smoke)
+        self.assertIn("$directorySecurity.AddAccessRule($userAccess)", standard_user_smoke)
+        self.assertIn("RunnerTemp = $smokeRoot", standard_user_smoke)
         self.assertIn('-Helper `"$helperPath`" -Child -SettingsPath', standard_user_smoke)
         self.assertIn("codex_app_managed_install_smoke.ps1", standard_user_smoke)
 

@@ -368,16 +368,26 @@ if (-not ("CxpLimitedTokenProcess" -as [type])) {
 
 try {
   New-Item -ItemType Directory -Force -Path $smokeRoot | Out-Null
+  $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
+  $directorySecurity = Get-Acl -LiteralPath $smokeRoot
+  $userAccess = [System.Security.AccessControl.FileSystemAccessRule]::new(
+    $identity.User,
+    [System.Security.AccessControl.FileSystemRights]::Modify,
+    [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit,
+    [System.Security.AccessControl.PropagationFlags]::None,
+    [System.Security.AccessControl.AccessControlType]::Allow
+  )
+  $directorySecurity.AddAccessRule($userAccess)
+  Set-Acl -LiteralPath $smokeRoot -AclObject $directorySecurity
   $settingsPath = Join-Path $smokeRoot "settings.json"
   $outputPath = Join-Path $smokeRoot "smoke.output.log"
   $resultPath = Join-Path $smokeRoot "smoke.result.json"
-  $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
   $helperPath = [IO.Path]::GetFullPath($Helper)
   $scriptPath = [IO.Path]::GetFullPath($PSCommandPath)
   $workingDirectory = [IO.Path]::GetFullPath((Get-Location).Path)
   [ordered]@{
     ExpectedIdentity = $identity.Name
-    RunnerTemp = $runnerTemp
+    RunnerTemp = $smokeRoot
     WorkingDirectory = $workingDirectory
     Helper = $helperPath
     NetworkInstall = [bool]$NetworkInstall
