@@ -823,11 +823,13 @@ echo 'ok'
         managed_smoke = (ROOT / "scripts" / "ci" / "codex_app_managed_install_smoke.ps1").read_text(encoding="utf-8")
         self.assertIn("--upgrade-codex-app", managed_smoke)
         standard_user_smoke = (ROOT / "scripts" / "ci" / "codex_app_smoke_as_standard_user.ps1").read_text(encoding="utf-8")
-        self.assertIn("New-LocalUser", standard_user_smoke)
-        self.assertIn("-Credential $credential", standard_user_smoke)
+        self.assertIn("New-ScheduledTaskPrincipal", standard_user_smoke)
+        self.assertIn("-LogonType Interactive", standard_user_smoke)
+        self.assertIn("-RunLevel Limited", standard_user_smoke)
+        self.assertIn("Start-ScheduledTask", standard_user_smoke)
+        self.assertIn("IsInRole($administratorsSID)", standard_user_smoke)
+        self.assertIn('-Helper `"$helperPath`" -Child -SettingsPath', standard_user_smoke)
         self.assertIn("codex_app_managed_install_smoke.ps1", standard_user_smoke)
-        self.assertIn("Microsoft.DesktopAppInstaller", standard_user_smoke)
-        self.assertIn("Add-AppxPackage -Path", standard_user_smoke)
 
     def test_release_install_smoke_checks_root_desktop_update_help(self):
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
