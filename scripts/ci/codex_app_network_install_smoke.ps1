@@ -18,6 +18,8 @@ New-Item -ItemType Directory -Force -Path $work | Out-Null
 $config = Join-Path $base "config.json"
 $out = Join-Path $base "app-launch.out"
 $desktopProcessNames = @("ChatGPT", "Codex")
+$configObject = [ordered]@{ version = 6; proxyEnabled = $false; profiles = @() }
+$configObject | ConvertTo-Json -Compress | Set-Content -LiteralPath $config -Encoding UTF8
 $existingProcessIds = @{}
 Get-Process -Name $desktopProcessNames -ErrorAction SilentlyContinue | ForEach-Object {
   $existingProcessIds[$_.Id] = $true
@@ -26,7 +28,7 @@ $launchedProcesses = @()
 
 try {
   try {
-    "n" | & $Helper --config $config app --cwd $work *> $out
+    & $Helper --config $config app --cwd $work *> $out
   } catch {
     $appOut = if (Test-Path -LiteralPath $out) { Get-Content -Raw -LiteralPath $out } else { "" }
     throw "cxp app failed during Codex desktop app network install smoke`napp output:`n$appOut`nerror:`n$($_.Exception.Message)"

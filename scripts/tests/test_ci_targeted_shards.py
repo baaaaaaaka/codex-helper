@@ -815,6 +815,10 @@ echo 'ok'
         network = blocks["Codex desktop app network install smoke (Windows)"]
         self.assertIn("codex_app_smoke_as_standard_user.ps1", network)
         self.assertIn("-NetworkInstall", network)
+        network_smoke = (ROOT / "scripts" / "ci" / "codex_app_network_install_smoke.ps1").read_text(encoding="utf-8")
+        self.assertIn("& $Helper --config $config app --cwd $work *> $out", network_smoke)
+        self.assertIn("proxyEnabled = $false", network_smoke)
+        self.assertNotIn('"n" | & $Helper', network_smoke)
 
         managed = blocks["Codex desktop app managed runtime smoke (Windows)"]
         self.assertIn("^Test(RootUpgradeCodexApp|WindowsManagedApp)", managed)
