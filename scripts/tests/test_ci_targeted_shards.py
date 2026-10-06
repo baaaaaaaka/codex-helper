@@ -794,9 +794,23 @@ echo 'ok'
         self.assertIn("app --cwd", unsupported)
         self.assertIn("only available for macOS and Windows", unsupported)
 
-        updater_unsupported = blocks["Codex desktop app updater unsupported smoke (Linux/macOS)"]
+        updater_unsupported = blocks["Codex desktop app updater unsupported smoke (Linux)"]
         self.assertIn("--upgrade-codex-app", updater_unsupported)
-        self.assertIn("only supported on native Windows or WSL", updater_unsupported)
+        self.assertIn("only supported on macOS, native Windows, or WSL", updater_unsupported)
+        self.assertIn("runner.os == 'Linux'", updater_unsupported)
+
+        installer_regressions = blocks["Managed install convergence regressions"]
+        self.assertIn("UsesUniqueTemporaryPathsAndCleansThemOnFailure", installer_regressions)
+        windows_installer = blocks["Windows installer checksum and concurrency regressions"]
+        self.assertIn("ChecksumMismatchFailsBeforeReplacingBinaries", windows_installer)
+        self.assertIn("ConcurrentDownloadsUseIsolatedTemporaryPaths", windows_installer)
+
+        mac_smoke = blocks["Codex desktop app network install smoke (macOS)"]
+        self.assertIn("UpgradeCodexDesktopAppMac", mac_smoke)
+        self.assertIn("codex_app_network_install_smoke.sh", mac_smoke)
+        mac_script = (ROOT / "scripts" / "ci" / "codex_app_network_install_smoke.sh").read_text(encoding="utf-8")
+        self.assertIn("--upgrade-codex-app", mac_script)
+        self.assertIn("Codex desktop app install/update smoke passed", mac_script)
 
         managed = blocks["Codex desktop app managed runtime smoke (Windows)"]
         self.assertIn("^Test(RootUpgradeCodexApp|WindowsManagedApp)", managed)

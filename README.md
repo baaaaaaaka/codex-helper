@@ -180,7 +180,7 @@ walk through the normal flows in order.
 | `codex-proxy app [profile]` | Install if needed, use or configure proxy mode, and launch the Codex desktop app on macOS, Windows, or WSL |
 | `codex-proxy app auth [profile]` | Complete ChatGPT auth for the Codex desktop app using the same `CODEX_HOME` and proxy setup |
 | `codex-proxy app --model-profile <name>` | Launch the Codex desktop app with a saved model profile through an isolated `CODEX_HOME` |
-| `codex-proxy --upgrade-codex-app [profile]` | Download and install the latest CXP-managed Windows/WSL desktop app copy |
+| `codex-proxy --upgrade-codex-app [profile]` | Update the CXP-managed Windows/WSL or current-user macOS desktop app |
 | `codex-proxy --upgrade-codex` | Install or upgrade the CXP-managed Codex CLI |
 | `codex-proxy --upgrade-codex --upgrade-codex-path <absolute-path>` | Upgrade one explicitly selected external Codex installation |
 | `codex-proxy completion <shell>` | Generate shell completion |
@@ -823,13 +823,25 @@ signed x64 ChatGPT MSIX, run:
 codex-proxy --upgrade-codex-app
 ```
 
-This command is supported on native Windows and WSL, optionally accepts a
+On Windows and WSL, this command optionally accepts a
 proxy profile (`codex-proxy --upgrade-codex-app <profile>`), installs the
 package if the managed copy is missing, and switches new `cxp app` launches to
 the newly verified runtime. It stages the new runtime beside the old one, so a
 currently running app is not overwritten; quit and relaunch the app to use the
 new version. It does not register the unpacked copy as an AppX package or
 change the Microsoft Store installation.
+
+On macOS, `--upgrade-codex-app` uses only a verified OpenAI app in the current
+user's `~/Applications` (or installs one there); it never updates `/Applications`.
+It preserves that app's path, stages and verifies the new bundle before
+replacement, refuses to update while any ChatGPT or Codex process is running,
+and restores a verifiable previous bundle after an interrupted replacement.
+To avoid macOS forwarding a same-bundle launch to another copy, `cxp app` also
+refuses to launch while ChatGPT or Codex is already running. Quit every
+ChatGPT/Codex instance, including system-installed copies, and do not reopen one
+until the update finishes. CXP serializes its own app launches and updates, but
+cannot lock Finder launches or OpenAI's updater; the updater's background file
+activity is not verified, so CXP is not guaranteed to be the only updater.
 On macOS the
 launcher also requires bundle identifier `com.openai.codex`, so a separately
 installed classic `ChatGPT.app` is never mistaken for Codex or overwritten; a

@@ -543,13 +543,22 @@ func TestWindowsManagedAppLaunchScriptPassesProxyAndIsolatedHome(t *testing.T) {
 		"$env:no_proxy = ''",
 		"Get-Process -Name 'ChatGPT','Codex'",
 		"Start-Process @start",
-		"$process.MainModule.FileName",
+		"Get-CimInstance -ClassName Win32_Process",
+		"$processInfo.ExecutablePath",
+		"$process.StartTime.ToUniversalTime()",
+		"$candidate.CreationDate.ToUniversalTime()",
+		"$_.ParentProcessId -eq $process.Id",
 		"CXP_MANAGED_STARTED_UNCERTAIN",
 		"CXP_MANAGED_PID=",
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("managed launch script missing %q:\n%s", want, script)
 		}
+	}
+	queryPathAt := strings.Index(script, "Get-CXPManagedProcessInfo $process.Id")
+	verifyPathAt := strings.Index(script, "managed ChatGPT process path could not be verified")
+	if queryPathAt < 0 || verifyPathAt < queryPathAt || strings.Contains(script, "$process.MainModule.FileName") {
+		t.Fatalf("managed launch script must verify the launched process image without an unreliable MainModule fallback:\n%s", script)
 	}
 	if strings.Contains(script, "Set-ItemProperty") || strings.Contains(script, "netsh winhttp set proxy") {
 		t.Fatalf("managed launch script must not change system proxy:\n%s", script)

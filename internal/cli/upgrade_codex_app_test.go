@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -54,6 +55,46 @@ func TestRootUpgradeCodexAppDispatchesManagedUpdate(t *testing.T) {
 	text := out.String()
 	if !strings.Contains(text, "Codex desktop app update target") || !strings.Contains(text, "Codex desktop app upgraded: 26.803.5235.0") {
 		t.Fatalf("unexpected upgrade output: %q", text)
+	}
+}
+
+func TestRootUpgradeCodexAppRejectsElevationBeforeConfigOrProxyWork(t *testing.T) {
+	lockCLITestHooks(t)
+	prevGOOS := codexAppGOOS
+	prevGOARCH := codexAppGOARCH
+	prevWSL := codexAppIsWSL
+	prevElevation := codexAppTokenElevationFn
+	prevProxy := codexAppEnsureProxyURLFn
+	prevUpgrade := codexAppUpgradeManagedInstallFn
+	t.Cleanup(func() {
+		codexAppGOOS = prevGOOS
+		codexAppGOARCH = prevGOARCH
+		codexAppIsWSL = prevWSL
+		codexAppTokenElevationFn = prevElevation
+		codexAppEnsureProxyURLFn = prevProxy
+		codexAppUpgradeManagedInstallFn = prevUpgrade
+	})
+	codexAppGOOS = func() string { return "windows" }
+	codexAppGOARCH = func() string { return "amd64" }
+	codexAppIsWSL = func() bool { return false }
+	codexAppTokenElevationFn = func() (bool, error) { return true, nil }
+	codexAppEnsureProxyURLFn = func(context.Context, *config.Store, config.Profile, []config.Instance, io.Writer) (string, error) {
+		t.Fatal("elevated upgrade must fail before proxy startup")
+		return "", nil
+	}
+	codexAppUpgradeManagedInstallFn = func(context.Context, string, codexDesktopAppOptions) (codexWindowsManagedInstallState, bool, error) {
+		t.Fatal("elevated upgrade must fail before package download or staging")
+		return codexWindowsManagedInstallState{}, false, nil
+	}
+	configPath := filepath.Join(t.TempDir(), "not-created", "config.json")
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"--config", configPath, "--upgrade-codex-app"})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "without Administrator privileges") {
+		t.Fatalf("elevated upgrade error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Dir(configPath)); !os.IsNotExist(err) {
+		t.Fatalf("upgrade created config parent before elevation refusal: %v", err)
 	}
 }
 
@@ -126,7 +167,7 @@ func TestRootUpgradeCodexAppRejectsUnsupportedPlatform(t *testing.T) {
 		codexAppIsWSL = prevWSL
 		codexAppUpgradeManagedInstallFn = prevUpgrade
 	})
-	codexAppGOOS = func() string { return "darwin" }
+	codexAppGOOS = func() string { return "freebsd" }
 	codexAppIsWSL = func() bool { return false }
 	codexAppUpgradeManagedInstallFn = func(context.Context, string, codexDesktopAppOptions) (codexWindowsManagedInstallState, bool, error) {
 		t.Fatal("unsupported platform must not start managed app update")
@@ -136,8 +177,90 @@ func TestRootUpgradeCodexAppRejectsUnsupportedPlatform(t *testing.T) {
 	cmd := newRootCmd()
 	cmd.SetArgs([]string{"--upgrade-codex-app"})
 	err := cmd.Execute()
-	if err == nil || !strings.Contains(err.Error(), "only supported on native Windows or WSL") {
+	if err == nil || !strings.Contains(err.Error(), "only supported on macOS, native Windows, or WSL") {
 		t.Fatalf("unsupported platform error = %v", err)
+	}
+}
+
+func TestRootUpgradeCodexAppDispatchesMacManagedUpdate(t *testing.T) {
+	lockCLITestHooks(t)
+	prevGOOS := codexAppGOOS
+	prevGOARCH := codexAppGOARCH
+	prevWSL := codexAppIsWSL
+	prevHome := codexAppUserHomeDir
+	prevMacUpgrade := codexAppUpgradeMacInstallFn
+	prevMacProcessCheck := codexAppMacProcessRunningFn
+	prevWindowsRoot := codexAppWindowsManagedRootFn
+	t.Cleanup(func() {
+		codexAppGOOS = prevGOOS
+		codexAppGOARCH = prevGOARCH
+		codexAppIsWSL = prevWSL
+		codexAppUserHomeDir = prevHome
+		codexAppUpgradeMacInstallFn = prevMacUpgrade
+		codexAppMacProcessRunningFn = prevMacProcessCheck
+		codexAppWindowsManagedRootFn = prevWindowsRoot
+	})
+	codexAppGOOS = func() string { return "darwin" }
+	codexAppGOARCH = func() string { return "arm64" }
+	codexAppIsWSL = func() bool { return false }
+	codexAppMacProcessRunningFn = func(context.Context) (bool, error) { return false, nil }
+	home := filepath.Join(t.TempDir(), "home")
+	codexAppUserHomeDir = func() (string, error) { return home, nil }
+	codexAppWindowsManagedRootFn = func(context.Context) (string, error) {
+		t.Fatal("macOS update must not resolve the Windows managed root")
+		return "", nil
+	}
+	codexAppUpgradeMacInstallFn = func(_ context.Context, opts codexDesktopAppOptions) (codexDesktopMacUpgradeState, bool, error) {
+		if opts.ProxyURL != "" {
+			t.Fatalf("unexpected proxy URL: %q", opts.ProxyURL)
+		}
+		return codexDesktopMacUpgradeState{AppPath: filepath.Join(home, "Applications", codexDesktopMacCurrentAppName), Version: "26.930.7945.0"}, true, nil
+	}
+
+	var out bytes.Buffer
+	cmd := newRootCmd()
+	cmd.SetOut(&out)
+	cmd.SetErr(io.Discard)
+	cmd.SetArgs([]string{"--config", filepath.Join(t.TempDir(), "config.json"), "--upgrade-codex-app"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("macOS upgrade app command: %v", err)
+	}
+	if got := out.String(); !strings.Contains(got, filepath.Join(home, "Applications")) || !strings.Contains(got, "Codex desktop app upgraded: 26.930.7945.0") {
+		t.Fatalf("unexpected macOS upgrade output: %q", got)
+	}
+}
+
+func TestRootUpgradeCodexAppRejectsRunningMacAppBeforeConfigOrProxyWork(t *testing.T) {
+	lockCLITestHooks(t)
+	prevGOOS := codexAppGOOS
+	prevGOARCH := codexAppGOARCH
+	prevWSL := codexAppIsWSL
+	prevProcessCheck := codexAppMacProcessRunningFn
+	prevProxy := codexAppEnsureProxyURLFn
+	t.Cleanup(func() {
+		codexAppGOOS = prevGOOS
+		codexAppGOARCH = prevGOARCH
+		codexAppIsWSL = prevWSL
+		codexAppMacProcessRunningFn = prevProcessCheck
+		codexAppEnsureProxyURLFn = prevProxy
+	})
+	codexAppGOOS = func() string { return "darwin" }
+	codexAppGOARCH = func() string { return "arm64" }
+	codexAppIsWSL = func() bool { return false }
+	codexAppMacProcessRunningFn = func(context.Context) (bool, error) { return true, nil }
+	codexAppEnsureProxyURLFn = func(context.Context, *config.Store, config.Profile, []config.Instance, io.Writer) (string, error) {
+		t.Fatal("running app must fail before proxy startup")
+		return "", nil
+	}
+	configPath := filepath.Join(t.TempDir(), "not-created", "config.json")
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"--config", configPath, "--upgrade-codex-app"})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "quit every desktop app instance") {
+		t.Fatalf("running macOS app error = %v", err)
+	}
+	if _, err := os.Stat(filepath.Dir(configPath)); !os.IsNotExist(err) {
+		t.Fatalf("upgrade created config parent before refusing running app: %v", err)
 	}
 }
 
@@ -166,6 +289,34 @@ func TestRootUpgradeCodexAppRejectsUnsupportedArchitecture(t *testing.T) {
 	err := cmd.Execute()
 	if err == nil || !strings.Contains(err.Error(), "supports x64 Windows only") {
 		t.Fatalf("unsupported architecture error = %v", err)
+	}
+}
+
+func TestRootUpgradeCodexAppRejectsUnsupportedMacArchitecture(t *testing.T) {
+	lockCLITestHooks(t)
+	prevGOOS := codexAppGOOS
+	prevGOARCH := codexAppGOARCH
+	prevWSL := codexAppIsWSL
+	prevProcessCheck := codexAppMacProcessRunningFn
+	t.Cleanup(func() {
+		codexAppGOOS = prevGOOS
+		codexAppGOARCH = prevGOARCH
+		codexAppIsWSL = prevWSL
+		codexAppMacProcessRunningFn = prevProcessCheck
+	})
+	codexAppGOOS = func() string { return "darwin" }
+	codexAppGOARCH = func() string { return "ppc64" }
+	codexAppIsWSL = func() bool { return false }
+	codexAppMacProcessRunningFn = func(context.Context) (bool, error) {
+		t.Fatal("unsupported architecture must fail before process detection")
+		return false, nil
+	}
+
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"--upgrade-codex-app"})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "supports Apple Silicon and Intel macOS only") {
+		t.Fatalf("unsupported macOS architecture error = %v", err)
 	}
 }
 

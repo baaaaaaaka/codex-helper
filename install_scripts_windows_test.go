@@ -243,6 +243,147 @@ func TestInstallPs1ChecksumDownloadFailureRemainsBestEffort(t *testing.T) {
 	}
 }
 
+func TestInstallPs1ChecksumMismatchFailsBeforeReplacingBinaries(t *testing.T) {
+	assetData := []byte("new-fake-binary")
+	wrongChecksum := sha256.Sum256([]byte("different-binary"))
+	server := newInstallServer(t, "owner/name", "v1.2.3", "codex-proxy_1.2.3_windows_amd64.exe", assetData, false, wrongChecksum)
+	defer server.Close()
+
+	installDir := t.TempDir()
+	tempDir := t.TempDir()
+	oldCodex := []byte("old-codex-proxy")
+	oldCXP := []byte("old-cxp")
+	for name, data := range map[string][]byte{"codex-proxy.exe": oldCodex, "cxp.exe": oldCXP} {
+		if err := os.WriteFile(filepath.Join(installDir, name), data, 0o600); err != nil {
+			t.Fatalf("write old %s: %v", name, err)
+		}
+	}
+
+	output, err := runInstallPs1ForChecksumTest(t, server.URL, installDir, tempDir)
+	if err == nil {
+		t.Fatalf("install.ps1 unexpectedly accepted an incorrect checksum:\n%s", output)
+	}
+	if strings.Contains(output, "CODEX-PROXY INSTALL SUCCESS") || !strings.Contains(output, "Checksum mismatch") {
+		t.Fatalf("unexpected checksum failure output:\n%s", output)
+	}
+	for name, want := range map[string][]byte{"codex-proxy.exe": oldCodex, "cxp.exe": oldCXP} {
+		got, readErr := os.ReadFile(filepath.Join(installDir, name))
+		if readErr != nil || !bytes.Equal(got, want) {
+			t.Fatalf("%s changed after checksum mismatch: got=%q err=%v", name, got, readErr)
+		}
+	}
+	assertInstallTempDirEmpty(t, tempDir)
+}
+
+func TestInstallPs1ChecksumWithoutTargetAssetRowRemainsBestEffort(t *testing.T) {
+	asset := "codex-proxy_1.2.3_windows_amd64.exe"
+	assetData := []byte("fake-binary")
+	otherChecksum := sha256.Sum256([]byte("other-asset"))
+	server := newInstallServerWithChecksumManifest(t, "owner/name", "v1.2.3", asset, assetData, false, fmt.Sprintf("%x  another-asset.exe\n", otherChecksum), http.StatusOK)
+	defer server.Close()
+
+	installDir := t.TempDir()
+	tempDir := t.TempDir()
+	output, err := runInstallPs1ForChecksumTest(t, server.URL, installDir, tempDir)
+	if err != nil {
+		t.Fatalf("install.ps1 should keep a missing target row best-effort: %v\n%s", err, output)
+	}
+	if !strings.Contains(output, "CODEX-PROXY INSTALL SUCCESS") {
+		t.Fatalf("expected success banner, got:\n%s", output)
+	}
+	got, err := os.ReadFile(filepath.Join(installDir, "codex-proxy.exe"))
+	if err != nil || !bytes.Equal(got, assetData) {
+		t.Fatalf("installed payload = %q err=%v", got, err)
+	}
+	assertInstallTempDirEmpty(t, tempDir)
+}
+
+func TestInstallPs1ConcurrentDownloadsUseIsolatedTemporaryPaths(t *testing.T) {
+	assetData := []byte("concurrent-fake-binary")
+	checksum := sha256.Sum256(assetData)
+	server := newInstallServer(t, "owner/name", "v1.2.3", "codex-proxy_1.2.3_windows_amd64.exe", assetData, false, checksum)
+	defer server.Close()
+
+	tempDir := t.TempDir()
+	firstInstallDir := t.TempDir()
+	secondInstallDir := t.TempDir()
+	firstCmd := newInstallPs1ChecksumCommand(t, server.URL, firstInstallDir, tempDir)
+	secondCmd := newInstallPs1ChecksumCommand(t, server.URL, secondInstallDir, tempDir)
+	type result struct {
+		output []byte
+		err    error
+	}
+	results := make(chan result, 2)
+	go func() {
+		output, err := firstCmd.CombinedOutput()
+		results <- result{output: output, err: err}
+	}()
+	go func() {
+		output, err := secondCmd.CombinedOutput()
+		results <- result{output: output, err: err}
+	}()
+	for index := 0; index < 2; index++ {
+		got := <-results
+		if got.err != nil || !strings.Contains(string(got.output), "CODEX-PROXY INSTALL SUCCESS") {
+			t.Fatalf("concurrent install failed: %v\n%s", got.err, got.output)
+		}
+	}
+	for _, installDir := range []string{firstInstallDir, secondInstallDir} {
+		got, err := os.ReadFile(filepath.Join(installDir, "codex-proxy.exe"))
+		if err != nil || !bytes.Equal(got, assetData) {
+			t.Fatalf("installed payload in %s = %q err=%v", installDir, got, err)
+		}
+	}
+	assertInstallTempDirEmpty(t, tempDir)
+}
+
+func runInstallPs1ForChecksumTest(t *testing.T, serverURL, installDir, tempDir string) (string, error) {
+	t.Helper()
+	cmd := newInstallPs1ChecksumCommand(t, serverURL, installDir, tempDir)
+	output, err := cmd.CombinedOutput()
+	return string(output), err
+}
+
+func newInstallPs1ChecksumCommand(t *testing.T, serverURL, installDir, tempDir string) *exec.Cmd {
+	t.Helper()
+	if _, err := exec.LookPath("powershell"); err != nil {
+		t.Skip("powershell not available")
+	}
+	repoRoot, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	profilePath := filepath.Join(t.TempDir(), "profile.ps1")
+	basePath := os.Getenv("SystemRoot")
+	if basePath == "" {
+		basePath = `C:\Windows`
+	}
+	cmd := exec.Command("powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", filepath.Join(repoRoot, "install.ps1"),
+		"-Repo", "owner/name", "-Version", "latest", "-InstallDir", installDir)
+	cmd.Env = isolatedWindowsInstallEnv(t, filterEnvWithoutKey(os.Environ(), "Path"))
+	cmd.Env = append(cmd.Env,
+		"CODEX_PROXY_API_BASE="+serverURL,
+		"CODEX_PROXY_RELEASE_BASE="+serverURL,
+		"CODEX_PROXY_PROFILE_PATH="+profilePath,
+		"CODEX_PROXY_SKIP_PATH_UPDATE=1",
+		"CODEX_NPM_PREFIX="+t.TempDir(),
+		"Path="+filepath.Join(basePath, "System32"),
+		"TEMP="+tempDir,
+	)
+	return cmd
+}
+
+func assertInstallTempDirEmpty(t *testing.T, tempDir string) {
+	t.Helper()
+	entries, err := os.ReadDir(tempDir)
+	if err != nil {
+		t.Fatalf("read installer temporary directory: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("installer temporary files remain after completion: %v", entries)
+	}
+}
+
 func TestInstallPs1DiskSpaceFailureBanner(t *testing.T) {
 	if _, err := exec.LookPath("powershell"); err != nil {
 		t.Skip("powershell not available")
@@ -817,6 +958,19 @@ func newInstallServerWithChecksumStatus(
 	checksum [32]byte,
 	checksumStatus int,
 ) *httptest.Server {
+	return newInstallServerWithChecksumManifest(t, repo, tag, asset, assetData, apiFail, fmt.Sprintf("%x  %s\n", checksum, asset), checksumStatus)
+}
+
+func newInstallServerWithChecksumManifest(
+	t *testing.T,
+	repo string,
+	tag string,
+	asset string,
+	assetData []byte,
+	apiFail bool,
+	checksumManifest string,
+	checksumStatus int,
+) *httptest.Server {
 	t.Helper()
 	apiPath := "/repos/" + repo + "/releases/latest"
 	latestPath := "/" + repo + "/releases/latest"
@@ -847,7 +1001,7 @@ func newInstallServerWithChecksumStatus(
 				return
 			}
 			w.Header().Set("Content-Type", "text/plain")
-			_, _ = fmt.Fprintf(w, "%x  %s\n", checksum, asset)
+			_, _ = fmt.Fprint(w, checksumManifest)
 		default:
 			http.NotFound(w, r)
 		}

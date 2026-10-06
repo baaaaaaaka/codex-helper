@@ -41,10 +41,11 @@ const (
 )
 
 var (
-	codexAppGOOS            = func() string { return runtime.GOOS }
-	codexAppGOARCH          = func() string { return runtime.GOARCH }
-	codexAppIsWSL           = func() bool { return teamsServiceIsWSL() }
-	codexAppLaunchDesktopFn = launchCodexDesktopApp
+	codexAppGOOS             = func() string { return runtime.GOOS }
+	codexAppGOARCH           = func() string { return runtime.GOARCH }
+	codexAppIsWSL            = func() bool { return teamsServiceIsWSL() }
+	codexAppTokenElevationFn = currentWindowsTokenElevated
+	codexAppLaunchDesktopFn  = launchCodexDesktopApp
 	// Desktop app launches use the stable App Gateway. The legacy helper is
 	// retained for explicit proxy-start compatibility and older tests/tools;
 	// it is no longer the default application path.
@@ -62,6 +63,7 @@ var (
 	codexAppProxyReadyTimeout       = 15 * time.Second
 	codexAppMacInstallURL           = func() string { return codexDesktopMacDownloadURLForArch(codexAppGOARCH()) }
 	codexAppUpgradeManagedInstallFn = upgradeCodexWindowsManagedInstall
+	codexAppUpgradeMacInstallFn     = upgradeCodexDesktopAppMac
 	errCodexDesktopAppUnsupported   = errors.New("codex desktop app is only available for macOS and Windows")
 )
 
@@ -86,6 +88,7 @@ type codexDesktopAppOptions struct {
 	// the desktop process. AppX activation cannot preserve that state.
 	RequiresDirectLaunch bool
 	WaitForExit          bool
+	RejectRunningMacApp  bool
 	ExecIdentity         *execIdentity
 	Log                  io.Writer
 }
@@ -171,6 +174,7 @@ func runCodexApp(cmd *cobra.Command, root *rootOptions, opts codexAppOptions) er
 	if err != nil {
 		return err
 	}
+	warnIfWindowsAppElevated(cmd.ErrOrStderr())
 
 	store, _, err := newRootStore(root, opts.codexDir)
 	if err != nil {
@@ -215,6 +219,14 @@ func runCodexApp(cmd *cobra.Command, root *rootOptions, opts codexAppOptions) er
 	if err != nil {
 		return err
 	}
+	needsModelProfile := strings.TrimSpace(opts.modelProfileRef) != "" || modelprofile.HasConfiguredThirdPartyModels(cfg) || cfg.HasExplicitGlobalDefaults()
+	launchOpts.RequiresDirectLaunch = strings.TrimSpace(opts.appPath) == "" &&
+		(useProxy || needsModelProfile || strings.TrimSpace(opts.codexDir) != "")
+	if platform == codexDesktopPlatformWindows {
+		if err := preflightCodexWindowsAppElevation(ctx, launchOpts); err != nil {
+			return err
+		}
+	}
 
 	if useProxy {
 		proxyURL, err := codexAppEnsureProxyURLFn(ctx, store, *profile, cfg.Instances, cmd.ErrOrStderr())
@@ -224,7 +236,7 @@ func runCodexApp(cmd *cobra.Command, root *rootOptions, opts codexAppOptions) er
 		launchOpts.ProxyURL = proxyURL
 	}
 
-	if strings.TrimSpace(opts.modelProfileRef) != "" || modelprofile.HasConfiguredThirdPartyModels(cfg) || cfg.HasExplicitGlobalDefaults() {
+	if needsModelProfile {
 		launch, err := codexAppEnsureModelProfileLaunchFn(ctx, store, opts.modelProfileRef, proxyRef, cmd.ErrOrStderr())
 		if err != nil {
 			return err
@@ -239,12 +251,21 @@ func runCodexApp(cmd *cobra.Command, root *rootOptions, opts codexAppOptions) er
 	// inherited by ChatGPT. This includes the proxy, model-profile isolation,
 	// and an explicitly selected Codex data directory. Keep this decision on
 	// the launch options so every Windows backend applies the same rule.
-	launchOpts.RequiresDirectLaunch = strings.TrimSpace(opts.appPath) == "" &&
-		(strings.TrimSpace(launchOpts.ProxyURL) != "" ||
-			strings.TrimSpace(launchOpts.ModelProfileName) != "" ||
-			strings.TrimSpace(opts.codexDir) != "")
-
 	return codexAppLaunchDesktopFn(ctx, launchOpts)
+}
+
+func warnIfWindowsAppElevated(log io.Writer) {
+	if codexAppGOOS() != "windows" {
+		return
+	}
+	elevated, err := codexAppTokenElevationFn()
+	if err != nil {
+		codexAppWarn(log, "could not determine whether CXP has an elevated Windows token; app installation will be refused if elevation cannot be verified")
+		return
+	}
+	if elevated {
+		codexAppWarn(log, "CXP is running with an elevated Windows token. ChatGPT may run with different privileges; app installation and upgrade require a non-elevated CXP process.")
+	}
 }
 
 func codexDesktopPlatformForCurrentHost() (codexDesktopPlatform, error) {
@@ -611,15 +632,32 @@ func codexAppWarn(log io.Writer, format string, args ...any) {
 }
 
 func launchCodexDesktopAppMac(ctx context.Context, opts codexDesktopAppOptions) error {
-	appPath, err := ensureCodexDesktopAppMac(ctx, opts)
+	home, err := codexDesktopMacInstallHome(opts)
 	if err != nil {
 		return err
 	}
-	executable, err := codexDesktopMacExecutablePath(appPath)
-	if err != nil {
-		return err
-	}
-	return startCodexDesktopProcess(ctx, executable, opts)
+	return withCodexDesktopMacLock(ctx, home, opts.ExecIdentity, func() error {
+		if err := rejectRunningCodexDesktopMacLaunch(ctx); err != nil {
+			return err
+		}
+		if err := cleanCodexDesktopMacStagingDirs(filepath.Join(home, "Applications")); err != nil {
+			return err
+		}
+		for _, candidate := range codexDesktopMacCandidatePaths(home) {
+			if err := recoverCodexDesktopMacAppBackup(ctx, filepath.Join(home, "Applications"), candidate, opts.Log); err != nil {
+				return err
+			}
+		}
+		appPath, err := ensureCodexDesktopAppMac(ctx, opts)
+		if err != nil {
+			return err
+		}
+		executable, err := codexDesktopMacExecutablePath(appPath)
+		if err != nil {
+			return err
+		}
+		return startCodexDesktopProcess(ctx, executable, opts)
+	})
 }
 
 func ensureCodexDesktopAppMac(ctx context.Context, opts codexDesktopAppOptions) (string, error) {
@@ -635,7 +673,34 @@ func ensureCodexDesktopAppMac(ctx context.Context, opts codexDesktopAppOptions) 
 	if err != nil {
 		return "", err
 	}
+	appPath, err := findExistingCodexDesktopAppMac(ctx, opts, home)
+	if err != nil {
+		return "", err
+	}
+	if appPath != "" {
+		return appPath, nil
+	}
+
+	installURL := codexAppMacInstallURL()
+	if opts.Log != nil {
+		_, _ = fmt.Fprintf(opts.Log, "installing Codex desktop app from %s...\n", installURL)
+	}
+	return installCodexDesktopAppMac(ctx, opts, home, installURL)
+}
+
+func findExistingCodexDesktopAppMac(ctx context.Context, opts codexDesktopAppOptions, home string) (string, error) {
+	if _, err := codexDesktopMacApplicationsDir(home); err != nil {
+		return "", err
+	}
 	for _, candidate := range codexDesktopMacCandidatePaths(home) {
+		info, err := os.Lstat(candidate)
+		if err == nil && info.Mode()&os.ModeSymlink != 0 {
+			codexAppWarn(opts.Log, "ignoring symbolic-link ChatGPT app path %s; CXP requires an app bundle stored directly under ~/Applications", candidate)
+			continue
+		}
+		if err != nil && !os.IsNotExist(err) {
+			return "", fmt.Errorf("inspect ChatGPT app candidate %s: %w", candidate, err)
+		}
 		if _, err := codexDesktopMacExecutablePath(candidate); err != nil {
 			continue
 		}
@@ -645,12 +710,7 @@ func ensureCodexDesktopAppMac(ctx context.Context, opts codexDesktopAppOptions) 
 		}
 		return candidate, nil
 	}
-
-	installURL := codexAppMacInstallURL()
-	if opts.Log != nil {
-		_, _ = fmt.Fprintf(opts.Log, "installing Codex desktop app from %s...\n", installURL)
-	}
-	return installCodexDesktopAppMac(ctx, opts, home, installURL)
+	return "", nil
 }
 
 func codexDesktopMacInstallHome(opts codexDesktopAppOptions) (string, error) {
@@ -668,14 +728,26 @@ func codexDesktopMacInstallHome(opts codexDesktopAppOptions) (string, error) {
 }
 
 func codexDesktopMacCandidatePaths(home string) []string {
-	var candidates []string
-	for _, appName := range codexDesktopMacAppNames() {
-		candidates = append(candidates, filepath.Join(codexAppMacSystemAppsDir, appName))
-		if strings.TrimSpace(home) != "" {
-			candidates = append(candidates, filepath.Join(home, "Applications", appName))
-		}
+	if strings.TrimSpace(home) == "" {
+		return nil
 	}
-	return candidates
+	applicationsDir := filepath.Join(home, "Applications")
+	return []string{
+		filepath.Join(applicationsDir, codexDesktopMacCurrentAppName),
+		filepath.Join(applicationsDir, codexDesktopMacLegacyAppName),
+	}
+}
+
+func codexDesktopMacApplicationsDir(home string) (string, error) {
+	applicationsDir := filepath.Join(home, "Applications")
+	info, err := os.Lstat(applicationsDir)
+	if err != nil && !os.IsNotExist(err) {
+		return "", fmt.Errorf("inspect current-user Applications directory: %w", err)
+	}
+	if err == nil && (info.Mode()&os.ModeSymlink != 0 || !info.IsDir()) {
+		return "", fmt.Errorf("current-user Applications path %s must be a real directory, not a symbolic link or file", applicationsDir)
+	}
+	return applicationsDir, nil
 }
 
 func codexDesktopMacExecutablePath(appPath string) (string, error) {
@@ -706,17 +778,25 @@ func codexDesktopMacExecutablePath(appPath string) (string, error) {
 }
 
 func installCodexDesktopAppMac(ctx context.Context, opts codexDesktopAppOptions, home string, installURL string) (string, error) {
-	installDir := filepath.Join(home, "Applications")
+	appPath, _, _, err := installCodexDesktopAppMacVersion(ctx, opts, home, installURL, "")
+	return appPath, err
+}
+
+func installCodexDesktopAppMacVersion(ctx context.Context, opts codexDesktopAppOptions, home string, installURL string, requestedDestination string) (string, string, bool, error) {
+	installDir, err := codexDesktopMacApplicationsDir(home)
+	if err != nil {
+		return "", "", false, err
+	}
 	if err := os.MkdirAll(installDir, 0o755); err != nil {
-		return "", err
+		return "", "", false, err
 	}
 	if err := ensurePathOwnedByIdentity(installDir, opts.ExecIdentity); err != nil {
-		return "", fmt.Errorf("set Codex desktop install dir ownership: %w", err)
+		return "", "", false, fmt.Errorf("set Codex desktop install dir ownership: %w", err)
 	}
 
 	tmpDir, err := os.MkdirTemp("", "codex-desktop-app-*")
 	if err != nil {
-		return "", err
+		return "", "", false, err
 	}
 	defer os.RemoveAll(tmpDir)
 
@@ -727,15 +807,15 @@ func installCodexDesktopAppMac(ctx context.Context, opts codexDesktopAppOptions,
 		ProxyURL: opts.ProxyURL,
 		Log:      opts.Log,
 	}); err != nil {
-		return "", fmt.Errorf("download Codex desktop app DMG; check network, proxy, and TLS inspection settings: %w", err)
+		return "", "", false, fmt.Errorf("download Codex desktop app DMG; check network, proxy, and TLS inspection settings: %w", err)
 	}
 
 	mountPath := filepath.Join(tmpDir, "mount")
 	if err := os.MkdirAll(mountPath, 0o755); err != nil {
-		return "", err
+		return "", "", false, err
 	}
 	if err := codexAppRunCommand(ctx, opts.Log, "hdiutil", "attach", "-nobrowse", "-readonly", "-mountpoint", mountPath, dmgPath); err != nil {
-		return "", fmt.Errorf("mount Codex desktop app DMG: %w", err)
+		return "", "", false, fmt.Errorf("mount Codex desktop app DMG: %w", err)
 	}
 	defer func() {
 		if err := codexAppRunCommand(context.Background(), io.Discard, "hdiutil", "detach", mountPath); err != nil {
@@ -745,51 +825,116 @@ func installCodexDesktopAppMac(ctx context.Context, opts codexDesktopAppOptions,
 
 	sourceApp, err := findCodexAppBundle(mountPath)
 	if err != nil {
-		return "", err
+		return "", "", false, err
 	}
 	appName := filepath.Base(sourceApp)
 
 	stagingRoot, err := os.MkdirTemp(installDir, ".codex-desktop-install-*")
 	if err != nil {
-		return "", err
+		return "", "", false, err
 	}
 	defer os.RemoveAll(stagingRoot)
 	stagedApp := filepath.Join(stagingRoot, appName)
 	if err := codexAppRunCommand(ctx, opts.Log, "ditto", sourceApp, stagedApp); err != nil {
-		return "", fmt.Errorf("copy Codex desktop app bundle: %w", err)
+		return "", "", false, fmt.Errorf("copy Codex desktop app bundle: %w", err)
 	}
 	if err := verifyCodexDesktopAppMac(ctx, stagedApp, opts.Log); err != nil {
-		return "", err
+		return "", "", false, err
 	}
 	_ = codexAppRunCommand(ctx, io.Discard, "xattr", "-dr", "com.apple.quarantine", stagedApp)
 	if err := ensureTreeOwnedByIdentity(stagedApp, opts.ExecIdentity); err != nil {
-		return "", fmt.Errorf("set Codex desktop app ownership: %w", err)
+		return "", "", false, fmt.Errorf("set Codex desktop app ownership: %w", err)
 	}
 
-	destApp, err := codexDesktopMacInstallDestination(ctx, installDir, appName)
-	if err != nil {
-		return "", err
+	destApp := ""
+	if requestedDestination != "" {
+		destApp, err = codexDesktopMacRequestedDestination(installDir, requestedDestination)
+	} else {
+		destApp, err = codexDesktopMacInstallDestination(ctx, installDir, appName)
 	}
-	backupApp := filepath.Join(installDir, fmt.Sprintf(".%s.backup-%d", filepath.Base(destApp), time.Now().UnixNano()))
+	if err != nil {
+		return "", "", false, err
+	}
+	newVersion := ""
+	backupApp := filepath.Join(installDir, fmt.Sprintf(".%s.backup-%d.app", filepath.Base(destApp), time.Now().UnixNano()))
 	hadExisting := false
-	if _, err := os.Stat(destApp); err == nil {
+	if _, err := os.Lstat(destApp); err == nil {
+		if info, err := os.Lstat(destApp); err != nil || info.Mode()&os.ModeSymlink != 0 {
+			if err == nil {
+				err = fmt.Errorf("destination is a symbolic link")
+			}
+			return "", "", false, fmt.Errorf("refusing to replace unsafe ChatGPT app destination %s: %w", destApp, err)
+		}
+		if err := verifyCodexDesktopAppMac(ctx, destApp, opts.Log); err != nil {
+			return "", "", false, fmt.Errorf("refusing to replace unverified ChatGPT app at %s: %w", destApp, err)
+		}
+		currentVersion, err := codexDesktopMacBundleVersion(ctx, destApp)
+		if err != nil {
+			return "", "", false, fmt.Errorf("read installed ChatGPT app version: %w", err)
+		}
+		newVersion, err = codexDesktopMacBundleVersion(ctx, stagedApp)
+		if err != nil {
+			return "", "", false, fmt.Errorf("read staged ChatGPT app version: %w", err)
+		}
+		comparison, err := compareCodexDesktopMacVersions(newVersion, currentVersion)
+		if err != nil {
+			return "", "", false, fmt.Errorf("compare installed and downloaded ChatGPT app versions: %w", err)
+		}
+		if comparison < 0 {
+			return "", "", false, fmt.Errorf("refusing to downgrade ChatGPT app from %s to %s", currentVersion, newVersion)
+		}
+		if comparison == 0 {
+			return destApp, currentVersion, false, nil
+		}
 		hadExisting = true
+		if opts.RejectRunningMacApp {
+			if err := rejectRunningCodexDesktopMacApp(ctx); err != nil {
+				return "", "", false, err
+			}
+		}
 		if err := os.Rename(destApp, backupApp); err != nil {
-			return "", fmt.Errorf("stage existing Codex desktop app for replacement: %w", err)
+			return "", "", false, fmt.Errorf("stage existing Codex desktop app for replacement: %w", err)
 		}
 	} else if err != nil && !os.IsNotExist(err) {
-		return "", fmt.Errorf("inspect existing Codex desktop app: %w", err)
+		return "", "", false, fmt.Errorf("inspect existing Codex desktop app: %w", err)
+	} else if opts.RejectRunningMacApp {
+		if err := rejectRunningCodexDesktopMacApp(ctx); err != nil {
+			return "", "", false, err
+		}
 	}
 	if err := os.Rename(stagedApp, destApp); err != nil {
 		if hadExisting {
-			_ = os.Rename(backupApp, destApp)
+			if restoreErr := os.Rename(backupApp, destApp); restoreErr != nil {
+				return "", "", false, fmt.Errorf("replace ChatGPT app failed: %v; restore previous app from %s failed: %w", err, backupApp, restoreErr)
+			}
 		}
-		return "", fmt.Errorf("replace Codex desktop app bundle: %w", err)
+		return "", "", false, fmt.Errorf("replace Codex desktop app bundle: %w", err)
+	}
+	if err := verifyCodexDesktopAppMac(ctx, destApp, opts.Log); err != nil {
+		if removeErr := os.RemoveAll(destApp); removeErr != nil {
+			return "", "", false, fmt.Errorf("verify installed ChatGPT app failed: %v; remove unverified replacement failed: %w; previous app remains at %s", err, removeErr, backupApp)
+		}
+		if hadExisting {
+			if restoreErr := os.Rename(backupApp, destApp); restoreErr != nil {
+				return "", "", false, fmt.Errorf("verify installed ChatGPT app failed: %v; restore previous app from %s failed: %w", err, backupApp, restoreErr)
+			}
+		}
+		return "", "", false, fmt.Errorf("verify installed ChatGPT app after replacement: %w", err)
 	}
 	if hadExisting {
-		_ = os.RemoveAll(backupApp)
+		if err := os.RemoveAll(backupApp); err != nil {
+			codexAppWarn(opts.Log, "ChatGPT app updated successfully but the previous bundle could not be removed from %s: %v", backupApp, err)
+		}
 	}
-	return destApp, nil
+	return destApp, newVersion, true, nil
+}
+
+func codexDesktopMacRequestedDestination(installDir, destination string) (string, error) {
+	destination = filepath.Clean(destination)
+	if filepath.Dir(destination) != filepath.Clean(installDir) || !isCodexDesktopMacAppName(filepath.Base(destination)) {
+		return "", fmt.Errorf("requested ChatGPT app destination must be ChatGPT.app or Codex.app directly under %s", installDir)
+	}
+	return destination, nil
 }
 
 func verifyCodexDesktopAppMac(ctx context.Context, appPath string, log io.Writer) error {
@@ -844,14 +989,14 @@ func codexDesktopMacInstallDestination(ctx context.Context, installDir string, s
 	var conflicts []string
 	for _, appName := range appNames {
 		destination := filepath.Join(installDir, appName)
-		info, err := os.Stat(destination)
+		info, err := os.Lstat(destination)
 		if os.IsNotExist(err) {
 			return destination, nil
 		}
 		if err != nil {
 			return "", fmt.Errorf("inspect existing desktop app at %s: %w", destination, err)
 		}
-		if !info.IsDir() {
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 			conflicts = append(conflicts, destination)
 			continue
 		}
@@ -926,7 +1071,7 @@ func codexDesktopMacExecutableNames(appPath string) []string {
 
 func launchCodexDesktopAppWindows(ctx context.Context, opts codexDesktopAppOptions) error {
 	backend := strings.ToLower(strings.TrimSpace(os.Getenv("CXP_WINDOWS_APP_BACKEND")))
-	if backend == "legacy" || strings.TrimSpace(opts.AppPath) != "" || (backend != "managed-only" && !opts.RequiresDirectLaunch) {
+	if !codexWindowsAppUsesManagedBackend(opts) {
 		return launchCodexDesktopAppWindowsLegacy(ctx, opts, true, !opts.RequiresDirectLaunch)
 	}
 
@@ -953,6 +1098,13 @@ func launchCodexDesktopAppWindows(ctx context.Context, opts codexDesktopAppOptio
 }
 
 func launchCodexDesktopAppWindowsLegacy(ctx context.Context, opts codexDesktopAppOptions, allowStoreInstall, allowAppXFallback bool) error {
+	if allowStoreInstall && strings.TrimSpace(opts.AppPath) == "" && codexAppGOOS() == "windows" {
+		elevated, elevationErr := codexAppTokenElevationFn()
+		if elevationErr != nil || elevated {
+			allowStoreInstall = false
+			codexAppWarn(opts.Log, "Microsoft Store app installation is disabled because CXP has an elevated or unknown Windows token; an existing Store app can still launch, but installation requires a non-elevated CXP process.")
+		}
+	}
 	script := codexDesktopWindowsInstallAndLaunchScriptWithPolicy(opts, allowStoreInstall, allowAppXFallback)
 	name := teamsServicePowerShellExecutable()
 	if _, err := codexAppLookPath(name); err != nil {
@@ -1004,7 +1156,7 @@ func codexDesktopWindowsInstallAndLaunchScriptWithPolicy(opts codexDesktopAppOpt
 		"function Get-CodexDirectLaunchFailureMessage([string]$FilePath, [System.Exception]$Exception) { $message = 'direct ChatGPT/Codex desktop executable launch failed: ' + $Exception.Message; if ($FilePath.IndexOf('\\WindowsApps\\', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { $message += ' The selected path is inside the protected WindowsApps package directory. Microsoft Store apps usually cannot be launched directly from that path; they must be started through AppX activation, which cannot preserve CODEX_HOME/proxy environment or Chromium --proxy-server arguments. Pass --app-path only for an unpackaged ChatGPT.exe or Codex.exe that Windows can execute directly.' }; return $message }",
 		"Warn-NonInteractiveDesktop",
 		"$pkg = Get-CodexPackage",
-		"if ($null -eq $pkg -and [string]::IsNullOrWhiteSpace($appPath)) { if (-not $allowStoreInstall) { throw 'legacy Store backend is disabled for managed-launch fallback because it cannot preserve direct-launch environment' }; $winget = Get-CodexWinget; & $winget.Source install --id $storeId --source msstore --exact --accept-source-agreements --accept-package-agreements --disable-interactivity; if ($LASTEXITCODE -ne 0) { throw ('winget Microsoft Store install failed with exit code ' + $LASTEXITCODE + '. Microsoft Store/winget may be blocked by enterprise policy, unavailable on this Windows edition, or unable to reach the network/proxy.') }; $pkg = Get-CodexPackage }",
+		"if ($null -eq $pkg -and [string]::IsNullOrWhiteSpace($appPath)) { if (-not $allowStoreInstall) { throw 'Microsoft Store app installation is disabled for this launch; install it with a standard Windows token or rerun cxp without Administrator privileges' }; $winget = Get-CodexWinget; & $winget.Source install --id $storeId --source msstore --exact --accept-source-agreements --accept-package-agreements --disable-interactivity; if ($LASTEXITCODE -ne 0) { throw ('winget Microsoft Store install failed with exit code ' + $LASTEXITCODE + '. Microsoft Store/winget may be blocked by enterprise policy, unavailable on this Windows edition, or unable to reach the network/proxy.') }; $pkg = Get-CodexPackage }",
 		"if (-not [string]::IsNullOrWhiteSpace($appPath)) { if (-not (Test-Path -LiteralPath $appPath)) { throw ('Codex desktop app path not found: ' + $appPath) }; try { Start-CodexDesktopProcess $appPath; return } catch { throw (Get-CodexDirectLaunchFailureMessage $appPath $_.Exception) } }",
 		"if ($null -eq $pkg) { throw 'OpenAI.Codex package was not found after installation. Microsoft Store/winget may be blocked by policy or source availability.' }",
 		"$manifest = Get-AppxPackageManifest -Package $pkg.PackageFullName",

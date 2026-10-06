@@ -17,6 +17,7 @@ $script:InstallFailureReason = $null
 $script:InstallSuccessDetails = @()
 $script:InstallRecordDetail = ""
 $script:InstallShowSummary = $true
+$script:InstallTemporaryPaths = @()
 $installMinFreeKB = 131072
 if (-not [string]::IsNullOrWhiteSpace($env:CODEX_PROXY_INSTALL_MIN_FREE_KB)) {
   $parsedMinFreeKB = 0L
@@ -36,6 +37,9 @@ function Write-InstallBanner([string]$title) {
 trap {
   if ([string]::IsNullOrWhiteSpace($script:InstallFailureReason)) {
     $script:InstallFailureReason = $_.Exception.Message
+  }
+  foreach ($tempPath in $script:InstallTemporaryPaths) {
+    Remove-Item -Force -LiteralPath $tempPath -ErrorAction SilentlyContinue
   }
   if ($script:InstallShowSummary) {
     Write-InstallBanner "CODEX-PROXY INSTALL FAILED"
@@ -489,14 +493,18 @@ Invoke-DiskWrite -Label "install directory" -PathValue $InstallDir -DefaultReaso
 }
 $installDirResolved = [IO.Path]::GetFullPath($InstallDir)
 
-$tmp = Join-Path $env:TEMP "$asset"
+$installTempToken = [Guid]::NewGuid().ToString("N")
+$tmp = Join-Path $env:TEMP ($installTempToken + "-" + $asset)
+$script:InstallTemporaryPaths += $tmp
 Invoke-DiskWrite -Label "release asset download" -PathValue $tmp -DefaultReason "Failed to download release asset: $url" -Action {
   Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing
 }
 
 # Optional checksum verification.
+$expected = $null
+$checksumsTmp = Join-Path $env:TEMP ($installTempToken + "-checksums.txt")
+$script:InstallTemporaryPaths += $checksumsTmp
 try {
-  $checksumsTmp = Join-Path $env:TEMP "checksums.txt"
   Assert-DiskSpace -label "checksum download" -pathValue $checksumsTmp -minBytes $script:InstallMinFreeBytes
   try {
     Invoke-WebRequest -Uri $checksumsUrl -OutFile $checksumsTmp -UseBasicParsing
@@ -511,12 +519,9 @@ try {
     }
     throw
   }
-  $expected = (Select-String -Path $checksumsTmp -Pattern ("\s{1}" + [regex]::Escape($asset) + "$") | Select-Object -First 1).Line.Split(" ", [System.StringSplitOptions]::RemoveEmptyEntries)[0]
-  if ($expected) {
-    $actual = Get-CodexProxySHA256Hex $tmp
-    if ($expected.ToLowerInvariant() -ne $actual) {
-      throw "Checksum mismatch for $asset (expected $expected, got $actual)"
-    }
+  $checksumLine = Select-String -Path $checksumsTmp -Pattern ("\s{1}" + [regex]::Escape($asset) + "$") | Select-Object -First 1
+  if ($null -ne $checksumLine) {
+    $expected = $checksumLine.Line.Split(" ", [System.StringSplitOptions]::RemoveEmptyEntries)[0]
   }
 } catch {
   if (Test-DiskSpaceError $_) {
@@ -531,6 +536,14 @@ try {
     throw
   }
   # Best-effort only; do not fail installation if checksum fetch/parse fails.
+} finally {
+  Remove-Item -Force -LiteralPath $checksumsTmp -ErrorAction SilentlyContinue
+}
+if (-not [string]::IsNullOrWhiteSpace($expected)) {
+  $actual = Get-CodexProxySHA256Hex $tmp
+  if ($expected.ToLowerInvariant() -ne $actual) {
+    throw "Checksum mismatch for $asset (expected $expected, got $actual)"
+  }
 }
 
 $dst = Join-Path $installDirResolved "codex-proxy.exe"
@@ -626,6 +639,11 @@ $null = Remove-ProfileLine -path $profilePath -line $legacyAliasLine
 $null = Ensure-ProfileLine -path $profilePath -line $aliasLine
 
 Write-InstallRecord -targetPath $dst -shimPath $cxpExe -repo $Repo -version $tag -goarch $arch
+
+foreach ($tempPath in $script:InstallTemporaryPaths) {
+  Remove-Item -Force -LiteralPath $tempPath -ErrorAction SilentlyContinue
+}
+$script:InstallTemporaryPaths = @()
 
 # Clean up legacy command names when they can be positively identified as
 # codex-proxy-owned leftovers from earlier installs.

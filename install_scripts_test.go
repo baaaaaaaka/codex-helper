@@ -339,8 +339,42 @@ func TestInstallPs1ChecksumDownloadRemainsBestEffort(t *testing.T) {
 	if !strings.Contains(checksumBlock, "Test-DiskSpaceError") {
 		t.Fatalf("checksum block should still promote disk-space failures, got:\n%s", checksumBlock)
 	}
+	bestEffortAt := strings.Index(checksumBlock, "# Best-effort only")
+	hashAt := strings.Index(checksumBlock, "Get-CodexProxySHA256Hex $tmp")
+	if bestEffortAt < 0 || hashAt <= bestEffortAt {
+		t.Fatalf("local hash verification must happen outside the best-effort checksum-fetch catch, got:\n%s", checksumBlock)
+	}
+	if !strings.Contains(checksumBlock, "$expected = $null") || !strings.Contains(checksumBlock, "if (-not [string]::IsNullOrWhiteSpace($expected))") {
+		t.Fatalf("checksum verification must remain optional only until a target digest is available, got:\n%s", checksumBlock)
+	}
 	if !strings.Contains(text, "Get-CodexProxySHA256Hex") || !strings.Contains(text, "System.Security.Cryptography.SHA256") {
 		t.Fatalf("install.ps1 should not depend solely on Get-FileHash for checksum verification")
+	}
+}
+
+func TestInstallPs1UsesUniqueTemporaryPathsAndCleansThemOnFailure(t *testing.T) {
+	repoRoot, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	data, err := os.ReadFile(filepath.Join(repoRoot, "install.ps1"))
+	if err != nil {
+		t.Fatalf("read install.ps1: %v", err)
+	}
+	text := string(data)
+	for _, required := range []string{
+		"$installTempToken = [Guid]::NewGuid().ToString(\"N\")",
+		"$script:InstallTemporaryPaths += $tmp",
+		"$script:InstallTemporaryPaths += $checksumsTmp",
+		"foreach ($tempPath in $script:InstallTemporaryPaths)",
+		"Remove-Item -Force -LiteralPath $tempPath -ErrorAction SilentlyContinue",
+	} {
+		if !strings.Contains(text, required) {
+			t.Errorf("install.ps1 missing isolated temp/cleanup contract %q", required)
+		}
+	}
+	if strings.Contains(text, "Join-Path $env:TEMP \"$asset\"") || strings.Contains(text, "Join-Path $env:TEMP \"checksums.txt\"") {
+		t.Fatal("install.ps1 must not reuse fixed download or checksum temporary paths")
 	}
 }
 

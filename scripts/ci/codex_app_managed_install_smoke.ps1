@@ -198,7 +198,12 @@ try {
     Start-Sleep -Milliseconds 100
   }
   if ($launchedProcesses.Count -eq 0) { throw "managed cached launch did not create the fake ChatGPT process" }
-  $paths = @($launchedProcesses | ForEach-Object { try { $_.Path } catch { "" } })
+  $paths = @($launchedProcesses | ForEach-Object {
+    try {
+      $processInfo = Get-CimInstance -ClassName Win32_Process -Filter ("ProcessId = " + $_.Id) -ErrorAction Stop
+      if ($null -ne $processInfo) { [string]$processInfo.ExecutablePath } else { "" }
+    } catch { "" }
+  })
   if (-not ($paths | Where-Object { $_ -and $_ -like "$managedRoot\*" })) {
     throw "observed desktop process did not run from managed runtime: $($paths -join '; ')"
   }

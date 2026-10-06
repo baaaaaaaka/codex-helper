@@ -43,7 +43,37 @@ for candidate in "$current_exe" "$current_app/Contents/MacOS/Codex" "$legacy_exe
 done | sort -u >"$existing_pids"
 proxy_pid=""
 
+stop_smoke_app() {
+  for _ in $(seq 1 50); do
+    still_running=0
+    for candidate in "$current_exe" "$current_app/Contents/MacOS/Codex" "$legacy_exe" "$legacy_app/Contents/MacOS/ChatGPT"; do
+      for pid in $(pgrep -f "$candidate" 2>/dev/null || true); do
+        if ! grep -Fxq "$pid" "$existing_pids"; then
+          still_running=1
+          break
+        fi
+      done
+      if [ "$still_running" = "1" ]; then
+        break
+      fi
+    done
+    if [ "$still_running" = "0" ]; then
+      return 0
+    fi
+    for candidate in "$current_exe" "$current_app/Contents/MacOS/Codex" "$legacy_exe" "$legacy_app/Contents/MacOS/ChatGPT"; do
+      for pid in $(pgrep -f "$candidate" 2>/dev/null || true); do
+        if ! grep -Fxq "$pid" "$existing_pids"; then
+          kill "$pid" >/dev/null 2>&1 || true
+        fi
+      done
+    done
+    sleep 0.1
+  done
+  return 1
+}
+
 cleanup() {
+  stop_smoke_app || true
   if [ -n "$proxy_pid" ]; then
     kill "$proxy_pid" >/dev/null 2>&1 || true
   fi
@@ -231,8 +261,46 @@ for _ in $(seq 1 90); do
         exit 1
       fi
     fi
-    echo "Codex desktop app network install smoke passed: entry=$entry app=$app"
-    kill "${launched_pids[@]}" >/dev/null 2>&1 || true
+    if ! stop_smoke_app; then
+      echo "Codex desktop app did not exit before the update smoke" >&2
+      exit 1
+    fi
+
+    upgrade_out="$base/app-upgrade.out"
+    proxy_hits_before=0
+    if [ "$mode" = "proxy" ]; then
+      proxy_hits_before="$(grep -c '^persistent.oaistatic.com:443$' "$proxy_log" || true)"
+    fi
+    if ! env \
+      HOME="$home" \
+      XDG_CACHE_HOME="$base/cache" \
+      PATH="/usr/bin:/bin:/usr/sbin:/sbin:$PATH" \
+      "$helper" --config "$config" --upgrade-codex-app >"$upgrade_out" 2>&1; then
+      echo "cxp --upgrade-codex-app failed after the desktop app exited" >&2
+      sed -n '1,200p' "$upgrade_out" >&2 || true
+      exit 1
+    fi
+    if ! grep -Eq 'Codex desktop app (upgraded|is already up to date):' "$upgrade_out"; then
+      echo "macOS updater did not report a verified package result" >&2
+      sed -n '1,200p' "$upgrade_out" >&2 || true
+      exit 1
+    fi
+    if [ ! -x "$exe" ]; then
+      echo "macOS updater changed the selected app path or removed its executable: $exe" >&2
+      exit 1
+    fi
+    if [ "$mode" = "proxy" ]; then
+      proxy_hits_after="$(grep -c '^persistent.oaistatic.com:443$' "$proxy_log" || true)"
+      if [ "$proxy_hits_after" -le "$proxy_hits_before" ]; then
+        echo "macOS app update DMG download did not use the configured proxy" >&2
+        sed -n '1,160p' "$upgrade_out" >&2 || true
+        sed -n '1,160p' "$proxy_log" >&2 || true
+        exit 1
+      fi
+    fi
+    codesign --verify --strict "$app"
+    spctl --assess --type execute "$app"
+    echo "Codex desktop app install/update smoke passed: entry=$entry app=$app"
     exit 0
   fi
   sleep 1

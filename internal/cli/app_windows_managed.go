@@ -223,6 +223,86 @@ func launchCodexDesktopAppWindowsManaged(ctx context.Context, opts codexDesktopA
 	return codexWindowsManagedLaunchStartedUncertain, errors.New("managed ChatGPT launcher did not report a process id")
 }
 
+func codexWindowsAppUsesManagedBackend(opts codexDesktopAppOptions) bool {
+	backend := strings.ToLower(strings.TrimSpace(os.Getenv("CXP_WINDOWS_APP_BACKEND")))
+	return backend != "legacy" && strings.TrimSpace(opts.AppPath) == "" && (backend == "managed-only" || opts.RequiresDirectLaunch)
+}
+
+func preflightCodexWindowsAppElevation(ctx context.Context, opts codexDesktopAppOptions) error {
+	if codexAppGOOS() != "windows" {
+		return nil
+	}
+	elevated, elevationErr := codexAppTokenElevationFn()
+	if !elevated && elevationErr == nil {
+		return nil
+	}
+	if strings.TrimSpace(opts.AppPath) != "" {
+		return nil
+	}
+	if codexWindowsAppUsesManagedBackend(opts) {
+		root, err := codexAppWindowsManagedRootFn(ctx)
+		if err != nil {
+			return windowsAppWriteDenied("install the CXP-managed ChatGPT app", elevated, elevationErr, err)
+		}
+		_, valid, err := readValidCodexWindowsManagedState(root)
+		if err != nil {
+			return windowsAppWriteDenied("install the CXP-managed ChatGPT app", elevated, elevationErr, err)
+		}
+		if valid {
+			return nil
+		}
+		return windowsAppWriteDenied("install the CXP-managed ChatGPT app", elevated, elevationErr, nil)
+	}
+	installed, err := codexWindowsStorePackageInstalled(ctx)
+	if err != nil {
+		return windowsAppWriteDenied("install the ChatGPT Microsoft Store app", elevated, elevationErr, err)
+	}
+	if installed {
+		return nil
+	}
+	return windowsAppWriteDenied("install the ChatGPT Microsoft Store app", elevated, elevationErr, nil)
+}
+
+func codexWindowsStorePackageInstalled(ctx context.Context) (bool, error) {
+	script := "$package = Get-AppxPackage -Name '" + codexDesktopWindowsPackageName + "' -ErrorAction Stop | Select-Object -First 1; if ($null -eq $package) { 'CXP_APPX_MISSING' } else { 'CXP_APPX_PRESENT' }"
+	output, err := codexAppCommandOutput(ctx, teamsServicePowerShellExecutable(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script)
+	if err != nil {
+		return false, fmt.Errorf("query registered ChatGPT AppX package: %w", err)
+	}
+	switch strings.TrimSpace(string(output)) {
+	case "CXP_APPX_PRESENT":
+		return true, nil
+	case "CXP_APPX_MISSING":
+		return false, nil
+	default:
+		return false, fmt.Errorf("unexpected ChatGPT AppX query response %q", strings.TrimSpace(string(output)))
+	}
+}
+
+func windowsAppWriteDenied(action string, elevated bool, elevationErr error, detail error) error {
+	if elevationErr != nil {
+		return fmt.Errorf("cannot verify the current Windows token; refusing to %s from an elevated or unknown token. Rerun CXP without Administrator privileges: %w", action, elevationErr)
+	}
+	if detail != nil {
+		return fmt.Errorf("cannot safely determine whether %s requires a write; refusing to continue with an elevated Windows token: %w", action, detail)
+	}
+	if elevated {
+		return fmt.Errorf("refusing to %s while CXP has an elevated Windows token; rerun CXP without Administrator privileges", action)
+	}
+	return fmt.Errorf("refusing to %s because Windows elevation status is unknown", action)
+}
+
+func ensureCodexWindowsAppWriteAllowed(action string) error {
+	if codexAppGOOS() != "windows" {
+		return nil
+	}
+	elevated, err := codexAppTokenElevationFn()
+	if err != nil || elevated {
+		return windowsAppWriteDenied(action, elevated, err, nil)
+	}
+	return nil
+}
+
 func checkWindowsManagedProcessConflict(ctx context.Context) error {
 	script := "$existing = @(Get-Process -Name 'ChatGPT','Codex' -ErrorAction SilentlyContinue); if ($existing.Count -gt 0) { Write-Output 'CXP_MANAGED_CONFLICT'; throw 'ChatGPT or Codex is already running; quit it before launching with cxp proxy or a model profile' }"
 	out, err := codexAppCommandOutput(ctx, teamsServicePowerShellExecutable(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script)
@@ -253,14 +333,17 @@ func ensureCodexWindowsManagedInstallWithRefresh(ctx context.Context, root strin
 	if root == "." || root == "" {
 		return codexWindowsManagedInstallState{}, false, errors.New("managed Windows ChatGPT root is empty")
 	}
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		return codexWindowsManagedInstallState{}, false, fmt.Errorf("create managed Windows ChatGPT root: %w", err)
-	}
 	currentState, currentOK, err := readValidCodexWindowsManagedState(root)
 	if err != nil {
 		return codexWindowsManagedInstallState{}, false, err
 	} else if currentOK && !refresh {
 		return currentState, false, nil
+	}
+	if err := ensureCodexWindowsAppWriteAllowed("install or update the CXP-managed ChatGPT app"); err != nil {
+		return codexWindowsManagedInstallState{}, false, err
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return codexWindowsManagedInstallState{}, false, fmt.Errorf("create managed Windows ChatGPT root: %w", err)
 	}
 
 	lockPath := filepath.Join(root, codexWindowsManagedLockDir)
@@ -752,12 +835,14 @@ func codexDesktopWindowsManagedLaunchScript(opts codexDesktopAppOptions, executa
 		"if ($codexArgs.Count -gt 0) { $start.ArgumentList = $codexArgs }",
 		"if ($codexWaitForExit) { $start.Wait = $true }",
 		"$process = Start-Process @start",
-		"$actualProcessPath = ''; try { $actualProcessPath = $process.MainModule.FileName } catch { }",
-		"if ([string]::IsNullOrWhiteSpace($actualProcessPath) -or -not [String]::Equals([IO.Path]::GetFullPath($actualProcessPath), [IO.Path]::GetFullPath($exe), [StringComparison]::OrdinalIgnoreCase)) { Write-Output 'CXP_MANAGED_STARTED_UNCERTAIN'; throw ('managed ChatGPT process path mismatch: ' + $actualProcessPath) }",
-		"Write-Output ('CXP_MANAGED_PID=' + $process.Id)",
+		"function Get-CXPManagedProcessInfo([int]$processId) { Get-CimInstance -ClassName Win32_Process -Filter ('ProcessId = ' + $processId) -ErrorAction Stop }",
+		"$expectedExePath = [IO.Path]::GetFullPath($exe); $processStartUtc = $null; try { $processStartUtc = $process.StartTime.ToUniversalTime() } catch { }",
+		"$processInfo = $null; for ($attempt = 0; $attempt -lt 10; $attempt++) { try { $candidate = Get-CXPManagedProcessInfo $process.Id; if ($null -ne $candidate -and -not [string]::IsNullOrWhiteSpace([string]$candidate.ExecutablePath) -and $null -ne $processStartUtc -and [Math]::Abs(($candidate.CreationDate.ToUniversalTime() - $processStartUtc).TotalSeconds) -le 2) { $processInfo = $candidate; break } } catch { }; Start-Sleep -Milliseconds 100 }",
+		"$confirmedProcessId = $process.Id; if (($null -eq $processInfo -or -not [String]::Equals([IO.Path]::GetFullPath([string]$processInfo.ExecutablePath), $expectedExePath, [StringComparison]::OrdinalIgnoreCase)) -and $process.HasExited -and $null -ne $processStartUtc) { try { $children = @(Get-CimInstance -ClassName Win32_Process -ErrorAction Stop | Where-Object { $_.ParentProcessId -eq $process.Id -and -not [string]::IsNullOrWhiteSpace([string]$_.ExecutablePath) -and [IO.Path]::GetFullPath([string]$_.ExecutablePath) -ieq $expectedExePath -and $_.CreationDate.ToUniversalTime() -ge $processStartUtc }); if ($children.Count -gt 0) { $processInfo = $children[0]; $confirmedProcessId = [int]$processInfo.ProcessId } } catch { } }",
+		"$actualProcessPath = if ($null -ne $processInfo) { [string]$processInfo.ExecutablePath } else { '' }; if ([string]::IsNullOrWhiteSpace($actualProcessPath) -or -not [String]::Equals([IO.Path]::GetFullPath($actualProcessPath), $expectedExePath, [StringComparison]::OrdinalIgnoreCase)) { Write-Output 'CXP_MANAGED_STARTED_UNCERTAIN'; throw ('managed ChatGPT process path could not be verified: ' + $actualProcessPath) }",
+		"Write-Output ('CXP_MANAGED_PID=' + $confirmedProcessId)",
 		"Start-Sleep -Milliseconds 300",
-		"$process.Refresh()",
-		"if ($process.HasExited) { Write-Output 'CXP_MANAGED_STARTED_UNCERTAIN'; throw 'managed ChatGPT process exited immediately after launch' }",
+		"$confirmedProcess = $null; try { $confirmedProcess = Get-CXPManagedProcessInfo $confirmedProcessId } catch { }; if ($null -eq $confirmedProcess -or [string]::IsNullOrWhiteSpace([string]$confirmedProcess.ExecutablePath) -or -not [String]::Equals([IO.Path]::GetFullPath([string]$confirmedProcess.ExecutablePath), $expectedExePath, [StringComparison]::OrdinalIgnoreCase) -or $confirmedProcess.CreationDate -ne $processInfo.CreationDate) { Write-Output 'CXP_MANAGED_STARTED_UNCERTAIN'; throw 'managed ChatGPT process exited or changed identity immediately after launch' }",
 	}
 	filtered := parts[:0]
 	for _, part := range parts {

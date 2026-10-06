@@ -2,17 +2,27 @@ package cli
 
 import (
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	"github.com/spf13/cobra"
 )
 
 func runUpgradeCodexAppFromRoot(cmd *cobra.Command, root *rootOptions) error {
-	profileRef, err := rootProfileArg(cmd)
-	if err != nil {
+	if err := validateCodexDesktopAppUpdatePlatform(); err != nil {
 		return err
 	}
-	if err := validateCodexWindowsManagedAppUpdatePlatform(); err != nil {
+	if codexAppGOOS() == "windows" {
+		if err := ensureCodexWindowsAppWriteAllowed("upgrade the CXP-managed ChatGPT app"); err != nil {
+			return err
+		}
+	} else if codexAppGOOS() == "darwin" {
+		if err := rejectRunningCodexDesktopMacApp(cmd.Context()); err != nil {
+			return err
+		}
+	}
+	profileRef, err := rootProfileArg(cmd)
+	if err != nil {
 		return err
 	}
 	ctx, stop := withSignalContext(cmd.Context())
@@ -40,6 +50,28 @@ func runUpgradeCodexAppFromRoot(cmd *cobra.Command, root *rootOptions) error {
 		installOpts.ProxyURL = proxyURL
 	}
 
+	if codexAppGOOS() == "darwin" {
+		home, err := codexDesktopMacInstallHome(installOpts)
+		if err != nil {
+			return err
+		}
+		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Codex desktop app update target (CXP-managed): %s\n", filepath.Join(home, "Applications"))
+		state, changed, err := codexAppUpgradeMacInstallFn(ctx, installOpts)
+		if err != nil {
+			return err
+		}
+		label := state.Version
+		if label == "" {
+			label = state.AppPath
+		}
+		if changed {
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Codex desktop app upgraded: %s\n", label)
+		} else {
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Codex desktop app is already up to date: %s\n", label)
+		}
+		return nil
+	}
+
 	managedRoot, err := codexAppWindowsManagedRootFn(ctx)
 	if err != nil {
 		return fmt.Errorf("resolve managed Codex desktop app root: %w", err)
@@ -62,8 +94,14 @@ func runUpgradeCodexAppFromRoot(cmd *cobra.Command, root *rootOptions) error {
 	return nil
 }
 
-func validateCodexWindowsManagedAppUpdatePlatform() error {
+func validateCodexDesktopAppUpdatePlatform() error {
 	switch codexAppGOOS() {
+	case "darwin":
+		arch := strings.TrimSpace(codexAppGOARCH())
+		if strings.EqualFold(arch, "arm64") || strings.EqualFold(arch, "amd64") {
+			return nil
+		}
+		return fmt.Errorf("--upgrade-codex-app supports Apple Silicon and Intel macOS only; current architecture: %s", arch)
 	case "windows":
 		arch := strings.TrimSpace(codexAppGOARCH())
 		if !strings.EqualFold(arch, codexWindowsManagedArch) && !strings.EqualFold(arch, "amd64") {
@@ -75,5 +113,5 @@ func validateCodexWindowsManagedAppUpdatePlatform() error {
 			return nil
 		}
 	}
-	return fmt.Errorf("--upgrade-codex-app is only supported on native Windows or WSL; current platform: %s", codexAppGOOS())
+	return fmt.Errorf("--upgrade-codex-app is only supported on macOS, native Windows, or WSL; current platform: %s", codexAppGOOS())
 }
