@@ -264,7 +264,7 @@ func warnIfWindowsAppElevated(log io.Writer) {
 		return
 	}
 	if elevated {
-		codexAppWarn(log, "CXP is running with an elevated Windows token. ChatGPT may run with different privileges; app installation and upgrade require a non-elevated CXP process.")
+		codexAppWarn(log, "CXP is running with an elevated Windows token. ChatGPT may run with different privileges; managed app installation and upgrade use the same user's verified normal token when available, otherwise rerun CXP without Administrator privileges.")
 	}
 }
 

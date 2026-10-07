@@ -76,7 +76,36 @@ if ($SettingsPath) {
         } finally {
           $diagnostics = Join-Path $env:LOCALAPPDATA "Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\DiagOutputDir"
           Save-SmokeWingetDiagnostics -SourceDirectory $diagnostics -OutputDirectory $env:RUNNER_TEMP
-          $storeProbe = '$ErrorActionPreference = "Stop"; foreach ($name in @("Microsoft.WindowsStore", "Microsoft.DesktopAppInstaller")) { $packages = @(Get-AppxPackage -Name $name); Write-Output ($name + " registered=" + ($packages.Count -gt 0)) }; Write-Output "AppInstallManager construction started"; $manager = [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager, Windows.ApplicationModel.Store.Preview.InstallControl, ContentType=WindowsRuntime]::new(); Write-Output "AppInstallManager construction succeeded"'
+          $storeProbe = @'
+$ErrorActionPreference = "Stop"
+foreach ($name in @("Microsoft.WindowsStore", "Microsoft.DesktopAppInstaller")) {
+  $packages = @(Get-AppxPackage -Name $name)
+  Write-Output ($name + " registered=" + ($packages.Count -gt 0))
+}
+Write-Output "AppInstallManager construction started"
+$manager = [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager, Windows.ApplicationModel.Store.Preview.InstallControl, ContentType=WindowsRuntime]::new()
+Write-Output "AppInstallManager construction succeeded"
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$asTask = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq "AsTask" -and $_.IsGenericMethod -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' } | Select-Object -First 1
+if ($null -eq $asTask) { throw "Windows Runtime async projection unavailable for the read-only policy probe" }
+foreach ($operation in @("IsStoreBlockedByPolicyAsync", "GetIsAppAllowedToInstallAsync")) {
+  try {
+    Write-Output "$operation started"
+    if ($operation -eq "IsStoreBlockedByPolicyAsync") {
+      $pending = $manager.IsStoreBlockedByPolicyAsync("Microsoft.WindowsStore", "CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US")
+    } else {
+      $pending = $manager.GetIsAppAllowedToInstallAsync("9PLM9XGG6VKS")
+    }
+    $task = $asTask.MakeGenericMethod([bool]).Invoke($null, @($pending))
+    if (!$task.Wait(30000)) { throw "$operation exceeded its read-only 30-second diagnostic timeout" }
+    Write-Output "$operation succeeded result=$($task.Result)"
+  } catch {
+    $failure = $_.Exception
+    while ($null -ne $failure.InnerException) { $failure = $failure.InnerException }
+    Write-Output ("$operation failed HRESULT=0x{0:X8}: {1}" -f $failure.HResult, $failure.Message)
+  }
+}
+'@
           try {
             Invoke-SmokeProcess -FilePath $windowsPowerShell -Arguments @("-NoProfile", "-NonInteractive", "-Command", $storeProbe) -OutputPath (Join-Path $env:RUNNER_TEMP "store-capability.out") | Write-Host
           } catch {

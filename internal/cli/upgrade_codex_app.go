@@ -14,7 +14,13 @@ func runUpgradeCodexAppFromRoot(cmd *cobra.Command, root *rootOptions) error {
 	}
 	if codexAppGOOS() == "windows" {
 		if err := ensureCodexWindowsAppWriteAllowed("upgrade the CXP-managed ChatGPT app"); err != nil {
-			return err
+			elevated, elevationErr := codexAppTokenElevationFn()
+			if elevationErr != nil || !elevated {
+				return err
+			}
+			if err := ensureWindowsInstallDelegationAvailable(); err != nil {
+				return err
+			}
 		}
 	} else if codexAppGOOS() == "darwin" {
 		if err := rejectRunningCodexDesktopMacApp(cmd.Context()); err != nil {

@@ -1947,12 +1947,13 @@ jobs:
           go test -c -o (Join-Path $env:RUNNER_TEMP "codex-desktop-token-probe.exe") ./internal/cli
           go build -o (Join-Path $env:RUNNER_TEMP "codex-managed-recording-proxy.exe") .\scripts\ci\windows_managed_recording_proxy
           go build -o (Join-Path $env:RUNNER_TEMP "codex-managed-fake-chatgpt.exe") .\scripts\ci\windows_managed_fake_chatgpt
-          $pattern = '^Test(CurrentWindowsTokenElevationQuery|WarnIfWindowsAppElevated|PreflightCodexWindowsAppElevation|ManagedWindowsWriterRejectsElevation|LegacyWindowsLauncherSuppressesWinget|RootUpgradeCodexApp|WindowsManagedApp|CodexDesktopWindows)'
+          $pattern = '^Test(CurrentWindowsTokenElevationQuery|WindowsInstall|WarnIfWindowsAppElevated|PreflightCodexWindowsAppElevation|ManagedWindowsWriterRejectsElevation|LegacyWindowsLauncherSuppressesWinget|RootUpgradeCodexApp|WindowsManagedApp|CodexDesktopWindows)'
           $listed = @(go test ./internal/cli -list $pattern | Select-String $pattern)
-          foreach ($required in @('^TestCurrentWindowsTokenElevationQuery$', '^TestPreflightCodexWindowsAppElevation', '^TestRootUpgradeCodexApp', '^TestWindowsManagedApp')) {
+          foreach ($required in @('^TestCurrentWindowsTokenElevationQuery$', '^TestWindowsInstall', '^TestPreflightCodexWindowsAppElevation', '^TestRootUpgradeCodexApp', '^TestWindowsManagedApp')) {
             if (!($listed | Select-String $required)) { throw "Windows desktop selector missed $required" }
           }
           go test ./internal/cli -run $pattern -count=1 -v
+          go test ./cmd/codex-proxy -run '^TestRunMainHandlesAppInstallWorkerBeforeRuntimeDispatch$' -count=1 -v
           .\scripts\ci\codex_app_smoke_process_test.ps1 -WorkingDirectory $env:RUNNER_TEMP
 
       - name: Codex desktop app managed runtime smoke (Windows)

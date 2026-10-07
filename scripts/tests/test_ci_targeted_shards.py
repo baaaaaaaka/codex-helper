@@ -815,9 +815,10 @@ echo 'ok'
         self.assertIn("Codex desktop app install/update smoke passed", mac_script)
 
         desktop_build = blocks["Codex desktop app Windows build and policy regressions"]
-        for selector in ("CurrentWindowsTokenElevationQuery", "PreflightCodexWindowsAppElevation", "RootUpgradeCodexApp|WindowsManagedApp"):
+        for selector in ("CurrentWindowsTokenElevationQuery", "WindowsInstall", "PreflightCodexWindowsAppElevation", "RootUpgradeCodexApp|WindowsManagedApp"):
             self.assertIn(selector, desktop_build)
         self.assertIn("codex_app_smoke_process_test.ps1", desktop_build)
+        self.assertIn("TestRunMainHandlesAppInstallWorkerBeforeRuntimeDispatch", desktop_build)
 
         network = blocks["Codex desktop app network install smoke (Windows)"]
         managed = blocks["Codex desktop app managed runtime smoke (Windows)"]

@@ -169,7 +169,7 @@ codex-proxy proxy doctor
 | `codex-proxy app [profile]` | 需要时安装、使用或配置代理模式，并在 macOS、Windows 或 WSL 上启动 Codex 桌面 App |
 | `codex-proxy app auth [profile]` | 使用相同的 `CODEX_HOME` 和代理设置完成 Codex 桌面 App 的 ChatGPT auth |
 | `codex-proxy app --model-profile <name>` | 通过隔离的 `CODEX_HOME` 使用保存的模型 profile 启动 Codex 桌面 App |
-| `codex-proxy --upgrade-codex-app [profile]` | 下载并安装 CXP-managed 的最新版 Windows/WSL 桌面 App 副本 |
+| `codex-proxy --upgrade-codex-app [profile]` | 更新 Windows/WSL 的 CXP 托管桌面 App 或 macOS 当前用户的桌面 App |
 | `codex-proxy --upgrade-codex` | 使用检测到的安装来源重新安装 Codex CLI |
 | `codex-proxy completion <shell>` | 生成 shell completion |
 | `codex-proxy init` | 创建 SSH profile |
