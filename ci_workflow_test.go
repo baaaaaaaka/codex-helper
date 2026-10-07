@@ -58,14 +58,20 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 	)
 	windowsDesktop := workflowStepBlock(t, targetedJob, "Codex desktop app network install smoke (Windows)")
 	requireStepContains(t, windowsDesktop,
-		"if: matrix.shard == 'windows-skills-desktop-b' && runner.os == 'Windows'",
-		`.\scripts\ci\codex_app_smoke_as_standard_user.ps1 -Helper $helper -NetworkInstall`,
+		"matrix.shard == 'windows-skills-desktop-b' && runner.os == 'Windows' && !cancelled()",
+		"steps.windows_desktop_build.outcome == 'success'",
+		"-Mode store",
 	)
 	managedDesktop := workflowStepBlock(t, targetedJob, "Codex desktop app managed runtime smoke (Windows)")
 	requireStepContains(t, managedDesktop,
-		"if: matrix.shard == 'windows-skills-desktop-b' && runner.os == 'Windows'",
-		`.\scripts\ci\codex_app_smoke_as_standard_user.ps1 -Helper $helper -ManagedInstall`,
+		"matrix.shard == 'windows-skills-desktop-b' && runner.os == 'Windows' && !cancelled()",
+		"steps.windows_desktop_build.outcome == 'success'",
+		"-Mode managed",
 	)
+	requireStepNotContains(t, managedDesktop, "continue-on-error", "steps.windows_desktop_store")
+	requireStepNotContains(t, windowsDesktop, "continue-on-error", "steps.windows_desktop_managed")
+	desktopBuild := workflowStepBlock(t, targetedJob, "Codex desktop app Windows build and policy regressions")
+	requireStepContains(t, desktopBuild, "CurrentWindowsTokenElevationQuery", "RootUpgradeCodexApp|WindowsManagedApp", "codex_app_smoke_process_test.ps1")
 	for _, name := range []string{
 		"Install Codex for integration (Windows)",
 		"Teams app-server probe (Windows)",

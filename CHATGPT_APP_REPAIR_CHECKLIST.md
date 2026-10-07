@@ -45,7 +45,7 @@ The pre-existing Windows launch investigation changes and `research-artifacts/ap
 ## Validation and CI
 
 - [x] Add focused Windows/macOS regression selectors to CI and update Linux-only unsupported-platform checks.
-- [x] Implement Windows smoke launch using the runner user's linked limited token when available, with a same-user restricted medium-integrity LUA-token fallback when the runner exposes no linked token.
+- [x] Remove the failed linked/restricted-token launcher and its implementation-string assertions; keep production elevation checks unchanged.
 - [ ] Verify the standard-account Windows app install/managed-launch smokes pass in GitHub CI.
 - [x] Run focused Linux Go tests and the 32-test CI shard-contract suite.
 - [x] Cross-compile Windows/amd64 and macOS/amd64 + arm64 test binaries.
@@ -57,6 +57,34 @@ The pre-existing Windows launch investigation changes and `research-artifacts/ap
 
 - `CXP_RUNTIME_DISABLE=1 go test ./... -count=1` completed but was not green: the Windows PowerShell script-parse tests could not reach PowerShell from WSL (`UtilBindVsockAnyPort`), and `internal/helperruntime/TestLaunchKeepsExplicitSameBasePrereleaseActive` failed. The changed packages' focused regression tests passed.
 - Windows checksum/concurrency tests, Windows elevation/managed-launch tests, and a CIM process-path smoke passed through host PowerShell. The full managed-app install/launch smoke was not run to completion because a pre-existing ChatGPT/Codex process was detected; it was left untouched.
-- GitHub CI confirmed Windows hosted jobs use elevated tokens. An isolated local account lost the Store logon-session context (`0x80070520`), Task Scheduler's `Interactive`/`Limited` configuration still returned an elevated token, and the runner's current token did not expose a linked limited token. The smoke prefers that linked token, then derives a same-user restricted token with Administrators disabled and medium integrity; both paths retain the production guard and verify the child is not an effective Administrator. GitHub CI showed `CreateProcessWithTokenW` fails with `ERROR_ACCESS_DENIED` (5) on the hosted runner. The harness now uses `CreateProcessAsUserW` directly so process creation follows the derived token's session; a local inert-child test passed, and native CI must confirm Store installation and managed-app launch.
+- GitHub CI confirmed elevated hosted tokens. Historical attempts failed separately: a temporary account lacked Store capability (`0x80070520` after App Installer registration), Task Scheduler still returned an elevated token, no linked limited token was available, and restricted-token launches encountered access-denied errors. Removing LUA restrictions left `TokenElevation=true`. These failures do not establish the cause of the original AppX identity report or the earlier access-denied errors. The failed native launcher has been removed rather than extended again.
+
+## CI convergence execution (2026-10-07)
+
+- [x] Work only in the investigation workspace; preserve research artifacts and the production feature changes.
+- [x] Start a validation branch from GitHub main instead of pushing hypotheses directly to main.
+- [x] Replace synthetic-token construction with a temporary real account using loaded native profile data; do not derive profile paths from a guessed username.
+- [x] Add a native test-binary probe of the production TokenElevation query before invoking CXP or installing an app.
+- [x] Separate policy regressions, managed smoke, and Store smoke. Probe each smoke's actual account before installation rather than creating a redundant third account. Independent smoke failures remain required failures.
+- [x] Start each test account with a fresh environment before any child code executes; derive profile variables only from its verified native profile.
+- [x] Replace process-runner implementation assertions with native behavior tests for UTF-8 output, argument boundaries, failing exit codes, and missing executables.
+- [x] Preserve failure diagnostics and clean only processes belonging to the unique test-account SID.
+- [x] Restrict temporary-account creation to disposable GitHub-hosted Windows runners; account profile residue is not allowed on the development host or persistent self-hosted workers.
+- [x] Run focused tests, script checks, and affected target cross-compiles; record actual results below.
+- [x] Review the complete convergence diff and run the final applicable local test gate once; investigate every local failure without changing unrelated code.
+- [ ] Validate the real standard-account probe on native Windows CI before treating the environment as supported.
+- [ ] Complete the managed installation/launch/update smoke independently of Store capability.
+- [ ] Complete the Store smoke on a supported real user session; lack of capability remains a failed gate, not a successful skip.
+- [ ] Complete the original Windows identity/admin/multiple-copy validation and native macOS verification described above.
+- [ ] Merge only after required validation; recompute the release version and publish only when the release stop conditions are satisfied.
 - macOS Intel/Apple Silicon test binaries cross-compiled successfully. The native macOS DMG install/update network smoke is configured in GitHub CI but could not run on this Linux/WSL host; live LaunchServices and OpenAI background-updater behavior remain unverified.
 - `python3 scripts/tests/test_ci_targeted_shards.py` passed (32 tests); the macOS network smoke passed `bash -n`; `git diff --check` passed.
+
+### Convergence validation evidence
+
+- The workflow contract test and all 32 shard-contract tests passed. Focused Windows elevation/managed/upgrade and macOS upgrade/recovery/lock tests passed on Linux. Windows/amd64 and macOS/amd64 + arm64 CLI test binaries compiled.
+- Native Windows PowerShell parsed the three controller/process/test scripts. The process-runner behavior test passed under PowerShell 7 with `RemoteSigned`, including UTF-8 output, argument boundaries, nonzero exit diagnostics, and a missing executable. Only inert fixtures were run, not an app lifecycle or local-user controller.
+- The native production token API test passed on the WSL host with `actual Windows TokenElevation=false`. This does not validate the temporary-account context on GitHub runners.
+- The complete local Go run finished with three explained failures, not a green result: sandbox-blocked WSL interop, an inherited `CXP_RUNTIME_DISABLE=1` suppressing a helperruntime launch test, and a long `GOTMPDIR` leaving too little filename budget in an existing Teams test. The exact parse test passed with narrowly authorized interop, the helperruntime test passed with runtime markers unset, and the Teams test passed under a validated short temporary root. No production or unrelated test changes were made to hide these failures.
+- CI-only I/O is bounded to one settings file and logs per smoke, four staged scripts, and prebuilt fixtures. There is no production hot-path or state-format change; hosted diagnostics expire after seven days.
+- Native GitHub user-context, managed app, Store, and macOS results remain pending. Do not merge or publish a prerelease until required gates pass; missing Store capability must remain visible.

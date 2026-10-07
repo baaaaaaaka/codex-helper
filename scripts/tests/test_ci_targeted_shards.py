@@ -719,6 +719,7 @@ echo 'ok'
             "Teams SQLite store migration and perf regressions": "state-perf",
             "Teams perf benchmark smoke": "state-perf",
             "Skills local git smoke (Windows)": "windows-skills-desktop",
+            "Codex desktop app Windows build and policy regressions": "windows-skills-desktop-b",
             "Codex desktop app network install smoke (Windows)": "windows-skills-desktop-b",
             "Codex desktop app managed runtime smoke (Windows)": "windows-skills-desktop-b",
             "Install Codex for integration (Windows)": "windows-codex-e2e",
@@ -812,59 +813,32 @@ echo 'ok'
         self.assertIn("--upgrade-codex-app", mac_script)
         self.assertIn("Codex desktop app install/update smoke passed", mac_script)
 
-        network = blocks["Codex desktop app network install smoke (Windows)"]
-        self.assertIn("codex_app_smoke_as_standard_user.ps1", network)
-        self.assertIn("-NetworkInstall", network)
-        network_smoke = (ROOT / "scripts" / "ci" / "codex_app_network_install_smoke.ps1").read_text(encoding="utf-8")
-        self.assertIn("codex_app_smoke_process.ps1", network_smoke)
-        self.assertIn("Invoke-SmokeProcess", network_smoke)
-        self.assertIn("proxyEnabled = $false", network_smoke)
-        self.assertNotIn("& $Helper", network_smoke)
+        desktop_build = blocks["Codex desktop app Windows build and policy regressions"]
+        for selector in ("CurrentWindowsTokenElevationQuery", "PreflightCodexWindowsAppElevation", "RootUpgradeCodexApp|WindowsManagedApp"):
+            self.assertIn(selector, desktop_build)
+        self.assertIn("codex_app_smoke_process_test.ps1", desktop_build)
 
+        network = blocks["Codex desktop app network install smoke (Windows)"]
         managed = blocks["Codex desktop app managed runtime smoke (Windows)"]
-        self.assertIn("^Test(RootUpgradeCodexApp|WindowsManagedApp)", managed)
-        self.assertIn("codex_app_smoke_as_standard_user.ps1", managed)
-        self.assertIn("-ManagedInstall", managed)
+        for block, mode in ((network, "store"), (managed, "managed")):
+            self.assertIn("!cancelled()", block)
+            self.assertIn("steps.windows_desktop_build.outcome == 'success'", block)
+            self.assertIn("-TokenProbe", block)
+            self.assertIn("-Mode " + mode, block)
+            self.assertNotIn("continue-on-error", block)
+        self.assertNotIn("steps.windows_desktop_managed.outcome", network)
+        self.assertNotIn("steps.windows_desktop_store.outcome", managed)
+
+        network_smoke = (ROOT / "scripts" / "ci" / "codex_app_network_install_smoke.ps1").read_text(encoding="utf-8")
+        self.assertIn("proxyEnabled = $false", network_smoke)
         managed_smoke = (ROOT / "scripts" / "ci" / "codex_app_managed_install_smoke.ps1").read_text(encoding="utf-8")
         self.assertIn("--upgrade-codex-app", managed_smoke)
-        self.assertIn("codex_app_smoke_process.ps1", managed_smoke)
-        self.assertIn("Invoke-SmokeProcess", managed_smoke)
-        self.assertNotIn("& $Helper", managed_smoke)
-        standard_user_smoke = (ROOT / "scripts" / "ci" / "codex_app_smoke_as_standard_user.ps1").read_text(encoding="utf-8")
-        self.assertIn("CxpLimitedTokenProcess", standard_user_smoke)
-        self.assertIn("GetTokenInformation", standard_user_smoke)
-        self.assertIn("TokenLinkedToken = 19", standard_user_smoke)
-        self.assertIn("TokenAssignPrimary = 0x0001", standard_user_smoke)
-        self.assertIn("CreateRestrictedToken", standard_user_smoke)
-        self.assertNotIn("LuaToken", standard_user_smoke)
-        self.assertIn("CreateRestrictedToken(currentToken, DisableMaxPrivilege, 1, ref disabledSid", standard_user_smoke)
-        self.assertIn("SetMediumIntegrity", standard_user_smoke)
-        self.assertIn("TokenElevation = 20", standard_user_smoke)
-        self.assertIn("CreateProcessAsUserW", standard_user_smoke)
-        self.assertNotIn("CreateProcessWithTokenW", standard_user_smoke)
-        self.assertIn("selected token's session (Win32 error ", standard_user_smoke)
-        self.assertIn("IsInRole($administratorsSID)", standard_user_smoke)
-        self.assertIn("FileSystemAccessRule", standard_user_smoke)
-        self.assertIn("$directorySecurity.AddAccessRule($userAccess)", standard_user_smoke)
-        self.assertIn("RunnerTemp = $smokeRoot", standard_user_smoke)
-        self.assertIn("function Copy-SmokeExecutable", standard_user_smoke)
-        self.assertIn("FileSystemRights]::ReadAndExecute", standard_user_smoke)
-        self.assertIn("Copy-SmokeExecutable -Source $helperPath -Destination $childHelperPath -User $identity.User", standard_user_smoke)
-        self.assertIn("Helper = $childHelperPath", standard_user_smoke)
-        self.assertIn("Copy-SmokeExecutable -Source ([IO.Path]::GetFullPath($RecordingProxy)) -Destination $childRecordingProxyPath", standard_user_smoke)
-        self.assertIn("Copy-SmokeExecutable -Source ([IO.Path]::GetFullPath($FakeChatGPT)) -Destination $childFakeChatGPTPath", standard_user_smoke)
-        self.assertIn("RecordingProxy = $childRecordingProxyPath", standard_user_smoke)
-        self.assertIn("FakeChatGPT = $childFakeChatGPTPath", standard_user_smoke)
-        self.assertIn('-Helper `"$childHelperPath`" -Child -SettingsPath', standard_user_smoke)
-        self.assertIn("codex_app_managed_install_smoke.ps1", standard_user_smoke)
-        smoke_process = (ROOT / "scripts" / "ci" / "codex_app_smoke_process.ps1").read_text(encoding="utf-8")
-        self.assertIn('failed to start process $($startInfo.FileName):', smoke_process)
-        self.assertIn("RedirectStandardInput = $true", smoke_process)
-        self.assertIn("RedirectStandardOutput = $true", smoke_process)
-        self.assertIn("RedirectStandardError = $true", smoke_process)
-        self.assertLess(smoke_process.index("RedirectStandardOutput = $true"), smoke_process.index("StandardOutputEncoding ="))
-        self.assertLess(smoke_process.index("RedirectStandardError = $true"), smoke_process.index("StandardErrorEncoding ="))
-        self.assertIn("ArgumentList.Add", smoke_process)
+
+        diagnostics = blocks["Upload Windows desktop smoke diagnostics"]
+        self.assertIn("!cancelled()", diagnostics)
+        self.assertIn("actions/upload-artifact@", diagnostics)
+        self.assertIn("*.log", diagnostics)
+        self.assertIn("*.out", diagnostics)
 
     def test_release_install_smoke_checks_root_desktop_update_help(self):
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")
