@@ -722,6 +722,7 @@ echo 'ok'
             "Codex desktop app Windows build and policy regressions": "windows-skills-desktop-b",
             "Codex desktop app network install smoke (Windows)": "windows-skills-desktop-b",
             "Codex desktop app managed runtime smoke (Windows)": "windows-skills-desktop-b",
+            "Codex desktop signed AppX provisioning and launch smoke (Windows)": "windows-skills-desktop-b",
             "Install Codex for integration (Windows)": "windows-codex-e2e",
             "Teams app-server probe (Windows)": "windows-codex-e2e",
             "Codex upgrade integration (system npm, Windows)": "windows-codex-e2e",
@@ -820,7 +821,8 @@ echo 'ok'
 
         network = blocks["Codex desktop app network install smoke (Windows)"]
         managed = blocks["Codex desktop app managed runtime smoke (Windows)"]
-        for block, mode in ((network, "store"), (managed, "managed")):
+        signed_appx = blocks["Codex desktop signed AppX provisioning and launch smoke (Windows)"]
+        for block, mode in ((network, "store"), (managed, "managed"), (signed_appx, "appx")):
             self.assertIn("!cancelled()", block)
             self.assertIn("steps.windows_desktop_build.outcome == 'success'", block)
             self.assertIn("-TokenProbe", block)
@@ -828,6 +830,8 @@ echo 'ok'
             self.assertNotIn("continue-on-error", block)
         self.assertNotIn("steps.windows_desktop_managed.outcome", network)
         self.assertNotIn("steps.windows_desktop_store.outcome", managed)
+        self.assertNotIn("steps.windows_desktop_store.outcome", signed_appx)
+        self.assertNotIn("steps.windows_desktop_managed.outcome", signed_appx)
 
         network_smoke = (ROOT / "scripts" / "ci" / "codex_app_network_install_smoke.ps1").read_text(encoding="utf-8")
         self.assertIn("proxyEnabled = $false", network_smoke)

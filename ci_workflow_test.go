@@ -70,6 +70,9 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 	)
 	requireStepNotContains(t, managedDesktop, "continue-on-error", "steps.windows_desktop_store")
 	requireStepNotContains(t, windowsDesktop, "continue-on-error", "steps.windows_desktop_managed")
+	signedDesktop := workflowStepBlock(t, targetedJob, "Codex desktop signed AppX provisioning and launch smoke (Windows)")
+	requireStepContains(t, signedDesktop, "!cancelled()", "steps.windows_desktop_build.outcome == 'success'", "-Mode appx", "-TokenProbe")
+	requireStepNotContains(t, signedDesktop, "continue-on-error", "steps.windows_desktop_store", "steps.windows_desktop_managed")
 	desktopBuild := workflowStepBlock(t, targetedJob, "Codex desktop app Windows build and policy regressions")
 	requireStepContains(t, desktopBuild, "CurrentWindowsTokenElevationQuery", "RootUpgradeCodexApp|WindowsManagedApp", "codex_app_smoke_process_test.ps1")
 	for _, name := range []string{

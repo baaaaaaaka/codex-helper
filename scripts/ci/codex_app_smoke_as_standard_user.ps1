@@ -4,7 +4,7 @@ param(
   [Parameter(Mandatory = $true)]
   [string]$TokenProbe,
   [Parameter(Mandatory = $true)]
-  [ValidateSet("managed", "store")]
+  [ValidateSet("managed", "store", "appx")]
   [string]$Mode,
   [string]$RecordingProxy = "",
   [string]$FakeChatGPT = "",
@@ -63,11 +63,23 @@ if ($SettingsPath) {
         & (Join-Path $PSScriptRoot "codex_app_managed_install_smoke.ps1") -Helper $Helper -RecordingProxy ([string]$settings.RecordingProxy) -FakeChatGPT ([string]$settings.FakeChatGPT)
       }
       "store" {
+        $windowsPowerShell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+        $register = '$ErrorActionPreference = "Stop"; Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe'
+        Write-Host "Preparing the current CI account's App Installer registration using the documented Microsoft command"
+        Invoke-SmokeProcess -FilePath $windowsPowerShell -Arguments @("-NoProfile", "-NonInteractive", "-Command", $register) -OutputPath (Join-Path $env:RUNNER_TEMP "app-installer-registration.out") | Write-Host
         if (!(Get-Command winget.exe -ErrorAction SilentlyContinue)) {
-          throw "Store smoke capability unavailable: App Installer is not registered for this standard account; the managed smoke does not require it"
+          throw "Store smoke capability unavailable after documented App Installer registration; managed and signed-AppX smokes do not require winget"
         }
         $env:CXP_WINDOWS_APP_BACKEND = "legacy"
         & (Join-Path $PSScriptRoot "codex_app_network_install_smoke.ps1") -Helper $Helper
+      }
+      "appx" {
+        $family = [string]$settings.PackageFamilyName
+        if ($family -notmatch '^OpenAI\.Codex_[a-z0-9]+$') { throw "unexpected fixture package family: $family" }
+        $register = '$ErrorActionPreference = "Stop"; Add-AppxPackage -RegisterByFamilyName -MainPackage ' + "'$family'"
+        Invoke-SmokeProcess -FilePath (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") -Arguments @("-NoProfile", "-NonInteractive", "-Command", $register) -OutputPath (Join-Path $env:RUNNER_TEMP "appx-registration.out") | Write-Host
+        $env:CXP_WINDOWS_APP_BACKEND = "legacy"
+        & (Join-Path $PSScriptRoot "codex_app_network_install_smoke.ps1") -Helper $Helper -RegisteredPackage
       }
       default { throw "unsupported smoke mode: $Mode" }
     }
@@ -102,6 +114,22 @@ $stderr = Join-Path $smokeRoot "stderr.log"
 
 try {
   New-Item -ItemType Directory -Path $smokeRoot | Out-Null
+  $packageFamily = ""
+  if ($Mode -eq "appx") {
+    try {
+      $env:CXP_TEST_WINDOWS_TOKEN_EXPECTATION = "elevated"
+      $probeOutput = Invoke-SmokeProcess -FilePath $TokenProbe -Arguments @("-test.run", "^TestCurrentWindowsTokenElevationQuery$", "-test.v") -OutputPath (Join-Path $smokeRoot "fixture-token-probe.out")
+      Write-Host $probeOutput
+      if (!$probeOutput.Contains("actual Windows TokenElevation=true")) { throw "the fixture-preparation token probe did not execute its elevated-token assertion" }
+    } finally { Remove-Item Env:CXP_TEST_WINDOWS_TOKEN_EXPECTATION -ErrorAction SilentlyContinue }
+    $package = Join-Path $smokeRoot "ChatGPT-x64.msix"
+    Invoke-WebRequest -Uri "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-x64.msix" -OutFile $package
+    Write-Host "Official MSIX SHA256=$((Get-FileHash -LiteralPath $package -Algorithm SHA256).Hash)"
+    $packagePath = $package.Replace("'", "''")
+    $install = '$ErrorActionPreference = "Stop"; Add-AppxPackage -Path ' + "'$packagePath'" + '; $package = Get-AppxPackage -Name OpenAI.Codex; if ($null -eq $package) { throw "OpenAI.Codex was not installed" }; $package.PackageFamilyName'
+    Write-Host "Preparing the signed package and its LocalSystem service with the CI runner; CXP will launch only in the standard account"
+    $packageFamily = (Invoke-SmokeProcess -FilePath (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") -Arguments @("-NoProfile", "-NonInteractive", "-Command", $install) -OutputPath (Join-Path $smokeRoot "signed-package-install.out")).Trim()
+  }
   $password = ConvertTo-SecureString ([guid]::NewGuid().ToString("N") + "Aa1!") -AsPlainText -Force
   $account = New-LocalUser -Name $accountName -Password $password -PasswordNeverExpires -Description "Ephemeral CXP desktop smoke user"
   $acl = Get-Acl -LiteralPath $smokeRoot
@@ -126,7 +154,7 @@ try {
     Copy-Item -LiteralPath $FakeChatGPT -Destination $childApp
   }
   $settings = Join-Path $smokeRoot "settings.json"
-  @{ AccountSid = $account.SID.Value; WorkingDirectory = $work; RecordingProxy = $childProxy; FakeChatGPT = $childApp } | ConvertTo-Json | Set-Content -LiteralPath $settings -Encoding UTF8
+  @{ AccountSid = $account.SID.Value; WorkingDirectory = $work; RecordingProxy = $childProxy; FakeChatGPT = $childApp; PackageFamilyName = $packageFamily } | ConvertTo-Json | Set-Content -LiteralPath $settings -Encoding UTF8
   $credential = [PSCredential]::new("$env:COMPUTERNAME\$accountName", $password)
   $childScript = Join-Path $smokeRoot "codex_app_smoke_as_standard_user.ps1"
   $arguments = "-NoLogo -NoProfile -NonInteractive -File `"$childScript`" -Helper `"$childHelper`" -TokenProbe `"$childProbe`" -Mode $Mode -SettingsPath `"$settings`""
