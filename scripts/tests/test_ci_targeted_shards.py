@@ -816,9 +816,10 @@ echo 'ok'
         self.assertIn("codex_app_smoke_as_standard_user.ps1", network)
         self.assertIn("-NetworkInstall", network)
         network_smoke = (ROOT / "scripts" / "ci" / "codex_app_network_install_smoke.ps1").read_text(encoding="utf-8")
-        self.assertIn("& $Helper --config $config app --cwd $work *> $out", network_smoke)
+        self.assertIn("codex_app_smoke_process.ps1", network_smoke)
+        self.assertIn("Invoke-SmokeProcess", network_smoke)
         self.assertIn("proxyEnabled = $false", network_smoke)
-        self.assertNotIn('"n" | & $Helper', network_smoke)
+        self.assertNotIn("& $Helper", network_smoke)
 
         managed = blocks["Codex desktop app managed runtime smoke (Windows)"]
         self.assertIn("^Test(RootUpgradeCodexApp|WindowsManagedApp)", managed)
@@ -826,6 +827,9 @@ echo 'ok'
         self.assertIn("-ManagedInstall", managed)
         managed_smoke = (ROOT / "scripts" / "ci" / "codex_app_managed_install_smoke.ps1").read_text(encoding="utf-8")
         self.assertIn("--upgrade-codex-app", managed_smoke)
+        self.assertIn("codex_app_smoke_process.ps1", managed_smoke)
+        self.assertIn("Invoke-SmokeProcess", managed_smoke)
+        self.assertNotIn("& $Helper", managed_smoke)
         standard_user_smoke = (ROOT / "scripts" / "ci" / "codex_app_smoke_as_standard_user.ps1").read_text(encoding="utf-8")
         self.assertIn("CxpLimitedTokenProcess", standard_user_smoke)
         self.assertIn("GetTokenInformation", standard_user_smoke)
@@ -844,6 +848,13 @@ echo 'ok'
         self.assertIn("RunnerTemp = $smokeRoot", standard_user_smoke)
         self.assertIn('-Helper `"$helperPath`" -Child -SettingsPath', standard_user_smoke)
         self.assertIn("codex_app_managed_install_smoke.ps1", standard_user_smoke)
+        smoke_process = (ROOT / "scripts" / "ci" / "codex_app_smoke_process.ps1").read_text(encoding="utf-8")
+        self.assertIn("RedirectStandardInput = $true", smoke_process)
+        self.assertIn("RedirectStandardOutput = $true", smoke_process)
+        self.assertIn("RedirectStandardError = $true", smoke_process)
+        self.assertLess(smoke_process.index("RedirectStandardOutput = $true"), smoke_process.index("StandardOutputEncoding ="))
+        self.assertLess(smoke_process.index("RedirectStandardError = $true"), smoke_process.index("StandardErrorEncoding ="))
+        self.assertIn("ArgumentList.Add", smoke_process)
 
     def test_release_install_smoke_checks_root_desktop_update_help(self):
         workflow = RELEASE_WORKFLOW.read_text(encoding="utf-8")

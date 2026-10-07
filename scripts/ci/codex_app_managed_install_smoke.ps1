@@ -7,6 +7,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $PSNativeCommandUseErrorActionPreference = $true
+. (Join-Path $PSScriptRoot "codex_app_smoke_process.ps1")
 
 if (!(Test-Path -LiteralPath $Helper -PathType Leaf)) {
   throw "helper does not exist: $Helper"
@@ -14,8 +15,13 @@ if (!(Test-Path -LiteralPath $Helper -PathType Leaf)) {
 
 function Get-ProxySnapshot {
   $internetSettings = Get-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" -ErrorAction SilentlyContinue
+  $winHTTPOutputPath = Join-Path $root "winhttp-proxy.out"
+  $winHTTPOutput = Invoke-SmokeProcess `
+    -FilePath (Join-Path $env:SystemRoot "System32\netsh.exe") `
+    -Arguments @("winhttp", "show", "proxy") `
+    -OutputPath $winHTTPOutputPath
   [ordered]@{
-    WinHTTP = (netsh winhttp show proxy | Out-String)
+    WinHTTP = $winHTTPOutput
     ProxyEnable = if ($null -ne $internetSettings) { [string]$internetSettings.ProxyEnable } else { "<missing>" }
     ProxyServer = if ($null -ne $internetSettings) { [string]$internetSettings.ProxyServer } else { "<missing>" }
     AutoConfigURL = if ($null -ne $internetSettings) { [string]$internetSettings.AutoConfigURL } else { "<missing>" }
@@ -117,7 +123,8 @@ try {
   $env:CXP_TEST_NONCE = $nonce
 
   try {
-    & $Helper --config $config app --cwd $work --codex-dir $codexHome *> $out
+    $appArguments = @("--config", $config, "app", "--cwd", $work, "--codex-dir", $codexHome)
+    $null = Invoke-SmokeProcess -FilePath $Helper -Arguments $appArguments -OutputPath $out
   } catch {
     $appOut = if (Test-Path -LiteralPath $out) { Get-Content -Raw -LiteralPath $out } else { "" }
     throw "managed install/launch failed`napp output:`n$appOut`nerror:`n$($_.Exception.Message)"
@@ -142,7 +149,8 @@ try {
   if (!(Test-Path -LiteralPath $managedExe -PathType Leaf)) { throw "managed runtime has no ChatGPT.exe: $managedExe" }
   if ($managedExe -like "*\WindowsApps\*") { throw "managed ChatGPT executable unexpectedly resides below WindowsApps: $managedExe" }
 
-  $rootHelp = (& $Helper --help | Out-String)
+  $rootHelpPath = Join-Path $base "root-help.out"
+  $rootHelp = Invoke-SmokeProcess -FilePath $Helper -Arguments @("--help") -OutputPath $rootHelpPath
   if ($rootHelp -notmatch "--upgrade-codex-app") { throw "built helper root help does not expose --upgrade-codex-app" }
   $stateBeforeUpgrade = Get-Content -Raw -LiteralPath $statePath
   $oldRuntime = $runtime
@@ -150,7 +158,8 @@ try {
   $proxyLogBeforeUpgrade = if (Test-Path -LiteralPath $proxyLog -PathType Leaf) { Get-Content -Raw -LiteralPath $proxyLog } else { "" }
   $upgradeOut = Join-Path $base "app-upgrade.out"
   try {
-    & $Helper --config $config --upgrade-codex-app "CI recording proxy" *> $upgradeOut
+    $upgradeArguments = @("--config", $config, "--upgrade-codex-app", "CI recording proxy")
+    $null = Invoke-SmokeProcess -FilePath $Helper -Arguments $upgradeArguments -OutputPath $upgradeOut
   } catch {
     $upgradeText = if (Test-Path -LiteralPath $upgradeOut) { Get-Content -Raw -LiteralPath $upgradeOut } else { "" }
     throw "managed app update command failed`nupdate output:`n$upgradeText`nerror:`n$($_.Exception.Message)"
@@ -197,7 +206,8 @@ try {
   Get-Process -Name $desktopProcessNames -ErrorAction SilentlyContinue | ForEach-Object { $existingProcessIds[$_.Id] = $true }
   Remove-Item -Force -LiteralPath $out -ErrorAction SilentlyContinue
   try {
-    & $Helper --config $config app --cwd $work --codex-dir $codexHome *> $out
+    $appArguments = @("--config", $config, "app", "--cwd", $work, "--codex-dir", $codexHome)
+    $null = Invoke-SmokeProcess -FilePath $Helper -Arguments $appArguments -OutputPath $out
   } catch {
     $appOut = if (Test-Path -LiteralPath $out) { Get-Content -Raw -LiteralPath $out } else { "" }
     throw "managed cached launch failed`napp output:`n$appOut`nerror:`n$($_.Exception.Message)"

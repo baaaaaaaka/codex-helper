@@ -5,6 +5,7 @@ param(
 
 $ErrorActionPreference = "Stop"
 $PSNativeCommandUseErrorActionPreference = $true
+. (Join-Path $PSScriptRoot "codex_app_smoke_process.ps1")
 
 if (!(Test-Path -LiteralPath $Helper)) {
   throw "helper does not exist: $Helper"
@@ -28,7 +29,8 @@ $launchedProcesses = @()
 
 try {
   try {
-    & $Helper --config $config app --cwd $work *> $out
+    $appArguments = @("--config", $config, "app", "--cwd", $work)
+    $null = Invoke-SmokeProcess -FilePath $Helper -Arguments $appArguments -OutputPath $out
   } catch {
     $appOut = if (Test-Path -LiteralPath $out) { Get-Content -Raw -LiteralPath $out } else { "" }
     throw "cxp app failed during Codex desktop app network install smoke`napp output:`n$appOut`nerror:`n$($_.Exception.Message)"
