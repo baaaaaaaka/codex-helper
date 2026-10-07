@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 root="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/codex-helper-teams-supervisor-smoke-$$"
 mkdir -p "$root"
@@ -7,6 +7,8 @@ mkdir -p "$root"
 log() {
   printf '[teams-supervisor-smoke] %s\n' "$*"
 }
+
+trap 'log "failed at line $LINENO (exit $?)"' ERR
 
 cleanup_pids=()
 cleanup_launchd_label=""
