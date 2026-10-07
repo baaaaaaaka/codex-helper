@@ -25,7 +25,12 @@ function Invoke-SmokeProcess {
   $process = [System.Diagnostics.Process]::new()
   try {
     $process.StartInfo = $startInfo
-    if (-not $process.Start()) {
+    try {
+      $started = $process.Start()
+    } catch {
+      throw "failed to start process $($startInfo.FileName): $($_.Exception.Message)"
+    }
+    if (-not $started) {
       throw "failed to start process: $FilePath"
     }
     $stdoutTask = $process.StandardOutput.ReadToEndAsync()

@@ -366,6 +366,29 @@ if (-not ("CxpLimitedTokenProcess" -as [type])) {
   Add-Type -TypeDefinition $nativeSource
 }
 
+function Copy-SmokeExecutable {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Source,
+    [Parameter(Mandatory = $true)]
+    [string]$Destination,
+    [Parameter(Mandatory = $true)]
+    [System.Security.Principal.SecurityIdentifier]$User
+  )
+
+  Copy-Item -LiteralPath $Source -Destination $Destination -Force
+  $fileSecurity = Get-Acl -LiteralPath $Destination
+  $fileAccess = [System.Security.AccessControl.FileSystemAccessRule]::new(
+    $User,
+    [System.Security.AccessControl.FileSystemRights]::ReadAndExecute,
+    [System.Security.AccessControl.InheritanceFlags]::None,
+    [System.Security.AccessControl.PropagationFlags]::None,
+    [System.Security.AccessControl.AccessControlType]::Allow
+  )
+  [void]$fileSecurity.AddAccessRule($fileAccess)
+  Set-Acl -LiteralPath $Destination -AclObject $fileSecurity
+}
+
 try {
   New-Item -ItemType Directory -Force -Path $smokeRoot | Out-Null
   $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
@@ -384,14 +407,14 @@ try {
   $resultPath = Join-Path $smokeRoot "smoke.result.json"
   $helperPath = [IO.Path]::GetFullPath($Helper)
   $childHelperPath = Join-Path $smokeRoot "cxp-smoke.exe"
-  Copy-Item -LiteralPath $helperPath -Destination $childHelperPath -Force
+  Copy-SmokeExecutable -Source $helperPath -Destination $childHelperPath -User $identity.User
   $childRecordingProxyPath = ""
   $childFakeChatGPTPath = ""
   if ($ManagedInstall) {
     $childRecordingProxyPath = Join-Path $smokeRoot "recording-proxy.exe"
     $childFakeChatGPTPath = Join-Path $smokeRoot "fake-chatgpt.exe"
-    Copy-Item -LiteralPath ([IO.Path]::GetFullPath($RecordingProxy)) -Destination $childRecordingProxyPath -Force
-    Copy-Item -LiteralPath ([IO.Path]::GetFullPath($FakeChatGPT)) -Destination $childFakeChatGPTPath -Force
+    Copy-SmokeExecutable -Source ([IO.Path]::GetFullPath($RecordingProxy)) -Destination $childRecordingProxyPath -User $identity.User
+    Copy-SmokeExecutable -Source ([IO.Path]::GetFullPath($FakeChatGPT)) -Destination $childFakeChatGPTPath -User $identity.User
   }
   $scriptPath = [IO.Path]::GetFullPath($PSCommandPath)
   $workingDirectory = [IO.Path]::GetFullPath((Get-Location).Path)
