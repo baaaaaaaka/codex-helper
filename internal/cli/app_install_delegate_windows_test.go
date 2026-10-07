@@ -97,9 +97,37 @@ func TestWindowsInstallNativeUACProcessCreation(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
-	for index, operation := range []struct{ refresh, changed bool }{{false, true}, {true, false}, {true, true}} {
+	for index, operation := range []struct{ refresh, changed bool }{{false, true}, {true, false}, {true, true}, {true, true}} {
 		if index == 2 {
 			writeTestCodexWindowsManagedMSIX(t, fixture, "CN=TestPublisher", "app/ChatGPT.exe", []byte("inert updated fixture"))
+		}
+		if index == 3 {
+			legacyState, valid, err := readValidCodexWindowsManagedState(root)
+			if err != nil || !valid {
+				t.Fatalf("missing source state for admin-created cache: %v", err)
+			}
+			root = filepath.Join(t.TempDir(), "admin-created-managed")
+			t.Setenv("CXP_WINDOWS_MANAGED_ROOT", root)
+			executablePath := filepath.Join(root, "versions", "legacy", "app", codexDesktopWindowsCurrentExecutable)
+			if err := os.MkdirAll(filepath.Dir(executablePath), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(executablePath, []byte("inert admin-created fixture"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			executableHash, err := sha256File(executablePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			legacyState.RuntimeRelative = "versions/legacy"
+			legacyState.ExecutableSHA256 = executableHash
+			if err := writeCodexWindowsManagedState(root, legacyState); err != nil {
+				t.Fatal(err)
+			}
+			if _, valid, err := readValidCodexWindowsManagedState(root); err != nil || !valid {
+				t.Fatalf("admin-created cache was not valid before normal-worker update: %v", err)
+			}
+			writeTestCodexWindowsManagedMSIX(t, fixture, "CN=TestPublisher", "app/ChatGPT.exe", []byte("inert update over admin-created cache"))
 		}
 		request, err := json.Marshal(windowsInstallRequest{Identity: expected, Root: root, ProxyURL: "http://127.0.0.1:8608", Refresh: operation.refresh})
 		if err != nil {
@@ -180,7 +208,7 @@ func TestWindowsInstallNativeUACProcessCreation(t *testing.T) {
 	if err != nil || !valid || before != after {
 		t.Fatalf("interrupted worker damaged the existing valid installation: %v", err)
 	}
-	t.Log("real elevated parent delegates inert install/update to the same normal identity; cancellation preserves the existing installation")
+	t.Log("real elevated parent delegates inert install/update, including an admin-created cache, to the same normal identity; cancellation preserves the existing installation")
 }
 
 func TestWindowsInstallWorkerCommandPreservesEnvironmentAndToken(t *testing.T) {
