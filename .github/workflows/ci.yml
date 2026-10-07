@@ -1434,6 +1434,7 @@ jobs:
           $env:CODEX_HELPER_WINDOWS_TASK_REGISTER_TEST = "1"
           $env:CODEX_HELPER_USER_PATH_WINDOWS_LIVE = "1"
           go test ./internal/userpath -count=1 -run '^TestWindowsAccountDefaultLiveTokenEnvironment$' -v
+          go test ./internal/teams/store -count=1 -run '^Test(SQLiteOptionalSidecar|WindowsSQLiteOptionalSidecar)' -v
           go test ./internal/cli -count=1 -run 'Test(TeamsServiceWindowsTask(XML(RegistersWithTaskScheduler|WithPrincipalRegistersWithTaskScheduler)|StartIfStoppedUsesTaskScheduler)|TeamsUserPathExpectedSIDMatchesLiveScheduledTaskPrincipal)CI$' -v
 
       - name: Teams Graph 429 stress (Linux only)
