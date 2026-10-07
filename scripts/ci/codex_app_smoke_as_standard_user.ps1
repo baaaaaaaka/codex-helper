@@ -112,7 +112,6 @@ public static class CxpLimitedTokenProcess
     private const uint TokenDuplicate = 0x0002;
     private const uint TokenAdjustDefault = 0x0080;
     private const uint DisableMaxPrivilege = 0x0001;
-    private const uint LuaToken = 0x0004;
     private const int TokenLinkedToken = 19;
     private const int TokenElevation = 20;
     private const int TokenIntegrityLevel = 25;
@@ -290,10 +289,10 @@ public static class CxpLimitedTokenProcess
                 throw new Win32Exception(Marshal.GetLastWin32Error(), "create the Administrators SID");
             SidAndAttributes disabledSid = new SidAndAttributes();
             disabledSid.Sid = administratorsSid;
-            if (!CreateRestrictedToken(currentToken, DisableMaxPrivilege | LuaToken, 1, ref disabledSid, 0, IntPtr.Zero, 0, IntPtr.Zero, out limitedToken))
+            if (!CreateRestrictedToken(currentToken, DisableMaxPrivilege, 1, ref disabledSid, 0, IntPtr.Zero, 0, IntPtr.Zero, out limitedToken))
             {
                 int error = Marshal.GetLastWin32Error();
-                throw new Win32Exception(error, "create LUA token after " + linkedTokenStatus);
+                throw new Win32Exception(error, "create limited token after " + linkedTokenStatus);
             }
             if (limitedToken == IntPtr.Zero)
                 throw new InvalidOperationException("CreateRestrictedToken returned no token after " + linkedTokenStatus);
