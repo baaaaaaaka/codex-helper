@@ -720,7 +720,6 @@ echo 'ok'
             "Teams perf benchmark smoke": "state-perf",
             "Skills local git smoke (Windows)": "windows-skills-desktop",
             "Codex desktop app Windows build and policy regressions": "windows-skills-desktop-b",
-            "Codex desktop app network install smoke (Windows)": "windows-skills-desktop-b",
             "Codex desktop app managed runtime smoke (Windows)": "windows-skills-desktop-b",
             "Codex desktop signed AppX provisioning and launch smoke (Windows)": "windows-skills-desktop-b",
             "Install Codex for integration (Windows)": "windows-codex-e2e",
@@ -820,22 +819,25 @@ echo 'ok'
         self.assertIn("codex_app_smoke_process_test.ps1", desktop_build)
         self.assertIn("TestRunMainHandlesAppInstallWorkerBeforeRuntimeDispatch", desktop_build)
 
-        network = blocks["Codex desktop app network install smoke (Windows)"]
+        self.assertNotIn("Codex desktop app network install smoke (Windows)", blocks)
         managed = blocks["Codex desktop app managed runtime smoke (Windows)"]
         signed_appx = blocks["Codex desktop signed AppX provisioning and launch smoke (Windows)"]
-        for block, mode in ((network, "store"), (managed, "managed"), (signed_appx, "appx")):
+        for block, mode in ((managed, "managed"), (signed_appx, "appx")):
             self.assertIn("!cancelled()", block)
             self.assertIn("steps.windows_desktop_build.outcome == 'success'", block)
             self.assertIn("-TokenProbe", block)
             self.assertIn("-Mode " + mode, block)
             self.assertNotIn("continue-on-error", block)
-        self.assertNotIn("steps.windows_desktop_managed.outcome", network)
         self.assertNotIn("steps.windows_desktop_store.outcome", managed)
         self.assertNotIn("steps.windows_desktop_store.outcome", signed_appx)
         self.assertNotIn("steps.windows_desktop_managed.outcome", signed_appx)
 
         network_smoke = (ROOT / "scripts" / "ci" / "codex_app_network_install_smoke.ps1").read_text(encoding="utf-8")
         self.assertIn("proxyEnabled = $false", network_smoke)
+        self.assertIn("the Store installation smoke requires a fresh account", network_smoke)
+        self.assertIn("does not test Microsoft Store acquisition", network_smoke)
+        standard_user_smoke = (ROOT / "scripts" / "ci" / "codex_app_smoke_as_standard_user.ps1").read_text(encoding="utf-8")
+        self.assertIn('"store"', standard_user_smoke)
         managed_smoke = (ROOT / "scripts" / "ci" / "codex_app_managed_install_smoke.ps1").read_text(encoding="utf-8")
         self.assertIn("--upgrade-codex-app", managed_smoke)
 

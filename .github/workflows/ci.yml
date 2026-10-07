@@ -1979,12 +1979,6 @@ jobs:
           $fakeChatGPT = Join-Path $env:RUNNER_TEMP "codex-managed-fake-chatgpt.exe"
           .\scripts\ci\codex_app_smoke_as_standard_user.ps1 -Helper $helper -TokenProbe $tokenProbe -Mode managed -RecordingProxy $recordingProxy -FakeChatGPT $fakeChatGPT
 
-      - name: Codex desktop app network install smoke (Windows)
-        if: matrix.shard == 'windows-skills-desktop-b' && runner.os == 'Windows' && !cancelled() && steps.windows_desktop_build.outcome == 'success'
-        shell: pwsh
-        run: |
-          .\scripts\ci\codex_app_smoke_as_standard_user.ps1 -Helper (Join-Path $env:RUNNER_TEMP "codex-proxy-desktop-smoke.exe") -TokenProbe (Join-Path $env:RUNNER_TEMP "codex-desktop-token-probe.exe") -Mode store
-
       - name: Codex desktop signed AppX provisioning and launch smoke (Windows)
         if: matrix.shard == 'windows-skills-desktop-b' && runner.os == 'Windows' && !cancelled() && steps.windows_desktop_build.outcome == 'success'
         shell: pwsh

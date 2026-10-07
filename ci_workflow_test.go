@@ -56,12 +56,7 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 		`.\scripts\ci\skills_smoke.ps1`,
 		`.\scripts\ci\skills_migration_smoke.ps1`,
 	)
-	windowsDesktop := workflowStepBlock(t, targetedJob, "Codex desktop app network install smoke (Windows)")
-	requireStepContains(t, windowsDesktop,
-		"matrix.shard == 'windows-skills-desktop-b' && runner.os == 'Windows' && !cancelled()",
-		"steps.windows_desktop_build.outcome == 'success'",
-		"-Mode store",
-	)
+	requireStepNotContains(t, targetedJob, "- name: Codex desktop app network install smoke (Windows)")
 	managedDesktop := workflowStepBlock(t, targetedJob, "Codex desktop app managed runtime smoke (Windows)")
 	requireStepContains(t, managedDesktop,
 		"matrix.shard == 'windows-skills-desktop-b' && runner.os == 'Windows' && !cancelled()",
@@ -69,7 +64,6 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 		"-Mode managed",
 	)
 	requireStepNotContains(t, managedDesktop, "continue-on-error", "steps.windows_desktop_store")
-	requireStepNotContains(t, windowsDesktop, "continue-on-error", "steps.windows_desktop_managed")
 	signedDesktop := workflowStepBlock(t, targetedJob, "Codex desktop signed AppX provisioning and launch smoke (Windows)")
 	requireStepContains(t, signedDesktop, "!cancelled()", "steps.windows_desktop_build.outcome == 'success'", "-Mode appx", "-TokenProbe")
 	requireStepNotContains(t, signedDesktop, "continue-on-error", "steps.windows_desktop_store", "steps.windows_desktop_managed")
