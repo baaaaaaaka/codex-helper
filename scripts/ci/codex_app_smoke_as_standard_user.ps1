@@ -71,7 +71,12 @@ if ($SettingsPath) {
           throw "Store smoke capability unavailable after documented App Installer registration; managed and signed-AppX smokes do not require winget"
         }
         $env:CXP_WINDOWS_APP_BACKEND = "legacy"
-        & (Join-Path $PSScriptRoot "codex_app_network_install_smoke.ps1") -Helper $Helper
+        try {
+          & (Join-Path $PSScriptRoot "codex_app_network_install_smoke.ps1") -Helper $Helper
+        } finally {
+          $diagnostics = Join-Path $env:LOCALAPPDATA "Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\DiagOutputDir"
+          Save-SmokeWingetDiagnostics -SourceDirectory $diagnostics -OutputDirectory $env:RUNNER_TEMP
+        }
       }
       "appx" {
         $family = [string]$settings.PackageFamilyName
