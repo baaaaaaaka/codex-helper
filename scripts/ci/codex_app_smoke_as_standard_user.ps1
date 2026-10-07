@@ -76,6 +76,12 @@ if ($SettingsPath) {
         } finally {
           $diagnostics = Join-Path $env:LOCALAPPDATA "Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\DiagOutputDir"
           Save-SmokeWingetDiagnostics -SourceDirectory $diagnostics -OutputDirectory $env:RUNNER_TEMP
+          $storeProbe = '$ErrorActionPreference = "Stop"; foreach ($name in @("Microsoft.WindowsStore", "Microsoft.DesktopAppInstaller")) { $packages = @(Get-AppxPackage -Name $name); Write-Output ($name + " registered=" + ($packages.Count -gt 0)) }; Write-Output "AppInstallManager construction started"; $manager = [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager, Windows.ApplicationModel.Store.Preview.InstallControl, ContentType=WindowsRuntime]::new(); Write-Output "AppInstallManager construction succeeded"'
+          try {
+            Invoke-SmokeProcess -FilePath $windowsPowerShell -Arguments @("-NoProfile", "-NonInteractive", "-Command", $storeProbe) -OutputPath (Join-Path $env:RUNNER_TEMP "store-capability.out") | Write-Host
+          } catch {
+            Write-Warning "Read-only Store capability probe failed: $($_.Exception.Message)"
+          }
         }
       }
       "appx" {
