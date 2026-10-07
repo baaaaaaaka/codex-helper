@@ -1,3 +1,24 @@
+function Save-SmokeWingetDiagnostics {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$SourceDirectory,
+    [Parameter(Mandatory = $true)]
+    [string]$OutputDirectory
+  )
+
+  try {
+    if (!(Test-Path -LiteralPath $SourceDirectory -PathType Container)) { return }
+    $logs = @(Get-ChildItem -LiteralPath $SourceDirectory -Filter "*.log" -File |
+      Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 3)
+    foreach ($log in $logs) {
+      if ($log.Length -gt 4MB) { Write-Warning "Skipping oversized WinGet diagnostic: $($log.Name)"; continue }
+      Copy-Item -LiteralPath $log.FullName -Destination (Join-Path $OutputDirectory ("winget-" + $log.Name))
+    }
+  } catch {
+    Write-Warning "Could not retain WinGet diagnostics: $($_.Exception.Message)"
+  }
+}
+
 function Invoke-SmokeProcess {
   param(
     [Parameter(Mandatory = $true)]

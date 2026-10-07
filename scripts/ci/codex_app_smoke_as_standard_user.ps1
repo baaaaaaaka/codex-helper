@@ -1,448 +1,221 @@
 param(
   [Parameter(Mandatory = $true)]
   [string]$Helper,
-  [switch]$NetworkInstall,
-  [switch]$ManagedInstall,
+  [Parameter(Mandatory = $true)]
+  [string]$TokenProbe,
+  [Parameter(Mandatory = $true)]
+  [ValidateSet("managed", "store", "appx")]
+  [string]$Mode,
   [string]$RecordingProxy = "",
   [string]$FakeChatGPT = "",
-  [switch]$Child,
   [string]$SettingsPath = ""
 )
 
 $ErrorActionPreference = "Stop"
 $PSNativeCommandUseErrorActionPreference = $true
+if (!$IsWindows) { throw "the standard-user app smoke requires native Windows" }
+. (Join-Path $PSScriptRoot "codex_app_smoke_process.ps1")
 
-if ($Child) {
-  $settings = $null
-  $exitCode = 1
-  $errorMessage = ""
+if ($SettingsPath) {
   try {
     $settings = Get-Content -Raw -LiteralPath $SettingsPath | ConvertFrom-Json
-    $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-    if (![string]::Equals($identity.Name, [string]$settings.ExpectedIdentity, [StringComparison]::OrdinalIgnoreCase)) {
-      throw "desktop app smoke identity is $($identity.Name), expected $($settings.ExpectedIdentity)"
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    if ($identity.User.Value -ne $settings.AccountSid) {
+      throw "unexpected smoke identity: $($identity.User.Value), expected $($settings.AccountSid)"
     }
-    $principal = [System.Security.Principal.WindowsPrincipal]::new($identity)
-    $administratorsSID = [System.Security.Principal.SecurityIdentifier]::new(
-      [System.Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid,
-      $null
-    )
-    if ($principal.IsInRole($administratorsSID)) {
-      throw "desktop app smoke is still elevated: $($identity.Name)"
+    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+    if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+      throw "the test account has effective Administrator membership"
+    }
+    $profile = [Environment]::GetFolderPath([Environment+SpecialFolder]::UserProfile)
+    $profileKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$($identity.User.Value)"
+    $registeredProfile = [Environment]::ExpandEnvironmentVariables((Get-ItemPropertyValue -LiteralPath $profileKey -Name ProfileImagePath))
+    if (!$profile -or $profile -ine $registeredProfile -or !(Test-Path -LiteralPath "Registry::HKEY_USERS\$($identity.User.Value)")) {
+      throw "the test account's native profile and registry hive were not loaded correctly"
     }
     foreach ($name in @([Environment]::GetEnvironmentVariables().Keys)) {
-      if (
-        $name -match '^(GITHUB|ACTIONS)_' -or
-        $name -match '^CXP_(RUNTIME|WINDOWS|TEST)_' -or
-        $name -match '^CODEX_(RUNTIME|PROXY)_' -or
-        $name -match '^(CODEX_HOME|CODEX_DIR|GH_TOKEN|OPENAI_API_KEY|MIMO_API_KEY|ANTHROPIC_API_KEY|CODEX_LIVE_AUTH_JSON|CHATGPT_AUTH_TOKEN|CODEX_AUTH_TOKEN)$' -or
-        $name -match '^CODEX_HELPER_TEAMS_.*TOKEN_CACHE$'
-      ) {
+      if ($name -match '^(GITHUB|ACTIONS)_' -or $name -match '^CXP_(RUNTIME|WINDOWS|TEST)_' -or $name -match '^CODEX_(RUNTIME|PROXY)_' -or $name -match '^(CODEX_HOME|CODEX_DIR|GH_TOKEN|OPENAI_API_KEY|MIMO_API_KEY|ANTHROPIC_API_KEY|CODEX_LIVE_AUTH_JSON|CHATGPT_AUTH_TOKEN|CODEX_AUTH_TOKEN)$' -or $name -match '^CODEX_HELPER_TEAMS_.*TOKEN_CACHE$') {
         Remove-Item ("Env:" + $name) -ErrorAction SilentlyContinue
       }
     }
-    $env:RUNNER_TEMP = [string]$settings.RunnerTemp
+    $env:USERPROFILE = $profile
+    $env:USERNAME = [Environment]::UserName
+    $env:USERDOMAIN = [Environment]::UserDomainName
+    $env:HOME = $profile
+    $env:APPDATA = [Environment]::GetFolderPath([Environment+SpecialFolder]::ApplicationData)
+    $env:LOCALAPPDATA = [Environment]::GetFolderPath([Environment+SpecialFolder]::LocalApplicationData)
+    $env:RUNNER_TEMP = [string]$settings.WorkingDirectory
+    $env:TEMP = $env:RUNNER_TEMP
+    $env:TMP = $env:RUNNER_TEMP
+    $env:PATH = (Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps") + ";" + [Environment]::GetEnvironmentVariable("PATH", "Machine")
     $env:CXP_RUNTIME_DISABLE = "1"
-    $windowsApps = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps"
-    $machinePath = [Environment]::GetEnvironmentVariable("Path", "Machine")
-    $env:Path = "$windowsApps;$machinePath"
-    Set-Location -LiteralPath ([string]$settings.WorkingDirectory)
-
-    for ($attempt = 1; $attempt -le 2; $attempt++) {
-      try {
-        if ($settings.NetworkInstall) {
-          $env:CXP_WINDOWS_APP_BACKEND = "legacy"
-          & (Join-Path $PSScriptRoot "codex_app_network_install_smoke.ps1") -Helper ([string]$settings.Helper) *> ([string]$settings.OutputPath)
-        } else {
-          & (Join-Path $PSScriptRoot "codex_app_managed_install_smoke.ps1") `
-            -Helper ([string]$settings.Helper) `
-            -RecordingProxy ([string]$settings.RecordingProxy) `
-            -FakeChatGPT ([string]$settings.FakeChatGPT) *> ([string]$settings.OutputPath)
-        }
-        if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) {
-          throw "desktop app smoke command failed with exit code $LASTEXITCODE"
-        }
-        $exitCode = 0
-        break
-      } catch {
-        $errorMessage = $_.Exception.ToString()
-        Add-Content -LiteralPath ([string]$settings.OutputPath) -Value $errorMessage -Encoding UTF8
-        if ($attempt -eq 2) { break }
-        Add-Content -LiteralPath ([string]$settings.OutputPath) -Value "Desktop app smoke failed on attempt $attempt; retrying in 10 seconds." -Encoding UTF8
-        Start-Sleep -Seconds 10
+    Set-Location -LiteralPath $env:RUNNER_TEMP
+    Write-Host "Smoke identity=$($identity.Name); SID=$($identity.User.Value); profile=$profile; session=$([Diagnostics.Process]::GetCurrentProcess().SessionId); mode=$Mode"
+    $env:CXP_TEST_WINDOWS_TOKEN_EXPECTATION = "standard"
+    $probeOutput = Invoke-SmokeProcess -FilePath $TokenProbe -Arguments @("-test.run", "^TestCurrentWindowsTokenElevationQuery$", "-test.v") -OutputPath (Join-Path $env:RUNNER_TEMP "token-probe.out")
+    Write-Host $probeOutput
+    if (!$probeOutput.Contains("actual Windows TokenElevation=false")) { throw "the native token probe did not execute its standard-token assertion" }
+    Remove-Item Env:CXP_TEST_WINDOWS_TOKEN_EXPECTATION
+    Invoke-SmokeProcess -FilePath $Helper -Arguments @("--version") -OutputPath (Join-Path $env:RUNNER_TEMP "helper-version.out") | Write-Host
+    Write-Host "Standard-user environment probe passed"
+    switch ($Mode) {
+      "managed" {
+        & (Join-Path $PSScriptRoot "codex_app_managed_install_smoke.ps1") -Helper $Helper -RecordingProxy ([string]$settings.RecordingProxy) -FakeChatGPT ([string]$settings.FakeChatGPT)
       }
+      "store" {
+        $windowsPowerShell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
+        $register = '$ErrorActionPreference = "Stop"; Add-AppxPackage -RegisterByFamilyName -MainPackage Microsoft.DesktopAppInstaller_8wekyb3d8bbwe'
+        Write-Host "Preparing the current CI account's App Installer registration using the documented Microsoft command"
+        Invoke-SmokeProcess -FilePath $windowsPowerShell -Arguments @("-NoProfile", "-NonInteractive", "-Command", $register) -OutputPath (Join-Path $env:RUNNER_TEMP "app-installer-registration.out") | Write-Host
+        if (!(Get-Command winget.exe -ErrorAction SilentlyContinue)) {
+          throw "Store smoke capability unavailable after documented App Installer registration; managed and signed-AppX smokes do not require winget"
+        }
+        $env:CXP_WINDOWS_APP_BACKEND = "legacy"
+        try {
+          & (Join-Path $PSScriptRoot "codex_app_network_install_smoke.ps1") -Helper $Helper
+        } finally {
+          $diagnostics = Join-Path $env:LOCALAPPDATA "Packages\Microsoft.DesktopAppInstaller_8wekyb3d8bbwe\LocalState\DiagOutputDir"
+          Save-SmokeWingetDiagnostics -SourceDirectory $diagnostics -OutputDirectory $env:RUNNER_TEMP
+          $storeProbe = @'
+$ErrorActionPreference = "Stop"
+foreach ($name in @("Microsoft.WindowsStore", "Microsoft.DesktopAppInstaller")) {
+  $packages = @(Get-AppxPackage -Name $name)
+  Write-Output ($name + " registered=" + ($packages.Count -gt 0))
+}
+Write-Output "AppInstallManager construction started"
+$manager = [Windows.ApplicationModel.Store.Preview.InstallControl.AppInstallManager, Windows.ApplicationModel.Store.Preview.InstallControl, ContentType=WindowsRuntime]::new()
+Write-Output "AppInstallManager construction succeeded"
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+$asTask = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq "AsTask" -and $_.IsGenericMethod -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' } | Select-Object -First 1
+if ($null -eq $asTask) { throw "Windows Runtime async projection unavailable for the read-only policy probe" }
+foreach ($operation in @("IsStoreBlockedByPolicyAsync", "GetIsAppAllowedToInstallAsync")) {
+  try {
+    Write-Output "$operation started"
+    if ($operation -eq "IsStoreBlockedByPolicyAsync") {
+      $pending = $manager.IsStoreBlockedByPolicyAsync("Microsoft.WindowsStore", "CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US")
+    } else {
+      $pending = $manager.GetIsAppAllowedToInstallAsync("9PLM9XGG6VKS")
     }
+    $task = $asTask.MakeGenericMethod([bool]).Invoke($null, @($pending))
+    if (!$task.Wait(30000)) { throw "$operation exceeded its read-only 30-second diagnostic timeout" }
+    Write-Output "$operation succeeded result=$($task.Result)"
   } catch {
-    $errorMessage = $_.Exception.ToString()
-    if ($settings -and $settings.OutputPath) {
-      Add-Content -LiteralPath ([string]$settings.OutputPath) -Value $errorMessage -Encoding UTF8
-    }
-  } finally {
-    if ($settings -and $settings.ResultPath) {
-      [ordered]@{ ExitCode = $exitCode; Error = $errorMessage } |
-        ConvertTo-Json -Compress |
-        Set-Content -LiteralPath ([string]$settings.ResultPath) -Encoding UTF8
-    }
+    $failure = $_.Exception
+    while ($null -ne $failure.InnerException) { $failure = $failure.InnerException }
+    Write-Output ("$operation failed HRESULT=0x{0:X8}: {1}" -f $failure.HResult, $failure.Message)
   }
-  exit $exitCode
-}
-
-if ($NetworkInstall -eq $ManagedInstall) {
-  throw "select exactly one of -NetworkInstall or -ManagedInstall"
-}
-if (!(Test-Path -LiteralPath $Helper -PathType Leaf)) {
-  throw "helper does not exist: $Helper"
-}
-if ($ManagedInstall -and (!(Test-Path -LiteralPath $RecordingProxy -PathType Leaf) -or !(Test-Path -LiteralPath $FakeChatGPT -PathType Leaf))) {
-  throw "managed install smoke requires existing recording proxy and fake ChatGPT fixtures"
-}
-
-$runnerTemp = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [IO.Path]::GetTempPath() }
-$smokeRoot = Join-Path $runnerTemp ("cxp-desktop-limited-token-smoke-" + [guid]::NewGuid().ToString("N"))
-$nativeSource = @'
-using System;
-using System.ComponentModel;
-using System.Runtime.InteropServices;
-using System.Text;
-
-public static class CxpLimitedTokenProcess
-{
-    private const uint TokenQuery = 0x0008;
-    private const uint TokenAssignPrimary = 0x0001;
-    private const uint TokenDuplicate = 0x0002;
-    private const uint TokenAdjustDefault = 0x0080;
-    private const uint DisableMaxPrivilege = 0x0001;
-    private const int TokenLinkedToken = 19;
-    private const int TokenElevation = 20;
-    private const int TokenIntegrityLevel = 25;
-    private const uint CreateUnicodeEnvironment = 0x00000400;
-    private const uint WaitObject0 = 0x00000000;
-    private const uint WaitTimeout = 0x00000102;
-    private const uint Infinite = 0xFFFFFFFF;
-    private const uint SeGroupIntegrity = 0x00000020;
-    private const int MediumIntegrityRid = 8192;
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct SidAndAttributes
-    {
-        public IntPtr Sid;
-        public uint Attributes;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct TokenMandatoryLabel
-    {
-        public SidAndAttributes Label;
-    }
-
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    private struct StartupInfo
-    {
-        public int cb;
-        public string lpReserved;
-        public string lpDesktop;
-        public string lpTitle;
-        public int dwX;
-        public int dwY;
-        public int dwXSize;
-        public int dwYSize;
-        public int dwXCountChars;
-        public int dwYCountChars;
-        public int dwFillAttribute;
-        public int dwFlags;
-        public short wShowWindow;
-        public short cbReserved2;
-        public IntPtr lpReserved2;
-        public IntPtr hStdInput;
-        public IntPtr hStdOutput;
-        public IntPtr hStdError;
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct ProcessInformation
-    {
-        public IntPtr hProcess;
-        public IntPtr hThread;
-        public uint dwProcessId;
-        public uint dwThreadId;
-    }
-
-    [DllImport("kernel32.dll")]
-    private static extern IntPtr GetCurrentProcess();
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool CloseHandle(IntPtr handle);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
-
-    [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern bool TerminateProcess(IntPtr process, uint exitCode);
-
-    [DllImport("advapi32.dll", SetLastError = true)]
-    private static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
-
-    [DllImport("advapi32.dll", SetLastError = true)]
-    private static extern bool CreateRestrictedToken(IntPtr existingToken, uint flags, uint disableSidCount, ref SidAndAttributes sidsToDisable, uint deletePrivilegeCount, IntPtr privilegesToDelete, uint restrictedSidCount, IntPtr sidsToRestrict, out IntPtr newToken);
-
-    [DllImport("advapi32.dll", SetLastError = true)]
-    private static extern bool GetTokenInformation(IntPtr token, int informationClass, out IntPtr information, uint informationLength, out uint returnedLength);
-
-    [DllImport("advapi32.dll", SetLastError = true)]
-    private static extern bool GetTokenInformation(IntPtr token, int informationClass, IntPtr information, uint informationLength, out uint returnedLength);
-
-    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern bool ConvertStringSidToSidW(string stringSid, out IntPtr sid);
-
-    [DllImport("advapi32.dll", SetLastError = true)]
-    private static extern uint GetLengthSid(IntPtr sid);
-
-    [DllImport("advapi32.dll", SetLastError = true)]
-    private static extern bool SetTokenInformation(IntPtr token, int informationClass, IntPtr information, uint informationLength);
-
-    [DllImport("kernel32.dll")]
-    private static extern IntPtr LocalFree(IntPtr memory);
-
-    [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern bool CreateProcessAsUserW(IntPtr token, string applicationName, StringBuilder commandLine, IntPtr processAttributes, IntPtr threadAttributes, bool inheritHandles, uint creationFlags, IntPtr environment, string currentDirectory, ref StartupInfo startupInfo, out ProcessInformation processInformation);
-
-    private static void SetMediumIntegrity(IntPtr token)
-    {
-        IntPtr mediumSid = IntPtr.Zero;
-        IntPtr labelBuffer = IntPtr.Zero;
-        try
-        {
-            if (!ConvertStringSidToSidW("S-1-16-" + MediumIntegrityRid, out mediumSid))
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "create the standard-user integrity SID");
-            uint sidLength = GetLengthSid(mediumSid);
-            if (sidLength == 0)
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "measure the standard-user integrity SID");
-
-            int labelSize = Marshal.SizeOf(typeof(TokenMandatoryLabel));
-            labelBuffer = Marshal.AllocHGlobal(labelSize + (int)sidLength);
-            IntPtr embeddedSid = IntPtr.Add(labelBuffer, labelSize);
-            byte[] sidBytes = new byte[sidLength];
-            Marshal.Copy(mediumSid, sidBytes, 0, (int)sidLength);
-            Marshal.Copy(sidBytes, 0, embeddedSid, (int)sidLength);
-            TokenMandatoryLabel label = new TokenMandatoryLabel();
-            label.Label.Sid = embeddedSid;
-            label.Label.Attributes = SeGroupIntegrity;
-            Marshal.StructureToPtr(label, labelBuffer, false);
-            if (!SetTokenInformation(token, TokenIntegrityLevel, labelBuffer, (uint)(labelSize + sidLength)))
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "set the smoke process to medium integrity");
-        }
-        finally
-        {
-            if (labelBuffer != IntPtr.Zero) Marshal.FreeHGlobal(labelBuffer);
-            if (mediumSid != IntPtr.Zero) LocalFree(mediumSid);
-        }
-    }
-
-    private static bool IsElevated(IntPtr token)
-    {
-        uint returnedLength;
-        IntPtr buffer = Marshal.AllocHGlobal(sizeof(uint));
-        try
-        {
-            if (!GetTokenInformation(token, TokenElevation, buffer, sizeof(uint), out returnedLength))
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "query limited-token elevation");
-            if (returnedLength < sizeof(uint))
-                throw new InvalidOperationException("Windows returned an incomplete token elevation value");
-            return Marshal.ReadInt32(buffer) != 0;
-        }
-        finally
-        {
-            Marshal.FreeHGlobal(buffer);
-        }
-    }
-
-    private static IntPtr GetLimitedToken(IntPtr currentToken)
-    {
-        IntPtr limitedToken = IntPtr.Zero;
-        uint returnedLength;
-        bool linkedTokenQuerySucceeded = GetTokenInformation(currentToken, TokenLinkedToken, out limitedToken, (uint)IntPtr.Size, out returnedLength);
-        int linkedTokenError = linkedTokenQuerySucceeded ? 0 : Marshal.GetLastWin32Error();
-        string linkedTokenStatus = linkedTokenQuerySucceeded ? "the linked token was unavailable or elevated" : "linked-token query failed with Win32 error " + linkedTokenError;
-        if (linkedTokenQuerySucceeded && limitedToken != IntPtr.Zero)
-        {
-            try
-            {
-                if (!IsElevated(limitedToken)) return limitedToken;
-            }
-            catch
-            {
-                CloseHandle(limitedToken);
-                throw;
-            }
-            CloseHandle(limitedToken);
-            limitedToken = IntPtr.Zero;
-            linkedTokenStatus = "the linked token was elevated";
-        }
-
-        IntPtr administratorsSid = IntPtr.Zero;
-        try
-        {
-            if (!ConvertStringSidToSidW("S-1-5-32-544", out administratorsSid))
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "create the Administrators SID");
-            SidAndAttributes disabledSid = new SidAndAttributes();
-            disabledSid.Sid = administratorsSid;
-            if (!CreateRestrictedToken(currentToken, DisableMaxPrivilege, 1, ref disabledSid, 0, IntPtr.Zero, 0, IntPtr.Zero, out limitedToken))
-            {
-                int error = Marshal.GetLastWin32Error();
-                throw new Win32Exception(error, "create limited token after " + linkedTokenStatus);
-            }
-            if (limitedToken == IntPtr.Zero)
-                throw new InvalidOperationException("CreateRestrictedToken returned no token after " + linkedTokenStatus);
-        }
-        finally
-        {
-            if (administratorsSid != IntPtr.Zero) LocalFree(administratorsSid);
-        }
-
-        try
-        {
-            SetMediumIntegrity(limitedToken);
-            if (IsElevated(limitedToken))
-                throw new InvalidOperationException("the restricted Windows token is still elevated after " + linkedTokenStatus);
-            return limitedToken;
-        }
-        catch
-        {
-            CloseHandle(limitedToken);
-            throw;
-        }
-    }
-
-    public static int Run(string application, string arguments, string currentDirectory, uint timeoutMilliseconds)
-    {
-        IntPtr currentToken = IntPtr.Zero;
-        IntPtr limitedToken = IntPtr.Zero;
-        ProcessInformation process = new ProcessInformation();
-        try
-        {
-            if (!OpenProcessToken(GetCurrentProcess(), TokenQuery | TokenAssignPrimary | TokenDuplicate | TokenAdjustDefault, out currentToken))
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "open current Windows token");
-            limitedToken = GetLimitedToken(currentToken);
-
-            StartupInfo startup = new StartupInfo();
-            startup.cb = Marshal.SizeOf(typeof(StartupInfo));
-            StringBuilder commandLine = new StringBuilder("\"" + application + "\" " + arguments);
-            if (!CreateProcessAsUserW(limitedToken, application, commandLine, IntPtr.Zero, IntPtr.Zero, false, CreateUnicodeEnvironment, IntPtr.Zero, currentDirectory, ref startup, out process))
-            {
-                int error = Marshal.GetLastWin32Error();
-                throw new Win32Exception(error, "start the desktop smoke in the selected token's session (Win32 error " + error + ")");
-            }
-
-            uint waitResult = WaitForSingleObject(process.hProcess, timeoutMilliseconds);
-            if (waitResult == WaitTimeout)
-            {
-                TerminateProcess(process.hProcess, 1);
-                WaitForSingleObject(process.hProcess, Infinite);
-                throw new TimeoutException("limited-token desktop app smoke exceeded its time limit");
-            }
-            if (waitResult != WaitObject0)
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "wait for the limited-token desktop app smoke");
-
-            uint exitCode;
-            if (!GetExitCodeProcess(process.hProcess, out exitCode))
-                throw new Win32Exception(Marshal.GetLastWin32Error(), "read the limited-token desktop app smoke exit code");
-            return unchecked((int)exitCode);
-        }
-        finally
-        {
-            if (process.hThread != IntPtr.Zero) CloseHandle(process.hThread);
-            if (process.hProcess != IntPtr.Zero) CloseHandle(process.hProcess);
-            if (limitedToken != IntPtr.Zero) CloseHandle(limitedToken);
-            if (currentToken != IntPtr.Zero) CloseHandle(currentToken);
-        }
-    }
 }
 '@
-if (-not ("CxpLimitedTokenProcess" -as [type])) {
-  Add-Type -TypeDefinition $nativeSource
+          try {
+            Invoke-SmokeProcess -FilePath $windowsPowerShell -Arguments @("-NoProfile", "-NonInteractive", "-Command", $storeProbe) -OutputPath (Join-Path $env:RUNNER_TEMP "store-capability.out") | Write-Host
+          } catch {
+            Write-Warning "Read-only Store capability probe failed: $($_.Exception.Message)"
+          }
+        }
+      }
+      "appx" {
+        $family = [string]$settings.PackageFamilyName
+        if ($family -notmatch '^OpenAI\.Codex_[a-z0-9]+$') { throw "unexpected fixture package family: $family" }
+        $register = '$ErrorActionPreference = "Stop"; Add-AppxPackage -RegisterByFamilyName -MainPackage ' + "'$family'"
+        Invoke-SmokeProcess -FilePath (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") -Arguments @("-NoProfile", "-NonInteractive", "-Command", $register) -OutputPath (Join-Path $env:RUNNER_TEMP "appx-registration.out") | Write-Host
+        $env:CXP_WINDOWS_APP_BACKEND = "legacy"
+        & (Join-Path $PSScriptRoot "codex_app_network_install_smoke.ps1") -Helper $Helper -RegisteredPackage
+      }
+      default { throw "unsupported smoke mode: $Mode" }
+    }
+    exit 0
+  } catch {
+    Write-Error -ErrorRecord $_ -ErrorAction Continue
+    exit 1
+  }
 }
 
-function Copy-SmokeExecutable {
-  param(
-    [Parameter(Mandatory = $true)]
-    [string]$Source,
-    [Parameter(Mandatory = $true)]
-    [string]$Destination,
-    [Parameter(Mandatory = $true)]
-    [System.Security.Principal.SecurityIdentifier]$User
-  )
-
-  Copy-Item -LiteralPath $Source -Destination $Destination -Force
-  $fileSecurity = Get-Acl -LiteralPath $Destination
-  $fileAccess = [System.Security.AccessControl.FileSystemAccessRule]::new(
-    $User,
-    [System.Security.AccessControl.FileSystemRights]::ReadAndExecute,
-    [System.Security.AccessControl.InheritanceFlags]::None,
-    [System.Security.AccessControl.PropagationFlags]::None,
-    [System.Security.AccessControl.AccessControlType]::Allow
-  )
-  [void]$fileSecurity.AddAccessRule($fileAccess)
-  Set-Acl -LiteralPath $Destination -AclObject $fileSecurity
+if ($env:RUNNER_ENVIRONMENT -ne "github-hosted") { throw "the temporary-account smoke is limited to disposable GitHub-hosted runners" }
+function Get-SmokeUserProcesses([string]$AccountSid) {
+  foreach ($candidate in @(Get-CimInstance -ClassName Win32_Process)) {
+    $owner = Invoke-CimMethod -InputObject $candidate -MethodName GetOwnerSid -ErrorAction SilentlyContinue
+    if ($null -ne $owner -and $owner.Sid -eq $AccountSid) { $candidate }
+  }
 }
+
+foreach ($path in @($Helper, $TokenProbe)) {
+  if (!(Test-Path -LiteralPath $path -PathType Leaf)) { throw "smoke executable does not exist: $path" }
+}
+if ($Mode -eq "managed" -and (!(Test-Path -LiteralPath $RecordingProxy -PathType Leaf) -or !(Test-Path -LiteralPath $FakeChatGPT -PathType Leaf))) {
+  throw "the managed smoke requires prebuilt recording proxy and ChatGPT fixtures"
+}
+$runnerTemp = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [IO.Path]::GetTempPath() }
+$smokeRoot = Join-Path $runnerTemp ("cxp-desktop-smoke-" + $Mode + "-" + [guid]::NewGuid().ToString("N"))
+$accountName = "CxpSmk" + [guid]::NewGuid().ToString("N").Substring(0, 12)
+$account = $null
+$process = $null
+$stdout = Join-Path $smokeRoot "stdout.log"
+$stderr = Join-Path $smokeRoot "stderr.log"
 
 try {
-  New-Item -ItemType Directory -Force -Path $smokeRoot | Out-Null
-  $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-  $directorySecurity = Get-Acl -LiteralPath $smokeRoot
-  $userAccess = [System.Security.AccessControl.FileSystemAccessRule]::new(
-    $identity.User,
-    [System.Security.AccessControl.FileSystemRights]::Modify,
-    [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [System.Security.AccessControl.InheritanceFlags]::ObjectInherit,
-    [System.Security.AccessControl.PropagationFlags]::None,
-    [System.Security.AccessControl.AccessControlType]::Allow
-  )
-  $directorySecurity.AddAccessRule($userAccess)
-  Set-Acl -LiteralPath $smokeRoot -AclObject $directorySecurity
-  $settingsPath = Join-Path $smokeRoot "settings.json"
-  $outputPath = Join-Path $smokeRoot "smoke.output.log"
-  $resultPath = Join-Path $smokeRoot "smoke.result.json"
-  $helperPath = [IO.Path]::GetFullPath($Helper)
-  $childHelperPath = Join-Path $smokeRoot "cxp-smoke.exe"
-  Copy-SmokeExecutable -Source $helperPath -Destination $childHelperPath -User $identity.User
-  $childRecordingProxyPath = ""
-  $childFakeChatGPTPath = ""
-  if ($ManagedInstall) {
-    $childRecordingProxyPath = Join-Path $smokeRoot "recording-proxy.exe"
-    $childFakeChatGPTPath = Join-Path $smokeRoot "fake-chatgpt.exe"
-    Copy-SmokeExecutable -Source ([IO.Path]::GetFullPath($RecordingProxy)) -Destination $childRecordingProxyPath -User $identity.User
-    Copy-SmokeExecutable -Source ([IO.Path]::GetFullPath($FakeChatGPT)) -Destination $childFakeChatGPTPath -User $identity.User
+  New-Item -ItemType Directory -Path $smokeRoot | Out-Null
+  $packageFamily = ""
+  if ($Mode -eq "appx") {
+    try {
+      $env:CXP_TEST_WINDOWS_TOKEN_EXPECTATION = "elevated"
+      $probeOutput = Invoke-SmokeProcess -FilePath $TokenProbe -Arguments @("-test.run", "^TestCurrentWindowsTokenElevationQuery$", "-test.v") -OutputPath (Join-Path $smokeRoot "fixture-token-probe.out")
+      Write-Host $probeOutput
+      if (!$probeOutput.Contains("actual Windows TokenElevation=true")) { throw "the fixture-preparation token probe did not execute its elevated-token assertion" }
+    } finally { Remove-Item Env:CXP_TEST_WINDOWS_TOKEN_EXPECTATION -ErrorAction SilentlyContinue }
+    $package = Join-Path $smokeRoot "ChatGPT-x64.msix"
+    Invoke-WebRequest -Uri "https://persistent.oaistatic.com/codex-app-prod/ChatGPT-x64.msix" -OutFile $package
+    Write-Host "Official MSIX SHA256=$((Get-FileHash -LiteralPath $package -Algorithm SHA256).Hash)"
+    $packagePath = $package.Replace("'", "''")
+    $install = '$ErrorActionPreference = "Stop"; Add-AppxPackage -Path ' + "'$packagePath'" + '; $package = Get-AppxPackage -Name OpenAI.Codex; if ($null -eq $package) { throw "OpenAI.Codex was not installed" }; $package.PackageFamilyName'
+    Write-Host "Preparing the signed package and its LocalSystem service with the CI runner; CXP will launch only in the standard account"
+    $packageFamily = (Invoke-SmokeProcess -FilePath (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") -Arguments @("-NoProfile", "-NonInteractive", "-Command", $install) -OutputPath (Join-Path $smokeRoot "signed-package-install.out")).Trim()
   }
-  $scriptPath = [IO.Path]::GetFullPath($PSCommandPath)
-  $workingDirectory = [IO.Path]::GetFullPath((Get-Location).Path)
-  [ordered]@{
-    ExpectedIdentity = $identity.Name
-    RunnerTemp = $smokeRoot
-    WorkingDirectory = $workingDirectory
-    Helper = $childHelperPath
-    NetworkInstall = [bool]$NetworkInstall
-    RecordingProxy = $childRecordingProxyPath
-    FakeChatGPT = $childFakeChatGPTPath
-    OutputPath = $outputPath
-    ResultPath = $resultPath
-  } | ConvertTo-Json | Set-Content -LiteralPath $settingsPath -Encoding UTF8
-  Set-Content -LiteralPath $outputPath -Value "" -Encoding UTF8
-
-  $powerShell = Join-Path $PSHOME "pwsh.exe"
-  $argumentLine = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$scriptPath`" -Helper `"$childHelperPath`" -Child -SettingsPath `"$settingsPath`""
-  $processExitCode = [CxpLimitedTokenProcess]::Run($powerShell, $argumentLine, $workingDirectory, 900000)
-
-  $output = if (Test-Path -LiteralPath $outputPath) { Get-Content -Raw -LiteralPath $outputPath } else { "" }
-  if (![string]::IsNullOrWhiteSpace($output)) { Write-Host $output }
-  if (!(Test-Path -LiteralPath $resultPath -PathType Leaf)) {
-    throw "limited-token desktop app smoke exited with code $processExitCode without a result file"
+  $password = ConvertTo-SecureString ([guid]::NewGuid().ToString("N") + "Aa1!") -AsPlainText -Force
+  $account = New-LocalUser -Name $accountName -Password $password -PasswordNeverExpires -Description "Ephemeral CXP desktop smoke user"
+  $acl = Get-Acl -LiteralPath $smokeRoot
+  $access = [Security.AccessControl.FileSystemAccessRule]::new($account.SID, "Modify", "ContainerInherit, ObjectInherit", "None", "Allow")
+  $acl.AddAccessRule($access)
+  Set-Acl -LiteralPath $smokeRoot -AclObject $acl
+  $work = Join-Path $smokeRoot "work"
+  New-Item -ItemType Directory -Path $work | Out-Null
+  foreach ($name in @("codex_app_smoke_as_standard_user.ps1", "codex_app_smoke_process.ps1", "codex_app_managed_install_smoke.ps1", "codex_app_network_install_smoke.ps1")) {
+    Copy-Item -LiteralPath (Join-Path $PSScriptRoot $name) -Destination (Join-Path $smokeRoot $name)
   }
-  $result = Get-Content -Raw -LiteralPath $resultPath | ConvertFrom-Json
-  if ($processExitCode -ne 0 -or $result.ExitCode -ne 0) {
-    throw "limited-token desktop app smoke failed with exit code $($result.ExitCode): $($result.Error)"
+  $childHelper = Join-Path $smokeRoot "cxp.exe"
+  $childProbe = Join-Path $smokeRoot "token-probe.exe"
+  Copy-Item -LiteralPath $Helper -Destination $childHelper
+  Copy-Item -LiteralPath $TokenProbe -Destination $childProbe
+  $childProxy = ""
+  $childApp = ""
+  if ($Mode -eq "managed") {
+    $childProxy = Join-Path $smokeRoot "recording-proxy.exe"
+    $childApp = Join-Path $smokeRoot "fake-chatgpt.exe"
+    Copy-Item -LiteralPath $RecordingProxy -Destination $childProxy
+    Copy-Item -LiteralPath $FakeChatGPT -Destination $childApp
   }
+  $settings = Join-Path $smokeRoot "settings.json"
+  @{ AccountSid = $account.SID.Value; WorkingDirectory = $work; RecordingProxy = $childProxy; FakeChatGPT = $childApp; PackageFamilyName = $packageFamily } | ConvertTo-Json | Set-Content -LiteralPath $settings -Encoding UTF8
+  $credential = [PSCredential]::new("$env:COMPUTERNAME\$accountName", $password)
+  $childScript = Join-Path $smokeRoot "codex_app_smoke_as_standard_user.ps1"
+  $arguments = "-NoLogo -NoProfile -NonInteractive -File `"$childScript`" -Helper `"$childHelper`" -TokenProbe `"$childProbe`" -Mode $Mode -SettingsPath `"$settings`""
+  $process = Start-Process -FilePath (Join-Path $PSHOME "pwsh.exe") -Credential $credential -LoadUserProfile -UseNewEnvironment -WorkingDirectory $work -ArgumentList $arguments -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+  if (!$process.WaitForExit(900000)) { throw "the $Mode smoke exceeded its 15-minute timeout" }
+  if ($process.ExitCode -ne 0) { throw "the $Mode smoke failed with exit code $($process.ExitCode); diagnostics: $smokeRoot" }
 } finally {
-  Remove-Item -Recurse -Force -LiteralPath $smokeRoot -ErrorAction SilentlyContinue
+  try {
+    if ($null -ne $account) {
+      foreach ($candidate in @(Get-SmokeUserProcesses $account.SID.Value)) {
+        Stop-Process -Id $candidate.ProcessId -Force -ErrorAction SilentlyContinue
+      }
+      $remaining = @(Get-SmokeUserProcesses $account.SID.Value)
+      if ($remaining.Count -gt 0) { throw "smoke cleanup left test-account processes: $($remaining.ProcessId -join ', ')" }
+    }
+  } finally {
+    if ($null -ne $account) { Remove-LocalUser -SID $account.SID }
+    if ($null -ne $process) { $process.Dispose() }
+    foreach ($log in @($stdout, $stderr)) {
+      if (Test-Path -LiteralPath $log) { Get-Content -Raw -LiteralPath $log | Write-Host }
+    }
+    Write-Host "Desktop smoke diagnostics retained at $smokeRoot"
+  }
 }

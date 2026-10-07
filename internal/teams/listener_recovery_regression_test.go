@@ -1147,6 +1147,9 @@ func (h *listenerRecoveryHandle) stop(t *testing.T) {
 	err := h.err
 	h.errMu.Unlock()
 	if err != nil && !errors.Is(err, context.Canceled) {
+		for cause := err; cause != nil; cause = errors.Unwrap(cause) {
+			t.Logf("listener error cause: %T: %#v", cause, cause)
+		}
 		t.Errorf("Listen returned unexpected error: %v", err)
 	}
 }

@@ -1,6 +1,7 @@
 param(
   [Parameter(Mandatory = $true)]
-  [string]$Helper
+  [string]$Helper,
+  [switch]$RegisteredPackage
 )
 
 $ErrorActionPreference = "Stop"
@@ -28,6 +29,13 @@ Get-Process -Name $desktopProcessNames -ErrorAction SilentlyContinue | ForEach-O
 $launchedProcesses = @()
 
 try {
+  $initialPackage = Get-AppxPackage -Name OpenAI.Codex -ErrorAction SilentlyContinue
+  if ($RegisteredPackage) {
+    if ($null -eq $initialPackage) { throw "the signed-package fixture was not registered for this account" }
+    Write-Host "The official signed package was prepared separately; this launch does not test Microsoft Store acquisition"
+  } elseif ($null -ne $initialPackage) {
+    throw "the Store installation smoke requires a fresh account without an existing OpenAI.Codex package"
+  }
   try {
     $appArguments = @("--config", $config, "app", "--cwd", $work)
     $null = Invoke-SmokeProcess -FilePath $Helper -Arguments $appArguments -OutputPath $out
@@ -78,7 +86,11 @@ try {
     throw "ChatGPT/Codex desktop app was installed but no supported process was observed`napp output:`n$appOut"
   }
 
-  Write-Host "Codex desktop app network install smoke passed: $($pkg.PackageFullName)"
+  if ($RegisteredPackage) {
+    Write-Host "Codex desktop signed AppX registered-launch smoke passed: $($pkg.PackageFullName)"
+  } else {
+    Write-Host "Codex desktop app network install smoke passed: $($pkg.PackageFullName)"
+  }
 } finally {
   if ($launchedProcesses.Count -gt 0) {
     $launchedProcesses | Stop-Process -Force -ErrorAction SilentlyContinue

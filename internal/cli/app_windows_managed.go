@@ -251,7 +251,10 @@ func preflightCodexWindowsAppElevation(ctx context.Context, opts codexDesktopApp
 		if valid {
 			return nil
 		}
-		return windowsAppWriteDenied("install the CXP-managed ChatGPT app", elevated, elevationErr, nil)
+		if elevationErr != nil {
+			return windowsAppWriteDenied("install the CXP-managed ChatGPT app", elevated, elevationErr, nil)
+		}
+		return ensureWindowsInstallDelegationAvailable()
 	}
 	installed, err := codexWindowsStorePackageInstalled(ctx)
 	if err != nil {
@@ -338,6 +341,18 @@ func ensureCodexWindowsManagedInstallWithRefresh(ctx context.Context, root strin
 		return codexWindowsManagedInstallState{}, false, err
 	} else if currentOK && !refresh {
 		return currentState, false, nil
+	}
+	if codexAppGOOS() == "windows" {
+		elevated, err := codexAppTokenElevationFn()
+		if err != nil {
+			return codexWindowsManagedInstallState{}, false, windowsAppWriteDenied("install or update the CXP-managed ChatGPT app", elevated, err, nil)
+		}
+		if elevated {
+			if err := ensureWindowsInstallDelegationAvailable(); err != nil {
+				return codexWindowsManagedInstallState{}, false, err
+			}
+			return windowsInstallDelegate(ctx, root, opts, refresh)
+		}
 	}
 	if err := ensureCodexWindowsAppWriteAllowed("install or update the CXP-managed ChatGPT app"); err != nil {
 		return codexWindowsManagedInstallState{}, false, err

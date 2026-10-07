@@ -36,6 +36,28 @@ func TestRunMainHandlesCandidateUpdateBeforeRuntimeDispatch(t *testing.T) {
 	}
 }
 
+func TestRunMainHandlesAppInstallWorkerBeforeRuntimeDispatch(t *testing.T) {
+	previousPreflight, previousLaunch, previousExecute, previousInput := runLegacyUpdaterVersionPreflight, launchHelperRuntime, executeCLI, os.Stdin
+	t.Cleanup(func() {
+		runLegacyUpdaterVersionPreflight, launchHelperRuntime, executeCLI, os.Stdin = previousPreflight, previousLaunch, previousExecute, previousInput
+	})
+	input, err := os.CreateTemp(t.TempDir(), "invalid-request")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer input.Close()
+	os.Stdin = input
+	runLegacyUpdaterVersionPreflight = func() error { t.Fatal("worker invoked legacy preflight"); return nil }
+	launchHelperRuntime = func(string, []string) (int, bool, error) {
+		t.Fatal("worker invoked runtime dispatch")
+		return 0, false, nil
+	}
+	executeCLI = func() int { t.Fatal("worker invoked root CLI"); return 0 }
+	if code := runMain([]string{"cxp", "--cxp-internal-windows-app-install"}); code != 1 {
+		t.Fatalf("invalid worker request exit code = %d", code)
+	}
+}
+
 func TestRunMainHandlesPostParentRepairBeforeRuntimeDispatch(t *testing.T) {
 	previousPreflight := runLegacyUpdaterVersionPreflight
 	previousLaunch := launchHelperRuntime

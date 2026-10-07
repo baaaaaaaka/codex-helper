@@ -1434,6 +1434,7 @@ jobs:
           $env:CODEX_HELPER_WINDOWS_TASK_REGISTER_TEST = "1"
           $env:CODEX_HELPER_USER_PATH_WINDOWS_LIVE = "1"
           go test ./internal/userpath -count=1 -run '^TestWindowsAccountDefaultLiveTokenEnvironment$' -v
+          go test ./internal/teams/store -count=1 -run '^Test(SQLiteOptionalSidecar|WindowsSQLiteOptionalSidecar)' -v
           go test ./internal/cli -count=1 -run 'Test(TeamsServiceWindowsTask(XML(RegistersWithTaskScheduler|WithPrincipalRegistersWithTaskScheduler)|StartIfStoppedUsesTaskScheduler)|TeamsUserPathExpectedSIDMatchesLiveScheduledTaskPrincipal)CI$' -v
 
       - name: Teams Graph 429 stress (Linux only)
@@ -1935,19 +1936,29 @@ jobs:
           go test ./internal/cli -run 'Test(CodexDesktopMacCandidatePaths|CodexDesktopMacExecutablePath|FindCodexAppBundle|EnsureCodexDesktopAppMac|InstallCodexDesktopAppMac|CompareCodexDesktopMacVersions|CodexDesktopMacAppLock|RecoverCodexDesktopMacAppBackup|UpgradeCodexDesktopAppMac|LaunchCodexDesktopAppMac|CodexDesktopMacApplicationsDir|CleanCodexDesktopMacStagingDirs|RootUpgradeCodexApp(DispatchesMacManagedUpdate|RejectsRunningMacAppBeforeConfigOrProxyWork|RejectsUnsupportedMacArchitecture))' -count=1 -v
           bash scripts/ci/retry.sh 2 10 bash scripts/ci/codex_app_network_install_smoke.sh "$helper" proxy chatgpt
 
-      - name: Codex desktop app network install smoke (Windows)
-        if: matrix.shard == 'windows-skills-desktop-b' && runner.os == 'Windows'
+      - name: Codex desktop app Windows build and policy regressions
+        id: windows_desktop_build
+        if: matrix.shard == 'windows-skills-desktop-b' && runner.os == 'Windows' && !cancelled()
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
-          $helper = Join-Path $env:RUNNER_TEMP "codex-proxy-desktop-network-smoke.exe"
+          $helper = Join-Path $env:RUNNER_TEMP "codex-proxy-desktop-smoke.exe"
           go build -o $helper .\cmd\codex-proxy
-          go test ./internal/cli -run 'TestCodexDesktopWindows(AppXEntrySelectionIntegration|ManifestExecutableCandidateIntegration|Script)' -count=1 -v
-          .\scripts\ci\codex_app_smoke_as_standard_user.ps1 -Helper $helper -NetworkInstall
+          go test -c -o (Join-Path $env:RUNNER_TEMP "codex-desktop-token-probe.exe") ./internal/cli
+          go build -o (Join-Path $env:RUNNER_TEMP "codex-managed-recording-proxy.exe") .\scripts\ci\windows_managed_recording_proxy
+          go build -o (Join-Path $env:RUNNER_TEMP "codex-managed-fake-chatgpt.exe") .\scripts\ci\windows_managed_fake_chatgpt
+          $pattern = '^Test(CurrentWindowsTokenElevationQuery|WindowsInstall|WarnIfWindowsAppElevated|PreflightCodexWindowsAppElevation|ManagedWindowsWriterRejectsElevation|LegacyWindowsLauncherSuppressesWinget|RootUpgradeCodexApp|WindowsManagedApp|CodexDesktopWindows)'
+          $listed = @(go test ./internal/cli -list $pattern | Select-String $pattern)
+          foreach ($required in @('^TestCurrentWindowsTokenElevationQuery$', '^TestWindowsInstall', '^TestPreflightCodexWindowsAppElevation', '^TestRootUpgradeCodexApp', '^TestWindowsManagedApp')) {
+            if (!($listed | Select-String $required)) { throw "Windows desktop selector missed $required" }
+          }
+          go test ./internal/cli -run $pattern -count=1 -v
+          go test ./cmd/codex-proxy -run '^TestRunMainHandlesAppInstallWorkerBeforeRuntimeDispatch$' -count=1 -v
+          .\scripts\ci\codex_app_smoke_process_test.ps1 -WorkingDirectory $env:RUNNER_TEMP
 
       - name: Codex desktop app managed runtime smoke (Windows)
-        if: matrix.shard == 'windows-skills-desktop-b' && runner.os == 'Windows'
+        if: matrix.shard == 'windows-skills-desktop-b' && runner.os == 'Windows' && !cancelled() && steps.windows_desktop_build.outcome == 'success'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -1963,19 +1974,29 @@ jobs:
           )) {
             Remove-Item ("Env:" + $name) -ErrorAction SilentlyContinue
           }
-          $helper = Join-Path $env:RUNNER_TEMP "codex-proxy-managed-chatgpt-smoke.exe"
-          go build -o $helper .\cmd\codex-proxy
-          $recordingProxy = Join-Path $env:RUNNER_TEMP "codex-proxy-managed-chatgpt-recording-proxy.exe"
-          $fakeChatGPT = Join-Path $env:RUNNER_TEMP "codex-proxy-managed-chatgpt-fake.exe"
-          go build -o $recordingProxy .\scripts\ci\windows_managed_recording_proxy
-          go build -o $fakeChatGPT .\scripts\ci\windows_managed_fake_chatgpt
-          $pattern = '^Test(RootUpgradeCodexApp|WindowsManagedApp)'
-          $listed = @(go test ./internal/cli -list $pattern | Select-String $pattern)
-          if ($listed.Count -lt 1) {
-            throw "Windows managed app/update test selector matched no tests; refusing a silent fake pass"
-          }
-          go test ./internal/cli -run $pattern -count=1 -v
-          .\scripts\ci\codex_app_smoke_as_standard_user.ps1 -Helper $helper -ManagedInstall -RecordingProxy $recordingProxy -FakeChatGPT $fakeChatGPT
+          $helper = Join-Path $env:RUNNER_TEMP "codex-proxy-desktop-smoke.exe"
+          $tokenProbe = Join-Path $env:RUNNER_TEMP "codex-desktop-token-probe.exe"
+          $recordingProxy = Join-Path $env:RUNNER_TEMP "codex-managed-recording-proxy.exe"
+          $fakeChatGPT = Join-Path $env:RUNNER_TEMP "codex-managed-fake-chatgpt.exe"
+          .\scripts\ci\codex_app_smoke_as_standard_user.ps1 -Helper $helper -TokenProbe $tokenProbe -Mode managed -RecordingProxy $recordingProxy -FakeChatGPT $fakeChatGPT
+
+      - name: Codex desktop signed AppX provisioning and launch smoke (Windows)
+        if: matrix.shard == 'windows-skills-desktop-b' && runner.os == 'Windows' && !cancelled() && steps.windows_desktop_build.outcome == 'success'
+        shell: pwsh
+        run: |
+          .\scripts\ci\codex_app_smoke_as_standard_user.ps1 -Helper (Join-Path $env:RUNNER_TEMP "codex-proxy-desktop-smoke.exe") -TokenProbe (Join-Path $env:RUNNER_TEMP "codex-desktop-token-probe.exe") -Mode appx
+
+      - name: Upload Windows desktop smoke diagnostics
+        if: matrix.shard == 'windows-skills-desktop-b' && runner.os == 'Windows' && !cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-desktop-smoke-diagnostics-${{ matrix.partition }}
+          path: |
+            ${{ runner.temp }}/cxp-desktop-smoke-*/**/*.log
+            ${{ runner.temp }}/cxp-desktop-smoke-*/**/*.out
+            ${{ runner.temp }}/cxp-desktop-smoke-*/**/managed/current.json
+          if-no-files-found: ignore
+          retention-days: 7
 
       - name: Install Codex for integration (Linux/macOS)
         if: matrix.shard == 'platform-integration' && runner.os != 'Windows'

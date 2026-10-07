@@ -15,8 +15,23 @@ func TestCurrentWindowsTokenElevationQuery(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("native Windows token API")
 	}
-	if _, err := currentWindowsTokenElevated(); err != nil {
+	elevated, err := currentWindowsTokenElevated()
+	if err != nil {
 		t.Fatalf("query current process elevation token: %v", err)
+	}
+	t.Logf("actual Windows TokenElevation=%t", elevated)
+	switch expectation := os.Getenv("CXP_TEST_WINDOWS_TOKEN_EXPECTATION"); expectation {
+	case "":
+	case "standard":
+		if elevated {
+			t.Fatal("the native Windows token probe expected a standard token, got elevated")
+		}
+	case "elevated":
+		if !elevated {
+			t.Fatal("the native Windows token probe expected an elevated token, got standard")
+		}
+	default:
+		t.Fatalf("unknown Windows token expectation %q", expectation)
 	}
 }
 

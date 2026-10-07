@@ -7659,11 +7659,29 @@ func validateExistingSQLiteStorePath(path string) error {
 		return fmt.Errorf("sqlite store %q does not exist", path)
 	}
 	for _, suffix := range []string{"-wal", "-shm"} {
-		if _, err := sqliteReadOnlyFileIdentityForPath(path + suffix); err != nil {
+		if _, err := readOptionalSQLiteSidecarIdentity(path+suffix, sqliteReadOnlyFileIdentityForPath); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+func readOptionalSQLiteSidecarIdentity(path string, readIdentity func(string) (sqliteReadOnlyFileIdentity, error)) (sqliteReadOnlyFileIdentity, error) {
+	var lastError error
+	for attempt := 0; attempt < 3; attempt++ {
+		identity, err := readIdentity(path)
+		if err == nil {
+			return identity, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) && !(runtime.GOOS == "windows" && errors.Is(err, os.ErrPermission)) {
+			return sqliteReadOnlyFileIdentity{}, err
+		}
+		lastError = err
+		if attempt < 2 {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	return sqliteReadOnlyFileIdentity{}, lastError
 }
 
 func openSQLiteStore(path string, create bool) (*sql.DB, error) {

@@ -23,6 +23,9 @@ func main() {
 }
 
 func runMain(args []string) int {
+	if exitCode, handled := cli.HandleWindowsAppInstallWorker(args, os.Stdin, os.Stdout, os.Stderr); handled {
+		return exitCode
+	}
 	if len(args) == 2 && args[1] == "--recover-previous" {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		version, err := helperruntime.RecoverPrevious(ctx)
