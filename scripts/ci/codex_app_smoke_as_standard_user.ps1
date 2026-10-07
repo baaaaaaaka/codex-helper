@@ -383,23 +383,33 @@ try {
   $outputPath = Join-Path $smokeRoot "smoke.output.log"
   $resultPath = Join-Path $smokeRoot "smoke.result.json"
   $helperPath = [IO.Path]::GetFullPath($Helper)
+  $childHelperPath = Join-Path $smokeRoot "cxp-smoke.exe"
+  Copy-Item -LiteralPath $helperPath -Destination $childHelperPath -Force
+  $childRecordingProxyPath = ""
+  $childFakeChatGPTPath = ""
+  if ($ManagedInstall) {
+    $childRecordingProxyPath = Join-Path $smokeRoot "recording-proxy.exe"
+    $childFakeChatGPTPath = Join-Path $smokeRoot "fake-chatgpt.exe"
+    Copy-Item -LiteralPath ([IO.Path]::GetFullPath($RecordingProxy)) -Destination $childRecordingProxyPath -Force
+    Copy-Item -LiteralPath ([IO.Path]::GetFullPath($FakeChatGPT)) -Destination $childFakeChatGPTPath -Force
+  }
   $scriptPath = [IO.Path]::GetFullPath($PSCommandPath)
   $workingDirectory = [IO.Path]::GetFullPath((Get-Location).Path)
   [ordered]@{
     ExpectedIdentity = $identity.Name
     RunnerTemp = $smokeRoot
     WorkingDirectory = $workingDirectory
-    Helper = $helperPath
+    Helper = $childHelperPath
     NetworkInstall = [bool]$NetworkInstall
-    RecordingProxy = if ($ManagedInstall) { [IO.Path]::GetFullPath($RecordingProxy) } else { "" }
-    FakeChatGPT = if ($ManagedInstall) { [IO.Path]::GetFullPath($FakeChatGPT) } else { "" }
+    RecordingProxy = $childRecordingProxyPath
+    FakeChatGPT = $childFakeChatGPTPath
     OutputPath = $outputPath
     ResultPath = $resultPath
   } | ConvertTo-Json | Set-Content -LiteralPath $settingsPath -Encoding UTF8
   Set-Content -LiteralPath $outputPath -Value "" -Encoding UTF8
 
   $powerShell = Join-Path $PSHOME "pwsh.exe"
-  $argumentLine = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$scriptPath`" -Helper `"$helperPath`" -Child -SettingsPath `"$settingsPath`""
+  $argumentLine = "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$scriptPath`" -Helper `"$childHelperPath`" -Child -SettingsPath `"$settingsPath`""
   $processExitCode = [CxpLimitedTokenProcess]::Run($powerShell, $argumentLine, $workingDirectory, 900000)
 
   $output = if (Test-Path -LiteralPath $outputPath) { Get-Content -Raw -LiteralPath $outputPath } else { "" }
