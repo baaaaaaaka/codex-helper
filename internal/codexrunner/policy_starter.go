@@ -110,6 +110,44 @@ func (t *policyAppServerTransport) ReadLine(ctx context.Context) ([]byte, error)
 	if err != nil {
 		return line, err
 	}
+	if err := t.observeInitializeResponse(line); err != nil {
+		return nil, err
+	}
+	return line, nil
+}
+
+func (t *policyAppServerTransport) ReadRecord(ctx context.Context, writeChunk func([]byte) error) (bool, error) {
+	if writeChunk == nil {
+		writeChunk = func([]byte) error { return nil }
+	}
+	streamed, ok := t.AppServerLineTransport.(AppServerRecordTransport)
+	if !ok {
+		line, err := t.AppServerLineTransport.ReadLine(ctx)
+		if err != nil {
+			return false, err
+		}
+		if err := t.observeInitializeResponse(line); err != nil {
+			return true, err
+		}
+		if len(line) > 0 {
+			if err := writeChunk(line); err != nil {
+				return true, err
+			}
+		}
+		return true, nil
+	}
+	if t.readyHook == nil {
+		return streamed.ReadRecord(ctx, writeChunk)
+	}
+	observer := newPolicyInitializeResponseObserver(t, writeChunk)
+	read, err := streamed.ReadRecord(ctx, observer.WriteChunk)
+	if err != nil || !read {
+		return read, err
+	}
+	return true, observer.Finish()
+}
+
+func (t *policyAppServerTransport) observeInitializeResponse(line []byte) error {
 	var message appServerMessage
 	if json.Unmarshal(bytes.TrimSpace(line), &message) == nil && message.Error == nil && len(bytes.TrimSpace(message.ID)) > 0 {
 		key := string(bytes.TrimSpace(message.ID))
@@ -122,11 +160,11 @@ func (t *policyAppServerTransport) ReadLine(ctx context.Context) ([]byte, error)
 		if ready && t.readyHook != nil {
 			t.readyOnce.Do(func() { t.readyErr = t.readyHook() })
 			if t.readyErr != nil {
-				return nil, t.readyErr
+				return t.readyErr
 			}
 		}
 	}
-	return line, nil
+	return nil
 }
 
 func (t *policyAppServerTransport) Close() error {

@@ -46,6 +46,16 @@ type AppServerLineTransport interface {
 	Close() error
 }
 
+// AppServerRecordTransport can stream one stdout JSONL record without
+// materializing the complete line. The callback receives borrowed chunks and
+// must consume them before returning. A successful call may deliver an empty
+// record; false means the stream ended before another record was available.
+// Callers must close the transport after a callback error because the current
+// record may have been only partially consumed.
+type AppServerRecordTransport interface {
+	ReadRecord(ctx context.Context, writeChunk func([]byte) error) (bool, error)
+}
+
 type AppServerTransportStarter interface {
 	StartAppServer(ctx context.Context, req AppServerStartRequest) (AppServerLineTransport, error)
 }

@@ -371,6 +371,109 @@ func TestAppServerProcessTransportRejectsOversizedStdoutLine(t *testing.T) {
 	}
 }
 
+func TestAppServerProcessTransportStreamsRecordsBeyondLineLimit(t *testing.T) {
+	oldLimit := appServerProcessStdoutLineLimit
+	appServerProcessStdoutLineLimit = 256
+	t.Cleanup(func() { appServerProcessStdoutLineLimit = oldLimit })
+
+	const payloadSize = defaultAppServerProcessStdoutLineLimit + 1024
+	transport := startProcessHelper(t, AppServerProcessStarter{}, "stream-jsonl", strconv.Itoa(payloadSize))
+	defer transport.Close()
+	streamed, ok := transport.(AppServerRecordTransport)
+	if !ok {
+		t.Fatal("process transport does not expose streaming records")
+	}
+
+	wantPrefix := `{"id":7,"result":{"plugins":"`
+	wantSuffix := `"}}`
+	var count int
+	var first, last byte
+	maxChunk := 0
+	read, err := streamed.ReadRecord(context.Background(), func(chunk []byte) error {
+		if len(chunk) > maxChunk {
+			maxChunk = len(chunk)
+		}
+		for _, value := range chunk {
+			if count == 0 {
+				first = value
+			}
+			last = value
+			count++
+		}
+		return nil
+	})
+	if err != nil || !read {
+		t.Fatalf("ReadRecord = (%t, %v), want one record", read, err)
+	}
+	wantSize := len(wantPrefix) + payloadSize + len(wantSuffix)
+	if count != wantSize {
+		t.Fatalf("streamed bytes = %d, want %d", count, wantSize)
+	}
+	if first != '{' || last != '}' {
+		t.Fatalf("streamed boundary bytes = %q...%q, want JSON object", first, last)
+	}
+	if maxChunk > appServerProcessStdoutChunkSize {
+		t.Fatalf("largest streamed chunk = %d, want <= %d", maxChunk, appServerProcessStdoutChunkSize)
+	}
+
+	var next []byte
+	read, err = streamed.ReadRecord(context.Background(), func(chunk []byte) error {
+		next = append(next, chunk...)
+		return nil
+	})
+	if err != nil || !read || string(next) != `{"next":true}` {
+		t.Fatalf("second ReadRecord = (%t, %q, %v), want next record", read, next, err)
+	}
+}
+
+func TestAppServerProcessTransportReadRecordAppliesBoundedBackpressure(t *testing.T) {
+	transport := startProcessHelper(t, AppServerProcessStarter{}, "stream-jsonl", strconv.Itoa(8*1024*1024))
+	defer transport.Close()
+	processTransport := transport.(*appServerProcessTransport)
+	streamed := AppServerRecordTransport(processTransport)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	finished := make(chan error, 1)
+	go func() {
+		read, err := streamed.ReadRecord(context.Background(), func([]byte) error {
+			select {
+			case <-entered:
+			default:
+				close(entered)
+				<-release
+			}
+			return nil
+		})
+		if err == nil && !read {
+			err = errors.New("stream ended before its first record")
+		}
+		finished <- err
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("record callback was not reached")
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for len(processTransport.stdoutChunks) < cap(processTransport.stdoutChunks) && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got, capacity := len(processTransport.stdoutChunks), cap(processTransport.stdoutChunks); got != capacity {
+		t.Fatalf("stdout handoff queue length = %d, capacity = %d; producer did not encounter bounded backpressure", got, capacity)
+	}
+	close(release)
+	select {
+	case err := <-finished:
+		if err != nil {
+			t.Fatalf("ReadRecord after releasing backpressure: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("record stream did not resume after releasing backpressure")
+	}
+}
+
 func TestAppServerProcessDiagnosticWaitsForStderrDrainAfterExit(t *testing.T) {
 	transport := &appServerProcessTransport{
 		stderrBuffer: newLimitedStderrBuffer(1024),
@@ -587,6 +690,25 @@ func runAppServerProcessHelper(args []string) int {
 			}
 		}
 		fmt.Fprint(os.Stdout, strings.Repeat("x", size))
+		time.Sleep(24 * time.Hour)
+		return 0
+	case "stream-jsonl":
+		size := 0
+		if len(args) > 1 {
+			size, _ = strconv.Atoi(args[1])
+		}
+		fmt.Fprint(os.Stdout, `{"id":7,"result":{"plugins":"`)
+		chunk := strings.Repeat("p", 16*1024)
+		for remaining := size; remaining > 0; {
+			count := len(chunk)
+			if count > remaining {
+				count = remaining
+			}
+			_, _ = fmt.Fprint(os.Stdout, chunk[:count])
+			remaining -= count
+		}
+		fmt.Fprintln(os.Stdout, `"}}`)
+		fmt.Fprintln(os.Stdout, `{"next":true}`)
 		time.Sleep(24 * time.Hour)
 		return 0
 	case "close-stdin":

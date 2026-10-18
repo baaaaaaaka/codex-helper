@@ -37,6 +37,13 @@ type AppServerServerRequestHandler interface {
 	HandleServerRequest(ctx context.Context, method string, params json.RawMessage) (json.RawMessage, bool, error)
 }
 
+// AppServerServerRequestMethodClassifier lets a handler identify methods it
+// could handle before the broker buffers a complete request. Handlers that do
+// not implement it remain conservative: every server request is a candidate.
+type AppServerServerRequestMethodClassifier interface {
+	MayHandleServerRequest(method string) bool
+}
+
 type AppServerServerRequestHandlerFunc func(context.Context, string, json.RawMessage) (json.RawMessage, bool, error)
 
 func (f AppServerServerRequestHandlerFunc) HandleServerRequest(ctx context.Context, method string, params json.RawMessage) (json.RawMessage, bool, error) {
@@ -69,6 +76,20 @@ func (h AutomaticApprovalHandler) HandleServerRequest(ctx context.Context, metho
 		}
 	}
 	return result, true, nil
+}
+
+func (AutomaticApprovalHandler) MayHandleServerRequest(method string) bool {
+	switch strings.TrimSpace(method) {
+	case appServerMethodCommandExecutionApproval,
+		appServerMethodFileChangeApproval,
+		appServerMethodPermissionsApproval,
+		appServerMethodMCPElicitation,
+		appServerMethodLegacyExecApproval,
+		appServerMethodLegacyPatchApproval:
+		return true
+	default:
+		return false
+	}
 }
 
 func automaticApprovalResult(method string, params json.RawMessage) (json.RawMessage, bool, error) {

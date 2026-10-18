@@ -1,7 +1,6 @@
 package codexrunner
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -20,8 +19,11 @@ import (
 
 const defaultAppServerProcessStderrLimit = 32 * 1024
 const defaultAppServerProcessStdoutLineLimit = 16 << 20
+const appServerProcessStdoutChunkSize = 32 * 1024
+const appServerProcessStdoutChunkQueue = 8
 
 var errAppServerProcessStdoutClosed = errors.New("app-server stdout closed")
+var errAppServerProcessStdoutLineTooLong = errors.New("bufio.Scanner: token too long")
 
 var appServerProcessRuntimeGOOS = func() string { return runtime.GOOS }
 var appServerProcessStdoutLineLimit = defaultAppServerProcessStdoutLineLimit
@@ -114,7 +116,7 @@ func (s AppServerProcessStarter) StartAppServer(ctx context.Context, req AppServ
 		stdout:        stdoutRead,
 		stderr:        stderrRead,
 		stderrBuffer:  newLimitedStderrBuffer(s.StderrLimit),
-		lines:         make(chan appServerProcessLine, 16),
+		stdoutChunks:  make(chan appServerProcessChunk, appServerProcessStdoutChunkQueue),
 		done:          make(chan struct{}),
 		stderrDone:    make(chan struct{}),
 		waitDone:      make(chan struct{}),
@@ -186,21 +188,24 @@ type appServerProcessTransport struct {
 	stderr        *os.File
 	stderrBuffer  *limitedStderrBuffer
 
-	lines      chan appServerProcessLine
-	done       chan struct{}
-	stderrDone chan struct{}
-	waitDone   chan struct{}
+	stdoutChunks chan appServerProcessChunk
+	done         chan struct{}
+	stderrDone   chan struct{}
+	waitDone     chan struct{}
 
-	writeMu   sync.Mutex
-	closeOnce sync.Once
-	closeErr  error
-	waitMu    sync.Mutex
-	waitErr   error
-	wg        sync.WaitGroup
+	writeMu     sync.Mutex
+	readMu      sync.Mutex
+	readPending []byte
+	readErr     error
+	closeOnce   sync.Once
+	closeErr    error
+	waitMu      sync.Mutex
+	waitErr     error
+	wg          sync.WaitGroup
 }
 
-type appServerProcessLine struct {
-	line []byte
+type appServerProcessChunk struct {
+	data []byte
 	err  error
 }
 
@@ -242,20 +247,88 @@ func (p *appServerProcessTransport) WriteLine(ctx context.Context, line []byte) 
 }
 
 func (p *appServerProcessTransport) ReadLine(ctx context.Context) ([]byte, error) {
-	select {
-	case item, ok := <-p.lines:
-		if !ok {
-			return nil, p.diagnosticError(errAppServerProcessStdoutClosed, "read app-server stdout")
+	var line []byte
+	limit := appServerProcessStdoutLineLimit
+	if limit <= 0 {
+		limit = defaultAppServerProcessStdoutLineLimit
+	}
+	read, err := p.ReadRecord(ctx, func(chunk []byte) error {
+		if len(line)+len(chunk) > limit {
+			return errAppServerProcessStdoutLineTooLong
 		}
-		if item.err != nil {
-			return nil, p.diagnosticError(item.err, "read app-server stdout")
+		line = append(line, chunk...)
+		return nil
+	})
+	if err != nil {
+		if errors.Is(err, errAppServerProcessStdoutLineTooLong) {
+			readErr := p.diagnosticError(err, "read app-server stdout")
+			_ = p.Close()
+			return nil, readErr
 		}
-		return item.line, nil
-	case <-ctx.Done():
-		_ = p.Close()
-		return nil, p.diagnosticError(ctx.Err(), "read app-server stdout")
-	case <-p.done:
-		return nil, p.diagnosticError(errors.New("app-server process is closed"), "read app-server stdout")
+		return nil, err
+	}
+	if !read {
+		return nil, p.diagnosticError(errAppServerProcessStdoutClosed, "read app-server stdout")
+	}
+	return bytes.TrimRight(line, "\r"), nil
+}
+
+// ReadRecord streams one complete JSONL record while retaining at most one
+// fixed-size stdout chunk plus the bounded handoff queue. Blocking in the
+// callback propagates backpressure through the queue to the app-server pipe.
+func (p *appServerProcessTransport) ReadRecord(ctx context.Context, writeChunk func([]byte) error) (bool, error) {
+	p.readMu.Lock()
+	defer p.readMu.Unlock()
+	if writeChunk == nil {
+		writeChunk = func([]byte) error { return nil }
+	}
+	if p.readErr != nil {
+		return false, p.diagnosticError(p.readErr, "read app-server stdout")
+	}
+
+	sawData := false
+	for {
+		if newline := bytes.IndexByte(p.readPending, '\n'); newline >= 0 {
+			if newline > 0 {
+				if err := writeChunk(p.readPending[:newline]); err != nil {
+					return true, err
+				}
+			}
+			p.readPending = p.readPending[newline+1:]
+			return true, nil
+		}
+		if len(p.readPending) > 0 {
+			chunk := p.readPending
+			p.readPending = nil
+			if err := writeChunk(chunk); err != nil {
+				return true, err
+			}
+			sawData = true
+		}
+
+		select {
+		case item, ok := <-p.stdoutChunks:
+			if !ok {
+				p.readErr = errAppServerProcessStdoutClosed
+				if sawData {
+					return true, nil
+				}
+				return false, p.diagnosticError(p.readErr, "read app-server stdout")
+			}
+			if item.err != nil {
+				p.readErr = item.err
+				return false, p.diagnosticError(item.err, "read app-server stdout")
+			}
+			p.readPending = item.data
+			if len(item.data) > 0 {
+				sawData = true
+			}
+		case <-ctx.Done():
+			_ = p.Close()
+			return false, p.diagnosticError(ctx.Err(), "read app-server stdout")
+		case <-p.done:
+			return false, p.diagnosticError(errors.New("app-server process is closed"), "read app-server stdout")
+		}
 	}
 }
 
@@ -283,27 +356,26 @@ func (p *appServerProcessTransport) Close() error {
 
 func (p *appServerProcessTransport) readStdout() {
 	defer p.wg.Done()
-	defer close(p.lines)
-
-	scanner := bufio.NewScanner(p.stdout)
-	lineLimit := appServerProcessStdoutLineLimit
-	if lineLimit <= 0 {
-		lineLimit = defaultAppServerProcessStdoutLineLimit
+	defer close(p.stdoutChunks)
+	for {
+		buffer := make([]byte, appServerProcessStdoutChunkSize)
+		count, err := p.stdout.Read(buffer)
+		if count > 0 {
+			chunk := appServerProcessChunk{data: buffer[:count]}
+			if !p.sendStdoutChunk(chunk) {
+				return
+			}
+		}
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				_ = p.sendStdoutChunk(appServerProcessChunk{err: err})
+			}
+			return
+		}
+		if count == 0 {
+			continue
+		}
 	}
-	initialBuffer := 64 * 1024
-	if initialBuffer > lineLimit {
-		initialBuffer = lineLimit
-	}
-	scanner.Buffer(make([]byte, 0, initialBuffer), lineLimit)
-	for scanner.Scan() {
-		line := bytes.TrimRight(scanner.Bytes(), "\r\n")
-		p.sendLine(appServerProcessLine{line: append([]byte{}, line...)})
-	}
-	err := scanner.Err()
-	if err == nil {
-		err = errAppServerProcessStdoutClosed
-	}
-	p.sendLine(appServerProcessLine{err: err})
 }
 
 func (p *appServerProcessTransport) readStderr() {
@@ -312,10 +384,12 @@ func (p *appServerProcessTransport) readStderr() {
 	_, _ = io.Copy(p.stderrBuffer, p.stderr)
 }
 
-func (p *appServerProcessTransport) sendLine(line appServerProcessLine) {
+func (p *appServerProcessTransport) sendStdoutChunk(chunk appServerProcessChunk) bool {
 	select {
-	case p.lines <- line:
+	case p.stdoutChunks <- chunk:
+		return true
 	case <-p.done:
+		return false
 	}
 }
 

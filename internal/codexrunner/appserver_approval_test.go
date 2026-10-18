@@ -43,6 +43,27 @@ func TestAutomaticApprovalResultMatrix(t *testing.T) {
 	}
 }
 
+func TestAutomaticApprovalHandlerClassifiesOnlySupportedMethods(t *testing.T) {
+	handler := AutomaticApprovalHandler{}
+	for _, method := range []string{
+		appServerMethodCommandExecutionApproval,
+		appServerMethodFileChangeApproval,
+		appServerMethodPermissionsApproval,
+		appServerMethodMCPElicitation,
+		appServerMethodLegacyExecApproval,
+		appServerMethodLegacyPatchApproval,
+	} {
+		if !handler.MayHandleServerRequest(method) {
+			t.Errorf("MayHandleServerRequest(%q) = false, want true", method)
+		}
+	}
+	for _, method := range []string{"", "initialize", "thread/start", "custom/approval"} {
+		if handler.MayHandleServerRequest(method) {
+			t.Errorf("MayHandleServerRequest(%q) = true, want false", method)
+		}
+	}
+}
+
 func TestAutomaticApprovalHandlerWaitsForConfiguredDelay(t *testing.T) {
 	delay := 30 * time.Millisecond
 	started := time.Now()

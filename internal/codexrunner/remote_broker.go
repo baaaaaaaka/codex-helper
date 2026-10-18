@@ -38,8 +38,13 @@ type RemoteBroker struct {
 	log       io.Writer
 	logMu     sync.Mutex
 
+	classificationPrefixLimit int
+	approvalCaptureLimit      int
+
 	clientMu sync.Mutex
 	client   bool
+	closed   bool
+	clientWS *websocket.Conn
 
 	transportWriteMu sync.Mutex
 	clientWriteMu    sync.Mutex
@@ -91,14 +96,16 @@ func StartRemoteBroker(ctx context.Context, options RemoteBrokerOptions) (*Remot
 		return nil, err
 	}
 	broker := &RemoteBroker{
-		transport: transport,
-		handler:   handler,
-		listener:  listener,
-		url:       "ws://" + listener.Addr().String(),
-		authToken: token,
-		done:      make(chan error, 1),
-		log:       options.Log,
-		approvals: make(map[string]*brokerApprovalState),
+		transport:                 transport,
+		handler:                   handler,
+		listener:                  listener,
+		url:                       "ws://" + listener.Addr().String(),
+		authToken:                 token,
+		done:                      make(chan error, 1),
+		log:                       options.Log,
+		approvals:                 make(map[string]*brokerApprovalState),
+		classificationPrefixLimit: defaultRemoteBrokerClassificationPrefixLimit,
+		approvalCaptureLimit:      defaultRemoteBrokerApprovalCaptureLimit,
 	}
 	broker.server = &http.Server{
 		Handler:           broker,
@@ -186,6 +193,21 @@ func (b *RemoteBroker) ServeHTTP(w http.ResponseWriter, request *http.Request) {
 		b.logf("remote broker WebSocket upgrade failed: %v", err)
 		return
 	}
+	b.clientMu.Lock()
+	if b.closed {
+		b.clientMu.Unlock()
+		_ = connection.Close()
+		return
+	}
+	b.clientWS = connection
+	b.clientMu.Unlock()
+	defer func() {
+		b.clientMu.Lock()
+		if b.clientWS == connection {
+			b.clientWS = nil
+		}
+		b.clientMu.Unlock()
+	}()
 	defer connection.Close()
 	b.serveConnection(request.Context(), connection)
 }
@@ -228,32 +250,21 @@ func (b *RemoteBroker) relayClientToAppServer(ctx context.Context, connection *w
 }
 
 func (b *RemoteBroker) relayAppServerToClient(ctx context.Context, connection *websocket.Conn, done chan<- error) {
-	var approvalWrites sync.WaitGroup
-	defer approvalWrites.Wait()
 	for {
-		line, err := b.transport.ReadLine(ctx)
+		gate := newRemoteBrokerRecordGate(ctx, b, connection)
+		read, err := readAppServerRecord(ctx, b.transport, gate.WriteChunk)
 		if err != nil {
+			gate.Abort()
 			sendBrokerError(ctx, done, err)
 			return
 		}
-		line = bytes.TrimSpace(line)
-		var message appServerMessage
-		if json.Unmarshal(line, &message) == nil && appServerMessageIsServerRequest(message) {
-			if b.handler == nil {
-				if err := b.writeClient(connection, line); err != nil {
-					sendBrokerError(ctx, done, err)
-					return
-				}
-				continue
-			}
-			approvalWrites.Add(1)
-			go func(request appServerMessage, raw []byte) {
-				defer approvalWrites.Done()
-				b.handleServerRequest(ctx, connection, request, raw, done)
-			}(message, append([]byte(nil), line...))
-			continue
+		if !read {
+			gate.Abort()
+			sendBrokerError(ctx, done, errAppServerProcessStdoutClosed)
+			return
 		}
-		if err := b.writeClient(connection, line); err != nil {
+		if err := gate.Finish(); err != nil {
+			gate.Abort()
 			sendBrokerError(ctx, done, err)
 			return
 		}
@@ -280,47 +291,40 @@ func (b *RemoteBroker) writeClient(connection *websocket.Conn, line []byte) erro
 	return connection.WriteMessage(websocket.TextMessage, line)
 }
 
-func (b *RemoteBroker) handleServerRequest(ctx context.Context, connection *websocket.Conn, request appServerMessage, raw []byte, done chan<- error) {
+func (b *RemoteBroker) handleServerRequest(ctx context.Context, connection *websocket.Conn, request appServerMessage, raw []byte) error {
 	key := string(bytes.TrimSpace(request.ID)) + "\x00" + strings.TrimSpace(request.Method)
 	state, owner := b.approvalState(key)
 	if !owner {
 		select {
 		case <-ctx.Done():
-			return
+			return ctx.Err()
 		case <-state.done:
 			if len(state.response) > 0 {
 				if err := b.writeTransport(ctx, state.response); err != nil {
-					sendBrokerError(ctx, done, err)
+					return err
 				}
 			}
 		}
-		return
+		return nil
 	}
 
 	result, handled, err := b.handler.HandleServerRequest(ctx, request.Method, request.Params)
 	if err != nil {
 		b.finishApprovalState(key, state, nil)
-		sendBrokerError(ctx, done, err)
-		return
+		return err
 	}
 	if !handled {
 		b.finishApprovalState(key, state, nil)
-		if err := b.writeClient(connection, raw); err != nil {
-			sendBrokerError(ctx, done, err)
-		}
-		return
+		return b.writeClient(connection, raw)
 	}
 	response := appServerResultResponse{JSONRPC: "2.0", ID: request.ID, Result: result}
 	encoded, err := json.Marshal(response)
 	if err != nil {
 		b.finishApprovalState(key, state, nil)
-		sendBrokerError(ctx, done, err)
-		return
+		return err
 	}
 	b.finishApprovalState(key, state, encoded)
-	if err := b.writeTransport(ctx, encoded); err != nil {
-		sendBrokerError(ctx, done, err)
-	}
+	return b.writeTransport(ctx, encoded)
 }
 
 func (b *RemoteBroker) approvalState(key string) (*brokerApprovalState, bool) {
@@ -361,6 +365,14 @@ func (b *RemoteBroker) Close(ctx context.Context) error {
 		return nil
 	}
 	b.closeOnce.Do(func() {
+		b.clientMu.Lock()
+		b.closed = true
+		connection := b.clientWS
+		b.clientWS = nil
+		b.clientMu.Unlock()
+		if connection != nil {
+			_ = connection.Close()
+		}
 		if b.server != nil {
 			b.closeErr = b.server.Shutdown(ctx)
 		}

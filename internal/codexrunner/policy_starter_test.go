@@ -1,8 +1,10 @@
 package codexrunner
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -89,6 +91,122 @@ func TestPolicyTransportReadyHookFailureRejectsInitialize(t *testing.T) {
 		t.Fatalf("ReadLine error = %v, want ready-hook failure", err)
 	}
 }
+
+func TestPolicyTransportReadyHookStreamsLargeNonInitializeResponse(t *testing.T) {
+	const payloadSize = defaultAppServerProcessStdoutLineLimit + 4096
+	prefix := []byte(`{"id":7,"result":{"plugins":"`)
+	suffix := []byte(`"}}`)
+	payload := strings.Repeat("p", payloadSize)
+	chunks := [][]byte{prefix}
+	for offset := 0; offset < len(payload); offset += appServerProcessStdoutChunkSize {
+		end := offset + appServerProcessStdoutChunkSize
+		if end > len(payload) {
+			end = len(payload)
+		}
+		chunks = append(chunks, []byte(payload[offset:end]))
+	}
+	chunks = append(chunks, suffix)
+	base := &policyStreamTestTransport{chunks: chunks}
+	var hookCalls atomic.Int32
+	transport := &policyAppServerTransport{
+		AppServerLineTransport: base,
+		readyHook: func() error {
+			hookCalls.Add(1)
+			return nil
+		},
+		initializeIDs: map[string]struct{}{"\"initialize\"": {}},
+	}
+
+	var got bytes.Buffer
+	read, err := transport.ReadRecord(context.Background(), func(chunk []byte) error {
+		_, writeErr := got.Write(chunk)
+		return writeErr
+	})
+	if err != nil || !read {
+		t.Fatalf("ReadRecord = (%t, %v), want one streamed response", read, err)
+	}
+	if got.Len() != len(prefix)+payloadSize+len(suffix) || !bytes.HasPrefix(got.Bytes(), prefix) || !bytes.HasSuffix(got.Bytes(), suffix) {
+		t.Fatalf("streamed response length/boundaries = %d", got.Len())
+	}
+	if hookCalls.Load() != 0 {
+		t.Fatalf("initialize ready hook calls = %d, want 0", hookCalls.Load())
+	}
+}
+
+func TestPolicyTransportReadyHookStreamingRunsBeforeInitializeResponseIsReleased(t *testing.T) {
+	base := &policyStreamTestTransport{chunks: [][]byte{
+		[]byte(`{"jsonrpc":"2.0","id":"init","result":{"userAgent":"test"}}`),
+	}}
+	var calls atomic.Int32
+	transport := &policyAppServerTransport{
+		AppServerLineTransport: base,
+		readyHook: func() error {
+			calls.Add(1)
+			return nil
+		},
+		initializeIDs: make(map[string]struct{}),
+	}
+	if err := transport.WriteLine(context.Background(), []byte(`{"jsonrpc":"2.0","id":"init","method":"initialize","params":{}}`)); err != nil {
+		t.Fatal(err)
+	}
+	var received []byte
+	read, err := transport.ReadRecord(context.Background(), func(chunk []byte) error {
+		if calls.Load() != 1 {
+			t.Errorf("initialize response bytes released before ready hook; hook calls=%d", calls.Load())
+		}
+		received = append(received, chunk...)
+		return nil
+	})
+	if err != nil || !read {
+		t.Fatalf("ReadRecord = (%t, %v), want initialize response", read, err)
+	}
+	if calls.Load() != 1 || string(received) != `{"jsonrpc":"2.0","id":"init","result":{"userAgent":"test"}}` {
+		t.Fatalf("hook calls=%d response=%s", calls.Load(), received)
+	}
+}
+
+func TestPolicyTransportReadyHookStreamingFailureRejectsInitializeRecord(t *testing.T) {
+	base := &policyStreamTestTransport{chunks: [][]byte{
+		[]byte(`{"jsonrpc":"2.0","id":7,"result":{}}`),
+	}}
+	transport := &policyAppServerTransport{
+		AppServerLineTransport: base,
+		readyHook: func() error {
+			return errors.New("migration commit failed")
+		},
+		initializeIDs: map[string]struct{}{"7": {}},
+	}
+	var released bool
+	read, err := transport.ReadRecord(context.Background(), func([]byte) error {
+		released = true
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "migration commit failed") {
+		t.Fatalf("ReadRecord error = %v, want ready-hook failure", err)
+	}
+	if !read || released {
+		t.Fatalf("ReadRecord=(%t, err=%v) released=%t; failed initialize must not reach TUI", read, err, released)
+	}
+}
+
+type policyStreamTestTransport struct {
+	chunks [][]byte
+}
+
+func (*policyStreamTestTransport) WriteLine(context.Context, []byte) error { return nil }
+
+func (*policyStreamTestTransport) ReadLine(context.Context) ([]byte, error) { return nil, io.EOF }
+
+func (t *policyStreamTestTransport) ReadRecord(_ context.Context, writeChunk func([]byte) error) (bool, error) {
+	for _, chunk := range t.chunks {
+		if err := writeChunk(chunk); err != nil {
+			return true, err
+		}
+	}
+	return true, nil
+}
+
+func (*policyStreamTestTransport) Close() error { return nil }
 
 func TestAppServerOpenAIBaseURLOverrideUsesLastCLIValueAndIgnoresChatGPT(t *testing.T) {
 	openAI := appServerOpenAIBaseURLOverride([]string{
