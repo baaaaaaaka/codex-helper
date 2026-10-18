@@ -277,6 +277,31 @@ func TestHandleKeyEnterSelectsSession(t *testing.T) {
 	}
 }
 
+func TestHandleKeyEnterOpensTopLevelForkSession(t *testing.T) {
+	now := time.Now()
+	project := codexhistory.Project{
+		Key:  "one",
+		Path: "/tmp/one",
+		Sessions: []codexhistory.Session{
+			{SessionID: "parent", Summary: "parent", ModifiedAt: now},
+			{SessionID: "fork", ParentSessionID: "parent", Summary: "fork", ModifiedAt: now},
+		},
+	}
+	state := newTestState([]codexhistory.Project{project})
+	state.focus = "sessions"
+	state.lastListFocus = "sessions"
+	state.sessionState.selected = 2 // new-agent row, parent, fork
+
+	selection, err := handleKey(context.Background(), newTestScreen(t, 120, 40), state, Options{}, tcell.NewEventKey(tcell.KeyEnter, 0, 0))
+	if err != nil {
+		t.Fatalf("handleKey error: %v", err)
+	}
+	if selection == nil || selection.Action != SelectionActionOpen || selection.RowKind != SelectionRowKindMain ||
+		selection.SourceThreadID != "fork" || selection.Session.SessionID != "fork" || selection.Session.ParentSessionID != "parent" {
+		t.Fatalf("fork selection = %#v, want fork thread with retained parent", selection)
+	}
+}
+
 func TestHandleKeyForksOnlyMainSession(t *testing.T) {
 	screen := newTestScreen(t, 120, 40)
 	now := time.Now()

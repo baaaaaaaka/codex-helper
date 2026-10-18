@@ -436,9 +436,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          history_pattern='Test(ReadSessionPreviewMessages(DeduplicatesMirroredCodexEvents|DeduplicatesMirrorsWithDifferentSourceKinds|DeduplicatesMirroredUserAndStripsTeamsEnvelope|CleansEventOnlyUserPrompt|KeepsDistinctSameSourceIDsWithSameText|KeepsDistinctRepeatedUserPrompts|KeepsIdenticalCommentaryAndFinal|LimitCountsMirroredUserOnce)|ReadSessionPreviewText(AppendDeduplicatesMirroredMessage|ColdCacheRetainsSkippedMirrorSourceID)|ParseMessagePayload_PreservesTeamsHelperEnvelope|FirstPromptTitleText(StripsLastTeamsHelperSuffix|PreservesLeadingQuotedMarkerBeforeOuterSuffix))$'
-          history_tui_pattern='^Test(HistoryTuiPathUnderExcludedRoot|FilterHistoryTuiProjects|LoadHistoryTuiProjectsFiltersDiscoveredTempProjects)$'
-          tui_pattern='Test(IsPreviewNavKey|ApplyPreviewNavigation|PreviewArrowKeysScrollWhenFocused|RefreshState(UpdatesOrPreserves|PreservesSelectionIdentityAcrossListChanges)|SelectionIdentityLookupDoesNotAllocate|SelectSessionAutoRefreshPreservesSelection)$'
+          history_pattern='Test(ReadSessionPreviewMessages(DeduplicatesMirroredCodexEvents|DeduplicatesMirrorsWithDifferentSourceKinds|DeduplicatesMirroredUserAndStripsTeamsEnvelope|CleansEventOnlyUserPrompt|KeepsDistinctSameSourceIDsWithSameText|KeepsDistinctRepeatedUserPrompts|KeepsIdenticalCommentaryAndFinal|LimitCountsMirroredUserOnce)|ReadSessionPreviewText(AppendDeduplicatesMirroredMessage|ColdCacheRetainsSkippedMirrorSourceID)|ParseMessagePayload_PreservesTeamsHelperEnvelope|FirstPromptTitleText(StripsLastTeamsHelperSuffix|PreservesLeadingQuotedMarkerBeforeOuterSuffix)|ProcessMetaLine_SubagentFields|DiscoverProjects_SubagentAssociation|FlattenSessionGraphKeepsForkLineageSeparateFromSubagentClassification)$'
+          history_tui_pattern='^Test(HistoryTuiPathUnderExcludedRoot|FilterHistoryTuiProjects|LoadHistoryTuiProjectsFiltersDiscoveredTempProjects|HistoryListCmdListsForkAsTopLevelSession)$'
+          tui_pattern='Test(IsPreviewNavKey|ApplyPreviewNavigation|PreviewArrowKeysScrollWhenFocused|RefreshState(UpdatesOrPreserves|PreservesSelectionIdentityAcrossListChanges)|SelectionIdentityLookupDoesNotAllocate|SelectSessionAutoRefreshPreservesSelection|HandleKeyEnterOpensTopLevelForkSession)$'
           go test ./internal/codexhistory -count=1 -run "$history_pattern" -v
           go test ./internal/cli -count=1 -run "$history_tui_pattern" -v
           go test ./internal/tui -count=1 -run "$tui_pattern" -v
@@ -636,7 +636,7 @@ jobs:
           set -euo pipefail
           # Keep parser, aggregation, rendering, stale-checkpoint/model-switch,
           # and subagent discovery regressions in the core CI shard.
-          token_stats_pattern='^Test(ParseCodexTokenStats|SummarizeCodexTokenStats|AggregateCodexTokenStats|RenderCodexTokenStatsHTML|Bridge(SendStatsToChatQueuesRenderedChunks|WorkHelperStats|SubagentProjectDiscovery))'
+          token_stats_pattern='^Test(ParseCodexTokenStats|SummarizeCodexTokenStats|AggregateCodexTokenStats|RenderCodexTokenStatsHTML|Bridge(SendStatsToChatQueuesRenderedChunks|WorkHelperStats|SubagentProjectDiscovery)|ReadSubagentTokenStatsAttributesNestedNativeChildrenToImmediateParents)'
           go test ./internal/teams -count=1 -run "$token_stats_pattern" -v
 
       - name: Teams chat-local model and global default regressions
@@ -857,7 +857,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go test ./internal/codexhistory -count=1 -run '^Test(SessionPreview(SQLite|CacheOff)|CacheV2|SessionMetaCatalog|DiscoverProjectsBatchesCatalog|HistoryCatalog|Catalog)' -v
+          go test ./internal/codexhistory -count=1 -run '^Test(SessionPreview(SQLite|CacheOff)|CacheV2|SessionMetaCatalog|ForkClassificationDoesNotReuseVersionTwoCatalogMetadata|DiscoverProjectsBatchesCatalog|HistoryCatalog|Catalog)' -v
 
       - name: CXP preview SQLite actual syscall write budget (Linux only)
         if: matrix.shard == 'state-perf' && matrix.partition == 0 && runner.os == 'Linux'

@@ -30,9 +30,10 @@ type Session struct {
 }
 
 // SessionGraphNode is the flat, relationship-preserving view of discovered
-// Codex transcripts. DiscoverProjects keeps its historical tree-shaped
-// compatibility view; stats and other graph consumers can use this view
-// without losing nested thread_spawn parent IDs.
+// Codex transcripts. DiscoverProjects keeps true subagents nested for legacy
+// callers, while forked sessions remain top-level and retain their parent ID.
+// The graph includes both child kinds so token attribution can remove inherited
+// cumulative usage from either kind of native child transcript.
 type SessionGraphNode struct {
 	SessionID       string
 	ParentSessionID string
@@ -45,10 +46,11 @@ type SessionGraphNode struct {
 	ModifiedAt      time.Time
 	ProjectPath     string
 	FilePath        string
-	IsSubagent      bool
 }
 
-func (n SessionGraphNode) AsSubagentSession() SubagentSession {
+// AsChildSession converts a parent-linked graph node to the shared child
+// session shape used by token attribution.
+func (n SessionGraphNode) AsChildSession() SubagentSession {
 	return SubagentSession{
 		AgentID:         n.AgentID,
 		ParentSessionID: n.ParentSessionID,
@@ -64,9 +66,10 @@ func (n SessionGraphNode) AsSubagentSession() SubagentSession {
 }
 
 // FlattenSessionGraph preserves every discovered session ID and its immediate
-// parent relationship. The legacy discovery shape attaches direct children to
-// known parents and promotes nested/orphan records; this function normalizes
-// both forms into one deterministic flat view.
+// parent relationship. The legacy discovery shape nests true subagents under
+// known parents and promotes orphan records; forked sessions remain top-level
+// with their parent edge. This function normalizes both forms into one
+// deterministic flat view.
 func FlattenSessionGraph(projects []Project) []SessionGraphNode {
 	byID := make(map[string]SessionGraphNode)
 	order := make([]string, 0)
@@ -103,13 +106,11 @@ func FlattenSessionGraph(projects []Project) []SessionGraphNode {
 			if node.ModifiedAt.After(existing.ModifiedAt) {
 				existing.ModifiedAt = node.ModifiedAt
 			}
-			existing.IsSubagent = existing.IsSubagent || node.IsSubagent
 			byID[node.SessionID] = existing
 			return
 		}
 		node.ParentSessionID = strings.TrimSpace(node.ParentSessionID)
 		node.AgentID = strings.TrimSpace(node.AgentID)
-		node.IsSubagent = node.IsSubagent || node.ParentSessionID != ""
 		byID[node.SessionID] = node
 		order = append(order, node.SessionID)
 	}
@@ -128,7 +129,6 @@ func FlattenSessionGraph(projects []Project) []SessionGraphNode {
 				ModifiedAt:      session.ModifiedAt,
 				ProjectPath:     firstNonEmptyString(session.ProjectPath, project.Path),
 				FilePath:        session.FilePath,
-				IsSubagent:      session.ParentSessionID != "",
 			})
 			for _, subagent := range session.Subagents {
 				add(SessionGraphNode{
@@ -143,7 +143,6 @@ func FlattenSessionGraph(projects []Project) []SessionGraphNode {
 					ModifiedAt:      subagent.ModifiedAt,
 					ProjectPath:     project.Path,
 					FilePath:        subagent.FilePath,
-					IsSubagent:      true,
 				})
 			}
 		}

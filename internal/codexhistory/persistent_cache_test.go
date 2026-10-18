@@ -159,6 +159,85 @@ func TestCacheV2DatabasesUseUnifiedVersionAndRollbackJournal(t *testing.T) {
 	}
 }
 
+func TestForkClassificationDoesNotReuseVersionTwoCatalogMetadata(t *testing.T) {
+	lockCodexHistoryTestHooks(t)
+	setTestUserCacheDir(t)
+	if cacheVersionDirName() == "v2" {
+		t.Fatal("fork classification changes must invalidate version-two session metadata")
+	}
+	root := os.Getenv(EnvCodexDir)
+	source := testSessionPath(t, root, "fork-versioned")
+	body := `{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"fork-versioned","cwd":"/project","source":"vscode","forked_from_id":"fork-parent"}}` + "\n" +
+		`{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"actual fork prompt"}]}}` + "\n"
+	if err := os.WriteFile(source, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	initial, err := readSessionFileMetaCached(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if initial.IsSubagent || initial.ParentThreadID != "fork-parent" {
+		t.Fatalf("initial metadata = %#v, want top-level fork with parent", initial)
+	}
+	currentPath, err := catalogSQLiteFileForSource(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := CloseCaches(); err != nil {
+		t.Fatal(err)
+	}
+	scope, err := persistentCacheWriterScopeID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldDir := filepath.Join(sharedPersistentCacheBase(root), "v2", scope)
+	if err := os.MkdirAll(oldDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	oldPath := filepath.Join(oldDir, cacheV2CatalogFile)
+	currentBytes, err := os.ReadFile(currentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(oldPath, currentBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldDB, err := sql.Open("sqlite", oldPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = oldDB.Close() })
+	if _, err := oldDB.Exec(`PRAGMA user_version = 2`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := oldDB.Exec(`UPDATE session_meta SET first_prompt = ?, is_subagent = 1,
+		subagent_type = 'thread_spawn' WHERE path = ?`, "stale cached prompt", source); err != nil {
+		t.Fatal(err)
+	}
+	if err := oldDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(currentPath); err != nil {
+		t.Fatal(err)
+	}
+	resetPersistentCacheStatesForTest()
+
+	meta, err := readSessionFileMetaCached(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if meta.IsSubagent || meta.SubagentType != "" || meta.ParentThreadID != "fork-parent" || meta.FirstPrompt != "actual fork prompt" {
+		t.Fatalf("metadata = %#v, want reparsed top-level fork from source JSONL", meta)
+	}
+	currentPath, err = catalogSQLiteFileForSource(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := filepath.Base(filepath.Dir(filepath.Dir(currentPath))); got != cacheVersionDirName() {
+		t.Fatalf("current catalog version directory = %q, want %q", got, cacheVersionDirName())
+	}
+}
+
 func TestCacheV2CloseCachesReleasesSQLiteFilesAndAllowsReopen(t *testing.T) {
 	setTestUserCacheDir(t)
 	root := os.Getenv(EnvCodexDir)
@@ -243,6 +322,41 @@ func TestSessionMetaCatalogPersistsAcrossProcessStateResetWithoutWriting(t *test
 	}
 	if before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
 		t.Fatalf("exact catalog hit changed database: before=%+v after=%+v", before, after)
+	}
+}
+
+func TestSessionMetaCatalogPersistsForkLineageWithoutSubagentClassification(t *testing.T) {
+	lockCodexHistoryTestHooks(t)
+	setTestUserCacheDir(t)
+	root := os.Getenv(EnvCodexDir)
+	source := testSessionPath(t, root, "fork-child")
+	body := `{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"fork-child","cwd":"/project","source":"vscode","forked_from_id":"fork-parent"}}` + "\n" +
+		`{"timestamp":"2026-01-01T00:00:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fork prompt"}]}}` + "\n"
+	if err := os.WriteFile(source, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := readSessionFileMetaCached(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.IsSubagent || first.SubagentType != "" || first.ParentThreadID != "fork-parent" {
+		t.Fatalf("parsed fork metadata = %#v, want top-level with retained parent", first)
+	}
+
+	resetSessionFileCache()
+	resetCatalogSQLiteForTest()
+	previousOpen := openSessionMetaFile
+	openSessionMetaFile = func(string) (*os.File, error) {
+		return nil, errors.New("exact catalog hit reparsed fork source")
+	}
+	t.Cleanup(func() { openSessionMetaFile = previousOpen })
+	second, err := readSessionFileMetaCached(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second != first {
+		t.Fatalf("persistent fork metadata = %#v, want %#v", second, first)
 	}
 }
 

@@ -139,14 +139,15 @@ func DiscoverProjectsContext(ctx context.Context, codexDir string) (projects []P
 		}
 
 		sess := Session{
-			SessionID:    sessionID,
-			ThreadName:   threadNames[sessionID],
-			FirstPrompt:  meta.FirstPrompt,
-			MessageCount: meta.MessageCount,
-			CreatedAt:    meta.CreatedAt,
-			ModifiedAt:   meta.ModifiedAt,
-			ProjectPath:  strings.TrimSpace(meta.ProjectPath),
-			FilePath:     filePath,
+			SessionID:       sessionID,
+			ParentSessionID: meta.ParentThreadID,
+			ThreadName:      threadNames[sessionID],
+			FirstPrompt:     meta.FirstPrompt,
+			MessageCount:    meta.MessageCount,
+			CreatedAt:       meta.CreatedAt,
+			ModifiedAt:      meta.ModifiedAt,
+			ProjectPath:     strings.TrimSpace(meta.ProjectPath),
+			FilePath:        filePath,
 		}
 
 		// Deduplicate by session ID, keep the more recent

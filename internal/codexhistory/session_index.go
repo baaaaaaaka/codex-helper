@@ -22,7 +22,7 @@ type sessionFileMeta struct {
 	ModifiedAt     time.Time
 	IsSubagent     bool
 	SubagentType   string // "thread_spawn", "review", "compact"
-	ParentThreadID string // only set for thread_spawn
+	ParentThreadID string // parent thread or fork source, when recorded
 }
 
 // codexEnvelope is the outer JSON structure of every line in a Codex JSONL file.
@@ -255,14 +255,15 @@ func processMetaLine(line []byte, meta *sessionFileMeta) {
 			if parentID == "" {
 				parentID = strings.TrimSpace(payload.ForkedFromID)
 			}
+			if parentID != "" {
+				meta.ParentThreadID = parentID
+			}
 			if isSub {
 				meta.IsSubagent = true
 				meta.SubagentType = subType
-				meta.ParentThreadID = parentID
-			} else if parentID != "" {
+			} else if strings.TrimSpace(payload.ParentThreadID) != "" {
 				meta.IsSubagent = true
 				meta.SubagentType = "thread_spawn"
-				meta.ParentThreadID = parentID
 			}
 		}
 

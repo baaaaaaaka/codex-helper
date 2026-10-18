@@ -254,12 +254,20 @@ func TestProcessMetaLine_SubagentFields(t *testing.T) {
 			wantSessionID:    "sess-parent-fallback",
 		},
 		{
-			name:             "forked-from fallback in session metadata",
+			name:             "fork source retains parent without becoming a subagent",
 			line:             `{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"sess-fork-fallback","cwd":"/x","forked_from_id":"parent-uuid"}}`,
-			wantIsSub:        true,
-			wantSubType:      "thread_spawn",
+			wantIsSub:        false,
+			wantSubType:      "",
 			wantParentThread: "parent-uuid",
 			wantSessionID:    "sess-fork-fallback",
+		},
+		{
+			name:             "explicit subagent remains a subagent when fork lineage is also present",
+			line:             `{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"sess-subagent-fork-lineage","cwd":"/x","source":{"subagent":{"thread_spawn":{"parent_thread_id":"subagent-parent","depth":2}}},"forked_from_id":"fork-source"}}`,
+			wantIsSub:        true,
+			wantSubType:      "thread_spawn",
+			wantParentThread: "subagent-parent",
+			wantSessionID:    "sess-subagent-fork-lineage",
 		},
 		{
 			name:          "source is null",
@@ -674,12 +682,14 @@ func TestDiscoverProjects_SubagentAssociation(t *testing.T) {
 
 	parentID := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 	childID := "11111111-2222-3333-4444-555555555555"
+	forkID := "22222222-3333-4444-5555-666666666666"
 	orphanID := "99999999-8888-7777-6666-555555555555"
 	ts := "2026-06-01T10:00:00Z"
 
 	writeSessionFile(t, sessionsDir, parentID, ts, projDir, `"cli"`, "hello parent")
 	writeSessionFile(t, sessionsDir, childID, ts, projDir,
 		`{"subagent":{"thread_spawn":{"parent_thread_id":"`+parentID+`","depth":1}}}`, "child task")
+	writeForkSessionFile(t, sessionsDir, forkID, ts, projDir, parentID, "fork task")
 	writeSessionFile(t, sessionsDir, orphanID, ts, projDir,
 		`{"subagent":"review"}`, "review task")
 
@@ -709,6 +719,17 @@ func TestDiscoverProjects_SubagentAssociation(t *testing.T) {
 		t.Errorf("child FirstPrompt = %q, want %q", parent.Subagents[0].FirstPrompt, "child task")
 	}
 
+	fork := findSession(all, forkID)
+	if fork == nil {
+		t.Fatal("fork should be discoverable as a top-level session")
+	}
+	if fork.ParentSessionID != parentID {
+		t.Errorf("fork parent = %q, want %q", fork.ParentSessionID, parentID)
+	}
+	if len(fork.Subagents) != 0 {
+		t.Errorf("fork has %d subagents, want none", len(fork.Subagents))
+	}
+
 	orphan := findSession(all, orphanID)
 	if orphan == nil {
 		t.Fatal("orphan subagent not found as top-level session")
@@ -717,10 +738,34 @@ func TestDiscoverProjects_SubagentAssociation(t *testing.T) {
 		t.Errorf("orphan Summary = %q, want [review subagent]", orphan.Summary)
 	}
 
-	// Child should NOT appear as a top-level session.
+	// True subagents remain nested; forks appear as independent top-level rows.
 	if findSession(all, childID) != nil {
 		t.Fatal("child subagent should not appear as top-level session")
 	}
+	graph := FlattenSessionGraph(projects)
+	var forkNode *SessionGraphNode
+	for i := range graph {
+		if graph[i].SessionID == forkID {
+			forkNode = &graph[i]
+			break
+		}
+	}
+	if forkNode == nil || forkNode.ParentSessionID != parentID {
+		t.Fatalf("fork graph node = %#v, want parent edge %q", forkNode, parentID)
+	}
+}
+
+func writeForkSessionFile(t *testing.T, sessionsDir, sessionID, ts, projectDir, forkedFromID, userMsg string) string {
+	t.Helper()
+	fname := "rollout-2026-01-01T00-00-00-" + sessionID + ".jsonl"
+	fpath := filepath.Join(sessionsDir, fname)
+	jsonDir := strings.ReplaceAll(projectDir, `\`, `\\`)
+	content := `{"timestamp":"` + ts + `","type":"session_meta","payload":{"id":"` + sessionID + `","cwd":"` + jsonDir + `","source":"vscode","forked_from_id":"` + forkedFromID + `"}}` + "\n"
+	content += `{"timestamp":"` + ts + `","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"` + userMsg + `"}]}}` + "\n"
+	if err := os.WriteFile(fpath, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return fpath
 }
 
 func TestDiscoverProjects_SubagentSortOrder(t *testing.T) {

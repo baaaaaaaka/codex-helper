@@ -2166,10 +2166,12 @@ func collectCodexSubagentUsageCandidates(nodes []codexhistory.SessionGraphNode, 
 	}
 	for _, node := range nodes {
 		parentID := strings.TrimSpace(node.ParentSessionID)
-		if !node.IsSubagent || parentID == "" || !reachable(node.SessionID) {
+		// Forks are parent-linked native child threads too, even though they are
+		// not subagents in the history/UI model.
+		if parentID == "" || !reachable(node.SessionID) {
 			continue
 		}
-		session := node.AsSubagentSession()
+		session := node.AsChildSession()
 		if len(codexhistory.FilterUserVisibleSubagentSessions([]codexhistory.SubagentSession{session})) == 0 {
 			continue
 		}

@@ -294,7 +294,9 @@ func TestReadSubagentTokenStatsAttributesNestedNativeChildrenToImmediateParents(
 		Path: tempDir,
 		Sessions: []codexhistory.Session{
 			{SessionID: "root", FilePath: parentPath, Subagents: []codexhistory.SubagentSession{child}},
-			{SessionID: "grandchild", ParentSessionID: "child", AgentID: "thread_spawn", Summary: "grandchild", FilePath: grandchildPath},
+			// A fork stays top-level and is not a subagent, but its parent edge
+			// still makes it a native child candidate for cumulative-prefix removal.
+			{SessionID: "grandchild", ParentSessionID: "child", Summary: "grandchild", FilePath: grandchildPath},
 			{SessionID: "unrelated-root", Subagents: []codexhistory.SubagentSession{{SessionID: "unrelated-child", ParentSessionID: "unrelated-root", AgentID: "thread_spawn", Summary: "unrelated", FilePath: filepath.Join(tempDir, "does-not-exist.jsonl")}}},
 		},
 	}}

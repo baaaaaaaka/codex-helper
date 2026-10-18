@@ -18,7 +18,9 @@ import (
 // It is not the cxp release version: bumping it means every cache database is
 // rebuilt in a new directory, while ordinary application upgrades reuse the
 // current cache unchanged.
-const cacheVersion = 2
+// Version 3 reparses session metadata because a fork source no longer implies
+// that the session is a subagent.
+const cacheVersion = 3
 
 const (
 	cacheV2CatalogFile      = "catalog.sqlite3"

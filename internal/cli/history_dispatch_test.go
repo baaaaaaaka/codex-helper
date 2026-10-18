@@ -532,6 +532,64 @@ func TestHistoryListCmdPrintsDiscoveredProjects(t *testing.T) {
 	}
 }
 
+func TestHistoryListCmdListsForkAsTopLevelSession(t *testing.T) {
+	codexDir := setupCodexHistoryDir(t)
+	parentID := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	forkID := "11111111-2222-3333-4444-555555555555"
+	subagentID := "22222222-3333-4444-5555-666666666666"
+	projectDir := t.TempDir()
+	writeCodexSessionFile(t, codexDir, parentID, projectDir, "parent prompt")
+	jsonProjectDir := strings.ReplaceAll(projectDir, `\`, `\\`)
+	sessionsDir := filepath.Join(codexDir, "sessions")
+	forkPath := filepath.Join(sessionsDir, "rollout-2026-03-10T10-01-00-"+forkID+".jsonl")
+	forkContent := `{"timestamp":"2026-03-10T10:01:00Z","type":"session_meta","payload":{"id":"` + forkID + `","cwd":"` + jsonProjectDir + `","source":"vscode","forked_from_id":"` + parentID + `"}}` + "\n" +
+		`{"timestamp":"2026-03-10T10:01:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"fork prompt"}]}}` + "\n"
+	if err := os.WriteFile(forkPath, []byte(forkContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	subagentPath := filepath.Join(sessionsDir, "rollout-2026-03-10T10-02-00-"+subagentID+".jsonl")
+	subagentContent := `{"timestamp":"2026-03-10T10:02:00Z","type":"session_meta","payload":{"id":"` + subagentID + `","cwd":"` + jsonProjectDir + `","source":{"subagent":{"thread_spawn":{"parent_thread_id":"` + parentID + `","depth":1}}}}}` + "\n" +
+		`{"timestamp":"2026-03-10T10:02:01Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"subagent prompt"}]}}` + "\n"
+	if err := os.WriteFile(subagentPath, []byte(subagentContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := newHistoryListCmd(&rootOptions{}, &codexDir)
+	cmd.SetContext(context.Background())
+	var out strings.Builder
+	cmd.SetOut(&out)
+	cmd.SetArgs([]string{"--pretty"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute history list: %v", err)
+	}
+	var payload struct {
+		Projects []codexhistory.Project `json:"projects"`
+	}
+	if err := json.Unmarshal([]byte(out.String()), &payload); err != nil {
+		t.Fatalf("unmarshal history list output: %v\noutput: %s", err, out.String())
+	}
+	if len(payload.Projects) != 1 {
+		t.Fatalf("projects = %d, want 1: %+v", len(payload.Projects), payload.Projects)
+	}
+	sessions := make(map[string]codexhistory.Session, len(payload.Projects[0].Sessions))
+	for _, session := range payload.Projects[0].Sessions {
+		sessions[session.SessionID] = session
+	}
+	parent, parentOK := sessions[parentID]
+	if !parentOK {
+		t.Fatalf("parent missing from top-level sessions: %+v", payload.Projects[0].Sessions)
+	}
+	if _, ok := sessions[forkID]; !ok {
+		t.Fatalf("fork missing from top-level sessions: %+v", payload.Projects[0].Sessions)
+	}
+	if len(sessions) != 2 {
+		t.Fatalf("top-level sessions = %d, want parent and fork: %+v", len(sessions), sessions)
+	}
+	if len(parent.Subagents) != 1 || parent.Subagents[0].SessionID != subagentID {
+		t.Fatalf("real subagent nesting = %+v, want only %s", parent.Subagents, subagentID)
+	}
+}
+
 func TestHistoryListCmdTracksCodexThreadNameIndex(t *testing.T) {
 	codexDir := setupCodexHistoryDir(t)
 	sessionID := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"

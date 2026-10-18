@@ -738,11 +738,13 @@ codex-proxy tui --codex-dir /path/to/.codex
 
 Session JSONL files remain authoritative. CXP keeps only rebuildable catalog and
 preview acceleration under the selected Codex data root at
-`CODEX_DIR/.codex-proxy/codexhistory/v2/<user-identity>/`. There is no separate
+`CODEX_DIR/.codex-proxy/codexhistory/v3/<user-identity>/`. There is no separate
 cache-directory setting: when a cluster places `CODEX_DIR` on larger or shared
 storage, the cache follows it automatically. Both SQLite databases use rollback
 journals instead of WAL, update only changed rows, and fall back to source JSONL
-when the cache directory is unavailable. Set
+when the cache directory is unavailable. The v3 namespace rebuilds the
+disposable history index, metadata, and preview caches from JSONL after the fork
+classification change. Set
 `CODEX_HELPER_PREVIEW_CACHE_BACKEND=off` only for diagnosis; the former `json`
 rollback value now uses SQLite and cannot re-enable whole-file JSON rewrites.
 
