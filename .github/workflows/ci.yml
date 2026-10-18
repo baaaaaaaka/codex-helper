@@ -940,6 +940,12 @@ jobs:
           go test ./internal/teams -count=1 -run "$asr_pattern" -v
           go test ./internal/cli -count=1 -run 'Test(TeamsASR(ArgsFromEnvAndServiceOverrides|TranscriberDefaultsToManagedQwenRuntime|TranscriberReadsManagedLlamaEnv)|TeamsCommandWiresPlannedSubcommands|TeamsServiceInstallPreservesScopedEnvironment)$' -v
 
+      - name: Setup managed ASR Python version for dependency availability
+        if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
       - name: Teams managed ASR dependency availability (Linux/macOS)
         if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
         shell: bash

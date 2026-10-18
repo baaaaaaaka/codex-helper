@@ -40384,11 +40384,16 @@ func TestBridgeMainLoopFlushesKnownQueuedBeforeSlowAmbiguousRecovery(t *testing.
 	var graphGets atomic.Int32
 	var graphPosts atomic.Int32
 	postStarted := make(chan struct{}, 1)
+	postFinished := make(chan struct{}, 1)
+	releaseSlowRecovery := make(chan struct{})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
 			graphGets.Add(1)
-			<-r.Context().Done()
+			select {
+			case <-r.Context().Done():
+			case <-releaseSlowRecovery:
+			}
 		case http.MethodPost:
 			if r.URL.Path != "/chats/chat-healthy/messages" {
 				return
@@ -40400,6 +40405,10 @@ func TestBridgeMainLoopFlushesKnownQueuedBeforeSlowAmbiguousRecovery(t *testing.
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = fmt.Fprint(w, `{"id":"known-queued-sent","messageType":"message"}`)
+			select {
+			case postFinished <- struct{}{}:
+			default:
+			}
 		default:
 			return
 		}
@@ -40414,24 +40423,48 @@ func TestBridgeMainLoopFlushesKnownQueuedBeforeSlowAmbiguousRecovery(t *testing.
 		jitter:     func(d time.Duration) time.Duration { return d },
 	}, store, &recordingExecutor{})
 	bridge.pollWorkerBudget = 25 * time.Millisecond
-	flushCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	flushCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	// Production main-loop phases retain a durable execution context after the
 	// short phase deadline.  Keep the direct test invocation on the same path so
 	// a slow ambiguous recovery cannot cancel the known queued message's final
 	// durable CAS on hosted runners.
 	flushCtx = withTeamsPhaseExecutionContext(flushCtx, context.Background())
-	flushErr := bridge.flushPendingOutboxMainLoop(flushCtx)
-	if flushErr == nil {
-		t.Fatal("flushPendingOutboxMainLoop unexpectedly settled the slow ambiguous recovery")
-	}
+	flushDone := make(chan struct{})
+	var flushErr error
+	go func() {
+		flushErr = bridge.flushPendingOutboxMainLoop(flushCtx)
+		close(flushDone)
+	}()
+	defer func() {
+		cancel()
+		select {
+		case <-flushDone:
+		case <-time.After(3 * time.Second):
+			t.Error("flushPendingOutboxMainLoop did not stop after cancellation")
+		}
+	}()
 	select {
 	case <-postStarted:
-	case <-time.After(200 * time.Millisecond):
-		t.Fatalf("known queued Graph POST did not start before slow recovery; gets=%d posts=%d err=%v", graphGets.Load(), graphPosts.Load(), flushErr)
+	case <-time.After(5 * time.Second):
+		t.Fatalf("known queued Graph POST did not start before slow recovery; gets=%d posts=%d", graphGets.Load(), graphPosts.Load())
+	}
+	select {
+	case <-postFinished:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("known queued Graph POST did not finish after starting; gets=%d posts=%d", graphGets.Load(), graphPosts.Load())
 	}
 	if graphPosts.Load() != 1 {
 		t.Fatalf("known queued Graph POST count=%d, want one", graphPosts.Load())
+	}
+	close(releaseSlowRecovery)
+	select {
+	case <-flushDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("flushPendingOutboxMainLoop did not settle after releasing slow recovery")
+	}
+	if flushErr == nil {
+		t.Fatal("flushPendingOutboxMainLoop unexpectedly settled the slow ambiguous recovery")
 	}
 	state, err := store.Load(ctx)
 	if err != nil {
