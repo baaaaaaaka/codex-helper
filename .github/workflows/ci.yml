@@ -305,7 +305,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if rg -n '\$\{\{[[:space:]]*secrets\.' .github/workflows; then
+          scan_workflows() {
+            local scan_status=0
+            grep "$@" .github/workflows || scan_status=$?
+            if [ "$scan_status" -gt 1 ]; then
+              exit "$scan_status"
+            fi
+            return "$scan_status"
+          }
+          if scan_workflows -RnE '\$\{\{[[:space:]]*secrets\.'; then
             echo "Repository CI must not read GitHub Actions secrets; use github.token only for repository-scoped release writes." >&2
             exit 1
           fi
@@ -317,7 +325,7 @@ jobs:
             "FILE_WRITE_TOKEN_CACHE""_JSON"
           )
           for credential_name in "${credential_names[@]}"; do
-            if rg -n --fixed-strings "$credential_name" .github/workflows; then
+            if scan_workflows -RnF -- "$credential_name"; then
               echo "Repository CI must not define external OpenAI, NVIDIA, proxy, or Teams credential input: $credential_name" >&2
               exit 1
             fi
@@ -1979,7 +1987,8 @@ jobs:
           # third-party model credential may be needed to reach the code path.
           foreach ($name in @(
             'GITHUB_TOKEN', 'GH_TOKEN', 'OPENAI_API_KEY', 'MIMO_API_KEY', 'ANTHROPIC_API_KEY',
-            'CODEX_LIVE_AUTH_JSON', 'CHATGPT_AUTH_TOKEN', 'CODEX_AUTH_TOKEN',
+            # This is a removal-only reference, like the guard's own name list.
+            ('CODEX_LIVE_AUTH' + '_JSON'), 'CHATGPT_AUTH_TOKEN', 'CODEX_AUTH_TOKEN',
             'CODEX_HELPER_TEAMS_TOKEN_CACHE', 'CODEX_HELPER_TEAMS_READ_TOKEN_CACHE',
             'CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE', 'CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE'
           )) {

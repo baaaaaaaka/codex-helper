@@ -2,8 +2,10 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import subprocess
 import tempfile
+import textwrap
 import unittest
 
 
@@ -33,6 +35,49 @@ def step_blocks(job: str) -> dict[str, str]:
 
 
 class TargetedShardWorkflowTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "POSIX credential guard")
+    def test_credential_guard_rejects_inputs_when_ripgrep_is_unavailable(self):
+        block = step_blocks(targeted_job())[
+            "Forbid external account credentials in repository CI (Linux only)"
+        ]
+        script = textwrap.dedent(block.split("        run: |\n", 1)[1])
+        shell, grep = shutil.which("bash"), shutil.which("grep")
+        self.assertIsNotNone(shell)
+        self.assertIsNotNone(grep)
+        with tempfile.TemporaryDirectory(prefix="cxp-credential-guard-") as temp_dir:
+            root = pathlib.Path(temp_dir)
+            tools = root / "bin"
+            tools.mkdir()
+            (tools / "grep").symlink_to(grep)
+            (tools / "rg").write_text("#!/bin/sh\nexit 127\n", encoding="utf-8")
+            (tools / "rg").chmod(0o755)
+            workflows = root / ".github" / "workflows"
+            workflows.mkdir(parents=True)
+            environment = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ.get("PATH", ""))
+            environment.pop("BASH_ENV", None)
+            for contents, allowed in (
+                ("name: safe\n", True),
+                ("token: ${{ secrets.TEST_TOKEN }}\n", False),
+                ("env: TEAMS_TOKEN_CACHE_JSON\n", False),
+            ):
+                (workflows / "test.yml").write_text(contents, encoding="utf-8")
+                result = subprocess.run(
+                    [shell, "-c", script], cwd=root, env=environment,
+                    text=True, capture_output=True,
+                )
+                self.assertEqual(result.returncode == 0, allowed, result.stderr)
+                if not allowed:
+                    self.assertIn("Repository CI must not", result.stderr)
+            # An unavailable or failing scanner must fail closed as well.
+            (tools / "grep").unlink()
+            (tools / "grep").write_text("#!/bin/sh\nexit 2\n", encoding="utf-8")
+            (tools / "grep").chmod(0o755)
+            result = subprocess.run(
+                [shell, "-c", script], cwd=root, env=environment,
+                text=True, capture_output=True,
+            )
+            self.assertEqual(result.returncode, 2)
+
     def test_managed_asr_dependency_checks_pin_python_on_every_platform(self):
         blocks = step_blocks(targeted_job())
         setup = blocks["Setup managed ASR Python version for dependency availability"]

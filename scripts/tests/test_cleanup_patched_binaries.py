@@ -42,6 +42,40 @@ class CleanupPatchedBinariesTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
+    def start_active_candidate(self) -> tuple[Path, subprocess.Popen]:
+        if not Path("/proc/self/exe").exists():
+            self.skipTest("requires Linux procfs")
+        binary = self.home / ".config" / "codex-proxy" / "codex-patched-active"
+        binary.parent.mkdir(parents=True)
+        # Use our known native interpreter instead of a renamed system utility:
+        # multicall launchers may redispatch by executable path, not argv[0].
+        shutil.copy2(Path("/proc/self/exe").resolve(), binary)
+        binary.chmod(0o755)
+        ready = self.root / "candidate-ready"
+        environment = dict(os.environ, PYTHONHOME=sys.base_prefix)
+        environment.pop("PYTHONPATH", None)
+        environment["LD_LIBRARY_PATH"] = os.pathsep.join(
+            filter(None, (str(Path(sys.base_prefix) / "lib"), environment.get("LD_LIBRARY_PATH")))
+        )
+        code = (
+            "import pathlib, time; "
+            f"pathlib.Path({str(ready)!r}).write_text('ready'); time.sleep(30)"
+        )
+        process = subprocess.Popen([str(binary), "-S", "-c", code], env=environment)
+        try:
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                self.assertIsNone(process.poll(), "native fixture exited before readiness")
+                if ready.exists():
+                    self.assertEqual(os.stat(f"/proc/{process.pid}/exe").st_ino, binary.stat().st_ino)
+                    return binary, process
+                time.sleep(0.01)
+            self.fail("native fixture did not report readiness")
+        except BaseException:
+            process.terminate()
+            process.wait(timeout=5)
+            raise
+
     def cleaner(
         self,
         *,
@@ -866,26 +900,8 @@ class CleanupPatchedBinariesTests(unittest.TestCase):
         )
 
     def test_active_candidate_is_reported_without_killing_it(self) -> None:
-        sleep = shutil.which("sleep")
-        if not sleep or not Path("/proc").is_dir():
-            self.skipTest("requires sleep and procfs")
-        binary = self.home / ".config" / "codex-proxy" / "codex-patched-active"
-        binary.parent.mkdir(parents=True)
-        shutil.copy2(sleep, binary)
-        binary.chmod(0o755)
-        # Multicall coreutils dispatches by argv[0]; keep its sleep identity
-        # while executing the copied candidate inode that the audit inspects.
-        process = subprocess.Popen(["sleep", "30"], executable=str(binary))
+        binary, process = self.start_active_candidate()
         try:
-            deadline = time.monotonic() + 2
-            while time.monotonic() < deadline:
-                try:
-                    if os.stat(f"/proc/{process.pid}/exe").st_ino == os.stat(binary).st_ino:
-                        break
-                except OSError:
-                    pass
-                time.sleep(0.01)
-            self.assertIsNone(process.poll(), "copied sleep fixture exited before audit")
             report = self.cleaner(purge=True).run()
             self.assertFalse(report["clean"])
             self.assertIsNone(process.poll())
@@ -898,26 +914,10 @@ class CleanupPatchedBinariesTests(unittest.TestCase):
             process.wait(timeout=5)
 
     def test_terminate_active_only_stops_exact_candidate_then_cleans_it(self) -> None:
-        sleep = shutil.which("sleep")
-        if not sleep or not Path("/proc").is_dir():
-            self.skipTest("requires sleep and procfs")
-        binary = self.home / ".config" / "codex-proxy" / "codex-patched-active"
-        binary.parent.mkdir(parents=True)
-        shutil.copy2(sleep, binary)
-        binary.chmod(0o755)
-        process = subprocess.Popen(["sleep", "30"], executable=str(binary))
+        binary, process = self.start_active_candidate()
         waiter = threading.Thread(target=process.wait, daemon=True)
         waiter.start()
         try:
-            deadline = time.monotonic() + 2
-            while time.monotonic() < deadline:
-                try:
-                    if os.stat(f"/proc/{process.pid}/exe").st_ino == os.stat(binary).st_ino:
-                        break
-                except OSError:
-                    pass
-                time.sleep(0.01)
-            self.assertIsNone(process.poll(), "copied sleep fixture exited before audit")
             report = self.cleaner(purge=True, terminate_active=True).run()
             waiter.join(timeout=5)
             self.assertTrue(report["clean"], report)
