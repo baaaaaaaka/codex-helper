@@ -714,6 +714,12 @@ echo 'ok'
             2,
             f"{fixture_name} must be both process-isolated and host-exclusive",
         )
+        targeted = targeted_job()
+        self.assertIn(f"-skip '^{fixture_name}$'", targeted)
+        self.assertIn(
+            f"go test ./internal/teams -count=1 -parallel=1 -run '^{fixture_name}$' -v",
+            targeted,
+        )
 
     def test_full_go_runner_isolates_cli_process_group_fixture(self):
         runner = FULL_GO_TEST_SHARDS.read_text(encoding="utf-8")

@@ -609,7 +609,10 @@ jobs:
           go test ./internal/teams/machineregistry -count=1 -v
           go test ./cmd/teams-registry-probe -count=1 -v
           go test ./internal/cli -count=1 -run 'Test(Delegate|CandidatesFromMachineStatuses|RootCommandWiresExpectedSubcommandsAndFlags|RootUpgradeCodexApp)' -v
-          go test ./internal/teams -count=1 -run 'Test(BridgeMachine(Registry|Delegation).*|Graph(CreateOrGetMeetingChat(UsesStableExternalID|WindowUsesProvidedWindow)|OnlineMeetingWindowRefresh))$' -v
+          # Match the full-test runner's clean-process boundary for the short
+          # asynchronous durable cancellation observation.
+          go test ./internal/teams -count=1 -skip '^TestBridgeMachineDelegationWorkerCancelsRunningExecution$' -run 'Test(BridgeMachine(Registry|Delegation).*|Graph(CreateOrGetMeetingChat(UsesStableExternalID|WindowUsesProvidedWindow)|OnlineMeetingWindowRefresh))$' -v
+          go test ./internal/teams -count=1 -parallel=1 -run '^TestBridgeMachineDelegationWorkerCancelsRunningExecution$' -v
 
       - name: Responses adapter provider compatibility regressions
         if: matrix.shard == 'core'

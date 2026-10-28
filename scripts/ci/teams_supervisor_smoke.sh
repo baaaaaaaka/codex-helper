@@ -2,7 +2,9 @@
 set -Eeuo pipefail
 
 # Keep room for systemctl's runtime socket suffix below the Unix socket limit.
-root="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/cxp-ts.XXXXXX")"
+smoke_temp_base="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
+mkdir -p "$smoke_temp_base"
+root="$(mktemp -d "$smoke_temp_base/cxp-ts.XXXXXX")"
 
 # Linux abstract sockets avoid sockaddr_un path limits when RUNNER_TEMP is long.
 # Leave this unique address unbound so the fallback probes see connection refused.
