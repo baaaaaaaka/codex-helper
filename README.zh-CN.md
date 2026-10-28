@@ -208,7 +208,7 @@ codex-proxy proxy doctor
 | `codex-proxy proxy start [profile]` | 启动长期运行的 proxy daemon |
 | `codex-proxy proxy list` | 列出已知 proxy instances |
 | `codex-proxy proxy stop <instance-id>` | 停止一个 proxy instance |
-| `codex-proxy proxy prune` | 移除 dead/unhealthy instances |
+| `codex-proxy proxy prune` | 清理失效记录，保留活进程、启动租约和恢复熔断记录 |
 | `codex-proxy proxy reset` | 清除已保存的代理设置，并尝试停止已知 daemons，让下次启动重新询问 |
 | `codex-proxy proxy doctor` | 报告环境问题和安装提示 |
 | `codex-proxy teams status` | 显示 Teams helper state、control chat、service、owner 和 queue 状态 |
@@ -1295,6 +1295,13 @@ ambiguous history 时会拒绝操作；对 in-place Claude patch 只恢复 execu
 codex-proxy proxy start [profile]
 codex-proxy proxy list
 ```
+
+`proxy list` 只读查询已保存实例，以及当前配置中各 profile 的 app-gateway 登记，
+检查本地监听器并展示故障原因，不探测外部目标。`LAST_SEEN` 是已保存的心跳或更新时间，
+不是本次检查时间。历史 dead 记录仍会显示。`proxy prune` 会保留后端正在恢复的活进程、
+启动租约，以及持久化的恢复熔断记录。
+app-gateway 行用于诊断；`proxy stop` 和 `proxy prune` 仍操作已保存实例，
+不管理 app-gateway 登记。
 
 普通 `run`、`history open` 和从 TUI 启动的 sessions 使用 private proxy stacks。只有用
 `proxy start` 启动的 instances 会跨 sessions shared/reused。

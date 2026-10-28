@@ -220,7 +220,7 @@ walk through the normal flows in order.
 | `codex-proxy proxy start [profile]` | Start a long-lived proxy daemon |
 | `codex-proxy proxy list` | List known proxy instances |
 | `codex-proxy proxy stop <instance-id>` | Stop a proxy instance |
-| `codex-proxy proxy prune` | Remove dead/unhealthy instances |
+| `codex-proxy proxy prune` | Remove dead records; preserve live owners, startup leases and recovery blocks |
 | `codex-proxy proxy reset` | Clear saved proxy setup and attempt to stop known daemons so the next launch asks again |
 | `codex-proxy proxy doctor` | Report environment issues and installation hints |
 | `codex-proxy teams status` | Show Teams helper state, control chat, service, owner, and queue status |
@@ -1564,6 +1564,15 @@ Start a reusable daemon instance:
 codex-proxy proxy start [profile]
 codex-proxy proxy list
 ```
+
+`proxy list` reads saved instances and app-gateway registrations for profiles in
+the selected config without changing state. It checks local listener health,
+shows failure details, and does not probe external destinations. `LAST_SEEN` is
+the saved heartbeat/update timestamp, not the time of this check. Historical dead
+records remain visible. `proxy prune` preserves live processes even when their
+backends are recovering, as well as startup leases and durable recovery blocks.
+App gateway rows are informational; `proxy stop` and `proxy prune` operate on
+saved instances, not app gateway registrations.
 
 Normal `run`, `history open`, and TUI-launched sessions use private proxy stacks.
 Only instances started with `proxy start` are shared/reused across sessions.

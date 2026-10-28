@@ -13,7 +13,6 @@ import (
 	"runtime"
 	"strings"
 	"syscall"
-	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -56,6 +55,7 @@ var (
 	proxyHeartbeat            = manager.Heartbeat
 	proxyHeartbeatOwned       = manager.HeartbeatOwned
 	proxyProcessAlive         = proc.IsAlive
+	proxyProcessStatus        = proc.CheckAlive
 	proxyLooksLikeProxyDaemon = proc.LooksLikeProxyDaemon
 	proxyFindProcess          = os.FindProcess
 	proxyTerminate            = terminateProcess
@@ -478,56 +478,13 @@ func newProxyListCmd(root *rootOptions) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "list",
 		Short: "List known proxy instances",
-		Args:  cobra.NoArgs,
+		Long: "List saved proxy instances and app gateways for profiles in the selected config. " +
+			"Checks local listener health without probing external destinations or changing state. " +
+			"Private session proxy stacks are not registered here. LAST_SEEN is the saved record timestamp. " +
+			"App gateway rows are informational; proxy stop/prune operate on saved instances.",
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			store, _, err := newRootStore(root, "")
-			if err != nil {
-				return err
-			}
-			cfg, err := store.Load()
-			if err != nil {
-				return err
-			}
-
-			w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 4, 2, ' ', 0)
-			_, _ = fmt.Fprintln(w, "INSTANCE\tTYPE\tPROFILE\tPID\tHTTP\tSOCKS\tSTATUS\tLAST_SEEN")
-			for _, inst := range cfg.Instances {
-				status := "dead"
-				if inst.DaemonPID > 0 && proxyProcessAlive(inst.DaemonPID) {
-					status = "alive"
-					if inst.HTTPPort > 0 {
-						if err := proxyCheckHTTPProxy(healthClientForProxyInstance(cfg, inst, 500*time.Millisecond), inst.HTTPPort, inst.ID); err != nil {
-							status = "unhealthy"
-						}
-					}
-				}
-				profileName := inst.ProfileID
-				for _, p := range cfg.Profiles {
-					if p.ID == inst.ProfileID {
-						profileName = p.Name
-						break
-					}
-				}
-				instanceType := inst.Kind
-				if instanceType == "" {
-					instanceType = "legacy"
-				}
-
-				_, _ = fmt.Fprintf(
-					w,
-					"%s\t%s\t%s\t%d\t%d\t%d\t%s\t%s\n",
-					inst.ID,
-					instanceType,
-					profileName,
-					inst.DaemonPID,
-					inst.HTTPPort,
-					inst.SocksPort,
-					status,
-					inst.LastSeenAt.Format(time.RFC3339),
-				)
-			}
-			_ = w.Flush()
-			return nil
+			return runProxyList(cmd, root)
 		},
 	}
 	return cmd
@@ -616,7 +573,7 @@ func newProxyStopCmd(root *rootOptions) *cobra.Command {
 func newProxyPruneCmd(root *rootOptions) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "prune",
-		Short: "Remove dead/unhealthy proxy instances from config",
+		Short: "Remove dead proxy records, preserving live owners, startup leases and recovery blocks",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			store, _, err := newRootStore(root, "")
@@ -625,25 +582,25 @@ func newProxyPruneCmd(root *rootOptions) *cobra.Command {
 			}
 
 			removed := 0
+			unchanged := errors.New("no dead proxy records")
 
 			if err := store.Update(func(cfg *config.Config) error {
 				out := cfg.Instances[:0]
+				now := proxyNow()
 				for _, inst := range cfg.Instances {
-					if inst.DaemonPID <= 0 || !proxyProcessAlive(inst.DaemonPID) {
+					alive, inspectErr := proxyProcessStatus(inst.DaemonPID)
+					if !inst.RecoveryBudget.Blocked && !proxyInstanceStarting(inst, now) && !alive && inspectErr == nil {
 						removed++
 						continue
-					}
-					if inst.HTTPPort > 0 {
-						if err := proxyCheckHTTPProxy(healthClientForProxyInstance(*cfg, inst, 500*time.Millisecond), inst.HTTPPort, inst.ID); err != nil {
-							removed++
-							continue
-						}
 					}
 					out = append(out, inst)
 				}
 				cfg.Instances = out
+				if removed == 0 {
+					return unchanged
+				}
 				return nil
-			}); err != nil {
+			}); err != nil && !errors.Is(err, unchanged) {
 				return err
 			}
 

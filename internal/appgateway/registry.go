@@ -191,12 +191,26 @@ func (r *Registry) Load(profileID string) (Registration, error) {
 	defer func() { _ = lock.Unlock() }()
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.loadLocked(profileID)
+	return r.readRegistration(profileID)
 }
 
-// loadLocked reads a registration while the caller holds both the per-profile
-// registration lock and r.mu.
-func (r *Registry) loadLocked(profileID string) (Registration, error) {
+// LoadReadOnly reads an atomic registration snapshot without creating a directory
+// or acquiring a lifecycle lock. Diagnostics must not repair or rewrite state.
+func LoadReadOnly(dir, profileID string) (Registration, error) {
+	dir = strings.TrimSpace(dir)
+	profileID = strings.TrimSpace(profileID)
+	if dir == "" || filepath.Clean(dir) == "." || profileID == "" {
+		return Registration{}, fmt.Errorf("%w: directory and profile id are required", ErrInvalidRegistration)
+	}
+	r := &Registry{dir: filepath.Clean(dir)}
+	reg, err := r.readRegistration(profileID)
+	if err == nil && reg.ProfileID != profileID {
+		return Registration{}, fmt.Errorf("%w: registration belongs to a different profile", ErrInvalidRegistration)
+	}
+	return reg, err
+}
+
+func (r *Registry) readRegistration(profileID string) (Registration, error) {
 	path := r.path(profileID)
 	b, err := os.ReadFile(path)
 	if err == nil {
@@ -261,7 +275,7 @@ func (r *Registry) ensure(ctx context.Context, profileID, fingerprint string, pr
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	reg, err := r.loadLocked(profileID)
+	reg, err := r.readRegistration(profileID)
 	if err == nil {
 		changed := false
 		if preferredPort > 0 && preferredPort != reg.HTTPPort && reg.State != StateReady && reg.LastReadyAt.IsZero() && reg.OwnerPID == 0 {

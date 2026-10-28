@@ -53,10 +53,10 @@
 Proxy profiles are SSH/network profiles for reaching another machine. They are not beacon execution profiles.
 
 - `cxp proxy`: manage local proxy profile configuration.
-- `cxp proxy list`: list proxy profiles and running instances.
+- `cxp proxy list`: read-only listing of saved instances and app gateways for profiles in the selected config; checks local health and shows failure details. Private session stacks are not registered. `LAST_SEEN` is the saved record timestamp.
 - `cxp proxy start <profile>`: start or reuse a proxy instance.
-- `cxp proxy stop <instance>`: stop a proxy instance.
-- `cxp proxy prune`: clean stale instances.
+- `cxp proxy stop <instance>`: stop a saved proxy instance; app-gateway rows in `proxy list` are informational and are not managed by this command.
+- `cxp proxy prune`: remove dead records, preserving live processes (including recovering backends), startup leases and durable recovery blocks.
 - `cxp proxy reset` or `cxp proxy clear`: clear saved proxy profiles, preference, and known instances, then attempt to stop known proxy daemons so the next launch asks whether to configure proxy mode again.
 - `cxp proxy doctor`: diagnose local proxy dependencies and configuration.
 

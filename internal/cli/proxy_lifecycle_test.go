@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/appgateway"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 	"github.com/baaaaaaaka/codex-helper/internal/manager"
 	"github.com/baaaaaaaka/codex-helper/internal/stack"
@@ -530,22 +531,19 @@ func TestProxyListReportsAliveUnhealthyAndDead(t *testing.T) {
 		t.Fatalf("seed config: %v", err)
 	}
 
-	prevAlive := proxyProcessAlive
-	prevCheck := proxyCheckHTTPProxy
+	prevAlive := proxyProcessStatus
+	prevCheck := proxyListProbe
 	t.Cleanup(func() {
-		proxyProcessAlive = prevAlive
-		proxyCheckHTTPProxy = prevCheck
+		proxyProcessStatus = prevAlive
+		proxyListProbe = prevCheck
 	})
 
-	proxyProcessAlive = func(pid int) bool { return pid != 33 }
-	proxyCheckHTTPProxy = func(_ manager.HealthClient, port int, expectedInstanceID string) error {
+	proxyProcessStatus = func(pid int) (bool, error) { return pid != 33, nil }
+	proxyListProbe = func(_ context.Context, port int, _ time.Duration) (appgateway.Health, error) {
 		if port == 18082 {
-			return errors.New("health failed")
+			return appgateway.Health{InstanceID: "inst-bad", Error: "health failed"}, nil
 		}
-		if expectedInstanceID == "" {
-			t.Fatal("expected instance id for health check")
-		}
-		return nil
+		return appgateway.Health{OK: true, InstanceID: "inst-alive"}, nil
 	}
 
 	cmd := newProxyListCmd(&rootOptions{configPath: store.Path()})
@@ -567,7 +565,7 @@ func TestProxyListReportsAliveUnhealthyAndDead(t *testing.T) {
 	assertLineContains(t, text, "inst-dead", "missing")
 }
 
-func TestProxyPruneRemovesDeadAndUnhealthyInstances(t *testing.T) {
+func TestProxyPrunePreservesLiveUnhealthyInstances(t *testing.T) {
 	lockCLITestHooks(t)
 	store := newTempStore(t)
 	if err := store.Save(config.Config{
@@ -581,18 +579,16 @@ func TestProxyPruneRemovesDeadAndUnhealthyInstances(t *testing.T) {
 		t.Fatalf("seed config: %v", err)
 	}
 
-	prevAlive := proxyProcessAlive
+	prevAlive := proxyProcessStatus
 	prevCheck := proxyCheckHTTPProxy
 	t.Cleanup(func() {
-		proxyProcessAlive = prevAlive
+		proxyProcessStatus = prevAlive
 		proxyCheckHTTPProxy = prevCheck
 	})
 
-	proxyProcessAlive = func(pid int) bool { return pid != 0 }
+	proxyProcessStatus = func(pid int) (bool, error) { return pid != 0, nil }
 	proxyCheckHTTPProxy = func(_ manager.HealthClient, port int, _ string) error {
-		if port == 18082 {
-			return errors.New("health failed")
-		}
+		t.Error("prune must not probe routes or use transient health to delete live owners")
 		return nil
 	}
 
@@ -605,7 +601,7 @@ func TestProxyPruneRemovesDeadAndUnhealthyInstances(t *testing.T) {
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("execute proxy prune: %v", err)
 	}
-	if !strings.Contains(out.String(), "Pruned 2 instances") {
+	if !strings.Contains(out.String(), "Pruned 1 instances") {
 		t.Fatalf("expected prune summary, got %q", out.String())
 	}
 
@@ -613,8 +609,8 @@ func TestProxyPruneRemovesDeadAndUnhealthyInstances(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	if len(cfg.Instances) != 1 || cfg.Instances[0].ID != "inst-ok" {
-		t.Fatalf("expected only healthy instance to remain, got %+v", cfg.Instances)
+	if len(cfg.Instances) != 2 || cfg.Instances[0].ID != "inst-ok" || cfg.Instances[1].ID != "inst-bad" {
+		t.Fatalf("expected both live instances to remain, got %+v", cfg.Instances)
 	}
 }
 

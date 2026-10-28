@@ -55,6 +55,76 @@ func TestRegistryRejectsCorruptAndInvalidState(t *testing.T) {
 	}
 }
 
+func TestRegistryLoadReadOnlyDoesNotCreateStateOrWaitForLock(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "missing")
+	if _, err := LoadReadOnly(dir, "p1"); !errors.Is(err, ErrRegistrationNotFound) {
+		t.Fatalf("missing read error = %v", err)
+	}
+	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("read created state directory: %v", err)
+	}
+	r, err := NewRegistry(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg, err := r.Ensure(context.Background(), "p1", "fp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock := flock.New(r.lockPath("p1"))
+	if err := lock.Lock(); err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Unlock()
+	before, err := os.Stat(r.path("p1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadReadOnly(r.Dir(), "p1")
+	if err != nil || got.ID != reg.ID {
+		t.Fatalf("snapshot = %+v/%v", got, err)
+	}
+	after, err := os.Stat(r.path("p1"))
+	if err != nil || !os.SameFile(before, after) || !before.ModTime().Equal(after.ModTime()) {
+		t.Fatalf("read rewrote state: %v", err)
+	}
+}
+
+func TestRegistryLoadReadOnlyValidatesScopeAndReadsBackupWithoutRepair(t *testing.T) {
+	r, err := NewRegistry(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	reg, err := r.Ensure(context.Background(), "p1", "fp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Save(reg); err != nil {
+		t.Fatal(err)
+	} // Creates a valid backup.
+	if err := os.WriteFile(r.path("p1"), []byte("broken"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadReadOnly(r.Dir(), "p1")
+	if err != nil || got.ID != reg.ID {
+		t.Fatalf("backup snapshot = %+v/%v", got, err)
+	}
+	raw, err := os.ReadFile(r.path("p1"))
+	if err != nil || string(raw) != "broken" {
+		t.Fatalf("diagnostic repaired primary: %q/%v", raw, err)
+	}
+	backup, err := os.ReadFile(r.path("p1") + ".bak")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(r.path("other-profile"), backup, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LoadReadOnly(r.Dir(), "other-profile"); !errors.Is(err, ErrInvalidRegistration) {
+		t.Fatalf("wrong-profile snapshot accepted: %v", err)
+	}
+}
+
 func TestRegistryFirstMigrationMayAdoptLegacyPortButReadyPortIsImmutable(t *testing.T) {
 	r, err := NewRegistry(t.TempDir())
 	if err != nil {

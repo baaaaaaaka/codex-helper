@@ -12,17 +12,27 @@ import (
 )
 
 func IsAlive(pid int) bool {
+	alive, _ := CheckAlive(pid)
+	return alive
+}
+
+// CheckAlive distinguishes a confirmed exit from an inspection failure. Cleanup
+// callers must preserve a process record when its existence cannot be checked.
+func CheckAlive(pid int) (bool, error) {
 	if pid <= 0 {
-		return false
+		return false, nil
 	}
 	err := syscall.Kill(pid, 0)
 	if err != nil {
-		return false
+		if errors.Is(err, syscall.ESRCH) {
+			return false, nil
+		}
+		return false, err
 	}
 	if runtime.GOOS != "linux" {
-		return true
+		return true, nil
 	}
-	return !isLinuxZombie(pid)
+	return !isLinuxZombie(pid), nil
 }
 
 func isLinuxZombie(pid int) bool {
