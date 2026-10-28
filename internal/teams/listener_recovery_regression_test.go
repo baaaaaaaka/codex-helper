@@ -81,7 +81,7 @@ type listenerRecoveryGraphState struct {
 	continuationEntered     chan struct{}
 	continuationRelease     chan struct{}
 	continuationOnce        sync.Once
-	delayOnceCanceled       chan struct{}
+	delayOnceCanceled       chan time.Duration
 	delayOnceCancelOnce     sync.Once
 	delayOnceStarted        chan struct{}
 	delayOnceStartOnce      sync.Once
@@ -292,7 +292,7 @@ func newListenerRecoveryGraph(t *testing.T, delays map[string]time.Duration, mes
 						if requestNumber == 1 && firstDelay > 0 {
 							state.delayOnceCancelOnce.Do(func() {
 								if state.delayOnceCanceled != nil {
-									close(state.delayOnceCanceled)
+									state.delayOnceCanceled <- time.Since(readAt)
 								}
 							})
 						}
@@ -4033,7 +4033,7 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 	graphState.getFailures = map[string]int{"chat-1": 1000}
 	firstDelayStarted := make(chan struct{})
 	graphState.delayOnceStarted = firstDelayStarted
-	firstDelayCanceled := make(chan struct{})
+	firstDelayCanceled := make(chan time.Duration, 1)
 	graphState.delayOnceCanceled = firstDelayCanceled
 	store := newBridgeTestStore(t)
 	executor := &listenerRecoveryExecutor{
@@ -4053,10 +4053,9 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 	bridge.lastHistoryWatchSync = maintenanceSkipUntil
 	bridge.lastHistoryWatchReconcile = maintenanceSkipUntil
 	bridge.lastSQLiteWALCheckpoint = maintenanceSkipUntil
-	// Force the mutation grace to expire during the first canceled Graph read;
-	// the production refresh-after-I/O path must still leave enough time to
-	// abandon the attempt before the next listener cycle.
-	bridge.pollAttemptDurableGrace = 500 * time.Millisecond
+	// Retain the production durable mutation grace for cleanup and later healthy
+	// delivery. The measured first Graph delay below must still exceed that
+	// grace, so the refresh-after-I/O regression cannot silently lose coverage.
 	listenerRecoverySeedDuePoll(t, store, bridge.reg.ControlChatID, now)
 	listenerRecoverySeedDuePoll(t, store, "chat-1", now)
 
@@ -4068,8 +4067,8 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 	// configured Graph budget larger than that slice so this test verifies the
 	// worker's cooperative cutoff and durable attempt cleanup, rather than
 	// relying on the phase itself to wait for a canceled worker.
-	options.PhaseBudget = 10 * time.Second
-	options.PollWorkerBudget = 12 * time.Second
+	options.PhaseBudget = mainLoopPhaseBudget
+	options.PollWorkerBudget = 2 * options.PhaseBudget
 	listener := startListenerRecovery(t, bridge, options)
 	select {
 	case <-firstDelayStarted:
@@ -4078,7 +4077,11 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 		t.Fatalf("phase-timeout Graph request did not start; gets=%d phase=%#v", graphState.getCount("chat-1"), bridge.mainLoopPhaseStatsSnapshot("poll"))
 	}
 	select {
-	case <-firstDelayCanceled:
+	case elapsed := <-firstDelayCanceled:
+		if elapsed <= pollAttemptDurableMutationGrace {
+			listener.stop(t)
+			t.Fatalf("first canceled Graph read lasted %s, want longer than the production durable grace %s", elapsed, pollAttemptDurableMutationGrace)
+		}
 	case <-time.After(options.PhaseBudget + 2*time.Second):
 		listener.stop(t)
 		t.Fatalf("phase-timeout Graph request did not observe cancellation after admission; gets=%d phase=%#v", graphState.getCount("chat-1"), bridge.mainLoopPhaseStatsSnapshot("poll"))
@@ -4127,14 +4130,18 @@ func TestTeamsListenFalsePollPhaseTimeoutDoesNotPoisonNextCycle(t *testing.T) {
 		listener.stop(t)
 		t.Fatalf("next-cycle poll after phase timeout did not dispatch; gets=%d calls=%#v state=%#v phase=%#v", graphState.getCount("chat-1"), executor.callsSnapshot(), state, bridge.mainLoopPhaseStatsSnapshot("poll"))
 	}
-	waitListenerRecovery(t, func() bool {
+	if !waitListenerRecoveryResult(func() bool {
 		for _, sent := range graphState.sentSnapshot() {
 			if strings.Contains(PlainTextFromTeamsHTML(sent.Body), "LISTENER_RECOVERY_PHASE_TIMEOUT_FINAL") {
 				return true
 			}
 		}
 		return false
-	}, listenerRecoveryDurableIOProgressTimeout, "phase-timeout final delivery")
+	}, listenerRecoveryDurableIOProgressTimeout) {
+		state, loadErr := store.Load(context.Background())
+		listener.stop(t)
+		t.Fatalf("phase-timeout final delivery stalled; state=%#v load-err=%v sent=%#v graph-errors=%#v poll-phase=%#v outbox-phase=%#v listener-err=%v", state, loadErr, graphState.sentSnapshot(), graphState.errorsSnapshot(), bridge.mainLoopPhaseStatsSnapshot("poll"), bridge.mainLoopPhaseStatsSnapshot("outbox"), listener.err)
+	}
 	messageModifiedAt, err := time.Parse(time.RFC3339Nano, message.LastModifiedDateTime)
 	if err != nil {
 		t.Fatalf("parse phase-timeout message timestamp: %v", err)
