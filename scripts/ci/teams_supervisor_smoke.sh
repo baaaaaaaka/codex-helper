@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-root="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/codex-helper-teams-supervisor-smoke-$$"
-mkdir -p "$root"
+# Keep room for systemctl's runtime socket suffix below the Unix socket limit.
+root="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/cxp-ts.XXXXXX")"
+
+# Linux abstract sockets avoid sockaddr_un path limits when RUNNER_TEMP is long.
+# Leave this unique address unbound so the fallback probes see connection refused.
+unavailable_user_bus_address="unix:abstract=cxp-ci-no-user-bus-$$-$RANDOM"
 
 log() {
   printf '[teams-supervisor-smoke] %s\n' "$*"
@@ -343,7 +347,7 @@ EOF
     "XDG_CACHE_HOME=$cache_home"
     "XDG_STATE_HOME=$state_home"
     "XDG_RUNTIME_DIR=$runtime_dir"
-    "DBUS_SESSION_BUS_ADDRESS=unix:path=$smoke/no-user-bus"
+    "DBUS_SESSION_BUS_ADDRESS=$unavailable_user_bus_address"
     "CODEX_PROXY_DEBUG=1"
     "HTTP_PROXY=http://127.0.0.1:9"
     "HTTPS_PROXY=http://127.0.0.1:9"
@@ -479,7 +483,7 @@ local_supervisor_bootstrap_auto_fallback_smoke() {
     "XDG_CACHE_HOME=$cache_home"
     "XDG_STATE_HOME=$state_home"
     "XDG_RUNTIME_DIR=$runtime_dir"
-    "DBUS_SESSION_BUS_ADDRESS=unix:path=$smoke/no-user-bus"
+    "DBUS_SESSION_BUS_ADDRESS=$unavailable_user_bus_address"
   )
   env -i "${bootstrap_env[@]}" "$cxp" teams service bootstrap --no-start >"$smoke/bootstrap.log" 2>&1
   if ! grep -q 'local-supervisor-no-start' "$smoke/bootstrap.log"; then

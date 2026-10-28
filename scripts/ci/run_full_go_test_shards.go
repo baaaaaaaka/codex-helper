@@ -201,6 +201,10 @@ var isolatedRunnableNames = map[string]map[string]bool{
 		"TestSQLiteHotPollWorkAdmissionKeepsRoutableUntrustedSessionFallback":      true,
 		"TestSQLiteHotPollReadyCanonicalFallbackReleasesStoreLockDuringRead":       true,
 		"TestSQLiteMalformedSessionDoesNotDisableHealthyHotPollAdmission":          true,
+		// Opaque retry-gate durability also uses the bounded compatibility lane.
+		// Preserve its production budget while isolating it from broad shard I/O.
+		"TestSQLiteOpaquePollRetryGateSurvivesWithoutRewritingRawEvidence": true,
+		"TestSQLiteEmptyOpaquePollRetryGateSurvivesReopen":                 true,
 		// These tests deliberately observe the first phase of a SQLite
 		// compatibility/fallback operation.  Their correctness depends on a
 		// short hook/legacy-lane window, so broad race-shard I/O must not turn a
@@ -374,6 +378,8 @@ var exclusiveRunnableNames = map[string]map[string]bool{
 		"TestSQLiteHotPollWorkAdmissionKeepsRoutableUntrustedSessionFallback":                  true,
 		"TestSQLiteHotPollReadyCanonicalFallbackReleasesStoreLockDuringRead":                   true,
 		"TestSQLiteMalformedSessionDoesNotDisableHealthyHotPollAdmission":                      true,
+		"TestSQLiteOpaquePollRetryGateSurvivesWithoutRewritingRawEvidence":                     true,
+		"TestSQLiteEmptyOpaquePollRetryGateSurvivesReopen":                                     true,
 		"TestSQLiteHotPollCorruptProbeRejectsNonRFC3339Times":                                  true,
 		"TestSQLiteHotPollRecoveryHashFenceRejectsMissingAndReplacedPoll":                      true,
 		"TestSQLiteHotPollAdmissionFallbackKeepsHealthyRowsOnScalarLane":                       true,
