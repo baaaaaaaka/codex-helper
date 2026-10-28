@@ -1262,6 +1262,13 @@ func TestTeamsListenFalseUntrustedSQLiteLeaseHoldsAndRecovers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reopen lease-hold SQLite fixture for repair: %v", err)
 	}
+	// This external repair races the live listener's short transactions. Match
+	// the store's bounded busy wait on the connection used for the UPDATE.
+	db.SetMaxOpenConns(1)
+	if _, err := db.ExecContext(ctx, `PRAGMA busy_timeout = 5000`); err != nil {
+		_ = db.Close()
+		t.Fatalf("configure lease repair busy wait: %v", err)
+	}
 	if _, err := db.ExecContext(ctx, `UPDATE runtime_state SET json = ? WHERE key = ?`, validLease, "control_lease"); err != nil {
 		_ = db.Close()
 		t.Fatalf("repair control lease: %v", err)

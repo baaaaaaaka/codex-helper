@@ -33,6 +33,22 @@ def step_blocks(job: str) -> dict[str, str]:
 
 
 class TargetedShardWorkflowTests(unittest.TestCase):
+    def test_managed_asr_dependency_checks_pin_python_on_every_platform(self):
+        blocks = step_blocks(targeted_job())
+        setup = blocks["Setup managed ASR Python version for dependency availability"]
+        self.assertIn("if: matrix.shard == 'platform-integration'\n", setup)
+        self.assertIn("id: managed-asr-python", setup)
+        self.assertIn('python-version: "3.10"', setup)
+
+        windows = blocks["Teams managed ASR dependency availability (Windows)"]
+        self.assertIn("steps.managed-asr-python.outputs.python-path", windows)
+        self.assertIn("sys.version_info[:2] == (3, 10)", windows)
+        self.assertNotIn("py -3", windows)
+        for package in ("qwen-asr", "imageio-ffmpeg", "torch"):
+            self.assertIn(
+                f"$out = & $managedAsrPython -m pip index versions {package}", windows
+            )
+
     def test_full_runner_partitions_cover_every_runnable_job_exactly_once(self):
         with tempfile.TemporaryDirectory(prefix="cxp-ci-shard-runner-") as temp_dir:
             runner_path = pathlib.Path(temp_dir) / (

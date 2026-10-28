@@ -944,7 +944,8 @@ jobs:
           go test ./internal/cli -count=1 -run 'Test(TeamsASR(ArgsFromEnvAndServiceOverrides|TranscriberDefaultsToManagedQwenRuntime|TranscriberReadsManagedLlamaEnv)|TeamsCommandWiresPlannedSubcommands|TeamsServiceInstallPreservesScopedEnvironment)$' -v
 
       - name: Setup managed ASR Python version for dependency availability
-        if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
+        if: matrix.shard == 'platform-integration'
+        id: managed-asr-python
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
@@ -1041,7 +1042,8 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
-          py -3 -c "import sys, venv; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)"
+          $managedAsrPython = "${{ steps.managed-asr-python.outputs.python-path }}"
+          & $managedAsrPython -c "import sys, venv; raise SystemExit(0 if sys.version_info[:2] == (3, 10) else 1)"
           function Invoke-Retry([scriptblock]$Command) {
             for ($attempt = 1; $attempt -le 3; $attempt++) {
               try {
@@ -1056,15 +1058,15 @@ jobs:
             }
           }
           Invoke-Retry {
-            $out = py -3 -m pip index versions qwen-asr
+            $out = & $managedAsrPython -m pip index versions qwen-asr
             if (-not ($out | Select-String -SimpleMatch "0.0.6")) { throw "qwen-asr 0.0.6 not listed" }
           }
           Invoke-Retry {
-            $out = py -3 -m pip index versions imageio-ffmpeg
+            $out = & $managedAsrPython -m pip index versions imageio-ffmpeg
             if (-not ($out | Select-String -SimpleMatch "0.6.0")) { throw "imageio-ffmpeg 0.6.0 not listed" }
           }
           Invoke-Retry {
-            $out = py -3 -m pip index versions torch
+            $out = & $managedAsrPython -m pip index versions torch
             if (-not ($out | Select-String -Pattern "2\.(4|5|6|7|8|9|10|11|12)\.")) { throw "supported torch version not listed" }
           }
           function Test-ManagedASRAsset([string]$Url) {
