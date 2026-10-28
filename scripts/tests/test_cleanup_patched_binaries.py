@@ -873,7 +873,9 @@ class CleanupPatchedBinariesTests(unittest.TestCase):
         binary.parent.mkdir(parents=True)
         shutil.copy2(sleep, binary)
         binary.chmod(0o755)
-        process = subprocess.Popen([str(binary), "30"])
+        # Multicall coreutils dispatches by argv[0]; keep its sleep identity
+        # while executing the copied candidate inode that the audit inspects.
+        process = subprocess.Popen(["sleep", "30"], executable=str(binary))
         try:
             deadline = time.monotonic() + 2
             while time.monotonic() < deadline:
@@ -883,6 +885,7 @@ class CleanupPatchedBinariesTests(unittest.TestCase):
                 except OSError:
                     pass
                 time.sleep(0.01)
+            self.assertIsNone(process.poll(), "copied sleep fixture exited before audit")
             report = self.cleaner(purge=True).run()
             self.assertFalse(report["clean"])
             self.assertIsNone(process.poll())
@@ -902,7 +905,7 @@ class CleanupPatchedBinariesTests(unittest.TestCase):
         binary.parent.mkdir(parents=True)
         shutil.copy2(sleep, binary)
         binary.chmod(0o755)
-        process = subprocess.Popen([str(binary), "30"])
+        process = subprocess.Popen(["sleep", "30"], executable=str(binary))
         waiter = threading.Thread(target=process.wait, daemon=True)
         waiter.start()
         try:
@@ -914,6 +917,7 @@ class CleanupPatchedBinariesTests(unittest.TestCase):
                 except OSError:
                     pass
                 time.sleep(0.01)
+            self.assertIsNone(process.poll(), "copied sleep fixture exited before audit")
             report = self.cleaner(purge=True, terminate_active=True).run()
             waiter.join(timeout=5)
             self.assertTrue(report["clean"], report)
