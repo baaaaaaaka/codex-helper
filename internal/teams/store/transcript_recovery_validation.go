@@ -13,20 +13,8 @@ const (
 	ExecutionAnchorProvenanceLegacy      = "legacy_unknown"
 )
 
-func ExecutionAnchorIsRuntime(anchor *ExecutionAnchor) bool {
-	return anchor != nil && strings.TrimSpace(anchor.Provenance) == ExecutionAnchorProvenanceRuntime
-}
-
 func ExecutionAnchorIsHistoryOnly(anchor *ExecutionAnchor) bool {
 	return anchor != nil && strings.TrimSpace(anchor.Provenance) == ExecutionAnchorProvenanceHistoryOnly
-}
-
-func ExecutionAnchorIsLegacyUnknown(anchor *ExecutionAnchor) bool {
-	if anchor == nil {
-		return false
-	}
-	provenance := strings.TrimSpace(anchor.Provenance)
-	return provenance == "" || provenance == ExecutionAnchorProvenanceLegacy
 }
 
 // These exported predicates are the store boundary used by JSON/SQLite

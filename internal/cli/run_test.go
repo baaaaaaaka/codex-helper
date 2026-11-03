@@ -972,23 +972,6 @@ func TestRunLikeAAAIsPerInvocationAndReachesOnlyCodexBroker(t *testing.T) {
 	}
 }
 
-func codexOverrideValue(t *testing.T, args []string, key string) string {
-	t.Helper()
-	prefix := key + "="
-	for i := 0; i+1 < len(args); i++ {
-		if args[i] != "-c" {
-			continue
-		}
-		value, ok := strings.CutPrefix(args[i+1], prefix)
-		if !ok {
-			continue
-		}
-		return strings.Trim(value, `"`)
-	}
-	t.Fatalf("missing codex override %q in args: %v", key, args)
-	return ""
-}
-
 func TestRunLikePersistsProxyEnabledAfterProfileSetup(t *testing.T) {
 	lockCLITestHooks(t)
 

@@ -570,15 +570,6 @@ func InspectRuntimeStoreForScopeWithRegistry(
 	return plan, nil
 }
 
-func executeLegacyOnlyMigrationContext(ctx context.Context, scope teamstore.ScopeIdentity, sourcePath string) (string, error) {
-	return executeLegacyOnlyMigrationContextWithOptions(
-		ctx,
-		scope,
-		sourcePath,
-		runtimeStoreMigrationOptions{},
-	)
-}
-
 func executeLegacyOnlyMigrationContextWithOptions(
 	ctx context.Context,
 	scope teamstore.ScopeIdentity,
@@ -1113,14 +1104,6 @@ func copyThreadLinkMigrationJournal(targetPath string, sourcePath string, source
 	return nil
 }
 
-func validateRuntimeStoreMigrationStaging(ctx context.Context, scope teamstore.ScopeIdentity, stagingPath string, sourcePath string) error {
-	layout, err := migrationSourceLayoutForStore(sourcePath)
-	if err != nil {
-		return err
-	}
-	return validateRuntimeStoreMigrationStagingWithLayout(ctx, scope, stagingPath, layout)
-}
-
 func validateRuntimeStoreMigrationStagingWithLayout(ctx context.Context, scope teamstore.ScopeIdentity, stagingPath string, layout migrationSourceLayout) error {
 	stagingStore, err := teamstore.Open(stagingPath)
 	if err != nil {
@@ -1275,14 +1258,6 @@ func migrationBackupPath(sourcePath string, scopeID string) string {
 	return filepath.Join(teamsRoot, "migration-backups", safeScopePathPart(scopeID), filepath.Base(clean))
 }
 
-func preflightLegacyQuarantineTargets(scopeID string, sourcePath string) error {
-	layout, err := migrationSourceLayoutForStore(sourcePath)
-	if err != nil {
-		return err
-	}
-	return preflightMigrationQuarantineTargets(scopeID, layout)
-}
-
 func preflightMigrationQuarantineTargets(scopeID string, layout migrationSourceLayout) error {
 	sourcePath := layout.StorePath
 	if !scopedStoreMigrationSource(sourcePath) {
@@ -1346,10 +1321,6 @@ func inspectMigrationQuarantinePath(path string, directory bool, role string) (b
 	return true, nil
 }
 
-func preflightMigrationSource(ctx context.Context, scope teamstore.ScopeIdentity, layout migrationSourceLayout) (migrationSourcePreflight, error) {
-	return preflightMigrationSourceWithRegistry(ctx, scope, layout, "")
-}
-
 func preflightMigrationSourceWithRegistry(
 	ctx context.Context,
 	scope teamstore.ScopeIdentity,
@@ -1376,19 +1347,6 @@ func preflightMigrationSourceWithRegistry(
 		Metadata:      metadata,
 		SourceScopeID: strings.TrimSpace(metadata.Scope.ID),
 	}, nil
-}
-
-func validateOfflineRuntimeStoreWriterStopped(ctx context.Context, scope teamstore.ScopeIdentity, sourcePath string) error {
-	layout, err := migrationSourceLayoutForStore(sourcePath)
-	if err != nil {
-		return err
-	}
-	_, err = preflightMigrationSource(ctx, scope, layout)
-	return err
-}
-
-func validateOfflineRuntimeStoreWriterMetadata(scope teamstore.ScopeIdentity, sourcePath string, metadata ScopeStoreMetadata) error {
-	return validateOfflineRuntimeStoreWriterMetadataWithRegistry(scope, sourcePath, metadata, "")
 }
 
 func validateOfflineRuntimeStoreWriterMetadataWithRegistry(
@@ -1449,14 +1407,6 @@ func validateRuntimeStoreWriterStoppedMetadata(role string, metadata ScopeStoreM
 		))
 	}
 	return nil
-}
-
-func clearConfirmedStoppedOwnerFromMigrationTarget(ctx context.Context, sourcePath string, targetPath string) error {
-	metadata, err := ProbeScopeMetadataReadOnly(ctx, sourcePath)
-	if err != nil {
-		return err
-	}
-	return clearConfirmedStoppedOwnerMetadataFromMigrationTarget(ctx, metadata, targetPath)
 }
 
 func clearConfirmedStoppedOwnerMetadataFromMigrationTarget(ctx context.Context, metadata ScopeStoreMetadata, targetPath string) error {
@@ -1857,17 +1807,6 @@ func completeOfflineRuntimeStoreTakeoverWithOptions(
 	}
 	if err := removeRuntimeStoreMigrationCleanup(canonicalPath); err != nil {
 		return err
-	}
-	return nil
-}
-
-func validateCanonicalRuntimeStoreForScope(ctx context.Context, scope teamstore.ScopeIdentity, path string) error {
-	state, err := teamstore.LoadPathReadOnly(ctx, path)
-	if err != nil {
-		return fmt.Errorf("validate canonical Teams store %s: %w", path, err)
-	}
-	if strings.TrimSpace(state.Scope.ID) != strings.TrimSpace(scope.ID) || !scopeStateMatches(scope, state) {
-		return fmt.Errorf("canonical Teams store %s identity does not match scope %q", path, scope.ID)
 	}
 	return nil
 }

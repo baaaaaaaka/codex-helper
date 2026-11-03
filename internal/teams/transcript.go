@@ -380,19 +380,6 @@ func readSessionTranscriptSinceFast(filePath string, afterKey string) (Transcrip
 	return transcript, true, nil
 }
 
-func checkpointLineMatches(line []byte, lineNo int, afterKey string, state transcriptParseState, sourceName string) bool {
-	_, _, ok := checkpointLineMatchRecords(line, lineNo, afterKey, state, sourceName)
-	return ok
-}
-
-func checkpointLineMatchRecords(line []byte, lineNo int, afterKey string, state transcriptParseState, sourceName string) ([]TranscriptRecord, int, bool) {
-	records, indices := checkpointLineMatchIndices(line, lineNo, afterKey, state, sourceName)
-	if len(indices) != 1 {
-		return records, -1, false
-	}
-	return records, indices[0], true
-}
-
 // checkpointLineMatchIndices returns every logical record on one physical
 // JSONL line that could satisfy the checkpoint key.  A source ID is normally
 // unique, but a turn/completed envelope can expand into several logical items

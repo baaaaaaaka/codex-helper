@@ -553,18 +553,6 @@ func (s Store) EnsureInbox(ctx context.Context, cache Cache, machineID string) (
 	return next, chat, meeting, written, nil
 }
 
-func (s Store) OpenInboxRef(ctx context.Context, inboxRef string) (Chat, OnlineMeeting, error) {
-	if s.Graph == nil {
-		return Chat{}, OnlineMeeting{}, fmt.Errorf("registry graph is required")
-	}
-	inboxRef = strings.TrimSpace(inboxRef)
-	if inboxRef == "" {
-		return Chat{}, OnlineMeeting{}, fmt.Errorf("inbox ref is required")
-	}
-	now := s.now()
-	return s.Graph.CreateOrGetMeetingChatWindow(ctx, s.inboxSubject(""), inboxRef, now.Add(-5*time.Minute), now.Add(s.windowDuration()))
-}
-
 func (s Store) RefreshMeeting(ctx context.Context, cache Cache) (Cache, bool, error) {
 	if s.Graph == nil {
 		return cache, false, fmt.Errorf("registry graph is required")

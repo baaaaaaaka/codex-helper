@@ -425,16 +425,6 @@ func knownTurnStatus(status TurnStatus) bool {
 	}
 }
 
-func knownInboundStatus(status InboundStatus) bool {
-	switch InboundStatus(strings.TrimSpace(string(status))) {
-	case "", InboundStatusPersisted, InboundStatusQueued, InboundStatusIgnored,
-		InboundStatusDeferred, InboundStatusManualHold, InboundStatusUncertain:
-		return true
-	default:
-		return false
-	}
-}
-
 func knownOutboxStatus(status OutboxStatus) bool {
 	switch OutboxStatus(strings.TrimSpace(string(status))) {
 	case "", OutboxStatusQueued, OutboxStatusSending, OutboxStatusAccepted,
@@ -3013,10 +3003,6 @@ func newJSONOutboxFIFOSnapshotProof(state State, msg OutboxMessage) *OutboxFIFOS
 		proof.jsonPredecessors[id] = outboxFIFOProofHash(candidate)
 	}
 	return proof
-}
-
-func (proof *OutboxFIFOSnapshotProof) jsonSnapshotMatchesState(state *State, msg OutboxMessage) bool {
-	return proof.jsonSnapshotMismatchReason(state, msg) == ""
 }
 
 func (proof *OutboxFIFOSnapshotProof) jsonSnapshotMismatchReason(state *State, msg OutboxMessage) string {
@@ -7679,18 +7665,6 @@ func (s *Store) UpdateIfChanged(ctx context.Context, fn func(*State) (bool, erro
 	return s.updateIfChangedWithCapability(ctx, storeOwnerCapability{}, fn)
 }
 
-// UpdateIfChangedForOwner applies a full-state compatibility update only while
-// the supplied control-lease capability is current. The state/file lock keeps
-// the capability check and the save in one critical section, so a takeover
-// cannot be followed by a stale JSON write from the previous owner.
-func (s *Store) UpdateIfChangedForOwner(ctx context.Context, machineID string, leaseGeneration int64, fn func(*State) (bool, error)) error {
-	capability, err := newStoreOwnerCapability(machineID, leaseGeneration)
-	if err != nil {
-		return err
-	}
-	return s.updateIfChangedWithCapability(ctx, capability, fn)
-}
-
 func (s *Store) updateIfChangedWithCapability(ctx context.Context, capability storeOwnerCapability, fn func(*State) (bool, error)) error {
 	if err := s.ensureSQLiteSchemaPreparedForUse(ctx); err != nil {
 		return err
@@ -8146,14 +8120,6 @@ func (s *Store) SetOutboxFairCursorForOwner(ctx context.Context, cursor string, 
 	return out, s.UpdateIfChanged(ctx, apply)
 }
 
-// SetBacklogFairCursorForOwner records one bounded history/linked scheduler
-// cursor under the current control-lease fence. A stale worker may finish a
-// source scan, but it must not move the successor's cursor backwards and
-// recreate starvation after a restart.
-func (s *Store) SetBacklogFairCursorForOwner(ctx context.Context, lane string, cursor string, machineID string, leaseGeneration int64) (ServiceControl, error) {
-	return s.setBacklogFairCursorForOwner(ctx, lane, cursor, "", false, machineID, leaseGeneration)
-}
-
 // SetBacklogFairCursorForOwnerExpected combines the control-lease fence with
 // an exact cursor CAS. A worker may have selected a bounded source window
 // while another same-generation worker advanced the durable hint; in that
@@ -8223,14 +8189,6 @@ func (s *Store) setBacklogFairCursorForOwner(ctx context.Context, lane string, c
 		return out, err
 	}
 	return out, s.UpdateIfChanged(ctx, apply)
-}
-
-// SetAmbiguousOutboxRecoveryCursor records the bounded cold reconciliation
-// hint for callers that do not carry a listener owner capability (for example,
-// a direct maintenance API). The production listener uses the owner-fenced
-// variant below.
-func (s *Store) SetAmbiguousOutboxRecoveryCursor(ctx context.Context, cursor string) (ServiceControl, error) {
-	return s.setAmbiguousOutboxRecoveryCursor(ctx, cursor, "", false, storeOwnerCapability{}, false)
 }
 
 // SetAmbiguousOutboxRecoveryCursorExpected advances the cold reconciliation
@@ -12129,27 +12087,6 @@ func unresolvedExecutionAnchorLocked(state *State, sessionID string) (ExecutionA
 	return *checkpoint.UnresolvedExecution, true
 }
 
-func transcriptQuarantineActive(checkpoint ImportCheckpoint) bool {
-	return checkpoint.TranscriptQuarantine != nil
-}
-
-// transcriptQuarantineBlocksAutomaticProgress distinguishes an opaque parser
-// gap from an execution/ownership ambiguity. The former has a durable
-// newline-bounded disposition and may be crossed by the physical cursor; the
-// latter remains a history frontier until an explicit recovery command chooses
-// the boundary. Neither kind participates in live admission.
-func transcriptQuarantineBlocksAutomaticProgress(quarantine *TranscriptQuarantine) bool {
-	if quarantine == nil {
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(quarantine.Kind)) {
-	case "malformed_record", "opaque_record", "oversized_record", "stale_partial_record":
-		return false
-	default:
-		return true
-	}
-}
-
 // liveBranchThreadIDLocked returns the already-admitted thread for a real
 // execution anchor. Transcript quarantine is deliberately excluded: it is a
 // history observation and must never become a live execution owner merely by
@@ -13492,17 +13429,6 @@ func (s *Store) MarkTurnFailedWithExecutionProof(ctx context.Context, req Execut
 		return out, err
 	}
 	return s.updateTurn(ctx, req.OuterTurnID, apply)
-}
-
-func currentExecutionAnchorGeneration(state *State, sessionID string) int64 {
-	if state == nil {
-		return 0
-	}
-	checkpoint, found := state.ImportCheckpoints[sessionTranscriptCheckpointID(strings.TrimSpace(sessionID))]
-	if !found || !importCheckpointHasUnresolvedExecution(checkpoint) || checkpoint.UnresolvedExecution == nil {
-		return 0
-	}
-	return checkpoint.UnresolvedExecution.Generation
 }
 
 func executionFailureAnchorRequest(state *State, identity ExecutionFailureIdentity) (ExecutionAnchorClearRequest, bool) {
@@ -16472,18 +16398,6 @@ func markOutboxSkippedLocked(state *State, msg OutboxMessage, reason string, now
 	}
 }
 
-// RetireLegacyHistoryGateOutbox removes obsolete automatic history-policy
-// notices after the caller has quiesced the sender. It includes active
-// sending rows because a stopped service has no legitimate sender left for
-// those rows; accepted/sent rows remain untouched. SQLite performs at most
-// maxPages short keyset transactions so a large unrelated outbox prefix does
-// not hold the database connection or liveness path for an unbounded scan.
-// Callers that require an exact post-cleanup answer must use
-// HasPendingLegacyHistoryGateOutbox after cleanup.
-func (s *Store) RetireLegacyHistoryGateOutbox(ctx context.Context, pageSize int, maxPages int) (int, error) {
-	return s.retireLegacyHistoryGateOutbox(ctx, pageSize, maxPages, true, storeOwnerCapability{})
-}
-
 // RetireLegacyHistoryGateOutboxForStartup retires queued and lease-expired
 // legacy notices while leaving a fresh Sending row alone. A control-lease
 // takeover does not prove that a previous process's Graph POST has returned;
@@ -16566,25 +16480,6 @@ func (s *Store) HasPendingLegacyHistoryGateOutbox(ctx context.Context) (bool, er
 		}
 	}
 	return false, nil
-}
-
-func (s *Store) markLegacyHistoryGateOutboxSkipped(ctx context.Context, outboxID string, includeActiveSending bool) (OutboxMessage, bool, error) {
-	changed := false
-	update := func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
-		if !legacyHistoryGateNoticeRetirable(msg, now, includeActiveSending) {
-			return msg, nil
-		}
-		updated, err := markOutboxSkippedLocked(state, msg, "obsolete automatic history-gate notice", now)
-		if err == nil && updated.Status == OutboxStatusSkipped && msg.Status != OutboxStatusSkipped {
-			changed = true
-		}
-		return updated, err
-	}
-	if out, handled, err := s.updateOutboxSQLite(ctx, strings.TrimSpace(outboxID), false, true, update); handled || err != nil {
-		return out, changed, err
-	}
-	out, err := s.updateOutbox(ctx, outboxID, update)
-	return out, changed, err
 }
 
 func markOutboxSkippedForAttemptLocked(state *State, msg OutboxMessage, attemptToken string, reason string, now time.Time) (OutboxMessage, error) {
@@ -16864,35 +16759,6 @@ func (s *Store) MarkOutboxAttachmentMessagePostRejectedForAttempt(ctx context.Co
 		msg.AttachmentMessagePostState = "pending"
 		msg.AttachmentMessagePostAttemptToken = ""
 		return markOutboxSendErrorLocked(state, msg, attemptToken, reason, now, true, false)
-	}
-	if out, handled, err := s.updateOutboxSQLite(ctx, outboxID, false, true, update); handled || err != nil {
-		return out, err
-	}
-	return s.updateOutbox(ctx, outboxID, update)
-}
-
-// ClearOutboxDriveItemForAttempt forgets a remote DriveItem that Graph has
-// conclusively reported as deleted. The caller must have an exact, definitive
-// missing-item error: before the Teams chat POST it is a normal replayable
-// upload, and after the POST was marked started it is safe only for the narrow
-// case where Graph proved that the referenced DriveItem no longer exists. The
-// attempt fence keeps a stale worker from clearing a newer upload's identity.
-func (s *Store) ClearOutboxDriveItemForAttempt(ctx context.Context, outboxID string, attemptToken string) (OutboxMessage, error) {
-	outboxID = strings.TrimSpace(outboxID)
-	attemptToken = strings.TrimSpace(attemptToken)
-	if outboxID == "" || attemptToken == "" {
-		return OutboxMessage{}, ErrOutboxSendNotClaimed
-	}
-	update := func(state *State, msg OutboxMessage, now time.Time) (OutboxMessage, error) {
-		if msg.Status != OutboxStatusSending || strings.TrimSpace(msg.SendAttemptToken) != attemptToken ||
-			(msg.AttachmentMessagePostState != "pending" && msg.AttachmentMessagePostState != "started") {
-			return msg, ErrOutboxSendNotClaimed
-		}
-		if err := validateOutboxOwnerCapability(state, msg); err != nil {
-			return msg, err
-		}
-		clearOutboxDriveItemLocked(state, &msg, now)
-		return msg, nil
 	}
 	if out, handled, err := s.updateOutboxSQLite(ctx, outboxID, false, true, update); handled || err != nil {
 		return out, err
@@ -17380,16 +17246,6 @@ func (s *Store) MarkOutboxSent(ctx context.Context, outboxID string, teamsMessag
 
 func (s *Store) MarkOutboxSentForAttempt(ctx context.Context, outboxID string, attemptToken string, teamsMessageID string) (OutboxMessage, error) {
 	return s.markOutboxSent(ctx, outboxID, attemptToken, teamsMessageID, true, false)
-}
-
-// MarkOutboxSentAfterSourceProof is the fast final-delivery CAS for a Bridge
-// that has just performed its forced source proof immediately before this
-// call. The store still validates the attempt, execution ownership, and
-// persisted source-rewrite fence atomically, but deliberately does not read
-// the transcript file while holding the store lock. A caller must use the
-// ordinary MarkOutboxSent method when it has not performed that proof.
-func (s *Store) MarkOutboxSentAfterSourceProof(ctx context.Context, outboxID string, teamsMessageID string) (OutboxMessage, error) {
-	return s.markOutboxSent(ctx, outboxID, "", teamsMessageID, false, true)
 }
 
 // MarkOutboxSentForAttemptAfterSourceProof is the attempt-scoped variant used

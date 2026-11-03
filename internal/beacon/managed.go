@@ -366,28 +366,6 @@ func readyMachineForAllocation(st State, req AllocationRequest, now time.Time) (
 	return Machine{}, false
 }
 
-func machineLooksReadyForSnapshot(machine Machine, snap TargetSnapshot, now time.Time) bool {
-	if !strings.EqualFold(strings.TrimSpace(machine.State), string(LeaseAccepting)) {
-		return false
-	}
-	if machine.ExternalOwned {
-		return false
-	}
-	if !workerHeartbeatFresh(machine, now) {
-		return false
-	}
-	if !machineDoctorAccepts(machine) {
-		return false
-	}
-	if strings.TrimSpace(snap.Signature) != "" && strings.TrimSpace(machine.Execution.Hash) != strings.TrimSpace(snap.Signature) {
-		return false
-	}
-	if !leaseTTLAccepts(machine, now) {
-		return false
-	}
-	return true
-}
-
 func MachineCanAcceptAllocation(machine Machine, req AllocationRequest, now time.Time) bool {
 	if !strings.EqualFold(strings.TrimSpace(machine.State), string(LeaseAccepting)) {
 		return false

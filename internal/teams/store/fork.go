@@ -710,13 +710,6 @@ func (s *Store) ClaimForkOperation(ctx context.Context, operationID string, mach
 	return out, err
 }
 
-func (s *Store) SaveForkManifest(ctx context.Context, operationID string, items []ForkHistoryItem, sourcePath string, sourceFingerprint string) (ForkOperation, error) {
-	return s.SaveForkManifestWithMetadata(ctx, operationID, items, ForkManifestMetadata{
-		SourcePath:        sourcePath,
-		SourceFingerprint: sourceFingerprint,
-	})
-}
-
 func (s *Store) SaveForkManifestWithMetadata(ctx context.Context, operationID string, items []ForkHistoryItem, metadata ForkManifestMetadata) (ForkOperation, error) {
 	return s.saveForkManifestWithMetadata(ctx, operationID, items, metadata, nil)
 }

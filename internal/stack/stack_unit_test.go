@@ -504,13 +504,6 @@ func TestReservationEnsuresDifferentPorts(t *testing.T) {
 // Start retry / canRetry behaviour
 // ---------------------------------------------------------------------------
 
-// fakeSSHScript returns a shell script that increments a counter file and
-// then blocks indefinitely. Requires /usr/bin/sleep; callers should skip
-// if it is unavailable.
-func fakeSSHScript(counterFile string) string {
-	return fmt.Sprintf("#!/bin/sh\necho x >> '%s'\nexec /usr/bin/sleep 30\n", counterFile)
-}
-
 // fakeFailingSSHScript returns a shell script that increments a counter file
 // and then exits immediately with a failure code. This makes tunnel startup
 // deterministically fail before the SOCKS port can become ready.

@@ -619,21 +619,6 @@ func dockerRealDataAmbiguousExecutionOutboxes(state teamstore.State) []teamstore
 	return rows
 }
 
-func dockerRealDataAmbiguousOutboxesForChat(state teamstore.State, chatID string) []teamstore.OutboxMessage {
-	chatID = strings.TrimSpace(chatID)
-	rows := make([]teamstore.OutboxMessage, 0)
-	for _, outbox := range state.OutboxMessages {
-		if strings.TrimSpace(outbox.TeamsChatID) != chatID || !teamstore.OutboxSendIsAmbiguous(outbox) {
-			continue
-		}
-		rows = append(rows, outbox)
-	}
-	sort.Slice(rows, func(i, j int) bool {
-		return strings.TrimSpace(rows[i].ID) < strings.TrimSpace(rows[j].ID)
-	})
-	return rows
-}
-
 type dockerRealDataUnknownPostWitness struct {
 	OutboxID    string `json:"outbox_id"`
 	ChatID      string `json:"chat_id"`
@@ -1614,10 +1599,6 @@ func (w *dockerRealDataTraceWriter) recordTiming(name string, elapsed time.Durat
 		aggregate.Errors++
 	}
 	w.timings[name] = aggregate
-}
-
-func (w *dockerRealDataTraceWriter) timingAggregatesSummary() string {
-	return w.timingAggregatesSummaryFor()
 }
 
 func (w *dockerRealDataTraceWriter) timingAggregatesSummaryFor(prefixes ...string) string {
@@ -4627,15 +4608,6 @@ type dockerRealDataSyntheticTurnObservation struct {
 	UpdatedAt       time.Time
 }
 
-func dockerRealDataTurnIsNonTerminal(status teamstore.TurnStatus) bool {
-	switch status {
-	case teamstore.TurnStatusQueued, teamstore.TurnStatusRunning, teamstore.TurnStatusInterrupted:
-		return true
-	default:
-		return false
-	}
-}
-
 func dockerRealDataTurnNeedsBoundaryRepair(status teamstore.TurnStatus) bool {
 	switch status {
 	case teamstore.TurnStatusQueued, teamstore.TurnStatusRunning:
@@ -6625,11 +6597,6 @@ func TestDockerRealDataCountsFromSQLiteHydratesOnlySyntheticTurns(t *testing.T) 
 	if got != want {
 		t.Fatalf("synthetic SQLite counts = %#v, want %#v", got, want)
 	}
-}
-
-func dockerRealDataDurableCorrelation(ctx context.Context, path string, requireCompleted bool) (int64, error) {
-	audit, err := dockerRealDataDurableCorrelationAudit(ctx, path, requireCompleted)
-	return audit.Unresolved, err
 }
 
 func dockerRealDataInterruptedTurnDetails(ctx context.Context, path string) ([]string, error) {

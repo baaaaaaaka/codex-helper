@@ -3,7 +3,6 @@ package teams
 import (
 	"context"
 	"errors"
-	"io"
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/teams/machineregistry"
@@ -15,10 +14,6 @@ type MachineRegistryGraphAdapter struct {
 
 func NewMachineRegistryGraphAdapter(graph *GraphClient) MachineRegistryGraphAdapter {
 	return MachineRegistryGraphAdapter{graph: graph}
-}
-
-func NewMachineRegistryGraphAdapterForAuth(auth *AuthManager, out io.Writer) MachineRegistryGraphAdapter {
-	return NewMachineRegistryGraphAdapter(NewGraphClient(auth, out))
 }
 
 func (a MachineRegistryGraphAdapter) SendHTML(ctx context.Context, chatID string, html string) (machineregistry.ChatMessage, error) {

@@ -44,10 +44,6 @@ type ProviderCommandEnvRunner interface {
 
 type ProviderCommandRunnerFunc func(context.Context, string, []string) (string, error)
 
-func (f ProviderCommandRunnerFunc) RunProviderCommand(ctx context.Context, name string, args []string) (string, error) {
-	return f(ctx, name, args)
-}
-
 type ProviderCommandConfig struct {
 	SlurmQueryCommand  string `json:"slurm_query_command,omitempty"`
 	SlurmSubmitCommand string `json:"slurm_submit_command,omitempty"`
@@ -361,10 +357,6 @@ func ProviderCommandShellModeForRequest(req AllocationRequest, base ProviderComm
 		provider = req.ProfileSnapshot.Provider
 	}
 	return providerCommandShellMode(provider, base, req.ProfileSnapshot.Adapter)
-}
-
-func ProviderCommandShellModeForProfile(profile Profile) (string, bool) {
-	return ProviderCommandShellModeForProfileWithBase(profile, ProviderCommandConfig{})
 }
 
 func ProviderCommandShellModeForProfileWithBase(profile Profile, base ProviderCommandConfig) (string, bool) {

@@ -1652,33 +1652,6 @@ func targetSnapshotLabelForTeams(snapshot beacon.TargetSnapshot) string {
 	}
 }
 
-func sortedBeaconMachines(st beacon.State) []beacon.Machine {
-	out := make([]beacon.Machine, 0, len(st.Machines))
-	for _, m := range st.Machines {
-		out = append(out, m)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		left := firstNonEmptyString(out[i].ID, out[i].LeaseID, out[i].ProviderJobID)
-		right := firstNonEmptyString(out[j].ID, out[j].LeaseID, out[j].ProviderJobID)
-		return left < right
-	})
-	return out
-}
-
-func sortedBeaconAllocations(st beacon.State) []beacon.AllocationRequest {
-	out := make([]beacon.AllocationRequest, 0, len(st.Allocations))
-	for _, req := range st.Allocations {
-		out = append(out, req)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if !out[i].CreatedAt.Equal(out[j].CreatedAt) {
-			return out[i].CreatedAt.Before(out[j].CreatedAt)
-		}
-		return out[i].ID < out[j].ID
-	})
-	return out
-}
-
 func findBeaconAllocation(st beacon.State, ref string) (beacon.AllocationRequest, bool) {
 	ref = strings.TrimSpace(ref)
 	for _, req := range st.Allocations {

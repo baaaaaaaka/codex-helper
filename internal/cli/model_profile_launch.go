@@ -1247,25 +1247,6 @@ func modelProfileCatalogFingerprint(provider modelprofile.ProviderSpec) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func modelProfileRequiresAdapter(root *rootOptions, ref string) (bool, error) {
-	if strings.TrimSpace(ref) == "" {
-		return false, nil
-	}
-	store, _, err := newRootStore(root, "")
-	if err != nil {
-		return false, err
-	}
-	cfg, err := store.Load()
-	if err != nil {
-		return false, err
-	}
-	resolved, err := modelprofile.Resolve(cfg, ref)
-	if err != nil {
-		return false, err
-	}
-	return resolved.Provider.UsesAdapter, nil
-}
-
 func prepareTeamsAppServerModelProfile(root *rootOptions, ref string, snapshot modelprofile.Snapshot, log io.Writer) ([]string, []string, func(), error) {
 	return prepareTeamsAppServerModelProfileWithContext(context.Background(), root, ref, snapshot, log)
 }

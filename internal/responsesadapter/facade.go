@@ -548,40 +548,6 @@ func (f *Facade) newID(prefix string) (string, error) {
 	return prefix + "_" + hex.EncodeToString(b[:]), nil
 }
 
-func extractInputText(raw json.RawMessage) string {
-	if len(raw) == 0 {
-		return ""
-	}
-	var s string
-	if err := json.Unmarshal(raw, &s); err == nil {
-		return s
-	}
-	var items []json.RawMessage
-	if err := json.Unmarshal(raw, &items); err != nil {
-		return ""
-	}
-	var parts []string
-	for _, itemRaw := range items {
-		if text := extractMessageText(itemRaw); text != "" {
-			parts = append(parts, text)
-		}
-	}
-	return strings.Join(parts, "\n")
-}
-
-func extractMessageText(raw json.RawMessage) string {
-	var obj map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &obj); err != nil {
-		return ""
-	}
-	if contentRaw, ok := obj["content"]; ok {
-		if text := extractContentText(contentRaw); text != "" {
-			return text
-		}
-	}
-	return ""
-}
-
 func extractContentText(raw json.RawMessage) string {
 	text, _ := extractMessageContent(raw)
 	return text
@@ -678,15 +644,6 @@ func imageURLPart(raw json.RawMessage) (string, string) {
 		return "", ""
 	}
 	return rawString(obj["url"]), rawString(obj["detail"])
-}
-
-func hasImagePart(parts []ProviderContentPart) bool {
-	for _, part := range parts {
-		if part.Type == "image_url" && part.ImageURL != "" {
-			return true
-		}
-	}
-	return false
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

@@ -263,10 +263,6 @@ func (b *Bridge) prepareGlobalInboundLedger(ctx context.Context) error {
 	return prepareGlobalInboundLedger(prepareCtx, path)
 }
 
-func (b *Bridge) tryClaimGlobalInbound(ctx context.Context, chatID string, messageID string) (globalInboundClaim, bool, error) {
-	return b.tryClaimGlobalInboundWithWriter(ctx, chatID, messageID, nil)
-}
-
 func (b *Bridge) tryClaimGlobalInboundWithWriter(ctx context.Context, chatID string, messageID string, writer *globalInboundSQLiteWriter) (globalInboundClaim, bool, error) {
 	if b == nil || strings.TrimSpace(chatID) == "" || strings.TrimSpace(messageID) == "" {
 		return globalInboundClaim{}, true, nil
@@ -950,36 +946,6 @@ ON CONFLICT(key) DO UPDATE SET chat_id = excluded.chat_id, message_id = excluded
 	return err
 }
 
-func insertGlobalInboundSQLiteTxIfMissing(ctx context.Context, tx *sql.Tx, key string, item globalInboundItem) error {
-	item.ChatID = strings.TrimSpace(item.ChatID)
-	item.MessageID = strings.TrimSpace(item.MessageID)
-	if item.ChatID == "" || item.MessageID == "" {
-		return nil
-	}
-	canonicalKey := globalInboundKey(item.ChatID, item.MessageID)
-	if strings.TrimSpace(key) == "" {
-		key = canonicalKey
-	} else if strings.TrimSpace(key) != canonicalKey {
-		return fmt.Errorf("%w: inbound key %q does not match %q", ErrInboundLedgerProjectionUntrusted, key, canonicalKey)
-	}
-	raw, err := json.Marshal(item)
-	if err != nil {
-		return err
-	}
-	_, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO inbound_ledger(key, chat_id, message_id, owner, status, claimed_at, updated_at, json)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-		key,
-		item.ChatID,
-		item.MessageID,
-		item.Owner,
-		item.Status,
-		globalInboundSQLiteTime(item.ClaimedAt),
-		globalInboundSQLiteTime(item.UpdatedAt),
-		raw,
-	)
-	return err
-}
-
 func pruneGlobalInboundSQLiteTx(ctx context.Context, tx *sql.Tx, now time.Time) error {
 	const maxPruneScanRows = 512
 	var count int
@@ -1279,54 +1245,6 @@ func inboundPruneProjectionTime(projection inboundPruneProjection) time.Time {
 		return projection.updatedAt
 	}
 	return projection.claimedAt
-}
-
-func pruneGlobalInboundLedger(ledger *globalInboundLedger, now time.Time) {
-	if ledger == nil || len(ledger.Items) <= maxGlobalInboundLedgerIDs {
-		return
-	}
-	type entry struct {
-		key      string
-		at       time.Time
-		priority int
-	}
-	entries := make([]entry, 0, len(ledger.Items))
-	for key, item := range ledger.Items {
-		if strings.TrimSpace(key) != globalInboundKey(item.ChatID, item.MessageID) ||
-			(item.Status != "claimed" && item.Status != "done") {
-			// A malformed/unknown legacy row is evidence, not safe eviction
-			// material. Keep it until an explicit repair can inspect the raw file.
-			continue
-		}
-		at := item.UpdatedAt
-		if at.IsZero() {
-			at = item.ClaimedAt
-		}
-		if at.IsZero() {
-			at = now
-		}
-		if item.Status == "claimed" && (item.UpdatedAt.IsZero() || now.Sub(item.UpdatedAt) < globalInboundClaimTTL) {
-			continue
-		}
-		priority := 1
-		if item.Status == "done" {
-			priority = 0
-		}
-		entries = append(entries, entry{key: key, at: at, priority: priority})
-	}
-	sort.Slice(entries, func(i, j int) bool {
-		if entries[i].priority != entries[j].priority {
-			return entries[i].priority < entries[j].priority
-		}
-		if entries[i].at.Equal(entries[j].at) {
-			return entries[i].key < entries[j].key
-		}
-		return entries[i].at.Before(entries[j].at)
-	})
-	for len(ledger.Items) > maxGlobalInboundLedgerIDs && len(entries) > 0 {
-		delete(ledger.Items, entries[0].key)
-		entries = entries[1:]
-	}
 }
 
 func globalInboundKey(chatID string, messageID string) string {

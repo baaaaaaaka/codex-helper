@@ -59,11 +59,6 @@ type ChatTitleOptions struct {
 	Cwd          string
 }
 
-func MachineChatTitle(opts ChatTitleOptions) string {
-	marker := sanitizedTitlePart(opts.Marker, DefaultMachineChatMarker)
-	return joinTitleParts(marker, machineTitlePart(opts.MachineLabel), profileTitlePart(opts.Profile))
-}
-
 func ControlChatTitle(opts ChatTitleOptions) string {
 	marker := sanitizedTitlePart(opts.Marker, DefaultControlChatMarker)
 	return joinTitleParts(marker, machineTitlePart(opts.MachineLabel), profileTitlePart(opts.Profile), SanitizeDashboardTitle(opts.UserTitle))
@@ -436,26 +431,6 @@ func dashboardWorkspaceLess(a, b DashboardWorkspace) bool {
 	return a.ID < b.ID
 }
 
-func dashboardSessionInputLess(a, b DashboardSessionInput) bool {
-	aTime := dashboardSessionInputRecency(a)
-	bTime := dashboardSessionInputRecency(b)
-	if !aTime.Equal(bTime) {
-		if aTime.IsZero() {
-			return false
-		}
-		if bTime.IsZero() {
-			return true
-		}
-		return aTime.After(bTime)
-	}
-	aTitle := DashboardDisplayTitle(a.UserTitle, a.Topic, a.Cwd)
-	bTitle := DashboardDisplayTitle(b.UserTitle, b.Topic, b.Cwd)
-	if aTitle != bTitle {
-		return aTitle < bTitle
-	}
-	return strings.TrimSpace(a.ID) < strings.TrimSpace(b.ID)
-}
-
 func dashboardSessionLess(a, b DashboardSession) bool {
 	aTime := dashboardSessionRecency(a)
 	bTime := dashboardSessionRecency(b)
@@ -475,13 +450,6 @@ func dashboardSessionLess(a, b DashboardSession) bool {
 		return a.ID < b.ID
 	}
 	return a.Number < b.Number
-}
-
-func dashboardSessionInputRecency(session DashboardSessionInput) time.Time {
-	if !session.UpdatedAt.IsZero() {
-		return session.UpdatedAt
-	}
-	return session.CreatedAt
 }
 
 func dashboardSessionRecency(session DashboardSession) time.Time {
@@ -528,54 +496,6 @@ func buildDashboardView(kind DashboardViewKind, selectedWorkspaceID string, work
 	return view
 }
 
-func previousWorkspaceNumbers(workspaces []DashboardWorkspace) map[string]int {
-	numbers := map[string]int{}
-	for _, workspace := range workspaces {
-		if workspace.ID != "" && workspace.Number > 0 {
-			numbers[workspace.ID] = workspace.Number
-		}
-	}
-	return numbers
-}
-
-func previousSessionNumbers(sessions []DashboardSession) map[string]int {
-	numbers := map[string]int{}
-	for _, session := range sessions {
-		if session.WorkspaceID != "" && session.ID != "" && session.Number > 0 {
-			numbers[sessionKey(session.WorkspaceID, session.ID)] = session.Number
-		}
-	}
-	return numbers
-}
-
-func stableNumbers(previous map[string]int, ids []string) map[string]int {
-	numbers := map[string]int{}
-	used := map[int]bool{}
-	seen := map[string]bool{}
-	for _, id := range ids {
-		if id == "" || seen[id] {
-			continue
-		}
-		seen[id] = true
-		if number := previous[id]; number > 0 && !used[number] {
-			numbers[id] = number
-			used[number] = true
-		}
-	}
-	next := 1
-	for _, id := range ids {
-		if id == "" || numbers[id] > 0 {
-			continue
-		}
-		for used[next] {
-			next++
-		}
-		numbers[id] = next
-		used[next] = true
-	}
-	return numbers
-}
-
 func dashboardWorkspaceID(input DashboardWorkspaceInput) string {
 	if id := strings.TrimSpace(input.ID); id != "" {
 		return id
@@ -595,15 +515,6 @@ func sanitizedTitlePart(value string, fallback string) string {
 		return title
 	}
 	return fallback
-}
-
-func shortTitleIDPart(value string, fallback string) string {
-	title := sanitizedTitlePart(value, fallback)
-	rs := []rune(title)
-	if len(rs) <= 12 {
-		return title
-	}
-	return string(rs[:12])
 }
 
 func machineTitlePart(machineLabel string) string {

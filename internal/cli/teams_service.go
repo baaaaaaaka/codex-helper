@@ -1381,10 +1381,6 @@ func teamsServiceActive(ctx context.Context) (bool, error) {
 	return backend.Active(ctx)
 }
 
-func stopTeamsService(ctx context.Context) error {
-	return stopTeamsServiceWithOutput(ctx, io.Discard)
-}
-
 func stopTeamsServiceWithOutput(ctx context.Context, out io.Writer) error {
 	backend, err := teamsServiceBackendForCurrentPlatform()
 	if err != nil {
@@ -3372,10 +3368,6 @@ func teamsServiceProxyEnvName(name string) bool {
 	}
 }
 
-func teamsServiceKeepLocalProxyEnv() bool {
-	return !teamsServiceDropLocalProxyEnv()
-}
-
 func teamsServiceDropLocalProxyEnv() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_KEEP_LOCAL_PROXY"))) {
 	case "1", "true", "yes", "on":
@@ -4691,15 +4683,6 @@ func teamsServiceWSLTaskIdentity() teamsServiceWSLTaskIdentityInfo {
 		Display: strings.Join(displayParts, " "),
 		Suffix:  hex.EncodeToString(sum[:])[:12],
 	}
-}
-
-func firstNonEmptyTeamsServiceString(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return value
-		}
-	}
-	return ""
 }
 
 func safeWindowsTaskNamePart(value string, max int) string {

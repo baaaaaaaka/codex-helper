@@ -1031,10 +1031,6 @@ func findManagedASRLlamaExecutable(root string) (string, error) {
 	return found, nil
 }
 
-func managedASRLlamaInstallEnv(root string) []string {
-	return managedASRLlamaInstallEnvForCommand(root, "")
-}
-
 func managedASRLlamaInstallEnvForCommand(root string, command string) []string {
 	var dirs []string
 	addDir := func(path string) {

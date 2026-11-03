@@ -107,20 +107,6 @@ func newManagedTeamsCodexExecutor(
 	return newManagedTeamsCodexExecutorWithContext(context.Background(), root, runnerName, codexPath, workDir, codexArgs, modelProfile, modelprofile.Snapshot{}, timeout, log)
 }
 
-func newManagedTeamsCodexExecutorWithSnapshot(
-	root *rootOptions,
-	runnerName string,
-	codexPath string,
-	workDir string,
-	codexArgs []string,
-	modelProfile string,
-	snapshot modelprofile.Snapshot,
-	timeout time.Duration,
-	log io.Writer,
-) (teams.Executor, error) {
-	return newManagedTeamsCodexExecutorWithContext(context.Background(), root, runnerName, codexPath, workDir, codexArgs, modelProfile, snapshot, timeout, log)
-}
-
 func newManagedTeamsCodexExecutorWithContext(
 	ctx context.Context,
 	root *rootOptions,
@@ -851,14 +837,6 @@ func parseTeamsCodexTurnOptions(args []string) (teamsCodexTurnOptions, error) {
 		}
 	}
 	return options, nil
-}
-
-func teamsStoreConfigForStatus(root *rootOptions) (*config.Store, error) {
-	store, _, err := newRootStore(root, "")
-	if err != nil {
-		return nil, err
-	}
-	return store, nil
 }
 
 var resolveTeamsCodexUpgradeTargetForRun = resolveTeamsCodexUpgradeTarget

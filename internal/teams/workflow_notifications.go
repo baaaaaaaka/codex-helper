@@ -404,21 +404,6 @@ func (b *Bridge) workflowNotificationEventForOutbox(ctx context.Context, outbox 
 	return event, true, nil
 }
 
-func (b *Bridge) workflowNotificationsEnabled(ctx context.Context) bool {
-	if b == nil || b.store == nil {
-		return false
-	}
-	state, err := b.store.WorkflowNotificationStateSnapshot(ctx)
-	if err != nil {
-		return false
-	}
-	cfg, err := b.effectiveWorkflowNotificationConfig(state)
-	if err != nil {
-		return false
-	}
-	return cfg.Enabled
-}
-
 func (b *Bridge) workflowUserAttentionAvailable(ctx context.Context) bool {
 	if b == nil || b.store == nil {
 		return false

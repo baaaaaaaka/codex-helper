@@ -640,25 +640,6 @@ func prompt(r *bufio.Reader, label, def string) string {
 	}
 }
 
-func promptRequired(r *bufio.Reader, label string) string {
-	for {
-		v := prompt(r, label, "")
-		if strings.TrimSpace(v) != "" {
-			return v
-		}
-	}
-}
-
-func promptInt(r *bufio.Reader, label string, def int) int {
-	for {
-		v := prompt(r, label, strconv.Itoa(def))
-		n, err := strconv.Atoi(strings.TrimSpace(v))
-		if err == nil && n > 0 && n <= 65535 {
-			return n
-		}
-	}
-}
-
 func promptYesNo(r *bufio.Reader, label string, def bool) bool {
 	defStr := "n"
 	if def {

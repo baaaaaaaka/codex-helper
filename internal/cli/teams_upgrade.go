@@ -727,19 +727,6 @@ func teamsUpgradeServiceActive(ctx context.Context) (bool, error) {
 	return active, nil
 }
 
-func restoreTeamsUpgradeDrain(ctx context.Context, st *teamsstore.Store, previous teamsstore.ServiceControl) error {
-	return st.Update(ctx, func(state *teamsstore.State) error {
-		current := state.ServiceControl
-		if !current.Draining || current.Reason != teamsUpgradeDrainReason || current.Paused != previous.Paused {
-			return nil
-		}
-		restored := previous
-		restored.UpdatedAt = time.Now()
-		state.ServiceControl = restored
-		return nil
-	})
-}
-
 func teamsUpgradeStateDrained(ctx context.Context, st *teamsstore.Store) (bool, error) {
 	state, err := st.Load(ctx)
 	if err != nil {

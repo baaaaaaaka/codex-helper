@@ -442,18 +442,6 @@ func withProxyStartupLockError(ctx context.Context, store *config.Store, fn func
 	return err
 }
 
-func cleanupCodexAppProxyStartup(store *config.Store, instanceID string) {
-	if cfg, err := store.Load(); err == nil {
-		for _, inst := range cfg.Instances {
-			if inst.ID == instanceID {
-				_ = stopProxyInstances([]config.Instance{inst})
-				break
-			}
-		}
-	}
-	_ = proxyRemoveInstance(store, instanceID)
-}
-
 func cleanupCodexAppProxyStartupOwned(store *config.Store, instanceID, ownerToken, brokerEpoch string) {
 	if cfg, err := store.Load(); err == nil {
 		for _, inst := range cfg.Instances {

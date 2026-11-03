@@ -19,17 +19,3 @@ func QualifiedModelID(provider, model string) string {
 	}
 	return provider + "/" + model
 }
-
-// SplitQualifiedModelID splits a provider/model selector. A bare model is
-// returned with an empty provider and is resolved only when unambiguous.
-func SplitQualifiedModelID(ref string) (provider, model string, qualified bool) {
-	ref = strings.Trim(strings.TrimSpace(ref), "/")
-	if ref == "" {
-		return "", "", false
-	}
-	provider, model, qualified = strings.Cut(ref, "/")
-	if !qualified || strings.TrimSpace(provider) == "" || strings.TrimSpace(model) == "" {
-		return "", ref, false
-	}
-	return strings.TrimSpace(provider), strings.Trim(strings.TrimSpace(model), "/"), true
-}

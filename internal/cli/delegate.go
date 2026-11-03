@@ -893,41 +893,6 @@ func delegateRegistryCachePath(override string) (string, error) {
 	return machineregistry.DefaultCachePath()
 }
 
-func runDelegateStartRegistry(opts *delegateOptions, record delegation.Record, now time.Time) (delegateStartResult, error) {
-	session, err := openDelegateRegistry(opts)
-	if err != nil {
-		return delegateStartResult{}, err
-	}
-	defer session.close(opts.context())
-	records, err := readDelegateRegistryRecords(opts, session)
-	if err != nil {
-		return delegateStartResult{}, err
-	}
-	idempotent := false
-	for _, existing := range records {
-		if existing.Kind == delegation.RequestKind && existing.SourceKey == record.SourceKey {
-			record = existing
-			idempotent = true
-			break
-		}
-	}
-	if !idempotent {
-		if _, err := session.graph.SendHTML(opts.context(), session.chatID, delegation.RenderRecordHTML(record)); err != nil {
-			return delegateStartResult{}, err
-		}
-		records = append(records, record)
-	}
-	state := delegation.Reduce(delegation.RecordsForID(records, record.DelegationID), now)
-	return delegateStartResult{
-		DelegationID: record.DelegationID,
-		Status:       state.Status,
-		MachineID:    record.MachineID,
-		Idempotent:   idempotent,
-		State:        state,
-		Transport:    "registry",
-	}, nil
-}
-
 func runDelegateStartInbox(opts *delegateOptions, token delegation.CandidateTokenPayload, record delegation.Record, now time.Time) (delegateStartResult, error) {
 	if strings.TrimSpace(token.InboxRef) == "" {
 		return delegateStartResult{}, fmt.Errorf("candidate token missing inbox_ref; run delegate resolve again with an active machine registry")
@@ -1025,19 +990,6 @@ func validateDelegateCandidateToken(opts *delegateOptions, session *delegateRegi
 	return fmt.Errorf("candidate machine %s is no longer present in the registry; run delegate resolve again", token.MachineID)
 }
 
-func readDelegateRegistryRecordsForID(opts *delegateOptions, delegationID string) ([]delegation.Record, error) {
-	session, err := openDelegateRegistry(opts)
-	if err != nil {
-		return nil, err
-	}
-	defer session.close(opts.context())
-	records, err := readDelegateRegistryRecords(opts, session)
-	if err != nil {
-		return nil, err
-	}
-	return delegation.RecordsForID(records, delegationID), nil
-}
-
 func readDelegateInboxRecordsForID(opts *delegateOptions, delegationID string) ([]delegation.Record, error) {
 	session, route, chatID, err := openDelegateInboxForID(opts, delegationID)
 	if err != nil {
@@ -1056,22 +1008,6 @@ func readDelegateInboxRecordsForID(opts *delegateOptions, delegationID string) (
 		}
 	}
 	return delegation.RecordsForID(records, delegationID), nil
-}
-
-func appendDelegateRegistryRecord(opts *delegateOptions, record delegation.Record) ([]delegation.Record, error) {
-	session, err := openDelegateRegistry(opts)
-	if err != nil {
-		return nil, err
-	}
-	defer session.close(opts.context())
-	records, err := readDelegateRegistryRecords(opts, session)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := session.graph.SendHTML(opts.context(), session.chatID, delegation.RenderRecordHTML(record)); err != nil {
-		return nil, err
-	}
-	return append(records, record), nil
 }
 
 func appendDelegateInboxRecordForID(opts *delegateOptions, delegationID string, record delegation.Record) ([]delegation.Record, error) {

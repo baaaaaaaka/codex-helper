@@ -457,10 +457,6 @@ func historyWatchCheckpointNeedsMandatoryMaintenance(checkpoint teamstore.Histor
 	return checkpoint.Offset > checkpoint.Size
 }
 
-func (b *Bridge) selectBacklogHistoryRecoveryPaths(paths []string) []string {
-	return b.selectBacklogHistoryRecoveryPathsWithLimit(paths, maxBacklogHistoryRecoveryJobs)
-}
-
 func (b *Bridge) selectBacklogHistoryRecoveryPathsWithLimit(paths []string, limit int) []string {
 	paths = uniqueSortedCleanPaths(paths)
 	if limit <= 0 || len(paths) <= limit || b == nil {
@@ -750,13 +746,6 @@ func (b *Bridge) syncCodexHistoryFinalsIfDue(ctx context.Context, now time.Time)
 		b.lastHistoryWatchReconcile = now
 	}
 	return err
-}
-
-func (b *Bridge) syncCodexHistoryFinalsIfDueForBacklog(ctx context.Context, now time.Time) error {
-	if now.IsZero() {
-		now = time.Now()
-	}
-	return b.syncCodexHistoryFinalsForBacklog(ctx, now)
 }
 
 func (b *Bridge) syncCodexHistoryFinals(ctx context.Context, now time.Time, reconcile bool) error {
@@ -2262,13 +2251,6 @@ func historyWatchCheckpointFromState(id string, state historyTieredFileState, no
 	}
 	applyHistoryWatchPendingAssistant(&checkpoint, state.pendingAssistant)
 	return checkpoint
-}
-
-func (b *Bridge) removeHistoryWatchCheckpoint(ctx context.Context, id string) error {
-	return b.updateHistoryWatch(ctx, func(historyWatch map[string]teamstore.HistoryWatchCheckpoint, _ *time.Time) error {
-		delete(historyWatch, id)
-		return nil
-	})
 }
 
 func (b *Bridge) removeHistoryWatchCheckpointIfCurrent(ctx context.Context, id string, expected *teamstore.HistoryWatchCheckpoint) error {

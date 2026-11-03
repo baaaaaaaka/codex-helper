@@ -33,7 +33,3 @@ func NewUpstreamHTTPClientWithResponseHeaderTimeout(proxy func(*http.Request) (*
 	tr.IdleConnTimeout = upstreamHTTPIdleConnTimeout
 	return &http.Client{Transport: tr}
 }
-
-func defaultUpstreamHTTPClient() *http.Client {
-	return NewUpstreamHTTPClient(http.ProxyFromEnvironment)
-}

@@ -1429,12 +1429,6 @@ func waitForBeaconMachineByProviderJob(t *testing.T, store *beacon.Store, provid
 	return beacon.Machine{}
 }
 
-func shellSingleQuoteForBeaconCLITestJSON(value string) string {
-	escaped := strings.ReplaceAll(value, `\`, `\\`)
-	escaped = strings.ReplaceAll(escaped, `"`, `\"`)
-	return `"` + escaped + `"`
-}
-
 func shellSingleQuoteForBeaconCLITest(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }

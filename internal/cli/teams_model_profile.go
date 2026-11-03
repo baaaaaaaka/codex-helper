@@ -735,17 +735,6 @@ func parseTeamsModelSetupGuideArg(arg string) (string, string) {
 	return strings.TrimSpace(provider), strings.TrimSpace(name)
 }
 
-func splitWords2(s string) (string, string) {
-	fields := strings.Fields(strings.TrimSpace(s))
-	if len(fields) == 0 {
-		return "", ""
-	}
-	if len(fields) == 1 {
-		return fields[0], ""
-	}
-	return fields[0], strings.Join(fields[1:], " ")
-}
-
 func shellQuoteForTeams(s string) string {
 	s = strings.TrimSpace(s)
 	if s == "" {

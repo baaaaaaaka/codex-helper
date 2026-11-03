@@ -500,10 +500,6 @@ func (a *AuthManager) TenantID() string {
 	return strings.TrimSpace(a.cfg.TenantID)
 }
 
-func newNonInteractiveAuthManager(cfg AuthConfig, action string, loginCommand ...string) graphAuth {
-	return newNonInteractiveAuthManagerWithHTTPClient(cfg, nil, action, loginCommand...)
-}
-
 func newNonInteractiveAuthManagerWithHTTPClient(cfg AuthConfig, client *http.Client, action string, loginCommand ...string) graphAuth {
 	command := "codex-proxy teams auth"
 	if len(loginCommand) > 0 && strings.TrimSpace(loginCommand[0]) != "" {

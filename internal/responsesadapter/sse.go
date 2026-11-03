@@ -521,10 +521,6 @@ func failedResponseObject(responseID string, req ResponsesRequest, model string,
 	}
 }
 
-func buildOutputItems(responseID string, text string, messageOutputIndex int, reasoning string, reasoningOutputIndex int, toolCalls []ToolCallRecord) []outputItem {
-	return buildOutputItemsWithSources(responseID, text, messageOutputIndex, reasoning, reasoningOutputIndex, toolCalls, nil)
-}
-
 func buildOutputItemsWithSources(responseID string, text string, messageOutputIndex int, reasoning string, reasoningOutputIndex int, toolCalls []ToolCallRecord, sources []SourceCitation) []outputItem {
 	doneItems := make([]doneItem, 0, 1+len(toolCalls))
 	if reasoning != "" {
@@ -636,10 +632,6 @@ func customToolInput(arguments string) string {
 type doneItem struct {
 	outputIndex int
 	item        outputItem
-}
-
-func buildDoneItems(responseID string, messageOutputIndex int, text string, reasoningOutputIndex int, reasoning string, toolCalls []ToolCallRecord, includeMessage bool, includeReasoning bool) []doneItem {
-	return buildDoneItemsWithSources(responseID, messageOutputIndex, text, reasoningOutputIndex, reasoning, toolCalls, includeMessage, includeReasoning, nil)
 }
 
 func buildDoneItemsWithSources(responseID string, messageOutputIndex int, text string, reasoningOutputIndex int, reasoning string, toolCalls []ToolCallRecord, includeMessage bool, includeReasoning bool, sources []SourceCitation) []doneItem {

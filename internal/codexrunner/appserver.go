@@ -376,10 +376,6 @@ func (r *AppServerRunner) turnInterruptConfirmationContext() (context.Context, c
 	return context.WithTimeout(context.Background(), appServerTurnInterruptConfirmationTimeout)
 }
 
-func (r *AppServerRunner) threadStateConfirmationContext() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), appServerThreadStateConfirmationTimeout)
-}
-
 func (r *AppServerRunner) confirmTurnStopped(threadID string, turnID string, subscription *appServerTurnSubscriber) error {
 	return r.confirmTurnStoppedWithContext(context.Background(), threadID, turnID, subscription)
 }
@@ -2235,19 +2231,6 @@ func classifyTransportError(err error) error {
 	}
 }
 
-func sameAppServerID(raw json.RawMessage, id int64) bool {
-	var num json.Number
-	if err := json.Unmarshal(raw, &num); err == nil {
-		got, err := strconv.ParseInt(num.String(), 10, 64)
-		return err == nil && got == id
-	}
-	var str string
-	if err := json.Unmarshal(raw, &str); err == nil {
-		return str == strconv.FormatInt(id, 10)
-	}
-	return false
-}
-
 func appServerListThreadsParams(opts ListThreadsOptions) map[string]any {
 	params := map[string]any{}
 	if opts.WorkingDir != "" {
@@ -2485,17 +2468,6 @@ func applyAppServerNotification(result *TurnResult, line []byte) (bool, error) {
 		return sideEffect, nil
 	}
 	return false, nil
-}
-
-func emitAppServerStreamEvent(handler EventHandler, line []byte) {
-	if handler == nil {
-		return
-	}
-	event, ok := appServerNotificationStreamEvent(line)
-	if !ok {
-		return
-	}
-	handler(event)
 }
 
 func appServerNotificationStreamEvent(line []byte) (StreamEvent, bool) {

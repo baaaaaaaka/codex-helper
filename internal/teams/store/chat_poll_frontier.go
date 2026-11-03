@@ -539,10 +539,6 @@ func (s *Store) abandonChatPollAttempt(ctx context.Context, chatID, attemptID st
 	return poll, abandoned, err
 }
 
-func chatPollAttemptMatches(poll *ChatPollState, attemptID string, expectedRevision uint64, now time.Time) bool {
-	return chatPollAttemptMatchesCapability(poll, attemptID, expectedRevision, nil, now)
-}
-
 // chatPollAttemptRevisionCanBeAdopted recognizes the one durable revision
 // advance that a live capability may safely absorb: the same unexpired
 // attempt is still present, its owner identity is unchanged, and the attempt

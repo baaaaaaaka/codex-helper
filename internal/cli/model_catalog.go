@@ -1319,10 +1319,6 @@ func printModelCatalogs(out io.Writer, cfg config.Config) {
 	}
 }
 
-func printModelProviders(out io.Writer, cfg config.Config) {
-	printModelProvidersWithSecrets(out, cfg, nil)
-}
-
 func printModelProvidersWithSecrets(out io.Writer, cfg config.Config, secrets *modelprofile.SecretStore) {
 	providers := make([]string, 0, len(cfg.ModelProviderBindings))
 	for provider := range cfg.ModelProviderBindings {

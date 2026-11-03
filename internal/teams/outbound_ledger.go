@@ -718,33 +718,6 @@ SELECT key FROM outbound_ledger ORDER BY updated_at ASC, recorded_at ASC, teams_
 	return err
 }
 
-func upsertGlobalOutboundItem(ledger *globalOutboundLedger, item globalOutboundItem, now time.Time) {
-	if ledger == nil {
-		return
-	}
-	if ledger.Items == nil {
-		ledger.Items = map[string]globalOutboundItem{}
-	}
-	item.ChatID = strings.TrimSpace(item.ChatID)
-	item.MessageID = strings.TrimSpace(item.MessageID)
-	if item.ChatID == "" || item.MessageID == "" {
-		return
-	}
-	if item.RecordedAt.IsZero() {
-		item.RecordedAt = now
-	}
-	if item.UpdatedAt.IsZero() {
-		item.UpdatedAt = now
-	}
-	key := globalOutboundKey(item.ChatID, item.MessageID)
-	existing, ok := ledger.Items[key]
-	if ok {
-		item = mergeGlobalOutboundItem(existing, item)
-		item.UpdatedAt = now
-	}
-	ledger.Items[key] = item
-}
-
 func mergeGlobalOutboundItem(existing globalOutboundItem, next globalOutboundItem) globalOutboundItem {
 	if next.ChatID == "" {
 		next.ChatID = existing.ChatID
@@ -780,35 +753,6 @@ func mergeGlobalOutboundItem(existing globalOutboundItem, next globalOutboundIte
 		next.TeamsCreatedAt = existing.TeamsCreatedAt
 	}
 	return next
-}
-
-func pruneGlobalOutboundLedger(ledger *globalOutboundLedger, now time.Time) {
-	if ledger == nil || len(ledger.Items) <= maxGlobalOutboundLedgerIDs {
-		return
-	}
-	type entry struct {
-		key string
-		at  time.Time
-	}
-	entries := make([]entry, 0, len(ledger.Items))
-	for key, item := range ledger.Items {
-		at := item.UpdatedAt
-		if at.IsZero() {
-			at = item.RecordedAt
-		}
-		if at.IsZero() {
-			at = item.TeamsCreatedAt
-		}
-		if at.IsZero() {
-			at = now
-		}
-		entries = append(entries, entry{key: key, at: at})
-	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].at.Before(entries[j].at) })
-	for len(entries) > maxGlobalOutboundLedgerIDs {
-		delete(ledger.Items, entries[0].key)
-		entries = entries[1:]
-	}
 }
 
 func globalOutboundKey(chatID string, messageID string) string {

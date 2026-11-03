@@ -148,36 +148,12 @@ func restartSelfWithResolvedExecutableAndEnv(exe string, env []string) error {
 	return execSelf(exe, args, env)
 }
 
-func stableRestartExecutablePath(path string) string {
-	exe, err := resolveRestartExecutablePath(path)
-	if err != nil {
-		return path
-	}
-	return exe
-}
-
-func resolveRestartExecutablePath(path string) (string, error) {
-	return resolveRestartExecutablePathFromSources(path, "")
-}
-
 func resolveRestartExecutablePathFromSources(path string, argv0 string) (string, error) {
 	resolved, err := helperpath.StableRunnablePathFromSources(path, argv0, helperpath.Options{})
 	if err != nil {
 		return "", err
 	}
 	return resolved.Path, nil
-}
-
-func stripReloadBackupSuffix(path string) string {
-	path = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(path), " (deleted)"))
-	if path == "" {
-		return path
-	}
-	dir, base := filepath.Split(path)
-	if idx := strings.Index(base, ".reload-backup-"); idx >= 0 {
-		return filepath.Join(dir, base[:idx])
-	}
-	return path
 }
 
 func startRestartProcess(exe string, args []string, env []string) error {

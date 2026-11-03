@@ -793,10 +793,6 @@ func (b *Bridge) failFork(ctx context.Context, operationID string, phase teamsto
 	return fmt.Errorf("%s", message)
 }
 
-func (b *Bridge) materializeForkHistory(ctx context.Context, parent *Session, cutoff teamstore.Turn) (forkHistorySnapshot, error) {
-	return b.materializeForkHistoryForVersion(ctx, parent, cutoff, 2)
-}
-
 func (b *Bridge) materializeForkHistoryForVersion(ctx context.Context, parent *Session, cutoff teamstore.Turn, planVersion int) (forkHistorySnapshot, error) {
 	if planVersion <= 0 {
 		planVersion = 1

@@ -2627,28 +2627,6 @@ func requireLiveCreatedJasonWeiSingleMemberChat(ctx context.Context, t *testing.
 	return me
 }
 
-func requireLiveMessageContaining(ctx context.Context, t *testing.T, graph *GraphClient, chatID string, parts ...string) {
-	t.Helper()
-	messages, err := graph.ListMessages(ctx, chatID, 20)
-	if err != nil {
-		t.Fatalf("Graph message read failed for %s: %v", chatID, err)
-	}
-	for _, msg := range messages {
-		text := PlainTextFromTeamsHTML(msg.Body.Content)
-		matched := true
-		for _, part := range parts {
-			if !strings.Contains(text, part) {
-				matched = false
-				break
-			}
-		}
-		if matched {
-			return
-		}
-	}
-	t.Fatalf("no live Teams message in %s contained all parts %q among %d recent message(s)", chatID, parts, len(messages))
-}
-
 func requireLiveSentOutboxContaining(ctx context.Context, t *testing.T, store *teamstore.Store, chatID string, parts ...string) {
 	t.Helper()
 	ok, err := liveSentOutboxContains(ctx, store, chatID, parts...)

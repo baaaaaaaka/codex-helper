@@ -70,10 +70,6 @@ func DefaultOutboundUploadFolder() string {
 	return defaultOutboundUploadFolder
 }
 
-func NewFileWriteGraphClient(out io.Writer) (*GraphClient, error) {
-	return NewFileWriteGraphClientWithHTTPClient(out, nil)
-}
-
 func NewFileWriteGraphClientWithHTTPClient(out io.Writer, client *http.Client) (*GraphClient, error) {
 	cfg, err := DefaultEffectiveFileWriteAuthConfig()
 	if err != nil {
@@ -297,52 +293,6 @@ func ensureOutboundRoot(root string) error {
 	return os.Chmod(root, 0o700)
 }
 
-func readOutboundAttachmentFile(path string, root string, allowAny bool, maxBytes int64) ([]byte, int64, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, 0, outboundPathError("open Teams upload file", err)
-	}
-	defer f.Close()
-
-	info, err := f.Stat()
-	if err != nil {
-		return nil, 0, outboundPathError("inspect Teams upload file", err)
-	}
-	pathInfo, err := os.Lstat(path)
-	if err != nil {
-		return nil, 0, outboundPathError("inspect Teams upload path", err)
-	}
-	if pathInfo.Mode()&os.ModeSymlink != 0 {
-		return nil, 0, fmt.Errorf("refusing to upload symlink: %s", filepath.Base(path))
-	}
-	if !info.Mode().IsRegular() {
-		return nil, 0, fmt.Errorf("refusing to upload non-regular file: %s", filepath.Base(path))
-	}
-	if info.Size() > maxBytes {
-		return nil, 0, fmt.Errorf("refusing to upload %d-byte file; limit is %d bytes", info.Size(), maxBytes)
-	}
-	if !allowAny {
-		if err := ensureResolvedPathUnderRoot(path, root); err != nil {
-			return nil, 0, err
-		}
-		currentInfo, err := os.Stat(path)
-		if err != nil {
-			return nil, 0, outboundPathError("inspect Teams upload path", err)
-		}
-		if !os.SameFile(info, currentInfo) {
-			return nil, 0, fmt.Errorf("Teams upload file changed during safety checks")
-		}
-	}
-	data, err := io.ReadAll(io.LimitReader(f, maxBytes+1))
-	if err != nil {
-		return nil, 0, outboundPathError("read Teams upload file", err)
-	}
-	if int64(len(data)) > maxBytes {
-		return nil, 0, fmt.Errorf("refusing to upload file larger than %d bytes", maxBytes)
-	}
-	return data, int64(len(data)), nil
-}
-
 // inspectOutboundAttachmentFile validates the file without materializing a
 // large upload in memory. Small files keep the historical Bytes field so the
 // existing simple-upload path and callers remain compatible.
@@ -503,47 +453,6 @@ func allowedOutboundFileName(name string, allowed map[string]bool) bool {
 		return true
 	}
 	return allowed[strings.ToLower(ext)]
-}
-
-func allowedOutboundExtension(ext string, allowed map[string]bool) bool {
-	if len(allowed) == 0 {
-		return true
-	}
-	return allowed[strings.ToLower(ext)]
-}
-
-func defaultOutboundExtensions() map[string]bool {
-	allowed := map[string]bool{}
-	addOutboundExtensions(allowed,
-		// Text, docs, and structured data.
-		".txt", ".md", ".markdown", ".rst", ".adoc", ".log",
-		".json", ".jsonl", ".ndjson", ".csv", ".tsv", ".xml",
-		".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".properties",
-		".env", ".envrc", ".lock", ".mod", ".sum",
-		// Source code, scripts, build files, and developer config.
-		".sh", ".bash", ".zsh", ".fish", ".ps1", ".psm1", ".psd1", ".bat", ".cmd",
-		".py", ".pyw", ".go", ".rs", ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh",
-		".java", ".kt", ".kts", ".swift", ".m", ".mm", ".cs", ".fs", ".fsx", ".vb",
-		".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".vue", ".svelte", ".astro",
-		".css", ".scss", ".sass", ".less", ".html", ".htm",
-		".php", ".rb", ".pl", ".pm", ".lua", ".r", ".jl", ".scala", ".sc",
-		".clj", ".cljs", ".ex", ".exs", ".erl", ".hrl", ".hs", ".ml", ".mli",
-		".dart", ".sql", ".graphql", ".gql", ".proto", ".thrift", ".sol",
-		".zig", ".nim", ".v", ".sv", ".svh", ".asm", ".s", ".cmake", ".gradle",
-		".dockerfile", ".hcl", ".tf", ".tfvars", ".rego", ".cue",
-		".editorconfig", ".gitignore", ".gitattributes", ".dockerignore", ".npmrc",
-		".yarnrc", ".prettierrc", ".eslintrc", ".babelrc", ".clang-format", ".clang-tidy",
-		".patch", ".diff",
-		// Images, notebooks, databases, and common generated artifacts.
-		".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico",
-		".pdf", ".ipynb", ".sqlite", ".sqlite3", ".db", ".parquet",
-		// Archives and package formats commonly used to exchange build artifacts.
-		".zip", ".tar", ".gz", ".tgz", ".bz2", ".tbz", ".tbz2", ".xz", ".txz",
-		".zst", ".tzst", ".br", ".7z", ".rar",
-		".jar", ".war", ".ear", ".whl", ".nupkg", ".crate", ".gem", ".deb", ".rpm",
-		".apk", ".ipa", ".vsix",
-	)
-	return allowed
 }
 
 func defaultOutboundBaseNames() map[string]bool {

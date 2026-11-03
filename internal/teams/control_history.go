@@ -151,16 +151,6 @@ func normalizeControlChatHistoryEntry(entry controlChatHistoryEntry) controlChat
 	return entry
 }
 
-func controlChatHistorySameMessage(a controlChatHistoryEntry, b controlChatHistoryEntry) bool {
-	if strings.TrimSpace(a.MessageID) == "" || strings.TrimSpace(b.MessageID) == "" {
-		return false
-	}
-	return strings.TrimSpace(a.ChatID) == strings.TrimSpace(b.ChatID) &&
-		strings.TrimSpace(a.MessageID) == strings.TrimSpace(b.MessageID) &&
-		strings.TrimSpace(a.Direction) == strings.TrimSpace(b.Direction) &&
-		strings.TrimSpace(a.Kind) == strings.TrimSpace(b.Kind)
-}
-
 func readControlChatHistoryEntries(path string) ([]controlChatHistoryEntry, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {

@@ -932,10 +932,6 @@ func hostProbeTarget(profile config.Profile) (host string, port int, direct bool
 	return host, port, direct
 }
 
-func resolveHostProbeTarget(profile config.Profile) (host string, port int, direct bool, err error) {
-	return resolveHostProbeTargetContext(context.Background(), profile)
-}
-
 func resolveHostProbeTargetContext(ctx context.Context, profile config.Profile) (host string, port int, direct bool, err error) {
 	return resolveHostProbeTargetContextWith(ctx, profile, defaultHostProbeDependencies())
 }

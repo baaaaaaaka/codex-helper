@@ -346,13 +346,6 @@ func InboxCursorSQLite(path string, chatID string) (InboxCursor, bool, error) {
 	return sqliteLoadByID[InboxCursor](path, "inbox_cursors", chatID)
 }
 
-// OutboxSQLite reads one durable worker outbox witness without materializing
-// the whole worker store. Callers use it before a non-idempotent Graph POST to
-// distinguish a first attempt from a retry after an unknown outcome.
-func OutboxSQLite(path string, recordID string) (OutboxRecord, bool, error) {
-	return sqliteLoadByID[OutboxRecord](path, "outbox", recordID)
-}
-
 func UpsertInboxCursorSQLite(path string, cursor InboxCursor) error {
 	return sqliteUpsertSingle(path, "inbox_cursors", cursor.ChatID, cursor)
 }
@@ -401,13 +394,6 @@ func UpsertRemoteThreadSQLite(path string, thread RemoteThread) error {
 	tmp.UpsertRemoteThread(thread)
 	thread, _ = tmp.RemoteThreadForID(thread.ThreadID)
 	return sqliteUpsertSingle(path, "remote_threads", thread.ThreadID, thread)
-}
-
-func UpsertRecordSQLite(path string, record Record) error {
-	if strings.TrimSpace(record.RecordID) == "" {
-		return nil
-	}
-	return sqliteUpsertSingle(path, "records", record.RecordID, record)
 }
 
 func sqliteLoadByID[T any](path string, table string, id string) (T, bool, error) {

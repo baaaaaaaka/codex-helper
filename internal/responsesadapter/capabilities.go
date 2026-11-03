@@ -258,15 +258,6 @@ func (p ProviderProfile) shouldSendReasoningContent(model string) bool {
 	}
 }
 
-func hasProviderImagePart(parts []ProviderContentPart) bool {
-	for _, part := range parts {
-		if part.Type == "image_url" && strings.TrimSpace(part.ImageURL) != "" {
-			return true
-		}
-	}
-	return false
-}
-
 func hasProviderMediaPart(parts []ProviderContentPart) bool {
 	for _, part := range parts {
 		if (part.Type == "image_url" && strings.TrimSpace(part.ImageURL) != "") ||

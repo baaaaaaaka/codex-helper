@@ -2636,10 +2636,6 @@ func defaultRunTeamsAppServerProbe(cmd *cobra.Command, opts teamsAppServerProbeO
 	return nil
 }
 
-func newTeamsAuthManager() (*teams.AuthManager, error) {
-	return newTeamsAuthManagerWithHTTPClient(nil)
-}
-
 func newTeamsAuthManagerWithHTTPClient(client *http.Client) (*teams.AuthManager, error) {
 	cfg, err := teams.DefaultEffectiveAuthConfig()
 	if err != nil {
@@ -2656,24 +2652,8 @@ func newTeamsFullAuthManagerWithHTTPClient(client *http.Client) (*teams.AuthMana
 	return teams.NewAuthManagerWithHTTPClient(cfg, client), nil
 }
 
-func newTeamsReadAuthManager() (*teams.AuthManager, error) {
-	return newTeamsReadAuthManagerWithHTTPClient(nil)
-}
-
 func newTeamsReadAuthManagerWithHTTPClient(client *http.Client) (*teams.AuthManager, error) {
 	cfg, err := teams.DefaultEffectiveReadAuthConfig()
-	if err != nil {
-		return nil, err
-	}
-	return teams.NewAuthManagerWithHTTPClient(cfg, client), nil
-}
-
-func newTeamsFileWriteAuthManager() (*teams.AuthManager, error) {
-	return newTeamsFileWriteAuthManagerWithHTTPClient(nil)
-}
-
-func newTeamsFileWriteAuthManagerWithHTTPClient(client *http.Client) (*teams.AuthManager, error) {
-	cfg, err := teams.DefaultEffectiveFileWriteAuthConfig()
 	if err != nil {
 		return nil, err
 	}
@@ -4023,10 +4003,6 @@ func teamsRegistryPathsWithMode(registryPath string, readOnly bool) ([]string, e
 		}
 	}
 	return uniquePaths(paths), nil
-}
-
-func existingTeamsRegistryPaths() ([]string, error) {
-	return existingTeamsRegistryPathsWithMode(false)
 }
 
 func existingTeamsRegistryPathsReadOnly() ([]string, error) {

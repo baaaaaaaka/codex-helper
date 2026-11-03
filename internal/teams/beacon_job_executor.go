@@ -135,10 +135,6 @@ func enqueueBeaconJobForTurn(ctx context.Context, store *beacon.Store, plan beac
 	return job, ctx.Err()
 }
 
-func waitBeaconJobTerminal(ctx context.Context, store *beacon.Store, jobID string) (ExecutionResult, error) {
-	return waitBeaconJobTerminalWithEventHandler(ctx, store, jobID, nil)
-}
-
 func waitBeaconJobTerminalWithEventHandler(ctx context.Context, store *beacon.Store, jobID string, handler codexrunner.EventHandler) (ExecutionResult, error) {
 	interval := beaconJobPollInterval
 	if interval <= 0 {
@@ -267,11 +263,6 @@ func drainBeaconJobStream(ctx context.Context, store *beacon.Store, reader *beac
 		case <-timer.C:
 		}
 	}
-}
-
-func readBeaconJobTerminal(store *beacon.Store, jobID string) (ExecutionResult, bool, error) {
-	result, done, _, _, err := readBeaconJobTerminalAndAttempt(store, jobID)
-	return result, done, err
 }
 
 func readBeaconJobTerminalAndAttempt(store *beacon.Store, jobID string) (ExecutionResult, bool, beacon.JobAttempt, bool, error) {

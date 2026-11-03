@@ -436,18 +436,6 @@ func (g *GraphClient) uploadDriveItemFromFileWithCheckpoint(ctx context.Context,
 	}
 }
 
-func (g *GraphClient) uploadSessionCheckpointUsable(checkpoint driveUploadSessionCheckpoint) bool {
-	if checkpoint.Offset < 0 {
-		return false
-	}
-	expiresAt := strings.TrimSpace(checkpoint.ExpirationDateTime)
-	if expiresAt == "" {
-		return true
-	}
-	t, err := time.Parse(time.RFC3339Nano, expiresAt)
-	return err == nil && time.Now().Before(t)
-}
-
 func (g *GraphClient) uploadDriveItemSingleFileWithOptions(ctx context.Context, folder string, name string, file *os.File, size int64, contentType string, opts graphRequestOptions) (DriveItem, error) {
 	path, err := meDriveRootContentPath(folder, name)
 	if err != nil {
@@ -795,17 +783,6 @@ func (g *GraphClient) queryUploadSessionOffset(ctx context.Context, uploadURL st
 		return 0, err
 	}
 	return parseUploadSessionOffset(session.NextExpectedRanges, total)
-}
-
-func nextUploadOffset(ranges []string, fallback int64) int64 {
-	// Kept as a small compatibility helper for callers/tests that only need to
-	// inspect a Graph range list. Upload production paths use the strict parser
-	// below and never fall back to a guessed offset.
-	best, err := parseUploadSessionOffset(ranges, maxTeamsTransferBytes)
-	if err == nil {
-		return best
-	}
-	return fallback
 }
 
 func parseUploadSessionOffset(ranges []string, total int64) (int64, error) {

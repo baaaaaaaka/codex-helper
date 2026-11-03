@@ -202,10 +202,6 @@ func DirectPushRefSpec(ctx context.Context, git GitRunner, source Source) (strin
 	return "HEAD:refs/heads/" + branch, nil
 }
 
-func ReviewBranchName(source Source, baseCommit string) string {
-	return ReviewBranchNameAt(source, baseCommit, time.Now())
-}
-
 func ReviewBranchNameAt(source Source, baseCommit string, now time.Time) string {
 	short := ShortSHA(baseCommit)
 	name := strings.Trim(source.Name, ".-_")
@@ -224,13 +220,6 @@ func ShortSHA(v string) string {
 		return v
 	}
 	return v[:12]
-}
-
-func SkillModeString(mode uint32) string {
-	if mode == 0 {
-		return "unknown"
-	}
-	return fmt.Sprintf("%06o", mode)
 }
 
 func applyLocalChangeToRepo(change LocalChange, repoDir string) error {

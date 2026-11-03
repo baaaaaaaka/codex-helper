@@ -617,29 +617,6 @@ func renderTeamsHTMLParagraphs(label string, text string, firstPrefixHTML string
 	return out.String()
 }
 
-func renderTeamsHTMLParagraphsAfterLabelBreak(label string, text string) string {
-	paragraphs := splitTeamsRenderParagraphs(text)
-	var out strings.Builder
-	for i, paragraph := range paragraphs {
-		body := html.EscapeString(paragraph)
-		body = strings.ReplaceAll(body, "\n", "<br>")
-		out.WriteString("<p>")
-		if i == 0 {
-			out.WriteString("<strong>")
-			out.WriteString(html.EscapeString(label))
-			out.WriteString(":</strong>")
-			if body != "" {
-				out.WriteString("<br>")
-				out.WriteString(body)
-			}
-		} else {
-			out.WriteString(body)
-		}
-		out.WriteString("</p>")
-	}
-	return out.String()
-}
-
 func splitTeamsRenderParagraphs(text string) []string {
 	text = normalizeTeamsRenderText(text)
 	lines := strings.Split(text, "\n")

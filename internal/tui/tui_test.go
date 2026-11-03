@@ -130,18 +130,6 @@ func waitForScreenInit(t *testing.T, initDone <-chan struct{}) {
 	}
 }
 
-func waitForScreenLineContains(t *testing.T, screen tcell.Screen, y int, want string) {
-	t.Helper()
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if strings.Contains(readScreenLine(screen, y), want) {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatalf("timeout waiting for screen line %d to contain %q; got %q", y, want, strings.TrimSpace(readScreenLine(screen, y)))
-}
-
 func waitForScreenContains(t *testing.T, screen tcell.Screen, want string) {
 	waitForScreenContainsWithin(t, screen, want, 500*time.Millisecond)
 }

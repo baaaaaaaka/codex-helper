@@ -697,10 +697,6 @@ func (p *HTTPProxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
-func (p *HTTPProxy) notifyBackendFailure(target string, err error) {
-	p.notifyBackendFailureContext(context.Background(), target, err)
-}
-
 func (p *HTTPProxy) notifyBackendFailureContext(ctx context.Context, target string, err error) {
 	if err == nil {
 		return
@@ -719,10 +715,6 @@ func (p *HTTPProxy) notifyBackendFailureContext(ctx context.Context, target stri
 	if p.targetFailure != nil {
 		p.targetFailure(target, err)
 	}
-}
-
-func (p *HTTPProxy) dialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	return p.dialContextWithHeaders(ctx, network, addr, nil)
 }
 
 func (p *HTTPProxy) dialContextWithHeaders(ctx context.Context, network, addr string, headers http.Header) (net.Conn, error) {

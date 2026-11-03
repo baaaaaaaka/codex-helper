@@ -301,26 +301,6 @@ func validateRealListenerSourceCached(item manifestTest, cache map[string]realLi
 	return source.validate(item)
 }
 
-// validateRealListenerSource prevents the manifest's real_listener bit from
-// becoming a self-declared label.  Required listener entries must call the
-// shared harness, and that harness must itself invoke production Bridge.Listen
-// rather than a phase helper or a test-only loop.  A lifecycle test that must
-// stop after exactly one owner generation may instead call the production
-// listenOwnerGeneration entry directly; the runtime harness also checks
-// Once=false.  This source check makes a renamed/empty selector fail before CI
-// can report a misleading green recovery job.
-func validateRealListenerSource(item manifestTest) error {
-	packagePath, err := realListenerPackagePath(item)
-	if err != nil {
-		return err
-	}
-	source, err := loadRealListenerSource(item, packagePath)
-	if err != nil {
-		return err
-	}
-	return source.validate(item)
-}
-
 func loadRealListenerSource(item manifestTest, packagePath string) (realListenerSource, error) {
 	harness := "startListenerRecovery"
 	entries, err := os.ReadDir(packagePath)
@@ -1057,17 +1037,6 @@ func validateTestJSONOutputMode(data []byte, name string, requireSingletonBacken
 		}
 	}
 	return nil
-}
-
-// validateExpectedBackendSubtests gives the manifest's backend metadata real
-// meaning.  A top-level Go test can pass while a backend subtest is silently
-// omitted (or skipped), which made a JSON/SQLite entry look covered when only
-// one store actually ran.  Existing tests use either explicit names
-// ("json"/"sqlite") or the boolean form ("sqlite=false"/"sqlite=true");
-// both are accepted, but every declared backend must emit its own RUN and
-// PASS event.
-func validateExpectedBackendSubtests(events []goTestJSONEvent, name string, backends []string) error {
-	return validateExpectedBackendSubtestsMode(events, name, backends, false)
 }
 
 func validateExpectedBackendSubtestsMode(events []goTestJSONEvent, name string, backends []string, requireSingleton bool) error {

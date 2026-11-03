@@ -121,10 +121,6 @@ func scheduleTeamsPendingHelperActivation(ctx context.Context, activation teamsP
 	return teamsServiceStartDetached(ctx, teamsServicePowerShellExecutable(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-Command", command)
 }
 
-func scheduleTeamsPendingHelperActivationForPath(ctx context.Context, pendingPath string) error {
-	return scheduleTeamsPendingHelperActivationForReplacement(ctx, pendingPath, "")
-}
-
 func scheduleTeamsPendingHelperActivationForReplacement(ctx context.Context, pendingPath string, installPath string) error {
 	pendingPath = strings.TrimSpace(pendingPath)
 	if teamsServiceGOOS() != "windows" || pendingPath == "" {
@@ -160,10 +156,6 @@ func normalizeTeamsPendingHelperActivation(activation teamsPendingHelperActivati
 	}
 	activation.InstallPath = resolved.Path
 	return activation, nil
-}
-
-func teamsPendingHelperActivationForPendingPath(pendingPath string) teamsPendingHelperActivation {
-	return teamsPendingHelperActivationForReplacement(pendingPath, "")
 }
 
 func teamsPendingHelperActivationForReplacement(pendingPath string, installPath string) teamsPendingHelperActivation {

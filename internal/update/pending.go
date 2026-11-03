@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -135,10 +134,6 @@ func looksLikeVersion(value string) bool {
 	return true
 }
 
-func FindPendingReplacements(installPath string) ([]PendingReplacement, error) {
-	return FindPendingReplacementsForPlatform(installPath, runtime.GOOS, runtime.GOARCH)
-}
-
 func FindPendingReplacementsForPlatform(installPath string, goos string, goarch string) ([]PendingReplacement, error) {
 	installPath = strings.TrimSpace(installPath)
 	if installPath == "" {
@@ -203,18 +198,4 @@ func FindPendingReplacementsForPlatform(installPath string, goos string, goarch 
 		return out[i].ModTime.After(out[j].ModTime)
 	})
 	return out, nil
-}
-
-func LatestPendingReplacement(installPath string, targetVersion string) (PendingReplacement, bool, error) {
-	pending, err := FindPendingReplacements(installPath)
-	if err != nil {
-		return PendingReplacement{}, false, err
-	}
-	targetVersion = strings.TrimPrefix(strings.TrimSpace(targetVersion), "v")
-	for _, candidate := range pending {
-		if targetVersion == "" || strings.EqualFold(strings.TrimPrefix(candidate.Version, "v"), targetVersion) {
-			return candidate, true, nil
-		}
-	}
-	return PendingReplacement{}, false, nil
 }

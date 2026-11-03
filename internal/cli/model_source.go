@@ -939,14 +939,6 @@ func hasCredential(m map[string]config.ModelCredential, k string) bool { _, ok :
 func hasProvider(m map[string]config.ModelProvider, k string) bool     { _, ok := m[k]; return ok }
 func hasModel(m map[string]config.ModelDefinition, k string) bool      { _, ok := m[k]; return ok }
 func hasProfile(m map[string]config.ModelProfile, k string) bool       { _, ok := m[k]; return ok }
-func containsFold(values []string, value string) bool {
-	for _, item := range values {
-		if strings.EqualFold(item, value) {
-			return true
-		}
-	}
-	return false
-}
 
 func runModelSourceBind(cmd *cobra.Command, root *rootOptions, sourceName, profileName string, opts modelSourceBindOptions) error {
 	store, _, err := newRootStore(root, "")

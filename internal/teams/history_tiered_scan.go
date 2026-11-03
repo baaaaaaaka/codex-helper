@@ -2129,12 +2129,6 @@ func historyTieredConsumedRecordKey(path string, lineNo int, startOffset int64, 
 	return "ignored:" + hex.EncodeToString(sum[:])[:24]
 }
 
-func historyTieredLineHasExplicitTurnID(line []byte) bool {
-	// Most transcript lines have no turn provenance. Keep the common path at a
-	// cheap byte scan; only decode JSON when a turn-shaped field is present.
-	return historyTieredLineHasExplicitTurnIDWithHint(line, historyTieredLineHints(line).MayTurnField)
-}
-
 func historyTieredLineHasExplicitTurnIDWithHint(line []byte, mayTurnField bool) bool {
 	if !mayTurnField {
 		return false
@@ -2174,10 +2168,6 @@ func historyTieredLineHasExplicitTurnIDWithHint(line []byte, mayTurnField bool) 
 		return false
 	}
 	return visit(value)
-}
-
-func historyTieredMayContainContinuation(line []byte) bool {
-	return historyTieredLineHints(line).MayContinuation
 }
 
 // historyTieredContinuationSignal recognizes only execution-bearing child
@@ -2412,10 +2402,6 @@ func historyTieredTerminalThreadID(value map[string]json.RawMessage) string {
 		}
 	}
 	return ""
-}
-
-func historyTieredMayContainTerminalSignal(line []byte) bool {
-	return historyTieredLineHints(line).MayTerminal
 }
 
 func historyTieredHasFinalAnswerPhase(obj map[string]json.RawMessage) bool {

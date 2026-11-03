@@ -235,25 +235,6 @@ func markMessageSeen(msg Message, seen *messageSeenState, dedupeUserMirrors bool
 	return true
 }
 
-func rememberMessageSeen(msg Message, seen *messageSeenState) {
-	if seen == nil {
-		return
-	}
-	if key := sourceMessageDedupKey(msg.sourceID); key != "" {
-		seen.sourceKeys[key] = true
-	}
-	// Keep both identity layers when rebuilding persistent preview state. A
-	// future append may carry only the other half of an event/response mirror.
-	key := fallbackMessageDedupKey(msg, true)
-	if key == "" {
-		return
-	}
-	if previous, ok := seen.fallbackTimes[key]; !ok || msg.Timestamp.After(previous) {
-		seen.fallbackTimes[key] = msg.Timestamp
-		seen.fallbackSourceKind[key] = messageSourceKind(msg.sourceID)
-	}
-}
-
 func messageSourceKind(sourceID string) string {
 	sourceID = strings.TrimSpace(sourceID)
 	if idx := strings.IndexByte(sourceID, ':'); idx > 0 {

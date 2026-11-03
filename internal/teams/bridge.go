@@ -1906,16 +1906,6 @@ func (b *Bridge) readClient() *GraphClient {
 	return b.graph
 }
 
-// RuntimeScopeIdentity exposes the authenticated scope before Listen opens a
-// store. The CLI service boundary uses it for the one-time offline migration;
-// callers must not mutate the returned value and no store is opened here.
-func (b *Bridge) RuntimeScopeIdentity() teamstore.ScopeIdentity {
-	if b == nil {
-		return teamstore.ScopeIdentity{}
-	}
-	return b.scope
-}
-
 func (b *Bridge) EnsureControlChat(ctx context.Context) (Chat, error) {
 	return b.ensureControlChat(ctx, true)
 }
@@ -3178,22 +3168,6 @@ func (b *Bridge) pollForegroundPressureBlocksColdMaintenance() bool {
 	return blocked
 }
 
-func (b *Bridge) pollForegroundPressureActive() bool {
-	if b == nil {
-		return false
-	}
-	b.pollMu.Lock()
-	// fastPollUntil is only a wake hint for the next poll interval.  It must not
-	// keep cold maintenance deferred after the durable Teams backlog has drained:
-	// otherwise the final admitted turn can keep history/linked maintenance out
-	// indefinitely while each completion refreshes the fast-poll hint.  The
-	// pressure bit lasts for the current poll cycle and is the precise signal for
-	// work that has actually been handed to the foreground Graph lane.
-	active := b.pollForegroundPressure
-	b.pollMu.Unlock()
-	return active
-}
-
 func (b *Bridge) nextPollInterval(base time.Duration, now time.Time) time.Duration {
 	if base <= 0 {
 		base = 5 * time.Second
@@ -3267,16 +3241,6 @@ func (b *Bridge) normalOptionalMaintenanceStillAllowed(ctx context.Context) (boo
 // wake immediately after a restart or a long executor completion.
 func (b *Bridge) optionalMaintenancePlanForOwner(ctx context.Context, now time.Time) (optionalMaintenancePlan, error) {
 	return b.optionalMaintenancePlanForOwnerWithOutboxResult(ctx, now, mainLoopOutboxFlushResult{})
-}
-
-// optionalMaintenancePlanForOwnerWithOutbox adds only a cycle-local hint from
-// the preceding outbox phase. It is intentionally not part of the durable
-// TeamsOperationalBacklog schema: a queued outbox is re-read on the next
-// cycle, while the hint cannot create a second frontier or alter outbox CAS.
-func (b *Bridge) optionalMaintenancePlanForOwnerWithOutbox(ctx context.Context, now time.Time, suppressForOutbox bool) (optionalMaintenancePlan, error) {
-	return b.optionalMaintenancePlanForOwnerWithOutboxResult(ctx, now, mainLoopOutboxFlushResult{
-		SuppressOptionalMaintenance: suppressForOutbox,
-	})
 }
 
 func (b *Bridge) optionalMaintenancePlanForOwnerWithOutboxResult(ctx context.Context, now time.Time, outboxResult mainLoopOutboxFlushResult) (optionalMaintenancePlan, error) {
@@ -3518,20 +3482,6 @@ func (b *Bridge) backlogOptionalMaintenanceFailed(now time.Time) {
 	b.backlogMaintenanceMu.Lock()
 	b.backlogOptionalMaintenanceDueAt = now.Add(optionalMaintenanceBacklogFairRetryInterval)
 	b.backlogMaintenanceMu.Unlock()
-}
-
-func optionalMaintenanceBacklogReason(backlog teamstore.TeamsOperationalBacklog) string {
-	reasons := make([]string, 0, 3)
-	if backlog.ActiveTurns {
-		reasons = append(reasons, "active-turns")
-	}
-	if backlog.PendingInbound {
-		reasons = append(reasons, "pending-inbound")
-	}
-	if backlog.OperationalPollFrontier {
-		reasons = append(reasons, "poll-frontier")
-	}
-	return "Teams backlog: " + strings.Join(reasons, ",")
 }
 
 func (b *Bridge) optionalMaintenanceNeedsMandatory(ctx context.Context) (bool, error) {
@@ -4840,10 +4790,6 @@ func (b *Bridge) pollFrontierRecoveryRequiredContext(ctx context.Context, chatID
 		strings.TrimSpace(session.CodexThreadID) != ""
 }
 
-func (b *Bridge) pollFrontierRecoveryRequired(chatID string) bool {
-	return b.pollFrontierRecoveryRequiredContext(nil, chatID)
-}
-
 func (b *Bridge) pollStateHasDurableHistoryContext(ctx context.Context, chatID string, poll teamstore.ChatPollState) bool {
 	// Seeded was added after the first poll-frontier format and was omitted by
 	// older JSON encoders when false. A non-zero successful-poll watermark or
@@ -4851,10 +4797,6 @@ func (b *Bridge) pollStateHasDurableHistoryContext(ctx context.Context, chatID s
 	// such a row as a first observation would mark the current Graph head seen
 	// and permanently discard the user's next message.
 	return !poll.LastSuccessfulPollAt.IsZero() || !poll.LastModifiedCursor.IsZero() || b.pollFrontierRecoveryRequiredContext(ctx, chatID)
-}
-
-func (b *Bridge) pollStateHasDurableHistory(chatID string, poll teamstore.ChatPollState) bool {
-	return b.pollStateHasDurableHistoryContext(nil, chatID, poll)
 }
 
 func (b *Bridge) registryHasSeenOrSentForPoll(chatID string, messageID string) bool {
@@ -4968,10 +4910,6 @@ func effectiveOwnerPollTop(top int) int {
 		return ownerPollMessageTop
 	}
 	return normalizedMessageTop(top)
-}
-
-func pollableWorkSessionFromRegistry(state teamstore.State, session Session, controlChatID string) (Session, bool) {
-	return pollableWorkSessionFromRegistryOptions(state.Sessions, session, controlChatID, len(state.Sessions) > 0)
 }
 
 func pollableWorkSessionFromRegistryOptions(sessions map[string]teamstore.SessionContext, session Session, controlChatID string, requireDurable bool) (Session, bool) {
@@ -5332,184 +5270,6 @@ func withInboundPollGraphBudget(ctx context.Context, budget time.Duration) (cont
 		ctx = context.Background()
 	}
 	return context.WithTimeout(ctx, budget)
-}
-
-// pollChatWithRoleStateOptionsLegacy is retained temporarily as a reference
-// for compatibility tests while the production path below uses one durable
-// frontier and a fenced page receipt. It is not called by runtime code.
-func (b *Bridge) pollChatWithRoleStateOptionsLegacy(ctx context.Context, chatID string, top int, role inboundPollRole, running bool, poll teamstore.ChatPollState, hasPoll bool, opts pollChatWithRoleOptions, handle func(context.Context, ChatMessage, string) error) (bool, error) {
-	if err := b.ensureStore(); err != nil {
-		return false, err
-	}
-	seeded := hasPoll && poll.Seeded
-	var modifiedAfter time.Time
-	if seeded && !poll.LastModifiedCursor.IsZero() {
-		modifiedAfter = poll.LastModifiedCursor.Add(-pollCursorOverlap)
-	}
-	readCtx, cancelRead := withInboundPollGraphTimeout(ctx)
-	window, err := b.readClient().ListMessagesWindowWithoutRateLimitRetry(readCtx, chatID, top, modifiedAfter)
-	cancelRead()
-	if err != nil {
-		_ = b.recordChatPollErrorWithCurrentOwner(ctx, chatID, err.Error(), inboundPollBlockedUntil(poll, err, time.Now()))
-		return false, err
-	}
-	headResult, err := b.handlePollMessageWindow(ctx, chatID, role, poll, hasPoll, window, top, 0, handle)
-	if err != nil {
-		return headResult.Handled, err
-	}
-	activeClaimHeldCursor := headResult.ActiveClaimHeld
-	maxModified := headResult.MaxModified
-	windowFull := headResult.WindowFull
-	fetched := headResult.Fetched
-	handled := headResult.Handled
-	activityAt := headResult.ActivityAt
-	continuationPath := existingWorkContinuationPath(role, poll)
-	headContinuationPath := ""
-	deferredContinuationPath := strings.TrimSpace(poll.DeferredContinuationPath)
-	deferredContinuationWasPersisted := deferredContinuationPath != ""
-	clearDeferredContinuationPath := false
-	if seeded && role != inboundPollRoleControl && window.Truncated {
-		headContinuationPath = strings.TrimSpace(window.NextPath)
-		if strings.TrimSpace(continuationPath) == "" {
-			continuationPath = headContinuationPath
-		} else if headContinuationPath != "" && headContinuationPath != continuationPath && deferredContinuationPath == "" {
-			// A head response and an older durable continuation are two
-			// independent Graph frontiers. Keep the fresh head page until the
-			// older frontier has drained instead of overwriting either one.
-			deferredContinuationPath = headContinuationPath
-		} else if headContinuationPath != "" && headContinuationPath != continuationPath && deferredContinuationPath != "" && deferredContinuationPath != headContinuationPath {
-			// There is no safe place for a third independent frontier in the
-			// bounded state model.  Keep the two durable paths and fail this
-			// chat locally instead of silently dropping the new head path.
-			frontierErr := fmt.Errorf("multiple Graph continuation frontiers require recovery for chat %s", chatID)
-			_ = b.recordChatPollErrorWithCurrentOwner(ctx, chatID, frontierErr.Error(), inboundPollBlockedUntil(poll, frontierErr, time.Now()))
-			return headResult.Handled, frontierErr
-		}
-	}
-	clearedStaleTerminalHeadContinuation := false
-	// Head traffic must not starve an already durable continuation. The
-	// continuation is still limited to MaxBacklogActions (normally one) and
-	// remains behind the same per-chat poll call, so this is a fairness quantum,
-	// not an unbounded backlog drain or a second concurrent writer.
-	if seeded && role != inboundPollRoleControl && opts.AllowBacklogDrain && strings.TrimSpace(poll.ContinuationPath) != "" {
-		readCtx, cancelRead := withInboundPollGraphTimeout(ctx)
-		backlogWindow, backlogErr := b.readClient().ListMessagesWindowFromPathWithoutRateLimitRetry(readCtx, poll.ContinuationPath)
-		cancelRead()
-		if backlogErr != nil {
-			if opts.RecoverStaleContinuation && stalePollContinuationError(backlogErr) {
-				// A stale Graph continuation proves only that this particular
-				// cursor can no longer be dereferenced.  It does not prove that
-				// the records behind it were delivered or deleted.  Keep the old
-				// frontier and, when the head exposed another page, persist that
-				// page as a separate deferred frontier.  Returning the error keeps
-				// this chat recoverable without falsely recording a clean cursor;
-				// the scheduler will continue unrelated chats.
-				if headContinuationPath != "" && headContinuationPath != continuationPath {
-					if deferredContinuationPath != "" && deferredContinuationPath != headContinuationPath {
-						frontierErr := fmt.Errorf("multiple Graph continuation frontiers require recovery for chat %s", chatID)
-						_ = b.recordChatPollErrorWithCurrentOwner(ctx, chatID, frontierErr.Error(), inboundPollBlockedUntil(poll, frontierErr, time.Now()))
-						return handled, frontierErr
-					}
-					if strings.TrimSpace(poll.DeferredContinuationPath) == "" {
-						if persistErr := b.updateChatPollScheduleForCurrentOwner(ctx, teamstore.ChatPollScheduleUpdate{
-							ChatID:                      chatID,
-							DeferredContinuationPath:    headContinuationPath,
-							SetDeferredContinuationPath: true,
-						}); persistErr != nil {
-							_ = b.recordChatPollErrorWithCurrentOwner(ctx, chatID, persistErr.Error(), inboundPollBlockedUntil(poll, persistErr, time.Now()))
-							return handled, persistErr
-						}
-					}
-				}
-				_ = b.recordChatPollErrorWithCurrentOwner(ctx, chatID, backlogErr.Error(), inboundPollBlockedUntil(poll, backlogErr, time.Now()))
-				return handled, backlogErr
-			} else {
-				if deferredContinuationPath != "" && strings.TrimSpace(poll.DeferredContinuationPath) == "" {
-					_ = b.updateChatPollScheduleForCurrentOwner(ctx, teamstore.ChatPollScheduleUpdate{
-						ChatID:                      chatID,
-						DeferredContinuationPath:    deferredContinuationPath,
-						SetDeferredContinuationPath: true,
-					})
-				}
-				_ = b.recordChatPollErrorWithCurrentOwner(ctx, chatID, backlogErr.Error(), inboundPollBlockedUntil(poll, backlogErr, time.Now()))
-				return handled, backlogErr
-			}
-		} else {
-			backlogResult, backlogErr := b.handlePollMessageWindow(ctx, chatID, role, poll, hasPoll, backlogWindow, top, opts.MaxBacklogActions, handle)
-			if backlogErr != nil {
-				return handled || backlogResult.Handled, backlogErr
-			}
-			handled = handled || backlogResult.Handled
-			activeClaimHeldCursor = activeClaimHeldCursor || backlogResult.ActiveClaimHeld
-			activityAt = latestTime(activityAt, backlogResult.ActivityAt)
-			maxModified = latestTime(maxModified, backlogResult.MaxModified)
-			windowFull = windowFull || backlogResult.WindowFull
-			fetched += backlogResult.Fetched
-			if !backlogResult.ActionLimitReached {
-				if backlogWindow.Truncated {
-					if strings.TrimSpace(backlogWindow.NextPath) == strings.TrimSpace(poll.ContinuationPath) {
-						repeatedErr := fmt.Errorf("Graph continuation repeated without progress for chat %s", chatID)
-						_ = b.recordChatPollErrorWithCurrentOwner(ctx, chatID, repeatedErr.Error(), inboundPollBlockedUntil(poll, repeatedErr, time.Now()))
-						return handled, repeatedErr
-					}
-					continuationPath = backlogWindow.NextPath
-				} else if deferredContinuationPath != "" && (deferredContinuationWasPersisted || shouldKeepTerminalHeadContinuation(poll, headResult)) {
-					continuationPath = deferredContinuationPath
-					deferredContinuationPath = ""
-					clearDeferredContinuationPath = true
-				} else if headContinuationPath != "" && shouldKeepTerminalHeadContinuation(poll, headResult) {
-					continuationPath = headContinuationPath
-				} else {
-					continuationPath = ""
-					clearedStaleTerminalHeadContinuation = headContinuationPath != ""
-				}
-			}
-		}
-	}
-	if clearedStaleTerminalHeadContinuation {
-		windowFull = false
-	}
-	if headContinuationPath != "" && strings.TrimSpace(poll.ContinuationPath) != "" && strings.TrimSpace(continuationPath) != headContinuationPath {
-		maxModified = poll.LastModifiedCursor
-	}
-	if activeClaimHeldCursor {
-		// A later continuation page may contain newer messages than a head
-		// message still claimed by another live owner. Do not let successful
-		// backlog handling advance the cursor past that unresolved claim.
-		maxModified = poll.LastModifiedCursor
-	}
-	if role == inboundPollRoleControl {
-		b.notePollSuccess(time.Now())
-	}
-	if handled && activityAt.IsZero() {
-		activityAt = time.Now()
-	}
-	if session := b.sessionByChatIDForPollContext(ctx, chatID); session != nil && b.sessionQuarantineFenced(session.ID) {
-		_, err := b.recordChatPollSuccessWithSchedule(ctx, chatID, maxModified, true, false, fetched, "", func(poll teamstore.ChatPollState) (teamstore.ChatPollScheduleUpdate, error) {
-			return teamstore.ChatPollScheduleUpdate{
-				ChatID:                        chatID,
-				PollState:                     inboundPollStateParked,
-				PreviousPollState:             poll.PreviousPollState,
-				ClearBlockedUntil:             true,
-				ClearContinuationPath:         true,
-				ClearDeferredContinuationPath: true,
-				ResetFailures:                 true,
-			}, nil
-		})
-		if err == nil {
-			// Persist the bounded seen-ID projection immediately. The durable poll
-			// cursor plus this overlap ledger ensures messages discarded from the
-			// breaker window cannot be replayed after a crash or unquarantine.
-			err = b.Save()
-		}
-		return handled, err
-	}
-	if opts.ParkedProbe && role == inboundPollRoleWork && !handled {
-		_, err = b.recordParkedProbeSuccessAndSchedule(ctx, chatID, maxModified, true, windowFull, fetched, continuationPath, activityAt)
-	} else {
-		_, err = b.recordChatPollSuccessAndSchedule(ctx, chatID, role, running, maxModified, true, windowFull, fetched, continuationPath, deferredContinuationPath, clearDeferredContinuationPath, activityAt)
-	}
-	return handled, err
 }
 
 // pollChatWithRoleStateOptions performs exactly one logical page operation.
@@ -6842,20 +6602,6 @@ func (b *Bridge) handlePollMessageWindow(ctx context.Context, chatID string, rol
 	return result, nil
 }
 
-func existingWorkContinuationPath(role inboundPollRole, poll teamstore.ChatPollState) string {
-	if role == inboundPollRoleControl {
-		return ""
-	}
-	return strings.TrimSpace(poll.ContinuationPath)
-}
-
-func shouldKeepTerminalHeadContinuation(poll teamstore.ChatPollState, head pollMessageWindowResult) bool {
-	if poll.LastModifiedCursor.IsZero() {
-		return true
-	}
-	return head.MaxModified.After(poll.LastModifiedCursor)
-}
-
 func stalePollContinuationError(err error) bool {
 	var graphErr *GraphStatusError
 	if !errors.As(err, &graphErr) {
@@ -6990,12 +6736,6 @@ func pollWindowHasUsableModifiedTimes(window MessageWindow) bool {
 	return true
 }
 
-func (b *Bridge) scheduleChatAfterPoll(ctx context.Context, chatID string, role inboundPollRole, running bool, poll teamstore.ChatPollState, activityAt time.Time) error {
-	now := time.Now()
-	update := chatPollScheduleUpdateAfterPoll(chatID, role, running, poll, activityAt, now)
-	return b.updateChatPollScheduleForCurrentOwner(ctx, update)
-}
-
 func (b *Bridge) updateChatPollScheduleForCurrentOwner(ctx context.Context, update teamstore.ChatPollScheduleUpdate) error {
 	if b == nil || b.store == nil {
 		return nil
@@ -7026,34 +6766,6 @@ func (b *Bridge) markChatPollParkNoticeSentForCurrentOwner(ctx context.Context, 
 	}
 	_, err := b.store.MarkChatPollParkNoticeSent(ctx, chatID, at)
 	return err
-}
-
-func (b *Bridge) recordChatPollSuccessAndSchedule(ctx context.Context, chatID string, role inboundPollRole, running bool, lastModifiedCursor time.Time, seeded bool, windowFull bool, fetched int, continuationPath string, deferredContinuationPath string, clearDeferredContinuationPath bool, activityAt time.Time) (teamstore.ChatPollState, error) {
-	poll, err := b.recordChatPollSuccessWithSchedule(ctx, chatID, lastModifiedCursor, seeded, windowFull, fetched, continuationPath, func(poll teamstore.ChatPollState) (teamstore.ChatPollScheduleUpdate, error) {
-		update := chatPollScheduleUpdateAfterPoll(chatID, role, running, poll, activityAt, time.Now())
-		if clearDeferredContinuationPath {
-			update.ClearDeferredContinuationPath = true
-		} else if deferred := strings.TrimSpace(deferredContinuationPath); deferred != "" {
-			update.DeferredContinuationPath = deferred
-			update.SetDeferredContinuationPath = true
-		}
-		return update, nil
-	})
-	if err != nil {
-		return poll, err
-	}
-	if role == inboundPollRoleWork {
-		if clearErr := b.clearTerminalWorkChatPollState(ctx, chatID); clearErr != nil {
-			return poll, clearErr
-		}
-		if markerErr := b.markSessionPollFrontierInitialized(ctx, chatID); markerErr != nil {
-			if errors.Is(markerErr, teamstore.ErrControlLeaseNotHeld) {
-				return poll, pollLeaseFailure(markerErr)
-			}
-			return poll, pollStoreFailure(markerErr)
-		}
-	}
-	return poll, nil
 }
 
 // markSessionPollFrontierInitialized records the one-time admission hint only
@@ -7095,52 +6807,6 @@ func (b *Bridge) markSessionPollFrontierInitialized(ctx context.Context, chatID 
 		b.syncRegistrySessionProjection(registrySessionFromDurable(next))
 	}
 	return nil
-}
-
-func (b *Bridge) recordParkedProbeSuccessAndSchedule(ctx context.Context, chatID string, lastModifiedCursor time.Time, seeded bool, windowFull bool, fetched int, continuationPath string, activityAt time.Time) (teamstore.ChatPollState, error) {
-	return b.recordChatPollSuccessWithSchedule(ctx, chatID, lastModifiedCursor, seeded, windowFull, fetched, continuationPath, func(poll teamstore.ChatPollState) (teamstore.ChatPollScheduleUpdate, error) {
-		return teamstore.ChatPollScheduleUpdate{
-			ChatID:            chatID,
-			PollState:         inboundPollStateParked,
-			NextPollAt:        time.Now().Add(inboundPollParkProbeInterval),
-			LastActivityAt:    activityAt,
-			ClearBlockedUntil: true,
-			ResetFailures:     true,
-		}, nil
-	})
-}
-
-func (b *Bridge) recordChatPollSuccessWithSchedule(ctx context.Context, chatID string, lastModifiedCursor time.Time, seeded bool, windowFull bool, fetched int, continuationPath string, schedule func(teamstore.ChatPollState) (teamstore.ChatPollScheduleUpdate, error)) (teamstore.ChatPollState, error) {
-	if machineID, leaseGeneration, ownerBound := b.transcriptCheckpointOwnerCapabilityForContext(ctx); ownerBound {
-		return b.store.RecordChatPollSuccessWithContinuationAndScheduleForOwner(ctx, chatID, lastModifiedCursor, seeded, windowFull, fetched, continuationPath, schedule, machineID, leaseGeneration)
-	}
-	return b.store.RecordChatPollSuccessWithContinuationAndSchedule(ctx, chatID, lastModifiedCursor, seeded, windowFull, fetched, continuationPath, schedule)
-}
-
-func chatPollScheduleUpdateAfterPoll(chatID string, role inboundPollRole, running bool, poll teamstore.ChatPollState, activityAt time.Time, now time.Time) teamstore.ChatPollScheduleUpdate {
-	poll.NextPollAt = time.Time{}
-	decision := decideInboundPoll(inboundPollInput{
-		ChatID:          chatID,
-		Role:            role,
-		Poll:            poll,
-		HasPoll:         true,
-		Running:         running,
-		ForceActivityAt: activityAt,
-		Now:             now,
-	})
-	next := decision.NextPollAt
-	if decision.Interval > 0 {
-		next = nextInboundPollAt(now, decision.Interval)
-	}
-	return teamstore.ChatPollScheduleUpdate{
-		ChatID:            chatID,
-		PollState:         decision.State,
-		PreviousPollState: decision.PreviousState,
-		NextPollAt:        next,
-		LastActivityAt:    activityAt,
-		ClearBlockedUntil: true,
-		ResetFailures:     true,
-	}
 }
 
 func (b *Bridge) effectiveMaxWorkChatPollsPerCycle() int {
@@ -7792,19 +7458,6 @@ func bindInboundPollScheduleRevision(update teamstore.ChatPollScheduleUpdate, po
 	return update
 }
 
-func durableAutoParkHandoffScheduleUpdate(decision inboundPollDecision) (teamstore.ChatPollScheduleUpdate, bool) {
-	if !decision.ShouldPark || strings.TrimSpace(decision.ChatID) == "" {
-		return teamstore.ChatPollScheduleUpdate{}, false
-	}
-	return teamstore.ChatPollScheduleUpdate{
-		ChatID:            decision.ChatID,
-		PollState:         inboundPollStateCold,
-		NextPollAt:        decision.NextPollAt,
-		LastActivityAt:    decision.LastActivityAt,
-		ClearBlockedUntil: true,
-	}, true
-}
-
 func inboundPollDecisionAlreadyPersisted(poll teamstore.ChatPollState, hasPoll bool, decision inboundPollDecision) bool {
 	if !hasPoll {
 		return false
@@ -8003,19 +7656,6 @@ func isPersistentPollFailureCandidate(err error) bool {
 		}
 	}
 	return false
-}
-
-func runningPollSessions(state teamstore.State) map[string]bool {
-	running := make(map[string]bool)
-	for _, turn := range state.Turns {
-		switch turn.Status {
-		case teamstore.TurnStatusQueued, teamstore.TurnStatusRunning:
-			if strings.TrimSpace(turn.SessionID) != "" {
-				running[turn.SessionID] = true
-			}
-		}
-	}
-	return running
 }
 
 func pollSessionTurnQueueStates(state teamstore.State) map[string]sessionTurnQueueState {
@@ -12585,35 +12225,6 @@ func helperUpgradeCompletionOutboxID(req teamstore.UpgradeRequest, tag string, c
 	return "outbox:control:helper-upgrade-complete:" + shortStableID(seed)
 }
 
-func existingHelperUpgradeCompletionOutbox(state teamstore.State, req teamstore.UpgradeRequest, expected teamstore.OutboxMessage) (teamstore.OutboxMessage, bool) {
-	chatID := strings.TrimSpace(expected.TeamsChatID)
-	if chatID == "" {
-		return teamstore.OutboxMessage{}, false
-	}
-	expectedBody := strings.TrimSpace(expected.Body)
-	var best teamstore.OutboxMessage
-	found := false
-	for _, outbox := range state.OutboxMessages {
-		if strings.TrimSpace(outbox.TeamsChatID) != chatID {
-			continue
-		}
-		if !strings.EqualFold(strings.TrimSpace(outbox.Kind), "control-"+helperRestartNoticeActionUpgrade+"-complete") {
-			continue
-		}
-		if expectedBody != "" && strings.TrimSpace(outbox.Body) != expectedBody {
-			continue
-		}
-		if !req.CompletedAt.IsZero() && !outbox.CreatedAt.IsZero() && outbox.CreatedAt.Before(req.CompletedAt.Add(-10*time.Minute)) {
-			continue
-		}
-		if !found || outbox.CreatedAt.After(best.CreatedAt) {
-			best = outbox
-			found = true
-		}
-	}
-	return best, found
-}
-
 func helperLifecycleCompletedNoticeBody(action string, tag string) string {
 	switch normalizedHelperRestartNoticeAction(action) {
 	case helperRestartNoticeActionReload:
@@ -13565,10 +13176,6 @@ func (b *Bridge) effectiveControlFallbackModel() string {
 		return model
 	}
 	return DefaultControlFallbackModel
-}
-
-func (b *Bridge) controlFallbackCodexPrompt(ctx context.Context, prompt string) string {
-	return b.controlFallbackCodexPromptForMessage(ctx, prompt, "")
 }
 
 func (b *Bridge) controlFallbackCodexPromptForMessage(ctx context.Context, prompt string, excludeMessageID string) string {
@@ -14928,14 +14535,6 @@ func (b *Bridge) queueTeamsPromptAckForMessage(ctx context.Context, session *Ses
 	return b.queueTeamsPromptAckWithBodyForMessage(ctx, session, turn, body, msg)
 }
 
-func (b *Bridge) queueTeamsPromptBlockedAck(ctx context.Context, session *Session, turn teamstore.Turn, gate localCodexBeforeTeamsGate) error {
-	return b.queueTeamsPromptBlockedAckForMessage(ctx, session, turn, ChatMessage{}, gate)
-}
-
-func (b *Bridge) queueTeamsPromptBlockedAckForMessage(ctx context.Context, session *Session, turn teamstore.Turn, msg ChatMessage, gate localCodexBeforeTeamsGate) error {
-	return b.queueTeamsPromptAckWithBodyForMessage(ctx, session, turn, b.formatBlockedTeamsPromptAck(ctx, session, gate), msg)
-}
-
 func (b *Bridge) formatBlockedTeamsPromptAck(ctx context.Context, session *Session, gate localCodexBeforeTeamsGate) string {
 	return b.formatBlockedTeamsPromptAckFromSnapshot(ctx, session, gate, nil)
 }
@@ -15170,10 +14769,6 @@ func turnPromptSummary(state teamstore.State, turn teamstore.Turn) string {
 	text = strings.Join(strings.Fields(text), " ")
 	text = strings.ReplaceAll(text, "`", "'")
 	return shortenTeamsLine(text, 180)
-}
-
-func (b *Bridge) queueTeamsPromptAckWithBody(ctx context.Context, session *Session, turn teamstore.Turn, body string) error {
-	return b.queueTeamsPromptAckWithBodyForMessage(ctx, session, turn, body, ChatMessage{})
 }
 
 func (b *Bridge) queueTeamsPromptAckWithBodyForMessage(ctx context.Context, session *Session, turn teamstore.Turn, body string, msg ChatMessage) error {
@@ -15574,10 +15169,6 @@ func classifyDeferredInboundFailure(err error) deferredInboundFailureDisposition
 		return deferredInboundFailureUncertain
 	}
 	return deferredInboundFailureFatal
-}
-
-func isDeferredInboundExternalOutcomeUnknown(err error) bool {
-	return classifyDeferredInboundFailure(err) == deferredInboundFailureUncertain
 }
 
 func (b *Bridge) handleDeferredInboundRowFailure(ctx context.Context, inbound teamstore.InboundEvent, rowErr error) (bool, error) {
@@ -16723,13 +16314,6 @@ func controlNewSessionArgument(text string) (string, error) {
 	return "", fmt.Errorf("deferred control input is no longer a new-session command")
 }
 
-func controlPublishTarget(text string) (DashboardCommandTarget, error) {
-	if parsed := ParseDashboardCommand(ChatScopeControl, text); parsed.HelperCommand && parsed.Name == DashboardCommandPublish {
-		return parsed.Target, nil
-	}
-	return DashboardCommandTarget{}, fmt.Errorf("deferred control input is no longer a publish command")
-}
-
 // updateDeferredInboundDisposition records a non-terminal recovery fence in
 // the inbound ledger.  It is intentionally a row-local status: held or
 // uncertain control input must not keep unrelated Work chats out of the
@@ -17745,15 +17329,6 @@ func (b *Bridge) recordDeferredInboundRetry(ctx context.Context, inbound teamsto
 	return err
 }
 
-// isDeferredInboundRowLocalFailure is retained for narrow callers that only
-// need to ask whether a retry gate is appropriate.  It must not classify an
-// arbitrary GraphStatusError or EOF as row-local: a POST/PATCH response loss
-// is an unknown external outcome, and an untyped EOF may come from the
-// executor rather than a safe Graph read.
-func isDeferredInboundRowLocalFailure(err error) bool {
-	return classifyDeferredInboundFailure(err) == deferredInboundFailureRetry
-}
-
 func isPermanentMissingDeferredTeamsMessage(err error) bool {
 	var graphErr *GraphStatusError
 	return errors.As(err, &graphErr) && graphErr.StatusCode == http.StatusNotFound
@@ -18116,48 +17691,10 @@ func ensurePrivateDirectory(path string) error {
 	return os.Chmod(path, 0o700)
 }
 
-func (b *Bridge) queueAndSendAttachmentOutbox(ctx context.Context, sessionID string, turnID string, chatID string, kind string, message string, item DriveItem) (teamstore.OutboxMessage, error) {
-	queued, err := b.queueOutbox(ctx, teamstore.OutboxMessage{
-		ID:              attachmentOutboxID(chatID, kind, item),
-		SessionID:       sessionID,
-		TurnID:          turnID,
-		TeamsChatID:     chatID,
-		Kind:            kind,
-		Body:            strings.TrimSpace(message),
-		DriveItemID:     strings.TrimSpace(item.ID),
-		DriveItemName:   strings.TrimSpace(item.Name),
-		DriveItemETag:   strings.TrimSpace(item.ETag),
-		DriveItemWebURL: strings.TrimSpace(item.WebURL),
-		DriveItemWebDav: strings.TrimSpace(item.WebDavURL),
-	})
-	if err != nil {
-		return teamstore.OutboxMessage{}, err
-	}
-	if queued.Status != teamstore.OutboxStatusSent {
-		if err := b.flushPendingOutboxForChat(ctx, chatID); err != nil && !isOutboxDeliveryDeferred(err) {
-			return teamstore.OutboxMessage{}, err
-		}
-		state, err := b.store.Load(ctx)
-		if err != nil {
-			return teamstore.OutboxMessage{}, err
-		}
-		if current, ok := state.OutboxMessages[queued.ID]; ok {
-			queued = current
-		}
-	}
-	return queued, nil
-}
-
 func attachmentUploadOutboxID(chatID string, kind string, file OutboundAttachmentFile) string {
 	id := strings.TrimSpace(firstNonEmptyString(file.UploadName, file.Path, file.Name))
 	sum := sha256.Sum256([]byte(chatID + "\x00" + kind + "\x00" + id))
 	return "outbox:attachment-upload:" + hex.EncodeToString(sum[:])
-}
-
-func attachmentOutboxID(chatID string, kind string, item DriveItem) string {
-	id := strings.TrimSpace(firstNonEmptyString(item.ID, item.WebURL, item.WebDavURL, item.Name))
-	sum := sha256.Sum256([]byte(chatID + "\x00" + kind + "\x00" + id))
-	return "outbox:attachment:" + hex.EncodeToString(sum[:])
 }
 
 func attachmentContentHash(data []byte) string {
@@ -18173,18 +17710,6 @@ func driveItemFromOutbox(outbox teamstore.OutboxMessage) DriveItem {
 		WebURL:    strings.TrimSpace(outbox.DriveItemWebURL),
 		WebDavURL: strings.TrimSpace(outbox.DriveItemWebDav),
 	}
-}
-
-func validateArtifactManifestFile(req ArtifactManifestValidationRequest) (ArtifactManifestFileInfo, error) {
-	info, err := os.Lstat(req.LocalPath)
-	if err != nil {
-		return ArtifactManifestFileInfo{}, outboundPathError("inspect artifact file", err)
-	}
-	return ArtifactManifestFileInfo{
-		Size:      info.Size(),
-		IsDir:     info.IsDir(),
-		IsSymlink: info.Mode()&os.ModeSymlink != 0,
-	}, nil
 }
 
 func artifactRecordID(sessionID string, turnID string, cleanPath string, uploadName string) string {
@@ -20067,10 +19592,6 @@ func retryTurnID(turnID string, commandID string) string {
 	return turnID + ":retry:" + shortStableID(commandID)
 }
 
-func (b *Bridge) rejectSessionAttachment(ctx context.Context, session *Session, msg ChatMessage) error {
-	return b.rejectSessionAttachmentWithMessage(ctx, session, msg, UnsupportedAttachmentMessage(msg.Attachments))
-}
-
 func attachmentDownloadUserMessage(err error) (string, bool) {
 	if err == nil {
 		return "", false
@@ -21266,34 +20787,6 @@ func sameCodexVisibleText(left string, right string) bool {
 	return strings.TrimSpace(StripOAIMemoryCitationBlocks(StripHelperPromptEchoes(StripArtifactManifestBlocks(left)))) == strings.TrimSpace(StripOAIMemoryCitationBlocks(StripHelperPromptEchoes(StripArtifactManifestBlocks(right))))
 }
 
-func formatCodexCommandStarted(event codexrunner.StreamEvent) string {
-	command := strings.TrimSpace(event.Command)
-	if command == "" {
-		command = "(command unavailable)"
-	}
-	return "Running command:\n" + command
-}
-
-func formatCodexCommandCompleted(event codexrunner.StreamEvent) string {
-	command := strings.TrimSpace(event.Command)
-	if command == "" {
-		command = "(command unavailable)"
-	}
-	status := strings.TrimSpace(event.Status)
-	if status == "" {
-		status = "completed"
-	}
-	exit := "unknown"
-	if event.ExitCode != nil {
-		exit = strconvItoa(*event.ExitCode)
-	}
-	output := trimTeamsCommandOutput(event.AggregatedOutput, maxTeamsCommandOutputRunes)
-	if strings.TrimSpace(output) == "" {
-		output = "(no output)"
-	}
-	return "Command:\n" + command + "\n\nStatus: " + status + "\nExit code: " + exit + "\n\nOutput:\n" + output
-}
-
 func trimTeamsCommandOutput(text string, limit int) string {
 	text = normalizeTeamsRenderText(text)
 	if limit <= 0 || len([]rune(text)) <= limit {
@@ -21306,10 +20799,6 @@ func trimTeamsCommandOutput(text string, limit int) string {
 		return string(runes[:limit])
 	}
 	return string(runes[:head]) + "\n\n[output truncated]\n\n" + string(runes[len(runes)-tail:])
-}
-
-func (b *Bridge) startActiveOwnerHeartbeat(ctx context.Context, sessionID string, turnID string) <-chan error {
-	return b.startActiveOwnerHeartbeatWithFailureCallback(ctx, sessionID, turnID, nil)
 }
 
 func (b *Bridge) startActiveOwnerHeartbeatWithFailureCallback(ctx context.Context, sessionID string, turnID string, onFailure func(error)) <-chan error {
@@ -21953,16 +21442,6 @@ func (b *Bridge) refreshControlLeaseForHeartbeat(ctx context.Context) error {
 	return nil
 }
 
-func (b *Bridge) clearOwnerIfSame(ctx context.Context) {
-	b.ownerMu.Lock()
-	owner := b.owner
-	b.ownerMu.Unlock()
-	if owner.PID <= 0 || b.store == nil {
-		return
-	}
-	_, _ = b.store.ClearOwnerIfSame(ctx, owner)
-}
-
 func (b *Bridge) sendControl(ctx context.Context, text string) error {
 	return b.sendToChat(ctx, b.reg.ControlChatID, text)
 }
@@ -22021,10 +21500,6 @@ func (b *Bridge) sendControlNewDuplicateNotice(ctx context.Context, msg ChatMess
 		return nil
 	}
 	return b.flushPendingOutboxForChat(ctx, chatID)
-}
-
-func (b *Bridge) sendDeferredUpgradeNotice(ctx context.Context, chatID string, inbound teamstore.InboundEvent) error {
-	return b.sendDeferredServiceControlNotice(ctx, chatID, inbound, teamstore.ServiceControl{Draining: true, Reason: teamstore.HelperUpgradeReason})
 }
 
 func (b *Bridge) sendDeferredServiceControlNotice(ctx context.Context, chatID string, inbound teamstore.InboundEvent, control teamstore.ServiceControl) error {
@@ -22888,27 +22363,6 @@ func inboundTextHashForTeamsMessage(text string, msg ChatMessage) string {
 	return normalizedTextHash(text)
 }
 
-func (b *Bridge) deferSessionMessageDuringTranscriptImport(ctx context.Context, session *Session, msg ChatMessage) error {
-	if session == nil {
-		return nil
-	}
-	if err := b.ensureDurableSession(ctx, session); err != nil {
-		return err
-	}
-	source := "teams_session_import_deferred"
-	if len(msg.Attachments) > 0 || len(HostedContentIDsFromHTML(msg.Body.Content)) > 0 {
-		source = "teams_session_import_deferred_attachment"
-	}
-	inbound, created, err := b.persistInboundWithStatusAndSource(ctx, session, msg, teamstore.InboundStatusDeferred, source)
-	if err != nil {
-		return err
-	}
-	if created {
-		return b.sendExternalDeferredReceipt(ctx, session.ChatID, inbound, "⏳ Codex received your question. I’m preparing this chat history first, then I’ll respond.")
-	}
-	return nil
-}
-
 type turnQueueOptions struct {
 	StartNewCodexThread bool
 }
@@ -22977,15 +22431,6 @@ func sessionWithTurnExecutionConfig(session *Session, turn teamstore.Turn) *Sess
 		clone.ReasoningEffortSource = reasoningEffortSourceLegacy
 	}
 	return &clone
-}
-
-func effectiveSessionReasoningEffort(session *Session) string {
-	return effectiveSessionReasoningEffortWithExecutor(session, nil)
-}
-
-func effectiveSessionReasoningEffortWithExecutor(session *Session, executor Executor) string {
-	effort, _ := effectiveSessionReasoningEffortResolution(session, executor)
-	return effort
 }
 
 func effectiveSessionReasoningEffortResolution(session *Session, executor Executor) (string, string) {
@@ -23257,10 +22702,6 @@ func validateFinalOutboxChunk(intended teamstore.OutboxMessage, queued teamstore
 		return nil
 	}
 	return fmt.Errorf("final outbox consistency conflict for turn %q part %d of %d", intended.TurnID, intended.PartIndex, intended.PartCount)
-}
-
-func (b *Bridge) queueAndSendTranscriptDeliveryChunksWithOptions(ctx context.Context, session Session, local codexhistory.Session, record TranscriptRecord, checkpointLine int, checkpointOffset int64, kind string, text string, opts outboxQueueOptions) error {
-	return b.queueOrSendTranscriptDeliveryChunksWithOptions(ctx, session, local, record, checkpointLine, checkpointOffset, kind, text, opts, "sync:"+session.ID, transcriptCheckpointID(session.ID), true, false, "")
 }
 
 func (b *Bridge) queueOrSendTranscriptDeliveryChunksWithOptions(ctx context.Context, session Session, local codexhistory.Session, record TranscriptRecord, checkpointLine int, checkpointOffset int64, kind string, text string, opts outboxQueueOptions, turnID string, checkpointID string, advanceCheckpoint bool, queueOnly bool, deliveryNamespace string) error {
@@ -27168,29 +26609,6 @@ func (b *Bridge) reconcilePendingSentOutboxSideEffects(ctx context.Context) erro
 	return errors.Join(errs...)
 }
 
-func (b *Bridge) recordOutboxMessageProvenance(ctx context.Context, outbox teamstore.OutboxMessage, msg ChatMessage) error {
-	if b == nil || b.store == nil {
-		return nil
-	}
-	messageID := strings.TrimSpace(firstNonEmptyString(msg.ID, outbox.TeamsMessageID))
-	if strings.TrimSpace(outbox.TeamsChatID) == "" || messageID == "" {
-		return nil
-	}
-	_, err := b.store.RecordMessageProvenance(ctx, teamstore.MessageProvenanceRecord{
-		TeamsChatID:    outbox.TeamsChatID,
-		TeamsMessageID: messageID,
-		Origin:         teamstore.MessageOriginHelperOutbox,
-		SessionID:      outbox.SessionID,
-		TurnID:         outbox.TurnID,
-		OutboxID:       outbox.ID,
-		Kind:           outbox.Kind,
-		RenderedHash:   outbox.RenderedHash,
-		CreatedAt:      outbox.CreatedAt,
-		UpdatedAt:      firstNonZeroTime(outbox.SentAt, outbox.UpdatedAt, outbox.CreatedAt),
-	})
-	return err
-}
-
 func (b *Bridge) handleSentOutboxSideEffects(ctx context.Context, outbox teamstore.OutboxMessage, msg ChatMessage) error {
 	return b.handleSentOutboxSideEffectsWithWorkflowDelivery(ctx, outbox, msg, false)
 }
@@ -27611,14 +27029,6 @@ func (b *Bridge) sendStatsToChat(ctx context.Context, chatID string, text string
 		return nil
 	}
 	return b.flushPendingOutboxForChat(ctx, chatID)
-}
-
-func (b *Bridge) sendSingleToChat(ctx context.Context, chatID string, text string) error {
-	return b.sendToChat(ctx, chatID, text)
-}
-
-func (b *Bridge) sendLongToChat(ctx context.Context, chatID string, text string) error {
-	return b.sendToChat(ctx, chatID, text)
 }
 
 func (b *Bridge) discoverDashboardProjects(ctx context.Context) ([]codexhistory.Project, error) {
@@ -31146,15 +30556,6 @@ func transcriptImportBatchOutboxKind(prefix string, first TranscriptRecord, last
 	return fmt.Sprintf("%s-batch-%04d-%s-%s", prefix, index, firstKey, lastKey)
 }
 
-func (b *Bridge) queueAndSendTranscriptImportBatch(ctx context.Context, session Session, sourcePath string, checkpointID string, turnID string, kind string, html string, first TranscriptRecord, last TranscriptRecord) error {
-	return b.queueOrSendTranscriptImportBatch(ctx, session, sourcePath, checkpointID, turnID, kind, html, first, last, outboxQueueOptions{}, false, "")
-}
-
-func (b *Bridge) queueOrSendTranscriptImportBatch(ctx context.Context, session Session, sourcePath string, checkpointID string, turnID string, kind string, html string, first TranscriptRecord, last TranscriptRecord, sourceProof outboxQueueOptions, queueOnly bool, deliveryNamespace string) error {
-	_, err := b.queueOrSendTranscriptImportBatchWithPending(ctx, session, sourcePath, checkpointID, turnID, kind, html, first, last, sourceProof, queueOnly, deliveryNamespace)
-	return err
-}
-
 func (b *Bridge) queueOrSendTranscriptImportBatchWithPending(ctx context.Context, session Session, sourcePath string, checkpointID string, turnID string, kind string, html string, first TranscriptRecord, last TranscriptRecord, sourceProof outboxQueueOptions, queueOnly bool, deliveryNamespace string) (bool, error) {
 	html = strings.TrimSpace(html)
 	if html == "" {
@@ -31209,10 +30610,6 @@ func (b *Bridge) queueOrSendTranscriptImportBatchWithPending(ctx context.Context
 		return false, err
 	}
 	return false, nil
-}
-
-func (b *Bridge) importSubagentMarkersToTeams(ctx context.Context, session Session, local codexhistory.Session, importTurnID string) error {
-	return b.importSubagentMarkersToTeamsWithOptions(ctx, session, local, importTurnID, transcriptImportRunOptions{})
 }
 
 func (b *Bridge) importSubagentMarkersToTeamsWithOptions(ctx context.Context, session Session, local codexhistory.Session, importTurnID string, opts transcriptImportRunOptions) error {
@@ -31692,10 +31089,6 @@ func (b *Bridge) classifyLocalTranscriptDelta(ctx context.Context, session Sessi
 	return out, nil
 }
 
-func (b *Bridge) advanceRecentCompletedTeamsTranscriptTail(ctx context.Context, session Session, local codexhistory.Session) (bool, error) {
-	return b.advanceRecentCompletedTeamsTranscriptTailWithParentFence(ctx, session, local, "")
-}
-
 func (b *Bridge) advanceRecentCompletedTeamsTranscriptTailWithParentFence(ctx context.Context, session Session, local codexhistory.Session, parentFenceSessionID string) (bool, error) {
 	if b == nil || strings.TrimSpace(local.FilePath) == "" {
 		return false, nil
@@ -31927,14 +31320,6 @@ func (s *localTranscriptDeltaState) setCheckpointBeforeActive(records []Transcri
 	previous := records[index-1]
 	s.CheckpointBeforeActive = transcriptRecordCheckpointKey(previous)
 	s.CheckpointBeforeLine = previous.SourceLine
-}
-
-func (b *Bridge) localTranscriptHasActionableDelta(ctx context.Context, session Session, local codexhistory.Session) (bool, error) {
-	delta, err := b.classifyLocalTranscriptDelta(ctx, session, local)
-	if err != nil {
-		return false, err
-	}
-	return delta.Active || delta.NeedsSync || delta.HasActionableTranscript, nil
 }
 
 func transcriptRecordIsTerminal(record TranscriptRecord) bool {
@@ -32232,14 +31617,6 @@ func (b *Bridge) syncLinkedTranscriptsIfDueForBacklogFair(ctx context.Context, n
 
 func (b *Bridge) syncLinkedTranscripts(ctx context.Context) error {
 	return b.syncLinkedTranscriptsWithDiscoveryOptions(ctx, true, time.Time{}, false)
-}
-
-// syncLinkedTranscriptsWithDiscovery retains the synchronous behavior used by
-// maintenance and focused unit-test callers. The continuous listener uses
-// syncLinkedTranscriptsIfDue, which queues durable outbox work and lets the
-// bounded outbox phase perform Graph I/O.
-func (b *Bridge) syncLinkedTranscriptsWithDiscovery(ctx context.Context, forceDiscovery bool, now time.Time) error {
-	return b.syncLinkedTranscriptsWithDiscoveryOptions(ctx, forceDiscovery, now, false)
 }
 
 type linkedTranscriptSyncJob struct {
@@ -32834,10 +32211,6 @@ func linkedTranscriptCheckpointNeedsMandatoryMaintenance(checkpoint teamstore.Im
 	// mandatory lane instead of allowing a backlog to hide the proof check.
 	return strings.TrimSpace(checkpoint.LastRecordID) != "" &&
 		(strings.TrimSpace(checkpoint.SourcePath) == "" || strings.TrimSpace(checkpoint.SourceFingerprint) == "" || !checkpoint.LastOffsetKnown)
-}
-
-func (b *Bridge) selectBacklogLinkedRecoveryJobs(jobs []linkedTranscriptSyncJob) []linkedTranscriptSyncJob {
-	return b.selectBacklogLinkedRecoveryJobsWithLimit(jobs, maxBacklogLinkedRecoveryJobs)
 }
 
 func (b *Bridge) selectBacklogLinkedRecoveryJobsWithLimit(jobs []linkedTranscriptSyncJob, limit int) []linkedTranscriptSyncJob {
@@ -36147,13 +35520,6 @@ func (b *Bridge) blockAutomaticTranscriptSyncForAmbiguousExecution(ctx context.C
 	return err
 }
 
-func (b *Bridge) blockAutomaticTranscriptSyncForUnresolvedContinuation(ctx context.Context, session Session, local codexhistory.Session, checkpoint teamstore.ImportCheckpoint) error {
-	return b.persistHistoryOnlyContinuationQuarantine(ctx, session, local, checkpoint, Transcript{
-		SourceName:             local.FilePath,
-		UnresolvedContinuation: true,
-	})
-}
-
 func (b *Bridge) persistHistoryOnlyContinuationQuarantine(ctx context.Context, session Session, local codexhistory.Session, checkpoint teamstore.ImportCheckpoint, transcript Transcript) error {
 	quarantine := transcript.TranscriptQuarantine
 	if quarantine == nil {
@@ -37544,18 +36910,6 @@ func liveTranscriptCheckpointID(turnID string) string {
 	return "transcript-live:" + strings.TrimSpace(turnID)
 }
 
-func (b *Bridge) recordTranscriptCheckpoint(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int) error {
-	return b.recordTranscriptCheckpointWithID(ctx, session, sourcePath, lastRecordID, lastLine, transcriptCheckpointID(session.ID))
-}
-
-func (b *Bridge) recordTranscriptCheckpointWithID(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int, checkpointID string) error {
-	return b.recordTranscriptCheckpointDetailedWithID(ctx, session, sourcePath, lastRecordID, lastLine, 0, checkpointID)
-}
-
-func (b *Bridge) recordTranscriptCheckpointDetailed(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int, lastOffset int64) error {
-	return b.recordTranscriptCheckpointDetailedWithID(ctx, session, sourcePath, lastRecordID, lastLine, lastOffset, transcriptCheckpointID(session.ID))
-}
-
 func (b *Bridge) recordTranscriptCheckpointDetailedWithID(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int, lastOffset int64, checkpointID string) error {
 	return b.recordTranscriptCheckpointDetailedWithParentFence(ctx, session, sourcePath, lastRecordID, lastLine, lastOffset, checkpointID, "")
 }
@@ -37600,10 +36954,6 @@ func (b *Bridge) recordTranscriptCheckpointDetailedWithParentFence(ctx context.C
 
 func (b *Bridge) recordTranscriptCheckpointProgressDetailedWithID(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int, lastOffset int64, checkpointID string) error {
 	return b.recordTranscriptCheckpointProgressDetailedWithSourceProof(ctx, session, sourcePath, lastRecordID, lastLine, lastOffset, checkpointID, outboxQueueOptions{})
-}
-
-func (b *Bridge) recordTranscriptCheckpointProgressDetailedWithParentFence(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int, lastOffset int64, checkpointID string, parentFenceSessionID string) error {
-	return b.recordTranscriptCheckpointProgressDetailedWithSourceProofAndParentFence(ctx, session, sourcePath, lastRecordID, lastLine, lastOffset, checkpointID, outboxQueueOptions{}, parentFenceSessionID)
 }
 
 func (b *Bridge) recordTranscriptCheckpointProgressDetailedWithSourceProof(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int, lastOffset int64, checkpointID string, sourceProof outboxQueueOptions) error {
@@ -37958,20 +37308,6 @@ func importCheckpointSameExceptUpdatedAt(left teamstore.ImportCheckpoint, right 
 	return reflect.DeepEqual(left, right)
 }
 
-func executionAnchorsEqual(left *teamstore.ExecutionAnchor, right *teamstore.ExecutionAnchor) bool {
-	if left == nil || right == nil {
-		return left == nil && right == nil
-	}
-	return reflect.DeepEqual(left, right)
-}
-
-func transcriptQuarantinesEqual(left *teamstore.TranscriptQuarantine, right *teamstore.TranscriptQuarantine) bool {
-	if left == nil || right == nil {
-		return left == nil && right == nil
-	}
-	return reflect.DeepEqual(left, right)
-}
-
 func transcriptQuarantineAllowsAutomaticBranch(session Session, checkpoint teamstore.ImportCheckpoint, sourcePath string) bool {
 	quarantine := checkpoint.TranscriptQuarantine
 	if quarantine == nil || strings.TrimSpace(quarantine.LiveBranchThreadID) == "" {
@@ -38037,18 +37373,6 @@ func transcriptSourceFileStateWithChangeTime(sourcePath string) (int64, time.Tim
 // times are enough to reject an EOF/identity shortcut.
 func sourceFileRevisionStable(left, right int64) bool {
 	return left == 0 || right == 0 || left == right
-}
-
-// transcriptSourceFileStateAtCheckpoint keeps a partially written JSONL tail
-// visible to the next watcher pass.  A checkpoint may be recorded immediately
-// after the last complete record while app-server is still writing the next
-// line; persisting the whole file size in that window makes the unchanged-file
-// fast path skip the completed tail forever.  The common complete-file path is
-// still a stat-only check.  A non-newline final byte is the JSONL writer's
-// incomplete-line marker, so only that path needs the extra seek/read.
-func transcriptSourceFileStateAtCheckpoint(sourcePath string, lastOffset int64) (int64, time.Time) {
-	sourceSize, sourceModTime, _ := transcriptSourceFileStateAtCheckpointWithChangeTime(sourcePath, lastOffset)
-	return sourceSize, sourceModTime
 }
 
 func transcriptSourceFileStateAtCheckpointWithChangeTime(sourcePath string, lastOffset int64) (int64, time.Time, int64) {
@@ -38155,10 +37479,6 @@ func (b *Bridge) markTranscriptImportNeedsAttention(ctx context.Context, session
 		return checkpoint, true, nil
 	})
 	return err
-}
-
-func (b *Bridge) markTranscriptImportComplete(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int) error {
-	return b.markTranscriptImportCompleteWithID(ctx, session, sourcePath, lastRecordID, lastLine, transcriptCheckpointID(session.ID))
 }
 
 func (b *Bridge) markTranscriptImportCompleteAtEOF(ctx context.Context, session Session, sourcePath string, lastRecordID string, lastLine int) error {
@@ -39606,14 +38926,6 @@ func findCodexSession(projects []codexhistory.Project, sessionID string) (codexh
 		}
 	}
 	return codexhistory.Session{}, codexhistory.Project{}, false
-}
-
-func latestProjectModified(project codexhistory.Project) time.Time {
-	var latest time.Time
-	for _, session := range project.Sessions {
-		latest = laterDashboardTime(latest, session.ModifiedAt)
-	}
-	return latest
 }
 
 func laterDashboardTime(current time.Time, candidate time.Time) time.Time {

@@ -5376,10 +5376,6 @@ func listenerRecoveryTranscriptTaskStartedLine(turnID string) string {
 	return fmt.Sprintf(`{"type":"event_msg","payload":{"type":"task_started","turn_id":%q,"started_at":1786181089,"model_context_window":128000,"collaboration_mode_kind":"default"}}`+"\n", turnID)
 }
 
-func listenerRecoveryTranscriptPromptLine(id string, text string) string {
-	return fmt.Sprintf(`{"type":"response_item","payload":{"id":%q,"type":"message","role":"user","content":[{"type":"input_text","text":%q}]}}`+"\n", id, text)
-}
-
 func listenerRecoveryTranscriptPromptWithTurnLine(id string, turnID string, text string) string {
 	return fmt.Sprintf(`{"type":"response_item","payload":{"id":%q,"type":"message","role":"user","turn_id":%q,"content":[{"type":"input_text","text":%q}]}}`+"\n", id, turnID, text)
 }

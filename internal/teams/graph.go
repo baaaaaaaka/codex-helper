@@ -2501,10 +2501,6 @@ func sleepContext(ctx context.Context, delay time.Duration) error {
 	}
 }
 
-func shouldRetryGraphStatus(status int) bool {
-	return status == http.StatusTooManyRequests || status >= 500 && status <= 599
-}
-
 func shouldRetryGraphRequest(method string, status int) bool {
 	if status == http.StatusTooManyRequests {
 		return graphRequestMethodMayReplay(method)

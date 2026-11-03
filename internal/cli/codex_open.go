@@ -202,26 +202,6 @@ func runCodexTUIViaBroker(
 	return runCodexTUIInvocationViaBrokerWithPreflight(ctx, root, store, profile, instances, cwd, codexPath, codexDir, useProxy, agentAutoApprove, modelProfileRef, nil, tail, nil, sessionID, log)
 }
 
-func runCodexTUIInvocationViaBroker(
-	ctx context.Context,
-	root *rootOptions,
-	store *config.Store,
-	profile *config.Profile,
-	instances []config.Instance,
-	cwd string,
-	codexPath string,
-	codexDir string,
-	useProxy bool,
-	agentAutoApprove bool,
-	modelProfileRef string,
-	tuiGlobalArgs []string,
-	tuiTail []string,
-	appServerExtraArgs []string,
-	log io.Writer,
-) error {
-	return runCodexTUIInvocationViaBrokerWithHooks(ctx, root, store, profile, instances, cwd, codexPath, codexDir, useProxy, agentAutoApprove, modelProfileRef, tuiGlobalArgs, tuiTail, appServerExtraArgs, nil, nil, log)
-}
-
 func runCodexTUIInvocationViaBrokerWithPreflight(
 	ctx context.Context,
 	root *rootOptions,

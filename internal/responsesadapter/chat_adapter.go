@@ -146,29 +146,6 @@ type chatToolFunction struct {
 	Arguments string `json:"arguments"`
 }
 
-func chatRequestTools(functions []ChatTool, native []ProviderNativeTool) []any {
-	if len(functions) == 0 && len(native) == 0 {
-		return nil
-	}
-	out := make([]any, 0, len(functions)+len(native))
-	for _, tool := range functions {
-		out = append(out, tool)
-	}
-	for _, tool := range native {
-		payload := map[string]any{"type": tool.UpstreamType}
-		if tool.Name != "" {
-			payload["name"] = tool.Name
-		}
-		for key, value := range tool.Fields {
-			if key != "type" && key != "name" {
-				payload[key] = value
-			}
-		}
-		out = append(out, payload)
-	}
-	return out
-}
-
 func (a OpenAIChatAdapter) Stream(ctx context.Context, req ProviderRequest) (<-chan ProviderEvent, error) {
 	if err := validateProviderResponseFields(req, "OpenAI Chat"); err != nil {
 		return nil, err
@@ -289,10 +266,6 @@ func (m *chatBufferedMessage) UnmarshalJSON(data []byte) error {
 	}
 	*m = chatBufferedMessage(decoded)
 	return json.Unmarshal(data, &m.Raw)
-}
-
-func parseBufferedChatCompletion(ctx context.Context, body io.Reader, out chan<- ProviderEvent, validateArguments bool, reasoningPath, cachedTokensPath string, status func(string)) {
-	parseBufferedChatCompletionWithPolicy(ctx, body, out, validateArguments, reasoningPath, cachedTokensPath, status, SourcePolicy{}, "")
 }
 
 func parseBufferedChatCompletionWithPolicy(ctx context.Context, body io.Reader, out chan<- ProviderEvent, validateArguments bool, reasoningPath, cachedTokensPath string, status func(string), sourcePolicy SourcePolicy, plainTextToolCall ...string) {
@@ -531,10 +504,6 @@ func chatToolChoice(raw json.RawMessage, profile ProviderProfile) json.RawMessag
 	return nil
 }
 
-func chatMessagesFromProviderRequest(req ProviderRequest) []chatMessage {
-	return chatMessagesFromProviderRequestWithProfile(req, ProfileForProvider("generic"))
-}
-
 func chatMessagesFromProviderRequestWithProfile(req ProviderRequest, profile ProviderProfile) []chatMessage {
 	if len(req.Messages) > 0 {
 		messages := make([]chatMessage, 0, len(req.Messages))
@@ -698,15 +667,6 @@ func chatContentParts(parts []ProviderContentPart) []chatContentPart {
 	return out
 }
 
-func hasChatImagePart(parts []chatContentPart) bool {
-	for _, part := range parts {
-		if part.Type == "image_url" && part.ImageURL != nil && strings.TrimSpace(part.ImageURL.URL) != "" {
-			return true
-		}
-	}
-	return false
-}
-
 func hasChatMediaPart(parts []chatContentPart) bool {
 	for _, part := range parts {
 		if part.Type == "image_url" || part.Type == "input_audio" || part.Type == "video_url" {
@@ -735,22 +695,6 @@ func chatCompletionsURL(base string) (string, error) {
 	}
 	u.Path = strings.TrimRight(u.Path, "/") + "/chat/completions"
 	return u.String(), nil
-}
-
-func parseChatCompletionSSE(ctx context.Context, body io.ReadCloser, out chan<- ProviderEvent, validateArguments bool) {
-	parseChatCompletionSSEWithPolicy(ctx, body, out, validateArguments, 0, "", "", nil)
-}
-
-func parseChatCompletionSSEWithIdleTimeout(ctx context.Context, body io.ReadCloser, out chan<- ProviderEvent, validateArguments bool, idleTimeout time.Duration) {
-	parseChatCompletionSSEWithPolicy(ctx, body, out, validateArguments, idleTimeout, "", "", nil)
-}
-
-func parseChatCompletionSSEWithPolicy(ctx context.Context, body io.ReadCloser, out chan<- ProviderEvent, validateArguments bool, idleTimeout time.Duration, reasoningPath, cachedTokensPath string, status func(string)) {
-	parseChatCompletionSSEWithPolicyAndSources(ctx, body, out, validateArguments, idleTimeout, reasoningPath, cachedTokensPath, status, SourcePolicy{})
-}
-
-func parseChatCompletionSSEWithPolicyAndSources(ctx context.Context, body io.ReadCloser, out chan<- ProviderEvent, validateArguments bool, idleTimeout time.Duration, reasoningPath, cachedTokensPath string, status func(string), sourcePolicy SourcePolicy) {
-	parseChatCompletionSSEWithProgressAndSources(ctx, body, out, validateArguments, idleTimeout, 0, 0, 0, "transport-only", reasoningPath, cachedTokensPath, "", status, sourcePolicy, "")
 }
 
 func parseChatCompletionSSEWithProgressAndSources(ctx context.Context, body io.ReadCloser, out chan<- ProviderEvent, validateArguments bool, idleTimeout, firstEventTimeout, semanticProgressTimeout, maxDuration time.Duration, heartbeatMode, reasoningPath, cachedTokensPath, reasoningTokensPath string, status func(string), sourcePolicy SourcePolicy, plainTextToolCall ...string) {

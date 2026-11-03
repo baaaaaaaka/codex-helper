@@ -403,16 +403,6 @@ func isRetryableChatPollErrorMessage(message string) bool {
 	return false
 }
 
-func nextInboundPollAt(now time.Time, interval time.Duration) time.Time {
-	if now.IsZero() {
-		now = time.Now()
-	}
-	if interval <= 0 {
-		return time.Time{}
-	}
-	return now.Add(interval)
-}
-
 func sortInboundPollDecisions(decisions []inboundPollDecision) {
 	sort.SliceStable(decisions, func(i, j int) bool {
 		if decisions[i].Due != decisions[j].Due {
