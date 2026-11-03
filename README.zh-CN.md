@@ -104,8 +104,8 @@ $ErrorActionPreference="Stop"; $u="https://raw.githubusercontent.com/baaaaaaaka/
   打开 session。
 - **日常选项**：通过选中的代理运行命令，选择模型 profile，打开 Codex 桌面 App，
   或从 Teams 驱动 Codex。
-- **高级操作**：skills 维护、beacon scheduler 执行、Teams service 恢复、
-  workflow webhook，以及 source-checkout 部署。
+- **高级操作**：skills 维护、Teams service 恢复、workflow webhook，以及
+  source-checkout 部署。
 
 本 README 的其余部分按这个分层组织：先是常用命令，再是可选的
 model/desktop/Teams 流程，然后是高级执行和维护参考。按受众和深度组织的完整
@@ -231,35 +231,6 @@ codex-proxy proxy doctor
 | `codex-proxy delegate resolve --query <text> --json` | 为 Codex 或诊断解析跨机器 delegation 候选机器 |
 | `codex-proxy delegate start --candidate-token <token> --task-file <path> --json` | 为选中的机器创建 idempotent delegation request |
 | `codex-proxy delegate status` / `wait` / `cancel` | 使用 `start` 保存的 route 检查、等待或取消 delegation |
-| `codex-proxy beacon profile list` | 列出 beacon execution profiles |
-| `codex-proxy beacon profile create <name>` | 创建 draft beacon execution profile |
-| `codex-proxy beacon profile update <name>` | 创建新的 profile revision，不破坏已绑定旧 revision 的 chats |
-| `codex-proxy beacon profile history <name>` | 列出某个 beacon profile 的当前和历史 revisions |
-| `codex-proxy beacon profile rollback <name> <revision>` | 把历史 profile revision 发布为新的 latest revision |
-| `codex-proxy beacon profile gc <name>` | 仅清理没有 active target/allocation 引用的历史 revisions |
-| `codex-proxy beacon profile doctor <name>` | 验证 profile fields 和 provider adapter commands，不触碰 scheduler |
-| `codex-proxy beacon profile doctor <name> --smoke` | submit、query、cancel 一个 scheduler allocation 以验证 adapters |
-| `codex-proxy beacon profile confirm <name>` | review 后确认 beacon profile；不完整 profiles 仍保持 draft |
-| `codex-proxy beacon profile status <name>` | 检查一个 beacon profile |
-| `codex-proxy beacon profile delete <name>` | 在未被 active 使用时 archive 一个 beacon profile |
-| `codex-proxy beacon status [--session <id>]` | 显示 beacon target state |
-| `codex-proxy beacon release <profile\|allocation\|provider-job\|machine>` | 按 profile、allocation id、provider job id 或 machine id 预览并释放 beacon resource |
-| `codex-proxy beacon switch-profile <name> --session <id>` | 把 conversation 切换到 ready beacon profile |
-| `codex-proxy beacon switch-profile <name> --session <id> --after-current-turn` | 延迟 beacon switch，让当前 Codex turn 完成 |
-| `codex-proxy beacon allocation list` | 列出 managed beacon allocation requests |
-| `codex-proxy beacon allocation status <allocation-or-provider-job>` | 显示一个 managed allocation request |
-| `codex-proxy beacon allocation cancel <allocation-or-provider-job>` | 通过配置的 provider adapter cancel 一个 managed allocation |
-| `codex-proxy beacon allocation reconcile <allocation>` | 通过配置的 provider adapter query/adopt/submit |
-| `codex-proxy beacon allocation reconcile-all` | reconcile 全部 allocations、drain stale workers，并 recover stale claims |
-| `codex-proxy beacon provider template slurm` | 打印 starter Slurm adapter script |
-| `codex-proxy beacon provider template lsf` | 打印 starter LSF adapter script |
-| `codex-proxy beacon worker run-once --machine <id>` | 在 allocated worker 上 claim 一个 queued beacon job，并发布 terminal result |
-| `codex-proxy beacon worker run-once --allocation <id> --wait 30m` | 注册当前 scheduler worker，等待 Teams job，并发布 terminal result |
-| `codex-proxy beacon worker serve --allocation <id>` | 注册带 bootstrap diagnostics 的 long-lived worker，serve jobs 直到 idle 或停止 |
-| `codex-proxy beacon machine list` | 列出 beacon machines |
-| `codex-proxy beacon machine status <machine-or-lease>` | 检查 beacon machine 或 lease，并获得 confirmation tokens |
-| `codex-proxy beacon machine release <machine-or-lease>` | drain 或 release beacon machine |
-| `codex-proxy beacon machine kill <machine-or-lease-or-job> --confirm <token>` | 只有带 status 中精确 token 时才 hard-kill beacon machine |
 | `codex-proxy upgrade` | 从 GitHub Releases self-update |
 
 常用 flags:
@@ -271,7 +242,6 @@ codex-proxy proxy doctor
 - `history open` 支持 `--codex-dir`、`--codex-path` 和 `--profile`
 - `history list` / `history show` 支持 `--codex-dir`
 - `skills` 支持 `--codex-dir`
-- `beacon` 支持 `--store /path/to/beacon.json` 覆盖 beacon state file
 
 </details>
 
@@ -289,7 +259,7 @@ codex-proxy run --aaa -- codex exec "..."
 ```
 
 AAA 收到支持的 approval 请求后固定等待 500 ms 再批准。未开启 AAA 时，非交互式
-`codex exec` facade 因没有人工 reviewer 而 fail-closed。Teams 和 Beacon 是无人值守入口，
+`codex exec` facade 因没有人工 reviewer 而 fail-closed。Teams 是无人值守入口，
 因此会在代码中显式启用相同的自动批准 handler，并且不会继承本地 TUI 偏好。
 `--aaa` 只由 CXP 消费，不会传给 Codex。
 
@@ -302,8 +272,7 @@ Codex 内层 sandbox 在操作获批前仍保持受限。获批操作只能继�
 cgroup、Slurm job 或 LSF job 已经授予的硬件和 mounts，不能突破外层隔离边界。Telemetry
 保持开启，并且 payload 不经过 CXP 修改。
 
-已接入 broker 的入口包括 Codex TUI/history、`codex exec` facade、Teams turn 和 Beacon
-worker。手动模式和 AAA 使用相同的原版 binary、on-request policy、Responses gateway 与
+已接入 broker 的入口包括 Codex TUI/history、`codex exec` facade 和 Teams turn。手动模式和 AAA 使用相同的原版 binary、on-request policy、Responses gateway 与
 proxy 路由，唯一差别是 reviewer。Contract CI 使用开启 analytics 的原版 Codex binary，并要求审批 telemetry 仍表现为
 普通的 `reviewer=user`、`status=approved`、`user_approved` 事件。CXP 不隐藏自己的
 app-server client identity，也不承诺服务端无法根据时序或其他正常 telemetry 推断自动化。
@@ -921,10 +890,6 @@ reload。普通安装的 helper 在本地 repair 后应使用 `helper restart no
 如果发到 control chat 的快速 Codex 问题卡住了，在同一个 control chat 发送
 `helper cancel running`。Work chat requests 仍在各自的 Work chat 内取消。
 
-Beacon profile setup 是本地 `codex-proxy beacon ...` CLI workflow。可以在 Teams
-control chat 里询问它，但 profile mutation commands 应在本地运行，除非 helper 打印了
-明确支持的 Teams command。
-
 Control-chat Codex fallback 使用配置的 Teams Codex PATH policy；新配置默认取目标账号
 环境，旧配置升级时保留显式 `service` 模式。child process 同时会收到绝对路径
 `CODEX_HELPER_CLI_PATH`；helper 不会为了暴露 `cxp` 而修改用户 PATH，因此缺少 `cxp`
@@ -937,217 +902,6 @@ Teams control chat 中发送 `helper restart now`，让已安装 helper update �
 
 更深入的部署和排障指南见
 [`docs/teams_source_deployment_guide.md`](docs/teams_source_deployment_guide.md)。
-
-## Beacon execution profiles
-
-Beacon 是高级 Teams 执行模式。除非你已经使用 Teams helper，并希望未来 Teams Work
-chat turns 在特定 local worker、Slurm allocation 或 LSF allocation 上运行，而不是在
-helper service machine 上运行，否则可以跳过本节。
-
-Beacon profiles 描述 Codex work 应在哪里执行。它们和 SSH proxy profiles 是不同的：
-`codex-proxy proxy` 控制网络路由，而 `codex-proxy beacon profile ...` 控制 scheduler
-或 worker placement。
-
-用站点所需 scheduler fields 创建一个 Slurm draft profile:
-
-```bash
-codex-proxy beacon profile create gpu \
-  --provider slurm \
-  --partition interactive \
-  --image image.sqsh \
-  --nodes 1 \
-  --gpu 1 \
-  --duration 4 \
-  --shared-path /shared/cxp-beacon \
-  --query-command /path/to/query-slurm-allocation \
-  --submit-command /path/to/submit-slurm-allocation \
-  --cancel-command /path/to/cancel-slurm-allocation \
-  --renew-command /path/to/renew-slurm-allocation
-```
-
-LSF 和 local drafts 输入更少：
-
-```bash
-codex-proxy beacon profile create batch --provider lsf --queue normal --shared-path /shared/cxp-beacon
-codex-proxy beacon profile create local --provider local
-```
-
-如果 beacon job 需要使用已有 SSH proxy profile 做网络访问，加上
-`--proxy ssh_profile --proxy-profile <existing-profile>`。用 `--isolation shared` 或
-`--isolation exclusive` 选择默认 lease sharing mode。
-
-对于 managed Slurm/LSF profiles，`--shared-path` 必须指向 control machine 和 allocated
-workers 都能读写的绝对目录。如果显式配置了 `CODEX_HELPER_BEACON_STORE`，cxp 会为 workers
-保留该 store path；否则会在 `shared_path` 下派生 store。
-
-Profiles 在检查并确认前保持 draft。`profile doctor` 会验证 profile fields、shared-path
-write/rename access，以及未来 Teams turns 需要的 `query`/`submit`/`cancel`/`renew`
-adapter commands:
-
-```bash
-codex-proxy beacon profile doctor gpu
-codex-proxy beacon profile doctor gpu --smoke
-codex-proxy beacon profile confirm gpu
-codex-proxy beacon profile status gpu
-```
-
-普通 `doctor` 是非破坏性的，会检查 profile fields 和 adapter presence/executability。
-只有当你希望 cxp submit、query、cancel 一个真实 scheduler allocation，从和未来 Teams
-turns 相同的 profile/environment 验证 adapter output contract 时，才加 `--smoke`。
-
-要修改 profile，原地 update。helper 会记录新的 revision，而 queued 或 running turns 会
-继续使用已有 target snapshot:
-
-```bash
-codex-proxy beacon profile update gpu \
-  --provider slurm \
-  --partition interactive \
-  --image new-image.sqsh \
-  --nodes 1 \
-  --gpu 1 \
-  --duration 4
-```
-
-用 `profile history` 查看 published revisions。如果新 revision 有问题，
-`profile rollback <name> <revision>` 会把历史 config 重新发布为新的 latest revision；
-`profile gc <name>` 只移除没有任何 conversation、queued turn 或 allocation 仍引用的
-history entries。
-
-Profile ready 后，检查 target state 或显式切换已有 conversation:
-
-```bash
-codex-proxy beacon status --session <session-id>
-codex-proxy beacon switch-profile gpu --session <session-id>
-```
-
-在 Teams 中，从 Work chat 使用 `beacon switch <profile>`。helper 会自动 submit、query、
-等待 worker、renew，并清理 managed allocation。如果需要手动释放当前 resource，在 Work
-chat 中发送 `beacon release`；profile binding 保持不变，未来 turns 可以为同一个 profile
-获取 fresh worker。如果 worker 是 shared，Work-chat release 只 detach 当前 chat 的 demand，
-并让 shared worker 可供其他 chats 使用；会影响所有人的 shared 或 forced release 仍然需要
-control-chat release。`beacon local` 会把未来 turns 切回 local execution，并在安全时要求
-helper drain 或 release 此 chat 的旧 beacon resource。
-
-从 CLI 或 Teams control chat，
-`codex-proxy beacon release <profile|allocation|provider-job|machine>` 接受你已有的
-resource identifier，并解析内部对象类型。Release commands 会显示预览，包括受影响 chats、
-queued/running turns、allocation ids、provider job ids 和计划动作。Shared 或 forced
-releases 必须带上显示的 `--confirm <token>` 值，才能影响其他 chats。
-
-当 Teams Work chat 目标是 beacon profile 时，每个 turn 都会 snapshot target，并在 Codex
-开始前记录 managed allocation request。显式 beacon turns 不会 fallback 到 local execution。
-如果尚无 accepting beacon worker/lease，`beacon status` 会显示需要关注的 allocation id、
-allocation state、provider job id、provider state 和 provider reason。
-
-Provider submission 基于 adapter。最不容易出错的 Teams workflow 是把 adapter commands
-存到 beacon profile 上：`--query-command`、`--submit-command`、`--cancel-command` 和
-`--renew-command`；这些 profile changes 会应用到未来 turns，而不需要 restart Teams helper。
-Managed Slurm/LSF adapters 默认使用你的 default user shell environment，所以 modules、
-`submit_job`、NSS 或 `SUBMIT_ACCOUNT` 的站点设置可用，不需要复制到 helper service。若
-`$SHELL -lic` 不兼容（例如 tcsh/csh），或 adapter 需要干净的 helper service environment，
-加 `--adapter-shell direct`。要从 site-editable Slurm 或 LSF wrapper 开始，打印 template:
-
-```bash
-codex-proxy beacon provider template slurm > ~/bin/cxp-beacon-slurm-adapter
-chmod +x ~/bin/cxp-beacon-slurm-adapter
-```
-
-如果更喜欢每个 provider 一个全局 adapter，也可以通过 helper service environment 指向
-可执行 adapters：
-
-```bash
-export CODEX_HELPER_BEACON_SLURM_QUERY=/path/to/query-slurm-allocation
-export CODEX_HELPER_BEACON_SLURM_SUBMIT=/path/to/submit-slurm-allocation
-export CODEX_HELPER_BEACON_SLURM_CANCEL=/path/to/cancel-slurm-allocation
-export CODEX_HELPER_BEACON_SLURM_RENEW=/path/to/renew-slurm-allocation
-export CODEX_HELPER_BEACON_LSF_QUERY=/path/to/query-lsf-allocation
-export CODEX_HELPER_BEACON_LSF_SUBMIT=/path/to/submit-lsf-allocation
-export CODEX_HELPER_BEACON_LSF_CANCEL=/path/to/cancel-lsf-allocation
-export CODEX_HELPER_BEACON_LSF_RENEW=/path/to/renew-lsf-allocation
-export CODEX_HELPER_BEACON_PROVIDER_SHELL_MODE=user
-```
-
-Profile-stored adapter commands 通常更简单，因为它们会应用到未来 turns，而不需要 service
-change。如果改的是 helper service environment variables，则在 Teams control chat 中用
-`helper restart now` 重启已安装 helper。
-
-当未设置 adapter shell mode 时，managed Slurm/LSF adapters 的行为等同于
-`--adapter-shell user`。cxp 只用 `$SHELL -lic` 捕获 framed environment snapshot，然后用
-该 environment 直接运行 adapter，因此 shell startup output 不会污染 adapter protocol。
-仅在少数站点 scheduler submission 是 shell function 或 alias、无法捕获为 environment
-时，才使用 `--adapter-shell shell-command`。adapter 接收 `--request-id`、`--name`、
-`--profile`、`--provider`、`--partition`、`--image`、`--queue` 和
-`--operation query|submit|cancel|renew` 等 flags。它应打印 JSON，例如
-`{"provider_job_id":"123","raw_state":"PD","reason":"Resources","provider_deadline":"2026-05-18T10:30:00Z"}`
-或 key-value 输出，例如
-`provider_job_id=123 raw_state=PD reason=Resources provider_deadline=1779090600`。
-生成的 Slurm/LSF templates 包含 `query`、`submit`、`cancel`，以及一个 site-policy
-`renew` stub；该 stub 在编辑前会非零退出。当 scheduler 暴露 walltime extension 时，实现
-renew case。
-
-Beacon adapter troubleshooting:
-
-- scheduler job 返回 `exit 127` 通常意味着 submitted command malformed，或 allocation
-  内 PATH 不同。最终 worker command 中保持恰好一个 `exec`；如果站点 wrapper 已经 prepends
-  `exec`，从 adapter 中移除额外的一个。
-- worker 内出现 `allocation request ... not found` 通常意味着 worker 使用了错误 state file。
-  自定义 Slurm/LSF submit adapters 必须接受 `--shared-store`，并传给 worker：
-  `cxp beacon --store <shared-store> worker ...`。
-- 如果 `$SHELL -lic` 在 tcsh/csh 下失败，用 `--adapter-shell direct` 更新 profile；profile
-  revisions 会应用到未来 turns。
-- Beacon worker 会在 allocation 内启动标准审批 runtime，因此获批命令可以继承 scheduler
-  或 container 已授予的 devices 和 mounts，同时保留外层隔离边界。
-- 如果 worker doctor 报告 `missing codex`，设置 scheduler PATH 或从 adapter 传 worker
-  `--codex-path <codex-or-wrapper>`。wrapper 对 path resolution 或额外 Codex exec flags
-  仍有用，例如 `--skip-git-repo-check`；Teams service `--codex-arg` settings 不会自动到达
-  remote beacon workers。生成的 templates 会通过 worker `--codex-path` 传递
-  `CXP_BEACON_CODEX_BIN`。
-
-Active Teams helper owner 会周期性 query existing provider jobs，把 scheduler state 投影回
-beacon machines/jobs，并 renew provider deadline 接近的 allocations。Provider calls 永远不会
-在持有 beacon state lock 时执行；renewal results 只有在 provider job id 和 renew epoch 仍然
-匹配时才会应用。Helper drain 期间，renewal controller 只保护 job 可能已经 started 的
-allocations；它不会为 pre-start turns 创建新的 scheduler work。Release/cancel intents 是
-durable 的，因此如果早期路径在 provider adapter 可用前记录了 intent，active owner 会在
-reconcile 时重试。同一个 reconcile pass 也会 drain 无 chat/job demand 的 idle workers，避免
-shared 和 exclusive workers 在 demand 消失后永远保持 accepting。
-
-在 allocated worker 内，scheduler job 应注册到 managed allocation，并等待 Teams turn 入队：
-
-```bash
-codex-proxy beacon worker run-once --allocation <request-id> --wait 30m
-```
-
-当未提供 `--provider-job` 时，worker 会从 `SLURM_JOB_ID` 或 `LSB_JOBID` 派生 scheduler
-job id，注册 accepting machine，claim 一个 queued job，用 snapshotted prompt 和 workspace
-运行 Codex，然后把 fenced terminal result 写回 shared beacon state。Teams 会等待 allocation
-和 worker terminal path，而不是过早失败或运行 local Codex。
-
-对于可复用 allocations，改运行 long-lived worker:
-
-```bash
-codex-proxy beacon worker serve --allocation <request-id> --idle-timeout 30m
-```
-
-`serve` 会记录 worker heartbeats，在 accepting jobs 前运行 worker doctor，存储 bootstrap
-diagnostics，例如 node list、stdout/stderr paths、shared beacon store path，以及 `codex`/`cxp`
-paths，然后在退出时 drain machine。Controller 或 cron job 可用以下命令 reconcile stale state:
-
-```bash
-codex-proxy beacon allocation reconcile-all
-```
-
-具备 scheduler 的 CI 可以通过 `CODEX_HELPER_BEACON_LIVE=1`、
-`CODEX_HELPER_BEACON_LIVE_PROVIDER=slurm|lsf` 和匹配的
-`CODEX_HELPER_BEACON_*_QUERY/SUBMIT/CANCEL` commands opt in 真实 adapter path。Live test
-会通过 profile-stored adapter snapshot submit，并在 cleanup 中 cancel provider job。
-
-从 active Codex turn 内发起 beacon switch 时，优先使用 deferred form，让当前 answer 留在
-现有 target，后续 turns 使用新 profile:
-
-```bash
-codex-proxy beacon switch-profile gpu --session <session-id> --after-current-turn
-```
 
 ## Git-backed skill subscriptions
 
@@ -1174,8 +928,8 @@ codex-proxy skills remove <name>
 
 安装器会 best-effort 把 bundled `cxp` Codex skill 安装到 `$HOME/.agents/skills/cxp`。
 之前安装在 `~/.codex/skills` 下的 managed skills 会在运行 skills commands 时迁移到 agents
-skills 目录。该 skill 包含本地命令地图，以及 beacon profile switching、Teams helper
-restarts 等 disruptive operations 的 safe handoff rules。它作为 built-in skill 管理，不是
+skills 目录。该 skill 包含本地命令地图，以及 Teams helper restarts 等 disruptive
+operations 的 safe handoff rules。它作为 built-in skill 管理，不是
 git-backed subscription，因此不会作为 remote source 出现在 `codex-proxy skills list` 中。
 
 手动修复或安装：

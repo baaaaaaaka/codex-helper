@@ -97,8 +97,6 @@ func dockerRealDataProductionPhaseNames() []string {
 		"helper-auto-update",
 		"helper-upgrade-notice",
 		"codex-upgrade",
-		"beacon-reconcile",
-		"beacon-lease-maintenance",
 		"deferred-inbound",
 		"interrupted-notices",
 	}

@@ -5,10 +5,7 @@ import "strings"
 // These names are accepted only as hidden, local compatibility shims. CXP
 // consumes them before launching Codex, so they never enter the child argv or
 // Codex telemetry. Keep their spellings isolated in the migration package.
-const (
-	LegacyRunModeFlagName       = "yolo"
-	LegacyBeaconSandboxFlagName = "no-yolo"
-)
+const LegacyRunModeFlagName = "yolo"
 
 // RemoveLegacyCodexExecutionOverrides is the one compatibility boundary for
 // persisted arguments written by older helper releases. The returned slice is

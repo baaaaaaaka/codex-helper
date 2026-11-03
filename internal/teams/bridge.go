@@ -24,7 +24,6 @@ import (
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
-	"github.com/baaaaaaaka/codex-helper/internal/beacon"
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
 	"github.com/baaaaaaaka/codex-helper/internal/migration"
@@ -1180,8 +1179,6 @@ type Bridge struct {
 	normalLinkedDiscoveryCursorKey     string
 	normalLinkedDiscoveryExpectedKey   string
 	backlogOptionalMaintenanceDueAt    time.Time
-	lastBeaconReconcile                time.Time
-	lastBeaconLeaseMaintenance         time.Time
 	lastSQLiteWALCheckpoint            time.Time
 	phaseBudget                        time.Duration
 	pollWorkerBudget                   time.Duration
@@ -2940,16 +2937,6 @@ func (b *Bridge) listenOwnerGeneration(ctx context.Context, opts BridgeOptions) 
 		}
 		if err := runPhase("codex-upgrade", b.maybeRunPendingCodexUpgrade); err != nil && b.out != nil {
 			_, _ = fmt.Fprintf(b.out, "Teams Codex upgrade error: %v\n", err)
-		}
-		if err := runPhase("beacon-reconcile", func(phaseCtx context.Context) error {
-			return b.maybeRunBeaconReconcile(phaseCtx, time.Now())
-		}); err != nil && b.out != nil {
-			_, _ = fmt.Fprintf(b.out, "Teams beacon reconcile error: %v\n", err)
-		}
-		if err := runPhase("beacon-lease-maintenance", func(phaseCtx context.Context) error {
-			return b.maybeRunBeaconLeaseMaintenance(phaseCtx, time.Now())
-		}); err != nil && b.out != nil {
-			_, _ = fmt.Fprintf(b.out, "Teams beacon lease maintenance error: %v\n", err)
 		}
 		if cycleDegraded {
 			cancelCycle()
@@ -9142,6 +9129,8 @@ func looksLikeRenderedHelperOrCodexOutputPlainText(text string) bool {
 		"No other prompts are queued.",
 		"Codex request canceled.",
 		"Teams helper safety:",
+		// Output forms of the removed beacon maintenance loop. Older helpers
+		// could emit these, so keep treating them as helper echoes.
 		"Teams beacon reconcile error:",
 		"Teams beacon lease maintenance error:",
 		"Teams beacon lease renewed:",
@@ -9981,8 +9970,6 @@ func (b *Bridge) handleControlMessage(ctx context.Context, msg ChatMessage, text
 			return b.cancelControlFallbackCommand(ctx, strings.TrimSpace(parsed.Argument))
 		case DashboardCommandSkills:
 			return b.handleSkillsCommandFromMessage(ctx, b.reg.ControlChatID, msg, parsed.Argument)
-		case DashboardCommandBeacon:
-			return b.handleBeaconControlCommand(ctx, msg, parsed.Argument)
 		case DashboardCommandModel:
 			message, err := b.handleModelControlCommand(ctx, msg, parsed.Argument)
 			if err != nil {
@@ -10815,20 +10802,6 @@ func controlAdvancedHelpText() string {
 		"- `helper webhook off` - disable Workflow notification cards",
 		"- `helper skills list|add|sync|push` - manage skill subscriptions",
 		"",
-		"Beacon commands:",
-		"- `beacon list` - list beacon profiles and machines",
-		"- `beacon profile create <name> ...` - create a draft beacon profile",
-		"- add `--query-command <script> --submit-command <script> --cancel-command <script> --renew-command <script>` to store provider adapters on the profile",
-		"- Slurm/LSF adapters use your normal shell setup by default; add `--adapter-shell direct` when user-shell capture is incompatible or a clean service environment is required",
-		"- `beacon profile update <name> ...` - create a new profile revision",
-		"- `beacon profile history <name>` / `beacon profile rollback <name> <revision>` / `beacon profile gc <name>` - inspect, restore, and prune revisions",
-		"- `beacon profile doctor <name>` - validate profile fields and provider adapters",
-		"- `beacon profile confirm <name>` - confirm review; incomplete profiles remain draft until doctor requirements pass",
-		"- `beacon release <target> [--force] [--confirm <token>]` - preview and release a beacon resource",
-		"- advanced: `beacon allocation ...` and `beacon machine ...` inspect internal state",
-		"- `new <directory> --beacon <profile>` - create a Work chat on a ready beacon profile",
-		"- Beacon execution profiles are separate from SSH proxy profiles managed by `cxp proxy`.",
-		"",
 		"Local CLI:",
 		"- `cxp skills install-builtin` - install or repair bundled local skills in `$HOME/.agents/skills`",
 		"- `cxp skills migrate` - migrate managed legacy skills from `~/.codex/skills` to `$HOME/.agents/skills`",
@@ -10858,8 +10831,6 @@ func sessionHelpText() string {
 		"`helper close` or `!close` - close this Codex session in Teams",
 		"`fork` - create a native Codex child from this Work chat; the new chat link is sent only after history publishing is verified",
 		"`helper details` or `!details` - show debug IDs and links",
-		"`beacon status` - show this Work chat execution target",
-		"`beacon switch <profile>` or `beacon switch local` - switch future turns",
 		"`model status`, `model switch <model>`, `model reset`, or `model fork <model>` - inspect or change this Work chat model",
 		"`effort status`, `effort list`, `effort set <value>`, or `effort reset` - inspect or change this Work chat's reasoning effort",
 		"`default ...` - global defaults are Control-chat-only",
@@ -10877,7 +10848,6 @@ func sessionAdvancedHelpText() string {
 		"`helper status` or `!status` - check progress",
 		"`helper stats` or `!stats` - show Codex token usage by model/service-tier combination, cache/context analysis, and rate-limit metadata when Codex recorded it",
 		"`helper details` or `!details` - show IDs and debug details",
-		"`beacon status`, `beacon list`, `beacon switch <profile>`, or `beacon switch local` - inspect or switch this Work chat execution target",
 		"`helper rename <title>` or `!rename <title>` - rename this Teams chat",
 		"`helper rename hostname <name>` - rename this machine in all related chat titles",
 		"`helper file <relative-path>` or `!file <relative-path>` - upload a file prepared in the helper's Teams upload folder",
@@ -13305,9 +13275,6 @@ func (b *Bridge) createSession(ctx context.Context, msg ChatMessage, request str
 		}
 		return b.sendControl(ctx, err.Error())
 	}
-	if err := b.validateBeaconNewSession(parsed); err != nil {
-		return b.sendControl(ctx, err.Error())
-	}
 	if parsed.WorkDir != "" {
 		if err := os.MkdirAll(parsed.WorkDir, 0o700); err != nil {
 			return b.sendControl(ctx, "create workspace failed: "+err.Error())
@@ -13359,9 +13326,6 @@ func (b *Bridge) createSession(ctx context.Context, msg ChatMessage, request str
 			return err
 		}
 	}
-	if err := b.activateBeaconNewSession(session.ID, parsed); err != nil {
-		return err
-	}
 	if err := b.sendChatCreatedMention(ctx, session.ID, chat.ID, workChatCreatedNotice(session)); err != nil {
 		return err
 	}
@@ -13370,7 +13334,7 @@ func (b *Bridge) createSession(ctx context.Context, msg ChatMessage, request str
 		SessionID:   session.ID,
 		TeamsChatID: chat.ID,
 		Kind:        "anchor",
-		Body:        sessionReadyMessage(session, parsed.Title, parsed.modelProfileTargetLabel(), parsed.beaconTargetLabel()),
+		Body:        sessionReadyMessage(session, parsed.Title, parsed.modelProfileTargetLabel()),
 	}); err != nil {
 		return err
 	}
@@ -13686,22 +13650,9 @@ func (b *Bridge) controlCommandAlreadyHandled(ctx context.Context, msg ChatMessa
 type newSessionRequest struct {
 	WorkDir              string
 	Title                string
-	BeaconProfile        string
-	BeaconIsolation      string
 	ModelProfile         string
 	ModelProfileExplicit bool
 	ModelProfileSnapshot modelprofile.Snapshot
-}
-
-func (r newSessionRequest) beaconTargetLabel() string {
-	if strings.TrimSpace(r.BeaconProfile) == "" {
-		return ""
-	}
-	label := "beacon:" + strings.TrimSpace(r.BeaconProfile)
-	if strings.TrimSpace(r.BeaconIsolation) != "" {
-		label += " isolation=" + strings.TrimSpace(r.BeaconIsolation)
-	}
-	return label
 }
 
 func (r newSessionRequest) modelProfileTargetLabel() string {
@@ -13740,41 +13691,33 @@ func parseNewSessionRequest(raw string) (newSessionRequest, error) {
 	}
 	before, after, hasSep := strings.Cut(raw, " -- ")
 	if !hasSep {
-		cleaned, profile, isolation, err := parseBeaconOptionsFromNewSession(raw)
-		if err != nil {
-			return newSessionRequest{}, err
-		}
-		cleaned, modelProfile, err := parseModelProfileOptionsFromNewSession(cleaned)
+		cleaned, modelProfile, err := parseModelProfileOptionsFromNewSession(raw)
 		if err != nil {
 			return newSessionRequest{}, err
 		}
 		if strings.TrimSpace(cleaned) == "" {
-			return newSessionRequest{BeaconProfile: profile, BeaconIsolation: isolation, ModelProfile: modelProfile}, nil
+			return newSessionRequest{ModelProfile: modelProfile}, nil
 		}
 		resolved, err := resolveUserWorkspacePath(cleaned)
 		if err != nil {
 			return newSessionRequest{}, err
 		}
-		return newSessionRequest{WorkDir: resolved, BeaconProfile: profile, BeaconIsolation: isolation, ModelProfile: modelProfile}, nil
+		return newSessionRequest{WorkDir: resolved, ModelProfile: modelProfile}, nil
 	}
-	dir, profile, isolation, err := parseBeaconOptionsFromNewSession(before)
-	if err != nil {
-		return newSessionRequest{}, err
-	}
-	dir, modelProfile, err := parseModelProfileOptionsFromNewSession(dir)
+	dir, modelProfile, err := parseModelProfileOptionsFromNewSession(before)
 	if err != nil {
 		return newSessionRequest{}, err
 	}
 	dir = strings.TrimSpace(dir)
 	title := strings.TrimSpace(after)
 	if dir == "" {
-		return newSessionRequest{Title: title, BeaconProfile: profile, BeaconIsolation: isolation, ModelProfile: modelProfile}, nil
+		return newSessionRequest{Title: title, ModelProfile: modelProfile}, nil
 	}
 	resolved, err := resolveUserWorkspacePath(dir)
 	if err != nil {
 		return newSessionRequest{}, err
 	}
-	return newSessionRequest{WorkDir: resolved, Title: title, BeaconProfile: profile, BeaconIsolation: isolation, ModelProfile: modelProfile}, nil
+	return newSessionRequest{WorkDir: resolved, Title: title, ModelProfile: modelProfile}, nil
 }
 
 func parseModelProfileOptionsFromNewSession(raw string) (string, string, error) {
@@ -14170,8 +14113,6 @@ func (b *Bridge) handleResolvedSessionMessageWithQueueState(ctx context.Context,
 			return nil
 		case DashboardCommandSkills:
 			return b.handleSkillsCommandFromMessage(ctx, chatID, msg, parsed.Argument)
-		case DashboardCommandBeacon:
-			return b.handleBeaconWorkCommand(ctx, session, msg, parsed.Argument)
 		case DashboardCommandModel:
 			message, err := b.handleModelWorkCommand(ctx, session, parsed.Argument)
 			if err != nil {
@@ -16870,8 +16811,8 @@ func (b *Bridge) prepareSessionPromptFromTeamsMessage(ctx context.Context, sessi
 	if !promptOK && len(localFiles) == 0 && len(referencedMessages) == 0 {
 		return ExecutionInput{}, cleanupAll, "deferred Teams input could not be resumed because the original message text was unavailable. Please resend it.", nil
 	}
-	// ASR is helper-local preprocessing. It intentionally runs before beacon
-	// execution planning so Teams media credentials and temp files stay local.
+	// ASR is helper-local preprocessing so Teams media credentials and temp
+	// files stay local.
 	transcripts, err := b.transcribeTeamsMediaAttachments(ctx, session, turnID, localFiles)
 	if err != nil {
 		return ExecutionInput{}, cleanupAll, teamsASRFailureUserMessage(err), nil
@@ -16949,9 +16890,6 @@ func (b *Bridge) cancelTurnCommandForScope(ctx context.Context, session *Session
 		if !marked {
 			return nil
 		}
-		if err := b.cancelBeaconTurn(ctx, session, turn, "canceled by user"); err != nil {
-			return err
-		}
 		return b.queueAndSendOutbox(ctx, teamstore.OutboxMessage{
 			ID:          "outbox:" + turn.ID + ":canceled",
 			SessionID:   session.ID,
@@ -16963,9 +16901,6 @@ func (b *Bridge) cancelTurnCommandForScope(ctx context.Context, session *Session
 	case teamstore.TurnStatusRunning:
 		if !b.requestRunningTurnCancel(turn.ID) {
 			return b.sendToChat(ctx, session.ChatID, "This Codex request is running, but this helper process does not own its live cancel handle. It may have started before the latest helper loaded or before a restart. Wait for it to finish, or use `helper status` to decide whether recovery is needed.")
-		}
-		if err := b.cancelBeaconTurn(ctx, session, turn, "canceled by user"); err != nil {
-			return err
 		}
 		return b.sendToChat(ctx, session.ChatID, formatCancelOneResponse(state, session.ID, turn, "cancel requested for running turn", true))
 	default:
@@ -16997,9 +16932,6 @@ func (b *Bridge) cancelAllTurnsCommand(ctx context.Context, session *Session, st
 		if !marked {
 			continue
 		}
-		if err := b.cancelBeaconTurn(ctx, session, turn, "canceled by user"); err != nil {
-			return err
-		}
 		canceledQueued = append(canceledQueued, turn)
 	}
 	for _, turn := range targets {
@@ -17007,9 +16939,6 @@ func (b *Bridge) cancelAllTurnsCommand(ctx context.Context, session *Session, st
 			continue
 		}
 		if b.requestRunningTurnCancel(turn.ID) {
-			if err := b.cancelBeaconTurn(ctx, session, turn, "canceled by user"); err != nil {
-				return err
-			}
 			requestedRunning = append(requestedRunning, turn)
 		} else {
 			unavailableRunning = append(unavailableRunning, turn)
@@ -18590,35 +18519,8 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 		}
 	}
 	b.cancelSupersededRunningTurnsForSession(sessionID, turn.ID)
-	traceQueuedTurn("beacon-plan-start", true, nil)
-	plan, handled, err := b.prepareBeaconTurnExecution(ctx, session, turn)
-	traceQueuedTurn("beacon-plan-finished", false, err)
 	if b.asyncTurnLifecycleStoppedForContext(ctx) {
 		return errAsyncTurnLifecycleStopped
-	}
-	if handled {
-		message := "beacon execution could not start"
-		if err != nil {
-			message = err.Error()
-		}
-		if cleanupErr := b.recordBeaconTurnStartFailure(ctx, session, turn, plan, beaconTurnStartFailureProviderReason(plan, message)); cleanupErr != nil {
-			return cleanupErr
-		}
-		if _, markErr := b.markLiveTurnFailed(ctx, turn, message); markErr != nil {
-			return markErr
-		}
-		return b.queueAndSendOutboxChunksWithOptions(ctx, session.ID, turn.ID, chatID, "helper", message, outboxQueueOptions{
-			MentionOwner:     true,
-			NotificationKind: "needs_attention",
-		})
-	}
-	if plan.Action == beacon.TurnRunBeacon || plan.Action == beacon.TurnWaitAllocation {
-		if plan.Action == beacon.TurnWaitAllocation {
-			if !b.suppressIntermediateWorkChatOutbox(chatID) {
-				_ = b.queueAndSendOutboxChunksWithOptions(ctx, session.ID, turn.ID, chatID, "helper", formatBeaconTurnAllocationProgress(plan), outboxQueueOptions{})
-			}
-		}
-		executor = BeaconJobExecutor{Plan: plan}
 	}
 	// Synchronous callers can invoke this path without ClaimNextQueuedTurn.
 	// Recheck a still-queued turn immediately before any thread resolution or
@@ -18833,12 +18735,7 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 			// provenance-matched final already written to the transcript; treating
 			// that response as canceled would create a second retry-looking answer.
 			if recovered, ok := b.completedTurnResultAfterExecutionError(recoveryCtx, session, turn, result); ok {
-				return b.completeQueuedTurnWithResult(recoveryCtx, session, turn, chatID, plan, recovered)
-			}
-			if plan.Action == beacon.TurnRunBeacon || plan.Action == beacon.TurnWaitAllocation {
-				if beaconErr := b.cancelBeaconTurn(recoveryCtx, session, turn, firstNonEmptyString(cancelReason, "canceled by user")); beaconErr != nil && b.out != nil {
-					_, _ = fmt.Fprintf(b.out, "beacon turn cancel cleanup error: %v\n", beaconErr)
-				}
+				return b.completeQueuedTurnWithResult(recoveryCtx, session, turn, chatID, recovered)
 			}
 			marked, markErr := b.markLiveTurnInterruptedUnlessTerminal(recoveryCtx, turn, firstNonEmptyString(cancelReason, "canceled by user"))
 			if markErr != nil {
@@ -18858,7 +18755,7 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 				notifyCtx = context.Background()
 			}
 			if recovered, ok := b.completedTurnResultAfterExecutionError(notifyCtx, session, turn, result); ok {
-				return b.completeQueuedTurnWithResult(notifyCtx, session, turn, chatID, plan, recovered)
+				return b.completeQueuedTurnWithResult(notifyCtx, session, turn, chatID, recovered)
 			}
 		}
 		if isCanceledExecutionError(err) {
@@ -18972,13 +18869,6 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 		if markErr != nil {
 			return markErr
 		}
-		if plan.Action == beacon.TurnRunBeacon || plan.Action == beacon.TurnWaitAllocation {
-			if beaconErr := b.recordBeaconTurnFinish(ctx, session, turn, plan, err.Error()); beaconErr != nil {
-				if b.out != nil {
-					_, _ = fmt.Fprintf(b.out, "beacon turn failure cleanup error: %v\n", beaconErr)
-				}
-			}
-		}
 		if codexErrorRequiresUpgrade(err) {
 			if upgradeErr := b.requestCodexUpgradeAfterFailure(ctx, session, turn, chatID, err); upgradeErr != nil {
 				return upgradeErr
@@ -19008,11 +18898,7 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 				IgnoreEarlierOutbox: true,
 			})
 		}
-		errorBody := "error: " + err.Error()
-		if (plan.Action == beacon.TurnRunBeacon || plan.Action == beacon.TurnWaitAllocation) && strings.HasPrefix(strings.TrimSpace(err.Error()), "Beacon ") {
-			errorBody = err.Error()
-		}
-		return b.queueAndSendOutboxChunksWithOptions(ctx, session.ID, turn.ID, chatID, "error", errorBody, outboxQueueOptions{
+		return b.queueAndSendOutboxChunksWithOptions(ctx, session.ID, turn.ID, chatID, "error", "error: "+err.Error(), outboxQueueOptions{
 			MentionOwner:        true,
 			NotificationKind:    "needs_attention",
 			IgnoreEarlierOutbox: true,
@@ -19028,15 +18914,10 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 		// durable turn interrupted; otherwise a successful answer can be followed
 		// by a misleading cancellation notice and a later retry.
 		if result.canonicalTranscriptFinal || (strings.TrimSpace(result.Text) != "" && strings.TrimSpace(result.CodexTurnID) != "") {
-			return b.completeQueuedTurnWithResult(recoveryCtx, session, turn, chatID, plan, result)
+			return b.completeQueuedTurnWithResult(recoveryCtx, session, turn, chatID, result)
 		}
 		if recovered, ok := b.completedTurnResultAfterExecutionError(recoveryCtx, session, turn, result); ok {
-			return b.completeQueuedTurnWithResult(recoveryCtx, session, turn, chatID, plan, recovered)
-		}
-		if plan.Action == beacon.TurnRunBeacon || plan.Action == beacon.TurnWaitAllocation {
-			if beaconErr := b.cancelBeaconTurn(recoveryCtx, session, turn, firstNonEmptyString(cancelReason, "canceled by user")); beaconErr != nil && b.out != nil {
-				_, _ = fmt.Fprintf(b.out, "beacon turn cancel cleanup error: %v\n", beaconErr)
-			}
+			return b.completeQueuedTurnWithResult(recoveryCtx, session, turn, chatID, recovered)
 		}
 		marked, markErr := b.markLiveTurnInterruptedUnlessTerminal(recoveryCtx, turn, firstNonEmptyString(cancelReason, "canceled by user"))
 		if markErr != nil {
@@ -19056,12 +18937,12 @@ func (b *Bridge) runQueuedTurnInputWithExecutor(ctx context.Context, executor Ex
 		return nil
 	}
 	traceQueuedTurn("completion-start", true, nil)
-	err = b.completeQueuedTurnWithResult(ctx, session, turn, chatID, plan, result)
+	err = b.completeQueuedTurnWithResult(ctx, session, turn, chatID, result)
 	traceQueuedTurn("completion-finished", false, err)
 	return err
 }
 
-func (b *Bridge) completeQueuedTurnWithResult(ctx context.Context, session *Session, turn teamstore.Turn, chatID string, plan beacon.TurnExecutionPlan, result ExecutionResult) error {
+func (b *Bridge) completeQueuedTurnWithResult(ctx context.Context, session *Session, turn teamstore.Turn, chatID string, result ExecutionResult) error {
 	traceQueuedTurn := func(stage string, started bool, err error) {
 		if b != nil && b.queuedTurnTraceHook != nil && session != nil {
 			b.queuedTurnTraceHook(stage, session.ID, turn.ID, started, err)
@@ -19272,13 +19153,6 @@ func (b *Bridge) completeQueuedTurnWithResult(ctx context.Context, session *Sess
 	}
 	session.UpdatedAt = time.Now()
 	b.markRegistryProjectionDirty()
-	if plan.Action == beacon.TurnRunBeacon || plan.Action == beacon.TurnWaitAllocation {
-		if beaconErr := b.recordBeaconTurnFinish(ctx, session, turn, plan, ""); beaconErr != nil {
-			if b.out != nil {
-				_, _ = fmt.Fprintf(b.out, "beacon turn cleanup error: %v\n", beaconErr)
-			}
-		}
-	}
 	if preFinal.Queued > 0 || len(planned) > 0 {
 		if b.asyncTurnCompletionUsesForegroundOutbox(ctx) {
 			// The terminal turn/checkpoint CAS above durably records every final
@@ -19684,13 +19558,6 @@ func (b *Bridge) markLiveTurnInterruptedUnlessTerminal(ctx context.Context, turn
 		return false, err
 	}
 	return marked.Status == teamstore.TurnStatusInterrupted, nil
-}
-
-func (b *Bridge) markLiveTurnFailed(ctx context.Context, turn teamstore.Turn, message string) (teamstore.Turn, error) {
-	if b != nil && turn.LeaseGeneration > 0 && strings.TrimSpace(turn.MachineID) != "" {
-		return b.store.MarkTurnFailedWithCodexIDsForOwner(ctx, turn.ID, message, "", "", turn.MachineID, turn.LeaseGeneration)
-	}
-	return b.store.MarkTurnFailed(ctx, turn.ID, message)
 }
 
 func (b *Bridge) rejectSessionAttachmentWithMessage(ctx context.Context, session *Session, msg ChatMessage, message string) error {
@@ -20213,18 +20080,6 @@ func (b *Bridge) handleUnresolvedQueuedTurnError(ctx context.Context, session *S
 	}); queueErr != nil && b.out != nil {
 		_, _ = fmt.Fprintf(b.out, "Teams unresolved queued turn notice failed: %v\n", queueErr)
 	}
-}
-
-func beaconTurnStartFailureProviderReason(plan beacon.TurnExecutionPlan, message string) string {
-	if reason := strings.TrimSpace(plan.ProviderReason); reason != "" {
-		return reason
-	}
-	for _, line := range strings.Split(strings.TrimSpace(message), "\n") {
-		if line = strings.TrimSpace(line); line != "" {
-			return line
-		}
-	}
-	return strings.TrimSpace(message)
 }
 
 func (b *Bridge) runExecutorWithHeartbeat(ctx context.Context, executor Executor, session *Session, turn teamstore.Turn, chatID string, input ExecutionInput) (ExecutionResult, error) {
@@ -28658,8 +28513,8 @@ func (b *Bridge) formatWorkSessionStatus(session *Session) string {
 		lines = append(lines, "Model profile: "+label)
 	}
 	lines = append(lines, teamsASRStatusLine(b.asrTranscriber))
-	if target := b.beaconTargetSummary(session.ID); target != "" {
-		lines = append(lines, target)
+	if strings.TrimSpace(session.ID) != "" {
+		lines = append(lines, "Execution target: local")
 	}
 	var latest teamstore.Turn
 	var hasLatest bool
@@ -28938,8 +28793,8 @@ func (b *Bridge) formatSessionDetails(session *Session) string {
 	if session.CodexThreadID != "" {
 		lines = append(lines, "Codex thread: "+session.CodexThreadID)
 	}
-	if target := b.beaconTargetSummary(session.ID); target != "" {
-		lines = append(lines, target)
+	if strings.TrimSpace(session.ID) != "" {
+		lines = append(lines, "Execution target: local")
 	}
 	if session.ChatURL != "" {
 		lines = append(lines, "Teams chat: "+session.ChatURL)
@@ -39032,7 +38887,6 @@ func splitTextChunksForHTMLMessage(prefix string, text string, limitBytes int) [
 }
 
 func controlCommandErrorMessage(err error) string {
-	var providerNotConfigured beacon.ProviderCommandNotConfiguredError
 	switch {
 	case err == nil:
 		return ""
@@ -39042,8 +38896,6 @@ func controlCommandErrorMessage(err error) string {
 		return "I do not have a current list yet. Send `projects` or `sessions` first, then choose a number."
 	case errors.Is(err, ErrDashboardNumberMissing):
 		return "That number is not in the current list. Send `projects` or `sessions` again, then choose one of the newly shown numbers."
-	case errors.As(err, &providerNotConfigured):
-		return beacon.ProviderAdapterConfigurationNotice(providerNotConfigured).Render()
 	default:
 		return err.Error()
 	}

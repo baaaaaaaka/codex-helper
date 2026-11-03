@@ -87,7 +87,6 @@ func newRootCmd() *cobra.Command {
 		newModelProfileCmd(opts),
 		newRunCmd(opts),
 		newTuiCmd(opts),
-		newBeaconCmd(opts),
 		newTeamsCmd(opts),
 		newProxyCmd(opts),
 		newResponsesCmd(opts),

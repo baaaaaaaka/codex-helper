@@ -373,9 +373,6 @@ helper update prerelease
 codex update now
 helper restart now
 helper reload now
-beacon status
-beacon switch <profile>
-beacon release
 ```
 
 `helper reload now` only applies to source-checkout development helpers that can

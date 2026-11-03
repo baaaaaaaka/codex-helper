@@ -9,7 +9,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/baaaaaaaka/codex-helper/internal/beacon"
 	"github.com/baaaaaaaka/codex-helper/internal/teams"
 )
 
@@ -22,7 +21,7 @@ func TestRootCommandWiresExpectedSubcommandsAndFlags(t *testing.T) {
 	}
 	sort.Strings(names)
 
-	want := []string{"__internal-npm-wrapper", "__user-path-probe", "app", "beacon", "delegate", "history", "init", "model", "model-profile", "model-source", "proxy", "responses", "run", "selftest", "skills", "teams", "tui", "upgrade"}
+	want := []string{"__internal-npm-wrapper", "__user-path-probe", "app", "delegate", "history", "init", "model", "model-profile", "model-source", "proxy", "responses", "run", "selftest", "skills", "teams", "tui", "upgrade"}
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("unexpected root subcommands\n got: %#v\nwant: %#v", names, want)
 	}
@@ -300,7 +299,6 @@ func TestRestartTeamsHelperFromTeamsWindowsServiceSchedulesTaskStart(t *testing.
 	t.Setenv(envTeamsCodexChild, "")
 	t.Setenv(envTeamsCodexParentPID, "")
 	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "1")
-	t.Setenv("CODEX_HELPER_BEACON_STORE", t.TempDir()+"/beacon.json")
 	teamsServiceGOOS = func() string { return "windows" }
 	teamsServicePowerShellExecutable = func() string { return "powershell.exe" }
 	var gotName string
@@ -340,7 +338,6 @@ func TestRestartTeamsHelperFromTeamsLinuxLocalSupervisorSchedulesServiceRestart(
 		cwd:  tmp,
 	})
 	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "1")
-	t.Setenv("CODEX_HELPER_BEACON_STORE", filepath.Join(tmp, "beacon.json"))
 	t.Setenv(envTeamsLinuxServiceBackend, "local-supervisor")
 
 	configPath, err := teamsServiceLocalSupervisorConfigPath()
@@ -403,45 +400,6 @@ func TestRestartTeamsHelperFromTeamsLinuxLocalSupervisorSchedulesServiceRestart(
 		!strings.Contains(joined, shellQuote(exe)+" teams service restart") ||
 		strings.Contains(joined, "systemctl") {
 		t.Fatalf("detached restart command = %q %#v, want local-supervisor service restart", gotName, gotArgs)
-	}
-}
-
-func TestRestartTeamsHelperFromTeamsBlocksOnBeaconJob(t *testing.T) {
-	lockCLITestHooks(t)
-	tmp := t.TempDir()
-	isolateUpgradeTeamsStateForTest(t, tmp)
-	seedBeaconStateForUpgradeTest(t, func(st *beacon.State) {
-		st.Machines["gpu-a"] = beacon.Machine{
-			ID:            "gpu-a",
-			LeaseID:       "lease-gpu-a",
-			ProviderJobID: "slurm-123",
-			Profile:       "gpu",
-			State:         "accepting",
-			Jobs:          []string{"job-1"},
-		}
-	})
-
-	prevExec := execSelf
-	prevStart := startSelf
-	prevGOOS := teamsServiceGOOS
-	t.Cleanup(func() {
-		execSelf = prevExec
-		startSelf = prevStart
-		teamsServiceGOOS = prevGOOS
-	})
-	teamsServiceGOOS = func() string { return "linux" }
-	execSelf = func(string, []string, []string) error {
-		t.Fatal("helper restart must not exec while beacon work is active")
-		return nil
-	}
-	startSelf = func(string, []string, []string) error {
-		t.Fatal("helper restart must not spawn while beacon work is active")
-		return nil
-	}
-
-	err := restartTeamsHelperFromTeams(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "Beacon state has upgrade-blocking work") || !strings.Contains(err.Error(), "beacon_job job-1") {
-		t.Fatalf("restartTeamsHelperFromTeams error = %v, want beacon blocker", err)
 	}
 }
 

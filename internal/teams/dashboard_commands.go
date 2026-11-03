@@ -47,7 +47,6 @@ const (
 	DashboardCommandCancel         DashboardCommandName = "cancel"
 	DashboardCommandSendFile       DashboardCommandName = "send-file"
 	DashboardCommandSkills         DashboardCommandName = "skills"
-	DashboardCommandBeacon         DashboardCommandName = "beacon"
 	DashboardCommandModel          DashboardCommandName = "model"
 	DashboardCommandEffort         DashboardCommandName = "effort"
 	DashboardCommandDefault        DashboardCommandName = "default"
@@ -230,8 +229,6 @@ func workBareCommandName(text string) (DashboardCommandName, string, bool) {
 		if strings.TrimSpace(arg) == "" || isAdvancedHelpArg(arg) {
 			return DashboardCommandHelp, arg, true
 		}
-	case "beacon":
-		return DashboardCommandBeacon, arg, true
 	case "model":
 		return DashboardCommandModel, arg, true
 	case "models":
@@ -412,7 +409,7 @@ func prefixedControlCommandArgLooksExplicit(commandName DashboardCommandName, ar
 		return arg == "" || isAdvancedHelpArg(arg)
 	case DashboardCommandWorkspaces, DashboardCommandSessions, DashboardCommandStatus:
 		return arg == ""
-	case DashboardCommandSkills, DashboardCommandBeacon, DashboardCommandModel, DashboardCommandEffort, DashboardCommandDefault:
+	case DashboardCommandSkills, DashboardCommandModel, DashboardCommandEffort, DashboardCommandDefault:
 		return true
 	case DashboardCommandFork:
 		return true
@@ -460,8 +457,6 @@ func controlNaturalCommandName(name string, arg string) (DashboardCommandName, b
 		return DashboardCommandStatus, true
 	case "skills", "skill":
 		return DashboardCommandSkills, true
-	case "beacon":
-		return DashboardCommandBeacon, true
 	case "model", "models", "model-profile", "model-profiles", "profiles":
 		return DashboardCommandModel, true
 	case "effort", "efforts", "reasoning-effort", "thinking-effort":
@@ -564,8 +559,6 @@ func workNaturalCommandName(name string, _ string) (DashboardCommandName, bool) 
 		return DashboardCommandFork, true
 	case "skills", "skill":
 		return DashboardCommandSkills, true
-	case "beacon":
-		return DashboardCommandBeacon, true
 	case "model", "models", "model-profile", "model-profiles", "profiles":
 		return DashboardCommandModel, true
 	case "effort", "efforts", "reasoning-effort", "thinking-effort":

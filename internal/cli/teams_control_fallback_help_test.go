@@ -31,33 +31,6 @@ func TestTeamsControlFallbackHelpContextCoversOperationalCommands(t *testing.T) 
 		"`cxp teams pause|resume|drain|recover`",
 		"`cxp teams chat recreate <session-id> --history full --yes`",
 		"`cxp teams chat publish-history <session-id> --full --yes`",
-		"`cxp beacon profile create <name>",
-		"`cxp beacon profile update <name>",
-		"`cxp beacon profile history <name>`",
-		"`cxp beacon profile rollback <name> <revision>`",
-		"`cxp beacon profile gc <name>`",
-		"--query-command <script>",
-		"`cxp beacon profile doctor <name>`",
-		"`cxp beacon profile confirm <name>`",
-		"`cxp beacon switch-profile <name> --session <id>`",
-		"`cxp beacon switch-profile <name> --session <id> --after-current-turn`",
-		"`cxp beacon release <profile|allocation|provider-job|machine> [--force] [--confirm <token>]`",
-		"`cxp beacon allocation list|status|cancel|reconcile`",
-		"`cxp beacon allocation reconcile-all`",
-		"`cxp beacon provider template slurm|lsf`",
-		"`cxp beacon worker run-once --machine <id>`",
-		"`cxp beacon worker serve --allocation <request-id>`",
-		"--shared-store",
-		"--codex-path <codex-or-wrapper>",
-		"--skip-git-repo-check",
-		"CXP_BEACON_CODEX_BIN",
-		"standard approval runtime inside the allocation",
-		"Teams service `--codex-arg` settings do not automatically reach remote beacon workers",
-		"Keep exactly one `exec`",
-		"`--adapter-shell direct`",
-		"user-shell capture is incompatible",
-		"CODEX_HELPER_BEACON_SLURM_QUERY",
-		"Beacon execution profiles are separate from SSH proxy profiles",
 		"$CODEX_HELPER_CLI_PATH",
 		"`cxp skills install-builtin`",
 		"`cxp skills migrate`",
@@ -92,7 +65,7 @@ func TestTeamsControlFallbackHelpContextCoversOperationalCommands(t *testing.T) 
 	}
 }
 
-func TestTeamsControlFallbackBeaconDigestStaysAlignedWithDocsAndSkill(t *testing.T) {
+func TestTeamsControlFallbackDigestStaysAlignedWithDocsAndSkill(t *testing.T) {
 	fallback := teamsControlFallbackHelpContext()
 	repoRoot := sourceCheckoutRootForDocsDriftTest(t)
 	read := func(path string) string {
@@ -119,41 +92,6 @@ func TestTeamsControlFallbackBeaconDigestStaysAlignedWithDocsAndSkill(t *testing
 			name:     "teams model commands",
 			fallback: []string{"new <directory> --model <profile>", "model list", "model status", "model switch <profile>", "model reset", "model fork <profile>", "default model status|list|set|reset", "default effort status|list|set|reset"},
 			docs:     []string{"new <directory> --model", "model list", "model status", "model switch", "model reset", "model fork", "default model status|list|set|reset", "default effort status|list|set|reset"},
-		},
-		{
-			name:     "profile lifecycle",
-			fallback: []string{"beacon profile create <name>", "beacon profile update <name>", "beacon profile history <name>", "beacon profile rollback <name> <revision>", "beacon profile gc <name>", "beacon profile doctor <name>", "beacon profile confirm <name>"},
-			docs:     []string{"beacon profile create <name>", "beacon profile update <name>", "beacon profile history <name>", "beacon profile rollback <name> <revision>", "beacon profile gc <name>", "beacon profile doctor <name>", "beacon profile confirm <name>"},
-		},
-		{
-			name:     "profile adapter commands",
-			fallback: []string{"--query-command <script>", "--submit-command <script>", "--cancel-command <script>", "--renew-command <script>"},
-			docs:     []string{"--query-command", "--submit-command", "--cancel-command", "--renew-command"},
-		},
-		{
-			name:     "profile switching",
-			fallback: []string{"beacon switch-profile <name> --session <id>", "beacon switch-profile <name> --session <id> --after-current-turn"},
-			docs:     []string{"beacon switch-profile <name> --session", "--after-current-turn"},
-		},
-		{
-			name:     "managed allocation",
-			fallback: []string{"beacon release <profile|allocation|provider-job|machine>", "beacon allocation list|status|cancel|reconcile", "beacon allocation reconcile-all"},
-			docs:     []string{"beacon release <profile|allocation|provider-job|machine>", "beacon allocation list", "beacon allocation status", "beacon allocation cancel", "beacon allocation reconcile", "beacon allocation reconcile-all"},
-		},
-		{
-			name:     "provider templates",
-			fallback: []string{"beacon provider template slurm|lsf"},
-			docs:     []string{"beacon provider template slurm", "beacon provider template lsf"},
-		},
-		{
-			name:     "worker execution",
-			fallback: []string{"beacon worker run-once --machine", "beacon worker run-once --allocation", "beacon worker serve --allocation"},
-			docs:     []string{"beacon worker run-once --machine", "beacon worker run-once --allocation", "beacon worker serve --allocation"},
-		},
-		{
-			name:     "worker adapter troubleshooting",
-			fallback: []string{"--shared-store", "--codex-path <codex-or-wrapper>", "--skip-git-repo-check", "CXP_BEACON_CODEX_BIN", "standard approval runtime inside the allocation", "Keep exactly one `exec`", "`--adapter-shell direct`"},
-			docs:     []string{"--shared-store", "--codex-path <codex-or-wrapper>", "--skip-git-repo-check", "CXP_BEACON_CODEX_BIN", "standard approval runtime inside the allocation", "Keep exactly one `exec`", "`--adapter-shell direct`"},
 		},
 	}
 	for _, check := range checks {

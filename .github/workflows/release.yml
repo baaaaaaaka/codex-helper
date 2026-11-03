@@ -131,8 +131,8 @@ jobs:
           set -euo pipefail
           go test ./internal/codexrunner -count=1 -run '^TestAppServerRunner(StartThreadEncodesThreadStartAndTurnStart|ListModels.*)$' -v
           go test ./internal/modelprofile -count=1 -run '^TestCodexModelCatalogJSONUsesPublicModelIDs$' -v
-          go test ./internal/cli -count=1 -run '^Test(TeamsCodexExecutor(ResumesExistingSession|ReasoningEffortCatalog.*)|CodexReasoningEffortFromArgsPreservesExplicitLastOverride|RunBeaconWorkerJobUsesStandardAppServer)$' -v
-          go test ./internal/teams -count=1 -run '^Test(ReasoningEffort.*|ParseControlDashboardCommandsDoNotRequireCodex|ParseWorkChatPlainTextIsCodexInput|BridgeTurnExecutionConfigOverridesSessionSnapshot|BeaconJobExecutorStreamsPerJobSidecarBeforeTerminal)$' -v
+          go test ./internal/cli -count=1 -run '^Test(TeamsCodexExecutor(ResumesExistingSession|ReasoningEffortCatalog.*)|CodexReasoningEffortFromArgsPreservesExplicitLastOverride)$' -v
+          go test ./internal/teams -count=1 -run '^Test(ReasoningEffort.*|ParseControlDashboardCommandsDoNotRequireCodex|ParseWorkChatPlainTextIsCodexInput|BridgeTurnExecutionConfigOverridesSessionSnapshot)$' -v
           go test ./internal/teams/store -count=1 -run '^TestQueueTurnPinsSessionExecutionConfigSnapshot$' -v
 
       - name: Unified official and third-party model routing contracts
@@ -337,7 +337,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cli_pattern='Test(TeamsStandardRuntimeRefreshesManagedNodePATHAfterExecutorCreation|TeamsAppServerReceivesUserPathInsteadOfServiceOrManagedRuntime|ApplyTeamsUserPathRuntime.*|ResolveTeamsCodexUserPath.*|CommandLooksNative.*|RunCodexNewSessionUsesManagedNodeWithoutSystemNode|RunBeaconWorkerJobUsesManagedNodeWithoutSystemNode|CodexRuntimeEnvironment.*|MergeCLIEnvironment.*|CodexAppAuthIdentityRuntimeEnvPrependsTargetManagedNode|RunTargetOnceWithOptionsRemovesRuntimeMarkers|StartCodexDesktopProcessPassesProxyArgAndEnv)$'
+          cli_pattern='Test(TeamsStandardRuntimeRefreshesManagedNodePATHAfterExecutorCreation|TeamsAppServerReceivesUserPathInsteadOfServiceOrManagedRuntime|ApplyTeamsUserPathRuntime.*|ResolveTeamsCodexUserPath.*|CommandLooksNative.*|RunCodexNewSessionUsesManagedNodeWithoutSystemNode|CodexRuntimeEnvironment.*|MergeCLIEnvironment.*|CodexAppAuthIdentityRuntimeEnvPrependsTargetManagedNode|RunTargetOnceWithOptionsRemovesRuntimeMarkers|StartCodexDesktopProcessPassesProxyArgAndEnv)$'
           process_pattern='Test(MergeAppServerProcessEnv.*|AppServerProcessStarter(RemovesInheritedRuntimeMarkers|RemovesRuntimeMarkersAfterConfiguration|NilConfiguredEnvironmentKeepsSanitizedParent)|AppServerRunnerRetries(LaunchFailureBeforeInitialization|TransportFailureDuringInitialization))$'
           go test ./internal/cli -count=1 -run '^TestNativeWindowsHTTPClient.*$' -v
           go test ./internal/cli -count=1 -run '^TestCodexAppAuthWindowsProxyBrowserScriptPassesIndependentArgsIntegration$' -v
@@ -409,8 +409,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go test ./internal/beacon -count=1 -run 'TestJobStreamWriterReaderIgnoresPartialAndOversizedLines$' -v
-          go test ./internal/teams -count=1 -run 'Test(CodexEventForwarder(DoesNotFlushFinalAnswerAsProgressOnIdle|TreatsTaskCompleteAgentMessageAsTerminal)|BeaconJobExecutorStreamsPerJobSidecarBeforeTerminal)$' -v
+          go test ./internal/teams -count=1 -run 'Test(CodexEventForwarder(DoesNotFlushFinalAnswerAsProgressOnIdle|TreatsTaskCompleteAgentMessageAsTerminal))$' -v
           go test ./internal/teams -count=1 -run 'TestBridgeCanQueueLiveTurnOutbox(ChecksTargetTurn|ChecksTargetTurnSQLite|IgnoresUnrelatedSQLiteCorruption)$' -v
 
       - name: Teams attachment filename and artifact upload regressions
@@ -726,9 +725,7 @@ jobs:
           builtin_skill="$HOME/.agents/skills/cxp"
           test -f "$builtin_skill/SKILL.md"
           test -f "$builtin_skill/references/commands.md"
-          grep -q -- "--after-current-turn" "$builtin_skill/references/commands.md"
           grep -q "standard approval broker" "$builtin_skill/references/commands.md"
-          grep -q "standard approval runtime" "$builtin_skill/references/commands.md"
           "$HOME/.local/bin/codex-proxy" proxy doctor || true
           reset_out="$("$HOME/.local/bin/codex-proxy" --config "$RUNNER_TEMP/proxy-reset-smoke.json" proxy reset)"
           printf '%s\n' "$reset_out"
@@ -805,9 +802,7 @@ jobs:
           if (!(Test-Path -LiteralPath (Join-Path $builtinSkill "SKILL.md"))) { throw "builtin cxp SKILL.md missing" }
           $builtinReference = Join-Path $builtinSkill "references\commands.md"
           if (!(Test-Path -LiteralPath $builtinReference)) { throw "builtin cxp command reference missing" }
-          if ((Get-Content -Raw -LiteralPath $builtinReference) -notmatch "--after-current-turn") { throw "builtin cxp command reference missing deferred beacon switch guidance" }
           if ((Get-Content -Raw -LiteralPath $builtinReference) -notmatch "standard approval broker") { throw "builtin cxp command reference missing standard approval broker guidance" }
-          if ((Get-Content -Raw -LiteralPath $builtinReference) -notmatch "standard approval runtime") { throw "builtin cxp command reference missing standard approval runtime guidance" }
           & $exe proxy doctor | Out-Default
           $resetConfig = Join-Path $env:RUNNER_TEMP "proxy-reset-smoke.json"
           $resetOut = (& $exe --config $resetConfig proxy reset | Out-String)

@@ -1621,9 +1621,6 @@ func restartTeamsHelperFromTeams(context.Context) error {
 	if err := rejectTeamsHelperSelfManagementFromChild("restart the Teams helper", "helper restart now"); err != nil {
 		return err
 	}
-	if err := helperRestartBeaconBlockerError(); err != nil {
-		return err
-	}
 	if strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_SERVICE")) != "" {
 		if teamsServiceGOOS() == "windows" {
 			if err := scheduleDelayedTeamsServiceStart(context.Background(), ""); err != nil {
@@ -1834,9 +1831,6 @@ func restartTeamsHelperFromTeamsAfterPendingReplacement(ctx context.Context, pen
 	if err := rejectTeamsHelperSelfManagementFromChild("restart the Teams helper", "helper restart now"); err != nil {
 		return err
 	}
-	if err := helperRestartBeaconBlockerError(); err != nil {
-		return err
-	}
 	if teamsServiceGOOS() == "windows" {
 		if strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_SERVICE")) != "" {
 			if err := scheduleTeamsPendingHelperActivationForReplacement(context.Background(), pendingReplacePath, installPath); err != nil {
@@ -1855,9 +1849,6 @@ func restartTeamsHelperFromTeamsAfterPendingReplacement(ctx context.Context, pen
 
 func restartTeamsHelperFromTeamsUsingInstallPath(_ context.Context, installPath string) error {
 	if err := rejectTeamsHelperSelfManagementFromChild("restart the Teams helper", "helper restart now"); err != nil {
-		return err
-	}
-	if err := helperRestartBeaconBlockerError(); err != nil {
 		return err
 	}
 	return restartSelfWithExecutable(installPath)

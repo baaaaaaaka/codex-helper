@@ -112,8 +112,8 @@ Most users only need the quick start above plus the common commands below:
   open sessions from the history TUI.
 - **Daily options**: run commands through the selected proxy, choose a model
   profile, open the Codex desktop app, or drive Codex from Teams.
-- **Advanced operations**: skills maintenance, beacon scheduler execution,
-  Teams service recovery, workflow webhooks, and source-checkout deployment.
+- **Advanced operations**: skills maintenance, Teams service recovery,
+  workflow webhooks, and source-checkout deployment.
 
 The rest of this README is grouped with that split in mind: common commands
 come first, then optional model/desktop/Teams flows, then advanced execution
@@ -243,35 +243,6 @@ walk through the normal flows in order.
 | `codex-proxy delegate resolve --query <text> --json` | Resolve cross-machine delegation candidates for Codex or diagnostics |
 | `codex-proxy delegate start --candidate-token <token> --task-file <path> --json` | Create an idempotent delegation request for a selected machine |
 | `codex-proxy delegate status` / `wait` / `cancel` | Inspect, wait for, or cancel a delegation using the route saved by `start` |
-| `codex-proxy beacon profile list` | List beacon execution profiles |
-| `codex-proxy beacon profile create <name>` | Create a draft beacon execution profile |
-| `codex-proxy beacon profile update <name>` | Create a new profile revision without breaking chats already bound to the old revision |
-| `codex-proxy beacon profile history <name>` | List current and historical revisions for a beacon profile |
-| `codex-proxy beacon profile rollback <name> <revision>` | Publish a historical profile revision as a new latest revision |
-| `codex-proxy beacon profile gc <name>` | Prune historical revisions no active target/allocation still references |
-| `codex-proxy beacon profile doctor <name>` | Validate profile fields and provider adapter commands without touching the scheduler |
-| `codex-proxy beacon profile doctor <name> --smoke` | Submit, query, and cancel one scheduler allocation to verify adapters |
-| `codex-proxy beacon profile confirm <name>` | Confirm a beacon profile after review; incomplete profiles remain draft |
-| `codex-proxy beacon profile status <name>` | Inspect one beacon profile |
-| `codex-proxy beacon profile delete <name>` | Archive a beacon profile when it is not in active use |
-| `codex-proxy beacon status [--session <id>]` | Show beacon target state |
-| `codex-proxy beacon release <profile\|allocation\|provider-job\|machine>` | Preview and release a beacon resource by profile, allocation id, provider job id, or machine id |
-| `codex-proxy beacon switch-profile <name> --session <id>` | Switch a conversation to a ready beacon profile |
-| `codex-proxy beacon switch-profile <name> --session <id> --after-current-turn` | Defer a beacon switch so the current Codex turn can finish |
-| `codex-proxy beacon allocation list` | List managed beacon allocation requests |
-| `codex-proxy beacon allocation status <allocation-or-provider-job>` | Show one managed allocation request |
-| `codex-proxy beacon allocation cancel <allocation-or-provider-job>` | Cancel one managed allocation through the configured provider adapter |
-| `codex-proxy beacon allocation reconcile <allocation>` | Query/adopt/submit through the configured provider adapter |
-| `codex-proxy beacon allocation reconcile-all` | Reconcile all allocations, drain stale workers, and recover stale claims |
-| `codex-proxy beacon provider template slurm` | Print a starter Slurm adapter script |
-| `codex-proxy beacon provider template lsf` | Print a starter LSF adapter script |
-| `codex-proxy beacon worker run-once --machine <id>` | Claim one queued beacon job on an allocated worker and publish its terminal result |
-| `codex-proxy beacon worker run-once --allocation <id> --wait 30m` | Register the current scheduler worker, wait for its Teams job, and publish the terminal result |
-| `codex-proxy beacon worker serve --allocation <id>` | Register a long-lived worker with bootstrap diagnostics and serve jobs until idle or stopped |
-| `codex-proxy beacon machine list` | List beacon machines |
-| `codex-proxy beacon machine status <machine-or-lease>` | Inspect a beacon machine or lease and get confirmation tokens |
-| `codex-proxy beacon machine release <machine-or-lease>` | Drain or release a beacon machine |
-| `codex-proxy beacon machine kill <machine-or-lease-or-job> --confirm <token>` | Hard-kill a beacon machine only with the exact token from status |
 | `codex-proxy upgrade` | Self-update from GitHub Releases |
 
 Common flags:
@@ -285,7 +256,6 @@ Common flags:
 - `history open` supports `--codex-dir`, `--codex-path`, and `--profile`
 - `history list` / `history show` support `--codex-dir`
 - `skills` supports `--codex-dir`
-- `beacon` supports `--store /path/to/beacon.json` to override the beacon state file
 
 </details>
 
@@ -306,8 +276,8 @@ codex-proxy run --aaa -- codex exec "..."
 
 AAA answers supported approval requests after a fixed 500 ms delay. Without
 AAA, non-interactive `codex exec` facade requests fail closed because no human
-reviewer is attached. Teams and Beacon are unattended surfaces and therefore
-enable the same automatic handler explicitly; they do not inherit the local TUI
+reviewer is attached. Teams is an unattended surface and therefore enables
+the same automatic handler explicitly; they do not inherit the local TUI
 preference. The `--aaa` flag is consumed by CXP and is never passed to Codex.
 
 This runtime requires Codex CLI 0.131.0 or newer; older managed/PATH installs
@@ -322,7 +292,7 @@ already provide. Telemetry remains enabled and is forwarded without payload
 mutation.
 
 The brokered surfaces are the Codex TUI/history launch paths, the `codex exec`
-facade, Teams turns, and Beacon workers. Manual and AAA modes use the same
+facade, and Teams turns. Manual and AAA modes use the same
 original binary, on-request policy, Responses gateway, and proxy routing; only
 the reviewer changes. Contract CI uses the original Codex
 binary with analytics enabled and requires the emitted review to remain an
@@ -1128,11 +1098,6 @@ If a quick Codex question sent in the control chat gets stuck, send
 `helper cancel running` in that same control chat. Work chat requests are still
 canceled inside their own Work chat.
 
-Beacon profile setup is a local `codex-proxy beacon ...` CLI workflow. You can
-ask questions about it in the Teams control chat, but profile mutation commands
-should be run locally unless the helper prints a specific supported Teams
-command.
-
 Control-chat Codex fallback receives the configured Teams Codex PATH policy,
 which defaults to the target account environment for newly written policy
 configs; migrated older configs retain explicit `service` mode. It also receives
@@ -1148,248 +1113,6 @@ run the installed helper update.
 
 For a deeper deployment and troubleshooting guide, see
 [`docs/teams_source_deployment_guide.md`](docs/teams_source_deployment_guide.md).
-
-## Beacon execution profiles
-
-Beacon is an advanced Teams execution mode. You can skip this section unless
-you already use Teams helper and want future Teams Work chat turns to run on a
-specific local worker, Slurm allocation, or LSF allocation instead of the
-helper service machine.
-
-Beacon profiles describe where Codex work should execute. They are separate
-from SSH proxy profiles: `codex-proxy proxy` controls network routing, while
-`codex-proxy beacon profile ...` controls scheduler or worker placement.
-
-Create a Slurm draft profile with the scheduler fields your site requires:
-
-```bash
-codex-proxy beacon profile create gpu \
-  --provider slurm \
-  --partition interactive \
-  --image image.sqsh \
-  --nodes 1 \
-  --gpu 1 \
-  --duration 4 \
-  --shared-path /shared/cxp-beacon \
-  --query-command /path/to/query-slurm-allocation \
-  --submit-command /path/to/submit-slurm-allocation \
-  --cancel-command /path/to/cancel-slurm-allocation \
-  --renew-command /path/to/renew-slurm-allocation
-```
-
-LSF and local drafts use smaller inputs:
-
-```bash
-codex-proxy beacon profile create batch --provider lsf --queue normal --shared-path /shared/cxp-beacon
-codex-proxy beacon profile create local --provider local
-```
-
-If the beacon job should use an existing SSH proxy profile for network access,
-add `--proxy ssh_profile --proxy-profile <existing-profile>`. Add
-`--isolation shared` or `--isolation exclusive` to choose the default lease
-sharing mode.
-
-For managed Slurm/LSF profiles, `--shared-path` must point at an absolute
-directory that both the control machine and allocated workers can read and
-write. If `CODEX_HELPER_BEACON_STORE` is explicitly configured, cxp preserves
-that store path for workers; otherwise it derives a store under `shared_path`.
-
-Profiles stay draft until checked and confirmed. `profile doctor` validates the
-profile fields, shared-path write/rename access, and the
-`query`/`submit`/`cancel`/`renew` adapter commands that future Teams turns will
-need:
-
-```bash
-codex-proxy beacon profile doctor gpu
-codex-proxy beacon profile doctor gpu --smoke
-codex-proxy beacon profile confirm gpu
-codex-proxy beacon profile status gpu
-```
-
-Plain `doctor` is non-destructive and checks profile fields plus adapter
-presence/executability. Add `--smoke` only when you want cxp to submit, query,
-and cancel one real scheduler allocation to verify the adapter output contract
-from the same profile/environment future Teams turns will use.
-
-To change a profile, update it in place. The helper records a new revision,
-while queued or running turns keep their existing target snapshot:
-
-```bash
-codex-proxy beacon profile update gpu \
-  --provider slurm \
-  --partition interactive \
-  --image new-image.sqsh \
-  --nodes 1 \
-  --gpu 1 \
-  --duration 4
-```
-
-Use `profile history` to inspect published revisions. If a new revision is bad,
-`profile rollback <name> <revision>` republishes the historical config as a new
-latest revision, and `profile gc <name>` removes only history entries that no
-conversation, queued turn, or allocation still references.
-
-After a profile is ready, inspect target state or switch an existing
-conversation explicitly:
-
-```bash
-codex-proxy beacon status --session <session-id>
-codex-proxy beacon switch-profile gpu --session <session-id>
-```
-
-In Teams, use `beacon switch <profile>` from the Work chat. The helper then
-submits, queries, waits for the worker, renews, and cleans up the managed
-allocation automatically. If you need to manually free the current resource,
-send `beacon release` in the Work chat; the profile binding stays unchanged, so
-future turns may acquire a fresh worker for the same profile. If the worker is
-shared, Work-chat release detaches only the current chat's demand and leaves the
-shared worker available to other chats; control-chat release is still required
-for a shared or forced release that would affect everyone. `beacon local`
-switches future turns back to local execution and asks the helper to drain or
-release this chat's old beacon resource when that is safe.
-
-From the CLI or Teams control chat,
-`codex-proxy beacon release <profile|allocation|provider-job|machine>` accepts
-the resource identifier you have and resolves the internal object type. Release
-commands show a preview with affected chats, queued/running turns, allocation
-ids, provider job ids, and the planned action. Shared or forced releases require
-the shown `--confirm <token>` value before they can affect other chats.
-
-When a Teams Work chat targets a beacon profile, each turn snapshots the target
-and records a managed allocation request before Codex can start. Explicit
-beacon turns do not fall back to local execution. If no accepting beacon
-worker/lease is available yet, `beacon status` shows the allocation id,
-allocation state, provider job id, provider state, and provider reason that
-need attention.
-
-Provider submission is adapter-based. The least surprising Teams workflow is to
-store adapter commands on the beacon profile with `--query-command`,
-`--submit-command`, `--cancel-command`, and `--renew-command`; those profile
-changes apply to future turns without restarting the Teams helper. Managed
-Slurm/LSF adapters use your default user shell environment by default, so site
-setup from modules, `submit_job`, NSS, or `SUBMIT_ACCOUNT` is available without
-copying those variables into the helper service. Add `--adapter-shell direct`
-when `$SHELL -lic` is incompatible (for example tcsh/csh) or an adapter needs
-the clean helper service environment. To start from a site-editable Slurm or
-LSF wrapper, print a template:
-
-```bash
-codex-proxy beacon provider template slurm > ~/bin/cxp-beacon-slurm-adapter
-chmod +x ~/bin/cxp-beacon-slurm-adapter
-```
-
-If you prefer one global adapter per provider, point managed beacon allocations
-at executable adapters through the helper service environment instead:
-
-```bash
-export CODEX_HELPER_BEACON_SLURM_QUERY=/path/to/query-slurm-allocation
-export CODEX_HELPER_BEACON_SLURM_SUBMIT=/path/to/submit-slurm-allocation
-export CODEX_HELPER_BEACON_SLURM_CANCEL=/path/to/cancel-slurm-allocation
-export CODEX_HELPER_BEACON_SLURM_RENEW=/path/to/renew-slurm-allocation
-export CODEX_HELPER_BEACON_LSF_QUERY=/path/to/query-lsf-allocation
-export CODEX_HELPER_BEACON_LSF_SUBMIT=/path/to/submit-lsf-allocation
-export CODEX_HELPER_BEACON_LSF_CANCEL=/path/to/cancel-lsf-allocation
-export CODEX_HELPER_BEACON_LSF_RENEW=/path/to/renew-lsf-allocation
-export CODEX_HELPER_BEACON_PROVIDER_SHELL_MODE=user
-```
-
-Profile-stored adapter commands are usually easier because they apply to future
-turns without a service change. If you change helper service environment
-variables instead, restart the installed helper from the Teams control chat with
-`helper restart now`.
-
-When no adapter shell mode is set, managed Slurm/LSF adapters behave as
-`--adapter-shell user`. cxp uses `$SHELL -lic` only to capture a framed
-environment snapshot, then runs the adapter directly with that environment so
-shell startup output cannot pollute the adapter protocol. Use
-`--adapter-shell shell-command` only for rare sites where scheduler submission
-is a shell function or alias that cannot be captured as environment. The
-adapter receives flags such as `--request-id`, `--name`, `--profile`,
-`--provider`, `--partition`, `--image`, `--queue`, and
-`--operation query|submit|cancel|renew`. It should print JSON like
-`{"provider_job_id":"123","raw_state":"PD","reason":"Resources","provider_deadline":"2026-05-18T10:30:00Z"}`
-or key-value output such as
-`provider_job_id=123 raw_state=PD reason=Resources provider_deadline=1779090600`.
-The generated Slurm/LSF templates include `query`, `submit`, `cancel`, and a
-site-policy `renew` stub that exits non-zero until edited; implement the renew
-case when the scheduler exposes walltime extension.
-
-Beacon adapter troubleshooting:
-
-- `exit 127` from the scheduler job often means the submitted command was
-  malformed or PATH is different inside the allocation. Keep exactly one `exec`
-  in the final worker command; if a site wrapper already prepends `exec`, remove
-  the extra one from the adapter.
-- `allocation request ... not found` inside the worker usually means the worker
-  is using the wrong state file. Custom Slurm/LSF submit adapters must accept
-  `--shared-store` and pass it to the worker as
-  `cxp beacon --store <shared-store> worker ...`.
-- If `$SHELL -lic` fails under tcsh/csh, update the profile with
-  `--adapter-shell direct`; profile revisions apply to future turns.
-- Beacon workers start the standard approval runtime inside the allocation, so
-  approved commands inherit the devices and mounts granted by the scheduler or
-  container while retaining the outer isolation boundary.
-- If worker doctor reports `missing codex`, set scheduler PATH or pass worker
-  `--codex-path <codex-or-wrapper>` from the adapter. A wrapper is still useful
-  for path resolution or extra Codex exec flags such as
-  `--skip-git-repo-check`; Teams service `--codex-arg` settings do not
-  automatically reach remote beacon workers. The generated templates honor
-  `CXP_BEACON_CODEX_BIN` by passing it as worker `--codex-path`.
-
-The active Teams helper owner periodically queries existing provider jobs,
-projects scheduler state back into beacon machines/jobs, and renews allocations
-whose provider deadline is near. Provider calls are never made while holding
-the beacon state lock, and renewal results are applied only when the provider
-job id and renew epoch still match. During helper drain, the renewal controller
-only protects allocations whose job may already have started; it does not
-create new scheduler work for pre-start turns. Release/cancel intents are
-durable, so the active owner retries them during reconcile if an earlier path
-recorded the intent before the provider adapter became available. The same
-reconcile pass drains idle workers with no chat/job demand so shared and
-exclusive workers do not stay accepting forever after demand disappears.
-
-Inside an allocated worker, the scheduler job should register itself against
-the managed allocation and wait for the Teams turn to enqueue work:
-
-```bash
-codex-proxy beacon worker run-once --allocation <request-id> --wait 30m
-```
-
-The worker derives the scheduler job id from `SLURM_JOB_ID` or `LSB_JOBID` when
-`--provider-job` is not provided, registers an accepting machine, claims one
-queued job, runs Codex with the snapshotted prompt and workspace, then writes a
-fenced terminal result back to the shared beacon state. Teams waits through the
-allocation and worker terminal path instead of failing early or running local
-Codex.
-
-For reusable allocations, run a long-lived worker instead:
-
-```bash
-codex-proxy beacon worker serve --allocation <request-id> --idle-timeout 30m
-```
-
-`serve` records worker heartbeats, runs the worker doctor before accepting
-jobs, stores bootstrap diagnostics such as node list, stdout/stderr paths,
-shared beacon store path, and `codex`/`cxp` paths, then drains the machine on
-exit. A controller or cron job can reconcile stale state with:
-
-```bash
-codex-proxy beacon allocation reconcile-all
-```
-
-Scheduler-capable CI can opt in to the real adapter path with
-`CODEX_HELPER_BEACON_LIVE=1`, `CODEX_HELPER_BEACON_LIVE_PROVIDER=slurm|lsf`,
-and the matching `CODEX_HELPER_BEACON_*_QUERY/SUBMIT/CANCEL` commands. The live
-test submits through the profile-stored adapter snapshot and cancels the
-provider job during cleanup.
-
-When issuing a beacon switch from inside an active Codex turn, prefer the
-deferred form so the current answer stays on its existing target and later
-turns use the new profile:
-
-```bash
-codex-proxy beacon switch-profile gpu --session <session-id> --after-current-turn
-```
 
 ## Git-backed skill subscriptions
 
@@ -1421,10 +1144,9 @@ The installer best-effort installs a bundled `cxp` Codex skill into
 `$HOME/.agents/skills/cxp`. Managed skills previously installed under
 `~/.codex/skills` are migrated to the agents skills directory when the skills
 commands run. The skill contains the local command map and the safe handoff
-rules for disruptive operations such as beacon profile switching and Teams
-helper restarts. It is managed as a built-in skill, not as a git-backed
-subscription, so it does not appear as a remote source in `codex-proxy skills
-list`.
+rules for disruptive operations such as Teams helper restarts. It is managed as
+a built-in skill, not as a git-backed subscription, so it does not appear as a
+remote source in `codex-proxy skills list`.
 
 To repair or install it manually:
 

@@ -21,7 +21,6 @@ import (
 	"github.com/gofrs/flock"
 
 	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
-	"github.com/baaaaaaaka/codex-helper/internal/beacon"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
@@ -4358,17 +4357,13 @@ func TestTeamsASRArgsFromEnvAndServiceOverrides(t *testing.T) {
 	}
 }
 
-func TestTeamsServiceInstallPreservesBeaconAndUpdateEnvironmentAndBlocksVolatile(t *testing.T) {
+func TestTeamsServiceInstallPreservesUpdateEnvironmentAndBlocksVolatile(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
 	isolateTeamsUserDirsForTest(t, tmp)
-	t.Setenv("CODEX_HELPER_BEACON_STORE", filepath.Join(tmp, "beacon.json"))
 	t.Setenv("CODEX_HELPER_TEAMS_AUTH_CONFIG", filepath.Join(tmp, "auth.json"))
 	t.Setenv("CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE", filepath.Join(tmp, "full-token.json"))
-	t.Setenv(beacon.BeaconSlurmQueryCommandEnv, filepath.Join(tmp, "slurm-query"))
-	t.Setenv(beacon.BeaconSlurmSubmitCommandEnv, filepath.Join(tmp, "slurm-submit"))
-	t.Setenv(beacon.BeaconLSFCancelCommandEnv, filepath.Join(tmp, "lsf-cancel"))
 	t.Setenv(update.EnvRepo, "owner/name")
 	t.Setenv(update.EnvUpdateIndexURL, "https://example.test/releases.json")
 	t.Setenv("HTTPS_PROXY", "http://user:pass@proxy.example.test:8080")
@@ -4421,12 +4416,8 @@ func TestTeamsServiceInstallPreservesBeaconAndUpdateEnvironmentAndBlocksVolatile
 	unit := string(data)
 	stableCXP := filepath.Join(filepath.Dir(managed), "cxp")
 	for _, want := range []string{
-		"Environment=" + systemdQuoteArg("CODEX_HELPER_BEACON_STORE="+filepath.Join(tmp, "beacon.json")),
 		"Environment=" + systemdQuoteArg("CODEX_HELPER_TEAMS_AUTH_CONFIG="+filepath.Join(tmp, "auth.json")),
 		"Environment=" + systemdQuoteArg("CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE="+filepath.Join(tmp, "full-token.json")),
-		"Environment=" + systemdQuoteArg(beacon.BeaconSlurmQueryCommandEnv+"="+filepath.Join(tmp, "slurm-query")),
-		"Environment=" + systemdQuoteArg(beacon.BeaconSlurmSubmitCommandEnv+"="+filepath.Join(tmp, "slurm-submit")),
-		"Environment=" + systemdQuoteArg(beacon.BeaconLSFCancelCommandEnv+"="+filepath.Join(tmp, "lsf-cancel")),
 		"Environment=" + systemdQuoteArg(update.EnvRepo+"=owner/name"),
 		"Environment=" + systemdQuoteArg(update.EnvUpdateIndexURL+"=https://example.test/releases.json"),
 		"Environment=" + systemdQuoteArg(update.EnvInstallPath+"="+stableCXP),
@@ -4468,8 +4459,6 @@ func TestTeamsServiceRepairMergesAllowedEnvironmentFromExistingSystemdUnit(t *te
 	}
 	oldUnit := strings.Join([]string{
 		"[Service]",
-		"Environment=" + systemdQuoteArg("CODEX_HELPER_BEACON_STORE="+filepath.Join(tmp, "old-beacon.json")),
-		"Environment=" + systemdQuoteArg(beacon.BeaconSlurmQueryCommandEnv+"="+filepath.Join(tmp, "old-slurm-query")),
 		"Environment=" + systemdQuoteArg(update.EnvUpdateIndexURL+"=https://old.example.test/index.json"),
 		"Environment=" + systemdQuoteArg("CODEX_HOME="+filepath.Join(tmp, "old-codex-home")),
 		"Environment=" + systemdQuoteArg(envTeamsHelperCLIPath+"=/tmp/.nfsbad"),
@@ -4500,8 +4489,6 @@ func TestTeamsServiceRepairMergesAllowedEnvironmentFromExistingSystemdUnit(t *te
 	}
 	unit := string(data)
 	for _, want := range []string{
-		"Environment=" + systemdQuoteArg("CODEX_HELPER_BEACON_STORE="+filepath.Join(tmp, "old-beacon.json")),
-		"Environment=" + systemdQuoteArg(beacon.BeaconSlurmQueryCommandEnv+"="+filepath.Join(tmp, "old-slurm-query")),
 		"Environment=" + systemdQuoteArg(update.EnvUpdateIndexURL+"=https://old.example.test/index.json"),
 		"Environment=" + systemdQuoteArg("CODEX_HOME="+filepath.Join(tmp, "old-codex-home")),
 		"Environment=" + systemdQuoteArg("CODEX_DIR="+filepath.Join(tmp, "old-codex-home")),

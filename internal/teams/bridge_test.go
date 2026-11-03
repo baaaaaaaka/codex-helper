@@ -25,7 +25,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/baaaaaaaka/codex-helper/internal/beacon"
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
@@ -9190,14 +9189,6 @@ func TestParseNewSessionRequestUsesDirectoryWithOptionalCompatTitle(t *testing.T
 		t.Fatalf("quoted directory request parsed as %#v", got)
 	}
 
-	got, err = parseNewSessionRequest(tmp + " --beacon gpu --beacon-isolation exclusive -- inspect beacon build")
-	if err != nil {
-		t.Fatalf("parse beacon directory request: %v", err)
-	}
-	if got.WorkDir != tmp || got.Title != "inspect beacon build" || got.BeaconProfile != "gpu" || got.BeaconIsolation != "exclusive" {
-		t.Fatalf("beacon directory request parsed as %#v", got)
-	}
-
 	got, err = parseNewSessionRequest(tmp + " --model-profile mimo25 -- inspect model build")
 	if err != nil {
 		t.Fatalf("parse model-profile directory request: %v", err)
@@ -9221,17 +9212,6 @@ func TestParseNewSessionRequestUsesDirectoryWithOptionalCompatTitle(t *testing.T
 		t.Fatalf("--model directory request parsed as %#v", got)
 	}
 
-	got, err = parseNewSessionRequest("--beacon gpu --beacon-isolation shared")
-	if err != nil {
-		t.Fatalf("parse beacon selected-workspace request: %v", err)
-	}
-	if got.WorkDir != "" || got.Title != "" || got.BeaconProfile != "gpu" || got.BeaconIsolation != "shared" {
-		t.Fatalf("beacon selected-workspace request parsed as %#v", got)
-	}
-
-	if _, err = parseNewSessionRequest(tmp + " --beacon"); err == nil {
-		t.Fatal("missing beacon profile should fail")
-	}
 	if _, err = parseNewSessionRequest(tmp + " --model-profile"); err == nil {
 		t.Fatal("missing model profile should fail")
 	}
@@ -15593,7 +15573,7 @@ func TestBridgeMismatchedCompletionQuarantinesFinalAndPublishesOneAttention(t *t
 		t.Fatalf("seed mismatched completion: %v", err)
 	}
 	result := ExecutionResult{Text: "stale final", CodexThreadID: "thread-owner", CodexTurnID: "codex-other", canonicalTranscriptFinal: true}
-	completionErr := bridge.completeQueuedTurnWithResult(ctx, session, turn, session.ChatID, beacon.TurnExecutionPlan{}, result)
+	completionErr := bridge.completeQueuedTurnWithResult(ctx, session, turn, session.ChatID, result)
 	if !errors.Is(completionErr, teamstore.ErrUnresolvedExecution) {
 		t.Fatalf("mismatched completion error = %v, want ErrUnresolvedExecution", completionErr)
 	}
@@ -15609,7 +15589,7 @@ func TestBridgeMismatchedCompletionQuarantinesFinalAndPublishesOneAttention(t *t
 			t.Fatalf("mismatched completion left sendable final: %#v", msg)
 		}
 	}
-	noIDErr := bridge.completeQueuedTurnWithResult(ctx, session, turn, session.ChatID, beacon.TurnExecutionPlan{}, ExecutionResult{
+	noIDErr := bridge.completeQueuedTurnWithResult(ctx, session, turn, session.ChatID, ExecutionResult{
 		Text: "anonymous child final", canonicalTranscriptFinal: true,
 	})
 	if !errors.Is(noIDErr, teamstore.ErrUnresolvedExecution) {
@@ -15661,7 +15641,7 @@ func TestBridgeExactCompletionPublishesOnceAndClearsAnchor(t *testing.T) {
 		t.Fatalf("seed exact completion: %v", err)
 	}
 	result := ExecutionResult{Text: "authoritative final", CodexThreadID: "thread-exact", CodexTurnID: "codex-exact", canonicalTranscriptFinal: true}
-	if err := bridge.completeQueuedTurnWithResult(ctx, session, turn, session.ChatID, beacon.TurnExecutionPlan{}, result); err != nil {
+	if err := bridge.completeQueuedTurnWithResult(ctx, session, turn, session.ChatID, result); err != nil {
 		t.Fatalf("exact completion: %v", err)
 	}
 	if err := bridge.flushPendingOutboxForChat(ctx, session.ChatID); err != nil {
@@ -15756,7 +15736,7 @@ func TestBridgeLiveBranchCompletionDoesNotAdvanceHistoricalTranscriptCheckpoint(
 				Text: "live branch answer", CodexThreadID: session.CodexThreadID,
 				CodexTurnID: turn.CodexTurnID, canonicalTranscriptFinal: true,
 			}
-			if err := bridge.completeQueuedTurnWithResult(ctx, session, turn, session.ChatID, beacon.TurnExecutionPlan{}, result); err != nil {
+			if err := bridge.completeQueuedTurnWithResult(ctx, session, turn, session.ChatID, result); err != nil {
 				t.Fatalf("complete live-branch turn: %v", err)
 			}
 			completed, found, err := store.TurnByID(ctx, turn.ID)
@@ -15782,7 +15762,7 @@ func TestBridgeLiveBranchCompletionDoesNotAdvanceHistoricalTranscriptCheckpoint(
 			if len(*sent) != 1 || !strings.Contains((*sent)[0].Content, "live branch answer") {
 				t.Fatalf("Graph finals = %#v, want one live-branch answer", *sent)
 			}
-			if err := bridge.completeQueuedTurnWithResult(ctx, session, turn, session.ChatID, beacon.TurnExecutionPlan{}, result); err != nil {
+			if err := bridge.completeQueuedTurnWithResult(ctx, session, turn, session.ChatID, result); err != nil {
 				t.Fatalf("repeat idempotent completion: %v", err)
 			}
 			if err := bridge.flushPendingOutboxForChat(ctx, session.ChatID); err != nil {
@@ -15977,7 +15957,7 @@ func TestBridgeExactCompletionResolvesInterruptedTurnWithProof(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed interrupted proof: %v", err)
 	}
-	if err := bridge.completeQueuedTurnWithResult(ctx, session, teamstore.Turn{ID: turnID, SessionID: session.ID, Status: teamstore.TurnStatusInterrupted, CodexThreadID: anchor.ThreadID, CodexTurnID: anchor.CodexTurnID}, session.ChatID, beacon.TurnExecutionPlan{}, ExecutionResult{Text: "recovered authoritative answer", CodexThreadID: anchor.ThreadID, CodexTurnID: anchor.CodexTurnID, canonicalTranscriptFinal: true}); err != nil {
+	if err := bridge.completeQueuedTurnWithResult(ctx, session, teamstore.Turn{ID: turnID, SessionID: session.ID, Status: teamstore.TurnStatusInterrupted, CodexThreadID: anchor.ThreadID, CodexTurnID: anchor.CodexTurnID}, session.ChatID, ExecutionResult{Text: "recovered authoritative answer", CodexThreadID: anchor.ThreadID, CodexTurnID: anchor.CodexTurnID, canonicalTranscriptFinal: true}); err != nil {
 		t.Fatalf("resolve interrupted completion: %v", err)
 	}
 	if err := bridge.flushPendingOutboxForChat(ctx, session.ChatID); err != nil {
@@ -16036,7 +16016,7 @@ func TestBridgeExactCompletionCommitsFinalCheckpointWithTurn(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed final checkpoint state: %v", err)
 	}
-	if err := bridge.completeQueuedTurnWithResult(ctx, session, turn, session.ChatID, beacon.TurnExecutionPlan{}, ExecutionResult{
+	if err := bridge.completeQueuedTurnWithResult(ctx, session, turn, session.ChatID, ExecutionResult{
 		Text: "done", CodexThreadID: session.CodexThreadID, CodexTurnID: turn.CodexTurnID, canonicalTranscriptFinal: true,
 	}); err != nil {
 		t.Fatalf("exact completion with final checkpoint: %v", err)
@@ -16118,7 +16098,7 @@ func TestBridgeCompletionDoesNotSynchronouslyFlushChatOutbox(t *testing.T) {
 			completionDone := make(chan error, 1)
 			go func() {
 				workerCtx := withTeamsAsyncTurnLifecycleContext(ctx, lifecycleStop)
-				completionDone <- bridge.completeQueuedTurnWithResult(workerCtx, session, turn, session.ChatID, beacon.TurnExecutionPlan{}, ExecutionResult{
+				completionDone <- bridge.completeQueuedTurnWithResult(workerCtx, session, turn, session.ChatID, ExecutionResult{
 					Text: "durably queued final", CodexThreadID: turn.CodexThreadID, CodexTurnID: turn.CodexTurnID, canonicalTranscriptFinal: true,
 				})
 			}()
@@ -16679,137 +16659,6 @@ func TestBridgeSessionCancelSelectorsReportMissingStatus(t *testing.T) {
 				t.Fatalf("missing selector response = %q, want %q", got, tc.want)
 			}
 		})
-	}
-}
-
-func TestBridgeSessionCancelQueuedBeaconTurnTombstonesRemoteJob(t *testing.T) {
-	t.Setenv("CODEX_HELPER_BEACON_STORE", filepath.Join(t.TempDir(), "beacon.json"))
-	graph, sent := newBridgeTestGraph(t)
-	store := newBridgeTestStore(t)
-	bridge := newBridgeTestBridge(graph, store, &recordingExecutor{})
-	session := bridge.reg.SessionByChatID("chat-1")
-	if err := bridge.ensureDurableSession(context.Background(), session); err != nil {
-		t.Fatalf("ensureDurableSession error: %v", err)
-	}
-	base := time.Date(2026, 5, 3, 1, 0, 0, 0, time.UTC)
-	turn := queueBridgeTestTurnWithPrompt(t, store, session, "beacon-cancel", "beacon queued prompt", teamstore.TurnStatusQueued, base)
-	beaconStore, err := beacon.NewStore("")
-	if err != nil {
-		t.Fatalf("beacon store: %v", err)
-	}
-	if err := beaconStore.Update(func(st *beacon.State) error {
-		st.Allocations["req-1"] = beacon.AllocationRequest{ID: "req-1", ConversationID: session.ID, TurnID: turn.ID, State: beacon.AllocationRunning, Provider: beacon.ProviderSlurm, ProviderIdentity: beacon.ProviderIdentity{ProviderJobID: "slurm-1"}}
-		st.Machines["machine-1"] = beacon.Machine{ID: "machine-1", LeaseID: "lease-1", ProviderJobID: "slurm-1", State: string(beacon.LeaseAccepting), Jobs: []string{"job-1"}}
-		st.JobAttempts["job-1"] = beacon.JobAttempt{ID: "job-1", RequestID: "req-1", TurnID: turn.ID, WorkerID: "worker-1", LeaseID: "lease-1", Phase: beacon.JobStarted, ProviderIdentity: beacon.ProviderIdentity{ProviderJobID: "slurm-1"}}
-		return nil
-	}); err != nil {
-		t.Fatalf("seed beacon state: %v", err)
-	}
-	if err := bridge.handleSessionMessage(context.Background(), "chat-1", bridgeTestMessage("cancel-beacon"), "helper cancel last"); err != nil {
-		t.Fatalf("cancel beacon turn: %v", err)
-	}
-	st, err := beaconStore.Load()
-	if err != nil {
-		t.Fatalf("load beacon state: %v", err)
-	}
-	if st.Allocations["req-1"].State != beacon.AllocationCanceled || st.JobAttempts["job-1"].Phase != beacon.JobTombstoned || len(st.Machines["machine-1"].Jobs) != 0 {
-		t.Fatalf("beacon state was not tombstoned: allocation=%#v job=%#v machine=%#v", st.Allocations["req-1"], st.JobAttempts["job-1"], st.Machines["machine-1"])
-	}
-	if got := sentPlainJoined(*sent); !strings.Contains(got, "turn canceled") {
-		t.Fatalf("cancel response = %q", got)
-	}
-}
-
-func TestBridgeBeaconReconcileProjectsProviderStateWithoutSubmitting(t *testing.T) {
-	t.Setenv("CODEX_HELPER_BEACON_STORE", filepath.Join(t.TempDir(), "beacon.json"))
-	store, err := beacon.NewStore("")
-	if err != nil {
-		t.Fatalf("beacon store: %v", err)
-	}
-	now := time.Date(2026, 5, 3, 1, 0, 0, 0, time.UTC)
-	if err := store.Update(func(st *beacon.State) error {
-		st.Allocations["req-1"] = beacon.AllocationRequest{ID: "req-1", Provider: beacon.ProviderSlurm, State: beacon.AllocationRunning, ProviderIdentity: beacon.ProviderIdentity{ProviderJobID: "slurm-1"}}
-		st.Allocations["req-new"] = beacon.AllocationRequest{ID: "req-new", Provider: beacon.ProviderSlurm, State: beacon.AllocationRequestPersisted}
-		st.Machines["machine-1"] = beacon.Machine{ID: "machine-1", LeaseID: "lease-1", ProviderJobID: "slurm-1", State: string(beacon.LeaseAccepting), LastHeartbeat: now.Add(-time.Hour), Jobs: []string{"job-1"}}
-		st.JobAttempts["job-1"] = beacon.JobAttempt{ID: "job-1", RequestID: "req-1", Phase: beacon.JobStarted}
-		st.JobAttempts["claimed-stale"] = beacon.JobAttempt{ID: "claimed-stale", RequestID: "req-new", Phase: beacon.JobClaimed, LeaseID: "old-lease", ProviderIdentity: beacon.ProviderIdentity{ProviderJobID: "old-provider"}, UpdatedAt: now.Add(-time.Hour)}
-		return nil
-	}); err != nil {
-		t.Fatalf("seed beacon store: %v", err)
-	}
-	bridge := &Bridge{}
-	adapter := &reconcileBeaconTestAdapter{query: beacon.SchedulerQueryResult{RawState: "F", Reason: "node failed"}}
-	if err := bridge.reconcileBeaconState(context.Background(), store, adapter, now); err != nil {
-		t.Fatalf("reconcileBeaconState: %v", err)
-	}
-	if adapter.submits != 0 {
-		t.Fatalf("periodic reconcile must not submit new allocations, submits=%d", adapter.submits)
-	}
-	st, err := store.Load()
-	if err != nil {
-		t.Fatalf("load beacon store: %v", err)
-	}
-	if st.Allocations["req-1"].State != beacon.AllocationNeedsAttention || st.Machines["machine-1"].State != string(beacon.LeaseNeedsAttention) || st.JobAttempts["job-1"].Phase != beacon.JobQuarantined {
-		t.Fatalf("provider projection did not propagate: allocation=%#v machine=%#v job=%#v", st.Allocations["req-1"], st.Machines["machine-1"], st.JobAttempts["job-1"])
-	}
-	if stale := st.JobAttempts["claimed-stale"]; stale.Phase != beacon.JobQueued || stale.LeaseID != "" || stale.ProviderIdentity.ProviderJobID != "" {
-		t.Fatalf("stale claimed job should be requeued with old binding cleared: %#v", stale)
-	}
-}
-
-type reconcileBeaconTestAdapter struct {
-	query   beacon.SchedulerQueryResult
-	renew   beacon.SchedulerQueryResult
-	submits int
-	renews  int
-}
-
-func (a *reconcileBeaconTestAdapter) QueryAllocation(context.Context, beacon.AllocationRequest) (beacon.SchedulerQueryResult, error) {
-	return a.query, nil
-}
-
-func (a *reconcileBeaconTestAdapter) SubmitAllocation(context.Context, beacon.AllocationRequest) (beacon.SchedulerQueryResult, error) {
-	a.submits++
-	return beacon.SchedulerQueryResult{}, nil
-}
-
-func (a *reconcileBeaconTestAdapter) RenewAllocation(context.Context, beacon.AllocationRequest) (beacon.SchedulerQueryResult, error) {
-	a.renews++
-	return a.renew, nil
-}
-
-func TestBridgeBeaconLeaseMaintenanceRenewsDueAllocation(t *testing.T) {
-	t.Setenv("CODEX_HELPER_BEACON_STORE", filepath.Join(t.TempDir(), "beacon.json"))
-	store, err := beacon.NewStore("")
-	if err != nil {
-		t.Fatalf("beacon store: %v", err)
-	}
-	now := time.Date(2026, 5, 3, 1, 0, 0, 0, time.UTC)
-	deadline := now.Add(time.Minute)
-	if err := store.Update(func(st *beacon.State) error {
-		st.Allocations["req-1"] = beacon.AllocationRequest{ID: "req-1", Provider: beacon.ProviderSlurm, State: beacon.AllocationRunning, ProviderDeadline: deadline, ProviderIdentity: beacon.ProviderIdentity{ProviderJobID: "slurm-1"}}
-		st.Machines["machine-1"] = beacon.Machine{ID: "machine-1", LeaseID: "lease-1", ProviderJobID: "slurm-1", State: string(beacon.LeaseAccepting), LeaseExpiresAt: deadline}
-		return nil
-	}); err != nil {
-		t.Fatalf("seed beacon store: %v", err)
-	}
-	renewedDeadline := now.Add(30 * time.Minute)
-	adapter := &reconcileBeaconTestAdapter{renew: beacon.SchedulerQueryResult{RawState: "R", Reason: "renewed", ProviderDeadline: renewedDeadline}}
-	if err := (&Bridge{}).renewDueBeaconAllocations(context.Background(), store, adapter, beacon.AllocationRenewOptions{}, now); err != nil {
-		t.Fatalf("renewDueBeaconAllocations: %v", err)
-	}
-	if adapter.renews != 1 || adapter.submits != 0 {
-		t.Fatalf("lease maintenance should renew without submitting, renews=%d submits=%d", adapter.renews, adapter.submits)
-	}
-	st, err := store.Load()
-	if err != nil {
-		t.Fatalf("load beacon store: %v", err)
-	}
-	if req := st.Allocations["req-1"]; req.RenewEpoch != 1 || !req.ProviderDeadline.Equal(renewedDeadline) || req.RenewError != "" {
-		t.Fatalf("allocation was not renewed cleanly: %#v", req)
-	}
-	if got := st.Machines["machine-1"].LeaseExpiresAt; !got.Equal(renewedDeadline) {
-		t.Fatalf("machine lease deadline = %s, want %s", got, renewedDeadline)
 	}
 }
 
@@ -18081,12 +17930,12 @@ func TestBridgeExternalUserMessageReferenceRunsWithoutUserMirror(t *testing.T) {
 	}
 }
 
-func TestBridgeSessionQuotedBeaconCommandIsCodexPrompt(t *testing.T) {
+func TestBridgeSessionQuotedHelperCommandIsCodexPrompt(t *testing.T) {
 	graph, sent := newBridgeTestGraph(t)
 	store := newBridgeTestStore(t)
-	executor := &recordingExecutor{result: ExecutionResult{Text: "looked at quoted beacon", CodexThreadID: "thread-1", CodexTurnID: "turn-1"}}
+	executor := &recordingExecutor{result: ExecutionResult{Text: "looked at quoted command", CodexThreadID: "thread-1", CodexTurnID: "turn-1"}}
 	bridge := newBridgeTestBridge(graph, store, executor)
-	msg := bridgeTestMessageWithText("quoted-beacon", `<p>看一下这个问题</p><blockquote><p>beacon release req-b7ae41d2ab8f40d9aad910e6d3a46d04</p></blockquote>`)
+	msg := bridgeTestMessageWithText("quoted-command", `<p>看一下这个问题</p><blockquote><p>helper cancel all</p></blockquote>`)
 	text := promptTextFromTeamsMessageHTML(msg.Body.Content)
 
 	if err := bridge.handleSessionMessage(context.Background(), "chat-1", msg, text); err != nil {
@@ -18094,22 +17943,22 @@ func TestBridgeSessionQuotedBeaconCommandIsCodexPrompt(t *testing.T) {
 	}
 	if got := executor.prompts; len(got) != 1 {
 		t.Fatalf("executor prompts = %#v, want one Codex prompt", got)
-	} else if !strings.Contains(got[0], "看一下这个问题") || !strings.Contains(got[0], "beacon release req-b7ae41d2ab8f40d9aad910e6d3a46d04") {
+	} else if !strings.Contains(got[0], "看一下这个问题") || !strings.Contains(got[0], "helper cancel all") {
 		t.Fatalf("executor prompt should keep current text and quoted context:\n%s", got[0])
 	}
 	joined := sentPlainJoined(*sent)
-	if strings.Contains(joined, "unknown beacon") || strings.Contains(joined, "usage: `beacon release`") {
-		t.Fatalf("quoted beacon command should not be handled by helper:\n%s", joined)
+	if strings.Contains(joined, "no running or queued turn is available to cancel") || strings.Contains(joined, "cancel requested for running turn") {
+		t.Fatalf("quoted helper command should not be handled by helper:\n%s", joined)
 	}
 }
 
 func TestCommandRouteTextTreatsRenderedTranscriptAsContextOnly(t *testing.T) {
-	msg := bridgeTestMessageWithText("rendered-transcript", `<p><strong>🧑‍💻 User:</strong></p><p>beacon release req-b7ae41d2ab8f40d9aad910e6d3a46d04</p><p><strong>🔧 Helper:</strong></p><p>usage: <code>beacon release</code></p>`)
+	msg := bridgeTestMessageWithText("rendered-transcript", `<p><strong>🧑‍💻 User:</strong></p><p>helper cancel all</p><p><strong>🔧 Helper:</strong></p><p>no running or queued turn is available to cancel in this <code>Work chat</code></p>`)
 	text := promptTextFromTeamsMessageHTML(msg.Body.Content)
 	if got := commandRouteTextFromTeamsMessage(msg, text); got != "" {
 		t.Fatalf("route text = %q, want rendered transcript excluded from helper command routing", got)
 	}
-	if !strings.Contains(text, "beacon release req-b7ae41d2ab8f40d9aad910e6d3a46d04") {
+	if !strings.Contains(text, "helper cancel all") {
 		t.Fatalf("prompt text should retain transcript context, got %q", text)
 	}
 }

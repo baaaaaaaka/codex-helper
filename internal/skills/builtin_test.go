@@ -109,7 +109,6 @@ func TestBuiltinCxpSkillDocumentsCommandMapAndDisruptiveHandoffs(t *testing.T) {
 		"$CODEX_HELPER_CLI_PATH",
 		"references/delegation.md",
 		"cxp delegate resolve/start/status/wait/cancel --json",
-		"cxp beacon switch-profile <profile> --session <session-id> --after-current-turn",
 		"helper reload now",
 		"helper restart now",
 		"do not restart, reload, update, kill, replace, or background the helper from a child Codex turn",
@@ -133,8 +132,6 @@ func TestBuiltinCxpSkillDocumentsCommandMapAndDisruptiveHandoffs(t *testing.T) {
 		"cxp responses serve",
 		"cxp proxy doctor",
 		"cxp proxy reset",
-		"cxp beacon profile create <name> --provider slurm",
-		"cxp beacon switch-profile <name> --session <session-id> --after-current-turn",
 		"cxp teams service bootstrap",
 		"cxp teams service restart --force",
 		"cxp teams workflow status|enable|disable|test",
@@ -196,7 +193,6 @@ func TestBuiltinCxpSkillTriggerDescriptionCoversImplicitRequestsWithoutTokenBloa
 		"Responses adapter",
 		"approvals",
 		"Teams",
-		"beacon targets",
 		"delegation",
 		"upgrades",
 		"operational Codex history",
@@ -216,7 +212,6 @@ func TestBuiltinCxpSkillTriggerDescriptionCoversImplicitRequestsWithoutTokenBloa
 		"model/profile routing",
 		"Responses adapter",
 		"standard approvals",
-		"beacon targets",
 		"cross-machine delegation",
 		"operational Codex history through the CXP CLI/store",
 		"CXP-managed skill operations",
@@ -267,15 +262,6 @@ func TestBuiltinCxpSkillScenarioMatrix(t *testing.T) {
 			},
 		},
 		{
-			name: "beacon profile setup is not proxy setup",
-			required: []string{
-				"Proxy profiles are SSH/network profiles",
-				"They are not beacon execution profiles",
-				"Use `cxp proxy` only when the user is asking about SSH/network routing",
-				"If the user asks for beacon mode or beacon profiles, use `cxp beacon ...`",
-			},
-		},
-		{
 			name: "model profiles responses and standard approvals",
 			required: []string{
 				"cxp run -- codex",
@@ -290,44 +276,6 @@ func TestBuiltinCxpSkillScenarioMatrix(t *testing.T) {
 				"model fork <profile>",
 				"Ctrl+K",
 				"Ctrl+A",
-			},
-		},
-		{
-			name: "slurm lsf and local beacon profile creation",
-			required: []string{
-				"cxp beacon profile create <name> --provider slurm",
-				"cxp beacon profile create <name> --provider lsf",
-				"cxp beacon profile create <name> --provider local",
-				"cxp beacon profile doctor <name>",
-				"cxp beacon profile confirm <name>",
-			},
-		},
-		{
-			name: "beacon worker adapter troubleshooting",
-			required: []string{
-				"--shared-store",
-				"--codex-path <codex-or-wrapper>",
-				"--skip-git-repo-check",
-				"CXP_BEACON_CODEX_BIN",
-				"standard approval runtime inside the allocation",
-				"Keep exactly one `exec`",
-				"`--adapter-shell direct`",
-				"user-shell capture is incompatible",
-			},
-		},
-		{
-			name: "active codex beacon switch uses deferred pending target",
-			required: []string{
-				"Do not run these inline from an active Codex turn",
-				"cxp beacon switch-profile <name> --session <session-id> --after-current-turn",
-				"the current Codex turn stays on its existing target and future turns use the new profile",
-			},
-		},
-		{
-			name: "incompatible signature requires user-approved fork",
-			required: []string{
-				"If the command reports an incompatible execution signature, ask whether to fork before using `--fork`",
-				"cxp beacon switch-profile <name> --session <session-id> --fork",
 			},
 		},
 		{
@@ -357,14 +305,6 @@ func TestBuiltinCxpSkillScenarioMatrix(t *testing.T) {
 				"For auth prompts, destructive confirmations, and skill pushes",
 				"direct the user to run the local `cxp ...` command in their terminal",
 				"cxp skills push [name]",
-			},
-		},
-		{
-			name: "machine hard kill requires exact confirmation token",
-			required: []string{
-				"cxp beacon machine status <machine-or-lease>",
-				"cxp beacon machine kill <machine-or-lease-or-job> --confirm <token>",
-				"hard kill only after using the exact token from status",
 			},
 		},
 		{

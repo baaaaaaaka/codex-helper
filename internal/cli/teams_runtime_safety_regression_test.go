@@ -117,7 +117,6 @@ func TestTeamsRuntimeSafetyServiceSpecNormalizesAllPersistedPathOverridesCI(t *t
 		teamsServiceSpecEnvironmentOverrides(map[string]string{
 			"CODEX_HELPER_TEAMS_AUTH_CONFIG": "auth/config.json",
 			"CODEX_HELPER_TEAMS_TOKEN_CACHE": "tokens/chat.json",
-			"CODEX_HELPER_BEACON_STORE":      "beacon/state.json",
 			envTeamsASRLlamaModel:            "models/qwen.gguf",
 			envTeamsASRCommand:               "bin/asr",
 			envTeamsASRFFmpeg:                "ffmpeg",
@@ -129,7 +128,6 @@ func TestTeamsRuntimeSafetyServiceSpecNormalizesAllPersistedPathOverridesCI(t *t
 	for name, relative := range map[string]string{
 		"CODEX_HELPER_TEAMS_AUTH_CONFIG": "auth/config.json",
 		"CODEX_HELPER_TEAMS_TOKEN_CACHE": "tokens/chat.json",
-		"CODEX_HELPER_BEACON_STORE":      "beacon/state.json",
 		envTeamsASRLlamaModel:            "models/qwen.gguf",
 		envTeamsASRCommand:               "bin/asr",
 	} {

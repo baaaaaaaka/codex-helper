@@ -17,8 +17,6 @@ common commands, model selection, standard approvals, Teams basics, and upgrade 
 
 ## Advanced execution and feature review
 
-- [Beacon mode plan](beacon_mode_plan.md): beacon execution target design and
-  command semantics.
 - [cxp feature interference matrix](cxp_feature_interference_matrix.md):
   feature families, shared resources, test anchors, and cross-feature review
   checklist.

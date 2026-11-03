@@ -25,7 +25,6 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
-	"github.com/baaaaaaaka/codex-helper/internal/beacon"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
@@ -3182,7 +3181,6 @@ func normalizeTeamsServicePathEnvironment(env map[string]string, invocationDir s
 		"CODEX_HELPER_TEAMS_TOKEN_CACHE",
 		"CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE",
 		"CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE",
-		"CODEX_HELPER_BEACON_STORE",
 		envTeamsASRLlamaModel,
 		envTeamsASRLlamaMMProj,
 		update.EnvInstallPath,
@@ -3470,16 +3468,6 @@ func teamsServiceEnvironmentAllowlist() []string {
 		"CODEX_HELPER_TEAMS_FULL_CLIENT_ID",
 		"CODEX_HELPER_TEAMS_FULL_SCOPES",
 		"CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE",
-		"CODEX_HELPER_BEACON_STORE",
-		beacon.BeaconSlurmQueryCommandEnv,
-		beacon.BeaconSlurmSubmitCommandEnv,
-		beacon.BeaconSlurmCancelCommandEnv,
-		beacon.BeaconSlurmRenewCommandEnv,
-		beacon.BeaconLSFQueryCommandEnv,
-		beacon.BeaconLSFSubmitCommandEnv,
-		beacon.BeaconLSFCancelCommandEnv,
-		beacon.BeaconLSFRenewCommandEnv,
-		beacon.BeaconProviderShellModeEnv,
 		update.EnvRepo,
 		update.EnvInstallPath,
 		update.EnvUpdateIndexURL,

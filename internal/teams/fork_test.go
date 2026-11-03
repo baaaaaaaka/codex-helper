@@ -167,7 +167,6 @@ func TestForkWorkCommandMutatesParentGate(t *testing.T) {
 		DashboardCommandPublishHistory,
 		DashboardCommandFork,
 		DashboardCommandSkills,
-		DashboardCommandBeacon,
 		DashboardCommandModel,
 		DashboardCommandEffort,
 	}

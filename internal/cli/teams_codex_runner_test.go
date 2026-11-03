@@ -19,7 +19,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/baaaaaaaka/codex-helper/internal/beacon"
 	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
@@ -687,7 +686,7 @@ case "${1:-}" in
     done ;;
   *) exit 64 ;;
 esac
-`, shellSingleQuoteForBeaconCLITest(envPath))
+`, shellQuote(envPath))
 	if err := os.WriteFile(codexPath, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -744,7 +743,7 @@ shift
 case "${1:-}" in
   --version) echo 'codex-cli 0.142.3'; exit 0 ;;
   --help) echo 'Options: --remote <ADDR> --remote-auth-token-env <ENV_VAR>'; exit 0 ;;
-  app-server) CXP_TEAMS_MANAGED_NODE_APP_SERVER=1 exec ` + shellSingleQuoteForBeaconCLITest(testBinary) + ` -test.run '^TestTeamsManagedNodeAppServerHelperProcess$' -- ;;
+  app-server) CXP_TEAMS_MANAGED_NODE_APP_SERVER=1 exec ` + shellQuote(testBinary) + ` -test.run '^TestTeamsManagedNodeAppServerHelperProcess$' -- ;;
   *) exit 64 ;;
 esac
 `
@@ -869,7 +868,7 @@ func TestTeamsStandardRuntimeRunsTwoSessionsConcurrentlyOnSharedProcess(t *testi
 case "${1:-}" in
   --version) echo 'codex-cli 0.142.3'; exit 0 ;;
   --help) echo 'Options: --remote <ADDR> --remote-auth-token-env <ENV_VAR>'; exit 0 ;;
-  app-server) CXP_TEAMS_PARALLEL_APP_SERVER=1 exec ` + shellSingleQuoteForBeaconCLITest(testBinary) + ` -test.run '^TestTeamsParallelAppServerHelperProcess$' -- ;;
+  app-server) CXP_TEAMS_PARALLEL_APP_SERVER=1 exec ` + shellQuote(testBinary) + ` -test.run '^TestTeamsParallelAppServerHelperProcess$' -- ;;
   *) exit 64 ;;
 esac
 `
@@ -1905,35 +1904,6 @@ func TestRunTeamsUpgradeCodexOnceRejectsUnfinishedTeamsWorkWithoutOwner(t *testi
 				t.Fatalf("upgrade-blocking error should name concrete blocker status, got %v", err)
 			}
 		})
-	}
-}
-
-func TestRunTeamsUpgradeCodexOnceRejectsBeaconTargetWork(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	isolateTeamsUserDirsForTest(t, tmp)
-	seedBeaconStateForUpgradeTest(t, func(st *beacon.State) {
-		st.Conversations["conv-1"] = beacon.Conversation{
-			ID: "conv-1",
-			Queued: []beacon.QueuedTurn{{
-				ID:       "turn-gpu",
-				Snapshot: beacon.TargetSnapshot{Target: beacon.TargetBeacon, Profile: "gpu", Signature: "sig-gpu"},
-			}},
-		}
-	})
-
-	prevUpgrade := upgradeCodexInstalledForTargetRun
-	t.Cleanup(func() { upgradeCodexInstalledForTargetRun = prevUpgrade })
-	upgradeCodexInstalledForTargetRun = func(context.Context, io.Writer, codexInstallOptions) (string, error) {
-		t.Fatal("upgrade should not run while beacon target work is queued")
-		return "", nil
-	}
-
-	cmd := newRootCmd()
-	err := runTeamsUpgradeCodexOnce(cmd, &rootOptions{}, "")
-	if err == nil || !strings.Contains(err.Error(), "Beacon state has upgrade-blocking work") || !strings.Contains(err.Error(), "beacon_queued_turn conv-1 turn-gpu") {
-		t.Fatalf("expected beacon queued turn blocker, got %v", err)
 	}
 }
 

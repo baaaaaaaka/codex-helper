@@ -258,18 +258,6 @@ func TestTeamsCodexUpgradeInvalidatesOfficialCatalogCache(t *testing.T) {
 	}
 }
 
-func TestBeaconDoctorDoesNotRequireNakedCodexForManagedRuntime(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("PATH fixture uses POSIX semantics")
-	}
-	t.Setenv("PATH", t.TempDir())
-	t.Setenv("CODEX_NPM_PREFIX", t.TempDir())
-	doctor := runBeaconWorkerDoctor("", filepath.Join(t.TempDir(), "beacon.json"))
-	if !doctor.CodexAvailable {
-		t.Fatal("Beacon doctor rejected a worker before the managed runtime resolver could install Codex")
-	}
-}
-
 func TestTeamsRuntimeWiringGuard(t *testing.T) {
 	source, err := os.ReadFile("teams.go")
 	if os.IsNotExist(err) {
@@ -316,9 +304,6 @@ func TestTeamsBareCodexAuditHasNoUnreviewedConsumers(t *testing.T) {
 		},
 		"teams_model_profile.go": {
 			`path := "codex"`:        1,
-			`exec.LookPath("codex")`: 0,
-		},
-		"beacon.go": {
 			`exec.LookPath("codex")`: 0,
 		},
 	}

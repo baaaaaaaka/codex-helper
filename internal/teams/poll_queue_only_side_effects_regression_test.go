@@ -297,7 +297,7 @@ func TestQueueOnlyCommandClassifiersAreFailClosed(t *testing.T) {
 		DashboardCommandWorkspace, DashboardCommandSessions, DashboardCommandOpen,
 		DashboardCommandPark, DashboardCommandResume, DashboardCommandSelect,
 		DashboardCommandPublish, DashboardCommandMkdir, DashboardCommandRename,
-		DashboardCommandCancel, DashboardCommandSkills, DashboardCommandBeacon,
+		DashboardCommandCancel, DashboardCommandSkills,
 		DashboardCommandModel, DashboardCommandEffort, DashboardCommandDefault,
 		DashboardCommandRestart, DashboardCommandReload, DashboardCommandUpdate,
 		DashboardCommandCodexUpdate, DashboardCommandWebhook, DashboardCommandFork,
@@ -317,7 +317,7 @@ func TestQueueOnlyCommandClassifiersAreFailClosed(t *testing.T) {
 		DashboardCommandClose, DashboardCommandPark, DashboardCommandResume,
 		DashboardCommandRetry, DashboardCommandRestoreThread, DashboardCommandCancel,
 		DashboardCommandSendFile, DashboardCommandRename, DashboardCommandPublishHistory,
-		DashboardCommandFork, DashboardCommandSkills, DashboardCommandBeacon,
+		DashboardCommandFork, DashboardCommandSkills,
 		DashboardCommandModel, DashboardCommandEffort, DashboardCommandDefault,
 	} {
 		if !workCommandRequiresForeground(command) {

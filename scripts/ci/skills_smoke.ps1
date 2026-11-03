@@ -58,7 +58,7 @@ $builtinSkill = Join-Path $agentsDir "cxp"
 if (!(Test-Path -LiteralPath (Join-Path $builtinSkill "SKILL.md"))) { throw "builtin cxp SKILL.md missing" }
 $builtinReference = Join-Path $builtinSkill "references\commands.md"
 if (!(Test-Path -LiteralPath $builtinReference)) { throw "builtin cxp command reference missing" }
-if ((Get-Content -Raw -LiteralPath $builtinReference) -notmatch "--after-current-turn") { throw "builtin cxp command reference missing deferred beacon switch guidance" }
+if ((Get-Content -Raw -LiteralPath $builtinReference) -notmatch "standard approval broker") { throw "builtin cxp command reference missing standard approval broker guidance" }
 $builtinMetadata = Join-Path $builtinSkill "agents\openai.yaml"
 if (!(Test-Path -LiteralPath $builtinMetadata)) { throw "builtin cxp OpenAI metadata missing" }
 if ((Get-Content -Raw -LiteralPath $builtinMetadata) -notmatch [regex]::Escape('Use $cxp')) { throw "builtin cxp OpenAI metadata missing default prompt" }

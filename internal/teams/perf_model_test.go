@@ -3023,8 +3023,6 @@ func BenchmarkCXPPerfModelSQLiteRealisticMixedUserIdleLoopBreakdown(b *testing.B
 		"helper_auto_update",
 		"upgrade_notice",
 		"codex_upgrade",
-		"beacon_reconcile",
-		"beacon_lease",
 		"drain_complete",
 		"deferred_inbound",
 		"process_queued",
@@ -3109,12 +3107,6 @@ func BenchmarkCXPPerfModelSQLiteRealisticMixedUserIdleLoopBreakdown(b *testing.B
 		})
 		runStage("codex_upgrade", func() error {
 			return bridge.maybeRunPendingCodexUpgrade(ctx)
-		})
-		runStage("beacon_reconcile", func() error {
-			return bridge.maybeRunBeaconReconcile(ctx, tick)
-		})
-		runStage("beacon_lease", func() error {
-			return bridge.maybeRunBeaconLeaseMaintenance(ctx, tick)
 		})
 		runStage("drain_complete", func() error {
 			_, err := bridge.drainComplete(ctx)
@@ -4465,8 +4457,6 @@ func cxpPerfRunMainLoopIdleTick(ctx context.Context, bridge *Bridge, opts Bridge
 	bridge.lastTranscriptSync = time.Time{}
 	bridge.lastHistoryWatchSync = time.Time{}
 	bridge.lastHistoryWatchReconcile = now
-	bridge.lastBeaconReconcile = time.Time{}
-	bridge.lastBeaconLeaseMaintenance = time.Time{}
 	return cxpPerfRunMainLoopSteadyIdleTick(ctx, bridge, opts, now)
 }
 
@@ -4474,8 +4464,6 @@ func cxpPerfMarkMainLoopMaintenanceFresh(bridge *Bridge, now time.Time) {
 	bridge.lastTranscriptSync = now
 	bridge.lastHistoryWatchSync = now
 	bridge.lastHistoryWatchReconcile = now
-	bridge.lastBeaconReconcile = now
-	bridge.lastBeaconLeaseMaintenance = now
 }
 
 func cxpPerfRunMainLoopSteadyIdleTick(ctx context.Context, bridge *Bridge, opts BridgeOptions, now time.Time) error {
@@ -4509,12 +4497,6 @@ func cxpPerfRunMainLoopSteadyIdleTick(ctx context.Context, bridge *Bridge, opts 
 		return err
 	}
 	if err := bridge.maybeRunPendingCodexUpgrade(ctx); err != nil {
-		return err
-	}
-	if err := bridge.maybeRunBeaconReconcile(ctx, now); err != nil {
-		return err
-	}
-	if err := bridge.maybeRunBeaconLeaseMaintenance(ctx, now); err != nil {
 		return err
 	}
 	if _, err := bridge.drainComplete(ctx); err != nil {

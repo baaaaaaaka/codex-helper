@@ -393,7 +393,7 @@ case "${1:-}" in
   --version) echo 'codex-cli 0.142.3'; exit 0 ;;
   --help) echo 'Options: --remote <ADDR> --remote-auth-token-env <ENV_VAR>'; exit 0 ;;
   app-server)
-    printf '%s' "$PATH" > ` + shellSingleQuoteForBeaconCLITest(pathFile) + `
+    printf '%s' "$PATH" > ` + shellQuote(pathFile) + `
     while IFS= read -r line; do
       id=$(printf %s "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
       case "$line" in

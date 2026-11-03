@@ -277,7 +277,7 @@ case "${1:-}" in
   plugin|future-command) printf '%%s\n' "$@" > %s ;;
   *) exit 64 ;;
 esac
-`, shellSingleQuoteForBeaconCLITest(argsPath))
+`, shellQuote(argsPath))
 	if err := os.WriteFile(codexPath, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}

@@ -39,7 +39,7 @@ if [ "${1:-}" = 'migrate-rollouts' ]; then
   done
 fi
 exit 64
-`, shellSingleQuoteForBeaconCLITest(sleepPath), shellSingleQuoteForBeaconCLITest(childPIDPath), shellSingleQuoteForBeaconCLITest(sleepPath))
+`, shellQuote(sleepPath), shellQuote(childPIDPath), shellQuote(sleepPath))
 	if err := os.WriteFile(codexPath, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}

@@ -287,7 +287,7 @@ case "${1:-}" in
     exit 0
     ;;
 esac
-	`, shellSingleQuoteForBeaconCLITest(events), shellSingleQuoteForBeaconCLITest(migrationArgs), envCodexHome, shellSingleQuoteForBeaconCLITest(migrationEnv), codexrunner.RemoteBrokerAuthTokenEnv, shellSingleQuoteForBeaconCLITest(migrationEnv), envCodexSQLiteHome, shellSingleQuoteForBeaconCLITest(migrationEnv), shellSingleQuoteForBeaconCLITest(events), shellSingleQuoteForBeaconCLITest(appServerArgs), envCodexSQLiteHome, shellSingleQuoteForBeaconCLITest(appSQLiteHome), shellSingleQuoteForBeaconCLITest(events), shellSingleQuoteForBeaconCLITest(events), shellSingleQuoteForBeaconCLITest(tuiArgs), codexrunner.RemoteBrokerAuthTokenEnv, shellSingleQuoteForBeaconCLITest(tuiAuthToken), envCodexSQLiteHome, shellSingleQuoteForBeaconCLITest(tuiSQLiteHome), shellSingleQuoteForBeaconCLITest(appSQLiteHome), shellSingleQuoteForBeaconCLITest(sleepPath))
+	`, shellQuote(events), shellQuote(migrationArgs), envCodexHome, shellQuote(migrationEnv), codexrunner.RemoteBrokerAuthTokenEnv, shellQuote(migrationEnv), envCodexSQLiteHome, shellQuote(migrationEnv), shellQuote(events), shellQuote(appServerArgs), envCodexSQLiteHome, shellQuote(appSQLiteHome), shellQuote(events), shellQuote(events), shellQuote(tuiArgs), codexrunner.RemoteBrokerAuthTokenEnv, shellQuote(tuiAuthToken), envCodexSQLiteHome, shellQuote(tuiSQLiteHome), shellQuote(appSQLiteHome), shellQuote(sleepPath))
 	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
 		t.Fatal(err)
 	}

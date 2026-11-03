@@ -36,12 +36,12 @@ func TestPlainTextFromTeamsHTML(t *testing.T) {
 }
 
 func TestCommandRoutePlainTextFromTeamsHTMLDropsQuotedBlocks(t *testing.T) {
-	html := `<p>这是什么意思？</p><blockquote><p>beacon release req-b7ae41d2ab8f40d9aad910e6d3a46d04</p></blockquote>`
+	html := `<p>这是什么意思？</p><blockquote><p>helper cancel all</p></blockquote>`
 	got := CommandRoutePlainTextFromTeamsHTML(html)
 	if got != "这是什么意思？" {
 		t.Fatalf("route text = %q, want current message only", got)
 	}
-	if prompt := PlainTextFromTeamsHTML(html); !strings.Contains(prompt, "beacon release req-b7ae41d2ab8f40d9aad910e6d3a46d04") {
+	if prompt := PlainTextFromTeamsHTML(html); !strings.Contains(prompt, "helper cancel all") {
 		t.Fatalf("prompt text should retain quoted context, got %q", prompt)
 	}
 }
