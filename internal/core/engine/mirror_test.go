@@ -281,3 +281,61 @@ func TestMirrorStatIsTiered(t *testing.T) {
 		t.Fatalf("parked rollout change not stat'ed within %s", tm.MirrorParkedStat+tm.MirrorStat)
 	}
 }
+
+// B3: the recent walk does not list a day directory again while its mtime
+// is unchanged (a new rollout changes it); it only re-stats the rollouts
+// still pending there (baselined, unreadable). The test restores the
+// directory's mtime after adding a rollout to observe the skip.
+func TestRecentWalkSkipsAnUnchangedDayDirectory(t *testing.T) {
+	sessions := t.TempDir()
+	now := time.Now()
+	day := filepath.Join(sessions, now.UTC().Format("2006"), now.UTC().Format("01"), now.UTC().Format("02"))
+	if err := os.MkdirAll(day, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	write := func(name string) string {
+		p := filepath.Join(day, name)
+		if err := os.WriteFile(p, []byte("not a record\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	a := write("rollout-a.jsonl") // unreadable: pending
+	old := now.Add(-time.Minute)
+	if err := os.Chtimes(day, old, old); err != nil {
+		t.Fatal(err)
+	}
+	stats := map[string]int{}
+	e := &Engine{cfg: Config{SessionsDir: sessions}, t: ProductionTiming(), now: time.Now, log: io.Discard}
+	e.statFile = func(p string) (transcript.FileInfo, error) {
+		stats[p]++
+		return transcript.Stat(p)
+	}
+	e.mirror = &mirrorState{files: map[string]*mirrorFile{}, known: map[string]string{}, checked: map[string]transcript.FileInfo{}, unreadable: map[string]transcript.FileInfo{}}
+	ctx := context.Background()
+	e.discover(ctx, false)
+	if _, ok := e.mirror.unreadable[a]; !ok {
+		t.Fatal("first walk did not see the rollout")
+	}
+
+	b := write("rollout-b.jsonl")
+	if err := os.Chtimes(day, old, old); err != nil {
+		t.Fatal(err)
+	}
+	e.discover(ctx, false)
+	if _, ok := e.mirror.unreadable[b]; ok {
+		t.Fatal("a day directory with an unchanged mtime was listed again")
+	}
+	if stats[a] != 1 {
+		t.Fatalf("pending rollout stat'ed %d times by the skipped walk, want 1", stats[a])
+	}
+
+	changed := now.Add(-10 * time.Second)
+	if err := os.Chtimes(day, changed, changed); err != nil {
+		t.Fatal(err)
+	}
+	e.discover(ctx, false)
+	if _, ok := e.mirror.unreadable[b]; !ok {
+		t.Fatal("a day directory whose mtime changed was not listed again")
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -41,9 +42,29 @@ type mirrorState struct {
 	// walked in this cycle, a few per discovery tick (bounded work).
 	oldDirs   []string
 	lastCycle time.Time
+	// recent: what the last walk of each recent day directory saw (B3).
+	recent    map[string]*recentDir
 	first     bool // first start of this store: pre-existing rollouts are baselined
 	startedAt time.Time
 }
+
+// recentDir is what the last walk of a recent day directory saw (B3).
+type recentDir struct {
+	mtime time.Time
+	// settled: the walk ran dirSettle after mtime, so a rollout created
+	// within the same mtime tick as an earlier one was listed too.
+	settled bool
+	// pending are the rollouts re-stat'ed while the directory is
+	// unchanged: baselined ones (a person may continue the session),
+	// unreadable ones (being written) and any not classified yet.
+	// Tracked rollouts are stat'ed by mirrorPoll; ignored ones never
+	// change state.
+	pending []string
+}
+
+// dirSettle is how long after a directory's mtime its listing is trusted
+// to be complete (coarse directory timestamps on some file systems).
+const dirSettle = 5 * time.Second
 
 // oldWalkFiles bounds the rollouts one discovery tick stats in old day
 // directories (a full cycle over every directory spreads over many ticks).
@@ -227,15 +248,111 @@ func (e *Engine) discoverOld(ctx context.Context) {
 // directories when full, else only recent day directories).
 func (e *Engine) discover(ctx context.Context, full bool) {
 	now := e.now()
-	dirsFrom := now.Add(-48 * time.Hour)
-	if full {
-		dirsFrom = time.Time{}
+	if !full {
+		e.discoverRecent(ctx, now)
+		return
 	}
-	found, err := transcript.Walk(e.cfg.SessionsDir, now.Add(-transcript.Window), dirsFrom)
+	found, err := transcript.Walk(e.cfg.SessionsDir, now.Add(-transcript.Window), time.Time{})
 	if err != nil {
 		e.logf("mirror walk: %v", err)
 	}
 	e.consider(ctx, found)
+}
+
+// discoverRecent walks the recent day directories (the last 48 h, with a
+// day of margin either side for time zones). A directory whose mtime did
+// not change since its last walk is not listed again (B3): a new rollout
+// changes it. Only its pending rollouts are stat'ed then; appends to
+// tracked rollouts are mirrorPoll's.
+func (e *Engine) discoverRecent(ctx context.Context, now time.Time) {
+	m := e.mirror
+	if m.recent == nil {
+		m.recent = map[string]*recentDir{}
+	}
+	since := now.Add(-transcript.Window)
+	dirs := recentDayDirs(e.cfg.SessionsDir, now)
+	var found []transcript.Found
+	walked := map[string][]string{}
+	for _, dir := range dirs {
+		fi, err := os.Stat(dir)
+		if err != nil {
+			delete(m.recent, dir)
+			continue
+		}
+		if rd := m.recent[dir]; rd != nil && rd.settled && fi.ModTime().Equal(rd.mtime) {
+			for _, p := range rd.pending {
+				if info, err := e.statFile(p); err == nil && !info.MTime.Before(since) {
+					found = append(found, transcript.Found{Path: p, Info: info})
+				}
+			}
+			continue
+		}
+		f, err := transcript.Walk(dir, since, time.Time{})
+		if err != nil {
+			e.logf("mirror walk: %v", err)
+			delete(m.recent, dir)
+		} else {
+			m.recent[dir] = &recentDir{mtime: fi.ModTime(), settled: now.Sub(fi.ModTime()) >= dirSettle}
+		}
+		paths := make([]string, len(f))
+		for i, x := range f {
+			paths[i] = x.Path
+		}
+		walked[dir] = paths
+		found = append(found, f...)
+	}
+	sort.SliceStable(found, func(i, j int) bool { return found[i].Info.MTime.Before(found[j].Info.MTime) })
+	e.consider(ctx, found)
+	// What stays pending after this pass.
+	keep := make(map[string]bool, len(dirs))
+	for _, dir := range dirs {
+		keep[dir] = true
+		rd := m.recent[dir]
+		if rd == nil {
+			continue
+		}
+		paths, ok := walked[dir]
+		if !ok {
+			paths = rd.pending
+		}
+		rd.pending = e.mirrorPending(paths)
+	}
+	for dir := range m.recent {
+		if !keep[dir] {
+			delete(m.recent, dir)
+		}
+	}
+}
+
+// mirrorPending keeps the rollouts discovery must stat again (see
+// recentDir.pending).
+func (e *Engine) mirrorPending(paths []string) []string {
+	var out []string
+	e.mirror.mu.Lock()
+	defer e.mirror.mu.Unlock()
+	for _, p := range paths {
+		if _, tracked := e.mirror.files[p]; tracked {
+			continue
+		}
+		if state, known := e.mirror.known[p]; known && state != store.SrcBaseline {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// recentDayDirs are the sessions/YYYY/MM/DD directories the recent walk
+// visits: from the day before now-48h to two days after now (UTC dates; a
+// local date is within a day of them).
+func recentDayDirs(sessionsDir string, now time.Time) []string {
+	from := now.UTC().Add(-48*time.Hour).Truncate(24*time.Hour).AddDate(0, 0, -1)
+	to := now.UTC().Truncate(24*time.Hour).AddDate(0, 0, 2)
+	var out []string
+	for d := from; !d.After(to); d = d.AddDate(0, 0, 1) {
+		out = append(out, filepath.Join(sessionsDir, d.Format("2006"), d.Format("01"), d.Format("02")))
+	}
+	return out
 }
 
 // consider handles the rollouts a walk found: new ones are classified
