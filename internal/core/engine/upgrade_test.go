@@ -145,6 +145,12 @@ func TestHelperUpdateDrainsInstallsRestartsAndAnnouncesOnce(t *testing.T) {
 	r.wait("completion", func() bool { return len(r.own(ctl, "Helper update completed")) == 1 })
 	r.wait("long answer", func() bool { return len(r.own(work, "ANSWER to long job")) == 1 })
 	r.wait("held turn runs after the restart", func() bool { return len(r.own(other, "ANSWER to other job")) == 1 })
+	// The held turn is started by the new process, not taken for a turn
+	// the old one left open: no "did not run" notice while it runs (the
+	// reconciler used to read the open turns after the runner started).
+	if n := len(r.own(other, "did not run")); n != 0 || r.logHas("mark running") {
+		t.Fatalf("held turn reported not run (%d notices) while it ran", n)
+	}
 	r.stop()
 	r.start()
 	ctl = r.control()

@@ -414,6 +414,13 @@ func (e *Engine) Run(ctx context.Context) error {
 		e.ag.Close()
 		return err
 	}
+	// The turns the previous process left open, read before the runner
+	// starts: a held turn this process starts must not be taken for one
+	// of them ("did not run" posted while it runs).
+	open, err := e.st.OpenTurns()
+	if err != nil {
+		e.logf("reconcile: %v", err)
+	}
 	loops := []func(context.Context){
 		e.receiverLoop, e.runnerLoop, e.senderLoop, e.resolverLoop,
 		e.commandLoop, e.maintenanceLoop, e.asrLoop, e.notifyLoop,
@@ -440,7 +447,7 @@ func (e *Engine) Run(ctx context.Context) error {
 	e.wg.Add(1)
 	go func() {
 		defer e.wg.Done()
-		e.reconcile(ctx)
+		e.reconcile(ctx, open)
 	}()
 	<-ctx.Done()
 	e.wg.Wait()

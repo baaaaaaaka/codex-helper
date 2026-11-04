@@ -897,12 +897,9 @@ func (e *Engine) cancelRunning(ctx context.Context, id int64) bool {
 // no such turn can still change; each is looked up by its turn key and ends
 // with its final or exactly one notice. The conversation's next turn cannot
 // start before (NextRunnable blocks on the open turn and the notice).
-func (e *Engine) reconcile(ctx context.Context) {
-	turns, err := e.st.OpenTurns()
-	if err != nil {
-		e.logf("reconcile: %v", err)
-		return
-	}
+// turns are the open turns as of the start, before any turn of this
+// process.
+func (e *Engine) reconcile(ctx context.Context, turns []store.Turn) {
 	sem := make(chan struct{}, e.cfg.Turns)
 	for _, tr := range turns {
 		if tr.State == store.TurnQueued {
