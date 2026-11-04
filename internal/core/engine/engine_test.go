@@ -1158,3 +1158,53 @@ func TestConcurrentProgressCallbacksAllPosted(t *testing.T) {
 		}
 	}
 }
+
+// flakyAck fails the n-th "Request accepted" render once.
+type flakyAck struct {
+	*channeltest.Fake
+	mu     sync.Mutex
+	acks   int
+	failAt int
+}
+
+func (f *flakyAck) Render(ctx context.Context, doc channel.RichDoc) ([]channel.Part, error) {
+	f.mu.Lock()
+	fail := false
+	if strings.Contains(doc.Markdown, "Request accepted") {
+		f.acks++
+		fail = f.acks == f.failAt
+	}
+	f.mu.Unlock()
+	if fail {
+		return nil, errors.New("test: render failed")
+	}
+	return f.Fake.Render(ctx, doc)
+}
+
+// A failed admit transaction leaves no in-memory trace: on the retry the
+// first prompt is not taken for a duplicate of itself (review L2).
+func TestFailedAdmitDoesNotMarkPromptsAsDuplicates(t *testing.T) {
+	var paused atomic.Value
+	paused.Store("")
+	r := newRig(t, func(c *Config) {
+		f := c.Channel.(*channeltest.Fake)
+		f.ReceiveFault = func(stream string) error {
+			if stream == paused.Load().(string) {
+				return errors.New("test: reads paused")
+			}
+			return nil
+		}
+		c.Channel = &flakyAck{Fake: f, failAt: 2}
+	})
+	work := r.newWork(t.TempDir())
+	paused.Store(work)
+	r.ch.PostUser(work, "first prompt")
+	r.ch.PostUser(work, "second prompt")
+	paused.Store("")
+	r.wait("both answered", func() bool {
+		return len(r.own(work, "ANSWER to first prompt")) == 1 && len(r.own(work, "ANSWER to second prompt")) == 1
+	})
+	if n := len(r.own(work, "Duplicate request ignored")); n != 0 {
+		t.Fatalf("%d duplicate notices after a failed admit", n)
+	}
+}

@@ -255,9 +255,11 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 		trip     bool
 		activity bool
 		hasFiles bool
+		stg      *admitStage
 	)
 	err := e.update(func(tx *store.Tx) error {
 		jobs, newTurns, becameGr, trip, activity, hasFiles = nil, false, false, false, false, false
+		stg = &admitStage{recent: map[string]recentPrompt{}} // a retried attempt starts over
 		var cls []classified
 		byID := map[string]*classified{}
 		for _, m := range fresh {
@@ -301,7 +303,7 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 			if c == nil {
 				continue
 			}
-			if c.suspect && e.breakerHit(id, now) {
+			if c.suspect && e.breakerHit(id, now, stg) {
 				trip = true
 			}
 			switch {
@@ -319,7 +321,7 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 				}
 			case a.Kind == store.InPrompt && a.TurnID != 0:
 				activity = true
-				dup, err := e.ackPrompt(tx, id, a, c)
+				dup, err := e.ackPrompt(tx, id, a, c, stg)
 				if err != nil {
 					return err
 				}
@@ -343,6 +345,7 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 	if becameGr {
 		cs.group = true
 	}
+	e.applyStage(cs, stg, now)
 	for _, m := range fresh {
 		cs.seen[m.ID] = now
 	}
@@ -589,24 +592,25 @@ func (e *Engine) markersTrusted() bool {
 
 // ackPrompt acknowledges a newly admitted prompt (or ignores a duplicate).
 // It reports whether the prompt was a duplicate.
-func (e *Engine) ackPrompt(tx *store.Tx, conv int64, a store.Admitted, c *classified) (bool, error) {
+func (e *Engine) ackPrompt(tx *store.Tx, conv int64, a store.Admitted, c *classified, stg *admitStage) (bool, error) {
 	norm := normalize(c.in.Body)
 	at := c.msg.Created
 	e.mu.Lock()
 	cs := e.convs[conv]
-	prev, seen := cs.recent[norm]
-	dup := seen && at.Sub(prev.at) < e.t.DuplicateFor && at.Sub(prev.at) >= -e.t.DuplicateFor && norm != ""
-	if !dup {
-		cs.recent[norm] = recentPrompt{at: at, inbound: a.InboundID}
-		for k, r := range cs.recent {
-			if at.Sub(r.at) > e.t.DuplicateFor {
-				delete(cs.recent, k)
-			}
-		}
-	} else {
-		cs.lastDup = a.InboundID
+	prev, seen := stg.recent[norm]
+	if !seen {
+		prev, seen = cs.recent[norm]
 	}
 	e.mu.Unlock()
+	dup := seen && at.Sub(prev.at) < e.t.DuplicateFor && at.Sub(prev.at) >= -e.t.DuplicateFor && norm != ""
+	if !dup {
+		stg.recent[norm] = recentPrompt{at: at, inbound: a.InboundID}
+		if at.After(stg.latest) {
+			stg.latest = at
+		}
+	} else {
+		stg.lastDup = a.InboundID
+	}
 	if dup {
 		msgs, err := e.noticeReply(store.OutNotice, fmt.Sprintf("dup:%d", a.InboundID), textDuplicate, c.quoteID)
 		if err != nil {
@@ -645,19 +649,63 @@ func (e *Engine) ackHeld(tx *store.Tx, conv int64, a store.Admitted, c *classifi
 	return err
 }
 
-// breakerHit counts one suspicious message and reports a trip.
-func (e *Engine) breakerHit(conv int64, now time.Time) bool {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	cs := e.convs[conv]
+// admitStage holds the in-memory effects of one admit attempt. They are
+// applied only after the transaction commits, so a failed or retried
+// attempt neither marks its own prompts as seen (which would cancel them as
+// duplicates on the retry) nor counts breaker hits twice.
+type admitStage struct {
+	recent  map[string]recentPrompt
+	latest  time.Time // newest prompt time staged in recent
+	lastDup int64
+	hits    int // suspicious messages
+}
+
+// applyStage applies a committed admit's effects. Called with e.mu held.
+func (e *Engine) applyStage(cs *convState, stg *admitStage, now time.Time) {
+	if stg == nil {
+		return
+	}
+	for k, r := range stg.recent {
+		cs.recent[k] = r
+	}
+	if len(stg.recent) > 0 {
+		for k, r := range cs.recent {
+			if stg.latest.Sub(r.at) > e.t.DuplicateFor {
+				delete(cs.recent, k)
+			}
+		}
+	}
+	if stg.lastDup != 0 {
+		cs.lastDup = stg.lastDup
+	}
+	if stg.hits > 0 {
+		cs.breaker = append(e.breakerWindow(cs, now), make([]time.Time, stg.hits)...)
+		for i := len(cs.breaker) - stg.hits; i < len(cs.breaker); i++ {
+			cs.breaker[i] = now
+		}
+	}
+}
+
+// breakerWindow returns the breaker hits still inside the window. Called
+// with e.mu held.
+func (e *Engine) breakerWindow(cs *convState, now time.Time) []time.Time {
 	keep := cs.breaker[:0]
 	for _, t := range cs.breaker {
 		if now.Sub(t) < e.t.BreakerWindow {
 			keep = append(keep, t)
 		}
 	}
-	cs.breaker = append(keep, now)
-	return len(cs.breaker) >= e.t.BreakerCount && !cs.paused
+	return keep
+}
+
+// breakerHit stages one suspicious message and reports a trip.
+func (e *Engine) breakerHit(conv int64, now time.Time, stg *admitStage) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cs := e.convs[conv]
+	cs.breaker = e.breakerWindow(cs, now)
+	stg.hits++
+	return len(cs.breaker)+stg.hits >= e.t.BreakerCount && !cs.paused
 }
 
 // tripBreaker pauses auto-start in a conversation and notifies once.
