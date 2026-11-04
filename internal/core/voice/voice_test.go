@@ -55,3 +55,25 @@ func TestFailureUserTextHasNoDiagnostic(t *testing.T) {
 		t.Fatalf("user text %q", txt)
 	}
 }
+
+// The text posted in Teams has no diagnostic line (it can name paths), so
+// its advice must not point to one ("below", "named in the diagnostic");
+// the diagnostic is in the helper's log.
+func TestFailureUserTextDoesNotPointToMissingDiagnostic(t *testing.T) {
+	for _, kind := range []asr.Kind{asr.KindNativeLoad, asr.KindBackend, asr.KindCache} {
+		f := &fakeASR{err: &asr.Error{Kind: kind, Op: "run", Detail: "/opt/llama/llama-server: error while loading shared libraries"}}
+		_, err := New(f, "").Transcribe(context.Background(), "/x.ogg")
+		var ut interface{ UserText() string }
+		if !errors.As(err, &ut) {
+			t.Fatalf("%s: no UserText", kind)
+		}
+		txt := ut.UserText()
+		low := strings.ToLower(txt)
+		if strings.Contains(low, "below") || strings.Contains(low, "diagnostic") || strings.Contains(txt, "/opt/") {
+			t.Fatalf("%s: user text points to a diagnostic it does not show: %q", kind, txt)
+		}
+		if !strings.Contains(txt, "helper's log") {
+			t.Fatalf("%s: user text should say where the details are: %q", kind, txt)
+		}
+	}
+}

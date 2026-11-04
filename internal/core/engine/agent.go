@@ -89,6 +89,9 @@ type TurnOutcome struct {
 	// ActiveWriter: another Codex process holds the thread (e.g. the TUI).
 	ActiveWriter bool
 	Usage        Usage
+	// Progressed: Codex streamed output during the turn (set by the
+	// engine). A capacity failure after progress restarts the retry window.
+	Progressed bool
 }
 
 // Usage is token usage of a turn.

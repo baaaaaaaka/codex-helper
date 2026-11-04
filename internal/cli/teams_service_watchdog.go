@@ -56,6 +56,12 @@ type teamsServiceWatchdogSnapshot struct {
 	// an old store at first start).
 	ManagedChildStarting  bool
 	ManagedChildStartedAt time.Time
+	// Disabled is true when the kill-switch file is next to the store: the
+	// helper must stay stopped (or stand by), so nothing is started.
+	Disabled bool
+	// BackoffUntil is set while this host's helper waits before starting
+	// again after repeated fast restarts (teams_service_backoff.go).
+	BackoffUntil time.Time
 }
 
 type teamsServiceWatchdogState struct {
@@ -239,6 +245,12 @@ func collectTeamsServiceWatchdogSnapshot(ctx context.Context, opts teamsServiceW
 	if err != nil || path == "" {
 		return snapshot, err
 	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(path), corestore.DisabledFile)); err == nil {
+		snapshot.Disabled = true
+	}
+	if host, err := os.Hostname(); err == nil {
+		snapshot.BackoffUntil = readTeamsServiceRestartRecord(teamsServiceRestartRecordPath(filepath.Dir(path), host)).WaitUntil
+	}
 	if info, err := os.Lstat(path); err != nil || !info.Mode().IsRegular() {
 		return snapshot, nil
 	}
@@ -285,6 +297,12 @@ func evaluateTeamsServiceWatchdog(snapshot teamsServiceWatchdogSnapshot, state t
 	opts = normalizeTeamsServiceWatchdogOptions(opts)
 	if !snapshot.Installed {
 		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: "service is not installed"}
+	}
+	if snapshot.Disabled {
+		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: "the kill-switch file " + corestore.DisabledFile + " exists; the helper stays stopped"}
+	}
+	if opts.Now.Before(snapshot.BackoffUntil) {
+		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: "the helper is pausing after repeated fast restarts until " + snapshot.BackoffUntil.Format(time.RFC3339)}
 	}
 	if !snapshot.Active {
 		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionStart, Reason: "service is installed but not running"}

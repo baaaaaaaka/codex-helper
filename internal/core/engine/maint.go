@@ -166,8 +166,10 @@ func (e *Engine) maintenanceLoop(ctx context.Context) {
 // vacuumPages bounds one incremental vacuum (1 MiB at 4 KiB pages).
 const vacuumPages = 256
 
+// isFence: errors that end this process's ownership (fenced by a newer
+// owner, never acquired, or the kill-switch file appeared).
 func isFence(err error) bool {
-	return err == store.ErrFenced || err == store.ErrNotAcquired
+	return err == store.ErrFenced || err == store.ErrNotAcquired || err == store.ErrDisabled
 }
 
 // parkIdle parks work chats that have been cold for ParkAfter: no reads

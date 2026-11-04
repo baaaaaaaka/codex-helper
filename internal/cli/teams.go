@@ -53,7 +53,22 @@ func newTeamsCmd(root *rootOptions) *cobra.Command {
 		newTeamsServiceCmd(root),
 		newTeamsMigrateCmd(),
 	)
+	rejectUnknownSubcommands(cmd)
 	return cmd
+}
+
+// rejectUnknownSubcommands makes every command group under cmd fail on an
+// unknown subcommand. Cobra checks that on the root command only; a group
+// otherwise prints its help and exits 0, so a removed command such as
+// `cxp teams recover` would look like it succeeded.
+func rejectUnknownSubcommands(cmd *cobra.Command) {
+	if cmd.HasSubCommands() && cmd.Run == nil && cmd.RunE == nil {
+		cmd.Args = cobra.NoArgs
+		cmd.RunE = func(c *cobra.Command, _ []string) error { return c.Help() }
+	}
+	for _, sub := range cmd.Commands() {
+		rejectUnknownSubcommands(sub)
+	}
 }
 
 func newTeamsSetupCmd() *cobra.Command {
@@ -400,6 +415,7 @@ func newTeamsRunCmd(root *rootOptions) *cobra.Command {
 				autoUpdateRepo:       autoUpdateRepo,
 				autoUpdatePrerelease: autoUpdatePrerelease,
 				codexArgs:            codexArgs,
+				managedServiceChild:  managedServiceChild,
 			})
 		},
 	}

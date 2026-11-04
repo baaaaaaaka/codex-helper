@@ -33,7 +33,7 @@ type Binaries struct {
 func ProcessFactory(bins Binaries) harness.SUTFactory {
 	return func(cfg harness.SUTConfig) (harness.SUT, error) {
 		s := &ProcSUT{cfg: cfg, bins: bins}
-		s.ProcessSUT = harness.NewProcessSUT(cfg, harness.ProcessSpec{Name: "newcore", Binary: bins.SUT, Env: s.childEnv})
+		s.ProcessSUT = harness.NewProcessSUT(cfg, harness.ProcessSpec{Name: peerName("newcore", cfg), Binary: bins.SUT, Env: s.childEnv})
 		return s, nil
 	}
 }
@@ -84,6 +84,10 @@ func CXPFactory(bins Binaries) harness.SUTFactory {
 		registry := cfg.ExtraEnv["E2E_SUT_MACHINE_REGISTRY"] == "1"
 		args := []string{"teams", "run", "--codex-path", bins.Codex,
 			"--machine-registry=" + strconv.FormatBool(registry), "--auto-update=false", "--auto-service=false"}
+		if cfg.ExtraEnv["E2E_SUT_MANAGED_CHILD"] == "1" {
+			// Run as the service runs the helper (pacing, standby).
+			args = append(args, "--managed-service-child")
+		}
 		env := func(tag string) []string {
 			return append(s.childEnv(tag),
 				fakecodex.EnvKind+"=work",
@@ -91,7 +95,16 @@ func CXPFactory(bins Binaries) harness.SUTFactory {
 				"CXP_RUNTIME_DISABLE=1",
 			)
 		}
-		s.ProcessSUT = harness.NewProcessSUT(cfg, harness.ProcessSpec{Name: "cxp", Binary: bins.SUT, Args: args, Env: env})
+		s.ProcessSUT = harness.NewProcessSUT(cfg, harness.ProcessSpec{Name: peerName("cxp", cfg), Binary: bins.SUT, Args: args, Env: env})
 		return s, nil
 	}
+}
+
+// peerName is the instance tag prefix: name, or name-<peer> for a second
+// helper on the same state (harness.SUTConfig.Peer).
+func peerName(name string, cfg harness.SUTConfig) string {
+	if cfg.Peer != "" {
+		return name + "-" + cfg.Peer
+	}
+	return name
 }

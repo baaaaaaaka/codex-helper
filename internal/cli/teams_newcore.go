@@ -61,6 +61,20 @@ type teamsNewCoreOptions struct {
 	autoUpdatePrerelease bool
 	// codexArgs are the --codex-arg values (teamsNewCoreCodexArgs).
 	codexArgs []string
+	// managedServiceChild is set for a helper run by the service
+	// (--managed-service-child): it paces fast restarts and stands by on an
+	// expected refusal instead of exiting (teams_service_backoff.go).
+	managedServiceChild bool
+}
+
+// teamsNewCoreChannelConfig is the Teams adapter configuration. Display
+// formulas are drawn with the managed MathJax renderer (NodeMath, as in
+// v0.1.20); while it installs, or when Node.js is missing, they show as TeX
+// code.
+func teamsNewCoreChannelConfig(client *http.Client, authCfg chteams.AuthConfig) chteams.Config {
+	return chteams.Config{HTTP: client, Tokens: chteams.NewDelegatedAuth(authCfg, client), TenantID: authCfg.TenantID,
+		SharePointHosts: chteams.SharePointHostsFromEnv(os.Getenv("CODEX_HELPER_TEAMS_ALLOWED_SHAREPOINT_HOSTS")),
+		Math:            &chteams.NodeMath{}}
 }
 
 // teamsNewCoreOverrides replace production wiring in the e2e build
@@ -73,6 +87,8 @@ type teamsNewCoreOverrides struct {
 	ReadRate float64
 	// Prepare runs on the acquired store before the engine is built.
 	Prepare func(st *corestore.Store, dir string) error
+	// Host replaces os.Hostname() ("" = keep it).
+	Host string
 }
 
 var teamsNewCoreTestOverrides func(stderr io.Writer) (teamsNewCoreOverrides, error)
@@ -224,6 +240,23 @@ func teamsBootID() string {
 	return strings.TrimSpace(string(raw))
 }
 
+// teamsCorePIDFile is this host's record of its Codex app-server process
+// groups. It is per host: on a shared (NFS) home a helper that takes over
+// from another host must not kill pids that only mean something there, and
+// two hosts must not overwrite each other's record.
+func teamsCorePIDFile(dir, host string) string {
+	name := strings.Map(func(r rune) rune {
+		if r == '-' || r == '.' || r == '_' || ('0' <= r && r <= '9') || ('a' <= r && r <= 'z') || ('A' <= r && r <= 'Z') {
+			return r
+		}
+		return '_'
+	}, strings.TrimSpace(host))
+	if name == "" {
+		return filepath.Join(dir, "core-app-servers.pid")
+	}
+	return filepath.Join(dir, "core-app-servers."+name+".pid")
+}
+
 // runTeamsNewCore runs the new core until it is stopped. engine.ErrRestart
 // becomes exit code 75.
 func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOptions) error {
@@ -251,22 +284,36 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 	if err != nil {
 		return err
 	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	host, _ := os.Hostname()
+	if ov.Host != "" {
+		host = ov.Host
+	}
+	if opts.managedServiceChild {
+		if err := teamsServiceStartBackoff(ctx, teamsServiceRestartRecordPath(dir, host), errOut); err != nil {
+			return nil // stopped while waiting
+		}
+	}
 	if migrateFrom != "" {
 		if err := migrateTeamsStoreAtStart(ctx, migrateFrom, filepath.Join(paths.CodexDir, "sessions"), errOut); err != nil {
 			return err
 		}
-	}
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
 	}
 	st, err := corestore.Open(path)
 	if err != nil {
 		return fmt.Errorf("open Teams core store: %w", err)
 	}
 	defer st.Close()
-	host, _ := os.Hostname()
-	if _, err := st.Acquire(corestore.Ident{Host: host, PID: os.Getpid(), BootID: teamsBootID()}); err != nil {
+	if err := teamsAcquireOrWait(ctx, func() error {
+		_, err := st.Acquire(corestore.Ident{Host: host, PID: os.Getpid(), BootID: teamsBootID()})
+		return err
+	}, opts.managedServiceChild, errOut); err != nil {
+		if ctx.Err() != nil {
+			return nil // stopped while standing by
+		}
 		if errors.Is(err, corestore.ErrDisabled) {
 			return fmt.Errorf("the Teams helper is disabled (%s exists next to %s)", corestore.DisabledFile, path)
 		}
@@ -293,8 +340,7 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 	if err != nil {
 		return fmt.Errorf("Teams auth: %w", err)
 	}
-	ch, err := chteams.New(chteams.Config{HTTP: client, Tokens: chteams.NewDelegatedAuth(authCfg, client), TenantID: authCfg.TenantID,
-		SharePointHosts: chteams.SharePointHostsFromEnv(os.Getenv("CODEX_HELPER_TEAMS_ALLOWED_SHAREPOINT_HOSTS"))})
+	ch, err := chteams.New(teamsNewCoreChannelConfig(client, authCfg))
 	if err != nil {
 		return err
 	}
@@ -328,7 +374,7 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 	}
 	ag := codexagent.New(codexagent.Config{
 		Server:  server,
-		PIDFile: filepath.Join(dir, "core-app-servers.pid"),
+		PIDFile: teamsCorePIDFile(dir, host),
 		Idle:    10 * time.Minute,
 		Poll:    2 * time.Second,
 		Log:     out,
@@ -417,6 +463,9 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 		}()
 	}
 	err = e.Run(runCtx)
+	if errors.Is(err, corestore.ErrDisabled) {
+		return fmt.Errorf("the Teams helper is disabled (%s exists next to %s); stopped", corestore.DisabledFile, path)
+	}
 	select {
 	case <-gatewayFailed:
 		if ctx.Err() == nil {

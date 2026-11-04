@@ -365,7 +365,7 @@ func recoverWSLTeamsServiceRefreshAccessDenied(ctx context.Context, in io.Reader
 		return installWSLTeamsServiceUpgradeStartupFallback(ctx, wslBackend, spec, out, fallbackReason, repairErr)
 	}
 	if !confirmTeamsServiceUACPrompt(in, out, false) {
-		return teamsUpgradeServiceRefreshResult{}, fmt.Errorf("Windows Startup watchdog fallback is unsafe because old WSL Scheduled Tasks could not be disabled after Scheduled Task refresh failed (%s): normal cleanup failed: %s; UAC was not confirmed", teamsServiceBootstrapErrorSummary(repairErr), teamsServiceBootstrapErrorSummary(retireErr))
+		return teamsUpgradeServiceRefreshResult{}, fmt.Errorf("Windows Startup fallback is unsafe because old WSL Scheduled Tasks could not be disabled after Scheduled Task refresh failed (%s): normal cleanup failed: %s; UAC was not confirmed", teamsServiceBootstrapErrorSummary(repairErr), teamsServiceBootstrapErrorSummary(retireErr))
 	}
 	elevatedReason := ""
 	principalUser, userErr := teamsServiceCurrentWindowsUser(ctx)
@@ -378,7 +378,7 @@ func recoverWSLTeamsServiceRefreshAccessDenied(ctx context.Context, in io.Reader
 		elevatedReason = "UAC Scheduled Task setup failed: " + teamsServiceBootstrapErrorSummary(elevatedErr)
 	}
 	if elevatedRetireErr := wslBackend.RetireScheduledTasksElevated(ctx); elevatedRetireErr != nil {
-		return teamsUpgradeServiceRefreshResult{}, fmt.Errorf("Windows Startup watchdog fallback is unsafe because old WSL Scheduled Tasks could not be disabled after Scheduled Task refresh failed (%s): normal cleanup failed: %s; elevated cleanup failed: %s", teamsServiceBootstrapErrorSummary(repairErr), teamsServiceBootstrapErrorSummary(retireErr), teamsServiceBootstrapErrorSummary(elevatedRetireErr))
+		return teamsUpgradeServiceRefreshResult{}, fmt.Errorf("Windows Startup fallback is unsafe because old WSL Scheduled Tasks could not be disabled after Scheduled Task refresh failed (%s): normal cleanup failed: %s; elevated cleanup failed: %s", teamsServiceBootstrapErrorSummary(repairErr), teamsServiceBootstrapErrorSummary(retireErr), teamsServiceBootstrapErrorSummary(elevatedRetireErr))
 	}
 	if strings.TrimSpace(elevatedReason) != "" {
 		fallbackReason = elevatedReason
@@ -390,63 +390,23 @@ func recoverWSLTeamsServiceRefreshAccessDenied(ctx context.Context, in io.Reader
 func installWSLTeamsServiceUpgradeStartupFallback(ctx context.Context, wslBackend teamsServiceWSLWindowsTaskBackend, spec teamsServiceSpec, out io.Writer, fallbackReason string, repairErr error) (teamsUpgradeServiceRefreshResult, error) {
 	printTeamsServiceBootstrapTaskFallback(out, fallbackReason)
 	if _, fallbackErr := wslBackend.InstallStartupFallback(ctx, spec, false); fallbackErr != nil {
-		return teamsUpgradeServiceRefreshResult{}, fmt.Errorf("Windows Startup watchdog fallback failed after Scheduled Task refresh failed (%s): %s", teamsServiceBootstrapErrorSummary(repairErr), teamsServiceBootstrapErrorSummary(fallbackErr))
+		return teamsUpgradeServiceRefreshResult{}, fmt.Errorf("Windows Startup fallback failed after Scheduled Task refresh failed (%s): %s", teamsServiceBootstrapErrorSummary(repairErr), teamsServiceBootstrapErrorSummary(fallbackErr))
 	}
 	_ = wslBackend.removeTaskConfig()
 	return teamsUpgradeServiceRefreshResult{StartupFallback: true}, nil
 }
 
-func startTeamsServiceAfterUpgrade(ctx context.Context, refresh teamsUpgradeServiceRefreshResult) error {
-	if refresh.StartupFallback {
-		backend, err := teamsServiceBackendForCurrentPlatform()
-		if err != nil {
-			return err
-		}
-		wslBackend, ok := backend.(teamsServiceWSLWindowsTaskBackend)
-		if !ok {
-			return fmt.Errorf("Teams service Startup fallback is only supported by the WSL Windows service backend")
-		}
-		spec, err := buildTeamsServiceSpec()
-		if err != nil {
-			return err
-		}
-		_, err = wslBackend.InstallStartupFallback(ctx, spec, true)
-		return err
-	}
+// After a Startup fallback refresh the local supervisor is the configured
+// backend, so the normal start paths apply.
+func startTeamsServiceAfterUpgrade(ctx context.Context, _ teamsUpgradeServiceRefreshResult) error {
 	return startTeamsService(ctx, false)
 }
 
-func scheduleDelayedTeamsServiceStartAfterUpgrade(ctx context.Context, refresh teamsUpgradeServiceRefreshResult, pendingReplacePath string, installPath string) error {
-	if refresh.StartupFallback {
-		return scheduleDelayedTeamsStartupFallbackStart(ctx)
-	}
+func scheduleDelayedTeamsServiceStartAfterUpgrade(ctx context.Context, _ teamsUpgradeServiceRefreshResult, pendingReplacePath string, installPath string) error {
 	if teamsServiceGOOS() == "windows" && strings.TrimSpace(pendingReplacePath) != "" {
 		return scheduleTeamsPendingHelperActivationForReplacement(ctx, pendingReplacePath, installPath)
 	}
 	return scheduleDelayedTeamsServiceStart(ctx, pendingReplacePath)
-}
-
-func scheduleDelayedTeamsStartupFallbackStart(ctx context.Context) error {
-	backend, err := teamsServiceBackendForCurrentPlatform()
-	if err != nil {
-		return err
-	}
-	wslBackend, ok := backend.(teamsServiceWSLWindowsTaskBackend)
-	if !ok {
-		return fmt.Errorf("Teams service Startup fallback is only supported by the WSL Windows service backend")
-	}
-	spec, err := buildTeamsServiceSpec()
-	if err != nil {
-		return err
-	}
-	markerPath, err := wslBackend.startupFallbackMarkerPath()
-	if err != nil {
-		return err
-	}
-	fallbackSpec := buildTeamsServiceWSLStartupFallbackSpec(spec, teamsServiceWSLStartupFallbackStopPath(markerPath))
-	args := buildTeamsServiceWSLArguments(fallbackSpec)
-	command := "Start-Sleep -Seconds 3; " + buildTeamsServiceWSLStartupFallbackCommand(wslBackend.Name(), args, true)
-	return teamsServiceStartDetached(ctx, teamsServicePowerShellExecutable(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-Command", command)
 }
 
 func scheduleDelayedTeamsServiceStart(ctx context.Context, pendingReplacePath string) error {

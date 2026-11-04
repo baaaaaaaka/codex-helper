@@ -21,6 +21,7 @@ import (
 	corestore "github.com/baaaaaaaka/codex-helper/internal/core/store"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakegraph"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/sandbox"
+	"github.com/baaaaaaaka/codex-helper/internal/e2e/sut/override"
 )
 
 // e2eBlockedLinePrefix is harness.BlockedLinePrefix: the harness fails a
@@ -51,16 +52,25 @@ func teamsNewCoreE2EOverrides(stderr io.Writer) (teamsNewCoreOverrides, error) {
 			return teamsNewCoreOverrides{}, fmt.Errorf("E2E_SUT_INTERVAL: %w", err)
 		}
 	}
+	if v := os.Getenv("E2E_SUT_REFUSAL_RECHECK"); v != "" {
+		if teamsRefusalRecheck, err = time.ParseDuration(v); err != nil {
+			return teamsNewCoreOverrides{}, fmt.Errorf("E2E_SUT_REFUSAL_RECHECK: %w", err)
+		}
+	}
 	timing := engine.FastTiming(interval)
 	readRate := 4 * float64(time.Second) / float64(interval)
 	if os.Getenv("E2E_SUT_PRODUCTION_TIMING") == "1" {
 		timing, readRate = engine.ProductionTiming(), 0
+	}
+	if err := override.Timing(&timing); err != nil {
+		return teamsNewCoreOverrides{}, err
 	}
 	webhook := os.Getenv("E2E_SUT_WORKFLOW_WEBHOOK_URL")
 	return teamsNewCoreOverrides{
 		HTTP:     tr.Client(),
 		Timing:   &timing,
 		ReadRate: readRate,
+		Host:     override.Hostname(""),
 		// The scenario's Workflow webhook is configured the way
 		// `cxp teams migrate` leaves it, so the production reader is used.
 		Prepare: func(st *corestore.Store, dir string) error {

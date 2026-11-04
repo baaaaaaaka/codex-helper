@@ -381,6 +381,61 @@ func TestDuplicatePromptIgnoredAndRetry(t *testing.T) {
 	r.wait("retry", func() bool { return r.ag.calls("same") == 2 })
 }
 
+// Duplicate guard edges as in v0.1.20: a repeat of a prompt whose turn
+// failed runs again, and the same caption with an attachment is never a
+// duplicate.
+func TestDuplicateGuardSkipsFailedAndAttachments(t *testing.T) {
+	r := newRig(t)
+	work := r.newWork(t.TempDir())
+	var failed atomic.Bool
+	r.ag.mu.Lock()
+	r.ag.outcome = func(req TurnRequest) (TurnOutcome, error) {
+		if strings.Contains(req.Text, "flaky") && failed.CompareAndSwap(false, true) {
+			return TurnOutcome{CodexTurnID: "t-fail", Status: StatusFailed, Error: "boom"}, nil
+		}
+		return TurnOutcome{CodexTurnID: "t-ok", Status: StatusCompleted, Final: "ANSWER to " + req.Text}, nil
+	}
+	r.ag.mu.Unlock()
+	r.ch.PostUser(work, "flaky job")
+	r.wait("failure notice", func() bool { return len(r.own(work, "boom")) == 1 })
+	r.ch.PostUser(work, "flaky job")
+	r.wait("rerun", func() bool { return len(r.own(work, "ANSWER to flaky job")) == 1 })
+
+	img := channel.FileRef{Kind: channel.FileImage, Name: "a.png", Ref: "img-1"}
+	r.ch.PostUser(work, "look at this", img)
+	r.wait("first image", func() bool { return r.ag.calls("look at this") == 1 })
+	img.Ref, img.Name = "img-2", "b.png"
+	r.ch.PostUser(work, "look at this", img)
+	r.wait("second image", func() bool { return r.ag.calls("look at this") == 2 })
+	if n := len(r.own(work, "Duplicate request ignored")); n != 0 {
+		t.Fatalf("%d duplicate notices", n)
+	}
+}
+
+// The control chat wakes a parked session with `r`, `resume`, `wake` or
+// `unpark` (v0.1.20 aliases), by id or bare number.
+func TestWakeAliases(t *testing.T) {
+	r := newRig(t)
+	ctl := r.control()
+	for i := 0; i < 2; i++ {
+		r.newWork(t.TempDir())
+	}
+	for _, c := range []struct{ park, wake, label string }{
+		{"park s001", "unpark s001", "s001"},
+		{"park 2", "r 2", "s002"},
+		{"park s002", "resume s002", "s002"},
+		{"park s001", "wake 1", "s001"},
+	} {
+		n := len(r.own(ctl, "Resumed "+c.label))
+		r.ch.PostUser(ctl, c.park)
+		r.wait(c.park, func() bool {
+			return len(r.own(ctl, "Parked "+c.label)) > 0 || len(r.own(ctl, c.label+" is parked")) > 0
+		})
+		r.ch.PostUser(ctl, c.wake)
+		r.wait(c.wake, func() bool { return len(r.own(ctl, "Resumed "+c.label)) == n+1 })
+	}
+}
+
 func TestCancelRunningTurn(t *testing.T) {
 	r := newRig(t)
 	work := r.newWork(t.TempDir())
@@ -705,6 +760,33 @@ func TestVoiceTranscriptionFailureStillRunsWithoutLeaks(t *testing.T) {
 	r.ag.mu.Unlock()
 	if strings.Contains(text, "/secret/path") || !strings.HasPrefix(text, "see voice") {
 		t.Fatalf("turn text %q", text)
+	}
+}
+
+// A message that is only a voice clip whose transcription failed is
+// answered with the reason and does not start a Codex turn (v0.1.20); the
+// next prompt in the chat still runs.
+func TestVoiceOnlyTranscriptionFailureIsAnsweredWithoutTurn(t *testing.T) {
+	asr := &fakeASR{release: make(chan struct{}), fail: true}
+	close(asr.release)
+	r := newRig(t, func(c *Config) { c.Transcriber = asr; c.FilesDir = t.TempDir() })
+	work := r.newWork(t.TempDir())
+	ref := r.ch.AddFile("voice.ogg", []byte("OggS..."))
+	ref.Kind = channel.FileVoice
+	r.ch.PostUser(work, "", ref)
+	r.wait("reason posted", func() bool { return len(r.own(work, "The voice message was not sent to Codex")) == 1 })
+	for _, m := range r.own(work, "The voice message was not sent to Codex") {
+		if strings.Contains(m.Text, "/secret/path") {
+			t.Fatalf("reason leaks a path: %q", m.Text)
+		}
+	}
+	r.ch.PostUser(work, "typed instead")
+	r.wait("next prompt", func() bool { return len(r.own(work, "ANSWER to typed instead")) == 1 })
+	r.ag.mu.Lock()
+	n := len(r.ag.runs)
+	r.ag.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("%d turns, want only the typed prompt", n)
 	}
 }
 
@@ -2040,5 +2122,62 @@ func TestOwnerCardFollowsTheFinalAcrossRestart(t *testing.T) {
 	}
 	if m := len(r.own(r.chatOf("control"), "Codex finished")); m != 0 {
 		t.Fatalf("%d control-chat mentions besides the card", m)
+	}
+}
+
+// A capacity failure after the attempt made progress for longer than the
+// retry window starts a new window (08-11 spec; decision: fix the 5-minute
+// window measured from the original start): the turn is retried, not
+// failed with "did not run within 5 minutes".
+func TestCapacityWindowRestartsAfterProgress(t *testing.T) {
+	window := 400 * time.Millisecond
+	r := newRig(t, func(c *Config) {
+		c.Timing.CapacityRetry = window
+		c.Timing.CapacityBackoff = 10 * time.Millisecond
+	})
+	r.ag.notes = []string{"step one done"}
+	var mu sync.Mutex
+	n := 0
+	r.ag.outcome = func(req TurnRequest) (TurnOutcome, error) {
+		mu.Lock()
+		n++
+		k := n
+		mu.Unlock()
+		switch k {
+		case 1:
+			return TurnOutcome{Status: StatusFailed, Capacity: true, Error: "Selected model is at capacity"}, nil
+		case 2: // works longer than the window, then capacity again
+			time.Sleep(2 * window)
+			return TurnOutcome{Status: StatusFailed, Capacity: true, Error: "Selected model is at capacity"}, nil
+		}
+		return TurnOutcome{Status: StatusCompleted, Final: "DONE long progress task"}, nil
+	}
+	work := r.newWork(t.TempDir())
+	r.ch.PostUser(work, "long progress task")
+	r.wait("answer", func() bool {
+		return len(r.own(work, "DONE long progress task")) == 1 || len(r.own(work, "over capacity")) > 0
+	})
+	if got := len(r.own(work, "over capacity")); got != 0 {
+		t.Fatalf("capacity failure after progress was not retried (%d failure notices)", got)
+	}
+	if got := r.ag.calls("long progress task"); got != 3 {
+		t.Fatalf("%d attempts, want 3", got)
+	}
+}
+
+// Without progress the window still runs from the first capacity error.
+func TestCapacityWindowBoundsWaitingWithoutProgress(t *testing.T) {
+	r := newRig(t, func(c *Config) {
+		c.Timing.CapacityRetry = 300 * time.Millisecond
+		c.Timing.CapacityBackoff = 10 * time.Millisecond
+	})
+	r.ag.outcome = func(req TurnRequest) (TurnOutcome, error) {
+		return TurnOutcome{Status: StatusFailed, Capacity: true, Error: "Selected model is at capacity"}, nil
+	}
+	work := r.newWork(t.TempDir())
+	r.ch.PostUser(work, "never fits")
+	r.wait("failure notice", func() bool { return len(r.own(work, "over capacity")) == 1 })
+	if got := r.ag.calls("never fits"); got < 2 {
+		t.Fatalf("%d attempts, want retries before the failure", got)
 	}
 }

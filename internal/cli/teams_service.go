@@ -82,23 +82,22 @@ var (
 		}
 		return os.Args[0]
 	}
-	teamsServiceGetwd                                                 = os.Getwd
-	teamsServiceSystemdUserDir                                        = defaultTeamsServiceSystemdUserDir
-	teamsServiceLaunchAgentDir                                        = defaultTeamsServiceLaunchAgentDir
-	teamsServiceWindowsTaskXMLDir                                     = defaultTeamsServiceWindowsTaskXMLDir
-	teamsServiceUserID                                                = defaultTeamsServiceUserID
-	teamsServiceIsWSL                                                 = defaultTeamsServiceIsWSL
-	teamsServiceWSLInteropAvailable                                   = defaultTeamsServiceWSLInteropAvailable
-	teamsServiceWSLDistroName                                         = defaultTeamsServiceWSLDistroName
-	teamsServiceWSLLinuxUserName                                      = defaultTeamsServiceWSLLinuxUserName
-	teamsServiceCurrentUser                                           = user.Current
-	teamsServicePowerShellExecutable                                  = defaultTeamsServicePowerShellExecutable
-	teamsServiceSystemctl                   teamsServiceCommandRunner = teamsServiceExecRunner{}
-	teamsServiceSystemdUserAvailable                                  = defaultTeamsServiceSystemdUserAvailable
-	teamsServiceAuthPreflight                                         = defaultTeamsServiceAuthPreflight
-	teamsServiceBootstrapControlChat                                  = defaultTeamsServiceBootstrapControlChat
-	teamsServiceOpenURL                                               = defaultTeamsServiceOpenURL
-	teamsServiceStartupFallbackRestartDelay                           = 2 * time.Second
+	teamsServiceGetwd                                          = os.Getwd
+	teamsServiceSystemdUserDir                                 = defaultTeamsServiceSystemdUserDir
+	teamsServiceLaunchAgentDir                                 = defaultTeamsServiceLaunchAgentDir
+	teamsServiceWindowsTaskXMLDir                              = defaultTeamsServiceWindowsTaskXMLDir
+	teamsServiceUserID                                         = defaultTeamsServiceUserID
+	teamsServiceIsWSL                                          = defaultTeamsServiceIsWSL
+	teamsServiceWSLInteropAvailable                            = defaultTeamsServiceWSLInteropAvailable
+	teamsServiceWSLDistroName                                  = defaultTeamsServiceWSLDistroName
+	teamsServiceWSLLinuxUserName                               = defaultTeamsServiceWSLLinuxUserName
+	teamsServiceCurrentUser                                    = user.Current
+	teamsServicePowerShellExecutable                           = defaultTeamsServicePowerShellExecutable
+	teamsServiceSystemctl            teamsServiceCommandRunner = teamsServiceExecRunner{}
+	teamsServiceSystemdUserAvailable                           = defaultTeamsServiceSystemdUserAvailable
+	teamsServiceAuthPreflight                                  = defaultTeamsServiceAuthPreflight
+	teamsServiceBootstrapControlChat                           = defaultTeamsServiceBootstrapControlChat
+	teamsServiceOpenURL                                        = defaultTeamsServiceOpenURL
 )
 
 func newTeamsServiceCmd(root *rootOptions) *cobra.Command {
@@ -938,11 +937,11 @@ func bootstrapTeamsService(ctx context.Context, opts teamsServiceBootstrapOption
 		if wslBackend, ok := backend.(teamsServiceWSLWindowsTaskBackend); ok {
 			if err := wslBackend.RetireScheduledTasks(ctx); err != nil {
 				if !wslBackend.canSkipScheduledTaskRetireForStartupFallback(err) {
-					return teamsServiceBootstrapResult{}, fmt.Errorf("--fallback-only cannot safely start the Windows Startup watchdog because old WSL Scheduled Tasks could not be disabled: %w", err)
+					return teamsServiceBootstrapResult{}, fmt.Errorf("--fallback-only cannot safely install the Windows Startup fallback because old WSL Scheduled Tasks could not be disabled: %w", err)
 				}
 			}
 			path, err := wslBackend.InstallStartupFallback(ctx, spec, true)
-			return teamsServiceBootstrapResult{Mode: "wsl-startup-watchdog", Path: path}, err
+			return teamsServiceBootstrapResult{Mode: "wsl-startup-local-supervisor", Path: path}, err
 		}
 		return teamsServiceBootstrapResult{}, fmt.Errorf("--fallback-only is only supported by the WSL Windows service backend")
 	}
@@ -976,9 +975,9 @@ func bootstrapTeamsService(ctx context.Context, opts teamsServiceBootstrapOption
 			printTeamsServiceBootstrapTaskFallback(opts.Out, fallbackReason)
 			path, fallbackErr := wslBackend.InstallStartupFallback(ctx, spec, true)
 			if fallbackErr != nil {
-				return teamsServiceBootstrapResult{}, fmt.Errorf("Windows Startup watchdog fallback failed after Scheduled Task setup failed (%s): %s", teamsServiceBootstrapErrorSummary(err), teamsServiceBootstrapErrorSummary(fallbackErr))
+				return teamsServiceBootstrapResult{}, fmt.Errorf("Windows Startup fallback failed after Scheduled Task setup failed (%s): %s", teamsServiceBootstrapErrorSummary(err), teamsServiceBootstrapErrorSummary(fallbackErr))
 			}
-			return teamsServiceBootstrapResult{Mode: "wsl-startup-watchdog", Path: path}, nil
+			return teamsServiceBootstrapResult{Mode: "wsl-startup-local-supervisor", Path: path}, nil
 		}
 		return teamsServiceBootstrapResult{}, fmt.Errorf("Windows Scheduled Task setup failed: %s", teamsServiceBootstrapErrorSummary(err))
 	}
@@ -1016,13 +1015,13 @@ func bootstrapTeamsService(ctx context.Context, opts teamsServiceBootstrapOption
 			}
 		} else if uacConfirmed {
 			if elevatedRetireErr := wslBackend.RetireScheduledTasksElevated(ctx); elevatedRetireErr != nil {
-				return teamsServiceBootstrapResult{}, fmt.Errorf("Windows Startup watchdog fallback is unsafe because old WSL Scheduled Tasks could not be disabled after Scheduled Task setup failed (%s): normal cleanup failed: %s; elevated cleanup failed: %s", teamsServiceBootstrapErrorSummary(err), teamsServiceBootstrapErrorSummary(retireErr), teamsServiceBootstrapErrorSummary(elevatedRetireErr))
+				return teamsServiceBootstrapResult{}, fmt.Errorf("Windows Startup fallback is unsafe because old WSL Scheduled Tasks could not be disabled after Scheduled Task setup failed (%s): normal cleanup failed: %s; elevated cleanup failed: %s", teamsServiceBootstrapErrorSummary(err), teamsServiceBootstrapErrorSummary(retireErr), teamsServiceBootstrapErrorSummary(elevatedRetireErr))
 			}
 			if strings.TrimSpace(fallbackReason) != "" {
 				fallbackReason += " Old WSL Scheduled Tasks were disabled using Windows permission before installing the fallback."
 			}
 		} else {
-			return teamsServiceBootstrapResult{}, fmt.Errorf("Windows Startup watchdog fallback is unsafe because old WSL Scheduled Tasks could not be disabled after Scheduled Task setup failed (%s): %s", teamsServiceBootstrapErrorSummary(err), teamsServiceBootstrapErrorSummary(retireErr))
+			return teamsServiceBootstrapResult{}, fmt.Errorf("Windows Startup fallback is unsafe because old WSL Scheduled Tasks could not be disabled after Scheduled Task setup failed (%s): %s", teamsServiceBootstrapErrorSummary(err), teamsServiceBootstrapErrorSummary(retireErr))
 		}
 	}
 	printTeamsServiceBootstrapTaskFallback(out, fallbackReason)
@@ -1031,9 +1030,9 @@ func bootstrapTeamsService(ctx context.Context, opts teamsServiceBootstrapOption
 		_ = wslBackend.removeTaskConfig()
 	}
 	if fallbackErr != nil {
-		return teamsServiceBootstrapResult{}, fmt.Errorf("Windows Startup watchdog fallback failed after Scheduled Task setup failed (%s): %s", teamsServiceBootstrapErrorSummary(err), teamsServiceBootstrapErrorSummary(fallbackErr))
+		return teamsServiceBootstrapResult{}, fmt.Errorf("Windows Startup fallback failed after Scheduled Task setup failed (%s): %s", teamsServiceBootstrapErrorSummary(err), teamsServiceBootstrapErrorSummary(fallbackErr))
 	}
-	return teamsServiceBootstrapResult{Mode: "wsl-startup-watchdog", Path: path}, nil
+	return teamsServiceBootstrapResult{Mode: "wsl-startup-local-supervisor", Path: path}, nil
 }
 
 func uninstallTeamsService(ctx context.Context) (string, error) {
@@ -1331,9 +1330,9 @@ func ensureTeamsServiceForRun(ctx context.Context, buildOptions ...teamsServiceS
 			}
 			_ = wslBackend.removeTaskConfig()
 			if isTeamsServiceWindowsAccessDeniedError(err) {
-				return fmt.Errorf("WSL Scheduled Task setup was blocked by Windows policy; installed the current-user Startup watchdog fallback")
+				return fmt.Errorf("WSL Scheduled Task setup was blocked by Windows policy; installed the Windows Startup entry that starts the local supervisor at login")
 			}
-			return fmt.Errorf("WSL Scheduled Task setup failed (%v); installed the current-user Startup watchdog fallback", err)
+			return fmt.Errorf("WSL Scheduled Task setup failed (%v); installed the Windows Startup entry that starts the local supervisor at login", err)
 		}
 	}
 	return err
@@ -2314,39 +2313,83 @@ func (b teamsServiceWSLWindowsTaskBackend) RetireLegacyScheduledTasks(ctx contex
 	return err
 }
 
+// InstallStartupFallback is used when Windows refuses the current-user
+// Scheduled Task. The single supervisor is the Linux-side local supervisor; the
+// Windows Startup folder only gets a one-shot entry that runs
+// `cxp teams service start` once at login. There is no Windows-side loop,
+// mutex or stop file: restarts, backoff and exit 75 belong to the supervisor.
+// Older looping Startup watchdogs are retired (fail-closed) in the same
+// PowerShell call that writes the entry. With start=true the entry is also run
+// once now.
 func (b teamsServiceWSLWindowsTaskBackend) InstallStartupFallback(ctx context.Context, spec teamsServiceSpec, start bool) (string, error) {
-	markerPath, err := b.startupFallbackMarkerPath()
+	local := teamsServiceLocalSupervisorBackend{}
+	path, err := local.Repair(ctx, spec, teamsServiceRepairOptions{Enable: true})
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("configure the local supervisor for the Windows Startup fallback: %w", err)
 	}
-	stopPath := teamsServiceWSLStartupFallbackStopPath(markerPath)
-	fallbackSpec := buildTeamsServiceWSLStartupFallbackSpec(spec, stopPath)
-	args := buildTeamsServiceWSLArguments(fallbackSpec)
-	if err := os.MkdirAll(filepath.Dir(markerPath), 0o700); err != nil {
-		return "", err
-	}
-	if err := os.Remove(stopPath); err != nil && !os.IsNotExist(err) {
-		return "", err
-	}
-	command := buildTeamsServiceWSLStartupFallbackCommand(b.Name(), args, start)
+	args := buildTeamsServiceWSLStartupKickArguments(spec)
+	command := buildTeamsServiceWSLStartupKickCommand(b.Name(), args, teamsServiceWSLTaskIdentity().Suffix, start)
 	if _, err := teamsServiceRunPowerShell(ctx, command); err != nil {
 		return "", err
 	}
-	if err := os.WriteFile(markerPath, []byte(buildTeamsServiceWSLStartupFallbackConfig(b.Name(), args)), 0o600); err != nil {
-		return "", err
+	// Legacy watchdog markers are gone with their scripts.
+	if markerPaths, err := b.startupFallbackMarkerPathsForCurrentTaskPrefix(); err == nil {
+		for _, markerPath := range markerPaths {
+			_ = os.Remove(markerPath)
+			_ = os.Remove(teamsServiceWSLStartupFallbackStopPath(markerPath))
+		}
 	}
-	return markerPath, nil
+	return path, nil
 }
 
-func buildTeamsServiceWSLStartupFallbackSpec(spec teamsServiceSpec, stopPath string) teamsServiceSpec {
-	fallbackSpec := spec
-	fallbackSpec.Environment = make(map[string]string, len(spec.Environment)+2)
+// teamsServiceStartupKickEnv marks a `teams service start` launched by the
+// Windows Startup entry; a disabled local supervisor is then left stopped.
+const teamsServiceStartupKickEnv = "CODEX_HELPER_TEAMS_STARTUP_KICK"
+
+func teamsServiceWSLStartupKickName(suffix string) string {
+	return "codex-helper-teams-start-" + suffix + ".vbs"
+}
+
+// buildTeamsServiceWSLStartupKickArguments runs `cxp teams service start`
+// once, with the paths the service uses and the local-supervisor backend.
+func buildTeamsServiceWSLStartupKickArguments(spec teamsServiceSpec) []string {
+	env := make(map[string]string, len(spec.Environment)+2)
 	for key, value := range spec.Environment {
-		fallbackSpec.Environment[key] = value
+		switch key {
+		case "CODEX_HELPER_TEAMS_SERVICE", "CODEX_HELPER_TEAMS_SERVICE_MODE":
+			continue
+		}
+		env[key] = value
 	}
-	fallbackSpec.Environment["CODEX_HELPER_TEAMS_STARTUP_FALLBACK"] = "1"
-	fallbackSpec.Environment["CODEX_HELPER_TEAMS_STARTUP_FALLBACK_STOP_FILE"] = stopPath
-	return fallbackSpec
+	env[envTeamsWSLServiceBackend] = teamsServiceLocalSupervisorID
+	env[teamsServiceStartupKickEnv] = "1"
+	args := teamsServiceWSLExecEnvArguments(spec, env)
+	return append(args, spec.Executable, "teams", "service", "start")
+}
+
+// buildTeamsServiceWSLStartupKickVBS is the whole Startup entry: run wsl.exe
+// hidden, once, without waiting.
+func buildTeamsServiceWSLStartupKickVBS(args []string) string {
+	line := "wsl.exe " + windowsCommandLine(args)
+	return "CreateObject(\"WScript.Shell\").Run \"" + strings.ReplaceAll(line, "\"", "\"\"") + "\", 0, False\r\n"
+}
+
+func buildTeamsServiceWSLStartupKickCommand(taskName string, args []string, suffix string, start bool) string {
+	ps := buildTeamsServiceWSLRemoveStartupFallbackCommand(taskName, []string{suffix}) + "; " +
+		"$startup = [Environment]::GetFolderPath('Startup'); " +
+		"if ([string]::IsNullOrWhiteSpace($startup)) { throw 'Windows Startup folder is unavailable' }; " +
+		"$kickPath = Join-Path $startup " + powershellSingleQuote(teamsServiceWSLStartupKickName(suffix)) + "; " +
+		"Set-Content -LiteralPath $kickPath -Value " + powershellSingleQuote(buildTeamsServiceWSLStartupKickVBS(args)) + " -Encoding Unicode"
+	if start {
+		ps += "; Start-Process -FilePath 'wscript.exe' -ArgumentList ('//B //Nologo \"' + $kickPath + '\"') -WindowStyle Hidden | Out-Null"
+	}
+	return ps
+}
+
+func buildTeamsServiceWSLRemoveStartupKickCommand(suffix string) string {
+	return "$startup = [Environment]::GetFolderPath('Startup'); " +
+		"if (-not [string]::IsNullOrWhiteSpace($startup)) { $kickPath = Join-Path $startup " + powershellSingleQuote(teamsServiceWSLStartupKickName(suffix)) + "; " +
+		"if (Test-Path -LiteralPath $kickPath) { Remove-Item -LiteralPath $kickPath -Force -ErrorAction Stop } }"
 }
 
 func (b teamsServiceWSLWindowsTaskBackend) StartupFallbackMarkerExists() (bool, error) {
@@ -2412,48 +2455,18 @@ func readTeamsServiceWSLStartupFallbackConfig(path string) (teamsServiceWSLStart
 	return cfg, cfg.TaskName != "" || cfg.Command != "" || cfg.Arguments != ""
 }
 
-func filterTeamsServiceWSLStartupFallbackArgs(args []string) []string {
-	out := args[:0]
-	for _, arg := range args {
-		if strings.HasPrefix(arg, "CODEX_HELPER_TEAMS_EXIT_ON_STANDBY=") {
-			continue
-		}
-		out = append(out, arg)
-	}
-	return out
-}
-
+// startStartupFallback handles a marker left by an older looping Startup
+// watchdog: it is replaced by the one-shot entry and the local supervisor.
 func (b teamsServiceWSLWindowsTaskBackend) startStartupFallback(ctx context.Context) ([]byte, error) {
-	markerPath, suffix, err := b.startupFallbackSuffix()
+	spec, err := buildTeamsServiceSpec()
 	if err != nil {
 		return nil, err
 	}
-	installed, err := teamsServiceFileExists(markerPath)
+	path, err := b.InstallStartupFallback(ctx, spec, true)
 	if err != nil {
 		return nil, err
 	}
-	if !installed {
-		return nil, fmt.Errorf("Teams WSL Startup fallback marker not found: %s", markerPath)
-	}
-	if err := os.Remove(teamsServiceWSLStartupFallbackStopPath(markerPath)); err != nil && !os.IsNotExist(err) {
-		return nil, err
-	}
-	command := buildTeamsServiceWSLStartExistingStartupFallbackCommand(suffix)
-	if config, ok := readTeamsServiceWSLStartupFallbackConfig(markerPath); ok && strings.TrimSpace(config.Arguments) != "" {
-		if args, err := splitWindowsCommandLine(config.Arguments); err == nil {
-			args = filterTeamsServiceWSLStartupFallbackArgs(args)
-			taskName := strings.TrimSpace(config.TaskName)
-			if taskName == "" {
-				taskName = b.Name()
-			}
-			command = buildTeamsServiceWSLStartupFallbackCommandWithArgumentLine(taskName, windowsCommandLine(args), suffix, true)
-		}
-	}
-	data, err := teamsServiceRunPowerShell(ctx, command)
-	if err != nil {
-		return data, err
-	}
-	return appendLaunchctlOutput(data, []byte("Startup watchdog fallback: started\nStartup watchdog config: "+markerPath+"\n")), nil
+	return []byte("Startup entry: installed; it starts the local supervisor at Windows login\nLocal supervisor config: " + path + "\n"), nil
 }
 
 func (b teamsServiceWSLWindowsTaskBackend) stopStartupFallback(ctx context.Context) ([]byte, error) {
@@ -2476,15 +2489,6 @@ func (b teamsServiceWSLWindowsTaskBackend) restartStartupFallback(ctx context.Co
 	if err != nil {
 		return stopData, err
 	}
-	if teamsServiceStartupFallbackRestartDelay > 0 {
-		timer := time.NewTimer(teamsServiceStartupFallbackRestartDelay)
-		select {
-		case <-timer.C:
-		case <-ctx.Done():
-			timer.Stop()
-			return stopData, ctx.Err()
-		}
-	}
 	startData, err := b.startStartupFallback(ctx)
 	return appendLaunchctlOutput(stopData, startData), err
 }
@@ -2495,7 +2499,20 @@ func (b teamsServiceWSLWindowsTaskBackend) RemoveStartupFallbackMarker() error {
 	return b.removeStartupFallbackMarker(context.Background())
 }
 
+// removeStartupFallbackMarker removes every Windows Startup launcher: older
+// looping watchdogs and the one-shot entry that starts the local supervisor.
+// Backends other than the local supervisor use it.
 func (b teamsServiceWSLWindowsTaskBackend) removeStartupFallbackMarker(ctx context.Context) error {
+	return b.removeStartupLaunchers(ctx, true)
+}
+
+// removeLegacyStartupWatchdogs removes only the older looping watchdogs; the
+// local supervisor keeps the one-shot entry that starts it at login.
+func (b teamsServiceWSLWindowsTaskBackend) removeLegacyStartupWatchdogs(ctx context.Context) error {
+	return b.removeStartupLaunchers(ctx, false)
+}
+
+func (b teamsServiceWSLWindowsTaskBackend) removeStartupLaunchers(ctx context.Context, includeKick bool) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -2521,7 +2538,11 @@ func (b teamsServiceWSLWindowsTaskBackend) removeStartupFallbackMarker(ctx conte
 		}
 		installedMarkers = append(installedMarkers, markerPath)
 	}
-	if _, err = teamsServiceRunPowerShell(ctx, buildTeamsServiceWSLRemoveStartupFallbackCommand(b.Name(), suffixes)); err != nil {
+	command := buildTeamsServiceWSLRemoveStartupFallbackCommand(b.Name(), suffixes)
+	if includeKick {
+		command += "; " + buildTeamsServiceWSLRemoveStartupKickCommand(teamsServiceWSLTaskIdentity().Suffix)
+	}
+	if _, err = teamsServiceRunPowerShell(ctx, command); err != nil {
 		return err
 	}
 	for _, markerPath := range installedMarkers {
@@ -2821,10 +2842,10 @@ func printTeamsServiceBootstrapTaskFallback(out io.Writer, reason string) {
 	}
 	_, _ = fmt.Fprintln(out)
 	_, _ = fmt.Fprintln(out, "============================================================")
-	_, _ = fmt.Fprintln(out, "NOTICE: USING STARTUP WATCHDOG FALLBACK")
+	_, _ = fmt.Fprintln(out, "NOTICE: USING WINDOWS STARTUP FALLBACK")
 	_, _ = fmt.Fprintln(out, "============================================================")
 	_, _ = fmt.Fprintln(out, reason)
-	_, _ = fmt.Fprintln(out, "Installing the current-user Windows Startup watchdog fallback instead.")
+	_, _ = fmt.Fprintln(out, "Installing a one-shot Windows Startup entry that starts the Linux-side local supervisor at login instead.")
 	_, _ = fmt.Fprintln(out, "============================================================")
 	_, _ = fmt.Fprintln(out)
 }
@@ -3746,6 +3767,14 @@ func buildTeamsServiceWindowsWatchdogTaskXMLWithPrincipalUser(spec teamsServiceS
 }
 
 func buildTeamsServiceWSLArguments(spec teamsServiceSpec) []string {
+	args := teamsServiceWSLExecEnvArguments(spec, spec.Environment)
+	args = append(args, spec.Executable, "teams", "run", "--owner-stale-after", teamsServiceRunOwnerStaleAfter.String(), "--auto-service=false", "--managed-service-child")
+	return args
+}
+
+// teamsServiceWSLExecEnvArguments returns the wsl.exe arguments up to and
+// including the environment assignments; callers append the Linux command.
+func teamsServiceWSLExecEnvArguments(spec teamsServiceSpec, environment map[string]string) []string {
 	var args []string
 	if distro := strings.TrimSpace(teamsServiceWSLDistroName()); distro != "" {
 		args = append(args, "-d", distro)
@@ -3760,10 +3789,9 @@ func buildTeamsServiceWSLArguments(spec teamsServiceSpec) []string {
 	// through the user's login shell. zsh NOMATCH would otherwise reject
 	// unquoted proxy globs such as NO_PROXY=*.example.com before helper starts.
 	args = append(args, "--exec", "env")
-	for _, key := range sortedEnvironmentKeys(spec.Environment) {
-		args = append(args, key+"="+spec.Environment[key])
+	for _, key := range sortedEnvironmentKeys(environment) {
+		args = append(args, key+"="+environment[key])
 	}
-	args = append(args, spec.Executable, "teams", "run", "--owner-stale-after", teamsServiceRunOwnerStaleAfter.String(), "--auto-service=false", "--managed-service-child")
 	return args
 }
 
@@ -4202,68 +4230,6 @@ func buildTeamsServiceWSLTaskConfig(taskName string, args []string) string {
 	return b.String()
 }
 
-func buildTeamsServiceWSLStartupFallbackCommand(taskName string, args []string, start bool) string {
-	identity := teamsServiceWSLTaskIdentity()
-	return buildTeamsServiceWSLStartupFallbackCommandWithArgumentLine(taskName, windowsCommandLine(args), identity.Suffix, start)
-}
-
-func buildTeamsServiceWSLStartupFallbackCommandWithArgumentLine(taskName string, wslArgumentLine string, suffix string, start bool) string {
-	scriptName := "codex-helper-teams-wsl-" + suffix + ".ps1"
-	launcherName := "codex-helper-teams-wsl-" + suffix + ".vbs"
-	legacyCmdLauncherName := "codex-helper-teams-wsl-" + suffix + ".cmd"
-	stopName := "codex-helper-teams-wsl-stop-" + suffix + ".signal"
-	script := buildTeamsServiceWSLStartupWatchdogScriptWithArgumentLine(taskName, wslArgumentLine, suffix)
-	cleanup := buildTeamsServiceWSLRemoveStartupFallbackCommand(taskName, []string{suffix})
-	ps := cleanup + "; " +
-		"$startup = [Environment]::GetFolderPath('Startup'); " +
-		"if ([string]::IsNullOrWhiteSpace($startup)) { throw 'Windows Startup folder is unavailable' }; " +
-		"$appDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'codex-helper\\teams'; " +
-		"New-Item -ItemType Directory -Force -Path $appDir | Out-Null; " +
-		"$scriptPath = Join-Path $appDir " + powershellSingleQuote(scriptName) + "; " +
-		"$launcherPath = Join-Path $startup " + powershellSingleQuote(launcherName) + "; " +
-		"$legacyCmdLauncherPath = Join-Path $startup " + powershellSingleQuote(legacyCmdLauncherName) + "; " +
-		"$stopPath = Join-Path $appDir " + powershellSingleQuote(stopName) + "; " +
-		"Remove-Item -LiteralPath $stopPath -Force -ErrorAction SilentlyContinue; " +
-		"Remove-Item -LiteralPath $legacyCmdLauncherPath -Force -ErrorAction SilentlyContinue; " +
-		"Set-Content -LiteralPath $scriptPath -Value " + powershellSingleQuote(script) + " -Encoding UTF8; " +
-		"$launcherPowerShellExe = Join-Path $env:SystemRoot 'System32\\WindowsPowerShell\\v1.0\\powershell.exe'; " +
-		"$launcherPowerShellExeVbs = $launcherPowerShellExe.Replace('\"', '\"\"'); " +
-		"$scriptPathVbs = $scriptPath.Replace('\"', '\"\"'); " +
-		"$launcherVbs = @(" +
-		powershellSingleQuote("Function Q(s)") + ", " +
-		powershellSingleQuote("  Q = Chr(34) & s & Chr(34)") + ", " +
-		powershellSingleQuote("End Function") + ", " +
-		powershellSingleQuote("Set shell = CreateObject(\"WScript.Shell\")") + ", " +
-		"('cmd = Q(\"' + $launcherPowerShellExeVbs + '\") & \" -NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -File \" & Q(\"' + $scriptPathVbs + '\")'), " +
-		powershellSingleQuote("code = shell.Run(cmd, 0, True)") + ", " +
-		powershellSingleQuote("WScript.Quit code") +
-		") -join \"`r`n\"; " +
-		"Set-Content -LiteralPath $launcherPath -Value $launcherVbs -Encoding ASCII"
-	if start {
-		ps += "; Start-Process -FilePath 'wscript.exe' -ArgumentList ('//B //Nologo \"' + $launcherPath + '\"') -WindowStyle Hidden | Out-Null"
-	}
-	return ps
-}
-
-func buildTeamsServiceWSLStartExistingStartupFallbackCommand(suffix string) string {
-	launcherName := "codex-helper-teams-wsl-" + suffix + ".vbs"
-	scriptName := "codex-helper-teams-wsl-" + suffix + ".ps1"
-	legacyCmdLauncherName := "codex-helper-teams-wsl-" + suffix + ".cmd"
-	stopName := "codex-helper-teams-wsl-stop-" + suffix + ".signal"
-	return "$startup = [Environment]::GetFolderPath('Startup'); " +
-		"if ([string]::IsNullOrWhiteSpace($startup)) { throw 'Windows Startup folder is unavailable' }; " +
-		"$appDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'codex-helper\\teams'; " +
-		"New-Item -ItemType Directory -Force -Path $appDir | Out-Null; " +
-		"$launcherPath = Join-Path $startup " + powershellSingleQuote(launcherName) + "; " +
-		"$scriptPath = Join-Path $appDir " + powershellSingleQuote(scriptName) + "; " +
-		"$legacyCmdLauncherPath = Join-Path $startup " + powershellSingleQuote(legacyCmdLauncherName) + "; " +
-		"$stopPath = Join-Path $appDir " + powershellSingleQuote(stopName) + "; " +
-		"Remove-Item -LiteralPath $stopPath -Force -ErrorAction SilentlyContinue; " +
-		"if (-not (Test-Path -LiteralPath $launcherPath)) { throw ('Teams WSL Startup watchdog launcher not found: ' + $launcherPath) }; " +
-		teamsServiceWSLStopStartupFallbackProcessesPowerShell("$scriptPath", "$launcherPath", "$legacyCmdLauncherPath") +
-		"Start-Process -FilePath 'wscript.exe' -ArgumentList ('//B //Nologo \"' + $launcherPath + '\"') -WindowStyle Hidden | Out-Null"
-}
-
 func buildTeamsServiceWSLStopStartupFallbackCommand(suffixes []string) string {
 	return "$appDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'codex-helper\\teams'; " +
 		"New-Item -ItemType Directory -Force -Path $appDir | Out-Null; " +
@@ -4363,64 +4329,6 @@ func teamsServiceWSLStopStartupFallbackProcessesPowerShell(pathExpressions ...st
 		"foreach ($needle in $watchdogNeedles) { if ($cmd.IndexOf($needle, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue; break } } " +
 		"} " +
 		"} } catch { }; "
-}
-
-func buildTeamsServiceWSLStartupWatchdogScript(taskName string, args []string, suffix string) string {
-	return buildTeamsServiceWSLStartupWatchdogScriptWithArgumentLine(taskName, windowsCommandLine(args), suffix)
-}
-
-func buildTeamsServiceWSLStartupWatchdogScriptWithArgumentLine(taskName string, wslArgumentLine string, suffix string) string {
-	mutexName := "Local\\CodexHelperTeamsWSLWatchdog-" + safeWindowsTaskNamePart(suffix, 32)
-	runLogName := "codex-helper-teams-wsl-run-" + safeWindowsTaskNamePart(suffix, 32) + ".log"
-	watchdogLogName := "codex-helper-teams-wsl-watchdog-" + safeWindowsTaskNamePart(suffix, 32) + ".log"
-	stopName := "codex-helper-teams-wsl-stop-" + safeWindowsTaskNamePart(suffix, 32) + ".signal"
-	var b strings.Builder
-	b.WriteString("$ErrorActionPreference = 'Continue'\r\n")
-	b.WriteString("$created = $false\r\n")
-	b.WriteString("$mutex = $null\r\n")
-	b.WriteString("try {\r\n")
-	b.WriteString("  $deadline = (Get-Date).AddSeconds(60)\r\n")
-	b.WriteString("  while (-not $created) {\r\n")
-	b.WriteString("    $mutex = New-Object System.Threading.Mutex($true, " + powershellSingleQuote(mutexName) + ", [ref]$created)\r\n")
-	b.WriteString("    if ($created) { break }\r\n")
-	b.WriteString("    if ($null -ne $mutex) { $mutex.Dispose(); $mutex = $null }\r\n")
-	b.WriteString("    if ((Get-Date) -ge $deadline) { exit 0 }\r\n")
-	b.WriteString("    Start-Sleep -Seconds 2\r\n")
-	b.WriteString("  }\r\n")
-	b.WriteString("  $logDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'codex-helper\\teams'\r\n")
-	b.WriteString("  New-Item -ItemType Directory -Force -Path $logDir | Out-Null\r\n")
-	b.WriteString("  $runLog = Join-Path $logDir " + powershellSingleQuote(runLogName) + "\r\n")
-	b.WriteString("  $watchdogLog = Join-Path $logDir " + powershellSingleQuote(watchdogLogName) + "\r\n")
-	b.WriteString("  $stopPath = Join-Path $logDir " + powershellSingleQuote(stopName) + "\r\n")
-	b.WriteString("  $stdoutLog = $runLog + '.stdout.log'\r\n")
-	b.WriteString("  $stderrLog = $runLog + '.stderr.log'\r\n")
-	b.WriteString("  $wslArgumentLine = " + powershellSingleQuote(wslArgumentLine) + "\r\n")
-	b.WriteString("  Add-Content -LiteralPath $watchdogLog -Value ((Get-Date).ToString('o') + ' starting " + strings.ReplaceAll(taskName, "'", "''") + "')\r\n")
-	b.WriteString("  while ($true) {\r\n")
-	b.WriteString("    if (Test-Path -LiteralPath $stopPath) { Add-Content -LiteralPath $watchdogLog -Value ((Get-Date).ToString('o') + ' stop requested; exiting'); break }\r\n")
-	b.WriteString("    Add-Content -LiteralPath $runLog -Value ((Get-Date).ToString('o') + ' starting hidden wsl.exe; stdout ' + $stdoutLog + ' stderr ' + $stderrLog)\r\n")
-	b.WriteString("    Remove-Item -LiteralPath $stdoutLog,$stderrLog -Force -ErrorAction SilentlyContinue\r\n")
-	b.WriteString("    $p = Start-Process -FilePath 'wsl.exe' -ArgumentList $wslArgumentLine -WindowStyle Hidden -Wait -PassThru -RedirectStandardOutput $stdoutLog -RedirectStandardError $stderrLog\r\n")
-	b.WriteString("    $code = if ($null -ne $p) { $p.ExitCode } else { 1 }\r\n")
-	b.WriteString("    if (Test-Path -LiteralPath $stopPath) { Add-Content -LiteralPath $watchdogLog -Value ((Get-Date).ToString('o') + ' stop requested after wsl.exe exited ' + $code); break }\r\n")
-	b.WriteString("    Add-Content -LiteralPath $watchdogLog -Value ((Get-Date).ToString('o') + ' wsl.exe exited ' + $code + '; restarting in " + strconv.Itoa(teamsServiceTaskRestartInterval) + "s')\r\n")
-	b.WriteString("    Start-Sleep -Seconds " + strconv.Itoa(teamsServiceTaskRestartInterval) + "\r\n")
-	b.WriteString("  }\r\n")
-	b.WriteString("} finally {\r\n")
-	b.WriteString("  if ($created -and $null -ne $mutex) { $mutex.ReleaseMutex(); $mutex.Dispose() } elseif ($null -ne $mutex) { $mutex.Dispose() }\r\n")
-	b.WriteString("}\r\n")
-	return b.String()
-}
-
-func buildTeamsServiceWSLStartupFallbackConfig(taskName string, args []string) string {
-	var b strings.Builder
-	b.WriteString("Fallback=Windows Startup watchdog\n")
-	b.WriteString("TaskName=")
-	b.WriteString(taskName)
-	b.WriteString("\nCommand=wsl.exe\nArguments=")
-	b.WriteString(windowsCommandLine(args))
-	b.WriteString("\n")
-	return b.String()
 }
 
 func buildTeamsServiceWindowsPowerShell(spec teamsServiceSpec, args []string) string {

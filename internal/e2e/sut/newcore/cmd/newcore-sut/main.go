@@ -34,6 +34,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakecodex"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakegraph"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/sandbox"
+	"github.com/baaaaaaaka/codex-helper/internal/e2e/sut/override"
 )
 
 // Environment variables.
@@ -100,7 +101,8 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("auth config: %w", err)
 	}
-	ch, err := teams.New(teams.Config{HTTP: client, Tokens: teams.NewDelegatedAuth(authCfg, client), TenantID: authCfg.TenantID})
+	// Formulas: the managed renderer, as `cxp teams run` wires it.
+	ch, err := teams.New(teams.Config{HTTP: client, Tokens: teams.NewDelegatedAuth(authCfg, client), TenantID: authCfg.TenantID, Math: &teams.NodeMath{}})
 	if err != nil {
 		return err
 	}
@@ -119,6 +121,7 @@ func run() error {
 	}
 	defer st.Close()
 	host, _ := os.Hostname()
+	host = override.Hostname(host)
 	boot, _ := os.ReadFile("/proc/sys/kernel/random/boot_id")
 	if _, err := st.Acquire(store.Ident{Host: host, PID: os.Getpid(), BootID: strings.TrimSpace(string(boot))}); err != nil {
 		return fmt.Errorf("acquire store: %w", err)
@@ -148,6 +151,9 @@ func run() error {
 	readRate := 4 * float64(time.Second) / float64(interval)
 	if os.Getenv(EnvProductionTiming) == "1" {
 		timing, readRate = engine.ProductionTiming(), 0
+	}
+	if err := override.Timing(&timing); err != nil {
+		return err
 	}
 	machine := os.Getenv("CODEX_HELPER_TEAMS_MACHINE_LABEL")
 	if machine == "" {

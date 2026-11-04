@@ -130,10 +130,26 @@ func TestOwnerAcquireRules(t *testing.T) {
 	_, err = d.Acquire(Ident{Host: "h3", PID: 400, BootID: "boot-3"})
 	mustT(t, err)
 
-	// Kill switch.
+	// Kill switch: the running owner's next heartbeat reports it (and does
+	// not renew), and no host acquires while the file exists.
+	mustT(t, d.Heartbeat())
+	before, _, err := d.OwnerInfo()
+	mustT(t, err)
 	mustT(t, os.WriteFile(filepath.Join(dir, DisabledFile), nil, 0o600))
+	wantErr(t, d.Heartbeat(), ErrDisabled)
+	after, _, err := d.OwnerInfo()
+	mustT(t, err)
+	if after.HeartbeatAt != before.HeartbeatAt {
+		t.Fatalf("heartbeat renewed while disabled: %d -> %d", before.HeartbeatAt, after.HeartbeatAt)
+	}
+	mustT(t, d.Release())
 	_, err = d.Acquire(Ident{Host: "h3", PID: 400, BootID: "boot-3"})
 	wantErr(t, err, ErrDisabled)
+	// Removing the file (un-kill) lets the next start in.
+	mustT(t, os.Remove(filepath.Join(dir, DisabledFile)))
+	_, err = d.Acquire(Ident{Host: "h3", PID: 400, BootID: "boot-3"})
+	mustT(t, err)
+	mustT(t, d.Heartbeat())
 }
 
 // TestFenceAcrossProcesses: a second OS process acquires the store; every

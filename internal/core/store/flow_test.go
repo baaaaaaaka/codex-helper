@@ -441,6 +441,19 @@ func TestNextRunnableBlocking(t *testing.T) {
 		}
 		return err
 	}))
+	// After progress the window starts again.
+	mustT(t, s.Update(func(tx *Tx) error { return tx.MarkStarting(1, "th") }))
+	mustT(t, s.Update(func(tx *Tx) error { return tx.RequeueTurnNewWindow(1, 333) }))
+	mustT(t, s.Update(func(tx *Tx) error {
+		tr, _, err := tx.Turn(1)
+		if err != nil {
+			return err
+		}
+		if tr.RetryDeadline != 333 || tr.State != TurnQueued {
+			t.Fatalf("requeued turn after progress %+v", tr)
+		}
+		return nil
+	}))
 }
 
 // Only rows that must reach the chat before the next turn starts block it:

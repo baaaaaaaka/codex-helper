@@ -230,7 +230,7 @@ func (e *Engine) controlCommand(ctx context.Context, j cmdJob, text string) {
 		e.reply(j, e.listText(), nil)
 	case "status":
 		e.reply(j, e.statusText(), nil)
-	case "r", "wake", "resume":
+	case "r", "wake", "resume", "unpark": // `unpark`: v0.1.20 alias
 		e.cmdWake(j, arg)
 	case "park":
 		e.cmdParkLabel(j, arg)

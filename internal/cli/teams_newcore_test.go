@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	chteams "github.com/baaaaaaaka/codex-helper/internal/channel/teams"
 	"github.com/baaaaaaaka/codex-helper/internal/core/migrate"
 	corestore "github.com/baaaaaaaka/codex-helper/internal/core/store"
 )
@@ -189,18 +191,19 @@ func TestLocalSupervisorRestartsPromptlyAfterExit75(t *testing.T) {
 }
 
 // Exit 75 (restart on the same state) restarts the helper under every
-// supervisor: launchd keeps a non-zero exit alive, the WSL Startup loop
-// restarts after any exit, and on Windows the watchdog task starts the
-// stopped task (systemd and the local supervisor are covered above).
+// supervisor: launchd keeps a non-zero exit alive and on Windows the watchdog
+// task starts the stopped task (systemd and the local supervisor are covered
+// above). The WSL Startup entry is not a supervisor: it only runs
+// `cxp teams service start` once, and the local supervisor restarts.
 func TestEverySupervisorRestartsAfterExit75(t *testing.T) {
 	spec := teamsServiceSpec{Executable: "/usr/local/bin/cxp", WorkingDir: "/w"}
 	plist := buildTeamsServiceLaunchAgentPlist(spec)
 	if !strings.Contains(plist, "<key>SuccessfulExit</key>\n\t\t<false/>") {
 		t.Fatalf("launchd plist does not restart a non-zero exit:\n%s", plist)
 	}
-	script := buildTeamsServiceWSLStartupWatchdogScript("task", []string{"-d", "Ubuntu", "--", "cxp", "teams", "run"}, "s")
-	if !strings.Contains(script, "while ($true)") || !strings.Contains(script, "restarting in 10s") {
-		t.Fatalf("WSL Startup loop does not restart after an exit:\n%s", script)
+	entry := buildTeamsServiceWSLStartupKickVBS(buildTeamsServiceWSLStartupKickArguments(spec))
+	if !strings.Contains(entry, "teams service start") || strings.Contains(entry, "teams run") || !strings.HasSuffix(entry, ", 0, False\r\n") {
+		t.Fatalf("WSL Startup entry is not a one-shot service start:\n%s", entry)
 	}
 	d := evaluateTeamsServiceWatchdog(teamsServiceWatchdogSnapshot{Installed: true, Active: false},
 		teamsServiceWatchdogState{LastActionAt: time.Now()}, teamsServiceWatchdogOptions{})
@@ -223,5 +226,30 @@ func TestServiceUnitRestartsOnExit75(t *testing.T) {
 	}
 	if !teamsServiceEnvironmentNameAllowed(envTeamsCoreStore) {
 		t.Fatal("the store override is not carried into the service environment")
+	}
+}
+
+// The app-server PID file is per host: a helper taking over a shared home
+// from another host never reads (and kills) that host's pids.
+func TestTeamsCorePIDFileIsPerHost(t *testing.T) {
+	dir := t.TempDir()
+	a, b := teamsCorePIDFile(dir, "login-01"), teamsCorePIDFile(dir, "compute-7.cluster")
+	if a == b || filepath.Dir(a) != dir || filepath.Dir(b) != dir {
+		t.Fatalf("pid files %q and %q", a, b)
+	}
+	if got := teamsCorePIDFile(dir, "../x/y"); filepath.Dir(got) != dir {
+		t.Fatalf("host name escapes the state dir: %q", got)
+	}
+	if got := teamsCorePIDFile(dir, ""); filepath.Base(got) != "core-app-servers.pid" {
+		t.Fatalf("no host: %q", got)
+	}
+}
+
+// D13: formulas are drawn by the managed renderer (as v0.1.20 did), not left
+// as TeX code because no renderer is configured.
+func TestNewCoreChannelRendersFormulas(t *testing.T) {
+	cfg := teamsNewCoreChannelConfig(http.DefaultClient, chteams.AuthConfig{TenantID: "t"})
+	if _, ok := cfg.Math.(*chteams.NodeMath); !ok {
+		t.Fatalf("Teams channel Math = %T, want the managed NodeMath renderer", cfg.Math)
 	}
 }

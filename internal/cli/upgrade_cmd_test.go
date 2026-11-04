@@ -1913,7 +1913,7 @@ func TestUpgradeCmdWSLMatchingTaskRefreshSkipsRepairAndUAC(t *testing.T) {
 		t.Fatalf("execute upgrade: %v\n%s", err, out.String())
 	}
 	if strings.Contains(out.String(), "NEXT STEP: TYPE yes TO CONTINUE") ||
-		strings.Contains(out.String(), "NOTICE: USING STARTUP WATCHDOG FALLBACK") {
+		strings.Contains(out.String(), "NOTICE: USING WINDOWS STARTUP FALLBACK") {
 		t.Fatalf("matching task refresh should be quiet, got output:\n%s", out.String())
 	}
 	joined := teamsServiceJoinedCalls(runner.calls)
@@ -2005,7 +2005,7 @@ func TestUpgradeCmdWSLMismatchRefreshRepairsWithoutUACWhenAllowed(t *testing.T) 
 		t.Fatalf("execute upgrade: %v\n%s", err, out.String())
 	}
 	if strings.Contains(out.String(), "NEXT STEP: TYPE yes TO CONTINUE") ||
-		strings.Contains(out.String(), "NOTICE: USING STARTUP WATCHDOG FALLBACK") {
+		strings.Contains(out.String(), "NOTICE: USING WINDOWS STARTUP FALLBACK") {
 		t.Fatalf("repairable mismatch should not ask for UAC or fallback:\n%s", out.String())
 	}
 	joined := teamsServiceJoinedCalls(runner.calls)
@@ -2022,6 +2022,8 @@ func TestUpgradeCmdWSLAccessDeniedRefreshFallsBackWithoutUACWhenCleanupIsAllowed
 
 	tmp := t.TempDir()
 	isolateUpgradeTeamsStateForTest(t, tmp)
+	isolateTeamsServiceLocalSupervisorDirsForTest(t)
+	localStarted := false
 	runner := &scriptedTeamsServiceRunner{
 		errs: []error{
 			nil,
@@ -2041,7 +2043,22 @@ func TestUpgradeCmdWSLAccessDeniedRefreshFallsBackWithoutUACWhenCleanupIsAllowed
 		wslDistro:      "Debian",
 		wslLinuxUser:   "alice",
 		runner:         runner,
+		localStartDetached: func(_ context.Context, configPath string, logPath string, _ teamsServiceSpec) (int, error) {
+			localStarted = true
+			return 4242, writeTeamsServiceLocalSupervisorStatus(teamsServiceLocalSupervisorStatus{
+				Version:       teamsServiceLocalSupervisorStatusVersion,
+				ConfigPath:    configPath,
+				LogPath:       logPath,
+				SupervisorPID: 4242,
+				State:         "running",
+				UpdatedAt:     time.Now(),
+			})
+		},
+		localVerifyProcessIdentity: func(int, string) error { return nil },
 	})
+	prevAlive := teamsLocalSupervisorProcessAlive
+	teamsLocalSupervisorProcessAlive = func(pid int) bool { return pid == 4242 }
+	t.Cleanup(func() { teamsLocalSupervisorProcessAlive = prevAlive })
 
 	prevCheck := checkForUpdate
 	prevPerform := performUpdate
@@ -2068,7 +2085,7 @@ func TestUpgradeCmdWSLAccessDeniedRefreshFallsBackWithoutUACWhenCleanupIsAllowed
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("execute upgrade: %v\n%s", err, out.String())
 	}
-	if !strings.Contains(out.String(), "NOTICE: USING STARTUP WATCHDOG FALLBACK") ||
+	if !strings.Contains(out.String(), "NOTICE: USING WINDOWS STARTUP FALLBACK") ||
 		!strings.Contains(out.String(), "Restarting Teams service after upgrade") {
 		t.Fatalf("upgrade output missing fallback and restart messages:\n%s", out.String())
 	}
@@ -2076,24 +2093,22 @@ func TestUpgradeCmdWSLAccessDeniedRefreshFallsBackWithoutUACWhenCleanupIsAllowed
 		strings.Contains(out.String(), "UAC prompt") {
 		t.Fatalf("upgrade should use quiet fallback without asking for UAC when old tasks can be retired normally:\n%s", out.String())
 	}
-	lastCall := runner.calls[len(runner.calls)-1]
-	lastJoined := lastCall.name + " " + strings.Join(lastCall.args, " ")
-	if !strings.Contains(teamsServiceJoinedCalls(runner.calls), "Disable-ScheduledTask") {
+	joined := teamsServiceJoinedCalls(runner.calls)
+	if !strings.Contains(joined, "Disable-ScheduledTask") {
 		t.Fatalf("fallback should retire old WSL Scheduled Tasks before installing Startup fallback, calls=%#v", runner.calls)
 	}
-	if strings.Contains(lastJoined, "Start-ScheduledTask -TaskName $taskName") {
-		t.Fatalf("fallback start should not call Scheduled Task start after access denied, last call=%#v all calls=%#v", lastCall, runner.calls)
-	}
-	if strings.Contains(teamsServiceJoinedCalls(runner.calls), "-Verb RunAs") {
+	if strings.Contains(joined, "-Verb RunAs") {
 		t.Fatalf("quiet fallback must not use elevated PowerShell, calls=%#v", runner.calls)
 	}
-	if !strings.Contains(lastJoined, "Start-Process -FilePath 'wscript.exe'") || !strings.Contains(lastJoined, "WScript.Shell") ||
-		strings.Contains(lastJoined, "Set-Content -LiteralPath $legacyCmdLauncherPath") || strings.Contains(lastJoined, "Start-Process -FilePath 'cmd.exe'") {
-		t.Fatalf("expected Startup fallback start command, last call=%#v all calls=%#v", lastCall, runner.calls)
+	if !strings.Contains(joined, "Set-Content -LiteralPath $kickPath") || !strings.Contains(joined, "teams service start") ||
+		strings.Contains(joined, "while ($true)") || strings.Contains(joined, "Start-Process -FilePath 'cmd.exe'") {
+		t.Fatalf("expected the one-shot Startup entry, calls=%#v", runner.calls)
 	}
-	backend := teamsServiceWSLWindowsTaskBackend{}
-	if installed, err := backend.StartupFallbackMarkerExists(); err != nil || !installed {
-		t.Fatalf("Startup fallback marker installed=%v err=%v", installed, err)
+	if !localStarted {
+		t.Fatal("the upgrade restart did not start the local supervisor")
+	}
+	if selected, err := teamsServiceBackendForCurrentPlatform(); err != nil || selected.ID() != teamsServiceLocalSupervisorID {
+		t.Fatalf("backend after upgrade fallback = %v err=%v, want the local supervisor", selected, err)
 	}
 	if _, err := os.Stat(filepath.Join(tmp, "wsl-task", "codex-helper-teams-wsl-task-"+teamsServiceWSLTaskIdentity().Suffix+".txt")); !os.IsNotExist(err) {
 		t.Fatalf("stale Scheduled Task config should be removed after fallback, err=%v", err)
@@ -2597,8 +2612,12 @@ func TestUpgradeFinalizerRefreshesWindowsServiceBeforePendingActivation(t *testi
 	}
 }
 
-func TestScheduleDelayedTeamsStartupFallbackStartUsesWSLStartupCommand(t *testing.T) {
+// After an upgrade falls back to the Windows Startup entry, the local
+// supervisor is the backend; the delayed start goes through it, not through
+// a Windows-side watchdog.
+func TestScheduleDelayedStartAfterStartupFallbackUsesLocalSupervisor(t *testing.T) {
 	lockCLITestHooks(t)
+	isolateTeamsServiceLocalSupervisorDirsForTest(t)
 
 	tmp := t.TempDir()
 	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
@@ -2609,7 +2628,12 @@ func TestScheduleDelayedTeamsStartupFallbackStartUsesWSLStartupCommand(t *testin
 		isWSL:          true,
 		wslDistro:      "Debian",
 		wslLinuxUser:   "alice",
+		runner:         &recordingTeamsServiceRunner{output: []byte("ok")},
 	})
+	spec := teamsServiceSpec{Executable: filepath.Join(tmp, "codex-proxy"), WorkingDir: tmp}
+	if _, err := (teamsServiceWSLWindowsTaskBackend{}).InstallStartupFallback(context.Background(), spec, false); err != nil {
+		t.Fatal(err)
+	}
 	prevDetached := teamsServiceStartDetached
 	var detachedName string
 	var detachedArgs []string
@@ -2620,15 +2644,13 @@ func TestScheduleDelayedTeamsStartupFallbackStartUsesWSLStartupCommand(t *testin
 	}
 	t.Cleanup(func() { teamsServiceStartDetached = prevDetached })
 
-	if err := scheduleDelayedTeamsStartupFallbackStart(context.Background()); err != nil {
-		t.Fatalf("scheduleDelayedTeamsStartupFallbackStart error: %v", err)
+	if err := scheduleDelayedTeamsServiceStartAfterUpgrade(context.Background(), teamsUpgradeServiceRefreshResult{StartupFallback: true}, "", ""); err != nil {
+		t.Fatalf("scheduleDelayedTeamsServiceStartAfterUpgrade error: %v", err)
 	}
 	joined := strings.Join(detachedArgs, " ")
-	if detachedName != "powershell.exe" ||
-		!strings.Contains(joined, "Start-Sleep -Seconds 3") ||
-		!strings.Contains(joined, "Start-Process -FilePath 'wscript.exe'") ||
-		strings.Contains(joined, "Start-ScheduledTask") {
-		t.Fatalf("unexpected delayed Startup fallback command: name=%q args=%#v", detachedName, detachedArgs)
+	if detachedName != "sh" || !strings.Contains(joined, "=local-supervisor") || !strings.Contains(joined, "teams service start") ||
+		strings.Contains(joined, "wscript.exe") || strings.Contains(joined, "Start-ScheduledTask") {
+		t.Fatalf("unexpected delayed start after Startup fallback: name=%q args=%#v", detachedName, detachedArgs)
 	}
 }
 

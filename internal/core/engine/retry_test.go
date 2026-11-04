@@ -2,6 +2,8 @@ package engine
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -45,6 +47,27 @@ func TestOwnershipLossStopsEngine(t *testing.T) {
 	if n != 1 {
 		t.Fatalf("%d fatal lines", n)
 	}
+}
+
+// The kill-switch file stops a running engine at its next heartbeat with
+// store.ErrDisabled (decision: "新增停用开关文件"; the owner asked that the
+// service stop as soon as it sees the file, not only refuse the next start).
+func TestKillSwitchStopsRunningEngine(t *testing.T) {
+	r := newRig(t, func(c *Config) { c.Timing.Heartbeat = 50 * time.Millisecond })
+	r.control()
+	if err := os.WriteFile(filepath.Join(filepath.Dir(r.path), store.DisabledFile), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var runErr error
+	select {
+	case runErr = <-r.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("engine kept running after the kill-switch file appeared")
+	}
+	if !errors.Is(runErr, store.ErrDisabled) {
+		t.Fatalf("Run returned %v, want store.ErrDisabled", runErr)
+	}
+	r.done <- runErr // for r.stop
 }
 
 // Invariant: an operation that keeps failing with the same error is retried

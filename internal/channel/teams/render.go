@@ -216,8 +216,8 @@ func renderBlock(b mdBlock, top bool) frag {
 	case bMath:
 		code := codeHTML(strings.Split(b.tex, "\n"))
 		if top && b.png != nil {
-			img := fmt.Sprintf(`<p><img src="%s" alt="Rendered TeX formula" width="%d" height="%d"></p>`,
-				imgPlaceholder, displayWidth(b.png), displayHeight(b.png))
+			// Same <img> as v0.1.20: no width/height, Teams sizes the image.
+			img := fmt.Sprintf(`<p><img src="%s" alt="Rendered TeX formula"></p>`, imgPlaceholder)
 			return frag{html: code + img, pngs: [][]byte{b.png.PNG}}
 		}
 		return frag{html: code}
@@ -244,11 +244,6 @@ func renderBlock(b mdBlock, top bool) frag {
 		return frag{html: paraHTML(b.lines, b.math)}
 	}
 }
-
-// Formula images are shown at half their pixel size (the renderer draws at
-// high zoom for sharpness), capped to a chat-friendly width.
-func displayWidth(r *MathResult) int  { return max(1, min(r.Width/2, 900)) }
-func displayHeight(r *MathResult) int { return max(1, r.Height*displayWidth(r)/max(1, r.Width)) }
 
 func codeHTML(lines []string) string {
 	return "<pre><code>" + esc(strings.Join(lines, "\n")) + "</code></pre>"

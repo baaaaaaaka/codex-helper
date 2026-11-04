@@ -73,6 +73,7 @@ func Run(m *testing.M) int {
 		}
 		fmt.Fprintf(os.Stderr, "e2e: built SUT binaries in %v\n", time.Since(start).Round(time.Millisecond))
 		harness.DefaultFactory = newcore.CXPFactory(bins)
+		harness.CLIBinary = bins.SUT
 		harness.SetProcessEnv = false
 	default:
 		fmt.Fprintf(os.Stderr, "unknown %s %q (known: cxp, newcore)\n", EnvSUT, name)

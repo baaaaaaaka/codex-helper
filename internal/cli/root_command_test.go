@@ -287,3 +287,36 @@ func TestInternalNpmWrapperCommandReportsFailureExit(t *testing.T) {
 		t.Fatalf("expected missing npm message, got %q", errOut.String())
 	}
 }
+
+// A removed Teams command must fail, not print the group help and exit 0
+// (decision: `cxp teams recover` and `probe-chat` are deleted). A bare
+// group still shows its help.
+func TestTeamsUnknownSubcommandFails(t *testing.T) {
+	for _, args := range [][]string{
+		{"teams", "recover"},
+		{"teams", "probe-chat"},
+		{"teams", "service", "reload"},
+		{"teams", "path", "capture-terminal"},
+		{"teams", "workflow", "probe"},
+	} {
+		cmd := newRootCmd()
+		var out bytes.Buffer
+		cmd.SetOut(&out)
+		cmd.SetErr(&out)
+		cmd.SetArgs(args)
+		err := cmd.Execute()
+		if err == nil || !strings.Contains(err.Error(), "unknown command") {
+			t.Fatalf("%v: error = %v, want unknown command (output %q)", args, err, out.String())
+		}
+	}
+	for _, args := range [][]string{{"teams"}, {"teams", "service"}} {
+		cmd := newRootCmd()
+		var out bytes.Buffer
+		cmd.SetOut(&out)
+		cmd.SetErr(&out)
+		cmd.SetArgs(args)
+		if err := cmd.Execute(); err != nil || !strings.Contains(out.String(), "Available Commands") {
+			t.Fatalf("%v: error = %v, output %q, want help", args, err, out.String())
+		}
+	}
+}

@@ -60,7 +60,11 @@ type SUTConfig struct {
 	// SUT must be configured with it before it starts, the way its own CLI
 	// or chat command would do it (old core: `cxp teams workflow enable`).
 	WorkflowWebhookURL string
-	Logf               func(format string, args ...any)
+	// Peer, when set, names a second helper on the same state (another
+	// host sharing the home): the adapter tags its instances
+	// "<name>-<Peer>-<n>" so the fakes tell the two apart.
+	Peer string
+	Logf func(format string, args ...any)
 }
 
 // SUTFactory builds a SUT for a scenario.
