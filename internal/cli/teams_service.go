@@ -3441,6 +3441,8 @@ func teamsServiceEnvironmentAllowlist() []string {
 		"CODEX_HELPER_TEAMS_MACHINE_LABEL",
 		"CODEX_HELPER_TEAMS_MACHINE_KIND",
 		"CODEX_HELPER_TEAMS_MACHINE_PRIORITY",
+		envTeamsCore,
+		envTeamsCoreStore,
 		envTeamsASRCommand,
 		envTeamsASRArgsJSON,
 		envTeamsASRBackend,
@@ -3600,7 +3602,14 @@ func buildTeamsServiceUnit(spec teamsServiceSpec) string {
 	b.WriteString("ExecStart=")
 	b.WriteString(execStart)
 	b.WriteString("\n")
-	b.WriteString("Restart=on-failure\n")
+	if teamsEnvSelectsNewCore(spec.Environment) {
+		// The new core exits 75 for `helper restart` (a new instance on the
+		// same state) and always runs while the service is enabled.
+		b.WriteString("Restart=always\n")
+		b.WriteString("RestartForceExitStatus=75\n")
+	} else {
+		b.WriteString("Restart=on-failure\n")
+	}
 	b.WriteString("RestartSec=10s\n")
 	for _, key := range sortedEnvironmentKeys(spec.Environment) {
 		b.WriteString("Environment=")

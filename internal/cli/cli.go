@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -34,10 +35,19 @@ func Execute() int {
 		return 1
 	}
 	cmd := newRootCmd()
-	if err := cmd.Execute(); err != nil {
-		return 1
+	return exitCodeFor(cmd.Execute())
+}
+
+// exitCodeFor is the process exit code for a command's error.
+func exitCodeFor(err error) int {
+	if err == nil {
+		return 0
 	}
-	return 0
+	var ec *exitCodeError
+	if errors.As(err, &ec) {
+		return ec.code
+	}
+	return 1
 }
 
 func newRootCmd() *cobra.Command {

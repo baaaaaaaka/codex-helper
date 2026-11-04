@@ -1045,12 +1045,28 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 	var modelProfile string
 	var machineRegistry bool
 	var managedServiceChild bool
+	var coreName string
 	cmd := &cobra.Command{
 		Use:     "run",
 		Aliases: []string{"listen"},
 		Short:   "Poll Teams chats and route session messages to Codex",
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			newCore, err := teamsNewCoreSelected(coreName)
+			if err != nil {
+				return err
+			}
+			if newCore {
+				if once {
+					return fmt.Errorf("--once is not supported by the new Teams core")
+				}
+				return runTeamsNewCore(cmd, root, teamsNewCoreOptions{
+					codexPath:  codexPath,
+					asrCommand: firstNonEmptyString(asrCommand, os.Getenv(envTeamsASRCommand)),
+					asrArgs:    asrArgs,
+					registry:   machineRegistry,
+				})
+			}
 			if upgradeCodex {
 				if err := runTeamsUpgradeCodexOnce(cmd, root, codexPath); err != nil {
 					return err
@@ -1211,6 +1227,8 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 	cmd.Flags().BoolVar(&machineRegistry, "machine-registry", true, "Enable cross-machine Teams registry heartbeat and delegation worker")
 	cmd.Flags().BoolVar(&managedServiceChild, "managed-service-child", false, "Internal marker for a Teams service-managed listener")
 	_ = cmd.Flags().MarkHidden("managed-service-child")
+	cmd.Flags().StringVar(&coreName, "core", "", "Teams core: old (default) or new; default from "+envTeamsCore)
+	_ = cmd.Flags().MarkHidden("core")
 	return cmd
 }
 

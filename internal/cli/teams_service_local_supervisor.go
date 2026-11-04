@@ -673,7 +673,7 @@ func runTeamsServiceLocalSupervisor(ctx context.Context, configPath string) erro
 			status.UpdatedAt = time.Now()
 			_ = writeTeamsServiceLocalSupervisorStatus(status)
 		}
-		if err := sleepContext(supervisorCtx, teamsServiceLocalSupervisorRestartDelay); err != nil {
+		if err := sleepContext(supervisorCtx, teamsServiceLocalSupervisorRestartDelayAfter(runErr)); err != nil {
 			return nil
 		}
 		status.RestartCount++
@@ -720,7 +720,7 @@ func runTeamsServiceLocalSupervisorChild(ctx context.Context, cfg teamsServiceLo
 			clearTeamsServiceLocalSupervisorChild(status, waitErr)
 			return ctx.Err()
 		case <-ticker.C:
-			decision, err := teamsServiceLocalSupervisorCheckChildHealth(ctx, &healthState)
+			decision, err := teamsServiceLocalSupervisorChildHealth(ctx, cfg, &healthState)
 			if err != nil {
 				status.LastHealthCheckAt = time.Now()
 				status.LastHealthReason = "health check unavailable: " + err.Error()
@@ -1015,6 +1015,32 @@ func teamsServiceLocalSupervisorBaseEnvAllowed(key string) bool {
 	}
 	return strings.HasPrefix(key, "LC_")
 }
+
+// teamsServiceLocalSupervisorRestartAfterExit75 is the pause before the
+// new instance a child asked for by exiting 75 (`helper restart`).
+var teamsServiceLocalSupervisorRestartAfterExit75 = time.Second
+
+// teamsServiceLocalSupervisorRestartDelayAfter is the pause before the next
+// child: short when the child asked for a restart, else the failure delay.
+func teamsServiceLocalSupervisorRestartDelayAfter(runErr error) time.Duration {
+	if teamsServiceLocalSupervisorExitCode(runErr) == teamsRestartExitCode {
+		return teamsServiceLocalSupervisorRestartAfterExit75
+	}
+	return teamsServiceLocalSupervisorRestartDelay
+}
+
+// teamsServiceLocalSupervisorChildHealth decides whether the running child
+// must be restarted. The new core is never judged from the old store.
+func teamsServiceLocalSupervisorChildHealth(ctx context.Context, cfg teamsServiceLocalSupervisorConfig, state *teamsServiceWatchdogState) (teamsServiceWatchdogDecision, error) {
+	if teamsEnvSelectsNewCore(cfg.Spec.Environment) {
+		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: teamsNewCoreHealthReason}, nil
+	}
+	return teamsServiceLocalSupervisorCheckChildHealth(ctx, state)
+}
+
+// teamsNewCoreHealthReason: the new core's liveness is its own store lease;
+// the old store's owner heartbeat says nothing about it.
+const teamsNewCoreHealthReason = "new Teams core: health is not judged from the old store"
 
 func teamsServiceLocalSupervisorExitCode(err error) int {
 	if err == nil {

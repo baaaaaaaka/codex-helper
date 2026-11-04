@@ -173,6 +173,11 @@ func runTeamsServiceWatchdogLoop(ctx context.Context, opts teamsServiceWatchdogO
 
 func runTeamsServiceWatchdogOnce(ctx context.Context, opts teamsServiceWatchdogOptions) (teamsServiceWatchdogResult, error) {
 	opts = normalizeTeamsServiceWatchdogOptions(opts)
+	if teamsEnvSelectsNewCore(map[string]string{envTeamsCore: os.Getenv(envTeamsCore)}) {
+		// The service manager restarts the new core (Restart=always); the
+		// old store's heartbeats would only ever look stale.
+		return teamsServiceWatchdogResult{Decision: teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: teamsNewCoreHealthReason}, DryRun: opts.DryRun}, nil
+	}
 	snapshot, err := teamsServiceWatchdogCollectSnapshot(ctx, opts)
 	if err != nil {
 		return teamsServiceWatchdogResult{}, err
