@@ -42,6 +42,7 @@ type Timing struct {
 	CancelWait      time.Duration // wait after turn/interrupt before killing
 	ResolveDelay    time.Duration // wait before reading back an unknown send
 	ResolveTries    int
+	ResolveAbsent   time.Duration // read-backs span this long after an ambiguous send before "absent" is authoritative (Graph listing lag)
 	CapacityRetry   time.Duration // window from the first capacity error
 	CapacityBackoff time.Duration // first capacity retry delay (doubles)
 	Heartbeat       time.Duration
@@ -61,7 +62,7 @@ func ProductionTiming() Timing {
 		Control: 5 * time.Second, ScanInterval: 5 * time.Second, SafetyRead: 10 * time.Minute, MaxBackoff: 5 * time.Minute,
 		MirrorStat: 2 * time.Second, Discovery: 10 * time.Second, FullWalk: 10 * time.Minute,
 		TurnPoll: 30 * time.Second, CancelWait: 10 * time.Second,
-		ResolveDelay: 5 * time.Second, ResolveTries: 3, CapacityRetry: 5 * time.Minute, CapacityBackoff: 10 * time.Second,
+		ResolveDelay: 5 * time.Second, ResolveTries: 3, ResolveAbsent: 2 * time.Minute, CapacityRetry: 5 * time.Minute, CapacityBackoff: 10 * time.Second,
 		Heartbeat: 30 * time.Second, Maintenance: time.Minute, ChatRate: time.Second,
 		DuplicateFor: 3 * time.Minute, BreakerWindow: time.Minute, BreakerCount: 3,
 	}
@@ -81,6 +82,7 @@ func FastTiming(base time.Duration) Timing {
 	t.MirrorStat, t.Discovery, t.FullWalk = base, 2*base, 20*base
 	t.TurnPoll = 2 * time.Second
 	t.ResolveDelay = 500 * time.Millisecond
+	t.ResolveAbsent = 3 * time.Second
 	t.Maintenance = 10 * time.Second
 	t.CapacityBackoff = time.Second
 	t.CancelWait = 5 * time.Second

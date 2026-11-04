@@ -473,6 +473,104 @@ func TestUnknownSendResolvedByReadBack(t *testing.T) {
 	}
 }
 
+// absentSends makes the first n sends whose body contains sub ambiguous
+// without storing them (the channel never got the message), and records the
+// time of every such send attempt.
+func absentSends(r *rig, sub string, n int) func() []time.Time {
+	var mu sync.Mutex
+	var at []time.Time
+	r.ch.SendFault = func(chat string, p channel.Part) (bool, error) {
+		if !strings.Contains(p.Body, sub) {
+			return false, nil
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		at = append(at, time.Now())
+		if len(at) <= n {
+			return false, &channel.Ambiguous{Err: errors.New("connection reset")}
+		}
+		return false, nil
+	}
+	return func() []time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]time.Time(nil), at...)
+	}
+}
+
+func quickResolve(c *Config) {
+	c.Timing.ResolveDelay = 100 * time.Millisecond
+	c.Timing.ResolveAbsent = time.Second
+}
+
+func TestAbsentFinalIsResentOnceAfterTheAbsenceWindow(t *testing.T) {
+	r := newRig(t, quickResolve)
+	work := r.newWork(t.TempDir())
+	attempts := absentSends(r, "ANSWER to vanished", 1)
+	r.ch.PostUser(work, "vanished")
+	r.wait("answer resent", func() bool { return len(r.own(work, "ANSWER to vanished")) == 1 })
+	at := attempts()
+	if len(at) != 2 {
+		t.Fatalf("%d send attempts, want 2", len(at))
+	}
+	if gap := at[1].Sub(at[0]); gap < time.Second {
+		t.Fatalf("resent after %s, before the 1s absence window", gap)
+	}
+	r.ch.PostUser(work, "after")
+	r.wait("next answer", func() bool { return len(r.own(work, "ANSWER to after")) == 1 })
+	if n := len(r.own(work, "could not be confirmed")); n != 0 {
+		t.Fatalf("%d unconfirmed notices for a resent answer", n)
+	}
+	if n := len(r.own(work, "ANSWER to vanished")); n != 1 || len(attempts()) != 2 {
+		t.Fatalf("%d copies after %d attempts", n, len(attempts()))
+	}
+}
+
+func TestAbsentResentFinalIsDroppedWithOneNotice(t *testing.T) {
+	r := newRig(t, quickResolve)
+	work := r.newWork(t.TempDir())
+	attempts := absentSends(r, "ANSWER to twice", 2)
+	r.ch.PostUser(work, "twice")
+	r.wait("notice", func() bool { return len(r.own(work, "even after sending it a second time")) == 1 })
+	r.ch.PostUser(work, "later")
+	r.wait("next answer", func() bool { return len(r.own(work, "ANSWER to later")) == 1 })
+	if n := len(attempts()); n != 2 {
+		t.Fatalf("%d send attempts, want 2 (one resend only)", n)
+	}
+	if n := len(r.ch.Messages(work)); n == 0 {
+		t.Fatal("no messages")
+	}
+	for _, m := range r.ch.Messages(work) {
+		if strings.Contains(m.Text, "ANSWER to twice") {
+			t.Fatalf("absent answer appeared: %q", m.Text)
+		}
+	}
+	if n := len(r.own(work, "could not be confirmed")); n != 1 {
+		t.Fatalf("%d notices", n)
+	}
+}
+
+func TestAbsentAckIsNotResent(t *testing.T) {
+	r := newRig(t, quickResolve)
+	work := r.newWork(t.TempDir())
+	attempts := absentSends(r, "Request accepted", 1)
+	r.ch.PostUser(work, "acked")
+	r.wait("answer", func() bool { return len(r.own(work, "ANSWER to acked")) == 1 })
+	r.wait("ack settled", func() bool {
+		rows, _ := r.st.UnknownOutbox()
+		return len(rows) == 0
+	})
+	r.ch.PostUser(work, "next")
+	r.wait("next answer", func() bool { return len(r.own(work, "ANSWER to next")) == 1 })
+	// The second prompt's ack is the second "Request accepted" send.
+	if n := len(attempts()); n != 2 {
+		t.Fatalf("%d ack sends, want 2 (the lost ack is not resent)", n)
+	}
+	if n := len(r.own(work, "could not be confirmed")); n != 0 {
+		t.Fatalf("%d notices for a lost ack", n)
+	}
+}
+
 func TestUserErrorHidesInternalIDs(t *testing.T) {
 	in := "thread 019e2e00-1234-7abc-8def-0123456789ab already has an active writer at /home/u/.codex/sessions/2026/x.jsonl in 19:meeting_abc@thread.v2"
 	got := userError(in)

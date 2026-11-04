@@ -305,8 +305,11 @@ func (e *Engine) noteUnknown(id int64, at time.Time) {
 
 // resolverLoop resolves unknown sends by reading the chat back. A send
 // found there (by its marker, or by its content hash when markers are not
-// trusted) becomes sent. One that is not found after ResolveTries reads is
-// dropped with one visible notice: re-posting could duplicate it.
+// trusted) becomes sent. One that is still not found after ResolveTries
+// reads spanning at least ResolveAbsent is absent: a final or mirror row is
+// sent again once (STORE-DESIGN §3.7, owner decision "read back; resend the
+// final if it is absent"); anything else, or a resend that is again absent,
+// is dropped with one visible notice.
 func (e *Engine) resolverLoop(ctx context.Context) {
 	if rows, err := e.st.UnknownOutbox(); err == nil {
 		for _, r := range rows {
@@ -420,8 +423,19 @@ func (e *Engine) resolveOne(ctx context.Context, id int64) {
 	var found string
 	err = e.update(func(tx *store.Tx) error {
 		found = ""
+		markers := map[string]bool{}
+		if marker != "" {
+			markers[marker] = true
+		}
+		// A resent row also counts as delivered when the first attempt
+		// shows up late.
+		if prev, ok, err := tx.Meta(resentKey(r.ID)); err != nil {
+			return err
+		} else if ok && prev != resentNoToken && prev != "" {
+			markers[e.marker(prev)] = true
+		}
 		for _, m := range msgs {
-			if marker != "" && m.Marker == marker {
+			if m.Marker != "" && markers[m.Marker] {
 				found = m.ID
 				break
 			}
@@ -463,24 +477,53 @@ func (e *Engine) resolveOne(ctx context.Context, id int64) {
 	u.tries++
 	tries := u.tries
 	u.next = now.Add(e.t.ResolveDelay << min(tries, 4))
+	absentAt := u.since.Add(e.t.ResolveAbsent)
+	if tries >= e.t.ResolveTries && now.Before(absentAt) && u.next.Before(absentAt) {
+		u.next = absentAt
+	}
 	e.mu.Unlock()
-	if tries < e.t.ResolveTries {
+	if tries < e.t.ResolveTries || now.Before(absentAt) {
 		return
 	}
-	// Not found: never re-post (it may still appear); tell the user once.
-	e.logf("unknown send %s not found after %d read-backs; dropped", r.DeliveryKey, tries)
+	// Authoritatively absent.
+	resent := false
 	err = e.update(func(tx *store.Tx) error {
+		resent = false
+		text := textUnconfirmed
+		if r.Kind == store.OutFinal || r.Kind == store.OutMirror {
+			_, done, err := tx.Meta(resentKey(r.ID))
+			if err != nil {
+				return err
+			}
+			text = textUnconfirmedRetried
+			if !done {
+				tok := r.AttemptToken
+				if tok == "" {
+					tok = resentNoToken
+				}
+				if err := tx.SetMeta(resentKey(r.ID), tok); err != nil {
+					return err
+				}
+				resent = true
+				return tx.Requeue(r.ID, 0) // BeginSend gives a fresh token and marker
+			}
+		}
 		if err := tx.Drop(r.ID, "not found by read-back"); err != nil {
 			return err
 		}
 		if r.Kind == store.OutAck || strings.HasPrefix(r.DeliveryKey, "unconfirmed:") {
 			return nil
 		}
-		return e.enqueueNotice(tx, r.ConvID, "unconfirmed:"+r.DeliveryKey, textUnconfirmed)
+		return e.enqueueNotice(tx, r.ConvID, "unconfirmed:"+r.DeliveryKey, text)
 	})
 	if err != nil {
-		e.logf("drop %d: %v", id, err)
+		e.logf("settle unknown %d: %v", id, err)
 		return
+	}
+	if resent {
+		e.logf("unknown send %s not found after %d read-backs over %s; sending it again once", r.DeliveryKey, tries, now.Sub(u.since).Round(time.Second))
+	} else {
+		e.logf("unknown send %s not found after %d read-backs; dropped", r.DeliveryKey, tries)
 	}
 	e.mu.Lock()
 	delete(e.unknown, id)
@@ -488,6 +531,15 @@ func (e *Engine) resolveOne(ctx context.Context, id int64) {
 	e.wakeRunner(r.ConvID)
 	e.wakeSender()
 }
+
+// resentKey is the engine meta key recording that an absent final or mirror
+// row was sent again (value: the first attempt's token, or resentNoToken).
+func resentKey(id int64) string { return fmt.Sprintf("%s%d", metaResentPrefix, id) }
+
+const (
+	metaResentPrefix = "engine_resent:"
+	resentNoToken    = "-"
+)
 
 // filePart renders the message that carries an uploaded outbound file.
 func (e *Engine) filePart(ctx context.Context, f store.OutFile) (channel.Part, error) {

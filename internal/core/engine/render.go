@@ -59,4 +59,7 @@ const (
 	textDuplicate   = "Duplicate request ignored (same text within 3 minutes). Send `helper retry` to run it again."
 	textActive      = "Codex did not run this request: the session is open in another Codex window that is writing to it. Close it there (or wait until it is idle) and resend."
 	textUnconfirmed = "A reply could not be confirmed as delivered, so it was not sent again to avoid a duplicate. Ask again if it is missing."
+	// textUnconfirmedRetried: an answer was sent a second time and that copy
+	// could not be confirmed either.
+	textUnconfirmedRetried = "A reply could not be confirmed as delivered, even after sending it a second time. Ask again if it is missing."
 )
