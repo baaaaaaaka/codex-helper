@@ -347,8 +347,8 @@ def main():
                                         turn=r["turn"], text=r["text"][:120]))
             if detail_f:
                 detail_f.write(json.dumps(dict(conv=label, path=os.path.basename(path), cls=c, line=r["line"],
-                                               start=r["start"], kind=r["kind"], id=r["id"], turn=r["turn"],
-                                               text=r["text"][:200]), ensure_ascii=False) + "\n")
+                                               start=r["start"], end=r["end"], kind=r["kind"], id=r["id"], turn=r["turn"],
+                                               ts=r["ts"], text=r["text"][:200]), ensure_ascii=False) + "\n")
         row["classes"] = dict(cls)
         row["examples"] = examples
         if R == D:

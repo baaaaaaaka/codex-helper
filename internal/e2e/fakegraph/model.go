@@ -33,6 +33,9 @@ const (
 	OriginCoworker Origin = "coworker"
 	// OriginSystem marks Teams-generated system event messages.
 	OriginSystem Origin = "system"
+	// OriginSeeded marks history that existed before the scenario (the
+	// owner's and an older helper's messages, see SeedMessage).
+	OriginSeeded Origin = "seeded"
 )
 
 // User is a Graph user known to the fake tenant.
