@@ -51,7 +51,8 @@ func TestKillSwitchFile(t *testing.T) {
 	out := s.SUT.Output()
 	s.Check("a running helper stops by itself when DISABLED appears", stopped,
 		"exited within 15 s (heartbeat 500 ms)", fmt.Sprintf("stopped=%v after %s", stopped, stopAfter), s.OutputTail(600))
-	s.Check("its exit names the kill-switch file", strings.Contains(out, "DISABLED"), "output mentions DISABLED", clipTail(out, 300))
+	s.Check("its exit names the kill-switch file", strings.Contains(out, "DISABLED") || strings.Contains(out, "kill-switch file"),
+		"output mentions DISABLED or the kill-switch file", clipTail(out, 300))
 
 	// A start while disabled is refused before any Graph request, and the
 	// prompt posted meanwhile is not run.

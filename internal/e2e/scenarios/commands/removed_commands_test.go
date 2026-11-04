@@ -51,6 +51,7 @@ func TestRemovedTeamsCommands(t *testing.T) {
 // and service; decision 熔断: the offline breaker CLI). Each exits non-zero
 // without touching anything; the kept modes still work.
 func TestRemovedCLICommands(t *testing.T) {
+	harness.NeedsCLI(t)
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "DELETED-CLI", harness.Options{
 		Guarantees: []string{"removed-commands"},

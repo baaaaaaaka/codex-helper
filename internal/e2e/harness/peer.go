@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"syscall"
+	"testing"
 	"time"
 )
 
@@ -81,6 +82,16 @@ func (s *Scenario) StorePath() string {
 // CLIBinary is the cxp binary scenarios run CLI commands with (set by
 // sut.Run when E2E_SUT=cxp; "" otherwise).
 var CLIBinary string
+
+// NeedsCLI skips a scenario that drives the cxp command line when the SUT
+// is not cxp. Call it before NewScenario, so a skipped scenario emits no
+// verdict.
+func NeedsCLI(t *testing.T) {
+	t.Helper()
+	if CLIBinary == "" {
+		t.Skip("needs the cxp binary (E2E_SUT=cxp)")
+	}
+}
 
 // RunCLI runs `cxp <args>` with the scenario's environment (HOME, state,
 // token caches; never the host's) and returns its combined output and exit

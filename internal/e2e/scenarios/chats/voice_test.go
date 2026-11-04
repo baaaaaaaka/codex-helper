@@ -22,6 +22,7 @@ import (
 // transcription with "Teams media transcription failed: … Next: …" and does
 // not run Codex on it.
 func TestVoiceExternalCommand(t *testing.T) {
+	harness.NeedsCLI(t) // the voice path is wired in the cxp entry point only
 	harness.Parallel(t)
 	tools := t.TempDir()
 	mode := filepath.Join(tools, "mode")
@@ -50,9 +51,6 @@ esac
 		SUTEnv:     map[string]string{"CODEX_HELPER_TEAMS_ASR_COMMAND": script},
 	})
 	defer s.Finish()
-	if s.SUT.Name() != "cxp" {
-		t.Skip("the voice path is wired in the cxp entry point only")
-	}
 	control := steps.ReadyControlChat(s)
 	work, _ := steps.NewWorkChat(s, control, "voice")
 

@@ -18,6 +18,7 @@ import (
 // to the store). Each final still notifies the owner exactly once: a
 // control-chat @mention while cards are off, a card while they are on.
 func TestWorkflowToggledWhileRunning(t *testing.T) {
+	harness.NeedsCLI(t)
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "WORKFLOW-LIVE", harness.Options{
 		Guarantees: []string{"R-49", "F-RND-6", "owner-notify-every-final"},
