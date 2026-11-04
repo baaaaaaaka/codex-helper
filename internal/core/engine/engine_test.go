@@ -412,6 +412,30 @@ func TestDuplicateGuardSkipsFailedAndAttachments(t *testing.T) {
 	}
 }
 
+// The control chat wakes a parked session with `r`, `resume`, `wake` or
+// `unpark` (v0.1.20 aliases), by id or bare number.
+func TestWakeAliases(t *testing.T) {
+	r := newRig(t)
+	ctl := r.control()
+	for i := 0; i < 2; i++ {
+		r.newWork(t.TempDir())
+	}
+	for _, c := range []struct{ park, wake, label string }{
+		{"park s001", "unpark s001", "s001"},
+		{"park 2", "r 2", "s002"},
+		{"park s002", "resume s002", "s002"},
+		{"park s001", "wake 1", "s001"},
+	} {
+		n := len(r.own(ctl, "Resumed "+c.label))
+		r.ch.PostUser(ctl, c.park)
+		r.wait(c.park, func() bool {
+			return len(r.own(ctl, "Parked "+c.label)) > 0 || len(r.own(ctl, c.label+" is parked")) > 0
+		})
+		r.ch.PostUser(ctl, c.wake)
+		r.wait(c.wake, func() bool { return len(r.own(ctl, "Resumed "+c.label)) == n+1 })
+	}
+}
+
 func TestCancelRunningTurn(t *testing.T) {
 	r := newRig(t)
 	work := r.newWork(t.TempDir())
