@@ -1060,11 +1060,19 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 				if once {
 					return fmt.Errorf("--once is not supported by the new Teams core")
 				}
+				if upgradeCodex {
+					if err := runTeamsUpgradeCodexOnce(cmd, root, codexPath); err != nil {
+						return err
+					}
+				}
 				return runTeamsNewCore(cmd, root, teamsNewCoreOptions{
-					codexPath:  codexPath,
-					asrCommand: firstNonEmptyString(asrCommand, os.Getenv(envTeamsASRCommand)),
-					asrArgs:    asrArgs,
-					registry:   machineRegistry,
+					codexPath:            codexPath,
+					asrCommand:           firstNonEmptyString(asrCommand, os.Getenv(envTeamsASRCommand)),
+					asrArgs:              asrArgs,
+					registry:             machineRegistry,
+					autoUpdate:           autoUpdate,
+					autoUpdateRepo:       autoUpdateRepo,
+					autoUpdatePrerelease: autoUpdatePrerelease,
 				})
 			}
 			if upgradeCodex {

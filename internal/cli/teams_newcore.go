@@ -79,6 +79,11 @@ type teamsNewCoreOptions struct {
 	asrCommand string
 	asrArgs    []string
 	registry   bool
+	// autoUpdate enables helper self-update (--auto-update), from
+	// autoUpdateRepo, with pre-releases when autoUpdatePrerelease.
+	autoUpdate           bool
+	autoUpdateRepo       string
+	autoUpdatePrerelease bool
 }
 
 // teamsNewCoreOverrides replace production wiring in the e2e build
@@ -292,6 +297,13 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 			CodexDir:  paths.CodexDir,
 			HomeDir:   paths.Home,
 		}),
+	}
+	if opts.autoUpdate && teamsNewCoreTestOverrides == nil {
+		cfg.Updater = newTeamsNewCoreUpdater(opts.autoUpdateRepo, opts.autoUpdatePrerelease, cfg.Version, errOut)
+		cfg.UpdatePrerelease = opts.autoUpdatePrerelease
+	}
+	if strings.TrimSpace(opts.codexPath) == "" && teamsNewCoreTestOverrides == nil {
+		cfg.CodexUpgrader = teamsNewCoreCodexUpgrader{root: root, log: errOut}
 	}
 	if cfg.Registry {
 		// The registry keys the inbox by the account id: read once (and
