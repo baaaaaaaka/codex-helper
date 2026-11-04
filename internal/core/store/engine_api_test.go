@@ -1,6 +1,10 @@
 package store
 
-import "testing"
+import (
+	"fmt"
+	"strings"
+	"testing"
+)
 
 func TestEngineAdditions(t *testing.T) {
 	s, _ := openTest(t)
@@ -70,5 +74,46 @@ func TestEngineAdditions(t *testing.T) {
 	}
 	if ids, err := s.CodexTurnIDs(); err != nil || len(ids) != 0 {
 		t.Errorf("CodexTurnIDs %v %v", ids, err)
+	}
+}
+
+func TestQueuedTurnConvs(t *testing.T) {
+	s, _ := openTest(t)
+	var a, b, c int64
+	mustT(t, s.Update(func(tx *Tx) error {
+		var err error
+		for i, p := range []*int64{&a, &b, &c} {
+			chat := fmt.Sprintf("c%d", i)
+			if *p, err = tx.CreateConversation(NewConversation{Label: fmt.Sprintf("s%03d", i), Kind: KindWork, Channel: "teams", ExtChatID: chat}); err != nil {
+				return err
+			}
+		}
+		// a: one queued turn; b: a turn that finished; c: none.
+		if _, err := tx.AdmitWindow("c0", a, []InboundMsg{{ExtMsgID: "m1", ExtTime: 1, Sender: SenderOwner, Kind: InPrompt, Body: "hi"}}, "cur"); err != nil {
+			return err
+		}
+		ad, err := tx.AdmitWindow("c1", b, []InboundMsg{{ExtMsgID: "m2", ExtTime: 1, Sender: SenderOwner, Kind: InPrompt, Body: "hi"}}, "cur")
+		if err != nil {
+			return err
+		}
+		return tx.FinishTurn(ad[0].TurnID, TurnCancelled, "test", nil)
+	}))
+	got, err := s.QueuedTurnConvs()
+	if err != nil || len(got) != 1 || got[0] != a {
+		t.Fatalf("QueuedTurnConvs = %v %v, want [%d]", got, err, a)
+	}
+	rows, err := s.r.Query(`EXPLAIN QUERY PLAN SELECT DISTINCT conv_id FROM turns
+WHERE state IN ('queued','starting','running') AND state = 'queued' ORDER BY conv_id`)
+	mustT(t, err)
+	defer rows.Close()
+	var plan string
+	for rows.Next() {
+		var detail string
+		mustT(t, rows.Scan(new(int), new(int), new(int), &detail))
+		plan += detail + "; "
+	}
+	mustT(t, rows.Err())
+	if !strings.Contains(plan, "turns_open") {
+		t.Errorf("query plan %q does not use turns_open", plan)
 	}
 }

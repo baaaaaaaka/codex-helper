@@ -117,3 +117,24 @@ func (s *Store) TurnCounts() (map[string]int, error) {
 	}
 	return out, rows.Err()
 }
+
+// QueuedTurnConvs lists the conversations that have a queued turn, in id
+// order: the only ones the runner's safety sweep can start a turn in.
+func (s *Store) QueuedTurnConvs() ([]int64, error) {
+	// The first term matches the turns_open partial index.
+	rows, err := s.r.QueryContext(context.Background(), `SELECT DISTINCT conv_id FROM turns
+WHERE state IN ('queued','starting','running') AND state = 'queued' ORDER BY conv_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
