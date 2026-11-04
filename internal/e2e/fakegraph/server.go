@@ -65,6 +65,8 @@ type Server struct {
 	violations    []Violation
 	blocked       []BlockedRequest
 	faults        []*FaultHandle
+	hosted        map[hostedKey][]byte
+	drive         map[string]driveFile
 	accessTokens  map[string]bool
 	refreshTokens map[string]bool
 	inflight      int
@@ -210,6 +212,18 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			s.record(rec, start)
 			dropConnection(w)
+			return
+		case FaultAcceptedHold:
+			// Apply, then never answer: the client waits until it gives up
+			// or its process dies (the harness SIGKILLs it meanwhile).
+			resp := s.dispatch(host, route, r, body, &rec)
+			rec.Status = resp.status
+			rec.Outcome = "held"
+			if resp.violation != nil {
+				s.addViolation(*resp.violation, rec)
+			}
+			s.record(rec, start)
+			<-r.Context().Done()
 			return
 		case FaultLatency:
 			// fall through to normal handling
@@ -439,6 +453,12 @@ func matchGraphRoute(method, p string) routeMatch {
 	case len(parts) == 3 && parts[0] == "me" && parts[1] == "onlineMeetings" && (method == http.MethodGet || method == http.MethodPatch):
 		m.meetingID = parts[2]
 		return set("/me/onlineMeetings/{meeting}")
+	case len(parts) == 3 && parts[0] == "shares" && parts[2] == "driveItem" && method == http.MethodGet:
+		m.extra = parts[1]
+		return set("/shares/{id}/driveItem")
+	case len(parts) == 4 && parts[0] == "shares" && parts[2] == "driveItem" && parts[3] == "content" && method == http.MethodGet:
+		m.extra = parts[1]
+		return set("/shares/{id}/driveItem/content")
 	case len(parts) >= 2 && parts[0] == "chats":
 		m.chatID = parts[1]
 		rest := parts[2:]
@@ -632,7 +652,14 @@ func (s *Server) handleGraph(route routeMatch, q url.Values, body []byte, rec *R
 		}
 		return s.patchMessage(route.chatID, route.messageID, body, rec)
 	case "GET /chats/{chat}/messages/{message}/hostedContents/{id}/$value":
-		return response{status: 404, body: graphError("NotFound", "hosted content not found")}
+		return s.hostedContent(route)
+	case "GET /shares/{id}/driveItem":
+		if v := checkSelect(q, "id", "name", "size", "eTag", "webUrl", "webDavUrl", "file"); v != "" {
+			return violationResponse(rec, "graph-contract", v)
+		}
+		return s.shareItem(route, false, rec)
+	case "GET /shares/{id}/driveItem/content":
+		return s.shareItem(route, true, rec)
 	}
 	return violationResponse(rec, "unmodeled", "route "+route.name+" not implemented")
 }

@@ -21,6 +21,11 @@ const (
 	FaultDropBeforeAccept
 	// FaultLatency only delays the request, then serves it normally.
 	FaultLatency
+	// FaultAcceptedHold applies the request (the message is stored) and
+	// then never answers; the request is recorded with Outcome "held" as
+	// soon as it was applied. Used to crash the client between Graph
+	// accepting a POST and the client learning the message id.
+	FaultAcceptedHold
 )
 
 // Fault is one injection rule. A request matches when every non-empty
