@@ -4,9 +4,12 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
+
+	"github.com/baaaaaaaka/codex-helper/internal/core/store"
 )
 
 const s001Thread = "11111111-1111-4111-8111-000000000001"
@@ -15,9 +18,10 @@ const s001Thread = "11111111-1111-4111-8111-000000000001"
 type rollout struct {
 	b    strings.Builder
 	ends []int64 // ends[n] = end offset of line n (1-based; ends[0] = 0)
+	ts   string  // timestamp of the next lines
 }
 
-func newRollout() *rollout { return &rollout{ends: []int64{0}} }
+func newRollout() *rollout { return &rollout{ends: []int64{0}, ts: "2029-12-31T00:00:00Z"} }
 
 func (r *rollout) add(v any) {
 	raw, err := json.Marshal(v)
@@ -30,7 +34,7 @@ func (r *rollout) add(v any) {
 }
 
 func (r *rollout) line(typ string, payload map[string]any) {
-	r.add(map[string]any{"timestamp": "2029-12-31T00:00:00Z", "type": typ, "payload": payload})
+	r.add(map[string]any{"timestamp": r.ts, "type": typ, "payload": payload})
 }
 
 func (r *rollout) turn(id string) {
@@ -228,5 +232,94 @@ func TestMirrorKey(t *testing.T) {
 	eq(t, "prefix", strings.HasPrefix(MirrorKey("th", "msg_1", 2), MirrorKeyPrefix("th", "msg_1")), true)
 	for id, want := range map[string]bool{"msg_1": true, "a..b": false, "fallback:session:x:line:3:kind:user": false, "": false} {
 		eq(t, "codexRecordID "+id, codexRecordID(id), want)
+	}
+}
+
+// Owner decision 2026-11-04: the catch-up uses a 120-day window per record.
+// Unproven records older than the window are passed over (not posted); a
+// closed conversation gets no catch-up and stays at its old position.
+func TestCatchUpWindowAndClosed(t *testing.T) {
+	r := newRollout()
+	r.ts = "2029-06-01T00:00:00Z" // 214 days before testNow
+	r.line("session_meta", map[string]any{"id": s001Thread, "originator": "codex_cli_rs", "source": "cli"})
+	r.turn("ta")
+	r.user("u1", "old local")
+	r.final("f1", "old answer")
+	r.done("ta", "old answer")
+	r.ts = "2029-12-31T00:00:00Z"
+	r.turn("tb")
+	r.user("u2", "recent local")
+	r.final("f2", "recent answer")
+	r.done("tb", "recent answer")
+	sessions, path := writeRollout(t, r)
+
+	t.Run("old records passed over", func(t *testing.T) {
+		dir := fixture(t, "rc59", "json")
+		editJSON(t, dir, positions(path, r.ends[9], 9, r.ends[9], 9, nil)) // no proof
+		rep, db := dryRun(t, dir, func(o *Options) { o.CodexSessions, o.CountBacklog = sessions, true })
+		if !rep.OK() {
+			t.Fatalf("checks: %+v", rep.Checks)
+		}
+		eq(t, "s001 source", qs(t, db, sourceQ, "%"+s001Thread+".jsonl"), "tracking@"+strconv.FormatInt(r.ends[4], 10)+":4")
+		eq(t, "skipped old", rep.Backlog.SkippedOld, 2)
+		eq(t, "catch-up", rep.Backlog.Prompts+rep.Backlog.Finals, 2)
+		eq(t, "no-proof row skip", rep.Resume[0].SkipOld, 2)
+	})
+
+	t.Run("without --count-backlog the scan still reaches the window", func(t *testing.T) {
+		dir := fixture(t, "rc59", "json")
+		editJSON(t, dir, positions(path, r.ends[2], 2, 0, 0, nil)) // old position before the old turn
+		_, db := dryRun(t, dir, func(o *Options) { o.CodexSessions = sessions })
+		eq(t, "s001 source", qs(t, db, sourceQ, "%"+s001Thread+".jsonl"), "tracking@"+strconv.FormatInt(r.ends[4], 10)+":4")
+	})
+
+	t.Run("closed conversation", func(t *testing.T) {
+		dir := fixture(t, "rc59", "json")
+		editJSON(t, dir, positions(path, r.ends[2], 2, 0, 0, nil))
+		editJSON(t, dir, func(m map[string]any) {
+			m["sessions"].(map[string]any)["s001"].(map[string]any)["status"] = "closed"
+		})
+		rep, db := dryRun(t, dir, func(o *Options) { o.CodexSessions, o.CountBacklog = sessions, true })
+		if !rep.OK() {
+			t.Fatalf("checks: %+v", rep.Checks)
+		}
+		eq(t, "s001 source", qs(t, db, sourceQ, "%"+s001Thread+".jsonl"), "baseline@"+strconv.FormatInt(r.ends[2], 10)+":2")
+		eq(t, "closed sources", rep.Backlog.ClosedSources, 1)
+		eq(t, "skipped closed", rep.Backlog.SkippedClosed, 2)
+		eq(t, "skipped old", rep.Backlog.SkippedOld, 2)
+		eq(t, "no catch-up", rep.Backlog.Prompts+rep.Backlog.Finals, 0)
+	})
+}
+
+// legacy-<16 hex> turn keys cannot collide with keys the core creates
+// ('<turn_key_prefix>-<n>', prefix 'cxp-<scope8>', or 'cxp-<8 hex>' on a fresh store).
+func TestLegacyTurnKeysDisjoint(t *testing.T) {
+	_, db := dryRun(t, fixture(t, "rc59", "json"), nil)
+	legacy := regexp.MustCompile(`^legacy-[0-9a-f]{16}$`)
+	rows, err := db.Query(`SELECT turn_key FROM turns`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	n := 0
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			t.Fatal(err)
+		}
+		n++
+		if !legacy.MatchString(k) {
+			t.Errorf("turn key %q is not legacy-<16 hex>", k)
+		}
+	}
+	if n == 0 {
+		t.Fatal("no turns")
+	}
+	prefix := qs(t, db, `SELECT value FROM meta WHERE key = ?`, store.MetaTurnKeyPrefix)
+	if !strings.HasPrefix(prefix, "cxp-") {
+		t.Fatalf("turn key prefix %q", prefix)
+	}
+	if legacy.MatchString(prefix+"-1") || strings.HasPrefix(prefix, "legacy-") {
+		t.Fatal("new turn keys could collide with legacy keys")
 	}
 }
