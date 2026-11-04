@@ -316,6 +316,10 @@ func TestPromptIsAckedAnsweredOnceAndControlMentioned(t *testing.T) {
 	if n := len(r.own(work, "Request accepted")); n != 2 {
 		t.Fatalf("%d acks", n)
 	}
+	// The ACK reads as v0.1.20's (fidelity run).
+	if n := len(r.own(work, "⏳ Codex is working. Request accepted.")); n != 2 {
+		t.Fatalf("%d acks with the v0.1.20 text", n)
+	}
 	if r.ag.calls("hello one") != 1 || r.ag.calls("hello two") != 1 {
 		t.Fatalf("calls %+v", r.ag.runs)
 	}
