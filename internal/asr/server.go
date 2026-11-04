@@ -42,13 +42,14 @@ type llamaServer struct {
 
 // serverArgs sizes the server for one voice message at a time: MaxThreads
 // threads, a 2048-token context (60 s of sped-up audio is ~780 audio
-// tokens), one slot, no web UI, no warm-up.
+// tokens), one slot, two HTTP threads (not one per core), no web UI, no
+// warm-up.
 func serverArgs(p *paths, device, keyFile string, port int) []string {
 	args := []string{
 		"-m", p.model, "--mmproj", p.mmproj,
 		"--host", "127.0.0.1", "--port", strconv.Itoa(port), "--api-key-file", keyFile,
 		"-t", strconv.Itoa(MaxThreads), "-tb", strconv.Itoa(MaxThreads),
-		"-c", strconv.Itoa(contextTokens), "-np", "1", "--no-webui", "--no-warmup",
+		"-c", strconv.Itoa(contextTokens), "-np", "1", "--threads-http", "2", "--no-webui", "--no-warmup",
 	}
 	if device == "cpu" {
 		args = append(args, "--device", "none", "--no-mmproj-offload")

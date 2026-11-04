@@ -36,7 +36,7 @@ def main(server, model, mmproj, wav, expected):
         f.write(key)
     port = free_port()
     args = [server, "-m", model, "--mmproj", mmproj, "--host", "127.0.0.1", "--port", str(port),
-            "--api-key-file", keyfile, "-t", "4", "-tb", "4", "-c", "2048", "-np", "1",
+            "--api-key-file", keyfile, "-t", "4", "-tb", "4", "-c", "2048", "-np", "1", "--threads-http", "2",
             "--no-webui", "--no-warmup", "--device", "none", "--no-mmproj-offload"]
     env = {k: v for k, v in os.environ.items() if not k.startswith("LLAMA_ARG_")}
     log = open("llama-server-smoke.log", "w")

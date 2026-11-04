@@ -51,7 +51,7 @@ func TestParseASR(t *testing.T) {
 func TestServerArgs(t *testing.T) {
 	p := &paths{model: "m.gguf", mmproj: "p.gguf"}
 	cpu := strings.Join(serverArgs(p, "cpu", "k", 1234), " ")
-	for _, want := range []string{"-t 4 -tb 4", "-c 2048", "-np 1", "--port 1234", "--host 127.0.0.1", "--device none --no-mmproj-offload", "--no-webui"} {
+	for _, want := range []string{"-t 4 -tb 4", "-c 2048", "-np 1 --threads-http 2", "--port 1234", "--host 127.0.0.1", "--device none --no-mmproj-offload", "--no-webui"} {
 		if !strings.Contains(cpu, want) {
 			t.Fatalf("cpu args %q lack %q", cpu, want)
 		}
