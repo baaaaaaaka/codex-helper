@@ -23,8 +23,12 @@ Definitions (see FIDELITY-REPORT.md):
      role=assistant phase=final_answer; else a task_complete
      last_agent_message of a turn without one), CORE-DESIGN section 5.
   posted-by-old: the record's text appears in what the old core put into
-     that chat: a sent outbox row (any kind) or, for a prompt, a Teams
-     inbound message of the chat (a Teams-run turn's own prompt).
+     that chat: a sent outbox row (any kind); for a prompt, a Teams inbound
+     message of the chat that starts with it and that the old core ignored
+     or labelled "User" (its own post read back); for a final, a "Codex answer"
+     post the old helper read back (inbound, label stripped).
+  closed conversations are baselined at their old position by owner
+     decision 2026-11-04: records skipped there are "skip:closed-conversation".
 """
 import argparse
 import bisect
@@ -38,6 +42,7 @@ import sqlite3
 import sys
 
 WORD = re.compile(r"[^\w]+", re.UNICODE)
+ECHO_LABEL = re.compile(r"^(🧑‍💻 User|🤖 ✅ Codex answer|🤖 ⏳ Codex status|🔧 Helper)( \[part \d+/\d+\])?:\s*")
 TAG = re.compile(r"<[^>]+>")
 
 
@@ -208,12 +213,22 @@ def main():
         if "<p>" in b or "<strong>" in b:
             b = strip_html(b)
         chat_text[chat].append(norm(b))
-    chat_in = collections.defaultdict(list)
-    for chat, j in old.execute("select teams_chat_id, json from inbound_events"):
-        t = jload(j).get("text") or ""
-        n = norm(t)
-        if n:
+    chat_in = collections.defaultdict(list)    # prompts: unlabelled or "User"
+    chat_echo = collections.defaultdict(list)  # finals: "Codex answer" read back
+    for chat, st, j in old.execute("select teams_chat_id, status, json from inbound_events"):
+        d = jload(j)
+        t = (d.get("text") or "").strip()
+        m = ECHO_LABEL.match(t)
+        n = norm(t[m.end():] if m else t)
+        if not n:
+            continue
+        # an unlabelled message the old core queued or ran was typed by the
+        # owner (its turn is a Teams turn, classed by turn id); one it
+        # ignored is its own post read back (or an ignored owner message)
+        if (not m and (d.get("status") or st) == "ignored") or (m and m.group(1) == "🧑‍💻 User"):
             chat_in[chat].append(n)
+        elif m and m.group(1) == "🤖 ✅ Codex answer":
+            chat_echo[chat].append(n)
     chat_blob = {c: "\x00".join(v) for c, v in chat_text.items()}
 
     # ---- core.sqlite ----
@@ -271,6 +286,8 @@ def main():
         teams_ids = set(all_teams_turns)
         blob = chat_blob.get(chat, "")
         inb = chat_in.get(chat, [])
+        ech = chat_echo.get(chat, [])
+        closed = conv_state.get(conv) == "closed"
 
         def posted(r):
             # the same answer text was delivered earlier in the turn (an agent_message
@@ -288,9 +305,13 @@ def main():
             if blob.count(pre) > k:
                 return "outbox"
             if r["kind"] == "prompt":
-                hits = sum(1 for t in inb if len(t) >= 12 and t[:80] in n)
+                hits = sum(1 for t in inb if len(t) >= 12 and n.startswith(t[:80]))
                 if hits > k:
                     return "inbound"
+            else:
+                hits = sum(1 for t in ech if len(t) >= 12 and n.startswith(t[:80]))
+                if hits > k:
+                    return "inbound-echo"
             return ""
 
         wrapped_turns = {r["turn"] for r in recs if r.get("wrapped") and r["turn"]}
@@ -299,7 +320,11 @@ def main():
         examples = collections.defaultdict(list)
         for r in recs:
             teams = r["turn"] in teams_ids or r["turn"] in wrapped_turns or r.get("wrapped")
-            keyed = (thread, r["id"]) in mirror_keys if r["id"] else False
+            # the record's mirror identity: its response-item id, else
+            # "t:<turn>:final" / "t:<turn>:prompt:<line>" (STORE-DESIGN mirror key)
+            rid = r["id"] or ("t:%s:final" % (r["turn"] or "?") if r["kind"] == "final"
+                              else "t:%s:prompt:%d" % (r["turn"] or "?", r["line"]))
+            keyed = (thread, rid) in mirror_keys
             old = r["ts"] and r["ts"] < cut_ms
             p = posted(r)
             # position classes
@@ -314,9 +339,11 @@ def main():
             if pos == "before-both":
                 continue
             if pos == "skipped-by-R":
-                if old:
+                if closed:
+                    c = "skip:closed-conversation"
+                elif old:
                     c = "skip:older-than-120d"
-                elif p in ("outbox", "inbound", "delivered-as-earlier-record"):
+                elif p in ("outbox", "inbound", "inbound-echo", "delivered-as-earlier-record"):
                     c = "skip:posted-by-old"
                 elif teams:
                     c = "skip:teams-turn"
@@ -332,7 +359,7 @@ def main():
                     c = "read:older-than-120d"
                 elif teams:
                     c = "read:teams-turn(skipped)"
-                elif p in ("outbox", "inbound", "delivered-as-earlier-record"):
+                elif p in ("outbox", "inbound", "inbound-echo", "delivered-as-earlier-record"):
                     c = "DUP:posted-by-old-and-will-repost"
                 elif p == "short":
                     c = "read:short-unverifiable"
