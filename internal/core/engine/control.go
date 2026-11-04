@@ -136,6 +136,9 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 	if state != store.ConvCreating || retry {
 		return false
 	}
+	if v, _, err := e.st.Meta(discoveredKey(id)); err != nil || v == discoveredPending {
+		return false // a discovered session with nothing to mirror yet: no chat
+	}
 	key := fmt.Sprintf("conv-%s-%d", e.prefix, id)
 	if kind == store.KindControl {
 		key = "control-" + e.prefix
@@ -169,11 +172,9 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 				return err
 			}
 		case discovered != "":
-			// A local session found on disk: v0.1.20's one notice in its
-			// work chat, nothing in the control chat.
-			if err := e.enqueueNotice(tx, id, "ready:"+label, textLocalDetected(label)); err != nil {
-				return err
-			}
+			// A local session found on disk: its one notice in its work
+			// chat is queued with its first records (mirrorRead); nothing
+			// goes to the control chat.
 			if err := tx.SetMeta(discoveredKey(id), ""); err != nil {
 				return err
 			}

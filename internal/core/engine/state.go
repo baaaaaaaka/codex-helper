@@ -20,8 +20,13 @@ const (
 	metaInbox          = "engine_inbox_conv"      // conversation id of the delegation inbox
 	// metaDiscoveredPrefix + conversation id: a work conversation the
 	// mirror created for a local session discovered on disk, until its
-	// chat is created (no `new` notices, no control-chat notice).
+	// chat is created (no `new` notices, no control-chat notice):
+	// discoveredPending while the session has nothing to mirror (no chat
+	// yet, as v0.1.20 skipped empty sessions), discoveredReady once its
+	// notice and first records are queued.
 	metaDiscoveredPrefix = "engine_discovered:"
+	discoveredPending    = "pending"
+	discoveredReady      = "ready"
 )
 
 // Visible labels, as v0.1.20 posted them (fidelity run): helper notices,

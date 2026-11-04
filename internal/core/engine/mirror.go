@@ -655,7 +655,7 @@ func (e *Engine) mirrorSession(ctx context.Context, src store.TranscriptSource, 
 		if src.ID, err = tx.UpsertSource(src); err != nil {
 			return err
 		}
-		if err := tx.SetMeta(discoveredKey(id), "1"); err != nil {
+		if err := tx.SetMeta(discoveredKey(id), discoveredPending); err != nil {
 			return err
 		}
 		_, err = e.refresh(tx, id)
@@ -676,12 +676,8 @@ func (e *Engine) mirrorSession(ctx context.Context, src store.TranscriptSource, 
 	delete(e.mirror.checked, src.Path)
 	e.mirror.files[src.Path] = &mirrorFile{src: src, tracker: transcript.NewTracker(meta.ID, offset, src.Line, e.mirrorSkip)}
 	e.mirror.mu.Unlock()
+	// The chat is created with the first record to mirror (mirrorRead).
 	e.logf("mirroring local session %s as %s", meta.ID, label)
-	e.wg.Add(1)
-	go func() {
-		defer e.wg.Done()
-		e.createChat(ctx, id)
-	}()
 }
 
 func oneLine(s string, n int) string {
@@ -851,10 +847,17 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 	if off == 0 && f.src.Offset > 0 {
 		off = 1 // the store never moves a source back to 0; 1 re-aligns to line 2
 	}
-	woke := false
+	woke, created := false, false
+	e.mu.Lock()
+	var label string
+	creating := false
+	if cs := e.convs[f.src.ConvID]; cs != nil {
+		label, creating = cs.label, cs.state == store.ConvCreating
+	}
+	e.mu.Unlock()
 	var posted int
 	err = e.update(func(tx *store.Tx) error {
-		posted, woke = 0, false
+		posted, woke, created = 0, false, false
 		var msgs []store.OutMsg
 		start := 0
 		if realign {
@@ -898,6 +901,24 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 				return err
 			}
 		}
+		if posted > 0 && creating {
+			// A discovered session's first records: its notice goes first,
+			// then its chat is created (v0.1.20: no chat for an empty
+			// session).
+			v, _, err := tx.Meta(discoveredKey(f.src.ConvID))
+			if err != nil {
+				return err
+			}
+			if v == discoveredPending {
+				if err := e.enqueueNotice(tx, f.src.ConvID, "ready:"+label, textLocalDetected(label)); err != nil {
+					return err
+				}
+				if err := tx.SetMeta(discoveredKey(f.src.ConvID), discoveredReady); err != nil {
+					return err
+				}
+				created = true
+			}
+		}
 		if posted > 0 || info.Size > f.src.Size {
 			c, ok, err := tx.Conversation(f.src.ConvID)
 			if err != nil {
@@ -922,6 +943,13 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 	f.realign, f.realignAt = realign && more, realignAt
 	if !more {
 		f.info = info
+	}
+	if created {
+		e.wg.Add(1)
+		go func() {
+			defer e.wg.Done()
+			e.createChat(ctx, f.src.ConvID)
+		}()
 	}
 	if woke {
 		_ = e.update(func(tx *store.Tx) error { _, err := e.refresh(tx, f.src.ConvID); return err })

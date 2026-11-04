@@ -87,3 +87,37 @@ func TestProjectLabel(t *testing.T) {
 		}
 	}
 }
+
+// v0.1.20 filterEmptySessions: a discovered session with nothing to mirror
+// gets no chat (it used to get one at once, with only the notice in it, as
+// for s598). Its chat comes with its first record, the notice first.
+func TestEmptyDiscoveredSessionGetsNoChatUntilItsFirstRecord(t *testing.T) {
+	r, sessions := mirrorRig(t)
+	w, err := rollout.New(sessions, t.TempDir(), rollout.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.wait("session tracked", func() bool {
+		srcs, _ := r.st.Sources()
+		for _, s := range srcs {
+			if s.ConvID != 0 {
+				return true
+			}
+		}
+		return false
+	})
+	time.Sleep(time.Second) // several stat, discovery and maintenance ticks
+	if chat := r.chatOf("s001"); chat != "" {
+		t.Fatalf("empty session got chat %s: %+v", chat, r.own(chat, ""))
+	}
+	if _, err := w.AppendTurn(rollout.Turn{Prompt: "first prompt", Answer: "first answer"}); err != nil {
+		t.Fatal(err)
+	}
+	chat := r.localChat()
+	r.wait("records mirrored", func() bool { return len(r.own(chat, "first answer")) == 1 })
+	got := r.own(chat, "")
+	if len(got) != 3 || got[0].Text != "🔧 Helper:\nLocal Codex chat detected: s001." ||
+		!strings.Contains(got[1].Text, "first prompt") || !strings.Contains(got[2].Text, "first answer") {
+		t.Fatalf("chat: %+v", got)
+	}
+}
