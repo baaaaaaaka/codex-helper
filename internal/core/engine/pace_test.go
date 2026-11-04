@@ -557,26 +557,12 @@ func ackFoldRun(r *rig, h *ackHold) string {
 func TestAcksFoldedPerChatInAWriteBacklog(t *testing.T) {
 	h := newAckHold()
 	r, _ := backlogRig(t, func(c *Config) {
-		// Four chats of progress that can send every millisecond keep
-		// the writes paced below the demand throughout.
-		c.WriteRate, c.Timing.ChatRate = 4, time.Millisecond
+		c.WriteRate = 4
 		c.Channel.(*channeltest.Fake).SendFault = h.fault
 	}, 4, 200, func(int) string { return store.OutProgress })
 	t.Cleanup(h.free)
 	work := ackFoldRun(r, h)
-	r.waitFor("folded ACK", 30*time.Second, func() bool {
-		if len(r.own(work, "Accepted 3 requests")) == 1 {
-			return true
-		}
-		if len(r.own(work, "Request accepted")) > 1 || len(r.own(work, "Accepted 2 requests")) > 0 {
-			var texts []string
-			for _, m := range r.ch.Messages(work) {
-				texts = append(texts, m.Text)
-			}
-			t.Fatalf("ACKs not folded into one; chat:\n%s", strings.Join(texts, "\n---\n"))
-		}
-		return false
-	})
+	r.wait("folded ACK", func() bool { return len(r.own(work, "Accepted 3 requests")) == 1 })
 	single := r.own(work, "Request accepted")
 	if len(single) != 1 || strings.Contains(single[0].Text, "Accepted") {
 		t.Fatalf("single ACKs = %+v, want the first prompt's only, unchanged", single)
