@@ -403,12 +403,16 @@ func (c *converter) importSource(p *pathInfo) error {
 	case scanned:
 		rs := c.decideResume(p, size)
 		src.Offset, src.Line = rs.off, rs.line
-		c.reportResume(p, rs, size, false, 0)
-		n, err := c.echoProof(p, rs, src.ThreadID)
+		proven, err := c.echoProof(p, rs, src.ThreadID)
 		if err != nil {
 			return err
 		}
-		if n > 0 {
+		// What the old helper's echo proves posted is not caught up: the
+		// backlog (the summary's count) leaves it out, as the engine will.
+		rs.backlog[0] -= proven[0]
+		rs.backlog[1] -= proven[1]
+		c.reportResume(p, rs, size, false, 0)
+		if n := proven[0] + proven[1]; n > 0 {
 			b["linked tracking: records proven posted by the old helper's own echo -> delivered (not mirrored again)"] += n
 		}
 	default:
