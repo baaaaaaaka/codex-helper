@@ -459,4 +459,10 @@ func TestEchoProof(t *testing.T) {
 		eq(t, id+" delivered", qi(t, db, `SELECT count(*) FROM outbox WHERE delivery_key = ? AND state = 'sent'`, MirrorKey(s001Thread, id, 1)), want)
 	}
 	eq(t, "bucket", rep.Buckets["linked tracking: records proven posted by the old helper's own echo -> delivered (not mirrored again)"], 2)
+	// The summary counts what will be posted: the proven records are not.
+	eq(t, "catch-up prompts", rep.Backlog.Prompts, 2)
+	eq(t, "catch-up finals", rep.Backlog.Finals, 2)
+	if sum := qs(t, db, `SELECT value FROM meta WHERE key = ?`, store.MetaMigrationSummary); !strings.Contains(sum, "Catch-up of local Codex sessions: 4 prompts and answers from 1 session (") {
+		t.Fatalf("summary: %s", sum)
+	}
 }

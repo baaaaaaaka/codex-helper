@@ -90,13 +90,13 @@ func echoKey(text string) string {
 // conversation proves posted: each echo proves one record of its kind with
 // the same key that it was received after, in file order (scanned records
 // before rs.off consume their echoes too, so a repeated text is proven only
-// as often as it was echoed). Returns the number marked.
-func (c *converter) echoProof(p *pathInfo, rs resume, thread string) (int, error) {
+// as often as it was echoed). Returns the number marked: prompts, finals.
+func (c *converter) echoProof(p *pathInfo, rs resume, thread string) ([2]int, error) {
+	var n [2]int
 	echoes := c.echoes[p.conv]
 	if len(echoes) == 0 || thread == "" || p.scan == nil {
-		return 0, nil
+		return n, nil
 	}
-	n := 0
 	for _, r := range p.scan.Recs {
 		if r.Key == "" {
 			continue
@@ -114,7 +114,11 @@ func (c *converter) echoProof(p *pathInfo, rs resume, thread string) (int, error
 			if err := c.sentMirror(p.conv, key, e.ext, e.at); err != nil {
 				return n, err
 			}
-			n++
+			if e.final {
+				n[1]++
+			} else {
+				n[0]++
+			}
 			break
 		}
 	}
