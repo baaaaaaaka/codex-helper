@@ -8,6 +8,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/channel"
@@ -541,7 +542,7 @@ func (e *Engine) mentionNotice(turnID int64, cs *convState) ([]store.OutMsg, err
 
 // internalRE matches ids and paths that must not reach a chat: UUIDs,
 // Teams chat and message ids, Codex item ids and absolute paths.
-var internalRE = regexp.MustCompile(`(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|19:[^\s"']+|\b(?:msg|turn|thread|rs|call)_[A-Za-z0-9]+|(?:[A-Za-z]:)?(?:/[^\s/"':]+){2,}/?`)
+var internalRE = regexp.MustCompile(`(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|19:[^\s"']+|\b(?:msg|turn|thread|rs|call)_[A-Za-z0-9]+|(?:[A-Za-z]:)?(?:/[^\s/"':]+){2,}/?|(?:\b[A-Za-z]:|\\\\[^\s\\"']+)\\[^\s"']*`)
 
 // userError makes an error text fit for a chat: one line, no internal ids
 // or paths.
@@ -726,9 +727,18 @@ const (
 	progressCoalesceFor = 5 * time.Minute
 )
 
-type progressState struct{ posted int }
+// progressState counts one turn's progress messages. Progress callbacks can
+// come from more than one goroutine (the agent's reader and its replay of
+// early items), so mu serializes them: each message gets its own delivery
+// key, in callback order.
+type progressState struct {
+	mu     sync.Mutex
+	posted int
+}
 
 func (e *Engine) progress(ctx context.Context, cs *convState, tr store.Turn, ps *progressState, text string) {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
 	text = strings.TrimSpace(text)
 	e.mu.Lock()
 	group := cs.group

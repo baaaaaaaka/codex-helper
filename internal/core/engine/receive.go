@@ -480,7 +480,9 @@ func (e *Engine) classify(tx *store.Tx, conv int64, kind string, group bool, m c
 		c.other = true
 		c.in.Sender = store.SenderOther
 		c.quoteID = m.ID
-		if m.MentionsOwner || strings.Contains(strings.ToLower(m.Text), "@codex") {
+		// The control chat and the delegation inbox ignore non-owners, even
+		// when they mention Codex (R-27).
+		if kind != store.KindControl && conv != e.inboxID && (m.MentionsOwner || strings.Contains(strings.ToLower(m.Text), "@codex")) {
 			return c, true, nil
 		}
 		c.in.Kind, c.chatter = store.InCommand, true
@@ -528,11 +530,21 @@ func (e *Engine) classify(tx *store.Tx, conv int64, kind string, group bool, m c
 		c.in.Kind = store.InCommand
 		return c, true, nil
 	}
-	if group && !strings.Contains(strings.ToLower(text), "@codex") {
-		// With other people in the chat only @codex addresses Codex.
+	if group && !strings.Contains(strings.ToLower(text), "@codex") && !hasVoice(m.Files) {
+		// With other people in the chat only @codex, or a voice or video
+		// clip from the owner, addresses Codex.
 		c.in.Kind, c.chatter = store.InCommand, true
 	}
 	return c, true, nil
+}
+
+func hasVoice(files []channel.FileRef) bool {
+	for _, f := range files {
+		if f.Kind == channel.FileVoice {
+			return true
+		}
+	}
+	return false
 }
 
 func hashBytes(h string) []byte {
