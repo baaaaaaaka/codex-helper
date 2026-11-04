@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/core/delegate/machineregistry"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakegraph"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/harness"
 )
@@ -168,12 +169,15 @@ func TestShadowRealData(t *testing.T) {
 	mark := shadowSeq(s)
 	isamples := sampleCPU(pid, idle, nil)
 	isum := summarizeCPU(isamples)
-	iw, ir := shadowRequests(s, mark)
+	iw, ir, ih := shadowRequests(s, mark)
 	phases["idle_s"] = idle.Seconds()
 	phases["idle_writes"] = iw
 	phases["idle_reads"] = ir
+	phases["idle_heartbeats"] = ih
 	phases["idle_cpu"] = map[string]any{"mean_pct": isum.mean, "p99_pct": isum.p99, "max_pct": isum.max, "total_cpu_s": isum.totalSec}
 	s.Check("no write in the idle window after the drain", len(iw) == 0, "0", fmt.Sprint(iw))
+	s.Check("idle: registry heartbeats only at the heartbeat rate", ih <= shadowHeartbeatsMax(idle, 0),
+		fmt.Sprintf("<= %d", shadowHeartbeatsMax(idle, 0)), fmt.Sprint(ih))
 	s.Note("idle %s: reads %v; CPU mean %.3f%% max %.1f%%", idle, ir, isum.mean, isum.max)
 
 	if mode == "full" {
@@ -182,10 +186,13 @@ func TestShadowRealData(t *testing.T) {
 		mark = shadowSeq(s)
 		s.StartSUT()
 		time.Sleep(3 * time.Minute)
-		rw, rr := shadowRequests(s, mark)
+		rw, rr, rh := shadowRequests(s, mark)
 		phases["restart_writes"] = rw
 		phases["restart_reads"] = rr
+		phases["restart_heartbeats"] = rh
 		s.Check("no write in 3 min after a restart", len(rw) == 0, "0", fmt.Sprint(rw))
+		s.Check("restart: registry heartbeats only at the heartbeat rate", rh <= shadowHeartbeatsMax(3*time.Minute, 1),
+			fmt.Sprintf("<= %d", shadowHeartbeatsMax(3*time.Minute, 1)), fmt.Sprint(rh))
 	}
 	s.StopSUT()
 
@@ -317,19 +324,42 @@ func shadowSeq(s *harness.Scenario) int64 {
 
 // shadowRequests counts the Graph requests after seq: writes (any non-GET
 // to Graph) by route, reads by route.
-func shadowRequests(s *harness.Scenario, since int64) (writes, reads map[string]int) {
+// shadowRegistryTopic is the machine registry inbox. Its card is edited
+// in place once per heartbeat (machineregistry.DefaultHeartbeatInterval,
+// as in the old helper), plus once when an instance starts or stops.
+const shadowRegistryTopic = "CXP Machine Registry"
+
+// shadowRequests splits the Graph requests since a mark into writes and
+// reads by route. Edits of the registry card are counted apart, as
+// heartbeats: they are the only write expected once the catch-up is done.
+func shadowRequests(s *harness.Scenario, since int64) (writes, reads map[string]int, heartbeats int) {
 	writes, reads = map[string]int{}, map[string]int{}
+	registry := map[string]bool{}
+	for _, c := range s.Graph.Chats() {
+		if c.Topic == shadowRegistryTopic {
+			registry[c.ID] = true
+		}
+	}
 	for _, r := range s.Graph.Requests(fakegraph.RequestFilter{Since: since}) {
 		if strings.Contains(r.Host, "login.") {
 			continue
 		}
-		if r.Method == "GET" {
+		switch {
+		case r.Method == "GET":
 			reads[r.Route]++
-		} else {
+		case r.Method == "PATCH" && r.Route == "PATCH /chats/{chat}/messages/{message}" && registry[r.ChatID]:
+			heartbeats++
+		default:
 			writes[r.Route]++
 		}
 	}
-	return writes, reads
+	return writes, reads, heartbeats
+}
+
+// shadowHeartbeatsMax: one card edit per heartbeat interval in the window,
+// plus one for each instance start and stop.
+func shadowHeartbeatsMax(window time.Duration, restarts int) int {
+	return int(window/machineregistry.DefaultHeartbeatInterval) + 1 + 2*restarts
 }
 
 // shadowDrained: nothing queued in the outbox, every tracked rollout read

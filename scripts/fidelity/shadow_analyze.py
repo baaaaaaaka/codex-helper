@@ -45,7 +45,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from checkpoint_oracle import scan_rollout, OLD_WRAPPER  # noqa: E402
 
 NONLETTER = re.compile(r"[\W\d_]+", re.UNICODE)
-LABEL = re.compile(r"^\s*(?:User|Codex|🔧 Helper|🤖[^:]*)(?: \[part \d+/\d+\])?:\s*")
+# A part header ("Codex [part 1/2]:", or an unlabelled " [part 1/2]:" as
+# split prompts had before 2026-11-05), then possibly an inline "User:".
+LABEL = re.compile(r"^\s*(?:(?:User|Codex|🔧 Helper|🤖[^:]*)(?: \[part \d+/\d+\])?|\[part \d+/\d+\]):\s*")
+USER = re.compile(r"^\s*(?:\[part \d+/\d+\]:\s*)?User(?: \[part \d+/\d+\])?:")
 TAG = re.compile(r"<[^>]+>")
 EXPECT_CLASSES = ("post:", "read:short-unverifiable", "DUP:")
 
@@ -89,11 +92,16 @@ def load_run(run, messages="messages-final.jsonl"):
         convs[cid] = dict(id=cid, label=label, chat=chat, state=state, kind=kind)
     by_chat = {c["chat"]: c for c in convs.values() if c["chat"]}
     out = {}
-    for cid, kind, key, part, parts, state, ext, sent in db.execute(
-            "select conv_id, kind, delivery_key, part, parts, state, ext_msg_id, sent_at from outbox"):
+    meta0 = dict(db.execute("select key, value from meta").fetchall())
+    migrated = int(meta0.get("migrated_at") or 0)
+    for cid, kind, key, part, parts, state, ext, sent, created in db.execute(
+            "select conv_id, kind, delivery_key, part, parts, state, ext_msg_id, sent_at, created_at from outbox"):
         if ext:
-            out[(convs[cid]["chat"], ext)] = dict(conv=cid, kind=kind, key=key, part=part, parts=parts, state=state, sent=sent)
-    outbox_states = collections.Counter(r[0] for r in db.execute("select state from outbox"))
+            out[(convs[cid]["chat"], ext)] = dict(conv=cid, kind=kind, key=key, part=part, parts=parts, state=state, sent=sent,
+                                                  run=created > migrated)
+    # rows created by the run (the converter's imported rows are older)
+    outbox_states = collections.Counter(r[0] for r in db.execute("select state from outbox where created_at > ?", (migrated,)))
+    imported_states = collections.Counter(r[0] for r in db.execute("select state from outbox where created_at <= ?", (migrated,)))
     sources = {}
     for path, conv, state, off, size in db.execute("select path, conv_id, state, offset, size from transcript_sources"):
         sources[path] = dict(conv=conv, state=state, offset=off, size=size)
@@ -101,7 +109,8 @@ def load_run(run, messages="messages-final.jsonl"):
     db.close()
     shutil.rmtree(tmp, ignore_errors=True)
     msgs = list(jl(os.path.join(run, messages)))
-    return dict(convs=convs, by_chat=by_chat, outbox=out, outbox_states=outbox_states, sources=sources, meta=meta, msgs=msgs)
+    return dict(convs=convs, by_chat=by_chat, outbox=out, outbox_states=outbox_states, imported_states=imported_states,
+                sources=sources, meta=meta, msgs=msgs)
 
 
 def logical(run):
@@ -124,9 +133,9 @@ def logical(run):
         g["parts"].append((part, m))
     for (chat, _), g in groups.items():
         g["parts"].sort(key=lambda x: x[0])
-        texts = [LABEL.sub("", visible(m)) for _, m in g["parts"]]
+        texts = [LABEL.sub("", LABEL.sub("", visible(m), count=1), count=1) for _, m in g["parts"]]
         g["text"] = "\n".join(texts)
-        g["user"] = visible(g["parts"][0][1]).lstrip().startswith("User:")
+        g["user"] = bool(USER.match(visible(g["parts"][0][1])))
         g["n_parts"] = len(g["parts"])
         g["patched"] = sum(m.get("patches", 0) for _, m in g["parts"])
         per[chat].append(g)
@@ -370,8 +379,12 @@ def main():
         if res["dup"]:
             row["dup_examples"] = [dict(user=mirror[j]["user"], text=mirror[j]["text"][:160]) for j in res["dup"][:5]]
         # the same content twice in a chat beyond the history's own repeats
+        # A posted message matched (exactly or fuzzily) to a record counts
+        # under that record's key, so a repeated record posted once per
+        # occurrence is not a repeat.
         ek = collections.Counter((r["user"], r["key"]) for r in e)
-        pk = collections.Counter((g["user"], letters(g["text"])) for g in mirror)
+        gkey = {j: (e[i]["user"], e[i]["key"]) for i, j in enumerate(res["used"]) if j is not None}
+        pk = collections.Counter(gkey.get(j, (g["user"], letters(g["text"]))) for j, g in enumerate(mirror))
         row["repeat_beyond_history"] = sum(max(0, n - max(1, ek.get(k, 0))) for k, n in pk.items())
         ok = collections.Counter(letters(g["text"]) for g in other)
         row["notice_repeats"] = {k[:60]: n for k, n in ok.items() if n > 1}
@@ -384,10 +397,11 @@ def main():
 
     # ---- integrity: Graph vs the store's outbox ----
     graph_ids = {(m["chat"], m["id"]) for m in run["msgs"]}
-    sent_rows = {k for k, v in run["outbox"].items() if v["state"] == "sent"}
+    sent_rows = {k for k, v in run["outbox"].items() if v["state"] == "sent" and v["run"]}
     integrity = dict(graph_messages=len(graph_ids), outbox_sent_with_id=len(sent_rows),
                      graph_not_in_outbox=len(orphans), sent_not_in_graph=len(sent_rows - graph_ids),
-                     outbox_states=dict(run["outbox_states"]))
+                     orphan_examples=[dict(chat=m["chat"], topic=m.get("topic"), text=visible(m)[:120]) for m in orphans[:5]],
+                     outbox_states=dict(run["outbox_states"]), imported_outbox_states=dict(run["imported_states"]))
 
     # ---- pacing ----
     posts = [w["at"] for w in jl(os.path.join(a.run, "writes.jsonl")) if w.get("route") == "POST /chats/{chat}/messages"]
