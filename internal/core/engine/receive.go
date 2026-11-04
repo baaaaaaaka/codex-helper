@@ -617,9 +617,7 @@ func (e *Engine) scanLoop(ctx context.Context) {
 		if until := e.gate(gateAccountRead); now.Before(until) {
 			continue
 		}
-		if ok, _ := e.readTokens.take(); !ok {
-			continue
-		}
+		e.readTokens.borrow()
 		acts, err := e.scanner.ScanActivity(ctx, mark.Add(-scanOverlap))
 		e.count(func(s *engineStats) { s.reads++ })
 		if ctx.Err() != nil {

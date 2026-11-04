@@ -90,6 +90,18 @@ func newBucket(rate, burst float64, now func() time.Time) *bucket {
 	return &bucket{rate: rate, burst: burst, tokens: burst, last: now(), now: now}
 }
 
+// borrow takes one token even when the bucket is empty (down to -burst):
+// for the read that serves every chat at once (the activity scan), which
+// must not lose to per-chat reads; the debt delays those instead.
+func (b *bucket) borrow() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := b.now()
+	b.tokens = math.Min(b.burst, b.tokens+now.Sub(b.last).Seconds()*b.rate)
+	b.last = now
+	b.tokens = math.Max(-b.burst, b.tokens-1)
+}
+
 // take takes one token; it returns false (and how long to wait) when empty.
 func (b *bucket) take() (bool, time.Duration) {
 	b.mu.Lock()
