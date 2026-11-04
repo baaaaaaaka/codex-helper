@@ -45,6 +45,9 @@ const (
 	EnvInterval        = "E2E_SUT_INTERVAL"
 	EnvCodexBin        = "E2E_SUT_CODEX_BIN"
 	EnvMachineRegistry = "E2E_SUT_MACHINE_REGISTRY"
+	// EnvProductionTiming=1 keeps production timing defaults that the
+	// harness otherwise shortens (used by the cost scenarios).
+	EnvProductionTiming = "E2E_SUT_PRODUCTION_TIMING"
 )
 
 // BlockedPrefix starts the stderr line reporting a refused foreign request.
@@ -110,6 +113,11 @@ func run() error {
 		ControlFallbackExecutor: control,
 		TranscriptSyncInterval:  interval,
 		AsyncTurnShutdownGrace:  2 * time.Second,
+	}
+	if os.Getenv(EnvProductionTiming) == "1" {
+		// Leave the transcript sync interval at the production default
+		// (`cxp teams run` does not set it) for cost measurements.
+		opts.TranscriptSyncInterval = 0
 	}
 	if os.Getenv(EnvMachineRegistry) == "1" {
 		registryAuth := teams.NewAuthManagerWithHTTPClient(authCfg, client)

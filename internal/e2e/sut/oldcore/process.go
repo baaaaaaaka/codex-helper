@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -129,15 +130,43 @@ func (s *ProcSUT) Pid() int {
 	return s.cur.cmd.Process.Pid
 }
 
-// CPUTime is the user+system CPU time of the last exited helper process.
+// CPUTime is the user+system CPU time of the current helper process: read
+// from /proc while it runs (Linux), from its exit status once it exited.
 func (s *ProcSUT) CPUTime() time.Duration {
 	s.mu.Lock()
 	cur := s.cur
 	s.mu.Unlock()
-	if cur == nil || cur.cmd.ProcessState == nil {
+	if cur == nil || cur.cmd.Process == nil {
 		return 0
 	}
-	return cur.cmd.ProcessState.UserTime() + cur.cmd.ProcessState.SystemTime()
+	select {
+	case <-cur.done:
+		return cur.cmd.ProcessState.UserTime() + cur.cmd.ProcessState.SystemTime()
+	default:
+	}
+	return procCPUTime(cur.cmd.Process.Pid)
+}
+
+// procCPUTime reads utime+stime from /proc/<pid>/stat (USER_HZ = 100 on
+// every Linux the suite runs on).
+func procCPUTime(pid int) time.Duration {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0
+	}
+	// Fields after the parenthesised command name; utime and stime are
+	// fields 14 and 15 overall, i.e. 12 and 13 after the name.
+	rest := string(data)
+	if i := strings.LastIndexByte(rest, ')'); i >= 0 {
+		rest = rest[i+1:]
+	}
+	f := strings.Fields(rest)
+	if len(f) < 13 {
+		return 0
+	}
+	ut, _ := strconv.ParseInt(f[11], 10, 64)
+	st, _ := strconv.ParseInt(f[12], 10, 64)
+	return time.Duration(ut+st) * 10 * time.Millisecond
 }
 
 func (s *ProcSUT) childEnv(tag string) []string {
@@ -260,6 +289,17 @@ func (s *ProcSUT) signal(ctx context.Context, sig syscall.Signal) error {
 		return fmt.Errorf("oldcore: %s did not exit after %v: %w", inst.tag, sig, ctx.Err())
 	}
 	return nil
+}
+
+// DumpStacks makes the SUT print every goroutine (SIGQUIT) and exit, and
+// returns what it wrote from then on. It is a debugging aid: the SUT is
+// gone afterwards.
+func (s *ProcSUT) DumpStacks(ctx context.Context) string {
+	mark := len(s.out.String())
+	if err := s.signal(ctx, syscall.SIGQUIT); err != nil {
+		return err.Error()
+	}
+	return s.out.String()[mark:]
 }
 
 // Restart implements harness.SUT.

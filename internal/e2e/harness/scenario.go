@@ -395,6 +395,26 @@ func (s *Scenario) dumpGoroutines(reason string) {
 	}
 	s.T.Logf("GOROUTINE DUMP (%s): %d goroutines total, %d relevant\n%s", reason, len(stacks), len(keep), dump)
 	s.T.Logf("SUT OUTPUT TAIL:\n%s", s.OutputTail(6000))
+	// A subprocess SUT can dump its own goroutines, but that ends it, so
+	// only on request (E2E_SUT_STACKS=1) while debugging a hang.
+	if d, ok := s.SUT.(interface {
+		DumpStacks(context.Context) string
+	}); ok && os.Getenv("E2E_SUT_STACKS") == "1" {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		out := d.DumpStacks(ctx)
+		cancel()
+		var keep []string
+		for _, st := range strings.Split(out, "\n\n") {
+			if strings.Contains(st, "internal/teams") {
+				keep = append(keep, st)
+			}
+		}
+		dump := strings.Join(keep, "\n\n")
+		if len(dump) > 120000 {
+			dump = dump[:120000] + "\n…(truncated)"
+		}
+		s.T.Logf("SUT GOROUTINE DUMP (SIGQUIT; the SUT is gone now):\n%s", dump)
+	}
 }
 
 // ---------------------------------------------------------------------------
