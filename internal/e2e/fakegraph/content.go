@@ -75,6 +75,35 @@ func (s *Server) PostFileAsUser(chatID, text, name string, data []byte) (Message
 	return m.Snapshot(), nil
 }
 
+// PostVoiceAsUser posts a Teams voice message (no text) as the owner: an
+// audio card attachment whose media URL is a hosted content of the
+// message, as the Teams client records a voice clip.
+func (s *Server) PostVoiceAsUser(chatID, name string, data []byte) (Message, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c := s.chats[chatID]
+	if c == nil {
+		return Message{}, fmt.Errorf("fakegraph: no chat %s", chatID)
+	}
+	s.idCounter++
+	attID := fmt.Sprintf("e2e0a0d1-0000-4000-8000-%012d", s.idCounter)
+	m := s.appendMessageLocked(c, OriginUser, s.opts.Owner, "html", fmt.Sprintf(`<attachment id="%s"></attachment>`, attID))
+	hcID := fmt.Sprintf("aWQ9dm9pY2UtJTAzZA%04d", s.idCounter)
+	src := fmt.Sprintf("https://graph.microsoft.com/v1.0/chats/%s/messages/%s/hostedContents/%s/$value", chatID, m.ID, hcID)
+	card, _ := json.Marshal(map[string]any{"duration": "PT3S", "media": []map[string]string{{"url": src}}})
+	att, _ := json.Marshal(map[string]any{
+		"id": attID, "contentType": "application/vnd.microsoft.card.audio", "contentUrl": nil,
+		"content": string(card), "name": name, "thumbnailUrl": nil, "teamsAppId": nil,
+	})
+	m.Attachments = append(m.Attachments, att)
+	m.Hosted = 1
+	if s.hosted == nil {
+		s.hosted = map[hostedKey][]byte{}
+	}
+	s.hosted[hostedKey{chatID, m.ID, hcID}] = append([]byte(nil), data...)
+	return m.Snapshot(), nil
+}
+
 // AddCoworker adds the coworker account to a chat (as when the owner adds
 // a colleague in the Teams client), making it a multi-member chat.
 func (s *Server) AddCoworker(chatID string) error {
