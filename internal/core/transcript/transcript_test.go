@@ -34,11 +34,15 @@ func readAll(t *testing.T, path string, tr *Tracker) []Output {
 func keys(out []Output) string {
 	var s []string
 	for _, o := range out {
-		kind := "F"
-		if o.User {
-			kind = "U"
+		kind := map[OutputKind]string{OutputPrompt: "U", OutputFinal: "F", OutputStatus: "S", OutputCompact: "C"}[o.Kind]
+		if o.User != (o.Kind == OutputPrompt) {
+			kind += "!user"
 		}
-		s = append(s, kind+":"+o.Text)
+		text := o.Text
+		if o.Kind == OutputCompact && text == CompactText {
+			text = "compacted"
+		}
+		s = append(s, kind+":"+text)
 	}
 	return strings.Join(s, " | ")
 }
@@ -57,7 +61,7 @@ func TestTrackerMirrorsUserAndFinalOfTUITurns(t *testing.T) {
 	mustTurn(t, w, rollout.Turn{Prompt: "first question", Commentary: "looking", Answer: "first answer"})
 	tr := NewTracker("", 0, 0, nil)
 	out := readAll(t, w.Path, tr)
-	if got := keys(out); got != "U:first question | F:first answer" {
+	if got := keys(out); got != "U:first question | S:looking | F:first answer" {
 		t.Fatalf("outputs %q", got)
 	}
 	if tr.ThreadID() != w.SessionID {

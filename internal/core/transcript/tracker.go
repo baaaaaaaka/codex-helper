@@ -5,15 +5,34 @@ import (
 	"time"
 )
 
+// OutputKind is what a mirrored record is.
+type OutputKind string
+
+const (
+	OutputPrompt  OutputKind = "prompt"  // a user prompt
+	OutputFinal   OutputKind = "final"   // the final answer of a turn
+	OutputStatus  OutputKind = "status"  // commentary (assistant message, phase commentary)
+	OutputCompact OutputKind = "compact" // a context compaction notice (Text is CompactText)
+)
+
+// CompactText is the text of a compaction notice (v0.1.20
+// transcriptContextCompactMessage).
+const CompactText = "Context compacted. Earlier turns were summarized so Codex can continue the thread."
+
 // Output is one record to mirror.
+//
+// RecordID is the response-item id when the record has one, else
+// "t:<turn>:final" or "t:<turn>:<kind>:<line>" (prompt, status, compact;
+// line is the 1-based line of the record).
 type Output struct {
-	RecordID string // response-item id, or "t:<turn>:final" / "t:<turn>:prompt:<line>"
-	User     bool   // a user prompt (else the turn's final answer)
+	RecordID string
+	Kind     OutputKind
+	User     bool // Kind == OutputPrompt
 	Text     string
 	Time     time.Time
 	TurnID   string
 	End      int64 // end offset of the record
-	line     int64 // 1-based line of the record (ids of id-less prompts)
+	line     int64 // 1-based line of the record (ids of id-less records)
 	start    int64
 }
 
@@ -25,20 +44,31 @@ func (o Output) Key(threadID string, part int) string { return MirrorKey(threadI
 // id (legacy turns without client id recorded in the store).
 type Skip func(clientID, turnID string) bool
 
-// Tracker turns the records of one rollout into mirror outputs: the user
-// prompts and the final answer of every turn not run by the helper. A
-// turn's records are held until it is known whether the helper ran it (the
-// prompt record precedes the item that carries the client id).
+// Tracker turns the records of one rollout into mirror outputs, v0.1.20's
+// transcript-sync selection: the user prompts, the commentary (status), the
+// compaction notices and the final answer of every turn not run by the
+// helper, in file order. A turn's records are held until it is known
+// whether the helper ran it (the prompt record precedes the item that
+// carries the client id).
 //
-// The persisted position (Resume) is the start of the open turn, or the
-// read position when no turn is open, so a restart re-reads at most the
-// open turn and regenerates the same record ids.
+// Prompts, commentary and answers are read from the response_item message
+// records only: their event_msg twins (user_message, agent_message) and
+// the item_completed items repeat them, and v0.1.20 posted each such pair
+// once. A compacted record directly followed by a context_compacted record
+// is one compaction: v0.1.20 posted the second (compactTranscriptRecords),
+// so a compacted record is held until the next record shows which.
+//
+// The persisted position (Resume) is the start of the open turn (or of a
+// held record), or the read position when nothing is open, so a restart
+// re-reads at most the open turn and regenerates the same record ids.
 type Tracker struct {
 	threadID string
 	skip     Skip
 
 	off, line int64 // next read position
 	turn      *openTurn
+	prev      *openTurn    // the last closed turn: a compaction between turns belongs to it
+	held      *heldCompact // a compacted record that a context_compacted may still replace
 	last      time.Time
 }
 
@@ -51,6 +81,12 @@ type openTurn struct {
 	decided   bool // the helper/local decision is known
 	finalSeen bool
 	pending   []Output
+}
+
+type heldCompact struct {
+	o      Output
+	turn   *openTurn // the turn it belongs to (nil: none known)
+	inTurn bool      // read inside turn (not after it closed)
 }
 
 // NewTracker starts reading at off (line number line, the count of records
@@ -68,26 +104,45 @@ func (t *Tracker) ThreadID() string { return t.threadID }
 // Offset is the next read position.
 func (t *Tracker) Offset() int64 { return t.off }
 
-// Resume returns the position to persist: the start of the open turn, or
-// the read position.
+// Resume returns the position to persist: the start of the open turn (or
+// of the earliest held record), or the read position.
 func (t *Tracker) Resume() (offset, line int64) {
-	if t.turn != nil && t.turn.started {
-		return t.turn.start, t.turn.startLine
+	offset, line = t.off, t.line
+	at := func(off, l int64) {
+		if off < offset {
+			offset, line = off, l
+		}
 	}
-	if t.turn != nil && len(t.turn.pending) > 0 {
-		// A turn learned mid-scan with held prompts: re-read from the
-		// first held record (its line count is approximate, lines are
-		// informational only).
-		return t.turn.pending[0].start, t.turn.pending[0].line - 1
+	if tr := t.turn; tr != nil {
+		if tr.started {
+			at(tr.start, tr.startLine)
+		} else if len(tr.pending) > 0 {
+			// A turn learned mid-scan with held records: re-read from
+			// the first one.
+			at(tr.pending[0].start, tr.pending[0].line-1)
+		}
 	}
-	return t.off, t.line
+	if h := t.held; h != nil {
+		if h.inTurn && h.turn.started {
+			// From the start of its turn, which may have ended since,
+			// so that the turn's decision is read again.
+			at(h.turn.start, h.turn.startLine)
+		} else {
+			// Read between turns (none in the fidelity data): the
+			// position does not move back to the closed turn, so after a
+			// restart there the compaction belongs to no known turn and
+			// is mirrored.
+			at(h.o.start, h.o.line-1)
+		}
+	}
+	return offset, line
 }
 
 // Restart rereads a rewritten file from its beginning. The caller drops
 // the outputs that were already delivered (by record id) and those before
 // the last delivered record (realignment by record id, §3.9).
 func (t *Tracker) Restart() {
-	t.off, t.line, t.turn = 0, 0, nil
+	t.off, t.line, t.turn, t.prev, t.held = 0, 0, nil, nil, nil
 }
 
 // Advance consumes bytes that were skipped without lines (alignment).
@@ -127,16 +182,44 @@ func (t *Tracker) flush(out []Output) []Output {
 	}
 	if !tr.teams {
 		for _, o := range tr.pending {
-			out = append(out, t.resolve(o))
+			out = append(out, resolve(o, tr))
 		}
 	}
 	tr.pending = nil
 	return out
 }
 
+// add emits o, a record of turn tr, when the helper/local decision of tr is
+// known (dropping it when the helper ran the turn), and holds it in tr
+// otherwise. tr nil: a record outside any known turn, mirrored.
+func (t *Tracker) add(out []Output, o Output, tr *openTurn) []Output {
+	switch {
+	case tr == nil:
+		return append(out, resolve(o, nil))
+	case !tr.decided:
+		tr.pending = append(tr.pending, o)
+	case !tr.teams:
+		out = append(out, resolve(o, tr))
+	}
+	return out
+}
+
+// release mirrors the held compacted record: no context_compacted record
+// replaced it.
+func (t *Tracker) release(out []Output) []Output {
+	if h := t.held; h != nil {
+		t.held = nil
+		out = t.add(out, h.o, h.turn)
+	}
+	return out
+}
+
 func (t *Tracker) apply(out []Output, ev Event, l Line) []Output {
 	if ev.ThreadID != "" && t.threadID != "" && ev.Kind != KindSessionMeta && ev.ThreadID != t.threadID {
 		return out // a subagent's item inside this rollout
+	}
+	if t.held != nil && ev.Kind != KindCompact && breaksCompaction(l, ev) {
+		out = t.release(out)
 	}
 	// Learn the turn of a scan that began mid-turn.
 	if ev.TurnID != "" && t.turn == nil && ev.Kind != KindTurnStarted {
@@ -167,18 +250,11 @@ func (t *Tracker) apply(out []Output, ev Event, l Line) []Output {
 			// A prompt without a turn record (very old rollouts): its own turn.
 			t.turn = &openTurn{started: true, start: l.Off, startLine: t.line - 1}
 		}
-		tr := t.turn
 		if LegacyTeamsPrompt(text) {
-			tr.teams = true
+			t.turn.teams = true
 		}
-		o := Output{RecordID: ev.RecordID, User: true, Text: text, Time: ev.Time, End: l.End, line: t.line, start: l.Off}
-		if tr.decided {
-			if !tr.teams {
-				out = append(out, t.resolve(o))
-			}
-		} else {
-			tr.pending = append(tr.pending, o)
-		}
+		o := Output{RecordID: ev.RecordID, Kind: OutputPrompt, User: true, Text: text, Time: ev.Time, End: l.End, line: t.line, start: l.Off}
+		out = t.add(out, o, t.turn)
 	case KindUserItem:
 		tr := t.turn
 		if tr == nil {
@@ -190,7 +266,21 @@ func (t *Tracker) apply(out []Output, ev Event, l Line) []Output {
 		tr.decided = true
 		out = t.flush(out)
 	case KindAgentMessage:
-		if ev.Phase != "final_answer" || strings.TrimSpace(ev.Text) == "" {
+		text := strings.TrimSpace(ev.Text)
+		if text == "" {
+			return out
+		}
+		switch ev.Phase {
+		case "commentary":
+			if t.turn == nil {
+				// A scan that began mid-turn before any record naming
+				// the turn: held until the turn is known.
+				t.turn = &openTurn{}
+			}
+			o := Output{RecordID: ev.RecordID, Kind: OutputStatus, Text: text, Time: ev.Time, End: l.End, line: t.line, start: l.Off}
+			return t.add(out, o, t.turn)
+		case "final_answer":
+		default:
 			return out
 		}
 		tr := t.turn
@@ -200,7 +290,7 @@ func (t *Tracker) apply(out []Output, ev Event, l Line) []Output {
 			// hold the final until the turn, and so whether the helper ran
 			// it, is known (fidelity run, s523/s526).
 			t.turn = &openTurn{finalSeen: true}
-			t.turn.pending = append(t.turn.pending, Output{RecordID: ev.RecordID, Text: strings.TrimSpace(ev.Text), Time: ev.Time, End: l.End, line: t.line, start: l.Off})
+			t.turn.pending = append(t.turn.pending, Output{RecordID: ev.RecordID, Kind: OutputFinal, Text: text, Time: ev.Time, End: l.End, line: t.line, start: l.Off})
 			return out
 		}
 		tr.finalSeen, tr.decided = true, true
@@ -208,10 +298,27 @@ func (t *Tracker) apply(out []Output, ev Event, l Line) []Output {
 		if !tr.teams {
 			id := ev.RecordID
 			if id == "" {
-				id = turnRecordID(tr.id, true, 0)
+				id = turnRecordID(tr.id, OutputFinal, 0)
 			}
-			out = append(out, Output{RecordID: id, Text: strings.TrimSpace(ev.Text), Time: ev.Time, TurnID: tr.id, End: l.End})
+			out = append(out, Output{RecordID: id, Kind: OutputFinal, Text: text, Time: ev.Time, TurnID: tr.id, End: l.End, line: t.line, start: l.Off})
 		}
+	case KindCompact:
+		o := Output{Kind: OutputCompact, Text: CompactText, Time: ev.Time, End: l.End, line: t.line, start: l.Off}
+		tr := t.turn
+		if tr == nil {
+			tr = t.prev
+		}
+		switch {
+		case ev.Phase == compactedType:
+			out = t.release(out)
+			t.held = &heldCompact{o: o, turn: tr, inTurn: tr != nil && tr == t.turn}
+			return out
+		case ev.Phase == contextCompactedType && t.held != nil:
+			t.held = nil // one compaction: v0.1.20 posted this record of the pair
+		default:
+			out = t.release(out)
+		}
+		out = t.add(out, o, tr)
 	case KindTurnComplete:
 		tr := t.turn
 		if tr == nil {
@@ -223,32 +330,32 @@ func (t *Tracker) apply(out []Output, ev Event, l Line) []Output {
 		// read and that had no final_answer item: a scan that began
 		// mid-turn usually begins right after the delivered final.
 		if tr.started && !tr.finalSeen && !tr.teams && strings.TrimSpace(ev.Text) != "" {
-			out = append(out, Output{RecordID: turnRecordID(tr.id, true, 0), Text: strings.TrimSpace(ev.Text), Time: ev.Time, TurnID: tr.id, End: l.End})
+			out = append(out, Output{RecordID: turnRecordID(tr.id, OutputFinal, 0), Kind: OutputFinal, Text: strings.TrimSpace(ev.Text), Time: ev.Time, TurnID: tr.id, End: l.End, line: t.line, start: l.Off})
 		}
-		t.turn = nil
+		t.turn, t.prev = nil, tr
 	case KindTurnAborted:
 		out = t.end(out)
 	}
 	return out
 }
 
-// end closes the open turn, releasing its held prompts.
+// end closes the open turn, releasing its held records.
 func (t *Tracker) end(out []Output) []Output {
 	if t.turn != nil {
 		t.turn.decided = true
 		out = t.flush(out)
-		t.turn = nil
+		t.turn, t.prev = nil, t.turn
 	}
 	return out
 }
 
-// resolve fills the turn id and the record id of an id-less record.
-func (t *Tracker) resolve(o Output) Output {
-	if t.turn != nil {
-		o.TurnID = t.turn.id
+// resolve fills the turn id (of tr) and the record id of an id-less record.
+func resolve(o Output, tr *openTurn) Output {
+	if tr != nil {
+		o.TurnID = tr.id
 	}
 	if o.RecordID == "" {
-		o.RecordID = turnRecordID(o.TurnID, !o.User, o.line)
+		o.RecordID = turnRecordID(o.TurnID, o.Kind, o.line)
 	}
 	return o
 }
