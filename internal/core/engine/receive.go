@@ -864,6 +864,7 @@ func (e *Engine) scanLoop(ctx context.Context) {
 	mark := e.now().Add(-time.Minute)
 	failures := 0
 	var last time.Time // the last scan request
+	waiting := false   // the scan waits for a read token (the receiver waits for it)
 	for {
 		reopened := false
 		select {
@@ -877,6 +878,7 @@ func (e *Engine) scanLoop(ctx context.Context) {
 		now := e.now()
 		if until := e.gate(e.gRead); now.Before(until) {
 			reopen.Reset(until.Sub(now))
+			waiting = false // a read throttle: the scan goes first when it ends
 			continue
 		}
 		every := e.scanEvery(now)
@@ -886,18 +888,20 @@ func (e *Engine) scanLoop(ctx context.Context) {
 			// read of the scarce budget on the same change list.
 			continue
 		}
-		if reopened || e.scanFirst.Load() {
-			// The scan serves every chat: after a read throttle, or
-			// once it waited for a token, it goes first.
+		if e.scanFirst.Load() && !waiting {
+			// The scan serves every chat: after a read throttle it
+			// goes first.
 			e.readTokens.borrow()
 		} else if ok, wait := e.readTokens.take(); !ok {
 			// Out of read budget (S6): the scan takes the next token
 			// and the chat reads wait for it, instead of borrowing
 			// every interval and spending a small budget on scans.
+			waiting = true
 			e.scanFirst.Store(true)
 			reopen.Reset(max(wait, e.t.Tick))
 			continue
 		}
+		waiting = false
 		last = now
 		tick.Reset(every) // the cadence counts from this scan
 		started := e.now()
