@@ -552,7 +552,7 @@ func TestVoiceTurnWaitsForTranscript(t *testing.T) {
 		t.Fatalf("%d turns started before the transcript was ready", n)
 	}
 	close(asr.release)
-	r.wait("voice answered", func() bool { return r.ag.calls("Voice message (transcribed):\nhello from voice") == 1 })
+	r.wait("voice answered", func() bool { return r.ag.calls(voiceLead+"\nhello from voice") == 1 })
 	r.wait("voice answer posted", func() bool { return len(r.own(work, "ANSWER to Voice message")) == 1 })
 }
 
@@ -585,5 +585,45 @@ func TestReadBudgetSharedFairlyWithControlChat(t *testing.T) {
 	}
 	if d := time.Since(start); d > 15*time.Second {
 		t.Fatalf("three prompts took %s at 1 read/s", d)
+	}
+}
+
+// laterASR is not ready for the first calls (setup), then transcribes.
+type laterASR struct {
+	mu    sync.Mutex
+	calls int
+	ready int
+}
+
+func (a *laterASR) Transcribe(ctx context.Context, path string) (string, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.calls++
+	if a.calls <= a.ready {
+		return "", fmt.Errorf("setup running: %w", ErrTranscribeLater)
+	}
+	return "voice after setup", nil
+}
+
+func TestVoiceWaitsForRecognizerSetupWithOneNotice(t *testing.T) {
+	asr := &laterASR{ready: 2}
+	r := newRig(t, func(c *Config) {
+		c.Transcriber = asr
+		c.FilesDir = t.TempDir()
+		c.Timing.Maintenance = 300 * time.Millisecond // asr retry cadence
+	})
+	work := r.newWork(t.TempDir())
+	ref := r.ch.AddFile("voice.ogg", []byte("OggS..."))
+	ref.Kind = channel.FileVoice
+	r.ch.PostUser(work, "", ref)
+	r.wait("voice answered after setup", func() bool { return r.ag.calls("voice after setup") == 1 })
+	if n := len(r.own(work, "Voice recognition is being set up")); n != 1 {
+		t.Fatalf("%d setup notices, want 1", n)
+	}
+	r.ag.mu.Lock()
+	n := len(r.ag.runs)
+	r.ag.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("%d turns, want 1", n)
 	}
 }

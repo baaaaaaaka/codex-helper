@@ -177,6 +177,9 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 // turnInput builds the Codex input of a prompt and its attachments: images
 // become image inputs, files are listed with their local path and original
 // name, voice messages contribute their transcript.
+// voiceLead introduces voice transcripts in a prompt.
+const voiceLead = "Voice message (automatic transcript; it may contain recognition errors, especially names, identifiers and commands; prefer typed text when they conflict):"
+
 func turnInput(body string, files []store.InboundFile) (string, []string) {
 	text := strings.TrimSpace(body)
 	var images, listed, voice, failed []string
@@ -202,7 +205,7 @@ func turnInput(body string, files []store.InboundFile) (string, []string) {
 	}
 	var sections []string
 	if len(voice) > 0 {
-		v := "Voice message (transcribed):\n" + strings.Join(voice, "\n\n")
+		v := voiceLead + "\n" + strings.Join(voice, "\n\n")
 		if text == "" {
 			text = v
 		} else {

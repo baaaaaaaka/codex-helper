@@ -107,6 +107,14 @@ var ErrUnknownOutcome = errors.New("engine: turn outcome unknown")
 
 // Transcriber turns a voice attachment into text (ASR). Implementations
 // live outside the engine; nil disables voice.
+//
+// An error wrapping ErrTranscribeLater keeps the attachment pending (and
+// the turn waiting) for a later pass, e.g. while the recognizer is still
+// being installed. An error with a UserText() string method supplies the
+// reason shown to the owner and to Codex; it must carry no paths.
 type Transcriber interface {
 	Transcribe(ctx context.Context, path string) (string, error)
 }
+
+// ErrTranscribeLater: the transcriber cannot run yet; try again later.
+var ErrTranscribeLater = errors.New("engine: transcription not ready yet")

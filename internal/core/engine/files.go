@@ -62,7 +62,7 @@ func firstNonEmpty(v ...string) string {
 
 // asrLoop downloads pending attachments and transcribes voice messages.
 func (e *Engine) asrLoop(ctx context.Context) {
-	tick := time.NewTicker(time.Minute)
+	tick := time.NewTicker(e.t.Maintenance) // retries transient failures
 	defer tick.Stop()
 	for {
 		ids, err := e.st.PendingInboundFiles()
@@ -111,6 +111,17 @@ func (e *Engine) fetchInbound(ctx context.Context, inboundID int64) {
 			return
 		}
 		key := fmt.Sprintf("%d/%d", inboundID, f.Idx)
+		if state == stateLater {
+			// The recognizer is not ready (first-time setup): tell the
+			// owner once, keep the row pending, retry on the next pass.
+			if err := e.update(func(tx *store.Tx) error {
+				return e.enqueueNotice(tx, in.ConvID, fmt.Sprintf("voice-wait:%d", inboundID), textVoiceWait)
+			}); err != nil {
+				e.logf("voice wait notice %d: %v", inboundID, err)
+			}
+			e.wakeSender()
+			continue
+		}
 		if state == "" {
 			e.mu.Lock()
 			e.fileTries[key]++
@@ -136,6 +147,13 @@ func (e *Engine) fetchInbound(ctx context.Context, inboundID int64) {
 // maxFileTries bounds transient download failures of one attachment; the
 // turn waits for it, so it must end in ready or failed.
 const maxFileTries = 5
+
+// stateLater is fetchOne's "transcriber not ready yet" outcome: the row
+// stays pending without counting as a failed try (the transcriber bounds
+// its own setup time and then fails for good).
+const stateLater = "later"
+
+const textVoiceWait = "Voice recognition is being set up on this machine (first use). The voice message will be transcribed and run when it is ready."
 
 // fetchOne downloads (and for voice transcribes) one attachment. It returns
 // the new state ("" = retry later), the local path and an error text.
@@ -175,8 +193,20 @@ func (e *Engine) fetchOne(ctx context.Context, inboundID int64, f store.InboundF
 		if ctx.Err() != nil {
 			return "", "", ""
 		}
+		var ut interface{ UserText() string }
+		reason := ""
+		if errors.As(err, &ut) {
+			reason = ut.UserText()
+		}
+		if errors.Is(err, ErrTranscribeLater) {
+			e.logf("transcribe %d/%d later: %v", inboundID, f.Idx, err)
+			return stateLater, "", ""
+		}
 		e.logf("transcribe %d/%d: %v", inboundID, f.Idx, err)
-		return "failed", dst, "the voice message could not be transcribed"
+		return "failed", dst, firstNonEmpty(reason, "the voice message could not be transcribed")
+	}
+	if strings.TrimSpace(text) == "" {
+		return "failed", dst, "no speech was recognised in the voice message"
 	}
 	txt := dst + ".txt"
 	if err := os.WriteFile(txt, []byte(strings.TrimSpace(text)), 0o600); err != nil {
