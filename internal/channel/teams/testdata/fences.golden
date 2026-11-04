@@ -1,0 +1,4 @@
+== part 1/1 size=186 mention=false images=0
+<p><strong>🤖 ✅ Codex answer:</strong></p><p>Run:</p><pre><code>func main() {
+	fmt.Println(&#34;&lt;hi&gt; &amp; bye&#34;)
+}</code></pre><pre><code>unterminated *not em*</code></pre>
