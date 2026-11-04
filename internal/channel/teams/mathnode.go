@@ -2,6 +2,7 @@ package teams
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"embed"
 	"encoding/base64"
@@ -40,8 +41,14 @@ type NodeMath struct {
 	HTTP        *http.Client  // font downloads; default http.DefaultClient
 	FontTimeout time.Duration // default 2 minutes
 
-	mu   sync.Mutex
-	root string
+	// Install state (runtime): the runtime installs in the background; a
+	// failed install is retried after mathInstallBackoff.
+	mu       sync.Mutex
+	root     string
+	pending  chan struct{} // closed when the running install ends
+	failures int
+	retryAt  time.Time
+	lastErr  error
 
 	fontMu sync.Mutex
 	fonts  map[string]fontStamp // verified font files
@@ -198,49 +205,124 @@ func parseMathOutput(raw []byte, n int) ([]MathResult, []string, error) {
 	return out, texts, nil
 }
 
-// runtime returns a directory holding renderer.mjs and node_modules,
-// installing it once if needed.
+// errMathInstalling: the renderer runtime is being installed in the
+// background; the formula is shown as code meanwhile.
+var errMathInstalling = errors.New("teams math: the renderer is being installed")
+
+// mathNow is the clock of the install backoff (tests replace it).
+var mathNow = time.Now
+
+// mathInstallBackoff is the pause after the n-th consecutive failed install:
+// 10 min doubling to 24 h.
+func mathInstallBackoff(n int) time.Duration {
+	d := 10 * time.Minute
+	for i := 1; i < n && d < 24*time.Hour; i++ {
+		d *= 2
+	}
+	return min(d, 24*time.Hour)
+}
+
+// runtime returns a directory holding renderer.mjs and node_modules.
+//
+// It never waits for an install: a runtime already on disk is used at once;
+// otherwise one install (npm ci, up to mathInstallTime) starts in the
+// background and errMathInstalling is returned, so the caller shows the
+// formula as code instead of holding the answer. After a failed install the
+// next one waits mathInstallBackoff (10 min doubling to 24 h); until then
+// every call fails fast with the last install error.
 func (n *NodeMath) runtime(ctx context.Context) (string, error) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	if n.root != "" {
 		return n.root, nil
 	}
-	root, err := n.install(ctx)
-	if err == nil {
-		n.root = root
+	if n.pending != nil {
+		return "", errMathInstalling
 	}
-	return root, err
+	if mathNow().Before(n.retryAt) {
+		return "", fmt.Errorf("teams math: renderer install failed; next try after %s: %w", n.retryAt.Format(time.RFC3339), n.lastErr)
+	}
+	base, err := n.base()
+	if err != nil {
+		return "", err
+	}
+	if root, ok := existingMathRuntime(base); ok {
+		n.root = root
+		return root, nil
+	}
+	done := make(chan struct{})
+	n.pending = done
+	go func() {
+		defer close(done)
+		root, err := n.install(context.WithoutCancel(ctx), base)
+		n.mu.Lock()
+		defer n.mu.Unlock()
+		n.pending = nil
+		if err != nil {
+			n.failures++
+			n.lastErr = err
+			n.retryAt = mathNow().Add(mathInstallBackoff(n.failures))
+			return
+		}
+		n.root, n.failures, n.lastErr, n.retryAt = root, 0, nil, time.Time{}
+	}()
+	return "", errMathInstalling
 }
 
-func (n *NodeMath) install(ctx context.Context) (string, error) {
-	base := n.Dir
-	if base == "" {
-		c, err := os.UserCacheDir()
-		if err != nil {
-			return "", err
-		}
-		base = filepath.Join(c, "codex-helper", "teams-math")
+// installDone returns a channel closed when no install is running.
+func (n *NodeMath) installDone() <-chan struct{} {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if n.pending != nil {
+		return n.pending
 	}
+	c := make(chan struct{})
+	close(c)
+	return c
+}
+
+func (n *NodeMath) base() (string, error) {
+	if n.Dir != "" {
+		return n.Dir, nil
+	}
+	c, err := os.UserCacheDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(c, "codex-helper", "teams-math"), nil
+}
+
+// mathRuntimeReady reports whether dir holds the current renderer and its
+// modules.
+func mathRuntimeReady(dir string) bool {
 	want, _ := mathjsFiles.ReadFile("mathjs/renderer.mjs")
-	ready := func(dir string) bool {
-		have, err := os.ReadFile(filepath.Join(dir, "renderer.mjs"))
-		if err != nil || !bytes.Equal(have, want) {
+	have, err := os.ReadFile(filepath.Join(dir, "renderer.mjs"))
+	if err != nil || !bytes.Equal(have, want) {
+		return false
+	}
+	for _, p := range []string{"node_modules/mathjax/package.json", "node_modules/@resvg/resvg-js/package.json"} {
+		if _, err := os.Stat(filepath.Join(dir, p)); err != nil {
 			return false
 		}
-		for _, p := range []string{"node_modules/mathjax/package.json", "node_modules/@resvg/resvg-js/package.json"} {
-			if _, err := os.Stat(filepath.Join(dir, p)); err != nil {
-				return false
-			}
-		}
-		return true
 	}
+	return true
+}
+
+// existingMathRuntime finds a ready runtime: the current one, or one from an
+// earlier release with an identical renderer.
+func existingMathRuntime(base string) (string, bool) {
+	for _, d := range []string{filepath.Join(base, mathRuntimeName), filepath.Join(base, mathRuntimeLegacy)} {
+		if mathRuntimeReady(d) {
+			return d, true
+		}
+	}
+	return "", false
+}
+
+func (n *NodeMath) install(ctx context.Context, base string) (string, error) {
 	root := filepath.Join(base, mathRuntimeName)
-	for _, d := range []string{root, filepath.Join(base, mathRuntimeLegacy)} {
-		if ready(d) {
-			return d, nil
-		}
-	}
+	ctx, cancel := context.WithTimeout(ctx, mathInstallTime)
+	defer cancel()
 	npm := n.Npm
 	if npm == "" {
 		var err error
@@ -251,12 +333,13 @@ func (n *NodeMath) install(ctx context.Context) (string, error) {
 	if err := os.MkdirAll(base, 0o700); err != nil {
 		return "", err
 	}
+	// Another process may be installing: wait for it within the same bound.
 	lock := flock.New(filepath.Join(base, "install.lock"))
-	if err := lock.Lock(); err != nil {
-		return "", err
+	if locked, err := lock.TryLockContext(ctx, 250*time.Millisecond); err != nil || !locked {
+		return "", fmt.Errorf("teams math: install lock: %v", cmp.Or(err, ctx.Err()))
 	}
 	defer lock.Unlock()
-	if ready(root) {
+	if mathRuntimeReady(root) {
 		return root, nil
 	}
 	stage, err := os.MkdirTemp(base, ".install-")
@@ -270,9 +353,7 @@ func (n *NodeMath) install(ctx context.Context) (string, error) {
 			return "", err
 		}
 	}
-	ictx, cancel := context.WithTimeout(ctx, mathInstallTime)
-	defer cancel()
-	cmd := exec.CommandContext(ictx, npm, "ci", "--ignore-scripts", "--no-audit", "--no-fund", "--include=optional")
+	cmd := exec.CommandContext(ctx, npm, "ci", "--ignore-scripts", "--no-audit", "--no-fund", "--include=optional")
 	cmd.Dir = stage
 	var log limitedBuffer
 	log.max = 8 << 10
@@ -284,7 +365,7 @@ func (n *NodeMath) install(ctx context.Context) (string, error) {
 	if err := os.Rename(stage, root); err != nil {
 		return "", err
 	}
-	if !ready(root) {
+	if !mathRuntimeReady(root) {
 		return "", errors.New("teams math: installed runtime is incomplete")
 	}
 	return root, nil

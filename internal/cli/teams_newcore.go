@@ -67,6 +67,16 @@ type teamsNewCoreOptions struct {
 	managedServiceChild bool
 }
 
+// teamsNewCoreChannelConfig is the Teams adapter configuration. Display
+// formulas are drawn with the managed MathJax renderer (NodeMath, as in
+// v0.1.20); while it installs, or when Node.js is missing, they show as TeX
+// code.
+func teamsNewCoreChannelConfig(client *http.Client, authCfg chteams.AuthConfig) chteams.Config {
+	return chteams.Config{HTTP: client, Tokens: chteams.NewDelegatedAuth(authCfg, client), TenantID: authCfg.TenantID,
+		SharePointHosts: chteams.SharePointHostsFromEnv(os.Getenv("CODEX_HELPER_TEAMS_ALLOWED_SHAREPOINT_HOSTS")),
+		Math:            &chteams.NodeMath{}}
+}
+
 // teamsNewCoreOverrides replace production wiring in the e2e build
 // (teams_newcore_e2e.go); production leaves teamsNewCoreTestOverrides nil.
 type teamsNewCoreOverrides struct {
@@ -330,8 +340,7 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 	if err != nil {
 		return fmt.Errorf("Teams auth: %w", err)
 	}
-	ch, err := chteams.New(chteams.Config{HTTP: client, Tokens: chteams.NewDelegatedAuth(authCfg, client), TenantID: authCfg.TenantID,
-		SharePointHosts: chteams.SharePointHostsFromEnv(os.Getenv("CODEX_HELPER_TEAMS_ALLOWED_SHAREPOINT_HOSTS"))})
+	ch, err := chteams.New(teamsNewCoreChannelConfig(client, authCfg))
 	if err != nil {
 		return err
 	}

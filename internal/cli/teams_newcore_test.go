@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	chteams "github.com/baaaaaaaka/codex-helper/internal/channel/teams"
 	"github.com/baaaaaaaka/codex-helper/internal/core/migrate"
 	corestore "github.com/baaaaaaaka/codex-helper/internal/core/store"
 )
@@ -240,5 +242,14 @@ func TestTeamsCorePIDFileIsPerHost(t *testing.T) {
 	}
 	if got := teamsCorePIDFile(dir, ""); filepath.Base(got) != "core-app-servers.pid" {
 		t.Fatalf("no host: %q", got)
+	}
+}
+
+// D13: formulas are drawn by the managed renderer (as v0.1.20 did), not left
+// as TeX code because no renderer is configured.
+func TestNewCoreChannelRendersFormulas(t *testing.T) {
+	cfg := teamsNewCoreChannelConfig(http.DefaultClient, chteams.AuthConfig{TenantID: "t"})
+	if _, ok := cfg.Math.(*chteams.NodeMath); !ok {
+		t.Fatalf("Teams channel Math = %T, want the managed NodeMath renderer", cfg.Math)
 	}
 }

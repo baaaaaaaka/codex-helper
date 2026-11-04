@@ -184,7 +184,20 @@ func (a *Adapter) Send(ctx context.Context, chat string, p channel.Part, token s
 		ID      string `json:"id"`
 		Created string `json:"createdDateTime"`
 	}
-	if err := a.g.writeJSON(ctx, http.MethodPost, path, in, &out); err != nil {
+	err = a.g.writeJSON(ctx, http.MethodPost, path, in, &out)
+	if err != nil && formulaImagesRefused(err) {
+		// Graph refused the formula images (as v0.1.20 handled it): the
+		// message was not stored, so post it again with the TeX code only.
+		if plain, ok := withoutFormulaImages(msg); ok {
+			if p.ReplyTo != "" {
+				in = map[string]any{"messageIds": []string{p.ReplyTo}, "replyMessage": plain}
+			} else {
+				in = plain
+			}
+			err = a.g.writeJSON(ctx, http.MethodPost, path, in, &out)
+		}
+	}
+	if err != nil {
 		return channel.Sent{}, err
 	}
 	if out.ID == "" {
@@ -192,6 +205,49 @@ func (a *Adapter) Send(ctx context.Context, chat string, p channel.Part, token s
 	}
 	t, _ := time.Parse(time.RFC3339Nano, out.Created)
 	return channel.Sent{ID: out.ID, Time: t}, nil
+}
+
+// formulaImagesRefused reports a definite refusal (nothing stored) that a
+// message without hosted images may not get: 400, 413, 415 or 422.
+func formulaImagesRefused(err error) bool {
+	var rej *channel.Rejected
+	var se *statusError
+	if !errors.As(err, &rej) || !rej.Permanent || !errors.As(err, &se) {
+		return false
+	}
+	switch se.Status {
+	case http.StatusBadRequest, http.StatusRequestEntityTooLarge, http.StatusUnsupportedMediaType, http.StatusUnprocessableEntity:
+		return true
+	}
+	return false
+}
+
+var formulaImageRE = regexp.MustCompile(`<p><img src="\.\./hostedContents/[^"]*"[^>]*></p>`)
+
+// withoutFormulaImages drops the hosted formula images from a message body;
+// the TeX code blocks stay. ok is false when there were none.
+func withoutFormulaImages(msg json.RawMessage) (json.RawMessage, bool) {
+	var m map[string]json.RawMessage
+	if json.Unmarshal(msg, &m) != nil {
+		return nil, false
+	}
+	var hosted []json.RawMessage
+	if json.Unmarshal(m["hostedContents"], &hosted) != nil || len(hosted) == 0 {
+		return nil, false
+	}
+	var b struct {
+		ContentType string `json:"contentType"`
+		Content     string `json:"content"`
+	}
+	if json.Unmarshal(m["body"], &b) != nil {
+		return nil, false
+	}
+	b.Content = formulaImageRE.ReplaceAllString(b.Content, "")
+	raw, _ := json.Marshal(b)
+	m["body"] = raw
+	delete(m, "hostedContents")
+	out, err := json.Marshal(m)
+	return out, err == nil
 }
 
 // withMarker returns the stored part body with the marker comment

@@ -101,7 +101,8 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("auth config: %w", err)
 	}
-	ch, err := teams.New(teams.Config{HTTP: client, Tokens: teams.NewDelegatedAuth(authCfg, client), TenantID: authCfg.TenantID})
+	// Formulas: the managed renderer, as `cxp teams run` wires it.
+	ch, err := teams.New(teams.Config{HTTP: client, Tokens: teams.NewDelegatedAuth(authCfg, client), TenantID: authCfg.TenantID, Math: &teams.NodeMath{}})
 	if err != nil {
 		return err
 	}
