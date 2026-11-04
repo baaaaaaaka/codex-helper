@@ -1,19 +1,20 @@
 # codex-helper documentation
 
 Start with the top-level [README](../README.md) for installation, first run,
-common commands, model selection, standard approvals, Teams basics, and upgrade basics.
+common commands, standard approvals, Teams basics, and upgrade basics.
 
 ## Basic use
 
 - [Top-level README](../README.md): install, first run, common commands, local
-  TUI, model profiles, standard approvals, Codex desktop app, Teams setup, and upgrade.
+  TUI, standard approvals, Codex desktop app, Teams setup, and upgrade.
 
 ## Daily Teams and operator use
 
 - [Teams source deployment guide](teams_source_deployment_guide.md): source
-  checkout deployment, service setup, daily Teams commands, file upload, and
-  recovery notes. This is for operators and source-checkout deployments, not
-  the first-run path for normal installed helpers.
+  checkout deployment, service setup, daily Teams commands, files, and the
+  automatic conversion of an older helper store. This is for operators and
+  source-checkout deployments, not the first-run path for normal installed
+  helpers.
 
 ## Advanced execution and feature review
 
@@ -27,9 +28,6 @@ common commands, model selection, standard approvals, Teams basics, and upgrade 
   security boundaries and risks.
 - [Codex compatibility](codex_compatibility.md): generated compatibility data
   from release monitoring.
-- [Third-party model open issues](third-party-model-open-issues.md): the
-  DeepSeek/MiMo external-catalog experiment's unresolved implementation,
-  protocol, and live-validation items.
 
 ## Design and implementation trackers
 
@@ -39,3 +37,9 @@ common commands, model selection, standard approvals, Teams basics, and upgrade 
   implementation tracker and execution notes.
 - [Telegram integration plan](telegram_integration_plan.md): Telegram research
   and design notes.
+
+## Archive
+
+- [archive/](archive/): execution checklists and notes of the old Teams
+  bridge (replaced by the new core) and of the removed third-party model
+  support. Kept for history; they do not describe the current helper.
