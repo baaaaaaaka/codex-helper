@@ -31,6 +31,17 @@ func mirrorRig(t *testing.T, tweak ...func(*Config)) (*rig, string) {
 	return r, sessions
 }
 
+// mirrorInitialised waits until the start-up walk has classified what
+// existed at start: a session written after that is live (written before,
+// it would be caught up, or baselined on a fresh install).
+func (r *rig) mirrorInitialised() {
+	r.t.Helper()
+	r.wait("mirror initialised", func() bool {
+		v, _, err := r.st.Meta(metaMirrorInit)
+		return err == nil && v != ""
+	})
+}
+
 // localChat waits for the work chat the mirror created for a local session.
 func (r *rig) localChat() string {
 	var chat string
@@ -531,10 +542,7 @@ func TestOldWalkTickStopsAtItsTimeBudget(t *testing.T) {
 // discovered after a restart and its whole history is caught up.
 func TestSessionFrom200DaysAgoIsDiscoveredAndCaughtUp(t *testing.T) {
 	r, sessions := mirrorRig(t)
-	r.wait("mirror initialised", func() bool {
-		v, _, err := r.st.Meta(metaMirrorInit)
-		return err == nil && v != ""
-	})
+	r.mirrorInitialised()
 	r.stop()
 	at := time.Now().Add(-200 * 24 * time.Hour)
 	w, err := rollout.New(sessions, t.TempDir(), rollout.Options{Start: at})

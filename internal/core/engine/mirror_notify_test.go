@@ -38,6 +38,7 @@ func (r *rig) mentionsCovered(ctl string) int {
 func TestLiveMirroredFinalsNotifyTheOwner(t *testing.T) {
 	r, sessions := mirrorRig(t)
 	ctl := r.control()
+	r.mirrorInitialised() // a live session, not one found at start
 	w, err := rollout.New(sessions, t.TempDir(), rollout.Options{})
 	if err != nil {
 		t.Fatal(err)
@@ -97,10 +98,7 @@ func TestCatchUpFinalsDoNotNotify(t *testing.T) {
 	ctl := r.control()
 	// A session that began while the helper was down (not its first run,
 	// which baselines what exists): found at start, caught up.
-	r.wait("mirror initialised", func() bool {
-		v, _, err := r.st.Meta(metaMirrorInit)
-		return err == nil && v != ""
-	})
+	r.mirrorInitialised()
 	r.stop()
 	w, err := rollout.New(sessions, t.TempDir(), rollout.Options{})
 	if err != nil {

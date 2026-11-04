@@ -17,6 +17,7 @@ import (
 func TestCreationNoticesAreV0120(t *testing.T) {
 	r, sessions := mirrorRig(t)
 	ctl := r.control()
+	r.mirrorInitialised() // a live session, not one found at start
 	ctlBefore := len(r.own(ctl, ""))
 
 	w, err := rollout.New(sessions, t.TempDir(), rollout.Options{})

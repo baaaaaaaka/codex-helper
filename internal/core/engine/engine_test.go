@@ -316,12 +316,15 @@ func TestPromptIsAckedAnsweredOnceAndControlMentioned(t *testing.T) {
 		return len(r.own(work, "ANSWER to hello one")) == 1 && len(r.own(work, "ANSWER to hello two")) == 1
 	})
 	time.Sleep(200 * time.Millisecond)
-	if n := len(r.own(work, "Request accepted")); n != 2 {
-		t.Fatalf("%d acks", n)
+	// One ACK each: "Request accepted", or v0.1.20's queued ACK when the
+	// second prompt is admitted while the first still runs.
+	accepted := len(r.own(work, "Request accepted"))
+	if n := accepted + len(r.own(work, "Your request is queued.")); n != 2 || accepted < 1 {
+		t.Fatalf("%d acks (%d accepted)", n, accepted)
 	}
 	// The ACK reads as v0.1.20's (fidelity run).
-	if n := len(r.own(work, "⏳ Codex is working. Request accepted.")); n != 2 {
-		t.Fatalf("%d acks with the v0.1.20 text", n)
+	if n := len(r.own(work, "⏳ Codex is working. Request accepted.")); n != accepted {
+		t.Fatalf("%d of %d acks with the v0.1.20 text", n, accepted)
 	}
 	if r.ag.calls("hello one") != 1 || r.ag.calls("hello two") != 1 {
 		t.Fatalf("calls %+v", r.ag.runs)
@@ -883,7 +886,9 @@ func TestProgressCoalescedWhenTurnsWaitBehind(t *testing.T) {
 	work := r.newWork(t.TempDir())
 	r.ch.PostUser(work, "progress first")
 	r.ch.PostUser(work, "second request")
-	r.wait("both admitted", func() bool { return len(r.own(work, "Request accepted")) == 2 })
+	r.wait("both admitted", func() bool { // the second one gets v0.1.20's queued ACK
+		return len(r.own(work, "Request accepted")) == 1 && len(r.own(work, "Your request is queued.")) == 1
+	})
 	// The fake streams the first turn's commentary after the release, while
 	// the second request waits behind it.
 	close(release)
@@ -930,7 +935,7 @@ func TestTooLargeBacklogSkippedWithOneNotice(t *testing.T) {
 	if len(notes) != 1 {
 		t.Fatalf("%d skip notices, want 1", len(notes))
 	}
-	if txt := notes[0].Text; !strings.Contains(txt, "at least 10 messages") || !strings.Contains(txt, "UTC") || !strings.Contains(txt, "Scroll up") {
+	if txt := notes[0].Text; !(strings.Contains(txt, "at least 10 messages") || strings.Contains(txt, "at least 11 messages")) || !strings.Contains(txt, "UTC") || !strings.Contains(txt, "Scroll up") {
 		t.Errorf("notice does not say what was skipped and how to see it: %q", txt)
 	}
 	if n := r.ag.calls("burst"); n != 0 {
@@ -1803,7 +1808,9 @@ func TestConcurrentProgressCallbacksAllPosted(t *testing.T) {
 	r := newRig(t, func(c *Config) { c.Agent = concurrentProgress{c.Agent.(*fakeAgent)} })
 	work := r.newWork(t.TempDir())
 	r.ch.PostUser(work, "parallel please")
-	r.wait("answer", func() bool { return len(r.own(work, "ANSWER parallel")) == 1 })
+	// Twelve posts to one chat at ChatRate (1 s): the two creation
+	// notices, the ACK, eight steps and the answer.
+	r.waitFor("answer", 30*time.Second, func() bool { return len(r.own(work, "ANSWER parallel")) == 1 })
 	for g := 'a'; g <= 'b'; g++ {
 		for i := 0; i < 4; i++ {
 			step := fmt.Sprintf("step %c%d", g, i)
