@@ -208,7 +208,13 @@ type Outbox struct {
 	CreatedAt     int64
 	SentAt        int64
 	Note          string
+	// HashAlgo is "" when BodyHash comes from the channel adapter, or
+	// HashLegacy for an imported legacy hash (re-hashed by RehashLegacy).
+	HashAlgo string
 }
+
+// HashLegacy marks an outbox body_hash imported from the legacy helper.
+const HashLegacy = "legacy"
 
 // TranscriptSource is a local Codex rollout file.
 type TranscriptSource struct {
@@ -240,6 +246,7 @@ type Fork struct {
 type Notification struct {
 	ID        int64
 	Key       string
+	Kind      string // e.g. turn_completed, chat_ready, needs_attention
 	Payload   string
 	State     string
 	CreatedAt int64

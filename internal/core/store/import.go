@@ -87,6 +87,13 @@ func (im *Importer) PauseConversation(convID, at int64, reason string) error {
 	return err
 }
 
+// Park parks an imported conversation (the loser of a shared Codex thread).
+func (im *Importer) Park(convID int64) error {
+	_, err := im.t.exec(`UPDATE conversations SET state = 'parked', parked_at = COALESCE(parked_at, ?), updated_at = ?
+WHERE id = ? AND state IN ('active','creating')`, im.t.now, im.t.now, convID)
+	return err
+}
+
 // LinkInbound sets the turn of an inbound row.
 func (im *Importer) LinkInbound(inboundID, turnID int64) error {
 	_, err := im.t.exec(`UPDATE inbound SET turn_id = ? WHERE id = ?`, turnID, inboundID)
@@ -117,10 +124,11 @@ func (im *Importer) Outbox(o Outbox, f *OutFile) (int64, bool, error) {
 	}
 	var id int64
 	err := im.t.row(`INSERT INTO outbox(conv_id,delivery_key,seq,kind,part,parts,body,body_hash,mention,reply_to,state,
-attempt_token,ext_msg_id,next_attempt_at,created_at,sent_at,note) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+attempt_token,ext_msg_id,next_attempt_at,created_at,sent_at,note,hash_algo) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(delivery_key) DO NOTHING RETURNING id`,
 		o.ConvID, o.DeliveryKey, o.Seq, o.Kind, o.Part, o.Parts, nullStr(o.Body), o.BodyHash, o.Mention, nullStr(o.ReplyTo),
-		o.State, nullStr(o.AttemptToken), nullStr(o.ExtMsgID), nullInt(o.NextAttemptAt), o.CreatedAt, nullInt(o.SentAt), nullStr(o.Note)).Scan(&id)
+		o.State, nullStr(o.AttemptToken), nullStr(o.ExtMsgID), nullInt(o.NextAttemptAt), o.CreatedAt, nullInt(o.SentAt), nullStr(o.Note),
+		nullStr(o.HashAlgo)).Scan(&id)
 	if err != nil {
 		if isNoRows(err) {
 			return 0, false, nil
@@ -159,8 +167,8 @@ func (im *Importer) Fork(f Fork) (int64, error) {
 
 // Notification inserts a notification row.
 func (im *Importer) Notification(n Notification) error {
-	_, err := im.t.exec(`INSERT INTO notifications(key,payload,state,created_at,sent_at) VALUES (?,?,?,?,?)
-ON CONFLICT(key) DO NOTHING`, n.Key, n.Payload, n.State, n.CreatedAt, nullInt(n.SentAt))
+	_, err := im.t.exec(`INSERT INTO notifications(key,kind,payload,state,created_at,sent_at) VALUES (?,?,?,?,?,?)
+ON CONFLICT(key) DO NOTHING`, n.Key, n.Kind, n.Payload, n.State, n.CreatedAt, nullInt(n.SentAt))
 	return err
 }
 

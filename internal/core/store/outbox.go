@@ -161,7 +161,7 @@ func (t *Tx) IsOwn(convID int64, extMsgID string, bodyHash []byte, since int64) 
 	}
 	if len(bodyHash) > 0 {
 		err := t.row(`SELECT EXISTS(SELECT 1 FROM outbox WHERE conv_id = ? AND body_hash = ?
-AND state IN ('sending','sent','unknown') AND created_at >= ?)`, convID, bodyHash, since).Scan(&hit)
+AND state IN ('sending','sent','unknown') AND created_at >= ? AND hash_algo IS NULL)`, convID, bodyHash, since).Scan(&hit)
 		return hit != 0, err
 	}
 	return false, nil
@@ -195,4 +195,35 @@ ext_item_id = COALESCE(?, ext_item_id) WHERE outbox_id = ?`, nullStr(uploadURL),
 		err = fmt.Errorf("%w: outbox file %d", ErrNotFound, outboxID)
 	}
 	return err
+}
+
+// RehashLegacy replaces body hashes imported from the legacy helper
+// (hash_algo 'legacy') with hash(body) from the channel adapter and clears
+// hash_algo. A row without a body keeps a NULL hash. The core runs it once
+// at first start; afterwards the partial index outbox_legacy_hash is empty.
+func (t *Tx) RehashLegacy(hash func(body string) []byte) (int, error) {
+	type legacyRow struct {
+		id   int64
+		body string
+	}
+	rows, err := collect(func(sc scanner) (legacyRow, error) {
+		var r legacyRow
+		var p nullPack
+		p.raw(&r.id)
+		p.str(&r.body)
+		return r, p.scan(sc)
+	})(t.rows(`SELECT id, body FROM outbox WHERE hash_algo IS NOT NULL`))
+	if err != nil {
+		return 0, err
+	}
+	for _, r := range rows {
+		var h []byte
+		if r.body != "" {
+			h = hash(r.body)
+		}
+		if _, err := t.exec(`UPDATE outbox SET body_hash = ?, hash_algo = NULL WHERE id = ?`, h, r.id); err != nil {
+			return 0, err
+		}
+	}
+	return len(rows), nil
 }

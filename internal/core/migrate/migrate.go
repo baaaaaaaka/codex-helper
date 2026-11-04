@@ -34,6 +34,10 @@ type Options struct {
 	// CodexSessions is the rollout root (~/.codex/sessions) used for stat
 	// and first-line classification. Empty skips the disk scan.
 	CodexSessions string
+	// CountBacklog scans every tracked rollout to EOF (read-only) to count
+	// the prompts and finals the mirror will post on first start. Without
+	// it the proof scan stops at the furthest old position.
+	CountBacklog bool
 	// Now is the clock (defaults to time.Now).
 	Now func() time.Time
 
@@ -127,6 +131,8 @@ func Run(opt Options) (*Report, error) {
 		forkParent: map[string]string{}, holdChild: map[string]bool{}, polls: map[string]legacyPoll{},
 		turns: map[string]*compactTurn{}, extSeen: map[int64]map[string]bool{}, oldestIn: map[int64]int64{},
 		inboundOld: map[string]int64{}, needPause: map[int64]string{}, threadLinks: links,
+		orphans: map[string]int64{}, lastAct: map[int64]int64{},
+		proofs: map[string]*proof{}, outboxMirror: map[string]string{}, loserOf: map[int64]int64{}, mirrorUsed: map[string]bool{},
 	}
 	err = st.Import(func(im *store.Importer) error {
 		c.im = im
@@ -306,7 +312,15 @@ LEFT JOIN threads t ON t.conv_id = c.id WHERE c.label = ? AND c.kind = 'work'`, 
 
 		var zero int
 		_ = q.QueryRowContext(bg, `SELECT count(*) FROM transcript_sources WHERE state = 'tracking' AND offset = 0 AND size > 0`).Scan(&zero)
-		add("no tracking source with progress at offset 0", zero == 0, fmt.Sprintf("%d", zero))
+		add("tracking sources at offset 0 are exactly the no-proof ones resumed at 0", zero == c.zeroNoProof, fmt.Sprintf("%d / %d", zero, c.zeroNoProof))
+
+		lost := 0
+		for loser := range c.loserOf {
+			var n int
+			_ = q.QueryRowContext(bg, `SELECT count(*) FROM transcript_sources WHERE conv_id = ?`, loser).Scan(&n)
+			lost += n
+		}
+		add("parked shared-thread conversations own no transcript source", lost == 0, fmt.Sprintf("%d losers, %d sources", len(c.loserOf), lost))
 
 		var maxKey int
 		_ = q.QueryRowContext(bg, `SELECT COALESCE(MAX(length(turn_key)),0) FROM turns`).Scan(&maxKey)

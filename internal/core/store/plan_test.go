@@ -126,10 +126,11 @@ func evalStr(e ast.Expr, consts map[string]string) (string, bool) {
 
 // hotTables must never be fully scanned by a hot statement. A scan of one of
 // the partial open-work indexes is allowed: its size is bounded by open work,
-// not by history.
+// not by history. outbox_legacy_hash holds only imported rows not yet
+// re-hashed, and is empty after the first start.
 var (
 	hotTables    = regexp.MustCompile(`^SCAN (inbound|outbox|turns|transcript_sources)\b`)
-	partialIndex = regexp.MustCompile(`USING (COVERING )?INDEX (outbox_pending|turns_open|inbound_open)\b`)
+	partialIndex = regexp.MustCompile(`USING (COVERING )?INDEX (outbox_pending|turns_open|inbound_open|outbox_legacy_hash)\b`)
 )
 
 // TestHotQueriesUseIndexes runs EXPLAIN QUERY PLAN on every SQL statement of
