@@ -256,6 +256,12 @@ func (b *accountBudget) fault(string, channel.Part) (bool, error) {
 // (kind) before the engine starts.
 func backlogRig(t *testing.T, tweak func(*Config), chats, rows int, kindOf func(chat int) string) (*rig, []string) {
 	t.Helper()
+	return backlogRigRows(t, tweak, chats, rows, func(chat, _ int) string { return kindOf(chat) })
+}
+
+// backlogRigRows is backlogRig with a kind per row.
+func backlogRigRows(t *testing.T, tweak func(*Config), chats, rows int, kindAt func(chat, row int) string) (*rig, []string) {
+	t.Helper()
 	r := &rig{t: t, ch: channeltest.New(), ag: newAgent(), path: filepath.Join(t.TempDir(), "core.db"), log: &strings.Builder{}, logMu: &sync.Mutex{}}
 	r.tweak = tweak
 	t.Cleanup(r.stop)
@@ -278,8 +284,11 @@ func backlogRig(t *testing.T, tweak func(*Config), chats, rows int, kindOf func(
 			if err := im.Stream(store.Stream{Key: store.ChatStreamKey("teams", chat), ConvID: id, Cursor: "0", Seeded: true}); err != nil {
 				return err
 			}
-			kind := kindOf(i)
 			for k := 0; k < rows; k++ {
+				kind := kindAt(i, k)
+				if kind == "" {
+					continue
+				}
 				key := fmt.Sprintf("bl:%s:%03d", chat, k)
 				if _, _, err := im.Outbox(store.Outbox{ConvID: id, DeliveryKey: key, Seq: int64(k + 1), Kind: kind, Body: kind + " backlog " + key, State: store.OutQueued, CreatedAt: im.Now()}, nil); err != nil {
 					return err
@@ -472,6 +481,64 @@ func TestPacerSettlesUnderABudgetFarBelowTheFloor(t *testing.T) {
 		}
 		if served < 70 {
 			t.Fatalf("scan=%v: %d requests served in 10 min, want more than the old pacer's 54", scan, served)
+		}
+	}
+}
+
+// F4b: a chat whose head is a progress post but which has a final queued
+// behind it ranks with the replies (priority inheritance), so its final is
+// not held back until every other chat's ACK is out. Within the chat the
+// order stays: the progress post goes first.
+func TestFinalBehindProgressNotHeldBackByOtherChatsAcks(t *testing.T) {
+	var (
+		mu    sync.Mutex
+		order []string
+	)
+	const chats, acks = 12, 4
+	r, _ := backlogRigRows(t, func(c *Config) {
+		c.WriteRate = 4
+		c.Channel.(*channeltest.Fake).SendFault = func(_ string, p channel.Part) (bool, error) {
+			mu.Lock()
+			order = append(order, p.Body)
+			mu.Unlock()
+			return false, nil
+		}
+	}, chats, acks, func(chat, row int) string {
+		if chat == chats-1 { // the highest id: last in a round robin
+			return []string{store.OutProgress, store.OutFinal, "", ""}[row]
+		}
+		return store.OutAck
+	})
+	r.wait("the final", func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		for _, b := range order {
+			if strings.HasPrefix(b, store.OutFinal+" backlog") {
+				return true
+			}
+		}
+		return false
+	})
+	mu.Lock()
+	defer mu.Unlock()
+	ackCount, progress := 0, false
+	for _, b := range order {
+		switch {
+		case strings.HasPrefix(b, store.OutProgress+" backlog"):
+			progress = true
+		case strings.HasPrefix(b, store.OutAck+" backlog"):
+			ackCount++
+		case strings.HasPrefix(b, store.OutFinal+" backlog"):
+			if !progress {
+				t.Fatal("the final went before the progress post queued ahead of it")
+			}
+			// Round robin among the replies: the progress post takes the
+			// chat's first turn, the final its second (about half of the
+			// ACKs); without inheritance both wait for every ACK.
+			if total := (chats - 1) * acks; ackCount > 3*total/4 {
+				t.Fatalf("the final went after %d of %d other chats' ACKs; want it ranked with them, not after them", ackCount, total)
+			}
+			return
 		}
 	}
 }
