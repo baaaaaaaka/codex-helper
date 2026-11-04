@@ -18,8 +18,6 @@ const (
 	metaRehashed       = "engine_legacy_rehashed"
 	metaRestart        = "engine_restart_confirm" // "<conv>:<inbound>:<quote>" of a pending `helper restart`
 	metaInbox          = "engine_inbox_conv"      // conversation id of the delegation inbox
-	gateAccountRead    = "teams:account-read"
-	gateAccountWrite   = "teams:account-write"
 )
 
 // Visible labels.

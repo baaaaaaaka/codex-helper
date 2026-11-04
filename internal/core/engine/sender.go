@@ -49,7 +49,7 @@ func (e *Engine) senderLoop(ctx context.Context) {
 // (0: only on wake).
 func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration {
 	now := e.now()
-	if until := e.gate(gateAccountWrite); now.Before(until) {
+	if until := e.gate(e.gWrite); now.Before(until) {
 		return until.Sub(now)
 	}
 	type job struct {
@@ -232,7 +232,7 @@ func (e *Engine) send(ctx context.Context, r store.Outbox, chat, token string, f
 	case throttled:
 		at := now.Add(th.RetryAfter + time.Duration(r.ConvID%5)*e.t.Tick)
 		if th.Scope == channel.ScopeAccount || th.Scope == channel.ScopeUnknown {
-			e.setGate(gateAccountWrite, at, "send throttled")
+			e.setGate(e.gWrite, at, "send throttled")
 		}
 		e.requeue(r.ID, at)
 	case errors.As(err, &rej) && rej.Permanent:
@@ -357,7 +357,7 @@ func (e *Engine) resolvePass(ctx context.Context) time.Duration {
 	if len(due) == 0 {
 		return wait
 	}
-	if until := e.gate(gateAccountRead); now.Before(until) {
+	if until := e.gate(e.gRead); now.Before(until) {
 		return until.Sub(now)
 	}
 	sort.Slice(due, func(i, j int) bool { return due[i] < due[j] })
@@ -405,7 +405,7 @@ func (e *Engine) resolveOne(ctx context.Context, id int64) {
 			u.next = now.Add(th.RetryAfter)
 			e.mu.Unlock()
 			if th.Scope != channel.ScopeChat {
-				e.setGate(gateAccountRead, now.Add(th.RetryAfter), "read-back throttled")
+				e.setGate(e.gRead, now.Add(th.RetryAfter), "read-back throttled")
 			}
 			return
 		}
@@ -609,7 +609,7 @@ func (e *Engine) upload(ctx context.Context, r store.Outbox, f store.OutFile) {
 		e.forgetFailures(r.ID)
 	case throttled:
 		if th.Scope == channel.ScopeAccount || th.Scope == channel.ScopeUnknown {
-			e.setGate(gateAccountWrite, now.Add(th.RetryAfter), "upload throttled")
+			e.setGate(e.gWrite, now.Add(th.RetryAfter), "upload throttled")
 		}
 		e.retryUpload(r.ID, now.Add(th.RetryAfter))
 	case errors.As(err, &rej) && rej.Permanent:

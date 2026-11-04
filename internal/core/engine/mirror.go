@@ -83,7 +83,15 @@ func (e *Engine) mirrorInit() error {
 	if err != nil {
 		return err
 	}
-	m.first = v == ""
+	from, _, err := e.st.Meta(store.MetaMigratedFrom)
+	if err != nil {
+		return err
+	}
+	// A fresh install baselines every existing rollout (no flood for a new
+	// user). A migrated store is not fresh: the converter left the recent
+	// interactive rollouts without a source row for discovery to catch up
+	// (DECISIONS: 120-day window).
+	m.first = v == "" && from == ""
 	srcs, err := e.st.Sources()
 	if err != nil {
 		return err
@@ -235,7 +243,8 @@ func (e *Engine) newRollout(ctx context.Context, f transcript.Found) (store.Tran
 		}
 		e.track(src)
 		return store.TranscriptSource{}, false
-	case e.mirror.first && f.Info.MTime.Before(e.mirror.startedAt):
+	case e.mirror.first && f.Info.MTime.Before(e.mirror.startedAt),
+		f.Info.MTime.Before(e.now().Add(-transcript.Window)):
 		src.State, src.Offset = store.SrcBaseline, f.Info.Size
 		return src, true
 	case !meta.Interactive():

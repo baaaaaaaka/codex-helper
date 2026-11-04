@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/gofrs/flock"
+
+	"github.com/baaaaaaaka/codex-helper/internal/core/store"
 )
 
 // The fixtures under testdata/{rc59,v0120} were written by the real old store
@@ -195,7 +197,7 @@ func TestConvertFixtures(t *testing.T) {
 			}
 
 			// Gates: unexpired only.
-			eq(t, "gate", qi(t, db, `SELECT until FROM gates WHERE key = 'chat:19:chat-s001@thread.v2'`), time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli())
+			eq(t, "gate", qi(t, db, `SELECT until FROM gates WHERE key = ?`, store.ChatGate("teams", "19:chat-s001@thread.v2")), time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli())
 			eq(t, "expired gate", qi(t, db, `SELECT count(*) FROM gates`), int64(1))
 
 			// Transcript sources (no rollout access): stored offsets.

@@ -136,6 +136,8 @@ type Engine struct {
 	cfg Config
 	st  *store.Store
 	ch  channel.Channel
+	// gRead and gWrite are the keys of the account-wide gates.
+	gRead, gWrite string
 	// scanner is set when the channel supports an activity scan (scan
 	// mode): idle chats are then read only when the scan shows a change.
 	scanner channel.ActivityScanner
@@ -227,6 +229,7 @@ func New(cfg Config) (*Engine, error) {
 	}
 	e := &Engine{
 		cfg: cfg, st: cfg.Store, ch: cfg.Channel, ag: cfg.Agent, t: cfg.Timing, log: cfg.Log, now: cfg.Now,
+		gRead: store.AccountReadGate(cfg.ChannelName), gWrite: store.AccountWriteGate(cfg.ChannelName),
 		convs: map[int64]*convState{}, intro: map[int64]string{}, forkThreads: map[string]bool{}, byChat: map[string]int64{}, byThread: map[string]int64{},
 		runnerWake: make(chan struct{}, 1), runnerDirty: map[int64]bool{},
 		senderWake: make(chan struct{}, 1), resolverWake: make(chan struct{}, 1),
@@ -412,16 +415,38 @@ func (e *Engine) load() error {
 	if err != nil {
 		return err
 	}
-	cursor := map[int64]store.Stream{}
+	// One stream per conversation, under store.ChatStreamKey. A row under
+	// another key (an older engine wrote "chat:<id>") is used only when the
+	// canonical row is missing; the cursor then moves to the canonical key
+	// with the next admission.
+	byConv := map[int64][]store.Stream{}
 	for _, s := range streams {
-		cursor[s.ConvID] = s
+		byConv[s.ConvID] = append(byConv[s.ConvID], s)
+	}
+	pick := func(c store.Conversation) (store.Stream, bool) {
+		rows := byConv[c.ID]
+		want := store.ChatStreamKey(e.cfg.ChannelName, c.ExtChatID)
+		var best store.Stream
+		found := false
+		for _, s := range rows {
+			if s.Key == want {
+				return s, true
+			}
+			if !found || s.UpdatedAt > best.UpdatedAt {
+				best, found = s, true
+			}
+		}
+		if len(rows) > 0 {
+			e.logf("conversation %s has no stream %q; using %q", c.Label, want, best.Key)
+		}
+		return best, found
 	}
 	now := e.now()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	for _, c := range convs {
 		cs := e.trackLocked(c)
-		if s, ok := cursor[c.ID]; ok {
+		if s, ok := pick(c); ok {
 			cs.cursor, cs.seeded = s.Cursor, s.Seeded
 			if s.UpdatedAt > 0 {
 				cs.lastActivity = time.UnixMilli(s.UpdatedAt)

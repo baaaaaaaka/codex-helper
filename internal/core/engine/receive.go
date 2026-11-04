@@ -36,7 +36,7 @@ func (e *Engine) receiverLoop(ctx context.Context) {
 		case <-tick.C:
 		}
 		now := e.now()
-		if until := e.gate(gateAccountRead); now.Before(until) {
+		if until := e.gate(e.gRead); now.Before(until) {
 			continue
 		}
 		due := e.dueReads(now)
@@ -184,7 +184,7 @@ func (e *Engine) read(ctx context.Context, id int64) {
 		} else {
 			cs.nextRead = until
 			e.mu.Unlock()
-			e.setGate(gateAccountRead, until, "read throttled")
+			e.setGate(e.gRead, until, "read throttled")
 			e.mu.Lock()
 		}
 		e.logf("read %s throttled for %s (%s scope)", cs.label, th.RetryAfter, th.Scope)
@@ -275,7 +275,7 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 			msgs = append(msgs, cls[i].in)
 			byID[cls[i].in.ExtMsgID] = &cls[i]
 		}
-		admitted, err := tx.AdmitWindow(cs.streamKey(), id, msgs, w.Cursor)
+		admitted, err := tx.AdmitWindow(e.streamKey(cs), id, msgs, w.Cursor)
 		if err != nil {
 			return err
 		}
@@ -363,7 +363,9 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 	return nil
 }
 
-func (cs *convState) streamKey() string { return "chat:" + cs.chat }
+func (e *Engine) streamKey(cs *convState) string {
+	return store.ChatStreamKey(e.cfg.ChannelName, cs.chat)
+}
 
 // classify decides sender and kind of one message (pure, plus store reads
 // for own-message recognition). keep=false drops it (deleted messages).
@@ -614,7 +616,7 @@ func (e *Engine) scanLoop(ctx context.Context) {
 		case <-tick.C:
 		}
 		now := e.now()
-		if until := e.gate(gateAccountRead); now.Before(until) {
+		if until := e.gate(e.gRead); now.Before(until) {
 			continue
 		}
 		e.readTokens.borrow()
@@ -625,7 +627,7 @@ func (e *Engine) scanLoop(ctx context.Context) {
 		}
 		if err != nil {
 			if th, ok := channel.AsThrottled(err); ok {
-				e.setGate(gateAccountRead, e.now().Add(th.RetryAfter), "activity scan throttled")
+				e.setGate(e.gRead, e.now().Add(th.RetryAfter), "activity scan throttled")
 				continue
 			}
 			failures++

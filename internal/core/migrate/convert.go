@@ -20,7 +20,7 @@ const (
 )
 
 // StreamKey is the receive-stream key of a Teams chat.
-func StreamKey(chatID string) string { return "teams:chat:" + chatID }
+func StreamKey(chatID string) string { return store.ChatStreamKey(channel, chatID) }
 
 // LegacyTurnKey is the turn key of a migrated turn: short, stable, and in a
 // namespace new keys ('cxp-...') never use.
@@ -1186,12 +1186,17 @@ func (c *converter) convertGates() error {
 			e.Outcomes["expired -> dropped"]++
 			return nil
 		}
-		key := "chat:" + chat
+		// Keys the engine reads (store/keys.go): the legacy account-wide
+		// Graph write gate becomes the account write gate, a chat gate
+		// delays that chat.
+		keys := []string{store.ChatGate(channel, chat)}
 		if chat == accountGraphGateKey {
-			key = "graph"
+			keys = []string{store.AccountWriteGate(channel)}
 		}
-		if err := c.im.Gate(store.Gate{Key: key, Until: until, Reason: firstNonEmpty(g.Reason, "migrated Retry-After")}); err != nil {
-			return err
+		for _, key := range keys {
+			if err := c.im.Gate(store.Gate{Key: key, Until: until, Reason: firstNonEmpty(g.Reason, "migrated Retry-After")}); err != nil {
+				return err
+			}
 		}
 		e.Imported++
 		return nil
@@ -1204,9 +1209,9 @@ func (c *converter) convertMeta() error {
 	var au legacyAutoUpdate
 	_, _ = decode(c.l.section("auto_update"), &au)
 	kv := map[string]string{
-		"migrated_from":       string(c.l.version),
-		"migrated_at":         strconv.FormatInt(c.ms(), 10),
-		"migrated_source_dir": c.l.dir,
+		store.MetaMigratedFrom: string(c.l.version),
+		"migrated_at":          strconv.FormatInt(c.ms(), 10),
+		"migrated_source_dir":  c.l.dir,
 	}
 	if c.scopeID != "" {
 		kv["scope_id"] = c.scopeID

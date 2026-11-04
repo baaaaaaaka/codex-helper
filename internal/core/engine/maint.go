@@ -44,6 +44,19 @@ func (e *Engine) loadGates() error {
 	}
 	for _, g := range gs {
 		e.gates[g.Key] = fromMS(g.Until)
+		// A per-chat gate (migrated Retry-After) delays that chat's reads
+		// and sends.
+		for _, cs := range e.convs {
+			if cs.chat != "" && g.Key == store.ChatGate(e.cfg.ChannelName, cs.chat) {
+				until := fromMS(g.Until)
+				if until.After(cs.nextRead) {
+					cs.nextRead = until
+				}
+				if last := until.Add(-e.t.ChatRate); last.After(cs.lastSend) {
+					cs.lastSend = last
+				}
+			}
+		}
 	}
 	return nil
 }

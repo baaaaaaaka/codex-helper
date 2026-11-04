@@ -714,7 +714,7 @@ func (e *Engine) progress(ctx context.Context, cs *convState, tr store.Turn, ps 
 	}
 	now := e.now()
 	coalesce := false
-	if until := e.gate(gateAccountWrite); !until.IsZero() && now.Sub(until) < progressCoalesceFor {
+	if until := e.gate(e.gWrite); !until.IsZero() && now.Sub(until) < progressCoalesceFor {
 		coalesce = true
 	}
 	if coalesce && ps.posted >= 1 {
