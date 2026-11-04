@@ -238,3 +238,9 @@ func TextHash(text string) string {
 	sum := sha256.Sum256([]byte(strings.Join(strings.Fields(clean), " ")))
 	return hex.EncodeToString(sum[:16])
 }
+
+// BodyHasher is implemented by channels that can recompute Part.Hash from
+// a stored part body (used once to re-hash imported legacy outbox rows).
+type BodyHasher interface {
+	BodyHash(body string) string
+}
