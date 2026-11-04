@@ -116,7 +116,7 @@ func TestR09_R10_MirrorTUIRollout(t *testing.T) {
 		}
 		return -1
 	}
-	order := []int{idx("User: Local question " + p1), idx(a1), idx(p2), idx(a2), idx(p3), idx(a3)}
+	order := []int{idx(p1), idx(a1), idx(p2), idx(a2), idx(p3), idx(a3)}
 	ordered := order[0] >= 0
 	for i := 1; i < len(order); i++ {
 		ordered = ordered && order[i] >= order[i-1]
