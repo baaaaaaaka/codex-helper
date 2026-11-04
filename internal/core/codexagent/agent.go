@@ -61,6 +61,10 @@ func New(cfg Config) *Agent {
 
 func key(conv int64) string { return fmt.Sprintf("conv-%d", conv) }
 
+// auxKey is the server for calls that need no working directory (model
+// lists, turn lookups): it is never reused for a conversation's turns.
+const auxKey = "aux"
+
 // Prepare kills app-servers a previous helper process left behind.
 func (a *Agent) Prepare(ctx context.Context) error {
 	if a.cfg.PIDFile == "" {
@@ -217,7 +221,15 @@ func (a *Agent) Lookup(ctx context.Context, convID int64, threadID, turnKey stri
 	if threadID == "" {
 		return engine.TurnOutcome{}, false, nil
 	}
-	lease, err := a.pool.Acquire(ctx, key(convID), a.serverConfig(""))
+	// The conversation's own server when it runs; otherwise the auxiliary
+	// one, so no conversation server is started without its working
+	// directory and then reused for the next turn (review L10). The lookup
+	// only reads the thread.
+	k := key(convID)
+	if !a.pool.Busy(k) {
+		k = auxKey
+	}
+	lease, err := a.pool.Acquire(ctx, k, a.serverConfig(""))
 	if err != nil {
 		return engine.TurnOutcome{}, false, err
 	}
@@ -269,7 +281,7 @@ func (a *Agent) Fork(ctx context.Context, convID int64, threadID, lastTurnID, cw
 
 // Models lists the models Codex offers (any running or a fresh server).
 func (a *Agent) Models(ctx context.Context) ([]engine.Model, error) {
-	lease, err := a.pool.Acquire(ctx, "models", a.serverConfig(""))
+	lease, err := a.pool.Acquire(ctx, auxKey, a.serverConfig(""))
 	if err != nil {
 		return nil, err
 	}

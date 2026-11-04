@@ -146,3 +146,46 @@ func TestCancelDuringStartNeverStartsTheTurn(t *testing.T) {
 		t.Fatalf("Codex began %d turn(s) after the cancel", n)
 	}
 }
+
+// Review L10: a lookup with no running conversation server does not start
+// one without the conversation's working directory.
+func TestLookupDoesNotStartAConversationServer(t *testing.T) {
+	brain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/begin":
+			_ = json.NewEncoder(w).Encode(fakecodex.Plan{Seq: 1})
+		case "/await":
+			_ = json.NewEncoder(w).Encode(fakecodex.AwaitResult{Outcome: "answered", Answer: "done"})
+		default:
+			_, _ = w.Write([]byte("{}"))
+		}
+	}))
+	defer func() { brain.CloseClientConnections(); brain.Close() }()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	a := New(Config{
+		Server: codex.Config{Bin: exe, Env: []string{envFake + "=1", "CODEX_HOME=" + home, fakecodex.EnvBrainURL + "=" + brain.URL}, Dir: home},
+		Poll:   100 * time.Millisecond,
+	})
+	defer a.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	var thread string
+	out, err := a.Run(ctx, engine.TurnRequest{ConvID: 1, Cwd: home, TurnKey: "k-1", Text: "hello"}, engine.TurnHooks{
+		ThreadStarted: func(id string) error { thread = id; return nil },
+	})
+	if err != nil || out.Status != engine.StatusCompleted {
+		t.Fatalf("Run: %+v, %v", out, err)
+	}
+	a.Kill(1) // as after a restart or an unknown outcome
+	found, ok, err := a.Lookup(ctx, 1, thread, "k-1")
+	if err != nil || !ok || found.Status != engine.StatusCompleted {
+		t.Fatalf("Lookup: %+v, %v, %v", found, ok, err)
+	}
+	if a.pool.Busy(key(1)) {
+		t.Fatal("Lookup started the conversation's server without its working directory")
+	}
+}
