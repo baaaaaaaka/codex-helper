@@ -172,6 +172,9 @@ func Parse(line []byte) Event {
 	if ev, ok := parseHead(line, len(line) > cheapRecordAt); ok {
 		return ev
 	}
+	if ev, ok := parseMetaOnce(line); ok {
+		return ev
+	}
 	var env envelope
 	if err := json.Unmarshal(line, &env); err != nil {
 		return Event{Kind: KindOther}
@@ -180,15 +183,10 @@ func Parse(line []byte) Event {
 	switch env.Type {
 	case "session_meta":
 		var m metaPayload
-		if json.Unmarshal(env.Payload, &m) != nil || m.ID == "" {
+		if json.Unmarshal(env.Payload, &m) != nil {
 			return Event{Kind: KindOther, Time: ts}
 		}
-		meta := &SessionMeta{ID: m.ID, Cwd: m.Cwd, Originator: m.Originator, Source: sourceName(m.Source), ForkedFrom: m.ForkedFrom}
-		meta.Time, _ = time.Parse(time.RFC3339Nano, m.Timestamp)
-		if meta.Time.IsZero() {
-			meta.Time = ts
-		}
-		return Event{Kind: KindSessionMeta, Time: ts, ThreadID: m.ID, Meta: meta}
+		return sessionMetaEvent(ts, m)
 	case "event_msg", "turn_context", "response_item":
 	default:
 		return Event{Kind: KindOther, Time: ts}
@@ -244,6 +242,69 @@ func Parse(line []byte) Event {
 		ev.Kind = KindTurnRef
 	}
 	return ev
+}
+
+// sessionMetaEvent is the event of a session_meta record with time ts and
+// payload m.
+func sessionMetaEvent(ts time.Time, m metaPayload) Event {
+	if m.ID == "" {
+		return Event{Kind: KindOther, Time: ts}
+	}
+	meta := &SessionMeta{ID: m.ID, Cwd: m.Cwd, Originator: m.Originator, Source: sourceName(m.Source), ForkedFrom: m.ForkedFrom}
+	meta.Time, _ = time.Parse(time.RFC3339Nano, m.Timestamp)
+	if meta.Time.IsZero() {
+		meta.Time = ts
+	}
+	return Event{Kind: KindSessionMeta, Time: ts, ThreadID: m.ID, Meta: meta}
+}
+
+// metaEnvelope is a session_meta record decoded in one pass.
+type metaEnvelope struct {
+	Timestamp string      `json:"timestamp"`
+	Type      string      `json:"type"`
+	Payload   metaPayload `json:"payload"`
+}
+
+var jSessionMeta = []byte(`"type":"session_meta"`)
+
+// parseMetaOnce decodes a session_meta record in one pass (W1b: the first
+// record of every rollout, about 8 KB, was decoded twice, each time after
+// a full validation scan). ok is false when the line is not one it can
+// decode exactly like the two-pass path in Parse, which then decodes it:
+//   - the line does not name the session_meta type, or its last top-level
+//     "type" is another one;
+//   - the decode fails (the two-pass path reports such a line in its own
+//     way);
+//   - a "payload" key may occur twice: the one-pass decode would merge the
+//     two objects where the two-pass decode keeps the last. So the line
+//     must hold the string "payload" once (in any letter case, which the
+//     decoder matches) and no \u escape (which could spell another one).
+func parseMetaOnce(line []byte) (Event, bool) {
+	if !bytes.Contains(line, jSessionMeta) || bytes.Contains(line, []byte(`\u`)) || countFold(line, "payload") != 1 {
+		return Event{}, false
+	}
+	var env metaEnvelope
+	if json.Unmarshal(line, &env) != nil || env.Type != "session_meta" {
+		return Event{}, false
+	}
+	ts, _ := time.Parse(time.RFC3339Nano, env.Timestamp)
+	return sessionMetaEvent(ts, env.Payload), true
+}
+
+// countFold counts the quoted strings "word" in line, ASCII case
+// insensitively (word is lower-case ASCII letters).
+func countFold(line []byte, word string) int {
+	n := 0
+	for i := 0; ; {
+		j := bytes.IndexByte(line[i:], '"')
+		if j < 0 {
+			return n
+		}
+		i += j + 1
+		if end := i + len(word); end < len(line) && line[end] == '"' && bytes.EqualFold(line[i:end], []byte(word)) {
+			n++
+		}
+	}
 }
 
 // parseHead classifies a record from its first cutHead bytes when that is
