@@ -61,6 +61,11 @@ type TurnHooks struct {
 	// Activity is called on any Codex event of the running turn (silence
 	// hints and the stall bound, R-19). It must not block.
 	Activity func()
+	// Cancelled reports whether the user cancelled the turn. The agent
+	// checks it once the turn is registered for Interrupt and before
+	// turn/start, so a cancel while Codex is still starting stops the turn
+	// before it runs.
+	Cancelled func() bool
 }
 
 // Turn statuses reported by the agent.

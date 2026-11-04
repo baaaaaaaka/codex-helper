@@ -36,9 +36,10 @@ type Agent struct {
 }
 
 type runningTurn struct {
-	srv      *codex.Server
-	threadID string
-	turnID   string
+	srv       *codex.Server
+	threadID  string
+	turnID    string
+	interrupt bool // Interrupt came before Codex accepted the turn
 }
 
 var _ engine.Agent = (*Agent)(nil)
@@ -126,13 +127,29 @@ func (a *Agent) Run(ctx context.Context, req engine.TurnRequest, hooks engine.Tu
 		}
 		a.mu.Unlock()
 	}()
+	// A cancel during app-server start (review L4): the engine marks the
+	// turn cancelled before it calls Interrupt, so either this check sees
+	// it or Interrupt finds the registered turn.
+	if hooks.Cancelled != nil && hooks.Cancelled() {
+		return engine.TurnOutcome{NotStarted: true, Status: engine.StatusInterrupted, Error: "cancelled before Codex started the turn"}, nil
+	}
 	res, err := srv.RunTurn(ctx, codex.TurnStartParams{
 		ThreadID: threadID, Input: in, ClientID: req.TurnKey, Cwd: req.Cwd, Model: req.Model, Effort: req.Effort,
 	}, a.cfg.Poll, codex.TurnHooks{
 		Started: func(id string) {
 			a.mu.Lock()
 			rt.turnID = id
+			pending := rt.interrupt
 			a.mu.Unlock()
+			if pending {
+				go func() {
+					ictx, cancel := context.WithTimeout(ctx, 30*time.Second)
+					defer cancel()
+					if err := srv.TurnInterrupt(ictx, threadID, id); err != nil {
+						fmt.Fprintf(a.cfg.Log, "codexagent: interrupt after start: %v\n", err)
+					}
+				}()
+			}
 			if hooks.Started != nil {
 				hooks.Started(id)
 			}
@@ -212,20 +229,23 @@ func (a *Agent) Lookup(ctx context.Context, convID int64, threadID, turnKey stri
 	return outcome(t.ID, t.Status, t.Final(), t.Error, nil), true, nil
 }
 
-// Interrupt asks Codex to stop the running turn of convID.
+// Interrupt asks Codex to stop the running turn of convID. A turn still
+// being started either sees the engine's cancel flag before turn/start
+// (TurnHooks.Cancelled) or, once turn/start was sent, is interrupted as
+// soon as Codex reports it started.
 func (a *Agent) Interrupt(ctx context.Context, convID int64) error {
 	a.mu.Lock()
 	rt := a.running[convID]
 	var turnID string
 	if rt != nil {
 		turnID = rt.turnID
+		if turnID == "" {
+			rt.interrupt = true
+		}
 	}
 	a.mu.Unlock()
-	if rt == nil {
+	if rt == nil || turnID == "" {
 		return nil
-	}
-	if turnID == "" {
-		return errors.New("codexagent: the turn has not started yet")
 	}
 	return rt.srv.TurnInterrupt(ctx, rt.threadID, turnID)
 }

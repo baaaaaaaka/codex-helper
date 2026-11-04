@@ -247,6 +247,11 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 	hooks := TurnHooks{
 		Progress: func(text string) { touch(); e.progress(ctx, cs, tr, prog, text) },
 		Activity: touch,
+		Cancelled: func() bool {
+			e.mu.Lock()
+			defer e.mu.Unlock()
+			return rs.cancelled
+		},
 		ThreadStarted: func(threadID string) error {
 			return e.bindThread(id, threadID)
 		},

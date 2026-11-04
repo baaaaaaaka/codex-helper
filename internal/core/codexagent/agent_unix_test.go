@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -95,5 +96,53 @@ func TestUnknownStartErrorKillsTheServer(t *testing.T) {
 	}
 	if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
 		t.Fatalf("app-server %d still alive after an unknown outcome (kill 0: %v)", pid, err)
+	}
+}
+
+// Review L4: a cancel that arrives while the app-server is still starting
+// (Interrupt finds no registered turn) stops the turn before turn/start.
+func TestCancelDuringStartNeverStartsTheTurn(t *testing.T) {
+	var begins atomic.Int32
+	brain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/begin" {
+			begins.Add(1)
+			_ = json.NewEncoder(w).Encode(fakecodex.Plan{Seq: 1})
+			return
+		}
+		_, _ = w.Write([]byte("{}"))
+	}))
+	defer func() { brain.CloseClientConnections(); brain.Close() }()
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	a := New(Config{
+		Server: codex.Config{Bin: exe, Env: []string{envFake + "=1", "CODEX_HOME=" + home, fakecodex.EnvBrainURL + "=" + brain.URL}, Dir: home},
+		Poll:   100 * time.Millisecond,
+	})
+	defer a.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	var cancelled atomic.Bool
+	out, err := a.Run(ctx, engine.TurnRequest{ConvID: 1, Cwd: home, TurnKey: "k-1", Text: "hello"}, engine.TurnHooks{
+		ThreadStarted: func(string) error {
+			// The engine marks the turn cancelled, then calls Interrupt.
+			cancelled.Store(true)
+			if err := a.Interrupt(ctx, 1); err != nil {
+				t.Errorf("Interrupt during start: %v", err)
+			}
+			return nil
+		},
+		Cancelled: cancelled.Load,
+	})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !out.NotStarted {
+		t.Fatalf("outcome %+v, want not started", out)
+	}
+	if n := begins.Load(); n != 0 {
+		t.Fatalf("Codex began %d turn(s) after the cancel", n)
 	}
 }
