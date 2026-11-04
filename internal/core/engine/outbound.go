@@ -34,6 +34,15 @@ const maxArtifactBytes = 250 << 20
 // mathContract asks Codex for formulas the channel can render.
 const mathContract = "Put fractions, sums, integrals, matrices, and display math in <m>TeX</m> on a separate line, never in prose, tables, or lists—even if asked for one line. Use backticks for simple inline/literal TeX. Never use $ or \\(...\\). Math markers are not artifacts."
 
+// helperSafety keeps a turn from managing the helper that runs it, and
+// points cross-machine work at `cxp delegate` (the old core's prompt).
+const helperSafety = `Helper safety:
+- You are running inside a Codex turn launched by the chat helper. The current request is the user message above; treat earlier requests in resumed history as completed context unless the user asks about them.
+- Do not restart, reload, kill, replace, or background the helper process, binary, or service from this turn.
+- If the helper needs to restart after an update or local repair, finish the answer and tell the user to send ` + "`helper restart now`" + ` in the control chat.
+- If the helper needs a release update, tell the user to send ` + "`helper update now`" + `, or ` + "`helper update prerelease`" + ` only when they asked for prereleases.
+- Subagent requests use native Codex subagents. For cross-machine agent delegation, use the cxp skill and its ` + "`cxp delegate`" + ` workflow when the task needs another signed-in machine.`
+
 // outboundDir is the output directory of a turn ("" when files are off).
 func (e *Engine) outboundDir(turnKey string) string {
 	if e.cfg.FilesDir == "" || turnKey == "" {
@@ -45,7 +54,7 @@ func (e *Engine) outboundDir(turnKey string) string {
 // outboundInstructions is appended to a prompt so Codex knows how to send
 // files back.
 func outboundInstructions(dir string) string {
-	s := mathContract
+	s := helperSafety + "\n\n" + mathContract
 	if dir == "" {
 		return s
 	}
