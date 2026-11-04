@@ -739,6 +739,33 @@ func TestVoiceTranscriptionFailureStillRunsWithoutLeaks(t *testing.T) {
 	}
 }
 
+// A message that is only a voice clip whose transcription failed is
+// answered with the reason and does not start a Codex turn (v0.1.20); the
+// next prompt in the chat still runs.
+func TestVoiceOnlyTranscriptionFailureIsAnsweredWithoutTurn(t *testing.T) {
+	asr := &fakeASR{release: make(chan struct{}), fail: true}
+	close(asr.release)
+	r := newRig(t, func(c *Config) { c.Transcriber = asr; c.FilesDir = t.TempDir() })
+	work := r.newWork(t.TempDir())
+	ref := r.ch.AddFile("voice.ogg", []byte("OggS..."))
+	ref.Kind = channel.FileVoice
+	r.ch.PostUser(work, "", ref)
+	r.wait("reason posted", func() bool { return len(r.own(work, "The voice message was not sent to Codex")) == 1 })
+	for _, m := range r.own(work, "The voice message was not sent to Codex") {
+		if strings.Contains(m.Text, "/secret/path") {
+			t.Fatalf("reason leaks a path: %q", m.Text)
+		}
+	}
+	r.ch.PostUser(work, "typed instead")
+	r.wait("next prompt", func() bool { return len(r.own(work, "ANSWER to typed instead")) == 1 })
+	r.ag.mu.Lock()
+	n := len(r.ag.runs)
+	r.ag.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("%d turns, want only the typed prompt", n)
+	}
+}
+
 // With a short account read budget the control chat (polled every tick in
 // fast timing) must not starve a work chat: due reads go most overdue first.
 func TestReadBudgetSharedFairlyWithControlChat(t *testing.T) {

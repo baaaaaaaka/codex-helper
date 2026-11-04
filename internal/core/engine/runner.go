@@ -172,10 +172,13 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 		request string // delegation request text (inbox turns)
 		queued  string // quote of a prompt that waited (folded notice)
 		batch   int64  // last turn of a batch start notice
+		// voiceFailed: the next turn was a voice message that could not
+		// be transcribed; it was answered with the reason, not started.
+		voiceFailed bool
 	)
 	err := e.update(func(tx *store.Tx) error {
 		var err error
-		queued, batch = "", 0
+		queued, batch, voiceFailed = "", 0, false
 		tr, got, err = tx.NextRunnable(id)
 		if err != nil || !got {
 			return err
@@ -195,6 +198,19 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 		files, err := tx.InboundFiles(tr.InboundID)
 		if err != nil {
 			return err
+		}
+		if text := voiceFailure(in.Body, files); text != "" {
+			// As in v0.1.20: a voice message that could not be
+			// transcribed is answered with the reason and not sent to
+			// Codex, which would only see an empty request. A prompt
+			// with text or another usable attachment still runs, with
+			// the reason listed for Codex (turnInput).
+			msgs, err := e.notice(fmt.Sprintf("turn:%d:voice", tr.ID), text)
+			if err != nil {
+				return err
+			}
+			got, voiceFailed = false, true
+			return tx.FinishTurn(tr.ID, store.TurnFailed, "voice transcription failed", msgs)
 		}
 		req = TurnRequest{ConvID: id, ThreadID: th.ThreadID, Cwd: th.Cwd, Model: th.Model, Effort: th.Effort,
 			TurnKey: tr.TurnKey, Text: in.Body}
@@ -247,6 +263,10 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 		e.logf("start turn in %d: %v", id, err)
 		return false
 	}
+	if voiceFailed {
+		e.wakeSender()
+		e.wakeRunner(id) // the next queued turn, if any
+	}
 	if !got {
 		return false
 	}
@@ -267,6 +287,29 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 		e.execTurn(ctx, cs, tr, req, rs)
 	}()
 	return true
+}
+
+// voiceFailure is the reply to a prompt that is only a voice message that
+// could not be transcribed ("" otherwise: it has text, a usable
+// attachment, or no failed voice). Each reason is the path-free user text
+// recorded by fetchOne.
+func voiceFailure(body string, files []store.InboundFile) string {
+	if strings.TrimSpace(body) != "" {
+		return ""
+	}
+	var reasons []string
+	for _, f := range files {
+		switch {
+		case f.State == "ready":
+			return ""
+		case f.Kind == "voice" && f.State == "failed":
+			reasons = append(reasons, firstNonEmpty(f.Error, "the voice message could not be transcribed"))
+		}
+	}
+	if len(reasons) == 0 {
+		return ""
+	}
+	return "The voice message was not sent to Codex.\n\n" + strings.Join(reasons, "\n\n")
 }
 
 // turnInput builds the Codex input of a prompt and its attachments: images
