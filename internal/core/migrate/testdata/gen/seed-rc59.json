@@ -1,0 +1,14 @@
+{
+  "sessions": {
+    "s006": {"id": "s006", "status": "staging", "codex_thread_id": "11111111-1111-4111-8111-000000000006", "created_at": "2026-09-01T10:00:00Z"},
+    "__control_fallback__": {"id": "__control_fallback__", "status": "active", "runner_kind": "control_fallback", "codex_thread_id": "11111111-1111-4111-8111-0000000000ff", "created_at": "2026-08-01T00:00:00Z"}
+  },
+  "fork_operations": {
+    "f1": {"id": "f1", "parent_session_id": "s001", "child_session_id": "s006", "child_thread_id": "11111111-1111-4111-8111-000000000006", "phase": "requested", "created_at": "2026-09-01T10:00:00Z"}
+  },
+  "inbound_events": {
+    "i6": {"id": "i6", "teams_chat_id": "19:control@thread.v2", "teams_message_id": "1788256806000", "text": "held control", "status": "manual_hold", "received_at": "2026-09-01T10:00:06Z", "created_at": "2026-09-01T10:00:06Z"},
+    "i7": {"id": "i7", "session_id": "s007", "teams_chat_id": "19:chat-s007@thread.v2", "teams_message_id": "1788256807000", "text": "held work", "status": "manual_hold", "received_at": "2026-09-01T10:00:07Z", "created_at": "2026-09-01T10:00:07Z"},
+    "i8": {"id": "i8", "session_id": "s007", "teams_chat_id": "19:chat-s007@thread.v2", "teams_message_id": "1788256808000", "text": "uncertain", "status": "uncertain", "received_at": "2026-09-01T10:00:08Z", "created_at": "2026-09-01T10:00:08Z"}
+  }
+}
