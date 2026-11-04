@@ -925,21 +925,26 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 }
 
 // renderMirror renders one mirrored record. Prompts read "User: <text>",
-// answers carry the Codex label; neither mentions the owner.
+// answers carry the Codex label; neither mentions the owner. A prompt too
+// long for one message carries the label in every part's header instead
+// ("User [part i/n]:", as v0.1.20's "🧑‍💻 User [part i/n]:"), not an
+// empty " [part i/n]:" header with the label inline in the first part only.
 func (e *Engine) renderMirror(ctx context.Context, thread string, o transcript.Output) ([]store.OutMsg, error) {
-	var doc channel.RichDoc
+	var parts []channel.Part
+	var err error
 	if o.User {
 		text := strings.TrimSpace(o.Text)
+		inline := "**" + labelUser + ":** " + text
 		if blockStart(text) {
-			text = "**" + labelUser + ":**\n\n" + text
-		} else {
-			text = "**" + labelUser + ":** " + text
+			inline = "**" + labelUser + ":**\n\n" + text
 		}
-		doc = channel.RichDoc{Markdown: text}
+		parts, err = e.ch.Render(ctx, channel.RichDoc{Markdown: inline})
+		if err == nil && len(parts) > 1 {
+			parts, err = e.ch.Render(ctx, channel.RichDoc{Label: labelUser, Markdown: text})
+		}
 	} else {
-		doc = channel.RichDoc{Label: labelCodex, Markdown: o.Text, Math: true}
+		parts, err = e.ch.Render(ctx, channel.RichDoc{Label: labelCodex, Markdown: o.Text, Math: true})
 	}
-	parts, err := e.ch.Render(ctx, doc)
 	if err != nil {
 		return nil, err
 	}
