@@ -391,3 +391,35 @@ func TestParseSkipsLargeNonEventRecordsCheaply(t *testing.T) {
 		t.Fatal("nested type key accepted as top-level")
 	}
 }
+
+// Review M8: Stat reports a file identity that changes when the rollout is
+// replaced by rename (inode on Unix, file index on Windows), so a rewrite
+// is detected even when the new file is not smaller.
+func TestStatFileIDChangesWhenReplaced(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "r.jsonl")
+	if err := os.WriteFile(p, []byte("a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a, err := Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmp := filepath.Join(dir, "r.tmp")
+	if err := os.WriteFile(tmp, []byte("a\nb\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(tmp, p); err != nil {
+		t.Fatal(err)
+	}
+	b, err := Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.Inode == 0 || b.Inode == 0 || a.Inode == b.Inode {
+		t.Fatalf("file ids %d, %d: want two different non-zero ids", a.Inode, b.Inode)
+	}
+	if !Rewritten(b, a.Size, a.Inode) {
+		t.Fatal("replacement not detected as a rewrite")
+	}
+}

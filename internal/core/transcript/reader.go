@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"os"
-	"syscall"
 	"time"
 )
 
@@ -117,17 +116,14 @@ type FileInfo struct {
 	Inode int64
 }
 
-// Stat returns the size, modification time and inode of path.
+// Stat returns the size, modification time and file identity of path: the
+// inode on Unix, the NTFS file index on Windows (0 when unknown).
 func Stat(path string) (FileInfo, error) {
 	st, err := os.Stat(path)
 	if err != nil {
 		return FileInfo{}, err
 	}
-	fi := FileInfo{Size: st.Size(), MTime: st.ModTime()}
-	if sys, ok := st.Sys().(*syscall.Stat_t); ok {
-		fi.Inode = int64(sys.Ino)
-	}
-	return fi, nil
+	return FileInfo{Size: st.Size(), MTime: st.ModTime(), Inode: fileID(path, st)}, nil
 }
 
 // Rewritten reports whether a file was replaced or truncated since it was

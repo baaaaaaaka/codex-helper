@@ -38,7 +38,19 @@ type mirrorFile struct {
 	src     store.TranscriptSource
 	tracker *transcript.Tracker
 	info    transcript.FileInfo
+	// realign is set while a rewritten rollout is re-read from the start,
+	// over as many passes as it takes (review M8): records already
+	// delivered, and records at or before realignAt (the old file's last
+	// processed modification time), are not posted again. Persisted in meta.
+	realign   bool
+	realignAt time.Time
+	// fails and retryAt back off a rollout whose records failed to render
+	// (review M7); the records are re-read, never dropped.
+	fails   int
+	retryAt time.Time
 }
+
+func realignKey(srcID int64) string { return fmt.Sprintf("%s%d", metaRealignPrefix, srcID) }
 
 func (e *Engine) mirrorSkipTurn(codexTurnID string) {
 	if e.mirror == nil || codexTurnID == "" {
@@ -105,8 +117,15 @@ func (e *Engine) mirrorInit() error {
 			}
 			continue
 		}
-		m.files[s.Path] = &mirrorFile{src: s, tracker: transcript.NewTracker(s.ThreadID, s.Offset, s.Line, e.mirrorSkip),
+		f := &mirrorFile{src: s, tracker: transcript.NewTracker(s.ThreadID, s.Offset, s.Line, e.mirrorSkip),
 			info: transcript.FileInfo{Size: s.Size, MTime: fromMS(s.MTime), Inode: s.Inode}}
+		if v, _, err := e.st.Meta(realignKey(s.ID)); err == nil && v != "" {
+			var at int64
+			if _, err := fmt.Sscan(v, &at); err == nil {
+				f.realign, f.realignAt = true, fromMS(at)
+			}
+		}
+		m.files[s.Path] = f
 	}
 	return nil
 }
@@ -389,6 +408,9 @@ func (e *Engine) mirrorPoll(ctx context.Context) {
 		if info == f.info && f.tracker.Offset() >= info.Size {
 			continue
 		}
+		if e.now().Before(f.retryAt) {
+			continue
+		}
 		e.mirrorRead(ctx, f, info)
 	}
 }
@@ -402,12 +424,16 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 		e.mirror.mu.Unlock()
 		return
 	}
-	rewritten := transcript.Rewritten(info, f.tracker.Offset(), f.src.Inode) && f.src.Inode != 0
-	prevMTime := fromMS(f.src.MTime)
+	// A shrink below the read offset needs no inode (Windows: the file
+	// index stands in for it, see transcript.Stat).
+	rewritten := transcript.Rewritten(info, f.tracker.Offset(), f.src.Inode)
+	realignAt := f.realignAt
 	if rewritten {
-		e.logf("mirror: %s was rewritten; realigning by record id", filepath.Base(f.src.Path))
+		e.logf("mirror: %s was rewritten; realigning", filepath.Base(f.src.Path))
 		f.tracker.Restart()
+		realignAt = fromMS(f.src.MTime)
 	}
+	realign := rewritten || f.realign
 	fh, err := os.Open(f.src.Path)
 	if err != nil {
 		return
@@ -455,11 +481,23 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 	for _, o := range outs {
 		msgs, err := e.renderMirror(ctx, thread, o)
 		if err != nil {
-			e.logf("mirror render: %v", err)
+			// Re-read these records from the persisted position after a
+			// backoff (review M7): never lose them.
+			f.fails++
+			back := e.t.MirrorStat << min(f.fails, 8)
+			if back > 5*time.Minute {
+				back = 5 * time.Minute
+			}
+			f.retryAt = e.now().Add(back)
+			if f.fails <= 3 || f.fails%20 == 0 {
+				e.logf("mirror render %s (%d in a row, retry in %s): %v", filepath.Base(f.src.Path), f.fails, back, err)
+			}
+			f.tracker = transcript.NewTracker(f.src.ThreadID, f.src.Offset, f.src.Line, e.mirrorSkip)
 			return
 		}
 		rs = append(rs, rendered{o: o, msgs: msgs})
 	}
+	f.fails, f.retryAt = 0, time.Time{}
 	off, line := f.tracker.Resume()
 	if off == 0 && f.src.Offset > 0 {
 		off = 1 // the store never moves a source back to 0; 1 re-aligns to line 2
@@ -470,9 +508,9 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 		posted, woke = 0, false
 		var msgs []store.OutMsg
 		start := 0
-		if rewritten {
-			// Realign: drop everything up to the last record already
-			// delivered; without one, what is not newer than the old file.
+		if realign {
+			// Realign: in this pass, drop everything up to the last record
+			// already delivered.
 			last := -1
 			for i, r := range rs {
 				ok, err := tx.Delivered(transcript.MirrorKeyPrefix(thread, r.o.RecordID))
@@ -484,11 +522,6 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 				}
 			}
 			start = last + 1
-			if last < 0 {
-				for start < len(rs) && !rs[start].o.Time.After(prevMTime) {
-					start++
-				}
-			}
 		}
 		for _, r := range rs[start:] {
 			ok, err := tx.Delivered(transcript.MirrorKeyPrefix(thread, r.o.RecordID))
@@ -498,8 +531,23 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 			if ok {
 				continue
 			}
+			if realign && (r.o.Time.IsZero() || !r.o.Time.After(realignAt)) {
+				continue // in the file before the rewrite: already handled
+			}
 			msgs = append(msgs, r.msgs...)
 			posted++
+		}
+		// Realignment lasts until a pass reaches the end of the file, across
+		// passes and restarts.
+		switch {
+		case realign && more:
+			if err := tx.SetMeta(realignKey(f.src.ID), fmt.Sprint(ms(realignAt))); err != nil {
+				return err
+			}
+		case realign:
+			if err := tx.SetMeta(realignKey(f.src.ID), ""); err != nil {
+				return err
+			}
 		}
 		if posted > 0 || info.Size > f.src.Size {
 			c, ok, err := tx.Conversation(f.src.ConvID)
@@ -522,6 +570,7 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 		return
 	}
 	f.src.Offset, f.src.Line, f.src.Size, f.src.MTime, f.src.Inode = off, line, info.Size, ms(info.MTime), info.Inode
+	f.realign, f.realignAt = realign && more, realignAt
 	if !more {
 		f.info = info
 	}
