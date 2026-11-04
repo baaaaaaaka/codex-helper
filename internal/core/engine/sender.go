@@ -79,43 +79,18 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 		if err != nil {
 			return err
 		}
-		// Priority inheritance (F4b): a conversation's head ranks by the
-		// most urgent class queued in that conversation, so a final
-		// queued behind a progress post is not held back by every other
-		// chat's ACKs. The order within a conversation stays FIFO.
-		class := make(map[int64]int, len(rows))
-		for _, r := range rows {
-			class[r.ConvID] = sendClass(r.Kind)
-		}
-		if len(rows) > 1 {
-			kinds, err := tx.QueuedKinds()
-			if err != nil {
-				return err
-			}
-			for conv, ks := range kinds {
-				c, ok := class[conv]
-				if !ok {
-					continue
-				}
-				for _, k := range ks {
-					c = min(c, sendClass(k))
-				}
-				class[conv] = c
-			}
-		}
 		e.mu.Lock()
 		ctl := e.controlID
 		e.mu.Unlock()
 		// Control chat first; then replies (ACKs, finals, notices,
-		// prompts) before mirrored messages before progress (each chat by
-		// its most urgent queued class), so a short
+		// prompts) before mirrored messages before progress, so a short
 		// write budget goes to what the user waits for; within a class,
 		// round robin from the conversation after the last one served, so
 		// a backlog in low-id chats never starves the others (review H4,
 		// CORE-DESIGN §3).
 		last := e.sendLast
 		rank := func(r store.Outbox) (int, int) {
-			c := class[r.ConvID]
+			c := sendClass(r.Kind)
 			switch {
 			case r.ConvID == ctl:
 				return 0, 0
@@ -183,7 +158,7 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 				break
 			}
 			if r.ConvID != ctl {
-				e.sendLast[class[r.ConvID]] = r.ConvID
+				e.sendLast[sendClass(r.Kind)] = r.ConvID
 			}
 			var fp *store.OutFile
 			if isFile {
