@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -313,7 +314,7 @@ func TestRecentWalkSkipsAnUnchangedDayDirectory(t *testing.T) {
 	}
 	e.mirror = &mirrorState{files: map[string]*mirrorFile{}, known: map[string]string{}, checked: map[string]transcript.FileInfo{}, unreadable: map[string]transcript.FileInfo{}}
 	ctx := context.Background()
-	e.discover(ctx, false)
+	e.discover(ctx)
 	if _, ok := e.mirror.unreadable[a]; !ok {
 		t.Fatal("first walk did not see the rollout")
 	}
@@ -322,7 +323,7 @@ func TestRecentWalkSkipsAnUnchangedDayDirectory(t *testing.T) {
 	if err := os.Chtimes(day, old, old); err != nil {
 		t.Fatal(err)
 	}
-	e.discover(ctx, false)
+	e.discover(ctx)
 	if _, ok := e.mirror.unreadable[b]; ok {
 		t.Fatal("a day directory with an unchanged mtime was listed again")
 	}
@@ -334,8 +335,70 @@ func TestRecentWalkSkipsAnUnchangedDayDirectory(t *testing.T) {
 	if err := os.Chtimes(day, changed, changed); err != nil {
 		t.Fatal(err)
 	}
-	e.discover(ctx, false)
+	e.discover(ctx)
 	if _, ok := e.mirror.unreadable[b]; !ok {
 		t.Fatal("a day directory whose mtime changed was not listed again")
+	}
+}
+
+// B4: the start-up walk classifies the rollouts a batch per stat tick,
+// newest first, instead of reading every rollout's first record before the
+// mirror loop starts (1.1 s in one second on a fresh install of 7,500).
+func TestStartupWalkClassifiesABatchPerTick(t *testing.T) {
+	sessions := t.TempDir()
+	base := time.Now().Add(-30 * 24 * time.Hour)
+	var newest []string
+	n := 0
+	for d := 0; d < 3; d++ {
+		day := base.AddDate(0, 0, d)
+		dir := filepath.Join(sessions, day.Format("2006"), day.Format("01"), day.Format("02"))
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < 100; i++ {
+			n++
+			id := fmt.Sprintf("00000000-0000-0000-0000-%012d", n)
+			at := day.Add(time.Duration(i) * time.Minute)
+			rec := fmt.Sprintf(`{"timestamp":%q,"type":"session_meta","payload":{"id":%q,"timestamp":%q,"cwd":"/w","originator":"codex_cli_rs","source":"cli"}}`+"\n",
+				at.UTC().Format(time.RFC3339Nano), id, at.UTC().Format(time.RFC3339Nano))
+			p := filepath.Join(dir, "rollout-"+id+".jsonl")
+			if err := os.WriteFile(p, []byte(rec), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chtimes(p, at, at); err != nil {
+				t.Fatal(err)
+			}
+			if d == 2 {
+				newest = append(newest, p)
+			}
+		}
+	}
+	st, err := store.Open(filepath.Join(t.TempDir(), "core.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if _, err := st.Acquire(store.Ident{Host: "h", PID: 1, BootID: "b"}); err != nil {
+		t.Fatal(err)
+	}
+	e := &Engine{cfg: Config{SessionsDir: sessions}, st: st, t: ProductionTiming(), now: time.Now, log: io.Discard,
+		statFile: transcript.Stat, convs: map[int64]*convState{}}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		e.mirrorLoop(ctx)
+	}()
+	time.Sleep(500 * time.Millisecond) // before the first 2 s stat tick
+	cancel()
+	<-done
+	known := e.mirror.known
+	if len(known) != firstWalkFiles {
+		t.Fatalf("%d of 300 rollouts classified before the first tick, want %d", len(known), firstWalkFiles)
+	}
+	for _, p := range newest {
+		if _, ok := known[p]; !ok {
+			t.Fatalf("%s (newest day) not in the first batch", filepath.Base(p))
+		}
 	}
 }

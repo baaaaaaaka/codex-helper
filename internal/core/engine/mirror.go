@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -43,9 +44,17 @@ type mirrorState struct {
 	oldDirs   []string
 	lastCycle time.Time
 	// recent: what the last walk of each recent day directory saw (B3).
-	recent    map[string]*recentDir
-	first     bool // first start of this store: pre-existing rollouts are baselined
-	startedAt time.Time
+	recent map[string]*recentDir
+	first  bool // first start of this store: pre-existing rollouts are baselined
+	// firstFound is what is left of the start-up walk (B4): every rollout
+	// not seen yet, newest first, with its state at start. It is
+	// classified a batch per stat tick; firstPending is set until done.
+	firstFound []transcript.Found
+	// firstAt is the state at start of each rollout still in firstFound:
+	// another walk that meets one first classifies it as of the start.
+	firstAt      map[string]transcript.FileInfo
+	firstPending bool
+	startedAt    time.Time
 }
 
 // recentDir is what the last walk of a recent day directory saw (B3).
@@ -181,13 +190,8 @@ func (e *Engine) mirrorLoop(ctx context.Context) {
 		e.logf("mirror: %v", err)
 		return
 	}
-	e.discover(ctx, true)
-	e.mirror.lastCycle = e.now()
-	if e.mirror.first {
-		if err := e.update(func(tx *store.Tx) error { return tx.SetMeta(metaMirrorInit, "1") }); err != nil {
-			e.logf("mirror: %v", err)
-		}
-	}
+	e.startFirstWalk()
+	e.discoverFirst(ctx)
 	stat := time.NewTicker(e.t.MirrorStat)
 	defer stat.Stop()
 	disc := time.NewTicker(e.t.Discovery)
@@ -198,12 +202,59 @@ func (e *Engine) mirrorLoop(ctx context.Context) {
 			return
 		case <-stat.C:
 		case <-e.mirrorWake:
-			e.discover(ctx, false)
+			e.discover(ctx)
 		case <-disc.C:
-			e.discover(ctx, false)
+			e.discover(ctx)
 			e.discoverOld(ctx)
 		}
+		e.discoverFirst(ctx)
 		e.mirrorPoll(ctx)
+	}
+}
+
+// firstWalkFiles bounds the rollouts the start-up walk classifies per stat
+// tick (B4): classifying reads each one's first record.
+const firstWalkFiles = 128
+
+// startFirstWalk lists every rollout once at start (a stat each, cheap) and
+// queues them newest first for classification. Their sizes and times are
+// the ones at start: a fresh install baselines what existed then, and a
+// session continued while the queue drains is promoted from that size.
+func (e *Engine) startFirstWalk() {
+	m := e.mirror
+	found, err := transcript.Walk(e.cfg.SessionsDir, e.now().Add(-transcript.Window), time.Time{})
+	if err != nil {
+		e.logf("mirror walk: %v", err)
+	}
+	slices.Reverse(found)
+	m.firstFound, m.firstPending = found, true
+	m.firstAt = make(map[string]transcript.FileInfo, len(found))
+	for _, f := range found {
+		m.firstAt[f.Path] = f.Info
+	}
+}
+
+// discoverFirst classifies the next batch of the start-up walk (reading a
+// rollout's first record is what costs). When it is done, the
+// older-directory cycle starts and a fresh store is marked as initialised.
+func (e *Engine) discoverFirst(ctx context.Context) {
+	m := e.mirror
+	if !m.firstPending {
+		return
+	}
+	n := min(firstWalkFiles, len(m.firstFound))
+	batch := m.firstFound[:n:n]
+	m.firstFound = m.firstFound[n:]
+	e.consider(ctx, batch)
+	if ctx.Err() != nil || len(m.firstFound) > 0 {
+		return
+	}
+	m.firstPending, m.firstFound, m.firstAt = false, nil, nil
+	m.lastCycle = e.now()
+	if m.first {
+		if err := e.update(func(tx *store.Tx) error { return tx.SetMeta(metaMirrorInit, "1") }); err != nil {
+			e.logf("mirror: %v", err)
+		}
 	}
 }
 
@@ -213,6 +264,9 @@ func (e *Engine) mirrorLoop(ctx context.Context) {
 // rollouts, so a large sessions tree never costs one long tick.
 func (e *Engine) discoverOld(ctx context.Context) {
 	m := e.mirror
+	if m.firstPending {
+		return // the start-up walk covers every directory
+	}
 	now := e.now()
 	if len(m.oldDirs) == 0 {
 		if now.Sub(m.lastCycle) < e.t.FullWalk {
@@ -244,20 +298,8 @@ func (e *Engine) discoverOld(ctx context.Context) {
 	e.consider(ctx, found)
 }
 
-// discover walks the sessions directory for rollouts not seen yet (all
-// directories when full, else only recent day directories).
-func (e *Engine) discover(ctx context.Context, full bool) {
-	now := e.now()
-	if !full {
-		e.discoverRecent(ctx, now)
-		return
-	}
-	found, err := transcript.Walk(e.cfg.SessionsDir, now.Add(-transcript.Window), time.Time{})
-	if err != nil {
-		e.logf("mirror walk: %v", err)
-	}
-	e.consider(ctx, found)
-}
+// discover walks the recent day directories for rollouts not seen yet.
+func (e *Engine) discover(ctx context.Context) { e.discoverRecent(ctx, e.now()) }
 
 // discoverRecent walks the recent day directories (the last 48 h, with a
 // day of margin either side for time zones). A directory whose mtime did
@@ -363,6 +405,12 @@ func (e *Engine) consider(ctx context.Context, found []transcript.Found) {
 	for _, f := range found {
 		if ctx.Err() != nil {
 			return
+		}
+		if at, ok := e.mirror.firstAt[f.Path]; ok {
+			// Not classified yet by the start-up walk: as of the start
+			// (a fresh install baselines what existed then).
+			f.Info = at
+			delete(e.mirror.firstAt, f.Path)
 		}
 		e.mirror.mu.Lock()
 		_, tracked := e.mirror.files[f.Path]
