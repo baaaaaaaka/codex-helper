@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakecodex"
 )
@@ -41,6 +43,10 @@ func main() {
 	if kind == "" {
 		kind = "work"
 	}
+	// Like real Codex (a Rust binary, SIGPIPE ignored), writing to a dead
+	// helper's pipes must fail with EPIPE instead of killing the process.
+	signal.Notify(make(chan os.Signal, 1), syscall.SIGPIPE)
+
 	// The helper keeps only a bounded stderr tail, so the protocol log also
 	// goes to a per-process file the harness shows when a scenario fails.
 	var log io.Writer = os.Stderr

@@ -79,6 +79,10 @@ type CodexBehavior struct {
 	// HoldCompletion: the turn completes inside Codex (persisted, rollout
 	// written) but turn/completed is never sent ("lost callback").
 	HoldCompletion bool
+	// HoldStart holds the app-server's turn/start (before the turn exists
+	// in Codex) until Release; if the helper dies meanwhile, Codex never
+	// records the turn ("helper crashed before turn/start reached Codex").
+	HoldStart bool
 	// SurviveHelper keeps the turn running when the helper goes away (stdin
 	// EOF); the app-server exits only after the turn finished, so the result
 	// is persisted while no helper is listening. Default: the app-server

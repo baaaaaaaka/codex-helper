@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/rollout"
@@ -44,6 +45,7 @@ type server struct {
 	rollouts map[string]*rollout.Writer
 	running  map[string]*runningTurn // by turn id
 	wg       sync.WaitGroup
+	gone     atomic.Bool // stdin closed: the helper went away
 }
 
 type runningTurn struct {
@@ -110,6 +112,7 @@ func Serve(cfg Config) error {
 		}
 	}
 	fmt.Fprintf(cfg.Log, "%s stdin closed\n", time.Now().Format("15:04:05.000"))
+	s.gone.Store(true)
 	s.onHelperGone()
 	return nil
 }
@@ -444,6 +447,12 @@ func (s *server) startTurn(p map[string]any) (any, *rpcError) {
 	}
 	if plan.RejectStart != "" {
 		return nil, &rpcError{Code: -32000, Message: plan.RejectStart}
+	}
+	if s.gone.Load() {
+		// The helper went away while turn/start was in flight: the turn
+		// never starts.
+		s.end(plan.Seq, "abandoned", "helper went away before the turn started")
+		return nil, &rpcError{Code: -32603, Message: "client gone"}
 	}
 	now := time.Now().Unix()
 	turn := &Turn{

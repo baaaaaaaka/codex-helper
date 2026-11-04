@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -59,10 +60,11 @@ type ProcSUT struct {
 }
 
 type procInstance struct {
-	tag  string
-	cmd  *exec.Cmd
-	done chan struct{}
-	err  error
+	tag      string
+	cmd      *exec.Cmd
+	done     chan struct{}
+	err      error
+	signaled atomic.Bool // stopped or killed by the harness on purpose
 }
 
 // Name implements harness.SUT.
@@ -97,7 +99,8 @@ func (s *ProcSUT) Running() bool {
 	}
 }
 
-// ExitErr implements harness.SUT.
+// ExitErr implements harness.SUT. Exits caused by Stop or Crash are not
+// errors.
 func (s *ProcSUT) ExitErr() error {
 	s.mu.Lock()
 	cur := s.cur
@@ -107,6 +110,9 @@ func (s *ProcSUT) ExitErr() error {
 	}
 	select {
 	case <-cur.done:
+		if cur.signaled.Load() {
+			return nil
+		}
 		return cur.err
 	default:
 		return nil
@@ -242,6 +248,7 @@ func (s *ProcSUT) signal(ctx context.Context, sig syscall.Signal) error {
 		verb = "crashing (SIGKILL)"
 	}
 	fmt.Fprintf(&s.out, "=== e2e: %s %s ===\n", verb, inst.tag)
+	inst.signaled.Store(true)
 	if err := inst.cmd.Process.Signal(sig); err != nil && !errors.Is(err, os.ErrProcessDone) {
 		return err
 	}

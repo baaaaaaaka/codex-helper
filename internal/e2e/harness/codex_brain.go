@@ -97,6 +97,15 @@ func (f *FakeCodex) Handler() http.Handler {
 			ThreadID: req.ThreadID, TurnID: req.TurnID, ClientID: req.ClientID, Cwd: req.Cwd,
 			Prompt: req.Prompt, Images: req.Images,
 		})
+		if b.HoldStart {
+			f.mu.Lock()
+			gate := f.gates[seq]
+			f.mu.Unlock()
+			select {
+			case <-gate:
+			case <-r.Context().Done():
+			}
+		}
 		plan := fakecodex.Plan{Seq: seq, Commentary: b.Commentary, Crash: b.Crash, HoldCompletion: b.HoldCompletion, SurviveHelper: b.SurviveHelper}
 		if b.FailKind == FailActiveWriter {
 			err := behaviorErr(b)
