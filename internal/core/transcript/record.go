@@ -135,6 +135,8 @@ var (
 	jTurnID       = []byte(`"turn_id":"`)
 	jThreadID     = []byte(`"thread_id":"`)
 	cheapRecordAt = 4 << 10
+	// cutHead is how much of a record parseHead looks at.
+	cutHead = 1024
 )
 
 // head returns the first n bytes of line.
@@ -167,32 +169,8 @@ func headString(h, key []byte) string {
 // first bytes (CPU budget: a live session appending large tool outputs
 // must not cost a full JSON decode per record).
 func Parse(line []byte) Event {
-	if t, ok := topType(line); ok {
-		switch t {
-		case "session_meta", "turn_context":
-		case "event_msg":
-			if len(line) > cheapRecordAt {
-				h := head(line, 1024)
-				switch headString(h, jPayloadType) {
-				case "task_started", "task_complete", "turn_aborted":
-				case "item_completed":
-					if bytes.Contains(h, jAgentItem) {
-						return cheapRef(h)
-					}
-				default:
-					// Command output, patch, MCP results...: only the turn
-					// they belong to matters.
-					return cheapRef(h)
-				}
-			}
-		case "response_item":
-			h := head(line, 512)
-			if !bytes.Contains(h, jMessage) || bytes.Contains(h, jRoleDev) || bytes.Contains(h, jRoleSystem) {
-				return Event{Kind: KindOther} // tool calls and outputs, reasoning, instructions
-			}
-		default:
-			return Event{Kind: KindOther}
-		}
+	if ev, ok := parseHead(line, len(line) > cheapRecordAt); ok {
+		return ev
 	}
 	var env envelope
 	if err := json.Unmarshal(line, &env); err != nil {
@@ -266,6 +244,57 @@ func Parse(line []byte) Event {
 		ev.Kind = KindTurnRef
 	}
 	return ev
+}
+
+// parseHead classifies a record from its first cutHead bytes when that is
+// enough: large tool calls, tool outputs, reasoning and developer messages.
+// large is whether the whole line is longer than cheapRecordAt. ok is
+// false when the record must be decoded.
+func parseHead(line []byte, large bool) (Event, bool) {
+	t, ok := topType(line)
+	if !ok {
+		return Event{}, false
+	}
+	switch t {
+	case "session_meta", "turn_context":
+		return Event{}, false
+	case "event_msg":
+		if !large {
+			return Event{}, false
+		}
+		h := head(line, cutHead)
+		switch headString(h, jPayloadType) {
+		case "task_started", "task_complete", "turn_aborted":
+			return Event{}, false
+		case "item_completed":
+			if bytes.Contains(h, jAgentItem) {
+				return cheapRef(h), true
+			}
+			return Event{}, false
+		}
+		// Command output, patch, MCP results...: only the turn they
+		// belong to matters.
+		return cheapRef(h), true
+	case "response_item":
+		h := head(line, 512)
+		if !bytes.Contains(h, jMessage) || bytes.Contains(h, jRoleDev) || bytes.Contains(h, jRoleSystem) {
+			return Event{Kind: KindOther}, true // tool calls and outputs, reasoning, instructions
+		}
+		return Event{}, false
+	}
+	return Event{Kind: KindOther}, true
+}
+
+// ParseLine is Parse for a line Read returned: a line cut to its head (B6)
+// is classified from it.
+func ParseLine(l Line) Event {
+	if l.Cut {
+		if ev, ok := parseHead(l.Data, true); ok {
+			return ev
+		}
+		return Event{Kind: KindOther}
+	}
+	return Parse(l.Data)
 }
 
 // cheapRef classifies a large event record from its first bytes: a

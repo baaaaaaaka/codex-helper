@@ -109,7 +109,7 @@ func (t *Tracker) Feed(lines []Line) []Output {
 		if l.Oversize {
 			continue
 		}
-		ev := Parse(l.Data)
+		ev := ParseLine(l)
 		if !ev.Time.IsZero() && ev.Time.After(t.last) {
 			t.last = ev.Time
 		}

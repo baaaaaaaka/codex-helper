@@ -154,7 +154,7 @@ func ReadMeta(path string) (SessionMeta, error) {
 	if len(lines) == 0 || lines[0].Oversize {
 		return SessionMeta{}, errors.New("transcript: no session_meta record")
 	}
-	ev := Parse(lines[0].Data)
+	ev := ParseLine(lines[0])
 	if ev.Kind != KindSessionMeta {
 		return SessionMeta{}, errors.New("transcript: first record is not session_meta")
 	}
@@ -174,7 +174,7 @@ func FirstPrompt(path string, limit int64) string {
 		if l.Oversize {
 			continue
 		}
-		if ev := Parse(l.Data); ev.Kind == KindUserMessage && !IsBoilerplate(ev.Text) && strings.TrimSpace(ev.Text) != "" {
+		if ev := ParseLine(l); ev.Kind == KindUserMessage && !IsBoilerplate(ev.Text) && strings.TrimSpace(ev.Text) != "" {
 			return strings.TrimSpace(ev.Text)
 		}
 	}

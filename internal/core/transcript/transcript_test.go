@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -459,5 +460,68 @@ func BenchmarkParseLargeToolOutput(b *testing.B) {
 	b.SetBytes(int64(len(line)))
 	for i := 0; i < b.N; i++ {
 		Parse(line)
+	}
+}
+
+// B6: Read keeps only the head of a long record that is classified from
+// its head (tool outputs, reasoning, developer messages), so a 2 MB tool
+// output does not allocate about 5 MB; records that are decoded (finals,
+// user items) are read whole, and every record classifies as before.
+func TestReadCutsLongRecordsClassifiedFromTheirHead(t *testing.T) {
+	ts := "2026-11-04T10:00:00.000Z"
+	big := strings.Repeat("x", 2<<20)
+	recs := []string{
+		`{"timestamp":"` + ts + `","type":"response_item","payload":{"type":"function_call_output","call_id":"c","output":"` + big + `"}}`,
+		`{"timestamp":"` + ts + `","type":"event_msg","payload":{"type":"exec_command_end","call_id":"c1","turn_id":"t7","aggregated_output":"` + big + `"}}`,
+		`{"timestamp":"` + ts + `","type":"event_msg","payload":{"type":"item_completed","thread_id":"th","turn_id":"t7","item":{"type":"AgentMessage","text":"` + big + `"}}}`,
+		`{"timestamp":"` + ts + `","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"` + big + `"}]}}`,
+		`{"timestamp":"` + ts + `","type":"event_msg","payload":{"type":"task_complete","turn_id":"t7","last_agent_message":"` + big + `"}}`,
+		`{"timestamp":"` + ts + `","type":"event_msg","payload":{"type":"item_completed","turn_id":"t7","item":{"type":"UserMessage","content":"` + big + `","client_id":"cid"}}}`,
+		`{"timestamp":"` + ts + `","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"short"}]}}`,
+	}
+	cut := []bool{true, true, true, true, false, false, false}
+	p := writeLines(t, strings.Join(recs, "\n")+"\n")
+	f, err := os.Open(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	lines, _, err := Read(f, 0, 0)
+	if err != nil || len(lines) != len(recs) {
+		t.Fatalf("%d lines, %v", len(lines), err)
+	}
+	for i, l := range lines {
+		if l.Cut != cut[i] {
+			t.Errorf("record %d: cut %v, want %v", i, l.Cut, cut[i])
+		}
+		got, want := ParseLine(l), Parse([]byte(recs[i]))
+		if got.Kind != want.Kind || got.TurnID != want.TurnID || got.ThreadID != want.ThreadID || !got.Time.Equal(want.Time) ||
+			got.ClientID != want.ClientID || got.Text != want.Text {
+			t.Errorf("record %d classified %v %q, want %v %q", i, got.Kind, got.TurnID, want.Kind, want.TurnID)
+		}
+	}
+
+	// Allocation: 8 skipped tool outputs of 2 MB each.
+	var b strings.Builder
+	for i := 0; i < 8; i++ {
+		b.WriteString(recs[i%2])
+		b.WriteByte('\n')
+	}
+	p2 := writeLines(t, b.String())
+	f2, err := os.Open(p2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f2.Close()
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	lines, _, err = Read(f2, 0, 0)
+	runtime.ReadMemStats(&after)
+	if err != nil || len(lines) != 8 {
+		t.Fatalf("%d lines, %v", len(lines), err)
+	}
+	if alloc := after.TotalAlloc - before.TotalAlloc; alloc > 2<<20 {
+		t.Fatalf("reading 16 MB of skipped records allocated %d KB, want under 2 MB", alloc>>10)
 	}
 }
