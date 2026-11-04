@@ -573,3 +573,16 @@ func TestSharedThreadWinner(t *testing.T) {
 	eq(t, "loser keeps thread", qs(t, db, `SELECT t.thread_id FROM threads t JOIN conversations c ON c.id = t.conv_id WHERE c.label = ?`, sh.Loser), "11111111-1111-4111-8111-000000000001")
 	eq(t, "loser has no source", qi(t, db, `SELECT count(*) FROM transcript_sources s JOIN conversations c ON c.id = s.conv_id WHERE c.label = ?`, sh.Loser), int64(0))
 }
+
+// The old store's registry machine id is kept (internal/core/delegate
+// publishes the card and opens the inbox under it).
+func TestMachineIdentityKept(t *testing.T) {
+	dir := fixture(t, "v0120", "json")
+	editJSON(t, dir, func(m map[string]any) {
+		m["machine_identity"].(map[string]any)["id"] = "machine:0123456789abcdef"
+	})
+	_, db := dryRun(t, dir, nil)
+	eq(t, "machine_id", qs(t, db, `SELECT value FROM meta WHERE key = 'machine_id'`), "machine:0123456789abcdef")
+	_, db = dryRun(t, fixture(t, "v0120", "json"), nil)
+	eq(t, "no machine_id without an identity", qi(t, db, `SELECT COUNT(*) FROM meta WHERE key = 'machine_id'`), int64(0))
+}

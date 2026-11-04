@@ -1233,6 +1233,14 @@ func (c *converter) convertMeta() error {
 	if c.opt.registry.MachineHostnameOverride != "" {
 		kv["machine_label"] = c.opt.registry.MachineHostnameOverride
 	}
+	// The registry machine id: the new core keeps it, so its card, inbox
+	// chat and the requesters' routes stay the same (internal/core/delegate).
+	var mid struct {
+		ID string `json:"id"`
+	}
+	if _, err := decode(c.l.section("machine_identity"), &mid); err == nil && strings.TrimSpace(mid.ID) != "" {
+		kv["machine_id"] = strings.TrimSpace(mid.ID)
+	}
 	for _, k := range sortedKeys(kv) {
 		if err := c.im.SetMeta(k, kv[k]); err != nil {
 			return err
