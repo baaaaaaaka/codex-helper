@@ -255,6 +255,20 @@ func (s *server) dispatch(msg message) (any, *rpcError) {
 			return nil, invalid("no rollout found for thread id %s", id)
 		}
 		s.mu.Lock()
+		_, loaded := s.loaded[id]
+		s.mu.Unlock()
+		if !loaded {
+			// Real Codex 0.166 refuses to load a thread another process
+			// holds (FIDELITY C5); the brain decides whether one does.
+			dec, err := s.resumeCheck(ResumeRequest{Instance: s.cfg.Instance, Kind: s.cfg.Kind, Pid: os.Getpid(), ThreadID: id})
+			if err != nil {
+				return nil, &rpcError{Code: -32603, Message: "fake codex brain unavailable: " + err.Error()}
+			}
+			if dec.Reject != "" {
+				return nil, invalid("%s", strings.ReplaceAll(dec.Reject, "{thread}", id))
+			}
+		}
+		s.mu.Lock()
 		if cur, ok := s.loaded[id]; ok {
 			t = cur
 		} else {
@@ -405,7 +419,9 @@ func (s *server) startTurn(p map[string]any) (any, *rpcError) {
 	busy := ok && t.Active()
 	s.mu.Unlock()
 	if !ok {
-		return nil, invalid("thread not loaded: %s (resume it first)", threadID)
+		// Real Codex 0.166 text for a thread this process has not loaded
+		// (FIDELITY C5).
+		return nil, invalid("thread not found: %s", threadID)
 	}
 	if busy {
 		// Real Codex 0.166 (probe c, internal/e2e/realcodex) does not reject
@@ -756,6 +772,14 @@ func (s *server) begin(req BeginRequest) (Plan, error) {
 	var plan Plan
 	err := s.post(ctx, "/begin", req, &plan)
 	return plan, err
+}
+
+func (s *server) resumeCheck(req ResumeRequest) (ResumeDecision, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var dec ResumeDecision
+	err := s.post(ctx, "/resume", req, &dec)
+	return dec, err
 }
 
 func (s *server) await(ctx context.Context, seq int) (AwaitResult, error) {

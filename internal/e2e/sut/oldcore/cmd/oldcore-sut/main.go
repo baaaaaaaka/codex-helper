@@ -54,6 +54,10 @@ const (
 	EnvProductionTiming = "E2E_SUT_PRODUCTION_TIMING"
 )
 
+// serviceRestartExitCode is harness.ServiceRestartExitCode (the harness
+// package is not imported into the SUT binary).
+const serviceRestartExitCode = 75
+
 // BlockedPrefix starts the stderr line reporting a refused foreign request.
 const BlockedPrefix = "E2E-BLOCKED "
 
@@ -129,6 +133,15 @@ func run() error {
 		ControlFallbackExecutor: control,
 		TranscriptSyncInterval:  interval,
 		AsyncTurnShutdownGrace:  2 * time.Second,
+	}
+	// `helper restart`: production schedules a restart with its service
+	// supervisor and exits (cli.restartTeamsHelperFromTeams). Here the
+	// harness process runner is the supervisor; exiting with
+	// serviceRestartExitCode asks it for a restart on the same state.
+	opts.HelperRestarter = func(context.Context) error {
+		fmt.Fprintf(os.Stdout, "=== e2e: %s exiting for a service restart ===\n", instance)
+		os.Exit(serviceRestartExitCode)
+		return nil
 	}
 	if os.Getenv(EnvProductionTiming) == "1" {
 		// Leave the transcript sync interval at the production default

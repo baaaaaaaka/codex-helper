@@ -70,9 +70,11 @@ type CodexBehavior struct {
 	// Commentary is streamed as a commentary agent message before the final.
 	Commentary string
 	// FailKind selects how Err is surfaced: "" (turn fails with Err's
-	// message), FailCapacity (turn fails with the model-capacity error) or
-	// FailActiveWriter (turn/start is rejected: another process holds the
-	// thread writer, as when the TUI has the session open).
+	// message), FailCapacity (turn fails with the model-capacity error),
+	// FailRateLimited, or FailActiveWriter (turn/start is rejected: another
+	// process holds the thread writer, as when the TUI has the session
+	// open). Real Codex 0.166 rejects at thread/resume instead; see
+	// SetResumeScript. This knob keeps the turn/start path covered.
 	FailKind string
 	// Crash makes the app-server process exit right after the turn started.
 	Crash bool
@@ -85,8 +87,10 @@ type CodexBehavior struct {
 	HoldStart bool
 	// SurviveHelper keeps the turn running when the helper goes away (stdin
 	// EOF); the app-server exits only after the turn finished, so the result
-	// is persisted while no helper is listening. Default: the app-server
-	// exits on stdin EOF and the turn is lost (interrupted).
+	// is persisted while no helper is listening. COUNTERFACTUAL: real Codex
+	// 0.145/0.166 never does this (FIDELITY C4); it stays as an opt-in knob
+	// and no scenario may depend on it. Default (= real Codex): the
+	// app-server exits on stdin EOF and the turn is lost (interrupted).
 	SurviveHelper bool
 }
 
@@ -112,8 +116,11 @@ type FakeCodex struct {
 	all     bool
 
 	behaviors map[int]CodexBehavior
-	server    *httptest.Server
-	changed   chan struct{}
+
+	resumeScript func(ResumeCall) error
+	resumes      []ResumeCall
+	server       *httptest.Server
+	changed      chan struct{}
 }
 
 // NewFakeCodex returns a fake that answers every call immediately.
@@ -345,6 +352,56 @@ func (f *FakeCodex) CallsWithToken(token string) []CodexCall {
 		}
 	}
 	return out
+}
+
+// ResumeCall is one thread/resume of a thread the fake app-server process
+// had not loaded yet (app-server only; the in-process Executor has no
+// resume).
+type ResumeCall struct {
+	At       time.Time
+	Instance string
+	Kind     string
+	Pid      int
+	ThreadID string
+	// Rejected is the error text returned to the helper, "" if allowed.
+	Rejected string
+}
+
+// ErrActiveWriter is real Codex 0.166's refusal of thread/resume while
+// another process holds the thread (FIDELITY C5); {thread} becomes the id.
+var ErrActiveWriter = errors.New("thread {thread} already has an active writer")
+
+// SetResumeScript installs the thread/resume hook: a non-nil error rejects
+// the resume with that message (-32600) and leaves the thread unloaded in
+// that app-server. nil restores the default (every resume succeeds).
+func (f *FakeCodex) SetResumeScript(fn func(ResumeCall) error) {
+	f.mu.Lock()
+	f.resumeScript = fn
+	f.mu.Unlock()
+}
+
+// Resumes returns every recorded thread/resume.
+func (f *FakeCodex) Resumes() []ResumeCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]ResumeCall(nil), f.resumes...)
+}
+
+func (f *FakeCodex) resume(call ResumeCall) string {
+	call.At = time.Now()
+	f.mu.Lock()
+	script := f.resumeScript
+	f.mu.Unlock()
+	if script != nil {
+		if err := threadErr(script(call), call.ThreadID); err != nil {
+			call.Rejected = err.Error()
+		}
+	}
+	f.mu.Lock()
+	f.resumes = append(f.resumes, call)
+	f.notifyLocked()
+	f.mu.Unlock()
+	return call.Rejected
 }
 
 // ErrScripted is a generic scripted Codex failure.

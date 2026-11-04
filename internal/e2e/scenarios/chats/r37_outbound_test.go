@@ -26,7 +26,11 @@ var outboundDirRE = regexp.MustCompile(`write them under this local directory:\s
 // R-37 (outbound half), F-RND-10: a file the agent asks to send arrives in
 // the chat exactly once, byte-identical, under the name the agent gave it.
 // Two files in one answer: a small one (simple drive upload) and a 12 MiB
-// one (above the 10 MiB single-request limit, so an upload session).
+// one (above the 10 MiB single-request limit, so an upload session). The
+// displayed name must be exactly the manifest name. A second answer then
+// sends a different file under the same name (a name conflict): there a
+// short uniquifying suffix ("quarterly report (2).csv") is allowed, but no
+// internal id (coordinator decision, M3).
 func TestR37_AgentFilesReachChat(t *testing.T) {
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "R-37-out", harness.Options{
@@ -41,9 +45,15 @@ func TestR37_AgentFilesReachChat(t *testing.T) {
 	rand.New(rand.NewSource(37)).Read(large)
 	const smallName, largeName = "quarterly report.csv", "dataset-large.bin"
 
+	tok2 := s.Token("conflict")
+	small2 := []byte(strings.Repeat("id,value,extra\n", 150) + "end " + tok2 + "\n")
+
 	var mu sync.Mutex
 	var promptDir, writeErr string
 	s.Codex.SetScript(func(c harness.CodexCall) harness.CodexBehavior {
+		if c.HasToken(tok2) {
+			return conflictTurn(c, tok2, smallName, small2, &mu, &writeErr)
+		}
 		if !c.HasToken(tok) {
 			return harness.CodexBehavior{}
 		}
@@ -124,4 +134,49 @@ func TestR37_AgentFilesReachChat(t *testing.T) {
 		"1", fmt.Sprint(len(s.SUTMessagesContaining(work.ID, "here are the two files you asked for "+tok))), tr...)
 	s.Check("F-RND-10 the manifest block is not shown to the user", len(s.SUTMessagesContaining(work.ID, `"version":1`)) == 0,
 		"no manifest JSON in chat", fmt.Sprint(len(s.SUTMessagesContaining(work.ID, `"version":1`))))
+
+	// Name conflict: a different file under the same name.
+	steps.MustPost(s, work.ID, "Send an updated report under the same name "+tok2)
+	s.WaitFor("the updated file is attached", 60*time.Second, func() (bool, string) {
+		return len(matching(small2)) > 0, fmt.Sprintf("%d attachments", len(s.Graph.OutboundFiles(work.ID)))
+	})
+	s.Settle(3*time.Second, 15*time.Second)
+	got := matching(small2)
+	s.Check("R-37 the updated file arrives byte-identical, attached exactly once", len(got) == 1, "1", fmt.Sprint(len(got)), s.Transcript(work.ID, 8)...)
+	name := "not attached"
+	if len(got) > 0 {
+		name = got[0].Name
+	}
+	leaks := steps.InternalLeaks(s, name)
+	ok := len(got) > 0 && (name == smallName || conflictNameRE.MatchString(name)) && len(leaks) == 0
+	s.Check("R-37 on a name conflict the file keeps the agent's name, at most with a short uniquifying suffix and no internal ids", ok,
+		strconv.Quote(smallName)+` or e.g. "quarterly report (2).csv"`, fmt.Sprintf("%q (internal ids: %q)", name, leaks))
+	if first := matching(small); len(first) == 1 {
+		s.Check("R-37 the first file is still attached unchanged", bytes.Equal(first[0].Item.Data, small), "unchanged", "changed")
+	}
+}
+
+// conflictNameRE accepts the manifest name with a short uniquifying suffix.
+var conflictNameRE = regexp.MustCompile(`^quarterly report ?(?:\(\d{1,3}\)|[-_ ]\d{1,3})\.csv$`)
+
+// conflictTurn writes data as report.csv into a fresh subdirectory of the
+// outbound directory and lists it under name.
+func conflictTurn(c harness.CodexCall, tok, name string, data []byte, mu *sync.Mutex, writeErr *string) harness.CodexBehavior {
+	m := outboundDirRE.FindStringSubmatch(c.Prompt)
+	if m == nil {
+		return harness.CodexBehavior{Answer: "E2EANSWER no outbound directory " + tok}
+	}
+	sub := filepath.Join(strings.TrimSpace(m[1]), "r37b-"+strings.ToLower(tok[len(tok)-6:]))
+	mu.Lock()
+	defer mu.Unlock()
+	if err := os.MkdirAll(sub, 0o700); err != nil {
+		*writeErr = err.Error()
+	}
+	if err := os.WriteFile(filepath.Join(sub, "report.csv"), data, 0o600); err != nil {
+		*writeErr = err.Error()
+	}
+	manifest, _ := json.Marshal(map[string]any{"version": 1, "files": []any{
+		map[string]any{"path": filepath.Base(sub) + "/report.csv", "name": name},
+	}})
+	return harness.CodexBehavior{Answer: "E2EANSWER here is the updated report " + tok + "\n\n```codex-helper-artifacts\n" + string(manifest) + "\n```\n"}
 }

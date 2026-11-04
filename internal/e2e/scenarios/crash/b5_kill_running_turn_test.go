@@ -12,33 +12,39 @@ import (
 )
 
 // B-5 (CLEANUP-PLAN §8.1), R-5b, R-32, R-33: kill -9 of the helper while
-// turns are in three different states, then restart.
+// turns are in three different states, then restart. Real Codex drops a
+// turn when its client dies (FIDELITY C4), and so does the fake by default:
 //
-//	chat X: turn running; Codex keeps running and completes it while the
-//	        helper is dead            -> its final is delivered exactly once
-//	chat Y: turn running; Codex loses it with the helper (stdin EOF)
-//	                                  -> exactly one interruption notice,
-//	                                     before the next turn starts
+//	chat X: turn running and already streaming progress (commentary)
+//	                                  -> interrupted: exactly one
+//	                                     interruption notice at restart
+//	                                     recovery, before the next turn
+//	chat Y: turn running, no output yet
+//	                                  -> the same
 //	chat Z: helper dies while turn/start is in flight; Codex never records
 //	        the turn                  -> one "not executed" notice, no re-run
 //
-// Then one new prompt per chat must continue the same Codex thread. The
-// scenario also records whether the helper gives Codex a Teams turn key
-// (turn/start clientUserMessageId, or a Teams id in the input) that would let
-// it match turns after a restart.
+// Then one new prompt per chat must be answered and continue the same Codex
+// thread. The scenario also records whether the helper gives Codex a Teams
+// turn key (turn/start clientUserMessageId, or a Teams id in the input)
+// that would let it match turns after a restart.
+//
+// (Until M3 chat X used the fake's SurviveHelper knob, a Codex that
+// finishes the turn after its client died; real Codex never does, so no
+// scenario depends on it.)
 func TestB5_KillDuringRunningTurn(t *testing.T) {
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "B-5", harness.Options{
 		Guarantees: []string{"B-5", "R-5b", "R-32", "R-33", "R-1", "R-2"},
-		Title:      "kill -9 with turns running / completing / not started; restart reconciles once and keeps the thread",
+		Title:      "kill -9 with turns running (with and without progress) / not started; restart reports each once and keeps the thread",
 		Budget:     150 * time.Second,
 	})
 	defer s.Finish()
-	tokX, tokY, tokZ := s.Token("survives"), s.Token("lost"), s.Token("notstarted")
+	tokX, tokY, tokZ := s.Token("streaming"), s.Token("lost"), s.Token("notstarted")
 	s.Codex.SetScript(func(c harness.CodexCall) harness.CodexBehavior {
 		switch {
 		case c.HasToken(tokX):
-			return harness.CodexBehavior{Block: true, SurviveHelper: true, Answer: "Final of X written while the helper was dead " + tokX}
+			return harness.CodexBehavior{Block: true, Commentary: "Looking at the files now."}
 		case c.HasToken(tokY):
 			return harness.CodexBehavior{Block: true}
 		case c.HasToken(tokZ):
@@ -64,26 +70,19 @@ func TestB5_KillDuringRunningTurn(t *testing.T) {
 		return n == 3, fmt.Sprintf("%d/3", n)
 	})
 
+	s.Settle(2*time.Second, 8*time.Second) // X's progress reaches the chat
 	s.CrashSUT()
 	killedAt := time.Now()
-	// Codex finishes X while no helper is listening.
-	callX := s.Codex.CallsWithToken(tokX)[0]
-	s.Codex.Release(callX.Seq)
-	s.Require("Codex completed X after the kill", 15*time.Second, func() (bool, string) {
-		c := s.Codex.CallsWithToken(tokX)[0]
-		return c.Outcome == "answered", "outcome=" + c.Outcome
-	})
-	callX = s.Codex.CallsWithToken(tokX)[0] // now carries the answer
 	s.Codex.Release(s.Codex.CallsWithToken(tokZ)[0].Seq)
-	s.Require("Codex lost Y and never started Z", 15*time.Second, func() (bool, string) {
-		y, z := s.Codex.CallsWithToken(tokY)[0], s.Codex.CallsWithToken(tokZ)[0]
-		return y.Outcome != "running" && z.Outcome != "running", "Y=" + y.Outcome + " Z=" + z.Outcome
+	s.Require("Codex lost X and Y and never started Z", 15*time.Second, func() (bool, string) {
+		x, y, z := s.Codex.CallsWithToken(tokX)[0], s.Codex.CallsWithToken(tokY)[0], s.Codex.CallsWithToken(tokZ)[0]
+		return x.Outcome != "running" && y.Outcome != "running" && z.Outcome != "running", "X=" + x.Outcome + " Y=" + y.Outcome + " Z=" + z.Outcome
 	})
 	s.StartSUT()
 
 	// R-33 / B-5: each chat reaches a visible terminal state for its turn.
 	s.WaitFor("each chat shows the outcome of its killed turn", 45*time.Second, func() (bool, string) {
-		x := (callX.Answer != "" && len(s.SUTMessagesContaining(chatX.ID, callX.Answer)) > 0) || len(noticesAfter(s, chatX.ID, killedAt)) > 0
+		x := len(noticesAfter(s, chatX.ID, killedAt)) > 0
 		y := len(noticesAfter(s, chatY.ID, killedAt)) > 0
 		z := len(noticesAfter(s, chatZ.ID, killedAt)) > 0
 		return x && y && z, fmt.Sprintf("x=%v y=%v z=%v", x, y, z)
@@ -102,18 +101,21 @@ func TestB5_KillDuringRunningTurn(t *testing.T) {
 
 	// --- verdicts --------------------------------------------------------
 	trX, trY, trZ := s.Transcript(chatX.ID, 25), s.Transcript(chatY.ID, 25), s.Transcript(chatZ.ID, 25)
-	nX := 0
-	if callX.Answer != "" {
-		nX = len(s.SUTMessagesContaining(chatX.ID, callX.Answer))
+	for _, c := range []struct {
+		name, chat string
+		tr         []string
+	}{{"X", chatX.ID, trX}, {"Y", chatY.ID, trY}} {
+		notices := noticesAfter(s, c.chat, killedAt)
+		s.Check("B-5/R-33 interrupted turn "+c.name+" gets exactly one notice", len(notices) == 1, "1 notice", fmt.Sprintf("%d: %q", len(notices), notices), c.tr...)
+		if callsNext := s.Codex.CallsWithToken(next[c.chat]); len(callsNext) > 0 && len(notices) > 0 {
+			first := firstNoticeTime(s, c.chat, killedAt)
+			s.Check("B-5 interruption notice in "+c.name+" precedes the next turn", first.Before(callsNext[0].Started), "notice before next turn/start",
+				fmt.Sprintf("notice %s, next turn started %s", first.Format("15:04:05.000"), callsNext[0].Started.Format("15:04:05.000")))
+		}
 	}
-	s.Check("B-5/R-1 final completed while the helper was dead is delivered exactly once", nX == 1, "1 copy of X's final", fmt.Sprintf("%d copies; notices after restart: %q", nX, noticesAfter(s, chatX.ID, killedAt)), trX...)
-
-	noticesY := noticesAfter(s, chatY.ID, killedAt)
-	s.Check("B-5/R-33 interrupted turn Y gets exactly one notice", len(noticesY) == 1, "1 notice", fmt.Sprintf("%d: %q", len(noticesY), noticesY), trY...)
-	if callsNext := s.Codex.CallsWithToken(next[chatY.ID]); len(callsNext) > 0 && len(noticesY) > 0 {
-		first := firstNoticeTime(s, chatY.ID, killedAt)
-		s.Check("B-5 interruption notice precedes the next turn", first.Before(callsNext[0].Started), "notice before next turn/start",
-			fmt.Sprintf("notice %s, next turn started %s", first.Format("15:04:05.000"), callsNext[0].Started.Format("15:04:05.000")))
+	for _, c := range []struct{ name, chat string }{{"X", chatX.ID}, {"Y", chatY.ID}, {"Z", chatZ.ID}} {
+		n := len(s.SUTMessagesContaining(c.chat, "answer for "+next[c.chat]))
+		s.Check("B-5 the next prompt in "+c.name+" is answered once", n == 1, "1 answer", fmt.Sprint(n))
 	}
 
 	noticesZ := noticesAfter(s, chatZ.ID, killedAt)
