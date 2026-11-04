@@ -39,14 +39,17 @@ violation instead of guessing.
 | A10 | Throttling: 429 with `Retry-After` per account, applies to reads and writes alike | Only when a scenario injects a fault; no ambient throttling | Idle cost scenarios count requests but nothing pushes back | IDLE, INBOX |
 | A11 | eTags on drive items are opaque `"{GUID},n"` strings | Fixed GUID | Upload/patch flows (not covered yet) | none yet |
 | A12 | A message posted "as another helper on the same account" is indistinguishable from the owner's own message except for content | Same `from.user`, origin recorded only in the fake | BREAKER | BREAKER |
+| A13 | Outbound files (M3): `PUT /me/drive/root:/{path}:/content` (default conflict behaviour replace; `?@microsoft.graph.conflictBehavior=fail` gives 409 `nameAlreadyExists`; 201 new / 200 replaced, body a driveItem), `POST .../{path}:/createUploadSession` (body `{"item":{...}}` with optional conflict behaviour and a `name` that must match the path; 200 with `uploadUrl` on the SharePoint host, `expirationDateTime`, `nextExpectedRanges ["0-"]`), fragment `PUT uploadUrl` with `Content-Range` and **no** `Authorization` (non-final fragments 320 KiB-aligned, < 60 MiB, in order or 416; 202 + `nextExpectedRanges`, last fragment 201/200 + driveItem), `GET uploadUrl` (status; 404 once complete), `DELETE uploadUrl`, `GET /me/drive/items/{id}[?$select]` and `/content` | Modelled after the Graph docs for *upload small files* / *createUploadSession*. Assumed: `webDavUrl` only on `$select` and equal to `webUrl`; the eTag is `"{GUID},n"` with a per-item GUID (A11) that changes neither on replace nor across versions; a 200 from `/content` instead of a 302 (A5); `rename` conflict behaviour is `unmodeled` | R-37-out |
+| A14 | A posted reference attachment must point at a drive item (`contentUrl` = its `webUrl`/`webDavUrl`), carry the GUID of that item's eTag as `id`, have a `name`, and be referenced by an `<attachment id>` tag | Rejected as `graph-contract` otherwise. Real Teams' exact checks are not documented; the eTag-GUID rule is what Teams clients do | R-37-out |
+| A15 | Teams Workflow webhook (M3): pre-signed `https://<env>.environment.api.powerplatform.com:443/powerautomate/automations/direct/workflows/<id>/triggers/manual/paths/invoke?api-version=1&sp=...&sv=1.0&sig=...`; POST `application/json` `{"type":"message","attachments":[{"contentType":"application/vnd.microsoft.card.adaptive","content":{"type":"AdaptiveCard","version":...}}]}` up to 28 KB, no `Authorization` | 202 Accepted with an empty body; wrong `sig` 401; unknown workflow 404; anything else `workflow-contract`. Faults by `Host: fakegraph.WorkflowHost`. The card is recorded, not posted into a chat | NOTIFY |
 
 ## Not modelled at all
 
 - Channel messages, chat creation by other users, message deletion and
   soft-delete tombstones, edits by the user (except `EditAsUser`),
   reactions, read receipts and system events beyond `PostSystemEvent`.
-- Outbound file upload (`helper file`): drive upload sessions are not
-  implemented, so R-37's outbound half is untested.
+- Where a Workflow card lands (the flow posts it as the Workflows bot);
+  the fake only records the cards it accepted.
 - Token lifetime: tokens never expire unless a scenario calls
   `Env.ExpireToken`.
 

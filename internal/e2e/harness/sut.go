@@ -43,7 +43,11 @@ type SUTConfig struct {
 	// switches such as E2E_SUT_MACHINE_REGISTRY=1). In-process adapters
 	// ignore it.
 	ExtraEnv map[string]string
-	Logf     func(format string, args ...any)
+	// WorkflowWebhookURL, if set, is the owner's Teams Workflow webhook. The
+	// SUT must be configured with it before it starts, the way its own CLI
+	// or chat command would do it (old core: `cxp teams workflow enable`).
+	WorkflowWebhookURL string
+	Logf               func(format string, args ...any)
 }
 
 // SUTFactory builds a SUT for a scenario.

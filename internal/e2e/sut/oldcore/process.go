@@ -182,6 +182,7 @@ func (s *ProcSUT) childEnv(tag string) []string {
 	vars["E2E_SUT_INTERVAL"] = s.cfg.Interval.String()
 	vars["E2E_SUT_CODEX_BIN"] = s.bins.Codex
 	vars[fakecodex.EnvBrainURL] = s.cfg.Codex.BrainURL()
+	vars["E2E_SUT_WORKFLOW_WEBHOOK_URL"] = s.cfg.WorkflowWebhookURL
 	for k, v := range s.cfg.ExtraEnv {
 		vars[k] = v
 	}

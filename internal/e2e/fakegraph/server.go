@@ -30,7 +30,8 @@ const (
 	graphHost = "graph.microsoft.com"
 	loginHost = "login.microsoftonline.com"
 
-	maxRequestBody = 8 << 20
+	// maxRequestBody fits one upload-session fragment (< 60 MiB).
+	maxRequestBody = 64 << 20
 	// maxMessageContentBytes approximates the documented Teams limit for a
 	// chat message body (~100 KB of HTML).
 	maxMessageContentBytes = 102289
@@ -72,6 +73,12 @@ type Server struct {
 	faults        []*FaultHandle
 	hosted        map[hostedKey][]byte
 	drive         map[string]driveFile
+	items         map[string]*driveItem
+	driveOrder    []string
+	lastFragments map[string]int
+	sessions      map[string]*uploadSession
+	workflows     map[string]*workflow
+	cards         []WorkflowCard
 	accessTokens  map[string]bool
 	refreshTokens map[string]bool
 	inflight      int
@@ -171,6 +178,10 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	var route routeMatch
 	if host == loginHost {
 		route = matchLoginRoute(r.Method, r.URL.Path)
+	} else if host == SharePointHost {
+		route = routeMatch{path: r.URL.Path, name: r.Method + " {uploadUrl}"}
+	} else if host == WorkflowHost {
+		route = routeMatch{path: r.URL.Path, name: r.Method + " {workflow}"}
 	} else {
 		route = matchGraphRoute(r.Method, strings.TrimPrefix(r.URL.Path, "/v1.0"))
 	}
@@ -200,9 +211,11 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			if f.Status == http.StatusTooManyRequests {
 				code = "TooManyRequests"
 			}
+			s.recordWorkflowFault(rec, body, f.Status)
 			s.finish(w, &rec, start, response{status: f.Status, headers: hdr, body: graphError(code, "e2e injected fault "+f.Name)})
 			return
 		case FaultDropBeforeAccept:
+			s.recordWorkflowFault(rec, body, 0)
 			rec.Status = 0
 			rec.Outcome = "dropped"
 			s.record(rec, start)
@@ -242,6 +255,12 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) dispatch(host string, route routeMatch, r *http.Request, body []byte, rec *Request) response {
 	if host == loginHost {
 		return s.handleLogin(route, r, body)
+	}
+	if host == SharePointHost {
+		return s.handleUploadURL(r, body, rec)
+	}
+	if host == WorkflowHost {
+		return s.handleWorkflow(r, body, rec)
 	}
 	if host != graphHost {
 		return violationResponse(rec, "unmodeled", "unknown host "+host)
@@ -439,12 +458,21 @@ func templatePath(p string) string {
 
 func matchGraphRoute(method, p string) routeMatch {
 	m := routeMatch{path: p}
+	if dm, ok := drivePathRoute(method, p, m); ok {
+		return dm
+	}
 	parts := strings.Split(strings.Trim(p, "/"), "/")
 	set := func(tmpl string) routeMatch {
 		m.name = method + " " + tmpl
 		return m
 	}
 	switch {
+	case len(parts) == 4 && parts[0] == "me" && parts[1] == "drive" && parts[2] == "items" && method == http.MethodGet:
+		m.extra = parts[3]
+		return set("/me/drive/items/{id}")
+	case len(parts) == 5 && parts[0] == "me" && parts[1] == "drive" && parts[2] == "items" && parts[4] == "content" && method == http.MethodGet:
+		m.extra = parts[3]
+		return set("/me/drive/items/{id}/content")
 	case len(parts) == 1 && parts[0] == "me" && method == http.MethodGet:
 		return set("/me")
 	case len(parts) == 2 && parts[0] == "me" && parts[1] == "chats" && method == http.MethodGet:
@@ -566,6 +594,14 @@ func (s *Server) handleGraph(route routeMatch, q url.Values, body []byte, rec *R
 		}}
 	case "GET /me/chats":
 		return s.listChats(q, rec)
+	case "PUT /me/drive/root:/{path}:/content":
+		return s.drivePutContent(route, q, body, rec)
+	case "POST /me/drive/root:/{path}:/createUploadSession":
+		return s.driveCreateUploadSession(route, q, body, rec)
+	case "GET /me/drive/items/{id}":
+		return s.driveGetItem(route.extra, false, q, rec)
+	case "GET /me/drive/items/{id}/content":
+		return s.driveGetItem(route.extra, true, q, rec)
 	case "POST /chats":
 		if len(q) > 0 {
 			return violationResponse(rec, "graph-contract", "POST /chats takes no query options")
@@ -1290,6 +1326,9 @@ func (s *Server) postMessage(chatID string, body []byte, rec *Request, quote boo
 	c, resp := s.memberChatLocked(chatID)
 	if c == nil {
 		return resp
+	}
+	if reason := s.checkReferenceAttachmentsLocked(pm.Attachments); reason != "" {
+		return violationResponse(rec, "graph-contract", reason)
 	}
 	for _, id := range quoted {
 		found := false

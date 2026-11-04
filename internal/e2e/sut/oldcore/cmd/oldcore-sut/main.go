@@ -45,6 +45,10 @@ const (
 	EnvInterval        = "E2E_SUT_INTERVAL"
 	EnvCodexBin        = "E2E_SUT_CODEX_BIN"
 	EnvMachineRegistry = "E2E_SUT_MACHINE_REGISTRY"
+	// EnvWorkflowWebhookURL configures the Workflow webhook before Listen,
+	// exactly like `cxp teams workflow enable --webhook-url-file`
+	// (EnsureControlChat, ConfigureWorkflowNotifications, Save).
+	EnvWorkflowWebhookURL = "E2E_SUT_WORKFLOW_WEBHOOK_URL"
 	// EnvProductionTiming=1 keeps production timing defaults that the
 	// harness otherwise shortens (used by the cost scenarios).
 	EnvProductionTiming = "E2E_SUT_PRODUCTION_TIMING"
@@ -98,6 +102,18 @@ func run() error {
 	bridge, err := teams.NewBridgeWithHTTPClient(ctx, auth, "", os.Stdout, client)
 	if err != nil {
 		return fmt.Errorf("NewBridgeWithHTTPClient: %w", err)
+	}
+
+	if hook := os.Getenv(EnvWorkflowWebhookURL); hook != "" {
+		if _, err := bridge.EnsureControlChat(ctx); err != nil {
+			return fmt.Errorf("workflow enable: EnsureControlChat: %w", err)
+		}
+		if _, err := bridge.ConfigureWorkflowNotificationsFromWebhookURL(ctx, hook); err != nil {
+			return fmt.Errorf("workflow enable: %w", err)
+		}
+		if err := bridge.Save(); err != nil {
+			return fmt.Errorf("workflow enable: save: %w", err)
+		}
 	}
 
 	codexHome := os.Getenv("CODEX_HOME")
