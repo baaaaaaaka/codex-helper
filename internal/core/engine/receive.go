@@ -930,44 +930,67 @@ func (e *Engine) scanLoop(ctx context.Context) {
 		}
 		failures = 0
 		e.scanFirst.Store(false)
-		woke := false
-		e.mu.Lock()
-		for _, a := range acts {
-			if a.Last.After(mark) {
-				mark = a.Last
-			}
-			id, ok := e.byChat[a.Chat]
-			if !ok {
-				continue
-			}
-			cs := e.convs[id]
-			if cs == nil || cs.scanLast == a.LastID {
-				continue
-			}
-			cs.scanLast = a.LastID
-			if cs.kind == store.KindWork && cs.state != store.ConvActive {
-				continue // parked or closed: no reads until woken
-			}
-			if a.LastID != "" && slices.Contains(cs.ownPosts, a.LastID) {
-				// The newest message is one this helper sent (S7): about
-				// half the scan's reads went to such chats. A user
-				// message posted just before it is found by the next
-				// change, a direct poll (a chat with a running or
-				// recent request is polled) or the safety read.
-				continue
-			}
-			cs.scanDue = true
-			cs.scanGen++
-			if cs.nextRead.After(now) {
-				cs.nextRead = now
-			}
-			woke = true
-		}
-		e.mu.Unlock()
+		var woke bool
+		mark, woke = e.markScanned(acts, mark, now)
 		if woke {
 			e.wakeReader()
 		}
 	}
+}
+
+// markScanned applies one activity scan: the chats it shows with a new
+// newest message are marked for a read. It returns the advanced watermark
+// and whether any chat was marked.
+func (e *Engine) markScanned(acts []channel.ChatActivity, mark, now time.Time) (time.Time, bool) {
+	woke := false
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, a := range acts {
+		if a.Last.After(mark) {
+			mark = a.Last
+		}
+		id, ok := e.byChat[a.Chat]
+		if !ok {
+			continue
+		}
+		cs := e.convs[id]
+		if cs == nil || cs.scanLast == a.LastID {
+			continue
+		}
+		cs.scanLast = a.LastID
+		if cs.kind == store.KindWork && cs.state != store.ConvActive {
+			continue // parked or closed: no reads until woken
+		}
+		if a.LastID != "" && slices.Contains(cs.ownPosts, a.LastID) && e.polledLocked(cs, now) {
+			// The newest message is one this helper sent (S7): about
+			// half the scan's reads went to such chats, mostly acks,
+			// progress and finals in chats with a running or recent
+			// request. Such a chat is read at its poll interval anyway;
+			// a user message posted just before the helper's is read
+			// by the next poll, which is not later than one poll
+			// interval from now. A chat that is not polled is marked:
+			// its next timed read is the safety read.
+			if next := now.Add(e.intervalLocked(cs, now)); cs.nextRead.After(next) {
+				cs.nextRead = next
+				woke = true
+			}
+			continue
+		}
+		cs.scanDue = true
+		cs.scanGen++
+		if cs.nextRead.After(now) {
+			cs.nextRead = now
+		}
+		woke = true
+	}
+	return mark, woke
+}
+
+// polledLocked reports whether a conversation is read at the hot or
+// control interval without the scan: the control chat, and a work chat with
+// a running request or recent owner activity (caller holds e.mu).
+func (e *Engine) polledLocked(cs *convState, now time.Time) bool {
+	return cs.kind == store.KindControl || cs.running != nil || now.Sub(cs.lastUser) < e.t.HotFor
 }
 
 // ownPostsKept is how many sent message ids a conversation remembers.

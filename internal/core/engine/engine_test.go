@@ -1471,10 +1471,58 @@ func TestScanStaysWithinTheReadBudget(t *testing.T) {
 	}
 }
 
-// Benchmark S7: a chat whose newest message (the scan's preview) is one
-// this helper sent is not read; one whose newest message is the owner's
-// is. About half the storm's chat reads went to the helper's own posts.
-func TestScanSkipsChatsWhoseNewestMessageIsTheHelpers(t *testing.T) {
+// S7: the scan does not read a chat whose newest message is one this helper
+// sent while the chat is polled anyway (a running or recent request, the
+// control chat); the next poll is pulled to one poll interval at most. A
+// chat that is not polled is marked as before.
+func TestScanSkipsTheHelpersOwnPostOnlyInAPolledChat(t *testing.T) {
+	now := time.Unix(10_000, 0)
+	e := &Engine{t: ProductionTiming(), gRead: "read", gates: map[string]time.Time{},
+		convs: map[int64]*convState{}, byChat: map[string]int64{}, scanner: &lagScanner{}}
+	add := func(id int64, cs *convState) *convState {
+		cs.chat, cs.state, cs.ownPosts = fmt.Sprintf("chat-%d", id), store.ConvActive, []string{fmt.Sprintf("own-%d", id)}
+		cs.nextRead = now.Add(time.Hour)
+		e.convs[id], e.byChat[cs.chat] = cs, id
+		return cs
+	}
+	running := add(1, &convState{kind: store.KindWork, running: &runState{}})
+	recent := add(2, &convState{kind: store.KindWork, lastUser: now.Add(-time.Second), lastActivity: now.Add(-time.Second)})
+	ctl := add(3, &convState{kind: store.KindControl})
+	idle := add(4, &convState{kind: store.KindWork, lastUser: now.Add(-time.Hour), lastActivity: now.Add(-time.Hour)})
+	user := add(5, &convState{kind: store.KindWork, running: &runState{}})
+	var acts []channel.ChatActivity
+	for id := int64(1); id <= 4; id++ {
+		acts = append(acts, channel.ChatActivity{Chat: fmt.Sprintf("chat-%d", id), LastID: fmt.Sprintf("own-%d", id), Last: now})
+	}
+	acts = append(acts, channel.ChatActivity{Chat: "chat-5", LastID: "user-5", Last: now})
+	if _, woke := e.markScanned(acts, now.Add(-time.Minute), now); !woke {
+		t.Fatal("scan woke no reader")
+	}
+	for _, c := range []struct {
+		name string
+		cs   *convState
+		at   time.Time
+	}{{"running", running, now.Add(e.t.Hot)}, {"recent", recent, now.Add(e.t.Hot)}, {"control", ctl, now.Add(e.t.Control)}} {
+		if c.cs.scanDue {
+			t.Errorf("%s chat marked for a read of the helper's own post", c.name)
+		}
+		if !c.cs.nextRead.Equal(c.at) {
+			t.Errorf("%s chat next read %s after the scan, want %s (one poll interval)", c.name, c.cs.nextRead.Sub(now), c.at.Sub(now))
+		}
+	}
+	if !idle.scanDue || !idle.nextRead.Equal(now) {
+		t.Errorf("idle chat whose newest message is the helper's: due %v, next read in %s; want an immediate read", idle.scanDue, idle.nextRead.Sub(now))
+	}
+	if !user.scanDue || !user.nextRead.Equal(now) {
+		t.Errorf("running chat with a user post: due %v, next read in %s; want an immediate read", user.scanDue, user.nextRead.Sub(now))
+	}
+}
+
+// S7 interleave: a user message posted just before the helper's own post in
+// a chat that is not polled (idle, scan mode) must not wait for the safety
+// read. The scan shows the helper's post as the newest; the chat is read
+// within one scan of it.
+func TestScanReadsAUserPostJustBeforeTheHelpersOwnPostInAnIdleChat(t *testing.T) {
 	var sc *lagScanner
 	r := newRig(t, func(c *Config) {
 		sc = &lagScanner{Fake: c.Channel.(*channeltest.Fake)}
@@ -1493,19 +1541,15 @@ func TestScanSkipsChatsWhoseNewestMessageIsTheHelpers(t *testing.T) {
 	answer := r.own(work, "ANSWER to first prompt")[0]
 	time.Sleep(time.Second) // the work chat goes idle: read only when the scan shows a change
 
+	// The owner posts, then the helper's post lands after it: the scan
+	// shows the helper's message (the answer's id stands in for it) as the
+	// chat's newest.
+	r.ch.PostUser(work, "second prompt")
 	shown := time.Now()
 	sc.set(channel.ChatActivity{Chat: ctl, LastID: "ctl-1", Last: newest},
 		channel.ChatActivity{Chat: work, LastID: answer.ID, Last: shown})
-	time.Sleep(time.Second) // 20 scans
-	if at, ok := sc.readAfter(work, shown); ok {
-		t.Fatalf("work chat read %s after the scan showed the helper's own answer as its newest message", at.Sub(shown))
-	}
-
-	m := r.ch.PostUser(work, "second prompt")
-	shown = time.Now()
-	sc.set(channel.ChatActivity{Chat: ctl, LastID: "ctl-1", Last: newest},
-		channel.ChatActivity{Chat: work, LastID: m.ID, Last: shown})
-	r.waitFor("work chat read after the owner's post", 2*time.Second, func() bool {
+	// Bound: one scan interval plus a read; the safety read is a minute.
+	r.waitFor("work chat read after the interleaved post", 2*time.Second, func() bool {
 		_, ok := sc.readAfter(work, shown)
 		return ok
 	})
