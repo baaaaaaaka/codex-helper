@@ -84,6 +84,10 @@ func CXPFactory(bins Binaries) harness.SUTFactory {
 		registry := cfg.ExtraEnv["E2E_SUT_MACHINE_REGISTRY"] == "1"
 		args := []string{"teams", "run", "--codex-path", bins.Codex,
 			"--machine-registry=" + strconv.FormatBool(registry), "--auto-update=false", "--auto-service=false"}
+		if cfg.ExtraEnv["E2E_SUT_MANAGED_CHILD"] == "1" {
+			// Run as the service runs the helper (pacing, standby).
+			args = append(args, "--managed-service-child")
+		}
 		env := func(tag string) []string {
 			return append(s.childEnv(tag),
 				fakecodex.EnvKind+"=work",

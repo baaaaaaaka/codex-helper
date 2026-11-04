@@ -415,6 +415,7 @@ func newTeamsRunCmd(root *rootOptions) *cobra.Command {
 				autoUpdateRepo:       autoUpdateRepo,
 				autoUpdatePrerelease: autoUpdatePrerelease,
 				codexArgs:            codexArgs,
+				managedServiceChild:  managedServiceChild,
 			})
 		},
 	}

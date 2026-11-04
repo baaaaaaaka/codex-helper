@@ -652,10 +652,12 @@ func runTeamsServiceLocalSupervisor(ctx context.Context, configPath string) erro
 		_ = writeTeamsServiceLocalSupervisorStatus(status)
 	}()
 
+	startFailures := 0
 	for {
 		if err := supervisorCtx.Err(); err != nil {
 			return nil
 		}
+		runStart := time.Now()
 		runErr := runTeamsServiceLocalSupervisorChild(supervisorCtx, cfg, &status, logWriter)
 		if errors.Is(runErr, errTeamsServiceLocalSupervisorCleanupFailed) {
 			// A cleanup failure is a safety stop.  Do not enter the restart delay
@@ -681,7 +683,16 @@ func runTeamsServiceLocalSupervisor(ctx context.Context, configPath string) erro
 			status.UpdatedAt = time.Now()
 			_ = writeTeamsServiceLocalSupervisorStatus(status)
 		}
-		if err := sleepContext(supervisorCtx, teamsServiceLocalSupervisorRestartDelayAfter(runErr)); err != nil {
+		// A started child paces its own fast restarts (teams_service_backoff.go);
+		// a child that cannot even be started (missing binary) is paced here.
+		delay := teamsServiceLocalSupervisorRestartDelayAfter(runErr)
+		if status.LastChildStartAt.Before(runStart) {
+			startFailures++
+			delay = max(delay, teamsCrashLoopDelay(startFailures))
+		} else {
+			startFailures = 0
+		}
+		if err := sleepContext(supervisorCtx, delay); err != nil {
 			return nil
 		}
 		status.RestartCount++

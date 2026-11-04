@@ -61,6 +61,10 @@ type teamsNewCoreOptions struct {
 	autoUpdatePrerelease bool
 	// codexArgs are the --codex-arg values (teamsNewCoreCodexArgs).
 	codexArgs []string
+	// managedServiceChild is set for a helper run by the service
+	// (--managed-service-child): it paces fast restarts and stands by on an
+	// expected refusal instead of exiting (teams_service_backoff.go).
+	managedServiceChild bool
 }
 
 // teamsNewCoreOverrides replace production wiring in the e2e build
@@ -270,25 +274,36 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 	if err != nil {
 		return err
 	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	host, _ := os.Hostname()
+	if ov.Host != "" {
+		host = ov.Host
+	}
+	if opts.managedServiceChild {
+		if err := teamsServiceStartBackoff(ctx, teamsServiceRestartRecordPath(dir, host), errOut); err != nil {
+			return nil // stopped while waiting
+		}
+	}
 	if migrateFrom != "" {
 		if err := migrateTeamsStoreAtStart(ctx, migrateFrom, filepath.Join(paths.CodexDir, "sessions"), errOut); err != nil {
 			return err
 		}
-	}
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
 	}
 	st, err := corestore.Open(path)
 	if err != nil {
 		return fmt.Errorf("open Teams core store: %w", err)
 	}
 	defer st.Close()
-	host, _ := os.Hostname()
-	if ov.Host != "" {
-		host = ov.Host
-	}
-	if _, err := st.Acquire(corestore.Ident{Host: host, PID: os.Getpid(), BootID: teamsBootID()}); err != nil {
+	if err := teamsAcquireOrWait(ctx, func() error {
+		_, err := st.Acquire(corestore.Ident{Host: host, PID: os.Getpid(), BootID: teamsBootID()})
+		return err
+	}, opts.managedServiceChild, errOut); err != nil {
+		if ctx.Err() != nil {
+			return nil // stopped while standing by
+		}
 		if errors.Is(err, corestore.ErrDisabled) {
 			return fmt.Errorf("the Teams helper is disabled (%s exists next to %s)", corestore.DisabledFile, path)
 		}

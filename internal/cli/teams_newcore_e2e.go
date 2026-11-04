@@ -52,6 +52,11 @@ func teamsNewCoreE2EOverrides(stderr io.Writer) (teamsNewCoreOverrides, error) {
 			return teamsNewCoreOverrides{}, fmt.Errorf("E2E_SUT_INTERVAL: %w", err)
 		}
 	}
+	if v := os.Getenv("E2E_SUT_REFUSAL_RECHECK"); v != "" {
+		if teamsRefusalRecheck, err = time.ParseDuration(v); err != nil {
+			return teamsNewCoreOverrides{}, fmt.Errorf("E2E_SUT_REFUSAL_RECHECK: %w", err)
+		}
+	}
 	timing := engine.FastTiming(interval)
 	readRate := 4 * float64(time.Second) / float64(interval)
 	if os.Getenv("E2E_SUT_PRODUCTION_TIMING") == "1" {
