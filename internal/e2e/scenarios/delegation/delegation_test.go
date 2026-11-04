@@ -9,9 +9,11 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakegraph"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/harness"
 	"github.com/baaaaaaaka/codex-helper/internal/teams/delegation"
+	"github.com/baaaaaaaka/codex-helper/internal/teams/machineregistry"
 )
 
-const inboxTopic = "CXP Machine Inbox"
+// registryTopic is the chat the machine cards are posted in.
+const registryTopic = "CXP Machine Registry"
 
 func options(title string, guarantees []string) harness.Options {
 	return harness.Options{
@@ -22,16 +24,48 @@ func options(title string, guarantees []string) harness.Options {
 	}
 }
 
-// waitInbox waits for the machine inbox and returns it with the machine id
-// its title names (the requester addresses requests by that id).
+// card returns this machine's newest card in the registry chat.
+func card(s *harness.Scenario) (machineregistry.MachineCard, bool) {
+	reg, ok := s.FindChat(registryTopic)
+	if !ok {
+		return machineregistry.MachineCard{}, false
+	}
+	var best machineregistry.MachineCard
+	found := false
+	for _, m := range s.Graph.Messages(reg.ID) {
+		if c, ok := machineregistry.ParseCardMessage(m.Content); ok && (!found || c.Sequence >= best.Sequence) {
+			best, found = c, true
+		}
+	}
+	return best, found
+}
+
+// waitInbox resolves the machine the way `cxp delegate` does: from its
+// card in the registry chat (online and accepting) to the inbox chat its
+// inbox_ref opens (the meeting externalId). It returns the inbox and the
+// machine id requests are addressed to.
 func waitInbox(s *harness.Scenario) (fakegraph.ChatInfo, string) {
-	var inbox fakegraph.ChatInfo
-	s.Require("machine inbox chat created", 30*time.Second, func() (bool, string) {
+	var c machineregistry.MachineCard
+	s.Require("machine card published, accepting", 30*time.Second, func() (bool, string) {
 		var ok bool
-		inbox, ok = s.FindChat(inboxTopic)
-		return ok, fmt.Sprintf("chats: %d", len(s.Graph.Chats()))
+		c, ok = card(s)
+		return ok && c.Accepting && c.InboxRef != "" && c.MachineID != "", fmt.Sprintf("card %v: accepting %v inbox_ref %q", ok, c.Accepting, c.InboxRef)
 	})
-	return inbox, strings.TrimSpace(strings.TrimPrefix(inbox.Topic, inboxTopic))
+	var inbox fakegraph.ChatInfo
+	s.Require("the card's inbox_ref opens the inbox chat", 30*time.Second, func() (bool, string) {
+		for _, ch := range s.Graph.Chats() {
+			if ch.ExternalID == c.InboxRef {
+				inbox = ch
+				return true, ch.Topic
+			}
+		}
+		return false, fmt.Sprintf("no chat with externalId %q", c.InboxRef)
+	})
+	status := machineregistry.ObserveMessages([]machineregistry.ChatMessage{{ID: "card", Body: machineregistry.ChatMessageBody{Content: machineregistry.RenderCardHTML(c)}}}, c.RegistryKey, time.Now())
+	s.Check("a requester sees the machine online and accepting", len(status) == 1 && status[0].State == "online" && status[0].Accepting,
+		"online, accepting", fmt.Sprintf("%+v", status))
+	s.Check("the inbox title names no internal id", !strings.Contains(inbox.Topic, c.MachineID), "no machine id", inbox.Topic)
+	return inbox, c.MachineID
 }
 
 // request posts a delegation request for machine as the owner (another
@@ -159,6 +193,9 @@ func TestDelegationRestartMidTask(t *testing.T) {
 	s.WaitCodexCalls(tok, 1, 60*time.Second)
 
 	s.StopSUT()
+	c, _ := card(s)
+	s.Check("a stopped helper's card says draining, not accepting", c.Draining && !c.Accepting,
+		"draining", fmt.Sprintf("accepting %v draining %v", c.Accepting, c.Draining))
 	s.StartSUT()
 	var result delegation.Record
 	s.WaitFor("terminal result after the restart", 60*time.Second, func() (bool, string) {
