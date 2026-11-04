@@ -10,7 +10,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/baaaaaaaka/codex-helper/internal/channel"
-	"github.com/baaaaaaaka/codex-helper/internal/teamshtml"
 )
 
 // Rendering: Markdown -> Teams chatMessage parts.
@@ -130,7 +129,7 @@ func (a *Adapter) Render(ctx context.Context, doc channel.RichDoc) ([]channel.Pa
 		}
 		p := channel.Part{
 			Index: i + 1, Count: len(packs), Body: string(body), Size: len(html),
-			Hash: channel.TextHash(teamshtml.PlainTextFromTeamsHTML(html)), Mention: m != nil,
+			Hash: channel.TextHash(plainText(html)), Mention: m != nil,
 		}
 		if i == 0 {
 			p.ReplyTo = doc.ReplyTo

@@ -194,7 +194,7 @@ func (a *Adapter) convert(chat string, gm graphMessage, owner string) channel.In
 		m.Marker = sm[1]
 	}
 	if strings.EqualFold(gm.Body.ContentType, "html") {
-		m.Text = teamshtml.PlainTextFromTeamsHTML(content)
+		m.Text = plainText(content)
 	} else {
 		m.Text = strings.TrimSpace(markerRE.ReplaceAllString(content, ""))
 	}
@@ -291,7 +291,7 @@ func quoteFrom(at graphAttachment) channel.Quote {
 	return channel.Quote{
 		ID:       first(c.MessageID, c.OriginalID, at.ID),
 		FromName: first(name(c.MessageSender), name(c.OriginalSender)),
-		Text:     first(c.MessagePreview, teamshtml.PlainTextFromTeamsHTML(c.OriginalText)),
+		Text:     first(c.MessagePreview, plainText(c.OriginalText)),
 	}
 }
 
@@ -313,6 +313,46 @@ func (a *Adapter) allowedHost(host string) bool {
 // SharePointHostsFromEnv parses CODEX_HELPER_TEAMS_ALLOWED_SHAREPOINT_HOSTS.
 func SharePointHostsFromEnv(v string) []string {
 	return strings.FieldsFunc(v, func(r rune) bool { return r == ',' || r == ';' || r == ' ' || r == '\n' || r == '\t' })
+}
+
+// Teams stores emoji as markup: <emoji id=".." alt="😀" title=".."></emoji>,
+// <customemoji .. alt=":name:">, or (older clients) <img
+// itemtype="http://schema.skype.com/Emoji" alt="😀">. They are part of what
+// the user wrote, so the plain text keeps their alt text.
+var (
+	emojiPairRE  = regexp.MustCompile(`(?is)<(emoji|customemoji)\b([^>]*)>[^<]*</(?:emoji|customemoji)\s*>`)
+	emojiOpenRE  = regexp.MustCompile(`(?is)<(?:emoji|customemoji)\b([^>]*)>`)
+	emojiCloseRE = regexp.MustCompile(`(?i)</(?:emoji|customemoji)\s*>`)
+	emojiImgRE   = regexp.MustCompile(`(?is)<img\b([^>]*itemtype\s*=\s*["']https?://schema\.skype\.com/(?:Emoji|Emoticon)["'][^>]*)>`)
+	altAttrRE    = regexp.MustCompile(`(?is)\balt\s*=\s*(?:"([^"]*)"|'([^']*)')`)
+	titleAttrRE  = regexp.MustCompile(`(?is)\btitle\s*=\s*(?:"([^"]*)"|'([^']*)')`)
+)
+
+func emojiAlt(attrs string) string {
+	for _, re := range []*regexp.Regexp{altAttrRE, titleAttrRE} {
+		if m := re.FindStringSubmatch(attrs); m != nil {
+			return m[1] + m[2]
+		}
+	}
+	return ""
+}
+
+// plainText is the inbound text of a Teams HTML body: emoji become their
+// Unicode (alt) text, the rest as teamshtml renders it.
+func plainText(content string) string {
+	if strings.Contains(content, "<") {
+		content = emojiPairRE.ReplaceAllStringFunc(content, func(t string) string {
+			return emojiAlt(emojiPairRE.FindStringSubmatch(t)[2])
+		})
+		content = emojiOpenRE.ReplaceAllStringFunc(content, func(t string) string {
+			return emojiAlt(emojiOpenRE.FindStringSubmatch(t)[1])
+		})
+		content = emojiCloseRE.ReplaceAllString(content, "")
+		content = emojiImgRE.ReplaceAllStringFunc(content, func(t string) string {
+			return emojiAlt(emojiImgRE.FindStringSubmatch(t)[1])
+		})
+	}
+	return teamshtml.PlainTextFromTeamsHTML(content)
 }
 
 func hostedRef(chat, msg, id string) string {
