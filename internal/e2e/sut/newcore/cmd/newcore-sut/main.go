@@ -49,7 +49,8 @@ const (
 // BlockedPrefix starts the stderr line reporting a refused foreign request.
 const BlockedPrefix = "E2E-BLOCKED "
 
-// exitRestart is the exit code of a requested restart.
+// exitRestart is harness.ServiceRestartExitCode: the harness (like a
+// service supervisor) starts a new instance on the same state.
 const exitRestart = 75
 
 func main() {
@@ -150,7 +151,8 @@ func run() error {
 	cfg := engine.Config{
 		Store: st, Channel: ch, ChannelName: "teams", Agent: ag,
 		Log: os.Stdout, Timing: timing, Machine: machine, Version: "e2e-newcore",
-		FilesDir: filepath.Join(dir, "files"),
+		FilesDir: filepath.Join(dir, "files"), ActivityScan: true,
+		Registry: os.Getenv("E2E_SUT_MACHINE_REGISTRY") == "1",
 	}
 	if codexHome != "" {
 		cfg.SessionsDir = filepath.Join(codexHome, "sessions")
