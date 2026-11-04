@@ -14,6 +14,7 @@ import (
 	"encoding/hex"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // Channel is one chat service account (one signed-in identity).
@@ -190,7 +191,8 @@ type FileRef struct {
 
 // UploadSession is resumable upload state the core persists between attempts.
 type UploadSession struct {
-	URL       string
+	URL       string // service upload URL (a bearer secret; store it like a token)
+	Target    string // adapter destination handle, used to find a finished upload
 	ExpiresAt time.Time
 	Offset    int64 // bytes the service has acknowledged
 }
@@ -203,9 +205,19 @@ type ChatInfo struct {
 }
 
 // TextHash is the content hash used for own-message recognition. It is
-// computed over visible text with all whitespace runs collapsed, so that
-// markup changes the service makes on storage do not change it.
+// computed over visible text with whitespace runs collapsed and pictographic
+// symbols (emoji, their modifiers and joiners) removed, because services
+// rewrite markup and emoji on storage (Teams stores emoji as <emoji> image
+// tags) while the words stay the same.
 func TextHash(text string) string {
-	sum := sha256.Sum256([]byte(strings.Join(strings.Fields(text), " ")))
+	clean := strings.Map(func(r rune) rune {
+		switch {
+		case unicode.Is(unicode.So, r), unicode.Is(unicode.Cf, r), unicode.Is(unicode.Sk, r) && r > 0xFF,
+			r >= 0xFE00 && r <= 0xFE0F, r >= 0xE0100 && r <= 0xE01EF, r == 0x20E3:
+			return ' '
+		}
+		return r
+	}, text)
+	sum := sha256.Sum256([]byte(strings.Join(strings.Fields(clean), " ")))
 	return hex.EncodeToString(sum[:16])
 }
