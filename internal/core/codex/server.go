@@ -32,6 +32,9 @@ type Config struct {
 	// OnServerRequest answers app-server initiated requests; nil uses
 	// AutoApprove and rejects everything else.
 	OnServerRequest func(method string, params json.RawMessage) (json.RawMessage, bool, error)
+	// Configure, when set, adjusts the command before it starts (the
+	// caller's environment and execution identity); an error fails Start.
+	Configure func(cmd *exec.Cmd) error
 }
 
 // ErrExited is returned for calls on (or turns of) a server that exited.
@@ -103,6 +106,11 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 	cmd.Dir = cfg.Dir
 	cmd.Stderr = cfg.Log
 	configure(cmd)
+	if cfg.Configure != nil {
+		if err := cfg.Configure(cmd); err != nil {
+			return nil, fmt.Errorf("codex: prepare app-server: %w", err)
+		}
+	}
 	in, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
