@@ -1208,3 +1208,133 @@ func TestFailedAdmitDoesNotMarkPromptsAsDuplicates(t *testing.T) {
 		t.Fatalf("%d duplicate notices after a failed admit", n)
 	}
 }
+
+// A throttle response without Retry-After is not retried every tick
+// (review L9): sends wait at least ThrottleFloor.
+func TestThrottleWithoutRetryAfterWaitsTheFloor(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		attempts []time.Time
+		until    time.Time
+	)
+	r := newRig(t, func(c *Config) {
+		c.Timing.ChatRate = 10 * time.Millisecond // the floor, not the per-chat gap, spaces the retries
+		c.Channel.(*channeltest.Fake).SendFault = func(chat string, p channel.Part) (bool, error) {
+			if !strings.Contains(p.Body, "ANSWER") {
+				return false, nil
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			now := time.Now()
+			attempts = append(attempts, now)
+			if until.IsZero() {
+				until = now.Add(time.Second)
+			}
+			if now.Before(until) {
+				return false, &channel.Throttled{Scope: channel.ScopeChat, Err: errors.New("429 without Retry-After")}
+			}
+			return false, nil
+		}
+	})
+	work := r.newWork(t.TempDir())
+	r.ch.PostUser(work, "throttled reply")
+	r.wait("answer", func() bool { return len(r.own(work, "ANSWER to throttled reply")) == 1 })
+	mu.Lock()
+	defer mu.Unlock()
+	floor := FastTiming(20 * time.Millisecond).ThrottleFloor
+	// One second of throttling at a 200 ms floor: about 6 attempts; the
+	// old one-tick retry made dozens.
+	if max := int(time.Second/floor) + 3; len(attempts) > max {
+		t.Fatalf("%d send attempts in one second of throttling, want at most %d", len(attempts), max)
+	}
+	for i := 1; i < len(attempts); i++ {
+		if gap := attempts[i].Sub(attempts[i-1]); gap < floor-floor/4 {
+			t.Fatalf("attempt %d only %s after the previous one", i, gap)
+		}
+	}
+}
+
+// Commands left unfinished at a stop are all re-run after the restart,
+// however many, and keep their group-chat quote (review L9).
+func TestRequeuedCommandsNotDroppedAndKeepQuote(t *testing.T) {
+	var (
+		mu      sync.Mutex
+		replies []string // ReplyTo of every "Unknown helper command" reply sent
+	)
+	r := newRig(t, func(c *Config) {
+		c.WriteRate, c.Timing.ChatRate = 1000, time.Millisecond
+		c.Channel.(*channeltest.Fake).SendFault = func(chat string, p channel.Part) (bool, error) {
+			if strings.Contains(p.Body, "Unknown helper command") {
+				mu.Lock()
+				replies = append(replies, p.ReplyTo)
+				mu.Unlock()
+			}
+			return false, nil
+		}
+	})
+	work := r.newWork(t.TempDir())
+	r.ch.PostCoworker(work, "hello all")
+	r.ch.PostUser(work, "helper frobnicate")
+	r.wait("group chat reply", func() bool { return len(r.own(work, "Unknown helper command")) == 1 })
+	r.stop()
+
+	const n = 300 // more than the command queue holds
+	st, err := store.Open(r.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Acquire(store.Ident{Host: "h", PID: 1, BootID: "b"}); err != nil {
+		t.Fatal(err)
+	}
+	streams, err := st.Streams()
+	if err != nil {
+		t.Fatal(err)
+	}
+	convs, err := st.Conversations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = st.Update(func(tx *store.Tx) error {
+		var conv int64
+		for _, c := range convs {
+			if c.ExtChatID == work {
+				conv = c.ID
+			}
+		}
+		for _, s := range streams {
+			if s.ConvID != conv {
+				continue
+			}
+			var msgs []store.InboundMsg
+			for i := 0; i < n; i++ {
+				msgs = append(msgs, store.InboundMsg{ExtMsgID: fmt.Sprintf("left-%d", i), ExtTime: time.Now().UnixMilli(),
+					Sender: store.SenderOwner, Kind: store.InCommand, Body: fmt.Sprintf("helper frob%d", i)})
+			}
+			_, err := tx.AdmitWindow(s.Key, conv, msgs, s.Cursor)
+			return err
+		}
+		return errors.New("no stream for the work chat")
+	})
+	st.Release()
+	st.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	replies = nil
+	mu.Unlock()
+	r.start()
+	r.wait("every left command answered", func() bool { mu.Lock(); defer mu.Unlock(); return len(replies) >= n })
+	mu.Lock()
+	defer mu.Unlock()
+	quoted := map[string]bool{}
+	for _, q := range replies {
+		if !strings.HasPrefix(q, "left-") {
+			t.Fatalf("requeued reply quotes %q, want the command it answers", q)
+		}
+		quoted[q] = true
+	}
+	if len(quoted) != n {
+		t.Fatalf("%d distinct commands answered, want %d", len(quoted), n)
+	}
+}

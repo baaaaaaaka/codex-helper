@@ -56,6 +56,9 @@ type Timing struct {
 	SilenceHint, SilenceStuck, StallLimit time.Duration
 	// R-35: reminder cadence for a turn that stays queued (0 disables).
 	QueueReminder time.Duration
+	// ThrottleFloor is the wait after a throttle response that names no
+	// Retry-After (review L9), so the service is not retried every tick.
+	ThrottleFloor time.Duration
 }
 
 // ProductionTiming are the CORE-DESIGN values.
@@ -72,6 +75,7 @@ func ProductionTiming() Timing {
 		DuplicateFor: 3 * time.Minute, BreakerWindow: time.Minute, BreakerCount: 3,
 		SilenceHint: 7 * time.Minute, SilenceStuck: 15 * time.Minute, StallLimit: time.Hour,
 		QueueReminder: 10 * time.Minute,
+		ThrottleFloor: 10 * time.Second,
 	}
 }
 
@@ -93,6 +97,7 @@ func FastTiming(base time.Duration) Timing {
 	t.Maintenance = 10 * time.Second
 	t.CapacityBackoff = time.Second
 	t.CancelWait = 5 * time.Second
+	t.ThrottleFloor = 10 * base
 	return t
 }
 
@@ -190,6 +195,7 @@ type Engine struct {
 
 	mirror       *mirrorState
 	sendFailures map[int64]int
+	requeued     []cmdJob // commands to re-run when the command loop starts
 	unknown      map[int64]*unknownState
 	gates        map[string]time.Time
 	forkThreads  map[string]bool  // forked threads: mirror from the end of the copied history

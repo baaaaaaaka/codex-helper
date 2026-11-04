@@ -133,15 +133,18 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 				soon(wait)
 				continue
 			}
-			if ok, w := e.writeTokens.take(); !ok {
-				soon(w)
-				break
-			}
+			// The send slot first: a write token taken while every slot
+			// is busy would be wasted (review L9).
 			select {
 			case sem <- struct{}{}:
 			default:
 				soon(e.t.Tick)
 				return nil
+			}
+			if ok, w := e.writeTokens.take(); !ok {
+				<-sem
+				soon(w)
+				break
 			}
 			if r.ConvID != ctl {
 				e.sendLast = r.ConvID
@@ -249,10 +252,11 @@ func (e *Engine) send(ctx context.Context, r store.Outbox, chat, token string, f
 		if err := e.update(func(tx *store.Tx) error { return tx.MarkUnknown(r.ID, clipText(err.Error(), 200)) }); err != nil {
 			e.logf("mark unknown %d: %v", r.ID, err)
 		}
+		e.forgetFailures(r.ID)
 		e.noteUnknown(r.ID, now)
 		e.wakeResolver()
 	case throttled:
-		at := now.Add(th.RetryAfter + time.Duration(r.ConvID%5)*e.t.Tick)
+		at := now.Add(e.retryAfter(th) + time.Duration(r.ConvID%5)*e.t.Tick)
 		if th.Scope == channel.ScopeAccount || th.Scope == channel.ScopeUnknown {
 			e.setGate(e.gWrite, at, "send throttled")
 		}
@@ -262,6 +266,7 @@ func (e *Engine) send(ctx context.Context, r store.Outbox, chat, token string, f
 		if err := e.update(func(tx *store.Tx) error { return tx.Drop(r.ID, clipText(err.Error(), 200)) }); err != nil {
 			e.logf("drop %d: %v", r.ID, err)
 		}
+		e.forgetFailures(r.ID)
 		e.wakeRunner(r.ConvID)
 	case errors.As(err, &auth):
 		e.logf("send needs sign-in: %v", err)
@@ -277,6 +282,15 @@ func (e *Engine) send(ctx context.Context, r store.Outbox, chat, token string, f
 		}
 		e.requeue(r.ID, now.Add(back))
 	}
+}
+
+// retryAfter is the wait a throttle response asks for, at least
+// ThrottleFloor when it names none.
+func (e *Engine) retryAfter(th *channel.Throttled) time.Duration {
+	if th.RetryAfter > 0 {
+		return th.RetryAfter
+	}
+	return e.t.ThrottleFloor
 }
 
 func (e *Engine) requeue(id int64, at time.Time) {
@@ -424,10 +438,10 @@ func (e *Engine) resolveOne(ctx context.Context, id int64) {
 	if err != nil {
 		if th, ok := channel.AsThrottled(err); ok {
 			e.mu.Lock()
-			u.next = now.Add(th.RetryAfter)
+			u.next = now.Add(e.retryAfter(th))
 			e.mu.Unlock()
 			if th.Scope != channel.ScopeChat {
-				e.setGate(e.gRead, now.Add(th.RetryAfter), "read-back throttled")
+				e.setGate(e.gRead, now.Add(e.retryAfter(th)), "read-back throttled")
 			}
 			return
 		}
@@ -631,9 +645,9 @@ func (e *Engine) upload(ctx context.Context, r store.Outbox, f store.OutFile) {
 		e.forgetFailures(r.ID)
 	case throttled:
 		if th.Scope == channel.ScopeAccount || th.Scope == channel.ScopeUnknown {
-			e.setGate(e.gWrite, now.Add(th.RetryAfter), "upload throttled")
+			e.setGate(e.gWrite, now.Add(e.retryAfter(th)), "upload throttled")
 		}
-		e.retryUpload(r.ID, now.Add(th.RetryAfter))
+		e.retryUpload(r.ID, now.Add(e.retryAfter(th)))
 	case errors.As(err, &rej) && rej.Permanent:
 		e.logf("upload %s rejected: %v", r.DeliveryKey, err)
 		e.dropFile(r, name)

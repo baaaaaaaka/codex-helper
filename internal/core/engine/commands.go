@@ -28,6 +28,11 @@ type cmdJob struct {
 // parallel. Urgent commands (cancel, status, help) run at once, so a slow
 // `model` or `fork` never delays `helper cancel`.
 func (e *Engine) commandLoop(ctx context.Context) {
+	requeued := e.requeued
+	e.requeued = nil
+	for _, j := range requeued {
+		e.dispatchCommand(ctx, j)
+	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -91,15 +96,19 @@ func urgentCommand(text string) bool {
 }
 
 // requeueCommands re-runs commands admitted but not finished before the
-// last stop (every command is safe to repeat: the reply key dedupes).
+// last stop (every command is safe to repeat: the reply key dedupes). The
+// command loop dispatches them all when it starts, so none is dropped
+// for a full queue (review L9).
 func (e *Engine) requeueCommands() {
 	var jobs []cmdJob
 	_ = e.update(func(tx *store.Tx) error {
 		jobs = jobs[:0]
 		e.mu.Lock()
 		ids := make([]int64, 0, len(e.convs))
-		for id := range e.convs {
+		group := map[int64]bool{}
+		for id, cs := range e.convs {
 			ids = append(ids, id)
+			group[id] = cs.group
 		}
 		e.mu.Unlock()
 		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
@@ -110,19 +119,17 @@ func (e *Engine) requeueCommands() {
 			}
 			for _, in := range open {
 				if in.Kind == store.InCommand && in.State == store.InQueued && in.Sender == store.SenderOwner {
-					jobs = append(jobs, cmdJob{conv: id, inbound: in.ID, ext: in.ExtMsgID, text: in.Body})
+					j := cmdJob{conv: id, inbound: in.ID, ext: in.ExtMsgID, text: in.Body}
+					if group[id] {
+						j.quote = in.ExtMsgID // as when it was admitted
+					}
+					jobs = append(jobs, j)
 				}
 			}
 		}
 		return nil
 	})
-	for _, j := range jobs {
-		select {
-		case e.cmdQueue <- j:
-		default:
-			e.logf("command queue full; command %d dropped", j.inbound)
-		}
-	}
+	e.requeued = jobs
 }
 
 // reply finishes a command with a visible reply in the same transaction.

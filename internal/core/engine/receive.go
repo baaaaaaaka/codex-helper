@@ -178,7 +178,7 @@ func (e *Engine) read(ctx context.Context, id int64) {
 	}
 	var tl *channel.WindowTooLarge
 	if th, ok := channel.AsThrottled(err); ok {
-		until := now.Add(th.RetryAfter + time.Duration(id%7)*e.t.Tick)
+		until := now.Add(e.retryAfter(th) + time.Duration(id%7)*e.t.Tick)
 		if th.Scope == channel.ScopeChat {
 			cs.nextRead = until
 		} else {
@@ -187,7 +187,7 @@ func (e *Engine) read(ctx context.Context, id int64) {
 			e.setGate(e.gRead, until, "read throttled")
 			e.mu.Lock()
 		}
-		e.logf("read %s throttled for %s (%s scope)", cs.label, th.RetryAfter, th.Scope)
+		e.logf("read %s throttled for %s (%s scope)", cs.label, e.retryAfter(th), th.Scope)
 		return
 	}
 	if errors.As(err, &tl) {
@@ -758,7 +758,7 @@ func (e *Engine) scanLoop(ctx context.Context) {
 		}
 		if err != nil {
 			if th, ok := channel.AsThrottled(err); ok {
-				e.setGate(e.gRead, e.now().Add(th.RetryAfter), "activity scan throttled")
+				e.setGate(e.gRead, e.now().Add(e.retryAfter(th)), "activity scan throttled")
 				continue
 			}
 			failures++
