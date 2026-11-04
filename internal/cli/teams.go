@@ -1060,6 +1060,12 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 				if once {
 					return fmt.Errorf("--once is not supported by the new Teams core")
 				}
+				if strings.TrimSpace(modelProfile) != "" {
+					// Model profiles configure third-party model providers,
+					// which the new core does not support; Codex's own models
+					// are chosen with `helper model` or --codex-arg --model.
+					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "--model-profile %s is ignored by the new Teams core\n", modelProfile)
+				}
 				if upgradeCodex {
 					if err := runTeamsUpgradeCodexOnce(cmd, root, codexPath); err != nil {
 						return err
@@ -1073,6 +1079,7 @@ func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
 					autoUpdate:           autoUpdate,
 					autoUpdateRepo:       autoUpdateRepo,
 					autoUpdatePrerelease: autoUpdatePrerelease,
+					codexArgs:            codexArgs,
 				})
 			}
 			if upgradeCodex {

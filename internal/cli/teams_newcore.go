@@ -84,6 +84,8 @@ type teamsNewCoreOptions struct {
 	autoUpdate           bool
 	autoUpdateRepo       string
 	autoUpdatePrerelease bool
+	// codexArgs are the --codex-arg values (teamsNewCoreCodexArgs).
+	codexArgs []string
 }
 
 // teamsNewCoreOverrides replace production wiring in the e2e build
@@ -255,12 +257,28 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 			return err
 		}
 	}
+	server := codex.Config{
+		Bin:  codexBin,
+		Args: []string{"--analytics-default-enabled"},
+		Env:  []string{"CODEX_HOME=" + paths.CodexDir},
+	}
+	extra, err := teamsNewCoreCodexArgs(opts.codexArgs, errOut)
+	if err != nil {
+		return err
+	}
+	server.Args = append(server.Args, extra...)
+	var gatewayDone <-chan error
+	if teamsNewCoreTestOverrides == nil {
+		launch, err := newTeamsNewCoreCodexLaunch(ctx, root, codexBin, errOut)
+		if err != nil {
+			return err
+		}
+		defer launch.Close()
+		server.Bin, server.Configure, gatewayDone = launch.Bin, launch.Configure, launch.Done
+		server.Args = append(server.Args, launch.Args...)
+	}
 	ag := codexagent.New(codexagent.Config{
-		Server: codex.Config{
-			Bin:  codexBin,
-			Args: []string{"--analytics-default-enabled"},
-			Env:  []string{"CODEX_HOME=" + paths.CodexDir},
-		},
+		Server:  server,
 		PIDFile: filepath.Join(dir, "core-app-servers.pid"),
 		Idle:    10 * time.Minute,
 		Poll:    2 * time.Second,
@@ -334,7 +352,30 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 		return err
 	}
 	_, _ = fmt.Fprintf(out, "Teams helper (new core) running on %s\n", path)
-	err = e.Run(ctx)
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	gatewayFailed := make(chan struct{})
+	if gatewayDone != nil {
+		go func() {
+			select {
+			case gerr := <-gatewayDone:
+				// Every app-server reaches the model through the gateway:
+				// start again on the same state rather than fail turns.
+				_, _ = fmt.Fprintf(errOut, "Codex policy gateway stopped: %v; restarting\n", gerr)
+				close(gatewayFailed)
+				cancelRun()
+			case <-runCtx.Done():
+			}
+		}()
+	}
+	err = e.Run(runCtx)
+	select {
+	case <-gatewayFailed:
+		if ctx.Err() == nil {
+			err = engine.ErrRestart
+		}
+	default:
+	}
 	switch {
 	case errors.Is(err, engine.ErrRestart):
 		return &exitCodeError{code: teamsRestartExitCode, err: errors.New("Teams helper restart requested")}
