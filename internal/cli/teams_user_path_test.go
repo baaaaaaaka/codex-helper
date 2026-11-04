@@ -130,7 +130,7 @@ func TestResolveTeamsCodexUpgradePathReturnsInstallTargetInsteadOfFallingBackToS
 	}
 }
 
-func TestResolveTeamsCodexUpgradeTargetServicePrefersManagedInstallOverSystemNPMAndUnknownCache(t *testing.T) {
+func TestResolveTeamsCodexUpgradeTargetPrefersManagedInstallOverSystemNPMAndUnknownCache(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX npm wrapper fixture")
 	}
@@ -159,13 +159,13 @@ func TestResolveTeamsCodexUpgradeTargetServicePrefersManagedInstallOverSystemNPM
 	previous := teamsUserPathResolver
 	teamsUserPathResolver = &recordingUserPathResolver{result: userpath.Result{
 		Path:   os.Getenv("PATH"),
-		Mode:   userpath.ModeService,
+		Mode:   userpath.ModeAccountDefault,
 		Source: "service-environment",
 	}}
 	t.Cleanup(func() { teamsUserPathResolver = previous })
 
 	target, err := resolveTeamsCodexUpgradeTarget(context.Background(), config.Config{
-		TeamsCodexPath: config.TeamsCodexPathPolicy{Mode: string(userpath.ModeService)},
+		TeamsCodexPath: config.TeamsCodexPathPolicy{Mode: string(userpath.ModeAccountDefault)},
 	}, effectivePaths{Home: home})
 	if err != nil {
 		t.Fatal(err)
@@ -211,38 +211,6 @@ func TestApplyTeamsUserPathRuntimeUsesNativeBinaryWithoutManagedNodePATH(t *test
 		if _, ok := sliceEnvValue(got.Environment, key); ok {
 			t.Fatalf("launcher-only %s leaked into native runtime: %#v", key, got.Environment)
 		}
-	}
-}
-
-func TestApplyTeamsUserPathRuntimeServiceModePreservesLegacyWrapper(t *testing.T) {
-	previous := teamsFindNativeCodex
-	teamsFindNativeCodex = func(wrapper string) (string, string, error) {
-		if wrapper != "/managed/codex" {
-			t.Fatalf("wrapper = %q", wrapper)
-		}
-		return "/managed/vendor/codex", "/managed/vendor/codex-path", nil
-	}
-	t.Cleanup(func() { teamsFindNativeCodex = previous })
-	want := resolvedCodexRuntime{
-		Command: "/managed/codex",
-		Environment: []string{
-			"PATH=/managed/node/bin:/service/bin",
-			"CODEX_NODE_INSTALL_ROOT=/managed/node",
-		},
-	}
-	got := applyTeamsUserPathRuntime(want, userpath.Result{
-		Path: "/service/bin",
-		Mode: userpath.ModeService,
-	}, io.Discard)
-	if got.Command != want.Command || got.WrapperCommand != want.Command {
-		t.Fatalf("service compatibility runtime bypassed wrapper: %#v", got)
-	}
-	wantPath := "/managed/vendor/codex-path" + string(os.PathListSeparator) + "/managed/node/bin:/service/bin"
-	if path := envValue(got.Environment, "PATH"); path != wantPath {
-		t.Fatalf("service compatibility PATH = %q, want bundled tool path %q", path, wantPath)
-	}
-	if got.VendorPathDir != "/managed/vendor/codex-path" || envValue(got.Environment, "CODEX_NODE_INSTALL_ROOT") != "/managed/node" {
-		t.Fatalf("service compatibility runtime = %#v", got)
 	}
 }
 

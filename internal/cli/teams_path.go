@@ -22,7 +22,6 @@ func newTeamsPathCmd(root *rootOptions) *cobra.Command {
 		newTeamsPathStatusCmd(root),
 		newTeamsPathModeCmd(root),
 		newTeamsPathExplicitCmd(root),
-		newTeamsPathCaptureCmd(root),
 		newTeamsPathShellCmd(root),
 	)
 	return cmd
@@ -88,13 +87,13 @@ func newTeamsPathStatusCmd(root *rootOptions) *cobra.Command {
 
 func newTeamsPathModeCmd(root *rootOptions) *cobra.Command {
 	return &cobra.Command{
-		Use:   "mode <account-default|captured-terminal|explicit|service>",
+		Use:   "mode <account-default|explicit>",
 		Short: "Choose how Teams resolves the Codex PATH",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			mode := strings.ToLower(strings.TrimSpace(args[0]))
 			switch userpath.Mode(mode) {
-			case userpath.ModeAccountDefault, userpath.ModeCapturedTerminal, userpath.ModeExplicit, userpath.ModeService:
+			case userpath.ModeAccountDefault, userpath.ModeExplicit:
 			default:
 				return fmt.Errorf("unknown Teams Codex PATH mode %q", args[0])
 			}
@@ -103,8 +102,8 @@ func newTeamsPathModeCmd(root *rootOptions) *cobra.Command {
 				return err
 			}
 			if err := store.Update(func(cfg *config.Config) error {
-				if (mode == string(userpath.ModeExplicit) || mode == string(userpath.ModeCapturedTerminal)) && cfg.TeamsCodexPath.ExplicitPath == "" {
-					return fmt.Errorf("mode %s requires a saved PATH; use `cxp teams path explicit` or `capture-terminal`", mode)
+				if mode == string(userpath.ModeExplicit) && cfg.TeamsCodexPath.ExplicitPath == "" {
+					return fmt.Errorf("mode %s requires a saved PATH; use `cxp teams path explicit <PATH>`", mode)
 				}
 				cfg.TeamsCodexPath.Mode = mode
 				return nil
@@ -127,22 +126,6 @@ func newTeamsPathExplicitCmd(root *rootOptions) *cobra.Command {
 				return fmt.Errorf("PATH must not be empty")
 			}
 			return updateTeamsPathConfig(root, cmd, string(userpath.ModeExplicit), args[0], "Saved explicit Teams Codex PATH")
-		},
-	}
-}
-
-func newTeamsPathCaptureCmd(root *rootOptions) *cobra.Command {
-	return &cobra.Command{
-		Use:   "capture-terminal",
-		Short: "Capture this terminal's PATH and select captured-terminal mode",
-		Long:  "Capture the current terminal PATH, including deliberate venv, direnv, Nix, or other terminal-specific activation, and use it for future Teams Codex cold starts.",
-		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			pathValue := os.Getenv("PATH")
-			if pathValue == "" {
-				return fmt.Errorf("current terminal PATH is empty")
-			}
-			return updateTeamsPathConfig(root, cmd, string(userpath.ModeCapturedTerminal), pathValue, "Captured terminal PATH for Teams Codex")
 		},
 	}
 }
