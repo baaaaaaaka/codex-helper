@@ -191,6 +191,32 @@ func TestProofBasedResume(t *testing.T) {
 		}
 	})
 
+	// Fidelity run, s278: the old core delivered the event_msg
+	// agent_message final; the response_item that repeats it right after
+	// the proof offset is the same final, not a record to mirror again.
+	t.Run("response_item twin of the delivered event final", func(t *testing.T) {
+		rt := newRollout()
+		rt.line("session_meta", map[string]any{"id": s001Thread, "originator": "codex_cli_rs", "source": "cli"})
+		rt.turn("ta")
+		rt.user("u1", "ping")
+		rt.line("event_msg", map[string]any{"type": "agent_message", "message": "pong answer", "phase": "final_answer"})
+		rt.final("f1", "pong answer")
+		rt.done("ta", "pong answer")
+		sessions, path := writeRollout(t, rt)
+		d := map[string]any{"d1": map[string]any{
+			"id": "d1", "session_id": "s001", "outbox_id": "o1", "teams_message_id": "1788256809000", "status": "sent",
+			"codex_thread_id": s001Thread, "source_path": path, "source_line": 4, "source_offset": rt.ends[4], "source_record_id": "fallback:x", "part_index": 1,
+		}}
+		dir := fixture(t, "rc59", "json")
+		editJSON(t, dir, positions(path, rt.ends[6], 6, 0, 0, d))
+		rep, db := dryRun(t, dir, func(o *Options) { o.CodexSessions, o.CountBacklog = sessions, true })
+		if !rep.OK() {
+			t.Fatalf("checks: %+v", rep.Checks)
+		}
+		eq(t, "s001 source", qs(t, db, sourceQ, "%"+s001Thread+".jsonl"), "tracking@"+strconv.FormatInt(rt.ends[6], 10)+":6")
+		eq(t, "catch-up finals", rep.Backlog.Finals, 0)
+	})
+
 	// Bug B1 (fidelity run, s547/s519): a later "compacted" record repeats
 	// delivered message ids inside replacement_history. Those nested ids are
 	// not the record's own id and must not move the resume position past
