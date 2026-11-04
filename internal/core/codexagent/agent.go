@@ -65,7 +65,7 @@ func (a *Agent) Prepare(ctx context.Context) error {
 	if a.cfg.PIDFile == "" {
 		return nil
 	}
-	n, err := codex.KillStale(a.cfg.PIDFile, 5*time.Second)
+	n, err := codex.KillStale(a.cfg.PIDFile, 15*time.Second)
 	if n > 0 {
 		fmt.Fprintf(a.cfg.Log, "codexagent: killed %d app-server(s) left by the previous helper\n", n)
 	}
