@@ -15,3 +15,8 @@ func AccountWriteGate(channel string) string { return channel + ":account-write"
 
 // ChatGate is the gates.key of a per-chat throttling gate.
 func ChatGate(channel, chatID string) string { return channel + ":chat-gate:" + chatID }
+
+// MetaMigratedFrom is the meta key the converter sets (to the legacy store
+// version) in a store it produced. The engine branches on it: a migrated
+// store is not a fresh install.
+const MetaMigratedFrom = "migrated_from"
