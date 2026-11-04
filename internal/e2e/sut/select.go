@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/harness"
+	"github.com/baaaaaaaka/codex-helper/internal/e2e/sut/newcore"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/sut/oldcore"
 )
 
@@ -19,6 +20,8 @@ import (
 //	oldcore         (default) the current core as a subprocess; real SIGKILL,
 //	                real codexrunner.AppServerRunner + fake app-server binary
 //	oldcore-inproc  the M1 in-process adapter (fake teams.Executor)
+//	newcore         the rebuilt core (internal/core/engine) as a subprocess:
+//	                real channel/teams adapter, codexagent + fake app-server
 const EnvSUT = "E2E_SUT"
 
 // Run is the TestMain body of every scenario package: it selects the SUT,
@@ -50,8 +53,31 @@ func Run(m *testing.M) int {
 		harness.SetProcessEnv = false
 	case "oldcore-inproc":
 		harness.DefaultFactory = oldcore.Factory
+	case "newcore":
+		dir, err := os.MkdirTemp("", "e2e-bin-")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 2
+		}
+		defer os.RemoveAll(dir)
+		bins := newcore.Binaries{
+			SUT:   filepath.Join(dir, "newcore-sut"),
+			Codex: filepath.Join(dir, "codex"),
+		}
+		start := time.Now()
+		if err := goBuild(bins.SUT, "./internal/e2e/sut/newcore/cmd/newcore-sut"); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 2
+		}
+		if err := goBuild(bins.Codex, "./internal/e2e/fakecodex/cmd/fakecodex"); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 2
+		}
+		fmt.Fprintf(os.Stderr, "e2e: built SUT binaries in %v\n", time.Since(start).Round(time.Millisecond))
+		harness.DefaultFactory = newcore.ProcessFactory(bins)
+		harness.SetProcessEnv = false
 	default:
-		fmt.Fprintf(os.Stderr, "unknown %s %q (known: oldcore, oldcore-inproc)\n", EnvSUT, name)
+		fmt.Fprintf(os.Stderr, "unknown %s %q (known: oldcore, oldcore-inproc, newcore)\n", EnvSUT, name)
 		return 2
 	}
 	return m.Run()
