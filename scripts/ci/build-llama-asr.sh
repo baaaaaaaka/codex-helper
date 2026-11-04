@@ -110,7 +110,8 @@ cmake --build "$WORK/build" --config Release -j "$JOBS" > "$WORK/build.log" 2>&1
 # 3. Stage only what the managed runtime needs.
 stage="$WORK/stage/$NAME"
 mkdir -p "$stage"
-cp "$WORK/build/bin/llama-server" "$WORK/build/bin/llama-mtmd-cli" "$stage/"
+# Only llama-server: internal/asr never runs llama-mtmd-cli or other tools.
+cp "$WORK/build/bin/llama-server" "$stage/"
 # Shared libraries are stored under their SONAME as plain files (no symlinks),
 # so the archive extracts the same way everywhere. Tool-only "-impl" libraries
 # other than the server's are left out.
