@@ -226,8 +226,15 @@ func (r *rig) stop() {
 
 func (r *rig) wait(what string, cond func() bool) {
 	r.t.Helper()
+	r.waitFor(what, 10*time.Second, cond)
+}
+
+// waitFor is wait with a deadline of d; on timeout it also logs the
+// engine's log.
+func (r *rig) waitFor(what string, d time.Duration, cond func() bool) {
+	r.t.Helper()
 	start := time.Now()
-	deadline := start.Add(10 * time.Second)
+	deadline := start.Add(d)
 	var dumps []string
 	nextDump := start.Add(3 * time.Second)
 	for time.Now().Before(deadline) {
@@ -245,6 +252,9 @@ func (r *rig) wait(what string, cond func() bool) {
 	for _, d := range dumps {
 		r.t.Logf("goroutines during wait at %s", d)
 	}
+	r.logMu.Lock()
+	r.t.Logf("engine log:\n%s", r.log.String())
+	r.logMu.Unlock()
 	r.t.Fatalf("timed out waiting for %s", what)
 }
 
@@ -325,9 +335,25 @@ func TestPromptIsAckedAnsweredOnceAndControlMentioned(t *testing.T) {
 	if r.ag.runs[1].ThreadID != "thread-1" {
 		t.Fatalf("second turn on %q", r.ag.runs[1].ThreadID)
 	}
-	// Exactly one owner notification per final: a control-chat mention.
+	// Exactly one owner notification per final: a control-chat mention
+	// (two finals delivered close together may share one, F2).
 	ctl := r.chatOf("control")
-	r.wait("mentions", func() bool { return len(r.own(ctl, "Codex finished")) == 2 })
+	covered := func() int {
+		n := 0
+		for _, m := range r.own(ctl, "Codex finished") {
+			if strings.Contains(m.Text, "(2 answers)") {
+				n += 2
+			} else {
+				n++
+			}
+		}
+		return n
+	}
+	r.wait("mentions", func() bool { return covered() >= 2 })
+	time.Sleep(500 * time.Millisecond)
+	if n := covered(); n != 2 {
+		t.Fatalf("mentions cover %d finals, want 2", n)
+	}
 	for _, m := range r.own(ctl, "Codex finished") {
 		if !m.MentionsOwner {
 			t.Fatalf("notification without mention: %q", m.Text)
@@ -972,16 +998,80 @@ func TestQueuedTurnRemindedAndAnnouncedWhenStarting(t *testing.T) {
 	}
 	close(release)
 	r.wait("second job answered", func() bool { return len(r.own(work, "ANSWER to second job")) == 1 })
-	if n := len(r.own(work, "starting this queued request: “second job”")); n != 1 {
-		t.Errorf("%d starting notices for the queued request, want 1", n)
+	// A single queued request is named at the head of its first message
+	// (here the answer: the turn posts no progress), not in a notice.
+	if n := len(r.own(work, "ueued request: “second job”")); n != 1 {
+		t.Errorf("%d messages name the queued request as it starts, want 1", n)
 	}
-	if n := len(r.own(work, "starting this queued request: “first job”")); n != 0 {
+	if n := len(r.own(work, "▶️ Queued request: “second job”\n\nANSWER to second job")); n != 1 {
+		t.Errorf("the answer of the queued request does not name it first")
+	}
+	if n := len(r.own(work, "ueued request: “first job”")); n != 0 {
 		t.Errorf("%d starting notices for a request that did not wait", n)
 	}
 	r.ch.PostUser(work, "third job")
 	r.wait("third job answered", func() bool { return len(r.own(work, "ANSWER to third job")) == 1 })
 	if n := len(r.own(work, "“third job”")); n != 0 {
 		t.Errorf("a request that did not wait got %d queue notices", n)
+	}
+}
+
+// Benchmark F5: a backlog of queued requests in one chat starts with one
+// notice listing them, and each later request is named at the head of its
+// first message: at most two posts per request (its ACK and its answer)
+// plus the one notice.
+func TestQueuedBacklogStartsWithOneNotice(t *testing.T) {
+	r := newRig(t)
+	release := make(chan struct{})
+	r.ag.mu.Lock()
+	r.ag.block["job 0"] = release
+	r.ag.notes = []string{"step A"}
+	r.ag.mu.Unlock()
+	work := r.newWork(t.TempDir())
+	before := len(r.own(work, ""))
+	r.ch.PostUser(work, "job 0")
+	r.wait("job 0 running", func() bool { return r.ag.calls("job 0") == 1 })
+	jobs := []string{"job 1", "job 2", "job 3 progress", "job 4"}
+	for _, j := range jobs {
+		r.ch.PostUser(work, j)
+	}
+	r.wait("queued ACKs", func() bool { return len(r.own(work, "queued behind")) == len(jobs) })
+	close(release)
+	for _, j := range append([]string{"job 0"}, jobs...) {
+		j := j
+		r.wait("answer to "+j, func() bool { return len(r.own(work, "ANSWER to "+j)) == 1 })
+	}
+	batch := r.own(work, "starting your 4 queued requests")
+	if len(batch) != 1 {
+		t.Fatalf("%d batch notices, want 1", len(batch))
+	}
+	for _, j := range jobs {
+		if !strings.Contains(batch[0].Text, "“"+j+"”") {
+			t.Errorf("batch notice does not list %q:\n%s", j, batch[0].Text)
+		}
+	}
+	if n := len(r.own(work, "starting this queued request: “job 1”")) + len(r.own(work, "Queued request: “job 1”")); n != 0 {
+		t.Errorf("the first request of the batch is named again in %d messages", n)
+	}
+	for _, j := range []string{"job 2", "job 4"} {
+		if a := r.own(work, "ANSWER to "+j); !strings.Contains(a[0].Text, "▶️ Queued request: “"+j+"”\n\nANSWER to "+j) {
+			t.Errorf("answer of %q does not name it first:\n%s", j, a[0].Text)
+		}
+	}
+	if p := r.own(work, "step A (job 3 progress)"); len(p) != 1 || !strings.Contains(p[0].Text, "▶️ Codex is starting this queued request: “job 3 progress”\n\nstep A") {
+		t.Errorf("first progress of a queued request does not name it: %v", p)
+	} else if a := r.own(work, "ANSWER to job 3 progress"); strings.Contains(a[0].Text, "Queued request") {
+		t.Errorf("answer names the request again after its progress did")
+	}
+	posts := len(r.own(work, "")) - before
+	turns := 1 + len(jobs)
+	// ACK + answer per request, one progress message, one batch notice.
+	if max := 2*turns + 1 + 1; posts > max {
+		var texts []string
+		for _, m := range r.own(work, "")[before:] {
+			texts = append(texts, m.Text)
+		}
+		t.Fatalf("%d posts for %d requests, want at most %d:\n%s", posts, turns, max, strings.Join(texts, "\n---\n"))
 	}
 }
 
@@ -1046,6 +1136,137 @@ func TestActivityScanCatchesLaggingPreview(t *testing.T) {
 		}
 	})
 	r.wait("lagging prompt answered", func() bool { return len(r.own(work, "ANSWER to lagging prompt")) == 1 })
+}
+
+// stormScanner logs the activity scans and chat reads in order and answers
+// them with an account throttle while storm is set.
+type stormScanner struct {
+	*channeltest.Fake
+	mu    sync.Mutex
+	storm bool
+	ops   []stormOp
+}
+
+type stormOp struct {
+	what      string // "scan" or "read"
+	at        time.Time
+	throttled bool
+}
+
+func (s *stormScanner) op(what string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ops = append(s.ops, stormOp{what: what, at: time.Now(), throttled: s.storm})
+	if s.storm {
+		return &channel.Throttled{RetryAfter: time.Second, Scope: channel.ScopeAccount, Err: errors.New("429 storm")}
+	}
+	return nil
+}
+
+func (s *stormScanner) ScanActivity(_ context.Context, _ time.Time) ([]channel.ChatActivity, error) {
+	if err := s.op("scan"); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
+
+func (s *stormScanner) Receive(ctx context.Context, stream, cursor string) (channel.Window, error) {
+	if err := s.op("read"); err != nil {
+		return channel.Window{}, err
+	}
+	return s.Fake.Receive(ctx, stream, cursor)
+}
+
+// Benchmark S1/S2: after an account read throttle the first request when
+// the Retry-After ends is the activity scan (it serves every chat), and the
+// chat reads then resume one at a time at the paced rate, not as a burst.
+func TestReadThrottleReleasesScanFirstThenPacedReads(t *testing.T) {
+	var sc *stormScanner
+	r := newRig(t, func(c *Config) {
+		sc = &stormScanner{Fake: c.Channel.(*channeltest.Fake)}
+		c.Channel, c.ActivityScan = sc, true
+		c.Timing.ScanInterval = 5 * time.Second // the scan after the gate is not a tick
+	})
+	r.control()
+	time.Sleep(300 * time.Millisecond)
+	sc.mu.Lock()
+	sc.storm = true
+	sc.mu.Unlock()
+	r.wait("a throttled read", func() bool {
+		sc.mu.Lock()
+		defer sc.mu.Unlock()
+		for _, o := range sc.ops {
+			if o.throttled {
+				return true
+			}
+		}
+		return false
+	})
+	time.Sleep(200 * time.Millisecond)
+	sc.mu.Lock()
+	sc.storm = false
+	sc.mu.Unlock()
+	time.Sleep(3 * time.Second)
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	last := -1
+	for i, o := range sc.ops {
+		if o.throttled {
+			last = i
+		}
+	}
+	after := sc.ops[last+1:]
+	if len(after) < 4 {
+		t.Fatalf("only %d requests in the 3 s after the storm", len(after))
+	}
+	if after[0].what != "scan" {
+		var seq []string
+		for _, o := range after[:min(len(after), 6)] {
+			seq = append(seq, o.what)
+		}
+		t.Fatalf("first requests after the read gate opened: %v, want the scan first", seq)
+	}
+	var reads []time.Time
+	for _, o := range after[1:] {
+		if o.what == "read" {
+			reads = append(reads, o.at)
+		}
+	}
+	// The read pacer stepped down to 3.75/s with a burst of one: about
+	// 267 ms between reads (the control chat polls every 20 ms otherwise).
+	for i := 1; i < len(reads) && i < 6; i++ {
+		if gap := reads[i].Sub(reads[i-1]); gap < 200*time.Millisecond {
+			t.Fatalf("reads %d and %d after the Retry-After only %s apart: a burst", i-1, i, gap)
+		}
+	}
+}
+
+// Benchmark S3: while the account's reads were throttled within the last
+// five minutes, the control chat and hot chats are polled four times less
+// often.
+func TestReadIntervalsStretchedAfterReadThrottle(t *testing.T) {
+	now := time.Unix(10_000, 0)
+	e := &Engine{t: ProductionTiming(), gRead: "read", gates: map[string]time.Time{}}
+	ctl := &convState{kind: store.KindControl}
+	hot := &convState{kind: store.KindWork, running: &runState{}}
+	if got := e.intervalLocked(ctl, now); got != e.t.Control {
+		t.Fatalf("control interval %s without a throttle", got)
+	}
+	e.gates["read"] = now.Add(-4 * time.Minute)
+	if got := e.intervalLocked(ctl, now); got != 4*e.t.Control {
+		t.Fatalf("control interval %s 4 min after a read throttle, want %s", got, 4*e.t.Control)
+	}
+	if got := e.intervalLocked(hot, now); got != 4*e.t.Hot {
+		t.Fatalf("hot interval %s 4 min after a read throttle, want %s", got, 4*e.t.Hot)
+	}
+	e.gates["read"] = now.Add(time.Minute) // gate still closed
+	if got := e.intervalLocked(hot, now); got != 4*e.t.Hot {
+		t.Fatalf("hot interval %s while the read gate is closed, want %s", got, 4*e.t.Hot)
+	}
+	e.gates["read"] = now.Add(-6 * time.Minute)
+	if got := e.intervalLocked(ctl, now); got != e.t.Control {
+		t.Fatalf("control interval %s 6 min after a read throttle, want %s", got, e.t.Control)
+	}
 }
 
 // R-27: the control chat and the inbox ignore non-owners, even when they
@@ -1238,7 +1459,10 @@ func TestThrottleWithoutRetryAfterWaitsTheFloor(t *testing.T) {
 	})
 	work := r.newWork(t.TempDir())
 	r.ch.PostUser(work, "throttled reply")
-	r.wait("answer", func() bool { return len(r.own(work, "ANSWER to throttled reply")) == 1 })
+	// The bound is on the spacing of the attempts, not on how soon the
+	// answer lands: under a loaded run (the whole package with -race) the
+	// turn itself can take seconds, so the wait is generous.
+	r.waitFor("answer", 60*time.Second, func() bool { return len(r.own(work, "ANSWER to throttled reply")) == 1 })
 	mu.Lock()
 	defer mu.Unlock()
 	floor := FastTiming(20 * time.Millisecond).ThrottleFloor
@@ -1357,6 +1581,52 @@ func TestFailedTurnFinishIsRetried(t *testing.T) {
 	r.wait("answer after failed finishes", func() bool { return len(r.own(work, "ANSWER to finish me")) == 1 })
 	r.ch.PostUser(work, "and the next")
 	r.wait("next answer", func() bool { return len(r.own(work, "ANSWER to and the next")) == 1 })
+}
+
+// Benchmark F2: without a Workflow card, finals delivered within the
+// mention window after an @mention are named together in one control-chat
+// @mention; each final is covered exactly once.
+func TestOwnerMentionsCoalescedWithinWindow(t *testing.T) {
+	r := newRig(t, func(c *Config) { c.Timing.MentionWindow = 4 * time.Second })
+	a := r.newWork(t.TempDir())
+	b := r.newWork(t.TempDir())
+	c := r.newWork(t.TempDir())
+	ctl := r.chatOf("control")
+	r.ch.PostUser(a, "first final")
+	r.wait("first mention", func() bool { return len(r.own(ctl, "Codex finished")) == 1 })
+	first := time.Now()
+	r.ch.PostUser(b, "second final")
+	r.ch.PostUser(c, "third final")
+	r.wait("answers", func() bool {
+		return len(r.own(b, "ANSWER to second final")) == 1 && len(r.own(c, "ANSWER to third final")) == 1
+	})
+	if time.Since(first) > 3*time.Second {
+		t.Skip("the answers took longer than the window; nothing to coalesce")
+	}
+	r.wait("second mention", func() bool { return len(r.own(ctl, "Codex finished")) == 2 })
+	time.Sleep(4500 * time.Millisecond) // a further window: nothing else is sent
+	ms := r.own(ctl, "Codex finished")
+	if len(ms) != 2 {
+		t.Fatalf("%d mentions for 3 finals, want 2 (the second covering two)", len(ms))
+	}
+	if strings.Contains(ms[0].Text, " and ") {
+		t.Fatalf("first mention names more than one final: %q", ms[0].Text)
+	}
+	if !strings.Contains(ms[1].Text, " and ") || !ms[1].MentionsOwner {
+		t.Fatalf("second mention does not name both finals: %q", ms[1].Text)
+	}
+	var labels []string
+	convs, _ := r.st.Conversations()
+	for _, cv := range convs {
+		if cv.ExtChatID == b || cv.ExtChatID == c {
+			labels = append(labels, firstNonEmpty(cv.Title, cv.Label))
+		}
+	}
+	for _, l := range labels {
+		if strings.Count(ms[1].Text, l) != 1 {
+			t.Fatalf("coalesced mention names %q %d times: %q", l, strings.Count(ms[1].Text, l), ms[1].Text)
+		}
+	}
 }
 
 // cardNotifier records Workflow cards and whether the answer was already

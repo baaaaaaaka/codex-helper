@@ -469,6 +469,7 @@ func (e *Engine) resolveOne(ctx context.Context, id int64) {
 	chat := cs.chat
 	u := e.unknown[id]
 	e.mu.Unlock()
+	started := e.now()
 	msgs, err := e.ch.ReadBack(ctx, chat, fromMS(r.CreatedAt).Add(-time.Minute))
 	if ctx.Err() != nil {
 		return
@@ -480,7 +481,7 @@ func (e *Engine) resolveOne(ctx context.Context, id int64) {
 			u.next = now.Add(e.retryAfter(th))
 			e.mu.Unlock()
 			if th.Scope != channel.ScopeChat {
-				e.setGate(e.gRead, now.Add(e.retryAfter(th)), "read-back throttled")
+				e.readThrottled(started, now.Add(e.retryAfter(th)), "read-back throttled")
 			}
 			return
 		}

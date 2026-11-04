@@ -65,6 +65,9 @@ type Timing struct {
 	PaceIncrease time.Duration
 	// Registry is the machine card heartbeat (registry.go).
 	Registry time.Duration
+	// MentionWindow coalesces the owner @mentions of finals delivered
+	// within it after the last one into one message (notify.go).
+	MentionWindow time.Duration
 	// UpdateCheck is the automatic release check cadence; UpdateDrain
 	// and CodexDrain bound the wait for running turns before a helper
 	// update and a Codex CLI upgrade (upgrade.go).
@@ -88,6 +91,7 @@ func ProductionTiming() Timing {
 		ThrottleFloor: 10 * time.Second,
 		PaceIncrease:  30 * time.Second,
 		Registry:      5 * time.Minute,
+		MentionWindow: 10 * time.Second,
 		UpdateCheck:   30 * time.Minute,
 		UpdateDrain:   10 * time.Minute,
 		CodexDrain:    30 * time.Minute,
@@ -115,6 +119,7 @@ func FastTiming(base time.Duration) Timing {
 	t.ThrottleFloor = 10 * base
 	t.PaceIncrease = 30 * base
 	t.Registry = 20 * base
+	t.MentionWindow = 10 * base
 	return t
 }
 
@@ -168,7 +173,7 @@ type Config struct {
 	CodexUpgrader CodexUpgrader
 
 	Readers, Senders, Turns int
-	// ReadRate caps chat reads per second account-wide (token bucket).
+	// ReadRate caps chat reads per second account-wide (paced like writes, pace.go).
 	ReadRate float64
 	// WriteRate caps sends per second account-wide: the ceiling of the
 	// adaptive write pacing (pace.go).
@@ -220,7 +225,12 @@ type Engine struct {
 	cmdPending   map[int64][]cmdJob // per-conversation command queues; present while a worker runs
 	asrWake      chan struct{}
 	notifyWake   chan struct{}
-	notifyN      atomic.Int64 // pending owner notifications (notify.go)
+	scanWake     chan struct{} // a read throttle: the scan waits for the gate (receive.go)
+	notifyN      atomic.Int64  // pending owner notifications (notify.go)
+	lastMention  time.Time     // last owner @mention sent (notifyLoop only)
+	// scanFirst: after an account read throttle the activity scan gets
+	// the first read when the gate opens (receive.go).
+	scanFirst atomic.Bool
 	// drainFlag holds new turn starts while an update waits for running
 	// turns to finish (upgrade.go).
 	drainFlag atomic.Bool
@@ -232,7 +242,7 @@ type Engine struct {
 	fileTries    map[string]int      // transient attachment failures by "<inbound>/<idx>"
 	uploadAt     map[int64]time.Time // outbound file rows waiting before an upload retry
 
-	readTokens  *bucket
+	readTokens  *pacer
 	writeTokens *pacer
 	// sendLast is, per send class (sendClass), the last work conversation
 	// the sender served; the next pass starts after it (round robin).
@@ -304,12 +314,12 @@ func New(cfg Config) (*Engine, error) {
 		convs: map[int64]*convState{}, intro: map[int64]string{}, forkThreads: map[string]bool{}, delegThreads: map[string]bool{}, byChat: map[string]int64{}, byThread: map[string]int64{},
 		runnerWake: make(chan struct{}, 1), runnerDirty: map[int64]bool{},
 		senderWake: make(chan struct{}, 1), resolverWake: make(chan struct{}, 1),
-		mirrorWake: make(chan struct{}, 1), cmdQueue: make(chan cmdJob, 256), cmdPending: map[int64][]cmdJob{}, reminded: map[int64]int{}, asrWake: make(chan struct{}, 1), notifyWake: make(chan struct{}, 1), updateWake: make(chan struct{}, 1), registryWake: make(chan struct{}, 1), fileTries: map[string]int{}, uploadAt: map[int64]time.Time{},
+		mirrorWake: make(chan struct{}, 1), cmdQueue: make(chan cmdJob, 256), cmdPending: map[int64][]cmdJob{}, reminded: map[int64]int{}, asrWake: make(chan struct{}, 1), notifyWake: make(chan struct{}, 1), scanWake: make(chan struct{}, 1), updateWake: make(chan struct{}, 1), registryWake: make(chan struct{}, 1), fileTries: map[string]int{}, uploadAt: map[int64]time.Time{},
 	}
 	if sc, ok := cfg.Channel.(channel.ActivityScanner); ok && cfg.ActivityScan && e.t.ScanInterval > 0 {
 		e.scanner = timedScanner{sc}
 	}
-	e.readTokens = newBucket(cfg.ReadRate, cfg.ReadRate*2, e.now)
+	e.readTokens = newPacer(cfg.ReadRate, e.t.PaceIncrease, e.now)
 	e.writeTokens = newPacer(cfg.WriteRate, e.t.PaceIncrease, e.now)
 	return e, nil
 }

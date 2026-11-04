@@ -4,8 +4,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"math"
-	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -56,10 +54,13 @@ type convState struct {
 	// lastTurnEnd is when a started turn of this conversation last ended:
 	// a queued turn admitted before it waited behind it (R-35).
 	lastTurnEnd time.Time
-	recent      map[string]recentPrompt // normalized prompt -> last prompt
-	lastDup     int64                   // inbound id of the last duplicate-ignored prompt
-	breaker     []time.Time
-	capWake     time.Time
+	// batchThrough is the last turn named by a "starting your N queued
+	// requests" notice: the turns up to it get no notice of their own.
+	batchThrough int64
+	recent       map[string]recentPrompt // normalized prompt -> last prompt
+	lastDup      int64                   // inbound id of the last duplicate-ignored prompt
+	breaker      []time.Time
+	capWake      time.Time
 
 	// sender
 	sending  bool
@@ -84,46 +85,9 @@ type runState struct {
 	// request is the delegation request text of a delegated turn ("" for
 	// an ordinary turn).
 	request string
-}
-
-// bucket is a token bucket.
-type bucket struct {
-	mu     sync.Mutex
-	rate   float64
-	burst  float64
-	tokens float64
-	last   time.Time
-	now    func() time.Time
-}
-
-func newBucket(rate, burst float64, now func() time.Time) *bucket {
-	return &bucket{rate: rate, burst: burst, tokens: burst, last: now(), now: now}
-}
-
-// borrow takes one token even when the bucket is empty (down to -burst):
-// for the read that serves every chat at once (the activity scan), which
-// must not lose to per-chat reads; the debt delays those instead.
-func (b *bucket) borrow() {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	now := b.now()
-	b.tokens = math.Min(b.burst, b.tokens+now.Sub(b.last).Seconds()*b.rate)
-	b.last = now
-	b.tokens = math.Max(-b.burst, b.tokens-1)
-}
-
-// take takes one token; it returns false (and how long to wait) when empty.
-func (b *bucket) take() (bool, time.Duration) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	now := b.now()
-	b.tokens = math.Min(b.burst, b.tokens+now.Sub(b.last).Seconds()*b.rate)
-	b.last = now
-	if b.tokens >= 1 {
-		b.tokens--
-		return true, 0
-	}
-	return false, time.Duration((1 - b.tokens) / b.rate * float64(time.Second))
+	// queuedPrompt is the quote of a prompt that waited behind an earlier
+	// turn: it heads the turn's first message (R-35, folded).
+	queuedPrompt string
 }
 
 func randHex(n int) string {

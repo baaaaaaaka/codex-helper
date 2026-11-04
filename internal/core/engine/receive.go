@@ -13,6 +13,28 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/core/store"
 )
 
+// After an account read throttle (S3), the control and hot polls are
+// stretched readStretch times for readStretchFor after the gate opens.
+const (
+	readStretch    = 4
+	readStretchFor = 5 * time.Minute
+)
+
+// readThrottled records an account read throttle of a request that started
+// at started: the read gate closes until resume, the read pacer steps down
+// (pace.go) and, in scan mode, the activity scan gets the first read when
+// the gate opens.
+func (e *Engine) readThrottled(started, resume time.Time, reason string) {
+	e.setGate(e.gRead, resume, reason)
+	if e.scanner != nil {
+		e.scanFirst.Store(true)
+		wake(e.scanWake)
+	}
+	if cut, rate := e.readTokens.throttled(started, resume); cut {
+		e.logf("account reads paced to %.2f/s", rate)
+	}
+}
+
 // receiverLoop schedules chat reads from in-memory state: no store access
 // and no request for a chat that is not due. Reads run on Readers workers.
 func (e *Engine) receiverLoop(ctx context.Context) {
@@ -37,6 +59,11 @@ func (e *Engine) receiverLoop(ctx context.Context) {
 		}
 		now := e.now()
 		if until := e.gate(e.gRead); now.Before(until) {
+			continue
+		}
+		if e.scanFirst.Load() {
+			// After a read throttle the activity scan, which serves every
+			// chat, gets the first read (scanLoop clears this).
 			continue
 		}
 		due := e.dueReads(now)
@@ -95,24 +122,31 @@ func (e *Engine) dueReads(now time.Time) []int64 {
 
 // interval is the read interval of a conversation (caller holds e.mu).
 func (e *Engine) intervalLocked(cs *convState, now time.Time) time.Duration {
+	// While the account's reads were throttled within readStretchFor, the
+	// frequent polls (control chat, hot chats) are stretched: they are
+	// what the read budget is spent on.
+	hot, control := e.t.Hot, e.t.Control
+	if until := e.gates[e.gRead]; !until.IsZero() && now.Sub(until) < readStretchFor {
+		hot, control = hot*readStretch, control*readStretch
+	}
 	if cs.kind == store.KindControl {
-		return e.t.Control
+		return control
 	}
 	if cs.running != nil {
-		return e.t.Hot
+		return hot
 	}
 	if e.scanner != nil {
 		// Scan mode: the activity scan finds new messages in idle chats;
 		// a direct read is only a safety net.
 		if now.Sub(cs.lastUser) < e.t.HotFor {
-			return e.t.Hot
+			return hot
 		}
 		return e.t.SafetyRead
 	}
 	idle := now.Sub(cs.lastActivity)
 	switch {
 	case idle < e.t.HotFor:
-		return e.t.Hot
+		return hot
 	case idle < e.t.WarmFor:
 		return e.t.Warm
 	case idle < e.t.CoolFor:
@@ -179,12 +213,10 @@ func (e *Engine) read(ctx context.Context, id int64) {
 	var tl *channel.WindowTooLarge
 	if th, ok := channel.AsThrottled(err); ok {
 		until := now.Add(e.retryAfter(th) + time.Duration(id%7)*e.t.Tick)
-		if th.Scope == channel.ScopeChat {
-			cs.nextRead = until
-		} else {
-			cs.nextRead = until
+		cs.nextRead = until
+		if th.Scope != channel.ScopeChat {
 			e.mu.Unlock()
-			e.setGate(e.gRead, until, "read throttled")
+			e.readThrottled(start, until, "read throttled")
 			e.mu.Lock()
 		}
 		e.logf("read %s throttled for %s (%s scope)", cs.label, e.retryAfter(th), th.Scope)
@@ -770,6 +802,10 @@ func (e *Engine) tripBreaker(tx *store.Tx, conv int64, label string) error {
 func (e *Engine) scanLoop(ctx context.Context) {
 	tick := time.NewTicker(e.t.ScanInterval)
 	defer tick.Stop()
+	// reopen fires when a closed read gate opens: the scan goes first.
+	reopen := time.NewTimer(time.Hour)
+	reopen.Stop()
+	defer reopen.Stop()
 	// Every conversation is read once at start, so the scan only needs
 	// what arrives from now on (with a margin for clock skew).
 	mark := e.now().Add(-time.Minute)
@@ -779,12 +815,16 @@ func (e *Engine) scanLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-tick.C:
+		case <-reopen.C:
+		case <-e.scanWake:
 		}
 		now := e.now()
 		if until := e.gate(e.gRead); now.Before(until) {
+			reopen.Reset(until.Sub(now))
 			continue
 		}
 		e.readTokens.borrow()
+		started := e.now()
 		acts, err := e.scanner.ScanActivity(ctx, mark.Add(-scanOverlap))
 		e.count(func(s *engineStats) { s.reads++ })
 		if ctx.Err() != nil {
@@ -792,9 +832,16 @@ func (e *Engine) scanLoop(ctx context.Context) {
 		}
 		if err != nil {
 			if th, ok := channel.AsThrottled(err); ok {
-				e.setGate(e.gRead, e.now().Add(e.retryAfter(th)), "activity scan throttled")
+				until := e.now().Add(e.retryAfter(th))
+				if th.Scope == channel.ScopeChat {
+					e.setGate(e.gRead, until, "activity scan throttled")
+				} else {
+					e.readThrottled(started, until, "activity scan throttled")
+				}
+				reopen.Reset(until.Sub(e.now()))
 				continue
 			}
+			e.scanFirst.Store(false)
 			failures++
 			if failures <= 3 || failures%100 == 0 {
 				e.logf("activity scan failed (%d in a row): %v", failures, err)
@@ -802,6 +849,7 @@ func (e *Engine) scanLoop(ctx context.Context) {
 			continue
 		}
 		failures = 0
+		e.scanFirst.Store(false)
 		e.mu.Lock()
 		for _, a := range acts {
 			if a.Last.After(mark) {

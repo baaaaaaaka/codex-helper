@@ -85,17 +85,24 @@ func (e *Engine) updateNotify(turn int64, fn func(*pendingNotify) bool) error {
 }
 
 // notifyLoop sends due notifications. It is woken by a turn's end and by
-// sender progress; the maintenance cadence is a safety net.
+// sender progress; the maintenance cadence is a safety net, and a timer
+// ends a mention coalescing window.
 func (e *Engine) notifyLoop(ctx context.Context) {
 	safety := time.NewTicker(e.t.Maintenance)
 	defer safety.Stop()
+	window := time.NewTimer(time.Hour)
+	window.Stop()
+	defer window.Stop()
 	for {
-		e.pumpNotify(ctx)
+		if next := e.pumpNotify(ctx); !next.IsZero() {
+			window.Reset(max(next.Sub(e.now()), e.t.Tick))
+		}
 		select {
 		case <-ctx.Done():
 			return
 		case <-e.notifyWake:
 		case <-safety.C:
+		case <-window.C:
 		}
 		// Coalesce bursts of sender wakes.
 		select {
@@ -106,16 +113,26 @@ func (e *Engine) notifyLoop(ctx context.Context) {
 	}
 }
 
-func (e *Engine) pumpNotify(ctx context.Context) {
-	var due []pendingNotify
+// mentionSetMax bounds the finals one coalesced @mention names.
+const mentionSetMax = 20
+
+// pumpNotify sends the due notifications: a Workflow card per final, or
+// control-chat @mentions coalesced per window (benchmark F2): the first
+// mention goes at once; finals delivered within MentionWindow after it
+// (three windows while the account's writes are paced) wait and are named
+// together in one mention ("Codex finished in A, B and C"), each exactly
+// once. It returns when the window ends ("" when nothing waits for it).
+func (e *Engine) pumpNotify(ctx context.Context) time.Time {
+	var cards, mentions []pendingNotify
 	pending := 0
 	err := e.update(func(tx *store.Tx) error {
-		due, pending = due[:0], 0
+		cards, mentions, pending = cards[:0], mentions[:0], 0
 		list, err := readNotify(tx)
 		if err != nil {
 			return err
 		}
 		pending = len(list)
+		card := e.cfg.Notifier != nil && e.cfg.Notifier.Available()
 		for _, n := range list {
 			rows, err := tx.PendingOutbox(n.Conv)
 			if err != nil {
@@ -129,26 +146,55 @@ func (e *Engine) pumpNotify(ctx context.Context) {
 					break
 				}
 			}
-			if !waiting {
-				due = append(due, n)
+			switch {
+			case waiting:
+			case card && !n.Attempted:
+				cards = append(cards, n)
+			default:
+				mentions = append(mentions, n)
 			}
 		}
 		return nil
 	})
 	if err != nil {
 		e.logf("owner notifications: %v", err)
-		return
+		return time.Time{}
 	}
 	e.notifyN.Store(int64(pending))
-	for _, n := range due {
+	for _, n := range cards {
 		if ctx.Err() != nil {
-			return
+			return time.Time{}
 		}
-		e.sendNotify(ctx, n)
+		if !e.sendCard(ctx, n) {
+			mentions = append(mentions, n) // failed: the owner is mentioned instead
+		}
 	}
+	if len(mentions) == 0 || ctx.Err() != nil {
+		return time.Time{}
+	}
+	window := e.t.MentionWindow
+	if e.writeTokens.limited() {
+		window *= 3
+	}
+	if next := e.lastMention.Add(window); !e.lastMention.IsZero() && e.now().Before(next) {
+		return next
+	}
+	if len(mentions) > mentionSetMax {
+		mentions = mentions[:mentionSetMax]
+	}
+	if e.sendMentions(mentions) {
+		e.lastMention = e.now()
+	}
+	if pending > len(mentions)+len(cards) {
+		return e.lastMention.Add(window) // more are waiting
+	}
+	return time.Time{}
 }
 
-func (e *Engine) sendNotify(ctx context.Context, n pendingNotify) {
+// sendCard posts the Workflow card of n once (never retried: a failed post
+// may still have been delivered). It reports whether the card was posted
+// or nothing more is to be done for n.
+func (e *Engine) sendCard(ctx context.Context, n pendingNotify) bool {
 	e.mu.Lock()
 	cs := e.convs[n.Conv]
 	var label, title, url string
@@ -158,29 +204,48 @@ func (e *Engine) sendNotify(ctx context.Context, n pendingNotify) {
 	e.mu.Unlock()
 	if cs == nil {
 		_ = e.updateNotify(n.Turn, func(*pendingNotify) bool { return false })
-		return
+		return true
 	}
-	card := !n.Attempted && e.cfg.Notifier != nil && e.cfg.Notifier.Available()
-	if card {
-		if err := e.updateNotify(n.Turn, func(p *pendingNotify) bool { p.Attempted = true; return true }); err != nil {
+	if err := e.updateNotify(n.Turn, func(p *pendingNotify) bool { p.Attempted = true; return true }); err != nil {
+		e.logf("notify %s: %v", label, err)
+		return true
+	}
+	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	err := e.cfg.Notifier.NotifyFinal(cctx, label, title, n.Text, url)
+	cancel()
+	if ctx.Err() != nil {
+		return true // the next start mentions the owner instead
+	}
+	if err == nil {
+		if err := e.updateNotify(n.Turn, func(*pendingNotify) bool { return false }); err != nil {
 			e.logf("notify %s: %v", label, err)
-			return
 		}
-		cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		err := e.cfg.Notifier.NotifyFinal(cctx, label, title, n.Text, url)
-		cancel()
-		if ctx.Err() != nil {
-			return // the next start mentions the owner instead
-		}
-		if err == nil {
-			if err := e.updateNotify(n.Turn, func(*pendingNotify) bool { return false }); err != nil {
-				e.logf("notify %s: %v", label, err)
-			}
-			return
-		}
-		e.logf("notify %s: %v; mentioning the owner in the control chat instead", label, err)
+		return true
 	}
-	msgs, err := e.mentionNotice(n.Turn, cs)
+	e.logf("notify %s: %v; mentioning the owner in the control chat instead", label, err)
+	return false
+}
+
+// sendMentions enqueues one control-chat @mention naming the finals of set
+// and removes them from the pending list in the same transaction.
+func (e *Engine) sendMentions(set []pendingNotify) bool {
+	var (
+		turns []int64
+		convs []*convState
+	)
+	e.mu.Lock()
+	for _, n := range set {
+		turns = append(turns, n.Turn)
+		if cs := e.convs[n.Conv]; cs != nil {
+			convs = append(convs, cs)
+		}
+	}
+	e.mu.Unlock()
+	var msgs []store.OutMsg
+	var err error
+	if len(convs) > 0 {
+		msgs, err = e.mentionNotice(turns, convs)
+	}
 	if err == nil {
 		err = e.update(func(tx *store.Tx) error {
 			if len(msgs) > 0 {
@@ -192,9 +257,13 @@ func (e *Engine) sendNotify(ctx context.Context, n pendingNotify) {
 			if err != nil {
 				return err
 			}
+			done := map[int64]bool{}
+			for _, t := range turns {
+				done[t] = true
+			}
 			out := list[:0]
 			for _, p := range list {
-				if p.Turn != n.Turn {
+				if !done[p.Turn] {
 					out = append(out, p)
 				}
 			}
@@ -202,8 +271,9 @@ func (e *Engine) sendNotify(ctx context.Context, n pendingNotify) {
 		})
 	}
 	if err != nil {
-		e.logf("notify %s: %v", label, err)
-		return
+		e.logf("owner notification: %v", err)
+		return false
 	}
 	e.wakeSender()
+	return len(msgs) > 0
 }

@@ -177,8 +177,32 @@ func textStalled(limit time.Duration) string {
 	return "Codex produced no update for " + minutes(limit) + ", so the helper stopped the request. It was not re-run; resend it if you still need it."
 }
 
-func textStarting(prompt string) string {
-	return "▶️ Codex is starting this queued request: " + quotePrompt(prompt)
+// textStarting names a queued request at the head of its first progress
+// message; quoted is a quotePrompt.
+func textStarting(quoted string) string {
+	return "▶️ Codex is starting this queued request: " + quoted
+}
+
+// textQueuedOutcome names a queued request at the head of its answer or
+// outcome notice when no progress message named it.
+func textQueuedOutcome(quoted string) string {
+	return "▶️ Queued request: " + quoted
+}
+
+// textStartingBatch is the one notice when several queued requests start
+// one after another (the first is starting now).
+func textStartingBatch(quoted []string) string {
+	const show = 10
+	var b strings.Builder
+	fmt.Fprintf(&b, "▶️ Codex is starting your %d queued requests, one after another:\n", len(quoted))
+	for i, q := range quoted {
+		if i == show {
+			fmt.Fprintf(&b, "\n…and %d more.", len(quoted)-show)
+			break
+		}
+		fmt.Fprintf(&b, "\n%d. %s", i+1, q)
+	}
+	return b.String()
 }
 
 func textStillQueued(prompt string, waited time.Duration, paused bool) string {
