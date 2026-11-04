@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 )
 
@@ -20,17 +21,46 @@ func (t *Tx) SourceByID(id int64) (TranscriptSource, bool, error) {
 // size/mtime/inode. It never moves an existing offset; use AdvanceSource.
 // Nothing is written when nothing changed.
 func (t *Tx) UpsertSource(src TranscriptSource) (int64, error) {
-	if src.Offset < 0 || src.Line < 0 {
-		return 0, fmt.Errorf("%w: negative offset", ErrState)
+	return t.upsertSource(src, func(args ...any) *sql.Row { return t.row(upsertSourceSQL, args...) })
+}
+
+// UpsertSources is UpsertSource for several sources in order, with the
+// statement prepared once for all of them. It returns their ids.
+func (t *Tx) UpsertSources(srcs []TranscriptSource) ([]int64, error) {
+	if len(srcs) == 0 {
+		return nil, nil
 	}
-	var id int64
-	err := t.row(`INSERT INTO transcript_sources(path,thread_id,conv_id,state,offset,line,size,mtime,inode,updated_at)
+	stmt, err := t.tx.PrepareContext(context.Background(), upsertSourceSQL)
+	if err != nil {
+		return nil, err
+	}
+	defer stmt.Close()
+	row := func(args ...any) *sql.Row { return stmt.QueryRowContext(context.Background(), args...) }
+	ids := make([]int64, 0, len(srcs))
+	for _, src := range srcs {
+		id, err := t.upsertSource(src, row)
+		if err != nil {
+			return ids, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, nil
+}
+
+const upsertSourceSQL = `INSERT INTO transcript_sources(path,thread_id,conv_id,state,offset,line,size,mtime,inode,updated_at)
 VALUES (?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(path) DO UPDATE SET thread_id=excluded.thread_id, conv_id=excluded.conv_id, state=excluded.state,
   size=excluded.size, mtime=excluded.mtime, inode=excluded.inode, updated_at=excluded.updated_at
 WHERE thread_id IS NOT excluded.thread_id OR conv_id IS NOT excluded.conv_id OR state IS NOT excluded.state
    OR size IS NOT excluded.size OR mtime IS NOT excluded.mtime OR inode IS NOT excluded.inode
-RETURNING id`, src.Path, nullStr(src.ThreadID), nullInt(src.ConvID), src.State, src.Offset, src.Line,
+RETURNING id`
+
+func (t *Tx) upsertSource(src TranscriptSource, row func(args ...any) *sql.Row) (int64, error) {
+	if src.Offset < 0 || src.Line < 0 {
+		return 0, fmt.Errorf("%w: negative offset", ErrState)
+	}
+	var id int64
+	err := row(src.Path, nullStr(src.ThreadID), nullInt(src.ConvID), src.State, src.Offset, src.Line,
 		src.Size, src.MTime, nullInt(src.Inode), t.now).Scan(&id)
 	if err == nil {
 		return id, nil

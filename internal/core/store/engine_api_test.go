@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -115,5 +116,86 @@ WHERE state IN ('queued','starting','running') AND state = 'queued' ORDER BY con
 	mustT(t, rows.Err())
 	if !strings.Contains(plan, "turns_open") {
 		t.Errorf("query plan %q does not use turns_open", plan)
+	}
+}
+
+// UpsertSources (W1b) does what UpsertSource does for each source in
+// turn, with one prepared statement: same ids, same rows, unchanged rows
+// not rewritten, a negative offset refused.
+func TestUpsertSourcesIsUpsertSourceInBulk(t *testing.T) {
+	one, _ := openTest(t)
+	bulk, _ := openTest(t)
+	batches := [][]TranscriptSource{
+		{
+			{Path: "/r/a.jsonl", ThreadID: "th-a", State: SrcBaseline, Offset: 10, Size: 10, MTime: 1, Inode: 7},
+			{Path: "/r/b.jsonl", ThreadID: "th-b", State: SrcIgnored, Size: 5, MTime: 2},
+			{Path: "/r/c.jsonl", State: SrcBaseline, Offset: 3, Size: 3, MTime: 3},
+		},
+		{
+			{Path: "/r/a.jsonl", ThreadID: "th-a", State: SrcBaseline, Offset: 10, Size: 10, MTime: 1, Inode: 7}, // unchanged
+			{Path: "/r/b.jsonl", ThreadID: "th-b", State: SrcBaseline, Offset: 9, Size: 9, MTime: 4},             // changed; offset kept
+			{Path: "/r/d.jsonl", ThreadID: "th-d", State: SrcIgnored, Size: 1, MTime: 5},
+		},
+	}
+	stamps := func(s *Store) map[string]int64 {
+		srcs, err := s.Sources()
+		mustT(t, err)
+		out := map[string]int64{}
+		for _, r := range srcs {
+			out[r.Path] = r.UpdatedAt
+		}
+		return out
+	}
+	var before map[string]int64
+	for i, b := range batches {
+		var want, got []int64
+		mustT(t, one.Update(func(tx *Tx) error {
+			want = want[:0]
+			for _, src := range b {
+				id, err := tx.UpsertSource(src)
+				if err != nil {
+					return err
+				}
+				want = append(want, id)
+			}
+			return nil
+		}))
+		if i == 1 {
+			before = stamps(bulk)
+		}
+		mustT(t, bulk.Update(func(tx *Tx) error {
+			var err error
+			got, err = tx.UpsertSources(b)
+			return err
+		}))
+		if fmt.Sprint(got) != fmt.Sprint(want) {
+			t.Fatalf("batch %d: ids %v, want %v", i, got, want)
+		}
+	}
+	a, err := one.Sources()
+	mustT(t, err)
+	b, err := bulk.Sources()
+	mustT(t, err)
+	if len(a) != len(b) || len(a) != 4 {
+		t.Fatalf("%d and %d sources, want 4", len(a), len(b))
+	}
+	for i := range a {
+		a[i].UpdatedAt, b[i].UpdatedAt = 0, 0
+		if a[i] != b[i] {
+			t.Errorf("source %d: bulk %+v, one by one %+v", i, b[i], a[i])
+		}
+	}
+	if after := stamps(bulk); after["/r/a.jsonl"] != before["/r/a.jsonl"] {
+		t.Errorf("an unchanged source was rewritten")
+	}
+	err = bulk.Update(func(tx *Tx) error {
+		_, err := tx.UpsertSources([]TranscriptSource{{Path: "/r/e.jsonl", State: SrcBaseline, Offset: -1}})
+		return err
+	})
+	if !errors.Is(err, ErrState) {
+		t.Fatalf("negative offset: %v, want ErrState", err)
+	}
+	if ids, err := bulk.Sources(); err != nil || len(ids) != 4 {
+		t.Fatalf("after a refused batch: %d sources, %v", len(ids), err)
 	}
 }
