@@ -155,11 +155,15 @@ func fakeFFmpeg(args []string) int {
 		fmt.Fprintln(os.Stderr, "Stream map '0:a:0' matches no streams.")
 		return 1
 	}
+	pattern := args[len(args)-1]
+	if os.Getenv("ASR_FAKE_FFMPEG") == "copy" { // real-model test: input is already 16 kHz WAV
+		os.WriteFile(fmt.Sprintf(pattern, 0), data, 0o600)
+		return 0
+	}
 	n, _ := strconv.Atoi(os.Getenv("ASR_FAKE_SEGMENTS"))
 	if n <= 0 {
 		n = 1
 	}
-	pattern := args[len(args)-1]
 	for i := 0; i < n; i++ {
 		seg := make([]byte, 4000)
 		copy(seg[44:], fmt.Sprintf("%s part %d", strings.TrimSpace(string(data)), i+1))
