@@ -16,6 +16,7 @@ import (
 
 	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
 	"github.com/baaaaaaaka/codex-helper/internal/channel"
+	"github.com/gofrs/flock"
 )
 
 // Delegated authentication: one Microsoft Entra delegated token for
@@ -241,7 +242,7 @@ func (a *DelegatedAuth) Token(ctx context.Context) (string, error) {
 	if a.fresh(a.cur) {
 		return a.cur.AccessToken, nil
 	}
-	return a.refreshLocked(ctx)
+	return a.refreshLocked(ctx, a.cur.AccessToken)
 }
 
 func (a *DelegatedAuth) Refresh(ctx context.Context, stale string) (string, error) {
@@ -253,7 +254,7 @@ func (a *DelegatedAuth) Refresh(ctx context.Context, stale string) (string, erro
 	if a.cur.AccessToken != "" && a.cur.AccessToken != stale && a.fresh(a.cur) {
 		return a.cur.AccessToken, nil
 	}
-	return a.refreshLocked(ctx)
+	return a.refreshLocked(ctx, stale)
 }
 
 func (a *DelegatedAuth) fresh(t TokenCache) bool {
@@ -272,7 +273,25 @@ func (a *DelegatedAuth) load() error {
 	return nil
 }
 
-func (a *DelegatedAuth) refreshLocked(ctx context.Context) (string, error) {
+// refreshLocked refreshes under the cross-process cache lock
+// (<cache>.lock, flock). Holding it, the cache is read again: another
+// process (the service, the CLI, a second machine on a shared home) may
+// have refreshed while we waited, and refreshing again with the rotated
+// refresh token would waste it. Binaries older than this lock never take
+// it; they still replace the cache atomically, so the worst case with them
+// is one extra refresh, as before.
+func (a *DelegatedAuth) refreshLocked(ctx context.Context, stale string) (string, error) {
+	unlock, err := lockFile(ctx, a.cfg.CachePath+".lock")
+	if err != nil {
+		return "", &channel.Rejected{Err: fmt.Errorf("lock Teams token cache: %w", err)}
+	}
+	defer unlock()
+	if err := a.load(); err != nil {
+		return "", err
+	}
+	if a.cur.AccessToken != "" && a.cur.AccessToken != stale && a.fresh(a.cur) {
+		return a.cur.AccessToken, nil
+	}
 	if a.cur.RefreshToken == "" {
 		return "", &channel.AuthRequired{Err: errors.New("Teams token cache has no refresh token; run `cxp teams auth login`")}
 	}
@@ -297,6 +316,23 @@ func (a *DelegatedAuth) refreshLocked(ctx context.Context) (string, error) {
 	}
 	a.cur = tok
 	return tok.AccessToken, nil
+}
+
+// lockFile takes an exclusive flock on path, waiting until ctx ends.
+func lockFile(ctx context.Context, path string) (func(), error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, err
+	}
+	l := flock.New(path)
+	ok, err := l.TryLockContext(ctx, 25*time.Millisecond)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, errors.New("lock not acquired")
+	}
+	_ = os.Chmod(path, 0o600)
+	return func() { _ = l.Unlock() }, nil
 }
 
 // DeviceLogin runs the device-code flow, prints the instructions to out and
@@ -335,6 +371,11 @@ func DeviceLogin(ctx context.Context, cfg AuthConfig, client *http.Client, out i
 		var oe *oauthError
 		switch {
 		case err == nil:
+			unlock, lerr := lockFile(ctx, cfg.CachePath+".lock")
+			if lerr != nil {
+				return lerr
+			}
+			defer unlock()
 			return WriteTokenCache(cfg.CachePath, tok)
 		case errors.As(err, &oe) && oe.Code == "authorization_pending":
 		case errors.As(err, &oe) && oe.Code == "slow_down":

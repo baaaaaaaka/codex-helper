@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -211,5 +212,55 @@ func TestResolveAuthConfigReadsExistingCaches(t *testing.T) {
 	}
 	if safePathPart("a b/ü") != "a_b__" || safePathPart(" ") != "default" {
 		t.Fatalf("safePathPart = %q", safePathPart("a b/ü"))
+	}
+}
+
+// Two token sources on one cache (service + CLI, or two machines on a shared
+// home) must not both spend the refresh token: the second one waits for the
+// cache lock, re-reads the cache and uses the token the first one stored.
+func TestDelegatedAuthRefreshIsSerialisedAcrossInstances(t *testing.T) {
+	fg := fakegraph.New(fakegraph.Options{})
+	t.Cleanup(fg.Close)
+	_, refresh := fg.IssueTokens("cached")
+	path := filepath.Join(t.TempDir(), "teams-full-token.json")
+	writeCache(t, path, TokenCache{AccessToken: "expired", RefreshToken: refresh, ExpiresAt: time.Now().Add(-time.Hour).Unix()})
+	fg.AddFault(fakegraph.Fault{Name: "slow-login", Kind: fakegraph.FaultLatency, Host: "login.microsoftonline.com", Latency: 300 * time.Millisecond})
+	const n = 4
+	toks := make([]string, n)
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		_, auth := authAdapter(t, fg, path) // separate instances: only the file lock is shared
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			toks[i], errs[i] = auth.Token(context.Background())
+		}(i)
+	}
+	wg.Wait()
+	for i := range toks {
+		if errs[i] != nil || toks[i] != toks[0] || toks[i] == "expired" {
+			t.Fatalf("instance %d: %q %v (first %q)", i, toks[i], errs[i], toks[0])
+		}
+	}
+	if got := countRequests(fg, "POST /{tenant}/oauth2/v2.0/token"); got != 1 {
+		t.Fatalf("%d refreshes, want 1", got)
+	}
+	if _, err := os.Stat(path + ".lock"); err != nil {
+		t.Fatalf("lock file: %v", err)
+	}
+
+	// Refresh(stale) after a 401: an instance holding the token another
+	// instance already replaced picks up the new one without refreshing.
+	_, a1 := authAdapter(t, fg, path)
+	_, a2 := authAdapter(t, fg, path)
+	t1, _ := a1.Token(context.Background())
+	t2, err := a2.Refresh(context.Background(), t1)
+	if err != nil || t2 == t1 {
+		t.Fatalf("refresh: %q %v", t2, err)
+	}
+	t3, err := a1.Refresh(context.Background(), t1)
+	if err != nil || t3 != t2 || countRequests(fg, "POST /{tenant}/oauth2/v2.0/token") != 2 {
+		t.Fatalf("second instance refreshed again: %q vs %q, %v", t3, t2, err)
 	}
 }
