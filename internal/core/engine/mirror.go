@@ -212,13 +212,16 @@ func (e *Engine) mirrorLoop(ctx context.Context) {
 	}
 }
 
-// firstWalkFiles and firstWalkBudget bound the rollouts the start-up walk
-// classifies per stat tick (B4, W1): classifying reads each one's first
-// record, so a batch stops at whichever comes first, 128 rollouts or
-// about 10 ms (a slow disk never makes one long tick).
+// firstWalkFiles and firstWalkBudget bound a batch of the start-up walk
+// per stat tick (B4, W1): classifying reads each rollout's first record,
+// so a batch stops at whichever comes first, 128 rollouts or about 10 ms
+// (a slow disk never makes one long tick). The budget covers the whole
+// batch: classification stops at firstWalkClassify, which leaves the rest
+// for the batch's store write (W1b).
 const (
-	firstWalkFiles  = 128
-	firstWalkBudget = 10 * time.Millisecond
+	firstWalkFiles    = 128
+	firstWalkBudget   = 10 * time.Millisecond
+	firstWalkClassify = firstWalkBudget / 2
 )
 
 // startFirstWalk lists every rollout once at start (a stat each, cheap) and
@@ -248,7 +251,7 @@ func (e *Engine) discoverFirst(ctx context.Context) {
 		return
 	}
 	n := min(firstWalkFiles, len(m.firstFound))
-	n = e.considerFor(ctx, m.firstFound[:n:n], firstWalkBudget)
+	n = e.considerFor(ctx, m.firstFound[:n:n], firstWalkClassify)
 	m.firstFound = m.firstFound[n:]
 	if ctx.Err() != nil || len(m.firstFound) > 0 {
 		return
@@ -408,8 +411,9 @@ func (e *Engine) consider(ctx context.Context, found []transcript.Found) {
 	e.considerFor(ctx, found, 0)
 }
 
-// considerFor is consider that stops once budget (0: none) has passed,
-// after at least one rollout. It returns how many it handled.
+// considerFor is consider whose classification stops once budget (0:
+// none) has passed, after at least one rollout; the store write of what it
+// classified follows. It returns how many it handled.
 func (e *Engine) considerFor(ctx context.Context, found []transcript.Found, budget time.Duration) int {
 	start := time.Now()
 	var baseline []store.TranscriptSource
