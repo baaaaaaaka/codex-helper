@@ -2,15 +2,19 @@ package migrate
 
 import "time"
 
+// CatchUpWindow bounds the first-start catch-up (owner decision 2026-11-04:
+// backlog catch-up and missed-sync lookback both use 120 days).
+const CatchUpWindow = 120 * 24 * time.Hour
+
 // resume is the decided position of one scanned, tracked rollout.
 type resume struct {
 	off, line int64
 	proof     int64 // end of the last record proven delivered (0: none)
 	hasProof  bool
 	via       string
-	gap       [2]int // prompts, finals in [proof, max old position)
+	gap       [2]int // prompts, finals in [off, max old position): mirrored behind an old position
 	backlog   [2]int // prompts, finals from off to the scan end
-	old       int    // of the backlog: records older than DiscoveryWindow
+	skipOld   int    // unproven records older than CatchUpWindow, not posted
 }
 
 // decideResume applies the proof rule (STORE-DESIGN §7.2) to a scanned
@@ -69,19 +73,31 @@ func (c *converter) decideResume(p *pathInfo, size int64) resume {
 			rs.line = sc.EndLine
 		}
 	}
+	// The catch-up window (owner decision 2026-11-04): unproven records
+	// older than CatchUpWindow are not posted; the resume point moves past
+	// them. The rollout stays on disk; only the posting is skipped.
+	cut := c.now.Add(-CatchUpWindow).UnixMilli()
+	for _, r := range sc.Recs {
+		if r.Start < rs.off {
+			continue
+		}
+		if r.TS == 0 || r.TS >= cut {
+			break
+		}
+		rs.off, rs.line = r.End, r.Line
+		rs.skipOld++
+		rs.via = "past records older than 120 days"
+	}
 	for _, r := range sc.Recs {
 		k := 0
 		if r.Kind == "final" {
 			k = 1
 		}
-		if r.Start >= rs.proof && r.Start < top {
+		if r.Start >= rs.off && r.Start < top {
 			rs.gap[k]++
 		}
 		if r.Start >= rs.off {
 			rs.backlog[k]++
-			if r.TS > 0 && c.now.Sub(time.UnixMilli(r.TS)) > DiscoveryWindow {
-				rs.old++
-			}
 		}
 	}
 	return rs
@@ -89,49 +105,62 @@ func (c *converter) decideResume(p *pathInfo, size int64) resume {
 
 // reportResume records buckets, the per-source rows the owner asked for and
 // the catch-up totals.
-func (c *converter) reportResume(p *pathInfo, rs resume, size int64) {
+func (c *converter) reportResume(p *pathInfo, rs resume, size int64, closed bool, kept int64) {
 	b := c.rep.Buckets
 	top := max(p.ckpt, p.cutoff, p.watch)
-	b["linked tracking: resume at "+rs.via]++
-	switch {
-	case top == 0:
-	case rs.off == top:
-		b["linked tracking: old furthest position confirmed"]++
-	case rs.off < top:
-		b["linked tracking: resume before the old furthest position (gap is mirrored)"]++
-	}
-	if p.anchor != nil {
+	if closed {
+		b["linked closed conversation: baseline at its old position (no catch-up)"]++
+	} else {
+		b["linked tracking: resume at "+rs.via]++
 		switch {
-		case p.anchor.CutoffOffset > 0 && rs.off == p.anchor.CutoffOffset:
-			b["anchor (0 synthetic turns): at cutoff_offset"]++
-		case p.anchor.CutoffOffset > 0 && rs.off > p.anchor.CutoffOffset:
-			b["anchor (0 synthetic turns): past cutoff_offset"]++
-		case p.anchor.CutoffOffset > 0:
-			b["anchor (0 synthetic turns): before cutoff_offset (gap is mirrored)"]++
-		default:
-			b["anchor (0 synthetic turns): no cutoff_offset"]++
+		case top == 0:
+		case rs.off == top:
+			b["linked tracking: old furthest position confirmed"]++
+		case rs.off < top:
+			b["linked tracking: resume before the old furthest position (gap is mirrored)"]++
+		}
+		if p.anchor != nil {
+			switch {
+			case p.anchor.CutoffOffset > 0 && rs.off == p.anchor.CutoffOffset:
+				b["anchor (0 synthetic turns): at cutoff_offset"]++
+			case p.anchor.CutoffOffset > 0 && rs.off > p.anchor.CutoffOffset:
+				b["anchor (0 synthetic turns): past cutoff_offset"]++
+			case p.anchor.CutoffOffset > 0:
+				b["anchor (0 synthetic turns): before cutoff_offset (gap is mirrored)"]++
+			default:
+				b["anchor (0 synthetic turns): no cutoff_offset"]++
+			}
+		}
+		if rs.off == 0 && size > 0 {
+			c.zeroNoProof++
 		}
 	}
-	if rs.off == 0 && size > 0 {
-		c.zeroNoProof++
+	skipClosed := 0
+	if closed {
+		skipClosed = rs.backlog[0] + rs.backlog[1]
 	}
 	if c.opt.CountBacklog {
 		bl := &c.rep.Backlog
 		bl.Counted = true
-		bl.Sources++
-		bl.Bytes += max(p.scan.EndOff-rs.off, 0)
-		bl.Prompts += rs.backlog[0]
-		bl.Finals += rs.backlog[1]
-		bl.Old += rs.old
-		bl.Gap += rs.gap[0] + rs.gap[1]
-		if rs.off == size && max(p.ckpt, p.cutoff, p.watch) == 0 && !rs.hasProof {
+		bl.SkippedOld += rs.skipOld
+		switch {
+		case closed:
+			bl.ClosedSources++
+			bl.SkippedClosed += skipClosed
+		case rs.off == size && top == 0 && !rs.hasProof:
 			bl.NoPositionSources++
 			bl.NoPositionRecords += len(p.scan.Recs)
-		} else if !rs.hasProof {
-			bl.NoProofSources++
-			bl.NoProofPrompts += rs.backlog[0]
-			bl.NoProofFinals += rs.backlog[1]
-			bl.NoProofOld += rs.old
+		default:
+			bl.Sources++
+			bl.Bytes += max(p.scan.EndOff-rs.off, 0)
+			bl.Prompts += rs.backlog[0]
+			bl.Finals += rs.backlog[1]
+			bl.Gap += rs.gap[0] + rs.gap[1]
+			if !rs.hasProof {
+				bl.NoProofSources++
+				bl.NoProofPrompts += rs.backlog[0]
+				bl.NoProofFinals += rs.backlog[1]
+			}
 		}
 	}
 	var cases []string
@@ -144,15 +173,21 @@ func (c *converter) reportResume(p *pathInfo, rs resume, size int64) {
 	if !rs.hasProof && top > 0 {
 		cases = append(cases, "no-proof")
 	}
-	if len(cases) == 0 && rs.gap[0]+rs.gap[1] > 0 {
+	if closed && len(cases) == 0 && skipClosed+rs.skipOld > 0 {
+		cases = append(cases, "closed")
+	}
+	if len(cases) == 0 && (rs.gap[0]+rs.gap[1] > 0 || rs.skipOld > 0) {
 		cases = append(cases, "proof-behind")
 	}
 	for _, cs := range cases {
 		row := ResumeRow{Path: p.path, Conv: c.labelOf[p.conv], Case: cs, Size: size,
 			Checkpoint: p.ckpt, Cutoff: p.cutoff, Watcher: p.watch, Proof: rs.proof, Resume: rs.off,
-			GapPrompts: rs.gap[0], GapFinals: rs.gap[1], BacklogPrompts: -1}
-		if c.opt.CountBacklog {
-			row.BacklogPrompts, row.BacklogFinals, row.BacklogOld = rs.backlog[0], rs.backlog[1], rs.old
+			GapPrompts: rs.gap[0], GapFinals: rs.gap[1], BacklogPrompts: -1, SkipOld: rs.skipOld, SkipClosed: skipClosed}
+		if closed {
+			row.Resume, row.GapPrompts, row.GapFinals = kept, 0, 0
+		}
+		if c.opt.CountBacklog && !closed {
+			row.BacklogPrompts, row.BacklogFinals = rs.backlog[0], rs.backlog[1]
 		}
 		c.rep.Resume = append(c.rep.Resume, row)
 	}

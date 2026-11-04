@@ -266,7 +266,8 @@ func (c *converter) scanLinked(paths map[string]*pathInfo, keys []string) {
 			continue
 		}
 		q := scanReq{path: p.path, teamsTurn: teams, to: max(p.ckpt, p.cutoff, p.watch),
-			offsets: []int64{p.ckpt, p.cutoff, p.watch}}
+			windowStart: c.now.Add(-CatchUpWindow).UnixMilli(),
+			offsets:     []int64{p.ckpt, p.cutoff, p.watch}}
 		if pr := c.proofs[p.path]; pr != nil {
 			if pr.endOff > 0 && pr.endLine > 0 && pr.endOff <= fst.size && recordBoundary(p.path, pr.endOff) {
 				q.from, q.fromLine = pr.endOff, pr.endLine
@@ -378,20 +379,45 @@ func (c *converter) importSource(p *pathInfo) error {
 	if canStat && !fst.ok {
 		src.State = store.SrcMissing
 	}
-	if p.scan != nil && p.scan.Err == nil {
+	scanned := p.scan != nil && p.scan.Err == nil
+	if p.scan != nil && p.scan.Err != nil {
+		c.rep.note("rollout %s: proof scan failed (%v); old position rule used", p.path, p.scan.Err)
+	}
+	// Closed conversations get no catch-up (owner decision 2026-11-04): the
+	// source stays at its old position as a baseline, and is not mirrored
+	// unless the core reopens the conversation.
+	closed := false
+	if si := c.sessionOfConv(conv); si != nil && si.state == store.ConvClosed {
+		closed = true
+	}
+	switch {
+	case closed:
+		if src.State == store.SrcTracking {
+			src.State = store.SrcBaseline
+		}
+		why := "closed conversation"
+		if !scanned {
+			why += ", not scanned"
+		}
+		c.legacyResume(p, &src, size, why)
+		if scanned {
+			c.reportResume(p, c.decideResume(p, size), size, true, src.Offset)
+		}
+	case scanned:
 		rs := c.decideResume(p, size)
 		src.Offset, src.Line = rs.off, rs.line
-		c.reportResume(p, rs, size)
-	} else {
-		if p.scan != nil {
-			c.rep.note("rollout %s: proof scan failed (%v); old position rule used", p.path, p.scan.Err)
+		c.reportResume(p, rs, size, false, 0)
+	default:
+		why := "file missing"
+		if fst.ok {
+			why = "no rollout access"
 		}
-		c.legacyResume(p, &src, size, fst.ok)
+		c.legacyResume(p, &src, size, why+", not scanned")
 	}
 	if fst.ok && src.Offset > fst.size {
 		b["linked: recorded offset beyond EOF (runtime rewrite handling)"]++
 	}
-	if p.progress && src.Offset == 0 && (p.scan == nil || p.scan.Err != nil) {
+	if p.progress && src.Offset == 0 && (!scanned || closed) {
 		c.rep.note("source %s had progress but no usable offset", p.path)
 	}
 	return c.putSource(src)
@@ -546,7 +572,7 @@ var errNotMeta = &fs.PathError{Op: "read", Path: "session_meta", Err: fs.ErrInva
 // legacyResume is the position rule when no proof scan ran (file missing, or
 // no rollout access): the furthest checkpoint or anchor cutoff, else the
 // watcher position, else EOF.
-func (c *converter) legacyResume(p *pathInfo, src *store.TranscriptSource, size int64, exists bool) {
+func (c *converter) legacyResume(p *pathInfo, src *store.TranscriptSource, size int64, why string) {
 	b := c.rep.Buckets
 	cand := offsetCand{rank: 99}
 	sort.SliceStable(p.cands, func(i, j int) bool {
@@ -567,9 +593,5 @@ func (c *converter) legacyResume(p *pathInfo, src *store.TranscriptSource, size 
 	default:
 		cand.src = "none"
 	}
-	why := "file missing"
-	if exists {
-		why = "no rollout access"
-	}
-	b["linked "+src.State+" ("+why+", not scanned): offset from "+cand.src]++
+	b["linked "+src.State+" ("+why+"): offset from "+cand.src]++
 }
