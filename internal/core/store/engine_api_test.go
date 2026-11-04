@@ -117,3 +117,40 @@ WHERE state IN ('queued','starting','running') AND state = 'queued' ORDER BY con
 		t.Errorf("query plan %q does not use turns_open", plan)
 	}
 }
+
+func TestQueuedKinds(t *testing.T) {
+	s, _ := openTest(t)
+	var a, b int64
+	mustT(t, s.Update(func(tx *Tx) error {
+		var err error
+		if a, err = tx.CreateConversation(NewConversation{Label: "s001", Kind: KindWork, Channel: "teams", ExtChatID: "c1"}); err != nil {
+			return err
+		}
+		if b, err = tx.CreateConversation(NewConversation{Label: "s002", Kind: KindWork, Channel: "teams", ExtChatID: "c2"}); err != nil {
+			return err
+		}
+		if _, err := tx.Enqueue(a, []OutMsg{out("p1", OutProgress), out("f1", OutFinal), out("p2", OutProgress)}); err != nil {
+			return err
+		}
+		_, err = tx.Enqueue(b, []OutMsg{out("m1", OutMirror)})
+		return err
+	}))
+	var got map[int64][]string
+	mustT(t, s.Update(func(tx *Tx) (err error) { got, err = tx.QueuedKinds(); return }))
+	if len(got) != 2 || strings.Join(got[a], ",") != OutFinal+","+OutProgress || strings.Join(got[b], ",") != OutMirror {
+		t.Fatalf("QueuedKinds = %v", got)
+	}
+	// A row being sent is not queued.
+	mustT(t, s.Update(func(tx *Tx) error {
+		rows, err := tx.PendingOutbox(b)
+		if err != nil {
+			return err
+		}
+		_, err = tx.BeginSend(rows[0].ID)
+		return err
+	}))
+	mustT(t, s.Update(func(tx *Tx) (err error) { got, err = tx.QueuedKinds(); return }))
+	if _, ok := got[b]; ok || len(got) != 1 {
+		t.Fatalf("QueuedKinds after a send began = %v", got)
+	}
+}
