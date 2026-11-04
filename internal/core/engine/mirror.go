@@ -191,7 +191,6 @@ func (e *Engine) mirrorLoop(ctx context.Context) {
 		return
 	}
 	e.startFirstWalk()
-	e.discoverFirst(ctx)
 	stat := time.NewTicker(e.t.MirrorStat)
 	defer stat.Stop()
 	disc := time.NewTicker(e.t.Discovery)
@@ -201,13 +200,17 @@ func (e *Engine) mirrorLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-stat.C:
+			// One start-up batch per stat tick, and none at start: the
+			// listing above is the start's cost, and a wake or the
+			// discovery tick in the same second adds no second batch
+			// (W1b).
+			e.discoverFirst(ctx)
 		case <-e.mirrorWake:
 			e.discover(ctx)
 		case <-disc.C:
 			e.discover(ctx)
 			e.discoverOld(ctx)
 		}
-		e.discoverFirst(ctx)
 		e.mirrorPoll(ctx)
 	}
 }

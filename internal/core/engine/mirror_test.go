@@ -12,6 +12,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -419,6 +420,57 @@ func TestStartupWalkClassifiesABatchPerTick(t *testing.T) {
 		t.Fatalf("%d of 300 rollouts classified in the first batch, want 1..%d", len(known), firstWalkFiles)
 	}
 	checkNewestFirst(t, known, newest)
+}
+
+// W1b: the start-up walk runs one batch per stat tick and nothing else:
+// not at start (the listing is the start's cost) and not on a mirror wake
+// or a discovery tick, which made two batches in the seconds where the
+// 10 s discovery tick met the 2 s stat tick.
+func TestStartupWalkBatchesOnlyOnTheStatTick(t *testing.T) {
+	var reads atomic.Int64
+	counted := func(p string) (transcript.SessionMeta, error) {
+		reads.Add(1)
+		return transcript.ReadMeta(p)
+	}
+	run := func(e *Engine, until func() bool) {
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			e.mirrorLoop(ctx)
+		}()
+		until()
+		cancel()
+		<-done
+	}
+	e, _ := startupRig(t, counted)
+	e.t.MirrorStat, e.t.Discovery = time.Hour, 20*time.Millisecond
+	e.mirrorWake = make(chan struct{}, 1)
+	run(e, func() bool {
+		for i := 0; i < 10; i++ {
+			e.mirrorWake <- struct{}{}
+			time.Sleep(20 * time.Millisecond)
+		}
+		return true
+	})
+	if n := reads.Load(); n != 0 {
+		t.Fatalf("%d first records read at start, on wakes and on discovery ticks, want 0 (stat tick only)", n)
+	}
+
+	e, newest := startupRig(t, counted)
+	e.t.MirrorStat = 50 * time.Millisecond
+	run(e, func() bool {
+		deadline := time.Now().Add(10 * time.Second)
+		for reads.Load() == 0 && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
+		time.Sleep(150 * time.Millisecond) // a batch or two complete with their write
+		return true
+	})
+	if len(e.mirror.known) == 0 {
+		t.Fatal("no batch on the stat tick")
+	}
+	checkNewestFirst(t, e.mirror.known, newest)
 }
 
 // W1, W1b: a start-up batch also stops after about firstWalkBudget, so
