@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/baaaaaaaka/codex-helper/internal/core/store"
 )
 
 // fakeUpdater offers tag (once set) and counts installs.
@@ -159,6 +161,9 @@ func TestHelperUpdateDrainsInstallsRestartsAndAnnouncesOnce(t *testing.T) {
 	if up.installed() != 1 {
 		t.Fatalf("installs = %d after the update", up.installed())
 	}
+	if s, err := ReadStoreStatus(r.st); err != nil || s.RunningVersion != "v2.0.0" || s.UpdateInstalled != "" || s.UpdateScheduled != "" {
+		t.Fatalf("store status %+v %v", s, err)
+	}
 }
 
 // When the restarted helper does not run the target version, the
@@ -173,6 +178,15 @@ func TestHelperUpdateActivationFailureReportedOnce(t *testing.T) {
 	})
 	if err := r.exited(); !errors.Is(err, ErrRestart) {
 		t.Fatalf("exit = %v", err)
+	}
+	if st, err := store.Open(r.path); err != nil {
+		t.Fatal(err)
+	} else {
+		s, err := ReadStoreStatus(st)
+		st.Close()
+		if err != nil || s.UpdateInstalled != "v2.0.0" || s.RunningVersion != "v1.0.0" {
+			t.Fatalf("store status before the restart %+v %v", s, err)
+		}
 	}
 	r.start()
 	ctl := r.control()

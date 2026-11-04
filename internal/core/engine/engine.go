@@ -435,6 +435,9 @@ func (e *Engine) start(ctx context.Context) error {
 			}
 		}
 		e.prefix = p
+		if err := tx.SetMeta(metaRunningVersion, e.cfg.Version); err != nil {
+			return err
+		}
 		v, _, err := tx.Meta(metaMarkerSelfTest)
 		e.preserved = v == "preserved"
 		return err
