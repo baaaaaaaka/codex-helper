@@ -62,8 +62,9 @@ type installer struct {
 	root     string
 	client   *http.Client
 	backoff  time.Duration
-	stall    time.Duration // abort a download attempt that receives nothing for this long
-	noLock   bool          // tests: behave like an NFS mount without working locks
+	stall    time.Duration                   // abort a download attempt that receives nothing for this long
+	progress func(asset string, bytes int64) // optional; bytes < 0 marks a finished install step
+	noLock   bool                            // tests: behave like an NFS mount without working locks
 	mu       sync.Mutex
 	verified map[string]bool // install dirs verified by this process
 }
@@ -140,6 +141,7 @@ func (in *installer) ensure(ctx context.Context, a Asset, validate func(dir stri
 			return "", err
 		}
 	}
+	in.report(a.Name, -1)
 	if err := writeManifest(stage, a); err != nil {
 		return "", newError(KindCache, "write install manifest", err, "")
 	}
@@ -212,7 +214,7 @@ func (in *installer) download(ctx context.Context, a Asset) (string, error) {
 			return file, nil
 		}
 		lastErr = err
-		if err.Kind != KindDownload || ctx.Err() != nil {
+		if err.Kind != KindDownload || errors.Is(err, errPermanent) || ctx.Err() != nil {
 			break
 		}
 		select {
@@ -246,14 +248,18 @@ func (in *installer) downloadOnce(parent context.Context, a Asset) (string, *Err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return "", newError(KindDownload, op, fmt.Errorf("HTTP %d from %s", resp.StatusCode, a.URL), "")
+		err := fmt.Errorf("HTTP %d from %s", resp.StatusCode, a.URL)
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusRequestTimeout && resp.StatusCode != http.StatusTooManyRequests {
+			err = fmt.Errorf("%w: %w", errPermanent, err) // the pinned file is missing or forbidden: retrying will not help
+		}
+		return "", newError(KindDownload, op, err, "")
 	}
 	f, err := os.CreateTemp(in.tmp(), "dl-")
 	if err != nil {
 		return "", newError(KindCache, op, err, "")
 	}
 	h := sha256.New()
-	body := &stallReader{r: resp.Body, t: stalled, d: in.stall}
+	body := &stallReader{r: resp.Body, t: stalled, d: in.stall, on: func(n int64) { in.report(a.Name, n) }}
 	n, copyErr := io.Copy(io.MultiWriter(f, h), io.LimitReader(body, a.Size+1))
 	closeErr := f.Close()
 	fail := func(e *Error) (string, *Error) { _ = os.Remove(f.Name()); return "", e }
@@ -273,17 +279,31 @@ func (in *installer) downloadOnce(parent context.Context, a Asset) (string, *Err
 	return f.Name(), nil
 }
 
-// stallReader re-arms the stall timer whenever bytes arrive.
+// errPermanent marks download failures that retrying cannot fix (HTTP 4xx).
+var errPermanent = errors.New("permanent download failure")
+
+func (in *installer) report(asset string, bytes int64) {
+	if in.progress != nil {
+		in.progress(asset, bytes)
+	}
+}
+
+// stallReader re-arms the stall timer and reports progress whenever bytes
+// arrive.
 type stallReader struct {
-	r io.Reader
-	t *time.Timer
-	d time.Duration
+	r     io.Reader
+	t     *time.Timer
+	d     time.Duration
+	on    func(total int64)
+	total int64
 }
 
 func (s *stallReader) Read(p []byte) (int, error) {
 	n, err := s.r.Read(p)
 	if n > 0 {
 		s.t.Reset(s.d)
+		s.total += int64(n)
+		s.on(s.total)
 	}
 	return n, err
 }

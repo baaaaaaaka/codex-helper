@@ -25,14 +25,16 @@ type ManagedConfig struct {
 	// Local overrides for offline hosts; each one skips its download.
 	ServerPath, ModelPath, MMProjPath, FFmpegPath string
 
-	SetupTimeout   time.Duration // whole first-run setup; default 45 min
-	RequestTimeout time.Duration // one transcription; default 15 min
-	LoadTimeout    time.Duration // llama-server start until healthy; default 5 min
-	IdleUnload     time.Duration // stop llama-server after this idle time; default 30 min
-	StallTimeout   time.Duration // abort a download that receives nothing; default 60 s
-	Speed          float64       // audio speed-up before recognition; default 1.25
-	SegmentSeconds int           // split long audio (after speed-up); default 60
-	HTTPClient     *http.Client
+	SetupTimeout     time.Duration // whole first-run setup; default 30 min
+	SetupIdleTimeout time.Duration // setup gives up after this long without progress; default 10 min
+	IntegrityBackoff time.Duration // first retry delay after a checksum failure, doubling up to 1 h; default 1 min
+	RequestTimeout   time.Duration // one transcription; default 15 min
+	LoadTimeout      time.Duration // llama-server start until healthy; default 5 min
+	IdleUnload       time.Duration // stop llama-server after this idle time; default 30 min
+	StallTimeout     time.Duration // abort a download that receives nothing; default 60 s
+	Speed            float64       // audio speed-up before recognition; default 1.25
+	SegmentSeconds   int           // split long audio (after speed-up); default 60
+	HTTPClient       *http.Client
 }
 
 // Server sizing that keeps memory at about 1.4 GB (Q8_0 0.6B model +
@@ -40,7 +42,7 @@ type ManagedConfig struct {
 const (
 	contextTokens = 2048
 	maxTokens     = 1024
-	stickyFor     = time.Hour // native-load / integrity / unsupported failures are not retried sooner
+	stickyFor     = time.Hour // native-load / unsupported failures are not retried sooner
 	transcribeMsg = "Transcribe the audio exactly. Do not translate. Preserve the spoken language. Preserve English words, acronyms, code identifiers, file names, and paths as spoken."
 )
 
@@ -52,13 +54,17 @@ type Managed struct {
 	closeCtx context.Context
 	closeFn  context.CancelFunc
 
-	mu      sync.Mutex
-	setup   *setupRun
-	mf      Manifest // resolved by the first setup
-	ready   *paths
-	failErr error
-	failAt  time.Time
-	closed  bool
+	mu             sync.Mutex
+	setup          *setupRun
+	mf             Manifest // resolved by the first setup
+	ready          *paths
+	failErr        error     // sticky failure, returned until failUntil
+	failUntil      time.Time //
+	integrityFails int       // consecutive checksum failures (exponential backoff)
+	setupFailures  map[string]error
+	lastProgress   time.Time
+	progressHigh   map[string]int64 // bytes reached per asset; re-downloading the same bytes is no progress
+	closed         bool
 
 	runMu   sync.Mutex // serializes transcriptions and server lifecycle
 	srv     *llamaServer
@@ -73,9 +79,16 @@ type setupRun struct {
 	preparing chan struct{} // closed when the run has to download something
 	bytes     int64
 	notified  map[string]bool // voice files already told about this run (by path)
+	pending   map[string]bool // voice files that went back to the caller as KindPreparing
+	lastDL    error           // last download failure, retried while setup makes progress
 	paths     *paths
 	err       error
 }
+
+var (
+	errSetupStalled = errors.New("setup stopped making progress")
+	errSetupTotal   = errors.New("setup took too long")
+)
 
 // NewManaged returns the managed backend. Nothing is downloaded until the
 // first Transcribe.
@@ -90,7 +103,9 @@ func NewManaged(cfg ManagedConfig) *Managed {
 	if abs, err := filepath.Abs(cfg.CacheDir); err == nil {
 		cfg.CacheDir = abs
 	}
-	setDefault(&cfg.SetupTimeout, 45*time.Minute)
+	setDefault(&cfg.SetupTimeout, 30*time.Minute)
+	setDefault(&cfg.SetupIdleTimeout, 10*time.Minute)
+	setDefault(&cfg.IntegrityBackoff, time.Minute)
 	setDefault(&cfg.RequestTimeout, 15*time.Minute)
 	setDefault(&cfg.LoadTimeout, 5*time.Minute)
 	setDefault(&cfg.IdleUnload, 30*time.Minute)
@@ -101,8 +116,10 @@ func NewManaged(cfg ManagedConfig) *Managed {
 	if cfg.SegmentSeconds <= 0 {
 		cfg.SegmentSeconds = 60
 	}
-	m := &Managed{cfg: cfg, in: newInstaller(cfg.CacheDir, cfg.HTTPClient)}
+	m := &Managed{cfg: cfg, in: newInstaller(cfg.CacheDir, cfg.HTTPClient),
+		setupFailures: map[string]error{}, progressHigh: map[string]int64{}}
 	m.in.stall = cfg.StallTimeout
+	m.in.progress = m.touch
 	m.closeCtx, m.closeFn = context.WithCancel(context.Background())
 	return m
 }
@@ -173,10 +190,12 @@ func (m *Managed) transcribeOnce(ctx context.Context, p *paths, req Request) (re
 }
 
 // waitReady returns the installed paths, starting first-run setup if needed.
-// Setup runs detached from ctx (bounded by SetupTimeout), so a caller whose
-// ctx ends gets KindPreparing and can retry later without restarting the
-// download. The request is told once via EventPreparing when it must wait
-// for a download.
+// Setup runs detached from ctx, so a caller whose ctx ends gets the
+// retryable KindPreparing and keeps its voice message pending while setup
+// makes progress. Setup ends only on a hard error, after SetupIdleTimeout
+// without progress, or after SetupTimeout in total; voice files that were
+// pending on it then get that error once, on their next call. The request
+// is told once via EventPreparing when it must wait for a download.
 func (m *Managed) waitReady(ctx context.Context, req Request) (*paths, error) {
 	m.mu.Lock()
 	switch {
@@ -187,14 +206,20 @@ func (m *Managed) waitReady(ctx context.Context, req Request) (*paths, error) {
 		p := m.ready
 		m.mu.Unlock()
 		return p, nil
-	case m.failErr != nil && time.Since(m.failAt) < stickyFor:
+	}
+	if err, ok := m.setupFailures[req.Path]; ok {
+		delete(m.setupFailures, req.Path)
+		m.mu.Unlock()
+		return nil, err
+	}
+	if m.failErr != nil && time.Now().Before(m.failUntil) {
 		err := m.failErr
 		m.mu.Unlock()
 		return nil, err
 	}
 	run := m.setup
 	if run == nil {
-		run = &setupRun{done: make(chan struct{}), preparing: make(chan struct{}), notified: map[string]bool{}}
+		run = &setupRun{done: make(chan struct{}), preparing: make(chan struct{}), notified: map[string]bool{}, pending: map[string]bool{}}
 		m.setup = run
 		go m.runSetup(run)
 	}
@@ -204,6 +229,11 @@ func (m *Managed) waitReady(ctx context.Context, req Request) (*paths, error) {
 	for {
 		select {
 		case <-run.done:
+			if run.err != nil { // delivered now; do not deliver it again
+				m.mu.Lock()
+				delete(m.setupFailures, req.Path)
+				m.mu.Unlock()
+			}
 			return run.paths, run.err
 		case <-preparing:
 			preparing = nil
@@ -215,36 +245,123 @@ func (m *Managed) waitReady(ctx context.Context, req Request) (*paths, error) {
 				req.notify(Event{Kind: EventPreparing, CacheDir: m.cfg.CacheDir, DownloadBytes: run.bytes})
 			}
 		case <-ctx.Done():
+			m.mu.Lock()
+			run.pending[req.Path] = true
+			m.mu.Unlock()
 			return nil, newError(KindPreparing, "prepare voice recognition", ctx.Err(), "")
 		}
 	}
 }
 
 func (m *Managed) runSetup(run *setupRun) {
-	ctx, cancel := context.WithTimeout(m.closeCtx, m.cfg.SetupTimeout)
-	defer cancel()
+	total, cancelTotal := context.WithTimeoutCause(m.closeCtx, m.cfg.SetupTimeout, errSetupTotal)
+	defer cancelTotal()
+	ctx, stop := context.WithCancelCause(total)
+	defer stop(nil)
+	m.touch("", -1)
+	go m.watchProgress(ctx, stop)
 	p, err := m.install(ctx, run)
 	if err != nil && ctx.Err() != nil {
-		err = ctxError(ctx, "prepare voice recognition")
-		if KindOf(err) == KindTimeout {
-			err.(*Error).Detail = "setup did not finish within " + m.cfg.SetupTimeout.String()
-		}
+		err = m.setupStopped(ctx, run)
 	}
 	m.mu.Lock()
 	run.paths, run.err = p, err
 	if err == nil {
-		m.ready = p
-	} else if k := KindOf(err); k == KindNativeLoad || k == KindIntegrity || k == KindUnsupported {
-		m.failErr, m.failAt = err, time.Now()
+		m.ready, m.integrityFails, m.setupFailures = p, 0, map[string]error{}
+	} else {
+		m.recordFailureLocked(err)
+		for path := range run.pending {
+			m.setupFailures[path] = err
+		}
 	}
 	m.setup = nil
 	m.mu.Unlock()
 	close(run.done)
 }
 
+// touch records setup progress: an install step finished (bytes < 0) or a
+// download got further than any earlier attempt of the same asset.
+func (m *Managed) touch(asset string, bytes int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if bytes >= 0 {
+		if bytes <= m.progressHigh[asset] {
+			return
+		}
+		m.progressHigh[asset] = bytes
+	}
+	m.lastProgress = time.Now()
+}
+
+func (m *Managed) watchProgress(ctx context.Context, stop context.CancelCauseFunc) {
+	tick := time.NewTicker(min(m.cfg.SetupIdleTimeout/4, time.Second))
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+			m.mu.Lock()
+			idle := time.Since(m.lastProgress)
+			m.mu.Unlock()
+			if idle >= m.cfg.SetupIdleTimeout {
+				stop(errSetupStalled)
+				return
+			}
+		}
+	}
+}
+
+// setupStopped explains why setup's context ended.
+func (m *Managed) setupStopped(ctx context.Context, run *setupRun) error {
+	const op = "prepare voice recognition"
+	switch cause := context.Cause(ctx); {
+	case errors.Is(cause, errSetupStalled) && run.lastDL != nil:
+		return newError(KindDownload, op, run.lastDL, "no download progress for "+m.cfg.SetupIdleTimeout.String())
+	case errors.Is(cause, errSetupStalled):
+		return newError(KindTimeout, op, cause, "setup made no progress for "+m.cfg.SetupIdleTimeout.String())
+	case errors.Is(cause, errSetupTotal):
+		return newError(KindTimeout, op, cause, "setup did not finish within "+m.cfg.SetupTimeout.String())
+	}
+	return ctxError(ctx, op)
+}
+
+// recordFailureLocked makes failures that retrying soon cannot fix sticky:
+// checksum failures back off exponentially from IntegrityBackoff up to an
+// hour, native-load and unsupported-platform failures wait an hour. The
+// error carries the retry time for the user message.
+func (m *Managed) recordFailureLocked(err error) {
+	var e *Error
+	if !errors.As(err, &e) {
+		return
+	}
+	var wait time.Duration
+	switch e.Kind {
+	case KindIntegrity:
+		m.integrityFails++
+		wait = backoff(m.cfg.IntegrityBackoff, m.integrityFails)
+	case KindNativeLoad, KindUnsupported:
+		wait = stickyFor
+	default:
+		return
+	}
+	m.failErr, m.failUntil = err, time.Now().Add(wait)
+	e.RetryAt = m.failUntil
+}
+
+// backoff is base doubled per earlier failure, capped at an hour.
+func backoff(base time.Duration, failures int) time.Duration {
+	d := base
+	for i := 1; i < failures && d < time.Hour; i++ {
+		d *= 2
+	}
+	return min(d, time.Hour)
+}
+
 func (m *Managed) stick(err error) {
 	m.mu.Lock()
-	m.failErr, m.failAt, m.ready = err, time.Now(), nil
+	m.recordFailureLocked(err)
+	m.ready = nil
 	m.mu.Unlock()
 }
 
@@ -275,18 +392,20 @@ func (m *Managed) install(ctx context.Context, run *setupRun) (*paths, error) {
 		file     string
 		validate func(string) error
 	}
+	// Small binaries first: a host that cannot run them fails before the
+	// large model download, and the model's download is the last step.
 	var jobs []job
 	if p.server == "" {
 		jobs = append(jobs, job{mf.Runtime, &p.server, exeName("llama-server"), m.validateBinary("llama-server", "--version")})
 	}
-	if p.model == "" {
-		jobs = append(jobs, job{mf.Model, &p.model, mf.Model.Name, nil})
+	if p.ffmpeg == "" && mf.FFmpeg.URL != "" {
+		jobs = append(jobs, job{mf.FFmpeg, &p.ffmpeg, exeName("ffmpeg"), m.validateBinary("ffmpeg", "-version")})
 	}
 	if p.mmproj == "" {
 		jobs = append(jobs, job{mf.MMProj, &p.mmproj, mf.MMProj.Name, nil})
 	}
-	if p.ffmpeg == "" && mf.FFmpeg.URL != "" {
-		jobs = append(jobs, job{mf.FFmpeg, &p.ffmpeg, exeName("ffmpeg"), m.validateBinary("ffmpeg", "-version")})
+	if p.model == "" {
+		jobs = append(jobs, job{mf.Model, &p.model, mf.Model.Name, nil})
 	}
 
 	var missing int64
@@ -305,11 +424,22 @@ func (m *Managed) install(ctx context.Context, run *setupRun) (*paths, error) {
 		close(run.preparing)
 	}
 	for _, j := range jobs {
-		dir, err := m.in.ensure(ctx, j.asset, j.validate)
-		if err != nil {
-			return nil, err
+		for attempt := 1; ; attempt++ {
+			dir, err := m.in.ensure(ctx, j.asset, j.validate)
+			if err == nil {
+				*j.target = filepath.Join(dir, j.file)
+				break
+			}
+			if KindOf(err) != KindDownload || errors.Is(err, errPermanent) || ctx.Err() != nil {
+				return nil, err
+			}
+			run.lastDL = err // transient: keep trying while setup makes progress
+			select {
+			case <-ctx.Done():
+				return nil, err
+			case <-time.After(min(time.Duration(attempt)*5*m.in.backoff, time.Minute)):
+			}
 		}
-		*j.target = filepath.Join(dir, j.file)
 	}
 	if p.ffmpeg == "" {
 		path, err := systemFFmpeg(ctx)

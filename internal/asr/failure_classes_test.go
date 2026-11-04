@@ -85,7 +85,8 @@ func TestFailureClassCleanHost(t *testing.T) {
 		g.srv.set(func(s *assetServer) { s.missing["model.gguf"] = true })
 		_, err := transcribe(t, g.managed(t), voiceFile(t, g.dir, "v.ogg", "x"), nil, time.Minute)
 		e := mustKind(t, err, KindDownload)
-		if !Retryable(err) || g.hitCount("model.gguf") != downloadTries || !strings.Contains(e.Error(), "HTTP 404") {
+		// 404 is permanent: no retries, and the row fails instead of staying pending.
+		if Retryable(err) || g.hitCount("model.gguf") != 1 || !strings.Contains(e.Error(), "HTTP 404") {
 			t.Fatalf("retryable=%v hits=%d err=%v", Retryable(err), g.hitCount("model.gguf"), err)
 		}
 		if msg := UserMessage(err); !strings.Contains(msg, "github.com and huggingface.co") {
@@ -102,6 +103,17 @@ func TestFailureClassCleanHost(t *testing.T) {
 			t.Fatalf("message: %s", UserMessage(err))
 		}
 	})
+}
+
+// prewarm installs everything but the model, so a test that measures setup
+// progress is not timing the (race-instrumented) fake binaries' validation.
+func (f *fixture) prewarm(t *testing.T) {
+	t.Helper()
+	f.srv.set(func(s *assetServer) { s.missing["model.gguf"] = true })
+	_, err := transcribe(t, f.managed(t), voiceFile(t, f.dir, "prewarm.ogg", "x"), nil, time.Minute)
+	mustKind(t, err, KindDownload)
+	f.srv.set(func(s *assetServer) { delete(s.missing, "model.gguf") })
+	f.srv.set(func(s *assetServer) { s.hits = map[string]int{} })
 }
 
 func (f *fixture) hitCount(name string) int { return f.srv.hitCount(name) }
@@ -259,6 +271,7 @@ func TestFailureClassSlowSetup(t *testing.T) {
 
 	t.Run("setup timeout is bounded and recoverable", func(t *testing.T) {
 		g := newFixture(t, nil)
+		g.prewarm(t)
 		g.srv.set(func(s *assetServer) { s.hold["model.gguf"] = make(chan struct{}) })
 		m := g.managed(t, func(c *ManagedConfig) { c.SetupTimeout = time.Second })
 		start := time.Now()
@@ -273,6 +286,102 @@ func TestFailureClassSlowSetup(t *testing.T) {
 		g.srv.set(func(s *assetServer) { delete(s.hold, "model.gguf") })
 		if res, err := transcribe(t, m, filepath.Join(g.dir, "v.ogg"), nil, time.Minute); err != nil || res.Text != "late part 1" {
 			t.Fatalf("after timeout: %+v %v", res, err)
+		}
+	})
+
+	t.Run("slow but progressing setup keeps the message pending", func(t *testing.T) {
+		g := newFixture(t, nil)
+		g.prewarm(t)
+		g.srv.set(func(s *assetServer) { s.trickle["model.gguf"] = 100 * time.Millisecond })
+		m := g.managed(t, func(c *ManagedConfig) { c.SetupIdleTimeout = 600 * time.Millisecond })
+		voice := voiceFile(t, g.dir, "v.ogg", "slow")
+		rec := &recorder{}
+		start := time.Now()
+		for {
+			m.mu.Lock()
+			ready := m.ready != nil
+			m.mu.Unlock()
+			wait := 200 * time.Millisecond // the core's short poll while setup runs
+			if ready {
+				wait = time.Minute
+			}
+			res, err := transcribe(t, m, voice, rec, wait)
+			if err == nil {
+				if res.Text != "slow part 1" {
+					t.Fatalf("text %q", res.Text)
+				}
+				break
+			}
+			m.mu.Lock()
+			ready = m.ready != nil
+			m.mu.Unlock()
+			if ready && KindOf(err) == KindTimeout && wait < time.Minute {
+				continue // setup finished during the short poll; transcription needs longer
+			}
+			if KindOf(err) != KindPreparing || !Retryable(err) {
+				t.Fatalf("after %v: %v; a progressing setup must keep the row pending", time.Since(start), err)
+			}
+			if time.Since(start) > time.Minute {
+				t.Fatal("setup never finished")
+			}
+		}
+		if d := time.Since(start); d < 1500*time.Millisecond {
+			t.Fatalf("setup took only %v; the trickle must outlast SetupIdleTimeout for this test to mean anything", d)
+		}
+		if rec.count() != 1 || g.hitCount("model.gguf") != 1 {
+			t.Fatalf("notices %d, model requests %d; want 1 and 1", rec.count(), g.hitCount("model.gguf"))
+		}
+	})
+
+	t.Run("setup without progress fails the pending message once", func(t *testing.T) {
+		g := newFixture(t, nil)
+		g.prewarm(t)
+		g.srv.set(func(s *assetServer) { s.hold["model.gguf"] = make(chan struct{}) })
+		m := g.managed(t, func(c *ManagedConfig) {
+			c.StallTimeout = 200 * time.Millisecond
+			c.SetupIdleTimeout = 1500 * time.Millisecond
+		})
+		voice := voiceFile(t, g.dir, "v.ogg", "stuck")
+		rec := &recorder{}
+		_, err := transcribe(t, m, voice, rec, 300*time.Millisecond)
+		mustKind(t, err, KindPreparing)
+		// Setup keeps retrying the download, but every attempt stops at the
+		// same byte, which is not progress. Wait for it to give up.
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			m.mu.Lock()
+			done := m.setup == nil
+			m.mu.Unlock()
+			if done {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("setup without progress was not stopped")
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		if g.hitCount("model.gguf") < 3 {
+			t.Fatalf("model requests = %d; transient failures must be retried while setup runs", g.hitCount("model.gguf"))
+		}
+		// The core retries the pending row: it now gets the final failure.
+		_, err = transcribe(t, m, voice, rec, time.Minute)
+		e := mustKind(t, err, KindDownload)
+		if Retryable(err) || !strings.Contains(e.Detail, "no download progress") {
+			t.Fatalf("err = %v", err)
+		}
+		if msg := UserMessage(err); !strings.HasPrefix(msg, "Voice transcription failed:") || !strings.Contains(msg, "resend") {
+			t.Fatalf("message: %s", msg)
+		}
+		if _, err := os.Stat(voice); err != nil {
+			t.Fatalf("voice file was removed: %v", err)
+		}
+		// Once delivered, a resend starts a fresh setup and succeeds.
+		g.srv.set(func(s *assetServer) { delete(s.hold, "model.gguf") })
+		if res, err := transcribe(t, m, voice, rec, time.Minute); err != nil || res.Text != "stuck part 1" {
+			t.Fatalf("resend: %+v %v", res, err)
+		}
+		if rec.count() != 2 {
+			t.Fatalf("notices = %d; want one per setup", rec.count())
 		}
 	})
 
@@ -382,12 +491,17 @@ func TestFailureClassBrokenCache(t *testing.T) {
 	t.Run("corrupt download is never published", func(t *testing.T) {
 		g := newFixture(t, nil)
 		g.srv.set(func(s *assetServer) { s.corrupt["mmproj.gguf"] = true })
-		m := g.managed(t)
+		const base = 400 * time.Millisecond
+		m := g.managed(t, func(c *ManagedConfig) { c.IntegrityBackoff = base })
 		voice := voiceFile(t, g.dir, "v.ogg", "x")
+		failed := time.Now()
 		_, err := transcribe(t, m, voice, nil, time.Minute)
-		mustKind(t, err, KindIntegrity)
-		if !strings.Contains(UserMessage(err), "checksum") {
-			t.Fatalf("message: %s", UserMessage(err))
+		e := mustKind(t, err, KindIntegrity)
+		if msg := UserMessage(err); !strings.Contains(msg, "checksum") || !strings.Contains(msg, "will not retry setup before") {
+			t.Fatalf("message: %s", msg)
+		}
+		if w := e.RetryAt.Sub(failed); w < base || w > base+5*time.Second {
+			t.Fatalf("first retry in %v, want about %v", w, base)
 		}
 		if _, err := os.Stat(g.installDir(g.manifest.MMProj)); !os.IsNotExist(err) {
 			t.Fatalf("corrupt projector published: %v", err)
@@ -401,8 +515,20 @@ func TestFailureClassBrokenCache(t *testing.T) {
 		if g.hitCount("mmproj.gguf") != hits {
 			t.Fatal("bad mirror is hammered: integrity failures must back off")
 		}
+		// After the backoff it tries again, and the next wait doubles.
+		time.Sleep(time.Until(e.RetryAt) + 50*time.Millisecond)
+		failed = time.Now()
+		_, err = transcribe(t, m, voice, nil, time.Minute)
+		e = mustKind(t, err, KindIntegrity)
+		if g.hitCount("mmproj.gguf") != hits+1 {
+			t.Fatalf("mmproj requests %d, want %d", g.hitCount("mmproj.gguf"), hits+1)
+		}
+		if w := e.RetryAt.Sub(failed); w < 2*base || w > 2*base+5*time.Second {
+			t.Fatalf("second retry in %v, want about %v", w, 2*base)
+		}
 		g.srv.set(func(s *assetServer) { delete(s.corrupt, "mmproj.gguf") })
-		if _, err := transcribe(t, g.managed(t), voice, nil, time.Minute); err != nil {
+		time.Sleep(time.Until(e.RetryAt) + 50*time.Millisecond)
+		if _, err := transcribe(t, m, voice, nil, time.Minute); err != nil {
 			t.Fatalf("after the mirror is fixed: %v", err)
 		}
 	})

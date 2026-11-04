@@ -127,6 +127,22 @@ func TestUserMessageEveryKind(t *testing.T) {
 	}
 }
 
+func TestIntegrityBackoff(t *testing.T) {
+	for _, c := range []struct {
+		fails int
+		want  time.Duration
+	}{{1, time.Minute}, {2, 2 * time.Minute}, {3, 4 * time.Minute}, {6, 32 * time.Minute}, {7, time.Hour}, {50, time.Hour}} {
+		if got := backoff(time.Minute, c.fails); got != c.want {
+			t.Errorf("backoff after %d failures = %v, want %v", c.fails, got, c.want)
+		}
+	}
+	at := time.Now().Add(4 * time.Minute)
+	msg := UserMessage(&Error{Kind: KindIntegrity, Op: "download model", RetryAt: at})
+	if !strings.Contains(msg, "not retry setup before "+at.Format("15:04")+" (in about 4m0s)") {
+		t.Fatalf("message: %s", msg)
+	}
+}
+
 func fakeCmd(t *testing.T) string {
 	t.Helper()
 	p := filepath.Join(t.TempDir(), exeName("fake-asr-cmd"))

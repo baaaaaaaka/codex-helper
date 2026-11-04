@@ -207,11 +207,13 @@ type assetServer struct {
 	corrupt map[string]bool          // flip one byte
 	hold    map[string]chan struct{} // send half, then wait for the channel (or the client to go away)
 	stall   map[string]int           // the first N requests send half, then hang
+	trickle map[string]time.Duration // send in 20 chunks with this pause between them
 }
 
 func newAssetServer(t *testing.T) *assetServer {
 	s := &assetServer{files: map[string][]byte{}, hits: map[string]int{}, missing: map[string]bool{},
-		corrupt: map[string]bool{}, hold: map[string]chan struct{}{}, stall: map[string]int{}}
+		corrupt: map[string]bool{}, hold: map[string]chan struct{}{}, stall: map[string]int{},
+		trickle: map[string]time.Duration{}}
 	s.Server = httptest.NewServer(http.HandlerFunc(s.serve))
 	t.Cleanup(func() {
 		s.Server.CloseClientConnections() // ends held/stalled handlers
@@ -225,7 +227,7 @@ func (s *assetServer) serve(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	s.hits[name]++
 	data, ok := s.files[name]
-	missing, corrupt, hold := s.missing[name], s.corrupt[name], s.hold[name]
+	missing, corrupt, hold, trickle := s.missing[name], s.corrupt[name], s.hold[name], s.trickle[name]
 	stall := s.stall[name] > 0
 	if stall {
 		s.stall[name]--
@@ -240,6 +242,22 @@ func (s *assetServer) serve(w http.ResponseWriter, r *http.Request) {
 		data[len(data)/2] ^= 0xff
 	}
 	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+	if trickle > 0 {
+		for rest, step := data, len(data)/20+1; len(rest) > 0; {
+			n := min(step, len(rest))
+			if _, err := w.Write(rest[:n]); err != nil {
+				return
+			}
+			w.(http.Flusher).Flush()
+			rest = rest[n:]
+			select {
+			case <-time.After(trickle):
+			case <-r.Context().Done():
+				return
+			}
+		}
+		return
+	}
 	if hold != nil || stall {
 		w.Write(data[:len(data)/2])
 		w.(http.Flusher).Flush()

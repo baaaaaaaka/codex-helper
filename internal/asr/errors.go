@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // Kind is a stable failure class. The core maps each kind to one user-visible
@@ -32,10 +33,11 @@ const (
 
 // Error is the only error type the package returns.
 type Error struct {
-	Kind   Kind
-	Op     string // what was being done, e.g. "download model"
-	Detail string // short diagnostic, e.g. a stderr tail or HTTP status
-	Err    error
+	Kind    Kind
+	Op      string // what was being done, e.g. "download model"
+	Detail  string // short diagnostic, e.g. a stderr tail or HTTP status
+	Err     error
+	RetryAt time.Time // set when the backend will not retry before this time
 }
 
 func (e *Error) Error() string {
@@ -74,10 +76,11 @@ func KindOf(err error) Kind {
 }
 
 // Retryable reports whether the same voice file should be tried again later
-// (keep the row pending) rather than marked failed.
+// (keep the row pending) rather than marked failed. Download failures are
+// final: setup already retried them for as long as it made progress.
 func Retryable(err error) bool {
 	switch KindOf(err) {
-	case KindPreparing, KindDownload, KindCanceled:
+	case KindPreparing, KindCanceled:
 		return true
 	}
 	return false
@@ -87,15 +90,15 @@ var userMessages = map[Kind][2]string{
 	KindNotConfigured: {"voice transcription is not set up on this helper.", "update or restart the helper; if you configured --asr-command, check that the command exists."},
 	KindUnsupported:   {"local voice transcription is not available for this operating system or CPU.", "configure an external transcriber with --asr-command, or use a supported machine."},
 	KindPreparing:     {"voice recognition is still being prepared (first-time download).", "nothing to do; the message will be transcribed when setup finishes."},
-	KindDownload:      {"downloading the voice recognition files failed.", "check this machine's access to github.com and huggingface.co; the helper will retry."},
-	KindIntegrity:     {"a downloaded voice recognition file did not match its pinned checksum and was discarded.", "retry later; if it keeps failing, update the helper."},
+	KindDownload:      {"downloading the voice recognition files failed.", "check this machine's access to github.com and huggingface.co, then resend the message."},
+	KindIntegrity:     {"a downloaded voice recognition file did not match its pinned checksum and was discarded.", "resend the message later; if it keeps failing, update the helper."},
 	KindDiskSpace:     {"there is not enough free disk space to install voice recognition.", "free space in the cache directory (about 2 GB is needed) and resend the message."},
 	KindCache:         {"the voice recognition cache directory is not usable (not writable, not executable, or locked).", "check free space, permissions and noexec mounts of the cache directory named in the diagnostic."},
 	KindNativeLoad:    {"the voice recognition program cannot run on this machine (missing system library or incompatible CPU/OS).", "update the helper; if it persists, report the diagnostic below or configure --asr-command."},
 	KindMedia:         {"the voice/video file could not be decoded or contains no audio.", "resend the recording, or type the message."},
 	KindNoSpeech:      {"no speech was recognised in the recording.", "resend the recording closer to the microphone, or type the message."},
 	KindBackend:       {"voice recognition failed.", "resend the message; if it keeps failing, check the diagnostic below."},
-	KindTimeout:       {"voice recognition took too long and was stopped.", "resend a shorter recording or try again later."},
+	KindTimeout:       {"voice recognition (setup or transcription) took too long and was stopped.", "resend the message to try again."},
 	KindCanceled:      {"voice recognition was interrupted.", "it will be retried automatically."},
 }
 
@@ -115,6 +118,15 @@ func UserMessage(err error) string {
 		out = "Voice transcription pending: " + msg[0] + " " + msg[1]
 	}
 	var e *Error
+	if errors.As(err, &e) && !e.RetryAt.IsZero() {
+		wait := time.Until(e.RetryAt)
+		if wait < time.Minute {
+			wait = wait.Round(time.Second)
+		} else {
+			wait = wait.Round(time.Minute)
+		}
+		out += fmt.Sprintf(" The helper will not retry setup before %s (in about %s); resend the message after that.", e.RetryAt.Format("15:04"), wait)
+	}
 	if errors.As(err, &e) && kind != KindPreparing {
 		if diag := firstNonEmpty(e.Detail, errString(e.Err)); diag != "" {
 			out += "\nDiagnostic: " + shorten(diag, 400)
