@@ -166,7 +166,9 @@ func TestConvertFixtures(t *testing.T) {
 			eq(t, "i3", qs(t, db, inQ, "1788256812000"), "queued/queued prompt")
 			eq(t, "i11", qs(t, db, inQ, "1788256814000"), "queued/deferred, no turn")
 			eq(t, "i12 control persisted", qs(t, db, inQ, "1788256815000"), "done/status")
-			eq(t, "i13 unknown chat", qi(t, db, `SELECT count(*) FROM inbound WHERE ext_msg_id = '1788256816000'`), int64(0))
+			// No data loss: an unknown chat's rows land on a closed placeholder conversation.
+			eq(t, "i13 unknown chat -> orphan", qs(t, db, `SELECT c.kind || '/' || c.state || '/' || c.label || '/' || c.ext_chat_id FROM inbound i JOIN conversations c ON c.id = i.conv_id WHERE i.ext_msg_id = '1788256816000'`),
+				"work/closed/orphan-1/"+qs(t, db, `SELECT ext_chat_id FROM conversations WHERE label = 'orphan-1'`))
 			if rc59 {
 				eq(t, "i6 control manual_hold", qs(t, db, inQ, "1788256806000"), "ignored/held control")
 				eq(t, "i7 work manual_hold", qs(t, db, inQ, "1788256807000"), "held/held work")
@@ -177,6 +179,7 @@ func TestConvertFixtures(t *testing.T) {
 			eq(t, "o1", qs(t, db, `SELECT state || '/' || body || '/' || ext_msg_id FROM outbox WHERE delivery_key = 'legacy-outbox:o1'`), "sent/answer one/1788256809000")
 			h := sha256.Sum256([]byte("answer one"))
 			eq(t, "o1 hash", qs(t, db, `SELECT hex(body_hash) FROM outbox WHERE delivery_key = 'legacy-outbox:o1'`), strings.ToUpper(hexs(h[:])))
+			eq(t, "o1 hash marked legacy", qs(t, db, `SELECT hash_algo FROM outbox WHERE delivery_key = 'legacy-outbox:o1'`), "legacy")
 			eq(t, "o2 sending", qs(t, db, outQ, "legacy-outbox:o2"), "unknown")
 			eq(t, "o6 accepted", qs(t, db, outQ, "legacy-outbox:o6"), "unknown")
 			eq(t, "o3", qs(t, db, outQ, "legacy-outbox:o3"), "queued")
@@ -204,6 +207,7 @@ func TestConvertFixtures(t *testing.T) {
 			eq(t, "synthetic turns", qi(t, db, `SELECT count(*) FROM turns WHERE turn_key NOT LIKE 'legacy-%'`), int64(0))
 
 			eq(t, "notifications", qi(t, db, `SELECT count(*) FROM notifications`), int64(2))
+			eq(t, "notification kinds", qi(t, db, `SELECT count(*) FROM notifications WHERE kind <> ''`), int64(2))
 			eq(t, "meta migrated_from", qs(t, db, `SELECT value FROM meta WHERE key = 'migrated_from'`), string(rep.Version))
 		})
 	}
@@ -512,4 +516,58 @@ func TestRolloutClassification(t *testing.T) {
 	eq(t, "bucket recent", rep.Buckets["unlinked interactive, mtime within 120 days -> no row (discovery)"], 1)
 	eq(t, "bucket subagent/exec", rep.Buckets["unlinked subagent/exec -> ignored"], 2)
 	eq(t, "bucket originator", rep.Buckets["unlinked originator=codex-helper -> ignored"], 1)
+}
+
+// Workflow card config and its webhook secret (SPEC §5.2): the secret is
+// copied 0600 next to the new store and never appears in the report.
+func TestWorkflowImport(t *testing.T) {
+	dir := fixture(t, "rc59", "json")
+	const secret = "https://example.invalid/workflows/SECRET-TOKEN"
+	if err := os.WriteFile(filepath.Join(dir, "workflow-webhook-url"), []byte(secret), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := `{"version":1,"workflow":{"enabled":true,"control_webhook_url_file":"/nonexistent/workflow-webhook-url","control_chat_id":"19:control@thread.v2"}}`
+	if err := os.WriteFile(filepath.Join(dir, "workflow-notifications.json"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out := filepath.Join(t.TempDir(), "out")
+	rep, db := dryRun(t, dir, func(o *Options) { o.Out = out })
+	eq(t, "enabled", qs(t, db, `SELECT value FROM meta WHERE key = ?`, MetaWorkflowEnabled), "true")
+	eq(t, "control chat", qs(t, db, `SELECT value FROM meta WHERE key = ?`, MetaWorkflowControlID), "19:control@thread.v2")
+	dst := filepath.Join(out, "workflow-webhook-url")
+	eq(t, "secret file", qs(t, db, `SELECT value FROM meta WHERE key = ?`, MetaWorkflowSecretFile), dst)
+	st, err := os.Stat(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eq(t, "mode", st.Mode().Perm(), os.FileMode(0o600))
+	raw, _ := os.ReadFile(dst)
+	eq(t, "content", string(raw), secret)
+	var b strings.Builder
+	rep.WriteText(&b)
+	if strings.Contains(b.String(), "SECRET-TOKEN") {
+		t.Error("secret in the report")
+	}
+}
+
+// Shared Codex thread: the conversation with the newest activity keeps the
+// rollout; the other is parked, keeps its thread id and owns no source.
+func TestSharedThreadWinner(t *testing.T) {
+	dir := fixture(t, "rc59", "json")
+	editJSON(t, dir, func(m map[string]any) {
+		m["sessions"].(map[string]any)["s002"].(map[string]any)["codex_thread_id"] = "11111111-1111-4111-8111-000000000001"
+	})
+	rep, db := dryRun(t, dir, nil)
+	if !rep.OK() {
+		t.Fatalf("checks: %+v", rep.Checks)
+	}
+	if len(rep.Shared) != 1 {
+		t.Fatalf("shared: %+v", rep.Shared)
+	}
+	sh := rep.Shared[0]
+	eq(t, "winner newer", sh.WinnerLast >= sh.LoserLast, true)
+	eq(t, "winner", sh.Winner, "s001") // s001 has the newer turns
+	eq(t, "loser parked", qs(t, db, `SELECT state FROM conversations WHERE label = ?`, sh.Loser), "parked")
+	eq(t, "loser keeps thread", qs(t, db, `SELECT t.thread_id FROM threads t JOIN conversations c ON c.id = t.conv_id WHERE c.label = ?`, sh.Loser), "11111111-1111-4111-8111-000000000001")
+	eq(t, "loser has no source", qi(t, db, `SELECT count(*) FROM transcript_sources s JOIN conversations c ON c.id = s.conv_id WHERE c.label = ?`, sh.Loser), int64(0))
 }
