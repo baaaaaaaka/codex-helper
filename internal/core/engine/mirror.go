@@ -30,7 +30,11 @@ type mirrorState struct {
 	skipTurns map[string]bool // Codex turn ids the helper ran
 	files     map[string]*mirrorFile
 	known     map[string]string // path -> state of untracked sources (baseline/ignored/missing)
-	first     bool              // first start of this store: pre-existing rollouts are baselined
+	// checked: the file state of each baseline rollout the last discovery
+	// pass looked at and left as baseline; an unchanged file is skipped
+	// without a store transaction (review L11).
+	checked   map[string]transcript.FileInfo
+	first     bool // first start of this store: pre-existing rollouts are baselined
 	startedAt time.Time
 }
 
@@ -83,7 +87,7 @@ func (e *Engine) mirrorSkip(clientID, turnID string) bool {
 }
 
 func (e *Engine) mirrorInit() error {
-	m := &mirrorState{skipTurns: map[string]bool{}, files: map[string]*mirrorFile{}, known: map[string]string{}, startedAt: e.now()}
+	m := &mirrorState{skipTurns: map[string]bool{}, files: map[string]*mirrorFile{}, known: map[string]string{}, checked: map[string]transcript.FileInfo{}, startedAt: e.now()}
 	ids, err := e.st.CodexTurnIDs()
 	if err != nil {
 		return err
@@ -277,6 +281,17 @@ func (e *Engine) newRollout(ctx context.Context, f transcript.Found) (store.Tran
 // promoteBaseline starts mirroring a baselined rollout that grew: a person
 // continued an old session.
 func (e *Engine) promoteBaseline(ctx context.Context, f transcript.Found) {
+	e.mirror.mu.Lock()
+	last, seen := e.mirror.checked[f.Path]
+	e.mirror.mu.Unlock()
+	if seen && last == f.Info {
+		return
+	}
+	stay := func() {
+		e.mirror.mu.Lock()
+		e.mirror.checked[f.Path] = f.Info
+		e.mirror.mu.Unlock()
+	}
 	var src store.TranscriptSource
 	var ok bool
 	if err := e.update(func(tx *store.Tx) error {
@@ -287,10 +302,15 @@ func (e *Engine) promoteBaseline(ctx context.Context, f transcript.Found) {
 		return
 	}
 	if f.Info.Size <= src.Offset && f.Info.Inode == src.Inode {
+		stay()
 		return
 	}
 	meta, err := transcript.ReadMeta(f.Path)
-	if err != nil || meta.Subagent() || !meta.Interactive() {
+	if err != nil {
+		return
+	}
+	if meta.Subagent() || !meta.Interactive() {
+		stay()
 		return
 	}
 	e.mu.Lock()
@@ -325,6 +345,7 @@ func (e *Engine) track(src store.TranscriptSource) {
 	}
 	e.mirror.mu.Lock()
 	delete(e.mirror.known, src.Path)
+	delete(e.mirror.checked, src.Path)
 	e.mirror.files[src.Path] = &mirrorFile{src: src, tracker: transcript.NewTracker(src.ThreadID, src.Offset, src.Line, e.mirrorSkip)}
 	e.mirror.mu.Unlock()
 }
@@ -374,6 +395,7 @@ func (e *Engine) mirrorSession(ctx context.Context, src store.TranscriptSource, 
 	e.mu.Unlock()
 	e.mirror.mu.Lock()
 	delete(e.mirror.known, src.Path)
+	delete(e.mirror.checked, src.Path)
 	e.mirror.files[src.Path] = &mirrorFile{src: src, tracker: transcript.NewTracker(meta.ID, offset, src.Line, e.mirrorSkip)}
 	e.mirror.mu.Unlock()
 	e.logf("mirroring local session %s as %s", meta.ID, label)

@@ -187,3 +187,33 @@ func TestMirrorRenderFailureIsRetried(t *testing.T) {
 		return len(r.own(chat, "flaky local prompt")) == 1 && len(r.own(chat, "flaky local answer")) == 1
 	})
 }
+
+// A rollout baselined at the first start is skipped by later discovery
+// passes while unchanged (review L11), and still mirrored from where it
+// was once it grows.
+func TestBaselinedRolloutMirroredOnceItGrows(t *testing.T) {
+	sessions := t.TempDir()
+	w, err := rollout.New(sessions, t.TempDir(), rollout.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.AppendTurn(rollout.Turn{Prompt: "before the helper", Answer: "old answer"}); err != nil {
+		t.Fatal(err)
+	}
+	r := newRig(t, func(c *Config) { c.SessionsDir = sessions })
+	r.control()
+	time.Sleep(time.Second) // many discovery passes over the unchanged file
+	if chat := r.chatOf("s001"); chat != "" {
+		t.Fatalf("an unchanged baselined rollout got a work chat")
+	}
+	if _, err := w.AppendTurn(rollout.Turn{Prompt: "after the helper", Answer: "new answer"}); err != nil {
+		t.Fatal(err)
+	}
+	chat := r.localChat()
+	r.wait("new turn mirrored", func() bool {
+		return len(r.own(chat, "after the helper")) == 1 && len(r.own(chat, "new answer")) == 1
+	})
+	if n := len(r.own(chat, "before the helper")); n != 0 {
+		t.Fatalf("the baselined turn was posted %d times", n)
+	}
+}
