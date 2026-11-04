@@ -28,11 +28,18 @@ const (
 	KindTurnComplete             // event_msg task_complete
 	KindTurnAborted              // event_msg turn_aborted
 	KindTurnRef                  // another event_msg naming the turn (item_completed AgentMessage, ...)
+	KindCompact                  // a context compaction: compacted, event_msg context_compacted
 )
 
 func (k Kind) String() string {
-	return [...]string{"other", "session_meta", "turn_started", "user_message", "user_item", "agent_message", "turn_complete", "turn_aborted", "turn_ref"}[k]
+	return [...]string{"other", "session_meta", "turn_started", "user_message", "user_item", "agent_message", "turn_complete", "turn_aborted", "turn_ref", "compact"}[k]
 }
+
+// Record types of a compaction (Event.Phase of a KindCompact event).
+const (
+	compactedType        = "compacted"         // top-level record holding the replacement history
+	contextCompactedType = "context_compacted" // event_msg (or response_item) announcing it
+)
 
 // SessionMeta is the session_meta payload.
 type SessionMeta struct {
@@ -57,7 +64,7 @@ type Event struct {
 	ThreadID string // item_completed thread id (a subagent's item has another)
 	RecordID string // response_item id ("msg_…"), may be empty
 	ClientID string // UserItem client_id (the turn/start clientUserMessageId)
-	Phase    string // AgentMessage phase: commentary | final_answer | ""
+	Phase    string // AgentMessage phase: commentary | final_answer | ""; Compact: the record type
 	Text     string // message text; TurnComplete: last_agent_message
 	HasLast  bool   // TurnComplete carried a non-null last_agent_message
 	Meta     *SessionMeta
@@ -229,6 +236,8 @@ func Parse(line []byte) Event {
 		}
 	case "turn_aborted":
 		ev.Kind = KindTurnAborted
+	case contextCompactedType:
+		ev.Kind, ev.Phase = KindCompact, contextCompactedType
 	case "item_completed":
 		if p.Item != nil && p.Item.Type == "UserMessage" {
 			ev.Kind, ev.ClientID = KindUserItem, p.Item.ClientID
@@ -332,6 +341,8 @@ func parseHead(line []byte, large bool) (Event, bool) {
 				return cheapRef(h), true
 			}
 			return Event{}, false
+		case contextCompactedType:
+			return Event{}, false
 		}
 		// Command output, patch, MCP results...: only the turn they
 		// belong to matters.
@@ -339,11 +350,69 @@ func parseHead(line []byte, large bool) (Event, bool) {
 	case "response_item":
 		h := head(line, 512)
 		if !bytes.Contains(h, jMessage) || bytes.Contains(h, jRoleDev) || bytes.Contains(h, jRoleSystem) {
+			switch pt := headString(h, jPayloadType); pt {
+			case "context_compaction", contextCompactedType:
+				// v0.1.20 read these item types as compaction notices too.
+				return compactEvent(h, pt), true
+			}
 			return Event{Kind: KindOther}, true // tool calls and outputs, reasoning, instructions
 		}
 		return Event{}, false
+	case compactedType:
+		// The replacement history is never decoded: only the fact matters.
+		return compactEvent(head(line, cutHead), compactedType), true
 	}
 	return Event{Kind: KindOther}, true
+}
+
+// compactEvent is the compaction event of a record of type typ whose first
+// bytes are h.
+func compactEvent(h []byte, typ string) Event {
+	ts, _ := time.Parse(time.RFC3339Nano, headString(h, jTimestamp))
+	return Event{Kind: KindCompact, Time: ts, Phase: typ}
+}
+
+// breaksCompaction reports whether a line is a record v0.1.20 parsed into
+// a transcript record, which ends the window in which a context_compacted
+// record shadows the compacted record before it (v0.1.20
+// compactedRecordIsShadowedByEvent: the two must be adjacent records).
+// Only consulted while a compacted record is held. Session metadata, turn
+// context, token counts, item and task events and reasoning without a
+// summary are not records; messages and tool items are.
+func breaksCompaction(l Line, ev Event) bool {
+	switch ev.Kind {
+	case KindUserMessage:
+		// v0.1.20 shouldSkipTranscriptUserText: injected context is no record.
+		t := strings.TrimSpace(ev.Text)
+		return t != "" && !(strings.HasPrefix(t, "<") && strings.HasSuffix(t, ">")) &&
+			!strings.HasPrefix(t, "# AGENTS.md") && !strings.Contains(t, "<INSTRUCTIONS>")
+	case KindAgentMessage:
+		return strings.TrimSpace(ev.Text) != ""
+	case KindCompact:
+		return true
+	}
+	if l.Data == nil {
+		return false
+	}
+	t, ok := topType(l.Data)
+	if !ok {
+		return false
+	}
+	h := head(l.Data, cutHead)
+	switch t {
+	case "response_item":
+		switch headString(h, jPayloadType) {
+		case "reasoning", "ghost_snapshot", "compaction", "web_search_call":
+			return false
+		}
+		return !bytes.Contains(h, jRoleDev) && !bytes.Contains(h, jRoleSystem)
+	case "event_msg":
+		switch headString(h, jPayloadType) {
+		case "agent_message", "user_message", "error", "warning", "stream_error", "background_event", "agent_reasoning":
+			return true
+		}
+	}
+	return false
 }
 
 // ParseLine is Parse for a line Read returned: a line cut to its head (B6)
@@ -452,15 +521,15 @@ func MirrorKey(threadID, recordID string, part int) string {
 	return MirrorKeyPrefix(threadID, recordID) + strconv.Itoa(part)
 }
 
-// turnRecordID is the record id of a prompt or final without a
-// response-item id: "t:<turn>:final" or "t:<turn>:prompt:<line>" (line is
-// 1-based), as in the converter.
-func turnRecordID(turn string, final bool, line int64) string {
+// turnRecordID is the record id of an output without a response-item id:
+// "t:<turn>:final", or "t:<turn>:<kind>:<line>" (line is 1-based) for a
+// prompt (as in the converter), a status or a compaction notice.
+func turnRecordID(turn string, kind OutputKind, line int64) string {
 	if turn == "" {
 		turn = "?"
 	}
-	if final {
+	if kind == OutputFinal {
 		return "t:" + turn + ":final"
 	}
-	return "t:" + turn + ":prompt:" + strconv.FormatInt(line, 10)
+	return "t:" + turn + ":" + string(kind) + ":" + strconv.FormatInt(line, 10)
 }
