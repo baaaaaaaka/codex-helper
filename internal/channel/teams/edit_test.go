@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -118,8 +120,15 @@ func TestEditHTMLPreservesAttachmentsAndMentions(t *testing.T) {
 	ctx := context.Background()
 	fg, a := newFake(t, fakegraph.Options{})
 	chat := fg.CreateMeetingChatAsUser("annotate").ID
-	p := renderOne(t, a, channel.RichDoc{Label: "L", Markdown: "see file", Mention: true,
-		Files: []channel.FileRef{{Kind: channel.FileDoc, Name: "a.pdf", Ref: `drive:{"item":"i1","att":"0a1b2c3d-0000-4000-8000-000000000001","url":"https://contoso.sharepoint.com/a.pdf","name":"a.pdf"}`}}})
+	src := filepath.Join(t.TempDir(), "a.pdf")
+	if err := os.WriteFile(src, []byte("%PDF-1.4"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ref, err := a.UploadFile(ctx, src, "a.pdf", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := renderOne(t, a, channel.RichDoc{Label: "L", Markdown: "see file", Mention: true, Files: []channel.FileRef{ref}})
 	sent, err := a.Send(ctx, chat, p, "")
 	if err != nil {
 		t.Fatal(err)

@@ -244,3 +244,23 @@ func TextHash(text string) string {
 type BodyHasher interface {
 	BodyHash(body string) string
 }
+
+// ChatActivity is one chat's newest message as reported by an activity scan.
+type ChatActivity struct {
+	Chat   string
+	LastID string    // id of the newest message ("" when the chat has none)
+	Last   time.Time // its creation time (service clock)
+	ByMe   bool      // the newest message was posted by this account
+}
+
+// ActivityScanner is implemented by channels that can list, in one cheap
+// account-wide request, which chats received messages recently (Teams:
+// GET /me/chats ordered by lastMessagePreview). The core then reads only
+// the chats that changed instead of polling every idle chat.
+type ActivityScanner interface {
+	// ScanActivity returns the chats whose newest message is newer than
+	// since, newest first, paging until it reaches older chats (all chats
+	// with a message when since is zero, bounded by the adapter's page
+	// limit). The order and times are the service's.
+	ScanActivity(ctx context.Context, since time.Time) ([]ChatActivity, error)
+}

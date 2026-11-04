@@ -213,7 +213,7 @@ func randFile(t *testing.T, name string, n int) (string, []byte) {
 
 func TestUploadSmallFileAndAttach(t *testing.T) {
 	ctx := context.Background()
-	fg, d, a := frontAdapter(t, 0)
+	_, d, a := frontAdapter(t, 0)
 	src, data := randFile(t, "report.pdf", 4096)
 	ref, err := a.UploadFile(ctx, src, "../evil/Q3 report: final?.pdf", nil, nil)
 	if err != nil {
@@ -231,17 +231,30 @@ func TestUploadSmallFileAndAttach(t *testing.T) {
 	if _, err := a.UploadFile(ctx, src, "Q3 report: final?.pdf", nil, nil); err != nil || len(d.files) != 2 {
 		t.Fatalf("second upload: %v (%d files)", err, len(d.files))
 	}
+}
+
+// TestUploadAndAttachAgainstGraphDrive uploads through the fake Graph's own
+// drive model and posts the reference attachment it validates (contentUrl =
+// the item's webUrl, id = its eTag GUID).
+func TestUploadAndAttachAgainstGraphDrive(t *testing.T) {
+	ctx := context.Background()
+	fg, a := newFake(t, fakegraph.Options{})
+	src, data := randFile(t, "report.pdf", 4096)
+	ref, err := a.UploadFile(ctx, src, "Q3 report.pdf", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	chat := fg.CreateMeetingChatAsUser("files").ID
 	parts, err := a.Render(ctx, channel.RichDoc{Label: "🤖 ✅ Codex answer", Markdown: "attached", Files: []channel.FileRef{ref}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.Send(ctx, chat, parts[0], "f1"); err != nil {
+	if _, err := a.Send(ctx, chat, parts[len(parts)-1], "f1"); err != nil {
 		t.Fatal(err)
 	}
-	msgs := fg.Messages(chat)
-	if len(msgs) != 1 || len(msgs[0].Attachments) != 1 || !strings.Contains(string(msgs[0].Attachments[0]), `"contentType":"reference"`) {
-		t.Fatalf("stored message %+v", msgs)
+	files := fg.OutboundFiles(chat)
+	if len(files) != 1 || files[0].Name != "Q3 report.pdf" || !bytes.Equal(files[0].Item.Data, data) {
+		t.Fatalf("outbound files %+v", files)
 	}
 	noViolations(t, fg)
 }
