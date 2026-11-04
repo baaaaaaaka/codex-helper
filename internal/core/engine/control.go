@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/baaaaaaaka/codex-helper/internal/core/store"
 )
@@ -127,7 +129,7 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 		return false
 	}
 	e.mu.Lock()
-	title, kind, label, state := cs.title, cs.kind, cs.label, cs.state
+	title, kind, label, state, cwd := cs.title, cs.kind, cs.label, cs.state, cs.cwd
 	retry := e.now().Before(cs.nextRead) && !cs.nextRead.IsZero() && cs.failures > 0
 	intro := e.intro[id]
 	e.mu.Unlock()
@@ -155,28 +157,46 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 		if err := tx.SetChat(id, info.ID, info.URL); err != nil {
 			return err
 		}
-		if inbox {
+		discovered, _, err := tx.Meta(discoveredKey(id))
+		if err != nil {
+			return err
+		}
+		switch {
+		case inbox:
 			// Nothing is announced in or about the inbox.
-		} else if kind == store.KindControl {
+		case kind == store.KindControl:
 			if err := e.enqueueNotice(tx, id, "ready:control", "Codex control chat is ready on "+e.machine()+". Send `new <directory>` to start a session, or `help`."); err != nil {
 				return err
 			}
-		} else {
-			text := "Work chat created: " + label + ". Work chat is ready: messages here go to Codex. Send `helper help` for commands."
-			if intro != "" {
-				text = intro
-			}
-			if err := e.enqueueNotice(tx, id, "ready:"+label, text); err != nil {
+		case discovered != "":
+			// A local session found on disk: v0.1.20's one notice in its
+			// work chat, nothing in the control chat.
+			if err := e.enqueueNotice(tx, id, "ready:"+label, textLocalDetected(label)); err != nil {
 				return err
 			}
-			if e.controlID != 0 {
-				if err := e.enqueueNotice(tx, e.controlID, fmt.Sprintf("created:%d", id),
-					fmt.Sprintf("Work chat created: %s — %s. Open it: %s", label, title, info.URL)); err != nil {
-					return err
-				}
+			if err := tx.SetMeta(discoveredKey(id), ""); err != nil {
+				return err
+			}
+		case intro != "":
+			if err := e.enqueueNotice(tx, id, "ready:"+label, intro); err != nil {
+				return err
+			}
+			if err := e.enqueueControlCreated(tx, id, label, info.URL); err != nil {
+				return err
+			}
+		default:
+			// `new`: v0.1.20's chat-created notice, then its ready anchor.
+			if err := e.enqueueNotice(tx, id, "ready:"+label, textWorkChatCreated(label, cwd)); err != nil {
+				return err
+			}
+			if err := e.enqueueNotice(tx, id, "anchor:"+label, textWorkChatReady(label, cwd)); err != nil {
+				return err
+			}
+			if err := e.enqueueControlCreated(tx, id, label, info.URL); err != nil {
+				return err
 			}
 		}
-		_, err := e.refresh(tx, id)
+		_, err = e.refresh(tx, id)
 		return err
 	})
 	if err != nil {
@@ -220,3 +240,79 @@ func (e *Engine) retryCreating(ctx context.Context) {
 }
 
 var _ = time.Second
+
+func discoveredKey(conv int64) string { return fmt.Sprintf("%s%d", metaDiscoveredPrefix, conv) }
+
+// textLocalDetected is v0.1.20's notice in the work chat of a local
+// session found on disk.
+func textLocalDetected(label string) string {
+	return "Local Codex chat detected: " + label + "."
+}
+
+// textWorkChatCreated is v0.1.20's first notice in a work chat made by
+// `new`.
+func textWorkChatCreated(label, cwd string) string {
+	text := "Work chat created: " + label + "."
+	if cwd = strings.TrimSpace(cwd); cwd != "" {
+		text += "\nWorking directory: " + cwd
+	}
+	return text
+}
+
+// textWorkChatReady is v0.1.20's ready anchor that follows it.
+func textWorkChatReady(label, cwd string) string {
+	lines := []string{
+		"💬 Work chat is ready.",
+		"Send a task in this chat. Codex will start automatically and continue this session.",
+		"Status: waiting for your first task.",
+		"Session: " + label,
+		"Project: " + projectLabel(cwd),
+	}
+	if cwd = strings.TrimSpace(cwd); cwd != "" {
+		lines = append(lines, "Working directory: "+cwd)
+	}
+	lines = append(lines,
+		"Commands: `helper status` or `!status`, `helper stats`, `helper help`, `helper close` to close this Codex session in Teams.",
+		"Need more details? Send `helper status`.")
+	return strings.Join(lines, "\n")
+}
+
+// projectLabel is v0.1.20's project name of a working directory: its last
+// element made safe for a title, at most 64 characters.
+func projectLabel(cwd string) string {
+	p := strings.TrimRight(strings.ReplaceAll(strings.TrimSpace(cwd), "\\", "/"), "/")
+	if i := strings.LastIndexByte(p, '/'); i >= 0 {
+		p = p[i+1:]
+	}
+	if p == "" && strings.TrimSpace(cwd) != "" {
+		p = "root"
+	}
+	p = strings.Map(func(r rune) rune {
+		switch {
+		case unicode.IsControl(r):
+			return -1
+		case strings.ContainsRune(`:<>"/\|?*`, r):
+			return '-'
+		}
+		return r
+	}, p)
+	p = strings.Trim(strings.Join(strings.Fields(p), " "), " -.")
+	if r := []rune(p); len(r) > 64 {
+		p = strings.TrimSpace(string(r[:61])) + "..."
+	}
+	if p == "" || p == "untitled" {
+		return "helper default directory"
+	}
+	return p
+}
+
+// enqueueControlCreated is v0.1.20's control-chat answer to `new` (and a
+// fork): where the new work chat is.
+func (e *Engine) enqueueControlCreated(tx *store.Tx, id int64, label, url string) error {
+	if e.controlID == 0 {
+		return nil
+	}
+	return e.enqueueNotice(tx, e.controlID, fmt.Sprintf("created:%d", id),
+		"✅ Work chat created: "+label+"\n\nOpen this Teams link and send your task there:\n"+url+
+			"\n\nIf Teams does not show it right away, search for: "+label)
+}

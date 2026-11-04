@@ -158,7 +158,7 @@ func UserRecords(s *harness.Scenario, chatID, prompt string) int {
 	return len(s.SUTMessagesContaining(chatID, "User: "+prompt))
 }
 
-var sessionIDRE = regexp.MustCompile(`Work chat created: (s\d+)`)
+var sessionIDRE = regexp.MustCompile(`(?:Work chat created|Local Codex chat detected): (s\d+)`)
 
 // SessionID returns the helper's session id ("s001") announced in a work
 // chat, or "".

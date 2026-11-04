@@ -163,8 +163,8 @@ type flakyRender struct {
 
 func (f *flakyRender) Render(ctx context.Context, doc channel.RichDoc) ([]channel.Part, error) {
 	f.mu.Lock()
-	// Only the mirrored prompt ("User: …"), not the chat's intro notice.
-	fail := strings.HasPrefix(doc.Markdown, "**"+labelUser) && strings.Contains(doc.Markdown, "flaky") && f.fails > 0
+	// Only the mirrored prompt ("🧑‍💻 User: …"), not the chat's intro notice.
+	fail := doc.Label == labelUser && strings.Contains(doc.Markdown, "flaky") && f.fails > 0
 	if fail {
 		f.fails--
 	}

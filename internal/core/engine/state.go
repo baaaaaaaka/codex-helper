@@ -18,6 +18,10 @@ const (
 	metaRehashed       = "engine_legacy_rehashed"
 	metaRestart        = "engine_restart_confirm" // "<conv>:<inbound>:<quote>" of a pending `helper restart`
 	metaInbox          = "engine_inbox_conv"      // conversation id of the delegation inbox
+	// metaDiscoveredPrefix + conversation id: a work conversation the
+	// mirror created for a local session discovered on disk, until its
+	// chat is created (no `new` notices, no control-chat notice).
+	metaDiscoveredPrefix = "engine_discovered:"
 )
 
 // Visible labels, as v0.1.20 posted them (fidelity run): helper notices,

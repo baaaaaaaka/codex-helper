@@ -655,6 +655,9 @@ func (e *Engine) mirrorSession(ctx context.Context, src store.TranscriptSource, 
 		if src.ID, err = tx.UpsertSource(src); err != nil {
 			return err
 		}
+		if err := tx.SetMeta(discoveredKey(id), "1"); err != nil {
+			return err
+		}
 		_, err = e.refresh(tx, id)
 		return err
 	})
@@ -667,8 +670,6 @@ func (e *Engine) mirrorSession(ctx context.Context, src store.TranscriptSource, 
 		cs.cwd, cs.threadID = meta.Cwd, meta.ID
 	}
 	e.byThread[meta.ID] = id
-	e.intro[id] = "Work chat created: " + label + ". This chat mirrors a local Codex session in `" + meta.Cwd +
-		"`: turns run in Codex itself appear here. Work chat is ready: messages you send here continue the same session."
 	e.mu.Unlock()
 	e.mirror.mu.Lock()
 	delete(e.mirror.known, src.Path)

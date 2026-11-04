@@ -156,6 +156,21 @@ func (e *Engine) reply(j cmdJob, text string, extra func(tx *store.Tx) error) {
 	e.wakeSender()
 }
 
+// complete finishes a command that answers later (or elsewhere): extra and
+// the command's end commit together, without a reply.
+func (e *Engine) complete(j cmdJob, extra func(tx *store.Tx) error) {
+	err := e.update(func(tx *store.Tx) error {
+		if err := extra(tx); err != nil {
+			return err
+		}
+		return tx.SetInbound(j.inbound, store.InDone, 0)
+	})
+	if err != nil {
+		e.logf("command in %d: %v", j.conv, err)
+	}
+	e.wakeSender()
+}
+
 func (e *Engine) runCommand(ctx context.Context, j cmdJob) {
 	cs := e.conv(j.conv)
 	if cs == nil {
@@ -317,7 +332,9 @@ func (e *Engine) cmdNew(ctx context.Context, j cmdJob, arg string) {
 		return
 	}
 	var id int64
-	e.reply(j, "Creating a work chat for `"+dir+"`…", func(tx *store.Tx) error {
+	// No reply of its own: as in v0.1.20, the control chat hears about the
+	// new chat once it exists ("✅ Work chat created: …", createChat).
+	e.complete(j, func(tx *store.Tx) error {
 		label, err := e.nextLabel(tx)
 		if err != nil {
 			return err
