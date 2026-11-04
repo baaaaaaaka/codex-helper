@@ -1471,6 +1471,47 @@ func TestScanStaysWithinTheReadBudget(t *testing.T) {
 	}
 }
 
+// Benchmark S7: a chat whose newest message (the scan's preview) is one
+// this helper sent is not read; one whose newest message is the owner's
+// is. About half the storm's chat reads went to the helper's own posts.
+func TestScanSkipsChatsWhoseNewestMessageIsTheHelpers(t *testing.T) {
+	var sc *lagScanner
+	r := newRig(t, func(c *Config) {
+		sc = &lagScanner{Fake: c.Channel.(*channeltest.Fake)}
+		c.Channel, c.ActivityScan = sc, true
+		c.Timing.HotFor, c.Timing.SafetyRead, c.Timing.ScanInterval = 200*time.Millisecond, time.Minute, 50*time.Millisecond
+		c.ReadRate = 100 // every scan takes a read token
+	})
+	work := r.newWork(t.TempDir())
+	ctl := r.control()
+	newest := time.Now()
+	sc.set(channel.ChatActivity{Chat: ctl, LastID: "ctl-1", Last: newest})
+	first := r.ch.PostUser(work, "first prompt")
+	sc.set(channel.ChatActivity{Chat: ctl, LastID: "ctl-1", Last: newest},
+		channel.ChatActivity{Chat: work, LastID: first.ID, Last: time.Now()})
+	r.wait("first answer", func() bool { return len(r.own(work, "ANSWER to first prompt")) == 1 })
+	answer := r.own(work, "ANSWER to first prompt")[0]
+	time.Sleep(time.Second) // the work chat goes idle: read only when the scan shows a change
+
+	shown := time.Now()
+	sc.set(channel.ChatActivity{Chat: ctl, LastID: "ctl-1", Last: newest},
+		channel.ChatActivity{Chat: work, LastID: answer.ID, Last: shown})
+	time.Sleep(time.Second) // 20 scans
+	if at, ok := sc.readAfter(work, shown); ok {
+		t.Fatalf("work chat read %s after the scan showed the helper's own answer as its newest message", at.Sub(shown))
+	}
+
+	m := r.ch.PostUser(work, "second prompt")
+	shown = time.Now()
+	sc.set(channel.ChatActivity{Chat: ctl, LastID: "ctl-1", Last: newest},
+		channel.ChatActivity{Chat: work, LastID: m.ID, Last: shown})
+	r.waitFor("work chat read after the owner's post", 2*time.Second, func() bool {
+		_, ok := sc.readAfter(work, shown)
+		return ok
+	})
+	r.wait("second answer", func() bool { return len(r.own(work, "ANSWER to second prompt")) == 1 })
+}
+
 // Benchmark S3: while the account's reads were throttled within the last
 // five minutes, the control chat and hot chats are polled four times less
 // often.

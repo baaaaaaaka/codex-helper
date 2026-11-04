@@ -48,8 +48,11 @@ type convState struct {
 	// read goes before the timed polls. scanGen counts the scan's marks,
 	// so a read that was already running when the scan marked the chat
 	// does not clear it.
-	scanDue  bool
-	scanGen  uint64
+	scanDue bool
+	scanGen uint64
+	// ownPosts are the ids of the messages this helper sent last (S7): a
+	// scan whose newest message is one of them shows no new message.
+	ownPosts []string
 	nextRead time.Time
 	reading  bool
 	failures int

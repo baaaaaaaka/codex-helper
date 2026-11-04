@@ -277,6 +277,7 @@ func (e *Engine) send(ctx context.Context, r store.Outbox, chat, token string, f
 	th, throttled := channel.AsThrottled(err)
 	switch {
 	case err == nil:
+		e.rememberOwnPost(r.ConvID, sent.ID)
 		if err := e.update(func(tx *store.Tx) error { return tx.MarkSent(r.ID, sent.ID) }); err != nil && !errors.Is(err, store.ErrState) {
 			e.logf("mark sent %d: %v", r.ID, err)
 		}
@@ -536,6 +537,9 @@ func (e *Engine) resolveOne(ctx context.Context, id int64) {
 		}
 		return nil
 	})
+	if err == nil && found != "" {
+		e.rememberOwnPost(r.ConvID, found)
+	}
 	if err != nil {
 		e.logf("resolve %d: %v", id, err)
 		return

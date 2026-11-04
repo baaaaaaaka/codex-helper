@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -585,6 +586,7 @@ func (e *Engine) classify(tx *store.Tx, conv int64, kind string, group bool, m c
 				if err := tx.MarkSent(r.ID, m.ID); err != nil {
 					return c, false, err
 				}
+				e.rememberOwnPost(conv, m.ID)
 				c.resolved = true // the resolver drops its entry when it sees the row sent
 			}
 			return c, true, nil
@@ -942,9 +944,14 @@ func (e *Engine) scanLoop(ctx context.Context) {
 			if cs.kind == store.KindWork && cs.state != store.ConvActive {
 				continue // parked or closed: no reads until woken
 			}
-			// Our own posts also change the newest message; reading after
-			// them costs one read but never misses a user message posted
-			// just before.
+			if a.LastID != "" && slices.Contains(cs.ownPosts, a.LastID) {
+				// The newest message is one this helper sent (S7): about
+				// half the scan's reads went to such chats. A user
+				// message posted just before it is found by the next
+				// change, a direct poll (a chat with a running or
+				// recent request is polled) or the safety read.
+				continue
+			}
 			cs.scanDue = true
 			cs.scanGen++
 			if cs.nextRead.After(now) {
@@ -955,6 +962,24 @@ func (e *Engine) scanLoop(ctx context.Context) {
 		e.mu.Unlock()
 		if woke {
 			e.wakeReader()
+		}
+	}
+}
+
+// ownPostsKept is how many sent message ids a conversation remembers.
+const ownPostsKept = 16
+
+// rememberOwnPost records the id of a message this helper sent.
+func (e *Engine) rememberOwnPost(conv int64, id string) {
+	if id == "" {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if cs := e.convs[conv]; cs != nil {
+		cs.ownPosts = append(cs.ownPosts, id)
+		if n := len(cs.ownPosts); n > ownPostsKept {
+			cs.ownPosts = append(cs.ownPosts[:0], cs.ownPosts[n-ownPostsKept:]...)
 		}
 	}
 }
