@@ -542,7 +542,7 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 			return
 		}
 		state, errText = store.TurnFailed, out.Error
-		msgs, err = e.notice(base+":failed", named("Codex is over capacity and the request did not run within 5 minutes of retrying. Resend it later."))
+		msgs, err = e.statusNotice(base+":failed", named("Codex is over capacity and the request did not run within 5 minutes of retrying. Resend it later."))
 	case out.Status != StatusCompleted && codexTooOld(out.Error):
 		// Codex rejected the request as too old for the model: upgrade
 		// it after running turns end; `helper retry last` runs it again.
@@ -554,7 +554,7 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 		if e.cfg.CodexUpgrader != nil {
 			text, upgrade = textCodexTooOld, true
 		}
-		msgs, err = e.notice(base+":codex-too-old", named(text+"\n\nCodex said: "+userError(out.Error)))
+		msgs, err = e.statusNotice(base+":codex-too-old", named(text+"\n\nCodex said: "+userError(out.Error)))
 		extra = func(tx *store.Tx) error {
 			if err := tx.SetMeta(fmt.Sprintf("%s%d", metaRetryPrefix, cs.id), strconv.FormatInt(tr.InboundID, 10)); err != nil {
 				return err
@@ -566,10 +566,10 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 		}
 	case out.ActiveWriter:
 		state, errText = store.TurnFailed, out.Error
-		msgs, err = e.notice(base+":active", named(textActive))
+		msgs, err = e.statusNotice(base+":active", named(textActive))
 	case out.NotStarted:
 		state, errText = store.TurnNotStarted, out.Error
-		msgs, err = e.notice(base+":notstarted", named("Codex did not start this request ("+userError(out.Error)+"). It was not run; resend it if you still need it."))
+		msgs, err = e.statusNotice(base+":notstarted", named("Codex did not start this request ("+userError(out.Error)+"). It was not run; resend it if you still need it."))
 	case out.Status == StatusCompleted:
 		state = store.TurnCompleted
 		visible, files, problems := e.stageArtifacts(tr, out.Final)
@@ -582,7 +582,7 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 		}
 		out.Final = final
 		if final != "" {
-			msgs, err = e.render(ctx, channel.RichDoc{Label: labelCodex, Markdown: named(final), Math: true}, store.OutFinal, base+":final")
+			msgs, err = e.render(ctx, answerDoc(named(final)), store.OutFinal, base+":final")
 		}
 		msgs = append(msgs, files...)
 		// Exactly one owner notification per final (CORE-DESIGN §4): the
@@ -592,17 +592,17 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 		notify = err == nil
 	case out.Status == StatusInterrupted && out.Error == errStalled:
 		state, errText = store.TurnInterrupted, out.Error
-		msgs, err = e.notice(base+":interrupted", named(textStalled(e.t.StallLimit)))
+		msgs, err = e.statusNotice(base+":interrupted", named(textStalled(e.t.StallLimit)))
 	case out.Status == StatusInterrupted:
 		state, errText = store.TurnInterrupted, out.Error
-		msgs, err = e.notice(base+":interrupted", named(textInterrupted))
+		msgs, err = e.statusNotice(base+":interrupted", named(textInterrupted))
 	default:
 		state, errText = store.TurnFailed, out.Error
-		msgs, err = e.notice(base+":failed", named("Codex reported an error and the request did not finish: "+userError(out.Error)+"\n\nIt was not re-run; resend it if you still need it."))
+		msgs, err = e.statusNotice(base+":failed", named("Codex reported an error and the request did not finish: "+userError(out.Error)+"\n\nIt was not re-run; resend it if you still need it."))
 	}
 	if err != nil {
 		e.logf("render outcome of turn %d: %v", tr.ID, err)
-		msgs, _ = e.notice(base+":failed", named("The answer could not be rendered for this chat. Resend the request if you still need it."))
+		msgs, _ = e.statusNotice(base+":failed", named("The answer could not be rendered for this chat. Resend the request if you still need it."))
 	}
 	if !e.commitFinish(ctx, tr, func(tx *store.Tx) error {
 		if err := tx.FinishTurn(tr.ID, state, errText, msgs); err != nil {
@@ -963,7 +963,7 @@ func (e *Engine) finishReconciled(ctx context.Context, cs *convState, tr store.T
 		return
 	}
 	if out.NotStarted && !out.Capacity && !out.ActiveWriter {
-		msgs, err := e.notice(fmt.Sprintf("turn:%d:notstarted", tr.ID), textNotStarted)
+		msgs, err := e.statusNotice(fmt.Sprintf("turn:%d:notstarted", tr.ID), textNotStarted)
 		if err == nil {
 			err = e.update(func(tx *store.Tx) error { return tx.FinishTurn(tr.ID, store.TurnNotStarted, out.Error, msgs) })
 		}
@@ -1032,7 +1032,7 @@ func (e *Engine) progress(ctx context.Context, cs *convState, tr store.Turn, ps 
 	if ps.queued != "" {
 		text = textStarting(ps.queued) + "\n\n" + text
 	}
-	msgs, err := e.render(ctx, channel.RichDoc{Label: labelCodex, Markdown: text, Math: true}, store.OutProgress,
+	msgs, err := e.render(ctx, statusDoc(text), store.OutProgress,
 		fmt.Sprintf("turn:%d:progress:%d", tr.ID, ps.posted+1))
 	if err != nil {
 		e.logf("progress of %s: %v", cs.label, err)

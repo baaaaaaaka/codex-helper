@@ -11,13 +11,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/baaaaaaaka/codex-helper/internal/channel"
 	"github.com/baaaaaaaka/codex-helper/internal/core/store"
 	"github.com/baaaaaaaka/codex-helper/internal/core/transcript"
 )
 
 // The mirror posts the turns a person runs in Codex itself (TUI, IDE) to
-// the session's work chat: the prompt ("User: …") and the final answer of
+// the session's work chat: the prompt ("🧑‍💻 User: …") and the final answer of
 // every turn the helper did not run. Unchanged files cost one stat per
 // tick and no store access.
 
@@ -933,27 +932,16 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 	}
 }
 
-// renderMirror renders one mirrored record. Prompts read "User: <text>",
-// answers carry the Codex label; neither mentions the owner. A prompt too
-// long for one message carries the label in every part's header instead
-// ("User [part i/n]:", as v0.1.20's "🧑‍💻 User [part i/n]:"), not an
-// empty " [part i/n]:" header with the label inline in the first part only.
+// renderMirror renders one mirrored record as v0.1.20 did: a prompt under
+// "🧑‍💻 User:", an answer under "🤖 ✅ Codex answer:" with the completion
+// footer; a long one carries "[part i/n]" in every part's header. Neither
+// mentions the owner in the work chat.
 func (e *Engine) renderMirror(ctx context.Context, thread string, o transcript.Output) ([]store.OutMsg, error) {
-	var parts []channel.Part
-	var err error
+	doc := answerDoc(o.Text)
 	if o.User {
-		text := strings.TrimSpace(o.Text)
-		inline := "**" + labelUser + ":** " + text
-		if blockStart(text) {
-			inline = "**" + labelUser + ":**\n\n" + text
-		}
-		parts, err = e.ch.Render(ctx, channel.RichDoc{Markdown: inline})
-		if err == nil && len(parts) > 1 {
-			parts, err = e.ch.Render(ctx, channel.RichDoc{Label: labelUser, Markdown: text})
-		}
-	} else {
-		parts, err = e.ch.Render(ctx, channel.RichDoc{Label: labelCodex, Markdown: o.Text, Math: true})
+		doc = userDoc(strings.TrimSpace(o.Text))
 	}
+	parts, err := e.ch.Render(ctx, doc)
 	if err != nil {
 		return nil, err
 	}
@@ -963,19 +951,4 @@ func (e *Engine) renderMirror(ctx context.Context, thread string, o transcript.O
 			Body: p.Body, BodyHash: hashBytes(p.Hash)})
 	}
 	return out, nil
-}
-
-// blockStart reports Markdown that must start its own block.
-func blockStart(s string) bool {
-	for _, p := range []string{"#", "```", "~~~", "- ", "* ", "+ ", "> ", "|", "    ", "\t"} {
-		if strings.HasPrefix(s, p) {
-			return true
-		}
-	}
-	if i := strings.IndexAny(s, ".)"); i > 0 && i < 10 {
-		if _, err := fmt.Sscanf(s[:i], "%d", new(int)); err == nil {
-			return true
-		}
-	}
-	return false
 }

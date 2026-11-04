@@ -20,11 +20,14 @@ const (
 	metaInbox          = "engine_inbox_conv"      // conversation id of the delegation inbox
 )
 
-// Visible labels.
+// Visible labels, as v0.1.20 posted them (fidelity run): helper notices,
+// local prompts, Codex answers, and Codex status (progress, commentary,
+// compaction, and turn outcomes other than a cancel).
 const (
 	labelHelper = "🔧 Helper"
-	labelCodex  = "Codex"
-	labelUser   = "User"
+	labelUser   = "🧑‍💻 User"
+	labelAnswer = "🤖 ✅ Codex answer"
+	labelStatus = "🤖 ⏳ Codex status"
 )
 
 // convState is the in-memory state of one conversation. It is guarded by

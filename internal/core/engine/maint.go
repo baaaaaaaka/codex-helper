@@ -79,11 +79,18 @@ func (e *Engine) renderLegacy(ctx context.Context) error {
 	}
 	err := e.update(func(tx *store.Tx) error {
 		for _, r := range rows {
-			label := labelHelper
-			if r.Kind == store.OutFinal || r.Kind == store.OutProgress || r.Kind == store.OutMirror {
-				label = labelCodex
+			doc := channel.RichDoc{Label: labelHelper, Markdown: r.Body}
+			switch r.Kind {
+			case store.OutFinal:
+				doc = answerDoc(r.Body)
+			case store.OutProgress:
+				doc = statusDoc(r.Body)
+			case store.OutMirror:
+				// The legacy kind (prompt or answer) is not kept.
+				doc = channel.RichDoc{Label: labelAnswer, Markdown: r.Body, Math: true}
 			}
-			msgs, err := e.render(ctx, channel.RichDoc{Label: label, Markdown: r.Body, ReplyTo: r.ReplyTo}, r.Kind, r.DeliveryKey+":r")
+			doc.ReplyTo = r.ReplyTo
+			msgs, err := e.render(ctx, doc, r.Kind, r.DeliveryKey+":r")
 			if err != nil {
 				return err
 			}

@@ -114,6 +114,10 @@ type RichDoc struct {
 	// Files are already-uploaded outbound files (from UploadFile). They are
 	// attached to the last part.
 	Files []FileRef
+	// Footer is a closing line after the body of the last part, shown as
+	// "FooterLabel: Footer" (v0.1.20's "🔧 Helper: ✅ Codex finished
+	// responding." under an answer). Plain text.
+	FooterLabel, Footer string
 }
 
 // Part is one rendered, sendable message.

@@ -105,7 +105,7 @@ func fidelityTranscript(t *testing.T, e *Engine, enc *json.Encoder) {
 	skip := func(clientID, turnID string) bool {
 		return strings.HasPrefix(clientID, "cxp-") || (turnID != "" && teamsTurn[turnID])
 	}
-	horizon := now.Add(-transcript.Window)
+	_ = now // no catch-up window any more: every record is mirrored
 	ctx := context.Background()
 	for _, s := range in.Sources {
 		tr := transcript.NewTracker(s.Thread, s.Offset, s.Line, skip)
@@ -126,19 +126,15 @@ func fidelityTranscript(t *testing.T, e *Engine, enc *json.Encoder) {
 			for _, o := range tr.Feed(lines) {
 				rec := map[string]any{"conv": s.Conv, "path": s.Path, "end": o.End, "record_id": o.RecordID,
 					"user": o.User, "turn": o.TurnID, "ts": o.Time.UTC().Format(time.RFC3339Nano), "text": o.Text}
-				if !o.Time.IsZero() && o.Time.Before(horizon) {
-					rec["skipped"] = "older-than-120d"
+				thread := tr.ThreadID()
+				if thread == "" {
+					thread = s.Thread
+				}
+				msgs, err := e.renderMirror(ctx, thread, o)
+				if err != nil {
+					rec["error"] = err.Error()
 				} else {
-					thread := tr.ThreadID()
-					if thread == "" {
-						thread = s.Thread
-					}
-					msgs, err := e.renderMirror(ctx, thread, o)
-					if err != nil {
-						rec["error"] = err.Error()
-					} else {
-						rec["parts"] = fidelityParts(msgs)
-					}
+					rec["parts"] = fidelityParts(msgs)
 				}
 				if err := enc.Encode(rec); err != nil {
 					t.Fatal(err)
@@ -158,25 +154,26 @@ func fidelityDoc(kind, body string) (channel.RichDoc, string, bool) {
 	k := kind
 	switch {
 	case strings.HasPrefix(k, "sync-user-"), strings.HasPrefix(k, "import-user-"), strings.HasPrefix(k, "publish-full-user-"), strings.HasPrefix(k, "fork-history-user"):
-		text := strings.TrimSpace(body)
-		if blockStart(text) {
-			text = "**" + labelUser + ":**\n\n" + text
-		} else {
-			text = "**" + labelUser + ":** " + text
-		}
-		return channel.RichDoc{Markdown: text}, store.OutMirror, true
+		return userDoc(strings.TrimSpace(body)), store.OutMirror, true
 	case strings.HasPrefix(k, "sync-assistant-"), strings.HasPrefix(k, "import-assistant-"), strings.HasPrefix(k, "publish-full-assistant-"), strings.HasPrefix(k, "fork-history-assistant"):
-		return channel.RichDoc{Label: labelCodex, Markdown: body, Math: true}, store.OutMirror, true
+		return answerDoc(body), store.OutMirror, true
 	case k == "final" || strings.HasPrefix(k, "final-"):
-		return channel.RichDoc{Label: labelCodex, Markdown: body, Math: true}, store.OutFinal, true
-	case strings.HasPrefix(k, "codex-progress-"):
-		return channel.RichDoc{Label: labelCodex, Markdown: body, Math: true}, store.OutProgress, true
-	case strings.Contains(k, "-batch-"), strings.HasPrefix(k, "sync-status"), strings.HasPrefix(k, "sync-compact"),
+		return answerDoc(body), store.OutFinal, true
+	case strings.HasPrefix(k, "codex-progress-"), strings.HasPrefix(k, "codex-compact-"):
+		return statusDoc(body), store.OutProgress, true
+	case strings.HasPrefix(k, "sync-status-source-rewritten"):
+		return channel.RichDoc{}, "", false // no such notice in the new core
+	case strings.HasPrefix(k, "sync-status-"), strings.HasPrefix(k, "sync-compact-"):
+		return statusDoc(body), store.OutMirror, true
+	case strings.Contains(k, "-batch-"),
 		strings.HasPrefix(k, "import-status"), strings.HasPrefix(k, "import-compact"), strings.HasPrefix(k, "publish-full-status"),
 		strings.HasPrefix(k, "publish-full-compact"), strings.HasPrefix(k, "fork-history-status"):
 		return channel.RichDoc{}, "", false // not mirrored / not batched by the new core
 	case strings.HasPrefix(k, "ack"):
 		return channel.RichDoc{Label: labelHelper, Markdown: body}, store.OutAck, true
+	case k == "error", strings.Contains(k, "interrupted"), strings.Contains(k, "failed"), strings.Contains(k, "tool"), strings.Contains(k, "artifact"):
+		// v0.1.20 renderKindForOutbox: Codex status.
+		return channel.RichDoc{Label: labelStatus, Markdown: body}, store.OutNotice, true
 	}
 	return channel.RichDoc{Label: labelHelper, Markdown: body}, store.OutNotice, true
 }

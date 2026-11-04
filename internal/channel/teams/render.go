@@ -51,8 +51,9 @@ func (a *Adapter) Render(ctx context.Context, doc channel.RichDoc) ([]channel.Pa
 		return nil, err
 	}
 
+	foot := footer(doc.FooterLabel, doc.Footer)
 	// Image placeholders grow to "../hostedContents/N/$value" when packed.
-	reserve := len(header(doc.Label, 999, 999, mention)) + markerReserve + len(attHTML) + maxImagesPerPart*32
+	reserve := len(header(doc.Label, 999, 999, mention)) + markerReserve + len(attHTML) + len(foot) + maxImagesPerPart*32
 	budget := targetPartBytes - reserve
 	if budget < 4<<10 {
 		return nil, fmt.Errorf("teams: label and attachments leave no room for content")
@@ -103,6 +104,9 @@ func (a *Adapter) Render(ctx context.Context, doc channel.RichDoc) ([]channel.Pa
 				})
 			}
 			content.WriteString(h)
+		}
+		if i == len(packs)-1 {
+			content.WriteString(foot)
 		}
 		msg := map[string]any{}
 		if i == len(packs)-1 && len(atts) > 0 {
@@ -158,6 +162,19 @@ func header(label string, i, n int, mention *identity) string {
 		return ""
 	}
 	return "<p>" + h + "</p>"
+}
+
+// footer is the closing line of the last part: "<p><strong>Label:</strong>
+// text</p>", as v0.1.20 appended "✅ Codex finished responding." to answers.
+func footer(label, text string) string {
+	label, text = strings.TrimSpace(label), strings.TrimSpace(text)
+	switch {
+	case text == "":
+		return ""
+	case label == "":
+		return "<p>" + esc(text) + "</p>"
+	}
+	return "<p><strong>" + esc(label) + ":</strong> " + esc(text) + "</p>"
 }
 
 // renderMath renders the top-level display formulas in one batch. Formulas

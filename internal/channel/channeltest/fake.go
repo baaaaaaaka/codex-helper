@@ -114,6 +114,9 @@ func (f *Fake) Render(_ context.Context, doc channel.RichDoc) ([]channel.Part, e
 		}
 		body := label + ":\n" + c
 		if i == len(chunks)-1 {
+			if doc.Footer != "" {
+				body += "\n" + doc.FooterLabel + ": " + doc.Footer
+			}
 			for _, fr := range doc.Files {
 				body += "\n[file " + fr.Name + "]"
 			}

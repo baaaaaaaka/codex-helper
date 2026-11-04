@@ -30,6 +30,30 @@ func (e *Engine) render(ctx context.Context, doc channel.RichDoc, kind, base str
 	return out, nil
 }
 
+// answerDoc is a Codex answer: the answer label and, after the last part,
+// v0.1.20's completion footer "🔧 Helper: ✅ Codex finished responding."
+// (without an @mention: v0.1.20 notified the owner by the Workflow card or
+// the control chat, never in a work chat that has a control chat).
+func answerDoc(text string) channel.RichDoc {
+	return channel.RichDoc{Label: labelAnswer, Markdown: text, Math: true, FooterLabel: labelHelper, Footer: textFinished}
+}
+
+// statusDoc is a Codex status post (progress, commentary, compaction).
+func statusDoc(text string) channel.RichDoc {
+	return channel.RichDoc{Label: labelStatus, Markdown: text, Math: true}
+}
+
+// userDoc is a local prompt mirrored into its work chat.
+func userDoc(text string) channel.RichDoc {
+	return channel.RichDoc{Label: labelUser, Markdown: text}
+}
+
+// statusNotice renders a turn outcome that v0.1.20 posted as Codex status
+// (interrupted, failed, not run, artifact problems).
+func (e *Engine) statusNotice(base, text string) ([]store.OutMsg, error) {
+	return e.render(context.Background(), channel.RichDoc{Label: labelStatus, Markdown: text}, store.OutNotice, base)
+}
+
 // notice renders a helper notice ("🔧 Helper: text").
 func (e *Engine) notice(base, text string) ([]store.OutMsg, error) {
 	return e.render(context.Background(), channel.RichDoc{Label: labelHelper, Markdown: text}, store.OutNotice, base)
@@ -54,6 +78,7 @@ func (e *Engine) enqueueNotice(tx *store.Tx, conv int64, base, text string) erro
 const (
 	// textAccepted is the v0.1.20 ACK, word for word (fidelity run).
 	textAccepted    = "⏳ Codex is working. Request accepted."
+	textFinished    = "✅ Codex finished responding."
 	textInterrupted = "The previous request was interrupted when the helper stopped. It was not re-run; resend it if you still need it."
 	textNotStarted  = "The previous request did not run: the helper stopped before Codex accepted it. Resend it if you still need it."
 	textRestarted   = "Helper restarted: the new process is running and has taken over."

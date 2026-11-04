@@ -289,7 +289,7 @@ func TestFirstStartRendersImportedUnsentRows(t *testing.T) {
 	for _, c := range convs {
 		for _, m := range ch.Messages(c.ExtChatID) {
 			// A legacy body sent without rendering has no label line.
-			if m.ByOwner && !strings.HasPrefix(m.Text, "🔧 Helper") && !strings.HasPrefix(m.Text, "Codex") {
+			if m.ByOwner && !strings.HasPrefix(m.Text, "🔧 Helper") && !strings.HasPrefix(m.Text, "🤖") {
 				t.Errorf("unrendered message in %s: %q", c.Label, m.Text)
 			}
 		}
