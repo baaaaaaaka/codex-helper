@@ -79,6 +79,26 @@ func (s *Store) CodexTurnIDs() ([]string, error) {
 	return out, rows.Err()
 }
 
+// OutboxCounts returns the number of outbox rows per state that are not
+// sent yet (queued, sending, unknown; `teams service status`).
+func (s *Store) OutboxCounts() (map[string]int, error) {
+	rows, err := s.r.QueryContext(context.Background(), `SELECT state, COUNT(*) FROM outbox WHERE state IN ('queued','sending','unknown') GROUP BY state`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var st string
+		var n int
+		if err := rows.Scan(&st, &n); err != nil {
+			return nil, err
+		}
+		out[st] = n
+	}
+	return out, rows.Err()
+}
+
 // TurnCounts returns the number of turns per state (status and stats).
 func (s *Store) TurnCounts() (map[string]int, error) {
 	rows, err := s.r.QueryContext(context.Background(), `SELECT state, COUNT(*) FROM turns GROUP BY state`)

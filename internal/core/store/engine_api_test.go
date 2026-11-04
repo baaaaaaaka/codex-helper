@@ -65,6 +65,9 @@ func TestEngineAdditions(t *testing.T) {
 	if err != nil || counts[TurnQueued] != 1 || counts[TurnCancelled] != 1 {
 		t.Errorf("TurnCounts %v %v", counts, err)
 	}
+	if oc, err := s.OutboxCounts(); err != nil || oc[OutSending] != 1 || oc[OutQueued] != 1 || len(oc) != 2 {
+		t.Errorf("OutboxCounts %v %v", oc, err)
+	}
 	if ids, err := s.CodexTurnIDs(); err != nil || len(ids) != 0 {
 		t.Errorf("CodexTurnIDs %v %v", ids, err)
 	}
