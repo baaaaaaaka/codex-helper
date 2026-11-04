@@ -18,11 +18,12 @@ Inputs
 
 Expected posts of a conversation that existed before the run: the oracle's
 records classed post:*, read:short-unverifiable and DUP:* (the last are
-posted again: listed as such). Records older than the 120-day window at
-the run's conversion time are listed separately (window delta). A
-conversation the helper created during the run (a local session that never
-had a chat) is expected to post every mirrorable record of its rollout
-within the window, except Teams-run turns.
+posted again: listed as such). There is no catch-up window (owner
+decision 2026-11-05; window_delta stays 0). A conversation the helper
+created during the run (a local session that never had a chat) is expected
+to post every mirrorable record of its rollout, except Teams-run turns.
+Mirrored status/compaction notices (live records only) are counted apart
+(posted_status), not matched.
 
 Matching is by text: the visible text of a posted message (parts joined,
 labels removed) and of a record are reduced to letters (punctuation,
@@ -47,8 +48,13 @@ from checkpoint_oracle import scan_rollout, OLD_WRAPPER  # noqa: E402
 NONLETTER = re.compile(r"[\W\d_]+", re.UNICODE)
 # A part header ("Codex [part 1/2]:", or an unlabelled " [part 1/2]:" as
 # split prompts had before 2026-11-05), then possibly an inline "User:".
-LABEL = re.compile(r"^\s*(?:(?:User|Codex|🔧 Helper|🤖[^:]*)(?: \[part \d+/\d+\])?|\[part \d+/\d+\]):\s*")
-USER = re.compile(r"^\s*(?:\[part \d+/\d+\]:\s*)?User(?: \[part \d+/\d+\])?:")
+# v0.1.20 labels since the parity round: "🧑‍💻 User", "🤖 ✅ Codex answer",
+# "🤖 ⏳ Codex status", "🔧 Helper", each possibly with " [part i/n]".
+LABEL = re.compile(r"^\s*(?:(?:(?:🧑\u200d💻 )?User|Codex|🔧 Helper|🤖[^:]*)(?: \[part \d+/\d+\])?|\[part \d+/\d+\]):\s*")
+USER = re.compile(r"^\s*(?:\[part \d+/\d+\]:\s*)?(?:🧑\u200d💻 )?User(?: \[part \d+/\d+\])?:")
+STATUS = re.compile(r"^\s*🤖 ⏳ Codex status(?: \[part \d+/\d+\])?:")
+# the footer v0.1.20 put on the last part of an answer
+FOOTER = re.compile(r"\s*🔧 Helper:\s*✅ Codex finished responding\.\s*$")
 TAG = re.compile(r"<[^>]+>")
 EXPECT_CLASSES = ("post:", "read:short-unverifiable", "DUP:")
 
@@ -133,9 +139,10 @@ def logical(run):
         g["parts"].append((part, m))
     for (chat, _), g in groups.items():
         g["parts"].sort(key=lambda x: x[0])
-        texts = [LABEL.sub("", LABEL.sub("", visible(m), count=1), count=1) for _, m in g["parts"]]
+        texts = [FOOTER.sub("", LABEL.sub("", LABEL.sub("", visible(m), count=1), count=1)) for _, m in g["parts"]]
         g["text"] = "\n".join(texts)
         g["user"] = bool(USER.match(visible(g["parts"][0][1])))
+        g["status"] = bool(STATUS.match(visible(g["parts"][0][1])))
         g["n_parts"] = len(g["parts"])
         g["patched"] = sum(m.get("patches", 0) for _, m in g["parts"])
         per[chat].append(g)
@@ -232,7 +239,8 @@ def main():
 
     run = load_run(a.run, a.messages)
     now_ms = int(run["meta"].get("migrated_at") or 0)
-    cut_ms = now_ms - 120 * 86400 * 1000
+    # No catch-up window (owner decision 2026-11-05): nothing is "too old".
+    cut_ms = 0
     per, orphans = logical(run)
     old = ro(a.old)
     teams_turns = set()
@@ -346,7 +354,9 @@ def main():
         c = conv_by_label.get(label)
         chat = c["chat"] if c else None
         posted = per.get(chat, []) if chat else []
-        mirror = [g for g in posted if g["kind"] == "mirror"]
+        # mirrored status/compaction notices (live records only, v0.1.20)
+        status = [g for g in posted if g["kind"] == "mirror" and g["status"]]
+        mirror = [g for g in posted if g["kind"] == "mirror" and not g["status"]]
         other = [g for g in posted if g["kind"] != "mirror"]
         for g in other:
             tmpl = re.sub(r"\d+", "#", " ".join(g["text"].split()))[:70]
@@ -356,7 +366,7 @@ def main():
         e = exp.get(label, [])
         res = match(e, mirror)
         row = dict(label=label, chat=chat, state=c["state"] if c else None, new=label not in base_conv,
-                   expected=len(e), posted_mirror=len(mirror), posted_other=len(other), matched=res["matched"], fuzzy=res["fuzzy"],
+                   expected=len(e), posted_mirror=len(mirror), posted_status=len(status), posted_other=len(other), matched=res["matched"], fuzzy=res["fuzzy"],
                    missing=len(res["missing"]), unexpected=len(res["unexpected"]), dup=len(res["dup"]),
                    window_delta=len(window.get(label, [])), multipart=sum(1 for g in mirror if g["n_parts"] > 1),
                    patched=sum(g["patched"] for g in posted))
@@ -388,7 +398,7 @@ def main():
         row["repeat_beyond_history"] = sum(max(0, n - max(1, ek.get(k, 0))) for k, n in pk.items())
         ok = collections.Counter(letters(g["text"]) for g in other)
         row["notice_repeats"] = {k[:60]: n for k, n in ok.items() if n > 1}
-        for k in ("expected", "posted_mirror", "posted_other", "matched", "fuzzy", "missing", "unexpected", "dup", "window_delta", "repeat_beyond_history", "multipart", "patched"):
+        for k in ("expected", "posted_mirror", "posted_status", "posted_other", "matched", "fuzzy", "missing", "unexpected", "dup", "window_delta", "repeat_beyond_history", "multipart", "patched"):
             totals[k] += row[k]
         totals["convs"] += 1
         totals["convs with missing"] += row["missing"] > 0

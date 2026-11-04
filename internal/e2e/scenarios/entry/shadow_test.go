@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -27,11 +28,15 @@ import (
 //	E2E_SHADOW_CODEX_HOME  the Codex home the helper reads: a tmpfs whose
 //	                       sessions/ is the owner's sessions, mounted read-only
 //	E2E_SHADOW_OUT         a writable directory for the dumps
-//	E2E_SHADOW_MODE        "full" (drain, idle, restart) or "kill" (SIGKILL
-//	                       mid-drain, restart, drain)
+//	E2E_SHADOW_MODE        "full" (drain, idle, restart), "kill" (SIGKILL
+//	                       mid-drain, restart, drain) or "live" (full, with
+//	                       an owner prompt and a local session turn injected
+//	                       mid-drain: shadowLive)
 //	E2E_SHADOW_IDLE        idle observation after the drain (default 10m)
 //	E2E_SHADOW_KILL_AFTER  posts before the SIGKILL (kill mode, default 800)
+//	E2E_SHADOW_LIVE_AFTER  posts before the injection (live mode, default 1500)
 const (
+	envShadowLiveAfter = "E2E_SHADOW_LIVE_AFTER"
 	envShadowStore     = "E2E_SHADOW_STORE"
 	envShadowSeed      = "E2E_SHADOW_SEED"
 	envShadowCodexHome = "E2E_SHADOW_CODEX_HOME"
@@ -73,6 +78,10 @@ func TestShadowRealData(t *testing.T) {
 	killAfter := 800
 	if v := os.Getenv(envShadowKillAfter); v != "" {
 		fmt.Sscan(v, &killAfter)
+	}
+	liveAfter := 1500
+	if v := os.Getenv(envShadowLiveAfter); v != "" {
+		fmt.Sscan(v, &liveAfter)
 	}
 	// The Codex home must be a throwaway tmpfs and its sessions read-only:
 	// the run writes config.toml there and nothing else may be written.
@@ -150,6 +159,10 @@ func TestShadowRealData(t *testing.T) {
 		pid = shadowPID(s)
 	}
 
+	var live *shadowLive
+	if mode == "live" {
+		live = startShadowLive(s, home, control, liveAfter)
+	}
 	drainStart := time.Now()
 	lag := ""
 	active := sampleCPU(pid, 3*time.Hour, func() bool {
@@ -163,6 +176,20 @@ func TestShadowRealData(t *testing.T) {
 	phases["drain_cpu"] = map[string]any{"samples": len(active.perSec), "mean_pct": asum.mean, "p99_pct": asum.p99, "max_pct": asum.max, "total_cpu_s": asum.totalSec}
 	s.Note("drain %s (%s); CPU mean %.2f%% p99 %.1f%% max %.1f%% of a core, total %.1fs", drained.Round(time.Second), lag, asum.mean, asum.p99, asum.max, asum.totalSec)
 	s.Check("the catch-up drains", lag == "", "drained", lag)
+	if live != nil {
+		<-live.done
+		finals, locals, texts := shadowNotifications(s, control)
+		live.res["control_final_notices"] = finals
+		live.res["control_local_notices"] = locals
+		live.res["control_notices"] = texts
+		phases["live"] = live.res
+		s.Check("live injection completes", len(live.errs) == 0, "no error", strings.Join(live.errs, "; "))
+		// Catch-up notifies nobody; the two live finals and the live
+		// session do (no Workflow card in the fake: control @mentions,
+		// two finals possibly in one notice).
+		s.Check("owner notified of the live activity only", locals == 1 && finals >= 1 && finals <= 2,
+			"1 local + 1-2 final notices", fmt.Sprintf("%d local, %d final", locals, finals), texts...)
+	}
 	shadowDump(t, s, filepath.Join(outDir, "messages-drained.jsonl"), allSeeded)
 
 	// Idle: no write at all, reads recorded.
@@ -180,7 +207,7 @@ func TestShadowRealData(t *testing.T) {
 		fmt.Sprintf("<= %d", shadowHeartbeatsMax(idle, 0)), fmt.Sprint(ih))
 	s.Note("idle %s: reads %v; CPU mean %.3f%% max %.1f%%", idle, ir, isum.mean, isum.max)
 
-	if mode == "full" {
+	if mode == "full" || mode == "live" {
 		// Restart on the same store: nothing to post again.
 		s.StopSUT()
 		mark = shadowSeq(s)
@@ -202,7 +229,11 @@ func TestShadowRealData(t *testing.T) {
 		prompts = append(prompts, fmt.Sprintf("%s %s %q", c.Kind, c.ChatID, clip(c.Prompt, 80)))
 	}
 	phases["codex_calls"] = prompts
-	s.Check("fake Codex never ran anything", len(calls) == 0, "0 calls", fmt.Sprint(len(calls)), prompts...)
+	if mode == "live" {
+		s.Check("fake Codex ran the owner's prompt only", len(calls) == 1, "1 call", fmt.Sprint(len(calls)), prompts...)
+	} else {
+		s.Check("fake Codex never ran anything", len(calls) == 0, "0 calls", fmt.Sprint(len(calls)), prompts...)
+	}
 
 	summaries := 0
 	for _, m := range s.Graph.Messages(control) {
@@ -247,6 +278,7 @@ func shadowCheckMounts(home string) error {
 	}
 	home = filepath.Clean(home)
 	var tmpfs, roSessions bool
+	under, rwUnder := 0, 0
 	for _, l := range strings.Split(string(raw), "\n") {
 		f := strings.Fields(l)
 		if len(f) < 4 {
@@ -261,7 +293,19 @@ func shadowCheckMounts(home string) error {
 					roSessions = true
 				}
 			}
+		default:
+			// live mode: the real day directories (and today's rollouts)
+			// are mounted read-only one by one under a writable sessions/
+			if strings.HasPrefix(f[1], filepath.Join(home, "sessions")+"/") {
+				under++
+				if !slices.Contains(strings.Split(f[3], ","), "ro") {
+					rwUnder++
+				}
+			}
 		}
+	}
+	if !roSessions && under > 0 && rwUnder == 0 {
+		roSessions = true
 	}
 	if !tmpfs || !roSessions {
 		return fmt.Errorf("%s must be a tmpfs (got %v) and %s/sessions a read-only mount (got %v)", home, tmpfs, home, roSessions)

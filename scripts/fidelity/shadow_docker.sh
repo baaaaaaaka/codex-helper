@@ -15,21 +15,58 @@ gomod=${GOMODCACHE_HOST:-$HOME/go/pkg/mod}
 gocache=${GOCACHE_HOST:?set GOCACHE_HOST to a writable Go build cache}
 mkdir -p "$out"
 scope_name=${SHADOW_SCOPE_NAME:-$(basename "$scope")}
+# The sessions tree, read-only. In live mode the test writes one rollout of
+# its own, so sessions/ is then part of the tmpfs Codex home and the real
+# tree is mounted read-only below it: each month directory, each day of the
+# current UTC month, and each rollout of today's UTC day directory (which
+# stays writable). Nothing else of ~/.codex is mounted.
+sess_mounts=(-v "$sessions":"$sessions":ro)
+if [ "$mode" = live ]; then
+  sess_mounts=()
+  month=$(date -u +%Y/%m); today=$(date -u +%Y/%m/%d)
+  while IFS= read -r d; do
+    rel=${d#"$sessions"/}
+    if [ "$rel" = "$month" ]; then
+      while IFS= read -r day; do
+        if [ "${day#"$sessions"/}" = "$today" ]; then
+          while IFS= read -r f; do sess_mounts+=(-v "$f":"$f":ro); done < <(find "$day" -maxdepth 1 -type f)
+        else
+          sess_mounts+=(-v "$day":"$day":ro)
+        fi
+      done < <(find "$d" -mindepth 1 -maxdepth 1 -type d | sort)
+    else
+      sess_mounts+=(-v "$d":"$d":ro)
+    fi
+  done < <(find "$sessions" -mindepth 2 -maxdepth 2 -type d | sort)
+  if find "$sessions" -mindepth 1 -maxdepth 2 -type f | grep -q .; then
+    echo "unexpected files above the month directories of $sessions" >&2; exit 2
+  fi
+fi
+uid=$(id -u); gid=$(id -g)
+user=(--user "$uid:$gid")
+cmd=(go test -count=1 -json -timeout 5h -run '^TestShadowRealData$' ./internal/e2e/scenarios/entry/)
+if [ "$mode" = live ]; then
+  # Docker creates the mount points' parents in the tmpfs as root: hand
+  # those few directories (never the mounts) to the user, then drop root.
+  user=(--user 0:0)
+  dirs=("$sessions" "$sessions/$(date -u +%Y)" "$sessions/$(date -u +%Y/%m)" "$sessions/$(date -u +%Y/%m/%d)")
+  cmd=(sh -c 'for d in "$@"; do [ -d "$d" ] && [ ! -L "$d" ] && chown '"$uid:$gid"' "$d"; done; exec setpriv --reuid='"$uid"' --regid='"$gid"' --clear-groups '"$(printf '%q ' "${cmd[@]}")" sh "${dirs[@]}")
+fi
 name="cxp-shadow-$$-$RANDOM"
 start=$(date +%s.%N)
 set +e
-docker run --rm --name "$name" --network=none --user "$(id -u):$(id -g)" \
+docker run --rm --name "$name" --network=none "${user[@]}" \
   --cpus=24 --memory=40g --pids-limit=8192 \
   -v "$src":/src:ro -v "$gomod":/gomod:ro -v "$gocache":/gocache \
   -v "$scope":/real/"$scope_name":ro -v "$seed":/seed/seed.jsonl.gz:ro -v "$out":/out \
-  --tmpfs "$codex_home":rw,size=256m,uid="$(id -u)",gid="$(id -g)",mode=0700 -v "$sessions":"$sessions":ro \
+  --tmpfs "$codex_home":rw,size=256m,uid="$(id -u)",gid="$(id -g)",mode=0700 "${sess_mounts[@]}" \
   --tmpfs /tmp:rw,exec,size=24g --tmpfs /home/t:rw,size=2g \
   -e HOME=/home/t -e GOMODCACHE=/gomod -e GOCACHE=/gocache -e GOFLAGS=-mod=readonly \
   -e GOPROXY=off -e GOTOOLCHAIN=local -e GOTELEMETRY=off -e CXP_RUNTIME_DISABLE=1 -e TMPDIR=/tmp \
   -e E2E_SUT=cxp -e E2E_SHADOW_STORE=/real/"$scope_name" -e E2E_SHADOW_SEED=/seed/seed.jsonl.gz \
   -e E2E_SHADOW_CODEX_HOME="$codex_home" -e E2E_SHADOW_OUT=/out -e E2E_SHADOW_MODE="$mode" -e E2E_SHADOW_IDLE="$idle" \
-  -e E2E_SHADOW_KILL_AFTER="${E2E_SHADOW_KILL_AFTER:-800}" \
-  -w /src golang:1.25.11-bookworm go test -count=1 -json -timeout 5h -run '^TestShadowRealData$' ./internal/e2e/scenarios/entry/ > "$out/test.json" 2> "$out/test.err"
+  -e E2E_SHADOW_KILL_AFTER="${E2E_SHADOW_KILL_AFTER:-800}" -e E2E_SHADOW_LIVE_AFTER="${E2E_SHADOW_LIVE_AFTER:-1500}" \
+  -w /src golang:1.25.11-bookworm "${cmd[@]}" > "$out/test.json" 2> "$out/test.err"
 rc=$?
 set -e
 end=$(date +%s.%N)

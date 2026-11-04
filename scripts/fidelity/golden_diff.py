@@ -10,7 +10,8 @@ Inputs (all JSONL, produced by the harnesses described in README-fidelity):
   --rc59-outbox     rc.59 render of the same rows
   --new-outbox      new-core render of the same bodies
   --sent            the sent rows themselves (kind, body)
-  --now             the conversion time (120-day window)
+  --now             the conversion time (120-day window; 2020-01-01T00:00:00Z
+                    for none, as the core has no window any more)
 
 Writes a JSON summary (--out) and examples (--examples).
 
@@ -34,7 +35,6 @@ TAG = re.compile(r"<(/?)([a-zA-Z0-9]+)[^>]*>")
 SHAPE_TAGS = {"p", "pre", "code", "ul", "ol", "li", "table", "tr", "td", "th", "strong", "b", "em", "i", "a",
               "h1", "h2", "h3", "h4", "h5", "h6", "blockquote", "br", "img", "hr", "del", "s"}
 OLD_LABELS = ["🧑‍💻 User", "🤖 ✅ Codex answer", "🤖 ⏳ Codex status", "🔧 Helper", "💻 Code", "🤖 🛠️ Codex command"]
-NEW_LABELS = ["User", "Codex", "🔧 Helper"]
 FOOTER = re.compile(r"<p><strong>🔧 Helper:</strong> ✅ Codex finished responding\.(?: <at[^>]*>[^<]*</at>)?</p>$")
 HEADER = re.compile(r"^<p><strong>([^<]*?)(?: \[part \d+/\d+\])?:</strong>")
 MARKER = re.compile(r"<!-- codex-helper-outbox:[^>]*-->")
@@ -166,18 +166,19 @@ def transcript_diff(a, horizon, ex):
             continue
         r["parts"].sort()
         k = r["kind"]
-        fam = {"user": "U", "assistant": "F"}.get(k, k)
+        # U prompt, F final, S status (commentary), C compaction notice
+        fam = {"user": "U", "assistant": "F", "status": "S", "compact": "C"}.get(k, k)
         if k == "assistant" and r["phase"] != "final_answer":
             fam = "assistant-" + (r["phase"] or "nophase")
         res["old_posted_records_by_kind"][fam] += 1
-        if fam in ("U", "F"):
+        if fam in ("U", "F", "S", "C"):
             idx[(r["conv"], fam, norm_text(r["body"]))].append(r)
     used = set()
     for d in new:
         if d.get("skipped"):
             res["selection"]["new:not-posted:" + d["skipped"]] += 1
             continue
-        fam = "U" if d["user"] else "F"
+        fam = {"prompt": "U", "final": "F", "status": "S", "compact": "C"}.get(d.get("kind") or "", "U" if d["user"] else "F")
         res["new_posted_by_kind"][fam] += 1
         text = norm_text(d["text"])
         cands = [r for r in idx.get((d["conv"], fam, text), []) if id(r) not in used]

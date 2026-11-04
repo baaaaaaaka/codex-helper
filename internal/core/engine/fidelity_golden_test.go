@@ -125,7 +125,7 @@ func fidelityTranscript(t *testing.T, e *Engine, enc *json.Encoder) {
 			}
 			for _, o := range tr.Feed(lines) {
 				rec := map[string]any{"conv": s.Conv, "path": s.Path, "end": o.End, "record_id": o.RecordID,
-					"user": o.User, "turn": o.TurnID, "ts": o.Time.UTC().Format(time.RFC3339Nano), "text": o.Text}
+					"user": o.User, "kind": string(o.Kind), "turn": o.TurnID, "ts": o.Time.UTC().Format(time.RFC3339Nano), "text": o.Text}
 				thread := tr.ThreadID()
 				if thread == "" {
 					thread = s.Thread
