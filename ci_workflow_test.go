@@ -74,7 +74,6 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 		"Teams app-server probe (Windows)",
 		"Codex upgrade integration (system npm, Windows)",
 		"Codex upgrade integration (managed npm with unrelated PATH Codex, Windows)",
-		"Teams target-account PATH Codex upgrade (Windows)",
 		"Codex approval, history, and cancellation runtime integration (Windows)",
 		"Native managed-node install integration (Windows)",
 	} {
@@ -83,39 +82,15 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 			"if: matrix.shard == 'windows-codex-e2e' && runner.os == 'Windows'",
 		)
 	}
-	for _, name := range []string{
-		"Teams recreate and full-history race regressions (Linux only)",
-		"Cross-compile check (Linux only)",
-		"Teams Graph 429 stress (Linux only)",
-	} {
-		step := workflowStepBlock(t, targetedJob, name)
-		requireStepContains(t, step,
-			"if: matrix.shard == 'ubuntu-stress' && runner.os == 'Linux'",
-		)
-	}
-	statePerf := workflowStepBlock(t, targetedJob, "Teams SQLite store migration and perf regressions")
+	crossCompile := workflowStepBlock(t, targetedJob, "Cross-compile check (Linux only)")
+	requireStepContains(t, crossCompile,
+		"if: matrix.shard == 'ubuntu-stress' && runner.os == 'Linux'",
+	)
+	statePerf := workflowStepBlock(t, targetedJob, "Helper state directory migration regressions")
 	requireStepContains(t, statePerf,
-		"if: matrix.shard == 'state-perf'",
-		"git fetch --force --tags --prune origin",
-		"CODEX_HELPER_REQUIRE_RELEASE_TAG_FIXTURES=1",
+		"if: matrix.shard == 'state-perf' && matrix.partition == 1",
 		"SubprocessMigrationStressCI",
-		"BenchmarkSQLiteManualWALCheckpointHotWrite",
-		"SQLiteRecordTranscript",
-		"TestCXPPerfModelSQLite",
-		"BenchmarkCXPPerfModelSQLiteRealisticMixedUserWALSpikeBreakdown",
 	)
-
-	recoveryJob := workflowJobBlock(t, workflow, "teams-recovery-test")
-	requireStepContains(t, recoveryJob,
-		"name: Teams transcript recovery (${{ matrix.os }} / ${{ matrix.mode }} / partition ${{ matrix.partition }})",
-		`partition_flags=("-partition-count=2" "-partition-index=${{ matrix.partition }}")`,
-	)
-	if strings.Contains(recoveryJob, `partition_flags=("-partition-count=1" "-partition-index=0")`) {
-		t.Fatal("Teams recovery still contains an unsplit Unix partition fallback")
-	}
-	if strings.Count(recoveryJob, `partition_flags=("-partition-count=2"`) != 2 {
-		t.Fatalf("Teams recovery normal and race steps must both select the matrix partition")
-	}
 
 	windowsLifecycle := workflowJobBlock(t, workflow, "windows-proxy-lifecycle")
 	requireStepContains(t, windowsLifecycle,
@@ -142,10 +117,9 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 	}
 	collector := string(collectorData)
 	requireStepContains(t, collector,
-		"frontier_recovery_pattern='^TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover$'",
 		"migration_process_pattern='^TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup$'",
-		"test -timeout=20m -parallel=16 -skip \"$isolated_skip_pattern\" -coverprofile=\"$coverage_file\" ./...",
-		"test ./internal/teams -timeout=2m -parallel=16 -count=1 -run \"$frontier_recovery_pattern\"",
+		"*/internal/e2e/scenarios/*) ;;",
+		"test -timeout=20m -parallel=16 -skip \"$isolated_skip_pattern\" -coverprofile=\"$coverage_file\" \"${packages[@]}\"",
 		"test ./internal/cli -timeout=2m -parallel=16 -count=1 -run \"$migration_process_pattern\"",
 		"status=${PIPESTATUS[0]}",
 		"failures+=(\"$label\")",
@@ -155,7 +129,7 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 	requireStepContains(t, nonLinuxTest,
 		"if: runner.os != 'Linux'",
 		"shell: bash",
-		"go run ./scripts/ci/run_full_go_test_shards.go -timeout=20m -parallel=16 -shards=16 -partition-count=2 -partition-index=\"${{ matrix.partition }}\"",
+		"go run ./scripts/ci/run_full_go_test_shards.go -timeout=20m -parallel=16 -shards=16 -partition-count=2 -partition-index=\"${{ matrix.partition }}\" -exclude-prefix=github.com/baaaaaaaka/codex-helper/internal/e2e/scenarios/",
 		"Test/Example/Fuzz",
 	)
 	if strings.Contains(nonLinuxTest, "go test -timeout=20m -parallel=16 ./...") {
@@ -176,7 +150,15 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 		"name: Race test (ubuntu-latest / partition ${{ matrix.partition }})",
 		"partition: [0, 1, 2, 3, 4, 5, 6, 7]",
 		"timeout-minutes: 45",
-		"go run ./scripts/ci/run_full_go_test_shards.go -race -timeout=30m -parallel=16 -shards=16 -partition-count=8 -partition-index=\"${{ matrix.partition }}\"",
+		"go run ./scripts/ci/run_full_go_test_shards.go -race -timeout=30m -parallel=16 -shards=16 -partition-count=8 -partition-index=\"${{ matrix.partition }}\" -exclude-prefix=github.com/baaaaaaaka/codex-helper/internal/e2e/scenarios/",
+		"go test -race -count=1 -timeout=20m ./internal/core/... ./internal/channel/...",
+	)
+
+	e2eJob := workflowJobBlock(t, workflow, "e2e")
+	requireStepContains(t, e2eJob,
+		"runs-on: ubuntu-latest",
+		"E2E_SUT: cxp",
+		"go test -count=1 -timeout=600s ./internal/e2e/scenarios/...",
 	)
 
 	distroJob := workflowJobBlock(t, workflow, "linux-distro-smoke")
@@ -197,31 +179,18 @@ func TestCIWorkflowFullTestStepsRunInParallelWithoutWeakeningRequiredChecks(t *t
 	requireStepContains(t, aggregateJob,
 		"name: Test",
 		"- targeted-test",
+		"- e2e",
 		"- full-go-test",
 		"- race-test",
 		"- linux-distro-smoke-build",
 		"- linux-distro-smoke",
 		"if: ${{ always() }}",
 		"check targeted-test \"${{ needs.targeted-test.result }}\"",
+		"check e2e \"${{ needs.e2e.result }}\"",
 		"check full-go-test \"${{ needs.full-go-test.result }}\"",
 		"check race-test \"${{ needs.race-test.result }}\"",
 		"check linux-distro-smoke-build \"${{ needs.linux-distro-smoke-build.result }}\"",
 		"check linux-distro-smoke \"${{ needs.linux-distro-smoke.result }}\"",
-	)
-}
-
-func TestTeamsGraph429StressScriptKeepsCISizedDefaultsVisible(t *testing.T) {
-	data, err := os.ReadFile("scripts/ci/teams_graph_429_stress.sh")
-	if err != nil {
-		t.Fatalf("read teams graph stress script: %v", err)
-	}
-	script := string(data)
-	requireStepContains(t, script,
-		`CODEX_HELPER_TEAMS_GRAPH_429_STRESS_CHATS:=32`,
-		`CODEX_HELPER_TEAMS_GRAPH_429_STRESS_MESSAGES:=6`,
-		`CODEX_HELPER_TEAMS_GRAPH_429_STRESS_ROUNDS:=8`,
-		`CODEX_HELPER_TEAMS_GRAPH_429_STRESS_COUNT:=1`,
-		`Teams Graph 429 stress scale:`,
 	)
 }
 

@@ -1,5 +1,0 @@
-FROM scratch
-
-COPY teams-ownership.test /teams-ownership.test
-
-ENTRYPOINT ["/teams-ownership.test"]

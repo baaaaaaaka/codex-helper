@@ -13,15 +13,15 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 TEAMS_RUNTIME_SHARD = ROOT / "scripts" / "tests" / "run_teams_runtime_safety_shard.sh"
-OWNERSHIP_STRESS_TESTS = ROOT / "internal" / "teams" / "ownership_stress_ci_test.go"
 FULL_GO_TEST_SHARDS = ROOT / "scripts" / "ci" / "run_full_go_test_shards.go"
 LINUX_FULL_GO_TEST_COLLECT = ROOT / "scripts" / "ci" / "run_linux_full_go_test_collect.sh"
+E2E_SCENARIOS_PREFIX = "github.com/baaaaaaaka/codex-helper/internal/e2e/scenarios/"
 
 
 def targeted_job() -> str:
     workflow = WORKFLOW.read_text(encoding="utf-8")
     start = workflow.index("  targeted-test:\n")
-    end = workflow.index("  teams-recovery-test:\n", start)
+    end = workflow.index("  codex-runtime-contract:\n", start)
     return workflow[start:end]
 
 
@@ -118,6 +118,7 @@ class TargetedShardWorkflowTests(unittest.TestCase):
                     command.append("-race")
                 command.extend(
                     [
+                        f"-exclude-prefix={E2E_SCENARIOS_PREFIX}",
                         f"-partition-count={partition_count}",
                         "-partition-index=0",
                         "-list-only",
@@ -152,9 +153,13 @@ class TargetedShardWorkflowTests(unittest.TestCase):
                 self.assertTrue(complete_plan)
                 self.assertTrue(
                     any(
-                        "TestTeamsMainLoopOutboxFairnessCursorWalksPastDistinctChatScanPrefix" in job
+                        "TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup" in job
                         for job in complete_plan
                     )
+                )
+                self.assertFalse(
+                    any("/internal/e2e/scenarios/" in job for job in complete_plan),
+                    "the end-to-end scenarios belong to the e2e job",
                 )
                 if len(complete_plan) != len(set(complete_plan)):
                     self.fail("unpartitioned full-test plan contains duplicate jobs")
@@ -178,6 +183,13 @@ class TargetedShardWorkflowTests(unittest.TestCase):
 
                 for job in partition_plans:
                     self.assertGreater(metadata(job)[0], 0, job)
+                # A single test process cannot be split across runners: the
+                # balance bound is 10% of the load or the largest job,
+                # whichever is larger.
+                largest_job = max(metadata(job)[0] for job in partition_plans)
+
+                def bound(loads: list[int]) -> int:
+                    return max(1, max(loads) // 10, largest_job)
                 exclusive_loads = []
                 parallel_spans = []
                 total_loads = []
@@ -200,10 +212,10 @@ class TargetedShardWorkflowTests(unittest.TestCase):
                     f"exclusive phase estimate is skewed: {exclusive_loads}",
                 )
                 if race and partition_count == 4:
-                    # There are 16 large Teams shards and four workers per
-                    # runner. One runner must receive a fifth shard; assert
-                    # that this is only one extra wave instead of requiring
-                    # an impossible equal span across all partitions.
+                    # Large packages are split into 16 prefix shards and each
+                    # runner has four workers. One runner may receive a fifth
+                    # shard; assert that this is only one extra wave instead
+                    # of requiring an impossible equal span across partitions.
                     largest_parallel = max(metadata(job)[0] for job in partition_plans if not metadata(job)[1])
                     self.assertLessEqual(
                         max(parallel_spans),
@@ -213,17 +225,17 @@ class TargetedShardWorkflowTests(unittest.TestCase):
                 else:
                     self.assertLessEqual(
                         max(parallel_spans) - min(parallel_spans),
-                        max(1, max(parallel_spans) // 10),
+                        bound(parallel_spans),
                         f"parallel phase estimate is skewed: {parallel_spans}",
                     )
                 self.assertLessEqual(
                     max(total_loads) - min(total_loads),
-                    max(1, max(total_loads) // 10),
+                    bound(total_loads),
                     f"estimated total work is skewed: {total_loads}",
                 )
                 if race and partition_count == 4:
-                    # A fifth heavy job is unavoidable with 17 heavy jobs and
-                    # four workers per runner. Keep the bound explicit: no
+                    # A fifth heavy job can be unavoidable with four workers
+                    # per runner. Keep the bound explicit: no
                     # partition may grow beyond two largest-job waves plus its
                     # already-balanced exclusive phase.
                     largest_parallel = max(metadata(job)[0] for job in partition_plans if not metadata(job)[1])
@@ -235,45 +247,14 @@ class TargetedShardWorkflowTests(unittest.TestCase):
                 else:
                     self.assertLessEqual(
                         max(critical_paths) - min(critical_paths),
-                        max(1, max(critical_paths) // 10),
+                        bound(critical_paths),
                         f"estimated critical path is skewed: {critical_paths}",
                     )
-
-    def test_direct_isolated_lane_reports_run_and_pass(self):
-        test_name = "TestTeamsMainLoopOutboxFairnessCursorWalksPastDistinctChatScanPrefix"
-        for race in (False, True):
-            command = ["go", "test", "./internal/teams"]
-            if race:
-                command.append("-race")
-            command.extend(
-                [
-                    "-count=1",
-                    "-timeout=5m",
-                    "-run",
-                    f"^{test_name}$",
-                    "-json",
-                ]
-            )
-            completed = subprocess.run(
-                command,
-                cwd=ROOT,
-                check=True,
-                text=True,
-                capture_output=True,
-            )
-            events = [json.loads(line) for line in completed.stdout.splitlines() if line.strip()]
-            for suffix in ("json", "sqlite"):
-                subtest_name = f"{test_name}/{suffix}"
-                self.assertTrue(any(event.get("Action") == "run" and event.get("Test") == subtest_name for event in events))
-                self.assertTrue(any(event.get("Action") == "pass" and event.get("Test") == subtest_name for event in events))
 
     def test_teams_runtime_safety_uses_one_shared_shard_definition(self):
         script = TEAMS_RUNTIME_SHARD.read_text(encoding="utf-8")
         for shard in (
             "isolation",
-            "store",
-            "store-io",
-            "store-process",
             "service-update",
             "wsl-process",
             "diagnostics",
@@ -328,94 +309,14 @@ class TargetedShardWorkflowTests(unittest.TestCase):
                 job,
             )
         blocks = step_blocks(job)
-        expensive = blocks["Teams SQLite store migration and perf regressions"]
+        expensive = blocks["Helper state directory migration regressions"]
         self.assertIn("if: matrix.shard == 'state-perf'", expensive)
         self.assertNotIn("matrix.partition == 0", expensive)
         for name, block in blocks.items():
-            if name == "Teams SQLite store migration and perf regressions":
+            if name == "Helper state directory migration regressions":
                 continue
             if "matrix.shard == 'state-perf'" in block:
                 self.assertIn("matrix.partition == 0", block, name)
-
-    def test_recovery_manifest_runs_in_parallel_platform_mode_jobs(self):
-        workflow = WORKFLOW.read_text(encoding="utf-8")
-        start = workflow.index("  teams-recovery-test:\n")
-        end = workflow.index("  codex-runtime-contract:\n", start)
-        job = workflow[start:end]
-        self.assertIn(
-            "name: Teams transcript recovery (${{ matrix.os }} / ${{ matrix.mode }} / partition ${{ matrix.partition }})",
-            job,
-        )
-        self.assertIn("os: [ubuntu-latest, macos-latest, windows-latest]", job)
-        self.assertIn("mode: [normal, race]", job)
-        self.assertIn("partition: [0, 1]", job)
-        self.assertNotIn("exclude:", job)
-        self.assertIn("Every hosted OS gets both independent partitions", job)
-        self.assertIn(
-            "go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery -list-only",
-            job,
-        )
-        self.assertIn(
-            "partition_flags=(\"-partition-count=2\" \"-partition-index=${{ matrix.partition }}\")",
-            job,
-        )
-        self.assertNotIn('partition_flags=("-partition-count=1" "-partition-index=0")', job)
-        self.assertEqual(job.count('partition_flags=("-partition-count=2"'), 2)
-        self.assertIn(
-            "go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery \"${partition_flags[@]}\"",
-            job,
-        )
-        self.assertIn(
-            "go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery -race \"${partition_flags[@]}\"",
-            job,
-        )
-        self.assertNotIn("Teams transcript recovery state-machine regressions", targeted_job())
-        aggregate_start = workflow.index("  test:\n")
-        aggregate = workflow[aggregate_start:]
-        self.assertIn("      - teams-recovery-test\n", aggregate)
-        self.assertIn(
-            'check teams-recovery-test "${{ needs.teams-recovery-test.result }}"',
-            aggregate,
-        )
-
-    def test_recovery_jobs_keep_phase_diagnostics_and_resource_contract(self):
-        workflow = WORKFLOW.read_text(encoding="utf-8")
-        start = workflow.index("  teams-recovery-test:\n")
-        end = workflow.index("  codex-runtime-contract:\n", start)
-        job = workflow[start:end]
-        self.assertIn("CODEX_HELPER_CI_PHASE_DIR: ${{ runner.temp }}/teams-recovery-phases", job)
-        self.assertIn("name: Upload Teams recovery phase diagnostics", job)
-        self.assertIn("if: always()", job)
-        self.assertIn("if-no-files-found: ignore", job)
-
-        manifest = json.loads((ROOT / "scripts" / "ci" / "teams_recovery_tests.json").read_text(encoding="utf-8"))
-        self.assertEqual(manifest["version"], 2)
-        allowed = {"pure_cpu", "listener_async", "sqlite_fsync", "host_exclusive"}
-        self.assertTrue(manifest["tests"])
-        for item in manifest["tests"]:
-            self.assertIn(item.get("resource_class"), allowed, item["name"])
-
-    def test_frontier_reopen_fixture_has_durable_io_budget_and_exclusive_phase(self):
-        manifest = json.loads((ROOT / "scripts" / "ci" / "teams_recovery_tests.json").read_text(encoding="utf-8"))
-        item = next(
-            entry
-            for entry in manifest["tests"]
-            if entry["name"] == "TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover"
-        )
-        self.assertEqual(item["backends"], ["json", "sqlite"])
-        self.assertEqual(item["resource_class"], "sqlite_fsync")
-        self.assertTrue(item["exclusive"])
-        self.assertGreaterEqual(item["max_seconds"], 180)
-
-    def test_transient_continuation_fixture_runs_before_recovery_pool(self):
-        manifest = json.loads((ROOT / "scripts" / "ci" / "teams_recovery_tests.json").read_text(encoding="utf-8"))
-        item = next(
-            entry
-            for entry in manifest["tests"]
-            if entry["name"] == "TestTeamsListenFalseGraphContinuationRecoversAfterTransientOutage"
-        )
-        self.assertTrue(item["exclusive"])
-        self.assertEqual(item["resource_class"], "listener_async")
 
     def test_long_full_suite_jobs_use_independent_runner_partitions(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
@@ -433,8 +334,10 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             full,
         )
 
+        self.assertIn(f"-exclude-prefix={E2E_SCENARIOS_PREFIX}", full)
+
         race_start = workflow.index("  race-test:\n")
-        race_end = workflow.index("  runtime-env-contract:\n", race_start)
+        race_end = workflow.index("  e2e:\n", race_start)
         race = workflow[race_start:race_end]
         self.assertIn(
             "name: Race test (ubuntu-latest / partition ${{ matrix.partition }})",
@@ -445,49 +348,26 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             "-partition-count=8 -partition-index=\"${{ matrix.partition }}\"",
             race,
         )
+        self.assertIn(f"-exclude-prefix={E2E_SCENARIOS_PREFIX}", race)
+        self.assertIn(
+            "go test -race -count=1 -timeout=20m ./internal/core/... ./internal/channel/...",
+            race,
+        )
 
-    def test_full_runner_keeps_new_listener_liveness_families_isolated(self):
-        runner = FULL_GO_TEST_SHARDS.read_text(encoding="utf-8")
-        self.assertIn("func autoIsolatedRunnableName", runner)
-        self.assertIn(
-            'strings.HasPrefix(name, "TestTeamsListenFalse")',
-            runner,
-        )
-        self.assertIn(
-            'strings.HasPrefix(name, "TestTeamsMainLoopOutbox")',
-            runner,
-        )
-        self.assertIn(
-            'strings.HasPrefix(name, "TestTeamsOwnershipStress")',
-            runner,
-        )
-        self.assertIn(
-            'strings.HasPrefix(name, "TestTeamsGraph429Stress")',
-            runner,
-        )
-        for name in (
-            "TestProxyStartBackgroundReapsExitedDetachedChild",
-            "TestStartCodexAppProxyDaemonReapsExitedDetachedChild",
-        ):
-            self.assertRegex(runner, rf'"{name}"\s*:\s*true')
-        self.assertIn("runnableIsolationMap(packageName, names)", runner)
-        self.assertIn("runnableExclusivityMap(packageName, names)", runner)
-
-    def test_outbox_fixtures_keep_process_isolation_without_host_exclusivity(self):
-        runner = FULL_GO_TEST_SHARDS.read_text(encoding="utf-8")
-        isolated_start = runner.index("func autoIsolatedRunnableName")
-        isolated_end = runner.index("func isCodexRunnerPackage", isolated_start)
-        isolated = runner[isolated_start:isolated_end]
-        self.assertIn('strings.HasPrefix(name, "TestTeamsMainLoopOutbox")', isolated)
-
-        exclusive_start = runner.index("func autoExclusiveRunnableName")
-        exclusive_end = runner.index("func isCodexRunnerPackage", exclusive_start)
-        exclusive = runner[exclusive_start:exclusive_end]
-        self.assertNotIn('strings.HasPrefix(name, "TestTeamsMainLoopOutbox")', exclusive)
-        self.assertRegex(runner, r'"TestTeamsMainLoopOutboxFairnessCursorWalksPastDistinctChatScanPrefix"\s*:\s*true')
-        self.assertRegex(runner, r'"TestTeamsMainLoopOutboxLedgerFailureDoesNotStarveHealthyTail"\s*:\s*true')
-        self.assertIn("Process isolation protects package globals", runner)
-        self.assertIn("if autoExclusiveRunnableName(packageName, name)", runner)
+    def test_e2e_scenarios_run_once_on_linux_through_the_production_entry_point(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        start = workflow.index("  e2e:\n")
+        end = workflow.index("  runtime-env-contract:\n", start)
+        job = workflow[start:end]
+        self.assertIn("runs-on: ubuntu-latest", job)
+        self.assertNotIn("matrix", job)
+        self.assertIn("E2E_SUT: cxp", job)
+        self.assertIn("go test -count=1 -timeout=600s ./internal/e2e/scenarios/...", job)
+        aggregate = workflow[workflow.index("  test:\n") :]
+        self.assertIn("      - e2e\n", aggregate)
+        self.assertIn('check e2e "${{ needs.e2e.result }}"', aggregate)
+        collector = LINUX_FULL_GO_TEST_COLLECT.read_text(encoding="utf-8")
+        self.assertIn("*/internal/e2e/scenarios/*) ;;", collector)
 
     def test_ubuntu_package_bootstrap_uses_source_isolated_update(self):
         targeted = targeted_job()
@@ -509,27 +389,6 @@ class TargetedShardWorkflowTests(unittest.TestCase):
         self.assertIn(
             "exclusive := runnableExclusivityMap(packageName, names)",
             runner,
-        )
-
-    def test_full_runner_isolates_async_cache_and_audience_budget_fixtures(self):
-        runner = FULL_GO_TEST_SHARDS.read_text(encoding="utf-8")
-        self.assertIn(
-            'strings.HasPrefix(name, "TestTeamsThirdPartyCacheStress")',
-            runner,
-        )
-        self.assertIn(
-            'name == "TestTeamsWorkChatAudienceLookupUsesPollBudget"',
-            runner,
-        )
-        self.assertIn("Cache-stress and audience-admission", runner)
-
-    def test_full_runner_isolates_cross_backend_legacy_owner_fixture(self):
-        runner = FULL_GO_TEST_SHARDS.read_text(encoding="utf-8")
-        fixture_name = "TestStoreOwnerBindsLegacyQueuedTurnAndRejectsPreviousOwnerCallbacks"
-        self.assertEqual(
-            runner.count(f'"{fixture_name}"'),
-            2,
-            f"{fixture_name} must be both process-isolated and host-exclusive",
         )
 
     def test_ci_serializes_superseded_runs_and_keeps_failure_evidence(self):
@@ -554,7 +413,7 @@ class TargetedShardWorkflowTests(unittest.TestCase):
         self.assertNotIn("isolated internal/cli retry", full)
 
         race_start = workflow.index("  race-test:\n")
-        race_end = workflow.index("  runtime-env-contract:\n", race_start)
+        race_end = workflow.index("  e2e:\n", race_start)
         race = workflow[race_start:race_end]
         self.assertIn('tee "$RUNNER_TEMP/race-test.log"', race)
         self.assertIn("Upload race diagnostics", race)
@@ -577,24 +436,12 @@ class TargetedShardWorkflowTests(unittest.TestCase):
         self.assertIn('flag.Int("partition-index", 0', runner)
         self.assertIn("jobs = partitionTestJobs(jobs, *partitionCount, *partitionIndex)", runner)
         self.assertIn("func partitionTestJobs", runner)
+        self.assertIn('flag.Var(&excludedPrefixes, "exclude-prefix"', runner)
+        self.assertIn("packages = excludePackages(packages, excludedPrefixes)", runner)
 
-        manifest = (ROOT / "scripts" / "ci" / "check_teams_recovery_manifest.go").read_text(encoding="utf-8")
-        self.assertIn('flag.Int("partition-count", 1', manifest)
-        self.assertIn('flag.Int("partition-index", 0', manifest)
-        self.assertIn("selected = partitionManifestTests(selected, *partitionCount, *partitionIndex)", manifest)
-        self.assertIn("func partitionManifestTests", manifest)
-
-    def test_full_go_runner_isolates_listener_liveness_fixture_from_shard_pool(self):
+    def test_full_go_runner_isolates_runtime_process_identity_fixture(self):
         runner = FULL_GO_TEST_SHARDS.read_text(encoding="utf-8")
-        fixtures = (
-            "TestTeamsListenFalseGraphWorkerSaturationPreservesHealthyPoll",
-            "TestTeamsListenFalseGraphHeadFailureDoesNotStarveHealthyTail",
-            "TestTeamsListenFalseLinkedTranscriptFullPoolDoesNotStarveHealthyTail",
-            "TestTeamsListenFalseStartupHeartbeatProtectsSlowInitialization",
-            "TestTeamsListenFalseUntrustedSQLiteLeaseHoldsAndRecovers",
-            "TestSQLiteActiveJSONSessionSurvivesStaleSQLStatus",
-            "TestRuntimeProcessIdentityWindows",
-        )
+        fixtures = ("TestRuntimeProcessIdentityWindows",)
         for fixture_name in fixtures:
             fixture = f'"{fixture_name}"'
             self.assertEqual(
@@ -620,6 +467,10 @@ for arg in "$@"; do
   esac
 done
 printf '%s\n' "$*" >> "$CXP_FAKE_GO_CALLS"
+if [[ "${1:-}" == list ]]; then
+  printf '%s\n' example.com/m/internal/cli example.com/m/internal/e2e/scenarios/turns example.com/m/internal/e2e/harness
+  exit 0
+fi
 if [[ -n "$profile" ]]; then
   mkdir -p "$(dirname "$profile")"
   printf 'mode: set\nfake.go:1.1,1.2 1 1\n' > "$profile"
@@ -653,73 +504,22 @@ echo 'ok'
 
             self.assertNotEqual(completed.returncode, 0, completed.stdout + completed.stderr)
             invocations = calls.read_text(encoding="utf-8").splitlines()
-            self.assertEqual(len(invocations), 6, invocations)
-            self.assertIn("./...", invocations[0])
-            self.assertIn("./internal/teams/store", invocations[-1])
+            self.assertEqual(len(invocations), 3, invocations)
+            self.assertEqual("list ./...", invocations[0])
+            # The end-to-end scenarios run in their own job.
+            self.assertIn("example.com/m/internal/cli", invocations[1])
+            self.assertIn("example.com/m/internal/e2e/harness", invocations[1])
+            self.assertNotIn("/internal/e2e/scenarios/", invocations[1])
+            self.assertIn("./internal/cli", invocations[-1])
             for log_name in (
                 "full-go-test.log",
-                "frontier-recovery-isolated.log",
                 "migration-process-isolated.log",
-                "external-perf-isolated.log",
-                "teams-durable-isolated.log",
-                "store-durable-isolated.log",
             ):
                 self.assertTrue((temp / "runner-temp" / log_name).is_file(), log_name)
             coverage = (temp / "coverage.out").read_text(encoding="utf-8").splitlines()
             self.assertEqual(coverage.count("mode: set"), 1)
-            self.assertEqual(len(coverage), 7)
-            self.assertIn("Isolated store durable", completed.stdout)
-
-    def test_full_go_runner_isolates_sqlite_compatibility_window_fixtures(self):
-        runner = FULL_GO_TEST_SHARDS.read_text(encoding="utf-8")
-        fixtures = (
-            "TestBridgePollOnceDispositionsOnlyCorruptDurableSession",
-            "TestSQLiteHotPollCorruptProbeRejectsNonRFC3339Times",
-            "TestSQLiteHotPollCorruptSessionWithOpaquePollIsFencedAcrossReopen",
-            "TestSQLiteHotPollCanonicalFallbackReleasesStoreLockDuringRead",
-            "TestSQLiteHotPollStandaloneCanonicalFallbackReleasesStoreLockDuringRead",
-            "TestSQLiteInterruptedOutboxProjectionAuditLeavesAuditingAndCanResume",
-            "TestSQLiteNullableTeamsMessageProjectionDoesNotHideUnknownOutbox",
-            "TestSQLiteOutboxProjectionPreparationDoesNotStarveOwnerHeartbeat",
-            "TestSQLiteHotPollReadGateCanonicalFallbackKeepsLocalReceiptWithStaleScalar",
-            "TestSQLiteHotPollWorkAdmissionRecoversStaleProjectionGeneration",
-            "TestSQLiteOutboxProjectionGuardRevokesNativeTrust",
-            "TestSQLiteOwnerMigrationRejectsSourceChangeBeforePointerPublication",
-            "TestSQLiteOwnerOutboxProjectionAuditClaimTokenFencesTakeoverOverlap",
-            "TestSQLiteFullAcceptedOutboxCASRecoversAfterCapacityReturns",
-            "TestSQLiteStoreCloseReleasesStateLockForImmediateReopen",
-            "TestEarlierUnsentOutboxKeepsSameTurnAmbiguousPredecessor",
-            "TestTeamsSameChatDefinitiveSendFailureDoesNotStarveLaterOutbox",
-            "TestSendQueuedOutboxFallsBackToControlMentionAfterDefiniteWebhookFailureSQLite",
-            "TestTeamsOutboxPredecessorMutationRefreshesFIFOSnapshotSQLite",
-            "TestBridgeMainLoopOutboxFlushUsesSmallBudget",
-            "TestTeamsMainLoopOutboxRotatesBeyondFirstTwoChats",
-            "TestBridgeAttachmentUploadSession429RecordsWriteGateWithoutReplay",
-            "TestBridgeFlushPendingOutboxSerializesConcurrentFlushes",
-            "TestCXPPerfModelSQLiteProfilesCoverUpgradeOperations",
-        )
-        for fixture_name in fixtures:
-            fixture = f'"{fixture_name}"'
-            self.assertEqual(
-                runner.count(fixture),
-                2,
-                f"{fixture_name} must be both process-isolated and host-exclusive",
-            )
-
-    def test_full_go_runner_isolates_machine_delegation_cancellation_fixture(self):
-        runner = FULL_GO_TEST_SHARDS.read_text(encoding="utf-8")
-        fixture_name = "TestBridgeMachineDelegationWorkerCancelsRunningExecution"
-        self.assertEqual(
-            runner.count(f'"{fixture_name}"'),
-            2,
-            f"{fixture_name} must be both process-isolated and host-exclusive",
-        )
-        targeted = targeted_job()
-        self.assertIn(f"-skip '^{fixture_name}$'", targeted)
-        self.assertIn(
-            f"go test ./internal/teams -count=1 -parallel=1 -run '^{fixture_name}$' -v",
-            targeted,
-        )
+            self.assertEqual(len(coverage), 3)
+            self.assertIn("Isolated migration process", completed.stdout)
 
     def test_full_go_runner_isolates_cli_process_group_fixture(self):
         runner = FULL_GO_TEST_SHARDS.read_text(encoding="utf-8")
@@ -771,20 +571,12 @@ echo 'ok'
             "Teams Codex runner classification regressions": "core-b",
             "Teams metadata-only resume and final integrity regressions": "core-b",
             "Teams user-marker compact and fallback regressions": "core-b",
-            "Teams thread recovery and self-echo regressions": "core-b",
-            "Teams frontier recovery and fenced-page regressions": "core-b",
-            "Teams bridge scheduling and history sync regressions": "core-b",
-            "Teams recreate and full-history race regressions (Linux only)": "ubuntu-stress",
             "Cross-compile check (Linux only)": "ubuntu-stress",
-            "Teams Graph 429 stress (Linux only)": "ubuntu-stress",
-            "Teams SQLite row-level migration regressions": "state-perf",
             "CXP preview SQLite correctness, concurrency, and write budgets": "state-perf",
             "CXP preview SQLite actual syscall write budget (Linux only)": "state-perf",
-            "Teams runtime safety resolver syscall budget": "state-perf",
-            "Teams runtime safety real-process, SIGKILL, and disk-full boundaries": "state-perf",
             "CXP cache v2 real NFS concurrency smoke (Linux only)": "state-perf",
-            "Teams SQLite store migration and perf regressions": "state-perf",
-            "Teams perf benchmark smoke": "state-perf",
+            "Helper state directory migration regressions": "state-perf",
+            "Codex runner benchmark smoke": "state-perf",
             "Skills local git smoke (Windows)": "windows-skills-desktop",
             "Codex desktop app Windows build and policy regressions": "windows-skills-desktop-b",
             "Codex desktop app managed runtime smoke (Windows)": "windows-skills-desktop-b",
@@ -793,7 +585,6 @@ echo 'ok'
             "Teams app-server probe (Windows)": "windows-codex-e2e",
             "Codex upgrade integration (system npm, Windows)": "windows-codex-e2e",
             "Codex upgrade integration (managed npm with unrelated PATH Codex, Windows)": "windows-codex-e2e",
-            "Teams target-account PATH Codex upgrade (Windows)": "windows-codex-e2e",
             "Codex approval, history, and cancellation runtime integration (Windows)": "windows-codex-e2e",
             "Native managed-node install integration (Windows)": "windows-codex-e2e",
         }
@@ -804,39 +595,6 @@ echo 'ok'
                 name,
             )
 
-    def test_state_perf_keeps_fixture_and_runtime_commands_together(self):
-        blocks = step_blocks(targeted_job())
-        state = blocks["Teams SQLite store migration and perf regressions"]
-        self.assertIn("git fetch --force --tags --prune origin", state)
-        self.assertIn("CODEX_HELPER_REQUIRE_RELEASE_TAG_FIXTURES=1", state)
-        self.assertIn("OfficialRelease(StoresUpgradeToCurrent|FixtureListCoversStableTags)", state)
-        self.assertIn("SubprocessMigrationStressCI", state)
-        self.assertIn("BenchmarkSQLiteManualWALCheckpointHotWrite", state)
-        self.assertIn("TestCXPPerfModelSQLite", state)
-        self.assertIn("BenchmarkCXPPerfModelSQLiteRealisticMixedUserWALSpikeBreakdown", state)
-        self.assertIn("Benchmark(GlobalOutboundLedgerRecord|GlobalInboundLedgerClaim|ControlChatHistoryAppend)", state)
-
-    def test_teams_ownership_stress_gate_is_strict_and_nonempty(self):
-        blocks = step_blocks(targeted_job())
-        block = blocks["Teams ownership stress regressions"]
-        smoke = (ROOT / "scripts" / "ci" / "teams_ownership_stress_docker_smoke.sh").read_text(encoding="utf-8")
-        self.assertIn("bash scripts/ci/teams_ownership_stress_docker_smoke.sh", block)
-        self.assertIn("CODEX_HELPER_TEAMS_OWNERSHIP_STRESS_STRICT=1", smoke)
-        self.assertIn("-test.run '^TestTeamsOwnershipStress'", smoke)
-        self.assertTrue((ROOT / "scripts" / "ci" / "Dockerfile.teams-ownership-stress").is_file())
-        tests = re.findall(r"^func (TestTeamsOwnershipStress\w*)\(", OWNERSHIP_STRESS_TESTS.read_text(encoding="utf-8"), re.MULTILINE)
-        self.assertGreater(len(tests), 0)
-
-    def test_targeted_poll_selectors_match_current_test_names(self):
-        workflow = WORKFLOW.read_text(encoding="utf-8")
-        self.assertNotIn("SkipsExplicitParkedPollWithStaleContinuation", workflow)
-        self.assertNotIn("RecoversStaleWorkContinuationErrorWithTerminalHead", workflow)
-        self.assertNotIn("RecoversStaleContinuationErrorWithTerminalHead", workflow)
-        self.assertIn("KeepsExplicitParkedPollBlockedUntilRetryDeadline", workflow)
-        self.assertIn("PreservesStaleWorkContinuationWithTerminalHead", workflow)
-        self.assertIn("PreservesStaleContinuationWithTerminalHead", workflow)
-        self.assertIn("ProbesAlreadyParkedNoticeSentWithoutFreezeRewrite", workflow)
-
     def test_windows_codex_e2e_installs_before_runtime_consumers(self):
         job = targeted_job()
         ordered_steps = [
@@ -844,7 +602,6 @@ echo 'ok'
             "Teams app-server probe (Windows)",
             "Codex upgrade integration (system npm, Windows)",
             "Codex upgrade integration (managed npm with unrelated PATH Codex, Windows)",
-            "Teams target-account PATH Codex upgrade (Windows)",
             "Codex approval, history, and cancellation runtime integration (Windows)",
             "Native managed-node install integration (Windows)",
         ]

@@ -18,7 +18,7 @@ concurrency:
 
 jobs:
   teams-math-runtime:
-    name: Teams math and managed font runtime (${{ matrix.os }})
+    name: Teams rendering and math fallbacks (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -35,23 +35,13 @@ jobs:
           go-version: "1.25.11"
           cache: true
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-
-      - name: Trusted TeX, Hosted Content, managed font, and cache regressions
+      - name: Safe TeX, rendering, hosted content, and math font regressions
         shell: bash
         run: |
           set -euo pipefail
-          go test ./internal/teams -count=1 -run 'Math|HostedContent' -v
-
-      - name: Actual MathJax, resvg, and managed font runtime
-        shell: bash
-        run: |
-          set -euo pipefail
-          bash scripts/ci/retry.sh 3 5 env CODEX_HELPER_TEST_TEAMS_MATH_RUNTIME=1 \
-            go test ./internal/teams -count=1 -run '^TestManagedTeamsMathRendererLive$' -v
+          # The math renderer and its font are exercised through stand-in
+          # binaries and a local server; nothing is downloaded.
+          go test ./internal/channel/teams -count=1 -run 'Math|TeX|Render|Hosted' -v
 
   proxy-recovery-loopback:
     name: Proxy recovery loopback fault lab (${{ matrix.os }})
@@ -269,7 +259,7 @@ jobs:
           - os: macos-latest
             shard: windows-codex-e2e
         # The state/performance shard contains a long, independent sequence of
-        # SQLite migration and benchmark processes.  Keep the normal targeted
+        # helper state directory migration processes.  Keep the normal targeted
         # matrix intact and add only a second state/perf runner for that
         # sequence; the other state/perf checks remain single-runner tests.
         include:
@@ -479,22 +469,6 @@ jobs:
           go test ./internal/codexrunner -count=1 -run '^Test(AppServerLaunchContext|AppServerRunnerForkThread)' -v
           go test ./internal/cli -count=1 -run '^Test(Run(CodexForkSession|HistoryTuiForksOnlyValidatedMainSelection)|TeamsCodexExecutorReconcileForkThread)' -v
           go test ./internal/tui -count=1 -run '^TestHandleKeyForksOnlyMainSession$' -v
-          go test ./internal/teams/store -count=1 -run '^Test(BeginFork|ClaimForkOperation|MarkForkNativeIntentRequiresClearParentExecutionAcrossBackends|Fork|BlockedAmbiguousFork)' -v
-          go test ./internal/teams -count=1 -run '^TestFork' -v
-
-      - name: Teams Codex fork Docker smoke (Linux only)
-        if: matrix.shard == 'core' && runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-          bash scripts/ci/teams_codex_fork_docker_smoke.sh
-
-      - name: Teams Codex fork Compose fault matrix (Linux only)
-        if: matrix.shard == 'core' && runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-          bash scripts/ci/teams_codex_fork_compose_smoke.sh
 
       - name: Managed install convergence regressions
         if: matrix.shard == 'platform-integration'
@@ -576,132 +550,30 @@ jobs:
           set -euo pipefail
           go test ./internal/localproxy -count=1 -run 'TestHTTPProxy(RejectsSelfLoopTargets|ServeHTTPRejectsSelfLoopTargets|SelfTargetDetection)$' -v
 
-      - name: Teams control and work chat rename regressions
-        if: matrix.shard == 'core'
-        shell: bash
-        run: |
-          set -euo pipefail
-          go test ./internal/teams -count=1 -run 'Test(ChatTitlesUseDistinctLeadingEmoji|ParseControlDashboardCommandsDoNotRequireCodex|ParseRenameHostnameArgumentPreservesRegularRenameTitles|Bridge(ControlRenameUpdatesTeamsTopicAndDurableState|RenameHostnameUpdatesControlAndWorkChatTopics|EnsureControlChat(DoesNotAdoptExistingSingleMemberMeetingByTitleWithoutLocalBinding|PreservesUserControlTitle|RestoresPersistedUserControlTitle|BackfillsUserControlTitleIntoPartialDurableBinding|RenamesOldControlTopic)|SessionRenameUpdatesTeamsTopicAndDurableState))$' -v
-
-      - name: Teams user annotation failure isolation regressions
-        if: matrix.shard == 'core'
-        shell: bash
-        run: |
-          set -euo pipefail
-          go test ./internal/teams -count=1 -run 'TestBridgeAnnotate(IncomingUserMessageDoesNotMirrorWhenGraphUpdateFails|AttachmentPatchFailureDoesNotDisableTextAnnotationsOrMirror|ASRPatchFailureDoesNotDisableTextAnnotations)$' -v
-
-      - name: Teams group chat guard regressions
-        if: matrix.shard == 'core'
-        shell: bash
-        run: |
-          set -euo pipefail
-          group_guard_pattern='Test(Bridge(Group(WorkChat|Guard).*|PreFinalStatusBackfill.*|SingleMemberQueuesStatusBeforeFinal.*|ActiveTurnTranscriptFinalCheckpoint.*)|Graph(CreateGroupChatUsesConfiguredMembers|SendHTMLReplyWithQuoteUsesReplyAction))$'
-          bench_pattern='Test(ValidateMembersRequiresExactOwnerAndTestUser|BenchSummaryPredicates|SanitizeMarkerKeepsGraphBenchNonceStable)$'
-          go test ./internal/teams -count=1 -run "$group_guard_pattern" -v
-          go test ./cmd/teams-graph-bench -count=1 -run "$bench_pattern" -v
-
       - name: Teams cross-machine registry regressions
         if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
-          go test ./internal/teams/delegation -count=1 -v
-          go test ./internal/teams/machineregistry -count=1 -v
-          go test ./cmd/teams-registry-probe -count=1 -v
+          go test ./internal/core/delegate/... -count=1 -v
+          go test ./internal/core/engine -count=1 -run 'Registry|Delegat' -v
           go test ./internal/cli -count=1 -run 'Test(Delegate|CandidatesFromMachineStatuses|RootCommandWiresExpectedSubcommandsAndFlags|RootUpgradeCodexApp)' -v
-          # Match the full-test runner's clean-process boundary for the short
-          # asynchronous durable cancellation observation.
-          go test ./internal/teams -count=1 -skip '^TestBridgeMachineDelegationWorkerCancelsRunningExecution$' -run 'Test(BridgeMachine(Registry|Delegation).*|Graph(CreateOrGetMeetingChat(UsesStableExternalID|WindowUsesProvidedWindow)|OnlineMeetingWindowRefresh))$' -v
-          go test ./internal/teams -count=1 -parallel=1 -run '^TestBridgeMachineDelegationWorkerCancelsRunningExecution$' -v
 
-      - name: Responses adapter provider compatibility regressions
-        if: matrix.shard == 'core'
-        shell: bash
-        run: |
-          set -euo pipefail
-          go test ./internal/responsesadapter -count=1 -run 'Test(UsageMarshalIncludesZeroCachedTokens|ProviderProfileReasoningEffortMapsXHighByProvider|OpenAIChatAdapter(HandlesUsageWithoutPromptTokenDetails|AppliesDeepSeekProviderProfile)|Facade(CompletedUsageIncludesZeroCachedTokens|ShellPolicy.*|ForwardsExplicitConversionOperationFields)|ProviderRegistryPinsConversionProfileInRuntime|DefaultUpstreamHTTPClientTimesOutWaitingForResponseHeaders|OpenAIChatAdapterEmitsErrorWhenSSEBodyStaysIdle|NewUpstreamHTTPClientConfiguresBoundedProxyTransport|AnthropicConverter(BuildsMessagesRequestAndParsesBufferedResponse|ParsesSSEWithoutDuplicateDone)|DeepSeekBeta(ConverterUsesFIMWireShape|FIMSSERequiresDoneMarker)|ConfiguredAdapterRejects(Unknown|Mismatched)ConversionProfile)$' -v
-
-      - name: External catalog conversion contract regressions
-        if: matrix.shard == 'core'
-        shell: bash
-        run: |
-          set -euo pipefail
-          go test ./internal/config -count=1 -run '^Test(ModelCatalogContract.*|ValidateModelConversionAndOperation.*)$' -v
-          go test ./internal/modelcatalog -count=1 -run '^Test(CatalogContract.*|CatalogV2.*|ValidateRejects.*)$' -v
-          go test ./internal/modelprofile -count=1 -run '^Test(ResolveCatalogV2.*|ResolveSnapshotUsesSelectedInterfaceCredential.*)$' -v
-          go test ./internal/responsesadapter -count=1 -run '^Test(ConfiguredAdapter.*|ChatAdapterContractMatrix.*|ProviderRegistry.*|Anthropic.*|DeepSeekBeta.*|NativeToolMapping.*|SourcePolicy.*)$' -v
-          go test ./internal/cli -count=1 -run '^Test(ModelCatalog.*|ModelProviderSetup.*|VerifySyncedModel.*)$' -v
-
-      - name: Teams per-chat reasoning effort regressions
+      - name: Codex per-turn reasoning effort regressions
         if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
           go test ./internal/codexrunner -count=1 -run '^TestAppServerRunner(StartThreadEncodesThreadStartAndTurnStart|RuntimeFallbackOmitsTurnStartEffort|ListModels.*)$' -v
-          go test ./internal/modelprofile -count=1 -run '^TestCodexModelCatalogJSONUsesPublicModelIDs$' -v
-          go test ./internal/cli -count=1 -run '^Test(TeamsCodexExecutor(ResumesExistingSession|RuntimeFallbackLeavesTurnEffortUnset|ReasoningEffortCatalog.*)|TeamsExecutorUsesStandardAppServerPolicyArgs|CodexReasoningEffortFromArgsPreservesExplicitLastOverride)$' -v
-          go test ./internal/teams -count=1 -run '^Test(ReasoningEffort.*|ParseControlDashboardCommandsDoNotRequireCodex|ParseWorkChatPlainTextIsCodexInput|BridgeTurnExecutionConfigOverridesSessionSnapshot)$' -v
-          go test ./internal/teams/store -count=1 -run '^TestQueueTurn(PinsSessionExecutionConfigSnapshot|PreservesCapturedRuntimeReasoningFallback)$' -v
-
-      - name: Teams helper token stats regressions
-        if: matrix.shard == 'core'
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Keep parser, aggregation, rendering, stale-checkpoint/model-switch,
-          # and subagent discovery regressions in the core CI shard.
-          token_stats_pattern='^Test(ParseCodexTokenStats|SummarizeCodexTokenStats|AggregateCodexTokenStats|RenderCodexTokenStatsHTML|Bridge(SendStatsToChatQueuesRenderedChunks|WorkHelperStats|SubagentProjectDiscovery)|ReadSubagentTokenStatsAttributesNestedNativeChildrenToImmediateParents)'
-          go test ./internal/teams -count=1 -run "$token_stats_pattern" -v
-
-      - name: Teams chat-local model and global default regressions
-        if: matrix.shard == 'core'
-        shell: bash
-        run: |
-          set -euo pipefail
-          go test ./internal/cli -count=1 -run 'Test(TeamsDefault|GlobalOfficialModelAndEffortDefaultsUseNativeLaunch|PinnedTeamsOfficialModelDoesNotReinheritGlobalDefaults|TeamsCodexExecutor(SwitchesProfileRunnerWithoutChangingThread|ReturnToBaseProfileUsesFreshGenerationRunner|ReclaimsPreviousSessionGenerationRunner)|Sanitize(Official|ThirdParty)ResponsesHistory)' -v
-          go test ./internal/teams -count=1 -run 'Test(ParseDefaultCommand|DefaultCommandWorkChatMessageIsExplicitlyControlOnly|GlobalDefaultsApplyOnlyWhenControlAndWorkSessionsAreCreated|RuntimeDefaultSourceIsCapturedOnlyForNewSessions|BridgeModelProfileSwitch|BridgePendingModelSwitch|BridgeModelSwitchSerializesWithQueueTurn)' -v
-
-      - name: Teams model/default/effort presentation and persistence contracts
-        if: matrix.shard == 'core'
-        shell: bash
-        run: |
-          set -euo pipefail
-          go test ./internal/teams -count=1 -run 'Test(ModelNaturalLanguageListRequestRoutesInControlAndWorkChats|ModelControlCommandsOperateOnControlSessionNotGlobalDefault|ModelListPutsCurrentChatBeforeGlobalDefaultAndVerifiedCatalog|ModelStatusShowsCapturedQueuedModelSeparatelyFromNextChatModel|SaveRegistryMergesProjectionState)$' -v
-          go test ./internal/cli -count=1 -run 'Test(ModelListShowsDisplayNamesAndCustomDefaultModel|TeamsModelListShowsOnlyCurrentlyAuthenticationVerifiedModels|TeamsDefaultManagerUsesRegistryAndAtomicallyReconcilesModelEffort|TeamsDefaultManagerLegacyConfigKeepsRuntimeEffortFallback)$' -v
 
       - name: Codex streaming transcript visibility regressions
         if: matrix.shard == 'core-b'
         shell: bash
         run: |
           set -euo pipefail
-          go test ./internal/responsesadapter -count=1 -run 'Test(FacadeStreams(TextLifecycleAndStoresCompletedResponse|MixedTextAndToolCallLifecycle|ReasoningLifecycleAndStoresCompletedResponse)|CodexCompatReasoningSSEMaintainsActiveReasoningItem|ParseInputFoldsRawReasoningWithoutVisibleSummaryIntoAssistantToolCallTurn)$' -v
           go test ./internal/codexrunner -count=1 -run 'TestParseStreamEventJSONL(StreamsAgentProgressForBothCodexFormats|FinalAnswerAndTaskComplete|DropsEmptyAndUnknownPhaseAgentMessages)$' -v
           go test ./internal/codexrunner -count=1 -run '^Test(EmitAppServerStreamEventRecognizesCompletedContextCompactionOnly|AppServerRunnerStreamsCanonicalContextCompactionBeforeNextItem)$' -v
           go test ./internal/codexrunner -count=1 -run 'TestLaunchOutputRecorder(RecoverParseErrors(ContinuesToRecoveredFinal|WithoutTerminalReturnsFirstError)|OmitCommandOutputStillReportsInvalidJSON)$' -v
-          go test ./internal/teams -count=1 -run 'Test(CodexEventForwarder(DoesNotFlushFinalAnswerAsProgressOnIdle|TreatsTaskCompleteAgentMessageAsTerminal)|Bridge(AcceptedOutboxBlockedByAnchorPromotesWithoutGraphRetry|BlockedOutboxSkipsTurnCompletionSideEffects))$' -v
-          go test ./internal/teams -count=1 -run 'Test(ParseCodexTranscript(ClassifiesEventCommentaryAsStatus|SkipsRawReasoningWithoutVisibleSummary|ReadsResponseItemTurnFromMetadata)|BridgeStreams(NewFormatCommentaryToTeams|UnphasedAgentMessagesToTeams|CodexProgressButNotCommandsToTeams)|BridgeCanQueueLiveTurnOutbox(ChecksTargetTurn|ChecksTargetTurnSQLite|IgnoresUnrelatedSQLiteCorruption)|BridgeRunningTurnTranscriptBackfill(SendsStatusWithoutAdvancingMainCheckpoint|SkipsWhenLiveProgressAlreadyQueued|KeepsFinalBarrierAcrossGoalContinuation)|BridgeSyncLinkedTranscript(DedupesLiveStreamed(Commentary|FinalAnswerFragmentSentAsStatus)|SkipsRecentTeamsTurnAgentMessageMirrorByCodexTurnID|KeepsAgentMessageWithoutRecentMirrorEvidence|BlocksOrphanContinuationWithoutDurableTurn|BlocksContinuationAfterCompletedOuterTurnWithoutAnchor|BlocksContinuationBeforeIncompleteTail)|ReadLinkedTranscriptDelta(BlocksPendingRootContinuationRecords|LegacyCheckpointUsesFailClosedScanner)|SessionExecutionOwnershipClearsOnlyAfterConfirmedFence|ObserveUnresolvedExecutionTail(SkipsUnchangedSource|FailsClosedOnTruncatedRecord)|ExecutionAnchorLineSignalRecognizesContinuationShapes|TranscriptImportCompletionLeavesConcurrentAppendForNextPass|HistoryTieredScanTail(MarksContinuationAcrossIncrementalScan|DoesNotMark(OrdinaryNextTurn|LegacyOrdinaryNextTurn)AsContinuation|MarksNestedTurnIDExplicit))$' -v
-          go test ./internal/teams -count=1 -run '^TestHistoryTieredScanTail' -v
-          go test ./internal/teams -count=1 -run '^TestHistoryWatchChangedPaths(SkipsSourceRewriteBlockedRows|ChecksLegacyProofOnNormalPoll)$' -v
-          go test ./internal/teams -count=1 -run 'Test(BridgeSyncLinkedTranscript(Quarantines(SourceIDChildEventMessageWithoutTurnID|NoIDChildEventMessage)|BlocksOversizedTail)|ReadLinkedTranscriptDelta(QuarantinesNoIDChildEventMessage|LegacyNoOffsetQuarantines(SourceIDChildEventMessage|DifferentTurn))|HistoryTieredScanTailQuarantines(SourceIDChildEventMessageWithoutTurnIDAfterTerminal|NoIDChildEventMessageAfterTerminal))$' -v
-          go test ./internal/teams -count=1 -run 'Test(HistoryTieredLineSignalsRecognizesTaskTerminalVariants|ExecutionAnchorForRestartedRunningTurnDoesNotTrustNewerCheckpoint|Bridge(PendingTranscriptPauseKeepsCheckpointCursor|SyncExistingEmptyCheckpointUsesFailClosedScanner|HandleClaimedQueuedTurnErrorSkipsTerminalTurns))$' -v
-          go test ./internal/teams -count=1 -run 'Test(Bridge(HistoryWatchRetriesCompleteFinalBeforeIncompleteTail|SyncLinkedTranscriptQuarantinesNonAdjacentMixedIDMirror)|ReadLinkedTranscriptDeltaLegacyCheckpoint(PreservesCompletePrefixBeforePartial|RefusesMissingKeyBeforePartial)|ReadLinkedTranscriptDeltaRejectsNonEOFPrefixedSourceRewrite|TranscriptCheckpointKnownZeroOffsetDoesNotMeanEOF|ExecutionAnchor(ProofRejectsMismatchedProvenance|GenerationIncreasesAfterClearAndRecreate)|TeamsSourceProofDetectsSameSizeInPlaceRewrite)$' -v
-          go test ./internal/teams -count=1 -run '^TestBridgeExactCompletionCommitsFinalCheckpointWithTurn$' -v
-          go test ./internal/teams -count=1 -run '^Test(Bridge(StaleExecutionCallbackKeepsOwnerAndPublishesStableAttention|SyncLinkedTranscriptDoesNotPublishCompletePrefixBeforeOrdinaryIncompleteTail)|LinkedCheckpointPrefixTerminalProbeParsesTypedRecordsOnly|P1SyncLinkedTranscriptPausesBeforeHalfWrittenTail)$' -v
-          go test ./internal/teams -count=1 -run '^TestBridgeSyncLinkedTranscriptsBlocksGrowingLegacyCursorWithoutFingerprintAcrossBackends$' -v
-          go test ./internal/teams -count=1 -run '^TestBridge(GraphAcceptedThenAnchorAppearsDoesNotRetryOrRunSideEffects|GraphAcceptedThenSourceRewriteKeepsAcceptedFenceAcrossBackends|ClaimedFinalAnchorBeforeGraphPostDoesNotSendAcrossBackends|MismatchedCompletionQuarantinesFinalAndPublishesOneAttention|ExactCompletionPublishesOnceAndClearsAnchor|ExactFailureClearsAnchorWithoutPublishingFinal|TerminalFailureFenceBlocksLateGraphFinalAcrossBackends|SyncLinkedTranscriptsBlocksUntrustedLegacyFingerprintAcrossBackends)$' -v
-          go test ./internal/teams -count=1 -run '^TestLinkedTranscriptIdleNoGrowthDoesNotBypassLaterPrefixProof$' -v
-          go test ./internal/teams -count=1 -run '^Test(Bridge(ActiveTurnLegacyCheckpointBlocksBeforeSourceScanAcrossBackends|ReadLinkedTranscriptDeltaBlocksOversizedTail|SyncLinkedTranscriptsBlocksLegacyCheckpointWithoutFingerprint)|HistoryTieredStatReconcileDetectsSameSizeSameMtimeRewrite|StoreSourceRewriteFenceDemotesSentAcrossBackends|TranscriptOutboxAnchorBlocksOnlyUnprovenTail)$' -v
-          go test ./internal/teams -count=1 -run '^Test(Bridge(ExactCompletionResolvesInterruptedTurnWithProof|TerminalFailureAfterFirstChunkFencesRemainingChunks|LinkedTranscriptOutboxSourceRewriteDoesNotPostAcrossBackends|LegacyTranscriptOutboxWithoutSourceProofDoesNotPostAcrossBackends|LegacySourceLessTranscriptOutboxIsFencedAfterSourceRewriteAcrossBackends|SourceRewriteAttentionNoticeRemainsDeliverableAcrossBackends|ActiveTurnCheckpointProvenanceMismatchHasNoSideEffectsAcrossBackends)|HistoryTieredScanTailQuarantines(AnonymousFinalPairBeforeTerminal|TwoAnonymousFinalsAfterTerminal|AnonymousFinalPairAcrossPolls)|ExecutionFenceProbeCacheIsBounded)$' -v
-
-      - name: Teams recovery mutation smoke
-        if: matrix.shard == 'core' && runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Kill a few deliberately selected safety/liveness mutants in an
-          # isolated copy. This catches tests that only pass on the happy path
-          # while keeping mutation work out of the live checkout and state.
-          bash scripts/ci/teams_recovery_mutation_smoke.sh
 
       - name: Teams liveness regressions
         if: matrix.shard == 'core'
@@ -709,9 +581,7 @@ jobs:
         run: |
           set -euo pipefail
           cli_pattern='^Test(TeamsRuntimeSafetyWatchdogDoesNotRestartLiveManagedChildBeforeOwnerRegistration|TeamsServiceWatchdog(DoesNotRestartWhenControlPollStaleDespiteFreshOwner|DoesNotRestartFreshOwnerBeforeFirstControlPoll|KeepsLiveManagedChildWaitingForOwnerPastPollThreshold|DoesNotRestartDuringExtendedControlPollOutage|ManagedReplacementRecognizesPreviousGeneration))$'
-          store_pattern='^Test(ControlLeaseClaimIgnoresUnrelatedCorruptRuntimeRow|LivenessFallbackIgnoresCorruptOptionalRuntimeRow|RecordOwnerHeartbeat(DoesNotWaitBehindFullStateUpdate|IsolatedFromUnrelatedCorruptRuntimeRow)|SQLiteFullStateUpdateDoesNotResurrectClearedOwner)$'
-          teams_pattern='^Test(BridgeListenDoesNotLeakControlLeaseWhenInitialOwnerHeartbeatFails|GraphOversized(JSONResponseIsNotMisclassifiedAsCorruptJSON|ErrorPreservesHTTPStatusAndRetryAfter)|TeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI)$'
-          for spec in "./internal/cli:$cli_pattern" "./internal/teams/store:$store_pattern" "./internal/teams:$teams_pattern"; do
+          for spec in "./internal/cli:$cli_pattern"; do
             package="${spec%%:*}"
             pattern="${spec#*:}"
             listed="$(go test "$package" -run '^$' -list "$pattern")"
@@ -730,38 +600,6 @@ jobs:
             fi
             go test ./internal/cli -count=1 -run "$supervisor_pattern" -v
           fi
-
-      - name: Teams ownership stress regressions
-        if: matrix.shard == 'core' && runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-          bash scripts/ci/teams_ownership_stress_docker_smoke.sh
-
-      - name: Teams runtime takeover process regressions
-        if: matrix.shard == 'core' && runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-          # This is a real compiled test-process boundary for the offline
-          # writer/takeover and SQLite-full scenarios. The listener vertical
-          # tests run separately in-process; keeping this lane required means
-          # SIGKILL/takeover and filesystem failures cannot be hidden behind
-          # those in-process ownership tests.
-          bash scripts/ci/teams_runtime_takeover_process_smoke.sh
-
-      - name: Teams durable routing authority regressions
-        if: matrix.shard == 'core'
-        shell: bash
-        run: |
-          set -euo pipefail
-          durable_routing_pattern='TestBridge(RestoreRegistryFromStoreDoesNotAdoptForeignControlBinding|DurableProjectionSteadyStateHasNoAllocationsOrRegistryWrite|ActiveAsyncSessionForIDStateUsesDurableBindingWithoutMutatingRegistry|PollOnce(SyncsRecreatedControlChatFromDurableBinding|DoesNotSyncForeignControlChatBinding|UsesDurableRecreatedWorkChatWhenRegistryIsStale|SQLitePersistsDynamicParkHandoffAndPreservesContinuation)|PollSessionResolutionFailureReleasesGlobalInboundForRetry|Process(DeferredInbound|QueuedTurns)UsesDurableRecreatedWorkChatWhenRegistryIsStale|ProcessDeferredInboundDoesNotRouteMissingDurableSessionThroughStaleRegistry(SQLite)?|SessionForIDState(PrefersDurableBindingOverStaleRegistry|DoesNotFallbackWhenDurableAuthorityRejectsRegistrySession)|IdleWorkChatAutoParkSweeperHandlesUserMessageFromIdleContinuationWithoutParking|RecreateSessionChat(RebindsSessionAndRetiresOldRouting|PublishesFullHistoryAfterPrimaryEOF|RetiresOldRoutingWhenMoveNoticeFails|CASPreservesConcurrentBinding|RejectsInactiveStatusBeforeGraphCreate|ActivatesQuarantinedSession)|RunningTurnTranscriptBackfillSendsStatusWithoutAdvancingMainCheckpoint)$'
-          scope_authority_pattern='TestResolveStorePathFor(SessionMaintenance(SelectsOnlyLiveMatchingStore|IgnoresUnrelatedLiveStore|UsesOnlyExistingLegacyStore|RejectsConflictingRetainedCopies|UsesCurrentForIdenticalRetainedCopies|FailsClosedWhenCurrentStoreIsUnreadable|RejectsAmbiguousSelectorInsideStore|RejectsForeignOverride|RejectsOverrideWithoutSelector)|Maintenance(PinsLiveLegacyStoreWithoutMigrating|FreshOwnerBeatsStaleRicherStore|RejectsMultipleFreshAuthorities)|Scope(KeepsMaintenanceAuthorityAfterOwnerClears|DoesNotLetOldMaintenanceMarkerOverrideNewerStore))$'
-          history_publish_pattern='Test(ResetRecreatedSessionChatStateRequiresCASAndClearsQuarantineOnActivate|BridgeFullHistoryImportUsesTargetChatCheckpointAndDeliveryNamespace|BridgeWorkPublishHistoryFullIgnoresPrimaryEOFForCurrentChat|PublishSessionFullHistoryIsIdempotentAndForceable|TranscriptDeliveryNamespacePreservesLegacyIDsAndSeparatesTargetChats|TranscriptCheckpointAtSourceEOFAllowsNoVisibleRecords|TranscriptImportBatchKindsRenderPreRenderedHTMLDirectly|OutboxMathTrustIsRestrictedToCodexOutputKinds)$'
-          go test ./internal/teams -count=1 -run "$durable_routing_pattern" -v
-          go test ./internal/teams -count=1 -run "$scope_authority_pattern" -v
-          go test ./internal/teams -count=1 -run "$history_publish_pattern" -v
-          go test ./internal/teams/store -count=1 -run 'TestSQLiteSelectedSnapshotsMatchExpectedFields$' -v
 
       - name: Teams test user-directory isolation guard
         if: matrix.shard == 'core' && runner.os == 'Linux'
@@ -783,21 +621,6 @@ jobs:
         shell: bash
         run: bash scripts/tests/run_teams_runtime_safety_shard.sh windows
 
-      - name: Teams runtime safety scope resolution and migration
-        if: matrix.shard == 'core' && runner.os == 'Linux'
-        shell: bash
-        run: bash scripts/tests/run_teams_runtime_safety_shard.sh store
-
-      - name: Teams runtime safety resolver syscall budget
-        if: matrix.shard == 'state-perf' && matrix.partition == 0 && runner.os == 'Linux'
-        shell: bash
-        run: bash scripts/tests/run_teams_runtime_safety_shard.sh store-io
-
-      - name: Teams runtime safety real-process, SIGKILL, and disk-full boundaries
-        if: matrix.shard == 'state-perf' && matrix.partition == 0 && runner.os == 'Linux'
-        shell: bash
-        run: bash scripts/tests/run_teams_runtime_safety_shard.sh store-process
-
       - name: Teams runtime safety service and update lifecycle
         if: matrix.shard == 'core' && runner.os == 'Linux'
         shell: bash
@@ -813,57 +636,12 @@ jobs:
         shell: bash
         run: bash scripts/tests/run_teams_runtime_safety_shard.sh diagnostics
 
-      - name: Teams read-only diagnostics regressions
-        if: matrix.shard == 'core'
-        shell: bash
-        run: |
-          set -euo pipefail
-          go test ./internal/cli -count=1 -run 'Test(TeamsStatusIsStrictlyReadOnlyAcrossLegacyRegistryAndStore|BuildTeamsAuthorityDiagnosticsReportsBindingAndPollHoles)$' -v
-          go test ./internal/teams/store -count=1 -run 'TestLoadPathReadOnly(JSONDoesNotCreateLockOrModifyFiles|SQLite(DoesNotModifyDatabaseFamily|SeesLiveWALWithoutModifyingPersistentFiles|RetriesWhenWALAppearsDuringImmutableRead|LiveWALWithoutSHMFailsWithoutCreatingSidecar))$' -v
-
-      - name: Teams self-echo containment and quarantine regressions
-        if: matrix.shard == 'core'
-        shell: bash
-        run: |
-          set -euo pipefail
-          store_pattern='Test(RecentOutboxEchoCandidatesAreBoundedPerStatus|QuarantineSessionIsTargetedAndFencesPendingWork|OutboxAttemptTokenRejectsStaleCompletion|AmbiguousOutboxSendKeepsLeaseAndStrictAttemptStateAcrossBackends)$'
-          bridge_pattern='Test(BridgeWorkPollDropsFreshPlainHelperLifecycleOutput|BridgeControlStatusShowsQuarantinedSessionsSeparately|BridgeRepeatedFreshHelperEchoQuarantinesBeforeDispatch|OutboxEchoAttemptCacheRequiresUniqueInflightMatch|HelperEchoBreakerCountsDistinctIDsAndRequiresActiveDurableBinding|GraphSendChecksQuarantineFenceImmediatelyBeforePost|BridgeAmbiguousGraphPostKeepsOutboxUnderSendLease)$'
-          cli_pattern='Test(TeamsChatQuarantineDryRunAndUnquarantine|TeamsChatQuarantineRejectsAmbiguousScopes|TeamsChatQuarantineRefusesLiveOwner|TeamsStatusSessionLayerReportsQuarantinedExplicitly)$'
-          go test ./internal/teams/store -count=1 -run "$store_pattern" -v
-          go test ./internal/teams -count=1 -run "$bridge_pattern" -v
-          go test ./internal/cli -count=1 -run "$cli_pattern" -v
-
       - name: Teams containment platform recovery regressions
         if: matrix.shard == 'platform-integration'
         shell: bash
         run: |
           set -euo pipefail
           go test ./internal/cli -count=1 -run 'Test(RepairRecordedHelperEntrypointsConvergesLegacyGoBinOnly|RepairRecordedHelperEntrypointsSkipsNonManagedRecord|TeamsServiceDoctorUsesInstalledWSLStartupFallbackWithoutScheduledTaskRequirement|TeamsServiceWSLStartupFallbackDoctorRejectsMismatchedMarker)$' -v
-
-      - name: Teams recreate maintenance fence regressions
-        if: matrix.shard == 'core'
-        shell: bash
-        run: |
-          set -euo pipefail
-          go test ./internal/teams/store -count=1 -run 'TestServiceControlDrainOperationFence$' -v
-          go test ./internal/cli -count=1 -run 'Test(BeginTeamsBridgeDrainFor(ChatRecreate(KeepsFencedUntilRelease|OnlyFencesPinnedStore|DoesNotMigrateLegacyStore)|HistoryPublishUsesDistinctFenceAndReleases)|TeamsChat(RecreateDrainReleaseDoesNotClearNewerFence|RecreateAndPublishHistoryExposeSafeRepairFlags)|DrainTeamsBridgeForChatRecreate(WaitsForOwnerAndClearsDrain|TimeoutClearsDrain))$' -v
-
-      - name: Teams recreate and full-history race regressions (Linux only)
-        if: matrix.shard == 'ubuntu-stress' && runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-          teams_pattern='Test(BridgeRecreateSessionChat(PublishesFullHistoryAfterPrimaryEOF|RetiresOldRoutingWhenMoveNoticeFails|CASPreservesConcurrentBinding|RejectsInactiveStatusBeforeGraphCreate|ActivatesQuarantinedSession)|ResetRecreatedSessionChatStateRequiresCASAndClearsQuarantineOnActivate|BridgeFullHistoryImportUsesTargetChatCheckpointAndDeliveryNamespace|BridgeWorkPublishHistoryFullIgnoresPrimaryEOFForCurrentChat|PublishSessionFullHistoryIsIdempotentAndForceable|TranscriptImportBatchKindsRenderPreRenderedHTMLDirectly|ResolveStorePathForSessionMaintenance.*)$'
-          go test -race ./internal/teams -count=1 -run "$teams_pattern" -v
-          go test -race ./internal/cli -count=1 -run 'Test(BeginTeamsBridgeDrainForHistoryPublishUsesDistinctFenceAndReleases|TeamsChatRecreateAndPublishHistoryExposeSafeRepairFlags)$' -v
-
-      - name: Teams SQLite row-level migration regressions
-        if: matrix.shard == 'state-perf' && matrix.partition == 0
-        shell: bash
-        run: |
-          set -euo pipefail
-          row_level_pattern='TestSQLite(SessionAndInboundRowUpdatesDoNotTouchColdState|ColdMetadataUpdatesDoNotRewriteHotRows|ControlChatBindingDoesNotRewriteHotRows|OfficialReleaseStoresUpgradeToCurrent)$'
-          go test ./internal/teams/store -count=1 -run "$row_level_pattern" -v
 
       - name: CXP preview SQLite correctness, concurrency, and write budgets
         if: matrix.shard == 'state-perf' && matrix.partition == 0
@@ -886,62 +664,11 @@ jobs:
           set -euo pipefail
           bash scripts/ci/codexhistory_cache_nfs_smoke.sh
 
-      - name: Teams control status display regressions
+      - name: Codex token usage parsing regressions
         if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
-          control_status_pattern='Test(BridgeControlStatus(ShowsNewestActiveChatLast|ChunkingKeepsNewestActiveChatLast|ShowsFolderLastUsedCompactLinkAndParkedResume)|BridgeDashboardSessionsShowLinkedChatAndParkedResume|RenderTeamsHTMLCompactTeamsChatLinkHidesVisibleURL)$'
-          go test ./internal/teams -count=1 -run "$control_status_pattern" -v
-
-      - name: Teams manual park and continuation regressions
-        if: matrix.shard == 'core'
-        shell: bash
-        run: |
-          set -euo pipefail
-          teams_poll_backlog_pattern='Test(InboundPollContinuationDoesNotForceCatchup|InboundPollContinuationDoesNotRegressActiveIntervals|InboundPollDecisionCatchupAndBlocked|BridgePollAllowsFreshHelperPrefixedUserPromptFromContinuation|BridgePollUsesDurableContinuationAfterOnePage|BridgePollPreservesOldContinuationWhenHeadAlsoTruncated|BridgeTerminalPollCleanupKeepsSharedActiveChat|BridgeControlParkSessionClearsPollState|BridgeControlParkSessionAmbiguousAndNotFound|BridgeControlParkRejectsQueuedOrRunningSession|BridgePollOnceKeepsExplicitParkedPollBlockedUntilRetryDeadline|BridgeControlUnparkAliasResumesWithHeadPoll|BridgePollOncePreservesStaleWorkContinuationWithTerminalHead|StalePollContinuationErrorRequiresContinuationTokenSignal|BridgeIdleWorkChatAutoParkSweeper(DrainsIdleContinuationThenParksAndResumes|HandlesUserMessageFromIdleContinuationWithoutParking|PreservesStaleContinuationWithTerminalHead|PreservesFreshHeadContinuationAfterStaleContinuationError|DoesNotRecoverContinuationForQueuedOrRunningSessions)|BridgeFinalAnswerPollBoostsLiveFinalAnswer|BridgeFinalAnswerPollBoostPreservesContinuation|BridgeFinalAnswerPollBoostSkipsTranscriptDelivery|BridgeFinalAnswerPollBoostSkipsParkedAndBlockedChats|BridgeQueuedTeamsPromptExplainsBlockedHistoryBacklog|BlockedTeamsPromptAckNextStepsMatchGateReasons|BridgeSessionCancel(LastDropsQueuedTurnBeforeRunningTurn|QueuedSelectorLeavesRunningTurn|RunningSelectorLeavesQueuedTurn|SelectorsReportMissingStatus)|LatestCancelableTurnIDPrefersQueuedOverRunning|ControlAdvancedHelpListsCancelSelectors|BridgeControlCancelLastRunningFallbackCancelsExecutor|BridgeRemindsWhenQueuedTurnWaitsOnActiveLocalTranscript|ParseControlCancel(TargetsControlFallback|NaturalLanguageFallsBackToCodex))$'
-          freeze_resume_pattern='Test(RenderTeamsFreezeNoticeHTML|ResumeCommandForSessionUsesNumberWithoutHashFallback|FreezeNoticeResumeCommandMatchingRequiresWholeCommand|SentFreezeNoticeExistsRequiresExactResumeCommand|BridgePollOnce(ParksIdleWorkChatAndAppendsFreezeNoticeToLatestMessage|SendsStandaloneFreezeNoticeWhenLatestMessagePatchRejected|SendsStandaloneFreezeNoticeWhenNoLatestMessageTarget|SendsStandaloneFreezeNoticeWhenLatestMessageIsNotEditable|DoesNotRepeatFreezeNoticeFrom(SentOutbox|GraphHistory))|BridgeControlResume(SessionNumberReactivatesParkedWorkChat|KeyReactivatesParkedWorkChat|KeyOnlyReactivatesMatchingParkedChat))$'
-          go test ./internal/teams -count=1 -run "$teams_poll_backlog_pattern" -v
-          go test ./internal/teams -count=1 -run "$freeze_resume_pattern" -v
-          go test ./internal/teams/store -count=1 -run 'TestChatPollCleanupClearsContinuationBackoffAndErrorForParkedAndClosed$' -v
-          go test ./internal/cli -count=1 -run 'TestTeamsStatus(SeparatesCatchupBacklogAndInactiveRows|ShowsRunningTurnDetails)$' -v
-
-      - name: Teams helper attachment echo race regressions
-        if: matrix.shard == 'core'
-        shell: bash
-        run: |
-          set -euo pipefail
-          attachment_echo_pattern='TestBridgePoll(DropsFreshHelperAttachmentEchoFromSendingOutbox|AllowsFreshHelperAttachmentEchoWhenOutboxAttachmentIDDiffers|AllowsFreshHelperAttachmentEchoWhenAttachmentIsMessageReference|AllowsFreshArtifactEchoShapedUserMessageWithAttachment|DropsHelperAttachmentEchoWithoutDurableMatch|DropsGlobalOutboundFromSiblingScope)$'
-          go test ./internal/teams -count=1 -run "$attachment_echo_pattern" -v
-          go test ./internal/teams/store -count=1 -run 'TestMarkOutboxSentIsIdempotent$' -v
-
-      - name: Teams file transfer durability and provenance regressions
-        if: matrix.shard == 'core'
-        shell: bash
-        run: |
-          set -euo pipefail
-          transfer_pattern='Test(GraphUploadDriveItemFromFile(PersistsSessionCheckpoint|ResumesPersistedSessionCheckpoint)|GraphDownloadSharedDriveItemContent(ToFileStreamsPastClientTimeout|RefreshesExpiredPreauthenticatedURL|ResumesCrashPartialWithMetadata|RejectsConcurrentDestinationWriter|RetriesShortPartialResponse)|GraphFileTransfer(DoesNotUseWholeRequestClientTimeout|ReusesItsTransportPool)|BridgePollDropsMarkedHelperAttachmentEchoWithDurableOutbox|BridgeProvenanceMarkerRequiresDurableMatchingOutbox|CleanupStagedOutboundAttachmentRejectsSymlinkParent)$'
-          go test ./internal/teams -count=1 -run "$transfer_pattern" -v
-          go test ./internal/teams/store -count=1 -run '^TestMarkOutbox(UploadSessionForAttemptPersistsAndFences|DriveItemForAttemptPersistsAndFences)$' -v
-
-      - name: Teams watchdog lifecycle drain regressions
-        if: matrix.shard == 'core'
-        shell: bash
-        run: |
-          set -euo pipefail
-          watchdog_pattern='TestTeamsServiceWatchdog(ClearsExpiredHelperUpgradeDrainWithIdleLocalOwner|DoesNotRestartExpiredHelperUpgradeDrainWithRemoteFreshOwner|ClearableUpgradeDrainWinsOverUnrelatedRemoteEvidence|ClearableReloadDrainWinsOverUnrelatedRemoteEvidence|DoesNotRestartExpiredHelperUpgradeDrainWithActiveTurn|ExpiredHelperUpgradeDrainIgnoresRestartCooldown|ClearsStaleHelperReloadDrainWithIdleLocalOwner|DoesNotRestartStaleHelperReloadDrainWithRemoteFreshOwner|DoesNotRestartStaleHelperReloadDrainWithActiveTurn|StaleHelperReloadDrainIgnoresRestartCooldown|ClearsLifecycleDrainBeforeStartingInactiveService|UnrelatedActiveTurnDoesNotBlockZombieDrainClear|RecoverableDrainWinsOverSeparatePausedState|ManyStateFilesRecoveryMatrix)$|TestRunTeamsServiceWatchdogOnce(DryRunLifecycleDrainClearDoesNotWriteState|ClearsExpiredHelperUpgradeDrainWithoutRestart|ClearsStaleHelperReloadDrainWithoutRestart|DoesNotClearFreshRemoteStoreDuringLocalDrainClear)$'
-          store_pattern='Test(AbortExpiredHelperUpgradeDrainPreservesPreviousDrain|AbortExpiredHelperUpgradeDrainPreservesFreshActiveOwner|ClearStaleHelperReloadDrainPreservesFreshDrain|ClearStaleHelperReloadDrainPreservesFreshRemoteOwner)$'
-          bridge_pattern='TestBridge(ClearsStaleHelperReloadDrainOnStart|DoesNotCompleteExpiredHelperUpgradeDrainWhenRunningVersionMissesTarget|CompletesExpiredHelperUpgradeDrainOnStart|DoesNotCompleteExpiredHelperUpgradeDrainOwnedByRemoteMachine|CompletesExpiredHelperUpgradeDrainWhenLastAttemptIsStale)$'
-          go test ./internal/cli -count=1 -run "$watchdog_pattern" -v
-          go test ./internal/teams/store -count=1 -run "$store_pattern" -v
-          go test ./internal/teams -count=1 -run "$bridge_pattern" -v
-
-      - name: Teams helper stats regressions
-        if: matrix.shard == 'core'
-        shell: bash
-        run: |
-          set -euo pipefail
-          go test ./internal/teams -count=1 -run 'Test(ParseCodexTokenStats.*|FormatCodexTokenStats.*|RenderCodexTokenStatsHTML.*|BridgeWorkHelperStatsReadsLinkedTranscript|ParseWorkChatPlainTextIsCodexInput)$' -v
           go test ./internal/codexrunner -count=1 -run 'Test(ParseJSONLExtractsThreadTurnMessageFailureAndCachedTokens|AppServerRunnerStartThreadEncodesThreadStartAndTurnStart)$' -v
 
       - name: Teams ASR input regressions
@@ -949,8 +676,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          asr_pattern='Test(CommandASRTranscriber(ArgsReplacePlaceholders|RunsCommandAndParsesJSON|UsesPlainStdout|ReturnsStderrOnFailure)|Managed(QwenASRTranscriber(InvokesIsolatedRuntimeWithDefaults|ReportsRuntimeFailureWithStderr|LlamaOptInInvokesConfiguredRuntime|AutoFallsBackToTransformers|AutoDoesNotInstallTransformersFallbackByDefault|AutoDoesNotFallbackFromLlamaRuntimeFailure|DefaultDownloadsManagedLlamaRuntime|ExplicitLlamaRejectsConfiguredMissingBinary)|ASR(ParseLlamaOutputHandlesLanguageColon|Llama(ConfigUsesLightweightDiskPreflight|ModelMarkerRejectsCorruptCachedFile|RuntimeConcurrentSetupReusesSingleInstall|NativeCompatCanRepairOnlyKnownBundleIssues|BinaryMarkerRejects(MissingNativeCompatRuntime|StaleNativeCompatInterpreter)|BinaryInstall(FallsBackToCPUAssetWhenAcceleratedValidationFails|RepairsNativeCompatWithPatchelf|RestoresOldRuntimeWhenFinalNativeCompatValidationFails|RepairsNativeCompatWithGlibc239Profile|EscalatesNativeCompatProfileAfterRetry|HonorsExplicitCPUDevice)|AssetMatrixCoversExpectedAccelerationFallbacks)|FFmpegWheelAssetMatrixCoversExpectedPlatforms|DiskPreflightReportsActionableSpace|PublishDirRestoresOldTargetOn(Publish|PostPublish)Failure|TempCleanupRemovesOnlyStaleRuntimeDirs|RunnerScriptIsRewrittenAtomically|PackageInstallPlanIncludesTorchAndPinnedRuntimeTools|Bootstrap(FallsBackToManagedStandalonePython|PythonCandidatesArePlatformSpecific)|StandalonePython(TargetCommonPlatforms|PinnedAssetUsesDirectDownloadURL|DownloadRejectsSizeAndHashMismatch|DownloadsExtractsAndMarksRuntime)))|EnsureManagedASRFFmpegInstallsAndReusesManagedWheel|DownloadManagedASRLlamaFile(RejectsSizeAndHashMismatch|RetriesAndReplacesExistingTarget)|ExtractManagedASRZipRejectsUnsafePath|PrepareManagedASRAudioForLlamaDownloadsManagedFFmpeg|ASRCommandEnvCapsCPUThreadVariables|TeamsASR(FailureUserMessageClassifiesActionableFailures|StatusLineIsUserLevelAndDoesNotLeakConfiguration)|PromptWithASRTranscriptsLabelsSpeechAsFallibleContext|ASRTranscriptDisplayNameFallsBackToStableMediaLabel|ExecutionInputWithPreparedTeamsContext(CombinesSpeechReferencesAndImages|StressMixedInputsDoesNotExposeRawTeamsMedia)|HostedContentRefsFromMessageStressDedupesAcrossBodyAndMediaCards|IsTeamsMediaAttachment|TranscribeTeamsMediaAttachments(FiltersAndDefaults|RequiresConfiguredASRForMedia|TreatsEmptyCommandASRAsUnconfigured)|ShouldSkipTeamsOriginTranscriptRecordIgnoresCodexPromptAdditions|TeamsOrigin(TextHashesIncludesControlFallbackSource|TranscriptUserDisplayBodyUsesOriginalTeamsPrompt)|BridgeSyncLinkedTranscript(MirrorsTeamsOriginUserPromptWithoutASRContext|SkipsASROnlyTeamsOriginUserPrompt)|ASRProgressOutboxIsTransientAndSkippedOnInterrupt|Bridge(ControlAudioCard(FallsBackToCodexWithASR|WithoutASRReportsSetupMessage)|UpgradeDrainReplaysControlAudioCardWithoutASRAsSetupNoticeOnly|SessionTeams(AudioCard(IsDownloadedAndTranscribed|WithoutASRReportsSetupMessage|TranscribesMultipleClipsInOrder)|MediaLimitDoesNotDownloadOrRunASR|MixedHostedImageAndAudioKeepsImageOnlyAsAttachment|VideoCardIsDownloadedAndTranscribed)|SessionRetryASRFailureInterruptsRetryBeforeCodex))$'
-          go test ./internal/teams -count=1 -run "$asr_pattern" -v
           go test ./internal/cli -count=1 -run 'Test(TeamsASR(ArgsFromEnvAndServiceOverrides|TranscriberDefaultsToManagedQwenRuntime|TranscriberReadsManagedLlamaEnv)|TeamsCommandWiresPlannedSubcommands|TeamsServiceInstallPreservesScopedEnvironment)$' -v
 
       - name: Setup managed ASR Python version for dependency availability
@@ -1113,37 +838,11 @@ jobs:
           Test-ManagedASRAsset "https://github.com/ggml-org/llama.cpp/releases/download/b9437/llama-b9437-bin-win-vulkan-x64.zip"
           Test-ManagedASRAsset "https://github.com/ggml-org/llama.cpp/releases/download/b9437/llama-b9437-bin-win-cpu-x64.zip"
 
-      - name: Teams managed ASR real runtime smoke
-        if: matrix.shard == 'platform-integration'
-        shell: bash
-        run: |
-          set -euo pipefail
-          CODEX_HELPER_ASR_REAL_ASSET_TEST=1 go test ./internal/teams -count=1 -run 'TestManagedASRRealPinnedLlamaAndFFmpegAssetsInstallAndValidate$' -v
-
-      - name: Teams work chat creation info regressions
-        if: matrix.shard == 'core'
-        shell: bash
-        run: |
-          set -euo pipefail
-          go test ./internal/teams -count=1 -run 'TestBridge(ControlNewCreatesDirectoryBoundSession|PublishImportsExistingTranscriptInExactTeamsOrder|RecreateSessionChatRebindsSessionAndRetiresOldRouting)$' -v
-
-      - name: Teams history watch Teams-origin regressions
-        if: matrix.shard == 'core'
-        shell: bash
-        run: |
-          set -euo pipefail
-          history_watch_pattern='TestBridgeHistoryWatch(SkipsTeamsOriginPromptBeforeFinal|SkipsTeamsOriginPromptAfterInjectedContext|StressSkipsTeamsOriginFinalAfterInjectedContextBurst|StressSkipsTeamsOriginFinalAcrossCheckpoint|ClearsTeamsOriginMarkerForLocalPrompt|SkipsTeamsOriginPromptByInboundHash|DoesNotSkipLocalPromptWithSameTextAsTeamsInboundDifferentThread|PublishesLocalSessionBeforeFinalAnswer|PersistsPendingAssistantAcrossPolls)$'
-          go test ./internal/teams -count=1 -run "$history_watch_pattern" -v
-          go test ./internal/teams/store -count=1 -run 'TestSQLiteHistoryWatchColdUpdatePreservesSplitTables$' -v
-
       - name: Teams recovery safety behavior regressions (Linux)
         if: matrix.shard == 'state-perf' && matrix.partition == 0 && runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
-          transcript_recovery_pattern='Test(BridgeSyncLinkedTranscript(PersistsHistoryQuarantineWithLegacyGeneration|ReleasesPendingRootAcrossPolls|ReleasesPendingRootAcrossSQLiteStoreReopen|ReleasesPendingRootSeenInOnePoll|AdvancesPastMalformedRecord|AdvancesPastLargeInvisibleCompleteRecord)|ExplicitHistoryRecoveryUsesStoredPendingRange)$'
-          go test ./internal/teams -count=1 -run "$transcript_recovery_pattern" -v
-          go test ./internal/teams/store -count=1 -run '^TestSQLite(MalformedCanonicalCheckpointIsIsolatedFromScopedReads|OpaqueCheckpointRepairUsesRawCAS|OperationCheckpointUpdateAcceptsValidNonCanonicalRow|NullableCheckpointMetadataIsolatedAndPreserved|CanonicalCheckpointSQLIdentityConflictIsolated)$' -v
           go test ./internal/cli -count=1 -run '^TestTeamsServiceLocalSupervisorChild(HealthRestartWithSeparatePipeHolder|HealthRestartsChild)$' -v -timeout=60s
 
       - name: Cross-compile check (Linux only)
@@ -1363,13 +1062,11 @@ jobs:
           config_pattern='TestStore(_(LoadAcceptsNewerAdditiveConfig|SaveStampsReaderFloor|ErrorPaths)|MigrationDropsLegacyExecutionModeField|RejectsUnknownBreakingReaderFloorAfterAdditiveWriterBump)$'
           cli_pattern='Test(Selftest(ReadsValidConfig|MissingConfigIsOK|FailsOnConfigNeedingNewerReader)|RuntimeMigration.*|PrepareCodexSelfUpdateGuardEnv.*|EnsureCodexBrokerRuntime.*|CodexInvocation.*|CodexExecAlias.*|CodexModelProfileFacade.*|NormalizeWorkingDir.*|LegacyExecutionFlags.*|AAAFlagIsPublicAndDefaultsOff|ResolveAAAEnabledDefaultsFalse|PersistAAAEnabledRoundTrip|LegacyYoloPreferenceDoesNotEnableAAA|RunHistoryTuiLoadsAndPersistsAAA|NewManagedTeamsCodexExecutor(UsesStandardAppServerRunner|RemovesLegacyExecutionArgs)|TeamsStandardRuntime.*|TeamsCodexArgsPreserve.*|RunLike(AAAIsPerInvocationAndReachesOnlyCodexBroker|RejectsAAAForNonCodexCommand|UsesDefaultCodexCommandInDirectMode|CodexWithProxyUsesStandardBrokerInsteadOfLegacyRunner))$'
           runtime_pattern='Test(AutomaticApproval.*|RemoteBroker.*|PolicyTransportReadyHook.*|AppServerRunner(DefaultApprovalModeFailsClosed|AutomaticApprovalModeIsExplicit|RetriesAfterCanceledInitialization|RestartsOnNextRequestAfterTransportCrash)|RunCodexExecFacadeUsesStandardApprovalAfterFixedDelay|RunCodexCLIInvocationRejectsAAAForNativeOnlySurface)$'
-          teams_pattern='Test(InfraLaunchFailureNotice|RunQueuedTurnReframesLaunchFailure)$'
           go test ./internal/config -count=1 -run "$config_pattern" -v
           go test ./internal/migration -count=1 -v
           go test ./internal/cli -count=1 -run "$cli_pattern" -v
           go test ./internal/cli ./internal/codexrunner -count=1 -run "$runtime_pattern" -v
           go test ./internal/responsespolicy -count=1 -v
-          go test ./internal/teams -count=1 -run "$teams_pattern" -v
           go test ./internal/update -count=1 -run 'TestReplaceBinary(BacksUpPrevious|FirstInstallHasNoBackup)$' -v
 
       - name: Config and standard runtime resilience regressions (Windows)
@@ -1381,13 +1078,11 @@ jobs:
           $configPattern = 'TestStore(_(LoadAcceptsNewerAdditiveConfig|SaveStampsReaderFloor|ErrorPaths)|MigrationDropsLegacyExecutionModeField|RejectsUnknownBreakingReaderFloorAfterAdditiveWriterBump)$'
           $cliPattern = 'Test(Selftest(ReadsValidConfig|MissingConfigIsOK|FailsOnConfigNeedingNewerReader)|RuntimeMigration.*|PrepareCodexSelfUpdateGuardEnv.*|EnsureCodexBrokerRuntime.*|CodexInvocation.*|CodexExecAlias.*|CodexModelProfileFacade.*|NormalizeWorkingDir.*|LegacyExecutionFlags.*|AAAFlagIsPublicAndDefaultsOff|ResolveAAAEnabledDefaultsFalse|PersistAAAEnabledRoundTrip|LegacyYoloPreferenceDoesNotEnableAAA|RunHistoryTuiLoadsAndPersistsAAA|NewManagedTeamsCodexExecutor(UsesStandardAppServerRunner|RemovesLegacyExecutionArgs)|TeamsStandardRuntime.*|TeamsCodexArgsPreserve.*|RunLike(AAAIsPerInvocationAndReachesOnlyCodexBroker|RejectsAAAForNonCodexCommand|UsesDefaultCodexCommandInDirectMode|CodexWithProxyUsesStandardBrokerInsteadOfLegacyRunner))$'
           $runtimePattern = 'Test(AutomaticApproval.*|RemoteBroker.*|PolicyTransportReadyHook.*|AppServerRunner(DefaultApprovalModeFailsClosed|AutomaticApprovalModeIsExplicit|RetriesAfterCanceledInitialization|RestartsOnNextRequestAfterTransportCrash)|RunCodexExecFacadeUsesStandardApprovalAfterFixedDelay|RunCodexCLIInvocationRejectsAAAForNativeOnlySurface)$'
-          $teamsPattern = 'Test(InfraLaunchFailureNotice|RunQueuedTurnReframesLaunchFailure)$'
           go test ./internal/config -count=1 -run $configPattern -v
           go test ./internal/migration -count=1 -v
           go test ./internal/cli -count=1 -run $cliPattern -v
           go test ./internal/cli ./internal/codexrunner -count=1 -run $runtimePattern -v
           go test ./internal/responsespolicy -count=1 -v
-          go test ./internal/teams -count=1 -run $teamsPattern -v
 
       - name: Teams background keepalive regressions (Linux/macOS)
         if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
@@ -1400,10 +1095,8 @@ jobs:
           set -euo pipefail
           teams_cli_keepalive='Test(TeamsBackgroundKeepalive|TeamsRecover(.*)|RestartSelfExecsSameBinaryWithCurrentArgs|TeamsHelperReload|DiscoverTeamsPendingHelperActivation.*|TeamsService(WindowsStartTasksRefreshesTaskState|WindowsElevatedScriptCapturesInnerErrors|WSLStartTasksRefreshTaskState|InstallWritesSystemdUserUnitWithoutEnabling|InstallDefaultsCodexHomeForScope|InstallDoesNotFailWhenDefaultCodexHomeCannotBeDerived|InstallWritesMacOSLaunchAgentPlist|InstallWritesWindowsTaskXMLAndRegistersTask|InstallWritesWSLWindowsTask|InstallWindowsAccessDeniedPromptsForUAC|InstallWindowsAccessDeniedYesUsesUACWithoutPrompt|InstallWindowsCleanupAccessDeniedUsesUAC|SystemctlStop(IgnoresMissingWatchdogUnits|StillFailsWhenPrimaryStopFails)|StartAndRestartActivatePendingWindowsHelperBeforeOldEntry|Environment(MirrorsSingleCodexHomeEnv|ResolvesRelativeCodexDirEnv|PreservesConflictingExplicitCodexHomes)|Bootstrap(ShowsControlChatInForeground|CanSkipAutomaticControlChatOpen|PreparesControlChatWith(ServiceCodexHomeEnv|RelativeCodexDirEnv|ResolvedRegistryPath)|WindowsAccessDeniedPromptsForUAC|WindowsAccessDeniedNoUACFailsWithoutPrompt|NoStartWindowsAccessDeniedPromptsForUAC|PendingActivationWindowsAccessDeniedPromptsForUAC)|OpenURLCommandMatrix|DoctorReportsWSLHint|DoctorReportsWSLReadinessFailure|RunPowerShellIncludesCombinedOutputOnFailure|ActiveQueriesSupervisorWithoutGeneratedConfig)|ScheduleDelayedTeamsServiceStartUses(WSLWindowsTask|ConfiguredPowerShell|WindowsPendingActivation)|TeamsServiceDetached.*|UpgradeCmd.*)'
           teams_service_cleanup_pattern='Test(TeamsService(RetireLocalBridgeProcessesFiltersRegistryProfileAndWatchdog|UpgradeRetiresLargeRunAndWatchdogPileBeforeRestart|PrimaryRestartRetiresOnlyLocalBridgeProcessesBeforeStart|StartRetiresLocalBridgeProcessesOnlyWhenWSLTaskInactive|StartDoesNotRetireLocalBridgeProcessesWhenWSLTaskActive|PrimaryStartDoesNotRetireLocalBridgeProcessesWhenWSLTaskActive|RestartRetiresLargeLocalBridgePileBeforeStart|RestartDoesNotStartWhenBridgeCleanupFails|RepairCleansWindowsBridgeChildrenBeforeTaskRewrite|Watchdog(DefaultsAvoidTransientRestartLoops|WaitsForConsecutiveStaleSamples))|RunTeamsServiceWatchdogOnce(RestartsAfterConsecutiveStaleState|RequiresPersistentStaleAndResetsOnFreshOwner|SuccessfulRestartCooldownSuppressesRestartStorm|DoesNotCooldownFailedRestart))$'
-          teams_runtime_keepalive='Test(TeamsBackgroundKeepalive|TeamsStartupFallback|GlobalInbound|InboundPoll|Bridge(LongRunningTurnKeepsOwnerHeartbeatActive|IdleOwnerHeartbeatPreservesActiveTurnFields|ListenStandbyDoesNotCreateControlChatOrPoll|PollChatReadRateLimitBlocksOnlyThatChat|ControlPollRateLimitDoesNotBlockWorkPollingWithoutRetrySleep|PollOnceContinuesOtherDueChatsAfterReadRateLimit|AckSendFailureDoesNotBlockCodexTurn|OutboxUploadRateLimitRecordsBlockWithoutRetrySleep|AcceptedOutboxRecoveryRateLimitRecordsBlockWithoutRetrySleep)|ClaimControlLease(PrimaryBeatsEphemeralAndEphemeralStaysStandby|DoesNotPreemptActiveTurn|ConcurrentManyMachinesSingleActive)|ControlLeaseForwardJumpAllowsTakeoverAfterSleep|IsStaleHandlesFutureHeartbeatAndThresholdBoundary|ValidateAndReleaseControlLease|RecordOwnerHeartbeat(WritesAndReadsOwner|UpdatesExistingOwner|TreatsExecRestartAsSameOwner|RefusesLiveOwnerWithDiagnostic|ReplacesDeadLocalOwnerBeforeStale)|RecoverStaleOwner(ReplacesStaleOwner|TreatsExecRestartAsSameOwner|ReplacesDeadLocalOwnerBeforeStale|RefusesLiveOwner)|ClearOwner(IsIdempotent|IfSameDoesNotClearDifferentOwner|IfSameDoesNotClearSameProcessDifferentInstance)|UpgradeBlockersDescribeBlockingWork|HasUpgradeBlockingWorkIgnoresImportCheckpointWithoutWork|PendingOutboxCrashRecoveryPromotesAcceptedDespiteRateLimitedChat|Graph(DoesNotRetryPostServerErrors|RetriesPostTooManyRequestsAfterRetryAfter))'
           go test ./internal/cli -count=1 -run "$teams_cli_keepalive" -v
           go test ./internal/cli -count=1 -run "$teams_service_cleanup_pattern" -v
-          go test ./internal/teams ./internal/teams/store -count=1 -run "$teams_runtime_keepalive" -v
           go test ./internal/update -count=1 -run 'Test(WindowsDeferredMoveScript(WaitsRetriesAndEscapesPaths|SafetyInvariantsStress)|FindPendingReplacementsForPlatformSortsHighestAndParsesWindowsAssets|ProbeBinaryVersionParsesCodexProxyVersion)$' -v
 
       - name: Teams background keepalive regressions (Windows)
@@ -1418,10 +1111,8 @@ jobs:
           $PSNativeCommandUseErrorActionPreference = $true
           $teamsCliKeepalive = 'Test(TeamsBackgroundKeepalive|TeamsRecover(.*)|RestartSelfExecsSameBinaryWithCurrentArgs|TeamsHelperReload|DiscoverTeamsPendingHelperActivation.*|TeamsService(WindowsStartTasksRefreshesTaskState|WindowsElevatedScriptCapturesInnerErrors|WSLStartTasksRefreshTaskState|InstallWritesSystemdUserUnitWithoutEnabling|InstallDefaultsCodexHomeForScope|InstallDoesNotFailWhenDefaultCodexHomeCannotBeDerived|InstallWritesMacOSLaunchAgentPlist|InstallWritesWindowsTaskXMLAndRegistersTask|InstallWritesWSLWindowsTask|InstallWindowsAccessDeniedPromptsForUAC|InstallWindowsAccessDeniedYesUsesUACWithoutPrompt|InstallWindowsCleanupAccessDeniedUsesUAC|SystemctlStop(IgnoresMissingWatchdogUnits|StillFailsWhenPrimaryStopFails)|StartAndRestartActivatePendingWindowsHelperBeforeOldEntry|Environment(MirrorsSingleCodexHomeEnv|ResolvesRelativeCodexDirEnv|PreservesConflictingExplicitCodexHomes)|Bootstrap(ShowsControlChatInForeground|CanSkipAutomaticControlChatOpen|PreparesControlChatWith(ServiceCodexHomeEnv|RelativeCodexDirEnv|ResolvedRegistryPath)|SchedulesPendingHelperActivationBeforeStartingOldWindowsEntry|WindowsAccessDeniedPromptsForUAC|WindowsAccessDeniedNoUACFailsWithoutPrompt|NoStartWindowsAccessDeniedPromptsForUAC|PendingActivationWindowsAccessDeniedPromptsForUAC)|OpenURLCommandMatrix|DoctorReportsWSLHint|DoctorReportsWSLReadinessFailure|RunPowerShellIncludesCombinedOutputOnFailure|ActiveQueriesSupervisorWithoutGeneratedConfig)|ScheduleDelayedTeamsServiceStartUses(WSLWindowsTask|ConfiguredPowerShell|WindowsPendingActivation)|RestartTeamsHelperFromTeamsUsesPending(ActivationForWindowsService|ProcessRestartForWindowsManualRun)|TeamsServiceDetached.*|UpgradeCmd.*)'
           $teamsServiceCleanupPattern = 'Test(TeamsService(RetireLocalBridgeProcessesFiltersRegistryProfileAndWatchdog|UpgradeRetiresLargeRunAndWatchdogPileBeforeRestart|PrimaryRestartRetiresOnlyLocalBridgeProcessesBeforeStart|StartRetiresLocalBridgeProcessesOnlyWhenWSLTaskInactive|StartDoesNotRetireLocalBridgeProcessesWhenWSLTaskActive|PrimaryStartDoesNotRetireLocalBridgeProcessesWhenWSLTaskActive|RestartRetiresLargeLocalBridgePileBeforeStart|RestartDoesNotStartWhenBridgeCleanupFails|RepairCleansWindowsBridgeChildrenBeforeTaskRewrite|Watchdog(DefaultsAvoidTransientRestartLoops|WaitsForConsecutiveStaleSamples))|RunTeamsServiceWatchdogOnce(RestartsAfterConsecutiveStaleState|RequiresPersistentStaleAndResetsOnFreshOwner|SuccessfulRestartCooldownSuppressesRestartStorm|DoesNotCooldownFailedRestart))$'
-          $teamsRuntimeKeepalive = 'Test(TeamsBackgroundKeepalive|TeamsStartupFallback|GlobalInbound|InboundPoll|Bridge(LongRunningTurnKeepsOwnerHeartbeatActive|IdleOwnerHeartbeatPreservesActiveTurnFields|ListenStandbyDoesNotCreateControlChatOrPoll|PollChatReadRateLimitBlocksOnlyThatChat|ControlPollRateLimitDoesNotBlockWorkPollingWithoutRetrySleep|PollOnceContinuesOtherDueChatsAfterReadRateLimit|AckSendFailureDoesNotBlockCodexTurn|OutboxUploadRateLimitRecordsBlockWithoutRetrySleep|AcceptedOutboxRecoveryRateLimitRecordsBlockWithoutRetrySleep)|ClaimControlLease(PrimaryBeatsEphemeralAndEphemeralStaysStandby|DoesNotPreemptActiveTurn|ConcurrentManyMachinesSingleActive)|ControlLeaseForwardJumpAllowsTakeoverAfterSleep|IsStaleHandlesFutureHeartbeatAndThresholdBoundary|ValidateAndReleaseControlLease|RecordOwnerHeartbeat(WritesAndReadsOwner|UpdatesExistingOwner|TreatsExecRestartAsSameOwner|RefusesLiveOwnerWithDiagnostic|ReplacesDeadLocalOwnerBeforeStale)|RecoverStaleOwner(ReplacesStaleOwner|TreatsExecRestartAsSameOwner|ReplacesDeadLocalOwnerBeforeStale|RefusesLiveOwner)|ClearOwner(IsIdempotent|IfSameDoesNotClearDifferentOwner|IfSameDoesNotClearSameProcessDifferentInstance)|UpgradeBlockersDescribeBlockingWork|HasUpgradeBlockingWorkIgnoresImportCheckpointWithoutWork|PendingOutboxCrashRecoveryPromotesAcceptedDespiteRateLimitedChat|Graph(DoesNotRetryPostServerErrors|RetriesPostTooManyRequestsAfterRetryAfter))'
           go test ./internal/cli -count=1 -run $teamsCliKeepalive -v
           go test ./internal/cli -count=1 -run $teamsServiceCleanupPattern -v
-          go test ./internal/teams ./internal/teams/store -count=1 -run $teamsRuntimeKeepalive -v
           go test ./internal/update -count=1 -run 'Test(WindowsDeferredMoveScript(WaitsRetriesAndEscapesPaths|SafetyInvariantsStress)|FindPendingReplacementsForPlatformSortsHighestAndParsesWindowsAssets|ProbeBinaryVersionParsesCodexProxyVersion)$' -v
 
       - name: Teams native supervisor validation (Linux)
@@ -1455,95 +1146,33 @@ jobs:
           $env:CODEX_HELPER_WINDOWS_TASK_REGISTER_TEST = "1"
           $env:CODEX_HELPER_USER_PATH_WINDOWS_LIVE = "1"
           go test ./internal/userpath -count=1 -run '^TestWindowsAccountDefaultLiveTokenEnvironment$' -v
-          go test ./internal/teams/store -count=1 -run '^Test(SQLiteOptionalSidecar|WindowsSQLiteOptionalSidecar)' -v
           go test ./internal/cli -count=1 -run 'Test(TeamsServiceWindowsTask(XML(RegistersWithTaskScheduler|WithPrincipalRegistersWithTaskScheduler)|StartIfStoppedUsesTaskScheduler)|TeamsUserPathExpectedSIDMatchesLiveScheduledTaskPrincipal)CI$' -v
 
-      - name: Teams Graph 429 stress (Linux only)
-        if: matrix.shard == 'ubuntu-stress' && runner.os == 'Linux'
+      - name: Helper state directory migration regressions
+        if: matrix.shard == 'state-perf' && matrix.partition == 1
         shell: bash
         run: |
           set -euo pipefail
-          bash scripts/ci/teams_graph_429_stress.sh
-
-      - name: Teams SQLite store migration and perf regressions
-        if: matrix.shard == 'state-perf'
-        shell: bash
-        run: |
-          set -euo pipefail
-          git fetch --force --tags --prune origin '+refs/tags/*:refs/tags/*'
-          export CODEX_HELPER_REQUIRE_RELEASE_TAG_FIXTURES=1
-          sqlite_store_pattern='Test(SQLiteFull(UpdateIsAtomicAndRecoversAfterCapacityReturns|AcceptedOutboxCASRecoversAfterCapacityReturns|InboundRetryAfterReopenIsExactlyOnce|DeferredContinuationWriteRemainsRetryable)|SQLite(DeferredInboundFiltersAndSortsLargeTable|HistoryWatch(ColdUpdatePreservesSplitTables|ProjectionDoesNotOverrideMixedVersionStateJSON|MissingProjectionMaterializesCurrentRevision|OriginState(SkipsOutboxDeliveryAndUnrelatedInboundRows|CoversSessionAndTurnMatches))|OwnerLeaseColdUpdatesPreserveHotTables|ColdSaveBackfillsSplitTablesFromLegacyStateJSON)|Migration(RoundTripAndHotPaths|UpgradesLegacySchemaWithRecoverableBackup|ThresholdSkipLeavesLegacyStateUntouched|MissingStateDoesNotCreatePointerOrDB|UnsupportedFutureSchemaFailsClosed|RetryReplacesStaleDBAndSidecars|FailureLeavesLegacyStateLoadableAndRetryable|CrashStageMatrixLeavesLegacyStateRetryable|FailureOnStaleSidecarLeavesLegacyState|ProcessBoundaryStressAfterUpgrade)|Pointer(MissingDBFailsClosedAndDoesNotCreateEmptyStore|UninitializedOrCorruptDBFailsClosed|PathValidationFailsClosed|SchemaRejectsLegacyV5Loaders|LegacySchema(LoadsAllEntryPoints|UnsupportedStorageVersionFailsClosed)|UnsupportedSchemaFailsClosed)|ReadUpgrade(SkipsLargeColdState|FallsBackWhenRuntime(UpgradeRowIsMissing|ProjectionIsIncomplete)|MalformedRuntimeRowFailsClosed|AcceptsNilContextAndWhitespaceID|ConcurrentRuntimeUpdate)|ExistingDBMissingHotTablesFailsClosed|OpenMigratesLegacyChatPollColumns|OfficialRelease(StoresUpgradeToCurrent|FixtureListCoversStableTags)|RecordTranscriptCheckpointPrunesSplitTranscriptLedger|TranscriptDeliveryPruneKeepsNewestRows|StoreUsesNormalSynchronousModeAndManualWALCheckpoint|SchemaEightStoreIsUpgradeOnlyForLegacyWriters)$'
-          sqlite_bridge_pattern='Test(Bridge(SQLiteMigration(UpgradeStateMatrix|FailureFallsBackToLegacyAndNotifiesControl|FallbackNoticeIsDeduped|FallbackFailsClosedForMissingPointerDB|FallbackFailsClosedForUnsupportedBackend)|DefersSQLiteMigrationWhileHelperUpgradeActivationIsPending|MigrateRegistryProjectionSkips(SaveWhenAlreadyMigrated|SentOnlyRegistryHistoryStoreWrite)|HistoryWatchSQLiteNarrowOriginLookupSkipsCorruptExcludedRows)|ProbeScopeMetadataReadOnlyAcceptsLegacySQLitePointerSchema)$'
-          sqlite_perf_pattern='TestCXPPerfModelSQLite(ProfilesCoverUpgradeOperations|ExternalScenariosCoverCommonPaths|HistoryWatchActiveAppendExercisesTeamsOriginLookup)$'
-          # Partition only the long independent process sequence.  The
-          # correctness gates remain single-runner checks above, while the two
-          # hosted runners split the expensive migration/benchmark work
-          # without running any test twice.
-          if [[ "${{ matrix.partition }}" == "0" ]]; then
-          go test ./internal/teams/store -count=1 -run "$sqlite_store_pattern" -v
-          go test ./internal/teams/store -count=1 -run '^TestReadUpgradeJSONBackendPreservesSemantics$' -v
-          go test ./internal/teams/store -run '^$' -bench 'BenchmarkSQLiteManualWALCheckpointHotWrite$' -benchtime=1x -count=1 -benchmem
-          go test ./internal/teams/store -run '^$' -bench 'BenchmarkSQLiteReadUpgradeLargeColdState$' -benchtime=10x -count=1 -benchmem
-          go test ./internal/teams/store -count=1 -run 'TestBackfillHelperDeliveries(CreatesEligibleRecord|ProductionScaleCompletesWithinBudget|UpdatesEveryLegacyRecordForOutbox)$' -v
-          go test ./internal/teams/store -run '^$' -bench 'Benchmark(BackfillHelperDeliveriesProductionScale|NormalizeLoadedStateProductionScaleHelperDeliveries)$' -benchtime=1x -count=1 -benchmem
-          go test ./internal/teams/store -count=1 -run 'Test(Has(QueuedTurns|PendingWorkflowNotifications)AcrossBackends|PendingWorkflowNotificationsAcrossBackendsFiltersAndOrders|UpdateNotificationAcrossBackendsTouchesOnlyNotification|ReadAutoUpdateControlSQLiteDoesNotLoadHotTables|UpgradeBlockingStateSnapshotSQLiteDoesNotLoadUnneededHotTables)$' -v
-          go test ./internal/teams/store -count=1 -run 'Test(SQLiteHistoryWatchColdUpdatePreservesSplitTables|SQLiteRecordTranscript(DeliveryDoesNotLoadColdStateAndPreservesDedupe|CheckpointDoesNotLoadColdStateAndTouchesOnlyCheckpointAndLedger)|RecordTranscriptCheckpointPreservesLegacySemantics|SessionExecutionStateSnapshotIsSessionScopedAndPersistsAnchor|SQLiteQueueTranscriptDeliveryOutbox(DoesNotLoadColdStateAndTouchesOnlyQueueRows|LinksExistingOutboxWithoutAllocatingSequence|SuppressesDeliveredWithoutColdLoad)|SQLiteMarkTurnLifecycleDoesNotLoadColdState|SQLiteUpsertArtifactRecordDoesNotLoadColdStateAndPreservesMergeFields|SQLiteMarkOutbox(SendError|DriveItem)DoesNotLoadColdState|RecordChatPollErrorWithBlockSQLiteUsesNarrowRows)$' -v
-          go test ./internal/teams/store -count=1 -run 'Test(MarkTurnRunningRespectsUnresolvedExecutionAcrossBackends|MarkTurnCompletedRequiresExactExecutionAnchorOwnershipAcrossBackends|ClaimNextQueuedTurn(RespectsUnresolvedExecutionAcrossBackends|LegacyAmbiguityIgnoresLaterDurableTerminal)|SQLiteLegacyAmbiguityMaterializesLatestInterruptedTurn|MarkOutboxSendAttemptBlocksLegacyAmbiguousTranscriptWithoutAnchor|FinalOutboxDeliveryCASRetainsStableGraphIdentityWhenAnchorAppears|MarkTurnInterruptedCannotOverwriteTerminalOwner|TerminalTurnCallbacksCannotReplaceOppositeTerminalState)$' -v
-          go test ./internal/teams/store -count=1 -run '^Test(MarkTurnCompletedWithTranscriptCheckpointIsAtomicAcrossBackends|ClearExecutionAnchorAndConfirmTurnIsAtomicAcrossBackends|HistoryWatchUnchangedCheckpointIsNoopAcrossBackends|UpdateHistoryWatchCheckpointIfCurrentRejectsStaleWriterAcrossBackends)$' -v
-          go test ./internal/teams/store -count=1 -run '^Test(MarkTurnFailedWithExecutionProofFencesEveryTerminalChunkAcrossBackends|CompleteTurnWithFinalCommitsOwnerAndFinalAtomicallyAcrossBackends|CompleteTurnWithFinalRejectsTerminalLoserBeforeCreatingFinalAcrossBackends|CompleteTurnWithFinalRejectsOutboxIDCollisionAcrossBackends|MarkTurnFailedForExecutionResolvesCurrentAnchorAcrossBackends|CompleteAndFailureBarrierOrderingAcrossBackends|CompleteAndFailureConcurrentExactlyOneOwnerAcrossBackends)$' -v
-          go test ./internal/teams/store -count=1 -run '^Test(PersistInterruptedTurnWithAnchorAndCompletionNeverLeaveCompletedAnchor)$' -v
-          go test ./internal/teams/store -count=1 -run '^Test(LinkedTranscriptSessionSnapshotCombinesRunningCheckpointAndOwnershipAcrossBackends|CompleteTurnWithFinalRequiresSourceProofForAnchoredExecutionAcrossBackends|LegacyExecutionAnchorGenerationMigratesOnExactCallbackAcrossBackends|TerminalFailureFencesLegacyTerminalOutboxKindsAcrossBackends|ImportCheckpointsForSessionsRejectsSameSessionWrongEmbeddedIDAcrossBackends|ImportCheckpointsForSessionsRejectsSessionProvenanceMismatchAcrossBackends|SQLiteScopedOwnershipQueriesBatchLargeSessionSet|SessionExecutionOwnershipCacheInvalidatesOnSQLitePointerSwitch|QuarantineQueuedTerminalAnswerOutboxPreservesAcceptedIdentityAcrossBackends|InFlightTerminalOutboxCanRecordAcceptedIDAfterQuarantineAcrossBackends|MarkTurnFailedForExecutionRejectsReusedIDsFromOlderAnchorGenerationAcrossBackends|MarkTurnFailedForExecutionPreservesThreadOnlyLegacyCompatibilityAcrossBackends|ExecutionAnchorAndInFlightOutboxSurviveCloseOpenAcrossBackends|TerminalFailureFenceOrderMatrixAcrossBackends|MarkTurnFailedForExecutionRejectsIncompleteOwnedIdentityAcrossBackends|UpdateImportCheckpointRejectsForeignRebindAcrossBackends|UpdateImportCheckpointRejectsForeignCreate(InDeterministicNamespace|ForColonSessionNamespace)AcrossBackends|ApplyOutboxReplayFences(LegacySourceLessRewriteAcrossBackends|PreservesTerminalFailureFence|SourceRewriteKeepsAcceptedFenceAcrossBackends)|RecordTranscriptProvenanceRejectsForeignCheckpointAcrossBackends|ApplyOutboxReplayFencesRejectsForeignCanonicalCheckpoint)$' -v
-          go test ./internal/teams -count=1 -run "$sqlite_bridge_pattern" -v
-          go test ./internal/teams -count=1 -run "$sqlite_perf_pattern" -v
-          go test ./internal/teams -count=1 -run 'TestWorkflowNotificationFlushInvalidPendingDoesNotLoadHotSQLiteTables$' -v
-          go test ./internal/teams -count=1 -run 'TestWorkflowNotificationFlushEnabledNoPendingSkipsWebhookSecretRead$' -v
-          go test ./internal/teams -count=1 -run 'TestBridge(HelperAutoUpdate(NotDueSkipsHotSQLiteTablesAndCheck|BackoffSkipsHotSQLiteTablesAndCheck|NotDueCachesMainLoopProbe)|ManualHelperUpdateClearsCachedAutoUpdateProbe)$' -v
-          go test ./internal/teams -count=1 -run 'TestBridge(PendingCodexUpgradeNoUpgradeSkipsHotSQLiteTablesAndUpgrade|SaveRepairsMissingRegistryDuringThrottleWindow|CodexVersionFailureSchedulesUpgradeAfterActiveWork)$' -v
-          go test ./internal/teams -count=1 -run 'TestCXPPerfActiveParkedFixtureHasNoPendingWorkflowNotifications$' -v
-          go test ./internal/teams -count=1 -run 'Test(BridgeSyncLinkedTranscriptLegacyBackfillPreservesDedupeWindow|BridgeSyncLinkedTranscriptDeliveryLedgerPreventsReplayAfterOutboxPruneAndCheckpointRegressionSQLite|BridgeSyncLinkedTranscripts(BackfillsLegacyCheckpointMetadata|BlocksLegacyCheckpointWithoutFingerprint|BlocksLegacyEOFCheckpointWithoutFingerprintAcrossBackends)|FindTranscriptCheckpointPositionSupportsFallbackCheckpoint)$' -v
-          go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteLegacyLinkedTranscriptBackfilledIdleProfiles/light-user$' -benchtime=1x -count=1 -benchmem
-          go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteInvalidWorkflowNotificationIdleTickProfiles/light-user$' -benchtime=1x -count=1 -benchmem
-          go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteHelperAutoUpdateNotDueProfiles/light-user/(cold-state-refresh|cached-main-loop)$' -benchtime=1x -count=1 -benchmem
-          go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteCodexUpgradeNoPendingProfiles/light-user/(cold-state-refresh|cached-main-loop)$' -benchtime=1x -count=1 -benchmem
-          go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteSelectedSnapshotLargeColdStateProfiles/light-user/pending-workflow-notifications$' -benchtime=1x -count=1 -benchmem
-          go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteHistoryWatchActiveAppendProfiles/many-long-chats$' -benchtime=1x -count=1 -benchmem
-          go test ./internal/teams -run '^$' -bench 'Benchmark(GlobalOutboundLedgerRecord|GlobalInboundLedgerClaim|ControlChatHistoryAppend)' -benchtime=1x -count=1 -benchmem
-          else
-          go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteRealisticMixedUser(ChatPollError|OutboxSendError|OutboxDriveItem|ArtifactUpsert|TranscriptDelivery|TranscriptCheckpoint|TranscriptQueue)StageWrites$' -benchtime=1x -count=1 -benchmem
-          go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteRealisticMixedUserWALSpikeBreakdown$' -benchtime=1x -count=1 -benchmem
-          go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteRegistryProjectionRetentionChurn$' -benchtime=1x -count=1 -benchmem
-          go test ./internal/teams ./internal/teams/store -count=1 -run 'Test(GlobalOutboundLedger(MigratesLegacyJSONWithoutRewrite|ReadRecoversPartialSQLiteSidecar)|GlobalInboundLedger(MigratesLegacyJSONWithoutRewrite|ReadRecoversPartialSQLiteSidecar)|ControlChatHistory(MigratesLegacyJSONLWithoutRewrite|ReadRecoversPartialSQLiteSidecar)|SQLiteSuppressOutboxOwnerMentionDoesNotLoadColdState)$' -v
-          go test ./internal/appdirs ./internal/cli ./internal/teams -count=1 -run 'Test(CleanupStaleMigrationTemps(RemovesOnlyOldMatchingFileTempsCI|RemovesOnlyOldMatchingDirTempsCI|DoesNotBlockMigrationOnRemoveFailureCI)|ResolveMigrated(File(FaultInjectionKeepsLegacyRetryableCI|AfterRenameFailureIsRetryableCI)|Dir(FaultInjectionKeepsLegacyRetryableCI|AfterRenameFailureIsRetryableCI)|DirWithRequired(RefreshesStaleRequiredFileCI|KeepsNewerRequiredFileCI|SkipsUnsafeLegacySideFilesCI|RejectsSymlinkRequiredFileCI)|RelatedFilesRequiresRegularSidecarsCI)|DefaultStorePathRefreshes(StaleMigratedStateCI|CorruptNewStateCI)|DefaultRegistryPath(ForScope)?RefreshesCorruptNewRegistryCI|DefaultAuthConfigRefreshesCorruptScopedCacheFromLegacyDefaultCI|TeamsServiceLocalSupervisorRuntimeDir(MigratesLegacyStatusWhenNewDirExists|Refreshes(StaleNewStatusCI|CorruptNewStatusCI))|TeamsBackgroundKeepaliveResolveStorePath(CompletesPartialNewScopeCI|FallsBackWhenPartialNewScopeCannotCompleteCI|RejectsNonRegularSQLiteSidecarCI|RepairsCorruptNewScope(CI|WithoutRegistryCI)|ConcurrentMigrationCI|SubprocessMigrationStressCI|MigratesLegacyGlobalStoreCI|CleansEligibleLegacyScopeFilesCI)|CleanupMigratedFileFamilySkips(FreshLegacyCI|NewerLegacyCI|LockedLegacyCI|SameFileAliasCI)|CleanupMigratedScopeLegacyFilesKeepsStoreWhenRegistryCleanupBlockedCI)$' -v
+          go test ./internal/appdirs ./internal/cli -count=1 -run 'Test(CleanupStaleMigrationTemps(RemovesOnlyOldMatchingFileTempsCI|RemovesOnlyOldMatchingDirTempsCI|DoesNotBlockMigrationOnRemoveFailureCI)|ResolveMigrated(File(FaultInjectionKeepsLegacyRetryableCI|AfterRenameFailureIsRetryableCI)|Dir(FaultInjectionKeepsLegacyRetryableCI|AfterRenameFailureIsRetryableCI)|DirWithRequired(RefreshesStaleRequiredFileCI|KeepsNewerRequiredFileCI|SkipsUnsafeLegacySideFilesCI|RejectsSymlinkRequiredFileCI)|RelatedFilesRequiresRegularSidecarsCI)|DefaultStorePathRefreshes(StaleMigratedStateCI|CorruptNewStateCI)|DefaultRegistryPath(ForScope)?RefreshesCorruptNewRegistryCI|DefaultAuthConfigRefreshesCorruptScopedCacheFromLegacyDefaultCI|TeamsServiceLocalSupervisorRuntimeDir(MigratesLegacyStatusWhenNewDirExists|Refreshes(StaleNewStatusCI|CorruptNewStatusCI))|TeamsBackgroundKeepaliveResolveStorePath(CompletesPartialNewScopeCI|FallsBackWhenPartialNewScopeCannotCompleteCI|RejectsNonRegularSQLiteSidecarCI|RepairsCorruptNewScope(CI|WithoutRegistryCI)|ConcurrentMigrationCI|SubprocessMigrationStressCI|MigratesLegacyGlobalStoreCI|CleansEligibleLegacyScopeFilesCI)|CleanupMigratedFileFamilySkips(FreshLegacyCI|NewerLegacyCI|LockedLegacyCI|SameFileAliasCI)|CleanupMigratedScopeLegacyFilesKeepsStoreWhenRegistryCleanupBlockedCI)$' -v
           go test ./internal/appdirs -count=1 -run 'Test(StateDir(ExpandsHomeAndPreservesSpacesCI|UsesConfigFallbackOnWindowsAndDarwinCI)|ResolveMigratedFile(Refreshes(StaleExistingNewCI|EqualMTimeDifferentExistingNewCI)|Replacement(FaultInjectionKeepsLegacyRetryableCI|AfterRenameFailureExposesFreshNewCI))|ResolveMigratedDirWithRequired(RefreshesEqualMTimeDifferentRequiredFileCI|Replacement(FaultInjectionKeepsLegacyRetryableCI|AfterRenameFailureExposesFreshNewCI))|CopyFileReplacingActiveTempDoesNotInheritOldSourceMTimeCI)$' -v
-          go test ./internal/cli ./internal/teams -count=1 -run 'Test(DefaultStorePath(RefreshesEqualMTimeDivergentStateCI|SubprocessMigrationStressCI)|DefaultResponsesStorePath(FallsBackWhenNewSidecarIsNonRegularCI|SubprocessMigrationStressCI)|DefaultOutboundRootFallsBackWhenLegacyContainsSymlinkCI|DefaultAuthConfigRefreshes(CorruptProfileScopedCacheFromLegacyScopedCI|EqualMTimeProfileScopedCacheFromLegacyScopedCI)|DefaultRegistryPathRefreshesEqualMTimeDivergentRegistryCI|TeamsBackgroundKeepaliveResolveStorePathRefreshesLoadableNewScopeStateCI|CleanupMigratedFileFamilyRemoveFailureIsRetryableCI)$' -v
-          go test ./internal/teams/store -count=1 -run 'TestDefaultPathRefreshes(CorruptNewStateBeforePromotionCI|StaleLoadableNewStateBeforePromotionCI|EqualMTimeDivergentStateBeforePromotionCI)$' -v
-          fi
 
       - name: Teams Codex runner classification regressions
         if: matrix.shard == 'core-b'
         shell: bash
         run: |
           set -euo pipefail
-          adapter_pattern='Test(TeamsCodexExecutor(DoesNotTreatExistingThreadIDErrorAsAccepted|RejectsResumeThreadMismatch|TreatsStartedTurnErrorAsAmbiguous|DoesNotTreatTerminalFailedTurnAsAmbiguous)|RunnerExecutor(DoesNotTreatExistingThreadIDErrorAsAccepted|RejectsResumeThreadMismatch|TreatsStartedTurnErrorAsAmbiguous|DoesNotTreatTerminalFailedTurnAsAmbiguous)|BridgeSession(CodexFailureWithOnlyExistingThreadIDMarksFailed|TerminalCodexFailureWithTurnIDMarksFailed))$'
           runner_pattern='Test(ExecRunnerResumeThreadFailureKeepsExistingThreadIDOnly|AppServerRunner(CapturesResumeThreadIDBeforeTurnStart|ResumeThreadFailureKeepsExistingThreadIDOnly|CachedModelsDoesNotStartTransport|PersistentCancelFenceDoesNotStartSameThread|UnconfirmedExplicitInterruptRetriesBeforeNextTurn)|ConfirmationProbeTimeoutSplitsBoundedParentBudget|AppServerProcess(TransportReadFailureIncludesLimitedStderr|DiagnosticWaitsForStderrDrainAfterExit))$'
           helper_auto_update_pattern='Test(TeamsReleaseAutoUpdater.*|TeamsAutoUpdateActivation.*|BridgeCompletedHelperUpgradeNotice(AutoIsPlainAndDedupes|AdoptsLegacyOutbox)|BridgePendingUpgradeNotice(DoesNotDuplicateDurableCompletionNotice|DoesNotResendMissingDurableCompletionOutbox)|BridgeHelperAutoUpdate(AppliesEligibleCandidate|WaitsForBlockingWorkThenAppliesPendingCandidate|RecordsCheckWithoutCandidate|PassesPrereleaseOptIn|QueuesPlainCompletionNotice|PendingReplacement(WaitsForVerifiedVersion|FailureNotifiesOnce)|SuccessfulActivationWithOldRunningVersionNeedsAttention|InstalledPathRestartMismatchNotifiesOnce|ApplyFailureBacksOffAndAbortsDrain|RestarterFailureKeepsInstalledState)|BridgeBackgroundHelperUpdate(ActivationPendingWithoutRestarter|ActivationRestartFailure|InstalledPathRestartMismatch|PendingReplacementFailure)StaysSilent|BridgeControlHelperUpdate(PrereleaseRunsManualUpdate|PrereleaseActivationPending(RestartsInstalledPath|RestarterFailureKeepsNotice)|ActivationPendingWithoutRestarterRequestsAction|WaitsForActiveWork))$'
-          upgrade_pattern='Test(BridgeCodexVersionFailureSchedulesUpgradeAfterActiveWork|BridgeCodexVersionUpgradeFailureNotifiesOriginWorkChat|CodexErrorRequiresUpgradeHeuristics|UpgradeNotificationTargetsDeduplicate|UpgradeRescue(InterruptsRunningPreservesQueuedAndSkipsTransientOutbox|PreservesProtectedOutboxBlocker|FencesStaleOwnerButRefusesLiveOwner)|RunTeamsUpgradeCodexOnceRejectsUnfinishedTeamsWorkWithoutOwner)$'
           upgrade_cmd_pattern='Test(UpgradeCmd(AlreadyUpToDateRescuesStaleTeamsState|DefaultDoesNot(TouchTeamsServiceOrRequestUAC|RestartTeamsServiceAfterUpdateError)|IgnoresBrokenEnvInstallPathAndUnifiesAliases|UnifiesDefaultInstallAliasWhenCurrentGoBinWins|UsesAutoUpdateInstallLock|FallsBackToCacheLockWhenInstallPathLockUnavailable|CreatesMissingCXPShimForManagedDefault|RepairsStaleCXPRegularFileForManagedDefault|AllowsOrphanQueuedTurn|RescuesOrphanRunningTurnAndTransientOutbox|RescuesStaleOwnerBeforeUpdate|PausesOnProtectedOutboxDuringRescue)|HandleUpdateAndRestartUnifiesCXPShimBeforeExec|EnsureCXPShimForInstallPath(RepairsStalePOSIXSymlink|CreatesWindowsCmdShim|RepairsWindowsCmdShim|KeepsNonHelperWindowsCmd)|RepairKnownHelperEntrypointsSkipsInstallPathThroughSymlinkedParent|SameHelperInstallLocationUsesResolvedParentForSelfSymlink|ReplaceSymlinkAtomicallySkipsSameInstallLocationThroughSymlinkedParent|ResolveManagedInstallPathPrefersLogicalDefaultThroughSymlinkedLocal|FinalizeHelperEntrypointsPreservesLogicalRecordThroughSymlinkedLocal|HelperInstallLockPathsUseSymlinkAwareCacheKey)$'
-          helper_upgrade_handoff_pattern='Test(Helper(UpgradeDrainExpired|ReloadDrainStale)|OwnerAppearsLocal|Bridge(ControlRestart(DoesNotRunDuringHelperUpgrade|DoesNotRunDuringHelperReloadCodexUpgradeOrManualDrain|RunsAfterExpiredHelperUpgradeDrain|DoesNotRecoverExpiredHelperUpgradeOwnedByRemoteMachine|NowBlocksExpiredHelperUpgradeWithActiveTurn|ForceRunsAfterExpiredHelperUpgradeWithActiveTurn|RunsAfterStaleHelperReloadDrain|DoesNotRecoverStaleHelperReloadOwnedByRemoteMachine|NowBlocksStaleHelperReloadWithActiveTurn|ForceRunsAfterStaleHelperReloadWithActiveTurn)|ControlReload(RetriesStaleHelperReloadDrain|DoesNotRecoverStaleHelperReloadOwnedByRemoteMachine|NowBlocksStaleHelperReloadWithActiveTurn)|ReloadDraining(SessionMessage|ControlNew)IsDeferredAndReplayed|CompletesExpiredHelperUpgradeDrainOnStart|DoesNotCompleteExpiredHelperUpgradeDrainOwnedByRemoteMachine)|TeamsServiceWatchdog(LifecycleStatePrecedenceMatrix|RecoverableDrainWinsOverSeparatePausedState|ManyStateFilesRecoveryMatrix|MergeDoesNotRecoverPausedStateDrain|Restarts(ExpiredHelperUpgradeDrain|StaleHelperReloadDrain)WithLocalOwner|DoesNotRestart(ExpiredHelperUpgradeDrain|StaleHelperReloadDrain)WithRemoteFreshOwner|RemoteFreshOwnerWinsOverLocal(Upgrade|Reload)Evidence|DoesNotRestart(ExpiredHelperUpgradeDrain|StaleHelperReloadDrain)WithActiveTurn|(ExpiredHelperUpgradeDrain|StaleHelperReloadDrain)RespectsRestartCooldown|MergeDetects(ExpiredHelperUpgradeDrain|StaleHelperReloadDrain)(LocalOwner|RemoteOwner)))$'
           go test ./internal/codexrunner -count=1 -run "$runner_pattern" -v
-          go test ./internal/teams/store -count=1 -run 'TestMarkTurnFailedWithCodexIDsPersistsDiagnostics$' -v
-          go test ./internal/cli ./internal/teams -count=1 -run "$adapter_pattern" -v
-          go test ./internal/cli ./internal/teams -count=1 -run "$helper_auto_update_pattern" -v
-          go test ./internal/teams ./internal/teams/store -count=1 -run "$upgrade_pattern" -v
+          go test ./internal/cli -count=1 -run "$helper_auto_update_pattern" -v
           go test ./internal/cli -count=1 -run "$upgrade_cmd_pattern" -v
-          go test ./internal/cli ./internal/teams ./internal/teams/store -count=1 -run "$helper_upgrade_handoff_pattern" -v
 
-      - name: Teams app-server model profile cancellation regressions
+      - name: Proxy health cancellation regressions
         if: matrix.shard == 'core'
         shell: bash
         run: |
           set -euo pipefail
-          go test ./internal/cli -count=1 -run 'Test(PrepareTeamsAppServerModelProfile(ProxyPrepareTimesOutCI|UsesCallerCancellationCI)|TeamsCodexExecutorSessionProfilePrepareUsesTurnContextCI|CodexModelProfileFacadeEnablesExecutionTargetShellPolicy)$' -v
           go test ./internal/manager -count=1 -run 'Test(HealthClient_CheckHTTPProxyContextCancellation|FindReusableInstanceContextHonorsCancellation)$' -v
 
       - name: Teams metadata-only resume and final integrity regressions
@@ -1552,19 +1181,7 @@ jobs:
         run: |
           set -euo pipefail
           runner_pattern='Test(AppServerRunner(MetadataOnly(ResumeExcludesPersistedTurns|BackfillsExactCompletedTurnSummary|RejectsWrongTurnSummary|WrapsSummaryFailureAsIncompleteFinal|KeepsCompleteFinalWhenTitleBackfillFails)|LegacyTitleBackfillFailureRemainsError)|CompletedFinalAgentMessageForTurnsListRequiresExactCompletedTurn)$'
-          adapter_pattern='Test(NewManagedTeamsCodexExecutorUsesStandardAppServerRunner|TeamsCodexExecutor(RejectsCompletedTurnWithoutFinalMessage|TreatsIncompleteCompletedTurnAsAmbiguous|RejectsSuccessfulPartialCompletedTurn|RejectsIncompleteCompletedTurnWithCanceledContext)|RunnerExecutor(RejectsCompletedTurnWithoutFinalMessage|TreatsIncompleteCompletedTurnAsAmbiguous|RejectsSuccessfulPartialCompletedTurn|RejectsIncompleteCompletedTurnWithCanceledContext))$'
-          bridge_pattern='Test(Bridge(DoesNotRecoverAmbiguousExecutionFromExactTranscriptFinal|DoesNotRecoverIntermediateGoalFinalForAmbiguousOuterTurn|SyncLinkedTranscript(PausesAfterAmbiguousTurnStillGrowing|BlocksOrphanContinuationWithoutDurableTurn|BlocksContinuationAfterCompletedOuterTurnWithoutAnchor|BlocksContinuationBeforeIncompleteTail)|FinalOutbox(RetryRequiresIdenticalChunkPlan|PreflightsAllChunksBeforeQueue)|StreamingErrorDoesNotSuppressPendingFinalLikeProgress)|UnresolvedAmbiguousCodexTurnRequiresConfirmedLaterBoundary|SessionExecutionOwnershipClearsOnlyAfterConfirmedFence|ObserveUnresolvedExecutionTail(SkipsUnchangedSource|FailsClosedOnTruncatedRecord)|ExecutionAnchorLineSignalRecognizesContinuationShapes|TranscriptImportCompletionLeavesConcurrentAppendForNextPass|HistoryTieredScanTail(MarksContinuationAcrossIncrementalScan|DoesNotMark(OrdinaryNextTurn|LegacyOrdinaryNextTurn)AsContinuation|MarksNestedTurnIDExplicit))$'
           go test ./internal/codexrunner -count=1 -run "$runner_pattern" -v
-          go test ./internal/cli ./internal/teams -count=1 -run "$adapter_pattern" -v
-          go test ./internal/teams -count=1 -run "$bridge_pattern" -v
-
-      - name: Model choice reusable credential regressions
-        if: matrix.shard == 'core'
-        shell: bash
-        run: |
-          set -euo pipefail
-          go test ./internal/modelprofile -count=1 -run 'Test(CodexModelCatalogJSONUsesPublicModelIDs|ThirdPartyMillionTokenProviderCatalogWindows)$' -v
-          go test ./internal/cli -count=1 -run 'Test(PrepareTeamsAppServerModelProfileAllowsLegacyDeepSeekContextFingerprintCI|ModelListShows(NeedsSetupWhenFamilyCredentialExistsWithoutProfile|DisplayNamesAndCustomDefaultModel)|ModelDoctor(ExplainsMissingRecommendedProfileWithReusableCredential|ValidatesCustomProfileBackingModelChoice)|TeamsModelProfileDoctor(ExplainsMissingRecommendedProfileWithReusableCredential|ValidatesCustomProfileBackingModelChoice))$' -v
 
       - name: Teams user-marker compact and fallback regressions
         if: matrix.shard == 'core-b'
@@ -1572,183 +1189,9 @@ jobs:
         run: |
           set -euo pipefail
           runner_pattern='TestExecRunnerTreatsCompletedTurnWithCanceledLaunchAsSuccess$'
-          adapter_pattern='Test(TeamsCodexExecutorTreatsCompletedTurnWithCanceledContextAsSuccess|RunnerExecutorTreatsCompletedTurnWithCanceledContextAsSuccess)$'
-          transcript_pattern='Test(ParseCodexTranscript(Records(ContextCompactEvent|CompactOnlyLine|ContextCompactCompletedItem)|HidesInternalResponseItemAgentMessages|HidesChatGPTAppInternalEvents|FailsClosedAcrossInternalAgentEnvelopes|TurnContextCheckpointKeySurvivesTailRead|AcceptsCaseInsensitiveKnownResponseItemTypes|KeepsResponseItemAssistantPrefixRecords|DropsStreamingPrefixAfterIntermediateAssistant)|PlanTranscriptImportRecordSkipsUnknownTranscriptEvents)$'
-          bridge_pattern='Test(StripUserAnnotationPrefixStripsExactlyOneHelperUserMarker|BridgeAnnotate(IncomingUserMessageDoesNotMirrorWhenGraphUpdateFails|ExternalUserMessageQueuesUserMirrorWithoutGraphPatch)|CommandRouteTextStripsPlainUserMarkerBeforeRouting|BridgePollHandlesPlainUserPromptWithExistingUserMarker|TranscriptDedupeKeepsRepeatedContextCompactMarkers|BridgeSyncLinkedTranscript(SendsContextCompactMarkersIndividually|SkipsContextCompactAlreadySentLive|OnlySkipsDeliveredContextCompactCount|StressSkipsLiveStatusesBeforeCheckpointWindow|SkipsStatusAlreadySkippedByTextHash|SkipsFinalAlreadySentLiveBeforeCheckpoint|SkipsInternalAgentMessagesAndAdvancesCheckpoint|SkipsChatGPTAppInternalEventsAndAdvancesCheckpoint|MirrorsTeamsOriginUserPrompt|SkipsTerminalTeamsOriginUserPrompt|MirrorsTeamsOriginUserPromptWithoutImagePlaceholder|MirrorsTeamsOriginUserPromptWithoutReferencedMessageContext)|BridgeImportTranscriptSkipsInternalEventsAndAdvancesCheckpoint|BridgeQueuesTranscriptOnlyContextCompactBeforeFinalAnswer|BridgeDoesNotSendFinalTextAsProgressWhenOnlyMemoryCitationDiffers|BridgeCompletes(NonStreamingTurnWithTranscriptFinalForCanonicalDedupe|TurnWithTranscriptFinalForCanonicalDedupe)|BridgeTranscriptSyncDoesNotSendPrefixFinalAnswerFragmentAfterFullFinal|BridgeStreamingFinalUsesTranscriptCanonicalBeforeClosingForwarder|BridgeStreamingErrorDoesNotSuppressPendingFinalLikeProgress|BridgeTranscriptCanonicalFinal(PreservesObservedArtifactManifest(WhenTranscriptManifestIsPlaceholder)?|RequiresSameCodexTurn|RejectsMissingCodexTurnWhenObservedTurnKnown|SkipsOversizedTailWhenObservedTurnKnown)|MergeObservedArtifactManifestsUsesObservedWhenTranscriptManifestMalformed|LinkedTranscriptCheckpointIdleUnchangedOnlySkipsSafeCompleteEOF|BridgeClassifyLocalTranscriptCompactOnlyDoesNotBlockTeamsTurn|KnownTranscriptOutbox(HashesIncludeUserStatusAndFinal|DedupeStressCompactCountsOldLiveBeforeCheckpoint)|ShouldSkipTeamsOriginTranscriptRecordIgnoresCodexPromptAdditions|TeamsOriginTranscriptUserDisplayBodyUsesOriginalTeamsPrompt|BridgeControlPollRateLimitDoesNotBlockWorkPollingWithoutRetrySleep)$'
-          lossless_annotation_pattern='Test(UserAnnotated(MessageHTMLSkipsTeamsAttachmentContext|AttachmentMessageHTMLPreservesComplexBodyShape)|BridgeAnnotate(MessageReferencePatchesWithAttachmentsAndNoMirror|FileAttachmentPatchesWithAttachmentsAndNoMirror|AttachmentPatchFailureDoesNotDisableTextAnnotationsOrMirror)|GraphUpdateChatMessageHTMLPreservingAttachments|HelperAttachmentMessageIsSelfIgnoring|BridgePollDropsPersistedInboundAfterUserAnnotation)$'
-          edit_engine_pattern='Test(HostedContentOnlyMessageContextRecognizesFormulaImages|TrustedMathHostedContentRequiresBoundProvenance|TeamsMessageEditExecutor(PreservesPayloadAndDoesNotFetchMessageAgain|SkipsUnsafeAttachmentContext|ClassifiesGraphFailures)|TeamsNonHTMLBodyAsHTMLPreservesLineBreaks|UserAnnotated(MessageHTMLConvertsNonHTMLContentToEscapedHTML|ASRTranscriptMessageHTMLConvertsNonHTMLContentToEscapedHTML|ASRTranscriptMessageHTMLHandlesMultipleMediaAndIsIdempotent)|BridgeAnnotate(PlainSelfMessageUsesBodyOnlyPatchAndNoMirror|MentionOnlySelfMessagePreserves(MentionPayloadAndNoMirror|MismatchedMentionPayload)|ForwardedMessageReferencePatchesWithAttachmentsAndNoMirror|MixedAttachmentContextPreservesPayloadMentionsAndNoMirror|AttachmentPayloadOrderMayDifferFromPlaceholderOrder|UnsafeAttachmentContextSkipsGraphWriteAndMirror|LiteralAttachmentTagTextSkipsConservatively|IncomingUserMessageSkipsMediaCardUntilASRTranscript|ASRTranscriptPreservesMediaAttachmentMentionsAndNoMirror|ASRTranscriptBadRequestDoesNotDisableTextAnnotationsOrMirror|ExternalAttachmentContextDoesNotPatchOrMirror)|BridgeFreezeNoticePatch(PreservesAttachments|PreservesMentions|AllowsTrustedMathHostedContent|UsesGlobalMathProvenance|SkipsUnsafeAttachmentContext)|AppendFreezeNoticeToMessageHTMLConvertsNonHTMLContentToEscapedHTML|BridgePollOnce(ParksIdleWorkChatAndAppendsFreezeNoticeToLatestMessage|SendsStandaloneFreezeNoticeWhenLatestMessage(PatchRejected|UnsafeToPatch)))$'
-          workflow_pattern='Test(WorkflowFallback(FormatsLocalSessionMentionAsFocusedClickableMessage|EscapesTextAndDoesNotLinkUnsafeURL)|WorkflowNotificationsDisabledByDefault)$'
           history_pattern='Test(SessionDisplayTitle|LoadHistoryIndex_StripsTeamsHelperSuffixFromFirstPrompt|ProcessMetaLine_StripsTeamsHelperSuffixFromFirstPrompt)$'
           go test ./internal/codexrunner -count=1 -run "$runner_pattern" -v
-          go test ./internal/cli ./internal/teams -count=1 -run "$adapter_pattern" -v
-          go test ./internal/teams -count=1 -run "$transcript_pattern" -v
-          go test ./internal/teams -count=1 -run "$bridge_pattern" -v
-          go test ./internal/teams -run '^$' -bench '^Benchmark(ParseChatGPTAppTextInternalEvents|ParseChatGPTAppCheckpointEvents|ReadLinkedTranscriptDeltaChatGPTAppCheckpointEvents|ImportChatGPTAppCheckpointEvents|HistoryTieredScanChatGPTAppCheckpointEvents|HistoryTieredScanChatGPTAppWarmNoChange|PlanChatGPTAppUnknownEvents)$' -benchtime=1x -count=1 -benchmem -v
-          go test ./internal/teams -count=1 -run "$lossless_annotation_pattern" -v
-          go test ./internal/teams -count=1 -run "$edit_engine_pattern" -v
-          go test ./internal/teams -count=1 -run "$workflow_pattern" -v
           go test ./internal/codexhistory -count=1 -run "$history_pattern" -v
-
-      - name: Teams thread recovery and self-echo regressions
-        if: matrix.shard == 'core-b'
-        shell: bash
-        run: |
-          set -euo pipefail
-          thread_recovery_pattern='Test(RunQueuedTurn(BindsDurableThreadWhenRegistryIsStale|IgnoresWrongRegistryThreadWhenDurableThreadExists|BlocksRegistryOnlyThreadAsWeakHint|BlocksMissingThreadWhenPriorCodexTurnExists|BindsThreadFromJournalFallback|IgnoresJournalRecordsForOtherScopeOrChat|BindsThreadFromPriorTurnWhenSessionIsEmpty|BlocksDurableJournalThreadConflict|ConflictingObservedThreadInterruptsWithoutFinal|StreamThreadMismatchInterrupts|FreshFirstTurnCanStartNewThread|BlocksJournalReadErrorBeforeExecutor|StoreReadErrorDoesNotCallExecutor)|RestoreThreadCommand(FillsEmptyBindingAndRejectsUnsafeOverwrites|RejectsThreadBoundToOtherActiveSession)|Poll(DropsExactTeamsStatusSelfEchoWithoutDurableMatch|DropsFreshRenderedCodexOutputLabelsWithoutDurableMatch|DoesNotDropPlainCurrentUserStatusText|DoesNotDropCoworkerStrongStatusText|DropsFreshRenderedCodeAndUserTranscriptSelfEcho)|BridgePollTreatsLateHelperOutboxRaceAsIgnored|TeamsHTMLFirstTextIsStrongLabel|ReadThreadLinkJournal(SkipsCorruptPartialOversizedAndMismatchedLines|BudgetExceededFailsClosed)|ThreadLinkJournalConcurrentAppendAndHashedPath|Teams(ReplaceFileWithRetry(RetriesRetryableErrors|StopsOnPermanentError|BoundsRetryableErrors)|DurableWriteFileUsesTempAndCleansFailedReplace)|Windows(DurableWriteFileRetriesLockedTarget|ReplaceRetryableErrors))$'
-          store_recovery_pattern='Test(MessageProvenance(RecordsHelperOutbox|DoesNotDowngradeHelperOutboxToInbound|AllowsHelperOutboxToReplaceEarlyInbound)|PersistInboundRejects(HelperOutboxMessageID|DeliveredOutboxWithoutProvenance)|HelperOutboxProvenanceSuppressesEarlyQueuedInbound|HasDeliveredOutboxMessageStatusMatrix|ReplaceFileWithRetry(RetriesRetryableErrors|StopsOnPermanentError|BoundsRetryableErrors)|AtomicWriteFileUsesTempAndCleansFailedReplace|Windows(AtomicWriteFileRetriesLockedTarget|ReplaceRetryableErrors))$'
-          outbound_ledger_pattern='Test(GlobalOutboundLedger(PathForRegistryAndStore|RecordLifecycle)|Bridge(SendQueuedOutboxRecordsGlobalOutbound|ShouldIgnoreFreshStrongHelperControlOutput|PollDropsGlobalOutboundFromSiblingScope|ControlPollAllowsFreshHelperPrefixedQuestion|PollAllowsFreshStrongHelperPrefixedUserPrompt))$'
-          go test ./internal/teams -count=1 -run "$thread_recovery_pattern" -v
-          go test ./internal/teams/store -count=1 -run "$store_recovery_pattern" -v
-          go test ./internal/teams -count=1 -run "$outbound_ledger_pattern" -v
-
-      - name: Teams frontier recovery and fenced-page regressions
-        if: matrix.shard == 'core-b'
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Keep the frontier contract tests in a dedicated, non-empty CI
-          # selector. The broad package test is intentionally supplemental;
-          # this step makes it impossible for a renamed test to silently drop
-          # the liveness gate from the core shard.
-          frontier_pattern='^TestPollFrontier'
-          store_pattern='^Test(ChatPollAttemptLifecyclePersistsAndRejectsStaleWriter|ChatPollLifecycleChangesFenceActiveAttemptAcrossBackends|RC16JSONFixtureMigratesAndRoundTripsLegacySafetyState|RC16SQLitePointerFixtureLoadsAndRoundTripsLegacySafetyState|SQLiteFullStateUpdatePreservesNewerChatPollFrontier|SQLiteLegacyPointerUpgradesBeforeNormalWrite|SQLiteHotPollAdmissionFiltersDeferredChatsAndPreservesDueFences)$'
-          frontier_tests="$(go test ./internal/teams -list "$frontier_pattern")"
-          if ! grep -q '^Test' <<<"$frontier_tests"; then
-            echo "frontier selector matched no tests" >&2
-            exit 1
-          fi
-          store_tests="$(go test ./internal/teams/store -list "$store_pattern")"
-          if ! grep -q '^Test' <<<"$store_tests"; then
-            echo "fenced-store selector matched no tests" >&2
-            exit 1
-          fi
-          go test ./internal/teams -count=1 -run "$frontier_pattern" -v
-          go test ./internal/teams/store -count=1 -run "$store_pattern" -v
-          go test ./internal/teams -count=1 -run '^Test(HistoryWatch(TrustedCleanCycleDoesNotSelectAllHistoryFiles|UncertainCycleSelectsCompleteHistorySet|TrustedIdleCycleReselectsCheckpointedUnfinishedTail|DirtyPathsRetainsFailedPathUntilAcknowledged|DirtyHintWorkerFailureRetainsRetryBoundary|WorkerFailureRetriesWithoutSecondEvent)|GlobalInbound(SQLiteWriterReopensReplacedDatabase|LedgerClaimLifecycle|LedgerWriterClaimLifecycle|LedgerMigrationDoesNotRegressNewerSQLiteState)|BridgePollWindow(CompletionFailureDoesNotMarkRegistrySeen|SidecarReplacementBeforeCompletionRetriesMessage))$' -v
-          go test ./internal/teams/store -count=1 -run '^TestMessageLookupBatch(MatchesSingleLookupAcrossBackends|ReturnsMissingIDsAsZeroLookup)$' -v
-          if [[ "${RUNNER_OS:-}" == "Linux" ]]; then
-            go test ./internal/teams -count=1 -run '^TestLinuxHistoryWatchEvents(DetectAppend|FeedBridgeDirtyPaths|ReleaseObsoleteDirectories|IncrementalUpdateRetainsExistingDirectory|OverflowIsUncertain|ReaddsRecreatedDirectory)$' -v
-          fi
-
-      - name: Teams bridge scheduling and history sync regressions
-        if: matrix.shard == 'core-b'
-        shell: bash
-        run: |
-          set -euo pipefail
-          bridge_pattern='Test(BridgePollBatchQueuesLaterMessageAfterStartingFirst|BridgePollWindowSQLiteBatchLookupAndInboundWriter|BridgeAsync(QueuedTurnsRunAcrossSessionsButSerializeEachSession|TurnsQueuesTeamsInputWhileCodexIsRunning|TurnsSendsQueuedNoticeForEveryNewBacklogMessage)|Bridge(BackgroundImportQueuesOneBatchAndResumesLater|MainLoopOutboxFlushUsesSmallBudget|SkippedOutboxDoesNotBlockQueuedTurnWaitNotice|QueuedTurnWaitNoticeFailureDoesNotStarveLaterSessions|QueuedTurnGateErrorDoesNotStarveLaterSessions|InterruptedTurnDropsLateStreamingStatus|TranscriptImportDeliveryLedgerPreventsBatchReplayAfterOutboxPruneAndCheckpointRegression|MarkUnreadFailureDoesNotFailFinalAnswer|AckSendFailureDoesNotBlockCodexTurn|TreatsFinalAnswerCanceledLaunchAsCompleted|RecoversCompletedHistoryFinalAfterCanceledExecution|DoesNotRecover(Stale|Undated)HistoryFinalAfterCanceledExecution|TreatsUnrequestedCanceledExecutionAsInterrupted|WorkStatusMapsContextCanceledFailure|Outbox(RateLimitBlocksOnlyFailingChat|RateLimitRestartReplayPreservesPerChatFIFO|UploadRateLimitRecordsBlockWithoutRetrySleep)|AcceptedOutboxRecoveryRateLimitRecordsBlockWithoutRetrySleep|Flush(PendingOutboxContinuesOtherChatsAfterSendFailure|PendingOutboxContinuesAfterRateLimitedChat|PromotesAcceptedOutboxDuringRateLimitWithoutPosting|RecoversGraphMessageIDAfterAcceptedPersistFailure|RecoversAcceptedOutboxFromGraphAfterRestart|DefersGraphRecoveryWhenListMessagesFails|DoesNotGraphRecoverOrdinaryQueuedSendError))|EarlierUnsentOutbox(StatusMatrix|IgnoresSkippedMessages)|PendingOutbox(CrashRecoveryPromotesAcceptedDespiteRateLimitedChat|StatusMatrix)|OutboxBlocksUpgradeStatusMatrix|MarkTurnInterruptedSkipsPendingTransientOutbox|RecordTranscriptDeliveryAdvancesCheckpointPosition|BridgeWarnsWhenCodexIdleMayBeStuck|BridgeQueuesTeamsPromptWhileExternalCodexTranscriptActive|BridgeSessionCancel(LastRunningTurnCancelsExecutor|RunningTurnWithoutLiveHandleExplainsLimit)|BridgeSessionTurnQueueSnapshotListsRunningAndQueuedInExecutionOrder|LatestCancelableTurnIDPrefersRunningOverQueued|BridgePollChatReadRateLimitBlocksOnlyThatChat|BridgePollOnce(BoostsAfterRealInboundAndFinalOutput|PrioritizesRunningWorkChatUnderPerCycleLimit|ContinuesOtherDueChatsAfterReadRateLimit|ParksIdleWorkChatAndAppendsFreezeNotice|SendsStandaloneFreezeNoticeWhenNoAppendTarget|DoesNotRepeatFreezeNoticeFrom(SentOutbox|GraphHistory)|SendsNewFreezeNoticeAfterEarlierResume|IgnoresStaleControlFallbackRegistryProjection)|BridgeWorkPublishHistoryImportsBlockedBacklogAndRunsQueuedTurn|BridgeBlocksQueuedTurnOnLocalToolOnlyTranscriptActivity|BridgeControl(Open(ParkedLinkedSessionResumesPolling|NumberParkedLinkedSessionResumesPolling|NonParkedLinkedSessionDoesNotResumeAgain|ClosedLinkedSessionDoesNotResumeParkedPoll)|SelectExistingParkedSessionResumesPolling)|BridgeControlResume(ClearsStaleContinuationBeforePolling|KeyOnlyReactivatesMatchingParkedChat|KeyReactivatesParkedWorkChat)|BridgeControlPoll(RateLimitRecordsBlockWithoutRetrySleep|IgnoresHistoricalHelperOutputAndClearsContinuation)|BridgePublishExistingParkedSession(ResumesPolling|WithActiveImportDoesNotResumePolling)|BridgeSyncLinkedTranscript(DedupesQueuedLiveFinal|ResumesInterruptedImportAfterOwnerRestart|RetriesRemainingRecordsFromSameLine|DeliveryLedgerPreventsBatchReplayAfterOutboxPruneAndCheckpointRegression|MultipartDeliveryLedgerPreventsBatchReplayAfterOutboxPruneAndCheckpointRegression|DeliveredLedgerDoesNotTriggerBacklogBlockAfterCheckpointRegression)|BridgeHistoryWatch.*|UserFacingFailureMessageMapsOnlyExactContextCanceled|LinkedCheckpointFileUnchangedRequiresFullyProcessedOffset|ChatPollScheduleCanClearContinuationPath|StoreConcurrentDistinctSessionWritersDoNotCrossMutate|InboundPollDecision(Thresholds|FutureActivityStaysHot|IgnoresControlContinuation)|SortInboundPollDecisionsPrioritizesRunningUnderCycleCap)$'
-          message_reference_pattern='Test(PersistInboundStoresOnlyControlFallbackMessageReferenceContext|Bridge(ControlMessageReferenceFallsBackToCodex|ControlAskMessageReferenceIncludesQuoteContext|ControlExplicitCommandRejectsMessageReference|ControlMixedMessageReferenceAndFileIsRejectedWithoutCodex|UpgradeDrainDefersControlFallbackMessageReferenceContext|SessionMessageReference(DefersUntilTranscriptImportCompletes|IsReadForCodexTurn|FallsBackToPreviewWhenGraphReadFails|QuoteOnlyRuns|DoesNotUseCrossChatFetchBody|LimitRejectsWithoutCodex)|SessionForwardedMessageReferenceUsesPreviewOnly|ExternalUserMessageReferenceRunsWithoutUserMirror|RetryTurnPreservesMessageReferenceContext|SessionReferenceFileAttachmentIsDownloadedForCodexTurn|ControlAttachmentGetsExplicitUnsupportedResponse))$'
-          transcript_pattern='Test(ReadSessionTranscriptSince(RefusesMissingCheckpoint|MatchesFullTailForSourceCheckpoint|MatchesFullTailForFallbackCheckpoint|RefusesInvalidLineLikeCheckpoint|FallsBackForPrefixDuplicateSourceIDs|AvoidsFullParseWorkForTail)|HistoryTiered(StatDetectsOnlyChangedFiles|ListSessionFilesInDirs|ScanTail(WaitsForCompletedTurn|MethodTurnCompletedWithItems|MultipleFinalAnswersInOneTail|UsesLastAssistantBeforeTerminal|DoesNotCompleteDifferentTurn|TreatsFinalAnswerPhaseAsComplete|DropsPrefixFinalAnswerFragment(WhenFullResponseFollows|AfterIntermediateAssistant)|FallbackIDsMatchFullParserWithSessionID|DoesNotTreatFinalAnswerTextAsPhase|DoesNotConsumeIncompleteTrailingLine|CapsLargeTail|CanRecoverAfterLargeTailCap|TruncateDoesNotSkipRewrittenContent)))$'
-          render_artifact_pattern='Test(DefaultTeamsChunkLimitsAreClientConservative|RenderTeamsHTMLCodexMarkdownRulesAndBlockquotesUseStructuralHTML|CodexOutputSymbolStressSurvivesTeamsCitationFilter|StripOAIMemoryCitationBlocks(RemovesInlineClosedBlock|PreservesFencedExamples|PreservesLiteralMultilineTagStress)|PlanTeamsHTMLChunks(Preserves(StatusListItemLines|LineBoundariesAcrossLimits)|UnicodeStressKeepsMarkersAndLimits|TextConservationStressCorpus|MarkdownTableKeepsEveryRow)|ParseArtifactManifestAllowsZipArtifacts|PrepareOutboundAttachmentAllowsZip|BridgePoll(DropsRenderedHelperLabelOutputInWorkChat|AllowsOwnerMessageStartingWithHelperPrefix)|BridgeShouldIgnoreFreshRenderedHelperCanceledEcho|P1ArtifactManifest(WithoutFileWriteAuthLeavesFinalVisibleAndWarns|RejectedAfterFinalWhenAuthExists)|BridgeAttachment(SendFailureRestartReusesUploadedDriveItem|ReplayRejectsTamperedStagedFileBeforeUpload)|SimulatedLive(TeamsRenderCasesRoundTripThroughGraphCI|HelperE2EControlWorkAndStatusCI))$'
-          workflow_pattern='Test(WorkflowNotificationsDisabledByDefault|WorkflowNotification(SendsAfterDurableOutboxSent|SendsDetectedCodexAnswerOnce|FlushLimitSendsOneQueuedCard|SendsManualHelperUpgradeCard|SkipsPlainAutoHelperUpgradeNotice|FallsBackToSidecarConfigWhenOldHelperErasesState|DoesNotDuplicateAfterAmbiguousFailure|ConcurrentFlushClaimsOnce|StaleSendingBecomesUnknown|RetriesOnlyRetryableFailuresWithBackoff|SuppressesAfterControlChatRebind|SkipsHistoricalImportsAndNotifiesDetectedSyncFinals|SupportsRecreatedChatMovedNotice)|NeedsAttentionFallback(MirrorsWorkChatBeforeControlMentionWhenWorkflowNotificationDisabled|MirrorsWorkChatWithSQLiteWorkflowSnapshot|WorkChatMirrorIsIdempotent|DoesNotMirrorWorkChatWithoutControlFallback)|NeedsAttentionWebhookFailureMirrorsWorkChatOnceBeforeControlFallbackWithSQLite|NeedsAttentionMirrorUsesEventWorkChatIDWithoutSessionSnapshot|QueueOutbox(SuppressesOwnerMentionWhenWorkflowNotificationEnabled|KeepsOwnerMentionWhenWorkflowNotificationDisabled)|TranscriptDeliverySuppressesOwnerMentionWhenWorkflowNotificationEnabled|SendQueuedOutbox(FallsBackToControlMentionAfterDefiniteWebhookFailure|RedirectsOwnerMentionToControlFallbackWhenWorkflowNotificationDisabled|SuppressesPersistedOwnerMentionWhenWorkflowNotificationEnabled)|HelperNeedsAttentionQueuesWorkflowCard(WithoutOwnerMention|AndMirrorsWorkChatWithSQLiteSnapshot)|WorkflowWebhookURLFileSafety|ConfigureWorkflowNotificationsFromWebhookURLWritesPrivateSecret|BridgeControlWebhook(CommandConfiguresWorkflowWithoutRunningCodex|RejectsInvalidURLWithoutRunningCodex)|PostWorkflowWebhook(SendsAdaptiveCard|RejectsUnsafeActionURL|RejectsNonAbsoluteWebhookURL|RejectsOversizedPayload|RetriesTooManyRequests|WithoutRateLimitRetryReturnsBeforeRetryAfterSleep|ClassifiesServerErrorAsDeliveryUncertain|ClassifiesTransportErrorAsDeliveryUncertain|ClassifiesInterruptedRateLimitWaitAsRetryable))$'
-          workflow_cli_pattern='TestTeamsWorkflowStatus(RedactsWebhookURL|ReadsSidecarConfig)$'
-          attachment_file_pattern='Test(DownloadReferenceFileAttachments(UsesDriveItemMetadataName|WritesPrivateFile)|ReferenceAttachmentLocalName(TruncatesForPathBudgetAndDeduplicates|HandlesTinyPathBudgetDuplicates)|BestReferenceAttachmentNameUsesMetadataWhenAttachmentNameHasNoExtension|GraphGetSharedDriveItemMetadataReturnsNameAndMimeType|ParseArtifactManifestAllowsArbitraryExtensionsByDefault|PrepareOutboundAttachmentAllowsArbitraryExtensionAndRejectsSymlink)$'
-          go test ./internal/teams ./internal/teams/store -count=1 -run "$bridge_pattern" -v
-          go test ./internal/teams -count=1 -run 'TestBridgePollOnce(ProbesAlreadyParkedNoticeSentWithoutFreezeRewrite|RepairsAlreadyNotifiedParkedPollMissingParkedAt)$' -v
-          go test ./internal/teams -count=1 -run "$message_reference_pattern" -v
-          go test ./internal/teams -count=1 -run "$transcript_pattern" -v
-          go test ./internal/teams -count=1 -run "$render_artifact_pattern" -v
-          go test ./internal/teams -count=1 -run "$attachment_file_pattern" -v
-          go test ./internal/teams -count=1 -run "$workflow_pattern" -v
-          go test ./internal/teams -count=1 -run 'TestSendQueuedOutboxFallsBackToControlMentionAfterDefiniteWebhookFailureSQLite$' -v
-          go test ./internal/cli -count=1 -run "$workflow_cli_pattern" -v
-
-      - name: Teams scalar hot admission regressions
-        if: matrix.shard == 'core-b'
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Keep the projection contract in an explicit, non-empty selector.
-          # The broad store test remains supplemental; this gate protects the
-          # trust/revision fence, JSON fallback, selected hydration, and the
-          # single-connection quarantine path from silently disappearing when
-          # a test is renamed or moved.
-          hot_admission_pattern='^Test(SQLiteHotPollScalarProjectionTrustIsFencedAndFallsBack|SQLiteHotPollTrustedWorkCandidatesMatchJSONOracle|SQLiteHotPollSelectedRefreshHydratesFreshSession|SQLiteTurnProjectionBackfillStopsAtDurablePageBoundary|SQLiteHotPollScalarProjectionTriggerDefinitionsAreCurrent|SQLiteHotPollScalarTrustRevokesContradictoryJSONWithMatchingRevision|SQLiteHotPollTrustedReadyUsesCanonicalTimeForDueGate|SQLiteHotPollAdmissionFallbackKeepsHealthyRowsOnScalarLane|SQLiteHotPollTrustedWorkCandidatesQuarantinesBadRowsWithoutDeadlock|SQLiteHotPollTrustedWorkCandidatesContinuesPastInvalidPage|SQLiteHotPollAdmissionFallbackProbeUsesPartialIndexes|SQLiteHotPollScheduleAndWorkCandidatesMatchesSeparateAdmission|SQLiteHotPollSelectedStateForChatsAndSessionsIsBoundedAndFresh|SQLiteOpenBackfillsLegacyChatSequencesWhenTableAlreadyExists|SQLiteQueueOutboxAvoidsColdHistoryWatchHydration)$'
-          listed="$(go test ./internal/teams/store -run '^$' -list "$hot_admission_pattern")"
-          if ! grep -q '^Test' <<<"$listed"; then
-            echo "scalar hot admission selector matched no tests" >&2
-            exit 1
-          fi
-          go test ./internal/teams/store -count=1 -run "$hot_admission_pattern" -v
-
-      - name: Teams durable deferred-retry and unknown-result regressions
-        if: matrix.shard == 'core-b'
-        shell: bash
-        run: |
-          set -euo pipefail
-          # These tests are kept in a dedicated selector because the broad
-          # Teams patterns are intentionally partitioned and could otherwise
-          # omit the per-row retry gate or unknown-POST fence silently.
-          recovery_store_pattern='^Test(InboundRecoveryCandidatesAcrossBackends|QueueTurnReconcilesExistingDeferredInboundAcrossBackends|QueueTurnFindsLegacyTurnByInboundEventIDWithoutCreatingDuplicate|QueueTurnFailsClosedWhenInboundHasConflictingLegacyTurns|QueueTurnRejectsForeignInboundAndTurnAcrossBackends|QueueTurnRejectsIgnoredInboundWithoutRevivingAcrossBackends|TerminalIgnoredInboundClearsRetryMetadataAcrossLifecyclePaths)$'
-          listed_store="$(go test ./internal/teams/store -count=1 -run '^$' -list "$recovery_store_pattern")"
-          if ! grep -q '^Test' <<<"$listed_store"; then
-            echo "deferred-retry store selector matched no tests" >&2
-            exit 1
-          fi
-          go test ./internal/teams/store -count=1 -run "$recovery_store_pattern" -v
-          recovery_bridge_pattern='^TestBridge(DeferredControlNewUnknownCreateResultUsesStableCreateOrGetKey|DeferredInboundGraphFailureDoesNotBlockLaterRow|DeferredAttachmentNotFoundUsesExplicitPermanentDisposition|DeferredAttachmentContentNotFoundUsesExplicitPermanentDisposition|AttachmentUploadSessionUnknownPOSTIsDurablyNonReplayable|SQLiteSyntaxCorruptPollRepairsWithoutGraphHead)$'
-          listed_bridge="$(go test ./internal/teams -count=1 -run '^$' -list "$recovery_bridge_pattern")"
-          if ! grep -q '^Test' <<<"$listed_bridge"; then
-            echo "deferred-retry bridge selector matched no tests" >&2
-            exit 1
-          fi
-          go test ./internal/teams -count=1 -run "$recovery_bridge_pattern" -v
-          deferred_safety_pattern='^(TestClassifyDeferredInboundFailureKeepsExternalBoundarySafe|TestDeferred.*)$'
-          listed_deferred_safety="$(go test ./internal/teams -count=1 -run '^$' -list "$deferred_safety_pattern")"
-          if ! grep -q '^Test' <<<"$listed_deferred_safety"; then
-            echo "deferred safety selector matched no tests" >&2
-            exit 1
-          fi
-          go test ./internal/teams -count=1 -run "$deferred_safety_pattern" -v
-
-      - name: Teams bounded Graph fault acceptance
-        if: matrix.shard == 'core-b' && runner.os == 'Linux'
-        shell: bash
-        run: |
-          set -euo pipefail
-          go test ./scripts/ci -count=1 -run '^TestTeams(BoundedAcceptanceDockerWrapper|RealDataDockerWrapper)' -v
-          bash scripts/ci/teams_bounded_acceptance_docker.sh
-
-      - name: Teams ambiguous execution diagnostic regressions
-        if: matrix.shard == 'core'
-        shell: bash
-        run: |
-          set -euo pipefail
-          go test ./internal/teams -count=1 -run 'TestBridgeQueuedTurnAmbiguousErrorIncludesDiagnostic$' -v
-
-      - name: Teams control dashboard formatting regressions
-        if: matrix.shard == 'core'
-        shell: bash
-        run: |
-          set -euo pipefail
-          teams_pattern='Test(Bridge(Control(DashboardReadableWorkspaceAndSessionFormatting|Status(ShowsNewestActiveChatLast|ChunkingKeepsNewestActiveChatLast)|WorkspacesAndSessionsDoNotRunCodex|WorkspaceListDoesNotShowWorkspaceFingerprint|WorkspaceListUsesSessionProjectPathWhenProjectPathMissing|WorkspaceSessionsOnlyShowsSelectedWorkspace|NewUsesSelectedWorkspaceWhenNoDirectoryGiven|UnknownTextFallsBackToCodex|HelperUpdateQuestionFallsBackToCodex|AskUsesExplicitFallbackText|FallbackEchoDoesNotLeakHiddenPrompt)|Control(FallbackPromptIncludesControlHistoryContext|RecognizedCommandWritesControlHistory|HistoryRedactsSecretsBeforePrompt)|DashboardProjectAndSessionListsUseStructuralSeparatorsAndIndent|UpgradeDrainDefersAndReplaysControlFallbackOnce|MigrateRegistryProjectionSkipsAndSanitizesControlFallback|RestoreRegistryFromStore(RepairsStaleSessionProjection|KeepsLegacyRegistryWhenStoreHasNoSessions))|ControlChatHistoryReadsLongEscapedLegacyEntry|ControlDashboard(CountsWorkspaceSessionStatuses|OrdersWorkspacesAndSessionsByRecentActivity|LargeCorpusStressKeepsCurrentViewDescendingPrivateNumbers)|ControlFallbackPrompt(UsesCodexhistoryMarker|WithContextIncludesHelpAndRedactsSecrets|DefaultHelpHasCommandDigest|TruncatesUTF8ContextSafely)|StripHelperPromptEchoes(RemovesHelperHistoryMarkers|RemovesGeneratedControlFallbackContext))$'
-          cli_pattern='TestTeams(ControlFallbackHelpContextCoversOperationalCommands|LocalSupervisorFallbackDocsStayAligned)$'
-          go test ./internal/teams -count=1 -run "$teams_pattern" -v
-          go test ./internal/cli -count=1 -run "$cli_pattern" -v
-
-      - name: Teams skills command regressions
-        if: matrix.shard == 'core'
-        shell: bash
-        run: |
-          set -euo pipefail
-          skills_pattern='Test(HandleSkillsCommandAddUsesTeamsHyperlinkHref|TeamsSkillAddURLFromTeamsMessagePrefersSafeMatchingHref)$'
-          go test ./internal/teams -count=1 -run "$skills_pattern" -v
-
-      - name: Teams background keepalive race regressions (Linux only)
-        if: matrix.shard == 'core' && runner.os == 'Linux'
-        shell: bash
-        env:
-          CODEX_HELPER_TEAMS_TOKEN_CACHE: ${{ runner.temp }}/teams-missing-token.json
-          CODEX_HELPER_TEAMS_READ_TOKEN_CACHE: ${{ runner.temp }}/teams-missing-read-token.json
-          CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE: ${{ runner.temp }}/teams-missing-file-token.json
-        run: |
-          set -euo pipefail
-          teams_runtime_keepalive='Test(TeamsBackgroundKeepalive|TeamsStartupFallback|GlobalInbound|InboundPoll|Bridge(LongRunningTurnKeepsOwnerHeartbeatActive|IdleOwnerHeartbeatPreservesActiveTurnFields|ListenStandbyDoesNotCreateControlChatOrPoll|PollChatReadRateLimitBlocksOnlyThatChat|ControlPollRateLimitDoesNotBlockWorkPollingWithoutRetrySleep|PollOnceContinuesOtherDueChatsAfterReadRateLimit|AckSendFailureDoesNotBlockCodexTurn|OutboxUploadRateLimitRecordsBlockWithoutRetrySleep|AcceptedOutboxRecoveryRateLimitRecordsBlockWithoutRetrySleep|SkippedOutboxDoesNotBlockQueuedTurnWaitNotice|QueuedTurnWaitNoticeFailureDoesNotStarveLaterSessions|QueuedTurnGateErrorDoesNotStarveLaterSessions|Flush(PendingOutboxContinuesOtherChatsAfterSendFailure|PromotesAcceptedOutboxDuringRateLimitWithoutPosting)|ReloadDraining(SessionMessage|ControlNew)IsDeferredAndReplayed)|BridgeControlRestart(DoesNotRunDuringHelperReloadCodexUpgradeOrManualDrain|RunsAfterExpiredHelperUpgradeDrain|DoesNotRecoverExpiredHelperUpgradeOwnedByRemoteMachine|NowBlocksExpiredHelperUpgradeWithActiveTurn|ForceRunsAfterExpiredHelperUpgradeWithActiveTurn|RunsAfterStaleHelperReloadDrain|DoesNotRecoverStaleHelperReloadOwnedByRemoteMachine|NowBlocksStaleHelperReloadWithActiveTurn|ForceRunsAfterStaleHelperReloadWithActiveTurn)|BridgeControlReload(RetriesStaleHelperReloadDrain|DoesNotRecoverStaleHelperReloadOwnedByRemoteMachine|NowBlocksStaleHelperReloadWithActiveTurn)|Bridge(CompletesExpiredHelperUpgradeDrainOnStart|DoesNotCompleteExpiredHelperUpgradeDrainOwnedByRemoteMachine)|ClaimControlLease(PrimaryBeatsEphemeralAndEphemeralStaysStandby|DoesNotPreemptActiveTurn|ConcurrentManyMachinesSingleActive)|ControlLeaseForwardJumpAllowsTakeoverAfterSleep|IsStaleHandlesFutureHeartbeatAndThresholdBoundary|ValidateAndReleaseControlLease|RecordOwnerHeartbeat(WritesAndReadsOwner|UpdatesExistingOwner|TreatsExecRestartAsSameOwner|RefusesLiveOwnerWithDiagnostic|ReplacesDeadLocalOwnerBeforeStale)|RecoverStaleOwner(ReplacesStaleOwner|TreatsExecRestartAsSameOwner|ReplacesDeadLocalOwnerBeforeStale|RefusesLiveOwner)|ClearOwner(IsIdempotent|IfSameDoesNotClearDifferentOwner|IfSameDoesNotClearSameProcessDifferentInstance)|Graph(DoesNotRetryPostServerErrors|RetriesPostTooManyRequestsAfterRetryAfter)|UpgradeRescue(InterruptsRunningPreservesQueuedAndSkipsTransientOutbox|PreservesProtectedOutboxBlocker|FencesStaleOwnerButRefusesLiveOwner)|Helper(UpgradeDrainExpired|ReloadDrainStale)|OwnerAppearsLocal|EarlierUnsentOutboxStatusMatrix|PendingOutbox(CrashRecoveryPromotesAcceptedDespiteRateLimitedChat|StatusMatrix)|OutboxBlocksUpgradeStatusMatrix|BridgeAsyncQueuedTurnsRunAcrossSessionsButSerializeEachSession|BridgePollBatchQueuesLaterMessageAfterStartingFirst)'
-          # The inbound prune/reopen fixture observes a hosted-runner SQLite
-          # lock boundary. Keep it out of this broad race process and run it
-          # immediately below in its own serial process, preserving coverage
-          # without letting unrelated race fixtures perturb the observation.
-          go test -race ./internal/teams ./internal/teams/store -count=1 -skip '^TestGlobalInboundSQLiteWriterDefersPruneUntilClose$' -run "$teams_runtime_keepalive" -v
-          go test -race ./internal/teams -count=1 -parallel=1 -run '^TestGlobalInboundSQLiteWriterDefersPruneUntilClose$' -v
 
       - name: Teams supervisor smoke (Linux/macOS)
         if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
@@ -1823,7 +1266,6 @@ jobs:
           helper_pattern='Test(HandleUpdateAndRestartUsesSharedInstallLock|TeamsService(LinuxAuto.*|WSL.*|SystemdUserUnavailableErrorMatrix|Windows(AccessDeniedErrorMatrix|ScheduledTasksUnavailableErrorMatrix)|InstallCreatesMissingManagedDefaultBeforeRepointingFromGoBin|InstallCreatesMissingCXPShimWhenManagedTargetCurrent|InstallUsesStablePathWhenExecutableIsNFSSillyRename|BootstrapDryRunDoesNotWriteOrStart|BootstrapNoStartRepairsButDoesNotStart|InstallPreservesUpdateEnvironmentAndBlocksVolatile|InstallWritesLocalSupervisorConfigWhenSystemdUserUnavailable|RepairMergesAllowedEnvironmentFromExistingSystemdUnit|StartPendingActivationUsesStableExecutablePath|LocalSupervisor.*|RestartForce(RecoversActiveOwnerBeforeRestart|RecoversBeforePendingWindowsActivation))|TeamsBackgroundKeepalive(WSLBootstrap(FallsBackWhenScheduledTasksCmdletsUnavailableCI|DoesNotSkipRetireWhenTaskConfigExistsCI)|AutoEnsureWSLScheduledTasksUnavailableSkipsRetireWithoutTaskConfigCI)|PendingHelperActivationAllowsTempSourceButRequiresStableDestination|TeamsCodexChildEnv(DoesNotExposeTransientHelperPath|ExposesRecoveredStableHelperPath)|ResolveTeamsHelperExecutableStatusReportsRawStableAndActivationPending|FormatTeamsHelperVersionStatusReportsOwnerEntryAndPending|RunInternalNpmWrapper.*|OSExecutableUsageIsCentralized|LegacyUpdater.*)'
           go test ./internal/cli -count=1 -run "$helper_pattern" -v
           go test ./internal/update -count=1 -run 'Test(ResolveInstallPath(UsesStableSiblingForNFSSillyRename|FallsBackToStableArgv0Last|RejectsExplicitNFSSillyRename)|PerformUpdateUsesStableInstallTargetForTransientRuntimePath)$' -v
-          go test ./internal/teams/store -count=1 -run 'Test(CurrentOwner(StoresStableExecutableWhenRawPathIsTransient|FallsBackToStableArgv0WhenRawPathIsGoBuild|RejectsUnresolvedTransientExecutable|RejectsUnresolvedGoBuildHelperExecutable|AllowsUnresolvedWindowsGoTestExecutable)|SameOwnerProcessCanonicalizesNFSSillyRename)$' -v
           go test ./internal/codexrunner -count=1 -v
 
       - name: Self-update clean-env regressions (Linux/macOS)
@@ -1851,26 +1293,11 @@ jobs:
         if: matrix.shard == 'core'
         run: go vet ./...
 
-      - name: Teams perf benchmark smoke
+      - name: Codex runner benchmark smoke
         if: matrix.shard == 'state-perf' && matrix.partition == 0 && runner.os == 'Linux'
         shell: bash
         run: |
           go test ./internal/codexrunner -run '^$' -bench 'Benchmark(CompletedFinalAgentMessageForTurnsList|AppServerProtocolFinalNotifications)$' -benchtime=100x -count=1 -benchmem
-          go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteWorkflowNotificationNoPendingFlushProfiles/many-long-chats$' -benchtime=1x -count=1
-          go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteSelectedSnapshotLargeColdStateProfiles/many-long-chats/has-pending-workflow-notifications$' -benchtime=1x -count=1
-          go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteNewChatFirstMessageStageWrites$' -benchtime=1x -count=1
-          go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLiteNewChatCompleteTurnBreakdown$' -benchtime=1x -count=1
-          go test ./internal/teams -run '^$' -bench 'BenchmarkCXPPerfModelSQLite(LongTranscriptFinalArrival|StatusOnlyFinalArrival)$' -benchtime=1x -count=1
-          go test ./internal/teams -run '^$' -bench '^BenchmarkCXPPerfModelSQLiteTargetedSessionQuarantine$' -benchtime=1x -count=1 -benchmem
-          go test ./internal/teams/store -run '^$' -bench '^BenchmarkSQLiteHotPollAdmissionScalarVsLegacy$' -benchtime=1x -count=1 -benchmem
-          # The 2100-chat RealisticMixedUser idle benchmark is an intentionally
-          # large profiling fixture. A single iteration can exceed the owner
-          # lease and take tens of minutes, so it belongs in a dedicated
-          # profiling run rather than this bounded PR smoke lane. The selected
-          # snapshot benchmark above still exercises the large-state SQLite
-          # admission path here.
-          go test ./internal/teams -run '^$' -bench '^BenchmarkLinkedTranscriptProvenanceMatrix$' -benchtime=10ms -count=1 -benchmem
-          go test ./internal/teams -run '^$' -bench '^BenchmarkHistoryWatchUnchangedPartialTail(Poll|CheckpointPersistence)$' -benchtime=100ms -count=1 -benchmem
 
       - name: Skills local git smoke (Linux/macOS)
         if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
@@ -2226,36 +1653,6 @@ jobs:
             throw "default managed upgrade changed PATH-selected Codex from $pathCodexBefore to $pathCodexAfter"
           }
 
-      - name: Teams target-account PATH Codex upgrade (Linux/macOS)
-        if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
-        shell: bash
-        run: |
-          set -euo pipefail
-          prefix="$RUNNER_TEMP/teams-target-codex"
-          bash scripts/ci/retry.sh 5 5 npm install -g --prefix "$prefix" --include=optional @openai/codex
-          NPM_CONFIG_PREFIX="$prefix" \
-            CODEX_NPM_PREFIX="$prefix" \
-            CODEX_HELPER_TEAMS_UPGRADE_LIVE=1 \
-            CODEX_HELPER_TEAMS_UPGRADE_CODEX_DIR="$prefix/bin" \
-            CODEX_HELPER_TEAMS_UPGRADE_PATH_MODE=service \
-            go test ./internal/cli -count=1 -run ^TestTeamsCodexUpgradeLiveTargetPATH -v
-
-      - name: Teams target-account PATH Codex upgrade (Windows)
-        if: matrix.shard == 'windows-codex-e2e' && runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $PSNativeCommandUseErrorActionPreference = $true
-          $prefix = Join-Path $env:RUNNER_TEMP "teams-target-codex"
-          & .\scripts\ci\retry.ps1 5 5 npm install -g --prefix $prefix --include=optional @openai/codex
-          $env:NPM_CONFIG_PREFIX = $prefix
-          $env:CODEX_NPM_PREFIX = $prefix
-          $env:CODEX_HELPER_TEAMS_UPGRADE_LIVE = "1"
-          $env:CODEX_HELPER_TEAMS_UPGRADE_CODEX_DIR = $prefix
-          $env:CODEX_HELPER_TEAMS_UPGRADE_PATH_MODE = "service"
-          $env:CODEX_HELPER_TEAMS_UPGRADE_CALLER_PROFILE = $env:USERPROFILE
-          go test ./internal/cli -count=1 -run ^TestTeamsCodexUpgradeLiveTargetPATH -v
-
       - name: Codex approval, history, and cancellation runtime integration (Linux/macOS)
         if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
         shell: bash
@@ -2307,83 +1704,6 @@ jobs:
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
           go test ./internal/cli -run TestEnsureCodexInstalledIntegrationManagedNode -count=1 -v
-
-  teams-recovery-test:
-    name: Teams transcript recovery (${{ matrix.os }} / ${{ matrix.mode }} / partition ${{ matrix.partition }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        mode: [normal, race]
-        partition: [0, 1]
-        # Every hosted OS gets both independent partitions. The Unix race
-        # corpus now has the same long listener/SQLite tail as Windows; keeping
-        # a single Unix partition makes a healthy job wait behind unrelated
-        # manifest entries for 30–45 minutes. Each partition uses its own
-        # runner filesystem, and the manifest runner still serializes the
-        # resource-sensitive entries within that runner.
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.25.11"
-          cache: true
-
-      - name: Validate Teams recovery manifest
-        shell: bash
-        run: |
-          set -euo pipefail
-          # Keep selector validation mandatory in both modes. The manifest
-          # runner still builds once per package and runs each entry in its own
-          # process with its declared watchdog.
-          go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery -list-only
-
-      - name: Run Teams recovery manifest (normal)
-        if: matrix.mode == 'normal'
-        shell: bash
-        env:
-          CODEX_HELPER_CI_PHASE_DIR: ${{ runner.temp }}/teams-recovery-phases
-          # Go on Windows otherwise places t.TempDir and go-build files under
-          # the user profile's C: temp directory.  The hosted runner's
-          # RUNNER_TEMP is the isolated per-job workspace; keeping SQLite WAL,
-          # phase traces, and compiler scratch on that volume avoids unrelated
-          # profile/antivirus I/O from changing durable test latency.
-          TMPDIR: ${{ runner.temp }}
-          TMP: ${{ runner.temp }}
-          TEMP: ${{ runner.temp }}
-        run: |
-          set -euo pipefail
-          partition_flags=("-partition-count=2" "-partition-index=${{ matrix.partition }}")
-          go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery "${partition_flags[@]}"
-
-      - name: Run Teams recovery manifest (race)
-        if: matrix.mode == 'race'
-        shell: bash
-        env:
-          CODEX_HELPER_CI_PHASE_DIR: ${{ runner.temp }}/teams-recovery-phases
-          # Keep Windows test files on the isolated per-job runner volume; see
-          # the normal-mode step above for why this matters to SQLite WAL
-          # durability observations.
-          TMPDIR: ${{ runner.temp }}
-          TMP: ${{ runner.temp }}
-          TEMP: ${{ runner.temp }}
-        run: |
-          set -euo pipefail
-          partition_flags=("-partition-count=2" "-partition-index=${{ matrix.partition }}")
-          go run ./scripts/ci/check_teams_recovery_manifest.go -job teams-recovery -race "${partition_flags[@]}"
-
-      - name: Upload Teams recovery phase diagnostics
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: teams-recovery-phases-${{ matrix.os }}-${{ matrix.mode }}-${{ matrix.partition }}
-          path: ${{ runner.temp }}/teams-recovery-phases
-          if-no-files-found: ignore
 
   codex-runtime-contract:
     name: Codex runtime contract (${{ matrix.os }} / ${{ matrix.codex-version }})
@@ -2457,12 +1777,10 @@ jobs:
           command -v codex >/dev/null
           go test ./internal/codexcontract -run 'TestInstalledCodex(RuntimeContract|RemoteTUI.*Handshake)' -count=1 -v
           go test ./internal/cli -run 'Test(ProbeCodexIntegration|InstalledCodexRuntimeMigrationDefersLivePrivateArtifacts)' -count=1 -v
-          go test ./internal/cli -run '^TestInstalledCodexTeamsExecutorSyntheticModelSwitchPreservesContext$' -count=1 -v -timeout=4m
           go test ./internal/responsespolicy -run TestServerRoutesResponsesAndLeavesNonResponsesTrafficUnchanged -count=1 -v
-          go test ./internal/modelprofile -run TestLiveCodexAppServerModelListUsesGeneratedCatalogOptIn -count=1 -v
           go test ./internal/codexrunner -run 'Test(InstalledCodex(StandardApproval|MetadataOnlyResume|ExplicitCancelInterrupt)Runtime|PolicyStarterPreservesUserChatGPTOriginAndAddsOnlyResponsesGateway|AppServerRunner(PreservesBoundedCloudConfigErrorData|DefaultApprovalModeFailsClosed|AutomaticApprovalModeIsExplicit)|AutomaticApprovalResultMatrix|RemoteBrokerManualModeRelaysApprovalRequestsAndResponsesByteTransparent)' -count=1 -v
           printf '%s\n' \
-            '{"schema":3,"os":"${{ matrix.os }}","codex_version":"${{ matrix.codex-version }}","authentication":"synthetic-chatgpt","external_account_credentials":false,"official_binary":true,"default_responses_websocket":true,"analytics_enabled":true,"contracts":["app-server-schema","model-list-reasoning-efforts","per-turn-model","per-turn-reasoning-effort","teams-session-model-switch","same-thread-cross-provider-resume","cross-provider-context-sanitization","metadata-only-resume","explicit-cancel-interrupt","same-thread-resume-after-cancel","turn-summary-final-integrity","resume-context-preserved","thread-rename-history-index","remote-tui-pty","production-remote-broker-bearer","manual-approval-byte-transparent","manual-headless-fail-closed","aaa-explicit","cli-probe","standard-user-approval","approval-request-matrix","analytics-user-approved","responses-websocket","responses-only-proxy-routing","chatgpt-origin-preserved","structured-cloud-config-errors"]}' \
+            '{"schema":3,"os":"${{ matrix.os }}","codex_version":"${{ matrix.codex-version }}","authentication":"synthetic-chatgpt","external_account_credentials":false,"official_binary":true,"default_responses_websocket":true,"analytics_enabled":true,"contracts":["app-server-schema","per-turn-model","per-turn-reasoning-effort","metadata-only-resume","explicit-cancel-interrupt","same-thread-resume-after-cancel","turn-summary-final-integrity","resume-context-preserved","thread-rename-history-index","remote-tui-pty","production-remote-broker-bearer","manual-approval-byte-transparent","manual-headless-fail-closed","aaa-explicit","cli-probe","standard-user-approval","approval-request-matrix","analytics-user-approved","responses-websocket","responses-only-proxy-routing","chatgpt-origin-preserved","structured-cloud-config-errors"]}' \
             > "$RUNNER_TEMP/codex-runtime-contract.json"
 
       - name: Upload runtime contract proof
@@ -2509,11 +1827,11 @@ jobs:
         run: |
           set -euo pipefail
           log="$RUNNER_TEMP/full-go-test.log"
-          # The Teams packages contain the largest and most independent test
-          # corpus. Run every discovered Test/Example/Fuzz entry exactly once,
-          # but in bounded prefix shards so one package test process cannot
-          # spend the entire 20-minute watchdog behind unrelated fixtures.
-          if ! go run ./scripts/ci/run_full_go_test_shards.go -timeout=20m -parallel=16 -shards=16 -partition-count=2 -partition-index="${{ matrix.partition }}" 2>&1 | tee "$log"; then
+          # Run every discovered Test/Example/Fuzz entry exactly once, in
+          # bounded prefix shards so one package test process cannot spend
+          # the entire 20-minute watchdog behind unrelated fixtures. The
+          # end-to-end scenarios run in the Linux e2e job.
+          if ! go run ./scripts/ci/run_full_go_test_shards.go -timeout=20m -parallel=16 -shards=16 -partition-count=2 -partition-index="${{ matrix.partition }}" -exclude-prefix=github.com/baaaaaaaka/codex-helper/internal/e2e/scenarios/ 2>&1 | tee "$log"; then
             summary="$(grep -E -A8 '^--- FAIL:|^FAIL[[:space:]]|^panic:|^fatal error:' "$log" | tail -80 | tr '\n' ' ' || true)"
             if ! grep -Eq '^--- FAIL:|^panic:|^fatal error:' "$log"; then
               summary="$(tail -40 "$log" | tr '\n' ' ')"
@@ -2533,11 +1851,7 @@ jobs:
           name: full-go-test-diagnostics-${{ matrix.os }}-${{ matrix.partition }}
           path: |
             ${{ runner.temp }}/full-go-test*.log
-            ${{ runner.temp }}/frontier-recovery-isolated.log
             ${{ runner.temp }}/migration-process-isolated.log
-            ${{ runner.temp }}/external-perf-isolated.log
-            ${{ runner.temp }}/teams-durable-isolated.log
-            ${{ runner.temp }}/store-durable-isolated.log
           if-no-files-found: ignore
 
       - name: Coverage gate (Linux only)
@@ -2583,14 +1897,63 @@ jobs:
         shell: bash
         run: |
           set -o pipefail
-          go run ./scripts/ci/run_full_go_test_shards.go -race -timeout=30m -parallel=16 -shards=16 -partition-count=8 -partition-index="${{ matrix.partition }}" 2>&1 | tee "$RUNNER_TEMP/race-test.log"
+          # Every package except the end-to-end scenarios (their system
+          # under test is a separate process); the core and the Teams channel
+          # adapter are included.
+          go run ./scripts/ci/run_full_go_test_shards.go -race -timeout=30m -parallel=16 -shards=16 -partition-count=8 -partition-index="${{ matrix.partition }}" -exclude-prefix=github.com/baaaaaaaka/codex-helper/internal/e2e/scenarios/ 2>&1 | tee "$RUNNER_TEMP/race-test.log"
+
+      - name: Core and channel race with leak checks
+        if: matrix.partition == 0
+        shell: bash
+        run: |
+          set -o pipefail
+          # The core packages check for leaked goroutines when their tests
+          # end; run them once more as a whole so that check sees every test.
+          go test -race -count=1 -timeout=20m ./internal/core/... ./internal/channel/... 2>&1 | tee "$RUNNER_TEMP/race-core.log"
 
       - name: Upload race diagnostics
         if: ${{ failure() }}
         uses: actions/upload-artifact@v4
         with:
           name: race-test-diagnostics-${{ matrix.partition }}
-          path: ${{ runner.temp }}/race-test.log
+          path: |
+            ${{ runner.temp }}/race-test.log
+            ${{ runner.temp }}/race-core.log
+          if-no-files-found: ignore
+
+  e2e:
+    name: End-to-end scenarios (ubuntu-latest / cxp)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.11"
+          cache: true
+
+      - name: Scenarios through the production entry point
+        shell: bash
+        env:
+          E2E_SUT: cxp
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          set -o pipefail
+          # The scenarios drive `cxp teams run` (e2e build tag) against a fake
+          # Graph service and a fake Codex app-server; nothing leaves the
+          # runner.
+          go test -count=1 -timeout=600s ./internal/e2e/scenarios/... 2>&1 | tee "$RUNNER_TEMP/e2e.log"
+
+      - name: Upload e2e diagnostics
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-diagnostics
+          path: ${{ runner.temp }}/e2e.log
           if-no-files-found: ignore
 
   runtime-env-contract:
@@ -2619,14 +1982,6 @@ jobs:
           process_pattern='Test(MergeAppServerProcessEnv.*|AppServerProcessStarter(RemovesInheritedRuntimeMarkers|RemovesRuntimeMarkersAfterConfiguration|NilConfiguredEnvironmentKeepsSanitizedParent)|AppServerRunnerRetries(LaunchFailureBeforeInitialization|TransportFailureDuringInitialization))$'
           go test ./internal/cli -count=1 -run "$cli_pattern" -v
           go test ./internal/codexrunner -count=1 -run "$process_pattern" -v
-          go test ./internal/teams -count=1 -run 'Test(InfraLaunchFailureNotice|RunQueuedTurnReframesLaunchFailure|RunQueuedTurnReportsSharedAuthMigrationBlocker)$' -v
-
-      - name: Control chat Codex update contracts
-        shell: bash
-        run: |
-          set -euo pipefail
-          go test ./internal/teams -count=1 -run 'Test(ControlCodexUpdate.*|BridgeCodexVersion(FailureSchedulesUpgradeAfterActiveWork|UpgradeFailureNotifiesOriginWorkChat))$' -v
-          go test ./internal/cli -count=1 -run 'Test(RunTeamsCodexUpgradeFromBridge.*|TeamsCodexUpgraderForRunRejectsCustomCodexPathBeforeDrain)$' -v
 
   linux-distro-smoke-build:
     name: Linux distro smoke build
@@ -2656,13 +2011,10 @@ jobs:
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/codexcontract -c -o dist/codex_contract_test
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/codexrunner -c -o dist/codex_runtime_test
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/proc -c -o dist/codex_proc_test
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/teams -c -o dist/codex_teams_test
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/teams/store -c -o dist/codex_teams_store_test
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/config -c -o dist/codex_config_test
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/modelcatalog -c -o dist/codex_modelcatalog_test
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/modelprofile -c -o dist/codex_modelprofile_test
-          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/responsesadapter -c -o dist/codex_responsesadapter_test
-          chmod +x dist/codex_cli_test dist/codex_contract_test dist/codex_runtime_test dist/codex_proc_test dist/codex_teams_test dist/codex_teams_store_test dist/codex_config_test dist/codex_modelcatalog_test dist/codex_modelprofile_test dist/codex_responsesadapter_test
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/core/engine -c -o dist/codex_core_engine_test
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/core/store -c -o dist/codex_core_store_test
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./internal/channel/teams -c -o dist/codex_channel_teams_test
+          chmod +x dist/codex_cli_test dist/codex_contract_test dist/codex_runtime_test dist/codex_proc_test dist/codex_core_engine_test dist/codex_core_store_test dist/codex_channel_teams_test
 
       - name: Upload Linux distro smoke binaries
         uses: actions/upload-artifact@v4
@@ -2722,12 +2074,9 @@ jobs:
             dist/codex_contract_test
             dist/codex_runtime_test
             dist/codex_proc_test
-            dist/codex_teams_test
-            dist/codex_teams_store_test
-            dist/codex_config_test
-            dist/codex_modelcatalog_test
-            dist/codex_modelprofile_test
-            dist/codex_responsesadapter_test
+            dist/codex_core_engine_test
+            dist/codex_core_store_test
+            dist/codex_channel_teams_test
           )
           missing_required() {
             local missing=0
@@ -2862,83 +2211,6 @@ jobs:
             --label "${{ matrix.label }}" \
             --expected-cpu-plan-status repairable
 
-      - name: Teams managed ASR native compatibility repair
-        shell: bash
-        run: |
-          set -euo pipefail
-          img="$DISTRO_IMAGE"
-          docker run --rm \
-            -e DISTRO_PACKAGE_ARGS="$DISTRO_PACKAGE_ARGS" \
-            -e CODEX_HELPER_ASR_REAL_NATIVE_COMPAT_TEST=1 \
-            -e CODEX_HELPER_ASR_EXPECT_NATIVE_COMPAT=1 \
-            -v "$PWD/dist:/dist:ro" \
-            -v "$PWD/scripts/ci:/ci:ro" \
-            "$img" bash -lc '
-              set -euo pipefail
-              if command -v apt-get >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
-                # shellcheck disable=SC2086
-                bash /ci/install_container_packages.sh $DISTRO_PACKAGE_ARGS
-              fi
-              /dist/codex_teams_test -test.v -test.count=1 -test.run="TestManagedASRRealLlamaNativeCompatRepairsPinnedCPUAsset$"
-            '
-
-      - name: Teams managed ASR glibc 2.39 native compatibility repair
-        shell: bash
-        run: |
-          set -euo pipefail
-          img="$DISTRO_IMAGE"
-          rm -rf glibc239-smoke
-          mkdir -p glibc239-smoke
-          docker run --rm \
-            -v "$PWD/glibc239-smoke:/out" \
-            ubuntu:24.04 bash -lc '
-              set -euo pipefail
-              apt-get update
-              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gcc libc6-dev binutils
-              cat > /tmp/glibc238.c <<'"'"'EOF'"'"'
-          #define _GNU_SOURCE
-          #include <stdio.h>
-          #include <string.h>
-          int main(void) {
-            char buf[8];
-            size_t n = strlcpy(buf, "glibc238", sizeof(buf));
-            printf("%zu:%s\n", n, buf);
-            return 0;
-          }
-          EOF
-              gcc -O2 /tmp/glibc238.c -o /out/glibc238-smoke
-              readelf --version-info /out/glibc238-smoke | grep -q "GLIBC_2.38"
-            '
-          docker run --rm \
-            -e DISTRO_PACKAGE_ARGS="$DISTRO_PACKAGE_ARGS" \
-            -e CODEX_HELPER_ASR_REAL_GLIBC239_COMPAT_TEST=1 \
-            -e CODEX_HELPER_ASR_GLIBC238_SMOKE_BINARY=/smoke/glibc238-smoke \
-            -v "$PWD/dist:/dist:ro" \
-            -v "$PWD/scripts/ci:/ci:ro" \
-            -v "$PWD/glibc239-smoke:/smoke:ro" \
-            "$img" bash -lc '
-              set -euo pipefail
-              if command -v apt-get >/dev/null 2>&1 || command -v dnf >/dev/null 2>&1 || command -v yum >/dev/null 2>&1; then
-                # shellcheck disable=SC2086
-                bash /ci/install_container_packages.sh $DISTRO_PACKAGE_ARGS
-              fi
-              set +e
-              /smoke/glibc238-smoke >/tmp/glibc238-no-compat.out 2>/tmp/glibc238-no-compat.err
-              no_compat_status="$?"
-              set -e
-              if [ "$no_compat_status" = 0 ]; then
-                echo "GLIBC_2.38 smoke unexpectedly ran without native compat on $img" >&2
-                cat /tmp/glibc238-no-compat.out >&2
-                exit 1
-              fi
-              if ! grep -q "GLIBC_2.38" /tmp/glibc238-no-compat.err; then
-                echo "GLIBC_2.38 smoke failed for an unexpected reason before native compat:" >&2
-                cat /tmp/glibc238-no-compat.err >&2
-                exit 1
-              fi
-              /dist/codex_teams_test -test.v -test.count=1 -test.run="TestManagedASRRealNativeCompatRepairsGLIBC238SmokeBinary$"
-            '
-
       - name: Smoke test in container (doctor)
         shell: bash
         run: |
@@ -2981,9 +2253,6 @@ jobs:
         run: |
           set -euo pipefail
           trap 'status=$?; echo "::error title=Linux distro smoke command failed::${BASH_COMMAND} (exit ${status})"' ERR
-          teams_resource_pattern='Test(BridgePollDrops(HelperAttachmentEchoWithoutDurableMatch|RenderedHelperLabelOutputInWorkChat)|IsHelperAttachmentEchoMessageVariants|BridgePollOnceDoesNotRewriteStateForUnchangedNotDuePolls|InboundPollDecisionAlreadyPersistedRequiresBlockedStateToMatch|CodexOutputSymbolStressSurvivesTeamsCitationFilter|StripOAIMemoryCitationBlocks(RemovesInlineClosedBlock|PreservesFencedExamples|PreservesLiteralMultilineTagStress)|PlanTeamsHTMLChunks(Preserves(StatusListItemLines|LineBoundariesAcrossLimits)|UnicodeStressKeepsMarkersAndLimits|TextConservationStressCorpus|MarkdownTableKeepsEveryRow)|P1ArtifactManifest(WithoutFileWriteAuthLeavesFinalVisibleAndWarns|RejectedAfterFinalWhenAuthExists)|BridgeAttachment(SendFailureRestartReusesUploadedDriveItem|ReplayRejectsTamperedStagedFileBeforeUpload)|DownloadReferenceFileAttachments(UsesDriveItemMetadataName|WritesPrivateFile)|ReferenceAttachmentLocalName(TruncatesForPathBudgetAndDeduplicates|HandlesTinyPathBudgetDuplicates)|BestReferenceAttachmentNameUsesMetadataWhenAttachmentNameHasNoExtension|GraphGetSharedDriveItemMetadataReturnsNameAndMimeType|ParseArtifactManifestAllowsArbitraryExtensionsByDefault|PrepareOutboundAttachmentAllowsArbitraryExtensionAndRejectsSymlink|HistoryTieredScanTailDoesNotConsumeIncompleteTrailingLine|SimulatedLive(TeamsRenderCasesRoundTripThroughGraphCI|HelperE2EControlWorkAndStatusCI))$'
-          teams_transfer_pattern='Test(GraphUploadDriveItemFromFile(PersistsSessionCheckpoint|ResumesPersistedSessionCheckpoint)|GraphDownloadSharedDriveItemContent(ToFileStreamsPastClientTimeout|RefreshesExpiredPreauthenticatedURL|ResumesCrashPartialWithMetadata|RejectsConcurrentDestinationWriter|RetriesShortPartialResponse)|GraphFileTransfer(DoesNotUseWholeRequestClientTimeout|ReusesItsTransportPool)|BridgePollDropsMarkedHelperAttachmentEchoWithDurableOutbox|BridgeProvenanceMarkerRequiresDurableMatchingOutbox|CleanupStagedOutboundAttachmentRejectsSymlinkParent)$'
-          teams_replay_fencing_pattern='Test(Bridge(InterruptedTurnDropsLateStreamingStatus|ShouldIgnoreFreshRenderedHelperCanceledEcho|TranscriptImportDeliveryLedgerPreventsBatchReplayAfterOutboxPruneAndCheckpointRegression|CompletesTurnWithTranscriptFinalForCanonicalDedupe|StreamingFinalUsesTranscriptCanonicalBeforeClosingForwarder|StreamingErrorDoesNotSuppressPendingFinalLikeProgress|TranscriptCanonicalFinal(PreservesObservedArtifactManifest|RequiresSameCodexTurn)|SyncLinkedTranscript(DeliveryLedgerPreventsReplayAfterOutboxPruneAndCheckpointRegression|MultipartDeliveryLedgerPreventsReplayAfterOutboxPruneAndCheckpointRegression|DeliveredLedgerDoesNotTriggerBacklogBlockAfterCheckpointRegression|StressSkipsLiveStatusesBeforeCheckpointWindow|SkipsStatusAlreadySkippedByTextHash|SkipsFinalAlreadySentLiveBeforeCheckpoint)|Flush(RecoversGraphMessageIDAfterAcceptedPersistFailure|RecoversAcceptedOutboxFromGraphAfterRestart|DefersGraphRecoveryWhenListMessagesFails|DoesNotGraphRecoverOrdinaryQueuedSendError))|KnownTranscriptOutboxDedupeStressCompactCountsOldLiveBeforeCheckpoint|MarkTurnInterruptedSkipsPendingTransientOutbox|RecordTranscriptDeliveryAdvancesCheckpointPosition)$'
           img="$DISTRO_IMAGE"
           echo "==> $img (Codex contract tests)"
           docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
@@ -2997,40 +2266,18 @@ jobs:
           echo "==> $img (proc zombie/parser tests)"
           docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
             /dist/codex_proc_test -test.v -test.count=1 -test.run='Test(IsAliveTreatsLinuxZombieAsDead|LinuxProcStateFromStatParsesLastParen)$'
-          echo "==> $img (external catalog JSON contract tests; network disabled)"
-          docker run --rm --network none -v "$PWD/dist:/dist:ro" "$img" \
-            /dist/codex_config_test -test.v -test.count=1 -test.run='Test(ModelCatalogContract|ValidateModelConversionAndOperation)'
-          docker run --rm --network none -v "$PWD/dist:/dist:ro" "$img" \
-            /dist/codex_modelcatalog_test -test.v -test.count=1 -test.run='Test(CatalogContract|CatalogV2|ValidateRejects)'
-          docker run --rm --network none -v "$PWD/dist:/dist:ro" "$img" \
-            /dist/codex_modelprofile_test -test.v -test.count=1 -test.run='TestResolveCatalogV2|TestResolveSnapshotUsesSelectedInterfaceCredential'
-          docker run --rm --network none -v "$PWD/dist:/dist:ro" "$img" \
-            /dist/codex_responsesadapter_test -test.v -test.count=1 -test.run='Test(ConfiguredAdapter|ChatAdapterContractMatrix|ProviderRegistry|Anthropic|DeepSeekBeta|NativeToolMapping|SourcePolicy)'
-          docker run --rm --network none -v "$PWD/dist:/dist:ro" "$img" \
-            /dist/codex_cli_test -test.v -test.count=1 -test.run='Test(ModelCatalog|ModelProviderSetup|VerifySyncedModel)'
-          echo "==> $img (Teams resource cleanup, artifact, transcript, and simulated-live tests)"
+          echo "==> $img (Teams core store, engine, and channel adapter tests)"
           docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
-            /dist/codex_teams_test -test.v -test.count=1 -test.run="$teams_resource_pattern"
-          echo "==> $img (Teams file transfer durability and provenance tests)"
+            /dist/codex_core_store_test -test.count=1
           docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
-            /dist/codex_teams_test -test.v -test.count=1 -test.run="$teams_transfer_pattern"
+            /dist/codex_core_engine_test -test.count=1
           docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
-            /dist/codex_teams_store_test -test.v -test.count=1 -test.run='TestMarkOutbox(UploadSessionForAttemptPersistsAndFences|DriveItemForAttemptPersistsAndFences)$'
-          docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
-            /dist/codex_teams_store_test -test.v -test.count=1 -test.run='Test(ChatPollSchedule(NoopDoesNotRewriteState|BlockedNoopPreservesPreviousState|ParkedNoopPreservesParkedAt)|SQLiteChatPollScheduleNoopPreservesHotPollFencesAndDoesNotRewrite)$'
-          echo "==> $img (Teams replay fencing tests)"
-          docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
-            /dist/codex_teams_test -test.v -test.count=1 -test.run="$teams_replay_fencing_pattern"
-          docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
-            /dist/codex_teams_store_test -test.v -test.count=1 -test.run="$teams_replay_fencing_pattern"
+            /dist/codex_channel_teams_test -test.count=1
 
       - name: Teams background keepalive tests in containers (non-root)
         shell: bash
         run: |
           set -euo pipefail
-          teams_runtime_keepalive='Test(TeamsBackgroundKeepalive|TeamsStartupFallback|InboundPoll|Bridge(LongRunningTurnKeepsOwnerHeartbeatActive|IdleOwnerHeartbeatPreservesActiveTurnFields|ListenStandbyDoesNotCreateControlChatOrPoll|PollChatReadRateLimitBlocksOnlyThatChat|ControlPollRateLimitDoesNotBlockWorkPollingWithoutRetrySleep|PollOnceContinuesOtherDueChatsAfterReadRateLimit|AckSendFailureDoesNotBlockCodexTurn|OutboxUploadRateLimitRecordsBlockWithoutRetrySleep|AcceptedOutboxRecoveryRateLimitRecordsBlockWithoutRetrySleep|FlushPromotesAcceptedOutboxDuringRateLimitWithoutPosting|ReloadDraining(SessionMessage|ControlNew)IsDeferredAndReplayed)|BridgeControlRestart(DoesNotRunDuringHelperReloadCodexUpgradeOrManualDrain|RunsAfterExpiredHelperUpgradeDrain|DoesNotRecoverExpiredHelperUpgradeOwnedByRemoteMachine|NowBlocksExpiredHelperUpgradeWithActiveTurn|ForceRunsAfterExpiredHelperUpgradeWithActiveTurn|RunsAfterStaleHelperReloadDrain|DoesNotRecoverStaleHelperReloadOwnedByRemoteMachine|NowBlocksStaleHelperReloadWithActiveTurn|ForceRunsAfterStaleHelperReloadWithActiveTurn)|BridgeControlReload(RetriesStaleHelperReloadDrain|DoesNotRecoverStaleHelperReloadOwnedByRemoteMachine|NowBlocksStaleHelperReloadWithActiveTurn)|Bridge(CompletesExpiredHelperUpgradeDrainOnStart|DoesNotCompleteExpiredHelperUpgradeDrainOwnedByRemoteMachine)|ClaimControlLease(PrimaryBeatsEphemeralAndEphemeralStaysStandby|DoesNotPreemptActiveTurn|ConcurrentManyMachinesSingleActive)|ControlLeaseForwardJumpAllowsTakeoverAfterSleep|IsStaleHandlesFutureHeartbeatAndThresholdBoundary|ValidateAndReleaseControlLease|RecordOwnerHeartbeat(WritesAndReadsOwner|UpdatesExistingOwner|TreatsExecRestartAsSameOwner|RefusesLiveOwnerWithDiagnostic|ReplacesDeadLocalOwnerBeforeStale)|RecoverStaleOwner(ReplacesStaleOwner|TreatsExecRestartAsSameOwner|ReplacesDeadLocalOwnerBeforeStale|RefusesLiveOwner)|ClearOwner(IsIdempotent|IfSameDoesNotClearDifferentOwner|IfSameDoesNotClearSameProcessDifferentInstance)|Helper(UpgradeDrainExpired|ReloadDrainStale)|OwnerAppearsLocal|PendingOutboxCrashRecoveryPromotesAcceptedDespiteRateLimitedChat|Graph(DoesNotRetryPostServerErrors|RetriesPostTooManyRequestsAfterRetryAfter))'
-          teams_nonroot_artifact='Test(CodexOutputSymbolStressSurvivesTeamsCitationFilter|StripOAIMemoryCitationBlocks(RemovesInlineClosedBlock|PreservesFencedExamples|PreservesLiteralMultilineTagStress)|PlanTeamsHTMLChunks(Preserves(StatusListItemLines|LineBoundariesAcrossLimits)|UnicodeStressKeepsMarkersAndLimits|TextConservationStressCorpus|MarkdownTableKeepsEveryRow)|P1ArtifactManifest(WithoutFileWriteAuthLeavesFinalVisibleAndWarns|RejectedAfterFinalWhenAuthExists)|BridgeAttachment(SendFailureRestartReusesUploadedDriveItem|ReplayRejectsTamperedStagedFileBeforeUpload)|DownloadReferenceFileAttachments(UsesDriveItemMetadataName|WritesPrivateFile)|ReferenceAttachmentLocalName(TruncatesForPathBudgetAndDeduplicates|HandlesTinyPathBudgetDuplicates)|BestReferenceAttachmentNameUsesMetadataWhenAttachmentNameHasNoExtension|GraphGetSharedDriveItemMetadataReturnsNameAndMimeType|ParseArtifactManifestAllowsArbitraryExtensionsByDefault|PrepareOutboundAttachmentAllowsArbitraryExtensionAndRejectsSymlink|HistoryTieredScanTailDoesNotConsumeIncompleteTrailingLine|SimulatedLive(TeamsRenderCasesRoundTripThroughGraphCI|HelperE2EControlWorkAndStatusCI))$'
-          teams_nonroot_transfer='Test(GraphDownloadSharedDriveItemContent(ToFileStreamsPastClientTimeout|RefreshesExpiredPreauthenticatedURL|ResumesCrashPartialWithMetadata|RejectsConcurrentDestinationWriter|RetriesShortPartialResponse)|GraphFileTransfer(DoesNotUseWholeRequestClientTimeout|ReusesItsTransportPool)|BridgePollDropsMarkedHelperAttachmentEchoWithDurableOutbox|BridgeProvenanceMarkerRequiresDurableMatchingOutbox|CleanupStagedOutboundAttachmentRejectsSymlinkParent)$'
           img="$DISTRO_IMAGE"
           echo "==> $img (Teams keepalive tests as non-root uid 1000)"
           docker run --rm --user 1000:1000 \
@@ -3042,53 +2289,19 @@ jobs:
             -e CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE=/tmp/codex-cache/teams-missing-file-token.json \
             -v "$PWD/dist:/dist:ro" "$img" \
             /dist/codex_cli_test -test.v -test.count=1 -test.run='TestTeamsBackgroundKeepalive'
+          echo "==> $img (Teams core store, engine, and channel adapter tests as non-root uid 1000)"
           docker run --rm --user 1000:1000 \
             -e HOME=/tmp/codex-home \
-            -e XDG_CONFIG_HOME=/tmp/codex-config \
-            -e XDG_CACHE_HOME=/tmp/codex-cache \
-            -e CODEX_HELPER_TEAMS_TOKEN_CACHE=/tmp/codex-cache/teams-missing-token.json \
-            -e CODEX_HELPER_TEAMS_READ_TOKEN_CACHE=/tmp/codex-cache/teams-missing-read-token.json \
-            -e CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE=/tmp/codex-cache/teams-missing-file-token.json \
             -v "$PWD/dist:/dist:ro" "$img" \
-            /dist/codex_cli_test -test.v -test.count=1 -test.run='TestTeamsServiceWatchdog(LifecycleStatePrecedenceMatrix|RecoverableDrainWinsOverSeparatePausedState|ManyStateFilesRecoveryMatrix|MergeDoesNotRecoverPausedStateDrain|Restarts(ExpiredHelperUpgradeDrain|StaleHelperReloadDrain)WithLocalOwner|DoesNotRestart(ExpiredHelperUpgradeDrain|StaleHelperReloadDrain)WithRemoteFreshOwner|RemoteFreshOwnerWinsOverLocal(Upgrade|Reload)Evidence|DoesNotRestart(ExpiredHelperUpgradeDrain|StaleHelperReloadDrain)WithActiveTurn|(ExpiredHelperUpgradeDrain|StaleHelperReloadDrain)RespectsRestartCooldown|MergeDetects(ExpiredHelperUpgradeDrain|StaleHelperReloadDrain)(LocalOwner|RemoteOwner))$'
+            /dist/codex_core_store_test -test.count=1
           docker run --rm --user 1000:1000 \
             -e HOME=/tmp/codex-home \
-            -e XDG_CONFIG_HOME=/tmp/codex-config \
-            -e XDG_CACHE_HOME=/tmp/codex-cache \
-            -e CODEX_HELPER_TEAMS_TOKEN_CACHE=/tmp/codex-cache/teams-missing-token.json \
-            -e CODEX_HELPER_TEAMS_READ_TOKEN_CACHE=/tmp/codex-cache/teams-missing-read-token.json \
-            -e CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE=/tmp/codex-cache/teams-missing-file-token.json \
             -v "$PWD/dist:/dist:ro" "$img" \
-            /dist/codex_teams_test -test.v -test.count=1 -test.run="$teams_runtime_keepalive"
+            /dist/codex_core_engine_test -test.count=1
           docker run --rm --user 1000:1000 \
             -e HOME=/tmp/codex-home \
-            -e XDG_CONFIG_HOME=/tmp/codex-config \
-            -e XDG_CACHE_HOME=/tmp/codex-cache \
-            -e CODEX_HELPER_TEAMS_TOKEN_CACHE=/tmp/codex-cache/teams-missing-token.json \
-            -e CODEX_HELPER_TEAMS_READ_TOKEN_CACHE=/tmp/codex-cache/teams-missing-read-token.json \
-            -e CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE=/tmp/codex-cache/teams-missing-file-token.json \
             -v "$PWD/dist:/dist:ro" "$img" \
-            /dist/codex_teams_store_test -test.v -test.count=1 -test.run="$teams_runtime_keepalive"
-          echo "==> $img (Teams artifact/transcript/simulated-live tests as non-root uid 1000)"
-          docker run --rm --user 1000:1000 \
-            -e HOME=/tmp/codex-home \
-            -e XDG_CONFIG_HOME=/tmp/codex-config \
-            -e XDG_CACHE_HOME=/tmp/codex-cache \
-            -e CODEX_HELPER_TEAMS_TOKEN_CACHE=/tmp/codex-cache/teams-missing-token.json \
-            -e CODEX_HELPER_TEAMS_READ_TOKEN_CACHE=/tmp/codex-cache/teams-missing-read-token.json \
-            -e CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE=/tmp/codex-cache/teams-missing-file-token.json \
-            -v "$PWD/dist:/dist:ro" "$img" \
-            /dist/codex_teams_test -test.v -test.count=1 -test.run="$teams_nonroot_artifact"
-          echo "==> $img (Teams file transfer tests as non-root uid 1000)"
-          docker run --rm --user 1000:1000 \
-            -e HOME=/tmp/codex-home \
-            -e XDG_CONFIG_HOME=/tmp/codex-config \
-            -e XDG_CACHE_HOME=/tmp/codex-cache \
-            -e CODEX_HELPER_TEAMS_TOKEN_CACHE=/tmp/codex-cache/teams-missing-token.json \
-            -e CODEX_HELPER_TEAMS_READ_TOKEN_CACHE=/tmp/codex-cache/teams-missing-read-token.json \
-            -e CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE=/tmp/codex-cache/teams-missing-file-token.json \
-            -v "$PWD/dist:/dist:ro" "$img" \
-            /dist/codex_teams_test -test.v -test.count=1 -test.run="$teams_nonroot_transfer"
+            /dist/codex_channel_teams_test -test.count=1
           echo "==> $img (Teams detached supervisor smoke as non-root uid 1000)"
           docker run --rm --user 1000:1000 \
             -e HOME=/tmp/codex-home \
@@ -3153,7 +2366,7 @@ jobs:
     runs-on: ubuntu-latest
     needs:
       - targeted-test
-      - teams-recovery-test
+      - e2e
       - proxy-recovery-loopback
       - windows-proxy-lifecycle
       - proxy-recovery-docker
@@ -3181,7 +2394,7 @@ jobs:
             fi
           }
           check targeted-test "${{ needs.targeted-test.result }}"
-          check teams-recovery-test "${{ needs.teams-recovery-test.result }}"
+          check e2e "${{ needs.e2e.result }}"
           check proxy-recovery-loopback "${{ needs.proxy-recovery-loopback.result }}"
           check windows-proxy-lifecycle "${{ needs.windows-proxy-lifecycle.result }}"
           check proxy-recovery-docker "${{ needs.proxy-recovery-docker.result }}"

@@ -5,23 +5,9 @@ case "${1:-}" in
   isolation)
     CXP_TEAMS_TEST_PRESERVE_USER_DIRS=1 go test ./internal/cli -count=1 \
       -run '^TestTeamsRuntimeSafetyPackageTestMainIsolatesEveryUserDirectoryCI$' -v
-    CXP_TEAMS_TEST_PRESERVE_USER_DIRS=1 go test ./internal/teams -count=1 \
-      -run '^TestTeamsPackageTestMain(IsolatesEveryUserDirectory|RejectsUnmarkedInheritedRoot)CI$' -v
-    ;;
-  store)
-    go test ./internal/teams -count=1 \
-      -run '^TestTeamsRuntimeSafety(RuntimeResolver|LegacyFallback|LegacyConfig|LegacyOnly|Canonical|Probe|Listener|BridgeConstruction|SuccessfulMigration|StagedLegacyMigration|ScopedQuarantine|LegacyReappearance|Migration|Malformed|AutomaticTakeover|BackupConflict|DualStore|OutboundReplayFence|ScopeTakeover|GlobalLedger|Discovery|Historical|TakeoverWriter|OfflineTakeover)' -v
-    go test ./internal/teams/store -count=1 \
-      -run '^(TestStoreLoadPropagatesContextPastStateLock|TestLoadPathRuntimeMetadataReadOnly|TestLoadPathOfflineRecoveryReadOnly|TestLoadPathWatchdogStateReadOnlyRejectsSQLiteFamilySymlinks)' -v
-    ;;
-  store-io)
-    bash scripts/ci/teams_runtime_resolver_io_smoke.sh
-    ;;
-  store-process)
-    bash scripts/ci/teams_runtime_takeover_process_smoke.sh
     ;;
   service-update)
-    go test ./internal/cli ./internal/teams -count=1 \
+    go test ./internal/cli -count=1 \
       -run '^TestTeamsRuntimeSafety(ServiceSpec|AutoUpdate|DoesNotRestore|ExplicitStable|ServiceEnvironment|BridgeHelperAutoUpdate|HelperUpdateStatus)' -v
     ;;
   wsl-process)
@@ -37,7 +23,7 @@ case "${1:-}" in
       -run '^TestTeamsRuntimeSafety(PackageTestMain|ServiceSpec|DoesNotRestore|ExplicitStable|ServiceEnvironment|StableEntry|ManagedRuntime|ActiveMigrationLease|LegacyMigrationMarker|LocalStatus|StatusReportsAuthoritative)' -v
     ;;
   *)
-    echo "usage: $0 {isolation|store|store-io|store-process|service-update|wsl-process|diagnostics|windows}" >&2
+    echo "usage: $0 {isolation|service-update|wsl-process|diagnostics|windows}" >&2
     exit 2
     ;;
 esac
