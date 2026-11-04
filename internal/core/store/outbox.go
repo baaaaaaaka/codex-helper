@@ -197,6 +197,25 @@ ext_item_id = COALESCE(?, ext_item_id) WHERE outbox_id = ?`, nullStr(uploadURL),
 	return err
 }
 
+// LegacyUnsentOutbox lists the rows imported from the legacy helper
+// (hash_algo 'legacy') that are not settled yet, in conversation order.
+// Their body is still the legacy Markdown text, not a channel payload.
+func (t *Tx) LegacyUnsentOutbox() ([]Outbox, error) {
+	return collect(scanOutbox)(t.rows(`SELECT ` + outboxCols + ` FROM outbox
+WHERE hash_algo IS NOT NULL AND state IN ('queued','sending','unknown') ORDER BY conv_id, seq`))
+}
+
+// SetOutboxRendered replaces an imported row's legacy body with the
+// rendered channel payload and its hash, and clears hash_algo.
+func (t *Tx) SetOutboxRendered(id int64, body string, hash []byte) error {
+	n, err := affected(t.exec(`UPDATE outbox SET body = ?, body_hash = ?, hash_algo = NULL WHERE id = ? AND hash_algo IS NOT NULL`,
+		body, hash, id))
+	if err == nil && n == 0 {
+		err = fmt.Errorf("%w: imported outbox %d", ErrNotFound, id)
+	}
+	return err
+}
+
 // RehashLegacy replaces body hashes imported from the legacy helper
 // (hash_algo 'legacy') with hash(body) from the channel adapter and clears
 // hash_algo. A row without a body keeps a NULL hash. The core runs it once
