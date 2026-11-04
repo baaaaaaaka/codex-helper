@@ -228,45 +228,13 @@ func (a *Adapter) Get(ctx context.Context, chat, id string) (channel.InboundMsg,
 	return a.convert(chat, gm, me.ID), nil
 }
 
-// CreateChat creates (or finds) the meeting chat whose externalId is key.
-// createOrGet is idempotent, so an Ambiguous result may be retried as is.
+// CreateChat creates (or finds) the meeting chat whose externalId is key,
+// with a 24 hour meeting window starting now. createOrGet is idempotent, so
+// an Ambiguous result may be retried as is.
 func (a *Adapter) CreateChat(ctx context.Context, title, key string) (channel.ChatInfo, error) {
-	key = strings.TrimSpace(key)
-	if key == "" {
-		return channel.ChatInfo{}, &channel.Rejected{Permanent: true, Err: errors.New("CreateChat needs a key")}
-	}
-	me, err := a.me(ctx)
-	if err != nil {
-		return channel.ChatInfo{}, err
-	}
-	subject := SanitizeTopic(title)
-	now := a.cfg.Now().UTC().Truncate(time.Second)
-	in := map[string]any{
-		"subject":       subject,
-		"externalId":    key,
-		"startDateTime": now.Format(time.RFC3339),
-		"endDateTime":   now.Add(24 * time.Hour).Format(time.RFC3339),
-		"participants": map[string]any{"attendees": []map[string]any{{
-			"upn": me.UPN, "role": "attendee",
-			"identity": map[string]any{"user": map[string]any{"id": me.ID}},
-		}}},
-		"allowMeetingChat":               "enabled",
-		"shareMeetingChatHistoryDefault": "all",
-	}
-	var out struct {
-		Subject  string `json:"subject"`
-		ChatInfo struct {
-			ThreadID string `json:"threadId"`
-		} `json:"chatInfo"`
-	}
-	if err := a.g.writeJSON(ctx, http.MethodPost, "/me/onlineMeetings/createOrGet", in, &out); err != nil {
-		return channel.ChatInfo{}, err
-	}
-	id := strings.TrimSpace(out.ChatInfo.ThreadID)
-	if id == "" {
-		return channel.ChatInfo{}, &channel.Ambiguous{Err: errors.New("onlineMeeting response has no chatInfo.threadId")}
-	}
-	return channel.ChatInfo{ID: id, Title: first(SanitizeTopic(out.Subject), subject), URL: ChatURL(id, a.cfg.TenantID)}, nil
+	now := a.cfg.Now()
+	info, _, err := a.CreateMeetingChat(ctx, title, key, now, now.Add(24*time.Hour))
+	return info, err
 }
 
 // RenameChat sets the chat topic. PATCH is idempotent.
