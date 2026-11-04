@@ -117,10 +117,10 @@ func (c *converter) summary() string {
 		if bl.Sources == 1 {
 			sessions = "session"
 		}
-		fmt.Fprintf(&b, "\n\nCatch-up of local Codex sessions from the last 120 days: %d prompts and answers from %d %s (%.1f MB), posted to their chats from now on.",
+		fmt.Fprintf(&b, "\n\nCatch-up of local Codex sessions: %d prompts and answers from %d %s (%.1f MB), posted to their chats from now on.",
 			bl.Prompts+bl.Finals, bl.Sources, sessions, float64(bl.Bytes)/1e6)
 	} else {
-		b.WriteString("\n\nLocal Codex sessions from the last 120 days are caught up from now on.")
+		b.WriteString("\n\nLocal Codex sessions are caught up from now on.")
 	}
 	b.WriteString("\n\nThe previous data is kept unchanged as a backup. The full report is " + ReportName + " next to the helper's store (`cxp teams status` shows where).")
 	return b.String()

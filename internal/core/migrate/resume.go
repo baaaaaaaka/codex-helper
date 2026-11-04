@@ -1,11 +1,5 @@
 package migrate
 
-import "time"
-
-// CatchUpWindow bounds the first-start catch-up (owner decision 2026-11-04:
-// backlog catch-up and missed-sync lookback both use 120 days).
-const CatchUpWindow = 120 * 24 * time.Hour
-
 // resume is the decided position of one scanned, tracked rollout.
 type resume struct {
 	off, line int64
@@ -14,7 +8,6 @@ type resume struct {
 	via       string
 	gap       [2]int // prompts, finals in [off, max old position): mirrored behind an old position
 	backlog   [2]int // prompts, finals from off to the scan end
-	skipOld   int    // unproven records older than CatchUpWindow, not posted
 }
 
 // decideResume applies the proof rule (STORE-DESIGN §7.2) to a scanned
@@ -73,21 +66,6 @@ func (c *converter) decideResume(p *pathInfo, size int64) resume {
 			rs.line = sc.EndLine
 		}
 	}
-	// The catch-up window (owner decision 2026-11-04): unproven records
-	// older than CatchUpWindow are not posted; the resume point moves past
-	// them. The rollout stays on disk; only the posting is skipped.
-	cut := c.now.Add(-CatchUpWindow).UnixMilli()
-	for _, r := range sc.Recs {
-		if r.Start < rs.off {
-			continue
-		}
-		if r.TS == 0 || r.TS >= cut {
-			break
-		}
-		rs.off, rs.line = r.End, r.Line
-		rs.skipOld++
-		rs.via = "past records older than 120 days"
-	}
 	for _, r := range sc.Recs {
 		k := 0
 		if r.Kind == "final" {
@@ -142,7 +120,6 @@ func (c *converter) reportResume(p *pathInfo, rs resume, size int64, closed bool
 	if c.opt.CountBacklog {
 		bl := &c.rep.Backlog
 		bl.Counted = true
-		bl.SkippedOld += rs.skipOld
 		switch {
 		case closed:
 			bl.ClosedSources++
@@ -173,16 +150,16 @@ func (c *converter) reportResume(p *pathInfo, rs resume, size int64, closed bool
 	if !rs.hasProof && top > 0 {
 		cases = append(cases, "no-proof")
 	}
-	if closed && len(cases) == 0 && skipClosed+rs.skipOld > 0 {
+	if closed && len(cases) == 0 && skipClosed > 0 {
 		cases = append(cases, "closed")
 	}
-	if len(cases) == 0 && (rs.gap[0]+rs.gap[1] > 0 || rs.skipOld > 0) {
+	if len(cases) == 0 && rs.gap[0]+rs.gap[1] > 0 {
 		cases = append(cases, "proof-behind")
 	}
 	for _, cs := range cases {
 		row := ResumeRow{Path: p.path, Conv: c.labelOf[p.conv], Case: cs, Size: size,
 			Checkpoint: p.ckpt, Cutoff: p.cutoff, Watcher: p.watch, Proof: rs.proof, Resume: rs.off,
-			GapPrompts: rs.gap[0], GapFinals: rs.gap[1], BacklogPrompts: -1, SkipOld: rs.skipOld, SkipClosed: skipClosed}
+			GapPrompts: rs.gap[0], GapFinals: rs.gap[1], BacklogPrompts: -1, SkipClosed: skipClosed}
 		if closed {
 			row.Resume, row.GapPrompts, row.GapFinals = kept, 0, 0
 		}

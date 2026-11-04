@@ -132,10 +132,13 @@ func TestFirstStartConvertsOldStore(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			for _, sub := range []string{"converted from v0.1.", "Work chats:", "Codex sessions from the last 120 days", migrate.ReportName} {
+			for _, sub := range []string{"converted from v0.1.", "Work chats:", migrate.ReportName} {
 				if !strings.Contains(summary, sub) {
 					t.Errorf("summary lacks %q:\n%s", sub, summary)
 				}
+			}
+			if !strings.Contains(summary, "Catch-up of local Codex sessions:") && !strings.Contains(summary, "Local Codex sessions are caught up") {
+				t.Errorf("summary lacks the catch-up of local Codex sessions:\n%s", summary)
 			}
 			if strings.ContainsAny(summary, `/\`) || strings.Contains(summary, "scope_") {
 				t.Errorf("summary shows a path:\n%s", summary)

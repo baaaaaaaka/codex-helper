@@ -126,7 +126,7 @@ func TestProofBasedResume(t *testing.T) {
 		eq(t, "catch-up finals", rep.Backlog.Finals, 1)
 		eq(t, "gap", rep.Backlog.Gap, 2)
 		// The control-chat summary carries the catch-up size.
-		if sum := qs(t, db, `SELECT value FROM meta WHERE key = ?`, store.MetaMigrationSummary); !strings.Contains(sum, "120 days: 2 prompts and answers from 1 session (") {
+		if sum := qs(t, db, `SELECT value FROM meta WHERE key = ?`, store.MetaMigrationSummary); !strings.Contains(sum, "Catch-up of local Codex sessions: 2 prompts and answers from 1 session (") {
 			t.Errorf("summary:\n%s", sum)
 		}
 		// The delivered outbox row carries the mirror key of its record.
@@ -239,10 +239,10 @@ func TestMirrorKey(t *testing.T) {
 	}
 }
 
-// Owner decision 2026-11-04: the catch-up uses a 120-day window per record.
-// Unproven records older than the window are passed over (not posted); a
-// closed conversation gets no catch-up and stays at its old position.
-func TestCatchUpWindowAndClosed(t *testing.T) {
+// Owner decision 2026-11-05: the catch-up has no window. Unproven records
+// are caught up however old; a closed conversation gets no catch-up and
+// stays at its old position.
+func TestCatchUpHasNoWindowAndClosed(t *testing.T) {
 	r := newRollout()
 	r.ts = "2029-06-01T00:00:00Z" // 214 days before testNow
 	r.line("session_meta", map[string]any{"id": s001Thread, "originator": "codex_cli_rs", "source": "cli"})
@@ -257,24 +257,23 @@ func TestCatchUpWindowAndClosed(t *testing.T) {
 	r.done("tb", "recent answer")
 	sessions, path := writeRollout(t, r)
 
-	t.Run("old records passed over", func(t *testing.T) {
+	t.Run("old records caught up", func(t *testing.T) {
 		dir := fixture(t, "rc59", "json")
 		editJSON(t, dir, positions(path, r.ends[9], 9, r.ends[9], 9, nil)) // no proof
 		rep, db := dryRun(t, dir, func(o *Options) { o.CodexSessions, o.CountBacklog = sessions, true })
 		if !rep.OK() {
 			t.Fatalf("checks: %+v", rep.Checks)
 		}
-		eq(t, "s001 source", qs(t, db, sourceQ, "%"+s001Thread+".jsonl"), "tracking@"+strconv.FormatInt(r.ends[4], 10)+":4")
-		eq(t, "skipped old", rep.Backlog.SkippedOld, 2)
-		eq(t, "catch-up", rep.Backlog.Prompts+rep.Backlog.Finals, 2)
-		eq(t, "no-proof row skip", rep.Resume[0].SkipOld, 2)
+		eq(t, "s001 source", qs(t, db, sourceQ, "%"+s001Thread+".jsonl"), "tracking@0:0")
+		eq(t, "catch-up", rep.Backlog.Prompts+rep.Backlog.Finals, 4)
+		eq(t, "no-proof row", rep.Resume[0].Case, "no-proof")
 	})
 
-	t.Run("without --count-backlog the scan still reaches the window", func(t *testing.T) {
+	t.Run("without --count-backlog the resume stays at the old position before the old turn", func(t *testing.T) {
 		dir := fixture(t, "rc59", "json")
 		editJSON(t, dir, positions(path, r.ends[2], 2, 0, 0, nil)) // old position before the old turn
 		_, db := dryRun(t, dir, func(o *Options) { o.CodexSessions = sessions })
-		eq(t, "s001 source", qs(t, db, sourceQ, "%"+s001Thread+".jsonl"), "tracking@"+strconv.FormatInt(r.ends[4], 10)+":4")
+		eq(t, "s001 source", qs(t, db, sourceQ, "%"+s001Thread+".jsonl"), "tracking@"+strconv.FormatInt(r.ends[2], 10)+":2")
 	})
 
 	t.Run("closed conversation", func(t *testing.T) {
@@ -289,8 +288,7 @@ func TestCatchUpWindowAndClosed(t *testing.T) {
 		}
 		eq(t, "s001 source", qs(t, db, sourceQ, "%"+s001Thread+".jsonl"), "baseline@"+strconv.FormatInt(r.ends[2], 10)+":2")
 		eq(t, "closed sources", rep.Backlog.ClosedSources, 1)
-		eq(t, "skipped closed", rep.Backlog.SkippedClosed, 2)
-		eq(t, "skipped old", rep.Backlog.SkippedOld, 2)
+		eq(t, "skipped closed", rep.Backlog.SkippedClosed, 4)
 		eq(t, "no catch-up", rep.Backlog.Prompts+rep.Backlog.Finals, 0)
 	})
 }

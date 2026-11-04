@@ -10,14 +10,9 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/core/store"
 )
-
-// DiscoveryWindow: unlinked interactive rollouts modified within this window
-// get no transcript_sources row, so runtime discovery creates their chat.
-const DiscoveryWindow = 120 * 24 * time.Hour
 
 var rolloutThread = regexp.MustCompile(`([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$`)
 
@@ -266,8 +261,7 @@ func (c *converter) scanLinked(paths map[string]*pathInfo, keys []string) {
 			continue
 		}
 		q := scanReq{path: p.path, teamsTurn: teams, to: max(p.ckpt, p.cutoff, p.watch),
-			windowStart: c.now.Add(-CatchUpWindow).UnixMilli(),
-			offsets:     []int64{p.ckpt, p.cutoff, p.watch}}
+			offsets: []int64{p.ckpt, p.cutoff, p.watch}}
 		if pr := c.proofs[p.path]; pr != nil {
 			if pr.endOff > 0 && pr.endLine > 0 && pr.endOff <= fst.size && recordBoundary(p.path, pr.endOff) {
 				q.from, q.fromLine = pr.endOff, pr.endLine
@@ -358,12 +352,11 @@ func (c *converter) importSource(p *pathInfo) error {
 		case err != nil:
 			src.State, src.Offset = store.SrcBaseline, size
 			b["unlinked, first line unreadable -> baseline at EOF"]++
-		case c.now.Sub(time.UnixMilli(mtime)) <= DiscoveryWindow:
-			b["unlinked interactive, mtime within 120 days -> no row (discovery)"]++
-			return nil
 		default:
-			src.State, src.Offset = store.SrcBaseline, size
-			b["unlinked interactive, older than 120 days -> baseline at EOF"]++
+			// No row, however old: runtime discovery creates its chat and
+			// catches it up (no window, owner decision 2026-11-05).
+			b["unlinked interactive -> no row (discovery)"]++
+			return nil
 		}
 		if src.Offset < 0 {
 			src.Offset = 0

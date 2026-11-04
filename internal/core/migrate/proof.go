@@ -124,7 +124,6 @@ func (c *converter) scanProofs() error {
 // a final answer of a turn that was not run from Teams.
 type mirrorRec struct {
 	Start, End, Line int64
-	TS               int64  // record timestamp (unix ms, 0: none)
 	Kind             string // "prompt" or "final"
 	ID               string
 }
@@ -139,10 +138,6 @@ type scanReq struct {
 	lines     map[int64]bool
 	ids       map[string]bool
 	teamsTurn map[string]bool // Codex turn ids run from Teams (read-only)
-	// windowStart (unix ms): keep scanning past to/toLine until a line
-	// with a timestamp at or after it, so the 120-day window can skip
-	// every older record (rollouts are chronological).
-	windowStart int64
 }
 
 type scanResult struct {
@@ -195,8 +190,7 @@ func scanRollout(q scanReq) scanResult {
 	var buf []byte
 	var recLen int64
 	big := false
-	inWindow := q.windowStart == 0
-	for off < q.to || line < q.toLine || !inWindow {
+	for off < q.to || line < q.toLine {
 		chunk, err := br.ReadSlice('\n')
 		res.Bytes += int64(len(chunk))
 		recLen += int64(len(chunk))
@@ -223,11 +217,6 @@ func scanRollout(q scanReq) scanResult {
 		start := off
 		off += recLen
 		line++
-		if !inWindow && !big {
-			if ts := lineTS(rec); ts == 0 || ts >= q.windowStart {
-				inWindow = true // no timestamp: stop extending
-			}
-		}
 		if !big {
 			cl.classify(rec, start, off, line)
 			if len(q.ids) > 0 {
@@ -305,9 +294,8 @@ func turnRecordID(turn, kind string, line int64) string {
 }
 
 type rolloutLine struct {
-	Timestamp string `json:"timestamp"`
-	Type      string `json:"type"`
-	Payload   struct {
+	Type    string `json:"type"`
+	Payload struct {
 		Type             string  `json:"type"`
 		ID               string  `json:"id"`
 		Role             string  `json:"role"`
@@ -333,9 +321,6 @@ func (c *classifier) classify(rec []byte, start, end, line int64) {
 	}
 	pl := l.Payload
 	r := mirrorRec{Start: start, End: end, Line: line}
-	if ts, err := time.Parse(time.RFC3339Nano, l.Timestamp); err == nil {
-		r.TS = ts.UnixMilli()
-	}
 	switch {
 	case l.Type == "turn_context":
 		c.setTurn(pl.TurnID, false)
@@ -400,26 +385,6 @@ var legacyTeamsMarkers = []string{
 	"\n\nTeams helper safety:\n- You are running inside a Codex turn launched by the Teams helper.",
 	"\n\nIf you need to return generated files or images to the Teams user, write them under this local directory:\n",
 	"<codex-helper-control-context",
-}
-
-// lineTS reads the top-level "timestamp" of a rollout line (0: none).
-// Codex writes it first; the payload follows it.
-func lineTS(rec []byte) int64 {
-	const lead = `"timestamp":"`
-	i := bytes.Index(rec[:min(len(rec), 512)], []byte(lead))
-	if i < 0 {
-		return 0
-	}
-	rest := rec[i+len(lead):]
-	j := bytes.IndexByte(rest[:min(len(rest), 64)], '"')
-	if j < 0 {
-		return 0
-	}
-	ts, err := time.Parse(time.RFC3339Nano, string(rest[:j]))
-	if err != nil {
-		return 0
-	}
-	return ts.UnixMilli()
 }
 
 // recordID extracts payload.id cheaply (ledger id matching).

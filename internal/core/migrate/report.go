@@ -69,7 +69,6 @@ type ResumeRow struct {
 	GapFinals        int
 	BacklogPrompts   int // prompts/finals from Resume to EOF (-1: not counted)
 	BacklogFinals    int
-	SkipOld          int // unproven records older than 120 days: not posted, resume moved past them
 	SkipClosed       int // records of a closed conversation: no catch-up
 }
 
@@ -82,7 +81,6 @@ type Backlog struct {
 	Gap                                  int // records behind an old furthest position without proof: mirrored
 	NoProofSources                       int
 	NoProofPrompts, NoProofFinals        int
-	SkippedOld                           int // records not posted: older than the 120-day window
 	SkippedClosed                        int // records not posted: conversation closed
 	ClosedSources                        int
 	NoPositionSources, NoPositionRecords int // linked rollouts the old core never positioned: kept at EOF
@@ -186,13 +184,13 @@ func (r *Report) writeResume(w io.Writer) {
 			r.Scan.Files, float64(r.Scan.Bytes)/1e9, r.Scan.Errors, r.Scan.Wall.Round(time.Millisecond))
 	}
 	if b := r.Backlog; b.Counted {
-		fmt.Fprintf(w, "first-start catch-up (120-day window, uncapped): %d sources, %.2f GB, %d prompts + %d finals\n",
+		fmt.Fprintf(w, "first-start catch-up (no window, uncapped): %d sources, %.2f GB, %d prompts + %d finals\n",
 			b.Sources, float64(b.Bytes)/1e9, b.Prompts, b.Finals)
 		fmt.Fprintf(w, "  of which behind an old position without proof (the gap): %d\n", b.Gap)
 		fmt.Fprintf(w, "  of which in no-proof sources: %d sources, %d prompts + %d finals\n",
 			b.NoProofSources, b.NoProofPrompts, b.NoProofFinals)
-		fmt.Fprintf(w, "not posted (rollouts stay on disk): %d records older than 120 days; %d records of %d closed conversations' sources\n",
-			b.SkippedOld, b.SkippedClosed, b.ClosedSources)
+		fmt.Fprintf(w, "not posted (rollouts stay on disk): %d records of %d closed conversations' sources\n",
+			b.SkippedClosed, b.ClosedSources)
 		fmt.Fprintf(w, "linked rollouts with no old position and no proof, kept at EOF: %d (%d prompts/finals not caught up)\n", b.NoPositionSources, b.NoPositionRecords)
 	}
 	if len(r.Shared) > 0 {
@@ -203,15 +201,15 @@ func (r *Report) writeResume(w io.Writer) {
 		}
 	}
 	if len(r.Resume) > 0 {
-		fmt.Fprintf(w, "\nresume positions (C checkpoint, A anchor cutoff, W watcher, P proof, R resume; gap = prompts/finals in [R, max(C,A,W)) mirrored; skip-old = unproven records older than 120 days passed over; closed rows stay at C/A/W):\n")
+		fmt.Fprintf(w, "\nresume positions (C checkpoint, A anchor cutoff, W watcher, P proof, R resume; gap = prompts/finals in [R, max(C,A,W)) mirrored; closed rows stay at C/A/W):\n")
 		for _, x := range r.Resume {
 			bl := "-"
 			if x.BacklogPrompts >= 0 {
 				bl = fmt.Sprintf("%d/%d", x.BacklogPrompts, x.BacklogFinals)
 			}
-			fmt.Fprintf(w, "  %-15s %-6s C=%d A=%d W=%d P=%d R=%d size=%d gap=%d/%d backlog=%s skip-old=%d skip-closed=%d %s\n",
+			fmt.Fprintf(w, "  %-15s %-6s C=%d A=%d W=%d P=%d R=%d size=%d gap=%d/%d backlog=%s skip-closed=%d %s\n",
 				x.Case, x.Conv, x.Checkpoint, x.Cutoff, x.Watcher, x.Proof, x.Resume, x.Size,
-				x.GapPrompts, x.GapFinals, bl, x.SkipOld, x.SkipClosed, x.Path)
+				x.GapPrompts, x.GapFinals, bl, x.SkipClosed, x.Path)
 		}
 	}
 }
