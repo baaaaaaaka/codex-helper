@@ -94,6 +94,9 @@ type CodexBehavior struct {
 const (
 	FailCapacity     = "capacity"
 	FailActiveWriter = "active-writer"
+	// FailRateLimited fails the turn like a provider 429 that outlived
+	// Codex's own retries.
+	FailRateLimited = "rate-limited"
 )
 
 // TokenPattern matches the unique tokens scenarios embed in prompts.
@@ -139,9 +142,20 @@ func DefaultAnswer(c CodexCall) string {
 func (f *FakeCodex) Invoke(ctx context.Context, call CodexCall) (CodexCall, error) {
 	seq, behavior := f.begin(call)
 	if behavior.FailKind == FailActiveWriter {
-		return f.finishSeq(seq, "rejected", "", behaviorErr(behavior))
+		return f.finishSeq(seq, "rejected", "", threadErr(behaviorErr(behavior), call.ThreadID))
 	}
 	return f.await(ctx, seq, behavior)
+}
+
+// threadErr fills the {thread} placeholder of a scripted error.
+func threadErr(err error, threadID string) error {
+	if err == nil || !strings.Contains(err.Error(), "{thread}") {
+		return err
+	}
+	if threadID == "" {
+		threadID = "<unknown>"
+	}
+	return errors.New(strings.ReplaceAll(err.Error(), "{thread}", threadID))
 }
 
 func behaviorErr(b CodexBehavior) error {
@@ -151,8 +165,11 @@ func behaviorErr(b CodexBehavior) error {
 	switch b.FailKind {
 	case FailCapacity:
 		return errors.New("Selected model is at capacity. Please try a different model.")
+	case FailRateLimited:
+		return errors.New("exceeded retry limit, last status: 429 Too Many Requests")
 	case FailActiveWriter:
-		return errors.New("thread is in use by another Codex process (active writer)")
+		// Real Codex 0.166 text (probe c); {thread} becomes the thread id.
+		return errors.New("thread {thread} already has an active writer")
 	}
 	return nil
 }

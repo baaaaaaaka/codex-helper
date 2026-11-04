@@ -58,6 +58,9 @@ type AwaitResult struct {
 	Answer   string `json:"answer,omitempty"`
 	Error    string `json:"error,omitempty"`
 	Capacity bool   `json:"capacity,omitempty"`
+	// RateLimited fails the turn the way Codex reports provider 429s after
+	// its retries (codexErrorInfo responseTooManyFailedAttempts).
+	RateLimited bool `json:"rateLimited,omitempty"`
 }
 
 // EndRequest reports an outcome the brain cannot see by itself

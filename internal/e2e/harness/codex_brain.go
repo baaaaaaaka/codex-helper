@@ -110,7 +110,7 @@ func (f *FakeCodex) Handler() http.Handler {
 		if b.FailKind == FailActiveWriter {
 			err := behaviorErr(b)
 			plan.RejectStart = err.Error()
-			_, _ = f.finishSeq(seq, "rejected", "", err)
+			_, _ = f.finishSeq(seq, "rejected", "", threadErr(err, req.ThreadID))
 		}
 		writeJSON(w, plan)
 	})
@@ -137,6 +137,9 @@ func (f *FakeCodex) Handler() http.Handler {
 		}
 		if call.Outcome == "failed" && b.FailKind == FailCapacity {
 			res.Capacity = true
+		}
+		if call.Outcome == "failed" && b.FailKind == FailRateLimited {
+			res.RateLimited = true
 		}
 		writeJSON(w, res)
 	})
