@@ -33,46 +33,126 @@ func (c *testClock) add(d time.Duration) {
 	c.mu.Unlock()
 }
 
-// One burst of account throttles halves the write rate once; later
-// throttles cut again down to the floor; quiet periods raise it additively
-// back to the ceiling.
-func TestPacerCutsOncePerBurstAndRecoversAdditively(t *testing.T) {
+// A lone account throttle lowers the rate by one step (a 429 at the edge of
+// the budget is noise); throttles of requests in flight with it do not
+// lower it again; the rate before it, minus one step, is the learned
+// ceiling, which is probed one step higher after a long quiet time.
+func TestPacerLoneThrottleStepsDownAdditively(t *testing.T) {
 	clk := &testClock{t: time.Unix(1000, 0)}
 	p := newPacer(4, 30*time.Second, clk.now)
 	inFlight := clk.now()
 	clk.add(100 * time.Millisecond)
-	if cut, rate := p.throttled(inFlight, clk.now().Add(time.Second)); !cut || rate != 2 {
-		t.Fatalf("first throttle: cut=%v rate=%v, want a cut to 2", cut, rate)
+	if cut, rate := p.throttled(inFlight, clk.now().Add(time.Second)); !cut || rate != 3.75 {
+		t.Fatalf("lone throttle: cut=%v rate=%v, want one step down to 3.75", cut, rate)
 	}
-	// Sends that were in flight with the first one: no further cut.
-	if cut, rate := p.throttled(inFlight, clk.now().Add(time.Second)); cut || rate != 2 {
-		t.Fatalf("throttle of a send in flight before the cut: cut=%v rate=%v, want no cut", cut, rate)
+	if cut, rate := p.throttled(inFlight, clk.now().Add(time.Second)); cut || rate != 3.75 {
+		t.Fatalf("throttle of a request in flight before the cut: cut=%v rate=%v, want no cut", cut, rate)
 	}
-	for _, want := range []float64{1, 1} {
+	// Quiet periods do not go back above the learned ceiling (3.75)...
+	clk.add(5 * time.Minute)
+	if r := p.currentRate(); r != 3.75 {
+		t.Fatalf("rate %v after 5 quiet minutes, want the learned ceiling 3.75", r)
+	}
+	if p.limited() {
+		t.Fatal("limited at the learned ceiling without demand")
+	}
+	// ...until a long quiet time (10 periods from the resume) probes one
+	// step higher, up to the configured ceiling.
+	clk.add(time.Second)
+	if r := p.currentRate(); r != 4 {
+		t.Fatalf("rate %v after 10 quiet periods, want a probe to the ceiling 4", r)
+	}
+	clk.add(time.Hour)
+	if r := p.currentRate(); r != 4 {
+		t.Fatalf("rate %v after a long quiet time, want at most the ceiling 4", r)
+	}
+}
+
+// A second throttle within one quiet period after the first halves the rate
+// (down to the floor). The first quiet period after a halving restores
+// about 0.9× the rate before it; later ones add a step up to the learned
+// ceiling (the rate before the last cut minus one step).
+func TestPacerRepeatedThrottleHalvesAndRestoresFast(t *testing.T) {
+	clk := &testClock{t: time.Unix(1000, 0)}
+	p := newPacer(4, 30*time.Second, clk.now)
+	p.throttled(clk.now(), clk.now().Add(time.Second)) // 4 → 3.75
+	clk.add(3 * time.Second)
+	started := clk.now()
+	clk.add(10 * time.Millisecond)
+	if cut, rate := p.throttled(started, clk.now().Add(time.Second)); !cut || rate != 1.875 {
+		t.Fatalf("second throttle within a quiet period: cut=%v rate=%v, want a halving to 1.875", cut, rate)
+	}
+	if !p.limited() {
+		t.Fatal("not limited with the rate below the learned ceiling")
+	}
+	clk.add(time.Second) // the Retry-After ends: the quiet time starts
+	clk.add(29 * time.Second)
+	if r := p.currentRate(); r != 1.875 {
+		t.Fatalf("rate %v before a quiet period, want 1.875", r)
+	}
+	clk.add(time.Second)
+	if r := p.currentRate(); math.Abs(r-3.375) > 1e-9 {
+		t.Fatalf("rate %v after one quiet period, want 0.9 × 3.75 = 3.375", r)
+	}
+	clk.add(30 * time.Second)
+	if r := p.currentRate(); r != 3.5 {
+		t.Fatalf("rate %v after two quiet periods, want the learned ceiling 3.5", r)
+	}
+	clk.add(2 * time.Minute)
+	if r := p.currentRate(); r != 3.5 {
+		t.Fatalf("rate %v at the learned ceiling, want 3.5 until a probe", r)
+	}
+
+	// A throttle after a full quiet period is a lone one again: one step.
+	clk.add(2 * time.Second)
+	started = clk.now()
+	clk.add(10 * time.Millisecond)
+	if _, rate := p.throttled(started, clk.now().Add(time.Second)); rate != 3.25 {
+		t.Fatalf("throttle after quiet periods: rate %v, want one step down to 3.25", rate)
+	}
+	// Repeated throttles halve down to the floor (a quarter of the ceiling).
+	for i := 0; i < 3; i++ {
 		clk.add(2 * time.Second)
 		started := clk.now()
 		clk.add(10 * time.Millisecond)
-		if _, rate := p.throttled(started, clk.now().Add(time.Second)); rate != want {
-			t.Fatalf("rate %v after a later throttle, want %v (floor 1)", rate, want)
+		p.throttled(started, clk.now().Add(time.Second))
+	}
+	if r := p.currentRate(); r != 1 {
+		t.Fatalf("rate %v after repeated throttles, want the floor 1", r)
+	}
+}
+
+// After a cut the bucket holds one request for a quiet period: the requests
+// that waited for the Retry-After are released one at a time.
+func TestPacerBurstIsOneAfterACut(t *testing.T) {
+	clk := &testClock{t: time.Unix(1000, 0)}
+	p := newPacer(4, 30*time.Second, clk.now)
+	for i := 0; i < 4; i++ {
+		if ok, _ := p.take(); !ok {
+			t.Fatalf("take %d refused with a full bucket", i)
 		}
 	}
-	if !p.limited() {
-		t.Fatal("not limited with the rate below the ceiling")
+	resume := clk.now().Add(time.Second)
+	p.throttled(clk.now(), resume)
+	clk.add(10 * time.Second)
+	granted := 0
+	for i := 0; i < 4; i++ {
+		if ok, _ := p.take(); ok {
+			granted++
+		}
 	}
-	clk.add(29 * time.Second)
-	if r := p.currentRate(); r != 1 {
-		t.Fatalf("rate %v before a quiet period, want 1", r)
+	if granted != 1 {
+		t.Fatalf("%d requests granted at once 9 s after the Retry-After, want 1", granted)
 	}
-	clk.add(time.Second)
-	if r := p.currentRate(); r != 1.25 {
-		t.Fatalf("rate %v after one quiet period, want 1.25", r)
+	clk.add(time.Minute) // a quiet period later the burst is one second of the rate again
+	granted = 0
+	for i := 0; i < 4; i++ {
+		if ok, _ := p.take(); ok {
+			granted++
+		}
 	}
-	clk.add(10 * time.Minute)
-	if r := p.currentRate(); r != 4 {
-		t.Fatalf("rate %v after a long quiet time, want the ceiling 4", r)
-	}
-	if p.limited() {
-		t.Fatal("limited at the ceiling without demand")
+	if granted != 3 {
+		t.Fatalf("%d requests granted at once a quiet period later, want 3 (one second at 3.75/s)", granted)
 	}
 }
 
@@ -96,15 +176,16 @@ func TestPacerReleasesGraduallyAfterRetryAfter(t *testing.T) {
 		}
 		clk.add(10 * time.Millisecond)
 	}
-	// 2 s at the cut rate (2/s): about 4 writes, never two within 400 ms.
-	if len(at) < 3 || len(at) > 5 {
-		t.Fatalf("%d writes in the 2 s after Retry-After (%v), want about 4", len(at), at)
+	// 2 s at the stepped-down rate (3.75/s): about 7 writes, never two
+	// within one interval (267 ms).
+	if len(at) < 6 || len(at) > 8 {
+		t.Fatalf("%d writes in the 2 s after Retry-After (%v), want about 7", len(at), at)
 	}
-	if at[0] < 400*time.Millisecond {
+	if at[0] < 250*time.Millisecond {
 		t.Fatalf("first write %s after Retry-After, want one paced interval", at[0])
 	}
 	for i := 1; i < len(at); i++ {
-		if at[i]-at[i-1] < 400*time.Millisecond {
+		if at[i]-at[i-1] < 250*time.Millisecond {
 			t.Fatalf("writes %s and %s after Retry-After: a burst", at[i-1], at[i])
 		}
 	}
