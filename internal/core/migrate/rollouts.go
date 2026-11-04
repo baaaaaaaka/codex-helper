@@ -37,7 +37,7 @@ type offsetCand struct {
 
 type pathInfo struct {
 	path           string
-	conv           int64
+	conv           int64 // chosen conversation (0: unlinked)
 	convs          map[int64]bool
 	thread         string
 	subagent       bool
@@ -48,6 +48,12 @@ type pathInfo struct {
 	recSize        int64
 	recMTime       int64
 	fromDisk       bool
+	// positions recorded by the old core (none of them is proof)
+	ckpt, ckptLine     int64
+	cutoff, cutoffLine int64
+	watch, watchLine   int64
+	scan               *scanResult
+	scanFrom, scanLine int64
 }
 
 func (c *converter) pinfo(m map[string]*pathInfo, path string) *pathInfo {
@@ -63,19 +69,13 @@ func (c *converter) pinfo(m map[string]*pathInfo, path string) *pathInfo {
 // history watch and (when available) a stat-only scan of the rollouts.
 func (c *converter) convertSources() error {
 	paths := map[string]*pathInfo{}
-	threadConv := map[string]int64{}
-	for _, label := range sortedKeys(c.sessions) {
-		si := c.sessions[label]
-		if si.s.CodexThreadID == "" || si.conv == 0 || si.state == "control" {
-			continue
-		}
-		if cur, ok := threadConv[si.s.CodexThreadID]; !ok || c.preferConv(si.conv, cur) {
-			threadConv[si.s.CodexThreadID] = si.conv
-		}
+	threadConv, err := c.resolveSharedThreads()
+	if err != nil {
+		return err
 	}
 	ce := c.rep.E("import_checkpoints")
 	rewriteFlags, watchFlags := 0, 0
-	err := c.l.each("import_checkpoints", func(r row) error {
+	err = c.l.each("import_checkpoints", func(r row) error {
 		ce.Source++
 		var cp legacyCheckpoint
 		if warn, err := decode(r.JSON, &cp); err != nil {
@@ -105,6 +105,9 @@ func (c *converter) convertSources() error {
 		// the flag only distinguishes a trusted zero, which is no resume point.
 		if cp.LastOffset > 0 {
 			p.cands = append(p.cands, offsetCand{rank: 1, src: "checkpoint", offset: cp.LastOffset, line: cp.LastSourceLine})
+			if cp.LastOffset > p.ckpt {
+				p.ckpt, p.ckptLine = cp.LastOffset, cp.LastSourceLine
+			}
 		}
 		if cp.SourceSize > 0 && cp.Status == "complete" {
 			p.cands = append(p.cands, offsetCand{rank: 3, src: "checkpoint source_size", offset: cp.SourceSize})
@@ -121,6 +124,7 @@ func (c *converter) convertSources() error {
 			ce.Outcomes["execution anchor"]++
 			if a.CutoffOffset > 0 {
 				p.cands = append(p.cands, offsetCand{rank: 1, src: "anchor cutoff", offset: a.CutoffOffset, line: a.CutoffLine})
+				p.cutoff, p.cutoffLine = a.CutoffOffset, a.CutoffLine
 			}
 		}
 		if cp.SourceRewriteBlocked {
@@ -157,6 +161,9 @@ func (c *converter) convertSources() error {
 		if w.Offset > 0 {
 			p.cands = append(p.cands, offsetCand{rank: 2, src: "history_watch", offset: w.Offset, line: w.Line})
 			p.progress = true
+			if w.Offset > p.watch {
+				p.watch, p.watchLine = w.Offset, w.Line
+			}
 		}
 		if w.Size > p.recSize {
 			p.recSize, p.recMTime = w.Size, ms(w.ModTime)
@@ -200,11 +207,92 @@ func (c *converter) convertSources() error {
 
 	keys := sortedKeys(paths)
 	for _, k := range keys {
+		p := paths[k]
+		p.conv = c.sourceConv(p)
+		if p.conv == 0 || c.opt.CodexSessions == "" {
+			continue
+		}
+		// history_watch links a subagent rollout by its parent's session id;
+		// it is never a conversation's own transcript.
+		if meta, err := readSessionMeta(p.path); err == nil && meta.subagentOrExec() {
+			p.conv, p.subagent = 0, true
+			c.rep.Buckets["linked by its parent session, but subagent/exec -> unlinked"]++
+		}
+	}
+	c.scanLinked(paths, keys)
+	for _, k := range keys {
 		if err := c.importSource(paths[k]); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// sourceConv picks the conversation a rollout is mirrored into (0: unlinked).
+func (c *converter) sourceConv(p *pathInfo) int64 {
+	var conv int64
+	for cv := range p.convs {
+		if w, lost := c.loserOf[cv]; lost {
+			cv = w // a rollout belongs to the winner of its shared thread
+		}
+		if conv == 0 || c.preferSourceConv(cv, conv, p.thread) {
+			conv = cv
+		}
+	}
+	return conv
+}
+
+// scanLinked runs the bounded proof scan on every linked rollout that exists:
+// from the furthest delivery proof (a validated record end) up to the
+// furthest old position, or to EOF with Options.CountBacklog.
+func (c *converter) scanLinked(paths map[string]*pathInfo, keys []string) {
+	if c.opt.CodexSessions == "" {
+		return
+	}
+	teams := map[string]bool{}
+	for _, ct := range c.turns {
+		if ct.t.CodexTurnID != "" {
+			teams[ct.t.CodexTurnID] = true
+		}
+	}
+	reqs := map[string]scanReq{}
+	for _, k := range keys {
+		p := paths[k]
+		if p.conv == 0 {
+			continue
+		}
+		fst := statFile(p.path)
+		if !fst.ok {
+			continue
+		}
+		q := scanReq{path: p.path, teamsTurn: teams, to: max(p.ckpt, p.cutoff, p.watch),
+			offsets: []int64{p.ckpt, p.cutoff, p.watch}}
+		if pr := c.proofs[p.path]; pr != nil {
+			if pr.endOff > 0 && pr.endLine > 0 && pr.endOff <= fst.size && recordBoundary(p.path, pr.endOff) {
+				q.from, q.fromLine = pr.endOff, pr.endLine
+			} else if pr.endOff > 0 {
+				c.rep.Buckets["proof: delivery offset is not a record end (or has no line) in the current file -> scanned from 0"]++
+			}
+			q.lines, q.ids = map[int64]bool{}, pr.ledgerIDs
+			for ln := range pr.ledgerLines {
+				if ln > q.fromLine {
+					q.lines[ln] = true
+					q.toLine = max(q.toLine, ln)
+				}
+			}
+		}
+		if c.opt.CountBacklog {
+			q.to = fst.size
+		}
+		q.to = min(max(q.to, q.from), fst.size)
+		p.scanFrom, p.scanLine = q.from, q.fromLine
+		reqs[p.path] = q
+	}
+	res := c.runScans(reqs)
+	for path, r := range res {
+		r := r
+		paths[path].scan = &r
+	}
 }
 
 type fileStat struct {
@@ -233,12 +321,7 @@ func (c *converter) importSource(p *pathInfo) error {
 	if fst.ok {
 		size, mtime = fst.size, fst.mtime
 	}
-	var conv int64
-	for cv := range p.convs {
-		if conv == 0 || c.preferSourceConv(cv, conv, p.thread) {
-			conv = cv
-		}
-	}
+	conv := p.conv
 	if len(p.convs) > 1 {
 		c.rep.note("rollout %s linked to %d conversations; kept %s", p.path, len(p.convs), c.labelOf[conv])
 	}
@@ -295,53 +378,73 @@ func (c *converter) importSource(p *pathInfo) error {
 	if canStat && !fst.ok {
 		src.State = store.SrcMissing
 	}
-	// Within a rank the furthest position wins: every rank-1 candidate (a
-	// checkpoint's known offset, an execution anchor's cutoff) is a
-	// delivered position, so resuming before the furthest one re-mirrors.
-	cand := offsetCand{rank: 99}
-	sort.SliceStable(p.cands, func(i, j int) bool {
-		if p.cands[i].rank != p.cands[j].rank {
-			return p.cands[i].rank < p.cands[j].rank
+	if p.scan != nil && p.scan.Err == nil {
+		rs := c.decideResume(p, size)
+		src.Offset, src.Line = rs.off, rs.line
+		c.reportResume(p, rs, size)
+	} else {
+		if p.scan != nil {
+			c.rep.note("rollout %s: proof scan failed (%v); old position rule used", p.path, p.scan.Err)
 		}
-		return p.cands[i].offset > p.cands[j].offset
-	})
-	if len(p.cands) > 0 {
-		cand = p.cands[0]
-	}
-	switch {
-	case cand.rank < 99:
-		src.Offset, src.Line = cand.offset, cand.line
-	case size > 0:
-		cand.src = "EOF (no recorded position)"
-		src.Offset = size
-	default:
-		cand.src = "none"
-	}
-	if p.anchor != nil {
-		switch {
-		case p.anchor.CutoffOffset > 0 && cand.offset == p.anchor.CutoffOffset:
-			b["anchor (0 synthetic turns): at cutoff_offset"]++
-		case p.anchor.CutoffOffset > 0:
-			b["anchor (0 synthetic turns): past cutoff_offset, at a later delivered "+cand.src+" offset"]++
-		default:
-			b["anchor (0 synthetic turns): no cutoff_offset, at "+cand.src+" offset"]++
-		}
-	}
-	if p.rewriteBlocked {
-		if cand.rank <= 2 {
-			b["rewrite-blocked (flag ignored): resumed at stored offset"]++
-		} else {
-			b["rewrite-blocked (flag ignored): no stored offset -> "+cand.src]++
-		}
+		c.legacyResume(p, &src, size, fst.ok)
 	}
 	if fst.ok && src.Offset > fst.size {
 		b["linked: recorded offset beyond EOF (runtime rewrite handling)"]++
 	}
-	b["linked "+src.State+": offset from "+cand.src]++
-	if p.progress && src.Offset == 0 {
+	if p.progress && src.Offset == 0 && (p.scan == nil || p.scan.Err != nil) {
 		c.rep.note("source %s had progress but no usable offset", p.path)
 	}
 	return c.putSource(src)
+}
+
+// resolveSharedThreads maps each Codex thread to the one conversation that
+// owns its rollout. When several work conversations share a thread, the one
+// with the most recent activity wins; the others are parked, keep their
+// thread_id as history and get no transcript source.
+func (c *converter) resolveSharedThreads() (map[string]int64, error) {
+	byThread := map[string][]int64{}
+	for _, label := range sortedKeys(c.sessions) {
+		si := c.sessions[label]
+		if si.s.CodexThreadID == "" || si.conv == 0 || si.state == "control" {
+			continue
+		}
+		byThread[si.s.CodexThreadID] = append(byThread[si.s.CodexThreadID], si.conv)
+	}
+	out := map[string]int64{}
+	e := c.rep.E("shared Codex threads")
+	for _, th := range sortedKeys(byThread) {
+		convs := byThread[th]
+		win := convs[0]
+		for _, cv := range convs[1:] {
+			if a, b := c.lastAct[cv], c.lastAct[win]; a > b || (a == b && c.preferConv(cv, win)) {
+				win = cv
+			}
+		}
+		out[th] = win
+		if len(convs) == 1 {
+			continue
+		}
+		e.Source++
+		for _, cv := range convs {
+			if cv == win {
+				continue
+			}
+			c.loserOf[cv] = win
+			si := c.sessionOfConv(cv)
+			before := si.state
+			if before == store.ConvActive || before == store.ConvCreating {
+				if err := c.im.Park(cv); err != nil {
+					return nil, err
+				}
+				si.state = store.ConvParked
+			}
+			e.Imported++
+			e.Outcomes["loser "+before+" -> "+si.state+", no transcript source"]++
+			c.rep.Shared = append(c.rep.Shared, SharedThread{Thread: th, Winner: c.labelOf[win], WinnerLast: c.lastAct[win],
+				Loser: c.labelOf[cv], LoserLast: c.lastAct[cv], LoserBefore: before, LoserAfter: si.state})
+		}
+	}
+	return out, nil
 }
 
 // preferConv orders conversations sharing a Codex thread: active before
@@ -439,3 +542,34 @@ func readSessionMeta(path string) (sessionMeta, error) {
 }
 
 var errNotMeta = &fs.PathError{Op: "read", Path: "session_meta", Err: fs.ErrInvalid}
+
+// legacyResume is the position rule when no proof scan ran (file missing, or
+// no rollout access): the furthest checkpoint or anchor cutoff, else the
+// watcher position, else EOF.
+func (c *converter) legacyResume(p *pathInfo, src *store.TranscriptSource, size int64, exists bool) {
+	b := c.rep.Buckets
+	cand := offsetCand{rank: 99}
+	sort.SliceStable(p.cands, func(i, j int) bool {
+		if p.cands[i].rank != p.cands[j].rank {
+			return p.cands[i].rank < p.cands[j].rank
+		}
+		return p.cands[i].offset > p.cands[j].offset
+	})
+	if len(p.cands) > 0 {
+		cand = p.cands[0]
+	}
+	switch {
+	case cand.rank < 99:
+		src.Offset, src.Line = cand.offset, cand.line
+	case size > 0:
+		cand.src = "EOF (no recorded position)"
+		src.Offset = size
+	default:
+		cand.src = "none"
+	}
+	why := "file missing"
+	if exists {
+		why = "no rollout access"
+	}
+	b["linked "+src.State+" ("+why+", not scanned): offset from "+cand.src]++
+}

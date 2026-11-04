@@ -115,6 +115,7 @@ var tableOf = map[string]string{
 	"import_checkpoints":    "import_checkpoints",
 	"transcript_deliveries": "transcript_deliveries",
 	"helper_deliveries":     "helper_deliveries",
+	"transcript_ledger":     "transcript_ledger",
 	"artifact_records":      "artifact_records",
 	"notifications":         "notifications",
 	"fork_operations":       "fork_operations",

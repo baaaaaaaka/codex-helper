@@ -226,6 +226,7 @@ type legacyWatch struct {
 
 type legacyNotification struct {
 	ID             string `json:"id"`
+	Kind           string `json:"kind"`
 	Status         string `json:"status"`
 	Title          string `json:"title"`
 	ChatTitle      string `json:"chat_title"`
@@ -253,6 +254,24 @@ type legacyDelivery struct {
 	Status         string `json:"status"`
 	CreatedAt      ltime  `json:"created_at"`
 	SentAt         ltime  `json:"sent_at"`
+	// transcript deliveries only: the rollout record that was delivered.
+	CodexThreadID  string `json:"codex_thread_id"`
+	SourcePath     string `json:"source_path"`
+	SourceLine     int64  `json:"source_line"`
+	SourceOffset   int64  `json:"source_offset"` // end offset of the record line
+	SourceRecordID string `json:"source_record_id"`
+	PartIndex      int    `json:"part_index"`
+}
+
+// legacyLedger is a transcript_ledger row: a rollout record the old importer
+// handled (rc.59).
+type legacyLedger struct {
+	ID             string `json:"id"`
+	SessionID      string `json:"session_id"`
+	CodexThreadID  string `json:"codex_thread_id"`
+	SourcePath     string `json:"source_path"`
+	SourceLine     int64  `json:"source_line"`
+	SourceRecordID string `json:"source_record_id"`
 }
 
 type legacyRateLimit struct {

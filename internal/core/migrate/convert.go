@@ -60,26 +60,41 @@ type converter struct {
 	opt Options
 	now time.Time
 
-	control     int64
-	controlChat string
-	scopeID     string
-	sessions    map[string]*sessInfo
-	convByChat  map[string]int64
-	labelOf     map[int64]string
-	forkParent  map[string]string // child session -> parent session (completed forks)
-	holdChild   map[string]bool   // child sessions of unfinished forks
-	polls       map[string]legacyPoll
-	turns       map[string]*compactTurn
-	extSeen     map[int64]map[string]bool // outbox ext ids per conversation
-	oldestIn    map[int64]int64           // oldest inbound ext_time per conversation
-	inboundOld  map[string]int64          // old inbound id -> new id (rows whose turn is kept)
-	needPause   map[int64]string
-	unknownSrc  int                     // source rows with an unknown send outcome
-	anchors     map[string]legacyAnchor // by source path
-	threadLinks map[string]threadLink
+	control      int64
+	controlChat  string
+	scopeID      string
+	sessions     map[string]*sessInfo
+	convByChat   map[string]int64
+	labelOf      map[int64]string
+	forkParent   map[string]string // child session -> parent session (completed forks)
+	holdChild    map[string]bool   // child sessions of unfinished forks
+	polls        map[string]legacyPoll
+	turns        map[string]*compactTurn
+	extSeen      map[int64]map[string]bool // outbox ext ids per conversation
+	oldestIn     map[int64]int64           // oldest inbound ext_time per conversation
+	inboundOld   map[string]int64          // old inbound id -> new id (rows whose turn is kept)
+	needPause    map[int64]string
+	orphans      map[string]int64        // unknown chat (or "session:<id>") -> placeholder conversation
+	lastAct      map[int64]int64         // newest activity per conversation (unix ms)
+	unknownSrc   int                     // source rows with an unknown send outcome
+	anchors      map[string]legacyAnchor // by source path
+	threadLinks  map[string]threadLink
+	proofs       map[string]*proof // delivery-ledger proof per rollout path
+	outboxMirror map[string]string // legacy outbox id -> mirror delivery key
+	loserOf      map[int64]int64   // parked shared-thread conversation -> winner
+	mirrorUsed   map[string]bool
+	zeroNoProof  int // tracking sources resumed at 0 for lack of proof
+	ledger       []legacyLedger
 }
 
 func (c *converter) ms() int64 { return c.now.UnixMilli() }
+
+// touch records activity on a conversation (shared-thread winner choice).
+func (c *converter) touch(conv, at int64) {
+	if conv != 0 && at > c.lastAct[conv] {
+		c.lastAct[conv] = at
+	}
+}
 
 func (c *converter) convOf(sessionID, chatID string) (int64, bool) {
 	if sessionID == controlFallbackID {
@@ -110,10 +125,12 @@ func (c *converter) run() error {
 		{"inbound", c.convertInbound},
 		{"turns", c.convertTurns},
 		{"streams", c.convertStreams},
+		{"delivery proofs (scan)", c.scanProofs},
 		{"outbox", c.convertOutbox},
 		{"deliveries", c.convertDeliveries},
 		{"transcript sources", c.convertSources},
 		{"notifications", c.convertNotifications},
+		{"workflow config", c.convertWorkflow},
 		{"artifacts", c.countArtifacts},
 		{"gates", c.convertGates},
 		{"meta", c.convertMeta},
@@ -508,6 +525,7 @@ func extTime(msgID string, fallback int64) int64 {
 
 func (c *converter) convertInbound() error {
 	e := c.rep.E("inbound_events")
+	var orphanRows []legacyInbound
 	err := c.l.each("inbound_events", func(r row) error {
 		e.Source++
 		var in legacyInbound
@@ -520,55 +538,116 @@ func (c *converter) convertInbound() error {
 		}
 		conv, ok := c.convOf(in.SessionID, in.TeamsChatID)
 		if !ok {
-			e.Outcomes["chat unknown -> dropped ("+firstNonEmpty(in.Status, "(empty)")+")"]++
+			orphanRows = append(orphanRows, in)
 			return nil
 		}
-		state, outcome := c.inboundDisposition(in, conv)
-		ext := firstNonEmpty(in.TeamsMessageID, "legacy:"+in.ID)
-		kind := store.InPrompt
-		if conv == c.control {
-			kind = store.InCommand
-		}
-		sender := store.SenderOwner
-		if state == store.InIgnored {
-			sender = store.SenderOther
-		}
-		body := in.Text // kept for every row (§6: nothing is blanked)
-		recv := firstNonZero(ms(in.ReceivedAt), ms(in.CreatedAt), c.ms())
-		row := store.Inbound{ConvID: conv, ExtMsgID: ext, ExtTime: extTime(in.TeamsMessageID, recv), ReceivedAt: recv,
-			Sender: sender, Kind: kind, State: state, Body: body}
-		id, ok, err := c.im.Inbound(row)
-		if err != nil {
-			return fmt.Errorf("inbound %s: %w", in.ID, err)
-		}
-		if !ok {
-			e.Outcomes["duplicate message id -> merged"]++
-			return nil
-		}
-		e.Imported++
-		e.Outcomes[outcome]++
-		if state == store.InHeld && conv != c.control {
-			if si := c.sessionOfConv(conv); si == nil || !si.paused {
-				c.needPause[conv] = "migrated-held-messages"
-			}
-		}
-		if old, seen := c.oldestIn[conv]; !seen || row.ExtTime < old {
-			c.oldestIn[conv] = row.ExtTime
-		}
-		if t := c.turns[in.TurnID]; t != nil && t.keep && t.conv == conv {
-			c.inboundOld[in.ID] = id
-		} else if state == store.InQueued && kind == store.InPrompt {
-			key := "inbound:" + in.ID
-			c.turns[key] = &compactTurn{t: legacyTurn{ID: key, SessionID: in.SessionID, InboundEventID: in.ID, Status: "queued"},
-				conv: conv, order: row.ExtTime, keep: true, newStat: store.TurnQueued}
-			c.inboundOld[in.ID] = id
-		}
-		return nil
+		return c.importInbound(e, in, conv, "")
 	})
 	if err != nil {
 		return err
 	}
+	// Rows of chats that map to no session: no data loss, so they go into
+	// placeholder conversations (closed, never polled), one per chat.
+	if err := c.createOrphans(orphanRows); err != nil {
+		return err
+	}
+	for _, in := range orphanRows {
+		if err := c.importInbound(e, in, c.orphanOf(in), "orphan chat: "); err != nil {
+			return err
+		}
+	}
 	return c.registrySeen()
+}
+
+// orphanKey identifies the placeholder conversation of a row whose chat is
+// unknown: its chat id, or its session id when it has no chat.
+func orphanKey(chat, session string) string {
+	if chat != "" {
+		return chat
+	}
+	return "session:" + session
+}
+
+func (c *converter) orphanOf(in legacyInbound) int64 {
+	return c.orphans[orphanKey(in.TeamsChatID, in.SessionID)]
+}
+
+// createOrphans creates one closed placeholder conversation per unknown chat
+// (inbound rows and registry seen ids), labelled orphan-<n> in chat order.
+func (c *converter) createOrphans(rows []legacyInbound) error {
+	keys := map[string]bool{}
+	for _, in := range rows {
+		keys[orphanKey(in.TeamsChatID, in.SessionID)] = true
+	}
+	for _, chat := range sortedKeys(c.opt.registry.Chats) {
+		if _, known := c.convByChat[chat]; !known && len(c.opt.registry.Chats[chat].SeenMessageIDs) > 0 {
+			keys[chat] = true
+		}
+	}
+	e := c.rep.E("orphan conversations")
+	for i, k := range sortedKeys(keys) {
+		chat := k
+		if strings.HasPrefix(k, "session:") {
+			chat = ""
+		}
+		id, err := c.im.Conversation(store.Conversation{Label: fmt.Sprintf("orphan-%d", i+1), Kind: store.KindWork, Channel: channel,
+			ExtChatID: chat, State: store.ConvClosed, CreatedAt: c.ms()})
+		if err != nil {
+			return err
+		}
+		c.orphans[k] = id
+		c.labelOf[id] = fmt.Sprintf("orphan-%d", i+1)
+		e.Source++
+		e.Imported++
+		e.Outcomes["closed placeholder (never polled)"]++
+	}
+	return nil
+}
+
+func (c *converter) importInbound(e *Entity, in legacyInbound, conv int64, prefix string) error {
+	state, outcome := c.inboundDisposition(in, conv)
+	outcome = prefix + outcome
+	ext := firstNonEmpty(in.TeamsMessageID, "legacy:"+in.ID)
+	kind := store.InPrompt
+	if conv == c.control {
+		kind = store.InCommand
+	}
+	sender := store.SenderOwner
+	if state == store.InIgnored {
+		sender = store.SenderOther
+	}
+	body := in.Text // kept for every row (§6: nothing is blanked)
+	recv := firstNonZero(ms(in.ReceivedAt), ms(in.CreatedAt), c.ms())
+	row := store.Inbound{ConvID: conv, ExtMsgID: ext, ExtTime: extTime(in.TeamsMessageID, recv), ReceivedAt: recv,
+		Sender: sender, Kind: kind, State: state, Body: body}
+	id, ok, err := c.im.Inbound(row)
+	if err != nil {
+		return fmt.Errorf("inbound %s: %w", in.ID, err)
+	}
+	if !ok {
+		e.Outcomes[prefix+"duplicate message id -> merged"]++
+		return nil
+	}
+	e.Imported++
+	e.Outcomes[outcome]++
+	if state == store.InHeld && conv != c.control && prefix == "" {
+		if si := c.sessionOfConv(conv); si == nil || !si.paused {
+			c.needPause[conv] = "migrated-held-messages"
+		}
+	}
+	if old, seen := c.oldestIn[conv]; !seen || row.ExtTime < old {
+		c.oldestIn[conv] = row.ExtTime
+	}
+	if t := c.turns[in.TurnID]; t != nil && t.keep && t.conv == conv {
+		c.inboundOld[in.ID] = id
+	} else if state == store.InQueued && kind == store.InPrompt && prefix == "" {
+		key := "inbound:" + in.ID
+		c.turns[key] = &compactTurn{t: legacyTurn{ID: key, SessionID: in.SessionID, InboundEventID: in.ID, Status: "queued"},
+			conv: conv, order: row.ExtTime, keep: true, newStat: store.TurnQueued}
+		c.inboundOld[in.ID] = id
+	}
+	c.touch(conv, row.ExtTime)
+	return nil
 }
 
 func (c *converter) sessionOfConv(conv int64) *sessInfo {
@@ -586,12 +665,12 @@ func (c *converter) registrySeen() error {
 		ids := c.opt.registry.Chats[chat].SeenMessageIDs
 		e.Source += len(ids)
 		conv, ok := c.convByChat[chat]
+		prefix := ""
 		if !ok {
-			e.Outcomes["chat unknown -> dropped"] += len(ids)
-			continue
+			conv, prefix = c.orphans[chat], "orphan chat: "
 		}
 		if _, has := c.oldestIn[conv]; has {
-			e.Outcomes["chat has inbound rows -> covered"] += len(ids)
+			e.Outcomes[prefix+"chat has inbound rows -> covered"] += len(ids)
 			continue
 		}
 		for _, id := range ids {
@@ -602,6 +681,7 @@ func (c *converter) registrySeen() error {
 			}
 			if ok {
 				e.Imported++
+				e.Outcomes[prefix+"imported (done)"]++
 			}
 		}
 	}
@@ -649,6 +729,7 @@ func (c *converter) convertTurns() error {
 			return err
 		}
 		ct.newID = nid
+		c.touch(ct.conv, firstNonZero(tr.FinishedAt, tr.StartedAt, tr.QueuedAt))
 		if inbound != 0 {
 			if err := c.im.LinkInbound(inbound, nid); err != nil {
 				return err
@@ -841,10 +922,13 @@ func (c *converter) convertOutbox() error {
 			o := co.o
 			seq++
 			row := store.Outbox{
-				ConvID: conv, DeliveryKey: "legacy-outbox:" + o.ID, Seq: seq, Kind: outboxKind(o.Kind),
+				ConvID: conv, DeliveryKey: c.mirrorKeyOr(c.outboxMirror[o.ID], "legacy-outbox:"+o.ID), Seq: seq, Kind: outboxKind(o.Kind),
 				Part: o.PartIndex, Parts: o.PartCount, Body: o.Body, Mention: bool(o.MentionOwner), ReplyTo: o.QuoteReplyToMessageID,
 				State: co.state, ExtMsgID: o.TeamsMessageID, CreatedAt: firstNonZero(ms(o.CreatedAt), c.ms()), SentAt: ms(o.SentAt),
 				BodyHash: renderedHash(o.RenderedHash),
+			}
+			if row.BodyHash != nil {
+				row.HashAlgo = store.HashLegacy // re-hashed by the core at first start
 			}
 			switch {
 			case co.opaque && co.state != store.OutUnknown:
@@ -885,6 +969,9 @@ func (c *converter) convertOutbox() error {
 			}
 			e.Imported++
 			e.Outcomes[o.Status+" -> "+co.state]++
+			if row.State == store.OutSent {
+				c.touch(conv, firstNonZero(row.SentAt, row.CreatedAt))
+			}
 			if o.TeamsMessageID != "" {
 				c.markExt(conv, o.TeamsMessageID)
 			}
@@ -957,7 +1044,11 @@ func (c *converter) convertDeliveries() error {
 				e.Outcomes["covered by outbox"]++
 				return nil
 			}
-			if err := c.sentMirror(conv, "legacy-delivery:"+d.ID, d.TeamsMessageID, firstNonZero(ms(d.SentAt), ms(d.CreatedAt), c.ms())); err != nil {
+			key := "legacy-delivery:" + d.ID
+			if ent == "transcript_deliveries" && d.CodexThreadID != "" && codexRecordID(d.SourceRecordID) {
+				key = c.mirrorKeyOr(MirrorKey(d.CodexThreadID, d.SourceRecordID, max(d.PartIndex, 1)), key)
+			}
+			if err := c.sentMirror(conv, key, d.TeamsMessageID, firstNonZero(ms(d.SentAt), ms(d.CreatedAt), c.ms())); err != nil {
 				return err
 			}
 			e.Imported++
@@ -1004,6 +1095,18 @@ func (c *converter) convertDeliveries() error {
 	})
 }
 
+// mirrorKeyOr returns the mirror key (proof.go) when it is set and not yet
+// taken, else the legacy key. A legacy row whose record identity is known
+// thus dedupes against the new mirror per record.
+func (c *converter) mirrorKeyOr(mirror, legacy string) string {
+	if mirror == "" || c.mirrorUsed[mirror] {
+		return legacy
+	}
+	c.mirrorUsed[mirror] = true
+	c.rep.E("mirror keys").Imported++
+	return mirror
+}
+
 func (c *converter) sentMirror(conv int64, key, ext string, at int64) error {
 	seq, err := c.im.MaxSeq(conv)
 	if err != nil {
@@ -1030,7 +1133,10 @@ func (c *converter) convertNotifications() error {
 			n.ID = r.ID
 		}
 		// Every row is kept (§6). Cards are at-most-once, so anything that
-		// is not queued or sent becomes dropped and is never re-sent.
+		// is not queued or sent becomes dropped and is never re-sent. Most
+		// rows are turn_completed cards: with a card available the old
+		// helper suppressed the owner @mention on the final, and the core
+		// keeps that rule (meta workflow_enabled).
 		st := store.OutDropped
 		switch n.Status {
 		case "queued":
@@ -1039,12 +1145,12 @@ func (c *converter) convertNotifications() error {
 			st = store.OutSent
 		}
 		payload := strings.TrimSpace(strings.Join([]string{n.Title, n.ChatTitle, n.RequestSummary, n.ButtonURL}, "\n"))
-		if err := c.im.Notification(store.Notification{Key: "legacy:" + n.ID, Payload: payload, State: st,
+		if err := c.im.Notification(store.Notification{Key: "legacy:" + n.ID, Kind: firstNonEmpty(n.Kind, "unknown"), Payload: payload, State: st,
 			CreatedAt: firstNonZero(ms(n.CreatedAt), c.ms()), SentAt: ms(n.SentAt)}); err != nil {
 			return err
 		}
 		e.Imported++
-		e.Outcomes[firstNonEmpty(n.Status, "(empty)")+" -> "+st]++
+		e.Outcomes[firstNonEmpty(n.Kind, "(no kind)")+" "+firstNonEmpty(n.Status, "(empty)")+" -> "+st]++
 		return nil
 	})
 }
