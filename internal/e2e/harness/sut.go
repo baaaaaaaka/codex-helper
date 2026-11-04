@@ -39,6 +39,10 @@ type SUTConfig struct {
 	Graph    *fakegraph.Server
 	Codex    *FakeCodex
 	Interval time.Duration
+	// ExtraEnv is added to a subprocess SUT's environment (scenario
+	// switches such as E2E_SUT_MACHINE_REGISTRY=1). In-process adapters
+	// ignore it.
+	ExtraEnv map[string]string
 	Logf     func(format string, args ...any)
 }
 

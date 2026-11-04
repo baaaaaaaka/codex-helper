@@ -17,6 +17,7 @@ import (
 // 20 per page). After restart both prompts must be answered exactly once and
 // in order.
 func TestR04_PagedBacklogAfterRestart(t *testing.T) {
+	harness.Parallel(t)
 	s := harness.NewScenario(t, "R-4-paging", harness.Options{
 		Guarantees: []string{"R-4", "R-3", "R-6"},
 		Title:      "a prompt reachable only via @odata.nextLink after downtime is answered once",

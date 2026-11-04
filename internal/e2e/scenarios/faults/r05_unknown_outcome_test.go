@@ -23,6 +23,7 @@ import (
 // Part 2 (dropped-before-accept): Graph never stores it. Expected: still no
 // automatic re-POST; the loss is reported visibly once (R-1 exception).
 func TestR05_LostResponseNeverReposted(t *testing.T) {
+	harness.Parallel(t)
 	s := harness.NewScenario(t, "R-5", harness.Options{
 		Guarantees: []string{"R-5", "R-1", "R-2"},
 		Title:      "final POST with unknown outcome is not auto-replayed; turn state visible",

@@ -14,6 +14,7 @@ import (
 // Codex runs one turn at a time per session (FIFO), and each answer appears
 // in Teams in the same order as the prompts.
 func TestR06_AnswersInOrder(t *testing.T) {
+	harness.Parallel(t)
 	s := harness.NewScenario(t, "R-6", harness.Options{
 		Guarantees: []string{"R-6", "R-30", "R-3"},
 		Title:      "three prompts in one chat are executed FIFO and answered in order",

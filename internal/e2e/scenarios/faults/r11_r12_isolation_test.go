@@ -14,6 +14,7 @@ import (
 // R-11 (with R-21): a chat whose message list keeps returning 5xx does not
 // block answers in another chat.
 func TestR11_BadChatDoesNotBlockOthers(t *testing.T) {
+	harness.Parallel(t)
 	s := harness.NewScenario(t, "R-11", harness.Options{
 		Guarantees: []string{"R-11", "R-21"},
 		Title:      "persistent 503 on one chat's message list does not delay another chat",
@@ -57,6 +58,7 @@ func TestR11_BadChatDoesNotBlockOthers(t *testing.T) {
 // R-12: sustained 429 on GET message lists does not stop POSTs of pending
 // answers (a read 429 never blocks writes).
 func TestR12_Read429DoesNotBlockWrites(t *testing.T) {
+	harness.Parallel(t)
 	s := harness.NewScenario(t, "R-12", harness.Options{
 		Guarantees: []string{"R-12"},
 		Title:      "all message-list reads throttled (429, Retry-After 30s) while answers are pending",

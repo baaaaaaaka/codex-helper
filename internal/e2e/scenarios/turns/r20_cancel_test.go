@@ -14,6 +14,7 @@ import (
 // Codex), the turn ends in exactly one visible terminal state with no answer
 // for it, and the next message in the chat still works.
 func TestR20_R33_CancelRunningTurn(t *testing.T) {
+	harness.Parallel(t)
 	s := harness.NewScenario(t, "R-20-33", harness.Options{
 		Guarantees: []string{"R-20", "R-33", "F-TRN-3"},
 		Title:      "cancel of a running turn is visible and final; next message works",

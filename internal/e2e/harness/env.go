@@ -17,9 +17,10 @@ import (
 
 // Env is one scenario's isolated filesystem and process environment.
 //
-// Because the old core reads its configuration from process environment
-// variables, Env uses t.Setenv. Scenarios therefore must not run in parallel
-// within one test binary.
+// The SUT reads its configuration from environment variables. Every variable
+// is recorded in Vars; a subprocess SUT gets exactly Vars (plus PATH). Only
+// when SetProcessEnv is true (in-process adapters) does Env also t.Setenv
+// them, which forbids parallel scenarios within one test binary.
 type Env struct {
 	Root        string
 	Home        string
@@ -43,6 +44,18 @@ const (
 	FakeReadClientID = "e2e0c11e-0000-4000-8000-000000000002"
 	MachineLabel     = "e2ehost"
 )
+
+// SetProcessEnv makes NewEnv apply the variables to the test process. The
+// in-process adapter needs it; sut.Run clears it for the subprocess adapter.
+var SetProcessEnv = true
+
+// Parallel marks the test parallel when the environment allows it (i.e.
+// when the SUT runs as a subprocess).
+func Parallel(t *testing.T) {
+	if !SetProcessEnv {
+		t.Parallel()
+	}
+}
 
 // NewEnv creates the directory tree, writes fake token caches issued by g and
 // points every relevant environment variable at them.
@@ -94,7 +107,9 @@ func NewEnv(t testing.TB, g *fakegraph.Server) *Env {
 	}
 
 	set := func(k, v string) {
-		t.Setenv(k, v)
+		if SetProcessEnv {
+			t.Setenv(k, v)
+		}
 		e.Vars[k] = v
 	}
 	set("HOME", e.Home)

@@ -17,6 +17,7 @@ var outboxMarker = regexp.MustCompile(`<!--\s*codex-helper-outbox:[^>]*-->`)
 // merely looks like helper output still runs, and a message from another
 // helper instance on the same account does not start a message loop.
 func TestR07_NoSelfEchoNoPingPong(t *testing.T) {
+	harness.Parallel(t)
 	s := harness.NewScenario(t, "R-7", harness.Options{
 		Guarantees: []string{"R-7", "R-3", "INC-02"},
 		Title:      "own posts never trigger Codex; look-alike user text does; another instance causes no loop",

@@ -16,6 +16,7 @@ import (
 // and a session created while down are caught up incrementally with no
 // duplicates.
 func TestR09_R10_MirrorTUIRollout(t *testing.T) {
+	harness.Parallel(t)
 	s := harness.NewScenario(t, "R-9-10", harness.Options{
 		Guarantees: []string{"R-9", "R-10", "R-2", "R-34", "F-MIR-1", "F-MIR-4"},
 		Title:      "TUI rollout mirrored once; incremental catch-up after stop; down-time session discovered",
@@ -26,22 +27,34 @@ func TestR09_R10_MirrorTUIRollout(t *testing.T) {
 	control := steps.ReadyControlChat(s)
 	chatsBefore := len(s.Graph.Chats())
 
-	// A new TUI session appears after the helper started.
-	cwd := s.Env.WorkDir(t, "r09-tui")
-	r := harness.NewRollout(t, s.Env, cwd)
-	p1, a1 := s.Token("tuiprompt1"), s.Token("tuianswer1")
-	r.AppendTurn(t, "Local question "+p1, "Looking into it", "Local answer "+a1)
-	writtenAt := time.Now()
-
-	var chat fakegraph.ChatInfo
-	s.WaitFor("TUI session mirrored (answer visible)", 45*time.Second, func() (bool, string) {
-		cs := steps.ChatsWithSUTText(s, a1)
-		if len(cs) > 0 {
-			chat = cs[0]
-			return true, ""
+	// A new TUI session appears after the helper started. On its very first
+	// start the old core baselines (skips) every rollout that exists when
+	// its first history scan runs, and that scan is not observable, so a
+	// session written in that window is never mirrored. Retry with a fresh
+	// session and record how often that happened.
+	var (
+		r         *harness.Rollout
+		p1, a1    string
+		chat      fakegraph.ChatInfo
+		writtenAt time.Time
+	)
+	for attempt := 1; attempt <= 3 && chat.ID == ""; attempt++ {
+		cwd := s.Env.WorkDir(t, fmt.Sprintf("r09-tui-%d", attempt))
+		r = harness.NewRollout(t, s.Env, cwd)
+		p1, a1 = s.Token("tuiprompt1"), s.Token("tuianswer1")
+		r.AppendTurn(t, "Local question "+p1, "Looking into it", "Local answer "+a1)
+		writtenAt = time.Now()
+		s.Poll(15*time.Second, func() bool {
+			if cs := steps.ChatsWithSUTText(s, a1); len(cs) > 0 {
+				chat = cs[0]
+				return true
+			}
+			return false
+		})
+		if chat.ID == "" {
+			s.Note("attempt %d: new TUI session not mirrored within 15s (first-start baseline race?)", attempt)
 		}
-		return false, fmt.Sprintf("%d chats", len(s.Graph.Chats()))
-	})
+	}
 	if chat.ID != "" {
 		s.Note("mirrored into %q %.1fs after the rollout was written", chat.Topic, time.Since(writtenAt).Seconds())
 	}

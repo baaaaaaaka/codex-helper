@@ -22,6 +22,7 @@ import (
 // automatically (R-5b) and the chat shows that A was interrupted; nothing is
 // replayed by the second restart.
 func TestR04_R29_RestartPreservesWork(t *testing.T) {
+	harness.Parallel(t)
 	s := harness.NewScenario(t, "R-4-29", harness.Options{
 		Guarantees: []string{"R-4", "R-29", "R-5", "R-3", "F-TRN-5"},
 		Title:      "queued and down-time messages survive a restart exactly once; running turn not re-run",
@@ -92,16 +93,19 @@ func TestR04_R29_RestartPreservesWork(t *testing.T) {
 		}
 	}
 	interrupted := 0
+	var notices []string
 	for _, m := range s.SUTMessages(work.ID) {
 		if m.Created.Before(restartAt.Add(-time.Second)) {
 			continue
 		}
 		low := strings.ToLower(m.PlainText())
-		if strings.Contains(low, "interrupt") || strings.Contains(low, "helper stopped") || strings.Contains(low, "restart") {
+		if strings.Contains(low, "interrupt") || strings.Contains(low, "helper stopped") || strings.Contains(low, "restart") || strings.Contains(low, "unconfirmed") {
 			interrupted++
+			notices = append(notices, harness.NormalizeSpace(m.PlainText()))
 		}
 	}
-	s.Check("R-33/F-TRN-5 interrupted turn A is reported (once)", interrupted == 1, "1 interruption notice after restart", fmt.Sprint(interrupted), transcript...)
+	s.Check("R-33/F-TRN-5 interrupted turn A is reported (once)", interrupted == 1, "1 interruption notice after restart",
+		fmt.Sprintf("%d: %q", interrupted, notices), transcript...)
 	if len(callsA) > 0 {
 		s.Note("A outcome in fake Codex: %s", callsA[0].Outcome)
 	}

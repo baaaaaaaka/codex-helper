@@ -14,6 +14,7 @@ import (
 // answer in Teams and exactly one Codex call. Also covers the control chat
 // basics (control chat created and ready; `new <dir>` creates one work chat).
 func TestR01_R02_R03_AnswerExactlyOnce(t *testing.T) {
+	harness.Parallel(t)
 	s := harness.NewScenario(t, "R-1-2-3", harness.Options{
 		Guarantees: []string{"R-1", "R-2", "R-3", "F-CTL-1", "F-CTL-4"},
 		Title:      "one prompt -> one Codex call -> one final answer; control chat basics",

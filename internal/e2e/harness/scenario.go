@@ -51,6 +51,8 @@ type Options struct {
 	Graph      fakegraph.Options
 	Factory    SUTFactory
 	NoStart    bool
+	// SUTEnv is passed to a subprocess SUT (see SUTConfig.ExtraEnv).
+	SUTEnv map[string]string
 }
 
 // Scenario owns one isolated run.
@@ -99,7 +101,7 @@ func NewScenario(t *testing.T, id string, opts Options) *Scenario {
 		T: t, ID: id, Opts: opts, Graph: g, Env: env, Codex: codex,
 		started: time.Now(), budget: time.Now().Add(opts.Budget), ctx: ctx, cancel: cancel,
 	}
-	sut, err := opts.Factory(SUTConfig{Env: env, Graph: g, Codex: codex, Interval: opts.Interval, Logf: t.Logf})
+	sut, err := opts.Factory(SUTConfig{Env: env, Graph: g, Codex: codex, Interval: opts.Interval, ExtraEnv: opts.SUTEnv, Logf: t.Logf})
 	if err != nil {
 		t.Fatalf("build SUT: %v", err)
 	}
@@ -121,6 +123,8 @@ func (s *Scenario) cleanup() {
 		}
 	}
 	s.Codex.ReleaseAll()
+	s.Codex.Close()
+	s.Codex.KillAppServers()
 	s.cancel()
 	s.Graph.Close()
 }
@@ -211,6 +215,24 @@ func (s *Scenario) WaitFor(desc string, timeout time.Duration, cond func() (bool
 	return false
 }
 
+// Poll is WaitFor without recording anything on timeout: it reports whether
+// cond became true within timeout (bounded by the scenario budget).
+func (s *Scenario) Poll(timeout time.Duration, cond func() bool) bool {
+	deadline := time.Now().Add(timeout)
+	if deadline.After(s.budget) {
+		deadline = s.budget
+	}
+	for {
+		if cond() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
 // Require is WaitFor that aborts the scenario (after emitting the verdict)
 // when the condition is not met.
 func (s *Scenario) Require(desc string, timeout time.Duration, cond func() (bool, string)) {
@@ -290,6 +312,7 @@ func (s *Scenario) Finish() Verdict {
 	}
 	if !v.Pass {
 		v.OutputTail = s.OutputTail(3000)
+		s.logCodexLogs()
 	}
 	if s.dumped && s.T != nil {
 		v.Notes = append(v.Notes, "goroutine dump emitted in test log")
@@ -311,6 +334,23 @@ func sanitize(s string) string {
 		}
 		return '_'
 	}, s)
+}
+
+// logCodexLogs writes the fake app-server protocol logs (if any) to the test
+// log for diagnosis.
+func (s *Scenario) logCodexLogs() {
+	files, _ := filepath.Glob(filepath.Join(s.Env.CodexHome, "e2e-fakecodex", "logs", "*.log"))
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		text := string(data)
+		if len(text) > 12000 {
+			text = "…" + text[len(text)-12000:]
+		}
+		s.T.Logf("FAKE APP-SERVER LOG %s:\n%s", filepath.Base(f), text)
+	}
 }
 
 // OutputTail returns the last n bytes of SUT output.
