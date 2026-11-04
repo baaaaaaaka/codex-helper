@@ -33,10 +33,21 @@ type mirrorState struct {
 	// checked: the file state of each baseline rollout the last discovery
 	// pass looked at and left as baseline; an unchanged file is skipped
 	// without a store transaction (review L11).
-	checked   map[string]transcript.FileInfo
+	checked map[string]transcript.FileInfo
+	// unreadable: rollouts whose first record could not be read (being
+	// written, or not a session); re-read only after they change.
+	unreadable map[string]transcript.FileInfo
+	// oldDirs: day directories older than the recent window still to be
+	// walked in this cycle, a few per discovery tick (bounded work).
+	oldDirs   []string
+	lastCycle time.Time
 	first     bool // first start of this store: pre-existing rollouts are baselined
 	startedAt time.Time
 }
+
+// oldWalkFiles bounds the rollouts one discovery tick stats in old day
+// directories (a full cycle over every directory spreads over many ticks).
+const oldWalkFiles = 256
 
 type mirrorFile struct {
 	src     store.TranscriptSource
@@ -87,7 +98,7 @@ func (e *Engine) mirrorSkip(clientID, turnID string) bool {
 }
 
 func (e *Engine) mirrorInit() error {
-	m := &mirrorState{skipTurns: map[string]bool{}, files: map[string]*mirrorFile{}, known: map[string]string{}, checked: map[string]transcript.FileInfo{}, startedAt: e.now()}
+	m := &mirrorState{skipTurns: map[string]bool{}, files: map[string]*mirrorFile{}, known: map[string]string{}, checked: map[string]transcript.FileInfo{}, unreadable: map[string]transcript.FileInfo{}, startedAt: e.now()}
 	ids, err := e.st.CodexTurnIDs()
 	if err != nil {
 		return err
@@ -148,6 +159,7 @@ func (e *Engine) mirrorLoop(ctx context.Context) {
 		return
 	}
 	e.discover(ctx, true)
+	e.mirror.lastCycle = e.now()
 	if e.mirror.first {
 		if err := e.update(func(tx *store.Tx) error { return tx.SetMeta(metaMirrorInit, "1") }); err != nil {
 			e.logf("mirror: %v", err)
@@ -157,8 +169,6 @@ func (e *Engine) mirrorLoop(ctx context.Context) {
 	defer stat.Stop()
 	disc := time.NewTicker(e.t.Discovery)
 	defer disc.Stop()
-	full := time.NewTicker(e.t.FullWalk)
-	defer full.Stop()
 	for {
 		select {
 		case <-ctx.Done():
@@ -168,11 +178,47 @@ func (e *Engine) mirrorLoop(ctx context.Context) {
 			e.discover(ctx, false)
 		case <-disc.C:
 			e.discover(ctx, false)
-		case <-full.C:
-			e.discover(ctx, true)
+			e.discoverOld(ctx)
 		}
 		e.mirrorPoll(ctx)
 	}
+}
+
+// discoverOld walks the older day directories a few at a time: a session
+// started long ago may have been resumed. One cycle over every directory
+// starts at most every FullWalk; each tick stats about oldWalkFiles
+// rollouts, so a large sessions tree never costs one long tick.
+func (e *Engine) discoverOld(ctx context.Context) {
+	m := e.mirror
+	now := e.now()
+	if len(m.oldDirs) == 0 {
+		if now.Sub(m.lastCycle) < e.t.FullWalk {
+			return
+		}
+		m.lastCycle = now
+		dirs, err := transcript.DayDirs(e.cfg.SessionsDir)
+		if err != nil {
+			e.logf("mirror walk: %v", err)
+		}
+		recent := now.Add(-48 * time.Hour)
+		for _, d := range dirs {
+			if d.Day.Before(recent.Truncate(24*time.Hour).AddDate(0, 0, -1)) {
+				m.oldDirs = append(m.oldDirs, d.Path)
+			}
+		}
+	}
+	since := now.Add(-transcript.Window)
+	var found []transcript.Found
+	for len(m.oldDirs) > 0 && len(found) < oldWalkFiles {
+		dir := m.oldDirs[0]
+		m.oldDirs = m.oldDirs[1:]
+		f, err := transcript.Walk(dir, since, time.Time{})
+		if err != nil {
+			e.logf("mirror walk: %v", err)
+		}
+		found = append(found, f...)
+	}
+	e.consider(ctx, found)
 }
 
 // discover walks the sessions directory for rollouts not seen yet (all
@@ -187,6 +233,13 @@ func (e *Engine) discover(ctx context.Context, full bool) {
 	if err != nil {
 		e.logf("mirror walk: %v", err)
 	}
+	e.consider(ctx, found)
+}
+
+// consider handles the rollouts a walk found: new ones are classified
+// (reading their first record once), grown baselined ones may be promoted;
+// known and unchanged ones cost a map lookup.
+func (e *Engine) consider(ctx context.Context, found []transcript.Found) {
 	var baseline []store.TranscriptSource
 	for _, f := range found {
 		if ctx.Err() != nil {
@@ -195,8 +248,9 @@ func (e *Engine) discover(ctx context.Context, full bool) {
 		e.mirror.mu.Lock()
 		_, tracked := e.mirror.files[f.Path]
 		state, known := e.mirror.known[f.Path]
+		last, unreadable := e.mirror.unreadable[f.Path]
 		e.mirror.mu.Unlock()
-		if tracked {
+		if tracked || (unreadable && last == f.Info) {
 			continue
 		}
 		if known && state != store.SrcBaseline {
@@ -237,8 +291,15 @@ func (e *Engine) discover(ctx context.Context, full bool) {
 func (e *Engine) newRollout(ctx context.Context, f transcript.Found) (store.TranscriptSource, bool) {
 	meta, err := transcript.ReadMeta(f.Path)
 	if err != nil {
-		return store.TranscriptSource{}, false // being written; next pass
+		// Being written, or not a session: read again once it changes.
+		e.mirror.mu.Lock()
+		e.mirror.unreadable[f.Path] = f.Info
+		e.mirror.mu.Unlock()
+		return store.TranscriptSource{}, false
 	}
+	e.mirror.mu.Lock()
+	delete(e.mirror.unreadable, f.Path)
+	e.mirror.mu.Unlock()
 	src := store.TranscriptSource{Path: f.Path, ThreadID: meta.ID, Size: f.Info.Size, MTime: ms(f.Info.MTime), Inode: f.Info.Inode}
 	if meta.Subagent() {
 		src.State = store.SrcIgnored
@@ -314,6 +375,7 @@ func (e *Engine) promoteBaseline(ctx context.Context, f transcript.Found) {
 	}
 	meta, err := transcript.ReadMeta(f.Path)
 	if err != nil {
+		stay() // read again once it changes
 		return
 	}
 	if meta.Subagent() || !meta.Interactive() {
@@ -330,6 +392,7 @@ func (e *Engine) promoteBaseline(ctx context.Context, f transcript.Found) {
 	}
 	if bound {
 		if !e.convOpen(conv) {
+			stay()
 			return
 		}
 		src.State, src.ConvID = store.SrcTracking, conv

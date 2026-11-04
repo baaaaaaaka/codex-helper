@@ -423,3 +423,41 @@ func TestStatFileIDChangesWhenReplaced(t *testing.T) {
 		t.Fatal("replacement not detected as a rewrite")
 	}
 }
+
+// Large records the mirror does not use are classified from their first
+// bytes, never decoded: the truncated (invalid) JSON below would be
+// "other" without a turn if it were decoded. The records it uses are still
+// decoded whatever their size.
+func TestParseLargeRecordsCheaply(t *testing.T) {
+	ts := "2026-11-04T10:00:00.000Z"
+	big := strings.Repeat("x", 64<<10)
+	out := `{"timestamp":"` + ts + `","type":"event_msg","payload":{"type":"exec_command_end","call_id":"c1","turn_id":"t7","aggregated_output":"` + big
+	ev := Parse([]byte(out))
+	if ev.Kind != KindTurnRef || ev.TurnID != "t7" || ev.Time.IsZero() {
+		t.Fatalf("large tool output: %+v", ev)
+	}
+	agent := `{"timestamp":"` + ts + `","type":"event_msg","payload":{"type":"item_completed","thread_id":"th","turn_id":"t7","item":{"type":"AgentMessage","text":"` + big
+	if ev := Parse([]byte(agent)); ev.Kind != KindTurnRef || ev.ThreadID != "th" {
+		t.Fatalf("large agent item: %+v", ev)
+	}
+	dev := `{"timestamp":"` + ts + `","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"` + big + `"}]}}`
+	if ev := Parse([]byte(dev)); ev.Kind != KindOther {
+		t.Fatalf("developer message: %+v", ev)
+	}
+	done := `{"timestamp":"` + ts + `","type":"event_msg","payload":{"type":"task_complete","turn_id":"t7","last_agent_message":"` + big + `"}}`
+	if ev := Parse([]byte(done)); ev.Kind != KindTurnComplete || len(ev.Text) != len(big) {
+		t.Fatalf("large final answer not decoded: kind %v, %d bytes", ev.Kind, len(ev.Text))
+	}
+	user := `{"timestamp":"` + ts + `","type":"event_msg","payload":{"type":"item_completed","turn_id":"t7","item":{"type":"UserMessage","content":"` + big + `","client_id":"cid"}}}`
+	if ev := Parse([]byte(user)); ev.Kind != KindUserItem || ev.ClientID != "cid" {
+		t.Fatalf("large user item not decoded: %+v", ev)
+	}
+}
+
+func BenchmarkParseLargeToolOutput(b *testing.B) {
+	line := []byte(`{"timestamp":"2026-11-04T10:00:00.000Z","type":"event_msg","payload":{"type":"exec_command_end","call_id":"c1","turn_id":"t7","aggregated_output":"` + strings.Repeat("x", 4<<20) + `"}}`)
+	b.SetBytes(int64(len(line)))
+	for i := 0; i < b.N; i++ {
+		Parse(line)
+	}
+}

@@ -113,13 +113,17 @@ func (e *Engine) maintenanceLoop(ctx context.Context) {
 			e.parkIdle()
 			if e.now().Sub(lastVacuum) > time.Hour {
 				lastVacuum = e.now()
-				if err := e.st.Vacuum(); err != nil {
+				// Bounded: a large free list is returned over many hours.
+				if err := e.st.VacuumStep(vacuumPages); err != nil {
 					e.logf("vacuum: %v", err)
 				}
 			}
 		}
 	}
 }
+
+// vacuumPages bounds one incremental vacuum (1 MiB at 4 KiB pages).
+const vacuumPages = 256
 
 func isFence(err error) bool {
 	return err == store.ErrFenced || err == store.ErrNotAcquired

@@ -37,7 +37,7 @@ type Timing struct {
 
 	MirrorStat time.Duration // stat tick for tracked rollouts
 	Discovery  time.Duration // discovery walk for new rollouts
-	FullWalk   time.Duration // full (non date-pruned) discovery walk
+	FullWalk   time.Duration // a cycle over the older day directories starts at most this often
 
 	TurnPoll        time.Duration // Codex turn/completed safety poll
 	CancelWait      time.Duration // wait after turn/interrupt before killing

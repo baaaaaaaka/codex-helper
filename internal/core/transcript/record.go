@@ -125,21 +125,70 @@ func topType(line []byte) (string, bool) {
 	return string(rest[1 : 1+end]), true
 }
 
-var jMessage = []byte(`"type":"message"`)
+var (
+	jMessage      = []byte(`"type":"message"`)
+	jPayloadType  = []byte(`"payload":{"type":"`)
+	jAgentItem    = []byte(`"type":"AgentMessage"`)
+	jRoleDev      = []byte(`"role":"developer"`)
+	jRoleSystem   = []byte(`"role":"system"`)
+	jTimestamp    = []byte(`"timestamp":"`)
+	jTurnID       = []byte(`"turn_id":"`)
+	jThreadID     = []byte(`"thread_id":"`)
+	cheapRecordAt = 4 << 10
+)
+
+// head returns the first n bytes of line.
+func head(line []byte, n int) []byte {
+	if len(line) > n {
+		return line[:n]
+	}
+	return line
+}
+
+// headString returns the string value that follows key in h ("" if none).
+func headString(h, key []byte) string {
+	i := bytes.Index(h, key)
+	if i < 0 {
+		return ""
+	}
+	rest := h[i+len(key):]
+	end := bytes.IndexByte(rest, '"')
+	if end < 0 {
+		return ""
+	}
+	return string(rest[:end])
+}
 
 // Parse decodes one record line. Lines that are not JSON or not relevant
 // are KindOther; Parse never fails.
+//
+// Only the records the mirror uses are decoded: large tool calls, tool
+// outputs, reasoning and developer messages are classified from their
+// first bytes (CPU budget: a live session appending large tool outputs
+// must not cost a full JSON decode per record).
 func Parse(line []byte) Event {
 	if t, ok := topType(line); ok {
 		switch t {
-		case "event_msg", "session_meta", "turn_context":
-		case "response_item":
-			head := line
-			if len(head) > 512 {
-				head = head[:512]
+		case "session_meta", "turn_context":
+		case "event_msg":
+			if len(line) > cheapRecordAt {
+				h := head(line, 1024)
+				switch headString(h, jPayloadType) {
+				case "task_started", "task_complete", "turn_aborted":
+				case "item_completed":
+					if bytes.Contains(h, jAgentItem) {
+						return cheapRef(h)
+					}
+				default:
+					// Command output, patch, MCP results...: only the turn
+					// they belong to matters.
+					return cheapRef(h)
+				}
 			}
-			if !bytes.Contains(head, jMessage) {
-				return Event{Kind: KindOther} // tool calls and outputs, reasoning
+		case "response_item":
+			h := head(line, 512)
+			if !bytes.Contains(h, jMessage) || bytes.Contains(h, jRoleDev) || bytes.Contains(h, jRoleSystem) {
+				return Event{Kind: KindOther} // tool calls and outputs, reasoning, instructions
 			}
 		default:
 			return Event{Kind: KindOther}
@@ -214,6 +263,17 @@ func Parse(line []byte) Event {
 		if p.TurnID == "" {
 			return Event{Kind: KindOther, Time: ts}
 		}
+		ev.Kind = KindTurnRef
+	}
+	return ev
+}
+
+// cheapRef classifies a large event record from its first bytes: a
+// reference to its turn (when the turn id is there), never decoded.
+func cheapRef(h []byte) Event {
+	ts, _ := time.Parse(time.RFC3339Nano, headString(h, jTimestamp))
+	ev := Event{Kind: KindOther, Time: ts, TurnID: headString(h, jTurnID), ThreadID: headString(h, jThreadID)}
+	if ev.TurnID != "" {
 		ev.Kind = KindTurnRef
 	}
 	return ev

@@ -68,6 +68,51 @@ func Walk(sessionsDir string, since, dirsFrom time.Time) ([]Found, error) {
 	return out, err
 }
 
+// DayDir is one sessions/YYYY/MM/DD directory.
+type DayDir struct {
+	Path string
+	Day  time.Time
+}
+
+// DayDirs lists the day directories under sessionsDir, oldest first, by
+// reading only the year and month directories.
+func DayDirs(sessionsDir string) ([]DayDir, error) {
+	var out []DayDir
+	years, err := os.ReadDir(sessionsDir)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	for _, y := range years {
+		if !y.IsDir() {
+			continue
+		}
+		months, err := os.ReadDir(filepath.Join(sessionsDir, y.Name()))
+		if err != nil {
+			continue
+		}
+		for _, m := range months {
+			if !m.IsDir() {
+				continue
+			}
+			days, err := os.ReadDir(filepath.Join(sessionsDir, y.Name(), m.Name()))
+			if err != nil {
+				continue
+			}
+			for _, d := range days {
+				p := filepath.Join(sessionsDir, y.Name(), m.Name(), d.Name())
+				if day, ok := dirDay(sessionsDir, p); ok && d.IsDir() {
+					out = append(out, DayDir{Path: p, Day: day})
+				}
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Day.Before(out[j].Day) })
+	return out, nil
+}
+
 // dirDay returns the date of a sessions/YYYY[/MM[/DD]] directory (the last
 // day it can contain, for partial paths it is the end of the period).
 func dirDay(root, path string) (time.Time, bool) {
