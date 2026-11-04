@@ -141,99 +141,6 @@ func TestTeamsServiceWindowsTaskCleanupHelperProcess(t *testing.T) {
 	}
 }
 
-func TestTeamsBackgroundKeepaliveStartupFallbackWatchdogRestartsWSLLoopCI(t *testing.T) {
-	args := []string{
-		"-d", "Ubuntu",
-		"-u", "alice",
-		"--exec",
-		"env",
-		"CODEX_HELPER_TEAMS_SERVICE=1",
-		"CODEX_HELPER_TEAMS_SERVICE_MODE=background",
-		"/home/alice/bin/codex-proxy",
-		"teams",
-		"run",
-		"--auto-service=false",
-		"--registry",
-		"/home/alice/.config/codex-helper/teams registry.json",
-	}
-	script := buildTeamsServiceWSLStartupWatchdogScript("Codex Helper Teams Bridge (WSL Ubuntu alice abc)", args, "abc")
-	for _, want := range []string{
-		"System.Threading.Mutex",
-		"$deadline = (Get-Date).AddSeconds(60)",
-		"Start-Sleep -Seconds 2",
-		"while ($true)",
-		"codex-helper-teams-wsl-stop-abc.signal",
-		"Test-Path -LiteralPath $stopPath",
-		"stop requested",
-		"$wslArgumentLine",
-		"Start-Process -FilePath",
-		"-WindowStyle Hidden",
-		"-RedirectStandardOutput $stdoutLog",
-		"-RedirectStandardError $stderrLog",
-		"wsl.exe exited",
-		"restarting in 10s",
-		"Start-Sleep -Seconds 10",
-		"$mutex.ReleaseMutex(); $mutex.Dispose()",
-		"-d Ubuntu",
-		"/home/alice/bin/codex-proxy",
-		"--auto-service=false",
-		`"/home/alice/.config/codex-helper/teams registry.json"`,
-	} {
-		if !strings.Contains(script, want) {
-			t.Fatalf("WSL Startup watchdog script missing %q:\n%s", want, script)
-		}
-	}
-	if strings.Contains(script, "& wsl.exe @wslArgs") {
-		t.Fatalf("WSL Startup watchdog script must not launch wsl.exe directly in a visible console path:\n%s", script)
-	}
-	if strings.Contains(script, "wsl.exe exited 0; exiting watchdog") {
-		t.Fatalf("WSL Startup watchdog must keep watching after a clean WSL exit unless a stop signal is present:\n%s", script)
-	}
-
-	startCommand := buildTeamsServiceWSLStartupFallbackCommand("Codex Helper Teams Bridge (WSL Ubuntu alice abc)", args, true)
-	for _, want := range []string{
-		"[Environment]::GetFolderPath('Startup')",
-		"codex-helper\\teams",
-		".vbs",
-		".ps1",
-		"$launcherPath = Join-Path $startup",
-		"$legacyCmdLauncherPath = Join-Path $startup",
-		".cmd",
-		"Get-ChildItem -LiteralPath $startup -Filter 'codex-helper-teams-wsl-*.cmd'",
-		"Get-ChildItem -LiteralPath $startup -Filter 'codex-helper-teams-wsl-*.vbs'",
-		"$content.Contains($legacyPrefix)",
-		"$stopPath = Join-Path $appDir",
-		"Remove-Item -LiteralPath $stopPath",
-		"Remove-Item -LiteralPath $legacyCmdLauncherPath",
-		"Set-Content -LiteralPath $scriptPath",
-		"Set-Content -LiteralPath $launcherPath",
-		"WScript.Shell",
-		"shell.Run(cmd, 0, True)",
-		"WScript.Quit code",
-		"WindowStyle Hidden",
-		"Start-Process -FilePath 'wscript.exe'",
-		"//B //Nologo",
-	} {
-		if !strings.Contains(startCommand, want) {
-			t.Fatalf("WSL Startup fallback command missing %q:\n%s", want, startCommand)
-		}
-	}
-	for _, forbidden := range []string{
-		"Set-Content -LiteralPath $legacyCmdLauncherPath",
-		"Start-Process -FilePath 'cmd.exe'",
-		"cmd.exe /",
-	} {
-		if strings.Contains(startCommand, forbidden) {
-			t.Fatalf("WSL Startup fallback must not create or start a console .cmd launcher, found %q:\n%s", forbidden, startCommand)
-		}
-	}
-
-	installOnlyCommand := buildTeamsServiceWSLStartupFallbackCommand("Codex Helper Teams Bridge (WSL Ubuntu alice abc)", args, false)
-	if strings.Contains(installOnlyCommand, "Start-Process -FilePath 'wscript.exe'") {
-		t.Fatalf("install-only WSL Startup fallback should not start watchdog immediately:\n%s", installOnlyCommand)
-	}
-}
-
 func TestTeamsBackgroundKeepaliveWSLRepairReplacesStaleRegisteredActionCI(t *testing.T) {
 	lockCLITestHooks(t)
 
@@ -653,6 +560,7 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapAccessDeniedConfirmsBeforeUACCI(t *
 
 func TestTeamsBackgroundKeepaliveWSLBootstrapDeclineUACInstallsStartupFallbackCI(t *testing.T) {
 	lockCLITestHooks(t)
+	isolateTeamsServiceLocalSupervisorDirsForTest(t)
 
 	tmp := t.TempDir()
 	runner := &scriptedTeamsServiceRunner{
@@ -703,19 +611,15 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapDeclineUACInstallsStartupFallbackCI
 	for _, want := range []string{
 		"GetFolderPath('Startup')",
 		"codex-helper\\teams",
-		"System.Threading.Mutex",
 		"wsl.exe",
-		"--auto-service=false",
-		"CODEX_HELPER_TEAMS_STARTUP_FALLBACK_STOP_FILE=",
-		"Remove-Item -LiteralPath $stopPath",
-		"Remove-Item -LiteralPath $legacyCmdLauncherPath",
+		"teams service start",
+		"CODEX_HELPER_TEAMS_WSL_SERVICE_BACKEND=local-supervisor",
 		"Get-CimInstance Win32_Process",
 		"$proc.ProcessId -ne $PID",
 		"Stop-Process -Id $proc.ProcessId -Force",
-		"$launcherPath = Join-Path $startup",
-		"Set-Content -LiteralPath $launcherPath",
+		"Set-Content -LiteralPath $kickPath",
 		"WScript.Shell",
-		"shell.Run(cmd, 0, True)",
+		", 0, False",
 		"Start-Process -FilePath 'wscript.exe'",
 		"//B //Nologo",
 	} {
@@ -723,26 +627,20 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapDeclineUACInstallsStartupFallbackCI
 			t.Fatalf("fallback command missing %q:\n%s", want, fallback)
 		}
 	}
-	if strings.Contains(fallback, "Set-Content -LiteralPath $legacyCmdLauncherPath") || strings.Contains(fallback, "Start-Process -FilePath 'cmd.exe'") {
-		t.Fatalf("Startup fallback should not create or start a console .cmd launcher:\n%s", fallback)
+	for _, forbidden := range []string{"System.Threading.Mutex", "while ($true)", "CODEX_HELPER_TEAMS_STARTUP_FALLBACK_STOP_FILE=", "Start-Process -FilePath 'cmd.exe'", "CODEX_HELPER_TEAMS_EXIT_ON_STANDBY=1", "-Verb RunAs", "Register-ScheduledTask"} {
+		if strings.Contains(fallback, forbidden) {
+			t.Fatalf("Startup fallback must be a one-shot entry without %q:\n%s", forbidden, fallback)
+		}
 	}
-	if strings.Contains(fallback, "CODEX_HELPER_TEAMS_EXIT_ON_STANDBY=1") {
-		t.Fatalf("Startup fallback must not retire itself when another helper temporarily owns the shared home:\n%s", fallback)
-	}
-	if strings.Contains(fallback, "-Verb RunAs") || strings.Contains(fallback, "Register-ScheduledTask") {
-		t.Fatalf("Startup fallback should not use UAC or Task Scheduler:\n%s", fallback)
-	}
-	files, err := filepath.Glob(filepath.Join(tmp, "wsl-task", "codex-helper-teams-wsl-startup-*.txt"))
-	if err != nil {
-		t.Fatalf("glob Startup fallback marker: %v", err)
-	}
-	if len(files) != 1 {
-		t.Fatalf("Startup fallback marker files = %#v, want one", files)
+	if cfgPath, err := teamsServiceLocalSupervisorConfigPath(); err != nil {
+		t.Fatal(err)
+	} else if cfg, err := readTeamsServiceLocalSupervisorConfig(cfgPath); err != nil || !cfg.Enabled {
+		t.Fatalf("Startup fallback should enable the local supervisor: cfg=%+v err=%v", cfg, err)
 	}
 	if _, err := os.Stat(fallbackTaskConfigPath); !os.IsNotExist(err) {
 		t.Fatalf("stale Scheduled Task config should be removed after fallback install, err=%v", err)
 	}
-	if got := out.String(); !strings.Contains(got, "UAC prompt was not confirmed") || !strings.Contains(got, "NOTICE: USING STARTUP WATCHDOG FALLBACK") || !strings.Contains(got, "Teams service bootstrap ready: wsl-startup-watchdog") {
+	if got := out.String(); !strings.Contains(got, "UAC prompt was not confirmed") || !strings.Contains(got, "NOTICE: USING WINDOWS STARTUP FALLBACK") || !strings.Contains(got, "Teams service bootstrap ready: wsl-startup-local-supervisor") {
 		t.Fatalf("bootstrap fallback output missing confirmation and mode:\n%s", got)
 	}
 }
@@ -840,13 +738,14 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapRefusesFallbackWhenStaleTasksCannot
 	if strings.Contains(out.String(), "Teams service bootstrap ready") {
 		t.Fatalf("bootstrap should not report success when stale task retirement failed:\n%s", out.String())
 	}
-	if strings.Contains(out.String(), "NOTICE: USING STARTUP WATCHDOG FALLBACK") {
+	if strings.Contains(out.String(), "NOTICE: USING WINDOWS STARTUP FALLBACK") {
 		t.Fatalf("bootstrap should not announce Startup fallback before stale tasks are safely disabled:\n%s", out.String())
 	}
 }
 
 func TestTeamsBackgroundKeepaliveWSLBootstrapUsesElevatedRetireBeforeFallbackCI(t *testing.T) {
 	lockCLITestHooks(t)
+	isolateTeamsServiceLocalSupervisorDirsForTest(t)
 
 	tmp := t.TempDir()
 	runner := &scriptedTeamsServiceRunner{
@@ -905,11 +804,11 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapUsesElevatedRetireBeforeFallbackCI(
 		t.Fatalf("elevated retire must not try to create or repair tasks:\n%s", elevatedRetire)
 	}
 	fallback := strings.Join(runner.calls[5].args, " ")
-	if !strings.Contains(fallback, "Start-Process -FilePath 'wscript.exe'") || !strings.Contains(fallback, "Remove-Item -LiteralPath $legacyCmdLauncherPath") {
-		t.Fatalf("fallback install should use hidden wscript launcher and remove old .cmd launcher:\n%s", fallback)
+	if !strings.Contains(fallback, "Start-Process -FilePath 'wscript.exe'") || !strings.Contains(fallback, "Set-Content -LiteralPath $kickPath") || !strings.Contains(fallback, "codex-helper-teams-wsl-*.cmd") {
+		t.Fatalf("fallback install should retire old launchers and run the one-shot Startup entry:\n%s", fallback)
 	}
 	got := out.String()
-	if !strings.Contains(got, "NOTICE: USING STARTUP WATCHDOG FALLBACK") || !strings.Contains(got, "Old WSL Scheduled Tasks were disabled using Windows permission") {
+	if !strings.Contains(got, "NOTICE: USING WINDOWS STARTUP FALLBACK") || !strings.Contains(got, "Old WSL Scheduled Tasks were disabled using Windows permission") {
 		t.Fatalf("bootstrap output missing elevated cleanup fallback explanation:\n%s", got)
 	}
 }
@@ -1018,6 +917,7 @@ func TestTeamsBackgroundKeepaliveWSLStartupFallbackServiceStartNoopsWhenActiveCI
 
 func TestTeamsBackgroundKeepaliveWSLStartupFallbackServiceStartPreservesOutputCI(t *testing.T) {
 	lockCLITestHooks(t)
+	isolateTeamsServiceLocalSupervisorDirsForTest(t)
 
 	tmp := t.TempDir()
 	runner := &scriptedTeamsServiceRunner{
@@ -1057,10 +957,8 @@ func TestTeamsBackgroundKeepaliveWSLStartupFallbackServiceStartPreservesOutputCI
 		t.Fatalf("startTeamsServiceWithOutput start: %v", err)
 	}
 	got := out.String()
-	if !strings.Contains(got, "hidden launcher started") ||
-		!strings.Contains(got, "Startup watchdog fallback: started") ||
-		!strings.Contains(got, markerPath) {
-		t.Fatalf("startup fallback start output was not preserved:\n%s", got)
+	if !strings.Contains(got, "Startup entry: installed") || !strings.Contains(got, "Local supervisor config:") {
+		t.Fatalf("legacy Startup fallback start should report the migration:\n%s", got)
 	}
 	if len(runner.calls) != 2 {
 		t.Fatalf("startup fallback start calls = %#v, want active probe then fallback start", runner.calls)
@@ -1069,6 +967,7 @@ func TestTeamsBackgroundKeepaliveWSLStartupFallbackServiceStartPreservesOutputCI
 
 func TestTeamsBackgroundKeepaliveWSLBootstrapNoUACFallsBackOnTaskFailureCI(t *testing.T) {
 	lockCLITestHooks(t)
+	isolateTeamsServiceLocalSupervisorDirsForTest(t)
 
 	tmp := t.TempDir()
 	runner := &scriptedTeamsServiceRunner{
@@ -1098,13 +997,14 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapNoUACFallsBackOnTaskFailureCI(t *te
 	if len(runner.calls) != 3 {
 		t.Fatalf("bootstrap --no-uac calls = %#v, want direct repair, stale task retirement, then Startup fallback", runner.calls)
 	}
-	if got := out.String(); !strings.Contains(got, "NOTICE: USING STARTUP WATCHDOG FALLBACK") || !strings.Contains(got, "Windows Scheduled Task setup could not be completed") || !strings.Contains(got, "Teams service bootstrap ready: wsl-startup-watchdog") {
+	if got := out.String(); !strings.Contains(got, "NOTICE: USING WINDOWS STARTUP FALLBACK") || !strings.Contains(got, "Windows Scheduled Task setup could not be completed") || !strings.Contains(got, "Teams service bootstrap ready: wsl-startup-local-supervisor") {
 		t.Fatalf("bootstrap --no-uac output missing protected-task fallback:\n%s", got)
 	}
 }
 
 func TestTeamsBackgroundKeepaliveWSLBootstrapClassifiesAccessDeniedOutputCI(t *testing.T) {
 	lockCLITestHooks(t)
+	isolateTeamsServiceLocalSupervisorDirsForTest(t)
 
 	tmp := t.TempDir()
 	runner := &scriptedTeamsServiceRunner{
@@ -1136,13 +1036,13 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapClassifiesAccessDeniedOutputCI(t *t
 		t.Fatalf("bootstrap fallback error: %v\noutput:\n%s", err, out.String())
 	}
 	got := out.String()
-	if !strings.Contains(got, "NOTICE: USING STARTUP WATCHDOG FALLBACK") || !strings.Contains(got, "Windows Scheduled Task setup could not be completed") || !strings.Contains(got, "Windows denied permission") {
+	if !strings.Contains(got, "NOTICE: USING WINDOWS STARTUP FALLBACK") || !strings.Contains(got, "Windows Scheduled Task setup could not be completed") || !strings.Contains(got, "Windows denied permission") {
 		t.Fatalf("bootstrap did not classify access denied PowerShell output:\n%s", got)
 	}
 	if strings.Contains(got, "Register-ScheduledTask : Access is denied") {
 		t.Fatalf("bootstrap should summarize access denied output instead of printing raw PowerShell noise:\n%s", got)
 	}
-	if !strings.Contains(got, "Teams service bootstrap ready: wsl-startup-watchdog") {
+	if !strings.Contains(got, "Teams service bootstrap ready: wsl-startup-local-supervisor") {
 		t.Fatalf("bootstrap output missing fallback mode:\n%s", got)
 	}
 	if len(runner.calls) != 3 {
@@ -1155,6 +1055,7 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapClassifiesAccessDeniedOutputCI(t *t
 
 func TestTeamsBackgroundKeepaliveWSLBootstrapFallsBackWhenScheduledTasksCmdletsUnavailableCI(t *testing.T) {
 	lockCLITestHooks(t)
+	isolateTeamsServiceLocalSupervisorDirsForTest(t)
 
 	tmp := t.TempDir()
 	runner := &scriptedTeamsServiceRunner{
@@ -1184,9 +1085,9 @@ func TestTeamsBackgroundKeepaliveWSLBootstrapFallsBackWhenScheduledTasksCmdletsU
 		t.Fatalf("bootstrap fallback error: %v\noutput:\n%s", err, out.String())
 	}
 	got := out.String()
-	if !strings.Contains(got, "NOTICE: USING STARTUP WATCHDOG FALLBACK") ||
+	if !strings.Contains(got, "NOTICE: USING WINDOWS STARTUP FALLBACK") ||
 		!strings.Contains(got, "Scheduled Task cmdlets are unavailable") ||
-		!strings.Contains(got, "Teams service bootstrap ready: wsl-startup-watchdog") {
+		!strings.Contains(got, "Teams service bootstrap ready: wsl-startup-local-supervisor") {
 		t.Fatalf("bootstrap output missing ScheduledTasks-unavailable fallback:\n%s", got)
 	}
 	if strings.Contains(got, "NEXT STEP: TYPE yes TO CONTINUE") {
@@ -1294,10 +1195,7 @@ func TestTeamsBackgroundKeepaliveWSLStatusReportsStartupFallbackCI(t *testing.T)
 
 func TestTeamsBackgroundKeepaliveWSLStartupFallbackServiceActionsAvoidScheduledTaskCI(t *testing.T) {
 	lockCLITestHooks(t)
-
-	prevDelay := teamsServiceStartupFallbackRestartDelay
-	teamsServiceStartupFallbackRestartDelay = 0
-	t.Cleanup(func() { teamsServiceStartupFallbackRestartDelay = prevDelay })
+	isolateTeamsServiceLocalSupervisorDirsForTest(t)
 
 	tmp := t.TempDir()
 	runner := &recordingTeamsServiceRunner{output: []byte("ok")}
@@ -1328,7 +1226,9 @@ func TestTeamsBackgroundKeepaliveWSLStartupFallbackServiceActionsAvoidScheduledT
 		t.Fatalf("could not resolve startup fallback suffix from %s", markerPath)
 	}
 
-	for _, action := range []string{"stop", "start", "restart"} {
+	// stop retires the legacy loop; start (and restart) replace it with the
+	// one-shot entry and the local supervisor, so start comes last.
+	for _, action := range []string{"stop", "start"} {
 		runner.calls = nil
 		if _, err := backend.Run(context.Background(), action); err != nil {
 			t.Fatalf("fallback service %s error: %v", action, err)
@@ -1360,29 +1260,17 @@ func TestTeamsBackgroundKeepaliveWSLStartupFallbackServiceActionsAvoidScheduledT
 				t.Fatalf("fallback stop should write Linux stop marker: %v", err)
 			}
 		case "start":
-			if !strings.Contains(joined, "Start-Process -FilePath 'wscript.exe'") || !strings.Contains(joined, "codex-helper-teams-wsl-"+suffix+".vbs") {
-				t.Fatalf("fallback start should launch existing hidden Startup watchdog:\n%s", joined)
+			if !strings.Contains(joined, "Start-Process -FilePath 'wscript.exe'") || !strings.Contains(joined, teamsServiceWSLStartupKickName(suffix)) || !strings.Contains(joined, "teams service start") {
+				t.Fatalf("fallback start should install and run the one-shot Startup entry:\n%s", joined)
 			}
-			if !strings.Contains(joined, "Get-CimInstance Win32_Process") || !strings.Contains(joined, "$proc.ProcessId -ne $PID") {
-				t.Fatalf("fallback start should retire stale existing watchdog wrapper before relaunch:\n%s", joined)
+			if !strings.Contains(joined, "Get-CimInstance Win32_Process") || !strings.Contains(joined, "$proc.ProcessId -ne $PID") || !strings.Contains(joined, "OrdinalIgnoreCase") {
+				t.Fatalf("fallback start should retire the stale looping watchdog first:\n%s", joined)
 			}
-			if !strings.Contains(joined, "OrdinalIgnoreCase") {
-				t.Fatalf("fallback start should match stale wrapper command lines case-insensitively:\n%s", joined)
-			}
-			if _, err := os.Stat(stopPath); !os.IsNotExist(err) {
-				t.Fatalf("fallback start should clear Linux stop marker, stat err=%v", err)
-			}
-		case "restart":
-			if len(runner.calls) != 2 {
-				t.Fatalf("fallback restart calls = %#v, want stop signal then hidden launcher", runner.calls)
-			}
-			first := strings.Join(runner.calls[0].args, " ")
-			second := strings.Join(runner.calls[1].args, " ")
-			if !strings.Contains(first, "Set-Content -LiteralPath $stopPath") || !strings.Contains(first, "Get-CimInstance Win32_Process") || !strings.Contains(second, "Start-Process -FilePath 'wscript.exe'") {
-				t.Fatalf("fallback restart should stop then start via Startup watchdog:\nfirst=%s\nsecond=%s", first, second)
+			if strings.Contains(joined, "while ($true)") {
+				t.Fatalf("fallback start still writes a looping watchdog:\n%s", joined)
 			}
 			if _, err := os.Stat(stopPath); !os.IsNotExist(err) {
-				t.Fatalf("fallback restart should clear Linux stop marker before starting, stat err=%v", err)
+				t.Fatalf("fallback start should clear the legacy stop marker, stat err=%v", err)
 			}
 		}
 	}
@@ -1764,7 +1652,7 @@ func waitForWindowsProcessCommandLineContains(t *testing.T, powershellExe string
 	t.Fatalf("process %d command line did not contain %q; last output:\n%s", pid, needle, lastOut)
 }
 
-func TestTeamsBackgroundKeepaliveWSLStartupFallbackStartRewritesLegacyConfigCI(t *testing.T) {
+func TestTeamsBackgroundKeepaliveWSLStartupFallbackStartMigratesLegacyConfigCI(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
@@ -1803,6 +1691,7 @@ func TestTeamsBackgroundKeepaliveWSLStartupFallbackStartRewritesLegacyConfigCI(t
 		t.Fatalf("write marker: %v", err)
 	}
 
+	isolateTeamsServiceLocalSupervisorDirsForTest(t)
 	if _, err := backend.Run(context.Background(), "start"); err != nil {
 		t.Fatalf("fallback start error: %v", err)
 	}
@@ -1811,21 +1700,23 @@ func TestTeamsBackgroundKeepaliveWSLStartupFallbackStartRewritesLegacyConfigCI(t
 	}
 	command := strings.Join(runner.calls[0].args, " ")
 	for _, want := range []string{
-		"Set-Content -LiteralPath $scriptPath",
-		"Start-Process -FilePath 'wscript.exe'",
-		"$deadline = (Get-Date).AddSeconds(60)",
-		"CODEX_HELPER_TEAMS_STARTUP_FALLBACK=1",
-		"/home/alice/bin/codex-proxy",
-		"Get-CimInstance Win32_Process",
-		"OrdinalIgnoreCase",
+		"Get-ChildItem -LiteralPath $startup -Filter 'codex-helper-teams-wsl-*.vbs'",
 		"Stop-Process -Id $proc.ProcessId -Force",
+		"Set-Content -LiteralPath $kickPath",
+		"teams service start",
+		"Start-Process -FilePath 'wscript.exe'",
 	} {
 		if !strings.Contains(command, want) {
-			t.Fatalf("fallback start rewrite command missing %q:\n%s", want, command)
+			t.Fatalf("legacy fallback start should retire the loop and install the one-shot entry; missing %q:\n%s", want, command)
 		}
 	}
-	if strings.Contains(command, "CODEX_HELPER_TEAMS_EXIT_ON_STANDBY=1") {
-		t.Fatalf("fallback start should strip legacy standby-exit env from rewritten watchdog:\n%s", command)
+	for _, forbidden := range []string{"CODEX_HELPER_TEAMS_EXIT_ON_STANDBY=1", "CODEX_HELPER_TEAMS_STARTUP_FALLBACK=1", "Set-Content -LiteralPath $scriptPath", "while ($true)"} {
+		if strings.Contains(command, forbidden) {
+			t.Fatalf("legacy fallback start still writes the looping watchdog (%q):\n%s", forbidden, command)
+		}
+	}
+	if _, err := os.Stat(markerPath); !os.IsNotExist(err) {
+		t.Fatalf("legacy marker should be removed after migration: %v", err)
 	}
 	assertTeamsServiceCallsDoNotContain(t, runner.calls, "Enable-ScheduledTask", "Start-ScheduledTask", "Stop-ScheduledTask")
 }
@@ -2569,6 +2460,7 @@ func TestTeamsBackgroundKeepaliveWSLTaskSchedulerRealWindowsRoundTripCI(t *testi
 
 func TestTeamsBackgroundKeepaliveAutoEnsureWSLTaskFailureInstallsStartupFallbackOnceCI(t *testing.T) {
 	lockCLITestHooks(t)
+	isolateTeamsServiceLocalSupervisorDirsForTest(t)
 
 	tmp := t.TempDir()
 	runner := &scriptedTeamsServiceRunner{
@@ -2592,7 +2484,7 @@ func TestTeamsBackgroundKeepaliveAutoEnsureWSLTaskFailureInstallsStartupFallback
 	})
 
 	err := ensureTeamsServiceForRun(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "Startup watchdog fallback") || !strings.Contains(err.Error(), "blocked by Windows policy") {
+	if err == nil || !strings.Contains(err.Error(), "Windows Startup entry") || !strings.Contains(err.Error(), "blocked by Windows policy") {
 		t.Fatalf("auto ensure task failure error = %v, want protected-task Startup fallback diagnostic", err)
 	}
 	if len(runner.calls) != 3 {
@@ -2602,7 +2494,7 @@ func TestTeamsBackgroundKeepaliveAutoEnsureWSLTaskFailureInstallsStartupFallback
 	runner.calls = nil
 	runner.errs = nil
 	if err := ensureTeamsServiceForRun(context.Background()); err != nil {
-		t.Fatalf("auto ensure with fallback marker should skip retry, got: %v", err)
+		t.Fatalf("auto ensure after the Startup fallback should skip retry, got: %v", err)
 	}
 	if len(runner.calls) != 0 {
 		t.Fatalf("auto ensure should not retry failed Scheduled Task after fallback marker: %#v", runner.calls)
@@ -2611,6 +2503,7 @@ func TestTeamsBackgroundKeepaliveAutoEnsureWSLTaskFailureInstallsStartupFallback
 
 func TestTeamsBackgroundKeepaliveAutoEnsureWSLScheduledTasksUnavailableSkipsRetireWithoutTaskConfigCI(t *testing.T) {
 	lockCLITestHooks(t)
+	isolateTeamsServiceLocalSupervisorDirsForTest(t)
 
 	tmp := t.TempDir()
 	unavailable := errors.New("Register-ScheduledTask : The term 'Register-ScheduledTask' is not recognized as the name of a cmdlet")
@@ -2633,7 +2526,7 @@ func TestTeamsBackgroundKeepaliveAutoEnsureWSLScheduledTasksUnavailableSkipsReti
 	})
 
 	err := ensureTeamsServiceForRun(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "Startup watchdog fallback") {
+	if err == nil || !strings.Contains(err.Error(), "Windows Startup entry") {
 		t.Fatalf("auto ensure ScheduledTasks-unavailable error = %v, want Startup fallback diagnostic", err)
 	}
 	if len(runner.calls) != 3 {
@@ -2651,6 +2544,7 @@ func TestTeamsBackgroundKeepaliveAutoEnsureWSLScheduledTasksUnavailableSkipsReti
 
 func TestTeamsBackgroundKeepaliveAutoEnsureWSLAccessDeniedInstallsStartupFallbackOnceCI(t *testing.T) {
 	lockCLITestHooks(t)
+	isolateTeamsServiceLocalSupervisorDirsForTest(t)
 
 	tmp := t.TempDir()
 	runner := &scriptedTeamsServiceRunner{
@@ -2671,7 +2565,7 @@ func TestTeamsBackgroundKeepaliveAutoEnsureWSLAccessDeniedInstallsStartupFallbac
 	})
 
 	err := ensureTeamsServiceForRun(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "Startup watchdog fallback") {
+	if err == nil || !strings.Contains(err.Error(), "Windows Startup entry") {
 		t.Fatalf("auto ensure access denied error = %v, want Startup fallback diagnostic", err)
 	}
 	if len(runner.calls) != 3 {
@@ -2685,14 +2579,14 @@ func TestTeamsBackgroundKeepaliveAutoEnsureWSLAccessDeniedInstallsStartupFallbac
 	if strings.Contains(fallback, "Start-Process -FilePath $cmdPath") {
 		t.Fatalf("auto ensure fallback should not start a background watchdog while foreground run is active:\n%s", fallback)
 	}
-	if !strings.Contains(fallback, "GetFolderPath('Startup')") || !strings.Contains(fallback, "--auto-service=false") {
-		t.Fatalf("auto ensure fallback command missing Startup watchdog setup:\n%s", fallback)
+	if !strings.Contains(fallback, "GetFolderPath('Startup')") || !strings.Contains(fallback, "teams service start") || strings.Contains(fallback, "wscript.exe") {
+		t.Fatalf("auto ensure fallback should install, not run, the one-shot Startup entry:\n%s", fallback)
 	}
 
 	runner.calls = nil
 	runner.errs = nil
 	if err := ensureTeamsServiceForRun(context.Background()); err != nil {
-		t.Fatalf("auto ensure with fallback marker should skip retry, got: %v", err)
+		t.Fatalf("auto ensure after the Startup fallback should skip retry, got: %v", err)
 	}
 	if len(runner.calls) != 0 {
 		t.Fatalf("auto ensure should not retry blocked Scheduled Task after fallback marker: %#v", runner.calls)

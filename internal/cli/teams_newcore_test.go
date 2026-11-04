@@ -189,18 +189,19 @@ func TestLocalSupervisorRestartsPromptlyAfterExit75(t *testing.T) {
 }
 
 // Exit 75 (restart on the same state) restarts the helper under every
-// supervisor: launchd keeps a non-zero exit alive, the WSL Startup loop
-// restarts after any exit, and on Windows the watchdog task starts the
-// stopped task (systemd and the local supervisor are covered above).
+// supervisor: launchd keeps a non-zero exit alive and on Windows the watchdog
+// task starts the stopped task (systemd and the local supervisor are covered
+// above). The WSL Startup entry is not a supervisor: it only runs
+// `cxp teams service start` once, and the local supervisor restarts.
 func TestEverySupervisorRestartsAfterExit75(t *testing.T) {
 	spec := teamsServiceSpec{Executable: "/usr/local/bin/cxp", WorkingDir: "/w"}
 	plist := buildTeamsServiceLaunchAgentPlist(spec)
 	if !strings.Contains(plist, "<key>SuccessfulExit</key>\n\t\t<false/>") {
 		t.Fatalf("launchd plist does not restart a non-zero exit:\n%s", plist)
 	}
-	script := buildTeamsServiceWSLStartupWatchdogScript("task", []string{"-d", "Ubuntu", "--", "cxp", "teams", "run"}, "s")
-	if !strings.Contains(script, "while ($true)") || !strings.Contains(script, "restarting in 10s") {
-		t.Fatalf("WSL Startup loop does not restart after an exit:\n%s", script)
+	entry := buildTeamsServiceWSLStartupKickVBS(buildTeamsServiceWSLStartupKickArguments(spec))
+	if !strings.Contains(entry, "teams service start") || strings.Contains(entry, "teams run") || !strings.HasSuffix(entry, ", 0, False\r\n") {
+		t.Fatalf("WSL Startup entry is not a one-shot service start:\n%s", entry)
 	}
 	d := evaluateTeamsServiceWatchdog(teamsServiceWatchdogSnapshot{Installed: true, Active: false},
 		teamsServiceWatchdogState{LastActionAt: time.Now()}, teamsServiceWatchdogOptions{})

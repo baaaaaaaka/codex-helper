@@ -5731,6 +5731,13 @@ type teamsServiceTestHooks struct {
 
 func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
 	t.Helper()
+	// A Windows Startup fallback enables the local-supervisor config, which
+	// makes later backend selection sticky; never let one test leak it.
+	if configPath, err := teamsServiceLocalSupervisorConfigPath(); err == nil {
+		if _, statErr := os.Stat(configPath); os.IsNotExist(statErr) {
+			t.Cleanup(func() { _ = os.Remove(configPath) })
+		}
+	}
 	t.Setenv(envTeamsCodexChild, "")
 	t.Setenv(envTeamsCodexParentPID, "")
 	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "")
