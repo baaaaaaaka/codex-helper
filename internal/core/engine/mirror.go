@@ -63,6 +63,8 @@ type mirrorFile struct {
 	// (review M7); the records are re-read, never dropped.
 	fails   int
 	retryAt time.Time
+	// nextStat is when mirrorPoll stats the rollout next (B1).
+	nextStat time.Time
 }
 
 func realignKey(srcID int64) string { return fmt.Sprintf("%s%d", metaRealignPrefix, srcID) }
@@ -486,30 +488,82 @@ func oneLine(s string, n int) string {
 	return clipText(s, n)
 }
 
-// mirrorPoll stats every tracked rollout and reads the changed ones.
+// mirrorPoll stats the tracked rollouts that are due and reads the changed
+// ones. The stat is tiered (B1): see mirrorStatEvery.
 func (e *Engine) mirrorPoll(ctx context.Context) {
+	now := e.now()
 	e.mirror.mu.Lock()
-	files := make([]*mirrorFile, 0, len(e.mirror.files))
+	var due []*mirrorFile
 	for _, f := range e.mirror.files {
-		files = append(files, f)
+		if !now.Before(f.nextStat) {
+			due = append(due, f)
+		}
 	}
 	e.mirror.mu.Unlock()
-	for _, f := range files {
+	for _, f := range due {
 		if ctx.Err() != nil {
 			return
 		}
-		info, err := transcript.Stat(f.src.Path)
+		first := f.nextStat.IsZero()
+		info, err := e.statFile(f.src.Path)
+		mtime := f.info.MTime
+		if err == nil {
+			mtime = info.MTime
+		}
+		every := e.mirrorStatEvery(f.src.ConvID, mtime, now)
+		f.nextStat = now.Add(every)
+		if first && every > 0 {
+			// Spread the rollouts over the period, so the slow tiers
+			// do not stat every file in the same tick.
+			f.nextStat = now.Add(time.Duration(pathHash(f.src.Path) % uint64(every)))
+		}
 		if err != nil {
 			continue // removed or unreadable; keep the row
 		}
 		if info == f.info && f.tracker.Offset() >= info.Size {
 			continue
 		}
-		if e.now().Before(f.retryAt) {
+		if now.Before(f.retryAt) {
 			continue
 		}
 		e.mirrorRead(ctx, f, info)
+		if f.tracker.Offset() < info.Size {
+			f.nextStat = now.Add(e.t.MirrorStat) // more to read: next tick
+		}
 	}
+}
+
+// mirrorStatEvery is the stat period of a tracked rollout last modified at
+// mtime (B1): MirrorStat while it changed within MirrorHotFor or its
+// conversation runs a turn, MirrorParkedStat when its conversation is
+// parked (a local session wakes it within that bound), MirrorIdleStat
+// otherwise.
+func (e *Engine) mirrorStatEvery(conv int64, mtime, now time.Time) time.Duration {
+	if now.Sub(mtime) < e.t.MirrorHotFor {
+		return e.t.MirrorStat
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cs := e.convs[conv]
+	switch {
+	case cs == nil:
+		return e.t.MirrorIdleStat
+	case cs.running != nil:
+		return e.t.MirrorStat
+	case cs.state == store.ConvParked:
+		return e.t.MirrorParkedStat
+	}
+	return e.t.MirrorIdleStat
+}
+
+// pathHash is a stable hash of a path (FNV-1a).
+func pathHash(p string) uint64 {
+	h := uint64(14695981039346656037)
+	for i := 0; i < len(p); i++ {
+		h ^= uint64(p[i])
+		h *= 1099511628211
+	}
+	return h
 }
 
 // mirrorRead reads new records of one rollout and posts them.

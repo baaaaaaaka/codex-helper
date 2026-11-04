@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +15,8 @@ import (
 
 	"github.com/baaaaaaaka/codex-helper/internal/channel"
 	"github.com/baaaaaaaka/codex-helper/internal/channel/channeltest"
+	"github.com/baaaaaaaka/codex-helper/internal/core/store"
+	"github.com/baaaaaaaka/codex-helper/internal/core/transcript"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/rollout"
 )
 
@@ -215,5 +218,66 @@ func TestBaselinedRolloutMirroredOnceItGrows(t *testing.T) {
 	})
 	if n := len(r.own(chat, "before the helper")); n != 0 {
 		t.Fatalf("the baselined turn was posted %d times", n)
+	}
+}
+
+// B1: the rollout stat is tiered. A rollout that changed within
+// MirrorHotFor, or whose conversation runs a turn, is stat'ed every
+// MirrorStat; other tracked rollouts every MirrorIdleStat, and those of
+// parked conversations every MirrorParkedStat, which bounds how late a
+// local session wakes its parked chat.
+func TestMirrorStatIsTiered(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	tm := ProductionTiming()
+	stats := map[string][]time.Time{}
+	infos := map[string]transcript.FileInfo{}
+	e := &Engine{t: tm, now: func() time.Time { return now }, log: io.Discard, convs: map[int64]*convState{}}
+	e.statFile = func(p string) (transcript.FileInfo, error) {
+		stats[p] = append(stats[p], now)
+		return infos[p], nil
+	}
+	e.mirror = &mirrorState{files: map[string]*mirrorFile{}, known: map[string]string{}}
+	add := func(path string, conv int64, cs *convState, mtime time.Time) {
+		e.convs[conv] = cs
+		info := transcript.FileInfo{Size: 100, MTime: mtime, Inode: 1}
+		infos[path] = info
+		e.mirror.files[path] = &mirrorFile{src: store.TranscriptSource{Path: path, ConvID: conv},
+			tracker: transcript.NewTracker("t", 100, 1, nil), info: info}
+	}
+	missing := filepath.Join(t.TempDir(), "missing")
+	hot, running, idle, parked := missing+"-hot", missing+"-running", missing+"-idle", missing+"-parked"
+	add(hot, 1, &convState{kind: store.KindWork, state: store.ConvActive}, now.Add(-time.Minute))
+	add(running, 2, &convState{kind: store.KindWork, state: store.ConvActive, running: &runState{}}, now.Add(-time.Hour))
+	add(idle, 3, &convState{kind: store.KindWork, state: store.ConvActive}, now.Add(-time.Hour))
+	add(parked, 4, &convState{kind: store.KindWork, state: store.ConvParked}, now.Add(-time.Hour))
+	ctx := context.Background()
+	start := now
+	for now.Sub(start) < 2*time.Minute { // the mirror loop's stat tick
+		e.mirrorPoll(ctx)
+		now = now.Add(tm.MirrorStat)
+	}
+	for _, c := range []struct {
+		path     string
+		min, max int
+	}{{hot, 60, 60}, {running, 60, 60}, {idle, 4, 5}, {parked, 2, 3}} {
+		if n := len(stats[c.path]); n < c.min || n > c.max {
+			t.Errorf("%s stat'ed %d times in 2 min, want %d..%d", filepath.Base(c.path), n, c.min, c.max)
+		}
+	}
+
+	// A local session appends to the parked conversation's rollout: the
+	// stat sees it within MirrorParkedStat (plus one tick).
+	changed := now
+	infos[parked] = transcript.FileInfo{Size: 200, MTime: now, Inode: 1}
+	for now.Sub(changed) <= tm.MirrorParkedStat+tm.MirrorStat {
+		e.mirrorPoll(ctx)
+		now = now.Add(tm.MirrorStat)
+	}
+	seen := false
+	for _, at := range stats[parked] {
+		seen = seen || !at.Before(changed)
+	}
+	if !seen {
+		t.Fatalf("parked rollout change not stat'ed within %s", tm.MirrorParkedStat+tm.MirrorStat)
 	}
 }

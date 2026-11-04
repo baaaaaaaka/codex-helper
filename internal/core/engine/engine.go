@@ -20,6 +20,7 @@ import (
 
 	"github.com/baaaaaaaka/codex-helper/internal/channel"
 	"github.com/baaaaaaaka/codex-helper/internal/core/store"
+	"github.com/baaaaaaaka/codex-helper/internal/core/transcript"
 )
 
 // Timing holds every cadence of the engine.
@@ -38,6 +39,12 @@ type Timing struct {
 	MirrorStat time.Duration // stat tick for tracked rollouts
 	Discovery  time.Duration // discovery walk for new rollouts
 	FullWalk   time.Duration // a cycle over the older day directories starts at most this often
+	// Tiered rollout stat (B1): a rollout that changed within MirrorHotFor,
+	// or whose conversation runs a turn, is stat'ed every MirrorStat;
+	// other tracked rollouts every MirrorIdleStat, and those of parked
+	// conversations every MirrorParkedStat (the bound on a local session
+	// waking its parked chat).
+	MirrorHotFor, MirrorIdleStat, MirrorParkedStat time.Duration
 
 	TurnPoll        time.Duration // Codex turn/completed safety poll
 	CancelWait      time.Duration // wait after turn/interrupt before killing
@@ -82,6 +89,7 @@ func ProductionTiming() Timing {
 		HotFor: 2 * time.Minute, WarmFor: 15 * time.Minute, CoolFor: 4 * time.Hour, ParkAfter: 48 * time.Hour,
 		Control: 5 * time.Second, ScanInterval: 5 * time.Second, SafetyRead: 10 * time.Minute, MaxBackoff: 5 * time.Minute,
 		MirrorStat: 2 * time.Second, Discovery: 10 * time.Second, FullWalk: 10 * time.Minute,
+		MirrorHotFor: 5 * time.Minute, MirrorIdleStat: 30 * time.Second, MirrorParkedStat: time.Minute,
 		TurnPoll: 30 * time.Second, CancelWait: 10 * time.Second,
 		ResolveDelay: 5 * time.Second, ResolveTries: 3, ResolveAbsent: 2 * time.Minute, CapacityRetry: 5 * time.Minute, CapacityBackoff: 10 * time.Second,
 		Heartbeat: 30 * time.Second, Maintenance: time.Minute, ChatRate: time.Second,
@@ -110,6 +118,7 @@ func FastTiming(base time.Duration) Timing {
 	t.SafetyRead = 60 * base
 	t.MaxBackoff = 30 * base
 	t.MirrorStat, t.Discovery, t.FullWalk = base, 2*base, 20*base
+	t.MirrorHotFor, t.MirrorIdleStat, t.MirrorParkedStat = 300*base, 15*base, 30*base
 	t.TurnPoll = 2 * time.Second
 	t.ResolveDelay = 500 * time.Millisecond
 	t.ResolveAbsent = 3 * time.Second
@@ -202,6 +211,8 @@ type Engine struct {
 	t       Timing
 	log     io.Writer
 	now     func() time.Time
+	// statFile stats a rollout (transcript.Stat; tests count calls).
+	statFile func(string) (transcript.FileInfo, error)
 
 	mu        sync.Mutex
 	convs     map[int64]*convState
@@ -311,7 +322,7 @@ func New(cfg Config) (*Engine, error) {
 		cfg.WriteRate = 4
 	}
 	e := &Engine{
-		cfg: cfg, st: cfg.Store, ch: timedChannel{cfg.Channel}, ag: cfg.Agent, t: cfg.Timing, log: cfg.Log, now: cfg.Now,
+		cfg: cfg, st: cfg.Store, ch: timedChannel{cfg.Channel}, ag: cfg.Agent, t: cfg.Timing, log: cfg.Log, now: cfg.Now, statFile: transcript.Stat,
 		gRead: store.AccountReadGate(cfg.ChannelName), gWrite: store.AccountWriteGate(cfg.ChannelName),
 		convs: map[int64]*convState{}, intro: map[int64]string{}, forkThreads: map[string]bool{}, delegThreads: map[string]bool{}, byChat: map[string]int64{}, byThread: map[string]int64{},
 		runnerWake: make(chan struct{}, 1), runnerDirty: map[int64]bool{},
