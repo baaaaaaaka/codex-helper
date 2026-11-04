@@ -3,6 +3,7 @@ package teams
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"regexp"
@@ -38,6 +39,12 @@ func (a *Adapter) Receive(ctx context.Context, stream, cursor string) (channel.W
 		since = t.Add(-a.cfg.Overlap)
 	}
 	msgs, newest, pages, err := a.walk(ctx, stream, since)
+	var tl *channel.WindowTooLarge
+	if errors.As(err, &tl) && cursor != "" {
+		if skip, _ := time.Parse(time.RFC3339Nano, tl.SkipCursor); !skip.After(watermark) {
+			tl.SkipCursor = cursor // never behind the input cursor
+		}
+	}
 	if err != nil {
 		return channel.Window{}, err
 	}
@@ -77,7 +84,15 @@ func (a *Adapter) walk(ctx context.Context, chat string, since time.Time) ([]cha
 	pages := 0
 	for next != "" {
 		if pages >= a.cfg.MaxPages {
-			return nil, time.Time{}, pages, &channel.Rejected{Err: fmt.Errorf("teams: receive window for chat exceeds %d pages", a.cfg.MaxPages)}
+			// Admitting only the newest pages would break ordering; let the
+			// core decide (visible notice, retry or skip).
+			oldest := newest
+			for _, m := range out {
+				if m.Modified.Before(oldest) {
+					oldest = m.Modified
+				}
+			}
+			return nil, time.Time{}, pages, &channel.WindowTooLarge{Pages: pages, OldestSeen: oldest, SkipCursor: newest.UTC().Format(cursorLayout)}
 		}
 		if seenLinks[next] {
 			return nil, time.Time{}, pages, &channel.Rejected{Err: fmt.Errorf("teams: nextLink loop")}

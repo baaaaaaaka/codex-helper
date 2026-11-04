@@ -16,6 +16,7 @@ import (
 //	           blindly, resolve it with ReadBack first.
 //	Throttled  the service asked us to slow down; nothing was applied.
 //	AuthRequired the credentials are missing or rejected; a human must sign in.
+//	WindowTooLarge Receive only: the backlog is too large to admit in order.
 
 // Rejected means the request was definitely not applied.
 type Rejected struct {
@@ -79,6 +80,23 @@ type AuthRequired struct{ Err error }
 
 func (e *AuthRequired) Error() string { return "channel: sign-in required: " + errText(e.Err) }
 func (e *AuthRequired) Unwrap() error { return e.Err }
+
+// WindowTooLarge is returned by Receive when the backlog behind the cursor
+// is larger than the adapter will walk in one window. Nothing is returned
+// and the cursor is not moved: admitting part of the window would break
+// ordering. The core must surface it (a visible notice in the chat) and
+// decide: retry later, or skip the backlog with SkipCursor.
+type WindowTooLarge struct {
+	Pages      int       // pages fetched before giving up
+	OldestSeen time.Time // oldest modification time reached; older messages were not seen
+	// SkipCursor would resume after the newest message seen, skipping every
+	// message not yet admitted. Only use it after telling the user.
+	SkipCursor string
+}
+
+func (e *WindowTooLarge) Error() string {
+	return fmt.Sprintf("channel: receive window larger than %d pages (reached %s)", e.Pages, e.OldestSeen.UTC().Format(time.RFC3339))
+}
 
 // ErrNotFound is wrapped by Get and FetchFile when the object does not exist.
 var ErrNotFound = errors.New("channel: not found")
