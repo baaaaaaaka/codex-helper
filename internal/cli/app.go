@@ -230,8 +230,8 @@ func runCodexApp(cmd *cobra.Command, root *rootOptions, opts codexAppOptions) er
 	}
 
 	// AppX activation is allowed only when no launch-time state needs to be
-	// inherited by ChatGPT. This includes the proxy, model-profile isolation,
-	// and an explicitly selected Codex data directory. Keep this decision on
+	// inherited by ChatGPT. This includes the proxy and an explicitly selected
+	// Codex data directory. Keep this decision on
 	// the launch options so every Windows backend applies the same rule.
 	return codexAppLaunchDesktopFn(ctx, launchOpts)
 }

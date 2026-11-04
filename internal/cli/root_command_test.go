@@ -18,7 +18,7 @@ func TestRootCommandWiresExpectedSubcommandsAndFlags(t *testing.T) {
 	}
 	sort.Strings(names)
 
-	want := []string{"__internal-npm-wrapper", "__user-path-probe", "app", "delegate", "history", "init", "model", "model-profile", "model-source", "proxy", "responses", "run", "selftest", "skills", "teams", "tui", "upgrade"}
+	want := []string{"__internal-npm-wrapper", "__user-path-probe", "app", "delegate", "history", "init", "proxy", "run", "selftest", "skills", "teams", "tui", "upgrade"}
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("unexpected root subcommands\n got: %#v\nwant: %#v", names, want)
 	}
@@ -38,8 +38,8 @@ func TestRootCommandWiresExpectedSubcommandsAndFlags(t *testing.T) {
 	if err != nil {
 		t.Fatalf("find app command: %v", err)
 	}
-	if appCmd.Flags().Lookup("model-profile") == nil {
-		t.Fatal("app command should expose --model-profile")
+	if appCmd.Flags().Lookup("model-profile") != nil {
+		t.Fatal("app command still exposes the retired --model-profile flag")
 	}
 }
 
