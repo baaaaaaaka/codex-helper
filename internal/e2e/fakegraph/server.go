@@ -45,6 +45,11 @@ type Options struct {
 	// modelling a Teams service that sanitises comments. Off by default
 	// because real Teams behaviour is not yet confirmed (CLEANUP-PLAN §8.3b).
 	StripHTMLComments bool
+	// PreviewLag delays lastMessagePreview on GET /me/chats: a message
+	// becomes the preview (and moves its chat in
+	// $orderby=lastMessagePreview/createdDateTime desc) only PreviewLag after
+	// it was stored. Zero means immediate. See FIDELITY.md A9.
+	PreviewLag time.Duration
 }
 
 // Server is the fake Graph + login service.
@@ -750,11 +755,22 @@ func (s *Server) addChatLocked(kind, topic string, members []string) *Chat {
 }
 
 func (s *Server) listChats(q url.Values, rec *Request) response {
+	expand, orderByPreview := false, false
 	for k := range q {
 		switch k {
 		case "$top", "$skiptoken":
-		case "$expand", "$filter", "$orderby":
-			return violationResponse(rec, "unmodeled", "/me/chats "+k+" is not modelled")
+		case "$expand":
+			if q.Get(k) != "lastMessagePreview" {
+				return violationResponse(rec, "graph-contract", "/me/chats $expand supports only lastMessagePreview, got "+q.Get(k))
+			}
+			expand = true
+		case "$orderby":
+			if q.Get(k) != "lastMessagePreview/createdDateTime desc" {
+				return violationResponse(rec, "graph-contract", "/me/chats $orderby supports only lastMessagePreview/createdDateTime desc, got "+q.Get(k))
+			}
+			orderByPreview = true
+		case "$filter":
+			return violationResponse(rec, "unmodeled", "/me/chats $filter is not modelled")
 		default:
 			return violationResponse(rec, "graph-contract", "/me/chats unsupported query option "+k)
 		}
@@ -777,23 +793,66 @@ func (s *Server) listChats(q url.Values, rec *Request) response {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var all []*Chat
+	// Stamps are strictly monotonic and may run a few ms ahead of the wall
+	// clock, so "no lag" must mean "every stored message", not "<= now".
+	visibleBefore := time.Now().Add(-s.opts.PreviewLag)
+	if s.opts.PreviewLag <= 0 {
+		visibleBefore = time.Unix(1<<40, 0)
+	}
+	type listed struct {
+		chat    *Chat
+		preview *Message
+	}
+	var all []listed
 	for i := len(s.chatOrder) - 1; i >= 0; i-- {
 		c := s.chats[s.chatOrder[i]]
 		for _, m := range c.Members {
 			if m == s.opts.Owner.ID {
-				all = append(all, c)
+				all = append(all, listed{chat: c, preview: c.previewLocked(visibleBefore)})
 				break
 			}
 		}
 	}
+	if orderByPreview {
+		// Chats without a (visible) last message sort after every chat that
+		// has one; ties keep the newest-created-first order.
+		sort.SliceStable(all, func(i, j int) bool {
+			pi, pj := all[i].preview, all[j].preview
+			switch {
+			case pi == nil:
+				return false
+			case pj == nil:
+				return true
+			default:
+				return pi.Created.After(pj.Created)
+			}
+		})
+	}
 	var page []any
 	for i := offset; i < len(all) && len(page) < top; i++ {
-		page = append(page, all[i].toGraph(TenantID))
+		g := all[i].chat.toGraph(TenantID)
+		if expand {
+			g["lastMessagePreview@odata.context"] = "https://graph.microsoft.com/v1.0/$metadata#users('" + s.opts.Owner.ID + "')/chats('" + all[i].chat.ID + "')/lastMessagePreview/$entity"
+			if p := all[i].preview; p != nil {
+				g["lastMessagePreview"] = p.previewGraph()
+			} else {
+				g["lastMessagePreview"] = nil
+			}
+		}
+		page = append(page, g)
 	}
 	out := map[string]any{"value": nonNil(page)}
 	if offset+top < len(all) {
-		out["@odata.nextLink"] = fmt.Sprintf("https://graph.microsoft.com/v1.0/me/chats?$top=%d&$skiptoken=chats-%d", top, offset+top)
+		next := url.Values{}
+		if expand {
+			next.Set("$expand", "lastMessagePreview")
+		}
+		if orderByPreview {
+			next.Set("$orderby", "lastMessagePreview/createdDateTime desc")
+		}
+		next.Set("$top", strconv.Itoa(top))
+		next.Set("$skiptoken", fmt.Sprintf("chats-%d", offset+top))
+		out["@odata.nextLink"] = "https://graph.microsoft.com/v1.0/me/chats?" + next.Encode()
 	}
 	return response{status: 200, body: out}
 }
