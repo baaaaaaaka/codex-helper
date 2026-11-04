@@ -82,6 +82,7 @@ func processAlive(pid int) bool {
 // Handler serves the brain protocol (see package fakecodex):
 //
 //	POST /begin        BeginRequest -> Plan
+//	POST /resume       ResumeRequest -> ResumeDecision
 //	POST /await?seq=N  -> AwaitResult (blocks; cancel by closing the request)
 //	POST /end?seq=N    EndRequest
 func (f *FakeCodex) Handler() http.Handler {
@@ -110,9 +111,18 @@ func (f *FakeCodex) Handler() http.Handler {
 		if b.FailKind == FailActiveWriter {
 			err := behaviorErr(b)
 			plan.RejectStart = err.Error()
-			_, _ = f.finishSeq(seq, "rejected", "", err)
+			_, _ = f.finishSeq(seq, "rejected", "", threadErr(err, req.ThreadID))
 		}
 		writeJSON(w, plan)
+	})
+	mux.HandleFunc("POST /resume", func(w http.ResponseWriter, r *http.Request) {
+		var req fakecodex.ResumeRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		rejected := f.resume(ResumeCall{Instance: req.Instance, Kind: req.Kind, Pid: req.Pid, ThreadID: req.ThreadID})
+		writeJSON(w, fakecodex.ResumeDecision{Reject: rejected})
 	})
 	mux.HandleFunc("POST /await", func(w http.ResponseWriter, r *http.Request) {
 		seq, err := strconv.Atoi(r.URL.Query().Get("seq"))
@@ -137,6 +147,9 @@ func (f *FakeCodex) Handler() http.Handler {
 		}
 		if call.Outcome == "failed" && b.FailKind == FailCapacity {
 			res.Capacity = true
+		}
+		if call.Outcome == "failed" && b.FailKind == FailRateLimited {
+			res.RateLimited = true
 		}
 		writeJSON(w, res)
 	})

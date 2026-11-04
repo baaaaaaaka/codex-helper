@@ -45,10 +45,18 @@ const (
 	EnvInterval        = "E2E_SUT_INTERVAL"
 	EnvCodexBin        = "E2E_SUT_CODEX_BIN"
 	EnvMachineRegistry = "E2E_SUT_MACHINE_REGISTRY"
+	// EnvWorkflowWebhookURL configures the Workflow webhook before Listen,
+	// exactly like `cxp teams workflow enable --webhook-url-file`
+	// (EnsureControlChat, ConfigureWorkflowNotifications, Save).
+	EnvWorkflowWebhookURL = "E2E_SUT_WORKFLOW_WEBHOOK_URL"
 	// EnvProductionTiming=1 keeps production timing defaults that the
 	// harness otherwise shortens (used by the cost scenarios).
 	EnvProductionTiming = "E2E_SUT_PRODUCTION_TIMING"
 )
+
+// serviceRestartExitCode is harness.ServiceRestartExitCode (the harness
+// package is not imported into the SUT binary).
+const serviceRestartExitCode = 75
 
 // BlockedPrefix starts the stderr line reporting a refused foreign request.
 const BlockedPrefix = "E2E-BLOCKED "
@@ -100,6 +108,18 @@ func run() error {
 		return fmt.Errorf("NewBridgeWithHTTPClient: %w", err)
 	}
 
+	if hook := os.Getenv(EnvWorkflowWebhookURL); hook != "" {
+		if _, err := bridge.EnsureControlChat(ctx); err != nil {
+			return fmt.Errorf("workflow enable: EnsureControlChat: %w", err)
+		}
+		if _, err := bridge.ConfigureWorkflowNotificationsFromWebhookURL(ctx, hook); err != nil {
+			return fmt.Errorf("workflow enable: %w", err)
+		}
+		if err := bridge.Save(); err != nil {
+			return fmt.Errorf("workflow enable: save: %w", err)
+		}
+	}
+
 	codexHome := os.Getenv("CODEX_HOME")
 	work := newExecutor(codexBin, codexHome, "work", instance)
 	defer work.Close()
@@ -113,6 +133,15 @@ func run() error {
 		ControlFallbackExecutor: control,
 		TranscriptSyncInterval:  interval,
 		AsyncTurnShutdownGrace:  2 * time.Second,
+	}
+	// `helper restart`: production schedules a restart with its service
+	// supervisor and exits (cli.restartTeamsHelperFromTeams). Here the
+	// harness process runner is the supervisor; exiting with
+	// serviceRestartExitCode asks it for a restart on the same state.
+	opts.HelperRestarter = func(context.Context) error {
+		fmt.Fprintf(os.Stdout, "=== e2e: %s exiting for a service restart ===\n", instance)
+		os.Exit(serviceRestartExitCode)
+		return nil
 	}
 	if os.Getenv(EnvProductionTiming) == "1" {
 		// Leave the transcript sync interval at the production default

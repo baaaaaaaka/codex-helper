@@ -30,7 +30,8 @@ const (
 	graphHost = "graph.microsoft.com"
 	loginHost = "login.microsoftonline.com"
 
-	maxRequestBody = 8 << 20
+	// maxRequestBody fits one upload-session fragment (< 60 MiB).
+	maxRequestBody = 64 << 20
 	// maxMessageContentBytes approximates the documented Teams limit for a
 	// chat message body (~100 KB of HTML).
 	maxMessageContentBytes = 102289
@@ -45,6 +46,11 @@ type Options struct {
 	// modelling a Teams service that sanitises comments. Off by default
 	// because real Teams behaviour is not yet confirmed (CLEANUP-PLAN §8.3b).
 	StripHTMLComments bool
+	// PreviewLag delays lastMessagePreview on GET /me/chats: a message
+	// becomes the preview (and moves its chat in
+	// $orderby=lastMessagePreview/createdDateTime desc) only PreviewLag after
+	// it was stored. Zero means immediate. See FIDELITY.md A9.
+	PreviewLag time.Duration
 }
 
 // Server is the fake Graph + login service.
@@ -67,6 +73,12 @@ type Server struct {
 	faults        []*FaultHandle
 	hosted        map[hostedKey][]byte
 	drive         map[string]driveFile
+	items         map[string]*driveItem
+	driveOrder    []string
+	lastFragments map[string]int
+	sessions      map[string]*uploadSession
+	workflows     map[string]*workflow
+	cards         []WorkflowCard
 	accessTokens  map[string]bool
 	refreshTokens map[string]bool
 	inflight      int
@@ -166,6 +178,10 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	var route routeMatch
 	if host == loginHost {
 		route = matchLoginRoute(r.Method, r.URL.Path)
+	} else if host == SharePointHost {
+		route = routeMatch{path: r.URL.Path, name: r.Method + " {uploadUrl}"}
+	} else if host == WorkflowHost {
+		route = routeMatch{path: r.URL.Path, name: r.Method + " {workflow}"}
 	} else {
 		route = matchGraphRoute(r.Method, strings.TrimPrefix(r.URL.Path, "/v1.0"))
 	}
@@ -195,9 +211,11 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			if f.Status == http.StatusTooManyRequests {
 				code = "TooManyRequests"
 			}
+			s.recordWorkflowFault(rec, body, f.Status)
 			s.finish(w, &rec, start, response{status: f.Status, headers: hdr, body: graphError(code, "e2e injected fault "+f.Name)})
 			return
 		case FaultDropBeforeAccept:
+			s.recordWorkflowFault(rec, body, 0)
 			rec.Status = 0
 			rec.Outcome = "dropped"
 			s.record(rec, start)
@@ -237,6 +255,12 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) dispatch(host string, route routeMatch, r *http.Request, body []byte, rec *Request) response {
 	if host == loginHost {
 		return s.handleLogin(route, r, body)
+	}
+	if host == SharePointHost {
+		return s.handleUploadURL(r, body, rec)
+	}
+	if host == WorkflowHost {
+		return s.handleWorkflow(r, body, rec)
 	}
 	if host != graphHost {
 		return violationResponse(rec, "unmodeled", "unknown host "+host)
@@ -434,12 +458,21 @@ func templatePath(p string) string {
 
 func matchGraphRoute(method, p string) routeMatch {
 	m := routeMatch{path: p}
+	if dm, ok := drivePathRoute(method, p, m); ok {
+		return dm
+	}
 	parts := strings.Split(strings.Trim(p, "/"), "/")
 	set := func(tmpl string) routeMatch {
 		m.name = method + " " + tmpl
 		return m
 	}
 	switch {
+	case len(parts) == 4 && parts[0] == "me" && parts[1] == "drive" && parts[2] == "items" && method == http.MethodGet:
+		m.extra = parts[3]
+		return set("/me/drive/items/{id}")
+	case len(parts) == 5 && parts[0] == "me" && parts[1] == "drive" && parts[2] == "items" && parts[4] == "content" && method == http.MethodGet:
+		m.extra = parts[3]
+		return set("/me/drive/items/{id}/content")
 	case len(parts) == 1 && parts[0] == "me" && method == http.MethodGet:
 		return set("/me")
 	case len(parts) == 2 && parts[0] == "me" && parts[1] == "chats" && method == http.MethodGet:
@@ -561,6 +594,14 @@ func (s *Server) handleGraph(route routeMatch, q url.Values, body []byte, rec *R
 		}}
 	case "GET /me/chats":
 		return s.listChats(q, rec)
+	case "PUT /me/drive/root:/{path}:/content":
+		return s.drivePutContent(route, q, body, rec)
+	case "POST /me/drive/root:/{path}:/createUploadSession":
+		return s.driveCreateUploadSession(route, q, body, rec)
+	case "GET /me/drive/items/{id}":
+		return s.driveGetItem(route.extra, false, q, rec)
+	case "GET /me/drive/items/{id}/content":
+		return s.driveGetItem(route.extra, true, q, rec)
 	case "POST /chats":
 		if len(q) > 0 {
 			return violationResponse(rec, "graph-contract", "POST /chats takes no query options")
@@ -750,11 +791,22 @@ func (s *Server) addChatLocked(kind, topic string, members []string) *Chat {
 }
 
 func (s *Server) listChats(q url.Values, rec *Request) response {
+	expand, orderByPreview := false, false
 	for k := range q {
 		switch k {
 		case "$top", "$skiptoken":
-		case "$expand", "$filter", "$orderby":
-			return violationResponse(rec, "unmodeled", "/me/chats "+k+" is not modelled")
+		case "$expand":
+			if q.Get(k) != "lastMessagePreview" {
+				return violationResponse(rec, "graph-contract", "/me/chats $expand supports only lastMessagePreview, got "+q.Get(k))
+			}
+			expand = true
+		case "$orderby":
+			if q.Get(k) != "lastMessagePreview/createdDateTime desc" {
+				return violationResponse(rec, "graph-contract", "/me/chats $orderby supports only lastMessagePreview/createdDateTime desc, got "+q.Get(k))
+			}
+			orderByPreview = true
+		case "$filter":
+			return violationResponse(rec, "unmodeled", "/me/chats $filter is not modelled")
 		default:
 			return violationResponse(rec, "graph-contract", "/me/chats unsupported query option "+k)
 		}
@@ -777,23 +829,66 @@ func (s *Server) listChats(q url.Values, rec *Request) response {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var all []*Chat
+	// Stamps are strictly monotonic and may run a few ms ahead of the wall
+	// clock, so "no lag" must mean "every stored message", not "<= now".
+	visibleBefore := time.Now().Add(-s.opts.PreviewLag)
+	if s.opts.PreviewLag <= 0 {
+		visibleBefore = time.Unix(1<<40, 0)
+	}
+	type listed struct {
+		chat    *Chat
+		preview *Message
+	}
+	var all []listed
 	for i := len(s.chatOrder) - 1; i >= 0; i-- {
 		c := s.chats[s.chatOrder[i]]
 		for _, m := range c.Members {
 			if m == s.opts.Owner.ID {
-				all = append(all, c)
+				all = append(all, listed{chat: c, preview: c.previewLocked(visibleBefore)})
 				break
 			}
 		}
 	}
+	if orderByPreview {
+		// Chats without a (visible) last message sort after every chat that
+		// has one; ties keep the newest-created-first order.
+		sort.SliceStable(all, func(i, j int) bool {
+			pi, pj := all[i].preview, all[j].preview
+			switch {
+			case pi == nil:
+				return false
+			case pj == nil:
+				return true
+			default:
+				return pi.Created.After(pj.Created)
+			}
+		})
+	}
 	var page []any
 	for i := offset; i < len(all) && len(page) < top; i++ {
-		page = append(page, all[i].toGraph(TenantID))
+		g := all[i].chat.toGraph(TenantID)
+		if expand {
+			g["lastMessagePreview@odata.context"] = "https://graph.microsoft.com/v1.0/$metadata#users('" + s.opts.Owner.ID + "')/chats('" + all[i].chat.ID + "')/lastMessagePreview/$entity"
+			if p := all[i].preview; p != nil {
+				g["lastMessagePreview"] = p.previewGraph()
+			} else {
+				g["lastMessagePreview"] = nil
+			}
+		}
+		page = append(page, g)
 	}
 	out := map[string]any{"value": nonNil(page)}
 	if offset+top < len(all) {
-		out["@odata.nextLink"] = fmt.Sprintf("https://graph.microsoft.com/v1.0/me/chats?$top=%d&$skiptoken=chats-%d", top, offset+top)
+		next := url.Values{}
+		if expand {
+			next.Set("$expand", "lastMessagePreview")
+		}
+		if orderByPreview {
+			next.Set("$orderby", "lastMessagePreview/createdDateTime desc")
+		}
+		next.Set("$top", strconv.Itoa(top))
+		next.Set("$skiptoken", fmt.Sprintf("chats-%d", offset+top))
+		out["@odata.nextLink"] = "https://graph.microsoft.com/v1.0/me/chats?" + next.Encode()
 	}
 	return response{status: 200, body: out}
 }
@@ -1231,6 +1326,9 @@ func (s *Server) postMessage(chatID string, body []byte, rec *Request, quote boo
 	c, resp := s.memberChatLocked(chatID)
 	if c == nil {
 		return resp
+	}
+	if reason := s.checkReferenceAttachmentsLocked(pm.Attachments); reason != "" {
+		return violationResponse(rec, "graph-contract", reason)
 	}
 	for _, id := range quoted {
 		found := false

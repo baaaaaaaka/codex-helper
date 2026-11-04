@@ -228,3 +228,10 @@ func (s *Server) CreateMeetingChatAsUser(topic string) ChatInfo {
 	info, _ := s.Chat(c.ID)
 	return info
 }
+
+// SetPreviewLag changes Options.PreviewLag at run time.
+func (s *Server) SetPreviewLag(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.opts.PreviewLag = d
+}

@@ -255,6 +255,20 @@ func (s *server) dispatch(msg message) (any, *rpcError) {
 			return nil, invalid("no rollout found for thread id %s", id)
 		}
 		s.mu.Lock()
+		_, loaded := s.loaded[id]
+		s.mu.Unlock()
+		if !loaded {
+			// Real Codex 0.166 refuses to load a thread another process
+			// holds (FIDELITY C5); the brain decides whether one does.
+			dec, err := s.resumeCheck(ResumeRequest{Instance: s.cfg.Instance, Kind: s.cfg.Kind, Pid: os.Getpid(), ThreadID: id})
+			if err != nil {
+				return nil, &rpcError{Code: -32603, Message: "fake codex brain unavailable: " + err.Error()}
+			}
+			if dec.Reject != "" {
+				return nil, invalid("%s", strings.ReplaceAll(dec.Reject, "{thread}", id))
+			}
+		}
+		s.mu.Lock()
 		if cur, ok := s.loaded[id]; ok {
 			t = cur
 		} else {
@@ -405,10 +419,15 @@ func (s *server) startTurn(p map[string]any) (any, *rpcError) {
 	busy := ok && t.Active()
 	s.mu.Unlock()
 	if !ok {
-		return nil, invalid("thread not loaded: %s (resume it first)", threadID)
+		// Real Codex 0.166 text for a thread this process has not loaded
+		// (FIDELITY C5).
+		return nil, invalid("thread not found: %s", threadID)
 	}
 	if busy {
-		return nil, invalid("thread %s already has an active turn", threadID)
+		// Real Codex 0.166 (probe c, internal/e2e/realcodex) does not reject
+		// a second turn/start on a thread with a running turn: it steers the
+		// new input into the running turn and answers with that turn's id.
+		return s.steer(t, threadID, p)
 	}
 	var prompt string
 	var images []string
@@ -446,7 +465,10 @@ func (s *server) startTurn(p map[string]any) (any, *rpcError) {
 		return nil, &rpcError{Code: -32603, Message: "fake codex brain unavailable: " + err.Error()}
 	}
 	if plan.RejectStart != "" {
-		return nil, &rpcError{Code: -32000, Message: plan.RejectStart}
+		// Real Codex 0.166 answers a thread held by another process with
+		// -32600 "thread <id> already has an active writer" (on thread/resume;
+		// see FIDELITY.md C5).
+		return nil, invalid("%s", strings.ReplaceAll(plan.RejectStart, "{thread}", threadID))
 	}
 	if s.gone.Load() {
 		// The helper went away while turn/start was in flight: the turn
@@ -490,6 +512,46 @@ func (s *server) startTurn(p map[string]any) (any, *rpcError) {
 	return map[string]any{"turn": view}, nil
 }
 
+// steer appends a turn/start input to the thread's running turn, the way
+// real Codex 0.166 does. The brain is not told: the running turn's answer
+// stands for both inputs.
+func (s *server) steer(t *Thread, threadID string, p map[string]any) (any, *rpcError) {
+	var content []any
+	inputs, _ := p["input"].([]any)
+	for _, raw := range inputs {
+		in, _ := raw.(map[string]any)
+		if in["type"] == "text" {
+			text, _ := in["text"].(string)
+			content = append(content, map[string]any{"type": "text", "text": text, "text_elements": []any{}})
+		}
+	}
+	clientID, _ := p["clientUserMessageId"].(string)
+	s.mu.Lock()
+	var running *Turn
+	for i := len(t.Turns) - 1; i >= 0; i-- {
+		if t.Turns[i].Status == StatusInProgress {
+			running = t.Turns[i]
+			break
+		}
+	}
+	if running == nil {
+		s.mu.Unlock()
+		return nil, invalid("thread %s has no running turn to steer", threadID)
+	}
+	running.Items = append(running.Items, map[string]any{"type": "userMessage", "id": newID(), "clientId": nullable(clientID), "content": content})
+	saveErr := s.cfg.Store.Save(t)
+	turnID := running.ID
+	s.mu.Unlock()
+	if saveErr != nil {
+		fmt.Fprintf(s.cfg.Log, "fakecodex: save: %v\n", saveErr)
+	}
+	fmt.Fprintf(s.cfg.Log, "fakecodex: turn/start on busy thread %s steered into turn %s\n", threadID, turnID)
+	view := turnView(turnID, StatusInProgress, []any{}, nil, 0, 0)
+	view["startedAt"] = nil
+	view["itemsView"] = "notLoaded"
+	return map[string]any{"turn": view}, nil
+}
+
 func (s *server) runTurn(rt *runningTurn, t *Thread, turn *Turn) {
 	defer func() {
 		s.mu.Lock()
@@ -526,8 +588,14 @@ func (s *server) runTurn(rt *runningTurn, t *Thread, turn *Turn) {
 	default:
 		status = StatusFailed
 		terr = &TurnError{Message: res.Error}
+		// Shapes verified against real Codex 0.145/0.166 (probe d): a
+		// provider 503 / response.failed server_is_overloaded and a 429
+		// after retries.
 		if res.Capacity {
 			terr.CodexErrorInfo = "serverOverloaded"
+		}
+		if res.RateLimited {
+			terr.CodexErrorInfo = map[string]any{"responseTooManyFailedAttempts": map[string]any{"httpStatusCode": 429}}
 		}
 	}
 	s.mu.Lock()
@@ -566,8 +634,19 @@ func (s *server) runTurn(rt *runningTurn, t *Thread, turn *Turn) {
 	var errView any
 	if terr != nil {
 		errView = terr
+		// Real Codex sends an "error" notification before a failed
+		// turn/completed.
+		s.notify("error", map[string]any{"error": terr, "willRetry": false, "threadId": rt.threadID, "turnId": rt.turnID})
 	}
-	s.notify("turn/completed", map[string]any{"threadId": rt.threadID, "turn": turnView(rt.turnID, status, []any{}, errView, turn.StartedAt, turn.CompletedAt)})
+	summary := []any{}
+	if final != nil {
+		summary = append(summary, final)
+	}
+	done := turnView(rt.turnID, status, summary, errView, turn.StartedAt, turn.CompletedAt)
+	// Codex 0.166 sends the turn's agent messages as a summary on
+	// turn/completed (0.145 sent items [] with itemsView notLoaded).
+	done["itemsView"] = "summary"
+	s.notify("turn/completed", map[string]any{"threadId": rt.threadID, "turn": done})
 }
 
 // rolloutLocked returns (creating on first use) the rollout writer of t.
@@ -693,6 +772,14 @@ func (s *server) begin(req BeginRequest) (Plan, error) {
 	var plan Plan
 	err := s.post(ctx, "/begin", req, &plan)
 	return plan, err
+}
+
+func (s *server) resumeCheck(req ResumeRequest) (ResumeDecision, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var dec ResumeDecision
+	err := s.post(ctx, "/resume", req, &dec)
+	return dec, err
 }
 
 func (s *server) await(ctx context.Context, seq int) (AwaitResult, error) {

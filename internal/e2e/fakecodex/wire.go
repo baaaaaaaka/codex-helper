@@ -40,6 +40,23 @@ type BeginRequest struct {
 	Images   []string `json:"images,omitempty"`
 }
 
+// ResumeRequest is sent by the app-server when a thread/resume arrives for a
+// thread this process has not loaded yet (POST /resume).
+type ResumeRequest struct {
+	Instance string `json:"instance"`
+	Kind     string `json:"kind"`
+	Pid      int    `json:"pid"`
+	ThreadID string `json:"threadId"`
+}
+
+// ResumeDecision is the brain's answer to a ResumeRequest.
+type ResumeDecision struct {
+	// Reject, if set, is returned as the JSON-RPC error (-32600) of
+	// thread/resume ("{thread}" becomes the thread id), and the thread stays
+	// unloaded: a following turn/start fails with "thread not found".
+	Reject string `json:"reject,omitempty"`
+}
+
 // Plan is the brain's answer to a BeginRequest.
 type Plan struct {
 	Seq int `json:"seq"`
@@ -58,6 +75,9 @@ type AwaitResult struct {
 	Answer   string `json:"answer,omitempty"`
 	Error    string `json:"error,omitempty"`
 	Capacity bool   `json:"capacity,omitempty"`
+	// RateLimited fails the turn the way Codex reports provider 429s after
+	// its retries (codexErrorInfo responseTooManyFailedAttempts).
+	RateLimited bool `json:"rateLimited,omitempty"`
 }
 
 // EndRequest reports an outcome the brain cannot see by itself

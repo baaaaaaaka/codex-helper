@@ -48,6 +48,7 @@ type TurnError struct {
 	Message           string  `json:"message"`
 	CodexErrorInfo    any     `json:"codexErrorInfo"`
 	AdditionalDetails *string `json:"additionalDetails"`
+	Misalignment      any     `json:"misalignment"`
 }
 
 // Store persists threads as one JSON file each. Several app-server

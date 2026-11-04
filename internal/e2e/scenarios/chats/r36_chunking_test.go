@@ -14,12 +14,13 @@ import (
 // R-36 / R-1 / R-6: a final of a 200-row table plus ~100 KB of prose is
 // split so that no Teams message exceeds 32 KiB of HTML, every table part
 // repeats the header, parts are labelled and in order, nothing is lost or
-// duplicated, and only one part mentions the owner.
+// duplicated, and the owner is notified once: by one control-chat @mention
+// (no webhook configured), never by an @mention on a part (M3 decision).
 func TestR36_LongAnswerIsChunked(t *testing.T) {
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "R-36", harness.Options{
 		Guarantees: []string{"R-36", "R-1", "R-2", "R-6"},
-		Title:      "200-row table + 100 KB prose: parts <= 32 KiB, headers repeated, in order, complete, one mention",
+		Title:      "200-row table + 100 KB prose: parts <= 32 KiB, headers repeated, in order, complete, owner notified once",
 		Budget:     120 * time.Second,
 	})
 	defer s.Finish()
@@ -33,6 +34,7 @@ func TestR36_LongAnswerIsChunked(t *testing.T) {
 	})
 	control := steps.ReadyControlChat(s)
 	work, _ := steps.NewWorkChat(s, control, "r36")
+	promptSeq := s.Graph.LastSeq()
 	steps.MustPost(s, work.ID, "Write the long report "+tok)
 	lastRow := fmt.Sprintf("ROW%03d-%s", 199, tok)
 	lastProse := fmt.Sprintf("PROSE%04d-%s", proseParas-1, tok)
@@ -85,7 +87,14 @@ func TestR36_LongAnswerIsChunked(t *testing.T) {
 		c := msgs[parts[len(parts)-1]].Content
 		tail = c[max(0, len(c)-300):]
 	}
-	s.Check("R-36 only one part mentions the owner", mentions == 1, "1 mention", fmt.Sprintf("%d mentions, %d <at> tags; last part ends: %q", mentions, atTags, tail))
+	controlMentions := 0
+	for _, m := range s.SUTMessages(control.ID) {
+		if m.RequestSeq > promptSeq && len(m.Mentions) > 0 {
+			controlMentions++
+		}
+	}
+	s.Check("R-36 no part @mentions the owner; one control-chat @mention for the final", mentions == 0 && controlMentions == 1, "0 part mentions, 1 control-chat mention",
+		fmt.Sprintf("%d part mentions (%d <at> tags), %d control-chat mentions; last part ends: %q", mentions, atTags, controlMentions, tail))
 	s.Check("R-36 parts are labelled", len(labels) == len(parts), "a part label on every part", fmt.Sprintf("%d labels for %d parts", len(labels), len(parts)))
 
 	want := expectedSentinels()
