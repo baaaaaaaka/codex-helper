@@ -172,6 +172,45 @@ func TestProofBasedResume(t *testing.T) {
 		// f1 found by id at line 4; the checkpoint at line 5 has nothing in between.
 		eq(t, "s001 source", qs(t, db, sourceQ, "%"+s001Thread+".jsonl"), "tracking@"+strconv.FormatInt(r.ends[5], 10)+":5")
 	})
+	// Bug B1 (fidelity run, s547/s519): a later "compacted" record repeats
+	// delivered message ids inside replacement_history. Those nested ids are
+	// not the record's own id and must not move the resume position past
+	// the undelivered records in between.
+	t.Run("compacted history repeats a delivered id", func(t *testing.T) {
+		rc := sampleRollout()
+		rc.add(map[string]any{"timestamp": rc.ts, "ordinal": 15, "type": "compacted", "payload": map[string]any{
+			"message": "", "replacement_history": []any{
+				map[string]any{"type": "message", "id": "f1", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": "local answer"}}},
+				map[string]any{"type": "message", "id": "u1", "role": "user", "content": []any{map[string]any{"type": "input_text", "text": "hello local"}}},
+			}}})
+		sessions, path := writeRollout(t, rc)
+		d := map[string]any{"d1": map[string]any{
+			"id": "d1", "session_id": "s001", "outbox_id": "o1", "teams_message_id": "1788256809000", "status": "sent",
+			"codex_thread_id": s001Thread, "source_path": path, "source_line": 4, "source_offset": rc.ends[4], "source_record_id": "f1", "part_index": 1,
+		}}
+		dir := fixture(t, "rc59", "json")
+		editJSON(t, dir, positions(path, rc.ends[4], 4, 0, 0, d))
+		rep, db := dryRun(t, dir, func(o *Options) { o.CodexSessions, o.CountBacklog = sessions, true })
+		if !rep.OK() {
+			t.Fatalf("checks: %+v", rep.Checks)
+		}
+		eq(t, "s001 source", qs(t, db, sourceQ, "%"+s001Thread+".jsonl"), "tracking@"+strconv.FormatInt(rc.ends[4], 10)+":4")
+		eq(t, "catch-up prompts", rep.Backlog.Prompts, 1)
+		eq(t, "catch-up finals", rep.Backlog.Finals, 1)
+	})
+}
+
+func TestRecordID(t *testing.T) {
+	for rec, want := range map[string]string{
+		`{"timestamp":"t","type":"response_item","payload":{"type":"message","id":"msg_1","role":"user"}}`:                 "msg_1",
+		`{"timestamp":"t","ordinal":3,"type":"response_item","payload":{"type":"message","role":"user","id":"msg_2"}}`:     "msg_2",
+		`{"timestamp":"t","ordinal":9,"type":"compacted","payload":{"message":"","replacement_history":[{"id":"msg_1"}]}}`: "",
+		`{"timestamp":"t","type":"response_item","payload":{"type":"message","role":"user","content":[{"id":"x"}]}}`:       "",
+		`{"timestamp":"t","type":"event_msg","payload":{"type":"agent_message","message":"say \"id\":\"no\"","id":"e1"}}`:  "e1",
+		`{"id":"top","payload":{"type":"message"}}`: "",
+	} {
+		eq(t, rec, recordID([]byte(rec)), want)
+	}
 }
 
 func TestScanClassifier(t *testing.T) {

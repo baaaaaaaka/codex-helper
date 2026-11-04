@@ -231,8 +231,13 @@ func scanRollout(q scanReq) scanResult {
 		if !big {
 			cl.classify(rec, start, off, line)
 			if len(q.ids) > 0 {
+				// The old core names a repeated id's later copies
+				// "<id>#line:N", so a bare ledger id proves only its first
+				// occurrence.
 				if id := recordID(rec); id != "" && q.ids[id] {
-					res.IDEnd[id] = [2]int64{off, line}
+					if _, seen := res.IDEnd[id]; !seen {
+						res.IDEnd[id] = [2]int64{off, line}
+					}
 				}
 			}
 		}
@@ -422,18 +427,58 @@ func lineTS(rec []byte) int64 {
 	return ts.UnixMilli()
 }
 
-// recordID extracts payload.id cheaply (ledger id matching).
+// recordID extracts the record's own payload.id cheaply (ledger id
+// matching). Only a direct member of the top-level "payload" object counts:
+// a nested id (for example the replacement_history of a "compacted" record,
+// which repeats earlier message ids) never names this record.
 func recordID(rec []byte) string {
-	i := bytes.Index(rec[:min(len(rec), 512)], []byte(`"id":"`))
-	if i < 0 {
-		return ""
+	head := rec[:min(len(rec), 4096)]
+	depth, payloadDepth := 0, 0
+	var lastKey string
+	for i := 0; i < len(head); i++ {
+		switch c := head[i]; c {
+		case '"':
+			j := i + 1
+			for j < len(head) && head[j] != '"' {
+				if head[j] == '\\' {
+					j++
+				}
+				j++
+			}
+			if j >= len(head) {
+				return ""
+			}
+			str := head[i+1 : j]
+			k := j + 1
+			for k < len(head) && (head[k] == ' ' || head[k] == '\t') {
+				k++
+			}
+			if k < len(head) && head[k] == ':' {
+				lastKey = string(str)
+			} else {
+				if payloadDepth > 0 && depth == payloadDepth && lastKey == "id" {
+					return string(str)
+				}
+				lastKey = ""
+			}
+			i = j
+		case '{', '[':
+			depth++
+			if c == '{' && depth == 2 && lastKey == "payload" && payloadDepth == 0 {
+				payloadDepth = 2
+			}
+			lastKey = ""
+		case '}', ']':
+			if payloadDepth > 0 && depth == payloadDepth {
+				return "" // payload closed without an id
+			}
+			depth--
+			lastKey = ""
+		case ',':
+			lastKey = ""
+		}
 	}
-	rest := rec[i+6:]
-	j := bytes.IndexByte(rest, '"')
-	if j < 0 || j > 200 {
-		return ""
-	}
-	return string(rest[:j])
+	return ""
 }
 
 // recordBoundary reports whether off is 0 or follows a newline (read-only pread).
