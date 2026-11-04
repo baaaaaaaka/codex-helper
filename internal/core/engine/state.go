@@ -72,6 +72,7 @@ type convState struct {
 	batchThrough int64
 	recent       map[string]recentPrompt // normalized prompt -> last prompt
 	lastDup      int64                   // inbound id of the last duplicate-ignored prompt
+	ack          *ackFold                // last ACK row, a fold target while queued (receive.go)
 	breaker      []time.Time
 	capWake      time.Time
 

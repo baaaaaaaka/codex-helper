@@ -731,7 +731,11 @@ func (e *Engine) ackPrompt(tx *store.Tx, conv int64, a store.Admitted, c *classi
 	if !seen {
 		prev, seen = cs.recent[norm]
 	}
+	fold := cs.ack
 	e.mu.Unlock()
+	if stg.ackSet {
+		fold = stg.ack
+	}
 	dup := seen && at.Sub(prev.at) < e.t.DuplicateFor && at.Sub(prev.at) >= -e.t.DuplicateFor && norm != ""
 	if !dup {
 		stg.recent[norm] = recentPrompt{at: at, inbound: a.InboundID}
@@ -748,6 +752,13 @@ func (e *Engine) ackPrompt(tx *store.Tx, conv int64, a store.Admitted, c *classi
 		}
 		return true, tx.FinishTurn(a.TurnID, store.TurnCancelled, "duplicate", msgs)
 	}
+	quote := quotePrompt(c.in.Body)
+	if fold != nil && e.writesBacklogged() {
+		ok, err := e.foldAck(tx, fold, quote, stg)
+		if ok || err != nil {
+			return false, err
+		}
+	}
 	open, err := tx.OpenTurnsOf(conv)
 	if err != nil {
 		return false, err
@@ -762,12 +773,96 @@ func (e *Engine) ackPrompt(tx *store.Tx, conv int64, a store.Admitted, c *classi
 	if ahead > 0 {
 		text += " It is queued behind " + plural(ahead, "earlier request", "earlier requests") + "."
 	}
-	msgs, err := e.noticeReply(store.OutAck, fmt.Sprintf("ack:%d", a.InboundID), text, c.quoteID)
+	base := fmt.Sprintf("ack:%d", a.InboundID)
+	msgs, err := e.noticeReply(store.OutAck, base, text, c.quoteID)
 	if err != nil {
 		return false, err
 	}
-	_, err = tx.Enqueue(conv, msgs)
-	return false, err
+	n, err := tx.Enqueue(conv, msgs)
+	if err != nil {
+		return false, err
+	}
+	// Later prompts may fold into this ACK while it waits to be sent.
+	stg.ack, stg.ackSet = nil, true
+	if n == 1 && len(msgs) == 1 {
+		r, ok, err := tx.LastOutbox(conv, store.OutAck)
+		if err != nil {
+			return false, err
+		}
+		if ok && r.DeliveryKey == msgs[0].DeliveryKey {
+			stg.ack = &ackFold{row: r.ID, base: base, replyTo: c.quoteID, ahead: ahead, prompts: []string{quote}, body: r.Body}
+		}
+	}
+	return false, nil
+}
+
+// ackFold is a conversation's last ACK row, which later prompts may fold
+// into while it is still queued (benchmark F4b): in a write backlog a
+// chat's ACKs then cost one send, not one per prompt, and the finals
+// behind them go out sooner.
+type ackFold struct {
+	row     int64  // outbox id
+	base    string // delivery key base ("ack:<inbound>")
+	replyTo string // the first prompt's quote reference
+	ahead   int    // requests the first prompt was queued behind
+	prompts []string
+	body    string // the row body as last written
+}
+
+// ackFoldMax bounds the prompts one folded ACK lists.
+const ackFoldMax = 20
+
+// foldAck folds the ACK of the prompt quoted as quote into f's row. It
+// changes the row only while it is queued, unchanged since this engine
+// wrote it and never sent before (not a resend after an unconfirmed
+// send): a row that is sending or unknown may already be in the chat.
+// It reports whether it folded.
+func (e *Engine) foldAck(tx *store.Tx, f *ackFold, quote string, stg *admitStage) (bool, error) {
+	if len(f.prompts) >= ackFoldMax {
+		return false, nil
+	}
+	r, ok, err := tx.Outbox(f.row)
+	if err != nil || !ok {
+		return false, err
+	}
+	if r.State != store.OutQueued || r.Kind != store.OutAck || r.Parts != 1 || r.Body != f.body {
+		return false, nil
+	}
+	if _, resent, err := tx.Meta(resentKey(r.ID)); err != nil || resent {
+		return false, err
+	}
+	prompts := append(slices.Clip(f.prompts), quote)
+	msgs, err := e.noticeReply(store.OutAck, f.base, textAcceptedFold(f.ahead, prompts), f.replyTo)
+	if err != nil {
+		return false, err
+	}
+	if len(msgs) != 1 || msgs[0].DeliveryKey != r.DeliveryKey {
+		return false, nil // it no longer fits one message
+	}
+	if err := tx.ReplaceQueuedBody(r.ID, msgs[0].Body, msgs[0].BodyHash); err != nil {
+		if errors.Is(err, store.ErrState) {
+			return false, nil
+		}
+		return false, err
+	}
+	nf := *f
+	nf.prompts, nf.body = prompts, msgs[0].Body
+	stg.ack, stg.ackSet = &nf, true
+	return true, nil
+}
+
+// textAcceptedFold is the ACK of several prompts folded into one message.
+func textAcceptedFold(ahead int, quoted []string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Accepted %d requests; they run in order", len(quoted))
+	if ahead > 0 {
+		b.WriteString(", behind " + plural(ahead, "earlier request", "earlier requests"))
+	}
+	b.WriteString(":")
+	for i, q := range quoted {
+		fmt.Fprintf(&b, "\n%d. %s", i+1, q)
+	}
+	return b.String()
 }
 
 func (e *Engine) ackHeld(tx *store.Tx, conv int64, a store.Admitted, c *classified) error {
@@ -788,6 +883,9 @@ type admitStage struct {
 	latest  time.Time // newest prompt time staged in recent
 	lastDup int64
 	hits    int // suspicious messages
+	// ack replaces the conversation's fold target when ackSet (nil: none).
+	ack    *ackFold
+	ackSet bool
 }
 
 // applyStage applies a committed admit's effects. Called with e.mu held.
@@ -807,6 +905,9 @@ func (e *Engine) applyStage(cs *convState, stg *admitStage, now time.Time) {
 	}
 	if stg.lastDup != 0 {
 		cs.lastDup = stg.lastDup
+	}
+	if stg.ackSet {
+		cs.ack = stg.ack
 	}
 	if stg.hits > 0 {
 		cs.breaker = append(e.breakerWindow(cs, now), make([]time.Time, stg.hits)...)

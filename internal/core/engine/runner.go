@@ -934,6 +934,17 @@ const (
 	progressCoalesceFor = 5 * time.Minute
 )
 
+// writesBacklogged reports whether the account's writes are behind: paced
+// below the demand (pace.go) or throttled within the last
+// progressCoalesceFor. Progress is coalesced and ACKs are folded then.
+func (e *Engine) writesBacklogged() bool {
+	if e.writeTokens.limited() {
+		return true
+	}
+	until := e.gate(e.gWrite)
+	return !until.IsZero() && e.now().Sub(until) < progressCoalesceFor
+}
+
 // progressState counts one turn's progress messages. Progress callbacks can
 // come from more than one goroutine (the agent's reader and its replay of
 // early items), so mu serializes them: each message gets its own delivery
@@ -956,14 +967,9 @@ func (e *Engine) progress(ctx context.Context, cs *convState, tr store.Turn, ps 
 	if text == "" || group || ps.posted >= maxProgress {
 		return
 	}
-	now := e.now()
 	// Paced account writes (the write rate is below the demand) or a
 	// recent write throttle: one progress message per turn.
-	coalesce := e.writeTokens.limited()
-	if until := e.gate(e.gWrite); !until.IsZero() && now.Sub(until) < progressCoalesceFor {
-		coalesce = true
-	}
-	if coalesce && ps.posted >= 1 {
+	if e.writesBacklogged() && ps.posted >= 1 {
 		return
 	}
 	if ps.queued != "" {
