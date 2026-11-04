@@ -736,6 +736,8 @@ func (e *Engine) scanLoop(ctx context.Context) {
 	}
 }
 
-// scanOverlap re-lists chats around the watermark; repeats are skipped by
-// message id.
-const scanOverlap = 5 * time.Second
+// scanOverlap re-lists chats this far behind the watermark; repeats are
+// skipped by message id. The chat list is eventually consistent: a chat's
+// preview can appear after a newer one of another chat (review M6), so the
+// overlap matches the receive overlap (2 min).
+const scanOverlap = 2 * time.Minute

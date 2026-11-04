@@ -984,3 +984,66 @@ func TestQueuedTurnRemindedAndAnnouncedWhenStarting(t *testing.T) {
 		t.Errorf("a request that did not wait got %d queue notices", n)
 	}
 }
+
+// lagScanner is an activity scan whose list the test scripts.
+type lagScanner struct {
+	*channeltest.Fake
+	mu    sync.Mutex
+	acts  []channel.ChatActivity
+	calls []time.Time
+	reads []string
+}
+
+func (s *lagScanner) ScanActivity(_ context.Context, since time.Time) ([]channel.ChatActivity, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls = append(s.calls, since)
+	var out []channel.ChatActivity
+	for _, a := range s.acts {
+		if a.Last.After(since) {
+			out = append(out, a)
+		}
+	}
+	return out, nil
+}
+
+func (s *lagScanner) Receive(ctx context.Context, stream, cursor string) (channel.Window, error) {
+	s.mu.Lock()
+	s.reads = append(s.reads, stream)
+	s.mu.Unlock()
+	return s.Fake.Receive(ctx, stream, cursor)
+}
+
+func (s *lagScanner) set(acts ...channel.ChatActivity) {
+	s.mu.Lock()
+	s.acts = acts
+	s.mu.Unlock()
+}
+
+// Review M6: a chat whose preview shows up in the scan behind a newer
+// preview of another chat is still read at once, not at the safety read.
+func TestActivityScanCatchesLaggingPreview(t *testing.T) {
+	var sc *lagScanner
+	r := newRig(t, func(c *Config) {
+		sc = &lagScanner{Fake: c.Channel.(*channeltest.Fake)}
+		c.Channel, c.ActivityScan = sc, true
+		// One scan per second: every scan borrows one of the 4 read tokens/s.
+		c.Timing.HotFor, c.Timing.SafetyRead, c.Timing.ScanInterval = 200*time.Millisecond, time.Minute, time.Second
+	})
+	work := r.newWork(t.TempDir())
+	ctl := r.control()
+	newest := time.Now()
+	sc.set(channel.ChatActivity{Chat: ctl, LastID: "ctl-1", Last: newest})
+	time.Sleep(time.Second) // the work chat goes idle; the scan watermark moves to newest
+	m := r.ch.PostUser(work, "lagging prompt")
+	sc.set(channel.ChatActivity{Chat: ctl, LastID: "ctl-1", Last: newest},
+		channel.ChatActivity{Chat: work, LastID: m.ID, Last: newest.Add(-30 * time.Second)})
+	t.Cleanup(func() {
+		if t.Failed() {
+			sc.mu.Lock()
+			t.Logf("scans: %d, last since %v (newest %v); work %s; reads %v", len(sc.calls), sc.calls[len(sc.calls)-1], newest, work, sc.reads[max(0, len(sc.reads)-30):])
+			sc.mu.Unlock()
+		}
+	})
+	r.wait("lagging prompt answered", func() bool { return len(r.own(work, "ANSWER to lagging prompt")) == 1 })
+}
