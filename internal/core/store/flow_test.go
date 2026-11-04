@@ -453,9 +453,8 @@ func TestGatesAndMeta(t *testing.T) {
 	if len(g) != 1 || g[0].Until != now+1000 || g[0].Reason != "429" {
 		t.Fatalf("gates %+v", g)
 	}
-	n, err := s.Retain(c.now())
-	mustT(t, err)
-	if n != 1 || countWhere(t, s, `SELECT count(*) FROM gates`) != 1 {
-		t.Fatalf("retain removed %d", n)
+	// Expired gates are scheduling state: kept (overwritten by key), never deleted.
+	if n := countWhere(t, s, `SELECT count(*) FROM gates`); n != 2 {
+		t.Fatalf("gates rows %d", n)
 	}
 }

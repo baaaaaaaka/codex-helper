@@ -14,8 +14,8 @@ import (
 )
 
 // hotFiles hold the runtime API. Every SQL statement in them is checked.
-// retain.go (daily, bounded batches) and import.go (one-shot converter) are
-// not hot paths.
+// vacuum.go (maintenance) and import.go (one-shot converter) are not hot
+// paths.
 var hotFiles = []string{"store.go", "owner.go", "conversations.go", "receive.go", "turns.go", "outbox.go", "transcripts.go"}
 
 // fragmentCompletions are representative full statements for SQL that the
@@ -135,10 +135,18 @@ var (
 // TestHotQueriesUseIndexes runs EXPLAIN QUERY PLAN on every SQL statement of
 // the runtime API and fails on a full scan of a history-sized table.
 func TestHotQueriesUseIndexes(t *testing.T) {
+	s, _ := openTest(t)
+	checkHotPlans(t, s)
+}
+
+// checkHotPlans EXPLAINs every hot statement against s and fails on a SCAN
+// of inbound, outbox, turns or transcript_sources that is not a partial
+// open-work index.
+func checkHotPlans(t *testing.T, s *Store) {
+	t.Helper()
 	if _, err := os.Stat("schema.go"); err != nil {
 		t.Skip("source not available")
 	}
-	s, _ := openTest(t)
 	stmts := sqlStatements(t)
 	if len(stmts) < 40 {
 		t.Fatalf("only %d statements extracted", len(stmts))
