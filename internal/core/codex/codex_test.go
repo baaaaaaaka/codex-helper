@@ -116,6 +116,8 @@ func (b *brain) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		_ = json.NewEncoder(w).Encode(res)
+	case "/resume":
+		_ = json.NewEncoder(w).Encode(fakecodex.ResumeDecision{})
 	case "/end":
 		var req fakecodex.EndRequest
 		_ = json.NewDecoder(r.Body).Decode(&req)
