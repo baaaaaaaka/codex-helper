@@ -1,2 +1,2 @@
-== part 1/1 size=239 mention=false images=0
-<p><strong>L:</strong></p><ol><li>one</li><li><p>two</p><ul><li>nested <em>em</em></li><li>☑ done</li></ul></li><li>three<br>continued lazily</li></ol><ol start="5"><li>five</li></ol><ul><li>☐ todo</li></ul><ul><li>other list</li></ul>
+== part 1/1 size=226 mention=false images=0
+<p><strong>L:</strong></p><ol><li>one</li><li>two<br><ul><li>nested <em>em</em></li><li>☑ done</li></ul></li><li>three<br>&nbsp;&nbsp;&nbsp;continued lazily</li><li>five</li></ol><ul><li>☐ todo</li><li>other list</li></ul>
