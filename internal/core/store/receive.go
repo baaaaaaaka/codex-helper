@@ -183,6 +183,25 @@ func (t *Tx) InboundFiles(inboundID int64) ([]InboundFile, error) {
 	return out, rows.Err()
 }
 
+// PendingInboundFiles lists the inbound row ids that have attachments
+// still pending (download or ASR), oldest first. It is a startup query.
+func (s *Store) PendingInboundFiles() ([]int64, error) {
+	rows, err := s.r.QueryContext(context.Background(), `SELECT DISTINCT inbound_id FROM inbound_files WHERE state = 'pending' ORDER BY inbound_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 // SetInboundFile records the download/ASR outcome of one attachment.
 func (t *Tx) SetInboundFile(inboundID int64, idx int, state, localPath, errText string) error {
 	if state != "ready" && state != "failed" && state != "pending" {

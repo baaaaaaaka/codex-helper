@@ -403,7 +403,13 @@ func TestNextRunnableBlocking(t *testing.T) {
 	if _, ok := runnable(); ok {
 		t.Fatal("runnable with a pending attachment")
 	}
+	if ids, err := s.PendingInboundFiles(); err != nil || len(ids) != 1 || ids[0] != 1 {
+		t.Fatalf("pending files %v %v", ids, err)
+	}
 	mustT(t, s.Update(func(tx *Tx) error { return tx.SetInboundFile(1, 0, "ready", "/tmp/x.png", "") }))
+	if ids, err := s.PendingInboundFiles(); err != nil || len(ids) != 0 {
+		t.Fatalf("pending files after ready %v %v", ids, err)
+	}
 	tr, ok := runnable()
 	if !ok || tr.ID != 1 {
 		t.Fatalf("head not runnable: %+v", tr)
