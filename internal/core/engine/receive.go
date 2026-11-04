@@ -733,6 +733,20 @@ func (e *Engine) ackPrompt(tx *store.Tx, conv int64, a store.Admitted, c *classi
 	}
 	e.mu.Unlock()
 	dup := seen && at.Sub(prev.at) < e.t.DuplicateFor && at.Sub(prev.at) >= -e.t.DuplicateFor && norm != ""
+	// As in v0.1.20 (recentDuplicateSessionPrompt): a message with files or
+	// pasted images is never a duplicate (the same caption with another
+	// screenshot is a new request), and only an earlier prompt that is still
+	// open or completed suppresses a repeat; resending one that failed, was
+	// interrupted or cancelled runs it.
+	if dup && len(c.msg.Files) > 0 {
+		dup = false
+	}
+	if dup {
+		var err error
+		if dup, err = e.earlierSuppresses(tx, prev.inbound); err != nil {
+			return false, err
+		}
+	}
 	if !dup {
 		stg.recent[norm] = recentPrompt{at: at, inbound: a.InboundID}
 		if at.After(stg.latest) {
@@ -768,6 +782,24 @@ func (e *Engine) ackPrompt(tx *store.Tx, conv int64, a store.Admitted, c *classi
 	}
 	_, err = tx.Enqueue(conv, msgs)
 	return false, err
+}
+
+// earlierSuppresses reports whether the earlier prompt (inbound id) still
+// suppresses a repeat: its turn is open or completed.
+func (e *Engine) earlierSuppresses(tx *store.Tx, inbound int64) (bool, error) {
+	in, ok, err := tx.Inbound(inbound)
+	if err != nil || !ok || in.TurnID == 0 {
+		return ok && err == nil, err
+	}
+	tr, ok, err := tx.Turn(in.TurnID)
+	if err != nil || !ok {
+		return ok && err == nil, err
+	}
+	switch tr.State {
+	case store.TurnFailed, store.TurnInterrupted, store.TurnCancelled, store.TurnNotStarted:
+		return false, nil
+	}
+	return true, nil
 }
 
 func (e *Engine) ackHeld(tx *store.Tx, conv int64, a store.Admitted, c *classified) error {

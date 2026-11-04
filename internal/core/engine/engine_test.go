@@ -381,6 +381,37 @@ func TestDuplicatePromptIgnoredAndRetry(t *testing.T) {
 	r.wait("retry", func() bool { return r.ag.calls("same") == 2 })
 }
 
+// Duplicate guard edges as in v0.1.20: a repeat of a prompt whose turn
+// failed runs again, and the same caption with an attachment is never a
+// duplicate.
+func TestDuplicateGuardSkipsFailedAndAttachments(t *testing.T) {
+	r := newRig(t)
+	work := r.newWork(t.TempDir())
+	var failed atomic.Bool
+	r.ag.mu.Lock()
+	r.ag.outcome = func(req TurnRequest) (TurnOutcome, error) {
+		if strings.Contains(req.Text, "flaky") && failed.CompareAndSwap(false, true) {
+			return TurnOutcome{CodexTurnID: "t-fail", Status: StatusFailed, Error: "boom"}, nil
+		}
+		return TurnOutcome{CodexTurnID: "t-ok", Status: StatusCompleted, Final: "ANSWER to " + req.Text}, nil
+	}
+	r.ag.mu.Unlock()
+	r.ch.PostUser(work, "flaky job")
+	r.wait("failure notice", func() bool { return len(r.own(work, "boom")) == 1 })
+	r.ch.PostUser(work, "flaky job")
+	r.wait("rerun", func() bool { return len(r.own(work, "ANSWER to flaky job")) == 1 })
+
+	img := channel.FileRef{Kind: channel.FileImage, Name: "a.png", Ref: "img-1"}
+	r.ch.PostUser(work, "look at this", img)
+	r.wait("first image", func() bool { return r.ag.calls("look at this") == 1 })
+	img.Ref, img.Name = "img-2", "b.png"
+	r.ch.PostUser(work, "look at this", img)
+	r.wait("second image", func() bool { return r.ag.calls("look at this") == 2 })
+	if n := len(r.own(work, "Duplicate request ignored")); n != 0 {
+		t.Fatalf("%d duplicate notices", n)
+	}
+}
+
 func TestCancelRunningTurn(t *testing.T) {
 	r := newRig(t)
 	work := r.newWork(t.TempDir())
