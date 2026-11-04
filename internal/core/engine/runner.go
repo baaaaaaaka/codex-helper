@@ -124,14 +124,19 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 		return false
 	}
 	var (
-		tr  store.Turn
-		req TurnRequest
-		got bool
+		tr      store.Turn
+		req     TurnRequest
+		got     bool
+		request string // delegation request text (inbox turns)
 	)
 	err := e.update(func(tx *store.Tx) error {
 		var err error
 		tr, got, err = tx.NextRunnable(id)
 		if err != nil || !got {
+			return err
+		}
+		if id == e.inboxID {
+			req, request, got, err = e.startDelegation(tx, id, tr)
 			return err
 		}
 		th, _, err := tx.Thread(id)
@@ -172,7 +177,7 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 	if !got {
 		return false
 	}
-	rs := &runState{turnID: tr.ID, turnKey: tr.TurnKey, done: make(chan struct{})}
+	rs := &runState{turnID: tr.ID, turnKey: tr.TurnKey, done: make(chan struct{}), request: request}
 	e.mu.Lock()
 	cs.running = rs
 	e.mu.Unlock()
@@ -245,7 +250,12 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 	touch := func() { rs.lastEvent.Store(ms(e.now())) }
 	touch()
 	hooks := TurnHooks{
-		Progress: func(text string) { touch(); e.progress(ctx, cs, tr, prog, text) },
+		Progress: func(text string) {
+			touch()
+			if rs.request == "" { // delegated turns post no progress
+				e.progress(ctx, cs, tr, prog, text)
+			}
+		},
 		Activity: touch,
 		Cancelled: func() bool {
 			e.mu.Lock()
@@ -253,6 +263,9 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 			return rs.cancelled
 		},
 		ThreadStarted: func(threadID string) error {
+			if rs.request != "" {
+				return e.bindDelegThread(tr, rs.request, threadID)
+			}
 			return e.bindThread(id, threadID)
 		},
 		Started: func(codexTurnID string) {
@@ -281,7 +294,7 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 		e.logf("turn %d in %s: %v; looking it up", tr.ID, cs.label, err)
 		threadID := req.ThreadID
 		if threadID == "" {
-			threadID = e.threadOf(id)
+			threadID = e.turnThread(cs, tr)
 		}
 		found, ok, lerr := e.ag.Lookup(ctx, id, threadID, tr.TurnKey)
 		switch {
@@ -362,6 +375,13 @@ func (e *Engine) bindThread(id int64, threadID string) error {
 // finish records the outcome of a turn: the final or one notice, in the
 // same transaction as the turn's end.
 func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out TurnOutcome, cancelled bool) {
+	if cs.id == e.inboxID {
+		if out.Capacity && (out.NotStarted || out.Status == StatusFailed) && !cancelled && e.capacityRetry(cs, tr, out) {
+			return
+		}
+		e.finishDelegation(ctx, cs, tr, out, cancelled)
+		return
+	}
 	var (
 		state, errText string
 		msgs           []store.OutMsg
@@ -423,45 +443,19 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 		e.logf("render outcome of turn %d: %v", tr.ID, err)
 		msgs, _ = e.notice(base+":failed", "The answer could not be rendered for this chat. Resend the request if you still need it.")
 	}
-	// A failed finish (busy database, full disk) is retried: the turn
-	// stays open and the chat waits until it commits (review L1).
-	for attempt := 1; ; attempt++ {
-		err := e.update(func(tx *store.Tx) error {
-			if e.cfg.finishFault != nil {
-				if err := e.cfg.finishFault(); err != nil {
-					return err
-				}
-			}
-			if err := tx.FinishTurn(tr.ID, state, errText, msgs); err != nil {
-				return err
-			}
-			if err := recordUsage(tx, cs.id, state, out.Usage); err != nil {
-				return err
-			}
-			if notify {
-				return addNotify(tx, pendingNotify{Turn: tr.ID, Conv: cs.id, Text: clipText(out.Final, 400)})
-			}
-			return nil
-		})
-		if err == nil {
-			break
+	if !e.commitFinish(ctx, tr, func(tx *store.Tx) error {
+		if err := tx.FinishTurn(tr.ID, state, errText, msgs); err != nil {
+			return err
 		}
-		if finalStoreError(err) || ctx.Err() != nil {
-			e.logf("finish turn %d: %v", tr.ID, err)
-			return
+		if err := recordUsage(tx, cs.id, state, out.Usage); err != nil {
+			return err
 		}
-		back := e.t.Hot << min(attempt, 8)
-		if back > e.t.MaxBackoff {
-			back = e.t.MaxBackoff
+		if notify {
+			return addNotify(tx, pendingNotify{Turn: tr.ID, Conv: cs.id, Text: clipText(out.Final, 400)})
 		}
-		if attempt <= 3 || attempt%10 == 0 {
-			e.logf("finish turn %d failed (%d): %v; retry in %s", tr.ID, attempt, err, back)
-		}
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(back):
-		}
+		return nil
+	}) {
+		return
 	}
 	if state == store.TurnCompleted {
 		e.count(func(s *engineStats) { s.completed++ })
@@ -473,6 +467,41 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 	if notify {
 		e.notifyN.Add(1)
 		wake(e.notifyWake)
+	}
+}
+
+// commitFinish runs a turn's finish transaction. A failure (busy
+// database, full disk) is retried with backoff: the turn stays open and
+// the chat waits until it commits (review L1). It reports success.
+func (e *Engine) commitFinish(ctx context.Context, tr store.Turn, fn func(tx *store.Tx) error) bool {
+	for attempt := 1; ; attempt++ {
+		err := e.update(func(tx *store.Tx) error {
+			if e.cfg.finishFault != nil {
+				if err := e.cfg.finishFault(); err != nil {
+					return err
+				}
+			}
+			return fn(tx)
+		})
+		if err == nil {
+			return true
+		}
+		if finalStoreError(err) || ctx.Err() != nil {
+			e.logf("finish turn %d: %v", tr.ID, err)
+			return false
+		}
+		back := e.t.Hot << min(attempt, 8)
+		if back > e.t.MaxBackoff {
+			back = e.t.MaxBackoff
+		}
+		if attempt <= 3 || attempt%10 == 0 {
+			e.logf("finish turn %d failed (%d): %v; retry in %s", tr.ID, attempt, err, back)
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(back):
+		}
 	}
 }
 
@@ -509,7 +538,7 @@ func (e *Engine) capacityRetry(cs *convState, tr store.Turn, out TurnOutcome) bo
 		if err := tx.RequeueTurn(tr.ID, ms(deadline)); err != nil {
 			return err
 		}
-		if first {
+		if first && cs.id != e.inboxID { // the inbox carries protocol records only
 			return e.enqueueNotice(tx, cs.id, fmt.Sprintf("turn:%d:capacity", tr.ID),
 				"Codex is at capacity right now; the request will be retried automatically for up to 5 minutes.")
 		}
@@ -644,7 +673,7 @@ func (e *Engine) reconcile(ctx context.Context) {
 func (e *Engine) reconcileTurn(ctx context.Context, cs *convState, tr store.Turn) {
 	threadID := tr.ThreadID
 	if threadID == "" {
-		threadID = e.threadOf(cs.id)
+		threadID = e.turnThread(cs, tr)
 	}
 	rs := &runState{turnID: tr.ID, turnKey: tr.TurnKey, done: make(chan struct{})}
 	e.mu.Lock()
@@ -701,6 +730,11 @@ func (e *Engine) reconcileTurn(ctx context.Context, cs *convState, tr store.Turn
 }
 
 func (e *Engine) finishReconciled(ctx context.Context, cs *convState, tr store.Turn, out TurnOutcome) {
+	if cs.id == e.inboxID {
+		out.Capacity = false
+		e.finishDelegation(ctx, cs, tr, out, false)
+		return
+	}
 	if out.NotStarted && !out.Capacity && !out.ActiveWriter {
 		msgs, err := e.notice(fmt.Sprintf("turn:%d:notstarted", tr.ID), textNotStarted)
 		if err == nil {

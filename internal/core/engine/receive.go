@@ -227,6 +227,8 @@ type classified struct {
 	other     bool   // sent by someone else than the owner
 	chatter   bool   // someone else's message not addressed to Codex
 	resolved  bool   // resolved one of our unknown sends
+	// delegation is the id of a delegation request this engine takes (inbox).
+	delegation string
 }
 
 // admit classifies and persists one receive window and acts on the newly
@@ -257,15 +259,30 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 		hasFiles bool
 		stg      *admitStage
 	)
+	inbox := id == e.inboxID && id != 0
+	var cancels []string
 	err := e.update(func(tx *store.Tx) error {
-		jobs, newTurns, becameGr, trip, activity, hasFiles = nil, false, false, false, false, false
+		jobs, newTurns, becameGr, trip, activity, hasFiles, cancels = nil, false, false, false, false, false, nil
 		stg = &admitStage{recent: map[string]recentPrompt{}} // a retried attempt starts over
 		var cls []classified
 		byID := map[string]*classified{}
+		var iw *inboxWindow
+		if inbox {
+			var err error
+			if iw, err = e.scanInbox(tx, fresh, now); err != nil {
+				return err
+			}
+			cancels = iw.cancel
+		}
 		for _, m := range fresh {
 			c, keep, err := e.classify(tx, id, kind, group, m)
 			if err != nil {
 				return err
+			}
+			if inbox && keep {
+				if c, err = e.classifyInbox(tx, iw, c, now); err != nil {
+					return err
+				}
 			}
 			if c.resolved {
 				newTurns = true // the conversation may be runnable now
@@ -307,6 +324,20 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 				trip = true
 			}
 			switch {
+			case c.delegation != "" && a.TurnID != 0:
+				activity, newTurns = true, true
+				if err := e.admitDelegation(tx, id, a, c); err != nil {
+					return err
+				}
+			case c.delegation != "":
+				// Held (the inbox is paused): not taken; the request expires
+				// at the requester.
+				if err := tx.SetInbound(a.InboundID, store.InIgnored, 0); err != nil {
+					return err
+				}
+				if err := tx.SetMeta(metaDelegPrefix+c.delegation, "paused"); err != nil {
+					return err
+				}
 			case c.chatter && a.State == store.InQueued:
 				if err := tx.SetInbound(a.InboundID, store.InIgnored, 0); err != nil {
 					return err
@@ -367,6 +398,9 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 	}
 	if newTurns {
 		e.wakeRunner(id)
+	}
+	if len(cancels) > 0 {
+		e.cancelDelegations(ctx, cancels)
 	}
 	for _, j := range jobs {
 		select {
@@ -522,7 +556,7 @@ func (e *Engine) classify(tx *store.Tx, conv int64, kind string, group bool, m c
 	}
 	text := strings.TrimSpace(m.Text)
 	if conv == e.inboxID && conv != 0 {
-		// Delegation requests are not executed yet: recorded, never run.
+		// Inbox records: classifyInbox picks the requests this engine runs.
 		c.in.Kind, c.chatter = store.InCommand, true
 		return c, true, nil
 	}

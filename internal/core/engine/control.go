@@ -139,6 +139,9 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 		key = "control-" + e.prefix
 	}
 	inbox := id == e.inboxID
+	if inbox && e.cfg.InboxKey != "" {
+		key = e.cfg.InboxKey
+	}
 	info, err := e.ch.CreateChat(ctx, title, key)
 	if err != nil {
 		e.mu.Lock()

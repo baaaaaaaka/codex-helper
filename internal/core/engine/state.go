@@ -81,6 +81,9 @@ type runState struct {
 	// lastEvent is the unix ms of the last Codex event (silence tracking).
 	lastEvent atomic.Int64
 	done      chan struct{}
+	// request is the delegation request text of a delegated turn ("" for
+	// an ordinary turn).
+	request string
 }
 
 // bucket is a token bucket.

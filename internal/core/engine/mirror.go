@@ -252,7 +252,14 @@ func (e *Engine) newRollout(ctx context.Context, f transcript.Found) (store.Tran
 		forked = cs.forkParent != 0
 	}
 	forked = forked || e.forkThreads[meta.ID]
+	delegated := e.delegThreads[meta.ID]
 	e.mu.Unlock()
+	if delegated {
+		// A delegated task's thread: its result goes to the requester,
+		// it is not a local session (no chat of its own).
+		src.State = store.SrcIgnored
+		return src, true
+	}
 	switch {
 	case bound && closed:
 		src.State = store.SrcIgnored
@@ -315,7 +322,12 @@ func (e *Engine) promoteBaseline(ctx context.Context, f transcript.Found) {
 	}
 	e.mu.Lock()
 	conv, bound := e.byThread[meta.ID]
+	delegated := e.delegThreads[meta.ID]
 	e.mu.Unlock()
+	if delegated {
+		stay()
+		return
+	}
 	if bound {
 		if !e.convOpen(conv) {
 			return

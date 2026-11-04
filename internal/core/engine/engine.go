@@ -128,6 +128,16 @@ type Config struct {
 	ActivityScan bool
 	// Registry enables the cross-machine delegation inbox.
 	Registry bool
+	// Delegations decodes and builds inbox records; with Registry set the
+	// engine runs the requests addressed to this machine (nil: requests are
+	// recorded and never run).
+	Delegations Delegations
+	// DelegationDir is the working directory of delegated turns ("" = the
+	// home directory).
+	DelegationDir string
+	// InboxKey is the channel key of the inbox chat ("" = derived from the
+	// store); a registry publishes it so requesters find the same chat.
+	InboxKey string
 	// Skills runs the `skills` command (nil: not available).
 	Skills Skills
 
@@ -204,6 +214,7 @@ type Engine struct {
 	unknown      map[int64]*unknownState
 	gates        map[string]time.Time
 	forkThreads  map[string]bool  // forked threads: mirror from the end of the copied history
+	delegThreads map[string]bool  // Codex threads of delegated turns: never mirrored
 	reminded     map[int64]int    // queued turn id -> queue reminders posted (R-35)
 	intro        map[int64]string // first notice of a chat being created (mirror)
 	restart      restartConfirm   // confirmation owed for a `helper restart`
@@ -254,7 +265,7 @@ func New(cfg Config) (*Engine, error) {
 	e := &Engine{
 		cfg: cfg, st: cfg.Store, ch: timedChannel{cfg.Channel}, ag: cfg.Agent, t: cfg.Timing, log: cfg.Log, now: cfg.Now,
 		gRead: store.AccountReadGate(cfg.ChannelName), gWrite: store.AccountWriteGate(cfg.ChannelName),
-		convs: map[int64]*convState{}, intro: map[int64]string{}, forkThreads: map[string]bool{}, byChat: map[string]int64{}, byThread: map[string]int64{},
+		convs: map[int64]*convState{}, intro: map[int64]string{}, forkThreads: map[string]bool{}, delegThreads: map[string]bool{}, byChat: map[string]int64{}, byThread: map[string]int64{},
 		runnerWake: make(chan struct{}, 1), runnerDirty: map[int64]bool{},
 		senderWake: make(chan struct{}, 1), resolverWake: make(chan struct{}, 1),
 		mirrorWake: make(chan struct{}, 1), cmdQueue: make(chan cmdJob, 256), cmdPending: map[int64][]cmdJob{}, reminded: map[int64]int{}, asrWake: make(chan struct{}, 1), notifyWake: make(chan struct{}, 1), fileTries: map[string]int{}, uploadAt: map[int64]time.Time{},
@@ -423,6 +434,9 @@ func (e *Engine) start(ctx context.Context) error {
 		e.logf("%d sends in flight at the last stop are unknown; resolving by read-back", unknown)
 	}
 	if err := e.ensureInbox(); err != nil {
+		return err
+	}
+	if err := e.loadDelegThreads(); err != nil {
 		return err
 	}
 	if err := e.ensureControl(ctx); err != nil {

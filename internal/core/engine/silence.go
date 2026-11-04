@@ -65,6 +65,9 @@ func (e *Engine) watchSilence(ctx context.Context, cs *convState, tr store.Turn,
 }
 
 func (e *Engine) silenceNotice(conv int64, key, text string) {
+	if conv == e.inboxID {
+		return // the inbox carries protocol records only
+	}
 	if err := e.update(func(tx *store.Tx) error { return e.enqueueNotice(tx, conv, key, text) }); err != nil {
 		e.logf("silence hint in %d: %v", conv, err)
 		return
@@ -121,7 +124,7 @@ func (e *Engine) remindQueued() {
 		waited := now.Sub(fromMS(tr.QueuedAt))
 		n := int(waited / e.t.QueueReminder)
 		cs := e.conv(tr.ConvID)
-		if n < 1 || cs == nil {
+		if n < 1 || cs == nil || tr.ConvID == e.inboxID {
 			continue
 		}
 		e.mu.Lock()
