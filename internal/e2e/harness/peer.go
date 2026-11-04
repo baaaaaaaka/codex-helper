@@ -118,3 +118,6 @@ func clipTail(s string, n int) string {
 	}
 	return s
 }
+
+// Ctx is the scenario context (cancelled at cleanup).
+func (s *Scenario) Ctx() context.Context { return s.ctx }
