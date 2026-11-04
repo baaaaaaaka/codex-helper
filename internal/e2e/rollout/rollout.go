@@ -107,13 +107,6 @@ func Open(path, id, cwd string) *Writer {
 	return &Writer{Path: path, SessionID: id, Cwd: cwd, clock: time.Now().UTC(), realtime: true}
 }
 
-// Clock returns the timestamp of the last record written.
-func (w *Writer) Clock() time.Time {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return w.clock
-}
-
 func (w *Writer) tick() string {
 	w.clock = w.clock.Add(37 * time.Millisecond)
 	if w.realtime {

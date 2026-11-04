@@ -99,31 +99,3 @@ func Main(m *testing.M) {
 	}
 	os.Exit(code)
 }
-
-// Check returns a function that fails t when goroutines started during the
-// test are still running (call it deferred).
-func Check(t testing.TB) func() {
-	before := map[string]bool{}
-	for _, g := range interesting() {
-		before[firstLine(g)] = true
-	}
-	return func() {
-		t.Helper()
-		var left []string
-		for _, g := range Find(5 * time.Second) {
-			if !before[firstLine(g)] {
-				left = append(left, g)
-			}
-		}
-		if len(left) > 0 {
-			t.Errorf("leakcheck: %d leaked goroutine(s):\n\n%s", len(left), strings.Join(left, "\n\n"))
-		}
-	}
-}
-
-func firstLine(g string) string {
-	if i := strings.IndexByte(g, '\n'); i >= 0 {
-		return g[:i]
-	}
-	return g
-}

@@ -129,26 +129,6 @@ func scheduleTeamsPendingHelperActivationForReplacement(ctx context.Context, pen
 	return scheduleTeamsPendingHelperActivation(ctx, teamsPendingHelperActivationForReplacement(pendingPath, installPath))
 }
 
-func scheduleTeamsPendingHelperProcessRestart(ctx context.Context, pendingPath string, installPath string, args []string) error {
-	if teamsServiceGOOS() != "windows" {
-		return nil
-	}
-	activation := teamsPendingHelperActivationForReplacement(pendingPath, installPath)
-	if strings.TrimSpace(activation.PendingPath) == "" || strings.TrimSpace(activation.InstallPath) == "" {
-		return fmt.Errorf("pending helper process restart requires both pending and install paths")
-	}
-	var err error
-	activation, err = normalizeTeamsPendingHelperActivation(activation)
-	if err != nil {
-		return err
-	}
-	if err := writeTeamsPendingHelperActivationOwner(activation.PendingPath, activation.Version); err != nil {
-		return err
-	}
-	command := windowsTeamsPendingHelperProcessRestartPowerShell(activation.PendingPath, activation.InstallPath, activation.Version, args)
-	return teamsServiceStartDetached(ctx, teamsServicePowerShellExecutable(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-Command", command)
-}
-
 func normalizeTeamsPendingHelperActivation(activation teamsPendingHelperActivation) (teamsPendingHelperActivation, error) {
 	resolved, err := helperpath.StableInstallTarget(strings.TrimSpace(activation.InstallPath), "", "", helperpath.Options{GOOS: "windows"})
 	if err != nil {

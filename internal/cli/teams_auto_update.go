@@ -28,10 +28,6 @@ var teamsAutoUpdateListReleases = update.ListReleases
 var teamsAutoUpdateFetchReleaseIndex = update.FetchReleaseIndex
 var teamsAutoUpdateExecutable = func() (string, error) { return teamsServiceExecutable() }
 
-func newTeamsReleaseAutoUpdater(repo string, includePrerelease bool) selfupdate.Updater {
-	return teamsReleaseAutoUpdater{repo: repo, includePrerelease: includePrerelease}
-}
-
 func (u teamsReleaseAutoUpdater) Check(ctx context.Context, check selfupdate.Check) (selfupdate.Decision, error) {
 	now := check.Now
 	if now.IsZero() {
@@ -562,15 +558,6 @@ func persistedTeamsServiceXMLValue(text string, tag string) string {
 		return ""
 	}
 	return html.UnescapeString(strings.TrimSpace(text[start : start+end]))
-}
-
-func registryArgumentValue(args []string) string {
-	for i := 0; i+1 < len(args); i++ {
-		if args[i] == "--registry" {
-			return args[i+1]
-		}
-	}
-	return ""
 }
 
 func firstString(values []string) string {

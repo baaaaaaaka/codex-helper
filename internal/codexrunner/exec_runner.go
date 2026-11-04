@@ -78,25 +78,6 @@ func (r *ExecRunner) ResumeThread(ctx context.Context, threadID string, input Tu
 	return result, err
 }
 
-func (r *ExecRunner) StartTurn(ctx context.Context, input StartTurnInput) (TurnResult, error) {
-	if strings.TrimSpace(input.ThreadID) == "" {
-		return r.StartThread(ctx, input.TurnInput)
-	}
-	return r.ResumeThread(ctx, input.ThreadID, input.TurnInput)
-}
-
-func (r *ExecRunner) InterruptTurn(context.Context, TurnRef) error {
-	return unsupported("interrupt turn")
-}
-
-func (r *ExecRunner) ReadThread(context.Context, string) (Thread, error) {
-	return Thread{}, unsupported("read thread")
-}
-
-func (r *ExecRunner) ListThreads(context.Context, ListThreadsOptions) ([]Thread, error) {
-	return nil, unsupported("list threads")
-}
-
 type launchInput struct {
 	args         []string
 	prompt       string

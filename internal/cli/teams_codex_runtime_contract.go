@@ -29,12 +29,6 @@ type teamsCodexRuntimeResolver func(context.Context) (teamsCodexRuntimeContract,
 
 var ensureManagedTeamsCodexForRuntime = ensureManagedTeamsCodexRuntime
 
-func newTeamsCodexRuntimeResolver(root *rootOptions, rawCommand, workDir string, log io.Writer) teamsCodexRuntimeResolver {
-	return func(ctx context.Context) (teamsCodexRuntimeContract, error) {
-		return resolveTeamsCodexRuntimeContract(ctx, root, rawCommand, workDir, log)
-	}
-}
-
 func resolveTeamsCodexRuntimeContract(ctx context.Context, root *rootOptions, rawCommand, workDir string, log io.Writer) (teamsCodexRuntimeContract, error) {
 	store, paths, err := newRootStore(root, "")
 	if err != nil {

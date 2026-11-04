@@ -83,9 +83,6 @@ func (t *Tracker) Resume() (offset, line int64) {
 	return t.off, t.line
 }
 
-// LastTime is the timestamp of the newest record fed.
-func (t *Tracker) LastTime() time.Time { return t.last }
-
 // Restart rereads a rewritten file from its beginning. The caller drops
 // the outputs that were already delivered (by record id) and those before
 // the last delivered record (realignment by record id, §3.9).

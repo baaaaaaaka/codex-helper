@@ -138,12 +138,6 @@ func (s *Scenario) cleanup() {
 	s.Graph.Close()
 }
 
-// Ctx is cancelled when the scenario ends.
-func (s *Scenario) Ctx() context.Context { return s.ctx }
-
-// Remaining is the time left in the scenario budget.
-func (s *Scenario) Remaining() time.Duration { return time.Until(s.budget) }
-
 // StartSUT starts the SUT and fails the test if that is impossible.
 func (s *Scenario) StartSUT() {
 	s.T.Helper()

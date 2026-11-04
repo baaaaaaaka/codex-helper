@@ -82,15 +82,6 @@ func (e *statusError) Error() string {
 	return s
 }
 
-// StatusOf returns the HTTP status inside a classified Graph error, or 0.
-func StatusOf(err error) int {
-	var se *statusError
-	if errors.As(err, &se) {
-		return se.Status
-	}
-	return 0
-}
-
 func (g *graph) do(ctx context.Context, c call) (response, error) {
 	if c.write {
 		return g.once(ctx, c)

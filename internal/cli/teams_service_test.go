@@ -117,14 +117,6 @@ func teamsServiceTestAbsPath(t *testing.T, path string) string {
 	return out
 }
 
-func teamsServiceTestRegistryPath(cwd string, registryPath string) string {
-	registryPath = strings.TrimSpace(registryPath)
-	if filepath.IsAbs(registryPath) {
-		return registryPath
-	}
-	return filepath.Join(cwd, registryPath)
-}
-
 func assertTeamsServiceWindowsElevatedScriptCommand(t *testing.T, command string) {
 	t.Helper()
 	for _, want := range []string{
@@ -5908,10 +5900,6 @@ func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
 		teamsServiceTerminateLocalProcess = prevTerminateLocalProcess
 		teamsServiceLocalProcessGraceDelay = prevLocalProcessGraceDelay
 	})
-}
-
-func stringPtr(s string) *string {
-	return &s
 }
 
 func testEnvValue(env []string, key string) (string, bool) {

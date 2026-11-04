@@ -22,56 +22,6 @@ type cliReadOnlyFileSnapshot struct {
 	Data    string
 }
 
-func snapshotCLITreeForReadOnlyTest(t *testing.T, root string) map[string]cliReadOnlyFileSnapshot {
-	t.Helper()
-	out := make(map[string]cliReadOnlyFileSnapshot)
-	err := filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-		if !entry.Type().IsRegular() {
-			return nil
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return err
-		}
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			return err
-		}
-		out[rel] = cliReadOnlyFileSnapshot{Mode: info.Mode(), Size: info.Size(), ModTime: info.ModTime().UnixNano(), Data: string(data)}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("snapshot tree %s: %v", root, err)
-	}
-	return out
-}
-
-func assertCLIPathInList(t *testing.T, paths []string, want string) {
-	t.Helper()
-	for _, path := range paths {
-		if filepath.Clean(path) == filepath.Clean(want) {
-			return
-		}
-	}
-	t.Fatalf("path %q missing from %#v", want, paths)
-}
-
-func assertCLIPathNotInList(t *testing.T, paths []string, want string) {
-	t.Helper()
-	for _, path := range paths {
-		if filepath.Clean(path) == filepath.Clean(want) {
-			t.Fatalf("path %q unexpectedly present in %#v", want, paths)
-		}
-	}
-}
-
 func assertCLIFileContent(t *testing.T, path string, want string) {
 	t.Helper()
 	got, err := os.ReadFile(path)

@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -797,47 +796,6 @@ func TestTeamsRuntimeSafetySupervisorLogsCarryTimestampPIDAndComponentCI(t *test
 		!strings.Contains(line, "scope=") {
 		t.Fatalf("log line lacks required timestamp/PID/component/generation/scope metadata: %q", line)
 	}
-}
-
-func runtimeSafetyRequireStatusLine(t *testing.T, out string, prefix string, wants ...string) {
-	t.Helper()
-	for _, line := range strings.Split(out, "\n") {
-		if !strings.HasPrefix(line, prefix) {
-			continue
-		}
-		for _, want := range wants {
-			if !strings.Contains(line, want) {
-				t.Errorf("status line %q omitted %q", prefix, want)
-			}
-		}
-		return
-	}
-	t.Errorf("status output omitted line %q", prefix)
-}
-
-func makeCLITreesReadOnlyForTest(t *testing.T, roots ...string) {
-	t.Helper()
-	var readOnlyPaths []string
-	for _, root := range roots {
-		if err := filepath.Walk(root, func(path string, info os.FileInfo, walkErr error) error {
-			if walkErr != nil {
-				return walkErr
-			}
-			readOnlyPaths = append(readOnlyPaths, path)
-			if info.IsDir() {
-				return os.Chmod(path, 0o555)
-			}
-			return os.Chmod(path, 0o444)
-		}); err != nil {
-			t.Fatalf("make diagnostic store family read-only: %v", err)
-		}
-	}
-	t.Cleanup(func() {
-		sort.Slice(readOnlyPaths, func(i, j int) bool { return len(readOnlyPaths[i]) > len(readOnlyPaths[j]) })
-		for _, path := range readOnlyPaths {
-			_ = os.Chmod(path, 0o700)
-		}
-	})
 }
 
 func TestTeamsRuntimeSafetyLocalStatusNamesAutostartGuaranteesPreciselyCI(t *testing.T) {

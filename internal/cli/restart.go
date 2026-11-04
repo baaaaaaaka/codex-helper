@@ -120,18 +120,6 @@ func restartSelf() error {
 	return restartSelfWithResolvedExecutable(exe)
 }
 
-func restartSelfWithExecutable(path string) error {
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return restartSelf()
-	}
-	exe, err := resolveRestartExecutablePathFromSources(path, "")
-	if err != nil {
-		return err
-	}
-	return restartSelfWithResolvedExecutableAndEnv(exe, helperruntime.LauncherEnvironment(os.Environ()))
-}
-
 func restartSelfWithResolvedExecutable(exe string) error {
 	return restartSelfWithResolvedExecutableAndEnv(exe, os.Environ())
 }

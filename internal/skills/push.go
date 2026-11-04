@@ -9,7 +9,6 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 )
@@ -29,33 +28,6 @@ type PushLocalChangesResult struct {
 	Summary         string
 	Pushed          bool
 	NoStagedChanges bool
-}
-
-func GroupLocalChangesBySource(changes []LocalChange) map[string][]LocalChange {
-	grouped := map[string][]LocalChange{}
-	for _, change := range changes {
-		grouped[change.Source.ID] = append(grouped[change.Source.ID], change)
-	}
-	for id := range grouped {
-		sort.Slice(grouped[id], func(i, j int) bool {
-			if grouped[id][i].Skill.ExportName != grouped[id][j].Skill.ExportName {
-				return grouped[id][i].Skill.ExportName < grouped[id][j].Skill.ExportName
-			}
-			return grouped[id][i].RelPath < grouped[id][j].RelPath
-		})
-	}
-	return grouped
-}
-
-func SortedChangeSourceIDs(grouped map[string][]LocalChange) []string {
-	ids := make([]string, 0, len(grouped))
-	for id := range grouped {
-		ids = append(ids, id)
-	}
-	sort.Slice(ids, func(i, j int) bool {
-		return grouped[ids[i]][0].Source.Name < grouped[ids[j]][0].Source.Name
-	})
-	return ids
 }
 
 func ValidateLocalChangesForPush(source Source, changes []LocalChange) (string, error) {

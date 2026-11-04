@@ -461,21 +461,6 @@ func scheduleDelayedTeamsServiceStart(ctx context.Context, pendingReplacePath st
 	return teamsServiceStartDetached(ctx, name, args...)
 }
 
-func scheduleDelayedLocalSupervisorServiceRestart(ctx context.Context) error {
-	backend, err := teamsServiceBackendForCurrentPlatform()
-	if err != nil {
-		return err
-	}
-	if backend.ID() != teamsServiceLocalSupervisorID {
-		return fmt.Errorf("local-supervisor restart requested for Teams service backend %s", backend.ID())
-	}
-	name, args, err := delayedLocalSupervisorServiceCommand(backend, "restart")
-	if err != nil {
-		return err
-	}
-	return teamsServiceStartDetached(ctx, name, args...)
-}
-
 func defaultTeamsServiceStartDetached(_ context.Context, name string, args ...string) error {
 	cmd := exec.Command(name, args...)
 	configureTeamsServiceDetachedCommand(cmd)
