@@ -14,29 +14,21 @@ import (
 // internal/teams/store at v0.1.20 and v0.1.22-rc.59, which agree on every
 // field used here.
 
-// lbool accepts true/false, numbers (non-zero is true) and quoted forms. Old
-// stores contain at least one numeric last_offset_known (hazard: wrong type).
+// lbool accepts true/false, numbers (non-zero is true) and quoted forms;
+// anything else is false. It never fails, so one wrong-typed flag (old stores
+// contain a numeric last_offset_known) never makes a whole row unparsable.
 type lbool bool
 
 func (b *lbool) UnmarshalJSON(p []byte) error {
-	s := strings.Trim(string(bytes.TrimSpace(p)), `"`)
-	switch strings.ToLower(s) {
-	case "true":
-		*b = true
-	case "false", "", "null":
-		*b = false
-	default:
-		f, err := strconv.ParseFloat(s, 64)
-		if err != nil {
-			return errors.New("bool: " + s)
-		}
+	s := strings.ToLower(strings.Trim(string(bytes.TrimSpace(p)), `"`))
+	if f, err := strconv.ParseFloat(s, 64); err == nil {
 		*b = f != 0
+		return nil
 	}
+	*b = s == "true" || s == "yes"
 	return nil
 }
 
-// ltime is a legacy RFC 3339 time. Zero ("0001-01-01T00:00:00Z"), empty,
-// null and unparsable values decode to the zero time without an error.
 type ltime struct{ time.Time }
 
 func (t *ltime) UnmarshalJSON(p []byte) error {
@@ -154,6 +146,8 @@ type legacyOutbox struct {
 	SentAt                       ltime  `json:"sent_at"`
 	NextAttemptAt                ltime  `json:"next_attempt_at"`
 	SendAttemptToken             string `json:"send_attempt_token"`
+	RenderedHash                 string `json:"rendered_hash"`
+	LastSendError                string `json:"last_send_error"`
 }
 
 // unknownOutcome reports whether the old row's send outcome is unknown:

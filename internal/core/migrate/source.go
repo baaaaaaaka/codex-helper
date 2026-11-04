@@ -276,7 +276,7 @@ func openSource(dir string, version Version, dbPath string, immutable bool, snap
 		read = filepath.Join(snapDir, "source.sqlite")
 		_ = os.Remove(read)
 		if err := backup(dbPath, read); err != nil {
-			return nil, fmt.Errorf("snapshot: %w", err)
+			return nil, fmt.Errorf("snapshot %s (the source directory must be writable for SQLite's -shm file, or pass --immutable on a checkpointed copy): %w", dbPath, err)
 		}
 	}
 	q := url.Values{}

@@ -418,9 +418,11 @@ func (c *converter) convertForks() error {
 
 func terminalTurn(s string) bool { return s == "completed" || s == "failed" || s == "interrupted" }
 
+// scanTurns indexes every turn. All of them are imported (no retention, §6):
+// queued stays queued, running becomes interrupted, terminal rows keep their
+// state, timestamps and model.
 func (c *converter) scanTurns() error {
 	e := c.rep.E("turns")
-	latest := map[int64]*compactTurn{}
 	err := c.l.each("turns", func(r row) error {
 		e.Source++
 		var t legacyTurn
@@ -439,26 +441,20 @@ func (c *converter) scanTurns() error {
 			e.Outcomes["session unknown -> dropped"]++
 			return nil
 		}
+		ct.keep = true
 		switch t.Status {
 		case "queued":
-			ct.keep, ct.newStat = true, store.TurnQueued
+			ct.newStat = store.TurnQueued
 		case "running":
-			ct.keep, ct.newStat = true, store.TurnInterrupted
+			ct.newStat = store.TurnInterrupted
 		default:
-			if !terminalTurn(t.Status) {
-				e.Outcomes["unknown status -> dropped"]++
-				return nil
-			}
 			ct.newStat = t.Status
-			if l := latest[conv]; l == nil || ct.order > l.order || (ct.order == l.order && t.ID > l.t.ID) {
-				latest[conv] = ct
+			if !terminalTurn(t.Status) {
+				ct.newStat = store.TurnFailed
 			}
 		}
 		return nil
 	})
-	for _, ct := range latest {
-		ct.keep = true
-	}
 	return err
 }
 
@@ -488,10 +484,15 @@ func (c *converter) inboundDisposition(in legacyInbound, conv int64) (state, out
 		if in.TurnID != "" {
 			return store.InDone, in.Status + " with a missing turn -> done"
 		}
-		if in.Status == "persisted" && in.Source == "registry_migration" {
-			return store.InDone, "registry_migration -> done"
+		if in.Status == "persisted" {
+			if in.Source == "registry_migration" {
+				return store.InDone, "registry_migration -> done"
+			}
+			return store.InDone, "persisted without a turn -> done"
 		}
-		return store.InHeld, in.Status + " without a turn -> held"
+		// queued/deferred and never run: queued, in order (a prompt gets its
+		// queued turn exactly as admission would create it).
+		return store.InQueued, in.Status + " without a turn -> queued"
 	}
 	return store.InHeld, "status " + in.Status + " -> held"
 }
@@ -513,11 +514,9 @@ func (c *converter) convertInbound() error {
 		if _, err := decode(r.JSON, &in); err != nil {
 			e.Failed = append(e.Failed, r.ID)
 			in = legacyInbound{ID: r.ID, SessionID: r.Cols["session_id"], TeamsChatID: r.Cols["teams_chat_id"], TeamsMessageID: r.Cols["teams_message_id"], Status: r.Status}
-			if in.Status == "ignored" || in.Status == "persisted" {
-				e.Outcomes["unparsable terminal -> skipped"]++
-				return nil
+			if in.Status != "ignored" && in.Status != "persisted" {
+				in.Status = "uncertain" // non-terminal and unreadable: hold
 			}
-			in.Status = "uncertain" // non-terminal and unreadable: hold
 		}
 		conv, ok := c.convOf(in.SessionID, in.TeamsChatID)
 		if !ok {
@@ -534,10 +533,7 @@ func (c *converter) convertInbound() error {
 		if state == store.InIgnored {
 			sender = store.SenderOther
 		}
-		body := ""
-		if state == store.InHeld || state == store.InQueued {
-			body = in.Text
-		}
+		body := in.Text // kept for every row (§6: nothing is blanked)
 		recv := firstNonZero(ms(in.ReceivedAt), ms(in.CreatedAt), c.ms())
 		row := store.Inbound{ConvID: conv, ExtMsgID: ext, ExtTime: extTime(in.TeamsMessageID, recv), ReceivedAt: recv,
 			Sender: sender, Kind: kind, State: state, Body: body}
@@ -560,6 +556,11 @@ func (c *converter) convertInbound() error {
 			c.oldestIn[conv] = row.ExtTime
 		}
 		if t := c.turns[in.TurnID]; t != nil && t.keep && t.conv == conv {
+			c.inboundOld[in.ID] = id
+		} else if state == store.InQueued && kind == store.InPrompt {
+			key := "inbound:" + in.ID
+			c.turns[key] = &compactTurn{t: legacyTurn{ID: key, SessionID: in.SessionID, InboundEventID: in.ID, Status: "queued"},
+				conv: conv, order: row.ExtTime, keep: true, newStat: store.TurnQueued}
 			c.inboundOld[in.ID] = id
 		}
 		return nil
@@ -653,20 +654,16 @@ func (c *converter) convertTurns() error {
 				return err
 			}
 		}
-		e.Imported++
 		switch {
+		case strings.HasPrefix(t.ID, "inbound:"):
+			c.rep.E("inbound_events").Outcomes["queued turn created for a never-run prompt"]++
+			continue
 		case t.Status == "running":
 			e.Outcomes["running -> interrupted (+notice)"]++
-		case t.Status == "queued":
-			e.Outcomes["queued -> "+state]++
 		default:
-			e.Outcomes["latest terminal kept"]++
+			e.Outcomes[firstNonEmpty(t.Status, "(empty)")+" -> "+state]++
 		}
-	}
-	for _, ct := range c.turns {
-		if !ct.keep && terminalTurn(ct.t.Status) && ct.conv != 0 {
-			e.Outcomes["older terminal -> dropped"]++
-		}
+		e.Imported++
 	}
 	return nil
 }
@@ -771,12 +768,14 @@ func (c *converter) convertOutbox() error {
 		var o legacyOutbox
 		opaque := false
 		if _, err := decode(r.JSON, &o); err != nil {
+			// Unparsable: keep the key from the columns. A terminal row stays
+			// terminal (its key still dedupes); anything else is unknown.
 			e.Failed = append(e.Failed, r.ID)
-			if r.Status == "sent" || r.Status == "skipped" {
-				e.Outcomes["unparsable terminal -> skipped"]++
-				return nil
+			status := r.Status
+			if status != "sent" && status != "skipped" {
+				status = "sending"
 			}
-			o = legacyOutbox{ID: r.ID, SessionID: r.Cols["session_id"], TeamsChatID: r.Cols["teams_chat_id"], TeamsMessageID: r.Cols["teams_message_id"], Status: "sending"}
+			o = legacyOutbox{ID: r.ID, SessionID: r.Cols["session_id"], TeamsChatID: r.Cols["teams_chat_id"], TeamsMessageID: r.Cols["teams_message_id"], Status: status}
 			opaque = true
 		}
 		if o.ID == "" {
@@ -810,9 +809,6 @@ func (c *converter) convertOutbox() error {
 		default:
 			st = store.OutUnknown
 			c.unknownSrc++
-		}
-		if st == store.OutSent || st == store.OutDropped {
-			o.Body = ""
 		}
 		byConv[conv] = append(byConv[conv], &compactOut{o: o, conv: conv, state: st, opaque: opaque})
 		return nil
@@ -848,6 +844,13 @@ func (c *converter) convertOutbox() error {
 				ConvID: conv, DeliveryKey: "legacy-outbox:" + o.ID, Seq: seq, Kind: outboxKind(o.Kind),
 				Part: o.PartIndex, Parts: o.PartCount, Body: o.Body, Mention: bool(o.MentionOwner), ReplyTo: o.QuoteReplyToMessageID,
 				State: co.state, ExtMsgID: o.TeamsMessageID, CreatedAt: firstNonZero(ms(o.CreatedAt), c.ms()), SentAt: ms(o.SentAt),
+				BodyHash: renderedHash(o.RenderedHash),
+			}
+			switch {
+			case co.opaque && co.state != store.OutUnknown:
+				row.Note = "migrated: unparsable legacy row (" + o.Status + "); key kept"
+			case co.state == store.OutDropped:
+				row.Note = "legacy skipped: " + firstNonEmpty(o.LastSendError, "(no reason recorded)")
 			}
 			if co.state == store.OutUnknown || co.state == store.OutQueued {
 				row.AttemptToken = o.SendAttemptToken
@@ -905,6 +908,16 @@ func (c *converter) convertOutbox() error {
 		c.rep.E("outbox_messages").Outcomes["interruption notice added"]++
 	}
 	return nil
+}
+
+// renderedHash decodes the legacy rendered_hash (hex sha256 of the rendered
+// text) into body_hash; anything else is left NULL.
+func renderedHash(h string) []byte {
+	b, err := hex.DecodeString(strings.TrimSpace(h))
+	if err != nil || len(b) != sha256.Size {
+		return nil
+	}
+	return b
 }
 
 func (c *converter) markExt(conv int64, ext string) {
@@ -1011,32 +1024,27 @@ func (c *converter) convertNotifications() error {
 		var n legacyNotification
 		if _, err := decode(r.JSON, &n); err != nil {
 			e.Failed = append(e.Failed, r.ID)
-			e.Outcomes["unparsable -> dropped"]++
-			return nil
+			n = legacyNotification{ID: r.ID, Status: "unparsable"}
 		}
 		if n.ID == "" {
 			n.ID = r.ID
 		}
-		var st string
+		// Every row is kept (§6). Cards are at-most-once, so anything that
+		// is not queued or sent becomes dropped and is never re-sent.
+		st := store.OutDropped
 		switch n.Status {
 		case "queued":
 			st = store.OutQueued
 		case "sent":
 			st = store.OutSent
-		default:
-			e.Outcomes[firstNonEmpty(n.Status, "(empty)")+" -> dropped (at-most-once)"]++
-			return nil
 		}
-		payload := ""
-		if st == store.OutQueued {
-			payload = strings.TrimSpace(strings.Join([]string{n.Title, n.ChatTitle, n.RequestSummary, n.ButtonURL}, "\n"))
-		}
+		payload := strings.TrimSpace(strings.Join([]string{n.Title, n.ChatTitle, n.RequestSummary, n.ButtonURL}, "\n"))
 		if err := c.im.Notification(store.Notification{Key: "legacy:" + n.ID, Payload: payload, State: st,
 			CreatedAt: firstNonZero(ms(n.CreatedAt), c.ms()), SentAt: ms(n.SentAt)}); err != nil {
 			return err
 		}
 		e.Imported++
-		e.Outcomes[n.Status+" -> "+st]++
+		e.Outcomes[firstNonEmpty(n.Status, "(empty)")+" -> "+st]++
 		return nil
 	})
 }

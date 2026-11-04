@@ -101,7 +101,9 @@ func (c *converter) convertSources() error {
 		} else if conv, ok := c.convOf(cp.SessionID, ""); ok && conv != c.control {
 			p.convs[conv] = true
 		}
-		if bool(cp.LastOffsetKnown) && cp.LastOffset > 0 {
+		// rc.59 itself treats "last_offset_known || last_offset > 0" as known;
+		// the flag only distinguishes a trusted zero, which is no resume point.
+		if cp.LastOffset > 0 {
 			p.cands = append(p.cands, offsetCand{rank: 1, src: "checkpoint", offset: cp.LastOffset, line: cp.LastSourceLine})
 		}
 		if cp.SourceSize > 0 && cp.Status == "complete" {
