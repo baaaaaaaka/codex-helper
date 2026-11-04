@@ -146,11 +146,13 @@ var schemaV1 = []string{
   created_at      INTEGER NOT NULL,
   sent_at         INTEGER,
   note            TEXT,
+  hash_algo       TEXT CHECK (hash_algo IN ('legacy')), -- NULL: the channel adapter's hash; 'legacy': imported, re-hash at first start
   UNIQUE (conv_id, seq)
 )`,
 	`CREATE INDEX outbox_pending ON outbox(conv_id, seq) WHERE state IN ('queued','sending','unknown')`,
 	`CREATE INDEX outbox_ext ON outbox(conv_id, ext_msg_id) WHERE ext_msg_id IS NOT NULL`,
 	`CREATE INDEX outbox_hash ON outbox(conv_id, body_hash) WHERE state IN ('sending','sent','unknown')`,
+	`CREATE INDEX outbox_legacy_hash ON outbox(id) WHERE hash_algo IS NOT NULL`,
 
 	`CREATE TABLE outbox_files (
   outbox_id         INTEGER PRIMARY KEY REFERENCES outbox(id),
@@ -190,6 +192,7 @@ var schemaV1 = []string{
 	`CREATE TABLE notifications (
   id         INTEGER PRIMARY KEY,
   key        TEXT NOT NULL UNIQUE,
+  kind       TEXT NOT NULL,
   payload    TEXT NOT NULL,
   state      TEXT NOT NULL CHECK (state IN ('queued','sending','sent','unknown','dropped')),
   created_at INTEGER NOT NULL,
