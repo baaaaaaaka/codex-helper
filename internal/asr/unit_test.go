@@ -151,9 +151,9 @@ func TestCommandBackend(t *testing.T) {
 	if err != nil || res.Text != voice || res.Backend != "command" || res.Language != "auto" {
 		t.Fatalf("default args: %+v %v", res, err)
 	}
-	c := NewCommand(cmd, []string{"--in={input}", "{name}", "{language}", "{speed}", "{threads}"})
-	res, err = c.Transcribe(t.Context(), Request{Path: voice, Name: "Voice note.ogg", Language: "zh"})
-	if err != nil || res.Text != "--in="+voice+" Voice note.ogg zh 1.25x 4" {
+	c := NewCommand(cmd, []string{"--in={input}", "{name}", "{language}", "{speed}", "{threads}", "{source_index}"})
+	res, err = c.Transcribe(t.Context(), Request{Path: voice, Name: "Voice note.ogg", Language: "zh", Index: 2})
+	if err != nil || res.Text != "--in="+voice+" Voice note.ogg zh 1.25x 4 2" {
 		t.Fatalf("placeholders: %+v %v", res, err)
 	}
 

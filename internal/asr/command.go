@@ -19,8 +19,8 @@ const DefaultCommandTimeout = 15 * time.Minute
 // prints either plain text or JSON {"text","language","model","backend"}.
 //
 // Args may use the placeholders {input} (= {path}), {prompt_path}, {name},
-// {content_type}, {language}, {speed} and {threads}. With no Args the media
-// path is the only argument.
+// {content_type}, {language}, {speed}, {threads} and {source_index}, as
+// before. With no Args the media path is the only argument.
 type Command struct {
 	Path    string
 	Args    []string
@@ -58,6 +58,7 @@ func (c *Command) Transcribe(ctx context.Context, req Request) (Result, error) {
 		"{input}", req.Path, "{path}", req.Path, "{prompt_path}", req.displayName(),
 		"{name}", req.displayName(), "{content_type}", req.ContentType,
 		"{language}", req.language(), "{speed}", "1.25x", "{threads}", strconv.Itoa(MaxThreads),
+		"{source_index}", strconv.Itoa(req.Index),
 	)
 	args := []string{req.Path}
 	if len(c.Args) > 0 {
@@ -71,6 +72,7 @@ func (c *Command) Transcribe(ctx context.Context, req Request) (Result, error) {
 		"CODEX_HELPER_TEAMS_ASR_LANGUAGE=" + req.language(),
 		"CODEX_HELPER_TEAMS_ASR_SPEED=1.25x",
 		"CODEX_HELPER_TEAMS_ASR_THREADS=" + strconv.Itoa(MaxThreads),
+		"CODEX_HELPER_TEAMS_ASR_SOURCE_INDEX=" + strconv.Itoa(req.Index),
 	}, c.Env...)...)
 	stdout, stderr, err := run(ctx, cmd)
 	if err != nil {

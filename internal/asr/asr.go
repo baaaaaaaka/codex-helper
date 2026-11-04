@@ -32,6 +32,7 @@ type Request struct {
 	Name        string      // display name (defaults to the base name of Path)
 	ContentType string      // MIME type as received, may be empty
 	Language    string      // language hint; "" means DefaultLanguage
+	Index       int         // position of the attachment in its message ({source_index})
 	Notify      func(Event) // optional; receives progress events for this request
 }
 
