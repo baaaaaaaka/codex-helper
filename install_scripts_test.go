@@ -458,8 +458,8 @@ func TestReadmeTeamsSetupDoesNotRequirePrerelease(t *testing.T) {
 	for _, required := range []string{
 		"Teams helper is available in stable releases.",
 		"codex-proxy upgrade",
-		"helper update now",
-		"Use `helper update prerelease` only when you intentionally want the newest\npre-release.",
+		"update now",
+		"Use `update prerelease` only when you intentionally want the newest\npre-release.",
 	} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("README missing stable Teams setup guidance %q", required)
