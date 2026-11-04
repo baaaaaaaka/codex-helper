@@ -158,7 +158,8 @@ def transcript_diff(a, horizon, ex):
 
     res = {"old_posted_records_by_kind": collections.Counter(), "new_posted_by_kind": collections.Counter(),
            "selection": collections.Counter(), "render": collections.defaultdict(collections.Counter),
-           "old_skips_all_ages": dict(old_skips)}
+           "old_skips_all_ages": dict(old_skips),
+           "old_only_by_conv": collections.Counter()}
     # index old by (conv, U/F, normalized text) -> list
     idx = collections.defaultdict(list)
     for key, r in old.items():
@@ -211,6 +212,7 @@ def transcript_diff(a, horizon, ex):
         for r in rs:
             if id(r) not in used:
                 res["selection"]["%s:old-only" % key[1]] += 1
+                res["old_only_by_conv"]["%s:%s" % (r["conv"], key[1])] += 1
                 k = "old-only-" + key[1]
                 if len(ex[k]) < 8:
                     ex[k].append({"conv": r["conv"], "line": r["line"], "turn": r["turn"], "src": r["src"], "text": r["body"][:200]})
