@@ -53,24 +53,30 @@ type Options struct {
 	NoStart    bool
 	// SUTEnv is passed to a subprocess SUT (see SUTConfig.ExtraEnv).
 	SUTEnv map[string]string
+	// WorkflowWebhook gives the owner a Teams Workflow webhook (served by
+	// the fake, see fakegraph.NewWorkflowWebhook) that the SUT is
+	// configured with before it starts (SUTConfig.WorkflowWebhookURL).
+	WorkflowWebhook bool
 }
 
 // Scenario owns one isolated run.
 type Scenario struct {
-	T       *testing.T
-	ID      string
-	Opts    Options
-	Graph   *fakegraph.Server
-	Env     *Env
-	Codex   *FakeCodex
-	SUT     SUT
-	started time.Time
-	budget  time.Time
-	checks  []Check
-	notes   []string
-	dumped  bool
-	ctx     context.Context
-	cancel  context.CancelFunc
+	T     *testing.T
+	ID    string
+	Opts  Options
+	Graph *fakegraph.Server
+	Env   *Env
+	Codex *FakeCodex
+	SUT   SUT
+	// WorkflowWebhookURL is the owner's webhook when Options.WorkflowWebhook.
+	WorkflowWebhookURL string
+	started            time.Time
+	budget             time.Time
+	checks             []Check
+	notes              []string
+	dumped             bool
+	ctx                context.Context
+	cancel             context.CancelFunc
 }
 
 // DefaultFactory is used when Options.Factory is nil. The scenarios package
@@ -101,7 +107,10 @@ func NewScenario(t *testing.T, id string, opts Options) *Scenario {
 		T: t, ID: id, Opts: opts, Graph: g, Env: env, Codex: codex,
 		started: time.Now(), budget: time.Now().Add(opts.Budget), ctx: ctx, cancel: cancel,
 	}
-	sut, err := opts.Factory(SUTConfig{Env: env, Graph: g, Codex: codex, Interval: opts.Interval, ExtraEnv: opts.SUTEnv, Logf: t.Logf})
+	if opts.WorkflowWebhook {
+		s.WorkflowWebhookURL = g.NewWorkflowWebhook()
+	}
+	sut, err := opts.Factory(SUTConfig{Env: env, Graph: g, Codex: codex, Interval: opts.Interval, ExtraEnv: opts.SUTEnv, WorkflowWebhookURL: s.WorkflowWebhookURL, Logf: t.Logf})
 	if err != nil {
 		t.Fatalf("build SUT: %v", err)
 	}

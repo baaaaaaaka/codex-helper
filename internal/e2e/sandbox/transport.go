@@ -84,7 +84,9 @@ func (tr *Transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 	host := strings.ToLower(req.URL.Hostname())
 	switch host {
-	case "graph.microsoft.com", "login.microsoftonline.com":
+	case "graph.microsoft.com", "login.microsoftonline.com", fakegraph.SharePointHost, fakegraph.WorkflowHost:
+		// SharePointHost serves drive upload-session URLs; WorkflowHost the
+		// fake Teams Workflow webhook. Both live in the fake server.
 	default:
 		tr.onBlocked(fakegraph.BlockedRequest{At: time.Now(), Instance: tr.instance, URL: req.URL.Redacted()})
 		if req.Body != nil {

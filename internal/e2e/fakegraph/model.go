@@ -202,6 +202,32 @@ func (m *Message) toGraph() map[string]any {
 	return out
 }
 
+// previewLocked returns the newest message stored at or before visibleBefore,
+// i.e. what lastMessagePreview shows under the configured preview lag.
+func (c *Chat) previewLocked(visibleBefore time.Time) *Message {
+	for i := len(c.Messages) - 1; i >= 0; i-- {
+		if !c.Messages[i].Created.After(visibleBefore) {
+			return c.Messages[i]
+		}
+	}
+	return nil
+}
+
+// previewGraph renders a message as a chatMessageInfo (the type of
+// chat.lastMessagePreview).
+func (m *Message) previewGraph() map[string]any {
+	full := m.toGraph()
+	return map[string]any{
+		"id":              m.ID,
+		"createdDateTime": formatTime(m.Created),
+		"isDeleted":       false,
+		"messageType":     m.MessageType,
+		"eventDetail":     full["eventDetail"],
+		"body":            full["body"],
+		"from":            full["from"],
+	}
+}
+
 func rawList(items []json.RawMessage) []any {
 	out := make([]any, 0, len(items))
 	for _, item := range items {
