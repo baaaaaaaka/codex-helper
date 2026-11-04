@@ -138,16 +138,3 @@ WHERE state IN ('queued','starting','running') AND state = 'queued' ORDER BY con
 	}
 	return out, rows.Err()
 }
-
-// ReplaceQueuedBody replaces the body and hash of a queued outbox row (the
-// engine folds a later notice into one that has not been sent yet). A row
-// in any other state (sending, unknown, settled) or an imported legacy row
-// is never changed: it fails with ErrState.
-func (t *Tx) ReplaceQueuedBody(id int64, body string, hash []byte) error {
-	n, err := affected(t.exec(`UPDATE outbox SET body = ?, body_hash = ? WHERE id = ? AND state = 'queued' AND hash_algo IS NULL`,
-		nullStr(body), hash, id))
-	if err == nil && n == 0 {
-		err = fmt.Errorf("%w: outbox %d is not a queued row", ErrState, id)
-	}
-	return err
-}

@@ -1,7 +1,6 @@
 package store
 
 import (
-	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -117,59 +116,4 @@ WHERE state IN ('queued','starting','running') AND state = 'queued' ORDER BY con
 	if !strings.Contains(plan, "turns_open") {
 		t.Errorf("query plan %q does not use turns_open", plan)
 	}
-}
-
-func TestReplaceQueuedBodyChangesOnlyAQueuedRow(t *testing.T) {
-	s, _ := openTest(t)
-	a := newWork(t, s, "a")
-	var rows []Outbox
-	mustT(t, s.Update(func(tx *Tx) error {
-		if _, err := tx.Enqueue(a, []OutMsg{out("k1", OutAck)}); err != nil {
-			return err
-		}
-		var err error
-		rows, err = tx.PendingOutbox(a)
-		return err
-	}))
-	mustT(t, s.Update(func(tx *Tx) error {
-		return tx.ReplaceQueuedBody(rows[0].ID, "folded", []byte{7})
-	}))
-	mustT(t, s.Update(func(tx *Tx) error {
-		r, _, err := tx.Outbox(rows[0].ID)
-		if err != nil {
-			return err
-		}
-		if r.Body != "folded" || string(r.BodyHash) != "\x07" || r.State != OutQueued || r.DeliveryKey != "k1" || r.Seq != rows[0].Seq {
-			t.Errorf("replaced row = %+v", r)
-		}
-		if _, err := tx.BeginSend(rows[0].ID); err != nil {
-			return err
-		}
-		if err := tx.ReplaceQueuedBody(rows[0].ID, "late", nil); !errors.Is(err, ErrState) {
-			t.Errorf("replace of a sending row: %v, want ErrState", err)
-		}
-		if err := tx.MarkUnknown(rows[0].ID, "timeout"); err != nil {
-			return err
-		}
-		if err := tx.ReplaceQueuedBody(rows[0].ID, "late", nil); !errors.Is(err, ErrState) {
-			t.Errorf("replace of an unknown row: %v, want ErrState", err)
-		}
-		if err := tx.MarkSent(rows[0].ID, "x1"); err != nil {
-			return err
-		}
-		if err := tx.ReplaceQueuedBody(rows[0].ID, "late", nil); !errors.Is(err, ErrState) {
-			t.Errorf("replace of a sent row: %v, want ErrState", err)
-		}
-		if err := tx.ReplaceQueuedBody(rows[0].ID+100, "late", nil); !errors.Is(err, ErrState) {
-			t.Errorf("replace of a missing row: %v, want ErrState", err)
-		}
-		r, _, err = tx.Outbox(rows[0].ID)
-		if err != nil {
-			return err
-		}
-		if r.Body != "folded" {
-			t.Errorf("settled row body = %q, want unchanged", r.Body)
-		}
-		return nil
-	}))
 }
