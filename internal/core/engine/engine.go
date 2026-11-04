@@ -113,6 +113,8 @@ type Config struct {
 	ActivityScan bool
 	// Registry enables the cross-machine delegation inbox.
 	Registry bool
+	// Skills runs the `skills` command (nil: not available).
+	Skills Skills
 
 	Readers, Senders, Turns int
 	// ReadRate caps chat reads per second account-wide (token bucket).
@@ -174,6 +176,7 @@ type Engine struct {
 	sendFailures map[int64]int
 	unknown      map[int64]*unknownState
 	gates        map[string]time.Time
+	forkThreads  map[string]bool  // forked threads: mirror from the end of the copied history
 	intro        map[int64]string // first notice of a chat being created (mirror)
 	restart      restartConfirm   // confirmation owed for a `helper restart`
 	stats        engineStats
@@ -222,7 +225,7 @@ func New(cfg Config) (*Engine, error) {
 	}
 	e := &Engine{
 		cfg: cfg, st: cfg.Store, ch: cfg.Channel, ag: cfg.Agent, t: cfg.Timing, log: cfg.Log, now: cfg.Now,
-		convs: map[int64]*convState{}, intro: map[int64]string{}, byChat: map[string]int64{}, byThread: map[string]int64{},
+		convs: map[int64]*convState{}, intro: map[int64]string{}, forkThreads: map[string]bool{}, byChat: map[string]int64{}, byThread: map[string]int64{},
 		runnerWake: make(chan struct{}, 1), runnerDirty: map[int64]bool{},
 		senderWake: make(chan struct{}, 1), resolverWake: make(chan struct{}, 1),
 		mirrorWake: make(chan struct{}, 1), cmdQueue: make(chan cmdJob, 256), asrWake: make(chan struct{}, 1), fileTries: map[string]int{}, uploadAt: map[int64]time.Time{},
@@ -435,6 +438,7 @@ func (e *Engine) load() error {
 		if cs := e.convs[th.ConvID]; cs != nil {
 			cs.cwd = th.Cwd
 			cs.threadID = th.ThreadID
+			cs.forkParent = th.ForkParent
 			if th.ThreadID != "" {
 				e.byThread[th.ThreadID] = th.ConvID
 			}
@@ -485,7 +489,8 @@ func (e *Engine) conv(id int64) *convState {
 	return e.convs[id]
 }
 
-// Stats is a snapshot for `helper status` and tests.
+// Stats is a snapshot for `helper status` and tests. Conversations counts
+// work sessions only (not the control chat or the delegation inbox).
 type Stats struct {
 	Conversations, Active, Parked, Running int
 	Turns, Completed, Reads, Sends         int
@@ -497,6 +502,9 @@ func (e *Engine) Snapshot() Stats {
 	e.mu.Lock()
 	var s Stats
 	for _, c := range e.convs {
+		if c.id == e.controlID || c.id == e.inboxID {
+			continue // not sessions
+		}
 		s.Conversations++
 		switch c.state {
 		case store.ConvActive:

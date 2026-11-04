@@ -215,10 +215,12 @@ func (e *Engine) newRollout(ctx context.Context, f transcript.Found) (store.Tran
 	}
 	e.mu.Lock()
 	conv, bound := e.byThread[meta.ID]
-	var closed bool
+	var closed, forked bool
 	if cs := e.convs[conv]; bound && cs != nil {
 		closed = cs.state == store.ConvClosed
+		forked = cs.forkParent != 0
 	}
+	forked = forked || e.forkThreads[meta.ID]
 	e.mu.Unlock()
 	switch {
 	case bound && closed:
@@ -226,6 +228,11 @@ func (e *Engine) newRollout(ctx context.Context, f transcript.Found) (store.Tran
 		return src, true
 	case bound:
 		src.State, src.ConvID = store.SrcTracking, conv
+		if forked {
+			// A fork's rollout starts with a copy of the parent's history,
+			// which is already in the parent chat.
+			src.Offset = f.Info.Size
+		}
 		e.track(src)
 		return store.TranscriptSource{}, false
 	case e.mirror.first && f.Info.MTime.Before(e.mirror.startedAt):

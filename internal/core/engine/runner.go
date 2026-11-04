@@ -399,6 +399,9 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 		if err := tx.FinishTurn(tr.ID, state, errText, msgs); err != nil {
 			return err
 		}
+		if err := recordUsage(tx, cs.id, state, out.Usage); err != nil {
+			return err
+		}
 		if len(mention) > 0 {
 			_, err := tx.Enqueue(e.controlID, mention)
 			return err

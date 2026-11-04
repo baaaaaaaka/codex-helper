@@ -118,6 +118,10 @@ const controlHelp = "Commands in this chat:\n\n" +
 	"- `list`: list sessions\n" +
 	"- `r <session>`: wake a parked session (for example `r s003`)\n" +
 	"- `park <session>`: stop reading a session's chat until woken\n" +
+	"- `fork <session>`: copy a session into a new work chat\n" +
+	"- `model`: list the models Codex offers\n" +
+	"- `stats`: requests and token usage of all sessions\n" +
+	"- `skills`: list skill subscriptions (`skills add <url>`, `skills sync`)\n" +
 	"- `status`: helper status\n" +
 	"- `restart`: restart the helper\n" +
 	"- `help`: this help"
@@ -129,12 +133,22 @@ const workHelp = "Commands in a work chat (prefix `helper`):\n\n" +
 	"- `helper unpause`: resume auto-start after a pause (held requests are not run)\n" +
 	"- `helper park`: stop reading this chat until woken\n" +
 	"- `helper status`: session status\n" +
+	"- `helper fork`: copy this session into a new work chat\n" +
+	"- `helper model` / `helper model list` / `helper model <model> [effort]` / `helper model reset`: show or switch the model\n" +
+	"- `helper effort <effort>`: switch the reasoning effort\n" +
+	"- `helper stats`: requests and token usage of this session\n" +
+	"- `helper skills`: skill subscriptions\n" +
 	"- `helper restart`: restart the helper\n" +
 	"- `helper help`: this help\n\n" +
 	"Any other message is sent to Codex."
 
 func (e *Engine) controlCommand(ctx context.Context, j cmdJob, text string) {
 	fields := strings.Fields(text)
+	if len(fields) > 0 && strings.EqualFold(fields[0], "helper") {
+		// `helper <command>` works in the control chat too.
+		text = strings.TrimSpace(strings.TrimPrefix(text, fields[0]))
+		fields = fields[1:]
+	}
 	if len(fields) == 0 {
 		e.reply(j, controlHelp, nil)
 		return
@@ -156,6 +170,24 @@ func (e *Engine) controlCommand(ctx context.Context, j cmdJob, text string) {
 		e.cmdParkLabel(j, arg)
 	case "restart":
 		e.cmdRestart(j, strings.ToLower(arg))
+	case "fork":
+		target := e.findLabel(arg)
+		if target == nil {
+			e.reply(j, "Usage: `fork <session>` (for example `fork s003`). Send `list` to see sessions.", nil)
+			return
+		}
+		e.cmdFork(ctx, j, target)
+	case "stats", "usage":
+		e.cmdStats(j, nil)
+	case "skills", "skill":
+		e.cmdSkills(ctx, j, arg)
+	case "model", "models":
+		models, err := e.ag.Models(ctx)
+		if err != nil {
+			e.reply(j, "Codex did not list its models ("+userError(err.Error())+"). Try again later.", nil)
+			return
+		}
+		e.reply(j, modelList(models, store.Thread{})+"\n\nSwitch a session's model in its chat with `helper model <model> [effort]`.", nil)
 	default:
 		e.reply(j, "Unknown command. Send `help` for the list of commands.", nil)
 	}
@@ -185,6 +217,20 @@ func (e *Engine) workCommand(ctx context.Context, j cmdJob, cs *convState, field
 		e.reply(j, e.workStatus(cs), nil)
 	case "restart":
 		e.cmdRestart(j, arg)
+	case "fork":
+		e.cmdFork(ctx, j, cs)
+	case "model", "models":
+		args := fields[1:]
+		if verb == "models" {
+			args = []string{"list"}
+		}
+		e.cmdModel(ctx, j, cs, args)
+	case "effort":
+		e.cmdModel(ctx, j, cs, append([]string{"effort"}, fields[1:]...))
+	case "stats", "usage":
+		e.cmdStats(j, cs)
+	case "skills", "skill":
+		e.cmdSkills(ctx, j, strings.Join(fields[1:], " "))
 	default:
 		e.reply(j, "Unknown helper command. Send `helper help` for the list. (Messages that do not start with `helper` go to Codex.)", nil)
 	}
@@ -493,8 +539,12 @@ func (e *Engine) cmdWake(j cmdJob, arg string) {
 		e.reply(j, label+" is "+state+"; nothing to wake.", nil)
 		return
 	}
-	e.reply(j, label+" woken.", func(tx *store.Tx) error {
+	e.reply(j, "Resumed "+label+": its chat is read again.", func(tx *store.Tx) error {
 		if err := tx.Wake(target.id); err != nil {
+			return err
+		}
+		if err := e.enqueueNotice(tx, target.id, fmt.Sprintf("resumed:%d", j.inbound),
+			"This chat was resumed: messages here are read again. Requests sent while it was parked run now."); err != nil {
 			return err
 		}
 		_, err := e.refresh(tx, target.id)
@@ -534,7 +584,7 @@ func (e *Engine) listText() string {
 func (e *Engine) statusText() string {
 	s := e.Snapshot()
 	return fmt.Sprintf("Helper %s on %s: up %s; %d sessions (%d active, %d parked, %d running); %d requests run, %d answered.",
-		e.cfg.Version, e.cfg.Machine, s.Uptime.Round(time.Second), s.Conversations-1, s.Active, s.Parked, s.Running, s.Turns, s.Completed)
+		e.cfg.Version, e.cfg.Machine, s.Uptime.Round(time.Second), s.Conversations, s.Active, s.Parked, s.Running, s.Turns, s.Completed)
 }
 
 func (e *Engine) workStatus(cs *convState) string {

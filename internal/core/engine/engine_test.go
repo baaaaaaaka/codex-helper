@@ -1,10 +1,12 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"path/filepath"
+	"runtime/pprof"
 	"strings"
 	"sync"
 	"testing"
@@ -143,8 +145,34 @@ func newRig(t *testing.T, tweak ...func(*Config)) *rig {
 		}
 	}
 	t.Cleanup(func() {
+		var chats []string
+		if t.Failed() && r.st != nil {
+			if convs, err := r.st.Conversations(); err == nil {
+				for _, c := range convs {
+					chats = append(chats, c.Label+"="+c.ExtChatID)
+					_ = r.st.Update(func(tx *store.Tx) error {
+						rows, _ := tx.PendingOutbox(c.ID)
+						for _, o := range rows {
+							t.Logf("pending outbox conv=%d id=%d key=%s kind=%s state=%s next=%d", c.ID, o.ID, o.DeliveryKey, o.Kind, o.State, o.NextAttemptAt)
+						}
+						return nil
+					})
+				}
+			}
+		}
 		r.stop()
 		if t.Failed() {
+			for _, lc := range chats {
+				label, chat, _ := strings.Cut(lc, "=")
+				for _, m := range r.ch.Messages(chat) {
+					t.Logf("[%s] marker=%v own=%v %q", label, m.Marker != "", m.ByOwner, m.Text)
+				}
+			}
+			r.ag.mu.Lock()
+			for _, run := range r.ag.runs {
+				t.Logf("run conv=%d thread=%q text=%.60q", run.ConvID, run.ThreadID, run.Text)
+			}
+			r.ag.mu.Unlock()
 			r.logMu.Lock()
 			t.Logf("engine log:\n%s", r.log.String())
 			r.logMu.Unlock()
@@ -188,12 +216,24 @@ func (r *rig) stop() {
 
 func (r *rig) wait(what string, cond func() bool) {
 	r.t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+	start := time.Now()
+	deadline := start.Add(10 * time.Second)
+	var dumps []string
+	nextDump := start.Add(3 * time.Second)
 	for time.Now().Before(deadline) {
 		if cond() {
 			return
 		}
+		if now := time.Now(); now.After(nextDump) && len(dumps) < 3 {
+			var buf bytes.Buffer
+			_ = pprof.Lookup("goroutine").WriteTo(&buf, 2)
+			dumps = append(dumps, now.Format("15:04:05.000")+"\n"+buf.String())
+			nextDump = now.Add(2 * time.Second)
+		}
 		time.Sleep(10 * time.Millisecond)
+	}
+	for _, d := range dumps {
+		r.t.Logf("goroutines during wait at %s", d)
 	}
 	r.t.Fatalf("timed out waiting for %s", what)
 }
@@ -469,5 +509,81 @@ func TestRegistryInboxCreatedOnceSilentAndNeverRuns(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("%d inbox conversations after restart", n)
+	}
+}
+
+// fakeASR transcribes after release; fail makes it return an error.
+type fakeASR struct {
+	release chan struct{}
+	fail    bool
+	mu      sync.Mutex
+	paths   []string
+}
+
+func (a *fakeASR) Transcribe(ctx context.Context, path string) (string, error) {
+	a.mu.Lock()
+	a.paths = append(a.paths, path)
+	a.mu.Unlock()
+	select {
+	case <-a.release:
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+	if a.fail {
+		return "", errors.New("asr: model crashed at /secret/path")
+	}
+	return "  hello from voice  ", nil
+}
+
+func TestVoiceTurnWaitsForTranscript(t *testing.T) {
+	asr := &fakeASR{release: make(chan struct{})}
+	files := t.TempDir()
+	r := newRig(t, func(c *Config) { c.Transcriber = asr; c.FilesDir = files })
+	work := r.newWork(t.TempDir())
+	ref := r.ch.AddFile("voice.ogg", []byte("OggS..."))
+	ref.Kind = channel.FileVoice
+	r.ch.PostUser(work, "", ref)
+	r.wait("transcription started", func() bool { asr.mu.Lock(); defer asr.mu.Unlock(); return len(asr.paths) == 1 })
+	time.Sleep(300 * time.Millisecond)
+	r.ag.mu.Lock()
+	n := len(r.ag.runs)
+	r.ag.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("%d turns started before the transcript was ready", n)
+	}
+	close(asr.release)
+	r.wait("voice answered", func() bool { return r.ag.calls("Voice message (transcribed):\nhello from voice") == 1 })
+	r.wait("voice answer posted", func() bool { return len(r.own(work, "ANSWER to Voice message")) == 1 })
+}
+
+func TestVoiceTranscriptionFailureStillRunsWithoutLeaks(t *testing.T) {
+	asr := &fakeASR{release: make(chan struct{}), fail: true}
+	close(asr.release)
+	r := newRig(t, func(c *Config) { c.Transcriber = asr; c.FilesDir = t.TempDir() })
+	work := r.newWork(t.TempDir())
+	ref := r.ch.AddFile("voice.ogg", []byte("OggS..."))
+	ref.Kind = channel.FileVoice
+	r.ch.PostUser(work, "see voice", ref)
+	r.wait("turn ran", func() bool { return r.ag.calls("could not be transcribed") == 1 })
+	r.ag.mu.Lock()
+	text := r.ag.runs[len(r.ag.runs)-1].Text
+	r.ag.mu.Unlock()
+	if strings.Contains(text, "/secret/path") || !strings.HasPrefix(text, "see voice") {
+		t.Fatalf("turn text %q", text)
+	}
+}
+
+// With a short account read budget the control chat (polled every tick in
+// fast timing) must not starve a work chat: due reads go most overdue first.
+func TestReadBudgetSharedFairlyWithControlChat(t *testing.T) {
+	r := newRig(t, func(c *Config) { c.ReadRate = 1 })
+	work := r.newWork(t.TempDir())
+	start := time.Now()
+	for i := 0; i < 3; i++ {
+		r.ch.PostUser(work, fmt.Sprintf("fair %d", i))
+		r.wait("fair answer", func() bool { return len(r.own(work, fmt.Sprintf("ANSWER to fair %d", i))) == 1 })
+	}
+	if d := time.Since(start); d > 15*time.Second {
+		t.Fatalf("three prompts took %s at 1 read/s", d)
 	}
 }

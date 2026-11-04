@@ -37,6 +37,7 @@ type convState struct {
 	label, kind, state, chat, url, title string
 	paused, group                        bool
 	cwd, threadID                        string
+	forkParent                           int64
 	created                              time.Time
 
 	// receive
