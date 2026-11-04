@@ -212,9 +212,14 @@ func (e *Engine) mirrorLoop(ctx context.Context) {
 	}
 }
 
-// firstWalkFiles bounds the rollouts the start-up walk classifies per stat
-// tick (B4): classifying reads each one's first record.
-const firstWalkFiles = 128
+// firstWalkFiles and firstWalkBudget bound the rollouts the start-up walk
+// classifies per stat tick (B4, W1): classifying reads each one's first
+// record, so a batch stops at whichever comes first, 128 rollouts or
+// about 10 ms (a slow disk never makes one long tick).
+const (
+	firstWalkFiles  = 128
+	firstWalkBudget = 10 * time.Millisecond
+)
 
 // startFirstWalk lists every rollout once at start (a stat each, cheap) and
 // queues them newest first for classification. Their sizes and times are
@@ -243,9 +248,8 @@ func (e *Engine) discoverFirst(ctx context.Context) {
 		return
 	}
 	n := min(firstWalkFiles, len(m.firstFound))
-	batch := m.firstFound[:n:n]
+	n = e.considerFor(ctx, m.firstFound[:n:n], firstWalkBudget)
 	m.firstFound = m.firstFound[n:]
-	e.consider(ctx, batch)
 	if ctx.Err() != nil || len(m.firstFound) > 0 {
 		return
 	}
@@ -401,11 +405,23 @@ func recentDayDirs(sessionsDir string, now time.Time) []string {
 // (reading their first record once), grown baselined ones may be promoted;
 // known and unchanged ones cost a map lookup.
 func (e *Engine) consider(ctx context.Context, found []transcript.Found) {
+	e.considerFor(ctx, found, 0)
+}
+
+// considerFor is consider that stops once budget (0: none) has passed,
+// after at least one rollout. It returns how many it handled.
+func (e *Engine) considerFor(ctx context.Context, found []transcript.Found, budget time.Duration) int {
+	start := time.Now()
 	var baseline []store.TranscriptSource
+	done := 0
 	for _, f := range found {
 		if ctx.Err() != nil {
-			return
+			return done
 		}
+		if budget > 0 && done > 0 && time.Since(start) >= budget {
+			break
+		}
+		done++
 		if at, ok := e.mirror.firstAt[f.Path]; ok {
 			// Not classified yet by the start-up walk: as of the start
 			// (a fresh install baselines what existed then).
@@ -431,32 +447,40 @@ func (e *Engine) consider(ctx context.Context, found []transcript.Found) {
 			baseline = append(baseline, b)
 		}
 	}
-	if len(baseline) > 0 {
-		err := e.update(func(tx *store.Tx) error {
-			for _, b := range baseline {
-				if _, err := tx.UpsertSource(b); err != nil {
-					return err
-				}
-			}
-			return nil
-		})
-		if err != nil {
-			e.logf("mirror baseline: %v", err)
-			return
-		}
-		e.mirror.mu.Lock()
-		for _, b := range baseline {
-			e.mirror.known[b.Path] = b.State
-		}
-		e.mirror.mu.Unlock()
+	e.recordBaseline(baseline)
+	return done
+}
+
+// recordBaseline records the baselined and ignored rollouts consider
+// classified, in one transaction.
+func (e *Engine) recordBaseline(baseline []store.TranscriptSource) {
+	if len(baseline) == 0 {
+		return
 	}
+	err := e.update(func(tx *store.Tx) error {
+		for _, b := range baseline {
+			if _, err := tx.UpsertSource(b); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		e.logf("mirror baseline: %v", err)
+		return
+	}
+	e.mirror.mu.Lock()
+	for _, b := range baseline {
+		e.mirror.known[b.Path] = b.State
+	}
+	e.mirror.mu.Unlock()
 }
 
 // newRollout decides what to do with a rollout seen for the first time. It
 // returns a source row to record in bulk (baseline/ignored), or tracks the
 // file itself.
 func (e *Engine) newRollout(ctx context.Context, f transcript.Found) (store.TranscriptSource, bool) {
-	meta, err := transcript.ReadMeta(f.Path)
+	meta, err := e.readMeta(f.Path)
 	if err != nil {
 		// Being written, or not a session: read again once it changes.
 		e.mirror.mu.Lock()
@@ -540,7 +564,7 @@ func (e *Engine) promoteBaseline(ctx context.Context, f transcript.Found) {
 		stay()
 		return
 	}
-	meta, err := transcript.ReadMeta(f.Path)
+	meta, err := e.readMeta(f.Path)
 	if err != nil {
 		stay() // read again once it changes
 		return
