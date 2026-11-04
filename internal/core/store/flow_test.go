@@ -1,6 +1,7 @@
 package store
 
 import (
+	"fmt"
 	"testing"
 )
 
@@ -440,6 +441,100 @@ func TestNextRunnableBlocking(t *testing.T) {
 		}
 		return err
 	}))
+}
+
+// Only rows that must reach the chat before the next turn starts block it:
+// an earlier turn's replies, final and interruption notice, and rows that
+// belong to no turn. ACKs and the notices of the queued turns themselves
+// (reminders, the start notice) do not (benchmark F4: 72 s of dead time
+// waiting for ACKs of later prompts under paced writes).
+func TestNextRunnableBlocksOnlyOnEarlierTurnRows(t *testing.T) {
+	s, _ := openTest(t)
+	a := newWork(t, s, "a")
+	mustT(t, s.Update(func(tx *Tx) error {
+		_, err := tx.AdmitWindow("k", a, []InboundMsg{prompt("p1", 1), prompt("p2", 2), prompt("p3", 3)}, "c")
+		return err
+	}))
+	runnable := func() (Turn, bool) {
+		var tr Turn
+		var ok bool
+		mustT(t, s.Update(func(tx *Tx) (err error) { tr, ok, err = tx.NextRunnable(a); return }))
+		return tr, ok
+	}
+	enqueue := func(key, kind string) {
+		mustT(t, s.Update(func(tx *Tx) error { _, err := tx.Enqueue(a, []OutMsg{out(key, kind)}); return err }))
+	}
+	// settle delivers the conversation's pending rows in order (the outbox
+	// sends only its head) up to and including key.
+	settle := func(key string) {
+		mustT(t, s.Update(func(tx *Tx) error {
+			pending, err := tx.PendingOutbox(a)
+			if err != nil {
+				return err
+			}
+			for _, o := range pending {
+				if _, err := tx.BeginSend(o.ID); err != nil {
+					return err
+				}
+				if err := tx.MarkSent(o.ID, "m-"+o.DeliveryKey); err != nil {
+					return err
+				}
+				if o.DeliveryKey == key {
+					return nil
+				}
+			}
+			return fmt.Errorf("%s is not pending", key)
+		}))
+	}
+	// The ACKs of all three prompts and the reminders of the queued ones
+	// are pending: the head still starts.
+	for _, k := range []string{"ack:1", "ack:2", "ack:3"} {
+		enqueue(k, OutAck)
+	}
+	enqueue("turn:2:waiting:1", OutNotice)
+	enqueue("turn:3:waiting:1", OutNotice)
+	tr, ok := runnable()
+	if !ok || tr.ID != 1 {
+		t.Fatalf("head not runnable behind ACKs and queued-turn notices: %+v %v", tr, ok)
+	}
+	mustT(t, s.Update(func(tx *Tx) error {
+		if err := tx.MarkStarting(tr.ID, "th"); err != nil {
+			return err
+		}
+		return tx.MarkRunning(tr.ID, "codex-1")
+	}))
+	enqueue("turn:1:progress:1", OutProgress)
+	mustT(t, s.Update(func(tx *Tx) error {
+		return tx.FinishTurn(tr.ID, TurnCompleted, "", []OutMsg{out("turn:1:final:1", OutFinal)})
+	}))
+	// The first turn's progress and final are pending: the next waits.
+	if _, ok := runnable(); ok {
+		t.Fatal("next turn runnable before the earlier turn's final was sent")
+	}
+	settle("turn:1:progress:1")
+	if _, ok := runnable(); ok {
+		t.Fatal("next turn runnable before the earlier turn's final was sent")
+	}
+	settle("turn:1:final:1")
+	tr, ok = runnable()
+	if !ok || tr.ID != 2 {
+		t.Fatalf("second turn not runnable once the first turn's rows were sent: %+v %v", tr, ok)
+	}
+	// An interruption notice of an earlier turn, and a row of no turn (a
+	// command reply), block; a later turn's row (turn 12 > 2) does not.
+	enqueue("turn:12:waiting:1", OutNotice)
+	if _, ok := runnable(); !ok {
+		t.Fatal("a later turn's notice blocked the head")
+	}
+	enqueue("turn:1:interrupted", OutNotice)
+	if _, ok := runnable(); ok {
+		t.Fatal("runnable before an earlier turn's interruption notice was sent")
+	}
+	settle("turn:1:interrupted")
+	enqueue("cmd:7", OutNotice)
+	if _, ok := runnable(); ok {
+		t.Fatal("runnable before a pending row of no turn was sent")
+	}
 }
 
 func TestGatesAndMeta(t *testing.T) {

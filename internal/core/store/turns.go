@@ -58,8 +58,14 @@ WHERE conv_id = ? AND state IN ('queued','starting','running') ORDER BY id`, con
 
 // NextRunnable returns the head queued turn of an active, unpaused
 // conversation when no turn of that conversation is starting or running, no
-// outbox row of it is pending (so an interruption notice is posted before
-// the next turn starts), and the prompt's attachments are not pending.
+// outbox row that must precede the turn is pending, and the prompt's
+// attachments are not pending.
+//
+// The rows that must precede it are an earlier turn's replies, final and
+// interruption notice (keys turn:<id>:… with id below the head's) and rows
+// of no turn. ACKs and rows of the head or later turns (their reminders
+// and start notices) do not hold it back: under paced writes they would
+// otherwise stall the queue for the time the ACK backlog takes to drain.
 func (t *Tx) NextRunnable(convID int64) (Turn, bool, error) {
 	c, ok, err := t.Conversation(convID)
 	if err != nil || !ok || c.State != ConvActive || c.PausedAt != 0 {
@@ -76,7 +82,8 @@ func (t *Tx) NextRunnable(convID int64) (Turn, bool, error) {
 		}
 	}
 	var blocked int
-	if err := t.row(`SELECT EXISTS(SELECT 1 FROM outbox WHERE conv_id = ? AND state IN ('queued','sending','unknown'))`, convID).Scan(&blocked); err != nil {
+	if err := t.row(`SELECT EXISTS(SELECT 1 FROM outbox WHERE conv_id = ? AND state IN ('queued','sending','unknown')
+AND kind <> 'ack' AND NOT (delivery_key LIKE 'turn:%' AND CAST(substr(delivery_key, 6) AS INTEGER) >= ?))`, convID, head.ID).Scan(&blocked); err != nil {
 		return Turn{}, false, err
 	}
 	if blocked != 0 {
