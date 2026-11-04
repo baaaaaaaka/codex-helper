@@ -29,6 +29,7 @@ type fakeAgent struct {
 	outcome func(TurnRequest) (TurnOutcome, error)
 	lookup  map[string]TurnOutcome // turn key -> outcome
 	irq     map[int64]chan struct{}
+	notes   []string // commentary streamed by turns whose text contains "progress"
 }
 
 func newAgent() *fakeAgent {
@@ -68,6 +69,14 @@ func (a *fakeAgent) Run(ctx context.Context, req TurnRequest, h TurnHooks) (Turn
 			return TurnOutcome{CodexTurnID: fmt.Sprintf("turn-%d", n), Status: StatusInterrupted}, nil
 		case <-ctx.Done():
 			return TurnOutcome{}, ctx.Err()
+		}
+	}
+	if strings.Contains(req.Text, "progress") && h.Progress != nil {
+		a.mu.Lock()
+		notes := append([]string(nil), a.notes...)
+		a.mu.Unlock()
+		for _, t := range notes {
+			h.Progress(t + " (" + strings.SplitN(req.Text, "\n", 2)[0] + ")")
 		}
 	}
 	if out != nil {
@@ -625,5 +634,54 @@ func TestVoiceWaitsForRecognizerSetupWithOneNotice(t *testing.T) {
 	r.ag.mu.Unlock()
 	if n != 1 {
 		t.Fatalf("%d turns, want 1", n)
+	}
+}
+
+func TestProgressPostedInOrderBeforeFinal(t *testing.T) {
+	r := newRig(t)
+	r.ag.mu.Lock()
+	r.ag.notes = []string{"step A", "step B", "step C"}
+	r.ag.mu.Unlock()
+	work := r.newWork(t.TempDir())
+	r.ch.PostUser(work, "progress live")
+	r.wait("final", func() bool { return len(r.own(work, "ANSWER to progress live")) == 1 })
+	var order []string
+	for _, m := range r.ch.Messages(work) {
+		for _, k := range []string{"step A", "step B", "step C", "ANSWER to progress live"} {
+			if m.Marker != "" && strings.Contains(m.Text, k) {
+				order = append(order, k)
+			}
+		}
+	}
+	if strings.Join(order, ",") != "step A,step B,step C,ANSWER to progress live" {
+		t.Fatalf("order %q", order)
+	}
+}
+
+func TestProgressCoalescedWhenTurnsWaitBehind(t *testing.T) {
+	r := newRig(t)
+	r.ag.mu.Lock()
+	r.ag.notes = []string{"step A", "step B", "step C"}
+	r.ag.mu.Unlock()
+	release := make(chan struct{})
+	r.ag.block["progress first"] = release
+	work := r.newWork(t.TempDir())
+	r.ch.PostUser(work, "progress first")
+	r.ch.PostUser(work, "second request")
+	r.wait("both admitted", func() bool { return len(r.own(work, "Request accepted")) == 2 })
+	// The fake streams the first turn's commentary after the release, while
+	// the second request waits behind it.
+	close(release)
+	r.wait("both answered", func() bool {
+		return len(r.own(work, "ANSWER to progress first")) == 1 && len(r.own(work, "ANSWER to second request")) == 1
+	})
+	n := 0
+	for _, m := range r.ch.Messages(work) {
+		if m.Marker != "" && strings.Contains(m.Text, "step ") && strings.Contains(m.Text, "(progress first)") {
+			n++
+		}
+	}
+	if n > 1 {
+		t.Fatalf("%d progress messages for a turn with another queued behind it, want at most 1", n)
 	}
 }

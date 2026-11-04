@@ -229,7 +229,9 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 	defer close(rs.done)
 	id := cs.id
 	accepted := false
+	prog := &progressState{}
 	hooks := TurnHooks{
+		Progress: func(text string) { e.progress(ctx, cs, tr, prog, text) },
 		ThreadStarted: func(threadID string) error {
 			return e.bindThread(id, threadID)
 		},
@@ -684,4 +686,70 @@ func (e *Engine) finishReconciled(ctx context.Context, cs *convState, tr store.T
 		out.Status = StatusFailed
 	}
 	e.finish(ctx, cs, tr, out, false)
+}
+
+// Progress (commentary while a turn runs). Each commentary message becomes
+// one chat message before the final, except:
+//   - group chats (other people present): none;
+//   - coalescing (CORE-DESIGN §3): when other turns wait behind this one in
+//     the conversation, or the account write gate closed within the last
+//     5 min, at most one progress message per turn;
+//   - at most maxProgress per turn.
+// The final is always complete; progress only shows the turn is alive.
+
+const (
+	maxProgress         = 20
+	progressCoalesceFor = 5 * time.Minute
+)
+
+type progressState struct{ posted int }
+
+func (e *Engine) progress(ctx context.Context, cs *convState, tr store.Turn, ps *progressState, text string) {
+	text = strings.TrimSpace(text)
+	e.mu.Lock()
+	group := cs.group
+	e.mu.Unlock()
+	if text == "" || group || ps.posted >= maxProgress {
+		return
+	}
+	now := e.now()
+	coalesce := false
+	if until := e.gate(gateAccountWrite); !until.IsZero() && now.Sub(until) < progressCoalesceFor {
+		coalesce = true
+	}
+	if coalesce && ps.posted >= 1 {
+		return
+	}
+	msgs, err := e.render(ctx, channel.RichDoc{Label: labelCodex, Markdown: text, Math: true}, store.OutProgress,
+		fmt.Sprintf("turn:%d:progress:%d", tr.ID, ps.posted+1))
+	if err != nil {
+		e.logf("progress of %s: %v", cs.label, err)
+		return
+	}
+	queued := false
+	err = e.update(func(tx *store.Tx) error {
+		queued = false
+		if ps.posted >= 1 {
+			open, err := tx.OpenTurnsOf(cs.id)
+			if err != nil {
+				return err
+			}
+			if len(open) > 1 {
+				return nil // turns wait behind this one: one progress message is enough
+			}
+		}
+		if _, err := tx.Enqueue(cs.id, msgs); err != nil {
+			return err
+		}
+		queued = true
+		return nil
+	})
+	if err != nil {
+		e.logf("progress of %s: %v", cs.label, err)
+		return
+	}
+	if queued {
+		ps.posted++
+		e.wakeSender()
+	}
 }
