@@ -1082,6 +1082,7 @@ type lagScanner struct {
 	acts  []channel.ChatActivity
 	calls []time.Time
 	reads []string
+	at    []time.Time // when each of reads started
 }
 
 func (s *lagScanner) ScanActivity(_ context.Context, since time.Time) ([]channel.ChatActivity, error) {
@@ -1100,6 +1101,7 @@ func (s *lagScanner) ScanActivity(_ context.Context, since time.Time) ([]channel
 func (s *lagScanner) Receive(ctx context.Context, stream, cursor string) (channel.Window, error) {
 	s.mu.Lock()
 	s.reads = append(s.reads, stream)
+	s.at = append(s.at, time.Now())
 	s.mu.Unlock()
 	return s.Fake.Receive(ctx, stream, cursor)
 }
@@ -1108,6 +1110,56 @@ func (s *lagScanner) set(acts ...channel.ChatActivity) {
 	s.mu.Lock()
 	s.acts = acts
 	s.mu.Unlock()
+}
+
+// readAfter returns when stream was first read at or after t.
+func (s *lagScanner) readAfter(stream string, t time.Time) (time.Time, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, r := range s.reads {
+		if r == stream && !s.at[i].Before(t) {
+			return s.at[i], true
+		}
+	}
+	return time.Time{}, false
+}
+
+// The receiver loop sleeps until the earliest next read (up to Hot) instead
+// of waking every Tick; a chat the activity scan marks due wakes it, so the
+// read follows the scan at once rather than at the end of the sleep.
+func TestScanMarkedChatReadWithoutWaitingForTheReceiverSleep(t *testing.T) {
+	var sc *lagScanner
+	r := newRig(t, func(c *Config) {
+		sc = &lagScanner{Fake: c.Channel.(*channeltest.Fake)}
+		c.Channel, c.ActivityScan = sc, true
+		c.Timing.Hot, c.Timing.Control = 2*time.Second, 2*time.Second
+		c.Timing.HotFor, c.Timing.SafetyRead, c.Timing.ScanInterval = 200*time.Millisecond, time.Minute, 50*time.Millisecond
+		c.ReadRate = 100 // every scan borrows a read token
+	})
+	work := r.newWork(t.TempDir())
+	ctl := r.control()
+	newest := time.Now()
+	sc.set(channel.ChatActivity{Chat: ctl, LastID: "ctl-1", Last: newest})
+	time.Sleep(time.Second) // the work chat goes idle: read only when the scan shows a change
+	for i := 1; i <= 3; i++ {
+		m := r.ch.PostUser(work, fmt.Sprintf("prompt %d", i))
+		shown := time.Now()
+		sc.set(channel.ChatActivity{Chat: ctl, LastID: "ctl-1", Last: newest},
+			channel.ChatActivity{Chat: work, LastID: m.ID, Last: shown})
+		var read time.Time
+		r.wait("work chat read after the scan", func() bool {
+			var ok bool
+			read, ok = sc.readAfter(work, shown)
+			return ok
+		})
+		// The scan runs every 50 ms; the receiver sleep is up to 2 s.
+		if d := read.Sub(shown); d > 700*time.Millisecond {
+			t.Fatalf("prompt %d: work chat read %s after the scan showed it, want well under the 2 s receiver sleep", i, d)
+		}
+		r.wait("answer", func() bool { return len(r.own(work, fmt.Sprintf("ANSWER to prompt %d", i))) == 1 })
+		newest = shown
+		time.Sleep(500 * time.Millisecond) // idle again (HotFor)
+	}
 }
 
 // Review M6: a chat whose preview shows up in the scan behind a newer

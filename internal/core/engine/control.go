@@ -192,6 +192,7 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 	cs.lastActivity = e.now()
 	delete(e.intro, id)
 	e.mu.Unlock()
+	e.wakeReader()
 	e.wakeSender()
 	return true
 }

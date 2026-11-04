@@ -214,10 +214,12 @@ type Engine struct {
 	inboxID   int64
 	ownerName string
 
-	runnerWake   chan struct{}
-	runnerDirty  map[int64]bool
-	runnerAll    bool
-	senderWake   chan struct{}
+	runnerWake  chan struct{}
+	runnerDirty map[int64]bool
+	runnerAll   bool
+	senderWake  chan struct{}
+	// readWake: a conversation's next read moved earlier (receive.go).
+	readWake     chan struct{}
 	resolverWake chan struct{}
 	mirrorWake   chan struct{}
 	cmdQueue     chan cmdJob
@@ -313,7 +315,7 @@ func New(cfg Config) (*Engine, error) {
 		gRead: store.AccountReadGate(cfg.ChannelName), gWrite: store.AccountWriteGate(cfg.ChannelName),
 		convs: map[int64]*convState{}, intro: map[int64]string{}, forkThreads: map[string]bool{}, delegThreads: map[string]bool{}, byChat: map[string]int64{}, byThread: map[string]int64{},
 		runnerWake: make(chan struct{}, 1), runnerDirty: map[int64]bool{},
-		senderWake: make(chan struct{}, 1), resolverWake: make(chan struct{}, 1),
+		senderWake: make(chan struct{}, 1), readWake: make(chan struct{}, 1), resolverWake: make(chan struct{}, 1),
 		mirrorWake: make(chan struct{}, 1), cmdQueue: make(chan cmdJob, 256), cmdPending: map[int64][]cmdJob{}, reminded: map[int64]int{}, asrWake: make(chan struct{}, 1), notifyWake: make(chan struct{}, 1), scanWake: make(chan struct{}, 1), updateWake: make(chan struct{}, 1), registryWake: make(chan struct{}, 1), fileTries: map[string]int{}, uploadAt: map[int64]time.Time{},
 	}
 	if sc, ok := cfg.Channel.(channel.ActivityScanner); ok && cfg.ActivityScan && e.t.ScanInterval > 0 {
@@ -356,6 +358,10 @@ func wake(ch chan struct{}) {
 }
 
 func (e *Engine) wakeSender() { wake(e.senderWake) }
+
+// wakeReader: a conversation's next read may be due sooner than the
+// receiver loop's sleep.
+func (e *Engine) wakeReader() { wake(e.readWake) }
 
 // wakeNotify: an outbox row left the queue; a pending owner notification
 // may be due.
@@ -620,6 +626,7 @@ func (e *Engine) trackLocked(c store.Conversation) *convState {
 	if c.ExtChatID != "" {
 		e.byChat[c.ExtChatID] = c.ID
 	}
+	e.wakeReader() // new, re-activated or re-bound: may be due now
 	return cs
 }
 

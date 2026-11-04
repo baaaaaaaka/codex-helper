@@ -49,44 +49,93 @@ func (e *Engine) receiverLoop(ctx context.Context) {
 		}()
 	}
 	defer close(jobs)
-	tick := time.NewTicker(e.t.Tick)
-	defer tick.Stop()
+	// The loop sleeps until the earliest next read (between Tick and Hot)
+	// instead of waking every Tick: an idle helper reads every few
+	// seconds, and each wake walks every conversation. Whatever moves a
+	// next read earlier wakes it (wakeReader); a missed wake costs at most
+	// Hot.
+	timer := time.NewTimer(e.t.Tick)
+	defer timer.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-tick.C:
+		case <-timer.C:
+		case <-e.readWake:
 		}
-		now := e.now()
-		if until := e.gate(e.gRead); now.Before(until) {
-			continue
+		wait, ok := e.dispatchReads(ctx, jobs)
+		if !ok {
+			return
 		}
-		if e.scanFirst.Load() {
-			// After a read throttle the activity scan, which serves every
-			// chat, gets the first read (scanLoop clears this).
-			continue
-		}
-		due := e.dueReads(now)
-		for i, id := range due {
-			if ok, _ := e.readTokens.take(); !ok {
-				// Out of read budget: the rest wait for the next tick,
-				// still ordered by how long they are overdue.
-				e.mu.Lock()
-				for _, rest := range due[i:] {
-					if cs := e.convs[rest]; cs != nil {
-						cs.reading = false
-					}
+		timer.Reset(wait)
+	}
+}
+
+// dispatchReads hands the due reads to the readers and returns how long
+// the receiver loop may sleep; false when ctx ended.
+func (e *Engine) dispatchReads(ctx context.Context, jobs chan<- int64) (time.Duration, bool) {
+	now := e.now()
+	if until := e.gate(e.gRead); now.Before(until) {
+		return e.readSleep(until.Sub(now)), true
+	}
+	if e.scanFirst.Load() {
+		// After a read throttle the activity scan, which serves every
+		// chat, gets the first read (scanLoop clears this).
+		return e.t.Tick, true
+	}
+	due := e.dueReads(now)
+	for i, id := range due {
+		if ok, wait := e.readTokens.take(); !ok {
+			// Out of read budget: the rest wait for a token, still
+			// ordered by how long they are overdue.
+			e.mu.Lock()
+			for _, rest := range due[i:] {
+				if cs := e.convs[rest]; cs != nil {
+					cs.reading = false
 				}
-				e.mu.Unlock()
-				break
 			}
-			select {
-			case jobs <- id:
-			case <-ctx.Done():
-				return
-			}
+			e.mu.Unlock()
+			return e.readSleep(wait), true
+		}
+		select {
+		case jobs <- id:
+		case <-ctx.Done():
+			return 0, false
 		}
 	}
+	return e.readSleep(e.untilNextRead(e.now())), true
+}
+
+// readSleep bounds a receiver loop sleep to [Tick, Hot].
+func (e *Engine) readSleep(d time.Duration) time.Duration {
+	return max(e.t.Tick, min(e.t.Hot, d))
+}
+
+// untilNextRead is the time until the earliest next read of a conversation
+// that is not being read (Hot when there is none).
+func (e *Engine) untilNextRead(now time.Time) time.Duration {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	d := e.t.Hot
+	for _, cs := range e.convs {
+		if !e.readableLocked(cs) {
+			continue
+		}
+		d = min(d, cs.nextRead.Sub(now))
+	}
+	return d
+}
+
+// readableLocked reports whether a conversation is read at its next read
+// time (not being read already, and in a state that is read).
+func (e *Engine) readableLocked(cs *convState) bool {
+	if cs.chat == "" || cs.reading {
+		return false
+	}
+	if cs.kind == store.KindWork && cs.state != store.ConvActive {
+		return false // parked, closed, hold: zero reads
+	}
+	return !(cs.kind == store.KindControl && cs.state == store.ConvClosed)
 }
 
 // dueReads returns the conversations whose next read is due, most overdue
@@ -98,13 +147,7 @@ func (e *Engine) dueReads(now time.Time) []int64 {
 	defer e.mu.Unlock()
 	var due []int64
 	for id, cs := range e.convs {
-		if cs.chat == "" || cs.reading || now.Before(cs.nextRead) {
-			continue
-		}
-		if cs.kind == store.KindWork && cs.state != store.ConvActive {
-			continue // parked, closed, hold: zero reads
-		}
-		if cs.kind == store.KindControl && cs.state == store.ConvClosed {
+		if !e.readableLocked(cs) || now.Before(cs.nextRead) {
 			continue
 		}
 		cs.reading = true
@@ -176,6 +219,7 @@ func (e *Engine) heatAs(id int64, user bool) {
 		}
 		if next := now.Add(e.t.Hot); cs.nextRead.After(next) {
 			cs.nextRead = next
+			e.wakeReader()
 		}
 	}
 }
@@ -200,6 +244,7 @@ func (e *Engine) read(ctx context.Context, id int64) {
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	defer e.wakeReader() // the next read time is set below
 	cs.reading = false
 	now := e.now()
 	if err == nil {
@@ -850,6 +895,7 @@ func (e *Engine) scanLoop(ctx context.Context) {
 		}
 		failures = 0
 		e.scanFirst.Store(false)
+		woke := false
 		e.mu.Lock()
 		for _, a := range acts {
 			if a.Last.After(mark) {
@@ -872,9 +918,13 @@ func (e *Engine) scanLoop(ctx context.Context) {
 			// just before.
 			if cs.nextRead.After(now) {
 				cs.nextRead = now
+				woke = true
 			}
 		}
 		e.mu.Unlock()
+		if woke {
+			e.wakeReader()
+		}
 	}
 }
 
