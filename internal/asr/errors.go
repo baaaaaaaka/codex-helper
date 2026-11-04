@@ -90,7 +90,7 @@ var userMessages = map[Kind][2]string{
 	KindDownload:      {"downloading the voice recognition files failed.", "check this machine's access to github.com and huggingface.co; the helper will retry."},
 	KindIntegrity:     {"a downloaded voice recognition file did not match its pinned checksum and was discarded.", "retry later; if it keeps failing, update the helper."},
 	KindDiskSpace:     {"there is not enough free disk space to install voice recognition.", "free space in the cache directory (about 2 GB is needed) and resend the message."},
-	KindCache:         {"the voice recognition cache directory is not usable (not writable, not executable, or locked).", "check permissions and noexec mounts of the cache directory, or point CODEX_HELPER_ASR_CACHE_DIR at a local disk."},
+	KindCache:         {"the voice recognition cache directory is not usable (not writable, not executable, or locked).", "check free space, permissions and noexec mounts of the cache directory named in the diagnostic."},
 	KindNativeLoad:    {"the voice recognition program cannot run on this machine (missing system library or incompatible CPU/OS).", "update the helper; if it persists, report the diagnostic below or configure --asr-command."},
 	KindMedia:         {"the voice/video file could not be decoded or contains no audio.", "resend the recording, or type the message."},
 	KindNoSpeech:      {"no speech was recognised in the recording.", "resend the recording closer to the microphone, or type the message."},
