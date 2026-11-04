@@ -7,6 +7,7 @@ import (
 
 	"github.com/baaaaaaaka/codex-helper/internal/channel"
 	"github.com/baaaaaaaka/codex-helper/internal/core/store"
+	"github.com/baaaaaaaka/codex-helper/internal/core/transcript"
 )
 
 // render turns doc into outbox messages keyed base:<part>. Rendering is
@@ -80,7 +81,7 @@ const (
 	textAccepted = "⏳ Codex is working. Request accepted."
 	textFinished = "✅ Codex finished responding."
 	// textCompacted is v0.1.20's status post for a context compaction.
-	textCompacted   = "Context compacted. Earlier turns were summarized so Codex can continue the thread."
+	textCompacted   = transcript.CompactText
 	textInterrupted = "The previous request was interrupted when the helper stopped. It was not re-run; resend it if you still need it."
 	textNotStarted  = "The previous request did not run: the helper stopped before Codex accepted it. Resend it if you still need it."
 	textRestarted   = "Helper restarted: the new process is running and has taken over."

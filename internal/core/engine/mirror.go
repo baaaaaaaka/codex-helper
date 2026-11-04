@@ -11,6 +11,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/channel"
 	"github.com/baaaaaaaka/codex-helper/internal/core/store"
 	"github.com/baaaaaaaka/codex-helper/internal/core/transcript"
 )
@@ -860,6 +861,9 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 	}
 	var rs []rendered
 	for _, o := range outs {
+		if o.Kind != transcript.OutputPrompt && o.Kind != transcript.OutputFinal && f.catchingUp(o) {
+			continue // catch-up posts prompts and finals only
+		}
 		msgs, err := e.renderMirror(ctx, thread, o)
 		if err != nil {
 			// Re-read these records from the persisted position after a
@@ -929,7 +933,7 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 			}
 			msgs = append(msgs, r.msgs...)
 			posted++
-			if live && !r.o.User {
+			if live && r.o.Kind == transcript.OutputFinal {
 				// A live final: the owner is notified once it is posted
 				// (Workflow card, else a control-chat @mention), as for
 				// a Teams-run final; catch-up finals notify nobody.
@@ -1024,12 +1028,18 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 
 // renderMirror renders one mirrored record as v0.1.20 did: a prompt under
 // "🧑‍💻 User:", an answer under "🤖 ✅ Codex answer:" with the completion
-// footer; a long one carries "[part i/n]" in every part's header. Neither
-// mentions the owner in the work chat.
+// footer, a commentary or compaction notice under "🤖 ⏳ Codex status:"; a
+// long one carries "[part i/n]" in every part's header. None mentions the
+// owner in the work chat.
 func (e *Engine) renderMirror(ctx context.Context, thread string, o transcript.Output) ([]store.OutMsg, error) {
-	doc := answerDoc(o.Text)
-	if o.User {
+	var doc channel.RichDoc
+	switch o.Kind {
+	case transcript.OutputPrompt:
 		doc = userDoc(strings.TrimSpace(o.Text))
+	case transcript.OutputStatus, transcript.OutputCompact:
+		doc = statusDoc(o.Text) // commentary, compaction: Codex status
+	default:
+		doc = answerDoc(o.Text)
 	}
 	parts, err := e.ch.Render(ctx, doc)
 	if err != nil {
