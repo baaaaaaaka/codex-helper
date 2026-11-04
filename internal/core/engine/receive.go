@@ -478,7 +478,7 @@ func (e *Engine) ackPrompt(tx *store.Tx, conv int64, a store.Admitted, c *classi
 	}
 	text := "Request accepted."
 	if ahead := len(open) - 1; ahead > 0 {
-		text += " Queued behind " + plural(ahead, "earlier request", "earlier requests") + "."
+		text += " It is queued behind " + plural(ahead, "earlier request", "earlier requests") + "."
 	}
 	msgs, err := e.noticeReply(store.OutAck, fmt.Sprintf("ack:%d", a.InboundID), text, c.quoteID)
 	if err != nil {

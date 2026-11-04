@@ -78,7 +78,7 @@ func FastTiming(base time.Duration) Timing {
 	t.MaxBackoff = 30 * base
 	t.MirrorStat, t.Discovery, t.FullWalk = base, 2*base, 20*base
 	t.TurnPoll = 2 * time.Second
-	t.ResolveDelay = 2 * time.Second
+	t.ResolveDelay = 500 * time.Millisecond
 	t.Maintenance = 10 * time.Second
 	t.CapacityBackoff = time.Second
 	t.CancelWait = 5 * time.Second
@@ -308,7 +308,10 @@ func (e *Engine) Run(ctx context.Context) error {
 // start loads state and makes sure the control chat exists.
 func (e *Engine) start(ctx context.Context) error {
 	if err := e.ag.Prepare(ctx); err != nil {
-		return fmt.Errorf("engine: prepare agent: %w", err)
+		// A leftover app-server that would not die is not fatal: Codex
+		// refuses a second writer on the same thread, which surfaces as the
+		// active-writer notice on that turn.
+		e.logf("engine: prepare agent: %v", err)
 	}
 	if err := e.update(func(tx *store.Tx) error {
 		p, ok, err := tx.Meta(store.MetaTurnKeyPrefix)
