@@ -73,6 +73,7 @@ func newTeamsCmd(root *rootOptions) *cobra.Command {
 		newTeamsResumeCmd(),
 		newTeamsDrainCmd(),
 		newTeamsRecoverCmd(),
+		newTeamsMigrateCmd(),
 	)
 	return cmd
 }
