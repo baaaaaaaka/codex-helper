@@ -409,3 +409,54 @@ func TestLegacyTurnKeysDisjoint(t *testing.T) {
 		t.Fatal("new turn keys could collide with legacy keys")
 	}
 }
+
+// Fidelity run, s001: an early helper kept no delivery ledger, so the
+// rollout has no proof and resumes at 0, but the old helper read some of its
+// own posts back as inbound events. Those records are delivered already and
+// must not be mirrored again; records without such an echo still are.
+func TestEchoProof(t *testing.T) {
+	r := newRollout()
+	r.ts = "2029-12-30T00:00:00Z"
+	r.line("session_meta", map[string]any{"id": s001Thread, "originator": "codex_cli_rs", "source": "cli"})
+	r.turn("ta")
+	r.user("u1", "please refactor the parser module today")
+	r.final("f1", "Refactored the **parser** module; all tests pass.")
+	r.done("ta", "Refactored the **parser** module; all tests pass.")
+	r.turn("tb")
+	r.user("u2", "now update the documentation for it")
+	r.final("f2", "Updated the documentation for the parser.")
+	r.done("tb", "Updated the documentation for the parser.")
+	r.turn("tc")
+	r.user("u3", "please refactor the parser module today") // the same text again, never echoed
+	r.final("f3", "Nothing left to refactor in the parser.")
+	r.done("tc", "Nothing left to refactor in the parser.")
+	sessions, path := writeRollout(t, r)
+	in := func(id, text, status, at string) map[string]any {
+		return map[string]any{"id": id, "session_id": "s001", "teams_chat_id": "19:chat-s001@thread.v2", "teams_message_id": "17999" + id,
+			"text": text, "status": status, "received_at": at, "created_at": at}
+	}
+	after, before := "2029-12-31T00:00:00Z", "2029-12-29T00:00:00Z"
+	dir := fixture(t, "rc59", "json")
+	editJSON(t, dir, positions(path, r.ends[13], 13, r.ends[13], 13, nil)) // no proof
+	editJSON(t, dir, func(m map[string]any) {
+		ie := m["inbound_events"].(map[string]any)
+		for _, e := range []map[string]any{
+			in("e1", "Please refactor the parser module today", "ignored", after), // imported prompt, no label
+			in("e2", "🤖 ✅ Codex answer [part 1/2]:\n\nRefactored the parser module; all tests pass.", "ignored", after),
+			in("e3", "now update the documentation for it", "queued", after),                              // typed by the owner: no proof
+			in("e4", "🤖 ✅ Codex answer:\n\nUpdated the documentation for the parser.", "ignored", before), // before the record
+			in("e5", "🤖 ⏳ Codex status:\n\nNothing left to refactor in the parser.", "ignored", after),    // a status is not the answer
+		} {
+			ie[e["id"].(string)] = e
+		}
+	})
+	rep, db := dryRun(t, dir, func(o *Options) { o.CodexSessions, o.CountBacklog = sessions, true })
+	if !rep.OK() {
+		t.Fatalf("checks: %+v", rep.Checks)
+	}
+	eq(t, "s001 source", qs(t, db, sourceQ, "%"+s001Thread+".jsonl"), "tracking@0:0")
+	for id, want := range map[string]int64{"u1": 1, "f1": 1, "u2": 0, "f2": 0, "u3": 0, "f3": 0} {
+		eq(t, id+" delivered", qi(t, db, `SELECT count(*) FROM outbox WHERE delivery_key = ? AND state = 'sent'`, MirrorKey(s001Thread, id, 1)), want)
+	}
+	eq(t, "bucket", rep.Buckets["linked tracking: records proven posted by the old helper's own echo -> delivered (not mirrored again)"], 2)
+}

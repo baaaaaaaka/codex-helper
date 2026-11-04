@@ -404,6 +404,13 @@ func (c *converter) importSource(p *pathInfo) error {
 		rs := c.decideResume(p, size)
 		src.Offset, src.Line = rs.off, rs.line
 		c.reportResume(p, rs, size, false, 0)
+		n, err := c.echoProof(p, rs, src.ThreadID)
+		if err != nil {
+			return err
+		}
+		if n > 0 {
+			b["linked tracking: records proven posted by the old helper's own echo -> delivered (not mirrored again)"] += n
+		}
 	default:
 		why := "file missing"
 		if fst.ok {

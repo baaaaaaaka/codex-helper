@@ -140,6 +140,7 @@ func Run(opt Options) (*Report, error) {
 		inboundOld: map[string]int64{}, needPause: map[int64]string{}, threadLinks: links,
 		orphans: map[string]int64{}, lastAct: map[int64]int64{},
 		proofs: map[string]*proof{}, outboxMirror: map[string]string{}, loserOf: map[int64]int64{}, mirrorUsed: map[string]bool{},
+		echoes: map[int64][]*echoMsg{},
 	}
 	err = st.Import(func(im *store.Importer) error {
 		c.im = im

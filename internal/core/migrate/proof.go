@@ -126,6 +126,8 @@ type mirrorRec struct {
 	Start, End, Line int64
 	Kind             string // "prompt" or "final"
 	ID               string
+	Key              string // echoKey of its text (echo.go)
+	At               int64  // its rollout timestamp (unix ms; 0: unknown)
 }
 
 type scanReq struct {
@@ -307,8 +309,9 @@ func turnRecordID(turn, kind string, line int64) string {
 }
 
 type rolloutLine struct {
-	Type    string `json:"type"`
-	Payload struct {
+	Timestamp string `json:"timestamp"`
+	Type      string `json:"type"`
+	Payload   struct {
 		Type             string  `json:"type"`
 		ID               string  `json:"id"`
 		Role             string  `json:"role"`
@@ -334,6 +337,9 @@ func (c *classifier) classify(rec []byte, start, end, line int64) {
 	}
 	pl := l.Payload
 	r := mirrorRec{Start: start, End: end, Line: line}
+	if t, err := time.Parse(time.RFC3339Nano, l.Timestamp); err == nil {
+		r.At = t.UnixMilli()
+	}
 	switch {
 	case l.Type == "turn_context":
 		c.setTurn(pl.TurnID, false)
@@ -348,7 +354,7 @@ func (c *classifier) classify(rec []byte, start, end, line int64) {
 		seen := c.finalSeen
 		c.finalSeen = true
 		if started && !seen && pl.LastAgentMessage != nil && strings.TrimSpace(*pl.LastAgentMessage) != "" {
-			r.Kind = "final"
+			r.Kind, r.Key = "final", echoKey(*pl.LastAgentMessage)
 			c.pending = append(c.pending, r)
 		}
 	case l.Type == "response_item" && pl.Type == "message" && pl.Role == "user":
@@ -363,23 +369,24 @@ func (c *classifier) classify(rec []byte, start, end, line int64) {
 			c.teamsTurn = true
 		default:
 			c.twin = ""
-			r.Kind, r.ID = "prompt", pl.ID
+			r.Kind, r.ID, r.Key = "prompt", pl.ID, echoKey(text)
 			c.pending = append(c.pending, r)
 		}
 	case l.Type == "response_item" && pl.Type == "message" && pl.Role == "assistant" && pl.Phase == "final_answer":
 		c.finalSeen = true
+		var sb strings.Builder
+		for _, ct := range pl.Content {
+			sb.WriteString(ct.Text)
+		}
+		text := strings.TrimSpace(sb.String())
 		if c.twin != "" {
-			var sb strings.Builder
-			for _, ct := range pl.Content {
-				sb.WriteString(ct.Text)
-			}
-			twin := strings.TrimSpace(sb.String()) == c.twin
+			twin := text == c.twin
 			c.twin = ""
 			if twin {
 				return
 			}
 		}
-		r.Kind, r.ID = "final", pl.ID
+		r.Kind, r.ID, r.Key = "final", pl.ID, echoKey(text)
 		c.pending = append(c.pending, r)
 	}
 }

@@ -84,7 +84,8 @@ type converter struct {
 	outboxMirror map[string]string // legacy outbox id -> mirror delivery key
 	loserOf      map[int64]int64   // parked shared-thread conversation -> winner
 	mirrorUsed   map[string]bool
-	zeroNoProof  int // tracking sources resumed at 0 for lack of proof
+	zeroNoProof  int                  // tracking sources resumed at 0 for lack of proof
+	echoes       map[int64][]*echoMsg // helper posts read back, per conversation (echo.go)
 	ledger       []legacyLedger
 }
 
@@ -542,6 +543,7 @@ func (c *converter) convertInbound() error {
 			orphanRows = append(orphanRows, in)
 			return nil
 		}
+		c.noteEcho(conv, in)
 		return c.importInbound(e, in, conv, "")
 	})
 	if err != nil {
