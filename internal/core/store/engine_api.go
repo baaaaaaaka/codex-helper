@@ -17,7 +17,7 @@ func (t *Tx) OutboxByHash(convID int64, hash []byte, since int64) ([]Outbox, err
 		return nil, nil
 	}
 	return collect(scanOutbox)(t.rows(`SELECT `+outboxCols+` FROM outbox
-WHERE conv_id = ? AND body_hash = ? AND state IN ('sending','sent','unknown') AND created_at >= ? ORDER BY seq`,
+WHERE conv_id = ? AND body_hash = ? AND state IN ('sending','sent','unknown') AND created_at >= ? AND hash_algo IS NULL ORDER BY seq`,
 		convID, hash, since))
 }
 
