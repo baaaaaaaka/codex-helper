@@ -1,0 +1,263 @@
+# Builds the managed voice-transcription runtime (llama.cpp llama-server and
+# its libraries) for every platform internal/asr supports, checks that each
+# build runs on old/plain systems, and uploads the archives plus pin files.
+#
+# Manual only and NOT part of a release: after reviewing a run, publish the
+# archives as the "llama-asr-<tag>-<rev>" release by hand and copy the pins
+# from the run summary into internal/asr/pins.go.
+name: llama-asr-assets
+
+on:
+  workflow_dispatch:
+    inputs:
+      llama_tag:
+        description: llama.cpp release tag
+        default: b9437
+      llama_commit:
+        description: expected commit of the tag
+        default: aa46bda89b9a8378ae76bb15fc2ce2f571f0983c
+      asset_rev:
+        description: our packaging revision
+        default: r1
+      windows_crt:
+        description: "static: link the VC++ runtime into every binary; applocal: ship vcruntime140/msvcp140 next to them"
+        type: choice
+        options: [static, applocal]
+        default: static
+      model_smoke:
+        description: also transcribe a spoken sentence with the real Qwen3-ASR model
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  LLAMA_TAG: ${{ inputs.llama_tag }}
+  LLAMA_COMMIT: ${{ inputs.llama_commit }}
+  ASSET_REV: ${{ inputs.asset_rev }}
+  MODEL_URL: https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/928ab958557df9aa2ef1c93e0e83c7ad0933fae2
+  MODEL_SHA256: bca259818b50ca7c4c05e9bdb35a5dc04fa039653a6d6f3f0f331f96f6aa1971
+  MMPROJ_SHA256: 41a342b5e4c514e968cb756de6cd1b7be39eff43c44c57a2ef5fc6522e36603d
+  SMOKE_TEXT: Hello world. Please run the unit tests and then open a pull request.
+  # Common to every platform; matches scripts/ci/build-llama-asr.sh.
+  COMMON_CMAKE: >-
+    -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF
+    -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_UI=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF
+    -DLLAMA_BUILD_APP=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON
+
+jobs:
+  linux:
+    name: linux-${{ matrix.arch }} (manylinux2014, glibc 2.17)
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: x64, runner: ubuntu-24.04, image: quay.io/pypa/manylinux2014_x86_64 }
+          - { arch: arm64, runner: ubuntu-24.04-arm, image: quay.io/pypa/manylinux2014_aarch64 }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build in manylinux2014
+        run: |
+          mkdir -p out
+          docker run --rm -v "$PWD":/work:ro -v "$PWD/out":/out \
+            -e LLAMA_TAG -e LLAMA_COMMIT -e ASSET_REV -e ASSET_PLATFORM=linux-${{ matrix.arch }} \
+            ${{ matrix.image }} /work/scripts/ci/build-llama-asr.sh
+          sudo chown -R "$(id -u):$(id -g)" out
+      - name: Run on CentOS 7 (glibc 2.17)
+        run: |
+          name=llama-asr-$LLAMA_TAG-$ASSET_REV-linux-${{ matrix.arch }}
+          mkdir -p run && tar -xzf out/$name.tar.gz -C run
+          docker run --rm --network=none -v "$PWD/run":/asr:ro centos:7 sh -euxc "
+            cat /etc/redhat-release; ldd --version | head -1
+            if ldd /asr/$name/llama-server | grep 'not found'; then exit 1; fi
+            /asr/$name/llama-server --version"
+      - name: Real-model smoke
+        if: inputs.model_smoke
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q espeak-ng
+          espeak-ng -w smoke.wav "$SMOKE_TEXT"
+          scripts/ci/llama-asr-fetch-model.sh models
+          python3 scripts/ci/llama-asr-smoke.py "$PWD/run/llama-asr-$LLAMA_TAG-$ASSET_REV-linux-${{ matrix.arch }}/llama-server" \
+            models/model.gguf models/mmproj.gguf smoke.wav "unit tests"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llama-asr-linux-${{ matrix.arch }}
+          path: out/*
+
+  macos:
+    name: macos-${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Metal is compiled in (embedded shaders); the CPU path is used
+          # unless the helper asks for the GPU (llama-server --device none).
+          - { arch: arm64, runner: macos-15, cmake: "-DGGML_METAL=ON -DGGML_METAL_EMBED_LIBRARY=ON -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3" }
+          # Upstream disables Metal on Intel; CPU variants cover old and new x86.
+          - { arch: x64, runner: macos-15-intel, cmake: "-DGGML_METAL=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3" }
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch llama.cpp
+        run: scripts/ci/llama-asr-fetch-source.sh src
+      - name: Build
+        run: |
+          cmake -S src -B build $COMMON_CMAKE ${{ matrix.cmake }} \
+            -DCMAKE_INSTALL_RPATH=@loader_path -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
+          # Build everything: with GGML_BACKEND_DL the CPU variants are plugins,
+          # not link dependencies of llama-server.
+          cmake --build build --config Release -j "$(sysctl -n hw.logicalcpu)"
+      - name: Package and check
+        run: |
+          name=llama-asr-$LLAMA_TAG-$ASSET_REV-macos-${{ matrix.arch }}
+          mkdir -p stage/$name out
+          cp build/bin/llama-server stage/$name/
+          for f in build/bin/*.dylib build/bin/*.so; do
+            [ -e "$f" ] || continue
+            case "$(basename "$f")" in libllama-server-impl*) ;; libllama-*-impl*) continue ;; esac
+            cp "$f" stage/$name/
+          done
+          cp src/LICENSE stage/$name/LICENSE-llama.cpp
+          # Every non-system dependency must resolve next to the binary.
+          for f in stage/$name/llama-server stage/$name/*.dylib; do
+            bad=$(otool -L "$f" | tail -n +2 | awk '{print $1}' | grep -v -E '^(/usr/lib/|/System/Library/|@rpath/|@loader_path/)' || true)
+            if [ -n "$bad" ]; then echo "::error::$f depends on $bad"; exit 1; fi
+          done
+          xattr -cr stage/$name
+          stage/$name/llama-server --version 2>&1 | tee stage/$name/BUILDINFO.txt
+          (cd stage && tar -czf ../out/$name.tar.gz $name)
+          scripts/ci/llama-asr-pin.sh out/$name.tar.gz macos-${{ matrix.arch }}
+      - name: Real-model smoke
+        if: inputs.model_smoke
+        run: |
+          say -o smoke.wav --data-format=LEI16@16000 "$SMOKE_TEXT"
+          scripts/ci/llama-asr-fetch-model.sh models
+          python3 scripts/ci/llama-asr-smoke.py "$PWD/stage/llama-asr-$LLAMA_TAG-$ASSET_REV-macos-${{ matrix.arch }}/llama-server" \
+            models/model.gguf models/mmproj.gguf smoke.wav "unit tests"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llama-asr-macos-${{ matrix.arch }}
+          path: out/*
+
+  windows:
+    name: windows-${{ matrix.arch }} (${{ inputs.windows_crt }} CRT)
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # x64: every CPU variant (loaded at run time) plus the Vulkan plugin,
+          # which is kept in gpu/ and only loaded when the helper asks for the GPU.
+          - { arch: x64, runner: windows-2025, vcvars: x64, cmake: "-DCMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_VULKAN=ON" }
+          # arm64: built natively so it can be smoke-tested; armv8.2-a instead of
+          # upstream's armv8.7-a so first-generation Windows-on-ARM devices work.
+          - { arch: arm64, runner: windows-11-arm, vcvars: arm64, cmake: "-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER_TARGET=arm64-pc-windows-msvc -DCMAKE_CXX_COMPILER_TARGET=arm64-pc-windows-msvc -DCMAKE_C_FLAGS=-march=armv8.2-a -DCMAKE_CXX_FLAGS=-march=armv8.2-a" }
+    env:
+      VULKAN_VERSION: 1.4.313.2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch llama.cpp
+        shell: bash
+        run: scripts/ci/llama-asr-fetch-source.sh src
+      - name: Install Ninja
+        run: choco install ninja -y --no-progress
+      - name: Install Vulkan SDK (build only; not shipped)
+        if: matrix.arch == 'x64'
+        run: |
+          curl.exe -sSfL -o "$env:RUNNER_TEMP\vulkan.exe" "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/vulkansdk-windows-X64-$env:VULKAN_VERSION.exe"
+          & "$env:RUNNER_TEMP\vulkan.exe" --accept-licenses --default-answer --confirm-command install
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\$env:VULKAN_VERSION"
+          Add-Content $env:GITHUB_PATH "C:\VulkanSDK\$env:VULKAN_VERSION\bin"
+      - name: Build
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath`) do set VSDIR=%%i
+          call "%VSDIR%\VC\Auxiliary\Build\vcvarsall.bat" ${{ matrix.vcvars }} || exit /b 1
+          set CRT=-DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+          if "${{ inputs.windows_crt }}"=="applocal" set CRT=-DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL
+          cd src
+          cmake -S . -B ..\build -G Ninja %COMMON_CMAKE% %CRT% ${{ matrix.cmake }} || exit /b 1
+          cmake --build ..\build || exit /b 1
+      - name: Package
+        run: |
+          $name = "llama-asr-$env:LLAMA_TAG-$env:ASSET_REV-win-${{ matrix.arch }}"
+          $dst = "stage\$name"
+          New-Item -ItemType Directory -Force $dst, "$dst\gpu", out | Out-Null
+          Copy-Item build\bin\llama-server.exe $dst
+          Get-ChildItem build\bin\*.dll | Where-Object { $_.Name -notmatch '^llama-.*-impl\.dll$' -or $_.Name -eq 'llama-server-impl.dll' } | Copy-Item -Destination $dst
+          if (Test-Path "$dst\ggml-vulkan.dll") { Move-Item "$dst\ggml-vulkan.dll" "$dst\gpu\" }
+          Copy-Item src\LICENSE "$dst\LICENSE-llama.cpp"
+          if ("${{ inputs.windows_crt }}" -eq "applocal") {
+            $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+            $crt = Get-ChildItem "$vs\VC\Redist\MSVC\*\${{ matrix.arch }}\Microsoft.VC14*.CRT" -Directory | Sort-Object FullName | Select-Object -Last 1
+            foreach ($dll in "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll") {
+              if (Test-Path "$($crt.FullName)\$dll") { Copy-Item "$($crt.FullName)\$dll" $dst }
+            }
+          }
+          "name=$name" >> $env:GITHUB_ENV
+      - name: Check DLL dependencies
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          $host_ = if ("${{ matrix.arch }}" -eq "arm64") { "Hostarm64\arm64" } else { "Hostx64\x64" }
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\$host_\dumpbin.exe" | Select-Object -Last 1
+          $dst = "stage\$env:name"
+          $shipped = (Get-ChildItem $dst -Recurse -Filter *.dll).Name | ForEach-Object { $_.ToLower() }
+          # In-box Windows DLLs only. api-ms-win-crt-* (the UCRT) is in-box since
+          # Windows 10; vcruntime/msvcp/libomp are not and must never be imported
+          # unless shipped app-local. vulkan-1.dll comes with GPU drivers and is
+          # only allowed for the optional gpu/ plugin.
+          $system = '^(kernel32|user32|advapi32|ws2_32|shell32|ole32|oleaut32|bcrypt|ntdll|shlwapi|crypt32|secur32|dbghelp|psapi|iphlpapi|version|mswsock|winmm|api-ms-win-core-.*|api-ms-win-crt-.*)\.dll$'
+          $report = @()
+          $bad = $false
+          foreach ($f in Get-ChildItem $dst -Recurse -Include *.exe, *.dll) {
+            $deps = & $dumpbin.FullName /nologo /dependents $f.FullName | Where-Object { $_ -match '^\s+\S+\.dll\s*$' } | ForEach-Object { $_.Trim().ToLower() }
+            foreach ($d in $deps) {
+              $ok = ($d -match $system) -or ($shipped -contains $d) -or ($d -eq 'vulkan-1.dll' -and $f.Directory.Name -eq 'gpu')
+              if (-not $ok) { $bad = $true; Write-Host "::error::$($f.Name) imports $d" }
+              if ($d -match '^(vcruntime|msvcp|libomp|vcomp)') { $report += "$($f.Name) -> $d" }
+            }
+          }
+          $summary = if ($report.Count -eq 0) { "no VC++ runtime / OpenMP imports (static CRT)" } else { "VC++ runtime imports (app-local): " + ($report -join ', ') }
+          Write-Host $summary
+          "Windows ${{ matrix.arch }} CRT: $summary" | Out-File -Append "$dst\BUILDINFO.txt"
+          if ($bad) { exit 1 }
+      - name: Smoke
+        shell: bash
+        run: |
+          "stage/$name/llama-server.exe" --version 2>&1 | tee -a "stage/$name/BUILDINFO.txt"
+          mkdir -p out && (cd stage && tar -czf "../out/$name.tar.gz" "$name")
+          scripts/ci/llama-asr-pin.sh "out/$name.tar.gz" "win-${{ matrix.arch }}"
+      - name: Real-model smoke
+        if: inputs.model_smoke
+        shell: bash
+        run: |
+          powershell -NoProfile -Command "Add-Type -AssemblyName System.Speech; \$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; \$s.SetOutputToWaveFile('smoke.wav'); \$s.Speak(\$env:SMOKE_TEXT); \$s.Dispose()"
+          scripts/ci/llama-asr-fetch-model.sh models
+          python scripts/ci/llama-asr-smoke.py "$PWD/stage/$name/llama-server.exe" models/model.gguf models/mmproj.gguf smoke.wav "unit tests"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llama-asr-win-${{ matrix.arch }}
+          path: out/*
+
+  pins:
+    needs: [linux, macos, windows]
+    if: always()
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Go pins for internal/asr/pins.go
+        run: |
+          {
+            echo '### llama-asr pins'
+            echo 'Publish the archives below as release `llama-asr-${{ inputs.llama_tag }}-${{ inputs.asset_rev }}`, then set:'
+            echo '```go'
+            for f in artifacts/*/*.pin.json; do
+              python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); print("\t\"%s\": runtimeAsset(\"%s\", FormatTarGz, \"%s\", %d)," % ({"linux-x64":"linux/amd64","linux-arm64":"linux/arm64","macos-arm64":"darwin/arm64","macos-x64":"darwin/amd64","win-x64":"windows/amd64","win-arm64":"windows/arm64"}[p["platform"]], p["platform"], p["sha256"], p["size"]))' "$f"
+            done
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"
