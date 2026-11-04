@@ -51,6 +51,7 @@ func newTeamsMigrateCmd() *cobra.Command {
 	f.BoolVar(&opt.DryRun, "dry-run", false, "Write the result and report into --out without touching the source")
 	f.BoolVar(&opt.Immutable, "immutable", false, "Read an existing consistent snapshot directly instead of taking a backup")
 	f.StringVar(&opt.CodexSessions, "codex-sessions", "", "Codex rollout directory (default: $CODEX_HOME/sessions or ~/.codex/sessions)")
+	f.BoolVar(&opt.CountBacklog, "count-backlog", false, "Scan tracked rollouts to EOF (read-only) to count the first-start catch-up")
 	f.BoolVar(&noRollouts, "no-rollouts", false, "Skip the rollout stat/first-line scan")
 	return cmd
 }
