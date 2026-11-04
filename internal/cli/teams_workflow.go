@@ -40,6 +40,12 @@ func newTeamsWorkflowEnableCmd(root *rootOptions, registryPath *string) *cobra.C
 			if err != nil {
 				return err
 			}
+			if corePath, use, err := teamsNewCoreCLIStorePath(); use {
+				if err != nil {
+					return err
+				}
+				return runTeamsNewCoreWorkflowEnable(cmd.OutOrStdout(), corePath, path)
+			}
 			bridge, closeBridge, err := newTeamsWorkflowBridge(cmd.Context(), root, registryPath, cmd.OutOrStdout(), cmd.ErrOrStderr())
 			if err != nil {
 				return err
@@ -76,6 +82,12 @@ func newTeamsWorkflowDisableCmd(root *rootOptions, registryPath *string) *cobra.
 		Short: "Disable Workflow notification cards",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if corePath, use, err := teamsNewCoreCLIStorePath(); use {
+				if err != nil {
+					return err
+				}
+				return runTeamsNewCoreWorkflowDisable(cmd.OutOrStdout(), corePath)
+			}
 			bridge, closeBridge, err := newTeamsWorkflowBridge(cmd.Context(), root, registryPath, cmd.OutOrStdout(), cmd.ErrOrStderr())
 			if err != nil {
 				return err
@@ -108,6 +120,18 @@ func newTeamsWorkflowTestCmd(root *rootOptions, registryPath *string) *cobra.Com
 		Short: "Send a test Workflow notification card to the configured control chat",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if corePath, use, err := teamsNewCoreCLIStorePath(); use {
+				if err != nil {
+					return err
+				}
+				file := ""
+				if strings.TrimSpace(webhookURLFile) != "" {
+					if file, err = normalizeTeamsWorkflowURLFile(webhookURLFile); err != nil {
+						return err
+					}
+				}
+				return runTeamsNewCoreWorkflowTest(cmd, root, corePath, file)
+			}
 			bridge, closeBridge, err := newTeamsWorkflowBridge(cmd.Context(), root, registryPath, cmd.OutOrStdout(), cmd.ErrOrStderr())
 			if err != nil {
 				return err
@@ -188,6 +212,12 @@ func normalizeTeamsWorkflowURLFile(path string) (string, error) {
 }
 
 func printTeamsWorkflowStatus(cmd *cobra.Command) error {
+	if corePath, use, err := teamsNewCoreCLIStorePath(); use {
+		if err != nil {
+			return err
+		}
+		return printTeamsNewCoreWorkflowStatus(cmd.OutOrStdout(), corePath)
+	}
 	paths, err := existingTeamsStorePaths()
 	if err != nil {
 		return err

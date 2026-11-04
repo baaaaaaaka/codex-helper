@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
 	"github.com/baaaaaaaka/codex-helper/internal/core/delegate"
 	"github.com/baaaaaaaka/codex-helper/internal/core/engine"
 	"github.com/baaaaaaaka/codex-helper/internal/core/migrate"
@@ -20,25 +19,16 @@ import (
 // unsent messages, Workflow cards and the registry machine id. It writes
 // nothing when the new core is neither selected nor has a store.
 func writeTeamsNewCoreStatus(out io.Writer, now time.Time) {
-	selected := teamsEnvSelectsNewCore(map[string]string{envTeamsCore: os.Getenv(envTeamsCore)})
-	stateDir, err := appdirs.StateDir()
-	if err != nil {
-		if selected {
-			_, _ = fmt.Fprintf(out, "\nTeams helper (new core): state directory: %v\n", err)
-		}
+	path, use, err := teamsNewCoreCLIStorePath()
+	if !use {
 		return
 	}
-	path, err := resolveTeamsCoreStorePath(stateDir)
 	if err != nil {
-		if selected {
-			_, _ = fmt.Fprintf(out, "\nTeams helper (new core): %v\n", err)
-		}
+		_, _ = fmt.Fprintf(out, "\nTeams helper (new core): %v\n", err)
 		return
 	}
 	if _, statErr := os.Stat(path); statErr != nil {
-		if selected {
-			_, _ = fmt.Fprintf(out, "\nTeams helper (new core): no store yet (%s)\n", path)
-		}
+		_, _ = fmt.Fprintf(out, "\nTeams helper (new core): no store yet (%s)\n", path)
 		return
 	}
 	_, _ = fmt.Fprintf(out, "\nTeams helper (new core)\nStore: %s\n", path)
