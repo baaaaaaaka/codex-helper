@@ -3,6 +3,7 @@ package newcore
 import (
 	"os"
 	"sort"
+	"strconv"
 
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakecodex"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/harness"
@@ -70,4 +71,28 @@ func (s *ProcSUT) childEnv(tag string) []string {
 	}
 	sort.Strings(env)
 	return env
+}
+
+// CXPFactory returns a factory that runs the production entry point,
+// `cxp teams run --core=new`, built with the e2e tag (bins.SUT is that cxp
+// binary). Same lifecycle as ProcessFactory; Codex is found through
+// --codex-path and the fake app-server gets its settings from the
+// inherited environment.
+func CXPFactory(bins Binaries) harness.SUTFactory {
+	return func(cfg harness.SUTConfig) (harness.SUT, error) {
+		s := &ProcSUT{cfg: cfg, bins: bins}
+		registry := cfg.ExtraEnv["E2E_SUT_MACHINE_REGISTRY"] == "1"
+		args := []string{"teams", "run", "--core=new", "--codex-path", bins.Codex,
+			"--machine-registry=" + strconv.FormatBool(registry), "--auto-update=false", "--auto-service=false"}
+		env := func(tag string) []string {
+			return append(s.childEnv(tag),
+				"CODEX_HELPER_TEAMS_CORE=new",
+				fakecodex.EnvKind+"=work",
+				fakecodex.EnvInstance+"="+tag,
+				"CXP_RUNTIME_DISABLE=1",
+			)
+		}
+		s.ProcessSUT = harness.NewProcessSUT(cfg, harness.ProcessSpec{Name: "cxp", Binary: bins.SUT, Args: args, Env: env})
+		return s, nil
+	}
 }

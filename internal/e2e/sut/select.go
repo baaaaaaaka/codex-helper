@@ -22,6 +22,8 @@ import (
 //	oldcore-inproc  the M1 in-process adapter (fake teams.Executor)
 //	newcore         the rebuilt core (internal/core/engine) as a subprocess:
 //	                real channel/teams adapter, codexagent + fake app-server
+//	cxp             the new core through the production entry point:
+//	                `cxp teams run --core=new` (e2e build tag)
 const EnvSUT = "E2E_SUT"
 
 // Run is the TestMain body of every scenario package: it selects the SUT,
@@ -76,20 +78,45 @@ func Run(m *testing.M) int {
 		fmt.Fprintf(os.Stderr, "e2e: built SUT binaries in %v\n", time.Since(start).Round(time.Millisecond))
 		harness.DefaultFactory = newcore.ProcessFactory(bins)
 		harness.SetProcessEnv = false
+	case "cxp":
+		dir, err := os.MkdirTemp("", "e2e-bin-")
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 2
+		}
+		defer os.RemoveAll(dir)
+		bins := newcore.Binaries{
+			SUT:   filepath.Join(dir, "cxp"),
+			Codex: filepath.Join(dir, "codex"),
+		}
+		start := time.Now()
+		// The real cxp entry point; the e2e tag only adds the sandbox
+		// transport and the scenario's timing (internal/cli/teams_newcore_e2e.go).
+		if err := goBuild(bins.SUT, "./cmd/codex-proxy", "-tags", "e2e"); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 2
+		}
+		if err := goBuild(bins.Codex, "./internal/e2e/fakecodex/cmd/fakecodex"); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			return 2
+		}
+		fmt.Fprintf(os.Stderr, "e2e: built SUT binaries in %v\n", time.Since(start).Round(time.Millisecond))
+		harness.DefaultFactory = newcore.CXPFactory(bins)
+		harness.SetProcessEnv = false
 	default:
-		fmt.Fprintf(os.Stderr, "unknown %s %q (known: oldcore, oldcore-inproc, newcore)\n", EnvSUT, name)
+		fmt.Fprintf(os.Stderr, "unknown %s %q (known: oldcore, oldcore-inproc, newcore, cxp)\n", EnvSUT, name)
 		return 2
 	}
 	return m.Run()
 }
 
 // goBuild builds pkg (relative to the module root) into out.
-func goBuild(out, pkg string) error {
+func goBuild(out, pkg string, flags ...string) error {
 	root, err := moduleRoot()
 	if err != nil {
 		return err
 	}
-	cmd := exec.Command("go", "build", "-o", out, pkg)
+	cmd := exec.Command("go", append(append([]string{"build", "-o", out}, flags...), pkg)...)
 	cmd.Dir = root
 	if msg, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("go build %s: %v\n%s", pkg, err, msg)
