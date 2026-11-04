@@ -172,6 +172,25 @@ func TestProofBasedResume(t *testing.T) {
 		// f1 found by id at line 4; the checkpoint at line 5 has nothing in between.
 		eq(t, "s001 source", qs(t, db, sourceQ, "%"+s001Thread+".jsonl"), "tracking@"+strconv.FormatInt(r.ends[5], 10)+":5")
 	})
+	// Fidelity run, s509: the file was rewritten, so the delivery offset is
+	// not a record end; the ledger id names a record past the old
+	// checkpoint. The id proof must be found without CountBacklog too.
+	t.Run("id proof past the delivery offset without backlog count", func(t *testing.T) {
+		d := map[string]any{"d1": map[string]any{
+			"id": "d1", "session_id": "s001", "outbox_id": "o1", "teams_message_id": "1788256809000", "status": "sent",
+			"codex_thread_id": s001Thread, "source_path": path, "source_line": 4, "source_offset": r.ends[3] + 7, "source_record_id": "f1", "part_index": 1,
+		}}
+		for _, count := range []bool{false, true} {
+			dir := fixture(t, "rc59", "json")
+			editJSON(t, dir, positions(path, r.ends[2], 2, 0, 0, d))
+			rep, db := dryRun(t, dir, func(o *Options) { o.CodexSessions, o.CountBacklog = sessions, count })
+			if !rep.OK() {
+				t.Fatalf("checks: %+v", rep.Checks)
+			}
+			eq(t, "s001 source", qs(t, db, sourceQ, "%"+s001Thread+".jsonl"), "tracking@"+strconv.FormatInt(r.ends[4], 10)+":4")
+		}
+	})
+
 	// Bug B1 (fidelity run, s547/s519): a later "compacted" record repeats
 	// delivered message ids inside replacement_history. Those nested ids are
 	// not the record's own id and must not move the resume position past
