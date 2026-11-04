@@ -1338,3 +1338,23 @@ func TestRequeuedCommandsNotDroppedAndKeepQuote(t *testing.T) {
 		t.Fatalf("%d distinct commands answered, want %d", len(quoted), n)
 	}
 }
+
+// A failed finish transaction is retried; the chat is not left with an
+// open turn (review L1).
+func TestFailedTurnFinishIsRetried(t *testing.T) {
+	var fails atomic.Int32
+	fails.Store(3)
+	r := newRig(t, func(c *Config) {
+		c.finishFault = func() error {
+			if fails.Add(-1) >= 0 {
+				return errors.New("test: disk full")
+			}
+			return nil
+		}
+	})
+	work := r.newWork(t.TempDir())
+	r.ch.PostUser(work, "finish me")
+	r.wait("answer after failed finishes", func() bool { return len(r.own(work, "ANSWER to finish me")) == 1 })
+	r.ch.PostUser(work, "and the next")
+	r.wait("next answer", func() bool { return len(r.own(work, "ANSWER to and the next")) == 1 })
+}

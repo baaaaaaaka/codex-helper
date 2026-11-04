@@ -429,21 +429,46 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 		e.logf("render outcome of turn %d: %v", tr.ID, err)
 		msgs, _ = e.notice(base+":failed", "The answer could not be rendered for this chat. Resend the request if you still need it.")
 	}
-	if err := e.update(func(tx *store.Tx) error {
-		if err := tx.FinishTurn(tr.ID, state, errText, msgs); err != nil {
-			return err
+	// A failed finish (busy database, full disk) is retried: the turn
+	// stays open and the chat waits until it commits (review L1).
+	for attempt := 1; ; attempt++ {
+		err := e.update(func(tx *store.Tx) error {
+			if e.cfg.finishFault != nil {
+				if err := e.cfg.finishFault(); err != nil {
+					return err
+				}
+			}
+			if err := tx.FinishTurn(tr.ID, state, errText, msgs); err != nil {
+				return err
+			}
+			if err := recordUsage(tx, cs.id, state, out.Usage); err != nil {
+				return err
+			}
+			if len(mention) > 0 {
+				_, err := tx.Enqueue(e.controlID, mention)
+				return err
+			}
+			return nil
+		})
+		if err == nil {
+			break
 		}
-		if err := recordUsage(tx, cs.id, state, out.Usage); err != nil {
-			return err
+		if finalStoreError(err) || ctx.Err() != nil {
+			e.logf("finish turn %d: %v", tr.ID, err)
+			return
 		}
-		if len(mention) > 0 {
-			_, err := tx.Enqueue(e.controlID, mention)
-			return err
+		back := e.t.Hot << min(attempt, 8)
+		if back > e.t.MaxBackoff {
+			back = e.t.MaxBackoff
 		}
-		return nil
-	}); err != nil {
-		e.logf("finish turn %d: %v", tr.ID, err)
-		return
+		if attempt <= 3 || attempt%10 == 0 {
+			e.logf("finish turn %d failed (%d): %v; retry in %s", tr.ID, attempt, err, back)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(back):
+		}
 	}
 	if state == store.TurnCompleted {
 		e.count(func(s *engineStats) { s.completed++ })
@@ -455,6 +480,16 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 	if notify {
 		e.notifyFinal(tr.ID, cs, out.Final)
 	}
+}
+
+// finalStoreError: store errors a retry cannot fix.
+func finalStoreError(err error) bool {
+	for _, f := range []error{store.ErrFenced, store.ErrNotAcquired, store.ErrDisabled, store.ErrState, store.ErrNotFound} {
+		if errors.Is(err, f) {
+			return true
+		}
+	}
+	return false
 }
 
 // capacityRetry requeues a capacity failure inside the retry window

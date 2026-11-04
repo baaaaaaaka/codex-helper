@@ -135,6 +135,8 @@ type Config struct {
 	ReadRate float64
 	// WriteRate caps sends per second account-wide.
 	WriteRate float64
+
+	finishFault func() error // tests: fails the turn-finish transaction
 }
 
 // Notifier delivers out-of-band owner notifications.
