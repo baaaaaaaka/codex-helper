@@ -42,12 +42,15 @@ func (e *Ambiguous) Unwrap() error { return e.Err }
 type ThrottleScope int
 
 const (
-	// ScopeUnknown: the service did not say. The core should treat it as
-	// the scope of the request kind: the account gate for reads, the chat
-	// gate for a chat write.
+	// ScopeUnknown: the service did not say. The core treats it
+	// conservatively as the account-wide gate of the request kind: the
+	// account read gate for reads, the account write gate for writes.
 	ScopeUnknown ThrottleScope = iota
 	ScopeChat                  // only the chat the request addressed
 	ScopeAccount               // every request of this kind for the account
+	// ScopeCall: only further calls of the same method (for example
+	// MarkUnread). It never blocks sends or receives.
+	ScopeCall
 )
 
 func (s ThrottleScope) String() string {
@@ -56,6 +59,8 @@ func (s ThrottleScope) String() string {
 		return "chat"
 	case ScopeAccount:
 		return "account"
+	case ScopeCall:
+		return "call"
 	default:
 		return "unknown"
 	}

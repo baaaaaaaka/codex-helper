@@ -39,11 +39,18 @@ type Fake struct {
 	SendFault func(chat string, p channel.Part) (deliver bool, err error)
 	// ReceiveFault, when set, can fail Receive/ReadBack/Get (e.g. *channel.Throttled).
 	ReceiveFault func(stream string) error
+	// MarkUnreadFault, when set, can fail MarkUnread.
+	MarkUnreadFault func(chat string) error
+	// MaxWindow, when > 0, makes Receive fail with *channel.WindowTooLarge
+	// when more than MaxWindow messages are pending.
+	MaxWindow int
 }
 
 type chat struct {
-	info channel.ChatInfo
-	msgs []stored
+	info    channel.ChatInfo
+	msgs    []stored
+	readAt  time.Time
+	unreads int
 }
 
 type stored struct {
@@ -58,7 +65,8 @@ func New() *Fake {
 	f := &Fake{
 		caps: channel.Caps{
 			ReadBack: true, SelfEcho: true, Mentions: true, Quotes: true,
-			Markers: true, HostedFiles: true, MaxPartBytes: 4096,
+			Markers: true, HostedFiles: true, EditMessages: true, MarkUnread: true,
+			MaxPartBytes: 4096,
 		},
 		chats: map[string]*chat{},
 		keys:  map[string]string{},
@@ -148,6 +156,9 @@ func (f *Fake) Receive(_ context.Context, stream, cursor string) (channel.Window
 		w.Msgs = append(w.Msgs, s.msg)
 		w.Cursor = strconv.FormatInt(s.seq, 10)
 	}
+	if f.MaxWindow > 0 && len(w.Msgs) > f.MaxWindow {
+		return channel.Window{}, &channel.WindowTooLarge{Pages: f.MaxWindow, OldestSeen: w.Msgs[0].Modified, SkipCursor: w.Cursor}
+	}
 	return w, nil
 }
 
@@ -169,6 +180,67 @@ func (f *Fake) Send(_ context.Context, chatID string, p channel.Part, token stri
 	}
 	m := f.store(chatID, p, token)
 	return channel.Sent{ID: m.ID, Time: m.Created}, nil
+}
+
+// Edit replaces the text of an owner message. Like Teams, the edited
+// message is returned again by the next Receive (it moves to the end of the
+// stream with a new modification time).
+func (f *Fake) Edit(_ context.Context, chatID, id string, p channel.Part, token string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c := f.chats[chatID]
+	if c == nil {
+		return &channel.Rejected{Permanent: true, Err: fmt.Errorf("chat %s: %w", chatID, channel.ErrNotFound)}
+	}
+	for i, s := range c.msgs {
+		if s.msg.ID != id {
+			continue
+		}
+		if !s.msg.ByOwner {
+			return &channel.Rejected{Permanent: true, Err: fmt.Errorf("message %s was not posted by the owner", id)}
+		}
+		m := s.msg
+		m.Text, m.Hash, m.Edited, m.Marker = p.Body, channel.TextHash(p.Body), true, ""
+		if token != "" && !f.StripMarkers && f.caps.Markers {
+			m.Marker = token
+		}
+		f.seq++
+		m.Modified = f.now()
+		c.msgs = append(append(c.msgs[:i:i], c.msgs[i+1:]...), stored{seq: f.seq, msg: m})
+		return nil
+	}
+	return &channel.Rejected{Permanent: true, Err: fmt.Errorf("message %s/%s: %w", chatID, id, channel.ErrNotFound)}
+}
+
+// MarkUnread records readAt for the chat; see Unread.
+func (f *Fake) MarkUnread(_ context.Context, chatID string, readAt time.Time) error {
+	f.mu.Lock()
+	hook := f.MarkUnreadFault
+	f.mu.Unlock()
+	if hook != nil {
+		if err := hook(chatID); err != nil {
+			return err
+		}
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c := f.chats[chatID]
+	if c == nil {
+		return &channel.Rejected{Permanent: true, Err: fmt.Errorf("chat %s: %w", chatID, channel.ErrNotFound)}
+	}
+	c.readAt = readAt
+	c.unreads++
+	return nil
+}
+
+// Unread returns the last MarkUnread readAt of chat and how often it was called.
+func (f *Fake) Unread(chatID string) (time.Time, int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if c := f.chats[chatID]; c != nil {
+		return c.readAt, c.unreads
+	}
+	return time.Time{}, 0
 }
 
 func (f *Fake) ReadBack(_ context.Context, chatID string, since time.Time) ([]channel.InboundMsg, error) {

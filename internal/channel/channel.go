@@ -63,6 +63,22 @@ type Channel interface {
 	// attempt (nil for a fresh upload); save is called whenever the session
 	// advances so the core can persist it.
 	UploadFile(ctx context.Context, src, name string, sess *UploadSession, save func(UploadSession) error) (FileRef, error)
+
+	// Edit replaces the content of a message this account posted with a
+	// part rendered by Render (Caps.EditMessages). token is embedded as the
+	// hidden marker like in Send; pass the marker of the original message to
+	// keep it recognisable. Editing is idempotent: after *Ambiguous the core
+	// may simply repeat the call.
+	Edit(ctx context.Context, chat, id string, p Part, token string) error
+
+	// MarkUnread makes chat show as unread for the owner (Caps.MarkUnread):
+	// every message created after readAt counts as unread. A delegated-user
+	// channel posts answers as the owner, so without this the chat looks
+	// already read. To flag one sent answer pass Sent.Time minus one
+	// millisecond (zero readAt: let the service choose). It is idempotent and
+	// a notification nicety: a *Throttled from it has Scope == ScopeCall and
+	// must never hold back sends.
+	MarkUnread(ctx context.Context, chat string, readAt time.Time) error
 }
 
 // Caps describes what a channel supports. The core switches features on
@@ -72,7 +88,8 @@ type Caps struct {
 	SelfEcho     bool // Receive also returns messages this helper posted (delegated-user channels)
 	Mentions     bool // RichDoc.Mention notifies the owner
 	Quotes       bool // RichDoc.ReplyTo quotes an earlier message
-	EditMessages bool // posted messages can be edited (no Edit method yet; reserved)
+	EditMessages bool // Edit works for messages this account posted
+	MarkUnread   bool // MarkUnread works
 	Markers      bool // Send can embed a hidden marker; whether the service keeps it must still be self-tested
 	HostedFiles  bool // UploadFile and FetchFile work
 	MaxPartBytes int  // hard limit of Part.Size
