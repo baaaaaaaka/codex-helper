@@ -191,7 +191,19 @@ func (e *Engine) read(ctx context.Context, id int64) {
 		return
 	}
 	if errors.As(err, &tl) {
-		e.logf("read %s: %v", cs.label, err)
+		label := cs.label
+		e.mu.Unlock()
+		moved := e.skipBacklog(id, cursor, tl)
+		e.mu.Lock()
+		cs.failures = 0
+		if moved {
+			cs.nextRead = now
+		} else {
+			// Nothing to skip to: retry rarely, the read is expensive.
+			cs.nextRead = now.Add(e.t.SafetyRead)
+		}
+		e.logf("read %s: %v (skipped: %v)", label, err, moved)
+		return
 	}
 	cs.failures++
 	back := e.t.Hot << min(cs.failures, 10)
@@ -361,6 +373,65 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 		}
 	}
 	return nil
+}
+
+// skipBacklog handles a receive window too large to admit in order (review
+// H3): it posts one notice in the chat saying what was skipped and how to
+// see it, and moves the cursor to the channel's SkipCursor in the same
+// transaction, so the chat is not left deaf and the walk is not repeated.
+// It reports whether the cursor moved.
+func (e *Engine) skipBacklog(id int64, cursor string, tl *channel.WindowTooLarge) bool {
+	e.mu.Lock()
+	cs := e.convs[id]
+	key := e.streamKey(cs)
+	e.mu.Unlock()
+	move := tl.SkipCursor != "" && tl.SkipCursor != cursor
+	err := e.update(func(tx *store.Tx) error {
+		base := fmt.Sprintf("skip:%d:%s", id, cursor)
+		if err := e.enqueueNotice(tx, id, base, textSkippedBacklog(tl, move)); err != nil {
+			return err
+		}
+		if !move {
+			return nil
+		}
+		_, err := tx.AdmitWindow(key, id, nil, tl.SkipCursor)
+		return err
+	})
+	if err != nil {
+		e.logf("skip backlog of conversation %d: %v", id, err)
+		return false
+	}
+	if move {
+		e.mu.Lock()
+		cs.cursor, cs.seeded = tl.SkipCursor, true
+		e.mu.Unlock()
+	}
+	e.wakeSender()
+	return move
+}
+
+// textSkippedBacklog says how many messages were skipped, from when, and
+// how to see them.
+func textSkippedBacklog(tl *channel.WindowTooLarge, moved bool) string {
+	var b strings.Builder
+	b.WriteString("Too many new messages arrived in this chat for the helper to read them in order")
+	const layout = "2006-01-02 15:04"
+	var span []string
+	if tl.Seen > 0 {
+		span = append(span, fmt.Sprintf("at least %d messages", tl.Seen))
+	}
+	if !tl.OldestSeen.IsZero() && !tl.NewestSeen.IsZero() {
+		span = append(span, fmt.Sprintf("from %s or earlier to %s UTC", tl.OldestSeen.UTC().Format(layout), tl.NewestSeen.UTC().Format(layout)))
+	}
+	if len(span) > 0 {
+		b.WriteString(" (" + strings.Join(span, ", ") + ")")
+	}
+	if moved {
+		b.WriteString(". They were skipped and Codex will not answer them; messages sent from now on are handled normally. Scroll up in this chat to read them, and resend anything you still need.")
+	} else {
+		b.WriteString(". New messages here are not answered for now; the helper will try again later. Scroll up in this chat to read them.")
+	}
+	return b.String()
 }
 
 func (e *Engine) streamKey(cs *convState) string {

@@ -92,7 +92,7 @@ func (a *Adapter) walk(ctx context.Context, chat string, since time.Time) ([]cha
 					oldest = m.Modified
 				}
 			}
-			return nil, time.Time{}, pages, &channel.WindowTooLarge{Pages: pages, OldestSeen: oldest, SkipCursor: newest.UTC().Format(cursorLayout)}
+			return nil, time.Time{}, pages, &channel.WindowTooLarge{Pages: pages, Seen: len(out), OldestSeen: oldest, NewestSeen: newest, SkipCursor: newest.UTC().Format(cursorLayout)}
 		}
 		if seenLinks[next] {
 			return nil, time.Time{}, pages, &channel.Rejected{Err: fmt.Errorf("teams: nextLink loop")}

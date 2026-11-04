@@ -170,6 +170,9 @@ type Engine struct {
 
 	readTokens  *bucket
 	writeTokens *bucket
+	// sendLast is the last work conversation the sender served; the next
+	// pass starts after it (round robin). Sender goroutine only.
+	sendLast int64
 
 	fatalOnce sync.Once
 	fatal     error

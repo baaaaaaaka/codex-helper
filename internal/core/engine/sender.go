@@ -80,7 +80,26 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 		e.mu.Lock()
 		ctl := e.controlID
 		e.mu.Unlock()
-		sort.SliceStable(rows, func(i, j int) bool { return rows[i].ConvID == ctl && rows[j].ConvID != ctl })
+		// Control chat first, then round robin from the conversation after
+		// the last one served, so a backlog in low-id chats never starves
+		// the others (review H4, CORE-DESIGN §3).
+		last := e.sendLast
+		rank := func(r store.Outbox) int {
+			switch {
+			case r.ConvID == ctl:
+				return 0
+			case r.ConvID > last:
+				return 1
+			default:
+				return 2
+			}
+		}
+		sort.SliceStable(rows, func(i, j int) bool {
+			if a, b := rank(rows[i]), rank(rows[j]); a != b {
+				return a < b
+			}
+			return rows[i].ConvID < rows[j].ConvID
+		})
 		for _, r := range rows {
 			e.mu.Lock()
 			cs := e.convs[r.ConvID]
@@ -123,6 +142,9 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 			default:
 				soon(e.t.Tick)
 				return nil
+			}
+			if r.ConvID != ctl {
+				e.sendLast = r.ConvID
 			}
 			var fp *store.OutFile
 			if isFile {

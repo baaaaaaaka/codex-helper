@@ -9,6 +9,7 @@ import (
 	"runtime/pprof"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -781,5 +782,109 @@ func TestProgressCoalescedWhenTurnsWaitBehind(t *testing.T) {
 	}
 	if n > 1 {
 		t.Fatalf("%d progress messages for a turn with another queued behind it, want at most 1", n)
+	}
+}
+
+// Review H3: a backlog too large to read in order is skipped once with one
+// notice that says what was skipped; the chat is not left deaf and the
+// too-large walk is not repeated.
+func TestTooLargeBacklogSkippedWithOneNotice(t *testing.T) {
+	var paused atomic.Value
+	paused.Store("")
+	r := newRig(t, func(c *Config) {
+		f := c.Channel.(*channeltest.Fake)
+		f.MaxWindow = 6
+		f.ReceiveFault = func(stream string) error {
+			if stream == paused.Load().(string) {
+				return errors.New("test: reads paused")
+			}
+			return nil
+		}
+	})
+	work := r.newWork(t.TempDir())
+	paused.Store(work)
+	for i := 0; i < 10; i++ {
+		r.ch.PostUser(work, fmt.Sprintf("burst %d", i))
+	}
+	paused.Store("")
+	r.wait("skip notice", func() bool { return len(r.own(work, "Too many new messages")) == 1 })
+	r.ch.PostUser(work, "later prompt")
+	r.wait("later prompt answered", func() bool { return len(r.own(work, "ANSWER to later prompt")) == 1 })
+	notes := r.own(work, "Too many new messages")
+	if len(notes) != 1 {
+		t.Fatalf("%d skip notices, want 1", len(notes))
+	}
+	if txt := notes[0].Text; !strings.Contains(txt, "at least 10 messages") || !strings.Contains(txt, "UTC") || !strings.Contains(txt, "Scroll up") {
+		t.Errorf("notice does not say what was skipped and how to see it: %q", txt)
+	}
+	if n := r.ag.calls("burst"); n != 0 {
+		t.Errorf("%d skipped messages were run", n)
+	}
+	r.logMu.Lock()
+	walks := strings.Count(r.log.String(), "receive window larger")
+	r.logMu.Unlock()
+	if walks != 1 {
+		t.Errorf("too-large window read %d times, want 1", walks)
+	}
+}
+
+// Review H4: twelve chats with an outbox backlog share the write budget
+// round robin; a backlog in low-id chats does not starve the others.
+func TestSenderServesChatsRoundRobin(t *testing.T) {
+	r := &rig{t: t, ch: channeltest.New(), ag: newAgent(), path: filepath.Join(t.TempDir(), "core.db"), log: &strings.Builder{}, logMu: &sync.Mutex{}}
+	r.tweak = func(*Config) {}
+	t.Cleanup(r.stop)
+	ctx := context.Background()
+	ctl, _ := r.ch.CreateChat(ctx, "control", "c")
+	var chats []string
+	for i := 0; i < 12; i++ {
+		ci, _ := r.ch.CreateChat(ctx, "w", fmt.Sprintf("k%02d", i))
+		chats = append(chats, ci.ID)
+	}
+	st, err := store.Open(r.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = st.Import(func(im *store.Importer) error {
+		if _, err := im.Conversation(store.Conversation{Label: "control", Kind: store.KindControl, Channel: "teams", ExtChatID: ctl.ID, State: store.ConvActive}); err != nil {
+			return err
+		}
+		for i, chat := range chats {
+			id, err := im.Conversation(store.Conversation{Label: fmt.Sprintf("s%03d", i+1), Kind: store.KindWork, Channel: "teams", ExtChatID: chat, State: store.ConvActive})
+			if err != nil {
+				return err
+			}
+			if err := im.Stream(store.Stream{Key: store.ChatStreamKey("teams", chat), ConvID: id, Cursor: "0", Seeded: true}); err != nil {
+				return err
+			}
+			for k := 0; k < 40; k++ {
+				key := fmt.Sprintf("rr:%s:%02d", chat, k)
+				if _, _, err := im.Outbox(store.Outbox{ConvID: id, DeliveryKey: key, Seq: int64(k + 1), Kind: store.OutNotice, Body: "backlog " + key, State: store.OutQueued, CreatedAt: im.Now()}, nil); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	r.start()
+	counts := func() (got []int, sum int) {
+		for _, c := range chats {
+			n := len(r.own(c, "backlog"))
+			got, sum = append(got, n), sum+n
+		}
+		return got, sum
+	}
+	r.wait("30 backlog posts", func() bool { _, sum := counts(); return sum >= 30 })
+	got, _ := counts()
+	lo, hi := got[0], got[0]
+	for _, n := range got {
+		lo, hi = min(lo, n), max(hi, n)
+	}
+	if lo < 2 || hi-lo > 2 {
+		t.Fatalf("posts per chat after 30 sends: %v, want an even spread (each >= 2, spread <= 2)", got)
 	}
 }

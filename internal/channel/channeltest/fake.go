@@ -157,7 +157,7 @@ func (f *Fake) Receive(_ context.Context, stream, cursor string) (channel.Window
 		w.Cursor = strconv.FormatInt(s.seq, 10)
 	}
 	if f.MaxWindow > 0 && len(w.Msgs) > f.MaxWindow {
-		return channel.Window{}, &channel.WindowTooLarge{Pages: f.MaxWindow, OldestSeen: w.Msgs[0].Modified, SkipCursor: w.Cursor}
+		return channel.Window{}, &channel.WindowTooLarge{Pages: f.MaxWindow, Seen: len(w.Msgs), OldestSeen: w.Msgs[0].Modified, NewestSeen: w.Msgs[len(w.Msgs)-1].Modified, SkipCursor: w.Cursor}
 	}
 	return w, nil
 }

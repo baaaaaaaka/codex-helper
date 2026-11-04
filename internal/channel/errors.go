@@ -93,7 +93,9 @@ func (e *AuthRequired) Unwrap() error { return e.Err }
 // decide: retry later, or skip the backlog with SkipCursor.
 type WindowTooLarge struct {
 	Pages      int       // pages fetched before giving up
+	Seen       int       // messages seen before giving up (a lower bound of the backlog)
 	OldestSeen time.Time // oldest modification time reached; older messages were not seen
+	NewestSeen time.Time // newest modification time seen
 	// SkipCursor would resume after the newest message seen, skipping every
 	// message not yet admitted. Only use it after telling the user.
 	SkipCursor string
