@@ -223,8 +223,9 @@ func TestRenderSplitsLongDocuments(t *testing.T) {
 				t.Fatalf("list items %d", strings.Count(all, "<li>item "))
 			}
 			for i, c := range contents[1:] {
-				if !regexp.MustCompile(`</p><ol start="\d+"><li>item `).MatchString(c) {
-					t.Fatalf("list part %d does not continue numbering: %.120s", i+2, c)
+				// Each part opens its own <ol> (v0.1.20 wrote no start attribute).
+				if !strings.Contains(c, "</p><ol><li>item ") || strings.Contains(c, "start=") {
+					t.Fatalf("list part %d does not reopen the list: %.120s", i+2, c)
 				}
 				// No item is cut: every part closes all items it opens.
 				if strings.Count(c, "<li>") != strings.Count(c, "</li>") {
@@ -275,7 +276,7 @@ func TestRenderAttachesFilesToLastPart(t *testing.T) {
 
 func TestSafeTeX(t *testing.T) {
 	ok := []string{`E = mc^2`, `\frac{a}{b}`, `\$5`, `\text{if } x > 0`}
-	bad := []string{"", `\href{x}{y}`, `a $ b`, `\(x\)`, `https://x`, `/home/u/x`, `C:\x`, `a@b.example`, `{`, `}{`, strings.Repeat("{", 65) + strings.Repeat("}", 65), strings.Repeat("x", 9000), `\newcommand{\a}{b}`}
+	bad := []string{"", `\href{x}{y}`, `a $ b`, `\(x\)`, `https://x`, `/home/u/x`, `C:\x`, `a@b.example`, `{`, `}{`, strings.Repeat("{", 65) + strings.Repeat("}", 65), strings.Repeat("x", 9000), strings.Repeat("&", 4000), `\newcommand{\a}{b}`}
 	for _, s := range ok {
 		if !safeTeX(s) {
 			t.Errorf("rejected %q", s)

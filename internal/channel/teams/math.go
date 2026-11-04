@@ -31,6 +31,7 @@ type MathResult struct {
 
 const (
 	maxMathSourceBytes  = 8 << 10  // per formula (N-19)
+	maxMathEscapedBytes = 16 << 10 // per formula, HTML-escaped (v0.1.20)
 	maxMathTotalBytes   = 32 << 10 // per document
 	maxMathFormulas     = 32       // markers per document
 	maxMathBraceDepth   = 64
@@ -53,7 +54,7 @@ var (
 // looks like a path, URL, address, nested delimiter or a macro definition is
 // refused and shown as code instead.
 func safeTeX(src string) bool {
-	if strings.TrimSpace(src) == "" || len(src) > maxMathSourceBytes || strings.ContainsRune(src, 0) {
+	if strings.TrimSpace(src) == "" || len(src) > maxMathSourceBytes || len(esc(src)) > maxMathEscapedBytes || strings.ContainsRune(src, 0) {
 		return false
 	}
 	if strings.Contains(src, mathOpen) || strings.Contains(src, mathClose) {
@@ -68,13 +69,13 @@ func safeTeX(src string) bool {
 		mathUnixRE.MatchString(src) || mathUnsafeRE.MatchString(src) {
 		return false
 	}
-	depth, peak, esc := 0, 0, false
+	depth, peak, escaped := 0, 0, false
 	for _, r := range src {
 		switch {
-		case esc:
-			esc = false
+		case escaped:
+			escaped = false
 		case r == '\\':
-			esc = true
+			escaped = true
 		case r == '{':
 			depth++
 			peak = max(peak, depth)
