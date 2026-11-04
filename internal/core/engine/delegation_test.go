@@ -110,7 +110,8 @@ func TestDelegationRoundTripRunsOnce(t *testing.T) {
 	if n := len(r.own(inbox, "DRESULT d1")); n != 1 {
 		t.Fatalf("%d results", n)
 	}
-	if r.ag.calls("not for us") != 0 || len(r.own(inbox, "d2")) != 0 {
+	// " d2 ": the random worker id of d1's records may contain "d2".
+	if r.ag.calls("not for us") != 0 || len(r.own(inbox, " d2 ")) != 0 {
 		t.Fatal("a request for another machine was taken")
 	}
 	// Only protocol records in the inbox: no acks, progress or notices.
