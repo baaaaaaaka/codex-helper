@@ -572,6 +572,12 @@ func (s *server) runTurn(rt *runningTurn, t *Thread, turn *Turn) {
 		s.cfg.Exit(3)
 		return
 	}
+	for i := 0; i < rt.plan.Compactions; i++ {
+		s.notify("item/completed", map[string]any{"threadId": rt.threadID, "turnId": rt.turnID, "completedAtMs": time.Now().UnixMilli(), "item": map[string]any{
+			"type": "contextCompaction", "id": newID(),
+		}})
+		s.notify("thread/compacted", map[string]any{"threadId": rt.threadID, "turnId": rt.turnID})
+	}
 	if rt.plan.Commentary != "" {
 		s.notify("item/completed", map[string]any{"threadId": rt.threadID, "turnId": rt.turnID, "completedAtMs": time.Now().UnixMilli(), "item": map[string]any{
 			"type": "agentMessage", "id": newID(), "text": rt.plan.Commentary, "phase": "commentary",

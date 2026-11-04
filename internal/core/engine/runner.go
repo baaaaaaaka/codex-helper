@@ -382,6 +382,14 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 				e.progress(ctx, cs, tr, prog, text)
 			}
 		},
+		// v0.1.20 posted each compaction as Codex status; it is one more
+		// progress message (same pacing, caps and delivery keys).
+		Compacted: func() {
+			touch()
+			if rs.request == "" {
+				e.progress(ctx, cs, tr, prog, textCompacted)
+			}
+		},
 		Activity: touch,
 		Cancelled: func() bool {
 			e.mu.Lock()

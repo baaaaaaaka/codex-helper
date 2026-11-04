@@ -63,11 +63,15 @@ type ResumeDecision struct {
 type Plan struct {
 	Seq int `json:"seq"`
 	// RejectStart, if set, is returned as the JSON-RPC error of turn/start.
-	RejectStart    string `json:"rejectStart,omitempty"`
-	Commentary     string `json:"commentary,omitempty"`
-	Crash          bool   `json:"crash,omitempty"`
-	HoldCompletion bool   `json:"holdCompletion,omitempty"`
-	SurviveHelper  bool   `json:"surviveHelper,omitempty"`
+	RejectStart string `json:"rejectStart,omitempty"`
+	Commentary  string `json:"commentary,omitempty"`
+	// Compactions is how many context compactions the turn reports before
+	// its commentary, each as a contextCompaction item and the legacy
+	// thread/compacted notification (as Codex does).
+	Compactions    int  `json:"compactions,omitempty"`
+	Crash          bool `json:"crash,omitempty"`
+	HoldCompletion bool `json:"holdCompletion,omitempty"`
+	SurviveHelper  bool `json:"surviveHelper,omitempty"`
 	// MalformedStart answers turn/start with a result the client cannot
 	// decode while the turn runs on (an error that is neither a JSON-RPC
 	// rejection nor an exit).

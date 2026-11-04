@@ -58,6 +58,8 @@ type TurnHooks struct {
 	Started func(codexTurnID string)
 	// Progress receives commentary.
 	Progress func(text string)
+	// Compacted is called once per context compaction during the turn.
+	Compacted func()
 	// Activity is called on any Codex event of the running turn (silence
 	// hints and the stall bound, R-19). It must not block.
 	Activity func()

@@ -34,10 +34,18 @@ type TurnHooks struct {
 	Started func(turnID string)
 	// Progress receives commentary agent messages.
 	Progress func(text string)
+	// Compacted is called once per context compaction of the turn (a
+	// contextCompaction item, or the legacy thread/compacted notification;
+	// both for one compaction count once).
+	Compacted func()
 	// Activity is called for every notification about the thread (any
 	// sign of life: deltas, items, token counts), for silence tracking.
 	Activity func()
 }
+
+// compactPair is how close a contextCompaction item and a legacy
+// thread/compacted notification must be to count as one compaction.
+const compactPair = 5 * time.Second
 
 // ErrNotStarted wraps a turn/start rejection: the turn certainly did not
 // start.
@@ -62,18 +70,66 @@ func (s *Server) RunTurn(ctx context.Context, p TurnStartParams, poll time.Durat
 		items     = map[string][]Item{} // by turn id
 		usage     = map[string]*Usage{}
 		completed = make(chan Turn, 4)
+		compacts  = map[string]bool{} // contextCompaction item ids seen
+		// The last unpaired item and legacy notification: one of each
+		// within compactPair is one compaction reported both ways.
+		lastItem, lastLegacy time.Time
 	)
+	// compacted reports one compaction of the running turn (item: the
+	// contextCompaction item id, "" for thread/compacted).
+	compacted := func(turn, item string) {
+		mu.Lock()
+		now := time.Now()
+		dup := false
+		switch {
+		case turn != "" && turnID != "" && turn != turnID:
+			dup = true // another turn's (a compaction before turn/start answered is this turn's)
+		case item != "" && compacts[item]:
+			dup = true
+		case item != "":
+			compacts[item] = true
+			if dup = !lastLegacy.IsZero() && now.Sub(lastLegacy) < compactPair; dup {
+				lastLegacy = time.Time{}
+			} else {
+				lastItem = now
+			}
+		default:
+			if dup = !lastItem.IsZero() && now.Sub(lastItem) < compactPair; dup {
+				lastItem = time.Time{}
+			} else {
+				lastLegacy = now
+			}
+		}
+		mu.Unlock()
+		if !dup && hooks.Compacted != nil {
+			hooks.Compacted()
+		}
+	}
 	unsub := s.Subscribe(p.ThreadID, func(n Notification) {
 		if hooks.Activity != nil {
 			hooks.Activity()
 		}
 		switch n.Method {
+		case "thread/compacted":
+			var m struct {
+				TurnID string `json:"turnId"`
+			}
+			if json.Unmarshal(n.Params, &m) == nil {
+				compacted(m.TurnID, "")
+			}
 		case "item/completed":
 			var m struct {
 				TurnID string `json:"turnId"`
 				Item   Item   `json:"item"`
 			}
-			if json.Unmarshal(n.Params, &m) != nil || m.Item.Type != "agentMessage" {
+			if json.Unmarshal(n.Params, &m) != nil {
+				return
+			}
+			if m.Item.Type == "contextCompaction" {
+				compacted(m.TurnID, m.Item.ID)
+				return
+			}
+			if m.Item.Type != "agentMessage" {
 				return
 			}
 			mu.Lock()

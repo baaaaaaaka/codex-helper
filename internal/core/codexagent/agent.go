@@ -158,8 +158,9 @@ func (a *Agent) Run(ctx context.Context, req engine.TurnRequest, hooks engine.Tu
 				hooks.Started(id)
 			}
 		},
-		Progress: hooks.Progress,
-		Activity: hooks.Activity,
+		Progress:  hooks.Progress,
+		Compacted: hooks.Compacted,
+		Activity:  hooks.Activity,
 	})
 	var ns *codex.ErrNotStarted
 	switch {

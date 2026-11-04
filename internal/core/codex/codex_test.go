@@ -98,6 +98,8 @@ func (b *brain) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			plan.HoldCompletion = true
 		case strings.HasPrefix(req.Prompt, "comment"):
 			plan.Commentary = "thinking about it"
+		case strings.HasPrefix(req.Prompt, "compact"):
+			plan.Compactions = 2
 		}
 		_ = json.NewEncoder(w).Encode(plan)
 	case "/await":
@@ -227,6 +229,30 @@ func TestRunTurnAnswerClientIDAndFind(t *testing.T) {
 	res, err = s2.RunTurn(ctx, TurnStartParams{ThreadID: th.ID, ClientID: "cxp-0000abcd-3", Input: []Input{{Text: "again"}}}, time.Minute, TurnHooks{})
 	if err != nil || res.Final != "ANSWER again" {
 		t.Fatalf("second turn: %v %+v", err, res)
+	}
+}
+
+// Each context compaction of a turn is reported once, though Codex reports
+// it both as a contextCompaction item and as thread/compacted.
+func TestRunTurnReportsEachCompactionOnce(t *testing.T) {
+	s, _, cfg := startFake(t)
+	ctx := tctx(t)
+	th, err := s.ThreadStart(ctx, ThreadStartParams{Cwd: cfg.Dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	n := 0
+	res, err := s.RunTurn(ctx, TurnStartParams{ThreadID: th.ID, ClientID: "k-compact", Input: []Input{{Text: "compact twice"}}}, time.Minute, TurnHooks{
+		Compacted: func() { mu.Lock(); n++; mu.Unlock() },
+	})
+	if err != nil || res.Status != StatusCompleted {
+		t.Fatalf("%v %+v", err, res)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if n != 2 {
+		t.Fatalf("%d compactions reported, want 2", n)
 	}
 }
 

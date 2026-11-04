@@ -73,6 +73,9 @@ func (a *fakeAgent) Run(ctx context.Context, req TurnRequest, h TurnHooks) (Turn
 			return TurnOutcome{}, ctx.Err()
 		}
 	}
+	if strings.Contains(req.Text, "compaction") && h.Compacted != nil {
+		h.Compacted()
+	}
 	if strings.Contains(req.Text, "progress") && h.Progress != nil {
 		a.mu.Lock()
 		notes := append([]string(nil), a.notes...)

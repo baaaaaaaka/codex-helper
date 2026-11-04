@@ -77,8 +77,10 @@ func (e *Engine) enqueueNotice(tx *store.Tx, conv int64, base, text string) erro
 // User-visible texts. They never carry internal ids or paths.
 const (
 	// textAccepted is the v0.1.20 ACK, word for word (fidelity run).
-	textAccepted    = "⏳ Codex is working. Request accepted."
-	textFinished    = "✅ Codex finished responding."
+	textAccepted = "⏳ Codex is working. Request accepted."
+	textFinished = "✅ Codex finished responding."
+	// textCompacted is v0.1.20's status post for a context compaction.
+	textCompacted   = "Context compacted. Earlier turns were summarized so Codex can continue the thread."
 	textInterrupted = "The previous request was interrupted when the helper stopped. It was not re-run; resend it if you still need it."
 	textNotStarted  = "The previous request did not run: the helper stopped before Codex accepted it. Resend it if you still need it."
 	textRestarted   = "Helper restarted: the new process is running and has taken over."
