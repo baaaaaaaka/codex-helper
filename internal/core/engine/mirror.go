@@ -1033,10 +1033,10 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 // owner in the work chat.
 func (e *Engine) renderMirror(ctx context.Context, thread string, o transcript.Output) ([]store.OutMsg, error) {
 	var doc channel.RichDoc
-	switch o.Kind {
-	case transcript.OutputPrompt:
+	switch {
+	case o.User || o.Kind == transcript.OutputPrompt:
 		doc = userDoc(strings.TrimSpace(o.Text))
-	case transcript.OutputStatus, transcript.OutputCompact:
+	case o.Kind == transcript.OutputStatus || o.Kind == transcript.OutputCompact:
 		doc = statusDoc(o.Text) // commentary, compaction: Codex status
 	default:
 		doc = answerDoc(o.Text)
