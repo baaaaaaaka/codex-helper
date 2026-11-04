@@ -373,6 +373,11 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 	hooks := TurnHooks{
 		Progress: func(text string) {
 			touch()
+			if strings.TrimSpace(text) != "" {
+				prog.mu.Lock()
+				prog.progressed = true
+				prog.mu.Unlock()
+			}
 			if rs.request == "" { // delegated turns post no progress
 				e.progress(ctx, cs, tr, prog, text)
 			}
@@ -440,6 +445,7 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 	}
 	prog.mu.Lock()
 	queued := prog.queued // not yet named in a progress message
+	out.Progressed = out.Progressed || prog.progressed
 	prog.mu.Unlock()
 	e.finish(ctx, cs, tr, out, cancelled, queued)
 	e.clearRun(id, rs)
@@ -679,17 +685,25 @@ func finalStoreError(err error) bool {
 }
 
 // capacityRetry requeues a capacity failure inside the retry window
-// measured from the first capacity error. It reports whether it requeued.
+// measured from the first capacity error; an attempt that made progress
+// starts a new window (08-11: reset after substantive progress), so the
+// window bounds waiting for capacity, not the length of a task. It reports
+// whether it requeued.
 func (e *Engine) capacityRetry(cs *convState, tr store.Turn, out TurnOutcome) bool {
 	now := e.now()
 	deadline := fromMS(tr.RetryDeadline)
-	if deadline.IsZero() {
+	renew := out.Progressed && !deadline.IsZero()
+	if deadline.IsZero() || renew {
 		deadline = now.Add(e.t.CapacityRetry)
 	}
 	if !now.Before(deadline) {
 		return false
 	}
-	back := e.t.CapacityBackoff << min(tr.Attempt, 5)
+	attempt := tr.Attempt
+	if out.Progressed {
+		attempt = 0
+	}
+	back := e.t.CapacityBackoff << min(attempt, 5)
 	if back > e.t.CapacityBackoff*16 {
 		back = e.t.CapacityBackoff * 16
 	}
@@ -698,7 +712,11 @@ func (e *Engine) capacityRetry(cs *convState, tr store.Turn, out TurnOutcome) bo
 	}
 	first := tr.RetryDeadline == 0
 	err := e.update(func(tx *store.Tx) error {
-		if err := tx.RequeueTurn(tr.ID, ms(deadline)); err != nil {
+		requeue := tx.RequeueTurn
+		if renew {
+			requeue = tx.RequeueTurnNewWindow
+		}
+		if err := requeue(tr.ID, ms(deadline)); err != nil {
 			return err
 		}
 		if first && cs.id != e.inboxID { // the inbox carries protocol records only
@@ -984,6 +1002,8 @@ const (
 type progressState struct {
 	mu     sync.Mutex
 	posted int
+	// progressed: Codex streamed non-empty output during the turn.
+	progressed bool
 	// queued is the quote of a prompt that waited behind an earlier turn,
 	// until a message of the turn names it.
 	queued string

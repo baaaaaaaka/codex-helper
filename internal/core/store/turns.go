@@ -143,6 +143,14 @@ func (t *Tx) RequeueTurn(turnID int64, retryDeadline int64) error {
 		`state = 'queued', retry_deadline = COALESCE(retry_deadline, ?)`, nullInt(retryDeadline))
 }
 
+// RequeueTurnNewWindow is RequeueTurn for a capacity failure after the
+// attempt made progress: the retry window starts again at retryDeadline
+// (the 5-minute bound limits waiting for capacity, not a long task).
+func (t *Tx) RequeueTurnNewWindow(turnID int64, retryDeadline int64) error {
+	return t.turnMove(turnID, []string{TurnStarting, TurnRunning},
+		`state = 'queued', retry_deadline = ?`, nullInt(retryDeadline))
+}
+
 func terminalTurnState(s string) bool {
 	switch s {
 	case TurnCompleted, TurnFailed, TurnInterrupted, TurnNotStarted, TurnCancelled:

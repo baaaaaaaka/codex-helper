@@ -2124,3 +2124,60 @@ func TestOwnerCardFollowsTheFinalAcrossRestart(t *testing.T) {
 		t.Fatalf("%d control-chat mentions besides the card", m)
 	}
 }
+
+// A capacity failure after the attempt made progress for longer than the
+// retry window starts a new window (08-11 spec; decision: fix the 5-minute
+// window measured from the original start): the turn is retried, not
+// failed with "did not run within 5 minutes".
+func TestCapacityWindowRestartsAfterProgress(t *testing.T) {
+	window := 400 * time.Millisecond
+	r := newRig(t, func(c *Config) {
+		c.Timing.CapacityRetry = window
+		c.Timing.CapacityBackoff = 10 * time.Millisecond
+	})
+	r.ag.notes = []string{"step one done"}
+	var mu sync.Mutex
+	n := 0
+	r.ag.outcome = func(req TurnRequest) (TurnOutcome, error) {
+		mu.Lock()
+		n++
+		k := n
+		mu.Unlock()
+		switch k {
+		case 1:
+			return TurnOutcome{Status: StatusFailed, Capacity: true, Error: "Selected model is at capacity"}, nil
+		case 2: // works longer than the window, then capacity again
+			time.Sleep(2 * window)
+			return TurnOutcome{Status: StatusFailed, Capacity: true, Error: "Selected model is at capacity"}, nil
+		}
+		return TurnOutcome{Status: StatusCompleted, Final: "DONE long progress task"}, nil
+	}
+	work := r.newWork(t.TempDir())
+	r.ch.PostUser(work, "long progress task")
+	r.wait("answer", func() bool {
+		return len(r.own(work, "DONE long progress task")) == 1 || len(r.own(work, "over capacity")) > 0
+	})
+	if got := len(r.own(work, "over capacity")); got != 0 {
+		t.Fatalf("capacity failure after progress was not retried (%d failure notices)", got)
+	}
+	if got := r.ag.calls("long progress task"); got != 3 {
+		t.Fatalf("%d attempts, want 3", got)
+	}
+}
+
+// Without progress the window still runs from the first capacity error.
+func TestCapacityWindowBoundsWaitingWithoutProgress(t *testing.T) {
+	r := newRig(t, func(c *Config) {
+		c.Timing.CapacityRetry = 300 * time.Millisecond
+		c.Timing.CapacityBackoff = 10 * time.Millisecond
+	})
+	r.ag.outcome = func(req TurnRequest) (TurnOutcome, error) {
+		return TurnOutcome{Status: StatusFailed, Capacity: true, Error: "Selected model is at capacity"}, nil
+	}
+	work := r.newWork(t.TempDir())
+	r.ch.PostUser(work, "never fits")
+	r.wait("failure notice", func() bool { return len(r.own(work, "over capacity")) == 1 })
+	if got := r.ag.calls("never fits"); got < 2 {
+		t.Fatalf("%d attempts, want retries before the failure", got)
+	}
+}
