@@ -41,9 +41,9 @@ func (e *Ambiguous) Unwrap() error { return e.Err }
 type ThrottleScope int
 
 const (
-	// ScopeUnknown: the service did not say. The core treats it as the
-	// scope of the request kind (one chat for a chat write, the account for
-	// reads), see CHANNEL-REPORT.md.
+	// ScopeUnknown: the service did not say. The core should treat it as
+	// the scope of the request kind: the account gate for reads, the chat
+	// gate for a chat write.
 	ScopeUnknown ThrottleScope = iota
 	ScopeChat                  // only the chat the request addressed
 	ScopeAccount               // every request of this kind for the account
