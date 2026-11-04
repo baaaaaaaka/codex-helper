@@ -34,6 +34,10 @@ type Pool struct {
 	mu      sync.Mutex
 	servers map[string]*entry
 	closed  bool
+
+	// pidMu serializes PID file writes from snapshot to rename, so an
+	// older snapshot can never replace a newer one (review M3).
+	pidMu sync.Mutex
 }
 
 type entry struct {
@@ -274,6 +278,8 @@ func (p *Pool) writePIDs() {
 	if p.cfg.PIDFile == "" {
 		return
 	}
+	p.pidMu.Lock()
+	defer p.pidMu.Unlock()
 	p.mu.Lock()
 	recs := []pidRecord{}
 	for _, e := range p.servers {
@@ -293,11 +299,30 @@ func writeFileAtomic(path string, data []byte) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	// A unique temp file per write: two writers never share (and so never
+	// interleave into) one file.
+	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	tmp := f.Name()
+	_, werr := f.Write(data)
+	if serr := f.Sync(); werr == nil {
+		werr = serr
+	}
+	if cerr := f.Close(); werr == nil {
+		werr = cerr
+	}
+	if werr == nil {
+		werr = os.Chmod(tmp, 0o600)
+	}
+	if werr == nil {
+		werr = os.Rename(tmp, path)
+	}
+	if werr != nil {
+		_ = os.Remove(tmp)
+	}
+	return werr
 }
 
 // KillStale kills the app-server process groups recorded in pidFile by a
