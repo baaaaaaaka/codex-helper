@@ -25,6 +25,8 @@ type CodexCall struct {
 	ClientID  string // turn/start clientUserMessageId (app-server only)
 	Prompt    string
 	Images    []string // local image paths passed as input items
+	Model     string   // turn/start model override ("" = thread default)
+	Effort    string   // turn/start effort override
 	Tokens    []string // E2E tokens found in the prompt
 	Started   time.Time
 	Ended     time.Time

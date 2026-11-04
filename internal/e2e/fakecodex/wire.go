@@ -38,6 +38,8 @@ type BeginRequest struct {
 	Cwd      string   `json:"cwd"`
 	Prompt   string   `json:"prompt"`
 	Images   []string `json:"images,omitempty"`
+	Model    string   `json:"model,omitempty"`  // turn/start model override
+	Effort   string   `json:"effort,omitempty"` // turn/start effort override
 }
 
 // ResumeRequest is sent by the app-server when a thread/resume arrives for a

@@ -456,10 +456,13 @@ func (s *server) startTurn(p map[string]any) (any, *rpcError) {
 	// clientUserMessageId is echoed as the userMessage item's clientId (and
 	// as client_id in the rollout), exactly like real Codex.
 	clientID, _ := p["clientUserMessageId"].(string)
+	model, _ := p["model"].(string)
+	effort, _ := p["effort"].(string)
 	turnID := newID()
 	plan, err := s.begin(BeginRequest{
 		Instance: s.cfg.Instance, Kind: s.cfg.Kind, Pid: os.Getpid(),
 		ThreadID: threadID, TurnID: turnID, ClientID: clientID, Cwd: cwd, Prompt: prompt, Images: images,
+		Model: model, Effort: effort,
 	})
 	if err != nil {
 		return nil, &rpcError{Code: -32603, Message: "fake codex brain unavailable: " + err.Error()}

@@ -96,7 +96,7 @@ func (f *FakeCodex) Handler() http.Handler {
 		seq, b := f.begin(CodexCall{
 			Instance: req.Instance, Kind: req.Kind, Pid: req.Pid,
 			ThreadID: req.ThreadID, TurnID: req.TurnID, ClientID: req.ClientID, Cwd: req.Cwd,
-			Prompt: req.Prompt, Images: req.Images,
+			Prompt: req.Prompt, Images: req.Images, Model: req.Model, Effort: req.Effort,
 		})
 		if b.HoldStart {
 			f.mu.Lock()
