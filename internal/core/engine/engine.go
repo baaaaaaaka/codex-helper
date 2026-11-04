@@ -15,6 +15,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/channel"
@@ -181,6 +182,8 @@ type Engine struct {
 	cmdMu        sync.Mutex
 	cmdPending   map[int64][]cmdJob // per-conversation command queues; present while a worker runs
 	asrWake      chan struct{}
+	notifyWake   chan struct{}
+	notifyN      atomic.Int64        // pending owner notifications (notify.go)
 	fileTries    map[string]int      // transient attachment failures by "<inbound>/<idx>"
 	uploadAt     map[int64]time.Time // outbound file rows waiting before an upload retry
 
@@ -254,7 +257,7 @@ func New(cfg Config) (*Engine, error) {
 		convs: map[int64]*convState{}, intro: map[int64]string{}, forkThreads: map[string]bool{}, byChat: map[string]int64{}, byThread: map[string]int64{},
 		runnerWake: make(chan struct{}, 1), runnerDirty: map[int64]bool{},
 		senderWake: make(chan struct{}, 1), resolverWake: make(chan struct{}, 1),
-		mirrorWake: make(chan struct{}, 1), cmdQueue: make(chan cmdJob, 256), cmdPending: map[int64][]cmdJob{}, reminded: map[int64]int{}, asrWake: make(chan struct{}, 1), fileTries: map[string]int{}, uploadAt: map[int64]time.Time{},
+		mirrorWake: make(chan struct{}, 1), cmdQueue: make(chan cmdJob, 256), cmdPending: map[int64][]cmdJob{}, reminded: map[int64]int{}, asrWake: make(chan struct{}, 1), notifyWake: make(chan struct{}, 1), fileTries: map[string]int{}, uploadAt: map[int64]time.Time{},
 	}
 	if sc, ok := cfg.Channel.(channel.ActivityScanner); ok && cfg.ActivityScan && e.t.ScanInterval > 0 {
 		e.scanner = timedScanner{sc}
@@ -295,7 +298,15 @@ func wake(ch chan struct{}) {
 	}
 }
 
-func (e *Engine) wakeSender()   { wake(e.senderWake) }
+func (e *Engine) wakeSender() { wake(e.senderWake) }
+
+// wakeNotify: an outbox row left the queue; a pending owner notification
+// may be due.
+func (e *Engine) wakeNotify() {
+	if e.notifyN.Load() > 0 {
+		wake(e.notifyWake)
+	}
+}
 func (e *Engine) wakeResolver() { wake(e.resolverWake) }
 
 // wakeRunner marks conversations for the runner (none = all candidates).
@@ -306,6 +317,7 @@ func (e *Engine) wakeRunner(ids ...int64) {
 	}
 	e.mu.Unlock()
 	wake(e.runnerWake)
+	e.wakeNotify() // the same events (a row left the outbox) can make a notification due
 }
 
 // Run starts the engine and blocks until ctx ends or a fatal error. The
@@ -321,7 +333,7 @@ func (e *Engine) Run(ctx context.Context) error {
 	}
 	loops := []func(context.Context){
 		e.receiverLoop, e.runnerLoop, e.senderLoop, e.resolverLoop,
-		e.commandLoop, e.maintenanceLoop, e.asrLoop,
+		e.commandLoop, e.maintenanceLoop, e.asrLoop, e.notifyLoop,
 	}
 	if e.cfg.SessionsDir != "" {
 		loops = append(loops, e.mirrorLoop)

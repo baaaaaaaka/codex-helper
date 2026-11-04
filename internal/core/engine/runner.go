@@ -367,7 +367,6 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 		msgs           []store.OutMsg
 		err            error
 		notify         bool
-		mention        []store.OutMsg
 	)
 	base := fmt.Sprintf("turn:%d", tr.ID)
 	switch {
@@ -405,16 +404,11 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 			msgs, err = e.render(ctx, channel.RichDoc{Label: labelCodex, Markdown: final, Math: true}, store.OutFinal, base+":final")
 		}
 		msgs = append(msgs, files...)
-		if err == nil {
-			// Exactly one owner notification per final (CORE-DESIGN §4):
-			// the Workflow card when configured, else one control-chat
-			// @mention.
-			if e.cfg.Notifier != nil && e.cfg.Notifier.Available() {
-				notify = true
-			} else {
-				mention, err = e.mentionNotice(tr.ID, cs)
-			}
-		}
+		// Exactly one owner notification per final (CORE-DESIGN §4): the
+		// Workflow card when configured, else one control-chat @mention.
+		// It is recorded with the turn's end and sent once the final is
+		// delivered (review L8; notify.go).
+		notify = err == nil
 	case out.Status == StatusInterrupted && out.Error == errStalled:
 		state, errText = store.TurnInterrupted, out.Error
 		msgs, err = e.notice(base+":interrupted", textStalled(e.t.StallLimit))
@@ -444,9 +438,8 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 			if err := recordUsage(tx, cs.id, state, out.Usage); err != nil {
 				return err
 			}
-			if len(mention) > 0 {
-				_, err := tx.Enqueue(e.controlID, mention)
-				return err
+			if notify {
+				return addNotify(tx, pendingNotify{Turn: tr.ID, Conv: cs.id, Text: clipText(out.Final, 400)})
 			}
 			return nil
 		})
@@ -478,7 +471,8 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 	cs.lastTurnEnd = e.now()
 	e.mu.Unlock()
 	if notify {
-		e.notifyFinal(tr.ID, cs, out.Final)
+		e.notifyN.Add(1)
+		wake(e.notifyWake)
 	}
 }
 
@@ -530,34 +524,6 @@ func (e *Engine) capacityRetry(cs *convState, tr store.Turn, out TurnOutcome) bo
 	e.mu.Unlock()
 	e.logf("turn %d in %s hit capacity (attempt %d); retrying in %s", tr.ID, cs.label, tr.Attempt, back)
 	return true
-}
-
-// notifyFinal sends the Workflow card once (never retried: a failed post
-// may still have been delivered); on failure the owner gets one
-// control-chat @mention instead.
-func (e *Engine) notifyFinal(turnID int64, cs *convState, text string) {
-	e.mu.Lock()
-	label, title, url := cs.label, cs.title, cs.url
-	e.mu.Unlock()
-	e.wg.Add(1)
-	go func() {
-		defer e.wg.Done()
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		err := e.cfg.Notifier.NotifyFinal(ctx, label, title, clipText(text, 400), url)
-		if err == nil {
-			return
-		}
-		e.logf("notify %s: %v; mentioning the owner in the control chat instead", label, err)
-		msgs, err := e.mentionNotice(turnID, cs)
-		if err == nil {
-			err = e.update(func(tx *store.Tx) error { _, err := tx.Enqueue(e.controlID, msgs); return err })
-		}
-		if err != nil {
-			e.logf("notify fallback %s: %v", label, err)
-		}
-		e.wakeSender()
-	}()
 }
 
 // mentionNotice is the control-chat @mention for a final.

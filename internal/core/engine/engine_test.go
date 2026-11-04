@@ -1358,3 +1358,72 @@ func TestFailedTurnFinishIsRetried(t *testing.T) {
 	r.ch.PostUser(work, "and the next")
 	r.wait("next answer", func() bool { return len(r.own(work, "ANSWER to and the next")) == 1 })
 }
+
+// cardNotifier records Workflow cards and whether the answer was already
+// in the chat when each was posted.
+type cardNotifier struct {
+	mu     sync.Mutex
+	r      *rig
+	chat   string
+	cards  []string
+	early  int // cards posted before the answer was visible
+	answer string
+}
+
+func (n *cardNotifier) Available() bool { return true }
+func (n *cardNotifier) NotifyFinal(_ context.Context, conv, title, text, url string) error {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.cards = append(n.cards, text)
+	if len(n.r.own(n.chat, n.answer)) == 0 {
+		n.early++
+	}
+	return nil
+}
+
+// The owner card is sent once the final is in the chat, and survives a
+// restart between the turn's end and the final's delivery (review L8).
+func TestOwnerCardFollowsTheFinalAcrossRestart(t *testing.T) {
+	var hold atomic.Bool
+	hold.Store(true)
+	n := &cardNotifier{answer: "ANSWER to card me"}
+	r := newRig(t, func(c *Config) {
+		c.Notifier = n
+		c.Channel.(*channeltest.Fake).SendFault = func(chat string, p channel.Part) (bool, error) {
+			if hold.Load() && strings.Contains(p.Body, "ANSWER") {
+				return false, &channel.Throttled{RetryAfter: 50 * time.Millisecond, Scope: channel.ScopeChat, Err: errors.New("held")}
+			}
+			return false, nil
+		}
+	})
+	n.r = r
+	work := r.newWork(t.TempDir())
+	n.mu.Lock()
+	n.chat = work
+	n.mu.Unlock()
+	r.ch.PostUser(work, "card me")
+	r.wait("turn finished", func() bool { c, _ := r.st.TurnCounts(); return c[store.TurnCompleted] == 1 })
+	time.Sleep(300 * time.Millisecond)
+	cards := func() int { n.mu.Lock(); defer n.mu.Unlock(); return len(n.cards) }
+	if got := cards(); got != 0 {
+		t.Fatalf("%d cards before the answer was sent", got)
+	}
+	r.stop()
+	r.start()
+	time.Sleep(300 * time.Millisecond)
+	if got := cards(); got != 0 {
+		t.Fatalf("%d cards after the restart, before the answer was sent", got)
+	}
+	hold.Store(false)
+	r.wait("answer", func() bool { return len(r.own(work, "ANSWER to card me")) == 1 })
+	r.wait("card", func() bool { return cards() == 1 })
+	time.Sleep(300 * time.Millisecond)
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	if len(n.cards) != 1 || n.early != 0 || !strings.Contains(n.cards[0], "ANSWER to card me") {
+		t.Fatalf("cards %q, %d before the answer", n.cards, n.early)
+	}
+	if m := len(r.own(r.chatOf("control"), "Codex finished")); m != 0 {
+		t.Fatalf("%d control-chat mentions besides the card", m)
+	}
+}
