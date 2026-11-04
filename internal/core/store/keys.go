@@ -20,3 +20,8 @@ func ChatGate(channel, chatID string) string { return channel + ":chat-gate:" + 
 // version) in a store it produced. The engine branches on it: a migrated
 // store is not a fresh install.
 const MetaMigratedFrom = "migrated_from"
+
+// MetaMigrationSummary is the meta key the converter sets to a short,
+// user-facing summary of the conversion. The engine posts it to the
+// control chat once and clears it in the same transaction.
+const MetaMigrationSummary = "migration_summary"
