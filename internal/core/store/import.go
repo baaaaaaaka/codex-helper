@@ -79,6 +79,14 @@ VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(conv_id, ext_msg_id) DO NOTHING RETURNING
 	return id, true, nil
 }
 
+// PauseConversation sets the per-chat breaker of an imported conversation
+// (used when it holds rows the converter could not classify).
+func (im *Importer) PauseConversation(convID, at int64, reason string) error {
+	_, err := im.t.exec(`UPDATE conversations SET paused_at = COALESCE(paused_at, ?), paused_reason = COALESCE(paused_reason, ?) WHERE id = ?`,
+		at, reason, convID)
+	return err
+}
+
 // LinkInbound sets the turn of an inbound row.
 func (im *Importer) LinkInbound(inboundID, turnID int64) error {
 	_, err := im.t.exec(`UPDATE inbound SET turn_id = ? WHERE id = ?`, turnID, inboundID)
