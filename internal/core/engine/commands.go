@@ -192,7 +192,8 @@ const controlHelp = "Commands in this chat:\n\n" +
 	"- `help`: this help"
 
 const workHelp = "Commands in a work chat (prefix `helper`):\n\n" +
-	"- `helper cancel` / `helper cancel last`: cancel the running (or last queued) request\n" +
+	"- `helper cancel` / `helper cancel last` / `helper cancel queued`: cancel the last queued request (else the running one)\n" +
+	"- `helper cancel running`: interrupt the running request only\n" +
 	"- `helper cancel all`: cancel the running and every queued request\n" +
 	"- `helper retry`: run the last ignored duplicate request again\n" +
 	"- `helper retry last`: run the request that failed because Codex needed an update again\n" +
@@ -392,8 +393,9 @@ func (e *Engine) nextLabel(tx *store.Tx) (string, error) {
 	return fmt.Sprintf("s%03d", n), nil
 }
 
-// cmdCancel: `cancel` / `cancel last` cancels the newest queued request,
-// else the running one; `cancel all` cancels everything.
+// cmdCancel: `cancel` / `cancel last` / `cancel queued` cancels the newest
+// queued request, else the running one; `cancel running` the running one
+// only; `cancel all` cancels everything.
 func (e *Engine) cmdCancel(ctx context.Context, j cmdJob, cs *convState, arg string) {
 	e.mu.Lock()
 	var runningID int64
@@ -403,8 +405,14 @@ func (e *Engine) cmdCancel(ctx context.Context, j cmdJob, cs *convState, arg str
 	e.mu.Unlock()
 	var cancelled int
 	all := arg == "all"
+	// `helper cancel running` (named by the queued ACK) interrupts the
+	// running request only; the queued ones stay.
+	onlyRunning := arg == "running"
 	err := e.update(func(tx *store.Tx) error {
 		cancelled = 0
+		if onlyRunning {
+			return nil
+		}
 		open, err := tx.OpenTurnsOf(cs.id)
 		if err != nil {
 			return err

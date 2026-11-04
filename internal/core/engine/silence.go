@@ -183,6 +183,54 @@ func textStarting(quoted string) string {
 	return "▶️ Codex is starting this queued request: " + quoted
 }
 
+// textQueuedAck is v0.1.20's ACK of a request that waits behind another
+// one in the same chat, word for word: running and queued are the prompts
+// of the chat's running and queued requests (this one is the last queued).
+func textQueuedAck(running, queued []string) string {
+	lines := []string{
+		"⚠️ **Your request is queued.**",
+		"",
+		"**Next step:** wait. I will run your request after the current Codex request finishes.",
+		"",
+		"Another Codex request is already running in this Work chat, so I will run yours after it finishes.",
+		"", "---", "",
+	}
+	if len(running) > 0 {
+		lines = append(lines, "**▶️ Running now:**")
+		lines = append(lines, promptList(running)...)
+	} else {
+		lines = append(lines, "**Currently blocking:**", "Codex/helper work already in progress.")
+	}
+	if len(queued) > 0 {
+		lines = append(lines, "", "**⏳ Queued requests:**")
+		lines = append(lines, promptList(queued)...)
+	}
+	lines = append(lines, "", "---", "",
+		"**Options:**",
+		"- Run this request next: do nothing. It is already submitted.",
+		"- Need it immediately: send it in a different 💬 Work chat.",
+		"- Drop the newest queued request: `helper cancel queued`.",
+		"- Interrupt the request ahead only if it looks stuck: `helper cancel running`.")
+	return strings.Join(lines, "\n")
+}
+
+// promptList numbers prompts as v0.1.20 listed them: one line each, at most
+// 180 characters, backquotes made plain quotes.
+func promptList(prompts []string) []string {
+	out := make([]string, 0, len(prompts))
+	for i, p := range prompts {
+		p = strings.ReplaceAll(strings.Join(strings.Fields(p), " "), "`", "'")
+		if r := []rune(p); len(r) > 180 {
+			p = strings.TrimSpace(string(r[:179])) + "…"
+		}
+		if p == "" {
+			p = "Prompt unavailable"
+		}
+		out = append(out, fmt.Sprintf("%d. %s", i+1, p))
+	}
+	return out
+}
+
 // textQueuedOutcome names a queued request at the head of its answer or
 // outcome notice when no progress message named it.
 func textQueuedOutcome(quoted string) string {

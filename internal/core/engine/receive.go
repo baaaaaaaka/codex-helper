@@ -766,15 +766,27 @@ func (e *Engine) ackPrompt(tx *store.Tx, conv int64, a store.Admitted, c *classi
 	if err != nil {
 		return false, err
 	}
-	ahead := 0
+	text := textAccepted
+	var running, queued []string
+	ahead := false
 	for _, t := range open {
-		if t.ID < a.TurnID {
-			ahead++
+		ahead = ahead || t.ID < a.TurnID
+		in, ok, err := tx.Inbound(t.InboundID)
+		if err != nil {
+			return false, err
+		}
+		prompt := ""
+		if ok {
+			prompt = in.Body
+		}
+		if t.State == store.TurnQueued {
+			queued = append(queued, prompt)
+		} else {
+			running = append(running, prompt)
 		}
 	}
-	text := textAccepted
-	if ahead > 0 {
-		text += " It is queued behind " + plural(ahead, "earlier request", "earlier requests") + "."
+	if ahead {
+		text = textQueuedAck(running, queued)
 	}
 	msgs, err := e.noticeReply(store.OutAck, fmt.Sprintf("ack:%d", a.InboundID), text, c.quoteID)
 	if err != nil {

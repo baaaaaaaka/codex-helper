@@ -1122,7 +1122,7 @@ func TestQueuedBacklogStartsWithOneNotice(t *testing.T) {
 	for _, j := range jobs {
 		r.ch.PostUser(work, j)
 	}
-	r.wait("queued ACKs", func() bool { return len(r.own(work, "queued behind")) == len(jobs) })
+	r.wait("queued ACKs", func() bool { return len(r.own(work, "Your request is queued.")) == len(jobs) })
 	close(release)
 	for _, j := range append([]string{"job 0"}, jobs...) {
 		j := j
