@@ -61,7 +61,12 @@ func (e *TurnError) Capacity() bool {
 	if strings.Contains(info, "serveroverloaded") || strings.Contains(info, "server_overloaded") {
 		return true
 	}
-	return strings.Contains(strings.ToLower(e.Message), "at capacity")
+	// Rate limit (429): Codex does not retry it either (probe d).
+	if strings.Contains(info, "responsetoomanyfailedattempts") && strings.Contains(info, "429") {
+		return true
+	}
+	msg := strings.ToLower(e.Message)
+	return strings.Contains(msg, "at capacity") || strings.Contains(msg, "429 too many requests")
 }
 
 // ClientID returns the clientId of the turn's user message.

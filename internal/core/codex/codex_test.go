@@ -259,6 +259,15 @@ func TestRunTurnRejectedAndCapacity(t *testing.T) {
 	if (&TurnError{Message: "other"}).Capacity() || (*TurnError)(nil).Capacity() {
 		t.Fatal("capacity false positive")
 	}
+	// Real Codex shapes (E2E-M3 probe d).
+	for _, te := range []TurnError{
+		{Message: "Selected model is at capacity. Please try a different model.", CodexErrorInfo: json.RawMessage(`"serverOverloaded"`)},
+		{Message: "exceeded retry limit, last status: 429 Too Many Requests", CodexErrorInfo: json.RawMessage(`{"responseTooManyFailedAttempts":{"httpStatusCode":429}}`)},
+	} {
+		if !te.Capacity() {
+			t.Fatalf("not capacity: %+v", te)
+		}
+	}
 }
 
 func TestRunTurnInterrupt(t *testing.T) {
