@@ -41,7 +41,7 @@ func (s *Store) Acquire(id Ident) (int64, error) {
 	if s.w == nil {
 		return 0, errors.New("store: opened read-only")
 	}
-	if _, err := os.Stat(filepath.Join(filepath.Dir(s.path), DisabledFile)); err == nil {
+	if s.Disabled() {
 		return 0, ErrDisabled
 	}
 	if id.InstallHost != "" && !strings.EqualFold(id.InstallHost, id.Host) {
@@ -87,9 +87,16 @@ func (t *Tx) owner() (Owner, bool, error) {
 }
 
 // Heartbeat refreshes the owner heartbeat. It is the one periodic write.
+//
+// It returns ErrDisabled without renewing the heartbeat once the kill-switch
+// file exists, so a running owner stops at its next heartbeat instead of
+// only the next start being refused.
 func (s *Store) Heartbeat() error {
 	if s.gen == 0 {
 		return ErrNotAcquired
+	}
+	if s.Disabled() {
+		return ErrDisabled
 	}
 	n, err := affected(s.w.Exec(`UPDATE owner SET heartbeat_at = ? WHERE id = 1 AND generation = ?`, s.ms(), s.gen))
 	if err != nil {
@@ -99,6 +106,12 @@ func (s *Store) Heartbeat() error {
 		return ErrFenced
 	}
 	return nil
+}
+
+// Disabled reports whether the kill-switch file <dir>/DISABLED exists.
+func (s *Store) Disabled() bool {
+	_, err := os.Stat(filepath.Join(filepath.Dir(s.path), DisabledFile))
+	return err == nil
 }
 
 // Release ends ownership so the next process can acquire immediately.

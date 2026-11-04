@@ -422,6 +422,9 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 		}()
 	}
 	err = e.Run(runCtx)
+	if errors.Is(err, corestore.ErrDisabled) {
+		return fmt.Errorf("the Teams helper is disabled (%s exists next to %s); stopped", corestore.DisabledFile, path)
+	}
 	select {
 	case <-gatewayFailed:
 		if ctx.Err() == nil {
