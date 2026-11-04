@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"runtime/pprof"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1290,6 +1291,160 @@ func TestReadThrottleReleasesScanFirstThenPacedReads(t *testing.T) {
 		if gap := reads[i].Sub(reads[i-1]); gap < 200*time.Millisecond {
 			t.Fatalf("reads %d and %d after the Retry-After only %s apart: a burst", i-1, i, gap)
 		}
+	}
+}
+
+// Benchmark S4: a chat the activity scan showed changed is read before the
+// overdue timed polls (control chat, hot chats): under a short read budget
+// the read that carries a new prompt must not be the one left over.
+func TestScanFlaggedChatReadBeforeOverduePolls(t *testing.T) {
+	now := time.Now()
+	e := &Engine{convs: map[int64]*convState{
+		1: {id: 1, chat: "ctl", kind: store.KindControl, nextRead: now.Add(-3 * time.Second)},
+		2: {id: 2, chat: "hot", kind: store.KindWork, state: store.ConvActive, nextRead: now.Add(-2 * time.Second)},
+		3: {id: 3, chat: "new", kind: store.KindWork, state: store.ConvActive, nextRead: now, scanDue: true},
+		4: {id: 4, chat: "idle", kind: store.KindWork, state: store.ConvActive, nextRead: now.Add(time.Minute)},
+	}}
+	if got := e.dueReads(now); !slices.Equal(got, []int64{3, 1, 2}) {
+		t.Fatalf("due reads %v, want the scan-flagged chat first, then the polls most overdue first: [3 1 2]", got)
+	}
+}
+
+// blockScanner holds one read of a chat after it fetched its window, so a
+// test can change the chat while that read is in flight.
+type blockScanner struct {
+	*lagScanner
+	mu      sync.Mutex
+	chat    string
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (b *blockScanner) Receive(ctx context.Context, stream, cursor string) (channel.Window, error) {
+	w, err := b.lagScanner.Receive(ctx, stream, cursor)
+	b.mu.Lock()
+	hold := stream == b.chat && b.release != nil
+	entered, release := b.entered, b.release
+	if hold {
+		b.chat = "" // one read only
+	}
+	b.mu.Unlock()
+	if hold {
+		close(entered)
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+	}
+	return w, err
+}
+
+func (b *blockScanner) scans() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.lagScanner.mu.Lock()
+	defer b.lagScanner.mu.Unlock()
+	return len(b.lagScanner.calls)
+}
+
+// A change the scan shows while a read of the chat is in flight is read
+// again at once: the running read may have fetched its window before the
+// new message, and its completion must not push the next read out to the
+// safety read.
+func TestScanMarkDuringReadIsNotLostWhenTheReadCompletes(t *testing.T) {
+	var bs *blockScanner
+	r := newRig(t, func(c *Config) {
+		bs = &blockScanner{lagScanner: &lagScanner{Fake: c.Channel.(*channeltest.Fake)}}
+		c.Channel, c.ActivityScan = bs, true
+		c.Timing.HotFor, c.Timing.SafetyRead, c.Timing.ScanInterval = 200*time.Millisecond, time.Minute, 50*time.Millisecond
+		c.ReadRate = 100 // every scan borrows a read token
+	})
+	work := r.newWork(t.TempDir())
+	ctl := r.control()
+	newest := time.Now()
+	bs.set(channel.ChatActivity{Chat: ctl, LastID: "ctl-1", Last: newest})
+	time.Sleep(time.Second) // the work chat goes idle: read only when the scan shows a change
+
+	bs.mu.Lock()
+	bs.chat, bs.entered, bs.release = work, make(chan struct{}), make(chan struct{})
+	entered, release := bs.entered, bs.release
+	bs.mu.Unlock()
+	bs.set(channel.ChatActivity{Chat: ctl, LastID: "ctl-1", Last: newest},
+		channel.ChatActivity{Chat: work, LastID: "own-post", Last: time.Now()})
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the scan-flagged read of the work chat did not start")
+	}
+	// The read has fetched its window; the owner posts now and the scan
+	// shows it before the read completes.
+	m := r.ch.PostUser(work, "prompt during read")
+	bs.set(channel.ChatActivity{Chat: ctl, LastID: "ctl-1", Last: newest},
+		channel.ChatActivity{Chat: work, LastID: m.ID, Last: time.Now()})
+	scans := bs.scans()
+	r.wait("a scan after the post", func() bool { return bs.scans() > scans+1 })
+	close(release)
+	r.waitFor("prompt answered well before the safety read", 5*time.Second, func() bool {
+		return len(r.own(work, "ANSWER to prompt during read")) == 1
+	})
+}
+
+// Benchmark S5: when the read gate reopens the scan runs once; the scan
+// ticker does not add a second scan in the same interval (each spends a
+// read of the scarce budget on the same change list).
+func TestScanRunsOncePerIntervalAfterTheGateReopens(t *testing.T) {
+	var sc *stormScanner
+	const every = 2 * time.Second
+	r := newRig(t, func(c *Config) {
+		sc = &stormScanner{Fake: c.Channel.(*channeltest.Fake)}
+		c.Channel, c.ActivityScan = sc, true
+		c.Timing.ScanInterval = every
+	})
+	r.control()
+	for round := 0; round < 3; round++ {
+		sc.mu.Lock()
+		sc.storm = true
+		n := len(sc.ops)
+		sc.mu.Unlock()
+		r.wait("a throttled request", func() bool {
+			sc.mu.Lock()
+			defer sc.mu.Unlock()
+			for _, o := range sc.ops[n:] {
+				if o.throttled {
+					return true
+				}
+			}
+			return false
+		})
+		time.Sleep(200 * time.Millisecond)
+		sc.mu.Lock()
+		sc.storm = false
+		sc.mu.Unlock()
+		time.Sleep(2*every + 500*time.Millisecond)
+	}
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	// The scan that runs when the gate reopens may follow the previous
+	// one closely (it goes first, S2); the next one waits an interval.
+	var reopenScan time.Time
+	afterThrottle, checked := false, 0
+	for _, o := range sc.ops {
+		switch {
+		case o.throttled:
+			afterThrottle, reopenScan = true, time.Time{}
+		case o.what != "scan":
+		case afterThrottle:
+			afterThrottle, reopenScan = false, o.at
+		case !reopenScan.IsZero():
+			if gap := o.at.Sub(reopenScan); gap < every*9/10 {
+				t.Fatalf("a second scan %s after the one the gate's reopening ran (interval %s)", gap, every)
+			}
+			reopenScan = time.Time{}
+			checked++
+		}
+	}
+	if checked < 3 {
+		t.Fatalf("only %d reopen scans followed by another scan", checked)
 	}
 }
 

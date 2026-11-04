@@ -44,10 +44,16 @@ type convState struct {
 	lastActivity time.Time // any activity (parking)
 	lastUser     time.Time // owner activity: prompt, command, turn end, wake (scan mode hot tier)
 	scanLast     string    // newest message id the activity scan reported
-	nextRead     time.Time
-	reading      bool
-	failures     int
-	seen         map[string]time.Time // ext ids admitted or classified recently
+	// scanDue: the activity scan showed a change not read yet; such a
+	// read goes before the timed polls. scanGen counts the scan's marks,
+	// so a read that was already running when the scan marked the chat
+	// does not clear it.
+	scanDue  bool
+	scanGen  uint64
+	nextRead time.Time
+	reading  bool
+	failures int
+	seen     map[string]time.Time // ext ids admitted or classified recently
 
 	// runner
 	running *runState

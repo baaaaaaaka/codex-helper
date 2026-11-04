@@ -155,6 +155,9 @@ func (e *Engine) dueReads(now time.Time) []int64 {
 	}
 	sort.Slice(due, func(i, j int) bool {
 		a, b := e.convs[due[i]], e.convs[due[j]]
+		if a.scanDue != b.scanDue {
+			return a.scanDue // a change the scan showed goes before timed polls
+		}
 		if !a.nextRead.Equal(b.nextRead) {
 			return a.nextRead.Before(b.nextRead)
 		}
@@ -228,7 +231,7 @@ func (e *Engine) heatAs(id int64, user bool) {
 func (e *Engine) read(ctx context.Context, id int64) {
 	e.mu.Lock()
 	cs := e.convs[id]
-	chat, cursor := cs.chat, cs.cursor
+	chat, cursor, gen := cs.chat, cs.cursor, cs.scanGen
 	e.mu.Unlock()
 	start := e.now()
 	w, err := e.ch.Receive(ctx, chat, cursor)
@@ -250,9 +253,12 @@ func (e *Engine) read(ctx context.Context, id int64) {
 	if err == nil {
 		cs.failures = 0
 		cs.nextRead = start.Add(e.intervalLocked(cs, now))
-		if cs.nextRead.Before(now) {
+		if cs.nextRead.Before(now) || cs.scanGen != gen {
+			// The scan marked the chat while this read ran: the change
+			// may be newer than what it returned.
 			cs.nextRead = now
 		}
+		cs.scanDue = cs.scanGen != gen
 		return
 	}
 	var tl *channel.WindowTooLarge
@@ -855,12 +861,15 @@ func (e *Engine) scanLoop(ctx context.Context) {
 	// what arrives from now on (with a margin for clock skew).
 	mark := e.now().Add(-time.Minute)
 	failures := 0
+	var last time.Time // the last scan request
 	for {
+		reopened := false
 		select {
 		case <-ctx.Done():
 			return
 		case <-tick.C:
 		case <-reopen.C:
+			reopened = true
 		case <-e.scanWake:
 		}
 		now := e.now()
@@ -868,6 +877,14 @@ func (e *Engine) scanLoop(ctx context.Context) {
 			reopen.Reset(until.Sub(now))
 			continue
 		}
+		if !reopened && !last.IsZero() && now.Sub(last) < e.t.ScanInterval {
+			// One scan per interval: the tick (or a wake) right after
+			// the scan the gate's reopening ran would spend a second
+			// read of the scarce budget on the same change list.
+			continue
+		}
+		last = now
+		tick.Reset(e.t.ScanInterval) // the cadence counts from this scan
 		e.readTokens.borrow()
 		started := e.now()
 		acts, err := e.scanner.ScanActivity(ctx, mark.Add(-scanOverlap))
@@ -916,10 +933,12 @@ func (e *Engine) scanLoop(ctx context.Context) {
 			// Our own posts also change the newest message; reading after
 			// them costs one read but never misses a user message posted
 			// just before.
+			cs.scanDue = true
+			cs.scanGen++
 			if cs.nextRead.After(now) {
 				cs.nextRead = now
-				woke = true
 			}
+			woke = true
 		}
 		e.mu.Unlock()
 		if woke {
