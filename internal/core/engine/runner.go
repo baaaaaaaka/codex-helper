@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,7 +23,9 @@ import (
 // safety net.
 func (e *Engine) runnerLoop(ctx context.Context) {
 	sem := make(chan struct{}, e.cfg.Turns)
-	sweep := time.NewTicker(e.t.Maintenance)
+	// The sweep runs half a period after the maintenance tick (B5), so
+	// the two do not stack.
+	sweep := time.NewTimer(e.t.Maintenance / 2)
 	defer sweep.Stop()
 	// The first pass looks at every conversation: turns queued before a
 	// restart (e.g. held by an update's drain) start without waiting for
@@ -36,6 +39,7 @@ func (e *Engine) runnerLoop(ctx context.Context) {
 			return
 		case <-e.runnerWake:
 		case <-sweep.C:
+			sweep.Reset(e.t.Maintenance)
 			all = true
 		case <-timer.C:
 			all = true
@@ -70,20 +74,42 @@ func (e *Engine) runnerLoop(ctx context.Context) {
 	}
 }
 
-// takeDirty returns the conversations to check (all when all or when the
-// wake carried no ids).
+// takeDirty returns the conversations to check: the ones a wake marked,
+// and with all (the sweep, a capacity timer, start) every conversation
+// that has a queued turn, from one read query (B5) instead of a write
+// transaction per conversation.
 func (e *Engine) takeDirty(all bool) []int64 {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	if e.runnerAll {
 		all, e.runnerAll = true, false
 	}
-	var ids []int64
+	e.mu.Unlock()
+	var queued []int64
+	listed := false
 	if all {
+		ids, err := e.st.QueuedTurnConvs()
+		if err != nil {
+			e.logf("runner sweep: %v", err)
+		} else {
+			queued, listed = ids, true
+		}
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var ids []int64
+	switch {
+	case all && !listed:
 		for id := range e.convs {
 			ids = append(ids, id)
 		}
-	} else {
+	case all:
+		ids = queued
+		for id := range e.runnerDirty {
+			if !slices.Contains(queued, id) {
+				ids = append(ids, id)
+			}
+		}
+	default:
 		for id := range e.runnerDirty {
 			ids = append(ids, id)
 		}
