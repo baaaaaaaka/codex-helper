@@ -213,6 +213,9 @@ type Engine struct {
 	now     func() time.Time
 	// statFile stats a rollout (transcript.Stat; tests count calls).
 	statFile func(string) (transcript.FileInfo, error)
+	// readMeta reads a rollout's first record (transcript.ReadMeta;
+	// tests slow it down).
+	readMeta func(string) (transcript.SessionMeta, error)
 
 	mu        sync.Mutex
 	convs     map[int64]*convState
@@ -322,7 +325,7 @@ func New(cfg Config) (*Engine, error) {
 		cfg.WriteRate = 4
 	}
 	e := &Engine{
-		cfg: cfg, st: cfg.Store, ch: timedChannel{cfg.Channel}, ag: cfg.Agent, t: cfg.Timing, log: cfg.Log, now: cfg.Now, statFile: transcript.Stat,
+		cfg: cfg, st: cfg.Store, ch: timedChannel{cfg.Channel}, ag: cfg.Agent, t: cfg.Timing, log: cfg.Log, now: cfg.Now, statFile: transcript.Stat, readMeta: transcript.ReadMeta,
 		gRead: store.AccountReadGate(cfg.ChannelName), gWrite: store.AccountWriteGate(cfg.ChannelName),
 		convs: map[int64]*convState{}, intro: map[int64]string{}, forkThreads: map[string]bool{}, delegThreads: map[string]bool{}, byChat: map[string]int64{}, byThread: map[string]int64{},
 		runnerWake: make(chan struct{}, 1), runnerDirty: map[int64]bool{},

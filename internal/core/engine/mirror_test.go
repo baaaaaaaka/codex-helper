@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -307,7 +308,7 @@ func TestRecentWalkSkipsAnUnchangedDayDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	stats := map[string]int{}
-	e := &Engine{cfg: Config{SessionsDir: sessions}, t: ProductionTiming(), now: time.Now, log: io.Discard}
+	e := &Engine{cfg: Config{SessionsDir: sessions}, t: ProductionTiming(), now: time.Now, log: io.Discard, readMeta: transcript.ReadMeta}
 	e.statFile = func(p string) (transcript.FileInfo, error) {
 		stats[p]++
 		return transcript.Stat(p)
@@ -341,13 +342,14 @@ func TestRecentWalkSkipsAnUnchangedDayDirectory(t *testing.T) {
 	}
 }
 
-// B4: the start-up walk classifies the rollouts a batch per stat tick,
-// newest first, instead of reading every rollout's first record before the
-// mirror loop starts (1.1 s in one second on a fresh install of 7,500).
-func TestStartupWalkClassifiesABatchPerTick(t *testing.T) {
+// startupRig writes 3 day directories of 100 old rollouts each and returns
+// an engine on them (readMeta reads a rollout's first record) and the
+// rollouts newest first.
+func startupRig(t *testing.T, readMeta func(string) (transcript.SessionMeta, error)) (*Engine, []string) {
+	t.Helper()
 	sessions := t.TempDir()
 	base := time.Now().Add(-30 * 24 * time.Hour)
-	var newest []string
+	var all []string
 	n := 0
 	for d := 0; d < 3; d++ {
 		day := base.AddDate(0, 0, d)
@@ -368,37 +370,75 @@ func TestStartupWalkClassifiesABatchPerTick(t *testing.T) {
 			if err := os.Chtimes(p, at, at); err != nil {
 				t.Fatal(err)
 			}
-			if d == 2 {
-				newest = append(newest, p)
-			}
+			all = append(all, p)
 		}
 	}
+	slices.Reverse(all)
 	st, err := store.Open(filepath.Join(t.TempDir(), "core.db"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer st.Close()
+	t.Cleanup(func() { st.Close() })
 	if _, err := st.Acquire(store.Ident{Host: "h", PID: 1, BootID: "b"}); err != nil {
 		t.Fatal(err)
 	}
 	e := &Engine{cfg: Config{SessionsDir: sessions}, st: st, t: ProductionTiming(), now: time.Now, log: io.Discard,
-		statFile: transcript.Stat, convs: map[int64]*convState{}}
+		statFile: transcript.Stat, readMeta: readMeta, convs: map[int64]*convState{}}
+	return e, all
+}
+
+// firstTick runs the mirror loop until just before its first stat tick
+// (2 s) and returns the rollouts it classified.
+func firstTick(e *Engine) map[string]string {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		e.mirrorLoop(ctx)
 	}()
-	time.Sleep(500 * time.Millisecond) // before the first 2 s stat tick
+	time.Sleep(500 * time.Millisecond)
 	cancel()
 	<-done
-	known := e.mirror.known
-	if len(known) != firstWalkFiles {
-		t.Fatalf("%d of 300 rollouts classified before the first tick, want %d", len(known), firstWalkFiles)
-	}
-	for _, p := range newest {
+	return e.mirror.known
+}
+
+// checkNewestFirst fails unless known is the first len(known) of newest.
+func checkNewestFirst(t *testing.T, known map[string]string, newest []string) {
+	t.Helper()
+	for _, p := range newest[:len(known)] {
 		if _, ok := known[p]; !ok {
-			t.Fatalf("%s (newest day) not in the first batch", filepath.Base(p))
+			t.Fatalf("%s not classified although %d rollouts were, newest first", filepath.Base(p), len(known))
 		}
 	}
+}
+
+// B4: the start-up walk classifies the rollouts a batch per stat tick,
+// newest first, instead of reading every rollout's first record before the
+// mirror loop starts (1.1 s in one second on a fresh install of 7,500).
+func TestStartupWalkClassifiesABatchPerTick(t *testing.T) {
+	e, newest := startupRig(t, transcript.ReadMeta)
+	known := firstTick(e)
+	if len(known) == 0 || len(known) > firstWalkFiles {
+		t.Fatalf("%d of 300 rollouts classified before the first tick, want 1..%d", len(known), firstWalkFiles)
+	}
+	checkNewestFirst(t, known, newest)
+}
+
+// W1: a start-up batch also stops after about firstWalkBudget, so slow
+// first-record reads (a cold or network disk) never make one long tick.
+func TestStartupWalkBatchStopsAtItsTimeBudget(t *testing.T) {
+	const perFile = 2 * time.Millisecond
+	e, newest := startupRig(t, func(p string) (transcript.SessionMeta, error) {
+		time.Sleep(perFile)
+		return transcript.ReadMeta(p)
+	})
+	start := time.Now()
+	known := firstTick(e)
+	if took := time.Since(start); took > 2*time.Second {
+		t.Fatalf("first tick ran %s", took)
+	}
+	if max := int(firstWalkBudget/perFile) + 3; len(known) == 0 || len(known) > max {
+		t.Fatalf("%d rollouts classified in the first batch at %s each, want 1..%d (budget %s)", len(known), perFile, max, firstWalkBudget)
+	}
+	checkNewestFirst(t, known, newest)
 }
