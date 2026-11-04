@@ -1,57 +1,63 @@
 package transcript
 
 import (
-	"fmt"
 	"strings"
 	"time"
 )
 
-// Output is one message to mirror. Key is stable for the same record no
-// matter from which offset the file is re-read, so it can be used as the
-// outbox delivery key and re-enqueueing is a no-op.
+// Output is one record to mirror.
 type Output struct {
-	Key    string // "<thread>:<turn>:u<n>" (user prompt n of the turn) or "<thread>:<turn>:f" (final)
-	User   bool   // a user prompt (else the turn's final answer)
-	Text   string
-	Time   time.Time
-	TurnID string
+	RecordID string // response-item id, or "t:<turn>:final" / "t:<turn>:prompt:<line>"
+	User     bool   // a user prompt (else the turn's final answer)
+	Text     string
+	Time     time.Time
+	TurnID   string
+	End      int64 // end offset of the record
+	line     int64 // 1-based line of the record (ids of id-less prompts)
+	start    int64
 }
 
+// Key returns the delivery key of part (1-based) of o in thread.
+func (o Output) Key(threadID string, part int) string { return MirrorKey(threadID, o.RecordID, part) }
+
+// Skip reports whether a turn was run by the helper (and is therefore
+// already in the chat): by the client id of its prompt, or by its Codex turn
+// id (legacy turns without client id recorded in the store).
+type Skip func(clientID, turnID string) bool
+
 // Tracker turns the records of one rollout into mirror outputs: the user
-// prompts and the final answer of every turn, skipping turns whose user
-// message carries a client id the helper itself sent (Teams turns).
+// prompts and the final answer of every turn not run by the helper. A
+// turn's records are held until it is known whether the helper ran it (the
+// prompt record precedes the item that carries the client id).
 //
-// The persisted position (Resume) is the start of the turn still open, or
-// the read position when no turn is open, so a restart re-reads at most the
-// open turn and regenerates the same keys.
+// The persisted position (Resume) is the start of the open turn, or the
+// read position when no turn is open, so a restart re-reads at most the
+// open turn and regenerates the same record ids.
 type Tracker struct {
 	threadID string
-	skip     func(clientID string) bool
+	skip     Skip
 
 	off, line int64 // next read position
 	turn      *openTurn
-	quiet     bool
-	quietTo   time.Time
 	last      time.Time
 }
 
 type openTurn struct {
-	id         string
-	start      int64
-	startLine  int64
-	skip       bool
-	users      []string
-	final      string
-	lastAgent  string
-	finalPhase bool
+	id        string
+	started   bool // its start record was read (not a scan that began mid-turn)
+	start     int64
+	startLine int64
+	teams     bool
+	decided   bool // the helper/local decision is known
+	finalSeen bool
+	pending   []Output
 }
 
-// NewTracker starts reading at off (line number line). threadID may be
-// empty; it is then taken from the session_meta record. skip reports the
-// client ids of turns that must not be mirrored.
-func NewTracker(threadID string, off, line int64, skip func(clientID string) bool) *Tracker {
+// NewTracker starts reading at off (line number line, the count of records
+// before off). threadID may be empty; it is then taken from session_meta.
+func NewTracker(threadID string, off, line int64, skip Skip) *Tracker {
 	if skip == nil {
-		skip = func(string) bool { return false }
+		skip = func(string, string) bool { return false }
 	}
 	return &Tracker{threadID: threadID, skip: skip, off: off, line: line}
 }
@@ -65,8 +71,14 @@ func (t *Tracker) Offset() int64 { return t.off }
 // Resume returns the position to persist: the start of the open turn, or
 // the read position.
 func (t *Tracker) Resume() (offset, line int64) {
-	if t.turn != nil {
+	if t.turn != nil && t.turn.started {
 		return t.turn.start, t.turn.startLine
+	}
+	if t.turn != nil && len(t.turn.pending) > 0 {
+		// A turn learned mid-scan with held prompts: re-read from the
+		// first held record (its line count is approximate, lines are
+		// informational only).
+		return t.turn.pending[0].start, t.turn.pending[0].line - 1
 	}
 	return t.off, t.line
 }
@@ -74,13 +86,11 @@ func (t *Tracker) Resume() (offset, line int64) {
 // LastTime is the timestamp of the newest record fed.
 func (t *Tracker) LastTime() time.Time { return t.last }
 
-// Realign restarts from the beginning of a rewritten file. Records written
-// at or before upTo were already processed; they are re-read only to
-// rebuild the open turn's state and produce no output (realignment by the
-// last delivered record's time, never blocking on a missing record).
-func (t *Tracker) Realign(upTo time.Time) {
+// Restart rereads a rewritten file from its beginning. The caller drops
+// the outputs that were already delivered (by record id) and those before
+// the last delivered record (realignment by record id, §3.9).
+func (t *Tracker) Restart() {
 	t.off, t.line, t.turn = 0, 0, nil
-	t.quiet, t.quietTo = true, upTo
 }
 
 // Advance consumes bytes that were skipped without lines (alignment).
@@ -106,18 +116,38 @@ func (t *Tracker) Feed(lines []Line) []Output {
 		if !ev.Time.IsZero() && ev.Time.After(t.last) {
 			t.last = ev.Time
 		}
-		emit := !t.quiet || (!ev.Time.IsZero() && ev.Time.After(t.quietTo))
-		if t.quiet && emit {
-			t.quiet = false
-		}
-		out = append(out, t.apply(ev, l, emit)...)
+		out = t.apply(out, ev, l)
 	}
 	return out
 }
 
-func (t *Tracker) apply(ev Event, l Line, emit bool) []Output {
+// flush releases the held records of the open turn (dropped when the
+// helper ran it).
+func (t *Tracker) flush(out []Output) []Output {
+	tr := t.turn
+	if tr == nil {
+		return out
+	}
+	if !tr.teams {
+		for _, o := range tr.pending {
+			out = append(out, t.resolve(o))
+		}
+	}
+	tr.pending = nil
+	return out
+}
+
+func (t *Tracker) apply(out []Output, ev Event, l Line) []Output {
 	if ev.ThreadID != "" && t.threadID != "" && ev.Kind != KindSessionMeta && ev.ThreadID != t.threadID {
-		return nil // a subagent's item inside this rollout
+		return out // a subagent's item inside this rollout
+	}
+	// Learn the turn of a scan that began mid-turn.
+	if ev.TurnID != "" && t.turn == nil && ev.Kind != KindTurnStarted {
+		t.turn = &openTurn{id: ev.TurnID, teams: t.skip("", ev.TurnID)}
+	}
+	if ev.TurnID != "" && t.turn != nil && t.turn.id == "" {
+		t.turn.id = ev.TurnID
+		t.turn.teams = t.turn.teams || t.skip("", ev.TurnID)
 	}
 	switch ev.Kind {
 	case KindSessionMeta:
@@ -125,70 +155,94 @@ func (t *Tracker) apply(ev Event, l Line, emit bool) []Output {
 			t.threadID = ev.Meta.ID
 		}
 	case KindTurnStarted:
-		t.begin(ev.TurnID, l)
+		if t.turn != nil && ev.TurnID != "" && t.turn.id == ev.TurnID {
+			return out // turn_context after task_started
+		}
+		out = t.end(out)
+		t.turn = &openTurn{id: ev.TurnID, started: true, start: l.Off, startLine: t.line - 1,
+			teams: ev.TurnID != "" && t.skip("", ev.TurnID)}
 	case KindUserMessage:
-		if t.turn == nil || (ev.TurnID != "" && ev.TurnID != t.turn.id) {
-			t.begin(ev.TurnID, l)
+		text := strings.TrimSpace(ev.Text)
+		if text == "" || IsBoilerplate(text) {
+			return out
+		}
+		if t.turn == nil {
+			// A prompt without a turn record (very old rollouts): its own turn.
+			t.turn = &openTurn{started: true, start: l.Off, startLine: t.line - 1}
 		}
 		tr := t.turn
-		if ev.ClientID != "" && t.skip(ev.ClientID) {
-			tr.skip = true
+		if LegacyTeamsPrompt(text) {
+			tr.teams = true
 		}
-		text := strings.TrimSpace(ev.Text)
-		if tr.skip || text == "" || IsBoilerplate(text) {
-			return nil
-		}
-		for _, u := range tr.users {
-			if u == text {
-				return nil // the same prompt in the legacy and the current record
+		o := Output{RecordID: ev.RecordID, User: true, Text: text, Time: ev.Time, End: l.End, line: t.line, start: l.Off}
+		if tr.decided {
+			if !tr.teams {
+				out = append(out, t.resolve(o))
 			}
+		} else {
+			tr.pending = append(tr.pending, o)
 		}
-		tr.users = append(tr.users, text)
-		if !emit {
-			return nil
+	case KindUserItem:
+		tr := t.turn
+		if tr == nil {
+			return out
 		}
-		return []Output{{Key: fmt.Sprintf("%s:%s:u%d", t.threadID, tr.id, len(tr.users)), User: true, Text: text, Time: ev.Time, TurnID: tr.id}}
+		if ev.ClientID != "" && t.skip(ev.ClientID, tr.id) {
+			tr.teams = true
+		}
+		tr.decided = true
+		out = t.flush(out)
 	case KindAgentMessage:
 		tr := t.turn
-		if tr == nil || (ev.TurnID != "" && ev.TurnID != tr.id) {
-			return nil
+		if tr == nil || ev.Phase != "final_answer" || strings.TrimSpace(ev.Text) == "" {
+			return out
 		}
-		if strings.TrimSpace(ev.Text) == "" {
-			return nil
-		}
-		tr.lastAgent = ev.Text
-		if ev.Phase == "final_answer" {
-			tr.final, tr.finalPhase = ev.Text, true
+		tr.finalSeen, tr.decided = true, true
+		out = t.flush(out)
+		if !tr.teams {
+			id := ev.RecordID
+			if id == "" {
+				id = turnRecordID(tr.id, true, 0)
+			}
+			out = append(out, Output{RecordID: id, Text: strings.TrimSpace(ev.Text), Time: ev.Time, TurnID: tr.id, End: l.End})
 		}
 	case KindTurnComplete:
 		tr := t.turn
-		if tr == nil || (ev.TurnID != "" && ev.TurnID != tr.id) {
-			t.turn = nil
-			return nil
+		if tr == nil {
+			return out
+		}
+		tr.decided = true
+		out = t.flush(out)
+		// last_agent_message is the final only for a turn whose start was
+		// read and that had no final_answer item: a scan that began
+		// mid-turn usually begins right after the delivered final.
+		if tr.started && !tr.finalSeen && !tr.teams && strings.TrimSpace(ev.Text) != "" {
+			out = append(out, Output{RecordID: turnRecordID(tr.id, true, 0), Text: strings.TrimSpace(ev.Text), Time: ev.Time, TurnID: tr.id, End: l.End})
 		}
 		t.turn = nil
-		text := tr.final
-		if !tr.finalPhase {
-			text = ev.Text
-			if strings.TrimSpace(text) == "" {
-				text = tr.lastAgent
-			}
-		}
-		if tr.skip || strings.TrimSpace(text) == "" || !emit {
-			return nil
-		}
-		return []Output{{Key: fmt.Sprintf("%s:%s:f", t.threadID, tr.id), Text: strings.TrimSpace(text), Time: ev.Time, TurnID: tr.id}}
 	case KindTurnAborted:
-		if t.turn != nil && (ev.TurnID == "" || ev.TurnID == t.turn.id) {
-			t.turn = nil
-		}
+		out = t.end(out)
 	}
-	return nil
+	return out
 }
 
-func (t *Tracker) begin(turnID string, l Line) {
-	if turnID == "" {
-		turnID = fmt.Sprintf("o%d", l.Off)
+// end closes the open turn, releasing its held prompts.
+func (t *Tracker) end(out []Output) []Output {
+	if t.turn != nil {
+		t.turn.decided = true
+		out = t.flush(out)
+		t.turn = nil
 	}
-	t.turn = &openTurn{id: turnID, start: l.Off, startLine: t.line - 1}
+	return out
+}
+
+// resolve fills the turn id and the record id of an id-less record.
+func (t *Tracker) resolve(o Output) Output {
+	if t.turn != nil {
+		o.TurnID = t.turn.id
+	}
+	if o.RecordID == "" {
+		o.RecordID = turnRecordID(o.TurnID, !o.User, o.line)
+	}
+	return o
 }

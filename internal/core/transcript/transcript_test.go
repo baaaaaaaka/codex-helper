@@ -71,8 +71,8 @@ func TestTrackerMirrorsUserAndFinalOfTUITurns(t *testing.T) {
 	again := readAll(t, w.Path, NewTracker("", 0, 0, nil))
 	all := append(out, out2...)
 	for i := range all {
-		if again[i].Key != all[i].Key {
-			t.Fatalf("key %d %q != %q", i, again[i].Key, all[i].Key)
+		if again[i].RecordID != all[i].RecordID || !strings.HasPrefix(all[i].RecordID, "msg_") {
+			t.Fatalf("record id %d %q != %q", i, again[i].RecordID, all[i].RecordID)
 		}
 	}
 	if off, _ := tr.Resume(); off != tr.Offset() {
@@ -91,7 +91,7 @@ func TestTrackerSkipsHelperTurnsByClientID(t *testing.T) {
 	w := newRollout(t, rollout.Options{Source: "vscode", Originator: "codex_vscode"})
 	mustTurn(t, w, rollout.Turn{ClientID: "cxp-0badc0de-7", Prompt: "from teams", Answer: "teams answer"})
 	mustTurn(t, w, rollout.Turn{Prompt: "typed in the TUI", Answer: "tui answer"})
-	skip := func(id string) bool { return strings.HasPrefix(id, "cxp-0badc0de-") }
+	skip := func(id, _ string) bool { return strings.HasPrefix(id, "cxp-0badc0de-") }
 	out := readAll(t, w.Path, NewTracker("", 0, 0, skip))
 	if got := keys(out); got != "U:typed in the TUI | F:tui answer" {
 		t.Fatalf("outputs %q", got)
@@ -122,8 +122,8 @@ func TestTrackerResumesFromOpenTurnStart(t *testing.T) {
 	if got := keys(out2); got != "U:long task | F:done" {
 		t.Fatalf("resumed outputs %q", got)
 	}
-	if out2[0].Key != out[0].Key {
-		t.Fatalf("user key changed after resume: %q vs %q", out2[0].Key, out[0].Key)
+	if out2[0].RecordID != out[0].RecordID {
+		t.Fatalf("user record id changed after resume: %q vs %q", out2[0].RecordID, out[0].RecordID)
 	}
 }
 
@@ -218,16 +218,21 @@ func TestRewriteDetectionAndRealign(t *testing.T) {
 	if err := os.Rename(tmp, w.Path); err != nil {
 		t.Fatal(err)
 	}
-	upTo := tr.LastTime()
+	first := readAll(t, w.Path, NewTracker("", 0, 0, nil))
 	time.Sleep(5 * time.Millisecond)
 	mustTurn(t, w, rollout.Turn{Prompt: "three", Answer: "a3"})
 	st2, _ := Stat(w.Path)
 	if !Rewritten(st2, tr.Offset(), st.Inode) {
 		t.Fatal("inode change not reported as a rewrite")
 	}
-	tr.Realign(upTo)
-	if got := keys(readAll(t, w.Path, tr)); got != "U:three | F:a3" {
-		t.Fatalf("after realign %q", got)
+	tr.Restart()
+	got := readAll(t, w.Path, tr)
+	if keys(got) != "U:two | F:a2 | U:three | F:a3" {
+		t.Fatalf("after restart %q", keys(got))
+	}
+	// Record ids survive the rewrite, so the caller can realign on them.
+	if got[0].RecordID != first[0].RecordID || got[1].RecordID != first[1].RecordID {
+		t.Fatalf("record ids moved: %q %q vs %q %q", got[0].RecordID, got[1].RecordID, first[0].RecordID, first[1].RecordID)
 	}
 	// A shrink alone (same inode) is a rewrite too.
 	if !Rewritten(FileInfo{Size: 10, Inode: st2.Inode}, 100, st2.Inode) {
@@ -238,24 +243,72 @@ func TestRewriteDetectionAndRealign(t *testing.T) {
 	}
 }
 
-func TestLegacyEventsAndSubagentItems(t *testing.T) {
+func TestLegacyRecordsAndSubagentItems(t *testing.T) {
 	ts := "2026-01-02T03:04:05.000Z"
 	p := writeLines(t,
 		`{"timestamp":"`+ts+`","type":"session_meta","payload":{"id":"thr-1","timestamp":"`+ts+`","cwd":"/w","originator":"codex_cli_rs","source":"cli"}}`+"\n",
 		`{"timestamp":"`+ts+`","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}`+"\n",
 		`{"timestamp":"`+ts+`","type":"event_msg","payload":{"type":"user_message","message":"legacy prompt","images":[]}}`+"\n",
-		`{"timestamp":"`+ts+`","type":"event_msg","payload":{"type":"item_completed","thread_id":"thr-1","turn_id":"t1","item":{"type":"UserMessage","client_id":"c1","content":[{"type":"text","text":"legacy prompt"}]}}}`+"\n",
+		`{"timestamp":"`+ts+`","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"legacy prompt"}]}}`+"\n",
 		`{"timestamp":"`+ts+`","type":"event_msg","payload":{"type":"item_completed","thread_id":"sub-9","turn_id":"t1","item":{"type":"AgentMessage","phase":"final_answer","content":[{"type":"Text","text":"subagent says"}]}}}`+"\n",
 		`{"timestamp":"`+ts+`","type":"event_msg","payload":{"type":"agent_message","message":"legacy answer"}}`+"\n",
-		`{"timestamp":"`+ts+`","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ignored"}]}}`+"\n",
-		`{"timestamp":"`+ts+`","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","last_agent_message":null}}`+"\n",
+		`{"timestamp":"`+ts+`","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"legacy answer"}]}}`+"\n",
+		`{"timestamp":"`+ts+`","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","last_agent_message":"legacy answer"}}`+"\n",
 	)
 	out := readAll(t, p, NewTracker("", 0, 0, nil))
 	if got := keys(out); got != "U:legacy prompt | F:legacy answer" {
 		t.Fatalf("outputs %q", got)
 	}
-	if out[0].Key != "thr-1:t1:u1" || out[1].Key != "thr-1:t1:f" {
-		t.Fatalf("keys %q %q", out[0].Key, out[1].Key)
+	if out[0].RecordID != "t:t1:prompt:4" || out[1].RecordID != "t:t1:final" {
+		t.Fatalf("record ids %q %q", out[0].RecordID, out[1].RecordID)
+	}
+	if k := out[1].Key("thr-1", 1); k != "mirror:thr-1:t:t1:final:1" {
+		t.Fatalf("key %q", k)
+	}
+}
+
+func TestLegacyTeamsWrapperAndTurnIDSkip(t *testing.T) {
+	w := newRollout(t, rollout.Options{})
+	wrapped := "do it\n\nTeams helper safety:\n- You are running inside a Codex turn launched by the Teams helper.\n- more"
+	mustTurn(t, w, rollout.Turn{Prompt: wrapped, Answer: "legacy teams answer"})
+	id, err := w.AppendTurn(rollout.Turn{Prompt: "run by an old helper", Answer: "known turn"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustTurn(t, w, rollout.Turn{Prompt: "quotes Teams helper safety: inline", Answer: "local"})
+	skip := func(_, turn string) bool { return turn == id }
+	if got := keys(readAll(t, w.Path, NewTracker("", 0, 0, skip))); got != "U:quotes Teams helper safety: inline | F:local" {
+		t.Fatalf("outputs %q", got)
+	}
+}
+
+func TestScanStartingMidTurnTakesNoSecondFinal(t *testing.T) {
+	w := newRollout(t, rollout.Options{})
+	mustTurn(t, w, rollout.Turn{Prompt: "q", Answer: "the answer"})
+	// Find the end of the final_answer record: a converted position right
+	// after the delivered final.
+	data, _ := os.ReadFile(w.Path)
+	var off int64
+	for _, l := range strings.SplitAfter(string(data), "\n") {
+		off += int64(len(l))
+		if strings.Contains(l, `"response_item"`) && strings.Contains(l, "final_answer") {
+			break
+		}
+	}
+	tr := NewTracker(w.SessionID, off, 0, nil)
+	if got := keys(readAll(t, w.Path, tr)); got != "" {
+		t.Fatalf("mid-turn scan produced %q", got)
+	}
+	// Starting between the prompt and the final mirrors only the final.
+	off = 0
+	for _, l := range strings.SplitAfter(string(data), "\n") {
+		off += int64(len(l))
+		if strings.Contains(l, `"UserMessage"`) {
+			break
+		}
+	}
+	if got := keys(readAll(t, w.Path, NewTracker(w.SessionID, off, 0, nil))); got != "F:the answer" {
+		t.Fatalf("scan after prompt produced %q", got)
 	}
 }
 
