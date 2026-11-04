@@ -11,22 +11,16 @@ import (
 	"time"
 )
 
-// Window is how far back discovery and catch-up look (owner decision).
-const Window = 120 * 24 * time.Hour
-
 // Found is one rollout file seen by Walk.
 type Found struct {
 	Path string
 	Info FileInfo
 }
 
-// Walk lists the rollout files (rollout-*.jsonl) under sessionsDir whose
-// modification time is at or after since, oldest first. When dirsFrom is
-// not zero, only the YYYY/MM/DD directories dated on or after that day are
-// visited (cheap periodic scan for new sessions); otherwise every
-// directory is visited, because a session started long ago may have been
-// resumed recently.
-func Walk(sessionsDir string, since, dirsFrom time.Time) ([]Found, error) {
+// Walk lists every rollout file (rollout-*.jsonl) under sessionsDir,
+// oldest modification time first. Every directory is visited: a session
+// started long ago may have been resumed recently.
+func Walk(sessionsDir string) ([]Found, error) {
 	var out []Found
 	err := filepath.WalkDir(sessionsDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -39,12 +33,6 @@ func Walk(sessionsDir string, since, dirsFrom time.Time) ([]Found, error) {
 			return err
 		}
 		if d.IsDir() {
-			if path == sessionsDir || dirsFrom.IsZero() {
-				return nil
-			}
-			if day, ok := dirDay(sessionsDir, path); ok && day.Before(dirsFrom.Truncate(24*time.Hour).AddDate(0, 0, -1)) {
-				return fs.SkipDir
-			}
 			return nil
 		}
 		name := d.Name()
@@ -53,9 +41,6 @@ func Walk(sessionsDir string, since, dirsFrom time.Time) ([]Found, error) {
 		}
 		fi, err := Stat(path)
 		if err != nil {
-			return nil
-		}
-		if fi.MTime.Before(since) {
 			return nil
 		}
 		out = append(out, Found{Path: path, Info: fi})

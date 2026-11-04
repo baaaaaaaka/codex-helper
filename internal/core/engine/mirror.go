@@ -39,9 +39,12 @@ type mirrorState struct {
 	// unreadable: rollouts whose first record could not be read (being
 	// written, or not a session); re-read only after they change.
 	unreadable map[string]transcript.FileInfo
-	// oldDirs: day directories older than the recent window still to be
+	// oldDirs: day directories older than the recent ones still to be
 	// walked in this cycle, a few per discovery tick (bounded work).
-	oldDirs   []string
+	oldDirs []string
+	// oldFound: rollouts the cycle listed but has not considered yet; a
+	// tick considers them for at most firstWalkClassify.
+	oldFound  []transcript.Found
 	lastCycle time.Time
 	// recent: what the last walk of each recent day directory saw (B3).
 	recent map[string]*recentDir
@@ -76,7 +79,8 @@ type recentDir struct {
 const dirSettle = 5 * time.Second
 
 // oldWalkFiles bounds the rollouts one discovery tick stats in old day
-// directories (a full cycle over every directory spreads over many ticks).
+// directories (a full cycle over every directory, the whole tree with no
+// age cut, spreads over many ticks).
 const oldWalkFiles = 256
 
 type mirrorFile struct {
@@ -147,9 +151,9 @@ func (e *Engine) mirrorInit() error {
 		return err
 	}
 	// A fresh install baselines every existing rollout (no flood for a new
-	// user). A migrated store is not fresh: the converter left the recent
-	// interactive rollouts without a source row for discovery to catch up
-	// (DECISIONS: 120-day window).
+	// user). A migrated store is not fresh: the converter left the
+	// unlinked interactive rollouts, however old, without a source row for
+	// discovery to catch up (no window, owner decision 2026-11-05).
 	m.first = v == "" && from == ""
 	srcs, err := e.st.Sources()
 	if err != nil {
@@ -233,7 +237,7 @@ const (
 // session continued while the queue drains is promoted from that size.
 func (e *Engine) startFirstWalk() {
 	m := e.mirror
-	found, err := transcript.Walk(e.cfg.SessionsDir, e.now().Add(-transcript.Window), time.Time{})
+	found, err := transcript.Walk(e.cfg.SessionsDir)
 	if err != nil {
 		e.logf("mirror walk: %v", err)
 	}
@@ -270,42 +274,49 @@ func (e *Engine) discoverFirst(ctx context.Context) {
 
 // discoverOld walks the older day directories a few at a time: a session
 // started long ago may have been resumed. One cycle over every directory
-// starts at most every FullWalk; each tick stats about oldWalkFiles
-// rollouts, so a large sessions tree never costs one long tick.
+// starts at most every FullWalk. A tick stats about oldWalkFiles rollouts
+// and considers what it listed for at most firstWalkClassify; the rest
+// waits for the next tick, which lists nothing new until it is done. So a
+// large sessions tree, walked whole with no age cut, never costs one long
+// tick.
 func (e *Engine) discoverOld(ctx context.Context) {
 	m := e.mirror
 	if m.firstPending {
 		return // the start-up walk covers every directory
 	}
-	now := e.now()
-	if len(m.oldDirs) == 0 {
-		if now.Sub(m.lastCycle) < e.t.FullWalk {
-			return
-		}
-		m.lastCycle = now
-		dirs, err := transcript.DayDirs(e.cfg.SessionsDir)
-		if err != nil {
-			e.logf("mirror walk: %v", err)
-		}
-		recent := now.Add(-48 * time.Hour)
-		for _, d := range dirs {
-			if d.Day.Before(recent.Truncate(24*time.Hour).AddDate(0, 0, -1)) {
-				m.oldDirs = append(m.oldDirs, d.Path)
+	if len(m.oldFound) == 0 {
+		now := e.now()
+		if len(m.oldDirs) == 0 {
+			if now.Sub(m.lastCycle) < e.t.FullWalk {
+				return
+			}
+			m.lastCycle = now
+			dirs, err := transcript.DayDirs(e.cfg.SessionsDir)
+			if err != nil {
+				e.logf("mirror walk: %v", err)
+			}
+			recent := now.Add(-48 * time.Hour)
+			for _, d := range dirs {
+				if d.Day.Before(recent.Truncate(24*time.Hour).AddDate(0, 0, -1)) {
+					m.oldDirs = append(m.oldDirs, d.Path)
+				}
 			}
 		}
-	}
-	since := now.Add(-transcript.Window)
-	var found []transcript.Found
-	for len(m.oldDirs) > 0 && len(found) < oldWalkFiles {
-		dir := m.oldDirs[0]
-		m.oldDirs = m.oldDirs[1:]
-		f, err := transcript.Walk(dir, since, time.Time{})
-		if err != nil {
-			e.logf("mirror walk: %v", err)
+		for len(m.oldDirs) > 0 && len(m.oldFound) < oldWalkFiles {
+			dir := m.oldDirs[0]
+			m.oldDirs = m.oldDirs[1:]
+			f, err := transcript.Walk(dir)
+			if err != nil {
+				e.logf("mirror walk: %v", err)
+			}
+			m.oldFound = append(m.oldFound, f...)
 		}
-		found = append(found, f...)
 	}
-	e.consider(ctx, found)
+	n := e.considerFor(ctx, m.oldFound, firstWalkClassify)
+	m.oldFound = m.oldFound[n:]
+	if len(m.oldFound) == 0 {
+		m.oldFound = nil
+	}
 }
 
 // discover walks the recent day directories for rollouts not seen yet.
@@ -321,7 +332,6 @@ func (e *Engine) discoverRecent(ctx context.Context, now time.Time) {
 	if m.recent == nil {
 		m.recent = map[string]*recentDir{}
 	}
-	since := now.Add(-transcript.Window)
 	dirs := recentDayDirs(e.cfg.SessionsDir, now)
 	var found []transcript.Found
 	walked := map[string][]string{}
@@ -333,13 +343,13 @@ func (e *Engine) discoverRecent(ctx context.Context, now time.Time) {
 		}
 		if rd := m.recent[dir]; rd != nil && rd.settled && fi.ModTime().Equal(rd.mtime) {
 			for _, p := range rd.pending {
-				if info, err := e.statFile(p); err == nil && !info.MTime.Before(since) {
+				if info, err := e.statFile(p); err == nil {
 					found = append(found, transcript.Found{Path: p, Info: info})
 				}
 			}
 			continue
 		}
-		f, err := transcript.Walk(dir, since, time.Time{})
+		f, err := transcript.Walk(dir)
 		if err != nil {
 			e.logf("mirror walk: %v", err)
 			delete(m.recent, dir)
@@ -528,8 +538,7 @@ func (e *Engine) newRollout(ctx context.Context, f transcript.Found) (store.Tran
 		}
 		e.track(src)
 		return store.TranscriptSource{}, false
-	case e.mirror.first && f.Info.MTime.Before(e.mirror.startedAt),
-		f.Info.MTime.Before(e.now().Add(-transcript.Window)):
+	case e.mirror.first && f.Info.MTime.Before(e.mirror.startedAt):
 		src.State, src.Offset = store.SrcBaseline, f.Info.Size
 		return src, true
 	case !meta.Interactive():
@@ -799,17 +808,6 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 	}
 	fh.Close()
 	more := f.tracker.Offset() < info.Size && read >= mirrorPassMax
-
-	// Catch-up window per record (§9.4): older records are not posted.
-	horizon := e.now().Add(-transcript.Window)
-	kept := outs[:0]
-	for _, o := range outs {
-		if !o.Time.IsZero() && o.Time.Before(horizon) {
-			continue
-		}
-		kept = append(kept, o)
-	}
-	outs = kept
 
 	// Render outside the transaction.
 	thread := f.tracker.ThreadID()

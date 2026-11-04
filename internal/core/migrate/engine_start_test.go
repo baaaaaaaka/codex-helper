@@ -89,9 +89,9 @@ func writeStartRollout(t *testing.T, sessions, id string, at time.Time) string {
 // A converted store started by the engine (review H1, H2):
 //   - the receive cursors the converter wrote are the engine's: after a
 //     restart no chat is read from its migration-time cursor again;
-//   - the first start is not a fresh install: a recent interactive rollout
-//     left for discovery gets its work chat, one older than the 120-day
-//     window is never caught up.
+//   - the first start is not a fresh install: an interactive rollout left
+//     for discovery gets its work chat, however old (no window, owner
+//     decision 2026-11-05).
 func TestConvertedStoreKeepsCursorsAndCatchesUpAcrossRestart(t *testing.T) {
 	out := t.TempDir()
 	if _, err := Run(Options{Source: fixture(t, "v0120", "json"), Out: out, DryRun: true, Now: func() time.Time { return testNow }}); err != nil {
@@ -116,7 +116,7 @@ func TestConvertedStoreKeepsCursorsAndCatchesUpAcrossRestart(t *testing.T) {
 
 	sessions := t.TempDir()
 	recent := writeStartRollout(t, sessions, "thr-recent", time.Now().Add(-24*time.Hour))
-	old := writeStartRollout(t, sessions, "thr-old", time.Now().Add(-130*24*time.Hour))
+	old := writeStartRollout(t, sessions, "thr-old", time.Now().Add(-200*24*time.Hour))
 	ch := &cursorChannel{Fake: channeltest.New()}
 
 	var log strings.Builder
@@ -168,13 +168,10 @@ func TestConvertedStoreKeepsCursorsAndCatchesUpAcrossRestart(t *testing.T) {
 	}
 
 	st, stop := start()
-	waitFor("migrated chats read and the recent rollout tracked", func() bool {
-		return migratedReads() >= 1 && sourceState(st, recent) == store.SrcTracking
+	waitFor("migrated chats read and the recent and 200-day-old rollouts tracked", func() bool {
+		return migratedReads() >= 1 && sourceState(st, recent) == store.SrcTracking && sourceState(st, old) == store.SrcTracking
 	})
 	time.Sleep(time.Second) // every live chat read once, cursors written
-	if got := sourceState(st, old); got != "" && got != store.SrcBaseline {
-		t.Errorf("rollout older than 120 days: state %q, want not caught up", got)
-	}
 	before := migratedReads()
 	stop()
 

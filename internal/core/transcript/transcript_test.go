@@ -336,7 +336,9 @@ func TestInteractiveClassification(t *testing.T) {
 	}
 }
 
-func TestWalkWindowAndRecentDirs(t *testing.T) {
+// Walk lists every rollout, however old (no discovery window, owner
+// decision 2026-11-05), oldest first, and nothing else.
+func TestWalkListsEveryRolloutHoweverOld(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "sessions")
 	now := time.Now()
 	mk := func(age time.Duration) string {
@@ -351,13 +353,13 @@ func TestWalkWindowAndRecentDirs(t *testing.T) {
 		}
 		return w.Path
 	}
-	old := mk(121 * 24 * time.Hour)
-	mid := mk(119 * 24 * time.Hour)
+	ancient := mk(400 * 24 * time.Hour)
+	old := mk(200 * 24 * time.Hour)
 	recent := mk(time.Hour)
 	if err := os.WriteFile(filepath.Join(filepath.Dir(recent), "notes.txt"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	found, err := Walk(root, now.Add(-Window), time.Time{})
+	found, err := Walk(root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -365,17 +367,13 @@ func TestWalkWindowAndRecentDirs(t *testing.T) {
 	for _, f := range found {
 		got = append(got, f.Path)
 	}
-	if strings.Join(got, ",") != mid+","+recent {
-		t.Fatalf("window walk %v (old %s)", got, old)
-	}
-	found, _ = Walk(root, time.Time{}, now.Add(-48*time.Hour))
-	if len(found) != 1 || found[0].Path != recent {
-		t.Fatalf("recent-dir walk %v", found)
+	if want := ancient + "," + old + "," + recent; strings.Join(got, ",") != want {
+		t.Fatalf("walk %v, want %s", got, want)
 	}
 	if fp := FirstPrompt(recent, 1<<20); fp != "p" {
 		t.Fatalf("first prompt %q", fp)
 	}
-	if found, err := Walk(filepath.Join(root, "missing"), time.Time{}, time.Time{}); err != nil || len(found) != 0 {
+	if found, err := Walk(filepath.Join(root, "missing")); err != nil || len(found) != 0 {
 		t.Fatalf("missing root: %v %v", found, err)
 	}
 }

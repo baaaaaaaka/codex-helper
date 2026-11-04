@@ -492,3 +492,64 @@ func TestStartupWalkBatchStopsAtItsTimeBudget(t *testing.T) {
 	}
 	checkNewestFirst(t, known, newest)
 }
+
+// No discovery or catch-up window (owner decision 2026-11-05): with no age
+// cut the older-directory cycle covers the whole sessions tree, so a tick
+// considers what it listed for at most firstWalkClassify and leaves the
+// rest for the next tick, which lists nothing new before it is done.
+func TestOldWalkTickStopsAtItsTimeBudget(t *testing.T) {
+	const perFile = time.Millisecond
+	var reads atomic.Int64
+	e, newest := startupRig(t, func(p string) (transcript.SessionMeta, error) {
+		reads.Add(1)
+		time.Sleep(perFile)
+		return transcript.ReadMeta(p)
+	})
+	if err := e.mirrorInit(); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	e.discoverOld(ctx)
+	if max := int64(firstWalkClassify/perFile) + 2; reads.Load() == 0 || reads.Load() > max {
+		t.Fatalf("the first old-walk tick read %d first records at %s each, want 1..%d", reads.Load(), perFile, max)
+	}
+	dirs := len(e.mirror.oldDirs)
+	e.discoverOld(ctx)
+	if len(e.mirror.oldFound) > 0 && len(e.mirror.oldDirs) != dirs {
+		t.Fatalf("a tick listed more directories (%d left, was %d) while %d listed rollouts waited", len(e.mirror.oldDirs), dirs, len(e.mirror.oldFound))
+	}
+	for i := 0; i < 1000 && (len(e.mirror.oldFound) > 0 || len(e.mirror.oldDirs) > 0); i++ {
+		e.discoverOld(ctx)
+	}
+	if len(e.mirror.known) != len(newest) || reads.Load() != int64(len(newest)) {
+		t.Fatalf("the cycle classified %d of %d rollouts with %d reads", len(e.mirror.known), len(newest), reads.Load())
+	}
+}
+
+// No discovery or catch-up window (owner decision 2026-11-05): a local
+// session last updated 200 days ago, while the helper was down, is
+// discovered after a restart and its whole history is caught up.
+func TestSessionFrom200DaysAgoIsDiscoveredAndCaughtUp(t *testing.T) {
+	r, sessions := mirrorRig(t)
+	r.wait("mirror initialised", func() bool {
+		v, _, err := r.st.Meta(metaMirrorInit)
+		return err == nil && v != ""
+	})
+	r.stop()
+	at := time.Now().Add(-200 * 24 * time.Hour)
+	w, err := rollout.New(sessions, t.TempDir(), rollout.Options{Start: at})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.AppendTurn(rollout.Turn{Prompt: "a prompt from 200 days ago", Answer: "an answer from 200 days ago"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.SetModTime(at.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	r.start()
+	chat := r.localChat()
+	r.wait("the 200-day-old turn caught up", func() bool {
+		return len(r.own(chat, "a prompt from 200 days ago")) == 1 && len(r.own(chat, "an answer from 200 days ago")) == 1
+	})
+}

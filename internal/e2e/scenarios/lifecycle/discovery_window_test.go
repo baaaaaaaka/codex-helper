@@ -9,19 +9,19 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/steps"
 )
 
-// Outage discovery window (decision: 120 days; F-MIR-3, R-9). Local TUI
-// sessions last updated while the helper was down are discovered after a
-// restart if they were updated within 120 days; older ones are baselined
-// and never posted.
+// Outage discovery has no window (owner decision 2026-11-05; F-MIR-3,
+// R-9). Local TUI sessions last updated while the helper was down are
+// discovered after a restart and caught up however old: 20, 121 and 200
+// days.
 //
 // The old core looks back 31 days and reconciles at most 4 recovery
 // discoveries every 5 minutes, so the wait is bounded and a miss is a
 // finding, not a hang.
-func TestDiscoveryWindow120Days(t *testing.T) {
+func TestDiscoveryHasNoWindow(t *testing.T) {
 	harness.Parallel(t)
-	s := harness.NewScenario(t, "WINDOW", harness.Options{
+	s := harness.NewScenario(t, "NO-WINDOW", harness.Options{
 		Guarantees: []string{"F-MIR-3", "R-9", "R-2"},
-		Title:      "after an outage, sessions updated 20 and 119 days ago are mirrored once; 121 days ago is not",
+		Title:      "after an outage, sessions updated 20, 121 and 200 days ago are each mirrored once (no window)",
 		Budget:     120 * time.Second,
 	})
 	defer s.Finish()
@@ -35,9 +35,8 @@ func TestDiscoveryWindow120Days(t *testing.T) {
 	type aged struct {
 		days   int
 		answer string
-		want   bool
 	}
-	sessions := []*aged{{days: 20, want: true}, {days: 119, want: true}, {days: 121, want: false}}
+	sessions := []*aged{{days: 20}, {days: 121}, {days: 200}}
 	for _, a := range sessions {
 		at := now.Add(-time.Duration(a.days) * 24 * time.Hour)
 		r := harness.NewRolloutAt(t, s.Env, s.Env.WorkDir(t, fmt.Sprintf("aged-%d", a.days)), at)
@@ -50,7 +49,7 @@ func TestDiscoveryWindow120Days(t *testing.T) {
 	s.StartSUT()
 	s.Poll(45*time.Second, func() bool {
 		for _, a := range sessions {
-			if a.want && len(steps.ChatsWithSUTText(s, a.answer)) == 0 {
+			if len(steps.ChatsWithSUTText(s, a.answer)) == 0 {
 				return false
 			}
 		}
@@ -63,12 +62,8 @@ func TestDiscoveryWindow120Days(t *testing.T) {
 		for _, c := range chats {
 			copies += len(s.SUTMessagesContaining(c.ID, a.answer))
 		}
-		if a.want {
-			s.Check(fmt.Sprintf("session updated %d days ago is mirrored once", a.days), len(chats) == 1 && copies == 1,
-				"1 chat, 1 copy", fmt.Sprintf("%d chats, %d copies (45 s after restart)", len(chats), copies))
-		} else {
-			s.Check(fmt.Sprintf("session updated %d days ago is not posted", a.days), len(chats) == 0, "0 chats", fmt.Sprintf("%d chats", len(chats)))
-		}
+		s.Check(fmt.Sprintf("session updated %d days ago is mirrored once", a.days), len(chats) == 1 && copies == 1,
+			"1 chat, 1 copy", fmt.Sprintf("%d chats, %d copies (45 s after restart)", len(chats), copies))
 	}
 	s.Check("discovery never runs Codex", len(s.Codex.Calls()) == 0, "0 Codex calls", fmt.Sprint(len(s.Codex.Calls())))
 }

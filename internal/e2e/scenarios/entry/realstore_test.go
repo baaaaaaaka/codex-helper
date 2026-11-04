@@ -39,7 +39,7 @@ const (
 // lease hot loop, ownership never resolved). The conversion completes, the
 // helper owns the new store at once (no old lease or generation), polls the
 // control chat within 5 s, posts the summary once and at most one notice
-// per interrupted request, starts the 120-day catch-up of a synthetic
+// per interrupted request, starts the catch-up of a synthetic
 // sessions tree, never repeats a log line more than a few times a minute,
 // and its CPU is recorded until the catch-up drains and then over the
 // measured idle window, which must stay within the idle budget.
@@ -82,8 +82,8 @@ func TestAcceptanceRealStoreFirstStart(t *testing.T) {
 	}
 	s.Note("seeded %d chats; control chat present: %v", len(chats), control != "")
 
-	// Synthetic sessions: interactive rollouts over the last 150 days (the
-	// ones within 120 days are caught up) and one live session appending
+	// Synthetic sessions: interactive rollouts over the last 150 days (all
+	// caught up: no window) and one live session appending
 	// large tool outputs during the whole run.
 	tokens := seedSessions(t, s)
 	live := harness.NewRollout(t, s.Env, s.Env.WorkRoot)
@@ -147,7 +147,7 @@ func TestAcceptanceRealStoreFirstStart(t *testing.T) {
 	}
 
 	// CPU per second, in two phases: the start (re-hash, local sessions
-	// mirrored, the 120-day catch-up posted at the channel's pace) until
+	// mirrored, the catch-up posted at the channel's pace) until
 	// the helper's writes fall to the live session's rate, then the
 	// measured idle window, while the live session keeps appending large
 	// tool outputs. The idle budget applies to the second phase.
@@ -204,7 +204,7 @@ func TestAcceptanceRealStoreFirstStart(t *testing.T) {
 	}
 	s.Check("at most one interrupted-request notice per chat", worst <= 1, "<= 1", fmt.Sprintf("%v", interrupted))
 	s.Note("helper messages posted: %d (catch-up of synthetic sessions: %d)", total, catchUp)
-	s.Check("the 120-day catch-up drains", catchUp > 0, "> 0 caught-up prompts/answers", fmt.Sprint(catchUp))
+	s.Check("the catch-up drains", catchUp > 0, "> 0 caught-up prompts/answers", fmt.Sprint(catchUp))
 
 	rep, line := worstRepeat(out)
 	s.Check("no log line repeats more than 10 times a minute", rep <= 10, "<= 10/min", fmt.Sprintf("%d× %q", rep, line))
@@ -310,9 +310,7 @@ func seedSessions(t *testing.T, s *harness.Scenario) []string {
 		for k := 0; k < 3; k++ {
 			p, a := fmt.Sprintf("catchup-p-%02d-%d", i, k), fmt.Sprintf("catchup-a-%02d-%d", i, k)
 			r.AppendTurn(t, "Synthetic prompt "+p, "", "Synthetic answer "+a+"\n\n"+strings.Repeat("Some answer text. ", 40))
-			if start.After(time.Now().Add(-119 * 24 * time.Hour)) {
-				tokens = append(tokens, p, a)
-			}
+			tokens = append(tokens, p, a)
 		}
 		if err := r.SetModTime(start.Add(time.Hour)); err != nil {
 			t.Fatal(err)
