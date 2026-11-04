@@ -728,7 +728,7 @@ func (e *Engine) capacityRetry(cs *convState, tr store.Turn, out TurnOutcome) bo
 			return err
 		}
 		if first && cs.id != e.inboxID { // the inbox carries protocol records only
-			return e.enqueueNotice(tx, cs.id, fmt.Sprintf("turn:%d:capacity", tr.ID),
+			return e.enqueueStatus(tx, cs.id, fmt.Sprintf("turn:%d:capacity", tr.ID),
 				"Codex is at capacity right now; the request will be retried automatically for up to 5 minutes.")
 		}
 		return nil

@@ -1070,6 +1070,12 @@ func TestSilentTurnHintsThenStopsAtStallBound(t *testing.T) {
 			t.Errorf("%d notices with %q, want %d", got, sub, want)
 		}
 	}
+	// v0.1.20 posted both hints as Codex status (kind codex-status).
+	for _, sub := range []string{"Still working. No new Codex update yet", "It may be stuck"} {
+		if got := r.own(work, sub); len(got) != 1 || !strings.HasPrefix(got[0].Text, "🤖 ⏳ Codex status:\n") {
+			t.Errorf("hint %q: %+v", sub, got)
+		}
+	}
 }
 
 // R-35 (review M5): a request queued behind a running one gets a reminder
@@ -2193,5 +2199,9 @@ func TestCapacityWindowBoundsWaitingWithoutProgress(t *testing.T) {
 	r.wait("failure notice", func() bool { return len(r.own(work, "over capacity")) == 1 })
 	if got := r.ag.calls("never fits"); got < 2 {
 		t.Fatalf("%d attempts, want retries before the failure", got)
+	}
+	// The retry notice is Codex status, as v0.1.20's codex-status kind.
+	if got := r.own(work, "at capacity right now"); len(got) != 1 || !strings.HasPrefix(got[0].Text, "🤖 ⏳ Codex status:\n") {
+		t.Fatalf("capacity retry notice: %+v", got)
 	}
 }

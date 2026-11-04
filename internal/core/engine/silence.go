@@ -68,7 +68,7 @@ func (e *Engine) silenceNotice(conv int64, key, text string) {
 	if conv == e.inboxID {
 		return // the inbox carries protocol records only
 	}
-	if err := e.update(func(tx *store.Tx) error { return e.enqueueNotice(tx, conv, key, text) }); err != nil {
+	if err := e.update(func(tx *store.Tx) error { return e.enqueueStatus(tx, conv, key, text) }); err != nil {
 		e.logf("silence hint in %d: %v", conv, err)
 		return
 	}

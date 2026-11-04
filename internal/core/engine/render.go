@@ -66,6 +66,18 @@ func (e *Engine) noticeReply(kind, base, text, replyTo string) ([]store.OutMsg, 
 }
 
 // enqueueNotice renders and enqueues a notice in tx.
+// enqueueStatus enqueues a turn-progress notice that v0.1.20 posted as
+// Codex status (its codex-status kind: still working, may be stuck,
+// capacity retry).
+func (e *Engine) enqueueStatus(tx *store.Tx, conv int64, base, text string) error {
+	msgs, err := e.statusNotice(base, text)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Enqueue(conv, msgs)
+	return err
+}
+
 func (e *Engine) enqueueNotice(tx *store.Tx, conv int64, base, text string) error {
 	msgs, err := e.notice(base, text)
 	if err != nil {

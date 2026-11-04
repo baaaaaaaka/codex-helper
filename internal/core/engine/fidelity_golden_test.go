@@ -171,7 +171,8 @@ func fidelityDoc(kind, body string) (channel.RichDoc, string, bool) {
 		return channel.RichDoc{}, "", false // not mirrored / not batched by the new core
 	case strings.HasPrefix(k, "ack"):
 		return channel.RichDoc{Label: labelHelper, Markdown: body}, store.OutAck, true
-	case k == "error", strings.Contains(k, "interrupted"), strings.Contains(k, "failed"), strings.Contains(k, "tool"), strings.Contains(k, "artifact"):
+	case k == "error", strings.Contains(k, "interrupted"), strings.Contains(k, "failed"), strings.Contains(k, "tool"), strings.Contains(k, "artifact"),
+		strings.HasPrefix(k, "codex-status"): // still working, may be stuck, capacity
 		// v0.1.20 renderKindForOutbox: Codex status.
 		return channel.RichDoc{Label: labelStatus, Markdown: body}, store.OutNotice, true
 	}
