@@ -1,6 +1,9 @@
 package store
 
-import "context"
+import (
+	"context"
+	"fmt"
+)
 
 // Vacuum returns genuinely free pages (WAL churn, index splits) to the OS
 // with PRAGMA incremental_vacuum. It never deletes or blanks a row: there is
@@ -9,5 +12,15 @@ import "context"
 // still recognised and never re-run.
 func (s *Store) Vacuum() error {
 	_, err := s.w.ExecContext(context.Background(), `PRAGMA incremental_vacuum`)
+	return err
+}
+
+// VacuumStep is Vacuum bounded to at most pages free pages, so one call
+// never costs more than a few milliseconds however large the free list is.
+func (s *Store) VacuumStep(pages int) error {
+	if pages <= 0 {
+		pages = 1
+	}
+	_, err := s.w.ExecContext(context.Background(), fmt.Sprintf(`PRAGMA incremental_vacuum(%d)`, pages))
 	return err
 }
