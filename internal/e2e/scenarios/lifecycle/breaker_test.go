@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakegraph"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/harness"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/steps"
 )
@@ -57,15 +58,20 @@ func TestSelfEchoBreaker(t *testing.T) {
 	s.Settle(2*time.Second, 6*time.Second)
 
 	// Echo the helper's three most recent messages in this chat, with the
-	// provenance marker stripped.
+	// provenance marker stripped. A helper that posted fewer than three
+	// helper messages here has its most recent ones echoed again (the
+	// trigger is three echoes, not three distinct texts).
 	marker := regexp.MustCompile(`<!--.*?-->`)
 	var echoed []string
+	var helperMsgs []fakegraph.Message
 	sut := s.SUTMessages(work.ID)
-	for i := len(sut) - 1; i >= 0 && len(echoed) < 3; i-- {
-		m := sut[i]
-		if !strings.Contains(m.Content, "Helper") {
-			continue
+	for i := len(sut) - 1; i >= 0 && len(helperMsgs) < 3; i-- {
+		if strings.Contains(sut[i].Content, "Helper") {
+			helperMsgs = append(helperMsgs, sut[i])
 		}
+	}
+	for i := 0; len(helperMsgs) > 0 && i < 3; i++ {
+		m := helperMsgs[i%len(helperMsgs)]
 		body := marker.ReplaceAllString(m.Content, "")
 		if _, err := s.Graph.PostAsOtherHelper(work.ID, body); err != nil {
 			t.Fatal(err)
