@@ -21,7 +21,9 @@ import (
 // sender for the same conversation (BeginSend requires the head).
 func (e *Engine) senderLoop(ctx context.Context) {
 	sem := make(chan struct{}, e.cfg.Senders)
-	timer := time.NewTimer(time.Hour)
+	// The first pass runs at once: rows left queued by the previous
+	// process (e.g. an update's outcome) go out without waiting for a wake.
+	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for {
 		select {

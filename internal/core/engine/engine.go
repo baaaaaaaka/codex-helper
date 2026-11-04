@@ -65,6 +65,10 @@ type Timing struct {
 	PaceIncrease time.Duration
 	// Registry is the machine card heartbeat (registry.go).
 	Registry time.Duration
+	// UpdateCheck is the automatic release check cadence; UpdateDrain
+	// and CodexDrain bound the wait for running turns before a helper
+	// update and a Codex CLI upgrade (upgrade.go).
+	UpdateCheck, UpdateDrain, CodexDrain time.Duration
 }
 
 // ProductionTiming are the CORE-DESIGN values.
@@ -84,6 +88,9 @@ func ProductionTiming() Timing {
 		ThrottleFloor: 10 * time.Second,
 		PaceIncrease:  30 * time.Second,
 		Registry:      5 * time.Minute,
+		UpdateCheck:   30 * time.Minute,
+		UpdateDrain:   10 * time.Minute,
+		CodexDrain:    30 * time.Minute,
 	}
 }
 
@@ -151,6 +158,14 @@ type Config struct {
 	Registrar Registrar
 	// Skills runs the `skills` command (nil: not available).
 	Skills Skills
+	// Updater updates the helper itself: automatic checks every
+	// Timing.UpdateCheck and `helper update` (nil: off). UpdatePrerelease
+	// includes pre-releases in automatic checks.
+	Updater          Updater
+	UpdatePrerelease bool
+	// CodexUpgrader upgrades the Codex CLI when Codex rejects a request as
+	// too old, and on `codex update now` (nil: not available).
+	CodexUpgrader CodexUpgrader
 
 	Readers, Senders, Turns int
 	// ReadRate caps chat reads per second account-wide (token bucket).
@@ -209,8 +224,13 @@ type Engine struct {
 	// drainFlag holds new turn starts while an update waits for running
 	// turns to finish (upgrade.go).
 	drainFlag atomic.Bool
-	fileTries map[string]int      // transient attachment failures by "<inbound>/<idx>"
-	uploadAt  map[int64]time.Time // outbound file rows waiting before an upload retry
+	// starting counts turn starts between the drain check and running
+	// being set (guarded by mu).
+	starting     int
+	updateWake   chan struct{}
+	registryWake chan struct{}
+	fileTries    map[string]int      // transient attachment failures by "<inbound>/<idx>"
+	uploadAt     map[int64]time.Time // outbound file rows waiting before an upload retry
 
 	readTokens  *bucket
 	writeTokens *pacer
@@ -284,7 +304,7 @@ func New(cfg Config) (*Engine, error) {
 		convs: map[int64]*convState{}, intro: map[int64]string{}, forkThreads: map[string]bool{}, delegThreads: map[string]bool{}, byChat: map[string]int64{}, byThread: map[string]int64{},
 		runnerWake: make(chan struct{}, 1), runnerDirty: map[int64]bool{},
 		senderWake: make(chan struct{}, 1), resolverWake: make(chan struct{}, 1),
-		mirrorWake: make(chan struct{}, 1), cmdQueue: make(chan cmdJob, 256), cmdPending: map[int64][]cmdJob{}, reminded: map[int64]int{}, asrWake: make(chan struct{}, 1), notifyWake: make(chan struct{}, 1), fileTries: map[string]int{}, uploadAt: map[int64]time.Time{},
+		mirrorWake: make(chan struct{}, 1), cmdQueue: make(chan cmdJob, 256), cmdPending: map[int64][]cmdJob{}, reminded: map[int64]int{}, asrWake: make(chan struct{}, 1), notifyWake: make(chan struct{}, 1), updateWake: make(chan struct{}, 1), registryWake: make(chan struct{}, 1), fileTries: map[string]int{}, uploadAt: map[int64]time.Time{},
 	}
 	if sc, ok := cfg.Channel.(channel.ActivityScanner); ok && cfg.ActivityScan && e.t.ScanInterval > 0 {
 		e.scanner = timedScanner{sc}
@@ -370,6 +390,9 @@ func (e *Engine) Run(ctx context.Context) error {
 	}
 	if e.cfg.Registry && e.cfg.Registrar != nil {
 		loops = append(loops, e.registryLoop)
+	}
+	if e.cfg.Updater != nil || e.cfg.CodexUpgrader != nil {
+		loops = append(loops, e.updateLoop)
 	}
 	for _, l := range loops {
 		e.wg.Add(1)
@@ -464,6 +487,9 @@ func (e *Engine) start(ctx context.Context) error {
 	e.resumeCreating(ctx)
 	e.requeueCommands()
 	e.loadRestartConfirm()
+	if err := e.announceUpdate(); err != nil {
+		return fmt.Errorf("engine: announce update: %w", err)
+	}
 	return nil
 }
 

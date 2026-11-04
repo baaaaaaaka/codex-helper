@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,7 +24,10 @@ func (e *Engine) runnerLoop(ctx context.Context) {
 	sem := make(chan struct{}, e.cfg.Turns)
 	sweep := time.NewTicker(e.t.Maintenance)
 	defer sweep.Stop()
-	timer := time.NewTimer(time.Hour)
+	// The first pass looks at every conversation: turns queued before a
+	// restart (e.g. held by an update's drain) start without waiting for
+	// the sweep.
+	timer := time.NewTimer(0)
 	defer timer.Stop()
 	for {
 		all := false
@@ -118,11 +122,20 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 	var lastEnd time.Time
 	if ok {
 		lastEnd = cs.lastTurnEnd
+		e.starting++ // a drain waits for it (upgrade.go)
 	}
 	e.mu.Unlock()
 	if !ok {
 		return false
 	}
+	started := false
+	defer func() {
+		if !started {
+			e.mu.Lock()
+			e.starting--
+			e.mu.Unlock()
+		}
+	}()
 	var (
 		tr      store.Turn
 		req     TurnRequest
@@ -180,6 +193,8 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 	rs := &runState{turnID: tr.ID, turnKey: tr.TurnKey, done: make(chan struct{}), request: request}
 	e.mu.Lock()
 	cs.running = rs
+	e.starting--
+	started = true
 	e.mu.Unlock()
 	e.count(func(s *engineStats) { s.turns++ })
 	e.wg.Add(1)
@@ -387,6 +402,8 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 		msgs           []store.OutMsg
 		err            error
 		notify         bool
+		extra          func(tx *store.Tx) error
+		upgrade        bool
 	)
 	base := fmt.Sprintf("turn:%d", tr.ID)
 	switch {
@@ -403,6 +420,27 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 		}
 		state, errText = store.TurnFailed, out.Error
 		msgs, err = e.notice(base+":failed", "Codex is over capacity and the request did not run within 5 minutes of retrying. Resend it later.")
+	case out.Status != StatusCompleted && codexTooOld(out.Error):
+		// Codex rejected the request as too old for the model: upgrade
+		// it after running turns end; `helper retry last` runs it again.
+		state, errText = store.TurnFailed, out.Error
+		if out.NotStarted {
+			state = store.TurnNotStarted
+		}
+		text := textCodexTooOldManual
+		if e.cfg.CodexUpgrader != nil {
+			text, upgrade = textCodexTooOld, true
+		}
+		msgs, err = e.notice(base+":codex-too-old", text+"\n\nCodex said: "+userError(out.Error))
+		extra = func(tx *store.Tx) error {
+			if err := tx.SetMeta(fmt.Sprintf("%s%d", metaRetryPrefix, cs.id), strconv.FormatInt(tr.InboundID, 10)); err != nil {
+				return err
+			}
+			if !upgrade {
+				return nil
+			}
+			return e.requestCodexUpgrade(tx, &codexTarget{Conv: cs.id, Inbound: tr.InboundID}, nil)
+		}
 	case out.ActiveWriter:
 		state, errText = store.TurnFailed, out.Error
 		msgs, err = e.notice(base+":active", textActive)
@@ -450,6 +488,11 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 		if err := recordUsage(tx, cs.id, state, out.Usage); err != nil {
 			return err
 		}
+		if extra != nil {
+			if err := extra(tx); err != nil {
+				return err
+			}
+		}
 		if notify {
 			return addNotify(tx, pendingNotify{Turn: tr.ID, Conv: cs.id, Text: clipText(out.Final, 400)})
 		}
@@ -467,6 +510,9 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 	if notify {
 		e.notifyN.Add(1)
 		wake(e.notifyWake)
+	}
+	if upgrade {
+		wake(e.updateWake)
 	}
 }
 

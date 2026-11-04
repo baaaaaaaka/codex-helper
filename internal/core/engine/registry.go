@@ -52,6 +52,18 @@ func (e *Engine) registryLoop(ctx context.Context) {
 			}
 			return
 		case <-t.C:
+		case <-e.registryWake:
+			// The drain state changed: publish it now, unless a failed
+			// publish waits out its backoff.
+			if backoff > 0 || !published {
+				continue
+			}
+			if !t.Stop() {
+				select {
+				case <-t.C:
+				default:
+				}
+			}
 		}
 		card, ok := e.registryCard(e.draining())
 		if !ok {
@@ -72,6 +84,7 @@ func (e *Engine) registryLoop(ctx context.Context) {
 		var th *channel.Throttled
 		switch {
 		case errors.As(err, &th) && th.RetryAfter > 0:
+			backoff = max(backoff, th.RetryAfter)
 			t.Reset(th.RetryAfter)
 		default:
 			backoff = min(max(2*backoff, e.t.Registry), registryMaxBackoff)

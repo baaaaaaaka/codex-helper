@@ -187,12 +187,15 @@ const controlHelp = "Commands in this chat:\n\n" +
 	"- `skills`: list skill subscriptions (`skills add <url>`, `skills sync`)\n" +
 	"- `status`: helper status\n" +
 	"- `restart`: restart the helper\n" +
+	"- `update now` / `update prerelease`: update the helper (`update status` shows a pending update)\n" +
+	"- `codex update now`: update the Codex CLI\n" +
 	"- `help`: this help"
 
 const workHelp = "Commands in a work chat (prefix `helper`):\n\n" +
 	"- `helper cancel` / `helper cancel last`: cancel the running (or last queued) request\n" +
 	"- `helper cancel all`: cancel the running and every queued request\n" +
 	"- `helper retry`: run the last ignored duplicate request again\n" +
+	"- `helper retry last`: run the request that failed because Codex needed an update again\n" +
 	"- `helper unpause`: resume auto-start after a pause (held requests are not run)\n" +
 	"- `helper park`: stop reading this chat until woken\n" +
 	"- `helper status`: session status\n" +
@@ -233,6 +236,10 @@ func (e *Engine) controlCommand(ctx context.Context, j cmdJob, text string) {
 		e.cmdParkLabel(j, arg)
 	case "restart":
 		e.cmdRestart(j, strings.ToLower(arg))
+	case "update", "upgrade":
+		e.cmdHelperUpdate(ctx, j, arg)
+	case "codex":
+		e.cmdCodexUpdate(j, arg)
 	case "fork":
 		target := e.findLabel(arg)
 		if target == nil {
@@ -271,7 +278,7 @@ func (e *Engine) workCommand(ctx context.Context, j cmdJob, cs *convState, field
 	case "cancel", "stop":
 		e.cmdCancel(ctx, j, cs, arg)
 	case "retry":
-		e.cmdRetry(j, cs)
+		e.cmdRetry(j, cs, arg)
 	case "unpause", "resume":
 		e.cmdUnpause(j, cs)
 	case "park":
@@ -441,20 +448,40 @@ func (e *Engine) cmdCancel(ctx context.Context, j cmdJob, cs *convState, arg str
 	e.wakeRunner(cs.id)
 }
 
-// cmdRetry runs the last duplicate-ignored prompt again.
-func (e *Engine) cmdRetry(j cmdJob, cs *convState) {
+// cmdRetry runs a request again: `helper retry` the last duplicate-ignored
+// prompt, else (and `helper retry last` first) the last request that
+// failed because Codex needed an update.
+func (e *Engine) cmdRetry(j cmdJob, cs *convState, arg string) {
+	key := fmt.Sprintf("%s%d", metaRetryPrefix, cs.id)
+	var failed int64
+	if v, ok, err := e.st.Meta(key); err == nil && ok {
+		failed, _ = strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+	}
 	e.mu.Lock()
 	dup := cs.lastDup
-	cs.lastDup = 0
+	useDup := dup != 0 && (arg != "last" || failed == 0)
+	if useDup {
+		cs.lastDup = 0
+	}
 	e.mu.Unlock()
-	if dup == 0 {
-		e.reply(j, "Nothing to retry: no request was ignored as a duplicate recently.", nil)
+	switch {
+	case useDup:
+		e.reply(j, "Running the ignored request again.", func(tx *store.Tx) error {
+			_, err := tx.RetryTurn(cs.id, dup)
+			return err
+		})
+	case failed != 0:
+		e.reply(j, "Running the failed request again.", func(tx *store.Tx) error {
+			if err := tx.SetMeta(key, ""); err != nil {
+				return err
+			}
+			_, err := tx.RetryTurn(cs.id, failed)
+			return err
+		})
+	default:
+		e.reply(j, "Nothing to retry: no request was ignored as a duplicate or failed for a Codex update recently.", nil)
 		return
 	}
-	e.reply(j, "Running the ignored request again.", func(tx *store.Tx) error {
-		_, err := tx.RetryTurn(cs.id, dup)
-		return err
-	})
 	e.wakeRunner(cs.id)
 }
 
@@ -646,8 +673,14 @@ func (e *Engine) listText() string {
 
 func (e *Engine) statusText() string {
 	s := e.Snapshot()
-	return fmt.Sprintf("Helper %s on %s: up %s; %d sessions (%d active, %d parked, %d running); %d requests run, %d answered.",
+	text := fmt.Sprintf("Helper %s on %s: up %s; %d sessions (%d active, %d parked, %d running); %d requests run, %d answered.",
 		e.cfg.Version, e.cfg.Machine, s.Uptime.Round(time.Second), s.Conversations, s.Active, s.Parked, s.Running, s.Turns, s.Completed)
+	if e.draining() {
+		text += " New requests wait for an update (it waits for running requests to finish)."
+	} else if v, ok, err := e.st.Meta(metaUpdateRequest); err == nil && ok && v != "" {
+		text += " A helper update is scheduled (`update status`)."
+	}
+	return text
 }
 
 func (e *Engine) workStatus(cs *convState) string {
