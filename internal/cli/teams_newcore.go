@@ -268,6 +268,11 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 	}
 	machine := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_MACHINE_LABEL"))
 	if machine == "" {
+		// `cxp teams migrate` keeps the old hostname override here.
+		machine, _, _ = st.Meta("machine_label")
+		machine = strings.TrimSpace(machine)
+	}
+	if machine == "" {
 		machine = host
 	}
 	skillsCache, err := defaultSkillsCacheDir()
@@ -289,7 +294,15 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 		}),
 	}
 	if cfg.Registry {
-		cfg.Delegations = delegate.New(machine)
+		// The registry keys the inbox by the account id: read once (and
+		// kept), so a start without network fails only the first time.
+		rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		err := delegate.Configure(rctx, &cfg, ch, authCfg.TenantID, host, os.Getenv("CODEX_HELPER_TEAMS_PROFILE"), "")
+		cancel()
+		if err != nil {
+			_, _ = fmt.Fprintf(errOut, "Machine registry is off until the next start: %v\n", err)
+			cfg.Registry = false
+		}
 	}
 	asrArgs, err := teamsASRArgsFromFlagsOrEnv(opts.asrArgs, strings.TrimSpace(opts.asrCommand) != "")
 	if err != nil {

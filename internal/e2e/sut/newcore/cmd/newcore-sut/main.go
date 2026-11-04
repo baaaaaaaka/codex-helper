@@ -170,9 +170,11 @@ func run() error {
 		cfg.SessionsDir = filepath.Join(codexHome, "sessions")
 	}
 	if cfg.Registry {
-		// The worker side of cross-machine delegation; the machine id is
-		// the one the inbox title names.
-		cfg.Delegations = delegate.New(machine)
+		// The worker side of cross-machine delegation and the machine
+		// card, as in production (cxp teams run).
+		if err := delegate.Configure(ctx, &cfg, ch, authCfg.TenantID, host, "", ""); err != nil {
+			return fmt.Errorf("machine registry: %w", err)
+		}
 	}
 	if url := os.Getenv(EnvWorkflowWebhook); url != "" {
 		cfg.Notifier = teams.NewWorkflowNotifier(url, client)
