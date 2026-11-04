@@ -6,10 +6,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/core/delegate/delegation"
+	"github.com/baaaaaaaka/codex-helper/internal/core/delegate/machineregistry"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakegraph"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/harness"
-	"github.com/baaaaaaaka/codex-helper/internal/teams/delegation"
-	"github.com/baaaaaaaka/codex-helper/internal/teams/machineregistry"
 )
 
 // registryTopic is the chat the machine cards are posted in.

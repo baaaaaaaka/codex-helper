@@ -20,6 +20,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/core/engine"
 	"github.com/baaaaaaaka/codex-helper/internal/core/internal/leakcheck"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakecodex"
+	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 )
 
 const envFake = "CODEXAGENT_TEST_FAKE_CODEX"
@@ -58,7 +59,7 @@ func TestUnknownStartErrorKillsTheServer(t *testing.T) {
 		}
 	}))
 	defer func() { brain.CloseClientConnections(); brain.Close() }()
-	exe, err := os.Executable()
+	exe, err := helperpath.RawExecutable()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +113,7 @@ func TestCancelDuringStartNeverStartsTheTurn(t *testing.T) {
 		_, _ = w.Write([]byte("{}"))
 	}))
 	defer func() { brain.CloseClientConnections(); brain.Close() }()
-	exe, err := os.Executable()
+	exe, err := helperpath.RawExecutable()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -161,7 +162,7 @@ func TestLookupDoesNotStartAConversationServer(t *testing.T) {
 		}
 	}))
 	defer func() { brain.CloseClientConnections(); brain.Close() }()
-	exe, err := os.Executable()
+	exe, err := helperpath.RawExecutable()
 	if err != nil {
 		t.Fatal(err)
 	}

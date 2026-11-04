@@ -20,7 +20,6 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 	"github.com/baaaaaaaka/codex-helper/internal/ids"
 	"github.com/baaaaaaaka/codex-helper/internal/manager"
-	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	"github.com/gofrs/flock"
 )
 
@@ -68,22 +67,20 @@ var (
 )
 
 type codexAppOptions struct {
-	profileRef      string
-	modelProfileRef string
-	codexDir        string
-	appPath         string
-	cwd             string
+	profileRef string
+	codexDir   string
+	appPath    string
+	cwd        string
 }
 
 type codexDesktopAppOptions struct {
-	Platform         codexDesktopPlatform
-	Cwd              string
-	AppPath          string
-	InstallHome      string
-	CodexHomeSource  string
-	ExtraEnv         []string
-	ProxyURL         string
-	ModelProfileName string
+	Platform        codexDesktopPlatform
+	Cwd             string
+	AppPath         string
+	InstallHome     string
+	CodexHomeSource string
+	ExtraEnv        []string
+	ProxyURL        string
 	// RequiresDirectLaunch is set when launch-time state must be inherited by
 	// the desktop process. AppX activation cannot preserve that state.
 	RequiresDirectLaunch bool
@@ -105,7 +102,6 @@ func newAppCmd(root *rootOptions) *cobra.Command {
 	var appPath string
 	var cwd string
 	var profileFlag string
-	var modelProfileFlag string
 
 	cmd := &cobra.Command{
 		Use:   "app [profile]",
@@ -119,11 +115,10 @@ func newAppCmd(root *rootOptions) *cobra.Command {
 				return err
 			}
 			return runCodexApp(cmd, root, codexAppOptions{
-				profileRef:      profileRef,
-				modelProfileRef: modelProfileFlag,
-				codexDir:        codexDir,
-				appPath:         appPath,
-				cwd:             cwd,
+				profileRef: profileRef,
+				codexDir:   codexDir,
+				appPath:    appPath,
+				cwd:        cwd,
 			})
 		},
 	}
@@ -132,7 +127,6 @@ func newAppCmd(root *rootOptions) *cobra.Command {
 	cmd.Flags().StringVar(&appPath, "app-path", "", "Override Codex desktop app path")
 	cmd.Flags().StringVar(&cwd, "cwd", "", "Working directory for Codex app (default: current directory)")
 	cmd.Flags().StringVar(&profileFlag, "profile", "", "Proxy profile id or name")
-	cmd.Flags().StringVar(&modelProfileFlag, "model-profile", "", "Model profile id or name for Codex launches")
 	cmd.AddCommand(newAppAuthCmd(root))
 	return cmd
 }
@@ -219,9 +213,8 @@ func runCodexApp(cmd *cobra.Command, root *rootOptions, opts codexAppOptions) er
 	if err != nil {
 		return err
 	}
-	needsModelProfile := strings.TrimSpace(opts.modelProfileRef) != "" || modelprofile.HasConfiguredThirdPartyModels(cfg) || cfg.HasExplicitGlobalDefaults()
 	launchOpts.RequiresDirectLaunch = strings.TrimSpace(opts.appPath) == "" &&
-		(useProxy || needsModelProfile || strings.TrimSpace(opts.codexDir) != "")
+		(useProxy || strings.TrimSpace(opts.codexDir) != "")
 	if platform == codexDesktopPlatformWindows {
 		if err := preflightCodexWindowsAppElevation(ctx, launchOpts); err != nil {
 			return err
@@ -234,17 +227,6 @@ func runCodexApp(cmd *cobra.Command, root *rootOptions, opts codexAppOptions) er
 			return err
 		}
 		launchOpts.ProxyURL = proxyURL
-	}
-
-	if needsModelProfile {
-		launch, err := codexAppEnsureModelProfileLaunchFn(ctx, store, opts.modelProfileRef, proxyRef, cmd.ErrOrStderr())
-		if err != nil {
-			return err
-		}
-		launchOpts, err = applyCodexDesktopModelProfileLaunch(store, launchOpts, launch)
-		if err != nil {
-			return err
-		}
 	}
 
 	// AppX activation is allowed only when no launch-time state needs to be
@@ -596,10 +578,6 @@ func printCodexDesktopAppLaunchAdvisories(opts codexDesktopAppOptions) {
 	if strings.TrimSpace(opts.ProxyURL) != "" {
 		codexAppWarn(opts.Log, "Codex desktop app will use proxy %s through environment variables and Chromium proxy arguments when direct launch is available.", opts.ProxyURL)
 		codexAppWarn(opts.Log, "if Codex desktop app is already running, quit it first so the new proxy arguments take effect.")
-	}
-	if strings.TrimSpace(opts.ModelProfileName) != "" {
-		codexAppWarn(opts.Log, "Codex desktop app will use model profile %q through an isolated CODEX_HOME and local adapter.", opts.ModelProfileName)
-		codexAppWarn(opts.Log, "if Codex desktop app is already running, quit it first so the model profile configuration takes effect.")
 	}
 	if opts.Platform == codexDesktopPlatformWindows && codexAppGOOS() == "linux" && codexAppIsWSL() {
 		codexAppWarn(opts.Log, "launching the Windows Codex desktop app from WSL. Windows must be able to access the converted working directory and CODEX_HOME paths.")

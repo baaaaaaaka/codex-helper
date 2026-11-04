@@ -2,9 +2,12 @@ package delegate
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -13,11 +16,9 @@ import (
 
 	"github.com/baaaaaaaka/codex-helper/internal/channel"
 	chteams "github.com/baaaaaaaka/codex-helper/internal/channel/teams"
+	"github.com/baaaaaaaka/codex-helper/internal/core/delegate/machineregistry"
 	"github.com/baaaaaaaka/codex-helper/internal/core/engine"
 	"github.com/baaaaaaaka/codex-helper/internal/core/store"
-	"github.com/baaaaaaaka/codex-helper/internal/teams"
-	"github.com/baaaaaaaka/codex-helper/internal/teams/machineregistry"
-	teamstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
 
 // meetings is a MeetingChannel: meeting chats by key, messages by chat.
@@ -254,7 +255,7 @@ func TestRegistryRefusesForeignInbox(t *testing.T) {
 // derived, and the environment overrides it.
 func TestResolveMachineID(t *testing.T) {
 	t.Setenv("CODEX_HELPER_TEAMS_MACHINE_ID", "")
-	t.Setenv("CODEX_HELPER_TEAMS_MACHINE_KIND", "")
+	t.Setenv("USER", "tester")
 	open := func() *store.Store {
 		st, err := store.Open(filepath.Join(t.TempDir(), "core.db"))
 		if err != nil {
@@ -275,7 +276,12 @@ func TestResolveMachineID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := teams.MachineRecordForUser(teams.User{ID: "owner-1"}, teamstore.ScopeIdentity{ID: "scope:abc"}).ID
+	// The old core's derivation (internal/teams/scope.go MachineRecordForUser
+	// of a long-lived host): sha256 of v1, scope id, host name, OS user and
+	// kind joined by NUL, first 16 hex digits.
+	host, _ := os.Hostname()
+	sum := sha256.Sum256([]byte(strings.Join([]string{"v1", "scope:abc", host, "tester", "primary"}, "\x00")))
+	want := "machine:" + hex.EncodeToString(sum[:])[:16]
 	if got != want {
 		t.Fatalf("migrated id = %s, want the old core's %s", got, want)
 	}

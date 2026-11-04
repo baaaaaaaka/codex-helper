@@ -898,25 +898,6 @@ func TestRunLikeExplicitProfileForcesProxy(t *testing.T) {
 	}
 }
 
-func TestRunLikeRejectsModelProfileForNonCodexCommand(t *testing.T) {
-	lockCLITestHooks(t)
-	store := newTempStore(t)
-	if err := store.Save(config.Config{Version: config.CurrentVersion}); err != nil {
-		t.Fatalf("save config: %v", err)
-	}
-	root := &rootOptions{configPath: store.Path()}
-	cmd := newRunCmd(root)
-	cmd.SetOut(io.Discard)
-	cmd.SetErr(io.Discard)
-	cmd.SetContext(context.Background())
-	cmd.SetArgs([]string{"--model-profile", "mimo25", "--", "bash", "-lc", "true"})
-
-	err := cmd.Execute()
-	if err == nil || !strings.Contains(err.Error(), "--model-profile only applies to Codex launches") {
-		t.Fatalf("run command error = %v, want model-profile non-Codex rejection", err)
-	}
-}
-
 func TestRunLikeRejectsAAAForNonCodexCommand(t *testing.T) {
 	lockCLITestHooks(t)
 	store := newTempStore(t)

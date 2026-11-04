@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"html"
@@ -25,12 +24,10 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
-	"github.com/baaaaaaaka/codex-helper/internal/config"
+	chteams "github.com/baaaaaaaka/codex-helper/internal/channel/teams"
+	corestore "github.com/baaaaaaaka/codex-helper/internal/core/store"
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
-	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
-	"github.com/baaaaaaaka/codex-helper/internal/teams"
-	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
 )
 
@@ -104,15 +101,15 @@ var (
 	teamsServiceStartupFallbackRestartDelay                           = 2 * time.Second
 )
 
-func newTeamsServiceCmd(root *rootOptions, registryPath *string) *cobra.Command {
+func newTeamsServiceCmd(root *rootOptions) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "service",
 		Short: "Manage the Teams bridge background service",
 		Args:  cobra.NoArgs,
 	}
 	cmd.AddCommand(
-		newTeamsServiceInstallCmd(registryPath),
-		newTeamsServiceBootstrapCmd(root, registryPath),
+		newTeamsServiceInstallCmd(),
+		newTeamsServiceBootstrapCmd(root),
 		newTeamsServiceUninstallCmd(),
 		newTeamsServiceEnableCmd(),
 		newTeamsServiceDisableCmd(),
@@ -127,7 +124,7 @@ func newTeamsServiceCmd(root *rootOptions, registryPath *string) *cobra.Command 
 	return cmd
 }
 
-func newTeamsServiceBootstrapCmd(root *rootOptions, registryPath *string) *cobra.Command {
+func newTeamsServiceBootstrapCmd(root *rootOptions) *cobra.Command {
 	var yes bool
 	var noUAC bool
 	var fallbackOnly bool
@@ -144,10 +141,10 @@ func newTeamsServiceBootstrapCmd(root *rootOptions, registryPath *string) *cobra
 				return err
 			}
 			if dryRun {
-				return printTeamsServiceDryRun(cmd.Context(), cmd.OutOrStdout(), registryPath)
+				return printTeamsServiceDryRun(cmd.Context(), cmd.OutOrStdout())
 			}
 			if noStart {
-				result, err := bootstrapTeamsService(cmd.Context(), registryPath, teamsServiceBootstrapOptions{
+				result, err := bootstrapTeamsService(cmd.Context(), teamsServiceBootstrapOptions{
 					NoStart: true,
 					In:      cmd.InOrStdin(),
 					Out:     cmd.OutOrStdout(),
@@ -162,12 +159,11 @@ func newTeamsServiceBootstrapCmd(root *rootOptions, registryPath *string) *cobra
 			if err := teamsServiceAuthPreflight(); err != nil {
 				return err
 			}
-			spec, err := buildTeamsServiceSpec(registryPath, teamsServiceSpecMaterializeManagedTarget())
+			spec, err := buildTeamsServiceSpec(teamsServiceSpecMaterializeManagedTarget())
 			if err != nil {
 				return err
 			}
-			control, controlErr := bootstrapControlChatWithServiceSpec(cmd.Context(), root, registryPath, spec, !noOpenControl, io.Discard)
-			result, err := bootstrapTeamsService(cmd.Context(), registryPath, teamsServiceBootstrapOptions{
+			result, err := bootstrapTeamsService(cmd.Context(), teamsServiceBootstrapOptions{
 				AssumeYes:    yes,
 				NoUAC:        noUAC,
 				FallbackOnly: fallbackOnly,
@@ -177,6 +173,8 @@ func newTeamsServiceBootstrapCmd(root *rootOptions, registryPath *string) *cobra
 			if err != nil {
 				return err
 			}
+			// The started helper creates the control chat; wait for it.
+			control, controlErr := bootstrapControlChatWithServiceSpec(cmd.Context(), root, spec, !noOpenControl, io.Discard)
 			printTeamsServiceBootstrapReady(cmd.OutOrStdout(), result)
 			if controlErr != nil {
 				printTeamsServiceBootstrapControlChatUnavailable(cmd.OutOrStdout(), controlErr)
@@ -195,7 +193,7 @@ func newTeamsServiceBootstrapCmd(root *rootOptions, registryPath *string) *cobra
 	return cmd
 }
 
-func newTeamsServiceInstallCmd(registryPath *string) *cobra.Command {
+func newTeamsServiceInstallCmd() *cobra.Command {
 	var yes bool
 	var noUAC bool
 	cmd := &cobra.Command{
@@ -206,7 +204,7 @@ func newTeamsServiceInstallCmd(registryPath *string) *cobra.Command {
 			if err := rejectTeamsHelperSelfManagementFromChildWithAdvice("install the Teams service", "run `cxp teams service install` in a local terminal"); err != nil {
 				return err
 			}
-			path, err := installTeamsService(cmd.Context(), registryPath, teamsServiceBootstrapOptions{
+			path, err := installTeamsService(cmd.Context(), teamsServiceBootstrapOptions{
 				AssumeYes: yes,
 				NoUAC:     noUAC,
 				In:        cmd.InOrStdin(),
@@ -379,14 +377,6 @@ func newTeamsServiceRestartCmd(root *rootOptions) *cobra.Command {
 			if err := teamsServiceAuthPreflight(); err != nil {
 				return err
 			}
-			if force {
-				_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Force recovering Teams state before service restart...")
-				summary, err := recoverTeamsStores(cmd.Context(), true, 0)
-				if err != nil {
-					return fmt.Errorf("force recover Teams state before service restart: %w", err)
-				}
-				printTeamsRecoverSummary(cmd.OutOrStdout(), summary)
-			}
 			warnTeamsServiceProxyLocalStatus(cmd.Context(), root, cmd.OutOrStdout())
 			if scheduled, err := schedulePendingTeamsServiceActivationBeforeStart(cmd.Context(), cmd.OutOrStdout(), "restart"); err != nil {
 				return err
@@ -404,7 +394,9 @@ func newTeamsServiceRestartCmd(root *rootOptions) *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().BoolVar(&force, "force", false, "Recover active Teams state before restarting; may interrupt running work")
+	// Accepted for old scripts: the helper recovers interrupted work at start.
+	cmd.Flags().BoolVar(&force, "force", false, "No effect; interrupted work is recovered automatically at start")
+	_ = cmd.Flags().MarkHidden("force")
 	return cmd
 }
 
@@ -545,31 +537,19 @@ func newTeamsServiceDoctorCmd(root *rootOptions) *cobra.Command {
 	}
 }
 
-func printTeamsServiceStoreDiagnostics(ctx context.Context, out io.Writer) {
+func printTeamsServiceStoreDiagnostics(_ context.Context, out io.Writer) {
 	if out == nil {
 		return
 	}
-	paths, err := existingTeamsStorePathsReadOnly()
-	if err != nil {
-		_, _ = fmt.Fprintf(out, "Teams store diagnostics: unavailable (%v)\n", err)
-		return
-	}
-	for _, path := range paths {
-		layer := teamsStatusStoreLayer(path)
-		if _, err := teamsstore.LoadPathReadOnly(ctx, path); err != nil {
-			_, _ = fmt.Fprintf(out, "Teams store %s load error: %s: %v\n", layer, path, err)
-			continue
-		}
-		_, _ = fmt.Fprintf(out, "Teams store %s: %s (ok)\n", layer, path)
-	}
+	writeTeamsCoreStoreStatus(out, time.Now())
 }
 
-func installTeamsService(ctx context.Context, registryPath *string, opts teamsServiceBootstrapOptions) (string, error) {
+func installTeamsService(ctx context.Context, opts teamsServiceBootstrapOptions) (string, error) {
 	backend, err := teamsServiceBackendForCurrentPlatform()
 	if err != nil {
 		return "", err
 	}
-	spec, err := buildTeamsServiceSpec(registryPath, teamsServiceSpecMaterializeManagedTarget())
+	spec, err := buildTeamsServiceSpec(teamsServiceSpecMaterializeManagedTarget())
 	if err != nil {
 		return "", err
 	}
@@ -589,13 +569,13 @@ func installTeamsService(ctx context.Context, registryPath *string, opts teamsSe
 	return path, nil
 }
 
-func repairTeamsService(ctx context.Context, registryPath *string, opts teamsServiceRepairOptions, buildOptions ...teamsServiceSpecBuildOption) (string, error) {
+func repairTeamsService(ctx context.Context, opts teamsServiceRepairOptions, buildOptions ...teamsServiceSpecBuildOption) (string, error) {
 	backend, err := teamsServiceBackendForCurrentPlatform()
 	if err != nil {
 		return "", err
 	}
 	buildOptions = append(buildOptions, teamsServiceSpecMaterializeManagedTarget())
-	spec, err := buildTeamsServiceSpec(registryPath, buildOptions...)
+	spec, err := buildTeamsServiceSpec(buildOptions...)
 	if err != nil {
 		return "", err
 	}
@@ -633,12 +613,12 @@ func cleanupTeamsServiceBeforeTaskRewrite(ctx context.Context, backend teamsServ
 	return nil
 }
 
-func printTeamsServiceDryRun(ctx context.Context, out io.Writer, registryPath *string) error {
+func printTeamsServiceDryRun(ctx context.Context, out io.Writer) error {
 	backend, err := teamsServiceBackendForCurrentPlatform()
 	if err != nil {
 		return err
 	}
-	spec, err := buildTeamsServiceSpec(registryPath)
+	spec, err := buildTeamsServiceSpec()
 	if err != nil {
 		return err
 	}
@@ -652,9 +632,6 @@ func printTeamsServiceDryRun(ctx context.Context, out io.Writer, registryPath *s
 	_, _ = fmt.Fprintf(out, "Teams service dry-run: backend=%s name=%s path=%s\n", backend.ID(), backend.Name(), path)
 	_, _ = fmt.Fprintf(out, "Executable: %s\n", spec.Executable)
 	_, _ = fmt.Fprintf(out, "WorkingDirectory: %s\n", spec.WorkingDir)
-	if spec.RegistryPath != "" {
-		_, _ = fmt.Fprintf(out, "Registry: %s\n", spec.RegistryPath)
-	}
 	switch typed := backend.(type) {
 	case teamsServiceSystemdBackend:
 		_, _ = fmt.Fprintln(out, "--- systemd main unit ---")
@@ -714,55 +691,65 @@ type teamsServiceBootstrapControlChatResult struct {
 	OpenErr error
 }
 
-func defaultTeamsServiceBootstrapControlChat(ctx context.Context, root *rootOptions, registryPath *string, openControl bool, errOut io.Writer) (teamsServiceBootstrapControlChatResult, error) {
-	httpClient, err := newTeamsGraphHTTPClientLease(ctx, root, errOut)
-	if err != nil {
-		return teamsServiceBootstrapControlChatResult{}, err
-	}
-	defer func() { _ = httpClient.Close(context.Background()) }()
-	auth, err := newTeamsAuthManagerWithHTTPClient(httpClient.Client)
-	if err != nil {
-		return teamsServiceBootstrapControlChatResult{}, err
-	}
-	var registry string
-	if registryPath != nil {
-		registry = *registryPath
-	}
-	bridge, err := teams.NewBridgeWithHTTPClient(ctx, auth, registry, io.Discard, httpClient.Client)
-	if err != nil {
-		return teamsServiceBootstrapControlChatResult{}, err
-	}
-	httpClient.RetireSuspects(ctx, errOut)
-	chat, err := bridge.EnsureControlChat(ctx)
-	if err != nil {
-		return teamsServiceBootstrapControlChatResult{}, err
-	}
-	if err := bridge.Save(); err != nil {
-		return teamsServiceBootstrapControlChatResult{}, err
-	}
-	result := teamsServiceBootstrapControlChatResult{
-		URL:    strings.TrimSpace(chat.WebURL),
-		Topic:  strings.TrimSpace(chat.Topic),
-		ChatID: strings.TrimSpace(chat.ID),
-	}
-	if openControl && result.URL != "" {
-		if err := teamsServiceOpenURL(ctx, result.URL); err != nil {
-			result.OpenErr = err
-		} else {
-			result.Opened = true
+// teamsServiceControlChatWait bounds how long bootstrap waits for the
+// started helper to create (or, on the first start after an update, to
+// convert the old store and find) the control chat.
+var teamsServiceControlChatWait = 2 * time.Minute
+
+// defaultTeamsServiceBootstrapControlChat reads the control chat the
+// started helper records in its store; it never talks to Teams itself.
+func defaultTeamsServiceBootstrapControlChat(ctx context.Context, _ *rootOptions, openControl bool, _ io.Writer) (teamsServiceBootstrapControlChatResult, error) {
+	deadline := time.Now().Add(teamsServiceControlChatWait)
+	var lastErr error
+	for {
+		c, ok, err := teamsStoredControlChat()
+		if err == nil && ok {
+			result := teamsServiceBootstrapControlChatResult{
+				URL:    strings.TrimSpace(c.ExtURL),
+				Topic:  strings.TrimSpace(c.Title),
+				ChatID: strings.TrimSpace(c.ExtChatID),
+			}
+			if openControl && result.URL != "" {
+				if err := teamsServiceOpenURL(ctx, result.URL); err != nil {
+					result.OpenErr = err
+				} else {
+					result.Opened = true
+				}
+			}
+			return result, nil
+		}
+		lastErr = err
+		if !time.Now().Before(deadline) {
+			if lastErr == nil {
+				lastErr = fmt.Errorf("the helper has not created the control chat yet; run `cxp teams control` later")
+			}
+			return teamsServiceBootstrapControlChatResult{}, lastErr
+		}
+		if err := sleepContext(ctx, 2*time.Second); err != nil {
+			return teamsServiceBootstrapControlChatResult{}, err
 		}
 	}
-	return result, nil
 }
 
-func bootstrapControlChatWithServiceSpec(ctx context.Context, root *rootOptions, registryPath *string, spec teamsServiceSpec, openControl bool, errOut io.Writer) (teamsServiceBootstrapControlChatResult, error) {
-	controlRegistryPath := registryPath
-	if strings.TrimSpace(spec.RegistryPath) != "" {
-		registry := spec.RegistryPath
-		controlRegistryPath = &registry
+func teamsStoredControlChat() (corestore.Conversation, bool, error) {
+	path, _, err := teamsNewCoreCLIStorePath()
+	if err != nil {
+		return corestore.Conversation{}, false, err
 	}
+	if !teamsFileExists(path) {
+		return corestore.Conversation{}, false, nil
+	}
+	st, err := corestore.OpenWith(path, corestore.Options{ReadOnly: true})
+	if err != nil {
+		return corestore.Conversation{}, false, err
+	}
+	defer st.Close()
+	return teamsControlConversation(st)
+}
+
+func bootstrapControlChatWithServiceSpec(ctx context.Context, root *rootOptions, spec teamsServiceSpec, openControl bool, errOut io.Writer) (teamsServiceBootstrapControlChatResult, error) {
 	return withTeamsServiceSpecEnvironment(spec.Environment, func() (teamsServiceBootstrapControlChatResult, error) {
-		return teamsServiceBootstrapControlChat(ctx, root, controlRegistryPath, openControl, errOut)
+		return teamsServiceBootstrapControlChat(ctx, root, openControl, errOut)
 	})
 }
 
@@ -891,12 +878,12 @@ func repairWindowsTaskBackendWithUAC(ctx context.Context, backend teamsServiceWi
 	return path, nil
 }
 
-func bootstrapTeamsService(ctx context.Context, registryPath *string, opts teamsServiceBootstrapOptions) (teamsServiceBootstrapResult, error) {
+func bootstrapTeamsService(ctx context.Context, opts teamsServiceBootstrapOptions) (teamsServiceBootstrapResult, error) {
 	backend, err := teamsServiceBackendForCurrentPlatform()
 	if err != nil {
 		return teamsServiceBootstrapResult{}, err
 	}
-	spec, err := buildTeamsServiceSpec(registryPath, teamsServiceSpecMaterializeManagedTarget())
+	spec, err := buildTeamsServiceSpec(teamsServiceSpecMaterializeManagedTarget())
 	if err != nil {
 		return teamsServiceBootstrapResult{}, err
 	}
@@ -904,7 +891,7 @@ func bootstrapTeamsService(ctx context.Context, registryPath *string, opts teams
 		return teamsServiceBootstrapResult{}, fmt.Errorf("check pending helper activation: %w", err)
 	} else if ok {
 		usedUAC := false
-		path, err := repairTeamsService(ctx, registryPath, teamsServiceRepairOptions{Enable: true, Start: false})
+		path, err := repairTeamsService(ctx, teamsServiceRepairOptions{Enable: true, Start: false})
 		if err != nil {
 			if windowsBackend, ok := backend.(teamsServiceWindowsTaskBackend); ok {
 				path, usedUAC, err = repairWindowsTaskBackendWithUACForBootstrap(ctx, windowsBackend, spec, teamsServiceRepairOptions{Enable: true, Start: false}, err, opts)
@@ -930,7 +917,7 @@ func bootstrapTeamsService(ctx context.Context, registryPath *string, opts teams
 		return teamsServiceBootstrapResult{Mode: mode, Path: path}, nil
 	}
 	if opts.NoStart {
-		path, err := repairTeamsService(ctx, registryPath, teamsServiceRepairOptions{Enable: true, Start: false})
+		path, err := repairTeamsService(ctx, teamsServiceRepairOptions{Enable: true, Start: false})
 		if err != nil {
 			if windowsBackend, ok := backend.(teamsServiceWindowsTaskBackend); ok {
 				if elevatedPath, _, elevatedErr := repairWindowsTaskBackendWithUACForBootstrap(ctx, windowsBackend, spec, teamsServiceRepairOptions{Enable: true, Start: false}, err, opts); elevatedErr == nil {
@@ -959,7 +946,7 @@ func bootstrapTeamsService(ctx context.Context, registryPath *string, opts teams
 		}
 		return teamsServiceBootstrapResult{}, fmt.Errorf("--fallback-only is only supported by the WSL Windows service backend")
 	}
-	path, err := repairTeamsService(ctx, registryPath, teamsServiceRepairOptions{Enable: true, Start: true})
+	path, err := repairTeamsService(ctx, teamsServiceRepairOptions{Enable: true, Start: true})
 	if err == nil {
 		if wslBackend, ok := backend.(teamsServiceWSLWindowsTaskBackend); ok {
 			if postRepairErr := wslBackend.VerifyAndCleanAfterRepair(ctx, spec); postRepairErr != nil {
@@ -1069,7 +1056,6 @@ func uninstallTeamsService(ctx context.Context) (string, error) {
 type teamsServiceSpec struct {
 	Executable                  string
 	WorkingDir                  string
-	RegistryPath                string
 	Environment                 map[string]string
 	WindowsTaskLauncherPath     string
 	WindowsWatchdogLauncherPath string
@@ -1283,34 +1269,21 @@ func runTeamsServiceWSLStartupFallbackReadinessCheck(ctx context.Context, out io
 }
 
 func defaultTeamsServiceAuthPreflight() error {
-	readCfg, err := teams.DefaultEffectiveReadAuthConfig()
+	cfg, err := chteams.ResolveAuthConfig("")
 	if err != nil {
 		return err
 	}
-	readStatus, err := teams.TokenCacheStatus(readCfg.CachePath)
-	if err != nil {
-		return err
+	tok, err := chteams.ReadTokenCache(cfg.CachePath)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("Teams sign-in cache is not usable for the background service: %w; run `cxp teams auth login --force` in a foreground terminal first", err)
 	}
-	switch readStatus {
-	case "missing", "empty", "present, access token expired":
-		return fmt.Errorf("Teams read auth cache is not ready for background service (%s at %s); run `%s` in a foreground terminal first", readStatus, readCfg.CachePath, teamsAuthCommandForCache(readCfg.CachePath, "codex-proxy teams auth read"))
-	}
-	writeCfg, err := teams.DefaultEffectiveAuthConfig()
-	if err != nil {
-		return err
-	}
-	writeStatus, err := teams.TokenCacheStatus(writeCfg.CachePath)
-	if err != nil {
-		return err
-	}
-	switch writeStatus {
-	case "missing", "empty", "present, access token expired":
-		return fmt.Errorf("Teams write auth cache is not ready for background service (%s at %s); run `%s` in a foreground terminal first", writeStatus, writeCfg.CachePath, teamsAuthCommandForCache(writeCfg.CachePath, "codex-proxy teams auth"))
+	if tok.RefreshToken == "" {
+		return fmt.Errorf("Teams sign-in is not ready for the background service; run `cxp teams auth login` in a foreground terminal first")
 	}
 	return nil
 }
 
-func ensureTeamsServiceForRun(ctx context.Context, registryPath *string, buildOptions ...teamsServiceSpecBuildOption) error {
+func ensureTeamsServiceForRun(ctx context.Context, buildOptions ...teamsServiceSpecBuildOption) error {
 	if runningInsideTeamsCodexChild() {
 		return nil
 	}
@@ -1340,11 +1313,11 @@ func ensureTeamsServiceForRun(ctx context.Context, registryPath *string, buildOp
 		}
 	}
 	start := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_SERVICE")) == ""
-	_, err = repairTeamsService(ctx, registryPath, teamsServiceRepairOptions{Enable: true, Start: start}, buildOptions...)
+	_, err = repairTeamsService(ctx, teamsServiceRepairOptions{Enable: true, Start: start}, buildOptions...)
 	if err != nil {
 		wslBackend, ok := backend.(teamsServiceWSLWindowsTaskBackend)
 		if ok {
-			spec, specErr := buildTeamsServiceSpec(registryPath, buildOptions...)
+			spec, specErr := buildTeamsServiceSpec(buildOptions...)
 			if specErr != nil {
 				return specErr
 			}
@@ -1391,7 +1364,7 @@ func stopTeamsServiceWithOutput(ctx context.Context, out io.Writer) error {
 		return err
 	}
 	if _, ok := backend.(teamsServiceWSLWindowsTaskBackend); ok {
-		return retireWSLTeamsBridgeProcesses(ctx, nil)
+		return retireWSLTeamsBridgeProcesses(ctx)
 	}
 	return nil
 }
@@ -1431,7 +1404,7 @@ func startTeamsServiceWithOutput(ctx context.Context, restart bool, out io.Write
 			if err := runTeamsServiceCommand(ctx, out, backend, "stop"); err != nil {
 				return err
 			}
-			if err := retireWSLTeamsBridgeProcesses(ctx, nil); err != nil {
+			if err := retireWSLTeamsBridgeProcesses(ctx); err != nil {
 				return err
 			}
 			return runTeamsServiceCommand(ctx, out, backend, "start")
@@ -1445,7 +1418,7 @@ func startTeamsServiceWithOutput(ctx context.Context, restart bool, out io.Write
 				return nil
 			}
 		} else {
-			if err := retireWSLTeamsBridgeProcesses(ctx, nil); err != nil {
+			if err := retireWSLTeamsBridgeProcesses(ctx); err != nil {
 				return err
 			}
 		}
@@ -1472,7 +1445,7 @@ func startTeamsPrimaryService(ctx context.Context, restart bool) error {
 				if _, err := primary.RunPrimary(ctx, "stop"); err != nil {
 					return err
 				}
-				if err := retireWSLTeamsBridgeProcesses(ctx, nil); err != nil {
+				if err := retireWSLTeamsBridgeProcesses(ctx); err != nil {
 					return err
 				}
 				_, err := primary.RunPrimary(ctx, "start")
@@ -1487,7 +1460,7 @@ func startTeamsPrimaryService(ctx context.Context, restart bool) error {
 					return nil
 				}
 			} else {
-				if err := retireWSLTeamsBridgeProcesses(ctx, nil); err != nil {
+				if err := retireWSLTeamsBridgeProcesses(ctx); err != nil {
 					return err
 				}
 			}
@@ -1507,8 +1480,8 @@ func teamsServiceWSLStartupFallbackInstalled(backend teamsServiceBackend) bool {
 	return err == nil && installed
 }
 
-func retireWSLTeamsBridgeProcesses(ctx context.Context, registryPath *string) error {
-	spec, err := buildTeamsServiceSpec(registryPath)
+func retireWSLTeamsBridgeProcesses(ctx context.Context) error {
+	spec, err := buildTeamsServiceSpec()
 	if err != nil {
 		return err
 	}
@@ -2973,7 +2946,7 @@ func teamsServiceRunCommandDirect(ctx context.Context, name string, args ...stri
 	return runner.Run(ctx, name, args...)
 }
 
-func buildTeamsServiceSpec(registryPath *string, buildOptions ...teamsServiceSpecBuildOption) (teamsServiceSpec, error) {
+func buildTeamsServiceSpec(buildOptions ...teamsServiceSpecBuildOption) (teamsServiceSpec, error) {
 	var opts teamsServiceSpecBuildOptions
 	for _, apply := range buildOptions {
 		if apply != nil {
@@ -3012,13 +2985,6 @@ func buildTeamsServiceSpec(registryPath *string, buildOptions ...teamsServiceSpe
 		return teamsServiceSpec{}, fmt.Errorf("validate stable Teams service home %s: %w", workingDir, statErr)
 	} else if !info.IsDir() {
 		return teamsServiceSpec{}, fmt.Errorf("validate stable Teams service home %s: not a directory", workingDir)
-	}
-	var resolvedRegistryPath string
-	if registryPath != nil && strings.TrimSpace(*registryPath) != "" {
-		resolvedRegistryPath = strings.TrimSpace(*registryPath)
-		if !filepath.IsAbs(resolvedRegistryPath) {
-			resolvedRegistryPath = filepath.Join(invocationDir, resolvedRegistryPath)
-		}
 	}
 	// Relative environment inputs are invocation-time inputs. Resolve them once
 	// against the caller's directory, then persist only absolute values while
@@ -3061,10 +3027,9 @@ func buildTeamsServiceSpec(registryPath *string, buildOptions ...teamsServiceSpe
 		return teamsServiceSpec{}, err
 	}
 	return teamsServiceSpec{
-		Executable:   exe,
-		WorkingDir:   workingDir,
-		RegistryPath: resolvedRegistryPath,
-		Environment:  env,
+		Executable:  exe,
+		WorkingDir:  workingDir,
+		Environment: env,
 	}, nil
 }
 
@@ -3179,9 +3144,6 @@ func normalizeTeamsServicePathEnvironment(env map[string]string, invocationDir s
 		"XDG_STATE_HOME",
 		"CODEX_HELPER_CONFIG",
 		"CODEX_HELPER_TEAMS_AUTH_CONFIG",
-		"CODEX_HELPER_TEAMS_READ_TOKEN_CACHE",
-		"CODEX_HELPER_TEAMS_TOKEN_CACHE",
-		"CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE",
 		"CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE",
 		envTeamsASRLlamaModel,
 		envTeamsASRLlamaMMProj,
@@ -3441,32 +3403,17 @@ func teamsServiceEnvironmentAllowlist() []string {
 		"CODEX_HELPER_TEAMS_AUTH_PROFILE",
 		"CODEX_HELPER_TEAMS_MACHINE_ID",
 		"CODEX_HELPER_TEAMS_MACHINE_LABEL",
-		"CODEX_HELPER_TEAMS_MACHINE_KIND",
-		"CODEX_HELPER_TEAMS_MACHINE_PRIORITY",
 		envTeamsCoreStore,
 		envTeamsASRCommand,
 		envTeamsASRArgsJSON,
-		envTeamsASRBackend,
 		envTeamsASRLlamaBinary,
 		envTeamsASRLlamaModel,
 		envTeamsASRLlamaMMProj,
 		envTeamsASRLlamaDevice,
 		envTeamsASRFFmpeg,
-		envTeamsASRAllowTransformersFallback,
 		"CODEX_HELPER_TEAMS_ALLOWED_SHAREPOINT_HOSTS",
-		"CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES",
-		"CODEX_HELPER_TEAMS_READ_TOKEN_CACHE",
-		"CODEX_HELPER_TEAMS_READ_TENANT_ID",
-		"CODEX_HELPER_TEAMS_READ_CLIENT_ID",
-		"CODEX_HELPER_TEAMS_READ_SCOPES",
-		"CODEX_HELPER_TEAMS_TOKEN_CACHE",
-		"CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE",
 		"CODEX_HELPER_TEAMS_TENANT_ID",
 		"CODEX_HELPER_TEAMS_CLIENT_ID",
-		"CODEX_HELPER_TEAMS_SCOPES",
-		"CODEX_HELPER_TEAMS_FILE_WRITE_TENANT_ID",
-		"CODEX_HELPER_TEAMS_FILE_WRITE_CLIENT_ID",
-		"CODEX_HELPER_TEAMS_FILE_WRITE_SCOPES",
 		"CODEX_HELPER_TEAMS_FULL_TENANT_ID",
 		"CODEX_HELPER_TEAMS_FULL_CLIENT_ID",
 		"CODEX_HELPER_TEAMS_FULL_SCOPES",
@@ -3483,65 +3430,6 @@ func teamsServiceEnvironmentAllowlist() []string {
 		"all_proxy",
 		"no_proxy",
 	}
-	for _, providerID := range modelprofile.ProviderIDs() {
-		spec, ok := modelprofile.LookupProvider(providerID)
-		if ok && strings.TrimSpace(spec.RecommendedEnv) != "" {
-			names = append(names, strings.TrimSpace(spec.RecommendedEnv))
-		}
-	}
-	names = append(names, teamsServiceConfiguredModelEnvNames()...)
-	return names
-}
-
-// External catalog providers may intentionally use env: references instead of
-// the local secret store. Include only those explicitly configured key
-// variable names in the background service environment; static provider
-// registries cannot know these names.
-func teamsServiceConfiguredModelEnvNames() []string {
-	path := strings.TrimSpace(os.Getenv("CODEX_HELPER_CONFIG"))
-	if path == "" {
-		var err error
-		path, err = config.DefaultPath()
-		if err != nil {
-			return nil
-		}
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return nil
-	}
-	var envelope struct {
-		ModelCredentials map[string]struct {
-			APIKeyRef string `json:"apiKeyRef"`
-		} `json:"modelCredentials"`
-		ModelProfiles map[string]struct {
-			APIKeyRef string `json:"apiKeyRef"`
-		} `json:"modelProfiles"`
-	}
-	if err := json.Unmarshal(raw, &envelope); err != nil {
-		return nil
-	}
-	seen := map[string]bool{}
-	var names []string
-	appendRef := func(ref string) {
-		ref = strings.TrimSpace(ref)
-		if !strings.HasPrefix(ref, modelprofile.EnvRefPrefix) {
-			return
-		}
-		name := strings.TrimSpace(strings.TrimPrefix(ref, modelprofile.EnvRefPrefix))
-		if name == "" || strings.ContainsAny(name, "=\x00\r\n") || seen[name] {
-			return
-		}
-		seen[name] = true
-		names = append(names, name)
-	}
-	for _, credential := range envelope.ModelCredentials {
-		appendRef(credential.APIKeyRef)
-	}
-	for _, profile := range envelope.ModelProfiles {
-		appendRef(profile.APIKeyRef)
-	}
-	sort.Strings(names)
 	return names
 }
 
@@ -3565,9 +3453,6 @@ func buildTeamsServiceRunArgs(spec teamsServiceSpec) []string {
 		teamsServiceRunOwnerStaleAfter.String(),
 		"--auto-service=false",
 		"--managed-service-child",
-	}
-	if spec.RegistryPath != "" {
-		args = append(args, "--registry", spec.RegistryPath)
 	}
 	return args
 }
@@ -3879,9 +3764,6 @@ func buildTeamsServiceWSLArguments(spec teamsServiceSpec) []string {
 		args = append(args, key+"="+spec.Environment[key])
 	}
 	args = append(args, spec.Executable, "teams", "run", "--owner-stale-after", teamsServiceRunOwnerStaleAfter.String(), "--auto-service=false", "--managed-service-child")
-	if spec.RegistryPath != "" {
-		args = append(args, "--registry", spec.RegistryPath)
-	}
 	return args
 }
 

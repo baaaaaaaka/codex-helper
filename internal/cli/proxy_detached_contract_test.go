@@ -10,7 +10,6 @@ import (
 
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
-	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 )
 
 const detachedContractChildEnv = "CODEX_HELPER_DETACHED_CONTRACT_CHILD"
@@ -85,44 +84,6 @@ func TestAppProxyLaunchConfiguresDetachedCommand(t *testing.T) {
 	}
 	if _, err := startCodexAppProxyDaemon(context.Background(), store, config.Profile{ID: "p1", Name: "dev"}); err != nil {
 		t.Fatalf("start app proxy daemon: %v", err)
-	}
-	assertDetachedCommandConfigured(t, launched)
-}
-
-func TestModelAdapterLaunchConfiguresDetachedCommand(t *testing.T) {
-	if os.Getenv(detachedContractChildEnv) == "adapter" {
-		os.Exit(0)
-	}
-	lockCLITestHooks(t)
-	configureDetachedContractStablePathForWindows(t)
-	store := newTempStore(t)
-	if err := store.Save(config.Config{Version: config.CurrentVersion}); err != nil {
-		t.Fatalf("seed config: %v", err)
-	}
-	exe, err := helperpath.RawExecutable()
-	if err != nil {
-		t.Fatal(err)
-	}
-	prevExecutable, prevCommand := proxyExecutable, proxyCommand
-	t.Cleanup(func() {
-		proxyExecutable = prevExecutable
-		proxyCommand = prevCommand
-	})
-	proxyExecutable = func() (string, error) { return exe, nil }
-	var launched *exec.Cmd
-	proxyCommand = func(_ string, _ ...string) *exec.Cmd {
-		launched = exec.Command(exe, "-test.run=^TestModelAdapterLaunchConfiguresDetachedCommand$")
-		launched.Env = append(os.Environ(), detachedContractChildEnv+"=adapter")
-		return launched
-	}
-	resolved := modelprofile.Resolved{
-		Name:     "adapter",
-		Profile:  config.ModelProfile{Provider: "test", Model: "test-model", Revision: 1},
-		Provider: modelprofile.ProviderSpec{ID: "test", DisplayName: "Test", DefaultModel: "test-model", UsesAdapter: true},
-		Model:    modelprofile.ModelSpec{ID: "test-model"},
-	}
-	if _, err := startModelProfileAdapterDaemon(context.Background(), store, resolved, "adapter-profile", "", nil, false); err != nil {
-		t.Fatalf("start model adapter daemon: %v", err)
 	}
 	assertDetachedCommandConfigured(t, launched)
 }

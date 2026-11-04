@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
 	"regexp"
 	"runtime"
 	"sort"
@@ -15,9 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
-	"github.com/baaaaaaaka/codex-helper/internal/teams"
-	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
+	"github.com/baaaaaaaka/codex-helper/internal/selfupdate"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
 )
 
@@ -54,94 +51,6 @@ func TestTeamsRuntimeSafetyPackageTestMainIsolatesEveryUserDirectoryCI(t *testin
 	}
 }
 
-func TestTeamsRuntimeSafetyServiceSpecDoesNotPersistInvocationWorkingDirCI(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	isolateTeamsUserDirsForTest(t, tmp)
-	invocationDir := filepath.Join(tmp, "disposable-checkout")
-	if err := os.MkdirAll(invocationDir, 0o755); err != nil {
-		t.Fatalf("mkdir invocation dir: %v", err)
-	}
-	exe := filepath.Join(tmp, "bin", "codex-proxy")
-	writeVersionedHelperForServiceTest(t, exe, "1.2.3")
-	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
-		goos:    "linux",
-		exe:     exe,
-		argv0:   exe,
-		cwd:     invocationDir,
-		unitDir: filepath.Join(tmp, "systemd"),
-		runner:  &recordingTeamsServiceRunner{},
-	})
-
-	spec, err := buildTeamsServiceSpec(stringPtr(""))
-	if err != nil {
-		t.Fatalf("buildTeamsServiceSpec: %v", err)
-	}
-	if teamsServiceLocalSupervisorSamePath(spec.WorkingDir, invocationDir) {
-		t.Fatalf("service WorkingDir %q is permanently bound to the invocation cwd; use a stable user-owned directory", spec.WorkingDir)
-	}
-	stableHome := strings.TrimSpace(os.Getenv("HOME"))
-	if !teamsServiceLocalSupervisorSamePath(spec.WorkingDir, stableHome) {
-		t.Fatalf("service WorkingDir = %q, want isolated stable user home %q", spec.WorkingDir, stableHome)
-	}
-	if info, err := os.Stat(spec.WorkingDir); err != nil || !info.IsDir() {
-		t.Fatalf("service WorkingDir must be an existing directory: path=%q info=%v err=%v", spec.WorkingDir, info, err)
-	}
-}
-
-func TestTeamsRuntimeSafetyServiceSpecNormalizesAllPersistedPathOverridesCI(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	isolateTeamsUserDirsForTest(t, tmp)
-	invocationDir := filepath.Join(tmp, "invocation")
-	if err := os.MkdirAll(invocationDir, 0o700); err != nil {
-		t.Fatalf("mkdir invocation dir: %v", err)
-	}
-	exe := filepath.Join(tmp, "bin", "codex-proxy")
-	writeVersionedHelperForServiceTest(t, exe, "1.2.3")
-	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
-		goos:    "linux",
-		exe:     exe,
-		argv0:   exe,
-		cwd:     invocationDir,
-		unitDir: filepath.Join(tmp, "systemd"),
-		runner:  &recordingTeamsServiceRunner{},
-	})
-
-	spec, err := buildTeamsServiceSpec(
-		stringPtr("registry.json"),
-		teamsServiceSpecEnvironmentOverrides(map[string]string{
-			"CODEX_HELPER_TEAMS_AUTH_CONFIG": "auth/config.json",
-			"CODEX_HELPER_TEAMS_TOKEN_CACHE": "tokens/chat.json",
-			envTeamsASRLlamaModel:            "models/qwen.gguf",
-			envTeamsASRCommand:               "bin/asr",
-			envTeamsASRFFmpeg:                "ffmpeg",
-		}),
-	)
-	if err != nil {
-		t.Fatalf("buildTeamsServiceSpec: %v", err)
-	}
-	for name, relative := range map[string]string{
-		"CODEX_HELPER_TEAMS_AUTH_CONFIG": "auth/config.json",
-		"CODEX_HELPER_TEAMS_TOKEN_CACHE": "tokens/chat.json",
-		envTeamsASRLlamaModel:            "models/qwen.gguf",
-		envTeamsASRCommand:               "bin/asr",
-	} {
-		want := filepath.Join(invocationDir, filepath.FromSlash(relative))
-		if got := spec.Environment[name]; got != want || !filepath.IsAbs(got) {
-			t.Fatalf("%s = %q, want invocation-time absolute path %q", name, got, want)
-		}
-	}
-	if got := spec.Environment[envTeamsASRFFmpeg]; got != "ffmpeg" {
-		t.Fatalf("bare ffmpeg command was incorrectly treated as a path: %q", got)
-	}
-	if spec.RegistryPath != filepath.Join(invocationDir, "registry.json") {
-		t.Fatalf("registry path = %q, want invocation-time absolute path", spec.RegistryPath)
-	}
-}
-
 func TestTeamsRuntimeSafetyManagedServiceArgsAlwaysCarryMigrationAuthorityMarkerCI(t *testing.T) {
 	args := buildTeamsServiceRunArgs(teamsServiceSpec{})
 	found := false
@@ -153,60 +62,6 @@ func TestTeamsRuntimeSafetyManagedServiceArgsAlwaysCarryMigrationAuthorityMarker
 	}
 	if !found {
 		t.Fatalf("managed service args omitted hidden migration authority marker: %v", args)
-	}
-}
-
-func TestTeamsRuntimeSafetyAutoUpdatePreflightsPersistedServiceWorkingDirCI(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	isolateTeamsUserDirsForTest(t, tmp)
-	exe := filepath.Join(tmp, "bin", "codex-proxy")
-	writeVersionedHelperForServiceTest(t, exe, "1.2.3")
-	missingWorkingDir := filepath.Join(tmp, "deleted-bootstrap-directory")
-	systemdUnavailable := false
-	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
-		goos:                 "linux",
-		exe:                  exe,
-		argv0:                exe,
-		cwd:                  tmp,
-		unitDir:              filepath.Join(tmp, "systemd"),
-		runner:               &recordingTeamsServiceRunner{},
-		systemdUserAvailable: &systemdUnavailable,
-	})
-	if _, err := (teamsServiceLocalSupervisorBackend{}).Install(context.Background(), teamsServiceSpec{
-		Executable:  exe,
-		WorkingDir:  missingWorkingDir,
-		Environment: map[string]string{},
-	}); err != nil {
-		t.Fatalf("install invalid local-supervisor fixture: %v", err)
-	}
-
-	prevPerform := performUpdate
-	prevResolve := teamsAutoUpdateResolveInstallPath
-	prevExecutable := teamsAutoUpdateExecutable
-	t.Cleanup(func() {
-		performUpdate = prevPerform
-		teamsAutoUpdateResolveInstallPath = prevResolve
-		teamsAutoUpdateExecutable = prevExecutable
-	})
-	teamsAutoUpdateResolveInstallPath = func(string) (string, error) { return exe, nil }
-	teamsAutoUpdateExecutable = func() (string, error) { return exe, nil }
-	updateCalled := false
-	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
-		updateCalled = true
-		return update.ApplyResult{Version: "1.2.4", InstallPath: exe}, nil
-	}
-
-	_, err := (teamsReleaseAutoUpdater{repo: "owner/repo"}).Apply(
-		context.Background(),
-		teams.HelperAutoUpdateCandidate{TagName: "v1.2.4", Version: "1.2.4"},
-	)
-	if updateCalled {
-		t.Fatal("helper binary was replaced before the persisted service configuration was proven restartable")
-	}
-	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "working") {
-		t.Fatalf("Apply error = %v, want an actionable WorkingDir preflight failure", err)
 	}
 }
 
@@ -536,247 +391,6 @@ func TestTeamsRuntimeSafetyAutoUpdateRejectsMissingOrUnknownWindowsTaskLauncherC
 	}
 }
 
-func TestTeamsRuntimeSafetyAutoUpdatePreflightsPersistedServiceExecutableCI(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	isolateTeamsUserDirsForTest(t, tmp)
-	currentExe := filepath.Join(tmp, "bin", "codex-proxy")
-	writeVersionedHelperForServiceTest(t, currentExe, "1.2.3")
-	missingServiceExe := filepath.Join(tmp, "deleted-runtime", "codex-proxy")
-	systemdUnavailable := false
-	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
-		goos:                 "linux",
-		exe:                  currentExe,
-		argv0:                currentExe,
-		cwd:                  tmp,
-		unitDir:              filepath.Join(tmp, "systemd"),
-		runner:               &recordingTeamsServiceRunner{},
-		systemdUserAvailable: &systemdUnavailable,
-	})
-	if _, err := (teamsServiceLocalSupervisorBackend{}).Install(context.Background(), teamsServiceSpec{
-		Executable:  missingServiceExe,
-		WorkingDir:  tmp,
-		Environment: map[string]string{},
-	}); err != nil {
-		t.Fatalf("install invalid local-supervisor fixture: %v", err)
-	}
-
-	prevPerform := performUpdate
-	prevResolve := teamsAutoUpdateResolveInstallPath
-	prevExecutable := teamsAutoUpdateExecutable
-	t.Cleanup(func() {
-		performUpdate = prevPerform
-		teamsAutoUpdateResolveInstallPath = prevResolve
-		teamsAutoUpdateExecutable = prevExecutable
-	})
-	teamsAutoUpdateResolveInstallPath = func(string) (string, error) { return currentExe, nil }
-	teamsAutoUpdateExecutable = func() (string, error) { return currentExe, nil }
-	updateCalled := false
-	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
-		updateCalled = true
-		return update.ApplyResult{Version: "1.2.4", InstallPath: currentExe}, nil
-	}
-
-	_, err := (teamsReleaseAutoUpdater{repo: "owner/repo"}).Apply(
-		context.Background(),
-		teams.HelperAutoUpdateCandidate{TagName: "v1.2.4", Version: "1.2.4"},
-	)
-	if updateCalled {
-		t.Fatal("helper binary was replaced before the persisted service executable was proven restartable")
-	}
-	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "executable") {
-		t.Fatalf("Apply error = %v, want an actionable executable preflight failure", err)
-	}
-}
-
-func TestTeamsRuntimeSafetyAutoUpdatePreflightsUnixExecutableModeWithoutExtraProbeCI(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Unix executable mode contract")
-	}
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	isolateTeamsUserDirsForTest(t, tmp)
-	currentExe := filepath.Join(tmp, "bin", "codex-proxy")
-	writeVersionedHelperForServiceTest(t, currentExe, "1.2.3")
-	serviceExe := filepath.Join(tmp, "service-bin", "codex-proxy")
-	writeVersionedHelperForServiceTest(t, serviceExe, "1.2.3")
-	if err := os.Chmod(serviceExe, 0o600); err != nil {
-		t.Fatalf("remove service executable bits: %v", err)
-	}
-	systemdUnavailable := false
-	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
-		goos:                 "linux",
-		exe:                  currentExe,
-		argv0:                currentExe,
-		cwd:                  tmp,
-		unitDir:              filepath.Join(tmp, "systemd"),
-		runner:               &recordingTeamsServiceRunner{},
-		systemdUserAvailable: &systemdUnavailable,
-	})
-	if _, err := (teamsServiceLocalSupervisorBackend{}).Install(context.Background(), teamsServiceSpec{
-		Executable:  serviceExe,
-		WorkingDir:  tmp,
-		Environment: map[string]string{},
-	}); err != nil {
-		t.Fatalf("install non-executable local-supervisor fixture: %v", err)
-	}
-
-	prevPerform := performUpdate
-	prevResolve := teamsAutoUpdateResolveInstallPath
-	prevExecutable := teamsAutoUpdateExecutable
-	t.Cleanup(func() {
-		performUpdate = prevPerform
-		teamsAutoUpdateResolveInstallPath = prevResolve
-		teamsAutoUpdateExecutable = prevExecutable
-	})
-	teamsAutoUpdateResolveInstallPath = func(string) (string, error) { return currentExe, nil }
-	teamsAutoUpdateExecutable = func() (string, error) { return currentExe, nil }
-	updateCalled := false
-	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
-		updateCalled = true
-		return update.ApplyResult{Version: "1.2.4", InstallPath: currentExe}, nil
-	}
-
-	_, err := (teamsReleaseAutoUpdater{repo: "owner/repo"}).Apply(
-		context.Background(),
-		teams.HelperAutoUpdateCandidate{TagName: "v1.2.4", Version: "1.2.4"},
-	)
-	if updateCalled {
-		t.Fatal("helper binary was replaced before executable mode validation")
-	}
-	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "not executable") {
-		t.Fatalf("Apply error = %v, want executable-mode preflight failure", err)
-	}
-}
-
-func TestTeamsRuntimeSafetyForegroundDualStoreFailsClosedWithoutMutationCI(t *testing.T) {
-	tmp := t.TempDir()
-	isolateTeamsUserDirsForTest(t, tmp)
-	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "")
-	scope, canonicalPath, legacyPath := seedCLIRuntimeSafetyDualStore(t, "foreground")
-
-	before := snapshotCLITreeForReadOnlyTest(t, tmp)
-	migrated, err := prepareManagedTeamsRuntimeStore(context.Background(), scope, true, false)
-	if err == nil || !strings.Contains(err.Error(), "managed Teams service") {
-		t.Fatalf("foreground dual-store error = %v, want managed-service guidance", err)
-	}
-	if migrated {
-		t.Fatal("foreground dual-store path reported a completed migration")
-	}
-	after := snapshotCLITreeForReadOnlyTest(t, tmp)
-	if !reflect.DeepEqual(before, after) {
-		t.Fatalf("foreground dual-store check modified files: before=%v after=%v", before, after)
-	}
-	for _, path := range []string{canonicalPath, legacyPath} {
-		if _, err := os.Stat(path); err != nil {
-			t.Fatalf("foreground dual-store check removed %s: %v", path, err)
-		}
-	}
-}
-
-func TestTeamsRuntimeSafetyManagedChildCompletesOfflineDualStoreTakeoverCI(t *testing.T) {
-	lockCLITestHooks(t)
-	previousGOOS := teamsServiceGOOS
-	t.Cleanup(func() { teamsServiceGOOS = previousGOOS })
-	for _, goos := range []string{"linux", "darwin", "windows"} {
-		for _, managedServiceChild := range []bool{true, false} {
-			spec := "new-spec"
-			if !managedServiceChild {
-				spec = "persisted-old-spec"
-			}
-			t.Run(goos+"/"+spec, func(t *testing.T) {
-				teamsServiceGOOS = func() string { return goos }
-				tmp := t.TempDir()
-				isolateTeamsUserDirsForTest(t, tmp)
-				t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "1")
-				t.Setenv("CODEX_HELPER_TEAMS_SERVICE_MODE", "background")
-				t.Setenv(envTeamsCodexChild, "")
-				suffix := "managed-" + goos + "-" + spec
-				scope, canonicalPath, legacyPath := seedCLIRuntimeSafetyDualStore(t, suffix)
-
-				migrated, err := prepareManagedTeamsRuntimeStore(context.Background(), scope, false, managedServiceChild)
-				if err != nil {
-					t.Fatalf("managed offline takeover: %v", err)
-				}
-				if !migrated {
-					t.Fatal("managed dual-store path did not report completed migration")
-				}
-				if _, err := os.Stat(canonicalPath); err != nil {
-					t.Fatalf("managed offline takeover removed canonical store: %v", err)
-				}
-				if _, err := os.Stat(legacyPath); !os.IsNotExist(err) {
-					t.Fatalf("managed offline takeover left legacy store in candidate path: %v", err)
-				}
-				backupPath, err := appdirs.LegacyConfigPath(
-					"teams",
-					"migration-backups",
-					scope.ID,
-					"state.json",
-				)
-				if err != nil {
-					t.Fatalf("managed offline takeover backup path: %v", err)
-				}
-				if _, err := os.Stat(backupPath); err != nil {
-					t.Fatalf("managed offline takeover backup missing at %s: %v", backupPath, err)
-				}
-				state, err := teamsstore.LoadPathReadOnly(context.Background(), canonicalPath)
-				if err != nil {
-					t.Fatalf("load canonical store after managed takeover: %v", err)
-				}
-				if state.ControlChat.TeamsChatID != "canonical-"+suffix {
-					t.Fatalf("managed takeover changed canonical business data: %#v", state.ControlChat)
-				}
-			})
-		}
-	}
-}
-
-func seedCLIRuntimeSafetyDualStore(t *testing.T, suffix string) (teamsstore.ScopeIdentity, string, string) {
-	t.Helper()
-	scope := teamsstore.ScopeIdentity{
-		ID:            "scope-cli-offline-" + suffix,
-		AccountID:     "account-" + suffix,
-		UserPrincipal: suffix + "@example.test",
-		Profile:       "default",
-	}
-	canonicalPath, err := teams.DefaultStorePathForScope(scope.ID)
-	if err != nil {
-		t.Fatalf("canonical store path: %v", err)
-	}
-	legacyPath, err := appdirs.LegacyConfigPath(
-		"teams",
-		"scopes",
-		scope.ID,
-		"state.json",
-	)
-	if err != nil {
-		t.Fatalf("legacy store path: %v", err)
-	}
-	for path, chatID := range map[string]string{
-		canonicalPath: "canonical-" + suffix,
-		legacyPath:    "legacy-" + suffix,
-	} {
-		store, err := teamsstore.Open(path)
-		if err != nil {
-			t.Fatalf("open store %s: %v", path, err)
-		}
-		if err := store.Update(context.Background(), func(state *teamsstore.State) error {
-			state.Scope = scope
-			state.ControlChat.TeamsChatID = chatID
-			return nil
-		}); err != nil {
-			_ = store.Close()
-			t.Fatalf("seed store %s: %v", path, err)
-		}
-		if err := store.Close(); err != nil {
-			t.Fatalf("close store %s: %v", path, err)
-		}
-	}
-	return scope, canonicalPath, legacyPath
-}
-
 func TestTeamsRuntimeSafetyDoesNotRestoreStaleLoopbackProxyFromServiceConfigCI(t *testing.T) {
 	lockCLITestHooks(t)
 
@@ -1103,7 +717,7 @@ func TestTeamsRuntimeSafetyLocalStartReportsSupervisorOnlyUntilListenerIsReadyCI
 		t.Fatalf("install local supervisor fixture: %v", err)
 	}
 
-	cmd := newTeamsServiceCmd(&rootOptions{}, stringPtr(""))
+	cmd := newTeamsServiceCmd(&rootOptions{})
 	cmd.SetArgs([]string{"start"})
 	var out bytes.Buffer
 	cmd.SetOut(&out)
@@ -1182,193 +796,6 @@ func TestTeamsRuntimeSafetySupervisorLogsCarryTimestampPIDAndComponentCI(t *test
 		!strings.Contains(line, "generation=") ||
 		!strings.Contains(line, "scope=") {
 		t.Fatalf("log line lacks required timestamp/PID/component/generation/scope metadata: %q", line)
-	}
-}
-
-func TestTeamsRuntimeSafetyRecoverableErrorIncludesOperationContextCI(t *testing.T) {
-	lockCLITestHooks(t)
-
-	prevDelay := teamsRunServiceRetryDelay
-	prevSleep := teamsRunServiceSleep
-	t.Cleanup(func() {
-		teamsRunServiceRetryDelay = prevDelay
-		teamsRunServiceSleep = prevSleep
-	})
-	teamsRunServiceRetryDelay = time.Millisecond
-	teamsRunServiceSleep = func(context.Context, time.Duration) error { return nil }
-	attempts := 0
-	var out bytes.Buffer
-	if err := runTeamsServiceRetryLoop(context.Background(), &out, func() error {
-		attempts++
-		if attempts == 1 {
-			return context.DeadlineExceeded
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("retry loop: %v", err)
-	}
-	lower := strings.ToLower(out.String())
-	for _, want := range []string{"operation=", "scope=", "attempt=", "deadline="} {
-		if !strings.Contains(lower, want) {
-			t.Fatalf("recoverable error omitted %q context:\n%s", want, out.String())
-		}
-	}
-}
-
-func TestTeamsRuntimeSafetyDeferredMigrationUsesBoundedExponentialRetryCI(t *testing.T) {
-	lockCLITestHooks(t)
-	previousBase := teamsRunServiceRetryDelay
-	previousMax := teamsRunServiceMaxRetryDelay
-	t.Cleanup(func() {
-		teamsRunServiceRetryDelay = previousBase
-		teamsRunServiceMaxRetryDelay = previousMax
-	})
-	teamsRunServiceRetryDelay = time.Second
-	teamsRunServiceMaxRetryDelay = 5 * time.Second
-	err := &teams.RuntimeStoreTakeoverDeferredError{Reason: "writer lock is still held"}
-	for attempt, want := range map[int]time.Duration{
-		1: time.Second,
-		2: 2 * time.Second,
-		3: 4 * time.Second,
-		4: 5 * time.Second,
-		8: 5 * time.Second,
-	} {
-		if got := teamsRunRetryDelay(err, attempt); got != want {
-			t.Fatalf("attempt %d delay = %s, want %s", attempt, got, want)
-		}
-	}
-	if got := teamsRunRetryDelay(&teams.GraphStatusError{StatusCode: 502}, 8); got != time.Second {
-		t.Fatalf("ordinary Graph retry delay = %s, want fixed base delay", got)
-	}
-}
-
-func TestTeamsRuntimeSafetyActiveMigrationLeaseIsSingleWriteAndClearsOnSuccessCI(t *testing.T) {
-	lockCLITestHooks(t)
-	tmp := t.TempDir()
-	isolateTeamsUserDirsForTest(t, tmp)
-
-	previousComplete := teamsCompleteOfflineStorePlan
-	previousNow := teamsServiceMigrationNow
-	previousStart := teamsLocalSupervisorProcessStartTime
-	previousAlive := teamsLocalSupervisorProcessAlive
-	t.Cleanup(func() {
-		teamsCompleteOfflineStorePlan = previousComplete
-		teamsServiceMigrationNow = previousNow
-		teamsLocalSupervisorProcessStartTime = previousStart
-		teamsLocalSupervisorProcessAlive = previousAlive
-		_ = clearTeamsServiceMigrationBlockedState()
-	})
-
-	now := time.Date(2026, 8, 1, 9, 0, 0, 0, time.UTC)
-	teamsServiceMigrationNow = func() time.Time { return now }
-	teamsLocalSupervisorProcessStartTime = func(pid int) (string, error) {
-		if pid != os.Getpid() {
-			return "", fmt.Errorf("unexpected pid %d", pid)
-		}
-		return "self-start", nil
-	}
-	teamsLocalSupervisorProcessAlive = func(pid int) bool { return pid == os.Getpid() }
-
-	var attempts int
-	teamsCompleteOfflineStorePlan = func(context.Context, teams.RuntimeStorePlan) error {
-		attempts++
-		state, exists, err := readTeamsServiceMigrationState()
-		if err != nil || !exists || state.Phase != teamsServiceMigrationPhaseActive {
-			t.Fatalf("migration attempt %d state=(%+v,%t,%v), want active lease", attempts, state, exists, err)
-		}
-		if attempts < 3 {
-			return &teams.RuntimeStoreTakeoverDeferredError{Reason: "writer lock is still held"}
-		}
-		return nil
-	}
-
-	plan := teams.RuntimeStorePlan{Action: teams.RuntimeStoreActionMigrateLegacy}
-	if err := completeManagedTeamsRuntimeStorePlan(context.Background(), plan); err == nil {
-		t.Fatal("first migration attempt succeeded, want deferred")
-	}
-	first, exists, err := readTeamsServiceMigrationState()
-	if err != nil || !exists {
-		t.Fatalf("read first active lease: state=%+v exists=%t err=%v", first, exists, err)
-	}
-
-	now = now.Add(time.Minute)
-	if err := completeManagedTeamsRuntimeStorePlan(context.Background(), plan); err == nil {
-		t.Fatal("second migration attempt succeeded, want deferred")
-	}
-	second, exists, err := readTeamsServiceMigrationState()
-	if err != nil || !exists {
-		t.Fatalf("read second active lease: state=%+v exists=%t err=%v", second, exists, err)
-	}
-	if !second.StartedAt.Equal(first.StartedAt) || !second.UpdatedAt.Equal(first.UpdatedAt) {
-		t.Fatalf("deferred retry rewrote active lease: first=%+v second=%+v", first, second)
-	}
-
-	now = now.Add(time.Minute)
-	if err := completeManagedTeamsRuntimeStorePlan(context.Background(), plan); err != nil {
-		t.Fatalf("successful migration attempt: %v", err)
-	}
-	if _, exists, err := readTeamsServiceMigrationState(); err != nil || exists {
-		t.Fatalf("active lease remained after success: exists=%t err=%v", exists, err)
-	}
-}
-
-func TestTeamsRuntimeSafetyDoctorDeepReadsBrokenLegacyAndReportsPerStoreErrorReadOnlyCI(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	configBase, _ := isolateTeamsUserDirsForTest(t, tmp)
-	exe := filepath.Join(tmp, "codex-proxy")
-	if runtime.GOOS == "windows" {
-		exe += ".exe"
-	}
-	writeVersionedHelperForServiceTest(t, exe, "1.2.3")
-	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
-		goos:    runtime.GOOS,
-		exe:     exe,
-		argv0:   exe,
-		cwd:     tmp,
-		unitDir: filepath.Join(tmp, "systemd"),
-		runner:  &recordingTeamsServiceRunner{output: []byte("inactive\n")},
-	})
-
-	scopeID := "scope-runtime-safety-doctor"
-	canonicalPath := cliStatePathForTest(t, "teams", "scopes", scopeID, "state.json")
-	canonical, err := teamsstore.Open(canonicalPath)
-	if err != nil {
-		t.Fatalf("open canonical store: %v", err)
-	}
-	if err := canonical.Update(context.Background(), func(state *teamsstore.State) error {
-		state.Scope = teamsstore.ScopeIdentity{ID: scopeID, Profile: "default"}
-		return nil
-	}); err != nil {
-		_ = canonical.Close()
-		t.Fatalf("seed canonical store: %v", err)
-	}
-	if err := canonical.Close(); err != nil {
-		t.Fatalf("close canonical store: %v", err)
-	}
-	legacyPath := filepath.Join(configBase, "codex-helper", "teams", "scopes", scopeID, "state.json")
-	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o700); err != nil {
-		t.Fatalf("mkdir legacy scope: %v", err)
-	}
-	if err := os.WriteFile(legacyPath, []byte(`{"schema_version":`), 0o640); err != nil {
-		t.Fatalf("write broken legacy store: %v", err)
-	}
-	if runtime.GOOS != "windows" {
-		makeCLITreesReadOnlyForTest(t, filepath.Dir(canonicalPath), filepath.Dir(legacyPath))
-	}
-
-	before := snapshotCLITreeForReadOnlyTest(t, tmp)
-	out, doctorErr := executeRootForTeamsTestAllowError(t, "teams", "service", "doctor")
-	diagnostic := strings.ToLower(out + "\n" + fmt.Sprint(doctorErr))
-	for _, want := range []string{canonicalPath, legacyPath, "legacy", "load error"} {
-		if !strings.Contains(diagnostic, strings.ToLower(want)) {
-			t.Errorf("teams service doctor omitted %q:\n%s", want, diagnostic)
-		}
-	}
-	after := snapshotCLITreeForReadOnlyTest(t, tmp)
-	if !reflect.DeepEqual(before, after) {
-		t.Errorf("doctor modified a canonical/broken-legacy store family:\nbefore=%#v\nafter=%#v", before, after)
 	}
 }
 
@@ -1454,5 +881,258 @@ func TestTeamsRuntimeSafetyLocalStatusNamesAutostartGuaranteesPreciselyCI(t *tes
 		if !strings.Contains(string(out), want) {
 			t.Fatalf("local status omitted %q:\n%s", want, out)
 		}
+	}
+}
+
+func TestTeamsRuntimeSafetyAutoUpdatePreflightsUnixExecutableModeWithoutExtraProbeCI(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Unix executable mode contract")
+	}
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	currentExe := filepath.Join(tmp, "bin", "codex-proxy")
+	writeVersionedHelperForServiceTest(t, currentExe, "1.2.3")
+	serviceExe := filepath.Join(tmp, "service-bin", "codex-proxy")
+	writeVersionedHelperForServiceTest(t, serviceExe, "1.2.3")
+	if err := os.Chmod(serviceExe, 0o600); err != nil {
+		t.Fatalf("remove service executable bits: %v", err)
+	}
+	systemdUnavailable := false
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		exe:                  currentExe,
+		argv0:                currentExe,
+		cwd:                  tmp,
+		unitDir:              filepath.Join(tmp, "systemd"),
+		runner:               &recordingTeamsServiceRunner{},
+		systemdUserAvailable: &systemdUnavailable,
+	})
+	if _, err := (teamsServiceLocalSupervisorBackend{}).Install(context.Background(), teamsServiceSpec{
+		Executable:  serviceExe,
+		WorkingDir:  tmp,
+		Environment: map[string]string{},
+	}); err != nil {
+		t.Fatalf("install non-executable local-supervisor fixture: %v", err)
+	}
+
+	prevPerform := performUpdate
+	prevResolve := teamsAutoUpdateResolveInstallPath
+	prevExecutable := teamsAutoUpdateExecutable
+	t.Cleanup(func() {
+		performUpdate = prevPerform
+		teamsAutoUpdateResolveInstallPath = prevResolve
+		teamsAutoUpdateExecutable = prevExecutable
+	})
+	teamsAutoUpdateResolveInstallPath = func(string) (string, error) { return currentExe, nil }
+	teamsAutoUpdateExecutable = func() (string, error) { return currentExe, nil }
+	updateCalled := false
+	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
+		updateCalled = true
+		return update.ApplyResult{Version: "1.2.4", InstallPath: currentExe}, nil
+	}
+
+	_, err := (teamsReleaseAutoUpdater{repo: "owner/repo"}).Apply(
+		context.Background(),
+		selfupdate.Candidate{TagName: "v1.2.4", Version: "1.2.4"},
+	)
+	if updateCalled {
+		t.Fatal("helper binary was replaced before executable mode validation")
+	}
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "not executable") {
+		t.Fatalf("Apply error = %v, want executable-mode preflight failure", err)
+	}
+}
+
+func TestTeamsRuntimeSafetyAutoUpdatePreflightsPersistedServiceExecutableCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	currentExe := filepath.Join(tmp, "bin", "codex-proxy")
+	writeVersionedHelperForServiceTest(t, currentExe, "1.2.3")
+	missingServiceExe := filepath.Join(tmp, "deleted-runtime", "codex-proxy")
+	systemdUnavailable := false
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		exe:                  currentExe,
+		argv0:                currentExe,
+		cwd:                  tmp,
+		unitDir:              filepath.Join(tmp, "systemd"),
+		runner:               &recordingTeamsServiceRunner{},
+		systemdUserAvailable: &systemdUnavailable,
+	})
+	if _, err := (teamsServiceLocalSupervisorBackend{}).Install(context.Background(), teamsServiceSpec{
+		Executable:  missingServiceExe,
+		WorkingDir:  tmp,
+		Environment: map[string]string{},
+	}); err != nil {
+		t.Fatalf("install invalid local-supervisor fixture: %v", err)
+	}
+
+	prevPerform := performUpdate
+	prevResolve := teamsAutoUpdateResolveInstallPath
+	prevExecutable := teamsAutoUpdateExecutable
+	t.Cleanup(func() {
+		performUpdate = prevPerform
+		teamsAutoUpdateResolveInstallPath = prevResolve
+		teamsAutoUpdateExecutable = prevExecutable
+	})
+	teamsAutoUpdateResolveInstallPath = func(string) (string, error) { return currentExe, nil }
+	teamsAutoUpdateExecutable = func() (string, error) { return currentExe, nil }
+	updateCalled := false
+	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
+		updateCalled = true
+		return update.ApplyResult{Version: "1.2.4", InstallPath: currentExe}, nil
+	}
+
+	_, err := (teamsReleaseAutoUpdater{repo: "owner/repo"}).Apply(
+		context.Background(),
+		selfupdate.Candidate{TagName: "v1.2.4", Version: "1.2.4"},
+	)
+	if updateCalled {
+		t.Fatal("helper binary was replaced before the persisted service executable was proven restartable")
+	}
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "executable") {
+		t.Fatalf("Apply error = %v, want an actionable executable preflight failure", err)
+	}
+}
+
+func TestTeamsRuntimeSafetyAutoUpdatePreflightsPersistedServiceWorkingDirCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	exe := filepath.Join(tmp, "bin", "codex-proxy")
+	writeVersionedHelperForServiceTest(t, exe, "1.2.3")
+	missingWorkingDir := filepath.Join(tmp, "deleted-bootstrap-directory")
+	systemdUnavailable := false
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:                 "linux",
+		exe:                  exe,
+		argv0:                exe,
+		cwd:                  tmp,
+		unitDir:              filepath.Join(tmp, "systemd"),
+		runner:               &recordingTeamsServiceRunner{},
+		systemdUserAvailable: &systemdUnavailable,
+	})
+	if _, err := (teamsServiceLocalSupervisorBackend{}).Install(context.Background(), teamsServiceSpec{
+		Executable:  exe,
+		WorkingDir:  missingWorkingDir,
+		Environment: map[string]string{},
+	}); err != nil {
+		t.Fatalf("install invalid local-supervisor fixture: %v", err)
+	}
+
+	prevPerform := performUpdate
+	prevResolve := teamsAutoUpdateResolveInstallPath
+	prevExecutable := teamsAutoUpdateExecutable
+	t.Cleanup(func() {
+		performUpdate = prevPerform
+		teamsAutoUpdateResolveInstallPath = prevResolve
+		teamsAutoUpdateExecutable = prevExecutable
+	})
+	teamsAutoUpdateResolveInstallPath = func(string) (string, error) { return exe, nil }
+	teamsAutoUpdateExecutable = func() (string, error) { return exe, nil }
+	updateCalled := false
+	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
+		updateCalled = true
+		return update.ApplyResult{Version: "1.2.4", InstallPath: exe}, nil
+	}
+
+	_, err := (teamsReleaseAutoUpdater{repo: "owner/repo"}).Apply(
+		context.Background(),
+		selfupdate.Candidate{TagName: "v1.2.4", Version: "1.2.4"},
+	)
+	if updateCalled {
+		t.Fatal("helper binary was replaced before the persisted service configuration was proven restartable")
+	}
+	if err == nil || !strings.Contains(strings.ToLower(err.Error()), "working") {
+		t.Fatalf("Apply error = %v, want an actionable WorkingDir preflight failure", err)
+	}
+}
+
+func TestTeamsRuntimeSafetyServiceSpecNormalizesAllPersistedPathOverridesCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	invocationDir := filepath.Join(tmp, "invocation")
+	if err := os.MkdirAll(invocationDir, 0o700); err != nil {
+		t.Fatalf("mkdir invocation dir: %v", err)
+	}
+	exe := filepath.Join(tmp, "bin", "codex-proxy")
+	writeVersionedHelperForServiceTest(t, exe, "1.2.3")
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     exe,
+		argv0:   exe,
+		cwd:     invocationDir,
+		unitDir: filepath.Join(tmp, "systemd"),
+		runner:  &recordingTeamsServiceRunner{},
+	})
+
+	spec, err := buildTeamsServiceSpec(
+		teamsServiceSpecEnvironmentOverrides(map[string]string{
+			"CODEX_HELPER_TEAMS_AUTH_CONFIG":      "auth/config.json",
+			"CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE": "tokens/chat.json",
+			envTeamsASRLlamaModel:                 "models/qwen.gguf",
+			envTeamsASRCommand:                    "bin/asr",
+			envTeamsASRFFmpeg:                     "ffmpeg",
+		}),
+	)
+	if err != nil {
+		t.Fatalf("buildTeamsServiceSpec: %v", err)
+	}
+	for name, relative := range map[string]string{
+		"CODEX_HELPER_TEAMS_AUTH_CONFIG":      "auth/config.json",
+		"CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE": "tokens/chat.json",
+		envTeamsASRLlamaModel:                 "models/qwen.gguf",
+		envTeamsASRCommand:                    "bin/asr",
+	} {
+		want := filepath.Join(invocationDir, filepath.FromSlash(relative))
+		if got := spec.Environment[name]; got != want || !filepath.IsAbs(got) {
+			t.Fatalf("%s = %q, want invocation-time absolute path %q", name, got, want)
+		}
+	}
+	if got := spec.Environment[envTeamsASRFFmpeg]; got != "ffmpeg" {
+		t.Fatalf("bare ffmpeg command was incorrectly treated as a path: %q", got)
+	}
+}
+
+func TestTeamsRuntimeSafetyServiceSpecDoesNotPersistInvocationWorkingDirCI(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	invocationDir := filepath.Join(tmp, "disposable-checkout")
+	if err := os.MkdirAll(invocationDir, 0o755); err != nil {
+		t.Fatalf("mkdir invocation dir: %v", err)
+	}
+	exe := filepath.Join(tmp, "bin", "codex-proxy")
+	writeVersionedHelperForServiceTest(t, exe, "1.2.3")
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     exe,
+		argv0:   exe,
+		cwd:     invocationDir,
+		unitDir: filepath.Join(tmp, "systemd"),
+		runner:  &recordingTeamsServiceRunner{},
+	})
+
+	spec, err := buildTeamsServiceSpec()
+	if err != nil {
+		t.Fatalf("buildTeamsServiceSpec: %v", err)
+	}
+	if teamsServiceLocalSupervisorSamePath(spec.WorkingDir, invocationDir) {
+		t.Fatalf("service WorkingDir %q is permanently bound to the invocation cwd; use a stable user-owned directory", spec.WorkingDir)
+	}
+	stableHome := strings.TrimSpace(os.Getenv("HOME"))
+	if !teamsServiceLocalSupervisorSamePath(spec.WorkingDir, stableHome) {
+		t.Fatalf("service WorkingDir = %q, want isolated stable user home %q", spec.WorkingDir, stableHome)
+	}
+	if info, err := os.Stat(spec.WorkingDir); err != nil || !info.IsDir() {
+		t.Fatalf("service WorkingDir must be an existing directory: path=%q info=%v err=%v", spec.WorkingDir, info, err)
 	}
 }

@@ -168,23 +168,6 @@ func TestExitCodeForRestart(t *testing.T) {
 	}
 }
 
-func TestServiceUnitRestartsOnExit75(t *testing.T) {
-	spec := teamsServiceSpec{Executable: "/usr/bin/cxp", WorkingDir: "/w", RegistryPath: "/r.json",
-		Environment: map[string]string{"CODEX_HELPER_TEAMS_SERVICE": "1"}}
-	unit := buildTeamsServiceUnit(spec)
-	for _, want := range []string{"Restart=always\n", "RestartForceExitStatus=75\n", "RestartSec=10s\n"} {
-		if !strings.Contains(unit, want) {
-			t.Fatalf("unit lacks %q:\n%s", want, unit)
-		}
-	}
-	if strings.Contains(unit, "Restart=on-failure") || strings.Contains(unit, "CODEX_HELPER_TEAMS_CORE=") {
-		t.Fatalf("unit keeps an old setting:\n%s", unit)
-	}
-	if !teamsServiceEnvironmentNameAllowed(envTeamsCoreStore) {
-		t.Fatal("the store override is not carried into the service environment")
-	}
-}
-
 func TestLocalSupervisorRestartsPromptlyAfterExit75(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("uses sh")
@@ -223,5 +206,22 @@ func TestEverySupervisorRestartsAfterExit75(t *testing.T) {
 		teamsServiceWatchdogState{LastActionAt: time.Now()}, teamsServiceWatchdogOptions{})
 	if d.Action != teamsServiceWatchdogActionStart {
 		t.Fatalf("watchdog does not start a stopped service: %+v", d)
+	}
+}
+
+func TestServiceUnitRestartsOnExit75(t *testing.T) {
+	spec := teamsServiceSpec{Executable: "/usr/bin/cxp", WorkingDir: "/w",
+		Environment: map[string]string{"CODEX_HELPER_TEAMS_SERVICE": "1"}}
+	unit := buildTeamsServiceUnit(spec)
+	for _, want := range []string{"Restart=always\n", "RestartForceExitStatus=75\n", "RestartSec=10s\n"} {
+		if !strings.Contains(unit, want) {
+			t.Fatalf("unit lacks %q:\n%s", want, unit)
+		}
+	}
+	if strings.Contains(unit, "Restart=on-failure") || strings.Contains(unit, "CODEX_HELPER_TEAMS_CORE=") {
+		t.Fatalf("unit keeps an old setting:\n%s", unit)
+	}
+	if !teamsServiceEnvironmentNameAllowed(envTeamsCoreStore) {
+		t.Fatal("the store override is not carried into the service environment")
 	}
 }

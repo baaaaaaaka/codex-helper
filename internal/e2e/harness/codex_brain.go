@@ -9,7 +9,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"syscall"
 
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakecodex"
 )
@@ -45,7 +44,7 @@ func (f *FakeCodex) KillAppServers() {
 	for _, c := range f.Calls() {
 		if c.Pid > 0 && c.Pid != os.Getpid() && !seen[c.Pid] {
 			seen[c.Pid] = true
-			_ = syscall.Kill(c.Pid, syscall.SIGKILL)
+			killPID(c.Pid)
 		}
 	}
 }
@@ -75,8 +74,7 @@ func processAlive(pid int) bool {
 		}
 		return true
 	}
-	err := syscall.Kill(pid, 0)
-	return err == nil || errors.Is(err, syscall.EPERM)
+	return pidAlive(pid)
 }
 
 // Handler serves the brain protocol (see package fakecodex):

@@ -214,7 +214,7 @@ func runCodexCLIInvocation(
 		if invocation.Command == "resume" {
 			threadID = explicitCodexResumeThreadID(invocation.Args)
 		}
-		return runCodexTUIInvocationViaBrokerWithPreflight(ctx, root, store, profile, instances, cwd, cmdArgs[0], "", useProxy, opts.AgentAutoApprove, opts.ModelProfileRef, invocation.GlobalArgs, tail, appServerArgs, threadID, opts.Log)
+		return runCodexTUIInvocationViaBrokerWithPreflight(ctx, root, store, profile, instances, cwd, cmdArgs[0], "", useProxy, opts.AgentAutoApprove, invocation.GlobalArgs, tail, appServerArgs, threadID, opts.Log)
 	case "exec", "e":
 		execArgs := codexFacadeArgsWithGlobalInputs(invocation, invocation.Args)
 		return runCodexExecFacade(ctx, root, store, profile, instances, cmdArgs[0], cwd, useProxy, opts, appServerArgs, execArgs)
@@ -297,13 +297,6 @@ func runCodexNativeInvocation(ctx context.Context, store *config.Store, profile 
 		if err != nil {
 			return err
 		}
-	}
-	cmdArgs, cleanup, err := prepareCodexModelProfileForRun(ctx, store, cmdArgs, &opts, proxyURL)
-	if err != nil {
-		return err
-	}
-	if cleanup != nil {
-		defer cleanup()
 	}
 	opts.UseProxy = useProxy
 	return runTargetWithFallbackWithOptions(ctx, cmdArgs, proxyURL, nil, nil, opts)
@@ -571,24 +564,6 @@ func runCodexExecFacade(
 		}
 		extraEnv = env.WithProxy(extraEnv, proxyURL)
 	}
-	officialAuth := false
-	if shouldProbeCodexLogin(store) {
-		officialAuth = codexLoginStatusProbeFn(ctx, codexPath, extraEnv, runOptions.Log)
-	}
-	modelLaunch, cleanup, err := startModelProfileAdapterForCodex(withCodexLoginProbePath(ctx, codexPath), store, runOptions.ModelProfileRef, runOptions.ModelProfileSnapshot, proxyURL, officialAuth, runOptions.Log)
-	if err != nil {
-		return err
-	}
-	if cleanup != nil {
-		defer cleanup()
-	}
-	if modelLaunch.Enabled {
-		args := appendCodexModelProfileArgs([]string{"codex"}, modelLaunch)
-		options.AppServerArgs = append(options.AppServerArgs, args[1:]...)
-		if !modelLaunch.Native {
-			extraEnv = append(extraEnv, modelLaunch.effectiveEnvKey()+"="+modelLaunch.ProxyKey)
-		}
-	}
 	configureIdentity := func(command *exec.Cmd) error {
 		updated, err := applyExecIdentity(command, command.Env, paths.ExecIdentity)
 		if err != nil {
@@ -798,4 +773,9 @@ func codexExecJSONEvent(event codexrunner.StreamEvent) []byte {
 	}
 	raw, _ := json.Marshal(value)
 	return raw
+}
+
+func tomlEscapeString(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	return strings.ReplaceAll(s, `"`, `\"`)
 }

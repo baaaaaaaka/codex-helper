@@ -103,6 +103,16 @@ func (s *ProcessSUT) Instance() string {
 // Output implements SUT.
 func (s *ProcessSUT) Output() string { return s.out.String() }
 
+// PID is the process id of the running helper (0 when none).
+func (s *ProcessSUT) PID() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cur == nil || s.cur.cmd == nil || s.cur.cmd.Process == nil {
+		return 0
+	}
+	return s.cur.cmd.Process.Pid
+}
+
 // ServiceRestarts is the number of service restarts the runner performed.
 func (s *ProcessSUT) ServiceRestarts() int {
 	s.mu.Lock()
@@ -237,7 +247,7 @@ func (s *ProcessSUT) start(wantIntent int) error {
 		cmd.Env = s.spec.Env(tag)
 	}
 	cmd.Dir = s.spec.Dir
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	setProcessGroup(cmd)
 	pr, pw := io.Pipe()
 	cmd.Stdout = pw
 	cmd.Stderr = pw

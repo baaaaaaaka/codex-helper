@@ -136,8 +136,6 @@ func NewEnv(t testing.TB, g *fakegraph.Server) *Env {
 	set("CODEX_HELPER_TEAMS_AUTH_PROFILE", "")
 	set("CODEX_HELPER_TEAMS_MACHINE_LABEL", MachineLabel)
 	set("CODEX_HELPER_TEAMS_MACHINE_ID", "")
-	set("CODEX_HELPER_TEAMS_MACHINE_KIND", "")
-	set("CODEX_HELPER_TEAMS_MACHINE_PRIORITY", "")
 	// Service mode: never fall back to interactive device login.
 	set("CODEX_HELPER_TEAMS_SERVICE", "1")
 	set("CODEX_HELPER_TEAMS_CHILD", "")

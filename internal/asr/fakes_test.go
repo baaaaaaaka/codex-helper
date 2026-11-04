@@ -23,6 +23,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 )
 
 // The test binary doubles as the fake native programs: copied (inside the
@@ -320,7 +322,7 @@ var (
 
 func self(t *testing.T) []byte {
 	selfOnce.Do(func() {
-		exe, err := os.Executable()
+		exe, err := helperpath.RawExecutable()
 		if err == nil {
 			selfBytes, err = os.ReadFile(exe)
 		}

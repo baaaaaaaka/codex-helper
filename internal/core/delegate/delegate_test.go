@@ -5,8 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/core/delegate/delegation"
 	"github.com/baaaaaaaka/codex-helper/internal/core/engine"
-	"github.com/baaaaaaaka/codex-helper/internal/teams/delegation"
 )
 
 func requestText(t *testing.T, machine string, now time.Time) (delegation.Record, string) {

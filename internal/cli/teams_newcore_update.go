@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/core/engine"
-	"github.com/baaaaaaaka/codex-helper/internal/teams"
+	"github.com/baaaaaaaka/codex-helper/internal/selfupdate"
 )
 
 // Updates of the new core (SPEC R-16): the engine decides when (drain,
@@ -28,7 +28,7 @@ func newTeamsNewCoreUpdater(repo string, prerelease bool, version string, log io
 }
 
 func (u *teamsNewCoreUpdater) Check(ctx context.Context, prerelease, manual bool) (engine.UpdateOffer, error) {
-	d, err := u.rel.Check(ctx, teams.HelperAutoUpdateCheck{InstalledVersion: u.version, Now: time.Now(),
+	d, err := u.rel.Check(ctx, selfupdate.Check{InstalledVersion: u.version, Now: time.Now(),
 		IncludePrerelease: prerelease, Manual: manual})
 	if err != nil || d.Candidate == nil {
 		return engine.UpdateOffer{}, err
@@ -45,7 +45,7 @@ func (u *teamsNewCoreUpdater) Check(ctx context.Context, prerelease, manual bool
 // move the update package schedules; the engine's restart (exit 75) then
 // starts the new binary, and the next process reports the version it runs.
 func (u *teamsNewCoreUpdater) Install(ctx context.Context, o engine.UpdateOffer) error {
-	res, err := u.rel.ApplyWithOptions(ctx, teams.HelperAutoUpdateCandidate{TagName: o.Tag}, teams.HelperAutoUpdateApplyOptions{})
+	res, err := u.rel.ApplyWithOptions(ctx, selfupdate.Candidate{TagName: o.Tag}, selfupdate.ApplyOptions{})
 	if err != nil {
 		return err
 	}
@@ -64,9 +64,6 @@ type teamsNewCoreCodexUpgrader struct {
 }
 
 func (c teamsNewCoreCodexUpgrader) Upgrade(ctx context.Context) error {
-	if _, err := runTeamsCodexUpgradeFromBridge(ctx, c.root, c.log, ""); err != nil {
-		return err
-	}
-	invalidateTeamsOfficialModelCache()
-	return nil
+	_, err := upgradeTeamsCodex(ctx, c.root, c.log)
+	return err
 }

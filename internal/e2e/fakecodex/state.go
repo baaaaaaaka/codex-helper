@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"sort"
 	"sync/atomic"
-	"syscall"
 	"time"
 )
 
@@ -131,8 +130,7 @@ func processAlive(pid int) bool {
 	if pid == os.Getpid() {
 		return true
 	}
-	err := syscall.Kill(pid, 0)
-	return err == nil || errors.Is(err, syscall.EPERM)
+	return pidAlive(pid)
 }
 
 // Active reports whether some turn of t is still running in a live process.

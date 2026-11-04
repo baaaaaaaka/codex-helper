@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -16,10 +17,10 @@ import (
 
 	"github.com/gofrs/flock"
 
+	corestore "github.com/baaaaaaaka/codex-helper/internal/core/store"
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 	"github.com/baaaaaaaka/codex-helper/internal/managedinstall"
-	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
 )
 
@@ -64,68 +65,6 @@ func TestUpgradeCmdAlreadyUpToDateSkipsDownload(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "Already up to date.") {
 		t.Fatalf("unexpected output: %q", out.String())
-	}
-}
-
-func TestUpgradeCmdAlreadyUpToDateRescuesStaleTeamsState(t *testing.T) {
-	lockCLITestHooks(t)
-	isolateUpgradeTeamsServiceForTest(t)
-
-	prevCheck := checkForUpdate
-	prevPerform := performUpdate
-	t.Cleanup(func() {
-		checkForUpdate = prevCheck
-		performUpdate = prevPerform
-	})
-
-	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
-		return update.Status{Supported: true, UpdateAvailable: false}
-	}
-	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
-		t.Fatal("PerformUpdate should not run when latest is already installed")
-		return update.ApplyResult{}, nil
-	}
-
-	st, err := openTeamsStore()
-	if err != nil {
-		t.Fatalf("openTeamsStore: %v", err)
-	}
-	ctx := context.Background()
-	staleHeartbeat := time.Now().Add(-3 * time.Minute)
-	owner := teamsstore.OwnerMetadata{
-		PID:             4242,
-		Hostname:        "stale-host",
-		ExecutablePath:  "/usr/local/bin/codex-proxy",
-		HelperVersion:   "v-old",
-		StartedAt:       staleHeartbeat,
-		ActiveSessionID: "s1",
-		ActiveTurnID:    "turn:old",
-	}
-	if _, err := st.RecordOwnerHeartbeat(ctx, owner, time.Minute, staleHeartbeat); err != nil {
-		t.Fatalf("RecordOwnerHeartbeat stale owner: %v", err)
-	}
-
-	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs(upgradeArgsWithTeamsRestart())
-	var out bytes.Buffer
-	cmd.SetOut(&out)
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("execute already-up-to-date rescue: %v\n%s", err, out.String())
-	}
-	if !strings.Contains(out.String(), "Teams upgrade rescue") || !strings.Contains(out.String(), "cleared stale helpers=1") || !strings.Contains(out.String(), "Already up to date.") {
-		t.Fatalf("unexpected output: %q", out.String())
-	}
-	if _, ok, err := st.ReadOwner(ctx); err != nil {
-		t.Fatalf("ReadOwner: %v", err)
-	} else if ok {
-		t.Fatal("stale owner should be cleared by no-op upgrade rescue")
-	}
-	upgrade, ok, err := st.ReadUpgrade(ctx)
-	if err != nil {
-		t.Fatalf("ReadUpgrade: %v", err)
-	}
-	if !ok || upgrade.Phase != teamsstore.UpgradePhaseCompleted {
-		t.Fatalf("upgrade state = %#v ok=%v, want completed", upgrade, ok)
 	}
 }
 
@@ -1525,247 +1464,6 @@ func TestHelperInstallLockPathsUseSymlinkAwareCacheKey(t *testing.T) {
 	}
 }
 
-func TestUpgradeCmdAllowsOrphanQueuedTurn(t *testing.T) {
-	lockCLITestHooks(t)
-	isolateUpgradeTeamsServiceForTest(t)
-
-	prevCheck := checkForUpdate
-	prevPerform := performUpdate
-	t.Cleanup(func() {
-		checkForUpdate = prevCheck
-		performUpdate = prevPerform
-	})
-	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
-		t.Fatal("CheckForUpdate should not run for explicit versions")
-		return update.Status{}
-	}
-	performCalls := 0
-	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
-		performCalls++
-		return update.ApplyResult{Version: "1.2.3"}, nil
-	}
-
-	st, err := openTeamsStore()
-	if err != nil {
-		t.Fatalf("openTeamsStore: %v", err)
-	}
-	ctx := context.Background()
-	if _, _, err := st.CreateSession(ctx, teamsstore.SessionContext{ID: "s1", Status: teamsstore.SessionStatusActive, TeamsChatID: "chat-1"}); err != nil {
-		t.Fatalf("CreateSession: %v", err)
-	}
-	if _, _, err := st.QueueTurn(ctx, teamsstore.Turn{ID: "turn:queued", SessionID: "s1", Status: teamsstore.TurnStatusQueued}); err != nil {
-		t.Fatalf("QueueTurn: %v", err)
-	}
-
-	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3"))
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("upgrade should preserve orphan queued turn without manual recover: %v", err)
-	}
-	if performCalls != 1 {
-		t.Fatalf("performUpdate calls = %d, want 1", performCalls)
-	}
-	state, err := st.Load(ctx)
-	if err != nil {
-		t.Fatalf("Load state after upgrade: %v", err)
-	}
-	if got := state.Turns["turn:queued"].Status; got != teamsstore.TurnStatusQueued {
-		t.Fatalf("queued turn status = %q, want queued for new helper to run", got)
-	}
-}
-
-func TestUpgradeCmdRescuesOrphanRunningTurnAndTransientOutbox(t *testing.T) {
-	lockCLITestHooks(t)
-	isolateUpgradeTeamsServiceForTest(t)
-
-	prevCheck := checkForUpdate
-	prevPerform := performUpdate
-	t.Cleanup(func() {
-		checkForUpdate = prevCheck
-		performUpdate = prevPerform
-	})
-	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
-		t.Fatal("CheckForUpdate should not run for explicit versions")
-		return update.Status{}
-	}
-	performCalls := 0
-	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
-		performCalls++
-		return update.ApplyResult{Version: "1.2.3"}, nil
-	}
-
-	st, err := openTeamsStore()
-	if err != nil {
-		t.Fatalf("openTeamsStore: %v", err)
-	}
-	ctx := context.Background()
-	if _, _, err := st.CreateSession(ctx, teamsstore.SessionContext{ID: "s1", Status: teamsstore.SessionStatusActive, TeamsChatID: "chat-1"}); err != nil {
-		t.Fatalf("CreateSession: %v", err)
-	}
-	if _, _, err := st.QueueTurn(ctx, teamsstore.Turn{ID: "turn:running", SessionID: "s1", Status: teamsstore.TurnStatusRunning}); err != nil {
-		t.Fatalf("QueueTurn: %v", err)
-	}
-	if _, _, err := st.QueueOutbox(ctx, teamsstore.OutboxMessage{
-		ID:          "outbox:status",
-		SessionID:   "s1",
-		TeamsChatID: "chat-1",
-		Kind:        "codex-status-001",
-		Status:      teamsstore.OutboxStatusQueued,
-	}); err != nil {
-		t.Fatalf("QueueOutbox: %v", err)
-	}
-
-	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3"))
-	var out bytes.Buffer
-	cmd.SetOut(&out)
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("upgrade should rescue orphan running turn: %v\n%s", err, out.String())
-	}
-	if performCalls != 1 {
-		t.Fatalf("performUpdate calls = %d, want 1", performCalls)
-	}
-	if !strings.Contains(out.String(), "Teams upgrade rescue") || !strings.Contains(out.String(), "interrupted abandoned requests=1") || !strings.Contains(out.String(), "skipped stale notices=1") {
-		t.Fatalf("upgrade output missing rescue summary:\n%s", out.String())
-	}
-	state, err := st.Load(ctx)
-	if err != nil {
-		t.Fatalf("Load state after rescue: %v", err)
-	}
-	if got := state.Turns["turn:running"].Status; got != teamsstore.TurnStatusInterrupted {
-		t.Fatalf("running turn status = %q, want interrupted", got)
-	}
-	if got := state.OutboxMessages["outbox:status"].Status; got != teamsstore.OutboxStatusSkipped {
-		t.Fatalf("transient outbox status = %q, want skipped", got)
-	}
-	upgrade, ok, err := st.ReadUpgrade(ctx)
-	if err != nil {
-		t.Fatalf("ReadUpgrade: %v", err)
-	}
-	if !ok || upgrade.Phase != teamsstore.UpgradePhaseCompleted {
-		t.Fatalf("upgrade state = %#v ok=%v, want completed", upgrade, ok)
-	}
-}
-
-func TestUpgradeCmdRescuesStaleOwnerBeforeUpdate(t *testing.T) {
-	lockCLITestHooks(t)
-	isolateUpgradeTeamsServiceForTest(t)
-
-	prevCheck := checkForUpdate
-	prevPerform := performUpdate
-	t.Cleanup(func() {
-		checkForUpdate = prevCheck
-		performUpdate = prevPerform
-	})
-	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
-		t.Fatal("CheckForUpdate should not run for explicit versions")
-		return update.Status{}
-	}
-	performCalls := 0
-	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
-		performCalls++
-		return update.ApplyResult{Version: "1.2.3"}, nil
-	}
-
-	st, err := openTeamsStore()
-	if err != nil {
-		t.Fatalf("openTeamsStore: %v", err)
-	}
-	ctx := context.Background()
-	staleHeartbeat := time.Now().Add(-3 * time.Minute)
-	owner := teamsstore.OwnerMetadata{
-		PID:             4242,
-		Hostname:        "stale-host",
-		ExecutablePath:  "/usr/local/bin/codex-proxy",
-		HelperVersion:   "v-old",
-		StartedAt:       staleHeartbeat,
-		ActiveSessionID: "s1",
-		ActiveTurnID:    "turn:old",
-	}
-	if _, err := st.RecordOwnerHeartbeat(ctx, owner, time.Minute, staleHeartbeat); err != nil {
-		t.Fatalf("RecordOwnerHeartbeat stale owner: %v", err)
-	}
-
-	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3"))
-	var out bytes.Buffer
-	cmd.SetOut(&out)
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("upgrade should rescue stale owner: %v\n%s", err, out.String())
-	}
-	if performCalls != 1 {
-		t.Fatalf("performUpdate calls = %d, want 1", performCalls)
-	}
-	if !strings.Contains(out.String(), "Teams upgrade rescue") || !strings.Contains(out.String(), "cleared stale helpers=1") {
-		t.Fatalf("upgrade output missing stale owner rescue summary:\n%s", out.String())
-	}
-	if _, ok, err := st.ReadOwner(ctx); err != nil {
-		t.Fatalf("ReadOwner: %v", err)
-	} else if ok {
-		t.Fatal("stale owner should be cleared by upgrade rescue")
-	}
-	upgrade, ok, err := st.ReadUpgrade(ctx)
-	if err != nil {
-		t.Fatalf("ReadUpgrade: %v", err)
-	}
-	if !ok || upgrade.Phase != teamsstore.UpgradePhaseCompleted {
-		t.Fatalf("upgrade state = %#v ok=%v, want completed", upgrade, ok)
-	}
-}
-
-func TestUpgradeCmdPausesOnProtectedOutboxDuringRescue(t *testing.T) {
-	lockCLITestHooks(t)
-	isolateUpgradeTeamsServiceForTest(t)
-
-	prevCheck := checkForUpdate
-	prevPerform := performUpdate
-	t.Cleanup(func() {
-		checkForUpdate = prevCheck
-		performUpdate = prevPerform
-	})
-	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
-		t.Fatal("CheckForUpdate should not run for explicit versions")
-		return update.Status{}
-	}
-	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
-		t.Fatal("PerformUpdate should not run while protected Teams output remains")
-		return update.ApplyResult{}, nil
-	}
-
-	st, err := openTeamsStore()
-	if err != nil {
-		t.Fatalf("openTeamsStore: %v", err)
-	}
-	ctx := context.Background()
-	if _, _, err := st.CreateSession(ctx, teamsstore.SessionContext{ID: "s1", Status: teamsstore.SessionStatusActive, TeamsChatID: "chat-1"}); err != nil {
-		t.Fatalf("CreateSession: %v", err)
-	}
-	if _, _, err := st.QueueOutbox(ctx, teamsstore.OutboxMessage{
-		ID:          "outbox:answer",
-		SessionID:   "s1",
-		TeamsChatID: "chat-1",
-		Kind:        "answer",
-		Body:        "saved answer",
-		Status:      teamsstore.OutboxStatusQueued,
-	}); err != nil {
-		t.Fatalf("QueueOutbox: %v", err)
-	}
-
-	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3"))
-	err = cmd.Execute()
-	if err == nil || !strings.Contains(err.Error(), "Teams upgrade paused") || !strings.Contains(err.Error(), "outbox s1 outbox:answer status=queued kind=answer") {
-		t.Fatalf("expected protected outbox pause, got %v", err)
-	}
-	upgrade, ok, err := st.ReadUpgrade(ctx)
-	if err != nil {
-		t.Fatalf("ReadUpgrade: %v", err)
-	}
-	if !ok || upgrade.Phase != teamsstore.UpgradePhaseAborted {
-		t.Fatalf("upgrade state = %#v ok=%v, want aborted after pause", upgrade, ok)
-	}
-}
-
 func TestUpgradeCmdLatestCanIncludePrerelease(t *testing.T) {
 	lockCLITestHooks(t)
 	isolateUpgradeTeamsServiceForTest(t)
@@ -2026,233 +1724,6 @@ func teamsServiceJoinedCalls(calls []teamsServiceCommandCall) string {
 	return strings.Join(parts, "\n")
 }
 
-func TestUpgradeCmdDrainsLiveTeamsOwnerBeforeUpdate(t *testing.T) {
-	lockCLITestHooks(t)
-	isolateUpgradeTeamsServiceForTest(t)
-
-	prevCheck := checkForUpdate
-	prevPerform := performUpdate
-	prevPoll := teamsUpgradePollInterval
-	t.Cleanup(func() {
-		checkForUpdate = prevCheck
-		performUpdate = prevPerform
-		teamsUpgradePollInterval = prevPoll
-	})
-	teamsUpgradePollInterval = time.Millisecond
-	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
-		t.Fatal("CheckForUpdate should not run for explicit versions")
-		return update.Status{}
-	}
-	performCalled := false
-	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
-		performCalled = true
-		return update.ApplyResult{Version: "1.2.3"}, nil
-	}
-
-	st := seedLiveTeamsOwnerForUpgradeTest(t)
-	cleared := make(chan struct{})
-	go func() {
-		defer close(cleared)
-		deadline := time.Now().Add(5 * time.Second)
-		for time.Now().Before(deadline) {
-			control, err := st.ReadControl(context.Background())
-			if err == nil && control.Draining {
-				_ = st.ClearOwner(context.Background())
-				return
-			}
-			time.Sleep(time.Millisecond)
-		}
-	}()
-
-	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3", "--teams-drain-timeout", "1s"))
-	var out bytes.Buffer
-	cmd.SetOut(&out)
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("execute upgrade: %v\n%s", err, out.String())
-	}
-	<-cleared
-	if !performCalled {
-		t.Fatal("performUpdate was not called after Teams drain")
-	}
-	if !strings.Contains(out.String(), "Waiting for active Teams bridge to drain") || !strings.Contains(out.String(), "Teams bridge drained.") {
-		t.Fatalf("upgrade output missing Teams drain messages:\n%s", out.String())
-	}
-	control, err := st.ReadControl(context.Background())
-	if err != nil {
-		t.Fatalf("ReadControl error: %v", err)
-	}
-	if control.Draining {
-		t.Fatalf("drain should be cleared after update: %#v", control)
-	}
-	upgrade, ok, err := st.ReadUpgrade(context.Background())
-	if err != nil {
-		t.Fatalf("ReadUpgrade error: %v", err)
-	}
-	if !ok || upgrade.Phase != teamsstore.UpgradePhaseCompleted {
-		t.Fatalf("upgrade state = %#v ok=%v, want completed", upgrade, ok)
-	}
-}
-
-func TestUpgradeCmdDrainsScopedTeamsStateBeforeUpdate(t *testing.T) {
-	lockCLITestHooks(t)
-	isolateUpgradeTeamsServiceForTest(t)
-
-	prevCheck := checkForUpdate
-	prevPerform := performUpdate
-	prevPoll := teamsUpgradePollInterval
-	t.Cleanup(func() {
-		checkForUpdate = prevCheck
-		performUpdate = prevPerform
-		teamsUpgradePollInterval = prevPoll
-	})
-	teamsUpgradePollInterval = time.Millisecond
-	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
-		t.Fatal("CheckForUpdate should not run for explicit versions")
-		return update.Status{}
-	}
-	performCalled := false
-	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
-		performCalled = true
-		return update.ApplyResult{Version: "1.2.3"}, nil
-	}
-
-	st := seedScopedLiveTeamsOwnerForUpgradeTest(t, "scope-upgrade")
-	go func() {
-		deadline := time.Now().Add(5 * time.Second)
-		for time.Now().Before(deadline) {
-			control, err := st.ReadControl(context.Background())
-			if err == nil && control.Draining {
-				_ = st.ClearOwner(context.Background())
-				return
-			}
-			time.Sleep(time.Millisecond)
-		}
-	}()
-
-	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3", "--teams-drain-timeout", "1s"))
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("execute upgrade: %v", err)
-	}
-	if !performCalled {
-		t.Fatal("performUpdate was not called after scoped Teams drain")
-	}
-	upgrade, ok, err := st.ReadUpgrade(context.Background())
-	if err != nil {
-		t.Fatalf("ReadUpgrade error: %v", err)
-	}
-	if !ok || upgrade.Phase != teamsstore.UpgradePhaseCompleted {
-		t.Fatalf("scoped upgrade state = %#v ok=%v, want completed", upgrade, ok)
-	}
-}
-
-func TestUpgradeCmdAllowsDeferredTeamsInboundWithoutOwner(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	isolateUpgradeTeamsStateForTest(t, tmp)
-	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
-		goos:    "linux",
-		exe:     filepath.Join(tmp, "codex-proxy"),
-		cwd:     tmp,
-		unitDir: filepath.Join(tmp, "systemd", "user"),
-		runner:  &recordingTeamsServiceRunner{},
-	})
-	prevCheck := checkForUpdate
-	prevPerform := performUpdate
-	t.Cleanup(func() {
-		checkForUpdate = prevCheck
-		performUpdate = prevPerform
-	})
-	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
-		t.Fatal("CheckForUpdate should not run for explicit versions")
-		return update.Status{}
-	}
-	performCalled := false
-	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
-		performCalled = true
-		return update.ApplyResult{Version: "1.2.3"}, nil
-	}
-
-	st, err := openTeamsStore()
-	if err != nil {
-		t.Fatalf("openTeamsStore error: %v", err)
-	}
-	if _, _, err := st.PersistInbound(context.Background(), teamsstore.InboundEvent{
-		TeamsChatID:    "chat-1",
-		TeamsMessageID: "deferred-1",
-		Status:         teamsstore.InboundStatusDeferred,
-	}); err != nil {
-		t.Fatalf("PersistInbound deferred error: %v", err)
-	}
-
-	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3"))
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("execute upgrade: %v", err)
-	}
-	if !performCalled {
-		t.Fatal("performUpdate was not called with deferred-only Teams state")
-	}
-}
-
-func TestUpgradeCmdAllowsOrphanedTranscriptImportCheckpointWithoutOwner(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	isolateUpgradeTeamsStateForTest(t, tmp)
-	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
-		goos:    "linux",
-		exe:     filepath.Join(tmp, "codex-proxy"),
-		cwd:     tmp,
-		unitDir: filepath.Join(tmp, "systemd", "user"),
-		runner:  &recordingTeamsServiceRunner{},
-	})
-	prevCheck := checkForUpdate
-	prevPerform := performUpdate
-	t.Cleanup(func() {
-		checkForUpdate = prevCheck
-		performUpdate = prevPerform
-	})
-	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
-		t.Fatal("CheckForUpdate should not run for explicit versions")
-		return update.Status{}
-	}
-	performCalled := false
-	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
-		performCalled = true
-		return update.ApplyResult{Version: "1.2.3"}, nil
-	}
-
-	st, err := openTeamsStore()
-	if err != nil {
-		t.Fatalf("openTeamsStore error: %v", err)
-	}
-	if err := st.Update(context.Background(), func(state *teamsstore.State) error {
-		state.ImportCheckpoints["transcript:s001"] = teamsstore.ImportCheckpoint{
-			ID:           "transcript:s001",
-			SessionID:    "s001",
-			Status:       "importing",
-			ImportTurnID: "import:s001",
-			LastRecordID: "fallback:missing",
-			SourcePath:   filepath.Join(tmp, "missing-rollout.jsonl"),
-		}
-		return nil
-	}); err != nil {
-		t.Fatalf("write import checkpoint: %v", err)
-	}
-
-	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3"))
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("execute upgrade with orphaned import checkpoint: %v", err)
-	}
-	if !performCalled {
-		t.Fatal("performUpdate was not called with orphaned import checkpoint")
-	}
-}
-
 func TestUpgradeCmdStopsAndRestartsActiveTeamsServiceAroundUpdate(t *testing.T) {
 	lockCLITestHooks(t)
 
@@ -2294,19 +1765,6 @@ func TestUpgradeCmdStopsAndRestartsActiveTeamsServiceAroundUpdate(t *testing.T) 
 		}
 		return update.ApplyResult{Version: "1.2.3"}, nil
 	}
-
-	st := seedLiveTeamsOwnerForUpgradeTest(t)
-	go func() {
-		deadline := time.Now().Add(5 * time.Second)
-		for time.Now().Before(deadline) {
-			control, err := st.ReadControl(context.Background())
-			if err == nil && control.Draining {
-				_ = st.ClearOwner(context.Background())
-				return
-			}
-			time.Sleep(time.Millisecond)
-		}
-	}()
 
 	cmd := newUpgradeCmd(&rootOptions{})
 	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3", "--teams-drain-timeout", "1s"))
@@ -2675,7 +2133,7 @@ func TestUpgradeCmdWSLAccessDeniedRefreshUsesElevatedRetireBeforeFallback(t *tes
 	})
 
 	var out bytes.Buffer
-	refresh, err := recoverWSLTeamsServiceRefreshAccessDenied(context.Background(), nil, strings.NewReader("yes\n"), &out, errTeamsKeepaliveAccessDeniedForTest{})
+	refresh, err := recoverWSLTeamsServiceRefreshAccessDenied(context.Background(), strings.NewReader("yes\n"), &out, errTeamsKeepaliveAccessDeniedForTest{})
 	if err != nil {
 		t.Fatalf("recover refresh access denied: %v\n%s", err, out.String())
 	}
@@ -2727,7 +2185,7 @@ func TestUpgradeCmdWSLAccessDeniedRefreshFailsWhenCleanupNeedsUACAndUACDeclined(
 	})
 
 	var out bytes.Buffer
-	refresh, err := recoverWSLTeamsServiceRefreshAccessDenied(context.Background(), nil, strings.NewReader("no\n"), &out, errTeamsKeepaliveAccessDeniedForTest{})
+	refresh, err := recoverWSLTeamsServiceRefreshAccessDenied(context.Background(), strings.NewReader("no\n"), &out, errTeamsKeepaliveAccessDeniedForTest{})
 	if err == nil {
 		t.Fatalf("recover refresh should fail when normal cleanup needs UAC and UAC is declined")
 	}
@@ -2742,99 +2200,6 @@ func TestUpgradeCmdWSLAccessDeniedRefreshFailsWhenCleanupNeedsUACAndUACDeclined(
 	}
 	if !strings.Contains(out.String(), "NEXT STEP: TYPE yes TO CONTINUE") {
 		t.Fatalf("cleanup failure should ask for UAC before failing:\n%s", out.String())
-	}
-}
-
-func TestUpgradeCmdDelaysTeamsServiceRestartWhenUpdateNeedsProcessExit(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	isolateUpgradeTeamsStateForTest(t, tmp)
-	unitDir := filepath.Join(tmp, "systemd", "user")
-	if err := os.MkdirAll(unitDir, 0o700); err != nil {
-		t.Fatalf("mkdir unit dir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(unitDir, teamsServiceUnitName), []byte("unit"), 0o600); err != nil {
-		t.Fatalf("write unit file: %v", err)
-	}
-	runner := &recordingTeamsServiceRunner{}
-	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
-		goos:    "linux",
-		exe:     filepath.Join(tmp, "codex-proxy"),
-		cwd:     tmp,
-		unitDir: unitDir,
-		runner:  runner,
-	})
-
-	prevCheck := checkForUpdate
-	prevPerform := performUpdate
-	prevPoll := teamsUpgradePollInterval
-	prevDetached := teamsServiceStartDetached
-	t.Cleanup(func() {
-		checkForUpdate = prevCheck
-		performUpdate = prevPerform
-		teamsUpgradePollInterval = prevPoll
-		teamsServiceStartDetached = prevDetached
-	})
-	var detachedName string
-	var detachedArgs []string
-	teamsServiceStartDetached = func(_ context.Context, name string, args ...string) error {
-		detachedName = name
-		detachedArgs = append([]string{}, args...)
-		return nil
-	}
-	teamsUpgradePollInterval = time.Millisecond
-	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
-		t.Fatal("CheckForUpdate should not run for explicit versions")
-		return update.Status{}
-	}
-	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
-		if !teamsServiceCallSeen(runner.calls, "stop") {
-			t.Fatalf("Teams service should be stopped before performUpdate, calls=%#v", runner.calls)
-		}
-		return update.ApplyResult{Version: "1.2.3", RestartRequired: true}, nil
-	}
-
-	st := seedLiveTeamsOwnerForUpgradeTest(t)
-	go func() {
-		deadline := time.Now().Add(5 * time.Second)
-		for time.Now().Before(deadline) {
-			control, err := st.ReadControl(context.Background())
-			if err == nil && control.Draining {
-				_ = st.ClearOwner(context.Background())
-				return
-			}
-			time.Sleep(time.Millisecond)
-		}
-	}()
-
-	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3", "--teams-drain-timeout", "1s"))
-	var out bytes.Buffer
-	cmd.SetOut(&out)
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("execute upgrade: %v\n%s", err, out.String())
-	}
-	if !teamsServiceCallSeen(runner.calls, "is-active") || !teamsServiceCallSeen(runner.calls, "stop") {
-		t.Fatalf("expected is-active and stop calls, got %#v", runner.calls)
-	}
-	if teamsServiceCallSeen(runner.calls, "start") {
-		t.Fatalf("restart-required upgrade must not immediately start service, calls=%#v", runner.calls)
-	}
-	if detachedName != "sh" || len(detachedArgs) != 2 || !strings.Contains(detachedArgs[1], "systemctl --user start '"+teamsServiceUnitName+"'") {
-		t.Fatalf("unexpected detached restart: name=%q args=%#v", detachedName, detachedArgs)
-	}
-	if !strings.Contains(out.String(), "Scheduling Teams service restart after the pending helper replacement") ||
-		!strings.Contains(out.String(), "Update replacement for v1.2.3 is pending.") ||
-		!strings.Contains(out.String(), "verify `codex-proxy --version`") {
-		t.Fatalf("upgrade output missing delayed restart/restart-required messages:\n%s", out.String())
-	}
-	upgrade, ok, err := st.ReadUpgrade(context.Background())
-	if err != nil {
-		t.Fatalf("ReadUpgrade error: %v", err)
-	}
-	if !ok || upgrade.Phase != teamsstore.UpgradePhaseAborted || !strings.Contains(upgrade.AbortReason, "did not complete") {
-		t.Fatalf("restart-required upgrade state = %#v ok=%v, want aborted pending install", upgrade, ok)
 	}
 }
 
@@ -3155,7 +2520,7 @@ func TestScheduleDelayedTeamsServiceStartUsesWindowsPendingActivation(t *testing
 		return nil
 	}
 
-	if err := scheduleDelayedTeamsServiceStartAfterUpgrade(context.Background(), nil, teamsUpgradeServiceRefreshResult{}, pending, filepath.Join(tmp, "codex-proxy.exe")); err != nil {
+	if err := scheduleDelayedTeamsServiceStartAfterUpgrade(context.Background(), teamsUpgradeServiceRefreshResult{}, pending, filepath.Join(tmp, "codex-proxy.exe")); err != nil {
 		t.Fatalf("scheduleDelayedTeamsServiceStartAfterUpgrade error: %v", err)
 	}
 	if detachedName != "powershell.exe" {
@@ -3202,7 +2567,7 @@ func TestUpgradeFinalizerRefreshesWindowsServiceBeforePendingActivation(t *testi
 		return nil
 	}
 
-	finalize, err := stopTeamsServiceForHelperUpgrade(context.Background(), nil, io.Discard, nil, nil)
+	finalize, err := stopTeamsServiceForHelperUpgrade(context.Background(), nil, io.Discard, nil)
 	if err != nil {
 		t.Fatalf("stopTeamsServiceForHelperUpgrade error: %v", err)
 	}
@@ -3232,147 +2597,6 @@ func TestUpgradeFinalizerRefreshesWindowsServiceBeforePendingActivation(t *testi
 	}
 }
 
-func TestRestartTeamsHelperFromTeamsUsesPendingActivationForWindowsService(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	pending := filepath.Join(tmp, ".codex-proxy_1.2.3_windows_amd64.exe.123")
-	if err := os.WriteFile(pending, []byte("new"), 0o600); err != nil {
-		t.Fatalf("write pending helper: %v", err)
-	}
-	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
-		goos:           "windows",
-		exe:            filepath.Join(tmp, "codex-proxy.exe"),
-		windowsTaskDir: filepath.Join(tmp, "tasks"),
-	})
-	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "1")
-	prevDetached := teamsServiceStartDetached
-	prevExit := exitFunc
-	prevStart := startSelf
-	t.Cleanup(func() {
-		teamsServiceStartDetached = prevDetached
-		exitFunc = prevExit
-		startSelf = prevStart
-	})
-	var detachedName string
-	var detachedArgs []string
-	var exitCode *int
-	teamsServiceStartDetached = func(_ context.Context, name string, args ...string) error {
-		detachedName = name
-		detachedArgs = append([]string(nil), args...)
-		return nil
-	}
-	exitFunc = func(code int) {
-		exitCode = &code
-	}
-	startSelf = func(string, []string, []string) error {
-		t.Fatal("pending Windows service restart must not start the old helper entry directly")
-		return nil
-	}
-
-	if err := restartTeamsHelperFromTeamsAfterPendingReplacement(context.Background(), pending, filepath.Join(tmp, "codex-proxy.exe")); err != nil {
-		t.Fatalf("restartTeamsHelperFromTeamsAfterPendingReplacement error: %v", err)
-	}
-	if exitCode == nil || *exitCode != 0 {
-		t.Fatalf("exitCode = %v, want 0", exitCode)
-	}
-	if detachedName != "powershell.exe" {
-		t.Fatalf("detached name = %q, want powershell.exe", detachedName)
-	}
-	joined := strings.Join(detachedArgs, " ")
-	for _, want := range []string{
-		pending,
-		filepath.Join(tmp, "codex-proxy.exe"),
-		"$want='1.2.3'",
-		".activation.json",
-		"Stop-ScheduledTask",
-		"Move-Item -Force",
-		"if (Test-DestVersion) { $ready=$true }",
-		"Write-Status 'failed'",
-		"Start-CodexHelperScheduledTaskIfStopped",
-	} {
-		if !strings.Contains(joined, want) {
-			t.Fatalf("pending activation restart command missing %q:\n%s", want, joined)
-		}
-	}
-}
-
-func TestRestartTeamsHelperFromTeamsUsesPendingProcessRestartForWindowsManualRun(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	pending := filepath.Join(tmp, ".codex-proxy_1.2.3_windows_amd64.exe.123")
-	if err := os.WriteFile(pending, []byte("new"), 0o600); err != nil {
-		t.Fatalf("write pending helper: %v", err)
-	}
-	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
-		goos:           "windows",
-		exe:            filepath.Join(tmp, "codex-proxy.exe"),
-		windowsTaskDir: filepath.Join(tmp, "tasks"),
-	})
-	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "")
-	prevDetached := teamsServiceStartDetached
-	prevExit := exitFunc
-	prevStart := startSelf
-	prevArgs := os.Args
-	t.Cleanup(func() {
-		teamsServiceStartDetached = prevDetached
-		exitFunc = prevExit
-		startSelf = prevStart
-		os.Args = prevArgs
-	})
-	os.Args = []string{filepath.Join(tmp, "codex-proxy.exe"), "teams", "run", "--auto-service=false"}
-	var detachedName string
-	var detachedArgs []string
-	var exitCode *int
-	teamsServiceStartDetached = func(_ context.Context, name string, args ...string) error {
-		detachedName = name
-		detachedArgs = append([]string(nil), args...)
-		return nil
-	}
-	exitFunc = func(code int) {
-		exitCode = &code
-	}
-	startSelf = func(string, []string, []string) error {
-		t.Fatal("pending Windows manual restart must not start the old helper entry directly")
-		return nil
-	}
-
-	if err := restartTeamsHelperFromTeamsAfterPendingReplacement(context.Background(), pending, filepath.Join(tmp, "codex-proxy.exe")); err != nil {
-		t.Fatalf("restartTeamsHelperFromTeamsAfterPendingReplacement error: %v", err)
-	}
-	if exitCode == nil || *exitCode != 0 {
-		t.Fatalf("exitCode = %v, want 0", exitCode)
-	}
-	if detachedName != "powershell.exe" {
-		t.Fatalf("detached name = %q, want powershell.exe", detachedName)
-	}
-	joined := strings.Join(detachedArgs, " ")
-	for _, want := range []string{
-		pending,
-		filepath.Join(tmp, "codex-proxy.exe"),
-		"$want='1.2.3'",
-		".activation.json",
-		"Move-Item -Force",
-		"if (Test-DestVersion) { $ready=$true }",
-		"Write-Status 'failed'",
-		"if (Test-Path -LiteralPath $dest) { try {",
-		"Start-Process -FilePath $dest",
-		"-RedirectStandardOutput $stdoutLog",
-		"-RedirectStandardError $stderrLog",
-		"'teams'",
-		"'run'",
-		"'--auto-service=false'",
-	} {
-		if !strings.Contains(joined, want) {
-			t.Fatalf("pending process restart command missing %q:\n%s", want, joined)
-		}
-	}
-	if strings.Contains(joined, "Start-ScheduledTask") {
-		t.Fatalf("manual pending restart should not start scheduled tasks:\n%s", joined)
-	}
-}
-
 func TestScheduleDelayedTeamsStartupFallbackStartUsesWSLStartupCommand(t *testing.T) {
 	lockCLITestHooks(t)
 
@@ -3396,7 +2620,7 @@ func TestScheduleDelayedTeamsStartupFallbackStartUsesWSLStartupCommand(t *testin
 	}
 	t.Cleanup(func() { teamsServiceStartDetached = prevDetached })
 
-	if err := scheduleDelayedTeamsStartupFallbackStart(context.Background(), nil); err != nil {
+	if err := scheduleDelayedTeamsStartupFallbackStart(context.Background()); err != nil {
 		t.Fatalf("scheduleDelayedTeamsStartupFallbackStart error: %v", err)
 	}
 	joined := strings.Join(detachedArgs, " ")
@@ -3458,17 +2682,27 @@ func TestUpgradeCmdStopsActiveTeamsServiceWithoutStateFile(t *testing.T) {
 	}
 }
 
-func TestUpgradeCmdPreservesExistingTeamsDrain(t *testing.T) {
+// A running Codex request is never interrupted by a helper upgrade: the
+// upgrade waits for it (up to the timeout) and does not update.
+func TestUpgradeCmdTimesOutBeforeUpdatingWhenTeamsRequestStaysRunning(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
 	isolateUpgradeTeamsStateForTest(t, tmp)
+	unitDir := filepath.Join(tmp, "systemd", "user")
+	if err := os.MkdirAll(unitDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(unitDir, teamsServiceUnitName), []byte("unit"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &recordingTeamsServiceRunner{}
 	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
 		goos:    "linux",
 		exe:     filepath.Join(tmp, "codex-proxy"),
 		cwd:     tmp,
-		unitDir: filepath.Join(tmp, "systemd", "user"),
-		runner:  &recordingTeamsServiceRunner{},
+		unitDir: unitDir,
+		runner:  runner,
 	})
 	prevCheck := checkForUpdate
 	prevPerform := performUpdate
@@ -3479,29 +2713,144 @@ func TestUpgradeCmdPreservesExistingTeamsDrain(t *testing.T) {
 		teamsUpgradePollInterval = prevPoll
 	})
 	teamsUpgradePollInterval = time.Millisecond
+	checkForUpdate = func(context.Context, update.CheckOptions) update.Status { return update.Status{} }
+	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
+		t.Fatal("performUpdate should not run while a Teams request runs")
+		return update.ApplyResult{}, nil
+	}
+	finish := seedRunningTeamsTurnForUpgradeTest(t)
+	defer finish()
+
+	cmd := newUpgradeCmd(&rootOptions{})
+	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3", "--teams-drain-timeout", "1ms"))
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "still running 1 request") {
+		t.Fatalf("expected a running-request timeout, got %v\n%s", err, out.String())
+	}
+	if teamsServiceCallSeen(runner.calls, "stop") {
+		t.Fatalf("service stopped although a request runs: %#v", runner.calls)
+	}
+}
+
+// seedRunningTeamsTurnForUpgradeTest writes a store (CODEX_HELPER_TEAMS_CORE_STORE)
+// with one running Codex request and releases it; finish completes it.
+func seedRunningTeamsTurnForUpgradeTest(t *testing.T) (finish func()) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "core.sqlite")
+	t.Setenv(envTeamsCoreStore, path)
+	st, err := corestore.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Acquire(corestore.Ident{Host: "h", PID: 1, BootID: "b"}); err != nil {
+		t.Fatal(err)
+	}
+	var turn corestore.Turn
+	err = st.Update(func(tx *corestore.Tx) error {
+		conv, err := tx.CreateConversation(corestore.NewConversation{Label: "s1", Kind: corestore.KindWork, Channel: "teams", ExtChatID: "chat-s1"})
+		if err != nil {
+			return err
+		}
+		if err := tx.Bind(corestore.Thread{ConvID: conv, ThreadID: "th-1", Cwd: "/w"}); err != nil {
+			return err
+		}
+		if _, err := tx.AdmitWindow("k", conv, []corestore.InboundMsg{{ExtMsgID: "m1", ExtTime: 1, Sender: corestore.SenderOwner, Kind: corestore.InPrompt, Body: "hi"}}, "c1"); err != nil {
+			return err
+		}
+		var ok bool
+		if turn, ok, err = tx.NextRunnable(conv); err != nil || !ok {
+			return fmt.Errorf("no runnable turn: %v", err)
+		}
+		if err := tx.MarkStarting(turn.ID, "th-1"); err != nil {
+			return err
+		}
+		return tx.MarkRunning(turn.ID, "codex-1")
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Release()
+	st.Close()
+	return func() {
+		st, err := corestore.Open(path)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer st.Close()
+		if _, err := st.Acquire(corestore.Ident{Host: "h", PID: 2, BootID: "b"}); err != nil {
+			t.Error(err)
+			return
+		}
+		defer st.Release()
+		if err := st.Update(func(tx *corestore.Tx) error { return tx.FinishTurn(turn.ID, corestore.TurnCompleted, "", nil) }); err != nil {
+			t.Error(err)
+		}
+	}
+}
+
+func TestUpgradeCmdDelaysTeamsServiceRestartWhenUpdateNeedsProcessExit(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateUpgradeTeamsStateForTest(t, tmp)
+	unitDir := filepath.Join(tmp, "systemd", "user")
+	if err := os.MkdirAll(unitDir, 0o700); err != nil {
+		t.Fatalf("mkdir unit dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(unitDir, teamsServiceUnitName), []byte("unit"), 0o600); err != nil {
+		t.Fatalf("write unit file: %v", err)
+	}
+	runner := &recordingTeamsServiceRunner{}
+	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
+		goos:    "linux",
+		exe:     filepath.Join(tmp, "codex-proxy"),
+		cwd:     tmp,
+		unitDir: unitDir,
+		runner:  runner,
+	})
+
+	prevCheck := checkForUpdate
+	prevPerform := performUpdate
+	prevPoll := teamsUpgradePollInterval
+	prevDetached := teamsServiceStartDetached
+	t.Cleanup(func() {
+		checkForUpdate = prevCheck
+		performUpdate = prevPerform
+		teamsUpgradePollInterval = prevPoll
+		teamsServiceStartDetached = prevDetached
+	})
+	var detachedName string
+	var detachedArgs []string
+	teamsServiceStartDetached = func(_ context.Context, name string, args ...string) error {
+		detachedName = name
+		detachedArgs = append([]string{}, args...)
+		return nil
+	}
+	teamsUpgradePollInterval = time.Millisecond
 	checkForUpdate = func(context.Context, update.CheckOptions) update.Status {
 		t.Fatal("CheckForUpdate should not run for explicit versions")
 		return update.Status{}
 	}
 	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
-		return update.ApplyResult{Version: "1.2.3"}, nil
+		if !teamsServiceCallSeen(runner.calls, "stop") {
+			t.Fatalf("Teams service should be stopped before performUpdate, calls=%#v", runner.calls)
+		}
+		return update.ApplyResult{Version: "1.2.3", RestartRequired: true}, nil
 	}
 
-	st := seedLiveTeamsOwnerForUpgradeTest(t)
-	if _, err := st.SetDraining(context.Background(), "maintenance"); err != nil {
-		t.Fatalf("SetDraining error: %v", err)
-	}
+	// A request still running when the upgrade starts: the service is
+	// stopped only after it finished.
+	finish := seedRunningTeamsTurnForUpgradeTest(t)
+	finished := make(chan struct{})
 	go func() {
-		deadline := time.Now().Add(5 * time.Second)
-		for time.Now().Before(deadline) {
-			control, err := st.ReadControl(context.Background())
-			if err == nil && control.Draining {
-				_ = st.ClearOwner(context.Background())
-				return
-			}
-			time.Sleep(time.Millisecond)
-		}
+		defer close(finished)
+		time.Sleep(50 * time.Millisecond)
+		finish()
 	}()
+	t.Cleanup(func() { <-finished })
 
 	cmd := newUpgradeCmd(&rootOptions{})
 	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3", "--teams-drain-timeout", "1s"))
@@ -3510,133 +2859,18 @@ func TestUpgradeCmdPreservesExistingTeamsDrain(t *testing.T) {
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("execute upgrade: %v\n%s", err, out.String())
 	}
-	control, err := st.ReadControl(context.Background())
-	if err != nil {
-		t.Fatalf("ReadControl error: %v", err)
+	if !teamsServiceCallSeen(runner.calls, "is-active") || !teamsServiceCallSeen(runner.calls, "stop") {
+		t.Fatalf("expected is-active and stop calls, got %#v", runner.calls)
 	}
-	if !control.Draining || control.Reason != "maintenance" {
-		t.Fatalf("existing drain should be preserved, got %#v", control)
+	if teamsServiceCallSeen(runner.calls, "start") {
+		t.Fatalf("restart-required upgrade must not immediately start service, calls=%#v", runner.calls)
 	}
-}
-
-func TestUpgradeCmdRestoresTeamsDrainOnTimeout(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	isolateUpgradeTeamsStateForTest(t, tmp)
-	prevCheck := checkForUpdate
-	prevPerform := performUpdate
-	prevPoll := teamsUpgradePollInterval
-	t.Cleanup(func() {
-		checkForUpdate = prevCheck
-		performUpdate = prevPerform
-		teamsUpgradePollInterval = prevPoll
-	})
-	teamsUpgradePollInterval = time.Millisecond
-	checkForUpdate = func(context.Context, update.CheckOptions) update.Status { return update.Status{} }
-	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
-		t.Fatal("performUpdate should not run before Teams drain")
-		return update.ApplyResult{}, nil
+	if detachedName != "sh" || len(detachedArgs) != 2 || !strings.Contains(detachedArgs[1], "systemctl --user start '"+teamsServiceUnitName+"'") {
+		t.Fatalf("unexpected detached restart: name=%q args=%#v", detachedName, detachedArgs)
 	}
-
-	st := seedLiveTeamsOwnerForUpgradeTest(t)
-	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3", "--teams-drain-timeout", "1ms"))
-	err := cmd.Execute()
-	if err == nil || !strings.Contains(err.Error(), "timed out waiting for Teams bridge to drain") {
-		t.Fatalf("expected drain timeout, got %v", err)
+	if !strings.Contains(out.String(), "Scheduling Teams service restart after the pending helper replacement") ||
+		!strings.Contains(out.String(), "Update replacement for v1.2.3 is pending.") ||
+		!strings.Contains(out.String(), "verify `codex-proxy --version`") {
+		t.Fatalf("upgrade output missing delayed restart/restart-required messages:\n%s", out.String())
 	}
-	control, err := st.ReadControl(context.Background())
-	if err != nil {
-		t.Fatalf("ReadControl error: %v", err)
-	}
-	if control.Draining {
-		t.Fatalf("upgrade-owned drain should be restored after timeout: %#v", control)
-	}
-	upgrade, ok, err := st.ReadUpgrade(context.Background())
-	if err != nil {
-		t.Fatalf("ReadUpgrade error: %v", err)
-	}
-	if !ok || upgrade.Phase != teamsstore.UpgradePhaseAborted {
-		t.Fatalf("upgrade state = %#v ok=%v, want aborted", upgrade, ok)
-	}
-}
-
-func TestUpgradeCmdTimesOutBeforeUpdatingWhenTeamsOwnerStaysLive(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	isolateUpgradeTeamsStateForTest(t, tmp)
-	prevCheck := checkForUpdate
-	prevPerform := performUpdate
-	prevPoll := teamsUpgradePollInterval
-	t.Cleanup(func() {
-		checkForUpdate = prevCheck
-		performUpdate = prevPerform
-		teamsUpgradePollInterval = prevPoll
-	})
-	teamsUpgradePollInterval = time.Millisecond
-	checkForUpdate = func(context.Context, update.CheckOptions) update.Status { return update.Status{} }
-	performUpdate = func(context.Context, update.UpdateOptions) (update.ApplyResult, error) {
-		t.Fatal("performUpdate should not run before Teams drain")
-		return update.ApplyResult{}, nil
-	}
-	st := seedLiveTeamsOwnerForUpgradeTest(t)
-
-	cmd := newUpgradeCmd(&rootOptions{})
-	cmd.SetArgs(upgradeArgsWithTeamsRestart("--version", "v1.2.3", "--teams-drain-timeout", "1ms"))
-	err := cmd.Execute()
-	if err == nil || !strings.Contains(err.Error(), "timed out waiting for Teams bridge to drain") {
-		t.Fatalf("expected drain timeout, got %v", err)
-	}
-	control, err := st.ReadControl(context.Background())
-	if err != nil {
-		t.Fatalf("ReadControl error: %v", err)
-	}
-	if control.Draining {
-		t.Fatalf("upgrade-owned drain should be restored after timeout: %#v", control)
-	}
-}
-
-func seedLiveTeamsOwnerForUpgradeTest(t *testing.T) *teamsstore.Store {
-	t.Helper()
-	st, err := openTeamsStore()
-	if err != nil {
-		t.Fatalf("openTeamsStore error: %v", err)
-	}
-	owner, err := teamsstore.CurrentOwner("v-test", "s1", "turn-1", time.Now())
-	if err != nil {
-		t.Fatalf("CurrentOwner error: %v", err)
-	}
-	if _, err := st.RecordOwnerHeartbeat(context.Background(), owner, time.Minute, time.Now()); err != nil {
-		t.Fatalf("RecordOwnerHeartbeat error: %v", err)
-	}
-	return st
-}
-
-func seedScopedLiveTeamsOwnerForUpgradeTest(t *testing.T, scopeID string) *teamsstore.Store {
-	t.Helper()
-	defaultPath, err := teamsStorePath()
-	if err != nil {
-		t.Fatalf("teamsStorePath error: %v", err)
-	}
-	path := filepath.Join(filepath.Dir(defaultPath), "scopes", scopeID, "state.json")
-	st, err := teamsstore.Open(path)
-	if err != nil {
-		t.Fatalf("Open scoped store error: %v", err)
-	}
-	if _, err := st.RecordScope(context.Background(), teamsstore.ScopeIdentity{ID: scopeID, AccountID: "user-1", OSUser: "alice", Profile: "default"}); err != nil {
-		t.Fatalf("RecordScope error: %v", err)
-	}
-	owner, err := teamsstore.CurrentOwner("v-test", "s1", "turn-1", time.Now())
-	if err != nil {
-		t.Fatalf("CurrentOwner error: %v", err)
-	}
-	owner.ScopeID = scopeID
-	owner.MachineID = "machine-1"
-	owner.LeaseGeneration = 1
-	if _, err := st.RecordOwnerHeartbeat(context.Background(), owner, time.Minute, time.Now()); err != nil {
-		t.Fatalf("RecordOwnerHeartbeat error: %v", err)
-	}
-	return st
 }

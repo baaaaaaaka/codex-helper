@@ -3,13 +3,10 @@ package cli
 import (
 	"bytes"
 	"context"
-	"path/filepath"
 	"reflect"
 	"sort"
 	"strings"
 	"testing"
-
-	"github.com/baaaaaaaka/codex-helper/internal/teams"
 )
 
 func TestRootCommandWiresExpectedSubcommandsAndFlags(t *testing.T) {
@@ -43,89 +40,6 @@ func TestRootCommandWiresExpectedSubcommandsAndFlags(t *testing.T) {
 	}
 	if appCmd.Flags().Lookup("model-profile") == nil {
 		t.Fatal("app command should expose --model-profile")
-	}
-}
-
-func TestModelCommandWiresSimpleSubcommands(t *testing.T) {
-	cmd := newRootCmd()
-	modelCmd, _, err := cmd.Find([]string{"model"})
-	if err != nil {
-		t.Fatalf("find model command: %v", err)
-	}
-	var names []string
-	for _, sub := range modelCmd.Commands() {
-		names = append(names, sub.Name())
-	}
-	sort.Strings(names)
-	want := []string{"catalog", "doctor", "list", "provider", "setup", "use"}
-	if !reflect.DeepEqual(names, want) {
-		t.Fatalf("unexpected model subcommands\n got: %#v\nwant: %#v", names, want)
-	}
-	setupCmd, _, err := modelCmd.Find([]string{"setup"})
-	if err != nil {
-		t.Fatalf("find model setup: %v", err)
-	}
-	for _, name := range []string{"api-key-env", "api-key-stdin", "ssh-proxy", "no-default", "no-doctor"} {
-		if setupCmd.Flags().Lookup(name) == nil {
-			t.Fatalf("model setup should expose --%s", name)
-		}
-	}
-	catalogCmd, _, err := modelCmd.Find([]string{"catalog"})
-	if err != nil {
-		t.Fatalf("find model catalog: %v", err)
-	}
-	for _, name := range []string{"add", "list", "remove", "replace", "sync"} {
-		if _, _, err := catalogCmd.Find([]string{name}); err != nil {
-			t.Fatalf("model catalog should expose %s: %v", name, err)
-		}
-	}
-	providerCmd, _, err := modelCmd.Find([]string{"provider"})
-	if err != nil {
-		t.Fatalf("find model provider: %v", err)
-	}
-	for _, name := range []string{"doctor", "list", "setup"} {
-		if _, _, err := providerCmd.Find([]string{name}); err != nil {
-			t.Fatalf("model provider should expose %s: %v", name, err)
-		}
-	}
-}
-
-func TestModelProfileCommandWiresPlannedSubcommands(t *testing.T) {
-	cmd := newRootCmd()
-	modelCmd, _, err := cmd.Find([]string{"model-profile"})
-	if err != nil {
-		t.Fatalf("find model-profile command: %v", err)
-	}
-	var names []string
-	for _, sub := range modelCmd.Commands() {
-		names = append(names, sub.Name())
-	}
-	sort.Strings(names)
-	want := []string{"delete", "doctor", "explain", "list", "set-default", "setup"}
-	if !reflect.DeepEqual(names, want) {
-		t.Fatalf("unexpected model-profile subcommands\n got: %#v\nwant: %#v", names, want)
-	}
-	setupCmd, _, err := modelCmd.Find([]string{"setup"})
-	if err != nil {
-		t.Fatalf("find model-profile setup: %v", err)
-	}
-	for _, name := range []string{"provider", "model", "base-url", "base-url-env", "api-key-env", "api-key-stdin", "ssh-proxy", "set-default", "no-doctor"} {
-		if setupCmd.Flags().Lookup(name) == nil {
-			t.Fatalf("model-profile setup should expose --%s", name)
-		}
-	}
-}
-
-func TestResponsesCommandWiresServeFlags(t *testing.T) {
-	cmd := newRootCmd()
-	serveCmd, _, err := cmd.Find([]string{"responses", "serve"})
-	if err != nil {
-		t.Fatalf("find responses serve command: %v", err)
-	}
-	for _, name := range []string{"listen", "base-url", "api-key", "api-key-env", "model", "provider", "store-path", "providers-json", "proxy-keys", "scope-salt"} {
-		if serveCmd.Flags().Lookup(name) == nil {
-			t.Fatalf("responses serve should expose --%s", name)
-		}
 	}
 }
 
@@ -171,7 +85,7 @@ func TestTeamsCommandWiresPlannedSubcommands(t *testing.T) {
 	}
 	sort.Strings(names)
 
-	want := []string{"auth", "chat", "control", "doctor", "drain", "migrate", "path", "pause", "probe-chat", "recover", "resume", "run", "send-file", "service", "setup", "status", "workflow"}
+	want := []string{"auth", "control", "doctor", "migrate", "path", "run", "service", "setup", "status", "workflow"}
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("unexpected teams subcommands\n got: %#v\nwant: %#v", names, want)
 	}
@@ -183,11 +97,11 @@ func TestTeamsCommandWiresPlannedSubcommands(t *testing.T) {
 	if runCmd.Name() != "run" {
 		t.Fatalf("teams listen should resolve to run, got %q", runCmd.Name())
 	}
-	if runCmd.Flags().Lookup("control-fallback-model") == nil {
-		t.Fatal("teams run should expose --control-fallback-model")
+	if flag := runCmd.Flags().Lookup("owner-stale-after"); flag == nil || !flag.Hidden {
+		t.Fatal("teams run should accept the hidden --owner-stale-after of earlier service units")
 	}
-	if runCmd.Flags().Lookup("owner-stale-after") == nil || runCmd.Flags().Lookup("max-work-chat-polls") == nil {
-		t.Fatal("teams run should expose Teams helper reliability tuning flags")
+	if flag := runCmd.Flag("registry"); flag == nil || !flag.Hidden {
+		t.Fatal("teams run should accept the hidden --registry of earlier service units")
 	}
 	if runCmd.Flags().Lookup("auto-update") == nil || runCmd.Flags().Lookup("auto-update-repo") == nil || runCmd.Flags().Lookup("auto-update-prerelease") == nil {
 		t.Fatal("teams run should expose Teams helper auto-update flags")
@@ -200,13 +114,10 @@ func TestTeamsCommandWiresPlannedSubcommands(t *testing.T) {
 	} else if flag.DefValue != "true" {
 		t.Fatalf("teams run --machine-registry default = %q, want true", flag.DefValue)
 	}
-	if flag := runCmd.Flags().Lookup("codex-timeout"); flag == nil {
-		t.Fatal("teams run should expose --codex-timeout")
-	} else if flag.DefValue != "0s" {
-		t.Fatalf("teams run --codex-timeout default = %q, want 0s", flag.DefValue)
-	}
-	if runCmd.Flags().Lookup("model-profile") == nil {
-		t.Fatal("teams run should expose --model-profile")
+	for _, removed := range []string{"model-profile", "control-fallback-model", "max-work-chat-polls", "codex-timeout"} {
+		if runCmd.Flags().Lookup(removed) != nil {
+			t.Fatalf("teams run still exposes removed --%s", removed)
+		}
 	}
 	if flag := runCmd.Flags().Lookup("asr-command"); flag == nil {
 		t.Fatal("teams run should keep developer ASR override wired")
@@ -232,185 +143,8 @@ func TestTeamsCommandWiresPlannedSubcommands(t *testing.T) {
 		authNames = append(authNames, sub.Name())
 	}
 	sort.Strings(authNames)
-	if want := []string{"config", "file-write", "file-write-logout", "file-write-status", "full", "full-logout", "full-status", "logout", "read", "read-logout", "read-status", "status"}; !reflect.DeepEqual(authNames, want) {
+	if want := []string{"config", "login", "logout", "status"}; !reflect.DeepEqual(authNames, want) {
 		t.Fatalf("unexpected teams auth subcommands\n got: %#v\nwant: %#v", authNames, want)
-	}
-}
-
-func TestTeamsASRTranscriberDefaultsToManagedQwenRuntime(t *testing.T) {
-	transcriber := teamsASRTranscriberFromConfig("", nil)
-	managed, ok := transcriber.(*teams.ManagedASRTranscriber)
-	if !ok {
-		t.Fatalf("default ASR transcriber = %T, want managed Qwen runtime", transcriber)
-	}
-	if managed == nil || managed.Config.ModelID != "" {
-		t.Fatalf("managed ASR config = %#v, want default model resolved lazily", managed)
-	}
-	if managed.Config.LlamaDevice != "cpu" || managed.Config.AllowTransformersFallback {
-		t.Fatalf("default managed ASR config = %#v, want CPU llama without transformers fallback opt-in", managed.Config)
-	}
-
-	override := teamsASRTranscriberFromConfig("/tmp/custom-asr", []string{"--input={input}"})
-	command, ok := override.(*teams.CommandASRTranscriber)
-	if !ok {
-		t.Fatalf("developer ASR override = %T, want command transcriber", override)
-	}
-	if command.Command != "/tmp/custom-asr" || strings.Join(command.Args, "\n") != "--input={input}" {
-		t.Fatalf("developer ASR override not preserved: %#v", command)
-	}
-}
-
-func TestTeamsASRTranscriberReadsManagedLlamaEnv(t *testing.T) {
-	t.Setenv(envTeamsASRBackend, "llama")
-	t.Setenv(envTeamsASRLlamaBinary, "/opt/llama/llama-mtmd-cli")
-	t.Setenv(envTeamsASRLlamaModel, "/models/qwen.gguf")
-	t.Setenv(envTeamsASRLlamaMMProj, "/models/mmproj.gguf")
-	t.Setenv(envTeamsASRLlamaDevice, "auto")
-	t.Setenv(envTeamsASRFFmpeg, "/opt/ffmpeg")
-	t.Setenv(envTeamsASRAllowTransformersFallback, "yes")
-
-	transcriber := teamsASRTranscriberFromConfig("", nil)
-	managed, ok := transcriber.(*teams.ManagedASRTranscriber)
-	if !ok {
-		t.Fatalf("ASR transcriber = %T, want managed Qwen runtime", transcriber)
-	}
-	if managed.Config.Backend != "llama" ||
-		managed.Config.LlamaBinaryPath != "/opt/llama/llama-mtmd-cli" ||
-		managed.Config.LlamaModelPath != "/models/qwen.gguf" ||
-		managed.Config.LlamaMMProjPath != "/models/mmproj.gguf" ||
-		managed.Config.LlamaDevice != "auto" ||
-		managed.Config.FFmpegPath != "/opt/ffmpeg" ||
-		!managed.Config.AllowTransformersFallback {
-		t.Fatalf("managed ASR config from env = %#v", managed.Config)
-	}
-}
-
-func TestRestartTeamsHelperFromTeamsWindowsServiceSchedulesTaskStart(t *testing.T) {
-	prevGOOS := teamsServiceGOOS
-	prevDetached := teamsServiceStartDetached
-	prevExit := exitFunc
-	prevPowerShell := teamsServicePowerShellExecutable
-	t.Cleanup(func() {
-		teamsServiceGOOS = prevGOOS
-		teamsServiceStartDetached = prevDetached
-		exitFunc = prevExit
-		teamsServicePowerShellExecutable = prevPowerShell
-	})
-	t.Setenv(envTeamsCodexChild, "")
-	t.Setenv(envTeamsCodexParentPID, "")
-	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "1")
-	teamsServiceGOOS = func() string { return "windows" }
-	teamsServicePowerShellExecutable = func() string { return "powershell.exe" }
-	var gotName string
-	var gotArgs []string
-	teamsServiceStartDetached = func(_ context.Context, name string, args ...string) error {
-		gotName = name
-		gotArgs = append([]string(nil), args...)
-		return nil
-	}
-	var exitCode int
-	var exited bool
-	exitFunc = func(code int) {
-		exited = true
-		exitCode = code
-	}
-
-	if err := restartTeamsHelperFromTeams(context.Background()); err != nil {
-		t.Fatalf("restartTeamsHelperFromTeams error: %v", err)
-	}
-	if !exited || exitCode != 0 {
-		t.Fatalf("exit = %v/%d, want true/0", exited, exitCode)
-	}
-	if gotName != "powershell.exe" || !strings.Contains(strings.Join(gotArgs, " "), "Start-ScheduledTask") {
-		t.Fatalf("detached restart command = %q %#v, want scheduled task start", gotName, gotArgs)
-	}
-}
-
-func TestRestartTeamsHelperFromTeamsLinuxLocalSupervisorSchedulesServiceRestart(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	isolateTeamsUserDirsForTest(t, tmp)
-	exe := filepath.Join(tmp, "bin", "codex-proxy")
-	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
-		goos: "linux",
-		exe:  exe,
-		cwd:  tmp,
-	})
-	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "1")
-	t.Setenv(envTeamsLinuxServiceBackend, "local-supervisor")
-
-	configPath, err := teamsServiceLocalSupervisorConfigPath()
-	if err != nil {
-		t.Fatalf("local supervisor config path: %v", err)
-	}
-	if err := writeTeamsServiceLocalSupervisorConfig(configPath, teamsServiceLocalSupervisorConfig{
-		Version: teamsServiceLocalSupervisorConfigVersion,
-		Enabled: true,
-		Spec: teamsServiceSpec{
-			Executable: exe,
-			WorkingDir: tmp,
-		},
-	}); err != nil {
-		t.Fatalf("write local supervisor config: %v", err)
-	}
-
-	prevDetached := teamsServiceStartDetached
-	prevExit := exitFunc
-	prevExec := execSelf
-	prevStart := startSelf
-	t.Cleanup(func() {
-		teamsServiceStartDetached = prevDetached
-		exitFunc = prevExit
-		execSelf = prevExec
-		startSelf = prevStart
-	})
-	var gotName string
-	var gotArgs []string
-	teamsServiceStartDetached = func(_ context.Context, name string, args ...string) error {
-		gotName = name
-		gotArgs = append([]string(nil), args...)
-		return nil
-	}
-	var exitCode int
-	var exited bool
-	exitFunc = func(code int) {
-		exited = true
-		exitCode = code
-	}
-	execSelf = func(string, []string, []string) error {
-		t.Fatal("local-supervisor service restart must not exec the current helper process")
-		return nil
-	}
-	startSelf = func(string, []string, []string) error {
-		t.Fatal("local-supervisor service restart must not spawn teams run directly")
-		return nil
-	}
-
-	if err := restartTeamsHelperFromTeams(context.Background()); err != nil {
-		t.Fatalf("restartTeamsHelperFromTeams error: %v", err)
-	}
-	if !exited || exitCode != 0 {
-		t.Fatalf("exit = %v/%d, want true/0", exited, exitCode)
-	}
-	joined := strings.Join(gotArgs, " ")
-	if gotName != "sh" ||
-		!strings.Contains(joined, envTeamsLinuxServiceBackend+"=local-supervisor") ||
-		!strings.Contains(joined, envTeamsWSLServiceBackend+"=local-supervisor") ||
-		!strings.Contains(joined, shellQuote(exe)+" teams service restart") ||
-		strings.Contains(joined, "systemctl") {
-		t.Fatalf("detached restart command = %q %#v, want local-supervisor service restart", gotName, gotArgs)
-	}
-}
-
-func TestRestartTeamsHelperFromTeamsRefusesTeamsCodexChild(t *testing.T) {
-	t.Setenv(envTeamsCodexChild, "1")
-	err := restartTeamsHelperFromTeams(context.Background())
-	if err == nil {
-		t.Fatal("restartTeamsHelperFromTeams error = nil, want refusal")
-	}
-	if !strings.Contains(err.Error(), "helper restart now") || !strings.Contains(err.Error(), "launched by Teams helper") {
-		t.Fatalf("restartTeamsHelperFromTeams error = %v, want Teams child refusal", err)
 	}
 }
 

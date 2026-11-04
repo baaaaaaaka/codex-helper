@@ -48,7 +48,9 @@ func ResolveMachineID(st *store.Store, tenantID, ownerID string) (string, error)
 		// not derivable here, and nothing refers to one yet).
 		scope = "core:" + strings.TrimSpace(tenantID) + ":" + strings.TrimSpace(ownerID)
 	}
-	id := stableID("machine", []string{"v1", strings.TrimSpace(scope), host, osUser(), machineKind()})
+	// "primary" was the old core's machine kind of a long-lived host; it
+	// stays in the derivation so a migrated host keeps the old core's id.
+	id := stableID("machine", []string{"v1", strings.TrimSpace(scope), host, osUser(), "primary"})
 	err = st.Update(func(tx *store.Tx) error { return tx.SetMeta(MetaMachineID, id) })
 	return id, err
 }
@@ -69,23 +71,6 @@ func osUser() string {
 		return home
 	}
 	return "unknown"
-}
-
-// machineKind is the old core's machine kind (primary, or ephemeral in a
-// batch job).
-func machineKind() string {
-	switch strings.ToLower(strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_MACHINE_KIND"))) {
-	case "primary", "long", "long-lived", "persistent":
-		return "primary"
-	case "ephemeral", "temporary", "temp":
-		return "ephemeral"
-	}
-	for _, k := range []string{"SLURM_JOB_ID", "PBS_JOBID", "LSB_JOBID", "JOB_ID", "KUBERNETES_SERVICE_HOST"} {
-		if strings.TrimSpace(os.Getenv(k)) != "" {
-			return "ephemeral"
-		}
-	}
-	return "primary"
 }
 
 // metaOwnerID keeps the account id the registry is keyed by, so a start

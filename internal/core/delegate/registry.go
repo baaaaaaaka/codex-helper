@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"html"
 	"net/http"
 	"os"
 	"runtime"
@@ -15,8 +16,8 @@ import (
 
 	"github.com/baaaaaaaka/codex-helper/internal/channel"
 	chteams "github.com/baaaaaaaka/codex-helper/internal/channel/teams"
+	"github.com/baaaaaaaka/codex-helper/internal/core/delegate/machineregistry"
 	"github.com/baaaaaaaka/codex-helper/internal/core/engine"
-	"github.com/baaaaaaaka/codex-helper/internal/teams/machineregistry"
 )
 
 // MeetingChannel is the part of the Teams channel adapter the registry
@@ -47,7 +48,7 @@ type RegistryConfig struct {
 }
 
 // Registry is engine.Registrar over the cross-machine registry of the old
-// core (internal/teams/machineregistry): the same registry chat, card
+// core (internal/core/delegate/machineregistry): the same registry chat, card
 // format and inbox addressing, so `cxp delegate` requesters of either core
 // find this machine.
 type Registry struct {
@@ -206,9 +207,20 @@ func (r *Registry) card(cache machineregistry.Cache, draining bool) machineregis
 
 func (r *Registry) now() time.Time { return r.cfg.Now().UTC() }
 
-// graph is machineregistry.Graph over the channel adapter. Listing is not
-// used by the publisher.
+// graph is machineregistry.Graph over the channel adapter. The publisher
+// does not list; requesters (`cxp delegate`) list through a channel that
+// reads a bounded tail (*chteams.Adapter.Recent).
 type graph struct{ ch MeetingChannel }
+
+// TailReader reads a chat's most recently modified messages, newest first.
+type TailReader interface {
+	Recent(ctx context.Context, chat string, limit int) ([]channel.InboundMsg, error)
+}
+
+// NewGraph is machineregistry.Graph over ch for requesters: listing needs
+// ch to be a TailReader. Messages are listed as plain text (records and
+// cards are marker + base64 tokens, which survive the conversion).
+func NewGraph(ch MeetingChannel) machineregistry.Graph { return graph{ch} }
 
 func (g graph) SendHTML(ctx context.Context, chat, html string) (machineregistry.ChatMessage, error) {
 	sent, err := g.ch.Send(ctx, chat, chteams.HTMLPart(html), "")
@@ -222,8 +234,25 @@ func (g graph) UpdateChatMessageHTML(ctx context.Context, chat, id, html string)
 	return statusError(g.ch.Edit(ctx, chat, id, chteams.HTMLPart(html), ""))
 }
 
-func (g graph) ListMessages(context.Context, string, int) ([]machineregistry.ChatMessage, error) {
-	return nil, errors.New("registry: listing is not supported by the publisher")
+func (g graph) ListMessages(ctx context.Context, chat string, top int) ([]machineregistry.ChatMessage, error) {
+	r, ok := g.ch.(TailReader)
+	if !ok {
+		return nil, errors.New("registry: listing is not supported by this channel")
+	}
+	msgs, err := r.Recent(ctx, chat, top)
+	if err != nil {
+		return nil, statusError(err)
+	}
+	out := make([]machineregistry.ChatMessage, 0, len(msgs))
+	for _, m := range msgs {
+		// Code spans arrive as backticks around the token.
+		text := strings.ReplaceAll(m.Text, "`", " ")
+		out = append(out, machineregistry.ChatMessage{ID: m.ID,
+			CreatedDateTime:      m.Created.UTC().Format(time.RFC3339Nano),
+			LastModifiedDateTime: m.Modified.UTC().Format(time.RFC3339Nano),
+			Body:                 machineregistry.ChatMessageBody{Content: html.EscapeString(text)}})
+	}
+	return out, nil
 }
 
 func (g graph) CreateOrGetMeetingChatWindow(ctx context.Context, topic, key string, start, end time.Time) (machineregistry.Chat, machineregistry.OnlineMeeting, error) {

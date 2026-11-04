@@ -2,12 +2,10 @@ package cli
 
 import (
 	"bytes"
-	"context"
-	"errors"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -15,49 +13,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-
-	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
-	"github.com/baaaaaaaka/codex-helper/internal/teams"
-	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
 )
-
-func TestBuildTeamsAuthorityDiagnosticsReportsBindingAndPollHoles(t *testing.T) {
-	reg := teams.Registry{Sessions: []teams.Session{{ID: "s001", ChatID: "registry-old"}}}
-	storeA := teamsStatusStoreSnapshot{
-		Path:      "/state/live.json",
-		OwnerKind: teamsStatusOwnerLive,
-		State: teamsstore.State{
-			Sessions: map[string]teamsstore.SessionContext{
-				"s001": {ID: "s001", Status: teamsstore.SessionStatusActive, TeamsChatID: "durable-new"},
-			},
-			ChatPolls: map[string]teamsstore.ChatPollState{
-				"orphan-chat": {ChatID: "orphan-chat", PollState: "warm"},
-				"parked-chat": {ChatID: "parked-chat", PollState: "parked", ContinuationPath: "/next"},
-			},
-		},
-	}
-	storeB := teamsStatusStoreSnapshot{
-		Path:      "/state/retained.json",
-		OwnerKind: teamsStatusOwnerStale,
-		State: teamsstore.State{Sessions: map[string]teamsstore.SessionContext{
-			"s001": {ID: "s001", Status: teamsstore.SessionStatusActive, TeamsChatID: "retained-old"},
-		}},
-	}
-	got := buildTeamsAuthorityDiagnostics([]teamsStatusStoreSnapshot{storeA, storeB}, reg, "control-chat")
-	want := teamsAuthorityDiagnostics{
-		ActiveMissingPoll:          1,
-		RegistryBindingMismatches:  1,
-		CrossStoreBindingConflicts: 1,
-		ParkedContinuations:        1,
-		OrphanPollRows:             2,
-	}
-	if got != want {
-		t.Fatalf("authority diagnostics = %#v, want %#v", got, want)
-	}
-	if formatted := formatTeamsAuthorityDiagnostics(got); !strings.Contains(formatted, "registry_binding_mismatch=1") || !strings.Contains(formatted, "parked_continuations=1") {
-		t.Fatalf("formatted authority diagnostics = %q", formatted)
-	}
-}
 
 type cliReadOnlyFileSnapshot struct {
 	Mode    os.FileMode
@@ -95,327 +51,6 @@ func snapshotCLITreeForReadOnlyTest(t *testing.T, root string) map[string]cliRea
 		t.Fatalf("snapshot tree %s: %v", root, err)
 	}
 	return out
-}
-
-func TestTeamsStoreAndRegistryPathsSkipMigratedLegacyMirrors(t *testing.T) {
-	tmp := t.TempDir()
-	configBase, cacheBase := isolateTeamsUserDirsForTest(t, tmp)
-
-	legacyStore := filepath.Join(configBase, "codex-helper", "teams", "state.json")
-	legacyScopedStore := filepath.Join(configBase, "codex-helper", "teams", "scopes", "scope_dup", "state.json")
-	newScopedStore := cliStatePathForTest(t, "teams", "scopes", "scope_dup", "state.json")
-	migratedStoreBody := `{"version":1}`
-	for _, fixture := range []struct {
-		path string
-		body string
-	}{
-		{path: legacyStore, body: migratedStoreBody},
-		{path: legacyScopedStore, body: migratedStoreBody},
-		{path: newScopedStore, body: migratedStoreBody},
-	} {
-		path := fixture.path
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			t.Fatalf("mkdir %s: %v", path, err)
-		}
-		if err := os.WriteFile(path, []byte(fixture.body), 0o600); err != nil {
-			t.Fatalf("write %s: %v", path, err)
-		}
-	}
-	migratedMTime := time.Unix(1_700_000_001, 0)
-	for _, path := range []string{legacyScopedStore, newScopedStore} {
-		if err := os.Chtimes(path, migratedMTime, migratedMTime); err != nil {
-			t.Fatalf("chtime migrated store %s: %v", path, err)
-		}
-	}
-	storePaths, err := teamsStorePaths()
-	if err != nil {
-		t.Fatalf("teamsStorePaths error: %v", err)
-	}
-	newStore := cliStatePathForTest(t, "teams", "state.json")
-	assertCLIPathInList(t, storePaths, newStore)
-	assertCLIPathNotInList(t, storePaths, legacyStore)
-	assertCLIPathInList(t, storePaths, newScopedStore)
-	assertCLIPathNotInList(t, storePaths, legacyScopedStore)
-
-	legacyRegistry := filepath.Join(cacheBase, "codex-helper", "teams-registry.json")
-	legacyScopedRegistry := filepath.Join(cacheBase, "codex-helper", "teams", "scopes", "scope_dup", "registry.json")
-	newScopedRegistry := cliStatePathForTest(t, "teams", "scopes", "scope_dup", "registry.json")
-	migratedRegistryBody := `{"version":1,"scope":"dup"}`
-	for _, fixture := range []struct {
-		path string
-		body string
-	}{
-		{path: legacyRegistry, body: `{"version":1}`},
-		{path: legacyScopedRegistry, body: migratedRegistryBody},
-		{path: newScopedRegistry, body: migratedRegistryBody},
-	} {
-		path := fixture.path
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			t.Fatalf("mkdir %s: %v", path, err)
-		}
-		if err := os.WriteFile(path, []byte(fixture.body), 0o600); err != nil {
-			t.Fatalf("write %s: %v", path, err)
-		}
-	}
-	for _, path := range []string{legacyScopedRegistry, newScopedRegistry} {
-		if err := os.Chtimes(path, migratedMTime, migratedMTime); err != nil {
-			t.Fatalf("chtime migrated registry %s: %v", path, err)
-		}
-	}
-	registryPaths, err := teamsRegistryPaths("")
-	if err != nil {
-		t.Fatalf("teamsRegistryPaths error: %v", err)
-	}
-	newRegistry := cliStatePathForTest(t, "teams", "registry.json")
-	assertCLIPathInList(t, registryPaths, newRegistry)
-	assertCLIPathNotInList(t, registryPaths, legacyRegistry)
-	assertCLIPathInList(t, registryPaths, newScopedRegistry)
-	assertCLIPathNotInList(t, registryPaths, legacyScopedRegistry)
-}
-
-func TestTeamsStorePathsKeepLegacyWhenScopedStoreNeedsRefreshCI(t *testing.T) {
-	tmp := t.TempDir()
-	configBase, _ := isolateTeamsUserDirsForTest(t, tmp)
-
-	legacyScopedStore := filepath.Join(configBase, "codex-helper", "teams", "scopes", "scope_stale", "state.json")
-	newScopedStore := cliStatePathForTest(t, "teams", "scopes", "scope_stale", "state.json")
-	for path, body := range map[string]string{
-		legacyScopedStore: `{"version":1,"legacy":true}`,
-		newScopedStore:    `{"version":1,"new":true}`,
-	} {
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			t.Fatalf("mkdir %s: %v", path, err)
-		}
-		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
-			t.Fatalf("write %s: %v", path, err)
-		}
-	}
-	sameMTime := time.Unix(1_700_000_000, 0)
-	if err := os.Chtimes(legacyScopedStore, sameMTime, sameMTime); err != nil {
-		t.Fatalf("chtime legacy scoped store: %v", err)
-	}
-	if err := os.Chtimes(newScopedStore, sameMTime, sameMTime); err != nil {
-		t.Fatalf("chtime new scoped store: %v", err)
-	}
-
-	storePaths, err := teamsStorePaths()
-	if err != nil {
-		t.Fatalf("teamsStorePaths error: %v", err)
-	}
-	assertCLIPathInList(t, storePaths, newScopedStore)
-	assertCLIPathInList(t, storePaths, legacyScopedStore)
-}
-
-func TestTeamsRegistryPathsDoNotCoupleScopeMigrationToGlobalLedger(t *testing.T) {
-	tmp := t.TempDir()
-	configBase, cacheBase := isolateTeamsUserDirsForTest(t, tmp)
-
-	legacyScopedStore := filepath.Join(configBase, "codex-helper", "teams", "scopes", "scope_partial", "state.json")
-	newScopedStore := cliStatePathForTest(t, "teams", "scopes", "scope_partial", "state.json")
-	legacyScopedRegistry := filepath.Join(cacheBase, "codex-helper", "teams", "scopes", "scope_partial", "registry.json")
-	for path, body := range map[string]string{
-		legacyScopedStore:    `{"version":1,"legacy":true}`,
-		newScopedStore:       `{"version":1,"new":true}`,
-		legacyScopedRegistry: `{"version":1,"legacy":true}`,
-	} {
-		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-			t.Fatalf("mkdir %s: %v", path, err)
-		}
-		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
-			t.Fatalf("write %s: %v", path, err)
-		}
-	}
-	storePaths, err := teamsStorePaths()
-	if err != nil {
-		t.Fatalf("teamsStorePaths error: %v", err)
-	}
-	assertCLIPathInList(t, storePaths, newScopedStore)
-	assertCLIPathInList(t, storePaths, legacyScopedStore)
-
-	newScopedRegistry := cliStatePathForTest(t, "teams", "scopes", "scope_partial", "registry.json")
-	if err := os.MkdirAll(filepath.Dir(newScopedRegistry), 0o700); err != nil {
-		t.Fatalf("mkdir new scoped registry: %v", err)
-	}
-	if err := os.WriteFile(newScopedRegistry, []byte(`{"version":1,"new":true}`), 0o600); err != nil {
-		t.Fatalf("write new scoped registry: %v", err)
-	}
-	legacyLedger := filepath.Join(cacheBase, "codex-helper", "teams", "global-outbound-ledger.json")
-	legacyLedgerData := []byte(`{"version":1}`)
-	if err := os.WriteFile(legacyLedger, legacyLedgerData, 0o600); err != nil {
-		t.Fatalf("write legacy ledger: %v", err)
-	}
-	registryPaths, err := teamsRegistryPaths("")
-	if err != nil {
-		t.Fatalf("teamsRegistryPaths error: %v", err)
-	}
-	assertCLIPathInList(t, registryPaths, newScopedRegistry)
-	assertCLIPathNotInList(t, registryPaths, legacyScopedRegistry)
-	gotLegacyLedger, err := os.ReadFile(legacyLedger)
-	if err != nil {
-		t.Fatalf("read retained global ledger: %v", err)
-	}
-	if !bytes.Equal(gotLegacyLedger, legacyLedgerData) {
-		t.Fatalf("global ledger changed during scoped registry enumeration: got %q want %q", gotLegacyLedger, legacyLedgerData)
-	}
-}
-
-func TestRunTeamsServiceRetryLoopRetriesRecoverableErrors(t *testing.T) {
-	lockCLITestHooks(t)
-
-	prevDelay := teamsRunServiceRetryDelay
-	prevSleep := teamsRunServiceSleep
-	t.Cleanup(func() {
-		teamsRunServiceRetryDelay = prevDelay
-		teamsRunServiceSleep = prevSleep
-	})
-	teamsRunServiceRetryDelay = 123 * time.Millisecond
-	var sleeps []time.Duration
-	teamsRunServiceSleep = func(_ context.Context, delay time.Duration) error {
-		sleeps = append(sleeps, delay)
-		return nil
-	}
-
-	attempts := 0
-	var errOut bytes.Buffer
-	err := runTeamsServiceRetryLoop(context.Background(), &errOut, func() error {
-		attempts++
-		if attempts == 1 {
-			return &teams.GraphStatusError{Method: "GET", Path: "/me", StatusCode: 502}
-		}
-		return nil
-	})
-	if err != nil {
-		t.Fatalf("runTeamsServiceRetryLoop error: %v", err)
-	}
-	if attempts != 2 {
-		t.Fatalf("attempts = %d, want 2", attempts)
-	}
-	if len(sleeps) != 1 || sleeps[0] != 123*time.Millisecond {
-		t.Fatalf("sleeps = %v, want one 123ms sleep", sleeps)
-	}
-	if !strings.Contains(errOut.String(), "recoverable error") || !strings.Contains(errOut.String(), "retrying in 123ms") {
-		t.Fatalf("retry output mismatch:\n%s", errOut.String())
-	}
-}
-
-func TestRunTeamsServiceRetryLoopDoesNotRetryPermanentErrors(t *testing.T) {
-	lockCLITestHooks(t)
-
-	prevSleep := teamsRunServiceSleep
-	t.Cleanup(func() { teamsRunServiceSleep = prevSleep })
-	teamsRunServiceSleep = func(context.Context, time.Duration) error {
-		t.Fatal("permanent errors should not sleep or retry")
-		return nil
-	}
-
-	attempts := 0
-	permanent := fmt.Errorf("invalid Teams configuration")
-	err := runTeamsServiceRetryLoop(context.Background(), nil, func() error {
-		attempts++
-		return permanent
-	})
-	if err != permanent {
-		t.Fatalf("error = %v, want permanent error", err)
-	}
-	if attempts != 1 {
-		t.Fatalf("attempts = %d, want 1", attempts)
-	}
-}
-
-func TestTeamsRunShouldRetryInProcessOnlyForServiceMode(t *testing.T) {
-	lockCLITestHooks(t)
-
-	t.Setenv(envTeamsCodexChild, "")
-	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "")
-	t.Setenv("CODEX_HELPER_TEAMS_SERVICE_MODE", "")
-	if teamsRunShouldRetryInProcess(false, false) {
-		t.Fatal("foreground teams run should not retry internally")
-	}
-	t.Setenv("CODEX_HELPER_TEAMS_SERVICE", "1")
-	t.Setenv("CODEX_HELPER_TEAMS_SERVICE_MODE", "background")
-	if !teamsRunShouldRetryInProcess(false, true) {
-		t.Fatal("background service teams run should retry recoverable errors internally")
-	}
-	if teamsRunShouldRetryInProcess(true, true) {
-		t.Fatal("teams run --once should not enter service retry loop")
-	}
-	t.Setenv(envTeamsCodexChild, "1")
-	if teamsRunShouldRetryInProcess(false, true) {
-		t.Fatal("Teams Codex child must not receive managed-service migration authority")
-	}
-	t.Setenv(envTeamsCodexChild, "")
-	if !teamsRunShouldRetryInProcess(false, false) {
-		t.Fatal("persisted background service specs created before the hidden managed-child argument must remain compatible")
-	}
-}
-
-func TestFormatTeamsHelperVersionStatusReportsOwnerEntryAndPending(t *testing.T) {
-	lockCLITestHooks(t)
-	if runtime.GOOS == "windows" {
-		t.Skip("POSIX shell fixture is not executable on Windows")
-	}
-	tmp := t.TempDir()
-	exe := filepath.Join(tmp, "codex-proxy")
-	if err := os.WriteFile(exe, []byte("#!/bin/sh\necho 'codex-proxy version 0.1.0-rc.68 (old)'\n"), 0o700); err != nil {
-		t.Fatalf("write fake helper: %v", err)
-	}
-	pending := filepath.Join(tmp, ".codex-proxy_0.1.0-rc.73_linux_"+runtime.GOARCH+".123")
-	if err := os.WriteFile(pending, []byte("new"), 0o600); err != nil {
-		t.Fatalf("write pending helper: %v", err)
-	}
-	failedPending := filepath.Join(tmp, ".codex-proxy_0.1.0-rc.74_linux_"+runtime.GOARCH+".123")
-	if err := os.WriteFile(failedPending, []byte("failed"), 0o600); err != nil {
-		t.Fatalf("write failed pending helper: %v", err)
-	}
-	failedStatus := append([]byte{0xef, 0xbb, 0xbf}, []byte(`{"version":1,"status":"failed","message":"file is locked"}`)...)
-	if err := os.WriteFile(failedPending+".activation.json", failedStatus, 0o600); err != nil {
-		t.Fatalf("write failed pending status: %v", err)
-	}
-	stalePending := filepath.Join(tmp, ".codex-proxy_0.1.0-rc.67_linux_"+runtime.GOARCH+".123")
-	if err := os.WriteFile(stalePending, []byte("stale"), 0o600); err != nil {
-		t.Fatalf("write stale pending helper: %v", err)
-	}
-	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
-		goos:    "linux",
-		exe:     exe,
-		unitDir: filepath.Join(tmp, "systemd"),
-	})
-
-	got := formatTeamsHelperVersionStatus(context.Background(), []teamsstore.OwnerMetadata{{
-		HelperVersion: "v0.1.0-rc.68",
-	}})
-	for _, want := range []string{
-		"owner=v0.1.0-rc.68",
-		"entry=v0.1.0-rc.68",
-		"pending=failed:v0.1.0-rc.74, newer:v0.1.0-rc.73, stale:v0.1.0-rc.67",
-	} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("helper version status missing %q: %s", want, got)
-		}
-	}
-}
-
-func TestResolveTeamsHelperExecutableStatusReportsRawStableAndActivationPending(t *testing.T) {
-	lockCLITestHooks(t)
-	if runtime.GOOS == "windows" {
-		t.Skip("NFS-style raw path fixture is Unix-focused")
-	}
-	tmp := t.TempDir()
-	stable := filepath.Join(tmp, "codex-proxy")
-	if err := os.WriteFile(stable, []byte("#!/bin/sh\necho 'codex-proxy version 0.1.0-rc.70'\n"), 0o700); err != nil {
-		t.Fatalf("write stable helper: %v", err)
-	}
-	raw := filepath.Join(tmp, ".nfs802014de01c482a800000492")
-	withTeamsServiceTestHooks(t, teamsServiceTestHooks{
-		goos: "linux",
-		exe:  raw,
-		cwd:  tmp,
-	})
-
-	got := resolveTeamsHelperExecutableStatus()
-	if got.Raw != raw || got.Stable != stable || !got.ActivationPending || got.Source != string(helperpath.SourceExecutable) {
-		t.Fatalf("path status = %#v, want raw %q stable %q pending executable source", got, raw, stable)
-	}
 }
 
 func assertCLIPathInList(t *testing.T, paths []string, want string) {
@@ -460,9 +95,9 @@ func TestTeamsSetupPrintsSafeChecklistWithoutState(t *testing.T) {
 		"teams auth",
 		"teams doctor --live",
 		"teams control",
-		"may create a Teams chat and send an @mention plus a ready message",
-		"codex-proxy teams service enable",
-		"codex-proxy teams service start",
+		"creates this machine's control chat when it first starts",
+		"teams run",
+		"teams service doctor",
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("setup output missing %q:\n%s", want, out)
@@ -473,76 +108,13 @@ func TestTeamsSetupPrintsSafeChecklistWithoutState(t *testing.T) {
 	}
 }
 
-func TestTeamsProbeChatHelpIsExplicitlySideEffectSafe(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	configBase, _ := isolateTeamsUserDirsForTest(t, tmp)
-
-	out := executeRootForTeamsTest(t, "teams", "probe-chat", "--help")
-	for _, want := range []string{
-		"Probe an external Teams chat without binding helper state",
-		"--send-test",
-		"--webhook-url-file",
-		"By default it is read-only",
-	} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("probe-chat help missing %q:\n%s", want, out)
-		}
-	}
-	if _, err := os.Stat(filepath.Join(configBase, "codex-helper", "teams", "state.json")); !os.IsNotExist(err) {
-		t.Fatalf("teams probe-chat --help should not create state file, stat err = %v", err)
-	}
-}
-
-func TestTeamsAuthConfigWritesLocalClientIDs(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	configBase, _ := isolateTeamsUserDirsForTest(t, tmp)
-
-	out := executeRootForTeamsTest(t,
-		"teams", "auth", "config",
-		"--tenant-id", "tenant-config",
-		"--read-client-id", "read-client-config",
-		"--chat-client-id", "chat-client-config",
-	)
-	configPath := filepath.Join(configBase, "codex-helper", "teams-auth.json")
-	for _, want := range []string{
-		"Saved Teams auth config: " + configPath,
-		"Tenant ID: configured",
-		"Read client ID: configured",
-		"Chat write client ID: configured",
-		"File write client ID: using chat write client",
-		"Full client ID: using chat write client",
-	} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("auth config output missing %q:\n%s", want, out)
-		}
-	}
-	cfg, err := teams.LoadTeamsAuthConfigFile(configPath)
-	if err != nil {
-		t.Fatalf("LoadTeamsAuthConfigFile error: %v", err)
-	}
-	if cfg.TenantID != "tenant-config" || cfg.Read.ClientID != "read-client-config" || cfg.ChatWrite.ClientID != "chat-client-config" {
-		t.Fatalf("saved auth config = %#v", cfg)
-	}
-	info, err := os.Stat(configPath)
-	if err != nil {
-		t.Fatalf("stat auth config: %v", err)
-	}
-	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
-		t.Fatalf("auth config permissions = %03o, want private", info.Mode().Perm())
-	}
-}
-
 func TestTeamsAuthStatusDoesNotPrintCachedSecrets(t *testing.T) {
 	lockCLITestHooks(t)
 
 	tmp := t.TempDir()
 	cachePath := filepath.Join(tmp, "token.json")
 	setTeamsAuthIDsForCLITest(t)
-	t.Setenv("CODEX_HELPER_TEAMS_TOKEN_CACHE", cachePath)
+	t.Setenv("CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE", cachePath)
 	t.Setenv("CODEX_HELPER_TEAMS_SCOPES", "")
 	secretAccess := "access-secret-value"
 	secretRefresh := "refresh-secret-value"
@@ -560,11 +132,175 @@ func TestTeamsAuthStatusDoesNotPrintCachedSecrets(t *testing.T) {
 	}
 
 	got := out.String()
-	if !strings.Contains(got, "Teams auth cache: present") {
+	if !strings.Contains(got, "Teams auth: logged in") {
 		t.Fatalf("expected present auth cache, got:\n%s", got)
 	}
 	if strings.Contains(got, secretAccess) || strings.Contains(got, secretRefresh) {
 		t.Fatalf("teams auth status printed a cached secret:\n%s", got)
+	}
+}
+
+func TestTeamsDoctorAppServerProbeWithoutAuthConfigStaysLocalOnly(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	for _, name := range []string{
+		"CODEX_HELPER_TEAMS_TENANT_ID",
+		"CODEX_HELPER_TEAMS_CLIENT_ID",
+		"CODEX_HELPER_TEAMS_READ_CLIENT_ID",
+		"CODEX_HELPER_TEAMS_FILE_WRITE_CLIENT_ID",
+		"CODEX_HELPER_TEAMS_FULL_CLIENT_ID",
+	} {
+		t.Setenv(name, "")
+	}
+
+	prevProbe := runTeamsAppServerProbe
+	runTeamsAppServerProbe = func(cmd *cobra.Command, _ teamsAppServerProbeOptions) error {
+		_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Codex app-server: ok (2 cold probe(s), min 1ms, max 2ms, total 3ms)")
+		return nil
+	}
+	t.Cleanup(func() { runTeamsAppServerProbe = prevProbe })
+
+	out := executeRootForTeamsTest(t, "teams", "doctor", "--appserver-probe")
+	for _, want := range []string{
+		"Graph: not checked",
+		"Codex app-server: ok",
+		"Auth: not ready",
+		"Next steps: run `cxp teams setup`",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("doctor output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestTeamsLogoutRemovesOnlyLocalAuthCache(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	cachePath := filepath.Join(tmp, "token.json")
+	setTeamsAuthIDsForCLITest(t)
+	t.Setenv("CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE", cachePath)
+	t.Setenv("CODEX_HELPER_TEAMS_SCOPES", "")
+	if err := os.WriteFile(cachePath, []byte(`{"access_token":"secret"}`), 0o600); err != nil {
+		t.Fatalf("write token cache: %v", err)
+	}
+
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"teams", "auth", "logout"})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute teams auth logout: %v", err)
+	}
+	if _, err := os.Stat(cachePath); !os.IsNotExist(err) {
+		t.Fatalf("expected auth cache to be removed, stat err = %v", err)
+	}
+	if strings.Contains(out.String(), "secret") {
+		t.Fatalf("teams auth logout printed token contents:\n%s", out.String())
+	}
+}
+
+func TestTeamsLogoutRefusesToRemoveNonTokenCacheOverride(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	cachePath := filepath.Join(tmp, "ordinary.json")
+	setTeamsAuthIDsForCLITest(t)
+	t.Setenv("CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE", cachePath)
+	t.Setenv("CODEX_HELPER_TEAMS_SCOPES", "")
+	if err := os.WriteFile(cachePath, []byte(`{"hello":"world"}`), 0o600); err != nil {
+		t.Fatalf("write ordinary json: %v", err)
+	}
+
+	cmd := newRootCmd()
+	cmd.SetArgs([]string{"teams", "auth", "logout"})
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "does not look like") {
+		t.Fatalf("expected non-token cache error, got %v", err)
+	}
+	if _, statErr := os.Stat(cachePath); statErr != nil {
+		t.Fatalf("ordinary file should not be removed, stat err = %v", statErr)
+	}
+}
+
+func unixString(v int64) string {
+	return strconv.FormatInt(v, 10)
+}
+
+func executeRootForTeamsTest(t *testing.T, args ...string) string {
+	t.Helper()
+	cmd := newRootCmd()
+	cmd.SetArgs(args)
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute %v: %v\n%s", args, err, out.String())
+	}
+	return out.String()
+}
+
+func executeRootForTeamsTestAllowError(t *testing.T, args ...string) (string, error) {
+	t.Helper()
+	cmd := newRootCmd()
+	cmd.SetArgs(args)
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	err := cmd.Execute()
+	return out.String(), err
+}
+
+// `teams auth config` writes the tenant and the one Graph client id to the
+// private user config, keeping fields written by earlier releases.
+func TestTeamsAuthConfigWritesLocalClientIDs(t *testing.T) {
+	lockCLITestHooks(t)
+
+	tmp := t.TempDir()
+	configBase, _ := isolateTeamsUserDirsForTest(t, tmp)
+	configPath := filepath.Join(configBase, "codex-helper", "teams-auth.json")
+	writeFile(t, configPath, `{"read":{"client_id":"old-read"},"full":{"scopes":"User.Read"}}`)
+
+	out := executeRootForTeamsTest(t,
+		"teams", "auth", "config",
+		"--tenant-id", "tenant-config",
+		"--chat-client-id", "chat-client-config",
+	)
+	for _, want := range []string{
+		"Saved Teams auth config: " + configPath,
+		"Tenant ID: configured",
+		"Client ID: configured",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("auth config output missing %q:\n%s", want, out)
+		}
+	}
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		TenantID string `json:"tenant_id"`
+		Read     struct {
+			ClientID string `json:"client_id"`
+		} `json:"read"`
+		Full struct {
+			ClientID string `json:"client_id"`
+			Scopes   string `json:"scopes"`
+		} `json:"full"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc.TenantID != "tenant-config" || doc.Full.ClientID != "chat-client-config" || doc.Full.Scopes != "User.Read" || doc.Read.ClientID != "old-read" {
+		t.Fatalf("saved auth config = %s", raw)
+	}
+	info, err := os.Stat(configPath)
+	if err != nil {
+		t.Fatalf("stat auth config: %v", err)
+	}
+	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+		t.Fatalf("auth config permissions = %03o, want private", info.Mode().Perm())
 	}
 }
 
@@ -577,7 +313,7 @@ func TestTeamsDoctorLiveUsesExplicitOptIn(t *testing.T) {
 	prevProbe := runTeamsAppServerProbe
 	liveCalled := false
 	probeCalled := false
-	runTeamsDoctorLiveCheck = func(cmd *cobra.Command, _ *rootOptions, _ string) error {
+	runTeamsDoctorLiveCheck = func(cmd *cobra.Command, _ *rootOptions) error {
 		liveCalled = true
 		_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Graph: ok as Test <test@example.com>")
 		return nil
@@ -608,7 +344,7 @@ func TestTeamsDoctorLiveUsesExplicitOptIn(t *testing.T) {
 	if !strings.Contains(out, "Codex app-server: not checked") {
 		t.Fatalf("doctor missing local-only appserver message:\n%s", out)
 	}
-	if !strings.Contains(out, "Teams auth cache: missing") || !strings.Contains(out, "Auth next step") {
+	if !strings.Contains(out, "Auth: not logged in (run `cxp teams auth`)") {
 		t.Fatalf("doctor missing auth guidance:\n%s", out)
 	}
 
@@ -627,920 +363,4 @@ func TestTeamsDoctorLiveUsesExplicitOptIn(t *testing.T) {
 	if !strings.Contains(out, "Codex app-server: ok") {
 		t.Fatalf("doctor --appserver-probe missing probe output:\n%s", out)
 	}
-}
-
-func TestTeamsDoctorAppServerProbeWithoutAuthConfigStaysLocalOnly(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	isolateTeamsUserDirsForTest(t, tmp)
-	for _, name := range []string{
-		"CODEX_HELPER_TEAMS_TENANT_ID",
-		"CODEX_HELPER_TEAMS_CLIENT_ID",
-		"CODEX_HELPER_TEAMS_READ_CLIENT_ID",
-		"CODEX_HELPER_TEAMS_FILE_WRITE_CLIENT_ID",
-		"CODEX_HELPER_TEAMS_FULL_CLIENT_ID",
-	} {
-		t.Setenv(name, "")
-	}
-
-	prevProbe := runTeamsAppServerProbe
-	runTeamsAppServerProbe = func(cmd *cobra.Command, _ teamsAppServerProbeOptions) error {
-		_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Codex app-server: ok (2 cold probe(s), min 1ms, max 2ms, total 3ms)")
-		return nil
-	}
-	t.Cleanup(func() { runTeamsAppServerProbe = prevProbe })
-
-	out := executeRootForTeamsTest(t, "teams", "doctor", "--appserver-probe")
-	for _, want := range []string{
-		"Graph: not checked",
-		"Codex app-server: ok",
-		"Teams read auth cache: not configured",
-		"Teams auth cache: not configured",
-		"Teams file-write auth cache: not configured",
-		"Next steps: run `codex-proxy teams setup`",
-	} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("doctor output missing %q:\n%s", want, out)
-		}
-	}
-}
-
-func TestTeamsLogoutRemovesOnlyLocalAuthCache(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	cachePath := filepath.Join(tmp, "token.json")
-	setTeamsAuthIDsForCLITest(t)
-	t.Setenv("CODEX_HELPER_TEAMS_TOKEN_CACHE", cachePath)
-	t.Setenv("CODEX_HELPER_TEAMS_SCOPES", "")
-	if err := os.WriteFile(cachePath, []byte(`{"access_token":"secret"}`), 0o600); err != nil {
-		t.Fatalf("write token cache: %v", err)
-	}
-
-	cmd := newRootCmd()
-	cmd.SetArgs([]string{"teams", "auth", "logout"})
-	var out bytes.Buffer
-	cmd.SetOut(&out)
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("execute teams auth logout: %v", err)
-	}
-	if _, err := os.Stat(cachePath); !os.IsNotExist(err) {
-		t.Fatalf("expected auth cache to be removed, stat err = %v", err)
-	}
-	if strings.Contains(out.String(), "secret") {
-		t.Fatalf("teams auth logout printed token contents:\n%s", out.String())
-	}
-}
-
-func TestTeamsLogoutRefusesToRemoveNonTokenCacheOverride(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	cachePath := filepath.Join(tmp, "ordinary.json")
-	setTeamsAuthIDsForCLITest(t)
-	t.Setenv("CODEX_HELPER_TEAMS_TOKEN_CACHE", cachePath)
-	t.Setenv("CODEX_HELPER_TEAMS_SCOPES", "")
-	if err := os.WriteFile(cachePath, []byte(`{"hello":"world"}`), 0o600); err != nil {
-		t.Fatalf("write ordinary json: %v", err)
-	}
-
-	cmd := newRootCmd()
-	cmd.SetArgs([]string{"teams", "auth", "logout"})
-	err := cmd.Execute()
-	if err == nil || !strings.Contains(err.Error(), "does not look like") {
-		t.Fatalf("expected non-token cache error, got %v", err)
-	}
-	if _, statErr := os.Stat(cachePath); statErr != nil {
-		t.Fatalf("ordinary file should not be removed, stat err = %v", statErr)
-	}
-}
-
-func TestTeamsFileWriteAuthStatusAndLogoutUseSeparateCache(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	cachePath := filepath.Join(tmp, "file-write-token.json")
-	setTeamsAuthIDsForCLITest(t)
-	t.Setenv("CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE", cachePath)
-	t.Setenv("CODEX_HELPER_TEAMS_FILE_WRITE_SCOPES", "")
-	secretAccess := "file-write-access-secret"
-	if err := os.WriteFile(cachePath, []byte(`{"access_token":"`+secretAccess+`","expires_at":`+unixString(time.Now().Add(time.Hour).Unix())+`}`), 0o600); err != nil {
-		t.Fatalf("write file-write token cache: %v", err)
-	}
-
-	out := executeRootForTeamsTest(t, "teams", "auth", "file-write-status")
-	if !strings.Contains(out, "Teams file-write auth cache: present") || !strings.Contains(out, cachePath) {
-		t.Fatalf("file-write status output mismatch:\n%s", out)
-	}
-	if strings.Contains(out, secretAccess) {
-		t.Fatalf("file-write status printed token contents:\n%s", out)
-	}
-
-	out = executeRootForTeamsTest(t, "teams", "auth", "file-write-logout")
-	if !strings.Contains(out, "Removed Teams file-write auth cache") {
-		t.Fatalf("file-write logout output mismatch:\n%s", out)
-	}
-	if _, err := os.Stat(cachePath); !os.IsNotExist(err) {
-		t.Fatalf("expected file-write auth cache to be removed, stat err=%v", err)
-	}
-}
-
-func TestResolveTeamsSendFileChatIDRequiresExplicitTargetWhenAmbiguous(t *testing.T) {
-	tmp := t.TempDir()
-	registryPath := filepath.Join(tmp, "teams-registry.json")
-	reg := teams.Registry{Version: 1, Sessions: []teams.Session{
-		{ID: "s001", ChatID: "chat-1", Status: "active", UpdatedAt: time.Now()},
-		{ID: "s002", ChatID: "chat-2", Status: "active", UpdatedAt: time.Now().Add(time.Second)},
-	}}
-	if err := teams.SaveRegistry(registryPath, reg); err != nil {
-		t.Fatalf("SaveRegistry error: %v", err)
-	}
-	if _, err := resolveTeamsSendFileChatID(registryPath, "", ""); err == nil {
-		t.Fatal("expected ambiguous target error")
-	}
-	got, err := resolveTeamsSendFileChatID(registryPath, "s001", "")
-	if err != nil {
-		t.Fatalf("resolve by session error: %v", err)
-	}
-	if got != "chat-1" {
-		t.Fatalf("resolved chat = %q, want chat-1", got)
-	}
-	got, err = resolveTeamsSendFileChatID(registryPath, "", "explicit-chat")
-	if err != nil {
-		t.Fatalf("resolve explicit chat error: %v", err)
-	}
-	if got != "explicit-chat" {
-		t.Fatalf("resolved explicit chat = %q", got)
-	}
-}
-
-func TestResolveTeamsSendFileChatIDDoesNotImplicitlyPickSingleActiveSession(t *testing.T) {
-	tmp := t.TempDir()
-	registryPath := filepath.Join(tmp, "teams-registry.json")
-	reg := teams.Registry{Version: 1, Sessions: []teams.Session{
-		{ID: "s001", ChatID: "chat-1", Status: "active", UpdatedAt: time.Now()},
-	}}
-	if err := teams.SaveRegistry(registryPath, reg); err != nil {
-		t.Fatalf("SaveRegistry error: %v", err)
-	}
-	if _, err := resolveTeamsSendFileChatID(registryPath, "", ""); err == nil || !strings.Contains(err.Error(), "--session or --chat-id") {
-		t.Fatalf("resolve without explicit target error = %v, want explicit target requirement", err)
-	}
-}
-
-func TestTeamsSendFileRequiresYesForExplicitChatID(t *testing.T) {
-	lockCLITestHooks(t)
-
-	out, err := executeRootForTeamsTestAllowError(t, "teams", "send-file", "--chat-id", "chat-1", "report.txt")
-	if err == nil {
-		t.Fatalf("send-file explicit chat-id succeeded without --yes, output:\n%s", out)
-	}
-	if !strings.Contains(err.Error(), "refusing explicit --chat-id without --yes") {
-		t.Fatalf("unexpected error: %v", err)
-	}
-}
-
-func TestTeamsSendFileMissingTokenFailsClosedWithoutDeviceLogin(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	file := filepath.Join(tmp, "report.txt")
-	if err := os.WriteFile(file, []byte("report"), 0o600); err != nil {
-		t.Fatalf("write report: %v", err)
-	}
-	isolateTeamsUserDirsForTest(t, tmp)
-	t.Setenv("CODEX_HELPER_TEAMS_FILE_WRITE_TOKEN_CACHE", filepath.Join(tmp, "missing-file-token.json"))
-
-	out, err := executeRootForTeamsTestAllowError(t, "teams", "send-file", "--chat-id", "chat-1", "--yes", "--allow-local-path", file)
-	if err == nil {
-		t.Fatalf("send-file succeeded without file-write token, output:\n%s", out)
-	}
-	if !strings.Contains(err.Error(), "auth cache is missing") || !strings.Contains(err.Error(), "teams auth file-write") {
-		t.Fatalf("unexpected send-file error: %v\noutput:\n%s", err, out)
-	}
-	if strings.Contains(out, "login.microsoft") || strings.Contains(out, "device login") {
-		t.Fatalf("send-file should not start interactive device login, output:\n%s", out)
-	}
-}
-
-func TestTeamsRecoverMissingStateIsLocalNoop(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	configBase, _ := isolateTeamsUserDirsForTest(t, tmp)
-
-	cmd := newRootCmd()
-	cmd.SetArgs([]string{"teams", "recover"})
-	var out bytes.Buffer
-	cmd.SetOut(&out)
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("execute teams recover: %v", err)
-	}
-	if !strings.Contains(out.String(), "Teams state unavailable") {
-		t.Fatalf("expected missing state message, got:\n%s", out.String())
-	}
-	if _, err := os.Stat(filepath.Join(configBase, "codex-helper", "teams", "state.json")); !os.IsNotExist(err) {
-		t.Fatalf("teams recover should not create missing state file, stat err = %v", err)
-	}
-}
-
-func TestTeamsRecoverRefusesLiveOwnerUnlessForced(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	isolateTeamsUserDirsForTest(t, tmp)
-	st := seedRecoverableTeamsState(t)
-	owner, err := teamsstore.CurrentOwner("v-test", "s1", "turn:manual", time.Now())
-	if err != nil {
-		t.Fatalf("CurrentOwner error: %v", err)
-	}
-	if _, err := st.RecordOwnerHeartbeat(context.Background(), owner, time.Minute, time.Now()); err != nil {
-		t.Fatalf("RecordOwnerHeartbeat error: %v", err)
-	}
-
-	out, err := executeRootForTeamsTestAllowError(t, "teams", "recover")
-	if err == nil {
-		t.Fatalf("teams recover succeeded with live owner, output:\n%s", out)
-	}
-	if !strings.Contains(err.Error(), "Teams bridge owner is active") {
-		t.Fatalf("unexpected recover error: %v", err)
-	}
-	state, err := st.Load(context.Background())
-	if err != nil {
-		t.Fatalf("Load error: %v", err)
-	}
-	if got := state.Turns["turn:manual"].Status; got != teamsstore.TurnStatusQueued {
-		t.Fatalf("turn status = %q, want queued after refused recover", got)
-	}
-
-	out = executeRootForTeamsTest(t, "teams", "recover", "--force")
-	if !strings.Contains(out, "Recovered interrupted turns: 1") {
-		t.Fatalf("force recover output mismatch:\n%s", out)
-	}
-	if _, ok, err := st.ReadOwner(context.Background()); err != nil {
-		t.Fatalf("ReadOwner error: %v", err)
-	} else if ok {
-		t.Fatal("owner should be cleared after forced recover")
-	}
-}
-
-func TestTeamsChatQuarantineDryRunAndUnquarantine(t *testing.T) {
-	lockCLITestHooks(t)
-	tmp := t.TempDir()
-	isolateTeamsUserDirsForTest(t, tmp)
-	path := filepath.Join(tmp, "maintenance", "state.json")
-	store, err := teamsstore.Open(path)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	ctx := context.Background()
-	if err := store.Update(ctx, func(state *teamsstore.State) error {
-		state.Scope = teamsstore.ScopeIdentity{ID: "scope-test"}
-		state.Sessions["s001"] = teamsstore.SessionContext{ID: "s001", Status: teamsstore.SessionStatusActive, TeamsChatID: "chat-1"}
-		state.Turns["turn-1"] = teamsstore.Turn{ID: "turn-1", SessionID: "s001", Status: teamsstore.TurnStatusQueued}
-		state.OutboxMessages["out-1"] = teamsstore.OutboxMessage{ID: "out-1", SessionID: "s001", TeamsChatID: "chat-1", Status: teamsstore.OutboxStatusQueued}
-		return nil
-	}); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
-	before := snapshotCLITreeForReadOnlyTest(t, tmp)
-	out := executeRootForTeamsTest(t, "teams", "chat", "quarantine", "s001", "--store", path, "--dry-run")
-	if !strings.Contains(out, "No files were modified") || !strings.Contains(out, "scope-test") {
-		t.Fatalf("dry-run output:\n%s", out)
-	}
-	after := snapshotCLITreeForReadOnlyTest(t, tmp)
-	if !reflect.DeepEqual(before, after) {
-		t.Fatalf("dry-run changed filesystem:\nbefore=%#v\nafter=%#v", before, after)
-	}
-	out = executeRootForTeamsTest(t, "teams", "chat", "quarantine", "s001", "--store", path, "--yes", "--reason", "operator test")
-	if !strings.Contains(out, "Teams session quarantined: s001") {
-		t.Fatalf("quarantine output:\n%s", out)
-	}
-	state, err := teamsstore.LoadPathReadOnly(ctx, path)
-	if err != nil {
-		t.Fatalf("read quarantined state: %v", err)
-	}
-	if state.Sessions["s001"].Status != teamsstore.SessionStatusQuarantined || state.Turns["turn-1"].Status != teamsstore.TurnStatusInterrupted || state.OutboxMessages["out-1"].Status != teamsstore.OutboxStatusSkipped {
-		t.Fatalf("quarantined state: %#v", state)
-	}
-	out = executeRootForTeamsTest(t, "teams", "chat", "unquarantine", "chat-1", "--store", path, "--yes")
-	if !strings.Contains(out, "Teams session unquarantined: s001") || !strings.Contains(out, "were not replayed") {
-		t.Fatalf("unquarantine output:\n%s", out)
-	}
-	state, err = teamsstore.LoadPathReadOnly(ctx, path)
-	if err != nil {
-		t.Fatalf("read unquarantined state: %v", err)
-	}
-	if state.Sessions["s001"].Status != teamsstore.SessionStatusActive || state.Turns["turn-1"].Status != teamsstore.TurnStatusInterrupted || state.OutboxMessages["out-1"].Status != teamsstore.OutboxStatusSkipped {
-		t.Fatalf("unquarantine replayed work: %#v", state)
-	}
-}
-
-func TestTeamsChatRecreateAndPublishHistoryExposeSafeRepairFlags(t *testing.T) {
-	registryPath := ""
-	root := &rootOptions{}
-	recreate := newTeamsChatRecreateCmd(root, &registryPath)
-	for name, wantDefault := range map[string]string{
-		"store":    "",
-		"history":  "none",
-		"activate": "false",
-		"yes":      "false",
-	} {
-		flag := recreate.Flags().Lookup(name)
-		if flag == nil || flag.DefValue != wantDefault {
-			t.Fatalf("recreate --%s flag = %#v, want default %q", name, flag, wantDefault)
-		}
-	}
-	publish := newTeamsChatPublishHistoryCmd(root, &registryPath)
-	for _, name := range []string{"full", "force", "yes", "store", "drain-timeout"} {
-		if flag := publish.Flags().Lookup(name); flag == nil {
-			t.Fatalf("publish-history missing --%s", name)
-		}
-	}
-	recreate.SetArgs([]string{"s178", "--yes", "--history", "delta"})
-	if err := recreate.Execute(); err == nil || !strings.Contains(err.Error(), "expected none or full") {
-		t.Fatalf("invalid recreate history mode error = %v", err)
-	}
-	publish.SetArgs([]string{"s178", "--force", "--yes"})
-	if err := publish.Execute(); err == nil || !strings.Contains(err.Error(), "requires --full") {
-		t.Fatalf("force publish without --full error = %v", err)
-	}
-}
-
-func TestTeamsChatQuarantineRejectsAmbiguousScopes(t *testing.T) {
-	lockCLITestHooks(t)
-	tmp := t.TempDir()
-	isolateTeamsUserDirsForTest(t, tmp)
-	ctx := context.Background()
-	for _, scopeID := range []string{"scope-a", "scope-b"} {
-		path, err := teams.DefaultStorePathForScope(scopeID)
-		if err != nil {
-			t.Fatalf("DefaultStorePathForScope(%s): %v", scopeID, err)
-		}
-		store, err := teamsstore.Open(path)
-		if err != nil {
-			t.Fatalf("Open(%s): %v", path, err)
-		}
-		if err := store.Update(ctx, func(state *teamsstore.State) error {
-			state.Scope = teamsstore.ScopeIdentity{ID: scopeID}
-			state.Sessions["s001"] = teamsstore.SessionContext{ID: "s001", Status: teamsstore.SessionStatusActive, TeamsChatID: "chat-" + scopeID}
-			return nil
-		}); err != nil {
-			t.Fatalf("seed %s: %v", scopeID, err)
-		}
-		_ = store.Close()
-	}
-	out, err := executeRootForTeamsTestAllowError(t, "teams", "chat", "quarantine", "s001", "--dry-run")
-	if err == nil || !strings.Contains(err.Error(), "ambiguous") || !strings.Contains(err.Error(), "--scope or --store") {
-		t.Fatalf("ambiguous result: err=%v out=%s", err, out)
-	}
-	selected := executeRootForTeamsTest(t, "teams", "chat", "quarantine", "s001", "--scope", "scope-a", "--dry-run")
-	if !strings.Contains(selected, "Scope: scope-a") {
-		t.Fatalf("scoped dry-run output:\n%s", selected)
-	}
-}
-
-func TestTeamsChatQuarantineRefusesLiveOwner(t *testing.T) {
-	lockCLITestHooks(t)
-	tmp := t.TempDir()
-	isolateTeamsUserDirsForTest(t, tmp)
-	path := filepath.Join(tmp, "maintenance", "state.json")
-	store, err := teamsstore.Open(path)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	ctx := context.Background()
-	if err := store.Update(ctx, func(state *teamsstore.State) error {
-		state.Sessions["s001"] = teamsstore.SessionContext{ID: "s001", Status: teamsstore.SessionStatusActive, TeamsChatID: "chat-1"}
-		return nil
-	}); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-	owner, err := teamsstore.CurrentOwner("v-test", "s001", "turn-1", time.Now())
-	if err != nil {
-		t.Fatalf("CurrentOwner: %v", err)
-	}
-	if _, err := store.RecordOwnerHeartbeat(ctx, owner, time.Minute, time.Now()); err != nil {
-		t.Fatalf("RecordOwnerHeartbeat: %v", err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-	before := snapshotCLITreeForReadOnlyTest(t, tmp)
-	out, err := executeRootForTeamsTestAllowError(t, "teams", "chat", "quarantine", "s001", "--store", path, "--yes")
-	if err == nil || !strings.Contains(err.Error(), "Teams bridge owner is active") {
-		t.Fatalf("live-owner quarantine: err=%v out=%s", err, out)
-	}
-	state, err := teamsstore.LoadPathReadOnly(ctx, path)
-	if err != nil {
-		t.Fatalf("LoadPathReadOnly: %v", err)
-	}
-	if state.Sessions["s001"].Status != teamsstore.SessionStatusActive {
-		t.Fatalf("refused quarantine mutated session: %#v", state.Sessions["s001"])
-	}
-	after := snapshotCLITreeForReadOnlyTest(t, tmp)
-	if !reflect.DeepEqual(before, after) {
-		t.Fatalf("live-owner refusal modified the store before checking ownership:\nbefore=%#v\nafter=%#v", before, after)
-	}
-}
-
-func TestTeamsStatusSessionLayerReportsQuarantinedExplicitly(t *testing.T) {
-	session := teamsstore.SessionContext{ID: "s001", TeamsChatID: "chat-1", Status: teamsstore.SessionStatusQuarantined}
-	if got := teamsStatusSessionLayer(teamsStatusStoreSnapshot{}, session, "control-chat", ""); got != "quarantined" {
-		t.Fatalf("teamsStatusSessionLayer = %q, want quarantined", got)
-	}
-}
-
-func TestTeamsRecoverAllowsStaleOwner(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	isolateTeamsUserDirsForTest(t, tmp)
-	st := seedRecoverableTeamsState(t)
-	old := time.Now().Add(-time.Hour)
-	owner, err := teamsstore.CurrentOwner("v-test", "s1", "turn:manual", old)
-	if err != nil {
-		t.Fatalf("CurrentOwner error: %v", err)
-	}
-	if _, err := st.RecordOwnerHeartbeat(context.Background(), owner, time.Minute, old); err != nil {
-		t.Fatalf("RecordOwnerHeartbeat error: %v", err)
-	}
-
-	out := executeRootForTeamsTest(t, "teams", "recover", "--stale-after", "1ms")
-	if !strings.Contains(out, "Cleared stale owners: 1") {
-		t.Fatalf("stale recover should report cleared owner:\n%s", out)
-	}
-	if !strings.Contains(out, "Recovered interrupted turns: 1") {
-		t.Fatalf("stale recover output mismatch:\n%s", out)
-	}
-	if _, ok, err := st.ReadOwner(context.Background()); err != nil {
-		t.Fatalf("ReadOwner error: %v", err)
-	} else if ok {
-		t.Fatal("owner should be cleared after stale recover")
-	}
-}
-
-func TestTeamsRecoverReportsRemainingUpgradeBlockers(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	isolateTeamsUserDirsForTest(t, tmp)
-	st, err := openTeamsStore()
-	if err != nil {
-		t.Fatalf("openTeamsStore error: %v", err)
-	}
-	ctx := context.Background()
-	if _, _, err := st.CreateSession(ctx, teamsstore.SessionContext{
-		ID:          "s1",
-		Status:      teamsstore.SessionStatusActive,
-		TeamsChatID: "chat-1",
-	}); err != nil {
-		t.Fatalf("CreateSession error: %v", err)
-	}
-	if _, _, err := st.QueueOutbox(ctx, teamsstore.OutboxMessage{
-		ID:          "outbox:blocking",
-		SessionID:   "s1",
-		TeamsChatID: "chat-1",
-		Kind:        "answer",
-		Body:        "pending answer",
-	}); err != nil {
-		t.Fatalf("QueueOutbox error: %v", err)
-	}
-
-	out := executeRootForTeamsTest(t, "teams", "recover")
-	if !strings.Contains(out, "Recovered interrupted turns: 0") {
-		t.Fatalf("recover should report no interrupted turns:\n%s", out)
-	}
-	if !strings.Contains(out, "Preserved protected outbox: 1") {
-		t.Fatalf("recover should report protected outbox preservation:\n%s", out)
-	}
-	if !strings.Contains(out, "Remaining upgrade blockers: 1") ||
-		!strings.Contains(out, "outbox s1 outbox:blocking status=queued kind=answer") {
-		t.Fatalf("recover should report remaining outbox blocker:\n%s", out)
-	}
-}
-
-func TestTeamsRecoverDoesNotReportNotificationOutboxAsUpgradeBlockers(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	isolateTeamsUserDirsForTest(t, tmp)
-	st, err := openTeamsStore()
-	if err != nil {
-		t.Fatalf("openTeamsStore error: %v", err)
-	}
-	ctx := context.Background()
-	if _, _, err := st.CreateSession(ctx, teamsstore.SessionContext{
-		ID:          "s1",
-		Status:      teamsstore.SessionStatusActive,
-		TeamsChatID: "chat-1",
-	}); err != nil {
-		t.Fatalf("CreateSession error: %v", err)
-	}
-	for _, msg := range []teamsstore.OutboxMessage{
-		{
-			ID:          "outbox:turn-1:codex-status-001",
-			SessionID:   "s1",
-			TeamsChatID: "chat-1",
-			Kind:        "codex-status-001",
-			Body:        "still running",
-			Status:      teamsstore.OutboxStatusQueued,
-		},
-		{
-			ID:          "outbox:turn-1:interrupted",
-			SessionID:   "s1",
-			TeamsChatID: "chat-1",
-			Kind:        "interrupted",
-			Body:        "ambiguous after restart",
-			Status:      teamsstore.OutboxStatusQueued,
-		},
-	} {
-		if _, _, err := st.QueueOutbox(ctx, msg); err != nil {
-			t.Fatalf("QueueOutbox %s error: %v", msg.ID, err)
-		}
-	}
-
-	out := executeRootForTeamsTest(t, "teams", "recover")
-	if !strings.Contains(out, "Recovered interrupted turns: 0") {
-		t.Fatalf("recover should report no interrupted turns:\n%s", out)
-	}
-	if !strings.Contains(out, "Superseded transient outbox: 2") {
-		t.Fatalf("recover should report transient outbox reconciliation:\n%s", out)
-	}
-	if strings.Contains(out, "Remaining upgrade blockers") {
-		t.Fatalf("notification outbox should not remain upgrade-blocking:\n%s", out)
-	}
-	state, err := st.Load(ctx)
-	if err != nil {
-		t.Fatalf("Load error: %v", err)
-	}
-	for _, id := range []string{"outbox:turn-1:codex-status-001", "outbox:turn-1:interrupted"} {
-		if got := state.OutboxMessages[id].Status; got != teamsstore.OutboxStatusSkipped {
-			t.Fatalf("%s status = %q, want skipped", id, got)
-		}
-	}
-}
-
-func TestDrainTeamsBridgeForChatRecreateWaitsForOwnerAndClearsDrain(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	isolateTeamsUserDirsForTest(t, tmp)
-	st, err := openTeamsStore()
-	if err != nil {
-		t.Fatalf("openTeamsStore error: %v", err)
-	}
-	owner, err := teamsstore.CurrentOwner("v-test", "", "", time.Now())
-	if err != nil {
-		t.Fatalf("CurrentOwner error: %v", err)
-	}
-	if _, err := st.RecordOwnerHeartbeat(context.Background(), owner, time.Minute, time.Now()); err != nil {
-		t.Fatalf("RecordOwnerHeartbeat error: %v", err)
-	}
-	prevPollInterval := teamsUpgradePollInterval
-	teamsUpgradePollInterval = time.Millisecond
-	t.Cleanup(func() { teamsUpgradePollInterval = prevPollInterval })
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		deadline := time.After(2 * time.Second)
-		for {
-			control, err := st.ReadControl(context.Background())
-			if err == nil && control.Draining && control.Reason == "chat recreate" {
-				_ = st.ClearOwner(context.Background())
-				return
-			}
-			select {
-			case <-deadline:
-				return
-			default:
-				time.Sleep(time.Millisecond)
-			}
-		}
-	}()
-
-	var out bytes.Buffer
-	if err := drainTeamsBridgeForChatRecreate(context.Background(), &out, time.Second); err != nil {
-		t.Fatalf("drainTeamsBridgeForChatRecreate error: %v\noutput:\n%s", err, out.String())
-	}
-	<-done
-	control, err := st.ReadControl(context.Background())
-	if err != nil {
-		t.Fatalf("ReadControl error: %v", err)
-	}
-	if control.Draining {
-		t.Fatalf("drain flag should be cleared after successful recreate drain: %#v", control)
-	}
-	if !strings.Contains(out.String(), "Waiting for active Teams listener") || !strings.Contains(out.String(), "Teams listener drained.") {
-		t.Fatalf("unexpected drain output:\n%s", out.String())
-	}
-}
-
-func TestBeginTeamsBridgeDrainForChatRecreateKeepsFencedUntilRelease(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	isolateTeamsUserDirsForTest(t, tmp)
-	st, err := openTeamsStore()
-	if err != nil {
-		t.Fatalf("openTeamsStore error: %v", err)
-	}
-	owner, err := teamsstore.CurrentOwner("v-test", "", "", time.Now())
-	if err != nil {
-		t.Fatalf("CurrentOwner error: %v", err)
-	}
-	if _, err := st.RecordOwnerHeartbeat(context.Background(), owner, time.Minute, time.Now()); err != nil {
-		t.Fatalf("RecordOwnerHeartbeat error: %v", err)
-	}
-	prevPollInterval := teamsUpgradePollInterval
-	teamsUpgradePollInterval = time.Millisecond
-	t.Cleanup(func() { teamsUpgradePollInterval = prevPollInterval })
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		deadline := time.After(2 * time.Second)
-		for {
-			control, readErr := st.ReadControl(context.Background())
-			if readErr == nil && control.Draining && control.DrainOperationID != "" {
-				_ = st.ClearOwner(context.Background())
-				return
-			}
-			select {
-			case <-deadline:
-				return
-			default:
-				time.Sleep(time.Millisecond)
-			}
-		}
-	}()
-
-	drain, err := beginTeamsBridgeDrainForChatRecreate(context.Background(), nil, time.Second, st.Path())
-	if err != nil {
-		t.Fatalf("beginTeamsBridgeDrainForChatRecreate error: %v", err)
-	}
-	<-done
-	control, err := st.ReadControl(context.Background())
-	if err != nil {
-		t.Fatalf("ReadControl while fenced: %v", err)
-	}
-	if !control.Draining || control.DrainOperationID != drain.operationID {
-		t.Fatalf("maintenance fence was released before recreate/save: %#v", control)
-	}
-	if _, err := st.ClearDrainOperation(context.Background(), "stale-operation"); !errors.Is(err, teamsstore.ErrDrainOperationConflict) {
-		t.Fatalf("stale cleanup error = %v", err)
-	}
-	if err := drain.Release(context.Background()); err != nil {
-		t.Fatalf("Release error: %v", err)
-	}
-	control, err = st.ReadControl(context.Background())
-	if err != nil {
-		t.Fatalf("ReadControl after release: %v", err)
-	}
-	if control.Draining || control.DrainOperationID != "" {
-		t.Fatalf("maintenance fence remains after release: %#v", control)
-	}
-}
-
-func TestBeginTeamsBridgeDrainForHistoryPublishUsesDistinctFenceAndReleases(t *testing.T) {
-	lockCLITestHooks(t)
-	tmp := t.TempDir()
-	isolateTeamsUserDirsForTest(t, tmp)
-	st, err := openTeamsStore()
-	if err != nil {
-		t.Fatalf("openTeamsStore error: %v", err)
-	}
-	storePath := st.Path()
-	if err := st.Close(); err != nil {
-		t.Fatalf("close seed store: %v", err)
-	}
-	var out bytes.Buffer
-	drain, err := beginTeamsBridgeDrainForHistoryPublish(context.Background(), &out, time.Second, storePath)
-	if err != nil {
-		t.Fatalf("begin history publish drain: %v", err)
-	}
-	check, err := teamsstore.Open(storePath)
-	if err != nil {
-		t.Fatalf("open fenced store: %v", err)
-	}
-	control, err := check.ReadControl(context.Background())
-	if err != nil {
-		t.Fatalf("read history publish fence: %v", err)
-	}
-	if !control.Draining || control.Reason != "history publish" || control.DrainOperationID != drain.operationID {
-		t.Fatalf("history publish fence = %#v", control)
-	}
-	if !strings.Contains(out.String(), "before publishing history") {
-		t.Fatalf("history publish drain output = %q", out.String())
-	}
-	if err := check.Close(); err != nil {
-		t.Fatalf("close fenced store: %v", err)
-	}
-	if err := drain.Release(context.Background()); err != nil {
-		t.Fatalf("release history publish drain: %v", err)
-	}
-	check, err = teamsstore.Open(storePath)
-	if err != nil {
-		t.Fatalf("reopen released store: %v", err)
-	}
-	defer check.Close()
-	control, err = check.ReadControl(context.Background())
-	if err != nil {
-		t.Fatalf("read released history publish fence: %v", err)
-	}
-	if control.Draining || control.DrainOperationID != "" {
-		t.Fatalf("history publish fence remained after release: %#v", control)
-	}
-}
-
-func TestBeginTeamsBridgeDrainForChatRecreateOnlyFencesPinnedStore(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	isolateTeamsUserDirsForTest(t, tmp)
-	primary, err := openTeamsStore()
-	if err != nil {
-		t.Fatalf("open primary store: %v", err)
-	}
-	t.Cleanup(func() { _ = primary.Close() })
-	secondaryPath := cliStatePathForTest(t, "teams", "scopes", "unrelated-scope", "state.json")
-	secondary, err := teamsstore.Open(secondaryPath)
-	if err != nil {
-		t.Fatalf("open secondary store: %v", err)
-	}
-	t.Cleanup(func() { _ = secondary.Close() })
-	if err := secondary.Update(context.Background(), func(state *teamsstore.State) error {
-		state.Scope.ID = "unrelated-scope"
-		return nil
-	}); err != nil {
-		t.Fatalf("seed secondary store: %v", err)
-	}
-
-	drain, err := beginTeamsBridgeDrainForChatRecreate(context.Background(), nil, time.Second, primary.Path())
-	if err != nil {
-		t.Fatalf("beginTeamsBridgeDrainForChatRecreate error: %v", err)
-	}
-	primaryControl, err := primary.ReadControl(context.Background())
-	if err != nil {
-		t.Fatalf("ReadControl primary: %v", err)
-	}
-	secondaryControl, err := secondary.ReadControl(context.Background())
-	if err != nil {
-		t.Fatalf("ReadControl secondary: %v", err)
-	}
-	if !primaryControl.Draining || primaryControl.DrainOperationID != drain.operationID {
-		t.Fatalf("primary store was not fenced: %#v", primaryControl)
-	}
-	if secondaryControl.Draining || secondaryControl.DrainOperationID != "" {
-		t.Fatalf("unrelated store was fenced: %#v", secondaryControl)
-	}
-	if err := drain.Release(context.Background()); err != nil {
-		t.Fatalf("Release error: %v", err)
-	}
-}
-
-func TestTeamsChatRecreateDrainReleaseDoesNotClearNewerFence(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	isolateTeamsUserDirsForTest(t, tmp)
-	st, err := openTeamsStore()
-	if err != nil {
-		t.Fatalf("openTeamsStore error: %v", err)
-	}
-	drain, err := beginTeamsBridgeDrainForChatRecreate(context.Background(), nil, time.Second, st.Path())
-	if err != nil {
-		t.Fatalf("beginTeamsBridgeDrainForChatRecreate error: %v", err)
-	}
-	if _, err := st.ClearDrainOperation(context.Background(), drain.operationID); err != nil {
-		t.Fatalf("clear original fence: %v", err)
-	}
-	if _, err := st.SetDrainingOperation(context.Background(), "new maintenance", "newer-operation"); err != nil {
-		t.Fatalf("set newer fence: %v", err)
-	}
-	if err := drain.Release(context.Background()); !errors.Is(err, teamsstore.ErrDrainOperationConflict) {
-		t.Fatalf("stale Release error = %v", err)
-	}
-	control, err := st.ReadControl(context.Background())
-	if err != nil {
-		t.Fatalf("ReadControl newer fence: %v", err)
-	}
-	if !control.Draining || control.DrainOperationID != "newer-operation" {
-		t.Fatalf("stale Release cleared newer fence: %#v", control)
-	}
-	if _, err := st.ClearDrainOperation(context.Background(), "newer-operation"); err != nil {
-		t.Fatalf("cleanup newer fence: %v", err)
-	}
-}
-
-func TestBeginTeamsBridgeDrainForChatRecreateDoesNotMigrateLegacyStore(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	configBase, _ := isolateTeamsUserDirsForTest(t, tmp)
-	legacyPath := filepath.Join(configBase, "codex-helper", "teams", "state.json")
-	if err := os.MkdirAll(filepath.Dir(legacyPath), 0o750); err != nil {
-		t.Fatalf("mkdir legacy store: %v", err)
-	}
-	if err := os.WriteFile(legacyPath, []byte(`{"schema_version":5}`), 0o640); err != nil {
-		t.Fatalf("write legacy store: %v", err)
-	}
-	currentPath := cliStatePathForTest(t, "teams", "state.json")
-	drain, err := beginTeamsBridgeDrainForChatRecreate(context.Background(), nil, time.Second, legacyPath)
-	if err != nil {
-		t.Fatalf("beginTeamsBridgeDrainForChatRecreate error: %v", err)
-	}
-	if _, err := os.Stat(currentPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("recreate drain migrated legacy store to %s: %v", currentPath, err)
-	}
-	if err := drain.Release(context.Background()); err != nil {
-		t.Fatalf("Release error: %v", err)
-	}
-	if _, err := os.Stat(currentPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("recreate release migrated legacy store to %s: %v", currentPath, err)
-	}
-}
-
-func TestDrainTeamsBridgeForChatRecreateTimeoutClearsDrain(t *testing.T) {
-	lockCLITestHooks(t)
-
-	tmp := t.TempDir()
-	isolateTeamsUserDirsForTest(t, tmp)
-	st, err := openTeamsStore()
-	if err != nil {
-		t.Fatalf("openTeamsStore error: %v", err)
-	}
-	owner, err := teamsstore.CurrentOwner("v-test", "", "", time.Now())
-	if err != nil {
-		t.Fatalf("CurrentOwner error: %v", err)
-	}
-	if _, err := st.RecordOwnerHeartbeat(context.Background(), owner, time.Minute, time.Now()); err != nil {
-		t.Fatalf("RecordOwnerHeartbeat error: %v", err)
-	}
-	prevPollInterval := teamsUpgradePollInterval
-	teamsUpgradePollInterval = time.Millisecond
-	t.Cleanup(func() { teamsUpgradePollInterval = prevPollInterval })
-
-	err = drainTeamsBridgeForChatRecreate(context.Background(), nil, 5*time.Millisecond)
-	if err == nil || !strings.Contains(err.Error(), "timed out waiting for Teams listener to drain") {
-		t.Fatalf("drain timeout error = %v", err)
-	}
-	control, readErr := st.ReadControl(context.Background())
-	if readErr != nil {
-		t.Fatalf("ReadControl error: %v", readErr)
-	}
-	if control.Draining {
-		t.Fatalf("drain flag should be cleared after timeout: %#v", control)
-	}
-}
-
-func seedRecoverableTeamsState(t *testing.T) *teamsstore.Store {
-	t.Helper()
-	st, err := openTeamsStore()
-	if err != nil {
-		t.Fatalf("openTeamsStore error: %v", err)
-	}
-	ctx := context.Background()
-	if _, _, err := st.CreateSession(ctx, teamsstore.SessionContext{
-		ID:          "s1",
-		Status:      teamsstore.SessionStatusActive,
-		TeamsChatID: "chat-1",
-	}); err != nil {
-		t.Fatalf("CreateSession error: %v", err)
-	}
-	if _, _, err := st.QueueTurn(ctx, teamsstore.Turn{ID: "turn:manual", SessionID: "s1"}); err != nil {
-		t.Fatalf("QueueTurn error: %v", err)
-	}
-	return st
-}
-
-func unixString(v int64) string {
-	return strconv.FormatInt(v, 10)
-}
-
-func executeRootForTeamsTest(t *testing.T, args ...string) string {
-	t.Helper()
-	cmd := newRootCmd()
-	cmd.SetArgs(args)
-	var out bytes.Buffer
-	cmd.SetOut(&out)
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("execute %v: %v\n%s", args, err, out.String())
-	}
-	return out.String()
-}
-
-func executeRootForTeamsTestAllowError(t *testing.T, args ...string) (string, error) {
-	t.Helper()
-	cmd := newRootCmd()
-	cmd.SetArgs(args)
-	var out bytes.Buffer
-	cmd.SetOut(&out)
-	err := cmd.Execute()
-	return out.String(), err
 }

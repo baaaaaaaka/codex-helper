@@ -387,7 +387,7 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 	if err != nil {
 		return err
 	}
-	tr := voice.New(asr.New(opts.asrCommand, asrArgs, teamsNewCoreASRConfig()), "")
+	tr := voice.New(asr.New(opts.asrCommand, asrArgs, teamsASRManagedConfig()), "")
 	defer func() { _ = tr.Close() }()
 	cfg.Transcriber = tr
 	notifier := &teamsNewCoreNotifier{st: st, path: path, client: client, log: errOut}
@@ -431,16 +431,4 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 		return nil
 	}
 	return err
-}
-
-// teamsNewCoreASRConfig maps the managed-ASR environment of the old core.
-func teamsNewCoreASRConfig() asr.ManagedConfig {
-	old := teamsASRManagedConfigFromEnv()
-	return asr.ManagedConfig{
-		Device:     old.LlamaDevice,
-		ServerPath: old.LlamaBinaryPath,
-		ModelPath:  old.LlamaModelPath,
-		MMProjPath: old.LlamaMMProjPath,
-		FFmpegPath: old.FFmpegPath,
-	}
 }

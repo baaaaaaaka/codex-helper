@@ -79,3 +79,34 @@ func TestReceiveWindowTooLarge(t *testing.T) {
 		t.Fatalf("after skip: %d msgs, %v", len(w2.Msgs), err)
 	}
 }
+
+// Recent reads a bounded tail, newest first, across page boundaries, and
+// stops fetching once it has enough (a long chat is not walked whole).
+func TestRecentReadsBoundedTailNewestFirst(t *testing.T) {
+	ctx := context.Background()
+	fg, a := newFake(t, fakegraph.Options{})
+	chat := fg.CreateMeetingChatAsUser("tail").ID
+	var ids []string
+	for i := 0; i < 130; i++ {
+		m, err := fg.PostAsUser(chat, fmt.Sprintf("m%d", i))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, m.ID)
+	}
+	before := len(fg.Requests(fakegraph.RequestFilter{Route: routeList}))
+	got, err := a.Recent(ctx, chat, 60)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 60 || got[0].ID != ids[129] || got[59].ID != ids[70] || got[0].Text != "m129" {
+		t.Fatalf("got %d messages, first %+v", len(got), got[0])
+	}
+	if n := len(fg.Requests(fakegraph.RequestFilter{Route: routeList})) - before; n != 2 {
+		t.Fatalf("%d list requests for 60 of 130 messages, want 2", n)
+	}
+	if none, err := a.Recent(ctx, chat, 0); err != nil || none != nil {
+		t.Fatalf("limit 0: %v %v", none, err)
+	}
+	noViolations(t, fg)
+}

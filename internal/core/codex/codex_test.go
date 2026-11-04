@@ -18,6 +18,7 @@ import (
 
 	"github.com/baaaaaaaka/codex-helper/internal/core/internal/leakcheck"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakecodex"
+	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 )
 
 const (
@@ -142,7 +143,7 @@ func (b *brain) clientIDs() []string {
 
 func fakeConfig(t *testing.T, brainURL, home string) Config {
 	t.Helper()
-	exe, err := os.Executable()
+	exe, err := helperpath.RawExecutable()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -394,7 +395,7 @@ func TestPoolWarmReapAndPIDFile(t *testing.T) {
 }
 
 func TestKillStale(t *testing.T) {
-	exe, err := os.Executable()
+	exe, err := helperpath.RawExecutable()
 	if err != nil {
 		t.Fatal(err)
 	}

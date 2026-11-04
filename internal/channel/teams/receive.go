@@ -373,3 +373,46 @@ func plainText(content string) string {
 func hostedRef(chat, msg, id string) string {
 	return "hosted:" + url.PathEscape(chat) + "/" + url.PathEscape(msg) + "/" + url.PathEscape(id)
 }
+
+// Recent lists up to limit of the chat's most recently modified messages,
+// newest first (Graph's order), following nextLink pages until limit is
+// reached. Unlike Receive it does not need the whole window: it is for
+// readers of a bounded tail (the delegation registry and inbox chats).
+func (a *Adapter) Recent(ctx context.Context, chat string, limit int) ([]channel.InboundMsg, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+	me, err := a.me(ctx)
+	if err != nil {
+		return nil, err
+	}
+	q := url.Values{}
+	q.Set("$top", strconv.Itoa(min(limit, pageSize)))
+	q.Set("$orderby", "lastModifiedDateTime desc")
+	next := "/chats/" + url.PathEscape(chat) + "/messages?" + q.Encode()
+	seenLinks := map[string]bool{}
+	seenIDs := map[string]bool{}
+	var out []channel.InboundMsg
+	for next != "" && len(out) < limit {
+		if seenLinks[next] {
+			return nil, &channel.Rejected{Err: fmt.Errorf("teams: nextLink loop")}
+		}
+		seenLinks[next] = true
+		var page struct {
+			Value    []graphMessage `json:"value"`
+			NextLink string         `json:"@odata.nextLink"`
+		}
+		if err := a.g.getJSON(ctx, next, pageBodyLimit, &page); err != nil {
+			return nil, err
+		}
+		for _, gm := range page.Value {
+			if gm.ID == "" || seenIDs[gm.ID] || len(out) >= limit {
+				continue
+			}
+			seenIDs[gm.ID] = true
+			out = append(out, a.convert(chat, gm, me.ID))
+		}
+		next = page.NextLink
+	}
+	return out, nil
+}

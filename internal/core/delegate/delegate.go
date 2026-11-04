@@ -1,5 +1,5 @@
 // Package delegate implements engine.Delegations over the existing
-// cross-machine delegation wire format (internal/teams/delegation), so the
+// cross-machine delegation wire format (internal/core/delegate/delegation), so the
 // rebuilt core's worker interoperates with `cxp delegate` requesters.
 //
 // It is an adapter: the engine never imports internal/teams.
@@ -11,8 +11,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/baaaaaaaka/codex-helper/internal/core/delegate/delegation"
 	"github.com/baaaaaaaka/codex-helper/internal/core/engine"
-	"github.com/baaaaaaaka/codex-helper/internal/teams/delegation"
 )
 
 // reuseRejectedPrefix starts a final that refuses a reused thread (the
