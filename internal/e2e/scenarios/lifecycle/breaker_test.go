@@ -154,7 +154,7 @@ func breakerNotices(s *harness.Scenario, chatID string, since int64) []string {
 		if m.RequestSeq <= since {
 			continue
 		}
-		low := strings.ToLower(m.PlainText())
+		low := strings.ToLower(harness.TokenPattern.ReplaceAllString(m.PlainText(), ""))
 		if strings.Contains(low, "quarantin") || strings.Contains(low, "unpause") || strings.Contains(low, "self-echo") || strings.Contains(low, "auto-start") {
 			out = append(out, clip(harness.NormalizeSpace(m.PlainText()), 140))
 		}
