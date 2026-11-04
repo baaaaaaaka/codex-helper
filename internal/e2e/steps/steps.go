@@ -6,11 +6,14 @@ package steps
 import (
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakecodex"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakegraph"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/harness"
+	"github.com/baaaaaaaka/codex-helper/internal/e2e/rollout"
 )
 
 // Generous upper bounds; the old core polls a hot chat every ~1 s and the
@@ -153,4 +156,51 @@ func ChatsWithSUTText(s *harness.Scenario, sub string) []fakegraph.ChatInfo {
 // prompt (the helper renders mirrored prompts as "User: <text>").
 func UserRecords(s *harness.Scenario, chatID, prompt string) int {
 	return len(s.SUTMessagesContaining(chatID, "User: "+prompt))
+}
+
+var sessionIDRE = regexp.MustCompile(`Work chat created: (s\d+)`)
+
+// SessionID returns the helper's session id ("s001") announced in a work
+// chat, or "".
+func SessionID(s *harness.Scenario, chatID string) string {
+	for _, m := range s.SUTMessages(chatID) {
+		if sm := sessionIDRE.FindStringSubmatch(m.PlainText()); sm != nil {
+			return sm[1]
+		}
+	}
+	return ""
+}
+
+// ThreadRollout returns the rollout file the fake Codex app-server wrote
+// for threadID (like real Codex, under $CODEX_HOME/sessions), so a scenario
+// can continue that session "in the TUI".
+func ThreadRollout(s *harness.Scenario, threadID string) (*rollout.Writer, error) {
+	st := fakecodex.Store{Dir: filepath.Join(s.Env.CodexHome, "e2e-fakecodex")}
+	th, err := st.Load(threadID)
+	if err != nil {
+		return nil, err
+	}
+	if th.RolloutPath == "" {
+		return nil, fmt.Errorf("thread %s has no rollout", threadID)
+	}
+	return rollout.Open(th.RolloutPath, th.ID, th.Cwd), nil
+}
+
+// HistoryWatchReady writes a fresh local TUI session and waits until it is
+// mirrored, proving the helper's history watcher has finished its first
+// scan (the old core silently baselines every rollout that exists when that
+// unobservable scan runs). It retries with a new session up to 3 times and
+// notes each miss.
+func HistoryWatchReady(s *harness.Scenario) bool {
+	s.T.Helper()
+	for attempt := 1; attempt <= 3; attempt++ {
+		r := harness.NewRollout(s.T, s.Env, s.Env.WorkDir(s.T, fmt.Sprintf("probe-%d", attempt)))
+		answer := s.Token("probe")
+		r.AppendTurn(s.T, "Probe session", "", "Probe answer "+answer)
+		if s.Poll(15*time.Second, func() bool { return len(ChatsWithSUTText(s, answer)) > 0 }) {
+			return true
+		}
+		s.Note("history probe %d not mirrored within 15s (first-start baseline race?)", attempt)
+	}
+	return false
 }
