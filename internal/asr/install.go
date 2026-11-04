@@ -62,9 +62,9 @@ type installer struct {
 	root     string
 	client   *http.Client
 	backoff  time.Duration
-	stall    time.Duration                   // abort a download attempt that receives nothing for this long
-	progress func(asset string, bytes int64) // optional; bytes < 0 marks a finished install step
-	noLock   bool                            // tests: behave like an NFS mount without working locks
+	stall    time.Duration // abort a download attempt that receives nothing for this long
+	progress func()        // optional; called when bytes arrive or an install step finishes
+	noLock   bool          // tests: behave like an NFS mount without working locks
 	mu       sync.Mutex
 	verified map[string]bool // install dirs verified by this process
 }
@@ -141,7 +141,7 @@ func (in *installer) ensure(ctx context.Context, a Asset, validate func(dir stri
 			return "", err
 		}
 	}
-	in.report(a.Name, -1)
+	in.report()
 	if err := writeManifest(stage, a); err != nil {
 		return "", newError(KindCache, "write install manifest", err, "")
 	}
@@ -259,7 +259,7 @@ func (in *installer) downloadOnce(parent context.Context, a Asset) (string, *Err
 		return "", newError(KindCache, op, err, "")
 	}
 	h := sha256.New()
-	body := &stallReader{r: resp.Body, t: stalled, d: in.stall, on: func(n int64) { in.report(a.Name, n) }}
+	body := &stallReader{r: resp.Body, t: stalled, d: in.stall, on: in.report}
 	n, copyErr := io.Copy(io.MultiWriter(f, h), io.LimitReader(body, a.Size+1))
 	closeErr := f.Close()
 	fail := func(e *Error) (string, *Error) { _ = os.Remove(f.Name()); return "", e }
@@ -282,28 +282,26 @@ func (in *installer) downloadOnce(parent context.Context, a Asset) (string, *Err
 // errPermanent marks download failures that retrying cannot fix (HTTP 4xx).
 var errPermanent = errors.New("permanent download failure")
 
-func (in *installer) report(asset string, bytes int64) {
+func (in *installer) report() {
 	if in.progress != nil {
-		in.progress(asset, bytes)
+		in.progress()
 	}
 }
 
 // stallReader re-arms the stall timer and reports progress whenever bytes
 // arrive.
 type stallReader struct {
-	r     io.Reader
-	t     *time.Timer
-	d     time.Duration
-	on    func(total int64)
-	total int64
+	r  io.Reader
+	t  *time.Timer
+	d  time.Duration
+	on func()
 }
 
 func (s *stallReader) Read(p []byte) (int, error) {
 	n, err := s.r.Read(p)
 	if n > 0 {
 		s.t.Reset(s.d)
-		s.total += int64(n)
-		s.on(s.total)
+		s.on()
 	}
 	return n, err
 }

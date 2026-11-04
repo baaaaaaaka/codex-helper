@@ -208,6 +208,7 @@ type assetServer struct {
 	files   map[string][]byte
 	hits    map[string]int
 	missing map[string]bool          // 404
+	down    map[string]bool          // 503
 	corrupt map[string]bool          // flip one byte
 	hold    map[string]chan struct{} // send half, then wait for the channel (or the client to go away)
 	stall   map[string]int           // the first N requests send half, then hang
@@ -215,7 +216,7 @@ type assetServer struct {
 }
 
 func newAssetServer(t *testing.T) *assetServer {
-	s := &assetServer{files: map[string][]byte{}, hits: map[string]int{}, missing: map[string]bool{},
+	s := &assetServer{files: map[string][]byte{}, hits: map[string]int{}, missing: map[string]bool{}, down: map[string]bool{},
 		corrupt: map[string]bool{}, hold: map[string]chan struct{}{}, stall: map[string]int{},
 		trickle: map[string]time.Duration{}}
 	s.Server = httptest.NewServer(http.HandlerFunc(s.serve))
@@ -239,6 +240,10 @@ func (s *assetServer) serve(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	if !ok || missing {
 		http.NotFound(w, r)
+		return
+	}
+	if s.isDown(name) {
+		http.Error(w, "mirror down", http.StatusServiceUnavailable)
 		return
 	}
 	if corrupt {
@@ -274,6 +279,12 @@ func (s *assetServer) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Write(data)
+}
+
+func (s *assetServer) isDown(name string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.down[name]
 }
 
 func (s *assetServer) hitCount(name string) int {

@@ -63,7 +63,6 @@ type Managed struct {
 	integrityFails int       // consecutive checksum failures (exponential backoff)
 	setupFailures  map[string]error
 	lastProgress   time.Time
-	progressHigh   map[string]int64 // bytes reached per asset; re-downloading the same bytes is no progress
 	closed         bool
 
 	runMu   sync.Mutex // serializes transcriptions and server lifecycle
@@ -117,7 +116,7 @@ func NewManaged(cfg ManagedConfig) *Managed {
 		cfg.SegmentSeconds = 60
 	}
 	m := &Managed{cfg: cfg, in: newInstaller(cfg.CacheDir, cfg.HTTPClient),
-		setupFailures: map[string]error{}, progressHigh: map[string]int64{}}
+		setupFailures: map[string]error{}}
 	m.in.stall = cfg.StallTimeout
 	reapOrphans(cfg.CacheDir)
 	m.in.progress = m.touch
@@ -259,7 +258,7 @@ func (m *Managed) runSetup(run *setupRun) {
 	defer cancelTotal()
 	ctx, stop := context.WithCancelCause(total)
 	defer stop(nil)
-	m.touch("", -1)
+	m.touch()
 	go m.watchProgress(ctx, stop)
 	p, err := m.install(ctx, run)
 	if err != nil && ctx.Err() != nil {
@@ -280,18 +279,13 @@ func (m *Managed) runSetup(run *setupRun) {
 	close(run.done)
 }
 
-// touch records setup progress: an install step finished (bytes < 0) or a
-// download got further than any earlier attempt of the same asset.
-func (m *Managed) touch(asset string, bytes int64) {
+// touch records setup progress: bytes arrived or an install step finished.
+// A mirror that keeps failing after some bytes is still bounded by
+// SetupTimeout.
+func (m *Managed) touch() {
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if bytes >= 0 {
-		if bytes <= m.progressHigh[asset] {
-			return
-		}
-		m.progressHigh[asset] = bytes
-	}
 	m.lastProgress = time.Now()
+	m.mu.Unlock()
 }
 
 func (m *Managed) watchProgress(ctx context.Context, stop context.CancelCauseFunc) {

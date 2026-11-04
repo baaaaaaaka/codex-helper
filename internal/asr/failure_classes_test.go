@@ -336,17 +336,14 @@ func TestFailureClassSlowSetup(t *testing.T) {
 	t.Run("setup without progress fails the pending message once", func(t *testing.T) {
 		g := newFixture(t, nil)
 		g.prewarm(t)
-		g.srv.set(func(s *assetServer) { s.hold["model.gguf"] = make(chan struct{}) })
-		m := g.managed(t, func(c *ManagedConfig) {
-			c.StallTimeout = 200 * time.Millisecond
-			c.SetupIdleTimeout = 1500 * time.Millisecond
-		})
+		g.srv.set(func(s *assetServer) { s.down["model.gguf"] = true })
+		m := g.managed(t, func(c *ManagedConfig) { c.SetupIdleTimeout = 1500 * time.Millisecond })
 		voice := voiceFile(t, g.dir, "v.ogg", "stuck")
 		rec := &recorder{}
 		_, err := transcribe(t, m, voice, rec, 300*time.Millisecond)
 		mustKind(t, err, KindPreparing)
-		// Setup keeps retrying the download, but every attempt stops at the
-		// same byte, which is not progress. Wait for it to give up.
+		// Setup keeps retrying the download (503 is transient), but no byte
+		// arrives. Wait for it to give up.
 		deadline := time.Now().Add(30 * time.Second)
 		for {
 			m.mu.Lock()
@@ -376,7 +373,7 @@ func TestFailureClassSlowSetup(t *testing.T) {
 			t.Fatalf("voice file was removed: %v", err)
 		}
 		// Once delivered, a resend starts a fresh setup and succeeds.
-		g.srv.set(func(s *assetServer) { delete(s.hold, "model.gguf") })
+		g.srv.set(func(s *assetServer) { delete(s.down, "model.gguf") })
 		if res, err := transcribe(t, m, voice, rec, time.Minute); err != nil || res.Text != "stuck part 1" {
 			t.Fatalf("resend: %+v %v", res, err)
 		}
