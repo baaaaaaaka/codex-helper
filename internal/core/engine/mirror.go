@@ -465,12 +465,8 @@ func (e *Engine) recordBaseline(baseline []store.TranscriptSource) {
 		return
 	}
 	err := e.update(func(tx *store.Tx) error {
-		for _, b := range baseline {
-			if _, err := tx.UpsertSource(b); err != nil {
-				return err
-			}
-		}
-		return nil
+		_, err := tx.UpsertSources(baseline) // one prepared statement (W1b)
+		return err
 	})
 	if err != nil {
 		e.logf("mirror baseline: %v", err)
