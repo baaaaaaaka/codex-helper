@@ -50,6 +50,10 @@ type convState struct {
 	// does not clear it.
 	scanDue bool
 	scanGen uint64
+	// scanSince is when the scan first marked the change not read yet:
+	// flagged chats are read oldest flag first (S7b), so one whose read
+	// drew a throttle is not overtaken by newer flags.
+	scanSince time.Time
 	// ownPosts are the ids of the messages this helper sent last (S7): a
 	// scan whose newest message is one of them shows no new message.
 	ownPosts []string

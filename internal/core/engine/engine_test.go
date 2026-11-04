@@ -1518,6 +1518,36 @@ func TestScanSkipsTheHelpersOwnPostOnlyInAPolledChat(t *testing.T) {
 	}
 }
 
+// S7b: scan-flagged chats are read oldest flag first. A flagged chat
+// whose read drew a throttle keeps its place: newer flags, whose next read
+// is earlier, do not overtake it; a later scan of the same chat does not
+// renew its flag time.
+func TestFlaggedChatsReadOldestFlagFirst(t *testing.T) {
+	t0 := time.Unix(10_000, 0)
+	e := &Engine{t: ProductionTiming(), gRead: "read", gates: map[string]time.Time{},
+		convs: map[int64]*convState{}, byChat: map[string]int64{}, scanner: &lagScanner{}}
+	for id := int64(1); id <= 3; id++ {
+		chat := fmt.Sprintf("chat-%d", id)
+		e.convs[id] = &convState{kind: store.KindWork, state: store.ConvActive, chat: chat, nextRead: t0.Add(time.Hour)}
+		e.byChat[chat] = id
+	}
+	scan := func(at time.Time, id int64, last string) {
+		e.markScanned([]channel.ChatActivity{{Chat: fmt.Sprintf("chat-%d", id), LastID: last, Last: at}}, t0.Add(-time.Minute), at)
+	}
+	scan(t0, 1, "a1")                              // chat 1 flagged first; its read draws a 429
+	e.convs[1].nextRead = t0.Add(35 * time.Second) // pushed back by the throttle
+	scan(t0.Add(10*time.Second), 2, "b1")          // chat 2 flagged later
+	scan(t0.Add(20*time.Second), 1, "a2")          // a newer message in chat 1: same flag
+	e.convs[3].nextRead = t0                       // a timed poll, overdue the longest
+	got := e.dueReads(t0.Add(40 * time.Second))
+	if want := []int64{1, 2, 3}; !slices.Equal(got, want) {
+		t.Fatalf("read order %v, want %v (oldest flag first, then timed polls)", got, want)
+	}
+	if !e.convs[1].scanSince.Equal(t0) {
+		t.Fatalf("chat 1 flag time %s after a second scan, want the first", e.convs[1].scanSince.Sub(t0))
+	}
+}
+
 // S7 interleave: a user message posted just before the helper's own post in
 // a chat that is not polled (idle, scan mode) must not wait for the safety
 // read. The scan shows the helper's post as the newest; the chat is read

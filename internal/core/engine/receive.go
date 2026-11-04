@@ -159,6 +159,9 @@ func (e *Engine) dueReads(now time.Time) []int64 {
 		if a.scanDue != b.scanDue {
 			return a.scanDue // a change the scan showed goes before timed polls
 		}
+		if a.scanDue && !a.scanSince.Equal(b.scanSince) {
+			return a.scanSince.Before(b.scanSince) // the oldest flag first (S7b)
+		}
 		if !a.nextRead.Equal(b.nextRead) {
 			return a.nextRead.Before(b.nextRead)
 		}
@@ -260,12 +263,20 @@ func (e *Engine) read(ctx context.Context, id int64) {
 			cs.nextRead = now
 		}
 		cs.scanDue = cs.scanGen != gen
+		if !cs.scanDue {
+			cs.scanSince = time.Time{}
+		}
 		return
 	}
 	var tl *channel.WindowTooLarge
 	if th, ok := channel.AsThrottled(err); ok {
 		until := now.Add(e.retryAfter(th) + time.Duration(id%7)*e.t.Tick)
 		cs.nextRead = until
+		if cs.scanDue && th.Scope != channel.ScopeChat {
+			// A flagged chat is due again the moment the account gate
+			// reopens, and goes first then (S7b): the gate holds it.
+			cs.nextRead = now
+		}
 		if th.Scope != channel.ScopeChat {
 			e.mu.Unlock()
 			e.readThrottled(start, until, "read throttled")
@@ -975,6 +986,9 @@ func (e *Engine) markScanned(acts []channel.ChatActivity, mark, now time.Time) (
 				woke = true
 			}
 			continue
+		}
+		if !cs.scanDue {
+			cs.scanSince = now
 		}
 		cs.scanDue = true
 		cs.scanGen++
