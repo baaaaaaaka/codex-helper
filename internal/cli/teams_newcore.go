@@ -226,6 +226,23 @@ func teamsBootID() string {
 	return strings.TrimSpace(string(raw))
 }
 
+// teamsCorePIDFile is this host's record of its Codex app-server process
+// groups. It is per host: on a shared (NFS) home a helper that takes over
+// from another host must not kill pids that only mean something there, and
+// two hosts must not overwrite each other's record.
+func teamsCorePIDFile(dir, host string) string {
+	name := strings.Map(func(r rune) rune {
+		if r == '-' || r == '.' || r == '_' || ('0' <= r && r <= '9') || ('a' <= r && r <= 'z') || ('A' <= r && r <= 'Z') {
+			return r
+		}
+		return '_'
+	}, strings.TrimSpace(host))
+	if name == "" {
+		return filepath.Join(dir, "core-app-servers.pid")
+	}
+	return filepath.Join(dir, "core-app-servers."+name+".pid")
+}
+
 // runTeamsNewCore runs the new core until it is stopped. engine.ErrRestart
 // becomes exit code 75.
 func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOptions) error {
@@ -333,7 +350,7 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 	}
 	ag := codexagent.New(codexagent.Config{
 		Server:  server,
-		PIDFile: filepath.Join(dir, "core-app-servers.pid"),
+		PIDFile: teamsCorePIDFile(dir, host),
 		Idle:    10 * time.Minute,
 		Poll:    2 * time.Second,
 		Log:     out,

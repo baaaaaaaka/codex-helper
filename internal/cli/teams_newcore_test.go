@@ -225,3 +225,19 @@ func TestServiceUnitRestartsOnExit75(t *testing.T) {
 		t.Fatal("the store override is not carried into the service environment")
 	}
 }
+
+// The app-server PID file is per host: a helper taking over a shared home
+// from another host never reads (and kills) that host's pids.
+func TestTeamsCorePIDFileIsPerHost(t *testing.T) {
+	dir := t.TempDir()
+	a, b := teamsCorePIDFile(dir, "login-01"), teamsCorePIDFile(dir, "compute-7.cluster")
+	if a == b || filepath.Dir(a) != dir || filepath.Dir(b) != dir {
+		t.Fatalf("pid files %q and %q", a, b)
+	}
+	if got := teamsCorePIDFile(dir, "../x/y"); filepath.Dir(got) != dir {
+		t.Fatalf("host name escapes the state dir: %q", got)
+	}
+	if got := teamsCorePIDFile(dir, ""); filepath.Base(got) != "core-app-servers.pid" {
+		t.Fatalf("no host: %q", got)
+	}
+}
