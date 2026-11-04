@@ -888,3 +888,38 @@ func TestSenderServesChatsRoundRobin(t *testing.T) {
 		t.Fatalf("posts per chat after 30 sends: %v, want an even spread (each >= 2, spread <= 2)", got)
 	}
 }
+
+// slowModels blocks Models until released (a Codex slow to start).
+type slowModels struct {
+	*fakeAgent
+	release chan struct{}
+}
+
+func (a slowModels) Models(ctx context.Context) ([]Model, error) {
+	select {
+	case <-a.release:
+	case <-ctx.Done():
+	}
+	return nil, errors.New("test: no models")
+}
+
+// Review M2: a slow command does not delay `helper cancel` in the same chat
+// nor prompts and commands elsewhere.
+func TestSlowCommandDoesNotBlockCancelOrOtherChats(t *testing.T) {
+	release := make(chan struct{})
+	r := newRig(t, func(c *Config) { c.Agent = slowModels{c.Agent.(*fakeAgent), release} })
+	defer close(release)
+	work := r.newWork(t.TempDir())
+	ctl := r.control()
+	r.ch.PostUser(work, "helper model list")
+	time.Sleep(200 * time.Millisecond)
+	r.ch.PostUser(work, "helper cancel")
+	r.wait("cancel reply while model is stuck", func() bool { return len(r.own(work, "Nothing to cancel")) == 1 })
+	r.ch.PostUser(ctl, "status")
+	r.wait("control status while model is stuck", func() bool { return len(r.own(ctl, "sessions (")) == 1 })
+	r.ch.PostUser(work, "prompt during model")
+	r.wait("prompt answered while model is stuck", func() bool { return len(r.own(work, "ANSWER to prompt during model")) == 1 })
+	if n := len(r.own(work, "did not list its models")); n != 0 {
+		t.Fatalf("model command finished early (%d replies)", n)
+	}
+}

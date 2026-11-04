@@ -64,7 +64,7 @@ func (e *Engine) loadGates() error {
 // rehashLegacy replaces imported legacy body hashes with the adapter's
 // hash once, at the first start after a migration.
 func (e *Engine) rehashLegacy() error {
-	h, ok := e.ch.(channel.BodyHasher)
+	h, ok := e.cfg.Channel.(channel.BodyHasher)
 	if !ok {
 		return nil
 	}

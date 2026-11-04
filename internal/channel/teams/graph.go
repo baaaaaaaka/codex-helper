@@ -38,7 +38,13 @@ type graph struct {
 	http   *http.Client
 	tokens TokenSource
 	sleep  func(context.Context, time.Duration) error
+	// timeout bounds one request; transfer one download or large upload
+	// body. Zero: no bound beyond ctx.
+	timeout, transfer time.Duration
 }
+
+// transferBody is the request body size from which transfer applies.
+const transferBody = 1 << 20
 
 type call struct {
 	method string
@@ -160,6 +166,15 @@ func (g *graph) send(ctx context.Context, c call) (response, string, error) {
 		if err != nil {
 			return response{}, "", authErr(err)
 		}
+	}
+	bound := g.timeout
+	if c.sink != nil || len(c.body) >= transferBody {
+		bound = g.transfer
+	}
+	if bound > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, bound)
+		defer cancel()
 	}
 	var body io.Reader
 	if c.body != nil {

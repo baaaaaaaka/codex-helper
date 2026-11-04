@@ -22,16 +22,72 @@ type cmdJob struct {
 	quote   string
 }
 
-// commandLoop executes commands one at a time, in admission order.
+// commandLoop dispatches commands without running them, so admission never
+// waits on a slow command (review M2). Commands of one conversation run in
+// admission order on that conversation's worker; conversations run in
+// parallel. Urgent commands (cancel, status, help) run at once, so a slow
+// `model` or `fork` never delays `helper cancel`.
 func (e *Engine) commandLoop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case j := <-e.cmdQueue:
-			e.runCommand(ctx, j)
+			e.dispatchCommand(ctx, j)
 		}
 	}
+}
+
+func (e *Engine) dispatchCommand(ctx context.Context, j cmdJob) {
+	if urgentCommand(j.text) {
+		e.wg.Add(1)
+		go func() {
+			defer e.wg.Done()
+			e.runCommand(ctx, j)
+		}()
+		return
+	}
+	e.cmdMu.Lock()
+	defer e.cmdMu.Unlock()
+	q, busy := e.cmdPending[j.conv]
+	e.cmdPending[j.conv] = append(q, j)
+	if busy {
+		return
+	}
+	e.wg.Add(1)
+	go func() {
+		defer e.wg.Done()
+		for {
+			e.cmdMu.Lock()
+			q := e.cmdPending[j.conv]
+			if len(q) == 0 || ctx.Err() != nil {
+				delete(e.cmdPending, j.conv)
+				e.cmdMu.Unlock()
+				return
+			}
+			next := q[0]
+			e.cmdPending[j.conv] = q[1:]
+			e.cmdMu.Unlock()
+			e.runCommand(ctx, next)
+		}
+	}()
+}
+
+// urgentCommand: commands that must not wait behind another command of
+// the same chat. They only read state or stop work.
+func urgentCommand(text string) bool {
+	f := strings.Fields(strings.ToLower(text))
+	if len(f) > 0 && f[0] == "helper" {
+		f = f[1:]
+	}
+	if len(f) == 0 {
+		return false
+	}
+	switch f[0] {
+	case "cancel", "stop", "status", "st", "help", "?":
+		return true
+	}
+	return false
 }
 
 // requeueCommands re-runs commands admitted but not finished before the

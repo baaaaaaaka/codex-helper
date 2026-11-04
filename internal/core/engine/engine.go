@@ -164,6 +164,8 @@ type Engine struct {
 	resolverWake chan struct{}
 	mirrorWake   chan struct{}
 	cmdQueue     chan cmdJob
+	cmdMu        sync.Mutex
+	cmdPending   map[int64][]cmdJob // per-conversation command queues; present while a worker runs
 	asrWake      chan struct{}
 	fileTries    map[string]int      // transient attachment failures by "<inbound>/<idx>"
 	uploadAt     map[int64]time.Time // outbound file rows waiting before an upload retry
@@ -231,15 +233,15 @@ func New(cfg Config) (*Engine, error) {
 		cfg.WriteRate = 4
 	}
 	e := &Engine{
-		cfg: cfg, st: cfg.Store, ch: cfg.Channel, ag: cfg.Agent, t: cfg.Timing, log: cfg.Log, now: cfg.Now,
+		cfg: cfg, st: cfg.Store, ch: timedChannel{cfg.Channel}, ag: cfg.Agent, t: cfg.Timing, log: cfg.Log, now: cfg.Now,
 		gRead: store.AccountReadGate(cfg.ChannelName), gWrite: store.AccountWriteGate(cfg.ChannelName),
 		convs: map[int64]*convState{}, intro: map[int64]string{}, forkThreads: map[string]bool{}, byChat: map[string]int64{}, byThread: map[string]int64{},
 		runnerWake: make(chan struct{}, 1), runnerDirty: map[int64]bool{},
 		senderWake: make(chan struct{}, 1), resolverWake: make(chan struct{}, 1),
-		mirrorWake: make(chan struct{}, 1), cmdQueue: make(chan cmdJob, 256), asrWake: make(chan struct{}, 1), fileTries: map[string]int{}, uploadAt: map[int64]time.Time{},
+		mirrorWake: make(chan struct{}, 1), cmdQueue: make(chan cmdJob, 256), cmdPending: map[int64][]cmdJob{}, asrWake: make(chan struct{}, 1), fileTries: map[string]int{}, uploadAt: map[int64]time.Time{},
 	}
 	if sc, ok := cfg.Channel.(channel.ActivityScanner); ok && cfg.ActivityScan && e.t.ScanInterval > 0 {
-		e.scanner = sc
+		e.scanner = timedScanner{sc}
 	}
 	e.readTokens = newBucket(cfg.ReadRate, cfg.ReadRate*2, e.now)
 	e.writeTokens = newBucket(cfg.WriteRate, cfg.WriteRate*2, e.now)

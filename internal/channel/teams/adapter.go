@@ -26,7 +26,7 @@ import (
 // Config configures an Adapter. Only Tokens is required.
 type Config struct {
 	GraphURL string       // default https://graph.microsoft.com/v1.0
-	HTTP     *http.Client // default: no whole-request timeout (uploads stream); requests use ctx deadlines
+	HTTP     *http.Client // default: no client-wide timeout; each request gets RequestTimeout or TransferTimeout
 	Tokens   TokenSource
 	TenantID string // for chat links
 
@@ -44,6 +44,12 @@ type Config struct {
 	UploadFolder string
 	// ChunkSize is the resumable upload chunk (multiple of 320 KiB). Default 10 MiB.
 	ChunkSize int64
+	// RequestTimeout bounds one Graph request, so a stalled connection
+	// cannot pin a chat. Default 60 s.
+	RequestTimeout time.Duration
+	// TransferTimeout bounds one download or upload-chunk request.
+	// Default 10 min.
+	TransferTimeout time.Duration
 
 	Now   func() time.Time
 	Sleep func(context.Context, time.Duration) error
@@ -102,13 +108,19 @@ func New(cfg Config) (*Adapter, error) {
 	if cfg.ChunkSize <= 0 || cfg.ChunkSize%(320<<10) != 0 {
 		cfg.ChunkSize = 10 << 20
 	}
+	if cfg.RequestTimeout <= 0 {
+		cfg.RequestTimeout = 60 * time.Second
+	}
+	if cfg.TransferTimeout <= 0 {
+		cfg.TransferTimeout = 10 * time.Minute
+	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
 	if cfg.Sleep == nil {
 		cfg.Sleep = sleepCtx
 	}
-	return &Adapter{cfg: cfg, g: &graph{base: base, http: cfg.HTTP, tokens: cfg.Tokens, sleep: cfg.Sleep}}, nil
+	return &Adapter{cfg: cfg, g: &graph{base: base, http: cfg.HTTP, tokens: cfg.Tokens, sleep: cfg.Sleep, timeout: cfg.RequestTimeout, transfer: cfg.TransferTimeout}}, nil
 }
 
 func (a *Adapter) Caps() channel.Caps {
