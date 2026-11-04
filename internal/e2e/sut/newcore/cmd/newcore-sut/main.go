@@ -27,6 +27,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/channel/teams"
 	"github.com/baaaaaaaka/codex-helper/internal/core/codex"
 	"github.com/baaaaaaaka/codex-helper/internal/core/codexagent"
+	"github.com/baaaaaaaka/codex-helper/internal/core/delegate"
 	"github.com/baaaaaaaka/codex-helper/internal/core/engine"
 	"github.com/baaaaaaaka/codex-helper/internal/core/skillcmd"
 	"github.com/baaaaaaaka/codex-helper/internal/core/store"
@@ -167,6 +168,11 @@ func run() error {
 	}
 	if codexHome != "" {
 		cfg.SessionsDir = filepath.Join(codexHome, "sessions")
+	}
+	if cfg.Registry {
+		// The worker side of cross-machine delegation; the machine id is
+		// the one the inbox title names.
+		cfg.Delegations = delegate.New(machine)
 	}
 	if url := os.Getenv(EnvWorkflowWebhook); url != "" {
 		cfg.Notifier = teams.NewWorkflowNotifier(url, client)
