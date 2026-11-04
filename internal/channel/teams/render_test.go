@@ -287,3 +287,20 @@ func TestSafeTeX(t *testing.T) {
 		}
 	}
 }
+
+// A row with more cells than the header keeps the extra text in its last
+// column (v0.1.20 behaviour). A prompt pasted as a table row followed by
+// the question on the same line lost the question.
+func TestRenderTableKeepsCellsPastTheHeader(t *testing.T) {
+	_, a := newFake(t, fakegraph.Options{})
+	md := "|  |  |  |\n|---|---|---|\n| 重写 | 修改已有行 | 缓存失效 |  什么情况下会出现这种 case？ | 另外\nafter"
+	p := renderOne(t, a, channel.RichDoc{Label: "User", Markdown: md})
+	c := decodePart(t, p).Body.Content
+	want := "<td>重写</td><td>修改已有行</td><td>缓存失效 | 什么情况下会出现这种 case？ | 另外</td></tr></table>"
+	if !strings.Contains(c, want) {
+		t.Fatalf("extra cells lost:\n%s", c)
+	}
+	if !strings.Contains(c, "after") {
+		t.Fatalf("text after the table lost:\n%s", c)
+	}
+}
