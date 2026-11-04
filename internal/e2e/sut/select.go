@@ -23,7 +23,7 @@ import (
 //	newcore         the rebuilt core (internal/core/engine) as a subprocess:
 //	                real channel/teams adapter, codexagent + fake app-server
 //	cxp             the new core through the production entry point:
-//	                `cxp teams run --core=new` (e2e build tag)
+//	                `cxp teams run` (e2e build tag)
 const EnvSUT = "E2E_SUT"
 
 // Run is the TestMain body of every scenario package: it selects the SUT,

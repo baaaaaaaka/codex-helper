@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -10,6 +9,7 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/core/migrate"
 	corestore "github.com/baaaaaaaka/codex-helper/internal/core/store"
@@ -22,28 +22,6 @@ func writeFile(t *testing.T, path, body string) {
 	}
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
-	}
-}
-
-func TestTeamsNewCoreSelection(t *testing.T) {
-	for _, c := range []struct {
-		flag, env string
-		want      bool
-		err       bool
-	}{
-		{"", "", false, false},
-		{"old", "new", false, false},
-		{"new", "", true, false},
-		{"", "new", true, false},
-		{"", "NEW", true, false},
-		{"", "old", false, false},
-		{"bogus", "", false, true},
-	} {
-		t.Setenv(envTeamsCore, c.env)
-		got, err := teamsNewCoreSelected(c.flag)
-		if got != c.want || (err != nil) != c.err {
-			t.Errorf("flag %q env %q: %v, %v; want %v, error %v", c.flag, c.env, got, err, c.want, c.err)
-		}
 	}
 }
 
@@ -109,16 +87,15 @@ func TestTeamsCoreStoreResolution(t *testing.T) {
 	})
 }
 
-// `cxp teams run --core=new` on an old store stops before touching it.
+// `cxp teams run` on an old store stops before touching it.
 func TestTeamsRunNewCoreRefusesUnconvertedStore(t *testing.T) {
 	state := t.TempDir()
 	t.Setenv("CODEX_HELPER_STATE_DIR", state)
 	t.Setenv("HOME", t.TempDir())
-	t.Setenv(envTeamsCore, "")
 	t.Setenv(envTeamsCoreStore, "")
 	writeFile(t, filepath.Join(state, "teams", "state.json"), "{}")
 	cmd := newRootCmd()
-	cmd.SetArgs([]string{"teams", "run", "--core=new", "--auto-service=false", "--auto-update=false"})
+	cmd.SetArgs([]string{"teams", "run", "--auto-service=false", "--auto-update=false"})
 	cmd.SetOut(&strings.Builder{})
 	cmd.SetErr(&strings.Builder{})
 	err := cmd.Execute()
@@ -190,25 +167,20 @@ func TestExitCodeForRestart(t *testing.T) {
 	}
 }
 
-func TestNewCoreServiceUnitRestartsOnExit75(t *testing.T) {
+func TestServiceUnitRestartsOnExit75(t *testing.T) {
 	spec := teamsServiceSpec{Executable: "/usr/bin/cxp", WorkingDir: "/w", RegistryPath: "/r.json",
 		Environment: map[string]string{"CODEX_HELPER_TEAMS_SERVICE": "1"}}
-	old := buildTeamsServiceUnit(spec)
-	if !strings.Contains(old, "Restart=on-failure\n") || strings.Contains(old, "RestartForceExitStatus") {
-		t.Fatalf("old core unit changed:\n%s", old)
-	}
-	spec.Environment[envTeamsCore] = "new"
 	unit := buildTeamsServiceUnit(spec)
-	for _, want := range []string{"Restart=always\n", "RestartForceExitStatus=75\n", "Environment=" + envTeamsCore + "=new\n"} {
+	for _, want := range []string{"Restart=always\n", "RestartForceExitStatus=75\n", "RestartSec=10s\n"} {
 		if !strings.Contains(unit, want) {
-			t.Fatalf("new core unit lacks %q:\n%s", want, unit)
+			t.Fatalf("unit lacks %q:\n%s", want, unit)
 		}
 	}
-	if strings.Contains(unit, "Restart=on-failure") {
-		t.Fatalf("new core unit keeps Restart=on-failure:\n%s", unit)
+	if strings.Contains(unit, "Restart=on-failure") || strings.Contains(unit, "CODEX_HELPER_TEAMS_CORE=") {
+		t.Fatalf("unit keeps an old setting:\n%s", unit)
 	}
-	if !teamsServiceEnvironmentNameAllowed(envTeamsCore) || !teamsServiceEnvironmentNameAllowed(envTeamsCoreStore) {
-		t.Fatal("the core selection is not carried into the service environment")
+	if !teamsServiceEnvironmentNameAllowed(envTeamsCoreStore) {
+		t.Fatal("the store override is not carried into the service environment")
 	}
 }
 
@@ -232,38 +204,23 @@ func TestLocalSupervisorRestartsPromptlyAfterExit75(t *testing.T) {
 	}
 }
 
-// Under the new core neither the local supervisor nor the watchdog judges
-// the helper from the old store's heartbeats (which would only look stale
-// and restart a healthy helper).
-func TestNewCoreNotJudgedFromOldStore(t *testing.T) {
-	prevCheck, prevCollect := teamsServiceLocalSupervisorCheckChildHealth, teamsServiceWatchdogCollectSnapshot
-	t.Cleanup(func() {
-		teamsServiceLocalSupervisorCheckChildHealth, teamsServiceWatchdogCollectSnapshot = prevCheck, prevCollect
-	})
-	checked, collected := 0, 0
-	teamsServiceLocalSupervisorCheckChildHealth = func(context.Context, *teamsServiceWatchdogState) (teamsServiceWatchdogDecision, error) {
-		checked++
-		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionRestart, Reason: "helper owner heartbeat is stale"}, nil
+// Exit 75 (restart on the same state) restarts the helper under every
+// supervisor: launchd keeps a non-zero exit alive, the WSL Startup loop
+// restarts after any exit, and on Windows the watchdog task starts the
+// stopped task (systemd and the local supervisor are covered above).
+func TestEverySupervisorRestartsAfterExit75(t *testing.T) {
+	spec := teamsServiceSpec{Executable: "/usr/local/bin/cxp", WorkingDir: "/w"}
+	plist := buildTeamsServiceLaunchAgentPlist(spec)
+	if !strings.Contains(plist, "<key>SuccessfulExit</key>\n\t\t<false/>") {
+		t.Fatalf("launchd plist does not restart a non-zero exit:\n%s", plist)
 	}
-	teamsServiceWatchdogCollectSnapshot = func(context.Context, teamsServiceWatchdogOptions) (teamsServiceWatchdogSnapshot, error) {
-		collected++
-		return teamsServiceWatchdogSnapshot{}, errors.New("old store read")
+	script := buildTeamsServiceWSLStartupWatchdogScript("task", []string{"-d", "Ubuntu", "--", "cxp", "teams", "run"}, "s")
+	if !strings.Contains(script, "while ($true)") || !strings.Contains(script, "restarting in 10s") {
+		t.Fatalf("WSL Startup loop does not restart after an exit:\n%s", script)
 	}
-
-	var state teamsServiceWatchdogState
-	cfg := teamsServiceLocalSupervisorConfig{Spec: teamsServiceSpec{Environment: map[string]string{envTeamsCore: "new"}}}
-	d, err := teamsServiceLocalSupervisorChildHealth(context.Background(), cfg, &state)
-	if err != nil || d.Action != teamsServiceWatchdogActionNoop || checked != 0 {
-		t.Fatalf("new core: %+v, %v, old check ran %d times", d, err, checked)
-	}
-	cfg.Spec.Environment = map[string]string{}
-	if d, _ := teamsServiceLocalSupervisorChildHealth(context.Background(), cfg, &state); d.Action != teamsServiceWatchdogActionRestart || checked != 1 {
-		t.Fatalf("old core: %+v, checked %d", d, checked)
-	}
-
-	t.Setenv(envTeamsCore, "new")
-	res, err := runTeamsServiceWatchdogOnce(context.Background(), teamsServiceWatchdogOptions{})
-	if err != nil || res.Decision.Action != teamsServiceWatchdogActionNoop || collected != 0 {
-		t.Fatalf("watchdog under the new core: %+v, %v, old store read %d times", res.Decision, err, collected)
+	d := evaluateTeamsServiceWatchdog(teamsServiceWatchdogSnapshot{Installed: true, Active: false},
+		teamsServiceWatchdogState{LastActionAt: time.Now()}, teamsServiceWatchdogOptions{})
+	if d.Action != teamsServiceWatchdogActionStart {
+		t.Fatalf("watchdog does not start a stopped service: %+v", d)
 	}
 }

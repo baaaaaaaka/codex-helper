@@ -1,5 +1,5 @@
 // Package entry holds black-box Teams E2E scenarios for the production entry
-// point of the new core, `cxp teams run --core=new` (E2E_SUT=cxp): where it
+// point of the new core, `cxp teams run` (E2E_SUT=cxp): where it
 // keeps its store, and that an old store is never converted implicitly.
 // Under other SUTs the scenarios are skipped.
 //

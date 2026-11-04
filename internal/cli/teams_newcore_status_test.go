@@ -2,6 +2,7 @@ package cli
 
 import (
 	"bytes"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -60,12 +61,11 @@ func TestTeamsNewCoreServiceStatusReadsStore(t *testing.T) {
 	}
 
 	t.Setenv(envTeamsCoreStore, path)
-	t.Setenv(envTeamsCore, "")
 	var out bytes.Buffer
 	writeTeamsNewCoreStatus(&out, time.Now())
 	got := out.String()
 	for _, want := range []string{
-		"Teams helper (new core)", "Store: " + path,
+		"Teams helper", "Store: " + path,
 		"Owner: box pid 4242", "(live)",
 		"Running version: v9.9.9",
 		"Helper update: v10.0.0 scheduled",
@@ -91,21 +91,39 @@ func TestTeamsNewCoreServiceStatusReadsStore(t *testing.T) {
 	}
 }
 
-// Without a new-core store and with the old core selected, status adds
-// nothing; with the new core selected it says the store is missing.
+// Without a store, status says so instead of creating one.
 func TestTeamsNewCoreServiceStatusWithoutStore(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("CODEX_HELPER_STATE_DIR", filepath.Join(dir, "state"))
-	t.Setenv(envTeamsCoreStore, filepath.Join(dir, "missing", "core.sqlite"))
-	t.Setenv(envTeamsCore, "")
+	missing := filepath.Join(dir, "missing", "core.sqlite")
+	t.Setenv(envTeamsCoreStore, missing)
 	var out bytes.Buffer
 	writeTeamsNewCoreStatus(&out, time.Now())
-	if out.Len() != 0 {
-		t.Errorf("old core status gained: %q", out.String())
+	if !strings.Contains(out.String(), "Store: none yet") {
+		t.Errorf("status without a store: %q", out.String())
 	}
-	t.Setenv(envTeamsCore, "new")
-	writeTeamsNewCoreStatus(&out, time.Now())
-	if !strings.Contains(out.String(), "no store yet") {
-		t.Errorf("new core without store: %q", out.String())
+	if _, err := os.Stat(missing); !os.IsNotExist(err) {
+		t.Errorf("status created the store: %v", err)
+	}
+}
+
+// `cxp teams status` reads auth and the store locally.
+func TestTeamsStatusCommandReadsStore(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CODEX_HELPER_STATE_DIR", filepath.Join(dir, "state"))
+	t.Setenv("HOME", dir)
+	t.Setenv(envTeamsCoreStore, filepath.Join(dir, "missing", "core.sqlite"))
+	cmd := newRootCmd()
+	var out strings.Builder
+	cmd.SetArgs([]string{"teams", "status"})
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Teams helper", "Auth:", "Store: none yet"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("teams status lacks %q:\n%s", want, out.String())
+		}
 	}
 }

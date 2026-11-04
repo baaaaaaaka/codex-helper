@@ -27,15 +27,15 @@ func teamsDir(s *harness.Scenario) string {
 	return filepath.Join(s.Env.StateDir, "codex-helper", "teams")
 }
 
-// ENTRY-FRESH: on a machine where no older helper ever ran, `cxp teams run
-// --core=new` creates its store in the Teams state directory and serves the
-// owner; a restart runs on the same store.
+// ENTRY-FRESH: on a machine where no older helper ever ran, `cxp teams run`
+// creates its store in the Teams state directory and serves the owner; a
+// restart runs on the same store.
 func TestEntryFreshInstall(t *testing.T) {
 	cxpOnly(t)
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "ENTRY-FRESH", harness.Options{
 		Guarantees: []string{"entry-point"},
-		Title:      "`cxp teams run --core=new` on a fresh machine: new store, work served, same store after a restart",
+		Title:      "`cxp teams run` on a fresh machine: new store, work served, same store after a restart",
 		Budget:     120 * time.Second,
 	})
 	defer s.Finish()

@@ -258,34 +258,6 @@ func TestTeamsCodexUpgradeInvalidatesOfficialCatalogCache(t *testing.T) {
 	}
 }
 
-func TestTeamsRuntimeWiringGuard(t *testing.T) {
-	source, err := os.ReadFile("teams.go")
-	if os.IsNotExist(err) {
-		t.Skip("source-tree wiring audit is unavailable in packaged binary smoke tests")
-	}
-	if err != nil {
-		t.Fatal(err)
-	}
-	text := string(source)
-	for _, required := range []string{
-		"officialRuntimeResolver := newTeamsCodexRuntimeResolver",
-		"newTeamsModelProfileManagerWithRuntime(root, officialRuntimeResolver)",
-		"newTeamsModelProfileResolverWithRuntime(root, officialRuntimeResolver)",
-	} {
-		if !strings.Contains(text, required) {
-			t.Fatalf("Teams runtime wiring lost required shared-contract expression %q", required)
-		}
-	}
-	for _, forbidden := range []string{
-		"ModelProfileManager:                newTeamsModelProfileManager(root, codexPath)",
-		"ModelProfileResolver:               newTeamsModelProfileResolver(root, codexPath)",
-	} {
-		if strings.Contains(text, forbidden) {
-			t.Fatalf("Teams runtime wiring regressed to a raw Codex path: %q", forbidden)
-		}
-	}
-}
-
 func TestTeamsBareCodexAuditHasNoUnreviewedConsumers(t *testing.T) {
 	// These are the only reviewed compatibility defaults. They do not execute
 	// the Teams service's model/auth/catalog path: the app-server starter

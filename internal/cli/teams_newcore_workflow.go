@@ -21,24 +21,16 @@ import (
 	corestore "github.com/baaaaaaaka/codex-helper/internal/core/store"
 )
 
-// teamsNewCoreCLIStorePath returns the new core's store for the teams
-// commands a user runs (status, workflow). It is used when the new core is
-// selected (CODEX_HELPER_TEAMS_CORE=new) or its store exists; use is false
-// otherwise and the old core's commands run. err is only set when used.
+// teamsNewCoreCLIStorePath returns the Teams helper's store for the
+// commands a user runs (status, workflow). use is false when the store
+// cannot be located (err says why).
 func teamsNewCoreCLIStorePath() (path string, use bool, err error) {
-	selected := teamsEnvSelectsNewCore(map[string]string{envTeamsCore: os.Getenv(envTeamsCore)})
 	stateDir, err := appdirs.StateDir()
 	if err != nil {
-		return "", selected, fmt.Errorf("state directory: %w", err)
+		return "", true, fmt.Errorf("state directory: %w", err)
 	}
 	path, err = resolveTeamsCoreStorePath(stateDir)
-	if err != nil {
-		return "", selected, err
-	}
-	if _, statErr := os.Stat(path); statErr == nil {
-		return path, true, nil
-	}
-	return path, selected, nil
+	return path, true, err
 }
 
 // errTeamsHelperRunning means a live helper owns the store, so only it may

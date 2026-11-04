@@ -1,37 +1,41 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strings"
 	"time"
 
+	chteams "github.com/baaaaaaaka/codex-helper/internal/channel/teams"
 	"github.com/baaaaaaaka/codex-helper/internal/core/delegate"
 	"github.com/baaaaaaaka/codex-helper/internal/core/engine"
 	"github.com/baaaaaaaka/codex-helper/internal/core/migrate"
 	corestore "github.com/baaaaaaaka/codex-helper/internal/core/store"
 )
 
-// writeTeamsNewCoreStatus appends the new core's state to `teams service
+// writeTeamsNewCoreStatus appends the helper's state to `teams service
 // status`, read from its store without taking ownership: the owner and its
 // heartbeat, the running and pending versions (R-17), conversations, turns,
-// unsent messages, Workflow cards and the registry machine id. It writes
-// nothing when the new core is neither selected nor has a store.
+// unsent messages, Workflow cards and the registry machine id.
 func writeTeamsNewCoreStatus(out io.Writer, now time.Time) {
-	path, use, err := teamsNewCoreCLIStorePath()
-	if !use {
-		return
-	}
+	_, _ = fmt.Fprintln(out, "\nTeams helper")
+	writeTeamsCoreStoreStatus(out, now)
+}
+
+// writeTeamsCoreStoreStatus prints the store's location and state.
+func writeTeamsCoreStoreStatus(out io.Writer, now time.Time) {
+	path, _, err := teamsNewCoreCLIStorePath()
 	if err != nil {
-		_, _ = fmt.Fprintf(out, "\nTeams helper (new core): %v\n", err)
+		_, _ = fmt.Fprintf(out, "Store: %v\n", err)
 		return
 	}
 	if _, statErr := os.Stat(path); statErr != nil {
-		_, _ = fmt.Fprintf(out, "\nTeams helper (new core): no store yet (%s)\n", path)
+		_, _ = fmt.Fprintf(out, "Store: none yet (%s)\n", path)
 		return
 	}
-	_, _ = fmt.Fprintf(out, "\nTeams helper (new core)\nStore: %s\n", path)
+	_, _ = fmt.Fprintf(out, "Store: %s\n", path)
 	st, err := corestore.OpenWith(path, corestore.Options{ReadOnly: true})
 	if err != nil {
 		_, _ = fmt.Fprintf(out, "Store unreadable: %v\n", err)
@@ -45,6 +49,43 @@ func writeTeamsNewCoreStatus(out io.Writer, now time.Time) {
 	if err != nil {
 		_, _ = fmt.Fprintf(out, "Store read error: %v\n", err)
 	}
+}
+
+// printTeamsCoreStatus is `cxp teams status` (F-CLI-1): strictly
+// read-only, local only (no Graph call), never message bodies or secrets.
+func printTeamsCoreStatus(out io.Writer, now time.Time) error {
+	_, _ = fmt.Fprintln(out, "Teams helper")
+	_, _ = fmt.Fprintf(out, "Version: %s\n", buildVersion())
+	cfg, err := chteams.ResolveAuthConfig("")
+	switch {
+	case err != nil:
+		_, _ = fmt.Fprintf(out, "Auth: not ready (%v)\n", err)
+	default:
+		_, _ = fmt.Fprintf(out, "Auth: %s\n", teamsTokenCacheStatus(cfg.CachePath, now))
+	}
+	writeTeamsCoreStoreStatus(out, now)
+	return nil
+}
+
+// teamsTokenCacheStatus describes a token cache without its contents.
+func teamsTokenCacheStatus(path string, now time.Time) string {
+	tok, err := chteams.ReadTokenCache(path)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return "not logged in (run `cxp teams auth`)"
+	case err != nil:
+		return fmt.Sprintf("token cache unreadable (%v)", err)
+	case tok.AccessToken == "" && tok.RefreshToken == "":
+		return "not logged in (run `cxp teams auth`)"
+	}
+	exp := time.Unix(tok.ExpiresAt, 0)
+	switch {
+	case tok.ExpiresAt > 0 && exp.After(now):
+		return fmt.Sprintf("logged in (access token valid for %s)", exp.Sub(now).Round(time.Minute))
+	case tok.RefreshToken != "":
+		return "logged in (access token expired; refreshed at the next use)"
+	}
+	return "expired (run `cxp teams auth`)"
 }
 
 func teamsNewCoreStatusLines(st *corestore.Store, now time.Time) ([]string, error) {

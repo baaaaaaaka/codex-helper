@@ -874,7 +874,7 @@ func defaultTeamsServiceLocalSupervisorCheckChildHealth(ctx context.Context, sta
 	if state == nil {
 		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: "health state unavailable"}, nil
 	}
-	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: time.Now()})
+	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: teamsServiceWatchdogNow()})
 	snapshot, err := collectTeamsServiceWatchdogSnapshot(ctx, opts)
 	if err != nil {
 		return teamsServiceWatchdogDecision{}, err
@@ -1030,17 +1030,10 @@ func teamsServiceLocalSupervisorRestartDelayAfter(runErr error) time.Duration {
 }
 
 // teamsServiceLocalSupervisorChildHealth decides whether the running child
-// must be restarted. The new core is never judged from the old store.
-func teamsServiceLocalSupervisorChildHealth(ctx context.Context, cfg teamsServiceLocalSupervisorConfig, state *teamsServiceWatchdogState) (teamsServiceWatchdogDecision, error) {
-	if teamsEnvSelectsNewCore(cfg.Spec.Environment) {
-		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: teamsNewCoreHealthReason}, nil
-	}
+// must be restarted (the watchdog's judgement of the store's owner).
+func teamsServiceLocalSupervisorChildHealth(ctx context.Context, _ teamsServiceLocalSupervisorConfig, state *teamsServiceWatchdogState) (teamsServiceWatchdogDecision, error) {
 	return teamsServiceLocalSupervisorCheckChildHealth(ctx, state)
 }
-
-// teamsNewCoreHealthReason: the new core's liveness is its own store lease;
-// the old store's owner heartbeat says nothing about it.
-const teamsNewCoreHealthReason = "new Teams core: health is not judged from the old store"
 
 func teamsServiceLocalSupervisorExitCode(err error) int {
 	if err == nil {

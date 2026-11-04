@@ -106,7 +106,8 @@ func TestTeamsBackgroundKeepaliveSupervisorConfigMatrixCI(t *testing.T) {
 		"Environment=CODEX_HELPER_TEAMS_SERVICE=1",
 		"Environment=CODEX_HELPER_TEAMS_SERVICE_MODE=background",
 		"Environment=HTTP_PROXY=http://127.0.0.1:38471",
-		"Restart=on-failure",
+		"Restart=always",
+		"RestartForceExitStatus=75",
 		"RestartSec=10s",
 		"WantedBy=default.target",
 	} {
@@ -115,7 +116,6 @@ func TestTeamsBackgroundKeepaliveSupervisorConfigMatrixCI(t *testing.T) {
 		}
 	}
 	for _, forbidden := range []string{
-		"Restart=always",
 		"User=root",
 		"sudo",
 		"StartLimitBurst=0",

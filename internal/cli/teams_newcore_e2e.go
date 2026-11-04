@@ -2,7 +2,7 @@
 
 package cli
 
-// The e2e build of cxp (go build -tags e2e) runs `cxp teams run --core=new`
+// The e2e build of cxp (go build -tags e2e) runs `cxp teams run`
 // inside the E2E harness (E2E_SUT=cxp): Graph and login traffic goes to the
 // fake Graph through the sandbox transport, and the poll timing is the
 // scenario's. Everything else is the production wiring. Production builds

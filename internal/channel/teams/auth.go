@@ -450,6 +450,10 @@ func postFormRaw(ctx context.Context, client *http.Client, cfg AuthConfig, endpo
 	return json.Unmarshal(data, out)
 }
 
+// ReadTokenCache reads a token cache (for status output; callers never
+// print the tokens).
+func ReadTokenCache(path string) (TokenCache, error) { return readTokenCache(path) }
+
 func readTokenCache(path string) (TokenCache, error) {
 	info, err := os.Lstat(path)
 	if err != nil {

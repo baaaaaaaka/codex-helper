@@ -20,7 +20,6 @@ func TestTeamsNewCoreWorkflowConfig(t *testing.T) {
 	tmp := t.TempDir()
 	isolateTeamsUserDirsForTest(t, tmp)
 	t.Setenv("CODEX_HELPER_STATE_DIR", filepath.Join(tmp, "state"))
-	t.Setenv(envTeamsCore, "new")
 	t.Setenv(envTeamsCoreStore, "")
 
 	secretDir := filepath.Join(tmp, "secret")

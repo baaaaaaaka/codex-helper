@@ -30,11 +30,8 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/core/voice"
 )
 
-// `cxp teams run` with the rebuilt core (internal/core/engine). It is
-// selected by the hidden --core=new flag or CODEX_HELPER_TEAMS_CORE=new;
-// the default stays the old core.
+// `cxp teams run`: the Teams helper core (internal/core/engine).
 const (
-	envTeamsCore = "CODEX_HELPER_TEAMS_CORE"
 	// envTeamsCoreStore names the core.sqlite to use when several exist.
 	envTeamsCoreStore = "CODEX_HELPER_TEAMS_CORE_STORE"
 	// teamsRestartExitCode asks the service manager to start a new
@@ -50,28 +47,6 @@ type exitCodeError struct {
 
 func (e *exitCodeError) Error() string { return e.err.Error() }
 func (e *exitCodeError) Unwrap() error { return e.err }
-
-// teamsNewCoreSelected reports whether flag (or, when the flag is empty,
-// the environment) selects the new core.
-func teamsNewCoreSelected(flag string) (bool, error) {
-	v := strings.ToLower(strings.TrimSpace(flag))
-	if v == "" {
-		v = strings.ToLower(strings.TrimSpace(os.Getenv(envTeamsCore)))
-	}
-	switch v {
-	case "", "old":
-		return false, nil
-	case "new":
-		return true, nil
-	}
-	return false, fmt.Errorf("unknown Teams core %q (use old or new)", v)
-}
-
-// teamsEnvSelectsNewCore reports whether a service environment selects the
-// new core. The service, its local supervisor and the watchdog use it.
-func teamsEnvSelectsNewCore(env map[string]string) bool {
-	return strings.EqualFold(strings.TrimSpace(env[envTeamsCore]), "new")
-}
 
 // teamsNewCoreOptions are the `teams run` flags the new core uses.
 type teamsNewCoreOptions struct {

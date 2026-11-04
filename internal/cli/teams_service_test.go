@@ -287,7 +287,7 @@ func TestTeamsServiceInstallWritesSystemdUserUnitWithoutEnabling(t *testing.T) {
 		"Description=Codex Helper Teams bridge",
 		"WorkingDirectory=" + systemdQuoteArg(stableHome),
 		"ExecStart=" + systemdQuoteArg(exePath) + " teams run --owner-stale-after 1m30s --auto-service=false --managed-service-child --registry " + strconv.Quote(registryPath),
-		"Restart=on-failure",
+		"Restart=always",
 		"RestartSec=10s",
 		"Environment=NO_COLOR=1",
 		"Environment=" + systemdQuoteArg(update.EnvInstallPath+"="+exePath),

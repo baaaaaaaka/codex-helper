@@ -1023,229 +1023,76 @@ func drainTeamsBridgeForChatRecreate(ctx context.Context, out io.Writer, timeout
 }
 
 func newTeamsRunCmd(root *rootOptions, registryPath *string) *cobra.Command {
-	var interval time.Duration
-	var once bool
-	var top int
-	var executorName string
-	var runnerName string
 	var codexPath string
-	var workDir string
 	var codexArgs []string
 	var asrCommand string
 	var asrArgs []string
-	var controlFallbackModel string
-	var timeout time.Duration
 	var ownerStaleAfter time.Duration
-	var maxWorkChatPolls int
 	var upgradeCodex bool
 	var autoUpdate bool
 	var autoUpdateRepo string
 	var autoUpdatePrerelease bool
 	var autoService bool
-	var modelProfile string
 	var machineRegistry bool
 	var managedServiceChild bool
-	var coreName string
 	cmd := &cobra.Command{
 		Use:     "run",
 		Aliases: []string{"listen"},
 		Short:   "Poll Teams chats and route session messages to Codex",
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			newCore, err := teamsNewCoreSelected(coreName)
-			if err != nil {
-				return err
-			}
-			if newCore {
-				if once {
-					return fmt.Errorf("--once is not supported by the new Teams core")
+			if autoService && !managedServiceChild {
+				// F-SVC-5: a foreground run repairs and starts the background
+				// service where one is supported; the service then runs the
+				// helper, so this terminal is not needed.
+				if err := ensureTeamsServiceForRun(cmd.Context(), registryPath, teamsServiceSpecEnvironmentOverrides(teamsASRServiceEnvironmentOverrides(asrCommand, asrArgs))); err != nil {
+					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Teams service auto-ensure warning: %v\n", err)
+				} else if active, err := teamsServiceActiveForRun(cmd.Context()); err == nil && active {
+					_, _ = fmt.Fprintln(cmd.OutOrStdout(), "The Teams helper runs as the background service; check it with `cxp teams service status`.")
+					return nil
 				}
-				if strings.TrimSpace(modelProfile) != "" {
-					// Model profiles configure third-party model providers,
-					// which the new core does not support; Codex's own models
-					// are chosen with `helper model` or --codex-arg --model.
-					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "--model-profile %s is ignored by the new Teams core\n", modelProfile)
-				}
-				if upgradeCodex {
-					if err := runTeamsUpgradeCodexOnce(cmd, root, codexPath); err != nil {
-						return err
-					}
-				}
-				return runTeamsNewCore(cmd, root, teamsNewCoreOptions{
-					codexPath:            codexPath,
-					asrCommand:           firstNonEmptyString(asrCommand, os.Getenv(envTeamsASRCommand)),
-					asrArgs:              asrArgs,
-					registry:             machineRegistry,
-					autoUpdate:           autoUpdate,
-					autoUpdateRepo:       autoUpdateRepo,
-					autoUpdatePrerelease: autoUpdatePrerelease,
-					codexArgs:            codexArgs,
-				})
 			}
 			if upgradeCodex {
 				if err := runTeamsUpgradeCodexOnce(cmd, root, codexPath); err != nil {
 					return err
 				}
 			}
-			effectiveASRCommand := firstNonEmptyString(asrCommand, os.Getenv(envTeamsASRCommand))
-			effectiveASRArgs, err := teamsASRArgsFromFlagsOrEnv(asrArgs, effectiveASRCommand != "")
-			if err != nil {
-				return err
-			}
-			runOnce := func() error {
-				autoSyncCtx, stopModelSourceAutoSync := context.WithCancel(cmd.Context())
-				defer stopModelSourceAutoSync()
-				if !once {
-					go runModelSourceAutoSyncLoop(autoSyncCtx, root, cmd.ErrOrStderr(), defaultModelSourceAutoSyncInterval)
-					go runModelCatalogAutoSyncLoop(autoSyncCtx, root, cmd.ErrOrStderr(), defaultModelSourceAutoSyncInterval)
-				}
-				if autoService && !once {
-					if err := ensureTeamsServiceForRun(cmd.Context(), registryPath, teamsServiceSpecEnvironmentOverrides(teamsASRServiceEnvironmentOverrides(asrCommand, asrArgs))); err != nil {
-						_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Teams service auto-ensure warning: %v\n", err)
-					}
-				}
-				if scheduled, err := maybeScheduleLegacyLocalSupervisorRestart(cmd.Context()); err != nil {
-					_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Teams local-supervisor upgrade activation warning: %v\n", err)
-					if noticeErr := queueLegacyLocalSupervisorActivationAttentionNoticeFromDisk(cmd.Context(), *registryPath); noticeErr != nil {
-						_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Teams local-supervisor upgrade activation notice warning: %v\n", noticeErr)
-					}
-				} else if scheduled {
-					_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "Teams local-supervisor upgrade activation scheduled; waiting briefly for supervisor handoff.")
-					if err := waitForLegacyLocalSupervisorActivationHandoff(cmd.Context()); err != nil {
-						_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Teams local-supervisor upgrade activation warning: %v\n", err)
-					} else {
-						_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "Teams local-supervisor upgrade activation did not stop this helper within the handoff window; continuing under the existing supervisor.")
-						if err := queueLegacyLocalSupervisorActivationAttentionNoticeFromDisk(cmd.Context(), *registryPath); err != nil {
-							_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Teams local-supervisor upgrade activation notice warning: %v\n", err)
-						}
-					}
-				}
-				httpClient, err := newTeamsGraphHTTPClientLease(cmd.Context(), root, cmd.ErrOrStderr())
-				if err != nil {
-					return err
-				}
-				defer func() { _ = httpClient.Close(context.Background()) }()
-				auth, err := newTeamsAuthManagerWithHTTPClient(httpClient.Client)
-				if err != nil {
-					return err
-				}
-				bridge, err := teams.NewBridgeWithHTTPClient(cmd.Context(), auth, *registryPath, cmd.OutOrStdout(), httpClient.Client)
-				if err != nil {
-					plan, actionRequired := teams.RuntimeStorePlanFromError(err)
-					if !actionRequired {
-						return err
-					}
-					if !teamsRunShouldRetryInProcess(once, managedServiceChild) {
-						return fmt.Errorf(
-							"%w; run the managed Teams service to complete offline migration",
-							err,
-						)
-					}
-					if err := completeManagedTeamsRuntimeStorePlan(cmd.Context(), plan); err != nil {
-						return err
-					}
-					bridge, err = teams.NewBridgeWithHTTPClient(cmd.Context(), auth, *registryPath, cmd.OutOrStdout(), httpClient.Client)
-					if err != nil {
-						return err
-					}
-				}
-				httpClient.RetireSuspects(cmd.Context(), cmd.ErrOrStderr())
-				executor, err := newTeamsExecutor(root, executorName, runnerName, codexPath, workDir, codexArgs, modelProfile, timeout, cmd.ErrOrStderr())
-				if err != nil {
-					return err
-				}
-				if closer, ok := executor.(interface{ Close() error }); ok {
-					defer func() { _ = closer.Close() }()
-				}
-				controlFallbackExecutor, err := newTeamsControlFallbackExecutor(root, runnerName, codexPath, workDir, codexArgs, modelProfile, controlFallbackModel, timeout, cmd.ErrOrStderr())
-				if err != nil {
-					return err
-				}
-				if closer, ok := controlFallbackExecutor.(interface{ Close() error }); ok {
-					defer func() { _ = closer.Close() }()
-				}
-				officialRuntimeResolver := newTeamsCodexRuntimeResolver(root, codexPath, workDir, cmd.ErrOrStderr())
-				modelManager := newTeamsModelProfileManagerWithRuntime(root, officialRuntimeResolver)
-				asrTranscriber := teamsASRTranscriberFromConfig(effectiveASRCommand, effectiveASRArgs)
-				var helperAutoUpdater teams.HelperAutoUpdater
-				if autoUpdate {
-					helperAutoUpdater = newTeamsReleaseAutoUpdater(autoUpdateRepo, autoUpdatePrerelease)
-				}
-				var machineRegistryGraph teams.MachineRegistryGraphAdapter
-				machineRegistryEnabled := false
-				if !once && machineRegistry {
-					registryAuth, registryErr := newTeamsAuthManagerWithHTTPClient(httpClient.Client)
-					if registryErr == nil {
-						registryGraph := teams.NewGraphClientWithHTTPClient(registryAuth, io.Discard, httpClient.Client)
-						machineRegistryGraph = teams.NewMachineRegistryGraphAdapter(registryGraph)
-						machineRegistryEnabled = true
-					} else {
-						_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Teams machine registry heartbeat disabled: Teams write auth is unavailable: %v\n", registryErr)
-					}
-				}
-				return bridge.Listen(cmd.Context(), teams.BridgeOptions{
-					RegistryPath:                       *registryPath,
-					HelperVersion:                      buildVersion(),
-					Interval:                           interval,
-					Once:                               once,
-					Top:                                top,
-					OwnerStaleAfter:                    ownerStaleAfter,
-					MaxWorkChatPollsPerCycle:           maxWorkChatPolls,
-					Executor:                           executor,
-					ControlFallbackExecutor:            controlFallbackExecutor,
-					ControlFallbackModel:               controlFallbackModel,
-					ControlFallbackHelpContext:         teamsControlFallbackHelpContext(),
-					ModelProfileResolver:               newTeamsModelProfileResolverWithRuntime(root, officialRuntimeResolver),
-					ModelProfileManager:                modelManager,
-					DefaultManager:                     modelManager,
-					ASRTranscriber:                     asrTranscriber,
-					HelperRestarter:                    restartTeamsHelperFromTeams,
-					HelperPendingRestarter:             restartTeamsHelperFromTeamsAfterPendingReplacement,
-					HelperReloader:                     reloadTeamsHelperFromTeams,
-					HelperAutoUpdater:                  helperAutoUpdater,
-					HelperAutoUpdatePrerelease:         autoUpdatePrerelease,
-					MachineRegistryEnabled:             machineRegistryEnabled,
-					MachineRegistryGraph:               machineRegistryGraph,
-					MachineDelegationClaimRecheckDelay: teams.DefaultMachineDelegationClaimRecheckDelay,
-					CodexUpgrader:                      teamsCodexUpgraderForRun(root, cmd.ErrOrStderr(), codexPath, executor, controlFallbackExecutor),
-				})
-			}
-			if teamsRunShouldRetryInProcess(once, managedServiceChild) {
-				return runTeamsServiceRetryLoop(cmd.Context(), cmd.ErrOrStderr(), runOnce)
-			}
-			return runOnce()
+			return runTeamsNewCore(cmd, root, teamsNewCoreOptions{
+				codexPath:            codexPath,
+				asrCommand:           firstNonEmptyString(asrCommand, os.Getenv(envTeamsASRCommand)),
+				asrArgs:              asrArgs,
+				registry:             machineRegistry,
+				autoUpdate:           autoUpdate,
+				autoUpdateRepo:       autoUpdateRepo,
+				autoUpdatePrerelease: autoUpdatePrerelease,
+				codexArgs:            codexArgs,
+			})
 		},
 	}
-	cmd.Flags().DurationVar(&interval, "interval", 5*time.Second, "Polling interval")
-	cmd.Flags().BoolVar(&once, "once", false, "Poll once and exit")
-	cmd.Flags().IntVar(&top, "top", 20, "Messages to inspect per chat per poll")
-	cmd.Flags().StringVar(&executorName, "executor", "codex", "Executor for session messages: codex or echo")
-	cmd.Flags().StringVar(&runnerName, "runner", "appserver", "Codex runner compatibility selector")
-	_ = cmd.Flags().MarkHidden("runner")
 	cmd.Flags().StringVar(&codexPath, "codex-path", "", "Override Codex CLI path")
-	cmd.Flags().StringVar(&workDir, "workdir", "", "Working directory for Codex sessions")
-	cmd.Flags().StringArrayVar(&codexArgs, "codex-arg", nil, "Extra argument to pass to codex exec (repeatable)")
-	cmd.Flags().StringVar(&modelProfile, "model-profile", "", "Model profile id or name for Codex launches")
+	cmd.Flags().StringArrayVar(&codexArgs, "codex-arg", nil, "Extra Codex argument for the app-server (repeatable)")
 	cmd.Flags().StringVar(&asrCommand, "asr-command", "", "Optional local Teams audio/video transcription command; stdout may be plain text or ASRTranscript JSON")
 	cmd.Flags().StringArrayVar(&asrArgs, "asr-arg", nil, "Argument for --asr-command (repeatable); placeholders: {input}, {language}, {speed}, {threads}, {source_index}, {prompt_path}, {content_type}")
 	_ = cmd.Flags().MarkHidden("asr-command")
 	_ = cmd.Flags().MarkHidden("asr-arg")
-	cmd.Flags().StringVar(&controlFallbackModel, "control-fallback-model", teams.DefaultControlFallbackModel, "Optional Codex model override for unrecognized control-chat requests; empty uses Codex default")
-	cmd.Flags().DurationVar(&timeout, "codex-timeout", 0, "Timeout for each Codex turn; 0 disables the helper-enforced turn timeout")
-	cmd.Flags().DurationVar(&ownerStaleAfter, "owner-stale-after", defaultTeamsOwnerStaleAfter, "How long a Teams helper owner can miss heartbeats before recovery or another helper may take over")
-	cmd.Flags().IntVar(&maxWorkChatPolls, "max-work-chat-polls", teams.DefaultMaxWorkChatPollsPerCycle, "Maximum work chats to read per poll cycle")
+	// Service units written by earlier releases pass --owner-stale-after; the
+	// store's owner lease has a fixed staleness bound now.
+	cmd.Flags().DurationVar(&ownerStaleAfter, "owner-stale-after", 0, "Ignored (kept for service units written by earlier releases)")
+	_ = cmd.Flags().MarkHidden("owner-stale-after")
 	cmd.Flags().BoolVar(&upgradeCodex, "upgrade-codex", false, "Upgrade Codex CLI once before starting Teams polling")
-	cmd.Flags().BoolVar(&autoUpdate, "auto-update", true, "Check codex-helper GitHub releases periodically and apply eligible p0/p1 helper updates")
+	cmd.Flags().BoolVar(&autoUpdate, "auto-update", true, "Check codex-helper GitHub releases periodically and apply eligible helper updates")
 	cmd.Flags().StringVar(&autoUpdateRepo, "auto-update-repo", "", "Override GitHub repo for Teams helper auto-update checks")
 	cmd.Flags().BoolVar(&autoUpdatePrerelease, "auto-update-prerelease", false, "Allow Teams helper auto-update checks to select eligible GitHub prereleases")
 	cmd.Flags().BoolVar(&autoService, "auto-service", true, "Automatically repair and start the per-user background service when supported")
 	cmd.Flags().BoolVar(&machineRegistry, "machine-registry", true, "Enable cross-machine Teams registry heartbeat and delegation worker")
 	cmd.Flags().BoolVar(&managedServiceChild, "managed-service-child", false, "Internal marker for a Teams service-managed listener")
 	_ = cmd.Flags().MarkHidden("managed-service-child")
-	cmd.Flags().StringVar(&coreName, "core", "", "Teams core: old (default) or new; default from "+envTeamsCore)
-	_ = cmd.Flags().MarkHidden("core")
 	return cmd
 }
+
+// teamsServiceActiveForRun reports whether the background service is
+// running the helper (tests replace it).
+var teamsServiceActiveForRun = teamsServiceActive
 
 func teamsASRArgsFromFlagsOrEnv(flagArgs []string, enabled bool) ([]string, error) {
 	if len(flagArgs) > 0 {
@@ -1894,7 +1741,7 @@ func newTeamsStatusCmd(registryPath *string) *cobra.Command {
 		Short: "Show local Teams bridge state",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return printTeamsLocalStatus(cmd, *registryPath)
+			return printTeamsCoreStatus(cmd.OutOrStdout(), time.Now())
 		},
 	}
 }
@@ -2013,7 +1860,7 @@ func newTeamsDoctorCmd(root *rootOptions, registryPath *string) *cobra.Command {
 			if err := printTeamsAuthDoctorSummary(out); err != nil {
 				return err
 			}
-			if err := printTeamsLocalStatus(cmd, *registryPath); err != nil {
+			if err := printTeamsCoreStatus(out, time.Now()); err != nil {
 				return err
 			}
 			_, _ = fmt.Fprintln(out, "Next steps: run `codex-proxy teams setup` for the safe setup checklist.")
@@ -2683,298 +2530,6 @@ func newTeamsReadAuthManagerWithHTTPClient(client *http.Client) (*teams.AuthMana
 		return nil, err
 	}
 	return teams.NewAuthManagerWithHTTPClient(cfg, client), nil
-}
-
-func printTeamsLocalStatus(cmd *cobra.Command, registryPath string) error {
-	out := cmd.OutOrStdout()
-	now := time.Now()
-	resolvedRegistryPath, err := teamsRegistryPath(registryPath)
-	if err != nil {
-		return err
-	}
-	reg, err := loadTeamsStatusRegistry(registryPath)
-	if err != nil {
-		return err
-	}
-	statusSessions := make(map[string]string)
-	for _, session := range reg.Sessions {
-		addStatusSession(statusSessions, session.ID, session.ChatID, session.Status)
-	}
-	defaultStatePath, err := teamsStorePathReadOnly()
-	if err != nil {
-		return err
-	}
-	statePaths, err := existingTeamsStorePathsReadOnly()
-	if err != nil {
-		return err
-	}
-	controlChatID := strings.TrimSpace(reg.ControlChatID)
-	controlChatTopic := strings.TrimSpace(reg.ControlChatTopic)
-	controlChatURL := strings.TrimSpace(reg.ControlChatURL)
-	controlChatSource := ""
-	if controlChatID != "" {
-		controlChatSource = resolvedRegistryPath
-	}
-	stateSessions := 0
-	turns := 0
-	queuedOutbox := 0
-	runningTurns := 0
-	queuedTurns := 0
-	var statusStores []teamsStatusStoreSnapshot
-	var owners []teamsstore.OwnerMetadata
-	var serviceControls []teamsstore.ServiceControl
-	var controlLeases []string
-	var canonicalLoadErrors []string
-	authoritativeStore := ""
-	authoritativeStorePath := ""
-	authoritativeStoreAmbiguous := false
-	storeIdentity := "unavailable"
-	canonicalStoreCandidates := 0
-	activeSessions := 0
-	parkedSessions := 0
-	historicalSessions := 0
-	pollableSessions := 0
-	for _, statePath := range statePaths {
-		if teamsStatusStoreLayer(statePath) == "legacy" {
-			continue
-		}
-		canonicalStoreCandidates++
-		state, err := teamsstore.LoadPathReadOnly(cmd.Context(), statePath)
-		if err != nil {
-			canonicalLoadErrors = append(canonicalLoadErrors, fmt.Sprintf("%s: %v", statePath, err))
-			continue
-		}
-		owner, ownerKind := teamsStatusOwner(state, now)
-		statusStores = append(statusStores, teamsStatusStoreSnapshot{
-			Path:      statePath,
-			State:     state,
-			Owner:     owner,
-			OwnerKind: ownerKind,
-		})
-		serviceControls = append(serviceControls, state.ServiceControl)
-		for _, session := range state.Sessions {
-			if session.RunnerKind == "control_fallback" && session.TeamsChatID == "" {
-				continue
-			}
-			stateSessions++
-			addStatusSession(statusSessions, session.ID, session.TeamsChatID, string(session.Status))
-			if session.Status == teamsstore.SessionStatusActive {
-				activeSessions++
-				poll := state.ChatPolls[session.TeamsChatID]
-				if strings.EqualFold(strings.TrimSpace(poll.PollState), "parked") {
-					parkedSessions++
-				} else if strings.TrimSpace(session.TeamsChatID) != "" {
-					pollableSessions++
-				}
-			} else {
-				historicalSessions++
-			}
-		}
-		for _, msg := range state.OutboxMessages {
-			if msg.Status == teamsstore.OutboxStatusQueued {
-				queuedOutbox++
-			}
-		}
-		for _, turn := range state.Turns {
-			turns++
-			switch turn.Status {
-			case teamsstore.TurnStatusQueued:
-				queuedTurns++
-			case teamsstore.TurnStatusRunning:
-				runningTurns++
-			}
-		}
-		if ownerKind == teamsStatusOwnerLive {
-			owners = append(owners, owner)
-		}
-		if state.ControlLease.HolderMachineID != "" {
-			controlLeases = append(controlLeases, fmt.Sprintf("Control lease: holder=%s kind=%s generation=%d until=%s", state.ControlLease.HolderMachineID, state.ControlLease.HolderKind, state.ControlLease.Generation, state.ControlLease.LeaseUntil.Format(time.RFC3339)))
-		}
-		if state.ControlChat.TeamsChatID != "" && (controlChatID == "" || controlChatSource == resolvedRegistryPath) {
-			controlChatID = state.ControlChat.TeamsChatID
-			controlChatTopic = state.ControlChat.TeamsChatTopic
-			controlChatURL = state.ControlChat.TeamsChatURL
-			controlChatSource = statePath
-		}
-	}
-	if canonicalStoreCandidates == 1 && len(statusStores) == 1 {
-		authoritativeStorePath = statusStores[0].Path
-	} else if canonicalStoreCandidates > 1 {
-		if len(canonicalLoadErrors) == 0 {
-			managedChild, managed := teamsServiceWatchdogManagedChild()
-			for _, snapshot := range statusStores {
-				if snapshot.OwnerKind != teamsStatusOwnerLive ||
-					!managed ||
-					!teamsServiceWatchdogOwnerMatchesManagedChild(snapshot.Owner, managedChild) {
-					continue
-				}
-				if authoritativeStorePath != "" {
-					authoritativeStorePath = ""
-					break
-				}
-				authoritativeStorePath = snapshot.Path
-			}
-		}
-		if authoritativeStorePath == "" {
-			authoritativeStoreAmbiguous = true
-		}
-	}
-	if authoritativeStorePath != "" {
-		authoritativeStore = authoritativeStorePath
-		for _, snapshot := range statusStores {
-			if filepath.Clean(snapshot.Path) != filepath.Clean(authoritativeStorePath) {
-				continue
-			}
-			storeIdentity = fmt.Sprintf(
-				"scope=%s account=%s profile=%s",
-				firstNonEmptyCLI(snapshot.State.Scope.ID, "unknown"),
-				firstNonEmptyCLI(snapshot.State.Scope.AccountID, "unknown"),
-				firstNonEmptyCLI(snapshot.State.Scope.Profile, "default"),
-			)
-			break
-		}
-	} else if authoritativeStoreAmbiguous {
-		authoritativeStore = "unknown (multiple canonical stores are ambiguous)"
-	} else if canonicalStoreCandidates > 0 {
-		authoritativeStore = "unknown (canonical store could not be loaded)"
-	} else {
-		authoritativeStore = defaultStatePath + " (not present)"
-	}
-	statusSummary := buildTeamsStatusSummary(statusStores, controlChatID, defaultStatePath, now)
-	authorityDiagnostics := buildTeamsAuthorityDiagnostics(statusStores, reg, controlChatID)
-	_, _ = fmt.Fprintln(out, "Teams status")
-	_, _ = fmt.Fprintf(out, "Registry: %s\n", resolvedRegistryPath)
-	_, _ = fmt.Fprintf(out, "Authoritative store: %s\n", authoritativeStore)
-	_, _ = fmt.Fprintf(out, "Store identity: %s\n", storeIdentity)
-	for _, statePath := range statePaths {
-		layer := teamsStatusStoreLayer(statePath)
-		authority := "non-authoritative"
-		if layer == "canonical" && authoritativeStoreAmbiguous {
-			authority = "unknown"
-		} else if layer == "canonical" && filepath.Clean(statePath) == filepath.Clean(authoritativeStorePath) {
-			authority = "authoritative"
-		}
-		_, _ = fmt.Fprintf(out, "Store candidate: %s %s %s\n", layer, authority, statePath)
-	}
-	for _, loadErr := range canonicalLoadErrors {
-		_, _ = fmt.Fprintf(out, "Canonical load error: %s\n", loadErr)
-	}
-	_, _ = fmt.Fprintln(out, "Desired service state: configured")
-	_, _ = fmt.Fprintln(out, "Supervisor state: see OS service")
-	_, _ = fmt.Fprintln(out, "Child state: see OS service")
-	listenerState := "stopped"
-	if len(owners) > 0 {
-		listenerState = "running"
-	}
-	_, _ = fmt.Fprintf(out, "Listener state: %s\n", listenerState)
-	if len(owners) == 0 {
-		_, _ = fmt.Fprintln(out, "Live owner: none")
-	} else {
-		owner := owners[0]
-		_, _ = fmt.Fprintf(out, "Live owner: machine=%s pid=%d generation=%d heartbeat=%s\n", owner.MachineID, owner.PID, owner.LeaseGeneration, owner.LastHeartbeat.Format(time.RFC3339))
-	}
-	if len(controlLeases) == 0 {
-		_, _ = fmt.Fprintln(out, "Control lease: none")
-	} else {
-		_, _ = fmt.Fprintln(out, controlLeases[0])
-	}
-	_, _ = fmt.Fprintf(out, "Active sessions: %d\n", activeSessions)
-	_, _ = fmt.Fprintf(out, "Parked sessions: %d\n", parkedSessions)
-	_, _ = fmt.Fprintf(out, "Historical sessions: %d\n", historicalSessions)
-	_, _ = fmt.Fprintf(out, "Pollable sessions: %d\n", pollableSessions)
-	_, _ = fmt.Fprintln(out, "Remediation: run `cxp teams service doctor` for actionable checks.")
-	if controlChatID == "" {
-		_, _ = fmt.Fprintln(out, "Control chat: unavailable")
-	} else if len(owners) == 0 {
-		_, _ = fmt.Fprintln(out, "Control chat: configured, listener stopped")
-	} else {
-		_, _ = fmt.Fprintln(out, "Control chat: configured")
-	}
-	if controlChatID != "" {
-		if controlChatTopic != "" {
-			_, _ = fmt.Fprintf(out, "Control chat title: %s\n", controlChatTopic)
-		}
-		if controlChatURL != "" {
-			_, _ = fmt.Fprintf(out, "Control chat URL: %s\n", controlChatURL)
-		}
-		if controlChatSource != "" && controlChatSource != resolvedRegistryPath {
-			_, _ = fmt.Fprintf(out, "Control chat source: %s\n", controlChatSource)
-		}
-	}
-	_, _ = fmt.Fprintf(out, "Sessions: %d total, %d active\n", len(statusSessions), activeStatusSessionCount(statusSessions))
-	_, _ = fmt.Fprintf(out, "State: %s\n", defaultStatePath)
-	pathStatus := resolveTeamsHelperExecutableStatus()
-	if pathStatus.Raw != "" {
-		_, _ = fmt.Fprintf(out, "Helper raw executable: %s\n", pathStatus.Raw)
-	}
-	if pathStatus.Stable != "" {
-		_, _ = fmt.Fprintf(out, "Helper stable executable: %s\n", pathStatus.Stable)
-	}
-	if pathStatus.Source != "" || pathStatus.Reason != "" {
-		_, _ = fmt.Fprintf(out, "Helper path resolution: source=%s reason=%s\n", firstNonEmptyCLI(pathStatus.Source, "unknown"), firstNonEmptyCLI(pathStatus.Reason, "unknown"))
-	}
-	if pathStatus.Warning != "" {
-		_, _ = fmt.Fprintf(out, "Helper path warning: %s\n", pathStatus.Warning)
-	}
-	_, _ = fmt.Fprintf(out, "OS service: %s\n", formatTeamsOSServiceStatus(cmd.Context()))
-	if activation, ok, activationErr := readTeamsServiceLocalSupervisorActivation(); activationErr != nil {
-		_, _ = fmt.Fprintf(out, "Local supervisor activation: unknown (%v)\n", activationErr)
-	} else if ok {
-		_, _ = fmt.Fprintf(out, "Local supervisor activation: %s\n", formatTeamsServiceLocalSupervisorActivation(activation))
-	}
-	_, _ = fmt.Fprintf(out, "Helper version: %s\n", formatTeamsHelperVersionStatus(cmd.Context(), owners))
-	if len(statePaths) == 0 {
-		_, _ = fmt.Fprintln(out, "Bridge: not running")
-		_, _ = fmt.Fprintln(out, "State summary: unavailable")
-		return nil
-	}
-	if len(statePaths) > 1 || statePaths[0] != defaultStatePath {
-		_, _ = fmt.Fprintf(out, "State files: %d\n", len(statePaths))
-	}
-	for _, lease := range controlLeases {
-		_, _ = fmt.Fprintln(out, lease)
-	}
-	if serviceControl, ok := summarizeServiceControls(serviceControls); ok {
-		_, _ = fmt.Fprintf(out, "Service control: %s\n", formatServiceControl(serviceControl))
-	}
-	if len(owners) == 0 {
-		_, _ = fmt.Fprintln(out, "Bridge: not running")
-		_, _ = fmt.Fprintln(out, "Teams listener: stopped - Teams messages are not being read.")
-		_, _ = fmt.Fprintln(out, "To make Teams messages work, run `codex-proxy teams run` or start the Teams service.")
-		_, _ = fmt.Fprintln(out, "This must run on the machine named in the control chat; messages sent from your phone cannot start a stopped local listener.")
-	} else {
-		_, _ = fmt.Fprintln(out, "Bridge: running")
-		_, _ = fmt.Fprintln(out, "Teams listener: running")
-	}
-	_, _ = fmt.Fprintf(out, "State summary: %d sessions, %d turns (%d queued, %d running), %d queued outbox\n", stateSessions, turns, queuedTurns, runningTurns, queuedOutbox)
-	_, _ = fmt.Fprintf(out, "Poll summary: %s\n", formatPollSummary(statusSummary))
-	_, _ = fmt.Fprintf(out, "Active summary: %s\n", formatTeamsActiveSummary(statusSummary))
-	_, _ = fmt.Fprintf(out, "Work row layers: %s\n", formatTeamsWorkRowLayers(statusSummary))
-	_, _ = fmt.Fprintf(out, "Scope layers: %s\n", formatTeamsScopeLayers(statusSummary))
-	_, _ = fmt.Fprintf(out, "Authority diagnostics: %s\n", formatTeamsAuthorityDiagnostics(authorityDiagnostics))
-	if len(statusSummary.RunningTurns) > 0 {
-		_, _ = fmt.Fprintln(out, "Running turns:")
-		for _, turn := range statusSummary.RunningTurns {
-			_, _ = fmt.Fprintf(out, "- %s\n", formatTeamsRunningTurnStatus(turn, now))
-		}
-	}
-	if len(statusSummary.UnresolvedExecutions) > 0 {
-		_, _ = fmt.Fprintf(out, "Unresolved execution fences: %d (automatic retry disabled)\n", len(statusSummary.UnresolvedExecutions))
-		for _, execution := range statusSummary.UnresolvedExecutions {
-			_, _ = fmt.Fprintf(out, "- %s\n", formatTeamsUnresolvedExecutionStatus(execution))
-		}
-	}
-	if statusSummary.AmbiguousOutbox > 0 {
-		_, _ = fmt.Fprintf(out, "Ambiguous outbox: %d rows across %d chat(s) (exact Graph evidence required; no automatic replay)\n", statusSummary.AmbiguousOutbox, statusSummary.AmbiguousOutboxChats)
-	}
-	if len(owners) == 0 {
-		_, _ = fmt.Fprintln(out, "Owner: none")
-	} else {
-		for _, owner := range owners {
-			_, _ = fmt.Fprintf(out, "Owner: pid=%d host=%s machine=%s generation=%d version=%s last_heartbeat=%s active_session=%s active_turn=%s\n", owner.PID, owner.Hostname, owner.MachineID, owner.LeaseGeneration, firstNonEmptyCLI(owner.HelperVersion, "unknown"), owner.LastHeartbeat.Format(time.RFC3339), owner.ActiveSessionID, owner.ActiveTurnID)
-		}
-	}
-	return nil
 }
 
 type teamsHelperExecutableStatus struct {

@@ -15,67 +15,47 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
-	"github.com/baaaaaaaka/codex-helper/internal/teams"
-	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
+	corestore "github.com/baaaaaaaka/codex-helper/internal/core/store"
 )
 
 const (
 	teamsServiceWatchdogActionNoop    = "noop"
 	teamsServiceWatchdogActionStart   = "start"
 	teamsServiceWatchdogActionRestart = "restart"
-	teamsServiceWatchdogActionClear   = "clear"
 
-	defaultTeamsServiceWatchdogOwnerStaleAfter    = 90 * time.Second
-	defaultTeamsServiceWatchdogPollStaleAfter     = 2 * time.Minute
+	defaultTeamsServiceWatchdogOwnerStaleAfter    = corestore.OwnerStaleAfter
 	defaultTeamsServiceWatchdogCooldown           = 2 * time.Minute
 	defaultTeamsServiceWatchdogConsecutiveStale   = 3
 	defaultTeamsServiceWatchdogMissingStateReason = "no Teams state evidence yet"
-	defaultTeamsServiceWatchdogReloadStaleAfter   = 6 * time.Minute
-	defaultTeamsServiceWatchdogMigrationActiveFor = 15 * time.Minute
 )
 
+// The watchdog (and the local supervisor's child health check) judge the
+// helper only from local evidence: whether the service is installed and
+// running, and the owner heartbeat in the Teams store (F-SVC-6). It never
+// calls Graph, so a Graph or proxy outage never restarts a helper whose
+// heartbeat is fresh. A stale or missing owner restarts the service after
+// three consecutive stale checks, at most once per cooldown.
 type teamsServiceWatchdogOptions struct {
 	Now                 time.Time
 	OwnerStaleAfter     time.Duration
-	PollStaleAfter      time.Duration
 	Cooldown            time.Duration
-	MigrationActiveFor  time.Duration
 	MinConsecutiveStale int
 	DryRun              bool
 }
 
 type teamsServiceWatchdogSnapshot struct {
-	Installed                          bool
-	Active                             bool
-	StateFiles                         int
-	AuthoritativeStorePath             string
-	AmbiguousCanonicalStores           bool
-	MultipleFreshOwnerStores           bool
-	MigrationBlocked                   bool
-	MigrationActive                    bool
-	MigrationStateUnknown              bool
-	ServicePaused                      bool
-	ServiceDraining                    bool
-	HelperUpgradeDrainExpired          bool
-	HelperUpgradeDrainLocalOwnerFresh  bool
-	HelperUpgradeDrainRemoteOwnerFresh bool
-	HelperReloadDrainStale             bool
-	HelperReloadDrainLocalOwnerFresh   bool
-	HelperReloadDrainRemoteOwnerFresh  bool
-	OwnerFound                         bool
-	OwnerFresh                         bool
-	OwnerActiveTurn                    bool
-	LastOwnerHeartbeat                 time.Time
-	FreshOwnerStartedAt                time.Time
-	// ManagedChildStarting is true when the local supervisor has positively
-	// identified a live child, but the store still has no owner or only has
-	// evidence from a previous child generation. A live managed child is kept
-	// alive while it retries Graph/proxy initialization; the owner heartbeat is
-	// the local liveness proof once listener initialization has completed.
+	Installed              bool
+	Active                 bool
+	StateFiles             int
+	AuthoritativeStorePath string
+	OwnerFound             bool
+	OwnerFresh             bool
+	LastOwnerHeartbeat     time.Time
+	// ManagedChildStarting is true when the local supervisor has a live
+	// child that does not own the store yet (it is starting, or converting
+	// an old store at first start).
 	ManagedChildStarting  bool
 	ManagedChildStartedAt time.Time
-	PollActivityFound     bool
-	PollActivityAt        time.Time
 }
 
 type teamsServiceWatchdogState struct {
@@ -111,8 +91,7 @@ var (
 	teamsServiceWatchdogNow             = time.Now
 	teamsServiceWatchdogStatePath       = defaultTeamsServiceWatchdogStatePath
 	teamsServiceWatchdogCollectSnapshot = collectTeamsServiceWatchdogSnapshot
-	teamsServiceWatchdogStorePaths      = existingCanonicalTeamsStorePathsReadOnly
-	teamsServiceWatchdogLoadState       = teamsstore.LoadPathWatchdogStateReadOnly
+	teamsServiceWatchdogStorePath       = defaultTeamsServiceWatchdogStorePath
 	teamsServiceWatchdogInstalled       = teamsServiceInstalled
 	teamsServiceWatchdogActive          = teamsServiceActive
 	teamsServiceWatchdogStartService    = startTeamsPrimaryService
@@ -173,11 +152,6 @@ func runTeamsServiceWatchdogLoop(ctx context.Context, opts teamsServiceWatchdogO
 
 func runTeamsServiceWatchdogOnce(ctx context.Context, opts teamsServiceWatchdogOptions) (teamsServiceWatchdogResult, error) {
 	opts = normalizeTeamsServiceWatchdogOptions(opts)
-	if teamsEnvSelectsNewCore(map[string]string{envTeamsCore: os.Getenv(envTeamsCore)}) {
-		// The service manager restarts the new core (Restart=always); the
-		// old store's heartbeats would only ever look stale.
-		return teamsServiceWatchdogResult{Decision: teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: teamsNewCoreHealthReason}, DryRun: opts.DryRun}, nil
-	}
 	snapshot, err := teamsServiceWatchdogCollectSnapshot(ctx, opts)
 	if err != nil {
 		return teamsServiceWatchdogResult{}, err
@@ -190,25 +164,6 @@ func runTeamsServiceWatchdogOnce(ctx context.Context, opts teamsServiceWatchdogO
 	next := nextTeamsServiceWatchdogState(state, decision, opts.Now)
 	result := teamsServiceWatchdogResult{Snapshot: snapshot, Decision: decision, State: next, DryRun: opts.DryRun}
 	if opts.DryRun {
-		return result, nil
-	}
-	if decision.Action == teamsServiceWatchdogActionClear {
-		path := snapshot.AuthoritativeStorePath
-		if strings.TrimSpace(path) == "" && snapshot.StateFiles == 1 {
-			paths, pathErr := teamsServiceWatchdogStorePaths()
-			if pathErr != nil {
-				return result, pathErr
-			}
-			if len(paths) == 1 {
-				path = paths[0]
-			}
-		}
-		if err := reconcileTeamsServiceWatchdogLifecycleDrainPath(ctx, opts, path); err != nil {
-			return result, err
-		}
-		if err := saveTeamsServiceWatchdogState(next); err != nil {
-			return teamsServiceWatchdogResult{}, err
-		}
 		return result, nil
 	}
 	if decision.Action == teamsServiceWatchdogActionStart || decision.Action == teamsServiceWatchdogActionRestart {
@@ -243,19 +198,27 @@ func normalizeTeamsServiceWatchdogOptions(opts teamsServiceWatchdogOptions) team
 	if opts.OwnerStaleAfter <= 0 {
 		opts.OwnerStaleAfter = defaultTeamsServiceWatchdogOwnerStaleAfter
 	}
-	if opts.PollStaleAfter <= 0 {
-		opts.PollStaleAfter = defaultTeamsServiceWatchdogPollStaleAfter
-	}
 	if opts.Cooldown <= 0 {
 		opts.Cooldown = defaultTeamsServiceWatchdogCooldown
-	}
-	if opts.MigrationActiveFor <= 0 {
-		opts.MigrationActiveFor = defaultTeamsServiceWatchdogMigrationActiveFor
 	}
 	if opts.MinConsecutiveStale <= 0 {
 		opts.MinConsecutiveStale = defaultTeamsServiceWatchdogConsecutiveStale
 	}
 	return opts
+}
+
+// defaultTeamsServiceWatchdogStorePath is the store the helper runs on
+// ("" when there is none yet, or it cannot be determined).
+func defaultTeamsServiceWatchdogStorePath() (string, error) {
+	stateDir, err := appdirs.StateDir()
+	if err != nil {
+		return "", err
+	}
+	path, err := resolveTeamsCoreStorePath(stateDir)
+	if err != nil {
+		return "", nil // the helper refuses to start and says why
+	}
+	return path, nil
 }
 
 func collectTeamsServiceWatchdogSnapshot(ctx context.Context, opts teamsServiceWatchdogOptions) (teamsServiceWatchdogSnapshot, error) {
@@ -272,170 +235,36 @@ func collectTeamsServiceWatchdogSnapshot(ctx context.Context, opts teamsServiceW
 		}
 		snapshot.Active = active
 	}
-	migrationState, migrationStateExists, migrationStateErr := readTeamsServiceMigrationState()
-	if migrationStateErr != nil {
-		// An unreadable marker is ambiguous only while the managed backend is
-		// still active. Once the backend is confirmed stopped, no managed child
-		// can be performing the offline migration, so let the normal watchdog
-		// start path recover instead of making a corrupt marker permanently
-		// suppress service startup.
-		if snapshot.Active {
-			snapshot.MigrationStateUnknown = true
-			return snapshot, nil
-		}
+	path, err := teamsServiceWatchdogStorePath()
+	if err != nil || path == "" {
+		return snapshot, err
 	}
-	if migrationStateExists && teamsServiceMigrationStateAppearsLive(migrationState) {
-		switch normalizedTeamsServiceMigrationPhase(migrationState.Phase) {
-		case teamsServiceMigrationPhaseBlocked:
-			snapshot.MigrationBlocked = true
-			return snapshot, nil
-		case teamsServiceMigrationPhaseActive:
-			if migrationState.StartedAt.After(opts.Now.Add(time.Minute)) {
-				snapshot.MigrationStateUnknown = true
-				return snapshot, nil
-			}
-			if snapshot.Active && opts.Now.Sub(migrationState.StartedAt) < opts.MigrationActiveFor {
-				snapshot.MigrationActive = true
-				return snapshot, nil
-			}
-		}
+	if info, err := os.Lstat(path); err != nil || !info.Mode().IsRegular() {
+		return snapshot, nil
 	}
-	paths, err := teamsServiceWatchdogStorePaths()
+	snapshot.StateFiles = 1
+	snapshot.AuthoritativeStorePath = path
+	st, err := corestore.OpenWith(path, corestore.Options{ReadOnly: true})
 	if err != nil {
 		return snapshot, err
 	}
-	type candidateSnapshot struct {
-		path     string
-		snapshot teamsServiceWatchdogSnapshot
-		owner    teamsstore.OwnerMetadata
-		scope    teamsstore.ScopeIdentity
-		hasOwner bool
+	defer st.Close()
+	owner, ok, err := st.OwnerInfo()
+	if err != nil {
+		return snapshot, err
 	}
-	var managedChild teamsServiceWatchdogManagedChildIdentity
-	managedChild, managedChildFound := teamsServiceWatchdogManagedChild()
-	managedChildFound = managedChildFound && managedChild.PID > 0 && !managedChild.StartedAt.IsZero()
-	if len(paths) > 1 {
-		binding, bindingFound, _ := teams.LoadActiveStoreBindingReadOnly()
-		if bindingFound && (!managedChildFound || teamsServiceWatchdogBindingMatchesManagedChildGeneration(binding, managedChild)) {
-			for _, path := range paths {
-				if !samePath(path, binding.CanonicalPath) {
-					continue
-				}
-				if err := validateTeamsServiceWatchdogStorePath(path); err != nil {
-					break
-				}
-				state, err := teamsServiceWatchdogLoadState(ctx, path)
-				if err != nil {
-					break
-				}
-				owner, hasOwner := rawTeamsStateOwner(state)
-				if !hasOwner || !teamsServiceWatchdogBindingMatchesCandidate(binding, path, owner, state.Scope) {
-					break
-				}
-				installed := snapshot.Installed
-				active := snapshot.Active
-				mergeTeamsServiceWatchdogState(&snapshot, state, opts)
-				snapshot.Installed = installed
-				snapshot.Active = active
-				snapshot.StateFiles = len(paths)
-				snapshot.AuthoritativeStorePath = path
-				annotateTeamsServiceWatchdogManagedChildStartup(&snapshot, owner, hasOwner, managedChild)
-				return snapshot, nil
-			}
-		}
+	if ok && owner.HeartbeatAt > 0 {
+		snapshot.OwnerFound = true
+		snapshot.LastOwnerHeartbeat = time.UnixMilli(owner.HeartbeatAt)
+		age := opts.Now.Sub(snapshot.LastOwnerHeartbeat)
+		snapshot.OwnerFresh = age < opts.OwnerStaleAfter
 	}
-	candidates := make([]candidateSnapshot, 0, len(paths))
-	freshOwnerStores := 0
-	for _, path := range paths {
-		if err := validateTeamsServiceWatchdogStorePath(path); err != nil {
-			return snapshot, err
-		}
-		state, err := teamsServiceWatchdogLoadState(ctx, path)
-		if err != nil {
-			return snapshot, err
-		}
-		snapshot.StateFiles++
-		var candidate teamsServiceWatchdogSnapshot
-		mergeTeamsServiceWatchdogState(&candidate, state, opts)
-		owner, hasOwner := rawTeamsStateOwner(state)
-		if candidate.OwnerFresh {
-			freshOwnerStores++
-		}
-		candidates = append(candidates, candidateSnapshot{path: path, snapshot: candidate, owner: owner, scope: state.Scope, hasOwner: hasOwner})
-	}
-	var selected candidateSnapshot
-	selectedFound := false
-	if len(candidates) == 1 {
-		selected = candidates[0]
-		selectedFound = true
-	} else if len(candidates) > 1 {
-		if managedChildFound {
-			for _, candidate := range candidates {
-				if !candidate.hasOwner ||
-					!candidate.snapshot.OwnerFresh ||
-					!teamsServiceWatchdogOwnerMatchesManagedChild(candidate.owner, managedChild) {
-					continue
-				}
-				if selectedFound {
-					selectedFound = false
-					break
-				}
-				selected = candidate
-				selectedFound = true
-			}
-		}
-		if !selectedFound {
-			binding, ok, _ := teams.LoadActiveStoreBindingReadOnly()
-			if ok {
-				for _, candidate := range candidates {
-					if !candidate.hasOwner ||
-						!teamsServiceWatchdogBindingMatchesCandidate(binding, candidate.path, candidate.owner, candidate.scope) {
-						continue
-					}
-					if selectedFound {
-						selectedFound = false
-						break
-					}
-					selected = candidate
-					selectedFound = true
-				}
-			}
-		}
-		if !selectedFound {
-			snapshot.AmbiguousCanonicalStores = true
-		}
-	}
-	if selectedFound {
-		installed := snapshot.Installed
-		active := snapshot.Active
-		stateFiles := snapshot.StateFiles
-		snapshot = selected.snapshot
-		snapshot.Installed = installed
-		snapshot.Active = active
-		snapshot.StateFiles = stateFiles
-		snapshot.AuthoritativeStorePath = selected.path
-		if managedChildFound {
-			annotateTeamsServiceWatchdogManagedChildStartup(&snapshot, selected.owner, selected.hasOwner, managedChild)
-		}
-		snapshot.MultipleFreshOwnerStores = freshOwnerStores > 1
-	} else {
-		snapshot.MultipleFreshOwnerStores = freshOwnerStores > 1
+	if child, found := teamsServiceWatchdogManagedChild(); found && child.PID > 0 && !child.StartedAt.IsZero() {
+		snapshot.ManagedChildStartedAt = child.StartedAt
+		owns := snapshot.OwnerFresh && owner.PID == child.PID && !snapshot.LastOwnerHeartbeat.Before(child.StartedAt)
+		snapshot.ManagedChildStarting = !owns
 	}
 	return snapshot, nil
-}
-
-func teamsServiceWatchdogBindingMatchesManagedChildGeneration(binding teams.ActiveStoreBinding, child teamsServiceWatchdogManagedChildIdentity) bool {
-	return binding.PID == child.PID &&
-		!binding.StartedAt.IsZero() &&
-		!binding.StartedAt.Before(child.StartedAt.Add(-time.Second))
-}
-
-func teamsServiceWatchdogBindingMatchesCandidate(binding teams.ActiveStoreBinding, path string, owner teamsstore.OwnerMetadata, scope teamsstore.ScopeIdentity) bool {
-	return samePath(binding.CanonicalPath, path) &&
-		binding.ScopeID == strings.TrimSpace(scope.ID) &&
-		binding.PID == owner.PID &&
-		binding.StartedAt.Equal(owner.StartedAt) &&
-		binding.LeaseGeneration == owner.LeaseGeneration
 }
 
 func defaultTeamsServiceWatchdogManagedChild() (teamsServiceWatchdogManagedChildIdentity, bool) {
@@ -452,179 +281,18 @@ func defaultTeamsServiceWatchdogManagedChild() (teamsServiceWatchdogManagedChild
 	return teamsServiceWatchdogManagedChildIdentity{PID: status.ChildPID, StartedAt: status.LastChildStartAt, ManagedBySupervisor: true}, true
 }
 
-func annotateTeamsServiceWatchdogManagedChildStartup(snapshot *teamsServiceWatchdogSnapshot, owner teamsstore.OwnerMetadata, hasOwner bool, child teamsServiceWatchdogManagedChildIdentity) {
-	if snapshot == nil || child.PID <= 0 || child.StartedAt.IsZero() {
-		return
-	}
-	snapshot.ManagedChildStartedAt = child.StartedAt
-	if !hasOwner || (child.ManagedBySupervisor && !owner.StartedAt.IsZero() &&
-		owner.StartedAt.Before(child.StartedAt)) || (owner.PID == child.PID &&
-		!owner.StartedAt.IsZero() && owner.StartedAt.Before(child.StartedAt)) {
-		snapshot.ManagedChildStarting = true
-	}
-}
-
-func teamsServiceWatchdogOwnerMatchesManagedChild(owner teamsstore.OwnerMetadata, child teamsServiceWatchdogManagedChildIdentity) bool {
-	return child.PID > 0 &&
-		!child.StartedAt.IsZero() &&
-		teamsstore.OwnerAppearsLocal(owner) &&
-		owner.PID == child.PID &&
-		!owner.StartedAt.IsZero() &&
-		!owner.StartedAt.Before(child.StartedAt.Add(-time.Second))
-}
-
-func mergeTeamsServiceWatchdogState(snapshot *teamsServiceWatchdogSnapshot, state teamsstore.State, opts teamsServiceWatchdogOptions) {
-	if snapshot == nil {
-		return
-	}
-	if state.ServiceControl.Paused {
-		snapshot.ServicePaused = true
-	}
-	if state.ServiceControl.Draining {
-		snapshot.ServiceDraining = true
-	}
-	owner, hasOwner := rawTeamsStateOwner(state)
-	if hasOwner {
-		snapshot.OwnerFound = true
-		if owner.LastHeartbeat.After(snapshot.LastOwnerHeartbeat) {
-			snapshot.LastOwnerHeartbeat = owner.LastHeartbeat
-		}
-		fresh := !teamsstore.IsStale(owner, opts.OwnerStaleAfter, opts.Now) && !teamsstore.OwnerAppearsLocallyDead(owner)
-		if fresh {
-			snapshot.OwnerFresh = true
-			if strings.TrimSpace(owner.ActiveTurnID) != "" {
-				snapshot.OwnerActiveTurn = true
-			}
-			if !owner.StartedAt.IsZero() && (snapshot.FreshOwnerStartedAt.IsZero() || owner.StartedAt.Before(snapshot.FreshOwnerStartedAt)) {
-				snapshot.FreshOwnerStartedAt = owner.StartedAt
-			}
-		}
-	}
-	if !state.ServiceControl.Paused && teamsstore.HelperUpgradeDrainExpired(state, opts.Now) {
-		snapshot.HelperUpgradeDrainExpired = true
-		if hasOwner {
-			fresh := !teamsstore.IsStale(owner, opts.OwnerStaleAfter, opts.Now) && !teamsstore.OwnerAppearsLocallyDead(owner)
-			if fresh {
-				if teamsstore.OwnerAppearsLocal(owner) {
-					snapshot.HelperUpgradeDrainLocalOwnerFresh = true
-				} else {
-					snapshot.HelperUpgradeDrainRemoteOwnerFresh = true
-				}
-			}
-		}
-	}
-	if !state.ServiceControl.Paused && teamsstore.HelperReloadDrainStale(state, opts.Now, defaultTeamsServiceWatchdogReloadStaleAfter) {
-		snapshot.HelperReloadDrainStale = true
-		if hasOwner {
-			fresh := !teamsstore.IsStale(owner, opts.OwnerStaleAfter, opts.Now) && !teamsstore.OwnerAppearsLocallyDead(owner)
-			if fresh {
-				if teamsstore.OwnerAppearsLocal(owner) {
-					snapshot.HelperReloadDrainLocalOwnerFresh = true
-				} else {
-					snapshot.HelperReloadDrainRemoteOwnerFresh = true
-				}
-			}
-		}
-	}
-	if activity, ok := teamsServiceWatchdogPollActivity(state, opts.Now); ok {
-		snapshot.PollActivityFound = true
-		if activity.After(snapshot.PollActivityAt) {
-			snapshot.PollActivityAt = activity
-		}
-	}
-}
-
-func rawTeamsStateOwner(state teamsstore.State) (teamsstore.OwnerMetadata, bool) {
-	if state.ServiceOwner != nil {
-		return *state.ServiceOwner, true
-	}
-	if state.LockOwner != nil {
-		return *state.LockOwner, true
-	}
-	return teamsstore.OwnerMetadata{}, false
-}
-
-func teamsServiceWatchdogPollActivity(state teamsstore.State, now time.Time) (time.Time, bool) {
-	if len(state.ChatPolls) == 0 {
-		return time.Time{}, false
-	}
-	controlChatID := strings.TrimSpace(state.ControlChat.TeamsChatID)
-	if controlChatID != "" {
-		poll, ok := state.ChatPolls[controlChatID]
-		if !ok {
-			return time.Time{}, false
-		}
-		return teamsServiceWatchdogPollStateActivity(poll, now)
-	}
-	var out time.Time
-	found := false
-	for _, poll := range state.ChatPolls {
-		if activity, ok := teamsServiceWatchdogPollStateActivity(poll, now); ok {
-			found = true
-			if activity.After(out) {
-				out = activity
-			}
-		}
-	}
-	return out, found
-}
-
-func teamsServiceWatchdogPollStateActivity(poll teamsstore.ChatPollState, now time.Time) (time.Time, bool) {
-	out := poll.LastSuccessfulPollAt
-	if poll.LastErrorAt.After(out) {
-		out = poll.LastErrorAt
-	}
-	if !poll.BlockedUntil.IsZero() && poll.BlockedUntil.After(now) && now.After(out) {
-		out = now
-	}
-	if out.IsZero() {
-		return time.Time{}, false
-	}
-	return out, true
-}
-
 func evaluateTeamsServiceWatchdog(snapshot teamsServiceWatchdogSnapshot, state teamsServiceWatchdogState, opts teamsServiceWatchdogOptions) teamsServiceWatchdogDecision {
 	opts = normalizeTeamsServiceWatchdogOptions(opts)
 	if !snapshot.Installed {
 		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: "service is not installed"}
 	}
-	if snapshot.MigrationBlocked {
-		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: "service child is waiting on a blocked store migration"}
-	}
-	if snapshot.MigrationStateUnknown {
-		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: "service migration state is invalid; refusing automatic lifecycle changes"}
-	}
-	if snapshot.MigrationActive {
-		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: "service child is performing offline store migration"}
-	}
-	if snapshot.AmbiguousCanonicalStores {
-		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: "multiple canonical Teams stores are ambiguous; refusing automatic lifecycle changes"}
-	}
-	if snapshot.MultipleFreshOwnerStores {
-		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: "multiple canonical Teams stores have fresh owners; refusing automatic lifecycle changes"}
-	}
-	if snapshot.ServiceDraining {
-		if snapshot.HelperUpgradeDrainExpired {
-			return evaluateTeamsServiceWatchdogExpiredHelperUpgradeDrain(snapshot)
-		}
-		if snapshot.HelperReloadDrainStale {
-			return evaluateTeamsServiceWatchdogStaleHelperReloadDrain(snapshot)
-		}
-	}
 	if !snapshot.Active {
 		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionStart, Reason: "service is installed but not running"}
-	}
-	if snapshot.ServicePaused {
-		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: "service is paused"}
-	}
-	if snapshot.ServiceDraining {
-		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: "service is draining"}
 	}
 	if snapshot.StateFiles == 0 {
 		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: defaultTeamsServiceWatchdogMissingStateReason}
 	}
-
-	stale, reason := teamsServiceWatchdogStaleReason(snapshot, opts)
+	stale, reason := teamsServiceWatchdogStaleReason(snapshot)
 	if !stale {
 		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: reason}
 	}
@@ -638,140 +306,16 @@ func evaluateTeamsServiceWatchdog(snapshot teamsServiceWatchdogSnapshot, state t
 	return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionRestart, Reason: reason, Stale: true, ConsecutiveStale: consecutive}
 }
 
-func evaluateTeamsServiceWatchdogExpiredHelperUpgradeDrain(snapshot teamsServiceWatchdogSnapshot) teamsServiceWatchdogDecision {
-	reason := "helper upgrade drain expired"
-	if snapshot.HelperUpgradeDrainLocalOwnerFresh && snapshot.OwnerActiveTurn {
-		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: reason + "; active turn is still heartbeating"}
-	}
-	if snapshot.HelperUpgradeDrainRemoteOwnerFresh && !snapshot.HelperUpgradeDrainLocalOwnerFresh {
-		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: reason + "; owner is fresh on another machine"}
-	}
-	return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionClear, Reason: reason + "; reconciling stale lifecycle drain"}
-}
-
-func evaluateTeamsServiceWatchdogStaleHelperReloadDrain(snapshot teamsServiceWatchdogSnapshot) teamsServiceWatchdogDecision {
-	reason := "helper reload drain is stale"
-	if snapshot.HelperReloadDrainLocalOwnerFresh && snapshot.OwnerActiveTurn {
-		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: reason + "; active turn is still heartbeating"}
-	}
-	if snapshot.HelperReloadDrainRemoteOwnerFresh && !snapshot.HelperReloadDrainLocalOwnerFresh {
-		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: reason + "; owner is fresh on another machine"}
-	}
-	return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionClear, Reason: reason + "; reconciling stale lifecycle drain"}
-}
-
-func reconcileTeamsServiceWatchdogLifecycleDrains(ctx context.Context, opts teamsServiceWatchdogOptions) error {
-	snapshot, err := collectTeamsServiceWatchdogSnapshot(ctx, opts)
-	if err != nil {
-		return err
-	}
-	if snapshot.AmbiguousCanonicalStores {
-		return fmt.Errorf("multiple canonical Teams stores are ambiguous; refusing lifecycle reconciliation")
-	}
-	return reconcileTeamsServiceWatchdogLifecycleDrainPath(ctx, opts, snapshot.AuthoritativeStorePath)
-}
-
-func reconcileTeamsServiceWatchdogLifecycleDrainPath(ctx context.Context, opts teamsServiceWatchdogOptions, path string) error {
-	opts = normalizeTeamsServiceWatchdogOptions(opts)
-	path = strings.TrimSpace(path)
-	if path == "" {
-		return nil
-	}
-	if err := validateTeamsServiceWatchdogStorePath(path); err != nil {
-		return err
-	}
-	state, err := teamsstore.LoadPathReadOnly(ctx, path)
-	if err != nil {
-		return err
-	}
-	upgradeExpired := teamsstore.HelperUpgradeDrainExpired(state, opts.Now) && state.Upgrade != nil && strings.TrimSpace(state.Upgrade.ID) != ""
-	reloadStale := teamsstore.HelperReloadDrainStale(state, opts.Now, defaultTeamsServiceWatchdogReloadStaleAfter)
-	if !upgradeExpired && !reloadStale {
-		return nil
-	}
-	if err := validateTeamsServiceWatchdogStorePath(path); err != nil {
-		return err
-	}
-	st, err := teamsstore.Open(path)
-	if err != nil {
-		return err
-	}
-	state, err = st.Load(ctx)
-	if err != nil {
-		_ = st.Close()
-		return err
-	}
-	if teamsstore.HelperUpgradeDrainExpired(state, opts.Now) && state.Upgrade != nil && strings.TrimSpace(state.Upgrade.ID) != "" {
-		if _, _, err := st.AbortExpiredHelperUpgradeDrain(ctx, state.Upgrade.ID, opts.Now, opts.OwnerStaleAfter, "helper upgrade drain expired; reconciled by watchdog"); err != nil {
-			_ = st.Close()
-			return err
-		}
-		if err := st.Close(); err != nil {
-			return err
-		}
-		return nil
-	}
-	if teamsstore.HelperReloadDrainStale(state, opts.Now, defaultTeamsServiceWatchdogReloadStaleAfter) {
-		if _, _, err := st.ClearStaleHelperReloadDrain(ctx, opts.Now, defaultTeamsServiceWatchdogReloadStaleAfter, opts.OwnerStaleAfter); err != nil {
-			_ = st.Close()
-			return err
-		}
-	}
-	if err := st.Close(); err != nil {
-		return err
-	}
-	return nil
-}
-
-func validateTeamsServiceWatchdogStorePath(path string) error {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return err
-	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return fmt.Errorf("canonical Teams watchdog store %s is not a regular file", path)
-	}
-	return nil
-}
-
-func teamsServiceWatchdogStaleReason(snapshot teamsServiceWatchdogSnapshot, opts teamsServiceWatchdogOptions) (bool, string) {
-	lastActivity := snapshot.LastOwnerHeartbeat
-	if snapshot.PollActivityAt.After(lastActivity) {
-		lastActivity = snapshot.PollActivityAt
-	}
-	if snapshot.ManagedChildStarting {
+func teamsServiceWatchdogStaleReason(snapshot teamsServiceWatchdogSnapshot) (bool, string) {
+	switch {
+	case snapshot.ManagedChildStarting:
 		return false, "managed Teams child is alive; waiting for owner heartbeat"
+	case snapshot.OwnerFresh:
+		return false, "helper owner heartbeat is fresh"
+	case snapshot.OwnerFound:
+		return true, "helper owner heartbeat is stale"
 	}
-	if !snapshot.OwnerFresh {
-		if !lastActivity.IsZero() && !lastActivity.After(opts.Now) && opts.Now.Sub(lastActivity) <= opts.OwnerStaleAfter {
-			return false, "no fresh owner yet, but local activity is recent"
-		}
-		if snapshot.OwnerFound {
-			return true, "helper owner heartbeat is stale"
-		}
-		return true, "helper owner is missing"
-	}
-	if snapshot.OwnerActiveTurn {
-		return false, "helper owner is fresh and a turn is active"
-	}
-	// A poll from an earlier owner generation says nothing about the child that
-	// just started. Ignore it until the current owner records its first poll, so
-	// a healthy replacement receives the same startup grace as a brand-new
-	// listener.
-	currentOwnerPollFound := snapshot.PollActivityFound
-	if currentOwnerPollFound && !snapshot.FreshOwnerStartedAt.IsZero() && snapshot.PollActivityAt.Before(snapshot.FreshOwnerStartedAt) {
-		currentOwnerPollFound = false
-	}
-	if currentOwnerPollFound {
-		if !snapshot.PollActivityAt.After(opts.Now) && opts.Now.Sub(snapshot.PollActivityAt) > opts.PollStaleAfter {
-			return false, "helper owner is fresh; control chat polling is stale and will retry"
-		}
-		return false, "helper owner and control chat polling are fresh"
-	}
-	if !snapshot.FreshOwnerStartedAt.IsZero() && !snapshot.FreshOwnerStartedAt.After(opts.Now) && opts.Now.Sub(snapshot.FreshOwnerStartedAt) > opts.PollStaleAfter {
-		return false, "helper owner is fresh; control chat polling has not become active and will retry"
-	}
-	return false, "helper owner is fresh; waiting for first control chat poll"
+	return true, "helper owner is missing"
 }
 
 func teamsServiceWatchdogCooldownUntil(state teamsServiceWatchdogState, opts teamsServiceWatchdogOptions) (time.Time, bool) {
