@@ -406,3 +406,72 @@ func TestProgressCoalescedWhileWritesArePaced(t *testing.T) {
 		t.Fatalf("%d progress messages while the account's writes are paced, want 1", n)
 	}
 }
+
+// fakeBudget is the benchmark's throttle model: a token bucket per account
+// and request class that answers 429 with a fixed Retry-After when empty.
+type fakeBudget struct {
+	rate, burst, tokens float64
+	last                time.Time
+}
+
+func (b *fakeBudget) allow(now time.Time) bool {
+	b.tokens = math.Min(b.burst, b.tokens+now.Sub(b.last).Seconds()*b.rate)
+	b.last = now
+	if b.tokens < 1 {
+		return false
+	}
+	b.tokens--
+	return true
+}
+
+// Benchmark S6 (storm gate): under a budget far below the pacer's floor
+// (0.2/s, burst 3, Retry-After 30 s) every Retry-After window ended in a
+// 429: the pacer released four requests at its floor rate into a burst of
+// three. A throttle that follows an earlier one now measures the budget,
+// so once one has been measured the window after each reopening is free
+// of 429s, and more requests get through than before.
+func TestPacerSettlesUnderABudgetFarBelowTheFloor(t *testing.T) {
+	const ra = 30 * time.Second
+	for _, scan := range []bool{false, true} { // reads: the activity scan borrows at each reopening
+		clk := &testClock{t: time.Unix(1000, 0)}
+		p := newPacer(4, 30*time.Second, clk.now)
+		b := &fakeBudget{rate: 0.2, burst: 3, tokens: 3, last: clk.now()}
+		start := clk.now()
+		var throttles []time.Time
+		served := 0
+		reopen := time.Time{}
+		for clk.now().Sub(start) < 10*time.Minute {
+			now := clk.now()
+			if scan && !reopen.IsZero() && !now.Before(reopen) {
+				p.borrow()
+				reopen = time.Time{}
+			} else if ok, wait := p.take(); !ok {
+				clk.add(max(wait, 10*time.Millisecond))
+				continue
+			}
+			if b.allow(now) {
+				served++
+			} else {
+				throttles = append(throttles, now)
+				p.throttled(now, now.Add(ra))
+				reopen = now.Add(ra)
+			}
+			clk.add(50 * time.Millisecond) // the request's duration
+		}
+		t.Logf("scan=%v: %d served, %d throttled at %v", scan, served, len(throttles), throttles)
+		// The first two throttles teach the budget (the storm's onset and
+		// the first reopening); after that the window following each
+		// reopening has no 429.
+		for i := 2; i < len(throttles); i++ {
+			if gap := throttles[i].Sub(throttles[i-1]); gap < 2*ra {
+				t.Fatalf("scan=%v: throttle %d came %s after the previous one: inside the window after the reopening", scan, i, gap)
+			}
+		}
+		if len(throttles) > 8 {
+			t.Fatalf("scan=%v: %d throttles in 10 min, want a few (the old pacer: one per window, 18)", scan, len(throttles))
+		}
+		if served < 70 {
+			t.Fatalf("scan=%v: %d requests served in 10 min, want more than the old pacer's 54", scan, served)
+		}
+	}
+}

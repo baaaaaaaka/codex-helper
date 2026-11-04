@@ -1420,7 +1420,7 @@ func TestScanRunsOncePerIntervalAfterTheGateReopens(t *testing.T) {
 		sc.mu.Lock()
 		sc.storm = false
 		sc.mu.Unlock()
-		time.Sleep(2*every + 500*time.Millisecond)
+		time.Sleep(readStretch*every + time.Second) // the scan interval is stretched after a read throttle (S3)
 	}
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
@@ -1445,6 +1445,29 @@ func TestScanRunsOncePerIntervalAfterTheGateReopens(t *testing.T) {
 	}
 	if checked < 3 {
 		t.Fatalf("only %d reopen scans followed by another scan", checked)
+	}
+}
+
+// Benchmark S6: the activity scan takes read tokens like the chat reads (it
+// borrows only to go first after a throttle), so a scan interval shorter
+// than the read budget does not spend the whole budget on scans.
+func TestScanStaysWithinTheReadBudget(t *testing.T) {
+	var sc *lagScanner
+	r := newRig(t, func(c *Config) {
+		sc = &lagScanner{Fake: c.Channel.(*channeltest.Fake)}
+		c.Channel, c.ActivityScan = sc, true
+		c.Timing.HotFor, c.Timing.SafetyRead, c.Timing.ScanInterval = 200*time.Millisecond, time.Minute, 50*time.Millisecond
+		c.ReadRate = 2
+	})
+	r.control()
+	time.Sleep(time.Second)
+	n := func() int { sc.mu.Lock(); defer sc.mu.Unlock(); return len(sc.calls) + len(sc.reads) }
+	before := n()
+	time.Sleep(3 * time.Second)
+	// 2 reads/s with a burst of 2: at most about 8 in 3 s (a scan every
+	// 50 ms would be 60).
+	if got := n() - before; got > 9 {
+		t.Fatalf("%d scans and reads in 3 s at a read budget of 2/s", got)
 	}
 }
 

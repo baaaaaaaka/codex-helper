@@ -877,15 +877,27 @@ func (e *Engine) scanLoop(ctx context.Context) {
 			reopen.Reset(until.Sub(now))
 			continue
 		}
-		if !reopened && !last.IsZero() && now.Sub(last) < e.t.ScanInterval {
+		every := e.scanEvery(now)
+		if !reopened && !last.IsZero() && now.Sub(last) < every {
 			// One scan per interval: the tick (or a wake) right after
 			// the scan the gate's reopening ran would spend a second
 			// read of the scarce budget on the same change list.
 			continue
 		}
+		if reopened || e.scanFirst.Load() {
+			// The scan serves every chat: after a read throttle, or
+			// once it waited for a token, it goes first.
+			e.readTokens.borrow()
+		} else if ok, wait := e.readTokens.take(); !ok {
+			// Out of read budget (S6): the scan takes the next token
+			// and the chat reads wait for it, instead of borrowing
+			// every interval and spending a small budget on scans.
+			e.scanFirst.Store(true)
+			reopen.Reset(max(wait, e.t.Tick))
+			continue
+		}
 		last = now
-		tick.Reset(e.t.ScanInterval) // the cadence counts from this scan
-		e.readTokens.borrow()
+		tick.Reset(every) // the cadence counts from this scan
 		started := e.now()
 		acts, err := e.scanner.ScanActivity(ctx, mark.Add(-scanOverlap))
 		e.count(func(s *engineStats) { s.reads++ })
@@ -945,6 +957,17 @@ func (e *Engine) scanLoop(ctx context.Context) {
 			e.wakeReader()
 		}
 	}
+}
+
+// scanEvery is the activity scan interval: stretched like the control and
+// hot polls (S3) while the account's reads were throttled recently.
+func (e *Engine) scanEvery(now time.Time) time.Duration {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if until := e.gates[e.gRead]; !until.IsZero() && now.Sub(until) < readStretchFor {
+		return e.t.ScanInterval * readStretch
+	}
+	return e.t.ScanInterval
 }
 
 // scanOverlap re-lists chats this far behind the watermark; repeats are

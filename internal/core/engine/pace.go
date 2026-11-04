@@ -28,6 +28,14 @@ import (
 //     then refills at the (cut) rate one request at a time (burst 1 for a
 //     quiet period): the release is gradual, never a burst of everything
 //     that waited.
+//   - A throttle after the requests resumed from an earlier one measures
+//     the budget: the requests the service let through since they resumed
+//     (all but the throttled one) over the time since then plus the new
+//     Retry-After. When that is lower than the cut rate, the rate drops to
+//     it, below the floor if need be (benchmark S6: a budget of 0.2/s with
+//     a Retry-After of 30 s, far under the floor, made every window end in
+//     a 429). Below the floor a quiet period adds half the rate instead of
+//     a step, so the rate climbs back without jumping over such a budget.
 type pacer struct {
 	mu          sync.Mutex
 	ceil, floor float64
@@ -43,6 +51,7 @@ type pacer struct {
 	cut         time.Time // the last cut
 	resumed     time.Time // the end of the last cut's Retry-After
 	refused     time.Time // the last refused take (demand above the rate)
+	granted     int       // requests let through since the last cut
 	now         func() time.Time
 }
 
@@ -90,10 +99,10 @@ func (p *pacer) advance(now time.Time) {
 	case p.rate < p.learned:
 		for n := int(now.Sub(p.since) / p.every); n > 0 && p.rate < p.learned; n-- {
 			if p.fast {
-				p.rate = math.Max(p.rate+p.step, p.before*paceRestore)
+				p.rate = math.Max(p.rate+p.stepAt(), p.before*paceRestore)
 				p.fast = false
 			} else {
-				p.rate += p.step
+				p.rate += p.stepAt()
 			}
 			p.since = p.since.Add(p.every)
 		}
@@ -115,6 +124,15 @@ func (p *pacer) advance(now time.Time) {
 	}
 }
 
+// stepAt is the additive increase at the current rate: a step, or half the
+// rate below the floor (a measured budget far under the floor).
+func (p *pacer) stepAt() float64 {
+	if p.rate < p.floor {
+		return math.Min(p.step, p.rate/2)
+	}
+	return p.step
+}
+
 // take takes one token; it returns false (and how long to wait) when none
 // is available.
 func (p *pacer) take() (bool, time.Duration) {
@@ -124,6 +142,7 @@ func (p *pacer) take() (bool, time.Duration) {
 	p.advance(now)
 	if p.tokens >= 1 && !now.Before(p.last) {
 		p.tokens--
+		p.granted++
 		return true, 0
 	}
 	p.refused = now
@@ -143,6 +162,7 @@ func (p *pacer) borrow() {
 	now := p.now()
 	p.advance(now)
 	p.tokens = math.Max(-p.burst(now), p.tokens-1)
+	p.granted++
 }
 
 // throttled records an account throttle of a request that started at
@@ -155,14 +175,22 @@ func (p *pacer) throttled(started, resume time.Time) (cut bool, rate float64) {
 	p.advance(now)
 	if started.After(p.cut) {
 		prev := p.rate
-		if !p.cut.IsZero() && now.Sub(p.quietFrom()) < p.every {
+		switch {
+		case p.rate < p.floor:
+			p.rate *= paceCut // a measured budget below the floor: never raised by a cut
+		case !p.cut.IsZero() && now.Sub(p.quietFrom()) < p.every:
 			p.rate = math.Max(p.floor, p.rate*paceCut)
-		} else {
+		default:
 			p.rate = math.Max(p.floor, p.rate-p.step)
 		}
 		p.learned = math.Max(p.floor, prev-p.step)
 		p.before, p.fast = prev, true
+		if est, ok := p.measured(now, resume); ok && est < p.rate {
+			p.rate = est
+			p.before, p.fast = est, false
+		}
 		p.cut, p.since = now, now
+		p.granted = 0
 		cut = true
 	}
 	p.tokens = 0
@@ -176,6 +204,26 @@ func (p *pacer) throttled(started, resume time.Time) (cut bool, rate float64) {
 		p.since = resume
 	}
 	return cut, p.rate
+}
+
+// measured is the budget a throttle shows when it follows an earlier one:
+// the requests let through since the requests resumed, but the throttled
+// one, over the time since then plus the new Retry-After (at least one
+// request per two Retry-Afters). p.mu must be held.
+func (p *pacer) measured(now, resume time.Time) (float64, bool) {
+	if p.resumed.IsZero() || p.granted == 0 || !now.After(p.resumed) {
+		return 0, false
+	}
+	ra := resume.Sub(now)
+	window := now.Sub(p.resumed) + ra
+	if window <= 0 {
+		return 0, false
+	}
+	est := float64(max(1, p.granted-1)) / window.Seconds()
+	if ra > 0 {
+		est = math.Max(est, 1/(2*ra.Seconds()))
+	}
+	return est, true
 }
 
 // limited reports whether the requests are paced below the demand: the
