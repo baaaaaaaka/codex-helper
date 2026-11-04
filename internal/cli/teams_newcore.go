@@ -73,6 +73,8 @@ type teamsNewCoreOverrides struct {
 	ReadRate float64
 	// Prepare runs on the acquired store before the engine is built.
 	Prepare func(st *corestore.Store, dir string) error
+	// Host replaces os.Hostname() ("" = keep it).
+	Host string
 }
 
 var teamsNewCoreTestOverrides func(stderr io.Writer) (teamsNewCoreOverrides, error)
@@ -266,6 +268,9 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 	}
 	defer st.Close()
 	host, _ := os.Hostname()
+	if ov.Host != "" {
+		host = ov.Host
+	}
 	if _, err := st.Acquire(corestore.Ident{Host: host, PID: os.Getpid(), BootID: teamsBootID()}); err != nil {
 		if errors.Is(err, corestore.ErrDisabled) {
 			return fmt.Errorf("the Teams helper is disabled (%s exists next to %s)", corestore.DisabledFile, path)
