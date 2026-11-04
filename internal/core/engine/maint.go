@@ -63,6 +63,47 @@ func (e *Engine) loadGates() error {
 
 // rehashLegacy replaces imported legacy body hashes with the adapter's
 // hash once, at the first start after a migration.
+// renderLegacy renders the unsent rows imported from the legacy helper,
+// whose body is still the legacy Markdown text, into channel payloads
+// before anything is sent. Rendering is local (no mention, no formula
+// service). A row that does not fit one part keeps the first part and the
+// rest is queued after it.
+func (e *Engine) renderLegacy(ctx context.Context) error {
+	var rows []store.Outbox
+	if err := e.update(func(tx *store.Tx) error {
+		var err error
+		rows, err = tx.LegacyUnsentOutbox()
+		return err
+	}); err != nil || len(rows) == 0 {
+		return err
+	}
+	err := e.update(func(tx *store.Tx) error {
+		for _, r := range rows {
+			label := labelHelper
+			if r.Kind == store.OutFinal || r.Kind == store.OutProgress || r.Kind == store.OutMirror {
+				label = labelCodex
+			}
+			msgs, err := e.render(ctx, channel.RichDoc{Label: label, Markdown: r.Body, ReplyTo: r.ReplyTo}, r.Kind, r.DeliveryKey+":r")
+			if err != nil {
+				return err
+			}
+			if err := tx.SetOutboxRendered(r.ID, msgs[0].Body, msgs[0].BodyHash); err != nil {
+				return err
+			}
+			if len(msgs) > 1 {
+				if _, err := tx.Enqueue(r.ConvID, msgs[1:]); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
+	if err == nil {
+		e.logf("rendered %d imported unsent messages", len(rows))
+	}
+	return err
+}
+
 func (e *Engine) rehashLegacy() error {
 	h, ok := e.cfg.Channel.(channel.BodyHasher)
 	if !ok {

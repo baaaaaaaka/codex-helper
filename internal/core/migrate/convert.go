@@ -77,6 +77,7 @@ type converter struct {
 	orphans      map[string]int64        // unknown chat (or "session:<id>") -> placeholder conversation
 	lastAct      map[int64]int64         // newest activity per conversation (unix ms)
 	unknownSrc   int                     // source rows with an unknown send outcome
+	staleUnsent  int                     // unsent source rows dropped as stale
 	anchors      map[string]legacyAnchor // by source path
 	threadLinks  map[string]threadLink
 	proofs       map[string]*proof // delivery-ledger proof per rollout path
@@ -839,6 +840,7 @@ type compactOut struct {
 	conv   int64
 	state  string
 	opaque bool
+	stale  bool
 }
 
 func (c *converter) convertOutbox() error {
@@ -863,15 +865,18 @@ func (c *converter) convertOutbox() error {
 			o.ID = r.ID
 		}
 		unknown := o.unknownOutcome()
-		if unknown {
-			c.unknownSrc++
-		}
+		// An unsent row older than Options.StaleUnsent is not sent (or resolved
+		// and possibly re-sent) weeks later: it is dropped and counted in
+		// the summary. An unparsable row has no age and stays unknown.
+		created := ms(o.CreatedAt)
+		stale := !opaque && o.Status != "sent" && o.Status != "skipped" && created > 0 &&
+			c.opt.StaleUnsent > 0 && created < c.ms()-c.opt.StaleUnsent.Milliseconds()
 		conv, ok := c.convOf(o.SessionID, o.TeamsChatID)
 		if !ok && o.SessionID == "" && (o.TeamsChatID == "" || o.TeamsChatID == c.controlChat) {
 			conv, ok = c.control, c.control != 0
 		}
 		if !ok {
-			if unknown || o.Status == "queued" {
+			if (unknown || o.Status == "queued") && !stale {
 				return fmt.Errorf("outbox %s (%s) has no conversation", o.ID, o.Status)
 			}
 			e.Outcomes["chat unknown -> dropped"]++
@@ -879,6 +884,9 @@ func (c *converter) convertOutbox() error {
 		}
 		st := ""
 		switch {
+		case stale:
+			st = store.OutDropped
+			c.staleUnsent++
 		case unknown:
 			st = store.OutUnknown
 		case o.Status == "queued":
@@ -889,9 +897,11 @@ func (c *converter) convertOutbox() error {
 			st = store.OutDropped
 		default:
 			st = store.OutUnknown
+		}
+		if st == store.OutUnknown {
 			c.unknownSrc++
 		}
-		byConv[conv] = append(byConv[conv], &compactOut{o: o, conv: conv, state: st, opaque: opaque})
+		byConv[conv] = append(byConv[conv], &compactOut{o: o, conv: conv, state: st, opaque: opaque, stale: stale})
 		return nil
 	})
 	if err != nil {
@@ -927,12 +937,16 @@ func (c *converter) convertOutbox() error {
 				State: co.state, ExtMsgID: o.TeamsMessageID, CreatedAt: firstNonZero(ms(o.CreatedAt), c.ms()), SentAt: ms(o.SentAt),
 				BodyHash: renderedHash(o.RenderedHash),
 			}
-			if row.BodyHash != nil {
-				row.HashAlgo = store.HashLegacy // re-hashed by the core at first start
+			if row.BodyHash != nil || row.State == store.OutQueued || row.State == store.OutUnknown {
+				// Re-hashed (sent rows) or rendered from the legacy text
+				// (unsent rows) by the core at first start.
+				row.HashAlgo = store.HashLegacy
 			}
 			switch {
 			case co.opaque && co.state != store.OutUnknown:
 				row.Note = "migrated: unparsable legacy row (" + o.Status + "); key kept"
+			case co.stale:
+				row.Note = "migrated: unsent for more than " + c.opt.StaleUnsent.String() + " before the conversion (" + o.Status + "); not sent"
 			case co.state == store.OutDropped:
 				row.Note = "legacy skipped: " + firstNonEmpty(o.LastSendError, "(no reason recorded)")
 			}
@@ -968,7 +982,11 @@ func (c *converter) convertOutbox() error {
 				return fmt.Errorf("duplicate outbox key %s", row.DeliveryKey)
 			}
 			e.Imported++
-			e.Outcomes[o.Status+" -> "+co.state]++
+			if co.stale {
+				e.Outcomes[o.Status+" -> dropped (stale)"]++
+			} else {
+				e.Outcomes[o.Status+" -> "+co.state]++
+			}
 			if row.State == store.OutSent {
 				c.touch(conv, firstNonZero(row.SentAt, row.CreatedAt))
 			}
@@ -987,8 +1005,8 @@ func (c *converter) convertOutbox() error {
 		if err != nil {
 			return err
 		}
-		if _, _, err := c.im.Outbox(store.Outbox{ConvID: ct.conv, DeliveryKey: "legacy-interrupted:" + id, Seq: seq + 1, Kind: store.OutNotice,
-			Body:  "The turn that was running when the helper was upgraded was interrupted. Send `retry` to run it again.",
+		if _, _, err := c.im.Outbox(store.Outbox{ConvID: ct.conv, DeliveryKey: "legacy-interrupted:" + id, Seq: seq + 1, Kind: store.OutNotice, HashAlgo: store.HashLegacy,
+			Body:  "The previous request was interrupted when the helper stopped. It was not re-run; resend it if you still need it.",
 			State: store.OutQueued, CreatedAt: c.ms()}, nil); err != nil {
 			return err
 		}
@@ -1171,6 +1189,10 @@ func (c *converter) countArtifacts() error {
 	})
 }
 
+// maxImportedGate bounds a chat or account gate carried over from the old
+// store.
+const maxImportedGate = time.Hour
+
 func (c *converter) convertGates() error {
 	e := c.rep.E("chat_rate_limits")
 	return c.l.each("chat_rate_limits", func(r row) error {
@@ -1185,6 +1207,12 @@ func (c *converter) convertGates() error {
 		if until <= c.ms() {
 			e.Outcomes["expired -> dropped"]++
 			return nil
+		}
+		// Graph's Retry-After is seconds to minutes: a longer block is
+		// stale state and would hold the chat's messages indefinitely.
+		if limit := c.ms() + maxImportedGate.Milliseconds(); until > limit {
+			until = limit
+			e.Outcomes["capped to "+maxImportedGate.String()]++
 		}
 		// Keys the engine reads (store/keys.go): the legacy account-wide
 		// Graph write gate becomes the account write gate, a chat gate

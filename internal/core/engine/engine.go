@@ -450,6 +450,9 @@ func (e *Engine) start(ctx context.Context) error {
 	if err := e.loadGates(); err != nil {
 		return err
 	}
+	if err := e.renderLegacy(ctx); err != nil {
+		return fmt.Errorf("engine: render imported messages: %w", err)
+	}
 	if err := e.rehashLegacy(); err != nil {
 		return fmt.Errorf("engine: re-hash legacy outbox: %w", err)
 	}
@@ -493,7 +496,25 @@ func (e *Engine) start(ctx context.Context) error {
 	if err := e.announceUpdate(); err != nil {
 		return fmt.Errorf("engine: announce update: %w", err)
 	}
+	if err := e.announceMigration(); err != nil {
+		return fmt.Errorf("engine: announce migration: %w", err)
+	}
 	return nil
+}
+
+// announceMigration posts the converter's summary to the control chat
+// once: it is enqueued and cleared in one transaction.
+func (e *Engine) announceMigration() error {
+	return e.update(func(tx *store.Tx) error {
+		text, _, err := tx.Meta(store.MetaMigrationSummary)
+		if err != nil || strings.TrimSpace(text) == "" {
+			return err
+		}
+		if err := e.enqueueNotice(tx, e.controlID, "migration:summary", text); err != nil {
+			return err
+		}
+		return tx.SetMeta(store.MetaMigrationSummary, "")
+	})
 }
 
 // load reads conversations, threads and streams into memory.

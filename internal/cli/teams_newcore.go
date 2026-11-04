@@ -79,15 +79,37 @@ var teamsNewCoreTestOverrides func(stderr io.Writer) (teamsNewCoreOverrides, err
 
 var migratedMarkerRE = regexp.MustCompile(`^migrated to (.+) at \S+ by cxp teams migrate`)
 
-// resolveTeamsCoreStorePath finds the core.sqlite to run on under the state
-// root. A legacy store that was never migrated is refused: conversion is
-// an explicit, offline step (`cxp teams migrate`), never automatic.
+// errTeamsStoreNotConverted: the store under the state root is from an
+// earlier helper version and is converted when the helper next starts.
+type errTeamsStoreNotConverted struct{ source string }
+
+func (e errTeamsStoreNotConverted) Error() string {
+	return fmt.Sprintf("the Teams store at %s is from an earlier helper version; the helper converts it when it starts (`cxp teams run` or the background service)", e.source)
+}
+
+// resolveTeamsCoreStorePath finds the core.sqlite the helper runs on, for
+// commands that only read or configure it: a store still to be converted
+// is an errTeamsStoreNotConverted.
 func resolveTeamsCoreStorePath(stateDir string) (string, error) {
+	path, from, err := planTeamsCoreStore(stateDir)
+	if err == nil && from != "" {
+		return "", errTeamsStoreNotConverted{source: from}
+	}
+	return path, err
+}
+
+// planTeamsCoreStore finds the core.sqlite to run on under the state root.
+// migrateFrom is set when no converted store exists yet and a single
+// supported older store (v0.1.20 or rc.59) does: the helper converts it
+// at its first start into path (next to it). Stores of an intermediate
+// release, or several candidates, are refused with what to do.
+func planTeamsCoreStore(stateDir string) (path, migrateFrom string, err error) {
 	if p := strings.TrimSpace(os.Getenv(envTeamsCoreStore)); p != "" {
-		return filepath.Abs(p)
+		p, err := filepath.Abs(p)
+		return p, "", err
 	}
 	exists := func(p string) bool { _, err := os.Stat(p); return err == nil }
-	var found, unmigrated []string
+	var found []string
 	add := func(p string) {
 		for _, f := range found {
 			if f == p {
@@ -103,7 +125,6 @@ func resolveTeamsCoreStorePath(stateDir string) (string, error) {
 		}
 		raw, err := os.ReadFile(filepath.Join(dir, migrate.MarkerName))
 		if err != nil {
-			unmigrated = append(unmigrated, dir)
 			continue
 		}
 		// Migrated with --out elsewhere: the marker names the target.
@@ -117,13 +138,61 @@ func resolveTeamsCoreStorePath(stateDir string) (string, error) {
 	}
 	switch {
 	case len(found) == 1:
-		return found[0], nil
+		return found[0], "", nil
 	case len(found) > 1:
-		return "", fmt.Errorf("several Teams core stores exist (%s); set %s to the one to use", strings.Join(found, ", "), envTeamsCoreStore)
-	case len(unmigrated) > 0:
-		return "", fmt.Errorf("a Teams store from an earlier helper version is at %s and has not been converted; stop the helper and run `cxp teams migrate --source %s` first", unmigrated[0], unmigrated[0])
+		return "", "", fmt.Errorf("several Teams core stores exist (%s); set %s to the one to use", strings.Join(found, ", "), envTeamsCoreStore)
 	}
-	return fresh, nil
+	src, err := migrate.ChooseSource(migrate.Pending(stateDir))
+	if err != nil {
+		return "", "", err
+	}
+	if src != "" {
+		return filepath.Join(src, migrate.TargetName), src, nil
+	}
+	return fresh, "", nil
+}
+
+// teamsMigrateRetry is the first wait after a failed conversion at start;
+// it doubles up to teamsMigrateRetryMax. The helper waits in-process so a
+// failing conversion of a large store is never repeated at the service
+// manager's restart rate.
+var (
+	teamsMigrateRetry    = 30 * time.Second
+	teamsMigrateRetryMax = 30 * time.Minute
+)
+
+// migrateTeamsStoreAtStart converts the older store at src into
+// src/core.sqlite (read-only on the old store, which stays as the backup;
+// the result is renamed into place only when complete). The conversion
+// leaves a summary in the new store that the engine posts once.
+func migrateTeamsStoreAtStart(ctx context.Context, src, sessionsDir string, log io.Writer) error {
+	wait := teamsMigrateRetry
+	for {
+		if _, err := os.Stat(filepath.Join(src, migrate.TargetName)); err == nil {
+			return nil // converted meanwhile (another start, or `cxp teams migrate`)
+		}
+		_, _ = fmt.Fprintf(log, "Converting the Teams store at %s (first start of this version; the old store is kept unchanged)\n", src)
+		started := time.Now()
+		rep, err := migrate.Run(migrate.Options{Source: src, CodexSessions: sessionsDir, CountBacklog: true})
+		if err == nil {
+			_, _ = fmt.Fprintf(log, "Teams store converted in %s; report: %s\n", time.Since(started).Round(time.Second), filepath.Join(src, migrate.ReportName))
+			return nil
+		}
+		if rep != nil {
+			err = fmt.Errorf("%w (report: %s)", err, filepath.Join(src, migrate.ReportName))
+		}
+		_, _ = fmt.Fprintf(log, "Teams store conversion failed: %v; retrying in %s\n", err, wait)
+		t := time.NewTimer(wait)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return err
+		case <-t.C:
+		}
+		if wait *= 2; wait > teamsMigrateRetryMax {
+			wait = teamsMigrateRetryMax
+		}
+	}
 }
 
 // teamsNewCoreWorkflowURL reads the Workflow (owner card) webhook from the
@@ -174,9 +243,18 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 	if err != nil {
 		return err
 	}
-	path, err := resolveTeamsCoreStorePath(stateDir)
+	path, migrateFrom, err := planTeamsCoreStore(stateDir)
 	if err != nil {
 		return err
+	}
+	_, paths, err := newRootStore(root, "")
+	if err != nil {
+		return err
+	}
+	if migrateFrom != "" {
+		if err := migrateTeamsStoreAtStart(ctx, migrateFrom, filepath.Join(paths.CodexDir, "sessions"), errOut); err != nil {
+			return err
+		}
 	}
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -222,10 +300,6 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 	}
 
 	// Codex: an explicit --codex-path, else the discovered installation.
-	_, paths, err := newRootStore(root, "")
-	if err != nil {
-		return err
-	}
 	codexBin := strings.TrimSpace(opts.codexPath)
 	if codexBin == "" {
 		if codexBin, err = ensureCodexInstalled(ctx, "", errOut); err != nil {

@@ -229,6 +229,20 @@ func (s *Server) CreateMeetingChatAsUser(topic string) ChatInfo {
 	return info
 }
 
+// SeedChat adds a group chat with a known id that existed before the
+// scenario (an older helper created it), with the owner as its member.
+func (s *Server) SeedChat(id, topic string) ChatInfo {
+	s.mu.Lock()
+	if s.chats[id] == nil {
+		c := &Chat{ID: id, Topic: topic, ChatType: "group", Created: s.nextStampLocked(), Members: []string{s.opts.Owner.ID}}
+		s.chats[id] = c
+		s.chatOrder = append(s.chatOrder, id)
+	}
+	s.mu.Unlock()
+	info, _ := s.Chat(id)
+	return info
+}
+
 // SetPreviewLag changes Options.PreviewLag at run time.
 func (s *Server) SetPreviewLag(d time.Duration) {
 	s.mu.Lock()

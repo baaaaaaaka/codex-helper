@@ -26,8 +26,8 @@ func writeFile(t *testing.T, path, body string) {
 }
 
 // The store the new core runs on: the converted store when there is one,
-// a fresh one only when no older helper ever ran, and never an automatic
-// conversion of an old store.
+// a fresh one only when no older helper ever ran (an older store is
+// converted at the first start: teams_newcore_migrate_test.go).
 func TestTeamsCoreStoreResolution(t *testing.T) {
 	t.Setenv(envTeamsCoreStore, "")
 	t.Run("fresh install", func(t *testing.T) {
@@ -37,11 +37,11 @@ func TestTeamsCoreStoreResolution(t *testing.T) {
 			t.Fatalf("got %q, %v", got, err)
 		}
 	})
-	t.Run("old store not converted is refused", func(t *testing.T) {
+	t.Run("intermediate release store is refused", func(t *testing.T) {
 		root := t.TempDir()
 		writeFile(t, filepath.Join(root, "teams", "scopes", "s1", "state.json"), "{}")
 		_, err := resolveTeamsCoreStorePath(root)
-		if err == nil || !strings.Contains(err.Error(), "`cxp teams migrate --source "+filepath.Join(root, "teams", "scopes", "s1")+"`") {
+		if err == nil || !strings.Contains(err.Error(), "run v0.1.22-rc.59 once") {
 			t.Fatalf("err = %v", err)
 		}
 	})
@@ -87,7 +87,8 @@ func TestTeamsCoreStoreResolution(t *testing.T) {
 	})
 }
 
-// `cxp teams run` on an old store stops before touching it.
+// `cxp teams run` on a store of an intermediate release stops before
+// touching it and says to run rc.59 once first.
 func TestTeamsRunNewCoreRefusesUnconvertedStore(t *testing.T) {
 	state := t.TempDir()
 	t.Setenv("CODEX_HELPER_STATE_DIR", state)
@@ -99,7 +100,7 @@ func TestTeamsRunNewCoreRefusesUnconvertedStore(t *testing.T) {
 	cmd.SetOut(&strings.Builder{})
 	cmd.SetErr(&strings.Builder{})
 	err := cmd.Execute()
-	if err == nil || !strings.Contains(err.Error(), "cxp teams migrate") {
+	if err == nil || !strings.Contains(err.Error(), "run v0.1.22-rc.59 once") {
 		t.Fatalf("err = %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(state, "teams", migrate.TargetName)); !os.IsNotExist(err) {

@@ -201,3 +201,105 @@ func TestConvertedStoreKeepsCursorsAndCatchesUpAcrossRestart(t *testing.T) {
 type writerFunc func([]byte)
 
 func (f writerFunc) Write(b []byte) (int, error) { f(b); return len(b), nil }
+
+// The first start renders the unsent rows the converter kept (their body
+// is the legacy Markdown text) into channel payloads before sending them,
+// with the label of their kind, and posts the summary once.
+func TestFirstStartRendersImportedUnsentRows(t *testing.T) {
+	out := t.TempDir()
+	// Real time: the fixture's leases are long expired; its unsent rows are
+	// kept (StaleUnsent -1) so they are sent.
+	if _, err := Run(Options{Source: fixture(t, "v0120", "json"), Out: out, DryRun: true, StaleUnsent: -1}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(out, TargetName)
+	st, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	convs, err := st.Conversations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ch := &cursorChannel{Fake: channeltest.New()}
+	var control string
+	for _, c := range convs {
+		if c.ExtChatID != "" {
+			ch.PostSystem(c.ExtChatID, "chat exists")
+		}
+		if c.Kind == store.KindControl {
+			control = c.ExtChatID
+		}
+	}
+	if _, err := st.Acquire(store.Ident{Host: "h", PID: 1, BootID: "b"}); err != nil {
+		t.Fatal(err)
+	}
+	var log strings.Builder
+	var logMu sync.Mutex
+	e, err := engine.New(engine.Config{Store: st, Channel: ch, ChannelName: "teams", Agent: idleAgent{}, Timing: engine.FastTiming(20 * time.Millisecond),
+		Machine: "m", Log: writerFunc(func(b []byte) { logMu.Lock(); log.Write(b); logMu.Unlock() })})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- e.Run(ctx) }()
+	defer func() { cancel(); <-done; st.Release(); st.Close() }()
+
+	summaries := func() int {
+		n := 0
+		for _, m := range ch.Messages(control) {
+			if m.ByOwner && strings.Contains(m.Text, "Teams helper data converted") {
+				n++
+			}
+		}
+		return n
+	}
+	// Every imported row rendered, and one of them sent to a work chat.
+	importedSent := func() bool {
+		var left int
+		if err := st.Update(func(tx *store.Tx) error {
+			rows, err := tx.LegacyUnsentOutbox()
+			left = len(rows)
+			return err
+		}); err != nil || left > 0 {
+			return false
+		}
+		for _, c := range convs {
+			if c.Kind == store.KindControl {
+				continue
+			}
+			for _, m := range ch.Messages(c.ExtChatID) {
+				if m.ByOwner {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	deadline := time.Now().Add(15 * time.Second)
+	for summaries() < 1 || !importedSent() {
+		if time.Now().After(deadline) {
+			logMu.Lock()
+			t.Fatalf("summary or an imported row not sent (control %s)\nengine log:\n%s", control, log.String())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if n := summaries(); n != 1 {
+		t.Errorf("summary sent %d times", n)
+	}
+	for _, c := range convs {
+		for _, m := range ch.Messages(c.ExtChatID) {
+			// A legacy body sent without rendering has no label line.
+			if m.ByOwner && !strings.HasPrefix(m.Text, "🔧 Helper") && !strings.HasPrefix(m.Text, "Codex") {
+				t.Errorf("unrendered message in %s: %q", c.Label, m.Text)
+			}
+		}
+	}
+	logMu.Lock()
+	defer logMu.Unlock()
+	if !strings.Contains(log.String(), "rendered ") {
+		t.Errorf("no render at start:\n%s", log.String())
+	}
+}

@@ -125,6 +125,10 @@ func TestProofBasedResume(t *testing.T) {
 		eq(t, "catch-up prompts", rep.Backlog.Prompts, 1)
 		eq(t, "catch-up finals", rep.Backlog.Finals, 1)
 		eq(t, "gap", rep.Backlog.Gap, 2)
+		// The control-chat summary carries the catch-up size.
+		if sum := qs(t, db, `SELECT value FROM meta WHERE key = ?`, store.MetaMigrationSummary); !strings.Contains(sum, "120 days: 2 prompts and answers from 1 session (") {
+			t.Errorf("summary:\n%s", sum)
+		}
 		// The delivered outbox row carries the mirror key of its record.
 		eq(t, "o1 key", qs(t, db, `SELECT state FROM outbox WHERE delivery_key = ?`, MirrorKey(s001Thread, "f1", 1)), "sent")
 		eq(t, "o1 legacy key gone", qi(t, db, `SELECT count(*) FROM outbox WHERE delivery_key = 'legacy-outbox:o1'`), int64(0))

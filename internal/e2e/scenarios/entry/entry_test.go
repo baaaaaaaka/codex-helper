@@ -1,9 +1,11 @@
 package entry
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -73,15 +75,15 @@ func TestEntryFreshInstall(t *testing.T) {
 	s.Check("one control chat across the restart", controls == 1, "1", fmt.Sprint(controls))
 }
 
-// ENTRY-MIGRATE: an older helper's store that was never converted stops
-// the new core before it reads Teams or creates anything: the owner is told
-// to run `cxp teams migrate`; nothing is converted automatically.
+// ENTRY-MIGRATE: a store of an intermediate release (neither v0.1.20 nor
+// rc.59) stops the new core before it reads Teams or creates anything: the
+// owner is told to run rc.59 once first.
 func TestEntryRefusesUnconvertedStore(t *testing.T) {
 	cxpOnly(t)
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "ENTRY-MIGRATE", harness.Options{
-		Guarantees: []string{"entry-point", "no-auto-migrate"},
-		Title:      "an unconverted old store is refused with the migrate instruction; nothing is touched",
+		Guarantees: []string{"entry-point", "unsupported-store-refused"},
+		Title:      "an intermediate-release store is refused with the rc.59 instruction; nothing is touched",
 		Budget:     60 * time.Second,
 		NoStart:    true,
 	})
@@ -98,7 +100,7 @@ func TestEntryRefusesUnconvertedStore(t *testing.T) {
 		return !s.SUT.Running(), s.OutputTail(300)
 	})
 	out := s.SUT.Output()
-	s.Check("the owner is told to run the migration", strings.Contains(out, "`cxp teams migrate --source "+dir+"`"), "migrate instruction naming the store", s.OutputTail(400))
+	s.Check("the owner is told to run rc.59 once first", strings.Contains(out, "run v0.1.22-rc.59 once"), "rc.59 instruction", s.OutputTail(400))
 	s.Check("the process exits with an error (not a restart request)", strings.Contains(out, "exited: exit status 1"), "exit status 1", s.OutputTail(200))
 	_, err := os.Stat(filepath.Join(dir, "core.sqlite"))
 	s.Check("no store is created", os.IsNotExist(err), "no core.sqlite", fmt.Sprint(err))
@@ -106,4 +108,123 @@ func TestEntryRefusesUnconvertedStore(t *testing.T) {
 	s.Check("Teams is not contacted", len(reqs) == 0, "0 Graph requests", fmt.Sprint(len(reqs)), s.RequestTail(5)...)
 	raw, _ := os.ReadFile(filepath.Join(dir, "state.json"))
 	s.Check("the old store is untouched", string(raw) == `{"schema_version":1}`, "unchanged", string(raw))
+}
+
+var chatIDRE = regexp.MustCompile(`19:[A-Za-z0-9_.-]+@thread\.v2`)
+
+// ENTRY-AUTOMIGRATE: the first start of this version on an rc.59 store
+// (written by the rc.59 code: internal/core/migrate/testdata) converts it
+// into core.sqlite next to it, keeps the old files unchanged, posts the
+// conversion summary to the control chat once and the interrupted-request
+// notice once, also across a restart, which runs on the converted store
+// without converting again.
+func TestEntryConvertsOldStoreAtFirstStart(t *testing.T) {
+	cxpOnly(t)
+	harness.Parallel(t)
+	s := harness.NewScenario(t, "ENTRY-AUTOMIGRATE", harness.Options{
+		Guarantees: []string{"entry-point", "auto-migrate"},
+		Title:      "first start on an rc.59 store: converted once, summary and interrupted notices once, old store kept",
+		Budget:     120 * time.Second,
+		NoStart:    true,
+	})
+	defer s.Finish()
+	scope := filepath.Join(teamsDir(s), "scopes", "scope_rc59")
+	if err := os.MkdirAll(scope, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	// The full-JSON form of an rc.59 store (the SQLite form is covered by
+	// the cli unit test and the real-store acceptance run). The fixture's
+	// chat gate until 2099 is removed: gates are honoured by design and
+	// would hold that chat's notice.
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "core", "migrate", "testdata", "rc59", "json", "state.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var state map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &state); err != nil {
+		t.Fatal(err)
+	}
+	delete(state, "chat_rate_limits")
+	if raw, err = json.Marshal(state); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(scope, "state.json"), raw, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before := map[string][]byte{"state.json": raw}
+	ids := map[string]bool{}
+	for _, id := range chatIDRE.FindAll(raw, -1) {
+		ids[string(id)] = true
+	}
+	// The chats the older helper created exist in Teams.
+	const control = "19:control@thread.v2"
+	for id := range ids {
+		s.Graph.SeedChat(id, "")
+	}
+	s.Check("the control chat is among the old store's chats", ids[control], control, fmt.Sprint(len(ids)))
+
+	own := func(chat, sub string) int {
+		n := 0
+		for _, m := range s.Graph.Messages(chat) {
+			if m.Origin == fakegraph.OriginSUT && strings.Contains(m.PlainText(), sub) {
+				n++
+			}
+		}
+		return n
+	}
+	const summary = "Teams helper data converted from v0.1.22-rc.59"
+	const interrupted = "The previous request was interrupted when the helper stopped"
+	interruptedAll := func() int {
+		n := 0
+		for id := range ids {
+			n += own(id, interrupted)
+		}
+		return n
+	}
+	s.StartSUT()
+	s.WaitFor("the conversion summary in the control chat", 60*time.Second, func() (bool, string) {
+		return own(control, summary) >= 1, s.OutputTail(400)
+	})
+	s.WaitFor("the interrupted-request notice", 30*time.Second, func() (bool, string) {
+		return interruptedAll() >= 1, s.OutputTail(200)
+	})
+	time.Sleep(3 * time.Second)
+	s.StopSUT()
+	s.StartSUT()
+	s.WaitFor("the restarted helper polls the control chat", 30*time.Second, func() (bool, string) {
+		return strings.Count(s.SUT.Output(), runningLine) == 2, s.OutputTail(200)
+	})
+	time.Sleep(3 * time.Second)
+
+	out := s.SUT.Output()
+	s.Check("the store is converted once", strings.Count(out, "Converting the Teams store") == 1 && strings.Count(out, "Teams store converted in") == 1,
+		"one conversion", s.OutputTail(600))
+	want := filepath.Join(scope, "core.sqlite")
+	s.Check("both starts run on the converted store next to the old one", strings.Count(out, runningLine+want) == 2, want+" twice", s.OutputTail(600))
+	s.Check("the summary is posted once", own(control, summary) == 1, "1", fmt.Sprint(own(control, summary)), s.Transcript(control, 6)...)
+	if msgs := s.Graph.Messages(control); len(msgs) > 0 {
+		for _, m := range msgs {
+			if m.Origin == fakegraph.OriginSUT && strings.Contains(m.PlainText(), summary) {
+				text := m.PlainText()
+				s.Check("the summary shows no paths", !strings.Contains(text, scope) && !strings.Contains(text, "scope_"), "no paths", text)
+			}
+		}
+	}
+	var transcripts []string
+	for id := range ids {
+		transcripts = append(transcripts, s.Transcript(id, 8)...)
+	}
+	for _, r := range s.Graph.Requests(fakegraph.RequestFilter{Method: "POST"}) {
+		transcripts = append(transcripts, r.String())
+	}
+	if raw, err := os.ReadFile(filepath.Join(scope, "migration-report.txt")); err == nil {
+		transcripts = append(transcripts, string(raw))
+	}
+	s.Check("each interrupted request gets one notice", interruptedAll() == 1, "1", fmt.Sprint(interruptedAll()), transcripts...)
+	for name, raw := range before {
+		now, err := os.ReadFile(filepath.Join(scope, name))
+		s.Check("the old store file "+name+" is unchanged", err == nil && string(now) == string(raw), "byte-identical", fmt.Sprint(err))
+	}
+	_, err = os.Stat(filepath.Join(scope, "migration-report.txt"))
+	s.Check("the conversion report is next to the store", err == nil, "migration-report.txt", fmt.Sprint(err))
 }

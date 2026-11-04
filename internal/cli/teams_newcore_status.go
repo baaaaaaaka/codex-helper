@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -36,6 +37,9 @@ func writeTeamsCoreStoreStatus(out io.Writer, now time.Time) {
 		return
 	}
 	_, _ = fmt.Fprintf(out, "Store: %s\n", path)
+	if report := filepath.Join(filepath.Dir(path), migrate.ReportName); teamsFileExists(report) {
+		_, _ = fmt.Fprintf(out, "Conversion report: %s\n", report)
+	}
 	st, err := corestore.OpenWith(path, corestore.Options{ReadOnly: true})
 	if err != nil {
 		_, _ = fmt.Fprintf(out, "Store unreadable: %v\n", err)
@@ -168,3 +172,5 @@ func teamsNewCoreStatusLines(st *corestore.Store, now time.Time) ([]string, erro
 	}
 	return lines, nil
 }
+
+func teamsFileExists(p string) bool { _, err := os.Stat(p); return err == nil }

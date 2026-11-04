@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -65,7 +66,9 @@ func copyFile(t *testing.T, src, dst string) {
 
 func dryRun(t *testing.T, dir string, mod func(*Options)) (*Report, *sql.DB) {
 	t.Helper()
-	opt := Options{Source: dir, Out: filepath.Join(t.TempDir(), "out"), DryRun: true, Now: func() time.Time { return testNow }}
+	// The fixtures are from 2026 and testNow is 2030: keep their unsent rows
+	// (TestStaleUnsentRowsDropped covers the default).
+	opt := Options{Source: dir, Out: filepath.Join(t.TempDir(), "out"), DryRun: true, StaleUnsent: -1, Now: func() time.Time { return testNow }}
 	if mod != nil {
 		mod(&opt)
 	}
@@ -189,6 +192,8 @@ func TestConvertFixtures(t *testing.T) {
 			eq(t, "o4 skipped", qs(t, db, `SELECT state || '/' || note || '/' || body FROM outbox WHERE delivery_key = 'legacy-outbox:o4'`), "dropped/legacy skipped: superseded by interrupted turn/skip me")
 			eq(t, "interruption notice", qs(t, db, outQ, "legacy-interrupted:t-run"), "queued")
 			eq(t, "unknown rows", qi(t, db, `SELECT count(*) FROM outbox WHERE state = 'unknown'`), int64(2))
+			// Unsent rows keep the legacy text: the core renders them.
+			eq(t, "unsent rows marked legacy", qi(t, db, `SELECT count(*) FROM outbox WHERE state IN ('queued','unknown') AND hash_algo IS NULL`), int64(0))
 
 			// Streams.
 			eq(t, "s001 cursor", qs(t, db, streamQ, StreamKey("19:chat-s001@thread.v2")), "2026-09-01T10:00:05Z")
@@ -197,7 +202,7 @@ func TestConvertFixtures(t *testing.T) {
 			}
 
 			// Gates: unexpired only.
-			eq(t, "gate", qi(t, db, `SELECT until FROM gates WHERE key = ?`, store.ChatGate("teams", "19:chat-s001@thread.v2")), time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli())
+			eq(t, "gate", qi(t, db, `SELECT until FROM gates WHERE key = ?`, store.ChatGate("teams", "19:chat-s001@thread.v2")), testNow.Add(time.Hour).UnixMilli()) // 2099 capped
 			eq(t, "expired gate", qi(t, db, `SELECT count(*) FROM gates`), int64(1))
 
 			// Transcript sources (no rollout access): stored offsets.
@@ -585,4 +590,28 @@ func TestMachineIdentityKept(t *testing.T) {
 	eq(t, "machine_id", qs(t, db, `SELECT value FROM meta WHERE key = 'machine_id'`), "machine:0123456789abcdef")
 	_, db = dryRun(t, fixture(t, "v0120", "json"), nil)
 	eq(t, "no machine_id without an identity", qi(t, db, `SELECT COUNT(*) FROM meta WHERE key = 'machine_id'`), int64(0))
+}
+
+// Unsent legacy rows from more than a day before the conversion are dropped
+// (not sent or resolved weeks later) and counted in the summary; the
+// interruption notice made at the conversion is kept.
+func TestStaleUnsentRowsDropped(t *testing.T) {
+	for _, v := range []string{"v0120", "rc59"} {
+		t.Run(v, func(t *testing.T) {
+			rep, db := dryRun(t, fixture(t, v, "sqlite-wal"), func(o *Options) { o.StaleUnsent = 0 })
+			if !rep.OK() {
+				t.Fatalf("checks: %+v", rep.Checks)
+			}
+			for _, k := range []string{"legacy-outbox:o2", "legacy-outbox:o3", "legacy-outbox:o6", "legacy-outbox:o7"} {
+				eq(t, k, qs(t, db, `SELECT state || '/' || substr(note, 1, 34) FROM outbox WHERE delivery_key = ?`, k), "dropped/migrated: unsent for more than 24h")
+			}
+			eq(t, "unknown rows", qi(t, db, `SELECT count(*) FROM outbox WHERE state = 'unknown'`), int64(0))
+			eq(t, "interruption notice", qs(t, db, outQ, "legacy-interrupted:t-run"), "queued")
+			sum := qs(t, db, `SELECT value FROM meta WHERE key = ?`, store.MetaMigrationSummary)
+			n := qi(t, db, `SELECT count(*) FROM outbox WHERE note LIKE 'migrated: unsent for more than%'`)
+			if want := fmt.Sprintf("%d older messages (from more than a day ago)", n); n == 0 || !strings.Contains(sum, want) {
+				t.Errorf("summary lacks %q:\n%s", want, sum)
+			}
+		})
+	}
 }

@@ -38,6 +38,10 @@ type Options struct {
 	// the prompts and finals the mirror will post on first start. Without
 	// it the proof scan stops at the furthest old position.
 	CountBacklog bool
+	// StaleUnsent: an unsent legacy row created longer than this before the
+	// conversion is dropped (counted in the summary) instead of being sent
+	// weeks later. 0 means 24h; negative keeps every unsent row.
+	StaleUnsent time.Duration
 	// Now is the clock (defaults to time.Now).
 	Now func() time.Time
 
@@ -58,6 +62,9 @@ const (
 func Run(opt Options) (*Report, error) {
 	if opt.Now == nil {
 		opt.Now = time.Now
+	}
+	if opt.StaleUnsent == 0 {
+		opt.StaleUnsent = 24 * time.Hour
 	}
 	if opt.Source == "" {
 		return nil, errors.New("migrate: no source directory")
@@ -136,7 +143,10 @@ func Run(opt Options) (*Report, error) {
 	}
 	err = st.Import(func(im *store.Importer) error {
 		c.im = im
-		return c.run()
+		if err := c.run(); err != nil {
+			return err
+		}
+		return im.SetMeta(store.MetaMigrationSummary, c.summary())
 	})
 	if err == nil {
 		validate(st, c)
