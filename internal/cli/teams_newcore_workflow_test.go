@@ -1,18 +1,20 @@
 package cli
 
 import (
+	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	corestore "github.com/baaaaaaaka/codex-helper/internal/core/store"
 )
 
 // With the new core selected, `teams workflow enable/disable/status` read
 // and write the new store's Workflow configuration (what the helper reads
-// at start) and never touch Graph or the old store. A running helper owns
-// the store, so the write is refused with the steps to apply it.
+// at start) and never touch Graph or the old store.
 func TestTeamsNewCoreWorkflowConfig(t *testing.T) {
 	lockCLITestHooks(t)
 	tmp := t.TempDir()
@@ -63,22 +65,54 @@ func TestTeamsNewCoreWorkflowConfig(t *testing.T) {
 		t.Fatalf("status = %q, %v", out, err)
 	}
 
-	// A live helper owns the store: refused, nothing changed.
-	st, err := corestore.Open(filepath.Join(tmp, "state", "teams", "core.sqlite"))
+	// A live helper owns the store: the command hands the change to it,
+	// and the helper applies it under its owner fence without a restart
+	// (as the old core did). Its notifier reads the setting at each card.
+	path := filepath.Join(tmp, "state", "teams", "core.sqlite")
+	st, err := corestore.Open(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err := st.Acquire(corestore.Ident{Host: "other-box", PID: 1, BootID: "b"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := run("disable"); err == nil || !strings.Contains(err.Error(), "cxp teams service stop") {
-		t.Fatalf("disable while running = %v", err)
+	n := &teamsNewCoreNotifier{st: st, path: path, log: io.Discard}
+	if !n.Available() {
+		t.Fatal("helper notifier off while enabled")
+	}
+	prevWait := teamsWorkflowApplyWait
+	teamsWorkflowApplyWait = 300 * time.Millisecond
+	t.Cleanup(func() { teamsWorkflowApplyWait = prevWait })
+
+	out, err = run("disable")
+	if err != nil || !strings.Contains(out, "has not picked the change up yet") {
+		t.Fatalf("disable while running, helper not polling = %q, %v", out, err)
+	}
+	if out, _ := run("status"); !strings.Contains(out, "Pending change: disabled") {
+		t.Fatalf("status with a pending change = %q", out)
+	}
+	if n.Available() {
+		t.Fatal("pending disable not applied by the helper's notifier")
+	}
+	if _, err := os.Stat(teamsWorkflowRequestPath(path)); !os.IsNotExist(err) {
+		t.Fatalf("request left after apply: %v", err)
+	}
+
+	teamsWorkflowApplyWait = 10 * time.Second
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { defer close(done); n.watch(ctx) }()
+	out, err = run("enable", "--webhook-url-file", secret)
+	cancel()
+	<-done
+	if err != nil || !strings.Contains(out, "The running Teams helper applied the change.") {
+		t.Fatalf("enable while running = %q, %v", out, err)
+	}
+	if !n.Available() {
+		t.Fatal("enable not in effect in the running helper")
 	}
 	_ = st.Release()
 	_ = st.Close()
-	if url() == "" {
-		t.Fatal("refused disable changed the setting")
-	}
 
 	if out, err := run("disable"); err != nil || !strings.Contains(out, "disabled") {
 		t.Fatalf("disable = %q, %v", out, err)

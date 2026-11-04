@@ -341,11 +341,9 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 	tr := voice.New(asr.New(opts.asrCommand, asrArgs, teamsNewCoreASRConfig()), "")
 	defer func() { _ = tr.Close() }()
 	cfg.Transcriber = tr
-	if url, err := teamsNewCoreWorkflowURL(st, dir); err != nil {
-		_, _ = fmt.Fprintf(errOut, "Teams Workflow cards are off: %v\n", err)
-	} else if url != "" {
-		cfg.Notifier = chteams.NewWorkflowNotifier(url, client)
-	}
+	notifier := &teamsNewCoreNotifier{st: st, path: path, client: client, log: errOut}
+	notifier.url() // applies a pending change and reports a broken setting once
+	cfg.Notifier = notifier
 
 	e, err := engine.New(cfg)
 	if err != nil {
@@ -354,6 +352,7 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 	_, _ = fmt.Fprintf(out, "Teams helper (new core) running on %s\n", path)
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
+	go notifier.watch(runCtx)
 	gatewayFailed := make(chan struct{})
 	if gatewayDone != nil {
 		go func() {
