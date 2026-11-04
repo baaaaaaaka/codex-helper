@@ -63,6 +63,8 @@ type Timing struct {
 	// PaceIncrease is the quiet period (no account write throttle) after
 	// which the paced write rate grows by one step (pace.go).
 	PaceIncrease time.Duration
+	// Registry is the machine card heartbeat (registry.go).
+	Registry time.Duration
 }
 
 // ProductionTiming are the CORE-DESIGN values.
@@ -81,6 +83,7 @@ func ProductionTiming() Timing {
 		QueueReminder: 10 * time.Minute,
 		ThrottleFloor: 10 * time.Second,
 		PaceIncrease:  30 * time.Second,
+		Registry:      5 * time.Minute,
 	}
 }
 
@@ -104,6 +107,7 @@ func FastTiming(base time.Duration) Timing {
 	t.CancelWait = 5 * time.Second
 	t.ThrottleFloor = 10 * base
 	t.PaceIncrease = 30 * base
+	t.Registry = 20 * base
 	return t
 }
 
@@ -143,6 +147,8 @@ type Config struct {
 	// InboxKey is the channel key of the inbox chat ("" = derived from the
 	// store); a registry publishes it so requesters find the same chat.
 	InboxKey string
+	// Registrar publishes the machine card (with Registry; nil = none).
+	Registrar Registrar
 	// Skills runs the `skills` command (nil: not available).
 	Skills Skills
 
@@ -199,9 +205,12 @@ type Engine struct {
 	cmdPending   map[int64][]cmdJob // per-conversation command queues; present while a worker runs
 	asrWake      chan struct{}
 	notifyWake   chan struct{}
-	notifyN      atomic.Int64        // pending owner notifications (notify.go)
-	fileTries    map[string]int      // transient attachment failures by "<inbound>/<idx>"
-	uploadAt     map[int64]time.Time // outbound file rows waiting before an upload retry
+	notifyN      atomic.Int64 // pending owner notifications (notify.go)
+	// drainFlag holds new turn starts while an update waits for running
+	// turns to finish (upgrade.go).
+	drainFlag atomic.Bool
+	fileTries map[string]int      // transient attachment failures by "<inbound>/<idx>"
+	uploadAt  map[int64]time.Time // outbound file rows waiting before an upload retry
 
 	readTokens  *bucket
 	writeTokens *pacer
@@ -358,6 +367,9 @@ func (e *Engine) Run(ctx context.Context) error {
 	}
 	if e.scanner != nil {
 		loops = append(loops, e.scanLoop)
+	}
+	if e.cfg.Registry && e.cfg.Registrar != nil {
+		loops = append(loops, e.registryLoop)
 	}
 	for _, l := range loops {
 		e.wg.Add(1)
