@@ -302,7 +302,9 @@ func newTeamsServiceStatusCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return runTeamsServiceCommand(cmd.Context(), cmd.OutOrStdout(), backend, "status")
+			err = runTeamsServiceCommand(cmd.Context(), cmd.OutOrStdout(), backend, "status")
+			writeTeamsNewCoreStatus(cmd.OutOrStdout(), time.Now())
+			return err
 		},
 	}
 }
