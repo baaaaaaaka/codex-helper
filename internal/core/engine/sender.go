@@ -3,7 +3,10 @@ package engine
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -50,9 +53,11 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 		return until.Sub(now)
 	}
 	type job struct {
-		row   store.Outbox
-		chat  string
-		token string
+		row    store.Outbox
+		chat   string
+		token  string
+		file   *store.OutFile // an outbound file row
+		upload bool           // upload the file first (no send yet)
 	}
 	var (
 		jobs  []job
@@ -92,6 +97,19 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 			if busy {
 				continue
 			}
+			f, isFile, err := tx.OutboxFile(r.ID)
+			if err != nil {
+				return err
+			}
+			if isFile {
+				e.mu.Lock()
+				at := e.uploadAt[r.ID]
+				e.mu.Unlock()
+				if d := at.Sub(now); d > 0 && f.ExtItemID == "" {
+					soon(d)
+					continue
+				}
+			}
 			if wait > 0 {
 				soon(wait)
 				continue
@@ -106,6 +124,14 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 				soon(e.t.Tick)
 				return nil
 			}
+			var fp *store.OutFile
+			if isFile {
+				fp = &f
+				if f.ExtItemID == "" {
+					jobs = append(jobs, job{row: r, chat: chat, file: fp, upload: true})
+					continue
+				}
+			}
 			tok, err := tx.BeginSend(r.ID)
 			if err != nil {
 				<-sem
@@ -114,7 +140,7 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 				}
 				return err
 			}
-			jobs = append(jobs, job{row: r, chat: chat, token: tok})
+			jobs = append(jobs, job{row: r, chat: chat, token: tok, file: fp})
 		}
 		return nil
 	})
@@ -135,7 +161,11 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 		go func(j job) {
 			defer e.wg.Done()
 			defer func() { <-sem }()
-			e.send(ctx, j.row, j.chat, j.token)
+			if j.upload {
+				e.upload(ctx, j.row, *j.file)
+				return
+			}
+			e.send(ctx, j.row, j.chat, j.token, j.file)
 		}(j)
 	}
 	return again
@@ -145,9 +175,23 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 func (e *Engine) marker(token string) string { return e.prefix + "." + token }
 
 // send performs one Send and records its outcome.
-func (e *Engine) send(ctx context.Context, r store.Outbox, chat, token string) {
+func (e *Engine) send(ctx context.Context, r store.Outbox, chat, token string, file *store.OutFile) {
 	p := channel.Part{Index: max(r.Part, 1), Count: max(r.Parts, 1), Body: r.Body, Hash: hex.EncodeToString(r.BodyHash),
 		Mention: r.Mention, ReplyTo: r.ReplyTo, Size: len(r.Body)}
+	if file != nil {
+		fp, err := e.filePart(ctx, *file)
+		if err != nil {
+			e.logf("render file %s: %v; dropped", r.DeliveryKey, err)
+			e.mu.Lock()
+			if cs := e.convs[r.ConvID]; cs != nil {
+				cs.sending = false
+			}
+			e.mu.Unlock()
+			e.dropFile(r, filepath.Base(file.LocalPath))
+			return
+		}
+		p = fp
+	}
 	sent, err := e.ch.Send(ctx, chat, p, e.marker(token))
 	now := e.now()
 	e.count(func(s *engineStats) { s.sends++ })
@@ -441,6 +485,126 @@ func (e *Engine) resolveOne(ctx context.Context, id int64) {
 	e.mu.Lock()
 	delete(e.unknown, id)
 	e.mu.Unlock()
+	e.wakeRunner(r.ConvID)
+	e.wakeSender()
+}
+
+// filePart renders the message that carries an uploaded outbound file.
+func (e *Engine) filePart(ctx context.Context, f store.OutFile) (channel.Part, error) {
+	var ref fileRef
+	if err := json.Unmarshal([]byte(f.ExtItemID), &ref); err != nil {
+		return channel.Part{}, fmt.Errorf("upload reference: %w", err)
+	}
+	name := firstNonEmpty(ref.Name, filepath.Base(f.LocalPath))
+	parts, err := e.ch.Render(ctx, channel.RichDoc{Label: labelCodex, Markdown: "📎 " + name,
+		Files: []channel.FileRef{{Kind: ref.Kind, Name: name, Size: ref.Size, ContentType: ref.ContentType, Ref: ref.Ref}}})
+	if err != nil {
+		return channel.Part{}, err
+	}
+	if len(parts) != 1 {
+		return channel.Part{}, fmt.Errorf("file message rendered as %d parts", len(parts))
+	}
+	return parts[0], nil
+}
+
+// maxUploadFailures bounds transient upload failures of one file.
+const maxUploadFailures = 8
+
+// upload uploads an outbound file (resuming a saved session) and records
+// the uploaded item; the row is then sent like any other.
+func (e *Engine) upload(ctx context.Context, r store.Outbox, f store.OutFile) {
+	e.mu.Lock()
+	if cs := e.convs[r.ConvID]; cs != nil {
+		cs.sending = true
+	}
+	e.mu.Unlock()
+	defer func() {
+		e.mu.Lock()
+		if cs := e.convs[r.ConvID]; cs != nil {
+			cs.sending = false
+		}
+		e.mu.Unlock()
+		e.wakeSender()
+	}()
+	name := filepath.Base(f.LocalPath)
+	var sess *channel.UploadSession
+	if f.UploadURL != "" && (f.UploadExpiresAt == 0 || fromMS(f.UploadExpiresAt).After(e.now().Add(time.Minute))) {
+		sess = &channel.UploadSession{URL: f.UploadURL, ExpiresAt: fromMS(f.UploadExpiresAt), Offset: f.UploadedBytes}
+	}
+	save := func(s channel.UploadSession) error {
+		var exp int64
+		if !s.ExpiresAt.IsZero() {
+			exp = ms(s.ExpiresAt)
+		}
+		return e.update(func(tx *store.Tx) error { return tx.SetUpload(r.ID, s.URL, exp, s.Offset, "") })
+	}
+	ref, err := e.ch.UploadFile(ctx, f.LocalPath, name, sess, save)
+	if ctx.Err() != nil {
+		return
+	}
+	now := e.now()
+	var rej *channel.Rejected
+	th, throttled := channel.AsThrottled(err)
+	switch {
+	case err == nil:
+		data, _ := json.Marshal(fileRef{Kind: ref.Kind, Name: name, Size: ref.Size, ContentType: ref.ContentType, Ref: ref.Ref})
+		if err := e.update(func(tx *store.Tx) error { return tx.SetUpload(r.ID, "", 0, f.Size, string(data)) }); err != nil {
+			e.logf("record upload %s: %v", r.DeliveryKey, err)
+		}
+		e.mu.Lock()
+		delete(e.uploadAt, r.ID)
+		e.mu.Unlock()
+		e.forgetFailures(r.ID)
+	case throttled:
+		if th.Scope == channel.ScopeAccount || th.Scope == channel.ScopeUnknown {
+			e.setGate(gateAccountWrite, now.Add(th.RetryAfter), "upload throttled")
+		}
+		e.retryUpload(r.ID, now.Add(th.RetryAfter))
+	case errors.As(err, &rej) && rej.Permanent:
+		e.logf("upload %s rejected: %v", r.DeliveryKey, err)
+		e.dropFile(r, name)
+	default:
+		n := e.failure(r.ID)
+		if n >= maxUploadFailures {
+			e.logf("upload %s failed %d times: %v", r.DeliveryKey, n, err)
+			e.dropFile(r, name)
+			return
+		}
+		back := e.t.Hot << min(n, 8)
+		if back > e.t.MaxBackoff {
+			back = e.t.MaxBackoff
+		}
+		e.logf("upload %s failed (%d): %v; retry in %s", r.DeliveryKey, n, err, back)
+		e.retryUpload(r.ID, now.Add(back))
+	}
+}
+
+func (e *Engine) retryUpload(id int64, at time.Time) {
+	e.mu.Lock()
+	e.uploadAt[id] = at
+	e.mu.Unlock()
+	d := at.Sub(e.now())
+	if d < 0 {
+		d = 0
+	}
+	time.AfterFunc(d, e.wakeSender)
+}
+
+// dropFile gives up on an outbound file with one visible notice.
+func (e *Engine) dropFile(r store.Outbox, name string) {
+	err := e.update(func(tx *store.Tx) error {
+		if err := tx.Drop(r.ID, "file not sent"); err != nil {
+			return err
+		}
+		return e.enqueueNotice(tx, r.ConvID, "file-failed:"+r.DeliveryKey, "The file "+name+" could not be sent.")
+	})
+	if err != nil {
+		e.logf("drop file %s: %v", r.DeliveryKey, err)
+	}
+	e.mu.Lock()
+	delete(e.uploadAt, r.ID)
+	e.mu.Unlock()
+	e.forgetFailures(r.ID)
 	e.wakeRunner(r.ConvID)
 	e.wakeSender()
 }

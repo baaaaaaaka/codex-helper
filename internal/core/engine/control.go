@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/core/store"
@@ -34,6 +35,60 @@ func (e *Engine) ensureControl(ctx context.Context) error {
 		e.mu.Unlock()
 	}
 	return nil
+}
+
+// ensureInbox makes sure the machine's delegation inbox conversation exists
+// when the registry is on (F-XM-2). The inbox is a work-kind conversation
+// without a thread: it is never polled on its own (the activity scan covers
+// it), never parked, never listed, and nothing is announced in it.
+func (e *Engine) ensureInbox() error {
+	if !e.cfg.Registry {
+		return nil
+	}
+	var id int64
+	err := e.update(func(tx *store.Tx) error {
+		v, ok, err := tx.Meta(metaInbox)
+		if err != nil {
+			return err
+		}
+		if ok && v != "" {
+			if n, perr := strconv.ParseInt(v, 10, 64); perr == nil {
+				if c, found, err := tx.Conversation(n); err != nil {
+					return err
+				} else if found && c.State != store.ConvClosed {
+					id = n
+					return nil
+				}
+			}
+		}
+		id, err = tx.CreateConversation(store.NewConversation{Label: "inbox", Kind: store.KindWork,
+			Channel: e.cfg.ChannelName, Title: e.inboxTitle(), TitleSource: "auto"})
+		if err != nil {
+			return err
+		}
+		if err := tx.SetMeta(metaInbox, strconv.FormatInt(id, 10)); err != nil {
+			return err
+		}
+		_, err = e.refresh(tx, id)
+		return err
+	})
+	if err != nil {
+		return fmt.Errorf("engine: create delegation inbox: %w", err)
+	}
+	e.mu.Lock()
+	e.inboxID = id
+	if cs := e.convs[id]; cs != nil {
+		cs.nextRead = e.now().Add(e.t.SafetyRead) // covered by the activity scan
+	}
+	e.mu.Unlock()
+	return nil
+}
+
+func (e *Engine) inboxTitle() string {
+	if e.cfg.Machine == "" {
+		return "CXP Machine Inbox"
+	}
+	return "CXP Machine Inbox " + e.cfg.Machine
 }
 
 func (e *Engine) controlTitle() string {
@@ -83,6 +138,7 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 	if kind == store.KindControl {
 		key = "control-" + e.prefix
 	}
+	inbox := id == e.inboxID
 	info, err := e.ch.CreateChat(ctx, title, key)
 	if err != nil {
 		e.mu.Lock()
@@ -96,7 +152,9 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 		if err := tx.SetChat(id, info.ID, info.URL); err != nil {
 			return err
 		}
-		if kind == store.KindControl {
+		if inbox {
+			// Nothing is announced in or about the inbox.
+		} else if kind == store.KindControl {
 			if err := e.enqueueNotice(tx, id, "ready:control", "Codex control chat is ready on "+e.machine()+". Send `new <directory>` to start a session, or `help`."); err != nil {
 				return err
 			}
@@ -125,6 +183,9 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 	e.mu.Lock()
 	cs.failures = 0
 	cs.nextRead = e.now()
+	if inbox {
+		cs.nextRead = e.now().Add(e.t.SafetyRead)
+	}
 	cs.lastActivity = e.now()
 	delete(e.intro, id)
 	e.mu.Unlock()

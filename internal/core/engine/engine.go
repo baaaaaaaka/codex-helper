@@ -31,6 +31,7 @@ type Timing struct {
 	ParkAfter                time.Duration // cold this long -> park (work chats)
 	Control                  time.Duration // control chat read interval (<= 5 s)
 	ScanInterval             time.Duration // activity scan cadence (scan mode)
+	SafetyRead               time.Duration // direct read of an idle chat in scan mode
 	MaxBackoff               time.Duration // failing stream backoff cap
 
 	MirrorStat time.Duration // stat tick for tracked rollouts
@@ -57,7 +58,7 @@ func ProductionTiming() Timing {
 		Tick: 250 * time.Millisecond,
 		Hot:  time.Second, Warm: 5 * time.Second, Cool: 10 * time.Second, Cold: 30 * time.Second,
 		HotFor: 2 * time.Minute, WarmFor: 15 * time.Minute, CoolFor: 4 * time.Hour, ParkAfter: 48 * time.Hour,
-		Control: 5 * time.Second, ScanInterval: 5 * time.Second, MaxBackoff: 5 * time.Minute,
+		Control: 5 * time.Second, ScanInterval: 5 * time.Second, SafetyRead: 10 * time.Minute, MaxBackoff: 5 * time.Minute,
 		MirrorStat: 2 * time.Second, Discovery: 10 * time.Second, FullWalk: 10 * time.Minute,
 		TurnPoll: 30 * time.Second, CancelWait: 10 * time.Second,
 		ResolveDelay: 5 * time.Second, ResolveTries: 3, CapacityRetry: 5 * time.Minute, CapacityBackoff: 10 * time.Second,
@@ -75,6 +76,7 @@ func FastTiming(base time.Duration) Timing {
 	}
 	t.Hot, t.Warm, t.Cool, t.Cold = base, 2*base, 4*base, 8*base
 	t.Control, t.ScanInterval = base, base
+	t.SafetyRead = 60 * base
 	t.MaxBackoff = 30 * base
 	t.MirrorStat, t.Discovery, t.FullWalk = base, 2*base, 20*base
 	t.TurnPoll = 2 * time.Second
@@ -130,10 +132,13 @@ type Engine struct {
 	cfg Config
 	st  *store.Store
 	ch  channel.Channel
-	ag  Agent
-	t   Timing
-	log io.Writer
-	now func() time.Time
+	// scanner is set when the channel supports an activity scan (scan
+	// mode): idle chats are then read only when the scan shows a change.
+	scanner channel.ActivityScanner
+	ag      Agent
+	t       Timing
+	log     io.Writer
+	now     func() time.Time
 
 	mu        sync.Mutex
 	convs     map[int64]*convState
@@ -142,6 +147,8 @@ type Engine struct {
 	prefix    string // turn key prefix
 	preserved bool   // markers survive the channel (self-test)
 	controlID int64
+	// inboxID is the delegation inbox (Config.Registry); set once at start.
+	inboxID   int64
 	ownerName string
 
 	runnerWake   chan struct{}
@@ -152,6 +159,8 @@ type Engine struct {
 	mirrorWake   chan struct{}
 	cmdQueue     chan cmdJob
 	asrWake      chan struct{}
+	fileTries    map[string]int      // transient attachment failures by "<inbound>/<idx>"
+	uploadAt     map[int64]time.Time // outbound file rows waiting before an upload retry
 
 	readTokens  *bucket
 	writeTokens *bucket
@@ -166,6 +175,7 @@ type Engine struct {
 	unknown      map[int64]*unknownState
 	gates        map[string]time.Time
 	intro        map[int64]string // first notice of a chat being created (mirror)
+	restart      restartConfirm   // confirmation owed for a `helper restart`
 	stats        engineStats
 }
 
@@ -215,7 +225,10 @@ func New(cfg Config) (*Engine, error) {
 		convs: map[int64]*convState{}, intro: map[int64]string{}, byChat: map[string]int64{}, byThread: map[string]int64{},
 		runnerWake: make(chan struct{}, 1), runnerDirty: map[int64]bool{},
 		senderWake: make(chan struct{}, 1), resolverWake: make(chan struct{}, 1),
-		mirrorWake: make(chan struct{}, 1), cmdQueue: make(chan cmdJob, 256), asrWake: make(chan struct{}, 1),
+		mirrorWake: make(chan struct{}, 1), cmdQueue: make(chan cmdJob, 256), asrWake: make(chan struct{}, 1), fileTries: map[string]int{}, uploadAt: map[int64]time.Time{},
+	}
+	if sc, ok := cfg.Channel.(channel.ActivityScanner); ok && cfg.ActivityScan && e.t.ScanInterval > 0 {
+		e.scanner = sc
 	}
 	e.readTokens = newBucket(cfg.ReadRate, cfg.ReadRate*2, e.now)
 	e.writeTokens = newBucket(cfg.WriteRate, cfg.WriteRate*2, e.now)
@@ -283,6 +296,9 @@ func (e *Engine) Run(ctx context.Context) error {
 	}
 	if e.cfg.SessionsDir != "" {
 		loops = append(loops, e.mirrorLoop)
+	}
+	if e.scanner != nil {
+		loops = append(loops, e.scanLoop)
 	}
 	for _, l := range loops {
 		e.wg.Add(1)
@@ -365,11 +381,15 @@ func (e *Engine) start(ctx context.Context) error {
 	if unknown > 0 {
 		e.logf("%d sends in flight at the last stop are unknown; resolving by read-back", unknown)
 	}
+	if err := e.ensureInbox(); err != nil {
+		return err
+	}
 	if err := e.ensureControl(ctx); err != nil {
 		return err
 	}
 	e.resumeCreating(ctx)
 	e.requeueCommands()
+	e.loadRestartConfirm()
 	return nil
 }
 

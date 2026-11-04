@@ -121,6 +121,7 @@ type rig struct {
 	done   chan error
 	log    *strings.Builder
 	logMu  *sync.Mutex
+	tweak  func(*Config)
 }
 
 type lockedWriter struct {
@@ -134,8 +135,13 @@ func (w lockedWriter) Write(p []byte) (int, error) {
 	return w.b.Write(p)
 }
 
-func newRig(t *testing.T) *rig {
+func newRig(t *testing.T, tweak ...func(*Config)) *rig {
 	r := &rig{t: t, ch: channeltest.New(), ag: newAgent(), path: filepath.Join(t.TempDir(), "core.db"), log: &strings.Builder{}, logMu: &sync.Mutex{}}
+	r.tweak = func(c *Config) {
+		for _, f := range tweak {
+			f(c)
+		}
+	}
 	t.Cleanup(func() {
 		r.stop()
 		if t.Failed() {
@@ -157,8 +163,10 @@ func (r *rig) start() {
 		r.t.Fatal(err)
 	}
 	r.st = st
-	e, err := New(Config{Store: st, Channel: r.ch, Agent: r.ag, Timing: FastTiming(20 * time.Millisecond),
-		Machine: "m", Log: lockedWriter{r.logMu, r.log}})
+	cfg := Config{Store: st, Channel: r.ch, Agent: r.ag, Timing: FastTiming(20 * time.Millisecond),
+		Machine: "m", Log: lockedWriter{r.logMu, r.log}}
+	r.tweak(&cfg)
+	e, err := New(cfg)
 	if err != nil {
 		r.t.Fatal(err)
 	}
@@ -426,5 +434,40 @@ func TestUserErrorHidesInternalIDs(t *testing.T) {
 	}
 	if !strings.Contains(got, "active writer") {
 		t.Fatalf("%q lost the message", got)
+	}
+}
+
+func TestRegistryInboxCreatedOnceSilentAndNeverRuns(t *testing.T) {
+	r := newRig(t, func(c *Config) { c.Registry = true })
+	r.control()
+	var inbox string
+	r.wait("inbox chat", func() bool { inbox = r.chatOf("inbox"); return inbox != "" })
+	if info, _ := r.ch.Chat(inbox); info.Title != "CXP Machine Inbox m" {
+		t.Fatalf("inbox title %q", info.Title)
+	}
+	r.ch.PostUser(inbox, "please run this")
+	time.Sleep(1500 * time.Millisecond) // > one safety read in fast timing
+	if n := len(r.ch.Messages(inbox)); n != 1 {
+		t.Fatalf("inbox has %d messages, want only the user's", n)
+	}
+	if r.ag.calls("please run this") != 0 {
+		t.Fatal("an inbox message started a turn")
+	}
+	if len(r.own(r.control(), "inbox")) != 0 {
+		t.Fatal("the inbox was announced in the control chat")
+	}
+	r.stop()
+	r.start()
+	r.control()
+	time.Sleep(200 * time.Millisecond)
+	n := 0
+	convs, _ := r.st.Conversations()
+	for _, c := range convs {
+		if c.Label == "inbox" {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Fatalf("%d inbox conversations after restart", n)
 	}
 }

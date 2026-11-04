@@ -86,6 +86,14 @@ func (e *Engine) intervalLocked(cs *convState, now time.Time) time.Duration {
 	if cs.running != nil {
 		return e.t.Hot
 	}
+	if e.scanner != nil {
+		// Scan mode: the activity scan finds new messages in idle chats;
+		// a direct read is only a safety net.
+		if now.Sub(cs.lastUser) < e.t.HotFor {
+			return e.t.Hot
+		}
+		return e.t.SafetyRead
+	}
 	idle := now.Sub(cs.lastActivity)
 	switch {
 	case idle < e.t.HotFor:
@@ -99,13 +107,24 @@ func (e *Engine) intervalLocked(cs *convState, now time.Time) time.Duration {
 	}
 }
 
-// heat marks activity in a conversation (prompt, command, own answer).
-func (e *Engine) heat(id int64) {
+// heat marks activity in a conversation (own post, mirror).
+func (e *Engine) heat(id int64) { e.heatAs(id, false) }
+
+// heatUser marks owner activity (prompt, command, turn end, wake): the
+// conversation is polled directly for HotFor even in scan mode.
+func (e *Engine) heatUser(id int64) { e.heatAs(id, true) }
+
+func (e *Engine) heatAs(id int64, user bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if cs := e.convs[id]; cs != nil {
 		now := e.now()
 		cs.lastActivity = now
+		if user {
+			cs.lastUser = now
+		} else if e.scanner != nil && cs.kind == store.KindWork && cs.running == nil && now.Sub(cs.lastUser) >= e.t.HotFor {
+			return // scan mode: our own posts do not make an idle chat hot
+		}
 		if next := now.Add(e.t.Hot); cs.nextRead.After(next) {
 			cs.nextRead = next
 		}
@@ -126,6 +145,9 @@ func (e *Engine) read(ctx context.Context, id int64) {
 	}
 	if err == nil {
 		err = e.admit(ctx, id, w)
+	}
+	if err == nil {
+		e.confirmRestart(id)
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -205,9 +227,10 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 		becameGr bool
 		trip     bool
 		activity bool
+		hasFiles bool
 	)
 	err := e.update(func(tx *store.Tx) error {
-		jobs, newTurns, becameGr, trip, activity = nil, false, false, false, false
+		jobs, newTurns, becameGr, trip, activity, hasFiles = nil, false, false, false, false, false
 		var cls []classified
 		byID := map[string]*classified{}
 		for _, m := range fresh {
@@ -223,6 +246,12 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 			}
 			if c.other && !group {
 				group, becameGr = true, true
+			}
+			if c.in.Kind == store.InPrompt && !c.chatter && (c.in.Sender == store.SenderOwner || c.in.Sender == store.SenderOther) {
+				c.in.Files = inboundFiles(m.Files)
+				if len(c.in.Files) > 0 {
+					hasFiles = true
+				}
 			}
 			cls = append(cls, c)
 		}
@@ -300,9 +329,12 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 	}
 	e.mu.Unlock()
 	if activity {
-		e.heat(id)
+		e.heatUser(id)
 	}
 	e.wakeSender()
+	if hasFiles {
+		wake(e.asrWake)
+	}
 	if newTurns {
 		e.wakeRunner(id)
 	}
@@ -396,11 +428,21 @@ func (e *Engine) classify(tx *store.Tx, conv int64, kind string, group bool, m c
 		c.quoteID = m.ID
 	}
 	text := strings.TrimSpace(m.Text)
+	if conv == e.inboxID && conv != 0 {
+		// Delegation requests are not executed yet: recorded, never run.
+		c.in.Kind, c.chatter = store.InCommand, true
+		return c, true, nil
+	}
 	if helperShaped(text) {
 		c.suspect = true // still runs: genuine look-alike text is allowed
 	}
 	if kind == store.KindControl || isHelperCommand(text) {
 		c.in.Kind = store.InCommand
+		return c, true, nil
+	}
+	if group && !strings.Contains(strings.ToLower(text), "@codex") {
+		// With other people in the chat only @codex addresses Codex.
+		c.in.Kind, c.chatter = store.InCommand, true
 	}
 	return c, true, nil
 }
@@ -476,8 +518,14 @@ func (e *Engine) ackPrompt(tx *store.Tx, conv int64, a store.Admitted, c *classi
 	if err != nil {
 		return false, err
 	}
+	ahead := 0
+	for _, t := range open {
+		if t.ID < a.TurnID {
+			ahead++
+		}
+	}
 	text := "Request accepted."
-	if ahead := len(open) - 1; ahead > 0 {
+	if ahead > 0 {
 		text += " It is queued behind " + plural(ahead, "earlier request", "earlier requests") + "."
 	}
 	msgs, err := e.noticeReply(store.OutAck, fmt.Sprintf("ack:%d", a.InboundID), text, c.quoteID)
@@ -533,3 +581,75 @@ func (e *Engine) tripBreaker(tx *store.Tx, conv int64, label string) error {
 	e.logf("breaker tripped in %s", label)
 	return tx.MarkPauseNotified(conv)
 }
+
+// scanLoop runs the activity scan (scan mode): one account-wide request per
+// ScanInterval lists the chats with new messages, and only those are read.
+// Parked and closed conversations are not woken by it (they get no reads).
+func (e *Engine) scanLoop(ctx context.Context) {
+	tick := time.NewTicker(e.t.ScanInterval)
+	defer tick.Stop()
+	// Every conversation is read once at start, so the scan only needs
+	// what arrives from now on (with a margin for clock skew).
+	mark := e.now().Add(-time.Minute)
+	failures := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-tick.C:
+		}
+		now := e.now()
+		if until := e.gate(gateAccountRead); now.Before(until) {
+			continue
+		}
+		if ok, _ := e.readTokens.take(); !ok {
+			continue
+		}
+		acts, err := e.scanner.ScanActivity(ctx, mark.Add(-scanOverlap))
+		e.count(func(s *engineStats) { s.reads++ })
+		if ctx.Err() != nil {
+			return
+		}
+		if err != nil {
+			if th, ok := channel.AsThrottled(err); ok {
+				e.setGate(gateAccountRead, e.now().Add(th.RetryAfter), "activity scan throttled")
+				continue
+			}
+			failures++
+			if failures <= 3 || failures%100 == 0 {
+				e.logf("activity scan failed (%d in a row): %v", failures, err)
+			}
+			continue
+		}
+		failures = 0
+		e.mu.Lock()
+		for _, a := range acts {
+			if a.Last.After(mark) {
+				mark = a.Last
+			}
+			id, ok := e.byChat[a.Chat]
+			if !ok {
+				continue
+			}
+			cs := e.convs[id]
+			if cs == nil || cs.scanLast == a.LastID {
+				continue
+			}
+			cs.scanLast = a.LastID
+			if cs.kind == store.KindWork && cs.state != store.ConvActive {
+				continue // parked or closed: no reads until woken
+			}
+			// Our own posts also change the newest message; reading after
+			// them costs one read but never misses a user message posted
+			// just before.
+			if cs.nextRead.After(now) {
+				cs.nextRead = now
+			}
+		}
+		e.mu.Unlock()
+	}
+}
+
+// scanOverlap re-lists chats around the watermark; repeats are skipped by
+// message id.
+const scanOverlap = 5 * time.Second

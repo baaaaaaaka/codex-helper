@@ -2,8 +2,10 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -148,6 +150,7 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 			req.Effort = th.PendingEffort
 		}
 		req.Text, req.Images = turnInput(in.Body, files)
+		req.Text = strings.TrimSpace(req.Text + "\n\n" + outboundInstructions(e.outboundDir(tr.TurnKey)))
 		return tx.MarkStarting(tr.ID, th.ThreadID)
 	})
 	if err != nil {
@@ -171,25 +174,49 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 	return true
 }
 
-// turnInput builds the Codex input of a prompt and its attachments.
+// turnInput builds the Codex input of a prompt and its attachments: images
+// become image inputs, files are listed with their local path and original
+// name, voice messages contribute their transcript.
 func turnInput(body string, files []store.InboundFile) (string, []string) {
-	text := body
-	var images []string
-	var notes []string
+	text := strings.TrimSpace(body)
+	var images, listed, voice, failed []string
 	for _, f := range files {
+		var ref fileRef
+		_ = json.Unmarshal([]byte(f.ExtRef), &ref)
+		ct := firstNonEmpty(ref.ContentType, f.Kind)
 		switch {
 		case f.State != "ready":
-			notes = append(notes, fmt.Sprintf("[attachment %q could not be downloaded: %s]", f.Name, f.Error))
+			failed = append(failed, fmt.Sprintf("- %s: %s", f.Name, firstNonEmpty(f.Error, "not available")))
 		case f.Kind == "image":
 			images = append(images, f.LocalPath)
 		case f.Kind == "voice":
-			notes = append(notes, fmt.Sprintf("[voice message %q transcript]\n%s", f.Name, f.Error))
+			data, err := os.ReadFile(f.LocalPath)
+			if err != nil {
+				failed = append(failed, fmt.Sprintf("- %s: the transcript is missing", f.Name))
+				continue
+			}
+			voice = append(voice, strings.TrimSpace(string(data)))
 		default:
-			notes = append(notes, fmt.Sprintf("[attached file %q saved at %s]", f.Name, f.LocalPath))
+			listed = append(listed, fmt.Sprintf("- %s (original name: %s; %s)", f.LocalPath, f.Name, ct))
 		}
 	}
-	if len(notes) > 0 {
-		text = strings.TrimSpace(text + "\n\n" + strings.Join(notes, "\n"))
+	var sections []string
+	if len(voice) > 0 {
+		v := "Voice message (transcribed):\n" + strings.Join(voice, "\n\n")
+		if text == "" {
+			text = v
+		} else {
+			sections = append(sections, v)
+		}
+	}
+	if len(listed) > 0 {
+		sections = append(sections, "Attached files (saved locally):\n"+strings.Join(listed, "\n"))
+	}
+	if len(failed) > 0 {
+		sections = append(sections, "Attachments that could not be used:\n"+strings.Join(failed, "\n"))
+	}
+	if len(sections) > 0 {
+		text = strings.TrimSpace(text + "\n\n" + strings.Join(sections, "\n\n"))
 	}
 	return text, images
 }
@@ -210,6 +237,11 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 				e.logf("mark running %s: %v", cs.label, err)
 			}
 		},
+	}
+	if dir := e.outboundDir(tr.TurnKey); dir != "" {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			e.logf("output directory of %s: %v", cs.label, err)
+		}
 	}
 	out, err := e.ag.Run(ctx, req, hooks)
 	if ctx.Err() != nil {
@@ -251,7 +283,7 @@ func (e *Engine) clearRun(id int64, rs *runState) {
 		cs.running = nil
 	}
 	e.mu.Unlock()
-	e.heat(id)
+	e.heatUser(id)
 	e.wakeSender()
 	e.wakeAll()
 }
@@ -329,11 +361,19 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 		msgs, err = e.notice(base+":notstarted", "Codex did not start this request ("+userError(out.Error)+"). It was not run; resend it if you still need it.")
 	case out.Status == StatusCompleted:
 		state = store.TurnCompleted
-		final := strings.TrimSpace(out.Final)
-		if final == "" {
+		visible, files, problems := e.stageArtifacts(tr, out.Final)
+		final := strings.TrimSpace(visible)
+		if len(problems) > 0 {
+			final = strings.TrimSpace(final + "\n\n_Some files could not be attached:_\n- " + strings.Join(problems, "\n- "))
+		}
+		if final == "" && len(files) == 0 {
 			final = "_Codex finished without a text answer._"
 		}
-		msgs, err = e.render(ctx, channel.RichDoc{Label: labelCodex, Markdown: final, Math: true}, store.OutFinal, base+":final")
+		out.Final = final
+		if final != "" {
+			msgs, err = e.render(ctx, channel.RichDoc{Label: labelCodex, Markdown: final, Math: true}, store.OutFinal, base+":final")
+		}
+		msgs = append(msgs, files...)
 		if err == nil {
 			// Exactly one owner notification per final (CORE-DESIGN §4):
 			// the Workflow card when configured, else one control-chat

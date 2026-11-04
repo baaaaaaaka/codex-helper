@@ -121,7 +121,7 @@ func (e *Engine) parkIdle() {
 	e.mu.Lock()
 	var ids []int64
 	for id, cs := range e.convs {
-		if cs.kind == store.KindWork && cs.state == store.ConvActive && cs.running == nil &&
+		if cs.kind == store.KindWork && cs.state == store.ConvActive && cs.running == nil && id != e.inboxID &&
 			now.Sub(cs.lastActivity) > e.t.ParkAfter {
 			ids = append(ids, id)
 		}
@@ -147,9 +147,4 @@ func (e *Engine) parkIdle() {
 			e.logf("park %d: %v", id, err)
 		}
 	}
-}
-
-// asrLoop downloads attachments and transcribes voice messages (phase 5).
-func (e *Engine) asrLoop(ctx context.Context) {
-	<-ctx.Done()
 }

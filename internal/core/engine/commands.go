@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -389,7 +390,7 @@ func (e *Engine) cmdPark(j cmdJob, cs *convState) {
 		e.reply(j, "A request is still running; park the chat after it ends.", nil)
 		return
 	}
-	e.reply(j, "Parked: this chat is no longer read. Wake it from the control chat with `r "+cs.label+"`, or by using the session in Codex.", func(tx *store.Tx) error {
+	e.reply(j, "Parked "+cs.label+": this chat is no longer read. Wake it from the control chat with `r "+cs.label+"`, or by using the session in Codex.", func(tx *store.Tx) error {
 		if err := tx.Park(cs.id); err != nil {
 			return err
 		}
@@ -415,53 +416,21 @@ func (e *Engine) cmdRestart(j cmdJob, arg string) {
 			plural(busy, "request is", "requests are")), nil)
 		return
 	}
-	e.reply(j, "Restarting the helper…", nil)
-	e.restartAfterReply(fmt.Sprintf("cmd:%d:1", j.inbound))
-}
-
-// restartAfterReply stops the engine with ErrRestart once the reply was
-// sent (or after a short wait).
-func (e *Engine) restartAfterReply(key string) {
-	e.wg.Add(1)
-	go func() {
-		defer e.wg.Done()
-		deadline := time.Now().Add(15 * time.Second)
-		for time.Now().Before(deadline) {
-			sent := false
-			_ = e.update(func(tx *store.Tx) error {
-				ok, err := tx.Delivered(key)
-				if err != nil || !ok {
-					return err
-				}
-				pending := false
-				e.mu.Lock()
-				ids := make([]int64, 0, len(e.convs))
-				for id := range e.convs {
-					ids = append(ids, id)
-				}
-				e.mu.Unlock()
-				for _, id := range ids {
-					rows, err := tx.PendingOutbox(id)
-					if err != nil {
-						return err
-					}
-					for _, r := range rows {
-						if r.DeliveryKey == key {
-							pending = true
-						}
-					}
-				}
-				sent = !pending
-				return nil
-			})
-			if sent {
-				break
-			}
-			time.Sleep(100 * time.Millisecond)
+	// The new process confirms, once it has read the chat the command came
+	// from; the old one only records that a confirmation is owed.
+	err := e.update(func(tx *store.Tx) error {
+		if err := tx.SetMeta(metaRestart, fmt.Sprintf("%d:%d:%s", j.conv, j.inbound, j.quote)); err != nil {
+			return err
 		}
-		e.logf("restart requested")
-		e.fail(ErrRestart)
-	}()
+		return tx.SetInbound(j.inbound, store.InDone, 0)
+	})
+	if err != nil {
+		e.logf("restart: %v", err)
+		e.reply(j, "Restart failed: the request could not be recorded.", nil)
+		return
+	}
+	e.logf("restart requested")
+	e.fail(ErrRestart)
 }
 
 // findLabel finds a work conversation by label ("s003", "3").
@@ -531,7 +500,7 @@ func (e *Engine) cmdWake(j cmdJob, arg string) {
 		_, err := e.refresh(tx, target.id)
 		return err
 	})
-	e.heat(target.id)
+	e.heatUser(target.id)
 }
 
 func (e *Engine) listText() string {
@@ -539,7 +508,7 @@ func (e *Engine) listText() string {
 	defer e.mu.Unlock()
 	var rows []*convState
 	for _, cs := range e.convs {
-		if cs.kind == store.KindWork && cs.state != store.ConvClosed {
+		if cs.kind == store.KindWork && cs.state != store.ConvClosed && cs.id != e.inboxID {
 			rows = append(rows, cs)
 		}
 	}
@@ -591,4 +560,57 @@ func (e *Engine) workStatus(cs *convState) string {
 		p = " Auto-start is paused (`helper unpause`)."
 	}
 	return fmt.Sprintf("%s (%s): %s, %d queued. Directory: `%s`.%s", label, state, run, queued, cwd, p)
+}
+
+// restartConfirm is a `helper restart` confirmation the new process owes.
+type restartConfirm struct {
+	conv, inbound int64
+	quote         string
+}
+
+// loadRestartConfirm reads a pending restart confirmation left by the
+// previous process.
+func (e *Engine) loadRestartConfirm() {
+	v, ok, err := e.st.Meta(metaRestart)
+	if err != nil || !ok || v == "" {
+		return
+	}
+	parts := strings.SplitN(v, ":", 3)
+	if len(parts) != 3 {
+		return
+	}
+	conv, _ := strconv.ParseInt(parts[0], 10, 64)
+	inbound, _ := strconv.ParseInt(parts[1], 10, 64)
+	e.mu.Lock()
+	e.restart = restartConfirm{conv: conv, inbound: inbound, quote: parts[2]}
+	e.mu.Unlock()
+}
+
+// confirmRestart posts the restart confirmation after the first successful
+// read of the chat the command came from, so that it follows this process
+// taking over.
+func (e *Engine) confirmRestart(conv int64) {
+	e.mu.Lock()
+	rc := e.restart
+	if rc.conv == 0 || rc.conv != conv {
+		e.mu.Unlock()
+		return
+	}
+	e.restart = restartConfirm{}
+	e.mu.Unlock()
+	msgs, err := e.noticeReply(store.OutControl, fmt.Sprintf("restart:%d", rc.inbound), textRestarted, rc.quote)
+	if err != nil {
+		e.logf("render restart confirmation: %v", err)
+		return
+	}
+	err = e.update(func(tx *store.Tx) error {
+		if _, err := tx.Enqueue(conv, msgs); err != nil {
+			return err
+		}
+		return tx.SetMeta(metaRestart, "")
+	})
+	if err != nil {
+		e.logf("restart confirmation: %v", err)
+	}
+	e.wakeSender()
 }

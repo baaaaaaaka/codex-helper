@@ -16,6 +16,8 @@ const (
 	metaNextLabel      = "engine_next_label"      // next sNNN number
 	metaMirrorInit     = "engine_mirror_initialized"
 	metaRehashed       = "engine_legacy_rehashed"
+	metaRestart        = "engine_restart_confirm" // "<conv>:<inbound>:<quote>" of a pending `helper restart`
+	metaInbox          = "engine_inbox_conv"      // conversation id of the delegation inbox
 	gateAccountRead    = "teams:account-read"
 	gateAccountWrite   = "teams:account-write"
 )
@@ -40,7 +42,9 @@ type convState struct {
 	// receive
 	cursor       string
 	seeded       bool
-	lastActivity time.Time
+	lastActivity time.Time // any activity (parking)
+	lastUser     time.Time // owner activity: prompt, command, turn end, wake (scan mode hot tier)
+	scanLast     string    // newest message id the activity scan reported
 	nextRead     time.Time
 	reading      bool
 	failures     int

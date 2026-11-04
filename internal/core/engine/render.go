@@ -54,6 +54,7 @@ func (e *Engine) enqueueNotice(tx *store.Tx, conv int64, base, text string) erro
 const (
 	textInterrupted = "The previous request was interrupted when the helper stopped. It was not re-run; resend it if you still need it."
 	textNotStarted  = "The previous request did not run: the helper stopped before Codex accepted it. Resend it if you still need it."
+	textRestarted   = "Helper restarted: the new process is running and has taken over."
 	textHeld        = "Request held: this chat is paused, so new requests do not run. It will not run later by itself; resend it once the chat is resumed."
 	textDuplicate   = "Duplicate request ignored (same text within 3 minutes). Send `helper retry` to run it again."
 	textActive      = "Codex did not run this request: the session is open in another Codex window that is writing to it. Close it there (or wait until it is idle) and resend."
