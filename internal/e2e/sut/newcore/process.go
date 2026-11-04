@@ -33,7 +33,7 @@ type Binaries struct {
 func ProcessFactory(bins Binaries) harness.SUTFactory {
 	return func(cfg harness.SUTConfig) (harness.SUT, error) {
 		s := &ProcSUT{cfg: cfg, bins: bins}
-		s.ProcessSUT = harness.NewProcessSUT(cfg, harness.ProcessSpec{Name: "newcore", Binary: bins.SUT, Env: s.childEnv})
+		s.ProcessSUT = harness.NewProcessSUT(cfg, harness.ProcessSpec{Name: peerName("newcore", cfg), Binary: bins.SUT, Env: s.childEnv})
 		return s, nil
 	}
 }
@@ -91,7 +91,16 @@ func CXPFactory(bins Binaries) harness.SUTFactory {
 				"CXP_RUNTIME_DISABLE=1",
 			)
 		}
-		s.ProcessSUT = harness.NewProcessSUT(cfg, harness.ProcessSpec{Name: "cxp", Binary: bins.SUT, Args: args, Env: env})
+		s.ProcessSUT = harness.NewProcessSUT(cfg, harness.ProcessSpec{Name: peerName("cxp", cfg), Binary: bins.SUT, Args: args, Env: env})
 		return s, nil
 	}
+}
+
+// peerName is the instance tag prefix: name, or name-<peer> for a second
+// helper on the same state (harness.SUTConfig.Peer).
+func peerName(name string, cfg harness.SUTConfig) string {
+	if cfg.Peer != "" {
+		return name + "-" + cfg.Peer
+	}
+	return name
 }
