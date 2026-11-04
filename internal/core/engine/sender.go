@@ -80,23 +80,32 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 		e.mu.Lock()
 		ctl := e.controlID
 		e.mu.Unlock()
-		// Control chat first, then round robin from the conversation after
-		// the last one served, so a backlog in low-id chats never starves
-		// the others (review H4, CORE-DESIGN §3).
+		// Control chat first; then replies (ACKs, finals, notices,
+		// prompts) before mirrored messages before progress, so a short
+		// write budget goes to what the user waits for; within a class,
+		// round robin from the conversation after the last one served, so
+		// a backlog in low-id chats never starves the others (review H4,
+		// CORE-DESIGN §3).
 		last := e.sendLast
-		rank := func(r store.Outbox) int {
+		rank := func(r store.Outbox) (int, int) {
+			c := sendClass(r.Kind)
 			switch {
 			case r.ConvID == ctl:
-				return 0
-			case r.ConvID > last:
-				return 1
+				return 0, 0
+			case r.ConvID > last[c]:
+				return 1 + c, 0
 			default:
-				return 2
+				return 1 + c, 1
 			}
 		}
 		sort.SliceStable(rows, func(i, j int) bool {
-			if a, b := rank(rows[i]), rank(rows[j]); a != b {
-				return a < b
+			ac, ar := rank(rows[i])
+			bc, br := rank(rows[j])
+			if ac != bc {
+				return ac < bc
+			}
+			if ar != br {
+				return ar < br
 			}
 			return rows[i].ConvID < rows[j].ConvID
 		})
@@ -147,7 +156,7 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 				break
 			}
 			if r.ConvID != ctl {
-				e.sendLast = r.ConvID
+				e.sendLast[sendClass(r.Kind)] = r.ConvID
 			}
 			var fp *store.OutFile
 			if isFile {
@@ -196,6 +205,32 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 	return again
 }
 
+// Send classes, in the order a short write budget serves them.
+const (
+	sendReply    = iota // ACKs, finals, notices, prompts, titles
+	sendMirror          // mirrored local-session messages
+	sendProgress        // progress while a turn runs
+	sendClasses
+)
+
+func sendClass(kind string) int {
+	switch kind {
+	case store.OutProgress:
+		return sendProgress
+	case store.OutMirror:
+		return sendMirror
+	}
+	return sendReply
+}
+
+// paceThrottled slows the account's write pacing after an account write
+// throttle of a write that started at started (pace.go).
+func (e *Engine) paceThrottled(started, resume time.Time) {
+	if cut, rate := e.writeTokens.throttled(started, resume); cut {
+		e.logf("account writes throttled; pacing at %.2f/s", rate)
+	}
+}
+
 // marker is the hidden marker of one send attempt.
 func (e *Engine) marker(token string) string { return e.prefix + "." + token }
 
@@ -217,6 +252,7 @@ func (e *Engine) send(ctx context.Context, r store.Outbox, chat, token string, f
 		}
 		p = fp
 	}
+	started := e.now()
 	sent, err := e.ch.Send(ctx, chat, p, e.marker(token))
 	now := e.now()
 	e.count(func(s *engineStats) { s.sends++ })
@@ -259,6 +295,7 @@ func (e *Engine) send(ctx context.Context, r store.Outbox, chat, token string, f
 		at := now.Add(e.retryAfter(th) + time.Duration(r.ConvID%5)*e.t.Tick)
 		if th.Scope == channel.ScopeAccount || th.Scope == channel.ScopeUnknown {
 			e.setGate(e.gWrite, at, "send throttled")
+			e.paceThrottled(started, now.Add(e.retryAfter(th)))
 		}
 		e.requeue(r.ID, at)
 	case errors.As(err, &rej) && rej.Permanent:
@@ -626,6 +663,7 @@ func (e *Engine) upload(ctx context.Context, r store.Outbox, f store.OutFile) {
 		}
 		return e.update(func(tx *store.Tx) error { return tx.SetUpload(r.ID, s.URL, exp, s.Offset, "") })
 	}
+	started := e.now()
 	ref, err := e.ch.UploadFile(ctx, f.LocalPath, name, sess, save)
 	if ctx.Err() != nil {
 		return
@@ -646,6 +684,7 @@ func (e *Engine) upload(ctx context.Context, r store.Outbox, f store.OutFile) {
 	case throttled:
 		if th.Scope == channel.ScopeAccount || th.Scope == channel.ScopeUnknown {
 			e.setGate(e.gWrite, now.Add(e.retryAfter(th)), "upload throttled")
+			e.paceThrottled(started, now.Add(e.retryAfter(th)))
 		}
 		e.retryUpload(r.ID, now.Add(e.retryAfter(th)))
 	case errors.As(err, &rej) && rej.Permanent:

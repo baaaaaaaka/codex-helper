@@ -757,8 +757,9 @@ func (e *Engine) finishReconciled(ctx context.Context, cs *convState, tr store.T
 // one chat message before the final, except:
 //   - group chats (other people present): none;
 //   - coalescing (CORE-DESIGN §3): when other turns wait behind this one in
-//     the conversation, or the account write gate closed within the last
-//     5 min, at most one progress message per turn;
+//     the conversation, the account's writes are paced below the demand
+//     (pace.go), or the account write gate closed within the last 5 min,
+//     at most one progress message per turn;
 //   - at most maxProgress per turn.
 // The final is always complete; progress only shows the turn is alive.
 
@@ -787,7 +788,9 @@ func (e *Engine) progress(ctx context.Context, cs *convState, tr store.Turn, ps 
 		return
 	}
 	now := e.now()
-	coalesce := false
+	// Paced account writes (the write rate is below the demand) or a
+	// recent write throttle: one progress message per turn.
+	coalesce := e.writeTokens.limited()
 	if until := e.gate(e.gWrite); !until.IsZero() && now.Sub(until) < progressCoalesceFor {
 		coalesce = true
 	}

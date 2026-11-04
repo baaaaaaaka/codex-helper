@@ -60,6 +60,9 @@ type Timing struct {
 	// ThrottleFloor is the wait after a throttle response that names no
 	// Retry-After (review L9), so the service is not retried every tick.
 	ThrottleFloor time.Duration
+	// PaceIncrease is the quiet period (no account write throttle) after
+	// which the paced write rate grows by one step (pace.go).
+	PaceIncrease time.Duration
 }
 
 // ProductionTiming are the CORE-DESIGN values.
@@ -77,6 +80,7 @@ func ProductionTiming() Timing {
 		SilenceHint: 7 * time.Minute, SilenceStuck: 15 * time.Minute, StallLimit: time.Hour,
 		QueueReminder: 10 * time.Minute,
 		ThrottleFloor: 10 * time.Second,
+		PaceIncrease:  30 * time.Second,
 	}
 }
 
@@ -99,6 +103,7 @@ func FastTiming(base time.Duration) Timing {
 	t.CapacityBackoff = time.Second
 	t.CancelWait = 5 * time.Second
 	t.ThrottleFloor = 10 * base
+	t.PaceIncrease = 30 * base
 	return t
 }
 
@@ -144,7 +149,8 @@ type Config struct {
 	Readers, Senders, Turns int
 	// ReadRate caps chat reads per second account-wide (token bucket).
 	ReadRate float64
-	// WriteRate caps sends per second account-wide.
+	// WriteRate caps sends per second account-wide: the ceiling of the
+	// adaptive write pacing (pace.go).
 	WriteRate float64
 
 	finishFault func() error // tests: fails the turn-finish transaction
@@ -198,10 +204,11 @@ type Engine struct {
 	uploadAt     map[int64]time.Time // outbound file rows waiting before an upload retry
 
 	readTokens  *bucket
-	writeTokens *bucket
-	// sendLast is the last work conversation the sender served; the next
-	// pass starts after it (round robin). Sender goroutine only.
-	sendLast int64
+	writeTokens *pacer
+	// sendLast is, per send class (sendClass), the last work conversation
+	// the sender served; the next pass starts after it (round robin).
+	// Sender goroutine only.
+	sendLast [sendClasses]int64
 
 	fatalOnce sync.Once
 	fatal     error
@@ -274,7 +281,7 @@ func New(cfg Config) (*Engine, error) {
 		e.scanner = timedScanner{sc}
 	}
 	e.readTokens = newBucket(cfg.ReadRate, cfg.ReadRate*2, e.now)
-	e.writeTokens = newBucket(cfg.WriteRate, cfg.WriteRate*2, e.now)
+	e.writeTokens = newPacer(cfg.WriteRate, e.t.PaceIncrease, e.now)
 	return e, nil
 }
 
