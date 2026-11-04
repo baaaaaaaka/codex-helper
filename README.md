@@ -110,13 +110,13 @@ Most users only need the quick start above plus the common commands below:
 
 - **Basic local use**: install, run `cxp`, choose direct or SSH proxy mode, and
   open sessions from the history TUI.
-- **Daily options**: run commands through the selected proxy, choose a model
-  profile, open the Codex desktop app, or drive Codex from Teams.
-- **Advanced operations**: skills maintenance, Teams service recovery,
+- **Daily options**: run commands through the selected proxy, open the Codex
+  desktop app, or drive Codex from Teams.
+- **Advanced operations**: skills maintenance, the Teams background service,
   workflow webhooks, and source-checkout deployment.
 
 The rest of this README is grouped with that split in mind: common commands
-come first, then optional model/desktop/Teams flows, then advanced execution
+come first, then optional desktop/Teams flows, then advanced execution
 and maintenance references. For a map of all docs by audience and depth, see
 [`docs/README.md`](docs/README.md).
 
@@ -155,10 +155,6 @@ These are the commands a normal install most often needs:
 | `codex-proxy run -- <cmd> [args...]` | Run a command using the current direct/proxy mode |
 | `codex-proxy run -- codex` | Launch the original Codex TUI through CXP's standard approval broker |
 | `codex-proxy run --aaa -- codex` | Enable agent-auto-approve for this Codex run |
-| `codex-proxy run --model-profile <name> -- codex` | Launch Codex with a saved model profile for this run |
-| `codex-proxy model list` | Show the official model and configured `provider/model` selectors |
-| `codex-proxy model catalog add <name> ...` | Add a Git or managed-JSON provider catalog |
-| `codex-proxy model provider setup <provider>` | Bind one local key and verify every model published by a provider |
 | `codex-proxy proxy doctor` | Check local proxy/Codex prerequisites |
 | `codex-proxy proxy reset` | Clear saved proxy setup and ask again on next launch |
 | `codex-proxy app` | Launch the Codex desktop app on macOS, Windows, or WSL |
@@ -179,7 +175,6 @@ walk through the normal flows in order.
 | `codex-proxy [profile]` | Open the TUI (default) |
 | `codex-proxy app [profile]` | Install if needed, use or configure proxy mode, and launch the Codex desktop app on macOS, Windows, or WSL |
 | `codex-proxy app auth [profile]` | Complete ChatGPT auth for the Codex desktop app using the same `CODEX_HOME` and proxy setup |
-| `codex-proxy app --model-profile <name>` | Launch the Codex desktop app with a saved model profile through an isolated `CODEX_HOME` |
 | `codex-proxy --upgrade-codex-app [profile]` | Update the CXP-managed Windows/WSL or current-user macOS desktop app |
 | `codex-proxy --upgrade-codex` | Install or upgrade the CXP-managed Codex CLI |
 | `codex-proxy --upgrade-codex --upgrade-codex-path <absolute-path>` | Upgrade one explicitly selected external Codex installation |
@@ -188,27 +183,11 @@ walk through the normal flows in order.
 | `codex-proxy run [profile] -- <cmd> [args...]` | Run a command using the current mode, or force proxy when a profile is given (`codex` by default) |
 | `codex-proxy run -- codex` | Launch the original Codex TUI through CXP's standard approval broker |
 | `codex-proxy run --aaa -- codex` | Enable agent-auto-approve for this Codex run |
-| `codex-proxy run --model-profile <name> -- codex` | Launch Codex with a saved model profile for this run |
 | `codex-proxy tui` | Browse Codex history in a terminal UI |
 | `codex-proxy history tui` | Browse Codex history in a terminal UI |
 | `codex-proxy history list [--pretty]` | List discovered projects/sessions as JSON |
 | `codex-proxy history show <session-id>` | Print full history for a session |
 | `codex-proxy history open <session-id>` | Open a session in Codex |
-| `codex-proxy model list` | List the official model and configured `provider/model` selectors |
-| `codex-proxy model catalog add <name> --git <url>` | Add and sync a Git catalog |
-| `codex-proxy model catalog add <name> --json <file>` | Import a local JSON catalog into managed storage |
-| `codex-proxy model catalog sync <name>` | Refresh one Git or managed-JSON catalog |
-| `codex-proxy model catalog list` | Show catalog revision and route counts |
-| `codex-proxy model provider list` | Show provider-wide activation status |
-| `codex-proxy model provider setup <provider>` | Store one local key and verify every model under that provider |
-| `codex-proxy model use <provider/model>` | Make an already verified selector the global default for future Codex launches |
-| `codex-proxy model doctor [model]` | Validate a configured model profile |
-| `codex-proxy model-profile setup [name]` | Create or update a named model profile |
-| `codex-proxy model-profile list` | List saved model profiles |
-| `codex-proxy model-profile doctor [name]` | Validate a saved model profile |
-| `codex-proxy model-profile set-default <name>` | Set the default model profile |
-| `codex-proxy model-profile delete <name>` | Delete a non-default model profile |
-| `codex-proxy responses serve` | Run a local `/v1/responses` adapter backed by an OpenAI-compatible chat upstream |
 | `codex-proxy skills install-builtin` | Install or repair bundled skills in `$HOME/.agents/skills`, including the built-in `cxp` usage skill |
 | `codex-proxy skills add <git-url>` | Install skills from a git source and keep them updated |
 | `codex-proxy skills migrate` | Migrate managed legacy skills from `~/.codex/skills` to `$HOME/.agents/skills` |
@@ -226,20 +205,16 @@ walk through the normal flows in order.
 | `codex-proxy teams status` | Show Teams helper state, control chat, service, owner, and queue status |
 | `codex-proxy teams doctor` | Check local Teams helper auth and service readiness |
 | `codex-proxy teams path status` | Resolve the account PATH used by Teams Codex; add `--show-path` to print it |
-| `codex-proxy teams path mode <mode>` | Select `account-default`, `captured-terminal`, `explicit`, or compatibility `service` PATH mode |
-| `codex-proxy teams path capture-terminal` | Explicitly snapshot the current terminal PATH for future Teams Codex cold starts |
+| `codex-proxy teams path mode <mode>` | Select the `account-default` or `explicit` PATH mode (`teams path explicit <PATH>` saves the PATH) |
 | `codex-proxy teams workflow status` | Show optional Teams Workflow notification configuration |
 | `codex-proxy teams workflow enable --webhook-url-file <path>` | Enable Workflow cards using a private local webhook URL file |
-| `codex-proxy teams send-file <path> --session <id>` | Upload a local outbound file and send it as a Teams attachment |
-| `codex-proxy teams probe-chat --chat <chat-id-or-link>` | Read-only probe of an external Teams chat without binding helper state |
-| `codex-proxy teams pause` / `resume` / `drain` / `recover` | Pause, resume, drain, or recover Teams helper state from a terminal |
-| `codex-proxy teams chat recreate <session-id> --history full --yes` | Create and atomically bind a fresh Work chat, selecting the store that owns the session and optionally publishing full local history |
-| `codex-proxy teams chat publish-history <session-id> --full --yes` | Idempotently publish full local Codex history to the current Work chat; add `--force` only for an intentional replay |
-| `codex-proxy teams chat quarantine <session-or-chat> --dry-run\|--yes` | Atomically contain exactly one unsafe Work chat; terminal mutation refuses a live helper owner |
-| `codex-proxy teams chat unquarantine <session-or-chat> --dry-run\|--yes` | Resume only an explicitly quarantined session without replaying old work |
 | `codex-proxy teams service bootstrap` | Install or repair the background Teams helper service |
-| `codex-proxy teams service restart --force` | Recover local active Teams state, then force a service restart from a terminal |
-| `codex-proxy teams control --print` | Print the configured Teams control chat link |
+| `codex-proxy teams service restart` | Restart the Teams helper service; interrupted requests continue after the restart |
+| `codex-proxy teams control` | Print this machine's Teams control chat link |
+| `codex-proxy teams auth config --tenant-id <id> --client-id <id>` | Save the Teams Graph tenant and client ID |
+| `codex-proxy teams auth` / `auth status` / `auth logout` | Sign in with a device code, show the sign-in state, or remove the token cache |
+| `codex-proxy teams run` | Start the Teams helper (installs and starts the background service where supported) |
+| `codex-proxy teams migrate` | Convert a stopped v0.1.20 or v0.1.22-rc.59 helper store explicitly (the helper does it at first start) |
 | `codex-proxy delegate resolve --query <text> --json` | Resolve cross-machine delegation candidates for Codex or diagnostics |
 | `codex-proxy delegate start --candidate-token <token> --task-file <path> --json` | Create an idempotent delegation request for a selected machine |
 | `codex-proxy delegate status` / `wait` / `cancel` | Inspect, wait for, or cancel a delegation using the route saved by `start` |
@@ -248,10 +223,6 @@ walk through the normal flows in order.
 Common flags:
 
 - `--config /path/to/config.json` overrides the config file location
-- `run` supports `--model-profile <name>` for per-launch model selection when
-  the command is Codex
-- `app` supports `--model-profile <name>` for desktop-app launches that should
-  use a saved model profile
 - `tui` / `history tui` support `--codex-dir`, `--codex-path`, `--profile`, and `--refresh-interval` (default `5s`, use `0` to disable)
 - `history open` supports `--codex-dir`, `--codex-path`, and `--profile`
 - `history list` / `history show` support `--codex-dir`
@@ -259,7 +230,7 @@ Common flags:
 
 </details>
 
-## Model selection and standard approvals
+## Standard approvals
 
 ### Standard approval runtime
 
@@ -310,10 +281,10 @@ Cloudflare behavior while keeping the existing SSH/direct proxy choice intact.
 Normal CI and the Codex release monitor assert this routing boundary without
 external account credentials. Runtime-contract jobs install and launch the
 original Codex binary, but provide a fresh synthetic `CODEX_HOME`, synthetic
-ChatGPT auth metadata, and loopback-only official/third-party Responses
-services. The contract fails if per-turn model or effort is lost, a model switch
-changes the thread, portable context disappears, third-party reasoning reaches
-the synthetic official route, or Codex attempts to rely on a real model account.
+ChatGPT auth metadata, and a loopback-only scripted Responses service. The
+contract fails if per-turn model or effort is lost, a model switch changes the
+thread, portable context disappears, or Codex attempts to rely on a real model
+account.
 Repository CI must not store or inject OpenAI, NVIDIA, Teams, proxy, or other
 external-account tokens.
 
@@ -322,358 +293,6 @@ App does not currently expose a stable external app-server attachment contract,
 so Desktop automatic approval remains a final-release blocker for any claim
 that every CXP surface is brokered; CXP does not silently fall back to a retired
 execution mode for that surface.
-
-### External model catalogs
-
-New catalog-defined third-party models are not compiled into CXP. DeepSeek V4 and
-MiMo V2.5 are not built-in providers; configure those families through an external
-catalog before activating them. New third-party additions must use a catalog.
-A catalog contains public provider/model metadata; the provider key is always local.
-The same model name
-can therefore be published by multiple providers. Models on a provider use its
-default interface credential by default; interfaces that require a different
-token have their own local credential binding:
-
-```bash
-# A Git subscription. models.json is the repository-relative manifest.
-cxp model catalog add example-provider --git https://example.invalid/team/models.git
-
-# Or import a hand-written JSON document; it is copied into managed storage.
-cxp model catalog add local --json ./models.json
-
-cxp model catalog list
-cxp model provider list
-printf '%s' "$EXAMPLE_PROVIDER_API_KEY" | cxp model provider setup example-provider --api-key-stdin
-# Interfaces that use a separate token can be bound independently.
-printf '%s' "$DEEPSEEK_ANTHROPIC_KEY" | cxp model provider setup deepseek --interface anthropic --api-key-stdin
-cxp model use example-provider/deepseek-v4
-cxp model list
-```
-
-The catalog document is strict JSON with this shape:
-
-```json
-{
-  "catalogVersion": 2,
-  "providers": {
-    "example-provider": {
-      "defaultInterface": "chat",
-      "interfaces": {
-        "chat": {
-          "adapter": "openai-chat",
-          "baseUrl": "https://api.example.invalid/v1"
-        }
-      },
-      "models": {
-        "deepseek-v4": {
-          "upstreamModel": "deepseek-ai/deepseek-v4",
-          "displayName": "DeepSeek V4",
-          "defaultInterface": "chat",
-          "features": {
-            "tools": {"support": "native", "interface": "chat"},
-            "structuredOutput": {"support": "native", "interface": "chat"},
-            "webSearch": {
-              "support": "plugin",
-              "fallback": {"selector": "official/gpt-5.6-luna", "effort": "high", "tier": "flex"}
-            }
-          }
-        }
-      }
-    }
-  }
-}
-```
-
-An interface that needs a non-OpenAI wire shape opts into a compiled,
-versioned converter. The profile is a registry key, not an arbitrary request
-template. For example:
-
-```json
-{
-  "adapter": "deepseek-anthropic",
-  "protocol": "messages",
-  "baseUrl": "https://api.deepseek.com/anthropic",
-  "conversion": {"enabled": true, "profile": "deepseek-anthropic-v1", "strict": true},
-  "auth": {"type": "header", "header": "x-api-key"}
-}
-```
-
-Beta prefix/FIM routes use the same mechanism and declare the request
-operation on the model feature, for example
-`{"support":"native","interface":"beta","operation":"fim"}`.
-Clients send `operation`, `prefix`, and `suffix` only for those explicit
-operations; an unknown operation or converter profile is rejected before any
-upstream request is made.
-
-Provider-native tools and source results are also declared in JSON. This is
-the required shape for a provider such as MiMo whose native search tool is
-available on Chat Completions but not on its Responses endpoint:
-
-```json
-{
-  "webSearch": {
-    "support": "native",
-    "interface": "chat",
-    "nativeTool": {
-      "inputTypes": ["web_search_preview", "web_search"],
-      "upstreamType": "web_search",
-      "allowedFields": ["search_context_size"]
-    },
-    "sources": {"mode": "annotations", "requireUrl": true, "requireSources": true}
-  },
-  "responses": {
-    "previousResponseId": "unsupported",
-    "background": "unsupported",
-    "contextManagement": "unsupported"
-  }
-}
-```
-
-For DeepSeek, set the model's native `webSearch.interface` to the named
-Anthropic interface and give that interface its own local credential binding.
-CXP then selects the compiled `deepseek-anthropic-v1` converter, forwards the
-typed server-search tool, and returns URL citations as Responses annotations.
-An unsupported native tool or a provider source result without a required URL
-fails closed; it is never silently dropped and presented as a normal answer.
-
-The user-facing selector is always `provider/model`. `model provider setup`
-verifies every model for that provider and never changes the current chat or a
-global default. Git catalogs with `--auto-sync` refresh in the long-lived Teams
-service; managed JSON catalogs are refreshed explicitly with `model catalog
-sync`. A provider may expose several named interfaces (for example Chat,
-Responses, Anthropic, or Beta/FIM), and each model feature selects the
-interface it actually supports. Provider URLs with embedded credentials,
-credential headers, and raw tokens in catalog JSON are rejected. A catalog
-feature that has no registered adapter fails closed instead of being silently
-dropped.
-
-Use a saved model profile for one launch without changing the default:
-
-```bash
-codex-proxy run --model-profile example-provider/deepseek-v4 -- codex
-codex-proxy app --model-profile example-provider/deepseek-v4
-```
-
-Teams users can pick model profiles when creating or switching Work chats; the
-Teams commands are listed in the Teams helper section below.
-
-### Custom model profiles and Responses adapter
-
-Use `model-profile` when you need a named profile with explicit provider,
-model, API-key source, or SSH proxy route:
-
-```bash
-codex-proxy model-profile setup work-compatible \
-  --provider responses-compatible \
-  --model example/reasoning-model \
-  --base-url-env RESPONSES_BASE_URL \
-  --api-key-env RESPONSES_API_KEY \
-  --set-default
-
-codex-proxy model-profile list
-codex-proxy model-profile doctor work-compatible
-codex-proxy model-profile set-default work-compatible
-```
-
-For a provider that already exposes a Responses-compatible API, use the generic
-`responses-compatible` provider. Keep provider-specific URLs, model ids, and
-credentials in local configuration or environment variables rather than in
-source control:
-
-```bash
-export RESPONSES_BASE_URL=https://api.example.com/v1
-
-codex-proxy model-profile setup private-responses \
-  --provider responses-compatible \
-  --model provider/model-id \
-  --base-url-env RESPONSES_BASE_URL \
-  --api-key-env RESPONSES_API_KEY \
-  --set-default
-
-codex-proxy model-profile doctor private-responses
-codex-proxy run --model-profile private-responses -- codex
-```
-
-For an OpenAI-compatible Chat Completions endpoint, use `chat-compatible`.
-The model id is not compiled into CXP, and reasoning compatibility can be kept
-in the local profile instead of source code:
-
-```bash
-codex-proxy model-profile setup private-chat \
-  --provider chat-compatible \
-  --model provider/future-model \
-  --base-url-env CHAT_BASE_URL \
-  --api-key-env CHAT_API_KEY \
-  --default-reasoning-effort high \
-  --supported-reasoning-efforts low,medium,high,xhigh \
-  --reasoning-effort-map xhigh=max
-```
-
-The same settings are stored as `defaultReasoningEffort`,
-`supportedReasoningEfforts`, and `reasoningEffortMap` in the local CXP JSON
-configuration and can be changed without adding provider-specific details to
-the repository.
-
-For per-model tuning, the local CXP config also supports a versioned four-layer
-schema. A `modelCredentials` entry can be shared by multiple models under one
-provider. `modelProviders` stores protocol, endpoint, credential reference,
-fixed headers, retry, and stream policy. `models` stores limits, capabilities,
-reasoning, tools, messages, sampling, cache, and search policy.
-`modelProfiles` contains only user choices and overrides. Unknown fields,
-dangling references, and contradictory capabilities fail during config load.
-
-HTTP behavior is independently tunable per provider and per model. The
-phase-specific fields avoid treating a slow first token and a stalled SSE body
-as the same failure. An explicit `maxRetries: 0` disables adapter retries;
-omitting it retains the default. `honorRetryAfter` controls whether an upstream
-`Retry-After` header can extend the backoff:
-
-```json
-{
-  "http": {
-    "responseHeaderTimeoutSeconds": 120,
-    "timeoutSeconds": 0,
-    "maxRetries": 1,
-    "retryStatuses": [429, 502, 503, 504, 529],
-    "honorRetryAfter": true,
-    "retryTransportErrors": false,
-    "maxConcurrentRequests": 1
-  },
-  "stream": {
-    "idleTimeoutSeconds": 300,
-    "reasoningDeltaPath": "choices[0].delta.reasoning_content",
-    "cachedTokensPath": "usage.prompt_tokens_details.cached_tokens"
-  },
-  "cache": {"usageField": "prompt_cache_hit_tokens"}
-}
-```
-
-`timeoutSeconds` is the legacy optional whole-request bound; zero or omission
-leaves the total request unbounded while the two phase-specific guards remain
-active. CXP logs when it is waiting for response headers and when it retries an
-upstream request so a slow model is distinguishable from a stalled stream.
-`maxConcurrentRequests` is zero/unlimited by default and can serialize a model
-whose serving deployment stalls under concurrency. The two stream paths accept
-dot, slash, or array-index JSON paths. `cache.usageField` is the fallback cached
-token path when `stream.cachedTokensPath` is omitted. Standard OpenAI fields
-continue to work without any path configuration. Impossible upstream counts
-(for example reasoning tokens greater than all completion tokens) are clamped
-and written to the CXP upstream diagnostic log.
-Set `retryTransportErrors` to false for deployments where a client-side header
-timeout may leave inference running server-side; this prevents one timed-out
-generation from being duplicated by adapter retries. HTTP status retries remain
-controlled independently by `maxRetries` and `retryStatuses`.
-
-`codex-proxy model-profile explain <name>` prints the redacted effective
-configuration and provider/model/catalog fingerprints, so inheritance and
-overrides can be checked before launching Teams, CLI, or App.
-
-For new subscriptions use the provider-first catalog commands above. The
-older flat `model-source` commands are retained only for reading existing
-source state while workspaces migrate; they do not define the new
-`provider/model` syntax:
-
-```bash
-cxp model-source sync https://github.example/team/models.git
-cxp model-source list
-cxp model-source bind models work-glm --api-key-stdin
-```
-
-The first sync uses a shallow filtered clone and asks for no key. Candidates
-appear only in `model-source list`, not in Codex. `bind` asks only for the
-source, profile, and missing key, then sends one timeout-bounded minimal real
-inference request. A model enters the CXP/Teams model list and the shared Codex
-CLI/App/Teams catalog only after that request succeeds. Failed verification
-keeps the candidate and a short diagnostic while the model remains hidden.
-Git revisions alone do not invalidate verification. If the effective provider,
-model, compatibility policy, or credential binding changes, CXP automatically
-reuses the stored key for a minimal re-verification; unchanged models remain
-available without user action. Only a failed re-verification stays hidden and
-is retried by later syncs. Private repositories use the existing Git credential helper or SSH agent;
-repository URLs with embedded credentials are rejected. New Git catalogs use
-the same shallow-sync and last-known-good behavior when `--auto-sync` is set;
-managed JSON remains explicit and never runs a background watcher.
-
-While the long-lived Teams service is running, configured model-source
-repositories are shallow-synced automatically every 30 minutes. The schedule
-is based on each source's persisted `syncedAt`, so restarting the helper does
-not postpone an overdue pull. Git, checkout, schema-validation, or merge
-failures emit a warning and keep the last successfully synced repository and
-configuration active; failures are retried on the next normal interval rather
-than in a tight loop. `teams run --once` never starts the background sync.
-When a previously activated source cannot accept its latest JSON, CXP records
-the last-known-good revision as an active backup. `model-source list` shows the
-state, and every accepted Teams Work-chat turn using one of its profiles carries
-a visible backup-JSON warning until a later sync succeeds. Initial sync failures
-do not claim that a backup exists.
-
-When at least one valid third-party model profile is configured, CXP starts a
-loopback-only unified model gateway. It asks the same Codex binary that will run
-the session for its complete bundled official catalog, appends only currently
-verified and routable third-party models, and atomically writes a reusable
-last-known-good catalog. This local operation does not perform the old
-`model/list` network prewarm or wait for gateway readiness. Codex CLI, App, and
-Teams model pickers can then show and switch
-between official and third-party models in the same launch. Requests are
-routed by an explicit model allowlist. Official authentication is forwarded
-only to the official backend; third-party credentials are forwarded only to
-their configured provider. If no third-party model profile is configured, CXP
-does not start the gateway or inject any provider, catalog, header, or
-environment override, so official-only Codex behavior is unchanged.
-If the unified gateway cannot be prepared while the official default is
-selected—including catalog, proxy, routing, or listener failures—CXP bypasses
-it and keeps Codex on its native official provider instead of letting a
-third-party failure block GPT. The App
-profile inherits user config and credential-store selection while overriding
-only CXP-owned model fields.
-
-CXP probes the effective `CODEX_HOME` and credential store through the official
-`codex login status` command instead of reading `auth.json` directly. When
-logged in, the official GPT catalog keeps its native order and always precedes
-third-party models, including explicit third-party profiles and resumed
-snapshots. When logged out, CXP uses a third-party-only provider with
-`requires_openai_auth=false`, so users who only want third-party models are not
-forced to log in. Official catalog refresh is never a prerequisite for
-third-party inference; an unavailable bundled catalog degrades immediately to
-the verified third-party-only catalog.
-
-Teams `model list` contains only models whose authentication verification is
-still current. After a successful Codex login probe, it reads the account-filtered
-Codex app-server `model/list`, shows every selectable official model in server
-order, and resolves `default` to the concrete model marked `isDefault`. A
-third-party profile requires a successful minimal real inference for that
-specific model, and its verification fingerprint must still match the current
-key and effective model configuration. `model setup` remains the
-separate discovery and key-intake surface. CLI setup, Teams one-time key intake,
-and Git `model-source bind` share the same verification semantics; failed
-profiles remain saved for retry but stay out of the Teams picker.
-
-CXP keeps each upstream key inside the helper and authenticates local gateway
-requests with a separate one-time header.
-The compatibility proxy preserves `prompt_cache_key`, native usage, streaming,
-and response ids while normalizing namespace/custom tools and replay items for
-function-tool-only Responses implementations. It configures Codex with
-`wire_api="responses"`, does not write the upstream key into generated Codex
-config, and does not translate requests through Chat Completions. Hosted web
-search is disabled on the third-party parent model. When that profile needs
-live web information, CXP exposes a local `gpt_search` role backed by
-`gpt-5.6-luna` with high reasoning and live search; Codex delegates only the
-standalone search task and returns the cited result. Profiles that support
-native hosted search are unchanged and do not receive this fallback. The role
-configuration stays in the local model-profile asset directory and contains no
-third-party URL or credential. Local MCP servers and skills remain available.
-Cache usage is reported as input, cached-token count, and hit rate in the
-launch log.
-
-For lower-level experiments or integrations, `responses serve` exposes a local
-`/v1/responses` facade backed by an OpenAI-compatible chat upstream:
-
-```bash
-codex-proxy responses serve \
-  --base-url https://api.example.com/v1 \
-  --api-key-env PROVIDER_API_KEY \
-  --model provider-model
-```
 
 ## Local Codex history and TUI
 
@@ -770,7 +389,7 @@ codex-proxy app
 
 On macOS and Windows this installs the desktop app if needed, uses the saved
 direct/proxy preference, asks on first setup, and launches the desktop app. On
-Windows, proxy/model-profile launches use a cxp-managed unpacked copy of the
+Windows, proxy launches use a cxp-managed unpacked copy of the
 official signed x64 ChatGPT MSIX under `%LOCALAPPDATA%\cxp\apps\chatgpt`,
 so `CODEX_HOME`, proxy environment variables, and Chromium's
 `--proxy-server` argument reach the process without changing the system proxy.
@@ -824,10 +443,6 @@ process, `cxp` makes one legacy direct-launch attempt; it never falls back to
 AppX activation when launch-time environment would be lost. Set
 `CXP_WINDOWS_APP_BACKEND=managed-only` or `legacy` only for diagnostics and CI.
 
-Use `codex-proxy app --model-profile <name>` when the desktop app should launch
-with a saved model profile. If the desktop app is already running, quit it first
-so the model profile configuration takes effect.
-
 Authenticate the Codex desktop app without relying on the desktop UI to show a
 device code:
 
@@ -862,9 +477,9 @@ codex-proxy tui --codex-path /path/to/codex
 ## Teams helper
 
 Teams helper lets you drive Codex from Microsoft Teams while keeping execution
-on your own machine. A local `codex-proxy teams run` listener reads Teams
-messages, starts or resumes Codex sessions in the selected project directory,
-and sends status, answer, artifact, and notification updates back to Teams.
+on your own machine. A local `codex-proxy teams run` helper reads Teams
+messages, runs Codex sessions in the selected project directory, and sends
+progress, answers, files, and notifications back to Teams.
 
 Teams helper is available in stable releases. Install the normal binary first;
 if this machine has an older helper, update to the latest stable release before
@@ -878,10 +493,10 @@ From an existing Teams control chat, you can ask the helper itself to move to
 the latest stable release:
 
 ```text
-helper update now
+update now
 ```
 
-Use `helper update prerelease` only when you intentionally want the newest
+Use `update prerelease` only when you intentionally want the newest
 pre-release.
 
 ### Fast setup
@@ -889,46 +504,59 @@ pre-release.
 The recommended setup path is the interactive bootstrap script from the quick
 start section. It performs the complete local setup flow:
 
-1. Configure Teams auth metadata.
+1. Configure the Teams Graph tenant and client ID.
 2. Run Microsoft device login.
 3. Verify the local Teams auth cache.
-4. Install or repair the background Teams helper service.
-5. Open or print the Teams control chat link.
+4. Install or repair the background Teams helper service and start it.
 
 The script stores auth metadata and tokens locally under the current user. It
 does not require a project checkout and does not hard-code Teams auth values;
 it asks for the required values interactively unless you provide them with
-environment variables or script flags.
+environment variables or script flags. One delegated sign-in covers reading and
+sending chat messages, meeting chats, and file uploads.
+
+The same steps by hand:
+
+```bash
+codex-proxy teams auth config --tenant-id <tenant-id> --client-id <client-id>
+codex-proxy teams auth
+codex-proxy teams run
+```
 
 ### How it works
 
-The helper creates a **control chat** for machine-level commands and separate
-work chats for Codex sessions. Use the control chat to list projects, choose a
-project/session, start new Codex work, check status, recover stuck state,
-update the local Codex CLI, restart or update the installed helper, and reload
-only a source-checkout development helper.
+The helper creates a **control chat** for machine-level commands and one
+**work chat** per Codex session. Use the control chat to start sessions, list,
+park and wake them, check status, update the local Codex CLI, and restart or
+update the helper.
 
-When a Teams work chat message is routed to Codex, the helper queues it,
-starts Codex with the selected session working directory, streams progress as
-status updates, and posts the final answer back to the work chat. If a Codex
-answer is detected from another local entry point, the helper can create or
-link the matching Teams chat and notify you there as well.
+A work chat message is acknowledged, queued, and run in the session's Codex
+thread; progress appears while Codex works and the final answer is posted once.
+The owner is mentioned in the control chat when an answer arrives (answers
+that arrive within a few seconds share one mention), or notified with a Teams
+Workflow card when one is configured. Several prompts sent while Codex is busy
+run one after another, and the queue is announced once when it starts.
 
 Teams text, quoted messages, files, pasted images, and supported inline media
-can be passed through to Codex when available. Teams voice or video clips are
-transcribed locally before the turn starts, and Codex receives the transcript
-with a note that it came from automatic speech recognition. Generated files
-listed in a Codex artifact manifest can be uploaded back to Teams when
-file-write auth is configured.
+are passed through to Codex. Teams voice or video clips are transcribed locally
+before the turn starts, and Codex receives the transcript with a note that it
+came from automatic speech recognition. Files that Codex lists in a
+`codex-helper-artifacts` manifest are uploaded back to the work chat.
 
-If you also use Codex from a local terminal on the same machine, Teams helper
-can notice the matching local answer, create or link the corresponding Teams
-chat, and post the visible result there. This keeps Teams usable as the shared
-conversation surface without forcing every Codex turn to start from Teams.
+If you also use Codex from a local terminal or IDE on a session that has a work
+chat, the helper posts those prompts and answers to the work chat too, so Teams
+stays the shared conversation surface.
+
+The helper keeps its state in one local SQLite store. A store from v0.1.20 or
+v0.1.22-rc.59 is converted automatically at the first start; the old store is
+kept unchanged. A request that was running when the helper stopped (a crash, an
+update, a restart) continues in the same Codex thread with one interruption
+notice. Under Microsoft Graph throttling the helper paces its reads and writes
+and catches up on its own.
 
 When the same Teams user runs helpers on multiple machines, Codex can use
 cross-machine delegation for tasks that need another machine's repo, hardware,
-or local context. The user-facing trigger is natural language in a Work chat,
+or local context. The user-facing trigger is natural language in a work chat,
 for example "ask the other machine to inspect this repo" or "have the GPU box
 check this failure"; Codex decides whether to use the `cxp delegate` workflow
 from its installed skill. Each active helper publishes a compact machine card
@@ -939,46 +567,37 @@ in the target machine inbox. This currently converges only for machines signed
 in as the same Teams user, and hidden Teams chats remain subject to tenant
 retention, eDiscovery, and audit policy.
 
-The background service keeps the listener alive after terminal close, SSH
+The background service keeps the helper alive after terminal close, SSH
 disconnect, WSL session exit, sleep/wake, or helper upgrade. Service bootstrap
 chooses the native per-user service mechanism for the platform where possible
 and repairs old helper service definitions when it can do so safely.
 
-Codex app-servers launched for Teams use the target account's default PATH by
-default instead of copying the background service PATH. Config files written by
-helper generations before this policy was introduced are migrated to explicit
-`service` mode so an upgrade does not silently change a working installation;
-select `teams path mode account-default` when ready. On Unix and WSL, cxp
-resolves the account shell from the account database, starts it under the same
-UID, GID, groups, and HOME as Codex, and receives only PATH through a framed
-private Unix socket with a per-probe nonce. On Windows, cxp reads the
-environment block for the current Scheduled Task user token. Managed Node
-remains private to Codex installation and wrapper discovery in non-`service`
-modes; when the packaged native Codex binary is available, it
-is launched directly so `node`, `npm`, and other tools still resolve from the
-user PATH.
+Codex app-servers launched for Teams use the target account's default PATH
+instead of copying the background service PATH. On Unix and WSL, cxp resolves
+the account shell from the account database, starts it under the same UID,
+GID, groups, and HOME as Codex, and receives only PATH through a framed private
+Unix socket with a per-probe nonce. On Windows, cxp reads the environment block
+for the current Scheduled Task user token. Managed Node remains private to
+Codex installation and wrapper discovery; when the packaged native Codex binary
+is available, it is launched directly so `node`, `npm`, and other tools still
+resolve from the user PATH.
 
 `account-default` intentionally does not reproduce terminal-only activation
-such as venv, direnv, or a project-specific shell. Use `teams path
-capture-terminal` when that exact snapshot is desired, `teams path explicit
-<PATH>` for a maintained explicit value, or `teams path mode service` as a
-compatibility rollback. Unknown account shells fail with a diagnostic instead
-of silently being treated as bash. `teams path status` reports identity, shell,
-source, entry count, and a fingerprint without printing the complete PATH
-unless `--show-path` is supplied. Use `teams path shell default` to clear a
-previous shell override and return to the account database value.
-
-Generation 5 remains readable by older helpers because the reader floor is
-unchanged, but older helpers deliberately refuse to overwrite a newer config;
-downgrade workflows should restore a matching config backup or return to the
-newer helper before changing settings.
+such as venv, direnv, or a project-specific shell. Use `teams path explicit
+<PATH>` for a maintained explicit value. Unknown account shells fail with a
+diagnostic instead of silently being treated as bash. `teams path status`
+reports identity, shell, source, entry count, and a fingerprint without
+printing the complete PATH unless `--show-path` is supplied. Use `teams path
+shell default` to clear a previous shell override and return to the account
+database value. Saved `captured-terminal` and `service` modes of earlier
+releases resolve as `explicit` and `account-default`.
 
 On non-WSL Linux, bootstrap uses `systemd --user` when the user manager is
 available. If `systemd --user` is not usable, it falls back to a local
 supervisor that detaches with `setsid`, uses a file lock to prevent duplicate
-instances, and restarts the Teams runner when it exits or local owner/poll
-evidence becomes stale. This fallback survives terminal close and helper
-crashes, but it does not provide restart after a machine or container reboot.
+instances, and restarts the Teams helper when it exits. This fallback survives
+terminal close and helper crashes, but it does not provide restart after a
+machine or container reboot.
 Set `CODEX_HELPER_TEAMS_LINUX_SERVICE_BACKEND=systemd` or
 `CODEX_HELPER_TEAMS_LINUX_SERVICE_BACKEND=local-supervisor` to force a backend;
 leave it unset for auto selection. In auto mode, an enabled or currently active
@@ -994,70 +613,49 @@ Daily local checks:
 ```bash
 codex-proxy teams status
 codex-proxy teams doctor --live
-codex-proxy teams control --print
+codex-proxy teams control
 ```
 
-Daily control-chat commands:
+Control chat commands (send `help` for the list):
 
 ```text
-help
-projects
 new /absolute/path
-new <directory> --model <profile>
-sessions
-continue 1
+list
+r s003
+park s003
+fork s003
+model
+stats
+skills
 status
-model status
-model list
-model catalog list
-model provider list
-model switch example-provider/deepseek-v4
-model reset
-effort status
-effort list
-effort set high
-effort reset
-default status
-default model set official:<slug>
-default effort set high
+restart
+update now
+codex update now
 ```
 
-Daily Work chat commands:
+Work chat commands (send `helper help` for the list; any other message goes to
+Codex):
 
 ```text
 helper status
+helper cancel
+helper cancel all
+helper retry
 helper retry last
-helper cancel running
-helper file relative/path.ext
-helper publish-history
-helper publish-history full
-model status
-model switch example-provider/deepseek-v4
-model reset
-model fork example-provider/deepseek-v4
-effort status
-effort list
-effort set xhigh
-effort reset
+helper unpause
+helper park
+helper fork
+helper model
+helper model <model> [effort]
+helper effort <effort>
+helper stats
+helper restart
 ```
 
-Teams `model` and `effort` commands affect only the chat where they are sent,
-including the Control chat. `model use <model>` remains an alias for the
-chat-local `model switch <provider/model>`. `model catalog` and `model provider`
-configure availability only; they never select a model or change a default.
-
-Control-only `default` commands manage global defaults for future CXP/Codex
-launches and newly created Teams chats under the same config root. They do not
-rewrite existing chats, including the Control chat where the command is sent.
-Use `default status`, `default model status|list|set|reset`, and
-`default effort status|list|set|reset`. Use `official:<slug>` or
-`profile:<name>` when a model name needs disambiguation. Work chats reject
-`default` commands.
-
-Control and Work chats keep their effort independently. `effort list` uses the
-current model's advertised choices and order; a switch applies to turns queued
-after the command. `effort reset` selects an explicit global effort when one is
-configured, otherwise it uses the model-advertised default.
+`model` lists the models Codex offers for the signed-in account, and
+`helper model <model> [effort]` switches one session. Third-party model
+profiles and catalogs are no longer supported; configs that still contain them
+load normally and keep those settings untouched.
 
 Advanced local checks and maintenance:
 
@@ -1065,51 +663,25 @@ Advanced local checks and maintenance:
 codex-proxy teams service doctor
 codex-proxy teams service status
 codex-proxy teams service bootstrap
+codex-proxy teams service restart
 codex-proxy teams workflow status
-codex-proxy teams send-file relative/path.ext --session <session-id>
-codex-proxy teams probe-chat --chat <teams-chat-id-or-link>
-codex-proxy teams pause
-codex-proxy teams resume
-codex-proxy teams drain
-codex-proxy teams recover
-codex-proxy teams chat recreate <session-id> --history full --yes
-codex-proxy teams chat publish-history <session-id> --full --yes
-codex-proxy teams chat quarantine <session-or-chat> --dry-run
-codex-proxy teams chat unquarantine <session-or-chat> --dry-run
+codex-proxy teams migrate --dry-run --out /tmp/core-preview.sqlite
 ```
 
-If retained state stores disagree about a session, both maintenance commands
-fail closed and print the candidates. Use `--store <state.json>` only after
-checking which copy is authoritative. Recreating a quarantined session also
-requires `--activate`; closed and archived sessions cannot be recreated.
-
-In the Teams control chat, `helper reload now` is for source-checkout
-development reloads only. Normal installed helpers should use `helper restart
-now` after a local repair or `helper update now` for a release update. Use
-`helper update prerelease` only when you intentionally want the newest
-pre-release.
-
 Send `codex update now` in the control chat to update the CXP-managed Codex CLI.
-The helper drains active Codex work first and posts
-the result back to the control chat. This command does not update cxp/codex-helper
-and does not automatically retry earlier failed requests.
+The helper waits for active Codex work first and posts the result back to the
+control chat. This command does not update cxp/codex-helper and does not retry
+earlier failed requests; `helper retry last` in a work chat does.
 
-If a quick Codex question sent in the control chat gets stuck, send
-`helper cancel running` in that same control chat. Work chat requests are still
-canceled inside their own Work chat.
+Codex turns launched by the helper receive the absolute
+`CODEX_HELPER_CLI_PATH`; cxp is not added to the user PATH, so a missing `cxp`
+alias does not mean the installed helper is missing.
 
-Control-chat Codex fallback receives the configured Teams Codex PATH policy,
-which defaults to the target account environment for newly written policy
-configs; migrated older configs retain explicit `service` mode. It also receives
-the absolute `CODEX_HELPER_CLI_PATH`; cxp is not added to the user PATH, so a
-missing `cxp` alias does not mean the installed helper is missing.
-
-If you update the helper from the Teams control chat, the helper drains current
-work first and sends a completion or failure notice back to Teams. A local
-`codex-proxy upgrade` only installs the helper binary and matching `cxp` entry
-points; it does not repair, stop, or restart the Teams service by default. After
-a local helper upgrade, send `helper restart now` in the Teams control chat to
-run the installed helper update.
+If you update the helper from the Teams control chat, the helper sends a
+completion or failure notice back to Teams. A local `codex-proxy upgrade` only
+installs the helper binary and matching `cxp` entry points; it does not restart
+the Teams service. After a local helper upgrade, send `restart` in the control
+chat (or run `codex-proxy teams service restart`).
 
 For a deeper deployment and troubleshooting guide, see
 [`docs/teams_source_deployment_guide.md`](docs/teams_source_deployment_guide.md).
@@ -1184,14 +756,14 @@ left `cxp` or `codex-proxy` in multiple known locations, the upgrade keeps the
 currently invoked helper as the canonical target when it is runnable, ignores
 broken stale install-path hints, and repairs known managed/env/default entries
 to point at the canonical helper. This keeps a network timeout or Windows
-service repair problem from interrupting a running helper. Use `helper restart
-now` in the Teams control chat to run the installed helper update.
+service repair problem from interrupting a running helper. Send `restart`
+in the Teams control chat to run the installed helper update.
 
 Teams background mode also checks `codex-helper` GitHub Releases every 30
 minutes and silently applies eligible helper updates after current Teams/Codex
 work drains. Background helper auto-update uses the running stable helper path
 when it is a runnable helper binary, then repairs known managed/env/default
-entry points to the installed helper before restarting the bridge:
+entry points to the installed helper before restarting the helper:
 
 - `p0`: update as soon as the release is detected.
 - `p1`: update after the release has been published for 48 hours.

@@ -15,38 +15,16 @@
 - `cxp tui`: open the local Codex history TUI explicitly. Press `Ctrl+A` to toggle Agent Auto Approve (AAA) and `Ctrl+K` to open the skills menu. AAA defaults off.
 - `cxp app [profile]`: install the Codex desktop app if needed, use or configure proxy mode, and launch the desktop app on macOS, Windows, or WSL. Linux outside WSL has no official Codex desktop app. If a proxy profile is literally named `app` or `auth`, use `cxp tui app`, `cxp app --profile auth`, or `cxp app auth --profile auth` to avoid command-name ambiguity.
 - `cxp app auth [profile]`: complete ChatGPT auth for the Codex desktop app through a temporary Codex app-server using the same CODEX_HOME and proxy setup as `cxp app`.
-- `cxp app --model-profile <name>`: launch the desktop app with a saved model profile through an isolated CODEX_HOME; quit an already-running app first so the setting takes effect.
 - `cxp --upgrade-codex-app [profile]`: on native Windows or WSL, download and verify the official signed x64 ChatGPT MSIX, publish it beside the current CXP-managed runtime, and select it for future `cxp app` launches without modifying the Microsoft Store/AppX installation.
 - `cxp run [profile] -- <cmd args...>`: run a command through the selected proxy profile and helper runtime handling.
 - `cxp run -- codex`: launch the original Codex TUI through CXP's standard approval broker with manual approvals.
 - `cxp run --aaa -- codex`: enable Agent Auto Approve for this run without changing the saved TUI preference.
 - `cxp run --aaa -- codex exec <prompt>`: enable Agent Auto Approve for a non-interactive Codex turn; without AAA, approval-required operations fail closed.
-- `cxp run --model-profile <name> -- codex`: launch Codex with a saved model profile for this run.
 - `cxp init`: create or repair local proxy configuration interactively; when `~/.ssh/config` contains concrete `Host` entries, it can reuse and validate one before falling back to manual SSH host details.
 
-## Model Profiles And Responses Adapter
+## Models
 
-- `cxp model list`: list built-in model choices and setup status.
-- `cxp model setup <model> --api-key-stdin`: configure a built-in third-party model choice using an API key read from stdin.
-- `cxp model setup <model> --api-key-env <ENV>`: configure a built-in model choice using an API key environment variable.
-- `cxp model use <model>`: make a configured model the default for future Codex launches.
-- `cxp model doctor [model]`: validate the profile backing a built-in model choice.
-- `cxp model-profile setup [name] --provider <built-in-or-compatibility-provider> --model <provider-model> --api-key-stdin --set-default`: create or update a named profile. DeepSeek V4 and MiMo V2.5 are external-catalog-only; add or sync a catalog and activate its provider with `cxp model provider setup <provider>`. Generic providers also require `--base-url <url>` or `--base-url-env <ENV>` and can use `--supported-reasoning-efforts low,medium,high,xhigh` plus `--reasoning-effort-map xhigh=max`. When any third-party profile is configured, CXP exposes official and third-party models through one credential-isolating gateway; official-only configurations remain on Codex's native path.
-- `cxp model-profile setup [name] ... --ssh-proxy <proxy-profile>`: route a model profile through an existing SSH proxy profile.
-- `cxp model-profile list`: list saved model profiles.
-- `cxp model-profile doctor [name]`: validate a saved model profile.
-- `cxp model-profile set-default <name>`: set the default model profile.
-- `cxp model-profile delete <name>`: delete a non-default model profile.
-- `cxp model-source sync <repository-or-source> [--kind git|file|directory] [--name <name>] [--ref <ref>] [--file <path>]`: shallow-sync candidates without asking for a key. The source can be a Git URL, a single legacy JSON file, or a local directory containing a schema-v2 `manifest.json` with `providers/` and `models/` documents. The kind is inferred when omitted; a `manifest.json` path denotes its containing directory.
-- `cxp model-source list`: list synced sources, candidates, and verification state.
-- `cxp model-source bind <source> <profile> --api-key-stdin|--api-key-env <ENV>`: store a key only in the local secret store and run a timeout-bounded minimal real inference probe; only a successful, fingerprint-current profile enters CLI, App, and Teams model catalogs. Never put a key in the subscription JSON.
-- Schema-v2 model identity is `provider/model`, so the same model id may exist behind multiple providers. A provider credential reference may be shared by its models, while each provider/interface can use its own auth shape and route policy.
-- Schema-v2 parsing is fail-closed and atomic: unknown fields, trailing JSON, raw secrets, path escapes or symlinks, dangling manifest references, alias collisions, missing capability declarations, and unsupported adapter/protocol routes are rejected.
-- Model-source refreshes preserve verification across Git-only changes. Effective model/config changes reuse the stored key for automatic verification, and a removed or failed default safely falls back to Codex Official.
-- A failed refresh of a previously activated source records its last-known-good JSON as an active backup. `model-source list` and every accepted Teams turn using that source show a warning until sync recovers.
-- CXP checks official login with `codex login status`. Logged-in launches merge the current Codex binary's complete bundled GPT catalog first; logged-out launches remain third-party-only and do not require OpenAI auth. Catalog preparation is local and cached: it never runs the old synchronous `model/list` prewarm or blocks third-party inference on official catalog readiness.
-- Teams `model list` is verified-only. When Codex login succeeds, it reads the current account's app-server `model/list`, preserves official order, and prints the concrete `isDefault` model. Use `model setup` to discover candidates; a third-party model appears in the selectable list only after its model-specific authentication probe succeeds and remains fingerprint-current.
-- `cxp responses serve --base-url <openai-compatible-url> --api-key-env <ENV> --model <model>`: run a local `/v1/responses` adapter backed by an OpenAI-compatible chat upstream.
+CXP launches the official Codex CLI and uses the models Codex offers for the signed-in account. Choose a model the way Codex does (`/model` in the TUI, `-m <model>` for `codex exec`). In Teams, send `model` in the control chat to list the models and `helper model <model> [effort]` in a work chat to switch that session. Third-party model profiles, catalogs and the local Responses adapter were removed; configs that still contain them load normally and keep the settings untouched.
 
 ## Proxy Profiles
 
@@ -64,33 +42,26 @@ Use `cxp proxy` only when the user is asking about SSH/network routing.
 
 ## Teams Helper
 
-- `cxp teams setup`: guided setup checklist.
-- `cxp teams run`: run the Teams listener in the foreground.
-- `cxp teams run --once`: poll once for diagnosis.
-- `cxp teams status`: show registry, owner, listener, poll, and session status.
-- `cxp teams doctor`: local diagnostics.
-- `cxp teams doctor --live`: opt in to live Microsoft Graph checks.
-- `cxp teams control --print`: print the bound Teams control chat.
+- `cxp teams setup`: local setup checklist (no network).
+- `cxp teams auth config --tenant-id <tenant-id> --client-id <client-id>`: save the Teams Graph tenant and public client ID.
+- `cxp teams auth` (or `cxp teams auth login`): sign in with a Microsoft device code in a foreground terminal; one delegated token covers reading and sending chat messages, meeting chats and file uploads. Add `--force` for a fresh login.
+- `cxp teams auth status`: show the local sign-in state and token expiry without printing tokens.
+- `cxp teams auth logout`: remove the local Teams token cache.
+- `cxp teams run`: start the helper. Where supported it installs and starts the background service, which keeps the helper running after terminal close; the helper creates this machine's control chat when it first starts.
+- `cxp teams status`: show the helper store, owner, control chat, sessions and queues.
+- `cxp teams doctor`: local diagnostics. `--live` also checks Microsoft Graph sign-in and read access; `--appserver-probe` checks Codex app-server compatibility without starting a model turn.
+- `cxp teams control`: print this machine's control chat from the local store.
+- `cxp teams migrate`: convert a stopped v0.1.20 or v0.1.22-rc.59 helper store explicitly (`--dry-run --out <path>` previews). The helper converts automatically at its first start and never modifies the old store.
 - `cxp teams path status [--show-path]`: resolve the effective Teams Codex PATH; the full value stays redacted unless explicitly requested.
-- `cxp teams path mode account-default|captured-terminal|explicit|service`: select the PATH source for future cold starts.
-- `cxp teams path capture-terminal`: save the current terminal PATH; use `cxp teams path shell <absolute-path|default>` to set or clear an account-shell override.
-- `cxp teams service bootstrap`: install or repair the background service/watchdog.
+- `cxp teams path mode account-default|explicit`: select the PATH source for future cold starts; `cxp teams path explicit <PATH>` saves an explicit PATH, and `cxp teams path shell <absolute-path|default>` sets or clears an account-shell override.
+- `cxp teams service bootstrap`: install or repair the background service/watchdog and start it.
 - `cxp teams service status`: inspect OS service/task state.
-- `cxp teams service restart --force`: recover active local Teams state, mark ambiguous turns interrupted, then restart or activate the pending helper. Use only from a local terminal when you accept interrupting active work.
+- `cxp teams service restart`: restart the helper service from a local terminal; interrupted work is recovered at start and each interrupted request gets one notice.
 - `cxp teams service doctor`: diagnose service backend readiness.
 - On Linux, service auto mode prefers `systemd --user`; if no user manager is usable, it falls back to `local-supervisor`, which survives terminal close and helper crashes but not machine/container reboot. Enabled or active local-supervisor installs stay sticky to avoid backend flapping; in WSL, the Windows Task backend remains preferred unless local-supervisor is sticky or explicitly selected.
-- `cxp teams auth full`: refresh full Teams auth locally.
-- `cxp teams auth full-status`: inspect auth cache expiry without printing tokens.
 - `cxp teams workflow status|enable|disable|test`: configure optional Teams Workflow notification cards; store the webhook URL in a private local file and pass that file path.
-- `cxp teams send-file <path> --session <session-id>`: upload a local outbound file and send it as a Teams attachment.
-- `cxp teams probe-chat --chat <teams-chat-id-or-link>`: read-only probe of an external Teams chat without binding helper state unless `--send-test` is used.
-- `cxp teams pause`, `cxp teams resume`, `cxp teams drain`, and `cxp teams recover`: local helper lifecycle controls for diagnosis and recovery.
-- `cxp teams chat recreate <session-id> --history full --yes`: create and atomically bind a fresh Work chat for an existing helper session, pinning the store that owns the session and publishing full history when requested. Add `--activate` only to reactivate a quarantined session, or `--store <state.json>` to resolve an inspected retained-store conflict.
-- `cxp teams chat publish-history <session-id> --full --yes`: idempotently publish complete local Codex history to the session's current Work chat. Add `--force` only for an intentional replay; the command briefly drains the listener and releases its maintenance fence before returning.
-- `cxp teams chat quarantine <session-or-chat> --dry-run|--yes`: resolve exactly one durable Work-chat session and atomically stop its polling, turns, pending inbound, and unsent outbox after unsafe helper behavior. Mutation refuses a live helper owner.
-- `cxp teams chat unquarantine <session-or-chat> --dry-run|--yes`: resume polling only for a session whose durable status is `quarantined`; interrupted turns and skipped messages are not replayed.
 
-From a Teams-launched Codex child turn, do not restart, reload, update, kill, replace, or background the running helper directly. For normal installed helpers, tell the user to send `helper restart now` after local upgrades or `helper update now` / `helper update prerelease` for release updates. Use `helper reload now` only for source-checkout development reloads when the helper has access to a local `codex-helper` source tree.
+From a Teams-launched Codex child turn, do not restart, update, kill, replace, or background the running helper directly. Tell the user to send `helper restart now` after local upgrades or `helper update now` / `helper update prerelease` for release updates.
 
 ## Cross-Machine Delegation
 
@@ -109,39 +80,39 @@ Use these from a Codex turn when the user naturally asks another signed-in Teams
 
 ## Teams Chat Commands
 
-Control chat commands:
+Control chat commands (a leading `helper` is accepted too):
 
-- `projects` or `p`: list workspaces.
-- `project <number>` or `p <number>`: open a workspace.
-- `sessions`, `s`, or `history`: list local Codex sessions.
-- `new <directory>` or `n <directory>`: create a Work chat for a directory.
-- `new <directory> --model <profile>` or `new <directory> --model-profile <profile>`: create a Work chat pinned to a model profile.
-- `new` or `n`: create a Work chat for the currently selected workspace.
-- `continue <number-or-session-id>` or `c <...>`: create or open a Work chat for an existing session.
-- `open <number>`: show an existing linked Work chat.
-- `status` or `st`: list active Work chats.
-- `model status`, `model list`, `model switch <model>`, and `model reset`: inspect or change only the Control chat model. `model use <model>` is an alias for `model switch <model>`.
-- `model setup <model>` and `model doctor <model>`: configure or validate model availability without selecting it or changing a default.
-- `effort status`, `effort list`, `effort set <value>`, and `effort reset`: inspect or change only the Control chat reasoning effort.
-- `default status`, `default model status|list|set|reset`, and `default effort status|list|set|reset`: inspect or change global defaults for future launches and newly created chats. These commands are Control-chat-only and do not rewrite an existing chat.
-- `helper cancel last`, `helper cancel queued`, `helper cancel running`, or `helper cancel all`: cancel or drop queued/running control-chat Codex question(s).
-- `helper update now`: update to the latest stable helper release.
-- `helper update prerelease`: update to the newest eligible release or pre-release.
-- `codex update now`: wait for active work, then update the local Codex CLI using its detected install source; this does not update the helper.
-- `helper restart now`: restart the installed Teams helper, including after a release update.
-- `helper reload now`: development/source-checkout only; rebuild and reload from a local `codex-helper` source checkout.
+- `new <directory>` or `n <directory>`: start a Codex session in a new work chat.
+- `list`: list sessions with their labels (for example `s003`).
+- `r <session>`: wake a parked session.
+- `park <session>`: stop reading a session's chat until it is woken.
+- `fork <session>`: copy a session into a new work chat.
+- `model`: list the models Codex offers.
+- `stats`: requests and token usage of all sessions.
+- `skills`: list skill subscriptions (`skills add <url>`, `skills sync`).
+- `status`: helper status.
+- `restart`: restart the helper; `helper restart now` restarts even while requests are running (they are recovered after the restart).
+- `update now` / `update prerelease`: update the helper (`update status` shows a pending update).
+- `codex update now`: update the local Codex CLI using its detected install source; this does not update the helper.
+- `help`: the command list.
 
 Work chat commands:
 
-- Regular text: send a task to Codex.
-- `helper status`: check current request state.
-- `helper retry last`: retry the last failed or interrupted request.
-- `helper cancel last`, `helper cancel queued`, `helper cancel running`, or `helper cancel all`: cancel or drop queued/running work.
-- `helper file <relative-path>`: upload a generated file from the Teams outbound folder.
-- `model status`, `model switch <profile>`, `model reset`, and `model fork <profile>`: inspect, switch when compatible, reset to the effective global model, or fork the Work chat with another model profile. Official `gpt-*` slugs take precedence on name collisions; use `official:<slug>` or `profile:<name>` to select explicitly.
-- `effort status`, `effort list`, `effort set <value>`, and `effort reset`: inspect or change this Work chat's reasoning effort.
-- `default ...`: rejected in a Work chat because global defaults are Control-chat-only.
-- `helper close`: close the Work chat binding.
+- Regular text, files and voice messages: sent to Codex (voice is transcribed locally).
+- `helper cancel` / `helper cancel last`: cancel the running (or last queued) request; `helper cancel all` cancels the running and every queued request.
+- `helper retry`: run the last ignored duplicate request again; `helper retry last` runs the request that failed because Codex needed an update again.
+- `helper unpause`: resume auto-start after a pause (held requests are not run).
+- `helper park`: stop reading this chat until woken.
+- `helper status`: session status.
+- `helper fork`: copy this session into a new work chat.
+- `helper model`, `helper model list`, `helper model <model> [effort]`, `helper model reset`: show or switch this session's model.
+- `helper effort <effort>`: switch this session's reasoning effort.
+- `helper stats`: requests and token usage of this session.
+- `helper skills`: skill subscriptions.
+- `helper restart`: restart the helper.
+- `helper help`: the command list.
+
+Codex returns files to a work chat by writing them under the per-turn directory named in its prompt and listing them in a `codex-helper-artifacts` block of the final answer.
 
 ## Skills
 
@@ -167,4 +138,4 @@ Built-in skills are installed into `$HOME/.agents/skills`, but they are not git 
 - `cxp upgrade --version <tag>`: install a specific release.
 - `cxp upgrade --include-prerelease`: allow latest resolution to include prereleases.
 
-From a Teams child turn, do not self-manage the running helper process. Use control chat update or restart commands for installed helpers; use reload only for source-checkout development as directed by the helper safety rules.
+From a Teams child turn, do not self-manage the running helper process. Use control chat update or restart commands for installed helpers.

@@ -1,13 +1,13 @@
 # Teams Helper Source Deployment Guide
 
-This guide installs the Teams helper from source on a second machine and brings
-it to the same operating model as the original machine: a Teams control chat, one
-Teams work chat per Codex session, background service supervision, local Codex
-history sync, and optional file upload support.
+This guide installs the Teams helper from source on a machine and brings it to
+the normal operating model: one Teams control chat per machine, one Teams work
+chat per Codex session, background service supervision, and file and voice
+message support.
 
 The guide intentionally does not include tenant IDs, client IDs, access tokens,
-refresh tokens, webhook URLs, or API keys. Keep those values in local config or a
-secret store only.
+refresh tokens, or webhook URLs. Keep those values in local config or a secret
+store only.
 
 ## 1. What You Need
 
@@ -17,17 +17,16 @@ secret store only.
 - Go 1.25 or newer. The repository pins Go 1.25.11 so local source builds use
   the same toolchain as CI and the bundled pure-Go SQLite runtime.
 - Network access to GitHub, Microsoft login, Microsoft Graph, and the Codex API.
-- The Microsoft Teams Graph tenant/client IDs approved for your environment:
-  - tenant ID
-  - read client ID
-  - chat/write client ID
-  - optional file-write client ID
+- The Microsoft Entra tenant ID and the public client ID of a Teams Graph app
+  approved for your environment. The app must allow the delegated scopes for
+  reading and sending chat messages, creating meeting chats, and uploading
+  files.
 - A Teams account that is allowed to use those delegated Graph scopes.
 - A working Codex login on that machine, or enough access for `codex-helper` to
-  install/use Codex in the same way it does for normal local usage.
+  install and use Codex the same way it does for normal local usage.
 
-Do not copy token cache files from another machine. Run Microsoft login on each
-machine separately.
+Do not copy token cache files from another machine. Sign in on each machine
+separately.
 
 ## 2. Build From Source
 
@@ -40,7 +39,7 @@ cd "$HOME/project"
 git clone https://github.com/baaaaaaaka/codex-helper.git
 cd codex-helper
 git checkout <branch-or-commit>
-go test ./internal/teams ./internal/cli
+go test ./internal/core/... ./internal/channel/... ./internal/cli
 go build -o "$HOME/.local/bin/codex-proxy" ./cmd/codex-proxy
 ```
 
@@ -63,38 +62,10 @@ codex-proxy --help
 Use a stable binary path for service mode. Do not install the service from a
 temporary `go run` binary.
 
-## 3. Configure Teams Graph App IDs
+## 3. Configure And Sign In
 
-Configure the local Teams auth metadata in one command:
-
-```sh
-codex-proxy teams auth config \
-  --tenant-id "<tenant-id>" \
-  --client-id "<teams-graph-public-client-id>"
-```
-
-This single client must be allowed to request the full delegated Graph scopes
-used by Teams helper. Advanced split-token deployments can still provide
-`--read-client-id`, `--chat-client-id`, `--file-write-client-id`, and
-`--full-client-id` separately.
-
-To keep scopes explicit, you may also configure them in the same command:
-
-```sh
-codex-proxy teams auth config \
-  --tenant-id "<tenant-id>" \
-  --client-id "<teams-graph-public-client-id>" \
-  --full-scopes "openid profile offline_access User.Read Chat.ReadWrite OnlineMeetings.ReadWrite Files.ReadWrite"
-```
-
-The default chat scopes are designed for meeting-based Teams chats. The helper
-creates standalone online meetings only as a chat carrier; it does not rely on
-calendar pollution for normal use.
-
-## 4. Authenticate Teams
-
-For the normal one-client setup, you can use the interactive helper script
-instead of running each command manually:
+The interactive setup script asks for the tenant ID and client ID, signs in,
+verifies the local token cache, and bootstraps the background service:
 
 Linux, macOS, or WSL:
 
@@ -108,154 +79,86 @@ Windows PowerShell:
 .\scripts\teams-auth-bootstrap.ps1
 ```
 
-The same scripts are also attached to GitHub releases for source-free setup.
+The same scripts are attached to GitHub releases for source-free setup.
 
-By default, the script asks for the tenant ID and one Teams Graph public client
-ID, writes that client ID into the read, chat-write, file-write, and full auth
-slots, runs `codex-proxy teams auth full`, verifies the local full-token cache,
-and then runs `codex-proxy teams service bootstrap`.
-
-To keep read-only polling on a separate app registration from write-capable
-Graph operations, pass split client IDs:
+To do the same steps by hand:
 
 ```sh
-scripts/teams-auth-bootstrap.sh \
+codex-proxy teams auth config \
   --tenant-id "<tenant-id>" \
-  --read-client-id "<teams-graph-read-client-id>" \
-  --write-client-id "<teams-graph-write-client-id>"
-```
-
-```powershell
-.\scripts\teams-auth-bootstrap.ps1 `
-  -TenantId "<tenant-id>" `
-  -ReadClientId "<teams-graph-read-client-id>" `
-  -WriteClientId "<teams-graph-write-client-id>"
-```
-
-When read and write client IDs differ, the script signs in once for the
-read-only cache and once for the write-capable full fallback cache. Chat sends,
-chat creation, meeting-chat carriers, and file uploads use the write-capable
-client ID; message polling prefers the dedicated read-only cache.
-
-Run one full auth first. This token is used for message polling, chat creation,
-message sends, meeting-chat carriers, and helper file/image uploads:
-
-```sh
-codex-proxy teams auth full
-```
-
-Open the device login URL shown by the command, enter the code, and complete SSO
-and MFA.
-
-Optional advanced split-token auths:
-
-```sh
-codex-proxy teams auth read
+  --client-id "<teams-graph-public-client-id>"
 codex-proxy teams auth
-codex-proxy teams auth file-write
+codex-proxy teams auth status
 ```
 
-The helper prefers split tokens when they exist, but falls back to the full token
-when read/chat/file-write caches are missing.
+`teams auth` prints a Microsoft device login URL and code. Open the URL, enter
+the code, and complete SSO and MFA. One delegated token covers everything the
+helper does: reading and sending chat messages, meeting chats, and file
+uploads. `--scopes` on `teams auth config` overrides the delegated scopes when
+your tenant needs a different set.
+
+The helper creates standalone online meetings only as chat carriers; it does
+not add calendar entries for normal use.
 
 Token caches are local secrets. They are stored under the user cache directory
 with private file permissions. Do not copy them to another machine and do not
-commit them.
+commit them. `codex-proxy teams auth logout` removes the local cache.
 
-## 5. Verify Auth And Connectivity
-
-Run local checks:
+## 4. Verify
 
 ```sh
-codex-proxy teams auth full-status
-codex-proxy teams auth read-status
-codex-proxy teams auth status
 codex-proxy teams doctor --live
 codex-proxy teams status
 ```
 
 Expected result:
 
-- auth status says the token cache is present and not expired
-- doctor can call Graph `/me`
-- status shows the state path and no active error
+- `doctor --live` signs in to Graph and reads the account (it sends nothing).
+- `status` shows the helper store and, once the helper has started, the
+  control chat, owner, and sessions.
 
 If your environment requires an HTTP proxy, configure `codex-helper` proxy
 settings as you normally would. Teams Graph calls respect the helper proxy
 configuration; if proxy is disabled, Teams Graph calls use direct networking.
 
-## 6. Create The Control Chat
-
-Create or show the machine control chat:
-
-```sh
-codex-proxy teams control
-```
-
-Expected Teams result:
-
-- A meeting-based chat appears with a title like `🏠 Codex Control - <machine>`.
-- The helper sends an owner mention and a ready/help message.
-- The control chat is single-user from the helper's perspective. Only use this
-  mode with your own Teams account.
-
-If the chat does not appear automatically on a mobile client, open the printed
-Teams URL once. Some Teams clients hide standalone meeting chats until they are
-opened or mentioned.
-
-Print the current local binding without creating or sending anything:
-
-```sh
-codex-proxy teams control --print
-```
-
-Recreate the control chat during development:
-
-```sh
-codex-proxy teams control --recreate --yes
-```
-
-The old control chat is not deleted. The helper sends a link to the new control
-chat before rebinding local state.
-
-## 7. Run Foreground For A First Test
-
-Start the bridge in a foreground terminal:
+## 5. Start The Helper
 
 ```sh
 codex-proxy teams run
 ```
 
-In the Teams control chat, try:
+Where a background service is supported, `teams run` installs (or repairs) and
+starts it, so the helper keeps running after the terminal closes. On first
+start the helper creates this machine's control chat, titled like
+`🏠 Codex Control - <machine>`, and mentions you in it.
 
-```text
-help
-p
+Print the control chat link at any time without sending anything:
+
+```sh
+codex-proxy teams control
 ```
 
-To create a new work chat for a directory:
+If the chat does not appear on a mobile client, open the printed link once.
+Some Teams clients hide standalone meeting chats until they are opened or
+mentioned.
 
-```text
-n /absolute/path/to/workspace
+The control chat is single-user from the helper's perspective. Only use this
+mode with your own Teams account.
+
+### Upgrading from an earlier helper
+
+A helper store written by v0.1.20 or v0.1.22-rc.59 is converted automatically
+at the first start of this version. The old store is never modified or
+deleted; a marker file next to it records the conversion. Sessions keep their
+work chats, and a request that was running during the upgrade continues in the
+same Codex thread with one interruption notice. To preview a conversion
+without starting the helper:
+
+```sh
+codex-proxy teams migrate --dry-run --out /tmp/core-preview.sqlite
 ```
 
-Inside the new `💬 Codex Work ...` chat, send a normal task, for example:
-
-```text
-Summarize this repository and list the most important test commands.
-```
-
-Expected behavior:
-
-- The work chat sends a short ACK.
-- Codex status messages appear as `🤖 ⏳ Codex status`.
-- The final reply appears as `🤖 ✅ Codex answer`.
-- The helper mentions the owner after a new final answer so Teams can notify.
-
-Stop foreground mode with `Ctrl-C`. Foreground mode stops when the terminal or
-SSH session closes, so use service mode for daily use.
-
-## 8. Install The Background Service
+## 6. Background Service
 
 Check which no-root backend the helper will use:
 
@@ -273,27 +176,24 @@ Typical backends:
 - macOS: LaunchAgent
 - Windows: per-user Scheduled Task
 
-Install, enable, and start:
+`teams run` and `teams service bootstrap` install, enable, and start the
+service. The individual steps are also available:
 
 ```sh
 codex-proxy teams service install
 codex-proxy teams service enable
 codex-proxy teams service start
 codex-proxy teams service status
-codex-proxy teams status
 ```
-
-The install step writes only user-level service configuration. It does not start
-automatically until you run `enable` and `start`.
 
 Platform notes:
 
-- Linux with `systemd --user`: the service should survive terminal close while
-  the user session exists. A real logout may stop `systemd --user` unless the
+- Linux with `systemd --user`: the service survives terminal close while the
+  user session exists. A real logout may stop `systemd --user` unless the
   environment enables linger or keeps a user session alive.
 - Linux without a usable user systemd manager: `service bootstrap` falls back to
   `local-supervisor`. It detaches with `setsid`, uses a config-root lock/status
-  file to prevent duplicate supervisors, and restarts the Teams runner after
+  file to prevent duplicate supervisors, and restarts the Teams helper after
   crashes, but it cannot guarantee restart after a machine or container reboot.
   Auto mode keeps an enabled or active local-supervisor install on that backend
   to avoid backend flapping.
@@ -305,97 +205,75 @@ Platform notes:
   non-WSL local-supervisor. If local-supervisor is already enabled or active,
   WSL auto mode keeps it sticky unless `CODEX_HELPER_TEAMS_WSL_SERVICE_BACKEND`
   explicitly requests `windows-task`.
-- macOS: LaunchAgent starts when the user logs in. Sleep/wake should restart the
+- macOS: LaunchAgent starts when the user logs in. Sleep/wake restarts the
   process if needed.
 - Windows: Scheduled Task runs as the current user. Enterprise policy can block
   scheduled tasks; `service doctor` and `service status` show the failure.
 
-## 9. Daily Teams Commands
+The service restarts the helper after a crash or an update (exit code 75 asks
+for a restart on the same state). Requests that were running are continued in
+the same Codex thread after the restart, with one interruption notice each.
 
-Basic control chat:
+## 7. Using It From Teams
+
+Control chat (send `help` for the list):
 
 ```text
-help
-p
-projects
-n /absolute/path
-new /absolute/path
-s
-sessions
-c 1
-continue 1
-st
+new /absolute/path/to/workspace
+list
+r s003
+park s003
+fork s003
+model
+stats
+skills
 status
-```
-
-Basic Work chat:
-
-```text
-helper help
-helper status
-helper retry last
-helper close
-helper file relative/path.ext
-```
-
-Model/profile commands:
-
-```text
-model status
-model list
-model catalog list
-model provider list
-model switch example-provider/deepseek-v4
-model reset
-new /absolute/path --model example-provider/deepseek-v4
-model fork example-provider/deepseek-v4
-effort status
-effort set high
-effort reset
-default status
-default model set profile:example-provider/deepseek-v4
-default effort set high
-```
-
-`model` and `effort` always affect only the current Control or Work chat.
-Catalog/provider management is Control-only; `model provider setup <provider>`
-activates every model under one provider after a local key is configured.
-`model setup` changes availability only. Global `default` commands are accepted
-only in the Control chat and affect future launches and newly created chats;
-they never rewrite an existing chat.
-
-Advanced maintenance and recovery:
-
-```text
-helper cancel running
-helper update now
-helper update prerelease
+restart
+update now
+update prerelease
 codex update now
-helper restart now
-helper reload now
 ```
 
-`helper reload now` only applies to source-checkout development helpers that can
-rebuild from a local `codex-helper` source tree. Normal installed helpers should
-use `helper restart now` after a local binary repair or `helper update now` for
-a release update.
+`new <directory>` creates a `💬` work chat for a new Codex session. Inside a
+work chat every message that does not start with `helper` goes to Codex,
+including attached files and voice messages (voice is transcribed locally).
 
-`codex update now` updates the local Codex CLI through its detected install
-source after active Codex work drains. It does not update the helper or retry
-failed Work chat requests automatically.
-
-Normal work chat messages are sent to Codex. Helper commands start with
-`helper` or the supported short command form shown by `helper help`.
-
-## 10. Files And Images
-
-Codex can ask the helper to upload generated files by writing them under:
+Work chat commands (send `helper help` for the list):
 
 ```text
-~/.cache/codex-helper/teams-outbound
+helper status
+helper cancel
+helper cancel all
+helper retry
+helper retry last
+helper unpause
+helper park
+helper fork
+helper model
+helper model <model> [effort]
+helper effort <effort>
+helper stats
+helper skills
+helper restart
 ```
 
-A final answer can include:
+Expected behaviour:
+
+- A prompt gets a short ACK; Codex progress appears while it works; the final
+  answer is posted once.
+- The owner is mentioned in the control chat when a final answer arrives.
+  Finals that arrive within a few seconds of each other share one mention.
+- Several prompts sent while Codex is busy are queued and run one after
+  another; the queue is announced once when it starts.
+
+`model` lists the models Codex offers for the signed-in account;
+`helper model <model> [effort]` switches one session. Third-party model
+profiles are no longer supported.
+
+## 8. Files And Images
+
+Each Codex turn is given its own output directory in its prompt. To return
+files, Codex writes them there and lists them in its final answer:
 
 ````text
 ```codex-helper-artifacts
@@ -403,32 +281,26 @@ A final answer can include:
 ```
 ````
 
-The helper only accepts relative manifest paths under the outbound root. File
-upload requires `codex-proxy teams auth full` or the advanced split-token
-`codex-proxy teams auth file-write`.
+The helper accepts only relative paths under that turn's directory, uploads
+each file, and posts it as an attachment under the given name after the final
+answer. Files and images sent to a work chat are downloaded and handed to
+Codex with the prompt.
 
-To send an existing local file manually from a work chat, put it under the
-outbound root and send:
-
-```text
-helper file relative/path.ext
-```
-
-## 11. Keep Multiple Machines Separate
+## 9. Keep Multiple Machines Separate
 
 Each machine gets its own `🏠 Codex Control - <machine>` chat and creates its own
-work chats. Durable local state includes the machine identity, scope, and Teams
+work chats. The helper store on each machine holds that machine's identity and
 chat bindings.
 
-If multiple machines share storage:
-
-- Long-lived machines should be treated as primary.
-- Temporary machines can start Teams mode, but the lease/avoidance mechanism
-  keeps only one active owner per helper scope.
+- Only one helper process owns a store at a time; a second `teams run` on the
+  same store waits instead of polling the same chats.
 - Multiple OS users on the same server use separate user config/cache paths and
-  should not interfere with each other.
+  do not interfere with each other.
+- Signed-in machines publish a small capability card to a hidden registry chat
+  so a Codex turn on one machine can delegate work to another with
+  `cxp delegate`.
 
-## 12. Upgrade From Source
+## 10. Upgrade From Source
 
 On the target machine:
 
@@ -437,118 +309,46 @@ cd "$HOME/project/codex-helper"
 git fetch origin
 git switch <branch>
 git pull --ff-only
-go test ./internal/teams ./internal/cli
+go test ./internal/core/... ./internal/channel/... ./internal/cli
 go build -o "$HOME/.local/bin/codex-proxy.new" ./cmd/codex-proxy
 mv "$HOME/.local/bin/codex-proxy.new" "$HOME/.local/bin/codex-proxy"
 codex-proxy teams service restart
 codex-proxy teams status
 ```
 
-For a pinned commit instead of a branch, do not run `git pull` from detached
-HEAD:
+For a pinned commit instead of a branch, use `git checkout <commit>` instead of
+`git switch` and `git pull`, then run the same test, build and restart steps.
 
-```sh
-cd "$HOME/project/codex-helper"
-git fetch origin
-git checkout <commit>
-go test ./internal/teams ./internal/cli
-go build -o "$HOME/.local/bin/codex-proxy.new" ./cmd/codex-proxy
-mv "$HOME/.local/bin/codex-proxy.new" "$HOME/.local/bin/codex-proxy"
-codex-proxy teams service restart
-codex-proxy teams status
-```
+Installed release helpers update themselves from the control chat with
+`update now` (or `update prerelease`); `restart` restarts the helper after a
+local binary repair.
 
-When the helper is already running from a stable source checkout and stable
-binary path, you can also ask from the Teams control chat:
-
-```text
-helper reload now
-```
-
-The Teams reload path runs its safety tests, builds a replacement binary,
-swaps it into the current install path, and restarts the helper. Use
-`helper reload force` only for development when you have checked that no Codex
-work is active.
-
-If service restart reports a stale owner:
-
-```sh
-codex-proxy teams status
-codex-proxy teams recover --stale-after 2m
-codex-proxy teams service start
-```
-
-Use `recover --force` only when you are sure the old helper process is gone.
-For a single command that intentionally interrupts local active state before
-restarting, use `codex-proxy teams service restart --force`.
-
-For one Work chat that was contained after repeated helper self-echo, resolve
-the exact scope/store before changing it:
-
-```sh
-cxp teams chat quarantine <session-or-chat> --dry-run
-cxp teams chat quarantine <session-or-chat> --yes --reason "operator containment"
-cxp teams chat unquarantine <session-or-chat> --dry-run
-cxp teams chat unquarantine <session-or-chat> --yes
-```
-
-These commands refuse an active helper owner and require `--scope` or `--store`
-when the selector matches more than one durable store. Unquarantine resumes
-polling but never replays interrupted turns, ignored inbound events, or skipped
-outbox rows.
-
-The running bridge also contains self-echo automatically. It first uses exact
-Graph message provenance, then a bounded 1,024-entry in-memory fingerprint
-cache for a POST whose response is still in flight or ambiguous. There is no
-background scanner or cleanup ticker. Ambiguous background sends stay under
-the existing two-minute send lease so the next Graph recovery read can find an
-accepted message before any retry; explicit operator/user retries may supersede
-only non-critical output, while final answers and attachments remain fenced.
-
-If three distinct, fresh, unprovenanced helper-output messages appear in one
-Work chat within 60 seconds, the bridge quarantines only that durable session.
-The quarantine transaction interrupts queued/running turns, ignores pending
-inbound work, skips unsent output, parks polling, and preserves only a Graph
-POST that is actively in flight. A control-chat warning identifies the session;
-the unsafe Work chat receives no further warning message.
-
-## 13. Troubleshooting
+## 11. Troubleshooting
 
 No control chat in Teams:
 
 ```sh
-codex-proxy teams control --print
+codex-proxy teams control
 codex-proxy teams doctor --live
 ```
 
-Open the printed URL once. Some mobile clients do not show standalone meeting
-chats until opened or mentioned.
+If `teams control` reports no control chat yet, the helper has not started on
+this store; run `codex-proxy teams run`. Otherwise open the printed link once.
 
-Messages are slow:
+Messages are slow or a request seems stuck:
 
 ```sh
 codex-proxy teams status
 ```
 
-Check poll summary, blocked chats, and Graph window warnings. Hot chats should
-poll faster after a user message or final answer. Parked chats do not poll until
-resumed from the control chat, either with `r <resume-key>` or by opening or
-continuing the linked work chat from the control chat.
-
-Queued or interrupted turn:
-
-```text
-helper status
-helper retry last
-```
-
-Check recent messages and local file changes before retrying. Retry can repeat
-file edits or terminal commands.
+In the work chat, `helper status` shows the running and queued requests;
+`helper cancel` cancels the running one. Under Graph throttling the helper
+paces its reads and writes and catches up on its own.
 
 Auth expired:
 
 ```sh
-codex-proxy teams auth full
+codex-proxy teams auth
 ```
 
 Service not running:
@@ -559,16 +359,10 @@ codex-proxy teams service status
 codex-proxy teams service restart
 ```
 
-Need a clean development chat:
-
-```sh
-codex-proxy teams control --recreate --yes
-```
-
-Need to inspect local state without sending Teams messages:
+Inspect local state without sending Teams messages:
 
 ```sh
 codex-proxy teams status
-codex-proxy teams control --print
+codex-proxy teams control
 codex-proxy teams doctor
 ```

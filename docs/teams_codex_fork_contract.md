@@ -1,5 +1,11 @@
 # Teams Codex fork contract
 
+> Historical: this contract describes the fork workflow of the old Teams
+> bridge, including history publication into the child chat. The current
+> helper's `fork` command forks the Codex thread with the app-server
+> `thread/fork` method, binds the child to a new work chat, and mirrors only
+> turns made after the fork; it publishes no history chunks.
+
 This document freezes the safety contract for the native Codex fork and the
 Teams history publication workflow. The fork remains no-ship until every
 condition in the last section is satisfied.
