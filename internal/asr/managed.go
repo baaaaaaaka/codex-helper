@@ -119,6 +119,7 @@ func NewManaged(cfg ManagedConfig) *Managed {
 	m := &Managed{cfg: cfg, in: newInstaller(cfg.CacheDir, cfg.HTTPClient),
 		setupFailures: map[string]error{}, progressHigh: map[string]int64{}}
 	m.in.stall = cfg.StallTimeout
+	reapOrphans(cfg.CacheDir)
 	m.in.progress = m.touch
 	m.closeCtx, m.closeFn = context.WithCancel(context.Background())
 	return m
@@ -600,7 +601,8 @@ func (m *Managed) startServerLocked(ctx context.Context, p *paths) error {
 		return nil
 	}
 	m.stopServerLocked()
-	srv, err := startLlamaServer(ctx, p, m.device(), m.in.tmp(), m.cfg.LoadTimeout)
+	reapOrphans(m.cfg.CacheDir)
+	srv, err := startLlamaServer(ctx, p, m.device(), m.cfg.CacheDir, m.in.tmp(), m.cfg.LoadTimeout)
 	if err != nil {
 		return err
 	}
@@ -638,6 +640,7 @@ func (m *Managed) stopServerLocked() {
 		m.srv.stop()
 		m.srv = nil
 	}
+
 }
 
 // armIdleLocked schedules unloading the model after IdleUnload without use

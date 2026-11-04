@@ -35,6 +35,7 @@ type llamaServer struct {
 	url     string
 	key     string
 	keyFile string
+	record  string // orphan record (see orphans.go), removed on stop
 	stderr  *boundedBuffer
 	exited  chan struct{}
 	client  *http.Client
@@ -57,9 +58,12 @@ func serverArgs(p *paths, device, keyFile string, port int) []string {
 	return args
 }
 
-func startLlamaServer(ctx context.Context, p *paths, device, tmp string, loadTimeout time.Duration) (*llamaServer, error) {
+// startLlamaServer starts the server and waits until it is ready. While it
+// runs it is recorded under root/run so a later helper can stop it if this
+// one dies without doing so.
+func startLlamaServer(ctx context.Context, p *paths, device, root, tmp string, loadTimeout time.Duration) (*llamaServer, error) {
 	for attempt := 0; ; attempt++ {
-		s, err := tryStartServer(ctx, p, device, tmp, loadTimeout)
+		s, err := tryStartServer(ctx, p, device, root, tmp, loadTimeout)
 		if err == nil || attempt > 0 || !strings.Contains(strings.ToLower(err.Error()), "bind") {
 			return s, err
 		}
@@ -67,7 +71,7 @@ func startLlamaServer(ctx context.Context, p *paths, device, tmp string, loadTim
 	}
 }
 
-func tryStartServer(ctx context.Context, p *paths, device, tmp string, loadTimeout time.Duration) (*llamaServer, error) {
+func tryStartServer(ctx context.Context, p *paths, device, root, tmp string, loadTimeout time.Duration) (*llamaServer, error) {
 	if err := os.MkdirAll(tmp, 0o700); err != nil {
 		return nil, newError(KindCache, "create temp dir", err, "")
 	}
@@ -93,6 +97,7 @@ func tryStartServer(ctx context.Context, p *paths, device, tmp string, loadTimeo
 		_ = os.Remove(keyFile)
 		return nil, classifyRun("start llama-server", err, "", KindCache)
 	}
+	s.record = recordServer(root, s.proc.cmd.Process.Pid)
 	var waitErr error
 	go func() { waitErr = s.proc.cmd.Wait(); close(s.exited) }()
 
@@ -200,6 +205,9 @@ func (s *llamaServer) stop() {
 	}
 	s.proc.release()
 	_ = os.Remove(s.keyFile)
+	if s.record != "" {
+		_ = os.Remove(s.record)
+	}
 }
 
 // transcribe sends one WAV segment and returns (text, language).

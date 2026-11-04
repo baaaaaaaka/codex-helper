@@ -3,6 +3,7 @@
 package asr
 
 import (
+	"fmt"
 	"os/exec"
 	"syscall"
 	"unsafe"
@@ -58,6 +59,49 @@ func (p *proc) release() {
 		_ = windows.CloseHandle(p.job)
 		p.job = 0
 	}
+}
+
+// processID identifies a running process across PID reuse: its creation
+// time and image path.
+func processID(pid int) (string, bool) {
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, uint32(pid))
+	if err != nil {
+		return "", false
+	}
+	defer windows.CloseHandle(h)
+	return handleID(h)
+}
+
+func handleID(h windows.Handle) (string, bool) {
+	const stillActive = 259
+	var code uint32
+	if windows.GetExitCodeProcess(h, &code) != nil || code != stillActive {
+		return "", false
+	}
+	var created, exited, kernel, user windows.Filetime
+	if windows.GetProcessTimes(h, &created, &exited, &kernel, &user) != nil {
+		return "", false
+	}
+	buf := make([]uint16, 4096)
+	n := uint32(len(buf))
+	if windows.QueryFullProcessImageName(h, 0, &buf[0], &n) != nil {
+		return "", false
+	}
+	return fmt.Sprintf("%d %s", created.Nanoseconds(), windows.UTF16ToString(buf[:n])), true
+}
+
+// killIfMatches terminates pid if it is still the process identified by id;
+// the check and the kill use one handle, so a recycled PID is never hit.
+func killIfMatches(pid int, id string) bool {
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.PROCESS_TERMINATE, false, uint32(pid))
+	if err != nil {
+		return false
+	}
+	defer windows.CloseHandle(h)
+	if got, ok := handleID(h); !ok || got != id {
+		return false
+	}
+	return windows.TerminateProcess(h, 1) == nil
 }
 
 func newKillOnCloseJob() (windows.Handle, error) {

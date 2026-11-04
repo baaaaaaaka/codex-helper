@@ -36,6 +36,8 @@ func TestMain(m *testing.M) {
 		os.Exit(fakeFFmpeg(os.Args[1:]))
 	case "fake-asr-cmd":
 		os.Exit(fakeCommand(os.Args[1:]))
+	case "fake-helper":
+		os.Exit(fakeHelper())
 	}
 	os.Exit(m.Run())
 }
@@ -184,6 +186,8 @@ func fakeCommand(args []string) int {
 			parts = append(parts, k+"="+os.Getenv(k))
 		}
 		fmt.Println(strings.Join(parts, ";"))
+	case mode == "sleep":
+		time.Sleep(2 * time.Minute)
 	case mode == "empty":
 		fmt.Fprintln(os.Stderr, "no speech found")
 	case strings.HasPrefix(mode, "exit:"):

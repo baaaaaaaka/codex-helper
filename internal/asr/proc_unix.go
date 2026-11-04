@@ -48,6 +48,17 @@ func (p *proc) kill() {
 
 func (p *proc) release() {}
 
+// killIfMatches kills pid and its process group (the server was started as
+// a group leader) if pid is still the process identified by id.
+func killIfMatches(pid int, id string) bool {
+	if got, ok := processID(pid); !ok || got != id {
+		return false
+	}
+	_ = unix.Kill(-pid, unix.SIGKILL)
+	_ = unix.Kill(pid, unix.SIGKILL)
+	return true
+}
+
 func freeBytes(path string) (uint64, error) {
 	var st unix.Statfs_t
 	if err := unix.Statfs(path, &st); err != nil {
