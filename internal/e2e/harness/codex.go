@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http/httptest"
 	"regexp"
 	"strings"
 	"sync"
@@ -21,13 +22,28 @@ type CodexCall struct {
 	Cwd       string
 	ThreadID  string
 	TurnID    string
+	ClientID  string // turn/start clientUserMessageId (app-server only)
 	Prompt    string
+	Images    []string // local image paths passed as input items
 	Tokens    []string // E2E tokens found in the prompt
 	Started   time.Time
 	Ended     time.Time
-	Outcome   string // "running", "answered", "failed", "cancelled"
-	Answer    string
-	Err       string
+	// Outcome is one of
+	//   running    still in progress
+	//   answered   final answer produced
+	//   failed     turn failed (scripted error)
+	//   cancelled  interrupted by the helper (turn/interrupt), or the
+	//              in-process caller's ctx ended
+	//   rejected   turn/start refused (active writer)
+	//   crashed    scripted app-server crash mid-turn
+	//   abandoned  app-server saw stdin EOF (helper died or closed it)
+	//   killed     app-server process vanished mid-turn (e.g. SIGKILLed by
+	//              the helper's runner on shutdown)
+	Outcome string
+	Answer  string
+	Err     string
+	// Pid is the fake app-server process that ran the call (0 in-process).
+	Pid int
 }
 
 // HasToken reports whether the prompt contained token.
@@ -46,7 +62,35 @@ type CodexBehavior struct {
 	Err    error         // return this error instead of an answer
 	Block  bool          // wait for Release/ReleaseAll or ctx cancellation
 	Delay  time.Duration // sleep (cancellable) before answering
+
+	// The fields below are honoured by the fake app-server binary only
+	// (the in-process Executor maps FailKind to an error and ignores the
+	// rest).
+
+	// Commentary is streamed as a commentary agent message before the final.
+	Commentary string
+	// FailKind selects how Err is surfaced: "" (turn fails with Err's
+	// message), FailCapacity (turn fails with the model-capacity error) or
+	// FailActiveWriter (turn/start is rejected: another process holds the
+	// thread writer, as when the TUI has the session open).
+	FailKind string
+	// Crash makes the app-server process exit right after the turn started.
+	Crash bool
+	// HoldCompletion: the turn completes inside Codex (persisted, rollout
+	// written) but turn/completed is never sent ("lost callback").
+	HoldCompletion bool
+	// SurviveHelper keeps the turn running when the helper goes away (stdin
+	// EOF); the app-server exits only after the turn finished, so the result
+	// is persisted while no helper is listening. Default: the app-server
+	// exits on stdin EOF and the turn is lost (interrupted).
+	SurviveHelper bool
 }
+
+// FailKind values.
+const (
+	FailCapacity     = "capacity"
+	FailActiveWriter = "active-writer"
+)
 
 // TokenPattern matches the unique tokens scenarios embed in prompts.
 var TokenPattern = regexp.MustCompile(`E2E[A-Z0-9]*-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*`)
@@ -59,12 +103,15 @@ type FakeCodex struct {
 	gates   map[int]chan struct{}
 	release map[int]bool
 	all     bool
-	changed chan struct{}
+
+	behaviors map[int]CodexBehavior
+	server    *httptest.Server
+	changed   chan struct{}
 }
 
 // NewFakeCodex returns a fake that answers every call immediately.
 func NewFakeCodex() *FakeCodex {
-	return &FakeCodex{gates: map[int]chan struct{}{}, release: map[int]bool{}, changed: make(chan struct{})}
+	return &FakeCodex{gates: map[int]chan struct{}{}, release: map[int]bool{}, behaviors: map[int]CodexBehavior{}, changed: make(chan struct{})}
 }
 
 // SetScript installs the behaviour function. nil restores the default.
@@ -83,8 +130,31 @@ func DefaultAnswer(c CodexCall) string {
 	return fmt.Sprintf("E2EANSWER-%d answer for %s", c.Seq, tok)
 }
 
-// Invoke runs one call. Adapters call it from their Executor/app-server.
+// Invoke runs one call. The in-process Executor adapter calls it directly;
+// the fake app-server reaches the same logic through Handler (begin + await).
 func (f *FakeCodex) Invoke(ctx context.Context, call CodexCall) (CodexCall, error) {
+	seq, behavior := f.begin(call)
+	if behavior.FailKind == FailActiveWriter {
+		return f.finishSeq(seq, "rejected", "", behaviorErr(behavior))
+	}
+	return f.await(ctx, seq, behavior)
+}
+
+func behaviorErr(b CodexBehavior) error {
+	if b.Err != nil {
+		return b.Err
+	}
+	switch b.FailKind {
+	case FailCapacity:
+		return errors.New("Selected model is at capacity. Please try a different model.")
+	case FailActiveWriter:
+		return errors.New("thread is in use by another Codex process (active writer)")
+	}
+	return nil
+}
+
+// begin records a call and returns its sequence number and behaviour.
+func (f *FakeCodex) begin(call CodexCall) (int, CodexBehavior) {
 	f.mu.Lock()
 	call.Seq = len(f.calls) + 1
 	call.Started = time.Now()
@@ -101,49 +171,77 @@ func (f *FakeCodex) Invoke(ctx context.Context, call CodexCall) (CodexCall, erro
 	f.notifyLocked()
 	snapshot := *rec
 	f.mu.Unlock()
-
 	behavior := CodexBehavior{}
 	if script != nil {
 		behavior = script(snapshot)
 	}
-	finish := func(outcome, answer string, err error) (CodexCall, error) {
-		f.mu.Lock()
-		rec.Ended = time.Now()
-		rec.Outcome = outcome
-		rec.Answer = answer
-		if err != nil {
-			rec.Err = err.Error()
-		}
-		f.notifyLocked()
-		out := *rec
-		f.mu.Unlock()
-		return out, err
+	f.mu.Lock()
+	f.behaviors[call.Seq] = behavior
+	f.mu.Unlock()
+	return call.Seq, behavior
+}
+
+func (f *FakeCodex) finishSeq(seq int, outcome, answer string, err error) (CodexCall, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if seq < 1 || seq > len(f.calls) {
+		return CodexCall{}, fmt.Errorf("fake codex: unknown call %d", seq)
 	}
+	rec := f.calls[seq-1]
+	if rec.Outcome != "running" {
+		// First terminal outcome wins (e.g. "crashed" reported before the
+		// await connection dropped).
+		return *rec, err
+	}
+	rec.Ended = time.Now()
+	rec.Outcome = outcome
+	rec.Answer = answer
+	if err != nil {
+		rec.Err = err.Error()
+	}
+	f.notifyLocked()
+	return *rec, err
+}
+
+// await applies the behaviour of call seq: delay, block, then answer or fail.
+// A cancelled ctx ends the call as "cancelled" (in-process Invoke).
+func (f *FakeCodex) await(ctx context.Context, seq int, behavior CodexBehavior) (CodexCall, error) {
+	return f.awaitMode(ctx, seq, behavior, true)
+}
+
+// awaitMode is await; with finishOnCancel false a cancelled ctx leaves the
+// call open (the app-server reports interrupts and exits explicitly, and a
+// vanished process is detected by reapDead).
+func (f *FakeCodex) awaitMode(ctx context.Context, seq int, behavior CodexBehavior, finishOnCancel bool) (CodexCall, error) {
+	f.mu.Lock()
+	gate := f.gates[seq]
+	snapshot := *f.calls[seq-1]
+	f.mu.Unlock()
 	if behavior.Delay > 0 {
 		select {
 		case <-time.After(behavior.Delay):
 		case <-ctx.Done():
-			return finish("cancelled", "", ctx.Err())
+			return f.cancelled(seq, ctx.Err(), finishOnCancel)
 		}
 	}
 	if behavior.Block {
 		select {
 		case <-gate:
 		case <-ctx.Done():
-			return finish("cancelled", "", ctx.Err())
+			return f.cancelled(seq, ctx.Err(), finishOnCancel)
 		}
 	}
 	if ctx.Err() != nil {
-		return finish("cancelled", "", ctx.Err())
+		return f.cancelled(seq, ctx.Err(), finishOnCancel)
 	}
-	if behavior.Err != nil {
-		return finish("failed", "", behavior.Err)
+	if err := behaviorErr(behavior); err != nil {
+		return f.finishSeq(seq, "failed", "", err)
 	}
 	answer := behavior.Answer
 	if answer == "" {
 		answer = DefaultAnswer(snapshot)
 	}
-	return finish("answered", answer, nil)
+	return f.finishSeq(seq, "answered", answer, nil)
 }
 
 func uniqueTokens(prompt string) []string {
@@ -196,8 +294,18 @@ func (f *FakeCodex) ReleaseAll() {
 	}
 }
 
+func (f *FakeCodex) cancelled(seq int, err error, finish bool) (CodexCall, error) {
+	if finish {
+		return f.finishSeq(seq, "cancelled", "", err)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return *f.calls[seq-1], err
+}
+
 // Calls returns a snapshot of all calls.
 func (f *FakeCodex) Calls() []CodexCall {
+	f.reapDead()
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := make([]CodexCall, 0, len(f.calls))
