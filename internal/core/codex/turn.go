@@ -34,6 +34,9 @@ type TurnHooks struct {
 	Started func(turnID string)
 	// Progress receives commentary agent messages.
 	Progress func(text string)
+	// Activity is called for every notification about the thread (any
+	// sign of life: deltas, items, token counts), for silence tracking.
+	Activity func()
 }
 
 // ErrNotStarted wraps a turn/start rejection: the turn certainly did not
@@ -61,6 +64,9 @@ func (s *Server) RunTurn(ctx context.Context, p TurnStartParams, poll time.Durat
 		completed = make(chan Turn, 4)
 	)
 	unsub := s.Subscribe(p.ThreadID, func(n Notification) {
+		if hooks.Activity != nil {
+			hooks.Activity()
+		}
 		switch n.Method {
 		case "item/completed":
 			var m struct {

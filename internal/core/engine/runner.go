@@ -114,6 +114,10 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 	cs := e.convs[id]
 	ok := cs != nil && cs.kind == store.KindWork && cs.state == store.ConvActive && !cs.paused &&
 		cs.running == nil && !e.now().Before(cs.capWake)
+	var lastEnd time.Time
+	if ok {
+		lastEnd = cs.lastTurnEnd
+	}
 	e.mu.Unlock()
 	if !ok {
 		return false
@@ -151,7 +155,14 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 		}
 		req.Text, req.Images = turnInput(in.Body, files)
 		req.Text = strings.TrimSpace(req.Text + "\n\n" + outboundInstructions(e.outboundDir(tr.TurnKey)))
-		return tx.MarkStarting(tr.ID, th.ThreadID)
+		if err := tx.MarkStarting(tr.ID, th.ThreadID); err != nil {
+			return err
+		}
+		if !lastEnd.IsZero() && ms(lastEnd) > tr.QueuedAt {
+			// It was queued behind the turn that just ended (R-35).
+			return e.enqueueNotice(tx, id, fmt.Sprintf("turn:%d:starting", tr.ID), textStarting(in.Body))
+		}
+		return nil
 	})
 	if err != nil {
 		e.logf("start turn in %d: %v", id, err)
@@ -230,12 +241,16 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 	id := cs.id
 	accepted := false
 	prog := &progressState{}
+	touch := func() { rs.lastEvent.Store(ms(e.now())) }
+	touch()
 	hooks := TurnHooks{
-		Progress: func(text string) { e.progress(ctx, cs, tr, prog, text) },
+		Progress: func(text string) { touch(); e.progress(ctx, cs, tr, prog, text) },
+		Activity: touch,
 		ThreadStarted: func(threadID string) error {
 			return e.bindThread(id, threadID)
 		},
 		Started: func(codexTurnID string) {
+			touch()
 			accepted = true
 			e.mirrorSkipTurn(codexTurnID)
 			if err := e.update(func(tx *store.Tx) error { return tx.MarkRunning(tr.ID, codexTurnID) }); err != nil {
@@ -248,7 +263,9 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 			e.logf("output directory of %s: %v", cs.label, err)
 		}
 	}
+	stopWatch := e.watchSilence(ctx, cs, tr, rs)
 	out, err := e.ag.Run(ctx, req, hooks)
+	stopWatch()
 	if ctx.Err() != nil {
 		// Shutting down: nothing is recorded; the next start reconciles.
 		e.clearRun(id, rs)
@@ -276,8 +293,11 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 		out = TurnOutcome{Status: StatusFailed, Error: err.Error()}
 	}
 	e.mu.Lock()
-	cancelled := rs.cancelled
+	cancelled, stalled := rs.cancelled, rs.stalled
 	e.mu.Unlock()
+	if stalled && !cancelled && out.Status != StatusCompleted {
+		out = TurnOutcome{CodexTurnID: out.CodexTurnID, Status: StatusInterrupted, Error: errStalled}
+	}
 	e.finish(ctx, cs, tr, out, cancelled)
 	e.clearRun(id, rs)
 }
@@ -389,6 +409,9 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 				mention, err = e.mentionNotice(tr.ID, cs)
 			}
 		}
+	case out.Status == StatusInterrupted && out.Error == errStalled:
+		state, errText = store.TurnInterrupted, out.Error
+		msgs, err = e.notice(base+":interrupted", textStalled(e.t.StallLimit))
 	case out.Status == StatusInterrupted:
 		state, errText = store.TurnInterrupted, out.Error
 		msgs, err = e.notice(base+":interrupted", textInterrupted)
@@ -421,6 +444,7 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 	}
 	e.mu.Lock()
 	cs.capWake = time.Time{}
+	cs.lastTurnEnd = e.now()
 	e.mu.Unlock()
 	if notify {
 		e.notifyFinal(tr.ID, cs, out.Final)

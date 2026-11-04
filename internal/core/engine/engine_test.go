@@ -923,3 +923,64 @@ func TestSlowCommandDoesNotBlockCancelOrOtherChats(t *testing.T) {
 		t.Fatalf("model command finished early (%d replies)", n)
 	}
 }
+
+// R-19 (review M5): a silent Codex turn gets one hint at each silence
+// threshold, then is stopped at the stall bound with exactly one notice,
+// and the chat runs its next request.
+func TestSilentTurnHintsThenStopsAtStallBound(t *testing.T) {
+	r := newRig(t, func(c *Config) {
+		c.Timing.SilenceHint, c.Timing.SilenceStuck, c.Timing.StallLimit = 400*time.Millisecond, 900*time.Millisecond, 1500*time.Millisecond
+	})
+	r.ag.mu.Lock()
+	r.ag.block["hang forever"] = make(chan struct{})
+	r.ag.mu.Unlock()
+	work := r.newWork(t.TempDir())
+	r.ch.PostUser(work, "hang forever")
+	r.wait("stall notice", func() bool { return len(r.own(work, "so the helper stopped the request")) == 1 })
+	r.ch.PostUser(work, "after the stall")
+	r.wait("next request answered", func() bool { return len(r.own(work, "ANSWER to after the stall")) == 1 })
+	for sub, want := range map[string]int{
+		"Still working. No new Codex update yet": 1,
+		"It may be stuck":                        1,
+		"so the helper stopped the request":      1,
+		"interrupted when the helper stopped":    0,
+	} {
+		if got := len(r.own(work, sub)); got != want {
+			t.Errorf("%d notices with %q, want %d", got, sub, want)
+		}
+	}
+}
+
+// R-35 (review M5): a request queued behind a running one gets a reminder
+// while it waits and one "starting" notice; a request that did not wait
+// gets neither.
+func TestQueuedTurnRemindedAndAnnouncedWhenStarting(t *testing.T) {
+	r := newRig(t, func(c *Config) {
+		c.Timing.QueueReminder, c.Timing.Maintenance = 500*time.Millisecond, 100*time.Millisecond
+	})
+	release := make(chan struct{})
+	r.ag.mu.Lock()
+	r.ag.block["first job"] = release
+	r.ag.mu.Unlock()
+	work := r.newWork(t.TempDir())
+	r.ch.PostUser(work, "first job")
+	r.wait("first job running", func() bool { return r.ag.calls("first job") == 1 })
+	r.ch.PostUser(work, "second job")
+	r.wait("queued reminder", func() bool { return len(r.own(work, "Still waiting")) >= 1 })
+	if n := len(r.own(work, "“second job”")); n == 0 {
+		t.Errorf("reminder does not name the queued request")
+	}
+	close(release)
+	r.wait("second job answered", func() bool { return len(r.own(work, "ANSWER to second job")) == 1 })
+	if n := len(r.own(work, "starting this queued request: “second job”")); n != 1 {
+		t.Errorf("%d starting notices for the queued request, want 1", n)
+	}
+	if n := len(r.own(work, "starting this queued request: “first job”")); n != 0 {
+		t.Errorf("%d starting notices for a request that did not wait", n)
+	}
+	r.ch.PostUser(work, "third job")
+	r.wait("third job answered", func() bool { return len(r.own(work, "ANSWER to third job")) == 1 })
+	if n := len(r.own(work, "“third job”")); n != 0 {
+		t.Errorf("a request that did not wait got %d queue notices", n)
+	}
+}

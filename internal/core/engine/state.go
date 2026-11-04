@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -51,10 +52,13 @@ type convState struct {
 
 	// runner
 	running *runState
-	recent  map[string]recentPrompt // normalized prompt -> last prompt
-	lastDup int64                   // inbound id of the last duplicate-ignored prompt
-	breaker []time.Time
-	capWake time.Time
+	// lastTurnEnd is when a started turn of this conversation last ended:
+	// a queued turn admitted before it waited behind it (R-35).
+	lastTurnEnd time.Time
+	recent      map[string]recentPrompt // normalized prompt -> last prompt
+	lastDup     int64                   // inbound id of the last duplicate-ignored prompt
+	breaker     []time.Time
+	capWake     time.Time
 
 	// sender
 	sending  bool
@@ -71,6 +75,10 @@ type runState struct {
 	turnID    int64
 	turnKey   string
 	cancelled bool
+	// stalled: stopped by the stall bound (R-19); under Engine.mu.
+	stalled bool
+	// lastEvent is the unix ms of the last Codex event (silence tracking).
+	lastEvent atomic.Int64
 	done      chan struct{}
 }
 

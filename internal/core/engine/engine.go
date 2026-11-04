@@ -51,6 +51,11 @@ type Timing struct {
 	DuplicateFor    time.Duration // duplicate prompt guard
 	BreakerWindow   time.Duration
 	BreakerCount    int
+	// R-19: hints after this much Codex silence in a running turn, and
+	// the bound after which the helper stops the turn (0 disables each).
+	SilenceHint, SilenceStuck, StallLimit time.Duration
+	// R-35: reminder cadence for a turn that stays queued (0 disables).
+	QueueReminder time.Duration
 }
 
 // ProductionTiming are the CORE-DESIGN values.
@@ -65,6 +70,8 @@ func ProductionTiming() Timing {
 		ResolveDelay: 5 * time.Second, ResolveTries: 3, ResolveAbsent: 2 * time.Minute, CapacityRetry: 5 * time.Minute, CapacityBackoff: 10 * time.Second,
 		Heartbeat: 30 * time.Second, Maintenance: time.Minute, ChatRate: time.Second,
 		DuplicateFor: 3 * time.Minute, BreakerWindow: time.Minute, BreakerCount: 3,
+		SilenceHint: 7 * time.Minute, SilenceStuck: 15 * time.Minute, StallLimit: time.Hour,
+		QueueReminder: 10 * time.Minute,
 	}
 }
 
@@ -186,6 +193,7 @@ type Engine struct {
 	unknown      map[int64]*unknownState
 	gates        map[string]time.Time
 	forkThreads  map[string]bool  // forked threads: mirror from the end of the copied history
+	reminded     map[int64]int    // queued turn id -> queue reminders posted (R-35)
 	intro        map[int64]string // first notice of a chat being created (mirror)
 	restart      restartConfirm   // confirmation owed for a `helper restart`
 	stats        engineStats
@@ -238,7 +246,7 @@ func New(cfg Config) (*Engine, error) {
 		convs: map[int64]*convState{}, intro: map[int64]string{}, forkThreads: map[string]bool{}, byChat: map[string]int64{}, byThread: map[string]int64{},
 		runnerWake: make(chan struct{}, 1), runnerDirty: map[int64]bool{},
 		senderWake: make(chan struct{}, 1), resolverWake: make(chan struct{}, 1),
-		mirrorWake: make(chan struct{}, 1), cmdQueue: make(chan cmdJob, 256), cmdPending: map[int64][]cmdJob{}, asrWake: make(chan struct{}, 1), fileTries: map[string]int{}, uploadAt: map[int64]time.Time{},
+		mirrorWake: make(chan struct{}, 1), cmdQueue: make(chan cmdJob, 256), cmdPending: map[int64][]cmdJob{}, reminded: map[int64]int{}, asrWake: make(chan struct{}, 1), fileTries: map[string]int{}, uploadAt: map[int64]time.Time{},
 	}
 	if sc, ok := cfg.Channel.(channel.ActivityScanner); ok && cfg.ActivityScan && e.t.ScanInterval > 0 {
 		e.scanner = timedScanner{sc}

@@ -512,6 +512,9 @@ func (s *server) startTurn(p map[string]any) (any, *rpcError) {
 		s.notify("turn/started", map[string]any{"threadId": threadID, "turn": view})
 		s.runTurn(rt, t, turn)
 	}()
+	if plan.MalformedStart {
+		return map[string]any{"turn": "malformed"}, nil
+	}
 	return map[string]any{"turn": view}, nil
 }
 

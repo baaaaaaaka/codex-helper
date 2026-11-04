@@ -108,6 +108,7 @@ func (e *Engine) maintenanceLoop(ctx context.Context) {
 			}
 		case <-mt.C:
 			e.ag.Maintain()
+			e.remindQueued()
 			e.retryCreating(ctx)
 			e.parkIdle()
 			if e.now().Sub(lastVacuum) > time.Hour {

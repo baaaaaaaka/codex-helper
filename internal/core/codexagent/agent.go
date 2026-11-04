@@ -138,6 +138,7 @@ func (a *Agent) Run(ctx context.Context, req engine.TurnRequest, hooks engine.Tu
 			}
 		},
 		Progress: hooks.Progress,
+		Activity: hooks.Activity,
 	})
 	var ns *codex.ErrNotStarted
 	switch {
@@ -149,6 +150,10 @@ func (a *Agent) Run(ctx context.Context, req engine.TurnRequest, hooks engine.Tu
 		a.pool.Drop(key(req.ConvID))
 		return engine.TurnOutcome{CodexTurnID: res.TurnID}, engine.ErrUnknownOutcome
 	case err != nil:
+		// The server may still be running the turn (review M4): kill its
+		// process group before the engine looks the turn up, so the turn
+		// cannot go on and the next turn never runs beside it.
+		a.pool.Drop(key(req.ConvID))
 		return engine.TurnOutcome{CodexTurnID: res.TurnID}, fmt.Errorf("%w: %v", engine.ErrUnknownOutcome, err)
 	}
 	return outcome(res.TurnID, res.Status, res.Final, res.Err, res.Usage), nil

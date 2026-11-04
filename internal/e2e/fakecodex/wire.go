@@ -68,6 +68,10 @@ type Plan struct {
 	Crash          bool   `json:"crash,omitempty"`
 	HoldCompletion bool   `json:"holdCompletion,omitempty"`
 	SurviveHelper  bool   `json:"surviveHelper,omitempty"`
+	// MalformedStart answers turn/start with a result the client cannot
+	// decode while the turn runs on (an error that is neither a JSON-RPC
+	// rejection nor an exit).
+	MalformedStart bool `json:"malformedStart,omitempty"`
 }
 
 // AwaitResult is the brain's final answer for a turn (POST /await?seq=N
