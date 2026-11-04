@@ -28,6 +28,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/core/codex"
 	"github.com/baaaaaaaka/codex-helper/internal/core/codexagent"
 	"github.com/baaaaaaaka/codex-helper/internal/core/engine"
+	"github.com/baaaaaaaka/codex-helper/internal/core/skillcmd"
 	"github.com/baaaaaaaka/codex-helper/internal/core/store"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakecodex"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakegraph"
@@ -141,8 +142,11 @@ func run() error {
 		Log:     os.Stdout,
 	})
 	timing := engine.FastTiming(interval)
+	// Fast timing polls interval/1s times faster than production; the
+	// account read budget (production 4/s) scales with it.
+	readRate := 4 * float64(time.Second) / float64(interval)
 	if os.Getenv(EnvProductionTiming) == "1" {
-		timing = engine.ProductionTiming()
+		timing, readRate = engine.ProductionTiming(), 0
 	}
 	machine := os.Getenv("CODEX_HELPER_TEAMS_MACHINE_LABEL")
 	if machine == "" {
@@ -150,9 +154,16 @@ func run() error {
 	}
 	cfg := engine.Config{
 		Store: st, Channel: ch, ChannelName: "teams", Agent: ag,
-		Log: os.Stdout, Timing: timing, Machine: machine, Version: "e2e-newcore",
+		Log: os.Stdout, Timing: timing, ReadRate: readRate, Machine: machine, Version: "e2e-newcore",
 		FilesDir: filepath.Join(dir, "files"), ActivityScan: true,
 		Registry: os.Getenv("E2E_SUT_MACHINE_REGISTRY") == "1",
+		// Skill subscriptions live in the scenario's sandbox only.
+		Skills: skillcmd.New(skillcmd.Options{
+			ConfigDir: filepath.Join(dir, "skills", "config"),
+			CacheDir:  filepath.Join(dir, "skills", "cache"),
+			CodexDir:  codexHome,
+			HomeDir:   os.Getenv("HOME"),
+		}),
 	}
 	if codexHome != "" {
 		cfg.SessionsDir = filepath.Join(codexHome, "sessions")
