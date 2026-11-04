@@ -47,7 +47,7 @@ echo {} > node_modules/@resvg/resvg-js/package.json
 	writeScript(t, node, `cat > "`+filepath.Join(dir, "in.json")+`"; cat "`+filepath.Join(dir, "out.json")+`"`)
 
 	cache := filepath.Join(dir, "cache")
-	m := &NodeMath{Dir: cache, Node: node, Npm: npm}
+	m := &NodeMath{Dir: cache, Node: node, Npm: npm, Fonts: []FontAsset{}}
 	res, err := m.Render(context.Background(), []string{`E=mc^2`, `\bad`, `\text{中文}`, `x`})
 	if err != nil {
 		t.Fatal(err)
@@ -104,13 +104,13 @@ echo {} > node_modules/@resvg/resvg-js/package.json
 }
 
 func TestParseMathOutputErrors(t *testing.T) {
-	if _, err := parseMathOutput([]byte("not json"), 1); err == nil {
+	if _, _, err := parseMathOutput([]byte("not json"), 1); err == nil {
 		t.Fatal("bad json accepted")
 	}
-	if _, err := parseMathOutput([]byte(`{"error":{"code":"startup"}}`), 1); err == nil {
+	if _, _, err := parseMathOutput([]byte(`{"error":{"code":"startup"}}`), 1); err == nil {
 		t.Fatal("top-level error accepted")
 	}
-	res, err := parseMathOutput([]byte(`{"results":[{"index":0,"png":"%%%"}]}`), 1)
+	res, _, err := parseMathOutput([]byte(`{"results":[{"index":0,"png":"%%%"}]}`), 1)
 	if err != nil || res[0].Err == nil {
 		t.Fatalf("bad base64: %+v %v", res, err)
 	}
@@ -135,7 +135,7 @@ func TestNodeMathFailingRendererFallsBackInRender(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 	_, a := newFake(t, fakegraph.Options{}, func(c *Config) { c.Math = m })
-	parts, err := a.Render(context.Background(), channel.RichDoc{Label: "L", Markdown: "$$\n\\frac{a}{b}\n$$", Math: true})
+	parts, err := a.Render(context.Background(), channel.RichDoc{Label: "L", Markdown: "<m>\n\\frac{a}{b}\n</m>", Math: true})
 	if err != nil {
 		t.Fatal(err)
 	}

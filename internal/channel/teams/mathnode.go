@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,20 +24,30 @@ import (
 // `npm ci --ignore-scripts` into a private cache directory; an install from
 // an earlier release with an identical renderer is reused as is.
 //
-// A formula whose SVG needs glyphs outside the MathJax fonts (for example
-// CJK text inside \text{}) is refused: resvg would draw them as boxes, and
-// a wrong image is worse than showing the TeX.
+// Text MathJax cannot draw itself (CJK inside \text{}, for example) needs a
+// font: pinned fonts (Fonts) are downloaded on demand, see mathfont.go. A
+// formula whose text is still not covered by an installed font is refused:
+// resvg would draw boxes, and a wrong image is worse than showing the TeX.
 type NodeMath struct {
 	Dir     string // cache root; default <user cache>/codex-helper/teams-math
 	Node    string // node binary; default from PATH
 	Npm     string // npm binary; default from PATH
 	Timeout time.Duration
 
+	// Fonts are the pinned fonts that may be downloaded; nil means
+	// DefaultMathFonts, an empty slice disables downloads.
+	Fonts       []FontAsset
+	HTTP        *http.Client  // font downloads; default http.DefaultClient
+	FontTimeout time.Duration // default 2 minutes
+
 	mu   sync.Mutex
 	root string
+
+	fontMu sync.Mutex
+	fonts  map[string]fontStamp // verified font files
 }
 
-//go:embed mathjs/package.json mathjs/package-lock.json mathjs/renderer.mjs
+//go:embed mathjs/package.json mathjs/package-lock.json mathjs/renderer.mjs mathjs/fonts/*.txt
 var mathjsFiles embed.FS
 
 const (
@@ -52,10 +63,61 @@ func (n *NodeMath) Render(ctx context.Context, sources []string) ([]MathResult, 
 	if err != nil {
 		return nil, err
 	}
+	all := make([]int, len(sources))
+	for i := range all {
+		all[i] = i
+	}
+	fonts := n.installedFonts(root)
+	res, texts, err := n.run(ctx, root, sources, all, fonts)
+	if err != nil {
+		return nil, err
+	}
+	// Formulas with text no installed font covers: fetch fonts, render again.
+	var retry []int
+	var need []string
+	for i, t := range texts {
+		if res[i].Err == nil && len(n.missingGlyphs(fonts, t)) > 0 {
+			retry, need = append(retry, i), append(need, t)
+		}
+	}
+	var fontErr error
+	if len(retry) > 0 {
+		var added bool
+		fonts, added, fontErr = n.ensureFonts(ctx, root, fonts, need)
+		if added {
+			again, againTexts, err := n.run(ctx, root, sources, retry, fonts)
+			for k, i := range retry {
+				switch {
+				case err != nil:
+					res[i], texts[i] = MathResult{Err: err}, ""
+				default:
+					res[i], texts[i] = again[k], againTexts[k]
+				}
+			}
+		}
+	}
+	for i, t := range texts {
+		if res[i].Err != nil {
+			continue
+		}
+		if missing := n.missingGlyphs(fonts, t); len(missing) > 0 {
+			msg := fmt.Sprintf("formula needs glyphs no math font has (%s)", runeList(missing))
+			if fontErr != nil {
+				msg += ": " + fontErr.Error()
+			}
+			res[i] = MathResult{Err: errors.New(msg)}
+		}
+	}
+	return res, nil
+}
+
+// run renders sources[idx...] and returns results and renderer text in idx order.
+func (n *NodeMath) run(ctx context.Context, root string, sources []string, idx []int, fonts []renderFont) ([]MathResult, []string, error) {
 	node := n.Node
 	if node == "" {
+		var err error
 		if node, err = exec.LookPath("node"); err != nil {
-			return nil, fmt.Errorf("teams math: node not found: %w", err)
+			return nil, nil, fmt.Errorf("teams math: node not found: %w", err)
 		}
 	}
 	type item struct {
@@ -63,11 +125,11 @@ func (n *NodeMath) Render(ctx context.Context, sources []string) ([]MathResult, 
 		Source string `json:"source"`
 	}
 	req := struct {
-		Items []item `json:"items"`
-		Fonts []any  `json:"fonts"`
-	}{Fonts: []any{}}
-	for i, s := range sources {
-		req.Items = append(req.Items, item{i, s})
+		Items []item       `json:"items"`
+		Fonts []renderFont `json:"fonts"`
+	}{Fonts: append([]renderFont{}, fonts...)}
+	for k, i := range idx {
+		req.Items = append(req.Items, item{k, sources[i]})
 	}
 	in, _ := json.Marshal(req)
 	timeout := n.Timeout
@@ -83,12 +145,14 @@ func (n *NodeMath) Render(ctx context.Context, sources []string) ([]MathResult, 
 	out.max, stderr.max = maxMathOutput, 4<<10
 	cmd.Stdout, cmd.Stderr = &out, &stderr
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("teams math: renderer failed: %w: %s", err, strings.TrimSpace(stderr.String()))
+		return nil, nil, fmt.Errorf("teams math: renderer failed: %w: %s", err, strings.TrimSpace(stderr.String()))
 	}
-	return parseMathOutput(out.Bytes(), len(sources))
+	return parseMathOutput(out.Bytes(), len(idx))
 }
 
-func parseMathOutput(raw []byte, n int) ([]MathResult, error) {
+// parseMathOutput decodes the renderer response. texts[i] is the text the
+// renderer drew with external fonts (to be checked against font coverage).
+func parseMathOutput(raw []byte, n int) ([]MathResult, []string, error) {
 	var resp struct {
 		Results []struct {
 			Index  int    `json:"index"`
@@ -106,12 +170,13 @@ func parseMathOutput(raw []byte, n int) ([]MathResult, error) {
 		} `json:"error"`
 	}
 	if err := json.Unmarshal(raw, &resp); err != nil {
-		return nil, fmt.Errorf("teams math: bad renderer output: %w", err)
+		return nil, nil, fmt.Errorf("teams math: bad renderer output: %w", err)
 	}
 	if resp.Error != nil {
-		return nil, fmt.Errorf("teams math: renderer error %s", resp.Error.Code)
+		return nil, nil, fmt.Errorf("teams math: renderer error %s", resp.Error.Code)
 	}
 	out := make([]MathResult, n)
+	texts := make([]string, n)
 	for i := range out {
 		out[i].Err = errors.New("no result")
 	}
@@ -120,29 +185,17 @@ func parseMathOutput(raw []byte, n int) ([]MathResult, error) {
 			continue
 		}
 		res := MathResult{Width: r.Width, Height: r.Height}
-		switch {
-		case r.Error != nil:
+		if r.Error != nil {
 			res.Err = fmt.Errorf("%s: %s", r.Error.Code, r.Error.Message)
-		case strings.TrimSpace(r.Text) != "":
-			res.Err = fmt.Errorf("formula needs glyphs the math fonts do not have (%q)", truncate(r.Text, 40))
-		default:
-			png, err := base64.StdEncoding.DecodeString(r.PNG)
-			if err != nil {
-				res.Err = err
-			} else {
-				res.PNG = png
-			}
+		} else if png, err := base64.StdEncoding.DecodeString(r.PNG); err != nil {
+			res.Err = err
+		} else {
+			res.PNG = png
+			texts[r.Index] = r.Text
 		}
 		out[r.Index] = res
 	}
-	return out, nil
-}
-
-func truncate(s string, n int) string {
-	if r := []rune(s); len(r) > n {
-		return string(r[:n]) + "…"
-	}
-	return s
+	return out, texts, nil
 }
 
 // runtime returns a directory holding renderer.mjs and node_modules,
