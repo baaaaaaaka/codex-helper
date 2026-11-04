@@ -276,7 +276,11 @@ func (c *converter) scanLinked(paths map[string]*pathInfo, keys []string) {
 				}
 			}
 		}
-		if c.opt.CountBacklog {
+		// A ledger record id can prove a record past every old offset (the
+		// delivery offset names the event that carried it, the id the
+		// message item after it), so a proof with ids is scanned to EOF:
+		// the resume position must not depend on CountBacklog.
+		if c.opt.CountBacklog || len(q.ids) > 0 {
 			q.to = fst.size
 		}
 		q.to = min(max(q.to, q.from), fst.size)

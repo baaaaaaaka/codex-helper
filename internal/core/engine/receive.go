@@ -772,7 +772,7 @@ func (e *Engine) ackPrompt(tx *store.Tx, conv int64, a store.Admitted, c *classi
 			ahead++
 		}
 	}
-	text := "Request accepted."
+	text := textAccepted
 	if ahead > 0 {
 		text += " It is queued behind " + plural(ahead, "earlier request", "earlier requests") + "."
 	}

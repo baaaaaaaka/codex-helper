@@ -142,7 +142,7 @@ func (t *Tracker) apply(out []Output, ev Event, l Line) []Output {
 	if ev.TurnID != "" && t.turn == nil && ev.Kind != KindTurnStarted {
 		t.turn = &openTurn{id: ev.TurnID, teams: t.skip("", ev.TurnID)}
 	}
-	if ev.TurnID != "" && t.turn != nil && t.turn.id == "" {
+	if ev.TurnID != "" && t.turn != nil && t.turn.id == "" && (t.turn.started || ev.Kind != KindTurnStarted) {
 		t.turn.id = ev.TurnID
 		t.turn.teams = t.turn.teams || t.skip("", ev.TurnID)
 	}
@@ -190,8 +190,17 @@ func (t *Tracker) apply(out []Output, ev Event, l Line) []Output {
 		tr.decided = true
 		out = t.flush(out)
 	case KindAgentMessage:
+		if ev.Phase != "final_answer" || strings.TrimSpace(ev.Text) == "" {
+			return out
+		}
 		tr := t.turn
-		if tr == nil || ev.Phase != "final_answer" || strings.TrimSpace(ev.Text) == "" {
+		if tr == nil {
+			// A scan that began mid-turn before any record naming the turn
+			// (older rollouts carry the turn id only on task_complete):
+			// hold the final until the turn, and so whether the helper ran
+			// it, is known (fidelity run, s523/s526).
+			t.turn = &openTurn{finalSeen: true}
+			t.turn.pending = append(t.turn.pending, Output{RecordID: ev.RecordID, Text: strings.TrimSpace(ev.Text), Time: ev.Time, End: l.End, line: t.line, start: l.Off})
 			return out
 		}
 		tr.finalSeen, tr.decided = true, true

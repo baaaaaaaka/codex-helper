@@ -186,6 +186,9 @@ func scanRollout(q scanReq) scanResult {
 		res.Boundary[off] = line
 	}
 	cl := classifier{teams: q.teamsTurn}
+	if q.from > 0 {
+		cl.twin = deliveredEventFinal(f, q.from)
+	}
 	br := bufio.NewReaderSize(f, 1<<20)
 	var buf []byte
 	var recLen int64
@@ -220,8 +223,13 @@ func scanRollout(q scanReq) scanResult {
 		if !big {
 			cl.classify(rec, start, off, line)
 			if len(q.ids) > 0 {
+				// The old core names a repeated id's later copies
+				// "<id>#line:N", so a bare ledger id proves only its first
+				// occurrence.
 				if id := recordID(rec); id != "" && q.ids[id] {
-					res.IDEnd[id] = [2]int64{off, line}
+					if _, seen := res.IDEnd[id]; !seen {
+						res.IDEnd[id] = [2]int64{off, line}
+					}
 				}
 			}
 		}
@@ -246,7 +254,12 @@ func scanRollout(q scanReq) scanResult {
 // dropped when the turn turns out to be run from Teams; a scan that starts
 // inside a turn learns the turn id from its task_complete.
 type classifier struct {
-	teams     map[string]bool
+	teams map[string]bool
+	// twin is the text of the event_msg agent_message final that ends at
+	// the scan start (the delivered record of the proof): Codex writes the
+	// same final again as the response_item that follows it, which is then
+	// not a record to mirror (fidelity run, s278).
+	twin      string
 	turn      string
 	teamsTurn bool
 	finalSeen bool
@@ -265,7 +278,7 @@ func (c *classifier) setTurn(id string, ends bool) {
 		return
 	}
 	c.flush()
-	c.turn, c.teamsTurn, c.finalSeen = id, c.teams[id], false
+	c.turn, c.teamsTurn, c.finalSeen, c.twin = id, c.teams[id], false, ""
 }
 
 // flush keeps the held records unless their turn was run from Teams.
@@ -349,11 +362,23 @@ func (c *classifier) classify(rec []byte, start, end, line int64) {
 		case LegacyTeamsPrompt(text):
 			c.teamsTurn = true
 		default:
+			c.twin = ""
 			r.Kind, r.ID = "prompt", pl.ID
 			c.pending = append(c.pending, r)
 		}
 	case l.Type == "response_item" && pl.Type == "message" && pl.Role == "assistant" && pl.Phase == "final_answer":
 		c.finalSeen = true
+		if c.twin != "" {
+			var sb strings.Builder
+			for _, ct := range pl.Content {
+				sb.WriteString(ct.Text)
+			}
+			twin := strings.TrimSpace(sb.String()) == c.twin
+			c.twin = ""
+			if twin {
+				return
+			}
+		}
 		r.Kind, r.ID = "final", pl.ID
 		c.pending = append(c.pending, r)
 	}
@@ -387,18 +412,92 @@ var legacyTeamsMarkers = []string{
 	"<codex-helper-control-context",
 }
 
-// recordID extracts payload.id cheaply (ledger id matching).
+// recordID extracts the record's own payload.id cheaply (ledger id
+// matching). Only a direct member of the top-level "payload" object counts:
+// a nested id (for example the replacement_history of a "compacted" record,
+// which repeats earlier message ids) never names this record.
 func recordID(rec []byte) string {
-	i := bytes.Index(rec[:min(len(rec), 512)], []byte(`"id":"`))
-	if i < 0 {
+	head := rec[:min(len(rec), 4096)]
+	depth, payloadDepth := 0, 0
+	var lastKey string
+	for i := 0; i < len(head); i++ {
+		switch c := head[i]; c {
+		case '"':
+			j := i + 1
+			for j < len(head) && head[j] != '"' {
+				if head[j] == '\\' {
+					j++
+				}
+				j++
+			}
+			if j >= len(head) {
+				return ""
+			}
+			str := head[i+1 : j]
+			k := j + 1
+			for k < len(head) && (head[k] == ' ' || head[k] == '\t') {
+				k++
+			}
+			if k < len(head) && head[k] == ':' {
+				lastKey = string(str)
+			} else {
+				if payloadDepth > 0 && depth == payloadDepth && lastKey == "id" {
+					return string(str)
+				}
+				lastKey = ""
+			}
+			i = j
+		case '{', '[':
+			depth++
+			if c == '{' && depth == 2 && lastKey == "payload" && payloadDepth == 0 {
+				payloadDepth = 2
+			}
+			lastKey = ""
+		case '}', ']':
+			if payloadDepth > 0 && depth == payloadDepth {
+				return "" // payload closed without an id
+			}
+			depth--
+			lastKey = ""
+		case ',':
+			lastKey = ""
+		}
+	}
+	return ""
+}
+
+// maxTwinRecord bounds the record read back from a proof offset.
+const maxTwinRecord = 1 << 20
+
+// deliveredEventFinal returns the text of the event_msg agent_message
+// final_answer record that ends at off ("" when the record there is
+// anything else or longer than maxTwinRecord). Read-only pread.
+func deliveredEventFinal(f *os.File, off int64) string {
+	from := max(0, off-maxTwinRecord)
+	b := make([]byte, off-from)
+	if n, err := f.ReadAt(b, from); n != len(b) || (err != nil && !errors.Is(err, io.EOF)) {
 		return ""
 	}
-	rest := rec[i+6:]
-	j := bytes.IndexByte(rest, '"')
-	if j < 0 || j > 200 {
+	if len(b) == 0 || b[len(b)-1] != '\n' {
 		return ""
 	}
-	return string(rest[:j])
+	i := bytes.LastIndexByte(b[:len(b)-1], '\n')
+	if i < 0 && from > 0 {
+		return ""
+	}
+	rec := b[i+1:]
+	var l struct {
+		Type    string `json:"type"`
+		Payload struct {
+			Type    string `json:"type"`
+			Phase   string `json:"phase"`
+			Message string `json:"message"`
+		} `json:"payload"`
+	}
+	if json.Unmarshal(rec, &l) != nil || l.Type != "event_msg" || l.Payload.Type != "agent_message" || l.Payload.Phase != "final_answer" {
+		return ""
+	}
+	return strings.TrimSpace(l.Payload.Message)
 }
 
 // recordBoundary reports whether off is 0 or follows a newline (read-only pread).

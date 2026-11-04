@@ -523,3 +523,50 @@ func TestReadCutsLongRecordsClassifiedFromTheirHead(t *testing.T) {
 		t.Fatalf("reading 16 MB of skipped records allocated %d KB, want under 2 MB", alloc>>10)
 	}
 }
+
+// Fidelity run, s523/s526: a resume position inside a turn of an older
+// rollout, whose records name the turn only on task_complete. The final
+// read before the turn is known is held, not dropped, and still skipped
+// when the helper ran the turn.
+func TestScanMidTurnHoldsFinalUntilTurnKnown(t *testing.T) {
+	const ts = `{"timestamp":"2026-09-01T00:00:00Z",`
+	lines := []string{
+		ts + `"type":"response_item","payload":{"type":"reasoning","summary":[]}}` + "\n",
+		ts + `"type":"event_msg","payload":{"type":"agent_message","message":"done here","phase":"final_answer"}}` + "\n",
+		ts + `"type":"response_item","payload":{"type":"message","id":"msg_f","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"done here"}]}}` + "\n",
+		ts + `"type":"event_msg","payload":{"type":"token_count"}}` + "\n",
+		ts + `"type":"event_msg","payload":{"type":"task_complete","turn_id":"tA","last_agent_message":"done here"}}` + "\n",
+	}
+	p := writeLines(t, lines...)
+	read := func(skip Skip) ([]Output, *Tracker) {
+		tr := NewTracker("th", 0, 10, skip)
+		return readAll(t, p, tr), tr
+	}
+	out, _ := read(nil)
+	if got := keys(out); got != "F:done here" {
+		t.Fatalf("outputs %q", got)
+	}
+	if out[0].RecordID != "msg_f" || out[0].TurnID != "tA" {
+		t.Fatalf("output %+v", out[0])
+	}
+	if out, _ := read(func(_, turn string) bool { return turn == "tA" }); len(out) != 0 {
+		t.Fatalf("helper turn mirrored: %q", keys(out))
+	}
+	// Held until task_complete: a restart re-reads from the final.
+	held := writeLines(t, lines[:4]...)
+	tr := NewTracker("th", 0, 10, nil)
+	if out := readAll(t, held, tr); len(out) != 0 {
+		t.Fatalf("released before the turn was known: %q", keys(out))
+	}
+	if off, _ := tr.Resume(); off != int64(len(lines[0])+len(lines[1])) {
+		t.Fatalf("resume %d", off)
+	}
+	// The next turn's start ends the unnamed turn; it is not taken for it.
+	next := writeLines(t, append(append([]string{}, lines[:4]...),
+		ts+`"type":"turn_context","payload":{"turn_id":"tB"}}`+"\n",
+		ts+`"type":"response_item","payload":{"type":"message","id":"msg_u","role":"user","content":[{"type":"input_text","text":"next question"}]}}`+"\n",
+		ts+`"type":"response_item","payload":{"type":"message","id":"msg_g","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"next answer"}]}}`+"\n")...)
+	if got := keys(readAll(t, next, NewTracker("th", 0, 10, nil))); got != "F:done here | U:next question | F:next answer" {
+		t.Fatalf("outputs %q", got)
+	}
+}

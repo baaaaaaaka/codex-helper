@@ -392,6 +392,12 @@ func parseTable(header string, lines []string, i int) (mdBlock, int, bool) {
 		for len(row) < len(head) {
 			row = append(row, "")
 		}
+		// Cells past the header's width stay in the last column, as in
+		// v0.1.20 (normalizeTeamsMarkdownTableRow): text written after a
+		// row's closing pipe must not vanish.
+		if n := len(head); len(row) > n {
+			row[n-1] = strings.TrimSpace(strings.Join(row[n-1:], " | "))
+		}
 		b.rows = append(b.rows, row[:len(head)])
 	}
 	return b, j - i, true

@@ -243,6 +243,29 @@ func (s *Server) SeedChat(id, topic string) ChatInfo {
 	return info
 }
 
+// SeedMessage adds a message that existed before the scenario, posted by the
+// owner's account (the owner, or an older helper posting as the owner), with
+// its original id and time. Seed each chat in chronological order before the
+// SUT starts; a message at or after the fake's clock is refused.
+func (s *Server) SeedMessage(chatID, id string, at time.Time, htmlBody string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	c := s.chats[chatID]
+	if c == nil {
+		return fmt.Errorf("seed message: unknown chat %s", chatID)
+	}
+	at = at.UTC().Truncate(time.Millisecond)
+	if !at.Before(time.Now()) || !at.After(time.Time{}) {
+		return fmt.Errorf("seed message %s: time %s is not in the past", id, at)
+	}
+	if n := len(c.Messages); n > 0 && at.Before(c.Messages[n-1].Created) {
+		return fmt.Errorf("seed message %s: out of order", id)
+	}
+	c.Messages = append(c.Messages, &Message{ID: id, ChatID: c.ID, Created: at, Modified: at, MessageType: "message",
+		FromUserID: s.opts.Owner.ID, FromName: s.opts.Owner.DisplayName, ContentType: "html", Content: htmlBody, Origin: OriginSeeded})
+	return nil
+}
+
 // SetPreviewLag changes Options.PreviewLag at run time.
 func (s *Server) SetPreviewLag(d time.Duration) {
 	s.mu.Lock()
