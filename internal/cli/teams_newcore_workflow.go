@@ -202,6 +202,10 @@ func (n *teamsNewCoreNotifier) NotifyFinal(ctx context.Context, conv, title, tex
 	return chteams.NewWorkflowNotifier(n.url(), n.client).NotifyFinal(ctx, conv, title, text, url)
 }
 
+func (n *teamsNewCoreNotifier) NotifyEvent(ctx context.Context, heading, text, url string) error {
+	return chteams.NewWorkflowNotifier(n.url(), n.client).NotifyEvent(ctx, heading, text, url)
+}
+
 // teamsWorkflowWatchEvery is how often the running helper looks for a
 // workflow enable/disable request (well inside teamsWorkflowApplyWait).
 const teamsWorkflowWatchEvery = 5 * time.Second

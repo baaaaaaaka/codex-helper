@@ -98,6 +98,30 @@ type mirrorFile struct {
 	retryAt time.Time
 	// nextStat is when mirrorPoll stats the rollout next (B1).
 	nextStat time.Time
+	// catchUpEnd is the file end when this process began catching the
+	// rollout up (catchUpSet once known): see catchingUp.
+	catchUpEnd int64
+	catchUpSet bool
+}
+
+// catchingUp is the one boundary between catch-up and live mirroring
+// (coordinator decision, parity round 2026-11-05). A record that already
+// existed when its source began catching up is catch-up: the source was
+// behind its end when the engine started (a converted store included), or
+// it is an old session found by discovery. Catch-up posts prompts and
+// finals only and notifies nobody. A record past that end is live and is
+// mirrored as v0.1.20 did: status and compaction posts too, and an owner
+// notification for each final.
+func (f *mirrorFile) catchingUp(o transcript.Output) bool { return o.End <= f.catchUpEnd }
+
+// catchUpFrom sets the catch-up end of a rollout first seen in state at:
+// what it held then if it existed when the engine started (atStart), else
+// nothing (a session started since is live from its first record).
+func catchUpFrom(at transcript.FileInfo, atStart bool) int64 {
+	if atStart {
+		return at.Size
+	}
+	return 0
 }
 
 func realignKey(srcID int64) string { return fmt.Sprintf("%s%d", metaRealignPrefix, srcID) }
@@ -438,7 +462,8 @@ func (e *Engine) considerFor(ctx context.Context, found []transcript.Found, budg
 			break
 		}
 		done++
-		if at, ok := e.mirror.firstAt[f.Path]; ok {
+		at, atStart := e.mirror.firstAt[f.Path]
+		if atStart {
 			// Not classified yet by the start-up walk: as of the start
 			// (a fresh install baselines what existed then).
 			f.Info = at
@@ -456,10 +481,10 @@ func (e *Engine) considerFor(ctx context.Context, found []transcript.Found, budg
 			continue
 		}
 		if known && state == store.SrcBaseline {
-			e.promoteBaseline(ctx, f)
+			e.promoteBaseline(ctx, f, atStart)
 			continue
 		}
-		if b, ok := e.newRollout(ctx, f); ok {
+		if b, ok := e.newRollout(ctx, f, atStart); ok {
 			baseline = append(baseline, b)
 		}
 	}
@@ -491,7 +516,7 @@ func (e *Engine) recordBaseline(baseline []store.TranscriptSource) {
 // newRollout decides what to do with a rollout seen for the first time. It
 // returns a source row to record in bulk (baseline/ignored), or tracks the
 // file itself.
-func (e *Engine) newRollout(ctx context.Context, f transcript.Found) (store.TranscriptSource, bool) {
+func (e *Engine) newRollout(ctx context.Context, f transcript.Found, atStart bool) (store.TranscriptSource, bool) {
 	meta, err := e.readMeta(f.Path)
 	if err != nil {
 		// Being written, or not a session: read again once it changes.
@@ -535,7 +560,7 @@ func (e *Engine) newRollout(ctx context.Context, f transcript.Found) (store.Tran
 			// which is already in the parent chat.
 			src.Offset = f.Info.Size
 		}
-		e.track(src)
+		e.track(src, catchUpFrom(f.Info, atStart || meta.Time.Before(e.mirror.startedAt)))
 		return store.TranscriptSource{}, false
 	case e.mirror.first && f.Info.MTime.Before(e.mirror.startedAt):
 		src.State, src.Offset = store.SrcBaseline, f.Info.Size
@@ -544,13 +569,13 @@ func (e *Engine) newRollout(ctx context.Context, f transcript.Found) (store.Tran
 		src.State = store.SrcIgnored
 		return src, true
 	}
-	e.mirrorSession(ctx, src, meta, 0)
+	e.mirrorSession(ctx, src, meta, 0, catchUpFrom(f.Info, atStart || meta.Time.Before(e.mirror.startedAt)))
 	return store.TranscriptSource{}, false
 }
 
 // promoteBaseline starts mirroring a baselined rollout that grew: a person
 // continued an old session.
-func (e *Engine) promoteBaseline(ctx context.Context, f transcript.Found) {
+func (e *Engine) promoteBaseline(ctx context.Context, f transcript.Found, atStart bool) {
 	e.mirror.mu.Lock()
 	last, seen := e.mirror.checked[f.Path]
 	e.mirror.mu.Unlock()
@@ -598,14 +623,15 @@ func (e *Engine) promoteBaseline(ctx context.Context, f transcript.Found) {
 			return
 		}
 		src.State, src.ConvID = store.SrcTracking, conv
-		e.track(src)
+		e.track(src, catchUpFrom(f.Info, atStart))
 		return
 	}
-	e.mirrorSession(ctx, src, meta, src.Offset)
+	e.mirrorSession(ctx, src, meta, src.Offset, catchUpFrom(f.Info, atStart))
 }
 
-// track records a tracking source and starts following it.
-func (e *Engine) track(src store.TranscriptSource) {
+// track records a tracking source and starts following it; catchUp is its
+// catch-up end (catchingUp).
+func (e *Engine) track(src store.TranscriptSource, catchUp int64) {
 	err := e.update(func(tx *store.Tx) error {
 		id, err := tx.UpsertSource(src)
 		src.ID = id
@@ -623,13 +649,14 @@ func (e *Engine) track(src store.TranscriptSource) {
 	e.mirror.mu.Lock()
 	delete(e.mirror.known, src.Path)
 	delete(e.mirror.checked, src.Path)
-	e.mirror.files[src.Path] = &mirrorFile{src: src, tracker: transcript.NewTracker(src.ThreadID, src.Offset, src.Line, e.mirrorSkip)}
+	e.mirror.files[src.Path] = &mirrorFile{src: src, tracker: transcript.NewTracker(src.ThreadID, src.Offset, src.Line, e.mirrorSkip),
+		catchUpEnd: catchUp, catchUpSet: true}
 	e.mirror.mu.Unlock()
 }
 
 // mirrorSession creates a work conversation for a local session and tracks
 // its rollout from offset.
-func (e *Engine) mirrorSession(ctx context.Context, src store.TranscriptSource, meta transcript.SessionMeta, offset int64) {
+func (e *Engine) mirrorSession(ctx context.Context, src store.TranscriptSource, meta transcript.SessionMeta, offset, catchUp int64) {
 	first := transcript.FirstPrompt(src.Path, firstPromptMax)
 	var id int64
 	var label string
@@ -674,7 +701,8 @@ func (e *Engine) mirrorSession(ctx context.Context, src store.TranscriptSource, 
 	e.mirror.mu.Lock()
 	delete(e.mirror.known, src.Path)
 	delete(e.mirror.checked, src.Path)
-	e.mirror.files[src.Path] = &mirrorFile{src: src, tracker: transcript.NewTracker(meta.ID, offset, src.Line, e.mirrorSkip)}
+	e.mirror.files[src.Path] = &mirrorFile{src: src, tracker: transcript.NewTracker(meta.ID, offset, src.Line, e.mirrorSkip),
+		catchUpEnd: catchUp, catchUpSet: true}
 	e.mirror.mu.Unlock()
 	// The chat is created with the first record to mirror (mirrorRead).
 	e.logf("mirroring local session %s as %s", meta.ID, label)
@@ -716,6 +744,14 @@ func (e *Engine) mirrorPoll(ctx context.Context) {
 		}
 		if err != nil {
 			continue // removed or unreadable; keep the row
+		}
+		if !f.catchUpSet {
+			// A source restored at start: what it holds now and has not
+			// been read yet is catch-up (catchingUp).
+			f.catchUpSet = true
+			if f.tracker.Offset() < info.Size {
+				f.catchUpEnd = info.Size
+			}
 		}
 		if sameFile(info, f.info) && f.tracker.Offset() >= info.Size {
 			continue
@@ -855,10 +891,11 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 		label, creating = cs.label, cs.state == store.ConvCreating
 	}
 	e.mu.Unlock()
-	var posted int
+	var posted, notify int
 	err = e.update(func(tx *store.Tx) error {
-		posted, woke, created = 0, false, false
+		posted, woke, created, notify = 0, false, false, 0
 		var msgs []store.OutMsg
+		firstLive := false
 		start := 0
 		if realign {
 			// Realign: in this pass, drop everything up to the last record
@@ -886,8 +923,22 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 			if realign && (r.o.Time.IsZero() || !r.o.Time.After(realignAt)) {
 				continue // in the file before the rewrite: already handled
 			}
+			live := !f.catchingUp(r.o)
+			if posted == 0 {
+				firstLive = live
+			}
 			msgs = append(msgs, r.msgs...)
 			posted++
+			if live && !r.o.User {
+				// A live final: the owner is notified once it is posted
+				// (Workflow card, else a control-chat @mention), as for
+				// a Teams-run final; catch-up finals notify nobody.
+				if err := addNotify(tx, pendingNotify{Conv: f.src.ConvID, Key: transcript.MirrorKeyPrefix(thread, r.o.RecordID),
+					Text: clipText(r.o.Text, 400)}); err != nil {
+					return err
+				}
+				notify++
+			}
 		}
 		// Realignment lasts until a pass reaches the end of the file, across
 		// passes and restarts.
@@ -917,6 +968,13 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 					return err
 				}
 				created = true
+				if firstLive {
+					// v0.1.20 local_session_started, for a live session only.
+					if err := addNotify(tx, pendingNotify{Conv: f.src.ConvID, Key: "ready:" + label + ":", Kind: notifyLocal}); err != nil {
+						return err
+					}
+					notify++
+				}
 			}
 		}
 		if posted > 0 || info.Size > f.src.Size {
@@ -943,6 +1001,9 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 	f.realign, f.realignAt = realign && more, realignAt
 	if !more {
 		f.info = info
+	}
+	if notify > 0 {
+		wake(e.notifyWake)
 	}
 	if created {
 		e.wg.Add(1)

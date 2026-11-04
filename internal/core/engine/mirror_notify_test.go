@@ -1,0 +1,118 @@
+package engine
+
+import (
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/baaaaaaaka/codex-helper/internal/e2e/rollout"
+)
+
+// mentionsCovered counts the finals the control-chat @mentions name.
+func (r *rig) mentionsCovered(ctl string) int {
+	n := 0
+	for _, m := range r.own(ctl, "Codex finished") {
+		if !m.MentionsOwner {
+			r.t.Fatalf("notification without mention: %q", m.Text)
+		}
+		n += 1 + strings.Count(m.Text, " and ")
+	}
+	return n
+}
+
+// v0.1.20 notified the owner of every live mirrored final and of a live
+// local session (turn_completed and local_session_started; here without a
+// Workflow card, so as control-chat @mentions), never in the work chat.
+func TestLiveMirroredFinalsNotifyTheOwner(t *testing.T) {
+	r, sessions := mirrorRig(t)
+	ctl := r.control()
+	w, err := rollout.New(sessions, t.TempDir(), rollout.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.AppendTurn(rollout.Turn{Prompt: "live prompt one", Answer: "live answer one"}); err != nil {
+		t.Fatal(err)
+	}
+	local := r.localChat()
+	r.wait("first final notified", func() bool { return r.mentionsCovered(ctl) == 1 })
+	r.wait("session notified", func() bool { return len(r.own(ctl, "New local Codex chat detected")) == 1 })
+	if m := r.own(ctl, "New local Codex chat detected")[0]; !m.MentionsOwner || !strings.Contains(m.Text, "Chat:") {
+		t.Fatalf("session notification: %+v", m)
+	}
+	if _, err := w.AppendTurn(rollout.Turn{Prompt: "live prompt two", Answer: "live answer two"}); err != nil {
+		t.Fatal(err)
+	}
+	r.wait("second answer", func() bool { return len(r.own(local, "live answer two")) == 1 })
+	r.wait("second final notified", func() bool { return r.mentionsCovered(ctl) == 2 })
+	time.Sleep(500 * time.Millisecond)
+	if n := r.mentionsCovered(ctl); n != 2 {
+		t.Fatalf("mentions cover %d finals, want 2", n)
+	}
+	if n := len(r.own(ctl, "New local Codex chat detected")); n != 1 {
+		t.Fatalf("%d session notifications", n)
+	}
+	for _, m := range r.own(local, "") {
+		if m.MentionsOwner {
+			t.Fatalf("work-chat post mentions the owner: %q", m.Text)
+		}
+	}
+}
+
+// Catch-up: records already in a rollout when its source starts catching
+// up (a session found at start, or a source behind its file at a restart) are mirrored without notifying anyone; what is appended after
+// the source reached the end of its file is live and notifies.
+func TestCatchUpFinalsDoNotNotify(t *testing.T) {
+	r, sessions := mirrorRig(t)
+	ctl := r.control()
+	// A session that began while the helper was down (not its first run,
+	// which baselines what exists): found at start, caught up.
+	r.wait("mirror initialised", func() bool {
+		v, _, err := r.st.Meta(metaMirrorInit)
+		return err == nil && v != ""
+	})
+	r.stop()
+	w, err := rollout.New(sessions, t.TempDir(), rollout.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"old one", "old two"} {
+		if _, err := w.AppendTurn(rollout.Turn{Prompt: "prompt " + p, Answer: "answer " + p}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	r.start()
+	local := r.localChat()
+	r.wait("catch-up mirrored", func() bool { return len(r.own(local, "answer old two")) == 1 })
+	time.Sleep(time.Second)
+	if n := r.mentionsCovered(ctl); n != 0 {
+		t.Fatalf("catch-up finals notified (%d)", n)
+	}
+	if n := len(r.own(ctl, "New local Codex chat detected")); n != 0 {
+		t.Fatalf("session found at start notified (%d)", n)
+	}
+
+	// Live from here on.
+	if _, err := w.AppendTurn(rollout.Turn{Prompt: "prompt new", Answer: "answer new"}); err != nil {
+		t.Fatal(err)
+	}
+	r.wait("live final notified", func() bool { return r.mentionsCovered(ctl) == 1 })
+
+	// Behind its file across a restart: catch-up again.
+	r.stop()
+	if _, err := w.AppendTurn(rollout.Turn{Prompt: "prompt while down", Answer: "answer while down"}); err != nil {
+		t.Fatal(err)
+	}
+	r.start()
+	r.wait("restart catch-up mirrored", func() bool { return len(r.own(local, "answer while down")) == 1 })
+	time.Sleep(time.Second)
+	if n := r.mentionsCovered(ctl); n != 1 {
+		t.Fatalf("mentions cover %d finals after the restart catch-up, want 1", n)
+	}
+	if _, err := w.AppendTurn(rollout.Turn{Prompt: "prompt after", Answer: "answer after"}); err != nil {
+		t.Fatal(err)
+	}
+	r.wait("live final after restart notified", func() bool { return r.mentionsCovered(ctl) == 2 })
+	if n := len(r.own(local, "answer")); n != 5 {
+		t.Fatalf("%d answers in the chat, want 5", n)
+	}
+}

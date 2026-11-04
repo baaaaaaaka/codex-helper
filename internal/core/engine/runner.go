@@ -744,10 +744,11 @@ func (e *Engine) capacityRetry(cs *convState, tr store.Turn, out TurnOutcome) bo
 	return true
 }
 
-// mentionNotice is the control-chat @mention for the finals of turns
-// (convs: their conversations, in order; a conversation may repeat). Its
-// delivery key names every turn, so the set is posted once.
-func (e *Engine) mentionNotice(turns []int64, convs []*convState) ([]store.OutMsg, error) {
+// mentionNotice is the control-chat @mention for the finals of ids
+// (pendingNotify ids; convs: their conversations, in order; a conversation
+// may repeat). Its delivery key names every final, so the set is posted
+// once.
+func (e *Engine) mentionNotice(ids []string, convs []*convState) ([]store.OutMsg, error) {
 	type chat struct {
 		name, url string
 		n         int
@@ -789,12 +790,32 @@ func (e *Engine) mentionNotice(turns []int64, convs []*convState) ([]store.OutMs
 		}
 		text = "Codex finished in " + joinAnd(names)
 	}
-	ids := make([]string, len(turns))
-	for i, t := range turns {
-		ids[i] = strconv.FormatInt(t, 10)
+	short := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if t, ok := strings.CutPrefix(id, "turn:"); ok {
+			short = append(short, t) // "notify:<turn>,<turn>" as before
+		} else {
+			short = append(short, fmt.Sprintf("m%012x", pathHash(id)&0xffffffffffff))
+		}
 	}
 	return e.render(context.Background(), channel.RichDoc{Label: labelHelper, Markdown: text + ".", Mention: true},
-		store.OutNotice, "notify:"+strings.Join(ids, ","))
+		store.OutNotice, "notify:"+strings.Join(short, ","))
+}
+
+// localMention is the control-chat @mention for a live local session found
+// on disk, when no Workflow card announced it (v0.1.20 local_session_started).
+func (e *Engine) localMention(cs *convState) ([]store.OutMsg, error) {
+	e.mu.Lock()
+	name, url := firstNonEmpty(cs.title, cs.label), cs.url
+	e.mu.Unlock()
+	// v0.1.20's control-chat fallback for its local_session_started card.
+	text := "**💬 New local Codex chat detected**\n\n**Chat:** " + name +
+		"\n\n**Next:** Open this chat to watch the answer and continue from the full local context."
+	if url != "" {
+		text += "\n\n**Open:** [Open chat](" + url + ")"
+	}
+	return e.render(context.Background(), channel.RichDoc{Label: labelHelper, Markdown: text, Mention: true},
+		store.OutNotice, fmt.Sprintf("notify:local:%d", cs.id))
 }
 
 // joinAnd joins "A", "B", "C" as "A, B and C".

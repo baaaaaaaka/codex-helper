@@ -12,7 +12,8 @@ import (
 // "Work chat created: sNNN." and the ready anchor in the work chat and one
 // "✅ Work chat created" answer in the control chat (no interim "Creating…"
 // reply); a local session found on disk posts only "Local Codex chat
-// detected: sNNN." in its own chat and nothing in the control chat.
+// detected: sNNN." in its own chat and no notice in the control chat (only
+// the owner's notifications, see mirror_notify_test.go).
 func TestCreationNoticesAreV0120(t *testing.T) {
 	r, sessions := mirrorRig(t)
 	ctl := r.control()
@@ -34,8 +35,13 @@ func TestCreationNoticesAreV0120(t *testing.T) {
 	if n := len(r.own(local, "Work chat")); n != 0 {
 		t.Errorf("%d `new`-style notices in the local chat", n)
 	}
+	// The control chat gets only the owner's notifications (no card
+	// here, so @mentions): the live session and its live final.
+	r.wait("owner notified", func() bool {
+		return len(r.own(ctl, "New local Codex chat detected")) == 1 && len(r.own(ctl, "Codex finished")) == 1
+	})
 	time.Sleep(300 * time.Millisecond)
-	if got := r.own(ctl, ""); len(got) != ctlBefore {
+	if got := r.own(ctl, ""); len(got) != ctlBefore+2 {
 		t.Errorf("control chat got %d messages for a discovered session: %+v", len(got)-ctlBefore, got[ctlBefore:])
 	}
 

@@ -22,10 +22,36 @@ import (
 const metaNotify = "engine_notify"
 
 type pendingNotify struct {
-	Turn      int64  `json:"turn"`
-	Conv      int64  `json:"conv"`
+	Turn int64 `json:"turn"`
+	Conv int64 `json:"conv"`
+	// Key identifies a notification that is not a Teams-run turn's final
+	// and is the delivery-key prefix of the posts it waits for: a live
+	// mirrored final ("mirror:<thread>:<record>:") or the notice of a live
+	// discovered session ("ready:<label>:", Kind notifyLocal).
+	Key       string `json:"key,omitempty"`
+	Kind      string `json:"kind,omitempty"`
 	Text      string `json:"text,omitempty"`
 	Attempted bool   `json:"attempted,omitempty"` // the card post was started
+}
+
+// notifyLocal is the Kind of a live discovered session's notification
+// (v0.1.20 local_session_started); "" is a final (turn_completed).
+const notifyLocal = "local"
+
+// id identifies n in the pending list.
+func (n pendingNotify) id() string {
+	if n.Turn != 0 {
+		return fmt.Sprintf("turn:%d", n.Turn)
+	}
+	return n.Key
+}
+
+// waitPrefix is the delivery-key prefix of the posts n waits for.
+func (n pendingNotify) waitPrefix() string {
+	if n.Turn != 0 {
+		return fmt.Sprintf("turn:%d:", n.Turn)
+	}
+	return n.Key
 }
 
 func readNotify(tx *store.Tx) ([]pendingNotify, error) {
@@ -58,16 +84,16 @@ func addNotify(tx *store.Tx, n pendingNotify) error {
 		return err
 	}
 	for _, p := range list {
-		if p.Turn == n.Turn {
+		if p.id() == n.id() {
 			return nil
 		}
 	}
 	return writeNotify(tx, append(list, n))
 }
 
-// updateNotify applies fn to the entry of turn (removing it when fn
-// returns false).
-func (e *Engine) updateNotify(turn int64, fn func(*pendingNotify) bool) error {
+// updateNotify applies fn to the entry id (removing it when fn returns
+// false).
+func (e *Engine) updateNotify(id string, fn func(*pendingNotify) bool) error {
 	return e.update(func(tx *store.Tx) error {
 		list, err := readNotify(tx)
 		if err != nil {
@@ -75,7 +101,7 @@ func (e *Engine) updateNotify(turn int64, fn func(*pendingNotify) bool) error {
 		}
 		out := list[:0]
 		for _, p := range list {
-			if p.Turn == turn && !fn(&p) {
+			if p.id() == id && !fn(&p) {
 				continue
 			}
 			out = append(out, p)
@@ -138,7 +164,7 @@ func (e *Engine) pumpNotify(ctx context.Context) time.Time {
 			if err != nil {
 				return err
 			}
-			prefix := fmt.Sprintf("turn:%d:", n.Turn)
+			prefix := n.waitPrefix()
 			waiting := false
 			for _, r := range rows {
 				if strings.HasPrefix(r.DeliveryKey, prefix) {
@@ -203,21 +229,31 @@ func (e *Engine) sendCard(ctx context.Context, n pendingNotify) bool {
 	}
 	e.mu.Unlock()
 	if cs == nil {
-		_ = e.updateNotify(n.Turn, func(*pendingNotify) bool { return false })
+		_ = e.updateNotify(n.id(), func(*pendingNotify) bool { return false })
 		return true
 	}
-	if err := e.updateNotify(n.Turn, func(p *pendingNotify) bool { p.Attempted = true; return true }); err != nil {
+	ev, events := e.cfg.Notifier.(EventNotifier)
+	if n.Kind == notifyLocal && !events {
+		return false // no card for it: the owner is mentioned instead
+	}
+	if err := e.updateNotify(n.id(), func(p *pendingNotify) bool { p.Attempted = true; return true }); err != nil {
 		e.logf("notify %s: %v", label, err)
 		return true
 	}
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	err := e.cfg.Notifier.NotifyFinal(cctx, label, title, n.Text, url)
+	var err error
+	if n.Kind == notifyLocal {
+		err = ev.NotifyEvent(cctx, "💬 New local Codex chat detected: "+firstNonEmpty(title, label),
+			"Open this chat to watch the answer and continue from the full local context.", url)
+	} else {
+		err = e.cfg.Notifier.NotifyFinal(cctx, label, title, n.Text, url)
+	}
 	cancel()
 	if ctx.Err() != nil {
 		return true // the next start mentions the owner instead
 	}
 	if err == nil {
-		if err := e.updateNotify(n.Turn, func(*pendingNotify) bool { return false }); err != nil {
+		if err := e.updateNotify(n.id(), func(*pendingNotify) bool { return false }); err != nil {
 			e.logf("notify %s: %v", label, err)
 		}
 		return true
@@ -230,21 +266,33 @@ func (e *Engine) sendCard(ctx context.Context, n pendingNotify) bool {
 // and removes them from the pending list in the same transaction.
 func (e *Engine) sendMentions(set []pendingNotify) bool {
 	var (
-		turns []int64
-		convs []*convState
+		ids          []string
+		convs, local []*convState
 	)
 	e.mu.Lock()
 	for _, n := range set {
-		turns = append(turns, n.Turn)
+		ids = append(ids, n.id())
 		if cs := e.convs[n.Conv]; cs != nil {
-			convs = append(convs, cs)
+			if n.Kind == notifyLocal {
+				local = append(local, cs)
+			} else {
+				convs = append(convs, cs)
+			}
 		}
 	}
 	e.mu.Unlock()
 	var msgs []store.OutMsg
 	var err error
 	if len(convs) > 0 {
-		msgs, err = e.mentionNotice(turns, convs)
+		msgs, err = e.mentionNotice(ids, convs)
+	}
+	for _, cs := range local {
+		if err != nil {
+			break
+		}
+		var m []store.OutMsg
+		m, err = e.localMention(cs)
+		msgs = append(msgs, m...)
 	}
 	if err == nil {
 		err = e.update(func(tx *store.Tx) error {
@@ -257,13 +305,13 @@ func (e *Engine) sendMentions(set []pendingNotify) bool {
 			if err != nil {
 				return err
 			}
-			done := map[int64]bool{}
-			for _, t := range turns {
-				done[t] = true
+			done := map[string]bool{}
+			for _, id := range ids {
+				done[id] = true
 			}
 			out := list[:0]
 			for _, p := range list {
-				if !done[p.Turn] {
+				if !done[p.id()] {
 					out = append(out, p)
 				}
 			}

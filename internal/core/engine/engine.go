@@ -197,6 +197,12 @@ type Notifier interface {
 	NotifyFinal(ctx context.Context, conv, title, text, url string) error
 }
 
+// EventNotifier is a Notifier that also posts other owner events (a live
+// local session found on disk); without it they go to the control chat.
+type EventNotifier interface {
+	NotifyEvent(ctx context.Context, heading, text, url string) error
+}
+
 // Engine is a running core.
 type Engine struct {
 	cfg Config

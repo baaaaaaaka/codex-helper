@@ -49,6 +49,19 @@ func (w *WorkflowNotifier) NotifyFinal(ctx context.Context, conv, title, text, u
 	} else if conv != "" {
 		heading += ": " + conv
 	}
+	return w.post(ctx, heading, text, url)
+}
+
+// NotifyEvent posts a card with heading, text and an "Open chat" button
+// (v0.1.20's local_session_started card).
+func (w *WorkflowNotifier) NotifyEvent(ctx context.Context, heading, text, url string) error {
+	if !w.Available() {
+		return fmt.Errorf("teams: no workflow webhook configured")
+	}
+	return w.post(ctx, heading, text, url)
+}
+
+func (w *WorkflowNotifier) post(ctx context.Context, heading, text, url string) error {
 	body := []any{
 		map[string]any{"type": "TextBlock", "text": heading, "weight": "Bolder", "wrap": true},
 	}
