@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -38,14 +39,19 @@ func (e *Engine) receiverLoop(ctx context.Context) {
 		if until := e.gate(gateAccountRead); now.Before(until) {
 			continue
 		}
-		for _, id := range e.dueReads(now) {
+		due := e.dueReads(now)
+		for i, id := range due {
 			if ok, _ := e.readTokens.take(); !ok {
+				// Out of read budget: the rest wait for the next tick,
+				// still ordered by how long they are overdue.
 				e.mu.Lock()
-				if cs := e.convs[id]; cs != nil {
-					cs.reading = false
+				for _, rest := range due[i:] {
+					if cs := e.convs[rest]; cs != nil {
+						cs.reading = false
+					}
 				}
 				e.mu.Unlock()
-				continue
+				break
 			}
 			select {
 			case jobs <- id:
@@ -56,8 +62,10 @@ func (e *Engine) receiverLoop(ctx context.Context) {
 	}
 }
 
-// dueReads returns the conversations whose next read is due and marks them
-// as being read.
+// dueReads returns the conversations whose next read is due, most overdue
+// first, and marks them as being read. The order matters when the account
+// read budget is short: a chat polled often (the control chat) must not
+// starve one that has waited longer.
 func (e *Engine) dueReads(now time.Time) []int64 {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -75,6 +83,13 @@ func (e *Engine) dueReads(now time.Time) []int64 {
 		cs.reading = true
 		due = append(due, id)
 	}
+	sort.Slice(due, func(i, j int) bool {
+		a, b := e.convs[due[i]], e.convs[due[j]]
+		if !a.nextRead.Equal(b.nextRead) {
+			return a.nextRead.Before(b.nextRead)
+		}
+		return due[i] < due[j]
+	})
 	return due
 }
 
