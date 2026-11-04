@@ -62,30 +62,6 @@ WHERE id IN (SELECT (SELECT p.id FROM outbox p WHERE p.conv_id = h.conv_id AND p
 ORDER BY conv_id`, now))
 }
 
-// QueuedKinds returns, per conversation, the distinct kinds of its queued
-// outbox rows. The sender ranks a conversation's head by the most urgent
-// kind queued behind it (priority inheritance; the order within the
-// conversation stays FIFO).
-func (t *Tx) QueuedKinds() (map[int64][]string, error) {
-	// The first term matches the outbox_pending partial index.
-	rows, err := t.rows(`SELECT DISTINCT conv_id, kind FROM outbox
-WHERE state IN ('queued','sending','unknown') AND state = 'queued' ORDER BY conv_id, kind`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := map[int64][]string{}
-	for rows.Next() {
-		var conv int64
-		var kind string
-		if err := rows.Scan(&conv, &kind); err != nil {
-			return nil, err
-		}
-		out[conv] = append(out[conv], kind)
-	}
-	return out, rows.Err()
-}
-
 // Outbox reads one outbox row.
 func (t *Tx) Outbox(id int64) (Outbox, bool, error) {
 	return one(t.row(`SELECT `+outboxCols+` FROM outbox WHERE id = ?`, id), scanOutbox)
