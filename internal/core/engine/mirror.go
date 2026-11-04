@@ -721,7 +721,7 @@ func (e *Engine) mirrorPoll(ctx context.Context) {
 		if err != nil {
 			continue // removed or unreadable; keep the row
 		}
-		if info == f.info && f.tracker.Offset() >= info.Size {
+		if sameFile(info, f.info) && f.tracker.Offset() >= info.Size {
 			continue
 		}
 		if now.Before(f.retryAt) {
@@ -732,6 +732,14 @@ func (e *Engine) mirrorPoll(ctx context.Context) {
 			f.nextStat = now.Add(e.t.MirrorStat) // more to read: next tick
 		}
 	}
+}
+
+// sameFile reports whether two stats of a rollout show the same file. The
+// store keeps the mtime in milliseconds (W1c): a file restored at start-up
+// compares equal to its nanosecond stat, so an unchanged rollout is not
+// read again, with its own transaction, on every helper start.
+func sameFile(a, b transcript.FileInfo) bool {
+	return a.Size == b.Size && a.Inode == b.Inode && ms(a.MTime) == ms(b.MTime)
 }
 
 // mirrorStatEvery is the stat period of a tracked rollout last modified at

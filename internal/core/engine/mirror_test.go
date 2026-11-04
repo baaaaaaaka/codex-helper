@@ -553,3 +553,42 @@ func TestSessionFrom200DaysAgoIsDiscoveredAndCaughtUp(t *testing.T) {
 		return len(r.own(chat, "a prompt from 200 days ago")) == 1 && len(r.own(chat, "an answer from 200 days ago")) == 1
 	})
 }
+
+// W1c: the store keeps a rollout's mtime in milliseconds. A tracked rollout
+// restored at start-up, unchanged since, must compare equal to its
+// nanosecond stat and not be read again: before the fix every tracked
+// rollout was read, and committed its own transaction, on each start.
+// mirrorRead drops the file of a closed conversation, which shows here
+// whether it was called.
+func TestRestoredRolloutWithMillisecondMTimeIsNotReadAgain(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	e := &Engine{t: ProductionTiming(), now: func() time.Time { return now }, log: io.Discard, convs: map[int64]*convState{}}
+	e.mirror = &mirrorState{files: map[string]*mirrorFile{}, known: map[string]string{}}
+	e.convs[1] = &convState{kind: store.KindWork, state: store.ConvClosed}
+	mtime := now.Add(-time.Hour).Add(123_456_789 * time.Nanosecond) // sub-millisecond part
+	stat := transcript.FileInfo{Size: 100, MTime: mtime, Inode: 7}
+	stats := 0
+	e.statFile = func(string) (transcript.FileInfo, error) { stats++; return stat, nil }
+	path := filepath.Join(t.TempDir(), "rollout.jsonl")
+	restore := func() {
+		e.mirror.files[path] = &mirrorFile{src: store.TranscriptSource{Path: path, ConvID: 1, Size: 100, MTime: ms(mtime), Inode: 7},
+			tracker: transcript.NewTracker("t", 100, 1, nil),
+			info:    transcript.FileInfo{Size: 100, MTime: fromMS(ms(mtime)), Inode: 7}} // as mirrorInit restores it
+	}
+	restore()
+	e.mirrorPoll(context.Background())
+	if stats != 1 {
+		t.Fatalf("stat'ed %d times, want 1", stats)
+	}
+	if _, ok := e.mirror.files[path]; !ok {
+		t.Fatalf("an unchanged restored rollout was read again")
+	}
+
+	// A real change (a later mtime, same size) is still read.
+	stat.MTime = mtime.Add(time.Second)
+	restore()
+	e.mirrorPoll(context.Background())
+	if _, ok := e.mirror.files[path]; ok {
+		t.Fatalf("a rollout with a newer mtime was not read")
+	}
+}
