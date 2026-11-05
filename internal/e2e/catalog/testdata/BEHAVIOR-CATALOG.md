@@ -35,30 +35,30 @@ Size: S < 100 LOC, M 100–400, L > 400 (product code, excluding tests).
 | 5 | (parser) F-TRN-7/F-TRN-8/F-CTL-9 | P1 | C | M | Work chats accept only `helper …`: bare `model`, `effort`, `help`, `default` and `!status` / `/x` / `cx x` go to Codex as prompts (the ready text even advertises `!status`) | `dashboard_commands.go` `workBareCommandName` :221, `splitDashboardCommand` :603, short names :571 | — |
 | 6 | F-WRK-4 | P1 | C | S | `helper close` missing although the work-chat ready text (`control.go:341`) advertises it | B:8007 "Session closed. The helper will no longer read or respond in this Teams chat.\n\nThis chat remains visible in Teams. Use the 🏠 control chat to open or create another work chat." | C |
 | 7 | F-TRN-14 | P1 | F | M | Codex receives the raw text: no User-message section, no Teams safety block (do not restart/kill the helper…), no outbound-root/manifest instructions, no math contract | `artifact_handoff.go:28` `TeamsCodexPrompt`, :184 `teamsUserMessagePrompt` | — |
-| 8 | F-RND-4 / R-8 | P1 | D | M | No user marker: the engine never calls the adapter's `Edit` (PATCH) | `annotateIncomingUserMessage` B:4081/:4109 | — |
+| 8 | F-RND-4 / R-8 | P1 | D | M | DONE (batch D, EDIT-LABEL). No user marker: the engine never calls the adapter's `Edit` (PATCH) | `annotateIncomingUserMessage` B:4081/:4109 | — |
 | 9 | F-RND-9 | P1 | F | M | Quoted/replied messages are parsed (`channel/teams/receive.go:271`, `quoteFrom` :329) but never reach Codex | v0.1.20 quote context in `artifact_handoff.go` user prompt (inline ≤2000 runes, else file) | — |
 | 10 | F-TRN-7 | P1 | B | M | `model` lacks `switch/use`, `fork <m>`, bare `model`; control-chat model is list-only | `model_profile_commands.go:15` (control), :125 (work); "Model profile switched for this Control chat…", "Forked Work chat %s with model profile %s:\n<url>" | C |
 | 11 | F-TRN-8 | P1 | B | S | `effort` lacks `status/list/reset` and bare `effort`/`efforts`; no control-chat effort | `reasoning_effort_commands.go:20/:32`; "Current chat effort (…)", "Reasoning effort updated for this … chat…" | C |
 | 12 | F-CTL-15 | P1 | B | M | `default status/model/effort …` missing (owner reaches global defaults only from a terminal) | `default_commands.go:35`, texts in `internal/cli/teams_defaults.go:45`; work chat: "`default` changes global settings and can only be used in the Control chat. Use `model` or `effort` to change only this Work chat." | C |
-| 13 | F-WRK-2 | P1 | D | M | Work-chat titles never update from the first prompt / Codex title (stay "s001 · <dir>"); no `helper rename` | `maybeUpdateWorkChatTitleFromLocalSession` B:10749 (gate B:10804), `renameSessionChat` B:10349 "Work chat renamed.\n\nNew title:\n…" | — |
+| 13 | F-WRK-2 | P1 | D | M | DONE (batch D, EDIT-TITLE). Work-chat titles never update from the first prompt / Codex title (stay "s001 · <dir>"); no `helper rename` | `maybeUpdateWorkChatTitleFromLocalSession` B:10749 (gate B:10804), `renameSessionChat` B:10349 "Work chat renamed.\n\nNew title:\n…" | — |
 | 14 | F-CTL-4 | P2 | A | S | `new` rejects missing and relative dirs (v0.1.20 creates 0700, resolves relative/`~`), no bare `new` in the opened workspace, no `--model` | `createWorkspaceDirectory`/new in B (help B:5150 "create the directory if missing") | A-dashboard for bare `new` |
 | 15 | F-CTL-7 | P2 | A | S | No `mkdir/m` and no path-hint reply for path-like text | B:7830 "Directory is ready: <dir>\n\nNext: send `new <dir>`…"; B:7358 "📁 Detected path: `%s`…" | C |
 | 16 | F-TRN-3 | P2 | E | S | `helper cancel <turn-id>` missing; replies do not name the cancelled prompt; no control-chat cancel (needs Q&A) | `cancelTurnCommandForScope` B:9490; usage "usage: `helper cancel last`, …, or `helper cancel <turn-id>`…" | C |
 | 17 | F-TRN-4 | P2 | E | M | `helper retry` only for duplicate-ignored / Codex-too-old turns; no `retry last` for failed or interrupted turns, no `<turn-id>`; interruption text says "resend it" | `retryTurnCommand` B:8236; "no failed or interrupted turn is available to retry in this session." etc. | C |
-| 18 | F-WRK-5 / R-22 | P2 | D | S | Auto-park after 48 h (`maint.go:191`) is silent: no freeze notice, so the owner does not know the chat stopped listening | freeze notice (PATCH latest message) per SPEC F-WRK-5; text must say messages are read after the wake (owner 11-05 Q6) | D-edit |
-| 19 | F-RND-11 | P2 | D | S | ASR transcript is not PATCHed under the voice card; voice in control chat (Q&A) unsupported | `asr_input.go` (PATCH under card) | D-edit, B for control |
+| 18 | F-WRK-5 / R-22 | P2 | D | S | DONE (batch D, EDIT-FREEZE). Auto-park after 48 h (`maint.go:191`) is silent: no freeze notice, so the owner does not know the chat stopped listening | freeze notice (PATCH latest message) per SPEC F-WRK-5; text must say messages are read after the wake (owner 11-05 Q6) | D-edit |
+| 19 | F-RND-11 | P2 | D | S | PARTIAL (batch D: transcript PATCH done, EDIT-VOICE; control-chat voice waits for B). ASR transcript is not PATCHed under the voice card; voice in control chat (Q&A) unsupported | `asr_input.go` (PATCH under card) | D-edit, B for control |
 | 20 | F-WRK-10 / F-CTL-13 / R-41 | P2 | E | M | Fork child does not receive the parent history (starts at the current position), fork is refused while a turn runs, texts differ ("⏳ Fork requested…") | SPEC F-WRK-10 steps 1-5; v0.1.20 0.1.21-rc.6 `1a210e6` | A-import |
 | 21 | F-STA-1 / R-42 | P2 | H | L | Stats are store meta counters, not computed from rollouts: no reset reconstruction, no model/tier sections, no subagents, cache hit or `unknown` bucket | `token_stats.go:1013/:1083` "STATS: Codex tokens…" | — |
 | 22 | F-MIR-6 | P2 | A | M | `helper publish-history [full]` / `ph` missing (and the CLI form) | B:8051, B:16039, B:16083 "Usage: `helper publish-history` imports the pending backlog…" | A-import |
 | 23 | F-RND-10 | P2 | E | S | `helper file <rel-path>` / `!file` missing (manifest upload works) | `sendFileCommand` B:9748 "usage: `helper file <relative-path>` or `!file <relative-path>`\nOutbound root: <root>" | C |
-| 24 | F-CTL-8 | P2 | D | M | `rename <title>` and `rename hostname <name>` missing | `renameControlChat` B:10683, `renameMachineHostname` B:10507 | D-rename |
+| 24 | F-CTL-8 | P2 | D | M | DONE (batch D, EDIT-RENAME). `rename <title>` and `rename hostname <name>` missing | `renameControlChat` B:10683, `renameMachineHostname` B:10507 | D-rename |
 | 25 | F-CTL-9 | P2 | C | S | Only a short help; no `help advanced`; texts differ from v0.1.20 | help B:5123, advanced B:5150, work B:5216/:5241 | — |
 | 26 | F-CTL-16 | P2 | C | S | Control attachments not rejected with a text; no "⚠️ Wrong chat" for work-only `helper …`; quotes ignored everywhere | `text.go:113/:121`, `isWorkOnlyHelperCommand` B:7330 | — |
 | 27 | F-WRK-12 | P2 | C | S | Bare `@codex` with no text gets no reply | B:2031 "Mention received, but there is no Codex request text. Add the task after `@codex`." | — |
 | 28 | F-WRK-13 / R-27 | P2 | C | S | Coworker `helper …` commands are ignored silently (no rejection), coworker ACK text differs | `rejectExternalWorkCommand` B:8218 "Only the helper owner can run helper commands in this Work chat. Send a normal question or task here and I will pass it to Codex."; coworker ACK "⏳ Codex received your question. Request accepted." | — |
 | 29 | F-CTL-11 / R-18 | P2 | E | S | `helper restart` restarts at once when idle (no confirmation step), `restart now` interrupts running work instead of waiting, no `restart force` | help B:5150 "`helper restart` - show the safe restart confirmation", "`helper restart now` - restart … after sending a confirmation" | — |
 | 30 | F-TRN-18 | P2 | E | S | `StallLimit` 1 h (`silence.go:52/:78`) kills a silent turn; SPEC and v0.1.20 never kill ("I will not retry automatically. To stop the running request, send `helper cancel running`") — needs owner confirmation | B:92-99, `sendIdleStatus` B:12037 | — |
-| 31 | F-TRN-1 | P2 | D | S | Final answers do not mark the chat unread (adapter has `MarkUnread`, engine never calls it) | SPEC F-TRN-1 step 4 | — |
+| 31 | F-TRN-1 | P2 | D | S | DONE (batch D, EDIT-UNREAD). Final answers do not mark the chat unread (adapter has `MarkUnread`, engine never calls it) | SPEC F-TRN-1 step 4 | — |
 | 32 | F-TRN-16 | P2 | E | S | Not-started turns get a generic text; no "⚠️ I couldn't start Codex due to a setup issue on my side…" with the class (Node missing, auth…) | SPEC F-TRN-16 | — |
 | 33 | F-CTL-14 | P2 | B | M | `helper webhook setup/<url>/test/status/off` from chat missing (CLI `teams workflow` exists) | `workflowWebhookFromControl` B:5529 | C |
 | 34 | F-CTL-17 | P2 | B | S | Skills `push` (review + `push confirm`) refused in Teams, points to local CLI | `helper skills push` / `push confirm` (help B:5216) | — |
@@ -72,7 +72,7 @@ Size: S < 100 LOC, M 100–400, L > 400 (product code, excluding tests).
 | 42 | F-CLI-10 / F-CLI-3 | P3 | G | S | `teams run --once` and `--interval` missing | SPEC F-CLI-3/F-CLI-10 | — |
 | 43 | F-CLI-1 / R-17 | P3 | G | S | `teams status` lacks installed-vs-running (pending) version and last poll | SPEC F-CLI-1 | — |
 | 44 | F-XM-1 | P3 | G | S | Service is not pinned to its install host (`store.Ident.InstallHost` never set by the CLI) — owner 定稿 共用 home | — | — |
-| 45 | F-CTL-1 | P3 | D | S | Control chat title lacks 🏠 and the user-title segment | `ControlChatTitle` (🏠 Codex Control - <machine>…) | D-rename |
+| 45 | F-CTL-1 | P3 | D | S | DONE (batch D, EDIT-RENAME). Control chat title lacks 🏠 and the user-title segment | `ControlChatTitle` (🏠 Codex Control - <machine>…) | D-rename |
 | 46 | R-26 | P3 | F | S | No raw-API-key rejection in chat found in the core (v0.1.20 rejects them first in `handleControlMessage` B:4613) | B:4613 | — |
 | 47 | F-SET-2 | P3 | G | S | No fail-closed gate for scopes broader than the defaults | SPEC F-SET-2 | — |
 
@@ -111,14 +111,14 @@ Columns: id · status (`keep` / `removed-by-owner` / `ask-owner`, with the owner
 | F-SET-4 | keep | cli/teams.go:76 `teams setup` | NONE | same |
 | F-SET-5 | keep | cli/teams_service.go:134 bootstrap, BOOTSTRAP COMPLETE :836 | NONE | same flags |
 | F-SET-6 | keep | cli/teams_graph_proxy.go:115 (proxy warning) | NONE | same |
-| F-CTL-1 | keep | PARTIAL: core/engine/control.go:18 `ensureControl`, :97 `controlTitle` = "Codex Control - <machine>"; no 🏠, no user-title segment | R-1-2-3 | v0.1.20 "🏠 Codex Control - <machine>[ - profile][ - user title]" |
+| F-CTL-1 | keep | core/engine/control.go:18 `ensureControl` creates the chat with core/engine/rename.go:105 `controlTitle` = "🏠 Codex Control - <machine>[ - user title]" (:110 `controlTitleFor`; user title from meta, kept over restarts and recreation); no profile segment (the core has no Teams profile) | R-1-2-3, EDIT-RENAME | v0.1.20 "🏠 Codex Control - <machine>[ - profile][ - user title]" |
 | F-CTL-2 | keep | MISSING: cli/teams.go:311 `teams control` only prints; no `--recreate --yes`, no "moved" link in the old chat | NONE | v0.1.20 `control --recreate` |
 | F-CTL-3 | keep | MISSING: no `p/projects/w/workspace/s/sessions/history`, no bare-number selection (commands.go:227 knows `s/sessions/history` only as an alias of `list`) | NONE | B:19702, B:19840, B:20304, dashboard.go:17 |
 | F-CTL-4 | keep | PARTIAL: commands.go:328 `cmdNew`, :370 `checkDir` rejects missing/relative dirs; no create-0700, no bare `new`, no `--model`; title "s001 · name" (:363) | R-1-2-3, CMD-FORK | v0.1.20 creates the dir, title "💬 <machine> - New message in <ws>" |
 | F-CTL-5 | keep | MISSING: no `continue/c/publish/import` | NONE | B:15710 / B:15741 |
 | F-CTL-6 | keep | PARTIAL: `st/status` (commands.go:703 `statusText`) prints helper status, `list` (:675) lists sessions; `open/o`, `details/d` MISSING; no "## Active Work chats" list | NONE | B:20036, B:15573, B:15242 |
 | F-CTL-7 | keep | MISSING: no `mkdir/m`, no path hint | NONE | B:7830, B:7343/B:7358 |
-| F-CTL-8 | keep | MISSING: no `rename <title>`, no `rename hostname <name>` (engine never calls RenameChat) | NONE | B:10683, B:10507 |
+| F-CTL-8 | keep | core/engine/commands.go:254 → core/engine/rename.go:301 `cmdRename`: :338 `renameControl` (`rename <title>`, stored in meta so a recreated control chat keeps it), :375 `cmdRenameHostname` (control + every open work chat, :511 `stripMachinePrefix` against all old labels so prefixes never nest, user titles kept, partial failures listed as in v0.1.20); every rename goes through :264 `renameChat` → `waitWrite` (account write pacer) | EDIT-RENAME | B:10683, B:10507 |
 | F-CTL-9 | keep | PARTIAL: commands.go:194 `controlHelp` (short only); no `help advanced`; texts differ | R-1-2-3 | B:5123, B:5150 |
 | F-CTL-10 | keep | MISSING: every control message is a command (receive.go ~:720); default "Unknown command. Send `help` for the list of commands." (commands.go:227); no `ask/q` | NONE | B:4901, B:7488, artifact_handoff.go:74 |
 | F-CTL-11 | keep (owner: `helper reload` removed, 第一级 4 / 定稿) | PARTIAL: commands.go:570 `cmdRestart`, :767 `confirmRestart`; upgrade.go:491 `cmdHelperUpdate`; idle `restart` has no confirmation step, `now` interrupts instead of waiting, no `force` | RESTART, CODEX-UPGRADE | v0.1.20: `restart` = confirmation prompt, `now` waits, `force` interrupts |
@@ -130,10 +130,10 @@ Columns: id · status (`keep` / `removed-by-owner` / `ask-owner`, with the owner
 | F-CTL-17 | keep (owner: DECISIONS 第一级 4 "这个保留，是常用功能"; 定稿 skills 保留) | PARTIAL: commands_ext.go:367 `cmdSkills` → core/skillcmd/skillcmd.go:36 list/add/sync; `push`/`remove` refused with a pointer to the local CLI (SPEC: push reviews in Teams) | CMD-SKILLS | v0.1.20 `skills push` / `push confirm` in Teams |
 | F-CTL-18 | removed-by-owner (beacon; SPEC + 定稿) | n/a | n/a | — |
 | F-WRK-1 | keep | core/engine (one conv = sNNN, one thread, cwd); thread bound before `turn/start` (runner.go) | R-1-2-3, B-5 | labels sNNN kept |
-| F-WRK-2 | keep | MISSING: no title auto-update, no `helper rename` (engine never calls RenameChat) | NONE | B:10749, B:10804, B:10349 |
+| F-WRK-2 | keep | core/engine/rename.go:746 `afterAnswers` (once the live answer's owner notification has gone out, :719 `notified`) → :530 `queueAutoTitle` → :595 `autoTitle`: Codex thread name (`session_index.jsonl`, :665) > first owner prompt > rollout first prompt (:172 `promptTitle`), gate :577 `autoAllowed` (= v0.1.20 `sessionAllowsAutoTitleUpdate`); the chat's next notification waits for it (:557 `retitling`, core/engine/notify.go:171) so it names the chat as the owner sees it; `helper rename <title>` core/engine/commands.go:305 → rename.go:301 (title source `user`, stops auto titles); catch-up never retitles | EDIT-TITLE, EDIT-RENAME | B:10749, B:10804, B:10349 |
 | F-WRK-3 | keep | PARTIAL: control.go:329 `textWorkChatReady` (new/fork), :314 `textLocalDetected`; ready text advertises non-existent `!status` / `helper close`; no import intro | R-1-2-3 | B:7841, B:7867 |
 | F-WRK-4 | keep | MISSING: no `helper close` (commands.go:282 `workCommand`) | NONE | B:8007 |
-| F-WRK-5 | keep | PARTIAL: maint.go:191 `parkIdle` after 48 h (engine.go:33 ParkAfter); no freeze notice at all | NONE | freeze notice PATCHed onto the latest message |
+| F-WRK-5 | keep | core/engine/maint.go:191 `parkIdle` after 48 h records the owed notice in the park transaction (:226 → core/engine/annotations.go:106 `owesFreeze`, meta `engine_freeze:<conv>`) and queues it (:149 `queueFreeze` → :159 `freeze`): PATCHed onto the chat's newest helper post or admitted owner message, else posted; once per park, resumed after a restart (:112 `resumeFreezes`); text :130 `freezeText` says messages are read once the chat wakes | EDIT-FREEZE | freeze notice PATCHed onto the latest message |
 | F-WRK-6 | keep | commands.go:648 `cmdWake`; local rollout wake engine.go:44 `MirrorParkedStat`, mirror.go:790 (open/select/continue wake paths absent with F-CTL-3/5/6) | PARK, PARK-CTL | same `r <id>` |
 | F-WRK-7 | keep | commands.go:550 `cmdPark` | PARK, PARK-CTL | same |
 | F-WRK-8 | keep (owner: 定稿 parked chat — no Graph poll; local rollout update wakes it; messages sent while parked are seen after the wake) | engine.go:44 `MirrorParkedStat`, mirror.go:790 | PARK | v0.1.20 polled parked chats (superseded) |
@@ -144,7 +144,7 @@ Columns: id · status (`keep` / `removed-by-owner` / `ask-owner`, with the owner
 | F-WRK-13 | keep | PARTIAL: coworker prompts run; coworker `helper …` silently ignored (no rejection text); coworker ACK text differs | NONE | B:8218, coworker ACK "⏳ Codex received your question. Request accepted." |
 | F-WRK-14 | keep (owner: 第二级 3 breaker, 第一级 8 `helper unpause`, 定稿) | receive.go:1028 breaker notice; commands.go:519 `cmdUnpause` | BREAKER | SPEC quarantine replaced by the breaker |
 | F-WRK-15 | removed-by-owner (beacon) | n/a | n/a | — |
-| F-TRN-1 | keep | PARTIAL: receive.go:443 `admit`, runner.go:515 `finish`; chat not marked unread (engine never calls MarkUnread) | R-1-2-3 | v0.1.20 marked unread |
+| F-TRN-1 | keep | core/engine/sender.go:441 → rename.go:697 `noteFinalSent` records the answer post's createdDateTime; :746 `afterAnswers` queues `MarkUnread(chat, created − 1 ms)` once per answer (:769) after its owner notification; catch-up answers have no notification, so they are not marked | R-1-2-3, EDIT-UNREAD | v0.1.20 marked unread |
 | F-TRN-2 | keep (owner: 11-05 第二批 排队确认措辞 "⏳ Queued") | silence.go:189 `textQueuedAck` (owner-ux `187b8ca4`), runner.go:260 start notice, silence.go:108 `remindQueued` | R-6 | text deliberately differs (owner) |
 | F-TRN-3 | keep | PARTIAL: commands.go:416 `cmdCancel` last/queued/running/all; no `<turn-id>`; reply does not name the prompt; no control-chat cancel | R-20-33, SILENCE | B:9490 |
 | F-TRN-4 | keep | PARTIAL: commands.go:483 `cmdRetry` only for duplicate-ignored and Codex-too-old turns; no `last` for failed/interrupted, no `<turn-id>` | DUP, CODEX-UPGRADE | B:8236 |
@@ -176,14 +176,14 @@ Columns: id · status (`keep` / `removed-by-owner` / `ask-owner`, with the owner
 | F-RND-1 | keep | channel/teams/render.go:37 (ported v0.1.20 markdown, 11-05) | R-36 | same |
 | F-RND-2 | keep | channel/teams/render.go labels | R-1-2-3 | v0.1.20 labels restored 11-05 |
 | F-RND-3 | keep | channel/teams/render.go:57-76 | R-36 | same |
-| F-RND-4 | keep | MISSING: engine never calls `Edit`; no user marker | NONE | B:4081/:4109 |
+| F-RND-4 | keep | core/engine/receive.go:570 → core/engine/annotations.go:35 `labelAdmitted` (live admitted owner commands and prompts only; catch-up stays silent) → edit queue core/engine/edits.go:51 `queueEdit` / :103 `runEdit` (account write pacer, read pacer for the GET; :174 `flushEdits` makes the pending ones at a graceful stop or restart, engine.go:516) → channel/teams/annotate.go:50 `Annotate` (:208 `labelEdit`: GET, refuse when the PATCH could lose hosted images/cards or the author is not the account, idempotent) | EDIT-LABEL | B:4081/:4109 |
 | F-RND-5 | keep (owner: 第二级 7 / 定稿 every final; 11-05 silent catch-up) | core/engine/notify.go:126, runner.go:756 `finalMention` | NOTIFY-BURST, NOTIFY-WH, NOTIFY-NOWH, NOTIFY-WH500, NOTIFY-WHDOWN, WORKFLOW-LIVE | owner redefined |
 | F-RND-6 | keep | channel/teams/workflow.go:28 | NOTIFY-WH, NOTIFY-NOWH, NOTIFY-WH500, NOTIFY-WHDOWN, WORKFLOW-LIVE | same |
 | F-RND-7 | keep (owner: 第一级 7 / 定稿 faithful + code-block fallback) | channel/teams/math.go, mathfont.go | FORMULA | same |
 | F-RND-8 | keep | PARTIAL: channel/teams/receive.go:275 `inboundFiles`, engine files.go; 16-attachment total limit (:228), not 5/5/3 | R-37 | SPEC limits |
 | F-RND-9 | keep | MISSING: quotes parsed (channel/teams/receive.go:271, :329) but dropped by the core | NONE | quote context in the prompt |
 | F-RND-10 | keep | PARTIAL: manifest upload core/engine/outbound.go:201; `helper file` and `cxp teams send-file` missing; Codex is not told the outbound root (F-TRN-14) | R-37-out | B:9748 |
-| F-RND-11 | keep (owner: 决定-4, 第一级 6, 定稿 ASR) | PARTIAL: core/engine/files.go:185-215 transcribe → prompt; no transcript PATCH, no control-chat voice | VOICE | asr_input.go |
+| F-RND-11 | keep (owner: 决定-4, 第一级 6, 定稿 ASR) | PARTIAL: core/engine/files.go:177-230 `fetchOne` transcribes → prompt; transcript PATCHed under the voice clip by core/engine/files.go:156 → annotations.go:66 `labelVoice` → channel/teams/annotate.go:229 `transcriptEdit` (failed clips are not edited); control-chat voice missing (needs batch B control Q&A) | VOICE, EDIT-VOICE | asr_input.go |
 | F-STA-1 | keep | PARTIAL: commands_ext.go:101 `cmdStats` from meta counters; not rollout-based | CMD-STATS | token_stats.go:1013/:1083 |
 | F-XM-1 | keep (owner: 定稿 共用 home — standby + takeover, no priority classes, pinned to install host) | PARTIAL: core/lease/acquire.go:185; install-host pin missing (`store.Ident.InstallHost` never set) | KILL-SWITCH, SERVICE-STANDBY, STANDBY-LOCKED, STANDBY-TAKEOVER, TAKEOVER-BATCH, TAKEOVER-CRASH-MID, TAKEOVER-KILLED, TAKEOVER-LEFTOVER, TAKEOVER-SAME-HOST, TAKEOVER-SIMULTANEOUS, TAKEOVER-THAW-EARLY | rc.59 lease lessons |
 | F-XM-2 | keep (owner: 决定-3) | core/engine/registry.go:37, core/delegate/registry.go:67 | DELEG-RT, INBOX | same |
@@ -218,7 +218,7 @@ Columns: id · status (`keep` / `removed-by-owner` / `ask-owner`, with the owner
 | R-5 | keep | runner.go:912 `reconcile`; outbox read-back | R-5, R-5a-crash, R-5b, R-4-29, B-5, ACTIVE-WRITER, ACTIVE-WRITER-RESUME, DELEG-RESTART | — |
 | R-6 | keep | per-chat outbox order; global invariant chat-order | R-6, R-36, R-4-paging | — |
 | R-7 | keep | outbox marker identity | R-7, R-5a-crash, BREAKER | — |
-| R-8 | keep | MISSING: no user marker (F-RND-4); COVERAGE "unit" cites outbox-marker tests | NONE | — |
+| R-8 | keep | core/engine/annotations.go:35 `labelAdmitted` + channel/teams/annotate.go:50 `Annotate` (F-RND-4): one lossless PATCH per message, never a helper post, never during catch-up | EDIT-LABEL | — |
 | R-9 | keep | mirror.go | R-9-10, NO-WINDOW | window removed by owner |
 | R-10 | keep | mirror.go | R-9-10 | — |
 | R-11 | keep | per-chat isolation | R-11, BREAKER, PARK | — |
@@ -232,7 +232,7 @@ Columns: id · status (`keep` / `removed-by-owner` / `ask-owner`, with the owner
 | R-19 | keep | PARTIAL: silence.go hints 7/15 min; setup-error class missing (F-TRN-16) | SILENCE | — |
 | R-20 | keep | PARTIAL: no cancel `<turn-id>` (F-TRN-3) | R-20-33, SILENCE | — |
 | R-21 | keep | per-chat runners; control never queued | R-11 | — |
-| R-22 | keep | PARTIAL: no freeze notice (so no PATCH-once); other notices once | BREAKER, DUP, IDLE, SILENCE, VOICE, WAKE-SYNTAX | — |
+| R-22 | keep | freeze notice once per park (core/engine/annotations.go:106 meta marker, :159 `freeze` with `Present` check in channel/teams/annotate.go:285 `noticeEdit`); other notices once | BREAKER, DUP, IDLE, SILENCE, VOICE, WAKE-SYNTAX, EDIT-FREEZE | — |
 | R-23 | keep | PARTIAL: no `<oai-mem-citation>` stripping (F-MIR-8); no prompt envelope exists to leak (F-TRN-14) | NONE | — |
 | R-24 | keep | cli/teams_user_path.go, teams_child_guard.go | NONE | — |
 | R-25 | keep | cli/teams_child_guard.go:14 | NONE | — |

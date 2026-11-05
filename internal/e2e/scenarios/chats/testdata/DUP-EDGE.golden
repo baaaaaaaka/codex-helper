@@ -1,12 +1,16 @@
 # DUP-EDGE: duplicate guard: repeat after the window runs; repeat of a failed prompt runs; same caption with a different image runs; other chat runs; plain repeat is ignored
 # cxp black-box transcript; volatile values are numbered placeholders
 
-== chat <chat:1> "Codex Control - e2ehost"
+== chat <chat:1> "🏠 Codex Control - e2ehost"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
 -- <msg:2> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>new <root>/work/dupedge</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>new <root>/work/dupedge</p>
 -- <msg:3> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -15,6 +19,10 @@
    | <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
    | <p>If Teams does not show it right away, search for: s001</p>
 -- <msg:4> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>new <root>/work/dupother</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>new <root>/work/dupother</p>
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -41,15 +49,14 @@
 -- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>✅ Codex finished</strong></p>
-   | <p><strong>Chat:</strong> s001 · dupedge<br>
-   | <strong>Request:</strong> Plain repeat E2E-DUPEDGE-plain-2</p>
+   | <p><strong>Chat:</strong> 💬 e2ehost - Plain repeat E2E-DUPEDGE-plain-2</p>
    | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
    | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
    mention 0: owner "E2E Owner"
 -- <msg:9> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>✅ Codex finished</strong></p>
-   | <p><strong>Chat:</strong> s001 · dupedge<br>
+   | <p><strong>Chat:</strong> 💬 e2ehost - Plain repeat E2E-DUPEDGE-plain-2<br>
    | <strong>Request:</strong> This one fails first E2E-DUPEDGE-fails-1</p>
    | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
    | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
@@ -57,7 +64,7 @@
 -- <msg:10> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>✅ Codex finished</strong></p>
-   | <p><strong>Chat:</strong> s001 · dupedge<br>
+   | <p><strong>Chat:</strong> 💬 e2ehost - Plain repeat E2E-DUPEDGE-plain-2<br>
    | <strong>Request:</strong> Look at this E2E-DUPEDGE-image-3</p>
    | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
    | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
@@ -65,13 +72,13 @@
 -- <msg:11> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>✅ Codex finished</strong></p>
-   | <p><strong>Chat:</strong> s001 · dupedge<br>
+   | <p><strong>Chat:</strong> 💬 e2ehost - Plain repeat E2E-DUPEDGE-plain-2<br>
    | <strong>Request:</strong> Look at this E2E-DUPEDGE-image-3</p>
    | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
    | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
    mention 0: owner "E2E Owner"
 
-== chat <chat:2> "s001 · dupedge"
+== chat <chat:2> "💬 e2ehost - Plain repeat E2E-DUPEDGE-plain-2"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -88,6 +95,10 @@
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
    | Need more details? Send <code>helper status</code>.</p>
 -- <msg:3> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Plain repeat E2E-DUPEDGE-plain-2</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>Plain repeat E2E-DUPEDGE-plain-2</p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -97,11 +108,19 @@
    | <p>E2EANSWER-<n> answer for E2E-DUPEDGE-plain-2</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:6> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Plain repeat E2E-DUPEDGE-plain-2</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>Plain repeat E2E-DUPEDGE-plain-2</p>
 -- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Duplicate request ignored (same text within 3 minutes). Send <code>helper retry</code> to run it again.</p>
 -- <msg:8> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Plain repeat E2E-DUPEDGE-plain-2</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>Plain repeat E2E-DUPEDGE-plain-2</p>
 -- <msg:9> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -111,6 +130,10 @@
    | <p>E2EANSWER-<n> answer for E2E-DUPEDGE-plain-2</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:11> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>This one fails first E2E-DUPEDGE-fails-1</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>This one fails first E2E-DUPEDGE-fails-1</p>
 -- <msg:12> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -120,6 +143,10 @@
    | <p>Codex reported an error and the request did not finish: scripted failure</p>
    | <p>It was not re-run; resend it if you still need it.</p>
 -- <msg:14> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>This one fails first E2E-DUPEDGE-fails-1</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>This one fails first E2E-DUPEDGE-fails-1</p>
 -- <msg:15> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -151,7 +178,7 @@
    | <p>E2EANSWER-<n> answer for E2E-DUPEDGE-image-3</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
-== chat <chat:3> "s002 · dupother"
+== chat <chat:3> "💬 e2ehost - Plain repeat E2E-DUPEDGE-plain-2"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -168,6 +195,10 @@
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
    | Need more details? Send <code>helper status</code>.</p>
 -- <msg:3> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Plain repeat E2E-DUPEDGE-plain-2</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>Plain repeat E2E-DUPEDGE-plain-2</p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>

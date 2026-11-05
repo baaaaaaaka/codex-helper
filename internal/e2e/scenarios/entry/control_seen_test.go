@@ -43,6 +43,9 @@ func TestEntryControlCommandNotReplayed(t *testing.T) {
 	s.WaitFor("the helper polls the control chat", 60*time.Second, func() (bool, string) {
 		return strings.Contains(s.SUT.Output(), runningLine), s.OutputTail(300)
 	})
+	// The migration notice goes out before the command is posted (the two
+	// would otherwise race in the transcript).
+	s.WaitSUTMessage(control, "Teams helper data converted", 30*time.Second)
 	// A command posted now is answered: the control chat was read past the
 	// old command.
 	steps.MustPost(s, control, "status")
