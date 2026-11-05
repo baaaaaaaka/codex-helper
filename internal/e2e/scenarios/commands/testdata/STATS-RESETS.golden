@@ -1,0 +1,290 @@
+# STATS-RESETS: `helper stats` totals across 35 counter resets and a subagent fork equal the hand-computed values
+# cxp black-box transcript; volatile values are numbered placeholders
+
+== chat <chat:1> "Codex Control - e2ehost"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
+-- <msg:2> owner (html)
+   | <p>new <root>/work/resets</p>
+-- <msg:3> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>✅ Work chat created: s001</p>
+   | <p>Open this Teams link and send your task there:<br>
+   | <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
+   | <p>If Teams does not show it right away, search for: s001</p>
+-- <msg:4> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
+   | <p><strong>✅ Codex finished</strong></p>
+   | <p><strong>Chat:</strong> s001 · resets<br>
+   | <strong>Request:</strong> Please answer E2E-STATSRESETS-first-1</p>
+   | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
+   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
+   mention 0: owner "E2E Owner"
+-- <msg:5> owner (html)
+   | <p>stats</p>
+-- <msg:6> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p><strong>STATS: Codex tokens</strong></p>
+   | <p><strong>Scope:</strong> all Work chats<br>
+   | <strong>Work chats with token usage:</strong> 1 of 1</p>
+   | <p><strong>Model usage:</strong></p>
+   | <table><tr><th>Metric</th><th>Conversation total</th></tr>
+   | <tr><td><strong>input</strong></td><td>74,493 (cached 28,300, non-cached 46,193)</td></tr>
+   | <tr><td><strong>Cache hit rate</strong></td><td>38.0%</td></tr>
+   | <tr><td><strong>output</strong></td><td>3,675 (reasoning 729)</td></tr>
+   | <tr><td><strong>total</strong></td><td>78,168</td></tr>
+   | </table>
+   | <p><strong>Model/tier usage:</strong></p>
+   | <p><strong>Model:</strong> gpt-5-codex<br>
+   | <strong>Tier:</strong> unknown<br>
+   | <strong>input:</strong> 1,200<br>
+   | <strong>output:</strong> 80 (reasoning 20)<br>
+   | <strong>total:</strong> 1,280</p>
+   | <p><strong>Model:</strong> gpt-5.5<br>
+   | <strong>Tier:</strong> priority<br>
+   | <strong>input:</strong> 59,027 (cached 22,700, non-cached 36,327)<br>
+   | <strong>Cache hit rate:</strong> 38.5%<br>
+   | <strong>output:</strong> 2,888 (reasoning 569)<br>
+   | <strong>total:</strong> 61,915</p>
+   | <p><strong>Model:</strong> gpt-5.5-mini<br>
+   | <strong>Tier:</strong> unknown<br>
+   | <strong>input:</strong> 14,266 (cached 5,600, non-cached 8,666)<br>
+   | <strong>Cache hit rate:</strong> 39.3%<br>
+   | <strong>output:</strong> 707 (reasoning 140)<br>
+   | <strong>total:</strong> 14,973</p>
+   | <p><strong>Model/effort usage:</strong></p>
+   | <p><strong>Model:</strong> gpt-5-codex<br>
+   | <strong>Overall:</strong><br>
+   | <strong>input:</strong> 1,200<br>
+   | <strong>output:</strong> 80 (reasoning 20)<br>
+   | <strong>total:</strong> 1,280</p>
+   | <p><strong>Effort:</strong> medium<br>
+   | <strong>input:</strong> 1,200<br>
+   | <strong>output:</strong> 80 (reasoning 20)<br>
+   | <strong>total:</strong> 1,280</p>
+   | <p><strong>Model:</strong> gpt-5.5<br>
+   | <strong>Overall:</strong><br>
+   | <strong>input:</strong> 59,027 (cached 22,700, non-cached 36,327)<br>
+   | <strong>Cache hit rate:</strong> 38.5%<br>
+   | <strong>output:</strong> 2,888 (reasoning 569)<br>
+   | <strong>total:</strong> 61,915</p>
+   | <p><strong>Effort:</strong> low<br>
+   | <strong>input:</strong> 2,103 (cached 300, non-cached 1,803)<br>
+   | <strong>Cache hit rate:</strong> 14.3%<br>
+   | <strong>output:</strong> 60 (reasoning 9)<br>
+   | <strong>total:</strong> 2,163</p>
+   | <p><strong>Effort:</strong> high<br>
+   | <strong>input:</strong> 56,924 (cached 22,400, non-cached 34,524)<br>
+   | <strong>Cache hit rate:</strong> 39.4%<br>
+   | <strong>output:</strong> 2,828 (reasoning 560)<br>
+   | <strong>total:</strong> 59,752</p>
+   | <p><strong>Model:</strong> gpt-5.5-mini<br>
+   | <strong>Overall:</strong><br>
+   | <strong>input:</strong> 14,266 (cached 5,600, non-cached 8,666)<br>
+   | <strong>Cache hit rate:</strong> 39.3%<br>
+   | <strong>output:</strong> 707 (reasoning 140)<br>
+   | <strong>total:</strong> 14,973</p>
+   | <p><strong>Effort:</strong> unknown<br>
+   | <strong>input:</strong> 14,266 (cached 5,600, non-cached 8,666)<br>
+   | <strong>Cache hit rate:</strong> 39.3%<br>
+   | <strong>output:</strong> 707 (reasoning 140)<br>
+   | <strong>total:</strong> 14,973</p>
+   | <p><strong>Per Work chat:</strong></p>
+   | <ul><li><strong>s001:</strong> total 78,168; cache hit rate 38.0%</li>
+   | </ul>
+   | <p><strong>Analysis:</strong></p>
+   | <ul><li><strong>model/tier attribution:</strong> 3 observed combination(s)</li>
+   | <li>2 combination(s), 16,253 total, have missing model or service-tier metadata; they remain <code>unknown</code> instead of being guessed or merged</li>
+   | <li><strong>model/effort attribution:</strong> 3 model(s), 4 per-effort group(s)</li>
+   | <li>1 model or effort group(s), 14,973 total, have missing metadata; they remain <code>unknown</code> instead of being guessed or merged</li>
+   | </ul>
+
+== chat <chat:2> "s001 · resets"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Work chat created: s001.<br>
+   | Working directory: <root>/work/resets</p>
+-- <msg:2> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>💬 Work chat is ready.<br>
+   | Send a task in this chat. Codex will start automatically and continue this session.<br>
+   | Status: waiting for your first task.<br>
+   | Session: s001<br>
+   | Project: resets<br>
+   | Working directory: <root>/work/resets<br>
+   | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
+   | Need more details? Send <code>helper status</code>.</p>
+-- <msg:3> owner (html)
+   | <p>Please answer E2E-STATSRESETS-first-1</p>
+-- <msg:4> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+-- <msg:5> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>E2EANSWER-<n> answer for E2E-STATSRESETS-first-1</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+-- <msg:6> owner (html)
+   | <p>helper stats</p>
+-- <msg:7> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p><strong>STATS: Codex tokens</strong></p>
+   | <p><strong>Session:</strong> s001<br>
+   | <strong>Codex thread:</strong> <uuid:1><br>
+   | <strong>Latest request:</strong> completed<br>
+   | <strong>Latest Codex turn:</strong> <uuid:2><br>
+   | <strong>Source:</strong> token_count at transcript line 221 (<root>/home/.codex/sessions/<day>/rollout-<start>-<uuid:1>.jsonl)<br>
+   | <strong>Reliability:</strong> reconstructed conversation usage from 71 unique Codex <code>token_count</code> update(s) in local history; malformed trailing JSONL lines are ignored and reported below.<br>
+   | <strong>Aggregation:</strong> ignored 35 non-advancing usage snapshot(s); observed 35 native cumulative counter reset(s) and 0 recovery event(s).</p>
+   | <p><strong>Model usage:</strong></p>
+   | <table><tr><th>Metric</th><th>Last recorded model usage</th><th>Conversation total</th></tr>
+   | <tr><td><strong>input</strong></td><td>1,034 (cached 400, non-cached 634)</td><td>72,390 (cached 28,000, non-cached 44,390)</td></tr>
+   | <tr><td><strong>Cache hit rate</strong></td><td>38.7%</td><td>38.7%</td></tr>
+   | <tr><td><strong>output</strong></td><td>51 (reasoning 10)</td><td>3,615 (reasoning 720)</td></tr>
+   | <tr><td><strong>total</strong></td><td>1,085</td><td>76,005</td></tr>
+   | </table>
+   | <p><strong>Model/tier usage:</strong></p>
+   | <p><strong>Model:</strong> gpt-5-codex<br>
+   | <strong>Tier:</strong> unknown<br>
+   | <strong>input:</strong> 1,200<br>
+   | <strong>output:</strong> 80 (reasoning 20)<br>
+   | <strong>total:</strong> 1,280</p>
+   | <p><strong>Model:</strong> gpt-5.5<br>
+   | <strong>Tier:</strong> priority<br>
+   | <strong>input:</strong> 56,924 (cached 22,400, non-cached 34,524)<br>
+   | <strong>Cache hit rate:</strong> 39.4%<br>
+   | <strong>output:</strong> 2,828 (reasoning 560)<br>
+   | <strong>total:</strong> 59,752</p>
+   | <p><strong>Model:</strong> gpt-5.5-mini<br>
+   | <strong>Tier:</strong> unknown<br>
+   | <strong>input:</strong> 14,266 (cached 5,600, non-cached 8,666)<br>
+   | <strong>Cache hit rate:</strong> 39.3%<br>
+   | <strong>output:</strong> 707 (reasoning 140)<br>
+   | <strong>total:</strong> 14,973</p>
+   | <p><strong>Model/effort usage:</strong></p>
+   | <p><strong>Model:</strong> gpt-5-codex<br>
+   | <strong>Overall:</strong><br>
+   | <strong>input:</strong> 1,200<br>
+   | <strong>output:</strong> 80 (reasoning 20)<br>
+   | <strong>total:</strong> 1,280</p>
+   | <p><strong>Effort:</strong> medium<br>
+   | <strong>input:</strong> 1,200<br>
+   | <strong>output:</strong> 80 (reasoning 20)<br>
+   | <strong>total:</strong> 1,280</p>
+   | <p><strong>Model:</strong> gpt-5.5<br>
+   | <strong>Overall:</strong><br>
+   | <strong>input:</strong> 56,924 (cached 22,400, non-cached 34,524)<br>
+   | <strong>Cache hit rate:</strong> 39.4%<br>
+   | <strong>output:</strong> 2,828 (reasoning 560)<br>
+   | <strong>total:</strong> 59,752</p>
+   | <p><strong>Effort:</strong> high<br>
+   | <strong>input:</strong> 56,924 (cached 22,400, non-cached 34,524)<br>
+   | <strong>Cache hit rate:</strong> 39.4%<br>
+   | <strong>output:</strong> 2,828 (reasoning 560)<br>
+   | <strong>total:</strong> 59,752</p>
+   | <p><strong>Model:</strong> gpt-5.5-mini<br>
+   | <strong>Overall:</strong><br>
+   | <strong>input:</strong> 14,266 (cached 5,600, non-cached 8,666)<br>
+   | <strong>Cache hit rate:</strong> 39.3%<br>
+   | <strong>output:</strong> 707 (reasoning 140)<br>
+   | <strong>total:</strong> 14,973</p>
+   | <p><strong>Effort:</strong> unknown<br>
+   | <strong>input:</strong> 14,266 (cached 5,600, non-cached 8,666)<br>
+   | <strong>Cache hit rate:</strong> 39.3%<br>
+   | <strong>output:</strong> 707 (reasoning 140)<br>
+   | <strong>total:</strong> 14,973</p>
+   | <p><strong>Analysis:</strong></p>
+   | <ul><li><strong>model context window:</strong> 258,400; current context uses 0.4%; approx remaining: 257,315</li>
+   | <li><strong>Codex baseline-adjusted context remaining:</strong> 100%</li>
+   | <li><strong>last reasoning output share:</strong> 19.6% of output tokens</li>
+   | <li><strong>model/tier attribution:</strong> 3 observed combination(s)</li>
+   | <li>2 combination(s), 16,253 total, have missing model or service-tier metadata; they remain <code>unknown</code> instead of being guessed or merged</li>
+   | <li><strong>model/effort attribution:</strong> 3 model(s), 3 per-effort group(s)</li>
+   | <li>1 model or effort group(s), 14,973 total, have missing metadata; they remain <code>unknown</code> instead of being guessed or merged</li>
+   | <li><strong>native latest cumulative total:</strong> 2,169; reconstructed conversation total: 76,005</li>
+   | </ul>
+   | <p><strong>🧩 SUBAGENTS (1) · overall:</strong></p>
+   | <p><strong>input:</strong> 2,103 (cached 300, non-cached 1,803)<br>
+   | <strong>Cache hit rate:</strong> 14.3%<br>
+   | <strong>output:</strong> 60 (reasoning 9)<br>
+   | <strong>total:</strong> 2,163</p>
+   | <p><strong>🧩 SUBAGENTS (1) · model/effort detail:</strong></p>
+   | <p><strong>Model:</strong> gpt-5.5<br>
+   | <strong>Overall:</strong><br>
+   | <strong>input:</strong> 2,103 (cached 300, non-cached 1,803)<br>
+   | <strong>Cache hit rate:</strong> 14.3%<br>
+   | <strong>output:</strong> 60 (reasoning 9)<br>
+   | <strong>total:</strong> 2,163</p>
+   | <p><strong>Effort:</strong> low<br>
+   | <strong>input:</strong> 2,103 (cached 300, non-cached 1,803)<br>
+   | <strong>Cache hit rate:</strong> 14.3%<br>
+   | <strong>output:</strong> 60 (reasoning 9)<br>
+   | <strong>total:</strong> 2,163</p>
+   | <p><strong>🧮 TOTAL (MAIN + SUBAGENTS) · overall:</strong></p>
+   | <p><strong>input:</strong> 74,493 (cached 28,300, non-cached 46,193)<br>
+   | <strong>Cache hit rate:</strong> 38.0%<br>
+   | <strong>output:</strong> 3,675 (reasoning 729)<br>
+   | <strong>total:</strong> 78,168</p>
+   | <p><strong>🧮 TOTAL (MAIN + SUBAGENTS) · model/effort detail:</strong></p>
+   | <p><strong>Model:</strong> gpt-5-codex<br>
+   | <strong>Overall:</strong><br>
+   | <strong>input:</strong> 1,200<br>
+   | <strong>output:</strong> 80 (reasoning 20)<br>
+   | <strong>total:</strong> 1,280</p>
+   | <p><strong>Effort:</strong> medium<br>
+   | <strong>input:</strong> 1,200<br>
+   | <strong>output:</strong> 80 (reasoning 20)<br>
+   | <strong>total:</strong> 1,280</p>
+   | <p><strong>Model:</strong> gpt-5.5<br>
+   | <strong>Overall:</strong><br>
+   | <strong>input:</strong> 59,027 (cached 22,700, non-cached 36,327)<br>
+   | <strong>Cache hit rate:</strong> 38.5%<br>
+   | <strong>output:</strong> 2,888 (reasoning 569)<br>
+   | <strong>total:</strong> 61,915</p>
+   | <p><strong>Effort:</strong> low<br>
+   | <strong>input:</strong> 2,103 (cached 300, non-cached 1,803)<br>
+   | <strong>Cache hit rate:</strong> 14.3%<br>
+   | <strong>output:</strong> 60 (reasoning 9)<br>
+   | <strong>total:</strong> 2,163</p>
+   | <p><strong>Effort:</strong> high<br>
+   | <strong>input:</strong> 56,924 (cached 22,400, non-cached 34,524)<br>
+   | <strong>Cache hit rate:</strong> 39.4%<br>
+   | <strong>output:</strong> 2,828 (reasoning 560)<br>
+   | <strong>total:</strong> 59,752</p>
+   | <p><strong>Model:</strong> gpt-5.5-mini<br>
+   | <strong>Overall:</strong><br>
+   | <strong>input:</strong> 14,266 (cached 5,600, non-cached 8,666)<br>
+   | <strong>Cache hit rate:</strong> 39.3%<br>
+   | <strong>output:</strong> 707 (reasoning 140)<br>
+   | <strong>total:</strong> 14,973</p>
+   | <p><strong>Effort:</strong> unknown<br>
+   | <strong>input:</strong> 14,266 (cached 5,600, non-cached 8,666)<br>
+   | <strong>Cache hit rate:</strong> 39.3%<br>
+   | <strong>output:</strong> 707 (reasoning 140)<br>
+   | <strong>total:</strong> 14,973</p>
+
+== codex turns (per thread; threads by kind, directory and first prompt; turns in start order)
+-- thread <uuid:1> (work, cwd <root>/work/resets)
+   turn: answered
+   prompt| Please answer E2E-STATSRESETS-first-1
+   prompt|
+   prompt| Helper safety:
+   prompt| - You are running inside a Codex turn launched by the chat helper. The current request is the user message above; treat earlier requests in resumed history as completed context unless the user asks about them.
+   prompt| - Do not restart, reload, kill, replace, or background the helper process, binary, or service from this turn.
+   prompt| - If the helper needs to restart after an update or local repair, finish the answer and tell the user to send `helper restart now` in the control chat.
+   prompt| - If the helper needs a release update, tell the user to send `helper update now`, or `helper update prerelease` only when they asked for prereleases.
+   prompt| - Subagent requests use native Codex subagents. For cross-machine agent delegation, use the cxp skill and its `cxp delegate` workflow when the task needs another signed-in machine.
+   prompt|
+   prompt| Put fractions, sums, integrals, matrices, and display math in <m>TeX</m> on a separate line, never in prose, tables, or lists—even if asked for one line. Use backticks for simple inline/literal TeX. Never use $ or \(...\). Math markers are not artifacts.
+   prompt|
+   prompt| If you need to return generated files or images to the Teams user, write them under this local directory:
+   prompt| <root>/home/.local/state/codex-helper/teams/core-files/outbound/cxp-<key:1>-<turn:1>
+   prompt|
+   prompt| Then include this fenced manifest in your final answer:
+   prompt| ```codex-helper-artifacts
+   prompt| {"version":1,"files":[{"path":"relative/path.ext","name":"display-name.ext"}]}
+   prompt| ```
+   prompt|
+   prompt| Use only relative manifest paths under that directory. Keep your normal answer visible; the helper attaches the listed files separately.

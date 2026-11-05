@@ -263,8 +263,8 @@ func (e *Engine) controlCommand(ctx context.Context, j cmdJob, text string) {
 			return
 		}
 		e.cmdFork(ctx, j, target)
-	case "stats", "usage":
-		e.cmdStats(j, nil)
+	case "stats", "usage", "tokens":
+		e.cmdStats(ctx, j, nil)
 	case "skills", "skill":
 		e.cmdSkills(ctx, j, arg)
 	case "model", "models":
@@ -313,8 +313,8 @@ func (e *Engine) workCommand(ctx context.Context, j cmdJob, cs *convState, field
 		e.cmdModel(ctx, j, cs, args)
 	case "effort":
 		e.cmdModel(ctx, j, cs, append([]string{"effort"}, fields[1:]...))
-	case "stats", "usage":
-		e.cmdStats(j, cs)
+	case "stats", "usage", "tokens":
+		e.cmdStats(ctx, j, cs)
 	case "skills", "skill":
 		e.cmdSkills(ctx, j, strings.Join(fields[1:], " "))
 	default:

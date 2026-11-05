@@ -153,28 +153,35 @@ func TestModelStatusAndSwitch(t *testing.T) {
 		"model=gpt-5-codex effort=medium", fmt.Sprintf("ok=%v model=%q effort=%q", ok3, last.Model, last.Effort))
 }
 
-// `helper stats` and control `stats`: requests and token usage.
+// `helper stats` and control `stats`: token usage computed from the Codex
+// rollouts, in v0.1.20's layout (F-STA-1).
 func TestStats(t *testing.T) {
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "CMD-STATS", harness.Options{
 		Guarantees: []string{"cmd-stats"},
-		Title:      "`helper stats` / `stats` report requests and token usage",
+		Title:      "`helper stats` / `stats` report token usage from the Codex rollouts",
 	})
 	defer s.Finish()
 	control := steps.ReadyControlChat(s)
 	work, _ := steps.NewWorkChat(s, control, "stats")
 	_, ok1 := ask(s, work.ID, "one")
-	_, ok2 := ask(s, work.ID, "two")
+	c2, ok2 := ask(s, work.ID, "two")
 	s.Check("two requests answered", ok1 && ok2, "2 answers", fmt.Sprintf("%v %v", ok1, ok2))
-	// The fake Codex reports 1,280 tokens per turn.
-	st, ok := command(s, work.ID, "helper stats", "stats")
-	s.Check("`helper stats` counts this session's requests", ok && strings.Contains(st, "2 requests") && strings.Contains(st, "2 answered"),
-		"2 requests, 2 answered", clip(st, 200))
-	s.Check("`helper stats` reports token usage", strings.Contains(st, "2,560"), "2,560 tokens total", clip(st, 200))
-	all, ok := command(s, control.ID, "stats", "all sessions")
-	s.Check("control `stats` sums all sessions", ok && strings.Contains(all, "2,560"), "2,560 tokens", clip(all, 200))
-	leaks := steps.InternalLeaks(s, st+" "+all)
-	s.Check("stats carry no internal ids or paths", len(leaks) == 0, "none", fmt.Sprint(leaks))
+	// The fake Codex's rollout records 1,280 tokens per turn (1,200 input,
+	// 80 output of which 20 reasoning) under gpt-5-codex / medium, without
+	// a service tier.
+	st, ok := command(s, work.ID, "helper stats", "STATS: Codex tokens")
+	s.Check("`helper stats` names the session, its Codex thread and latest request",
+		ok && strings.Contains(st, "Session: s001") && strings.Contains(st, "Codex thread: "+c2.ThreadID) && strings.Contains(st, "Latest request: completed"),
+		"Session: s001, Codex thread, Latest request: completed", clip(st, 300))
+	s.Check("`helper stats` reports the conversation total from the rollout", strings.Contains(st, "2,560") && strings.Contains(st, "2,400") && strings.Contains(st, "reasoning 40"),
+		"2,560 total, 2,400 input, reasoning 40", clip(st, 300))
+	s.Check("`helper stats` shows model, effort and the unknown tier", strings.Contains(st, "Model: gpt-5-codex") && strings.Contains(st, "Effort: medium") && strings.Contains(st, "Tier: unknown"),
+		"Model: gpt-5-codex, Effort: medium, Tier: unknown", clip(st, 300))
+	all, ok := command(s, control.ID, "stats", "Scope: all Work chats")
+	s.Check("control `stats` sums the Work chats", ok && strings.Contains(all, "2,560") && strings.Contains(all, "s001: total 2,560"), "s001: total 2,560", clip(all, 300))
+	leaks := steps.InternalLeaks(s, all)
+	s.Check("control stats carry no internal ids or paths", len(leaks) == 0, "none", fmt.Sprint(leaks))
 }
 
 // `skills` in the control chat and `helper skills` in a work chat answer

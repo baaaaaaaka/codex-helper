@@ -184,7 +184,7 @@ Columns: id · status (`keep` / `removed-by-owner` / `ask-owner`, with the owner
 | F-RND-9 | keep | MISSING: quotes parsed (channel/teams/receive.go:271, :329) but dropped by the core | NONE | quote context in the prompt |
 | F-RND-10 | keep | PARTIAL: manifest upload core/engine/outbound.go:201; `helper file` and `cxp teams send-file` missing; Codex is not told the outbound root (F-TRN-14) | R-37-out | B:9748 |
 | F-RND-11 | keep (owner: 决定-4, 第一级 6, 定稿 ASR) | PARTIAL: core/engine/files.go:185-215 transcribe → prompt; no transcript PATCH, no control-chat voice | VOICE | asr_input.go |
-| F-STA-1 | keep | PARTIAL: commands_ext.go:101 `cmdStats` from meta counters; not rollout-based | CMD-STATS | token_stats.go:1013/:1083 |
+| F-STA-1 | keep | core/engine/stats.go:39 `cmdStats` (work chat :153, control :259) from the rollouts; core/transcript/usage.go:752 (v0.1.20 reconstruction), usage_cache.go:94 (incremental reader, no timer) | CMD-STATS, STATS-RESETS | token_stats.go:1013/:1083 |
 | F-XM-1 | keep (owner: 定稿 共用 home — standby + takeover, no priority classes, pinned to install host) | PARTIAL: core/lease/acquire.go:185; install-host pin missing (`store.Ident.InstallHost` never set) | KILL-SWITCH, SERVICE-STANDBY, STANDBY-LOCKED, STANDBY-TAKEOVER, TAKEOVER-BATCH, TAKEOVER-CRASH-MID, TAKEOVER-KILLED, TAKEOVER-LEFTOVER, TAKEOVER-SAME-HOST, TAKEOVER-SIMULTANEOUS, TAKEOVER-THAW-EARLY | rc.59 lease lessons |
 | F-XM-2 | keep (owner: 决定-3) | core/engine/registry.go:37, core/delegate/registry.go:67 | DELEG-RT, INBOX | same |
 | F-XM-3 | keep (owner: 决定-3) | core/engine/delegation.go:90 | DELEG-RT, DELEG-RESTART | same |
@@ -252,7 +252,7 @@ Columns: id · status (`keep` / `removed-by-owner` / `ask-owner`, with the owner
 | R-39 | keep | `new` idempotent (createOrGet + record) | NONE | — |
 | R-40 | keep | MISSING: pause removed; drain internal only (F-TRN-17) | NONE | — |
 | R-41 | keep | PARTIAL: see F-WRK-10 | CMD-FORK | — |
-| R-42 | keep | PARTIAL: see F-STA-1 | CMD-STATS | — |
+| R-42 | keep | core/transcript/usage.go:242 resets, :599 fork-prefix attribution; see F-STA-1 | CMD-STATS, STATS-RESETS | — |
 | R-43 | keep | receive.go:785 | R-43 | — |
 | R-44 | keep | read-only rollout access by construction | NONE | — |
 | R-45 | keep | no DELETE call in channel/teams | exempt: enforced in every scenario by the global invariant graph-contract (the fake models DELETE only for upload sessions) | — |

@@ -252,6 +252,9 @@ type Engine struct {
 	scanWake     chan struct{} // a read throttle: the scan waits for the gate (receive.go)
 	historyWake  chan struct{} // a resume history check was decided (history_check.go)
 	notifyN      atomic.Int64  // pending owner notifications (notify.go)
+	// statsCache is the rollout usage cache of `helper stats` (stats.go).
+	statsOnce  sync.Once
+	statsCache *transcript.UsageCache
 	// scanFirst: after an account read throttle the activity scan gets
 	// the first read when the gate opens (receive.go).
 	scanFirst atomic.Bool

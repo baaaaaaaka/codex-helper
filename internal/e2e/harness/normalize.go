@@ -62,6 +62,8 @@ var genericRules = []struct{ kind, pattern string }{
 	{"chat", `19:[A-Za-z0-9_\-]+@(?:thread\.v2|thread\.tacv2|unq\.gbl\.spaces)`},
 	{"chaturl", `19%3[Aa][A-Za-z0-9_\-]+%40(?:thread\.v2|thread\.tacv2|unq\.gbl\.spaces)`},
 	{"uuid", `(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b`},
+	// A Codex rollout path: sessions/YYYY/MM/DD/rollout-<start time>-<thread>.jsonl.
+	{"rollout", `\b\d{4}/\d{2}/\d{2}/rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-`},
 	{"time", `\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?`},
 	{"time", `\b\d{4}-\d{2}-\d{2}[ _]\d{2}[:\-]\d{2}(?:[:\-]\d{2})?(?: ?(?:UTC|Z|[+-]\d{2}:?\d{2}))?`},
 	{"outbox", `codex-helper-outbox:[A-Za-z0-9._\-]+`},
@@ -166,6 +168,10 @@ func (n *normalizer) norm(text string) string {
 			return m
 		case kind == "pid":
 			return "pid " + n.placeholder("pid", "\x00"+strings.TrimPrefix(m, "pid "))
+		case kind == "rollout":
+			// The day and start time are the run's; the thread id after
+			// them is numbered on its own.
+			return "<day>/rollout-<start>-"
 		case kind == "outbox":
 			// The idempotency marker of every helper post: its presence is
 			// behaviour, its value (store prefix + delivery hash) is not.

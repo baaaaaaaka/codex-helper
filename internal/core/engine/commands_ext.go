@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sort"
 	"strings"
 
 	"github.com/baaaaaaaka/codex-helper/internal/core/store"
@@ -65,69 +64,8 @@ func recordUsage(tx *store.Tx, conv int64, state string, u Usage) error {
 	return tx.SetMeta(key, string(b))
 }
 
-func (e *Engine) usageOf(conv int64) usageStats {
-	var u usageStats
-	if v, ok, err := e.st.Meta(fmt.Sprintf("%s%d", metaUsagePrefix, conv)); err == nil && ok && v != "" {
-		_ = json.Unmarshal([]byte(v), &u)
-	}
-	return u
-}
-
-func formatUsage(u usageStats) string {
-	return fmt.Sprintf("%s (%d answered, %d failed). Tokens: %s total — %s input (%s cached), %s output (%s reasoning).",
-		plural(u.Turns, "request", "requests"), u.Completed, u.Failed,
-		thousands(u.Total), thousands(u.Input), thousands(u.Cached), thousands(u.Output), thousands(u.Reasoning))
-}
-
-// thousands formats n with comma separators.
-func thousands(n int64) string {
-	s := fmt.Sprint(n)
-	neg := strings.HasPrefix(s, "-")
-	s = strings.TrimPrefix(s, "-")
-	var b strings.Builder
-	for i, c := range s {
-		if i > 0 && (len(s)-i)%3 == 0 {
-			b.WriteByte(',')
-		}
-		b.WriteRune(c)
-	}
-	if neg {
-		return "-" + b.String()
-	}
-	return b.String()
-}
-
-// cmdStats answers `helper stats` (one session) and `stats` (all sessions).
-func (e *Engine) cmdStats(j cmdJob, cs *convState) {
-	if cs != nil {
-		e.mu.Lock()
-		label := cs.label
-		e.mu.Unlock()
-		e.reply(j, "Stats for "+label+": "+formatUsage(e.usageOf(cs.id)), nil)
-		return
-	}
-	e.mu.Lock()
-	var ids []int64
-	labels := map[int64]string{}
-	for id, c := range e.convs {
-		if c.kind == store.KindWork && id != e.inboxID && c.state != store.ConvClosed {
-			ids = append(ids, id)
-			labels[id] = c.label
-		}
-	}
-	e.mu.Unlock()
-	sort.Slice(ids, func(a, b int) bool { return labels[ids[a]] < labels[ids[b]] })
-	var total usageStats
-	var b strings.Builder
-	for _, id := range ids {
-		u := e.usageOf(id)
-		total.add(u)
-		if u.Turns > 0 {
-			fmt.Fprintf(&b, "\n- %s: %s, %s tokens", labels[id], plural(u.Turns, "request", "requests"), thousands(u.Total))
-		}
-	}
-	e.reply(j, "Stats for all sessions: "+formatUsage(total)+b.String(), nil)
-}
+// The stats command (cmdStats) is in stats.go: computed from the Codex
+// rollouts, not from these counters (F-STA-1).
 
 // cmdModel handles `helper model …` in a work chat:
 //

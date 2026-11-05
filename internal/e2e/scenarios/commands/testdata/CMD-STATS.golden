@@ -1,4 +1,4 @@
-# CMD-STATS: `helper stats` / `stats` report requests and token usage
+# CMD-STATS: `helper stats` / `stats` report token usage from the Codex rollouts
 # cxp black-box transcript; volatile values are numbered placeholders
 
 == chat <chat:1> "Codex Control - e2ehost"
@@ -34,8 +34,38 @@
    | <p>stats</p>
 -- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Stats for all sessions: 2 requests (2 answered, 0 failed). Tokens: 2,560 total — 2,400 input (0 cached), 160 output (40 reasoning).</p>
-   | <ul><li>s001: 2 requests, 2,560 tokens</li>
+   | <p><strong>STATS: Codex tokens</strong></p>
+   | <p><strong>Scope:</strong> all Work chats<br>
+   | <strong>Work chats with token usage:</strong> 1 of 1</p>
+   | <p><strong>Model usage:</strong></p>
+   | <table><tr><th>Metric</th><th>Conversation total</th></tr>
+   | <tr><td><strong>input</strong></td><td>2,400</td></tr>
+   | <tr><td><strong>output</strong></td><td>160 (reasoning 40)</td></tr>
+   | <tr><td><strong>total</strong></td><td>2,560</td></tr>
+   | </table>
+   | <p><strong>Model/tier usage:</strong></p>
+   | <p><strong>Model:</strong> gpt-5-codex<br>
+   | <strong>Tier:</strong> unknown<br>
+   | <strong>input:</strong> 2,400<br>
+   | <strong>output:</strong> 160 (reasoning 40)<br>
+   | <strong>total:</strong> 2,560</p>
+   | <p><strong>Model/effort usage:</strong></p>
+   | <p><strong>Model:</strong> gpt-5-codex<br>
+   | <strong>Overall:</strong><br>
+   | <strong>input:</strong> 2,400<br>
+   | <strong>output:</strong> 160 (reasoning 40)<br>
+   | <strong>total:</strong> 2,560</p>
+   | <p><strong>Effort:</strong> medium<br>
+   | <strong>input:</strong> 2,400<br>
+   | <strong>output:</strong> 160 (reasoning 40)<br>
+   | <strong>total:</strong> 2,560</p>
+   | <p><strong>Per Work chat:</strong></p>
+   | <ul><li><strong>s001:</strong> total 2,560</li>
+   | </ul>
+   | <p><strong>Analysis:</strong></p>
+   | <ul><li><strong>model/tier attribution:</strong> 1 observed combination(s)</li>
+   | <li>1 combination(s), 2,560 total, have missing model or service-tier metadata; they remain <code>unknown</code> instead of being guessed or merged</li>
+   | <li><strong>model/effort attribution:</strong> 1 model(s), 1 per-effort group(s)</li>
    | </ul>
 
 == chat <chat:2> "s001 · stats"
@@ -76,7 +106,43 @@
    | <p>helper stats</p>
 -- <msg:10> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Stats for s001: 2 requests (2 answered, 0 failed). Tokens: 2,560 total — 2,400 input (0 cached), 160 output (40 reasoning).</p>
+   | <p><strong>STATS: Codex tokens</strong></p>
+   | <p><strong>Session:</strong> s001<br>
+   | <strong>Codex thread:</strong> <uuid:1><br>
+   | <strong>Latest request:</strong> completed<br>
+   | <strong>Latest Codex turn:</strong> <uuid:2><br>
+   | <strong>Source:</strong> token_count at transcript line 19 (<root>/home/.codex/sessions/<day>/rollout-<start>-<uuid:1>.jsonl)<br>
+   | <strong>Reliability:</strong> reconstructed conversation usage from 2 unique Codex <code>token_count</code> update(s) in local history; malformed trailing JSONL lines are ignored and reported below.</p>
+   | <p><strong>Model usage:</strong></p>
+   | <table><tr><th>Metric</th><th>Last recorded model usage</th><th>Conversation total</th></tr>
+   | <tr><td><strong>input</strong></td><td>1,200</td><td>2,400</td></tr>
+   | <tr><td><strong>output</strong></td><td>80 (reasoning 20)</td><td>160 (reasoning 40)</td></tr>
+   | <tr><td><strong>total</strong></td><td>1,280</td><td>2,560</td></tr>
+   | </table>
+   | <p><strong>Model/tier usage:</strong></p>
+   | <p><strong>Model:</strong> gpt-5-codex<br>
+   | <strong>Tier:</strong> unknown<br>
+   | <strong>input:</strong> 2,400<br>
+   | <strong>output:</strong> 160 (reasoning 40)<br>
+   | <strong>total:</strong> 2,560</p>
+   | <p><strong>Model/effort usage:</strong></p>
+   | <p><strong>Model:</strong> gpt-5-codex<br>
+   | <strong>Overall:</strong><br>
+   | <strong>input:</strong> 2,400<br>
+   | <strong>output:</strong> 160 (reasoning 40)<br>
+   | <strong>total:</strong> 2,560</p>
+   | <p><strong>Effort:</strong> medium<br>
+   | <strong>input:</strong> 2,400<br>
+   | <strong>output:</strong> 160 (reasoning 40)<br>
+   | <strong>total:</strong> 2,560</p>
+   | <p><strong>Analysis:</strong></p>
+   | <ul><li><strong>model context window:</strong> 258,400; current context uses 0.5%; approx remaining: 257,120</li>
+   | <li><strong>Codex baseline-adjusted context remaining:</strong> 100%</li>
+   | <li><strong>last reasoning output share:</strong> 25.0% of output tokens</li>
+   | <li><strong>model/tier attribution:</strong> 1 observed combination(s)</li>
+   | <li>1 combination(s), 2,560 total, have missing model or service-tier metadata; they remain <code>unknown</code> instead of being guessed or merged</li>
+   | <li><strong>model/effort attribution:</strong> 1 model(s), 1 per-effort group(s)</li>
+   | </ul>
 
 == codex turns (per thread; threads by kind, directory and first prompt; turns in start order)
 -- thread <uuid:1> (work, cwd <root>/work/stats)
