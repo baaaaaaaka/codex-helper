@@ -24,6 +24,19 @@ const (
 	AnswerTimeout  = 30 * time.Second
 )
 
+// The helper's notices for a turn that a stopped helper left behind (the
+// exact sentences; the goldens pin the rest of the message).
+const (
+	InterruptedNotice = "The previous request was interrupted when the helper stopped. It was not re-run; resend it if you still need it."
+	DidNotRunNotice   = "The previous request did not run: the helper stopped before Codex accepted it. Resend it if you still need it."
+)
+
+// IsStoppedTurnNotice reports whether text is one of those notices.
+func IsStoppedTurnNotice(text string) bool {
+	t := harness.NormalizeSpace(text)
+	return strings.Contains(t, InterruptedNotice) || strings.Contains(t, DidNotRunNotice)
+}
+
 // ReadyControlChat waits for the control chat, its ready notice, and one
 // SUT poll of it after the notice (so a following user message is not part
 // of the initial baseline).

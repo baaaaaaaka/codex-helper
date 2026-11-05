@@ -98,11 +98,7 @@ func TestR04_R29_RestartPreservesWork(t *testing.T) {
 		if m.Created.Before(restartAt.Add(-time.Second)) {
 			continue
 		}
-		low := strings.ToLower(m.PlainText())
-		if strings.Contains(low, "your request is queued") {
-			continue // v0.1.20's queued ACK names `helper cancel running` ("Interrupt the request ahead…")
-		}
-		if strings.Contains(low, "interrupt") || strings.Contains(low, "helper stopped") || strings.Contains(low, "restart") || strings.Contains(low, "unconfirmed") {
+		if steps.IsStoppedTurnNotice(m.PlainText()) {
 			interrupted++
 			notices = append(notices, harness.NormalizeSpace(m.PlainText()))
 		}

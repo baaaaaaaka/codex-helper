@@ -176,13 +176,7 @@ func noticesAfter(s *harness.Scenario, chatID string, t time.Time) []string {
 }
 
 func isNotice(m fakegraph.Message) bool {
-	low := strings.ToLower(m.PlainText())
-	for _, k := range []string{"interrupt", "restart", "unconfirmed", "not executed", "did not run", "resend", "needs attention"} {
-		if strings.Contains(low, k) {
-			return true
-		}
-	}
-	return false
+	return steps.IsStoppedTurnNotice(m.PlainText())
 }
 
 func firstNoticeTime(s *harness.Scenario, chatID string, t time.Time) time.Time {

@@ -37,7 +37,7 @@ func TestControlChatPark(t *testing.T) {
 	steps.MustPost(s, control.ID, "park "+id)
 	ackOK := s.WaitFor("control chat acknowledges `park "+id+"`", steps.CommandTimeout, func() (bool, string) {
 		for _, m := range s.SUTMessages(control.ID) {
-			if m.RequestSeq > cmdSeq && strings.Contains(strings.ToLower(harness.TokenPattern.ReplaceAllString(m.PlainText(), "")), "park") {
+			if m.RequestSeq > cmdSeq && strings.Contains(m.PlainText(), "Parked "+id+": its chat is no longer read.") {
 				return true, ""
 			}
 		}

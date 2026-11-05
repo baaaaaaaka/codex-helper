@@ -31,8 +31,9 @@ import (
 
 // Invariant names.
 const (
-	// InvNoDuplicatePost: no chat holds two helper messages with the same
-	// HTML that carries a scenario token (an answer, a mirrored prompt).
+	// InvNoDuplicatePost: no chat holds the same Codex answer twice, and
+	// no restarted helper re-posts what an earlier instance posted when
+	// nothing new happened in between (checkDuplicates).
 	InvNoDuplicatePost = "no-duplicate-post"
 	// InvChatOrder: per chat, helper output follows the source order: the
 	// answers of one Codex thread in turn order, and mirrored local
@@ -361,18 +362,68 @@ func (s *Scenario) checkPostAfterExit(res *invResults, reqs []fakegraph.Request,
 // Codex's default answers (E2EANSWER-<n>).
 var TokenRE = regexp.MustCompile(`E2E[A-Z0-9]*-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*`)
 
+// outboxMarkerRE matches cxp's per-attempt delivery marker; a re-post of
+// the same message carries a new one, so duplicates compare without it.
+var outboxMarkerRE = regexp.MustCompile(`<!--\s*codex-helper-outbox:[^>]*-->`)
+
+// checkDuplicates finds re-posted helper messages, comparing HTML without
+// the per-attempt delivery marker:
+//   - a Codex answer (the fake's answers are unique: E2EANSWER-<n>)
+//     appears at most once per chat;
+//   - a helper instance never posts what an earlier instance already
+//     posted to the chat unless something new happened in between: an
+//     owner message in that chat, a Codex turn started, or a local
+//     rollout record written (a restart re-sending something that was
+//     delivered).
 func (s *Scenario) checkDuplicates(res *invResults) {
+	var events []time.Time // account-wide causes of new helper output
+	if s.Codex != nil {
+		for _, c := range s.Codex.Calls() {
+			events = append(events, c.Started)
+		}
+	}
+	for _, w := range s.Env.Rollouts() {
+		for _, e := range w.Written() {
+			events = append(events, e.At)
+		}
+	}
+	between := func(a, b time.Time) bool {
+		for _, t := range events {
+			if t.After(a) && !t.After(b) {
+				return true
+			}
+		}
+		return false
+	}
 	for _, c := range s.Graph.Chats() {
-		seen := map[string]string{}
+		answers := map[string]string{}
+		type post struct {
+			id, instance string
+			at           time.Time
+			owner        int // owner messages in the chat before it
+		}
+		last := map[string]post{}
+		owner := 0
 		for _, m := range s.Graph.Messages(c.ID) {
-			if m.Origin != fakegraph.OriginSUT || !TokenRE.MatchString(m.Content) {
+			if m.Origin == fakegraph.OriginUser {
+				owner++
 				continue
 			}
-			if first, ok := seen[m.Content]; ok {
-				res.add(InvNoDuplicatePost, "chat %q: message %s repeats %s: %.160s", c.Topic, m.ID, first, NormalizeSpace(m.PlainText()))
+			if m.Origin != fakegraph.OriginSUT {
 				continue
 			}
-			seen[m.Content] = m.ID
+			body := outboxMarkerRE.ReplaceAllString(m.Content, "")
+			if answerSeqRE.MatchString(body) {
+				if first, ok := answers[body]; ok {
+					res.add(InvNoDuplicatePost, "chat %q: message %s repeats answer %s: %.160s", c.Topic, m.ID, first, NormalizeSpace(m.PlainText()))
+				}
+				answers[body] = m.ID
+			}
+			if p, ok := last[body]; ok && p.owner == owner && p.instance != "" && m.Instance != "" && p.instance != m.Instance && !between(p.at, m.Created) {
+				res.add(InvNoDuplicatePost, "chat %q: %s re-posts message %s of %s with nothing new in between (no owner message here, no Codex turn, no local record): %.160s",
+					c.Topic, m.Instance, p.id, p.instance, NormalizeSpace(m.PlainText()))
+			}
+			last[body] = post{id: m.ID, instance: m.Instance, at: m.Created, owner: owner}
 		}
 	}
 }

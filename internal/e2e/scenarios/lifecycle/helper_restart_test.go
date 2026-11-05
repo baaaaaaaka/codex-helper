@@ -41,7 +41,7 @@ func TestHelperRestartConfirmation(t *testing.T) {
 	confirmations := func() []fakegraph.Message {
 		var out []fakegraph.Message
 		for _, m := range s.SUTMessages(control.ID) {
-			if m.RequestSeq > cmdSeq && m.Instance != "" && m.Instance != oldInst && strings.Contains(strings.ToLower(harness.TokenPattern.ReplaceAllString(m.PlainText(), "")), "restart") {
+			if m.RequestSeq > cmdSeq && m.Instance != "" && m.Instance != oldInst && strings.Contains(m.PlainText(), "Helper restarted: the new process is running and has taken over.") {
 				out = append(out, m)
 			}
 		}

@@ -61,6 +61,11 @@ func TestStandbyTakeoverOnStaleOwner(t *testing.T) {
 	s.Check("the standby sends no Graph request", len(bReqs) == 0, "0 requests from B", fmt.Sprintf("%d: %q", len(bReqs), bReqs))
 
 	// A hangs. B's supervisor restarts it until it owns the state.
+	// A is frozen once it settled: frozen inside a store write, it keeps
+	// the SQLite write lock and every start of B fails with SQLITE_BUSY
+	// (a known cxp limitation, reported to the owner; not this scenario's
+	// point).
+	s.Settle(2*time.Second, 15*time.Second)
 	if !harness.Freeze(s.SUT) {
 		t.Fatal("cannot freeze host A")
 	}

@@ -78,22 +78,18 @@ func TestActiveWriterOneNoticeNoRetry(t *testing.T) {
 		fmt.Sprintf("answered=%v same thread=%v (%d calls)", answered, same, len(nx)), tr...)
 }
 
-// sutAfter returns the texts of SUT messages in chatID created by requests
-// after seq that report a problem with the request. Ordinary turn progress
-// ("request accepted", "now running") is not a notice.
+// writerNotice is the helper's notice for a prompt Codex refused because
+// another process writes to the session (the exact sentence; the golden
+// pins the rest of the transcript).
+const writerNotice = "Codex did not run this request: the session is open in another Codex window that is writing to it."
+
+// sutAfter returns the texts of the active-writer notices in chatID created
+// by requests after seq.
 func sutAfter(s *harness.Scenario, chatID string, seq int64) []string {
 	var out []string
 	for _, m := range s.SUTMessages(chatID) {
-		if m.RequestSeq <= seq {
-			continue
-		}
-		text := harness.NormalizeSpace(m.PlainText())
-		low := strings.ToLower(harness.TokenPattern.ReplaceAllString(text, ""))
-		for _, k := range []string{"writer", "error", "fail", "attention", "problem", "in use", "open in", "another", "busy", "could not", "couldn't", "not run", "tui", "elsewhere"} {
-			if strings.Contains(low, k) {
-				out = append(out, text)
-				break
-			}
+		if text := harness.NormalizeSpace(m.PlainText()); m.RequestSeq > seq && strings.Contains(text, writerNotice) {
+			out = append(out, text)
 		}
 	}
 	return out
