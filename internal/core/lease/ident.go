@@ -58,9 +58,9 @@ func (id Ident) sameMachine(r Record) bool {
 	return strings.EqualFold(r.Host, id.Host) && r.Boot != "" && r.Boot == id.Boot && r.PIDNS == id.PIDNS
 }
 
-// rebooted reports whether r was written on this host before its last
-// boot: its process is gone. This assumes hostnames are unique among the
-// hosts that share the state directory.
+// rebooted reports whether r may have been written on this host before
+// its last boot: the host name matches, the boot id does not (Config.dead
+// checks the time).
 func (id Ident) rebooted(r Record) bool {
 	return strings.EqualFold(r.Host, id.Host) && r.Boot != "" && id.Boot != "" && r.Boot != id.Boot
 }

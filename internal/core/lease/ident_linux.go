@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 func pidNamespace() string {
@@ -33,4 +34,20 @@ func startTime(pid int) string {
 		return ""
 	}
 	return f[19]
+}
+
+// bootTime is when this machine booted (btime in /proc/stat).
+func bootTime() time.Time {
+	data, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		return time.Time{}
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if rest, ok := strings.CutPrefix(line, "btime "); ok {
+			if n, err := strconv.ParseInt(strings.TrimSpace(rest), 10, 64); err == nil && n > 0 {
+				return time.Unix(n, 0)
+			}
+		}
+	}
+	return time.Time{}
 }

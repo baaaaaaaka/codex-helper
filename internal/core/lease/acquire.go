@@ -83,6 +83,7 @@ type Config struct {
 	Sleep     func(context.Context, time.Duration) error
 	Alive     func(pid int) bool
 	StartTime func(pid int) string
+	BootTime  func() time.Time // when this machine booted (zero: unknown)
 }
 
 // Standby says why Acquire is waiting.
@@ -121,6 +122,9 @@ func (c *Config) defaults() {
 	if c.StartTime == nil {
 		c.StartTime = startTime
 	}
+	if c.BootTime == nil {
+		c.BootTime = bootTime
+	}
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) error {
@@ -137,9 +141,16 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 // dead reports whether r's process is known to be gone: a process of this
 // machine whose pid is gone or now names another process, or a process of
 // this host from before its last boot.
+//
+// A record with this host name and another boot id is from before this
+// machine's last boot only if it was last renewed before that boot (this
+// machine's clock wrote both times). A record renewed later comes from
+// another machine with the same host name: nothing is known about its
+// process, so it is waited out like any other host's.
 func (c *Config) dead(r Record) bool {
 	if c.Self.rebooted(r) {
-		return true
+		bt := c.BootTime()
+		return !bt.IsZero() && r.Wall > 0 && r.Wall < bt.UnixMilli()
 	}
 	if !c.Self.sameMachine(r) {
 		return false

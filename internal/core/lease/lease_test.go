@@ -53,6 +53,7 @@ type env struct {
 	anchor string
 	clock  *fakeClock
 	alive  map[int]bool
+	boot   time.Time // this machine's boot time (zero: unknown)
 }
 
 func newEnv(t *testing.T) *env {
@@ -66,6 +67,7 @@ func (e *env) cfg(self Ident, wait bool) Config {
 		Clock: e.clock.Now, Sleep: e.clock.Sleep,
 		Alive:     func(pid int) bool { return e.alive[pid] },
 		StartTime: func(int) string { return "100" },
+		BootTime:  func() time.Time { return e.boot },
 	}
 }
 
@@ -267,18 +269,51 @@ func TestDeadOwnerHereAndRebootedHost(t *testing.T) {
 		t.Fatalf("dead plan: %+v", pl)
 	}
 	h.Activate()
-	// The host rebooted: its old process is dead whatever its pid.
+	// The host rebooted after the record's last renewal: its old process
+	// is dead whatever its pid.
 	after := ident("a", 2)
 	after.Boot = "boot-new"
 	e.alive[2] = true
 	h.halt() // the process "vanishes" without releasing
 	h.done = true
+	e.boot = e.clock.Now().Add(time.Second)
 	h2, err := e.acquire(e.cfg(after, false))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if pl := h2.Plan(); pl.Why != "dead" || !pl.InPlace || pl.Quiet {
 		t.Fatalf("rebooted plan: %+v", pl)
+	}
+}
+
+// A record with this host name and another boot id, renewed after this
+// machine booted, is another machine with the same name: it is waited out,
+// never taken over in place.
+func TestSameHostNameOnAnotherMachine(t *testing.T) {
+	e := newEnv(t)
+	e.boot = e.clock.Now().Add(-time.Hour)
+	other := ident("a", 1)
+	other.Boot = "boot-other"
+	r := rec(1, Active, other, "core.sqlite")
+	r.Wall = e.clock.Now().UnixMilli()
+	e.put(r)
+	now := e.cfg(ident("a", 2), false)
+	now.Immediate = true
+	if _, err := e.acquire(now); !errors.Is(err, ErrOwnerLive) {
+		t.Fatalf("took over a machine with the same host name at once: %v", err)
+	}
+	// Unknown boot time: the same.
+	e.boot = time.Time{}
+	if _, err := e.acquire(now); !errors.Is(err, ErrOwnerLive) {
+		t.Fatalf("took over without knowing the boot time: %v", err)
+	}
+	// Once its lease is stale, it is copied after the quiet time.
+	h, err := e.acquire(e.cfg(ident("a", 2), true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pl := h.Plan(); pl.Why != "stale" || pl.InPlace || !pl.Quiet {
+		t.Fatalf("plan: %+v", pl)
 	}
 }
 
