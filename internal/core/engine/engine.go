@@ -512,6 +512,9 @@ func (e *Engine) Run(ctx context.Context) error {
 	}()
 	<-ctx.Done()
 	e.wg.Wait()
+	if e.fatal == nil || errors.Is(e.fatal, ErrRestart) {
+		e.flushEdits(flushEditsMax) // a graceful stop keeps the last labels and titles (edits.go)
+	}
 	e.ag.Close()
 	if e.fatal != nil {
 		return e.fatal

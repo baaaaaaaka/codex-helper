@@ -166,7 +166,9 @@ func (e *Engine) pumpNotify(ctx context.Context) {
 				return err
 			}
 			prefix := n.waitPrefix()
-			waiting := false
+			// A notification waits for the automatic title of its chat
+			// (rename.go): it names the chat as the owner sees it.
+			waiting := e.retitling(n.Conv)
 			for _, r := range rows {
 				if strings.HasPrefix(r.DeliveryKey, prefix) {
 					waiting = true
@@ -206,7 +208,8 @@ func (e *Engine) pumpNotify(ctx context.Context) {
 		return
 	}
 	e.notifyN.Store(int64(pending))
-	defer e.afterAnswers(answered) // after the notifications named the chat
+	// After the notifications named their chats (rename.go).
+	defer func() { e.afterAnswers(e.notified(answered)) }()
 	for _, n := range cards {
 		if ctx.Err() != nil {
 			return

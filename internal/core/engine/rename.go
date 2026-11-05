@@ -69,6 +69,9 @@ type titleState struct {
 	// lastFinal is when the channel created the newest answer post of a
 	// conversation (the unread mark's reference).
 	lastFinal map[int64]time.Time
+	// retitling holds when a conversation's automatic title was queued
+	// (until it is made; see retitling).
+	retitling map[int64]time.Time
 }
 
 // machineLabel is the machine's name in chat titles and status.
@@ -532,9 +535,42 @@ func (e *Engine) queueAutoTitle(conv int64) {
 	if !ok {
 		return
 	}
-	e.queueEdit(conv, chatEdit{key: "title", what: "chat title", afterRows: true, run: func(ctx context.Context, chat string) error {
+	e.mu.Lock()
+	if e.titles.retitling == nil {
+		e.titles.retitling = map[int64]time.Time{}
+	}
+	e.titles.retitling[conv] = e.now()
+	e.mu.Unlock()
+	e.queueEdit(conv, chatEdit{key: "title", what: "chat title", run: func(ctx context.Context, chat string) error {
+		defer e.retitled(conv)
 		return e.autoTitle(ctx, conv, chat)
 	}})
+}
+
+// retitleWait bounds how long an owner notification waits for the
+// automatic title of its chat (an edit that is dropped never clears it).
+const retitleWait = 30 * time.Second
+
+// retitling reports whether conv's automatic title is being made: the
+// owner notification of the chat's next answer waits for it, so it names
+// the chat by the title the owner sees (and does so deterministically).
+func (e *Engine) retitling(conv int64) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	at, ok := e.titles.retitling[conv]
+	if ok && e.now().Sub(at) > retitleWait {
+		delete(e.titles.retitling, conv)
+		return false
+	}
+	return ok
+}
+
+// retitled ends retitling(conv) and lets a held notification go.
+func (e *Engine) retitled(conv int64) {
+	e.mu.Lock()
+	delete(e.titles.retitling, conv)
+	e.mu.Unlock()
+	e.wakeNotify()
 }
 
 // autoAllowed is sessionAllowsAutoTitleUpdate.
@@ -676,6 +712,37 @@ func (e *Engine) noteFinalSent(conv int64, kind string, at time.Time) {
 // per answer: the chat is marked unread for the owner from the newest
 // answer post on (F-TRN-1), then its title follows the session
 // (F-WRK-2). Called once the notifications named the chat by its title.
+// notified keeps the entries of list whose notification has gone out
+// (no longer pending): an answer is followed (unread mark, title) only
+// after the notification that names its chat, also when that
+// notification waits for a later pump or the next process.
+func (e *Engine) notified(list []pendingNotify) []pendingNotify {
+	if len(list) == 0 {
+		return nil
+	}
+	v, _, err := e.st.Meta(metaNotify)
+	if err != nil {
+		return nil
+	}
+	var pending []pendingNotify
+	if v != "" {
+		if err := json.Unmarshal([]byte(v), &pending); err != nil {
+			return nil
+		}
+	}
+	still := map[string]bool{}
+	for _, p := range pending {
+		still[p.id()] = true
+	}
+	var out []pendingNotify
+	for _, n := range list {
+		if !still[n.id()] {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
 func (e *Engine) afterAnswers(list []pendingNotify) {
 	for _, n := range list {
 		if n.Kind != "" {

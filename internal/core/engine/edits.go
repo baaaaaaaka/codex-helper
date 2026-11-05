@@ -28,9 +28,6 @@ type chatEdit struct {
 	what      string // for the log
 	notBefore time.Time
 	tries     int
-	// afterRows: made only once the conversation has no row to send (an
-	// automatic title goes after the answer it follows).
-	afterRows bool
 	// run makes the edit in chat. errEditLater asks for another try.
 	run func(ctx context.Context, chat string) error
 }
@@ -45,6 +42,8 @@ const (
 	// editReadWait bounds the wait for a read token inside an edit: the
 	// conversation's replies wait behind the edit.
 	editReadWait = 5 * time.Second
+	// flushEditsMax bounds the edits made after a graceful stop.
+	flushEditsMax = 3 * time.Second
 )
 
 // queueEdit adds an edit for conv unless one with the same key waits. It
@@ -72,12 +71,6 @@ func (e *Engine) withEdits(items []sendItem, now time.Time, soon func(time.Durat
 	if len(e.edits) == 0 {
 		return items
 	}
-	rows := map[int64]bool{}
-	for _, it := range items {
-		if !it.create {
-			rows[it.conv] = true
-		}
-	}
 	due := map[int64]bool{}
 	for conv, q := range e.edits {
 		cs := e.convs[conv]
@@ -87,9 +80,6 @@ func (e *Engine) withEdits(items []sendItem, now time.Time, soon func(time.Durat
 		}
 		if cs.chat == "" || cs.sending {
 			continue
-		}
-		if q[0].afterRows && rows[conv] {
-			continue // the sender comes back once those rows are sent
 		}
 		if d := q[0].notBefore.Sub(now); d > 0 {
 			soon(d)
@@ -128,7 +118,19 @@ func (e *Engine) runEdit(ctx context.Context, conv int64) {
 	cctx, cancel := context.WithTimeout(ctx, editTimeout)
 	err := ed.run(cctx, chat)
 	cancel()
-	if err == nil || ctx.Err() != nil {
+	if err == nil {
+		return
+	}
+	if ctx.Err() != nil {
+		// The engine is stopping: flushEdits makes it again (every edit is
+		// idempotent, so one the channel made before the stop is not
+		// made twice).
+		e.mu.Lock()
+		if e.edits == nil {
+			e.edits = map[int64][]*chatEdit{}
+		}
+		e.edits[conv] = append([]*chatEdit{ed}, e.edits[conv]...)
+		e.mu.Unlock()
 		return
 	}
 	now := e.now()
@@ -162,6 +164,45 @@ func (e *Engine) runEdit(ctx context.Context, conv int64) {
 	e.edits[conv] = append([]*chatEdit{ed}, e.edits[conv]...)
 	e.mu.Unlock()
 	time.AfterFunc(retry.Sub(now), e.wakeSender)
+}
+
+// flushEdits makes the queued edits that are due once the engine has
+// stopped gracefully (a stop or a restart), within limit and under the
+// account write pacing: the queue is in memory, and the label or title of
+// the last moments before a stop would otherwise be lost. Failures are
+// dropped (they are cosmetic); nothing is retried.
+func (e *Engine) flushEdits(limit time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), limit)
+	defer cancel()
+	for ctx.Err() == nil {
+		now := e.now()
+		var (
+			conv int64
+			ed   *chatEdit
+			chat string
+		)
+		e.mu.Lock()
+		for id, q := range e.edits {
+			cs := e.convs[id]
+			if len(q) == 0 || cs == nil || cs.chat == "" || now.Before(q[0].notBefore) || (ed != nil && id > conv) {
+				continue
+			}
+			conv, ed, chat = id, q[0], cs.chat
+		}
+		if ed != nil {
+			e.edits[conv] = e.edits[conv][1:]
+			if len(e.edits[conv]) == 0 {
+				delete(e.edits, conv)
+			}
+		}
+		e.mu.Unlock()
+		if ed == nil || e.waitWrite(ctx) != nil {
+			return
+		}
+		if err := ed.run(ctx, chat); err != nil {
+			e.logf("%s in conversation %d not made at stop: %v", ed.what, conv, err)
+		}
+	}
 }
 
 // waitRead waits for a read token of the account's read pacing (and its
