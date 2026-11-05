@@ -25,12 +25,11 @@ import (
 // anything. Both helpers use one control chat.
 func TestStandbyTakeoverOnStaleOwner(t *testing.T) {
 	harness.Parallel(t)
-	timing := "Heartbeat=500ms"
 	s := harness.NewScenario(t, "STANDBY-TAKEOVER", harness.Options{
 		Guarantees: []string{"F-XM-1", "R-1", "R-13"},
 		Title:      "shared home: a second host stands by with no Graph traffic, takes over after the owner's heartbeat is stale, the old owner is fenced and posts nothing",
 		Budget:     220 * time.Second,
-		SUTEnv:     map[string]string{"E2E_SUT_TIMING": timing, "E2E_SUT_HOSTNAME": "host-a"},
+		Seam:       harness.Seam{Knobs: map[string]string{"Heartbeat": "500ms"}, Hostname: "host-a"},
 	})
 	defer s.Finish()
 	t.Cleanup(func() { harness.Thaw(s.SUT) })
@@ -43,7 +42,7 @@ func TestStandbyTakeoverOnStaleOwner(t *testing.T) {
 	aTag := s.SUT.Instance()
 
 	// B starts while A is live: it stands by and touches nothing.
-	b := s.NewPeer("B", map[string]string{"E2E_SUT_HOSTNAME": "host-b"})
+	b := s.NewPeer("B", harness.PeerOptions{Seam: harness.Seam{Hostname: "host-b"}})
 	bFrom := s.Graph.LastSeq()
 	if err := b.Start(s.Ctx()); err != nil {
 		t.Fatal(err)

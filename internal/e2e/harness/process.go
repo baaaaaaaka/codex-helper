@@ -15,14 +15,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-
-	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakegraph"
 )
-
-// BlockedLinePrefix starts the output line by which a subprocess SUT reports
-// a request its sandbox transport refused (see sandbox.New); ProcessSUT
-// records it on the fake Graph as a blocked request.
-const BlockedLinePrefix = "E2E-BLOCKED "
 
 // ServiceRestartDelay is how long ProcessSUT, acting as the SUT's service
 // supervisor, waits before starting the replacement instance after an exit
@@ -68,6 +61,7 @@ type ProcessSUT struct {
 	pending    bool
 	restarts   int
 	cur        *procInstance
+	all        []*procInstance
 }
 
 type procInstance struct {
@@ -75,8 +69,63 @@ type procInstance struct {
 	cmd        *exec.Cmd
 	done       chan struct{}
 	err        error
+	started    time.Time
+	exited     time.Time
+	how        string      // "stop", "crash", "stacks" when ended by the harness
 	signaled   atomic.Bool // stopped or killed by the harness on purpose
 	supervised atomic.Bool // exited asking for a service restart
+}
+
+// InstanceRecord is the life of one SUT instance, for the invariants.
+type InstanceRecord struct {
+	Tag     string
+	Pid     int
+	Started time.Time
+	// Exited is zero while the instance runs.
+	Exited time.Time
+	// How ended it: "stop" (SIGTERM by the harness), "crash" (SIGKILL),
+	// "stacks" (SIGQUIT), "service-restart" (exit 75) or "self" (any other
+	// exit of its own); "" while running.
+	How string
+	// ExitErr is the wait error ("" = exit status 0).
+	ExitErr string
+	CPU     time.Duration
+}
+
+// Instances returns every instance this runner started, in start order.
+func (s *ProcessSUT) Instances() []InstanceRecord {
+	s.mu.Lock()
+	all := append([]*procInstance(nil), s.all...)
+	hows := make([]string, len(all))
+	for i, in := range all {
+		hows[i] = in.how
+	}
+	s.mu.Unlock()
+	out := make([]InstanceRecord, 0, len(all))
+	for i, in := range all {
+		r := InstanceRecord{Tag: in.tag, Started: in.started}
+		if in.cmd.Process != nil {
+			r.Pid = in.cmd.Process.Pid
+		}
+		select {
+		case <-in.done:
+			r.Exited, r.How = in.exited, hows[i]
+			if r.How == "" {
+				r.How = "self"
+				if in.supervised.Load() {
+					r.How = "service-restart"
+				}
+			}
+			if in.err != nil {
+				r.ExitErr = in.err.Error()
+			}
+			r.CPU = in.cmd.ProcessState.UserTime() + in.cmd.ProcessState.SystemTime()
+		default:
+			r.CPU = procCPUTime(r.Pid)
+		}
+		out = append(out, r)
+	}
+	return out
 }
 
 // NewProcessSUT returns a runner for spec.
@@ -169,6 +218,15 @@ func (s *ProcessSUT) Pid() int {
 	return s.cur.cmd.Process.Pid
 }
 
+// TotalCPUTime is the user+system CPU time of every instance so far.
+func (s *ProcessSUT) TotalCPUTime() time.Duration {
+	var d time.Duration
+	for _, r := range s.Instances() {
+		d += r.CPU
+	}
+	return d
+}
+
 // CPUTime is the user+system CPU time of the current instance: read from
 // /proc while it runs (Linux), from its exit status once it exited.
 func (s *ProcessSUT) CPUTime() time.Duration {
@@ -255,17 +313,19 @@ func (s *ProcessSUT) start(wantIntent int) error {
 		_ = pw.Close()
 		return fmt.Errorf("start %s: %w", s.spec.Binary, err)
 	}
-	inst := &procInstance{tag: tag, cmd: cmd, done: make(chan struct{})}
+	inst := &procInstance{tag: tag, cmd: cmd, done: make(chan struct{}), started: time.Now()}
 	s.mu.Lock()
 	s.cur = inst
+	s.all = append(s.all, inst)
 	s.mu.Unlock()
 	scanned := make(chan struct{})
 	go func() {
 		defer close(scanned)
-		s.scan(pr, tag)
+		s.scan(pr)
 	}()
 	go func() {
 		err := cmd.Wait()
+		inst.exited = time.Now()
 		_ = pw.Close()
 		<-scanned
 		inst.err = err
@@ -294,15 +354,11 @@ func (s *ProcessSUT) start(wantIntent int) error {
 	return nil
 }
 
-func (s *ProcessSUT) scan(r io.Reader, tag string) {
+func (s *ProcessSUT) scan(r io.Reader) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 64<<10), 4<<20)
 	for sc.Scan() {
-		line := sc.Text()
-		if rest, ok := strings.CutPrefix(line, BlockedLinePrefix); ok && s.cfg.Graph != nil {
-			s.cfg.Graph.RecordBlocked(fakegraph.BlockedRequest{At: time.Now(), Instance: tag, URL: rest})
-		}
-		fmt.Fprintln(&s.out, line)
+		fmt.Fprintln(&s.out, sc.Text())
 	}
 	_, _ = io.Copy(io.Discard, r)
 }
@@ -327,13 +383,16 @@ func (s *ProcessSUT) signal(ctx context.Context, sig syscall.Signal) error {
 		return nil
 	default:
 	}
-	verb := "stopping"
+	verb, how := "stopping", "stop"
 	switch sig {
 	case syscall.SIGKILL:
-		verb = "crashing (SIGKILL)"
+		verb, how = "crashing (SIGKILL)", "crash"
 	case syscall.SIGQUIT:
-		verb = "dumping stacks (SIGQUIT)"
+		verb, how = "dumping stacks (SIGQUIT)", "stacks"
 	}
+	s.mu.Lock()
+	inst.how = how
+	s.mu.Unlock()
 	fmt.Fprintf(&s.out, "=== e2e: %s %s ===\n", verb, inst.tag)
 	inst.signaled.Store(true)
 	if err := inst.cmd.Process.Signal(sig); err != nil && !errors.Is(err, os.ErrProcessDone) {

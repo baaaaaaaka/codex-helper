@@ -183,7 +183,9 @@ func ThreadRollout(s *harness.Scenario, threadID string) (*rollout.Writer, error
 	if th.RolloutPath == "" {
 		return nil, fmt.Errorf("thread %s has no rollout", threadID)
 	}
-	return rollout.Open(th.RolloutPath, th.ID, th.Cwd), nil
+	w := rollout.Open(th.RolloutPath, th.ID, th.Cwd)
+	s.Env.TrackRollout(w)
+	return w, nil
 }
 
 // HistoryWatchReady writes a fresh local TUI session and waits until it is

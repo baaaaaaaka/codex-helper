@@ -21,11 +21,13 @@ import (
 const TenantID = "e2e00000-0000-4000-8000-00000000te57"
 
 const (
-	// HeaderOriginalHost is set by the harness transport to the host the SUT
-	// tried to reach.
-	HeaderOriginalHost = "X-E2e-Original-Host"
-	// HeaderInstance is set by the harness transport to a SUT instance tag.
-	HeaderInstance = "X-E2e-Instance"
+	// HeaderOriginalHost, HeaderOriginalScheme and HeaderInstance are set by
+	// cxp's test seam (CXP_TEST_ONLY_SEAM, docs/teams-e2e-test-seam.md) on
+	// every request it redirects here: the host and scheme production would
+	// have used, and the instance tag.
+	HeaderOriginalHost   = "X-Cxp-Test-Original-Host"
+	HeaderOriginalScheme = "X-Cxp-Test-Original-Scheme"
+	HeaderInstance       = "X-Cxp-Test-Instance"
 
 	graphHost = "graph.microsoft.com"
 	loginHost = "login.microsoftonline.com"
@@ -151,9 +153,20 @@ type response struct {
 func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	body, _ := io.ReadAll(io.LimitReader(r.Body, maxRequestBody))
-	host := r.Header.Get(HeaderOriginalHost)
+	host := strings.ToLower(r.Header.Get(HeaderOriginalHost))
 	if host == "" {
 		host = graphHost
+	}
+	scheme := r.Header.Get(HeaderOriginalScheme)
+	if scheme == "" {
+		scheme = "https"
+	}
+	if !knownHost(host) {
+		// Anything but the Microsoft endpoints the fake serves is a request
+		// the offline sandbox would have refused: recorded, never answered.
+		s.RecordBlocked(BlockedRequest{At: start, Instance: r.Header.Get(HeaderInstance), URL: scheme + "://" + host + r.URL.RequestURI()})
+		dropConnection(w)
+		return
 	}
 	rec := Request{
 		At:       start,
@@ -206,6 +219,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			if f.RetryAfter > 0 {
 				secs := int((f.RetryAfter + time.Second - 1) / time.Second)
 				hdr["Retry-After"] = strconv.Itoa(secs)
+				rec.RetryAfter = time.Duration(secs) * time.Second
 			}
 			code := "ServiceUnavailable"
 			if f.Status == http.StatusTooManyRequests {
@@ -253,6 +267,9 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) dispatch(host string, route routeMatch, r *http.Request, body []byte, rec *Request) response {
+	if scheme := r.Header.Get(HeaderOriginalScheme); scheme != "" && scheme != "https" {
+		return violationResponse(rec, "graph-contract", "plain "+scheme+" request to "+host+" (Microsoft endpoints are https only)")
+	}
 	if host == loginHost {
 		return s.handleLogin(route, r, body)
 	}
@@ -290,6 +307,15 @@ func (s *Server) dispatch(host string, route routeMatch, r *http.Request, body [
 		return violationResponse(rec, "graph-contract", "malformed query: "+err.Error())
 	}
 	return s.handleGraph(route, q, body, rec)
+}
+
+// knownHost reports whether the fake serves host.
+func knownHost(host string) bool {
+	switch host {
+	case graphHost, loginHost, SharePointHost, WorkflowHost:
+		return true
+	}
+	return false
 }
 
 func (s *Server) finish(w http.ResponseWriter, rec *Request, start time.Time, resp response) {
@@ -1345,6 +1371,7 @@ func (s *Server) postMessage(chatID string, body []byte, rec *Request, quote boo
 	m.Attachments = pm.Attachments
 	m.Mentions = pm.Mentions
 	m.Hosted = len(pm.HostedContents)
+	m.HostedHashes = hostedHashes(pm.HostedContents)
 	m.QuotedIDs = quoted
 	m.Instance = rec.Instance
 	m.RequestSeq = rec.Seq
@@ -1371,6 +1398,31 @@ var atTagID = func(content string) []string {
 		}
 		ids = append(ids, rest[:j])
 	}
+}
+
+// hostedHashes returns "sha256:<hex>" of each posted hosted content's
+// contentBytes ("sha256:invalid" when it is not base64).
+func hostedHashes(items []json.RawMessage) []string {
+	var out []string
+	for _, raw := range items {
+		var hc struct {
+			ContentBytes string `json:"contentBytes"`
+		}
+		_ = json.Unmarshal(raw, &hc)
+		data, err := base64.StdEncoding.DecodeString(hc.ContentBytes)
+		if err != nil {
+			out = append(out, "sha256:invalid")
+			continue
+		}
+		out = append(out, HashBytes(data))
+	}
+	return out
+}
+
+// HashBytes is the "sha256:<hex>" form used for hosted contents and files.
+func HashBytes(data []byte) string {
+	sum := sha256.Sum256(data)
+	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 func validateMessagePayload(pm postedMessage, requireBody bool) string {

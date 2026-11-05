@@ -16,7 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/baaaaaaaka/codex-helper/internal/core/delegate/machineregistry"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakegraph"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/harness"
 )
@@ -59,7 +58,6 @@ const routePostMessage = "POST /chats/{chat}/messages"
 // no write during the idle window or after a restart, one conversion
 // summary.
 func TestShadowRealData(t *testing.T) {
-	cxpOnly(t)
 	src, seed, home, outDir := os.Getenv(envShadowStore), os.Getenv(envShadowSeed), os.Getenv(envShadowCodexHome), os.Getenv(envShadowOut)
 	if src == "" || seed == "" || home == "" || outDir == "" {
 		t.Skip("real-data shadow run only: set " + strings.Join([]string{envShadowStore, envShadowSeed, envShadowCodexHome, envShadowOut}, ", "))
@@ -101,8 +99,11 @@ func TestShadowRealData(t *testing.T) {
 		Title:      "shadow run on the owner's real store and sessions: " + mode,
 		Budget:     4 * time.Hour,
 		NoStart:    true,
-		SUTEnv: map[string]string{"E2E_SUT_PRODUCTION_TIMING": "1", "E2E_SUT_MACHINE_REGISTRY": "1",
-			"CODEX_HOME": home},
+		Seam:       harness.Seam{ProductionTiming: true},
+		Args:       []string{"--machine-registry"},
+		UserEnv:    map[string]string{"CODEX_HOME": home},
+		Golden:     harness.GoldenOptions{Skip: "opt-in shadow run on the owner's private data: its transcript is not committed"},
+		Invariants: harness.Invariants{CPUBudget: 4 * time.Hour},
 	})
 	defer s.Finish()
 
@@ -370,9 +371,13 @@ func shadowSeq(s *harness.Scenario) int64 {
 // shadowRequests counts the Graph requests after seq: writes (any non-GET
 // to Graph) by route, reads by route.
 // shadowRegistryTopic is the machine registry inbox. Its card is edited
-// in place once per heartbeat (machineregistry.DefaultHeartbeatInterval,
-// as in the old helper), plus once when an instance starts or stops.
+// in place once per heartbeat (shadowRegistryHeartbeat, as in the old
+// helper), plus once when an instance starts or stops.
 const shadowRegistryTopic = "CXP Machine Registry"
+
+// shadowRegistryHeartbeat is the documented production interval of the
+// machine card heartbeat (F-XM-2: every 5 minutes).
+const shadowRegistryHeartbeat = 5 * time.Minute
 
 // shadowRequests splits the Graph requests since a mark into writes and
 // reads by route. Edits of the registry card are counted apart, as
@@ -404,7 +409,7 @@ func shadowRequests(s *harness.Scenario, since int64) (writes, reads map[string]
 // shadowHeartbeatsMax: one card edit per heartbeat interval in the window,
 // plus one for each instance start and stop.
 func shadowHeartbeatsMax(window time.Duration, restarts int) int {
-	return int(window/machineregistry.DefaultHeartbeatInterval) + 1 + 2*restarts
+	return int(window/shadowRegistryHeartbeat) + 1 + 2*restarts
 }
 
 // shadowDrained: nothing queued in the outbox, every tracked rollout read

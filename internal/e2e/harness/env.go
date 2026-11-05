@@ -1,6 +1,7 @@
-// Package harness holds the SUT-agnostic parts of the Teams black-box E2E
-// harness: the isolated environment, the network sandbox transport, the fake
-// Codex, waiters, observations and verdict recording.
+// Package harness is the Teams black-box E2E harness: the isolated
+// environment, the fake Codex, the scenario lifecycle, waiters, the
+// transcript goldens and the global invariants checked at teardown. It
+// reaches cxp only from outside (see internal/e2e/doc.go).
 package harness
 
 import (
@@ -9,18 +10,21 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakegraph"
+	"github.com/baaaaaaaka/codex-helper/internal/e2e/rollout"
 )
 
 // Env is one scenario's isolated filesystem and process environment.
 //
-// The SUT reads its configuration from environment variables. Every variable
-// is recorded in Vars; a subprocess SUT gets exactly Vars (plus PATH). Only
-// when SetProcessEnv is true (in-process adapters) does Env also t.Setenv
-// them, which forbids parallel scenarios within one test binary.
+// cxp reads its configuration from environment variables a user could set
+// (HOME, XDG dirs, CODEX_HOME, token caches, ...). Every one is recorded in
+// Vars; the cxp processes get exactly Vars (plus PATH and TMPDIR). The test
+// process's own environment is never changed, so scenarios run in
+// parallel.
 type Env struct {
 	Root        string
 	Home        string
@@ -36,6 +40,29 @@ type Env struct {
 
 	TokenCaches map[string]string // kind -> path
 	Vars        map[string]string // every variable this Env set
+
+	mu       sync.Mutex
+	rollouts []*rollout.Writer
+}
+
+// TrackRollout registers a rollout the scenario writes as a local Codex
+// user, for the order and catch-up invariants.
+func (e *Env) TrackRollout(w *rollout.Writer) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	for _, have := range e.rollouts {
+		if have.Path == w.Path {
+			return
+		}
+	}
+	e.rollouts = append(e.rollouts, w)
+}
+
+// Rollouts returns the tracked rollouts.
+func (e *Env) Rollouts() []*rollout.Writer {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]*rollout.Writer(nil), e.rollouts...)
 }
 
 // ClientIDs used for the fake app registrations.
@@ -45,17 +72,9 @@ const (
 	MachineLabel     = "e2ehost"
 )
 
-// SetProcessEnv makes NewEnv apply the variables to the test process. The
-// in-process adapter needs it; sut.Run clears it for the subprocess adapter.
-var SetProcessEnv = true
-
-// Parallel marks the test parallel when the environment allows it (i.e.
-// when the SUT runs as a subprocess).
-func Parallel(t *testing.T) {
-	if !SetProcessEnv {
-		t.Parallel()
-	}
-}
+// Parallel marks the scenario parallel (every SUT is its own process with
+// its own environment).
+func Parallel(t *testing.T) { t.Parallel() }
 
 // NewEnv creates the directory tree, writes fake token caches issued by g and
 // points every relevant environment variable at them.
@@ -106,12 +125,7 @@ func NewEnv(t testing.TB, g *fakegraph.Server) *Env {
 		e.TokenCaches[kind] = path
 	}
 
-	set := func(k, v string) {
-		if SetProcessEnv {
-			t.Setenv(k, v)
-		}
-		e.Vars[k] = v
-	}
+	set := func(k, v string) { e.Vars[k] = v }
 	set("HOME", e.Home)
 	set("XDG_STATE_HOME", e.StateDir)
 	set("XDG_CONFIG_HOME", e.ConfigDir)

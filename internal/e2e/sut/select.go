@@ -1,4 +1,7 @@
-// Package sut selects the system under test for the scenario packages.
+// Package sut runs the system under test of the scenario packages: the
+// release `cxp` binary (./cmd/codex-proxy, built without build tags),
+// started as a user starts the Teams helper (`cxp teams run`) and reached
+// only through its external interfaces (see internal/e2e/doc.go).
 package sut
 
 import (
@@ -6,80 +9,96 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakecodex"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/harness"
-	"github.com/baaaaaaaka/codex-helper/internal/e2e/sut/newcore"
 )
 
-// EnvSUT names the adapter to use:
-//
-//	cxp      (default) the core through the production entry point:
-//	         `cxp teams run` (e2e build tag)
-//	newcore  the core (internal/core/engine) as a bare subprocess:
-//	         real channel/teams adapter, codexagent + fake app-server
+// EnvSUT may name the SUT; "cxp" (the default) is the only one.
 const EnvSUT = "E2E_SUT"
 
-// Run is the TestMain body of every scenario package: it selects the SUT,
-// builds the binaries it needs (once per test binary) and runs the tests.
+// Run is the TestMain body of every scenario package: it builds the cxp
+// binary and the fake Codex (once per test binary) and runs the tests.
 func Run(m *testing.M) int {
-	switch name := os.Getenv(EnvSUT); name {
-	case "newcore":
-		dir, err := os.MkdirTemp("", "e2e-bin-")
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 2
-		}
-		defer os.RemoveAll(dir)
-		bins := newcore.Binaries{
-			SUT:   filepath.Join(dir, "newcore-sut"),
-			Codex: filepath.Join(dir, "codex"),
-		}
-		start := time.Now()
-		if err := goBuild(bins.SUT, "./internal/e2e/sut/newcore/cmd/newcore-sut"); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 2
-		}
-		if err := goBuild(bins.Codex, "./internal/e2e/fakecodex/cmd/fakecodex"); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 2
-		}
-		fmt.Fprintf(os.Stderr, "e2e: built SUT binaries in %v\n", time.Since(start).Round(time.Millisecond))
-		harness.DefaultFactory = newcore.ProcessFactory(bins)
-		harness.SetProcessEnv = false
-	case "", "cxp":
-		dir, err := os.MkdirTemp("", "e2e-bin-")
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 2
-		}
-		defer os.RemoveAll(dir)
-		bins := newcore.Binaries{
-			SUT:   filepath.Join(dir, "cxp"),
-			Codex: filepath.Join(dir, "codex"),
-		}
-		start := time.Now()
-		// The real cxp entry point; the e2e tag only adds the sandbox
-		// transport and the scenario's timing (internal/cli/teams_newcore_e2e.go).
-		if err := goBuild(bins.SUT, "./cmd/codex-proxy", "-tags", "e2e"); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 2
-		}
-		if err := goBuild(bins.Codex, "./internal/e2e/fakecodex/cmd/fakecodex"); err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			return 2
-		}
-		fmt.Fprintf(os.Stderr, "e2e: built SUT binaries in %v\n", time.Since(start).Round(time.Millisecond))
-		harness.DefaultFactory = newcore.CXPFactory(bins)
-		harness.CLIBinary = bins.SUT
-		harness.SetProcessEnv = false
-	default:
-		fmt.Fprintf(os.Stderr, "unknown %s %q (known: cxp, newcore)\n", EnvSUT, name)
+	if name := os.Getenv(EnvSUT); name != "" && name != "cxp" {
+		fmt.Fprintf(os.Stderr, "unknown %s %q (the only SUT is cxp)\n", EnvSUT, name)
 		return 2
 	}
-	return m.Run()
+	dir, err := os.MkdirTemp("", "e2e-bin-")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+	defer os.RemoveAll(dir)
+	cxp, codex := filepath.Join(dir, "cxp"), filepath.Join(dir, "codex")
+	start := time.Now()
+	if err := goBuild(cxp, "./cmd/codex-proxy"); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+	if err := goBuild(codex, "./internal/e2e/fakecodex/cmd/fakecodex"); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 2
+	}
+	fmt.Fprintf(os.Stderr, "e2e: built cxp and the fake Codex in %v\n", time.Since(start).Round(time.Millisecond))
+	harness.CLIBinary = cxp
+	harness.DefaultFactory = Factory(cxp, codex)
+	return harness.RunAndCheckLeaks(m)
+}
+
+// Factory returns the SUT factory for the cxp binary.
+//
+// Lifecycle (harness.ProcessSUT):
+//   - Start runs `cxp teams run --codex-path <fake codex> ...` with the
+//     scenario's environment (HOME, XDG dirs, CODEX_HOME, token caches) and
+//     the test seam (CXP_TEST_ONLY_SEAM: the fake Graph endpoint, the
+//     instance tag, the timing profile and the host name).
+//   - Stop sends SIGTERM and waits; Crash sends SIGKILL to the helper only
+//     (its app-servers see their stdin close).
+//   - Restart is Stop + Start on the same state.
+//   - An exit with harness.ServiceRestartExitCode is followed by a new
+//     instance on the same state, as the service manager does.
+func Factory(cxp, codex string) harness.SUTFactory {
+	return func(cfg harness.SUTConfig) (harness.SUT, error) {
+		args := []string{"teams", "run", "--codex-path", codex,
+			"--machine-registry=false", "--auto-update=false", "--auto-service=false"}
+		args = append(args, cfg.Args...)
+		name := "cxp"
+		if cfg.Peer != "" {
+			name += "-" + cfg.Peer
+		}
+		env := func(tag string) []string {
+			vars := map[string]string{}
+			for k, v := range cfg.Env.Vars {
+				vars[k] = v
+			}
+			vars["PATH"] = os.Getenv("PATH")
+			vars["TMPDIR"] = os.Getenv("TMPDIR")
+			vars["GOTRACEBACK"] = "all"
+			// The fake Codex reads its own settings from the environment it
+			// inherits from cxp, like a real Codex reads CODEX_HOME.
+			vars[fakecodex.EnvBrainURL] = cfg.Codex.BrainURL()
+			vars[fakecodex.EnvKind] = "work"
+			vars[fakecodex.EnvInstance] = tag
+			for k, v := range cfg.UserEnv {
+				vars[k] = v
+			}
+			vars[harness.EnvSeam] = cfg.Seam.Value(cfg.Graph.URL(), tag, cfg.Interval)
+			out := make([]string, 0, len(vars))
+			for k, v := range vars {
+				if v != "" || k == "CODEX_DIR" {
+					out = append(out, k+"="+v)
+				}
+			}
+			sort.Strings(out)
+			return out
+		}
+		return harness.NewProcessSUT(cfg, harness.ProcessSpec{Name: name, Binary: cxp, Args: args, Env: env}), nil
+	}
 }
 
 // goBuild builds pkg (relative to the module root) into out.

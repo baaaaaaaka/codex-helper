@@ -46,7 +46,7 @@ printf '%s' '{"results":[{"index":0,"png":"`+base64.StdEncoding.EncodeToString(i
 		Guarantees: []string{"D13"},
 		Title:      "a display formula is posted as TeX code plus a rendered image; during the renderer install and when Graph refuses the image it is code only, never held or dropped",
 		Budget:     150 * time.Second,
-		SUTEnv:     map[string]string{"PATH": bin + string(os.PathListSeparator) + os.Getenv("PATH")},
+		UserEnv:    map[string]string{"PATH": bin + string(os.PathListSeparator) + os.Getenv("PATH")},
 	})
 	defer s.Finish()
 	s.Codex.SetScript(func(c harness.CodexCall) harness.CodexBehavior {

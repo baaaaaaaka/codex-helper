@@ -43,6 +43,7 @@ func (s *Server) PostImageAsUser(chatID, text string, png []byte) (Message, erro
 	src := fmt.Sprintf("https://graph.microsoft.com/v1.0/chats/%s/messages/%s/hostedContents/%s/$value", chatID, m.ID, hcID)
 	m.Content = TextToHTML(text) + fmt.Sprintf(`<p><img src="%s" width="64" height="64" alt="image" itemid="0"></p>`, src)
 	m.Hosted = 1
+	m.HostedHashes = []string{HashBytes(png)}
 	if s.hosted == nil {
 		s.hosted = map[hostedKey][]byte{}
 	}
@@ -97,6 +98,7 @@ func (s *Server) PostVoiceAsUser(chatID, name string, data []byte) (Message, err
 	})
 	m.Attachments = append(m.Attachments, att)
 	m.Hosted = 1
+	m.HostedHashes = []string{HashBytes(data)}
 	if s.hosted == nil {
 		s.hosted = map[hostedKey][]byte{}
 	}

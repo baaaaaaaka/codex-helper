@@ -17,14 +17,14 @@ import (
 // running or completed, never when it failed or was cancelled, and never
 // for a message with attachments or pasted images; the window is counted
 // from the earlier prompt. DuplicateFor is scaled to 6 s through
-// E2E_SUT_TIMING.
+// the test seam's timing knob.
 func TestDuplicateGuardEdges(t *testing.T) {
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "DUP-EDGE", harness.Options{
 		Guarantees: []string{"F-WRK-dup", "R-3", "R-1"},
 		Title:      "duplicate guard: repeat after the window runs; repeat of a failed prompt runs; same caption with a different image runs; other chat runs; plain repeat is ignored",
 		Budget:     120 * time.Second,
-		SUTEnv:     map[string]string{"E2E_SUT_TIMING": "DuplicateFor=6s"},
+		Seam:       harness.Seam{Knobs: map[string]string{"DuplicateFor": "6s"}},
 	})
 	defer s.Finish()
 	failTok := s.Token("fails")

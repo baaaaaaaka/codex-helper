@@ -27,6 +27,7 @@ func NewRolloutAt(t testing.TB, env *Env, cwd string, start time.Time) *Rollout 
 	if err != nil {
 		t.Fatalf("create rollout: %v", err)
 	}
+	env.TrackRollout(w)
 	return &Rollout{Writer: w}
 }
 

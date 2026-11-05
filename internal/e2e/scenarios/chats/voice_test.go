@@ -48,7 +48,7 @@ esac
 		Guarantees: []string{"F-ATT-voice", "R-37", "R-22"},
 		Title:      "voice clip transcribed by the external ASR command runs as a prompt; each failure class gets a visible reason and no Codex turn",
 		Budget:     150 * time.Second,
-		SUTEnv:     map[string]string{"CODEX_HELPER_TEAMS_ASR_COMMAND": script},
+		UserEnv:    map[string]string{"CODEX_HELPER_TEAMS_ASR_COMMAND": script},
 	})
 	defer s.Finish()
 	control := steps.ReadyControlChat(s)

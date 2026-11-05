@@ -16,7 +16,7 @@ import (
 // 10 consecutive capacity failures and resets after substantive progress;
 // the 5-minute bound limits waiting for capacity, it must not fail a long
 // task whose continuation made progress for longer than that. The window
-// is scaled to 5 s (E2E_SUT_TIMING CapacityRetry=5s, CapacityBackoff=300ms).
+// is scaled to 5 s (test seam knobs CapacityRetry=5s, CapacityBackoff=300ms).
 //
 // Attempt 1 fails with capacity at once. Attempt 2 makes progress for 8 s
 // (longer than the window) and then fails with capacity again. Attempt 3
@@ -27,7 +27,7 @@ func TestCapacityWindowResetsAfterProgress(t *testing.T) {
 		Guarantees: []string{"capacity-retry-5min"},
 		Title:      "capacity error, then a continuation that works longer than the retry window and hits capacity again: retried again, answered once",
 		Budget:     90 * time.Second,
-		SUTEnv:     map[string]string{"E2E_SUT_TIMING": "CapacityRetry=5s,CapacityBackoff=300ms"},
+		Seam:       harness.Seam{Knobs: map[string]string{"CapacityRetry": "5s", "CapacityBackoff": "300ms"}},
 	})
 	defer s.Finish()
 	tok := s.Token("capwin")

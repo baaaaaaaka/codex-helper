@@ -13,7 +13,7 @@ import (
 // Silence hints and the stall bound (R-19, SPEC acceptance: a silent
 // Codex gets one hint at 7 min, one at 15 min, and is stopped at the 60
 // min stall bound with one visible message). The bounds are scaled down
-// through E2E_SUT_TIMING (3 s / 6 s / 10 s); the code path is the
+// through the test seam's timing knobs (3 s / 6 s / 10 s); the code path is the
 // production one.
 func TestSilenceHintsAndStallBound(t *testing.T) {
 	harness.Parallel(t)
@@ -21,7 +21,7 @@ func TestSilenceHintsAndStallBound(t *testing.T) {
 		Guarantees: []string{"R-19", "R-20", "R-22"},
 		Title:      "a silent Codex turn: one hint at SilenceHint, one at SilenceStuck, stopped at StallLimit with one notice; the chat keeps working",
 		Budget:     90 * time.Second,
-		SUTEnv:     map[string]string{"E2E_SUT_TIMING": "SilenceHint=3s,SilenceStuck=6s,StallLimit=10s"},
+		Seam:       harness.Seam{Knobs: map[string]string{"SilenceHint": "3s", "SilenceStuck": "6s", "StallLimit": "10s"}},
 	})
 	defer s.Finish()
 	silent := s.Token("silent")

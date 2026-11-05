@@ -10,7 +10,7 @@ import (
 type Request struct {
 	Seq      int64
 	At       time.Time
-	Instance string // SUT instance tag added by the harness transport
+	Instance string // SUT instance tag (X-Cxp-Test-Instance)
 	Host     string // original host (graph.microsoft.com / login.microsoftonline.com)
 	Method   string
 	RawPath  string // escaped path + "?" + raw query, as sent
@@ -21,8 +21,10 @@ type Request struct {
 	Body     string // request body, truncated
 	Status   int
 	Fault    string // name of the injected fault, if any
-	Outcome  string // "ok", "fault", "violation", "dropped", "error"
-	Duration time.Duration
+	// RetryAfter is the Retry-After the fake answered with (0 = none).
+	RetryAfter time.Duration
+	Outcome    string // "ok", "fault", "violation", "dropped", "error"
+	Duration   time.Duration
 }
 
 // String renders a compact one-line form for logs and reports.
@@ -68,7 +70,7 @@ func (v Violation) Key() string {
 	return v.Kind + " " + v.Method + " " + v.Route + ": " + v.Reason
 }
 
-// BlockedRequest is an attempt to reach a host other than Graph or login.
+// BlockedRequest is an attempt to reach a host the fake does not serve.
 type BlockedRequest struct {
 	At       time.Time
 	Instance string

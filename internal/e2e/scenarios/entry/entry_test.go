@@ -13,16 +13,9 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakegraph"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/harness"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/steps"
-	"github.com/baaaaaaaka/codex-helper/internal/e2e/sut"
 )
 
 const runningLine = "Teams helper (new core) running on "
-
-func cxpOnly(t *testing.T) {
-	if os.Getenv(sut.EnvSUT) != "cxp" {
-		t.Skip("production entry point scenarios run with E2E_SUT=cxp")
-	}
-}
 
 // teamsDir is the helper's Teams state directory in the scenario sandbox.
 func teamsDir(s *harness.Scenario) string {
@@ -33,7 +26,6 @@ func teamsDir(s *harness.Scenario) string {
 // creates its store in the Teams state directory and serves the owner; a
 // restart runs on the same store.
 func TestEntryFreshInstall(t *testing.T) {
-	cxpOnly(t)
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "ENTRY-FRESH", harness.Options{
 		Guarantees: []string{"entry-point"},
@@ -79,13 +71,14 @@ func TestEntryFreshInstall(t *testing.T) {
 // rc.59) stops the new core before it reads Teams or creates anything: the
 // owner is told to run rc.59 once first.
 func TestEntryRefusesUnconvertedStore(t *testing.T) {
-	cxpOnly(t)
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "ENTRY-MIGRATE", harness.Options{
 		Guarantees: []string{"entry-point", "unsupported-store-refused"},
 		Title:      "an intermediate-release store is refused with the rc.59 instruction; nothing is touched",
 		Budget:     60 * time.Second,
 		NoStart:    true,
+		Invariants: harness.Invariants{Except: []harness.Exception{{Invariant: harness.InvCleanStop, Match: "exited on its own with \"exit status 1\"",
+			Reason: "the point of the scenario: an unsupported store stops the helper with an error"}}},
 	})
 	defer s.Finish()
 	dir := teamsDir(s)
@@ -119,7 +112,6 @@ var chatIDRE = regexp.MustCompile(`19:[A-Za-z0-9_.-]+@thread\.v2`)
 // notice once, also across a restart, which runs on the converted store
 // without converting again.
 func TestEntryConvertsOldStoreAtFirstStart(t *testing.T) {
-	cxpOnly(t)
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "ENTRY-AUTOMIGRATE", harness.Options{
 		Guarantees: []string{"entry-point", "auto-migrate"},

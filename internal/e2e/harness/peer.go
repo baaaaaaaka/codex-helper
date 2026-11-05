@@ -1,50 +1,44 @@
 package harness
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
-	"sort"
 	"strings"
+	"sync"
 	"syscall"
-	"testing"
 	"time"
 )
 
+// PeerOptions configures a second helper on the scenario's state.
+type PeerOptions struct {
+	// Seam is merged over the scenario's seam (e.g. another Hostname).
+	Seam Seam
+	// Args are extra `cxp teams run` flags (e.g. --managed-service-child).
+	Args []string
+}
+
 // NewPeer builds a second SUT on this scenario's state (same HOME, Graph
-// and Codex), as another host sharing the home would run it. extraEnv is
-// added to the scenario's SUTEnv. The peer is not started; the scenario
-// stops it at cleanup.
-func (s *Scenario) NewPeer(peer string, extraEnv map[string]string) SUT {
+// and Codex), as another host sharing the home would run it. The peer is
+// not started; the scenario stops it at teardown and checks it like the
+// main SUT.
+func (s *Scenario) NewPeer(peer string, opts PeerOptions) SUT {
 	s.T.Helper()
-	env := map[string]string{}
-	for k, v := range s.Opts.SUTEnv {
-		env[k] = v
-	}
-	for k, v := range extraEnv {
-		env[k] = v
-	}
-	p, err := s.Opts.Factory(SUTConfig{Env: s.Env, Graph: s.Graph, Codex: s.Codex, Interval: s.Opts.Interval, ExtraEnv: env,
-		WorkflowWebhookURL: s.WorkflowWebhookURL, Peer: peer, Logf: s.T.Logf})
+	p, err := s.Opts.Factory(s.sutConfig(peer, opts.Seam, opts.Args))
 	if err != nil {
 		s.T.Fatalf("build peer SUT: %v", err)
 	}
-	s.T.Cleanup(func() {
-		Thaw(p)
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		defer cancel()
-		if p.Running() {
-			_ = p.Stop(ctx)
-		}
-	})
+	s.mu.Lock()
+	s.suts = append(s.suts, p)
+	s.mu.Unlock()
 	return p
 }
 
-// Freeze stops a subprocess SUT's helper process with SIGSTOP (a hung or
-// partitioned host: no heartbeat, no request), Thaw resumes it. Both are
-// no-ops for an SUT without a process.
+// Freeze stops a SUT's helper process with SIGSTOP (a hung or partitioned
+// host: no heartbeat, no request); Thaw resumes it.
 func Freeze(sut SUT) bool { return signalPID(sut, syscall.SIGSTOP) }
 
 // Thaw resumes a frozen SUT (SIGCONT).
@@ -58,59 +52,123 @@ func signalPID(sut SUT, sig syscall.Signal) bool {
 	return syscall.Kill(p.Pid(), sig) == nil
 }
 
-// StorePath finds the SUT's store database under the scenario root
-// (cxp: <state>/…/core.sqlite; newcore-sut: <state>/core/core.db), "" when
-// it does not exist yet.
+// StorePath is the helper's store database as `cxp teams status` reports
+// it ("Store: <path>"), "" when status names none.
 func (s *Scenario) StorePath() string {
-	var found []string
-	_ = filepath.WalkDir(s.Env.Root, func(path string, d os.DirEntry, err error) error {
-		if err != nil {
-			return nil
+	s.T.Helper()
+	res := s.runCLI(20*time.Second, false, "teams", "status")
+	for _, line := range strings.Split(res.Stdout+"\n"+res.Stderr, "\n") {
+		if rest, ok := strings.CutPrefix(strings.TrimSpace(line), "Store:"); ok {
+			path := strings.TrimSpace(rest)
+			if i := strings.Index(path, " ("); i >= 0 {
+				path = path[:i]
+			}
+			if _, err := os.Stat(path); err == nil {
+				return path
+			}
 		}
-		if !d.IsDir() && (d.Name() == "core.sqlite" || d.Name() == "core.db") {
-			found = append(found, path)
-		}
-		return nil
-	})
-	sort.Strings(found)
-	if len(found) == 0 {
-		return ""
 	}
-	return found[0]
+	return ""
 }
 
-// CLIBinary is the cxp binary scenarios run CLI commands with (set by
-// sut.Run when E2E_SUT=cxp; "" otherwise).
+// CLIBinary is the cxp binary scenarios run CLI commands with (sut.Run).
 var CLIBinary string
 
-// NeedsCLI skips a scenario that drives the cxp command line when the SUT
-// is not cxp. Call it before NewScenario, so a skipped scenario emits no
-// verdict.
-func NeedsCLI(t *testing.T) {
+// NeedsCLI is kept for the scenarios that drive the cxp command line; the
+// SUT is always the cxp binary, so it only checks the binary was built.
+func NeedsCLI(t interface {
+	Helper()
+	Fatal(...any)
+}) {
 	t.Helper()
 	if CLIBinary == "" {
-		t.Skip("needs the cxp binary (E2E_SUT=cxp)")
+		t.Fatal("harness: no cxp binary (run the scenarios through sut.Run)")
 	}
+}
+
+// CLIRun is one `cxp` command run by the scenario, as the user would see it.
+type CLIRun struct {
+	Args   []string
+	Stdout string
+	Stderr string
+	Code   int
 }
 
 // RunCLI runs `cxp <args>` with the scenario's environment (HOME, state,
 // token caches; never the host's) and returns its combined output and exit
-// code. It skips the scenario when no cxp binary is available.
+// code. The run is part of the transcript golden.
 func (s *Scenario) RunCLI(timeout time.Duration, args ...string) (string, int) {
 	s.T.Helper()
-	if CLIBinary == "" {
-		s.T.Skip("needs the cxp binary (E2E_SUT=cxp)")
-	}
+	res := s.runCLI(timeout, true, args...)
+	return res.Combined, res.Code
+}
+
+// CLIAs describes who runs a cxp command: by default the scenario's user on
+// the scenario's machine.
+type CLIAs struct {
+	// Env overrides user environment variables (e.g. another HOME: another
+	// machine of the same user).
+	Env map[string]string
+	// Dir is the working directory ("" = HOME).
+	Dir string
+	// Hostname is the host name the command believes it runs on.
+	Hostname string
+}
+
+// RunCLIAs is RunCLI run as as; the run is part of the golden.
+func (s *Scenario) RunCLIAs(timeout time.Duration, as CLIAs, args ...string) CLIResult {
+	s.T.Helper()
+	return s.runCLIWith(timeout, true, as, args...)
+}
+
+// CLIResult is the outcome of one cxp command.
+type CLIResult struct {
+	Stdout, Stderr, Combined string
+	Code                     int
+}
+
+func (s *Scenario) runCLI(timeout time.Duration, record bool, args ...string) CLIResult {
+	return s.runCLIWith(timeout, record, CLIAs{}, args...)
+}
+
+func (s *Scenario) runCLIWith(timeout time.Duration, record bool, as CLIAs, args ...string) CLIResult {
+	s.T.Helper()
+	NeedsCLI(s.T)
 	ctx, cancel := context.WithTimeout(s.ctx, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, CLIBinary, args...)
-	env := []string{"PATH=" + os.Getenv("PATH"), "TMPDIR=" + os.Getenv("TMPDIR"), "CXP_RUNTIME_DISABLE=1"}
+	vars := map[string]string{"PATH": os.Getenv("PATH"), "TMPDIR": os.Getenv("TMPDIR")}
 	for k, v := range s.Env.Vars {
-		env = append(env, k+"="+v)
+		vars[k] = v
 	}
-	cmd.Env = env
+	for k, v := range s.Opts.UserEnv {
+		vars[k] = v
+	}
+	// CLI commands that talk to Teams (workflow test, delegate) use the
+	// same seam as the helper, tagged as the CLI.
+	for k, v := range as.Env {
+		if strings.HasPrefix(k, "E2E_") || strings.HasPrefix(k, "CXP_TEST") {
+			s.T.Fatalf("harness: CLI env %s is a test switch", k)
+		}
+		vars[k] = v
+	}
+	vars[EnvSeam] = s.Opts.Seam.With(Seam{Hostname: as.Hostname}).Value(s.Graph.URL(), "cxp-cli", s.Opts.Interval)
+	for k, v := range vars {
+		cmd.Env = append(cmd.Env, k+"="+v)
+	}
 	cmd.Dir = s.Env.Home
-	out, err := cmd.CombinedOutput()
+	if h := as.Env["HOME"]; h != "" {
+		cmd.Dir = h
+	}
+	if as.Dir != "" {
+		cmd.Dir = as.Dir
+	}
+	var stdout, stderr, combined bytes.Buffer
+	var mu lockedWriter
+	mu.w = &combined
+	cmd.Stdout = io.MultiWriter(&stdout, &mu)
+	cmd.Stderr = io.MultiWriter(&stderr, &mu)
+	err := cmd.Run()
 	code := 0
 	if err != nil {
 		code = -1
@@ -118,9 +176,25 @@ func (s *Scenario) RunCLI(timeout time.Duration, args ...string) (string, int) {
 			code = ee.ExitCode()
 		}
 	}
-	text := string(out)
-	s.T.Logf("cxp %s -> exit %d\n%s", strings.Join(args, " "), code, clipTail(text, 2000))
-	return text, code
+	res := CLIResult{Stdout: stdout.String(), Stderr: stderr.String(), Combined: combined.String(), Code: code}
+	s.T.Logf("cxp %s -> exit %d\n%s", strings.Join(args, " "), code, clipTail(res.Combined, 2000))
+	if record {
+		s.mu.Lock()
+		s.cli = append(s.cli, CLIRun{Args: append([]string(nil), args...), Stdout: res.Stdout, Stderr: res.Stderr, Code: code})
+		s.mu.Unlock()
+	}
+	return res
+}
+
+type lockedWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (l *lockedWriter) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.w.Write(p)
 }
 
 func clipTail(s string, n int) string {

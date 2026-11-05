@@ -1,18 +1,39 @@
-// Package e2e is the root of the black-box end-to-end harness for the Teams
-// service (CLEANUP-PLAN §10). It contains test code only:
+// Package e2e is the root of the black-box end-to-end suite of the Teams
+// helper. It contains test code only.
 //
-//   - fakegraph: strict in-memory Microsoft Graph (Teams chats/messages,
-//     onlineMeetings) and login.microsoftonline.com token endpoint, with
-//     fault injection, a full request log and a contract-violation list.
-//   - harness: per-scenario isolated environment, sandbox HTTP transport,
-//     SUT interface, fake Codex, rollout writer, waiters and verdicts.
-//   - sut/oldcore: adapter for the current internal/teams core (exported API
-//     only); sut.MustSelect picks the adapter from E2E_SUT.
-//   - steps: shared black-box scenario steps.
-//   - scenarios/*: scenario packages named after the SPEC guarantees (R-*).
+// The system under test is the release `cxp` binary (./cmd/codex-proxy,
+// built without build tags) started as a user starts it (`cxp teams run`),
+// and nothing else. The suite reaches it only through:
 //
-// Scenarios observe only the fake Teams service, the fake Codex and the SUT
-// output. Run them only in the offline Docker runner (no network, throwaway
-// HOME), e.g. `go test -json -count=1 ./internal/e2e/...`; each scenario
+//   - Microsoft Graph and login over HTTP: fakegraph, a strict in-memory
+//     Graph (chats, messages, hosted contents, drive uploads, meetings),
+//     login.microsoftonline.com and Teams Workflow webhooks, with fault
+//     injection and a full request log;
+//   - Codex: fakecodex, a fake `codex app-server` binary cxp launches, and
+//     rollout files under CODEX_HOME (rollout);
+//   - the cxp command line (Scenario.RunCLI / RunCLIAs);
+//   - files a user or the OS sees (the store location, the kill-switch
+//     file, the conversion report), signals (SIGTERM, SIGKILL, SIGSTOP);
+//   - the one documented test seam, CXP_TEST_ONLY_SEAM
+//     (docs/teams-e2e-test-seam.md): Microsoft endpoints, instance tag,
+//     timing profile, host name.
+//
+// TestBlackBoxBoundary enforces the boundary on imports: E2E code may
+// import only the harness, the fakes, rollout, the standard library and
+// third-party packages.
+//
+// Packages:
+//
+//   - harness: isolated environment, scenario lifecycle, waiters, transcript
+//     goldens (golden.go, normalize.go) and global invariants checked at
+//     every teardown (invariants.go);
+//   - sut: builds cxp and the fake Codex and starts cxp for the harness;
+//   - steps: shared black-box scenario steps;
+//   - scenarios/*: the scenario packages, each with testdata/<id>.golden.
+//
+// Run the scenarios only in the offline Docker runner (no network,
+// throwaway HOME), e.g. `go test -count=1 ./internal/e2e/...`. Each scenario
 // prints one `E2E-VERDICT {json}` line with its structured result.
+// E2E_UPDATE_GOLDEN=1 regenerates the goldens; E2E_GOLDEN_OUT=<dir> writes
+// the actual transcripts to <dir> (for a read-only source tree).
 package e2e

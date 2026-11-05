@@ -30,7 +30,7 @@ func TestServiceChildStandsByInsteadOfRestarting(t *testing.T) {
 		Guarantees: []string{"R-13", "F-XM-1", "F-XM-4"},
 		Title:      "a service-run helper refused by a live owner or the kill-switch file stands by in-process with no Graph traffic, and takes over once the refusal is gone",
 		Budget:     120 * time.Second,
-		SUTEnv:     map[string]string{"E2E_SUT_TIMING": "Heartbeat=500ms", "E2E_SUT_HOSTNAME": "host-a"},
+		Seam:       harness.Seam{Knobs: map[string]string{"Heartbeat": "500ms"}, Hostname: "host-a"},
 	})
 	defer s.Finish()
 	control := steps.ReadyControlChat(s)
@@ -40,7 +40,10 @@ func TestServiceChildStandsByInsteadOfRestarting(t *testing.T) {
 	_, answered := steps.WaitAnswered(s, work.ID, first, steps.AnswerTimeout)
 	s.Check("host A answers", answered, "answered", fmt.Sprint(answered))
 
-	b := s.NewPeer("B", map[string]string{"E2E_SUT_HOSTNAME": "host-b", "E2E_SUT_MANAGED_CHILD": "1", "E2E_SUT_REFUSAL_RECHECK": "500ms"})
+	b := s.NewPeer("B", harness.PeerOptions{
+		Seam: harness.Seam{Hostname: "host-b", Knobs: map[string]string{"RefusalRecheck": "500ms"}},
+		Args: []string{"--managed-service-child"},
+	})
 	bFrom := s.Graph.LastSeq()
 	if err := b.Start(s.Ctx()); err != nil {
 		t.Fatal(err)

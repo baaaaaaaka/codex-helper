@@ -39,6 +39,7 @@ type Writer struct {
 	ordinal   int
 	clock     time.Time
 	realtime  bool
+	written   []Written
 }
 
 // New creates sessions/YYYY/MM/DD/rollout-<ts>-<id>.jsonl under sessionsDir
@@ -141,6 +142,25 @@ func (w *Writer) append(records ...map[string]any) error {
 	return nil
 }
 
+// Written is one text a Writer wrote, in order: what a local Codex user
+// produced, for the harness's order and catch-up invariants.
+type Written struct {
+	At   time.Time // wall-clock time of the write
+	Kind string    // "prompt", "commentary", "answer" or "aborted"
+	Text string
+}
+
+func (w *Writer) logWritten(kind, text string) {
+	w.written = append(w.written, Written{At: time.Now(), Kind: kind, Text: text})
+}
+
+// Written returns everything this Writer wrote so far.
+func (w *Writer) Written() []Written {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return append([]Written(nil), w.written...)
+}
+
 // Turn describes one turn to append.
 type Turn struct {
 	// ID is the Codex turn id. Empty generates one.
@@ -198,6 +218,7 @@ func (w *Writer) BeginTurn(turn Turn) (OpenTurn, error) {
 		turnID = w.uuid()
 	}
 	startedAt := w.clock
+	w.logWritten("prompt", turn.Prompt)
 	userID := "msg_" + w.uuid()
 	clientID := turn.ClientID
 	if clientID == "" {
@@ -246,14 +267,17 @@ func (w *Writer) FinishTurn(open OpenTurn, turn Turn) error {
 	defer w.mu.Unlock()
 	turnID := open.ID
 	if turn.Aborted {
+		w.logWritten("aborted", "")
 		return w.append(line(w.tick(), "event_msg", map[string]any{
 			"type": "turn_aborted", "turn_id": turnID, "reason": "interrupted",
 		}))
 	}
 	var recs []map[string]any
 	if turn.Commentary != "" {
+		w.logWritten("commentary", turn.Commentary)
 		recs = append(recs, w.agent(turnID, "commentary", turn.Commentary)...)
 	}
+	w.logWritten("answer", turn.Answer)
 	recs = append(recs, w.agent(turnID, "final_answer", turn.Answer)...)
 	recs = append(recs,
 		line(w.tick(), "event_msg", map[string]any{

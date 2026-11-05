@@ -9,6 +9,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -39,7 +40,13 @@ type Verdict struct {
 	Requests   int      `json:"requests"`
 	Routes     []string `json:"routes,omitempty"`
 	CodexCalls int      `json:"codex_calls"`
-	OutputTail string   `json:"output_tail,omitempty"`
+	// Invariants are the teardown invariant results (name: "ok",
+	// "waived: <reason>" or the failures).
+	Invariants map[string]string `json:"invariants,omitempty"`
+	// Golden is "match", "updated", "written" or "mismatch".
+	Golden     string  `json:"golden,omitempty"`
+	CPUSeconds float64 `json:"cpu_seconds"`
+	OutputTail string  `json:"output_tail,omitempty"`
 }
 
 // Options configures a scenario.
@@ -47,16 +54,27 @@ type Options struct {
 	Guarantees []string
 	Title      string
 	Budget     time.Duration // whole-scenario time budget (default 60s)
-	Interval   time.Duration // SUT base poll interval (default 250ms)
+	Interval   time.Duration // fast timing base of the seam (default 250ms)
 	Graph      fakegraph.Options
 	Factory    SUTFactory
 	NoStart    bool
-	// SUTEnv is passed to a subprocess SUT (see SUTConfig.ExtraEnv).
-	SUTEnv map[string]string
+	// Seam is the scenario's test-seam setting: production timing, named
+	// waits, host name (the endpoint and instance are always set).
+	Seam Seam
+	// Args are extra `cxp teams run` flags (e.g. "--machine-registry").
+	Args []string
+	// UserEnv are environment variables a user could set for the helper
+	// (e.g. CODEX_HELPER_TEAMS_ASR_COMMAND, PATH). Test switches (E2E_*,
+	// CXP_TEST_*) are refused: the seam is the only one.
+	UserEnv map[string]string
 	// WorkflowWebhook gives the owner a Teams Workflow webhook (served by
-	// the fake, see fakegraph.NewWorkflowWebhook) that the SUT is
-	// configured with before it starts (SUTConfig.WorkflowWebhookURL).
+	// the fake) and enables it with `cxp teams workflow enable
+	// --webhook-url-file` before the helper starts.
 	WorkflowWebhook bool
+	// Invariants adjusts the teardown invariants (invariants.go).
+	Invariants Invariants
+	// Golden adjusts the transcript golden (golden.go).
+	Golden GoldenOptions
 }
 
 // Scenario owns one isolated run.
@@ -77,10 +95,15 @@ type Scenario struct {
 	dumped             bool
 	ctx                context.Context
 	cancel             context.CancelFunc
+
+	mu      sync.Mutex
+	suts    []SUT // the SUT and every peer, for teardown
+	cli     []CLIRun
+	tokens  int
+	verdict *Verdict
 }
 
-// DefaultFactory is used when Options.Factory is nil. The scenarios package
-// sets it.
+// DefaultFactory is used when Options.Factory is nil. sut.Run sets it.
 var DefaultFactory SUTFactory
 
 // NewScenario builds the fake world and the SUT and (unless NoStart) starts
@@ -99,6 +122,17 @@ func NewScenario(t *testing.T, id string, opts Options) *Scenario {
 	if opts.Factory == nil {
 		t.Fatal("harness: no SUT factory configured")
 	}
+	for k := range opts.UserEnv {
+		if strings.HasPrefix(k, "E2E_") || strings.HasPrefix(k, "CXP_TEST") {
+			t.Fatalf("harness: UserEnv %s is a test switch; use Options.Seam", k)
+		}
+	}
+	if err := opts.Invariants.validate(); err != nil {
+		t.Fatalf("harness: %v", err)
+	}
+	if err := opts.Golden.validate(); err != nil {
+		t.Fatalf("harness: %v", err)
+	}
 	g := fakegraph.New(opts.Graph)
 	env := NewEnv(t, g)
 	codex := NewFakeCodex()
@@ -107,30 +141,44 @@ func NewScenario(t *testing.T, id string, opts Options) *Scenario {
 		T: t, ID: id, Opts: opts, Graph: g, Env: env, Codex: codex,
 		started: time.Now(), budget: time.Now().Add(opts.Budget), ctx: ctx, cancel: cancel,
 	}
-	if opts.WorkflowWebhook {
-		s.WorkflowWebhookURL = g.NewWorkflowWebhook()
-	}
-	sut, err := opts.Factory(SUTConfig{Env: env, Graph: g, Codex: codex, Interval: opts.Interval, ExtraEnv: opts.SUTEnv, WorkflowWebhookURL: s.WorkflowWebhookURL, Logf: t.Logf})
+	sut, err := opts.Factory(s.sutConfig("", Seam{}, nil))
 	if err != nil {
 		t.Fatalf("build SUT: %v", err)
 	}
 	s.SUT = sut
+	s.suts = append(s.suts, sut)
 	t.Cleanup(s.cleanup)
+	if opts.WorkflowWebhook {
+		s.WorkflowWebhookURL = g.NewWorkflowWebhook()
+		s.EnableWorkflow(s.WorkflowWebhookURL)
+	}
 	if !opts.NoStart {
 		s.StartSUT()
 	}
 	return s
 }
 
-func (s *Scenario) cleanup() {
-	stopCtx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-	defer cancel()
-	if s.SUT != nil && s.SUT.Running() {
-		if err := s.SUT.Stop(stopCtx); err != nil {
-			s.T.Logf("SUT stop during cleanup: %v", err)
-			s.dumpGoroutines("cleanup stop failed")
-		}
+func (s *Scenario) sutConfig(peer string, seam Seam, args []string) SUTConfig {
+	return SUTConfig{Env: s.Env, Graph: s.Graph, Codex: s.Codex, Interval: s.Opts.Interval,
+		Seam: s.Opts.Seam.With(seam), Args: append(append([]string(nil), s.Opts.Args...), args...),
+		UserEnv: s.Opts.UserEnv, Peer: peer, Logf: s.T.Logf}
+}
+
+// EnableWorkflow configures the owner's Workflow webhook the way a user
+// does: `cxp teams workflow enable --webhook-url-file <file>`.
+func (s *Scenario) EnableWorkflow(url string) {
+	s.T.Helper()
+	secret := filepath.Join(s.Env.Root, "workflow-webhook-url")
+	if err := os.WriteFile(secret, []byte(url+"\n"), 0o600); err != nil {
+		s.T.Fatalf("write webhook url file: %v", err)
 	}
+	if _, code := s.RunCLI(40*time.Second, "teams", "workflow", "enable", "--webhook-url-file", secret); code != 0 {
+		s.T.Fatalf("cxp teams workflow enable exited %d", code)
+	}
+}
+
+func (s *Scenario) cleanup() {
+	s.teardown()
 	s.Codex.ReleaseAll()
 	s.Codex.Close()
 	s.Codex.KillAppServers()
@@ -246,10 +294,11 @@ func (s *Scenario) Require(desc string, timeout time.Duration, cond func() (bool
 	}
 }
 
-// Settle waits until the SUT has made no Graph write for quiet, bounded by
-// max. It is used before "exactly once" assertions so late duplicates get a
-// chance to appear.
-func (s *Scenario) Settle(quiet, max time.Duration) {
+// Settle waits until the SUT has made no Graph write for quiet and no
+// Codex turn runs, bounded by max; it reports whether that happened. It is
+// used before "exactly once" assertions so late duplicates get a chance to
+// appear.
+func (s *Scenario) Settle(quiet, max time.Duration) bool {
 	deadline := time.Now().Add(max)
 	if deadline.After(s.budget) {
 		deadline = s.budget
@@ -270,16 +319,28 @@ func (s *Scenario) Settle(quiet, max time.Duration) {
 				}
 			}
 			if !running {
-				return
+				return true
 			}
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
+	return false
 }
 
-// Finish emits the structured verdict. It is safe to call more than once;
-// only the first call emits.
-func (s *Scenario) Finish() Verdict {
+// Finish marks the end of the scenario body. The verdict (checks,
+// invariants, golden) is emitted at teardown, after the invariants ran; it
+// is safe to call Finish more than once.
+func (s *Scenario) Finish() {}
+
+// emitVerdict writes the structured verdict (once).
+func (s *Scenario) emitVerdict(inv map[string]string, golden string, cpu time.Duration) Verdict {
+	s.mu.Lock()
+	if s.verdict != nil {
+		v := *s.verdict
+		s.mu.Unlock()
+		return v
+	}
+	s.mu.Unlock()
 	v := Verdict{
 		Scenario:   s.ID,
 		Guarantees: s.Opts.Guarantees,
@@ -291,13 +352,11 @@ func (s *Scenario) Finish() Verdict {
 		Requests:   len(s.Graph.Requests(fakegraph.RequestFilter{})),
 		Routes:     s.RequestsSummary(fakegraph.RequestFilter{}),
 		CodexCalls: len(s.Codex.Calls()),
+		Invariants: inv,
+		Golden:     golden,
+		CPUSeconds: cpu.Seconds(),
 	}
-	v.Pass = len(s.checks) > 0
-	for _, c := range s.checks {
-		if !c.Pass {
-			v.Pass = false
-		}
-	}
+	v.Pass = !s.T.Failed()
 	seen := map[string]int{}
 	var order []string
 	for _, viol := range s.Graph.Violations() {
@@ -317,7 +376,7 @@ func (s *Scenario) Finish() Verdict {
 		v.OutputTail = s.OutputTail(3000)
 		s.logCodexLogs()
 	}
-	if s.dumped && s.T != nil {
+	if s.dumped {
 		v.Notes = append(v.Notes, "goroutine dump emitted in test log")
 	}
 	data, _ := json.Marshal(v)
@@ -326,6 +385,9 @@ func (s *Scenario) Finish() Verdict {
 		_ = os.MkdirAll(dir, 0o755)
 		_ = os.WriteFile(filepath.Join(dir, sanitize(s.ID)+".json"), data, 0o644)
 	}
+	s.mu.Lock()
+	s.verdict = &v
+	s.mu.Unlock()
 	return v
 }
 
@@ -388,7 +450,7 @@ func (s *Scenario) dumpGoroutines(reason string) {
 	stacks := strings.Split(string(buf[:n]), "\n\n")
 	var keep []string
 	for _, st := range stacks {
-		if strings.Contains(st, "internal/teams") || strings.Contains(st, "internal/e2e") {
+		if strings.Contains(st, "internal/e2e") {
 			keep = append(keep, st)
 		}
 	}
@@ -408,7 +470,7 @@ func (s *Scenario) dumpGoroutines(reason string) {
 		cancel()
 		var keep []string
 		for _, st := range strings.Split(out, "\n\n") {
-			if strings.Contains(st, "internal/teams") {
+			if strings.Contains(st, "codex-helper/internal/") {
 				keep = append(keep, st)
 			}
 		}
@@ -562,9 +624,15 @@ func (s *Scenario) RequestsSummary(f fakegraph.RequestFilter) []string {
 	return out
 }
 
-// Token returns a unique token for embedding in a message.
+// Token returns a unique token for embedding in a message. Tokens are
+// numbered per scenario, so they are the same in every run (and in the
+// golden).
 func (s *Scenario) Token(label string) string {
-	return fmt.Sprintf("E2E-%s-%s-%d", sanitize(strings.ReplaceAll(s.ID, "-", "")), label, time.Now().UnixNano()%1000000)
+	s.mu.Lock()
+	s.tokens++
+	n := s.tokens
+	s.mu.Unlock()
+	return fmt.Sprintf("E2E-%s-%s-%d", sanitize(strings.ReplaceAll(s.ID, "-", "")), label, n)
 }
 
 func short(id string) string {

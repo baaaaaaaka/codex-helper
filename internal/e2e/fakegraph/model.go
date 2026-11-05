@@ -47,18 +47,21 @@ type User struct {
 
 // Message is one stored chat message.
 type Message struct {
-	ID           string
-	ChatID       string
-	Created      time.Time
-	Modified     time.Time
-	MessageType  string
-	FromUserID   string
-	FromName     string
-	ContentType  string
-	Content      string
-	Attachments  []json.RawMessage
-	Mentions     []json.RawMessage
-	Hosted       int
+	ID          string
+	ChatID      string
+	Created     time.Time
+	Modified    time.Time
+	MessageType string
+	FromUserID  string
+	FromName    string
+	ContentType string
+	Content     string
+	Attachments []json.RawMessage
+	Mentions    []json.RawMessage
+	Hosted      int
+	// HostedHashes are "sha256:<hex>" of each hosted content's bytes, in
+	// the order they were posted.
+	HostedHashes []string
 	QuotedIDs    []string
 	Origin       Origin
 	Instance     string // SUT instance tag (from the harness transport), if any
@@ -106,6 +109,7 @@ func (m *Message) Snapshot() Message {
 	c.Mentions = append([]json.RawMessage(nil), m.Mentions...)
 	c.QuotedIDs = append([]string(nil), m.QuotedIDs...)
 	c.PatchHistory = append([]string(nil), m.PatchHistory...)
+	c.HostedHashes = append([]string(nil), m.HostedHashes...)
 	return c
 }
 

@@ -101,8 +101,8 @@ func (s *Server) Violations() []Violation {
 	return append([]Violation(nil), s.violations...)
 }
 
-// RecordBlocked records a request the harness transport refused because it
-// targeted a foreign host.
+// RecordBlocked records a request to a host the fake does not serve (it is
+// dropped unanswered, as the offline sandbox would).
 func (s *Server) RecordBlocked(b BlockedRequest) {
 	s.mu.Lock()
 	s.blocked = append(s.blocked, b)

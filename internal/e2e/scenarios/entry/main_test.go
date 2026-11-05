@@ -1,7 +1,6 @@
 // Package entry holds black-box Teams E2E scenarios for the production entry
-// point of the new core, `cxp teams run` (E2E_SUT=cxp): where it
-// keeps its store, and that an old store is never converted implicitly.
-// Under other SUTs the scenarios are skipped.
+// point, `cxp teams run`: where it keeps its store, and that an old store
+// is converted only in the supported cases.
 //
 // Each scenario package is its own test binary so `go test` can run the
 // packages in parallel.

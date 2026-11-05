@@ -28,7 +28,7 @@ func TestKillSwitchFile(t *testing.T) {
 		Guarantees: []string{"F-XM-4", "F-XM-1", "R-1"},
 		Title:      "DISABLED next to the store stops the running helper, refuses a start with no Graph traffic; removing it resumes and answers the held prompt once",
 		Budget:     120 * time.Second,
-		SUTEnv:     map[string]string{"E2E_SUT_TIMING": "Heartbeat=500ms"},
+		Seam:       harness.Seam{Knobs: map[string]string{"Heartbeat": "500ms"}},
 	})
 	defer s.Finish()
 	control := steps.ReadyControlChat(s)

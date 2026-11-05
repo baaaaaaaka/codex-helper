@@ -16,7 +16,6 @@ import (
 
 	_ "modernc.org/sqlite"
 
-	corestore "github.com/baaaaaaaka/codex-helper/internal/core/store"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakegraph"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/harness"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/rollout"
@@ -44,7 +43,6 @@ const (
 // and its CPU is recorded until the catch-up drains and then over the
 // measured idle window, which must stay within the idle budget.
 func TestAcceptanceRealStoreFirstStart(t *testing.T) {
-	cxpOnly(t)
 	src := os.Getenv(envRealStore)
 	if src == "" {
 		t.Skip(envRealStore + " is not set (real-store acceptance run only)")
@@ -58,12 +56,14 @@ func TestAcceptanceRealStoreFirstStart(t *testing.T) {
 		measure = d
 	}
 	s := harness.NewScenario(t, "ACCEPT-REALSTORE", harness.Options{
-		Guarantees:      []string{"auto-migrate", "cpu-budget", "no-hot-loop"},
-		Title:           "first start on the owner's real rc.59 store: converted, owned at once, summary once, catch-up drains, CPU recorded",
-		Budget:          measure + 55*time.Minute,
-		NoStart:         true,
-		WorkflowWebhook: true,
-		SUTEnv:          map[string]string{"E2E_SUT_PRODUCTION_TIMING": "1", "E2E_SUT_MACHINE_REGISTRY": "1"},
+		Guarantees: []string{"auto-migrate", "cpu-budget", "no-hot-loop"},
+		Title:      "first start on the owner's real rc.59 store: converted, owned at once, summary once, catch-up drains, CPU recorded",
+		Budget:     measure + 55*time.Minute,
+		NoStart:    true,
+		Seam:       harness.Seam{ProductionTiming: true},
+		Args:       []string{"--machine-registry"},
+		Golden:     harness.GoldenOptions{Skip: "opt-in run on the owner's private store copy: its transcript is not committed"},
+		Invariants: harness.Invariants{CPUBudget: 2 * time.Hour},
 	})
 	defer s.Finish()
 
@@ -126,17 +126,22 @@ func TestAcceptanceRealStoreFirstStart(t *testing.T) {
 		return pid != 0 && strings.Contains(s.SUT.Output(), runningLine), s.OutputTail(300)
 	})
 
-	// Owned at once by this process, from generation 1.
-	core := filepath.Join(scope, "core.sqlite")
-	if st, err := corestore.OpenWith(core, corestore.Options{ReadOnly: true}); err == nil {
-		o, ok, err := st.OwnerInfo()
-		st.Close()
-		s.Check("the helper owns the new store at once (no old lease or generation)", ok && err == nil && o.PID == pid && o.Generation == 1,
-			fmt.Sprintf("pid %d generation 1", pid), fmt.Sprintf("%+v %v %v", o, ok, err))
-	} else {
-		s.Check("the converted store opens", false, "opened", err.Error())
-	}
+	// The owner's Workflow webhook, enabled the way the owner does it
+	// (`cxp teams workflow enable`) once the converted store is in use; a
+	// stopped helper's enable would write a fresh store before the
+	// conversion.
+	s.WorkflowWebhookURL = s.Graph.NewWorkflowWebhook()
+	s.EnableWorkflow(s.WorkflowWebhookURL)
 
+	// Owned at once by this process (`cxp teams status`: "Owner: <host> pid
+	// <pid>, heartbeat …"). The owner generation is not shown by any
+	// command, so "from generation 1" is not observable from outside.
+	status, _ := s.RunCLI(60*time.Second, "teams", "status")
+	ownerPID := 0
+	if m := regexp.MustCompile(`Owner: \S+ pid (\d+), heartbeat`).FindStringSubmatch(status); m != nil {
+		ownerPID, _ = strconv.Atoi(m[1])
+	}
+	s.Check("the helper owns the new store at once", ownerPID == pid, fmt.Sprintf("owner pid %d", pid), harness.NormalizeSpace(status))
 	// First control-chat poll within 5 s of the conversion.
 	s.WaitFor("the first control-chat poll", 30*time.Second, func() (bool, string) {
 		return len(s.Graph.Requests(fakegraph.RequestFilter{Method: "GET", ChatID: control})) > 0, strings.Join(s.RequestTail(5), "\n")

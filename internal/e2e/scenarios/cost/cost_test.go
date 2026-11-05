@@ -12,19 +12,16 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/steps"
 )
 
-// Production timing: `cxp teams run` polls with --interval 5s and leaves
-// the transcript sync interval at its default.
-func prodOptions(title string, guarantees []string, env map[string]string) harness.Options {
-	sutEnv := map[string]string{"E2E_SUT_PRODUCTION_TIMING": "1"}
-	for k, v := range env {
-		sutEnv[k] = v
-	}
+// Production timing: the helper runs with its production cadences (the
+// seam's timing=production); args are extra `cxp teams run` flags.
+func prodOptions(title string, guarantees []string, args ...string) harness.Options {
 	return harness.Options{
 		Guarantees: guarantees,
 		Title:      title,
 		Budget:     120 * time.Second,
 		Interval:   5 * time.Second,
-		SUTEnv:     sutEnv,
+		Seam:       harness.Seam{ProductionTiming: true},
+		Args:       args,
 	}
 }
 
@@ -38,7 +35,7 @@ func TestDelegationInboxReadPressure(t *testing.T) {
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "INBOX", prodOptions(
 		"idle helper with machine registry: inbox reads <= 1/min, no idle writes",
-		[]string{"F-XM-2", "R-14", "R-12"}, map[string]string{"E2E_SUT_MACHINE_REGISTRY": "1"}))
+		[]string{"F-XM-2", "R-14", "R-12"}, "--machine-registry"))
 	defer s.Finish()
 	steps.ReadyControlChat(s)
 	var inbox fakegraph.ChatInfo
@@ -70,7 +67,7 @@ func TestIdleCost(t *testing.T) {
 	const n = 6
 	s := harness.NewScenario(t, "IDLE", prodOptions(
 		fmt.Sprintf("%d idle work chats: chat reads independent of N, no writes, CPU <= 1%% of a core", n),
-		[]string{"R-14", "R-22"}, nil))
+		[]string{"R-14", "R-22"}))
 	defer s.Finish()
 	control := steps.ReadyControlChat(s)
 	before := map[string]bool{}
