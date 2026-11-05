@@ -59,8 +59,13 @@ TAG = re.compile(r"<[^>]+>")
 EXPECT_CLASSES = ("post:", "read:short-unverifiable", "DUP:")
 
 
+# v0.1.20 renders a Markdown link to a local file as the path alone
+# ("[name](/abs/path:1)" -> "/abs/path:1"): key a record the same way.
+LOCAL_LINK = re.compile(r"\[([^\]\n]*)\]\((/[^)\s]+)\)")
+
+
 def letters(s):
-    return NONLETTER.sub("", s or "").lower()
+    return NONLETTER.sub("", LOCAL_LINK.sub(r"\2", s or "")).lower()
 
 
 def jl(path):
@@ -298,8 +303,10 @@ def main():
             continue
         recs, _, _ = scan_rollout(p)
         last = None
+        # a turn whose prompt has the old helper's wrapper was run from Teams
+        wrapped_turns = {r["turn"] for r in recs if r.get("wrapped") and r["turn"]}
         for r in recs:
-            if r["turn"] in teams_turns or r.get("wrapped") or (r["ts"] and r["ts"] < cut_ms):
+            if r["turn"] in teams_turns or r["turn"] in wrapped_turns or r.get("wrapped") or (r["ts"] and r["ts"] < cut_ms):
                 continue
             last = r
         if last is not None:
@@ -325,7 +332,11 @@ def main():
         conv = run["convs"].get(s["conv"])
         if conv and conv["label"] not in base_conv:
             run_new[p] = conv
-    disc = dict(expected=len(expected_new), created=len(run_new),
+    # a session the live mode wrote inside the container (not on the host):
+    # measured by the scenario itself, left out of the comparison
+    live_labels = {run_new[p]["label"] for p in list(run_new) if not os.path.exists(p)}
+    run_new = {p: c for p, c in run_new.items() if os.path.exists(p)}
+    disc = dict(live_injected=sorted(live_labels), expected=len(expected_new), created=len(run_new),
                 missing=sorted(os.path.basename(p) for p in expected_new if p not in run_new),
                 unexpected=sorted(os.path.basename(p) for p in run_new if p not in expected_new))
     for p, conv in run_new.items():
@@ -363,6 +374,11 @@ def main():
             notices[(g["kind"], tmpl)] += 1
             if c and c["kind"] == "control":
                 control_msgs.append(dict(kind=g["kind"], text=g["text"][:400]))
+        if label in live_labels:
+            totals["live-injected convs (left out)"] += 1
+            totals["live-injected mirror posts"] += len(mirror)
+            totals["live-injected status posts"] += len(status)
+            continue
         e = exp.get(label, [])
         res = match(e, mirror)
         row = dict(label=label, chat=chat, state=c["state"] if c else None, new=label not in base_conv,

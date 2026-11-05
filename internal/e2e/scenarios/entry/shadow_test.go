@@ -2,6 +2,7 @@ package entry
 
 import (
 	"bufio"
+	"bytes"
 	"compress/gzip"
 	"database/sql"
 	"encoding/json"
@@ -445,7 +446,7 @@ func shadowDrained(s *harness.Scenario, core string) (bool, string) {
 		if err != nil || now.Sub(fi.ModTime()) < 10*time.Minute {
 			continue
 		}
-		if off < fi.Size() {
+		if off < fi.Size() && !shadowOpenTurnOnly(p, off, fi.Size()) {
 			behind++
 		}
 	}
@@ -535,4 +536,26 @@ func shadowCopyFile(src, dst string) error {
 		return err
 	}
 	return out.Close()
+}
+
+// shadowOpenTurnOnly reports whether what follows off in a rollout is one
+// turn that never ended (a session left mid-turn): the tracker resumes at
+// that turn's start, so the source is read to its end although its offset
+// is short of the size. A tail with a turn end in it, or too long to scan,
+// is behind.
+func shadowOpenTurnOnly(path string, off, size int64) bool {
+	if size-off > 64<<20 {
+		return false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	tail := make([]byte, size-off)
+	if _, err := f.ReadAt(tail, off); err != nil {
+		return false
+	}
+	starts := bytes.Count(tail, []byte(`"type":"task_started"`))
+	return starts <= 1 && !bytes.Contains(tail, []byte(`"type":"task_complete"`)) && !bytes.Contains(tail, []byte(`"type":"turn_aborted"`))
 }
