@@ -83,9 +83,14 @@ var teamsTestSeamTimingKnobs = map[string]func(*engine.Timing, time.Duration){
 	// capacity is retried (5 min) and the first retry delay (10 s, doubling).
 	"CapacityRetry":   func(t *engine.Timing, d time.Duration) { t.CapacityRetry = d },
 	"CapacityBackoff": func(t *engine.Timing, d time.Duration) { t.CapacityBackoff = d },
-	// RefusalRecheck (not an engine setting): how often a service-run
-	// helper refused the store re-checks (45 s).
+	// RefusalRecheck (not an engine setting): how often a standby reads
+	// the lease (20 s) and a service-run helper refused the store's write
+	// lock re-checks it (45 s).
 	"RefusalRecheck": nil,
+	// Takeover (not an engine setting): how long a standby waits for the
+	// owner to renew its lease before it takes over (90 s); the lease's
+	// other intervals scale with it (internal/core/lease.Scaled).
+	"Takeover": nil,
 }
 
 var errTeamsTestSeamInvalid = errors.New(envTeamsTestSeam + " is set but invalid; it is a test-only switch: unset it")

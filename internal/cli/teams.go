@@ -326,15 +326,15 @@ func newTeamsControlCmd() *cobra.Command {
 }
 
 func printTeamsControlChat(out io.Writer) error {
-	path, _, err := teamsNewCoreCLIStorePath()
+	view, err := teamsReadStoreView()
 	if err != nil {
 		return err
 	}
-	if !teamsFileExists(path) {
+	if !view.exists() {
 		_, _ = fmt.Fprintln(out, "Teams control chat: none yet (the helper creates it when it first starts: `cxp teams run`)")
 		return nil
 	}
-	st, err := corestore.OpenWith(path, corestore.Options{ReadOnly: true})
+	st, err := view.openReadOnly()
 	if err != nil {
 		return err
 	}
@@ -598,8 +598,8 @@ func defaultRunTeamsDoctorLiveCheck(cmd *cobra.Command, root *rootOptions) error
 	lease.RetireSuspects(cmd.Context(), cmd.ErrOrStderr())
 	_, _ = fmt.Fprintf(out, "Graph auth: ok as %s\n", name)
 	chat := ""
-	if path, _, err := teamsNewCoreCLIStorePath(); err == nil && teamsFileExists(path) {
-		if st, err := corestore.OpenWith(path, corestore.Options{ReadOnly: true}); err == nil {
+	if view, err := teamsReadStoreView(); err == nil && view.exists() {
+		if st, err := view.openReadOnly(); err == nil {
 			if c, ok, _ := teamsControlConversation(st); ok {
 				chat = c.ExtChatID
 			}

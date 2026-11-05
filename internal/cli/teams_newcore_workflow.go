@@ -44,26 +44,9 @@ func updateTeamsNewCoreConfig(path string, fn func(*corestore.Tx) error) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return err
 	}
-	st, err := corestore.Open(path)
-	if err != nil {
-		return fmt.Errorf("open Teams core store: %w", err)
-	}
-	defer st.Close()
-	host, err := teamsHostname()
-	if err != nil {
-		return err
-	}
-	if _, err := st.Acquire(corestore.Ident{Host: host, PID: os.Getpid(), BootID: teamsBootID()}); err != nil {
-		switch {
-		case errors.Is(err, corestore.ErrOwnerLive):
-			return errTeamsHelperRunning
-		case errors.Is(err, corestore.ErrDisabled):
-			return fmt.Errorf("the Teams helper is disabled (%s exists next to %s)", corestore.DisabledFile, path)
-		}
-		return fmt.Errorf("acquire Teams core store: %w", err)
-	}
-	defer st.Release()
-	return st.Update(fn)
+	return teamsWithLeasedStore(context.Background(), path, func(st *corestore.Store) error {
+		return st.Update(fn)
+	})
 }
 
 // teamsWorkflowRequestName is the sidecar a command leaves next to the
@@ -263,10 +246,14 @@ func runTeamsNewCoreWorkflowDisable(out io.Writer, path string) error {
 // teamsNewCoreWorkflowConfig reads the Workflow setting from the store
 // ("" file when none is configured).
 func teamsNewCoreWorkflowConfig(path string) (enabled bool, file string, err error) {
-	if _, statErr := os.Stat(path); statErr != nil {
+	view, err := teamsStoreViewAt(path)
+	if err != nil {
+		return false, "", err
+	}
+	if !teamsFileExists(view.DB) {
 		return false, "", nil
 	}
-	st, err := corestore.OpenWith(path, corestore.Options{ReadOnly: true})
+	st, err := view.openReadOnly()
 	if err != nil {
 		return false, "", fmt.Errorf("open Teams core store: %w", err)
 	}

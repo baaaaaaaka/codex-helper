@@ -242,8 +242,8 @@ func (s *Store) Release() error {
 	if s.gen == 0 {
 		return nil
 	}
-	if s.ls != nil {
-		s.gen = 0 // the lease is released by its holder
+	if s.ls != nil && s.ls.Check() != nil {
+		s.gen = 0 // superseded: this file is no longer the store
 		return nil
 	}
 	_, err := s.w.Exec(`UPDATE owner SET heartbeat_at = 0 WHERE id = 1 AND generation = ?`, s.gen)

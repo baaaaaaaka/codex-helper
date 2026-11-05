@@ -24,6 +24,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/core/codexagent"
 	"github.com/baaaaaaaka/codex-helper/internal/core/delegate"
 	"github.com/baaaaaaaka/codex-helper/internal/core/engine"
+	"github.com/baaaaaaaka/codex-helper/internal/core/lease"
 	"github.com/baaaaaaaka/codex-helper/internal/core/migrate"
 	"github.com/baaaaaaaka/codex-helper/internal/core/skillcmd"
 	corestore "github.com/baaaaaaaka/codex-helper/internal/core/store"
@@ -119,7 +120,9 @@ func planTeamsCoreStore(stateDir string) (path, migrateFrom string, err error) {
 		found = append(found, p)
 	}
 	for _, dir := range migrate.Candidates(stateDir) {
-		if p := filepath.Join(dir, migrate.TargetName); exists(p) {
+		// A lease file means the store is managed there even while the
+		// file in use has another name (a takeover's copy).
+		if p := filepath.Join(dir, migrate.TargetName); exists(p) || exists(lease.Path(p)) {
 			add(p)
 			continue
 		}
@@ -133,7 +136,7 @@ func planTeamsCoreStore(stateDir string) (path, migrateFrom string, err error) {
 		}
 	}
 	fresh := filepath.Join(stateDir, "teams", migrate.TargetName)
-	if exists(fresh) {
+	if exists(fresh) || exists(lease.Path(fresh)) {
 		add(fresh)
 	}
 	switch {
@@ -284,12 +287,47 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 			return nil // stopped while waiting
 		}
 	}
-	if migrateFrom != "" {
+	// The lease decides which host owns the store; nothing opens the store
+	// with SQLite before it is held (teams_lease.go).
+	anchor := path
+	holder, err := teamsAcquireLease(ctx, anchor, host, teamsLeaseTiming(seam), opts.managedServiceChild, errOut)
+	if err != nil {
+		if ctx.Err() != nil {
+			return nil // stopped while standing by
+		}
+		if errors.Is(err, lease.ErrDisabled) {
+			return fmt.Errorf("the Teams helper is disabled (%s exists next to %s)", corestore.DisabledFile, path)
+		}
+		return fmt.Errorf("acquire Teams core store: %w", err)
+	}
+	defer holder.Release() // after the store is closed (deferred below)
+	plan := holder.Plan()
+	if plan.Quiet {
+		_, _ = fmt.Fprintf(errOut, "Teams helper taking over generation %d from %s (%s); waiting %s for it to stop\n",
+			plan.Gen, firstNonEmptyString(plan.From.Host, "an unfinished takeover"), plan.Why, teamsLeaseTiming(seam).Quiet)
+	}
+	if err := holder.WaitQuiet(ctx); err != nil {
+		if ctx.Err() != nil {
+			return nil
+		}
+		return teamsLeaseLostError(err, anchor)
+	}
+	switch {
+	case !plan.InPlace:
+		_, _ = fmt.Fprintf(errOut, "Teams helper copying the store %s to %s\n", plan.Src, plan.DB)
+		if err := corestore.CopySnapshot(plan.Src, plan.DB); err != nil {
+			return fmt.Errorf("take over the Teams core store: %w", err)
+		}
+	case migrateFrom != "" && plan.FromGen == 0:
 		if err := migrateTeamsStoreAtStart(ctx, migrateFrom, filepath.Join(paths.CodexDir, "sessions"), errOut); err != nil {
 			return err
 		}
 	}
-	st, err := corestore.Open(path)
+	if err := holder.Activate(); err != nil {
+		return teamsLeaseLostError(err, anchor)
+	}
+	path = plan.DB
+	st, err := corestore.OpenWith(path, corestore.Options{Lease: holder})
 	if err != nil {
 		return fmt.Errorf("open Teams core store: %w", err)
 	}
@@ -309,12 +347,12 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 	defer st.Release()
 
 	// Graph: the real adapter with the delegated token cache.
-	lease, err := newTeamsGraphHTTPClientLease(ctx, root, errOut)
+	graphLease, err := newTeamsGraphHTTPClientLease(ctx, root, errOut)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = lease.Close(context.Background()) }()
-	client := teamsFencedHTTPClient(lease.Client, st.Fence)
+	defer func() { _ = graphLease.Close(context.Background()) }()
+	client := teamsFencedHTTPClient(graphLease.Client, st.Fence)
 	authCfg, err := chteams.ResolveAuthConfig("")
 	if err != nil {
 		return fmt.Errorf("Teams auth: %w", err)
@@ -377,6 +415,7 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 	cfg := engine.Config{
 		Store: st, Channel: ch, ChannelName: "teams", Agent: ag,
 		Log: out, Timing: timing, ReadRate: readRate, Machine: machine, Version: buildVersion(),
+		Host: host, TakeoverWhy: plan.Why,
 		SessionsDir:  filepath.Join(paths.CodexDir, "sessions"),
 		FilesDir:     filepath.Join(dir, "core-files"),
 		ActivityScan: true,
@@ -424,6 +463,14 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 	_, _ = fmt.Fprintf(out, "Teams helper (new core) running on %s\n", path)
 	runCtx, cancelRun := context.WithCancel(ctx)
 	defer cancelRun()
+	go func() {
+		// Superseded or disabled: stop serving, close the store, exit.
+		select {
+		case <-holder.Lost():
+			cancelRun()
+		case <-runCtx.Done():
+		}
+	}()
 	go notifier.watch(runCtx)
 	gatewayFailed := make(chan struct{})
 	if gatewayDone != nil {
@@ -440,6 +487,9 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 		}()
 	}
 	err = e.Run(runCtx)
+	if lerr := holder.Err(); lerr != nil && ctx.Err() == nil {
+		return teamsLeaseLostError(lerr, anchor)
+	}
 	if errors.Is(err, corestore.ErrDisabled) {
 		return fmt.Errorf("the Teams helper is disabled (%s exists next to %s); stopped", corestore.DisabledFile, path)
 	}
