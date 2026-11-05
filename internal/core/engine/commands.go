@@ -89,7 +89,7 @@ func urgentCommand(text string) bool {
 		return false
 	}
 	switch f[0] {
-	case "cancel", "stop", "status", "st", "help", "?":
+	case "cancel", "stop", "status", "st", "help", "h", "menu", "?":
 		return true
 	}
 	return false
@@ -238,19 +238,19 @@ func (e *Engine) controlCommand(ctx context.Context, j cmdJob, text string) {
 	verb := strings.ToLower(fields[0])
 	arg := strings.TrimSpace(strings.TrimPrefix(text, fields[0]))
 	switch verb {
-	case "new", "n":
+	case "new", "n", "create": // `create`: v0.1.20 alias
 		e.cmdNew(ctx, j, arg)
-	case "help", "?":
+	case "help", "h", "menu", "?": // `h`, `menu`: v0.1.20 aliases
 		e.reply(j, controlHelp, nil)
-	case "list", "ls", "sessions":
+	case "list", "ls", "sessions", "s", "session", "history": // `s`, `session`, `history`: v0.1.20 aliases
 		e.reply(j, e.listText(), nil)
-	case "status":
+	case "status", "st": // `st`: v0.1.20 alias
 		e.reply(j, e.statusText(), nil)
 	case "r", "wake", "resume", "unpark": // `unpark`: v0.1.20 alias
 		e.cmdWake(j, arg)
 	case "park":
 		e.cmdParkLabel(j, arg)
-	case "restart":
+	case "restart", "reboot": // `reboot`: v0.1.20 alias
 		e.cmdRestart(j, strings.ToLower(arg))
 	case "update", "upgrade":
 		e.cmdHelperUpdate(ctx, j, arg)
