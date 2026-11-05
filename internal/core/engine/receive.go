@@ -567,6 +567,7 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 					newTurns = true
 				}
 			}
+			e.labelAdmitted(id, group, a, c) // F-RND-4: the user label (annotations.go)
 		}
 		if trip {
 			if err := e.tripBreaker(tx, id, label); err != nil {

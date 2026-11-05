@@ -312,6 +312,9 @@ type Engine struct {
 	// Prepare stopped the previous app-servers.
 	orphans map[int64]bool
 	stats   engineStats
+	// Teams edits (edits.go, annotations.go): queued chat edits per
+	// conversation.
+	edits map[int64][]*chatEdit
 }
 
 type engineStats struct {
@@ -591,6 +594,7 @@ func (e *Engine) start(ctx context.Context) error {
 		return err
 	}
 	e.resumeCreating()
+	e.resumeFreezes()
 	e.requeueCommands()
 	e.loadRestartConfirm()
 	if err := e.announceUpdate(); err != nil {

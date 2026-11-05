@@ -54,6 +54,7 @@ func (e *Engine) senderLoop(ctx context.Context) {
 type sendItem struct {
 	row    store.Outbox
 	create bool // create the chat of conv (row unset)
+	edit   bool // make conv's next chat edit (edits.go) instead of sending row
 	conv   int64
 	class  int
 }
@@ -72,6 +73,7 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 		file   *store.OutFile // an outbound file row
 		upload bool           // upload the file first (no send yet)
 		create int64          // create this conversation's chat (no row)
+		edit   int64          // make this conversation's next chat edit (edits.go)
 	}
 	var (
 		jobs  []job
@@ -100,6 +102,7 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 			return err
 		}
 		items = append(items, creates...)
+		items = e.withEdits(items, now, soon)
 		e.mu.Lock()
 		ctl := e.controlID
 		e.mu.Unlock()
@@ -133,6 +136,23 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 			return items[i].conv < items[j].conv
 		})
 		for _, it := range items {
+			if it.edit {
+				// A chat edit (edits.go) goes before the conversation's
+				// next row: the slot first, then the write token.
+				select {
+				case sem <- struct{}{}:
+				default:
+					soon(e.t.Tick)
+					return nil
+				}
+				if ok, w := e.takeWrite(); !ok {
+					<-sem
+					soon(w)
+					return nil
+				}
+				jobs = append(jobs, job{edit: it.conv})
+				continue
+			}
 			if it.create {
 				// The send slot first, then the write token (review L9).
 				select {
@@ -233,6 +253,9 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 		if j.create != 0 {
 			conv = j.create
 		}
+		if j.edit != 0 {
+			conv = j.edit
+		}
 		e.mu.Lock()
 		if cs := e.convs[conv]; cs != nil {
 			cs.sending = true
@@ -243,6 +266,14 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 			defer e.wg.Done()
 			defer func() { <-sem }()
 			switch {
+			case j.edit != 0:
+				e.runEdit(ctx, j.edit)
+				e.mu.Lock()
+				if cs := e.convs[j.edit]; cs != nil {
+					cs.sending = false
+				}
+				e.mu.Unlock()
+				e.wakeSender()
 			case j.create != 0:
 				e.createChat(ctx, j.create)
 				e.mu.Lock()
