@@ -270,6 +270,10 @@ type Engine struct {
 
 	readTokens  *pacer
 	writeTokens *pacer
+	// liveRun counts the live reads the receiver dispatched in a row while
+	// background reads waited (receive.go orderReads). Receiver goroutine
+	// only.
+	liveRun int
 	// sendLast is, per send class (sendClass), the last work conversation
 	// the sender served; the next pass starts after it (round robin).
 	// Sender goroutine only.

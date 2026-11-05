@@ -1466,7 +1466,7 @@ func TestScanFlaggedChatReadBeforeOverduePolls(t *testing.T) {
 	e := &Engine{convs: map[int64]*convState{
 		1: {id: 1, chat: "ctl", kind: store.KindControl, nextRead: now.Add(-3 * time.Second)},
 		2: {id: 2, chat: "hot", kind: store.KindWork, state: store.ConvActive, nextRead: now.Add(-2 * time.Second)},
-		3: {id: 3, chat: "new", kind: store.KindWork, state: store.ConvActive, nextRead: now, scanDue: true},
+		3: {id: 3, chat: "new", kind: store.KindWork, state: store.ConvActive, nextRead: now, scanDue: true, scanGen: 1, scanLive: 1},
 		4: {id: 4, chat: "idle", kind: store.KindWork, state: store.ConvActive, nextRead: now.Add(time.Minute)},
 	}}
 	if got := e.dueReads(now); !slices.Equal(got, []int64{3, 1, 2}) {

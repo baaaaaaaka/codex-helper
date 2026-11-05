@@ -84,11 +84,11 @@ func (e *Engine) dispatchReads(ctx context.Context, jobs chan<- int64) (time.Dur
 		// chat, gets the first read (scanLoop clears this).
 		return e.t.Tick, true
 	}
-	due := e.dueReads(now)
+	due, live := e.orderReads(now)
 	for i, id := range due {
 		if ok, wait := e.readTokens.take(); !ok {
-			// Out of read budget: the rest wait for a token, still
-			// ordered by how long they are overdue.
+			// Out of read budget: the rest wait for a token, live reads
+			// still first.
 			e.mu.Lock()
 			for _, rest := range due[i:] {
 				if cs := e.convs[rest]; cs != nil {
@@ -102,6 +102,11 @@ func (e *Engine) dispatchReads(ctx context.Context, jobs chan<- int64) (time.Dur
 		case jobs <- id:
 		case <-ctx.Done():
 			return 0, false
+		}
+		if live[i] {
+			e.liveRun = min(e.liveRun+1, liveReadsInARow)
+		} else {
+			e.liveRun = 0
 		}
 	}
 	return e.readSleep(e.untilNextRead(e.now())), true
@@ -139,35 +144,95 @@ func (e *Engine) readableLocked(cs *convState) bool {
 	return !(cs.kind == store.KindControl && cs.state == store.ConvClosed)
 }
 
-// dueReads returns the conversations whose next read is due, most overdue
-// first, and marks them as being read. The order matters when the account
-// read budget is short: a chat polled often (the control chat) must not
-// starve one that has waited longer.
+// liveReadsInARow is how many live reads the receiver dispatches in a row
+// while background reads wait: every fourth read then goes to the oldest
+// background read, so owner activity that alone fills the read budget (many
+// running turns) does not starve the start-up reads, read-backs and safety
+// reads. A live read waits for at most one background read.
+const liveReadsInARow = 3
+
+// dueReads returns the conversations whose next read is due in the order
+// they are read (orderReads) and marks them as being read.
 func (e *Engine) dueReads(now time.Time) []int64 {
+	due, _ := e.orderReads(now)
+	return due
+}
+
+// orderReads returns the conversations whose next read is due, in the
+// order they are read, with whether each is a live read, and marks them as
+// being read.
+//
+// Live reads are what the owner waits for: the control chat, a work chat
+// with a running turn or recent owner activity (polledLocked), and a chat
+// the activity scan showed with a new message that is not this helper's
+// own post (scanLive). They go before the background reads: the start-up
+// read of every chat, the read-back of a chat whose newest message is the
+// helper's own post (catch-up), and the safety reads of idle chats. A
+// catch-up queues hundreds of background reads at the account's read pace;
+// the owner's next message must not wait behind them (N-3: the control chat
+// every 5 s regardless of the backlog, never starved). Background reads
+// still get every fourth read while live ones wait (liveReadsInARow).
+//
+// The split applies in scan mode only (liveReadLocked). Within each class
+// a change the scan showed goes before timed reads, the oldest flag first
+// (S7b), then the most overdue first: under a short read budget a chat
+// polled often (the control chat) must not starve one that has waited
+// longer.
+func (e *Engine) orderReads(now time.Time) ([]int64, []bool) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	var due []int64
+	var live, bg []int64
 	for id, cs := range e.convs {
 		if !e.readableLocked(cs) || now.Before(cs.nextRead) {
 			continue
 		}
 		cs.reading = true
-		due = append(due, id)
+		if e.liveReadLocked(cs, now) {
+			live = append(live, id)
+		} else {
+			bg = append(bg, id)
+		}
 	}
-	sort.Slice(due, func(i, j int) bool {
-		a, b := e.convs[due[i]], e.convs[due[j]]
-		if a.scanDue != b.scanDue {
-			return a.scanDue // a change the scan showed goes before timed polls
+	byAge := func(due []int64) {
+		sort.Slice(due, func(i, j int) bool {
+			a, b := e.convs[due[i]], e.convs[due[j]]
+			if a.scanDue != b.scanDue {
+				return a.scanDue // a change the scan showed goes before timed reads
+			}
+			if a.scanDue && !a.scanSince.Equal(b.scanSince) {
+				return a.scanSince.Before(b.scanSince) // the oldest flag first (S7b)
+			}
+			if !a.nextRead.Equal(b.nextRead) {
+				return a.nextRead.Before(b.nextRead)
+			}
+			return due[i] < due[j]
+		})
+	}
+	byAge(live)
+	byAge(bg)
+	due := make([]int64, 0, len(live)+len(bg))
+	isLive := make([]bool, 0, len(live)+len(bg))
+	run := e.liveRun
+	for len(live) > 0 || len(bg) > 0 {
+		if len(bg) > 0 && (len(live) == 0 || run >= liveReadsInARow) {
+			due, isLive, bg, run = append(due, bg[0]), append(isLive, false), bg[1:], 0
+			continue
 		}
-		if a.scanDue && !a.scanSince.Equal(b.scanSince) {
-			return a.scanSince.Before(b.scanSince) // the oldest flag first (S7b)
-		}
-		if !a.nextRead.Equal(b.nextRead) {
-			return a.nextRead.Before(b.nextRead)
-		}
-		return due[i] < due[j]
-	})
-	return due
+		due, isLive, live, run = append(due, live[0]), append(isLive, true), live[1:], run+1
+	}
+	return due, isLive
+}
+
+// liveReadLocked reports whether a due read of a conversation is a live
+// read (orderReads; caller holds e.mu). Without an activity scan (polling
+// mode) every read is live: a chat's timed poll is the only way the
+// owner's message in it is found, so the overdue-first order applies to
+// all of them, as before.
+func (e *Engine) liveReadLocked(cs *convState, now time.Time) bool {
+	if e.scanner == nil {
+		return true
+	}
+	return e.polledLocked(cs, now) || (cs.scanDue && cs.scanLive != 0)
 }
 
 // interval is the read interval of a conversation (caller holds e.mu).
@@ -257,6 +322,9 @@ func (e *Engine) read(ctx context.Context, id int64) {
 	if err == nil {
 		cs.failures = 0
 		cs.nextRead = start.Add(e.intervalLocked(cs, now))
+		if cs.scanLive <= gen {
+			cs.scanLive = 0 // read: the change was before the read started
+		}
 		if cs.nextRead.Before(now) || cs.scanGen != gen {
 			// The scan marked the chat while this read ran: the change
 			// may be newer than what it returned.
@@ -1033,7 +1101,8 @@ func (e *Engine) markScanned(acts []channel.ChatActivity, mark, now time.Time) (
 		if cs.kind == store.KindWork && cs.state != store.ConvActive {
 			continue // parked or closed: no reads until woken
 		}
-		if a.LastID != "" && slices.Contains(cs.ownPosts, a.LastID) && e.polledLocked(cs, now) {
+		own := a.LastID != "" && slices.Contains(cs.ownPosts, a.LastID)
+		if own && e.polledLocked(cs, now) {
 			// The newest message is one this helper sent (S7): about
 			// half the scan's reads went to such chats, mostly acks,
 			// progress and finals in chats with a running or recent
@@ -1053,6 +1122,11 @@ func (e *Engine) markScanned(acts []channel.ChatActivity, mark, now time.Time) (
 		}
 		cs.scanDue = true
 		cs.scanGen++
+		if !own {
+			// Not the helper's own post: a message the owner (or someone
+			// else) sent, read at live priority (orderReads).
+			cs.scanLive = cs.scanGen
+		}
 		if cs.nextRead.After(now) {
 			cs.nextRead = now
 		}

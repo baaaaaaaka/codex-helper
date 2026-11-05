@@ -66,6 +66,12 @@ type convState struct {
 	// flagged chats are read oldest flag first (S7b), so one whose read
 	// drew a throttle is not overtaken by newer flags.
 	scanSince time.Time
+	// scanLive is the scan mark (scanGen) of the newest change whose
+	// newest message is not one this helper sent (0: none unread): a
+	// message of the owner or someone else, read at live priority. A
+	// change that shows only the helper's own post is read back in the
+	// background.
+	scanLive uint64
 	// ownPosts are the ids of the messages this helper sent last (S7): a
 	// scan whose newest message is one of them shows no new message.
 	ownPosts []string
