@@ -16,9 +16,11 @@ import (
 )
 
 // senderLoop delivers the outbox head of every conversation, in order per
-// conversation, in parallel across conversations, control chat first.
-// Rows in sending state belong to a worker; the store fences a second
-// sender for the same conversation (BeginSend requires the head).
+// conversation, in parallel across conversations, control chat first, and
+// creates the chats requested by requestChat. Every Graph write it makes
+// takes a token of the account's write pacing first. Rows in sending state
+// belong to a worker; the store fences a second sender for the same
+// conversation (BeginSend requires the head).
 func (e *Engine) senderLoop(ctx context.Context) {
 	sem := make(chan struct{}, e.cfg.Senders)
 	// The first pass runs at once: rows left queued by the previous
@@ -47,8 +49,17 @@ func (e *Engine) senderLoop(ctx context.Context) {
 	}
 }
 
-// sendPass starts sends for every due head. It returns when to look again
-// (0: only on wake).
+// sendItem is one write the sender may make in a pass: the head row of a
+// conversation, or the creation of a conversation's chat.
+type sendItem struct {
+	row    store.Outbox
+	create bool // create the chat of conv (row unset)
+	conv   int64
+	class  int
+}
+
+// sendPass starts sends and chat creations for every due head. It returns
+// when to look again (0: only on wake).
 func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration {
 	now := e.now()
 	if until := e.gate(e.gWrite); now.Before(until) {
@@ -60,6 +71,7 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 		token  string
 		file   *store.OutFile // an outbound file row
 		upload bool           // upload the file first (no send yet)
+		create int64          // create this conversation's chat (no row)
 	}
 	var (
 		jobs  []job
@@ -79,39 +91,68 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 		if err != nil {
 			return err
 		}
+		items := make([]sendItem, 0, len(rows))
+		for _, r := range rows {
+			items = append(items, sendItem{row: r, conv: r.ConvID, class: sendClass(r.Kind)})
+		}
+		creates, err := e.dueChats(tx, now, soon)
+		if err != nil {
+			return err
+		}
+		items = append(items, creates...)
 		e.mu.Lock()
 		ctl := e.controlID
 		e.mu.Unlock()
 		// Control chat first; then replies (ACKs, finals, notices,
-		// prompts) before mirrored messages before progress, so a short
-		// write budget goes to what the user waits for; within a class,
-		// round robin from the conversation after the last one served, so
-		// a backlog in low-id chats never starves the others (review H4,
+		// prompts, chats the owner asked for) before mirrored messages
+		// and chats nobody waits for before progress, so a short write
+		// budget goes to what the user waits for; within a class, round
+		// robin from the conversation after the last one served, so a
+		// backlog in low-id chats never starves the others (review H4,
 		// CORE-DESIGN §3).
 		last := e.sendLast
-		rank := func(r store.Outbox) (int, int) {
-			c := sendClass(r.Kind)
+		rank := func(it sendItem) (int, int) {
 			switch {
-			case r.ConvID == ctl:
+			case it.conv == ctl:
 				return 0, 0
-			case r.ConvID > last[c]:
-				return 1 + c, 0
+			case it.conv > last[it.class]:
+				return 1 + it.class, 0
 			default:
-				return 1 + c, 1
+				return 1 + it.class, 1
 			}
 		}
-		sort.SliceStable(rows, func(i, j int) bool {
-			ac, ar := rank(rows[i])
-			bc, br := rank(rows[j])
+		sort.SliceStable(items, func(i, j int) bool {
+			ac, ar := rank(items[i])
+			bc, br := rank(items[j])
 			if ac != bc {
 				return ac < bc
 			}
 			if ar != br {
 				return ar < br
 			}
-			return rows[i].ConvID < rows[j].ConvID
+			return items[i].conv < items[j].conv
 		})
-		for _, r := range rows {
+		for _, it := range items {
+			if it.create {
+				// The send slot first, then the write token (review L9).
+				select {
+				case sem <- struct{}{}:
+				default:
+					soon(e.t.Tick)
+					return nil
+				}
+				if ok, w := e.writeTokens.take(); !ok {
+					<-sem
+					soon(w)
+					return nil
+				}
+				if it.conv != ctl {
+					e.sendLast[it.class] = it.conv
+				}
+				jobs = append(jobs, job{create: it.conv})
+				continue
+			}
+			r := it.row
 			e.mu.Lock()
 			cs := e.convs[r.ConvID]
 			var chat string
@@ -155,10 +196,10 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 			if ok, w := e.writeTokens.take(); !ok {
 				<-sem
 				soon(w)
-				break
+				return nil
 			}
 			if r.ConvID != ctl {
-				e.sendLast[sendClass(r.Kind)] = r.ConvID
+				e.sendLast[it.class] = r.ConvID
 			}
 			var fp *store.OutFile
 			if isFile {
@@ -188,8 +229,12 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 		return e.t.Hot
 	}
 	for _, j := range jobs {
+		conv := j.row.ConvID
+		if j.create != 0 {
+			conv = j.create
+		}
 		e.mu.Lock()
-		if cs := e.convs[j.row.ConvID]; cs != nil {
+		if cs := e.convs[conv]; cs != nil {
 			cs.sending = true
 		}
 		e.mu.Unlock()
@@ -197,14 +242,60 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 		go func(j job) {
 			defer e.wg.Done()
 			defer func() { <-sem }()
-			if j.upload {
+			switch {
+			case j.create != 0:
+				e.createChat(ctx, j.create)
+				e.mu.Lock()
+				if cs := e.convs[j.create]; cs != nil {
+					cs.sending = false
+				}
+				e.mu.Unlock()
+				e.wakeSender()
+			case j.upload:
 				e.upload(ctx, j.row, *j.file)
-				return
+			default:
+				e.send(ctx, j.row, j.chat, j.token, j.file)
 			}
-			e.send(ctx, j.row, j.chat, j.token, j.file)
 		}(j)
 	}
 	return again
+}
+
+// dueChats lists the requested chat creations (requestChat) that may run
+// now; a creation still in its retry backoff sets when to look again.
+// Requests of conversations that left the creating state are dropped.
+func (e *Engine) dueChats(tx *store.Tx, now time.Time, soon func(time.Duration)) ([]sendItem, error) {
+	e.mu.Lock()
+	var out []sendItem
+	for id, class := range e.chatWant {
+		cs := e.convs[id]
+		switch {
+		case cs == nil || cs.state != store.ConvCreating:
+			delete(e.chatWant, id)
+		case cs.sending:
+		case cs.failures > 0 && now.Before(cs.nextRead):
+			soon(cs.nextRead.Sub(now))
+		default:
+			out = append(out, sendItem{create: true, conv: id, class: class})
+		}
+	}
+	e.mu.Unlock()
+	kept := out[:0]
+	for _, it := range out {
+		v, _, err := tx.Meta(discoveredKey(it.conv))
+		if err != nil {
+			return nil, err
+		}
+		if v == discoveredPending {
+			// Nothing to mirror yet: no chat (mirrorRead asks again).
+			e.mu.Lock()
+			delete(e.chatWant, it.conv)
+			e.mu.Unlock()
+			continue
+		}
+		kept = append(kept, it)
+	}
+	return kept, nil
 }
 
 // Send classes, in the order a short write budget serves them.
@@ -230,6 +321,30 @@ func sendClass(kind string) int {
 func (e *Engine) paceThrottled(started, resume time.Time) {
 	if cut, rate := e.writeTokens.throttled(started, resume); cut {
 		e.logf("account writes throttled; pacing at %.2f/s", rate)
+	}
+}
+
+// waitWrite blocks until one Graph write may go under the account's write
+// pacing and gate (or ctx ends): for writers outside the sender, such as
+// the registry card (WritePaced), so every write shares one budget.
+func (e *Engine) waitWrite(ctx context.Context) error {
+	for {
+		now := e.now()
+		var wait time.Duration
+		if until := e.gate(e.gWrite); now.Before(until) {
+			wait = until.Sub(now)
+		} else if ok, w := e.writeTokens.take(); ok {
+			return nil
+		} else {
+			wait = w
+		}
+		t := time.NewTimer(max(wait, e.t.Tick))
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return ctx.Err()
+		case <-t.C:
+		}
 	}
 }
 

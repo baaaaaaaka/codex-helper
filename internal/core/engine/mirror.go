@@ -1015,11 +1015,9 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 		wake(e.notifyWake)
 	}
 	if created {
-		e.wg.Add(1)
-		go func() {
-			defer e.wg.Done()
-			e.createChat(ctx, f.src.ConvID)
-		}()
+		// Catch-up: nobody waits for this chat, so its creation goes
+		// with the mirrored messages, after the replies.
+		e.requestChat(f.src.ConvID, sendMirror)
 	}
 	if woke {
 		_ = e.update(func(tx *store.Tx) error { _, err := e.refresh(tx, f.src.ConvID); return err })

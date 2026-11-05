@@ -434,5 +434,5 @@ func (e *Engine) cmdFork(ctx context.Context, j cmdJob, cs *convState) {
 	e.byThread[child] = id
 	e.intro[id] = "Forked from " + label + ": this chat continues a copy of that session; " + label + " itself is unchanged. Send `helper help` for commands."
 	e.mu.Unlock()
-	e.createChat(ctx, id)
+	e.requestChat(id, sendReply)
 }
