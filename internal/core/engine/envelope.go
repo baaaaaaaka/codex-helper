@@ -103,8 +103,8 @@ func teamsCodexPrompt(prompt, root string) string {
 // localFile is one file listed for Codex.
 type localFile struct{ path, name, contentType string }
 
-// voiceClip is one transcribed voice or video clip.
-type voiceClip struct{ name, text string }
+// promptClip is one transcribed voice or video clip of a prompt.
+type promptClip struct{ name, text string }
 
 // quoteText is one referenced message as given to Codex.
 type quoteText struct {
@@ -121,7 +121,7 @@ func codexInput(body string, files []store.InboundFile, root string) (string, []
 	var (
 		listed, quoteFiles []localFile
 		images, failed     []string
-		clips              []voiceClip
+		clips              []promptClip
 		quotes             []quoteText
 	)
 	for _, f := range files {
@@ -144,7 +144,7 @@ func codexInput(body string, files []store.InboundFile, root string) (string, []
 				failed = append(failed, fmt.Sprintf("- %s: the transcript is missing", f.Name))
 				continue
 			}
-			clips = append(clips, voiceClip{name: firstNonEmpty(ref.Name, f.Name), text: string(data)})
+			clips = append(clips, promptClip{name: firstNonEmpty(ref.Name, f.Name), text: string(data)})
 		default:
 			// A pasted image has no name of its own (attachment-N).
 			name := ref.Name
@@ -170,7 +170,7 @@ func codexInput(body string, files []store.InboundFile, root string) (string, []
 }
 
 // withTranscripts is promptWithASRTranscripts.
-func withTranscripts(text string, clips []voiceClip) string {
+func withTranscripts(text string, clips []promptClip) string {
 	text = strings.TrimSpace(text)
 	if len(clips) == 0 {
 		return text

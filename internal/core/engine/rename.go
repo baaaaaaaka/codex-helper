@@ -169,19 +169,53 @@ func topicTitle(topic string) string {
 	return clean
 }
 
-// promptTitle is the title text of a prompt as Codex received it: the
-// helper's own suffix (safety notes, artifact instructions) and the voice
-// lead are not the owner's words (v0.1.20 firstPromptTitleText).
+// promptTitleMarkers start the helper's own suffix of a prompt: v0.1.20's
+// teamsHelperPromptSuffixMarkers, plus the earlier core's markers.
+var promptTitleMarkers = []string{
+	"Teams helper safety:",
+	"If you need to return generated files or images to the Teams user,",
+	"Then include this fenced manifest in your final answer:",
+	"Helper safety:",
+	"Attached files (saved locally):",
+}
+
+// promptTitle is the title text of a prompt as Codex received it
+// (v0.1.20 firstPromptTitleText): the helper's suffix (safety notes,
+// artifact instructions) and its "User message:" lead are cut, and a
+// voice-only prompt is titled by its transcript, not by the ASR lead.
 func promptTitle(text string) string {
-	for _, marker := range []string{"Helper safety:", "Attached files (saved locally):",
-		"If you need to return generated files or images to the", "Then include this fenced manifest in your final answer:"} {
-		if i := strings.Index(text, "\n"+marker); i >= 0 {
-			text = text[:i]
+	text = strings.TrimSpace(text)
+	stripped := false
+	for _, marker := range promptTitleMarkers {
+		at := -1
+		for _, prefix := range []string{"\n\n", "\n"} {
+			if i := strings.LastIndex(text, prefix+marker); i > at {
+				at = i
+			}
+		}
+		if at >= 0 {
+			text = strings.TrimSpace(text[:at])
+			stripped = true
+			continue
+		}
+		if strings.HasPrefix(text, marker) {
+			return ""
 		}
 	}
-	text = strings.TrimSpace(text)
-	if strings.HasPrefix(text, voiceLead) {
-		text = strings.TrimSpace(text[len(voiceLead):])
+	if stripped && len(text) >= len(userMessageLead) && strings.EqualFold(text[:len(userMessageLead)], userMessageLead) {
+		text = strings.TrimSpace(text[len(userMessageLead):])
+	}
+	if lead := strings.TrimSpace(asrLead); strings.HasPrefix(text, lead) {
+		text = strings.TrimSpace(text[len(lead):])
+		// The clip header line ("Voice/video clip: name (attrs)") is not
+		// the owner's words either.
+		if strings.HasPrefix(text, "Voice/video clip") {
+			if i := strings.Index(text, "\n"); i >= 0 {
+				text = strings.TrimSpace(text[i+1:])
+			} else {
+				text = ""
+			}
+		}
 	}
 	return text
 }
