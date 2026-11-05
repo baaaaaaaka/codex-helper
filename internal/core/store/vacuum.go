@@ -11,6 +11,11 @@ import (
 // an old Teams message whose lastModified is bumped by an edit or reaction is
 // still recognised and never re-run.
 func (s *Store) Vacuum() error {
+	if s.ls != nil {
+		if err := s.ls.Check(); err != nil {
+			return leaseErr(err)
+		}
+	}
 	_, err := s.w.ExecContext(context.Background(), `PRAGMA incremental_vacuum`)
 	return err
 }
@@ -20,6 +25,11 @@ func (s *Store) Vacuum() error {
 func (s *Store) VacuumStep(pages int) error {
 	if pages <= 0 {
 		pages = 1
+	}
+	if s.ls != nil {
+		if err := s.ls.Check(); err != nil {
+			return leaseErr(err)
+		}
 	}
 	_, err := s.w.ExecContext(context.Background(), fmt.Sprintf(`PRAGMA incremental_vacuum(%d)`, pages))
 	return err
