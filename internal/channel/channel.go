@@ -249,6 +249,21 @@ type BodyHasher interface {
 	BodyHash(body string) string
 }
 
+// HistoryPager is implemented by channels that can list a chat's history
+// one service request at a time, so the core can pace a long read.
+type HistoryPager interface {
+	// HistoryPage returns one page of the messages of chat modified after
+	// since, newest first, and the position of the next page ("" after the
+	// last one). pos "" starts the listing.
+	HistoryPage(ctx context.Context, chat string, since time.Time, pos string) ([]InboundMsg, string, error)
+}
+
+// PartTexter is implemented by channels that can tell the visible text of a
+// rendered part body, as InboundMsg.Text carries it when the part is read.
+type PartTexter interface {
+	PartText(body string) string
+}
+
 // ChatActivity is one chat's newest message as reported by an activity scan.
 type ChatActivity struct {
 	Chat   string

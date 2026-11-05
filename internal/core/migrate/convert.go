@@ -3,6 +3,7 @@ package migrate
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
@@ -99,11 +100,13 @@ type converter struct {
 	oldestIn     map[int64]int64           // oldest inbound ext_time per conversation
 	inboundOld   map[string]int64          // old inbound id -> new id (rows whose turn is kept)
 	needPause    map[int64]string
-	orphans      map[string]int64        // unknown chat (or "session:<id>") -> placeholder conversation
-	lastAct      map[int64]int64         // newest activity per conversation (unix ms)
-	unknownSrc   int                     // source rows with an unknown send outcome
-	staleUnsent  int                     // unsent source rows dropped as stale
-	quarantine   map[string][]string     // quarantineRuling outcome -> session labels (summary)
+	orphans      map[string]int64    // unknown chat (or "session:<id>") -> placeholder conversation
+	lastAct      map[int64]int64     // newest activity per conversation (unix ms)
+	unknownSrc   int                 // source rows with an unknown send outcome
+	staleUnsent  int                 // unsent source rows dropped as stale
+	quarantine   map[string][]string // quarantineRuling outcome -> session labels (summary)
+	finalChecks  []store.LegacyFinalCheck
+	checkAnswer  map[string]int64        // answer (legacy turn or row) -> created (unix ms), of finalChecks
 	anchors      map[string]legacyAnchor // by source path
 	threadLinks  map[string]threadLink
 	proofs       map[string]*proof // delivery-ledger proof per rollout path
@@ -886,6 +889,7 @@ type compactOut struct {
 	state  string
 	opaque bool
 	stale  bool
+	check  bool // an answer checked against the chat history (store.LegacyFinalCheck)
 }
 
 func (c *converter) convertOutbox() error {
@@ -927,8 +931,16 @@ func (c *converter) convertOutbox() error {
 			e.Outcomes["chat unknown -> dropped"]++
 			return nil
 		}
+		// Owner ruling 2026-11-05 (Q1): an answer whose send outcome is
+		// unknown, of any age, is checked once against the chat's history
+		// at first start and resent only when it is absent. Its row is
+		// imported dropped (it does not hold the conversation's sends back
+		// while the check runs). Other unknown kinds keep the rules below.
+		check := !opaque && unknown && outboxKind(o.Kind) == store.OutFinal && o.AttachmentPath == ""
 		st := ""
 		switch {
+		case check:
+			st = store.OutDropped
 		case stale:
 			st = store.OutDropped
 			c.staleUnsent++
@@ -946,7 +958,7 @@ func (c *converter) convertOutbox() error {
 		if st == store.OutUnknown {
 			c.unknownSrc++
 		}
-		byConv[conv] = append(byConv[conv], &compactOut{o: o, conv: conv, state: st, opaque: opaque, stale: stale})
+		byConv[conv] = append(byConv[conv], &compactOut{o: o, conv: conv, state: st, opaque: opaque, stale: stale && !check, check: check})
 		return nil
 	})
 	if err != nil {
@@ -988,6 +1000,14 @@ func (c *converter) convertOutbox() error {
 				row.HashAlgo = store.HashLegacy
 			}
 			switch {
+			case co.check:
+				row.Note = "migrated: send outcome unknown (" + o.Status + "); checked against the chat history at first start, resent only if absent"
+				c.finalChecks = append(c.finalChecks, store.LegacyFinalCheck{Key: row.DeliveryKey, ConvID: conv, LegacyID: o.ID,
+					ExtMsgID: o.TeamsMessageID, Created: row.CreatedAt, Body: o.Body, ReplyTo: o.QuoteReplyToMessageID})
+				if c.checkAnswer == nil {
+					c.checkAnswer = map[string]int64{}
+				}
+				c.checkAnswer[fmt.Sprintf("%d:%s", conv, firstNonEmpty(o.TurnID, o.ID))] = row.CreatedAt
 			case co.opaque && co.state != store.OutUnknown:
 				row.Note = "migrated: unparsable legacy row (" + o.Status + "); key kept"
 			case co.stale:
@@ -1027,9 +1047,12 @@ func (c *converter) convertOutbox() error {
 				return fmt.Errorf("duplicate outbox key %s", row.DeliveryKey)
 			}
 			e.Imported++
-			if co.stale {
+			switch {
+			case co.check:
+				e.Outcomes[o.Status+" final -> checked against the chat history at first start"]++
+			case co.stale:
 				e.Outcomes[o.Status+" -> dropped (stale)"]++
-			} else {
+			default:
 				e.Outcomes[o.Status+" -> "+co.state]++
 			}
 			if row.State == store.OutSent {
@@ -1038,6 +1061,15 @@ func (c *converter) convertOutbox() error {
 			if o.TeamsMessageID != "" {
 				c.markExt(conv, o.TeamsMessageID)
 			}
+		}
+	}
+	if len(c.finalChecks) > 0 {
+		b, err := json.Marshal(c.finalChecks)
+		if err != nil {
+			return err
+		}
+		if err := c.im.SetMeta(store.MetaLegacyFinalChecks, string(b)); err != nil {
+			return err
 		}
 	}
 	// One interruption notice per turn that was running (§7.2).

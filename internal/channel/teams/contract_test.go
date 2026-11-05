@@ -3,8 +3,10 @@ package teams
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	"github.com/baaaaaaaka/codex-helper/internal/channel"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakegraph"
@@ -340,4 +342,61 @@ func TestOwnerUnauthorizedRefreshesOnce(t *testing.T) {
 	if n := countRequests(fg, "GET /me"); n != 2 {
 		t.Fatalf("GET /me sent %d times, want 2", n)
 	}
+}
+
+// Q1 (owner ruling 2026-11-05): the history check reads a chat one page per
+// call, newest first, following nextLink, and compares an answer's
+// rendered text (PartText) with the text a read-back message carries.
+func TestHistoryPageOnePagePerCall(t *testing.T) {
+	ctx := context.Background()
+	fg, a := newFake(t, fakegraph.Options{})
+	chat := fg.CreateMeetingChatAsUser("history").ID
+	since := time.Now().Add(-time.Minute)
+	p := renderOne(t, a, channel.RichDoc{Markdown: "The **answer**: `x := 1` and [a link](https://example.com).", Math: true})
+	sent, err := a.Send(ctx, chat, p, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 60; i++ {
+		if _, err := fg.PostSystemEvent(chat); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var all []channel.InboundMsg
+	pos, pages := "", 0
+	for {
+		before := countRequests(fg, routeList)
+		msgs, next, err := a.HistoryPage(ctx, chat, since, pos)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if n := countRequests(fg, routeList) - before; n != 1 {
+			t.Fatalf("page %d made %d list requests, want 1", pages, n)
+		}
+		pages++
+		all = append(all, msgs...)
+		if next == "" {
+			break
+		}
+		pos = next
+	}
+	if pages < 2 || len(all) != 61 {
+		t.Fatalf("%d pages, %d messages; want several pages and 61", pages, len(all))
+	}
+	last := all[len(all)-1]
+	if last.ID != sent.ID || !last.ByOwner || last.Kind != channel.KindMessage {
+		t.Fatalf("oldest message = %+v, want the answer %s last (newest first)", last, sent.ID)
+	}
+	alnum := func(s string) string {
+		return strings.Map(func(r rune) rune {
+			if unicode.IsLetter(r) || unicode.IsDigit(r) {
+				return unicode.ToLower(r)
+			}
+			return -1
+		}, s)
+	}
+	if got, want := alnum(last.Text), alnum(a.PartText(p.Body)); want == "" || got != want {
+		t.Fatalf("read-back text %q, rendered text %q", got, want)
+	}
+	noViolations(t, fg)
 }

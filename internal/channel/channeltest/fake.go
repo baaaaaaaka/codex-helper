@@ -44,6 +44,10 @@ type Fake struct {
 	// MaxWindow, when > 0, makes Receive fail with *channel.WindowTooLarge
 	// when more than MaxWindow messages are pending.
 	MaxWindow int
+	// HistoryPageSize is the page size of HistoryPage (default 50).
+	HistoryPageSize int
+
+	historyPages int
 }
 
 type chat struct {
@@ -261,6 +265,52 @@ func (f *Fake) ReadBack(_ context.Context, chatID string, since time.Time) ([]ch
 		}
 	}
 	return out, nil
+}
+
+// HistoryPage lists one page of the messages of chat modified after since,
+// newest first (channel.HistoryPager); pos is the index of the page start.
+func (f *Fake) HistoryPage(_ context.Context, chatID string, since time.Time, pos string) ([]channel.InboundMsg, string, error) {
+	if err := f.receiveFault(chatID); err != nil {
+		return nil, "", err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.historyPages++
+	var all []channel.InboundMsg
+	if c := f.chats[chatID]; c != nil {
+		for i := len(c.msgs) - 1; i >= 0; i-- {
+			if m := c.msgs[i].msg; m.Modified.After(since) {
+				all = append(all, m)
+			}
+		}
+	}
+	size := f.HistoryPageSize
+	if size <= 0 {
+		size = 50
+	}
+	start, _ := strconv.Atoi(pos)
+	if start >= len(all) {
+		return nil, "", nil
+	}
+	end, next := min(start+size, len(all)), ""
+	if end < len(all) {
+		next = strconv.Itoa(end)
+	}
+	return append([]channel.InboundMsg(nil), all[start:end]...), next, nil
+}
+
+// HistoryPages is the number of HistoryPage requests served.
+func (f *Fake) HistoryPages() int { f.mu.Lock(); defer f.mu.Unlock(); return f.historyPages }
+
+// PartText is the visible text of a part body: the fake stores it as is.
+func (f *Fake) PartText(body string) string { return body }
+
+// SetClock makes the fake's clock start at base (it still advances one
+// millisecond per message).
+func (f *Fake) SetClock(base time.Time) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.now = func() time.Time { return base.Add(time.Duration(f.seq) * time.Millisecond) }
 }
 
 func (f *Fake) Get(_ context.Context, chatID, id string) (channel.InboundMsg, error) {

@@ -185,13 +185,15 @@ func TestConvertFixtures(t *testing.T) {
 			h := sha256.Sum256([]byte("answer one"))
 			eq(t, "o1 hash", qs(t, db, `SELECT hex(body_hash) FROM outbox WHERE delivery_key = 'legacy-outbox:o1'`), strings.ToUpper(hexs(h[:])))
 			eq(t, "o1 hash marked legacy", qs(t, db, `SELECT hash_algo FROM outbox WHERE delivery_key = 'legacy-outbox:o1'`), "legacy")
-			eq(t, "o2 sending", qs(t, db, outQ, "legacy-outbox:o2"), "unknown")
+			// An answer with an unknown outcome is checked against the
+			// chat history at first start (owner ruling 2026-11-05, Q1).
+			eq(t, "o2 sending (answer)", qs(t, db, outQ, "legacy-outbox:o2"), "dropped")
 			eq(t, "o6 accepted", qs(t, db, outQ, "legacy-outbox:o6"), "unknown")
 			eq(t, "o3", qs(t, db, outQ, "legacy-outbox:o3"), "queued")
 			eq(t, "o7 control", qs(t, db, `SELECT o.state || '/' || c.kind FROM outbox o JOIN conversations c ON c.id = o.conv_id WHERE delivery_key = 'legacy-outbox:o7'`), "queued/control")
 			eq(t, "o4 skipped", qs(t, db, `SELECT state || '/' || note || '/' || body FROM outbox WHERE delivery_key = 'legacy-outbox:o4'`), "dropped/legacy skipped: superseded by interrupted turn/skip me")
 			eq(t, "interruption notice", qs(t, db, outQ, "legacy-interrupted:t-run"), "queued")
-			eq(t, "unknown rows", qi(t, db, `SELECT count(*) FROM outbox WHERE state = 'unknown'`), int64(2))
+			eq(t, "unknown rows", qi(t, db, `SELECT count(*) FROM outbox WHERE state = 'unknown'`), int64(1))
 			// Unsent rows keep the legacy text: the core renders them.
 			eq(t, "unsent rows marked legacy", qi(t, db, `SELECT count(*) FROM outbox WHERE state IN ('queued','unknown') AND hash_algo IS NULL`), int64(0))
 
@@ -310,7 +312,9 @@ func TestOpaqueRows(t *testing.T) {
 	eq(t, "o1 sent: key kept", qs(t, out, `SELECT state || '/' || ext_msg_id FROM outbox WHERE delivery_key = 'legacy-outbox:o1'`), "sent/1788256809000")
 	eq(t, "o3 queued: unknown", qs(t, out, outQ, "legacy-outbox:o3"), "unknown")
 	eq(t, "n2", qs(t, out, `SELECT state FROM notifications WHERE key = 'legacy:n2'`), "dropped")
-	eq(t, "unknown outbox rows", qi(t, out, `SELECT count(*) FROM outbox WHERE state = 'unknown'`), int64(3))
+	// o3 (unparsable), o6 (a title); o2, an answer, is checked against the
+	// chat history instead (owner ruling 2026-11-05, Q1).
+	eq(t, "unknown outbox rows", qi(t, out, `SELECT count(*) FROM outbox WHERE state = 'unknown'`), int64(2))
 }
 
 // Hazard: an initialised session without a poll row must not rebaseline at
@@ -602,7 +606,7 @@ func TestStaleUnsentRowsDropped(t *testing.T) {
 			if !rep.OK() {
 				t.Fatalf("checks: %+v", rep.Checks)
 			}
-			for _, k := range []string{"legacy-outbox:o2", "legacy-outbox:o3", "legacy-outbox:o6", "legacy-outbox:o7"} {
+			for _, k := range []string{"legacy-outbox:o3", "legacy-outbox:o6", "legacy-outbox:o7"} {
 				eq(t, k, qs(t, db, `SELECT state || '/' || substr(note, 1, 34) FROM outbox WHERE delivery_key = ?`, k), "dropped/migrated: unsent for more than 24h")
 			}
 			eq(t, "unknown rows", qi(t, db, `SELECT count(*) FROM outbox WHERE state = 'unknown'`), int64(0))
@@ -691,6 +695,45 @@ func TestQuarantineByCause(t *testing.T) {
 				}
 				eq(t, "s001", qs(t, db, convQ, "s001"), "active/")
 				eq(t, "s005", qs(t, db, convQ, "s005"), "closed/")
+			})
+		}
+	}
+}
+
+// Owner ruling 2026-11-05 (Q1): an answer of the previous helper whose send
+// outcome is unknown, of any age, is imported dropped (it does not hold its
+// conversation's sends back) and listed for the engine's history check,
+// with what the check matches on: the old outbox id (its hidden marker),
+// the recorded Teams message id, the creation time and the text. Other
+// unknown kinds keep their rules (o6, a title: unknown or stale-dropped).
+func TestUnknownAnswerListedForHistoryCheck(t *testing.T) {
+	for _, v := range []string{"v0120", "rc59"} {
+		for _, stale := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/stale=%v", v, stale), func(t *testing.T) {
+				_, db := dryRun(t, fixture(t, v, "sqlite-wal"), func(o *Options) {
+					if stale {
+						o.StaleUnsent = 0
+					}
+				})
+				eq(t, "o2", qs(t, db, `SELECT state || '/' || note FROM outbox WHERE delivery_key = 'legacy-outbox:o2'`),
+					"dropped/migrated: send outcome unknown (sending); checked against the chat history at first start, resent only if absent")
+				var list []store.LegacyFinalCheck
+				if err := json.Unmarshal([]byte(qs(t, db, `SELECT value FROM meta WHERE key = ?`, store.MetaLegacyFinalChecks)), &list); err != nil {
+					t.Fatal(err)
+				}
+				s001 := qi(t, db, `SELECT id FROM conversations WHERE label = 's001'`)
+				want := store.LegacyFinalCheck{Key: "legacy-outbox:o2", ConvID: s001, LegacyID: "o2",
+					Created: time.Date(2026, 9, 1, 10, 0, 20, 0, time.UTC).UnixMilli(), Body: "maybe posted"}
+				if len(list) != 1 || list[0] != want {
+					t.Fatalf("checks = %+v, want [%+v]", list, want)
+				}
+				o6 := map[bool]string{false: "unknown", true: "dropped"}[stale]
+				eq(t, "o6 (a title, not an answer)", qs(t, db, outQ, "legacy-outbox:o6"), o6)
+				sum := qs(t, db, `SELECT value FROM meta WHERE key = ?`, store.MetaMigrationSummary)
+				line := "\n\n1 answer from 2026-09-01 that the previous helper could not confirm as sent is checked against the chat history now, and sent only if it is missing."
+				if !strings.Contains(sum, line) {
+					t.Errorf("summary lacks %q:\n%s", line, sum)
+				}
 			})
 		}
 	}

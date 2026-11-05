@@ -2,11 +2,14 @@ package migrate
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -64,6 +67,20 @@ func (idleAgent) Fork(context.Context, int64, string, string, string) (string, e
 func (idleAgent) Models(context.Context) ([]engine.Model, error) { return nil, nil }
 func (idleAgent) Maintain()                                      {}
 func (idleAgent) Close()                                         {}
+
+// countingAgent is idleAgent counting the turns whose prompt contains sub.
+type countingAgent struct {
+	idleAgent
+	sub  string
+	runs atomic.Int32
+}
+
+func (a *countingAgent) Run(ctx context.Context, r engine.TurnRequest, h engine.TurnHooks) (engine.TurnOutcome, error) {
+	if strings.Contains(r.Text, a.sub) {
+		a.runs.Add(1)
+	}
+	return a.idleAgent.Run(ctx, r, h)
+}
 
 func writeStartRollout(t *testing.T, sessions, id string, at time.Time) string {
 	t.Helper()
@@ -298,5 +315,198 @@ func TestFirstStartRendersImportedUnsentRows(t *testing.T) {
 	defer logMu.Unlock()
 	if !strings.Contains(log.String(), "rendered ") {
 		t.Errorf("no render at start:\n%s", log.String())
+	}
+}
+
+// Owner ruling 2026-11-05 (Q1): at first start the engine reads the chat's
+// history of an answer whose send outcome was unknown (fixture o2, "maybe
+// posted", s001) and resends it only when it is not there, once: a restart
+// neither reads that history again nor resends. A post of the same text
+// that is another row's (its message id is recorded on o1) is not taken
+// for it.
+func TestUnknownAnswerCheckedAgainstHistoryOnce(t *testing.T) {
+	const body = "maybe posted, the answer of the previous helper"
+	for _, tc := range []struct {
+		name   string
+		seed   func(ch *channeltest.Fake, chat string) // before the first start
+		resent bool
+	}{
+		{"absent", func(*channeltest.Fake, string) {}, true},
+		{"found by the old marker", func(ch *channeltest.Fake, chat string) {
+			ch.PostOtherHelper(chat, "🤖 ✅ Codex answer:\n"+body, "o2")
+		}, false},
+		{"found by its text", func(ch *channeltest.Fake, chat string) {
+			ch.PostUser(chat, "🤖 ✅ Codex answer:\n"+body+"\n\n🔧 Helper: ✅ Codex finished responding. @Owner")
+		}, false},
+		{"found on a later page", func(ch *channeltest.Fake, chat string) {
+			ch.PostOtherHelper(chat, "🤖 ✅ Codex answer:\n"+body, "o2")
+			for i := 0; i < 7; i++ {
+				ch.PostSystem(chat, fmt.Sprintf("later event %d", i))
+			}
+		}, false},
+		{"the same text is another row's post", nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := fixture(t, "v0120", "json")
+			const chat = "19:chat-s001@thread.v2"
+			ch := &cursorChannel{Fake: channeltest.New()}
+			// The posts land after o2 was created (10:00:20) and after s001's
+			// stream cursor (10:00:05), as an answer posted while the old
+			// helper stopped does: the receiver's first read sees them as new.
+			ch.SetClock(time.Date(2026, 9, 1, 10, 0, 21, 0, time.UTC))
+			ch.HistoryPageSize = 3
+			seed := tc.seed
+			if seed == nil {
+				// o1 (sent) recorded the message id of this post.
+				decoy := ch.PostUser(chat, "🤖 ✅ Codex answer:\n"+body)
+				editJSON(t, src, func(m map[string]any) {
+					for _, o := range m["outbox_messages"].(map[string]any) {
+						if o := o.(map[string]any); o["id"] == "o1" {
+							o["teams_message_id"], o["body"] = decoy.ID, body
+						}
+					}
+				})
+				seed = func(*channeltest.Fake, string) {}
+			}
+			editJSON(t, src, func(m map[string]any) {
+				for _, o := range m["outbox_messages"].(map[string]any) {
+					if o := o.(map[string]any); o["id"] == "o2" {
+						o["body"] = body
+					}
+				}
+				// The fixture's chat gate until 2099 would hold s001's sends.
+				delete(m, "chat_rate_limits")
+			})
+			out := t.TempDir()
+			if _, err := Run(Options{Source: src, Out: out, DryRun: true, StaleUnsent: -1}); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(out, TargetName)
+			st, err := store.Open(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			convs, err := st.Conversations()
+			st.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, c := range convs {
+				if c.ExtChatID != "" {
+					ch.PostSystem(c.ExtChatID, "chat exists")
+				}
+			}
+			seed(ch.Fake, chat)
+
+			var log strings.Builder
+			var logMu sync.Mutex
+			agent := &countingAgent{sub: body}
+			start := func() (*store.Store, func()) {
+				st, err := store.Open(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := st.Acquire(store.Ident{Host: "h", PID: 1, BootID: "b"}); err != nil {
+					t.Fatal(err)
+				}
+				e, err := engine.New(engine.Config{Store: st, Channel: ch, ChannelName: "teams", Agent: agent, Timing: engine.FastTiming(20 * time.Millisecond),
+					Machine: "m", Log: writerFunc(func(b []byte) { logMu.Lock(); log.Write(b); logMu.Unlock() })})
+				if err != nil {
+					t.Fatal(err)
+				}
+				ctx, cancel := context.WithCancel(context.Background())
+				done := make(chan error, 1)
+				go func() { done <- e.Run(ctx) }()
+				return st, func() { cancel(); <-done; st.Release(); st.Close() }
+			}
+			// checks lists the converter's entries; undecided counts those
+			// neither resent nor found.
+			checks := func(st *store.Store) []store.LegacyFinalCheck {
+				v, _, _ := st.Meta(store.MetaLegacyFinalChecks)
+				var list []store.LegacyFinalCheck
+				if v != "" {
+					if err := json.Unmarshal([]byte(v), &list); err != nil {
+						t.Fatal(err)
+					}
+				}
+				return list
+			}
+			undecided := func(st *store.Store) int {
+				n := 0
+				for _, c := range checks(st) {
+					if c.Found == "" {
+						n++
+					}
+				}
+				return n
+			}
+			resends := func() int {
+				n := 0
+				for _, m := range ch.Messages(chat) {
+					if m.Marker != "" && m.Marker != "o2" && strings.HasPrefix(m.Text, "🤖") && strings.Contains(m.Text, body) {
+						n++
+					}
+				}
+				return n
+			}
+			wait := func(what string, cond func() bool) {
+				t.Helper()
+				deadline := time.Now().Add(15 * time.Second)
+				for !cond() {
+					if time.Now().After(deadline) {
+						logMu.Lock()
+						t.Fatalf("timeout waiting for %s\nengine log:\n%s", what, log.String())
+					}
+					time.Sleep(20 * time.Millisecond)
+				}
+			}
+
+			st, stop := start()
+			wait("the check decided", func() bool { return undecided(st) == 0 })
+			want := 0
+			if tc.resent {
+				want = 1
+				wait("the answer resent", func() bool { return resends() == 1 })
+			}
+			time.Sleep(300 * time.Millisecond)
+			list := checks(st)
+			stop()
+			if n := resends(); n != want {
+				t.Fatalf("resent %d times, want %d", n, want)
+			}
+			// Resent: the entry is gone. Found: it stays with the post's id
+			// (the receiver's first read may have found it before any page
+			// of the history was read).
+			if tc.resent != (len(list) == 0) || (!tc.resent && list[0].Found == "") {
+				t.Fatalf("entries after the decision: %+v", list)
+			}
+			pages := ch.HistoryPages()
+			if tc.resent && pages == 0 {
+				t.Fatal("the chat history was not read")
+			}
+			// The old post is the helper's own, never the owner's prompt.
+			if n := agent.runs.Load(); n != 0 {
+				t.Fatalf("%d Codex turns ran on the old answer's text, want 0 (taken for a prompt)", n)
+			}
+
+			_, stop = start()
+			time.Sleep(time.Second)
+			stop()
+			if n := resends(); n != want {
+				t.Fatalf("after a restart: resent %d times, want %d", n, want)
+			}
+			if n := ch.HistoryPages(); n != pages {
+				t.Fatalf("a restart read the history again: %d pages, then %d", pages, n)
+			}
+			if n := agent.runs.Load(); n != 0 {
+				t.Fatalf("after a restart: %d Codex turns ran on the old answer's text, want 0", n)
+			}
+			logMu.Lock()
+			defer logMu.Unlock()
+			outcome := map[bool]string{true: "absent from the chat's history: sent now", false: "found in the chat's history"}[tc.resent]
+			if !strings.Contains(log.String(), outcome) {
+				t.Errorf("log lacks %q:\n%s", outcome, log.String())
+			}
+		})
 	}
 }

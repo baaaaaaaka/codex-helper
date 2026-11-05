@@ -56,15 +56,9 @@ func (a *Adapter) Receive(ctx context.Context, stream, cursor string) (channel.W
 	return w, nil
 }
 
-// walk lists every message of chat with lastModifiedDateTime > since
-// (all messages when since is zero). It returns them sorted by
-// (createdDateTime, id), the newest lastModifiedDateTime seen and the
-// number of pages fetched.
-func (a *Adapter) walk(ctx context.Context, chat string, since time.Time) ([]channel.InboundMsg, time.Time, int, error) {
-	me, err := a.me(ctx)
-	if err != nil {
-		return nil, time.Time{}, 0, err
-	}
+// messagesURL is the first page of the messages of chat modified after
+// since (all messages when since is zero), newest modification first.
+func messagesURL(chat string, since time.Time) string {
 	q := url.Values{}
 	q.Set("$top", strconv.Itoa(pageSize))
 	q.Set("$orderby", "lastModifiedDateTime desc")
@@ -76,7 +70,64 @@ func (a *Adapter) walk(ctx context.Context, chat string, since time.Time) ([]cha
 		}
 		q.Set("$filter", "lastModifiedDateTime gt "+since.UTC().Truncate(time.Millisecond).Format(time.RFC3339Nano))
 	}
-	next := "/chats/" + url.PathEscape(chat) + "/messages?" + q.Encode()
+	return "/chats/" + url.PathEscape(chat) + "/messages?" + q.Encode()
+}
+
+// HistoryPage lists one page of the messages of chat modified after since,
+// newest modification first (channel.HistoryPager): one Graph request.
+func (a *Adapter) HistoryPage(ctx context.Context, chat string, since time.Time, pos string) ([]channel.InboundMsg, string, error) {
+	me, err := a.me(ctx)
+	if err != nil {
+		return nil, "", err
+	}
+	next := pos
+	if next == "" {
+		next = messagesURL(chat, since)
+	}
+	var page struct {
+		Value    []graphMessage `json:"value"`
+		NextLink string         `json:"@odata.nextLink"`
+	}
+	if err := a.g.getJSON(ctx, next, pageBodyLimit, &page); err != nil {
+		return nil, "", err
+	}
+	if page.NextLink == next {
+		return nil, "", &channel.Rejected{Err: fmt.Errorf("teams: nextLink loop")}
+	}
+	out := make([]channel.InboundMsg, 0, len(page.Value))
+	for _, gm := range page.Value {
+		if gm.ID != "" {
+			out = append(out, a.convert(chat, gm, me.ID))
+		}
+	}
+	return out, page.NextLink, nil
+}
+
+// PartText is the visible text of a rendered part, as a message read back
+// carries it (channel.PartTexter). A part body is the chatMessage request
+// JSON; its text is that of body.content.
+func (a *Adapter) PartText(body string) string {
+	var m struct {
+		Body struct {
+			Content string `json:"content"`
+		} `json:"body"`
+	}
+	if json.Unmarshal([]byte(body), &m) != nil {
+		return ""
+	}
+	return plainText(m.Body.Content)
+}
+
+// walk lists every message of chat with lastModifiedDateTime > since
+// (all messages when since is zero). It returns them sorted by
+// (createdDateTime, id), the newest lastModifiedDateTime seen and the
+// number of pages fetched.
+func (a *Adapter) walk(ctx context.Context, chat string, since time.Time) ([]channel.InboundMsg, time.Time, int, error) {
+	me, err := a.me(ctx)
+	if err != nil {
+		return nil, time.Time{}, 0, err
+	}
+	next := messagesURL(chat, since)
 	seenLinks := map[string]bool{}
 	seenIDs := map[string]bool{}
 	var out []channel.InboundMsg

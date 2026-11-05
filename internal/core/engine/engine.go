@@ -280,6 +280,10 @@ type Engine struct {
 	reminded     map[int64]int    // queued turn id -> queue reminders posted (R-35)
 	intro        map[int64]string // first notice of a chat being created (mirror)
 	restart      restartConfirm   // confirmation owed for a `helper restart`
+	// legacy are the previous helper's unconfirmed answers (legacy_check.go),
+	// guarded by legacyMu.
+	legacyMu sync.Mutex
+	legacy   []legacyAnswer
 	// orphans are the turns the previous process left starting or
 	// running, until reconcile settles them (under mu). None of them runs:
 	// Prepare stopped the previous app-servers.
@@ -427,9 +431,13 @@ func (e *Engine) Run(ctx context.Context) error {
 		}
 	}
 	e.mu.Unlock()
+	// Before the receiver's first read: a post of one of them must not be
+	// taken for the owner's.
+	e.loadLegacyAnswers(ctx)
 	loops := []func(context.Context){
 		e.receiverLoop, e.runnerLoop, e.senderLoop, e.resolverLoop,
 		e.commandLoop, e.maintenanceLoop, e.asrLoop, e.notifyLoop,
+		e.legacyCheckLoop,
 	}
 	if e.cfg.SessionsDir != "" {
 		loops = append(loops, e.mirrorLoop)

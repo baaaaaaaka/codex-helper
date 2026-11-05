@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Identify returns the legacy store version of a scope directory (holding
@@ -115,6 +116,27 @@ func (c *converter) summary() string {
 			b.WriteString("\n\n1 message that was not sent yet is sent now.")
 		} else {
 			fmt.Fprintf(&b, "\n\n%d messages that were not sent yet are sent now.", unsent)
+		}
+	}
+	if n := len(c.checkAnswer); n > 0 {
+		var first, last string
+		for _, at := range c.checkAnswer {
+			d := time.UnixMilli(at).In(c.now.Location()).Format("2006-01-02")
+			if first == "" || d < first {
+				first = d
+			}
+			if d > last {
+				last = d
+			}
+		}
+		when := "from " + first
+		if last != first {
+			when = "from " + first + " to " + last
+		}
+		if n == 1 {
+			fmt.Fprintf(&b, "\n\n1 answer %s that the previous helper could not confirm as sent is checked against the chat history now, and sent only if it is missing.", when)
+		} else {
+			fmt.Fprintf(&b, "\n\n%d answers %s that the previous helper could not confirm as sent are checked against the chat history now, and sent only if they are missing.", n, when)
 		}
 	}
 	if c.staleUnsent > 0 {

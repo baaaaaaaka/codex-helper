@@ -625,6 +625,13 @@ func (e *Engine) classify(tx *store.Tx, conv int64, kind string, group bool, m c
 	if err != nil {
 		return c, false, err
 	}
+	if !own {
+		// A post of the previous helper whose send it could not confirm
+		// (no marker, no recorded id).
+		if own, err = e.legacyOwn(tx, conv, m); err != nil {
+			return c, false, err
+		}
+	}
 	if own {
 		c.in.Sender = store.SenderSelf
 		return c, true, nil
