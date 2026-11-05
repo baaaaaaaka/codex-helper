@@ -143,6 +143,12 @@ type Config struct {
 	Timing  Timing
 	Machine string // shown in the control chat title
 	Version string
+	// Host is the host this helper runs on. When the previous run was on
+	// another host (a takeover on a shared home), the control chat gets one
+	// notice naming both; TakeoverWhy says how the previous owner ended:
+	// "stale" (it stopped answering) or anything else (it stopped).
+	Host        string
+	TakeoverWhy string
 
 	// SessionsDir is $CODEX_HOME/sessions ("" disables mirroring).
 	SessionsDir string
@@ -555,6 +561,9 @@ func (e *Engine) start(ctx context.Context) error {
 	}
 	if err := e.announceMigration(); err != nil {
 		return fmt.Errorf("engine: announce migration: %w", err)
+	}
+	if err := e.announceTakeover(); err != nil {
+		return fmt.Errorf("engine: announce takeover: %w", err)
 	}
 	return nil
 }

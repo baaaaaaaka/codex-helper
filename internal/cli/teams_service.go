@@ -718,6 +718,10 @@ func defaultTeamsServiceBootstrapControlChat(ctx context.Context, _ *rootOptions
 			return result, nil
 		}
 		lastErr = err
+		var remote errTeamsStoreOnOtherHost
+		if errors.As(err, &remote) {
+			return teamsServiceBootstrapControlChatResult{}, err // this host stands by
+		}
 		if !time.Now().Before(deadline) {
 			if lastErr == nil {
 				lastErr = fmt.Errorf("the helper has not created the control chat yet; run `cxp teams control` later")
@@ -731,14 +735,14 @@ func defaultTeamsServiceBootstrapControlChat(ctx context.Context, _ *rootOptions
 }
 
 func teamsStoredControlChat() (corestore.Conversation, bool, error) {
-	path, _, err := teamsNewCoreCLIStorePath()
+	view, err := teamsReadStoreView()
 	if err != nil {
 		return corestore.Conversation{}, false, err
 	}
-	if !teamsFileExists(path) {
+	if !view.exists() {
 		return corestore.Conversation{}, false, nil
 	}
-	st, err := corestore.OpenWith(path, corestore.Options{ReadOnly: true})
+	st, err := view.openReadOnly()
 	if err != nil {
 		return corestore.Conversation{}, false, err
 	}

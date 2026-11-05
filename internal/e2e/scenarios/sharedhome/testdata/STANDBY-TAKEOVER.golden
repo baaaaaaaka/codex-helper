@@ -1,4 +1,4 @@
-# STANDBY-TAKEOVER: shared home: a second host stands by with no Graph traffic, takes over after the owner's heartbeat is stale, the old owner is fenced and posts nothing
+# STANDBY-TAKEOVER: shared home: a foreground start on a second host is refused, a service-run standby waits with no Graph traffic, takes over within 2-3 min after the owner hangs and announces it once; the old owner is fenced and makes no Graph write
 # cxp black-box transcript; volatile values are numbered placeholders
 
 == chat <chat:1> "Codex Control - e2ehost"
@@ -23,6 +23,9 @@
    | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
    mention 0: owner "E2E Owner"
 -- <msg:5> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>🔁 The helper now runs on host-b: it took over from host-a, whose helper stopped answering.</p>
+-- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>✅ Codex finished</strong></p>
    | <p><strong>Chat:</strong> s001 · standby<br>
@@ -30,7 +33,7 @@
    | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
    | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
    mention 0: owner "E2E Owner"
--- <msg:6> helper (html)
+-- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>✅ Codex finished</strong></p>
    | <p><strong>Chat:</strong> s001 · standby<br>

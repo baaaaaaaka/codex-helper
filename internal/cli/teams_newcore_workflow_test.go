@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/core/lease"
 	corestore "github.com/baaaaaaaka/codex-helper/internal/core/store"
 )
 
@@ -68,11 +69,23 @@ func TestTeamsNewCoreWorkflowConfig(t *testing.T) {
 	// and the helper applies it under its owner fence without a restart
 	// (as the old core did). Its notifier reads the setting at each card.
 	path := filepath.Join(tmp, "state", "teams", "core.sqlite")
-	st, err := corestore.Open(path)
+	host, _ := teamsHostname()
+	h, err := lease.Acquire(context.Background(), lease.Config{Anchor: path, Self: lease.Local(host, teamsBootID())})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := st.Acquire(corestore.Ident{Host: "other-box", PID: 1, BootID: "b"}); err != nil {
+	defer h.Release()
+	if !h.Plan().InPlace {
+		t.Fatalf("plan %+v", h.Plan())
+	}
+	if err := h.Activate(); err != nil {
+		t.Fatal(err)
+	}
+	st, err := corestore.OpenWith(path, corestore.Options{Lease: h})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Acquire(corestore.Ident{Host: host, PID: os.Getpid(), BootID: teamsBootID()}); err != nil {
 		t.Fatal(err)
 	}
 	n := &teamsNewCoreNotifier{st: st, path: path, log: io.Discard}
@@ -112,6 +125,7 @@ func TestTeamsNewCoreWorkflowConfig(t *testing.T) {
 	}
 	_ = st.Release()
 	_ = st.Close()
+	_ = h.Release()
 
 	if out, err := run("disable"); err != nil || !strings.Contains(out, "disabled") {
 		t.Fatalf("disable = %q, %v", out, err)

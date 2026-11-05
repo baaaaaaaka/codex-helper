@@ -16,6 +16,7 @@ import (
 
 	"github.com/gofrs/flock"
 
+	"github.com/baaaaaaaka/codex-helper/internal/core/lease"
 	corestore "github.com/baaaaaaaka/codex-helper/internal/core/store"
 )
 
@@ -56,7 +57,7 @@ func ensureTeamsIdleBeforeCodexUpgrade(context.Context) error {
 // teamsHelperOwnerLive reports whether a helper holds the store with a
 // fresh heartbeat (read-only).
 func teamsHelperOwnerLive(now time.Time) (bool, error) {
-	path, _, err := teamsNewCoreCLIStorePath()
+	view, err := teamsReadStoreView()
 	if err != nil {
 		var notConverted *errTeamsStoreNotConverted
 		if errors.As(err, &notConverted) {
@@ -64,10 +65,13 @@ func teamsHelperOwnerLive(now time.Time) (bool, error) {
 		}
 		return false, err
 	}
-	if !teamsFileExists(path) {
+	if view.Info.Exists {
+		return view.Info.Live(now, lease.ProductionStale), nil
+	}
+	if !view.exists() {
 		return false, nil
 	}
-	st, err := corestore.OpenWith(path, corestore.Options{ReadOnly: true})
+	st, err := view.openReadOnly()
 	if err != nil {
 		return false, err
 	}
@@ -82,7 +86,7 @@ func teamsHelperOwnerLive(now time.Time) (bool, error) {
 // teamsRunningCodexWork counts the requests the helper is running (read
 // from its store; 0 without a store).
 func teamsRunningCodexWork() (int, error) {
-	path, _, err := teamsNewCoreCLIStorePath()
+	view, err := teamsReadStoreView()
 	if err != nil {
 		var notConverted *errTeamsStoreNotConverted
 		if errors.As(err, &notConverted) {
@@ -90,10 +94,10 @@ func teamsRunningCodexWork() (int, error) {
 		}
 		return 0, err
 	}
-	if !teamsFileExists(path) {
-		return 0, nil
+	if !view.exists() || view.Remote != "" {
+		return 0, nil // another host's helper runs that work, not this host's service
 	}
-	st, err := corestore.OpenWith(path, corestore.Options{ReadOnly: true})
+	st, err := view.openReadOnly()
 	if err != nil {
 		return 0, err
 	}

@@ -27,12 +27,13 @@ func writeTeamsNewCoreStatus(out io.Writer, now time.Time) {
 
 // writeTeamsCoreStoreStatus prints the store's location and state.
 func writeTeamsCoreStoreStatus(out io.Writer, now time.Time) {
-	path, _, err := teamsNewCoreCLIStorePath()
+	view, err := teamsReadStoreView()
 	if err != nil {
 		_, _ = fmt.Fprintf(out, "Store: %v\n", err)
 		return
 	}
-	if _, statErr := os.Stat(path); statErr != nil {
+	path := view.DB
+	if !view.exists() {
 		_, _ = fmt.Fprintf(out, "Store: none yet (%s)\n", path)
 		return
 	}
@@ -40,13 +41,23 @@ func writeTeamsCoreStoreStatus(out io.Writer, now time.Time) {
 	if report := filepath.Join(filepath.Dir(path), migrate.ReportName); teamsFileExists(report) {
 		_, _ = fmt.Fprintf(out, "Conversion report: %s\n", report)
 	}
-	st, err := corestore.OpenWith(path, corestore.Options{ReadOnly: true})
+	if view.Remote != "" {
+		// Only the host whose helper uses the store opens it.
+		_, _ = fmt.Fprintln(out, view.ownerLine(now))
+		_, _ = fmt.Fprintf(out, "Store details: in use by the helper on %s (run `cxp teams status` there); this host stands by\n", view.Remote)
+		return
+	}
+	if !teamsFileExists(path) {
+		_, _ = fmt.Fprintln(out, view.ownerLine(now))
+		return
+	}
+	st, err := view.openReadOnly()
 	if err != nil {
 		_, _ = fmt.Fprintf(out, "Store unreadable: %v\n", err)
 		return
 	}
 	defer st.Close()
-	lines, err := teamsNewCoreStatusLines(st, now)
+	lines, err := teamsNewCoreStatusLines(st, view, now)
 	for _, l := range lines {
 		_, _ = fmt.Fprintln(out, l)
 	}
@@ -92,7 +103,7 @@ func teamsTokenCacheStatus(path string, now time.Time) string {
 	return "expired (run `cxp teams auth`)"
 }
 
-func teamsNewCoreStatusLines(st *corestore.Store, now time.Time) ([]string, error) {
+func teamsNewCoreStatusLines(st *corestore.Store, view teamsStoreView, now time.Time) ([]string, error) {
 	var lines []string
 	add := func(format string, args ...any) { lines = append(lines, fmt.Sprintf(format, args...)) }
 	o, ok, err := st.OwnerInfo()
@@ -100,6 +111,8 @@ func teamsNewCoreStatusLines(st *corestore.Store, now time.Time) ([]string, erro
 		return lines, err
 	}
 	switch {
+	case view.Info.Exists:
+		add("%s", view.ownerLine(now))
 	case !ok || o.Generation == 0:
 		add("Owner: none (never started)")
 	case o.HeartbeatAt == 0:

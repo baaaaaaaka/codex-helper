@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/core/lease"
 	_ "modernc.org/sqlite" // driver "sqlite"
 )
 
@@ -59,6 +60,35 @@ type Options struct {
 	PIDAlive func(pid int) bool
 	// ReadOnly opens only the read pool (status/stats); Update fails.
 	ReadOnly bool
+	// Lease, when set, is the owner lease of a store in a directory that
+	// hosts may share (internal/core/lease). It replaces the heartbeat in
+	// the owner row: every write transaction checks it first, and Fence
+	// verifies it.
+	Lease Lease
+}
+
+// Lease is the owner lease that gates writes (internal/core/lease.Holder).
+type Lease interface {
+	// Check returns nil while the lease is held. It is cheap within the
+	// lease's validity and renews past it.
+	Check() error
+	// Verify reads the lease now: nil means no later owner has claimed it.
+	Verify() error
+}
+
+// leaseErr maps the lease's errors to the store's.
+func leaseErr(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, lease.ErrFenced):
+		return ErrFenced
+	case errors.Is(err, lease.ErrDisabled):
+		return ErrDisabled
+	case errors.Is(err, lease.ErrReleased):
+		return ErrNotAcquired
+	}
+	return err
 }
 
 // Store is an open core store.
@@ -73,17 +103,25 @@ type Store struct {
 	lease  sync.Mutex // guards beat and fenced; held by Heartbeat, Fence, Acquire, Release
 	beat   time.Time  // start of the last successful heartbeat or acquire
 	fenced bool       // a heartbeat found a newer generation
+	ls     Lease      // the owner lease (nil: the owner row's heartbeat)
 }
 
 // Open opens or creates the store at path with production options.
 func Open(path string) (*Store, error) { return OpenWith(path, Options{}) }
 
 func dsn(path string, ro bool) string {
+	sync := "synchronous(NORMAL)"
+	if !ro && networkFS(filepath.Dir(path)) {
+		// On a network filesystem another host may have to take the store
+		// over after this one dies: every commit must be on the server
+		// (fsync is an NFS COMMIT), not only in this host's page cache.
+		sync = "synchronous(FULL)"
+	}
 	q := url.Values{}
 	for _, p := range []string{
 		"busy_timeout(5000)",
 		"foreign_keys(ON)",
-		"synchronous(NORMAL)",
+		sync,
 		"temp_store(MEMORY)",
 		"cache_size(-16000)",
 		"journal_size_limit(67108864)",
@@ -100,7 +138,7 @@ func dsn(path string, ro bool) string {
 
 // OpenWith opens or creates the store at path.
 func OpenWith(path string, opt Options) (*Store, error) {
-	s := &Store{path: path, now: opt.Now, pid: opt.PIDAlive}
+	s := &Store{path: path, now: opt.Now, pid: opt.PIDAlive, ls: opt.Lease}
 	if s.now == nil {
 		s.now = time.Now
 	}
@@ -290,6 +328,11 @@ func (s *Store) Update(fn func(*Tx) error) error {
 }
 
 func (s *Store) update(fence bool, fn func(*Tx) error) error {
+	if s.ls != nil {
+		if err := s.ls.Check(); err != nil {
+			return leaseErr(err)
+		}
+	}
 	ctx := context.Background()
 	tx, err := s.w.BeginTx(ctx, nil) // _txlock=immediate
 	if err != nil {

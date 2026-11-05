@@ -35,6 +35,9 @@ const DisabledFile = "DISABLED"
 
 // Acquire takes ownership of the store and returns the new generation.
 //
+// With a Lease the lease decides ownership; Acquire only bumps the
+// generation (the store's own fence).
+//
 // Rules:
 //   - <dir>/DISABLED blocks acquire on every host.
 //   - a service pinned to another host (InstallHost != Host) never acquires.
@@ -57,7 +60,7 @@ func (s *Store) Acquire(id Ident) (int64, error) {
 		if err != nil {
 			return err
 		}
-		if ok {
+		if ok && s.ls == nil {
 			fresh := t.now-cur.HeartbeatAt < OwnerStaleAfter.Milliseconds()
 			sameBoot := strings.EqualFold(cur.Host, id.Host) && cur.BootID == id.BootID && cur.BootID != ""
 			deadHere := sameBoot && (cur.PID == id.PID || !s.pid(cur.PID))
@@ -121,6 +124,8 @@ func (t *Tx) owner() (Owner, bool, error) {
 }
 
 // Heartbeat refreshes the owner heartbeat. It is the one periodic write.
+// With a Lease it writes nothing: the lease's own goroutine renews it, and
+// Heartbeat only checks the lease and the kill switch.
 //
 // It returns ErrDisabled without renewing the heartbeat once the kill-switch
 // file exists, so a running owner stops at its next heartbeat instead of
@@ -140,6 +145,16 @@ func (s *Store) heartbeatLocked() error {
 	}
 	if s.Disabled() {
 		return ErrDisabled
+	}
+	if s.ls != nil {
+		// The lease's goroutine renews it; no store write.
+		if err := leaseErr(s.ls.Check()); err != nil {
+			if err == ErrFenced {
+				s.fenced = true
+			}
+			return err
+		}
+		return nil
 	}
 	start := s.now()
 	n, err := affected(s.w.Exec(`UPDATE owner SET heartbeat_at = ? WHERE id = 1 AND generation = ?`, start.UnixMilli(), s.gen))
@@ -177,6 +192,24 @@ const ownerLease = OwnerStaleAfter / 2
 // The caller must not hold a write transaction (the renewal needs the one
 // writer connection); no transaction spans I/O.
 func (s *Store) Fence() error {
+	if s.ls != nil {
+		s.lease.Lock()
+		gen, fenced := s.gen, s.fenced
+		s.lease.Unlock()
+		switch {
+		case gen == 0:
+			return ErrNotAcquired
+		case fenced:
+			return ErrFenced
+		}
+		err := leaseErr(s.ls.Verify())
+		if err == ErrFenced {
+			s.lease.Lock()
+			s.fenced = true
+			s.lease.Unlock()
+		}
+		return err
+	}
 	s.lease.Lock()
 	defer s.lease.Unlock()
 	if s.gen != 0 && !s.fenced && leaseAge(s.now(), s.beat) < ownerLease {
@@ -207,6 +240,10 @@ func (s *Store) Release() error {
 	s.lease.Lock()
 	defer s.lease.Unlock()
 	if s.gen == 0 {
+		return nil
+	}
+	if s.ls != nil && s.ls.Check() != nil {
+		s.gen = 0 // superseded: this file is no longer the store
 		return nil
 	}
 	_, err := s.w.Exec(`UPDATE owner SET heartbeat_at = 0 WHERE id = 1 AND generation = ?`, s.gen)

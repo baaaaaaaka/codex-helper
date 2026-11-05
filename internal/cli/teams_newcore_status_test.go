@@ -85,7 +85,7 @@ func TestTeamsNewCoreServiceStatusReadsStore(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ro.Close()
-	lines, err := teamsNewCoreStatusLines(ro, time.Now().Add(5*time.Minute))
+	lines, err := teamsNewCoreStatusLines(ro, teamsStoreView{}, time.Now().Add(5*time.Minute))
 	if err != nil || !strings.Contains(strings.Join(lines, "\n"), "(stale)") {
 		t.Errorf("stale owner not reported: %v %v", lines, err)
 	}

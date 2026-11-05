@@ -15,6 +15,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
+	"github.com/baaaaaaaka/codex-helper/internal/core/lease"
 	corestore "github.com/baaaaaaaka/codex-helper/internal/core/store"
 )
 
@@ -56,6 +57,10 @@ type teamsServiceWatchdogSnapshot struct {
 	// an old store at first start).
 	ManagedChildStarting  bool
 	ManagedChildStartedAt time.Time
+	// RemoteOwner is the host whose helper holds the lease when that is
+	// not this host: this host's service stands by and takes over by
+	// itself, so a restart would not help.
+	RemoteOwner string
 	// Disabled is true when the kill-switch file is next to the store: the
 	// helper must stay stopped (or stand by), so nothing is started.
 	Disabled bool
@@ -251,6 +256,9 @@ func collectTeamsServiceWatchdogSnapshot(ctx context.Context, opts teamsServiceW
 	if host, err := teamsHostname(); err == nil {
 		snapshot.BackoffUntil = readTeamsServiceRestartRecord(teamsServiceRestartRecordPath(filepath.Dir(path), host)).WaitUntil
 	}
+	if view, err := teamsStoreViewAt(path); err == nil && view.Info.Exists {
+		return teamsServiceWatchdogLeaseSnapshot(snapshot, view, opts), nil
+	}
 	if info, err := os.Lstat(path); err != nil || !info.Mode().IsRegular() {
 		return snapshot, nil
 	}
@@ -277,6 +285,35 @@ func collectTeamsServiceWatchdogSnapshot(ctx context.Context, opts teamsServiceW
 		snapshot.ManagedChildStarting = !owns
 	}
 	return snapshot, nil
+}
+
+// teamsServiceWatchdogLeaseSnapshot judges the owner from the lease: a
+// helper of another host is left alone (its heartbeat is on its clock, and
+// this host's standby takes over by itself); one of this host is fresh
+// while its lease renewals are recent by this host's clock.
+func teamsServiceWatchdogLeaseSnapshot(snapshot teamsServiceWatchdogSnapshot, view teamsStoreView, opts teamsServiceWatchdogOptions) teamsServiceWatchdogSnapshot {
+	snapshot.StateFiles = 1
+	snapshot.AuthoritativeStorePath = view.DB
+	in := view.Info
+	holding := in.HeadOK && (in.Head.State == lease.Active || in.Head.State == lease.Claimed)
+	host, _ := teamsHostname()
+	if holding && !teamsHostEqual(in.Head.Host, host) {
+		snapshot.RemoteOwner = in.Head.Host
+		return snapshot
+	}
+	ownerPID := 0
+	if holding {
+		snapshot.OwnerFound = true
+		snapshot.LastOwnerHeartbeat = time.UnixMilli(in.Head.Wall)
+		snapshot.OwnerFresh = opts.Now.Sub(snapshot.LastOwnerHeartbeat) < opts.OwnerStaleAfter
+		ownerPID = in.Head.PID
+	}
+	if child, found := teamsServiceWatchdogManagedChild(); found && child.PID > 0 && !child.StartedAt.IsZero() {
+		snapshot.ManagedChildStartedAt = child.StartedAt
+		owns := snapshot.OwnerFresh && ownerPID == child.PID && !snapshot.LastOwnerHeartbeat.Before(child.StartedAt)
+		snapshot.ManagedChildStarting = !owns
+	}
+	return snapshot
 }
 
 func defaultTeamsServiceWatchdogManagedChild() (teamsServiceWatchdogManagedChildIdentity, bool) {
@@ -326,6 +363,8 @@ func evaluateTeamsServiceWatchdog(snapshot teamsServiceWatchdogSnapshot, state t
 
 func teamsServiceWatchdogStaleReason(snapshot teamsServiceWatchdogSnapshot) (bool, string) {
 	switch {
+	case snapshot.RemoteOwner != "":
+		return false, "the helper on " + snapshot.RemoteOwner + " owns the Teams state; this host stands by"
 	case snapshot.ManagedChildStarting:
 		return false, "managed Teams child is alive; waiting for owner heartbeat"
 	case snapshot.OwnerFresh:

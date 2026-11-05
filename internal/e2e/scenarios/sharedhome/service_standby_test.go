@@ -21,8 +21,10 @@ import (
 // Host A owns the state and answers. Host B starts as a service child: it
 // stands by (A is live) and keeps running. DISABLED appears: A stops; B
 // keeps standing by (now for the kill-switch file). A prompt is posted.
-// DISABLED is removed: B takes the state at its next check and answers the
-// prompt once.
+// A start on a third host exits at once. DISABLED is removed: B takes the
+// state at its next check (A released its lease when it stopped, so B does
+// not wait for it to go stale), answers the prompt once and announces the
+// takeover once.
 func TestServiceChildStandsByInsteadOfRestarting(t *testing.T) {
 	harness.NeedsCLI(t)
 	harness.Parallel(t)
@@ -34,6 +36,8 @@ func TestServiceChildStandsByInsteadOfRestarting(t *testing.T) {
 		Invariants: harness.Invariants{Except: []harness.Exception{
 			{Invariant: harness.InvCleanStop, Match: `cxp-1 exited on its own with "exit status 1"`,
 				Reason: "the owner (not a service child) stops with an error when DISABLED appears"},
+			{Invariant: harness.InvCleanStop, Match: `^cxp-C-\d+ exited on its own with "exit status 1"$`,
+				Reason: "a start on a third host while DISABLED exists is refused with an error"},
 		}},
 	})
 	defer s.Finish()
@@ -73,6 +77,16 @@ func TestServiceChildStandsByInsteadOfRestarting(t *testing.T) {
 	bOut = b.Output()
 	s.Check("the service child stands by for the kill-switch file without exiting", b.Running() && sawKillSwitch,
 		"B running, naming the kill-switch file", fmt.Sprintf("running=%v; output %s", b.Running(), clipTail(bOut, 300)))
+	// DISABLED wins on every host: a start on a third host exits at once.
+	c := s.NewPeer("C", harness.PeerOptions{Seam: harness.Seam{Hostname: "host-c"}})
+	cFrom := s.Graph.LastSeq()
+	if err := c.Start(s.Ctx()); err != nil {
+		t.Fatal(err)
+	}
+	cExited := s.Poll(10*time.Second, func() bool { return !c.Running() })
+	cReqs := peerRequests(s, cFrom, "-C-")
+	s.Check("a start on any other host exits at once while DISABLED exists", cExited && len(cReqs) == 0 && strings.Contains(c.Output(), "disabled"),
+		"exited, naming the kill switch, 0 Graph requests", fmt.Sprintf("exited=%v requests=%q; output %s", cExited, cReqs, clipTail(c.Output(), 300)))
 	beforeRemove := peerRequests(s, bFrom, "-B-")
 	s.Check("a standing-by service child sends no Graph request", len(beforeRemove) == 0, "0 requests from B",
 		fmt.Sprintf("%d: %q", len(beforeRemove), beforeRemove))
@@ -101,4 +115,7 @@ func TestServiceChildStandsByInsteadOfRestarting(t *testing.T) {
 	s.Check("once DISABLED is removed the standing-by child takes over and answers once", heldAnswered && len(posts) == 1 && byB == 1 && b.Running(),
 		"1 answer, by B, B still running", fmt.Sprintf("answered=%v posts=%d byB=%d running=%v", heldAnswered, len(posts), byB, b.Running()),
 		s.Transcript(work.ID, 15)...)
+	notices := takeoverNotices(s, control.ID)
+	s.Check("the control chat gets one notice naming the new host", len(notices) == 1 && strings.Contains(notices[0], "host-b"),
+		"1 notice naming host-b", fmt.Sprintf("%d: %q", len(notices), notices))
 }
