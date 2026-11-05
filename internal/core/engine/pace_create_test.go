@@ -254,3 +254,47 @@ func TestDefaultWriteRateKeepsAMinuteUnder240(t *testing.T) {
 	}
 	t.Logf("at most %d writes in any 60 s at %.1f/s", best, e.cfg.WriteRate)
 }
+
+// `new` commands sent at once are answered in their order, as by the old
+// helper: each creates its chat in the command (e2e IDLE: chats created by
+// the sender in parallel announced s002 and s003 before s001).
+func TestNewChatsAnnouncedInCommandOrder(t *testing.T) {
+	const n = 6
+	// The first work chat takes longer to create (Graph latency varies).
+	slow := &slowCreate{delay: []time.Duration{0, 2 * time.Second}}
+	r := newRig(t, func(c *Config) {
+		c.WriteRate = 3
+		slow.Fake = c.Channel.(*channeltest.Fake)
+		c.Channel = slow
+	})
+	ctl := r.control()
+	for i := 0; i < n; i++ {
+		r.ch.PostUser(ctl, "new "+t.TempDir())
+	}
+	r.waitFor("work chats", 30*time.Second, func() bool { return len(r.own(ctl, "Work chat created")) == n })
+	for i, m := range r.own(ctl, "Work chat created") {
+		if want := fmt.Sprintf("Work chat created: s%03d", i+1); !strings.Contains(m.Text, want) {
+			t.Fatalf("notice %d is %q, want %q", i+1, m.Text, want)
+		}
+	}
+}
+
+// slowCreate delays the i-th chat creation by delay[i].
+type slowCreate struct {
+	*channeltest.Fake
+	mu    sync.Mutex
+	n     int
+	delay []time.Duration
+}
+
+func (c *slowCreate) CreateChat(ctx context.Context, title, key string) (channel.ChatInfo, error) {
+	c.mu.Lock()
+	var d time.Duration
+	if c.n < len(c.delay) {
+		d = c.delay[c.n]
+	}
+	c.n++
+	c.mu.Unlock()
+	time.Sleep(d)
+	return c.Fake.CreateChat(ctx, title, key)
+}

@@ -251,6 +251,9 @@ type Engine struct {
 	// drainFlag holds new turn starts while an update waits for running
 	// turns to finish (upgrade.go).
 	drainFlag atomic.Bool
+	// writeWaiters counts writers in waitWrite: the sender leaves the
+	// account's write tokens to them (sender.go).
+	writeWaiters atomic.Int32
 	// starting counts turn starts between the drain check and running
 	// being set (guarded by mu).
 	starting     int

@@ -53,9 +53,9 @@ func (e *Engine) registryLoop(ctx context.Context) {
 			return
 		case <-t.C:
 		case <-e.registryWake:
-			// The drain state changed: publish it now, unless a failed
-			// publish waits out its backoff.
-			if backoff > 0 || !published {
+			// The drain state changed, or the inbox chat was created:
+			// publish now, unless a failed publish waits out its backoff.
+			if backoff > 0 {
 				continue
 			}
 			if !t.Stop() {
@@ -67,7 +67,8 @@ func (e *Engine) registryLoop(ctx context.Context) {
 		}
 		card, ok := e.registryCard(e.draining())
 		if !ok {
-			// The inbox chat is created by the maintenance loop.
+			// The sender creates the inbox chat (requestChat) and wakes
+			// this loop; the timer is a backstop.
 			t.Reset(e.t.Control)
 			continue
 		}

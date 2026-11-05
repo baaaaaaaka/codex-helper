@@ -126,10 +126,10 @@ func (e *Engine) resumeCreating() {
 }
 
 // requestChat asks the sender to create the chat of a creating
-// conversation, ranked in send class class (sendReply for a chat the owner
-// asked for, sendMirror for one nobody waits for; the control chat always
-// goes first). A request stays until the chat exists or the conversation
-// leaves the creating state.
+// conversation, ranked in send class class (sendMirror: nobody waits for
+// it; the control chat always goes first, and the chats the owner asks for
+// are created by createChatNow). A request stays until the chat exists or
+// the conversation leaves the creating state.
 func (e *Engine) requestChat(id int64, class int) {
 	e.mu.Lock()
 	if e.chatWant == nil {
@@ -140,6 +140,31 @@ func (e *Engine) requestChat(id int64, class int) {
 	}
 	e.mu.Unlock()
 	e.wakeSender()
+}
+
+// createChatNow creates the chat the owner asked for (`new`, fork) in the
+// command, as the old helper did, so its notices keep their order with the
+// command's other replies; it waits for a write token first, ahead of the
+// sender. A failure is retried in the background (retryCreating).
+func (e *Engine) createChatNow(ctx context.Context, id int64) {
+	e.mu.Lock()
+	cs := e.convs[id]
+	if cs == nil || cs.sending {
+		e.mu.Unlock()
+		return // the sender is creating it
+	}
+	cs.sending = true // the sender leaves it alone (dueChats)
+	e.mu.Unlock()
+	defer func() {
+		e.mu.Lock()
+		cs.sending = false
+		e.mu.Unlock()
+		e.wakeSender()
+	}()
+	if err := e.waitWrite(ctx); err != nil {
+		return
+	}
+	e.createChat(ctx, id)
 }
 
 // createChat creates the chat of a creating conversation and announces it.
@@ -252,6 +277,9 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 	cs.lastActivity = e.now()
 	delete(e.intro, id)
 	e.mu.Unlock()
+	if inbox {
+		wake(e.registryWake) // the card can be published now
+	}
 	e.wakeReader()
 	e.wakeSender()
 	return true

@@ -141,7 +141,7 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 					soon(e.t.Tick)
 					return nil
 				}
-				if ok, w := e.writeTokens.take(); !ok {
+				if ok, w := e.takeWrite(); !ok {
 					<-sem
 					soon(w)
 					return nil
@@ -193,7 +193,7 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 				soon(e.t.Tick)
 				return nil
 			}
-			if ok, w := e.writeTokens.take(); !ok {
+			if ok, w := e.takeWrite(); !ok {
 				<-sem
 				soon(w)
 				return nil
@@ -324,10 +324,24 @@ func (e *Engine) paceThrottled(started, resume time.Time) {
 	}
 }
 
+// takeWrite takes a write token for the sender, unless a writer waits in
+// waitWrite: that one goes first.
+func (e *Engine) takeWrite() (bool, time.Duration) {
+	if e.writeWaiters.Load() > 0 {
+		return false, e.t.Tick
+	}
+	return e.writeTokens.take()
+}
+
 // waitWrite blocks until one Graph write may go under the account's write
-// pacing and gate (or ctx ends): for writers outside the sender, such as
-// the registry card (WritePaced), so every write shares one budget.
+// pacing and gate (or ctx ends): for writers outside the sender, so every
+// write shares one budget. They are few and waited for (the chat of `new`
+// or fork, the registry card), so the sender leaves the tokens to them
+// while they wait: a catch-up backlog never delays them by more than one
+// token.
 func (e *Engine) waitWrite(ctx context.Context) error {
+	e.writeWaiters.Add(1)
+	defer e.writeWaiters.Add(-1)
 	for {
 		now := e.now()
 		var wait time.Duration
