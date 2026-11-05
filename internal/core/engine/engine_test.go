@@ -34,6 +34,9 @@ type fakeAgent struct {
 	notes   []string // commentary streamed by turns whose text contains "progress"
 	// interrupted runs after an interrupt reached a running turn.
 	interrupted func()
+	// lookupGate, when set, holds Lookup (restart reconciliation) until
+	// it is closed.
+	lookupGate chan struct{}
 }
 
 func newAgent() *fakeAgent {
@@ -92,7 +95,17 @@ func (a *fakeAgent) Run(ctx context.Context, req TurnRequest, h TurnHooks) (Turn
 	return TurnOutcome{CodexTurnID: fmt.Sprintf("turn-%d", n), Status: StatusCompleted, Final: "ANSWER to " + req.Text}, nil
 }
 
-func (a *fakeAgent) Lookup(_ context.Context, _ int64, _, key string) (TurnOutcome, bool, error) {
+func (a *fakeAgent) Lookup(ctx context.Context, _ int64, _, key string) (TurnOutcome, bool, error) {
+	a.mu.Lock()
+	gate := a.lookupGate
+	a.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return TurnOutcome{}, false, ctx.Err()
+		}
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	o, ok := a.lookup[key]

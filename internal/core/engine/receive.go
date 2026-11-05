@@ -769,7 +769,17 @@ func (e *Engine) ackPrompt(tx *store.Tx, conv int64, a store.Admitted, c *classi
 	text := textAccepted
 	var running, queued []string
 	ahead := false
+	// A turn the previous process left open is not running: it is
+	// settled, with its own notice, before the next turn starts.
+	e.mu.Lock()
+	live := open[:0]
 	for _, t := range open {
+		if !e.orphans[t.ID] {
+			live = append(live, t)
+		}
+	}
+	e.mu.Unlock()
+	for _, t := range live {
 		ahead = ahead || t.ID < a.TurnID
 		in, ok, err := tx.Inbound(t.InboundID)
 		if err != nil {

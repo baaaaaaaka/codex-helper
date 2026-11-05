@@ -73,9 +73,8 @@
    | <p><strong>Next step:</strong> wait. I will run your request after the current Codex request finishes.</p>
    | <p>Another Codex request is already running in this Work chat, so I will run yours after it finishes.</p>
    | <hr/>
-   | <p><strong>▶️ Running now:</strong></p>
-   | <ol><li>Long task E2E-R429-running-1</li>
-   | </ol>
+   | <p><strong>Currently blocking:</strong><br>
+   | Codex/helper work already in progress.</p>
    | <p><strong>⏳ Queued requests:</strong></p>
    | <ol><li>Follow-up E2E-R429-queued-2</li>
    | <li>Sent while helper is down E2E-R429-whiledown-3</li>

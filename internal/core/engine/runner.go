@@ -933,6 +933,9 @@ func (e *Engine) reconcileTurn(ctx context.Context, cs *convState, tr store.Turn
 	cs.running = rs
 	e.mu.Unlock()
 	defer func() {
+		e.mu.Lock()
+		delete(e.orphans, tr.ID)
+		e.mu.Unlock()
 		close(rs.done)
 		e.clearRun(cs.id, rs)
 	}()
