@@ -254,6 +254,10 @@ type Engine struct {
 	// scanFirst: after an account read throttle the activity scan gets
 	// the first read when the gate opens (receive.go).
 	scanFirst atomic.Bool
+	// scanBlind is the read interval of idle active work chats while the
+	// activity scan has failed for longer than scanBlindAfter (0: the scan
+	// works). Guarded by mu (receive.go scanFallbackLocked).
+	scanBlind time.Duration
 	// drainFlag holds new turn starts while an update waits for running
 	// turns to finish (upgrade.go).
 	drainFlag atomic.Bool

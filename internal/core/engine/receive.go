@@ -257,6 +257,9 @@ func (e *Engine) intervalLocked(cs *convState, now time.Time) time.Duration {
 		if now.Sub(cs.lastUser) < e.t.HotFor {
 			return hot
 		}
+		if e.scanBlind > 0 && cs.kind == store.KindWork {
+			return e.scanBlind // the scan is failing (scanFallback)
+		}
 		return e.t.SafetyRead
 	}
 	idle := now.Sub(cs.lastActivity)
@@ -1044,6 +1047,7 @@ func (e *Engine) scanLoop(ctx context.Context) {
 	// what arrives from now on (with a margin for clock skew).
 	mark := e.now().Add(-time.Minute)
 	failures := 0
+	okAt := e.now()    // the last successful scan (the start-up reads cover before)
 	var last time.Time // the last scan request
 	waiting := false   // the scan waits for a read token (the receiver waits for it)
 	for {
@@ -1107,15 +1111,79 @@ func (e *Engine) scanLoop(ctx context.Context) {
 			if failures <= 3 || failures%100 == 0 {
 				e.logf("activity scan failed (%d in a row): %v", failures, err)
 			}
+			if blind := e.now().Sub(okAt); blind >= e.scanBlindAfter() {
+				e.scanFallback(blind)
+			}
 			continue
 		}
 		failures = 0
+		okAt = e.now()
 		e.scanFirst.Store(false)
+		e.scanWorks()
 		var woke bool
 		mark, woke = e.markScanned(acts, mark, now)
 		if woke {
 			e.wakeReader()
 		}
+	}
+}
+
+// scanBlindAfter is how long the activity scan may fail before the idle
+// active work chats are read directly (scanFallback): a few failed scans in
+// a row (the live canary saw 502/504 clusters of up to 101 s) cost a short
+// delay, a longer outage must not leave the owner's prompts to the
+// SafetyRead (10 min).
+func (e *Engine) scanBlindAfter() time.Duration { return 6 * e.t.ScanInterval }
+
+// scanFallback runs while the activity scan has failed for blind (at least
+// scanBlindAfter): a change it would show is not lost (the watermark stays
+// until a scan succeeds) but would be seen only by the next successful
+// scan or the SafetyRead. The idle active work chats are read every
+// fallback interval instead: max(12 scan intervals, two read tokens per
+// chat), so the reads stay background reads under the read pacer and take
+// at most half the account's read budget. A safety read due later is
+// brought forward, spread over the interval by chat id.
+func (e *Engine) scanFallback(blind time.Duration) {
+	now := e.now()
+	e.mu.Lock()
+	var idle []*convState
+	for _, cs := range e.convs {
+		if cs.kind == store.KindWork && e.readableLocked(cs) && !e.polledLocked(cs, now) {
+			idle = append(idle, cs)
+		}
+	}
+	every := max(12*e.t.ScanInterval, time.Duration(float64(len(idle))*2/e.cfg.ReadRate*float64(time.Second)))
+	first := e.scanBlind == 0
+	e.scanBlind = every
+	moved := 0
+	for _, cs := range idle {
+		if cs.reading {
+			continue
+		}
+		at := now.Add(every - 2*safetyJitter(cs.id, every)) // spread over [0, every)
+		if cs.nextRead.After(at) {
+			cs.nextRead, cs.safeAt = at, at
+			moved++
+		}
+	}
+	e.mu.Unlock()
+	if first {
+		e.logf("activity scan failing for %s: reading the %d idle work chats every %s until it works", blind.Round(100*time.Millisecond), len(idle), every)
+	}
+	if moved > 0 {
+		e.wakeReader()
+	}
+}
+
+// scanWorks ends scanFallback after a successful scan: idle chats return to
+// the SafetyRead after their next read.
+func (e *Engine) scanWorks() {
+	e.mu.Lock()
+	was := e.scanBlind != 0
+	e.scanBlind = 0
+	e.mu.Unlock()
+	if was {
+		e.logf("activity scan works again")
 	}
 }
 
