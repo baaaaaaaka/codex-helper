@@ -168,13 +168,13 @@ func (l *shadowLive) local(s *harness.Scenario, home string) {
 
 // shadowNotifications lists what the control chat told the owner
 // (@mentions): final notices and local sessions announced. Which finals
-// a notice covers is in the store (delivery key notify:<ids>), counted by
+// a notice covers is in the store (delivery key notify:<id>), counted by
 // shadow_analyze.py.
 func shadowNotifications(s *harness.Scenario, control string) (finals, locals int, texts []string) {
 	for _, m := range s.SUTMessages(control) {
 		t := harness.NormalizeSpace(m.PlainText())
 		switch {
-		case strings.Contains(t, "Codex finished in"):
+		case strings.Contains(m.Content, "<strong>✅ Codex finished</strong>"):
 			finals++
 		case strings.Contains(t, "New local Codex chat detected"):
 			locals++

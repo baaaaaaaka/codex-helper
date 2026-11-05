@@ -11,19 +11,19 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/steps"
 )
 
-// Decision "@ 通知: 每条最终答案都 @（维持现状）". Three finals land at the
-// same moment in three work chats (no webhook). The core coalesces the
-// control-chat @mentions of finals within MentionWindow (benchmark F2), so
-// this checks the decision's substance under a burst: every final is named
-// in an owner @mention in the control chat exactly once, none is dropped,
-// and there is no @mention in a work chat.
+// Decision "@ 通知: 每条最终答案都 @（维持现状）" and owner ruling 2026-11-05
+// (Q3): every final gets its own notification, never merged. Three finals
+// land at the same moment in three work chats (no webhook): the control
+// chat gets three owner @mentions, each naming exactly one of the chats in
+// v0.1.20's "✅ Codex finished" text, and there is no @mention in a work
+// chat.
 func TestNotify_BurstOfFinals(t *testing.T) {
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "NOTIFY-BURST", harness.Options{
 		Guarantees: []string{"owner-notify-every-final"},
-		Title:      "three finals at once in three work chats: each named in a control-chat owner @mention exactly once, none in work chats",
+		Title:      "three finals at once in three work chats: three control-chat owner @mentions, one per final, none in work chats",
 		Budget:     120 * time.Second,
-		Golden:     harness.GoldenOptions{FinishedNotices: "three finals complete at once; the scenario checks each is named exactly once"},
+		Golden:     harness.GoldenOptions{FinishedNotices: "three finals complete at once"},
 	})
 	defer s.Finish()
 	toks := []string{s.Token("burst1"), s.Token("burst2"), s.Token("burst3")}
@@ -85,12 +85,19 @@ func TestNotify_BurstOfFinals(t *testing.T) {
 	for _, w := range works {
 		n := 0
 		for _, m := range mentions {
-			if m.ChatID == control.ID {
-				n += strings.Count(m.PlainText(), w.Topic)
+			if m.ChatID == control.ID && strings.Contains(m.PlainText(), w.Topic) {
+				n++
 			}
 		}
-		s.Check(fmt.Sprintf("the final in %q is named in an owner @mention exactly once", w.Topic), n == 1, "1", fmt.Sprint(n), ev...)
+		s.Check(fmt.Sprintf("the final in %q has its own owner @mention, exactly one", w.Topic), n == 1, "1", fmt.Sprint(n), ev...)
 	}
+	for _, m := range mentions {
+		named := 0
+		for _, w := range works {
+			named += strings.Count(m.PlainText(), w.Topic)
+		}
+		s.Check("an owner @mention names one final", m.ChatID != control.ID || named == 1, "1", fmt.Sprint(named), ev...)
+	}
+	s.Check("one control-chat owner @mention per final", inControl == len(works), fmt.Sprint(len(works)), fmt.Sprint(inControl), ev...)
 	s.Check("owner @mentions are in the control chat only", elsewhere == 0, "0 elsewhere", fmt.Sprint(elsewhere), ev...)
-	s.Note("%d control-chat @mention message(s) for 3 simultaneous finals", inControl)
 }

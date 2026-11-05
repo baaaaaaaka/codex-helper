@@ -35,14 +35,14 @@
 -- <msg:9> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Resumed s001: its chat is read again.</p>
--- "Codex finished" notices, by session (batching is timing: several chats finish close together)
-   finished: s001 · park-a (@owner)
-   finished: s001 · park-a (@owner)
+-- "Codex finished" notices, one line each, sorted (posting order is timing: several chats finish close together)
+   finished: s001 · park-a | request: First task E2E-PARK-warma-1 (@owner)
+   finished: s001 · park-a | request: Typed while parked E2E-PARK-whileparked-4 (@owner)
    finished: s002 · park-b (@owner)
-   finished: s002 · park-b (@owner)
-   finished: s002 · park-b (@owner)
+   finished: s002 · park-b | request: First task E2E-PARK-warmb-2 (@owner)
+   finished: s002 · park-b | request: Follow-up after the local work E2E-PARK-afterlocal-9 (@owner)
    finished: s003 · park-c (@owner)
-   finished: s003 · park-c (@owner)
+   finished: s003 · park-c | request: First task E2E-PARK-warmc-3 (@owner)
 
 == chat <chat:2> "s001 · park-a"
    type: meeting; members: owner

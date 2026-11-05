@@ -115,7 +115,12 @@ func TestR05b_AbsentFinalResentOnce(t *testing.T) {
 	s.Check("R-5b a resend that is absent again is not sent a third time", len(posts2) == 2, "2 POST attempts", fmt.Sprintf("%d POST attempts", len(posts2)), ev2...)
 	n2 := len(s.SUTMessagesContaining(work2.ID, "could not be confirmed"))
 	s.Check("R-1 exactly one visible notice for the lost answer", n2 == 1, "1 notice", fmt.Sprintf("%d notices", n2), transcript2...)
-	finished := len(s.SUTMessagesContaining(control.ID, "Codex finished in s002"))
+	finished := 0
+	for _, m := range s.SUTMessagesContaining(control.ID, "Codex finished") {
+		if strings.Contains(m.PlainText(), "Chat: s002") {
+			finished++
+		}
+	}
 	s.Check("R-5b the owner is notified of the visible answer only", finished == 1, "1 notification (the next answer)",
 		fmt.Sprintf("%d notifications", finished), s.Transcript(control.ID, 4)...)
 	var visible []string

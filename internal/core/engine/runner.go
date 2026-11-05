@@ -625,7 +625,11 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 			}
 		}
 		if notify {
-			return addNotify(tx, pendingNotify{Turn: tr.ID, Conv: cs.id, Text: clipText(out.Final, 400)})
+			in, _, err := tx.Inbound(tr.InboundID)
+			if err != nil {
+				return err
+			}
+			return addNotify(tx, pendingNotify{Turn: tr.ID, Conv: cs.id, Text: clipText(out.Final, 400), Request: requestSummary(in.Body)})
 		}
 		return nil
 	}) {
@@ -744,63 +748,89 @@ func (e *Engine) capacityRetry(cs *convState, tr store.Turn, out TurnOutcome) bo
 	return true
 }
 
-// mentionNotice is the control-chat @mention for the finals of ids
-// (pendingNotify ids; convs: their conversations, in order; a conversation
-// may repeat). Its delivery key names every final, so the set is posted
-// once.
-func (e *Engine) mentionNotice(ids []string, convs []*convState) ([]store.OutMsg, error) {
-	type chat struct {
-		name, url string
-		n         int
-	}
+// finalMention is the control-chat @mention of one final (owner ruling
+// 2026-11-05, Q3: one notification per final, never merged), in the
+// v0.1.20 text of its control-chat turn_completed notification
+// (workflowNotificationFallbackBody). Its delivery key names the final, so
+// it is posted once.
+func (e *Engine) finalMention(n pendingNotify, cs *convState) ([]store.OutMsg, error) {
 	e.mu.Lock()
-	ctl := e.controlID
-	var chats []*chat
-	byID := map[int64]*chat{}
-	for _, cs := range convs {
-		if c := byID[cs.id]; c != nil {
-			c.n++
-			continue
-		}
-		c := &chat{name: firstNonEmpty(cs.title, cs.label), url: cs.url, n: 1}
-		byID[cs.id] = c
-		chats = append(chats, c)
-	}
+	ctl, name, url := e.controlID, compactChatTitle(firstNonEmpty(cs.title, cs.label)), cs.url
 	e.mu.Unlock()
-	if ctl == 0 || len(chats) == 0 {
+	if ctl == 0 {
 		return nil, nil
 	}
-	var text string
-	if len(chats) == 1 && chats[0].n == 1 {
-		text = "Codex finished in " + chats[0].name
-		if chats[0].url != "" {
-			text += ". Open: " + chats[0].url
-		}
+	text := "**✅ Codex finished**\n\n**Chat:** " + mdInline(name)
+	if req := n.Request; req != "" && !redundantRequest(req, name) {
+		text += "\n**Request:** " + mdInline(req)
+	}
+	text += "\n\n**Next:** The answer is ready in the work chat."
+	if url != "" {
+		text += "\n\n**Open:** [Open answer](" + url + ")"
+	}
+	key := "notify:"
+	if t, ok := strings.CutPrefix(n.id(), "turn:"); ok {
+		key += t
 	} else {
-		names := make([]string, 0, len(chats))
-		for _, c := range chats {
-			name := c.name
-			if c.url != "" {
-				name = "[" + mdLinkText(c.name) + "](" + c.url + ")"
-			}
-			if c.n > 1 {
-				name += fmt.Sprintf(" (%d answers)", c.n)
-			}
-			names = append(names, name)
-		}
-		text = "Codex finished in " + joinAnd(names)
+		key += fmt.Sprintf("m%012x", pathHash(n.id())&0xffffffffffff)
 	}
-	short := make([]string, 0, len(ids))
-	for _, id := range ids {
-		if t, ok := strings.CutPrefix(id, "turn:"); ok {
-			short = append(short, t) // "notify:<turn>,<turn>" as before
-		} else {
-			short = append(short, fmt.Sprintf("m%012x", pathHash(id)&0xffffffffffff))
-		}
-	}
-	return e.render(context.Background(), channel.RichDoc{Label: labelHelper, Markdown: text + ".", Mention: true},
-		store.OutNotice, "notify:"+strings.Join(short, ","))
+	return e.render(context.Background(), channel.RichDoc{Label: labelHelper, Markdown: text, Mention: true}, store.OutNotice, key)
 }
+
+// v0.1.20 limits of a notification's chat title and request summary.
+const (
+	notifyTitleRunes   = 96
+	notifyRequestRunes = 120
+)
+
+// requestSummary is a prompt as a notification names it (v0.1.20
+// workflowRequestSummary): one line, at most 120 runes.
+func requestSummary(prompt string) string {
+	return limitRunes(strings.Join(strings.Fields(prompt), " "), notifyRequestRunes)
+}
+
+// compactChatTitle is v0.1.20's workflowNotificationFallbackCompactChatTitle
+// (a repeated leading "A - A - …" collapses to "A - …"), limited to 96 runes.
+func compactChatTitle(title string) string {
+	title = strings.Join(strings.Fields(title), " ")
+	for {
+		parts := strings.Split(title, " - ")
+		if len(parts) < 3 || strings.TrimSpace(parts[0]) == "" || strings.TrimSpace(parts[0]) != strings.TrimSpace(parts[1]) {
+			break
+		}
+		title = strings.Join(append([]string{strings.TrimSpace(parts[0])}, parts[2:]...), " - ")
+	}
+	return limitRunes(title, notifyTitleRunes)
+}
+
+// redundantRequest reports a request summary the chat title already says
+// (v0.1.20 workflowNotificationFallbackTextRedundant).
+func redundantRequest(req, title string) bool {
+	key := func(s string) string { return strings.ToLower(strings.Join(strings.Fields(s), " ")) }
+	r, t := key(req), key(title)
+	switch {
+	case r == "":
+		return true
+	case t == "":
+		return false
+	}
+	return r == t || len([]rune(r)) >= 8 && strings.Contains(t, r)
+}
+
+// limitRunes is v0.1.20's workflowLimitRunes: at most n runes, the last
+// one an ellipsis when cut.
+func limitRunes(s string, n int) string {
+	s = strings.TrimSpace(s)
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return strings.TrimSpace(string(r[:n-1])) + "…"
+}
+
+// mdInline escapes the Markdown that user text could carry into a helper
+// notice line.
+var mdInline = strings.NewReplacer(`\`, `\\`, "`", "\\`", "*", `\*`, "_", `\_`, "[", `\[`, "]", `\]`, "<", `\<`, ">", `\>`, "~", `\~`, "|", `\|`).Replace
 
 // localMention is the control-chat @mention for a live local session found
 // on disk, when no Workflow card announced it (v0.1.20 local_session_started).
@@ -816,19 +846,6 @@ func (e *Engine) localMention(cs *convState) ([]store.OutMsg, error) {
 	}
 	return e.render(context.Background(), channel.RichDoc{Label: labelHelper, Markdown: text, Mention: true},
 		store.OutNotice, fmt.Sprintf("notify:local:%d", cs.id))
-}
-
-// joinAnd joins "A", "B", "C" as "A, B and C".
-func joinAnd(s []string) string {
-	if len(s) <= 1 {
-		return strings.Join(s, "")
-	}
-	return strings.Join(s[:len(s)-1], ", ") + " and " + s[len(s)-1]
-}
-
-// mdLinkText escapes the brackets of a Markdown link text.
-func mdLinkText(s string) string {
-	return strings.NewReplacer("[", "\\[", "]", "\\]").Replace(s)
 }
 
 // internalRE matches ids and paths that must not reach a chat: UUIDs,

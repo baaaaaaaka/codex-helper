@@ -31,6 +31,7 @@ type pendingNotify struct {
 	Key       string `json:"key,omitempty"`
 	Kind      string `json:"kind,omitempty"`
 	Text      string `json:"text,omitempty"`
+	Request   string `json:"request,omitempty"`   // the prompt, summarised (requestSummary)
 	Attempted bool   `json:"attempted,omitempty"` // the card post was started
 }
 
@@ -121,24 +122,17 @@ func (e *Engine) updateNotify(id string, fn func(*pendingNotify) bool) error {
 }
 
 // notifyLoop sends due notifications. It is woken by a turn's end and by
-// sender progress; the maintenance cadence is a safety net, and a timer
-// ends a mention coalescing window.
+// sender progress; the maintenance cadence is a safety net.
 func (e *Engine) notifyLoop(ctx context.Context) {
 	safety := time.NewTicker(e.t.Maintenance)
 	defer safety.Stop()
-	window := time.NewTimer(time.Hour)
-	window.Stop()
-	defer window.Stop()
 	for {
-		if next := e.pumpNotify(ctx); !next.IsZero() {
-			window.Reset(max(next.Sub(e.now()), e.t.Tick))
-		}
+		e.pumpNotify(ctx)
 		select {
 		case <-ctx.Done():
 			return
 		case <-e.notifyWake:
 		case <-safety.C:
-		case <-window.C:
 		}
 		// Coalesce bursts of sender wakes.
 		select {
@@ -149,16 +143,11 @@ func (e *Engine) notifyLoop(ctx context.Context) {
 	}
 }
 
-// mentionSetMax bounds the finals one coalesced @mention names.
-const mentionSetMax = 20
-
-// pumpNotify sends the due notifications: a Workflow card per final, or
-// control-chat @mentions coalesced per window (benchmark F2): the first
-// mention goes at once; finals delivered within MentionWindow after it
-// (three windows while the account's writes are paced) wait and are named
-// together in one mention ("Codex finished in A, B and C"), each exactly
-// once. It returns when the window ends ("" when nothing waits for it).
-func (e *Engine) pumpNotify(ctx context.Context) time.Time {
+// pumpNotify sends the due notifications, one per final (owner ruling
+// 2026-11-05, Q3): the Workflow card when one is configured, else a
+// control-chat @mention of its own. Finals are never merged into one
+// notification.
+func (e *Engine) pumpNotify(ctx context.Context) {
 	var cards, mentions []pendingNotify
 	pending := 0
 	// Outside the transaction: Available reads the Workflow setting files
@@ -213,37 +202,21 @@ func (e *Engine) pumpNotify(ctx context.Context) time.Time {
 	})
 	if err != nil {
 		e.logf("owner notifications: %v", err)
-		return time.Time{}
+		return
 	}
 	e.notifyN.Store(int64(pending))
 	for _, n := range cards {
 		if ctx.Err() != nil {
-			return time.Time{}
+			return
 		}
 		if !e.sendCard(ctx, n) {
 			mentions = append(mentions, n) // failed: the owner is mentioned instead
 		}
 	}
 	if len(mentions) == 0 || ctx.Err() != nil {
-		return time.Time{}
+		return
 	}
-	window := e.t.MentionWindow
-	if e.writeTokens.limited() {
-		window *= 3
-	}
-	if next := e.lastMention.Add(window); !e.lastMention.IsZero() && e.now().Before(next) {
-		return next
-	}
-	if len(mentions) > mentionSetMax {
-		mentions = mentions[:mentionSetMax]
-	}
-	if e.sendMentions(mentions) {
-		e.lastMention = e.now()
-	}
-	if pending > len(mentions)+len(cards) {
-		return e.lastMention.Add(window) // more are waiting
-	}
-	return time.Time{}
+	e.sendMentions(mentions)
 }
 
 // sendCard posts the Workflow card of n once (never retried: a failed post
@@ -291,66 +264,61 @@ func (e *Engine) sendCard(ctx context.Context, n pendingNotify) bool {
 	return false
 }
 
-// sendMentions enqueues one control-chat @mention naming the finals of set
-// and removes them from the pending list in the same transaction.
-func (e *Engine) sendMentions(set []pendingNotify) bool {
+// sendMentions enqueues one control-chat @mention per entry of set and
+// removes them from the pending list in the same transaction.
+func (e *Engine) sendMentions(set []pendingNotify) {
 	var (
-		ids          []string
-		convs, local []*convState
+		ids  []string
+		msgs []store.OutMsg
 	)
-	e.mu.Lock()
 	for _, n := range set {
+		e.mu.Lock()
+		cs := e.convs[n.Conv]
+		e.mu.Unlock()
 		ids = append(ids, n.id())
-		if cs := e.convs[n.Conv]; cs != nil {
-			if n.Kind == notifyLocal {
-				local = append(local, cs)
-			} else {
-				convs = append(convs, cs)
-			}
+		if cs == nil {
+			continue
 		}
-	}
-	e.mu.Unlock()
-	var msgs []store.OutMsg
-	var err error
-	if len(convs) > 0 {
-		msgs, err = e.mentionNotice(ids, convs)
-	}
-	for _, cs := range local {
+		var (
+			m   []store.OutMsg
+			err error
+		)
+		if n.Kind == notifyLocal {
+			m, err = e.localMention(cs)
+		} else {
+			m, err = e.finalMention(n, cs)
+		}
 		if err != nil {
-			break
+			e.logf("owner notification: %v", err)
+			return
 		}
-		var m []store.OutMsg
-		m, err = e.localMention(cs)
 		msgs = append(msgs, m...)
 	}
-	if err == nil {
-		err = e.update(func(tx *store.Tx) error {
-			if len(msgs) > 0 {
-				if _, err := tx.Enqueue(e.controlID, msgs); err != nil {
-					return err
-				}
-			}
-			list, err := readNotify(tx)
-			if err != nil {
+	err := e.update(func(tx *store.Tx) error {
+		if len(msgs) > 0 {
+			if _, err := tx.Enqueue(e.controlID, msgs); err != nil {
 				return err
 			}
-			done := map[string]bool{}
-			for _, id := range ids {
-				done[id] = true
+		}
+		list, err := readNotify(tx)
+		if err != nil {
+			return err
+		}
+		done := map[string]bool{}
+		for _, id := range ids {
+			done[id] = true
+		}
+		out := list[:0]
+		for _, p := range list {
+			if !done[p.id()] {
+				out = append(out, p)
 			}
-			out := list[:0]
-			for _, p := range list {
-				if !done[p.id()] {
-					out = append(out, p)
-				}
-			}
-			return writeNotify(tx, out)
-		})
-	}
+		}
+		return writeNotify(tx, out)
+	})
 	if err != nil {
 		e.logf("owner notification: %v", err)
-		return false
+		return
 	}
 	e.wakeSender()
-	return len(msgs) > 0
 }

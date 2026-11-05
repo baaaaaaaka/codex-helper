@@ -33,5 +33,5 @@ func TestTeamsRunTurnPostsV0120StatusAndAnswer(t *testing.T) {
 		!strings.HasSuffix(got[2], "\n🔧 Helper: ✅ Codex finished responding.") || strings.Count(got[2], "finished responding") != 1 {
 		t.Fatalf("Codex posts: %q", got)
 	}
-	r.wait("owner notified in the control chat", func() bool { return len(r.own(r.control(), "Codex finished in")) == 1 })
+	r.wait("owner notified in the control chat", func() bool { return len(r.own(r.control(), "Codex finished")) == 1 })
 }

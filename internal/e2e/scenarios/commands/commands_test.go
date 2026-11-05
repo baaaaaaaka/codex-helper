@@ -74,7 +74,7 @@ func TestNewAndFork(t *testing.T) {
 	s.Check("the original session answers", ok && first.ThreadID != "", "answered on a thread", fmt.Sprintf("ok=%v thread=%q", ok, first.ThreadID))
 	// The owner's "Codex finished" notice comes before the fork's
 	// announcement in the control chat (a fixed transcript).
-	s.WaitSUTMessage(control.ID, "Codex finished in", steps.CommandTimeout)
+	s.WaitSUTMessage(control.ID, "Codex finished", steps.CommandTimeout)
 
 	before := map[string]bool{}
 	for _, c := range s.Graph.Chats() {

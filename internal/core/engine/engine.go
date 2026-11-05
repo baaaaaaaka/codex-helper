@@ -72,9 +72,6 @@ type Timing struct {
 	PaceIncrease time.Duration
 	// Registry is the machine card heartbeat (registry.go).
 	Registry time.Duration
-	// MentionWindow coalesces the owner @mentions of finals delivered
-	// within it after the last one into one message (notify.go).
-	MentionWindow time.Duration
 	// UpdateCheck is the automatic release check cadence; UpdateDrain
 	// and CodexDrain bound the wait for running turns before a helper
 	// update and a Codex CLI upgrade (upgrade.go).
@@ -99,7 +96,6 @@ func ProductionTiming() Timing {
 		ThrottleFloor: 10 * time.Second,
 		PaceIncrease:  30 * time.Second,
 		Registry:      5 * time.Minute,
-		MentionWindow: 10 * time.Second,
 		UpdateCheck:   30 * time.Minute,
 		UpdateDrain:   10 * time.Minute,
 		CodexDrain:    30 * time.Minute,
@@ -128,7 +124,6 @@ func FastTiming(base time.Duration) Timing {
 	t.ThrottleFloor = 10 * base
 	t.PaceIncrease = 30 * base
 	t.Registry = 20 * base
-	t.MentionWindow = 10 * base
 	return t
 }
 
@@ -249,7 +244,6 @@ type Engine struct {
 	notifyWake   chan struct{}
 	scanWake     chan struct{} // a read throttle: the scan waits for the gate (receive.go)
 	notifyN      atomic.Int64  // pending owner notifications (notify.go)
-	lastMention  time.Time     // last owner @mention sent (notifyLoop only)
 	// scanFirst: after an account read throttle the activity scan gets
 	// the first read when the gate opens (receive.go).
 	scanFirst atomic.Bool

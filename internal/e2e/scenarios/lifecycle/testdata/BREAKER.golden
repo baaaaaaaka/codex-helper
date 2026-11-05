@@ -25,12 +25,12 @@
 -- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Paused auto-start in s001 (possible self-echo loop). Send <code>helper unpause</code> in that chat to resume.</p>
--- "Codex finished" notices, by session (batching is timing: the s002 burst finishes concurrently with the s001 pause notice in the control chat)
-   finished: s001 · breaker (@owner)
-   finished: s001 · breaker (@owner)
-   finished: s002 · burst (@owner)
-   finished: s002 · burst (@owner)
-   finished: s002 · burst (@owner)
+-- "Codex finished" notices, one line each, sorted (posting order is timing: the s002 burst finishes concurrently with the s001 pause notice in the control chat)
+   finished: s001 · breaker | request: Long task E2E-BREAKER-running-1 (@owner)
+   finished: s001 · breaker | request: Prompt after unpause E2E-BREAKER-afterunpause-7 (@owner)
+   finished: s002 · burst | request: Quick question 0 E2E-BREAKER-burst0-2 (@owner)
+   finished: s002 · burst | request: Quick question 1 E2E-BREAKER-burst1-3 (@owner)
+   finished: s002 · burst | request: Quick question 2 E2E-BREAKER-burst2-4 (@owner)
 
 == chat <chat:2> "s001 · breaker"
    type: meeting; members: owner

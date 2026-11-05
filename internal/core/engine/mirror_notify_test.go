@@ -19,14 +19,14 @@ func appendCompaction(t *testing.T, path string) {
 		ts+`"type":"event_msg","payload":{"type":"context_compacted"}}`+"\n"))
 }
 
-// mentionsCovered counts the finals the control-chat @mentions name.
+// mentionsCovered counts the control-chat @mentions of finals.
 func (r *rig) mentionsCovered(ctl string) int {
 	n := 0
 	for _, m := range r.own(ctl, "Codex finished") {
 		if !m.MentionsOwner {
 			r.t.Fatalf("notification without mention: %q", m.Text)
 		}
-		n += 1 + strings.Count(m.Text, " and ")
+		n++ // one final each (owner ruling 2026-11-05, Q3)
 	}
 	return n
 }

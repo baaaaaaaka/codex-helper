@@ -366,19 +366,9 @@ func TestPromptIsAckedAnsweredOnceAndControlMentioned(t *testing.T) {
 		t.Fatalf("second turn on %q", r.ag.runs[1].ThreadID)
 	}
 	// Exactly one owner notification per final: a control-chat mention
-	// (two finals delivered close together may share one, F2).
+	// each (owner ruling 2026-11-05, Q3).
 	ctl := r.chatOf("control")
-	covered := func() int {
-		n := 0
-		for _, m := range r.own(ctl, "Codex finished") {
-			if strings.Contains(m.Text, "(2 answers)") {
-				n += 2
-			} else {
-				n++
-			}
-		}
-		return n
-	}
+	covered := func() int { return len(r.own(ctl, "Codex finished")) }
 	r.wait("mentions", func() bool { return covered() >= 2 })
 	time.Sleep(500 * time.Millisecond)
 	if n := covered(); n != 2 {
@@ -695,12 +685,12 @@ func TestAbsentResentFinalIsDroppedWithOneNotice(t *testing.T) {
 		v, _, err := r.st.Meta(metaNotify)
 		return err == nil && v == ""
 	})
-	if n := len(r.own(r.control(), "Codex finished in")); n != 0 {
+	if n := len(r.own(r.control(), "Codex finished")); n != 0 {
 		t.Fatalf("%d owner notifications for an answer that was never confirmed delivered", n)
 	}
 	r.ch.PostUser(work, "later")
 	r.wait("next answer", func() bool { return len(r.own(work, "ANSWER to later")) == 1 })
-	r.wait("owner notified of the next answer", func() bool { return len(r.own(r.control(), "Codex finished in")) == 1 })
+	r.wait("owner notified of the next answer", func() bool { return len(r.own(r.control(), "Codex finished")) == 1 })
 	if n := len(attempts()); n != 2 {
 		t.Fatalf("%d send attempts, want 2 (one resend only)", n)
 	}
@@ -2104,49 +2094,86 @@ func TestFailedTurnFinishIsRetried(t *testing.T) {
 	r.wait("next answer", func() bool { return len(r.own(work, "ANSWER to and the next")) == 1 })
 }
 
-// Benchmark F2: without a Workflow card, finals delivered within the
-// mention window after an @mention are named together in one control-chat
-// @mention; each final is covered exactly once.
-func TestOwnerMentionsCoalescedWithinWindow(t *testing.T) {
-	r := newRig(t, func(c *Config) { c.Timing.MentionWindow = 4 * time.Second })
-	a := r.newWork(t.TempDir())
-	b := r.newWork(t.TempDir())
-	c := r.newWork(t.TempDir())
-	ctl := r.chatOf("control")
-	r.ch.PostUser(a, "first final")
-	r.wait("first mention", func() bool { return len(r.own(ctl, "Codex finished")) == 1 })
-	first := time.Now()
-	r.ch.PostUser(b, "second final")
-	r.ch.PostUser(c, "third final")
-	r.wait("answers", func() bool {
-		return len(r.own(b, "ANSWER to second final")) == 1 && len(r.own(c, "ANSWER to third final")) == 1
-	})
-	if time.Since(first) > 3*time.Second {
-		t.Skip("the answers took longer than the window; nothing to coalesce")
-	}
-	r.wait("second mention", func() bool { return len(r.own(ctl, "Codex finished")) == 2 })
-	time.Sleep(4500 * time.Millisecond) // a further window: nothing else is sent
-	ms := r.own(ctl, "Codex finished")
-	if len(ms) != 2 {
-		t.Fatalf("%d mentions for 3 finals, want 2 (the second covering two)", len(ms))
-	}
-	if strings.Contains(ms[0].Text, " and ") {
-		t.Fatalf("first mention names more than one final: %q", ms[0].Text)
-	}
-	if !strings.Contains(ms[1].Text, " and ") || !ms[1].MentionsOwner {
-		t.Fatalf("second mention does not name both finals: %q", ms[1].Text)
-	}
-	var labels []string
+// Owner ruling 2026-11-05 (Q3): without a Workflow card every final gets
+// a control-chat @mention of its own, also when finals end together; none
+// is merged with another (benchmark F2's batching is gone). The text is
+// v0.1.20's control-chat turn_completed notification.
+func TestOwnerMentionedOncePerFinal(t *testing.T) {
+	r := newRig(t)
+	ctl := r.control()
+	chats := []string{r.newWork(t.TempDir()), r.newWork(t.TempDir()), r.newWork(t.TempDir())}
+	names := map[string]string{}
 	convs, _ := r.st.Conversations()
 	for _, cv := range convs {
-		if cv.ExtChatID == b || cv.ExtChatID == c {
-			labels = append(labels, firstNonEmpty(cv.Title, cv.Label))
+		names[cv.ExtChatID] = firstNonEmpty(cv.Title, cv.Label)
+	}
+	for i, c := range chats {
+		r.ch.PostUser(c, fmt.Sprintf("final number %d", i+1))
+	}
+	r.wait("answers", func() bool {
+		for i, c := range chats {
+			if len(r.own(c, fmt.Sprintf("ANSWER to final number %d", i+1))) != 1 {
+				return false
+			}
+		}
+		return true
+	})
+	r.wait("three mentions", func() bool { return len(r.own(ctl, "Codex finished")) >= 3 })
+	time.Sleep(time.Second) // nothing else is sent
+	ms := r.own(ctl, "Codex finished")
+	if len(ms) != 3 {
+		t.Fatalf("%d mentions for 3 finals, want 3", len(ms))
+	}
+	seen := map[string]bool{}
+	for _, m := range ms {
+		if !m.MentionsOwner {
+			t.Fatalf("notification without mention: %q", m.Text)
+		}
+		named := 0
+		for i, c := range chats {
+			want := fmt.Sprintf("**✅ Codex finished**\n\n**Chat:** %s\n**Request:** final number %d\n\n**Next:** The answer is ready in the work chat.", names[c], i+1)
+			if strings.Contains(m.Text, want) {
+				named++
+				seen[c] = true
+			}
+		}
+		if named != 1 {
+			t.Fatalf("mention names %d finals, want 1: %q", named, m.Text)
 		}
 	}
-	for _, l := range labels {
-		if strings.Count(ms[1].Text, l) != 1 {
-			t.Fatalf("coalesced mention names %q %d times: %q", l, strings.Count(ms[1].Text, l), ms[1].Text)
+	if len(seen) != 3 {
+		t.Fatalf("finals mentioned: %d of 3", len(seen))
+	}
+}
+
+// The notification's request line is v0.1.20's: one line of at most 120
+// runes, left out when the chat title already says it.
+func TestFinalMentionRequestLine(t *testing.T) {
+	long := strings.Repeat("word ", 40)
+	if got := requestSummary("  two\n lines  "); got != "two lines" {
+		t.Fatalf("summary %q", got)
+	}
+	if got := requestSummary(long); len([]rune(got)) != 120 || !strings.HasSuffix(got, "…") {
+		t.Fatalf("summary of %d runes: %q", len([]rune(got)), got)
+	}
+	for _, tc := range []struct {
+		req, title string
+		redundant  bool
+	}{
+		{"fix the build", "s001 · fix the build please", true},
+		{"fix it", "s001 · fix it now", false}, // under 8 runes: kept
+		{"fix the build", "s001 · other", false},
+		{"", "s001", true},
+	} {
+		if got := redundantRequest(tc.req, tc.title); got != tc.redundant {
+			t.Errorf("redundantRequest(%q, %q) = %v", tc.req, tc.title, got)
 		}
+	}
+	if got := compactChatTitle("host - host - topic"); got != "host - topic" {
+		t.Fatalf("compact title %q", got)
+	}
+	if got := mdInline("a *b* [c](d) <e>"); got != `a \*b\* \[c\](d) \<e\>` {
+		t.Fatalf("escaped %q", got)
 	}
 }
 

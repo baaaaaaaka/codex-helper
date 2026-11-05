@@ -22,6 +22,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"html"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -55,11 +56,12 @@ type GoldenOptions struct {
 	// known race in cxp: when the two are adjacent in the reverse order,
 	// the golden shows them in the declared order and says so.
 	Races []Race
-	// FinishedNotices renders the owner's "Codex finished in …"
-	// notifications of the control chat as the sorted list of the
-	// sessions they name (with their @mention), not as messages, because
-	// finals that complete together are batched by timing. Value: the
-	// reason. A session notified twice still shows twice.
+	// FinishedNotices renders the owner's "✅ Codex finished"
+	// notifications of the control chat (one per final) as a sorted list,
+	// one line per notification with the session and request it names and
+	// its @mention, not as messages, because finals that complete together
+	// are posted in timing order. Value: the reason. A session notified
+	// twice still shows twice.
 	FinishedNotices string
 }
 
@@ -173,7 +175,7 @@ func (s *Scenario) GoldenTranscript() string {
 			s.renderMessage(&b, n, m, who, c.Topic == RegistryChatTopic)
 		}
 		if len(notices) > 0 {
-			fmt.Fprintf(&b, "-- \"Codex finished\" notices, by session (batching is timing: %s)\n", s.Opts.Golden.FinishedNotices)
+			fmt.Fprintf(&b, "-- \"Codex finished\" notices, one line each, sorted (posting order is timing: %s)\n", s.Opts.Golden.FinishedNotices)
 			for _, x := range notices {
 				fmt.Fprintf(&b, "   finished: %s\n", n.norm(x))
 			}
@@ -516,19 +518,21 @@ func writeWireRecords(b *strings.Builder, n *normalizer, content string) {
 }
 
 var (
-	finishedOneRE  = regexp.MustCompile(`^Codex finished in (.+?)\. Open:`)
-	finishedManyRE = regexp.MustCompile(`<a href="[^"]*">([^<]+)</a> \(https://`)
+	finishedChatRE    = regexp.MustCompile(`<strong>Chat:</strong> ([^<]*)`)
+	finishedRequestRE = regexp.MustCompile(`<strong>Request:</strong> ([^<]*)`)
 )
 
-// splitFinishedNotices takes the helper's "Codex finished in …" notices
-// out of msgs and returns, sorted, one line per session they name with the
-// message's mentions.
+// finishedHeading marks the owner's notification of a final.
+const finishedHeading = "<strong>✅ Codex finished</strong>"
+
+// splitFinishedNotices takes the helper's "✅ Codex finished" notices out
+// of msgs and returns, sorted, one line per notice: the session and the
+// request it names, and its mentions.
 func splitFinishedNotices(msgs []fakegraph.Message, who func(string) string) ([]fakegraph.Message, []string) {
 	var rest []fakegraph.Message
 	var out []string
 	for _, m := range msgs {
-		text := strings.TrimSpace(m.PlainText())
-		if i := strings.Index(text, "Codex finished in "); m.Origin != fakegraph.OriginSUT || i < 0 || i > 40 {
+		if m.Origin != fakegraph.OriginSUT || !strings.Contains(m.Content, finishedHeading) {
 			rest = append(rest, m)
 			continue
 		}
@@ -550,20 +554,14 @@ func splitFinishedNotices(msgs []fakegraph.Message, who func(string) string) ([]
 		if len(at) > 0 {
 			mentions = " (" + strings.Join(at, " ") + ")"
 		}
-		var names []string
-		if sub := finishedOneRE.FindStringSubmatch(text[strings.Index(text, "Codex finished in "):]); sub != nil {
-			names = append(names, sub[1])
-		} else {
-			for _, a := range finishedManyRE.FindAllStringSubmatch(m.Content, -1) {
-				names = append(names, a[1])
+		line := "unparsed: " + strings.TrimSpace(m.PlainText())
+		if sub := finishedChatRE.FindAllStringSubmatch(m.Content, -1); len(sub) == 1 {
+			line = html.UnescapeString(sub[0][1])
+			if req := finishedRequestRE.FindStringSubmatch(m.Content); req != nil {
+				line += " | request: " + html.UnescapeString(req[1])
 			}
 		}
-		if len(names) == 0 {
-			names = append(names, "unparsed: "+text)
-		}
-		for _, name := range names {
-			out = append(out, name+mentions)
-		}
+		out = append(out, line+mentions)
 	}
 	sort.Strings(out)
 	return rest, out

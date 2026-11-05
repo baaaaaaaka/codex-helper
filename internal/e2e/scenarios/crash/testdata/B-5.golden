@@ -30,10 +30,10 @@
    | <p>Open this Teams link and send your task there:<br>
    | <a href="https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
    | <p>If Teams does not show it right away, search for: s003</p>
--- "Codex finished" notices, by session (batching is timing: the chats finish together after the restart)
-   finished: s001 · b5-x (@owner)
-   finished: s002 · b5-y (@owner)
-   finished: s003 · b5-z (@owner)
+-- "Codex finished" notices, one line each, sorted (posting order is timing: the chats finish together after the restart)
+   finished: s001 · b5-x | request: Next request E2E-B5-nextx-4 (@owner)
+   finished: s002 · b5-y | request: Next request E2E-B5-nexty-5 (@owner)
+   finished: s003 · b5-z | request: Next request E2E-B5-nextz-6 (@owner)
 
 == chat <chat:2> "s001 · b5-x"
    type: meeting; members: owner

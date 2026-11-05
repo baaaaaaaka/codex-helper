@@ -1,4 +1,4 @@
-# NOTIFY-BURST: three finals at once in three work chats: each named in a control-chat owner @mention exactly once, none in work chats
+# NOTIFY-BURST: three finals at once in three work chats: three control-chat owner @mentions, one per final, none in work chats
 # cxp black-box transcript; volatile values are numbered placeholders
 
 == chat <chat:1> "Codex Control - e2ehost"
@@ -30,10 +30,10 @@
    | <p>Open this Teams link and send your task there:<br>
    | <a href="https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
    | <p>If Teams does not show it right away, search for: s003</p>
--- "Codex finished" notices, by session (batching is timing: three finals complete at once; the scenario checks each is named exactly once)
-   finished: s001 · burst-a (@owner)
-   finished: s002 · burst-b (@owner)
-   finished: s003 · burst-c (@owner)
+-- "Codex finished" notices, one line each, sorted (posting order is timing: three finals complete at once)
+   finished: s001 · burst-a | request: Burst question E2E-NOTIFYBURST-burst1-1 (@owner)
+   finished: s002 · burst-b | request: Burst question E2E-NOTIFYBURST-burst2-2 (@owner)
+   finished: s003 · burst-c | request: Burst question E2E-NOTIFYBURST-burst3-3 (@owner)
 
 == chat <chat:2> "s001 · burst-a"
    type: meeting; members: owner
