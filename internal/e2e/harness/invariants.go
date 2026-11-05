@@ -16,6 +16,7 @@ package harness
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -608,13 +609,41 @@ func (s *Scenario) checkCatchUp(res *invResults, instances []InstanceRecord) {
 			}
 		}
 	}
+	// A chat that only caught up (no record written while a helper ran,
+	// no prompt sent from Teams) must not be named in any owner
+	// notification: no @mention message links to it, no card points at it.
 	for chat := range catchUpChats {
 		if liveChats[chat] {
 			continue
 		}
+		teams := false
+		for _, m := range s.Graph.Messages(chat) {
+			if m.Origin == fakegraph.OriginUser {
+				teams = true
+			}
+		}
+		if teams {
+			continue
+		}
+		refs := []string{chat, url.QueryEscape(chat)}
+		names := func(text string) bool {
+			for _, r := range refs {
+				if strings.Contains(text, r) {
+					return true
+				}
+			}
+			return false
+		}
 		for _, c := range s.Graph.WorkflowCards() {
-			if strings.Contains(c.Raw, chat) {
+			if names(c.Raw) {
 				res.add(InvCatchUpSilent, "a Workflow card points at chat %s, which only caught up", s.topic(chat))
+			}
+		}
+		for _, c := range s.Graph.Chats() {
+			for _, m := range s.Graph.Messages(c.ID) {
+				if m.Origin == fakegraph.OriginSUT && (len(m.Mentions) > 0 || strings.Contains(m.Content, "<at ")) && names(m.Content) {
+					res.add(InvCatchUpSilent, "an @mention in chat %s names chat %s, which only caught up: %s", s.topic(c.ID), s.topic(chat), clipBody(m.PlainText()))
+				}
 			}
 		}
 	}

@@ -51,12 +51,22 @@ type GoldenOptions struct {
 	Masks []Mask
 	// OmitCodex leaves the Codex section out (reason).
 	OmitCodex string
+	// Races declares pairs of helper messages whose order in a chat is a
+	// known race in cxp: when the two are adjacent in the reverse order,
+	// the golden shows them in the declared order and says so.
+	Races []Race
 	// FinishedNotices renders the owner's "Codex finished in …"
 	// notifications of the control chat as the sorted list of the
 	// sessions they name (with their @mention), not as messages, because
 	// finals that complete together are batched by timing. Value: the
 	// reason. A session notified twice still shows twice.
 	FinishedNotices string
+}
+
+// Race is a declared ordering race between two helper messages of one
+// chat: First and Second are substrings of their plain text.
+type Race struct {
+	First, Second, Reason string
 }
 
 // Mask replaces every match of Pattern in the transcript with Replace.
@@ -70,6 +80,11 @@ func (o GoldenOptions) validate() error {
 	for k, r := range o.UnorderedChats {
 		if strings.TrimSpace(r) == "" {
 			return fmt.Errorf("golden: UnorderedChats[%q] needs a reason", k)
+		}
+	}
+	for _, r := range o.Races {
+		if r.First == "" || r.Second == "" || strings.TrimSpace(r.Reason) == "" {
+			return fmt.Errorf("golden: a race needs both messages and a reason")
 		}
 	}
 	if o.FinishedNotices != "" && strings.TrimSpace(o.FinishedNotices) == "" {
@@ -134,6 +149,11 @@ func (s *Scenario) GoldenTranscript() string {
 		var notices []string
 		if s.Opts.Golden.FinishedNotices != "" && strings.HasPrefix(c.Topic, ControlChatTopicMarker) {
 			msgs, notices = splitFinishedNotices(msgs, who)
+		}
+		var raced []string
+		msgs, raced = s.Opts.Golden.applyRaces(msgs)
+		for _, r := range raced {
+			fmt.Fprintf(&b, "   (declared race, shown in the declared order: %s)\n", r)
 		}
 		// Message placeholders are numbered per chat, so a difference in
 		// one chat does not renumber the others.
@@ -547,4 +567,33 @@ func splitFinishedNotices(msgs []fakegraph.Message, who func(string) string) ([]
 	}
 	sort.Strings(out)
 	return rest, out
+}
+
+// applyRaces puts the declared racing pairs of msgs into their declared
+// order and returns the reasons of the races present in the chat (in
+// either order, so the golden does not depend on who won).
+func (o GoldenOptions) applyRaces(msgs []fakegraph.Message) ([]fakegraph.Message, []string) {
+	var reasons []string
+	for _, r := range o.Races {
+		found := false
+		for i := 0; i+1 < len(msgs); i++ {
+			a, b := msgs[i], msgs[i+1]
+			if a.Origin != fakegraph.OriginSUT || b.Origin != fakegraph.OriginSUT {
+				continue
+			}
+			at, bt := a.PlainText(), b.PlainText()
+			switch {
+			case strings.Contains(at, r.First) && strings.Contains(bt, r.Second):
+				found = true
+			case strings.Contains(at, r.Second) && strings.Contains(bt, r.First):
+				msgs = append([]fakegraph.Message(nil), msgs...)
+				msgs[i], msgs[i+1] = b, a
+				found = true
+			}
+		}
+		if found {
+			reasons = append(reasons, r.Reason)
+		}
+	}
+	return msgs, reasons
 }

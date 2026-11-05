@@ -2,7 +2,6 @@ package turns
 
 import (
 	"fmt"
-	"strings"
 	"testing"
 	"time"
 
@@ -19,6 +18,8 @@ func TestR20_R33_CancelRunningTurn(t *testing.T) {
 		Guarantees: []string{"R-20", "R-33", "F-TRN-3"},
 		Title:      "cancel of a running turn is visible and final; next message works",
 		Budget:     90 * time.Second,
+		Golden: harness.GoldenOptions{Races: []harness.Race{{First: "Cancelling the running request", Second: "Request cancelled.",
+			Reason: "cxp enqueues the cancel command's reply after it interrupts the turn, so a fast interrupt's \"Request cancelled.\" can be posted first"}}},
 	})
 	defer s.Finish()
 	stuck, next := s.Token("stuck"), s.Token("next")
@@ -33,7 +34,6 @@ func TestR20_R33_CancelRunningTurn(t *testing.T) {
 
 	steps.MustPost(s, work.ID, "Long running "+stuck)
 	s.WaitCodexCalls(stuck, 1, steps.AnswerTimeout)
-	cancelSeq := s.Graph.LastSeq()
 	// `helper cancel` without a selector only prints usage in the old core;
 	// `last` selects the running turn when nothing is queued (F-TRN-3).
 	steps.MustPost(s, work.ID, "helper cancel last")
@@ -41,22 +41,13 @@ func TestR20_R33_CancelRunningTurn(t *testing.T) {
 		cs := s.Codex.CallsWithToken(stuck)
 		return len(cs) > 0 && cs[0].Outcome == "cancelled", "outcome=" + steps.Outcome(cs)
 	})
-	var terminal []string
-	s.WaitFor("visible terminal state for the cancelled turn", 30*time.Second, func() (bool, string) {
-		terminal = terminal[:0]
-		for _, m := range s.SUTMessages(work.ID) {
-			if m.RequestSeq <= cancelSeq {
-				continue
-			}
-			low := strings.ToLower(m.PlainText())
-			if strings.Contains(low, "usage:") {
-				continue
-			}
-			if strings.Contains(low, "cancel") || strings.Contains(low, "interrupt") || strings.Contains(low, "stopped") {
-				terminal = append(terminal, m.PlainText())
-			}
-		}
-		return len(terminal) > 0, "no cancel/interrupt notice yet"
+	// The command's reply and the turn's terminal notice; the next prompt
+	// follows both, so the transcript is fixed (their mutual order is a
+	// declared race, see Golden.Races).
+	const ack, cancelled = "Cancelling the running request", "Request cancelled."
+	terminal := s.WaitFor("cancel reply and terminal notice for the cancelled turn", 30*time.Second, func() (bool, string) {
+		a, c := len(s.SUTMessagesContaining(work.ID, ack)), len(s.SUTMessagesContaining(work.ID, cancelled))
+		return a > 0 && c > 0, fmt.Sprintf("%q x%d, %q x%d", ack, a, cancelled, c)
 	})
 	// Even if the fake Codex were released now, the cancelled turn must not
 	// post an answer.
@@ -67,7 +58,7 @@ func TestR20_R33_CancelRunningTurn(t *testing.T) {
 
 	tr := s.Transcript(work.ID, 30)
 	s.Check("R-20 interrupt reaches the running Codex turn", cancelledInCodex, "fake Codex call cancelled", "outcome="+steps.Outcome(s.Codex.CallsWithToken(stuck)))
-	s.Check("R-33 cancelled turn has a visible terminal state", len(terminal) >= 1, ">= 1 cancel/interrupt notice", fmt.Sprintf("%d notices", len(terminal)), tr...)
+	s.Check("R-33 cancelled turn has a visible terminal state", terminal, fmt.Sprintf("%q posted", cancelled), map[bool]string{true: "posted", false: "missing"}[terminal], tr...)
 	late := len(s.SUTMessagesContaining(work.ID, "LATE-ANSWER"))
 	s.Check("R-20 no answer is posted for the cancelled turn", late == 0, "0", fmt.Sprint(late))
 	s.Check("R-20 the next message still works", ok && len(s.Codex.CallsWithToken(next)) == 1, "answered once",
