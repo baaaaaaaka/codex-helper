@@ -83,6 +83,9 @@ type Config struct {
 	Alive     func(pid int) bool
 	StartTime func(pid int) string
 	BootTime  func() time.Time // when this machine booted (zero: unknown)
+	// MountInfo returns /proc/self/mountinfo (nil: the mount is not
+	// checked).
+	MountInfo func() (string, error)
 }
 
 // Standby says why Acquire is waiting.
@@ -123,6 +126,9 @@ func (c *Config) defaults() {
 	}
 	if c.BootTime == nil {
 		c.BootTime = bootTime
+	}
+	if c.MountInfo == nil {
+		c.MountInfo = mountInfo
 	}
 }
 
@@ -215,6 +221,16 @@ func Acquire(ctx context.Context, cfg Config) (*Holder, error) {
 				return nil, ErrDisabled
 			}
 			report(Standby{Reason: ReasonDisabled})
+			obs = observation{}
+			continue
+		}
+		// A mount without close-to-open consistency could not see the
+		// owner's renewals or a successor's claim: stay out of the lease.
+		if err := checkMount(p.dir, cfg.MountInfo); err != nil {
+			if !cfg.Wait {
+				return nil, err
+			}
+			report(Standby{Reason: ReasonError, Err: err})
 			obs = observation{}
 			continue
 		}

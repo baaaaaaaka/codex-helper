@@ -51,3 +51,9 @@ func bootTime() time.Time {
 	}
 	return time.Time{}
 }
+
+// mountInfo is this process's /proc/self/mountinfo.
+func mountInfo() (string, error) {
+	data, err := os.ReadFile("/proc/self/mountinfo")
+	return string(data), err
+}
