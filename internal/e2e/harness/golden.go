@@ -149,7 +149,7 @@ func (s *Scenario) GoldenTranscript() string {
 		}
 		msgs := s.Graph.Messages(c.ID)
 		var notices []string
-		if s.Opts.Golden.FinishedNotices != "" && strings.HasPrefix(c.Topic, ControlChatTopicMarker) {
+		if s.Opts.Golden.FinishedNotices != "" && strings.Contains(c.Topic, ControlChatTopicMarker) {
 			msgs, notices = splitFinishedNotices(msgs, who)
 		}
 		var raced []string

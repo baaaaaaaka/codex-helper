@@ -1,12 +1,16 @@
 # CODEX-UPGRADE: Codex rejects a request as too old: one notice, no automatic retry, `helper retry last` answers; `codex update now` with --codex-path is refused with the reason
 # cxp black-box transcript; volatile values are numbered placeholders
 
-== chat <chat:1> "Codex Control - e2ehost"
+== chat <chat:1> "🏠 Codex Control - e2ehost"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
 -- <msg:2> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>new <root>/work/tooold</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>new <root>/work/tooold</p>
 -- <msg:3> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -23,11 +27,19 @@
    | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
    mention 0: owner "E2E Owner"
 -- <msg:5> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>codex update now</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>codex update now</p>
 -- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>⚠️ Codex CLI update is not available in this helper process: it runs a Codex CLI chosen with <code>--codex-path</code>. Update that Codex installation directly.</p>
 -- <msg:7> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>codex update</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>codex update</p>
 -- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -38,7 +50,7 @@
    | <ul><li><code>codex update now</code> - update Codex CLI to the latest version available from its install source</li>
    | </ul>
 
-== chat <chat:2> "s001 · tooold"
+== chat <chat:2> "💬 e2ehost - Use the newest model E2E-CODEXUPGRADE-tooold-1"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -55,6 +67,10 @@
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
    | Need more details? Send <code>helper status</code>.</p>
 -- <msg:3> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Use the newest model E2E-CODEXUPGRADE-tooold-1</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>Use the newest model E2E-CODEXUPGRADE-tooold-1</p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -66,6 +82,10 @@
    | <p>Automatic Codex upgrade isn&#39;t enabled here, so an administrator needs to update Codex — no action needed from you. Once it&#39;s updated, send <code>helper retry last</code> here.</p>
    | <p>Codex said: The &#39;gpt-9&#39; model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again.</p>
 -- <msg:6> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper retry last</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>helper retry last</p>
 -- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>

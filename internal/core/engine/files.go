@@ -102,6 +102,18 @@ func (e *Engine) fetchInbound(ctx context.Context, inboundID int64) {
 		e.logf("attachments of %d: %v", inboundID, err)
 		return
 	}
+	// F-RND-11: the transcripts go under the voice message once every
+	// attachment of it is done (annotations.go labelVoice).
+	var clips []voiceClip
+	left := 0
+	for _, f := range files {
+		switch {
+		case f.State == "pending":
+			left++
+		case f.Kind == "voice" && f.State == "ready":
+			clips = append(clips, voiceClip{name: f.Name, path: f.LocalPath})
+		}
+	}
 	for _, f := range files {
 		if f.State != "pending" || ctx.Err() != nil {
 			continue
@@ -135,7 +147,14 @@ func (e *Engine) fetchInbound(ctx context.Context, inboundID int64) {
 		e.mu.Lock()
 		delete(e.fileTries, key)
 		e.mu.Unlock()
+		left--
+		if f.Kind == "voice" && state == "ready" {
+			clips = append(clips, voiceClip{name: f.Name, path: local})
+		}
 		if err := e.update(func(tx *store.Tx) error {
+			if left == 0 {
+				e.labelVoice(in.ConvID, in, clips)
+			}
 			return tx.SetInboundFile(inboundID, f.Idx, state, local, msg)
 		}); err != nil {
 			e.logf("record attachment %d/%d: %v", inboundID, f.Idx, err)

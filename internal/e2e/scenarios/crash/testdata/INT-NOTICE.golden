@@ -1,12 +1,16 @@
 # INT-NOTICE: interruption notice: one per interrupted turn, at restart, before the next turn, without internal ids
 # cxp black-box transcript; volatile values are numbered placeholders
 
-== chat <chat:1> "Codex Control - e2ehost"
+== chat <chat:1> "🏠 Codex Control - e2ehost"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
 -- <msg:2> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>new <root>/work/int-a</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>new <root>/work/int-a</p>
 -- <msg:3> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -15,6 +19,10 @@
    | <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
    | <p>If Teams does not show it right away, search for: s001</p>
 -- <msg:4> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>new <root>/work/int-b</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>new <root>/work/int-b</p>
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -23,6 +31,10 @@
    | <a href="https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
    | <p>If Teams does not show it right away, search for: s002</p>
 -- <msg:6> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>new <root>/work/int-c</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>new <root>/work/int-c</p>
 -- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -33,10 +45,10 @@
 -- "Codex finished" notices, one line each, sorted (posting order is timing: several chats finish together after the restart)
    finished: s001 · int-a | request: Next request E2E-INTNOTICE-nexta-4 (@owner)
    finished: s002 · int-b | request: Next request E2E-INTNOTICE-nextb-5 (@owner)
-   finished: s003 · int-c | request: Next request E2E-INTNOTICE-nextc-6 (@owner)
    finished: s003 · int-c | request: Quick task E2E-INTNOTICE-idlec-3 (@owner)
+   finished: 💬 e2ehost - Quick task E2E-INTNOTICE-idlec-3 | request: Next request E2E-INTNOTICE-nextc-6 (@owner)
 
-== chat <chat:2> "s001 · int-a"
+== chat <chat:2> "💬 e2ehost - Long task E2E-INTNOTICE-runa-1"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -53,6 +65,10 @@
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
    | Need more details? Send <code>helper status</code>.</p>
 -- <msg:3> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Long task E2E-INTNOTICE-runa-1</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>Long task E2E-INTNOTICE-runa-1</p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -61,6 +77,10 @@
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
    | <p>The previous request was interrupted when the helper stopped. It was not re-run; resend it if you still need it.</p>
 -- <msg:6> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Next request E2E-INTNOTICE-nexta-4</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>Next request E2E-INTNOTICE-nexta-4</p>
 -- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -70,7 +90,7 @@
    | <p>E2EANSWER-<n> answer for E2E-INTNOTICE-nexta-4</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
-== chat <chat:3> "s002 · int-b"
+== chat <chat:3> "💬 e2ehost - Long task E2E-INTNOTICE-runb-2"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -87,6 +107,10 @@
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
    | Need more details? Send <code>helper status</code>.</p>
 -- <msg:3> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Long task E2E-INTNOTICE-runb-2</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>Long task E2E-INTNOTICE-runb-2</p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -95,6 +119,10 @@
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
    | <p>The previous request was interrupted when the helper stopped. It was not re-run; resend it if you still need it.</p>
 -- <msg:6> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Next request E2E-INTNOTICE-nextb-5</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>Next request E2E-INTNOTICE-nextb-5</p>
 -- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -104,7 +132,7 @@
    | <p>E2EANSWER-<n> answer for E2E-INTNOTICE-nextb-5</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
-== chat <chat:4> "s003 · int-c"
+== chat <chat:4> "💬 e2ehost - Quick task E2E-INTNOTICE-idlec-3"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -121,6 +149,10 @@
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
    | Need more details? Send <code>helper status</code>.</p>
 -- <msg:3> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Quick task E2E-INTNOTICE-idlec-3</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>Quick task E2E-INTNOTICE-idlec-3</p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -130,6 +162,10 @@
    | <p>E2EANSWER-<n> answer for E2E-INTNOTICE-idlec-3</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:6> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Next request E2E-INTNOTICE-nextc-6</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>Next request E2E-INTNOTICE-nextc-6</p>
 -- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>

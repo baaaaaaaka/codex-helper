@@ -947,6 +947,10 @@
    | <p>Local Codex sessions are caught up from now on.</p>
    | <p>The previous data is kept unchanged as a backup. The full report is migration-report.txt next to the helper&#39;s store (<code>cxp teams status</code> shows where).</p>
 -- <msg:2> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>new <root>/work/live</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>new <root>/work/live</p>
 -- <msg:3> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -965,7 +969,7 @@
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>✅ Codex finished</strong></p>
-   | <p><strong>Chat:</strong> s024 · live<br>
+   | <p><strong>Chat:</strong> 💬 e2ehost - Live task E2E-CATCHUPLIVE-first-1<br>
    | <strong>Request:</strong> Follow-up 1 E2E-CATCHUPLIVE-followup1-2</p>
    | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
    | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:325>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:325>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
@@ -973,7 +977,7 @@
 -- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>✅ Codex finished</strong></p>
-   | <p><strong>Chat:</strong> s024 · live<br>
+   | <p><strong>Chat:</strong> 💬 e2ehost - Live task E2E-CATCHUPLIVE-first-1<br>
    | <strong>Request:</strong> Follow-up 2 E2E-CATCHUPLIVE-followup2-3</p>
    | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
    | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:325>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:325>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
@@ -981,7 +985,7 @@
 -- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>✅ Codex finished</strong></p>
-   | <p><strong>Chat:</strong> s024 · live<br>
+   | <p><strong>Chat:</strong> 💬 e2ehost - Live task E2E-CATCHUPLIVE-first-1<br>
    | <strong>Request:</strong> Follow-up 3 E2E-CATCHUPLIVE-followup3-4</p>
    | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
    | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:325>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:325>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
@@ -1422,7 +1426,7 @@
    | <p>Backlog answer backlog-a-15-2</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
-== chat <chat:325> "s024 · live"
+== chat <chat:325> "💬 e2ehost - Live task E2E-CATCHUPLIVE-first-1"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -1439,6 +1443,10 @@
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
    | Need more details? Send <code>helper status</code>.</p>
 -- <msg:3> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Live task E2E-CATCHUPLIVE-first-1</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>Live task E2E-CATCHUPLIVE-first-1</p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -1448,6 +1456,10 @@
    | <p>E2EANSWER-<n> answer for E2E-CATCHUPLIVE-first-1</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:6> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Follow-up 1 E2E-CATCHUPLIVE-followup1-2</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>Follow-up 1 E2E-CATCHUPLIVE-followup1-2</p>
 -- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -1457,6 +1469,10 @@
    | <p>E2EANSWER-<n> answer for E2E-CATCHUPLIVE-followup1-2</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:9> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Follow-up 2 E2E-CATCHUPLIVE-followup2-3</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>Follow-up 2 E2E-CATCHUPLIVE-followup2-3</p>
 -- <msg:10> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -1466,6 +1482,10 @@
    | <p>E2EANSWER-<n> answer for E2E-CATCHUPLIVE-followup2-3</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:12> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Follow-up 3 E2E-CATCHUPLIVE-followup3-4</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>Follow-up 3 E2E-CATCHUPLIVE-followup3-4</p>
 -- <msg:13> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>

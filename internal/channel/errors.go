@@ -105,6 +105,10 @@ func (e *WindowTooLarge) Error() string {
 	return fmt.Sprintf("channel: receive window larger than %d pages (reached %s)", e.Pages, e.OldestSeen.UTC().Format(time.RFC3339))
 }
 
+// ErrNotEditable is wrapped by Annotator.Annotate when the message cannot
+// be edited without losing part of it (or is not the signed-in account's).
+var ErrNotEditable = errors.New("channel: message cannot be edited safely")
+
 // ErrNotFound is wrapped by Get and FetchFile when the object does not exist.
 var ErrNotFound = errors.New("channel: not found")
 

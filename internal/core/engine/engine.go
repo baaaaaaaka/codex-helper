@@ -315,6 +315,10 @@ type Engine struct {
 	// Prepare stopped the previous app-servers.
 	orphans map[int64]bool
 	stats   engineStats
+	// Teams edits (edits.go, annotations.go, rename.go): queued chat
+	// edits per conversation, the machine label and the unread marks.
+	edits  map[int64][]*chatEdit
+	titles titleState
 }
 
 type engineStats struct {
@@ -511,6 +515,9 @@ func (e *Engine) Run(ctx context.Context) error {
 	}()
 	<-ctx.Done()
 	e.wg.Wait()
+	if e.fatal == nil || errors.Is(e.fatal, ErrRestart) {
+		e.flushEdits(flushEditsMax) // a graceful stop keeps the last labels and titles (edits.go)
+	}
 	e.ag.Close()
 	if e.fatal != nil {
 		return e.fatal
@@ -594,6 +601,7 @@ func (e *Engine) start(ctx context.Context) error {
 		return err
 	}
 	e.resumeCreating()
+	e.resumeFreezes()
 	e.requeueCommands()
 	e.loadRestartConfirm()
 	if err := e.announceUpdate(); err != nil {

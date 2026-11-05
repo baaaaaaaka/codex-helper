@@ -260,6 +260,42 @@ type HistoryPager interface {
 	HistoryPage(ctx context.Context, chat string, since time.Time, pos string) ([]InboundMsg, string, error)
 }
 
+// Annotator is implemented by channels that can annotate a message in
+// place (Caps.EditMessages): what v0.1.20 added to the owner's messages
+// (the user label, a voice clip's transcript) and to the newest message
+// of a chat that stopped listening (the freeze notice). One call reads the
+// message once and edits it at most once, keeping its attachments,
+// mentions and quotes. It edits nothing and returns an error wrapping
+// ErrNotEditable when the edit could lose part of the message or the
+// message is not the signed-in account's, and nil when the annotation is
+// already there.
+type Annotator interface {
+	Annotate(ctx context.Context, chat, id string, a Annotation) error
+}
+
+// Annotation is one in-place edit (Annotator). Label alone is the user
+// marker; Clips adds a voice transcript (the label too, when missing);
+// Notice appends a document below the message.
+type Annotation struct {
+	// Label heads the message as its own line ("🧑‍💻 User:") unless the
+	// message already starts with it. Without Clips, a message carrying a
+	// voice or video clip is not labelled (it gets its transcript).
+	Label string
+	// ClipsLabel heads the transcripts of the message's voice clips.
+	ClipsLabel string
+	Clips      []Clip
+	// Notice is appended below the message. Present: the message already
+	// shows the notice when its text contains every one of these strings.
+	Notice  *RichDoc
+	Present []string
+}
+
+// Clip is the transcript of one voice or video clip of a message.
+type Clip struct {
+	Name string
+	Text string
+}
+
 // PartTexter is implemented by channels that can tell the visible text of a
 // rendered part body, as InboundMsg.Text carries it when the part is read.
 type PartTexter interface {

@@ -1,12 +1,16 @@
 # VOICE: voice clip transcribed by the external ASR command runs as a prompt; each failure class gets a visible reason and no Codex turn
 # cxp black-box transcript; volatile values are numbered placeholders
 
-== chat <chat:1> "Codex Control - e2ehost"
+== chat <chat:1> "🏠 Codex Control - e2ehost"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
 -- <msg:2> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>new <root>/work/voice</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>new <root>/work/voice</p>
 -- <msg:3> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -24,12 +28,12 @@
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>✅ Codex finished</strong></p>
-   | <p><strong>Chat:</strong> s001 · voice</p>
+   | <p><strong>Chat:</strong> 💬 e2ehost - transcribed- please list the files E2E-VOICE-voiceok-1</p>
    | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
    | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
    mention 0: owner "E2E Owner"
 
-== chat <chat:2> "s001 · voice"
+== chat <chat:2> "💬 e2ehost - transcribed- please list the files E2E-VOICE-voiceok-1"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -46,9 +50,15 @@
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
    | Need more details? Send <code>helper status</code>.</p>
 -- <msg:3> owner (html)
-   | <attachment id="<uuid:1>"></attachment>
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <attachment id="<uuid:1>"></attachment><p><strong>🎙️ Speech-to-text transcript (automatic; may contain recognition errors):</strong></p>
+   | <p><em>Clip: voice.ogg</em></p>
+   | <p>transcribed: please list the files E2E-VOICE-voiceok-1</p>
    hosted: sha256:0615efb2d15eaf68b0386cd0d8c61ab7667c8b6d745de94f5f0faaa5e95c4ca1
    attachment: {"content":"{\"duration\":\"PT3S\",\"media\":[{\"url\":\"https://graph.microsoft.com/v1.0/chats/<chat:2>/messages/<msg:3>/hostedContents/aWQ9dm9pY2UtJTAzZA0009/$value\"}]}","contentType":"application/vnd.microsoft.card.audio","contentUrl":null,"id":"<uuid:1>","name":"voice.ogg","teamsAppId":null,"thumbnailUrl":null}
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <attachment id="<uuid:1>"></attachment>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
@@ -101,9 +111,15 @@
    | <p>The voice message was not sent to Codex.</p>
    | <p>Voice transcription failed: voice transcription is not set up on this helper. Next: update or restart the helper; if you configured --asr-command, check that the command exists.</p>
 -- <msg:18> owner (html)
-   | <attachment id="<uuid:6>"></attachment>
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <attachment id="<uuid:6>"></attachment><p><strong>🎙️ Speech-to-text transcript (automatic; may contain recognition errors):</strong></p>
+   | <p><em>Clip: again.ogg</em></p>
+   | <p>transcribed: and again E2E-VOICE-again-2</p>
    hosted: sha256:9ce0a9374f491da9b4ddda599f582d7e09ab2b5de29ee06886a796718c4cf429
    attachment: {"content":"{\"duration\":\"PT3S\",\"media\":[{\"url\":\"https://graph.microsoft.com/v1.0/chats/<chat:2>/messages/<msg:18>/hostedContents/aWQ9dm9pY2UtJTAzZA0014/$value\"}]}","contentType":"application/vnd.microsoft.card.audio","contentUrl":null,"id":"<uuid:6>","name":"again.ogg","teamsAppId":null,"thumbnailUrl":null}
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <attachment id="<uuid:6>"></attachment>
 -- <msg:19> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>

@@ -203,7 +203,9 @@ func (e *Engine) parkIdle() {
 	}
 	e.mu.Unlock()
 	for _, id := range ids {
+		var parkedAt int64
 		err := e.update(func(tx *store.Tx) error {
+			parkedAt = 0
 			open, err := tx.OpenTurnsOf(id)
 			if err != nil || len(open) > 0 {
 				return err
@@ -215,11 +217,18 @@ func (e *Engine) parkIdle() {
 			if err := tx.Park(id); err != nil {
 				return err
 			}
-			_, err = e.refresh(tx, id)
-			return err
+			c, err := e.refresh(tx, id)
+			if err != nil {
+				return err
+			}
+			// F-WRK-5: the freeze notice of this park (annotations.go).
+			parkedAt = c.ParkedAt
+			return owesFreeze(tx, id, parkedAt)
 		})
 		if err != nil {
 			e.logf("park %d: %v", id, err)
+		} else if parkedAt != 0 {
+			e.queueFreeze(id, parkedAt)
 		}
 	}
 }

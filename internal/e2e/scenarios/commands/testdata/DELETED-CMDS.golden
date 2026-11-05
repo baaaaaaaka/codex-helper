@@ -1,31 +1,7 @@
 # DELETED-CMDS: `helper restore-thread`, `helper reload`, `helper model provider|catalog`, control `reload`: refused with a pointer to help, no Codex turn
 # cxp black-box transcript; volatile values are numbered placeholders
 
-== chat <chat:1> "Codex Control - e2ehost"
-   type: meeting; members: owner
--- <msg:1> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
--- <msg:2> owner (html)
-   | <p>new <root>/work/removed</p>
--- <msg:3> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>✅ Work chat created: s001</p>
-   | <p>Open this Teams link and send your task there:<br>
-   | <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
-   | <p>If Teams does not show it right away, search for: s001</p>
--- <msg:4> owner (html)
-   | <p>reload</p>
--- <msg:5> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Unknown command. Send <code>help</code> for the list of commands.</p>
--- <msg:6> owner (html)
-   | <p>restore-thread</p>
--- <msg:7> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Unknown command. Send <code>help</code> for the list of commands.</p>
-
-== chat <chat:2> "s001 · removed"
+== chat <chat:1> "s001 · removed"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -42,22 +18,74 @@
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
    | Need more details? Send <code>helper status</code>.</p>
 -- <msg:3> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper restore-thread</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>helper restore-thread</p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Unknown helper command. Send <code>helper help</code> for the list. (Messages that do not start with <code>helper</code> go to Codex.)</p>
 -- <msg:5> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper reload</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>helper reload</p>
 -- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Unknown helper command. Send <code>helper help</code> for the list. (Messages that do not start with <code>helper</code> go to Codex.)</p>
 -- <msg:7> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper model provider</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>helper model provider</p>
 -- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Unknown model <code>provider</code>. Send <code>helper model list</code> to see the models.</p>
 -- <msg:9> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper model catalog</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>helper model catalog</p>
 -- <msg:10> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Unknown model <code>catalog</code>. Send <code>helper model list</code> to see the models.</p>
+
+== chat <chat:2> "🏠 Codex Control - e2ehost"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
+-- <msg:2> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>new <root>/work/removed</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>new <root>/work/removed</p>
+-- <msg:3> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>✅ Work chat created: s001</p>
+   | <p>Open this Teams link and send your task there:<br>
+   | <a href="https://teams.microsoft.com/l/chat/<chat:1>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:1>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
+   | <p>If Teams does not show it right away, search for: s001</p>
+-- <msg:4> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>reload</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>reload</p>
+-- <msg:5> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Unknown command. Send <code>help</code> for the list of commands.</p>
+-- <msg:6> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>restore-thread</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>restore-thread</p>
+-- <msg:7> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Unknown command. Send <code>help</code> for the list of commands.</p>

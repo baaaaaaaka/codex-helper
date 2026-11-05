@@ -1,12 +1,16 @@
 # CMD-MODEL: `helper model` shows, lists, switches and resets the session model
 # cxp black-box transcript; volatile values are numbered placeholders
 
-== chat <chat:1> "Codex Control - e2ehost"
+== chat <chat:1> "🏠 Codex Control - e2ehost"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
 -- <msg:2> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>new <root>/work/model</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>new <root>/work/model</p>
 -- <msg:3> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -25,7 +29,7 @@
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>✅ Codex finished</strong></p>
-   | <p><strong>Chat:</strong> s001 · model<br>
+   | <p><strong>Chat:</strong> 💬 e2ehost - Please answer E2E-CMDMODEL-default-1<br>
    | <strong>Request:</strong> Please answer E2E-CMDMODEL-switched-2</p>
    | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
    | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
@@ -33,13 +37,13 @@
 -- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>✅ Codex finished</strong></p>
-   | <p><strong>Chat:</strong> s001 · model<br>
+   | <p><strong>Chat:</strong> 💬 e2ehost - Please answer E2E-CMDMODEL-default-1<br>
    | <strong>Request:</strong> Please answer E2E-CMDMODEL-reset-3</p>
    | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
    | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
    mention 0: owner "E2E Owner"
 
-== chat <chat:2> "s001 · model"
+== chat <chat:2> "💬 e2ehost - Please answer E2E-CMDMODEL-default-1"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -56,12 +60,20 @@
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
    | Need more details? Send <code>helper status</code>.</p>
 -- <msg:3> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper model</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>helper model</p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Model: <code>gpt-5-codex</code> (Codex default). Reasoning effort: medium (default).</p>
    | <p>Switch with <code>helper model &lt;model&gt; [effort]</code>, list with <code>helper model list</code>, go back with <code>helper model reset</code>.</p>
 -- <msg:5> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper model list</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>helper model list</p>
 -- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -69,11 +81,19 @@
    | <ul><li><code>gpt-5-codex</code> — GPT-5-Codex (default; efforts: low, medium, high)</li>
    | </ul>
 -- <msg:7> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper model no-such-model</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>helper model no-such-model</p>
 -- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Unknown model <code>no-such-model</code>. Send <code>helper model list</code> to see the models.</p>
 -- <msg:9> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Please answer E2E-CMDMODEL-default-1</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>Please answer E2E-CMDMODEL-default-1</p>
 -- <msg:10> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -83,11 +103,19 @@
    | <p>E2EANSWER-<n> answer for E2E-CMDMODEL-default-1</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:12> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper model gpt-5-codex high</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>helper model gpt-5-codex high</p>
 -- <msg:13> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Model for this session: <code>gpt-5-codex</code>, effort high. It applies from the next request on.</p>
 -- <msg:14> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Please answer E2E-CMDMODEL-switched-2</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>Please answer E2E-CMDMODEL-switched-2</p>
 -- <msg:15> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -97,11 +125,19 @@
    | <p>E2EANSWER-<n> answer for E2E-CMDMODEL-switched-2</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:17> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper model reset</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>helper model reset</p>
 -- <msg:18> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Model reset: this session uses the Codex default (<code>gpt-5-codex</code>, effort medium) from the next request on.</p>
 -- <msg:19> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Please answer E2E-CMDMODEL-reset-3</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>Please answer E2E-CMDMODEL-reset-3</p>
 -- <msg:20> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>

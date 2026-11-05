@@ -148,13 +148,13 @@ func (e *Engine) notifyLoop(ctx context.Context) {
 // control-chat @mention of its own. Finals are never merged into one
 // notification.
 func (e *Engine) pumpNotify(ctx context.Context) {
-	var cards, mentions []pendingNotify
+	var cards, mentions, answered []pendingNotify
 	pending := 0
 	// Outside the transaction: Available reads the Workflow setting files
 	// and may apply a pending change (a store write of its own).
 	card := e.cfg.Notifier != nil && e.cfg.Notifier.Available()
 	err := e.update(func(tx *store.Tx) error {
-		cards, mentions, pending = cards[:0], mentions[:0], 0
+		cards, mentions, answered, pending = cards[:0], mentions[:0], answered[:0], 0
 		list, err := readNotify(tx)
 		if err != nil {
 			return err
@@ -166,7 +166,9 @@ func (e *Engine) pumpNotify(ctx context.Context) {
 				return err
 			}
 			prefix := n.waitPrefix()
-			waiting := false
+			// A notification waits for the automatic title of its chat
+			// (rename.go): it names the chat as the owner sees it.
+			waiting := e.retitling(n.Conv)
 			for _, r := range rows {
 				if strings.HasPrefix(r.DeliveryKey, prefix) {
 					waiting = true
@@ -184,6 +186,7 @@ func (e *Engine) pumpNotify(ctx context.Context) {
 				if gone {
 					continue
 				}
+				answered = append(answered, n) // F-TRN-1, F-WRK-2 (rename.go)
 			}
 			keep = append(keep, n)
 			switch {
@@ -205,6 +208,8 @@ func (e *Engine) pumpNotify(ctx context.Context) {
 		return
 	}
 	e.notifyN.Store(int64(pending))
+	// After the notifications named their chats (rename.go).
+	defer func() { e.afterAnswers(e.notified(answered)) }()
 	for _, n := range cards {
 		if ctx.Err() != nil {
 			return
