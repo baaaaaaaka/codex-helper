@@ -2,6 +2,7 @@ package turns
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,8 +19,6 @@ func TestR20_R33_CancelRunningTurn(t *testing.T) {
 		Guarantees: []string{"R-20", "R-33", "F-TRN-3"},
 		Title:      "cancel of a running turn is visible and final; next message works",
 		Budget:     90 * time.Second,
-		Golden: harness.GoldenOptions{Races: []harness.Race{{First: "Cancelling the running request", Second: "Request cancelled.",
-			Reason: "cxp enqueues the cancel command's reply after it interrupts the turn, so a fast interrupt's \"Request cancelled.\" can be posted first"}}},
 	})
 	defer s.Finish()
 	stuck, next := s.Token("stuck"), s.Token("next")
@@ -41,9 +40,8 @@ func TestR20_R33_CancelRunningTurn(t *testing.T) {
 		cs := s.Codex.CallsWithToken(stuck)
 		return len(cs) > 0 && cs[0].Outcome == "cancelled", "outcome=" + steps.Outcome(cs)
 	})
-	// The command's reply and the turn's terminal notice; the next prompt
-	// follows both, so the transcript is fixed (their mutual order is a
-	// declared race, see Golden.Races).
+	// The command's reply and the turn's terminal notice, in this order;
+	// the next prompt follows both, so the transcript is fixed.
 	const ack, cancelled = "Cancelling the running request", "Request cancelled."
 	terminal := s.WaitFor("cancel reply and terminal notice for the cancelled turn", 30*time.Second, func() (bool, string) {
 		a, c := len(s.SUTMessagesContaining(work.ID, ack)), len(s.SUTMessagesContaining(work.ID, cancelled))
@@ -58,6 +56,17 @@ func TestR20_R33_CancelRunningTurn(t *testing.T) {
 
 	tr := s.Transcript(work.ID, 30)
 	s.Check("R-20 interrupt reaches the running Codex turn", cancelledInCodex, "fake Codex call cancelled", "outcome="+steps.Outcome(s.Codex.CallsWithToken(stuck)))
+	replyAt, noticeAt := -1, -1
+	for i, m := range s.SUTMessages(work.ID) {
+		switch txt := m.PlainText(); {
+		case replyAt < 0 && strings.Contains(txt, ack):
+			replyAt = i
+		case noticeAt < 0 && strings.Contains(txt, cancelled):
+			noticeAt = i
+		}
+	}
+	s.Check("R-20 the cancel reply precedes the terminal notice", replyAt >= 0 && replyAt < noticeAt, "reply first",
+		fmt.Sprintf("reply at %d, %q at %d", replyAt, cancelled, noticeAt), tr...)
 	s.Check("R-33 cancelled turn has a visible terminal state", terminal, fmt.Sprintf("%q posted", cancelled), map[bool]string{true: "posted", false: "missing"}[terminal], tr...)
 	late := len(s.SUTMessagesContaining(work.ID, "LATE-ANSWER"))
 	s.Check("R-20 no answer is posted for the cancelled turn", late == 0, "0", fmt.Sprint(late))

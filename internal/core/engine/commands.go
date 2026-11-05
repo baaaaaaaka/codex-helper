@@ -456,10 +456,11 @@ func (e *Engine) cmdCancel(ctx context.Context, j cmdJob, cs *convState, arg str
 	if err != nil {
 		e.logf("cancel in %s: %v", cs.label, err)
 	}
-	running := false
-	if all || cancelled == 0 {
-		running = e.cancelRunning(ctx, cs.id)
-	}
+	// The reply is enqueued before the running turn is interrupted, so
+	// it always precedes the turn's "Request cancelled." (R-20-33).
+	e.mu.Lock()
+	running := cs.running != nil && (all || cancelled == 0)
+	e.mu.Unlock()
 	switch {
 	case running && cancelled > 0:
 		e.reply(j, fmt.Sprintf("Cancelling the running request and %s.", plural(cancelled, "queued request", "queued requests")), nil)
@@ -469,6 +470,9 @@ func (e *Engine) cmdCancel(ctx context.Context, j cmdJob, cs *convState, arg str
 		e.reply(j, fmt.Sprintf("Cancelled %s.", plural(cancelled, "queued request", "queued requests")), nil)
 	default:
 		e.reply(j, "Nothing to cancel: no request is running or queued.", nil)
+	}
+	if running {
+		e.cancelRunning(ctx, cs.id)
 	}
 	e.wakeRunner(cs.id)
 }

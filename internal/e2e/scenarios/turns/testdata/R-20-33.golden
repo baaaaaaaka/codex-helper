@@ -21,7 +21,6 @@
 
 == chat <chat:2> "s001 · r20"
    type: meeting; members: owner
-   (declared race, shown in the declared order: cxp enqueues the cancel command's reply after it interrupts the turn, so a fast interrupt's "Request cancelled." can be posted first)
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Work chat created: s001.<br>

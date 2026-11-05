@@ -32,6 +32,8 @@ type fakeAgent struct {
 	lookup  map[string]TurnOutcome // turn key -> outcome
 	irq     map[int64]chan struct{}
 	notes   []string // commentary streamed by turns whose text contains "progress"
+	// interrupted runs after an interrupt reached a running turn.
+	interrupted func()
 }
 
 func newAgent() *fakeAgent {
@@ -99,10 +101,14 @@ func (a *fakeAgent) Lookup(_ context.Context, _ int64, _, key string) (TurnOutco
 
 func (a *fakeAgent) Interrupt(_ context.Context, conv int64) error {
 	a.mu.Lock()
-	defer a.mu.Unlock()
-	if ch := a.irq[conv]; ch != nil {
+	ch, hook := a.irq[conv], a.interrupted
+	if ch != nil {
 		close(ch)
 		delete(a.irq, conv)
+	}
+	a.mu.Unlock()
+	if ch != nil && hook != nil {
+		hook()
 	}
 	return nil
 }
@@ -462,6 +468,52 @@ func TestCancelRunningTurn(t *testing.T) {
 	r.wait("next", func() bool { return len(r.own(work, "ANSWER to next one")) == 1 })
 	if len(r.own(work, "ANSWER to slow")) != 0 {
 		t.Fatal("late answer")
+	}
+}
+
+// R-20-33: the cancel command's reply precedes the turn's "Request
+// cancelled." even when the interrupt ends the turn at once: the agent
+// here returns from Interrupt only after the turn's notice is committed.
+func TestCancelReplyPrecedesTheCancelledNotice(t *testing.T) {
+	r := newRig(t)
+	work := r.newWork(t.TempDir())
+	release := make(chan struct{})
+	defer close(release)
+	r.ag.mu.Lock()
+	r.ag.block["slow"] = release
+	r.ag.interrupted = func() {
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			n := 0
+			_ = r.st.View(func(q store.Querier) error {
+				return q.QueryRowContext(context.Background(),
+					`SELECT count(*) FROM outbox WHERE delivery_key LIKE 'turn:%:cancelled:%'`).Scan(&n)
+			})
+			if n > 0 {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+	r.ag.mu.Unlock()
+	r.ch.PostUser(work, "slow job")
+	r.wait("running", func() bool { return r.ag.calls("slow") == 1 })
+	r.ch.PostUser(work, "helper cancel last")
+	r.wait("reply and notice", func() bool {
+		return len(r.own(work, "Cancelling the running request")) == 1 && len(r.own(work, "Request cancelled.")) == 1
+	})
+	reply, notice := -1, -1
+	for i, m := range r.ch.Messages(work) {
+		switch {
+		case m.Marker == "":
+		case strings.Contains(m.Text, "Cancelling the running request"):
+			reply = i
+		case strings.Contains(m.Text, "Request cancelled."):
+			notice = i
+		}
+	}
+	if reply > notice {
+		t.Fatalf("\"Request cancelled.\" (message %d) was posted before the cancel reply (message %d)", notice, reply)
 	}
 }
 
