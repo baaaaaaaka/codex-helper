@@ -697,8 +697,8 @@ func (c *converter) sessionOfConv(conv int64) *sessInfo {
 	return nil
 }
 
-// registrySeen imports registry seen message ids for chats that have no
-// inbound rows (dedupe only).
+// registrySeen imports registry seen message ids as done inbound rows
+// (dedupe only): what the old helper had seen never runs again.
 func (c *converter) registrySeen() error {
 	e := c.rep.E("registry seen ids")
 	for _, chat := range sortedKeys(c.opt.registry.Chats) {
@@ -709,10 +709,14 @@ func (c *converter) registrySeen() error {
 		if !ok {
 			conv, prefix = c.orphans[chat], "orphan chat: "
 		}
-		if _, has := c.oldestIn[conv]; has {
-			e.Outcomes[prefix+"chat has inbound rows -> covered"] += len(ids)
-			continue
-		}
+		// Every seen id is imported, also in a chat with inbound rows: the
+		// old helper skipped a message it had seen ("ignored-registry-seen")
+		// and recorded its control chat's commands only here and in the
+		// control-chat history, not as inbound rows. The receiver re-reads
+		// 2 minutes before the converted cursor, so a seen command without
+		// a done row would run again (live canary 2026-11-05: an answered
+		// `st` the old helper had answered was handled again). An id with an
+		// inbound row keeps that row.
 		for _, id := range ids {
 			t := extTime(id, c.ms())
 			_, ok, err := c.im.Inbound(store.Inbound{ConvID: conv, ExtMsgID: id, ExtTime: t, ReceivedAt: t, Sender: store.SenderOther, Kind: store.InPrompt, State: store.InDone})
@@ -722,6 +726,8 @@ func (c *converter) registrySeen() error {
 			if ok {
 				e.Imported++
 				e.Outcomes[prefix+"imported (done)"]++
+			} else {
+				e.Outcomes[prefix+"already an inbound row"]++
 			}
 		}
 	}
