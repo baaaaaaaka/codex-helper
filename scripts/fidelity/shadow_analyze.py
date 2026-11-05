@@ -60,12 +60,13 @@ EXPECT_CLASSES = ("post:", "read:short-unverifiable", "DUP:")
 
 
 # v0.1.20 renders a Markdown link to a local file as the path alone
-# ("[name](/abs/path:1)" -> "/abs/path:1"): key a record the same way.
-LOCAL_LINK = re.compile(r"\[([^\]\n]*)\]\((/[^)\s]+)\)")
+# ("[name](/abs/path:1)" -> "/abs/path:1", also with the destination in
+# angle brackets, "[name](</abs/path>)"): key a record the same way.
+LOCAL_LINK = re.compile(r"\[([^\]\n]*)\]\((?:<(/[^>\n]+)>|(/[^)\s]+))\)")
 
 
 def letters(s):
-    return NONLETTER.sub("", LOCAL_LINK.sub(r"\2", s or "")).lower()
+    return NONLETTER.sub("", LOCAL_LINK.sub(lambda m: m.group(2) or m.group(3), s or "")).lower()
 
 
 def jl(path):
