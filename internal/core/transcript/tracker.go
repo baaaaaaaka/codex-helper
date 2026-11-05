@@ -345,6 +345,25 @@ func (t *Tracker) apply(out []Output, ev Event, l Line) []Output {
 	return out
 }
 
+// Settle decides the open turn when no record will: the rollout stopped
+// growing before the engine started, so a turn still waiting for its
+// helper/local decision was abandoned mid-way by a Codex that writes no
+// user item (fidelity run, s671: its prompt was never mirrored). Its held
+// records are mirrored unless the helper ran it (by its Codex turn id or a
+// Teams wrapper). A turn learned mid-scan without its start stays held: its
+// prompt, and so its wrapper, was not read.
+func (t *Tracker) Settle() []Output {
+	tr := t.turn
+	if tr == nil || tr.decided || !tr.started {
+		return nil
+	}
+	if tr.id != "" && t.skip("", tr.id) {
+		tr.teams = true
+	}
+	tr.decided = true
+	return t.flush(nil)
+}
+
 // end closes the open turn, releasing its held records.
 func (t *Tracker) end(out []Output) []Output {
 	if t.turn != nil {

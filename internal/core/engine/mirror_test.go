@@ -562,6 +562,45 @@ func TestSessionFrom200DaysAgoIsDiscoveredAndCaughtUp(t *testing.T) {
 	})
 }
 
+// Fidelity run, s671: an older Codex writes no user item, so a local turn
+// is decided by its final; a turn abandoned before one (the process died)
+// left its prompt held forever, and the conversation never reached its last
+// record. At the end of a rollout unchanged since before the start the turn
+// is decided: its prompt is caught up.
+func TestAbandonedTurnOfAnOlderCodexIsCaughtUp(t *testing.T) {
+	r, sessions := mirrorRig(t)
+	r.mirrorInitialised()
+	r.stop()
+	at := time.Now().Add(-48 * time.Hour)
+	w, err := rollout.New(sessions, t.TempDir(), rollout.Options{Start: at})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.AppendTurn(rollout.Turn{Prompt: "an earlier prompt", Answer: "an earlier answer"}); err != nil {
+		t.Fatal(err)
+	}
+	ts := at.Add(time.Hour).UTC().Format("2006-01-02T15:04:05.000Z")
+	appendFile(t, w.Path, []byte(
+		`{"timestamp":"`+ts+`","type":"event_msg","payload":{"type":"task_started","turn_id":"t-abandoned"}}`+"\n"+
+			`{"timestamp":"`+ts+`","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"the abandoned prompt"}]}}`+"\n"))
+	if err := w.SetModTime(at.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	r.start()
+	chat := r.localChat()
+	r.wait("the abandoned turn's prompt caught up", func() bool {
+		return len(r.own(chat, "an earlier answer")) == 1 && len(r.own(chat, "the abandoned prompt")) == 1
+	})
+	// Once: a restart reads the turn again from its start.
+	r.stop()
+	r.start()
+	r.mirrorInitialised()
+	time.Sleep(500 * time.Millisecond)
+	if n := len(r.own(chat, "the abandoned prompt")); n != 1 {
+		t.Fatalf("abandoned prompt posted %d times", n)
+	}
+}
+
 // W1c: the store keeps a rollout's mtime in milliseconds. A tracked rollout
 // restored at start-up, unchanged since, must compare equal to its
 // nanosecond stat and not be read again: before the fix every tracked

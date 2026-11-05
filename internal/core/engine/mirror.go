@@ -848,6 +848,11 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 		read += next - lines[0].Off
 	}
 	fh.Close()
+	if f.tracker.Offset() >= info.Size && info.MTime.Before(e.mirror.startedAt) {
+		// At the end of a rollout unchanged since before the start: no
+		// record will decide a turn still held (abandoned, s671).
+		outs = append(outs, f.tracker.Settle()...)
+	}
 	more := f.tracker.Offset() < info.Size && read >= mirrorPassMax
 
 	// Render outside the transaction.

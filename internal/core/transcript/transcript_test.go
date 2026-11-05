@@ -314,6 +314,41 @@ func TestSeveralIDlessFinalsInOneTurn(t *testing.T) {
 	}
 }
 
+// An open turn of an older Codex (no user item) is held until a record
+// decides it; Settle decides it when none will (fidelity run, s671), unless
+// the helper ran it.
+func TestSettleReleasesAnAbandonedTurn(t *testing.T) {
+	ts := "2026-01-02T03:04:05.000Z"
+	write := func(turn, prompt string) string {
+		return writeLines(t,
+			`{"timestamp":"`+ts+`","type":"session_meta","payload":{"id":"thr-1","timestamp":"`+ts+`","cwd":"/w","originator":"codex_cli_rs","source":"cli"}}`+"\n",
+			`{"timestamp":"`+ts+`","type":"event_msg","payload":{"type":"task_started","turn_id":"`+turn+`"}}`+"\n",
+			`{"timestamp":"`+ts+`","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"`+prompt+`"}]}}`+"\n",
+		)
+	}
+	tr := NewTracker("", 0, 0, nil)
+	if out := readAll(t, write("t1", "abandoned prompt"), tr); len(out) != 0 {
+		t.Fatalf("undecided turn released early: %q", keys(out))
+	}
+	out := tr.Settle()
+	if got := keys(out); got != "U:abandoned prompt" || out[0].RecordID != "t:t1:prompt:3" {
+		t.Fatalf("settled %q %+v", got, out)
+	}
+	if again := tr.Settle(); len(again) != 0 {
+		t.Fatalf("settled twice: %q", keys(again))
+	}
+	if off, _ := tr.Resume(); off == 0 {
+		t.Fatal("resume moved to the file start")
+	}
+	// A helper-run turn (by its Codex turn id) stays unmirrored.
+	skip := func(_, turn string) bool { return turn == "t2" }
+	tr2 := NewTracker("", 0, 0, skip)
+	readAll(t, write("t2", "from teams"), tr2)
+	if out := tr2.Settle(); len(out) != 0 {
+		t.Fatalf("helper turn settled as local: %q", keys(out))
+	}
+}
+
 func TestLegacyTeamsWrapperAndTurnIDSkip(t *testing.T) {
 	w := newRollout(t, rollout.Options{})
 	wrapped := "do it\n\nTeams helper safety:\n- You are running inside a Codex turn launched by the Teams helper.\n- more"
