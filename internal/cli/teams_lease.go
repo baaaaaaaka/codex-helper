@@ -61,6 +61,12 @@ func teamsAcquireLease(ctx context.Context, anchor, host string, timing lease.Ti
 				// left alone until its lease stays unrenewed for Stale.
 				reason = fmt.Sprintf("another helper owns the Teams state (%s pid %d); this host takes over if it stops renewing its lease for %s",
 					firstNonEmptyString(s.Owner.Host, "unknown host"), s.Owner.PID, timing.Stale)
+			case lease.ReasonClaimLost:
+				// Another helper won the claim this host tried; its record
+				// may not be written yet. Without this line a service child
+				// that lost a simultaneous start says nothing until its
+				// next check, a full Poll later.
+				reason = fmt.Sprintf("another helper claimed the Teams state first; this host takes over if it stops renewing its lease for %s", timing.Stale)
 			case lease.ReasonBatch:
 				reason = fmt.Sprintf("this is a batch-job host; it leaves the takeover to an interactive host for %s", timing.BatchDefer)
 			case lease.ReasonError:
