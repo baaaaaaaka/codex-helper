@@ -615,3 +615,28 @@ func TestStaleUnsentRowsDropped(t *testing.T) {
 		})
 	}
 }
+
+// The summary counts the previous helper's messages that are sent now, not
+// the interruption notices the conversion adds itself (E2E
+// ENTRY-AUTOMIGRATE: "1 message that was not sent yet is sent now" named
+// only the conversion's own notice).
+func TestSummaryCountsOnlyThePreviousHelpersUnsentMessages(t *testing.T) {
+	for _, v := range []string{"v0120", "rc59"} {
+		t.Run(v, func(t *testing.T) {
+			// Kept unsent rows (StaleUnsent -1) plus the interruption notice.
+			_, db := dryRun(t, fixture(t, v, "sqlite-wal"), nil)
+			eq(t, "interruption notice", qs(t, db, outQ, "legacy-interrupted:t-run"), "queued")
+			own := qi(t, db, `SELECT count(*) FROM outbox WHERE state IN ('queued','unknown') AND delivery_key NOT LIKE 'legacy-interrupted:%'`)
+			sum := qs(t, db, `SELECT value FROM meta WHERE key = ?`, store.MetaMigrationSummary)
+			if own < 2 || !strings.Contains(sum, fmt.Sprintf("\n\n%d messages that were not sent yet are sent now.", own)) {
+				t.Errorf("summary should count the %d unsent messages of the previous helper:\n%s", own, sum)
+			}
+			// Only the interruption notice is left to send: no such line.
+			_, db = dryRun(t, fixture(t, v, "sqlite-wal"), func(o *Options) { o.StaleUnsent = 0 })
+			eq(t, "interruption notice (stale rows dropped)", qs(t, db, outQ, "legacy-interrupted:t-run"), "queued")
+			if sum := qs(t, db, `SELECT value FROM meta WHERE key = ?`, store.MetaMigrationSummary); strings.Contains(sum, "not sent yet") {
+				t.Errorf("summary counts the conversion's own notice as an unsent message:\n%s", sum)
+			}
+		})
+	}
+}

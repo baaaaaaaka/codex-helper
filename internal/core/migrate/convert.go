@@ -1007,7 +1007,7 @@ func (c *converter) convertOutbox() error {
 		if err != nil {
 			return err
 		}
-		if _, _, err := c.im.Outbox(store.Outbox{ConvID: ct.conv, DeliveryKey: "legacy-interrupted:" + id, Seq: seq + 1, Kind: store.OutNotice, HashAlgo: store.HashLegacy,
+		if _, _, err := c.im.Outbox(store.Outbox{ConvID: ct.conv, DeliveryKey: interruptedNoticeKey + id, Seq: seq + 1, Kind: store.OutNotice, HashAlgo: store.HashLegacy,
 			Body:  "The previous request was interrupted when the helper stopped. It was not re-run; resend it if you still need it.",
 			State: store.OutQueued, CreatedAt: c.ms()}, nil); err != nil {
 			return err

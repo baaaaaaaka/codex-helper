@@ -75,6 +75,10 @@ func ChooseSource(pending []string) (string, error) {
 	return supported[0], nil
 }
 
+// interruptedNoticeKey prefixes the delivery key of the interruption notice
+// the conversion adds for a turn that was running (convert.go).
+const interruptedNoticeKey = "legacy-interrupted:"
+
 // summary is the short user-facing text the engine posts to the control
 // chat once after the conversion (no internal ids or paths).
 func (c *converter) summary() string {
@@ -89,7 +93,10 @@ func (c *converter) summary() string {
 	parked := q(`SELECT count(*) FROM conversations WHERE kind='work' AND state='parked'`)
 	closed := q(`SELECT count(*) FROM conversations WHERE kind='work' AND state='closed'`)
 	turns := q(`SELECT count(*) FROM turns`)
-	unsent := q(`SELECT count(*) FROM outbox WHERE state IN ('queued','unknown')`)
+	// The previous helper's messages that are sent now; the interruption
+	// notices the conversion itself adds are not among them.
+	unsent := q(`SELECT count(*) FROM outbox WHERE state IN ('queued','unknown') AND substr(delivery_key, 1, ?) <> ?`,
+		len(interruptedNoticeKey), interruptedNoticeKey)
 	interrupted := c.rep.E("turns").Outcomes["running -> interrupted (+notice)"]
 
 	var b strings.Builder
