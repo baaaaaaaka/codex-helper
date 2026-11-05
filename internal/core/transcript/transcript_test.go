@@ -264,11 +264,53 @@ func TestLegacyRecordsAndSubagentItems(t *testing.T) {
 	if got := keys(out); got != "U:legacy prompt | F:legacy answer" {
 		t.Fatalf("outputs %q", got)
 	}
-	if out[0].RecordID != "t:t1:prompt:4" || out[1].RecordID != "t:t1:final" {
+	if out[0].RecordID != "t:t1:prompt:4" || out[1].RecordID != "t:t1:final:8" {
 		t.Fatalf("record ids %q %q", out[0].RecordID, out[1].RecordID)
 	}
-	if k := out[1].Key("thr-1", 1); k != "mirror:thr-1:t:t1:final:1" {
+	if k := out[1].Key("thr-1", 1); k != "mirror:thr-1:t:t1:final:8:1" {
 		t.Fatalf("key %q", k)
+	}
+}
+
+// A turn can write several final_answer items without ids (fidelity run,
+// s698): each is a record of its own, with an id that does not depend on
+// where the scan began.
+func TestSeveralIDlessFinalsInOneTurn(t *testing.T) {
+	ts := "2026-01-02T03:04:05.000Z"
+	final := func(text string) string {
+		return `{"timestamp":"` + ts + `","type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"` + text + `"}]}}` + "\n"
+	}
+	lines := []string{
+		`{"timestamp":"` + ts + `","type":"session_meta","payload":{"id":"thr-1","timestamp":"` + ts + `","cwd":"/w","originator":"codex_cli_rs","source":"cli"}}` + "\n",
+		`{"timestamp":"` + ts + `","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}` + "\n",
+		`{"timestamp":"` + ts + `","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"prompt"}]}}` + "\n",
+		final("first"),
+		final("second"),
+		final("third"),
+		`{"timestamp":"` + ts + `","type":"event_msg","payload":{"type":"task_complete","turn_id":"t1","last_agent_message":"third"}}` + "\n",
+	}
+	p := writeLines(t, lines...)
+	out := readAll(t, p, NewTracker("", 0, 0, nil))
+	if got := keys(out); got != "U:prompt | F:first | F:second | F:third" {
+		t.Fatalf("outputs %q", got)
+	}
+	want := []string{"t:t1:prompt:3", "t:t1:final:4", "t:t1:final:5", "t:t1:final:6"}
+	for i, o := range out {
+		if o.RecordID != want[i] {
+			t.Fatalf("record %d id %q, want %q", i, o.RecordID, want[i])
+		}
+	}
+	// Resumed after the first final (a mid-turn scan): the same ids.
+	var off int64
+	for _, l := range lines[:4] {
+		off += int64(len(l))
+	}
+	mid := readAll(t, p, NewTracker("thr-1", off, 4, nil))
+	if got := keys(mid); got != "F:second | F:third" {
+		t.Fatalf("resumed outputs %q", got)
+	}
+	if mid[0].RecordID != want[2] || mid[1].RecordID != want[3] {
+		t.Fatalf("resumed ids %q %q", mid[0].RecordID, mid[1].RecordID)
 	}
 }
 

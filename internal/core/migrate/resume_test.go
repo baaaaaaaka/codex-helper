@@ -286,7 +286,18 @@ func TestScanClassifier(t *testing.T) {
 	r2.done("ty", "local answer without final item")
 	_, p2 := writeRollout(t, r2)
 	res := scanRollout(scanReq{path: p2, to: r2.ends[len(r2.ends)-1], teamsTurn: map[string]bool{"tx": true}})
-	eq(t, "teams turn by id", kinds(res), "prompt:p2,final:t:ty:final")
+	eq(t, "teams turn by id", kinds(res), "prompt:p2,final:t:ty:final:7")
+
+	// Several id-less finals in one turn are records of their own (s698).
+	r3 := newRollout()
+	r3.turn("tz")
+	r3.user("p3", "local")
+	r3.final("", "first")
+	r3.final("", "second")
+	r3.done("tz", "second")
+	_, p3 := writeRollout(t, r3)
+	res3 := scanRollout(scanReq{path: p3, to: r3.ends[len(r3.ends)-1]})
+	eq(t, "several finals", kinds(res3), "prompt:p3,final:t:tz:final:3,final:t:tz:final:4")
 
 	// Mid-turn start after the delivered final: task_complete is not a second final.
 	mid := scanRollout(scanReq{path: path, from: r.ends[4], fromLine: 4, to: r.ends[len(r.ends)-1]})

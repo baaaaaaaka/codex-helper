@@ -297,15 +297,13 @@ func (c *classifier) flush() {
 }
 
 // turnRecordID is the record id of a prompt or final without a response-item
-// id: "t:<codex turn id>:final" or "t:<codex turn id>:prompt:<line>".
+// id: "t:<codex turn id>:<kind>:<line>", as in the mirror. A final carries
+// its line: a turn can write several final_answer items (fidelity run, s698).
 func turnRecordID(turn, kind string, line int64) string {
 	if turn == "" {
 		turn = "?"
 	}
-	if kind == "final" {
-		return "t:" + turn + ":final"
-	}
-	return "t:" + turn + ":prompt:" + strconv.FormatInt(line, 10)
+	return "t:" + turn + ":" + kind + ":" + strconv.FormatInt(line, 10)
 }
 
 type rolloutLine struct {

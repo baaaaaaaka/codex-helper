@@ -22,8 +22,8 @@ const CompactText = "Context compacted. Earlier turns were summarized so Codex c
 // Output is one record to mirror.
 //
 // RecordID is the response-item id when the record has one, else
-// "t:<turn>:final" or "t:<turn>:<kind>:<line>" (prompt, status, compact;
-// line is the 1-based line of the record).
+// "t:<turn>:<kind>:<line>" (final, prompt, status, compact; line is the
+// 1-based line of the record).
 type Output struct {
 	RecordID string
 	Kind     OutputKind
@@ -289,8 +289,14 @@ func (t *Tracker) apply(out []Output, ev Event, l Line) []Output {
 			// (older rollouts carry the turn id only on task_complete):
 			// hold the final until the turn, and so whether the helper ran
 			// it, is known (fidelity run, s523/s526).
-			t.turn = &openTurn{finalSeen: true}
-			t.turn.pending = append(t.turn.pending, Output{RecordID: ev.RecordID, Kind: OutputFinal, Text: text, Time: ev.Time, End: l.End, line: t.line, start: l.Off})
+			tr = &openTurn{}
+			t.turn = tr
+		}
+		if tr.id == "" && !tr.started {
+			// Still held: a later final of the same unknown turn waits too,
+			// so each gets the turn id once it is known (s698).
+			tr.finalSeen = true
+			tr.pending = append(tr.pending, Output{RecordID: ev.RecordID, Kind: OutputFinal, Text: text, Time: ev.Time, End: l.End, line: t.line, start: l.Off})
 			return out
 		}
 		tr.finalSeen, tr.decided = true, true
@@ -298,7 +304,7 @@ func (t *Tracker) apply(out []Output, ev Event, l Line) []Output {
 		if !tr.teams {
 			id := ev.RecordID
 			if id == "" {
-				id = turnRecordID(tr.id, OutputFinal, 0)
+				id = turnRecordID(tr.id, OutputFinal, t.line)
 			}
 			out = append(out, Output{RecordID: id, Kind: OutputFinal, Text: text, Time: ev.Time, TurnID: tr.id, End: l.End, line: t.line, start: l.Off})
 		}
@@ -330,7 +336,7 @@ func (t *Tracker) apply(out []Output, ev Event, l Line) []Output {
 		// read and that had no final_answer item: a scan that began
 		// mid-turn usually begins right after the delivered final.
 		if tr.started && !tr.finalSeen && !tr.teams && strings.TrimSpace(ev.Text) != "" {
-			out = append(out, Output{RecordID: turnRecordID(tr.id, OutputFinal, 0), Kind: OutputFinal, Text: strings.TrimSpace(ev.Text), Time: ev.Time, TurnID: tr.id, End: l.End, line: t.line, start: l.Off})
+			out = append(out, Output{RecordID: turnRecordID(tr.id, OutputFinal, t.line), Kind: OutputFinal, Text: strings.TrimSpace(ev.Text), Time: ev.Time, TurnID: tr.id, End: l.End, line: t.line, start: l.Off})
 		}
 		t.turn, t.prev = nil, tr
 	case KindTurnAborted:

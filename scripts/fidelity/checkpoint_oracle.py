@@ -135,7 +135,7 @@ def scan_rollout(path):
                 if tid and tid != turn:
                     turn, turn_final, turn_started_here = tid, False, False
                 if turn_started_here and not turn_final and isinstance(lam, str) and lam.strip():
-                    recs.append(dict(start=start, end=off, line=line, kind="final", id="t:%s:final" % turn,
+                    recs.append(dict(start=start, end=off, line=line, kind="final", id="t:%s:final:%d" % (turn, line),
                                      turn=turn, ts=ts, text=lam.strip(),
                                      alt_ends=list(asst_ends.get((turn, norm(lam)), []))))
                 turn_final = True
@@ -321,9 +321,8 @@ def main():
         for r in recs:
             teams = r["turn"] in teams_ids or r["turn"] in wrapped_turns or r.get("wrapped")
             # the record's mirror identity: its response-item id, else
-            # "t:<turn>:final" / "t:<turn>:prompt:<line>" (STORE-DESIGN mirror key)
-            rid = r["id"] or ("t:%s:final" % (r["turn"] or "?") if r["kind"] == "final"
-                              else "t:%s:prompt:%d" % (r["turn"] or "?", r["line"]))
+            # "t:<turn>:<kind>:<line>" (STORE-DESIGN mirror key)
+            rid = r["id"] or "t:%s:%s:%d" % (r["turn"] or "?", r["kind"], r["line"])
             keyed = (thread, rid) in mirror_keys
             old = r["ts"] and r["ts"] < cut_ms
             p = posted(r)

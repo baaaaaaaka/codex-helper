@@ -522,14 +522,12 @@ func MirrorKey(threadID, recordID string, part int) string {
 }
 
 // turnRecordID is the record id of an output without a response-item id:
-// "t:<turn>:final", or "t:<turn>:<kind>:<line>" (line is 1-based) for a
-// prompt (as in the converter), a status or a compaction notice.
+// "t:<turn>:<kind>:<line>" (line is the 1-based line of the record), as in
+// the converter. A final carries its line too: a turn can write several
+// final_answer items, each one a record of its own (fidelity run, s698).
 func turnRecordID(turn string, kind OutputKind, line int64) string {
 	if turn == "" {
 		turn = "?"
-	}
-	if kind == OutputFinal {
-		return "t:" + turn + ":final"
 	}
 	return "t:" + turn + ":" + string(kind) + ":" + strconv.FormatInt(line, 10)
 }
