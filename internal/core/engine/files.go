@@ -158,6 +158,9 @@ const textVoiceWait = "Voice recognition is being set up on this machine (first 
 // fetchOne downloads (and for voice transcribes) one attachment. It returns
 // the new state ("" = retry later), the local path and an error text.
 func (e *Engine) fetchOne(ctx context.Context, inboundID int64, f store.InboundFile) (string, string, string) {
+	if q, ok := quoteOf(f); ok { // a quoted message (envelope.go)
+		return e.fetchQuote(ctx, inboundID, f, q)
+	}
 	var ref fileRef
 	if err := json.Unmarshal([]byte(f.ExtRef), &ref); err != nil {
 		return "failed", "", "the attachment reference is unreadable"

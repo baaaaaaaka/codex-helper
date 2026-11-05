@@ -49,7 +49,7 @@ func TestManifestBlocksStripAndParse(t *testing.T) {
 	}
 }
 
-func TestTurnInputListsAttachments(t *testing.T) {
+func TestCodexInputListsAttachments(t *testing.T) {
 	dir := t.TempDir()
 	voice := filepath.Join(dir, "v.ogg.txt")
 	if err := os.WriteFile(voice, []byte("hello from voice"), 0o600); err != nil {
@@ -61,11 +61,11 @@ func TestTurnInputListsAttachments(t *testing.T) {
 		{Idx: 2, Name: "v.ogg", Kind: "voice", State: "ready", LocalPath: voice},
 		{Idx: 3, Name: "gone.pdf", Kind: "file", State: "failed", Error: "the attachment could not be downloaded"},
 	}
-	text, images := turnInput("Please look", files)
+	text, images := codexInput("Please look", files, "/out")
 	if len(images) != 1 || images[0] != "/x/0-pic.png" {
 		t.Fatalf("images %v", images)
 	}
-	for _, want := range []string{"Please look", "hello from voice", "- /x/1-design notes.txt (original name: design notes.txt; text/plain)", "- gone.pdf: the attachment could not be downloaded"} {
+	for _, want := range []string{"User message:\nPlease look", "hello from voice", "- /x/1-design notes.txt (original name: design notes.txt; text/plain)", "- gone.pdf: the attachment could not be downloaded"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("input lacks %q:\n%s", want, text)
 		}

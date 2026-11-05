@@ -159,8 +159,10 @@ func FirstPrompt(path string, limit int64) string {
 		if l.Oversize {
 			continue
 		}
-		if ev := ParseLine(l); ev.Kind == KindUserMessage && !IsBoilerplate(ev.Text) && strings.TrimSpace(ev.Text) != "" {
-			return strings.TrimSpace(ev.Text)
+		if ev := ParseLine(l); ev.Kind == KindUserMessage && !IsBoilerplate(ev.Text) {
+			if text := StripHelperPrompt(ev.Text); text != "" {
+				return text
+			}
 		}
 	}
 	return ""

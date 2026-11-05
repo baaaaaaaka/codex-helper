@@ -34,9 +34,9 @@ Size: S < 100 LOC, M 100–400, L > 400 (product code, excluding tests).
 | 4 | F-CTL-6 | P1 | A | M | `open/o` and `details/d` missing; `st/status` prints helper status, not the "## Active Work chats" list with links and `r <id>` hints | `formatOpenControlTarget` B:20036, `formatDetailsControlTarget` B:15573, `formatSessionList` B:15242 | A-dashboard |
 | 5 | (parser) F-TRN-7/F-TRN-8/F-CTL-9 | P1 | C | M | Work chats accept only `helper …`: bare `model`, `effort`, `help`, `default` and `!status` / `/x` / `cx x` go to Codex as prompts (the ready text even advertises `!status`) | `dashboard_commands.go` `workBareCommandName` :221, `splitDashboardCommand` :603, short names :571 | — |
 | 6 | F-WRK-4 | P1 | C | S | `helper close` missing although the work-chat ready text (`control.go:341`) advertises it | B:8007 "Session closed. The helper will no longer read or respond in this Teams chat.\n\nThis chat remains visible in Teams. Use the 🏠 control chat to open or create another work chat." | C |
-| 7 | F-TRN-14 | P1 | F | M | Codex receives the raw text: no User-message section, no Teams safety block (do not restart/kill the helper…), no outbound-root/manifest instructions, no math contract | `artifact_handoff.go:28` `TeamsCodexPrompt`, :184 `teamsUserMessagePrompt` | — |
+| 7 | F-TRN-14 | P1 | F | M | **DONE** (batch F, `cleanup/gap-f-20261106`, scenario F-TRN-14): Codex receives the raw text: no User-message section, no Teams safety block (do not restart/kill the helper…), no outbound-root/manifest instructions, no math contract | `artifact_handoff.go:28` `TeamsCodexPrompt`, :184 `teamsUserMessagePrompt` | — |
 | 8 | F-RND-4 / R-8 | P1 | D | M | No user marker: the engine never calls the adapter's `Edit` (PATCH) | `annotateIncomingUserMessage` B:4081/:4109 | — |
-| 9 | F-RND-9 | P1 | F | M | Quoted/replied messages are parsed (`channel/teams/receive.go:271`, `quoteFrom` :329) but never reach Codex | v0.1.20 quote context in `artifact_handoff.go` user prompt (inline ≤2000 runes, else file) | — |
+| 9 | F-RND-9 | P1 | F | M | **DONE** (batch F, `cleanup/gap-f-20261106`, scenario F-RND-9): Quoted/replied messages are parsed (`channel/teams/receive.go:271`, `quoteFrom` :329) but never reach Codex | v0.1.20 quote context in `artifact_handoff.go` user prompt (inline ≤2000 runes, else file) | — |
 | 10 | F-TRN-7 | P1 | B | M | `model` lacks `switch/use`, `fork <m>`, bare `model`; control-chat model is list-only | `model_profile_commands.go:15` (control), :125 (work); "Model profile switched for this Control chat…", "Forked Work chat %s with model profile %s:\n<url>" | C |
 | 11 | F-TRN-8 | P1 | B | S | `effort` lacks `status/list/reset` and bare `effort`/`efforts`; no control-chat effort | `reasoning_effort_commands.go:20/:32`; "Current chat effort (…)", "Reasoning effort updated for this … chat…" | C |
 | 12 | F-CTL-15 | P1 | B | M | `default status/model/effort …` missing (owner reaches global defaults only from a terminal) | `default_commands.go:35`, texts in `internal/cli/teams_defaults.go:45`; work chat: "`default` changes global settings and can only be used in the Control chat. Use `model` or `effort` to change only this Work chat." | C |
@@ -63,8 +63,8 @@ Size: S < 100 LOC, M 100–400, L > 400 (product code, excluding tests).
 | 33 | F-CTL-14 | P2 | B | M | `helper webhook setup/<url>/test/status/off` from chat missing (CLI `teams workflow` exists) | `workflowWebhookFromControl` B:5529 | C |
 | 34 | F-CTL-17 | P2 | B | S | Skills `push` (review + `push confirm`) refused in Teams, points to local CLI | `helper skills push` / `push confirm` (help B:5216) | — |
 | 35 | F-WRK-3 | P2 | C | S | Ready text advertises non-existent `!status` and `helper close`; imported chats get no intro (no import) | `sessionReadyMessage` B:7841, lifecycle B:7867 | A-import |
-| 36 | F-RND-8 | P3 | F | S | Limit is 16 attachments total (`channel/teams/receive.go:228`), not 5 images / 5 files / 3 quotes; overflow note differs | SPEC F-RND-8 | — |
-| 37 | F-MIR-8 / R-23 | P3 | F | S | No `<oai-mem-citation>` stripping found; no canary scenario for hidden records | origin/main `artifact_handoff.go:576` (not in v0.1.20) | — |
+| 36 | F-RND-8 | P3 | F | S | **DONE** (batch F, `cleanup/gap-f-20261106`, scenario F-RND-8): Limit is 16 attachments total (`channel/teams/receive.go:228`), not 5 images / 5 files / 3 quotes; overflow note differs | SPEC F-RND-8 | — |
+| 37 | F-MIR-8 / R-23 | P3 | F | S | **DONE** (batch F, `cleanup/gap-f-20261106`, scenario F-MIR-8): No `<oai-mem-citation>` stripping found; no canary scenario for hidden records | origin/main `artifact_handoff.go:576` (not in v0.1.20) | — |
 | 38 | F-SVC-10 | P3 | E | S | Messages that arrive during a restart/update drain get no "…I saved this message and will resume it…" notice | SPEC F-SVC-10 | — |
 | 39 | F-TRN-17 / R-40 | P3 | G | M | `cxp teams pause/resume` deleted (DELETED-CLI asserts "unknown"); Q-19 default kept them — **ask owner** whether `teams stop/start` replaces them | SPEC F-TRN-17 | owner |
 | 40 | F-CTL-2 | P3 | G | M | `cxp teams control --recreate --yes` missing (only prints the link) | SPEC F-CTL-2 | — |
@@ -73,7 +73,7 @@ Size: S < 100 LOC, M 100–400, L > 400 (product code, excluding tests).
 | 43 | F-CLI-1 / R-17 | P3 | G | S | `teams status` lacks installed-vs-running (pending) version and last poll | SPEC F-CLI-1 | — |
 | 44 | F-XM-1 | P3 | G | S | Service is not pinned to its install host (`store.Ident.InstallHost` never set by the CLI) — owner 定稿 共用 home | — | — |
 | 45 | F-CTL-1 | P3 | D | S | Control chat title lacks 🏠 and the user-title segment | `ControlChatTitle` (🏠 Codex Control - <machine>…) | D-rename |
-| 46 | R-26 | P3 | F | S | No raw-API-key rejection in chat found in the core (v0.1.20 rejects them first in `handleControlMessage` B:4613) | B:4613 | — |
+| 46 | R-26 | P3 | F | S | **DONE** (batch F, `cleanup/gap-f-20261106`, scenario R-26): No raw-API-key rejection in chat found in the core (v0.1.20 rejects them first in `handleControlMessage` B:4613) | B:4613 | — |
 | 47 | F-SET-2 | P3 | G | S | No fail-closed gate for scopes broader than the defaults | SPEC F-SET-2 | — |
 
 ### Contradictions between SPEC and owner decisions (and other inconsistencies)
@@ -157,7 +157,7 @@ Columns: id · status (`keep` / `removed-by-owner` / `ask-owner`, with the owner
 | F-TRN-11 | keep (owner: 定稿 原样保留) | upgrade.go:127 `codexTooOld`, :227 `updateStep` | CODEX-UPGRADE | same |
 | F-TRN-12 | keep | core/codex/approval.go:10 (auto-approve), app-server runtime | R-1-2-3 (app-server path; approvals not exercised) | same |
 | F-TRN-13 | keep | cli/teams_user_path.go:42, cli/teams_child_guard.go:16/:42 `CODEX_HELPER_CLI_PATH` | NONE | same |
-| F-TRN-14 | keep | MISSING: runner.go:321 `turnInput` sends the raw text (+ attachments/voice lead); no User section, safety block, outbound-root/manifest instructions or math contract | NONE | artifact_handoff.go:28/:184 |
+| F-TRN-14 | keep | core/engine/envelope.go:80 `teamsCodexPrompt` (v0.1.20 `TeamsCodexPrompt` byte for byte: User message, Teams safety, math contract, outbound root + manifest instructions; owner changes: no `helper reload now` line, native-subagent sentence of ae23659), :120 `codexInput` (ASR lead, attachment list, quotes, local files), runner.go:223; unit differential golden engine/envelope_test.go `TestCodexInputMatchesV0120` against v0.1.20 bytes (testdata/v0120_envelope.json) | F-TRN-14 | artifact_handoff.go:28/:184 |
 | F-TRN-15 | keep | runner.go progress streaming | R-20-33, B-5 | same |
 | F-TRN-16 | keep | PARTIAL: runner.go:857 `userError`; NotStarted gives a generic text, no setup-class message | NONE | SPEC text "⚠️ I couldn't start Codex due to a setup issue on my side…" |
 | F-TRN-17 | keep (Q-19 default: keep `pause/resume`, drain internal; not removed by owner) | MISSING: `cxp teams pause/resume` deleted (COVERAGE D28) | NONE (DELETED-CLI asserts the opposite) | v0.1.20 `teams pause/resume/drain` |
@@ -170,7 +170,7 @@ Columns: id · status (`keep` / `removed-by-owner` / `ask-owner`, with the owner
 | F-MIR-5 | keep | MISSING: no import on `continue` | NONE | B:15741, B:16174 |
 | F-MIR-6 | keep | MISSING: no `helper publish-history [full]`, no `ph`, no CLI `chat publish-history` | NONE | B:8051, B:16039, B:16083 |
 | F-MIR-7 | keep | mirror.go:831 rewritten-rollout realign | NONE | same |
-| F-MIR-8 | keep | PARTIAL: transcript/record.go:358/:380 hide tool/reasoning/token events; no `<oai-mem-citation>` stripping found | NONE | origin/main artifact_handoff.go:576 |
+| F-MIR-8 | keep | transcript/record.go:358/:380 hide tool/reasoning/token events; `<oai-mem-citation>` blocks stripped by transcript/strip.go:15 `StripMemCitations` (port of v0.1.20 `StripOAIMemoryCitationBlocks`) in answers (engine/outbound.go:177), progress (runner.go:1010) and mirrored TUI turns (transcript/tracker.go:269/:338); a block inside a closed code fence stays. Note: v0.1.20 already had it (artifact_handoff.go:501), not only origin/main | F-MIR-8 | artifact_handoff.go:501 |
 | F-MIR-9 | keep | transcript/record.go:320 bounded classification of large records | NONE | same |
 | F-MIR-10 | keep | receive.go:443 `admit` independent of mirror state | CATCHUP-LIVE | same |
 | F-RND-1 | keep | channel/teams/render.go:37 (ported v0.1.20 markdown, 11-05) | R-36 | same |
@@ -180,9 +180,9 @@ Columns: id · status (`keep` / `removed-by-owner` / `ask-owner`, with the owner
 | F-RND-5 | keep (owner: 第二级 7 / 定稿 every final; 11-05 silent catch-up) | core/engine/notify.go:126, runner.go:756 `finalMention` | NOTIFY-BURST, NOTIFY-WH, NOTIFY-NOWH, NOTIFY-WH500, NOTIFY-WHDOWN, WORKFLOW-LIVE | owner redefined |
 | F-RND-6 | keep | channel/teams/workflow.go:28 | NOTIFY-WH, NOTIFY-NOWH, NOTIFY-WH500, NOTIFY-WHDOWN, WORKFLOW-LIVE | same |
 | F-RND-7 | keep (owner: 第一级 7 / 定稿 faithful + code-block fallback) | channel/teams/math.go, mathfont.go | FORMULA | same |
-| F-RND-8 | keep | PARTIAL: channel/teams/receive.go:275 `inboundFiles`, engine files.go; 16-attachment total limit (:228), not 5/5/3 | R-37 | SPEC limits |
-| F-RND-9 | keep | MISSING: quotes parsed (channel/teams/receive.go:271, :329) but dropped by the core | NONE | quote context in the prompt |
-| F-RND-10 | keep | PARTIAL: manifest upload core/engine/outbound.go:201; `helper file` and `cxp teams send-file` missing; Codex is not told the outbound root (F-TRN-14) | R-37-out | B:9748 |
+| F-RND-8 | keep | engine/envelope.go:59 limits 5 media (images + voice/video) / 5 files / 3 quotes, :500 `screen` refuses the whole message with v0.1.20's text (no turn, no ACK, quoted in group chats, as v0.1.20); the 16-attachment cut in channel/teams/receive.go is gone; limits apply to prompts only | F-RND-8, R-37 | SPEC limits; B `validateTeamsAttachmentLimits` |
+| F-RND-9 | keep | channel/teams/receive.go:316/:360 (forward flag, send time); quotes stored as inbound_files rows (engine/envelope.go:367 `admittedFiles`), resolved by :413 `fetchQuote` (reply → GET full message, forward → its own text, failure → preview; transient errors retry like files) from files.go:161; prompt section :204 `withQuotes` (≤2000 runes inline, longer → `referenced-message-NNN.txt` listed as a local file) | F-RND-9 | quote context in the prompt |
+| F-RND-10 | keep | PARTIAL: manifest upload core/engine/outbound.go:201; Codex is told the outbound root and manifest format (engine/envelope.go:80, F-TRN-14); `helper file` and `cxp teams send-file` missing | R-37-out | B:9748 |
 | F-RND-11 | keep (owner: 决定-4, 第一级 6, 定稿 ASR) | PARTIAL: core/engine/files.go:185-215 transcribe → prompt; no transcript PATCH, no control-chat voice | VOICE | asr_input.go |
 | F-STA-1 | keep | core/engine/stats.go:39 `cmdStats` (work chat :153, control :259) from the rollouts; core/transcript/usage.go:752 (v0.1.20 reconstruction), usage_cache.go:94 (incremental reader, no timer) | CMD-STATS, STATS-RESETS | token_stats.go:1013/:1083 |
 | F-XM-1 | keep (owner: 定稿 共用 home — standby + takeover, no priority classes, pinned to install host) | PARTIAL: core/lease/acquire.go:185; install-host pin missing (`store.Ident.InstallHost` never set) | KILL-SWITCH, SERVICE-STANDBY, STANDBY-LOCKED, STANDBY-TAKEOVER, TAKEOVER-BATCH, TAKEOVER-CRASH-MID, TAKEOVER-KILLED, TAKEOVER-LEFTOVER, TAKEOVER-SAME-HOST, TAKEOVER-SIMULTANEOUS, TAKEOVER-THAW-EARLY | rc.59 lease lessons |
@@ -233,10 +233,10 @@ Columns: id · status (`keep` / `removed-by-owner` / `ask-owner`, with the owner
 | R-20 | keep | PARTIAL: no cancel `<turn-id>` (F-TRN-3) | R-20-33, SILENCE | — |
 | R-21 | keep | per-chat runners; control never queued | R-11 | — |
 | R-22 | keep | PARTIAL: no freeze notice (so no PATCH-once); other notices once | BREAKER, DUP, IDLE, SILENCE, VOICE, WAKE-SYNTAX | — |
-| R-23 | keep | PARTIAL: no `<oai-mem-citation>` stripping (F-MIR-8); no prompt envelope exists to leak (F-TRN-14) | NONE | — |
+| R-23 | keep | the envelope stays out of Teams and titles (transcript/strip.go:209 `StripHelperPrompt`, discover.go:163); `<oai-mem-citation>` stripped (F-MIR-8, transcript/strip.go:15) | F-TRN-14, F-MIR-8 | — |
 | R-24 | keep | cli/teams_user_path.go, teams_child_guard.go | NONE | — |
 | R-25 | keep | cli/teams_child_guard.go:14 | NONE | — |
-| R-26 | keep | PARTIAL: token cache/redaction in cli; no raw-API-key rejection in chat found | NONE | — |
+| R-26 | keep | engine/envelope.go:549 `containsRawAPIKey` (v0.1.20 port), :500 `screen` / :537 `refuse`: a prompt or command with a raw key from a human is refused with one unquoted reply, never run or sent to Codex, and its body is stored redacted (receive.go:506); reply text adapted (no `model setup`, owner removed third-party APIs) | R-26 | B:4613 |
 | R-27 | keep | PARTIAL: control chat owner-only; coworker `helper …` ignored without the rejection text | R-43 | — |
 | R-28 | keep | core/lease/acquire.go:185 | TAKEOVER-*, STANDBY-TAKEOVER, KILL-SWITCH | — |
 | R-29 | keep | store-backed queue/outbox | R-4-29 | — |
@@ -247,7 +247,7 @@ Columns: id · status (`keep` / `removed-by-owner` / `ask-owner`, with the owner
 | R-34 | keep | mirror recognises Teams turns | R-9-10 | — |
 | R-35 | keep | silence.go:189 queued ACK, runner.go:260 starting notice, silence.go:108 reminder | R-6 | ACK text per owner |
 | R-36 | keep | channel/teams/render.go | R-36 | — |
-| R-37 | keep | files.go, outbound.go | R-37, R-37-out, VOICE | — |
+| R-37 | keep | files.go, outbound.go; per-message limits engine/envelope.go:59 (F-RND-8) | R-37, R-37-out, VOICE, F-RND-8 | — |
 | R-38 | keep | core/migrate refuses unsupported/corrupt stores | ENTRY-MIGRATE | — |
 | R-39 | keep | `new` idempotent (createOrGet + record) | NONE | — |
 | R-40 | keep | MISSING: pause removed; drain internal only (F-TRN-17) | NONE | — |

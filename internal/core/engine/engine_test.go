@@ -49,6 +49,8 @@ func (a *fakeAgent) Run(ctx context.Context, req TurnRequest, h TurnHooks) (Turn
 	a.mu.Lock()
 	a.runs = append(a.runs, req)
 	n := len(a.runs)
+	// Answers and progress name the user's own text, not the envelope.
+	req.Text = strings.TrimPrefix(req.Text, userMessageLead+"\n")
 	if req.ThreadID == "" {
 		a.threads++
 		req.ThreadID = fmt.Sprintf("thread-%d", a.threads)
@@ -816,8 +818,10 @@ func TestVoiceTurnWaitsForTranscript(t *testing.T) {
 		t.Fatalf("%d turns started before the transcript was ready", n)
 	}
 	close(asr.release)
-	r.wait("voice answered", func() bool { return r.ag.calls(voiceLead+"\nhello from voice") == 1 })
-	r.wait("voice answer posted", func() bool { return len(r.own(work, "ANSWER to Voice message")) == 1 })
+	r.wait("voice answered", func() bool {
+		return r.ag.calls(asrLead+"\nVoice/video clip: voice.ogg ("+asrAttrs+")\nhello from voice") == 1
+	})
+	r.wait("voice answer posted", func() bool { return len(r.own(work, "ANSWER to Automatic local ASR transcript")) == 1 })
 }
 
 func TestVoiceTranscriptionFailureStillRunsWithoutLeaks(t *testing.T) {
@@ -832,7 +836,7 @@ func TestVoiceTranscriptionFailureStillRunsWithoutLeaks(t *testing.T) {
 	r.ag.mu.Lock()
 	text := r.ag.runs[len(r.ag.runs)-1].Text
 	r.ag.mu.Unlock()
-	if strings.Contains(text, "/secret/path") || !strings.HasPrefix(text, "see voice") {
+	if strings.Contains(text, "/secret/path") || !strings.HasPrefix(text, "User message:\nsee voice") {
 		t.Fatalf("turn text %q", text)
 	}
 }
@@ -1817,7 +1821,9 @@ func TestOwnerVoiceInGroupChatIsARequest(t *testing.T) {
 	ref := r.ch.AddFile("voice.ogg", []byte("OggS..."))
 	ref.Kind = channel.FileVoice
 	r.ch.PostUser(work, "", ref)
-	r.wait("voice answered", func() bool { return r.ag.calls(voiceLead+"\nhello from voice") == 1 })
+	r.wait("voice answered", func() bool {
+		return r.ag.calls(asrLead+"\nVoice/video clip: voice.ogg ("+asrAttrs+")\nhello from voice") == 1
+	})
 	if r.ag.calls("plain chatter") != 0 {
 		t.Fatal("owner chatter without @codex ran in a group chat")
 	}

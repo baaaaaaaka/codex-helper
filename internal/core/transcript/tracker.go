@@ -266,7 +266,7 @@ func (t *Tracker) apply(out []Output, ev Event, l Line) []Output {
 		tr.decided = true
 		out = t.flush(out)
 	case KindAgentMessage:
-		text := strings.TrimSpace(ev.Text)
+		text := strings.TrimSpace(StripMemCitations(ev.Text)) // F-MIR-8
 		if text == "" {
 			return out
 		}
@@ -335,8 +335,8 @@ func (t *Tracker) apply(out []Output, ev Event, l Line) []Output {
 		// last_agent_message is the final only for a turn whose start was
 		// read and that had no final_answer item: a scan that began
 		// mid-turn usually begins right after the delivered final.
-		if tr.started && !tr.finalSeen && !tr.teams && strings.TrimSpace(ev.Text) != "" {
-			out = append(out, Output{RecordID: turnRecordID(tr.id, OutputFinal, t.line), Kind: OutputFinal, Text: strings.TrimSpace(ev.Text), Time: ev.Time, TurnID: tr.id, End: l.End, line: t.line, start: l.Off})
+		if final := strings.TrimSpace(StripMemCitations(ev.Text)); tr.started && !tr.finalSeen && !tr.teams && final != "" {
+			out = append(out, Output{RecordID: turnRecordID(tr.id, OutputFinal, t.line), Kind: OutputFinal, Text: final, Time: ev.Time, TurnID: tr.id, End: l.End, line: t.line, start: l.Off})
 		}
 		t.turn, t.prev = nil, tr
 	case KindTurnAborted:
