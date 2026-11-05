@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 )
@@ -211,7 +210,7 @@ func Acquire(ctx context.Context, cfg Config) (*Holder, error) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
-		if _, err := os.Stat(p.disabled()); err == nil {
+		if KillSwitch(p.dir) {
 			if !cfg.Wait {
 				return nil, ErrDisabled
 			}

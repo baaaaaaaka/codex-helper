@@ -206,8 +206,6 @@ func (p paths) dbPath(name string) string {
 	return filepath.Join(p.dir, filepath.Base(name))
 }
 
-func (p paths) disabled() string { return filepath.Join(p.dir, DisabledFile) }
-
 // view is what one read of the lease file shows.
 type view struct {
 	top   int64            // highest non-empty slot (0: none)
@@ -401,4 +399,23 @@ func garbage(p paths, gen int64, now time.Time) {
 			_ = os.Remove(filepath.Join(p.dir, name))
 		}
 	}
+}
+
+// openDir opens a directory (a variable for tests).
+var openDir = func(dir string) (*os.File, error) { return os.Open(dir) }
+
+// KillSwitch reports whether the kill-switch file DISABLED exists in dir.
+//
+// A plain stat can miss a file another NFS client created for as long as
+// this client caches the directory's attributes (up to acdirmax, 60 s by
+// default, or actimeo): its negative lookup stays cached. Opening the
+// directory first revalidates its attributes (close-to-open), which drops
+// the stale negative entry, so a cross-host `touch DISABLED` is seen at
+// the next check (TAKEOVER-REPORT §9, drill 5).
+func KillSwitch(dir string) bool {
+	if d, err := openDir(dir); err == nil {
+		_ = d.Close()
+	}
+	_, err := os.Stat(filepath.Join(dir, DisabledFile))
+	return err == nil
 }

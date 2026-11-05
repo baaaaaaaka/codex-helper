@@ -4,12 +4,13 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	sqlite "modernc.org/sqlite"
+
+	"github.com/baaaaaaaka/codex-helper/internal/core/lease"
 )
 
 // Ident identifies the process that wants to own the store (§2).
@@ -229,10 +230,11 @@ func leaseAge(now, start time.Time) time.Duration {
 	return d
 }
 
-// Disabled reports whether the kill-switch file <dir>/DISABLED exists.
+// Disabled reports whether the kill-switch file <dir>/DISABLED exists. It
+// sees a file another host created on a shared home at once
+// (lease.KillSwitch).
 func (s *Store) Disabled() bool {
-	_, err := os.Stat(filepath.Join(filepath.Dir(s.path), DisabledFile))
-	return err == nil
+	return lease.KillSwitch(filepath.Dir(s.path))
 }
 
 // Release ends ownership so the next process can acquire immediately.
