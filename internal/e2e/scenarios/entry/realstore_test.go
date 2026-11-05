@@ -600,7 +600,10 @@ func newChats(s *harness.Scenario, seeded []string) []string {
 func readsPerMinute(s *harness.Scenario, from time.Time, d time.Duration) string {
 	n := make([]int, (d+time.Minute-1)/time.Minute)
 	for _, r := range s.Graph.Requests(fakegraph.RequestFilter{Method: "GET", Route: "GET /chats/{chat}/messages"}) {
-		if i := int(r.At.Sub(from) / time.Minute); i >= 0 && i < len(n) {
+		if r.At.Before(from) {
+			continue // integer division truncates toward zero: -59 s would count as minute 0
+		}
+		if i := int(r.At.Sub(from) / time.Minute); i < len(n) {
 			n[i]++
 		}
 	}
