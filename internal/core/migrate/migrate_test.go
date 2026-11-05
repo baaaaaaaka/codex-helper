@@ -640,3 +640,58 @@ func TestSummaryCountsOnlyThePreviousHelpersUnsentMessages(t *testing.T) {
 		})
 	}
 }
+
+// Owner ruling 2026-11-05 (Q7): a quarantined session is converted by the
+// cause of its quarantine. The previous helper's automatic self-echo
+// breaker is lifted (not paused, and what was posted in the chat before the
+// conversion is not answered); a quarantine the owner applied with
+// `cxp teams chat quarantine` closes the chat; any other cause keeps the
+// chat paused.
+func TestQuarantineByCause(t *testing.T) {
+	const chat = "19:chat-s003@thread.v2"
+	const restored = "Chat s003: the previous helper paused it automatically (self-echo protection); it is no longer paused"
+	for _, v := range []string{"v0120", "rc59"} {
+		for _, tc := range []struct {
+			name, source, conv, summary string
+			sharedThread, restored      bool
+		}{
+			{"breaker", "teams_self_echo_breaker", "active/", restored + ". Messages posted there before now are not answered.", false, true},
+			// s388 on the real store: s413 continues its Codex thread, so the
+			// shared-thread rule parks it (not paused; `r s388` wakes it).
+			{"breaker-shared-thread", "teams_self_echo_breaker", "parked/", restored + ", and parked because another chat continues its Codex session (wake it with `r s003`). Messages posted there before now are not answered.", true, true},
+			{"manual", "teams_chat_quarantine_cli", "closed/", "Chat s003: you quarantined it with the previous helper; it is closed.", false, false},
+			{"decoder", "store_decoder", "active/migrated-quarantine: fixture self-echo", "Chat s003: quarantined by the previous helper; it stays paused.", false, false},
+			{"no-source", "", "active/migrated-quarantine: fixture self-echo", "Chat s003: quarantined by the previous helper; it stays paused.", false, false},
+		} {
+			t.Run(v+"/"+tc.name, func(t *testing.T) {
+				dir := fixture(t, v, "json")
+				editJSON(t, dir, func(m map[string]any) {
+					s003 := m["sessions"].(map[string]any)["s003"].(map[string]any)
+					if tc.source != "" {
+						s003["quarantine_source"] = tc.source
+					}
+					if tc.sharedThread {
+						s003["codex_thread_id"] = "11111111-1111-4111-8111-000000000001" // s001's, newer
+					}
+				})
+				rep, db := dryRun(t, dir, nil)
+				if !rep.OK() {
+					t.Fatalf("checks: %+v", rep.Checks)
+				}
+				eq(t, "s003", qs(t, db, convQ, "s003"), tc.conv)
+				eq(t, "s003 paused", qi(t, db, `SELECT paused_at IS NOT NULL FROM conversations WHERE label = 's003'`) == 1, strings.HasPrefix(tc.conv, "active/migrated-quarantine"))
+				wantCursor := "2026-08-19T00:00:00Z"
+				if tc.restored {
+					wantCursor = cursor(testNow)
+				}
+				eq(t, "s003 cursor", qs(t, db, streamQ, StreamKey(chat)), wantCursor)
+				sum := qs(t, db, `SELECT value FROM meta WHERE key = ?`, store.MetaMigrationSummary)
+				if !strings.Contains(sum, "\n\n"+tc.summary) {
+					t.Errorf("summary lacks %q:\n%s", tc.summary, sum)
+				}
+				eq(t, "s001", qs(t, db, convQ, "s001"), "active/")
+				eq(t, "s005", qs(t, db, convQ, "s005"), "closed/")
+			})
+		}
+	}
+}

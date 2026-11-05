@@ -82,6 +82,7 @@ type legacySession struct {
 	PollFrontierInitialized lbool         `json:"poll_frontier_initialized"`
 	QuarantinedAt           ltime         `json:"quarantined_at"`
 	QuarantineReason        string        `json:"quarantine_reason"`
+	QuarantineSource        string        `json:"quarantine_source"`
 	CreatedAt               ltime         `json:"created_at"`
 	UpdatedAt               ltime         `json:"updated_at"`
 }

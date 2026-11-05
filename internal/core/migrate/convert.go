@@ -38,10 +38,35 @@ func cursor(t time.Time) string {
 }
 
 type sessInfo struct {
-	s      legacySession
-	conv   int64
-	state  string
-	paused bool
+	s        legacySession
+	conv     int64
+	state    string
+	paused   bool
+	restored bool // automatic quarantine lifted (quarantineRuling)
+}
+
+// Quarantine sources of the previous helper (store.SessionQuarantineRequest).
+const (
+	quarantineBreaker = "teams_self_echo_breaker"   // automatic self-echo containment
+	quarantineManual  = "teams_chat_quarantine_cli" // the owner's `cxp teams chat quarantine`
+)
+
+// quarantineRuling maps a quarantined session to its new state by the
+// cause of the quarantine (owner ruling 2026-11-05, Q7). The previous
+// helper's automatic self-echo breaker guarded against a loop of its own
+// that the new core does not have (it recognises its own posts by marker
+// and hash and has its own breaker): the chat is active again. A chat the
+// owner quarantined by hand was taken out of service on purpose: closed.
+// Any other cause (a store decoder failure, an unknown or missing source)
+// keeps the chat active but paused, as before.
+func quarantineRuling(s legacySession) (state string, paused bool, outcome string) {
+	switch s.QuarantineSource {
+	case quarantineBreaker:
+		return store.ConvActive, false, "quarantined (self-echo breaker) -> active"
+	case quarantineManual:
+		return store.ConvClosed, false, "quarantined (owner) -> closed"
+	}
+	return store.ConvActive, true, "quarantined -> active+paused"
 }
 
 type compactTurn struct {
@@ -78,6 +103,7 @@ type converter struct {
 	lastAct      map[int64]int64         // newest activity per conversation (unix ms)
 	unknownSrc   int                     // source rows with an unknown send outcome
 	staleUnsent  int                     // unsent source rows dropped as stale
+	quarantine   map[string][]string     // quarantineRuling outcome -> session labels (summary)
 	anchors      map[string]legacyAnchor // by source path
 	threadLinks  map[string]threadLink
 	proofs       map[string]*proof // delivery-ledger proof per rollout path
@@ -276,7 +302,7 @@ func (c *converter) convertSessions() error {
 			e.Outcomes["control fallback -> control conversation"]++
 			continue
 		}
-		state, paused := store.ConvActive, false
+		state, paused, restored, outcome := store.ConvActive, false, false, ""
 		switch s.Status {
 		case "active":
 		case "archived":
@@ -284,7 +310,15 @@ func (c *converter) convertSessions() error {
 		case "closed":
 			state = store.ConvClosed
 		case "quarantined":
-			paused = true
+			state, paused, outcome = quarantineRuling(s)
+			if c.quarantine == nil {
+				c.quarantine = map[string][]string{}
+			}
+			c.quarantine[outcome] = append(c.quarantine[outcome], s.ID)
+			restored = s.QuarantineSource == quarantineBreaker
+			if !paused {
+				c.rep.note("session %s: %s (quarantine source %s, reason %q)", s.ID, outcome, s.QuarantineSource, s.QuarantineReason)
+			}
 		case "staging", "awaiting_history":
 			state = store.ConvHold
 		default:
@@ -333,7 +367,7 @@ func (c *converter) convertSessions() error {
 		if err != nil {
 			return err
 		}
-		c.sessions[s.ID] = &sessInfo{s: s, conv: id, state: state, paused: paused}
+		c.sessions[s.ID] = &sessInfo{s: s, conv: id, state: state, paused: paused, restored: restored}
 		c.labelOf[id] = s.ID
 		if chat != "" {
 			c.convByChat[chat] = id
@@ -360,8 +394,8 @@ func (c *converter) convertSessions() error {
 		}
 		e.Imported++
 		switch {
-		case paused:
-			e.Outcomes["quarantined -> active+paused"]++
+		case outcome != "":
+			e.Outcomes[outcome]++
 		default:
 			e.Outcomes[s.Status+" -> "+state]++
 		}
@@ -774,6 +808,12 @@ func (c *converter) convertStreams() error {
 			cur, src = p.LastModifiedCursor.Time, "last_modified_cursor"
 		}
 		seeded := bool(p.Seeded) && !cur.IsZero()
+		if si := c.sessionOfConv(conv); si != nil && si.restored {
+			// The previous helper ignored this chat while it was quarantined
+			// (its loop may have kept posting there): what was posted before
+			// the conversion is not answered; new messages are.
+			cur, src, seeded = c.now, "restored quarantine: from the conversion on", true
+		}
 		if !seeded {
 			if oldest, has := c.oldestIn[conv]; has {
 				cur, src, seeded = time.UnixMilli(oldest-1000), "unseeded: oldest inbound - 1s", true
@@ -797,11 +837,14 @@ func (c *converter) convertStreams() error {
 			continue
 		}
 		oldest, has := c.oldestIn[si.conv]
-		if !has && !bool(si.s.PollFrontierInitialized) {
+		if !has && !bool(si.s.PollFrontierInitialized) && !si.restored {
 			continue
 		}
 		var cur string
-		if has {
+		outcome := "no poll row: oldest inbound - 1s"
+		if si.restored {
+			cur, outcome = cursor(c.now), "no poll row: restored quarantine, from the conversion on"
+		} else if has {
 			cur = cursor(time.UnixMilli(oldest - 1000))
 		} else {
 			c.rep.note("session %s: frontier initialised but no poll row and no inbound rows; stream left unseeded", label)
@@ -812,7 +855,7 @@ func (c *converter) convertStreams() error {
 		}
 		done[si.conv] = true
 		e.Imported++
-		e.Outcomes["no poll row: oldest inbound - 1s"]++
+		e.Outcomes[outcome]++
 	}
 	return nil
 }

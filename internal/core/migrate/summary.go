@@ -109,6 +109,7 @@ func (c *converter) summary() string {
 			fmt.Fprintf(&b, "\n\n%d requests were running when the previous helper stopped: each chat gets one notice; they are not re-run.", interrupted)
 		}
 	}
+	c.quarantineSummary(&b)
 	if unsent > 0 {
 		if unsent == 1 {
 			b.WriteString("\n\n1 message that was not sent yet is sent now.")
@@ -131,4 +132,36 @@ func (c *converter) summary() string {
 	}
 	b.WriteString("\n\nThe previous data is kept unchanged as a backup. The full report is " + ReportName + " next to the helper's store (`cxp teams status` shows where).")
 	return b.String()
+}
+
+// quarantineSummary says what became of each quarantined chat
+// (quarantineRuling), by its title and final state.
+func (c *converter) quarantineSummary(b *strings.Builder) {
+	name := func(label string) string {
+		if si := c.sessions[label]; si != nil {
+			return chatName(firstNonEmpty(si.s.UserTitle, si.s.TeamsTopic), label)
+		}
+		return chatName("", label)
+	}
+	for _, label := range c.quarantine["quarantined (self-echo breaker) -> active"] {
+		fmt.Fprintf(b, "\n\n%s: the previous helper paused it automatically (self-echo protection); it is no longer paused", name(label))
+		if n, err := c.im.QueryInt(`SELECT count(*) FROM conversations WHERE label = ? AND state = 'parked'`, label); err == nil && n > 0 {
+			fmt.Fprintf(b, ", and parked because another chat continues its Codex session (wake it with `r %s`)", label)
+		}
+		b.WriteString(". Messages posted there before now are not answered.")
+	}
+	for _, label := range c.quarantine["quarantined (owner) -> closed"] {
+		fmt.Fprintf(b, "\n\n%s: you quarantined it with the previous helper; it is closed.", name(label))
+	}
+	for _, label := range c.quarantine["quarantined -> active+paused"] {
+		fmt.Fprintf(b, "\n\n%s: quarantined by the previous helper; it stays paused.", name(label))
+	}
+}
+
+// chatName names a chat in the summary: its label and title.
+func chatName(title, label string) string {
+	if title == "" {
+		return "Chat " + label
+	}
+	return "Chat " + label + " (\u201c" + title + "\u201d)"
 }

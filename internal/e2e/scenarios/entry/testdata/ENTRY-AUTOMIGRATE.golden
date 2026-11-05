@@ -29,6 +29,7 @@
    | <p>Teams helper data converted from v0.1.22-rc.59</p>
    | <p>Work chats: 8 (5 active, 1 parked, 2 closed). Past requests: 6.</p>
    | <p>1 request was running when the previous helper stopped: its chat gets one notice; it is not re-run.</p>
+   | <p>Chat s003: quarantined by the previous helper; it stays paused.</p>
    | <p>4 older messages (from more than a day ago) that the previous helper had not sent or could not confirm are not sent now.</p>
    | <p>Local Codex sessions are caught up from now on.</p>
    | <p>The previous data is kept unchanged as a backup. The full report is migration-report.txt next to the helper&#39;s store (<code>cxp teams status</code> shows where).</p>
