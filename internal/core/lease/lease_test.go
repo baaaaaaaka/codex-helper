@@ -448,7 +448,8 @@ func TestKillSwitch(t *testing.T) {
 	if _, err := os.Stat(Path(e.anchor)); !os.IsNotExist(err) {
 		t.Fatal("the kill switch must not create the lease file")
 	}
-	// An owner loses the lease at its next renewal.
+	// An owner keeps the lease (no one else may claim) until it releases:
+	// it stops through the store's heartbeat.
 	os.Remove(filepath.Join(e.dir, DisabledFile))
 	h, err := e.acquire(e.cfg(ident("a", 1), false))
 	if err != nil {
@@ -456,8 +457,11 @@ func TestKillSwitch(t *testing.T) {
 	}
 	h.Activate()
 	os.WriteFile(filepath.Join(e.dir, DisabledFile), nil, 0o600)
-	if err := h.Verify(); !errors.Is(err, ErrDisabled) {
+	if err := h.Verify(); err != nil {
 		t.Fatalf("owner: %v", err)
+	}
+	if err := h.renew(true); err != nil {
+		t.Fatalf("renew: %v", err)
 	}
 	h.Release()
 	if in, _ := Read(e.anchor); in.Head.State != Released || !in.Disabled {

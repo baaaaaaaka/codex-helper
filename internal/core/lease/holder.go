@@ -3,7 +3,6 @@ package lease
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -26,7 +25,7 @@ type Holder struct {
 	rec     Record
 	raw     []byte    // the bytes last written to our slot
 	renewed time.Time // start of the last successful renewal or check
-	err     error     // ErrFenced or ErrDisabled once lost
+	err     error     // ErrFenced or ErrReleased once lost
 	done    bool      // released
 
 	lost     chan struct{}
@@ -74,7 +73,7 @@ func (h *Holder) Gen() int64 { return h.plan.Gen }
 func (h *Holder) Plan() Plan { return h.plan }
 
 // Lost is closed when the lease is lost: a later generation claimed it
-// (Err is ErrFenced) or the kill-switch file appeared (ErrDisabled).
+// (Err is ErrFenced) or it was released (ErrReleased).
 func (h *Holder) Lost() <-chan struct{} { return h.lost }
 
 // Err is why the lease was lost (nil while held).
@@ -96,8 +95,13 @@ func (h *Holder) lose(err error) error {
 }
 
 // renew reads our slot and those above it and, with write, rewrites ours
-// with the beat counter bumped. A later generation or the kill switch
-// loses the lease for good; an I/O error leaves the lease to run out.
+// with the beat counter bumped. A later generation loses the lease for
+// good; an I/O error leaves the lease to run out.
+//
+// The kill switch does not end the lease: no other host claims while it
+// exists, and the owner stops through the store's heartbeat, which checks
+// it, finishing its own bookkeeping (requeues, outbox states) with the
+// lease still valid before it releases.
 func (h *Holder) renew(write bool) error {
 	h.io.Lock()
 	defer h.io.Unlock()
@@ -117,9 +121,6 @@ func (h *Holder) renew(write bool) error {
 	}
 	if !bytes.Equal(own, raw) {
 		return h.lose(fmt.Errorf("%w (slot %d was rewritten)", ErrFenced, h.plan.Gen))
-	}
-	if _, err := os.Stat(h.p.disabled()); err == nil {
-		return h.lose(ErrDisabled)
 	}
 	if write {
 		h.mu.Lock()
@@ -270,7 +271,7 @@ func (h *Holder) Release() error {
 	h.halt()
 	h.io.Lock()
 	defer h.io.Unlock()
-	if h.Err() != nil && !errors.Is(h.Err(), ErrDisabled) {
+	if h.Err() != nil {
 		return nil
 	}
 	own, later, err := readOwn(h.p.records, h.plan.Gen)

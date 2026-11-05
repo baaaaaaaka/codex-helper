@@ -202,8 +202,6 @@ func teamsWithLeasedStore(ctx context.Context, anchor string, fn func(*corestore
 // lease.
 func teamsLeaseLostError(err error, anchor string) error {
 	switch {
-	case errors.Is(err, lease.ErrDisabled):
-		return fmt.Errorf("the Teams helper is disabled (%s exists next to %s); stopped", lease.DisabledFile, anchor)
 	case errors.Is(err, lease.ErrFenced):
 		return fmt.Errorf("Teams helper fenced: another helper took over the Teams state (%v); stopped", err)
 	}
