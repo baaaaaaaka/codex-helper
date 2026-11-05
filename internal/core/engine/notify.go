@@ -54,6 +54,16 @@ func (n pendingNotify) waitPrefix() string {
 	return n.Key
 }
 
+// undelivered reports whether a post n announces was dropped unconfirmed:
+// a part of a turn's answer (its text or files), or any post of a keyed
+// notification.
+func (n pendingNotify) undelivered(tx *store.Tx) (bool, error) {
+	if n.Turn != 0 {
+		return tx.DroppedUnder(n.waitPrefix(), store.OutFinal)
+	}
+	return tx.DroppedUnder(n.waitPrefix())
+}
+
 func readNotify(tx *store.Tx) ([]pendingNotify, error) {
 	v, ok, err := tx.Meta(metaNotify)
 	if err != nil || !ok || v == "" {
@@ -157,8 +167,8 @@ func (e *Engine) pumpNotify(ctx context.Context) time.Time {
 		if err != nil {
 			return err
 		}
-		pending = len(list)
 		card := e.cfg.Notifier != nil && e.cfg.Notifier.Available()
+		keep := list[:0]
 		for _, n := range list {
 			rows, err := tx.PendingOutbox(n.Conv)
 			if err != nil {
@@ -172,6 +182,19 @@ func (e *Engine) pumpNotify(ctx context.Context) time.Time {
 					break
 				}
 			}
+			if !waiting {
+				// An answer that was never confirmed delivered is not
+				// announced: the chat carries the "could not be
+				// confirmed" notice instead (R-5b).
+				gone, err := n.undelivered(tx)
+				if err != nil {
+					return err
+				}
+				if gone {
+					continue
+				}
+			}
+			keep = append(keep, n)
 			switch {
 			case waiting:
 			case card && !n.Attempted:
@@ -179,6 +202,10 @@ func (e *Engine) pumpNotify(ctx context.Context) time.Time {
 			default:
 				mentions = append(mentions, n)
 			}
+		}
+		pending = len(keep)
+		if len(keep) < len(list) {
+			return writeNotify(tx, keep)
 		}
 		return nil
 	})

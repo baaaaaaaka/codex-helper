@@ -690,8 +690,17 @@ func TestAbsentResentFinalIsDroppedWithOneNotice(t *testing.T) {
 	attempts := absentSends(r, "ANSWER to twice", 2)
 	r.ch.PostUser(work, "twice")
 	r.wait("notice", func() bool { return len(r.own(work, "even after sending it a second time")) == 1 })
+	// R-5b: the owner is not told an answer arrived that is not visible.
+	r.wait("owner notification settled", func() bool {
+		v, _, err := r.st.Meta(metaNotify)
+		return err == nil && v == ""
+	})
+	if n := len(r.own(r.control(), "Codex finished in")); n != 0 {
+		t.Fatalf("%d owner notifications for an answer that was never confirmed delivered", n)
+	}
 	r.ch.PostUser(work, "later")
 	r.wait("next answer", func() bool { return len(r.own(work, "ANSWER to later")) == 1 })
+	r.wait("owner notified of the next answer", func() bool { return len(r.own(r.control(), "Codex finished in")) == 1 })
 	if n := len(attempts()); n != 2 {
 		t.Fatalf("%d send attempts, want 2 (one resend only)", n)
 	}

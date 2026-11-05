@@ -30,10 +30,6 @@
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p>Codex finished in s002 · r05b-twice. Open: <a href="https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a>.</p>
    mention 0: owner "E2E Owner"
--- <msg:8> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
-   | <p>Codex finished in s002 · r05b-twice. Open: <a href="https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a>.</p>
-   mention 0: owner "E2E Owner"
 
 == chat <chat:2> "s001 · r05b-once"
    type: meeting; members: owner

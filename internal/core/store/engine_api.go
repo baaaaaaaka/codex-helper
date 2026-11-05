@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"fmt"
+	"strings"
 )
 
 // Additive read and write helpers used by the engine (ENGINE-REPORT,
@@ -33,6 +34,23 @@ func (t *Tx) Delivered(prefix string) (bool, error) {
 	var hit int
 	err := t.row(`SELECT EXISTS(SELECT 1 FROM outbox WHERE delivery_key >= ? AND delivery_key < ?)`,
 		prefix, prefix+"\U0010FFFF").Scan(&hit)
+	return hit != 0, err
+}
+
+// DroppedUnder reports whether an outbox row whose delivery key starts with
+// prefix was dropped (never confirmed delivered). kinds, when given, limits
+// the rows considered to those kinds.
+func (t *Tx) DroppedUnder(prefix string, kinds ...string) (bool, error) {
+	q := `SELECT EXISTS(SELECT 1 FROM outbox WHERE delivery_key >= ? AND delivery_key < ? AND state = 'dropped'`
+	args := []any{prefix, prefix + "\U0010FFFF"}
+	if len(kinds) > 0 {
+		q += ` AND kind IN (?` + strings.Repeat(`,?`, len(kinds)-1) + `)`
+		for _, k := range kinds {
+			args = append(args, k)
+		}
+	}
+	var hit int
+	err := t.row(q+`)`, args...).Scan(&hit)
 	return hit != 0, err
 }
 

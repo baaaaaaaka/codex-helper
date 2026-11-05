@@ -21,7 +21,8 @@ import (
 // read-back of the chat between them and no "not confirmed" notice.
 //
 // Part 2: the resend is lost the same way. Expected: no third POST, one
-// visible notice, and the chat keeps working.
+// visible notice, no owner notification for the lost answer, and the chat
+// keeps working.
 func TestR05b_AbsentFinalResentOnce(t *testing.T) {
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "R-5b", harness.Options{
@@ -114,6 +115,9 @@ func TestR05b_AbsentFinalResentOnce(t *testing.T) {
 	s.Check("R-5b a resend that is absent again is not sent a third time", len(posts2) == 2, "2 POST attempts", fmt.Sprintf("%d POST attempts", len(posts2)), ev2...)
 	n2 := len(s.SUTMessagesContaining(work2.ID, "could not be confirmed"))
 	s.Check("R-1 exactly one visible notice for the lost answer", n2 == 1, "1 notice", fmt.Sprintf("%d notices", n2), transcript2...)
+	finished := len(s.SUTMessagesContaining(control.ID, "Codex finished in s002"))
+	s.Check("R-5b the owner is notified of the visible answer only", finished == 1, "1 notification (the next answer)",
+		fmt.Sprintf("%d notifications", finished), s.Transcript(control.ID, 4)...)
 	var visible []string
 	for _, m := range s.SUTMessages(work2.ID) {
 		visible = append(visible, m.PlainText())
