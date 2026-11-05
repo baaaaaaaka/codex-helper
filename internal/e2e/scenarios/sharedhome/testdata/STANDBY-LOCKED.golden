@@ -1,4 +1,4 @@
-# STANDBY-LOCKED: shared home: a standby facing an owner frozen inside a store write reports it once and waits in-process without Graph traffic, takes over once the write lock is gone, and the old owner posts nothing
+# STANDBY-LOCKED: shared home: an owner frozen inside a store write does not block the takeover: the standby copies the store without its lock, keeps every session, answers once, and the old owner makes no Graph write
 # cxp black-box transcript; volatile values are numbered placeholders
 
 == chat <chat:1> "Codex Control - e2ehost"
@@ -19,6 +19,9 @@
    | <p>Codex finished in s001 · locked. Open: <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a>.</p>
    mention 0: owner "E2E Owner"
 -- <msg:5> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>🔁 The helper now runs on host-b: it took over from host-a, whose helper stopped answering.</p>
+-- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p>Codex finished in s001 · locked. Open: <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a>.</p>
    mention 0: owner "E2E Owner"
