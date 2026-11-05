@@ -312,9 +312,10 @@ type Engine struct {
 	// Prepare stopped the previous app-servers.
 	orphans map[int64]bool
 	stats   engineStats
-	// Teams edits (edits.go, annotations.go): queued chat edits per
-	// conversation.
-	edits map[int64][]*chatEdit
+	// Teams edits (edits.go, annotations.go, rename.go): queued chat
+	// edits per conversation, the machine label and the unread marks.
+	edits  map[int64][]*chatEdit
+	titles titleState
 }
 
 type engineStats struct {

@@ -250,6 +250,8 @@ func (e *Engine) controlCommand(ctx context.Context, j cmdJob, text string) {
 		e.cmdWake(j, arg)
 	case "park":
 		e.cmdParkLabel(j, arg)
+	case "rename": // F-CTL-8 (rename.go)
+		e.cmdRename(ctx, j, nil, arg)
 	case "restart", "reboot": // `reboot`: v0.1.20 alias
 		e.cmdRestart(j, strings.ToLower(arg))
 	case "update", "upgrade":
@@ -299,6 +301,8 @@ func (e *Engine) workCommand(ctx context.Context, j cmdJob, cs *convState, field
 		e.cmdUnpause(j, cs)
 	case "park":
 		e.cmdPark(j, cs)
+	case "rename": // F-WRK-2, F-CTL-8 (rename.go)
+		e.cmdRename(ctx, j, cs, strings.Join(fields[1:], " "))
 	case "status":
 		e.reply(j, e.workStatus(cs), nil)
 	case "restart":
@@ -703,7 +707,7 @@ func (e *Engine) listText() string {
 func (e *Engine) statusText() string {
 	s := e.Snapshot()
 	text := fmt.Sprintf("Helper %s on %s: up %s; %d sessions (%d active, %d parked, %d running); %d requests run, %d answered.",
-		e.cfg.Version, e.cfg.Machine, s.Uptime.Round(time.Second), s.Conversations, s.Active, s.Parked, s.Running, s.Turns, s.Completed)
+		e.cfg.Version, e.machineLabel(), s.Uptime.Round(time.Second), s.Conversations, s.Active, s.Parked, s.Running, s.Turns, s.Completed)
 	if e.draining() {
 		text += " New requests wait for an update (it waits for running requests to finish)."
 	} else if v, ok, err := e.st.Meta(metaUpdateRequest); err == nil && ok && v != "" {

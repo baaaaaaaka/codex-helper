@@ -438,6 +438,7 @@ func (e *Engine) send(ctx context.Context, r store.Outbox, chat, token string, f
 	switch {
 	case err == nil:
 		e.rememberOwnPost(r.ConvID, sent.ID)
+		e.noteFinalSent(r.ConvID, r.Kind, sent.Time) // F-TRN-1 (rename.go)
 		if err := e.update(func(tx *store.Tx) error { return tx.MarkSent(r.ID, sent.ID) }); err != nil && !errors.Is(err, store.ErrState) {
 			e.logf("mark sent %d: %v", r.ID, err)
 		}

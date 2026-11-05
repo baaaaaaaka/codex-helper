@@ -94,13 +94,6 @@ func (e *Engine) inboxTitle() string {
 	return "CXP Machine Inbox " + e.cfg.Machine
 }
 
-func (e *Engine) controlTitle() string {
-	if e.cfg.Machine == "" {
-		return "Codex Control"
-	}
-	return "Codex Control - " + e.cfg.Machine
-}
-
 // resumeCreating asks the sender to create the chats of conversations
 // still in creating state (control first); maintenance calls it again for
 // failures. Every chat creation is a Graph write: the sender makes it under
@@ -286,10 +279,10 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 }
 
 func (e *Engine) machine() string {
-	if e.cfg.Machine == "" {
-		return "this machine"
+	if m := e.machineLabel(); m != "" { // rename.go (F-CTL-8)
+		return m
 	}
-	return e.cfg.Machine
+	return "this machine"
 }
 
 // retryCreating is called by maintenance.
