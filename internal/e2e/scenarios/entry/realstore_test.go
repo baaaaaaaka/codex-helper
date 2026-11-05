@@ -164,6 +164,9 @@ func TestAcceptanceRealStoreFirstStart(t *testing.T) {
 	s.Note("CPU from the start until the catch-up drained (%s, %d samples): mean %.3f%%, p99 %.1f%%, max %.1f%% of a core per second (second %d); total %.2fs CPU",
 		drained.Round(time.Second), len(active.perSec), asum.mean, asum.p99, asum.max, asum.maxAt, asum.totalSec)
 	s.Note("catch-up after the conversion: %s", catchUpTimes(s, control, converted))
+	gap, gapAt := maxReadGap(s, control, time.Now())
+	s.Note("longest gap between control-chat reads from its first read until the catch-up drained: %s (ending %s after the first read)", gap.Round(10*time.Millisecond), gapAt)
+	s.Check("the control chat is read every 5 s during the catch-up (N-3)", gap <= controlPoll+readSlack, "<= "+(controlPoll+readSlack).String(), gap.Round(10*time.Millisecond).String())
 	s.Check("the catch-up drains within 30 min", drained < 30*time.Minute, "< 30m", drained.Round(time.Second).String())
 
 	samples := sampleCPU(pid, measure, nil)
@@ -172,6 +175,7 @@ func TestAcceptanceRealStoreFirstStart(t *testing.T) {
 	sum := summarizeCPU(samples)
 	s.Note("CPU over %s idle after the catch-up (%d samples, live session appended %d large records): mean %.3f%%, p99 %.1f%%, max %.1f%% of a core per second; total %.2fs CPU",
 		measure, len(samples.perSec), appended, sum.mean, sum.p99, sum.max, sum.totalSec)
+	s.Note("idle CPU mean per minute (%%): %s", perMinute(samples.perSec))
 	s.Check("idle CPU mean is negligible", sum.mean <= 0.2 || len(samples.perSec) == 0, "<= 0.2% of a core", fmt.Sprintf("%.3f%%", sum.mean))
 	s.Check("no idle 1 s window above 10% of a core", sum.max <= 10, "<= 10%", fmt.Sprintf("max %.1f%% at second %d", sum.max, sum.maxAt))
 	for _, w := range []time.Duration{time.Minute, time.Second} {
@@ -587,4 +591,19 @@ func newChats(s *harness.Scenario, seeded []string) []string {
 		}
 	}
 	return out
+}
+
+// perMinute renders the mean of each full or partial minute of per-second
+// samples.
+func perMinute(perSec []float64) string {
+	var out []string
+	for i := 0; i < len(perSec); i += 60 {
+		j := min(i+60, len(perSec))
+		var sum float64
+		for _, v := range perSec[i:j] {
+			sum += v
+		}
+		out = append(out, fmt.Sprintf("%.3f", sum/float64(j-i)))
+	}
+	return strings.Join(out, ", ")
 }
