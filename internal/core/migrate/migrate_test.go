@@ -738,3 +738,135 @@ func TestUnknownAnswerListedForHistoryCheck(t *testing.T) {
 		}
 	}
 }
+
+// scopedFixture copies testdata/<version>/<form> into <tmp>/teams/scopes/<id>,
+// where rc.59 keeps a scope's store.
+func scopedFixture(t *testing.T, version, form string) string {
+	t.Helper()
+	src := fixture(t, version, form)
+	dst := filepath.Join(t.TempDir(), "teams", "scopes", "scope_fixture0001")
+	if err := os.MkdirAll(filepath.Dir(dst), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(src, dst); err != nil {
+		t.Fatal(err)
+	}
+	return dst
+}
+
+// rc59RefusesGuard applies rc.59's readRuntimeStoreMigrationCleanup
+// (scope_runtime.go) to the guard: a regular file under 4 KiB with valid
+// JSON whose source_path is not a scopes/*/state.json makes rc.59 refuse to
+// start on the store.
+func rc59RefusesGuard(t *testing.T, dir string) string {
+	t.Helper()
+	path := filepath.Join(dir, OldHelperGuardName)
+	fi, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("guard: %v", err)
+	}
+	if !fi.Mode().IsRegular() || fi.Size() > 4096 {
+		t.Fatalf("guard is not a small regular file: %v %d", fi.Mode(), fi.Size())
+	}
+	raw, _ := os.ReadFile(path)
+	var m struct {
+		SourcePath string `json:"source_path"`
+	}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("guard is not JSON rc.59 can parse: %v", err)
+	}
+	sp := filepath.Clean(strings.TrimSpace(m.SourcePath))
+	if sp == "." || (filepath.Base(sp) == "state.json" && filepath.Base(filepath.Dir(filepath.Dir(sp))) == "scopes") {
+		t.Fatalf("rc.59 would accept source_path %q", m.SourcePath)
+	}
+	return m.SourcePath
+}
+
+// Converting an rc.59 scope leaves a file beside the old store that makes
+// rc.59 refuse to start there (another host sharing the home would serve
+// the old store next to the new helper), and leaves the old store's data
+// byte-identical. A dry run writes nothing, a live old writer still stops
+// the conversion (the guard stays: that writer is refused at its next
+// start), and a file rc.59 wrote itself is kept.
+func TestRealRunGuardsTheOldHelper(t *testing.T) {
+	t.Run("converted", func(t *testing.T) {
+		dir := scopedFixture(t, "rc59", "sqlite-wal")
+		names := []string{"state.json", "store.sqlite", "store.sqlite-wal"}
+		sum := func() map[string][32]byte {
+			out := map[string][32]byte{}
+			for _, n := range names {
+				b, err := os.ReadFile(filepath.Join(dir, n))
+				if err != nil {
+					t.Fatal(err)
+				}
+				out[n] = sha256.Sum256(b)
+			}
+			return out
+		}
+		before := sum()
+		if _, err := Run(Options{Source: dir, Now: func() time.Time { return testNow }}); err != nil {
+			t.Fatal(err)
+		}
+		if sp := rc59RefusesGuard(t, dir); !strings.Contains(sp, "delete this file") {
+			t.Errorf("the refusal does not say how to roll back: %q", sp)
+		}
+		after := sum()
+		for _, n := range names {
+			if after[n] != before[n] {
+				t.Errorf("%s changed", n)
+			}
+		}
+	})
+	t.Run("dry run", func(t *testing.T) {
+		dir := scopedFixture(t, "rc59", "sqlite-wal")
+		if _, err := Run(Options{Source: dir, Out: t.TempDir(), DryRun: true, StaleUnsent: -1, Now: func() time.Time { return testNow }}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(filepath.Join(dir, OldHelperGuardName)); !os.IsNotExist(err) {
+			t.Fatalf("dry run wrote the guard: %v", err)
+		}
+	})
+	t.Run("live old writer", func(t *testing.T) {
+		dir := scopedFixture(t, "rc59", "sqlite-wal")
+		db, err := sql.Open("sqlite", "file:"+filepath.Join(dir, "store.sqlite"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		lease := `{"scope_id":"scope:fixture0001","holder_machine_id":"machine:x","status":"active","generation":4,"lease_until":"` +
+			testNow.Add(time.Hour).Format(time.RFC3339) + `"}`
+		if _, err := db.Exec(`UPDATE runtime_state SET json = ? WHERE key = 'control_lease'`, lease); err != nil {
+			t.Fatal(err)
+		}
+		db.Close()
+		if _, err := Run(Options{Source: dir, Now: func() time.Time { return testNow }}); !errors.Is(err, ErrLiveWriter) {
+			t.Fatalf("got %v", err)
+		}
+		rc59RefusesGuard(t, dir)
+	})
+	t.Run("rc.59's own cleanup marker is kept", func(t *testing.T) {
+		dir := scopedFixture(t, "rc59", "sqlite-wal")
+		own := []byte(`{"source_path":"/x/scopes/a/state.json"}` + "\n")
+		if err := os.WriteFile(filepath.Join(dir, OldHelperGuardName), own, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		rep, err := Run(Options{Source: dir, Now: func() time.Time { return testNow }})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, _ := os.ReadFile(filepath.Join(dir, OldHelperGuardName)); string(got) != string(own) {
+			t.Fatalf("rc.59's marker was replaced: %s", got)
+		}
+		if !strings.Contains(strings.Join(rep.Notes, "\n"), OldHelperGuardName) {
+			t.Fatalf("no report note: %q", rep.Notes)
+		}
+	})
+	t.Run("not a scope directory", func(t *testing.T) {
+		dir := fixture(t, "v0120", "sqlite-wal")
+		if _, err := Run(Options{Source: dir, Now: func() time.Time { return testNow }}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(filepath.Join(dir, OldHelperGuardName)); !os.IsNotExist(err) {
+			t.Fatalf("guard outside a scopes dir: %v", err)
+		}
+	})
+}
