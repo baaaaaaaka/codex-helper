@@ -19,6 +19,10 @@ type PeerOptions struct {
 	Seam Seam
 	// Args are extra `cxp teams run` flags (e.g. --managed-service-child).
 	Args []string
+	// UserEnv are merged over the scenario's UserEnv: what differs on the
+	// other host (e.g. SLURM_JOB_ID on a batch-job node). Test switches are
+	// refused as for Options.UserEnv.
+	UserEnv map[string]string
 }
 
 // NewPeer builds a second SUT on this scenario's state (same HOME, Graph
@@ -27,7 +31,21 @@ type PeerOptions struct {
 // main SUT.
 func (s *Scenario) NewPeer(peer string, opts PeerOptions) SUT {
 	s.T.Helper()
-	p, err := s.Opts.Factory(s.sutConfig(peer, opts.Seam, opts.Args))
+	cfg := s.sutConfig(peer, opts.Seam, opts.Args)
+	if len(opts.UserEnv) > 0 {
+		env := map[string]string{}
+		for k, v := range s.Opts.UserEnv {
+			env[k] = v
+		}
+		for k, v := range opts.UserEnv {
+			if strings.HasPrefix(k, "E2E_") || strings.HasPrefix(k, "CXP_TEST") {
+				s.T.Fatalf("harness: peer UserEnv %s is a test switch; use PeerOptions.Seam", k)
+			}
+			env[k] = v
+		}
+		cfg.UserEnv = env
+	}
+	p, err := s.Opts.Factory(cfg)
 	if err != nil {
 		s.T.Fatalf("build peer SUT: %v", err)
 	}
