@@ -250,6 +250,7 @@ type Engine struct {
 	asrWake      chan struct{}
 	notifyWake   chan struct{}
 	scanWake     chan struct{} // a read throttle: the scan waits for the gate (receive.go)
+	historyWake  chan struct{} // a resume history check was decided (history_check.go)
 	notifyN      atomic.Int64  // pending owner notifications (notify.go)
 	// scanFirst: after an account read throttle the activity scan gets
 	// the first read when the gate opens (receive.go).
@@ -360,7 +361,7 @@ func New(cfg Config) (*Engine, error) {
 		convs: map[int64]*convState{}, intro: map[int64]string{}, forkThreads: map[string]bool{}, delegThreads: map[string]bool{}, byChat: map[string]int64{}, byThread: map[string]int64{},
 		runnerWake: make(chan struct{}, 1), runnerDirty: map[int64]bool{},
 		senderWake: make(chan struct{}, 1), readWake: make(chan struct{}, 1), resolverWake: make(chan struct{}, 1),
-		mirrorWake: make(chan struct{}, 1), cmdQueue: make(chan cmdJob, 256), cmdPending: map[int64][]cmdJob{}, reminded: map[int64]int{}, asrWake: make(chan struct{}, 1), notifyWake: make(chan struct{}, 1), scanWake: make(chan struct{}, 1), updateWake: make(chan struct{}, 1), registryWake: make(chan struct{}, 1), fileTries: map[string]int{}, uploadAt: map[int64]time.Time{},
+		mirrorWake: make(chan struct{}, 1), cmdQueue: make(chan cmdJob, 256), cmdPending: map[int64][]cmdJob{}, reminded: map[int64]int{}, asrWake: make(chan struct{}, 1), notifyWake: make(chan struct{}, 1), scanWake: make(chan struct{}, 1), historyWake: make(chan struct{}, 1), updateWake: make(chan struct{}, 1), registryWake: make(chan struct{}, 1), fileTries: map[string]int{}, uploadAt: map[int64]time.Time{},
 	}
 	if sc, ok := cfg.Channel.(channel.ActivityScanner); ok && cfg.ActivityScan && e.t.ScanInterval > 0 {
 		e.scanner = timedScanner{sc}
@@ -482,7 +483,7 @@ func (e *Engine) Run(ctx context.Context) error {
 		e.legacyCheckLoop,
 	}
 	if e.cfg.SessionsDir != "" {
-		loops = append(loops, e.mirrorLoop)
+		loops = append(loops, e.mirrorLoop, e.historyCheckLoop)
 	}
 	if e.scanner != nil {
 		loops = append(loops, e.scanLoop)

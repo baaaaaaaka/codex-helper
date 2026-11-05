@@ -220,6 +220,15 @@ func (c *converter) convertSources() error {
 			return err
 		}
 	}
+	if len(c.histChecks) > 0 {
+		b, err := json.Marshal(c.histChecks)
+		if err != nil {
+			return err
+		}
+		if err := c.im.SetMeta(store.MetaHistoryChecks, string(b)); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -414,6 +423,17 @@ func (c *converter) importSource(p *pathInfo) error {
 		c.reportResume(p, rs, size, false, 0)
 		if n := proven[0] + proven[1]; n > 0 {
 			b["linked tracking: records proven posted by the old helper's own echo -> delivered (not mirrored again)"] += n
+		}
+		if top := max(p.ckpt, p.cutoff, p.watch); rs.off < top && rs.gap[0]+rs.gap[1] > 0 {
+			// Records behind the old furthest position with no proof
+			// they were posted: the engine reads the chat's history
+			// before this rollout's catch-up posts anything, and
+			// resumes after the newest record it finds there
+			// (store.HistoryCheck). Without the check, s001 re-posted
+			// at least 267 records (live canary 2026-11-05).
+			c.histChecks = append(c.histChecks, store.HistoryCheck{Path: p.path, ConvID: conv,
+				From: rs.off, FromLine: rs.line, To: top, End: size})
+			b["linked tracking: records behind the old position without proof -> checked against the chat history at first start"]++
 		}
 	default:
 		why := "file missing"

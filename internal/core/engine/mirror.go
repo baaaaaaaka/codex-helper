@@ -103,6 +103,12 @@ type mirrorFile struct {
 	// rollout up (catchUpSet once known): see catchingUp.
 	catchUpEnd int64
 	catchUpSet bool
+	// held: the rollout's resume point is being checked against its
+	// chat's history (history_check.go); nothing is read until decided.
+	// proven: the end of the newest record the check found in the chat;
+	// records up to it are not posted.
+	held   bool
+	proven int64
 }
 
 // catchingUp is the one boundary between catch-up and live mirroring
@@ -202,6 +208,7 @@ func (e *Engine) mirrorInit() error {
 		}
 		m.files[s.Path] = f
 	}
+	e.mirrorHistory()
 	return nil
 }
 
@@ -235,6 +242,8 @@ func (e *Engine) mirrorLoop(ctx context.Context) {
 			e.discoverFirst(ctx)
 		case <-e.mirrorWake:
 			e.discover(ctx)
+		case <-e.historyWake:
+			e.mirrorHistory() // a resume history check was decided
 		case <-disc.C:
 			e.discover(ctx)
 			e.discoverOld(ctx)
@@ -754,7 +763,7 @@ func (e *Engine) mirrorPoll(ctx context.Context) {
 				f.catchUpEnd = info.Size
 			}
 		}
-		if sameFile(info, f.info) && f.tracker.Offset() >= info.Size {
+		if f.held || (sameFile(info, f.info) && f.tracker.Offset() >= info.Size) {
 			continue
 		}
 		if now.Before(f.retryAt) {
@@ -825,6 +834,7 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 		e.logf("mirror: %s was rewritten; realigning", filepath.Base(f.src.Path))
 		f.tracker.Restart()
 		realignAt = fromMS(f.src.MTime)
+		f.proven = 0 // offsets of the old file
 	}
 	realign := rewritten || f.realign
 	fh, err := os.Open(f.src.Path)
@@ -866,6 +876,9 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 	}
 	var rs []rendered
 	for _, o := range outs {
+		if o.End <= f.proven {
+			continue // found in the chat's history (history_check.go)
+		}
 		if o.Kind != transcript.OutputPrompt && o.Kind != transcript.OutputFinal && f.catchingUp(o) {
 			continue // catch-up posts prompts and finals only
 		}

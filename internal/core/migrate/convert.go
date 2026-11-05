@@ -106,6 +106,7 @@ type converter struct {
 	staleUnsent  int                 // unsent source rows dropped as stale
 	quarantine   map[string][]string // quarantineRuling outcome -> session labels (summary)
 	finalChecks  []store.LegacyFinalCheck
+	histChecks   []store.HistoryCheck    // rollouts whose resume point the engine checks against the chat history
 	checkAnswer  map[string]int64        // answer (legacy turn or row) -> created (unix ms), of finalChecks
 	anchors      map[string]legacyAnchor // by source path
 	threadLinks  map[string]threadLink

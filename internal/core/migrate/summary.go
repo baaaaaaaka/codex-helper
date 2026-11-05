@@ -152,6 +152,11 @@ func (c *converter) summary() string {
 	} else {
 		b.WriteString("\n\nLocal Codex sessions are caught up from now on.")
 	}
+	if n := len(c.histChecks); n == 1 {
+		b.WriteString("\n\n1 session's chat history is read first: what the chat already has is not posted again.")
+	} else if n > 1 {
+		fmt.Fprintf(&b, "\n\n%d sessions' chat histories are read first: what a chat already has is not posted again.", n)
+	}
 	b.WriteString("\n\nThe previous data is kept unchanged as a backup. The full report is " + ReportName + " next to the helper's store (`cxp teams status` shows where).")
 	return b.String()
 }
