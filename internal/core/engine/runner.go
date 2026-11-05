@@ -144,7 +144,7 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 	e.mu.Lock()
 	cs := e.convs[id]
 	ok := cs != nil && cs.kind == store.KindWork && cs.state == store.ConvActive && !cs.paused &&
-		cs.running == nil && !e.now().Before(cs.capWake) && !e.draining()
+		cs.running == nil && !e.now().Before(cs.capWake) && !e.draining() && !e.stopping.Load()
 	var (
 		lastEnd      time.Time
 		batchThrough int64
@@ -185,6 +185,9 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 		}
 		if id == e.inboxID {
 			req, request, got, err = e.startDelegation(tx, id, tr)
+			if got && continuesPrompt(tr, req.ThreadID) {
+				req.Text, req.Images = continueText, nil
+			}
 			return err
 		}
 		th, _, err := tx.Thread(id)
@@ -221,6 +224,9 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 			req.Effort = th.PendingEffort
 		}
 		req.Text, req.Images = codexInput(in.Body, files, e.outboundDir(tr.TurnKey)) // envelope.go (F-TRN-14)
+		if continuesPrompt(tr, th.ThreadID) {
+			req.Text, req.Images = continueText, nil
+		}
 		if err := tx.MarkStarting(tr.ID, th.ThreadID); err != nil {
 			return err
 		}
@@ -286,6 +292,20 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 		e.execTurn(ctx, cs, tr, req, rs)
 	}()
 	return true
+}
+
+// continueText is the prompt of a capacity retry whose request Codex
+// already recorded in the thread (owner ruling 2026-11-05).
+const continueText = "continue"
+
+// continuesPrompt reports whether a turn is a capacity retry of an attempt
+// Codex accepted in threadID: its prompt is already part of that thread,
+// so the retry sends continueText instead of the prompt again. A retry of
+// an attempt Codex never started (or one in another thread) resends the
+// prompt. The retry keeps the turn's client id, so it is the helper's turn,
+// not a prompt typed in Codex, and is never mirrored.
+func continuesPrompt(tr store.Turn, threadID string) bool {
+	return tr.RetryDeadline != 0 && tr.CodexTurnID != "" && threadID != "" && tr.ThreadID == threadID
 }
 
 // voiceFailure is the reply to a prompt that is only a voice message that
@@ -672,12 +692,24 @@ func (e *Engine) capacityRetry(cs *convState, tr store.Turn, out TurnOutcome) bo
 		back = rest
 	}
 	first := tr.RetryDeadline == 0
+	// Codex recorded the prompt when it accepted the attempt (even one
+	// that made no progress): the retry continues that thread with
+	// `continue` rather than sending the prompt again (tryStart).
+	var landedThread, landedTurn string
+	if !out.NotStarted {
+		landedTurn = out.CodexTurnID
+		if cs.id == e.inboxID {
+			landedThread = e.delegThread(tr.ID)
+		} else {
+			landedThread = e.threadOf(cs.id)
+		}
+	}
 	err := e.update(func(tx *store.Tx) error {
 		requeue := tx.RequeueTurn
 		if renew {
 			requeue = tx.RequeueTurnNewWindow
 		}
-		if err := requeue(tr.ID, ms(deadline)); err != nil {
+		if err := requeue(tr.ID, ms(deadline), landedThread, landedTurn); err != nil {
 			return err
 		}
 		if first && cs.id != e.inboxID { // the inbox carries protocol records only

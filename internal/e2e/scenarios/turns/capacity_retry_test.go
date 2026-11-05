@@ -2,6 +2,7 @@ package turns
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -14,9 +15,10 @@ import (
 // Owner decision: a model-capacity failure is retried automatically and the
 // turn is answered within 5 minutes of the FIRST capacity error; the user
 // gets the answer once and no failure message. Here Codex fails the turn
-// twice with the capacity error and then succeeds. A retry may resend the
-// prompt or send a continuation on the same thread, so every call on that
-// thread after the first failure counts as a retry.
+// twice with the capacity error and then succeeds. Codex recorded the
+// prompt with the first attempt, so both retries send `continue` on the
+// same thread (owner ruling 2026-11-05); every call on that thread after
+// the first failure counts as a retry.
 func TestCapacityRetryWithinFiveMinutes(t *testing.T) {
 	harness.Parallel(t)
 	const window = 5 * time.Minute
@@ -82,6 +84,40 @@ func TestCapacityRetryWithinFiveMinutes(t *testing.T) {
 		}
 	}
 	s.Check("capacity: no failure message once the retry succeeded", len(failures) == 0, "0 failure messages", fmt.Sprintf("%q", failures))
+	checkRetriesContinue(s, work.ID, calls, tok, 1)
+}
+
+// mirroredContinue matches a mirrored Codex prompt ("🧑‍💻 User: …") that is
+// the `continue` retry.
+var mirroredContinue = regexp.MustCompile(`(?is)\bUser\b\W*continue\b`)
+
+// checkRetriesContinue checks the owner ruling of 2026-11-05: the prompt
+// reaches Codex only until Codex records it (the first sent calls carry
+// it), every later retry sends the literal `continue` on the same thread
+// with the turn's own client id, and that continuation is never mirrored
+// to Teams as a prompt typed in Codex.
+func checkRetriesContinue(s *harness.Scenario, chatID string, calls []harness.CodexCall, tok string, sent int) {
+	var got []string
+	ok := len(calls) > sent
+	for i, c := range calls {
+		got = append(got, fmt.Sprintf("#%d %s %.40q", i+1, c.Outcome, c.Prompt))
+		switch {
+		case i < sent:
+			ok = ok && c.HasToken(tok)
+		default:
+			ok = ok && c.Prompt == "continue" && c.ThreadID == calls[sent-1].ThreadID
+		}
+		ok = ok && c.ClientID == calls[0].ClientID && c.ClientID != ""
+	}
+	s.Check("capacity: once Codex recorded the prompt, every retry sends `continue` in the same thread, with the same client id", ok,
+		fmt.Sprintf("the prompt %d time(s), then only `continue`", sent), strings.Join(got, " | "))
+	var mirrored []string
+	for _, m := range s.SUTMessages(chatID) {
+		if mirroredContinue.MatchString(m.PlainText()) {
+			mirrored = append(mirrored, harness.NormalizeSpace(m.PlainText()))
+		}
+	}
+	s.Check("capacity: the `continue` retry is not mirrored to Teams", len(mirrored) == 0, "no message shows it", fmt.Sprintf("%q", mirrored))
 }
 
 // attempts returns the work calls that carried tok or ran on its thread.

@@ -18,9 +18,12 @@ import (
 //
 //	A: the user types a prompt while A is parked, then sends `r <id>` in the
 //	   control chat     -> no turn before the wake, exactly one after it
-//	B: the session is continued in the local TUI (rollout append)
-//	                    -> mirrored into B and B is active again: a new
-//	                       prompt there is answered without `r`
+//	B: the user types a prompt while B is parked, then the session is
+//	   continued in the local TUI (rollout append)
+//	                    -> mirrored into B and B is active again: the
+//	                       prompt typed while parked runs once (the park
+//	                       notice promises it for both wake triggers) and
+//	                       a new prompt there is answered without `r`
 //	C: an active (never parked) chat whose session gets the same kind of
 //	   TUI update   -> mirrored (F-MIR-2); separates "parked" from
 //	                   "linked-transcript mirroring" when B fails
@@ -70,11 +73,13 @@ func TestParkedChat_NoPollingAndWake(t *testing.T) {
 
 	held := s.Token("whileparked")
 	steps.MustPost(s, chatA.ID, "Typed while parked "+held)
+	heldB := s.Token("whileparkedb")
+	steps.MustPost(s, chatB.ID, "Typed while parked "+heldB)
 	const window = 15 * time.Second
 	s.Poll(window, func() bool { return false })
 	readsA := chatReads(s, chatA.ID, parkedFrom)
 	readsB := chatReads(s, chatB.ID, parkedFrom)
-	callsHeld := len(s.Codex.CallsWithToken(held))
+	callsHeld := len(s.Codex.CallsWithToken(held)) + len(s.Codex.CallsWithToken(heldB))
 	s.Note("parked window %.0fs: reads A=%d B=%d", time.Since(parkedAt).Seconds(), len(readsA), len(readsB))
 
 	// Wake A explicitly; continue B in the local TUI.
@@ -84,12 +89,13 @@ func TestParkedChat_NoPollingAndWake(t *testing.T) {
 	tuiA := continueInTUI(s, warmB)
 	tuiC := continueInTUI(s, warmC)
 
-	var heldAnswered, mirrored, mirroredC bool
+	var heldAnswered, heldBAnswered, mirrored, mirroredC bool
 	s.Poll(25*time.Second, func() bool {
 		heldAnswered = len(s.SUTMessagesContaining(chatA.ID, "answer for "+held)) > 0
+		heldBAnswered = len(s.SUTMessagesContaining(chatB.ID, "answer for "+heldB)) > 0
 		mirrored = len(s.SUTMessagesContaining(chatB.ID, tuiA)) > 0
 		mirroredC = len(s.SUTMessagesContaining(chatC.ID, tuiC)) > 0
-		return heldAnswered && mirrored && mirroredC
+		return heldAnswered && heldBAnswered && mirrored && mirroredC
 	})
 	after := s.Token("afterlocal")
 	steps.MustPost(s, chatB.ID, "Follow-up after the local work "+after)
@@ -122,6 +128,10 @@ func TestParkedChat_NoPollingAndWake(t *testing.T) {
 	s.Check("R-22 the wake posts one resume notice", resumeNotices == 1, "1", fmt.Sprint(resumeNotices))
 	s.Check("F-MIR-2 control: a TUI update of an active Teams session is mirrored", mirroredC, "TUI answer in C", fmt.Sprint(mirroredC), s.Transcript(chatC.ID, 10)...)
 	s.Check("a local TUI update of a parked session is mirrored into its chat", mirrored, "TUI answer in B", fmt.Sprint(mirrored), trB...)
+	nHeldB := len(s.Codex.CallsWithToken(heldB))
+	startedAfterLocal := nHeldB == 1 && !s.Codex.CallsWithToken(heldB)[0].Started.Before(wokeAt)
+	s.Check("a local TUI update wakes the chat and the prompt typed while parked runs exactly once", heldBAnswered && startedAfterLocal,
+		"1 turn, started after the local update", fmt.Sprintf("%d turns, answered=%v, started after the update=%v", nHeldB, heldBAnswered, startedAfterLocal), trB...)
 	s.Check("a local TUI update reactivates the parked chat", afterAnswered, "next prompt in B answered without `r`",
 		fmt.Sprintf("answered=%v, turns=%d, reads of B since the TUI update=%d", afterAnswered, len(s.Codex.CallsWithToken(after)), len(chatReads(s, chatB.ID, wakeSeq))))
 }

@@ -418,7 +418,7 @@ func runModel(t *testing.T, seed int64, steps int) {
 				tr.State = TurnRunning
 			case pick(5) == 0:
 				log = append(log, fmt.Sprintf("requeue turn %d", id))
-				err = s.Update(func(tx *Tx) error { return tx.RequeueTurn(id, now+1000) })
+				err = s.Update(func(tx *Tx) error { return tx.RequeueTurn(id, now+1000, "", "") })
 				tr.State = TurnQueued
 			default:
 				final := []string{TurnCompleted, TurnFailed, TurnInterrupted}[pick(3)]

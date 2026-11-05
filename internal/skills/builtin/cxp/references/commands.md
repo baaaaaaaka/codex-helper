@@ -48,7 +48,9 @@ Use `cxp proxy` only when the user is asking about SSH/network routing.
 - `cxp teams auth status`: show the local sign-in state and token expiry without printing tokens.
 - `cxp teams auth logout`: remove the local Teams token cache.
 - `cxp teams run`: start the helper. Where supported it installs and starts the background service, which keeps the helper running after terminal close; the helper creates this machine's control chat when it first starts.
-- `cxp teams status`: show the helper store, owner, control chat, sessions and queues.
+- `cxp teams status`: show the helper store, owner, control chat, sessions and queues. When the helper is stopped on all machines, the first line says by whom and how to start it again.
+- `cxp teams stop`: stop the helper on all machines that share this state directory until `cxp teams start` (it creates the kill-switch file `DISABLED` next to the store; the running helper stops at its next heartbeat and standbys and services stay idle). `shutdown` in the Teams control chat does the same.
+- `cxp teams start`: start it again after `cxp teams stop`; it starts this machine's installed service when that is not running, otherwise it says which helper picks up.
 - `cxp teams doctor`: local diagnostics. `--live` also checks Microsoft Graph sign-in and read access; `--appserver-probe` checks Codex app-server compatibility without starting a model turn.
 - `cxp teams control`: print this machine's control chat from the local store.
 - `cxp teams migrate`: convert a stopped v0.1.20 or v0.1.22-rc.59 helper store explicitly (`--dry-run --out <path>` previews). The helper converts automatically at its first start and never modifies the old store.
@@ -56,7 +58,8 @@ Use `cxp proxy` only when the user is asking about SSH/network routing.
 - `cxp teams path mode account-default|explicit`: select the PATH source for future cold starts; `cxp teams path explicit <PATH>` saves an explicit PATH, and `cxp teams path shell <absolute-path|default>` sets or clears an account-shell override.
 - `cxp teams service bootstrap`: install or repair the background service/watchdog and start it.
 - `cxp teams service status`: inspect OS service/task state.
-- `cxp teams service restart`: restart the helper service from a local terminal; interrupted work is recovered at start and each interrupted request gets one notice.
+- `cxp teams service restart`: restart the helper service from a local terminal; interrupted work is recovered at start and each interrupted request gets one notice. While the helper is stopped on all machines, `service start` and `service restart` refuse and point to `cxp teams start`.
+- `cxp teams service stop`: stop this machine's service only; a helper on another machine sharing the home may take over. Use `cxp teams stop` to stop it everywhere.
 - `cxp teams service doctor`: diagnose service backend readiness.
 - On Linux, service auto mode prefers `systemd --user`; if no user manager is usable, it falls back to `local-supervisor`, which survives terminal close and helper crashes but not machine/container reboot. Enabled or active local-supervisor installs stay sticky to avoid backend flapping; in WSL, the Windows Task backend remains preferred unless local-supervisor is sticky or explicitly selected.
 - `cxp teams workflow status|enable|disable|test`: configure optional Teams Workflow notification cards; store the webhook URL in a private local file and pass that file path.

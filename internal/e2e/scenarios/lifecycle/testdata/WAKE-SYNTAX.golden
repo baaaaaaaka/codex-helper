@@ -110,7 +110,7 @@
    | <p>park s001</p>
 -- <msg:9> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Parked s001: its chat is no longer read. Wake it with <code>r s001</code>, or by using the session in Codex.</p>
+   | <p>Parked s001: its chat is no longer read. Messages sent to it while it is parked are read and run once it wakes. Wake it with <code>r s001</code>, or by using the session in Codex.</p>
 -- <msg:10> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>park s002</p>
@@ -119,7 +119,7 @@
    | <p>park s002</p>
 -- <msg:11> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Parked s002: its chat is no longer read. Wake it with <code>r s002</code>, or by using the session in Codex.</p>
+   | <p>Parked s002: its chat is no longer read. Messages sent to it while it is parked are read and run once it wakes. Wake it with <code>r s002</code>, or by using the session in Codex.</p>
 -- <msg:12> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>park s003</p>
@@ -128,7 +128,7 @@
    | <p>park s003</p>
 -- <msg:13> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Parked s003: its chat is no longer read. Wake it with <code>r s003</code>, or by using the session in Codex.</p>
+   | <p>Parked s003: its chat is no longer read. Messages sent to it while it is parked are read and run once it wakes. Wake it with <code>r s003</code>, or by using the session in Codex.</p>
 -- <msg:14> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>r 1</p>

@@ -153,7 +153,7 @@ Columns: id · status (`keep` / `removed-by-owner` / `ask-owner`, with the owner
 | F-TRN-7 | keep | PARTIAL: commands_ext.go:139 `cmdModel` status/list/reset/<id>; no `switch/use`, no `fork <m>`, no bare `model`; control chat list-only | CMD-MODEL | model_profile_commands.go:15/:125 |
 | F-TRN-8 | keep | PARTIAL: commands_ext.go:209 `cmdEffort` set only; no `status/list/reset`, no bare `effort`/`efforts` | NONE | reasoning_effort_commands.go:20 |
 | F-TRN-9 | removed-by-owner (DECISIONS 第一级 4 "把第三方 api 的功能移除掉"; 定稿 第三方模型 API 全部移除; SPEC says keep) | n/a (`model provider/catalog` refused) | DELETED-CMDS | — |
-| F-TRN-10 | keep (owner: 定稿 满载重试 + 11-05 第二批 Q2 `continue`) | runner.go:704 `capacityRetry`; owner-ux `bf79e9bd` continue-once | CAP-RETRY, CAP-WINDOW (CAP-CONTINUE on owner-ux) | owner redefined |
+| F-TRN-10 | keep (owner: 定稿 满载重试 + 11-05 第二批 Q2 `continue`) | runner.go:704 `capacityRetry`; `continuesPrompt` (runner.go) continue-once | CAP-RETRY, CAP-WINDOW, CAP-CONTINUE | owner redefined |
 | F-TRN-11 | keep (owner: 定稿 原样保留) | upgrade.go:127 `codexTooOld`, :227 `updateStep` | CODEX-UPGRADE | same |
 | F-TRN-12 | keep | core/codex/approval.go:10 (auto-approve), app-server runtime | R-1-2-3 (app-server path; approvals not exercised) | same |
 | F-TRN-13 | keep | cli/teams_user_path.go:42, cli/teams_child_guard.go:16/:42 `CODEX_HELPER_CLI_PATH` | NONE | same |
@@ -185,10 +185,10 @@ Columns: id · status (`keep` / `removed-by-owner` / `ask-owner`, with the owner
 | F-RND-10 | keep | PARTIAL: manifest upload core/engine/outbound.go:201; Codex is told the outbound root and manifest format (engine/envelope.go:80, F-TRN-14); `helper file` and `cxp teams send-file` missing | R-37-out | B:9748 |
 | F-RND-11 | keep (owner: 决定-4, 第一级 6, 定稿 ASR) | PARTIAL: core/engine/files.go:177-230 `fetchOne` transcribes → prompt; transcript PATCHed under the voice clip by core/engine/files.go:156 → annotations.go:66 `labelVoice` → channel/teams/annotate.go:229 `transcriptEdit` (failed clips are not edited); control-chat voice missing (needs batch B control Q&A) | VOICE, EDIT-VOICE | asr_input.go |
 | F-STA-1 | keep | core/engine/stats.go:39 `cmdStats` (work chat :153, control :259) from the rollouts; core/transcript/usage.go:752 (v0.1.20 reconstruction), usage_cache.go:94 (incremental reader, no timer) | CMD-STATS, STATS-RESETS | token_stats.go:1013/:1083 |
-| F-XM-1 | keep (owner: 定稿 共用 home — standby + takeover, no priority classes, pinned to install host) | PARTIAL: core/lease/acquire.go:185; install-host pin missing (`store.Ident.InstallHost` never set) | KILL-SWITCH, SERVICE-STANDBY, STANDBY-LOCKED, STANDBY-TAKEOVER, TAKEOVER-BATCH, TAKEOVER-CRASH-MID, TAKEOVER-KILLED, TAKEOVER-LEFTOVER, TAKEOVER-SAME-HOST, TAKEOVER-SIMULTANEOUS, TAKEOVER-THAW-EARLY | rc.59 lease lessons |
+| F-XM-1 | keep (owner: 定稿 共用 home — standby + takeover, no priority classes, pinned to install host) | PARTIAL: core/lease/acquire.go:185; install-host pin missing (`store.Ident.InstallHost` never set) | KILL-SWITCH, SERVICE-STANDBY, STANDBY-LOCKED, STANDBY-TAKEOVER, TAKEOVER-BATCH, TAKEOVER-CRASH-MID, TAKEOVER-KILLED, TAKEOVER-LEFTOVER, TAKEOVER-SAME-HOST, TAKEOVER-SIMULTANEOUS, TAKEOVER-THAW-EARLY, STOP-SHARED | rc.59 lease lessons |
 | F-XM-2 | keep (owner: 决定-3) | core/engine/registry.go:37, core/delegate/registry.go:67 | DELEG-RT, INBOX | same |
 | F-XM-3 | keep (owner: 决定-3) | core/engine/delegation.go:90 | DELEG-RT, DELEG-RESTART | same |
-| F-XM-4 | keep (owner: 定稿 停用开关文件 + 11-05 第二批 Q4) | core/store/store.go:40 `ErrDisabled`; `teams stop/start` + control `shutdown` on owner-ux | KILL-SWITCH, SERVICE-STANDBY | new |
+| F-XM-4 | keep (owner: 定稿 停用开关文件 + 11-05 第二批 Q4) | core/store/store.go:40 `ErrDisabled`; `teams stop/start` + control `shutdown` (cli/teams_stop.go, engine `cmdShutdown`) | KILL-SWITCH, SERVICE-STANDBY, STOP-START, SHUTDOWN, STOP-RESTART, STOP-SHARED | new |
 | F-SVC-1 | keep | cli/teams_service.go:105 (systemd/launchd/Task Scheduler backends) | exempt: needs systemd --user, launchd or Windows Task Scheduler; the offline container has none | same |
 | F-SVC-2 | keep | cli/teams_service_local_supervisor.go:111 | NONE | same |
 | F-SVC-3 | keep (owner: 定稿 WSL one-shot Startup entry) | cli/teams_service.go:451 | exempt: needs a Windows host with WSL | owner redefined |
@@ -211,7 +211,7 @@ Columns: id · status (`keep` / `removed-by-owner` / `ask-owner`, with the owner
 | F-CLI-8 | keep (owner: 决定-3) | cli/delegate.go:69 | DELEG-RT | same |
 | F-CLI-9 | removed-by-owner (beacon) | n/a | n/a | — |
 | F-CLI-10 | keep | MISSING: no `teams run --once` | NONE | SPEC |
-| R-1 | keep | outbox + read-back (see R-5) | R-1-2-3, R-5, R-5a-crash, R-5b, R-36, R-37-out, B-5, DUP-EDGE, DELEG-RT, ENTRY-CONTROLSEEN, ENTRY-OLDANSWER, KILL-SWITCH, STANDBY-LOCKED, STANDBY-TAKEOVER, TAKEOVER-* | — |
+| R-1 | keep | outbox + read-back (see R-5) | R-1-2-3, R-5, R-5a-crash, R-5b, R-36, R-37-out, B-5, DUP-EDGE, DELEG-RT, ENTRY-CONTROLSEEN, ENTRY-OLDANSWER, KILL-SWITCH, STANDBY-LOCKED, STANDBY-TAKEOVER, TAKEOVER-*, STOP-START, SHUTDOWN, STOP-RESTART, STOP-SHARED | — |
 | R-2 | keep | outbox marker + read-back; global invariant no-duplicate-post | R-1-2-3, R-5, R-5a-crash, R-5b, R-9-10, R-36, B-5, DELEG-RT, NO-WINDOW | — |
 | R-3 | keep | inbound dedupe | R-1-2-3, R-4-29, R-4-paging, R-6, R-7, R-37, R-43, DUP, DUP-EDGE, PARK | — |
 | R-4 | keep | receive.go cursor + dispositions | R-4-29, R-4-paging, BREAKER, DELEG-RESTART, PARK | — |
@@ -223,7 +223,7 @@ Columns: id · status (`keep` / `removed-by-owner` / `ask-owner`, with the owner
 | R-10 | keep | mirror.go | R-9-10 | — |
 | R-11 | keep | per-chat isolation | R-11, BREAKER, PARK | — |
 | R-12 | keep | Retry-After handling; global invariant retry-after | R-12, INBOX | — |
-| R-13 | keep | lease + supervisor backoff | SERVICE-STANDBY, STANDBY-LOCKED, STANDBY-TAKEOVER, TAKEOVER-CRASH-MID, TAKEOVER-LEFTOVER, TAKEOVER-SAME-HOST | — |
+| R-13 | keep | lease + supervisor backoff | SERVICE-STANDBY, STANDBY-LOCKED, STANDBY-TAKEOVER, TAKEOVER-CRASH-MID, TAKEOVER-LEFTOVER, TAKEOVER-SAME-HOST, STOP-RESTART | — |
 | R-14 | keep | tiered reads; global invariants idle-quiet, cpu-budget | IDLE, INBOX, PARK, ACCEPT-REALSTORE, SHADOW-REALDATA | — |
 | R-15 | keep | (bench) | exempt: throughput benchmark tier (gotest-docker-bench.sh), not a pass/fail black-box scenario | — |
 | R-16 | keep | core/migrate; upgrade.go drain | ENTRY-MIGRATE, ENTRY-AUTOMIGRATE (conversion part; UAC/activation exempt) | — |

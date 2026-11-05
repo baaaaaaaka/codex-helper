@@ -431,25 +431,36 @@ func TestNextRunnableBlocking(t *testing.T) {
 		t.Fatal("second turn runnable while first is starting")
 	}
 	// Capacity retry keeps the first deadline.
-	mustT(t, s.Update(func(tx *Tx) error { return tx.RequeueTurn(1, 111) }))
-	mustT(t, s.Update(func(tx *Tx) error { return tx.MarkStarting(1, "th") }))
-	mustT(t, s.Update(func(tx *Tx) error { return tx.RequeueTurn(1, 222) }))
+	mustT(t, s.Update(func(tx *Tx) error { return tx.RequeueTurn(1, 111, "", "") }))
 	mustT(t, s.Update(func(tx *Tx) error {
 		tr, _, err := tx.Turn(1)
-		if tr.RetryDeadline != 111 || tr.Attempt != 2 || tr.State != TurnQueued {
+		if tr.CodexTurnID != "" {
+			t.Fatalf("a turn Codex never started records no Codex turn: %+v", tr)
+		}
+		return err
+	}))
+	mustT(t, s.Update(func(tx *Tx) error { return tx.MarkStarting(1, "") }))
+	// Codex accepted this attempt in a thread it created: both are kept
+	// for the next attempt, which continues there.
+	mustT(t, s.Update(func(tx *Tx) error { return tx.RequeueTurn(1, 222, "th-new", "ct-1") }))
+	mustT(t, s.Update(func(tx *Tx) error {
+		tr, _, err := tx.Turn(1)
+		if tr.RetryDeadline != 111 || tr.Attempt != 2 || tr.State != TurnQueued ||
+			tr.ThreadID != "th-new" || tr.CodexTurnID != "ct-1" {
 			t.Fatalf("requeued turn %+v", tr)
 		}
 		return err
 	}))
 	// After progress the window starts again.
-	mustT(t, s.Update(func(tx *Tx) error { return tx.MarkStarting(1, "th") }))
-	mustT(t, s.Update(func(tx *Tx) error { return tx.RequeueTurnNewWindow(1, 333) }))
+	mustT(t, s.Update(func(tx *Tx) error { return tx.MarkStarting(1, "th-new") }))
+	// A later attempt Codex refused keeps what the accepted one recorded.
+	mustT(t, s.Update(func(tx *Tx) error { return tx.RequeueTurnNewWindow(1, 333, "", "") }))
 	mustT(t, s.Update(func(tx *Tx) error {
 		tr, _, err := tx.Turn(1)
 		if err != nil {
 			return err
 		}
-		if tr.RetryDeadline != 333 || tr.State != TurnQueued {
+		if tr.RetryDeadline != 333 || tr.State != TurnQueued || tr.ThreadID != "th-new" || tr.CodexTurnID != "ct-1" {
 			t.Fatalf("requeued turn after progress %+v", tr)
 		}
 		return nil

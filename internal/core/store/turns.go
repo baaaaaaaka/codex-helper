@@ -137,18 +137,22 @@ func (t *Tx) MarkRunning(turnID int64, codexTurnID string) error {
 
 // RequeueTurn puts a starting/running turn back to queued for a capacity
 // retry. retryDeadline is only recorded the first time, so the retry window
-// is measured from the first capacity error.
-func (t *Tx) RequeueTurn(turnID int64, retryDeadline int64) error {
+// is measured from the first capacity error. threadID and codexTurnID are
+// where Codex recorded the attempt's prompt ("" if it never started): a
+// later attempt then continues that thread instead of resending it.
+func (t *Tx) RequeueTurn(turnID int64, retryDeadline int64, threadID, codexTurnID string) error {
 	return t.turnMove(turnID, []string{TurnStarting, TurnRunning},
-		`state = 'queued', retry_deadline = COALESCE(retry_deadline, ?)`, nullInt(retryDeadline))
+		`state = 'queued', retry_deadline = COALESCE(retry_deadline, ?), thread_id = COALESCE(?, thread_id), codex_turn_id = COALESCE(?, codex_turn_id)`,
+		nullInt(retryDeadline), nullStr(threadID), nullStr(codexTurnID))
 }
 
 // RequeueTurnNewWindow is RequeueTurn for a capacity failure after the
 // attempt made progress: the retry window starts again at retryDeadline
 // (the 5-minute bound limits waiting for capacity, not a long task).
-func (t *Tx) RequeueTurnNewWindow(turnID int64, retryDeadline int64) error {
+func (t *Tx) RequeueTurnNewWindow(turnID int64, retryDeadline int64, threadID, codexTurnID string) error {
 	return t.turnMove(turnID, []string{TurnStarting, TurnRunning},
-		`state = 'queued', retry_deadline = ?`, nullInt(retryDeadline))
+		`state = 'queued', retry_deadline = ?, thread_id = COALESCE(?, thread_id), codex_turn_id = COALESCE(?, codex_turn_id)`,
+		nullInt(retryDeadline), nullStr(threadID), nullStr(codexTurnID))
 }
 
 func terminalTurnState(s string) bool {

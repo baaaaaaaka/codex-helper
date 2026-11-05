@@ -77,6 +77,9 @@ func (e *Engine) receiverLoop(ctx context.Context) {
 // the receiver loop may sleep; false when ctx ended.
 func (e *Engine) dispatchReads(ctx context.Context, jobs chan<- int64) (time.Duration, bool) {
 	now := e.now()
+	if e.stopping.Load() {
+		return e.t.Tick, true // shutdown: no chat is read again
+	}
 	if until := e.gate(e.gRead); now.Before(until) {
 		return e.readSleep(until.Sub(now)), true
 	}
@@ -896,8 +899,12 @@ func (e *Engine) ackPrompt(tx *store.Tx, conv int64, a store.Admitted, c *classi
 		return false, err
 	}
 	text := textAccepted
-	var running, queued []string
-	ahead := false
+	var (
+		running   string
+		isRunning bool
+		ahead     bool
+		before    int // other queued requests ahead of this one
+	)
 	// A turn the previous process left open is not running: it is
 	// settled, with its own notice, before the next turn starts.
 	e.mu.Lock()
@@ -909,23 +916,27 @@ func (e *Engine) ackPrompt(tx *store.Tx, conv int64, a store.Admitted, c *classi
 	}
 	e.mu.Unlock()
 	for _, t := range live {
-		ahead = ahead || t.ID < a.TurnID
-		in, ok, err := tx.Inbound(t.InboundID)
-		if err != nil {
+		if t.ID >= a.TurnID {
+			continue
+		}
+		ahead = true
+		// A turn waiting to retry at Codex capacity is the current one.
+		if t.State == store.TurnQueued && t.RetryDeadline == 0 {
+			before++
+			continue
+		}
+		if isRunning {
+			continue
+		}
+		isRunning = true
+		if in, ok, err := tx.Inbound(t.InboundID); err != nil {
 			return false, err
-		}
-		prompt := ""
-		if ok {
-			prompt = in.Body
-		}
-		if t.State == store.TurnQueued {
-			queued = append(queued, prompt)
-		} else {
-			running = append(running, prompt)
+		} else if ok {
+			running = in.Body
 		}
 	}
 	if ahead {
-		text = textQueuedAck(running, queued)
+		text = textQueuedAck(running, isRunning, before)
 	}
 	msgs, err := e.noticeReply(store.OutAck, fmt.Sprintf("ack:%d", a.InboundID), text, c.quoteID)
 	if err != nil {
@@ -1069,6 +1080,9 @@ func (e *Engine) scanLoop(ctx context.Context) {
 		case <-reopen.C:
 			reopened = true
 		case <-e.scanWake:
+		}
+		if e.stopping.Load() {
+			continue // shutdown: no chat is read again
 		}
 		now := e.now()
 		if until := e.gate(e.gRead); now.Before(until) {

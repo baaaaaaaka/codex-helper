@@ -315,6 +315,9 @@ func newTeamsServiceStartCmd(root *rootOptions) *cobra.Command {
 			if err := rejectTeamsHelperSelfManagementFromChild("start the Teams service", "helper restart now"); err != nil {
 				return err
 			}
+			if err := errTeamsStoppedEverywhere("started"); err != nil {
+				return err
+			}
 			if err := teamsServiceAuthPreflight(); err != nil {
 				return err
 			}
@@ -344,8 +347,12 @@ func newTeamsServiceStartCmd(root *rootOptions) *cobra.Command {
 func newTeamsServiceStopCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "stop",
-		Short: "Stop the Teams bridge service",
-		Args:  cobra.NoArgs,
+		Short: "Stop the Teams bridge service on this machine only",
+		Long: "Stop the Teams bridge service on this machine only.\n\n" +
+			"Helpers on other machines that share this state directory keep running, and one standing by may take over " +
+			"(it does so once this machine's helper stops renewing its lease). To stop the Teams helper on all machines, " +
+			"run `cxp teams stop`; `cxp teams start` starts it again.",
+		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if err := rejectTeamsHelperSelfManagementFromChild("stop the Teams service", "helper restart now"); err != nil {
 				return err
@@ -371,6 +378,9 @@ func newTeamsServiceRestartCmd(root *rootOptions) *cobra.Command {
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			if err := rejectTeamsHelperSelfManagementFromChild("restart the Teams service", "helper restart now"); err != nil {
+				return err
+			}
+			if err := errTeamsStoppedEverywhere("restarted"); err != nil {
 				return err
 			}
 			if err := teamsServiceAuthPreflight(); err != nil {

@@ -22,6 +22,9 @@ import (
 // unsent messages, Workflow cards and the registry machine id.
 func writeTeamsNewCoreStatus(out io.Writer, now time.Time) {
 	_, _ = fmt.Fprintln(out, "\nTeams helper")
+	if line := teamsStoppedLine(); line != "" {
+		_, _ = fmt.Fprintln(out, line)
+	}
 	writeTeamsCoreStoreStatus(out, now)
 }
 
@@ -68,7 +71,11 @@ func writeTeamsCoreStoreStatus(out io.Writer, now time.Time) {
 
 // printTeamsCoreStatus is `cxp teams status` (F-CLI-1): strictly
 // read-only, local only (no Graph call), never message bodies or secrets.
+// A helper stopped on all machines says so first, with how to start it.
 func printTeamsCoreStatus(out io.Writer, now time.Time) error {
+	if line := teamsStoppedLine(); line != "" {
+		_, _ = fmt.Fprintln(out, line)
+	}
 	_, _ = fmt.Fprintln(out, "Teams helper")
 	_, _ = fmt.Fprintf(out, "Version: %s\n", buildVersion())
 	cfg, err := chteams.ResolveAuthConfig("")

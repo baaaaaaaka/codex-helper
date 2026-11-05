@@ -155,6 +155,9 @@ func (e *Engine) maintenanceLoop(ctx context.Context) {
 			return
 		case <-hb.C:
 			if err := e.st.Heartbeat(); err != nil {
+				if err == store.ErrDisabled && e.stopping.Load() {
+					continue // `shutdown` stops this process once its reply is out
+				}
 				e.logf("heartbeat: %v", err)
 				if isFence(err) {
 					e.fail(err)
