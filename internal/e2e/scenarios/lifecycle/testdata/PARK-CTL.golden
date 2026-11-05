@@ -26,7 +26,7 @@
    | <p>park s001</p>
 -- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Parked s001: its chat is no longer read. Wake it with <code>r s001</code>, or by using the session in Codex.</p>
+   | <p>Parked s001: its chat is no longer read. Messages sent to it while it is parked are read and run once it wakes. Wake it with <code>r s001</code>, or by using the session in Codex.</p>
 -- <msg:7> owner (html)
    | <p>r s001</p>
 -- <msg:8> helper (html)

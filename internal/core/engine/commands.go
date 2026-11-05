@@ -555,7 +555,7 @@ func (e *Engine) cmdPark(j cmdJob, cs *convState) {
 		e.reply(j, "A request is still running; park the chat after it ends.", nil)
 		return
 	}
-	e.reply(j, "Parked "+cs.label+": this chat is no longer read. Wake it from the control chat with `r "+cs.label+"`, or by using the session in Codex.", func(tx *store.Tx) error {
+	e.reply(j, "Parked "+cs.label+": this chat is no longer read. Messages sent here while it is parked are read and run once it wakes. Wake it from the control chat with `r "+cs.label+"`, or by using the session in Codex.", func(tx *store.Tx) error {
 		if err := tx.Park(cs.id); err != nil {
 			return err
 		}
@@ -634,7 +634,7 @@ func (e *Engine) cmdParkLabel(j cmdJob, arg string) {
 	case busy:
 		e.reply(j, label+" is running a request; park it after it ends.", nil)
 	default:
-		e.reply(j, "Parked "+label+": its chat is no longer read. Wake it with `r "+label+"`, or by using the session in Codex.", func(tx *store.Tx) error {
+		e.reply(j, "Parked "+label+": its chat is no longer read. Messages sent to it while it is parked are read and run once it wakes. Wake it with `r "+label+"`, or by using the session in Codex.", func(tx *store.Tx) error {
 			if err := tx.Park(cs.id); err != nil {
 				return err
 			}
