@@ -370,7 +370,7 @@ func (e *Engine) checkHistory(ctx context.Context, c store.HistoryCheck) error {
 	switch {
 	case resume == 0:
 	case resume >= recs[len(recs)-1].end:
-		where = "every record is in the chat: nothing is caught up"
+		where = "the newest record is in the chat: nothing to catch up"
 	case resume >= lastBefore(recs, c.To):
 		where = "the records before the old position are in the chat: catch-up from there"
 	default:
