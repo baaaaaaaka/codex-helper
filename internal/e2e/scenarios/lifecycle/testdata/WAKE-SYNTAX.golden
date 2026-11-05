@@ -1,0 +1,132 @@
+# WAKE-SYNTAX: `r 1` wakes s001 only, `unpark <id>` and `resume <n>` work, a second `r` says it is active, an unknown number points to `list`
+# cxp black-box transcript; volatile values are numbered placeholders
+
+== chat <chat:1> "Codex Control - e2ehost"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
+-- <msg:2> owner (html)
+   | <p>new <root>/work/wake-a</p>
+-- <msg:3> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>✅ Work chat created: s001</p>
+   | <p>Open this Teams link and send your task there:<br>
+   | <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
+   | <p>If Teams does not show it right away, search for: s001</p>
+-- <msg:4> owner (html)
+   | <p>new <root>/work/wake-b</p>
+-- <msg:5> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>✅ Work chat created: s002</p>
+   | <p>Open this Teams link and send your task there:<br>
+   | <a href="https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
+   | <p>If Teams does not show it right away, search for: s002</p>
+-- <msg:6> owner (html)
+   | <p>new <root>/work/wake-c</p>
+-- <msg:7> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>✅ Work chat created: s003</p>
+   | <p>Open this Teams link and send your task there:<br>
+   | <a href="https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
+   | <p>If Teams does not show it right away, search for: s003</p>
+-- <msg:8> owner (html)
+   | <p>park s001</p>
+-- <msg:9> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Parked s001: its chat is no longer read. Wake it with <code>r s001</code>, or by using the session in Codex.</p>
+-- <msg:10> owner (html)
+   | <p>park s002</p>
+-- <msg:11> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Parked s002: its chat is no longer read. Wake it with <code>r s002</code>, or by using the session in Codex.</p>
+-- <msg:12> owner (html)
+   | <p>park s003</p>
+-- <msg:13> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Parked s003: its chat is no longer read. Wake it with <code>r s003</code>, or by using the session in Codex.</p>
+-- <msg:14> owner (html)
+   | <p>r 1</p>
+-- <msg:15> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Resumed s001: its chat is read again.</p>
+-- <msg:16> owner (html)
+   | <p>r s001</p>
+-- <msg:17> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>s001 is active; nothing to wake.</p>
+-- <msg:18> owner (html)
+   | <p>unpark s002</p>
+-- <msg:19> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Resumed s002: its chat is read again.</p>
+-- <msg:20> owner (html)
+   | <p>resume 3</p>
+-- <msg:21> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Resumed s003: its chat is read again.</p>
+-- <msg:22> owner (html)
+   | <p>r 97</p>
+-- <msg:23> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>No session <code>97</code>. Send <code>list</code> to see sessions.</p>
+
+== chat <chat:2> "s001 · wake-a"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Work chat created: s001.<br>
+   | Working directory: <root>/work/wake-a</p>
+-- <msg:2> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>💬 Work chat is ready.<br>
+   | Send a task in this chat. Codex will start automatically and continue this session.<br>
+   | Status: waiting for your first task.<br>
+   | Session: s001<br>
+   | Project: wake-a<br>
+   | Working directory: <root>/work/wake-a<br>
+   | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
+   | Need more details? Send <code>helper status</code>.</p>
+-- <msg:3> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>This chat was resumed: messages here are read again. Requests sent while it was parked run now.</p>
+
+== chat <chat:3> "s002 · wake-b"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Work chat created: s002.<br>
+   | Working directory: <root>/work/wake-b</p>
+-- <msg:2> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>💬 Work chat is ready.<br>
+   | Send a task in this chat. Codex will start automatically and continue this session.<br>
+   | Status: waiting for your first task.<br>
+   | Session: s002<br>
+   | Project: wake-b<br>
+   | Working directory: <root>/work/wake-b<br>
+   | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
+   | Need more details? Send <code>helper status</code>.</p>
+-- <msg:3> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>This chat was resumed: messages here are read again. Requests sent while it was parked run now.</p>
+
+== chat <chat:4> "s003 · wake-c"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Work chat created: s003.<br>
+   | Working directory: <root>/work/wake-c</p>
+-- <msg:2> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>💬 Work chat is ready.<br>
+   | Send a task in this chat. Codex will start automatically and continue this session.<br>
+   | Status: waiting for your first task.<br>
+   | Session: s003<br>
+   | Project: wake-c<br>
+   | Working directory: <root>/work/wake-c<br>
+   | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
+   | Need more details? Send <code>helper status</code>.</p>
+-- <msg:3> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>This chat was resumed: messages here are read again. Requests sent while it was parked run now.</p>

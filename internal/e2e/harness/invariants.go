@@ -81,18 +81,23 @@ var AllInvariants = []string{
 
 // Limits of the invariants.
 const (
-	IdleSettleQuiet = time.Second
+	IdleSettleQuiet = 3 * time.Second // longer than Timing.ChatRate gaps of a draining queue
 	IdleSettleMax   = 15 * time.Second
 	IdleWindow      = 3 * time.Second
 	StopWithin      = 15 * time.Second
 	// DefaultCPUBudget is the helpers' CPU budget of a scenario that sets
 	// none (calibrated on the Docker runner: see E2E-BLACKBOX-REPORT.md).
-	DefaultCPUBudget = 20 * time.Second
+	// The heaviest scenario used 0.6 s in the first calibration run.
+	DefaultCPUBudget = 5 * time.Second
 
-	// Rate caps. The engine paces sends at 4/s account-wide (token bucket)
-	// and at most one message per chat per second (Timing.ChatRate).
+	// Rate caps. The engine paces message sends at 4/s account-wide (a
+	// token bucket holding one second of rate, so at most 8 in any 1 s
+	// window) and at most one message per chat per second
+	// (Timing.ChatRate). Other writes (chat creation, members, topics,
+	// registry card) are not paced; they only have the storm cap.
 	CapChatPostsPerSecond = 2   // message posts to one chat in any 1 s
-	CapWritesPerSecond    = 8   // Graph writes in any 1 s
+	CapPostsPerSecond     = 8   // message posts account-wide in any 1 s
+	CapWritesPerSecond    = 20  // Graph writes of any kind in any 1 s
 	CapWritesPerMinute    = 240 // Graph writes in any 60 s
 	CapChatReadsPerSecond = 10  // reads of one chat's messages in any 1 s
 	CapIdenticalWrites    = 5   // the same write (method, path, body)
@@ -124,8 +129,8 @@ func (s *Scenario) idleAllowed(r fakegraph.Request) bool {
 type Invariants struct {
 	// Waive turns invariants off: name -> reason (required).
 	Waive map[string]string
-	// Except accepts the failures of Invariant whose message contains
-	// Match.
+	// Except accepts the failures of Invariant whose message matches
+	// the regular expression Match (keep it narrow: name the instance).
 	Except []Exception
 	// CPUBudget overrides DefaultCPUBudget.
 	CPUBudget time.Duration
@@ -154,6 +159,9 @@ func (iv Invariants) validate() error {
 	for _, e := range iv.Except {
 		if !known[e.Invariant] || e.Match == "" || strings.TrimSpace(e.Reason) == "" {
 			return fmt.Errorf("invariants: exception %+v needs a known invariant, a match and a reason", e)
+		}
+		if _, err := regexp.Compile(e.Match); err != nil {
+			return fmt.Errorf("invariants: exception match %q: %v", e.Match, err)
 		}
 	}
 	return nil
@@ -189,7 +197,7 @@ func (s *Scenario) teardown() {
 			time.Sleep(IdleWindow)
 			for _, r := range s.Graph.Requests(fakegraph.RequestFilter{Since: from}) {
 				if isGraphWrite(r) && !s.idleAllowed(r) {
-					res.add(InvIdleQuiet, "idle helper wrote %s %s (%s) within %v after it settled", r.Method, r.Route, r.Instance, IdleWindow)
+					res.add(InvIdleQuiet, "idle helper wrote %s (%s) within %v after it settled: %s", r.Route, r.Instance, IdleWindow, clipBody(r.Body))
 				}
 			}
 		} else {
@@ -289,7 +297,7 @@ func (s *Scenario) reportInvariants(res *invResults) map[string]string {
 		for _, f := range res.fail[name] {
 			ok := false
 			for _, e := range s.Opts.Invariants.Except {
-				if e.Invariant == name && strings.Contains(f, e.Match) {
+				if e.Invariant == name && regexp.MustCompile(e.Match).MatchString(f) {
 					ok = true
 					excused = append(excused, f+" [expected: "+e.Reason+"]")
 					break
@@ -445,7 +453,8 @@ func (s *Scenario) checkOrder(res *invResults) {
 }
 
 func (s *Scenario) checkRates(res *invResults, reqs []fakegraph.Request) {
-	var writes []time.Time
+	var writes, posts []time.Time
+	var writeReqs []fakegraph.Request
 	perChat := map[string][]time.Time{}
 	reads := map[string][]time.Time{}
 	for _, r := range reqs {
@@ -454,16 +463,23 @@ func (s *Scenario) checkRates(res *invResults, reqs []fakegraph.Request) {
 		}
 		if isGraphWrite(r) {
 			writes = append(writes, r.At)
+			writeReqs = append(writeReqs, r)
 		}
-		if isMessagePost(r) && r.ChatID != "" {
-			perChat[r.ChatID] = append(perChat[r.ChatID], r.At)
+		if isMessagePost(r) {
+			posts = append(posts, r.At)
+			if r.ChatID != "" {
+				perChat[r.ChatID] = append(perChat[r.ChatID], r.At)
+			}
 		}
 		if r.Method == "GET" && r.Route == "GET /chats/{chat}/messages" {
 			reads[r.ChatID] = append(reads[r.ChatID], r.At)
 		}
 	}
+	if at, n := maxInWindow(posts, time.Second); n > CapPostsPerSecond {
+		res.add(InvRateCap, "%d message posts within 1s at %s (cap %d)", n, s.rel(at), CapPostsPerSecond)
+	}
 	if at, n := maxInWindow(writes, time.Second); n > CapWritesPerSecond {
-		res.add(InvRateCap, "%d Graph writes within 1s at %s (cap %d)", n, s.rel(at), CapWritesPerSecond)
+		res.add(InvRateCap, "%d Graph writes within 1s at %s (cap %d): %s", n, s.rel(at), CapWritesPerSecond, routeCounts(writeReqs, at, time.Second))
 	}
 	if at, n := maxInWindow(writes, time.Minute); n > CapWritesPerMinute {
 		res.add(InvRateCap, "%d Graph writes within 60s from %s (cap %d)", n, s.rel(at), CapWritesPerMinute)
@@ -694,4 +710,29 @@ func RunAndCheckLeaks(m interface{ Run() int }) int {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
+}
+
+// clipBody shortens a request body for a failure message.
+func clipBody(b string) string {
+	b = strings.Join(strings.Fields(b), " ")
+	if len(b) > 240 {
+		return b[:240] + "…"
+	}
+	return b
+}
+
+// routeCounts summarizes the routes of the requests in [at, at+w).
+func routeCounts(reqs []fakegraph.Request, at time.Time, w time.Duration) string {
+	n := map[string]int{}
+	for _, r := range reqs {
+		if !r.At.Before(at) && r.At.Before(at.Add(w)) {
+			n[r.Route]++
+		}
+	}
+	var out []string
+	for k, v := range n {
+		out = append(out, fmt.Sprintf("%d× %s", v, k))
+	}
+	sort.Strings(out)
+	return strings.Join(out, ", ")
 }

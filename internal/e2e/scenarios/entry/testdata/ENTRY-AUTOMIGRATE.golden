@@ -1,0 +1,38 @@
+# ENTRY-AUTOMIGRATE: first start on an rc.59 store: converted once, summary and interrupted notices once, old store kept
+# cxp black-box transcript; volatile values are numbered placeholders
+
+== chat <chat:1> ""
+   type: group; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>The previous request was interrupted when the helper stopped. It was not re-run; resend it if you still need it.</p>
+
+== chat <chat:2> ""
+   type: group; members: owner
+
+== chat <chat:3> ""
+   type: group; members: owner
+
+== chat <chat:4> ""
+   type: group; members: owner
+
+== chat <chat:5> ""
+   type: group; members: owner
+
+== chat <chat:6> ""
+   type: group; members: owner
+
+== chat <chat:7> ""
+   type: group; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Teams helper data converted from v0.1.22-rc.59</p>
+   | <p>Work chats: 8 (5 active, 1 parked, 2 closed). Past requests: 6.</p>
+   | <p>1 request was running when the previous helper stopped: its chat gets one notice; it is not re-run.</p>
+   | <p>1 message that was not sent yet is sent now.</p>
+   | <p>4 older messages (from more than a day ago) that the previous helper had not sent or could not confirm are not sent now.</p>
+   | <p>Local Codex sessions are caught up from now on.</p>
+   | <p>The previous data is kept unchanged as a backup. The full report is migration-report.txt next to the helper&#39;s store (<code>cxp teams status</code> shows where).</p>
+
+== chat <chat:8> ""
+   type: group; members: owner

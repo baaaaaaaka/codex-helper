@@ -23,6 +23,7 @@ func TestNotify_BurstOfFinals(t *testing.T) {
 		Guarantees: []string{"owner-notify-every-final"},
 		Title:      "three finals at once in three work chats: each named in a control-chat owner @mention exactly once, none in work chats",
 		Budget:     120 * time.Second,
+		Golden:     harness.GoldenOptions{FinishedNotices: "three finals complete at once; the scenario checks each is named exactly once"},
 	})
 	defer s.Finish()
 	toks := []string{s.Token("burst1"), s.Token("burst2"), s.Token("burst3")}

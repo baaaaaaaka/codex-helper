@@ -38,6 +38,7 @@ func TestB5_KillDuringRunningTurn(t *testing.T) {
 		Guarantees: []string{"B-5", "R-5b", "R-32", "R-33", "R-1", "R-2"},
 		Title:      "kill -9 with turns running (with and without progress) / not started; restart reports each once and keeps the thread",
 		Budget:     150 * time.Second,
+		Golden:     harness.GoldenOptions{FinishedNotices: "the chats finish together after the restart"},
 	})
 	defer s.Finish()
 	tokX, tokY, tokZ := s.Token("streaming"), s.Token("lost"), s.Token("notstarted")

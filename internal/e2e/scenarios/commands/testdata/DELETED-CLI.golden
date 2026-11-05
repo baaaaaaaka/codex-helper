@@ -1,0 +1,34 @@
+# DELETED-CLI: `cxp teams recover|probe-chat|pause|drain`, `auth read|file-write`, `path mode captured-terminal|service`: unknown, non-zero exit; kept `path mode account-default` works
+# cxp black-box transcript; volatile values are numbered placeholders
+
+== cli
+$ cxp teams recover
+   exit 1
+   stderr| Error: unknown command "recover" for "cxp teams"
+$ cxp teams probe-chat
+   exit 1
+   stderr| Error: unknown command "probe-chat" for "cxp teams"
+$ cxp teams pause
+   exit 1
+   stderr| Error: unknown command "pause" for "cxp teams"
+$ cxp teams drain
+   exit 1
+   stderr| Error: unknown command "drain" for "cxp teams"
+$ cxp teams auth read
+   exit 1
+   stderr| Error: unknown command "read" for "cxp teams auth"
+$ cxp teams auth file-write
+   exit 1
+   stderr| Error: unknown command "file-write" for "cxp teams auth"
+$ cxp teams auth read-status
+   exit 1
+   stderr| Error: unknown command "read-status" for "cxp teams auth"
+$ cxp teams path mode captured-terminal
+   exit 1
+   stderr| Error: unknown Teams Codex PATH mode "captured-terminal"
+$ cxp teams path mode service
+   exit 1
+   stderr| Error: unknown Teams Codex PATH mode "service"
+$ cxp teams path mode account-default
+   exit 0
+   stdout| Teams Codex PATH mode: account-default

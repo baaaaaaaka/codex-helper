@@ -31,6 +31,10 @@ func TestServiceChildStandsByInsteadOfRestarting(t *testing.T) {
 		Title:      "a service-run helper refused by a live owner or the kill-switch file stands by in-process with no Graph traffic, and takes over once the refusal is gone",
 		Budget:     120 * time.Second,
 		Seam:       harness.Seam{Knobs: map[string]string{"Heartbeat": "500ms"}, Hostname: "host-a"},
+		Invariants: harness.Invariants{Except: []harness.Exception{
+			{Invariant: harness.InvCleanStop, Match: `cxp-1 exited on its own with "exit status 1"`,
+				Reason: "the owner (not a service child) stops with an error when DISABLED appears"},
+		}},
 	})
 	defer s.Finish()
 	control := steps.ReadyControlChat(s)

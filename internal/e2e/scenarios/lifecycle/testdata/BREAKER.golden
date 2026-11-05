@@ -1,0 +1,297 @@
+# BREAKER: 3 marker-less helper echoes in 60 s: pause auto-start only, running turn survives, one notice, survives restart, `helper unpause` lifts it
+# cxp black-box transcript; volatile values are numbered placeholders
+
+== chat <chat:1> "Codex Control - e2ehost"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
+-- <msg:2> owner (html)
+   | <p>new <root>/work/breaker</p>
+-- <msg:3> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>✅ Work chat created: s001</p>
+   | <p>Open this Teams link and send your task there:<br>
+   | <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
+   | <p>If Teams does not show it right away, search for: s001</p>
+-- <msg:4> owner (html)
+   | <p>new <root>/work/burst</p>
+-- <msg:5> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>✅ Work chat created: s002</p>
+   | <p>Open this Teams link and send your task there:<br>
+   | <a href="https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
+   | <p>If Teams does not show it right away, search for: s002</p>
+-- <msg:6> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Paused auto-start in s001 (possible self-echo loop). Send <code>helper unpause</code> in that chat to resume.</p>
+-- "Codex finished" notices, by session (batching is timing: the s002 burst finishes concurrently with the s001 pause notice in the control chat)
+   finished: s001 · breaker (@owner)
+   finished: s001 · breaker (@owner)
+   finished: s002 · burst (@owner)
+   finished: s002 · burst (@owner)
+   finished: s002 · burst (@owner)
+
+== chat <chat:2> "s001 · breaker"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Work chat created: s001.<br>
+   | Working directory: <root>/work/breaker</p>
+-- <msg:2> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>💬 Work chat is ready.<br>
+   | Send a task in this chat. Codex will start automatically and continue this session.<br>
+   | Status: waiting for your first task.<br>
+   | Session: s001<br>
+   | Project: breaker<br>
+   | Working directory: <root>/work/breaker<br>
+   | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
+   | Need more details? Send <code>helper status</code>.</p>
+-- <msg:3> owner (html)
+   | <p>Long task E2E-BREAKER-running-1</p>
+-- <msg:4> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+-- <msg:5> peer-helper (html)
+   | <p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+-- <msg:6> peer-helper (html)
+   | <p><strong>🔧 Helper:</strong></p>
+   | <p>💬 Work chat is ready.<br>
+   | Send a task in this chat. Codex will start automatically and continue this session.<br>
+   | Status: waiting for your first task.<br>
+   | Session: s001<br>
+   | Project: breaker<br>
+   | Working directory: <root>/work/breaker<br>
+   | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
+   | Need more details? Send <code>helper status</code>.</p>
+-- <msg:7> peer-helper (html)
+   | <p><strong>🔧 Helper:</strong></p>
+   | <p>Work chat created: s001.<br>
+   | Working directory: <root>/work/breaker</p>
+-- <msg:8> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Paused auto-start of new requests: several messages that look like helper output arrived in a short time (possible self-echo loop). Messages are still read and held. Send <code>helper unpause</code> to resume.</p>
+-- <msg:9> owner (html)
+   | <p>Prompt while paused E2E-BREAKER-held-5</p>
+-- <msg:10> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Request held: this chat is paused, so new requests do not run. It will not run later by itself; resend it once the chat is resumed.</p>
+-- <msg:11> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>Final of the running turn E2E-BREAKER-running-1</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+-- <msg:12> owner (html)
+   | <p>Prompt after restart E2E-BREAKER-afterrestart-6</p>
+-- <msg:13> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Request held: this chat is paused, so new requests do not run. It will not run later by itself; resend it once the chat is resumed.</p>
+-- <msg:14> owner (html)
+   | <p>helper unpause</p>
+-- <msg:15> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Resumed: new requests in this chat run again. Requests sent while paused were not run; resend them if needed.</p>
+-- <msg:16> owner (html)
+   | <p>Prompt after unpause E2E-BREAKER-afterunpause-7</p>
+-- <msg:17> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+-- <msg:18> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>E2EANSWER-<n> answer for E2E-BREAKER-afterunpause-7</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+
+== chat <chat:3> "s002 · burst"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Work chat created: s002.<br>
+   | Working directory: <root>/work/burst</p>
+-- <msg:2> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>💬 Work chat is ready.<br>
+   | Send a task in this chat. Codex will start automatically and continue this session.<br>
+   | Status: waiting for your first task.<br>
+   | Session: s002<br>
+   | Project: burst<br>
+   | Working directory: <root>/work/burst<br>
+   | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
+   | Need more details? Send <code>helper status</code>.</p>
+-- <msg:3> owner (html)
+   | <p>Quick question 0 E2E-BREAKER-burst0-2</p>
+-- <msg:4> owner (html)
+   | <p>Quick question 1 E2E-BREAKER-burst1-3</p>
+-- <msg:5> owner (html)
+   | <p>Quick question 2 E2E-BREAKER-burst2-4</p>
+-- <msg:6> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+-- <msg:7> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⚠️ <strong>Your request is queued.</strong></p>
+   | <p><strong>Next step:</strong> wait. I will run your request after the current Codex request finishes.</p>
+   | <p>Another Codex request is already running in this Work chat, so I will run yours after it finishes.</p>
+   | <hr/>
+   | <p><strong>Currently blocking:</strong><br>
+   | Codex/helper work already in progress.</p>
+   | <p><strong>⏳ Queued requests:</strong></p>
+   | <ol><li>Quick question 0 E2E-BREAKER-burst0-2</li>
+   | <li>Quick question 1 E2E-BREAKER-burst1-3</li>
+   | <li>Quick question 2 E2E-BREAKER-burst2-4</li>
+   | </ol>
+   | <hr/>
+   | <p><strong>Options:</strong></p>
+   | <ul><li>Run this request next: do nothing. It is already submitted.</li>
+   | <li>Need it immediately: send it in a different 💬 Work chat.</li>
+   | <li>Drop the newest queued request: <code>helper cancel queued</code>.</li>
+   | <li>Interrupt the request ahead only if it looks stuck: <code>helper cancel running</code>.</li>
+   | </ul>
+-- <msg:8> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⚠️ <strong>Your request is queued.</strong></p>
+   | <p><strong>Next step:</strong> wait. I will run your request after the current Codex request finishes.</p>
+   | <p>Another Codex request is already running in this Work chat, so I will run yours after it finishes.</p>
+   | <hr/>
+   | <p><strong>Currently blocking:</strong><br>
+   | Codex/helper work already in progress.</p>
+   | <p><strong>⏳ Queued requests:</strong></p>
+   | <ol><li>Quick question 0 E2E-BREAKER-burst0-2</li>
+   | <li>Quick question 1 E2E-BREAKER-burst1-3</li>
+   | <li>Quick question 2 E2E-BREAKER-burst2-4</li>
+   | </ol>
+   | <hr/>
+   | <p><strong>Options:</strong></p>
+   | <ul><li>Run this request next: do nothing. It is already submitted.</li>
+   | <li>Need it immediately: send it in a different 💬 Work chat.</li>
+   | <li>Drop the newest queued request: <code>helper cancel queued</code>.</li>
+   | <li>Interrupt the request ahead only if it looks stuck: <code>helper cancel running</code>.</li>
+   | </ul>
+-- <msg:9> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>E2EANSWER-<n> answer for E2E-BREAKER-burst0-2</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+-- <msg:10> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>▶️ Codex is starting your 2 queued requests, one after another:</p>
+   | <ol><li>“Quick question 1 E2E-BREAKER-burst1-3”</li>
+   | <li>“Quick question 2 E2E-BREAKER-burst2-4”</li>
+   | </ol>
+-- <msg:11> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>E2EANSWER-<n> answer for E2E-BREAKER-burst1-3</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+-- <msg:12> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>▶️ Queued request: “Quick question 2 E2E-BREAKER-burst2-4”</p>
+   | <p>E2EANSWER-<n> answer for E2E-BREAKER-burst2-4</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+
+== codex turns (per thread; threads by kind, directory and first prompt; turns in start order)
+-- thread <uuid:1> (work, cwd <root>/work/breaker)
+   turn: answered
+   prompt| Long task E2E-BREAKER-running-1
+   prompt|
+   prompt| Helper safety:
+   prompt| - You are running inside a Codex turn launched by the chat helper. The current request is the user message above; treat earlier requests in resumed history as completed context unless the user asks about them.
+   prompt| - Do not restart, reload, kill, replace, or background the helper process, binary, or service from this turn.
+   prompt| - If the helper needs to restart after an update or local repair, finish the answer and tell the user to send `helper restart now` in the control chat.
+   prompt| - If the helper needs a release update, tell the user to send `helper update now`, or `helper update prerelease` only when they asked for prereleases.
+   prompt| - Subagent requests use native Codex subagents. For cross-machine agent delegation, use the cxp skill and its `cxp delegate` workflow when the task needs another signed-in machine.
+   prompt|
+   prompt| Put fractions, sums, integrals, matrices, and display math in <m>TeX</m> on a separate line, never in prose, tables, or lists—even if asked for one line. Use backticks for simple inline/literal TeX. Never use $ or \(...\). Math markers are not artifacts.
+   prompt|
+   prompt| If you need to return generated files or images to the Teams user, write them under this local directory:
+   prompt| <root>/home/.local/state/codex-helper/teams/core-files/outbound/cxp-<key:1>-<turn:1>
+   prompt|
+   prompt| Then include this fenced manifest in your final answer:
+   prompt| ```codex-helper-artifacts
+   prompt| {"version":1,"files":[{"path":"relative/path.ext","name":"display-name.ext"}]}
+   prompt| ```
+   prompt|
+   prompt| Use only relative manifest paths under that directory. Keep your normal answer visible; the helper attaches the listed files separately.
+   turn: answered
+   prompt| Prompt after unpause E2E-BREAKER-afterunpause-7
+   prompt|
+   prompt| Helper safety:
+   prompt| - You are running inside a Codex turn launched by the chat helper. The current request is the user message above; treat earlier requests in resumed history as completed context unless the user asks about them.
+   prompt| - Do not restart, reload, kill, replace, or background the helper process, binary, or service from this turn.
+   prompt| - If the helper needs to restart after an update or local repair, finish the answer and tell the user to send `helper restart now` in the control chat.
+   prompt| - If the helper needs a release update, tell the user to send `helper update now`, or `helper update prerelease` only when they asked for prereleases.
+   prompt| - Subagent requests use native Codex subagents. For cross-machine agent delegation, use the cxp skill and its `cxp delegate` workflow when the task needs another signed-in machine.
+   prompt|
+   prompt| Put fractions, sums, integrals, matrices, and display math in <m>TeX</m> on a separate line, never in prose, tables, or lists—even if asked for one line. Use backticks for simple inline/literal TeX. Never use $ or \(...\). Math markers are not artifacts.
+   prompt|
+   prompt| If you need to return generated files or images to the Teams user, write them under this local directory:
+   prompt| <root>/home/.local/state/codex-helper/teams/core-files/outbound/cxp-<key:1>-<turn:2>
+   prompt|
+   prompt| Then include this fenced manifest in your final answer:
+   prompt| ```codex-helper-artifacts
+   prompt| {"version":1,"files":[{"path":"relative/path.ext","name":"display-name.ext"}]}
+   prompt| ```
+   prompt|
+   prompt| Use only relative manifest paths under that directory. Keep your normal answer visible; the helper attaches the listed files separately.
+-- thread <uuid:2> (work, cwd <root>/work/burst)
+   turn: answered
+   prompt| Quick question 0 E2E-BREAKER-burst0-2
+   prompt|
+   prompt| Helper safety:
+   prompt| - You are running inside a Codex turn launched by the chat helper. The current request is the user message above; treat earlier requests in resumed history as completed context unless the user asks about them.
+   prompt| - Do not restart, reload, kill, replace, or background the helper process, binary, or service from this turn.
+   prompt| - If the helper needs to restart after an update or local repair, finish the answer and tell the user to send `helper restart now` in the control chat.
+   prompt| - If the helper needs a release update, tell the user to send `helper update now`, or `helper update prerelease` only when they asked for prereleases.
+   prompt| - Subagent requests use native Codex subagents. For cross-machine agent delegation, use the cxp skill and its `cxp delegate` workflow when the task needs another signed-in machine.
+   prompt|
+   prompt| Put fractions, sums, integrals, matrices, and display math in <m>TeX</m> on a separate line, never in prose, tables, or lists—even if asked for one line. Use backticks for simple inline/literal TeX. Never use $ or \(...\). Math markers are not artifacts.
+   prompt|
+   prompt| If you need to return generated files or images to the Teams user, write them under this local directory:
+   prompt| <root>/home/.local/state/codex-helper/teams/core-files/outbound/cxp-<key:1>-<turn:3>
+   prompt|
+   prompt| Then include this fenced manifest in your final answer:
+   prompt| ```codex-helper-artifacts
+   prompt| {"version":1,"files":[{"path":"relative/path.ext","name":"display-name.ext"}]}
+   prompt| ```
+   prompt|
+   prompt| Use only relative manifest paths under that directory. Keep your normal answer visible; the helper attaches the listed files separately.
+   turn: answered
+   prompt| Quick question 1 E2E-BREAKER-burst1-3
+   prompt|
+   prompt| Helper safety:
+   prompt| - You are running inside a Codex turn launched by the chat helper. The current request is the user message above; treat earlier requests in resumed history as completed context unless the user asks about them.
+   prompt| - Do not restart, reload, kill, replace, or background the helper process, binary, or service from this turn.
+   prompt| - If the helper needs to restart after an update or local repair, finish the answer and tell the user to send `helper restart now` in the control chat.
+   prompt| - If the helper needs a release update, tell the user to send `helper update now`, or `helper update prerelease` only when they asked for prereleases.
+   prompt| - Subagent requests use native Codex subagents. For cross-machine agent delegation, use the cxp skill and its `cxp delegate` workflow when the task needs another signed-in machine.
+   prompt|
+   prompt| Put fractions, sums, integrals, matrices, and display math in <m>TeX</m> on a separate line, never in prose, tables, or lists—even if asked for one line. Use backticks for simple inline/literal TeX. Never use $ or \(...\). Math markers are not artifacts.
+   prompt|
+   prompt| If you need to return generated files or images to the Teams user, write them under this local directory:
+   prompt| <root>/home/.local/state/codex-helper/teams/core-files/outbound/cxp-<key:1>-<turn:4>
+   prompt|
+   prompt| Then include this fenced manifest in your final answer:
+   prompt| ```codex-helper-artifacts
+   prompt| {"version":1,"files":[{"path":"relative/path.ext","name":"display-name.ext"}]}
+   prompt| ```
+   prompt|
+   prompt| Use only relative manifest paths under that directory. Keep your normal answer visible; the helper attaches the listed files separately.
+   turn: answered
+   prompt| Quick question 2 E2E-BREAKER-burst2-4
+   prompt|
+   prompt| Helper safety:
+   prompt| - You are running inside a Codex turn launched by the chat helper. The current request is the user message above; treat earlier requests in resumed history as completed context unless the user asks about them.
+   prompt| - Do not restart, reload, kill, replace, or background the helper process, binary, or service from this turn.
+   prompt| - If the helper needs to restart after an update or local repair, finish the answer and tell the user to send `helper restart now` in the control chat.
+   prompt| - If the helper needs a release update, tell the user to send `helper update now`, or `helper update prerelease` only when they asked for prereleases.
+   prompt| - Subagent requests use native Codex subagents. For cross-machine agent delegation, use the cxp skill and its `cxp delegate` workflow when the task needs another signed-in machine.
+   prompt|
+   prompt| Put fractions, sums, integrals, matrices, and display math in <m>TeX</m> on a separate line, never in prose, tables, or lists—even if asked for one line. Use backticks for simple inline/literal TeX. Never use $ or \(...\). Math markers are not artifacts.
+   prompt|
+   prompt| If you need to return generated files or images to the Teams user, write them under this local directory:
+   prompt| <root>/home/.local/state/codex-helper/teams/core-files/outbound/cxp-<key:1>-<turn:5>
+   prompt|
+   prompt| Then include this fenced manifest in your final answer:
+   prompt| ```codex-helper-artifacts
+   prompt| {"version":1,"files":[{"path":"relative/path.ext","name":"display-name.ext"}]}
+   prompt| ```
+   prompt|
+   prompt| Use only relative manifest paths under that directory. Keep your normal answer visible; the helper attaches the listed files separately.

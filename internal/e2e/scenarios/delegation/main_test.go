@@ -3,8 +3,8 @@
 // machine's inbox runs once as a Codex turn and gets one result record.
 //
 // Each scenario package is its own test binary so `go test` can run the
-// packages in parallel; with the default subprocess SUT, scenarios inside a
-// package also run in parallel (harness.Parallel).
+// packages in parallel; scenarios inside a package also run in parallel
+// (harness.Parallel), each against its own cxp process.
 package delegation
 
 import (

@@ -88,9 +88,11 @@ type resolveResult struct {
 // token.
 func resolveWorker(s *harness.Scenario, as harness.CLIAs) (candidate, bool) {
 	var found candidate
+	poll := as
+	poll.Poll = true
 	ok := s.WaitFor("the requester sees the worker online and accepting", 60*time.Second, func() (bool, string) {
 		var r resolveResult
-		res := s.RunCLIAs(60*time.Second, as, "delegate", "resolve", "--query", harness.MachineLabel, "--json")
+		res := s.RunCLIAs(60*time.Second, poll, "delegate", "resolve", "--query", harness.MachineLabel, "--json")
 		if res.Code != 0 || json.Unmarshal([]byte(res.Stdout), &r) != nil {
 			return false, harness.NormalizeSpace(res.Combined)
 		}
@@ -102,6 +104,17 @@ func resolveWorker(s *harness.Scenario, as harness.CLIAs) (candidate, bool) {
 		}
 		return false, fmt.Sprintf("%d candidates", len(r.Candidates))
 	})
+	if ok {
+		// The settled answer, for the golden.
+		var r resolveResult
+		if delegateJSON(s, as, &r, "resolve", "--query", harness.MachineLabel) {
+			for _, c := range r.Candidates {
+				if c.MachineID == found.MachineID {
+					found = c
+				}
+			}
+		}
+	}
 	return found, ok
 }
 
@@ -160,7 +173,9 @@ func inboxRecords(s *harness.Scenario, id string) (map[string][]record, []string
 				continue
 			}
 			inbox = c.ID
-			out[r.Kind] = append(out[r.Kind], r)
+			// Kinds on the wire are "cxp.delegation.<kind>.v1".
+			kind := strings.TrimSuffix(strings.TrimPrefix(r.Kind, "cxp.delegation."), ".v1")
+			out[kind] = append(out[kind], r)
 		}
 	}
 	if inbox != "" {
@@ -189,13 +204,19 @@ func describe(recs map[string][]record) string {
 // sees it (`cxp delegate status`).
 func waitTerminal(s *harness.Scenario, as harness.CLIAs, id string, timeout time.Duration) state {
 	var st state
-	s.WaitFor("terminal result of "+id, timeout, func() (bool, string) {
+	poll := as
+	poll.Poll = true
+	if s.WaitFor("terminal result of "+id, timeout, func() (bool, string) {
 		st = state{}
-		if !delegateJSON(s, as, &st, "status", "--id", id) {
+		if !delegateJSON(s, poll, &st, "status", "--id", id) {
 			return false, "status failed"
 		}
 		return st.Terminal != nil, st.Status
-	})
+	}) {
+		// The settled state, for the golden.
+		st = state{}
+		delegateJSON(s, as, &st, "status", "--id", id)
+	}
 	return st
 }
 

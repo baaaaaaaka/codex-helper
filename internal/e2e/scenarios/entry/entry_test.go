@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -150,7 +151,14 @@ func TestEntryConvertsOldStoreAtFirstStart(t *testing.T) {
 	}
 	// The chats the older helper created exist in Teams.
 	const control = "19:control@thread.v2"
+	// Seeded in id order: the transcript lists chats with equal (empty)
+	// titles in creation order.
+	seed := make([]string, 0, len(ids))
 	for id := range ids {
+		seed = append(seed, id)
+	}
+	sort.Strings(seed)
+	for _, id := range seed {
 		s.Graph.SeedChat(id, "")
 	}
 	s.Check("the control chat is among the old store's chats", ids[control], control, fmt.Sprint(len(ids)))

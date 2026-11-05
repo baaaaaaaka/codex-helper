@@ -29,6 +29,12 @@ func TestKillSwitchFile(t *testing.T) {
 		Title:      "DISABLED next to the store stops the running helper, refuses a start with no Graph traffic; removing it resumes and answers the held prompt once",
 		Budget:     120 * time.Second,
 		Seam:       harness.Seam{Knobs: map[string]string{"Heartbeat": "500ms"}},
+		Invariants: harness.Invariants{Except: []harness.Exception{
+			{Invariant: harness.InvCleanStop, Match: `cxp-1 exited on its own with "exit status 1"`,
+				Reason: "the point of the scenario: DISABLED stops the running helper with an error naming the file"},
+			{Invariant: harness.InvCleanStop, Match: `cxp-2 exited on its own with "exit status 1"`,
+				Reason: "the point of the scenario: a start while DISABLED exists is refused with an error"},
+		}},
 	})
 	defer s.Finish()
 	control := steps.ReadyControlChat(s)

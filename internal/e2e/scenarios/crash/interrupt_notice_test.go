@@ -27,6 +27,7 @@ func TestInterruptionNoticeText(t *testing.T) {
 		Guarantees: []string{"R-33", "B-5", "interrupt-notice-once-no-internal-ids"},
 		Title:      "interruption notice: one per interrupted turn, at restart, before the next turn, without internal ids",
 		Budget:     150 * time.Second,
+		Golden:     harness.GoldenOptions{FinishedNotices: "several chats finish together after the restart"},
 	})
 	defer s.Finish()
 	tokA, tokB, tokC := s.Token("runa"), s.Token("runb"), s.Token("idlec")

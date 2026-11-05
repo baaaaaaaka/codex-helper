@@ -30,6 +30,12 @@ func TestStandbyTakeoverOnStaleOwner(t *testing.T) {
 		Title:      "shared home: a second host stands by with no Graph traffic, takes over after the owner's heartbeat is stale, the old owner is fenced and posts nothing",
 		Budget:     220 * time.Second,
 		Seam:       harness.Seam{Knobs: map[string]string{"Heartbeat": "500ms"}, Hostname: "host-a"},
+		Invariants: harness.Invariants{Except: []harness.Exception{
+			{Invariant: harness.InvCleanStop, Match: `cxp-1 exited on its own with "exit status 1"`,
+				Reason: "the point of the scenario: the resumed old owner is fenced and exits with an error"},
+			{Invariant: harness.InvCleanStop, Match: `^cxp-B-\d+ exited on its own with "exit status 1"$`,
+				Reason: "host B is started repeatedly; each start refused by the live owner exits with an error (the takeover is checked by the scenario)"},
+		}},
 	})
 	defer s.Finish()
 	t.Cleanup(func() { harness.Thaw(s.SUT) })

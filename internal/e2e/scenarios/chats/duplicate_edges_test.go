@@ -40,6 +40,11 @@ func TestDuplicateGuardEdges(t *testing.T) {
 	other, _ := steps.NewWorkChat(s, control, "dupother")
 	const dupNotice = "Duplicate request ignored"
 	dupNotices := func() int { return len(s.SUTMessagesContaining(work.ID, dupNotice)) }
+	// answers waits until the work chat shows n answers for tok, so the
+	// next user message follows the helper's posts (a fixed transcript).
+	answers := func(tok string, n int) {
+		s.Poll(steps.AnswerTimeout, func() bool { return len(s.SUTMessagesContaining(work.ID, "answer for "+tok)) >= n })
+	}
 
 	// Sanity: a plain repeat inside the window is ignored.
 	plain := s.Token("plain")
@@ -60,6 +65,7 @@ func TestDuplicateGuardEdges(t *testing.T) {
 	s.Poll(8*time.Second, func() bool { return false })
 	steps.MustPost(s, work.ID, "Plain repeat "+plain)
 	s.Poll(steps.AnswerTimeout, func() bool { return len(s.Codex.CallsWithToken(plain)) == 3 })
+	answers(plain, 2)
 	s.Check("a repeat after the window runs", len(s.Codex.CallsWithToken(plain)) == 3, "3 turns in total",
 		fmt.Sprint(len(s.Codex.CallsWithToken(plain))))
 
@@ -69,6 +75,9 @@ func TestDuplicateGuardEdges(t *testing.T) {
 	s.Poll(steps.AnswerTimeout, func() bool { return len(s.SUTMessagesContaining(work.ID, "scripted failure")) > 0 })
 	steps.MustPost(s, work.ID, "This one fails first "+failTok)
 	s.Poll(15*time.Second, func() bool { return len(s.Codex.CallsWithToken(failTok)) == 2 || dupNotices() > notices0 })
+	if len(s.Codex.CallsWithToken(failTok)) == 2 {
+		answers(failTok, 1)
+	}
 	s.Settle(time.Second, 4*time.Second)
 	s.Check("resending a failed prompt within the window runs it", len(s.Codex.CallsWithToken(failTok)) == 2 && dupNotices() == notices0,
 		"2 turns, no duplicate notice (v0.1.20: only queued/running/completed turns suppress)",

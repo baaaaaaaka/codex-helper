@@ -113,12 +113,17 @@ type CLIAs struct {
 	Dir string
 	// Hostname is the host name the command believes it runs on.
 	Hostname string
+	// Poll marks one try of a wait loop: how many tries a wait takes is
+	// timing, so the run is not part of the golden. The scenario records
+	// the settled result with one more run without Poll.
+	Poll bool
 }
 
-// RunCLIAs is RunCLI run as as; the run is part of the golden.
+// RunCLIAs is RunCLI run as as; the run is part of the golden unless
+// as.Poll is set.
 func (s *Scenario) RunCLIAs(timeout time.Duration, as CLIAs, args ...string) CLIResult {
 	s.T.Helper()
-	return s.runCLIWith(timeout, true, as, args...)
+	return s.runCLIWith(timeout, !as.Poll, as, args...)
 }
 
 // CLIResult is the outcome of one cxp command.

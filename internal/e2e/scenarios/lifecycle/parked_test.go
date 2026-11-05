@@ -32,6 +32,7 @@ func TestParkedChat_NoPollingAndWake(t *testing.T) {
 		Guarantees: []string{"F-WRK-6", "F-WRK-7", "F-WRK-8", "F-CTL-12", "R-14", "R-4", "R-11", "R-3"},
 		Title:      "parked chat: no Graph reads; `r` wakes it and runs the parked prompt once; local TUI update reactivates it",
 		Budget:     150 * time.Second,
+		Golden:     harness.GoldenOptions{FinishedNotices: "several chats finish close together"},
 	})
 	defer s.Finish()
 	control := steps.ReadyControlChat(s)

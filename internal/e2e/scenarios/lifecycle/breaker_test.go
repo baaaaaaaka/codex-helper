@@ -27,6 +27,7 @@ func TestSelfEchoBreaker(t *testing.T) {
 		Guarantees: []string{"F-WRK-14", "R-7", "R-11", "R-22", "R-4"},
 		Title:      "3 marker-less helper echoes in 60 s: pause auto-start only, running turn survives, one notice, survives restart, `helper unpause` lifts it",
 		Budget:     150 * time.Second,
+		Golden:     harness.GoldenOptions{FinishedNotices: "the s002 burst finishes concurrently with the s001 pause notice in the control chat"},
 	})
 	defer s.Finish()
 	running := s.Token("running")

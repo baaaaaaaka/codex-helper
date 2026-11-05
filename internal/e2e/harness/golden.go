@@ -19,6 +19,7 @@ package harness
 // A mismatch fails the scenario with a unified diff.
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -50,6 +51,12 @@ type GoldenOptions struct {
 	Masks []Mask
 	// OmitCodex leaves the Codex section out (reason).
 	OmitCodex string
+	// FinishedNotices renders the owner's "Codex finished in …"
+	// notifications of the control chat as the sorted list of the
+	// sessions they name (with their @mention), not as messages, because
+	// finals that complete together are batched by timing. Value: the
+	// reason. A session notified twice still shows twice.
+	FinishedNotices string
 }
 
 // Mask replaces every match of Pattern in the transcript with Replace.
@@ -64,6 +71,9 @@ func (o GoldenOptions) validate() error {
 		if strings.TrimSpace(r) == "" {
 			return fmt.Errorf("golden: UnorderedChats[%q] needs a reason", k)
 		}
+	}
+	if o.FinishedNotices != "" && strings.TrimSpace(o.FinishedNotices) == "" {
+		return fmt.Errorf("golden: FinishedNotices needs a reason")
 	}
 	for _, m := range o.Masks {
 		if m.Pattern == nil || strings.TrimSpace(m.Reason) == "" {
@@ -121,6 +131,13 @@ func (s *Scenario) GoldenTranscript() string {
 			}
 		}
 		msgs := s.Graph.Messages(c.ID)
+		var notices []string
+		if s.Opts.Golden.FinishedNotices != "" && strings.HasPrefix(c.Topic, ControlChatTopicMarker) {
+			msgs, notices = splitFinishedNotices(msgs, who)
+		}
+		// Message placeholders are numbered per chat, so a difference in
+		// one chat does not renumber the others.
+		n.counters["msg"] = 0
 		for _, m := range msgs {
 			n.msgID(m.ID)
 		}
@@ -133,7 +150,13 @@ func (s *Scenario) GoldenTranscript() string {
 			})
 		}
 		for _, m := range msgs {
-			s.renderMessage(&b, n, m, who)
+			s.renderMessage(&b, n, m, who, c.Topic == RegistryChatTopic)
+		}
+		if len(notices) > 0 {
+			fmt.Fprintf(&b, "-- \"Codex finished\" notices, by session (batching is timing: %s)\n", s.Opts.Golden.FinishedNotices)
+			for _, x := range notices {
+				fmt.Fprintf(&b, "   finished: %s\n", n.norm(x))
+			}
 		}
 	}
 
@@ -208,7 +231,7 @@ var senders = map[fakegraph.Origin]string{
 	fakegraph.OriginSeeded:      "seeded",
 }
 
-func (s *Scenario) renderMessage(b *strings.Builder, n *normalizer, m fakegraph.Message, who func(string) string) {
+func (s *Scenario) renderMessage(b *strings.Builder, n *normalizer, m fakegraph.Message, who func(string) string, heartbeat bool) {
 	sender := senders[m.Origin]
 	if sender == "" {
 		sender = string(m.Origin)
@@ -229,6 +252,7 @@ func (s *Scenario) renderMessage(b *strings.Builder, n *normalizer, m fakegraph.
 	}
 	fmt.Fprintf(b, "-- %s %s%s (%s)\n", n.msgID(m.ID), sender, extra, m.ContentType)
 	writeHTML(b, n.norm(m.Content))
+	writeWireRecords(b, n, m.Content)
 	for _, raw := range m.Mentions {
 		var mention struct {
 			ID          json.Number `json:"id"`
@@ -254,7 +278,12 @@ func (s *Scenario) renderMessage(b *strings.Builder, n *normalizer, m fakegraph.
 		_ = json.Unmarshal(a, &v)
 		fmt.Fprintf(b, "   attachment: %s\n", n.norm(canonicalJSON(v)))
 	}
-	if m.PatchCount > 0 {
+	if m.PatchCount > 0 && heartbeat {
+		// The registry card is re-written on every heartbeat: how often
+		// depends on the scenario's duration, so only the final version
+		// is behaviour.
+		b.WriteString("   edited by heartbeats (count and earlier versions not recorded: timing)\n")
+	} else if m.PatchCount > 0 {
 		fmt.Fprintf(b, "   edited %d time(s); earlier versions:\n", m.PatchCount)
 		for i, old := range m.PatchHistory {
 			fmt.Fprintf(b, "   [version %d]\n", i+1)
@@ -268,7 +297,7 @@ func (s *Scenario) renderCodex(b *strings.Builder, n *normalizer) {
 	if len(calls) == 0 {
 		return
 	}
-	b.WriteString("\n== codex turns (per thread, in start order)\n")
+	b.WriteString("\n== codex turns (per thread; threads by kind, directory and first prompt; turns in start order)\n")
 	var threads []string
 	byThread := map[string][]CodexCall{}
 	for _, c := range calls {
@@ -281,6 +310,13 @@ func (s *Scenario) renderCodex(b *strings.Builder, n *normalizer) {
 		}
 		byThread[key] = append(byThread[key], c)
 	}
+	// Threads of different chats start concurrently: order them by what
+	// they are, not by which start won the race.
+	key := func(t string) string {
+		c := byThread[t][0]
+		return c.Kind + "\x00" + n.scratch(c.Cwd) + "\x00" + n.scratch(c.Prompt)
+	}
+	sort.SliceStable(threads, func(a, b int) bool { return key(threads[a]) < key(threads[b]) })
 	for _, t := range threads {
 		cs := byThread[t]
 		fmt.Fprintf(b, "-- thread %s (%s, cwd %s)\n", n.norm(t), cs[0].Kind, n.norm(cs[0].Cwd))
@@ -433,4 +469,82 @@ func packageRel() string {
 			return filepath.Base(wd)
 		}
 	}
+}
+
+// wireRecordRE finds cxp's machine-to-machine records (delegation records,
+// registry cards): a marker and a base64url JSON payload.
+var wireRecordRE = regexp.MustCompile(`(CXP_[A-Z_]+_V\d+)\s+([A-Za-z0-9_\-]{8,})`)
+
+// writeWireRecords decodes the wire records of a message so the golden
+// shows their content (they are what other machines read).
+func writeWireRecords(b *strings.Builder, n *normalizer, content string) {
+	for _, sub := range wireRecordRE.FindAllStringSubmatch(content, -1) {
+		raw, err := base64.RawURLEncoding.DecodeString(sub[2])
+		if err != nil {
+			fmt.Fprintf(b, "   record %s: not base64url (%v)\n", sub[1], err)
+			continue
+		}
+		var v any
+		if err := json.Unmarshal(raw, &v); err != nil {
+			fmt.Fprintf(b, "   record %s: not JSON (%v)\n", sub[1], err)
+			continue
+		}
+		pretty, _ := json.MarshalIndent(v, "", "  ")
+		fmt.Fprintf(b, "   record %s:\n", sub[1])
+		writeBlock(b, "   record| ", n.norm(string(pretty)))
+	}
+}
+
+var (
+	finishedOneRE  = regexp.MustCompile(`^Codex finished in (.+?)\. Open:`)
+	finishedManyRE = regexp.MustCompile(`<a href="[^"]*">([^<]+)</a> \(https://`)
+)
+
+// splitFinishedNotices takes the helper's "Codex finished in …" notices
+// out of msgs and returns, sorted, one line per session they name with the
+// message's mentions.
+func splitFinishedNotices(msgs []fakegraph.Message, who func(string) string) ([]fakegraph.Message, []string) {
+	var rest []fakegraph.Message
+	var out []string
+	for _, m := range msgs {
+		text := strings.TrimSpace(m.PlainText())
+		if i := strings.Index(text, "Codex finished in "); m.Origin != fakegraph.OriginSUT || i < 0 || i > 40 {
+			rest = append(rest, m)
+			continue
+		}
+		var at []string
+		for _, raw := range m.Mentions {
+			var mention struct {
+				Mentioned struct {
+					User *struct {
+						ID string `json:"id"`
+					} `json:"user"`
+				} `json:"mentioned"`
+			}
+			_ = json.Unmarshal(raw, &mention)
+			if mention.Mentioned.User != nil {
+				at = append(at, "@"+who(mention.Mentioned.User.ID))
+			}
+		}
+		mentions := " (no mention)"
+		if len(at) > 0 {
+			mentions = " (" + strings.Join(at, " ") + ")"
+		}
+		var names []string
+		if sub := finishedOneRE.FindStringSubmatch(text[strings.Index(text, "Codex finished in "):]); sub != nil {
+			names = append(names, sub[1])
+		} else {
+			for _, a := range finishedManyRE.FindAllStringSubmatch(m.Content, -1) {
+				names = append(names, a[1])
+			}
+		}
+		if len(names) == 0 {
+			names = append(names, "unparsed: "+text)
+		}
+		for _, name := range names {
+			out = append(out, name+mentions)
+		}
+	}
+	sort.Strings(out)
+	return rest, out
 }
