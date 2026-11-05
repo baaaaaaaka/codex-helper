@@ -55,3 +55,22 @@ func TestRegistryCardHeartbeatAndDrainingOnStop(t *testing.T) {
 		t.Fatalf("last card on stop = %+v, want draining", last)
 	}
 }
+
+// The card is published as soon as the inbox chat exists, not a control
+// interval later: the sender creates the chat under the write pacing and
+// wakes the registry loop (e2e INBOX: a card posted 5 s after the start
+// fell into the idle window).
+func TestRegistryCardPublishedOnceTheInboxExists(t *testing.T) {
+	reg := &fakeRegistrar{}
+	r := newRig(t, func(c *Config) {
+		c.Registry, c.Registrar = true, reg
+		c.Timing.Control = time.Minute
+	})
+	var inbox string
+	r.wait("inbox chat", func() bool { inbox = r.chatOf("inbox"); return inbox != "" })
+	created := time.Now()
+	r.waitFor("card", 5*time.Second, func() bool { return len(reg.all()) >= 1 })
+	if lag := time.Since(created); lag > 2*time.Second {
+		t.Fatalf("card published %v after the inbox chat was created", lag)
+	}
+}

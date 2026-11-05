@@ -75,6 +75,54 @@ func NewRegistry(cfg RegistryConfig) *Registry {
 		Now: func() time.Time { return cfg.Now().UTC() }}}
 }
 
+var _ engine.WritePaced = (*Registry)(nil)
+
+// PaceWrites makes every Graph write of the registry (card posts and
+// edits, meeting chat creation and renewal) wait for wait first: the
+// engine's account write pacing, which the card shares with every other
+// write of the helper. The engine calls it before it starts.
+func (r *Registry) PaceWrites(wait func(ctx context.Context) error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	ch := pacedChannel{MeetingChannel: r.cfg.Channel, wait: wait}
+	r.cfg.Channel = ch
+	r.store.Graph = graph{ch}
+}
+
+// pacedChannel is a MeetingChannel whose writes wait for the pacing first.
+type pacedChannel struct {
+	MeetingChannel
+	wait func(ctx context.Context) error
+}
+
+func (c pacedChannel) Send(ctx context.Context, chat string, p channel.Part, token string) (channel.Sent, error) {
+	if err := c.wait(ctx); err != nil {
+		return channel.Sent{}, err
+	}
+	return c.MeetingChannel.Send(ctx, chat, p, token)
+}
+
+func (c pacedChannel) Edit(ctx context.Context, chat, id string, p channel.Part, token string) error {
+	if err := c.wait(ctx); err != nil {
+		return err
+	}
+	return c.MeetingChannel.Edit(ctx, chat, id, p, token)
+}
+
+func (c pacedChannel) CreateMeetingChat(ctx context.Context, title, key string, start, end time.Time) (channel.ChatInfo, chteams.Meeting, error) {
+	if err := c.wait(ctx); err != nil {
+		return channel.ChatInfo{}, chteams.Meeting{}, err
+	}
+	return c.MeetingChannel.CreateMeetingChat(ctx, title, key, start, end)
+}
+
+func (c pacedChannel) RenewMeeting(ctx context.Context, id string, start, end time.Time) (chteams.Meeting, error) {
+	if err := c.wait(ctx); err != nil {
+		return chteams.Meeting{}, err
+	}
+	return c.MeetingChannel.RenewMeeting(ctx, id, start, end)
+}
+
 // InboxKey is the channel key (meeting externalId) of the machine's inbox
 // chat: requesters open the inbox by this key (the card's inbox_ref).
 func InboxKey(tenantID, ownerID, machineID string) string {

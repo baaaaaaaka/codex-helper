@@ -185,8 +185,9 @@ type Config struct {
 	Readers, Senders, Turns int
 	// ReadRate caps chat reads per second account-wide (paced like writes, pace.go).
 	ReadRate float64
-	// WriteRate caps sends per second account-wide: the ceiling of the
-	// adaptive write pacing (pace.go).
+	// WriteRate caps Graph writes per second account-wide (posts, file
+	// uploads, chat creations, the registry card): the ceiling of the
+	// adaptive write pacing (pace.go). Default DefaultWriteRate.
 	WriteRate float64
 
 	finishFault func() error // tests: fails the turn-finish transaction
@@ -256,6 +257,9 @@ type Engine struct {
 	// drainFlag holds new turn starts while an update waits for running
 	// turns to finish (upgrade.go).
 	drainFlag atomic.Bool
+	// writeWaiters counts writers in waitWrite: the sender leaves the
+	// account's write tokens to them (sender.go).
+	writeWaiters atomic.Int32
 	// starting counts turn starts between the drain check and running
 	// being set (guarded by mu).
 	starting     int
@@ -286,6 +290,10 @@ type Engine struct {
 	reminded     map[int64]int    // queued turn id -> queue reminders posted (R-35)
 	intro        map[int64]string // first notice of a chat being created (mirror)
 	restart      restartConfirm   // confirmation owed for a `helper restart`
+	// chatWant are the creating conversations whose chat the sender is
+	// to create, with the send class the creation is ranked in (control.go
+	// requestChat; under mu).
+	chatWant map[int64]int
 	// legacy are the previous helper's unconfirmed answers (legacy_check.go),
 	// guarded by legacyMu.
 	legacyMu sync.Mutex
@@ -336,7 +344,7 @@ func New(cfg Config) (*Engine, error) {
 		cfg.ReadRate = 4
 	}
 	if cfg.WriteRate <= 0 {
-		cfg.WriteRate = 4
+		cfg.WriteRate = DefaultWriteRate
 	}
 	e := &Engine{
 		cfg: cfg, st: cfg.Store, ch: timedChannel{cfg.Channel}, ag: cfg.Agent, t: cfg.Timing, log: cfg.Log, now: cfg.Now, statFile: transcript.Stat, readMeta: transcript.ReadMeta,
@@ -351,7 +359,27 @@ func New(cfg Config) (*Engine, error) {
 	}
 	e.readTokens = newPacer(cfg.ReadRate, e.t.PaceIncrease, e.now)
 	e.writeTokens = newPacer(cfg.WriteRate, e.t.PaceIncrease, e.now)
+	if p, ok := cfg.Registrar.(WritePaced); ok {
+		p.PaceWrites(e.waitWrite)
+	}
 	return e, nil
+}
+
+// DefaultWriteRate is the ceiling of the account's write pacing, for every
+// Graph write together. The pacer's bucket holds one second of rate, so
+// the most writes any 60 s can see is 61 × the rate: 219 at 3.6/s. That
+// keeps a full minute of catch-up 8% under the 240 writes per minute
+// (4/s) the helper must never exceed, where 4/s with its one-second burst
+// would allow 244 (the real-store run measured 243 posts alone, and 303
+// writes with the unpaced chat creations).
+const DefaultWriteRate = 3.6
+
+// WritePaced is implemented by a Registrar (or any other writer the
+// engine hands its writes to) whose Graph writes must share the account's
+// write pacing: the engine gives it wait, which blocks until one write may
+// go (or ctx ends).
+type WritePaced interface {
+	PaceWrites(wait func(ctx context.Context) error)
 }
 
 func (e *Engine) logf(format string, args ...any) {
@@ -553,7 +581,7 @@ func (e *Engine) start(ctx context.Context) error {
 	if err := e.ensureControl(ctx); err != nil {
 		return err
 	}
-	e.resumeCreating(ctx)
+	e.resumeCreating()
 	e.requeueCommands()
 	e.loadRestartConfirm()
 	if err := e.announceUpdate(); err != nil {

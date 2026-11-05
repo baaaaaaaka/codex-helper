@@ -5,15 +5,16 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"time"
 	"unicode"
 
+	"github.com/baaaaaaaka/codex-helper/internal/channel"
 	"github.com/baaaaaaaka/codex-helper/internal/core/store"
 )
 
 // ensureControl makes sure the control conversation exists. Its chat is
-// created by createChat (idempotent per key), here or later by
-// maintenance when the channel is unavailable at start.
+// created by createChat (idempotent per key) on the sender's first pass,
+// ahead of every other write, or later when the channel is unavailable at
+// start.
 func (e *Engine) ensureControl(ctx context.Context) error {
 	e.mu.Lock()
 	id := e.controlID
@@ -100,26 +101,70 @@ func (e *Engine) controlTitle() string {
 	return "Codex Control - " + e.cfg.Machine
 }
 
-// resumeCreating creates the chats of conversations still in creating
-// state (control first). Failures are retried by maintenance.
-func (e *Engine) resumeCreating(ctx context.Context) {
+// resumeCreating asks the sender to create the chats of conversations
+// still in creating state (control first); maintenance calls it again for
+// failures. Every chat creation is a Graph write: the sender makes it under
+// the account's write pacing, ranked like a send (dueChats).
+func (e *Engine) resumeCreating() {
 	e.mu.Lock()
 	var ids []int64
-	if cs := e.convs[e.controlID]; cs != nil && cs.state == store.ConvCreating {
-		ids = append(ids, cs.id)
-	}
 	for id, cs := range e.convs {
-		if cs.state == store.ConvCreating && id != e.controlID {
+		if cs.state == store.ConvCreating {
 			ids = append(ids, id)
 		}
 	}
 	e.mu.Unlock()
 	for _, id := range ids {
-		if ctx.Err() != nil {
-			return
+		if v, _, err := e.st.Meta(discoveredKey(id)); err != nil || v == discoveredPending {
+			continue // a discovered session with nothing to mirror yet: no chat
 		}
-		e.createChat(ctx, id)
+		// Nobody waits for these chats (a retry, or chats left from an
+		// earlier process): they go with the background class, after
+		// the replies.
+		e.requestChat(id, sendMirror)
 	}
+}
+
+// requestChat asks the sender to create the chat of a creating
+// conversation, ranked in send class class (sendMirror: nobody waits for
+// it; the control chat always goes first, and the chats the owner asks for
+// are created by createChatNow). A request stays until the chat exists or
+// the conversation leaves the creating state.
+func (e *Engine) requestChat(id int64, class int) {
+	e.mu.Lock()
+	if e.chatWant == nil {
+		e.chatWant = map[int64]int{}
+	}
+	if c, ok := e.chatWant[id]; !ok || class < c {
+		e.chatWant[id] = class
+	}
+	e.mu.Unlock()
+	e.wakeSender()
+}
+
+// createChatNow creates the chat the owner asked for (`new`, fork) in the
+// command, as the old helper did, so its notices keep their order with the
+// command's other replies; it waits for a write token first, ahead of the
+// sender. A failure is retried in the background (retryCreating).
+func (e *Engine) createChatNow(ctx context.Context, id int64) {
+	e.mu.Lock()
+	cs := e.convs[id]
+	if cs == nil || cs.sending {
+		e.mu.Unlock()
+		return // the sender is creating it
+	}
+	cs.sending = true // the sender leaves it alone (dueChats)
+	e.mu.Unlock()
+	defer func() {
+		e.mu.Lock()
+		cs.sending = false
+		e.mu.Unlock()
+		e.wakeSender()
+	}()
+	if err := e.waitWrite(ctx); err != nil {
+		return
+	}
+	e.createChat(ctx, id)
 }
 
 // createChat creates the chat of a creating conversation and announces it.
@@ -133,7 +178,13 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 	retry := e.now().Before(cs.nextRead) && !cs.nextRead.IsZero() && cs.failures > 0
 	intro := e.intro[id]
 	e.mu.Unlock()
-	if state != store.ConvCreating || retry {
+	if state != store.ConvCreating {
+		e.mu.Lock()
+		delete(e.chatWant, id)
+		e.mu.Unlock()
+		return false
+	}
+	if retry {
 		return false
 	}
 	if v, _, err := e.st.Meta(discoveredKey(id)); err != nil || v == discoveredPending {
@@ -147,11 +198,23 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 	if inbox && e.cfg.InboxKey != "" {
 		key = e.cfg.InboxKey
 	}
+	started := e.now()
 	info, err := e.ch.CreateChat(ctx, title, key)
 	if err != nil {
+		now := e.now()
+		next := now.Add(min(e.t.Hot<<min(cs.failures+1, 8), e.t.MaxBackoff))
+		if th, ok := channel.AsThrottled(err); ok {
+			// A chat creation spends the account's write budget like a
+			// send: an account throttle slows every write.
+			next = now.Add(e.retryAfter(th))
+			if th.Scope == channel.ScopeAccount || th.Scope == channel.ScopeUnknown {
+				e.setGate(e.gWrite, next, "create chat throttled")
+				e.paceThrottled(started, next)
+			}
+		}
 		e.mu.Lock()
 		cs.failures++
-		cs.nextRead = e.now().Add(min(e.t.Hot<<min(cs.failures, 8), e.t.MaxBackoff))
+		cs.nextRead = next
 		e.mu.Unlock()
 		e.logf("create chat for %s: %v", label, err)
 		return false
@@ -205,6 +268,7 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 		return false
 	}
 	e.mu.Lock()
+	delete(e.chatWant, id)
 	cs.failures = 0
 	cs.nextRead = e.now()
 	if inbox {
@@ -213,6 +277,9 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 	cs.lastActivity = e.now()
 	delete(e.intro, id)
 	e.mu.Unlock()
+	if inbox {
+		wake(e.registryWake) // the card can be published now
+	}
 	e.wakeReader()
 	e.wakeSender()
 	return true
@@ -226,7 +293,7 @@ func (e *Engine) machine() string {
 }
 
 // retryCreating is called by maintenance.
-func (e *Engine) retryCreating(ctx context.Context) {
+func (e *Engine) retryCreating() {
 	e.mu.Lock()
 	n := 0
 	for _, cs := range e.convs {
@@ -236,11 +303,9 @@ func (e *Engine) retryCreating(ctx context.Context) {
 	}
 	e.mu.Unlock()
 	if n > 0 {
-		e.resumeCreating(ctx)
+		e.resumeCreating()
 	}
 }
-
-var _ = time.Second
 
 func discoveredKey(conv int64) string { return fmt.Sprintf("%s%d", metaDiscoveredPrefix, conv) }
 

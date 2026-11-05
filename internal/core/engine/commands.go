@@ -356,7 +356,7 @@ func (e *Engine) cmdNew(ctx context.Context, j cmdJob, arg string) {
 			cs.cwd = dir
 		}
 		e.mu.Unlock()
-		e.createChat(ctx, id)
+		e.createChatNow(ctx, id)
 	}
 }
 

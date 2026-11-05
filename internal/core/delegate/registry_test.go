@@ -304,3 +304,41 @@ func TestResolveMachineID(t *testing.T) {
 		t.Errorf("fresh id not kept: %q", v)
 	}
 }
+
+// Every Graph write of the registry (meeting creation and renewal, card
+// post and edit) waits for the engine's account write pacing first: the
+// card shares the account's write budget with every other write.
+func TestRegistryWritesWaitForEnginePacing(t *testing.T) {
+	ch, reg, card, now := rig(t)
+	ctx := context.Background()
+	waits := 0
+	reg.PaceWrites(func(context.Context) error { waits++; return nil })
+	writes := func() int {
+		n := ch.sends + ch.edits + ch.renews
+		for _, c := range ch.creates {
+			n += c
+		}
+		return n
+	}
+	if err := reg.Publish(ctx, card); err != nil {
+		t.Fatal(err)
+	}
+	*now = now.Add(5 * time.Minute)
+	if err := reg.Publish(ctx, card); err != nil {
+		t.Fatal(err)
+	}
+	if w := writes(); w < 3 || waits != w {
+		t.Fatalf("%d writes, %d waited for the pacing", w, waits)
+	}
+	// A write the pacing does not admit is not made.
+	before := writes()
+	held := errors.New("pacing: context done")
+	reg.PaceWrites(func(context.Context) error { return held })
+	*now = now.Add(5 * time.Minute)
+	if err := reg.Publish(ctx, card); !errors.Is(err, held) {
+		t.Fatalf("publish under held pacing = %v", err)
+	}
+	if w := writes(); w != before {
+		t.Fatalf("%d writes made while the pacing held them", w-before)
+	}
+}

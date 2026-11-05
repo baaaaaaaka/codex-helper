@@ -92,11 +92,12 @@ const (
 	// The heaviest scenario used 0.6 s in the first calibration run.
 	DefaultCPUBudget = 5 * time.Second
 
-	// Rate caps. The engine paces message sends at 4/s account-wide (a
-	// token bucket holding one second of rate, so at most 8 in any 1 s
-	// window) and at most one message per chat per second
-	// (Timing.ChatRate). Other writes (chat creation, members, topics,
-	// registry card) are not paced; they only have the storm cap.
+	// Rate caps. One helper paces all its Graph writes (message posts,
+	// uploads, chat creation, the registry card) with one account token
+	// bucket of 3.6/s holding one second of rate: at most 7 in any 1 s
+	// and 3.6×61 ≈ 219 in any 60 s, 8% under CapWritesPerMinute; and at
+	// most one message per chat per second (Timing.ChatRate). The caps
+	// count every helper instance of a scenario together.
 	CapChatPostsPerSecond = 2   // message posts to one chat in any 1 s
 	CapPostsPerSecond     = 8   // message posts account-wide in any 1 s
 	CapWritesPerSecond    = 20  // Graph writes of any kind in any 1 s
