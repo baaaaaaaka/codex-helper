@@ -321,9 +321,10 @@ func TestFirstStartRendersImportedUnsentRows(t *testing.T) {
 // Owner ruling 2026-11-05 (Q1): at first start the engine reads the chat's
 // history of an answer whose send outcome was unknown (fixture o2, "maybe
 // posted", s001) and resends it only when it is not there, once: a restart
-// neither reads that history again nor resends. A post of the same text
-// that is another row's (its message id is recorded on o1) is not taken
-// for it.
+// neither reads that history again nor resends. An identical text already
+// in the chat counts as present even when the old store recorded that post
+// as another row (its message id on o1, or another old marker): owner
+// ruling after the live canary, where a 32nd identical copy was resent.
 func TestUnknownAnswerCheckedAgainstHistoryOnce(t *testing.T) {
 	const body = "maybe posted, the answer of the previous helper"
 	for _, tc := range []struct {
@@ -344,7 +345,10 @@ func TestUnknownAnswerCheckedAgainstHistoryOnce(t *testing.T) {
 				ch.PostSystem(chat, fmt.Sprintf("later event %d", i))
 			}
 		}, false},
-		{"the same text is another row's post", nil, true},
+		{"found: the same text is another row's post", nil, false},
+		{"found: the same text under another old marker", func(ch *channeltest.Fake, chat string) {
+			ch.PostOtherHelper(chat, "🤖 ✅ Codex answer:\n"+body, "o9")
+		}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			src := fixture(t, "v0120", "json")
@@ -443,7 +447,7 @@ func TestUnknownAnswerCheckedAgainstHistoryOnce(t *testing.T) {
 			resends := func() int {
 				n := 0
 				for _, m := range ch.Messages(chat) {
-					if m.Marker != "" && m.Marker != "o2" && strings.HasPrefix(m.Text, "🤖") && strings.Contains(m.Text, body) {
+					if m.Marker != "" && m.Marker != "o2" && m.Marker != "o9" && strings.HasPrefix(m.Text, "🤖") && strings.Contains(m.Text, body) {
 						n++
 					}
 				}

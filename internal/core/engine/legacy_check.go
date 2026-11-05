@@ -391,27 +391,28 @@ func (e *Engine) readHistory(ctx context.Context, chat string, since time.Time,
 
 // legacyMatch reports whether m is the post of c: by the Teams message id
 // the old helper recorded, by its hidden marker (the old outbox id), or by
-// its text: an owner-account message created at most a minute before the
-// answer, not one of this store's other posts, without another marker,
-// whose visible text contains the answer's (want: letters and digits)
-// with little else (labels, footer, @mention).
-func legacyMatch(tx *store.Tx, c store.LegacyFinalCheck, want string, m channel.InboundMsg) (bool, error) {
+// its text: an owner-account message whose visible text contains the
+// answer's (want: letters and digits) with little else (labels, footer,
+// @mention).
+//
+// Owner ruling (canary 2026-11-06): an identical text already in the chat
+// counts as present, whenever it was posted and whichever row of the old
+// store it was recorded as (another answer's post, another old marker).
+// The real control chat held 31 identical copies of the 2026-09-23 answer,
+// each recorded as another row; resending it made a 32nd.
+func legacyMatch(_ *store.Tx, c store.LegacyFinalCheck, want string, m channel.InboundMsg) (bool, error) {
 	switch {
 	case m.Kind != channel.KindMessage:
 		return false, nil
 	case c.ExtMsgID != "" && m.ID == c.ExtMsgID:
 		return true, nil
-	case m.Marker != "":
-		return m.Marker == c.LegacyID, nil
-	case !m.ByOwner || want == "" || m.Created.Before(time.UnixMilli(c.Created).Add(-time.Minute)):
+	case m.Marker != "" && m.Marker == c.LegacyID:
+		return true, nil
+	case !m.ByOwner || want == "":
 		return false, nil
 	}
 	got := letters(m.Text)
-	if !strings.Contains(got, want) || len([]rune(got))-len([]rune(want)) > legacyCheckResidue {
-		return false, nil
-	}
-	own, err := tx.IsOwn(c.ConvID, m.ID, nil, 0)
-	return !own, err
+	return strings.Contains(got, want) && len([]rune(got))-len([]rune(want)) <= legacyCheckResidue, nil
 }
 
 // letters keeps the lower-cased letters and digits of s: the visible text
