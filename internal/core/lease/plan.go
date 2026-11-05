@@ -42,7 +42,11 @@ func plan(cfg *Config, p paths, v view, gen int64, why string) Plan {
 	pl := Plan{Gen: gen, Why: why, From: r, FromGen: rg, Gap: gap}
 	if rg == 0 {
 		pl.Src = coldSource(p)
-		pl.InPlace = !gap
+		// After an unfinished first start (a claim that never served)
+		// an existing store is copied; a store that does not exist yet is
+		// created (or converted) in place once that claim's lease ran out.
+		_, err := os.Stat(pl.Src)
+		pl.InPlace = !gap || err != nil
 		pl.Quiet = gap
 	} else {
 		pl.Src = p.dbPath(r.DB)

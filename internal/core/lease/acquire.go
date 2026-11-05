@@ -24,11 +24,15 @@ import (
 //   - BatchDefer: a batch-job host waits this much longer than an
 //     interactive standby before taking over from another host.
 //
-// Safety needs Quiet >= 1.5 * Valid and Stale >= 3 * Valid: an owner whose
-// last renewal read the file just before a claim was written stops acting
-// before its successor starts, as long as the clocks of the two hosts run
-// at rates within a factor of 1.5 of each other. Clock offsets do not
-// matter: no host compares its clock with another's.
+// Safety needs Quiet >= 1.5 * Valid: an owner whose last renewal read the
+// file just before a claim was written acts for at most Valid after that
+// renewal started (by its clock), and its successor starts Quiet after
+// writing the claim (by its own clock), so the old owner has stopped first
+// as long as the two clocks run at rates within a factor of 1.5. Clock
+// offsets do not matter: no host compares its clock with another's.
+// Liveness needs Stale far above Beat + Poll, so that a renewing owner is
+// never judged stale (production: a change every 10 s, looked at every
+// 20 s, judged after 90 s without one).
 type Timing struct {
 	Beat, Valid, Poll, Stale, Quiet, BatchDefer time.Duration
 }
@@ -36,8 +40,8 @@ type Timing struct {
 // ProductionStale is the production Stale bound.
 const ProductionStale = 90 * time.Second
 
-// Production is the production timing: beat 10s, valid 30s, poll 20s,
-// stale 90s, quiet 45s, batch defer 60s.
+// Production is the production timing: beat 10s, valid 20s, poll 20s,
+// stale 90s, quiet 30s, batch defer 60s.
 func Production() Timing { return Scaled(ProductionStale) }
 
 // Scaled derives every interval from the stale bound.
@@ -47,10 +51,10 @@ func Scaled(stale time.Duration) Timing {
 	}
 	return Timing{
 		Beat:       stale / 9,
-		Valid:      stale / 3,
+		Valid:      stale * 2 / 9,
 		Poll:       stale * 2 / 9,
 		Stale:      stale,
-		Quiet:      stale / 2,
+		Quiet:      stale / 3,
 		BatchDefer: stale * 2 / 3,
 	}
 }
@@ -66,6 +70,11 @@ type Config struct {
 	// ErrOwnerLive or ErrDisabled as soon as it sees a live owner or the
 	// kill switch.
 	Wait bool
+	// Immediate claims only what can be claimed at the first look (no
+	// owner, a released one, or a dead process of this machine) and
+	// returns ErrOwnerLive otherwise: for a short command that writes the
+	// store, never for a helper.
+	Immediate bool
 	// Report is told when the standby's reason for waiting changes.
 	Report func(Standby)
 
@@ -236,6 +245,9 @@ func Acquire(ctx context.Context, cfg Config) (*Holder, error) {
 		case now.Sub(obs.since) >= cfg.Timing.Stale:
 			why, ok = "stale", true
 		}
+		if cfg.Immediate && (!ok || why == "stale") {
+			return nil, fmt.Errorf("%w: %s", ErrOwnerLive, describe(rec, recOK, g))
+		}
 		liveHere := recOK && !ok && cfg.Self.sameMachine(rec)
 		st := Standby{Reason: ReasonWatching, Gen: g, Owner: rec}
 		if !ok {
@@ -256,6 +268,9 @@ func Acquire(ctx context.Context, cfg Config) (*Holder, error) {
 		// host first; it never defers to a successor of its own host.
 		if cfg.Self.Batch && g != 0 && !(recOK && strings.EqualFold(rec.Host, cfg.Self.Host)) &&
 			now.Sub(obs.eligible) < cfg.Timing.BatchDefer {
+			if cfg.Immediate {
+				return nil, fmt.Errorf("%w: %s", ErrOwnerLive, describe(rec, recOK, g))
+			}
 			st.Reason = ReasonBatch
 			report(st)
 			continue

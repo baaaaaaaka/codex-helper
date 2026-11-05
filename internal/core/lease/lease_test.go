@@ -511,7 +511,19 @@ func TestUnknownSlotIsWaitedOutNotTrusted(t *testing.T) {
 	if d := e.clock.Now().Sub(start); d < Production().Stale {
 		t.Fatalf("took an unknown slot after %v", d)
 	}
-	if pl := h.Plan(); pl.Gen != 2 || pl.InPlace || !pl.Quiet || !pl.Gap {
+	// No store yet (an unfinished first start): created in place after
+	// the quiet wait.
+	if pl := h.Plan(); pl.Gen != 2 || !pl.InPlace || !pl.Quiet || !pl.Gap {
+		t.Fatalf("plan: %+v", pl)
+	}
+	h.Release()
+	// With a store, it is copied.
+	os.WriteFile(e.anchor, []byte("x"), 0o600)
+	h, err = e.acquire(e.cfg(ident("b", 3), false))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pl := h.Plan(); pl.Gen != 3 || pl.InPlace || !pl.Quiet || !pl.Gap {
 		t.Fatalf("plan: %+v", pl)
 	}
 }
@@ -646,5 +658,21 @@ func TestColdSourcePrefersNewestGenerationStore(t *testing.T) {
 	}
 	if pl := h.Plan(); !pl.InPlace || pl.DB != filepath.Join(e.dir, "core.g12.sqlite") {
 		t.Fatalf("plan: %+v", pl)
+	}
+}
+
+func TestImmediateNeverWaits(t *testing.T) {
+	e := newEnv(t)
+	e.put(rec(1, Active, ident("b", 1), "core.sqlite"))
+	cfg := e.cfg(ident("a", 2), false)
+	cfg.Immediate = true
+	start := e.clock.Now()
+	if _, err := e.acquire(cfg); !errors.Is(err, ErrOwnerLive) || e.clock.Now() != start {
+		t.Fatalf("immediate: %v after %v", err, e.clock.Now().Sub(start))
+	}
+	e.put(rec(1, Released, ident("a", 1), "core.sqlite"))
+	h, err := e.acquire(cfg)
+	if err != nil || !h.Plan().InPlace {
+		t.Fatalf("released: %v", err)
 	}
 }
