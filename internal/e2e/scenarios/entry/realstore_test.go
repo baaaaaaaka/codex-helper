@@ -152,16 +152,18 @@ func TestAcceptanceRealStoreFirstStart(t *testing.T) {
 	}
 
 	// CPU per second, in two phases: the start (re-hash, local sessions
-	// mirrored, the catch-up posted at the channel's pace) until
-	// the helper's writes fall to the live session's rate, then the
-	// measured idle window, while the live session keeps appending large
-	// tool outputs. The idle budget applies to the second phase.
+	// mirrored, the catch-up posted at the channel's pace, and the reads
+	// it causes) until the helper's writes and reads fall to the live
+	// session's rate, then the measured idle window, while the live
+	// session keeps appending large tool outputs. The idle budget applies
+	// to the second phase.
 	drainStart := time.Now()
-	active := sampleCPU(pid, 30*time.Minute, func() bool { return catchUpDrained(s) })
+	active := sampleCPU(pid, 30*time.Minute, func() bool { return catchUpDrained(s, control) })
 	drained := time.Since(drainStart)
 	asum := summarizeCPU(active)
 	s.Note("CPU from the start until the catch-up drained (%s, %d samples): mean %.3f%%, p99 %.1f%%, max %.1f%% of a core per second (second %d); total %.2fs CPU",
 		drained.Round(time.Second), len(active.perSec), asum.mean, asum.p99, asum.max, asum.maxAt, asum.totalSec)
+	s.Note("catch-up after the conversion: %s", catchUpTimes(s, control, converted))
 	s.Check("the catch-up drains within 30 min", drained < 30*time.Minute, "< 30m", drained.Round(time.Second).String())
 
 	samples := sampleCPU(pid, measure, nil)
@@ -172,6 +174,10 @@ func TestAcceptanceRealStoreFirstStart(t *testing.T) {
 		measure, len(samples.perSec), appended, sum.mean, sum.p99, sum.max, sum.totalSec)
 	s.Check("idle CPU mean is negligible", sum.mean <= 0.2 || len(samples.perSec) == 0, "<= 0.2% of a core", fmt.Sprintf("%.3f%%", sum.mean))
 	s.Check("no idle 1 s window above 10% of a core", sum.max <= 10, "<= 10%", fmt.Sprintf("max %.1f%% at second %d", sum.max, sum.maxAt))
+	for _, w := range []time.Duration{time.Minute, time.Second} {
+		n, from, routes := maxWrites(s, w)
+		s.Note("most Graph writes in any %s: %d from %s (%s)", w, n, from.Sub(converted).Round(time.Millisecond), routes)
+	}
 
 	out := s.SUT.Output()
 	summaryN := 0
@@ -388,21 +394,90 @@ func sampleCPU(pid int, d time.Duration, done func() bool) cpuSamples {
 }
 
 // catchUpDrained: no chat created for a minute and, over the last 30 s,
-// no more posts than the live session's mirrored turns.
-func catchUpDrained(s *harness.Scenario) bool {
+// no more posts than the live session's mirrored turns, and no more reads
+// of chats other than the control chat than those posts (each one is read
+// back once: the activity scan shows the helper's own post as the newest)
+// plus two. The reads are part of the catch-up: every chat is read once
+// at the start, and a chat whose newest message is a catch-up post is
+// read after it; at 4 reads/s they end well after the last post.
+func catchUpDrained(s *harness.Scenario, control string) bool {
 	now := time.Now()
 	for _, r := range s.Graph.Requests(fakegraph.RequestFilter{Method: "POST", Route: "POST /me/onlineMeetings/createOrGet"}) {
 		if now.Sub(r.At) < time.Minute {
 			return false
 		}
 	}
-	recent := 0
+	posts := 0
 	for _, r := range s.Graph.Requests(fakegraph.RequestFilter{Method: "POST", Route: "POST /chats/{chat}/messages"}) {
 		if now.Sub(r.At) < 30*time.Second {
-			recent++
+			posts++
 		}
 	}
-	return recent <= 4
+	reads := 0
+	for _, r := range s.Graph.Requests(fakegraph.RequestFilter{Method: "GET", Route: "GET /chats/{chat}/messages"}) {
+		if now.Sub(r.At) < 30*time.Second && r.ChatID != control {
+			reads++
+		}
+	}
+	return posts <= 4 && reads <= posts+2
+}
+
+// catchUpTimes is when the last chat was created, the last message posted
+// and the last chat other than the control chat read, after t0.
+func catchUpTimes(s *harness.Scenario, control string, t0 time.Time) string {
+	var create, post, read time.Time
+	for _, r := range s.Graph.Requests(fakegraph.RequestFilter{}) {
+		switch {
+		case r.Route == "POST /me/onlineMeetings/createOrGet":
+			create = r.At
+		case r.Route == "POST /chats/{chat}/messages":
+			post = r.At
+		case r.Route == "GET /chats/{chat}/messages" && r.ChatID != control:
+			read = r.At
+		}
+	}
+	rel := func(t time.Time) string {
+		if t.IsZero() {
+			return "none"
+		}
+		return t.Sub(t0).Round(time.Second).String()
+	}
+	return fmt.Sprintf("last chat created at %s, last message posted at %s, last chat read at %s", rel(create), rel(post), rel(read))
+}
+
+// maxWrites is the most Graph writes of the helper in any window w, when
+// the window starts and its writes by route (as the harness's rate caps
+// count them).
+func maxWrites(s *harness.Scenario, w time.Duration) (int, time.Time, string) {
+	var writes []fakegraph.Request
+	for _, r := range s.Graph.Requests(fakegraph.RequestFilter{}) {
+		if r.Host == "graph.microsoft.com" && r.Method != "GET" && r.Method != "HEAD" &&
+			strings.HasPrefix(r.Instance, "cxp") && r.Instance != "cxp-cli" {
+			writes = append(writes, r)
+		}
+	}
+	sort.SliceStable(writes, func(i, j int) bool { return writes[i].At.Before(writes[j].At) })
+	best, from, j := 0, time.Time{}, 0
+	for i := range writes {
+		for writes[i].At.Sub(writes[j].At) >= w {
+			j++
+		}
+		if n := i - j + 1; n > best {
+			best, from = n, writes[j].At
+		}
+	}
+	routes := map[string]int{}
+	for _, r := range writes {
+		if !r.At.Before(from) && r.At.Before(from.Add(w)) {
+			routes[r.Route]++
+		}
+	}
+	var out []string
+	for k, v := range routes {
+		out = append(out, fmt.Sprintf("%d× %s", v, k))
+	}
+	sort.Strings(out)
+	return best, from, strings.Join(out, ", ")
 }
 
 // taskRunNs sums the on-CPU nanoseconds of the process's threads.
