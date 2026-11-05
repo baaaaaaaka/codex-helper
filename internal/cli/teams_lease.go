@@ -42,8 +42,10 @@ func teamsLeaseTiming(seam *teamsTestSeam) lease.Timing {
 }
 
 // teamsAcquireLease waits for (service child) or tries to take (foreground)
-// the store's lease. A service child reports each reason to wait once.
+// the store's lease. A service child reports each reason to wait once; a
+// foreground start says so when it waits for an owner's lease to run out.
 func teamsAcquireLease(ctx context.Context, anchor, host string, timing lease.Timing, wait bool, errOut io.Writer) (*lease.Holder, error) {
+	var last string
 	cfg := lease.Config{
 		Anchor: anchor,
 		Self:   lease.Local(host, teamsBootID()),
@@ -54,8 +56,10 @@ func teamsAcquireLease(ctx context.Context, anchor, host string, timing lease.Ti
 			switch s.Reason {
 			case lease.ReasonDisabled:
 				reason = "the kill-switch file " + lease.DisabledFile + " exists"
-			case lease.ReasonLive:
-				reason = fmt.Sprintf("another live helper owns the Teams state (%s pid %d); this host takes over if it stops renewing its lease for %s",
+			case lease.ReasonLive, lease.ReasonWatching:
+				// Watching: not yet seen renewing. Either way the owner is
+				// left alone until its lease stays unrenewed for Stale.
+				reason = fmt.Sprintf("another helper owns the Teams state (%s pid %d); this host takes over if it stops renewing its lease for %s",
 					firstNonEmptyString(s.Owner.Host, "unknown host"), s.Owner.PID, timing.Stale)
 			case lease.ReasonBatch:
 				reason = fmt.Sprintf("this is a batch-job host; it leaves the takeover to an interactive host for %s", timing.BatchDefer)
@@ -64,8 +68,18 @@ func teamsAcquireLease(ctx context.Context, anchor, host string, timing lease.Ti
 			default:
 				return
 			}
-			if wait {
+			if reason == last {
+				return
+			}
+			last = reason
+			switch {
+			case wait:
 				_, _ = fmt.Fprintf(errOut, "Teams helper standing by: %s; checking again every %s\n", reason, timing.Poll)
+			case s.Reason == lease.ReasonWatching:
+				// A foreground start waits only for an owner that is not
+				// seen renewing (it exits on one that is): say why it is
+				// silent.
+				_, _ = fmt.Fprintf(errOut, "Teams helper waiting: %s\n", reason)
 			}
 		},
 	}
