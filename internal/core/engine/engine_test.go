@@ -29,9 +29,12 @@ type fakeAgent struct {
 	threads int
 	block   map[string]chan struct{} // text substring -> release
 	outcome func(TurnRequest) (TurnOutcome, error)
-	lookup  map[string]TurnOutcome // turn key -> outcome
-	irq     map[int64]chan struct{}
-	notes   []string // commentary streamed by turns whose text contains "progress"
+	// refuse, when it reports true, refuses turn/start: the outcome is
+	// returned before Codex starts (records) the turn.
+	refuse func(TurnRequest) (TurnOutcome, bool)
+	lookup map[string]TurnOutcome // turn key -> outcome
+	irq    map[int64]chan struct{}
+	notes  []string // commentary streamed by turns whose text contains "progress" (or is a capacity `continue`)
 	// interrupted runs after an interrupt reached a running turn.
 	interrupted func()
 	// lookupGate, when set, holds Lookup (restart reconciliation) until
@@ -66,8 +69,13 @@ func (a *fakeAgent) Run(ctx context.Context, req TurnRequest, h TurnHooks) (Turn
 	}
 	irq := make(chan struct{})
 	a.irq[req.ConvID] = irq
-	out := a.outcome
+	out, refuse := a.outcome, a.refuse
 	a.mu.Unlock()
+	if refuse != nil {
+		if o, ok := refuse(req); ok {
+			return o, nil
+		}
+	}
 	h.Started(fmt.Sprintf("turn-%d", n))
 	if wait != nil {
 		select {
@@ -81,7 +89,7 @@ func (a *fakeAgent) Run(ctx context.Context, req TurnRequest, h TurnHooks) (Turn
 	if strings.Contains(req.Text, "compaction") && h.Compacted != nil {
 		h.Compacted()
 	}
-	if strings.Contains(req.Text, "progress") && h.Progress != nil {
+	if (strings.Contains(req.Text, "progress") || req.Text == continueText) && h.Progress != nil {
 		a.mu.Lock()
 		notes := append([]string(nil), a.notes...)
 		a.mu.Unlock()
@@ -144,6 +152,17 @@ func (a *fakeAgent) calls(sub string) int {
 		}
 	}
 	return n
+}
+
+// texts is the prompt of every run, in order.
+func (a *fakeAgent) texts() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	out := make([]string, len(a.runs))
+	for i, r := range a.runs {
+		out[i] = r.Text
+	}
+	return out
 }
 
 type rig struct {
@@ -2281,8 +2300,11 @@ func TestCapacityWindowRestartsAfterProgress(t *testing.T) {
 	if got := len(r.own(work, "over capacity")); got != 0 {
 		t.Fatalf("capacity failure after progress was not retried (%d failure notices)", got)
 	}
-	if got := r.ag.calls("long progress task"); got != 3 {
-		t.Fatalf("%d attempts, want 3", got)
+	// Codex recorded the prompt with the first attempt: the retries
+	// continue the thread instead of sending it again (owner ruling
+	// 2026-11-05).
+	if got, all := r.ag.calls("long progress task"), r.ag.texts(); got != 1 || len(all) != 3 || all[1] != "continue" || all[2] != "continue" {
+		t.Fatalf("attempts %q, want the prompt once and then `continue` twice", all)
 	}
 }
 
@@ -2298,11 +2320,80 @@ func TestCapacityWindowBoundsWaitingWithoutProgress(t *testing.T) {
 	work := r.newWork(t.TempDir())
 	r.ch.PostUser(work, "never fits")
 	r.wait("failure notice", func() bool { return len(r.own(work, "over capacity")) == 1 })
-	if got := r.ag.calls("never fits"); got < 2 {
-		t.Fatalf("%d attempts, want retries before the failure", got)
+	if got, all := r.ag.calls("never fits"), r.ag.texts(); got != 1 || len(all) < 2 || all[1] != "continue" {
+		t.Fatalf("attempts %q, want the prompt once and `continue` retries before the failure", all)
 	}
 	// The retry notice is Codex status, as v0.1.20's codex-status kind.
 	if got := r.own(work, "at capacity right now"); len(got) != 1 || !strings.HasPrefix(got[0].Text, "🤖 ⏳ Codex status:\n") {
 		t.Fatalf("capacity retry notice: %+v", got)
+	}
+}
+
+// A capacity retry sends the prompt again only while Codex has never
+// started the turn (turn/start refused: the prompt is not in the thread).
+// Once an attempt was accepted, even one that made no progress, the
+// prompt is part of the thread and every later retry sends `continue` in
+// that thread, with the turn's own client id (owner ruling 2026-11-05).
+func TestCapacityRetrySendsContinueOnceCodexRecordedThePrompt(t *testing.T) {
+	r := newRig(t, func(c *Config) {
+		c.Timing.CapacityRetry = 5 * time.Second
+		c.Timing.CapacityBackoff = 10 * time.Millisecond
+	})
+	var mu sync.Mutex
+	n := 0
+	attempt := func() int { mu.Lock(); defer mu.Unlock(); n++; return n }
+	capacity := TurnOutcome{Status: StatusFailed, Capacity: true, Error: "Selected model is at capacity"}
+	r.ag.refuse = func(req TurnRequest) (TurnOutcome, bool) {
+		mu.Lock()
+		k := n + 1
+		mu.Unlock()
+		switch k {
+		case 1, 2: // turn/start refused: nothing recorded
+			attempt()
+			return TurnOutcome{NotStarted: true, Status: StatusFailed, Capacity: true, Error: "Selected model is at capacity"}, true
+		case 4: // refused again after an accepted attempt
+			attempt()
+			return TurnOutcome{NotStarted: true, Status: StatusFailed, Capacity: true, Error: "Selected model is at capacity"}, true
+		}
+		return TurnOutcome{}, false
+	}
+	r.ag.outcome = func(req TurnRequest) (TurnOutcome, error) {
+		if attempt() == 3 { // accepted, failed without progress
+			return capacity, nil
+		}
+		return TurnOutcome{Status: StatusCompleted, Final: "DONE after capacity"}, nil
+	}
+	work := r.newWork(t.TempDir())
+	r.ch.PostUser(work, "fit me in")
+	r.wait("answer", func() bool {
+		return len(r.own(work, "DONE after capacity")) == 1 || len(r.own(work, "over capacity")) > 0
+	})
+	r.ag.mu.Lock()
+	runs := append([]TurnRequest(nil), r.ag.runs...)
+	r.ag.mu.Unlock()
+	if len(runs) != 5 {
+		t.Fatalf("%d attempts, want 5: %+v", len(runs), runs)
+	}
+	for i, run := range runs {
+		want := "continue"
+		if i < 3 {
+			if !strings.HasPrefix(run.Text, "fit me in") {
+				t.Fatalf("attempt %d sent %q, want the prompt (Codex had not recorded it)", i+1, run.Text)
+			}
+		} else if run.Text != want || len(run.Images) != 0 {
+			t.Fatalf("attempt %d sent %q (+%d images), want %q", i+1, run.Text, len(run.Images), want)
+		}
+		if run.TurnKey != runs[0].TurnKey {
+			t.Fatalf("attempt %d has turn key %q, want the turn's own %q", i+1, run.TurnKey, runs[0].TurnKey)
+		}
+		if i > 0 && run.ThreadID != "thread-1" {
+			t.Fatalf("attempt %d ran in thread %q, want thread-1", i+1, run.ThreadID)
+		}
+	}
+	if got := r.own(work, "at capacity right now"); len(got) != 1 {
+		t.Fatalf("%d capacity notices, want 1", len(got))
+	}
+	if got := r.own(work, "DONE after capacity"); len(got) != 1 {
+		t.Fatalf("%d answers, want 1", len(got))
 	}
 }
