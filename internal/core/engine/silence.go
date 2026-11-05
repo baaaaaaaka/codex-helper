@@ -183,52 +183,45 @@ func textStarting(quoted string) string {
 	return "▶️ Codex is starting this queued request: " + quoted
 }
 
-// textQueuedAck is v0.1.20's ACK of a request that waits behind another
-// one in the same chat, word for word: running and queued are the prompts
-// of the chat's running and queued requests (this one is the last queued).
-func textQueuedAck(running, queued []string) string {
-	lines := []string{
-		"⚠️ **Your request is queued.**",
-		"",
-		"**Next step:** wait. I will run your request after the current Codex request finishes.",
-		"",
-		"Another Codex request is already running in this Work chat, so I will run yours after it finishes.",
-		"", "---", "",
+// textQueuedAck acknowledges a request that waits behind another one in
+// the same chat (owner ruling 2026-11-05: short, says when it runs and how
+// to cancel it). isRunning reports whether a request of the chat runs (or
+// waits for Codex capacity), running is its prompt ("" if unknown, as for
+// an attachment-only request), ahead the number of other queued requests
+// before this one. `helper cancel` cancels the newest queued request (this
+// one, until another arrives); `helper cancel running` interrupts the
+// running one.
+func textQueuedAck(running string, isRunning bool, ahead int) string {
+	head := "⏳ **Queued.** Your request will run after the current one finishes"
+	if !isRunning {
+		head = "⏳ **Queued.** Your request will run when the current work in this chat finishes"
 	}
-	if len(running) > 0 {
-		lines = append(lines, "**▶️ Running now:**")
-		lines = append(lines, promptList(running)...)
-	} else {
-		lines = append(lines, "**Currently blocking:**", "Codex/helper work already in progress.")
+	switch {
+	case ahead == 1:
+		head += ", behind 1 other queued request"
+	case ahead > 1:
+		head += fmt.Sprintf(", behind %d other queued requests", ahead)
 	}
-	if len(queued) > 0 {
-		lines = append(lines, "", "**⏳ Queued requests:**")
-		lines = append(lines, promptList(queued)...)
+	lines := []string{head + "."}
+	cancel := "To cancel it: `helper cancel` (cancels the newest queued request)."
+	if p := promptLine(running); isRunning && p != "" {
+		lines = append(lines, "", "**Running now:** "+p)
 	}
-	lines = append(lines, "", "---", "",
-		"**Options:**",
-		"- Run this request next: do nothing. It is already submitted.",
-		"- Need it immediately: send it in a different 💬 Work chat.",
-		"- Drop the newest queued request: `helper cancel queued`.",
-		"- Interrupt the request ahead only if it looks stuck: `helper cancel running`.")
+	if isRunning {
+		cancel += " To interrupt the running one: `helper cancel running`."
+	}
+	lines = append(lines, "", cancel)
 	return strings.Join(lines, "\n")
 }
 
-// promptList numbers prompts as v0.1.20 listed them: one line each, at most
-// 180 characters, backquotes made plain quotes.
-func promptList(prompts []string) []string {
-	out := make([]string, 0, len(prompts))
-	for i, p := range prompts {
-		p = strings.ReplaceAll(strings.Join(strings.Fields(p), " "), "`", "'")
-		if r := []rune(p); len(r) > 180 {
-			p = strings.TrimSpace(string(r[:179])) + "…"
-		}
-		if p == "" {
-			p = "Prompt unavailable"
-		}
-		out = append(out, fmt.Sprintf("%d. %s", i+1, p))
+// promptLine is a prompt on one line as v0.1.20 listed it: at most 180
+// characters, backquotes made plain quotes.
+func promptLine(p string) string {
+	p = strings.ReplaceAll(strings.Join(strings.Fields(p), " "), "`", "'")
+	if r := []rune(p); len(r) > 180 {
+		p = strings.TrimSpace(string(r[:179])) + "…"
 	}
-	return out
+	return p
 }
 
 // textQueuedOutcome names a queued request at the head of its answer or

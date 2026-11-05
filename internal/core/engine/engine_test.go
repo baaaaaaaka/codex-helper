@@ -354,10 +354,10 @@ func TestPromptIsAckedAnsweredOnceAndControlMentioned(t *testing.T) {
 		return len(r.own(work, "ANSWER to hello one")) == 1 && len(r.own(work, "ANSWER to hello two")) == 1
 	})
 	time.Sleep(200 * time.Millisecond)
-	// One ACK each: "Request accepted", or v0.1.20's queued ACK when the
-	// second prompt is admitted while the first still runs.
+	// One ACK each: "Request accepted", or the queued ACK when the second
+	// prompt is admitted while the first still runs.
 	accepted := len(r.own(work, "Request accepted"))
-	if n := accepted + len(r.own(work, "Your request is queued.")); n != 2 || accepted < 1 {
+	if n := accepted + len(r.own(work, "**Queued.**")); n != 2 || accepted < 1 {
 		t.Fatalf("%d acks (%d accepted)", n, accepted)
 	}
 	// The ACK reads as v0.1.20's (fidelity run).
@@ -969,8 +969,8 @@ func TestProgressCoalescedWhenTurnsWaitBehind(t *testing.T) {
 	work := r.newWork(t.TempDir())
 	r.ch.PostUser(work, "progress first")
 	r.ch.PostUser(work, "second request")
-	r.wait("both admitted", func() bool { // the second one gets v0.1.20's queued ACK
-		return len(r.own(work, "Request accepted")) == 1 && len(r.own(work, "Your request is queued.")) == 1
+	r.wait("both admitted", func() bool { // the second one gets the queued ACK
+		return len(r.own(work, "Request accepted")) == 1 && len(r.own(work, "**Queued.**")) == 1
 	})
 	// The fake streams the first turn's commentary after the release, while
 	// the second request waits behind it.
@@ -1219,7 +1219,7 @@ func TestQueuedBacklogStartsWithOneNotice(t *testing.T) {
 	for _, j := range jobs {
 		r.ch.PostUser(work, j)
 	}
-	r.wait("queued ACKs", func() bool { return len(r.own(work, "Your request is queued.")) == len(jobs) })
+	r.wait("queued ACKs", func() bool { return len(r.own(work, "**Queued.**")) == len(jobs) })
 	close(release)
 	for _, j := range append([]string{"job 0"}, jobs...) {
 		j := j

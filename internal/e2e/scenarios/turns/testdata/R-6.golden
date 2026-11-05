@@ -66,43 +66,13 @@
    | <p>⏳ Codex is working. Request accepted.</p>
 -- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⚠️ <strong>Your request is queued.</strong></p>
-   | <p><strong>Next step:</strong> wait. I will run your request after the current Codex request finishes.</p>
-   | <p>Another Codex request is already running in this Work chat, so I will run yours after it finishes.</p>
-   | <hr/>
-   | <p><strong>Currently blocking:</strong><br>
-   | Codex/helper work already in progress.</p>
-   | <p><strong>⏳ Queued requests:</strong></p>
-   | <ol><li>Step 1: E2E-R6-first-1</li>
-   | <li>Step 2: E2E-R6-second-2</li>
-   | </ol>
-   | <hr/>
-   | <p><strong>Options:</strong></p>
-   | <ul><li>Run this request next: do nothing. It is already submitted.</li>
-   | <li>Need it immediately: send it in a different 💬 Work chat.</li>
-   | <li>Drop the newest queued request: <code>helper cancel queued</code>.</li>
-   | <li>Interrupt the request ahead only if it looks stuck: <code>helper cancel running</code>.</li>
-   | </ul>
+   | <p>⏳ <strong>Queued.</strong> Your request will run when the current work in this chat finishes, behind 1 other queued request.</p>
+   | <p>To cancel it: <code>helper cancel</code> (cancels the newest queued request).</p>
 -- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⚠️ <strong>Your request is queued.</strong></p>
-   | <p><strong>Next step:</strong> wait. I will run your request after the current Codex request finishes.</p>
-   | <p>Another Codex request is already running in this Work chat, so I will run yours after it finishes.</p>
-   | <hr/>
-   | <p><strong>▶️ Running now:</strong></p>
-   | <ol><li>Step 1: E2E-R6-first-1</li>
-   | </ol>
-   | <p><strong>⏳ Queued requests:</strong></p>
-   | <ol><li>Step 2: E2E-R6-second-2</li>
-   | <li>Step 3: E2E-R6-third-3</li>
-   | </ol>
-   | <hr/>
-   | <p><strong>Options:</strong></p>
-   | <ul><li>Run this request next: do nothing. It is already submitted.</li>
-   | <li>Need it immediately: send it in a different 💬 Work chat.</li>
-   | <li>Drop the newest queued request: <code>helper cancel queued</code>.</li>
-   | <li>Interrupt the request ahead only if it looks stuck: <code>helper cancel running</code>.</li>
-   | </ul>
+   | <p>⏳ <strong>Queued.</strong> Your request will run after the current one finishes, behind 1 other queued request.</p>
+   | <p><strong>Running now:</strong> Step 1: E2E-R6-first-1</p>
+   | <p>To cancel it: <code>helper cancel</code> (cancels the newest queued request). To interrupt the running one: <code>helper cancel running</code>.</p>
 -- <msg:9> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-R6-first-1</p>
