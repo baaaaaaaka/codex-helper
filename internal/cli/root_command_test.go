@@ -85,7 +85,7 @@ func TestTeamsCommandWiresPlannedSubcommands(t *testing.T) {
 	}
 	sort.Strings(names)
 
-	want := []string{"auth", "control", "doctor", "migrate", "path", "run", "service", "setup", "status", "workflow"}
+	want := []string{"auth", "control", "doctor", "migrate", "path", "run", "service", "setup", "start", "status", "stop", "workflow"}
 	if !reflect.DeepEqual(names, want) {
 		t.Fatalf("unexpected teams subcommands\n got: %#v\nwant: %#v", names, want)
 	}

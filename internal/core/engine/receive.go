@@ -77,6 +77,9 @@ func (e *Engine) receiverLoop(ctx context.Context) {
 // the receiver loop may sleep; false when ctx ended.
 func (e *Engine) dispatchReads(ctx context.Context, jobs chan<- int64) (time.Duration, bool) {
 	now := e.now()
+	if e.stopping.Load() {
+		return e.t.Tick, true // shutdown: no chat is read again
+	}
 	if until := e.gate(e.gRead); now.Before(until) {
 		return e.readSleep(until.Sub(now)), true
 	}
@@ -1063,6 +1066,9 @@ func (e *Engine) scanLoop(ctx context.Context) {
 		case <-reopen.C:
 			reopened = true
 		case <-e.scanWake:
+		}
+		if e.stopping.Load() {
+			continue // shutdown: no chat is read again
 		}
 		now := e.now()
 		if until := e.gate(e.gRead); now.Before(until) {

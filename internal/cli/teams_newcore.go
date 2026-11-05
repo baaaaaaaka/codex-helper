@@ -287,6 +287,47 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 			return nil // stopped while waiting
 		}
 	}
+	for {
+		err := serveTeamsNewCore(ctx, out, errOut, root, opts, seam, paths, path, migrateFrom, host)
+		var stopped errTeamsStoppedEverywhereNow
+		if !opts.managedServiceChild || !errors.As(err, &stopped) || ctx.Err() != nil {
+			return err
+		}
+		// Stopped on all machines (`cxp teams stop`, `shutdown`): a
+		// service-managed helper stands by in-process, as for a refusal
+		// at start, instead of exiting into its supervisor's restarts.
+		_, _ = fmt.Fprintf(errOut, "%v\nTeams helper standing by until `cxp teams start`\n", err)
+	}
+}
+
+// errTeamsStoppedEverywhereNow: the running helper stopped because the
+// kill-switch file appeared.
+type errTeamsStoppedEverywhereNow struct{ desc string }
+
+func (e errTeamsStoppedEverywhereNow) Error() string {
+	return "the Teams helper is disabled and stopped. " + e.desc
+}
+
+// teamsDisabledDesc describes the kill-switch file next to the store at
+// path: who stopped the helper everywhere and how to start it again.
+func teamsDisabledDesc(path string) string {
+	desc, ok := teamsStopState(path)
+	if !ok {
+		desc = corestore.StopRecord{}.Describe(corestore.DisabledPath(filepath.Dir(path)))
+	}
+	return desc
+}
+
+// errTeamsDisabledAtStart refuses a start while the helper is stopped on
+// all machines.
+func errTeamsDisabledAtStart(path string) error {
+	return fmt.Errorf("the Teams helper is disabled and was not started. %s", teamsDisabledDesc(path))
+}
+
+// serveTeamsNewCore takes the store and serves until stopped.
+func serveTeamsNewCore(ctx context.Context, out, errOut io.Writer, root *rootOptions, opts teamsNewCoreOptions, seam *teamsTestSeam,
+	paths effectivePaths, path, migrateFrom, host string) error {
+	dir := filepath.Dir(path)
 	// The lease decides which host owns the store; nothing opens the store
 	// with SQLite before it is held (teams_lease.go).
 	anchor := path
@@ -296,7 +337,7 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 			return nil // stopped while standing by
 		}
 		if errors.Is(err, lease.ErrDisabled) {
-			return fmt.Errorf("the Teams helper is disabled (%s exists next to %s)", corestore.DisabledFile, path)
+			return errTeamsDisabledAtStart(path)
 		}
 		return fmt.Errorf("acquire Teams core store: %w", err)
 	}
@@ -340,7 +381,7 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 			return nil // stopped while standing by
 		}
 		if errors.Is(err, corestore.ErrDisabled) {
-			return fmt.Errorf("the Teams helper is disabled (%s exists next to %s)", corestore.DisabledFile, path)
+			return errTeamsDisabledAtStart(path)
 		}
 		return fmt.Errorf("acquire Teams core store: %w", err)
 	}
@@ -491,7 +532,7 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 		return teamsLeaseLostError(lerr, anchor)
 	}
 	if errors.Is(err, corestore.ErrDisabled) {
-		return fmt.Errorf("the Teams helper is disabled (%s exists next to %s); stopped", corestore.DisabledFile, path)
+		return errTeamsStoppedEverywhereNow{desc: teamsDisabledDesc(path)}
 	}
 	select {
 	case <-gatewayFailed:

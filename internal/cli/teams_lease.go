@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -55,7 +56,8 @@ func teamsAcquireLease(ctx context.Context, anchor, host string, timing lease.Ti
 			var reason string
 			switch s.Reason {
 			case lease.ReasonDisabled:
-				reason = "the kill-switch file " + lease.DisabledFile + " exists"
+				rec, _, _ := corestore.ReadStop(filepath.Dir(anchor))
+				reason = rec.Reason()
 			case lease.ReasonLive, lease.ReasonWatching:
 				// Watching: not yet seen renewing. Either way the owner is
 				// left alone until its lease stays unrenewed for Stale.

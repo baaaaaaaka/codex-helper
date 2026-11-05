@@ -257,6 +257,12 @@ type Engine struct {
 	// drainFlag holds new turn starts while an update waits for running
 	// turns to finish (upgrade.go).
 	drainFlag atomic.Bool
+	// stopping: `shutdown` stopped the helper on all machines; until this
+	// process stops it starts no turn, reads no chat and sends only the
+	// control chat up to the shutdown reply, whose delivery keys start with
+	// stopReply (guarded by mu; shutdown.go).
+	stopping  atomic.Bool
+	stopReply string
 	// writeWaiters counts writers in waitWrite: the sender leaves the
 	// account's write tokens to them (sender.go).
 	writeWaiters atomic.Int32

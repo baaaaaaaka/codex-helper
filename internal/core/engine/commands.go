@@ -89,7 +89,7 @@ func urgentCommand(text string) bool {
 		return false
 	}
 	switch f[0] {
-	case "cancel", "stop", "status", "st", "help", "?":
+	case "cancel", "stop", "status", "st", "help", "?", "shutdown":
 		return true
 	}
 	return false
@@ -202,6 +202,7 @@ const controlHelp = "Commands in this chat:\n\n" +
 	"- `skills`: list skill subscriptions (`skills add <url>`, `skills sync`)\n" +
 	"- `status`: helper status\n" +
 	"- `restart`: restart the helper\n" +
+	"- `shutdown`: stop the helper on all machines until `cxp teams start` is run on a machine\n" +
 	"- `update now` / `update prerelease`: update the helper (`update status` shows a pending update)\n" +
 	"- `codex update now`: update the Codex CLI\n" +
 	"- `help`: this help"
@@ -252,6 +253,8 @@ func (e *Engine) controlCommand(ctx context.Context, j cmdJob, text string) {
 		e.cmdParkLabel(j, arg)
 	case "restart":
 		e.cmdRestart(j, strings.ToLower(arg))
+	case "shutdown":
+		e.cmdShutdown(ctx, j)
 	case "update", "upgrade":
 		e.cmdHelperUpdate(ctx, j, arg)
 	case "codex":

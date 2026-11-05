@@ -1,0 +1,133 @@
+# STOP-START: `cxp teams stop` stops the helper with no Graph traffic until `cxp teams start`, which resumes it: the prompt sent meanwhile is answered once
+# cxp black-box transcript; volatile values are numbered placeholders
+
+== chat <chat:1> "Codex Control - e2ehost"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
+-- <msg:2> owner (html)
+   | <p>new <root>/work/stopstart</p>
+-- <msg:3> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>✅ Work chat created: s001</p>
+   | <p>Open this Teams link and send your task there:<br>
+   | <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
+   | <p>If Teams does not show it right away, search for: s001</p>
+-- <msg:4> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
+   | <p><strong>✅ Codex finished</strong></p>
+   | <p><strong>Chat:</strong> s001 · stopstart<br>
+   | <strong>Request:</strong> Before the stop E2E-STOPSTART-first-1</p>
+   | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
+   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
+   mention 0: owner "E2E Owner"
+-- <msg:5> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
+   | <p><strong>✅ Codex finished</strong></p>
+   | <p><strong>Chat:</strong> s001 · stopstart<br>
+   | <strong>Request:</strong> While stopped E2E-STOPSTART-held-2</p>
+   | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
+   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
+   mention 0: owner "E2E Owner"
+
+== chat <chat:2> "s001 · stopstart"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Work chat created: s001.<br>
+   | Working directory: <root>/work/stopstart</p>
+-- <msg:2> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>💬 Work chat is ready.<br>
+   | Send a task in this chat. Codex will start automatically and continue this session.<br>
+   | Status: waiting for your first task.<br>
+   | Session: s001<br>
+   | Project: stopstart<br>
+   | Working directory: <root>/work/stopstart<br>
+   | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
+   | Need more details? Send <code>helper status</code>.</p>
+-- <msg:3> owner (html)
+   | <p>Before the stop E2E-STOPSTART-first-1</p>
+-- <msg:4> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+-- <msg:5> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>E2EANSWER-<n> answer for E2E-STOPSTART-first-1</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+-- <msg:6> owner (html)
+   | <p>While stopped E2E-STOPSTART-held-2</p>
+-- <msg:7> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+-- <msg:8> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>E2EANSWER-<n> answer for E2E-STOPSTART-held-2</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+
+== codex turns (per thread; threads by kind, directory and first prompt; turns in start order)
+-- thread <uuid:1> (work, cwd <root>/work/stopstart)
+   turn: answered
+   prompt| Before the stop E2E-STOPSTART-first-1
+   prompt|
+   prompt| Helper safety:
+   prompt| - You are running inside a Codex turn launched by the chat helper. The current request is the user message above; treat earlier requests in resumed history as completed context unless the user asks about them.
+   prompt| - Do not restart, reload, kill, replace, or background the helper process, binary, or service from this turn.
+   prompt| - If the helper needs to restart after an update or local repair, finish the answer and tell the user to send `helper restart now` in the control chat.
+   prompt| - If the helper needs a release update, tell the user to send `helper update now`, or `helper update prerelease` only when they asked for prereleases.
+   prompt| - Subagent requests use native Codex subagents. For cross-machine agent delegation, use the cxp skill and its `cxp delegate` workflow when the task needs another signed-in machine.
+   prompt|
+   prompt| Put fractions, sums, integrals, matrices, and display math in <m>TeX</m> on a separate line, never in prose, tables, or lists—even if asked for one line. Use backticks for simple inline/literal TeX. Never use $ or \(...\). Math markers are not artifacts.
+   prompt|
+   prompt| If you need to return generated files or images to the Teams user, write them under this local directory:
+   prompt| <root>/home/.local/state/codex-helper/teams/core-files/outbound/cxp-<key:1>-<turn:1>
+   prompt|
+   prompt| Then include this fenced manifest in your final answer:
+   prompt| ```codex-helper-artifacts
+   prompt| {"version":1,"files":[{"path":"relative/path.ext","name":"display-name.ext"}]}
+   prompt| ```
+   prompt|
+   prompt| Use only relative manifest paths under that directory. Keep your normal answer visible; the helper attaches the listed files separately.
+   turn: answered
+   prompt| While stopped E2E-STOPSTART-held-2
+   prompt|
+   prompt| Helper safety:
+   prompt| - You are running inside a Codex turn launched by the chat helper. The current request is the user message above; treat earlier requests in resumed history as completed context unless the user asks about them.
+   prompt| - Do not restart, reload, kill, replace, or background the helper process, binary, or service from this turn.
+   prompt| - If the helper needs to restart after an update or local repair, finish the answer and tell the user to send `helper restart now` in the control chat.
+   prompt| - If the helper needs a release update, tell the user to send `helper update now`, or `helper update prerelease` only when they asked for prereleases.
+   prompt| - Subagent requests use native Codex subagents. For cross-machine agent delegation, use the cxp skill and its `cxp delegate` workflow when the task needs another signed-in machine.
+   prompt|
+   prompt| Put fractions, sums, integrals, matrices, and display math in <m>TeX</m> on a separate line, never in prose, tables, or lists—even if asked for one line. Use backticks for simple inline/literal TeX. Never use $ or \(...\). Math markers are not artifacts.
+   prompt|
+   prompt| If you need to return generated files or images to the Teams user, write them under this local directory:
+   prompt| <root>/home/.local/state/codex-helper/teams/core-files/outbound/cxp-<key:1>-<turn:2>
+   prompt|
+   prompt| Then include this fenced manifest in your final answer:
+   prompt| ```codex-helper-artifacts
+   prompt| {"version":1,"files":[{"path":"relative/path.ext","name":"display-name.ext"}]}
+   prompt| ```
+   prompt|
+   prompt| Use only relative manifest paths under that directory. Keep your normal answer visible; the helper attaches the listed files separately.
+
+== cli
+$ cxp teams stop
+   exit 0
+   stdout| Stopping the Teams helper on all machines (created <root>/home/.local/state/codex-helper/teams/DISABLED).
+   stdout| Waiting for the helper on host-a (pid <pid:1>) to stop...
+   stdout| The helper on host-a (pid <pid:1>) stopped.
+   stdout| Helpers standing by and services on every machine stay idle and do not read Teams. Messages sent meanwhile are read when the helper starts again.
+   stdout| To start it again: cxp teams start
+$ cxp teams stop
+   exit 0
+   stdout| Already stopped; nothing changed.
+   stdout| Stopped on all machines by `cxp teams stop` (host-a, <time:1>). Start again with `cxp teams start`.
+$ cxp teams start
+   exit 0
+   stdout| Started the Teams helper again on all machines (it was: Stopped on all machines by `cxp teams stop` (host-a, <time:1>); removed <root>/home/.local/state/codex-helper/teams/DISABLED).
+   stdout| No Teams service is installed on this machine. A helper standing by on any machine (the last one ran on host-a) resumes within a minute; if none is, run `cxp teams run`, or install the service with `cxp teams service install`.
+$ cxp teams start
+   exit 0
+   stdout| The Teams helper was not stopped; nothing to remove.
+   stdout| No Teams service is installed on this machine. A helper standing by on any machine (the last one ran on host-a) resumes within a minute; if none is, run `cxp teams run`, or install the service with `cxp teams service install`.

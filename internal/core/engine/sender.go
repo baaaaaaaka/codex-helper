@@ -91,18 +91,30 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 		if err != nil {
 			return err
 		}
+		e.mu.Lock()
+		ctl, stopReply := e.controlID, e.stopReply
+		e.mu.Unlock()
+		stopping := stopReply != ""
+		var through int64 // shutdown: the control chat is sent up to its reply
+		if stopping {
+			if through, err = shutdownThrough(tx, ctl, stopReply); err != nil {
+				return err
+			}
+		}
 		items := make([]sendItem, 0, len(rows))
 		for _, r := range rows {
+			if stopping && (r.ConvID != ctl || r.Seq > through) {
+				continue // shutdown: nothing after its reply is sent
+			}
 			items = append(items, sendItem{row: r, conv: r.ConvID, class: sendClass(r.Kind)})
 		}
-		creates, err := e.dueChats(tx, now, soon)
-		if err != nil {
-			return err
+		if !stopping {
+			creates, err := e.dueChats(tx, now, soon)
+			if err != nil {
+				return err
+			}
+			items = append(items, creates...)
 		}
-		items = append(items, creates...)
-		e.mu.Lock()
-		ctl := e.controlID
-		e.mu.Unlock()
 		// Control chat first; then replies (ACKs, finals, notices,
 		// prompts, chats the owner asked for) before mirrored messages
 		// and chats nobody waits for before progress, so a short write

@@ -144,7 +144,7 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 	e.mu.Lock()
 	cs := e.convs[id]
 	ok := cs != nil && cs.kind == store.KindWork && cs.state == store.ConvActive && !cs.paused &&
-		cs.running == nil && !e.now().Before(cs.capWake) && !e.draining()
+		cs.running == nil && !e.now().Before(cs.capWake) && !e.draining() && !e.stopping.Load()
 	var (
 		lastEnd      time.Time
 		batchThrough int64
