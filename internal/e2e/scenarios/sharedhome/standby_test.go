@@ -21,8 +21,9 @@ import (
 // (SIGSTOP: no heartbeat, no request); B's supervisor keeps starting it
 // (Restart=always) and B takes over once A's heartbeat is stale (90 s).
 // A prompt posted after the hang is answered once, by B. A resumes
-// (SIGCONT): it is fenced at its next heartbeat and exits without posting
-// anything. Both helpers use one control chat.
+// (SIGCONT): it is past its lease, so its first write renews the
+// heartbeat and finds B's generation; it is fenced and exits without
+// posting anything. Both helpers use one control chat.
 func TestStandbyTakeoverOnStaleOwner(t *testing.T) {
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "STANDBY-TAKEOVER", harness.Options{
@@ -61,13 +62,16 @@ func TestStandbyTakeoverOnStaleOwner(t *testing.T) {
 	s.Check("the standby sends no Graph request", len(bReqs) == 0, "0 requests from B", fmt.Sprintf("%d: %q", len(bReqs), bReqs))
 
 	// A hangs. B's supervisor restarts it until it owns the state.
-	// A is frozen once it settled: frozen inside a store write, it keeps
-	// the SQLite write lock and every start of B fails with SQLITE_BUSY
-	// (a known cxp limitation, reported to the owner; not this scenario's
-	// point).
+	// A is frozen once it settled (no post in flight), outside any store
+	// write: a helper frozen inside one keeps the SQLite write lock, which
+	// nothing can break (STANDBY-LOCKED covers that case).
 	s.Settle(2*time.Second, 15*time.Second)
-	if !harness.Freeze(s.SUT) {
-		t.Fatal("cannot freeze host A")
+	store := s.StorePath()
+	if store == "" {
+		t.Fatal("no store under " + s.Env.Root)
+	}
+	if err := harness.FreezeOutsideStoreWrite(s.SUT, store); err != nil {
+		t.Fatal(err)
 	}
 	frozenAt := time.Now()
 	s.Note("froze host A (%s)", aTag)

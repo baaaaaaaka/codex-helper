@@ -161,13 +161,15 @@ const mentionSetMax = 20
 func (e *Engine) pumpNotify(ctx context.Context) time.Time {
 	var cards, mentions []pendingNotify
 	pending := 0
+	// Outside the transaction: Available reads the Workflow setting files
+	// and may apply a pending change (a store write of its own).
+	card := e.cfg.Notifier != nil && e.cfg.Notifier.Available()
 	err := e.update(func(tx *store.Tx) error {
 		cards, mentions, pending = cards[:0], mentions[:0], 0
 		list, err := readNotify(tx)
 		if err != nil {
 			return err
 		}
-		card := e.cfg.Notifier != nil && e.cfg.Notifier.Available()
 		keep := list[:0]
 		for _, n := range list {
 			rows, err := tx.PendingOutbox(n.Conv)

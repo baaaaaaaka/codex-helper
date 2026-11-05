@@ -77,23 +77,30 @@ func (e *Engine) renderLegacy(ctx context.Context) error {
 	}); err != nil || len(rows) == 0 {
 		return err
 	}
+	// Render first, outside any transaction: math renders through a local
+	// renderer, and no write transaction may span I/O.
+	rendered := make([][]store.OutMsg, len(rows))
+	for i, r := range rows {
+		doc := channel.RichDoc{Label: labelHelper, Markdown: r.Body}
+		switch r.Kind {
+		case store.OutFinal:
+			doc = answerDoc(r.Body)
+		case store.OutProgress:
+			doc = statusDoc(r.Body)
+		case store.OutMirror:
+			// The legacy kind (prompt or answer) is not kept.
+			doc = channel.RichDoc{Label: labelAnswer, Markdown: r.Body, Math: true}
+		}
+		doc.ReplyTo = r.ReplyTo
+		msgs, err := e.render(ctx, doc, r.Kind, r.DeliveryKey+":r")
+		if err != nil {
+			return err
+		}
+		rendered[i] = msgs
+	}
 	err := e.update(func(tx *store.Tx) error {
-		for _, r := range rows {
-			doc := channel.RichDoc{Label: labelHelper, Markdown: r.Body}
-			switch r.Kind {
-			case store.OutFinal:
-				doc = answerDoc(r.Body)
-			case store.OutProgress:
-				doc = statusDoc(r.Body)
-			case store.OutMirror:
-				// The legacy kind (prompt or answer) is not kept.
-				doc = channel.RichDoc{Label: labelAnswer, Markdown: r.Body, Math: true}
-			}
-			doc.ReplyTo = r.ReplyTo
-			msgs, err := e.render(ctx, doc, r.Kind, r.DeliveryKey+":r")
-			if err != nil {
-				return err
-			}
+		for i, r := range rows {
+			msgs := rendered[i]
 			if err := tx.SetOutboxRendered(r.ID, msgs[0].Body, msgs[0].BodyHash); err != nil {
 				return err
 			}

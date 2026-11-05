@@ -32,8 +32,10 @@ import (
 // restarts every exit-75 restart would wait the full maximum.
 //
 // Expected refusals do not restart at all: a service-managed helper that is
-// refused the store because the kill-switch file exists or another host's
-// helper is live waits in-process and checks again every teamsRefusalRecheck.
+// refused the store because the kill-switch file exists, another host's
+// helper is live, or a stalled owner still holds the write lock (it cannot
+// be broken while that process exists) waits in-process, reports each
+// reason once, and checks again every teamsRefusalRecheck.
 const (
 	teamsCrashLoopBase       = 10 * time.Second
 	teamsCrashLoopCap        = 5 * time.Minute
@@ -127,6 +129,8 @@ func teamsRefusalReason(err error) string {
 		return "the kill-switch file " + corestore.DisabledFile + " exists"
 	case errors.Is(err, corestore.ErrOwnerLive):
 		return "another live helper owns the Teams state"
+	case errors.Is(err, corestore.ErrLocked):
+		return "the owner stopped answering while it holds the Teams state's write lock (frozen?); waiting for it to resume or exit"
 	}
 	return ""
 }

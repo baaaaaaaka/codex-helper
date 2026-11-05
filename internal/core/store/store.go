@@ -2,8 +2,10 @@
 //
 // One file, typed columns, no JSON, no triggers. One writer connection; every
 // write transaction starts with BEGIN IMMEDIATE and checks the owner
-// generation (the only stale-writer fence). No method performs network or
-// Codex I/O.
+// generation (the stale-writer fence for the store; Fence is the one for
+// writes outside it). No method performs network or Codex I/O, and no
+// caller may perform I/O inside a write transaction: the write lock is held
+// for its duration.
 package store
 
 import (
@@ -14,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite" // driver "sqlite"
@@ -27,6 +30,11 @@ var (
 	ErrNotAcquired = errors.New("store: owner not acquired")
 	// ErrOwnerLive means another live process holds the store.
 	ErrOwnerLive = errors.New("store: another live owner holds the store")
+	// ErrLocked means the store's write lock stayed held for the whole
+	// busy timeout while the owner's heartbeat is stale: the owner stopped
+	// inside a write transaction (frozen). The lock is released only when
+	// that process resumes or exits.
+	ErrLocked = errors.New("store: the write lock is held by a stalled process")
 	// ErrDisabled means the kill-switch file <dir>/DISABLED exists.
 	ErrDisabled = errors.New("store: disabled by kill-switch file")
 	// ErrWrongHost means the service was installed for another host.
@@ -61,6 +69,10 @@ type Store struct {
 	now  func() time.Time
 	pid  func(int) bool
 	gen  int64
+
+	lease  sync.Mutex // guards beat and fenced; held by Heartbeat, Fence, Acquire, Release
+	beat   time.Time  // start of the last successful heartbeat or acquire
+	fenced bool       // a heartbeat found a newer generation
 }
 
 // Open opens or creates the store at path with production options.

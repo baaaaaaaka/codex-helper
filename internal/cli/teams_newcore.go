@@ -314,7 +314,7 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 		return err
 	}
 	defer func() { _ = lease.Close(context.Background()) }()
-	client := lease.Client
+	client := teamsFencedHTTPClient(lease.Client, st.Fence)
 	authCfg, err := chteams.ResolveAuthConfig("")
 	if err != nil {
 		return fmt.Errorf("Teams auth: %w", err)
