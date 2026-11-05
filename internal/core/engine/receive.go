@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"sort"
 	"strings"
@@ -271,6 +272,45 @@ func (e *Engine) intervalLocked(cs *convState, now time.Time) time.Duration {
 	}
 }
 
+// nextReadLocked is the next timed read of a conversation read
+// successfully at start (caller holds e.mu): one read interval later. In
+// scan mode the read of an idle chat is a safety net, at most SafetyRead
+// apart. A read that was not itself the scheduled safety read (safety: a
+// start-up read, a read-back, a read the scan or the owner's activity
+// caused) brings the next one forward by up to half the interval, by a
+// fraction spread over the chat ids (safetyJitter). Chats read together, as
+// a catch-up reads hundreds at the account's read pace, come back spread
+// over half the interval instead of as one wave every SafetyRead, and stay
+// spread: a safety read schedules the next exactly one interval later.
+func (e *Engine) nextReadLocked(cs *convState, start, now time.Time, safety bool) time.Time {
+	iv := e.intervalLocked(cs, now)
+	if e.scanner == nil || e.polledLocked(cs, now) {
+		cs.safeAt = time.Time{}
+		return start.Add(iv)
+	}
+	next := start.Add(iv)
+	if !safety {
+		next = next.Add(-safetyJitter(cs.id, iv))
+	}
+	cs.safeAt = next
+	return next
+}
+
+// safetyReadLocked reports whether a read starting now is the safety read
+// nextReadLocked scheduled: nothing moved the chat's next read since, and
+// the scan has not marked it (caller holds e.mu).
+func safetyReadLocked(cs *convState) bool {
+	return !cs.safeAt.IsZero() && cs.nextRead.Equal(cs.safeAt) && !cs.scanDue
+}
+
+// safetyJitter is how much sooner than period the first safety read after
+// other reads comes, in [0, period/2): spread over the chat ids by the
+// golden ratio, so consecutive ids land far apart.
+func safetyJitter(id int64, period time.Duration) time.Duration {
+	_, frac := math.Modf(math.Abs(float64(id)) * 0.6180339887498949)
+	return time.Duration(frac * float64(period/2))
+}
+
 // heat marks activity in a conversation (own post, mirror).
 func (e *Engine) heat(id int64) { e.heatAs(id, false) }
 
@@ -301,6 +341,7 @@ func (e *Engine) read(ctx context.Context, id int64) {
 	e.mu.Lock()
 	cs := e.convs[id]
 	chat, cursor, gen := cs.chat, cs.cursor, cs.scanGen
+	safety := safetyReadLocked(cs)
 	e.mu.Unlock()
 	start := e.now()
 	w, err := e.ch.Receive(ctx, chat, cursor)
@@ -321,7 +362,7 @@ func (e *Engine) read(ctx context.Context, id int64) {
 	now := e.now()
 	if err == nil {
 		cs.failures = 0
-		cs.nextRead = start.Add(e.intervalLocked(cs, now))
+		cs.nextRead = e.nextReadLocked(cs, start, now, safety)
 		if cs.scanLive <= gen {
 			cs.scanLive = 0 // read: the change was before the read started
 		}

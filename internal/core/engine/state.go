@@ -76,6 +76,10 @@ type convState struct {
 	// scan whose newest message is one of them shows no new message.
 	ownPosts []string
 	nextRead time.Time
+	// safeAt is the safety read nextReadLocked scheduled (scan mode, idle
+	// chat): a read that starts with nextRead still at it, and no scan
+	// mark, is that safety read.
+	safeAt   time.Time
 	reading  bool
 	failures int
 	seen     map[string]time.Time // ext ids admitted or classified recently
