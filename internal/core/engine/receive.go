@@ -436,6 +436,9 @@ type classified struct {
 	resolved  bool   // resolved one of our unknown sends
 	// delegation is the id of a delegation request this engine takes (inbox).
 	delegation string
+	// reject answers a refused message instead of running it, quoting
+	// rejectQuote (screen, envelope.go).
+	reject, rejectQuote string
 }
 
 // admit classifies and persists one receive window and acts on the newly
@@ -500,8 +503,9 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 			if c.other && !group {
 				group, becameGr = true, true
 			}
+			screen(&c) // raw API keys, attachment limits (envelope.go)
 			if c.in.Kind == store.InPrompt && !c.chatter && (c.in.Sender == store.SenderOwner || c.in.Sender == store.SenderOther) {
-				c.in.Files = inboundFiles(m.Files)
+				c.in.Files = admittedFiles(m) // files, then quotes (envelope.go)
 				if len(c.in.Files) > 0 {
 					hasFiles = true
 				}
@@ -531,6 +535,11 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 				trip = true
 			}
 			switch {
+			case c.reject != "" && a.State == store.InQueued:
+				activity = true
+				if err := e.refuse(tx, id, a, c); err != nil {
+					return err
+				}
 			case c.delegation != "" && a.TurnID != 0:
 				activity, newTurns = true, true
 				if err := e.admitDelegation(tx, id, a, c); err != nil {
@@ -852,12 +861,12 @@ func (e *Engine) ackPrompt(tx *store.Tx, conv int64, a store.Admitted, c *classi
 	}
 	e.mu.Unlock()
 	dup := seen && at.Sub(prev.at) < e.t.DuplicateFor && at.Sub(prev.at) >= -e.t.DuplicateFor && norm != ""
-	// As in v0.1.20 (recentDuplicateSessionPrompt): a message with files or
-	// pasted images is never a duplicate (the same caption with another
-	// screenshot is a new request), and only an earlier prompt that is still
-	// open or completed suppresses a repeat; resending one that failed, was
-	// interrupted or cancelled runs it.
-	if dup && len(c.msg.Files) > 0 {
+	// As in v0.1.20 (recentDuplicateSessionPrompt): a message with files,
+	// pasted images or quotes is never a duplicate (the same caption with
+	// another screenshot is a new request), and only an earlier prompt that
+	// is still open or completed suppresses a repeat; resending one that
+	// failed, was interrupted or cancelled runs it.
+	if dup && len(c.msg.Files)+len(c.msg.Quotes) > 0 {
 		dup = false
 	}
 	if dup {

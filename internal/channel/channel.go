@@ -185,9 +185,11 @@ type InboundMsg struct {
 
 // Quote is a message quoted or forwarded inside an inbound message.
 type Quote struct {
-	ID       string
-	FromName string
-	Text     string // preview text as delivered by the service; fetch with Get for the full body
+	ID        string
+	FromName  string
+	Text      string // preview text as delivered by the service; fetch with Get for the full body
+	Time      string // the original's send time as the service gives it ("" when not given)
+	Forwarded bool   // a forward: the original may be in another chat and is not fetched
 }
 
 // FileKind classifies a file reference.

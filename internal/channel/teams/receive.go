@@ -225,8 +225,6 @@ type graphAttachment struct {
 
 var hostedRE = regexp.MustCompile(`(?i)/hostedContents/([^/"'<>\s]+)/\$value`)
 
-const maxInboundFiles = 16
-
 func (a *Adapter) convert(chat string, gm graphMessage, owner string) channel.InboundMsg {
 	m := channel.InboundMsg{Chat: chat, ID: gm.ID}
 	m.Created, _ = time.Parse(time.RFC3339Nano, gm.Created)
@@ -314,15 +312,15 @@ func (a *Adapter) inboundFiles(chat string, gm graphMessage) ([]channel.FileRef,
 				files = append(files, channel.FileRef{Kind: channel.FileUnsupported, Name: at.Name, Note: "media card without hosted content"})
 			}
 		case "messagereference", "forwardedmessagereference":
-			quotes = append(quotes, quoteFrom(at))
+			q := quoteFrom(at)
+			q.Forwarded = ct == "forwardedmessagereference"
+			quotes = append(quotes, q)
 		default:
 			files = append(files, channel.FileRef{Kind: channel.FileUnsupported, Name: at.Name, Note: "unsupported attachment type " + ct})
 		}
 	}
-	if len(files) > maxInboundFiles {
-		extra := len(files) - maxInboundFiles
-		files = append(files[:maxInboundFiles], channel.FileRef{Kind: channel.FileUnsupported, Note: fmt.Sprintf("%d more attachments not fetched", extra)})
-	}
+	// The per-message limits (5 media, 5 files, 3 quotes) are the engine's
+	// (SPEC F-RND-8): an over-limit message is refused, not truncated.
 	return files, quotes
 }
 
@@ -343,6 +341,7 @@ func quoteFrom(at graphAttachment) channel.Quote {
 		OriginalID     string `json:"originalMessageId"`
 		OriginalText   string `json:"originalMessageContent"`
 		OriginalSender who    `json:"originalMessageSender"`
+		OriginalTime   string `json:"originalSentDateTime"`
 	}
 	_ = json.Unmarshal([]byte(at.Content), &c)
 	name := func(w who) string {
@@ -358,6 +357,7 @@ func quoteFrom(at graphAttachment) channel.Quote {
 		ID:       first(c.MessageID, c.OriginalID, at.ID),
 		FromName: first(name(c.MessageSender), name(c.OriginalSender)),
 		Text:     first(c.MessagePreview, plainText(c.OriginalText)),
+		Time:     strings.TrimSpace(c.OriginalTime),
 	}
 }
 

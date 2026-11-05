@@ -64,7 +64,7 @@ esac
 		prompt = cs[0].Prompt
 	}
 	s.Check("a voice clip is transcribed and answered", answered && strings.Contains(prompt, "transcribed: please list the files "+ok) &&
-		strings.Contains(prompt, "automatic transcript"), "1 turn whose prompt carries the transcript",
+		strings.Contains(prompt, "Automatic local ASR transcript from Microsoft Teams media."), "1 turn whose prompt carries the transcript",
 		fmt.Sprintf("answered=%v prompt=%q", answered, clip(prompt, 300)), s.Transcript(work.ID, 8)...)
 
 	cases := []struct {

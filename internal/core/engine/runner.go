@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -15,6 +14,7 @@ import (
 
 	"github.com/baaaaaaaka/codex-helper/internal/channel"
 	"github.com/baaaaaaaka/codex-helper/internal/core/store"
+	"github.com/baaaaaaaka/codex-helper/internal/core/transcript"
 )
 
 // runnerLoop starts runnable turns. It is woken by the transactions that
@@ -204,7 +204,7 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 			// transcribed is answered with the reason and not sent to
 			// Codex, which would only see an empty request. A prompt
 			// with text or another usable attachment still runs, with
-			// the reason listed for Codex (turnInput).
+			// the reason listed for Codex (codexInput).
 			msgs, err := e.notice(fmt.Sprintf("turn:%d:voice", tr.ID), text)
 			if err != nil {
 				return err
@@ -220,8 +220,7 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 		if th.PendingEffort != "" {
 			req.Effort = th.PendingEffort
 		}
-		req.Text, req.Images = turnInput(in.Body, files)
-		req.Text = strings.TrimSpace(req.Text + "\n\n" + outboundInstructions(e.outboundDir(tr.TurnKey)))
+		req.Text, req.Images = codexInput(in.Body, files, e.outboundDir(tr.TurnKey)) // envelope.go (F-TRN-14)
 		if err := tx.MarkStarting(tr.ID, th.ThreadID); err != nil {
 			return err
 		}
@@ -310,56 +309,6 @@ func voiceFailure(body string, files []store.InboundFile) string {
 		return ""
 	}
 	return "The voice message was not sent to Codex.\n\n" + strings.Join(reasons, "\n\n")
-}
-
-// turnInput builds the Codex input of a prompt and its attachments: images
-// become image inputs, files are listed with their local path and original
-// name, voice messages contribute their transcript.
-// voiceLead introduces voice transcripts in a prompt.
-const voiceLead = "Voice message (automatic transcript; it may contain recognition errors, especially names, identifiers and commands; prefer typed text when they conflict):"
-
-func turnInput(body string, files []store.InboundFile) (string, []string) {
-	text := strings.TrimSpace(body)
-	var images, listed, voice, failed []string
-	for _, f := range files {
-		var ref fileRef
-		_ = json.Unmarshal([]byte(f.ExtRef), &ref)
-		ct := firstNonEmpty(ref.ContentType, f.Kind)
-		switch {
-		case f.State != "ready":
-			failed = append(failed, fmt.Sprintf("- %s: %s", f.Name, firstNonEmpty(f.Error, "not available")))
-		case f.Kind == "image":
-			images = append(images, f.LocalPath)
-		case f.Kind == "voice":
-			data, err := os.ReadFile(f.LocalPath)
-			if err != nil {
-				failed = append(failed, fmt.Sprintf("- %s: the transcript is missing", f.Name))
-				continue
-			}
-			voice = append(voice, strings.TrimSpace(string(data)))
-		default:
-			listed = append(listed, fmt.Sprintf("- %s (original name: %s; %s)", f.LocalPath, f.Name, ct))
-		}
-	}
-	var sections []string
-	if len(voice) > 0 {
-		v := voiceLead + "\n" + strings.Join(voice, "\n\n")
-		if text == "" {
-			text = v
-		} else {
-			sections = append(sections, v)
-		}
-	}
-	if len(listed) > 0 {
-		sections = append(sections, "Attached files (saved locally):\n"+strings.Join(listed, "\n"))
-	}
-	if len(failed) > 0 {
-		sections = append(sections, "Attachments that could not be used:\n"+strings.Join(failed, "\n"))
-	}
-	if len(sections) > 0 {
-		text = strings.TrimSpace(text + "\n\n" + strings.Join(sections, "\n\n"))
-	}
-	return text, images
 }
 
 // execTurn runs one turn and records its outcome.
@@ -1058,7 +1007,7 @@ type progressState struct {
 func (e *Engine) progress(ctx context.Context, cs *convState, tr store.Turn, ps *progressState, text string) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
-	text = strings.TrimSpace(text)
+	text = strings.TrimSpace(transcript.StripMemCitations(text)) // F-MIR-8
 	e.mu.Lock()
 	group := cs.group
 	e.mu.Unlock()
