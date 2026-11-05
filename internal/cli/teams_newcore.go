@@ -77,22 +77,6 @@ func teamsNewCoreChannelConfig(client *http.Client, authCfg chteams.AuthConfig) 
 		Math:            &chteams.NodeMath{}}
 }
 
-// teamsNewCoreOverrides replace production wiring in the e2e build
-// (teams_newcore_e2e.go); production leaves teamsNewCoreTestOverrides nil.
-type teamsNewCoreOverrides struct {
-	// HTTP is the client for Graph and the token endpoint.
-	HTTP *http.Client
-	// Timing replaces the production timing (and ReadRate the read budget).
-	Timing   *engine.Timing
-	ReadRate float64
-	// Prepare runs on the acquired store before the engine is built.
-	Prepare func(st *corestore.Store, dir string) error
-	// Host replaces os.Hostname() ("" = keep it).
-	Host string
-}
-
-var teamsNewCoreTestOverrides func(stderr io.Writer) (teamsNewCoreOverrides, error)
-
 var migratedMarkerRE = regexp.MustCompile(`^migrated to (.+) at \S+ by cxp teams migrate`)
 
 // errTeamsStoreNotConverted: the store under the state root is from an
@@ -264,11 +248,14 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	var ov teamsNewCoreOverrides
-	if teamsNewCoreTestOverrides != nil {
-		var err error
-		if ov, err = teamsNewCoreTestOverrides(errOut); err != nil {
-			return err
+	seam, err := loadTeamsTestSeam()
+	if err != nil {
+		return err
+	}
+	if seam != nil {
+		_, _ = fmt.Fprintln(errOut, seam.describe())
+		if d := seam.refusalRecheck(); d > 0 {
+			teamsRefusalRecheck = d
 		}
 	}
 
@@ -288,9 +275,9 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
-	host, _ := os.Hostname()
-	if ov.Host != "" {
-		host = ov.Host
+	host, err := teamsHostname()
+	if err != nil {
+		host = ""
 	}
 	if opts.managedServiceChild {
 		if err := teamsServiceStartBackoff(ctx, teamsServiceRestartRecordPath(dir, host), errOut); err != nil {
@@ -320,22 +307,14 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 		return fmt.Errorf("acquire Teams core store: %w", err)
 	}
 	defer st.Release()
-	if ov.Prepare != nil {
-		if err := ov.Prepare(st, dir); err != nil {
-			return err
-		}
-	}
 
 	// Graph: the real adapter with the delegated token cache.
-	client := ov.HTTP
-	if client == nil {
-		lease, err := newTeamsGraphHTTPClientLease(ctx, root, errOut)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = lease.Close(context.Background()) }()
-		client = lease.Client
+	lease, err := newTeamsGraphHTTPClientLease(ctx, root, errOut)
+	if err != nil {
+		return err
 	}
+	defer func() { _ = lease.Close(context.Background()) }()
+	client := lease.Client
 	authCfg, err := chteams.ResolveAuthConfig("")
 	if err != nil {
 		return fmt.Errorf("Teams auth: %w", err)
@@ -362,16 +341,14 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 		return err
 	}
 	server.Args = append(server.Args, extra...)
-	var gatewayDone <-chan error
-	if teamsNewCoreTestOverrides == nil {
-		launch, err := newTeamsNewCoreCodexLaunch(ctx, root, codexBin, errOut)
-		if err != nil {
-			return err
-		}
-		defer launch.Close()
-		server.Bin, server.Configure, gatewayDone = launch.Bin, launch.Configure, launch.Done
-		server.Args = append(server.Args, launch.Args...)
+	launch, err := newTeamsNewCoreCodexLaunch(ctx, root, codexBin, errOut)
+	if err != nil {
+		return err
 	}
+	defer launch.Close()
+	server.Bin, server.Configure = launch.Bin, launch.Configure
+	server.Args = append(server.Args, launch.Args...)
+	gatewayDone := launch.Done
 	ag := codexagent.New(codexagent.Config{
 		Server:  server,
 		PIDFile: teamsCorePIDFile(dir, host),
@@ -381,8 +358,8 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 	})
 
 	timing, readRate := engine.ProductionTiming(), 0.0
-	if ov.Timing != nil {
-		timing, readRate = *ov.Timing, ov.ReadRate
+	if seam != nil {
+		timing, readRate = seam.timing()
 	}
 	machine := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_MACHINE_LABEL"))
 	if machine == "" {
@@ -411,11 +388,11 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 			HomeDir:   paths.Home,
 		}),
 	}
-	if opts.autoUpdate && teamsNewCoreTestOverrides == nil {
+	if opts.autoUpdate {
 		cfg.Updater = newTeamsNewCoreUpdater(opts.autoUpdateRepo, opts.autoUpdatePrerelease, cfg.Version, errOut)
 		cfg.UpdatePrerelease = opts.autoUpdatePrerelease
 	}
-	if strings.TrimSpace(opts.codexPath) == "" && teamsNewCoreTestOverrides == nil {
+	if strings.TrimSpace(opts.codexPath) == "" {
 		cfg.CodexUpgrader = teamsNewCoreCodexUpgrader{root: root, log: errOut}
 	}
 	if cfg.Registry {

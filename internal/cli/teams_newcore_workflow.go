@@ -49,7 +49,10 @@ func updateTeamsNewCoreConfig(path string, fn func(*corestore.Tx) error) error {
 		return fmt.Errorf("open Teams core store: %w", err)
 	}
 	defer st.Close()
-	host, _ := os.Hostname()
+	host, err := teamsHostname()
+	if err != nil {
+		return err
+	}
 	if _, err := st.Acquire(corestore.Ident{Host: host, PID: os.Getpid(), BootID: teamsBootID()}); err != nil {
 		switch {
 		case errors.Is(err, corestore.ErrOwnerLive):

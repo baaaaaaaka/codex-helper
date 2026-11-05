@@ -248,7 +248,7 @@ func collectTeamsServiceWatchdogSnapshot(ctx context.Context, opts teamsServiceW
 	if _, err := os.Stat(filepath.Join(filepath.Dir(path), corestore.DisabledFile)); err == nil {
 		snapshot.Disabled = true
 	}
-	if host, err := os.Hostname(); err == nil {
+	if host, err := teamsHostname(); err == nil {
 		snapshot.BackoffUntil = readTeamsServiceRestartRecord(teamsServiceRestartRecordPath(filepath.Dir(path), host)).WaitUntil
 	}
 	if info, err := os.Lstat(path); err != nil || !info.Mode().IsRegular() {
