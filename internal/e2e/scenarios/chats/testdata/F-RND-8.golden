@@ -1,12 +1,16 @@
 # F-RND-8: per message: 5 images/clips, 5 files and 3 quotes run; one more of any is refused with v0.1.20's text and no turn
 # cxp black-box transcript; volatile values are numbered placeholders
 
-== chat <chat:1> "Codex Control - e2ehost"
+== chat <chat:1> "🏠 Codex Control - e2ehost"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
 -- <msg:2> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>new <root>/work/limits</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>new <root>/work/limits</p>
 -- <msg:3> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -23,7 +27,7 @@
    | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
    mention 0: owner "E2E Owner"
 
-== chat <chat:2> "s001 · limits"
+== chat <chat:2> "💬 e2ehost - Everything at the limit E2E-FRND8-atlimit-4"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -57,6 +61,7 @@
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Teams message has more than 5 inline Teams media attachments. Please send fewer media items in one message.</p>
 -- <msg:5> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>6 files E2E-FRND8-over-2</p>
    | <attachment id="<uuid:1>"></attachment><attachment id="<uuid:2>"></attachment><attachment id="<uuid:3>"></attachment><attachment id="<uuid:4>"></attachment><attachment id="<uuid:5>"></attachment><attachment id="<uuid:6>"></attachment>
    attachment: {"content":null,"contentType":"reference","contentUrl":"https://e2etenant-my.sharepoint.com/personal/owner_e2e_example/Documents/Microsoft%20Teams%20Chat%20Files/notes-1.txt","id":"<uuid:1>","name":"notes-1.txt","teamsAppId":null,"thumbnailUrl":null}
@@ -65,15 +70,23 @@
    attachment: {"content":null,"contentType":"reference","contentUrl":"https://e2etenant-my.sharepoint.com/personal/owner_e2e_example/Documents/Microsoft%20Teams%20Chat%20Files/notes-4.txt","id":"<uuid:4>","name":"notes-4.txt","teamsAppId":null,"thumbnailUrl":null}
    attachment: {"content":null,"contentType":"reference","contentUrl":"https://e2etenant-my.sharepoint.com/personal/owner_e2e_example/Documents/Microsoft%20Teams%20Chat%20Files/notes-5.txt","id":"<uuid:5>","name":"notes-5.txt","teamsAppId":null,"thumbnailUrl":null}
    attachment: {"content":null,"contentType":"reference","contentUrl":"https://e2etenant-my.sharepoint.com/personal/owner_e2e_example/Documents/Microsoft%20Teams%20Chat%20Files/notes-6.txt","id":"<uuid:6>","name":"notes-6.txt","teamsAppId":null,"thumbnailUrl":null}
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>6 files E2E-FRND8-over-2</p>
+   | <attachment id="<uuid:1>"></attachment><attachment id="<uuid:2>"></attachment><attachment id="<uuid:3>"></attachment><attachment id="<uuid:4>"></attachment><attachment id="<uuid:5>"></attachment><attachment id="<uuid:6>"></attachment>
 -- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Teams message has more than 5 file attachments. Please send fewer files in one message.</p>
 -- <msg:7> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
    | <attachment id="<ms:1>"></attachment><attachment id="<ms:2>"></attachment><attachment id="<ms:3>"></attachment><attachment id="<ms:4>"></attachment><p>4 quotes E2E-FRND8-over-3</p>
    attachment: {"content":"{\"messageId\":\"<ms:1>\",\"messagePreview\":\"quoted 1\",\"messageSender\":{\"application\":null,\"device\":null,\"user\":{\"displayName\":\"E2E Owner\",\"id\":\"\",\"userIdentityType\":\"aadUser\"}}}","contentType":"messageReference","contentUrl":null,"id":"<ms:1>","name":null}
    attachment: {"content":"{\"messageId\":\"<ms:2>\",\"messagePreview\":\"quoted 2\",\"messageSender\":{\"application\":null,\"device\":null,\"user\":{\"displayName\":\"E2E Owner\",\"id\":\"\",\"userIdentityType\":\"aadUser\"}}}","contentType":"messageReference","contentUrl":null,"id":"<ms:2>","name":null}
    attachment: {"content":"{\"messageId\":\"<ms:3>\",\"messagePreview\":\"quoted 3\",\"messageSender\":{\"application\":null,\"device\":null,\"user\":{\"displayName\":\"E2E Owner\",\"id\":\"\",\"userIdentityType\":\"aadUser\"}}}","contentType":"messageReference","contentUrl":null,"id":"<ms:3>","name":null}
    attachment: {"content":"{\"messageId\":\"<ms:4>\",\"messagePreview\":\"quoted 4\",\"messageSender\":{\"application\":null,\"device\":null,\"user\":{\"displayName\":\"E2E Owner\",\"id\":\"\",\"userIdentityType\":\"aadUser\"}}}","contentType":"messageReference","contentUrl":null,"id":"<ms:4>","name":null}
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <attachment id="<ms:1>"></attachment><attachment id="<ms:2>"></attachment><attachment id="<ms:3>"></attachment><attachment id="<ms:4>"></attachment><p>4 quotes E2E-FRND8-over-3</p>
 -- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Teams message has more than 3 quoted/referenced messages. Please send fewer references in one message.</p>

@@ -37,6 +37,13 @@ func (e *Engine) labelAdmitted(conv int64, group bool, a store.Admitted, c *clas
 		conv == e.inboxID || hasVoice(c.msg.Files) {
 		return
 	}
+	// A message refused for a raw API key is not labelled: the label edit
+	// would send the pasted key back to Graph and add one more copy of it
+	// to the message's edit history. (v0.1.20 labelled it; R-26 wins.)
+	// Other refusals (attachment limits) keep v0.1.20's label.
+	if c.reject == textRawAPIKey {
+		return
+	}
 	acted := a.Kind == store.InCommand && a.State == store.InQueued ||
 		a.Kind == store.InPrompt && (a.State == store.InHeld || a.TurnID != 0)
 	if !acted {

@@ -1,12 +1,16 @@
 # STATS-RESETS: `helper stats` totals across 35 counter resets and a subagent fork equal the hand-computed values
 # cxp black-box transcript; volatile values are numbered placeholders
 
-== chat <chat:1> "Codex Control - e2ehost"
+== chat <chat:1> "🏠 Codex Control - e2ehost"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
 -- <msg:2> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>new <root>/work/resets</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>new <root>/work/resets</p>
 -- <msg:3> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -23,6 +27,10 @@
    | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
    mention 0: owner "E2E Owner"
 -- <msg:5> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>stats</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>stats</p>
 -- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -101,7 +109,7 @@
    | <li>1 model or effort group(s), 14,973 total, have missing metadata; they remain <code>unknown</code> instead of being guessed or merged</li>
    | </ul>
 
-== chat <chat:2> "s001 · resets"
+== chat <chat:2> "💬 e2ehost - Please answer E2E-STATSRESETS-first-1"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -118,6 +126,10 @@
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
    | Need more details? Send <code>helper status</code>.</p>
 -- <msg:3> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Please answer E2E-STATSRESETS-first-1</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>Please answer E2E-STATSRESETS-first-1</p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -127,6 +139,10 @@
    | <p>E2EANSWER-<n> answer for E2E-STATSRESETS-first-1</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:6> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper stats</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
    | <p>helper stats</p>
 -- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>

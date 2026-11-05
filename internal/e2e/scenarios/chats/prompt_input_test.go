@@ -208,7 +208,11 @@ func TestQuotedMessages(t *testing.T) {
 		"its path in the quote and in the file list", clip(pl[max(0, len(pl)-300):], 300))
 	wantFile := "Referenced Teams message\nFrom: E2E Owner\nTime: "
 	s.Check("F-RND-9 the file holds the whole quoted message", strings.HasPrefix(file, wantFile) &&
-		strings.Contains(file, "\nSource: Graph full message\n\nLong specification "+longTok+"\n") &&
+		// The quoted owner message carries the helper's user label once
+		// the helper has labelled it (F-RND-4); v0.1.20 kept that label in
+		// the Graph full text too.
+		(strings.Contains(file, "\nSource: Graph full message\n\nLong specification "+longTok+"\n") ||
+			strings.Contains(file, "\nSource: Graph full message\n\n🧑‍💻 User:\nLong specification "+longTok+"\n")) &&
 		strings.Count(file, "requirement line with enough words to be long") == 60, "header + full text", clip(file, 300))
 }
 
@@ -429,6 +433,13 @@ func TestRawAPIKeyRefused(t *testing.T) {
 	for _, m := range append(s.SUTMessages(work.ID), s.SUTMessages(control.ID)...) {
 		if strings.Contains(m.Content, key) {
 			where = append(where, "posted message")
+		}
+	}
+	// No Graph write of the helper carries the key either (an edit of the
+	// owner's message, such as the user label, would send it back).
+	for _, r := range s.Graph.Requests(fakegraph.RequestFilter{}) {
+		if r.Method != "GET" && strings.Contains(r.Body, key) {
+			where = append(where, r.Route)
 		}
 	}
 	s.Check("R-26 the key is not stored, logged or posted", len(where) == 0, "nowhere", fmt.Sprint(where))
