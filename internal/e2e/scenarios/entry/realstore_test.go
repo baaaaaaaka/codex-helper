@@ -169,6 +169,7 @@ func TestAcceptanceRealStoreFirstStart(t *testing.T) {
 	s.Check("the control chat is read every 5 s during the catch-up (N-3)", gap <= controlPoll+readSlack, "<= "+(controlPoll+readSlack).String(), gap.Round(10*time.Millisecond).String())
 	s.Check("the catch-up drains within 30 min", drained < 30*time.Minute, "< 30m", drained.Round(time.Second).String())
 
+	idleStart := time.Now()
 	samples := sampleCPU(pid, measure, nil)
 	close(stopLive)
 	appended := <-liveDone
@@ -176,6 +177,7 @@ func TestAcceptanceRealStoreFirstStart(t *testing.T) {
 	s.Note("CPU over %s idle after the catch-up (%d samples, live session appended %d large records): mean %.3f%%, p99 %.1f%%, max %.1f%% of a core per second; total %.2fs CPU",
 		measure, len(samples.perSec), appended, sum.mean, sum.p99, sum.max, sum.totalSec)
 	s.Note("idle CPU mean per minute (%%): %s", perMinute(samples.perSec))
+	s.Note("chat reads per idle minute: %s", readsPerMinute(s, idleStart, measure))
 	s.Check("idle CPU mean is negligible", sum.mean <= 0.2 || len(samples.perSec) == 0, "<= 0.2% of a core", fmt.Sprintf("%.3f%%", sum.mean))
 	s.Check("no idle 1 s window above 10% of a core", sum.max <= 10, "<= 10%", fmt.Sprintf("max %.1f%% at second %d", sum.max, sum.maxAt))
 	for _, w := range []time.Duration{time.Minute, time.Second} {
@@ -591,6 +593,22 @@ func newChats(s *harness.Scenario, seeded []string) []string {
 		}
 	}
 	return out
+}
+
+// readsPerMinute renders the number of chat reads in each minute of the
+// window [from, from+d) (the safety reads' spread shows here).
+func readsPerMinute(s *harness.Scenario, from time.Time, d time.Duration) string {
+	n := make([]int, (d+time.Minute-1)/time.Minute)
+	for _, r := range s.Graph.Requests(fakegraph.RequestFilter{Method: "GET", Route: "GET /chats/{chat}/messages"}) {
+		if i := int(r.At.Sub(from) / time.Minute); i >= 0 && i < len(n) {
+			n[i]++
+		}
+	}
+	out := make([]string, len(n))
+	for i, v := range n {
+		out[i] = strconv.Itoa(v)
+	}
+	return strings.Join(out, ", ")
 }
 
 // perMinute renders the mean of each full or partial minute of per-second
