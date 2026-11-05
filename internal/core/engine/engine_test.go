@@ -2383,7 +2383,7 @@ func TestCapacityRetrySendsContinueOnceCodexRecordedThePrompt(t *testing.T) {
 	for i, run := range runs {
 		want := "continue"
 		if i < 3 {
-			if !strings.HasPrefix(run.Text, "fit me in") {
+			if !strings.HasPrefix(run.Text, "User message:\nfit me in") {
 				t.Fatalf("attempt %d sent %q, want the prompt (Codex had not recorded it)", i+1, run.Text)
 			}
 		} else if run.Text != want || len(run.Images) != 0 {

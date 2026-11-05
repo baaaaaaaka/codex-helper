@@ -74,6 +74,16 @@ func (e *Engine) cmdShutdown(ctx context.Context, j cmdJob) {
 	e.fail(store.ErrDisabled)
 }
 
+// shutdownCommand reports whether a command text is `shutdown` (as
+// urgentCommand reads it).
+func shutdownCommand(text string) bool {
+	f := strings.Fields(strings.ToLower(text))
+	if len(f) > 0 && f[0] == "helper" {
+		f = f[1:]
+	}
+	return len(f) > 0 && f[0] == "shutdown"
+}
+
 // shutdownThrough is the seq of the shutdown reply's last part in the
 // control chat ctl (0 when none is pending): while the helper stops, the
 // control chat is sent up to it, in order, and nothing after it.

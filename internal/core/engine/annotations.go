@@ -44,6 +44,12 @@ func (e *Engine) labelAdmitted(conv int64, group bool, a store.Admitted, c *clas
 	if c.reject == textRawAPIKey {
 		return
 	}
+	// `shutdown` stops the process right after its reply, before queued
+	// edits are made, so whether its label went out would depend on timing.
+	// It is never labelled (shutdown.go).
+	if a.Kind == store.InCommand && shutdownCommand(c.in.Body) {
+		return
+	}
 	acted := a.Kind == store.InCommand && a.State == store.InQueued ||
 		a.Kind == store.InPrompt && (a.State == store.InHeld || a.TurnID != 0)
 	if !acted {
