@@ -11,6 +11,7 @@ import (
 
 	"github.com/baaaaaaaka/codex-helper/internal/channel/channeltest"
 	"github.com/baaaaaaaka/codex-helper/internal/core/store"
+	"github.com/baaaaaaaka/codex-helper/internal/e2e/rollout"
 )
 
 // cliRig starts the rig's engine itself to reach CLIRequest (gap batch
@@ -18,7 +19,7 @@ import (
 func cliRig(t *testing.T, tweak ...func(*Config)) (*rig, *Engine) {
 	r := &rig{t: t, ch: channeltest.New(), ag: newAgent(), path: filepath.Join(t.TempDir(), "core.db"),
 		log: &strings.Builder{}, logMu: &sync.Mutex{}}
-	st, err := store.Open(r.path)
+	st, err := store.OpenWith(r.path, store.Options{Exclusive: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -160,4 +161,33 @@ func TestCLISendFileToSession(t *testing.T) {
 	if msgAt < 0 || fileAt < 0 || msgAt > fileAt {
 		t.Fatalf("message at %d, file at %d; want the message first", msgAt, fileAt)
 	}
+}
+
+// `chat recreate --history full` with the store in the single-connection
+// mode of a network filesystem (the rig's store): the request's store
+// reads happen outside its transaction, so it completes instead of
+// waiting forever on the one connection.
+func TestCLIRecreateWithHistorySingleConnection(t *testing.T) {
+	sessions := t.TempDir()
+	r, e := cliRig(t, func(c *Config) { c.SessionsDir = sessions })
+	r.control()
+	w, err := rollout.New(sessions, t.TempDir(), rollout.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.AppendTurn(rollout.Turn{Prompt: "local prompt", Answer: "local answer"}); err != nil {
+		t.Fatal(err)
+	}
+	old := r.localChat()
+	r.wait("local records mirrored", func() bool { return len(r.own(old, "local answer")) == 1 })
+	res := cliRun(t, e, CLIRequest{ID: "18-ab", Op: CLIRecreateChat, Selector: "s001", History: true})
+	if res.Error != "" {
+		t.Fatalf("recreate: %s", res.Error)
+	}
+	fresh := r.chatOf("s001")
+	if fresh == "" || fresh == old {
+		t.Fatalf("s001 still on %q (was %q)", fresh, old)
+	}
+	r.wait("history in the new chat", func() bool { return len(r.own(fresh, "local answer")) == 1 })
+	r.wait("recreated notice", func() bool { return len(r.own(fresh, "Work chat recreated: s001.")) == 1 })
 }

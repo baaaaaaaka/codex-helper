@@ -316,6 +316,9 @@ func (e *Engine) dashTitles(sessions []*dashSession) {
 				first = promptTitle(transcript.FirstPrompt(s.path, firstPromptMax))
 				if first != "" {
 					e.dash.mu.Lock()
+					if e.dash.titles == nil { // the dashboard may not have been read yet
+						e.dash.titles = map[string]string{}
+					}
 					e.dash.titles[s.path] = first
 					e.dash.mu.Unlock()
 				}

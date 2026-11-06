@@ -74,9 +74,12 @@ type Options struct {
 	// verifies it.
 	Lease Lease
 
-	// exclusive forces the network-filesystem mode on any filesystem
-	// (tests).
-	exclusive bool
+	// Exclusive forces the network-filesystem mode (one connection,
+	// locking_mode=EXCLUSIVE) on any filesystem. Production leaves it
+	// unset: the mode follows the filesystem. The engine's tests set it,
+	// so a store read made inside a transaction (which waits forever on
+	// the single connection) fails there instead of only on NFS.
+	Exclusive bool
 }
 
 // Lease is the owner lease that gates writes (internal/core/lease.Holder).
@@ -247,7 +250,7 @@ func OpenWith(path string, opt Options) (*Store, error) {
 	if fresh && opt.ReadOnly {
 		return nil, fmt.Errorf("store: %s does not exist", path)
 	}
-	exclusive := opt.exclusive || networkFS(filepath.Dir(path))
+	exclusive := opt.Exclusive || networkFS(filepath.Dir(path))
 	if !opt.ReadOnly {
 		w, err := openDB(path, exclusive)
 		if err != nil {
