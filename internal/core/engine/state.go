@@ -82,7 +82,13 @@ type convState struct {
 	safeAt   time.Time
 	reading  bool
 	failures int
-	seen     map[string]time.Time // ext ids admitted or classified recently
+	// firstRead is closed by this process's first successful read of the
+	// chat (read): the reconcile of a turn the previous process left open
+	// waits for it, so the prompts sent while the helper was down are
+	// admitted (and acknowledged) before that turn's notice.
+	firstRead chan struct{}
+	readOnce  bool
+	seen      map[string]time.Time // ext ids admitted or classified recently
 
 	// runner
 	running *runState

@@ -139,7 +139,14 @@ func (e *Engine) untilNextRead(now time.Time) time.Duration {
 // readableLocked reports whether a conversation is read at its next read
 // time (not being read already, and in a state that is read).
 func (e *Engine) readableLocked(cs *convState) bool {
-	if cs.chat == "" || cs.reading {
+	return !cs.reading && readStateLocked(cs)
+}
+
+// readStateLocked reports whether a conversation is in a state that is
+// read: bound to a chat, and not a parked, closed or held work chat or a
+// closed control chat (caller holds e.mu).
+func readStateLocked(cs *convState) bool {
+	if cs.chat == "" {
 		return false
 	}
 	if cs.kind == store.KindWork && cs.state != store.ConvActive {
@@ -368,6 +375,10 @@ func (e *Engine) read(ctx context.Context, id int64) {
 	now := e.now()
 	if err == nil {
 		cs.failures = 0
+		if !cs.readOnce && cs.firstRead != nil {
+			cs.readOnce = true
+			close(cs.firstRead) // reconcileTurn waits for it
+		}
 		cs.nextRead = e.nextReadLocked(cs, start, now, safety)
 		if cs.scanLive <= gen {
 			cs.scanLive = 0 // read: the change was before the read started

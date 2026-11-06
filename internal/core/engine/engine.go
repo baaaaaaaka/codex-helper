@@ -727,7 +727,8 @@ func (e *Engine) load() error {
 func (e *Engine) trackLocked(c store.Conversation) *convState {
 	cs := e.convs[c.ID]
 	if cs == nil {
-		cs = &convState{id: c.ID, recent: map[string]recentPrompt{}, seen: map[string]time.Time{}, created: time.UnixMilli(c.CreatedAt)}
+		cs = &convState{id: c.ID, recent: map[string]recentPrompt{}, seen: map[string]time.Time{}, created: time.UnixMilli(c.CreatedAt),
+			firstRead: make(chan struct{})}
 		e.convs[c.ID] = cs
 	}
 	if cs.chat != "" && cs.chat != c.ExtChatID {
