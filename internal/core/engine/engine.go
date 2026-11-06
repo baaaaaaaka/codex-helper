@@ -245,6 +245,7 @@ type Engine struct {
 	resolverWake chan struct{}
 	mirrorWake   chan struct{}
 	cmdQueue     chan cmdJob
+	once         onceState // `run --once` (once.go)
 	cmdMu        sync.Mutex
 	cmdPending   map[int64][]cmdJob // per-conversation command queues; present while a worker runs
 	asrWake      chan struct{}

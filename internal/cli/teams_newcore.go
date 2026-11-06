@@ -66,6 +66,10 @@ type teamsNewCoreOptions struct {
 	// (--managed-service-child): it paces fast restarts and stands by on an
 	// expected refusal instead of exiting (teams_service_backoff.go).
 	managedServiceChild bool
+	// interval is --interval (0: the production read tiers); once is
+	// --once (F-CLI-10: one cycle, then exit).
+	interval time.Duration
+	once     bool
 }
 
 // teamsNewCoreChannelConfig is the Teams adapter configuration. Display
@@ -300,6 +304,46 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 	}
 }
 
+// teamsPollIntervalTiming applies `cxp teams run --interval d` (F-CLI-3):
+// the control chat, the activity scan and recently active chats are read
+// every d; the fastest tier never waits longer than d and the idle tiers
+// never read more often than d.
+func teamsPollIntervalTiming(t engine.Timing, d time.Duration) engine.Timing {
+	d = max(d, t.Tick)
+	t.Control, t.ScanInterval, t.Warm = d, d, d
+	t.Hot = min(t.Hot, d)
+	t.Cool, t.Cold = max(t.Cool, d), max(t.Cold, d)
+	return t
+}
+
+// teamsOnceCheck is how often `run --once` asks whether its cycle is
+// over (only while --once runs).
+const teamsOnceCheck = 500 * time.Millisecond
+
+// watchTeamsOnceCycle stops the engine once its first cycle is over
+// (engine.CycleDone twice in a row, so work queued in between is seen).
+func watchTeamsOnceCycle(ctx context.Context, e *engine.Engine, stop context.CancelFunc, done chan<- struct{}) {
+	t := time.NewTicker(teamsOnceCheck)
+	defer t.Stop()
+	quiet := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		if !e.CycleDone() {
+			quiet = 0
+			continue
+		}
+		if quiet++; quiet >= 2 {
+			close(done)
+			stop()
+			return
+		}
+	}
+}
+
 // errTeamsStoppedEverywhereNow: the running helper stopped because the
 // kill-switch file appeared.
 type errTeamsStoppedEverywhereNow struct{ desc string }
@@ -440,6 +484,9 @@ func serveTeamsNewCore(ctx context.Context, out, errOut io.Writer, root *rootOpt
 	if seam != nil {
 		timing, readRate = seam.timing()
 	}
+	if opts.interval > 0 {
+		timing = teamsPollIntervalTiming(timing, opts.interval)
+	}
 	machine := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_MACHINE_LABEL"))
 	if machine == "" {
 		// `cxp teams migrate` keeps the old hostname override here.
@@ -528,7 +575,20 @@ func serveTeamsNewCore(ctx context.Context, out, errOut io.Writer, root *rootOpt
 			}
 		}()
 	}
+	var cycleDone chan struct{}
+	if opts.once {
+		cycleDone = make(chan struct{})
+		go watchTeamsOnceCycle(runCtx, e, cancelRun, cycleDone)
+	}
 	err = e.Run(runCtx)
+	if cycleDone != nil {
+		select {
+		case <-cycleDone:
+			_, _ = fmt.Fprintln(out, "Teams poll cycle complete (--once); exiting")
+			return nil
+		default:
+		}
+	}
 	if lerr := holder.Err(); lerr != nil && ctx.Err() == nil {
 		return teamsLeaseLostError(lerr, anchor)
 	}
