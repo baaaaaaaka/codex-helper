@@ -1,0 +1,26 @@
+{
+  "_comment": [
+    "Seconds each E2E scenario package took (package elapsed, go test -json) in one",
+    "run of the whole suite in a 4-CPU offline Docker container (2026-11-06).",
+    "scripts/ci/e2e_shards.py packs whole packages onto the CI shards by these",
+    "weights; a package missing here gets the script's default weight. Refresh",
+    "after adding or growing a scenario package: python3 scripts/ci/e2e_shards.py --count 3 --plan"
+  ],
+  "weights": {
+    "commands": 216,
+    "sharedhome": 183,
+    "entry": 171,
+    "dashboard": 123,
+    "lifecycle": 66,
+    "turns": 66,
+    "chats": 58,
+    "cost": 54,
+    "notify": 48,
+    "faults": 43,
+    "edits": 37,
+    "crash": 29,
+    "inbound": 20,
+    "restart": 17,
+    "delegation": 13
+  }
+}

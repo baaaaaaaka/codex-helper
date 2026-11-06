@@ -257,7 +257,9 @@ class CIHelperScriptTests(unittest.TestCase):
         script = (CI_DIR / "windows_locked_cxp_self_upgrade.ps1").read_text(
             encoding="utf-8"
         )
-        ci = (WORKFLOW_DIR / "ci.yml").read_text(encoding="utf-8")
+        # The Split reproduction downloads released binaries, so it runs in
+        # the nightly tier (nightly.yml), which also gates every release.
+        ci = (WORKFLOW_DIR / "nightly.yml").read_text(encoding="utf-8")
         release = (WORKFLOW_DIR / "release.yml").read_text(encoding="utf-8")
 
         self.assertIn('[ValidateSet("Split", "Converged")]', script)
