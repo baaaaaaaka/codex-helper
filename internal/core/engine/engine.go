@@ -683,6 +683,13 @@ func (e *Engine) load() error {
 		}
 		return best, found
 	}
+	// Read before taking e.mu: transactions take it.
+	group := map[int64]bool{}
+	for _, c := range convs {
+		if v, ok, _ := e.st.Meta(metaGroupPrefix + fmt.Sprint(c.ID)); ok && v == "1" {
+			group[c.ID] = true
+		}
+	}
 	now := e.now()
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -714,7 +721,7 @@ func (e *Engine) load() error {
 		}
 	}
 	for id, cs := range e.convs {
-		if v, ok, _ := e.st.Meta(metaGroupPrefix + fmt.Sprint(id)); ok && v == "1" {
+		if group[id] {
 			cs.group = true
 		}
 	}

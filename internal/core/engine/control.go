@@ -20,10 +20,11 @@ func (e *Engine) ensureControl(ctx context.Context) error {
 	id := e.controlID
 	e.mu.Unlock()
 	if id == 0 {
+		title := e.controlTitle() // reads the store: not inside the transaction
 		err := e.update(func(tx *store.Tx) error {
 			var err error
 			id, err = tx.CreateConversation(store.NewConversation{Label: "control", Kind: store.KindControl,
-				Channel: e.cfg.ChannelName, Title: e.controlTitle(), TitleSource: "auto"})
+				Channel: e.cfg.ChannelName, Title: title, TitleSource: "auto"})
 			if err != nil {
 				return err
 			}
@@ -211,6 +212,7 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 		e.logf("create chat for %s: %v", label, err)
 		return false
 	}
+	machine := e.machine() // reads the store: not inside the transaction
 	err = e.update(func(tx *store.Tx) error {
 		if err := tx.SetChat(id, info.ID, info.URL); err != nil {
 			return err
@@ -231,7 +233,7 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 		case inbox:
 			// Nothing is announced in or about the inbox.
 		case kind == store.KindControl:
-			if err := e.enqueueNotice(tx, id, "ready:control", "Codex control chat is ready on "+e.machine()+". Send `new <directory>` to start a session, or `help`."); err != nil {
+			if err := e.enqueueNotice(tx, id, "ready:control", "Codex control chat is ready on "+machine+". Send `new <directory>` to start a session, or `help`."); err != nil {
 				return err
 			}
 		case discovered != "":
