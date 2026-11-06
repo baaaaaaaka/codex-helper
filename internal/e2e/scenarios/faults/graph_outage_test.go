@@ -42,6 +42,11 @@ func TestGraphOutageWhileRunning(t *testing.T) {
 		s.Check("history watcher initialised", false, "probe session mirrored", "never mirrored")
 		return
 	}
+	// The probe session's "Codex finished" notice is posted before `new`
+	// (it would race the reply in the control chat).
+	s.WaitFor("the probe session's notice", 30*time.Second, func() (bool, string) {
+		return len(s.SUTMessagesContaining(control.ID, "Codex finished")) > 0, "no notice yet"
+	})
 	work, _ := steps.NewWorkChat(s, control, "outage")
 	pid := 0
 	if p, ok := s.SUT.(interface{ Pid() int }); ok {
