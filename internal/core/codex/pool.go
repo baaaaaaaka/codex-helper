@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"sync"
 	"time"
@@ -394,6 +395,12 @@ func writeFileAtomic(path string, data []byte) error {
 	}
 	if werr == nil {
 		werr = os.Rename(tmp, path)
+		// Windows refuses (access denied) a rename onto a file another
+		// writer is replacing at that moment; that writer is done shortly.
+		for i := 0; werr != nil && runtime.GOOS == "windows" && i < 50; i++ {
+			time.Sleep(10 * time.Millisecond)
+			werr = os.Rename(tmp, path)
+		}
 	}
 	if werr != nil {
 		_ = os.Remove(tmp)

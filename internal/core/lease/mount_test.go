@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -53,6 +54,9 @@ func noctoMountinfo(dir string) func() (string, error) {
 // a foreground start fails with ErrUnsafeMount and a service standby says
 // why it waits, and claims once the mount is fixed.
 func TestNoctoMountRefusesTheLease(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the mount check reads Linux mountinfo")
+	}
 	e := newEnv(t)
 	dir, err := filepath.EvalSymlinks(e.dir)
 	if err != nil {

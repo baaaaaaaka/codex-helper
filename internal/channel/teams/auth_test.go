@@ -7,10 +7,12 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
 	"github.com/baaaaaaaka/codex-helper/internal/channel"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakegraph"
 )
@@ -60,7 +62,7 @@ func TestDelegatedAuthRefreshesOn401ForReads(t *testing.T) {
 		t.Fatalf("cache not refreshed: %+v", tok)
 	}
 	st, _ := os.Stat(path)
-	if st.Mode().Perm() != 0o600 {
+	if runtime.GOOS != "windows" && st.Mode().Perm() != 0o600 { // no Unix modes on Windows
 		t.Fatalf("cache mode %v", st.Mode())
 	}
 	noViolations(t, fg)
@@ -150,7 +152,11 @@ func TestResolveAuthConfigReadsExistingCaches(t *testing.T) {
 	cache := filepath.Join(root, "cache")
 	cfgPath := filepath.Join(root, "teams-auth.json")
 	t.Setenv("CODEX_HELPER_STATE_DIR", state)
+	// The user cache dir is XDG_CACHE_HOME on Linux, ~/Library/Caches on
+	// macOS and %LocalAppData% on Windows: point all of them into root.
 	t.Setenv("XDG_CACHE_HOME", cache)
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("LocalAppData", cache)
 	t.Setenv("CODEX_HELPER_TEAMS_AUTH_CONFIG", cfgPath)
 	for _, k := range []string{"CODEX_HELPER_TEAMS_AUTH_PROFILE", "CODEX_HELPER_TEAMS_PROFILE", "CODEX_HELPER_TEAMS_FULL_TENANT_ID",
 		"CODEX_HELPER_TEAMS_TENANT_ID", "CODEX_HELPER_TEAMS_FULL_CLIENT_ID", "CODEX_HELPER_TEAMS_CLIENT_ID",
@@ -177,7 +183,10 @@ func TestResolveAuthConfigReadsExistingCaches(t *testing.T) {
 	}
 
 	// Pre-profile default cache from older builds.
-	legacy := filepath.Join(cache, "codex-helper", "teams-full-token.json")
+	legacy, err := appdirs.LegacyCachePath("teams-full-token.json")
+	if err != nil {
+		t.Fatal(err)
+	}
 	writeCache(t, legacy, TokenCache{RefreshToken: "r"})
 	if cfg, _ := ResolveAuthConfig(""); cfg.CachePath != legacy {
 		t.Fatalf("legacy cache not used: %s", cfg.CachePath)

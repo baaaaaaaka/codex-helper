@@ -144,6 +144,11 @@ jobs:
   windows:
     name: windows-${{ matrix.arch }} (${{ inputs.windows_crt }} CRT)
     runs-on: ${{ matrix.runner }}
+    # pwsh is the Windows runners' default; stated so that actionlint does
+    # not check these PowerShell steps as bash (runs-on is a matrix value).
+    defaults:
+      run:
+        shell: pwsh
     strategy:
       fail-fast: false
       matrix:

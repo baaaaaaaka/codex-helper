@@ -728,6 +728,7 @@ func TestTeamsServiceRetireLocalDuplicateProcessesFiltersAndTerminates(t *testin
 	// --registry naming it is the same helper instance.
 	home := filepath.Join(tmp, "home")
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home) // os.UserHomeDir on Windows
 	t.Setenv("XDG_STATE_HOME", "")
 	t.Setenv("CODEX_HELPER_STATE_DIR", "")
 	registryPath := filepath.Join(home, ".local", "state", "codex-helper", "teams", "registry.json")
@@ -787,6 +788,7 @@ func TestTeamsServiceRetireLocalBridgeProcessesFiltersRegistryProfileAndWatchdog
 	// --registry naming it is the same helper instance.
 	home := filepath.Join(tmp, "home")
 	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home) // os.UserHomeDir on Windows
 	t.Setenv("XDG_STATE_HOME", "")
 	t.Setenv("CODEX_HELPER_STATE_DIR", "")
 	registryPath := filepath.Join(home, ".local", "state", "codex-helper", "teams", "registry.json")

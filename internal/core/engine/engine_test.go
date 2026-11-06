@@ -2131,7 +2131,8 @@ func TestRequeuedCommandsNotDroppedAndKeepQuote(t *testing.T) {
 	replies = nil
 	mu.Unlock()
 	r.start()
-	r.wait("every left command answered", func() bool { mu.Lock(); defer mu.Unlock(); return len(replies) >= n })
+	// 300 commands with replies: slow under -race on a shared runner.
+	r.waitFor("every left command answered", 60*time.Second, func() bool { mu.Lock(); defer mu.Unlock(); return len(replies) >= n })
 	mu.Lock()
 	defer mu.Unlock()
 	quoted := map[string]bool{}

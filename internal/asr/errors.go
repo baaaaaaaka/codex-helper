@@ -159,6 +159,7 @@ var nativeLoadMarkers = []string{
 	"not found (required by",
 	"cannot open shared object file",
 	"exec format error", "bad cpu type", "not a valid win32 application",
+	"is not compatible with the version of windows", // ERROR_EXE_MACHINE_TYPE_MISMATCH
 	"dyld: library not loaded", "dyld[", "symbol not found",
 	"illegal instruction",
 }

@@ -223,9 +223,14 @@ func teamsNewCoreWorkflowURL(st *corestore.Store, storeDir string) (string, erro
 	return strings.TrimSpace(string(raw)), nil
 }
 
+// teamsBootID identifies this boot of the machine for the lease: the
+// kernel boot id on Linux, the boot session UUID on macOS, the boot counter
+// on Windows (teamsOSBootID). "" means unknown: the lease then treats every
+// predecessor as possibly another machine, so it copies the store instead
+// of opening it in place and waits out a crashed owner's lease.
 func teamsBootID() string {
 	if runtime.GOOS != "linux" {
-		return ""
+		return teamsOSBootID()
 	}
 	raw, _ := os.ReadFile("/proc/sys/kernel/random/boot_id")
 	return strings.TrimSpace(string(raw))

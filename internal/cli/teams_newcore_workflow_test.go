@@ -75,7 +75,8 @@ func TestTeamsNewCoreWorkflowConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer h.Release()
-	if !h.Plan().InPlace {
+	// In place needs a known boot id (without one the lease copies).
+	if teamsBootID() != "" && !h.Plan().InPlace {
 		t.Fatalf("plan %+v", h.Plan())
 	}
 	if err := h.Activate(); err != nil {

@@ -133,14 +133,18 @@ func TestResolveUserPath(t *testing.T) {
 	}
 	wd, _ := os.Getwd()
 	t.Setenv("CXP_TEST_DIR_VAR", "/var/x")
+	abs := func(p string) string { // a rooted path on Windows takes the current drive
+		a, _ := filepath.Abs(filepath.FromSlash(p))
+		return a
+	}
 	for in, want := range map[string]string{
-		"/abs/dir/":            "/abs/dir",
+		"/abs/dir/":            abs("/abs/dir"),
 		"~":                    home,
 		"~/proj":               filepath.Join(home, "proj"),
-		`"/with space/dir"`:    "/with space/dir",
+		`"/with space/dir"`:    abs("/with space/dir"),
 		"'rel/dir'":            filepath.Join(wd, "rel/dir"),
 		"`./a/../b`":           filepath.Join(wd, "b"),
-		"$CXP_TEST_DIR_VAR/ok": "/var/x/ok",
+		"$CXP_TEST_DIR_VAR/ok": abs("/var/x/ok"),
 	} {
 		got, err := resolveUserPath(in)
 		if err != nil || got != want {

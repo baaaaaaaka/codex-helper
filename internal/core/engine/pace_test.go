@@ -303,6 +303,9 @@ func backlogRig(t *testing.T, tweak func(*Config), chats, rows int, kindOf func(
 // (Scaled: a 40/s budget with a 100 ms Retry-After grain stands for 4/s
 // with Graph's 1 s; the ceiling is twice the budget.)
 func TestWritesPacedUnderAccountBudget(t *testing.T) {
+	if raceEnabled {
+		t.Skip("goodput against a wall-clock budget is not meaningful under the race detector")
+	}
 	budget := &accountBudget{rate: 40, grain: 100 * time.Millisecond}
 	const chats, rows = 16, 15
 	r, ids := backlogRig(t, func(c *Config) {

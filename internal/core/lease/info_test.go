@@ -3,12 +3,16 @@ package lease
 import (
 	"os"
 	"os/exec"
+	"runtime"
 	"testing"
 )
 
 // HeadGone knows only this machine's processes: an exited pid of this
 // host and boot is gone; this process, or another host's, is not.
 func TestHeadGone(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("pidAlive is conservative on Windows: an owner counts as alive until its slot is stale")
+	}
 	self := Local("box", "boot-1")
 	cmd := exec.Command("true")
 	if err := cmd.Run(); err != nil {

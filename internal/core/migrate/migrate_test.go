@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -551,7 +552,9 @@ func TestWorkflowImport(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	eq(t, "mode", st.Mode().Perm(), os.FileMode(0o600))
+	if runtime.GOOS != "windows" { // no Unix modes on Windows
+		eq(t, "mode", st.Mode().Perm(), os.FileMode(0o600))
+	}
 	raw, _ := os.ReadFile(dst)
 	eq(t, "content", string(raw), secret)
 	var b strings.Builder
