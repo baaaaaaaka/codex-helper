@@ -91,3 +91,16 @@ func (in Info) Age(now time.Time) time.Duration {
 	}
 	return now.Sub(time.UnixMilli(in.Head.Wall))
 }
+
+// HeadGone reports whether the head's process is known to have exited:
+// its record is from this machine (host and boot id) and the pid is gone
+// or now another process, or this machine rebooted after the record's
+// last renewal. A record of another machine is never known to be gone.
+func (in Info) HeadGone(host, boot string) bool {
+	if !in.HeadOK {
+		return false
+	}
+	c := Config{Self: Local(host, boot)}
+	c.defaults()
+	return c.dead(in.Head)
+}

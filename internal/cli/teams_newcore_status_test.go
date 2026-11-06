@@ -80,14 +80,12 @@ func TestTeamsNewCoreServiceStatusReadsStore(t *testing.T) {
 		}
 	}
 
-	ro, err := corestore.OpenWith(path, corestore.Options{ReadOnly: true})
+	s, err := teamsReadStoreDirect(teamsStoreView{Anchor: path, DB: path})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer ro.Close()
-	lines, err := teamsNewCoreStatusLines(ro, teamsStoreView{}, time.Now().Add(5*time.Minute))
-	if err != nil || !strings.Contains(strings.Join(lines, "\n"), "(stale)") {
-		t.Errorf("stale owner not reported: %v %v", lines, err)
+	if line := teamsStoreOwnerLine(s, time.Now().Add(5*time.Minute)); !strings.Contains(line, "(stale)") {
+		t.Errorf("stale owner not reported: %q", line)
 	}
 }
 

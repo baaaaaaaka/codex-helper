@@ -18,9 +18,11 @@ import (
 //
 // Hosts that share the state directory agree on one owner through the
 // lease files next to the store. A host opens the store with SQLite only
-// while it holds the lease, or, for a read-only command, when the store
-// file in use belongs to its own host: SQLite's WAL index is shared memory
-// that does not work across hosts. A helper that is refused stands by
+// while it holds the lease, or, for a read-only command, while no helper
+// holds it and the store file in use belongs to its own host: SQLite's WAL
+// index is shared memory that does not work across hosts. While a helper
+// holds it, a read-only command reads the state the helper publishes
+// (teams_newcore_state.go). A helper that is refused stands by
 // (service) or exits (foreground); a standby takes over once the owner's
 // lease has not been renewed for the stale bound, copying the store into a
 // file of its own when it comes from another host.
@@ -142,14 +144,6 @@ func teamsStoreViewAt(anchor string) (teamsStoreView, error) {
 // exists reports whether there is a store to read.
 func (v teamsStoreView) exists() bool { return v.Info.Exists || teamsFileExists(v.DB) }
 
-// openReadOnly opens the store file in use, read-only, when this host may.
-func (v teamsStoreView) openReadOnly() (*corestore.Store, error) {
-	if v.Remote != "" {
-		return nil, errTeamsStoreOnOtherHost{host: v.Remote}
-	}
-	return corestore.OpenWith(v.DB, corestore.Options{ReadOnly: true})
-}
-
 // ownerLine is the status line for the lease's owner. The heartbeat age
 // is from the owner's clock (display only).
 func (v teamsStoreView) ownerLine(now time.Time) string {
@@ -217,7 +211,12 @@ func teamsWithLeasedStore(ctx context.Context, anchor string, fn func(*corestore
 		return fmt.Errorf("acquire Teams core store: %w", err)
 	}
 	defer st.Release()
-	return fn(st)
+	if err := fn(st); err != nil {
+		return err
+	}
+	// Commands on other hosts read the state this generation leaves.
+	newTeamsStatusPublisher(st, filepath.Dir(anchor), h.Gen(), host, nil).publish(time.Now())
+	return nil
 }
 
 // teamsLeaseLostError explains why a running helper stopped on losing its

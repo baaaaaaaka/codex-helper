@@ -25,7 +25,6 @@ import (
 
 	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
 	chteams "github.com/baaaaaaaka/codex-helper/internal/channel/teams"
-	corestore "github.com/baaaaaaaka/codex-helper/internal/core/store"
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
@@ -706,7 +705,8 @@ type teamsServiceBootstrapControlChatResult struct {
 var teamsServiceControlChatWait = 2 * time.Minute
 
 // defaultTeamsServiceBootstrapControlChat reads the control chat the
-// started helper records in its store; it never talks to Teams itself.
+// started helper records (teamsStoredControlChat: what it publishes while
+// it runs); it never talks to Teams itself.
 func defaultTeamsServiceBootstrapControlChat(ctx context.Context, _ *rootOptions, openControl bool, _ io.Writer) (teamsServiceBootstrapControlChatResult, error) {
 	deadline := time.Now().Add(teamsServiceControlChatWait)
 	var lastErr error
@@ -714,9 +714,9 @@ func defaultTeamsServiceBootstrapControlChat(ctx context.Context, _ *rootOptions
 		c, ok, err := teamsStoredControlChat()
 		if err == nil && ok {
 			result := teamsServiceBootstrapControlChatResult{
-				URL:    strings.TrimSpace(c.ExtURL),
+				URL:    strings.TrimSpace(c.URL),
 				Topic:  strings.TrimSpace(c.Title),
-				ChatID: strings.TrimSpace(c.ExtChatID),
+				ChatID: strings.TrimSpace(c.ChatID),
 			}
 			if openControl && result.URL != "" {
 				if err := teamsServiceOpenURL(ctx, result.URL); err != nil {
@@ -727,6 +727,9 @@ func defaultTeamsServiceBootstrapControlChat(ctx context.Context, _ *rootOptions
 			}
 			return result, nil
 		}
+		// A helper that holds the store but has not published its state
+		// (errTeamsStateUnpublished) is waited for like one that has not
+		// created the control chat; the error says which it was.
 		lastErr = err
 		var remote errTeamsStoreOnOtherHost
 		if errors.As(err, &remote) {
@@ -742,22 +745,6 @@ func defaultTeamsServiceBootstrapControlChat(ctx context.Context, _ *rootOptions
 			return teamsServiceBootstrapControlChatResult{}, err
 		}
 	}
-}
-
-func teamsStoredControlChat() (corestore.Conversation, bool, error) {
-	view, err := teamsReadStoreView()
-	if err != nil {
-		return corestore.Conversation{}, false, err
-	}
-	if !view.exists() {
-		return corestore.Conversation{}, false, nil
-	}
-	st, err := view.openReadOnly()
-	if err != nil {
-		return corestore.Conversation{}, false, err
-	}
-	defer st.Close()
-	return teamsControlConversation(st)
 }
 
 func bootstrapControlChatWithServiceSpec(ctx context.Context, root *rootOptions, spec teamsServiceSpec, openControl bool, errOut io.Writer) (teamsServiceBootstrapControlChatResult, error) {

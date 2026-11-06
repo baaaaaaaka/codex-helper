@@ -11,7 +11,10 @@
 // writes, in EXCLUSIVE locking mode (see OpenWith). So no Update or View
 // callback may call another method of the Store, and no goroutine may wait
 // for the Store while it holds a lock that such a callback takes: either
-// would wait forever for the one connection.
+// would wait forever for the one connection. The file lock is held from
+// open to Close, so no other process opens the store meanwhile; a command
+// that needs the state of a running helper reads what the helper
+// publishes instead (internal/cli, core-status.json).
 package store
 
 import (
@@ -66,7 +69,10 @@ type Options struct {
 	Now func() time.Time
 	// PIDAlive reports whether pid is alive on this host. Defaults to an OS check.
 	PIDAlive func(pid int) bool
-	// ReadOnly opens only the read pool (status/stats); Update fails.
+	// ReadOnly opens the file for reading only (a command run while no
+	// helper holds the store); Update fails. On a network filesystem it
+	// takes the file's exclusive lock like any open there (OpenWith), so
+	// the caller must close it promptly.
 	ReadOnly bool
 	// Lease, when set, is the owner lease of a store in a directory that
 	// hosts may share (internal/core/lease). It replaces the heartbeat in
@@ -108,7 +114,6 @@ type Store struct {
 	path string
 	w    *sql.DB // single writer connection, BEGIN IMMEDIATE
 	r    *sql.DB // read-only pool; w itself in exclusive mode
-	view string  // read-only on a network filesystem: the private copy's directory
 	now  func() time.Time
 	pid  func(int) bool
 	gen  int64
@@ -117,10 +122,16 @@ type Store struct {
 	beat   time.Time  // start of the last successful heartbeat or acquire
 	fenced bool       // a heartbeat found a newer generation
 	ls     Lease      // the owner lease (nil: the owner row's heartbeat)
+
+	changed chan struct{} // signalled after each commit (Changes)
 }
 
 // Open opens or creates the store at path with production options.
 func Open(path string) (*Store, error) { return OpenWith(path, Options{}) }
+
+// busyTimeoutMS is how long a statement waits for a lock another
+// connection holds (tests shorten it).
+var busyTimeoutMS = 5000
 
 // pragmas are the connection settings. A network filesystem gets
 // synchronous=FULL: another host may have to take the store over after
@@ -132,7 +143,7 @@ func pragmas(path string, ro bool) []string {
 		sync = "synchronous(FULL)"
 	}
 	return []string{
-		"busy_timeout(5000)",
+		fmt.Sprintf("busy_timeout(%d)", busyTimeoutMS),
 		"foreign_keys(ON)",
 		sync,
 		"temp_store(MEMORY)",
@@ -170,16 +181,22 @@ func dsn(path string, ro bool) string {
 //
 // A crash leaves the database and its WAL, as in the shared mode; whoever
 // opens them next rebuilds the WAL index from the WAL (CopySnapshot).
-func openDB(path string, exclusive bool) (*sql.DB, error) {
+//
+// readOnly (exclusive mode only) adds query_only: the connection never
+// writes a row. It still needs a writable file descriptor, because opening
+// a WAL database in exclusive mode takes a write lock on the file; and when
+// it closes, SQLite folds a WAL left by a crash into the database, as the
+// next owner would at its open.
+func openDB(path string, exclusive, readOnly bool) (*sql.DB, error) {
 	if !exclusive {
-		return sql.Open("sqlite", dsn(path, false))
+		return sql.Open("sqlite", dsn(path, readOnly))
 	}
 	// The driver applies DSN pragmas in name order, and some of them read
 	// the database (cache_size, synchronous). The locking mode must come
 	// before that first read, so the DSN carries only it and the busy
 	// timeout, and the connector applies the rest.
 	q := url.Values{}
-	q.Add("_pragma", "busy_timeout(5000)")
+	q.Add("_pragma", fmt.Sprintf("busy_timeout(%d)", busyTimeoutMS))
 	q.Add("_pragma", "locking_mode(EXCLUSIVE)")
 	q.Set("_txlock", "immediate")
 	probe, err := sql.Open("sqlite", "")
@@ -193,6 +210,9 @@ func openDB(path string, exclusive bool) (*sql.DB, error) {
 		if !strings.HasPrefix(p, "busy_timeout") {
 			after = append(after, "PRAGMA "+p)
 		}
+	}
+	if readOnly {
+		after = append(after, "PRAGMA query_only(1)")
 	}
 	return sql.OpenDB(exclusiveConnector{drv: drv, dsn: "file:" + filepath.ToSlash(path) + "?" + q.Encode(), after: after}), nil
 }
@@ -230,12 +250,12 @@ func (c exclusiveConnector) Driver() driver.Driver { return c.drv }
 //
 // On a network filesystem (networkFS) the store is opened in exclusive
 // mode (openDB): a single connection serves reads and writes, and other
-// processes cannot open the file while it is open. A read-only Store
-// there never opens the file in use: it copies the database and its WAL
-// into a private temporary directory (as CopySnapshot does) and reads the
-// copy, so a status command neither waits for nor blocks the helper.
+// processes cannot open the file while it is open. That holds for a
+// read-only Store too, so a command opens the store only while no helper
+// holds it (the lease) and closes it at once. A helper that starts
+// meanwhile waits for it (openLockWait).
 func OpenWith(path string, opt Options) (*Store, error) {
-	s := &Store{path: path, now: opt.Now, pid: opt.PIDAlive, ls: opt.Lease}
+	s := &Store{path: path, now: opt.Now, pid: opt.PIDAlive, ls: opt.Lease, changed: make(chan struct{}, 1)}
 	if s.now == nil {
 		s.now = time.Now
 	}
@@ -248,49 +268,88 @@ func OpenWith(path string, opt Options) (*Store, error) {
 		return nil, fmt.Errorf("store: %s does not exist", path)
 	}
 	exclusive := opt.exclusive || networkFS(filepath.Dir(path))
-	if !opt.ReadOnly {
-		w, err := openDB(path, exclusive)
-		if err != nil {
-			return nil, err
-		}
-		w.SetMaxOpenConns(1)
-		w.SetMaxIdleConns(1)
-		w.SetConnMaxLifetime(0)
-		s.w = w
-		if err := s.prepare(fresh, exclusive); err != nil {
-			w.Close()
-			return nil, err
-		}
-		if exclusive {
-			s.r = w
-			return s, nil
-		}
+	if opt.ReadOnly {
+		return s.openReadOnly(exclusive)
 	}
-	read := path
+	deadline := time.Now().Add(openLockWait)
+	for {
+		err := s.openWriter(fresh, exclusive)
+		if err == nil {
+			break
+		}
+		if !isBusy(err) || !time.Now().Before(deadline) {
+			if isBusy(err) {
+				err = fmt.Errorf("%w (%v)", ErrBusy, err)
+			}
+			return nil, err
+		}
+		// Another process holds the file for a moment (a command reading
+		// it while no helper ran); each attempt already waited for the
+		// busy timeout.
+		time.Sleep(200 * time.Millisecond)
+	}
 	if exclusive {
-		dir, err := os.MkdirTemp("", "cxp-store-view-")
-		if err != nil {
-			return nil, err
-		}
-		s.view = dir
-		read = filepath.Join(dir, filepath.Base(path))
-		if err := copyStable(path, read); err != nil {
-			s.Close()
-			return nil, err
-		}
+		s.r = s.w
+		return s, nil
 	}
-	r, err := sql.Open("sqlite", dsn(read, true))
+	r, err := sql.Open("sqlite", dsn(path, true))
 	if err != nil {
 		s.Close()
 		return nil, err
 	}
 	r.SetMaxOpenConns(4)
 	s.r = r
-	if opt.ReadOnly {
-		if err := checkVersion(r, false); err != nil {
-			s.Close()
-			return nil, err
+	return s, nil
+}
+
+// openLockWait bounds how long OpenWith waits for a file another process
+// holds in exclusive mode (a read-only command; each holds it for well
+// under a second).
+var openLockWait = 30 * time.Second
+
+// ErrBusy means another process held the store file for longer than the
+// open waits.
+var ErrBusy = errors.New("store: the file is in use by another process")
+
+func (s *Store) openWriter(fresh, exclusive bool) error {
+	w, err := openDB(s.path, exclusive, false)
+	if err != nil {
+		return err
+	}
+	w.SetMaxOpenConns(1)
+	w.SetMaxIdleConns(1)
+	w.SetConnMaxLifetime(0)
+	s.w = w
+	if err := s.prepare(fresh, exclusive); err != nil {
+		w.Close()
+		s.w = nil
+		return err
+	}
+	return nil
+}
+
+// openReadOnly opens the file for reading: a pool of read-only
+// connections, or on a network filesystem the one exclusive connection
+// with query_only.
+func (s *Store) openReadOnly(exclusive bool) (*Store, error) {
+	r, err := openDB(s.path, exclusive, true)
+	if err != nil {
+		return nil, err
+	}
+	if exclusive {
+		r.SetMaxOpenConns(1)
+		r.SetMaxIdleConns(1)
+		r.SetConnMaxLifetime(0)
+	} else {
+		r.SetMaxOpenConns(4)
+	}
+	s.r = r
+	if err := checkVersion(r, false); err != nil {
+		r.Close()
+		if isBusy(err) {
+			err = fmt.Errorf("%w (%v)", ErrBusy, err)
 		}
+		return nil, err
 	}
 	return s, nil
 }
@@ -421,9 +480,6 @@ func (s *Store) Close() error {
 			err = e
 		}
 	}
-	if s.view != "" {
-		_ = os.RemoveAll(s.view)
-	}
 	return err
 }
 
@@ -483,8 +539,20 @@ func (s *Store) update(fence bool, fn func(*Tx) error) error {
 		tx.Rollback()
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	select {
+	case s.changed <- struct{}{}:
+	default: // one signal is pending already
+	}
+	return nil
 }
+
+// Changes receives after a write transaction commits. Signals coalesce:
+// one pending signal stands for any number of commits. It is for a single
+// reader (the helper's status publisher).
+func (s *Store) Changes() <-chan struct{} { return s.changed }
 
 // View runs fn against the read-only pool inside one read transaction.
 // fn must not call the Store's methods (see the package comment).

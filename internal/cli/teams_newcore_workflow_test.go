@@ -88,6 +88,8 @@ func TestTeamsNewCoreWorkflowConfig(t *testing.T) {
 	if _, err := st.Acquire(corestore.Ident{Host: host, PID: os.Getpid(), BootID: teamsBootID()}); err != nil {
 		t.Fatal(err)
 	}
+	// The helper publishes its state for read-only commands.
+	newTeamsStatusPublisher(st, filepath.Dir(path), h.Gen(), host, io.Discard).publish(time.Now())
 	n := &teamsNewCoreNotifier{st: st, path: path, log: io.Discard}
 	if !n.Available() {
 		t.Fatal("helper notifier off while enabled")

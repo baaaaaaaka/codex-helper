@@ -2,12 +2,12 @@ package store
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -81,12 +81,11 @@ func TestExclusiveModeHasNoSharedMemory(t *testing.T) {
 }
 
 // While the store is open in exclusive mode no other connection can read
-// it, and a read-only Store reads a private copy instead: it sees the
-// committed data, does not stop the owner from writing, and removes its
-// copy on Close.
-func TestExclusiveModeReadOnlyReadsACopy(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "core.sqlite")
+// it: a read-only Store opened meanwhile gets ErrBusy (a command then
+// reads what the helper publishes instead).
+func TestExclusiveModeReadOnlyIsRefusedWhileTheOwnerHasIt(t *testing.T) {
+	short(t, 200)
+	path := filepath.Join(t.TempDir(), "core.sqlite")
 	s := openExclusive(t, path)
 	_, err := s.Acquire(testIdent(1))
 	mustT(t, err)
@@ -99,37 +98,144 @@ func TestExclusiveModeReadOnlyReadsACopy(t *testing.T) {
 	if err := other.QueryRow("SELECT count(*) FROM meta").Scan(&n); !isBusy(err) {
 		t.Fatalf("another connection read the store in exclusive mode: %v", err)
 	}
+	if ro, err := OpenWith(path, Options{ReadOnly: true, exclusive: true}); !errors.Is(err, ErrBusy) {
+		if ro != nil {
+			ro.Close()
+		}
+		t.Fatalf("read-only open next to the owner: %v, want ErrBusy", err)
+	}
+	if v, _, err := s.Meta("k"); err != nil || v != "1" {
+		t.Fatalf("owner after the refused open: %q %v", v, err)
+	}
+}
+
+// With no owner, a read-only Store opens the file itself in exclusive
+// mode: it reads the data, writes nothing (query_only), creates no -shm,
+// and holds the file until Close. A helper that starts meanwhile waits for
+// it instead of failing, and opens the store once the command closes it.
+func TestExclusiveModeReadOnlyOpensDirectlyAndTheOwnerWaits(t *testing.T) {
+	short(t, 200)
+	path := filepath.Join(t.TempDir(), "core.sqlite")
+	s := openExclusive(t, path)
+	_, err := s.Acquire(testIdent(1))
+	mustT(t, err)
+	mustT(t, s.Update(func(tx *Tx) error { return tx.SetMeta("k", "1") }))
+	mustT(t, s.Release())
+	mustT(t, s.Close())
 
 	ro, err := OpenWith(path, Options{ReadOnly: true, exclusive: true})
 	mustT(t, err)
 	if v, ok, err := ro.Meta("k"); err != nil || !ok || v != "1" {
-		t.Fatalf("read-only view: %q %v %v", v, ok, err)
+		t.Fatalf("read-only: %q %v %v", v, ok, err)
 	}
-	if o, ok, err := ro.OwnerInfo(); err != nil || !ok || o.PID != 1 {
-		t.Fatalf("read-only owner: %+v %v %v", o, ok, err)
+	if err := ro.Update(func(tx *Tx) error { return tx.SetMeta("k", "2") }); err == nil {
+		t.Fatal("a read-only Store wrote")
 	}
-	done := make(chan error, 1)
-	go func() { done <- s.Update(func(tx *Tx) error { return tx.SetMeta("k", "2") }) }()
+	if _, err := ro.r.Exec(`INSERT INTO meta(key,value) VALUES ('x','y')`); err == nil {
+		t.Fatal("a read-only connection wrote (query_only is off)")
+	}
+	if _, err := os.Stat(path + "-shm"); err == nil {
+		t.Fatal("a read-only open in exclusive mode created a -shm file")
+	}
+
+	type opened struct {
+		s   *Store
+		err error
+		at  time.Time
+	}
+	done := make(chan opened, 1)
+	go func() {
+		w, err := OpenWith(path, Options{Now: newClock().now, PIDAlive: alwaysAlive, exclusive: true})
+		done <- opened{w, err, time.Now()}
+	}()
+	time.Sleep(600 * time.Millisecond) // three busy timeouts: the owner retries
 	select {
-	case err := <-done:
-		mustT(t, err)
-	case <-time.After(3 * time.Second):
-		t.Fatal("the owner's write waited for a read-only view")
+	case o := <-done:
+		t.Fatalf("the owner opened the store while a command held it: %v", o.err)
+	default:
 	}
-	if v, _, _ := ro.Meta("k"); v != "1" {
-		t.Fatalf("the view is not a snapshot: %q", v)
-	}
-	view := ro.view
-	if view == "" || strings.HasPrefix(view, dir) {
-		t.Fatalf("the view is not a private copy: %q", view)
-	}
+	closed := time.Now()
 	mustT(t, ro.Close())
-	if _, err := os.Stat(view); !os.IsNotExist(err) {
-		t.Fatalf("the copy was not removed: %v", err)
+	var o opened
+	select {
+	case o = <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the owner did not open the store after the command closed it")
 	}
-	if v, _, _ := s.Meta("k"); v != "2" {
-		t.Fatalf("owner after the view: %q", v)
+	mustT(t, o.err)
+	defer o.s.Close()
+	if o.at.Before(closed) {
+		t.Fatal("the owner opened before the command closed the store")
 	}
+	if _, err := o.s.Acquire(testIdent(2)); err != nil {
+		t.Fatal(err)
+	}
+	mustT(t, o.s.Update(func(tx *Tx) error { return tx.SetMeta("k", "3") }))
+}
+
+// A command that keeps the file longer than openLockWait makes the owner's
+// open fail with ErrBusy (the service starts it again later), never hang.
+func TestExclusiveModeOwnerOpenGivesUpOnAHeldFile(t *testing.T) {
+	short(t, 100)
+	wait := openLockWait
+	openLockWait = 500 * time.Millisecond
+	t.Cleanup(func() { openLockWait = wait })
+	path := filepath.Join(t.TempDir(), "core.sqlite")
+	s := openExclusive(t, path)
+	mustT(t, s.Close())
+	ro, err := OpenWith(path, Options{ReadOnly: true, exclusive: true})
+	mustT(t, err)
+	defer ro.Close()
+	if w, err := OpenWith(path, Options{exclusive: true}); !errors.Is(err, ErrBusy) {
+		if w != nil {
+			w.Close()
+		}
+		t.Fatalf("open of a held file: %v, want ErrBusy", err)
+	}
+}
+
+// Changes signals after a commit, coalesced, and not for a rolled-back
+// transaction.
+func TestChangesSignalsCommits(t *testing.T) {
+	for _, excl := range []bool{false, true} {
+		path := filepath.Join(t.TempDir(), "core.sqlite")
+		s, err := OpenWith(path, Options{Now: newClock().now, PIDAlive: alwaysAlive, exclusive: excl})
+		mustT(t, err)
+		_, err = s.Acquire(testIdent(1))
+		mustT(t, err)
+		drain := func() int {
+			n := 0
+			for {
+				select {
+				case <-s.Changes():
+					n++
+				default:
+					return n
+				}
+			}
+		}
+		drain()
+		if err := s.Update(func(tx *Tx) error { return errors.New("no") }); err == nil {
+			t.Fatal("rollback reported success")
+		}
+		if n := drain(); n != 0 {
+			t.Fatalf("exclusive=%v: %d signals after a rollback", excl, n)
+		}
+		for i := 0; i < 3; i++ {
+			mustT(t, s.Update(func(tx *Tx) error { return tx.SetMeta("k", strconv.Itoa(i)) }))
+		}
+		if n := drain(); n != 1 {
+			t.Fatalf("exclusive=%v: %d signals after 3 commits, want 1 (coalesced)", excl, n)
+		}
+		mustT(t, s.Close())
+	}
+}
+
+// short sets the busy timeout to ms for one test.
+func short(t *testing.T, ms int) {
+	old := busyTimeoutMS
+	busyTimeoutMS = ms
+	t.Cleanup(func() { busyTimeoutMS = old })
 }
 
 // A process that dies with the store open in exclusive mode leaves the
@@ -177,6 +283,20 @@ func TestExclusiveModeCrashKeepsEveryCommit(t *testing.T) {
 		if res != "ok" {
 			t.Fatalf("%s: quick_check %s", what, res)
 		}
+	}
+	// A command on the same host while no helper runs: reads the files
+	// (here a raw copy, so the in-place reopen below still finds the WAL)
+	// read-only, recovering the WAL index from the WAL.
+	rawDir := t.TempDir()
+	if _, err := copyFiles(src, filepath.Join(rawDir, "core.sqlite")); err != nil {
+		t.Fatal(err)
+	}
+	ro, err := OpenWith(filepath.Join(rawDir, "core.sqlite"), Options{ReadOnly: true, exclusive: true})
+	mustT(t, err)
+	check(ro, "read-only")
+	mustT(t, ro.Close())
+	if _, err := os.Stat(filepath.Join(rawDir, "core.sqlite-shm")); err == nil {
+		t.Fatal("the read-only open created a -shm file")
 	}
 	// Another host: copies the raw files and opens the copy.
 	dst := filepath.Join(dir, "core.g2.sqlite")
