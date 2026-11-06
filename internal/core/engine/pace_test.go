@@ -296,6 +296,19 @@ func backlogRig(t *testing.T, tweak func(*Config), chats, rows int, kindOf func(
 	return r, ids
 }
 
+// skipWallClockPacingUnderRace skips a test that checks what the pacer lets
+// through at a real write rate (goodput, which class goes first, how much
+// is coalesced). Under -race on a small CI runner the engine falls behind
+// the wall clock and those orders and counts are not meaningful; the
+// fake-clock pacer tests cover the same logic deterministically, and
+// upper bounds on writes (which slowness cannot break) still run.
+func skipWallClockPacingUnderRace(t *testing.T) {
+	t.Helper()
+	if raceEnabled {
+		t.Skip("wall-clock pacing outcome; not meaningful under the race detector")
+	}
+}
+
 // Benchmark finding (throttled variants): against an account write budget
 // the sender burst after every Retry-After, 42% of the writes were 429'd
 // and the goodput fell to about half the budget. With adaptive pacing the
@@ -303,9 +316,7 @@ func backlogRig(t *testing.T, tweak func(*Config), chats, rows int, kindOf func(
 // (Scaled: a 40/s budget with a 100 ms Retry-After grain stands for 4/s
 // with Graph's 1 s; the ceiling is twice the budget.)
 func TestWritesPacedUnderAccountBudget(t *testing.T) {
-	if raceEnabled {
-		t.Skip("goodput against a wall-clock budget is not meaningful under the race detector")
-	}
+	skipWallClockPacingUnderRace(t)
 	budget := &accountBudget{rate: 40, grain: 100 * time.Millisecond}
 	const chats, rows = 16, 15
 	r, ids := backlogRig(t, func(c *Config) {
@@ -343,6 +354,7 @@ func TestWritesPacedUnderAccountBudget(t *testing.T) {
 // When the write budget is short, ACKs, finals and notices go before
 // progress across conversations (round robin among each class).
 func TestRepliesBeforeProgressWhenWritesArePaced(t *testing.T) {
+	skipWallClockPacingUnderRace(t)
 	var (
 		mu    sync.Mutex
 		order []string
@@ -392,6 +404,7 @@ func TestRepliesBeforeProgressWhenWritesArePaced(t *testing.T) {
 // a turn posts at most one progress message; its ACK and final still go
 // ahead of the progress backlog of other chats.
 func TestProgressCoalescedWhileWritesArePaced(t *testing.T) {
+	skipWallClockPacingUnderRace(t)
 	r, _ := backlogRig(t, func(c *Config) { c.WriteRate = 4 }, 4, 200, func(int) string { return store.OutProgress })
 	r.ag.mu.Lock()
 	r.ag.notes = []string{"step A", "step B", "step C"}

@@ -185,6 +185,7 @@ func TestEveryWriteIsPacedIncludingChatCreation(t *testing.T) {
 // (at 4 writes/s) are still to be created, and a turn in it is answered
 // while most of the catch-up waits. (Reads are not the bottleneck here.)
 func TestRepliesBeforeCatchUpChatCreation(t *testing.T) {
+	skipWallClockPacingUnderRace(t)
 	const creating = 40
 	r, w := creatingRig(t, func(c *Config) { c.WriteRate, c.ReadRate = 4, 1000 }, 0, creating, 1)
 	ctl := r.control()
