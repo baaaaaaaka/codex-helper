@@ -74,9 +74,10 @@ $doctor = Invoke-Smoke -Name "doctor" -CommandArgs @("teams", "doctor")
 $serviceDoctor = Invoke-Smoke -Name "service-doctor" -CommandArgs @("teams", "service", "doctor")
 
 Assert-Contains -Path $setup -Text "Teams setup checklist"
-Assert-Contains -Path $status -Text "Teams status"
-Assert-Contains -Path $status -Text "Control chat: unavailable"
-Assert-Contains -Path $control -Text "Teams control chat: unavailable"
+Assert-Contains -Path $status -Text "Teams helper"
+Assert-Contains -Path $status -Text "Auth: not logged in"
+Assert-Contains -Path $status -Text "Store: none yet"
+Assert-Contains -Path $control -Text "Teams control chat: none yet"
 Assert-Contains -Path $doctor -Text "Teams doctor"
 Assert-Contains -Path $doctor -Text "Graph: not checked"
 Assert-Contains -Path $serviceDoctor -Text "Teams service backend:"

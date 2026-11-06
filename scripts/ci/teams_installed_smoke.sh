@@ -51,9 +51,10 @@ run_smoke doctor teams doctor
 run_smoke service-doctor teams service doctor
 
 assert_contains "$base/setup.txt" "Teams setup checklist"
-assert_contains "$base/status.txt" "Teams status"
-assert_contains "$base/status.txt" "Control chat: unavailable"
-assert_contains "$base/control-print.txt" "Teams control chat: unavailable"
+assert_contains "$base/status.txt" "Teams helper"
+assert_contains "$base/status.txt" "Auth: not logged in"
+assert_contains "$base/status.txt" "Store: none yet"
+assert_contains "$base/control-print.txt" "Teams control chat: none yet"
 assert_contains "$base/doctor.txt" "Teams doctor"
 assert_contains "$base/doctor.txt" "Graph: not checked"
 assert_contains "$base/service-doctor.txt" "Teams service backend:"

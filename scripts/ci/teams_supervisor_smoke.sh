@@ -361,7 +361,11 @@ EOF
     "CODEX_HELPER_TEAMS_READ_CLIENT_ID=read-client"
     "CODEX_HELPER_TEAMS_TOKEN_CACHE=$cache_home/write-token.json"
     "CODEX_HELPER_TEAMS_READ_TOKEN_CACHE=$cache_home/read-token.json"
+    "CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE=$cache_home/full-token.json"
   )
+  # The service refuses to enable without a Teams sign-in. The fake child
+  # never talks to Graph, so a placeholder refresh token is enough.
+  (umask 077 && printf '{"refresh_token":"ci-placeholder-not-a-token"}\n' >"$cache_home/full-token.json")
 
   run_logged "public-install" "$smoke/install.log" env -i "${common_env[@]}" "$cxp" teams service install
   replace_json_executable "$config" "$fake"
