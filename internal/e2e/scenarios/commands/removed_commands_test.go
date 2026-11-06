@@ -26,12 +26,12 @@ func TestRemovedTeamsCommands(t *testing.T) {
 	work, _ := steps.NewWorkChat(s, control, "removed")
 	before := len(s.Codex.Calls())
 	for _, c := range []struct{ chat, text, want string }{
-		{work.ID, "helper restore-thread", "Unknown helper command"},
-		{work.ID, "helper reload", "Unknown helper command"},
+		{work.ID, "helper restore-thread", "unknown work chat command"},
+		{work.ID, "helper reload", "unknown work chat command"},
 		{work.ID, "helper model provider", "Unknown model"},
 		{work.ID, "helper model catalog", "Unknown model"},
-		{control.ID, "reload", "Unknown command"},
-		{control.ID, "restore-thread", "Unknown command"},
+		{control.ID, "reload", "unknown control command"},
+		{control.ID, "restore-thread", "unknown control command"},
 	} {
 		got, ok := command(s, c.chat, c.text, c.want)
 		s.Check(fmt.Sprintf("`%s` is refused", c.text), ok, c.want, clip(got, 160))

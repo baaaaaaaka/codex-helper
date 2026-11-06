@@ -46,8 +46,9 @@ func (e *Engine) labelAdmitted(conv int64, group bool, a store.Admitted, c *clas
 	}
 	// `shutdown` stops the process right after its reply, before queued
 	// edits are made, so whether its label went out would depend on timing.
-	// It is never labelled (shutdown.go).
-	if a.Kind == store.InCommand && shutdownCommand(c.in.Body) {
+	// It is never labelled (shutdown.go), in any of its forms (`shutdown`,
+	// `!shutdown`, `/shutdown`, `helper shutdown`; parse.go).
+	if a.Kind == store.InCommand && c.control && c.cmd.form == formCommand && c.cmd.name == cmdShutdown {
 		return
 	}
 	acted := a.Kind == store.InCommand && a.State == store.InQueued ||

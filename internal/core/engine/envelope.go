@@ -507,6 +507,15 @@ func screen(c *classified) {
 		c.in.Kind, c.in.Body = store.InCommand, redactedBody
 		return
 	}
+	if c.reject != "" {
+		return // classify refused it (bare @codex, a coworker's command)
+	}
+	if c.control {
+		if text := controlAttachmentRefusal(c); text != "" {
+			c.reject, c.rejectQuote = text, c.quoteID
+		}
+		return
+	}
 	if c.in.Kind != store.InPrompt {
 		return
 	}
@@ -543,6 +552,60 @@ func (e *Engine) refuse(tx *store.Tx, conv int64, a store.Admitted, c *classifie
 		return err
 	}
 	return tx.SetInbound(a.InboundID, store.InIgnored, 0)
+}
+
+// controlAttachmentRefusal is v0.1.20's control-chat attachment check
+// (handleControlMessage B:4626, unsupportedControlAttachments B:4842): the
+// control chat takes text only. Quotes are kept for a question for Codex
+// (`ask …` or text that is not a command or a path), as is a voice clip
+// there; any other attachment refuses the message, which then runs
+// nothing.
+func controlAttachmentRefusal(c *classified) string {
+	allowRefs := c.cmd.form == formCommand && c.cmd.name == cmdAsk ||
+		c.cmd.form == formText && !looksLikeControlPath(c.msg.Text)
+	var refused []string
+	refs := false
+	for _, t := range c.msg.Attachments {
+		switch strings.ToLower(strings.TrimSpace(strings.Split(t, ";")[0])) {
+		case "messagereference", "forwardedmessagereference":
+			if allowRefs {
+				continue
+			}
+			refs = true
+		case "application/vnd.microsoft.card.audio", "application/vnd.microsoft.card.video":
+			if allowRefs && hasVoice(c.msg.Files) {
+				continue
+			}
+		}
+		refused = append(refused, t)
+	}
+	if len(refused) == 0 {
+		return ""
+	}
+	if refs {
+		return textUnsupportedAttachments(refused) + " Quoted Teams messages in the 🏠 control chat are only supported with `ask <question>` or natural-language fallback prompts; explicit control commands do not consume quoted context."
+	}
+	return textUnsupportedAttachments(refused) + " Files and images belong in a 💬 Work chat; the 🏠 control chat only handles text commands like `projects`, `new <directory>`, `continue <number>`, and `status`."
+}
+
+// textUnsupportedAttachments is v0.1.20's UnsupportedAttachmentMessage
+// (text.go:89).
+func textUnsupportedAttachments(types []string) string {
+	shown := make([]string, 0, 3)
+	for _, t := range types {
+		if t = strings.TrimSpace(t); t == "" {
+			t = "unknown"
+		}
+		shown = append(shown, t)
+		if len(shown) >= 3 {
+			break
+		}
+	}
+	detail := strings.Join(shown, ", ")
+	if len(types) > len(shown) {
+		detail += fmt.Sprintf(", +%d more", len(types)-len(shown))
+	}
+	return fmt.Sprintf("I could not process %d Teams attachment(s): %s. Supported inputs are plain text plus Teams-hosted inline/reference file attachments that the current Graph scopes can download. For generated files from Codex, use `helper file <relative-path>` from the Teams outbound root.", len(types), detail)
 }
 
 // containsRawAPIKey is v0.1.20's containsRawModelAPIKey.

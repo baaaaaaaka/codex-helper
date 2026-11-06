@@ -34,22 +34,26 @@
    | <p>help</p>
 -- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Commands in this chat:</p>
-   | <ul><li><code>new &lt;directory&gt;</code>: start a Codex session in a new work chat</li>
-   | <li><code>list</code>: list sessions</li>
-   | <li><code>r &lt;session&gt;</code>: wake a parked session (for example <code>r s003</code>)</li>
-   | <li><code>park &lt;session&gt;</code>: stop reading a session&#39;s chat until woken</li>
-   | <li><code>fork &lt;session&gt;</code>: copy a session into a new work chat</li>
-   | <li><code>model</code>: list the models Codex offers</li>
-   | <li><code>stats</code>: requests and token usage of all sessions</li>
-   | <li><code>skills</code>: list skill subscriptions (<code>skills add &lt;url&gt;</code>, <code>skills sync</code>)</li>
-   | <li><code>status</code>: helper status</li>
-   | <li><code>restart</code>: restart the helper</li>
-   | <li><code>shutdown</code>: stop the helper on all machines until <code>cxp teams start</code> is run on a machine</li>
-   | <li><code>update now</code> / <code>update prerelease</code>: update the helper (<code>update status</code> shows a pending update)</li>
-   | <li><code>codex update now</code>: update the Codex CLI</li>
-   | <li><code>help</code>: this help</li>
+   | <p><strong>🏠 Control chat</strong></p>
+   | <p>Use this chat to choose a workspace and create or continue 💬 Work chats.</p>
+   | <p>Start here:</p>
+   | <ul><li><code>p</code> / <code>projects</code> - choose a workspace</li>
+   | <li><code>n &lt;directory&gt;</code> / <code>new &lt;directory&gt;</code> - create a new Work chat for a directory</li>
+   | <li><code>new &lt;directory&gt; --model &lt;model&gt;</code> - create a Work chat pinned to a model</li>
+   | <li><code>model status|list|switch|reset</code> - inspect or change only this Control chat&#39;s model</li>
+   | <li><code>effort status|list|set|reset</code> - inspect or change this Control chat&#39;s reasoning effort</li>
+   | <li><code>default status</code> / <code>default model ...</code> / <code>default effort ...</code> - manage global defaults for future launches and chats</li>
+   | <li><code>s</code> / <code>sessions</code> - show sessions in the selected workspace</li>
+   | <li><code>c &lt;number&gt;</code> / <code>continue &lt;number&gt;</code> - continue an old local Codex session in Teams</li>
+   | <li><code>st</code> / <code>status</code> - show active Work chats</li>
+   | <li><code>helper rename &lt;title&gt;</code> - rename this Control chat</li>
+   | <li><code>helper rename hostname &lt;name&gt;</code> - rename this machine in all related chat titles</li>
+   | <li><code>skills</code> - list installed skill subscriptions</li>
+   | <li><code>shutdown</code> - stop the helper on all machines until <code>cxp teams start</code> is run on a machine</li>
    | </ul>
+   | <p>After <code>p</code>, reply with a number such as <code>1</code> to open that workspace. On a workspace page, send <code>new</code> to create a Work chat in that workspace.</p>
+   | <p>For quick helper questions, type the question here. For project work, use a 💬 Work chat.</p>
+   | <p>Send <code>help advanced</code> for all commands.</p>
 -- <msg:7> owner (html)
    | <p>shutdown</p>
 -- <msg:8> helper (html)
@@ -63,22 +67,26 @@
    | <p>help</p>
 -- <msg:10> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Commands in this chat:</p>
-   | <ul><li><code>new &lt;directory&gt;</code>: start a Codex session in a new work chat</li>
-   | <li><code>list</code>: list sessions</li>
-   | <li><code>r &lt;session&gt;</code>: wake a parked session (for example <code>r s003</code>)</li>
-   | <li><code>park &lt;session&gt;</code>: stop reading a session&#39;s chat until woken</li>
-   | <li><code>fork &lt;session&gt;</code>: copy a session into a new work chat</li>
-   | <li><code>model</code>: list the models Codex offers</li>
-   | <li><code>stats</code>: requests and token usage of all sessions</li>
-   | <li><code>skills</code>: list skill subscriptions (<code>skills add &lt;url&gt;</code>, <code>skills sync</code>)</li>
-   | <li><code>status</code>: helper status</li>
-   | <li><code>restart</code>: restart the helper</li>
-   | <li><code>shutdown</code>: stop the helper on all machines until <code>cxp teams start</code> is run on a machine</li>
-   | <li><code>update now</code> / <code>update prerelease</code>: update the helper (<code>update status</code> shows a pending update)</li>
-   | <li><code>codex update now</code>: update the Codex CLI</li>
-   | <li><code>help</code>: this help</li>
+   | <p><strong>🏠 Control chat</strong></p>
+   | <p>Use this chat to choose a workspace and create or continue 💬 Work chats.</p>
+   | <p>Start here:</p>
+   | <ul><li><code>p</code> / <code>projects</code> - choose a workspace</li>
+   | <li><code>n &lt;directory&gt;</code> / <code>new &lt;directory&gt;</code> - create a new Work chat for a directory</li>
+   | <li><code>new &lt;directory&gt; --model &lt;model&gt;</code> - create a Work chat pinned to a model</li>
+   | <li><code>model status|list|switch|reset</code> - inspect or change only this Control chat&#39;s model</li>
+   | <li><code>effort status|list|set|reset</code> - inspect or change this Control chat&#39;s reasoning effort</li>
+   | <li><code>default status</code> / <code>default model ...</code> / <code>default effort ...</code> - manage global defaults for future launches and chats</li>
+   | <li><code>s</code> / <code>sessions</code> - show sessions in the selected workspace</li>
+   | <li><code>c &lt;number&gt;</code> / <code>continue &lt;number&gt;</code> - continue an old local Codex session in Teams</li>
+   | <li><code>st</code> / <code>status</code> - show active Work chats</li>
+   | <li><code>helper rename &lt;title&gt;</code> - rename this Control chat</li>
+   | <li><code>helper rename hostname &lt;name&gt;</code> - rename this machine in all related chat titles</li>
+   | <li><code>skills</code> - list installed skill subscriptions</li>
+   | <li><code>shutdown</code> - stop the helper on all machines until <code>cxp teams start</code> is run on a machine</li>
    | </ul>
+   | <p>After <code>p</code>, reply with a number such as <code>1</code> to open that workspace. On a workspace page, send <code>new</code> to create a Work chat in that workspace.</p>
+   | <p>For quick helper questions, type the question here. For project work, use a 💬 Work chat.</p>
+   | <p>Send <code>help advanced</code> for all commands.</p>
 -- <msg:11> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>✅ Codex finished</strong></p>

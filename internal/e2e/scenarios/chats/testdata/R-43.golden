@@ -72,7 +72,7 @@
    | <p>@codex please summarise the build log E2E-R43-mention-4</p>
 -- <msg:9> helper quoting <msg:8> (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
+   | <p>⏳ Codex received your question. Request accepted.</p>
 -- <msg:10> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-R43-mention-4</p>

@@ -1,0 +1,115 @@
+# CMD-CONTROL-FORMS: control chat: `!st` `/status` `helper st` run; `helper close|retry|file` get ⚠️ Wrong chat; `!frobnicate` gets the unknown-command help
+# cxp black-box transcript; volatile values are numbered placeholders
+
+== chat <chat:1> "🏠 Codex Control - e2ehost"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
+-- <msg:2> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>!st</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>!st</p>
+-- <msg:3> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Helper v0.1.22 on e2ehost: up 1s; 0 sessions (0 active, 0 parked, 0 running); 0 requests run, 0 answered.</p>
+-- <msg:4> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>/status</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>/status</p>
+-- <msg:5> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Helper v0.1.22 on e2ehost: up 1s; 0 sessions (0 active, 0 parked, 0 running); 0 requests run, 0 answered.</p>
+-- <msg:6> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper st</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper st</p>
+-- <msg:7> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Helper v0.1.22 on e2ehost: up 2s; 0 sessions (0 active, 0 parked, 0 running); 0 requests run, 0 answered.</p>
+-- <msg:8> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper close</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper close</p>
+-- <msg:9> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⚠️ Wrong chat</p>
+   | <p>This is the 🏠 control chat. <code>helper ...</code> commands like <code>helper file</code>, <code>helper retry</code>, and <code>helper close</code> work inside a 💬 Work chat.</p>
+   | <p>To start project work, send <code>new &lt;directory&gt;</code> here, then open the new Work chat and send the task there.</p>
+-- <msg:10> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper retry last</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper retry last</p>
+-- <msg:11> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⚠️ Wrong chat</p>
+   | <p>This is the 🏠 control chat. <code>helper ...</code> commands like <code>helper file</code>, <code>helper retry</code>, and <code>helper close</code> work inside a 💬 Work chat.</p>
+   | <p>To start project work, send <code>new &lt;directory&gt;</code> here, then open the new Work chat and send the task there.</p>
+-- <msg:12> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper file out.txt</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper file out.txt</p>
+-- <msg:13> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⚠️ Wrong chat</p>
+   | <p>This is the 🏠 control chat. <code>helper ...</code> commands like <code>helper file</code>, <code>helper retry</code>, and <code>helper close</code> work inside a 💬 Work chat.</p>
+   | <p>To start project work, send <code>new &lt;directory&gt;</code> here, then open the new Work chat and send the task there.</p>
+-- <msg:14> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>!frobnicate</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>!frobnicate</p>
+-- <msg:15> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>unknown control command: <code>frobnicate</code></p>
+   | <p><strong>🏠 Control chat</strong></p>
+   | <p>Use this chat to choose a workspace and create or continue 💬 Work chats.</p>
+   | <p>Start here:</p>
+   | <ul><li><code>p</code> / <code>projects</code> - choose a workspace</li>
+   | <li><code>n &lt;directory&gt;</code> / <code>new &lt;directory&gt;</code> - create a new Work chat for a directory</li>
+   | <li><code>new &lt;directory&gt; --model &lt;model&gt;</code> - create a Work chat pinned to a model</li>
+   | <li><code>model status|list|switch|reset</code> - inspect or change only this Control chat&#39;s model</li>
+   | <li><code>effort status|list|set|reset</code> - inspect or change this Control chat&#39;s reasoning effort</li>
+   | <li><code>default status</code> / <code>default model ...</code> / <code>default effort ...</code> - manage global defaults for future launches and chats</li>
+   | <li><code>s</code> / <code>sessions</code> - show sessions in the selected workspace</li>
+   | <li><code>c &lt;number&gt;</code> / <code>continue &lt;number&gt;</code> - continue an old local Codex session in Teams</li>
+   | <li><code>st</code> / <code>status</code> - show active Work chats</li>
+   | <li><code>helper rename &lt;title&gt;</code> - rename this Control chat</li>
+   | <li><code>helper rename hostname &lt;name&gt;</code> - rename this machine in all related chat titles</li>
+   | <li><code>skills</code> - list installed skill subscriptions</li>
+   | <li><code>shutdown</code> - stop the helper on all machines until <code>cxp teams start</code> is run on a machine</li>
+   | </ul>
+   | <p>After <code>p</code>, reply with a number such as <code>1</code> to open that workspace. On a workspace page, send <code>new</code> to create a Work chat in that workspace.</p>
+   | <p>For quick helper questions, type the question here. For project work, use a 💬 Work chat.</p>
+   | <p>Send <code>help advanced</code> for all commands.</p>
+-- <msg:16> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>cx p</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>cx p</p>
+-- <msg:17> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p><code>continue</code> is not available in this helper version yet.</p>
+-- <msg:18> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>2</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>2</p>
+-- <msg:19> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>I do not have a current list yet. Send <code>projects</code> or <code>sessions</code> first, then choose a number.</p>

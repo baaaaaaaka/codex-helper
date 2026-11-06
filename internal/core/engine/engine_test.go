@@ -2019,12 +2019,12 @@ func TestThrottleWithoutRetryAfterWaitsTheFloor(t *testing.T) {
 func TestRequeuedCommandsNotDroppedAndKeepQuote(t *testing.T) {
 	var (
 		mu      sync.Mutex
-		replies []string // ReplyTo of every "Unknown helper command" reply sent
+		replies []string // ReplyTo of every "unknown work chat command" reply sent
 	)
 	r := newRig(t, func(c *Config) {
 		c.WriteRate, c.Timing.ChatRate = 1000, time.Millisecond
 		c.Channel.(*channeltest.Fake).SendFault = func(chat string, p channel.Part) (bool, error) {
-			if strings.Contains(p.Body, "Unknown helper command") {
+			if strings.Contains(p.Body, "unknown work chat command") {
 				mu.Lock()
 				replies = append(replies, p.ReplyTo)
 				mu.Unlock()
@@ -2034,8 +2034,8 @@ func TestRequeuedCommandsNotDroppedAndKeepQuote(t *testing.T) {
 	})
 	work := r.newWork(t.TempDir())
 	r.ch.PostCoworker(work, "hello all")
-	r.ch.PostUser(work, "helper frobnicate")
-	r.wait("group chat reply", func() bool { return len(r.own(work, "Unknown helper command")) == 1 })
+	r.ch.PostUser(work, "!frobnicate")
+	r.wait("group chat reply", func() bool { return len(r.own(work, "unknown work chat command")) == 1 })
 	r.stop()
 
 	const n = 300 // more than the command queue holds
@@ -2068,7 +2068,7 @@ func TestRequeuedCommandsNotDroppedAndKeepQuote(t *testing.T) {
 			var msgs []store.InboundMsg
 			for i := 0; i < n; i++ {
 				msgs = append(msgs, store.InboundMsg{ExtMsgID: fmt.Sprintf("left-%d", i), ExtTime: time.Now().UnixMilli(),
-					Sender: store.SenderOwner, Kind: store.InCommand, Body: fmt.Sprintf("helper frob%d", i)})
+					Sender: store.SenderOwner, Kind: store.InCommand, Body: fmt.Sprintf("!frob%d", i)})
 			}
 			_, err := tx.AdmitWindow(s.Key, conv, msgs, s.Cursor)
 			return err

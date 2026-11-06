@@ -144,7 +144,7 @@ func TestShutdownFromTheControlChat(t *testing.T) {
 	s.Settle(2*time.Second, 8*time.Second)
 
 	steps.MustPost(s, control.ID, "help")
-	helpMsg, _ := s.WaitSUTMessage(control.ID, "Commands in this chat", steps.CommandTimeout)
+	helpMsg, _ := s.WaitSUTMessage(control.ID, "for all commands", steps.CommandTimeout)
 	s.Check("the control-chat help lists `shutdown`", strings.Contains(helpMsg.PlainText(), "shutdown"), "`shutdown` listed",
 		clipTail(harness.NormalizeSpace(helpMsg.PlainText()), 600))
 

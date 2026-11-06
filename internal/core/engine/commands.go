@@ -44,7 +44,13 @@ func (e *Engine) commandLoop(ctx context.Context) {
 }
 
 func (e *Engine) dispatchCommand(ctx context.Context, j cmdJob) {
-	if urgentCommand(j.text) {
+	kind := ""
+	if cs := e.conv(j.conv); cs != nil {
+		e.mu.Lock()
+		kind = cs.kind
+		e.mu.Unlock()
+	}
+	if urgentCommand(kind, j.text) {
 		e.wg.Add(1)
 		go func() {
 			defer e.wg.Done()
@@ -79,17 +85,21 @@ func (e *Engine) dispatchCommand(ctx context.Context, j cmdJob) {
 }
 
 // urgentCommand: commands that must not wait behind another command of
-// the same chat. They only read state or stop work.
-func urgentCommand(text string) bool {
-	f := strings.Fields(strings.ToLower(text))
-	if len(f) > 0 && f[0] == "helper" {
-		f = f[1:]
+// the same chat. They only read state or stop work. The text is parsed as
+// it is run (parse.go), so `!status`, `/cancel` and `cx st` are urgent too.
+func urgentCommand(kind, text string) bool {
+	var p parsed
+	if kind == store.KindControl {
+		p = parseControl(text)
+	} else {
+		t, _ := stripCodexMention(text)
+		p = parseWork(t)
 	}
-	if len(f) == 0 {
+	if p.form != formCommand {
 		return false
 	}
-	switch f[0] {
-	case "cancel", "stop", "status", "st", "help", "h", "menu", "?", "shutdown":
+	switch p.name {
+	case cmdCancelName, cmdStatus, cmdHelp, cmdShutdown:
 		return true
 	}
 	return false
@@ -179,154 +189,12 @@ func (e *Engine) runCommand(ctx context.Context, j cmdJob) {
 	e.mu.Lock()
 	kind := cs.kind
 	e.mu.Unlock()
-	text := strings.TrimSpace(j.text)
+	// The grammar is in parse.go, the handlers in cmdtable.go.
 	if kind == store.KindControl {
-		e.controlCommand(ctx, j, text)
+		e.runControl(ctx, j, cs)
 		return
 	}
-	fields := strings.Fields(text)
-	if len(fields) > 0 && strings.EqualFold(fields[0], "helper") {
-		fields = fields[1:]
-	}
-	e.workCommand(ctx, j, cs, fields)
-}
-
-const controlHelp = "Commands in this chat:\n\n" +
-	"- `new <directory>`: start a Codex session in a new work chat\n" +
-	"- `list`: list sessions\n" +
-	"- `r <session>`: wake a parked session (for example `r s003`)\n" +
-	"- `park <session>`: stop reading a session's chat until woken\n" +
-	"- `fork <session>`: copy a session into a new work chat\n" +
-	"- `model`: list the models Codex offers\n" +
-	"- `stats`: requests and token usage of all sessions\n" +
-	"- `skills`: list skill subscriptions (`skills add <url>`, `skills sync`)\n" +
-	"- `status`: helper status\n" +
-	"- `restart`: restart the helper\n" +
-	"- `shutdown`: stop the helper on all machines until `cxp teams start` is run on a machine\n" +
-	"- `update now` / `update prerelease`: update the helper (`update status` shows a pending update)\n" +
-	"- `codex update now`: update the Codex CLI\n" +
-	"- `help`: this help"
-
-const workHelp = "Commands in a work chat (prefix `helper`):\n\n" +
-	"- `helper cancel` / `helper cancel last` / `helper cancel queued`: cancel the last queued request (else the running one)\n" +
-	"- `helper cancel running`: interrupt the running request only\n" +
-	"- `helper cancel all`: cancel the running and every queued request\n" +
-	"- `helper retry`: run the last ignored duplicate request again\n" +
-	"- `helper retry last`: run the request that failed because Codex needed an update again\n" +
-	"- `helper unpause`: resume auto-start after a pause (held requests are not run)\n" +
-	"- `helper park`: stop reading this chat until woken\n" +
-	"- `helper status`: session status\n" +
-	"- `helper fork`: copy this session into a new work chat\n" +
-	"- `helper model` / `helper model list` / `helper model <model> [effort]` / `helper model reset`: show or switch the model\n" +
-	"- `helper effort <effort>`: switch the reasoning effort\n" +
-	"- `helper stats`: requests and token usage of this session\n" +
-	"- `helper skills`: skill subscriptions\n" +
-	"- `helper restart`: restart the helper\n" +
-	"- `helper help`: this help\n\n" +
-	"Any other message is sent to Codex."
-
-func (e *Engine) controlCommand(ctx context.Context, j cmdJob, text string) {
-	fields := strings.Fields(text)
-	if len(fields) > 0 && strings.EqualFold(fields[0], "helper") {
-		// `helper <command>` works in the control chat too.
-		text = strings.TrimSpace(strings.TrimPrefix(text, fields[0]))
-		fields = fields[1:]
-	}
-	if len(fields) == 0 {
-		e.reply(j, controlHelp, nil)
-		return
-	}
-	verb := strings.ToLower(fields[0])
-	arg := strings.TrimSpace(strings.TrimPrefix(text, fields[0]))
-	switch verb {
-	case "new", "n", "create": // `create`: v0.1.20 alias
-		e.cmdNew(ctx, j, arg)
-	case "help", "h", "menu", "?": // `h`, `menu`: v0.1.20 aliases
-		e.reply(j, controlHelp, nil)
-	case "list", "ls", "sessions", "s", "session", "history": // `s`, `session`, `history`: v0.1.20 aliases
-		e.reply(j, e.listText(), nil)
-	case "status", "st": // `st`: v0.1.20 alias
-		e.reply(j, e.statusText(), nil)
-	case "r", "wake", "resume", "unpark": // `unpark`: v0.1.20 alias
-		e.cmdWake(j, arg)
-	case "park":
-		e.cmdParkLabel(j, arg)
-	case "rename": // F-CTL-8 (rename.go)
-		e.cmdRename(ctx, j, nil, arg)
-	case "restart", "reboot": // `reboot`: v0.1.20 alias
-		e.cmdRestart(j, strings.ToLower(arg))
-	case "shutdown":
-		e.cmdShutdown(ctx, j)
-	case "update", "upgrade":
-		e.cmdHelperUpdate(ctx, j, arg)
-	case "codex":
-		e.cmdCodexUpdate(j, arg)
-	case "fork":
-		target := e.findLabel(arg)
-		if target == nil {
-			e.reply(j, "Usage: `fork <session>` (for example `fork s003`). Send `list` to see sessions.", nil)
-			return
-		}
-		e.cmdFork(ctx, j, target)
-	case "stats", "usage", "tokens":
-		e.cmdStats(ctx, j, nil)
-	case "skills", "skill":
-		e.cmdSkills(ctx, j, arg)
-	case "model", "models":
-		models, err := e.ag.Models(ctx)
-		if err != nil {
-			e.reply(j, "Codex did not list its models ("+userError(err.Error())+"). Try again later.", nil)
-			return
-		}
-		e.reply(j, modelList(models, store.Thread{})+"\n\nSwitch a session's model in its chat with `helper model <model> [effort]`.", nil)
-	default:
-		e.reply(j, "Unknown command. Send `help` for the list of commands.", nil)
-	}
-}
-
-func (e *Engine) workCommand(ctx context.Context, j cmdJob, cs *convState, fields []string) {
-	verb := ""
-	if len(fields) > 0 {
-		verb = strings.ToLower(fields[0])
-	}
-	arg := ""
-	if len(fields) > 1 {
-		arg = strings.ToLower(fields[1])
-	}
-	switch verb {
-	case "", "help", "?":
-		e.reply(j, workHelp, nil)
-	case "cancel", "stop":
-		e.cmdCancel(ctx, j, cs, arg)
-	case "retry":
-		e.cmdRetry(j, cs, arg)
-	case "unpause", "resume":
-		e.cmdUnpause(j, cs)
-	case "park":
-		e.cmdPark(j, cs)
-	case "rename": // F-WRK-2, F-CTL-8 (rename.go)
-		e.cmdRename(ctx, j, cs, strings.Join(fields[1:], " "))
-	case "status":
-		e.reply(j, e.workStatus(cs), nil)
-	case "restart":
-		e.cmdRestart(j, arg)
-	case "fork":
-		e.cmdFork(ctx, j, cs)
-	case "model", "models":
-		args := fields[1:]
-		if verb == "models" {
-			args = []string{"list"}
-		}
-		e.cmdModel(ctx, j, cs, args)
-	case "effort":
-		e.cmdModel(ctx, j, cs, append([]string{"effort"}, fields[1:]...))
-	case "stats", "usage", "tokens":
-		e.cmdStats(ctx, j, cs)
-	case "skills", "skill":
-		e.cmdSkills(ctx, j, strings.Join(fields[1:], " "))
-	default:
-		e.reply(j, "Unknown helper command. Send `helper help` for the list. (Messages that do not start with `helper` go to Codex.)", nil)
-	}
+	e.runWork(ctx, j, cs)
 }
 
 // cmdNew creates a work conversation. The command and the conversation row

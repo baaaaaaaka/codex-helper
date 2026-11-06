@@ -45,9 +45,9 @@ func TestShutdownStopsEverywhereAfterItsReply(t *testing.T) {
 	})
 	ctl := r.control()
 	r.ch.PostUser(ctl, "help")
-	r.wait("help", func() bool { return len(r.own(ctl, "Commands in this chat")) == 1 })
-	if help := r.own(ctl, "Commands in this chat")[0].Text; !strings.Contains(help,
-		"- `shutdown`: stop the helper on all machines until `cxp teams start` is run on a machine") {
+	r.wait("help", func() bool { return len(r.own(ctl, "for all commands")) == 1 })
+	if help := r.own(ctl, "for all commands")[0].Text; !strings.Contains(help,
+		"- `shutdown` - stop the helper on all machines until `cxp teams start` is run on a machine") {
 		t.Fatalf("control help does not list shutdown:\n%s", help)
 	}
 	work := r.newWork(t.TempDir())

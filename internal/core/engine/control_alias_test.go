@@ -14,8 +14,8 @@ func TestControlChatAcceptsV0120Aliases(t *testing.T) {
 	for _, c := range []struct{ text, want string }{
 		{"st", "sessions ("},
 		{"helper st", "sessions ("},
-		{"h", "Commands in this chat"},
-		{"menu", "Commands in this chat"},
+		{"h", "Send `help advanced` for all commands."},
+		{"menu", "Send `help advanced` for all commands."},
 		{"s", "No sessions yet"},
 		{"session", "No sessions yet"},
 		{"history", "No sessions yet"},
@@ -24,8 +24,8 @@ func TestControlChatAcceptsV0120Aliases(t *testing.T) {
 		r.ch.PostUser(ctl, c.text)
 		r.wait("reply to `"+c.text+"`", func() bool { return len(r.own(ctl, c.want)) > before })
 	}
-	if n := len(r.own(ctl, "Unknown command")); n != 0 {
-		t.Fatalf("%d aliases answered with Unknown command", n)
+	if n := len(r.own(ctl, "unknown control command")); n != 0 {
+		t.Fatalf("%d aliases answered with unknown control command", n)
 	}
 	dir := t.TempDir()
 	r.ch.PostUser(ctl, "create "+dir)

@@ -430,7 +430,8 @@ func (e *Engine) read(ctx context.Context, id int64) {
 type classified struct {
 	msg       channel.InboundMsg
 	in        store.InboundMsg
-	command   bool   // an owner command (control chat, or "helper …")
+	control   bool   // received in the control chat
+	cmd       parsed // the owner's command as parsed at admission (parse.go)
 	suspect   bool   // counts toward the breaker
 	ownMarker bool   // carried our own marker (self-test passed)
 	quoteID   string // ext id to quote in replies (group chats)
@@ -740,7 +741,17 @@ func (e *Engine) classify(tx *store.Tx, conv int64, kind string, group bool, m c
 		c.quoteID = m.ID
 		// The control chat and the delegation inbox ignore non-owners, even
 		// when they mention Codex (R-27).
-		if kind != store.KindControl && conv != e.inboxID && (m.MentionsOwner || strings.Contains(strings.ToLower(m.Text), "@codex")) {
+		if kind != store.KindControl && conv != e.inboxID && (m.MentionsOwner || codexMention.MatchString(m.Text)) {
+			text, mentioned := stripCodexMention(strings.TrimSpace(m.Text))
+			switch {
+			case mentioned && bareMention(text, m):
+				c.in.Kind, c.reject = store.InCommand, textBareMention
+			case parseWork(text).isCommand():
+				// v0.1.20 rejectExternalWorkCommand (F-WRK-13): commands
+				// are the owner's; it quotes the sender's message (the
+				// core can only mention the owner).
+				c.in.Kind, c.reject, c.rejectQuote = store.InCommand, textCoworkerCommand, c.quoteID
+			}
 			return c, true, nil
 		}
 		c.in.Kind, c.chatter = store.InCommand, true
@@ -791,11 +802,26 @@ func (e *Engine) classify(tx *store.Tx, conv int64, kind string, group bool, m c
 	if helperShaped(text) {
 		c.suspect = true // still runs: genuine look-alike text is allowed
 	}
-	if kind == store.KindControl || isHelperCommand(text) {
+	if kind == store.KindControl {
+		c.in.Kind, c.control, c.cmd = store.InCommand, true, parseControl(text)
+		return c, true, nil
+	}
+	// With other people in the chat the @codex mention is not part of the
+	// command (v0.1.20 prepareWorkChatMessageForAudience). The prompt body
+	// keeps it.
+	mentioned := false
+	if group {
+		text, mentioned = stripCodexMention(text)
+		if mentioned && bareMention(text, m) {
+			c.in.Kind, c.reject = store.InCommand, textBareMention
+			return c, true, nil
+		}
+	}
+	if c.cmd = parseWork(text); c.cmd.isCommand() {
 		c.in.Kind = store.InCommand
 		return c, true, nil
 	}
-	if group && !strings.Contains(strings.ToLower(text), "@codex") && !hasVoice(m.Files) {
+	if group && !mentioned && !hasVoice(m.Files) {
 		// With other people in the chat only @codex, or a voice or video
 		// clip from the owner, addresses Codex.
 		c.in.Kind, c.chatter = store.InCommand, true
@@ -826,10 +852,10 @@ func helperShaped(text string) bool {
 	return strings.HasPrefix(t, "Helper:") || strings.HasPrefix(text, labelHelper)
 }
 
-// isHelperCommand reports a work-chat command ("helper …").
-func isHelperCommand(text string) bool {
-	low := strings.ToLower(strings.TrimSpace(text))
-	return low == "helper" || strings.HasPrefix(low, "helper ")
+// bareMention reports an @codex mention with nothing else (v0.1.20
+// B:2031: no request text and no attachment).
+func bareMention(stripped string, m channel.InboundMsg) bool {
+	return strings.TrimSpace(stripped) == "" && len(m.Files) == 0 && len(m.Quotes) == 0 && len(m.Attachments) == 0
 }
 
 // markerSeen records the passive marker self-test: one of our markers
@@ -937,6 +963,8 @@ func (e *Engine) ackPrompt(tx *store.Tx, conv int64, a store.Admitted, c *classi
 	}
 	if ahead {
 		text = textQueuedAck(running, isRunning, before)
+	} else if c.in.Sender == store.SenderOther {
+		text = textCoworkerAccepted // v0.1.20 queueTeamsPromptAckForMessage (R-27)
 	}
 	msgs, err := e.noticeReply(store.OutAck, fmt.Sprintf("ack:%d", a.InboundID), text, c.quoteID)
 	if err != nil {
