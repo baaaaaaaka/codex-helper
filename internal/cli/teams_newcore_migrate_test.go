@@ -105,16 +105,17 @@ func TestFirstStartConvertsOldStore(t *testing.T) {
 				}
 			}
 			sort.Strings(added)
-			// Besides the result: the old helper's lock file and SQLite's
+			// Besides the result: the guard that keeps rc.59 off the
+			// converted store, the old helper's lock file and SQLite's
 			// shared-memory index of the online backup (no data).
 			allowed := map[string]bool{migrate.MarkerName: true, migrate.TargetName: true, migrate.ReportName: true,
-				"state.json.lock": true, "store.sqlite-shm": true}
+				migrate.OldHelperGuardName: true, "state.json.lock": true, "store.sqlite-shm": true}
 			for _, name := range added {
 				if !allowed[name] {
 					t.Errorf("unexpected file %s added next to the old store", name)
 				}
 			}
-			for _, name := range []string{migrate.MarkerName, migrate.TargetName, migrate.ReportName} {
+			for _, name := range []string{migrate.MarkerName, migrate.TargetName, migrate.ReportName, migrate.OldHelperGuardName} {
 				if _, ok := after[name]; !ok {
 					t.Errorf("%s missing", name)
 				}
