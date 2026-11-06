@@ -81,9 +81,13 @@ try {
   $stderr = Join-Path $root "stderr.log"
   $env:HOME = Join-Path $root "home"
   $env:XDG_STATE_HOME = Join-Path $root "state"
+  # A long-lived CXP process with no network or account: `cxp run` in
+  # direct mode (stdin is not a terminal) waiting on a loopback ping.
+  $stdin = Join-Path $root "stdin.txt"
+  Set-Content -LiteralPath $stdin -NoNewline -Value ""
   $process = Start-Process -FilePath (Join-Path $root "cxp.exe") `
-    -ArgumentList @("responses", "serve", "--listen", "127.0.0.1:0", "--base-url", "http://127.0.0.1:9/v1", "--api-key", "process-identity-smoke", "--model", "process-identity-smoke", "--store-path", (Join-Path $root "responses.sqlite")) `
-    -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
+    -ArgumentList @("run", "--", "ping.exe", "-n", "600", "127.0.0.1") `
+    -RedirectStandardInput $stdin -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
 
   $active = Join-Path $root ".cxp-runtime\active"
   $ready = $false
@@ -139,7 +143,14 @@ try {
       ($_.ProcessId -eq $process.Id -or $_.ParentProcessId -eq $process.Id) -and
       $_.Name -ieq "cxp.exe"
     } | Sort-Object { if ($_.ProcessId -eq $process.Id) { 1 } else { 0 } })
+    $ownedIds = @($owned | ForEach-Object { $_.ProcessId })
+    $waited = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+      $ownedIds -contains $_.ParentProcessId -and $_.Name -ieq "ping.exe"
+    })
     foreach ($row in $owned) {
+      Stop-Process -Id $row.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    foreach ($row in $waited) {
       Stop-Process -Id $row.ProcessId -Force -ErrorAction SilentlyContinue
     }
     foreach ($row in $owned) {

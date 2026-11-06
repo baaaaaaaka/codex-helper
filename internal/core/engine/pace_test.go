@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -317,6 +318,13 @@ func skipWallClockPacingUnderRace(t *testing.T) {
 // with Graph's 1 s; the ceiling is twice the budget.)
 func TestWritesPacedUnderAccountBudget(t *testing.T) {
 	skipWallClockPacingUnderRace(t)
+	if runtime.GOOS == "windows" {
+		// The scaled 25 ms write interval is within the scheduling noise
+		// of the 2-vCPU Windows runners (goodput 13/s of 40/s once, with
+		// 5% throttled); production intervals are ten times longer and
+		// the pacer is the same code on every OS, covered on Linux/macOS.
+		t.Skip("compressed wall-clock goodput; not meaningful on Windows CI runners")
+	}
 	budget := &accountBudget{rate: 40, grain: 100 * time.Millisecond}
 	const chats, rows = 16, 15
 	r, ids := backlogRig(t, func(c *Config) {

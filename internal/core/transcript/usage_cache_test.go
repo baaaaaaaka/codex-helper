@@ -342,6 +342,50 @@ func TestUsageSkippedRecordDiagnostics(t *testing.T) {
 	}
 }
 
+// A rollout made or removed within the same clock tick as the last
+// listing leaves the day's modification time unchanged (Windows ticks are
+// about 16 ms): a listing taken that close to the time is read again,
+// while an old day's unchanged listing is trusted.
+func TestUsageIndexRacyModificationTime(t *testing.T) {
+	dir := t.TempDir()
+	a := TokenUsage{Input: 1, Output: 1, Total: 2}
+	day := filepath.Dir(rolloutPath(dir, idOther))
+	writeUsageLines(t, rolloutPath(dir, idOther), []string{lineMeta(0, idOther, `"cli"`, ""), lineCount(1, a, a)}, false)
+	setDayTime := func(at time.Time) {
+		t.Helper()
+		if err := os.Chtimes(day, at, at); err != nil {
+			t.Fatal(err)
+		}
+	}
+	recent := time.Now()
+	setDayTime(recent)
+	c := NewUsageCache(dir)
+	if u := usageOnce(t, c, idOther); len(u.Main) != 1 {
+		t.Fatalf("usage %+v", u)
+	}
+	// Same tick: a new rollout and a removed one, the time unchanged.
+	writeUsageLines(t, rolloutPath(dir, idIndep), []string{lineMeta(0, idIndep, `"cli"`, ""), lineCount(1, a, a)}, false)
+	if err := os.Remove(rolloutPath(dir, idOther)); err != nil {
+		t.Fatal(err)
+	}
+	setDayTime(recent)
+	if u := usageOnce(t, c, idIndep); len(u.Main) != 1 || u.Main[0].Err != nil {
+		t.Fatalf("rollout made in the listing's tick not found: %+v", u)
+	}
+	if u := usageOnce(t, c, idOther); len(u.Main) != 0 {
+		t.Fatalf("rollout removed in the listing's tick still listed: %+v", u)
+	}
+
+	old := recent.Add(-time.Hour)
+	setDayTime(old)
+	usageOnce(t, c, idIndep)
+	listed := c.c.Days[day].Listed
+	usageOnce(t, c, idIndep)
+	if got := c.c.Days[day].Listed; got != listed {
+		t.Fatalf("an old day with an unchanged time was listed again")
+	}
+}
+
 // Thread ids are taken from file names; days are listed again only when
 // they change; a deleted rollout leaves the cache.
 func TestUsageIndex(t *testing.T) {

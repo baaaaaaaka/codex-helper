@@ -166,6 +166,11 @@ func TestSameHostSecondHelper(t *testing.T) {
 	steps.MustPost(s, work.ID, "Owner answers "+first)
 	_, answered := steps.WaitAnswered(s, work.ID, first, steps.AnswerTimeout)
 	s.Check("the owner answers", answered, "answered", fmt.Sprint(answered))
+	// Let the owner finish the edits that follow the answer (the work
+	// chat's automatic title): a stop in the middle of one leaves its
+	// outcome unknown, and the successor makes it again, which is correct
+	// but makes the transcript depend on timing.
+	s.Settle(2*time.Second, 15*time.Second)
 
 	f := s.NewPeer("F", harness.PeerOptions{Seam: takeoverSeam("host-a")})
 	t0 := time.Now()

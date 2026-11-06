@@ -26,6 +26,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // UsageCache is the incremental token usage of the rollouts under a
@@ -45,10 +46,17 @@ type cacheData struct {
 }
 
 type dayEntry struct {
-	MTime int64
-	Day   int64 // unix seconds of the day
-	Names []string
+	MTime  int64
+	Day    int64 // unix seconds of the day
+	Names  []string
+	Listed int64 // when Names was read (unix nanoseconds)
 }
+
+// racyListing is how long after a directory's modification time its
+// listing is trusted: a file made or removed within the same clock tick
+// as the listing (about 16 ms on Windows, seconds on some filesystems)
+// leaves the time unchanged, so such a listing is read again.
+const racyListing = 2 * time.Second
 
 // usageFile is one rollout's cached state.
 type usageFile struct {
@@ -166,7 +174,8 @@ func dedupe(in []string) []string {
 }
 
 // refreshIndex lists the day directories, again only those whose
-// modification time changed, and rebuilds the thread index.
+// modification time changed or was too recent to trust (racyListing), and
+// rebuilds the thread index.
 func (c *UsageCache) refreshIndex() error {
 	days, err := DayDirs(c.dir)
 	if err != nil {
@@ -180,9 +189,10 @@ func (c *UsageCache) refreshIndex() error {
 			continue
 		}
 		mt := fi.ModTime().UnixNano()
-		if e, ok := c.c.Days[d.Path]; ok && e.MTime == mt {
+		if e, ok := c.c.Days[d.Path]; ok && e.MTime == mt && e.Listed-mt >= int64(racyListing) {
 			continue
 		}
+		listed := time.Now().UnixNano()
 		ents, err := os.ReadDir(d.Path)
 		if err != nil {
 			continue
@@ -194,7 +204,7 @@ func (c *UsageCache) refreshIndex() error {
 			}
 		}
 		sort.Strings(names)
-		c.c.Days[d.Path] = dayEntry{MTime: mt, Day: d.Day.Unix(), Names: names}
+		c.c.Days[d.Path] = dayEntry{MTime: mt, Day: d.Day.Unix(), Names: names, Listed: listed}
 	}
 	files := map[string]bool{}
 	c.byThread = map[string][]string{}

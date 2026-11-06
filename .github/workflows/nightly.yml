@@ -1532,11 +1532,11 @@ jobs:
           docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
             /dist/codex_proc_test -test.v -test.count=1 -test.run='Test(IsAliveTreatsLinuxZombieAsDead|LinuxProcStateFromStatParsesLastParen)$'
           echo "==> $img (Teams core store, engine, and channel adapter tests)"
-          docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
+          docker run --rm -v "$PWD/dist:/dist:ro" -v "$PWD:/src:ro" -w /src/internal/core/store "$img" \
             /dist/codex_core_store_test -test.count=1
-          docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
+          docker run --rm -v "$PWD/dist:/dist:ro" -v "$PWD:/src:ro" -w /src/internal/core/engine "$img" \
             /dist/codex_core_engine_test -test.count=1
-          docker run --rm -v "$PWD/dist:/dist:ro" "$img" \
+          docker run --rm -v "$PWD/dist:/dist:ro" -v "$PWD:/src:ro" -w /src/internal/channel/teams "$img" \
             /dist/codex_channel_teams_test -test.count=1
 
       - name: Teams background keepalive tests in containers (non-root)
@@ -1557,15 +1557,15 @@ jobs:
           echo "==> $img (Teams core store, engine, and channel adapter tests as non-root uid 1000)"
           docker run --rm --user 1000:1000 \
             -e HOME=/tmp/codex-home \
-            -v "$PWD/dist:/dist:ro" "$img" \
+            -v "$PWD/dist:/dist:ro" -v "$PWD:/src:ro" -w /src/internal/core/store "$img" \
             /dist/codex_core_store_test -test.count=1
           docker run --rm --user 1000:1000 \
             -e HOME=/tmp/codex-home \
-            -v "$PWD/dist:/dist:ro" "$img" \
+            -v "$PWD/dist:/dist:ro" -v "$PWD:/src:ro" -w /src/internal/core/engine "$img" \
             /dist/codex_core_engine_test -test.count=1
           docker run --rm --user 1000:1000 \
             -e HOME=/tmp/codex-home \
-            -v "$PWD/dist:/dist:ro" "$img" \
+            -v "$PWD/dist:/dist:ro" -v "$PWD:/src:ro" -w /src/internal/channel/teams "$img" \
             /dist/codex_channel_teams_test -test.count=1
           echo "==> $img (Teams detached supervisor smoke as non-root uid 1000)"
           docker run --rm --user 1000:1000 \
