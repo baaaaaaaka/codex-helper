@@ -152,8 +152,9 @@ var controlCommands = map[string]cmdHandler{
 	cmdAsk: func(e *Engine, _ context.Context, j cmdJob, _ *convState, _ parsed) {
 		e.reply(j, "usage: `ask <question>`", nil)
 	},
-	// HOOK(batch B): Workflow webhooks.
-	cmdWebhook: hook("helper webhook"),
+	cmdWebhook: func(e *Engine, ctx context.Context, j cmdJob, cs *convState, p parsed) {
+		e.cmdWebhook(ctx, j, cs, p.arg) // Workflow webhooks (webhook.go, batch B)
+	},
 }
 
 // hook answers a command a later batch implements. It is never sent to
