@@ -108,6 +108,43 @@ func (t *Tx) AdvanceSource(id, offset, line, size, mtime, inode int64, outputs [
 	return err
 }
 
+// RewindSource binds a source to conversation conv in state and moves its
+// processed position back to the start of the file (a history import,
+// F-MIR-5): the file is read again from its first record. Records already
+// delivered keep their delivery keys, so re-reading posts none of them
+// twice.
+func (t *Tx) RewindSource(id, conv int64, state string) error {
+	res, err := t.exec(`UPDATE transcript_sources SET offset = 0, line = 0, conv_id = ?, state = ?, updated_at = ? WHERE id = ?`,
+		nullInt(conv), state, t.now, id)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return fmt.Errorf("%w: transcript source %d", ErrNotFound, id)
+	}
+	return nil
+}
+
+// ThreadConvs lists the conversations bound to Codex thread threadID,
+// oldest first: the in-transaction check that a thread gets one open work
+// chat (a history import racing discovery, F-MIR-5).
+func (t *Tx) ThreadConvs(threadID string) ([]int64, error) {
+	rows, err := t.rows(`SELECT conv_id FROM threads WHERE thread_id = ? ORDER BY conv_id`, threadID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
 // Sources lists every transcript source (loaded once at start; unchanged
 // files are then detected by stat against this copy, without DB access).
 func (s *Store) Sources() ([]TranscriptSource, error) {

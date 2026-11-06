@@ -103,6 +103,26 @@ func TestTrackerSkipsHelperTurnsByClientID(t *testing.T) {
 	}
 }
 
+// KeepTeams (a history import into a new chat, F-MIR-5) keeps the
+// helper-run turns up to its limit; later ones are still skipped.
+func TestTrackerKeepTeamsUpToLimit(t *testing.T) {
+	w := newRollout(t, rollout.Options{Source: "vscode", Originator: "codex_vscode"})
+	mustTurn(t, w, rollout.Turn{ClientID: "cxp-0badc0de-7", Prompt: "from teams", Answer: "teams answer"})
+	mustTurn(t, w, rollout.Turn{Prompt: "typed in the TUI", Answer: "tui answer"})
+	st, err := os.Stat(w.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustTurn(t, w, rollout.Turn{ClientID: "cxp-0badc0de-8", Prompt: "later from teams", Answer: "later answer"})
+	skip := func(id, _ string) bool { return strings.HasPrefix(id, "cxp-0badc0de-") }
+	tr := NewTracker("", 0, 0, skip)
+	tr.KeepTeams(st.Size())
+	out := readAll(t, w.Path, tr)
+	if got := keys(out); got != "U:from teams | F:teams answer | U:typed in the TUI | F:tui answer" {
+		t.Fatalf("outputs %q", got)
+	}
+}
+
 func TestTrackerResumesFromOpenTurnStart(t *testing.T) {
 	w := newRollout(t, rollout.Options{})
 	open, err := w.BeginTurn(rollout.Turn{Prompt: "long task"})

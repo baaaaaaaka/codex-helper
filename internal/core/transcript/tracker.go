@@ -70,6 +70,7 @@ type Tracker struct {
 	prev      *openTurn    // the last closed turn: a compaction between turns belongs to it
 	held      *heldCompact // a compacted record that a context_compacted may still replace
 	last      time.Time
+	keep      int64 // KeepTeams: helper-run records ending at or before it are mirrored too
 }
 
 type openTurn struct {
@@ -96,6 +97,25 @@ func NewTracker(threadID string, off, line int64, skip Skip) *Tracker {
 		skip = func(string, string) bool { return false }
 	}
 	return &Tracker{threadID: threadID, skip: skip, off: off, line: line}
+}
+
+// KeepTeams mirrors the records of helper-run turns too, up to and
+// including the record that ends at until (a history import into a new
+// chat, F-MIR-5: those turns were answered in another chat, or by a helper
+// that kept no record of them). Their prompts lose the helper's envelope.
+func (t *Tracker) KeepTeams(until int64) { t.keep = until }
+
+// kept returns o, a record of a helper-run turn, when KeepTeams keeps it.
+func (t *Tracker) kept(o Output) (Output, bool) {
+	if o.End > t.keep {
+		return o, false
+	}
+	if o.Kind == OutputPrompt {
+		if o.Text = StripHelperPrompt(o.Text); o.Text == "" {
+			return o, false
+		}
+	}
+	return o, true
 }
 
 // ThreadID returns the session id (known after session_meta or from NewTracker).
@@ -180,10 +200,14 @@ func (t *Tracker) flush(out []Output) []Output {
 	if tr == nil {
 		return out
 	}
-	if !tr.teams {
-		for _, o := range tr.pending {
-			out = append(out, resolve(o, tr))
+	for _, o := range tr.pending {
+		if tr.teams {
+			var ok bool
+			if o, ok = t.kept(o); !ok {
+				continue
+			}
 		}
+		out = append(out, resolve(o, tr))
 	}
 	tr.pending = nil
 	return out
@@ -200,6 +224,10 @@ func (t *Tracker) add(out []Output, o Output, tr *openTurn) []Output {
 		tr.pending = append(tr.pending, o)
 	case !tr.teams:
 		out = append(out, resolve(o, tr))
+	default:
+		if k, ok := t.kept(o); ok {
+			out = append(out, resolve(k, tr))
+		}
 	}
 	return out
 }
@@ -301,7 +329,7 @@ func (t *Tracker) apply(out []Output, ev Event, l Line) []Output {
 		}
 		tr.finalSeen, tr.decided = true, true
 		out = t.flush(out)
-		if !tr.teams {
+		if !tr.teams || l.End <= t.keep {
 			id := ev.RecordID
 			if id == "" {
 				id = turnRecordID(tr.id, OutputFinal, t.line)
@@ -335,7 +363,7 @@ func (t *Tracker) apply(out []Output, ev Event, l Line) []Output {
 		// last_agent_message is the final only for a turn whose start was
 		// read and that had no final_answer item: a scan that began
 		// mid-turn usually begins right after the delivered final.
-		if final := strings.TrimSpace(StripMemCitations(ev.Text)); tr.started && !tr.finalSeen && !tr.teams && final != "" {
+		if final := strings.TrimSpace(StripMemCitations(ev.Text)); tr.started && !tr.finalSeen && (!tr.teams || l.End <= t.keep) && final != "" {
 			out = append(out, Output{RecordID: turnRecordID(tr.id, OutputFinal, t.line), Kind: OutputFinal, Text: final, Time: ev.Time, TurnID: tr.id, End: l.End, line: t.line, start: l.Off})
 		}
 		t.turn, t.prev = nil, tr
