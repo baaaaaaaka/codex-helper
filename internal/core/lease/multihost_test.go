@@ -1,3 +1,8 @@
+//go:build unix
+
+// The multi-host drill freezes contender processes with SIGSTOP/SIGCONT,
+// which exist only on Unix.
+
 package lease
 
 import (

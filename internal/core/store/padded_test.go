@@ -28,6 +28,13 @@ func TestPaddedHistoryKeepsHotPathsFlat(t *testing.T) {
 	if testing.Short() {
 		t.Skip("padded history test skipped in -short mode")
 	}
+	if raceEnabled {
+		// A latency check on one goroutine: the race detector has nothing to
+		// find here, and the race build of the pure-Go SQLite pads 10x the
+		// real history about 30x slower (10 minutes on 4 CPUs) and skews the
+		// latencies the test compares. Every non-race job runs it in full.
+		t.Skip("padded history latency test skipped under -race")
+	}
 	s, c := openTest(t)
 	a := newWork(t, s, "a")
 	cycle := hotCycle(t, s, c, a)

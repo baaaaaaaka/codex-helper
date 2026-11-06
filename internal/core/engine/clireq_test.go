@@ -17,6 +17,7 @@ import (
 // cliRig starts the rig's engine itself to reach CLIRequest (gap batch
 // G: the `cxp teams` commands that act through the running helper).
 func cliRig(t *testing.T, tweak ...func(*Config)) (*rig, *Engine) {
+	parallelRig(t)
 	r := &rig{t: t, ch: channeltest.New(), ag: newAgent(), path: filepath.Join(t.TempDir(), "core.db"),
 		log: &strings.Builder{}, logMu: &sync.Mutex{}}
 	st, err := store.OpenWith(r.path, store.Options{Exclusive: true})

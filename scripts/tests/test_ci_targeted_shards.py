@@ -11,18 +11,26 @@ import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
+NIGHTLY_WORKFLOW = ROOT / ".github" / "workflows" / "nightly.yml"
 RELEASE_WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 TEAMS_RUNTIME_SHARD = ROOT / "scripts" / "tests" / "run_teams_runtime_safety_shard.sh"
 FULL_GO_TEST_SHARDS = ROOT / "scripts" / "ci" / "run_full_go_test_shards.go"
 LINUX_FULL_GO_TEST_COLLECT = ROOT / "scripts" / "ci" / "run_linux_full_go_test_collect.sh"
+E2E_SHARDS = ROOT / "scripts" / "ci" / "e2e_shards.py"
 E2E_SCENARIOS_PREFIX = "github.com/baaaaaaaka/codex-helper/internal/e2e/scenarios/"
 
 
-def targeted_job() -> str:
-    workflow = WORKFLOW.read_text(encoding="utf-8")
-    start = workflow.index("  targeted-test:\n")
-    end = workflow.index("  codex-runtime-contract:\n", start)
+def job_block(workflow_path: pathlib.Path, job: str) -> str:
+    workflow = workflow_path.read_text(encoding="utf-8")
+    start = workflow.index(f"  {job}:\n")
+    following = re.search(r"^  [a-z][a-z0-9-]*:\n", workflow[start + len(job) + 4 :], re.MULTILINE)
+    end = start + len(job) + 4 + following.start() if following else len(workflow)
     return workflow[start:end]
+
+
+def targeted_job() -> str:
+    """The nightly per-OS integration job (the old targeted-test matrix)."""
+    return job_block(NIGHTLY_WORKFLOW, "platform-integration")
 
 
 def step_blocks(job: str) -> dict[str, str]:
@@ -37,8 +45,8 @@ def step_blocks(job: str) -> dict[str, str]:
 class TargetedShardWorkflowTests(unittest.TestCase):
     @unittest.skipUnless(os.name == "posix", "POSIX credential guard")
     def test_credential_guard_rejects_inputs_when_ripgrep_is_unavailable(self):
-        block = step_blocks(targeted_job())[
-            "Forbid external account credentials in repository CI (Linux only)"
+        block = step_blocks(job_block(WORKFLOW, "lint"))[
+            "Forbid external account credentials in repository CI"
         ]
         script = textwrap.dedent(block.split("        run: |\n", 1)[1])
         shell, grep = shutil.which("bash"), shutil.which("grep")
@@ -253,6 +261,13 @@ class TargetedShardWorkflowTests(unittest.TestCase):
 
     def test_teams_runtime_safety_uses_one_shared_shard_definition(self):
         script = TEAMS_RUNTIME_SHARD.read_text(encoding="utf-8")
+        # The isolation case sets CXP_TEAMS_TEST_PRESERVE_USER_DIRS, which the
+        # full suite does not, so it runs on every pull request; the other
+        # cases are subsets of the full suite and stay release preflights.
+        self.assertIn(
+            "bash scripts/tests/run_teams_runtime_safety_shard.sh isolation",
+            job_block(WORKFLOW, "unit-linux"),
+        )
         for shard in (
             "isolation",
             "service-update",
@@ -261,11 +276,11 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             "windows",
         ):
             self.assertIn(f"  {shard})", script)
+        for shard in ("service-update", "wsl-process", "diagnostics"):
             call = f"bash scripts/tests/run_teams_runtime_safety_shard.sh {shard}"
-            self.assertIn(call, WORKFLOW.read_text(encoding="utf-8"))
             self.assertIn(call, RELEASE_WORKFLOW.read_text(encoding="utf-8"))
 
-        for workflow in (WORKFLOW, RELEASE_WORKFLOW):
+        for workflow in (WORKFLOW, NIGHTLY_WORKFLOW, RELEASE_WORKFLOW):
             text = workflow.read_text(encoding="utf-8")
             self.assertNotRegex(
                 text,
@@ -275,99 +290,123 @@ class TargetedShardWorkflowTests(unittest.TestCase):
 
     def test_declares_parallel_shards_and_limits_platform_only_shards(self):
         job = targeted_job()
-        self.assertIn(
-            "shard: [core, core-b, platform-integration, state-perf, ubuntu-stress, "
-            "windows-skills-desktop, windows-skills-desktop-b, windows-codex-e2e]",
-            job,
+        combos = re.findall(
+            r"^          - os: (\S+)\n            shard: (\S+)$", job, re.MULTILINE
         )
-        for os_name in ("macos-latest", "windows-latest"):
-            self.assertIn(
-                f"- os: {os_name}\n            shard: ubuntu-stress",
-                job,
-            )
-        for os_name in ("ubuntu-latest", "macos-latest"):
-            self.assertIn(
-                f"- os: {os_name}\n            shard: windows-skills-desktop",
-                job,
-            )
-            self.assertIn(
-                f"- os: {os_name}\n            shard: windows-skills-desktop-b",
-                job,
-            )
-            self.assertIn(
-                f"- os: {os_name}\n            shard: windows-codex-e2e",
-                job,
-            )
+        self.assertEqual(
+            sorted(combos),
+            sorted(
+                [
+                    ("ubuntu-latest", "platform-integration"),
+                    ("macos-latest", "platform-integration"),
+                    ("windows-latest", "platform-integration"),
+                    ("ubuntu-latest", "state-perf"),
+                    ("ubuntu-latest", "scripts"),
+                    ("macos-latest", "scripts"),
+                    ("windows-latest", "scripts"),
+                    ("windows-latest", "windows-skills-desktop"),
+                    ("windows-latest", "windows-skills-desktop-b"),
+                    ("windows-latest", "windows-codex-e2e"),
+                ]
+            ),
+        )
         self.assertNotIn("needs:", job)
 
-    def test_state_perf_partitions_only_the_expensive_sequence(self):
-        job = targeted_job()
-        self.assertIn("partition: [0]", job)
-        for os_name in ("ubuntu-latest", "macos-latest", "windows-latest"):
-            self.assertIn(
-                f"- os: {os_name}\n            shard: state-perf\n            partition: 1",
-                job,
-            )
-        blocks = step_blocks(job)
-        expensive = blocks["Helper state directory migration regressions"]
-        self.assertIn("if: matrix.shard == 'state-perf'", expensive)
-        self.assertNotIn("matrix.partition == 0", expensive)
-        for name, block in blocks.items():
-            if name == "Helper state directory migration regressions":
-                continue
-            if "matrix.shard == 'state-perf'" in block:
-                self.assertIn("matrix.partition == 0", block, name)
+    def test_state_perf_runs_only_linux_measurements(self):
+        blocks = step_blocks(targeted_job())
+        state_perf = [name for name, block in blocks.items() if "matrix.shard == 'state-perf'" in block]
+        self.assertEqual(
+            sorted(state_perf),
+            sorted(
+                [
+                    "CXP preview SQLite actual syscall write budget (Linux only)",
+                    "CXP cache v2 real NFS concurrency smoke (Linux only)",
+                    "Codex runner benchmark smoke",
+                    "TUI and session history benchmark smoke",
+                ]
+            ),
+        )
+        self.assertNotIn("matrix.partition", targeted_job())
 
     def test_long_full_suite_jobs_use_independent_runner_partitions(self):
-        workflow = WORKFLOW.read_text(encoding="utf-8")
-        full_start = workflow.index("  full-go-test:\n")
-        full_end = workflow.index("  race-test:\n", full_start)
-        full = workflow[full_start:full_end]
+        full = job_block(WORKFLOW, "unit-windows-macos")
         self.assertIn(
-            "name: Full go test (${{ matrix.os }} / partition ${{ matrix.partition }})",
+            "name: Unit tests (${{ matrix.os }} / partition ${{ matrix.partition }})",
             full,
         )
+        self.assertIn("os: [windows-latest, macos-latest]", full)
         self.assertIn("partition: [0, 1]", full)
-        self.assertIn("- os: ubuntu-latest\n            partition: 1", full)
         self.assertIn(
             "-partition-count=2 -partition-index=\"${{ matrix.partition }}\"",
             full,
         )
-
         self.assertIn(f"-exclude-prefix={E2E_SCENARIOS_PREFIX}", full)
 
-        race_start = workflow.index("  race-test:\n")
-        race_end = workflow.index("  e2e:\n", race_start)
-        race = workflow[race_start:race_end]
+        race = job_block(NIGHTLY_WORKFLOW, "race-test")
         self.assertIn(
             "name: Race test (ubuntu-latest / partition ${{ matrix.partition }})",
             race,
         )
-        self.assertIn("partition: [0, 1, 2, 3, 4, 5, 6, 7]", race)
+        self.assertIn("partition: [0, 1, 2, 3]", race)
         self.assertIn(
-            "-partition-count=8 -partition-index=\"${{ matrix.partition }}\"",
+            "-partition-count=4 -partition-index=\"${{ matrix.partition }}\"",
             race,
         )
         self.assertIn(f"-exclude-prefix={E2E_SCENARIOS_PREFIX}", race)
         self.assertIn(
-            "go test -race -count=1 -timeout=20m ./internal/core/... ./internal/channel/...",
-            race,
+            "go test -race -count=1 -timeout=15m -parallel=16 ./internal/core/... ./internal/channel/...",
+            job_block(WORKFLOW, "race-core"),
         )
 
     def test_e2e_scenarios_run_once_on_linux_through_the_production_entry_point(self):
-        workflow = WORKFLOW.read_text(encoding="utf-8")
-        start = workflow.index("  e2e:\n")
-        end = workflow.index("  runtime-env-contract:\n", start)
-        job = workflow[start:end]
+        job = job_block(WORKFLOW, "e2e")
         self.assertIn("runs-on: ubuntu-latest", job)
-        self.assertNotIn("matrix", job)
+        self.assertIn("shard: [0, 1, 2]", job)
         self.assertIn("E2E_SUT: cxp", job)
-        self.assertIn("go test -count=1 -timeout=600s ./internal/e2e/scenarios/...", job)
-        aggregate = workflow[workflow.index("  test:\n") :]
+        self.assertIn(
+            'python3 scripts/ci/e2e_shards.py --count 3 --index "${{ matrix.shard }}"', job
+        )
+        self.assertIn('go test -count=1 -parallel=8 -timeout=600s "${packages[@]}"', job)
+        aggregate = job_block(WORKFLOW, "test")
         self.assertIn("      - e2e\n", aggregate)
         self.assertIn('check e2e "${{ needs.e2e.result }}"', aggregate)
         collector = LINUX_FULL_GO_TEST_COLLECT.read_text(encoding="utf-8")
         self.assertIn("*/internal/e2e/scenarios/*) ;;", collector)
+
+    def test_e2e_shards_partition_every_scenario_package_exactly_once(self):
+        prefix = "github.com/baaaaaaaka/codex-helper/internal/e2e/scenarios/"
+        listed = sorted(
+            prefix + path.name
+            for path in (ROOT / "internal" / "e2e" / "scenarios").iterdir()
+            if path.is_dir()
+        )
+        # A package nobody measured yet must still be scheduled.
+        packages = listed + [prefix + "zz-new-scenario"]
+        weights = json.loads(
+            (ROOT / "scripts" / "ci" / "e2e_shard_weights.json").read_text(encoding="utf-8")
+        )["weights"]
+        for name in weights:
+            self.assertIn(prefix + name, listed, f"stale E2E weight for {name}")
+        for count in (1, 2, 3, 5, len(packages) + 2):
+            with self.subTest(count=count):
+                shards = []
+                for index in range(count):
+                    out = subprocess.run(
+                        ["python3", str(E2E_SHARDS), "--count", str(count), "--index", str(index),
+                         "--packages", *packages],
+                        check=True, text=True, capture_output=True,
+                    ).stdout.split()
+                    shards.append(out)
+                flat = [pkg for shard in shards for pkg in shard]
+                self.assertEqual(sorted(flat), sorted(packages))
+                self.assertEqual(len(flat), len(set(flat)))
+                if count <= len(packages):
+                    self.assertTrue(all(shards), shards)
+                # Heaviest first, so `go test -p` starts the long package
+                # at once; an unmeasured package counts as DEFAULT_WEIGHT.
+                for shard in shards:
+                    loads = [weights.get(pkg.rsplit("/", 1)[-1], 60) for pkg in shard]
+                    self.assertEqual(loads, sorted(loads, reverse=True), shard)
 
     def test_ubuntu_package_bootstrap_uses_source_isolated_update(self):
         targeted = targeted_job()
@@ -397,9 +436,7 @@ class TargetedShardWorkflowTests(unittest.TestCase):
             "concurrency:\n  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}\n  cancel-in-progress: true",
             workflow,
         )
-        full_start = workflow.index("  full-go-test:\n")
-        full_end = workflow.index("  race-test:\n", full_start)
-        full = workflow[full_start:full_end]
+        full = job_block(WORKFLOW, "unit-linux")
         collector = LINUX_FULL_GO_TEST_COLLECT.read_text(encoding="utf-8")
         self.assertIn("bash scripts/ci/run_linux_full_go_test_collect.sh", full)
         self.assertIn('tail -n +2 "$profile" >> "$coverage_file"', collector)
@@ -412,19 +449,16 @@ class TargetedShardWorkflowTests(unittest.TestCase):
         self.assertNotIn("full-go-test-cli-retry", full)
         self.assertNotIn("isolated internal/cli retry", full)
 
-        race_start = workflow.index("  race-test:\n")
-        race_end = workflow.index("  e2e:\n", race_start)
-        race = workflow[race_start:race_end]
+        race = job_block(NIGHTLY_WORKFLOW, "race-test")
         self.assertIn('tee "$RUNNER_TEMP/race-test.log"', race)
         self.assertIn("Upload race diagnostics", race)
+        self.assertIn("Upload race diagnostics", job_block(WORKFLOW, "race-core"))
 
-        aggregate = workflow[workflow.index("  test:\n") :]
+        aggregate = job_block(WORKFLOW, "test")
         self.assertIn("    name: Test\n", aggregate)
         self.assertNotIn("name: Test (${{ matrix.os }})", aggregate)
 
-        windows_start = workflow.index("  windows-proxy-lifecycle:\n")
-        windows_end = workflow.index("  proxy-recovery-docker:\n", windows_start)
-        windows = workflow[windows_start:windows_end]
+        windows = job_block(NIGHTLY_WORKFLOW, "windows-proxy-lifecycle")
         self.assertIn(
             "go test -p=1 ./internal/helperruntime -count=1 -run '^TestRuntimeProcessIdentityWindows$' -v",
             windows,
@@ -555,7 +589,7 @@ echo 'ok'
                 continue
             matches = re.findall(
                 r"^        if: (?:always\(\) && )?matrix\.shard == '("
-                r"core|core-b|platform-integration|state-perf|ubuntu-stress|"
+                r"platform-integration|state-perf|scripts|"
                 r"windows-skills-desktop|windows-skills-desktop-b|windows-codex-e2e"
                 r")'(?: && .+)?$",
                 block,
@@ -566,17 +600,13 @@ echo 'ok'
     def test_heavy_steps_are_assigned_to_expected_shards(self):
         blocks = step_blocks(targeted_job())
         expected = {
-            "CXP TUI preview, navigation, refresh, and thread-name regressions": "core-b",
-            "Codex streaming transcript visibility regressions": "core-b",
-            "Teams Codex runner classification regressions": "core-b",
-            "Teams metadata-only resume and final integrity regressions": "core-b",
-            "Teams user-marker compact and fallback regressions": "core-b",
-            "Cross-compile check (Linux only)": "ubuntu-stress",
-            "CXP preview SQLite correctness, concurrency, and write budgets": "state-perf",
+            "Script unit tests (macOS)": "scripts",
+            "Script unit tests (Windows)": "scripts",
+            "Patched-binary cleanup real HOME safety (Linux only)": "scripts",
             "CXP preview SQLite actual syscall write budget (Linux only)": "state-perf",
             "CXP cache v2 real NFS concurrency smoke (Linux only)": "state-perf",
-            "Helper state directory migration regressions": "state-perf",
             "Codex runner benchmark smoke": "state-perf",
+            "TUI and session history benchmark smoke": "state-perf",
             "Skills local git smoke (Windows)": "windows-skills-desktop",
             "Codex desktop app Windows build and policy regressions": "windows-skills-desktop-b",
             "Codex desktop app managed runtime smoke (Windows)": "windows-skills-desktop-b",
@@ -611,10 +641,21 @@ echo 'ok'
     def test_desktop_app_update_contracts_are_selected_by_ci(self):
         job = targeted_job()
         blocks = step_blocks(job)
-        self.assertIn(
-            "RootCommandWiresExpectedSubcommandsAndFlags|RootUpgradeCodexApp",
-            job,
+        # The unit suite runs every test on every OS on each pull request
+        # (ci.yml), so these contracts only have to exist as tests.
+        go_tests = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in ROOT.rglob("*_test.go")
+            if "/.git/" not in path.as_posix()
         )
+        for test_name in (
+            "TestRootCommandWiresExpectedSubcommandsAndFlags",
+            "TestRootUpgradeCodexAppDispatchesManagedUpdate",
+            "TestInstallPs1UsesUniqueTemporaryPathsAndCleansThemOnFailure",
+            "TestInstallPs1ChecksumMismatchFailsBeforeReplacingBinaries",
+            "TestInstallPs1ConcurrentDownloadsUseIsolatedTemporaryPaths",
+        ):
+            self.assertIn(f"func {test_name}(", go_tests)
         unsupported = blocks["Codex desktop app unsupported smoke (Linux)"]
         self.assertIn("app --cwd", unsupported)
         self.assertIn("only available for macOS and Windows", unsupported)
@@ -623,12 +664,6 @@ echo 'ok'
         self.assertIn("--upgrade-codex-app", updater_unsupported)
         self.assertIn("only supported on macOS, native Windows, or WSL", updater_unsupported)
         self.assertIn("runner.os == 'Linux'", updater_unsupported)
-
-        installer_regressions = blocks["Managed install convergence regressions"]
-        self.assertIn("UsesUniqueTemporaryPathsAndCleansThemOnFailure", installer_regressions)
-        windows_installer = blocks["Windows installer checksum and concurrency regressions"]
-        self.assertIn("ChecksumMismatchFailsBeforeReplacingBinaries", windows_installer)
-        self.assertIn("ConcurrentDownloadsUseIsolatedTemporaryPaths", windows_installer)
 
         mac_smoke = blocks["Codex desktop app network install smoke (macOS)"]
         self.assertIn("UpgradeCodexDesktopAppMac", mac_smoke)
