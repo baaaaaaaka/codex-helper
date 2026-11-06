@@ -51,13 +51,13 @@ func expect(s *harness.Scenario, chatID, text string, parts ...string) string {
 // `model list` (and a natural-language list question), `model switch|use
 // <m>` keeping the Codex thread and reconciling the effort, `model reset`
 // to the global default, `model fork <m>` into a new Work chat on a new
-// thread; the control chat's own model (`model switch` there changes the
-// control questions only); removed subcommands and unknown models refused.
+// thread; removed subcommands and unknown models refused. The control
+// chat's own model is CMD-MODEL-CTL.
 func TestModelCommands(t *testing.T) {
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "CMD-MODEL", harness.Options{
 		Guarantees: []string{"cmd-model", "F-TRN-7"},
-		Title:      "`model status|list|switch|use|reset|fork` in a Work chat and `model status|list|switch|reset` in the Control chat, with v0.1.20's texts",
+		Title:      "`model status|list|switch|use|reset|fork` in a Work chat, with v0.1.20's texts",
 		Budget:     240 * time.Second,
 	})
 	defer s.Finish()
@@ -128,7 +128,33 @@ func TestModelCommands(t *testing.T) {
 			"gpt-5-mini, same cwd, new thread", fmt.Sprintf("model=%q cwd=%q thread=%q", inFork.Model, inFork.Cwd, inFork.ThreadID))
 	}
 
-	// The control chat's own model.
+	s.Settle(time.Second, 4*time.Second)
+	var replies []string
+	for _, id := range []string{work.ID, control.ID} {
+		for _, m := range s.SUTMessages(id) {
+			replies = append(replies, m.PlainText())
+		}
+	}
+	leaks := steps.InternalLeaks(s, strings.Join(replies, " "))
+	s.Check("model replies carry no internal ids", len(leaks) == 0, "none", fmt.Sprint(leaks))
+}
+
+// CMD-MODEL-CTL (F-TRN-7): the control chat's own model: `model`, `model
+// list`, `model switch <m>` (the control questions run on it), `model
+// default` pointing to the `default` command, `model fork` refused with
+// the usage, `model reset`. A scenario of its own: its control questions
+// carry the control-chat history, which a work chat's notices (with their
+// temp-directory paths) would push over the prompt's byte limit, so the
+// cut would move with the path length.
+func TestControlModelCommands(t *testing.T) {
+	harness.Parallel(t)
+	s := harness.NewScenario(t, "CMD-MODEL-CTL", harness.Options{
+		Guarantees: []string{"F-TRN-7"},
+		Title:      "`model status|list|switch|reset` in the Control chat change the control questions' model, with v0.1.20's texts",
+		Budget:     120 * time.Second,
+	})
+	defer s.Finish()
+	control := steps.ReadyControlChat(s)
 	expect(s, control.ID, "model", "Chat: Control", "Effective effort: `low` (helper fallback)")
 	expect(s, control.ID, "model list", "Verified models", "Current chat model (Control)")
 	expect(s, control.ID, "model switch gpt-5-mini", "Model profile switched for this Control chat", "Effective next-turn model: Codex Official (`gpt-5-mini`)")
@@ -140,10 +166,8 @@ func TestModelCommands(t *testing.T) {
 	expect(s, control.ID, "model reset", "Model profile switched for this Control chat", "Selection: global default")
 	s.Settle(time.Second, 4*time.Second)
 	var replies []string
-	for _, id := range []string{work.ID, control.ID} {
-		for _, m := range s.SUTMessages(id) {
-			replies = append(replies, m.PlainText())
-		}
+	for _, m := range s.SUTMessages(control.ID) {
+		replies = append(replies, m.PlainText())
 	}
 	leaks := steps.InternalLeaks(s, strings.Join(replies, " "))
 	s.Check("model replies carry no internal ids", len(leaks) == 0, "none", fmt.Sprint(leaks))
