@@ -83,6 +83,9 @@ var teamsTestSeamTimingKnobs = map[string]func(*engine.Timing, time.Duration){
 	// capacity is retried (5 min) and the first retry delay (10 s, doubling).
 	"CapacityRetry":   func(t *engine.Timing, d time.Duration) { t.CapacityRetry = d },
 	"CapacityBackoff": func(t *engine.Timing, d time.Duration) { t.CapacityBackoff = d },
+	// RetryStatus: the minimum gap between two "Codex is reconnecting"
+	// statuses of one turn (5 min).
+	"RetryStatus": func(t *engine.Timing, d time.Duration) { t.RetryStatus = d },
 	// ParkAfter: how long a work chat stays idle before it is parked with
 	// its freeze notice (48 h).
 	"ParkAfter": func(t *engine.Timing, d time.Duration) { t.ParkAfter = d },

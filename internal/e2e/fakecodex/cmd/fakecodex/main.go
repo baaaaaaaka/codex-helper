@@ -65,6 +65,7 @@ func main() {
 		Brain:       brain,
 		Kind:        kind,
 		Instance:    os.Getenv(fakecodex.EnvInstance),
+		CodexHome:   codexHome,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "fakecodex: %v\n", err)

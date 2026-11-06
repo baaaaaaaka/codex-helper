@@ -86,9 +86,10 @@ func (a *Agent) serverConfig(cwd string) codex.Config {
 	return c
 }
 
-// Run executes one turn.
+// Run executes one turn, on an app-server that read the current Codex
+// config (Pool.AcquireCurrent).
 func (a *Agent) Run(ctx context.Context, req engine.TurnRequest, hooks engine.TurnHooks) (engine.TurnOutcome, error) {
-	lease, err := a.pool.Acquire(ctx, key(req.ConvID), a.serverConfig(req.Cwd))
+	lease, err := a.pool.AcquireCurrent(ctx, key(req.ConvID), a.serverConfig(req.Cwd))
 	if err != nil {
 		if ctx.Err() != nil {
 			return engine.TurnOutcome{}, ctx.Err()
@@ -161,6 +162,7 @@ func (a *Agent) Run(ctx context.Context, req engine.TurnRequest, hooks engine.Tu
 		Progress:  hooks.Progress,
 		Compacted: hooks.Compacted,
 		Activity:  hooks.Activity,
+		Retrying:  hooks.Retrying,
 	})
 	var ns *codex.ErrNotStarted
 	switch {
@@ -282,7 +284,7 @@ func (a *Agent) Fork(ctx context.Context, convID int64, threadID, lastTurnID, cw
 
 // Models lists the models Codex offers (any running or a fresh server).
 func (a *Agent) Models(ctx context.Context) ([]engine.Model, error) {
-	lease, err := a.pool.Acquire(ctx, auxKey, a.serverConfig(""))
+	lease, err := a.pool.AcquireCurrent(ctx, auxKey, a.serverConfig(""))
 	if err != nil {
 		return nil, err
 	}

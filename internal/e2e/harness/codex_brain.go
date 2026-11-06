@@ -94,7 +94,8 @@ func (f *FakeCodex) Handler() http.Handler {
 		seq, b := f.begin(CodexCall{
 			Instance: req.Instance, Kind: req.Kind, Pid: req.Pid,
 			ThreadID: req.ThreadID, TurnID: req.TurnID, ClientID: req.ClientID, Cwd: req.Cwd,
-			Prompt: req.Prompt, Images: req.Images, Model: req.Model, Effort: req.Effort,
+			Prompt: req.Prompt, Images: req.Images, Model: req.Model, Effort: req.Effort, Exe: req.Exe,
+			MCPServers: req.MCPServers,
 		})
 		if b.HoldStart {
 			f.mu.Lock()
@@ -105,7 +106,7 @@ func (f *FakeCodex) Handler() http.Handler {
 			case <-r.Context().Done():
 			}
 		}
-		plan := fakecodex.Plan{Seq: seq, Commentary: b.Commentary, Crash: b.Crash, HoldCompletion: b.HoldCompletion, SurviveHelper: b.SurviveHelper}
+		plan := fakecodex.Plan{Seq: seq, Commentary: b.Commentary, Crash: b.Crash, HoldCompletion: b.HoldCompletion, SurviveHelper: b.SurviveHelper, Retries: b.Retries}
 		if b.FailKind == FailActiveWriter {
 			err := behaviorErr(b)
 			plan.RejectStart = err.Error()

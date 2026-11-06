@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"strings"
 	"time"
 
@@ -55,15 +56,47 @@ func (u *teamsNewCoreUpdater) Install(ctx context.Context, o engine.UpdateOffer)
 	return nil
 }
 
-// teamsNewCoreCodexUpgrader upgrades the discovered Codex CLI from its
-// install source (`codex update now`, or Codex rejecting a request as too
+// teamsNewCoreCodexUpgrader upgrades the CXP-managed Codex CLI the
+// app-servers run (`codex update now`, or Codex rejecting a request as too
 // old). It is off with an explicit --codex-path, as in the old core.
+//
+// An upgrade that leaves the version unchanged cannot help: the install
+// source has nothing newer. It is reported as a failure, so the engine
+// posts why and does not restart (a restart would only replace the
+// app-servers with the same CLI, and the next too-old rejection would
+// upgrade and restart again).
 type teamsNewCoreCodexUpgrader struct {
-	root *rootOptions
-	log  io.Writer
+	root     *rootOptions
+	bin      string // the Codex the app-servers run
+	identity *execIdentity
+	log      io.Writer
 }
 
+var upgradeTeamsCodexForNewCore = upgradeTeamsCodex
+
 func (c teamsNewCoreCodexUpgrader) Upgrade(ctx context.Context) error {
-	_, err := upgradeTeamsCodex(ctx, c.root, c.log)
-	return err
+	before := teamsCodexVersionForUpgrade(ctx, c.bin, c.identity)
+	path, err := upgradeTeamsCodexForNewCore(ctx, c.root, c.log)
+	if err != nil {
+		return err
+	}
+	if after := teamsCodexVersionForUpgrade(ctx, path, c.identity); before != "" && after == before {
+		return fmt.Errorf("Codex CLI is already %s, the newest version its install source offers; nothing changed, so the helper was not restarted", before)
+	}
+	return nil
+}
+
+// teamsCodexVersionForUpgrade is `codex --version` of path ("" when it
+// cannot be read).
+var teamsCodexVersionForUpgrade = func(ctx context.Context, path string, identity *execIdentity) string {
+	if strings.TrimSpace(path) == "" {
+		return ""
+	}
+	pctx, cancel := context.WithTimeout(ctx, codexProbeTimeout)
+	defer cancel()
+	out, err := runCodexProbeCommand(pctx, path, []string{"--version"}, codexRuntimeEnvironment(os.Environ(), nil, identity), identity)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }

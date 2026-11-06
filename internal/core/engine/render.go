@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"fmt"
+	"strings"
 
 	"github.com/baaaaaaaka/codex-helper/internal/channel"
 	"github.com/baaaaaaaka/codex-helper/internal/core/store"
@@ -108,3 +109,20 @@ const (
 	// could not be confirmed either.
 	textUnconfirmedRetried = "A reply could not be confirmed as delivered, even after sending it a second time. Ask again if it is missing."
 )
+
+// textReconnecting is v0.1.20's status when Codex retries within a turn
+// (B:formatCodexStreamRetryStatus), word for word.
+func textReconnecting(message, code string) string {
+	message, code = strings.TrimSpace(message), strings.TrimSpace(code)
+	if message == "" {
+		message = "Reconnecting..."
+	}
+	lines := []string{"Connection dropped. Codex is reconnecting."}
+	if !strings.EqualFold(message, lines[0]) {
+		lines = append(lines, "", message)
+	}
+	if code != "" {
+		lines = append(lines, "Reason: "+code)
+	}
+	return strings.Join(lines, "\n")
+}

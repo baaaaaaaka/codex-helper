@@ -41,6 +41,10 @@ type TurnHooks struct {
 	// Activity is called for every notification about the thread (any
 	// sign of life: deltas, items, token counts), for silence tracking.
 	Activity func()
+	// Retrying is called for each error notification of the turn that
+	// Codex will retry by itself (willRetry: a dropped stream, a
+	// reconnect), with the composed, sanitized message and reason code.
+	Retrying func(message, code string)
 }
 
 // compactPair is how close a contextCompaction item and a legacy
@@ -138,6 +142,20 @@ func (s *Server) RunTurn(ctx context.Context, p TurnStartParams, poll time.Durat
 			mu.Unlock()
 			if mine && m.Item.Phase != "final_answer" && hooks.Progress != nil && strings.TrimSpace(m.Item.Text) != "" {
 				hooks.Progress(m.Item.Text)
+			}
+		case "error":
+			if hooks.Retrying == nil {
+				return
+			}
+			r, ok := parseRetry(n.Params)
+			if !ok {
+				return
+			}
+			mu.Lock()
+			mine := r.turnID == "" || turnID == "" || r.turnID == turnID
+			mu.Unlock()
+			if mine {
+				hooks.Retrying(r.message, r.code)
 			}
 		case "thread/tokenUsage/updated":
 			var m struct {

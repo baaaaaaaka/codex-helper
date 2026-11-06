@@ -100,6 +100,11 @@ func (b *brain) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			plan.Commentary = "thinking about it"
 		case strings.HasPrefix(req.Prompt, "compact"):
 			plan.Compactions = 2
+		case strings.HasPrefix(req.Prompt, "retry"):
+			plan.Retries = []fakecodex.Retry{
+				{Message: "Reconnecting... 1/5", Details: "stream disconnected:\n via http://h/_cxp/tok/v1", Info: map[string]any{"responseStreamDisconnected": map[string]any{"httpStatusCode": nil}}},
+				{Message: "", Info: "serverOverloaded"},
+			}
 		}
 		_ = json.NewEncoder(w).Encode(plan)
 	case "/await":

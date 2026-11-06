@@ -76,6 +76,9 @@ type Timing struct {
 	// and CodexDrain bound the wait for running turns before a helper
 	// update and a Codex CLI upgrade (upgrade.go).
 	UpdateCheck, UpdateDrain, CodexDrain time.Duration
+	// RetryStatus is the minimum gap between two "Codex is reconnecting"
+	// statuses of one turn (v0.1.20 codexStreamRetryStatusRepeatDelay).
+	RetryStatus time.Duration
 }
 
 // ProductionTiming are the CORE-DESIGN values.
@@ -99,6 +102,7 @@ func ProductionTiming() Timing {
 		UpdateCheck:   30 * time.Minute,
 		UpdateDrain:   10 * time.Minute,
 		CodexDrain:    30 * time.Minute,
+		RetryStatus:   5 * time.Minute,
 	}
 }
 

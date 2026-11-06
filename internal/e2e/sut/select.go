@@ -48,12 +48,14 @@ func Run(m *testing.M) int {
 	}
 	fmt.Fprintf(os.Stderr, "e2e: built cxp and the fake Codex in %v\n", time.Since(start).Round(time.Millisecond))
 	harness.CLIBinary = cxp
+	fakeCodex = codex
 	harness.DefaultFactory = Factory(cxp, codex)
 	return harness.RunAndCheckLeaks(m)
 }
 
 var (
 	binDir     string
+	fakeCodex  string
 	versionsMu sync.Mutex
 	versions   = map[string]string{}
 )
@@ -96,9 +98,32 @@ func VersionedCLI(v string) (string, error) {
 //   - An exit with harness.ServiceRestartExitCode is followed by a new
 //     instance on the same state, as the service manager does.
 func Factory(cxp, codex string) harness.SUTFactory {
+	return factory(cxp, codex)
+}
+
+// FakeCodexBinary is the fake Codex executable of the test binary, for a
+// scenario that installs it where a user's Codex lives (with
+// InstalledCodexFactory).
+func FakeCodexBinary() string { return fakeCodex }
+
+// InstalledCodexFactory is Factory without --codex-path: the helper finds
+// Codex the way it does on a user's machine (the CXP-managed install under
+// HOME, else installs one; never the network here). The scenario puts
+// FakeCodexBinary where it should be found before the SUT starts.
+func InstalledCodexFactory() harness.SUTFactory {
+	if harness.CLIBinary == "" {
+		panic("sut: InstalledCodexFactory outside sut.Run")
+	}
+	return factory(harness.CLIBinary, "")
+}
+
+func factory(cxp, codex string) harness.SUTFactory {
 	return func(cfg harness.SUTConfig) (harness.SUT, error) {
-		args := []string{"teams", "run", "--codex-path", codex,
-			"--machine-registry=false", "--auto-update=false", "--auto-service=false"}
+		args := []string{"teams", "run"}
+		if codex != "" {
+			args = append(args, "--codex-path", codex)
+		}
+		args = append(args, "--machine-registry=false", "--auto-update=false", "--auto-service=false")
 		args = append(args, cfg.Args...)
 		name := "cxp"
 		if cfg.Peer != "" {

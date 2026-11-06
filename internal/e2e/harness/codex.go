@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakecodex"
 )
 
 // CodexCall is one Codex invocation as the fake Codex saw it. It is the
@@ -46,6 +48,11 @@ type CodexCall struct {
 	Err     string
 	// Pid is the fake app-server process that ran the call (0 in-process).
 	Pid int
+	// Exe is the Codex executable that ran the call ("" in-process).
+	Exe string
+	// MCPServers are the MCP servers of config.toml the turn runs with
+	// (the app-server's thread config; nil in-process).
+	MCPServers []string
 }
 
 // HasToken reports whether the prompt contained token.
@@ -87,6 +94,10 @@ type CodexBehavior struct {
 	// in Codex) until Release; if the helper dies meanwhile, Codex never
 	// records the turn ("helper crashed before turn/start reached Codex").
 	HoldStart bool
+	// Retries are error notifications Codex retries by itself (willRetry:
+	// a dropped stream it reconnects), sent after the commentary, each
+	// after its Delay, before the turn's outcome.
+	Retries []fakecodex.Retry
 	// SurviveHelper keeps the turn running when the helper goes away (stdin
 	// EOF); the app-server exits only after the turn finished, so the result
 	// is persisted while no helper is listening. COUNTERFACTUAL: real Codex

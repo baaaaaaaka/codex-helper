@@ -2,6 +2,8 @@ package codex
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -49,6 +51,7 @@ type entry struct {
 	last   time.Time
 	ready  chan struct{} // closed when srv/err is set
 	err    error
+	stamp  string // ConfigFile content before the server started
 }
 
 // NewPool returns an empty pool.
@@ -144,7 +147,7 @@ func (p *Pool) Acquire(ctx context.Context, key string, cfg Config) (*Lease, err
 				}
 			}
 		}
-		e = &entry{key: key, loaded: map[string]bool{}, ready: make(chan struct{}), leases: 1}
+		e = &entry{key: key, loaded: map[string]bool{}, ready: make(chan struct{}), leases: 1, stamp: configStamp(cfg.ConfigFile)}
 		p.servers[key] = e
 		p.mu.Unlock()
 
@@ -171,6 +174,55 @@ func (p *Pool) Acquire(ctx context.Context, key string, cfg Config) (*Lease, err
 		}
 		return &Lease{p: p, e: e}, nil
 	}
+}
+
+// AcquireCurrent is Acquire at the start of a turn: Codex reads its
+// config file (MCP servers, providers, features) only when the app-server
+// starts, so a warm server of key started before cfg.ConfigFile changed
+// is closed first (stdin EOF, waiting for it to exit, so no two processes
+// hold the thread) and the turn runs on a fresh one, with no helper
+// restart (SPEC R-24, F-TRN-12; rc.15 58c6bc0). It never interrupts work:
+// a server with a lease (a running turn, fork or lookup) is kept and the
+// next turn start replaces it. Nothing polls: the file is read here only.
+func (p *Pool) AcquireCurrent(ctx context.Context, key string, cfg Config) (*Lease, error) {
+	if cfg.ConfigFile != "" {
+		stamp := configStamp(cfg.ConfigFile)
+		var stale *entry
+		p.mu.Lock()
+		if e := p.servers[key]; e != nil && e.leases == 0 && e.stamp != stamp {
+			select {
+			case <-e.ready:
+				if e.srv != nil {
+					delete(p.servers, key)
+					stale = e
+				}
+			default:
+			}
+		}
+		p.mu.Unlock()
+		if stale != nil {
+			fmt.Fprintf(p.cfg.Log, "codex: %s changed; restarting app-server %s (pid %d) for the next turn\n", cfg.ConfigFile, key, stale.srv.PID())
+			stale.srv.Close(5 * time.Second)
+			p.writePIDs()
+		}
+	}
+	return p.Acquire(ctx, key, cfg)
+}
+
+// configStamp identifies the content of path ("" for no file to watch).
+func configStamp(path string) string {
+	if path == "" {
+		return ""
+	}
+	data, err := os.ReadFile(path)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return "absent"
+	case err != nil:
+		return "unreadable: " + err.Error()
+	}
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }
 
 // Busy reports whether key has a live server.
