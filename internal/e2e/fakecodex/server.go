@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -59,6 +60,7 @@ type server struct {
 type runningTurn struct {
 	threadID string
 	turnID   string
+	cwd      string
 	plan     Plan
 	ctx      context.Context
 	cancel   context.CancelFunc
@@ -508,7 +510,7 @@ func (s *server) startTurn(p map[string]any) (any, *rpcError) {
 		Items: []map[string]any{{"type": "userMessage", "id": newID(), "clientId": nullable(clientID), "content": content}},
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	rt := &runningTurn{threadID: threadID, turnID: turnID, plan: plan, ctx: ctx, cancel: cancel, done: make(chan struct{})}
+	rt := &runningTurn{threadID: threadID, turnID: turnID, cwd: cwd, plan: plan, ctx: ctx, cancel: cancel, done: make(chan struct{})}
 	s.mu.Lock()
 	t.Turns = append(t.Turns, turn)
 	t.UpdatedAt = now
@@ -595,15 +597,33 @@ func (s *server) runTurn(rt *runningTurn, t *Thread, turn *Turn) {
 		s.cfg.Exit(3)
 		return
 	}
+	for _, command := range rt.plan.Exec {
+		cctx, cancel := context.WithTimeout(rt.ctx, 60*time.Second)
+		cmd := exec.CommandContext(cctx, "sh", "-c", command)
+		cmd.Dir = rt.cwd
+		cmd.Stdout, cmd.Stderr = s.cfg.Log, s.cfg.Log
+		err := cmd.Run()
+		cancel()
+		fmt.Fprintf(s.cfg.Log, "fakecodex: exec %q: %v\n", command, err)
+	}
 	for i := 0; i < rt.plan.Compactions; i++ {
 		s.notify("item/completed", map[string]any{"threadId": rt.threadID, "turnId": rt.turnID, "completedAtMs": time.Now().UnixMilli(), "item": map[string]any{
 			"type": "contextCompaction", "id": newID(),
 		}})
 		s.notify("thread/compacted", map[string]any{"threadId": rt.threadID, "turnId": rt.turnID})
 	}
-	if rt.plan.Commentary != "" {
+	phase := func(p string) any {
+		if rt.plan.Unphased {
+			return nil
+		}
+		return p
+	}
+	for _, text := range append([]string{rt.plan.Commentary}, rt.plan.MoreCommentary...) {
+		if text == "" {
+			continue
+		}
 		s.notify("item/completed", map[string]any{"threadId": rt.threadID, "turnId": rt.turnID, "completedAtMs": time.Now().UnixMilli(), "item": map[string]any{
-			"type": "agentMessage", "id": newID(), "text": rt.plan.Commentary, "phase": "commentary",
+			"type": "agentMessage", "id": newID(), "text": text, "phase": phase("commentary"),
 		}})
 	}
 	for _, r := range rt.plan.Retries {
@@ -638,7 +658,7 @@ func (s *server) runTurn(rt *runningTurn, t *Thread, turn *Turn) {
 		status = StatusFailed
 		terr = &TurnError{Message: "fake codex brain unavailable: " + err.Error()}
 	case res.Outcome == "answered":
-		final = map[string]any{"type": "agentMessage", "id": newID(), "text": res.Answer, "phase": "final_answer"}
+		final = map[string]any{"type": "agentMessage", "id": newID(), "text": res.Answer, "phase": phase("final_answer")}
 	default:
 		status = StatusFailed
 		terr = &TurnError{Message: res.Error}

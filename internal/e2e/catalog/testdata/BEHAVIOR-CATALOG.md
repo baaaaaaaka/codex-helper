@@ -108,9 +108,9 @@ Columns: id · status (`keep` / `removed-by-owner` / `ask-owner`, with the owner
 | F-SET-1 | keep | cli/teams.go:114 `auth login` (alias `full`), :260 status, :278 logout | exempt: interactive device-code sign-in against real Entra ID; the fake Graph has no authority endpoint | `auth full` kept as alias |
 | F-SET-2 | keep | channel/teams/auth.go:198 `ValidateScopes`: a configured scope outside the allowlist is refused with "unexpected Teams Graph scope(s): …; set CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES=1 to override" by `teams auth config`, `auth`, `status` and `run` (fail closed); the service passes the opt-in through (cli/teams_service.go); cli/teams.go:161 `auth config` + `CODEX_HELPER_TEAMS_*` env | AUTH-SCOPES | v0.1.20 refused broader scopes without ALLOW_UNSAFE_SCOPES |
 | F-SET-3 | removed-by-owner (DECISIONS 第一级 4 【删除】, 定稿 删除 分离 token) | n/a | DELETED-CLI (`auth read/file-write` unknown) | — |
-| F-SET-4 | keep | cli/teams.go:76 `teams setup` | NONE | same |
-| F-SET-5 | keep | cli/teams_service.go:134 bootstrap, BOOTSTRAP COMPLETE :836 | NONE | same flags |
-| F-SET-6 | keep | cli/teams_graph_proxy.go:115 (proxy warning) | NONE | same |
+| F-SET-4 | keep | cli/teams.go:76 `teams setup` | CLI-READONLY | same |
+| F-SET-5 | keep | cli/teams_service.go:134 bootstrap, BOOTSTRAP COMPLETE :836 | exempt: bootstrap installs and starts the per-user service (systemd --user, launchd or Task Scheduler), which the offline container lacks; and the service child is started from a persisted launch spec whose environment allowlist (cli/teams_service.go teamsServiceEnvironmentAllowlist) drops the test-only Graph seam, so in the offline suite it cannot reach the fake Graph | same flags |
+| F-SET-6 | keep | cli/teams_graph_proxy.go:115 (proxy warning) | exempt: needs a reusable local SSH proxy profile and daemon in front of Graph; the offline suite has no proxy and the fake Graph is reached through the test seam, which bypasses proxy mode | same |
 | F-CTL-1 | keep | core/engine/control.go:18 `ensureControl` creates the chat with core/engine/rename.go:105 `controlTitle` = "🏠 Codex Control - <machine>[ - user title]" (:110 `controlTitleFor`; user title from meta, kept over restarts and recreation); no profile segment (the core has no Teams profile) | R-1-2-3, EDIT-RENAME | v0.1.20 "🏠 Codex Control - <machine>[ - profile][ - user title]" |
 | F-CTL-2 | keep | cli/teams.go:314 `teams control --recreate --yes` → cli/teams_chat.go:26 → request file (cli/teams_newcore_clireq.go:78 `submitTeamsCLIRequest`; the helper runs it on its 5 s watcher tick, :160) → core/engine/clireq.go:109 `CLIRequest` / :297 `cliRecreate`: new chat, @mentioned "🔁 This chat moved" link in the old chat (:266 `textChatMoved`) confirmed before :528 `cliRebind` moves the control conversation, then "Control chat recreated." (@mention) + ready/help in the new chat; old chat kept, no longer read; the command prints the new and previous chat | CONTROL-RECREATE | v0.1.20 `control --recreate`; "Restart or reload…" line replaced by "The running Teams helper now uses the new control chat." (no restart needed) |
 | F-CTL-3 | keep | core/engine/dashboard.go:466 `cmdWorkspaces`, :525 `cmdWorkspaceSessions`, :668 `cmdSelect` (bare number), :636 `dashResolve`; the list is store state with a 10-min expiry (:43 `dashViewTTL`, meta `engine_dashboard_view`), used up by any other command (:156 `dashConsume`); no timer | DASH-FLOW | B:19702, B:19840, B:20304, dashboard.go:17 |
@@ -156,9 +156,9 @@ Columns: id · status (`keep` / `removed-by-owner` / `ask-owner`, with the owner
 | F-TRN-10 | keep (owner: 定稿 满载重试 + 11-05 第二批 Q2 `continue`) | runner.go:704 `capacityRetry`; `continuesPrompt` (runner.go) continue-once | CAP-RETRY, CAP-WINDOW, CAP-CONTINUE | owner redefined |
 | F-TRN-11 | keep (owner: 定稿 原样保留) | upgrade.go:127 `codexTooOld`, :227 `updateStep` | CODEX-UPGRADE | same |
 | F-TRN-12 | keep | core/codex/approval.go:10 (auto-approve), app-server runtime; config.toml/MCP changes apply from the next turn without a helper restart: core/codex/pool.go:187 `AcquireCurrent` (idle server started before the change is replaced at turn start; running turns untouched), codexagent/agent.go:92 | R-1-2-3 (app-server path; approvals not exercised), CODEX-CONFIG | same |
-| F-TRN-13 | keep | cli/teams_user_path.go:42, cli/teams_child_guard.go:16/:42 `CODEX_HELPER_CLI_PATH` | NONE | same |
+| F-TRN-13 | keep | cli/teams_user_path.go:42, cli/teams_child_guard.go:16/:42 `CODEX_HELPER_CLI_PATH` | CHILD-GUARD | same |
 | F-TRN-14 | keep | core/engine/envelope.go:80 `teamsCodexPrompt` (v0.1.20 `TeamsCodexPrompt` byte for byte: User message, Teams safety, math contract, outbound root + manifest instructions; owner changes: no `helper reload now` line, native-subagent sentence of ae23659), :120 `codexInput` (ASR lead, attachment list, quotes, local files), runner.go:223; unit differential golden engine/envelope_test.go `TestCodexInputMatchesV0120` against v0.1.20 bytes (testdata/v0120_envelope.json) | F-TRN-14 | artifact_handoff.go:28/:184 |
-| F-TRN-15 | keep | runner.go progress streaming; stream reconnect status (v0.1.20 text, once per 5 min per turn): core/codex/turn.go:146 + retry.go `parseRetry`, engine/runner.go:379 `Retrying`, render.go `textReconnecting` | R-20-33, B-5, RETRY-STATUS | same |
+| F-TRN-15 | keep | runner.go progress streaming; stream reconnect status (v0.1.20 text, once per 5 min per turn): core/codex/turn.go:146 + retry.go `parseRetry`, engine/runner.go:379 `Retrying`, render.go `textReconnecting` | R-20-33, B-5, RETRY-STATUS, TURN-UNPHASED | same |
 | F-TRN-16 | keep | core/engine/setuperr.go:19 `setupClass` (Node.js missing, config route, launch failure), :42 `textNotStartedTurn` / :69 `textFailedTurn` (v0.1.20 missingNodeRuntime / codexConfiguration / infraLaunchFailure notices + "Diagnostic for the admin"), used by runner.go:541/:567; core/codex/server.go:110 keeps the app-server's start-up stderr tail so the class is visible; never retried automatically | SETUP-ERR | SPEC text "⚠️ I couldn't start Codex due to a setup issue on my side…"; no auth-specific class (v0.1.20 had none) |
 | F-TRN-17 | keep (Q-19 default: keep `pause/resume`, drain internal; coordinator ruling batch G: hidden aliases of `teams stop/start`) | cli/teams_stop.go:105 `teams pause [reason]` (hidden alias of `teams stop`), :120 `teams resume` (hidden alias of `teams start`); the reason is accepted, not kept; `drain` stays removed | PAUSE-ALIAS | v0.1.20 `teams pause/resume/drain` (pause = kill switch now: it stops reading instead of deferring) |
 | F-TRN-18 | keep | core/engine/silence.go:16 `watchSilence`: hints at SilenceHint / SilenceStuck (:137 v0.1.20 "…It may be stuck. I will not retry automatically…" text), never stops a silent turn (StallLimit removed; coordinator ruling: match v0.1.20) | SILENCE | v0.1.20 never killed (B:92-99) |
@@ -166,12 +166,12 @@ Columns: id · status (`keep` / `removed-by-owner` / `ask-owner`, with the owner
 | F-MIR-1 | keep | mirror.go:288 detection | R-9-10 | "Local Codex chat detected" per 11-05 |
 | F-MIR-2 | keep | mirror.go | R-9-10 | same |
 | F-MIR-3 | keep (owner: 2026-11-05 追加 — no window) | no window (all sessions caught up) | NO-WINDOW | owner redefined |
-| F-MIR-4 | keep (owner: 11-05 catch-up silent) | mirror.go | CATCHUP-LIVE, ENTRY-RESUMECHECK, R-9-10, SHADOW-REALDATA | same |
+| F-MIR-4 | keep (owner: 11-05 catch-up silent) | mirror.go | CATCHUP-LIVE, ENTRY-RESUMECHECK, R-9-10, SHADOW-REALDATA, CATCHUP-CRASH | same |
 | F-MIR-5 | keep | core/engine/import.go:168 `queueImport` (persisted job), :235 `importApply` (mirror goroutine moves the shared cursor: mirror.go:748), :449 `importProgress` (mirror.go:1040), :509 `importFinish`; records go through the mirror outbox with its delivery keys (silent catch-up format), so a crash, restart or a second import never posts a record twice | DASH-FLOW, IMPORT-AGAIN, IMPORT-CRASH | B:15741, B:16174 |
 | F-MIR-6 | keep | chat `helper publish-history [full]` / `!ph` (core/engine/import.go:846 `cmdPublishHistory`; `full` re-reads the rollout in the same delivery namespace, so it posts only what is missing); CLI cli/teams_chat.go:71 `teams chat publish-history <sel> --full [--force] --yes` → core/engine/clireq.go:672 `cliPublishHistory` (same import; "already published" when nothing is missing; `--force` replays in a fresh namespace) | IMPORT-AGAIN, PUBLISH-HISTORY-CLI | B:8051, B:16039, B:16083 |
-| F-MIR-7 | keep | mirror.go:831 rewritten-rollout realign | NONE | same |
+| F-MIR-7 | keep | mirror.go:831 rewritten-rollout realign | MIR-REWRITE | same |
 | F-MIR-8 | keep | transcript/record.go:358/:380 hide tool/reasoning/token events; `<oai-mem-citation>` blocks stripped by transcript/strip.go:15 `StripMemCitations` (port of v0.1.20 `StripOAIMemoryCitationBlocks`) in answers (engine/outbound.go:177), progress (runner.go:1010) and mirrored TUI turns (transcript/tracker.go:269/:338); a block inside a closed code fence stays. Note: v0.1.20 already had it (artifact_handoff.go:501), not only origin/main | F-MIR-8 | artifact_handoff.go:501 |
-| F-MIR-9 | keep | transcript/record.go:320 bounded classification of large records | NONE | same |
+| F-MIR-9 | keep | transcript/record.go:320 bounded classification of large records | MIR-BAD-RECORDS | same |
 | F-MIR-10 | keep | receive.go:443 `admit` independent of mirror state | CATCHUP-LIVE | same |
 | F-RND-1 | keep | channel/teams/render.go:37 (ported v0.1.20 markdown, 11-05) | R-36 | same |
 | F-RND-2 | keep | channel/teams/render.go labels | R-1-2-3 | v0.1.20 labels restored 11-05 |
@@ -190,19 +190,19 @@ Columns: id · status (`keep` / `removed-by-owner` / `ask-owner`, with the owner
 | F-XM-3 | keep (owner: 决定-3) | core/engine/delegation.go:90 | DELEG-RT, DELEG-RESTART | same |
 | F-XM-4 | keep (owner: 定稿 停用开关文件 + 11-05 第二批 Q4) | core/store/store.go:40 `ErrDisabled`; `teams stop/start` + control `shutdown` / `!shutdown` / `/shutdown` / `helper shutdown` (cli/teams_stop.go, engine `cmdShutdown`; parse.go; never labelled, annotations.go:51) | KILL-SWITCH, SERVICE-STANDBY, STOP-START, SHUTDOWN, SHUTDOWN-FORMS, STOP-RESTART, STOP-SHARED | new |
 | F-SVC-1 | keep | cli/teams_service.go:105 (systemd/launchd/Task Scheduler backends) | exempt: needs systemd --user, launchd or Windows Task Scheduler; the offline container has none | same |
-| F-SVC-2 | keep | cli/teams_service_local_supervisor.go:111 | NONE | same |
+| F-SVC-2 | keep | cli/teams_service_local_supervisor.go:111 | exempt: the service child is started from a persisted launch spec whose environment allowlist (cli/teams_service.go teamsServiceEnvironmentAllowlist) drops the test-only Graph seam, so in the offline suite it cannot reach the fake Graph; the restart behaviour itself is unit-tested (teams_service_local_supervisor*_test.go) | same |
 | F-SVC-3 | keep (owner: 定稿 WSL one-shot Startup entry) | cli/teams_service.go:451 | exempt: needs a Windows host with WSL | owner redefined |
 | F-SVC-4 | keep | cli/teams_service.go:854 | exempt: Windows UAC | same |
-| F-SVC-5 | keep | cli/teams_service.go:1289 auto-service | NONE | same |
-| F-SVC-6 | keep | cli/teams_service_watchdog.go:118 | NONE | same |
-| F-SVC-7 | keep | cli/teams_service.go:105-437 | NONE | same |
+| F-SVC-5 | keep | cli/teams_service.go:1289 auto-service | exempt: `teams run` repairs and starts the background service through a service backend the offline container lacks; and the service child is started from a persisted launch spec whose environment allowlist (cli/teams_service.go teamsServiceEnvironmentAllowlist) drops the test-only Graph seam, so in the offline suite it cannot reach the fake Graph | same |
+| F-SVC-6 | keep | cli/teams_service_watchdog.go:118 | exempt: the watchdog acts on an installed service backend (systemd/launchd/Task Scheduler/local supervisor), and the service child is started from a persisted launch spec whose environment allowlist (cli/teams_service.go teamsServiceEnvironmentAllowlist) drops the test-only Graph seam, so in the offline suite it cannot reach the fake Graph; unit-tested in teams_service_watchdog_test.go | same |
+| F-SVC-7 | keep | cli/teams_service.go:105-437 | exempt: the service subcommands drive systemd --user, launchd or Task Scheduler, none of which the offline container has; and the service child is started from a persisted launch spec whose environment allowlist (cli/teams_service.go teamsServiceEnvironmentAllowlist) drops the test-only Graph seam, so in the offline suite it cannot reach the fake Graph | same |
 | F-SVC-8 | keep | core/engine/upgrade.go:491 `cmdHelperUpdate`, cli/teams_auto_update.go:31 | exempt: needs a GitHub release feed and a managed install (CXP_RUNTIME_DISABLE=1 in the suite) | same |
 | F-SVC-9 | keep | cli/managed_install.go | exempt: managed runtime install is disabled in the suite (CXP_RUNTIME_DISABLE=1); release infrastructure | same |
 | F-SVC-10 | keep | core/engine/restart.go:269 `drainNotice` replaces the ACK (receive.go:969) of a message admitted while a restart or an update waits for running work: "…I saved this message and will resume it after …"; the turn stays queued and runs once after the restart; upgrade.go:227 `updateStep` drains | RESTART-DRAIN | SPEC text; v0.1.20 `sendDeferredServiceControlNotice` |
 | F-SVC-11 | keep (owner: 第一级 5 v0.1.20 + rc.59 only) | core/migrate/migrate.go:62 | ENTRY-AUTOMIGRATE, ENTRY-FRESH, ENTRY-MIGRATE, ENTRY-CONTROLSEEN, ENTRY-OLDANSWER, ENTRY-RESUMECHECK, ACCEPT-REALSTORE, CATCHUP-LIVE, SHADOW-REALDATA, BREAKER-BACKLOG | new |
 | F-SVC-12 | keep | core/engine/upgrade.go:596 `cmdCodexUpdate` | CODEX-UPGRADE | same |
 | F-CLI-1 | keep | cli/teams_newcore_status.go:84 "Installed version" (this build) next to the store's running version; cli/teams_newcore_poll.go:108 "Pending version: X installed, not running yet …"; :90 "Last poll: <time> (<age> ago)" from core-poll.json, written on the helper's 5 s watcher tick (may lag up to 10 s); while a helper holds the store the store lines (and `teams control`, the bootstrap's control-chat lookup) come from core-status.json, which the helper rewrites after commits (cli/teams_newcore_state.go), never from the store file; with no helper the store is read directly | STATUS-VERSIONS, STATUS-SOURCE | SPEC |
-| F-CLI-2 | keep | cli/teams.go:523 (`--live`, `--appserver-probe`) | NONE | same |
+| F-CLI-2 | keep | cli/teams.go:523 (`--live`, `--appserver-probe`) | CLI-READONLY | same |
 | F-CLI-3 | keep | cli/teams.go:392 `teams run`, :458 `--interval` (the control and active chats; idle tiers keep their production periods), :459 `--once` | ENTRY-FRESH, RUN-ONCE, RUN-INTERVAL | SPEC flag list |
 | F-CLI-4 | removed-by-owner (第一级 4 【删除】; 定稿) | n/a | DELETED-CLI | — |
 | F-CLI-5 | removed-by-owner (第一级 4 【删除】; 定稿) | n/a | DELETED-CLI | — |
@@ -211,18 +211,18 @@ Columns: id · status (`keep` / `removed-by-owner` / `ask-owner`, with the owner
 | F-CLI-8 | keep (owner: 决定-3) | cli/delegate.go:69 | DELEG-RT | same |
 | F-CLI-9 | removed-by-owner (beacon) | n/a | n/a | — |
 | F-CLI-10 | keep | cli/teams.go:459 `teams run --once`: cli/teams_newcore.go:325 `watchTeamsOnceCycle` stops after one cycle (every chat read once, the work it brought in finished, kept command-line requests done) | RUN-ONCE | SPEC |
-| R-1 | keep | outbox + read-back (see R-5) | R-1-2-3, R-5, R-5a-crash, R-5b, R-36, R-37-out, B-5, DUP-EDGE, DELEG-RT, ENTRY-CONTROLSEEN, ENTRY-OLDANSWER, BREAKER-BACKLOG, KILL-SWITCH, STANDBY-LOCKED, STANDBY-TAKEOVER, TAKEOVER-*, STOP-START, SHUTDOWN, STOP-RESTART, STOP-SHARED, MOVED-HOME, MOVED-LIVE-STOPPED, MOVED-LIVE-BOTH | — |
-| R-2 | keep | outbox marker + read-back; global invariant no-duplicate-post | R-1-2-3, R-5, R-5a-crash, R-5b, R-9-10, R-36, B-5, DELEG-RT, NO-WINDOW, IMPORT-CRASH, FORK-CRASH | — |
+| R-1 | keep | outbox + read-back (see R-5) | R-1-2-3, R-5, R-5a-crash, R-5b, R-36, R-37-out, B-5, DUP-EDGE, DELEG-RT, ENTRY-CONTROLSEEN, ENTRY-OLDANSWER, BREAKER-BACKLOG, KILL-SWITCH, STANDBY-LOCKED, STANDBY-TAKEOVER, TAKEOVER-*, STOP-START, SHUTDOWN, STOP-RESTART, STOP-SHARED, MOVED-HOME, MOVED-LIVE-STOPPED, MOVED-LIVE-BOTH, MIR-BAD-RECORDS | — |
+| R-2 | keep | outbox marker + read-back; global invariant no-duplicate-post | R-1-2-3, R-5, R-5a-crash, R-5b, R-9-10, R-36, B-5, DELEG-RT, NO-WINDOW, IMPORT-CRASH, FORK-CRASH, MIR-REWRITE, TURN-UNPHASED, CATCHUP-CRASH, NEW-CRASH, GRAPH-OUTAGE, THROTTLE-CRASH | — |
 | R-3 | keep | inbound dedupe | R-1-2-3, R-4-29, R-4-paging, R-6, R-7, R-37, R-43, DUP, DUP-EDGE, PARK | — |
 | R-4 | keep | receive.go cursor + dispositions | R-4-29, R-4-paging, BREAKER, DELEG-RESTART, PARK | — |
-| R-5 | keep | runner.go:912 `reconcile`; outbox read-back | R-5, R-5a-crash, R-5b, R-4-29, B-5, ACTIVE-WRITER, ACTIVE-WRITER-RESUME, DELEG-RESTART | — |
+| R-5 | keep | runner.go:912 `reconcile`; outbox read-back | R-5, R-5a-crash, R-5b, R-4-29, B-5, ACTIVE-WRITER, ACTIVE-WRITER-RESUME, DELEG-RESTART, CODEX-LOST | — |
 | R-6 | keep | per-chat outbox order; global invariant chat-order | R-6, R-36, R-4-paging | — |
 | R-7 | keep | outbox marker identity (receive.go:746 the converted outbox's message ids identify the previous helper's posts) | R-7, R-5a-crash, BREAKER, BREAKER-BACKLOG | — |
 | R-8 | keep | core/engine/annotations.go:35 `labelAdmitted` + channel/teams/annotate.go:50 `Annotate` (F-RND-4): one lossless PATCH per message, never a helper post, never during catch-up | EDIT-LABEL | — |
-| R-9 | keep | mirror.go | R-9-10, NO-WINDOW, MOVED-HOME | window removed by owner |
-| R-10 | keep | mirror.go | R-9-10, MOVED-HOME | — |
-| R-11 | keep | per-chat isolation | R-11, BREAKER, BREAKER-BACKLOG, PARK | — |
-| R-12 | keep | Retry-After handling; global invariant retry-after | R-12, INBOX | — |
+| R-9 | keep | mirror.go | R-9-10, NO-WINDOW, MOVED-HOME, GRAPH-OUTAGE | window removed by owner |
+| R-10 | keep | mirror.go | R-9-10, MOVED-HOME, CATCHUP-CRASH | — |
+| R-11 | keep | per-chat isolation | R-11, BREAKER, BREAKER-BACKLOG, PARK, GRAPH-OUTAGE | — |
+| R-12 | keep | Retry-After handling; global invariant retry-after | R-12, INBOX, THROTTLE-CRASH | — |
 | R-13 | keep | lease + supervisor backoff | SERVICE-STANDBY, STANDBY-LOCKED, STANDBY-TAKEOVER, TAKEOVER-CRASH-MID, TAKEOVER-LEFTOVER, TAKEOVER-SAME-HOST, STOP-RESTART | — |
 | R-14 | keep | tiered reads; global invariants idle-quiet, cpu-budget | IDLE, INBOX, PARK, ACCEPT-REALSTORE, SHADOW-REALDATA | — |
 | R-15 | keep | (bench) | exempt: throughput benchmark tier (gotest-docker-bench.sh), not a pass/fail black-box scenario | — |
@@ -234,29 +234,29 @@ Columns: id · status (`keep` / `removed-by-owner` / `ask-owner`, with the owner
 | R-21 | keep | per-chat runners; control never queued | R-11 | — |
 | R-22 | keep | freeze notice once per park (core/engine/annotations.go:106 meta marker, :159 `freeze` with `Present` check in channel/teams/annotate.go:285 `noticeEdit`); other notices once | BREAKER, DUP, IDLE, SILENCE, VOICE, WAKE-SYNTAX, EDIT-FREEZE | — |
 | R-23 | keep | the envelope stays out of Teams and titles (transcript/strip.go:209 `StripHelperPrompt`, discover.go:163); `<oai-mem-citation>` stripped (F-MIR-8, transcript/strip.go:15) | F-TRN-14, F-MIR-8 | — |
-| R-24 | keep | cli/teams_user_path.go, teams_child_guard.go; cli/teams_newcore_codexenv.go:122 (managed Codex for app-servers = the upgrade target), cli/teams_newcore_update.go:77 (unchanged-version upgrade: no restart); config.toml changes reach the next turn (core/codex/pool.go:187) | CODEX-MANAGED, CODEX-CONFIG | — |
-| R-25 | keep | cli/teams_child_guard.go:14 | NONE | — |
+| R-24 | keep | cli/teams_user_path.go, teams_child_guard.go; cli/teams_newcore_codexenv.go:122 (managed Codex for app-servers = the upgrade target), cli/teams_newcore_update.go:77 (unchanged-version upgrade: no restart); config.toml changes reach the next turn (core/codex/pool.go:187) | CODEX-MANAGED, CODEX-CONFIG, CHILD-GUARD | — |
+| R-25 | keep | cli/teams_child_guard.go:14 | CHILD-GUARD | — |
 | R-26 | keep | engine/envelope.go:549 `containsRawAPIKey` (v0.1.20 port), :500 `screen` / :537 `refuse`: a prompt or command with a raw key from a human is refused with one unquoted reply, never run or sent to Codex, and its body is stored redacted (receive.go:506); reply text adapted (no `model setup`, owner removed third-party APIs) | R-26 | B:4613 |
 | R-27 | keep | control chat owner-only (receive.go:744); coworker commands refused with v0.1.20's text (receive.go:753), coworker ACK text (:967) | R-43, GROUP-CMDS | — |
 | R-28 | keep | core/lease/acquire.go:185 | TAKEOVER-*, STANDBY-TAKEOVER, KILL-SWITCH | — |
 | R-29 | keep | store-backed queue/outbox | R-4-29 | — |
 | R-30 | keep | per-session runner | R-6 | — |
-| R-31 | keep | turn captures model/effort | NONE | — |
-| R-32 | keep | thread bound before `turn/start` | B-5 | — |
-| R-33 | keep | runner.go `finish` | R-20-33, B-5, INT-NOTICE | — |
+| R-31 | keep | turn captures model/effort | MODEL-SWITCH-BUSY | — |
+| R-32 | keep | thread bound before `turn/start` | B-5, CODEX-LOST | — |
+| R-33 | keep | runner.go `finish` | R-20-33, B-5, INT-NOTICE, TURN-UNPHASED, CODEX-LOST | — |
 | R-34 | keep | mirror recognises Teams turns | R-9-10 | — |
 | R-35 | keep | silence.go:189 queued ACK, runner.go:260 starting notice, silence.go:108 reminder | R-6 | ACK text per owner |
 | R-36 | keep | channel/teams/render.go | R-36 | — |
 | R-37 | keep | files.go, outbound.go; per-message limits engine/envelope.go:59 (F-RND-8) | R-37, R-37-out, VOICE, F-RND-8 | — |
 | R-38 | keep | core/migrate refuses unsupported/corrupt stores | ENTRY-MIGRATE | — |
-| R-39 | keep | `new` idempotent (createOrGet + record) | NONE | — |
+| R-39 | keep | `new` idempotent (createOrGet + record) | NEW-CRASH | — |
 | R-40 | keep | see F-TRN-17 (`pause/resume` = hidden aliases of `stop/start`; drain internal only) | PAUSE-ALIAS | — |
 | R-41 | keep | see F-WRK-10: the child's history is the parent's records up to the cutoff, once each (delivery keys of the child's namespace; a crash mid-import resumes from the stored cursor); the child's own rollout is mirrored from where it stood at the fork (its source row is written in the fork's transaction; core/engine/mirror.go:569 keeps discovery off a child rollout until it is bound), so nothing of the parent is posted twice and none of the child's records is skipped; only forks converted from v0.1.20 keep "mirror from the size first seen" (core/engine/mirror.go:580) | CMD-FORK, FORK-RUNNING, FORK-CTL, FORK-CRASH | — |
 | R-42 | keep | core/transcript/usage.go:242 resets, :599 fork-prefix attribution; see F-STA-1 | CMD-STATS, STATS-RESETS | — |
 | R-43 | keep | receive.go:785 | R-43 | — |
-| R-44 | keep | read-only rollout access by construction | NONE | — |
+| R-44 | keep | read-only rollout access by construction | MIR-BAD-RECORDS, MIR-REWRITE | — |
 | R-45 | keep | no DELETE call in channel/teams | exempt: enforced in every scenario by the global invariant graph-contract (the fake models DELETE only for upload sessions) | — |
-| R-46 | keep | cli/teams_newcore_status.go read-only open | NONE | — |
+| R-46 | keep | cli/teams_newcore_status.go read-only open | CLI-READONLY | — |
 | R-47 | keep | core/engine/defaults.go:89 `default …` in the control chat (F-CTL-15); model setup removed by owner | CMD-DEFAULT | — |
 | R-48 | keep | upgrade.go:596 waits for drain, no auto-retry | CODEX-UPGRADE | — |
 | R-49 | keep | notify.go, channel/teams/workflow.go | NOTIFY-WH, NOTIFY-NOWH, NOTIFY-WH500, NOTIFY-WHDOWN, WORKFLOW-LIVE | — |

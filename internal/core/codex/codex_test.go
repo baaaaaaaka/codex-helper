@@ -98,6 +98,10 @@ func (b *brain) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			plan.HoldCompletion = true
 		case strings.HasPrefix(req.Prompt, "comment"):
 			plan.Commentary = "thinking about it"
+		case strings.HasPrefix(req.Prompt, "unphased"):
+			plan.Unphased = true
+			plan.Commentary = "step one"
+			plan.MoreCommentary = []string{"step two"}
 		case strings.HasPrefix(req.Prompt, "compact"):
 			plan.Compactions = 2
 		case strings.HasPrefix(req.Prompt, "retry"):
@@ -234,6 +238,30 @@ func TestRunTurnAnswerClientIDAndFind(t *testing.T) {
 	res, err = s2.RunTurn(ctx, TurnStartParams{ThreadID: th.ID, ClientID: "cxp-0000abcd-3", Input: []Input{{Text: "again"}}}, time.Minute, TurnHooks{})
 	if err != nil || res.Final != "ANSWER again" {
 		t.Fatalf("second turn: %v %+v", err, res)
+	}
+}
+
+// Agent messages without a phase: every one but the last is progress; the
+// last is the final and never progress (v0.1.20 look-behind).
+func TestRunTurnUnphasedFinalIsNotProgress(t *testing.T) {
+	s, _, cfg := startFake(t)
+	ctx := tctx(t)
+	th, err := s.ThreadStart(ctx, ThreadStartParams{Cwd: cfg.Dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var progress []string
+	res, err := s.RunTurn(ctx, TurnStartParams{ThreadID: th.ID, ClientID: "k-unphased", Input: []Input{{Text: "unphased"}}}, time.Minute, TurnHooks{
+		Progress: func(text string) { mu.Lock(); progress = append(progress, text); mu.Unlock() },
+	})
+	if err != nil || res.Status != StatusCompleted || res.Final != "ANSWER unphased" {
+		t.Fatalf("%v %+v", err, res)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if strings.Join(progress, "|") != "step one|step two" {
+		t.Fatalf("progress %q, want [step one step two]", progress)
 	}
 }
 

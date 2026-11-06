@@ -72,6 +72,10 @@ const (
 	// InvGraphContract: no request real Graph would reject, or that the
 	// fake does not model.
 	InvGraphContract = "graph-contract"
+	// InvLocalHistory: the local Codex history the scenario wrote (the
+	// rollouts of a TUI user) is byte for byte what it wrote: the helper
+	// only reads it (R-44).
+	InvLocalHistory = "local-history-untouched"
 )
 
 // AllInvariants lists every invariant in check order.
@@ -79,6 +83,7 @@ var AllInvariants = []string{
 	InvIdleQuiet, InvCleanStop, InvNoLeakedProcess, InvCPUBudget,
 	InvNoDuplicatePost, InvChatOrder, InvNoPostAfterExit, InvRateCap,
 	InvRetryAfter, InvNoLoop, InvCatchUpSilent, InvOffline, InvGraphContract,
+	InvLocalHistory,
 }
 
 // Limits of the invariants.
@@ -281,6 +286,11 @@ func (s *Scenario) teardown() {
 	}
 	for _, v := range s.Graph.Violations() {
 		res.add(InvGraphContract, "%s", v.String())
+	}
+	for _, w := range s.Env.Rollouts() {
+		if err := w.Intact(); err != nil {
+			res.add(InvLocalHistory, "local Codex history changed: %v", err)
+		}
 	}
 
 	summary := s.reportInvariants(res)

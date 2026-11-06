@@ -8,6 +8,8 @@
 package rollout
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -40,6 +42,14 @@ type Writer struct {
 	clock     time.Time
 	realtime  bool
 	written   []Written
+	// chunks are the bytes this Writer appended, in order (hash and
+	// length), so Intact can tell whether anyone rewrote them.
+	chunks []chunk
+}
+
+type chunk struct {
+	sum [sha256.Size]byte
+	n   int
 }
 
 // New creates sessions/YYYY/MM/DD/rollout-<ts>-<id>.jsonl under sessionsDir
@@ -135,9 +145,105 @@ func (w *Writer) append(records ...map[string]any) error {
 		if err != nil {
 			return err
 		}
-		if _, err := f.Write(append(data, '\n')); err != nil {
+		data = append(data, '\n')
+		if _, err := f.Write(data); err != nil {
 			return err
 		}
+		w.chunks = append(w.chunks, chunk{sum: sha256.Sum256(data), n: len(data)})
+	}
+	return nil
+}
+
+// AppendRecord appends one record of type typ ("response_item",
+// "event_msg", ...) with payload, stamped with the Writer's clock: e.g. a
+// tool call or a large tool output in the middle of a turn.
+func (w *Writer) AppendRecord(typ string, payload map[string]any) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.append(line(w.tick(), typ, payload))
+}
+
+// AppendRaw appends data verbatim: a malformed record, or the first part
+// of a record whose newline is not written yet (a record Codex is still
+// writing).
+func (w *Writer) AppendRaw(data []byte) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	f, err := os.OpenFile(w.Path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := f.Write(data); err != nil {
+		return err
+	}
+	w.chunks = append(w.chunks, chunk{sum: sha256.Sum256(data), n: len(data)})
+	return nil
+}
+
+// Replace plays Codex replacing the rollout file (e.g. a legacy rollout
+// rewritten as a paginated one): edit gets the current lines (without
+// newlines) and returns the new file's lines, which are written to a new
+// file renamed over the old path (a new inode). What this Writer appended
+// before is forgotten: the new file is its content from now on.
+func (w *Writer) Replace(edit func(lines [][]byte) [][]byte) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	data, err := os.ReadFile(w.Path)
+	if err != nil {
+		return err
+	}
+	lines := bytes.Split(bytes.TrimSuffix(data, []byte("\n")), []byte("\n"))
+	var out []byte
+	for _, l := range edit(lines) {
+		out = append(append(out, l...), '\n')
+	}
+	tmp := w.Path + ".replace"
+	if err := os.WriteFile(tmp, out, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, w.Path); err != nil {
+		return err
+	}
+	w.chunks = []chunk{{sum: sha256.Sum256(out), n: len(out)}}
+	return nil
+}
+
+// Intact reports whether everything this Writer appended (since it was
+// created or last Replaced) is still in the file, byte for byte and in
+// order. Records others appended in between (Codex continuing the same
+// session) are allowed; a rewrite, truncation or edit of the local
+// history is not (R-44).
+func (w *Writer) Intact() error {
+	w.mu.Lock()
+	chunks := append([]chunk(nil), w.chunks...)
+	w.mu.Unlock()
+	if len(chunks) == 0 {
+		return nil
+	}
+	data, err := os.ReadFile(w.Path)
+	if err != nil {
+		return err
+	}
+	off := 0
+	for i, c := range chunks {
+		found := false
+		for off+c.n <= len(data) {
+			if sha256.Sum256(data[off:off+c.n]) == c.sum {
+				found = true
+				break
+			}
+			// Others only append whole lines: resume at the next line.
+			nl := bytes.IndexByte(data[off:], '\n')
+			if nl < 0 {
+				break
+			}
+			off += nl + 1
+		}
+		if !found {
+			return fmt.Errorf("%s: write %d of %d (%d bytes) is no longer in the file (size %d)", filepath.Base(w.Path), i+1, len(chunks), c.n, len(data))
+		}
+		off += c.n
 	}
 	return nil
 }
@@ -174,6 +280,9 @@ type Turn struct {
 	// Aborted writes the turn start and the user message, then a
 	// turn_aborted event instead of an answer (an interrupted turn).
 	Aborted bool
+	// Images are data URLs pasted into the prompt (input_image items of
+	// the user message, as the TUI records a pasted screenshot).
+	Images []string
 }
 
 // AppendTurn appends one complete user-triggered turn in the current Codex
@@ -226,6 +335,10 @@ func (w *Writer) BeginTurn(turn Turn) (OpenTurn, error) {
 	}
 	userPassthrough := w.passthrough(turnID, "user.text")
 	userPassthrough["content_item_metadata"] = []any{map[string]any{"provenance": map[string]any{"type": "user"}}}
+	content := []any{map[string]any{"type": "input_text", "text": turn.Prompt}}
+	for _, img := range turn.Images {
+		content = append(content, map[string]any{"type": "input_image", "image_url": img})
+	}
 	recs := []map[string]any{
 		line(w.tick(), "event_msg", map[string]any{
 			"type": "task_started",
@@ -244,7 +357,7 @@ func (w *Writer) BeginTurn(turn Turn) (OpenTurn, error) {
 		}),
 		line(w.tick(), "response_item", map[string]any{
 			"type": "message", "id": userID, "role": "user",
-			"content": []any{map[string]any{"type": "input_text", "text": turn.Prompt}},
+			"content": content,
 			"internal_chat_message_metadata_passthrough": userPassthrough,
 		}),
 		line(w.tick(), "event_msg", w.itemCompleted(turnID, map[string]any{
@@ -265,12 +378,36 @@ func (w *Writer) BeginTurn(turn Turn) (OpenTurn, error) {
 func (w *Writer) FinishTurn(open OpenTurn, turn Turn) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	return w.append(w.finishRecords(open, turn)...)
+}
+
+// RenderFinish returns the bytes FinishTurn would append, without writing
+// them, so a scenario can write them in pieces (AppendRaw) the way a
+// record still being written looks to a reader. The turn counts as
+// written now.
+func (w *Writer) RenderFinish(open OpenTurn, turn Turn) ([]byte, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var out []byte
+	for _, rec := range w.finishRecords(open, turn) {
+		w.ordinal++
+		rec["ordinal"] = w.ordinal
+		data, err := json.Marshal(rec)
+		if err != nil {
+			return nil, err
+		}
+		out = append(append(out, data...), '\n')
+	}
+	return out, nil
+}
+
+func (w *Writer) finishRecords(open OpenTurn, turn Turn) []map[string]any {
 	turnID := open.ID
 	if turn.Aborted {
 		w.logWritten("aborted", "")
-		return w.append(line(w.tick(), "event_msg", map[string]any{
+		return []map[string]any{line(w.tick(), "event_msg", map[string]any{
 			"type": "turn_aborted", "turn_id": turnID, "reason": "interrupted",
-		}))
+		})}
 	}
 	var recs []map[string]any
 	if turn.Commentary != "" {
@@ -295,7 +432,7 @@ func (w *Writer) FinishTurn(open OpenTurn, turn Turn) error {
 			"duration_ms": w.clock.Sub(open.startedAt).Milliseconds(), "time_to_first_token_ms": 120,
 		}),
 	)
-	return w.append(recs...)
+	return recs
 }
 
 func (w *Writer) passthrough(turnID, kind string) map[string]any {

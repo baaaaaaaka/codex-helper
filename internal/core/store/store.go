@@ -335,7 +335,18 @@ func (s *Store) openWriter(fresh, exclusive bool) error {
 // connections, or on a network filesystem the one exclusive connection
 // with query_only.
 func (s *Store) openReadOnly(exclusive bool) (*Store, error) {
-	r, err := openDB(s.path, exclusive, true)
+	var r *sql.DB
+	var err error
+	if _, serr := os.Stat(s.path + "-wal"); !exclusive && errors.Is(serr, os.ErrNotExist) {
+		// No helper has the store open (SQLite removes the WAL when the
+		// last writer closes it). A read-only connection would still
+		// create -wal and -shm files next to the store and leave them
+		// behind; read the file as immutable instead, so that status and
+		// doctor write nothing (R-46).
+		r, err = sql.Open("sqlite", dsn(s.path, true)+"&immutable=1")
+	} else {
+		r, err = openDB(s.path, exclusive, true)
+	}
 	if err != nil {
 		return nil, err
 	}
