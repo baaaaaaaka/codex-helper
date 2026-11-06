@@ -241,6 +241,8 @@ type ChatInfo struct {
 func TextHash(text string) string {
 	clean := strings.Map(func(r rune) rune {
 		switch {
+		case r < 0x80:
+			return r // no ASCII rune is one of the below
 		case unicode.Is(unicode.So, r), unicode.Is(unicode.Cf, r), unicode.Is(unicode.Sk, r) && r > 0xFF,
 			r >= 0xFE00 && r <= 0xFE0F, r >= 0xE0100 && r <= 0xE01EF, r == 0x20E3:
 			return ' '

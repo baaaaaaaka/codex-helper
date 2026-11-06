@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math/rand/v2"
+	"strings"
 	"testing"
 	"time"
 
@@ -39,6 +41,8 @@ func TestInboundEmojiKept(t *testing.T) {
 		`x <emoji id="no-alt"></emoji>y`:                              "x y",
 		`<IMG ITEMTYPE='http://schema.skype.com/Emoticon' ALT='(y)'>`: "(y)",
 		`<img src="photo.png" alt="not an emoji">`:                    "",
+		`<EMOJI ALT="😀"></EMOJI> ok`:                                  "😀 ok",
+		`a<CustomEmoji alt=":p:">b`:                                   "a:p:b",
 	}
 	for in, want := range cases {
 		if got := plainText(in); got != want {
@@ -46,6 +50,47 @@ func TestInboundEmojiKept(t *testing.T) {
 		}
 	}
 	noViolations(t, fg)
+}
+
+func TestContainsFold(t *testing.T) {
+	for _, c := range []struct {
+		s, sub string
+		k      int
+		want   bool
+	}{
+		{"<p>just joking</p>", "emoji", 3, false},
+		{"<EmOjI", "emoji", 3, true},
+		{"j<emoJi alt", "emoji", 3, true},
+		{"Jjj emoj", "emoji", 3, false},
+		{"emojI", "emoji", 3, true},
+		{"x<IMG src", "<img", 0, true},
+		{"<im <iMg", "<img", 0, true},
+		{"<im", "<img", 0, false},
+		{"é<ATTACHMENT id", "<attachment", 0, true},
+		{"", "emoji", 3, false},
+	} {
+		if got := containsFold(c.s, c.sub, c.k); got != c.want {
+			t.Errorf("containsFold(%q, %q) = %v", c.s, c.sub, got)
+		}
+	}
+	// Against the plain definition, on random strings of the letters.
+	rng := rand.New(rand.NewPCG(1, 2))
+	const alphabet = "eEmMoOjJiI<gG x"
+	for n := 0; n < 20000; n++ {
+		b := make([]byte, rng.IntN(16))
+		for i := range b {
+			b[i] = alphabet[rng.IntN(len(alphabet))]
+		}
+		for _, c := range []struct {
+			sub string
+			k   int
+		}{{"emoji", 3}, {"<img", 0}, {"jo", 0}} {
+			want := strings.Contains(strings.ToLower(string(b)), c.sub)
+			if got := containsFold(string(b), c.sub, c.k); got != want {
+				t.Fatalf("containsFold(%q, %q, %d) = %v", b, c.sub, c.k, got)
+			}
+		}
+	}
 }
 
 func TestReceiveWindowTooLarge(t *testing.T) {

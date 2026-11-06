@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -58,6 +59,9 @@ type call struct {
 	// sink, when set, consumes a 2xx response body instead of buffering it
 	// (downloads). Its error is a transient Rejected for reads.
 	sink func(*http.Response) error
+	// buf, when set, holds the response body instead of a new slice; the
+	// body is then valid only until buf is reused (getDecoded).
+	buf *bytes.Buffer
 }
 
 type response struct {
@@ -222,7 +226,15 @@ func (g *graph) send(ctx context.Context, c call) (response, string, error) {
 	if limit <= 0 {
 		limit = smallBodyLimit
 	}
-	raw, rerr := io.ReadAll(io.LimitReader(hr.Body, limit+1))
+	var raw []byte
+	var rerr error
+	if c.buf != nil {
+		c.buf.Reset()
+		_, rerr = c.buf.ReadFrom(io.LimitReader(hr.Body, limit+1))
+		raw = c.buf.Bytes()
+	} else {
+		raw, rerr = io.ReadAll(io.LimitReader(hr.Body, limit+1))
+	}
 	resp := response{status: hr.StatusCode, header: hr.Header, body: raw}
 	if rerr == nil && int64(len(raw)) > limit {
 		rerr = fmt.Errorf("response body over %d bytes", limit)
@@ -402,14 +414,40 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 }
 
 func (g *graph) getJSON(ctx context.Context, path string, limit int64, out any) error {
-	resp, err := g.do(ctx, call{method: http.MethodGet, url: path, limit: limit})
+	return g.getDecoded(ctx, path, limit, func(body []byte) error { return json.Unmarshal(body, out) })
+}
+
+// bodyBufs are the response buffers of getDecoded. An idle helper reads a
+// page of messages or chats every second or so; reading each into a new,
+// doubling slice was most of what it allocated, and so of its GC work.
+var bodyBufs = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+
+// bodyBufKeep is the largest buffer kept for reuse: a rare long catch-up
+// page is not held on to.
+const bodyBufKeep = 4 << 20
+
+// getDecoded performs an idempotent GET and hands the response body to
+// decode, which must not keep it (json.Unmarshal copies what it keeps).
+func (g *graph) getDecoded(ctx context.Context, path string, limit int64, decode func([]byte) error) error {
+	buf := bodyBufs.Get().(*bytes.Buffer)
+	defer func() {
+		if buf.Cap() <= bodyBufKeep {
+			bodyBufs.Put(buf)
+		}
+	}()
+	resp, err := g.do(ctx, call{method: http.MethodGet, url: path, limit: limit, buf: buf})
 	if err != nil {
 		return err
 	}
-	if err := json.Unmarshal(resp.body, out); err != nil {
-		return &channel.Rejected{Err: fmt.Errorf("graph GET %s: decoding: %w", redactPath(path), err)}
+	if err := decode(resp.body); err != nil {
+		return decodeError(path, err)
 	}
 	return nil
+}
+
+// decodeError is the error of a GET response that does not decode.
+func decodeError(path string, err error) error {
+	return &channel.Rejected{Err: fmt.Errorf("graph GET %s: decoding: %w", redactPath(path), err)}
 }
 
 // writeJSON performs a non-idempotent write and decodes the response. A 2xx

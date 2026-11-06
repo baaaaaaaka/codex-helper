@@ -26,11 +26,14 @@ type Seam struct {
 	// Hostname makes the helper believe it runs on this host (two helpers
 	// sharing one home act as two hosts).
 	Hostname string
+	// CPUProfile is a directory for the helper's one-minute CPU profiles
+	// (diagnostic runs only).
+	CPUProfile string
 }
 
 // With returns s with the fields of o that are set.
 func (s Seam) With(o Seam) Seam {
-	out := Seam{ProductionTiming: s.ProductionTiming || o.ProductionTiming, Hostname: s.Hostname, Knobs: map[string]string{}}
+	out := Seam{ProductionTiming: s.ProductionTiming || o.ProductionTiming, Hostname: s.Hostname, CPUProfile: s.CPUProfile, Knobs: map[string]string{}}
 	for k, v := range s.Knobs {
 		out.Knobs[k] = v
 	}
@@ -39,6 +42,9 @@ func (s Seam) With(o Seam) Seam {
 	}
 	if o.Hostname != "" {
 		out.Hostname = o.Hostname
+	}
+	if o.CPUProfile != "" {
+		out.CPUProfile = o.CPUProfile
 	}
 	return out
 }
@@ -61,6 +67,9 @@ func (s Seam) Value(endpoint, instance string, interval time.Duration) string {
 	}
 	if s.Hostname != "" {
 		parts = append(parts, "hostname="+s.Hostname)
+	}
+	if s.CPUProfile != "" {
+		parts = append(parts, "cpuprofile="+s.CPUProfile)
 	}
 	return strings.Join(parts, ";")
 }

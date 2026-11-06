@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -39,6 +40,7 @@ func TestTeamsTestSeamRejectsAnythingButALoopbackEndpoint(t *testing.T) {
 		"endpoint=http://127.0.0.1:1234;timing.Tick=1s",
 		"endpoint=http://127.0.0.1:1234;timing.SilenceHint=-1s",
 		"endpoint=http://127.0.0.1:1234;hostname",
+		"endpoint=http://127.0.0.1:1234;cpuprofile=relative/dir",
 	} {
 		if _, err := parseTeamsTestSeam(raw); !errors.Is(err, errTeamsTestSeamInvalid) {
 			t.Errorf("%q: err = %v, want errTeamsTestSeamInvalid", raw, err)
@@ -66,6 +68,24 @@ func TestTeamsTestSeamTimingProfiles(t *testing.T) {
 	if s.refusalRecheck() != 500*time.Millisecond {
 		t.Fatalf("refusal recheck = %v", s.refusalRecheck())
 	}
+}
+
+func TestTeamsTestSeamCPUProfileWritesAProfileUntilStopped(t *testing.T) {
+	dir := t.TempDir()
+	s, err := parseTeamsTestSeam("endpoint=http://127.0.0.1:1234;cpuprofile=" + dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.startCPUProfile(io.Discard)()
+	files, _ := filepath.Glob(filepath.Join(dir, "cpu-*.pprof"))
+	if len(files) != 1 {
+		t.Fatalf("profiles = %v, want one", files)
+	}
+	if fi, err := os.Stat(files[0]); err != nil || fi.Size() == 0 {
+		t.Fatalf("profile %s: %v (a stopped profile is complete, not empty)", files[0], err)
+	}
+	var off *teamsTestSeam
+	off.startCPUProfile(io.Discard)() // no seam: no profile, no error
 }
 
 func TestTeamsTestSeamSendsEveryRequestToTheEndpointUnchanged(t *testing.T) {

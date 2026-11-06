@@ -264,6 +264,7 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 		if d := seam.refusalRecheck(); d > 0 {
 			teamsRefusalRecheck = d
 		}
+		defer seam.startCPUProfile(errOut)()
 	}
 
 	stateDir, err := appdirs.StateDir()

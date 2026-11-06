@@ -286,7 +286,7 @@ func attachmentTypes(gm graphMessage) []string {
 			types = append(types, "Teams-hosted inline content")
 		}
 	}
-	if len(types) == 0 && strings.Contains(strings.ToLower(gm.Body.Content), "<attachment") {
+	if len(types) == 0 && containsFold(gm.Body.Content, "<attachment", 0) {
 		types = append(types, "Teams attachment placeholder")
 	}
 	return types
@@ -426,9 +426,11 @@ func emojiAlt(attrs string) string {
 }
 
 // plainText is the inbound text of a Teams HTML body: emoji become their
-// Unicode (alt) text, the rest as teamshtml renders it.
+// Unicode (alt) text, the rest as teamshtml renders it. Each emoji pattern
+// runs only on a body that holds its tag name: most bodies have no emoji,
+// and the four passes were most of an idle read's parse.
 func plainText(content string) string {
-	if strings.Contains(content, "<") {
+	if containsFold(content, "emoji", 3) {
 		content = emojiPairRE.ReplaceAllStringFunc(content, func(t string) string {
 			return emojiAlt(emojiPairRE.FindStringSubmatch(t)[2])
 		})
@@ -436,11 +438,73 @@ func plainText(content string) string {
 			return emojiAlt(emojiOpenRE.FindStringSubmatch(t)[1])
 		})
 		content = emojiCloseRE.ReplaceAllString(content, "")
+	}
+	if containsFold(content, "<img", 0) {
 		content = emojiImgRE.ReplaceAllStringFunc(content, func(t string) string {
 			return emojiAlt(emojiImgRE.FindStringSubmatch(t)[1])
 		})
 	}
 	return teamshtml.PlainTextFromTeamsHTML(content)
+}
+
+// containsFold reports whether s contains sub, a lower-case ASCII string,
+// in any ASCII case. It jumps between the occurrences of sub[k] (in either
+// case) with IndexByte, so k should name sub's rarest byte: a body without
+// it costs one fast scan and no allocation. It finds every match of a (?i)
+// pattern that contains sub: no letter of sub folds to a non-ASCII rune
+// ("k" and "s" do, so sub must not hold them).
+func containsFold(s, sub string, k int) bool {
+	lo := sub[k]
+	up := lo
+	if 'a' <= lo && lo <= 'z' {
+		up = lo - 'a' + 'A'
+	}
+	nextLo, nextUp := 0, 0 // where to search each case from
+	for {
+		i := -1
+		if nextLo >= 0 {
+			if j := strings.IndexByte(s[nextLo:], lo); j >= 0 {
+				i = nextLo + j
+			} else {
+				nextLo = -1
+			}
+		}
+		if up != lo && nextUp >= 0 {
+			if j := strings.IndexByte(s[nextUp:], up); j >= 0 {
+				if j += nextUp; i < 0 || j < i {
+					i = j
+				}
+			} else {
+				nextUp = -1
+			}
+		}
+		if i < 0 {
+			return false
+		}
+		if s[i] == lo {
+			nextLo = i + 1
+		} else {
+			nextUp = i + 1
+		}
+		if start := i - k; start >= 0 && start+len(sub) <= len(s) && foldEqual(s[start:start+len(sub)], sub) {
+			return true
+		}
+	}
+}
+
+// foldEqual reports whether s equals sub, a lower-case ASCII string, in
+// any ASCII case.
+func foldEqual(s, sub string) bool {
+	for i := 0; i < len(sub); i++ {
+		b := s[i]
+		if 'A' <= b && b <= 'Z' {
+			b += 'a' - 'A'
+		}
+		if b != sub[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func hostedRef(chat, msg, id string) string {

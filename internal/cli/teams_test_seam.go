@@ -24,6 +24,9 @@ package cli
 //   - hostname: the host identity used for the store owner, per-host files
 //     and the default machine label, so two helpers in one test container
 //     act as two hosts sharing one home.
+//   - cpuprofile: a directory that receives consecutive one-minute CPU
+//     profiles of the running helper (diagnostic: the real-data shadow
+//     run's CPU measurements).
 //
 // The seam must never change what cxp selects, sends, renders or decides:
 // only where the requests go, how long the waits are, and which host name
@@ -34,10 +37,13 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
+	"runtime/pprof"
 	"sort"
 	"strings"
 	"time"
@@ -63,6 +69,8 @@ type teamsTestSeam struct {
 	// fast is the base of the fast timing profile (0 = production timing).
 	fast      time.Duration
 	overrides map[string]time.Duration
+	// cpuProfileDir receives the CPU profiles ("" = no profiling).
+	cpuProfileDir string
 }
 
 // teamsTestSeamTimingKnobs are the waits a scenario may shorten beyond the
@@ -140,6 +148,11 @@ func parseTeamsTestSeam(raw string) (*teamsTestSeam, error) {
 			s.instance = val
 		case key == "hostname":
 			s.hostname = val
+		case key == "cpuprofile":
+			if !filepath.IsAbs(val) {
+				return bad("cpuprofile %q: want an absolute directory", val)
+			}
+			s.cpuProfileDir = val
 		case key == "timing":
 			switch {
 			case val == "production":
@@ -252,4 +265,51 @@ func teamsHostname() (string, error) {
 		return seam.hostname, nil
 	}
 	return os.Hostname()
+}
+
+// teamsTestSeamCPUProfileEvery is the length of one profile of the seam's
+// cpuprofile key: a measurement merges the files of its window.
+const teamsTestSeamCPUProfileEvery = time.Minute
+
+// startCPUProfile writes consecutive CPU profiles, cpu-<pid>-<unix start>.pprof,
+// to the cpuprofile directory until the returned stop is called (no-op
+// without the key). It is diagnostic only: it changes nothing cxp does.
+func (s *teamsTestSeam) startCPUProfile(errOut io.Writer) (stop func()) {
+	if s == nil || s.cpuProfileDir == "" {
+		return func() {}
+	}
+	if err := os.MkdirAll(s.cpuProfileDir, 0o755); err != nil {
+		_, _ = fmt.Fprintf(errOut, "cpuprofile: %v\n", err)
+		return func() {}
+	}
+	quit, done := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			f, err := os.Create(filepath.Join(s.cpuProfileDir, fmt.Sprintf("cpu-%d-%d.pprof", os.Getpid(), time.Now().Unix())))
+			if err == nil {
+				if err = pprof.StartCPUProfile(f); err != nil {
+					_ = f.Close()
+				}
+			}
+			if err != nil {
+				_, _ = fmt.Fprintf(errOut, "cpuprofile: %v\n", err)
+				return
+			}
+			t := time.NewTimer(teamsTestSeamCPUProfileEvery)
+			select {
+			case <-t.C:
+			case <-quit:
+			}
+			t.Stop()
+			pprof.StopCPUProfile()
+			_ = f.Close()
+			select {
+			case <-quit:
+				return
+			default:
+			}
+		}
+	}()
+	return func() { close(quit); <-done }
 }
