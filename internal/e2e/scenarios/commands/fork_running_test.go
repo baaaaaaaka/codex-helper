@@ -12,12 +12,13 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/steps"
 )
 
-// F-WRK-10 / F-CTL-13 / R-41 (rc.6 parity, minus the history import that
-// is batch A's): `helper fork` is accepted while a turn runs. The fork is
-// cut at the last completed turn (the running one is not copied), the
-// original chat gets "Fork requested" and then exactly one "Fork complete"
-// with the new chat's link, the running turn finishes in the original chat
-// only, and the fork works on its own thread.
+// F-WRK-10 / F-CTL-13 / R-41 (rc.6 parity): `helper fork` is accepted
+// while a turn runs. The fork is cut at the last completed turn: the fork
+// chat gets the history up to it (not the running prompt), then the
+// marker; the original chat gets "Fork requested" and then exactly one
+// "Fork complete" with the new chat's link, after the marker; the running
+// turn finishes in the original chat only, and the fork works on its own
+// thread.
 func TestForkWhileRunning(t *testing.T) {
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "FORK-RUNNING", harness.Options{
@@ -67,6 +68,12 @@ func TestForkWhileRunning(t *testing.T) {
 		return
 	}
 	s.WaitSUTMessage(fork.ID, "Forked from", steps.CommandTimeout)
+	s.WaitSUTMessage(control.ID, "Work chat created: s002", steps.CommandTimeout)
+	if len(first.Tokens) > 0 {
+		forkHistoryOnce(s, fork.ID, work.ID, control.ID, "s002", "Please answer "+first.Tokens[0], first.Answer)
+	}
+	n := len(helperSeqs(s, fork.ID, running))
+	s.Check("F-WRK-10 the running turn is not in the fork's history", n == 0, "0", fmt.Sprint(n), s.Transcript(fork.ID, 6)...)
 	s.WaitPolled(fork.ID, forkSeq, steps.CommandTimeout)
 	inFork, okFork := ask(s, fork.ID, "infork")
 	s.Check("R-41 a prompt in the fork runs on a new thread", okFork && inFork.ThreadID != "" && inFork.ThreadID != first.ThreadID,
@@ -80,7 +87,7 @@ func TestForkWhileRunning(t *testing.T) {
 		"1 answer in the original, 0 in the fork, 1 Codex call",
 		fmt.Sprintf("original=%d fork=%d calls=%d", len(steps.AnswerPosts(s, work.ID, running)), len(steps.AnswerPosts(s, fork.ID, running)), len(s.Codex.CallsWithToken(running))),
 		s.Transcript(work.ID, 12)...)
-	n := len(s.SUTMessagesContaining(work.ID, "Fork complete"))
+	n = len(s.SUTMessagesContaining(work.ID, "Fork complete"))
 	s.Check("F-CTL-13 exactly one completion notice", n == 1, "1", fmt.Sprint(n))
 	leaks := steps.InternalLeaks(s, reply)
 	s.Check("the fork request reply carries no internal ids or paths", len(leaks) == 0, "none", fmt.Sprint(leaks))

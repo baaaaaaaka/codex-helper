@@ -95,7 +95,7 @@
    | <p>⏳ Codex is working. Request accepted.</p>
 -- <msg:9> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Fork requested. I fixed the parent cutoff and am preparing the new chat; I will send its link when it is ready.</p>
+   | <p>⏳ Fork requested. I fixed the parent cutoff and am preparing the new chat; I will send its link only after the visible history is confirmed.</p>
 -- <msg:10> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>✅ Fork complete. Open the new Codex chat:<br>
@@ -110,16 +110,26 @@
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Forked from s001: this chat continues a copy of that session; s001 itself is unchanged. Send <code>helper help</code> for commands.</p>
--- <msg:2> owner (html)
+-- <msg:2> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
+   | <p>Please answer E2E-FORKRUNNING-before-2</p>
+-- <msg:3> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>E2EANSWER-<n> answer for E2E-FORKRUNNING-before-2</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+-- <msg:4> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>History import complete. The new Codex chat is ready.</p>
+-- <msg:5> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Please answer E2E-FORKRUNNING-infork-3</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>Please answer E2E-FORKRUNNING-infork-3</p>
--- <msg:3> helper (html)
+-- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:4> helper (html)
+-- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-FORKRUNNING-infork-3</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>

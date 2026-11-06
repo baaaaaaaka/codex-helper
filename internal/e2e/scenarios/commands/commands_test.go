@@ -77,8 +77,10 @@ func askNotified(s *harness.Scenario, controlID, chatID, label string) (harness.
 }
 
 // `new` then `helper fork`: the fork gets its own chat and a new Codex
-// thread forked from the original; both chats keep working on their own
-// threads, and the fork does not replay the original's history.
+// thread forked from the original; the fork chat gets the original's
+// visible history once, then "History import complete", and only then
+// the original chat gets "Fork complete" with the link (rc.6); both chats
+// keep working on their own threads.
 func TestNewAndFork(t *testing.T) {
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "CMD-FORK", harness.Options{
@@ -117,6 +119,12 @@ func TestNewAndFork(t *testing.T) {
 	}
 	intro, introOK := s.WaitSUTMessage(fork.ID, "Forked from", steps.CommandTimeout)
 	s.Check("the fork chat says what it is", introOK, "\"Forked from …\"", clip(intro.PlainText(), 120))
+	done, doneOK := replyAfter(s, work.ID, forkSeq, "Fork complete", steps.CommandTimeout)
+	s.Check("the original chat gets the fork's link", doneOK, "✅ Fork complete …", clip(done, 160))
+	s.WaitSUTMessage(control.ID, "Work chat created: s002", steps.CommandTimeout)
+	if len(first.Tokens) > 0 {
+		forkHistoryOnce(s, fork.ID, work.ID, control.ID, "s002", "Please answer "+first.Tokens[0], first.Answer)
+	}
 	s.WaitPolled(fork.ID, forkSeq, steps.CommandTimeout) // the SUT reads the new chat before the prompt
 
 	inFork, okFork := ask(s, fork.ID, "infork")
@@ -126,11 +134,12 @@ func TestNewAndFork(t *testing.T) {
 	s.Check("the original chat continues on its own thread", okAgain && again.ThreadID == first.ThreadID,
 		"same thread as before", fmt.Sprintf("ok=%v now=%q before=%q", okAgain, again.ThreadID, first.ThreadID))
 	s.Settle(2*time.Second, 8*time.Second)
-	replayed := 0
-	if first.Answer != "" {
-		replayed = len(s.SUTMessagesContaining(fork.ID, first.Answer))
+	n := len(s.SUTMessagesContaining(fork.ID, first.Answer))
+	s.Check("the fork's history is not posted again by its own turns", first.Answer != "" && n == 1, "1 copy of the original answer", fmt.Sprint(n), s.Transcript(fork.ID, 8)...)
+	if len(again.Tokens) > 0 {
+		n = len(s.SUTMessagesContaining(fork.ID, again.Tokens[0]))
+		s.Check("the original's later turns stay out of the fork", n == 0, "0", fmt.Sprint(n))
 	}
-	s.Check("the fork does not replay the original's history", replayed == 0, "0 copies of the original answer", fmt.Sprint(replayed), s.Transcript(fork.ID, 8)...)
 	leaks := steps.InternalLeaks(s, intro.PlainText()+" "+reply)
 	s.Check("fork replies carry no internal ids or paths", len(leaks) == 0, "none", fmt.Sprint(leaks))
 }
