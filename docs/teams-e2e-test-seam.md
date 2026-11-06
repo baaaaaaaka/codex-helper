@@ -20,6 +20,7 @@ separated by `;`:
 | `timing` | `production` (default) or `fast:<duration>` | `fast:250ms` shortens the poll and mirror cadences to multiples of 250 ms (`engine.FastTiming`) and scales the account read rate with it |
 | `timing.<Knob>` | a positive duration | shortens one user-visible wait: `SilenceHint`, `SilenceStuck`, `StallLimit`, `DuplicateFor`, `Heartbeat`, `CapacityRetry`, `CapacityBackoff`, `RefusalRecheck`, `Takeover` (the stale bound of the shared-home lease; its other intervals scale with it) |
 | `hostname` | a name | the host identity used for the store owner, per-host files and the default machine label, so two helpers in one container act as two hosts sharing one home |
+| `cpuprofile` | an absolute directory | diagnostic: the helper writes consecutive one-minute CPU profiles there (`cpu-<pid>-<unix start>.pprof`); used by the real-data shadow run (`E2E_SHADOW_CPUPROFILE`) |
 
 ## Why it cannot be enabled by accident
 
@@ -36,8 +37,8 @@ separated by `;`:
 ## What it must never change
 
 What cxp selects, sends, renders or decides. The seam only changes where
-the requests go, how long the waits are, and which host name cxp believes
-it runs on. A rewrite of the helper keeps the same seam (the same variable,
+the requests go, how long the waits are, which host name cxp believes
+it runs on, and (diagnostic) whether it writes CPU profiles. A rewrite of the helper keeps the same seam (the same variable,
 keys and knob names, mapped to its own settings) and runs the same suite.
 
 ## Former test hooks and where they went

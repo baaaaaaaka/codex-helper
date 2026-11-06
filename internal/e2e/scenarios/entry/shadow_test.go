@@ -35,7 +35,12 @@ import (
 //	E2E_SHADOW_IDLE        idle observation after the drain (default 10m)
 //	E2E_SHADOW_KILL_AFTER  posts before the SIGKILL (kill mode, default 800)
 //	E2E_SHADOW_LIVE_AFTER  posts before the injection (live mode, default 1500)
+//	E2E_SHADOW_CPUPROFILE  a directory for the helper's one-minute CPU
+//	                       profiles (seam cpuprofile; phases.json has the
+//	                       phase times to select them)
 const (
+	envShadowCPUProfile = "E2E_SHADOW_CPUPROFILE"
+
 	envShadowLiveAfter = "E2E_SHADOW_LIVE_AFTER"
 	envShadowStore     = "E2E_SHADOW_STORE"
 	envShadowSeed      = "E2E_SHADOW_SEED"
@@ -99,7 +104,7 @@ func TestShadowRealData(t *testing.T) {
 		Title:      "shadow run on the owner's real store and sessions: " + mode,
 		Budget:     4 * time.Hour,
 		NoStart:    true,
-		Seam:       harness.Seam{ProductionTiming: true},
+		Seam:       harness.Seam{ProductionTiming: true, CPUProfile: os.Getenv(envShadowCPUProfile)},
 		Args:       []string{"--machine-registry"},
 		UserEnv:    map[string]string{"CODEX_HOME": home},
 		Golden:     harness.GoldenOptions{Skip: "opt-in shadow run on the owner's private data: its transcript is not committed"},
@@ -175,6 +180,7 @@ func TestShadowRealData(t *testing.T) {
 	drained := time.Since(drainStart)
 	asum := summarizeCPU(active)
 	phases["drain_s"] = drained.Seconds()
+	phases["drain_unix"] = []int64{drainStart.Unix(), time.Now().Unix()}
 	phases["drain_cpu"] = map[string]any{"samples": len(active.perSec), "mean_pct": asum.mean, "p99_pct": asum.p99, "max_pct": asum.max, "total_cpu_s": asum.totalSec}
 	s.Note("drain %s (%s); CPU mean %.2f%% p99 %.1f%% max %.1f%% of a core, total %.1fs", drained.Round(time.Second), lag, asum.mean, asum.p99, asum.max, asum.totalSec)
 	s.Check("the catch-up drains", lag == "", "drained", lag)
@@ -196,7 +202,9 @@ func TestShadowRealData(t *testing.T) {
 
 	// Idle: no write at all, reads recorded.
 	mark := shadowSeq(s)
+	idleStart := time.Now()
 	isamples := sampleCPU(pid, idle, nil)
+	phases["idle_unix"] = []int64{idleStart.Unix(), time.Now().Unix()}
 	isum := summarizeCPU(isamples)
 	iw, ir, ih := shadowRequests(s, mark)
 	phases["idle_s"] = idle.Seconds()
@@ -204,6 +212,7 @@ func TestShadowRealData(t *testing.T) {
 	phases["idle_reads"] = ir
 	phases["idle_heartbeats"] = ih
 	phases["idle_cpu"] = map[string]any{"mean_pct": isum.mean, "p99_pct": isum.p99, "max_pct": isum.max, "total_cpu_s": isum.totalSec}
+	phases["idle_cpu_per_sec"] = isamples.perSec
 	s.Check("no write in the idle window after the drain", len(iw) == 0, "0", fmt.Sprint(iw))
 	s.Check("idle: registry heartbeats only at the heartbeat rate", ih <= shadowHeartbeatsMax(idle, 0),
 		fmt.Sprintf("<= %d", shadowHeartbeatsMax(idle, 0)), fmt.Sprint(ih))
