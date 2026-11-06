@@ -512,7 +512,8 @@ func serveTeamsNewCore(ctx context.Context, out, errOut io.Writer, root *rootOpt
 		case <-runCtx.Done():
 		}
 	}()
-	go notifier.watch(runCtx)
+	stamper := &teamsPollStamper{dir: dir, host: host, version: cfg.Version, lastRead: func() time.Time { return e.Snapshot().LastRead }}
+	go notifier.watch(runCtx, stamper.tick)
 	gatewayFailed := make(chan struct{})
 	if gatewayDone != nil {
 		go func() {

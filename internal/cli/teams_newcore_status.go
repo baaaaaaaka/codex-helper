@@ -47,6 +47,7 @@ func writeTeamsCoreStoreStatus(out io.Writer, now time.Time) {
 	if view.Remote != "" {
 		// Only the host whose helper uses the store opens it.
 		_, _ = fmt.Fprintln(out, view.ownerLine(now))
+		_, _ = fmt.Fprintln(out, teamsLastPollLine(view, now))
 		_, _ = fmt.Fprintf(out, "Store details: in use by the helper on %s (run `cxp teams status` there); this host stands by\n", view.Remote)
 		return
 	}
@@ -61,8 +62,11 @@ func writeTeamsCoreStoreStatus(out io.Writer, now time.Time) {
 	}
 	defer st.Close()
 	lines, err := teamsNewCoreStatusLines(st, view, now)
-	for _, l := range lines {
+	for i, l := range lines {
 		_, _ = fmt.Fprintln(out, l)
+		if i == 0 && view.Info.Exists {
+			_, _ = fmt.Fprintln(out, teamsLastPollLine(view, now)) // after the owner
+		}
 	}
 	if err != nil {
 		_, _ = fmt.Fprintf(out, "Store read error: %v\n", err)
@@ -77,7 +81,7 @@ func printTeamsCoreStatus(out io.Writer, now time.Time) error {
 		_, _ = fmt.Fprintln(out, line)
 	}
 	_, _ = fmt.Fprintln(out, "Teams helper")
-	_, _ = fmt.Fprintf(out, "Version: %s\n", buildVersion())
+	_, _ = fmt.Fprintf(out, "Installed version: %s\n", buildVersion())
 	cfg, err := chteams.ResolveAuthConfig("")
 	switch {
 	case err != nil:
@@ -137,6 +141,9 @@ func teamsNewCoreStatusLines(st *corestore.Store, view teamsStoreView, now time.
 		return lines, err
 	}
 	add("Running version: %s", firstNonEmptyString(s.RunningVersion, "unknown"))
+	if line := teamsPendingVersionLine(view, s.RunningVersion, now); line != "" {
+		add("%s", line)
+	}
 	switch {
 	case s.UpdateInstalled != "":
 		add("Helper update: %s installed, pending the restart that activates it", s.UpdateInstalled)
