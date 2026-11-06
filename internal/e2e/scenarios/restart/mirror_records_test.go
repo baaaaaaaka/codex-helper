@@ -29,9 +29,9 @@ import (
 // 16 MiB line limit), a malformed line and a record type nobody knows,
 // then the turn's commentary and answer. The prompt text, commentary and
 // answer each arrive once and nothing of the bulk reaches Teams. The next
-// turn's answer record is written in two pieces with a pause in between:
-// nothing is posted from the first piece, and the whole answer arrives
-// once after the second.
+// turn's answer records are written in pieces that end inside each
+// record, with pauses in between: no answer is posted without its end,
+// and the whole answer arrives once.
 func TestMirrorSurvivesBadRecords(t *testing.T) {
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "MIR-BAD-RECORDS", harness.Options{
@@ -102,19 +102,41 @@ func TestMirrorSurvivesBadRecords(t *testing.T) {
 	must(err)
 	rest, err := r.RenderFinish(open3, turn3)
 	must(err)
-	cut := bytes.Index(rest, []byte("then more text")) // inside the first answer record
-	if cut <= 0 {
+	// Codex writes the answer in three records (item_completed, the
+	// response item, task_complete): each is cut in the middle, so a
+	// reader that consumes a half-written tail loses all of them.
+	var cuts []int
+	for off := 0; off < len(rest); {
+		end := bytes.IndexByte(rest[off:], '\n')
+		if end < 0 {
+			end = len(rest) - off
+		}
+		if i := bytes.Index(rest[off:off+end], []byte("then more text")); i > 0 {
+			cuts = append(cuts, off+i)
+		}
+		off += end + 1
+	}
+	if len(cuts) == 0 {
 		t.Fatal("answer text not found in the rendered records")
 	}
-	must(r.AppendRaw(rest[:cut]))
-	s.WaitFor("the prompt of the turn being written is mirrored", 20*time.Second, func() (bool, string) {
-		return steps.UserRecords(s, chat.ID, "And now? "+p3) > 0, "not yet"
-	})
-	// Several mirror passes over the half-written record.
-	time.Sleep(2 * time.Second)
-	half := len(s.SUTMessagesContaining(chat.ID, "First half of the answer"))
-	s.Check("nothing of a half-written record is posted", half == 0, "0 messages", fmt.Sprint(half), s.Transcript(chat.ID, 6)...)
-	must(r.AppendRaw(rest[cut:]))
+	s.Note("the answer's records are written in %d pieces", len(cuts)+1)
+	prev := 0
+	half := 0
+	for i, cut := range cuts {
+		must(r.AppendRaw(rest[prev:cut]))
+		prev = cut
+		if i == 0 {
+			s.WaitFor("the prompt of the turn being written is mirrored", 20*time.Second, func() (bool, string) {
+				return steps.UserRecords(s, chat.ID, "And now? "+p3) > 0, "not yet"
+			})
+		}
+		// Several mirror passes over the half-written record.
+		time.Sleep(2 * time.Second)
+		// A completed record may be mirrored already; a cut one may not.
+		half += len(s.SUTMessagesContaining(chat.ID, "First half of the answer")) - len(s.SUTMessagesContaining(chat.ID, a3))
+	}
+	s.Check("nothing of a half-written record is posted", half == 0, "no answer without its end", fmt.Sprint(half), s.Transcript(chat.ID, 6)...)
+	must(r.AppendRaw(rest[prev:]))
 	s.WaitFor("the completed answer is mirrored", 20*time.Second, func() (bool, string) {
 		return len(s.SUTMessagesContaining(chat.ID, a3)) > 0, "not yet"
 	})

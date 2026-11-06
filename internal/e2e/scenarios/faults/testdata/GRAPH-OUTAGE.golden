@@ -1,4 +1,4 @@
-# GRAPH-OUTAGE: Graph returns 503 to everything for 25 s: no restart, no storm; afterwards the prompt is answered once and new sessions get one chat each
+# GRAPH-OUTAGE: Graph returns 503 to everything for 25 s: no restart, no storm; afterwards the prompt is answered once and a new local session gets one chat
 # cxp black-box transcript; volatile values are numbered placeholders
 
 == chat <chat:1> "🏠 Codex Control - e2ehost"
@@ -11,7 +11,7 @@
    | <p><strong>💬 New local Codex chat detected</strong></p>
    | <p><strong>Chat:</strong> s001 · Probe session</p>
    | <p><strong>Next:</strong> Open this chat to watch the answer and continue from the full local context.</p>
-   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open chat</a> (https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
+   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open chat</a> (https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
    mention 0: owner "E2E Owner"
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
@@ -20,25 +20,25 @@
    [version 1]
    | <p>new <root>/work/outage</p>
 -- <msg:4> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>✅ Work chat created: s002</p>
-   | <p>Open this Teams link and send your task there:<br>
-   | <a href="https://teams.microsoft.com/l/chat/<chat:5>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:5>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
-   | <p>If Teams does not show it right away, search for: s002</p>
--- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>✅ Codex finished</strong></p>
    | <p><strong>Chat:</strong> s001 · Probe session</p>
    | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
-   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
+   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
    mention 0: owner "E2E Owner"
+-- <msg:5> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>✅ Work chat created: s002</p>
+   | <p>Open this Teams link and send your task there:<br>
+   | <a href="https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
+   | <p>If Teams does not show it right away, search for: s002</p>
 -- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>✅ Codex finished</strong></p>
    | <p><strong>Chat:</strong> s002 · outage<br>
    | <strong>Request:</strong> Sent while Teams is down E2E-GRAPHOUTAGE-duringoutage-2</p>
    | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
-   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:5>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:5>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
+   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
    mention 0: owner "E2E Owner"
 -- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
@@ -49,24 +49,10 @@
    mention 0: owner "E2E Owner"
 -- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
-   | <p><strong>💬 New local Codex chat detected</strong></p>
-   | <p><strong>Chat:</strong> s004 · Local session 2 started during the outage</p>
-   | <p><strong>Next:</strong> Open this chat to watch the answer and continue from the full local context.</p>
-   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open chat</a> (https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
-   mention 0: owner "E2E Owner"
--- <msg:9> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>✅ Codex finished</strong></p>
    | <p><strong>Chat:</strong> s003 · Local session 1 started during the outage</p>
    | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
    | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
-   mention 0: owner "E2E Owner"
--- <msg:10> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
-   | <p><strong>✅ Codex finished</strong></p>
-   | <p><strong>Chat:</strong> s004 · Local session 2 started during the outage</p>
-   | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
-   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
    mention 0: owner "E2E Owner"
 
 == chat <chat:2> "💬 e2ehost - Local session 1 started during the outage"
@@ -82,20 +68,7 @@
    | <p>Local answer E2E-GRAPHOUTAGE-tui1-3</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
-== chat <chat:3> "💬 e2ehost - Local session 2 started during the outage"
-   type: meeting; members: owner
--- <msg:1> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Local Codex chat detected: s004.</p>
--- <msg:2> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
-   | <p>Local session 2 started during the outage</p>
--- <msg:3> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
-   | <p>Local answer E2E-GRAPHOUTAGE-tui2-4</p>
-   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
-
-== chat <chat:4> "💬 e2ehost - Probe session"
+== chat <chat:3> "💬 e2ehost - Probe session"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -108,7 +81,7 @@
    | <p>Probe answer E2E-GRAPHOUTAGE-probe-1</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
-== chat <chat:5> "💬 e2ehost - Sent while Teams is down E2E-GRAPHOUTAGE-duringoutage-2"
+== chat <chat:4> "💬 e2ehost - Sent while Teams is down E2E-GRAPHOUTAGE-duringoutage-2"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>

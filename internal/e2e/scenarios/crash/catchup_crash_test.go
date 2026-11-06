@@ -63,6 +63,7 @@ func TestCatchUpSurvivesCrashes(t *testing.T) {
 	s.Settle(2*time.Second, 10*time.Second)
 
 	s.StopSUT()
+	downSeq, downAt := s.Graph.LastSeq(), time.Now()
 	const turns = 20
 	add(live, "Live", turns)
 	down := &session{r: harness.NewRollout(t, s.Env, s.Env.WorkDir(t, "catchup-down"))}
@@ -135,6 +136,27 @@ func TestCatchUpSurvivesCrashes(t *testing.T) {
 		}
 		s.Check(c.name+": records in rollout order", inOrder, "increasing message positions", fmt.Sprint(at))
 	}
+	// Everything after the stop is catch-up: no @mention anywhere, no
+	// card (the catch-up-silent invariant exempts a chat that also had
+	// live records, as the live session's has).
+	var loud []string
+	for _, c := range s.Graph.Chats() {
+		for _, m := range s.SUTMessages(c.ID) {
+			if m.RequestSeq > downSeq && (len(m.Mentions) > 0 || strings.Contains(m.Content, "<at ")) {
+				loud = append(loud, fmt.Sprintf("%s: %.80q", m.Instance, harness.NormalizeSpace(m.PlainText())))
+			}
+		}
+	}
+	for _, c := range s.Graph.WorkflowCards() {
+		if c.At.After(downAt) {
+			loud = append(loud, "card: "+strings.Join(c.Texts, " / "))
+		}
+	}
+	n := len(loud)
+	if n > 3 {
+		loud = append(loud[:3], "…")
+	}
+	s.Check("the restarts notify nobody", n == 0, "no @mention, no card after the stop", fmt.Sprintf("%d: %s", n, strings.Join(loud, "; ")))
 	s.Check("catch-up never runs Codex", len(s.Codex.Calls()) == 0, "0", fmt.Sprint(len(s.Codex.Calls())))
 }
 

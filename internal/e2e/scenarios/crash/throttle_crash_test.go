@@ -13,8 +13,9 @@ import (
 )
 
 // A write throttle (429 with Retry-After) outlives a crash: the restarted
-// helper sends no Graph write before the Retry-After ends, then delivers
-// the answer once (R-12, R-2).
+// helper sends no Graph write before the Retry-After ends, neither the
+// throttled answer nor anything for a prompt that arrives meanwhile in
+// another chat, then delivers both answers once (R-12, R-2).
 //
 // History: throttling storms, where restarts and retries ignored
 // Retry-After and kept the account throttled for hours (INC-06, U-I05;
@@ -25,12 +26,13 @@ func TestWriteThrottleSurvivesCrash(t *testing.T) {
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "THROTTLE-CRASH", harness.Options{
 		Guarantees: []string{"R-12", "R-2"},
-		Title:      "an answer POST gets 429 Retry-After 12 s, then SIGKILL and restart: no Graph write before the 12 s end, the answer arrives once",
+		Title:      "an answer POST gets 429 Retry-After 12 s, then SIGKILL, restart and a prompt in another chat: no Graph write before the 12 s end, each answer arrives once",
 		Budget:     90 * time.Second,
 	})
 	defer s.Finish()
 	control := steps.ReadyControlChat(s)
 	work, _ := steps.NewWorkChat(s, control, "throttlecrash")
+	other, _ := steps.NewWorkChat(s, control, "otherchat")
 	tok := s.Token("throttled")
 	const retryAfter = 12 * time.Second
 	fault := s.Graph.AddFault(fakegraph.Fault{
@@ -49,7 +51,12 @@ func TestWriteThrottleSurvivesCrash(t *testing.T) {
 	}
 	s.CrashSUT()
 	s.StartSUT()
+	// The throttle is account-wide (no scope header): it also holds the
+	// acknowledgement and answer of a prompt read after the restart.
+	tok2 := s.Token("meanwhile")
+	steps.MustPost(s, other.ID, "Another question during the throttle "+tok2)
 	steps.WaitAnswered(s, work.ID, tok, 45*time.Second)
+	steps.WaitAnswered(s, other.ID, tok2, 45*time.Second)
 	s.Settle(3*time.Second, 12*time.Second)
 
 	until := throttledAt.Add(retryAfter)
@@ -62,13 +69,15 @@ func TestWriteThrottleSurvivesCrash(t *testing.T) {
 	}
 	s.Check("no Graph write before the Retry-After ends, across the restart", len(early) == 0,
 		fmt.Sprintf("no write within %s of the 429", retryAfter), strings.Join(early, "; "))
-	n := 0
-	for _, r := range steps.AnswerPosts(s, work.ID, tok) {
-		if r.Status >= 200 && r.Status < 300 {
-			n++
+	for _, c := range []struct{ name, chat, tok string }{{"the throttled answer", work.ID, tok}, {"the answer of the prompt sent meanwhile", other.ID, tok2}} {
+		n := 0
+		for _, r := range steps.AnswerPosts(s, c.chat, c.tok) {
+			if r.Status >= 200 && r.Status < 300 {
+				n++
+			}
 		}
+		calls := len(s.Codex.CallsWithToken(c.tok))
+		s.Check(c.name+" is posted once and Codex ran once", n == 1 && calls == 1,
+			"1 accepted answer POST, 1 Codex call", fmt.Sprintf("%d accepted answer POSTs, %d calls", n, calls), s.Transcript(c.chat, 8)...)
 	}
-	calls := len(s.Codex.CallsWithToken(tok))
-	s.Check("the answer is posted once and Codex ran once", n == 1 && calls == 1,
-		"1 accepted answer POST, 1 Codex call", fmt.Sprintf("%d accepted answer POSTs, %d calls", n, calls), s.Transcript(work.ID, 8)...)
 }
