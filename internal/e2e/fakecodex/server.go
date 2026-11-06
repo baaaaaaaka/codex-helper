@@ -10,6 +10,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -29,6 +31,8 @@ type Config struct {
 	Brain       string // base URL of the brain
 	Kind        string
 	Instance    string
+	// CodexHome is where config.toml is read ("" = no config).
+	CodexHome string
 	// Exit terminates the process (os.Exit); replaceable for tests.
 	Exit func(code int)
 }
@@ -40,8 +44,12 @@ type server struct {
 	outMu sync.Mutex
 	out   *bufio.Writer
 
-	mu       sync.Mutex
-	loaded   map[string]*Thread // threads started/resumed by this process
+	mu     sync.Mutex
+	loaded map[string]*Thread // threads started/resumed by this process
+	// mcp is, per loaded thread, the MCP servers of config.toml when this
+	// process loaded it: like real Codex, a loaded thread keeps the config
+	// it was loaded with until the process ends.
+	mcp      map[string][]string
 	rollouts map[string]*rollout.Writer
 	running  map[string]*runningTurn // by turn id
 	wg       sync.WaitGroup
@@ -87,6 +95,7 @@ func Serve(cfg Config) error {
 		http:     &http.Client{Transport: &http.Transport{Proxy: nil}},
 		out:      bufio.NewWriter(cfg.Out),
 		loaded:   map[string]*Thread{},
+		mcp:      map[string][]string{},
 		rollouts: map[string]*rollout.Writer{},
 		running:  map[string]*runningTurn{},
 	}
@@ -252,8 +261,10 @@ func (s *server) dispatch(msg message) (any, *rpcError) {
 		if err := s.cfg.Store.Save(t); err != nil {
 			return nil, invalid("thread/start: %v", err)
 		}
+		mcp := s.mcpServers()
 		s.mu.Lock()
 		s.loaded[t.ID] = t
+		s.mcp[t.ID] = mcp
 		s.mu.Unlock()
 		s.notify("thread/started", map[string]any{"thread": threadJSON(t, false)})
 		return map[string]any{"thread": threadJSON(t, false), "model": "gpt-5-codex", "modelProvider": "openai", "cwd": t.Cwd}, nil
@@ -277,11 +288,13 @@ func (s *server) dispatch(msg message) (any, *rpcError) {
 				return nil, invalid("%s", strings.ReplaceAll(dec.Reject, "{thread}", id))
 			}
 		}
+		mcp := s.mcpServers()
 		s.mu.Lock()
 		if cur, ok := s.loaded[id]; ok {
 			t = cur
 		} else {
 			s.loaded[id] = t
+			s.mcp[id] = mcp
 		}
 		s.mu.Unlock()
 		include := true
@@ -426,6 +439,7 @@ func (s *server) startTurn(p map[string]any) (any, *rpcError) {
 	s.mu.Lock()
 	t, ok := s.loaded[threadID]
 	busy := ok && t.Active()
+	mcp := s.mcp[threadID]
 	s.mu.Unlock()
 	if !ok {
 		// Real Codex 0.166 text for a thread this process has not loaded
@@ -471,7 +485,7 @@ func (s *server) startTurn(p map[string]any) (any, *rpcError) {
 	plan, err := s.begin(BeginRequest{
 		Instance: s.cfg.Instance, Kind: s.cfg.Kind, Pid: os.Getpid(),
 		ThreadID: threadID, TurnID: turnID, ClientID: clientID, Cwd: cwd, Prompt: prompt, Images: images,
-		Model: model, Effort: effort, Exe: executable(),
+		Model: model, Effort: effort, Exe: executable(), MCPServers: mcp,
 	})
 	if err != nil {
 		return nil, &rpcError{Code: -32603, Message: "fake codex brain unavailable: " + err.Error()}
@@ -756,8 +770,10 @@ func (s *server) fork(p map[string]any) (any, *rpcError) {
 		return nil, invalid("thread/fork: %v", err)
 	}
 	if ephemeral, _ := p["ephemeral"].(bool); !ephemeral {
+		mcp := s.mcpServers()
 		s.mu.Lock()
 		s.loaded[child.ID] = child
+		s.mcp[child.ID] = mcp
 		s.mu.Unlock()
 	}
 	s.notify("thread/started", map[string]any{"thread": threadJSON(child, false)})
@@ -832,4 +848,23 @@ func executable() string {
 		return ""
 	}
 	return p
+}
+
+// mcpServerRE matches a `[mcp_servers.<name>]` table header of config.toml.
+var mcpServerRE = regexp.MustCompile(`(?m)^\s*\[mcp_servers\.("?)([^".\]]+)("?)\]\s*$`)
+
+// mcpServers reads the MCP server names of $CODEX_HOME/config.toml now.
+func (s *server) mcpServers() []string {
+	if s.cfg.CodexHome == "" {
+		return nil
+	}
+	data, err := os.ReadFile(filepath.Join(s.cfg.CodexHome, "config.toml"))
+	if err != nil {
+		return nil
+	}
+	var names []string
+	for _, m := range mcpServerRE.FindAllStringSubmatch(string(data), -1) {
+		names = append(names, m[2])
+	}
+	return names
 }

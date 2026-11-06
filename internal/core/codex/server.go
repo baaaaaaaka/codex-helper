@@ -35,6 +35,11 @@ type Config struct {
 	// Configure, when set, adjusts the command before it starts (the
 	// caller's environment and execution identity); an error fails Start.
 	Configure func(cmd *exec.Cmd) error
+	// ConfigFile is the Codex config the server reads when it starts
+	// ($CODEX_HOME/config.toml: MCP servers, providers, features).
+	// Pool.AcquireCurrent replaces an idle server started before it
+	// changed. "" = not watched.
+	ConfigFile string
 }
 
 // ErrExited is returned for calls on (or turns of) a server that exited.

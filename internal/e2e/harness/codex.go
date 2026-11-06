@@ -48,6 +48,9 @@ type CodexCall struct {
 	Pid int
 	// Exe is the Codex executable that ran the call ("" in-process).
 	Exe string
+	// MCPServers are the MCP servers of config.toml the turn runs with
+	// (the app-server's thread config; nil in-process).
+	MCPServers []string
 }
 
 // HasToken reports whether the prompt contained token.

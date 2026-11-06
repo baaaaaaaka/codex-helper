@@ -457,6 +457,9 @@ func serveTeamsNewCore(ctx context.Context, out, errOut io.Writer, root *rootOpt
 	server := codex.Config{
 		Args: []string{"--analytics-default-enabled"},
 		Env:  []string{"CODEX_HOME=" + paths.CodexDir},
+		// A changed config.toml (e.g. MCP servers) applies from the next
+		// turn: the conversation's idle app-server is replaced.
+		ConfigFile: filepath.Join(paths.CodexDir, "config.toml"),
 	}
 	extra, err := teamsNewCoreCodexArgs(opts.codexArgs, errOut)
 	if err != nil {

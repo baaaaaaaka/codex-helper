@@ -43,6 +43,9 @@ type BeginRequest struct {
 	// Exe is the path of the Codex executable that runs the app-server
 	// (which installation the helper chose).
 	Exe string `json:"exe,omitempty"`
+	// MCPServers are the MCP servers of config.toml the thread was loaded
+	// with in this process (which config the turn runs with).
+	MCPServers []string `json:"mcpServers,omitempty"`
 }
 
 // ResumeRequest is sent by the app-server when a thread/resume arrives for a
