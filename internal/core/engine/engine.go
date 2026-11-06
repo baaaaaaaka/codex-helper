@@ -281,6 +281,10 @@ type Engine struct {
 	// writeWaiters counts writers in waitWrite: the sender leaves the
 	// account's write tokens to them (sender.go).
 	writeWaiters atomic.Int32
+	// readWaiters counts chat edits in waitRead (edits.go): the receiver
+	// leaves the account's read tokens to them before its background
+	// reads; live reads still go first (receive.go dispatchReads).
+	readWaiters atomic.Int32
 	// starting counts turn starts between the drain check and running
 	// being set (guarded by mu).
 	starting     int

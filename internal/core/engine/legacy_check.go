@@ -334,6 +334,14 @@ func (e *Engine) readHistory(ctx context.Context, chat string, since time.Time,
 			}
 			continue
 		}
+		if e.readWaiters.Load() > 0 {
+			// A chat edit waits for a read token: this background read
+			// leaves it the next one (edits.go waitRead).
+			if !sleepCtx(ctx, e.t.Tick) {
+				return "", ctx.Err()
+			}
+			continue
+		}
 		if ok, wait := e.readTokens.take(); !ok {
 			if !sleepCtx(ctx, max(wait, e.t.Tick)) {
 				return "", ctx.Err()
