@@ -123,6 +123,12 @@ func TestHelperClose(t *testing.T) {
 	_, ok := ask(s, work.ID, "before")
 	s.Check("the chat answers before `helper close`", ok, "answered", fmt.Sprint(ok))
 	s.WaitSUTMessage(control.ID, "Codex finished", steps.CommandTimeout)
+	// The title follows the first answer; close only after it, or the
+	// retitle may be dropped with the closed chat (a golden race).
+	s.WaitFor("the work chat is retitled after the first answer", steps.CommandTimeout, func() (bool, string) {
+		c, _ := s.Graph.Chat(work.ID)
+		return strings.HasPrefix(c.Topic, "💬 "), c.Topic
+	})
 
 	got, ok := command(s, work.ID, "helper close", "Session closed")
 	want := "Session closed. The helper will no longer read or respond in this Teams chat. This chat remains visible in Teams. Use the 🏠 control chat to open or create another work chat."
