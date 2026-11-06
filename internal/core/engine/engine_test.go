@@ -237,7 +237,24 @@ func newRig(t *testing.T, tweak ...func(*Config)) *rig {
 	return r
 }
 
+// parallelRigs records the tests that already called t.Parallel through
+// parallelRig (a test may start its rig more than once).
+var parallelRigs sync.Map // *testing.T -> struct{}
+
+// parallelRig runs the test in parallel with the other rig tests. Each rig
+// owns its store file, fake channel, fake agent and engine, so rig tests
+// share nothing but the process; most of their time is spent waiting on the
+// per-chat send pace (Timing.ChatRate), not on the CPU. It is called before
+// the first engine of the test starts.
+func parallelRig(t *testing.T) {
+	t.Helper()
+	if _, dup := parallelRigs.LoadOrStore(t, struct{}{}); !dup {
+		t.Parallel()
+	}
+}
+
 func (r *rig) start() {
+	parallelRig(r.t)
 	st, err := store.Open(r.path)
 	if err != nil {
 		r.t.Fatal(err)

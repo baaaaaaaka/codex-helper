@@ -351,6 +351,9 @@ func TestUnknownAnswerCheckedAgainstHistoryOnce(t *testing.T) {
 		}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			// Each case owns its fixture copy, store, fake channel and
+			// engine; most of its time is the engine's per-chat send pace.
+			t.Parallel()
 			src := fixture(t, "v0120", "json")
 			const chat = "19:chat-s001@thread.v2"
 			ch := &cursorChannel{Fake: channeltest.New()}
