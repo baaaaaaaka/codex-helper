@@ -237,7 +237,9 @@ func (e *Engine) restartNotice(req restartRequest, text string, clear bool) {
 }
 
 // waitOutboxIdle waits (at most limit) until no outbox row is queued or
-// being sent. A row whose outcome is unknown does not hold it.
+// being sent and no owner notification waits for its final (notify.go: a
+// final's control-chat mention is queued once the final is sent). A row
+// whose outcome is unknown does not hold it.
 func (e *Engine) waitOutboxIdle(ctx context.Context, limit time.Duration) {
 	e.wakeSender()
 	deadline := time.Now().Add(limit)
@@ -245,7 +247,11 @@ func (e *Engine) waitOutboxIdle(ctx context.Context, limit time.Duration) {
 	defer t.Stop()
 	for time.Now().Before(deadline) {
 		n, err := e.st.OutboxCounts()
-		if err != nil || n["queued"]+n["sending"] == 0 {
+		if err != nil {
+			return
+		}
+		notify, _, err := e.st.Meta(metaNotify)
+		if err != nil || n["queued"]+n["sending"] == 0 && notify == "" {
 			return
 		}
 		select {
