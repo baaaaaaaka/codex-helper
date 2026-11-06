@@ -1,0 +1,369 @@
+# DELEG-RESTART: delegated task interrupted by a restart: not re-run, one terminal result
+# cxp black-box transcript; volatile values are numbered placeholders
+
+== chat <chat:1> "CXP Machine Inbox e2ehost"
+   type: meeting; members: owner
+-- <msg:1> cxp-cli (html)
+   | <p>CXP_DELEGATION_RECORD_V1 <b64:1></p>
+   record CXP_DELEGATION_RECORD_V1:
+   record| {
+   record|   "created_at": "<time:1>",
+   record|   "delegation_id": "del_<id:1>",
+   record|   "expires_at": "<time:2>",
+   record|   "hop_budget": 1,
+   record|   "inbox_generation": "<hex:1>",
+   record|   "inbox_ref": "cxp-inbox-<id:2>",
+   record|   "kind": "cxp.delegation.request.v1",
+   record|   "machine_id": "machine:<id:3>",
+   record|   "path": [
+   record|     "machine:<id:3>"
+   record|   ],
+   record|   "record_id": "rec_<id:4>",
+   record|   "source_key": "src_<id:5>",
+   record|   "source_session_id": "src-session-1",
+   record|   "source_turn_id": "src-turn-1",
+   record|   "spec": {
+   record|     "objective": "Run the long migration E2E-DELEGRESTART-deleg-long-1",
+   record|     "title": "E2E delegated task"
+   record|   },
+   record|   "spec_hash": "<hex:2>"
+   record| }
+-- <msg:2> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><code>CXP_DELEGATION_RECORD_V1 <b64:2></code></p>
+   record CXP_DELEGATION_RECORD_V1:
+   record| {
+   record|   "claim_epoch": 1,
+   record|   "claim_id": "claim_<id:6>",
+   record|   "created_at": "<time:3>",
+   record|   "delegation_id": "del_<id:1>",
+   record|   "inbox_generation": "<hex:1>",
+   record|   "inbox_ref": "cxp-inbox-<id:2>",
+   record|   "kind": "cxp.delegation.claim.v1",
+   record|   "machine_id": "machine:<id:3>",
+   record|   "record_id": "rec_<id:7>",
+   record|   "spec": {
+   record|     "objective": ""
+   record|   },
+   record|   "worker_instance_id": "w-<id:8>"
+   record| }
+-- <msg:3> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><code>CXP_DELEGATION_RECORD_V1 <b64:3></code></p>
+   record CXP_DELEGATION_RECORD_V1:
+   record| {
+   record|   "body": "Delegated worker accepted the task.",
+   record|   "claim_epoch": 1,
+   record|   "claim_id": "claim_<id:6>",
+   record|   "created_at": "<time:3>",
+   record|   "delegation_id": "del_<id:1>",
+   record|   "inbox_generation": "<hex:1>",
+   record|   "inbox_ref": "cxp-inbox-<id:2>",
+   record|   "kind": "cxp.delegation.status.v1",
+   record|   "machine_id": "machine:<id:3>",
+   record|   "payload_hash": "<hex:3>",
+   record|   "record_id": "rec_<id:9>",
+   record|   "spec": {
+   record|     "objective": ""
+   record|   },
+   record|   "status": "running",
+   record|   "worker_instance_id": "w-<id:8>"
+   record| }
+-- <msg:4> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><code>CXP_DELEGATION_RECORD_V1 <b64:4></code></p>
+   record CXP_DELEGATION_RECORD_V1:
+   record| {
+   record|   "body": "The delegated task was interrupted when the worker's helper restarted. It was not re-run; send it again if it is still needed.",
+   record|   "claim_epoch": 1,
+   record|   "claim_id": "claim_<id:6>",
+   record|   "created_at": "<time:4>",
+   record|   "delegation_id": "del_<id:1>",
+   record|   "inbox_generation": "<hex:1>",
+   record|   "inbox_ref": "cxp-inbox-<id:2>",
+   record|   "kind": "cxp.delegation.result.v1",
+   record|   "machine_id": "machine:<id:3>",
+   record|   "payload_hash": "<hex:4>",
+   record|   "record_id": "rec_<id:10>",
+   record|   "result_sequence": 1,
+   record|   "spec": {
+   record|     "objective": ""
+   record|   },
+   record|   "status": "blocked",
+   record|   "worker_instance_id": "w-<id:8>"
+   record| }
+
+== chat <chat:2> "CXP Machine Registry"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <p>CXP_REGISTRY_CARD_V1 <b64:5></p>
+   record CXP_REGISTRY_CARD_V1:
+   record| {
+   record|   "accepting": false,
+   record|   "aliases": [
+   record|     "<hostname>"
+   record|   ],
+   record|   "capabilities": [
+   record|     "cxp",
+   record|     "codex",
+   record|     "teams-helper",
+   record|     "teams-registry"
+   record|   ],
+   record|   "capability_fingerprint": "<hex:5>",
+   record|   "cxp_version": "v0.1.22",
+   record|   "draining": true,
+   record|   "expires_at": "<time:5>",
+   record|   "heartbeat_interval_seconds": 5,
+   record|   "host_label": "<hostname>",
+   record|   "inbox_generation": "<hex:1>",
+   record|   "inbox_ref": "cxp-inbox-<id:2>",
+   record|   "instance_id": "worker_machine:<id:3>_<pid:1>",
+   record|   "kind": "cxp.machine-card.v1",
+   record|   "load": {},
+   record|   "machine_id": "machine:<id:3>",
+   record|   "machine_label": "e2ehost",
+   record|   "platform": {
+   record|     "arch": "amd64",
+   record|     "os": "linux"
+   record|   },
+   record|   "protocol_versions": [
+   record|     "cxp-delegation-v1"
+   record|   ],
+   record|   "published_at": "<time:6>",
+   record|   "registry_key": "cxp-registry-<id:11>",
+   record|   "revision": <unix:1>,
+   record|   "sequence": <unix:1>,
+   record|   "skills": [
+   record|     "cxp"
+   record|   ],
+   record|   "ttl_seconds": 15
+   record| }
+   edited by heartbeats (count and earlier versions not recorded: timing)
+
+== chat <chat:3> "🏠 Codex Control - e2ehost"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
+
+== codex turns (per thread; threads by kind, directory and first prompt; turns in start order)
+-- thread <uuid:1> (work, cwd <root>/home)
+   turn: abandoned
+   prompt| You are Agent B completing a CXP cross-machine delegated task.
+   prompt|
+   prompt| Title: E2E delegated task
+   prompt|
+   prompt| Objective:
+   prompt| Run the long migration E2E-DELEGRESTART-deleg-long-1
+   prompt|
+   prompt| Return a concise final result for Agent A. Do not delegate this same task back to Agent A.
+
+== cli
+$ cxp delegate resolve --query e2ehost --json
+   exit 0
+   stdout| {
+   stdout|   "action": "start",
+   stdout|   "reason": "single_online_matching_candidate",
+   stdout|   "query": "e2ehost",
+   stdout|   "candidate_token": "<b64:6>",
+   stdout|   "new_thread_token": "<b64:7>",
+   stdout|   "valid_until": "<time:7>",
+   stdout|   "candidates": [
+   stdout|     {
+   stdout|       "machine_id": "machine:<id:3>",
+   stdout|       "instance_id": "worker_machine:<id:3>_<pid:2>",
+   stdout|       "label": "e2ehost",
+   stdout|       "host_label": "<hostname>",
+   stdout|       "aliases": [
+   stdout|         "<hostname>"
+   stdout|       ],
+   stdout|       "state": "online",
+   stdout|       "accepting": true,
+   stdout|       "inbox_ref": "cxp-inbox-<id:2>",
+   stdout|       "inbox_generation": "<hex:1>",
+   stdout|       "registry_generation": "<hex:6>",
+   stdout|       "card_revision": <unix:2>,
+   stdout|       "capability_fingerprint": "<hex:5>",
+   stdout|       "capabilities": [
+   stdout|         "cxp",
+   stdout|         "codex",
+   stdout|         "teams-helper",
+   stdout|         "teams-registry"
+   stdout|       ],
+   stdout|       "skills": [
+   stdout|         "cxp"
+   stdout|       ],
+   stdout|       "protocol_versions": [
+   stdout|         "cxp-delegation-v1"
+   stdout|       ],
+   stdout|       "confidence": 0.95,
+   stdout|       "matched_reasons": [
+   stdout|         "query matched machine alias or label"
+   stdout|       ],
+   stdout|       "candidate_token": "<b64:6>",
+   stdout|       "new_thread_token": "<b64:7>",
+   stdout|       "valid_until": "<time:7>"
+   stdout|     }
+   stdout|   ]
+   stdout| }
+$ cxp delegate start --candidate-token <b64:6> --task-file <root>/task-E2E-DELEGRESTART-deleg-long-1.json --source-session src-session-1 --source-turn src-turn-1 --json
+   exit 0
+   stdout| {
+   stdout|   "delegation_id": "del_<id:1>",
+   stdout|   "status": "open",
+   stdout|   "machine_id": "machine:<id:3>",
+   stdout|   "idempotent": false,
+   stdout|   "state": {
+   stdout|     "delegation_id": "del_<id:1>",
+   stdout|     "status": "open",
+   stdout|     "request": {
+   stdout|       "kind": "cxp.delegation.request.v1",
+   stdout|       "record_id": "rec_<id:4>",
+   stdout|       "delegation_id": "del_<id:1>",
+   stdout|       "source_key": "src_<id:5>",
+   stdout|       "source_session_id": "src-session-1",
+   stdout|       "source_turn_id": "src-turn-1",
+   stdout|       "path": [
+   stdout|         "machine:<id:3>"
+   stdout|       ],
+   stdout|       "hop_budget": 1,
+   stdout|       "machine_id": "machine:<id:3>",
+   stdout|       "inbox_ref": "cxp-inbox-<id:2>",
+   stdout|       "inbox_generation": "<hex:1>",
+   stdout|       "spec": {
+   stdout|         "title": "E2E delegated task",
+   stdout|         "objective": "Run the long migration E2E-DELEGRESTART-deleg-long-1"
+   stdout|       },
+   stdout|       "spec_hash": "<hex:2>",
+   stdout|       "created_at": "<time:1>",
+   stdout|       "expires_at": "<time:2>"
+   stdout|     }
+   stdout|   },
+   stdout|   "transport": "inbox"
+   stdout| }
+$ cxp delegate resolve --query e2ehost --json
+   exit 0
+   stdout| {
+   stdout|   "action": "do_not_delegate",
+   stdout|   "reason": "no_online_matching_candidate",
+   stdout|   "query": "e2ehost",
+   stdout|   "candidates": [
+   stdout|     {
+   stdout|       "machine_id": "machine:<id:3>",
+   stdout|       "instance_id": "worker_machine:<id:3>_<pid:2>",
+   stdout|       "label": "e2ehost",
+   stdout|       "host_label": "<hostname>",
+   stdout|       "aliases": [
+   stdout|         "<hostname>"
+   stdout|       ],
+   stdout|       "state": "online",
+   stdout|       "accepting": false,
+   stdout|       "inbox_ref": "cxp-inbox-<id:2>",
+   stdout|       "inbox_generation": "<hex:1>",
+   stdout|       "registry_generation": "<hex:6>",
+   stdout|       "card_revision": <unix:3>,
+   stdout|       "capability_fingerprint": "<hex:5>",
+   stdout|       "capabilities": [
+   stdout|         "cxp",
+   stdout|         "codex",
+   stdout|         "teams-helper",
+   stdout|         "teams-registry"
+   stdout|       ],
+   stdout|       "skills": [
+   stdout|         "cxp"
+   stdout|       ],
+   stdout|       "protocol_versions": [
+   stdout|         "cxp-delegation-v1"
+   stdout|       ],
+   stdout|       "confidence": 0.95,
+   stdout|       "matched_reasons": [
+   stdout|         "query matched machine alias or label"
+   stdout|       ],
+   stdout|       "not_startable_reasons": [
+   stdout|         "machine is not accepting delegation"
+   stdout|       ]
+   stdout|     }
+   stdout|   ],
+   stdout|   "not_startable_reasons": [
+   stdout|     "machine:<id:3>: machine is not accepting delegation"
+   stdout|   ]
+   stdout| }
+$ cxp delegate status --id del_<id:1> --json
+   exit 0
+   stdout| {
+   stdout|   "delegation_id": "del_<id:1>",
+   stdout|   "status": "blocked",
+   stdout|   "request": {
+   stdout|     "kind": "cxp.delegation.request.v1",
+   stdout|     "record_id": "rec_<id:4>",
+   stdout|     "delegation_id": "del_<id:1>",
+   stdout|     "source_key": "src_<id:5>",
+   stdout|     "source_session_id": "src-session-1",
+   stdout|     "source_turn_id": "src-turn-1",
+   stdout|     "path": [
+   stdout|       "machine:<id:3>"
+   stdout|     ],
+   stdout|     "hop_budget": 1,
+   stdout|     "machine_id": "machine:<id:3>",
+   stdout|     "inbox_ref": "cxp-inbox-<id:2>",
+   stdout|     "inbox_generation": "<hex:1>",
+   stdout|     "spec": {
+   stdout|       "title": "E2E delegated task",
+   stdout|       "objective": "Run the long migration E2E-DELEGRESTART-deleg-long-1"
+   stdout|     },
+   stdout|     "spec_hash": "<hex:2>",
+   stdout|     "created_at": "<time:1>",
+   stdout|     "expires_at": "<time:2>"
+   stdout|   },
+   stdout|   "winning_claim": {
+   stdout|     "kind": "cxp.delegation.claim.v1",
+   stdout|     "record_id": "rec_<id:7>",
+   stdout|     "delegation_id": "del_<id:1>",
+   stdout|     "machine_id": "machine:<id:3>",
+   stdout|     "inbox_ref": "cxp-inbox-<id:2>",
+   stdout|     "inbox_generation": "<hex:1>",
+   stdout|     "claim_id": "claim_<id:6>",
+   stdout|     "claim_epoch": 1,
+   stdout|     "worker_instance_id": "w-<id:8>",
+   stdout|     "spec": {
+   stdout|       "objective": ""
+   stdout|     },
+   stdout|     "created_at": "<time:3>"
+   stdout|   },
+   stdout|   "status_records": [
+   stdout|     {
+   stdout|       "kind": "cxp.delegation.status.v1",
+   stdout|       "record_id": "rec_<id:9>",
+   stdout|       "delegation_id": "del_<id:1>",
+   stdout|       "machine_id": "machine:<id:3>",
+   stdout|       "inbox_ref": "cxp-inbox-<id:2>",
+   stdout|       "inbox_generation": "<hex:1>",
+   stdout|       "claim_id": "claim_<id:6>",
+   stdout|       "claim_epoch": 1,
+   stdout|       "worker_instance_id": "w-<id:8>",
+   stdout|       "payload_hash": "<hex:3>",
+   stdout|       "status": "running",
+   stdout|       "body": "Delegated worker accepted the task.",
+   stdout|       "spec": {
+   stdout|         "objective": ""
+   stdout|       },
+   stdout|       "created_at": "<time:3>"
+   stdout|     }
+   stdout|   ],
+   stdout|   "terminal": {
+   stdout|     "kind": "cxp.delegation.result.v1",
+   stdout|     "record_id": "rec_<id:10>",
+   stdout|     "delegation_id": "del_<id:1>",
+   stdout|     "machine_id": "machine:<id:3>",
+   stdout|     "inbox_ref": "cxp-inbox-<id:2>",
+   stdout|     "inbox_generation": "<hex:1>",
+   stdout|     "claim_id": "claim_<id:6>",
+   stdout|     "claim_epoch": 1,
+   stdout|     "worker_instance_id": "w-<id:8>",
+   stdout|     "payload_hash": "<hex:4>",
+   stdout|     "result_sequence": 1,
+   stdout|     "status": "blocked",
+   stdout|     "body": "The delegated task was interrupted when the worker's helper restarted. It was not re-run; send it again if it is still needed.",
+   stdout|     "spec": {
+   stdout|       "objective": ""
+   stdout|     },
+   stdout|     "created_at": "<time:4>"
+   stdout|   }
+   stdout| }

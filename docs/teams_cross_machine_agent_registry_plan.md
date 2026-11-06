@@ -4,14 +4,13 @@ Status: registry/store foundation, per-machine inbox locators, model-facing `cxp
 
 Prototype evidence:
 
-- `internal/teams.GraphClient.CreateOrGetMeetingChat` can use `onlineMeetings/createOrGet` with a stable `externalId` and return the meeting chat thread id.
-- `internal/teams.GraphClient.CreateOrGetMeetingChatWindow`, `GetOnlineMeeting`, and `UpdateOnlineMeetingWindow` provide the long-window create/get/refresh surface needed to keep the registry meeting writable.
-- `internal/teams/machineregistry` owns the reusable machine-card schema, per-machine inbox locator, liveness observation, PATCH-slot heartbeat publisher, stable registry ids, and low-write local cache.
-- `internal/teams/delegation` owns task specs, candidate tokens, remote thread tokens, deterministic request ids, claim/result fencing, progress/question status records, cancel/expiry handling, loop prevention, and content-sensitive local state for tests/debug.
-- `cxp delegate resolve/start/status/wait/cancel/claim/progress/question/result --json` is the model-facing command contract. `resolve` returns compact thread reuse candidates and a new-thread token; `start` binds exactly one chosen token. Active `cxp teams run` helpers publish machine capability heartbeats automatically; `cxp delegate machine publish-once` and `cmd/teams-registry-probe` are debug/admin surfaces, not the normal model path.
+- The Teams channel adapter (`internal/channel/teams`: `CreateMeetingChat`, `GetMeeting`, `RenewMeeting`) uses `onlineMeetings/createOrGet` with a stable `externalId`, returns the meeting chat thread id, and provides the long-window create/get/refresh surface needed to keep the registry meeting writable.
+- `internal/core/delegate/machineregistry` owns the reusable machine-card schema, per-machine inbox locator, liveness observation, PATCH-slot heartbeat publisher, stable registry ids, and low-write local cache.
+- `internal/core/delegate/delegation` owns task specs, candidate tokens, remote thread tokens, deterministic request ids, claim/result fencing, progress/question status records, cancel/expiry handling, loop prevention, and content-sensitive local state for tests/debug.
+- `cxp delegate resolve/start/status/wait/cancel/claim/progress/question/result --json` is the model-facing command contract. `resolve` returns compact thread reuse candidates and a new-thread token; `start` binds exactly one chosen token. Active `cxp teams run` helpers publish machine capability heartbeats automatically; `cxp delegate machine publish-once` is a debug/admin surface, not the normal model path.
 - The built-in `cxp` skill now points cross-machine natural-language requests to `references/delegation.md`, so the normal Teams prompt only needs a small capability hint.
-- `cmd/teams-registry-probe` proved that Docker containers can converge on the same Teams-only registry chat, publish machine heartbeats, and classify a stopped container as stale.
-- `cmd/teams-registry-probe --page-size` follows Graph pagination instead of treating the first page as the registry window; `--top` remains a deprecated alias for compatibility.
+- A registry probe tool (since removed) proved that Docker containers can converge on the same Teams-only registry chat, publish machine heartbeats, and classify a stopped container as stale.
+- Registry reads follow Graph pagination instead of treating the first page as the registry window.
 - The probe now uses a per-machine heartbeat slot during each run: the first heartbeat appends the slot message, and later heartbeats patch that same message. Append is only a replacement path when the slot patch fails.
 - Probe settings: `heartbeat=15s`, `ttl=45s`, A ran for 105s, B ran for 35s, watcher ran for 110s.
 - Probe result: all containers observed the same registry chat hash; B moved from online to stale after its last heartbeat aged past the TTL.
@@ -443,11 +442,9 @@ Malformed cards:
 
 Implemented foundation:
 
-- Keep `cmd/teams-registry-probe` as an experimental live tool.
-- Use it to reproduce Graph/Teams behavior before changing product paths.
-- `internal/teams/machineregistry` contains card schema, external id derivation, parsing, liveness classification, heartbeat slot publishing, cache validation, and low-write cache persistence.
-- `internal/teams.MachineRegistryGraphAdapter` keeps Teams Graph types outside the registry core, so the active helper runtime can publish without an import cycle.
-- `internal/teams/delegation` contains task spec validation, candidate tokens, remote thread tokens/state, deterministic source keys, reducer state, claim/progress/question/result fencing, loop guards, cancellation, expiry, local route/outbox/cursor/backoff state, and retention pruning.
+- `internal/core/delegate/machineregistry` contains card schema, external id derivation, parsing, liveness classification, heartbeat slot publishing, cache validation, and low-write cache persistence.
+- `internal/core/delegate` adapts the Teams channel adapter to the registry's Graph interface, keeping Teams Graph types outside the registry core.
+- `internal/core/delegate/delegation` contains task spec validation, candidate tokens, remote thread tokens/state, deterministic source keys, reducer state, claim/progress/question/result fencing, loop guards, cancellation, expiry, local route/outbox/cursor/backoff state, and retention pruning.
 - `cxp delegate` exposes the model-facing JSON workflow and writes delegation request/status records to the target machine inbox by default; `--store` is local test/debug fallback.
 - `cxp delegate claim/progress/question/result` provides target-side debug/recovery primitives over the same inbox-backed route.
 - Active `cxp teams run` helpers create or reuse their per-machine inbox, publish a capability card with `inbox_ref`, `instance_id`, `host_label`, capability fingerprint, and protocol versions, PATCH the same heartbeat slot every 5 minutes, poll their own inbox with exact-top head checks and paged drains, claim open requests, recheck the winning claim before execution, execute via the configured Teams executor behind a durable execution fence, use `remote_thread_id` as the Codex session id when present, publish sparse running/final status, convert bad thread reuse into `reuse_rejected`, and best-effort publish `draining` on shutdown. If effective Teams write auth is unavailable, normal Teams helper operation continues without registry presence. `cxp delegate machine publish-once` remains available for diagnostics.
@@ -610,11 +607,10 @@ Default `ci.yml`:
 - Run:
 
 ```bash
-go test ./internal/teams/machineregistry -count=1 -v
-go test ./internal/teams/delegation -count=1 -v
-go test ./cmd/teams-registry-probe -count=1 -v
+go test ./internal/core/delegate/... -count=1 -v
+go test ./internal/core/engine -count=1 -run 'Registry|Delegat' -v
+go test ./internal/channel/teams -count=1 -run 'Meeting' -v
 go test ./internal/cli -count=1 -run 'Test(Delegate|CandidatesFromMachineStatuses|RootCommandWiresExpectedSubcommandsAndFlags)' -v
-go test ./internal/teams -count=1 -run 'Test(BridgeMachineRegistry|Graph(CreateOrGetMeetingChat(UsesStableExternalID|WindowUsesProvidedWindow)|OnlineMeetingWindowRefresh))$' -v
 ```
 
 Container CI:
@@ -631,8 +627,7 @@ Perf and stress coverage:
 - Keep benchmarks for slot heartbeat publication and registry-window parsing:
 
 ```bash
-go test ./internal/teams/machineregistry -run '^$' -bench 'Benchmark(HeartbeatSlotPublisher|ObserveMessages50Cards)$' -benchmem
-go test ./cmd/teams-registry-probe -run '^$' -bench 'Benchmark(HeartbeatSlotPublisher|ObserveRegistryWindow)$' -benchmem
+go test ./internal/core/delegate/machineregistry -run '^$' -bench 'Benchmark(HeartbeatSlotPublisher|ObserveMessages50Cards)$' -benchmem
 ```
 
 Release workflow:

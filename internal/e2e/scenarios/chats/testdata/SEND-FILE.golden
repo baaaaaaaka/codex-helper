@@ -1,0 +1,89 @@
+# SEND-FILE: `helper file <rel-path>` uploads a file from the outbound root; escapes are rejected; usage names the root
+# cxp black-box transcript; volatile values are numbered placeholders
+
+== chat <chat:1> "s001 · send-file"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Work chat created: s001.<br>
+   | Working directory: <root>/work/send-file</p>
+-- <msg:2> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>💬 Work chat is ready.<br>
+   | Send a task in this chat. Codex will start automatically and continue this session.<br>
+   | Status: waiting for your first task.<br>
+   | Session: s001<br>
+   | Project: send-file<br>
+   | Working directory: <root>/work/send-file<br>
+   | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
+   | Need more details? Send <code>helper status</code>.</p>
+-- <msg:3> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper file</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper file</p>
+-- <msg:4> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>usage: <code>helper file &lt;relative-path&gt;</code> or <code>!file &lt;relative-path&gt;</code><br>
+   | Outbound root: <root>/home/.local/state/codex-helper/teams/core-files/outbound</p>
+-- <msg:5> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper file reports/summary.txt</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper file reports/summary.txt</p>
+-- <msg:6> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
+   | <p>📎 summary.txt</p>
+   | <attachment id="<uuid:1>"></attachment>
+   attachment: {"contentType":"reference","contentUrl":"https://e2etenant-my.sharepoint.com/personal/owner_e2e_example/Documents/Microsoft%20Teams%20Chat%20Files/codex-<upload:1>/summary.txt","id":"<uuid:1>","name":"summary.txt"}
+-- <msg:7> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>!file ../outside-E2E-SENDFILE-file-1.txt</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>!file ../outside-E2E-SENDFILE-file-1.txt</p>
+-- <msg:8> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Teams file upload rejected: the path must stay inside the outbound root. <code>helper file</code> only reads relative files under the Teams outbound root: <root>/home/.local/state/codex-helper/teams/core-files/outbound</p>
+-- <msg:9> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper file <root>/home/.local/state/codex-helper/teams/core-files/outside-E2E-SENDFILE-file-1.txt</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper file <root>/home/.local/state/codex-helper/teams/core-files/outside-E2E-SENDFILE-file-1.txt</p>
+-- <msg:10> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Teams file upload rejected: the path must be relative to the outbound root. <code>helper file</code> only reads relative files under the Teams outbound root: <root>/home/.local/state/codex-helper/teams/core-files/outbound</p>
+-- <msg:11> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper file escape.txt</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper file escape.txt</p>
+-- <msg:12> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Teams file upload rejected: the file is outside the outbound root. <code>helper file</code> only reads relative files under the Teams outbound root: <root>/home/.local/state/codex-helper/teams/core-files/outbound</p>
+
+== chat <chat:2> "🏠 Codex Control - e2ehost"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
+-- <msg:2> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>new <root>/work/send-file</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>new <root>/work/send-file</p>
+-- <msg:3> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>✅ Work chat created: s001</p>
+   | <p>Open this Teams link and send your task there:<br>
+   | <a href="https://teams.microsoft.com/l/chat/<chat:1>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:1>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
+   | <p>If Teams does not show it right away, search for: s001</p>
+
+== uploaded files
+-- /Microsoft Teams Chat Files/codex-<upload:1>/summary.txt
+   sha256:0180d8321d52b45776ce2dfac21dbd7af87e3518a6aee8a72cc770702d9f32e0, 38 bytes, writes: put

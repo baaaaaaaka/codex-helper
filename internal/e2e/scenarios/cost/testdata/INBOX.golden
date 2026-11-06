@@ -1,0 +1,58 @@
+# INBOX: idle helper with machine registry: inbox reads <= 1/min, no idle writes
+# cxp black-box transcript; volatile values are numbered placeholders
+
+== chat <chat:1> "CXP Machine Inbox e2ehost"
+   type: meeting; members: owner
+
+== chat <chat:2> "CXP Machine Registry"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <p>CXP_REGISTRY_CARD_V1 <b64:1></p>
+   record CXP_REGISTRY_CARD_V1:
+   record| {
+   record|   "accepting": false,
+   record|   "aliases": [
+   record|     "<hostname>"
+   record|   ],
+   record|   "capabilities": [
+   record|     "cxp",
+   record|     "codex",
+   record|     "teams-helper",
+   record|     "teams-registry"
+   record|   ],
+   record|   "capability_fingerprint": "<hex:1>",
+   record|   "cxp_version": "v0.1.22",
+   record|   "draining": true,
+   record|   "expires_at": "<time:1>",
+   record|   "heartbeat_interval_seconds": 300,
+   record|   "host_label": "<hostname>",
+   record|   "inbox_generation": "<hex:2>",
+   record|   "inbox_ref": "cxp-inbox-<id:1>",
+   record|   "instance_id": "worker_machine:<id:2>_<pid:1>",
+   record|   "kind": "cxp.machine-card.v1",
+   record|   "load": {},
+   record|   "machine_id": "machine:<id:2>",
+   record|   "machine_label": "e2ehost",
+   record|   "platform": {
+   record|     "arch": "amd64",
+   record|     "os": "linux"
+   record|   },
+   record|   "protocol_versions": [
+   record|     "cxp-delegation-v1"
+   record|   ],
+   record|   "published_at": "<time:2>",
+   record|   "registry_key": "cxp-registry-<id:3>",
+   record|   "revision": <unix:1>,
+   record|   "sequence": <unix:1>,
+   record|   "skills": [
+   record|     "cxp"
+   record|   ],
+   record|   "ttl_seconds": 900
+   record| }
+   edited by heartbeats (count and earlier versions not recorded: timing)
+
+== chat <chat:3> "🏠 Codex Control - e2ehost"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>

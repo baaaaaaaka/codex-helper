@@ -39,7 +39,7 @@ test -f "$agents_dir/cxp/SKILL.md"
 test -f "$agents_dir/cxp/references/commands.md"
 test -f "$agents_dir/cxp/agents/openai.yaml"
 grep -Fq 'Use $cxp' "$agents_dir/cxp/agents/openai.yaml"
-grep -q -- "--after-current-turn" "$agents_dir/cxp/references/commands.md"
+grep -q "standard approval broker" "$agents_dir/cxp/references/commands.md"
 list_output="$("${helper_cmd[@]}" --config "$config" skills --codex-dir "$codex_dir" list)"
 grep -q "No skill subscriptions." <<<"$list_output"
 

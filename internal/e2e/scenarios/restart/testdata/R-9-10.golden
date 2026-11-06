@@ -1,0 +1,72 @@
+# R-9-10: TUI rollout mirrored once; incremental catch-up after stop; down-time session discovered
+# cxp black-box transcript; volatile values are numbered placeholders
+
+== chat <chat:1> "s002 · Created while helper was down E2E-R910-downpromp…"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Local Codex chat detected: s002.</p>
+-- <msg:2> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
+   | <p>Created while helper was down E2E-R910-downprompt-7</p>
+-- <msg:3> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>Down answer E2E-R910-downanswer-8</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+
+== chat <chat:2> "🏠 Codex Control - e2ehost"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
+-- <msg:2> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
+   | <p><strong>💬 New local Codex chat detected</strong></p>
+   | <p><strong>Chat:</strong> s001 · Local question E2E-R910-tuiprompt1-1</p>
+   | <p><strong>Next:</strong> Open this chat to watch the answer and continue from the full local context.</p>
+   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open chat</a> (https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
+   mention 0: owner "E2E Owner"
+-- <msg:3> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
+   | <p><strong>✅ Codex finished</strong></p>
+   | <p><strong>Chat:</strong> s001 · Local question E2E-R910-tuiprompt1-1</p>
+   | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
+   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
+   mention 0: owner "E2E Owner"
+-- <msg:4> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
+   | <p><strong>✅ Codex finished</strong></p>
+   | <p><strong>Chat:</strong> 💬 e2ehost - Local question E2E-R910-tuiprompt1-1</p>
+   | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
+   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
+   mention 0: owner "E2E Owner"
+
+== chat <chat:3> "💬 e2ehost - Local question E2E-R910-tuiprompt1-1"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Local Codex chat detected: s001.</p>
+-- <msg:2> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
+   | <p>Local question E2E-R910-tuiprompt1-1</p>
+-- <msg:3> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
+   | <p>Looking into it</p>
+-- <msg:4> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>Local answer E2E-R910-tuianswer1-2</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+-- <msg:5> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
+   | <p>Second local question E2E-R910-tuiprompt2-3</p>
+-- <msg:6> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>Second local answer E2E-R910-tuianswer2-4</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+-- <msg:7> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
+   | <p>Third local question E2E-R910-tuiprompt3-5</p>
+-- <msg:8> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>Third local answer E2E-R910-tuianswer3-6</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>

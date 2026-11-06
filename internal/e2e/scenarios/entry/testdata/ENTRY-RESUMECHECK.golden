@@ -1,0 +1,77 @@
+# ENTRY-RESUMECHECK: first start on an rc.59 store with a no-proof checkpoint: the chat's history decides where the catch-up resumes
+# cxp black-box transcript; volatile values are numbered placeholders
+
+== chat <chat:1> ""
+   type: group; members: owner
+-- <msg:1> seeded (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>resume-p1 first local prompt</p>
+-- <msg:2> seeded (html)
+   | <p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>resume-a1 first local answer</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+-- <msg:3> seeded (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>resume-p2 second local prompt</p>
+-- <msg:4> seeded (html)
+   | <p><strong>🤖 ✅ Codex answer [part 1/2]:</strong></p>
+   | <p>resume-a2 a long answer the old helper split into two parts a long answer the old helper split into two parts a long answer the old helper split into two parts a long answer the old helper split into two p</p>
+-- <msg:5> seeded (html)
+   | <p><strong>🤖 ✅ Codex answer [part 2/2]:</strong></p>
+   | <p>arts a long answer the old helper split into two parts a long answer the old helper split into two parts a long answer the old helper split into two parts a long answer the old helper split into two parts </p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+-- <msg:6> seeded (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>resume-p3 third local prompt</p>
+-- <msg:7> seeded (html)
+   | <p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>resume-a3 third local answer, the last one before the checkpoint</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+-- <msg:8> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>The previous request was interrupted when the helper stopped. It was not re-run; resend it if you still need it.</p>
+-- <msg:9> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
+   | <p>resume-p4 written after the checkpoint</p>
+-- <msg:10> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>resume-a4 answer written after the checkpoint</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+-- <msg:11> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
+   | <p>resume-p5 another prompt after the checkpoint</p>
+-- <msg:12> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>resume-a5 another answer after the checkpoint</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+
+== chat <chat:2> ""
+   type: group; members: owner
+
+== chat <chat:3> ""
+   type: group; members: owner
+
+== chat <chat:4> ""
+   type: group; members: owner
+
+== chat <chat:5> ""
+   type: group; members: owner
+
+== chat <chat:6> ""
+   type: group; members: owner
+
+== chat <chat:7> ""
+   type: group; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Teams helper data converted from v0.1.22-rc.59</p>
+   | <p>Work chats: 8 (5 active, 1 parked, 2 closed). Past requests: 5.</p>
+   | <p>1 request was running when the previous helper stopped: its chat gets one notice; it is not re-run.</p>
+   | <p>Chat s003: quarantined by the previous helper; it stays paused.</p>
+   | <p>3 older messages (from more than a day ago) that the previous helper had not sent or could not confirm are not sent now.</p>
+   | <p>Catch-up of local Codex sessions: 9 prompts and answers from 1 session (0.0 MB), posted to their chats from now on.</p>
+   | <p>1 session&#39;s chat history is read first: what the chat already has is not posted again.</p>
+   | <p>The previous data is kept unchanged as a backup. The full report is migration-report.txt next to the helper&#39;s store (<code>cxp teams status</code> shows where).</p>
+
+== chat <chat:8> ""
+   type: group; members: owner

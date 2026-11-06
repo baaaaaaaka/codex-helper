@@ -130,7 +130,7 @@ grep -q "${tag#v}" <<<"$cxp_version"
 builtin_skill="$HOME/.agents/skills/cxp"
 test -f "$builtin_skill/SKILL.md"
 test -f "$builtin_skill/references/commands.md"
-grep -q -- "--after-current-turn" "$builtin_skill/references/commands.md"
+grep -q "standard approval broker" "$builtin_skill/references/commands.md"
 "$HOME/.local/bin/codex-proxy" proxy doctor || true
 codex_proxy_skills_list="$("$HOME/.local/bin/codex-proxy" --config "$HOME/codex-proxy-skills-config.json" skills list)"
 grep -q "No skill subscriptions." <<<"$codex_proxy_skills_list"

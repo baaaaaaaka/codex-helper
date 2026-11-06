@@ -1,9 +1,9 @@
 name: Proxy native platform validation
 
+# Native macOS (arm64 and Intel) and Windows Server proxy validation with
+# repeated (-count=5) runs. It is part of the slow tier: nightly and on
+# demand. Pull requests cover the same packages once per OS in ci.yml.
 on:
-  pull_request:
-  push:
-    branches: ["main"]
   schedule:
     - cron: "30 2 * * *"
   workflow_dispatch:

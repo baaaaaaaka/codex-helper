@@ -6,14 +6,21 @@ import (
 	"testing"
 )
 
+func containsRenderedPath(body string, path string) bool {
+	if strings.Contains(body, path) {
+		return true
+	}
+	escapedBackslashes := strings.ReplaceAll(path, `\`, `\\`)
+	return escapedBackslashes != path && strings.Contains(body, escapedBackslashes)
+}
+
 func TestTeamsServiceRendererOutputsUseStableExecutable(t *testing.T) {
 	tmp := t.TempDir()
 	stable := filepath.Join(tmp, "codex-proxy")
 	raw := filepath.Join(tmp, ".nfs802014de01c482a9000004bf")
 	spec := teamsServiceSpec{
-		Executable:   stable,
-		WorkingDir:   tmp,
-		RegistryPath: filepath.Join(tmp, "registry.json"),
+		Executable: stable,
+		WorkingDir: tmp,
 		Environment: map[string]string{
 			"NO_COLOR":                   "1",
 			"CODEX_HELPER_TEAMS_SERVICE": "1",
@@ -40,12 +47,4 @@ func TestTeamsServiceRendererOutputsUseStableExecutable(t *testing.T) {
 			}
 		}
 	}
-}
-
-func containsRenderedPath(body string, path string) bool {
-	if strings.Contains(body, path) {
-		return true
-	}
-	escapedBackslashes := strings.ReplaceAll(path, `\`, `\\`)
-	return escapedBackslashes != path && strings.Contains(body, escapedBackslashes)
 }

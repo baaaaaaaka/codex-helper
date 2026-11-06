@@ -1,35 +1,32 @@
 package cli
 
 import (
-	"context"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
 
-	"github.com/baaaaaaaka/codex-helper/internal/teams"
+	chteams "github.com/baaaaaaaka/codex-helper/internal/channel/teams"
 )
 
-func newTeamsWorkflowCmd(root *rootOptions, registryPath *string) *cobra.Command {
+func newTeamsWorkflowCmd(root *rootOptions) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "workflow",
 		Short: "Configure optional Teams Workflow notification cards",
 		Long:  "Configure optional Teams Workflow notification cards. The webhook URL is treated as a local secret: store it in a private file and pass the file path, not the raw URL.",
 	}
 	cmd.AddCommand(
-		newTeamsWorkflowEnableCmd(root, registryPath),
-		newTeamsWorkflowDisableCmd(root, registryPath),
+		newTeamsWorkflowEnableCmd(),
+		newTeamsWorkflowDisableCmd(),
 		newTeamsWorkflowStatusCmd(),
-		newTeamsWorkflowTestCmd(root, registryPath),
+		newTeamsWorkflowTestCmd(root),
 	)
 	return cmd
 }
 
-func newTeamsWorkflowEnableCmd(root *rootOptions, registryPath *string) *cobra.Command {
+func newTeamsWorkflowEnableCmd() *cobra.Command {
 	var webhookURLFile string
 	cmd := &cobra.Command{
 		Use:   "enable --webhook-url-file <path>",
@@ -40,29 +37,11 @@ func newTeamsWorkflowEnableCmd(root *rootOptions, registryPath *string) *cobra.C
 			if err != nil {
 				return err
 			}
-			bridge, closeBridge, err := newTeamsWorkflowBridge(cmd.Context(), root, registryPath, cmd.OutOrStdout(), cmd.ErrOrStderr())
+			corePath, _, err := teamsNewCoreCLIStorePath()
 			if err != nil {
 				return err
 			}
-			defer closeBridge()
-			chat, err := bridge.EnsureControlChat(cmd.Context())
-			if err != nil {
-				return err
-			}
-			cfg, err := bridge.ConfigureWorkflowNotifications(cmd.Context(), path, true)
-			if err != nil {
-				return err
-			}
-			if err := bridge.Save(); err != nil {
-				return err
-			}
-			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Teams workflow notifications enabled.")
-			printTeamsControlChatDetails(cmd.OutOrStdout(), "Control chat", chat.ID, chat.Topic, chat.WebURL)
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Webhook URL file: configured (%s)\n", workflowSecretFileStatus(path))
-			if cfg.ControlChatID != "" {
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Bound control chat ID: %s\n", cfg.ControlChatID)
-			}
-			return nil
+			return runTeamsNewCoreWorkflowEnable(cmd.OutOrStdout(), corePath, path)
 		},
 	}
 	cmd.Flags().StringVar(&webhookURLFile, "webhook-url-file", "", "Absolute path to a private file containing the Teams Workflow webhook URL")
@@ -70,22 +49,17 @@ func newTeamsWorkflowEnableCmd(root *rootOptions, registryPath *string) *cobra.C
 	return cmd
 }
 
-func newTeamsWorkflowDisableCmd(root *rootOptions, registryPath *string) *cobra.Command {
+func newTeamsWorkflowDisableCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "disable",
 		Short: "Disable Workflow notification cards",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			bridge, closeBridge, err := newTeamsWorkflowBridge(cmd.Context(), root, registryPath, cmd.OutOrStdout(), cmd.ErrOrStderr())
+			corePath, _, err := teamsNewCoreCLIStorePath()
 			if err != nil {
 				return err
 			}
-			defer closeBridge()
-			if _, err := bridge.ConfigureWorkflowNotifications(cmd.Context(), "", false); err != nil {
-				return err
-			}
-			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Teams workflow notifications disabled.")
-			return nil
+			return runTeamsNewCoreWorkflowDisable(cmd.OutOrStdout(), corePath)
 		},
 	}
 }
@@ -96,69 +70,37 @@ func newTeamsWorkflowStatusCmd() *cobra.Command {
 		Short: "Show local Workflow notification configuration",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return printTeamsWorkflowStatus(cmd)
+			corePath, _, err := teamsNewCoreCLIStorePath()
+			if err != nil {
+				return err
+			}
+			return printTeamsNewCoreWorkflowStatus(cmd.OutOrStdout(), corePath)
 		},
 	}
 }
 
-func newTeamsWorkflowTestCmd(root *rootOptions, registryPath *string) *cobra.Command {
+func newTeamsWorkflowTestCmd(root *rootOptions) *cobra.Command {
 	var webhookURLFile string
 	cmd := &cobra.Command{
 		Use:   "test",
 		Short: "Send a test Workflow notification card to the configured control chat",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			bridge, closeBridge, err := newTeamsWorkflowBridge(cmd.Context(), root, registryPath, cmd.OutOrStdout(), cmd.ErrOrStderr())
+			corePath, _, err := teamsNewCoreCLIStorePath()
 			if err != nil {
 				return err
 			}
-			defer closeBridge()
-			chat, err := bridge.EnsureControlChat(cmd.Context())
-			if err != nil {
-				return err
-			}
+			file := ""
 			if strings.TrimSpace(webhookURLFile) != "" {
-				path, err := normalizeTeamsWorkflowURLFile(webhookURLFile)
-				if err != nil {
-					return err
-				}
-				if _, err := bridge.ConfigureWorkflowNotifications(cmd.Context(), path, true); err != nil {
-					return err
-				}
-				if err := bridge.Save(); err != nil {
+				if file, err = normalizeTeamsWorkflowURLFile(webhookURLFile); err != nil {
 					return err
 				}
 			}
-			if err := bridge.SendWorkflowNotificationTest(cmd.Context()); err != nil {
-				return err
-			}
-			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Teams workflow test card accepted.")
-			printTeamsControlChatDetails(cmd.OutOrStdout(), "Control chat", chat.ID, chat.Topic, chat.WebURL)
-			return nil
+			return runTeamsNewCoreWorkflowTest(cmd, root, corePath, file)
 		},
 	}
 	cmd.Flags().StringVar(&webhookURLFile, "webhook-url-file", "", "Optional absolute path to configure before sending the test card")
 	return cmd
-}
-
-func newTeamsWorkflowBridge(ctx context.Context, root *rootOptions, registryPath *string, out io.Writer, errOut io.Writer) (*teams.Bridge, func(), error) {
-	httpClient, err := newTeamsGraphHTTPClientLease(ctx, root, errOut)
-	if err != nil {
-		return nil, func() {}, err
-	}
-	closeBridge := func() { _ = httpClient.Close(context.Background()) }
-	auth, err := newTeamsAuthManagerWithHTTPClient(httpClient.Client)
-	if err != nil {
-		closeBridge()
-		return nil, func() {}, err
-	}
-	bridge, err := teams.NewBridgeWithHTTPClient(ctx, auth, *registryPath, out, httpClient.Client)
-	if err != nil {
-		closeBridge()
-		return nil, func() {}, err
-	}
-	httpClient.RetireSuspects(ctx, errOut)
-	return bridge, closeBridge, nil
 }
 
 func normalizeTeamsWorkflowURLFile(path string) (string, error) {
@@ -181,64 +123,10 @@ func normalizeTeamsWorkflowURLFile(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := teams.ValidateWorkflowWebhookURLFile(abs); err != nil {
+	if _, err := chteams.ReadWebhookURLFile(abs); err != nil {
 		return "", err
 	}
 	return abs, nil
-}
-
-func printTeamsWorkflowStatus(cmd *cobra.Command) error {
-	paths, err := existingTeamsStorePaths()
-	if err != nil {
-		return err
-	}
-	sort.Strings(paths)
-	if len(paths) == 0 {
-		_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Teams workflow notifications: disabled")
-		return nil
-	}
-	printed := false
-	for _, path := range paths {
-		state, err := loadTeamsStoreStateAndClose(cmd.Context(), path)
-		if err != nil {
-			return err
-		}
-		cfg := state.Workflow
-		if !cfg.Enabled && cfg.ControlWebhookURLFile == "" && cfg.ControlChatID == "" && state.Scope.ID != "" {
-			sidecarCfg, ok, err := teams.LoadWorkflowNotificationConfigFileForScope(state.Scope.ID)
-			if err != nil {
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams workflow notifications: invalid sidecar config (%v)\n", err)
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "State file: %s\n", path)
-				printed = true
-				continue
-			}
-			if ok {
-				cfg = sidecarCfg
-			}
-		}
-		if !cfg.Enabled && cfg.ControlWebhookURLFile == "" && cfg.ControlChatID == "" {
-			continue
-		}
-		if printed {
-			_, _ = fmt.Fprintln(cmd.OutOrStdout())
-		}
-		printed = true
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams workflow notifications: %s\n", workflowEnabledLabel(cfg.Enabled))
-		_, _ = fmt.Fprintf(cmd.OutOrStdout(), "State file: %s\n", path)
-		if cfg.ControlChatID != "" {
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Bound control chat ID: %s\n", cfg.ControlChatID)
-		}
-		if cfg.ControlWebhookURLFile != "" {
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Webhook URL file: configured (%s)\n", workflowSecretFileStatus(cfg.ControlWebhookURLFile))
-		}
-		if !cfg.UpdatedAt.IsZero() {
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Updated: %s\n", cfg.UpdatedAt.Format("2006-01-02 15:04:05 MST"))
-		}
-	}
-	if !printed {
-		_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Teams workflow notifications: disabled")
-	}
-	return nil
 }
 
 func workflowEnabledLabel(enabled bool) string {
@@ -249,7 +137,7 @@ func workflowEnabledLabel(enabled bool) string {
 }
 
 func workflowSecretFileStatus(path string) string {
-	if err := teams.ValidateWorkflowWebhookURLFile(path); err != nil {
+	if _, err := chteams.ReadWebhookURLFile(path); err != nil {
 		return "invalid: " + err.Error()
 	}
 	return "ok"

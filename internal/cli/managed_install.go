@@ -307,10 +307,6 @@ func legacyInstallDirCandidateForGOOS(value string, goos string, stat func(strin
 	return filepath.Join(value, helperpath.BinaryName(goos))
 }
 
-func dedupeStrings(values []string) []string {
-	return dedupeStringsForGOOS(values, runtime.GOOS)
-}
-
 func dedupeStringsForGOOS(values []string, goos string) []string {
 	seen := map[string]bool{}
 	var out []string

@@ -11,9 +11,10 @@ import (
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
-	"github.com/baaaaaaaka/codex-helper/internal/teams"
-	"github.com/baaaaaaaka/codex-helper/internal/teams/delegation"
-	"github.com/baaaaaaaka/codex-helper/internal/teams/machineregistry"
+	chteams "github.com/baaaaaaaka/codex-helper/internal/channel/teams"
+	coredelegate "github.com/baaaaaaaka/codex-helper/internal/core/delegate"
+	"github.com/baaaaaaaka/codex-helper/internal/core/delegate/delegation"
+	"github.com/baaaaaaaka/codex-helper/internal/core/delegate/machineregistry"
 	"github.com/spf13/cobra"
 )
 
@@ -793,16 +794,12 @@ func loadDelegateCandidatesFromTeamsRegistry(opts *delegateOptions) ([]delegatio
 	return candidates, nil
 }
 
+// delegateRegistryRecordGraph is what the requester needs from Teams: the
+// registry graph over the channel adapter (core/delegate.NewGraph).
 type delegateRegistryRecordGraph interface {
-	SendHTML(ctx context.Context, chatID string, html string) (teams.ChatMessage, error)
-	ListMessages(ctx context.Context, chatID string, top int) ([]teams.ChatMessage, error)
-	ListMessagesExactTopWithoutRateLimitRetry(ctx context.Context, chatID string, top int) ([]teams.ChatMessage, error)
-	CreateOrGetMeetingChatWindow(ctx context.Context, topic string, externalID string, start time.Time, end time.Time) (teams.Chat, teams.OnlineMeeting, error)
-}
-
-type delegateRegistryRecordWindowLister interface {
-	ListMessagesWindow(ctx context.Context, chatID string, top int, modifiedAfter time.Time) (teams.MessageWindow, error)
-	ListMessagesWindowFromPath(ctx context.Context, path string) (teams.MessageWindow, error)
+	SendHTML(ctx context.Context, chatID string, html string) (machineregistry.ChatMessage, error)
+	ListMessages(ctx context.Context, chatID string, top int) ([]machineregistry.ChatMessage, error)
+	CreateOrGetMeetingChatWindow(ctx context.Context, topic string, externalID string, start time.Time, end time.Time) (machineregistry.Chat, machineregistry.OnlineMeeting, error)
 }
 
 type delegateRegistrySession struct {
@@ -825,33 +822,33 @@ func openDelegateRegistry(opts *delegateOptions) (*delegateRegistrySession, erro
 	closeSession := func(ctx context.Context) error {
 		return httpClient.Close(ctx)
 	}
-	cfg, err := teams.DefaultEffectiveAuthConfig()
+	cfg, err := chteams.ResolveAuthConfig("")
 	if err != nil {
 		_ = closeSession(context.Background())
 		return nil, err
 	}
-	auth := teams.NewAuthManagerWithHTTPClient(cfg, httpClient.Client)
-	graph := teams.NewGraphClientWithHTTPClient(auth, io.Discard, httpClient.Client)
-	me, err := graph.Me(ctx)
+	adapter, err := chteams.New(chteams.Config{HTTP: httpClient.Client, Tokens: chteams.NewDelegatedAuth(cfg, httpClient.Client), TenantID: cfg.TenantID})
 	if err != nil {
 		_ = closeSession(context.Background())
 		return nil, err
 	}
-	userID := strings.TrimSpace(me.ID)
-	if userID == "" {
-		userID = strings.TrimSpace(me.UserPrincipalName)
+	userID, _, err := adapter.Owner(ctx)
+	if err != nil {
+		_ = closeSession(context.Background())
+		return nil, err
 	}
-	if userID == "" {
+	if strings.TrimSpace(userID) == "" {
 		_ = closeSession(context.Background())
 		return nil, errDelegateMissingTeamsUserID
 	}
+	graph := coredelegate.NewGraph(adapter)
 	cachePath, err := delegateRegistryCachePath(opts.registryCache)
 	if err != nil {
 		_ = closeSession(context.Background())
 		return nil, err
 	}
 	store := machineregistry.Store{
-		Graph:     teams.NewMachineRegistryGraphAdapter(graph),
+		Graph:     graph,
 		CachePath: cachePath,
 		Now:       opts.now,
 	}
@@ -891,41 +888,6 @@ func delegateRegistryCachePath(override string) (string, error) {
 		return override, nil
 	}
 	return machineregistry.DefaultCachePath()
-}
-
-func runDelegateStartRegistry(opts *delegateOptions, record delegation.Record, now time.Time) (delegateStartResult, error) {
-	session, err := openDelegateRegistry(opts)
-	if err != nil {
-		return delegateStartResult{}, err
-	}
-	defer session.close(opts.context())
-	records, err := readDelegateRegistryRecords(opts, session)
-	if err != nil {
-		return delegateStartResult{}, err
-	}
-	idempotent := false
-	for _, existing := range records {
-		if existing.Kind == delegation.RequestKind && existing.SourceKey == record.SourceKey {
-			record = existing
-			idempotent = true
-			break
-		}
-	}
-	if !idempotent {
-		if _, err := session.graph.SendHTML(opts.context(), session.chatID, delegation.RenderRecordHTML(record)); err != nil {
-			return delegateStartResult{}, err
-		}
-		records = append(records, record)
-	}
-	state := delegation.Reduce(delegation.RecordsForID(records, record.DelegationID), now)
-	return delegateStartResult{
-		DelegationID: record.DelegationID,
-		Status:       state.Status,
-		MachineID:    record.MachineID,
-		Idempotent:   idempotent,
-		State:        state,
-		Transport:    "registry",
-	}, nil
 }
 
 func runDelegateStartInbox(opts *delegateOptions, token delegation.CandidateTokenPayload, record delegation.Record, now time.Time) (delegateStartResult, error) {
@@ -1025,19 +987,6 @@ func validateDelegateCandidateToken(opts *delegateOptions, session *delegateRegi
 	return fmt.Errorf("candidate machine %s is no longer present in the registry; run delegate resolve again", token.MachineID)
 }
 
-func readDelegateRegistryRecordsForID(opts *delegateOptions, delegationID string) ([]delegation.Record, error) {
-	session, err := openDelegateRegistry(opts)
-	if err != nil {
-		return nil, err
-	}
-	defer session.close(opts.context())
-	records, err := readDelegateRegistryRecords(opts, session)
-	if err != nil {
-		return nil, err
-	}
-	return delegation.RecordsForID(records, delegationID), nil
-}
-
 func readDelegateInboxRecordsForID(opts *delegateOptions, delegationID string) ([]delegation.Record, error) {
 	session, route, chatID, err := openDelegateInboxForID(opts, delegationID)
 	if err != nil {
@@ -1056,22 +1005,6 @@ func readDelegateInboxRecordsForID(opts *delegateOptions, delegationID string) (
 		}
 	}
 	return delegation.RecordsForID(records, delegationID), nil
-}
-
-func appendDelegateRegistryRecord(opts *delegateOptions, record delegation.Record) ([]delegation.Record, error) {
-	session, err := openDelegateRegistry(opts)
-	if err != nil {
-		return nil, err
-	}
-	defer session.close(opts.context())
-	records, err := readDelegateRegistryRecords(opts, session)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := session.graph.SendHTML(opts.context(), session.chatID, delegation.RenderRecordHTML(record)); err != nil {
-		return nil, err
-	}
-	return append(records, record), nil
 }
 
 func appendDelegateInboxRecordForID(opts *delegateOptions, delegationID string, record delegation.Record) ([]delegation.Record, error) {
@@ -1182,31 +1115,7 @@ func readDelegateRegistryRecords(opts *delegateOptions, session *delegateRegistr
 	if top <= 0 {
 		top = 100
 	}
-	if windowLister, ok := session.graph.(delegateRegistryRecordWindowLister); ok {
-		var messages []teams.ChatMessage
-		nextPath := ""
-		for page := 0; page < 20; page++ {
-			var (
-				window teams.MessageWindow
-				err    error
-			)
-			if page == 0 {
-				window, err = windowLister.ListMessagesWindow(opts.context(), session.chatID, top, time.Time{})
-			} else {
-				window, err = windowLister.ListMessagesWindowFromPath(opts.context(), nextPath)
-			}
-			if err != nil {
-				return nil, err
-			}
-			messages = append(messages, window.Messages...)
-			if !window.Truncated || strings.TrimSpace(window.NextPath) == "" {
-				return delegation.ObserveRecords(delegateMessages(messages)), nil
-			}
-			nextPath = window.NextPath
-		}
-		return delegation.ObserveRecords(delegateMessages(messages)), nil
-	}
-	messages, err := session.graph.ListMessages(opts.context(), session.chatID, top)
+	messages, err := session.graph.ListMessages(opts.context(), session.chatID, 20*top)
 	if err != nil {
 		return nil, err
 	}
@@ -1218,31 +1127,7 @@ func readDelegateInboxRecords(opts *delegateOptions, session *delegateRegistrySe
 	if top <= 0 {
 		top = 50
 	}
-	if windowLister, ok := session.graph.(delegateRegistryRecordWindowLister); ok {
-		var messages []teams.ChatMessage
-		nextPath := ""
-		for page := 0; page < 20; page++ {
-			var (
-				window teams.MessageWindow
-				err    error
-			)
-			if page == 0 {
-				window, err = windowLister.ListMessagesWindow(opts.context(), chatID, top, time.Time{})
-			} else {
-				window, err = windowLister.ListMessagesWindowFromPath(opts.context(), nextPath)
-			}
-			if err != nil {
-				return nil, err
-			}
-			messages = append(messages, window.Messages...)
-			if !window.Truncated || strings.TrimSpace(window.NextPath) == "" {
-				return delegation.ObserveRecords(delegateMessages(messages)), nil
-			}
-			nextPath = window.NextPath
-		}
-		return delegation.ObserveRecords(delegateMessages(messages)), nil
-	}
-	messages, err := session.graph.ListMessages(opts.context(), chatID, top)
+	messages, err := session.graph.ListMessages(opts.context(), chatID, 20*top)
 	if err != nil {
 		return nil, err
 	}
@@ -1713,7 +1598,7 @@ func delegateRouteStorePath(opts *delegateOptions) (string, error) {
 	return delegateStorePath("")
 }
 
-func delegateMessages(messages []teams.ChatMessage) []delegation.ChatMessage {
+func delegateMessages(messages []machineregistry.ChatMessage) []delegation.ChatMessage {
 	out := make([]delegation.ChatMessage, 0, len(messages))
 	for _, msg := range messages {
 		out = append(out, delegation.ChatMessage{

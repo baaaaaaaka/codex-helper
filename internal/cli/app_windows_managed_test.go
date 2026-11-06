@@ -528,43 +528,6 @@ func TestWindowsManagedAppStartedUncertainDoesNotFallback(t *testing.T) {
 	}
 }
 
-func TestWindowsManagedAppLaunchScriptPassesProxyAndIsolatedHome(t *testing.T) {
-	script := codexDesktopWindowsManagedLaunchScript(codexDesktopAppOptions{
-		Cwd:              `C:\Users\Alice\work`,
-		ExtraEnv:         []string{`CODEX_DIR=C:\Users\Alice\.codex-profile`, `CODEX_HOME=C:\Users\Alice\.codex-profile`},
-		ProxyURL:         "http://127.0.0.1:23123",
-		ModelProfileName: "profile",
-	}, `C:\Users\Alice\AppData\Local\cxp\apps\chatgpt\versions\v\app\ChatGPT.exe`)
-	for _, want := range []string{
-		"--proxy-server=http://127.0.0.1:23123",
-		"$env:CODEX_DIR = 'C:\\Users\\Alice\\.codex-profile'",
-		"$env:CODEX_HOME = 'C:\\Users\\Alice\\.codex-profile'",
-		"$env:NO_PROXY = ''",
-		"$env:no_proxy = ''",
-		"Get-Process -Name 'ChatGPT','Codex'",
-		"Start-Process @start",
-		"Get-CimInstance -ClassName Win32_Process",
-		"$processInfo.ExecutablePath",
-		"$process.StartTime.ToUniversalTime()",
-		"$candidate.CreationDate.ToUniversalTime()",
-		"$_.ParentProcessId -eq $process.Id",
-		"CXP_MANAGED_STARTED_UNCERTAIN",
-		"CXP_MANAGED_PID=",
-	} {
-		if !strings.Contains(script, want) {
-			t.Fatalf("managed launch script missing %q:\n%s", want, script)
-		}
-	}
-	queryPathAt := strings.Index(script, "Get-CXPManagedProcessInfo $process.Id")
-	verifyPathAt := strings.Index(script, "managed ChatGPT process path could not be verified")
-	if queryPathAt < 0 || verifyPathAt < queryPathAt || strings.Contains(script, "$process.MainModule.FileName") {
-		t.Fatalf("managed launch script must verify the launched process image without an unreliable MainModule fallback:\n%s", script)
-	}
-	if strings.Contains(script, "Set-ItemProperty") || strings.Contains(script, "netsh winhttp set proxy") {
-		t.Fatalf("managed launch script must not change system proxy:\n%s", script)
-	}
-}
-
 func TestWindowsManagedAppLaunchScriptHonorsWaitForExit(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -795,43 +758,6 @@ func TestWindowsManagedAppDirectModeUsesLegacyBackend(t *testing.T) {
 	}
 	if !strings.Contains(script, "$allowStoreInstall = $true") || !strings.Contains(script, "$allowAppXFallback = $true") {
 		t.Fatalf("ordinary direct launch did not retain legacy Store/AppX policy:\n%s", script)
-	}
-}
-
-func TestWindowsManagedAppModelProfileUsesDirectBackendAndSafeFallback(t *testing.T) {
-	lockCLITestHooks(t)
-	forceCodexWindowsManagedX64(t)
-	prevRoot := codexAppWindowsManagedRootFn
-	prevLookPath := codexAppLookPath
-	prevRun := codexAppRunCommand
-	prevGOOS := codexAppGOOS
-	prevWSL := codexAppIsWSL
-	t.Cleanup(func() {
-		codexAppWindowsManagedRootFn = prevRoot
-		codexAppLookPath = prevLookPath
-		codexAppRunCommand = prevRun
-		codexAppGOOS = prevGOOS
-		codexAppIsWSL = prevWSL
-	})
-	codexAppGOOS = func() string { return "windows" }
-	codexAppIsWSL = func() bool { return false }
-	codexAppWindowsManagedRootFn = func(context.Context) (string, error) { return "", errors.New("managed cache unavailable") }
-	codexAppLookPath = func(name string) (string, error) { return name, nil }
-	var script string
-	codexAppRunCommand = func(_ context.Context, _ io.Writer, _ string, args ...string) error {
-		script = args[len(args)-1]
-		return nil
-	}
-	t.Setenv("CXP_WINDOWS_APP_BACKEND", "auto")
-	if err := launchCodexDesktopAppWindows(context.Background(), codexDesktopAppOptions{
-		Cwd:                  `C:\Users\Alice`,
-		ModelProfileName:     "mimo25",
-		RequiresDirectLaunch: true,
-	}); err != nil {
-		t.Fatalf("model-profile managed launch with fallback: %v", err)
-	}
-	if !strings.Contains(script, "$allowStoreInstall = $false") || !strings.Contains(script, "$allowAppXFallback = $false") {
-		t.Fatalf("model-profile fallback allowed Store/AppX activation:\n%s", script)
 	}
 }
 
@@ -1228,5 +1154,41 @@ func writeTestCodexWindowsManagedMSIXWithIdentity(t *testing.T, packagePath, pac
 	}
 	if err := file.Close(); err != nil {
 		t.Fatalf("close test MSIX file: %v", err)
+	}
+}
+
+func TestWindowsManagedAppLaunchScriptPassesProxyAndIsolatedHome(t *testing.T) {
+	script := codexDesktopWindowsManagedLaunchScript(codexDesktopAppOptions{
+		Cwd:      `C:\Users\Alice\work`,
+		ExtraEnv: []string{`CODEX_DIR=C:\Users\Alice\.codex-profile`, `CODEX_HOME=C:\Users\Alice\.codex-profile`},
+		ProxyURL: "http://127.0.0.1:23123",
+	}, `C:\Users\Alice\AppData\Local\cxp\apps\chatgpt\versions\v\app\ChatGPT.exe`)
+	for _, want := range []string{
+		"--proxy-server=http://127.0.0.1:23123",
+		"$env:CODEX_DIR = 'C:\\Users\\Alice\\.codex-profile'",
+		"$env:CODEX_HOME = 'C:\\Users\\Alice\\.codex-profile'",
+		"$env:NO_PROXY = ''",
+		"$env:no_proxy = ''",
+		"Get-Process -Name 'ChatGPT','Codex'",
+		"Start-Process @start",
+		"Get-CimInstance -ClassName Win32_Process",
+		"$processInfo.ExecutablePath",
+		"$process.StartTime.ToUniversalTime()",
+		"$candidate.CreationDate.ToUniversalTime()",
+		"$_.ParentProcessId -eq $process.Id",
+		"CXP_MANAGED_STARTED_UNCERTAIN",
+		"CXP_MANAGED_PID=",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("managed launch script missing %q:\n%s", want, script)
+		}
+	}
+	queryPathAt := strings.Index(script, "Get-CXPManagedProcessInfo $process.Id")
+	verifyPathAt := strings.Index(script, "managed ChatGPT process path could not be verified")
+	if queryPathAt < 0 || verifyPathAt < queryPathAt || strings.Contains(script, "$process.MainModule.FileName") {
+		t.Fatalf("managed launch script must verify the launched process image without an unreliable MainModule fallback:\n%s", script)
+	}
+	if strings.Contains(script, "Set-ItemProperty") || strings.Contains(script, "netsh winhttp set proxy") {
+		t.Fatalf("managed launch script must not change system proxy:\n%s", script)
 	}
 }

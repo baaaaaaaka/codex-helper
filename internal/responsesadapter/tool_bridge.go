@@ -7,24 +7,6 @@ import (
 	"strings"
 )
 
-func NormalizeTools(raw json.RawMessage) ([]ChatTool, []ToolWarning, error) {
-	return NormalizeToolsWithPolicy(raw, "function", "drop")
-}
-
-func NormalizeToolsWithMode(raw json.RawMessage, customToolMode string) ([]ChatTool, []ToolWarning, error) {
-	return NormalizeToolsWithPolicy(raw, customToolMode, "drop")
-}
-
-// NormalizeToolsWithPolicy is the catalog-aware entry point. A provider that
-// declares a native feature but has no registered wire adapter must use
-// policy=error; silently dropping web_search (or another native tool) would
-// make the upstream model fabricate a result while the HTTP request still
-// appears successful.
-func NormalizeToolsWithPolicy(raw json.RawMessage, customToolMode string, unsupportedToolPolicy string) ([]ChatTool, []ToolWarning, error) {
-	tools, _, warnings, err := NormalizeRequestTools(raw, customToolMode, unsupportedToolPolicy, nil)
-	return tools, warnings, err
-}
-
 // NormalizeRequestTools separates ordinary function tools from provider-owned
 // native tools. Native tools are accepted only when a catalog route supplies a
 // typed mapping; otherwise the existing fail-closed policy is preserved.

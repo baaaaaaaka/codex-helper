@@ -14,7 +14,7 @@ import (
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
-	"github.com/baaaaaaaka/codex-helper/internal/teams"
+	"github.com/baaaaaaaka/codex-helper/internal/selfupdate"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
 )
 
@@ -28,11 +28,7 @@ var teamsAutoUpdateListReleases = update.ListReleases
 var teamsAutoUpdateFetchReleaseIndex = update.FetchReleaseIndex
 var teamsAutoUpdateExecutable = func() (string, error) { return teamsServiceExecutable() }
 
-func newTeamsReleaseAutoUpdater(repo string, includePrerelease bool) teams.HelperAutoUpdater {
-	return teamsReleaseAutoUpdater{repo: repo, includePrerelease: includePrerelease}
-}
-
-func (u teamsReleaseAutoUpdater) Check(ctx context.Context, check teams.HelperAutoUpdateCheck) (teams.HelperAutoUpdateDecision, error) {
+func (u teamsReleaseAutoUpdater) Check(ctx context.Context, check selfupdate.Check) (selfupdate.Decision, error) {
 	now := check.Now
 	if now.IsZero() {
 		now = time.Now()
@@ -42,7 +38,7 @@ func (u teamsReleaseAutoUpdater) Check(ctx context.Context, check teams.HelperAu
 	}
 	releases, err := u.indexedOrListedReleases(ctx)
 	if err != nil {
-		return teams.HelperAutoUpdateDecision{
+		return selfupdate.Decision{
 			NextCheckAt:  now.Add(update.DefaultAutoUpdateCheckInterval),
 			BackoffUntil: now.Add(update.DefaultAutoUpdateCheckInterval),
 			LastError:    err.Error(),
@@ -58,11 +54,11 @@ func (u teamsReleaseAutoUpdater) Check(ctx context.Context, check teams.HelperAu
 		IncludePrerelease: u.includePrerelease || check.IncludePrerelease,
 		IgnorePriority:    check.Manual,
 	})
-	decision := teams.HelperAutoUpdateDecision{
+	decision := selfupdate.Decision{
 		NextCheckAt: selected.NextCheckAt,
 	}
 	if selected.Candidate != nil {
-		decision.Candidate = &teams.HelperAutoUpdateCandidate{
+		decision.Candidate = &selfupdate.Candidate{
 			TagName:     selected.Candidate.TagName,
 			Version:     selected.Candidate.Version,
 			Priority:    string(selected.Candidate.Priority),
@@ -92,7 +88,7 @@ func (u teamsReleaseAutoUpdater) indexedOrListedReleases(ctx context.Context) ([
 	return releases, nil
 }
 
-func (u teamsReleaseAutoUpdater) checkManualStable(ctx context.Context, check teams.HelperAutoUpdateCheck, now time.Time) (teams.HelperAutoUpdateDecision, error) {
+func (u teamsReleaseAutoUpdater) checkManualStable(ctx context.Context, check selfupdate.Check, now time.Time) (selfupdate.Decision, error) {
 	installedVersion := check.InstalledVersion
 	if strings.TrimSpace(installedVersion) == "" || strings.EqualFold(strings.TrimSpace(installedVersion), "dev") {
 		installedVersion = "0.0.0"
@@ -108,9 +104,9 @@ func (u teamsReleaseAutoUpdater) checkManualStable(ctx context.Context, check te
 			Now:              now,
 			IgnorePriority:   true,
 		})
-		decision := teams.HelperAutoUpdateDecision{NextCheckAt: selected.NextCheckAt}
+		decision := selfupdate.Decision{NextCheckAt: selected.NextCheckAt}
 		if selected.Candidate != nil {
-			decision.Candidate = &teams.HelperAutoUpdateCandidate{
+			decision.Candidate = &selfupdate.Candidate{
 				TagName:     selected.Candidate.TagName,
 				Version:     selected.Candidate.Version,
 				Priority:    "manual",
@@ -132,13 +128,13 @@ func (u teamsReleaseAutoUpdater) checkManualStable(ctx context.Context, check te
 			err = fmt.Errorf("helper update check failed")
 		}
 		err = fmt.Errorf("release index failed: %v; %w", indexErr, err)
-		return teams.HelperAutoUpdateDecision{
+		return selfupdate.Decision{
 			NextCheckAt:  next,
 			BackoffUntil: next,
 			LastError:    err.Error(),
 		}, err
 	}
-	decision := teams.HelperAutoUpdateDecision{NextCheckAt: next}
+	decision := selfupdate.Decision{NextCheckAt: next}
 	if !status.UpdateAvailable {
 		return decision, nil
 	}
@@ -146,7 +142,7 @@ func (u teamsReleaseAutoUpdater) checkManualStable(ctx context.Context, check te
 	if tag == "" {
 		tag = "v" + strings.TrimPrefix(strings.TrimSpace(status.RemoteVersion), "v")
 	}
-	decision.Candidate = &teams.HelperAutoUpdateCandidate{
+	decision.Candidate = &selfupdate.Candidate{
 		TagName:  tag,
 		Version:  strings.TrimPrefix(strings.TrimSpace(status.RemoteVersion), "v"),
 		Priority: "manual",
@@ -155,24 +151,24 @@ func (u teamsReleaseAutoUpdater) checkManualStable(ctx context.Context, check te
 	return decision, nil
 }
 
-func (u teamsReleaseAutoUpdater) Apply(ctx context.Context, candidate teams.HelperAutoUpdateCandidate) (teams.HelperAutoUpdateApplyResult, error) {
-	return u.ApplyWithOptions(ctx, candidate, teams.HelperAutoUpdateApplyOptions{})
+func (u teamsReleaseAutoUpdater) Apply(ctx context.Context, candidate selfupdate.Candidate) (selfupdate.ApplyResult, error) {
+	return u.ApplyWithOptions(ctx, candidate, selfupdate.ApplyOptions{})
 }
 
-func (u teamsReleaseAutoUpdater) ApplyWithOptions(ctx context.Context, candidate teams.HelperAutoUpdateCandidate, applyOpts teams.HelperAutoUpdateApplyOptions) (teams.HelperAutoUpdateApplyResult, error) {
+func (u teamsReleaseAutoUpdater) ApplyWithOptions(ctx context.Context, candidate selfupdate.Candidate, applyOpts selfupdate.ApplyOptions) (selfupdate.ApplyResult, error) {
 	if err := preflightPersistedTeamsServiceForUpdate(); err != nil {
-		return teams.HelperAutoUpdateApplyResult{}, err
+		return selfupdate.ApplyResult{}, err
 	}
 	installPath, err := teamsAutoUpdateResolveInstallPath("")
 	if err != nil {
-		return teams.HelperAutoUpdateApplyResult{}, err
+		return selfupdate.ApplyResult{}, err
 	}
 	lock, ok, err := acquireHelperInstallLock(ctx, installPath)
 	if err != nil {
-		return teams.HelperAutoUpdateApplyResult{}, err
+		return selfupdate.ApplyResult{}, err
 	}
 	if !ok {
-		return teams.HelperAutoUpdateApplyResult{}, fmt.Errorf("another helper auto-update is already updating %s", installPath)
+		return selfupdate.ApplyResult{}, fmt.Errorf("another helper auto-update is already updating %s", installPath)
 	}
 	defer func() { _ = lock.Unlock() }()
 	activationPending, activationReason := teamsAutoUpdateShouldDeferActivation(installPath)
@@ -185,15 +181,15 @@ func (u teamsReleaseAutoUpdater) ApplyWithOptions(ctx context.Context, candidate
 		PendingReplacement: teamsPendingReplacementMode(applyOpts),
 	})
 	if err != nil {
-		return teams.HelperAutoUpdateApplyResult{}, err
+		return selfupdate.ApplyResult{}, err
 	}
 	activationPending, activationReason, err = teamsAutoUpdateActivationAfterApply(activationPending, activationReason, res)
 	if err != nil {
-		return teams.HelperAutoUpdateApplyResult{}, err
+		return selfupdate.ApplyResult{}, err
 	}
 	if res.RestartRequired {
 		if err := ensureCXPShimForInstallPath(res.InstallPath); err != nil {
-			return teams.HelperAutoUpdateApplyResult{}, err
+			return selfupdate.ApplyResult{}, err
 		}
 		if teamsServiceGOOS() == "windows" && strings.TrimSpace(res.PendingReplacePath) != "" {
 			// Best effort: the primary activation remains authoritative. A running
@@ -203,11 +199,11 @@ func (u teamsReleaseAutoUpdater) ApplyWithOptions(ctx context.Context, candidate
 		}
 	} else {
 		if err := finalizeHelperUpdateResult(res, io.Discard); err != nil {
-			return teams.HelperAutoUpdateApplyResult{}, err
+			return selfupdate.ApplyResult{}, err
 		}
 	}
 	installBundledSkillsFromHelper(ctx, helperUpdateExecutionPath(res), io.Discard)
-	return teams.HelperAutoUpdateApplyResult{
+	return selfupdate.ApplyResult{
 		Version:            res.Version,
 		InstallPath:        res.InstallPath,
 		RestartRequired:    res.RestartRequired,
@@ -281,16 +277,12 @@ func preflightPersistedTeamsServiceForUpdate() error {
 		// Linux Go runtime and still takes this check.
 		return fmt.Errorf("persisted Teams service executable %s is not executable", executable)
 	}
-	if registryPath := strings.TrimSpace(contract.RegistryPath); registryPath != "" && !filepath.IsAbs(registryPath) {
-		return fmt.Errorf("persisted Teams service registry path must be absolute: %s", registryPath)
-	}
 	return nil
 }
 
 type persistedTeamsServiceLaunchContract struct {
-	Executable   string
-	WorkingDir   string
-	RegistryPath string
+	Executable string
+	WorkingDir string
 }
 
 func readPersistedTeamsServiceLaunchContract(backendID string, path string) (persistedTeamsServiceLaunchContract, error) {
@@ -300,9 +292,8 @@ func readPersistedTeamsServiceLaunchContract(backendID string, path string) (per
 			return persistedTeamsServiceLaunchContract{}, err
 		}
 		return persistedTeamsServiceLaunchContract{
-			Executable:   cfg.Spec.Executable,
-			WorkingDir:   cfg.Spec.WorkingDir,
-			RegistryPath: cfg.Spec.RegistryPath,
+			Executable: cfg.Spec.Executable,
+			WorkingDir: cfg.Spec.WorkingDir,
 		}, nil
 	}
 	data, err := os.ReadFile(path)
@@ -325,7 +316,6 @@ func readPersistedTeamsServiceLaunchContract(backendID string, path string) (per
 				if len(fields) > 0 {
 					contract.Executable = fields[0]
 				}
-				contract.RegistryPath = registryArgumentValue(fields)
 			}
 		}
 		return contract, nil
@@ -333,9 +323,8 @@ func readPersistedTeamsServiceLaunchContract(backendID string, path string) (per
 		values := parsePersistedTeamsServicePlistStrings(text)
 		arguments := values["ProgramArguments"]
 		return persistedTeamsServiceLaunchContract{
-			Executable:   firstString(arguments),
-			WorkingDir:   firstString(values["WorkingDirectory"]),
-			RegistryPath: registryArgumentValue(arguments),
+			Executable: firstString(arguments),
+			WorkingDir: firstString(values["WorkingDirectory"]),
 		}, nil
 	case "windows-task-scheduler":
 		return readPersistedWindowsTaskLaunchContract(text)
@@ -351,7 +340,7 @@ func readPersistedTeamsServiceLaunchContract(backendID string, path string) (per
 		if err != nil {
 			return persistedTeamsServiceLaunchContract{}, err
 		}
-		contract := persistedTeamsServiceLaunchContract{RegistryPath: registryArgumentValue(args)}
+		contract := persistedTeamsServiceLaunchContract{}
 		for i := 0; i+1 < len(args); i++ {
 			if args[i] == "--cd" {
 				contract.WorkingDir = args[i+1]
@@ -413,20 +402,14 @@ func readPersistedWindowsTaskLaunchContract(text string) (persistedTeamsServiceL
 		}
 		return persistedWindowsPowerShellLaunchContract(psPath, contract)
 	case "powershell.exe", "powershell":
-		executable, argumentLine, err := persistedTeamsExecutableFromPowerShell(arguments)
+		executable, _, err := persistedTeamsExecutableFromPowerShell(arguments)
 		if err != nil {
 			return persistedTeamsServiceLaunchContract{}, err
 		}
 		contract.Executable = executable
-		if args, splitErr := splitWindowsCommandLine(argumentLine); splitErr == nil {
-			contract.RegistryPath = registryArgumentValue(args)
-		}
 		return contract, nil
 	default:
 		contract.Executable = command
-		if args, err := splitWindowsCommandLine(arguments); err == nil {
-			contract.RegistryPath = registryArgumentValue(args)
-		}
 		return contract, nil
 	}
 }
@@ -455,14 +438,11 @@ func persistedWindowsPowerShellLaunchContract(path string, contract persistedTea
 	if err != nil {
 		return persistedTeamsServiceLaunchContract{}, fmt.Errorf("read persisted Windows Teams PowerShell launcher %s: %w", path, err)
 	}
-	executable, argumentLine, err := persistedTeamsExecutableFromPowerShell(string(data))
+	executable, _, err := persistedTeamsExecutableFromPowerShell(string(data))
 	if err != nil {
 		return persistedTeamsServiceLaunchContract{}, err
 	}
 	contract.Executable = executable
-	if args, splitErr := splitWindowsCommandLine(argumentLine); splitErr == nil {
-		contract.RegistryPath = registryArgumentValue(args)
-	}
 	return contract, nil
 }
 
@@ -580,15 +560,6 @@ func persistedTeamsServiceXMLValue(text string, tag string) string {
 	return html.UnescapeString(strings.TrimSpace(text[start : start+end]))
 }
 
-func registryArgumentValue(args []string) string {
-	for i := 0; i+1 < len(args); i++ {
-		if args[i] == "--registry" {
-			return args[i+1]
-		}
-	}
-	return ""
-}
-
 func firstString(values []string) string {
 	if len(values) == 0 {
 		return ""
@@ -618,7 +589,7 @@ func teamsAutoUpdateActivationAfterApply(preUpdatePending bool, preUpdateReason 
 	return false, "", nil
 }
 
-func teamsPendingReplacementMode(applyOpts teams.HelperAutoUpdateApplyOptions) update.PendingReplacementMode {
+func teamsPendingReplacementMode(applyOpts selfupdate.ApplyOptions) update.PendingReplacementMode {
 	if applyOpts.OwnsPendingReplacement && teamsServiceGOOS() == "windows" {
 		return update.PendingReplacementReturnOnly
 	}

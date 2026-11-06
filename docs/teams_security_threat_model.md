@@ -116,13 +116,14 @@ reuse the durable bridge state.
 - Local temporary attachment paths should be exposed to Codex through stable,
   neutral aliases where possible. Full temp paths can leak usernames, message
   ids, or state layout and should not be used for ordinary no-attachment turns.
-- Outbound file send is explicit only. `teams send-file` may upload a local path
-  when the operator passes `--allow-local-path`; session `/send-file` accepts
-  only relative paths under the Teams outbound root.
+- Outbound file send is explicit only. Each turn gets its own output
+  directory; Codex lists files to return in a `codex-helper-artifacts`
+  manifest, and the helper accepts only relative paths under that turn's
+  directory. There is no command that uploads an arbitrary local path.
 - Outbound uploads use a fixed default OneDrive folder, a size cap, a narrow
   extension allowlist, symlink rejection, private local staging, and Teams
-  reference attachments. The bridge must not automatically upload arbitrary
-  Codex output without an explicit command.
+  reference attachments. The helper must not automatically upload arbitrary
+  Codex output that the manifest does not list.
 - The default remote folder should remain the Teams-compatible
   `Microsoft Teams Chat Files` folder unless the operator explicitly overrides
   it. Generated upload names must avoid collisions without exposing raw prompts,

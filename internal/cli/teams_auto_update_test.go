@@ -16,7 +16,7 @@ import (
 
 	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 	"github.com/baaaaaaaka/codex-helper/internal/managedinstall"
-	"github.com/baaaaaaaka/codex-helper/internal/teams"
+	"github.com/baaaaaaaka/codex-helper/internal/selfupdate"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
 )
 
@@ -166,7 +166,7 @@ func TestTeamsReleaseAutoUpdaterCheckSelectionAndBackoff(t *testing.T) {
 			if tc.installed != "" {
 				installed = tc.installed
 			}
-			got, err := updater.Check(context.Background(), teams.HelperAutoUpdateCheck{
+			got, err := updater.Check(context.Background(), selfupdate.Check{
 				InstalledVersion:  installed,
 				Now:               now,
 				IncludePrerelease: tc.checkPre,
@@ -228,7 +228,7 @@ func TestTeamsReleaseAutoUpdaterPrefersReleaseIndexOverListAPI(t *testing.T) {
 	}
 
 	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
-	got, err := updater.Check(context.Background(), teams.HelperAutoUpdateCheck{
+	got, err := updater.Check(context.Background(), selfupdate.Check{
 		InstalledVersion: "1.2.3",
 		Now:              now,
 	})
@@ -264,7 +264,7 @@ func TestTeamsReleaseAutoUpdaterReleaseIndexNoCandidateDoesNotFallBackToListAPI(
 	}
 
 	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
-	got, err := updater.Check(context.Background(), teams.HelperAutoUpdateCheck{
+	got, err := updater.Check(context.Background(), selfupdate.Check{
 		InstalledVersion: "1.2.3",
 		Now:              now,
 	})
@@ -296,7 +296,7 @@ func TestTeamsReleaseAutoUpdaterReleaseIndexFailureFallsBackToListAPI(t *testing
 	}
 
 	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
-	got, err := updater.Check(context.Background(), teams.HelperAutoUpdateCheck{
+	got, err := updater.Check(context.Background(), selfupdate.Check{
 		InstalledVersion: "1.2.3",
 		Now:              now,
 	})
@@ -338,7 +338,7 @@ func TestTeamsReleaseAutoUpdaterManualStablePrefersReleaseIndex(t *testing.T) {
 	}
 
 	updater := teamsReleaseAutoUpdater{repo: "owner/name", includePrerelease: true}
-	got, err := updater.Check(context.Background(), teams.HelperAutoUpdateCheck{
+	got, err := updater.Check(context.Background(), selfupdate.Check{
 		InstalledVersion:  "v1.2.3",
 		Now:               now,
 		Manual:            true,
@@ -398,7 +398,7 @@ func TestTeamsReleaseAutoUpdaterManualStableFallsBackToLatestCheckWhenIndexFails
 	}
 
 	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
-	got, err := updater.Check(context.Background(), teams.HelperAutoUpdateCheck{
+	got, err := updater.Check(context.Background(), selfupdate.Check{
 		InstalledVersion: "dev",
 		Now:              now,
 		Manual:           true,
@@ -445,7 +445,7 @@ func TestTeamsReleaseAutoUpdaterManualStableBacksOffWhenIndexAndLatestFail(t *te
 	}
 
 	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
-	got, err := updater.Check(context.Background(), teams.HelperAutoUpdateCheck{
+	got, err := updater.Check(context.Background(), selfupdate.Check{
 		InstalledVersion: "dev",
 		Now:              now,
 		Manual:           true,
@@ -496,7 +496,7 @@ func TestTeamsReleaseAutoUpdaterApplyUsesExplicitSelectedTag(t *testing.T) {
 		return update.ApplyResult{Version: "1.2.4", InstallPath: opts.InstallPath}, nil
 	}
 	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
-	res, err := updater.Apply(context.Background(), teams.HelperAutoUpdateCandidate{
+	res, err := updater.Apply(context.Background(), selfupdate.Candidate{
 		TagName:     "v1.2.4",
 		Version:     "1.2.4",
 		Priority:    "p0",
@@ -562,7 +562,7 @@ func TestTeamsReleaseAutoUpdaterApplyUsesRunningGoBinAndUnifiesManagedDefault(t 
 	}
 
 	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
-	res, err := updater.Apply(context.Background(), teams.HelperAutoUpdateCandidate{TagName: "v1.2.4", Version: "1.2.4"})
+	res, err := updater.Apply(context.Background(), selfupdate.Candidate{TagName: "v1.2.4", Version: "1.2.4"})
 	if err != nil {
 		t.Fatalf("Apply error: %v", err)
 	}
@@ -628,7 +628,7 @@ func TestTeamsReleaseAutoUpdaterManagedRuntimeActivationUsesNormalRestart(t *tes
 	}
 
 	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
-	res, err := updater.Apply(context.Background(), teams.HelperAutoUpdateCandidate{
+	res, err := updater.Apply(context.Background(), selfupdate.Candidate{
 		TagName: "v1.2.4",
 		Version: "1.2.4",
 	})
@@ -737,7 +737,7 @@ func TestTeamsReleaseAutoUpdaterApplyCreatesMissingCXPShim(t *testing.T) {
 	}
 
 	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
-	if _, err := updater.Apply(context.Background(), teams.HelperAutoUpdateCandidate{TagName: "v1.2.4", Version: "1.2.4"}); err != nil {
+	if _, err := updater.Apply(context.Background(), selfupdate.Candidate{TagName: "v1.2.4", Version: "1.2.4"}); err != nil {
 		t.Fatalf("Apply error: %v", err)
 	}
 	if target, err := os.Readlink(cxp); err != nil || target != managed {
@@ -792,7 +792,7 @@ func TestTeamsReleaseAutoUpdaterApplyUnifiesBrokenEnvAliases(t *testing.T) {
 	}
 
 	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
-	if _, err := updater.Apply(context.Background(), teams.HelperAutoUpdateCandidate{TagName: "v1.2.4", Version: "1.2.4"}); err != nil {
+	if _, err := updater.Apply(context.Background(), selfupdate.Candidate{TagName: "v1.2.4", Version: "1.2.4"}); err != nil {
 		t.Fatalf("Apply error: %v", err)
 	}
 	if out, err := exec.Command(current, "--version").CombinedOutput(); err != nil || !strings.Contains(string(out), "1.2.4") {
@@ -846,7 +846,7 @@ func TestTeamsReleaseAutoUpdaterApplyWithOptionsReturnsWindowsPendingReplacement
 	}
 
 	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
-	res, err := updater.ApplyWithOptions(context.Background(), teams.HelperAutoUpdateCandidate{TagName: "v1.2.4", Version: "1.2.4"}, teams.HelperAutoUpdateApplyOptions{OwnsPendingReplacement: true})
+	res, err := updater.ApplyWithOptions(context.Background(), selfupdate.Candidate{TagName: "v1.2.4", Version: "1.2.4"}, selfupdate.ApplyOptions{OwnsPendingReplacement: true})
 	if err != nil {
 		t.Fatalf("ApplyWithOptions error: %v", err)
 	}
@@ -881,7 +881,7 @@ func TestTeamsReleaseAutoUpdaterApplyDefersActivationFromTransientExecutable(t *
 		return update.ApplyResult{Version: "1.2.4", InstallPath: opts.InstallPath}, nil
 	}
 	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
-	res, err := updater.Apply(context.Background(), teams.HelperAutoUpdateCandidate{TagName: "v1.2.4", Version: "1.2.4"})
+	res, err := updater.Apply(context.Background(), selfupdate.Candidate{TagName: "v1.2.4", Version: "1.2.4"})
 	if err != nil {
 		t.Fatalf("Apply error: %v", err)
 	}
@@ -911,7 +911,7 @@ func TestTeamsReleaseAutoUpdaterApplyKeepsImmediateActivationForStableExecutable
 		return update.ApplyResult{Version: "1.2.4", InstallPath: opts.InstallPath}, nil
 	}
 	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
-	res, err := updater.Apply(context.Background(), teams.HelperAutoUpdateCandidate{TagName: "v1.2.4", Version: "1.2.4"})
+	res, err := updater.Apply(context.Background(), selfupdate.Candidate{TagName: "v1.2.4", Version: "1.2.4"})
 	if err != nil {
 		t.Fatalf("Apply error: %v", err)
 	}
@@ -944,7 +944,7 @@ func TestTeamsReleaseAutoUpdaterChecksActivationBeforeReplacingStableExecutable(
 	}
 
 	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
-	res, err := updater.Apply(context.Background(), teams.HelperAutoUpdateCandidate{TagName: "v1.2.4", Version: "1.2.4"})
+	res, err := updater.Apply(context.Background(), selfupdate.Candidate{TagName: "v1.2.4", Version: "1.2.4"})
 	if err != nil {
 		t.Fatalf("Apply error: %v", err)
 	}
@@ -1071,7 +1071,7 @@ func TestTeamsReleaseAutoUpdaterApplyPrefersLogicalDefaultThroughSymlinkedLocal(
 	}
 
 	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
-	res, err := updater.Apply(context.Background(), teams.HelperAutoUpdateCandidate{TagName: "v1.2.4", Version: "1.2.4"})
+	res, err := updater.Apply(context.Background(), selfupdate.Candidate{TagName: "v1.2.4", Version: "1.2.4"})
 	if err != nil {
 		t.Fatalf("Apply error: %v", err)
 	}
@@ -1191,7 +1191,7 @@ func TestTeamsReleaseAutoUpdaterApplyRepairsSelfLoopedManagedTargetThroughSymlin
 	}
 
 	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
-	res, err := updater.Apply(context.Background(), teams.HelperAutoUpdateCandidate{TagName: "v1.2.4", Version: "1.2.4"})
+	res, err := updater.Apply(context.Background(), selfupdate.Candidate{TagName: "v1.2.4", Version: "1.2.4"})
 	if err != nil {
 		t.Fatalf("Apply error: %v", err)
 	}
@@ -1272,7 +1272,7 @@ func TestTeamsReleaseAutoUpdaterApplyIgnoresUnusableSelfLoopedEnvWhenCurrentExec
 	}
 
 	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
-	res, err := updater.Apply(context.Background(), teams.HelperAutoUpdateCandidate{TagName: "v1.2.4", Version: "1.2.4"})
+	res, err := updater.Apply(context.Background(), selfupdate.Candidate{TagName: "v1.2.4", Version: "1.2.4"})
 	if err != nil {
 		t.Fatalf("Apply error: %v", err)
 	}
@@ -1318,7 +1318,7 @@ func TestTeamsReleaseAutoUpdaterApplyUsesSharedInstallLock(t *testing.T) {
 	t.Cleanup(func() { _ = lock.Unlock() })
 
 	updater := teamsReleaseAutoUpdater{repo: "owner/name"}
-	_, err = updater.Apply(context.Background(), teams.HelperAutoUpdateCandidate{
+	_, err = updater.Apply(context.Background(), selfupdate.Candidate{
 		TagName:     "v1.2.4",
 		Version:     "1.2.4",
 		Priority:    "p0",

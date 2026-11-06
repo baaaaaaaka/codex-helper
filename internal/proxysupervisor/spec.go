@@ -8,7 +8,6 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -250,14 +249,4 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
-}
-
-// RenderPath returns a conventional per-user output path without creating or
-// writing anything.
-func RenderPath(baseDir string, s Spec) (string, error) {
-	name, _, err := Render(s)
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(baseDir, name), nil
 }

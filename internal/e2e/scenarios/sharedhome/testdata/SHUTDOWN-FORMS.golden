@@ -1,0 +1,19 @@
+# SHUTDOWN-FORMS: `/shutdown` in the control chat is `shutdown`: one reply, the helper stops, the message is not labelled
+# cxp black-box transcript; volatile values are numbered placeholders
+
+== chat <chat:1> "🏠 Codex Control - e2ehost"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
+-- <msg:2> owner (html)
+   | <p>/shutdown</p>
+-- <msg:3> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Stopped on all machines. Teams is no longer read, so it cannot be restarted from here: run <code>cxp teams start</code> on any machine.</p>
+
+== cli
+$ cxp teams start
+   exit 0
+   stdout| Started the Teams helper again on all machines (it was: Stopped on all machines by `shutdown` in the Teams control chat (host-a, <time:1>); removed <root>/home/.local/state/codex-helper/teams/DISABLED).
+   stdout| No Teams service is installed on this machine. A helper standing by on any machine (the last one ran on host-a) resumes within a minute; if none is, run `cxp teams run`, or install the service with `cxp teams service install`.

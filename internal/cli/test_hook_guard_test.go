@@ -64,7 +64,7 @@ func lockCLITestHooks(t testing.TB) {
 	codexAppTokenElevationFn = func() (bool, error) { return false, nil }
 	teamsUserPathResolver = cliTestUserPathResolverFunc(func(_ context.Context, request userpath.Request) (userpath.Result, error) {
 		pathValue, _ := userpath.EnvironmentValue(request.ServiceEnvironment, "PATH", false)
-		return userpath.Result{Path: pathValue, Mode: userpath.ModeService, Source: "test-service-environment"}, nil
+		return userpath.Result{Path: pathValue, Mode: userpath.ModeAccountDefault, Source: "test-service-environment"}, nil
 	})
 	t.Cleanup(func() {
 		resolveInstallPathForCLI = prevResolveInstallPathForCLI

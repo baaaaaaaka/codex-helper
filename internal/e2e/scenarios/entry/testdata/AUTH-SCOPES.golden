@@ -1,0 +1,26 @@
+# AUTH-SCOPES: Graph scopes broader than the defaults are refused (auth config, status, run) unless CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES=1
+# cxp black-box transcript; volatile values are numbered placeholders
+
+== chat <chat:1> "🏠 Codex Control - e2ehost"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
+
+== cli
+$ cxp teams auth config --scopes openid profile offline_access User.Read Chat.ReadWrite Mail.Read Sites.FullControl.All
+   exit 0
+   stdout| Saved Teams auth config: <root>/home/.config/codex-helper/teams-auth.json
+   stdout| Not ready: unexpected Teams Graph scope(s): Mail.Read, Sites.FullControl.All; set CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES=1 to override
+$ cxp teams auth config
+   exit 0
+   stdout| Teams auth config: <root>/home/.config/codex-helper/teams-auth.json
+   stdout| Tenant ID: configured
+   stdout| Client ID: configured
+   stdout| Scopes: openid profile offline_access User.Read Chat.ReadWrite Mail.Read Sites.FullControl.All
+$ cxp teams auth config --scopes 
+   exit 0
+   stdout| Saved Teams auth config: <root>/home/.config/codex-helper/teams-auth.json
+   stdout| Tenant ID: configured
+   stdout| Client ID: configured
+   stdout| Scopes: openid profile offline_access User.Read Chat.ReadWrite OnlineMeetings.ReadWrite Files.ReadWrite

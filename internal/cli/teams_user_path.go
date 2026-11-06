@@ -77,17 +77,6 @@ func resolveTeamsCodexUserPath(ctx context.Context, cfg config.Config, paths eff
 // wrapper probes, but is removed from the PATH exposed to the final app-server.
 func applyTeamsUserPathRuntime(runtimeContract resolvedCodexRuntime, pathResult userpath.Result, log io.Writer) resolvedCodexRuntime {
 	runtimeContract.WrapperCommand = runtimeContract.Command
-	// service is the exact compatibility mode for pre-policy installations.
-	// Preserve the JavaScript wrapper and managed Node environment as well as
-	// the service PATH; otherwise migration would still change runtime behavior
-	// even though the configured PATH source was kept compatible.
-	if pathResult.Mode == userpath.ModeService {
-		if _, vendorPath, err := teamsFindNativeCodex(runtimeContract.Command); err == nil && strings.TrimSpace(vendorPath) != "" {
-			runtimeContract.VendorPathDir = vendorPath
-			runtimeContract.Environment = setEnvValue(runtimeContract.Environment, "PATH", prependPathDir(vendorPath, envValue(runtimeContract.Environment, "PATH")))
-		}
-		return runtimeContract
-	}
 	userPath := pathResult.Path
 	if native, vendorPath, err := teamsFindNativeCodex(runtimeContract.Command); err == nil {
 		runtimeContract.Command = native

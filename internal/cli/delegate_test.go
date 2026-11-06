@@ -15,9 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/baaaaaaaka/codex-helper/internal/teams"
-	"github.com/baaaaaaaka/codex-helper/internal/teams/delegation"
-	"github.com/baaaaaaaka/codex-helper/internal/teams/machineregistry"
+	"github.com/baaaaaaaka/codex-helper/internal/core/delegate/delegation"
+	"github.com/baaaaaaaka/codex-helper/internal/core/delegate/machineregistry"
 )
 
 func TestDelegateResolveReturnsSingleStartCandidate(t *testing.T) {
@@ -1025,9 +1024,6 @@ func TestDelegateInboxStatusReadsPagedResult(t *testing.T) {
 	if state.Status != delegation.StateComplete || state.Terminal == nil || state.Terminal.Body != "paged answer" {
 		t.Fatalf("state = %#v, want complete result from second page", state)
 	}
-	if graph.windowListCount < 2 {
-		t.Fatalf("window list count = %d, want paged read", graph.windowListCount)
-	}
 }
 
 func TestDelegateRegistryRecordsReadsPagedMessages(t *testing.T) {
@@ -1055,9 +1051,6 @@ func TestDelegateRegistryRecordsReadsPagedMessages(t *testing.T) {
 	}
 	if !containsDelegateRecordID(records, req.RecordID) {
 		t.Fatalf("records = %#v, want request from second page", records)
-	}
-	if graph.windowListCount < 2 {
-		t.Fatalf("window list count = %d, want paged registry read", graph.windowListCount)
 	}
 }
 
@@ -1595,10 +1588,9 @@ func containsString(values []string, want string) bool {
 }
 
 type fakeDelegateRegistryGraph struct {
-	messagesByChat      map[string][]teams.ChatMessage
+	messagesByChat      map[string][]machineregistry.ChatMessage
 	chatsByRef          map[string]string
 	sendCount           int
-	windowListCount     int
 	sendErrAfterCommit  error
 	sendErrBeforeCommit error
 	listErrAfterSend    error
@@ -1606,23 +1598,23 @@ type fakeDelegateRegistryGraph struct {
 
 func newFakeDelegateRegistryGraph() *fakeDelegateRegistryGraph {
 	return &fakeDelegateRegistryGraph{
-		messagesByChat: map[string][]teams.ChatMessage{},
+		messagesByChat: map[string][]machineregistry.ChatMessage{},
 		chatsByRef:     map[string]string{},
 	}
 }
 
-func (g *fakeDelegateRegistryGraph) SendHTML(_ context.Context, chatID string, content string) (teams.ChatMessage, error) {
+func (g *fakeDelegateRegistryGraph) SendHTML(_ context.Context, chatID string, content string) (machineregistry.ChatMessage, error) {
 	g.sendCount++
 	id := fmt.Sprintf("message-%06d", g.sendCount)
-	msg := teams.ChatMessage{ID: id}
+	msg := machineregistry.ChatMessage{ID: id}
 	msg.Body.Content = content
 	chatID = strings.TrimSpace(chatID)
 	if g.sendErrBeforeCommit != nil {
 		err := g.sendErrBeforeCommit
 		g.sendErrBeforeCommit = nil
-		return teams.ChatMessage{}, err
+		return machineregistry.ChatMessage{}, err
 	}
-	g.messagesByChat[chatID] = append([]teams.ChatMessage{msg}, g.messagesByChat[chatID]...)
+	g.messagesByChat[chatID] = append([]machineregistry.ChatMessage{msg}, g.messagesByChat[chatID]...)
 	if g.sendErrAfterCommit != nil {
 		err := g.sendErrAfterCommit
 		g.sendErrAfterCommit = nil
@@ -1631,7 +1623,7 @@ func (g *fakeDelegateRegistryGraph) SendHTML(_ context.Context, chatID string, c
 	return msg, nil
 }
 
-func (g *fakeDelegateRegistryGraph) ListMessages(_ context.Context, chatID string, top int) ([]teams.ChatMessage, error) {
+func (g *fakeDelegateRegistryGraph) ListMessages(_ context.Context, chatID string, top int) ([]machineregistry.ChatMessage, error) {
 	if g.listErrAfterSend != nil {
 		return nil, g.listErrAfterSend
 	}
@@ -1639,62 +1631,17 @@ func (g *fakeDelegateRegistryGraph) ListMessages(_ context.Context, chatID strin
 	if top <= 0 || top > len(messages) {
 		top = len(messages)
 	}
-	return append([]teams.ChatMessage(nil), messages[:top]...), nil
+	return append([]machineregistry.ChatMessage(nil), messages[:top]...), nil
 }
 
-func (g *fakeDelegateRegistryGraph) ListMessagesExactTopWithoutRateLimitRetry(ctx context.Context, chatID string, top int) ([]teams.ChatMessage, error) {
-	return g.ListMessages(ctx, chatID, top)
-}
-
-func (g *fakeDelegateRegistryGraph) ListMessagesWindow(_ context.Context, chatID string, top int, _ time.Time) (teams.MessageWindow, error) {
-	if g.listErrAfterSend != nil {
-		return teams.MessageWindow{}, g.listErrAfterSend
-	}
-	return g.listMessagesWindowFromOffset(chatID, top, 0), nil
-}
-
-func (g *fakeDelegateRegistryGraph) ListMessagesWindowFromPath(_ context.Context, path string) (teams.MessageWindow, error) {
-	if g.listErrAfterSend != nil {
-		return teams.MessageWindow{}, g.listErrAfterSend
-	}
-	var chatID string
-	var top, offset int
-	if _, err := fmt.Sscanf(path, "fake-window:%s %d %d", &chatID, &top, &offset); err != nil {
-		return teams.MessageWindow{}, err
-	}
-	return g.listMessagesWindowFromOffset(chatID, top, offset), nil
-}
-
-func (g *fakeDelegateRegistryGraph) listMessagesWindowFromOffset(chatID string, top int, offset int) teams.MessageWindow {
-	g.windowListCount++
-	chatID = strings.TrimSpace(chatID)
-	messages := g.messagesByChat[chatID]
-	if top <= 0 {
-		top = len(messages)
-	}
-	if offset < 0 {
-		offset = 0
-	}
-	end := offset + top
-	if end > len(messages) {
-		end = len(messages)
-	}
-	window := teams.MessageWindow{Messages: append([]teams.ChatMessage(nil), messages[offset:end]...)}
-	if end < len(messages) {
-		window.Truncated = true
-		window.NextPath = fmt.Sprintf("fake-window:%s %d %d", chatID, top, end)
-	}
-	return window
-}
-
-func (g *fakeDelegateRegistryGraph) CreateOrGetMeetingChatWindow(_ context.Context, topic string, externalID string, _ time.Time, _ time.Time) (teams.Chat, teams.OnlineMeeting, error) {
+func (g *fakeDelegateRegistryGraph) CreateOrGetMeetingChatWindow(_ context.Context, topic string, externalID string, _ time.Time, _ time.Time) (machineregistry.Chat, machineregistry.OnlineMeeting, error) {
 	externalID = strings.TrimSpace(externalID)
 	chatID := g.chatsByRef[externalID]
 	if chatID == "" {
 		chatID = "chat-" + externalID
 		g.chatsByRef[externalID] = chatID
 	}
-	return teams.Chat{ID: chatID, Topic: topic, ChatType: "meeting"}, teams.OnlineMeeting{ID: "meeting-" + externalID}, nil
+	return machineregistry.Chat{ID: chatID, Topic: topic, ChatType: "meeting"}, machineregistry.OnlineMeeting{ID: "meeting-" + externalID}, nil
 }
 
 func (g *fakeDelegateRegistryGraph) sendCountForChat(chatID string) int {

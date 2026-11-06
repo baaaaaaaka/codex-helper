@@ -19,14 +19,26 @@ if ! mkdir -p "$runner_temp"; then
   exit 2
 fi
 
-frontier_recovery_pattern='^TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover$'
 migration_process_pattern='^TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup$'
-external_perf_pattern='^(?:TestCXPPerfModelExternalScenariosCoverCommonPaths|TestCXPPerfModelSQLiteExternalScenariosCoverCommonPaths)$'
-teams_durable_pattern='^(?:TestBridgeSyncLinkedTranscriptPersistsHistoryQuarantineWithLegacyGeneration|TestBridgeSyncLinkedTranscriptReleasesPendingRootAcrossSQLiteStoreReopen|TestTeamsListenFalseMalformedActiveSQLitePollDoesNotBaseline|TestTeamsListenFalsePolledTurnOutboxSurvivesReopen|TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI)$'
-store_durable_pattern='^(?:TestGlobalInboundSQLiteWriterDefersPruneUntilClose|TestSQLiteHotPollAdmissionAdmitsMalformedPollWithoutStarvingHealthyChat|TestSQLiteHotPollReadyScheduleSkipsMalformedOperationalPrefix|TestSQLiteLegacyEmptyRuntimeProjectionBootstrapsOnceForHotPoll|TestSQLiteMalformedNumericCompatibilityColumnsDoNotAbortRecovery|TestSQLiteHotPollTrustedWorkCandidatesContinuesPastInvalidPage|TestSQLiteHotPollAdmissionUsesJSONFrontierHonorsBlockedUntilAndReservesControl|TestStoreOwnerBoundOutboxAdmissionRejectsStaleOwnerAcrossBackends|TestSQLiteActiveJSONSessionSurvivesStaleSQLStatus)$'
-isolated_skip_pattern='^(?:TestTeamsListenFalsePollFrontierSurvivesStoreReopenAndOwnerTakeover|TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup|TestCXPPerfModelExternalScenariosCoverCommonPaths|TestCXPPerfModelSQLiteExternalScenariosCoverCommonPaths|TestBridgeSyncLinkedTranscriptPersistsHistoryQuarantineWithLegacyGeneration|TestBridgeSyncLinkedTranscriptReleasesPendingRootAcrossSQLiteStoreReopen|TestTeamsListenFalseMalformedActiveSQLitePollDoesNotBaseline|TestTeamsListenFalsePolledTurnOutboxSurvivesReopen|TestTeamsOwnershipStressSQLiteHeartbeatSurvivesSaturatedGraphWorkersCI|TestGlobalInboundSQLiteWriterDefersPruneUntilClose|TestSQLiteHotPollAdmissionAdmitsMalformedPollWithoutStarvingHealthyChat|TestSQLiteHotPollReadyScheduleSkipsMalformedOperationalPrefix|TestSQLiteLegacyEmptyRuntimeProjectionBootstrapsOnceForHotPoll|TestSQLiteMalformedNumericCompatibilityColumnsDoNotAbortRecovery|TestSQLiteHotPollTrustedWorkCandidatesContinuesPastInvalidPage|TestSQLiteHotPollAdmissionUsesJSONFrontierHonorsBlockedUntilAndReservesControl|TestStoreOwnerBoundOutboxAdmissionRejectsStaleOwnerAcrossBackends|TestSQLiteActiveJSONSessionSurvivesStaleSQLStatus)$'
+isolated_skip_pattern='^(?:TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup)$'
 
 failures=()
+
+# The end-to-end scenarios run in their own CI job (one SUT build per package
+# and a wall-clock budget of their own); every other package is covered here.
+if ! packages_text="$("$go_bin" list ./... 2>"$runner_temp/full-go-test-list.err")"; then
+  cat "$runner_temp/full-go-test-list.err" >&2
+  echo "::error title=Full Go test failure::go list ./... failed"
+  exit 1
+fi
+packages=()
+while IFS= read -r pkg; do
+  case "$pkg" in
+    */internal/e2e/scenarios/*) ;;
+    "") ;;
+    *) packages+=("$pkg") ;;
+  esac
+done <<< "$packages_text"
 
 failure_summary() {
   local log=$1
@@ -78,13 +90,7 @@ run_suite \
   "Full Go test" \
   "$runner_temp/full-go-test.log" \
   "$coverage_file" \
-  test -timeout=20m -parallel=16 -skip "$isolated_skip_pattern" -coverprofile="$coverage_file" ./...
-
-run_suite \
-  "Isolated frontier recovery" \
-  "$runner_temp/frontier-recovery-isolated.log" \
-  "$runner_temp/frontier-recovery-coverage.out" \
-  test ./internal/teams -timeout=2m -parallel=16 -count=1 -run "$frontier_recovery_pattern" -coverprofile="$runner_temp/frontier-recovery-coverage.out" -v
+  test -timeout=20m -parallel=16 -skip "$isolated_skip_pattern" -coverprofile="$coverage_file" "${packages[@]}"
 
 run_suite \
   "Isolated migration process" \
@@ -92,27 +98,9 @@ run_suite \
   "$runner_temp/migration-process-coverage.out" \
   test ./internal/cli -timeout=2m -parallel=16 -count=1 -run "$migration_process_pattern" -coverprofile="$runner_temp/migration-process-coverage.out" -v
 
-run_suite \
-  "Isolated external perf" \
-  "$runner_temp/external-perf-isolated.log" \
-  "$runner_temp/external-perf-coverage.out" \
-  test ./internal/teams -timeout=12m -parallel=1 -count=1 -run "$external_perf_pattern" -coverprofile="$runner_temp/external-perf-coverage.out" -v
-
-run_suite \
-  "Isolated Teams durable" \
-  "$runner_temp/teams-durable-isolated.log" \
-  "$runner_temp/teams-durable-coverage.out" \
-  test ./internal/teams -timeout=12m -parallel=1 -count=1 -run "$teams_durable_pattern" -coverprofile="$runner_temp/teams-durable-coverage.out" -v
-
-run_suite \
-  "Isolated store durable" \
-  "$runner_temp/store-durable-isolated.log" \
-  "$runner_temp/store-durable-coverage.out" \
-  test ./internal/teams/store -timeout=12m -parallel=1 -count=1 -run "$store_durable_pattern" -coverprofile="$runner_temp/store-durable-coverage.out" -v
-
 if (( ${#failures[@]} != 0 )); then
   printf 'full Linux Go test suites failed after collection: %s\n' "${failures[*]}" >&2
   exit 1
 fi
 
-echo "full Linux Go test suites passed: 6 suite(s)"
+echo "full Linux Go test suites passed: 2 suite(s)"

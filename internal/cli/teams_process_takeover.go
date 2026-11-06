@@ -93,7 +93,7 @@ func teamsServiceLocalProcessMatchesSpec(proc teamsServiceLocalProcess, spec tea
 	if !teamsServiceLocalProcessStateRootMatches(proc.Env, spec.Environment) {
 		return false
 	}
-	return teamsServiceLocalProcessRegistryMatches(proc.Args, proc.Env, spec.RegistryPath, spec.Environment)
+	return teamsServiceLocalProcessRegistryMatches(proc.Args, proc.Env, "", spec.Environment)
 }
 
 func teamsServiceLocalProcessKind(args []string) string {

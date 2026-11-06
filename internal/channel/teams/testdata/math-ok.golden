@@ -1,0 +1,4 @@
+== part 1/1 size=374 mention=false images=2
+<p><strong>Codex answer:</strong></p><p>Energy:</p><pre><code>E = mc^2</code></pre><p><img src="../hostedContents/1/$value" alt="Rendered TeX formula"></p><p>inline <code>a+b</code> here</p><pre><code>
+\frac{1}{2}
+</code></pre><p><img src="../hostedContents/2/$value" alt="Rendered TeX formula"></p><ul><li>in list <code>x</code></li></ul><p><code>x</code> trailing text</p>

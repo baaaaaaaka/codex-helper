@@ -279,13 +279,3 @@ func IsKind(err error, kind ErrorKind) bool {
 	var target *Error
 	return errors.As(err, &target) && target.Kind == kind
 }
-
-func unsupported(operation string) error {
-	return &Error{Kind: ErrorUnsupported, Message: operation + " is not supported by this runner"}
-}
-
-// UnsupportedError exposes the same typed error used by built-in runners to
-// optional integrations such as the Teams native fork workflow.
-func UnsupportedError(operation string) error {
-	return unsupported(operation)
-}

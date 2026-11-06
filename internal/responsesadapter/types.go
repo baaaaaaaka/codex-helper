@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
-
-	"github.com/baaaaaaaka/codex-helper/internal/config"
 )
 
 type Scope struct {
@@ -111,7 +109,7 @@ type ProviderRequest struct {
 	Background             *bool
 	ContextManagement      json.RawMessage
 	ParallelEnforcement    string
-	StructuredOutputPolicy config.ModelStructuredOutputPolicy
+	StructuredOutputPolicy StructuredOutputPolicy
 	SourcePolicy           SourcePolicy
 	Scope                  Scope
 	History                []ResponseRecord

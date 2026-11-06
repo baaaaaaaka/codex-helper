@@ -770,15 +770,6 @@ func copyDirContents(dst string, src string) error {
 	})
 }
 
-func relatedPaths(base string, suffixes ...string) []string {
-	withBase := suffixesWithBase(suffixes...)
-	paths := make([]string, 0, len(withBase))
-	for _, suffix := range withBase {
-		paths = append(paths, base+suffix)
-	}
-	return paths
-}
-
 func suffixesWithBase(suffixes ...string) []string {
 	out := []string{""}
 	for _, suffix := range suffixes {
@@ -788,16 +779,6 @@ func suffixesWithBase(suffixes ...string) []string {
 		out = append(out, suffix)
 	}
 	return out
-}
-
-func anyPathExists(paths []string) bool {
-	for _, path := range paths {
-		ok, err := pathExists(path)
-		if err == nil && ok {
-			return true
-		}
-	}
-	return false
 }
 
 func pathExists(path string) (bool, error) {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -40,10 +41,6 @@ func TestStore_SaveAndLoadRoundTrip(t *testing.T) {
 	now := time.Now().UTC().Truncate(time.Second)
 	in := Config{
 		Version: CurrentVersion,
-		Defaults: &GlobalDefaults{
-			Model:           "profile:deepseek-work",
-			ReasoningEffort: "high",
-		},
 		TeamsCodexPath: TeamsCodexPathPolicy{
 			Mode:          "explicit",
 			ExplicitPath:  "/home/alice/.local/bin:/usr/bin",
@@ -51,18 +48,6 @@ func TestStore_SaveAndLoadRoundTrip(t *testing.T) {
 		},
 		Profiles: []Profile{
 			{ID: "p1", Name: "n1", Host: "h", Port: 22, User: "u", CreatedAt: now},
-		},
-		DefaultModelProfile: "deepseek-work",
-		ModelProfiles: map[string]ModelProfile{
-			"deepseek-work": {
-				Provider:  "deepseek",
-				BaseURL:   "https://responses.example.invalid/v1",
-				APIKeyRef: "env:DEEPSEEK_API_KEY",
-				SSHProxy:  "n1",
-				Revision:  2,
-				CreatedAt: now,
-				UpdatedAt: now,
-			},
 		},
 	}
 
@@ -80,17 +65,58 @@ func TestStore_SaveAndLoadRoundTrip(t *testing.T) {
 	if len(out.Profiles) != 1 || out.Profiles[0].ID != "p1" {
 		t.Fatalf("Profiles=%#v", out.Profiles)
 	}
-	if out.DefaultModelProfile != "deepseek-work" {
-		t.Fatalf("DefaultModelProfile=%q", out.DefaultModelProfile)
-	}
-	if out.Defaults == nil || out.Defaults.Model != "profile:deepseek-work" || out.Defaults.ReasoningEffort != "high" {
-		t.Fatalf("Defaults round trip failed: %#v", out.Defaults)
-	}
-	if got := out.ModelProfiles["deepseek-work"]; got.Provider != "deepseek" || got.BaseURL != "https://responses.example.invalid/v1" || got.APIKeyRef != "env:DEEPSEEK_API_KEY" || got.Revision != 2 {
-		t.Fatalf("ModelProfiles round trip failed: %#v", out.ModelProfiles)
-	}
 	if out.TeamsCodexPath != in.TeamsCodexPath {
 		t.Fatalf("TeamsCodexPath = %#v, want %#v", out.TeamsCodexPath, in.TeamsCodexPath)
+	}
+}
+
+// The model settings of earlier releases are no longer read, but a rewrite
+// keeps them verbatim (an older binary may share the config), and a model
+// config the old validation would have refused no longer blocks loading.
+func TestStore_KeepsRetiredModelSettingsVerbatim(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.json")
+	legacy := `{"version":6,"minReader":1,"profiles":[],` +
+		`"defaults":{"model":"profile:work","reasoningEffort":"high"},` +
+		`"defaultModelProfile":"work",` +
+		`"modelProfiles":{"work":{"provider":"deepseek","revision":1,"unknownField":true}},` +
+		`"modelCatalogs":{"c":{"git":"https://example.invalid/m.git"}},` +
+		`"modelProviderBindings":{"p":{"apiKeyRef":"secret:p"}}}`
+	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Update(func(cfg *Config) error {
+		cfg.Profiles = append(cfg.Profiles, Profile{ID: "p1", Name: "n1", Host: "h", Port: 22, User: "u"})
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]string{
+		"defaults":              `{"model":"profile:work","reasoningEffort":"high"}`,
+		"defaultModelProfile":   `"work"`,
+		"modelProfiles":         `{"work":{"provider":"deepseek","revision":1,"unknownField":true}}`,
+		"modelCatalogs":         `{"c":{"git":"https://example.invalid/m.git"}}`,
+		"modelProviderBindings": `{"p":{"apiKeyRef":"secret:p"}}`,
+	} {
+		var got, exp any
+		if err := json.Unmarshal(doc[key], &got); err != nil {
+			t.Fatalf("%s: %v (%s)", key, err, doc[key])
+		}
+		_ = json.Unmarshal([]byte(want), &exp)
+		if !reflect.DeepEqual(got, exp) {
+			t.Fatalf("%s = %s, want %s", key, doc[key], want)
+		}
 	}
 }
 
@@ -111,35 +137,8 @@ func TestStore_LoadMigratesVersionOneConfig(t *testing.T) {
 	if cfg.Version != CurrentVersion {
 		t.Fatalf("Version=%d want %d", cfg.Version, CurrentVersion)
 	}
-	if cfg.TeamsCodexPath.Mode != "service" {
-		t.Fatalf("legacy TeamsCodexPath mode = %q, want service", cfg.TeamsCodexPath.Mode)
-	}
 	if len(cfg.Profiles) != 1 || cfg.Profiles[0].Name != "n1" {
 		t.Fatalf("Profiles=%#v", cfg.Profiles)
-	}
-	if cfg.DefaultModelProfile != "" || len(cfg.ModelProfiles) != 0 {
-		t.Fatalf("version 1 migration should not synthesize model profiles: default=%q profiles=%#v", cfg.DefaultModelProfile, cfg.ModelProfiles)
-	}
-	if got, ok := cfg.FindModelProfile(""); !ok || got.SSHProxy != "" {
-		t.Fatalf("built-in default model profile should not inherit an ssh proxy: ok=%v profile=%#v", ok, got)
-	}
-}
-
-func TestStore_LoadKeepsPrePathPolicyInstallationsOnServiceMode(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.json")
-	if err := os.WriteFile(path, []byte(`{"version":4,"minReader":1,"profiles":[]}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	store, err := NewStore(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	cfg, err := store.Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.TeamsCodexPath.Mode != "service" {
-		t.Fatalf("legacy TeamsCodexPath mode = %q, want service", cfg.TeamsCodexPath.Mode)
 	}
 }
 

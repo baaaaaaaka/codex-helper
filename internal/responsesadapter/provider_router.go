@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-
-	"github.com/baaaaaaaka/codex-helper/internal/config"
 )
 
 type ProviderRuntime struct {
@@ -28,13 +26,32 @@ type ProviderRuntime struct {
 	SourcePolicy            SourcePolicy
 	ResponsesPolicy         ResponsesPolicy
 	ParallelToolEnforcement string
-	Route                   config.ModelRoute
+	Route                   Route
 }
 
-// ResponsesPolicy is the runtime view of the JSON model contract. Keeping an
-// alias here prevents structured-output declarations from being dropped when
-// a catalog is materialized into the adapter registry.
-type ResponsesPolicy = config.ModelResponsesPolicy
+// Route selects a wire adapter for one operation.
+type Route struct {
+	Interface  string `json:"interface"`
+	Adapter    string `json:"adapter"`
+	Protocol   string `json:"protocol"`
+	Conversion string `json:"conversion,omitempty"`
+}
+
+// StructuredOutputPolicy distinguishes json_object from json_schema;
+// providers commonly support one format reliably but not the other.
+type StructuredOutputPolicy struct {
+	JSONObject string `json:"jsonObject,omitempty"`
+	JSONSchema string `json:"jsonSchema,omitempty"`
+}
+
+// ResponsesPolicy advertises fields whose semantics differ between provider
+// APIs. A value of "unsupported" makes the facade fail closed.
+type ResponsesPolicy struct {
+	PreviousResponseID string                 `json:"previousResponseId,omitempty"`
+	Background         string                 `json:"background,omitempty"`
+	ContextManagement  string                 `json:"contextManagement,omitempty"`
+	StructuredOutput   StructuredOutputPolicy `json:"structuredOutput,omitempty"`
+}
 
 func validateSourcePolicy(policy SourcePolicy) error {
 	mode := strings.ToLower(strings.TrimSpace(policy.Mode))
@@ -53,22 +70,6 @@ func validateSourcePolicy(policy SourcePolicy) error {
 		return fmt.Errorf("source policy cannot require URL/structured citations when mode is text")
 	}
 	return nil
-}
-
-// ValidateDirectSourcePolicy is the fail-closed boundary for a native
-// Responses pass-through. Unlike the translated Chat facade, the native
-// proxy does not inspect provider response events, so it cannot enforce
-// annotation/text/source requirements. An explicitly unsupported policy is
-// safe; every other source mode must use a route with response translation.
-func ValidateDirectSourcePolicy(policy SourcePolicy) error {
-	mode := strings.ToLower(strings.TrimSpace(policy.Mode))
-	if mode == "" || mode == "unsupported" {
-		if mode == "unsupported" && (policy.RequireURL || policy.RequireSources) {
-			return fmt.Errorf("direct Responses route cannot require sources when source mode is unsupported")
-		}
-		return nil
-	}
-	return fmt.Errorf("direct Responses route cannot enforce source policy %q; use a translated route", policy.Mode)
 }
 
 type ProviderRouter interface {
@@ -133,10 +134,6 @@ func (f *Facade) resolveRuntime(r *http.Request, req ResponsesRequest) (Provider
 	}, nil
 }
 
-func routeErrorf(status int, format string, args ...any) RouteError {
-	return RouteError{Status: status, Message: fmt.Sprintf(format, args...)}
-}
-
 func validateResponsesPolicy(req ResponsesRequest, policy ResponsesPolicy) error {
 	if err := validateStructuredOutputRequest(req.ResponseFormat, policy.StructuredOutput); err != nil {
 		return err
@@ -168,24 +165,6 @@ func validateResponsesPolicy(req ResponsesRequest, policy ResponsesPolicy) error
 		case "delegated":
 			return fmt.Errorf("context_management is marked delegated but no local context manager is configured")
 		}
-	}
-	return nil
-}
-
-// ValidateResponsesRequestPolicy exposes the same catalog policy check to
-// transports that forward a provider's native Responses wire directly. This
-// keeps a direct native route from bypassing JSON-declared unsupported or
-// delegated field semantics.
-func ValidateResponsesRequestPolicy(req ResponsesRequest, policy ResponsesPolicy) error {
-	return validateResponsesPolicy(req, policy)
-}
-
-func validateProviderResponseFields(req ProviderRequest, adapter string) error {
-	if req.Background != nil {
-		return fmt.Errorf("%s adapter cannot forward background responses", adapter)
-	}
-	if len(req.ContextManagement) > 0 {
-		return fmt.Errorf("%s adapter cannot forward context_management", adapter)
 	}
 	return nil
 }

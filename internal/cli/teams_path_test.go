@@ -12,7 +12,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/userpath"
 )
 
-func TestTeamsPathExplicitCaptureAndModeCommandsPersistPolicy(t *testing.T) {
+func TestTeamsPathExplicitAndModeCommandsPersistPolicy(t *testing.T) {
 	lockCLITestHooks(t)
 	configPath := filepath.Join(t.TempDir(), "config.json")
 
@@ -42,22 +42,23 @@ func TestTeamsPathExplicitCaptureAndModeCommandsPersistPolicy(t *testing.T) {
 		t.Fatalf("explicit policy = %#v", cfg.TeamsCodexPath)
 	}
 
-	t.Setenv("PATH", "/terminal/venv/bin:/usr/bin")
-	execute("capture-terminal")
+	// The modes removed with the old core are refused.
+	for _, mode := range []string{"captured-terminal", "service"} {
+		cmd := newRootCmd()
+		var out bytes.Buffer
+		cmd.SetOut(&out)
+		cmd.SetErr(&out)
+		cmd.SetArgs([]string{"--config", configPath, "teams", "path", "mode", mode})
+		if err := cmd.Execute(); err == nil {
+			t.Fatalf("teams path mode %s succeeded, want unknown mode", mode)
+		}
+	}
+	execute("mode", "account-default")
 	cfg, err = store.Load()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.TeamsCodexPath.Mode != "captured-terminal" || cfg.TeamsCodexPath.ExplicitPath != "/terminal/venv/bin:/usr/bin" {
-		t.Fatalf("captured policy = %#v", cfg.TeamsCodexPath)
-	}
-
-	execute("mode", "service")
-	cfg, err = store.Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.TeamsCodexPath.Mode != "service" {
+	if cfg.TeamsCodexPath.Mode != "account-default" {
 		t.Fatalf("mode policy = %#v", cfg.TeamsCodexPath)
 	}
 }

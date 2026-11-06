@@ -7,6 +7,11 @@ never selects the retired direct `ExecRunner` path.
 
 Implementation tracker: `docs/teams_integration_execution_plan.md`.
 
+> The helper now runs on the new core (`internal/core`,
+> `internal/channel/teams`). Operator commands listed in this plan that no
+> longer exist (`teams pause`, `teams recover`, `teams send-file`, `/send-file`)
+> are kept for provenance; the README lists the current commands.
+
 ## Current Findings
 
 - Azure Bot creation is blocked by the organization.

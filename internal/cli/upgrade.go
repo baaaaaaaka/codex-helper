@@ -46,11 +46,6 @@ func newUpgradeCmd(_ *rootOptions) *cobra.Command {
 					IncludePrerelease: includePrerelease,
 				})
 				if status.Supported && !status.UpdateAvailable {
-					if restartTeamsService {
-						if err := rescueTeamsForNoopHelperUpgrade(ctx, cmd.InOrStdin(), cmd.OutOrStdout(), teamsDrainTimeout, resolvedInstallPath); err != nil {
-							return err
-						}
-					}
 					if err := finalizeHelperEntrypointsAfterUpgrade(resolvedInstallPath, version, cmd.ErrOrStderr()); err != nil {
 						_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Warning: failed to verify cxp entrypoint while already up to date: %v\n", err)
 					}
@@ -124,7 +119,7 @@ func runUpgradeWithTeamsServiceRestart(ctx context.Context, in io.Reader, out io
 	var res update.ApplyResult
 	err := withTeamsHelperUpgradeInstallLock(ctx, resolvedInstallPath, func() error {
 		var prepareErr error
-		finishTeams, prepareErr = prepareTeamsForHelperUpgrade(ctx, in, out, teamsDrainTimeout, nil)
+		finishTeams, prepareErr = prepareTeamsForHelperUpgrade(ctx, in, out, teamsDrainTimeout)
 		if prepareErr != nil {
 			return prepareErr
 		}

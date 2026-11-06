@@ -45,6 +45,12 @@ func TestOSExecutableUsageIsCentralized(t *testing.T) {
 		if strings.HasPrefix(rel, allowedDir+"/") {
 			return nil
 		}
+		// The black-box E2E suite must not import cxp packages
+		// (internal/e2e/boundary_test.go); its fakes resolve their own
+		// executable, not cxp's.
+		if strings.HasPrefix(rel, "internal/e2e/") {
+			return nil
+		}
 		file, err := parser.ParseFile(fset, path, nil, 0)
 		if err != nil {
 			return err

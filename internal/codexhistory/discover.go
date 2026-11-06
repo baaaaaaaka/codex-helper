@@ -12,10 +12,6 @@ import (
 
 var ErrSessionsDirNotFound = errors.New("Codex sessions dir not found")
 
-func IsSessionsDirNotFound(err error) bool {
-	return errors.Is(err, ErrSessionsDirNotFound)
-}
-
 func DiscoverProjects(codexDir string) ([]Project, error) {
 	return DiscoverProjectsContext(context.Background(), codexDir)
 }

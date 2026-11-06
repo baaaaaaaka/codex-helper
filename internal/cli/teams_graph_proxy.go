@@ -62,6 +62,11 @@ func (l teamsGraphHTTPClientLease) RetireSuspects(ctx context.Context, out io.Wr
 }
 
 func newTeamsGraphHTTPClientLease(ctx context.Context, root *rootOptions, out io.Writer) (teamsGraphHTTPClientLease, error) {
+	if seam, err := loadTeamsTestSeam(); err != nil {
+		return teamsGraphHTTPClientLease{}, err
+	} else if seam != nil {
+		return teamsGraphHTTPClientLease{Client: seam.httpClient(), Mode: "test-seam"}, nil
+	}
 	store, _, err := newRootStore(root, "")
 	if err != nil {
 		return teamsGraphHTTPClientLease{}, err

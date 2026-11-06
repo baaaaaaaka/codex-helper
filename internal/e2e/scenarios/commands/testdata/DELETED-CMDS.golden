@@ -1,0 +1,177 @@
+# DELETED-CMDS: `helper restore-thread`, `helper reload`, `helper model provider|catalog`, control `reload`: refused with a pointer to help, no Codex turn
+# cxp black-box transcript; volatile values are numbered placeholders
+
+== chat <chat:1> "s001 · removed"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Work chat created: s001.<br>
+   | Working directory: <root>/work/removed</p>
+-- <msg:2> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>💬 Work chat is ready.<br>
+   | Send a task in this chat. Codex will start automatically and continue this session.<br>
+   | Status: waiting for your first task.<br>
+   | Session: s001<br>
+   | Project: removed<br>
+   | Working directory: <root>/work/removed<br>
+   | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
+   | Need more details? Send <code>helper status</code>.</p>
+-- <msg:3> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper restore-thread</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper restore-thread</p>
+-- <msg:4> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>unknown work chat command: <code>restore-thread</code></p>
+   | <p>💬 Work chat<br>
+   | Send your task as a regular Teams message. Messages starting with <code>helper</code> or <code>!</code> are helper commands.</p>
+   | <p>Common commands:<br>
+   | <code>helper status</code> or <code>!status</code> - check progress<br>
+   | <code>helper stats</code> or <code>!stats</code> - show Codex token usage from the linked local history, grouped by model and service tier<br>
+   | <code>helper file &lt;relative-path&gt;</code> or <code>!file &lt;relative-path&gt;</code> - upload a file prepared in the helper&#39;s Teams upload folder<br>
+   | <code>helper close</code> or <code>!close</code> - close this Codex session in Teams<br>
+   | <code>helper details</code> or <code>!details</code> - show debug IDs and links<br>
+   | <code>model status</code>, <code>model switch &lt;model&gt;</code>, <code>model reset</code>, or <code>model fork &lt;model&gt;</code> - inspect or change this Work chat model<br>
+   | <code>effort status</code>, <code>effort list</code>, <code>effort set &lt;value&gt;</code>, or <code>effort reset</code> - inspect or change this Work chat&#39;s reasoning effort<br>
+   | <code>default ...</code> - global defaults are Control-chat-only<br>
+   | <code>helper publish-history</code> - import a paused local Codex history backlog<br>
+   | <code>helper publish-history full</code> - publish the complete local Codex history once to this chat<br>
+   | <code>helper skills list</code> / <code>helper skills add &lt;url&gt;</code> / <code>helper skills push</code> / <code>helper skills push confirm</code> - inspect and push skill subscriptions</p>
+   | <p>Send <code>helper help advanced</code> for retry, cancel, and rename commands.</p>
+-- <msg:5> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper reload</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper reload</p>
+-- <msg:6> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>unknown work chat command: <code>reload</code></p>
+   | <p>💬 Work chat<br>
+   | Send your task as a regular Teams message. Messages starting with <code>helper</code> or <code>!</code> are helper commands.</p>
+   | <p>Common commands:<br>
+   | <code>helper status</code> or <code>!status</code> - check progress<br>
+   | <code>helper stats</code> or <code>!stats</code> - show Codex token usage from the linked local history, grouped by model and service tier<br>
+   | <code>helper file &lt;relative-path&gt;</code> or <code>!file &lt;relative-path&gt;</code> - upload a file prepared in the helper&#39;s Teams upload folder<br>
+   | <code>helper close</code> or <code>!close</code> - close this Codex session in Teams<br>
+   | <code>helper details</code> or <code>!details</code> - show debug IDs and links<br>
+   | <code>model status</code>, <code>model switch &lt;model&gt;</code>, <code>model reset</code>, or <code>model fork &lt;model&gt;</code> - inspect or change this Work chat model<br>
+   | <code>effort status</code>, <code>effort list</code>, <code>effort set &lt;value&gt;</code>, or <code>effort reset</code> - inspect or change this Work chat&#39;s reasoning effort<br>
+   | <code>default ...</code> - global defaults are Control-chat-only<br>
+   | <code>helper publish-history</code> - import a paused local Codex history backlog<br>
+   | <code>helper publish-history full</code> - publish the complete local Codex history once to this chat<br>
+   | <code>helper skills list</code> / <code>helper skills add &lt;url&gt;</code> / <code>helper skills push</code> / <code>helper skills push confirm</code> - inspect and push skill subscriptions</p>
+   | <p>Send <code>helper help advanced</code> for retry, cancel, and rename commands.</p>
+-- <msg:7> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper model provider</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper model provider</p>
+-- <msg:8> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Unknown model command <code>provider</code>. Third-party model setup was removed from this helper; it uses the Codex models of the signed-in account.</p>
+   | <p>Work chat model commands:</p>
+   | <ul><li><code>model status</code> - show this chat&#39;s pinned profile</li>
+   | <li><code>model switch &lt;name&gt;</code> - switch this chat while preserving its Codex thread</li>
+   | <li><code>model reset</code> - switch this chat to the global default</li>
+   | <li><code>model fork &lt;name&gt;</code> - create a new Work chat with another profile</li>
+   | <li><code>model list</code> - show this chat&#39;s effective model first, then verified profiles</li>
+   | <li><code>effort list|status|set|reset</code> - inspect or change this chat&#39;s effort</li>
+   | </ul>
+-- <msg:9> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper model catalog</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper model catalog</p>
+-- <msg:10> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Unknown model command <code>catalog</code>. Third-party model setup was removed from this helper; it uses the Codex models of the signed-in account.</p>
+   | <p>Work chat model commands:</p>
+   | <ul><li><code>model status</code> - show this chat&#39;s pinned profile</li>
+   | <li><code>model switch &lt;name&gt;</code> - switch this chat while preserving its Codex thread</li>
+   | <li><code>model reset</code> - switch this chat to the global default</li>
+   | <li><code>model fork &lt;name&gt;</code> - create a new Work chat with another profile</li>
+   | <li><code>model list</code> - show this chat&#39;s effective model first, then verified profiles</li>
+   | <li><code>effort list|status|set|reset</code> - inspect or change this chat&#39;s effort</li>
+   | </ul>
+
+== chat <chat:2> "🏠 Codex Control - e2ehost"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
+-- <msg:2> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>new <root>/work/removed</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>new <root>/work/removed</p>
+-- <msg:3> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>✅ Work chat created: s001</p>
+   | <p>Open this Teams link and send your task there:<br>
+   | <a href="https://teams.microsoft.com/l/chat/<chat:1>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:1>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
+   | <p>If Teams does not show it right away, search for: s001</p>
+-- <msg:4> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>reload</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>reload</p>
+-- <msg:5> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>unknown control command: <code>reload</code></p>
+   | <p><strong>🏠 Control chat</strong></p>
+   | <p>Use this chat to choose a workspace and create or continue 💬 Work chats.</p>
+   | <p>Start here:</p>
+   | <ul><li><code>p</code> / <code>projects</code> - choose a workspace</li>
+   | <li><code>n &lt;directory&gt;</code> / <code>new &lt;directory&gt;</code> - create a new Work chat for a directory</li>
+   | <li><code>new &lt;directory&gt; --model &lt;model&gt;</code> - create a Work chat pinned to a model</li>
+   | <li><code>model status|list|switch|reset</code> - inspect or change only this Control chat&#39;s model</li>
+   | <li><code>effort status|list|set|reset</code> - inspect or change this Control chat&#39;s reasoning effort</li>
+   | <li><code>default status</code> / <code>default model ...</code> / <code>default effort ...</code> - manage global defaults for future launches and chats</li>
+   | <li><code>s</code> / <code>sessions</code> - show sessions in the selected workspace</li>
+   | <li><code>c &lt;number&gt;</code> / <code>continue &lt;number&gt;</code> - continue an old local Codex session in Teams</li>
+   | <li><code>st</code> / <code>status</code> - show active Work chats</li>
+   | <li><code>helper rename &lt;title&gt;</code> - rename this Control chat</li>
+   | <li><code>helper rename hostname &lt;name&gt;</code> - rename this machine in all related chat titles</li>
+   | <li><code>skills</code> - list installed skill subscriptions</li>
+   | <li><code>shutdown</code> - stop the helper on all machines until <code>cxp teams start</code> is run on a machine</li>
+   | </ul>
+   | <p>After <code>p</code>, reply with a number such as <code>1</code> to open that workspace. On a workspace page, send <code>new</code> to create a Work chat in that workspace.</p>
+   | <p>For quick helper questions, type the question here. For project work, use a 💬 Work chat.</p>
+   | <p>Send <code>help advanced</code> for all commands.</p>
+-- <msg:6> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>restore-thread</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>restore-thread</p>
+-- <msg:7> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>unknown control command: <code>restore-thread</code></p>
+   | <p><strong>🏠 Control chat</strong></p>
+   | <p>Use this chat to choose a workspace and create or continue 💬 Work chats.</p>
+   | <p>Start here:</p>
+   | <ul><li><code>p</code> / <code>projects</code> - choose a workspace</li>
+   | <li><code>n &lt;directory&gt;</code> / <code>new &lt;directory&gt;</code> - create a new Work chat for a directory</li>
+   | <li><code>new &lt;directory&gt; --model &lt;model&gt;</code> - create a Work chat pinned to a model</li>
+   | <li><code>model status|list|switch|reset</code> - inspect or change only this Control chat&#39;s model</li>
+   | <li><code>effort status|list|set|reset</code> - inspect or change this Control chat&#39;s reasoning effort</li>
+   | <li><code>default status</code> / <code>default model ...</code> / <code>default effort ...</code> - manage global defaults for future launches and chats</li>
+   | <li><code>s</code> / <code>sessions</code> - show sessions in the selected workspace</li>
+   | <li><code>c &lt;number&gt;</code> / <code>continue &lt;number&gt;</code> - continue an old local Codex session in Teams</li>
+   | <li><code>st</code> / <code>status</code> - show active Work chats</li>
+   | <li><code>helper rename &lt;title&gt;</code> - rename this Control chat</li>
+   | <li><code>helper rename hostname &lt;name&gt;</code> - rename this machine in all related chat titles</li>
+   | <li><code>skills</code> - list installed skill subscriptions</li>
+   | <li><code>shutdown</code> - stop the helper on all machines until <code>cxp teams start</code> is run on a machine</li>
+   | </ul>
+   | <p>After <code>p</code>, reply with a number such as <code>1</code> to open that workspace. On a workspace page, send <code>new</code> to create a Work chat in that workspace.</p>
+   | <p>For quick helper questions, type the question here. For project work, use a 💬 Work chat.</p>
+   | <p>Send <code>help advanced</code> for all commands.</p>

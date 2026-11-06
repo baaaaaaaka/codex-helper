@@ -1554,10 +1554,6 @@ func ensureCodexInstalledWithOptions(ctx context.Context, codexPath string, out 
 	return "", codexPostInstallError("installation", nil)
 }
 
-func findManagedCodexForEnvironment(ctx context.Context, environment []string) (string, error) {
-	return findManagedCodexForEnvironmentWithProbe(ctx, environment, nil)
-}
-
 func findManagedCodexForEnvironmentWithProbe(
 	ctx context.Context,
 	environment []string,

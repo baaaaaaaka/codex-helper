@@ -49,13 +49,6 @@ func TestLegacyExecutionFlagsRemainHiddenCompatibilityOnly(t *testing.T) {
 	if runFlag == nil || !runFlag.Hidden {
 		t.Fatalf("legacy run flag = %#v, want hidden compatibility flag", runFlag)
 	}
-	storePath := ""
-	for _, command := range []*cobra.Command{newBeaconWorkerRunOnceCmd(&storePath), newBeaconWorkerServeCmd(&storePath)} {
-		flag := command.Flags().Lookup("no-yolo")
-		if flag == nil || !flag.Hidden {
-			t.Fatalf("%s legacy worker flag = %#v, want hidden compatibility flag", command.Name(), flag)
-		}
-	}
 }
 
 func TestAAAFlagIsPublicAndDefaultsOff(t *testing.T) {

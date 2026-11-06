@@ -161,13 +161,9 @@ func (s *Store) loadUnlocked() (Config, error) {
 	}
 
 	var cfg Config
-	if err := validateRawModelConfig(b); err != nil {
-		return Config{}, fmt.Errorf("parse model config: %w", err)
-	}
 	if err := json.Unmarshal(b, &cfg); err != nil {
 		return Config{}, fmt.Errorf("parse config: %w", err)
 	}
-	fileVersion := cfg.Version
 
 	// Three-state gate. Compatibility is decided by the reader floor, not by
 	// version equality, so an additive future config (higher version, same
@@ -187,30 +183,15 @@ func (s *Store) loadUnlocked() (Config, error) {
 			WriterVersion: cfg.Version,
 		}
 	}
-	if err := ValidateModelConfig(cfg); err != nil {
-		return Config{}, fmt.Errorf("validate model config: %w", err)
-	}
-
 	// Migrate legacy write-generation stamps in memory. Newer additive
 	// generations (Version > CurrentVersion) are left as-is and read tolerantly.
 	if cfg.Version == 0 || cfg.Version == 1 {
 		cfg.Version = CurrentVersion
 	}
-	// Existing installations predate the Teams user-PATH policy. Keep their
-	// service PATH behavior until the operator explicitly opts in, while configs
-	// first created by generation 5 continue to use account-default via the
-	// policy's empty-mode default.
-	if fileVersion < teamsCodexPathIntroducedVersion && strings.TrimSpace(cfg.TeamsCodexPath.Mode) == "" {
-		cfg.TeamsCodexPath.Mode = "service"
-	}
-
 	return cfg, nil
 }
 
 func (s *Store) saveUnlocked(cfg Config) error {
-	if err := ValidateModelConfig(cfg); err != nil {
-		return fmt.Errorf("validate model config: %w", err)
-	}
 	// Never let an older binary clobber a newer-generation file: that would
 	// silently drop fields this build does not know about. Fail loudly instead;
 	// the operator/service should upgrade rather than corrupt the config.

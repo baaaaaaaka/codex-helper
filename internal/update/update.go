@@ -12,7 +12,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"strings"
 	"time"
 
@@ -738,67 +737,4 @@ func trimValidationOutput(output string) string {
 		return output[:500] + "..."
 	}
 	return output
-}
-
-func isVersionNewer(remote, local string) (bool, bool) {
-	rv, ok := parseVersionTuple(remote)
-	if !ok {
-		return false, false
-	}
-	lv, ok := parseVersionTuple(local)
-	if !ok {
-		return false, false
-	}
-
-	n := len(rv)
-	if len(lv) > n {
-		n = len(lv)
-	}
-	for len(rv) < n {
-		rv = append(rv, 0)
-	}
-	for len(lv) < n {
-		lv = append(lv, 0)
-	}
-
-	for i := 0; i < n; i++ {
-		if rv[i] > lv[i] {
-			return true, true
-		}
-		if rv[i] < lv[i] {
-			return false, true
-		}
-	}
-	return false, true
-}
-
-func parseVersionTuple(v string) ([]int, bool) {
-	s := strings.TrimSpace(v)
-	s = strings.TrimPrefix(s, "v")
-	if s == "" {
-		return nil, false
-	}
-	parts := strings.Split(s, ".")
-	out := make([]int, 0, len(parts))
-	for _, p := range parts {
-		digits := ""
-		for _, ch := range p {
-			if ch < '0' || ch > '9' {
-				break
-			}
-			digits += string(ch)
-		}
-		if digits == "" {
-			break
-		}
-		n, err := strconv.Atoi(digits)
-		if err != nil {
-			return nil, false
-		}
-		out = append(out, n)
-	}
-	if len(out) == 0 {
-		return nil, false
-	}
-	return out, true
 }

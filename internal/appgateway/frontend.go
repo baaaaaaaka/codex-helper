@@ -121,13 +121,6 @@ func isAddressInUse(err error) bool {
 	return strings.Contains(text, "address already in use") || strings.Contains(text, "only one usage") || strings.Contains(text, "bind:") && strings.Contains(text, "use")
 }
 
-func (f *Frontend) ID() string {
-	if f == nil {
-		return ""
-	}
-	return f.id
-}
-
 func (f *Frontend) Port() int {
 	if f == nil {
 		return 0
@@ -140,13 +133,6 @@ func (f *Frontend) Addr() string {
 		return ""
 	}
 	return f.addr
-}
-
-func (f *Frontend) URL() string {
-	if f == nil {
-		return ""
-	}
-	return "http://" + f.addr
 }
 
 func (f *Frontend) State() (string, error) {

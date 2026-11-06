@@ -1,0 +1,37 @@
+# CTL-ATTACH: control chat: an image, a file or a quoted command is refused with v0.1.20's attachment text and runs nothing
+# cxp black-box transcript; volatile values are numbered placeholders
+
+== chat <chat:1> "🏠 Codex Control - e2ehost"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
+-- <msg:2> owner (html)
+   | <p>status</p>
+   | <p><img src="https://graph.microsoft.com/v1.0/chats/<chat:1>/messages/<msg:2>/hostedContents/aWQ9eF8wLXd1cy1kMTEtZTJl/$value" width="64" height="64" alt="image" itemid="0"></p>
+   hosted: sha256:b5e82ab5f73de5263733b316d0c411293a0895e6958a410f435617a38d8085b1
+-- <msg:3> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>I could not process 1 Teams attachment(s): Teams-hosted inline content. Supported inputs are plain text plus Teams-hosted inline/reference file attachments that the current Graph scopes can download. For generated files from Codex, use <code>helper file &lt;relative-path&gt;</code> from the Teams outbound root. Files and images belong in a 💬 Work chat; the 🏠 control chat only handles text commands like <code>projects</code>, <code>new &lt;directory&gt;</code>, <code>continue &lt;number&gt;</code>, and <code>status</code>.</p>
+-- <msg:4> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>st</p>
+   | <attachment id="<uuid:1>"></attachment>
+   attachment: {"content":null,"contentType":"reference","contentUrl":"https://e2etenant-my.sharepoint.com/personal/owner_e2e_example/Documents/Microsoft%20Teams%20Chat%20Files/notes.txt","id":"<uuid:1>","name":"notes.txt","teamsAppId":null,"thumbnailUrl":null}
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>st</p>
+   | <attachment id="<uuid:1>"></attachment>
+-- <msg:5> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>I could not process 1 Teams attachment(s): reference. Supported inputs are plain text plus Teams-hosted inline/reference file attachments that the current Graph scopes can download. For generated files from Codex, use <code>helper file &lt;relative-path&gt;</code> from the Teams outbound root. Files and images belong in a 💬 Work chat; the 🏠 control chat only handles text commands like <code>projects</code>, <code>new &lt;directory&gt;</code>, <code>continue &lt;number&gt;</code>, and <code>status</code>.</p>
+-- <msg:6> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <attachment id="1"></attachment><p>status</p>
+   attachment: {"content":"{\"messageId\":\"1\",\"messagePreview\":\"earlier\",\"messageSender\":{\"application\":null,\"device\":null,\"user\":{\"displayName\":\"E2E Owner\",\"id\":\"\",\"userIdentityType\":\"aadUser\"}}}","contentType":"messageReference","contentUrl":null,"id":"1","name":null}
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <attachment id="1"></attachment><p>status</p>
+-- <msg:7> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>I could not process 1 Teams attachment(s): messageReference. Supported inputs are plain text plus Teams-hosted inline/reference file attachments that the current Graph scopes can download. For generated files from Codex, use <code>helper file &lt;relative-path&gt;</code> from the Teams outbound root. Quoted Teams messages in the 🏠 control chat are only supported with <code>ask &lt;question&gt;</code> or natural-language fallback prompts; explicit control commands do not consume quoted context.</p>

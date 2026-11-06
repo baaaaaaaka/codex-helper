@@ -600,21 +600,6 @@ func insertCatalogHistorySessions(ctx context.Context, tx *sql.Tx, sourcePath st
 	return nil
 }
 
-func (store *catalogSQLiteStore) deleteHistory(ctx context.Context, path string) error {
-	result, err := store.db.ExecContext(ctx, `DELETE FROM history_source WHERE path = ?`, filepath.Clean(path))
-	if err != nil {
-		return err
-	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if rows > 0 && catalogSQLiteCommitHook != nil {
-		catalogSQLiteCommitHook(store.path)
-	}
-	return nil
-}
-
 func withCatalogSessionMetaBatch(ctx context.Context) (context.Context, *catalogSessionMetaBatch) {
 	if ctx == nil {
 		ctx = context.Background()

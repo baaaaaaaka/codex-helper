@@ -1,0 +1,320 @@
+# DASH-FLOW: workspaces, sessions, number selection, details, continue with history import, status list, open
+# cxp black-box transcript; volatile values are numbered placeholders
+
+== chat <chat:1> "🏠 Codex Control - e2ehost"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
+-- <msg:2> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>p</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>p</p>
+-- <msg:3> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p><strong>📁 Workspaces</strong></p>
+   | <p>Reply with a number to open a workspace.</p>
+   | <hr/>
+   | <p><strong>2. beta</strong><br>
+   | &nbsp;&nbsp;<code><root>/work/beta</code><br>
+   | &nbsp;&nbsp;Sessions: 0 active, 1 idle, last updated <minute></p>
+   | <p>&nbsp;&nbsp;<strong>Next:</strong> send <code>2</code> or <code>p 2</code> to open this workspace</p>
+   | <hr/>
+   | <p><strong>1. alpha</strong><br>
+   | &nbsp;&nbsp;<code><root>/work/alpha</code><br>
+   | &nbsp;&nbsp;Sessions: 0 active, 2 idle, last updated <minute></p>
+   | <p>&nbsp;&nbsp;<strong>Next:</strong> send <code>1</code> or <code>p 1</code> to open this workspace</p>
+   | <hr/>
+   | <p><strong>Other options:</strong></p>
+   | <ul><li>Send a workspace number, for example <code>1</code>, to open it.</li>
+   | <li><code>n &lt;directory&gt;</code> or <code>new &lt;directory&gt;</code> - create a new Work chat directly.</li>
+   | </ul>
+   | <p>Numbers apply to your next reply and expire after 10 minutes. If a number looks wrong, send <code>projects</code> again.</p>
+-- <msg:4> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>1</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>1</p>
+-- <msg:5> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p><strong>Sessions</strong></p>
+   | <p>Workspace: <code><root>/work/alpha</code></p>
+   | <p>Reply with a number to continue a session in Teams.</p>
+   | <hr/>
+   | <p><strong>2. Plan the alpha release</strong><br>
+   | &nbsp;&nbsp;<code><root>/work/alpha</code><br>
+   | &nbsp;&nbsp;Session: idle, last updated <minute></p>
+   | <p>&nbsp;&nbsp;<strong>Next:</strong> send <code>2</code> or <code>c 2</code> to continue this session in Teams</p>
+   | <hr/>
+   | <p><strong>1. Fix the alpha login bug</strong><br>
+   | &nbsp;&nbsp;<code><root>/work/alpha</code><br>
+   | &nbsp;&nbsp;Session: idle, last updated <minute></p>
+   | <p>&nbsp;&nbsp;<strong>Next:</strong> send <code>1</code> or <code>c 1</code> to continue this session in Teams</p>
+   | <hr/>
+   | <p>Need debug IDs? Send <code>details &lt;number&gt;</code>. Numbers expire after one reply.</p>
+   | <p><strong>Next:</strong> send <code>new</code> to create a new Work chat in this workspace.</p>
+-- <msg:6> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>9</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>9</p>
+-- <msg:7> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>That number is not in the current list. Send <code>projects</code> or <code>sessions</code> again, then choose one of the newly shown numbers.</p>
+-- <msg:8> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>2</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>2</p>
+-- <msg:9> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>I do not have a current list yet. Send <code>projects</code> or <code>sessions</code> first, then choose a number.</p>
+-- <msg:10> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>s</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>s</p>
+-- <msg:11> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p><strong>Sessions</strong></p>
+   | <p>Workspace: <code><root>/work/alpha</code></p>
+   | <p>Reply with a number to continue a session in Teams.</p>
+   | <hr/>
+   | <p><strong>2. Plan the alpha release</strong><br>
+   | &nbsp;&nbsp;<code><root>/work/alpha</code><br>
+   | &nbsp;&nbsp;Session: idle, last updated <minute></p>
+   | <p>&nbsp;&nbsp;<strong>Next:</strong> send <code>2</code> or <code>c 2</code> to continue this session in Teams</p>
+   | <hr/>
+   | <p><strong>1. Fix the alpha login bug</strong><br>
+   | &nbsp;&nbsp;<code><root>/work/alpha</code><br>
+   | &nbsp;&nbsp;Session: idle, last updated <minute></p>
+   | <p>&nbsp;&nbsp;<strong>Next:</strong> send <code>1</code> or <code>c 1</code> to continue this session in Teams</p>
+   | <hr/>
+   | <p>Need debug IDs? Send <code>details &lt;number&gt;</code>. Numbers expire after one reply.</p>
+   | <p><strong>Next:</strong> send <code>new</code> to create a new Work chat in this workspace.</p>
+-- <msg:12> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>d 2</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>d 2</p>
+-- <msg:13> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Local Codex session<br>
+   | List number: 2<br>
+   | Title: Plan the alpha release<br>
+   | Working directory: <root>/work/alpha<br>
+   | Updated: <time:1><br>
+   | Codex session ID: <uuid:1><br>
+   | Teams chat: not published<br>
+   | Next: send <code>continue 2</code> to create a work chat and import its history.</p>
+-- <msg:14> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>o 1</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>o 1</p>
+-- <msg:15> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>I do not have a current list yet. Send <code>projects</code> or <code>sessions</code> first, then choose a number.</p>
+-- <msg:16> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>s</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>s</p>
+-- <msg:17> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p><strong>Sessions</strong></p>
+   | <p>Workspace: <code><root>/work/alpha</code></p>
+   | <p>Reply with a number to continue a session in Teams.</p>
+   | <hr/>
+   | <p><strong>2. Plan the alpha release</strong><br>
+   | &nbsp;&nbsp;<code><root>/work/alpha</code><br>
+   | &nbsp;&nbsp;Session: idle, last updated <minute></p>
+   | <p>&nbsp;&nbsp;<strong>Next:</strong> send <code>2</code> or <code>c 2</code> to continue this session in Teams</p>
+   | <hr/>
+   | <p><strong>1. Fix the alpha login bug</strong><br>
+   | &nbsp;&nbsp;<code><root>/work/alpha</code><br>
+   | &nbsp;&nbsp;Session: idle, last updated <minute></p>
+   | <p>&nbsp;&nbsp;<strong>Next:</strong> send <code>1</code> or <code>c 1</code> to continue this session in Teams</p>
+   | <hr/>
+   | <p>Need debug IDs? Send <code>details &lt;number&gt;</code>. Numbers expire after one reply.</p>
+   | <p><strong>Next:</strong> send <code>new</code> to create a new Work chat in this workspace.</p>
+-- <msg:18> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>2</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>2</p>
+-- <msg:19> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>✅ Work chat created: s001</p>
+   | <p>Open Work chat:<br>
+   | <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
+   | <p>Preparing local Codex history now. Long sessions can take a few minutes.<br>
+   | Wait for &#34;Import complete&#34; in the Work chat before sending a new task there.</p>
+-- <msg:20> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Published local Codex session as s001: <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
+   | <p>Open this Teams work chat and send a message there to continue.</p>
+-- <msg:21> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>st</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>st</p>
+-- <msg:22> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p><strong>Active Work chats</strong></p>
+   | <p><strong>💬 e2ehost - Plan the alpha release</strong> [active]<br>
+   | &nbsp;&nbsp;<strong>Session:</strong> <code>s001</code><br>
+   | &nbsp;&nbsp;<strong>Folder:</strong> <code><root>/work/alpha</code><br>
+   | &nbsp;&nbsp;<strong>Last used:</strong> <minute><br>
+   | &nbsp;&nbsp;<strong>Chat:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">▶ Open chat</a></p>
+   | <hr/>
+   | <p>Speech recognition: configured.<br>
+   | Next: open one of these Teams chats to continue work, or send <code>new &lt;directory&gt;</code> to create another Work chat.</p>
+-- <msg:23> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>s</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>s</p>
+-- <msg:24> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p><strong>Sessions</strong></p>
+   | <p>Workspace: <code><root>/work/alpha</code></p>
+   | <p>Reply with a number to continue a session in Teams.</p>
+   | <hr/>
+   | <p><strong>2. Plan the alpha release</strong><br>
+   | &nbsp;&nbsp;<code><root>/work/alpha</code><br>
+   | &nbsp;&nbsp;Session: active, last updated <minute><br>
+   | &nbsp;&nbsp;<strong>Chat:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">▶ Open chat</a></p>
+   | <p>&nbsp;&nbsp;<strong>Next:</strong> send <code>2</code> to open this Teams chat or import updates</p>
+   | <hr/>
+   | <p><strong>1. Fix the alpha login bug</strong><br>
+   | &nbsp;&nbsp;<code><root>/work/alpha</code><br>
+   | &nbsp;&nbsp;Session: idle, last updated <minute></p>
+   | <p>&nbsp;&nbsp;<strong>Next:</strong> send <code>1</code> or <code>c 1</code> to continue this session in Teams</p>
+   | <hr/>
+   | <p>Need debug IDs? Send <code>details &lt;number&gt;</code>. Numbers expire after one reply.</p>
+   | <p><strong>Next:</strong> send <code>new</code> to create a new Work chat in this workspace.</p>
+-- <msg:25> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>o 2</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>o 2</p>
+-- <msg:26> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>s001 [active] 💬 e2ehost - Plan the alpha release<br>
+   | <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a><br>
+   | Next: open this Teams work chat and send a message there to continue. <code>open</code> only shows the linked chat; it does not import local history.</p>
+-- <msg:27> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>continue <uuid:1></p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>continue <uuid:1></p>
+-- <msg:28> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Already published as s001: <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
+   | <p>No new local history was imported. Open this Teams work chat and send a message there to continue.</p>
+-- <msg:29> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>d s001</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>d s001</p>
+-- <msg:30> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Session: s001<br>
+   | Chat polling: listening<br>
+   | Title: 💬 e2ehost - Plan the alpha release<br>
+   | Working directory: <root>/work/alpha<br>
+   | Codex thread: <uuid:1><br>
+   | Teams chat: <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a><br>
+   | Codex status: will start when you send a task</p>
+-- <msg:31> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
+   | <p><strong>✅ Codex finished</strong></p>
+   | <p><strong>Chat:</strong> 💬 e2ehost - Plan the alpha release<br>
+   | <strong>Request:</strong> Please answer E2E-DASHFLOW-continued-1</p>
+   | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
+   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
+   mention 0: owner "E2E Owner"
+
+== chat <chat:2> "💬 e2ehost - Plan the alpha release"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Work chat created: s001.<br>
+   | Working directory: <root>/work/alpha</p>
+-- <msg:2> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Imported Codex session history</p>
+   | <p>The messages below came from your local Codex session. Reply in this chat to continue from here.</p>
+   | <p>Session: Plan the alpha release</p>
+-- <msg:3> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
+   | <p>Plan the alpha release</p>
+-- <msg:4> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>Release plan drafted</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+-- <msg:5> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
+   | <p>List the open risks</p>
+-- <msg:6> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>Three risks remain</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+-- <msg:7> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Import complete. This chat is ready; reply here to continue the Codex session.</p>
+-- <msg:8> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Please answer E2E-DASHFLOW-continued-1</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>Please answer E2E-DASHFLOW-continued-1</p>
+-- <msg:9> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+-- <msg:10> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>E2EANSWER-<n> answer for E2E-DASHFLOW-continued-1</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+
+== codex turns (per thread; threads by kind, directory and first prompt; turns in start order)
+-- thread <uuid:1> (work, cwd <root>/work/alpha)
+   turn: answered
+   prompt| User message:
+   prompt| Please answer E2E-DASHFLOW-continued-1
+   prompt|
+   prompt| Teams helper safety:
+   prompt| - You are running inside a Codex turn launched by the Teams helper.
+   prompt| - The current Teams request is the `User message` section above. Treat earlier Teams requests in resumed Codex history as completed context, not as work to continue or answer, unless the current user explicitly asks about them.
+   prompt| - Do not restart, reload, kill, replace, or background the Teams helper process, binary, or service from this turn.
+   prompt| - If an installed helper needs to restart after an update or local repair, finish the answer and tell the user to send `helper restart now` in the Teams control chat.
+   prompt| - If the helper needs a release update, tell the user to send `helper update now`, or `helper update prerelease` only when they asked for prereleases.
+   prompt| - Subagent requests use native Codex subagents. For cross-machine agent delegation, use the cxp skill and its `cxp delegate` workflow when the task needs another signed-in Teams machine.
+   prompt|
+   prompt| Put fractions, sums, integrals, matrices, and display math in <m>TeX</m> on a separate line, never in prose, tables, or lists—even if asked for one line. Use backticks for simple inline/literal TeX. Never use $ or \(...\). Math markers are not artifacts.
+   prompt|
+   prompt| If you need to return generated files or images to the Teams user, write them under this local directory:
+   prompt| <root>/home/.local/state/codex-helper/teams/core-files/outbound/cxp-<key:1>-<turn:1>
+   prompt|
+   prompt| Then include this fenced manifest in your final answer:
+   prompt| ```codex-helper-artifacts
+   prompt| {"version":1,"files":[{"path":"relative/path.ext","name":"display-name.ext"}]}
+   prompt| ```
+   prompt|
+   prompt| Use only relative manifest paths under that directory. Keep your normal answer visible; the helper will upload listed files separately when file-write auth is available.

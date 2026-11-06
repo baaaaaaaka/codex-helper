@@ -173,7 +173,7 @@ func defaultTeamsLocalSupervisorVerifyChildIdentity(pid int, spec teamsServiceSp
 		return err
 	}
 	if !teamsLocalSupervisorChildArgsMatch(args, spec) {
-		return fmt.Errorf("refusing to manage pid %d because it does not look like the local supervisor child for registry %s: %s", pid, spec.RegistryPath, strings.Join(args, " "))
+		return fmt.Errorf("refusing to manage pid %d because it does not look like the local supervisor child of this service: %s", pid, strings.Join(args, " "))
 	}
 	if err := teamsLocalSupervisorExecutableMatches(pid, spec.Executable, args); err != nil {
 		return err

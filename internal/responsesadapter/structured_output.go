@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"io"
 	"strings"
-
-	"github.com/baaaaaaaka/codex-helper/internal/config"
 )
 
 // structuredOutputFormat extracts the two wire formats supported by the
@@ -29,7 +27,7 @@ func structuredOutputFormat(raw json.RawMessage) string {
 	}
 }
 
-func structuredOutputMode(policy config.ModelStructuredOutputPolicy, format string) string {
+func structuredOutputMode(policy StructuredOutputPolicy, format string) string {
 	switch format {
 	case "json_object":
 		return strings.ToLower(strings.TrimSpace(policy.JSONObject))
@@ -40,7 +38,7 @@ func structuredOutputMode(policy config.ModelStructuredOutputPolicy, format stri
 	}
 }
 
-func validateStructuredOutputRequest(raw json.RawMessage, policy config.ModelStructuredOutputPolicy) error {
+func validateStructuredOutputRequest(raw json.RawMessage, policy StructuredOutputPolicy) error {
 	format := structuredOutputFormat(raw)
 	if format == "" {
 		return nil
@@ -55,7 +53,7 @@ func validateStructuredOutputRequest(raw json.RawMessage, policy config.ModelStr
 // independent part of the contract: the result must be actual JSON and, for
 // json_schema, an object containing every declared required property. Full
 // JSON-Schema validation remains provider-specific and is not guessed here.
-func validateStructuredOutputResponse(raw json.RawMessage, text string, policy config.ModelStructuredOutputPolicy) error {
+func validateStructuredOutputResponse(raw json.RawMessage, text string, policy StructuredOutputPolicy) error {
 	format := structuredOutputFormat(raw)
 	if format == "" || structuredOutputMode(policy, format) != "native" {
 		return nil

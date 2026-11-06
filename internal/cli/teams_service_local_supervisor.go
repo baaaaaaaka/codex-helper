@@ -213,6 +213,11 @@ func (b teamsServiceLocalSupervisorBackend) Uninstall(ctx context.Context) (stri
 	if err := retireTeamsServiceConflictingBackendsForLocalSupervisor(ctx, teamsServiceSpec{}); err != nil {
 		return "", fmt.Errorf("retire conflicting Teams service backend before local-supervisor uninstall: %w", err)
 	}
+	if teamsServiceGOOS() == "linux" && teamsServiceIsWSL() {
+		if _, err := teamsServiceRunPowerShell(ctx, buildTeamsServiceWSLRemoveStartupKickCommand(teamsServiceWSLTaskIdentity().Suffix)); err != nil {
+			return "", fmt.Errorf("remove the Windows Startup entry during local-supervisor uninstall: %w", err)
+		}
+	}
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return "", err
 	}
@@ -305,6 +310,9 @@ func (b teamsServiceLocalSupervisorBackend) start(ctx context.Context, configPat
 	cfg, err := readTeamsServiceLocalSupervisorConfig(configPath)
 	if err != nil {
 		return nil, err
+	}
+	if !cfg.Enabled && strings.TrimSpace(os.Getenv(teamsServiceStartupKickEnv)) == "1" {
+		return []byte("Local supervisor disabled; the Windows login start was skipped.\n"), nil
 	}
 	if status, ok, err := readTeamsServiceLocalSupervisorStatus(); err != nil {
 		return nil, err
@@ -644,10 +652,12 @@ func runTeamsServiceLocalSupervisor(ctx context.Context, configPath string) erro
 		_ = writeTeamsServiceLocalSupervisorStatus(status)
 	}()
 
+	startFailures := 0
 	for {
 		if err := supervisorCtx.Err(); err != nil {
 			return nil
 		}
+		runStart := time.Now()
 		runErr := runTeamsServiceLocalSupervisorChild(supervisorCtx, cfg, &status, logWriter)
 		if errors.Is(runErr, errTeamsServiceLocalSupervisorCleanupFailed) {
 			// A cleanup failure is a safety stop.  Do not enter the restart delay
@@ -673,7 +683,16 @@ func runTeamsServiceLocalSupervisor(ctx context.Context, configPath string) erro
 			status.UpdatedAt = time.Now()
 			_ = writeTeamsServiceLocalSupervisorStatus(status)
 		}
-		if err := sleepContext(supervisorCtx, teamsServiceLocalSupervisorRestartDelay); err != nil {
+		// A started child paces its own fast restarts (teams_service_backoff.go);
+		// a child that cannot even be started (missing binary) is paced here.
+		delay := teamsServiceLocalSupervisorRestartDelayAfter(runErr)
+		if status.LastChildStartAt.Before(runStart) {
+			startFailures++
+			delay = max(delay, teamsCrashLoopDelay(startFailures))
+		} else {
+			startFailures = 0
+		}
+		if err := sleepContext(supervisorCtx, delay); err != nil {
 			return nil
 		}
 		status.RestartCount++
@@ -720,7 +739,7 @@ func runTeamsServiceLocalSupervisorChild(ctx context.Context, cfg teamsServiceLo
 			clearTeamsServiceLocalSupervisorChild(status, waitErr)
 			return ctx.Err()
 		case <-ticker.C:
-			decision, err := teamsServiceLocalSupervisorCheckChildHealth(ctx, &healthState)
+			decision, err := teamsServiceLocalSupervisorChildHealth(ctx, cfg, &healthState)
 			if err != nil {
 				status.LastHealthCheckAt = time.Now()
 				status.LastHealthReason = "health check unavailable: " + err.Error()
@@ -874,7 +893,7 @@ func defaultTeamsServiceLocalSupervisorCheckChildHealth(ctx context.Context, sta
 	if state == nil {
 		return teamsServiceWatchdogDecision{Action: teamsServiceWatchdogActionNoop, Reason: "health state unavailable"}, nil
 	}
-	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: time.Now()})
+	opts := normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: teamsServiceWatchdogNow()})
 	snapshot, err := collectTeamsServiceWatchdogSnapshot(ctx, opts)
 	if err != nil {
 		return teamsServiceWatchdogDecision{}, err
@@ -1014,6 +1033,25 @@ func teamsServiceLocalSupervisorBaseEnvAllowed(key string) bool {
 		return true
 	}
 	return strings.HasPrefix(key, "LC_")
+}
+
+// teamsServiceLocalSupervisorRestartAfterExit75 is the pause before the
+// new instance a child asked for by exiting 75 (`helper restart`).
+var teamsServiceLocalSupervisorRestartAfterExit75 = time.Second
+
+// teamsServiceLocalSupervisorRestartDelayAfter is the pause before the next
+// child: short when the child asked for a restart, else the failure delay.
+func teamsServiceLocalSupervisorRestartDelayAfter(runErr error) time.Duration {
+	if teamsServiceLocalSupervisorExitCode(runErr) == teamsRestartExitCode {
+		return teamsServiceLocalSupervisorRestartAfterExit75
+	}
+	return teamsServiceLocalSupervisorRestartDelay
+}
+
+// teamsServiceLocalSupervisorChildHealth decides whether the running child
+// must be restarted (the watchdog's judgement of the store's owner).
+func teamsServiceLocalSupervisorChildHealth(ctx context.Context, _ teamsServiceLocalSupervisorConfig, state *teamsServiceWatchdogState) (teamsServiceWatchdogDecision, error) {
+	return teamsServiceLocalSupervisorCheckChildHealth(ctx, state)
 }
 
 func teamsServiceLocalSupervisorExitCode(err error) int {
@@ -1226,9 +1264,10 @@ func retireTeamsServiceConflictingBackendsForLocalSupervisor(ctx context.Context
 		// Scheduled Tasks and the Startup watchdog are independent launch
 		// mechanisms. Retiring only the former leaves two possible Teams
 		// writers, which caused repeated owner-generation fencing in the live
-		// service. RemoveStartupFallbackMarker is fail-closed: if Windows
-		// cleanup cannot be confirmed, do not start a new local supervisor.
-		if err := backend.removeStartupFallbackMarker(ctx); err != nil {
+		// service. The cleanup is fail-closed: if Windows cleanup cannot be
+		// confirmed, do not start a new local supervisor. The one-shot Startup
+		// entry that starts this supervisor at login stays.
+		if err := backend.removeLegacyStartupWatchdogs(ctx); err != nil {
 			return fmt.Errorf("remove old WSL Startup fallback before local-supervisor start: %w", err)
 		}
 		return nil

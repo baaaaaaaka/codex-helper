@@ -23,7 +23,6 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/ids"
 	"github.com/baaaaaaaka/codex-helper/internal/manager"
 	"github.com/baaaaaaaka/codex-helper/internal/migration"
-	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	"github.com/baaaaaaaka/codex-helper/internal/proc"
 	"github.com/baaaaaaaka/codex-helper/internal/stack"
 )
@@ -43,7 +42,6 @@ var (
 )
 
 func newRunCmd(root *rootOptions) *cobra.Command {
-	var modelProfile string
 	var agentAutoApprove bool
 	var legacyMode bool
 	cmd := &cobra.Command{
@@ -55,7 +53,6 @@ func newRunCmd(root *rootOptions) *cobra.Command {
 			return runLike(cmd, root, true)
 		},
 	}
-	cmd.Flags().StringVar(&modelProfile, "model-profile", "", "Model profile id or name for Codex launches")
 	cmd.Flags().BoolVar(&agentAutoApprove, "aaa", false, "Automatically approve Codex agent requests for this run")
 	cmd.Flags().BoolVar(&legacyMode, migration.LegacyRunModeFlagName, false, "")
 	_ = cmd.Flags().MarkHidden(migration.LegacyRunModeFlagName)
@@ -84,9 +81,6 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 		after = []string{"codex"}
 	}
 	runOpts := runTargetOptionsFromRunFlags(cmd)
-	if strings.TrimSpace(runOpts.ModelProfileRef) != "" && (len(after) == 0 || !isCodexCommand(after[0])) {
-		return fmt.Errorf("--model-profile only applies to Codex launches")
-	}
 	if runOpts.AgentAutoApprove && (len(after) == 0 || !isCodexCommand(after[0])) {
 		return fmt.Errorf("--aaa only applies to Codex launches")
 	}
@@ -98,32 +92,6 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 	if err != nil {
 		return err
 	}
-	modelProfileLaunchRequested := false
-	if runOpts.ModelProfileRef != "" || (len(after) > 0 && isCodexCommand(after[0])) {
-		cfgForModelProfile, err := store.Load()
-		if err != nil {
-			return err
-		}
-		resolvedModelProfile, err := modelprofile.Resolve(cfgForModelProfile, runOpts.ModelProfileRef)
-		if err != nil {
-			return err
-		}
-		modelProfileLaunchRequested = strings.TrimSpace(runOpts.ModelProfileRef) != "" || strings.TrimSpace(cfgForModelProfile.DefaultModelProfile) != "" || cfgForModelProfile.HasExplicitGlobalDefaults()
-		if resolvedModelProfile.SSHProfile != nil {
-			if profileRef != "" {
-				selected, ok := cfgForModelProfile.FindProfile(profileRef)
-				if !ok {
-					return fmt.Errorf("profile %q not found", profileRef)
-				}
-				if selected.ID != resolvedModelProfile.SSHProfile.ID {
-					return fmt.Errorf("model profile %q requires ssh proxy %q, but run selected proxy profile %q", resolvedModelProfile.Name, resolvedModelProfile.SSHProfile.Name, profileRef)
-				}
-			} else {
-				profileRef = resolvedModelProfile.SSHProfile.Name
-			}
-		}
-	}
-
 	if profileRef != "" {
 		profile, cfg, err := ensureProfileRunFn(ctx, store, profileRef, autoInit, cmd.OutOrStdout())
 		if err != nil {
@@ -139,10 +107,6 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 		if len(after) > 0 && isCodexCommand(after[0]) {
 			runOpts.Log = cmd.ErrOrStderr()
 			return runCodexCLIInvocationFn(ctx, root, store, &profile, cfg.Instances, after, true, runOpts)
-		}
-		if isCodexCommand(after[0]) || modelProfileLaunchRequested {
-			runOpts.Log = cmd.ErrOrStderr()
-			return runWithProfileOptionsFn(ctx, store, profile, cfg.Instances, after, runOpts)
 		}
 		return runWithProfileFn(ctx, store, profile, cfg.Instances, after)
 	}
@@ -168,10 +132,6 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 			runOpts.Log = cmd.ErrOrStderr()
 			return runCodexCLIInvocationFn(ctx, root, store, &profile, cfgWithProfile.Instances, after, true, runOpts)
 		}
-		if isCodexCommand(after[0]) || modelProfileLaunchRequested {
-			runOpts.Log = cmd.ErrOrStderr()
-			return runWithProfileOptionsFn(ctx, store, profile, cfgWithProfile.Instances, after, runOpts)
-		}
 		return runWithProfileFn(ctx, store, profile, cfgWithProfile.Instances, after)
 	}
 
@@ -193,9 +153,6 @@ func runTargetOptionsFromRunFlags(cmd *cobra.Command) runTargetOptions {
 	opts := defaultRunTargetOptions()
 	if cmd == nil {
 		return opts
-	}
-	if flag := cmd.Flags().Lookup("model-profile"); flag != nil {
-		opts.ModelProfileRef = strings.TrimSpace(flag.Value.String())
 	}
 	if flag := cmd.Flags().Lookup("aaa"); flag != nil {
 		opts.AgentAutoApprove = strings.EqualFold(strings.TrimSpace(flag.Value.String()), "true")
@@ -248,14 +205,6 @@ func runWithExistingInstanceOptions(
 		if err := applyDefaultCodexExecutionContext(&opts); err != nil {
 			return err
 		}
-		var modelCleanup func()
-		cmdArgs, modelCleanup, err = prepareCodexModelProfileForRun(ctx, store, cmdArgs, &opts, proxyURL)
-		if err != nil {
-			return err
-		}
-		if modelCleanup != nil {
-			defer modelCleanup()
-		}
 	}
 
 	return runTargetSupervisedWithOptions(ctx, cmdArgs, proxyURL, func() error {
@@ -307,14 +256,6 @@ func runWithNewStackOptions(
 	if isCodexCommand(cmdArgs[0]) {
 		if err := applyDefaultCodexExecutionContext(&opts); err != nil {
 			return err
-		}
-		var modelCleanup func()
-		cmdArgs, modelCleanup, err = prepareCodexModelProfileForRun(ctx, store, cmdArgs, &opts, proxyURL)
-		if err != nil {
-			return err
-		}
-		if modelCleanup != nil {
-			defer modelCleanup()
 		}
 	}
 
@@ -411,10 +352,8 @@ type runTargetOptions struct {
 	Stdout       io.Writer
 	Stderr       io.Writer
 	// PreserveTTY keeps the target in the foreground terminal process group for interactive CLIs.
-	PreserveTTY          bool
-	ModelProfileRef      string
-	ModelProfileSnapshot modelprofile.Snapshot
-	AgentAutoApprove     bool
+	PreserveTTY      bool
+	AgentAutoApprove bool
 }
 
 type codexResolveError struct {

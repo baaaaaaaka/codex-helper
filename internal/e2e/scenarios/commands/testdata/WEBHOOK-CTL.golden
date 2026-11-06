@@ -1,0 +1,241 @@
+# WEBHOOK-CTL: `helper webhook setup|<url>|test|status|off` in the control chat with v0.1.20's texts, one test card per command
+# cxp black-box transcript; volatile values are numbered placeholders
+
+== chat <chat:1> "🏠 Codex Control - e2ehost"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
+-- <msg:2> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper webhook</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper webhook</p>
+-- <msg:3> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p><strong>🔔 Workflow webhook</strong></p>
+   | <p>Use this to send Teams Workflow notification cards for important helper events.</p>
+   | <p>Commands:</p>
+   | <ul><li><code>helper webhook setup</code> - show the setup steps</li>
+   | <li><code>helper webhook &lt;https-url&gt;</code> - save and enable the webhook</li>
+   | <li><code>helper webhook test</code> - send one test card</li>
+   | <li><code>helper webhook status</code> - show whether it is enabled</li>
+   | <li><code>helper webhook off</code> - disable cards</li>
+   | </ul>
+   | <p>The webhook URL is stored locally as a private secret file and is not echoed back.</p>
+-- <msg:4> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper webhook setup</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper webhook setup</p>
+-- <msg:5> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p><strong>🔔 Workflow webhook setup</strong></p>
+   | <p>Use this to send notification cards when Codex finishes, restarts, or needs your attention.</p>
+   | <p>Step 1: Open Workflows here<br>
+   | In this Control chat, click the <code>+</code> button at the lower right of the message box, then choose <code>Workflow</code>.</p>
+   | <p>Step 2: Pick exactly this Workflow template<br>
+   | Search <code>webhook</code>, then choose exactly: <strong>Send webhook alerts to a chat</strong></p>
+   | <p>Step 3: Confirm the target chat<br>
+   | Keep the target set to this Control chat:<br>
+   | 🏠 Codex Control - e2ehost<br>
+   | Chat ID: <code><chat:1></code></p>
+   | <p>Step 4: Create the Workflow and copy the URL<br>
+   | Click <code>Next</code> / <code>Add workflow</code>. Teams will show a webhook URL; copy it.</p>
+   | <p>Step 5: Send this here<br>
+   | <code>helper webhook &lt;paste-url&gt;</code><br>
+   | If Teams turns the pasted URL into a shortened hyperlink, paste the full URL as plain text instead.</p>
+   | <p>Need the Microsoft walkthrough? Open <a href="https://support.microsoft.com/en-us/office/create-incoming-webhooks-with-workflows-for-microsoft-teams-<uuid:1>">Teams webhook setup guide</a> (https://support.microsoft.com/en-us/office/create-incoming-webhooks-with-workflows-for-microsoft-teams-<uuid:1>).</p>
+   | <p>Note: Microsoft does not provide a reliable one-click link that pre-fills every workflow field and returns the generated webhook URL.</p>
+-- <msg:6> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper webhook status</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper webhook status</p>
+-- <msg:7> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>🔕 Workflow webhook disabled.</p>
+   | <p>Send <code>helper webhook &lt;https-url&gt;</code> to enable Workflow notification cards.</p>
+-- <msg:8> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper webhook test</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper webhook test</p>
+-- <msg:9> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⚠️ Workflow webhook test failed.</p>
+   | <p>Teams workflow notifications are disabled</p>
+-- <msg:10> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper webhook http://defaulte2e00000000000000000000057.e2.environment.api.powerplatform.com:443/powerautomate/automations/direct/workflows/<hex:1>/triggers/manual/paths/invoke?api-version=1&amp;sp=%2Ftriggers%2Fmanual%2Frun&amp;sv=1.0&amp;sig=e2esig0000000000000000000000d889</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper webhook http://defaulte2e00000000000000000000057.e2.environment.api.powerplatform.com:443/powerautomate/automations/direct/workflows/<hex:1>/triggers/manual/paths/invoke?api-version=1&amp;sp=%2Ftriggers%2Fmanual%2Frun&amp;sv=1.0&amp;sig=e2esig0000000000000000000000d889</p>
+-- <msg:11> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⚠️ Workflow webhook URL was not saved.</p>
+   | <p>Send an absolute <code>https://...</code> Teams Workflow webhook URL, for example:<br>
+   | <code>helper webhook https://...</code></p>
+-- <msg:12> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper webhook https://defaulte2e00000000000000000000057.e2.environment.api.powerplatform.com:443/powerautomate/automations/direct/workflows/<hex:1>/triggers/manual/paths/invoke?api-version=1&amp;sp=%2Ftriggers%2Fmanual%2Frun&amp;sv=1.0&amp;sig=e2esig0000000000000000000000d889</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper webhook https://defaulte2e00000000000000000000057.e2.environment.api.powerplatform.com:443/powerautomate/automations/direct/workflows/<hex:1>/triggers/manual/paths/invoke?api-version=1&amp;sp=%2Ftriggers%2Fmanual%2Frun&amp;sv=1.0&amp;sig=e2esig0000000000000000000000d889</p>
+-- <msg:13> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>✅ Workflow webhook enabled.</p>
+   | <p>Notification cards will be sent for important helper events.<br>
+   | Webhook URL: saved locally as a private secret file; I will not echo it back.</p>
+   | <p>Send <code>helper webhook test</code> to send a test card.</p>
+-- <msg:14> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper webhook status</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper webhook status</p>
+-- <msg:15> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>🔔 Workflow webhook enabled.</p>
+   | <p>Webhook URL: configured as a local private secret file.</p>
+-- <msg:16> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper webhook test</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper webhook test</p>
+-- <msg:17> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>✅ Workflow webhook test card queued.</p>
+-- <msg:18> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>new <root>/work/hook</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>new <root>/work/hook</p>
+-- <msg:19> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>✅ Work chat created: s001</p>
+   | <p>Open this Teams link and send your task there:<br>
+   | <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
+   | <p>If Teams does not show it right away, search for: s001</p>
+-- <msg:20> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper webhook test</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper webhook test</p>
+-- <msg:21> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>✅ Workflow webhook test card queued.</p>
+-- <msg:22> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper webhook off</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper webhook off</p>
+-- <msg:23> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>🔕 Workflow webhook disabled.</p>
+   | <p>The helper will stop sending Workflow notification cards.</p>
+-- <msg:24> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper webhook status</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper webhook status</p>
+-- <msg:25> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>🔕 Workflow webhook disabled.</p>
+   | <p>Send <code>helper webhook &lt;https-url&gt;</code> to enable Workflow notification cards.</p>
+-- <msg:26> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper webhook test</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper webhook test</p>
+-- <msg:27> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⚠️ Workflow webhook test failed.</p>
+   | <p>Teams workflow notifications are disabled</p>
+
+== chat <chat:2> "💬 e2ehost - Short question E2E-WEBHOOKCTL-final-1"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Work chat created: s001.<br>
+   | Working directory: <root>/work/hook</p>
+-- <msg:2> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>💬 Work chat is ready.<br>
+   | Send a task in this chat. Codex will start automatically and continue this session.<br>
+   | Status: waiting for your first task.<br>
+   | Session: s001<br>
+   | Project: hook<br>
+   | Working directory: <root>/work/hook<br>
+   | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
+   | Need more details? Send <code>helper status</code>.</p>
+-- <msg:3> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Short question E2E-WEBHOOKCTL-final-1</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>Short question E2E-WEBHOOKCTL-final-1</p>
+-- <msg:4> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+-- <msg:5> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>E2EANSWER-<n> answer for E2E-WEBHOOKCTL-final-1</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+
+== workflow cards
+-- card 1: status 202
+   text: ✅ Codex helper notification test
+   text: Workflow card delivery is configured for this control chat.
+   action: {"title":"Open chat","type":"Action.OpenUrl","url":"https://teams.microsoft.com/l/chat/<chat:1>/0?tenantId=e2e00000-0000-4000-8000-00000000te57"}
+-- card 2: status 202
+   text: Codex finished: s001 · hook
+   text: E2EANSWER-<n> answer for E2E-WEBHOOKCTL-final-1
+   action: {"title":"Open chat","type":"Action.OpenUrl","url":"https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57"}
+-- card 3: status 202
+   text: ✅ Codex helper notification test
+   text: Workflow card delivery is configured for this control chat.
+   action: {"title":"Open chat","type":"Action.OpenUrl","url":"https://teams.microsoft.com/l/chat/<chat:1>/0?tenantId=e2e00000-0000-4000-8000-00000000te57"}
+
+== codex turns (per thread; threads by kind, directory and first prompt; turns in start order)
+-- thread <uuid:2> (work, cwd <root>/work/hook)
+   turn: answered
+   prompt| User message:
+   prompt| Short question E2E-WEBHOOKCTL-final-1
+   prompt|
+   prompt| Teams helper safety:
+   prompt| - You are running inside a Codex turn launched by the Teams helper.
+   prompt| - The current Teams request is the `User message` section above. Treat earlier Teams requests in resumed Codex history as completed context, not as work to continue or answer, unless the current user explicitly asks about them.
+   prompt| - Do not restart, reload, kill, replace, or background the Teams helper process, binary, or service from this turn.
+   prompt| - If an installed helper needs to restart after an update or local repair, finish the answer and tell the user to send `helper restart now` in the Teams control chat.
+   prompt| - If the helper needs a release update, tell the user to send `helper update now`, or `helper update prerelease` only when they asked for prereleases.
+   prompt| - Subagent requests use native Codex subagents. For cross-machine agent delegation, use the cxp skill and its `cxp delegate` workflow when the task needs another signed-in Teams machine.
+   prompt|
+   prompt| Put fractions, sums, integrals, matrices, and display math in <m>TeX</m> on a separate line, never in prose, tables, or lists—even if asked for one line. Use backticks for simple inline/literal TeX. Never use $ or \(...\). Math markers are not artifacts.
+   prompt|
+   prompt| If you need to return generated files or images to the Teams user, write them under this local directory:
+   prompt| <root>/home/.local/state/codex-helper/teams/core-files/outbound/cxp-<key:1>-<turn:1>
+   prompt|
+   prompt| Then include this fenced manifest in your final answer:
+   prompt| ```codex-helper-artifacts
+   prompt| {"version":1,"files":[{"path":"relative/path.ext","name":"display-name.ext"}]}
+   prompt| ```
+   prompt|
+   prompt| Use only relative manifest paths under that directory. Keep your normal answer visible; the helper will upload listed files separately when file-write auth is available.
+
+== cli
+$ cxp teams workflow status
+   exit 0
+   stdout| Teams workflow notifications: enabled
+   stdout| Store: <root>/home/.local/state/codex-helper/teams/core.sqlite
+   stdout| Webhook URL file: configured (ok)

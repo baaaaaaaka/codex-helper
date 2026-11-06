@@ -2,7 +2,7 @@
 
 Use this only when the user naturally asks for another signed-in Teams machine or remote agent to inspect part of the task. The user does not need to remember a command.
 
-Active `cxp teams run` helpers publish machine capability heartbeats to the hidden Teams registry automatically after they become the owner when effective Teams write auth is available. A dedicated full-token cache is not required if the normal write token covers chat and online-meeting scopes. Each accepting machine also creates a hidden per-machine inbox and publishes its opaque inbox locator in the machine card. The heartbeat patches the same machine slot roughly every 5 minutes and marks the machine draining on shutdown when possible. Do not ask the user to run a publish command for normal use.
+Active `cxp teams run` helpers publish machine capability heartbeats to the hidden Teams registry automatically once they are signed in (`cxp teams auth`) and own the helper store. Each accepting machine also creates a hidden per-machine inbox and publishes its opaque inbox locator in the machine card. The heartbeat patches the same machine slot roughly every 5 minutes and marks the machine draining on shutdown when possible. Do not ask the user to run a publish command for normal use.
 
 Model-facing flow:
 

@@ -121,36 +121,12 @@ func scheduleTeamsPendingHelperActivation(ctx context.Context, activation teamsP
 	return teamsServiceStartDetached(ctx, teamsServicePowerShellExecutable(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-Command", command)
 }
 
-func scheduleTeamsPendingHelperActivationForPath(ctx context.Context, pendingPath string) error {
-	return scheduleTeamsPendingHelperActivationForReplacement(ctx, pendingPath, "")
-}
-
 func scheduleTeamsPendingHelperActivationForReplacement(ctx context.Context, pendingPath string, installPath string) error {
 	pendingPath = strings.TrimSpace(pendingPath)
 	if teamsServiceGOOS() != "windows" || pendingPath == "" {
 		return nil
 	}
 	return scheduleTeamsPendingHelperActivation(ctx, teamsPendingHelperActivationForReplacement(pendingPath, installPath))
-}
-
-func scheduleTeamsPendingHelperProcessRestart(ctx context.Context, pendingPath string, installPath string, args []string) error {
-	if teamsServiceGOOS() != "windows" {
-		return nil
-	}
-	activation := teamsPendingHelperActivationForReplacement(pendingPath, installPath)
-	if strings.TrimSpace(activation.PendingPath) == "" || strings.TrimSpace(activation.InstallPath) == "" {
-		return fmt.Errorf("pending helper process restart requires both pending and install paths")
-	}
-	var err error
-	activation, err = normalizeTeamsPendingHelperActivation(activation)
-	if err != nil {
-		return err
-	}
-	if err := writeTeamsPendingHelperActivationOwner(activation.PendingPath, activation.Version); err != nil {
-		return err
-	}
-	command := windowsTeamsPendingHelperProcessRestartPowerShell(activation.PendingPath, activation.InstallPath, activation.Version, args)
-	return teamsServiceStartDetached(ctx, teamsServicePowerShellExecutable(), "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-Command", command)
 }
 
 func normalizeTeamsPendingHelperActivation(activation teamsPendingHelperActivation) (teamsPendingHelperActivation, error) {
@@ -160,10 +136,6 @@ func normalizeTeamsPendingHelperActivation(activation teamsPendingHelperActivati
 	}
 	activation.InstallPath = resolved.Path
 	return activation, nil
-}
-
-func teamsPendingHelperActivationForPendingPath(pendingPath string) teamsPendingHelperActivation {
-	return teamsPendingHelperActivationForReplacement(pendingPath, "")
 }
 
 func teamsPendingHelperActivationForReplacement(pendingPath string, installPath string) teamsPendingHelperActivation {

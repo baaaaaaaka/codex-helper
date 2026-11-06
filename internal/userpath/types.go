@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"time"
 )
@@ -16,10 +15,15 @@ import (
 type Mode string
 
 const (
-	ModeAccountDefault   Mode = "account-default"
-	ModeCapturedTerminal Mode = "captured-terminal"
-	ModeExplicit         Mode = "explicit"
-	ModeService          Mode = "service"
+	ModeAccountDefault Mode = "account-default"
+	ModeExplicit       Mode = "explicit"
+)
+
+// Modes saved by earlier releases: a captured terminal PATH was saved like
+// an explicit one, and the service mode now resolves the account default.
+const (
+	legacyModeCapturedTerminal = "captured-terminal"
+	legacyModeService          = "service"
 )
 
 type Policy struct {
@@ -79,21 +83,11 @@ func (DefaultResolver) Resolve(ctx context.Context, req Request) (Result, error)
 
 	var result Result
 	switch mode {
-	case ModeService:
-		pathValue, ok := EnvironmentValue(req.ServiceEnvironment, "PATH", runtime.GOOS == "windows")
-		if !ok {
-			return Result{}, fmt.Errorf("Teams service environment does not contain PATH")
-		}
-		result = Result{Path: pathValue, Source: "service-environment", Mode: mode, Target: req.Target}
-	case ModeExplicit, ModeCapturedTerminal:
+	case ModeExplicit:
 		if req.Policy.ExplicitPath == "" {
 			return Result{}, fmt.Errorf("Teams Codex PATH mode %s requires a non-empty path", mode)
 		}
-		source := "explicit-config"
-		if mode == ModeCapturedTerminal {
-			source = "captured-terminal"
-		}
-		result = Result{Path: req.Policy.ExplicitPath, Source: source, Mode: mode, Target: req.Target}
+		result = Result{Path: req.Policy.ExplicitPath, Source: "explicit-config", Mode: mode, Target: req.Target}
 	case ModeAccountDefault:
 		result, err = resolveAccountDefault(ctx, req)
 		if err != nil {
@@ -114,14 +108,10 @@ func (DefaultResolver) Resolve(ctx context.Context, req Request) (Result, error)
 
 func normalizeMode(mode Mode) (Mode, error) {
 	switch Mode(strings.ToLower(strings.TrimSpace(string(mode)))) {
-	case "", ModeAccountDefault:
+	case "", ModeAccountDefault, legacyModeService:
 		return ModeAccountDefault, nil
-	case ModeCapturedTerminal:
-		return ModeCapturedTerminal, nil
-	case ModeExplicit:
+	case ModeExplicit, legacyModeCapturedTerminal:
 		return ModeExplicit, nil
-	case ModeService:
-		return ModeService, nil
 	default:
 		return "", fmt.Errorf("unknown Teams Codex PATH mode %q", mode)
 	}

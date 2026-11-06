@@ -381,10 +381,6 @@ func codexAppAuthRuntimeEnvForIdentity(base []string, identity *execIdentity) []
 	return setEnvValue(envVars, "PATH", strings.Join(updated, string(os.PathListSeparator)))
 }
 
-func findCodexAppAuthCodexForIdentity(ctx context.Context, identity *execIdentity) (string, error) {
-	return findCodexAppAuthCodexForIdentityWithPolicy(ctx, identity, false)
-}
-
 func findCodexAppAuthCodexForIdentityWithPolicy(ctx context.Context, identity *execIdentity, requireManaged bool) (string, error) {
 	candidates := make([]string, 0, 8)
 	seen := map[string]struct{}{}

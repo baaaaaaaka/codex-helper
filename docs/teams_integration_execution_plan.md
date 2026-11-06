@@ -2,6 +2,12 @@
 
 Status: historical implementation tracker with current-runtime corrections.
 
+> The Teams bridge this tracker describes (`internal/teams`) has been replaced
+> by the new core (`internal/core`, `internal/channel/teams`). Commands such
+> as `teams pause`, `teams recover`, `teams send-file`, `teams probe-chat`,
+> `helper reload`, and model profiles no longer exist; see the README and
+> `docs/teams_source_deployment_guide.md` for the current command set.
+
 Current runtime note: Teams now uses the standard `AppServerRunner` approval
 broker by default. The former direct `ExecRunner` fallback and experimental
 runner switch are retired. Protocol incompatibility fails closed and is caught

@@ -16,7 +16,6 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 	"github.com/baaaaaaaka/codex-helper/internal/env"
-	"github.com/baaaaaaaka/codex-helper/internal/modelprofile"
 	"github.com/baaaaaaaka/codex-helper/internal/responsespolicy"
 )
 
@@ -66,7 +65,7 @@ func runCodexSession(
 	if err != nil {
 		return err
 	}
-	return runCodexTUIViaBroker(ctx, root, store, profile, instances, cwd, session.SessionID, codexPath, codexDir, useProxy, agentAutoApprove, "", log)
+	return runCodexTUIViaBroker(ctx, root, store, profile, instances, cwd, session.SessionID, codexPath, codexDir, useProxy, agentAutoApprove, log)
 }
 
 func runCodexNewSession(
@@ -85,7 +84,7 @@ func runCodexNewSession(
 	if err != nil {
 		return err
 	}
-	return runCodexTUIViaBroker(ctx, root, store, profile, instances, cwd, "", codexPath, codexDir, useProxy, agentAutoApprove, "", log)
+	return runCodexTUIViaBroker(ctx, root, store, profile, instances, cwd, "", codexPath, codexDir, useProxy, agentAutoApprove, log)
 }
 
 func runCodexForkSession(
@@ -123,7 +122,6 @@ func runCodexForkSession(
 		codexDir,
 		useProxy,
 		agentAutoApprove,
-		"",
 		nil,
 		nil,
 		nil,
@@ -192,34 +190,13 @@ func runCodexTUIViaBroker(
 	codexDir string,
 	useProxy bool,
 	agentAutoApprove bool,
-	modelProfileRef string,
 	log io.Writer,
 ) error {
 	tail := []string{}
 	if sessionID = strings.TrimSpace(sessionID); sessionID != "" {
 		tail = []string{"resume", sessionID}
 	}
-	return runCodexTUIInvocationViaBrokerWithPreflight(ctx, root, store, profile, instances, cwd, codexPath, codexDir, useProxy, agentAutoApprove, modelProfileRef, nil, tail, nil, sessionID, log)
-}
-
-func runCodexTUIInvocationViaBroker(
-	ctx context.Context,
-	root *rootOptions,
-	store *config.Store,
-	profile *config.Profile,
-	instances []config.Instance,
-	cwd string,
-	codexPath string,
-	codexDir string,
-	useProxy bool,
-	agentAutoApprove bool,
-	modelProfileRef string,
-	tuiGlobalArgs []string,
-	tuiTail []string,
-	appServerExtraArgs []string,
-	log io.Writer,
-) error {
-	return runCodexTUIInvocationViaBrokerWithHooks(ctx, root, store, profile, instances, cwd, codexPath, codexDir, useProxy, agentAutoApprove, modelProfileRef, tuiGlobalArgs, tuiTail, appServerExtraArgs, nil, nil, log)
+	return runCodexTUIInvocationViaBrokerWithPreflight(ctx, root, store, profile, instances, cwd, codexPath, codexDir, useProxy, agentAutoApprove, nil, tail, nil, sessionID, log)
 }
 
 func runCodexTUIInvocationViaBrokerWithPreflight(
@@ -233,7 +210,6 @@ func runCodexTUIInvocationViaBrokerWithPreflight(
 	codexDir string,
 	useProxy bool,
 	agentAutoApprove bool,
-	modelProfileRef string,
 	tuiGlobalArgs []string,
 	tuiTail []string,
 	appServerExtraArgs []string,
@@ -247,7 +223,7 @@ func runCodexTUIInvocationViaBrokerWithPreflight(
 			return migrateCodexRolloutBeforeTUI(ctx, launch, identity, threadID)
 		}
 	}
-	return runCodexTUIInvocationViaBrokerWithHooks(ctx, root, store, profile, instances, cwd, codexPath, codexDir, useProxy, agentAutoApprove, modelProfileRef, tuiGlobalArgs, tuiTail, appServerExtraArgs, nil, preflight, log)
+	return runCodexTUIInvocationViaBrokerWithHooks(ctx, root, store, profile, instances, cwd, codexPath, codexDir, useProxy, agentAutoApprove, tuiGlobalArgs, tuiTail, appServerExtraArgs, nil, preflight, log)
 }
 
 func runCodexTUIInvocationViaBrokerWithHook(
@@ -261,14 +237,13 @@ func runCodexTUIInvocationViaBrokerWithHook(
 	codexDir string,
 	useProxy bool,
 	agentAutoApprove bool,
-	modelProfileRef string,
 	tuiGlobalArgs []string,
 	tuiTail []string,
 	appServerExtraArgs []string,
 	beforeBroker codexTUIBeforeBroker,
 	log io.Writer,
 ) error {
-	return runCodexTUIInvocationViaBrokerWithHooks(ctx, root, store, profile, instances, cwd, codexPath, codexDir, useProxy, agentAutoApprove, modelProfileRef, tuiGlobalArgs, tuiTail, appServerExtraArgs, beforeBroker, nil, log)
+	return runCodexTUIInvocationViaBrokerWithHooks(ctx, root, store, profile, instances, cwd, codexPath, codexDir, useProxy, agentAutoApprove, tuiGlobalArgs, tuiTail, appServerExtraArgs, beforeBroker, nil, log)
 }
 
 func runCodexTUIInvocationViaBrokerWithHooks(
@@ -282,7 +257,6 @@ func runCodexTUIInvocationViaBrokerWithHooks(
 	codexDir string,
 	useProxy bool,
 	agentAutoApprove bool,
-	modelProfileRef string,
 	tuiGlobalArgs []string,
 	tuiTail []string,
 	appServerExtraArgs []string,
@@ -336,25 +310,7 @@ func runCodexTUIInvocationViaBrokerWithHooks(
 		extraEnv = env.WithProxy(extraEnv, proxyURL)
 	}
 
-	officialAuth := false
-	if shouldProbeCodexLogin(store) {
-		officialAuth = codexLoginStatusProbeFn(ctx, codexPath, extraEnv, log)
-	}
-	modelLaunch, modelCleanup, err := startModelProfileAdapterForCodex(withCodexLoginProbePath(ctx, codexPath), store, modelProfileRef, modelprofile.Snapshot{}, proxyURL, officialAuth, log)
-	if err != nil {
-		return err
-	}
-	if modelCleanup != nil {
-		defer modelCleanup()
-	}
 	appServerArgs := append([]string{"app-server", "--analytics-default-enabled"}, appServerExtraArgs...)
-	if modelLaunch.Enabled {
-		modelArgs := appendCodexModelProfileArgs([]string{"codex"}, modelLaunch)
-		appServerArgs = append(appServerArgs, modelArgs[1:]...)
-		if !modelLaunch.Native {
-			extraEnv = append(extraEnv, modelLaunch.effectiveEnvKey()+"="+modelLaunch.ProxyKey)
-		}
-	}
 
 	guardCleanup := func() {}
 	if guarded, cleanup, guardErr := prepareCodexSelfUpdateGuardEnv(ctx, codexPath, extraEnv, paths.ExecIdentity); guardErr == nil {

@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	teamsstore "github.com/baaaaaaaka/codex-helper/internal/teams/store"
+	corestore "github.com/baaaaaaaka/codex-helper/internal/core/store"
 )
 
 const supervisorPipeHolderEnv = "CXP_TEST_SUPERVISOR_PIPE_HOLDER"
@@ -181,39 +181,31 @@ func TestTeamsServiceLocalSupervisorChildHealthRestartWithSeparatePipeHolder(t *
 
 // Exercise the actual local-supervisor child loop rather than only testing a
 // watchdog decision.  During startup the replacement child is already alive,
-// but the previous owner's stale row can remain until listener initialization
-// records the new owner.  A stale row must not make the supervisor terminate
+// but it has not acquired the store yet.  A missing owner must not make the
+// supervisor terminate
 // that replacement child before it gets a chance to initialize.
 func TestTeamsServiceLocalSupervisorDoesNotRestartChildBeforeOwnerRegistration(t *testing.T) {
 	lockCLITestHooks(t)
 	tmp := t.TempDir()
 	isolateTeamsUserDirsForTest(t, tmp)
 
-	statePath := filepath.Join(tmp, "canonical", "state.json")
-	if err := os.MkdirAll(filepath.Dir(statePath), 0o700); err != nil {
-		t.Fatalf("mkdir watchdog state dir: %v", err)
-	}
-	if err := os.WriteFile(statePath, []byte("{}"), 0o600); err != nil {
-		t.Fatalf("write watchdog state placeholder: %v", err)
-	}
-	hostname, err := os.Hostname()
+	// The previous owner released the store; the replacement child has not
+	// acquired it yet.
+	storePath := filepath.Join(tmp, "core.sqlite")
+	st, err := corestore.Open(storePath)
 	if err != nil {
-		t.Fatalf("Hostname: %v", err)
+		t.Fatal(err)
+	}
+	if _, err := st.Acquire(corestore.Ident{Host: "box", PID: os.Getpid(), BootID: "b"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
 	}
 	now := time.Now()
-	previousOwner := teamsstore.OwnerMetadata{
-		PID:             os.Getpid(),
-		Hostname:        hostname,
-		ScopeID:         "scope-supervisor-startup",
-		LeaseGeneration: 19,
-		StartedAt:       now.Add(-time.Hour),
-		LastHeartbeat:   now.Add(-10 * time.Minute),
-	}
-	watchdogState := teamsstore.State{
-		Scope:        teamsstore.ScopeIdentity{ID: previousOwner.ScopeID},
-		ServiceOwner: &previousOwner,
-		LockOwner:    &previousOwner,
-	}
 
 	fake := filepath.Join(tmp, "fake-cxp")
 	if err := os.WriteFile(fake, []byte("#!/bin/sh\nwhile :; do sleep 1; done\n"), 0o700); err != nil {
@@ -230,8 +222,7 @@ func TestTeamsServiceLocalSupervisorDoesNotRestartChildBeforeOwnerRegistration(t
 	prevHeartbeat := teamsServiceLocalSupervisorHeartbeatEvery
 	prevTerminationWait := teamsServiceLocalSupervisorTerminationWait
 	prevHealth := teamsServiceLocalSupervisorCheckChildHealth
-	prevStorePaths := teamsServiceWatchdogStorePaths
-	prevLoadState := teamsServiceWatchdogLoadState
+	prevStorePath := teamsServiceWatchdogStorePath
 	prevInstalled := teamsServiceWatchdogInstalled
 	prevActive := teamsServiceWatchdogActive
 	prevManagedChild := teamsServiceWatchdogManagedChild
@@ -240,20 +231,14 @@ func TestTeamsServiceLocalSupervisorDoesNotRestartChildBeforeOwnerRegistration(t
 		teamsServiceLocalSupervisorHeartbeatEvery = prevHeartbeat
 		teamsServiceLocalSupervisorTerminationWait = prevTerminationWait
 		teamsServiceLocalSupervisorCheckChildHealth = prevHealth
-		teamsServiceWatchdogStorePaths = prevStorePaths
-		teamsServiceWatchdogLoadState = prevLoadState
+		teamsServiceWatchdogStorePath = prevStorePath
 		teamsServiceWatchdogInstalled = prevInstalled
 		teamsServiceWatchdogActive = prevActive
 		teamsServiceWatchdogManagedChild = prevManagedChild
 	})
 	teamsServiceLocalSupervisorHeartbeatEvery = 10 * time.Millisecond
 	teamsServiceLocalSupervisorTerminationWait = 100 * time.Millisecond
-	teamsServiceWatchdogStorePaths = func() ([]string, error) {
-		return []string{statePath}, nil
-	}
-	teamsServiceWatchdogLoadState = func(context.Context, string) (teamsstore.State, error) {
-		return watchdogState, nil
-	}
+	teamsServiceWatchdogStorePath = func() (string, error) { return storePath, nil }
 	teamsServiceWatchdogInstalled = func() (bool, error) { return true, nil }
 	teamsServiceWatchdogActive = func(context.Context) (bool, error) { return true, nil }
 	teamsServiceWatchdogManagedChild = func() (teamsServiceWatchdogManagedChildIdentity, bool) {

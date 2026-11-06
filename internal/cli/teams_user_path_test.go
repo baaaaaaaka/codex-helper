@@ -10,10 +10,8 @@ import (
 	"runtime"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/config"
-	"github.com/baaaaaaaka/codex-helper/internal/teams"
 	"github.com/baaaaaaaka/codex-helper/internal/userpath"
 )
 
@@ -132,7 +130,7 @@ func TestResolveTeamsCodexUpgradePathReturnsInstallTargetInsteadOfFallingBackToS
 	}
 }
 
-func TestResolveTeamsCodexUpgradeTargetServicePrefersManagedInstallOverSystemNPMAndUnknownCache(t *testing.T) {
+func TestResolveTeamsCodexUpgradeTargetPrefersManagedInstallOverSystemNPMAndUnknownCache(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX npm wrapper fixture")
 	}
@@ -161,92 +159,19 @@ func TestResolveTeamsCodexUpgradeTargetServicePrefersManagedInstallOverSystemNPM
 	previous := teamsUserPathResolver
 	teamsUserPathResolver = &recordingUserPathResolver{result: userpath.Result{
 		Path:   os.Getenv("PATH"),
-		Mode:   userpath.ModeService,
+		Mode:   userpath.ModeAccountDefault,
 		Source: "service-environment",
 	}}
 	t.Cleanup(func() { teamsUserPathResolver = previous })
 
 	target, err := resolveTeamsCodexUpgradeTarget(context.Background(), config.Config{
-		TeamsCodexPath: config.TeamsCodexPathPolicy{Mode: string(userpath.ModeService)},
+		TeamsCodexPath: config.TeamsCodexPathPolicy{Mode: string(userpath.ModeAccountDefault)},
 	}, effectivePaths{Home: home})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if target.path != managedCodex {
 		t.Fatalf("upgrade target = %q, want managed install %q instead of system npm %q or unknown cache %q", target.path, managedCodex, systemNPMCodex, unknownCachedCodex)
-	}
-}
-
-func TestTeamsCodexUpgradeLiveTargetPATH(t *testing.T) {
-	if os.Getenv("CODEX_HELPER_TEAMS_UPGRADE_LIVE") != "1" {
-		t.Skip("set CODEX_HELPER_TEAMS_UPGRADE_LIVE=1 to run the real npm upgrade")
-	}
-	codexDir := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_UPGRADE_CODEX_DIR"))
-	if codexDir == "" {
-		t.Fatal("CODEX_HELPER_TEAMS_UPGRADE_CODEX_DIR is required")
-	}
-	t.Setenv("XDG_CACHE_HOME", t.TempDir())
-	if runtime.GOOS == "windows" {
-		callerProfile := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_UPGRADE_CALLER_PROFILE"))
-		if callerProfile == "" {
-			t.Fatal("CODEX_HELPER_TEAMS_UPGRADE_CALLER_PROFILE is required on Windows; TestMain must not recover the ambient profile implicitly")
-		}
-		if !filepath.IsAbs(callerProfile) {
-			t.Fatalf("CODEX_HELPER_TEAMS_UPGRADE_CALLER_PROFILE must be absolute, got %q", callerProfile)
-		}
-		if samePath(callerProfile, os.Getenv("USERPROFILE")) {
-			t.Fatalf("live shard restored caller profile globally instead of passing it through the explicit test-only channel: %q", callerProfile)
-		}
-		t.Setenv("LOCALAPPDATA", t.TempDir())
-	}
-	servicePath := os.Getenv("PATH")
-	if path, ok := teamsCodexExecutableOnPath(servicePath); ok && samePath(filepath.Dir(path), codexDir) {
-		t.Fatalf("test precondition failed: service PATH already exposes target Codex %s", path)
-	}
-	targetPath := codexDir + string(os.PathListSeparator) + servicePath
-	mode := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_UPGRADE_PATH_MODE"))
-	if mode == "" {
-		mode = string(userpath.ModeExplicit)
-	}
-	pathPolicy := config.TeamsCodexPathPolicy{Mode: mode}
-	if mode == string(userpath.ModeExplicit) || mode == string(userpath.ModeCapturedTerminal) {
-		pathPolicy.ExplicitPath = targetPath
-	}
-	cfgPath := filepath.Join(t.TempDir(), "config.json")
-	store, err := config.NewStore(cfgPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Save(config.Config{
-		Version:        config.CurrentVersion,
-		TeamsCodexPath: pathPolicy,
-		ProxyEnabled:   boolPtr(false),
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	result, err := runTeamsCodexUpgradeFromBridge(context.Background(), &rootOptions{configPath: cfgPath}, io.Discard, "")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !samePath(filepath.Dir(result.Path), codexDir) {
-		t.Fatalf("upgraded path = %q, want directory %q", result.Path, codexDir)
-	}
-	if err := probeCodexVersion(context.Background(), result.Path); err != nil {
-		t.Fatalf("upgraded Codex is not functional: %v", err)
-	}
-	runtimeContract := applyTeamsUserPathRuntime(resolvedCodexRuntime{
-		Command:     result.Path,
-		Environment: []string{"PATH=" + servicePath},
-	}, userpath.Result{Path: servicePath, Mode: userpath.ModeService}, io.Discard)
-	rgPath, err := lookPathInEnvironment("rg", runtimeContract.Environment)
-	if err != nil {
-		t.Fatalf("service-mode Codex runtime did not expose bundled rg: %v; command=%s wrapper=%s vendor=%s PATH=%s", err, runtimeContract.Command, runtimeContract.WrapperCommand, runtimeContract.VendorPathDir, envValue(runtimeContract.Environment, "PATH"))
-	}
-	rgProbe := exec.Command(rgPath, "--version")
-	rgProbe.Env = runtimeContract.Environment
-	if output, err := rgProbe.CombinedOutput(); err != nil {
-		t.Fatalf("bundled rg is not functional: %v: %s", err, output)
 	}
 }
 
@@ -286,38 +211,6 @@ func TestApplyTeamsUserPathRuntimeUsesNativeBinaryWithoutManagedNodePATH(t *test
 		if _, ok := sliceEnvValue(got.Environment, key); ok {
 			t.Fatalf("launcher-only %s leaked into native runtime: %#v", key, got.Environment)
 		}
-	}
-}
-
-func TestApplyTeamsUserPathRuntimeServiceModePreservesLegacyWrapper(t *testing.T) {
-	previous := teamsFindNativeCodex
-	teamsFindNativeCodex = func(wrapper string) (string, string, error) {
-		if wrapper != "/managed/codex" {
-			t.Fatalf("wrapper = %q", wrapper)
-		}
-		return "/managed/vendor/codex", "/managed/vendor/codex-path", nil
-	}
-	t.Cleanup(func() { teamsFindNativeCodex = previous })
-	want := resolvedCodexRuntime{
-		Command: "/managed/codex",
-		Environment: []string{
-			"PATH=/managed/node/bin:/service/bin",
-			"CODEX_NODE_INSTALL_ROOT=/managed/node",
-		},
-	}
-	got := applyTeamsUserPathRuntime(want, userpath.Result{
-		Path: "/service/bin",
-		Mode: userpath.ModeService,
-	}, io.Discard)
-	if got.Command != want.Command || got.WrapperCommand != want.Command {
-		t.Fatalf("service compatibility runtime bypassed wrapper: %#v", got)
-	}
-	wantPath := "/managed/vendor/codex-path" + string(os.PathListSeparator) + "/managed/node/bin:/service/bin"
-	if path := envValue(got.Environment, "PATH"); path != wantPath {
-		t.Fatalf("service compatibility PATH = %q, want bundled tool path %q", path, wantPath)
-	}
-	if got.VendorPathDir != "/managed/vendor/codex-path" || envValue(got.Environment, "CODEX_NODE_INSTALL_ROOT") != "/managed/node" {
-		t.Fatalf("service compatibility runtime = %#v", got)
 	}
 }
 
@@ -393,7 +286,7 @@ case "${1:-}" in
   --version) echo 'codex-cli 0.142.3'; exit 0 ;;
   --help) echo 'Options: --remote <ADDR> --remote-auth-token-env <ENV_VAR>'; exit 0 ;;
   app-server)
-    printf '%s' "$PATH" > ` + shellSingleQuoteForBeaconCLITest(pathFile) + `
+    printf '%s' "$PATH" > ` + shellQuote(pathFile) + `
     while IFS= read -r line; do
       id=$(printf %s "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
       case "$line" in
@@ -426,18 +319,21 @@ esac
 	if err := store.Save(config.Config{Version: config.CurrentVersion, RuntimeGeneration: currentRuntimeGeneration}); err != nil {
 		t.Fatal(err)
 	}
-	executor, err := newManagedTeamsCodexExecutor(&rootOptions{configPath: store.Path()}, "appserver", codexPath, rootDir, nil, "", 5*time.Second, io.Discard)
+	launch, err := newTeamsNewCoreCodexLaunch(context.Background(), &rootOptions{configPath: store.Path()}, codexPath, io.Discard)
 	if err != nil {
 		t.Fatal(err)
 	}
-	managed := executor.(teamsCodexExecutor)
-	defer managed.Close()
-	result, err := managed.Run(context.Background(), &teams.Session{Cwd: rootDir}, "check path")
-	if err != nil {
+	defer launch.Close()
+	if launch.Bin != codexPath {
+		t.Fatalf("app-server binary = %q, want %q", launch.Bin, codexPath)
+	}
+	cmd := exec.Command(launch.Bin, append([]string{"app-server"}, launch.Args...)...)
+	if err := launch.Configure(cmd); err != nil {
 		t.Fatal(err)
 	}
-	if result.Text != "ok" {
-		t.Fatalf("result = %#v", result)
+	cmd.Stdin = strings.NewReader("")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("app-server: %v\n%s", err, out)
 	}
 	raw, err := os.ReadFile(pathFile)
 	if err != nil {

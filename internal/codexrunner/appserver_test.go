@@ -1675,35 +1675,11 @@ func assertParamBool(tb testing.TB, got map[string]any, key string, want bool) {
 	}
 }
 
-func assertParamNil(tb testing.TB, got map[string]any, key string) {
-	tb.Helper()
-	params := paramsMap(tb, got)
-	if value, ok := params[key]; !ok || value != nil {
-		tb.Fatalf("param %s = %#v, want nil in %#v", key, value, got)
-	}
-}
-
 func assertParamAbsent(tb testing.TB, got map[string]any, key string) {
 	tb.Helper()
 	params := paramsMap(tb, got)
 	if value, ok := params[key]; ok {
 		tb.Fatalf("param %s = %#v, want absent in %#v", key, value, got)
-	}
-}
-
-func assertParamStrings(tb testing.TB, got map[string]any, key string, want []string) {
-	tb.Helper()
-	params := paramsMap(tb, got)
-	raw, ok := params[key].([]any)
-	if !ok {
-		tb.Fatalf("param %s = %#v, want string list in %#v", key, params[key], got)
-	}
-	var gotStrings []string
-	for _, value := range raw {
-		gotStrings = append(gotStrings, value.(string))
-	}
-	if !reflect.DeepEqual(gotStrings, want) {
-		tb.Fatalf("param %s = %#v, want %#v in %#v", key, gotStrings, want, got)
 	}
 }
 

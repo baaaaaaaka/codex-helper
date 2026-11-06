@@ -81,10 +81,6 @@ func appendWSLInteropPath(base, inherited string) string {
 	return strings.Join(out, string(os.PathListSeparator))
 }
 
-func isWSLInteropPath(path string) bool {
-	return isWSLInteropPathWithRoot(path, wslAutomountRoot())
-}
-
 func isWSLInteropPathWithRoot(path string, automountRoot string) bool {
 	slashed := filepath.ToSlash(filepath.Clean(path))
 	switch slashed {
