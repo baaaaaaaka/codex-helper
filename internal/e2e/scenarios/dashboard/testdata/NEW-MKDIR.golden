@@ -114,7 +114,7 @@
    | <hr/>
    | <p><strong>1. opened</strong><br>
    | &nbsp;&nbsp;<code><root>/work/opened</code><br>
-   | &nbsp;&nbsp;Sessions: 0 active, 1 idle, last updated <time:1></p>
+   | &nbsp;&nbsp;Sessions: 0 active, 1 idle, last updated <minute></p>
    | <p>&nbsp;&nbsp;<strong>Next:</strong> send <code>1</code> or <code>p 1</code> to open this workspace</p>
    | <hr/>
    | <p><strong>Other options:</strong></p>
@@ -136,7 +136,7 @@
    | <hr/>
    | <p><strong>1. Old work in the opened workspace</strong><br>
    | &nbsp;&nbsp;<code><root>/work/opened</code><br>
-   | &nbsp;&nbsp;Session: idle, last updated <time:1></p>
+   | &nbsp;&nbsp;Session: idle, last updated <minute></p>
    | <p>&nbsp;&nbsp;<strong>Next:</strong> send <code>1</code> or <code>c 1</code> to continue this session in Teams</p>
    | <hr/>
    | <p>Need debug IDs? Send <code>details &lt;number&gt;</code>. Numbers expire after one reply.</p>

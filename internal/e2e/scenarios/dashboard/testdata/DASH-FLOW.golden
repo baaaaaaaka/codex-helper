@@ -19,12 +19,12 @@
    | <hr/>
    | <p><strong>2. beta</strong><br>
    | &nbsp;&nbsp;<code><root>/work/beta</code><br>
-   | &nbsp;&nbsp;Sessions: 0 active, 1 idle, last updated <time:1></p>
+   | &nbsp;&nbsp;Sessions: 0 active, 1 idle, last updated <minute></p>
    | <p>&nbsp;&nbsp;<strong>Next:</strong> send <code>2</code> or <code>p 2</code> to open this workspace</p>
    | <hr/>
    | <p><strong>1. alpha</strong><br>
    | &nbsp;&nbsp;<code><root>/work/alpha</code><br>
-   | &nbsp;&nbsp;Sessions: 0 active, 2 idle, last updated <time:2></p>
+   | &nbsp;&nbsp;Sessions: 0 active, 2 idle, last updated <minute></p>
    | <p>&nbsp;&nbsp;<strong>Next:</strong> send <code>1</code> or <code>p 1</code> to open this workspace</p>
    | <hr/>
    | <p><strong>Other options:</strong></p>
@@ -46,12 +46,12 @@
    | <hr/>
    | <p><strong>2. Plan the alpha release</strong><br>
    | &nbsp;&nbsp;<code><root>/work/alpha</code><br>
-   | &nbsp;&nbsp;Session: idle, last updated <time:3></p>
+   | &nbsp;&nbsp;Session: idle, last updated <minute></p>
    | <p>&nbsp;&nbsp;<strong>Next:</strong> send <code>2</code> or <code>c 2</code> to continue this session in Teams</p>
    | <hr/>
    | <p><strong>1. Fix the alpha login bug</strong><br>
    | &nbsp;&nbsp;<code><root>/work/alpha</code><br>
-   | &nbsp;&nbsp;Session: idle, last updated <time:2></p>
+   | &nbsp;&nbsp;Session: idle, last updated <minute></p>
    | <p>&nbsp;&nbsp;<strong>Next:</strong> send <code>1</code> or <code>c 1</code> to continue this session in Teams</p>
    | <hr/>
    | <p>Need debug IDs? Send <code>details &lt;number&gt;</code>. Numbers expire after one reply.</p>
@@ -88,12 +88,12 @@
    | <hr/>
    | <p><strong>2. Plan the alpha release</strong><br>
    | &nbsp;&nbsp;<code><root>/work/alpha</code><br>
-   | &nbsp;&nbsp;Session: idle, last updated <time:3></p>
+   | &nbsp;&nbsp;Session: idle, last updated <minute></p>
    | <p>&nbsp;&nbsp;<strong>Next:</strong> send <code>2</code> or <code>c 2</code> to continue this session in Teams</p>
    | <hr/>
    | <p><strong>1. Fix the alpha login bug</strong><br>
    | &nbsp;&nbsp;<code><root>/work/alpha</code><br>
-   | &nbsp;&nbsp;Session: idle, last updated <time:2></p>
+   | &nbsp;&nbsp;Session: idle, last updated <minute></p>
    | <p>&nbsp;&nbsp;<strong>Next:</strong> send <code>1</code> or <code>c 1</code> to continue this session in Teams</p>
    | <hr/>
    | <p>Need debug IDs? Send <code>details &lt;number&gt;</code>. Numbers expire after one reply.</p>
@@ -110,7 +110,7 @@
    | List number: 2<br>
    | Title: Plan the alpha release<br>
    | Working directory: <root>/work/alpha<br>
-   | Updated: <time:4><br>
+   | Updated: <time:1><br>
    | Codex session ID: <uuid:1><br>
    | Teams chat: not published<br>
    | Next: send <code>continue 2</code> to create a work chat and import its history.</p>
@@ -137,12 +137,12 @@
    | <hr/>
    | <p><strong>2. Plan the alpha release</strong><br>
    | &nbsp;&nbsp;<code><root>/work/alpha</code><br>
-   | &nbsp;&nbsp;Session: idle, last updated <time:3></p>
+   | &nbsp;&nbsp;Session: idle, last updated <minute></p>
    | <p>&nbsp;&nbsp;<strong>Next:</strong> send <code>2</code> or <code>c 2</code> to continue this session in Teams</p>
    | <hr/>
    | <p><strong>1. Fix the alpha login bug</strong><br>
    | &nbsp;&nbsp;<code><root>/work/alpha</code><br>
-   | &nbsp;&nbsp;Session: idle, last updated <time:2></p>
+   | &nbsp;&nbsp;Session: idle, last updated <minute></p>
    | <p>&nbsp;&nbsp;<strong>Next:</strong> send <code>1</code> or <code>c 1</code> to continue this session in Teams</p>
    | <hr/>
    | <p>Need debug IDs? Send <code>details &lt;number&gt;</code>. Numbers expire after one reply.</p>
@@ -176,7 +176,7 @@
    | <p><strong>💬 e2ehost - Plan the alpha release</strong> [active]<br>
    | &nbsp;&nbsp;<strong>Session:</strong> <code>s001</code><br>
    | &nbsp;&nbsp;<strong>Folder:</strong> <code><root>/work/alpha</code><br>
-   | &nbsp;&nbsp;<strong>Last used:</strong> <time:5><br>
+   | &nbsp;&nbsp;<strong>Last used:</strong> <minute><br>
    | &nbsp;&nbsp;<strong>Chat:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">▶ Open chat</a></p>
    | <hr/>
    | <p>Speech recognition: configured.<br>
@@ -195,13 +195,13 @@
    | <hr/>
    | <p><strong>2. Plan the alpha release</strong><br>
    | &nbsp;&nbsp;<code><root>/work/alpha</code><br>
-   | &nbsp;&nbsp;Session: active, last updated <time:3><br>
+   | &nbsp;&nbsp;Session: active, last updated <minute><br>
    | &nbsp;&nbsp;<strong>Chat:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">▶ Open chat</a></p>
    | <p>&nbsp;&nbsp;<strong>Next:</strong> send <code>2</code> to open this Teams chat or import updates</p>
    | <hr/>
    | <p><strong>1. Fix the alpha login bug</strong><br>
    | &nbsp;&nbsp;<code><root>/work/alpha</code><br>
-   | &nbsp;&nbsp;Session: idle, last updated <time:2></p>
+   | &nbsp;&nbsp;Session: idle, last updated <minute></p>
    | <p>&nbsp;&nbsp;<strong>Next:</strong> send <code>1</code> or <code>c 1</code> to continue this session in Teams</p>
    | <hr/>
    | <p>Need debug IDs? Send <code>details &lt;number&gt;</code>. Numbers expire after one reply.</p>

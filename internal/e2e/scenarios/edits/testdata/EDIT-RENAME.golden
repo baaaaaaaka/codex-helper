@@ -89,13 +89,13 @@
    | <p><strong>s002 · host-b</strong> [active]<br>
    | &nbsp;&nbsp;<strong>Session:</strong> <code>s002</code><br>
    | &nbsp;&nbsp;<strong>Folder:</strong> <code><root>/work/host-b</code><br>
-   | &nbsp;&nbsp;<strong>Last used:</strong> <time:1><br>
+   | &nbsp;&nbsp;<strong>Last used:</strong> <minute><br>
    | &nbsp;&nbsp;<strong>Chat:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:1>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">▶ Open chat</a></p>
    | <hr/>
    | <p><strong>💬 newbox - Tidy the build E2E-EDITRENAME-a-1</strong> [active]<br>
    | &nbsp;&nbsp;<strong>Session:</strong> <code>s001</code><br>
    | &nbsp;&nbsp;<strong>Folder:</strong> <code><root>/work/host-a</code><br>
-   | &nbsp;&nbsp;<strong>Last used:</strong> <time:1><br>
+   | &nbsp;&nbsp;<strong>Last used:</strong> <minute><br>
    | &nbsp;&nbsp;<strong>Chat:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">▶ Open chat</a></p>
    | <hr/>
    | <p>Speech recognition: configured.<br>

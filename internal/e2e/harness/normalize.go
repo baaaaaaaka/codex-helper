@@ -19,6 +19,9 @@ package harness
 //	<time:N>          ISO-8601 / "YYYY-MM-DD HH:MM[:SS]" / YYYYMMDD-HHMMSS
 //	                  timestamps
 //	<time>            the time of a control-chat history entry in a prompt
+//	<minute>          a "YYYY-MM-DD HH:MM" time without seconds (status
+//	                  "Last used"): which minute two events fall in is
+//	                  timing, so these are not numbered
 //	<ms:N>, <unix:N>  other millisecond / second Unix stamps
 //	<pid:N>           "pid <n>"
 //	<port:N>          loopback ports
@@ -57,6 +60,9 @@ type normalizer struct {
 }
 
 type exactRule struct{ from, to string }
+
+// minuteRE is a whole minute-resolution time (see <minute>).
+var minuteRE = regexp.MustCompile(`^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$`)
 
 // genericRules are tried left to right on every text (first match wins
 // at a position); each names the placeholder kind.
@@ -186,6 +192,8 @@ func (n *normalizer) norm(text string) string {
 			return "codex-helper-outbox:<marker>"
 		case kind == "histtime":
 			return "- <time> " + m[strings.LastIndexByte(m, ' ')+1:]
+		case kind == "time" && minuteRE.MatchString(m):
+			return "<minute>"
 		case kind == "answer":
 			// The fake Codex numbers its answers across all threads; with
 			// concurrent chats the number depends on start order.

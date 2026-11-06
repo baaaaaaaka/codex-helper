@@ -19,7 +19,6 @@ import (
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/rollout"
-	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 )
 
 // Config configures one app-server process.
@@ -863,7 +862,7 @@ func (s *server) end(seq int, outcome, msg string) {
 
 // executable is the path this app-server was started from ("" if unknown).
 func executable() string {
-	p, err := helperpath.RawExecutable()
+	p, err := os.Executable()
 	if err != nil {
 		return ""
 	}
