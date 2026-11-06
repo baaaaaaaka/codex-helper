@@ -555,3 +555,70 @@ func TestRealCodexCapacityErrors(t *testing.T) {
 	p.evidence("d.model_requests", p.resp.Requests())
 	p.evidence("d.all_notification_methods", noteMethods(a.Notes()))
 }
+
+// TestRealCodexForkRollout answers the fork question (F-WRK-10): what does
+// the child's rollout hold right after thread/fork (the copied history up
+// to the cutoff, with the parent's turn and client ids?), and does a fork
+// cut at lastTurnId while a later turn runs leave the running turn out?
+func TestRealCodexForkRollout(t *testing.T) {
+	p := newProbe(t)
+	a := p.start("fork")
+	threadID := p.startThread(a)
+	for _, cid := range []string{"cxp-probe-a", "cxp-probe-b"} {
+		id := p.mustTurn(a, threadID, "prompt "+cid, cid)
+		if _, ok := waitCompleted(a, id, 90*time.Second); !ok {
+			t.Fatalf("turn %s did not complete", cid)
+		}
+	}
+	raw, _ := p.readThread(a, threadID)
+	turns := summarizeThread(raw)
+	if len(turns) != 2 {
+		t.Fatalf("parent turns: %+v", turns)
+	}
+	running := p.mustTurn(a, threadID, "running probe:hold:fork", "cxp-probe-c")
+	select {
+	case <-p.resp.Started("fork"):
+	case <-time.After(90 * time.Second):
+		t.Fatal("model request never arrived")
+	}
+	res, rerr, err := a.Call("thread/fork", map[string]any{"threadId": threadID, "lastTurnId": turns[1].ID}, 60*time.Second)
+	p.evidence("f.fork_result", map[string]any{"result": json.RawMessage(nonEmpty(res)), "rpc": rerr, "err": fmt.Sprint(err)})
+	var out struct {
+		Thread struct {
+			ID   string `json:"id"`
+			Path string `json:"path"`
+		} `json:"thread"`
+	}
+	_ = json.Unmarshal(res, &out)
+	child := out.Thread.Path
+	if child == "" {
+		child = FindRollout(p.home, out.Thread.ID)
+	}
+	st, serr := os.Stat(child)
+	p.evidence("f.child_rollout_right_after_fork", map[string]any{"path_in_result": out.Thread.Path != "", "stat_err": fmt.Sprint(serr), "size": func() int64 {
+		if st != nil {
+			return st.Size()
+		}
+		return -1
+	}()})
+	p.evidence("f.child_rollout_facts_after_fork", rolloutFacts(child, turns[0].ID, turns[1].ID, running, "cxp-probe-a", "cxp-probe-c", threadID))
+	p.resp.Release("fork")
+	if _, ok := waitCompleted(a, running, 90*time.Second); !ok {
+		t.Fatal("running turn did not complete")
+	}
+	before := int64(-1)
+	if st, err := os.Stat(child); err == nil {
+		before = st.Size()
+	}
+	if _, rerr, err := a.Call("thread/resume", map[string]any{"threadId": out.Thread.ID}, 60*time.Second); err != nil || rerr != nil {
+		p.evidence("f.child_resume_error", map[string]any{"rpc": rerr, "err": fmt.Sprint(err)})
+	}
+	own := p.mustTurn(a, out.Thread.ID, "child own turn", "cxp-probe-d")
+	if _, ok := waitCompleted(a, own, 90*time.Second); !ok {
+		t.Fatal("child turn did not complete")
+	}
+	p.evidence("f.child_rollout_size_before_own_turn", before)
+	p.evidence("f.child_rollout_facts_after_own_turn", rolloutFacts(child, own, "cxp-probe-d"))
+	craw, _ := p.readThread(a, out.Thread.ID)
+	p.evidence("f.child_thread_read", summarizeThread(craw))
+}
