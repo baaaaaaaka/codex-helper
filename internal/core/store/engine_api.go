@@ -190,3 +190,11 @@ func (s *Store) PendingOutboxConvs() ([]int64, error) {
 	}
 	return out, rows.Err()
 }
+
+// OutboxByKeyPrefix lists the outbox rows whose delivery key starts with
+// prefix, in order (an index range scan on the unique key; read pool).
+func (s *Store) OutboxByKeyPrefix(prefix string) ([]Outbox, error) {
+	rows, err := s.r.QueryContext(context.Background(), `SELECT `+outboxCols+` FROM outbox
+WHERE delivery_key >= ? AND delivery_key < ? ORDER BY seq`, prefix, prefix+"\U0010FFFF")
+	return collect(scanOutbox)(rows, err)
+}

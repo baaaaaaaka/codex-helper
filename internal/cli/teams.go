@@ -45,6 +45,8 @@ func newTeamsCmd(root *rootOptions) *cobra.Command {
 		newTeamsSetupCmd(),
 		newTeamsAuthCmd(root),
 		newTeamsControlCmd(),
+		newTeamsChatCmd(),
+		newTeamsSendFileCmd(),
 		newTeamsWorkflowCmd(root),
 		newTeamsRunCmd(root),
 		newTeamsStopCmd(),
@@ -310,16 +312,28 @@ func newTeamsLogoutCmd() *cobra.Command {
 // newTeamsControlCmd prints this machine's control chat from the helper's
 // store. The helper creates the chat itself when it starts.
 func newTeamsControlCmd() *cobra.Command {
-	var printOnly bool
+	var printOnly, recreate, yes bool
 	cmd := &cobra.Command{
 		Use:   "control",
-		Short: "Show this machine's Teams control chat",
-		Long:  "Show this machine's Teams control chat, read from the helper's local store. The helper creates the control chat when it first starts.",
+		Short: "Show or recreate this machine's Teams control chat",
+		Long:  "Show this machine's Teams control chat, read from the helper's local store. The helper creates the control chat when it first starts. With --recreate --yes the running helper creates a fresh control chat, switches to it and posts a link to it in the old one (which is not deleted).",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if printOnly && recreate {
+				return fmt.Errorf("use only one of --no-create/--print or --recreate")
+			}
+			if recreate {
+				if !yes {
+					return fmt.Errorf("recreating the control chat creates a new Teams chat and sends messages; rerun with --yes")
+				}
+				return runTeamsControlRecreate(cmd.OutOrStdout())
+			}
 			return printTeamsControlChat(cmd.OutOrStdout())
 		},
 	}
+	cmd.Flags().BoolVar(&recreate, "recreate", false, "Create a fresh meeting-based control chat and switch the helper to it; old Teams chats are not deleted")
+	cmd.Flags().BoolVar(&yes, "yes", false, "Confirm that --recreate may create a Teams chat and send an @mention plus a ready message")
+	teamsDrainTimeoutFlag(cmd)
 	// Accepted for scripts written for earlier releases (printing is the
 	// only mode now).
 	cmd.Flags().BoolVar(&printOnly, "print", false, "Print the control chat (the default)")

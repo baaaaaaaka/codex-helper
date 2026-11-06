@@ -58,6 +58,12 @@ func (t *Tx) Wake(convID int64) error {
 	return t.convUpdate(convID, `state = 'active', parked_at = NULL`, []string{ConvParked})
 }
 
+// Reactivate returns a held conversation to active (`cxp teams chat
+// recreate --activate`, the v0.1.20 reactivation of a quarantined session).
+func (t *Tx) Reactivate(convID int64) error {
+	return t.convUpdate(convID, `state = 'active', parked_at = NULL`, []string{ConvHold})
+}
+
 // Close closes a conversation.
 func (t *Tx) Close(convID int64) error {
 	return t.convUpdate(convID, `state = 'closed'`, []string{ConvCreating, ConvActive, ConvParked, ConvHold})

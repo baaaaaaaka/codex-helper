@@ -322,17 +322,21 @@ const teamsOnceCheck = 500 * time.Millisecond
 
 // watchTeamsOnceCycle stops the engine once its first cycle is over
 // (engine.CycleDone twice in a row, so work queued in between is seen).
-func watchTeamsOnceCycle(ctx context.Context, e *engine.Engine, stop context.CancelFunc, done chan<- struct{}) {
+func watchTeamsOnceCycle(ctx context.Context, e *engine.Engine, requests *teamsCLIRequests, stop context.CancelFunc, done chan<- struct{}) {
 	t := time.NewTicker(teamsOnceCheck)
 	defer t.Stop()
 	quiet := 0
 	for {
+		var now time.Time
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case now = <-t.C:
 		}
-		if !e.CycleDone() {
+		// The requests commands left while no helper ran are run (and
+		// finished) before the cycle ends.
+		requests.tick(now)
+		if requests.pending() || !e.CycleDone() {
 			quiet = 0
 			continue
 		}
@@ -560,7 +564,9 @@ func serveTeamsNewCore(ctx context.Context, out, errOut io.Writer, root *rootOpt
 		}
 	}()
 	stamper := &teamsPollStamper{dir: dir, host: host, version: cfg.Version, lastRead: func() time.Time { return e.Snapshot().LastRead }}
-	go notifier.watch(runCtx, stamper.tick)
+	requests := newTeamsCLIRequests(runCtx, anchor, e, errOut)
+	defer func() { cancelRun(); requests.wait(10 * time.Second) }() // before the store closes
+	go notifier.watch(runCtx, stamper.tick, requests.tick)
 	gatewayFailed := make(chan struct{})
 	if gatewayDone != nil {
 		go func() {
@@ -578,7 +584,7 @@ func serveTeamsNewCore(ctx context.Context, out, errOut io.Writer, root *rootOpt
 	var cycleDone chan struct{}
 	if opts.once {
 		cycleDone = make(chan struct{})
-		go watchTeamsOnceCycle(runCtx, e, cancelRun, cycleDone)
+		go watchTeamsOnceCycle(runCtx, e, requests, cancelRun, cycleDone)
 	}
 	err = e.Run(runCtx)
 	if cycleDone != nil {
