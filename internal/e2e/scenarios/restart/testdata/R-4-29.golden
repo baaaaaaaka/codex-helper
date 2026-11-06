@@ -83,7 +83,8 @@
    | <p>To cancel it: <code>helper cancel</code> (cancels the newest queued request).</p>
 -- <msg:9> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
-   | <p>The previous request was interrupted when the helper stopped. It was not re-run; resend it if you still need it.</p>
+   | <p>Codex request interrupted because the Teams helper stopped, restarted, or lost its execution context before it could verify a final Codex result.</p>
+   | <p>Check recent messages and changed files first. If no final answer appears, resend the message or use <code>helper retry last</code>.</p>
 -- <msg:10> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>▶️ Codex is starting your 2 queued requests, one after another:</p>

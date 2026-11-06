@@ -7,7 +7,6 @@ import (
 	"os"
 	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -415,11 +414,8 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 		out = TurnOutcome{Status: StatusFailed, Error: err.Error()}
 	}
 	e.mu.Lock()
-	cancelled, stalled := rs.cancelled, rs.stalled
+	cancelled := rs.cancelled
 	e.mu.Unlock()
-	if stalled && !cancelled && out.Status != StatusCompleted {
-		out = TurnOutcome{CodexTurnID: out.CodexTurnID, Status: StatusInterrupted, Error: errStalled}
-	}
 	prog.mu.Lock()
 	queued := prog.queued // not yet named in a progress message
 	out.Progressed = out.Progressed || prog.progressed
@@ -509,9 +505,9 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 	switch {
 	case cancelled:
 		state, errText = store.TurnCancelled, "cancelled by the user"
-		text := "Request cancelled."
+		text := textCancelledRunning // v0.1.20
 		if out.Status == StatusCompleted {
-			text = "Request cancelled. Codex had already finished; its answer was discarded."
+			text = textCancelledRunning + " Codex had already finished; its answer was discarded."
 		}
 		msgs, err = e.notice(base+":cancelled", named(text))
 	case out.Capacity && (out.NotStarted || out.Status == StatusFailed):
@@ -532,21 +528,17 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 			text, upgrade = textCodexTooOld, true
 		}
 		msgs, err = e.statusNotice(base+":codex-too-old", named(text+"\n\nCodex said: "+userError(out.Error)))
-		extra = func(tx *store.Tx) error {
-			if err := tx.SetMeta(fmt.Sprintf("%s%d", metaRetryPrefix, cs.id), strconv.FormatInt(tr.InboundID, 10)); err != nil {
-				return err
+		if upgrade {
+			extra = func(tx *store.Tx) error {
+				return e.requestCodexUpgrade(tx, &codexTarget{Conv: cs.id, Inbound: tr.InboundID}, nil)
 			}
-			if !upgrade {
-				return nil
-			}
-			return e.requestCodexUpgrade(tx, &codexTarget{Conv: cs.id, Inbound: tr.InboundID}, nil)
 		}
 	case out.ActiveWriter:
 		state, errText = store.TurnFailed, out.Error
 		msgs, err = e.statusNotice(base+":active", named(textActive))
 	case out.NotStarted:
 		state, errText = store.TurnNotStarted, out.Error
-		msgs, err = e.statusNotice(base+":notstarted", named("Codex did not start this request ("+userError(out.Error)+"). It was not run; resend it if you still need it."))
+		msgs, err = e.statusNotice(base+":notstarted", named(textNotStartedTurn(out.Error))) // setuperr.go (F-TRN-16)
 	case out.Status == StatusCompleted:
 		state = store.TurnCompleted
 		visible, files, problems := e.stageArtifacts(tr, out.Final)
@@ -567,15 +559,12 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 		// It is recorded with the turn's end and sent once the final is
 		// delivered (review L8; notify.go).
 		notify = err == nil
-	case out.Status == StatusInterrupted && out.Error == errStalled:
-		state, errText = store.TurnInterrupted, out.Error
-		msgs, err = e.statusNotice(base+":interrupted", named(textStalled(e.t.StallLimit)))
 	case out.Status == StatusInterrupted:
 		state, errText = store.TurnInterrupted, out.Error
 		msgs, err = e.statusNotice(base+":interrupted", named(textInterrupted))
 	default:
 		state, errText = store.TurnFailed, out.Error
-		msgs, err = e.statusNotice(base+":failed", named("Codex reported an error and the request did not finish: "+userError(out.Error)+"\n\nIt was not re-run; resend it if you still need it."))
+		msgs, err = e.statusNotice(base+":failed", named(textFailedTurn(out.Error))) // setuperr.go (F-TRN-16)
 	}
 	if err != nil {
 		e.logf("render outcome of turn %d: %v", tr.ID, err)

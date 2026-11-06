@@ -112,8 +112,6 @@ type runState struct {
 	turnID    int64
 	turnKey   string
 	cancelled bool
-	// stalled: stopped by the stall bound (R-19); under Engine.mu.
-	stalled bool
 	// lastEvent is the unix ms of the last Codex event (silence tracking).
 	lastEvent atomic.Int64
 	done      chan struct{}

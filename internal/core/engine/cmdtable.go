@@ -76,14 +76,14 @@ var workCommands = map[string]cmdHandler{
 		e.reply(j, textWorkDefault, nil)
 	},
 	cmdFork: func(e *Engine, ctx context.Context, j cmdJob, cs *convState, _ parsed) { e.cmdFork(ctx, j, cs) },
-	cmdRestartName: func(e *Engine, _ context.Context, j cmdJob, _ *convState, p parsed) {
-		e.cmdRestart(j, strings.ToLower(p.arg))
+	cmdRestartName: func(e *Engine, ctx context.Context, j cmdJob, _ *convState, p parsed) {
+		e.cmdRestart(ctx, j, strings.ToLower(p.arg)) // restart.go (batch E)
 	},
 	cmdShutdown: func(e *Engine, _ context.Context, j cmdJob, _ *convState, _ parsed) {
 		e.reply(j, textShutdownControlOnly, nil)
 	},
-	// HOOK(batch E): `helper file <path>` (F-WRK-5).
-	cmdSendFile: hook("helper file"),
+	// `helper file <path>` (F-RND-10, batch E: sendfile.go).
+	cmdSendFile: func(e *Engine, _ context.Context, j cmdJob, cs *convState, p parsed) { e.cmdSendFile(j, cs, p.arg) },
 	// HOOK(batch A): `helper details`, `helper publish-history`.
 	cmdDetails:        hook("helper details"),
 	cmdPublishHistory: hook("helper publish-history"),
@@ -113,8 +113,8 @@ var controlCommands = map[string]cmdHandler{
 		}
 		e.cmdWake(j, p.arg)
 	},
-	cmdRestartName: func(e *Engine, _ context.Context, j cmdJob, _ *convState, p parsed) {
-		e.cmdRestart(j, strings.ToLower(p.arg))
+	cmdRestartName: func(e *Engine, ctx context.Context, j cmdJob, _ *convState, p parsed) {
+		e.cmdRestart(ctx, j, strings.ToLower(p.arg)) // restart.go (batch E)
 	},
 	cmdShutdown: func(e *Engine, ctx context.Context, j cmdJob, _ *convState, _ parsed) { e.cmdShutdown(ctx, j) },
 	cmdUpdate: func(e *Engine, ctx context.Context, j cmdJob, _ *convState, p parsed) {

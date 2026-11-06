@@ -60,10 +60,13 @@
    | <p>⏳ Codex is working. Request accepted.</p>
 -- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Cancelling the running request…</p>
+   | <p>cancel requested for running turn: <code>turn-1</code></p>
+   | <p><strong>Prompt being canceled:</strong><br>
+   | Long running E2E-R2033-stuck-1</p>
+   | <p>No other prompts are queued.</p>
 -- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Request cancelled.</p>
+   | <p>Codex request canceled.</p>
 -- <msg:8> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Next request E2E-R2033-next-2</p>

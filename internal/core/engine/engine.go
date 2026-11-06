@@ -59,9 +59,9 @@ type Timing struct {
 	DuplicateFor    time.Duration // duplicate prompt guard
 	BreakerWindow   time.Duration
 	BreakerCount    int
-	// R-19: hints after this much Codex silence in a running turn, and
-	// the bound after which the helper stops the turn (0 disables each).
-	SilenceHint, SilenceStuck, StallLimit time.Duration
+	// R-19: hints after this much Codex silence in a running turn (0
+	// disables each). A silent turn is never stopped (F-TRN-18).
+	SilenceHint, SilenceStuck time.Duration
 	// R-35: reminder cadence for a turn that stays queued (0 disables).
 	QueueReminder time.Duration
 	// ThrottleFloor is the wait after a throttle response that names no
@@ -91,7 +91,7 @@ func ProductionTiming() Timing {
 		ResolveDelay: 5 * time.Second, ResolveTries: 3, ResolveAbsent: 2 * time.Minute, CapacityRetry: 5 * time.Minute, CapacityBackoff: 10 * time.Second,
 		Heartbeat: 30 * time.Second, Maintenance: time.Minute, ChatRate: time.Second,
 		DuplicateFor: 3 * time.Minute, BreakerWindow: time.Minute, BreakerCount: 3,
-		SilenceHint: 7 * time.Minute, SilenceStuck: 15 * time.Minute, StallLimit: time.Hour,
+		SilenceHint: 7 * time.Minute, SilenceStuck: 15 * time.Minute,
 		QueueReminder: 10 * time.Minute,
 		ThrottleFloor: 10 * time.Second,
 		PaceIncrease:  30 * time.Second,
@@ -265,6 +265,9 @@ type Engine struct {
 	// drainFlag holds new turn starts while an update waits for running
 	// turns to finish (upgrade.go).
 	drainFlag atomic.Bool
+	// restartDrain / restartRun: a `helper restart now` drains (its
+	// prompts get the restart notice) / its waiter runs (restart.go).
+	restartDrain, restartRun atomic.Bool
 	// stopping: `shutdown` stopped the helper on all machines; until this
 	// process stops it starts no turn, reads no chat and sends only the
 	// control chat up to the shutdown reply, whose delivery keys start with
@@ -610,6 +613,7 @@ func (e *Engine) start(ctx context.Context) error {
 	e.resumeFreezes()
 	e.requeueCommands()
 	e.loadRestartConfirm()
+	e.resumeRestart(ctx) // restart.go: a `helper restart now` still waiting
 	if err := e.announceUpdate(); err != nil {
 		return fmt.Errorf("engine: announce update: %w", err)
 	}

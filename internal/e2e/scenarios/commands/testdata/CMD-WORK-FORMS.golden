@@ -106,6 +106,8 @@
 -- <msg:16> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Nothing to cancel: no request is running or queued.</p>
+   | <p>usage: <code>helper cancel last</code>, <code>helper cancel queued</code>, <code>helper cancel running</code>, <code>helper cancel all</code>, <code>helper cancel &lt;turn-id&gt;</code>, or <code>!cancel &lt;turn-id&gt;</code></p>
+   | <p>These commands apply to this Work chat.</p>
 -- <msg:17> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>cx rt</p>
@@ -114,7 +116,7 @@
    | <p>cx rt</p>
 -- <msg:18> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Nothing to retry: no request was ignored as a duplicate or failed for a Codex update recently.</p>
+   | <p>usage: <code>helper retry last</code>, <code>helper retry &lt;turn-id&gt;</code>, or <code>!retry &lt;turn-id&gt;</code></p>
 -- <msg:19> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>help</p>
@@ -245,7 +247,7 @@
    | <p>!f out/report.md</p>
 -- <msg:36> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p><code>helper file</code> is not available in this helper version yet.</p>
+   | <p>Teams file upload rejected: the file was not found. <code>helper file</code> only reads relative files under the Teams outbound root: <root>/home/.local/state/codex-helper/teams/core-files/outbound</p>
 -- <msg:37> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>/explain Please answer E2E-CMDWORKFORMS-slash-1</p>

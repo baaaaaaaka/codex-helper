@@ -487,7 +487,7 @@ func TestCancelRunningTurn(t *testing.T) {
 	r.ch.PostUser(work, "slow job")
 	r.wait("running", func() bool { return r.ag.calls("slow") == 1 })
 	r.ch.PostUser(work, "helper cancel last")
-	r.wait("cancelled", func() bool { return len(r.own(work, "Request cancelled.")) == 1 })
+	r.wait("cancelled", func() bool { return len(r.own(work, "Codex request canceled.")) == 1 })
 	r.ch.PostUser(work, "next one")
 	r.wait("next", func() bool { return len(r.own(work, "ANSWER to next one")) == 1 })
 	if len(r.own(work, "ANSWER to slow")) != 0 {
@@ -495,8 +495,8 @@ func TestCancelRunningTurn(t *testing.T) {
 	}
 }
 
-// R-20-33: the cancel command's reply precedes the turn's "Request
-// cancelled." even when the interrupt ends the turn at once: the agent
+// R-20-33: the cancel command's reply precedes the turn's "Codex
+// request canceled." even when the interrupt ends the turn at once: the agent
 // here returns from Interrupt only after the turn's notice is committed.
 func TestCancelReplyPrecedesTheCancelledNotice(t *testing.T) {
 	r := newRig(t)
@@ -524,20 +524,20 @@ func TestCancelReplyPrecedesTheCancelledNotice(t *testing.T) {
 	r.wait("running", func() bool { return r.ag.calls("slow") == 1 })
 	r.ch.PostUser(work, "helper cancel last")
 	r.wait("reply and notice", func() bool {
-		return len(r.own(work, "Cancelling the running request")) == 1 && len(r.own(work, "Request cancelled.")) == 1
+		return len(r.own(work, "cancel requested for running turn")) == 1 && len(r.own(work, "Codex request canceled.")) == 1
 	})
 	reply, notice := -1, -1
 	for i, m := range r.ch.Messages(work) {
 		switch {
 		case m.Marker == "":
-		case strings.Contains(m.Text, "Cancelling the running request"):
+		case strings.Contains(m.Text, "cancel requested for running turn"):
 			reply = i
-		case strings.Contains(m.Text, "Request cancelled."):
+		case strings.Contains(m.Text, "Codex request canceled."):
 			notice = i
 		}
 	}
 	if reply > notice {
-		t.Fatalf("\"Request cancelled.\" (message %d) was posted before the cancel reply (message %d)", notice, reply)
+		t.Fatalf("\"Codex request canceled.\" (message %d) was posted before the cancel reply (message %d)", notice, reply)
 	}
 }
 
@@ -568,7 +568,9 @@ func TestRestartReconcilesInterruptedTurnWithOneNotice(t *testing.T) {
 	r.ag.lookup[key] = TurnOutcome{Status: StatusInterrupted}
 	r.ag.mu.Unlock()
 	r.start()
-	r.wait("interruption notice", func() bool { return len(r.own(work, "interrupted when the helper stopped")) == 1 })
+	r.wait("interruption notice", func() bool {
+		return len(r.own(work, "Codex request interrupted because the Teams helper stopped")) == 1
+	})
 	r.ch.PostUser(work, "after restart")
 	r.wait("next answer", func() bool { return len(r.own(work, "ANSWER to after restart")) == 1 })
 	time.Sleep(200 * time.Millisecond)
@@ -1132,26 +1134,34 @@ func TestSlowCommandDoesNotBlockCancelOrOtherChats(t *testing.T) {
 	}
 }
 
-// R-19 (review M5): a silent Codex turn gets one hint at each silence
-// threshold, then is stopped at the stall bound with exactly one notice,
-// and the chat runs its next request.
-func TestSilentTurnHintsThenStopsAtStallBound(t *testing.T) {
+// R-19 / F-TRN-18 (review M5): a silent Codex turn gets one hint at each
+// silence threshold and is never stopped by the helper (v0.1.20: "I will
+// not retry automatically"); only `helper cancel running` stops it, and
+// the chat then runs its next request.
+func TestSilentTurnHintsAndIsNeverStopped(t *testing.T) {
 	r := newRig(t, func(c *Config) {
-		c.Timing.SilenceHint, c.Timing.SilenceStuck, c.Timing.StallLimit = 400*time.Millisecond, 900*time.Millisecond, 1500*time.Millisecond
+		c.Timing.SilenceHint, c.Timing.SilenceStuck = 400*time.Millisecond, 900*time.Millisecond
 	})
 	r.ag.mu.Lock()
 	r.ag.block["hang forever"] = make(chan struct{})
 	r.ag.mu.Unlock()
 	work := r.newWork(t.TempDir())
 	r.ch.PostUser(work, "hang forever")
-	r.wait("stall notice", func() bool { return len(r.own(work, "so the helper stopped the request")) == 1 })
-	r.ch.PostUser(work, "after the stall")
-	r.wait("next request answered", func() bool { return len(r.own(work, "ANSWER to after the stall")) == 1 })
+	r.wait("stuck hint", func() bool { return len(r.own(work, "It may be stuck")) == 1 })
+	time.Sleep(2 * time.Second) // well past both thresholds: still running
+	if n := len(r.own(work, "canceled")) + len(r.own(work, "interrupted")) + len(r.own(work, "stopped")); n != 0 {
+		t.Fatalf("a silent turn was stopped (%d notices)", n)
+	}
+	r.ch.PostUser(work, "helper cancel running")
+	r.wait("cancelled", func() bool { return len(r.own(work, "Codex request canceled.")) == 1 })
+	r.ch.PostUser(work, "after the silence")
+	r.wait("next request answered", func() bool { return len(r.own(work, "ANSWER to after the silence")) == 1 })
 	for sub, want := range map[string]int{
-		"Still working. No new Codex update yet": 1,
-		"It may be stuck":                        1,
-		"so the helper stopped the request":      1,
-		"interrupted when the helper stopped":    0,
+		"Still working. No new Codex update yet":                     1,
+		"It may be stuck":                                            1,
+		"I will not retry automatically":                             1,
+		"send `helper cancel running`":                               2,
+		"Codex request interrupted because the Teams helper stopped": 0,
 	} {
 		if got := len(r.own(work, sub)); got != want {
 			t.Errorf("%d notices with %q, want %d", got, sub, want)

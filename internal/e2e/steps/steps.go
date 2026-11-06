@@ -27,8 +27,8 @@ const (
 // The helper's notices for a turn that a stopped helper left behind (the
 // exact sentences; the goldens pin the rest of the message).
 const (
-	InterruptedNotice = "The previous request was interrupted when the helper stopped. It was not re-run; resend it if you still need it."
-	DidNotRunNotice   = "The previous request did not run: the helper stopped before Codex accepted it. Resend it if you still need it."
+	InterruptedNotice = "Codex request interrupted because the Teams helper stopped, restarted, or lost its execution context before it could verify a final Codex result. Check recent messages and changed files first. If no final answer appears, resend the message or use helper retry last."
+	DidNotRunNotice   = "The previous request did not run: the helper stopped before Codex accepted it. Send helper retry last to run it, or resend it."
 )
 
 // IsStoppedTurnNotice reports whether text is one of those notices.

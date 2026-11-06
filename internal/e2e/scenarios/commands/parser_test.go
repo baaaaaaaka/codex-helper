@@ -48,7 +48,7 @@ func TestWorkChatCommandForms(t *testing.T) {
 		{"Helper: status", "queued. Directory:"},
 		{"!st", "queued. Directory:"},
 		{"!x", "Nothing to cancel"},
-		{"cx rt", "Nothing to retry"},
+		{"cx rt", "usage: helper retry last"},
 		{"help", "💬 Work chat"},
 		{"model", "Model:"},
 		{"models", "Models:"},
@@ -57,7 +57,7 @@ func TestWorkChatCommandForms(t *testing.T) {
 		{"default model gpt-5", "can only be used in the Control chat"},
 		{"!frobnicate", "unknown work chat command: frobnicate"},
 		{"!rs", "unknown work chat command: rs"},
-		{"!f out/report.md", "is not available in this helper version yet"},
+		{"!f out/report.md", "Teams file upload rejected: the file was not found."},
 	} {
 		got, ok := command(s, work.ID, c.text, c.want)
 		s.Check(fmt.Sprintf("`%s` runs as a command", c.text), ok, c.want, clip(got, 160))

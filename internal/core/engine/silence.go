@@ -9,14 +9,13 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/core/store"
 )
 
-// errStalled is the turn error of a turn stopped by the stall bound.
-const errStalled = "no Codex update within the stall bound"
-
-// watchSilence posts the R-19 hints while a turn's Codex stays silent and
-// stops the turn at the stall bound. The returned func ends the watch.
+// watchSilence posts the R-19 hints while a turn's Codex stays silent. It
+// never stops the turn (F-TRN-18, v0.1.20 parity: "I will not retry
+// automatically"; only the user's `helper cancel running` stops it). The
+// returned func ends the watch.
 func (e *Engine) watchSilence(ctx context.Context, cs *convState, tr store.Turn, rs *runState) func() {
 	every := time.Duration(0)
-	for _, d := range []time.Duration{e.t.SilenceHint, e.t.SilenceStuck, e.t.StallLimit} {
+	for _, d := range []time.Duration{e.t.SilenceHint, e.t.SilenceStuck} {
 		if d > 0 && (every == 0 || d < every) {
 			every = d
 		}
@@ -49,12 +48,9 @@ func (e *Engine) watchSilence(ctx context.Context, cs *convState, tr store.Turn,
 			}
 			quiet := e.now().Sub(fromMS(last))
 			switch {
-			case e.t.StallLimit > 0 && quiet >= e.t.StallLimit:
-				e.stopStalled(ctx, cs, rs)
-				return
 			case e.t.SilenceStuck > 0 && quiet >= e.t.SilenceStuck && hinted < 2:
 				hinted = 2
-				e.silenceNotice(cs.id, fmt.Sprintf("turn:%d:silence:%d:2", tr.ID, episode), textStuck(quiet, e.t.StallLimit))
+				e.silenceNotice(cs.id, fmt.Sprintf("turn:%d:silence:%d:2", tr.ID, episode), textStuck(quiet))
 			case e.t.SilenceHint > 0 && quiet >= e.t.SilenceHint && hinted < 1:
 				hinted = 1
 				e.silenceNotice(cs.id, fmt.Sprintf("turn:%d:silence:%d:1", tr.ID, episode), textSilent)
@@ -73,34 +69,6 @@ func (e *Engine) silenceNotice(conv int64, key, text string) {
 		return
 	}
 	e.wakeSender()
-}
-
-// stopStalled stops a turn whose Codex stayed silent for StallLimit:
-// turn/interrupt, then kill if it does not end within CancelWait. The turn
-// then ends with one notice (finish, errStalled).
-func (e *Engine) stopStalled(ctx context.Context, cs *convState, rs *runState) {
-	e.mu.Lock()
-	if cs.running != rs || rs.cancelled {
-		e.mu.Unlock()
-		return
-	}
-	rs.stalled = true
-	label := cs.label
-	e.mu.Unlock()
-	e.logf("turn in %s: no Codex update for %s; stopping it", label, e.t.StallLimit)
-	ictx, cancel := context.WithTimeout(ctx, e.t.CancelWait)
-	err := e.ag.Interrupt(ictx, cs.id)
-	cancel()
-	if err == nil {
-		select {
-		case <-rs.done:
-			return
-		case <-ctx.Done():
-			return
-		case <-time.After(e.t.CancelWait):
-		}
-	}
-	e.ag.Kill(cs.id)
 }
 
 // remindQueued posts a reminder for every turn still queued after each
@@ -162,19 +130,21 @@ func (e *Engine) remindQueued() {
 	e.mu.Unlock()
 }
 
-// Texts of R-19 and R-35 (wording from the previous core).
-const textSilent = "Still working. No new Codex update yet.\n\nThis is taking longer than usual. To stop the running request, send `helper cancel` in this chat."
+// Texts of R-19 (v0.1.20 codexIdleStatusMessage + codexIdleStatusCancelHint
+// and codexSuspectedStuckMessage, B:92-99).
+const textSilent = "Still working. No new Codex update yet.\n\nThis is taking longer than usual. To stop the running request, send `helper cancel running` in this chat."
 
-func textStuck(quiet, limit time.Duration) string {
-	s := "Codex has not produced any update for " + minutes(quiet) + ". It may be stuck.\n\nTo stop the running request, send `helper cancel` in this chat."
-	if limit > 0 {
-		s += " If it stays silent for " + minutes(limit) + ", the helper stops it."
-	}
-	return s
+func textStuck(quiet time.Duration) string {
+	return "Codex has not produced any update for " + quietDuration(quiet) + ". It may be stuck.\n\nI will not retry automatically. To stop the running request, send `helper cancel running` in this chat."
 }
 
-func textStalled(limit time.Duration) string {
-	return "Codex produced no update for " + minutes(limit) + ", so the helper stopped the request. It was not re-run; resend it if you still need it."
+// quietDuration is v0.1.20's formatCodexQuietDuration (B:12065).
+func quietDuration(d time.Duration) string {
+	r := d.Round(time.Minute)
+	if r < time.Minute {
+		return "less than 1m"
+	}
+	return strings.TrimSuffix(r.String(), "0s")
 }
 
 // textStarting names a queued request at the head of its first progress

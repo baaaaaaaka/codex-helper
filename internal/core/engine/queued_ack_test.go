@@ -47,11 +47,11 @@ func TestQueuedAckIsShortAndCancelRunningKeepsQueue(t *testing.T) {
 	}
 
 	r.ch.PostUser(work, "helper cancel running")
-	r.wait("running cancelled", func() bool { return len(r.own(work, "Request cancelled.")) == 1 })
+	r.wait("running cancelled", func() bool { return len(r.own(work, "Codex request canceled.")) == 1 })
 	r.wait("queued ones answered", func() bool {
 		return len(r.own(work, "ANSWER to second")) == 1 && len(r.own(work, "ANSWER to third")) == 1
 	})
-	if n := len(r.own(work, "Queued request cancelled.")); n != 0 {
+	if n := len(r.own(work, "turn canceled:")); n != 0 {
 		t.Fatalf("`helper cancel running` cancelled %d queued requests", n)
 	}
 }
@@ -70,7 +70,10 @@ func TestQueuedAckCancelCancelsTheAcknowledgedRequest(t *testing.T) {
 	r.ch.PostUser(work, "second job")
 	r.wait("queued ACK", func() bool { return len(r.own(work, "**Queued.**")) == 1 })
 	r.ch.PostUser(work, "helper cancel")
-	r.wait("queued one cancelled", func() bool { return len(r.own(work, "Queued request cancelled.")) == 1 })
+	r.wait("queued one cancelled", func() bool { return len(r.own(work, "turn canceled:")) == 1 })
+	if n := len(r.own(work, "Canceled prompt:**\nsecond job")); n != 1 {
+		t.Fatalf("the cancel reply does not name the cancelled prompt (%d)", n)
+	}
 	close(release)
 	r.wait("first answered", func() bool { return len(r.own(work, "ANSWER to first job")) == 1 })
 	if n := r.ag.calls("second job"); n != 0 {
@@ -124,7 +127,9 @@ func TestQueuedAckAfterRestartDoesNotListTheInterruptedTurn(t *testing.T) {
 		"To cancel it: `helper cancel` (cancels the newest queued request)."; ack != want {
 		t.Fatalf("queued ACK after restart:\n%s\nwant:\n%s", ack, want)
 	}
-	r.wait("interruption notice", func() bool { return len(r.own(work, "interrupted when the helper stopped")) == 1 })
+	r.wait("interruption notice", func() bool {
+		return len(r.own(work, "Codex request interrupted because the Teams helper stopped")) == 1
+	})
 	r.wait("both answered", func() bool {
 		return len(r.own(work, "ANSWER to queued job")) == 1 && len(r.own(work, "ANSWER to sent while down")) == 1
 	})

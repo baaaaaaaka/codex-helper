@@ -134,12 +134,6 @@ func addDelegThread(tx *store.Tx, threadID string) error {
 // helper restart (it is never re-run).
 const textDelegInterrupted = "The delegated task was interrupted when the worker's helper restarted. It was not re-run; send it again if it is still needed."
 
-// textDelegStalled is the result of a delegated task stopped at the stall
-// bound (R-19).
-func textDelegStalled(limit time.Duration) string {
-	return fmt.Sprintf("The delegated task was stopped: Codex reported no activity for %s. It was not re-run; send it again if it is still needed.", minutes(limit))
-}
-
 func (e *Engine) delegations() Delegations {
 	if !e.cfg.Registry {
 		return nil
@@ -412,8 +406,6 @@ func (e *Engine) finishDelegation(ctx context.Context, cs *convState, tr store.T
 	case out.NotStarted:
 		state, errText = store.TurnNotStarted, out.Error
 		body = "The delegated task did not start: " + userError(out.Error)
-	case out.Status == StatusInterrupted && out.Error == errStalled:
-		state, errText, body = store.TurnInterrupted, out.Error, textDelegStalled(e.t.StallLimit)
 	case out.Status == StatusInterrupted:
 		state, errText, body = store.TurnInterrupted, out.Error, textDelegInterrupted
 	default:

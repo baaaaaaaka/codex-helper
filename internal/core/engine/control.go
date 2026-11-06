@@ -167,7 +167,7 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 		return false
 	}
 	e.mu.Lock()
-	title, kind, label, state, cwd := cs.title, cs.kind, cs.label, cs.state, cs.cwd
+	title, kind, label, state, cwd, forkParent := cs.title, cs.kind, cs.label, cs.state, cs.cwd, cs.forkParent
 	retry := e.now().Before(cs.nextRead) && !cs.nextRead.IsZero() && cs.failures > 0
 	intro := e.intro[id]
 	e.mu.Unlock()
@@ -250,6 +250,13 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 				return err
 			}
 			if err := e.enqueueControlCreated(tx, id, label, info.URL); err != nil {
+				return err
+			}
+		}
+		// A fork's parent gets its link once (F-WRK-10 step 4; batch A
+		// moves this after the history import).
+		if forkParent != 0 && discovered == "" && !inbox && kind != store.KindControl && e.conv(forkParent) != nil {
+			if err := e.enqueueNotice(tx, forkParent, fmt.Sprintf("fork-done:%d", id), textForkComplete(info.URL)); err != nil {
 				return err
 			}
 		}

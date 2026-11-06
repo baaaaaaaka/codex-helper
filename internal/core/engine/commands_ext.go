@@ -320,15 +320,18 @@ func (e *Engine) cmdFork(ctx context.Context, j cmdJob, cs *convState) {
 	e.mu.Lock()
 	label, threadID, cwd, running := cs.label, cs.threadID, cs.cwd, cs.running != nil
 	e.mu.Unlock()
-	switch {
-	case threadID == "":
+	if threadID == "" {
 		e.reply(j, "Nothing to fork yet: "+label+" has no Codex conversation. Send a request first.", nil)
 		return
-	case running:
-		e.reply(j, "A request is running in "+label+". Fork after it finishes.", nil)
-		return
 	}
-	child, err := e.ag.Fork(ctx, cs.id, threadID, "", cwd)
+	// A fork while a request runs (F-WRK-10, batch E; v0.1.20's `model
+	// fork` did not wait either) is cut at the last completed turn, so
+	// the child never holds a half-finished one.
+	cutoff := ""
+	if running {
+		cutoff = e.lastCompletedCodexTurn(cs.id)
+	}
+	child, err := e.ag.Fork(ctx, cs.id, threadID, cutoff, cwd)
 	if err != nil {
 		e.reply(j, "Fork failed: "+userError(err.Error())+". Nothing was changed.", nil)
 		return
@@ -340,7 +343,11 @@ func (e *Engine) cmdFork(ctx context.Context, j cmdJob, cs *convState) {
 	e.mu.Unlock()
 	var id int64
 	var newLabel string
-	e.reply(j, "Forking "+label+" into a new work chat…", func(tx *store.Tx) error {
+	// HOOK(batch A, F-WRK-10 step 3): the child's history import; the
+	// rc.6 text then promises the link only after the history is
+	// confirmed ("…I will send its link only after the visible history is
+	// confirmed.").
+	e.reply(j, textForkRequested, func(tx *store.Tx) error {
 		var err error
 		newLabel, err = e.nextLabel(tx)
 		if err != nil {
@@ -373,4 +380,29 @@ func (e *Engine) cmdFork(ctx context.Context, j cmdJob, cs *convState) {
 	e.intro[id] = "Forked from " + label + ": this chat continues a copy of that session; " + label + " itself is unchanged. Send `helper help` for commands."
 	e.mu.Unlock()
 	e.createChatNow(ctx, id)
+}
+
+// Fork texts (0.1.21-rc.6 1a210e6, SPEC F-WRK-10 steps 1 and 4).
+const textForkRequested = "⏳ Fork requested. I fixed the parent cutoff and am preparing the new chat; I will send its link when it is ready."
+
+func textForkComplete(url string) string {
+	return "✅ Fork complete. Open the new Codex chat:\n" + url
+}
+
+// lastCompletedCodexTurn is the Codex turn id of the newest completed turn
+// of a conversation ("" if none is known).
+func (e *Engine) lastCompletedCodexTurn(conv int64) string {
+	var id string
+	_ = e.update(func(tx *store.Tx) error {
+		id = ""
+		turns, err := tx.RecentTurns(conv, retryHorizon)
+		for _, tr := range turns {
+			if tr.State == store.TurnCompleted && tr.CodexTurnID != "" {
+				id = tr.CodexTurnID
+				break
+			}
+		}
+		return err
+	})
+	return id
 }

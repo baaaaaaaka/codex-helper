@@ -93,10 +93,13 @@ const (
 	textAccepted = "⏳ Codex is working. Request accepted."
 	textFinished = "✅ Codex finished responding."
 	// textCompacted is v0.1.20's status post for a context compaction.
-	textCompacted   = transcript.CompactText
-	textInterrupted = "The previous request was interrupted when the helper stopped. It was not re-run; resend it if you still need it."
-	textNotStarted  = "The previous request did not run: the helper stopped before Codex accepted it. Resend it if you still need it."
-	textRestarted   = "Helper restarted: the new process is running and has taken over."
+	textCompacted = transcript.CompactText
+	// textInterrupted is v0.1.20's interrupted-turn notice (B:11189),
+	// pointing to `helper retry last` (F-TRN-4/F-TRN-5).
+	textInterrupted = "Codex request interrupted because the Teams helper stopped, restarted, or lost its execution context before it could verify a final Codex result.\n\nCheck recent messages and changed files first. If no final answer appears, resend the message or use `helper retry last`."
+	textNotStarted  = "The previous request did not run: the helper stopped before Codex accepted it. Send `helper retry last` to run it, or resend it."
+	// textRestarted is v0.1.20's post-restart confirmation (F-CTL-11).
+	textRestarted   = "✅ Helper restart completed\n\nThe Teams helper is back online. Send `st` to check status."
 	textHeld        = "Request held: this chat is paused, so new requests do not run. It will not run later by itself; resend it once the chat is resumed."
 	textDuplicate   = "Duplicate request ignored (same text within 3 minutes). Send `helper retry` to run it again."
 	textActive      = "Codex did not run this request: the session is open in another Codex window that is writing to it. Close it there (or wait until it is idle) and resend."

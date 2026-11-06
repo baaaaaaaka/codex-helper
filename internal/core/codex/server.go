@@ -104,7 +104,11 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 	cmd := exec.Command(cfg.Bin, append([]string{"app-server"}, cfg.Args...)...)
 	cmd.Env = append(os.Environ(), cfg.Env...)
 	cmd.Dir = cfg.Dir
-	cmd.Stderr = cfg.Log
+	// The start-up stderr is kept (bounded) for the error of a server that
+	// exits before it answers initialize (a missing Node runtime, a broken
+	// install: F-TRN-16 classifies it); after initialize nothing is kept.
+	startErr := &startTail{}
+	cmd.Stderr = io.MultiWriter(cfg.Log, startErr)
 	configure(cmd)
 	if cfg.Configure != nil {
 		if err := cfg.Configure(cmd); err != nil {
@@ -129,10 +133,45 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 	}
 	go s.readLoop(out)
 	if err := s.initialize(ctx); err != nil {
-		s.Kill()
+		s.Kill() // waits for the exit, so stderr is complete
+		if tail := startErr.close(); tail != "" {
+			return nil, fmt.Errorf("%w (app-server stderr: %s)", err, tail)
+		}
 		return nil, err
 	}
+	startErr.close()
 	return s, nil
+}
+
+// startTail keeps the last startTailMax bytes of stderr until close.
+type startTail struct {
+	mu     sync.Mutex
+	buf    []byte
+	closed bool
+}
+
+const startTailMax = 600
+
+func (t *startTail) Write(p []byte) (int, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.closed {
+		t.buf = append(t.buf, p...)
+		if len(t.buf) > startTailMax {
+			t.buf = append(t.buf[:0], t.buf[len(t.buf)-startTailMax:]...)
+		}
+	}
+	return len(p), nil
+}
+
+// close stops keeping stderr and returns what was kept, on one line.
+func (t *startTail) close() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.closed = true
+	out := strings.Join(strings.Fields(string(t.buf)), " ")
+	t.buf = nil
+	return out
 }
 
 // PID is the process id (also the process group id on unix).

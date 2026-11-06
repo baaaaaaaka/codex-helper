@@ -48,7 +48,6 @@ const (
 	metaUpdatePending = "engine_update_pending"    // JSON updateRequest: installed, announced by the next process
 	metaUpdateSkip    = "engine_update_skip"       // tag whose activation failed: automatic checks skip it
 	metaCodexUpgrade  = "engine_codex_upgrade"     // JSON codexRequest: a Codex CLI upgrade waiting for drain
-	metaRetryPrefix   = "engine_retry:"            // + conv id: inbound id of the request `helper retry last` runs
 )
 
 // updateRequest is a helper release to install, and the command that asked

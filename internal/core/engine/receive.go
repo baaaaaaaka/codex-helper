@@ -966,6 +966,9 @@ func (e *Engine) ackPrompt(tx *store.Tx, conv int64, a store.Admitted, c *classi
 	} else if c.in.Sender == store.SenderOther {
 		text = textCoworkerAccepted // v0.1.20 queueTeamsPromptAckForMessage (R-27)
 	}
+	if notice := e.drainNotice(); notice != "" {
+		text = notice // batch E, F-SVC-10: restart.go
+	}
 	msgs, err := e.noticeReply(store.OutAck, fmt.Sprintf("ack:%d", a.InboundID), text, c.quoteID)
 	if err != nil {
 		return false, err

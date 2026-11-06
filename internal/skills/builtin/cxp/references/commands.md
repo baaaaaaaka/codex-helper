@@ -94,7 +94,7 @@ Control chat commands (a leading `helper` is accepted too):
 - `stats`: requests and token usage of all sessions.
 - `skills`: list skill subscriptions (`skills add <url>`, `skills sync`).
 - `status`: helper status.
-- `restart`: restart the helper; `helper restart now` restarts even while requests are running (they are recovered after the restart).
+- `restart`: show the safe-restart confirmation; `helper restart now` restarts when the running requests finish (messages sent meanwhile are saved and run once after the restart); `helper restart force` restarts at once (running requests are interrupted and reported once).
 - `update now` / `update prerelease`: update the helper (`update status` shows a pending update).
 - `codex update now`: update the local Codex CLI using its detected install source; this does not update the helper.
 - `help`: the command list.
@@ -102,17 +102,18 @@ Control chat commands (a leading `helper` is accepted too):
 Work chat commands:
 
 - Regular text, files and voice messages: sent to Codex (voice is transcribed locally).
-- `helper cancel` / `helper cancel last`: cancel the running (or last queued) request; `helper cancel all` cancels the running and every queued request.
-- `helper retry`: run the last ignored duplicate request again; `helper retry last` runs the request that failed because Codex needed an update again.
+- `helper cancel` / `helper cancel last`: cancel the newest queued request (or the running one when none is queued); `helper cancel queued`, `helper cancel running`, `helper cancel all`, `helper cancel <turn-id>` (`!cancel <turn-id>`). The reply names the cancelled prompt and what is still queued.
+- `helper retry`: run the last ignored duplicate request again; `helper retry last` runs the last failed, interrupted, not-started or cancelled request again; `helper retry <turn-id>` (`!retry <turn-id>`) runs that one again. A request is never retried automatically.
 - `helper unpause`: resume auto-start after a pause (held requests are not run).
 - `helper park`: stop reading this chat until woken.
 - `helper status`: session status.
-- `helper fork`: copy this session into a new work chat.
+- `helper fork`: copy this session into a new work chat (also while a request runs; the copy stops at the last finished request), then post the new chat's link.
 - `helper model`, `helper model list`, `helper model <model> [effort]`, `helper model reset`: show or switch this session's model.
 - `helper effort <effort>`: switch this session's reasoning effort.
 - `helper stats`: requests and token usage of this session.
 - `helper skills`: skill subscriptions.
-- `helper restart`: restart the helper.
+- `helper file <relative-path>` / `!file <relative-path>`: send one file from the Teams outbound root (the bare command shows the root).
+- `helper restart`: restart the helper (see `restart` above).
 - `helper help`: the command list.
 
 Codex returns files to a work chat by writing them under the per-turn directory named in its prompt and listing them in a `codex-helper-artifacts` block of the final answer.

@@ -141,7 +141,7 @@
 -- <msg:13> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
    | <p>Codex reported an error and the request did not finish: scripted failure</p>
-   | <p>It was not re-run; resend it if you still need it.</p>
+   | <p>It was not re-run. Send <code>helper retry last</code> to run it again.</p>
 -- <msg:14> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>This one fails first E2E-DUPEDGE-fails-1</p>

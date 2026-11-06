@@ -34,8 +34,14 @@
    | <p>helper restart now</p>
 -- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Helper restarted: the new process is running and has taken over.</p>
+   | <p>🔄 Helper restart scheduled</p>
+   | <p>I may be silent for a few seconds.<br>
+   | After it comes back, send <code>st</code> if you want to check status.</p>
 -- <msg:7> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>✅ Helper restart completed</p>
+   | <p>The Teams helper is back online. Send <code>st</code> to check status.</p>
+-- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>✅ Codex finished</strong></p>
    | <p><strong>Chat:</strong> 💬 e2ehost - First task E2E-RESTART-warm-1<br>

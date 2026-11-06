@@ -75,7 +75,8 @@
    | <p>⏳ Codex is working. Request accepted.</p>
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
-   | <p>The previous request was interrupted when the helper stopped. It was not re-run; resend it if you still need it.</p>
+   | <p>Codex request interrupted because the Teams helper stopped, restarted, or lost its execution context before it could verify a final Codex result.</p>
+   | <p>Check recent messages and changed files first. If no final answer appears, resend the message or use <code>helper retry last</code>.</p>
 -- <msg:6> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Next request E2E-INTNOTICE-nexta-4</p>
@@ -117,7 +118,8 @@
    | <p>⏳ Codex is working. Request accepted.</p>
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
-   | <p>The previous request was interrupted when the helper stopped. It was not re-run; resend it if you still need it.</p>
+   | <p>Codex request interrupted because the Teams helper stopped, restarted, or lost its execution context before it could verify a final Codex result.</p>
+   | <p>Check recent messages and changed files first. If no final answer appears, resend the message or use <code>helper retry last</code>.</p>
 -- <msg:6> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Next request E2E-INTNOTICE-nextb-5</p>

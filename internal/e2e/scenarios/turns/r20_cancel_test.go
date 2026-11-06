@@ -33,7 +33,6 @@ func TestR20_R33_CancelRunningTurn(t *testing.T) {
 
 	steps.MustPost(s, work.ID, "Long running "+stuck)
 	s.WaitCodexCalls(stuck, 1, steps.AnswerTimeout)
-	// `helper cancel` without a selector only prints usage in the old core;
 	// `last` selects the running turn when nothing is queued (F-TRN-3).
 	steps.MustPost(s, work.ID, "helper cancel last")
 	cancelledInCodex := s.WaitFor("interrupt reaches Codex", 30*time.Second, func() (bool, string) {
@@ -42,7 +41,8 @@ func TestR20_R33_CancelRunningTurn(t *testing.T) {
 	})
 	// The command's reply and the turn's terminal notice, in this order;
 	// the next prompt follows both, so the transcript is fixed.
-	const ack, cancelled = "Cancelling the running request", "Request cancelled."
+	// v0.1.20's texts (cancelTurnCommandForScope, B:9490).
+	const ack, cancelled = "cancel requested for running turn", "Codex request canceled."
 	terminal := s.WaitFor("cancel reply and terminal notice for the cancelled turn", 30*time.Second, func() (bool, string) {
 		a, c := len(s.SUTMessagesContaining(work.ID, ack)), len(s.SUTMessagesContaining(work.ID, cancelled))
 		return a > 0 && c > 0, fmt.Sprintf("%q x%d, %q x%d", ack, a, cancelled, c)
@@ -68,6 +68,12 @@ func TestR20_R33_CancelRunningTurn(t *testing.T) {
 	s.Check("R-20 the cancel reply precedes the terminal notice", replyAt >= 0 && replyAt < noticeAt, "reply first",
 		fmt.Sprintf("reply at %d, %q at %d", replyAt, cancelled, noticeAt), tr...)
 	s.Check("R-33 cancelled turn has a visible terminal state", terminal, fmt.Sprintf("%q posted", cancelled), map[bool]string{true: "posted", false: "missing"}[terminal], tr...)
+	reply := ""
+	if rs := s.SUTMessagesContaining(work.ID, ack); len(rs) > 0 {
+		reply = harness.NormalizeSpace(rs[0].PlainText())
+	}
+	named := strings.Contains(reply, "Prompt being canceled:") && strings.Contains(reply, "Long running "+stuck) && strings.Contains(reply, "No other prompts are queued.")
+	s.Check("F-TRN-3 the cancel reply names the cancelled prompt and what remains queued", named, "names the prompt; no other prompts queued", reply, tr...)
 	late := len(s.SUTMessagesContaining(work.ID, "LATE-ANSWER"))
 	s.Check("R-20 no answer is posted for the cancelled turn", late == 0, "0", fmt.Sprint(late))
 	s.Check("R-20 the next message still works", ok && len(s.Codex.CallsWithToken(next)) == 1, "answered once",
