@@ -1,3 +1,8 @@
+//go:build unix
+
+// The benchmark measures CPU time with getrusage(2), which exists only on
+// Unix; both tests here are skipped unless their corpus is named.
+
 package transcript
 
 import (
