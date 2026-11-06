@@ -35,3 +35,7 @@ func groupAlive(pid int) bool {
 }
 
 func startTime(int) string { return "" }
+
+func bootID() string { return "" }
+
+func pidNamespace() string { return "" }
