@@ -532,6 +532,13 @@ func (e *Engine) cliRebind(ctx context.Context, r CLIRequest, p *cliProgress, co
 		return nil, err
 	}
 	defer release()
+	// The transcript source is read before the transaction: on a network
+	// filesystem the store has one connection, and the transaction holds it.
+	var src store.TranscriptSource
+	var srcOK bool
+	if r.History && !control {
+		src, srcOK = e.cliSource(p.Conv, cs.threadID)
+	}
 	var queued bool
 	var gone string
 	err = e.update(func(tx *store.Tx) error {
@@ -576,28 +583,25 @@ func (e *Engine) cliRebind(ctx context.Context, r CLIRequest, p *cliProgress, co
 				return err
 			}
 		}
-		if r.History && !control {
-			src, ok := e.cliSource(p.Conv, cs.threadID)
-			if ok {
-				ns, _, err := tx.Meta(mirrorNSKey(src.ID))
-				if err != nil {
+		if srcOK {
+			ns, _, err := tx.Meta(mirrorNSKey(src.ID))
+			if err != nil {
+				return err
+			}
+			// The new chat has none of the session's messages: the
+			// whole rollout, helper-run turns included, under keys of
+			// its own (the old chat's keys are taken).
+			job := importJob{Conv: p.Conv, Kind: importFull, Thread: src.ThreadID, Path: src.Path,
+				Rewind: true, KeepTeams: true, NS: firstNonEmpty(ns, src.ThreadID) + "@r" + r.ID}
+			id, err := e.queueImport(tx, job)
+			if err != nil && !errors.Is(err, errImportRunning) {
+				return err
+			}
+			if err == nil {
+				if err := e.enqueueNotice(tx, p.Conv, fmt.Sprintf("import:%d:title", id), textImportTitle(e.sessionTitleOf(src.Path, src.ThreadID))); err != nil {
 					return err
 				}
-				// The new chat has none of the session's messages: the
-				// whole rollout, helper-run turns included, under keys of
-				// its own (the old chat's keys are taken).
-				job := importJob{Conv: p.Conv, Kind: importFull, Thread: src.ThreadID, Path: src.Path,
-					Rewind: true, KeepTeams: true, NS: firstNonEmpty(ns, src.ThreadID) + "@r" + r.ID}
-				id, err := e.queueImport(tx, job)
-				if err != nil && !errors.Is(err, errImportRunning) {
-					return err
-				}
-				if err == nil {
-					if err := e.enqueueNotice(tx, p.Conv, fmt.Sprintf("import:%d:title", id), textImportTitle(e.sessionTitleOf(src.Path, src.ThreadID))); err != nil {
-						return err
-					}
-					p.Import, queued = id, true
-				}
+				p.Import, queued = id, true
 			}
 		}
 		if queued {
