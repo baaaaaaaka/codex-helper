@@ -796,7 +796,19 @@ func (s *Server) nextStampLocked() time.Time {
 func (s *Server) newChatIDLocked(kind string) string {
 	s.idCounter++
 	sum := sha256.Sum256([]byte(fmt.Sprintf("%s-%d-%d", kind, s.idCounter, time.Now().UnixNano())))
-	enc := base64.RawURLEncoding.EncodeToString(sum[:])[:32]
+	// Letters and digits only, as in real meeting IDs (base64 of a GUID's
+	// text). A '_' in the ID can turn into Markdown emphasis where a reply
+	// quotes it (rename failures), and the transcript then misses the
+	// <chat:N> mask: a golden that fails about one run in a few hundred.
+	enc := strings.Map(func(r rune) rune {
+		switch r {
+		case '-':
+			return 'x'
+		case '_':
+			return 'y'
+		}
+		return r
+	}, base64.RawURLEncoding.EncodeToString(sum[:]))[:32]
 	if kind == "meeting" {
 		return "19:meeting_" + enc + "@thread.v2"
 	}
