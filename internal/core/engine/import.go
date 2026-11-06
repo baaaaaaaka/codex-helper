@@ -130,18 +130,28 @@ func saveImports(tx *store.Tx, jobs []importJob) error {
 // importLoad fills the cache from the store once (mirrorInit).
 func (e *Engine) importLoad() {
 	e.imp.mu.Lock()
-	defer e.imp.mu.Unlock()
-	if e.imp.loaded {
+	loaded := e.imp.loaded
+	e.imp.mu.Unlock()
+	if loaded {
 		return
 	}
+	// Read outside imp.mu: transactions take it (importChatCreated).
 	jobs, err := loadImports(e.st.Meta)
 	if err != nil {
 		e.logf("import: %v", err)
 		return
 	}
+	e.imp.mu.Lock()
+	defer e.imp.mu.Unlock()
+	if e.imp.loaded {
+		return
+	}
 	e.imp.loaded = true
 	e.imp.sweep.Store(true) // fork snapshots left by a crash (fork.go)
-	e.imp.convs = map[int64]bool{}
+	if e.imp.convs == nil {
+		// Jobs queued since the read are already in it (importQueued).
+		e.imp.convs = map[int64]bool{}
+	}
 	for _, j := range jobs {
 		e.imp.convs[j.Conv] = true
 		if !j.Applied {

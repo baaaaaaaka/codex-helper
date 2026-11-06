@@ -2,7 +2,6 @@ package store
 
 import (
 	"crypto/sha256"
-	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -22,8 +21,10 @@ import (
 // index from the WAL: frames after the last valid commit frame (a
 // transaction the old owner had not finished, or WAL pages it never got to
 // the server) fail their checksums and are ignored, exactly as after a
-// power loss. The copy is checked, checkpointed into a single file, synced
-// and renamed into place, so dst either does not exist or is complete.
+// power loss. The WAL index is rebuilt from the WAL alone, so this holds for
+// a source used in exclusive mode too, which never has a -shm. The copy is
+// checked, checkpointed into a single file, synced and renamed into place,
+// so dst either does not exist or is complete.
 //
 // A missing src is an error: an owner never starts from an empty store
 // when the lease says one exists.
@@ -38,26 +39,9 @@ func CopySnapshot(src, dst string) error {
 		}
 	}
 	clean()
-	stable := false
-	for attempt := 0; attempt < 10 && !stable; attempt++ {
-		if attempt > 0 {
-			time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
-		}
-		first, err := copyFiles(src, tmp)
-		if err != nil {
-			clean()
-			return err
-		}
-		again, err := hashFiles(src)
-		if err != nil {
-			clean()
-			return err
-		}
-		stable = first == again
-	}
-	if !stable {
+	if err := copyStable(src, tmp); err != nil {
 		clean()
-		return fmt.Errorf("store: %s kept changing while it was copied", src)
+		return err
 	}
 	if err := finishCopy(tmp); err != nil {
 		clean()
@@ -69,6 +53,28 @@ func CopySnapshot(src, dst string) error {
 	}
 	clean()
 	return syncDir(filepath.Dir(dst))
+}
+
+// copyStable copies src and its WAL to dst as raw bytes, repeating until
+// two reads of both files agree (nothing wrote to them in between).
+func copyStable(src, dst string) error {
+	for attempt := 0; attempt < 10; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
+		}
+		first, err := copyFiles(src, dst)
+		if err != nil {
+			return err
+		}
+		again, err := hashFiles(src)
+		if err != nil {
+			return err
+		}
+		if first == again {
+			return nil
+		}
+	}
+	return fmt.Errorf("store: %s kept changing while it was copied", src)
 }
 
 type fileSums [2][sha256.Size + 1]byte // database, WAL (last byte: present)
@@ -134,7 +140,7 @@ func hashFiles(src string) (fileSums, error) {
 // finishCopy opens the copied files with SQLite (WAL recovery), checks
 // them and folds the WAL into the database file.
 func finishCopy(path string) error {
-	db, err := sql.Open("sqlite", dsn(path, false))
+	db, err := openDB(path, networkFS(filepath.Dir(path)))
 	if err != nil {
 		return err
 	}

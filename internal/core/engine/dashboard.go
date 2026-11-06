@@ -105,15 +105,24 @@ var (
 
 func (e *Engine) dashLoad() *dashView {
 	e.dash.mu.Lock()
+	if e.dash.loaded {
+		v := e.dash.view
+		e.dash.mu.Unlock()
+		return v
+	}
+	e.dash.mu.Unlock()
+	// Read outside dash.mu: dashStore takes it inside a store transaction.
+	var view *dashView
+	if v, ok, err := e.st.Meta(metaDashView); err == nil && ok && v != "" {
+		var dv dashView
+		if json.Unmarshal([]byte(v), &dv) == nil {
+			view = &dv
+		}
+	}
+	e.dash.mu.Lock()
 	defer e.dash.mu.Unlock()
 	if !e.dash.loaded {
-		e.dash.loaded = true
-		if v, ok, err := e.st.Meta(metaDashView); err == nil && ok && v != "" {
-			var dv dashView
-			if json.Unmarshal([]byte(v), &dv) == nil {
-				e.dash.view = &dv
-			}
-		}
+		e.dash.loaded, e.dash.view = true, view
 	}
 	return e.dash.view
 }
