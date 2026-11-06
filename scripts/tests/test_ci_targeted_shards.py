@@ -161,7 +161,8 @@ class TargetedShardWorkflowTests(unittest.TestCase):
                 self.assertTrue(complete_plan)
                 self.assertTrue(
                     any(
-                        "TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup" in job
+                        # An exclusive test built on every OS.
+                        "TestRunAppGatewayDaemonKeepsStableFrontendWhileBackendRuns" in job
                         for job in complete_plan
                     )
                 )
@@ -214,9 +215,14 @@ class TargetedShardWorkflowTests(unittest.TestCase):
                         worker_loads[target] += weight
                     parallel_spans.append(max(worker_loads))
                     critical_paths.append(sum(exclusive) + max(worker_loads))
+                # Few exclusive jobs cannot always balance within 10%: the
+                # unavoidable skew is one job, so the largest one bounds it.
+                largest_exclusive = max(
+                    (metadata(job)[0] for job in partition_plans if metadata(job)[1]), default=1
+                )
                 self.assertLessEqual(
                     max(exclusive_loads) - min(exclusive_loads),
-                    max(1, max(exclusive_loads) // 10),
+                    max(1, max(exclusive_loads) // 10, largest_exclusive),
                     f"exclusive phase estimate is skewed: {exclusive_loads}",
                 )
                 if race and partition_count == 4:

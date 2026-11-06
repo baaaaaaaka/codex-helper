@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -16,6 +17,18 @@ import (
 	corestore "github.com/baaaaaaaka/codex-helper/internal/core/store"
 )
 
+// migrateTestdata is a converter fixture directory of another package. A
+// test binary run without the source tree (the Linux distro smoke) skips
+// the tests that need one.
+func migrateTestdata(t *testing.T, parts ...string) string {
+	t.Helper()
+	p := filepath.Join(append([]string{"..", "core", "migrate", "testdata"}, parts...)...)
+	if _, err := os.Stat(p); errors.Is(err, os.ErrNotExist) {
+		t.Skipf("converter fixture %s not present (test binary run without the source tree)", p)
+	}
+	return p
+}
+
 // migrateFixture copies a converter fixture (real code of v0.1.20 and
 // rc.59 wrote it: internal/core/migrate/testdata) into a scope directory
 // under a fresh state root.
@@ -23,7 +36,7 @@ func migrateFixture(t *testing.T, version, form string) (root, scope string) {
 	t.Helper()
 	root = t.TempDir()
 	scope = filepath.Join(root, "teams", "scopes", "scope_"+strings.ReplaceAll(version, ".", ""))
-	src := filepath.Join("..", "core", "migrate", "testdata", version, form)
+	src := migrateTestdata(t, version, form)
 	ents, err := os.ReadDir(src)
 	if err != nil {
 		t.Fatal(err)
@@ -169,7 +182,7 @@ func TestFirstStartRefusesAmbiguousOldStores(t *testing.T) {
 	})
 	t.Run("two supported stores", func(t *testing.T) {
 		root, _ := migrateFixture(t, "rc59", "json")
-		raw, err := os.ReadFile(filepath.Join("..", "core", "migrate", "testdata", "v0120", "json", "state.json"))
+		raw, err := os.ReadFile(filepath.Join(migrateTestdata(t, "v0120", "json"), "state.json"))
 		if err != nil {
 			t.Fatal(err)
 		}

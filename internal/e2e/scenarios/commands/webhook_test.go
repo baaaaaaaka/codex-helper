@@ -60,7 +60,14 @@ func TestWebhookFromControlChat(t *testing.T) {
 	expect(s, control.ID, "helper webhook "+hook, "Workflow webhook enabled.",
 		"Webhook URL: saved locally as a private secret file; I will not echo it back.", "Send helper webhook test to send a test card.")
 	expect(s, control.ID, "helper webhook status", "Workflow webhook enabled.", "Webhook URL: configured as a local private secret file.")
-	out, code := s.RunCLI(40*time.Second, "teams", "workflow", "status")
+	// The CLI reads the state the running helper publishes, which follows
+	// a change within seconds.
+	var out string
+	var code int
+	s.Poll(15*time.Second, func() bool {
+		out, code = s.RunCLI(40*time.Second, "teams", "workflow", "status")
+		return strings.Contains(out, "Teams workflow notifications: enabled")
+	})
 	s.Check("`cxp teams workflow status` shows the chat's setting", code == 0 && strings.Contains(out, "Teams workflow notifications: enabled") &&
 		strings.Contains(out, "Webhook URL file: configured"), "enabled, file configured", fmt.Sprintf("exit %d: %s", code, clip(out, 300)))
 

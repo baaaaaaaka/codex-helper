@@ -143,13 +143,10 @@ for entry in cxp codex-proxy; do
   : >"$root/stdout.log"
   : >"$root/stderr.log"
   HOME="$root/home" XDG_STATE_HOME="$root/state" \
-    "$root/$entry" responses serve \
-      --listen 127.0.0.1:0 \
-      --base-url http://127.0.0.1:9/v1 \
-      --api-key process-identity-smoke \
-      --model process-identity-smoke \
-      --store-path "$root/responses.sqlite" \
-      >"$root/stdout.log" 2>"$root/stderr.log" &
+    # A long-lived CXP process with no network or account: `cxp run` in
+    # direct mode (stdin is not a terminal) waiting on a child.
+    "$root/$entry" run -- sleep 600 \
+      </dev/null >"$root/stdout.log" 2>"$root/stderr.log" &
   pid=$!
   wait_for_runtime "$pid"
   assert_process_clean "$pid"
