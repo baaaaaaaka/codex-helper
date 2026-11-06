@@ -69,7 +69,7 @@ func TestCopiedHomeOldMachineStoppedFirst(t *testing.T) {
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "MOVED-LIVE-STOPPED", harness.Options{
 		Guarantees: []string{"F-XM-1", "R-1"},
-		Title:      "home copied while the helper runs, old helper stopped later: the new machine does not answer again what the old one took after the copy, lists it once, answers the gap prompts once; the old machine started again stands down",
+		Title:      "home copied while the helper runs, old helper stopped later: the new machine does not answer again what the old one took after the copy, lists it once, answers the gap prompt once; the old machine started again stands down",
 		Budget:     150 * time.Second,
 		Seam:       takeoverSeam("host-a"),
 		Invariants: harness.Invariants{Except: []harness.Exception{
@@ -93,8 +93,10 @@ func TestCopiedHomeOldMachineStoppedFirst(t *testing.T) {
 	s.Check("the old machine answers after the copy", answered, "answered", fmt.Sprint(answered))
 	s.Settle(2*time.Second, 10*time.Second)
 	s.StopSUT()
-	gap, after := s.Token("gap"), s.Token("after")
-	steps.MustPost(s, quiet.ID, "While no helper runs "+gap)
+	// A prompt no helper saw. (A gap prompt in a chat the old machine did
+	// not post in is the engine tests': two chats read at once would make
+	// the turn numbers in the transcript vary.)
+	after := s.Token("after")
 	steps.MustPost(s, work.ID, "After the old machine stopped "+after)
 
 	b := s.NewPeer("B", harness.PeerOptions{Seam: takeoverSeam("host-b"), Env: moved})
@@ -103,10 +105,8 @@ func TestCopiedHomeOldMachineStoppedFirst(t *testing.T) {
 	}
 	_, ok := waitServing(s, b, 90*time.Second)
 	s.Check("the new machine serves after the copied lease went stale", ok, "serving", clipTail(b.Output(), 600))
-	for _, c := range []struct{ chat, token string }{{quiet.ID, gap}, {work.ID, after}} {
-		by := answeredBy(s, c.chat, c.token, "-B-", steps.AnswerTimeout)
-		s.Check("a prompt no helper saw is answered by the new machine", by, "answered by B", fmt.Sprint(by), s.Transcript(c.chat, 12)...)
-	}
+	by := answeredBy(s, work.ID, after, "-B-", steps.AnswerTimeout)
+	s.Check("a prompt no helper saw is answered by the new machine", by, "answered by B", fmt.Sprint(by), s.Transcript(work.ID, 12)...)
 	s.Settle(3*time.Second, 15*time.Second)
 	checkSkipNotice(s, work.ID, []string{taken}, before, after)
 	s.Check("no notice in a chat the old machine did not post in", len(skipNotices(s, quiet.ID))+len(skipNotices(s, control.ID)) == 0,
@@ -126,8 +126,8 @@ func TestCopiedHomeOldMachineStoppedFirst(t *testing.T) {
 	s.Check("`cxp teams status` on the old machine says it stood down and how to undo it", supersededLine(line),
 		"Stopped here: a copy of this state took over and the helper now runs on host-b (<time>). Start again with `cxp teams start`.", line)
 
-	for _, c := range []struct{ chat, token string }{{work.ID, before}, {work.ID, taken}, {work.ID, after}, {quiet.ID, gap}} {
-		exactlyOnce(s, c.chat, c.token)
+	for _, tok := range []string{before, taken, after} {
+		exactlyOnce(s, work.ID, tok)
 	}
 }
 
