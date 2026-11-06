@@ -195,14 +195,14 @@ func TestEffortCommands(t *testing.T) {
 	expect(s, work.ID, "helper effort set", "usage: `effort set <value>`")
 	expect(s, work.ID, "helper effort set high", "Reasoning effort updated for this Work chat", "Previous: `unset`",
 		"Effective for next turn: `high`", "Model: `gpt-5-codex`", "Source: chat override")
-	hi, ok := ask(s, work.ID, "high")
+	hi, ok := askNotified(s, control.ID, work.ID, "high")
 	s.Check("the next turn runs at the chosen effort", ok && hi.Effort == "high", "effort high", fmt.Sprintf("effort=%q", hi.Effort))
 	expect(s, work.ID, "helper effort low", "Reasoning effort updated", "Previous: `high`", "Effective for next turn: `low`")
 	expect(s, work.ID, "helper model effort status", "Current chat effort (Work)", "Effective for next turn: `low`", "Source: chat override")
 	expect(s, work.ID, "helper effort turbo", "is not supported by model", `reasoning effort "turbo" is not supported by model "gpt-5-codex"`)
 	expect(s, work.ID, "helper effort help", "Reasoning effort commands:", "`effort reset`")
 	expect(s, work.ID, "helper effort reset", "Reasoning effort updated", "Effective for next turn: `medium`", "Source: model-advertised default")
-	md, ok := ask(s, work.ID, "medium")
+	md, ok := askNotified(s, control.ID, work.ID, "medium")
 	s.Check("after `effort reset` the next turn runs at the model's default", ok && md.Effort == "medium", "effort medium", fmt.Sprintf("effort=%q", md.Effort))
 
 	expect(s, control.ID, "effort", "Current chat effort (Control)", "Effective for next turn: `low`", "Source: helper fallback")
@@ -211,7 +211,7 @@ func TestEffortCommands(t *testing.T) {
 	s.Check("a control question runs at the Control chat's effort", ok && q.Effort == "high", "effort high", fmt.Sprintf("effort=%q", q.Effort))
 	expect(s, control.ID, "efforts", "Current chat effort choices for GPT-5-Codex:", "- `high` (current)")
 	expect(s, control.ID, "effort reset", "Reasoning effort updated for this Control chat", "Effective for next turn: `medium`")
-	w, ok := ask(s, work.ID, "after")
+	w, ok := askNotified(s, control.ID, work.ID, "after")
 	s.Check("the control chat's effort does not change the Work chat", ok && w.Effort == "medium", "effort medium", fmt.Sprintf("effort=%q", w.Effort))
 }
 
@@ -250,19 +250,19 @@ func TestGlobalDefaults(t *testing.T) {
 	expect(s, control.ID, "default help", "Global default commands (Control chat only):")
 
 	fresh, _ := steps.NewWorkChat(s, control, "fresh")
-	n, ok := ask(s, fresh.ID, "fresh")
+	n, ok := askNotified(s, control.ID, fresh.ID, "fresh")
 	s.Check("a new chat takes the global defaults", ok && n.Model == "gpt-5-mini" && n.Effort == "medium",
 		"gpt-5-mini, medium", fmt.Sprintf("model=%q effort=%q", n.Model, n.Effort))
 	expect(s, fresh.ID, "helper model", "Selection: global default", "Effective effort: `medium` (global default)",
 		"Global default for new chats: Codex Official (`gpt-5-mini`)")
-	o, ok := ask(s, old.ID, "old")
+	o, ok := askNotified(s, control.ID, old.ID, "old")
 	s.Check("an existing chat keeps its model", ok && o.Model == "" && o.Effort == "", "Codex default", fmt.Sprintf("model=%q effort=%q", o.Model, o.Effort))
 	expect(s, old.ID, "helper default status", "can only be used in the Control chat")
 
 	expect(s, control.ID, "default model reset", "Global default model reset to the built-in Codex account default.", "Previous selector: `official:gpt-5-mini`")
 	expect(s, control.ID, "default effort reset", "Global default effort reset (previous configured effort: `medium`).")
 	expect(s, control.ID, "default status", "Configured selector: `default`", "Configured: `unset`")
-	n2, ok := ask(s, fresh.ID, "fresh2")
+	n2, ok := askNotified(s, control.ID, fresh.ID, "fresh2")
 	s.Check("resetting the defaults does not change a chat created with them", ok && n2.Model == "gpt-5-mini" && n2.Effort == "medium",
 		"gpt-5-mini, medium", fmt.Sprintf("model=%q effort=%q", n2.Model, n2.Effort))
 }

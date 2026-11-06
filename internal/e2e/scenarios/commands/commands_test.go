@@ -58,6 +58,24 @@ func ask(s *harness.Scenario, chatID, label string) (harness.CodexCall, bool) {
 	return calls[0], ok
 }
 
+// askNotified is ask for a Work chat whose owner notice in the Control
+// chat must land before the scenario posts there again: the notice is
+// asynchronous, so without the wait its place in the Control chat's
+// transcript (and in a later control question's history) would race.
+func askNotified(s *harness.Scenario, controlID, chatID, label string) (harness.CodexCall, bool) {
+	token := s.Token(label)
+	steps.MustPost(s, chatID, "Please answer "+token)
+	_, ok := steps.WaitAnswered(s, chatID, token, steps.AnswerTimeout)
+	if _, seen := s.WaitSUTMessage(controlID, "Please answer "+token, steps.CommandTimeout); !seen {
+		ok = false
+	}
+	calls := s.Codex.CallsWithToken(token)
+	if len(calls) != 1 {
+		return harness.CodexCall{}, false
+	}
+	return calls[0], ok
+}
+
 // `new` then `helper fork`: the fork gets its own chat and a new Codex
 // thread forked from the original; both chats keep working on their own
 // threads, and the fork does not replay the original's history.
