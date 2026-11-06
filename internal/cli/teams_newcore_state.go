@@ -173,10 +173,12 @@ func readTeamsPublishedStatus(dir string) (teamsPublishedStatus, bool) {
 
 // teamsStatusPublisher is the helper's side: it keeps core-status.json
 // equal to the store's state. It reads the store after commits
-// (Store.Changes): at once after the first commit of a quiet store, then
-// no more often than every teamsStatusPublishGap while commits keep
-// coming, and rewrites the file only when the state changed. An idle
-// store costs nothing: no commit, no read.
+// (Store.Changes): at once after the first commit of a quiet store, then,
+// while commits keep coming, no more often than every
+// teamsStatusPublishGap or (up to teamsStatusPublishMaxGap)
+// teamsStatusPublishCost times what the last read took, and rewrites the
+// file only when the state changed. An idle store
+// costs nothing: no commit, no read.
 type teamsStatusPublisher struct {
 	st   *corestore.Store
 	dir  string
@@ -188,13 +190,21 @@ type teamsStatusPublisher struct {
 	failed string // the last error logged
 }
 
-// teamsStatusPublishGap folds the commits of a burst into one read, and
-// bounds how far the file lags a busy helper. A read is not free while a
-// catch-up commits several times a second: every commit invalidates the
-// read connection's page cache, and the outbox count visits each queued
-// row (the real-data shadow run, thousands of posts queued: at a 250 ms
-// gap these reads took about 140 s of the drain's 371 s of CPU).
-const teamsStatusPublishGap = 2 * time.Second
+// teamsStatusPublishGap folds the commits of a burst into one read.
+const teamsStatusPublishGap = 250 * time.Millisecond
+
+// teamsStatusPublishCost bounds the reads to about 1% of a core, and
+// teamsStatusPublishMaxGap how far the file then lags. A read is not free
+// while a catch-up commits several times a second: every commit
+// invalidates the read connection's page cache, and the outbox count
+// visits each queued row (the real-data shadow run, thousands of posts
+// queued: every 250 ms, these reads took about 140 s of the drain's 371 s
+// of CPU). A small or quiet store reads in a millisecond or two and keeps
+// the 250 ms gap.
+const (
+	teamsStatusPublishCost   = 100
+	teamsStatusPublishMaxGap = 5 * time.Second
+)
 
 func newTeamsStatusPublisher(st *corestore.Store, dir string, gen int64, host string, log io.Writer) *teamsStatusPublisher {
 	return &teamsStatusPublisher{st: st, dir: dir, gen: gen, host: host, log: log}
@@ -229,8 +239,10 @@ func (p *teamsStatusPublisher) run(ctx context.Context) {
 			return
 		case <-p.st.Changes():
 		}
-		p.publish(time.Now())
-		if sleepContext(ctx, teamsStatusPublishGap) != nil {
+		start := time.Now()
+		p.publish(start)
+		gap := min(teamsStatusPublishMaxGap, max(teamsStatusPublishGap, teamsStatusPublishCost*time.Since(start)))
+		if sleepContext(ctx, gap) != nil {
 			return
 		}
 	}
