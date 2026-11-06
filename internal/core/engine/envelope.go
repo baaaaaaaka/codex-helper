@@ -513,6 +513,7 @@ func screen(c *classified) {
 	if c.control {
 		if text := controlAttachmentRefusal(c); text != "" {
 			c.reject, c.rejectQuote = text, c.quoteID
+			c.in.Kind = store.InCommand // batch B: a refused question runs nothing
 		}
 		return
 	}

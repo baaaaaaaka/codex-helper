@@ -341,7 +341,8 @@ func TestRunTurnServerCrashThenReconcile(t *testing.T) {
 		t.Fatalf("reconcile: %v %v %+v", err, ok, turn)
 	}
 	models, err := s2.Models(ctx)
-	if err != nil || len(models) != 1 || !models[0].IsDefault || len(models[0].Efforts) != 3 {
+	// The fake lists a second, non-default model (gap batch B).
+	if err != nil || len(models) != 2 || !models[0].IsDefault || len(models[0].Efforts) != 3 || models[1].IsDefault {
 		t.Fatalf("models %v %+v", err, models)
 	}
 	fork, err := s2.ThreadFork(ctx, th.ID, "", cfg.Dir)

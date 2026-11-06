@@ -223,7 +223,8 @@ func (e *Engine) convOpen(id int64) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	cs := e.convs[id]
-	return cs != nil && cs.state != store.ConvClosed
+	// The control chat's Codex questions are not mirrored (batch B).
+	return cs != nil && cs.state != store.ConvClosed && cs.kind != store.KindControl
 }
 
 // mirrorLoop watches $CODEX_HOME/sessions.
@@ -554,7 +555,7 @@ func (e *Engine) newRollout(ctx context.Context, f transcript.Found, atStart boo
 	conv, bound := e.byThread[meta.ID]
 	var closed, forked bool
 	if cs := e.convs[conv]; bound && cs != nil {
-		closed = cs.state == store.ConvClosed
+		closed = cs.state == store.ConvClosed || cs.kind == store.KindControl // batch B: control Q&A
 		forked = cs.forkParent != 0
 	}
 	forked = forked || e.forkThreads[meta.ID]

@@ -192,6 +192,53 @@ func (n *teamsNewCoreNotifier) NotifyEvent(ctx context.Context, heading, text, u
 	return chteams.NewWorkflowNotifier(n.url(), n.client).NotifyEvent(ctx, heading, text, url)
 }
 
+// The control chat's `helper webhook …` (engine.WebhookSettings, gap batch
+// B, F-CTL-14). The URL is saved as v0.1.20 saved it: a private file named
+// workflow-webhook-url next to the store (the name the migration copies
+// the old secret to); a file the user configured elsewhere is not touched.
+const teamsWorkflowChatSecretName = "workflow-webhook-url"
+
+func (n *teamsNewCoreNotifier) WebhookEnabled() (bool, error) {
+	n.apply()
+	on, _, err := n.st.Meta(migrate.MetaWorkflowEnabled)
+	return strings.EqualFold(strings.TrimSpace(on), "true"), err
+}
+
+func (n *teamsNewCoreNotifier) SetWebhook(url string) error {
+	url = strings.TrimSpace(url)
+	if !chteams.SafeWebhookURL(url) {
+		return fmt.Errorf("workflow webhook URL must be an absolute https URL")
+	}
+	n.apply() // an older command's request must not undo this change later
+	file := filepath.Join(filepath.Dir(n.path), teamsWorkflowChatSecretName)
+	if info, err := os.Lstat(file); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("workflow webhook URL file must not be a symlink")
+	}
+	tmp := file + ".tmp"
+	if err := os.WriteFile(tmp, []byte(url+"\n"), 0o600); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp, 0o600); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, file); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if _, err := chteams.ReadWebhookURLFile(file); err != nil {
+		return err
+	}
+	return n.st.Update(func(tx *corestore.Tx) error {
+		return setTeamsWorkflowMeta(tx, teamsWorkflowRequest{Enabled: true, WebhookURLFile: file})
+	})
+}
+
+func (n *teamsNewCoreNotifier) DisableWebhook() error {
+	n.apply()
+	return n.st.Update(func(tx *corestore.Tx) error { return setTeamsWorkflowMeta(tx, teamsWorkflowRequest{}) })
+}
+
 // teamsWorkflowWatchEvery is how often the running helper looks for a
 // workflow enable/disable request (well inside teamsWorkflowApplyWait).
 const teamsWorkflowWatchEvery = 5 * time.Second

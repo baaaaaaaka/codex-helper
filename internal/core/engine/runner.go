@@ -142,12 +142,13 @@ func (e *Engine) nextCapWake() time.Time {
 func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool {
 	e.mu.Lock()
 	cs := e.convs[id]
-	ok := cs != nil && cs.kind == store.KindWork && cs.state == store.ConvActive && !cs.paused &&
+	ok := cs != nil && (cs.kind == store.KindWork || cs.kind == store.KindControl) && cs.state == store.ConvActive && !cs.paused &&
 		cs.running == nil && !e.now().Before(cs.capWake) && !e.draining() && !e.stopping.Load()
 	var (
 		lastEnd      time.Time
 		batchThrough int64
 	)
+	control := ok && cs.kind == store.KindControl // batch B: control Q&A (control_qa.go)
 	if ok {
 		lastEnd, batchThrough = cs.lastTurnEnd, cs.batchThrough
 		e.starting++ // a drain waits for it (upgrade.go)
@@ -174,6 +175,7 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 		// voiceFailed: the next turn was a voice message that could not
 		// be transcribed; it was answered with the reason, not started.
 		voiceFailed bool
+		ctl         ctlRequest // batch B: a control question's history
 	)
 	err := e.update(func(tx *store.Tx) error {
 		var err error
@@ -214,15 +216,23 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 			got, voiceFailed = false, true
 			return tx.FinishTurn(tr.ID, store.TurnFailed, "voice transcription failed", msgs)
 		}
-		req = TurnRequest{ConvID: id, ThreadID: th.ThreadID, Cwd: th.Cwd, Model: th.Model, Effort: th.Effort,
+		// selector: v0.1.20's "default" model profile is the account
+		// default (modelcmds.go, batch B).
+		req = TurnRequest{ConvID: id, ThreadID: th.ThreadID, Cwd: th.Cwd, Model: selector(th.Model), Effort: th.Effort,
 			TurnKey: tr.TurnKey, Text: in.Body}
 		if th.PendingModel != "" {
-			req.Model = th.PendingModel
+			req.Model = selector(th.PendingModel)
 		}
 		if th.PendingEffort != "" {
 			req.Effort = th.PendingEffort
 		}
 		req.Text, req.Images = codexInput(in.Body, files, e.outboundDir(tr.TurnKey)) // envelope.go (F-TRN-14)
+		// Batch B: the control envelope, model and effort (control_qa.go).
+		if control {
+			if req, ctl, err = e.controlRequest(tx, req, in, files, th); err != nil {
+				return err
+			}
+		}
 		if continuesPrompt(tr, th.ThreadID) {
 			req.Text, req.Images = continueText, nil
 		}
@@ -273,6 +283,9 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 	}
 	if !got {
 		return false
+	}
+	if control {
+		e.afterControlStart(ctl) // batch B
 	}
 	rs := &runState{turnID: tr.ID, turnKey: tr.TurnKey, done: make(chan struct{}), request: request, queuedPrompt: queued}
 	e.mu.Lock()
@@ -551,7 +564,14 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 		}
 		out.Final = final
 		if final != "" {
-			msgs, err = e.render(ctx, answerDoc(named(final)), store.OutFinal, base+":final")
+			doc := answerDoc(named(final))
+			// Batch B: a control-chat answer mentions the owner itself
+			// (v0.1.20 outboxAlreadyMentionedControlOwner); finalMention
+			// adds no second mention.
+			e.mu.Lock()
+			doc.Mention = cs.kind == store.KindControl
+			e.mu.Unlock()
+			msgs, err = e.render(ctx, doc, store.OutFinal, base+":final")
 		}
 		msgs = append(msgs, files...)
 		// Exactly one owner notification per final (CORE-DESIGN §4): the
@@ -727,7 +747,7 @@ func (e *Engine) finalMention(n pendingNotify, cs *convState) ([]store.OutMsg, e
 	e.mu.Lock()
 	ctl, name, url := e.controlID, compactChatTitle(firstNonEmpty(cs.title, cs.label)), cs.url
 	e.mu.Unlock()
-	if ctl == 0 {
+	if ctl == 0 || cs.id == ctl { // batch B: a control answer carries its own mention
 		return nil, nil
 	}
 	text := "**✅ Codex finished**\n\n**Chat:** " + mdInline(name)

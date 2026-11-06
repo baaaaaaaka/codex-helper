@@ -1,7 +1,8 @@
 // Package skillcmd is the chat `skills` command of the new core: a thin
 // engine.Skills over internal/skills (list, add, sync). The parsers and
-// formatters are copied from the legacy Teams bridge; destructive and
-// interactive operations (remove, push) stay in the local CLI.
+// formatters are copied from the legacy Teams bridge. `push` reviews and
+// pushes from a chat (push.go, gap batch B); remove stays in the local
+// CLI.
 package skillcmd
 
 import (
@@ -10,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/skills"
@@ -24,21 +26,34 @@ type Options struct {
 // Command implements engine.Skills.
 type Command struct {
 	opts Options
+	mu   sync.Mutex // the push reviews file (push.go)
 }
 
 // New returns the skills command backend.
 func New(opts Options) *Command { return &Command{opts: opts} }
 
-const usage = "Usage: `helper skills list`, `helper skills add <github/gitlab/git-url>` or `helper skills sync [name]`. " +
-	"Use the local `cxp skills` command to remove or push skills."
+const usage = "Usage: `helper skills list`, `helper skills add <github/gitlab/git-url>`, `helper skills sync [name]`, " +
+	"`helper skills push [--direct] [name]` or `helper skills push [--direct] confirm`. " +
+	"Use the local `cxp skills` command to remove skills."
 
-// Command runs one `skills …` command and returns the reply.
+// Command runs one `skills …` command outside any chat and returns the
+// reply; `push` needs a chat (ChatCommand).
 func (c *Command) Command(ctx context.Context, args string) string {
+	return c.ChatCommand(ctx, "", args)
+}
+
+// ChatCommand runs one `skills …` command of chat (engine.ChatSkills): a
+// `push` review is kept for the chat it was made in.
+func (c *Command) ChatCommand(ctx context.Context, chat, args string) string {
 	action, rest := split(args)
 	switch action {
 	case "", "list", "ls", "status", "st":
 	case "add", "sync":
-	case "remove", "rm", "push":
+	case "push":
+		if strings.TrimSpace(chat) == "" {
+			return "Use the local `cxp skills push` command for this, so sign-in prompts and confirmations happen in your terminal."
+		}
+	case "remove", "rm":
 		return "Use the local `cxp skills " + action + "` command for this, so sign-in prompts and confirmations happen in your terminal."
 	case "help", "?":
 		return usage
@@ -51,6 +66,8 @@ func (c *Command) Command(ctx context.Context, args string) string {
 	}
 	var body string
 	switch action {
+	case "push":
+		body = c.push(ctx, chat, mgr, rest)
 	case "add":
 		raw, perr := parseAdd(rest)
 		if perr != nil {
@@ -81,19 +98,20 @@ func (c *Command) Command(ctx context.Context, args string) string {
 	return body
 }
 
-func (c *Command) manager(ctx context.Context) (*skills.Manager, string, error) {
+// resolved fills the default directories in.
+func (c *Command) resolved() (Options, error) {
 	o := c.opts
 	if o.ConfigDir == "" {
 		base, err := os.UserConfigDir()
 		if err != nil {
-			return nil, "", err
+			return o, err
 		}
 		o.ConfigDir = filepath.Join(base, "codex-proxy")
 	}
 	if o.CacheDir == "" {
 		base, err := os.UserCacheDir()
 		if err != nil {
-			return nil, "", err
+			return o, err
 		}
 		o.CacheDir = filepath.Join(base, "codex-proxy", "skill-subscriptions")
 	}
@@ -105,6 +123,14 @@ func (c *Command) manager(ctx context.Context) (*skills.Manager, string, error) 
 		if o.CodexDir == "" && o.HomeDir != "" {
 			o.CodexDir = filepath.Join(o.HomeDir, ".codex")
 		}
+	}
+	return o, nil
+}
+
+func (c *Command) manager(ctx context.Context) (*skills.Manager, string, error) {
+	o, err := c.resolved()
+	if err != nil {
+		return nil, "", err
 	}
 	mgr, err := skills.NewManager(skills.ManagerOptions{ConfigDir: o.ConfigDir, CacheDir: o.CacheDir, CodexDir: o.CodexDir, HomeDir: o.HomeDir})
 	if err != nil {

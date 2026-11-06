@@ -56,21 +56,15 @@ var workCommands = map[string]cmdHandler{
 	cmdRenameName: func(e *Engine, ctx context.Context, j cmdJob, cs *convState, p parsed) {
 		e.cmdRename(ctx, j, cs, p.arg)
 	},
-	cmdSkillsName: func(e *Engine, ctx context.Context, j cmdJob, _ *convState, p parsed) { e.cmdSkills(ctx, j, p.arg) },
+	cmdSkillsName: func(e *Engine, ctx context.Context, j cmdJob, cs *convState, p parsed) {
+		e.cmdSkills(ctx, j, cs, p.arg)
+	},
+	// `model …` / `effort …` (modelcmds.go, batch B).
 	cmdModelName: func(e *Engine, ctx context.Context, j cmdJob, cs *convState, p parsed) {
-		e.cmdModel(ctx, j, cs, strings.Fields(p.arg))
+		e.cmdModelChat(ctx, j, cs, p.arg)
 	},
 	cmdEffortName: func(e *Engine, ctx context.Context, j cmdJob, cs *convState, p parsed) {
-		// Bare `effort` / `efforts` (v0.1.20 workBareCommandName) show the
-		// status / the list until batch B brings the full effort grammar.
-		switch firstLower(p.arg) {
-		case "", "status", "st":
-			e.cmdModel(ctx, j, cs, nil)
-		case "list", "ls":
-			e.cmdModel(ctx, j, cs, []string{"list"})
-		default:
-			e.cmdModel(ctx, j, cs, append([]string{"effort"}, strings.Fields(p.arg)...))
-		}
+		e.cmdEffortChat(ctx, j, cs, p.arg)
 	},
 	cmdDefault: func(e *Engine, _ context.Context, j cmdJob, _ *convState, _ parsed) {
 		e.reply(j, textWorkDefault, nil)
@@ -131,24 +125,22 @@ var controlCommands = map[string]cmdHandler{
 		}
 		e.cmdFork(ctx, j, target)
 	},
-	cmdStats:      func(e *Engine, ctx context.Context, j cmdJob, _ *convState, _ parsed) { e.cmdStats(ctx, j, nil) },
-	cmdSkillsName: func(e *Engine, ctx context.Context, j cmdJob, _ *convState, p parsed) { e.cmdSkills(ctx, j, p.arg) },
-	cmdModelName: func(e *Engine, ctx context.Context, j cmdJob, _ *convState, _ parsed) {
-		models, err := e.ag.Models(ctx)
-		if err != nil {
-			e.reply(j, "Codex did not list its models ("+userError(err.Error())+"). Try again later.", nil)
-			return
-		}
-		e.reply(j, modelList(models, store.Thread{})+"\n\nSwitch a session's model in its chat with `helper model <model> [effort]`.", nil)
+	cmdStats: func(e *Engine, ctx context.Context, j cmdJob, _ *convState, _ parsed) { e.cmdStats(ctx, j, nil) },
+	cmdSkillsName: func(e *Engine, ctx context.Context, j cmdJob, cs *convState, p parsed) {
+		e.cmdSkills(ctx, j, cs, p.arg)
 	},
-	cmdCancelName: func(e *Engine, _ context.Context, j cmdJob, _ *convState, p parsed) {
-		// The control chat runs no Codex question yet (control Q&A is
-		// batch B): v0.1.20's answers for a control chat with no turn.
-		e.reply(j, controlCancelText(p.arg), nil)
+	// `model …` / `effort …` (modelcmds.go, batch B).
+	cmdModelName: func(e *Engine, ctx context.Context, j cmdJob, cs *convState, p parsed) {
+		e.cmdModelChat(ctx, j, cs, p.arg)
 	},
-	cmdDefault: func(e *Engine, _ context.Context, j cmdJob, _ *convState, _ parsed) {
-		// HOOK(batch B): global defaults (F-CTL-11).
-		e.reply(j, "Global default management is not configured for this Teams service.", nil)
+	cmdEffortName: func(e *Engine, ctx context.Context, j cmdJob, cs *convState, p parsed) {
+		e.cmdEffortChat(ctx, j, cs, p.arg)
+	},
+	cmdCancelName: func(e *Engine, ctx context.Context, j cmdJob, cs *convState, p parsed) {
+		e.cmdControlCancel(ctx, j, cs, p.arg) // the control chat's Codex questions (control_qa.go)
+	},
+	cmdDefault: func(e *Engine, ctx context.Context, j cmdJob, _ *convState, p parsed) {
+		e.cmdDefaultControl(ctx, j, p.arg) // global defaults (defaults.go, batch B)
 	},
 	// Batch A: the workspace / session dashboard, `continue`, `open`,
 	// `details`, `status`, `mkdir` (dashboard.go, import.go).
@@ -167,10 +159,14 @@ var controlCommands = map[string]cmdHandler{
 	cmdPublish: func(e *Engine, ctx context.Context, j cmdJob, _ *convState, p parsed) { e.cmdContinue(ctx, j, p.arg) },
 	cmdMkdir:   func(e *Engine, _ context.Context, j cmdJob, _ *convState, p parsed) { e.cmdMkdir(j, p.arg) },
 	cmdDetails: func(e *Engine, _ context.Context, j cmdJob, _ *convState, p parsed) { e.cmdDetails(j, p.arg) },
-	// HOOK(batch B): control Q&A, the control chat's effort, Workflow webhooks.
-	cmdAsk:        hook("ask"),
-	cmdEffortName: hook("effort"),
-	cmdWebhook:    hook("helper webhook"),
+	// `ask <question>` is a question for Codex (control_qa.go); a bare
+	// `ask` gets here.
+	cmdAsk: func(e *Engine, _ context.Context, j cmdJob, _ *convState, _ parsed) {
+		e.reply(j, "usage: `ask <question>`", nil)
+	},
+	cmdWebhook: func(e *Engine, ctx context.Context, j cmdJob, cs *convState, p parsed) {
+		e.cmdWebhook(ctx, j, cs, p.arg) // Workflow webhooks (webhook.go, batch B)
+	},
 }
 
 // hook answers a command a later batch implements. It is never sent to
@@ -208,9 +204,8 @@ func (e *Engine) runControl(ctx context.Context, j cmdJob, cs *convState) {
 			e.reply(j, pathHintText(j.text), nil)
 			return
 		}
-		// HOOK(batch B): v0.1.20 forwards this to a Codex question in the
-		// control chat. Until then it answers as v0.1.20's
-		// unknownControlCommandMessage does for text without a prefix.
+		// Questions for Codex never get here (control_qa.go); empty text
+		// does (v0.1.20 runControlFallback: the help).
 		e.reply(j, controlHelpText, nil)
 		return
 	}
@@ -251,23 +246,6 @@ func unknownWorkText(p parsed) string {
 		return sessionHelpText
 	}
 	return fmt.Sprintf("unknown work chat command: `%s`\n\n%s", p.name, sessionHelpText)
-}
-
-// controlCancelText is v0.1.20's answer to a control-chat cancel when no
-// control question runs.
-func controlCancelText(arg string) string {
-	first, _ := splitBody(arg)
-	switch first {
-	case "":
-		return "usage: `helper cancel last`, `helper cancel queued`, `helper cancel running`, `helper cancel all`, or `helper cancel <turn-id>`\n\nThese commands apply to the current Control chat Codex question."
-	case "last", "all":
-		return "no running or queued turn is available to cancel in this control chat."
-	case "queued":
-		return "no queued turn is available to cancel in this control chat."
-	case "running":
-		return "no running turn is available to cancel in this control chat."
-	}
-	return "turn not found in this control chat: " + strings.TrimSpace(arg)
 }
 
 // cmdCloseChat closes a work chat (`helper close`, v0.1.20 B:8007): it is

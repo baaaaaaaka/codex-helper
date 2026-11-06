@@ -233,9 +233,18 @@ func (s *server) dispatch(msg message) (any, *rpcError) {
 		for _, e := range []string{"low", "medium", "high"} {
 			efforts = append(efforts, map[string]any{"reasoningEffort": e, "description": e})
 		}
+		// A second, smaller model (gap batch B: `model switch|fork`,
+		// `default model set`, effort reconciliation).
+		small := []any{}
+		for _, e := range []string{"low", "medium"} {
+			small = append(small, map[string]any{"reasoningEffort": e, "description": e})
+		}
 		return map[string]any{"data": []any{map[string]any{
 			"id": "gpt-5-codex", "model": "gpt-5-codex", "displayName": "GPT-5-Codex", "description": "e2e",
 			"isDefault": true, "supportedReasoningEfforts": efforts, "defaultReasoningEffort": "medium",
+		}, map[string]any{
+			"id": "gpt-5-mini", "model": "gpt-5-mini", "displayName": "GPT-5-Mini", "description": "e2e",
+			"isDefault": false, "supportedReasoningEfforts": small, "defaultReasoningEffort": "low",
 		}}, "nextCursor": nil}, nil
 	case "thread/start":
 		now := time.Now().Unix()

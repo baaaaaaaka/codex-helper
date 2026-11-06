@@ -1,4 +1,4 @@
-# CMD-SKILLS: `skills` lists skill subscriptions; push/remove point to the local CLI
+# CMD-SKILLS: `skills` lists skill subscriptions; push reviews in the chat; remove points to the local CLI
 # cxp black-box transcript; volatile values are numbered placeholders
 
 == chat <chat:1> "s001 · skills"
@@ -34,7 +34,16 @@
    | <p>helper skills push</p>
 -- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Use the local <code>cxp skills push</code> command for this, so sign-in prompts and confirmations happen in your terminal.</p>
+   | <p>No local skill changes to push.</p>
+-- <msg:7> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper skills remove demo</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper skills remove demo</p>
+-- <msg:8> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Use the local <code>cxp skills remove</code> command for this, so sign-in prompts and confirmations happen in your terminal.</p>
 
 == chat <chat:2> "🏠 Codex Control - e2ehost"
    type: meeting; members: owner

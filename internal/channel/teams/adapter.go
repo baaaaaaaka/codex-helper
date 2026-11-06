@@ -342,3 +342,18 @@ func SanitizeTopic(topic string) string {
 }
 
 var _ channel.Channel = (*Adapter)(nil)
+
+// PayloadText is the plain text of a stored part body (a chatMessage
+// payload): the control chat's Q&A history (gap batch B) lists the
+// helper's posts as text.
+func (a *Adapter) PayloadText(body string) string {
+	var m struct {
+		Body struct {
+			Content string `json:"content"`
+		} `json:"body"`
+	}
+	if err := json.Unmarshal([]byte(body), &m); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(plainText(m.Body.Content))
+}

@@ -222,9 +222,12 @@ func (e *Engine) cmdNew(ctx context.Context, j cmdJob, arg string) {
 		if err != nil {
 			return err
 		}
-		th := store.Thread{ConvID: id, Cwd: dir}
-		if req.model != "" {
-			th.Model, th.ModelSource = req.model, sourceUser
+		th, err := newChatThread(tx, id, dir) // the global defaults (defaults.go, batch B)
+		if err != nil {
+			return err
+		}
+		if req.model != "" { // `new --model` (batch A)
+			th.Model, th.ModelSource = selector(req.model), modelSrcChatOverride
 		}
 		if err := tx.Bind(th); err != nil {
 			return err

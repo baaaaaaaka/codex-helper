@@ -73,7 +73,15 @@
    | <p>helper model provider</p>
 -- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Unknown model <code>provider</code>. Send <code>helper model list</code> to see the models.</p>
+   | <p>Unknown model command <code>provider</code>. Third-party model setup was removed from this helper; it uses the Codex models of the signed-in account.</p>
+   | <p>Work chat model commands:</p>
+   | <ul><li><code>model status</code> - show this chat&#39;s pinned profile</li>
+   | <li><code>model switch &lt;name&gt;</code> - switch this chat while preserving its Codex thread</li>
+   | <li><code>model reset</code> - switch this chat to the global default</li>
+   | <li><code>model fork &lt;name&gt;</code> - create a new Work chat with another profile</li>
+   | <li><code>model list</code> - show this chat&#39;s effective model first, then verified profiles</li>
+   | <li><code>effort list|status|set|reset</code> - inspect or change this chat&#39;s effort</li>
+   | </ul>
 -- <msg:9> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper model catalog</p>
@@ -82,7 +90,15 @@
    | <p>helper model catalog</p>
 -- <msg:10> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Unknown model <code>catalog</code>. Send <code>helper model list</code> to see the models.</p>
+   | <p>Unknown model command <code>catalog</code>. Third-party model setup was removed from this helper; it uses the Codex models of the signed-in account.</p>
+   | <p>Work chat model commands:</p>
+   | <ul><li><code>model status</code> - show this chat&#39;s pinned profile</li>
+   | <li><code>model switch &lt;name&gt;</code> - switch this chat while preserving its Codex thread</li>
+   | <li><code>model reset</code> - switch this chat to the global default</li>
+   | <li><code>model fork &lt;name&gt;</code> - create a new Work chat with another profile</li>
+   | <li><code>model list</code> - show this chat&#39;s effective model first, then verified profiles</li>
+   | <li><code>effort list|status|set|reset</code> - inspect or change this chat&#39;s effort</li>
+   | </ul>
 
 == chat <chat:2> "🏠 Codex Control - e2ehost"
    type: meeting; members: owner

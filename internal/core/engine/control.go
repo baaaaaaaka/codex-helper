@@ -224,6 +224,10 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 		if err != nil {
 			return err
 		}
+		fork, err := modelForkOf(tx, id) // batch B: `model fork` (modelcmds.go)
+		if err != nil {
+			return err
+		}
 		switch {
 		case inbox:
 			// Nothing is announced in or about the inbox.
@@ -240,6 +244,10 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 			}
 		case imported:
 			// Its notices are queued with the conversation (import.go).
+		case fork.Src != 0: // batch B
+			if err := e.announceModelFork(tx, id, label, cwd, info.URL, fork); err != nil {
+				return err
+			}
 		case intro != "":
 			if err := e.enqueueNotice(tx, id, "ready:"+label, intro); err != nil {
 				return err
