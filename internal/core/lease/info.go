@@ -28,7 +28,7 @@ type Info struct {
 func Read(anchor string) (Info, error) {
 	p := newPaths(anchor)
 	var in Info
-	if _, err := os.Stat(p.disabled()); err == nil {
+	if KillSwitch(p.dir) {
 		in.Disabled = true
 	}
 	if _, err := os.Stat(p.records); err == nil {

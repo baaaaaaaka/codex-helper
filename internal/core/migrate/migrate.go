@@ -55,6 +55,9 @@ const (
 	MarkerName = "MIGRATED-TO-core.sqlite"
 	// ReportName is the report written next to the target.
 	ReportName = "migration-report.txt"
+	// OldHelperGuardName is the file that keeps v0.1.22-rc.59 from running
+	// on a scope directory this version converts (writeOldHelperGuard).
+	OldHelperGuardName = ".migration-cleanup.json"
 )
 
 // Run converts opt.Source. It returns the report even on failure when one
@@ -101,6 +104,11 @@ func Run(opt Options) (*Report, error) {
 		return nil, err
 	}
 	defer unlock()
+	if !opt.DryRun {
+		if note := writeOldHelperGuard(opt.Source); note != "" {
+			rep.note("%s", note)
+		}
+	}
 
 	snapDir := filepath.Join(opt.Out, "migrate.tmp")
 	l, err := openSource(opt.Source, version, dbPath, opt.Immutable, snapDir)
@@ -338,4 +346,51 @@ LEFT JOIN threads t ON t.conv_id = c.id WHERE c.label = ? AND c.kind = 'work'`, 
 		add("turn keys <= 64 chars", maxKey <= 64, fmt.Sprintf("max %d", maxKey))
 		return nil
 	})
+}
+
+// oldHelperGuardBody is the guard's content. rc.59 reads the file before it
+// opens its store (InspectRuntimeStoreForScopeWithRegistry, scope_runtime.go)
+// and refuses to start with `invalid Teams migration cleanup source "<the
+// source_path below>"`, because the value does not name a scopes/*/state.json;
+// a service child exits and its supervisor retries without ever opening the
+// store or posting. The text is what an owner then sees in rc.59's log.
+const oldHelperGuardBody = `{"source_path":"this Teams store was converted to core.sqlite by a newer cxp; ` +
+	`v0.1.22-rc.59 must not run on it (it would answer chats the new helper answers). ` +
+	`Upgrade this host. To roll back instead, stop the new helper on every host and delete this file and MIGRATED-TO-core.sqlite"}` + "\n"
+
+// writeOldHelperGuard keeps v0.1.22-rc.59 helpers on other hosts that share
+// this home from serving the old store next to the converted one, which
+// would duplicate every answer (TAKEOVER-REPORT §9, drill 8). It runs before
+// the live-writer check, so an rc.59 that starts while the conversion runs
+// is refused too, and it is never removed: rolling back means deleting it.
+// It only adds a file beside the old store, whose data stays unchanged.
+//
+// It applies to rc.59's scope directories (<state>/teams/scopes/<id>); a
+// file of that name rc.59 wrote itself (a pending cleanup) is left alone.
+// It returns a note for the report when it could not guard.
+func writeOldHelperGuard(dir string) string {
+	if filepath.Base(filepath.Dir(filepath.Clean(dir))) != "scopes" {
+		return ""
+	}
+	path := filepath.Join(dir, OldHelperGuardName)
+	if raw, err := os.ReadFile(path); err == nil {
+		if string(raw) == oldHelperGuardBody {
+			return ""
+		}
+		return fmt.Sprintf("%s exists (written by v0.1.22-rc.59) and was kept: an rc.59 helper on another host is not kept from this store", OldHelperGuardName)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(oldHelperGuardBody), 0o600); err != nil {
+		return fmt.Sprintf("could not write %s: %v", OldHelperGuardName, err)
+	}
+	if err := syncFile(tmp); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Sprintf("could not write %s: %v", OldHelperGuardName, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Sprintf("could not write %s: %v", OldHelperGuardName, err)
+	}
+	_ = syncDir(dir)
+	return ""
 }
