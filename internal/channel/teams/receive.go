@@ -267,7 +267,29 @@ func (a *Adapter) convert(chat string, gm graphMessage, owner string) channel.In
 		return m
 	}
 	m.Files, m.Quotes = a.inboundFiles(chat, gm)
+	m.Attachments = attachmentTypes(gm)
 	return m
+}
+
+// attachmentTypes lists a message's attachments as v0.1.20's
+// unsupportedControlAttachments did: the attachments in Graph order, then
+// each inline hosted content of the body, else a bare placeholder.
+func attachmentTypes(gm graphMessage) []string {
+	var types []string
+	for _, at := range gm.Attachments {
+		types = append(types, strings.TrimSpace(at.ContentType))
+	}
+	seen := map[string]bool{}
+	for _, sm := range hostedRE.FindAllStringSubmatch(gm.Body.Content, -1) {
+		if !seen[sm[1]] {
+			seen[sm[1]] = true
+			types = append(types, "Teams-hosted inline content")
+		}
+	}
+	if len(types) == 0 && strings.Contains(strings.ToLower(gm.Body.Content), "<attachment") {
+		types = append(types, "Teams attachment placeholder")
+	}
+	return types
 }
 
 func (a *Adapter) inboundFiles(chat string, gm graphMessage) ([]channel.FileRef, []channel.Quote) {

@@ -181,6 +181,12 @@ type InboundMsg struct {
 	Marker        string // hidden helper marker found in the message ("" if none or stripped)
 	Files         []FileRef
 	Quotes        []Quote
+	// Attachments names everything the message carries besides its text,
+	// as the service types it, in v0.1.20's order: each attachment's
+	// content type (files, quotes, media cards, cards), then one
+	// "Teams-hosted inline content" per inline image of the body. The
+	// control chat, which takes text only, refuses a message by these.
+	Attachments []string
 }
 
 // Quote is a message quoted or forwarded inside an inbound message.
