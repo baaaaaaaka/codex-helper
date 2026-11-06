@@ -393,8 +393,8 @@ func (e *Engine) read(ctx context.Context, id int64) {
 		if !cs.readOnce && cs.firstRead != nil {
 			cs.readOnce = true
 			close(cs.firstRead) // reconcileTurn waits for it
-			if id == e.controlID {
-				e.runnerAll = true // turns wait for it (controlReadLocked)
+			if id == e.controlID || e.tookOver != "" {
+				e.runnerAll = true // turns wait for it (readyLocked)
 				wake(e.runnerWake)
 			}
 		}
@@ -511,7 +511,8 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 		activity bool
 		hasFiles bool
 		stg      *admitStage
-		by       string // a sibling's takeover notice names this host (takeover.go)
+		by       string  // a sibling's takeover notice names this host (takeover.go)
+		closed   []int64 // turns the copy left open, closed by rule 2 (takeover.go)
 	)
 	inbox := id == e.inboxID && id != 0
 	// The first read after taking over by a copy: requests the other copy
@@ -519,7 +520,7 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 	moved := backlog && e.tookOver != "" && !inbox
 	var cancels []string
 	err := e.update(func(tx *store.Tx) error {
-		jobs, newTurns, becameGr, trip, activity, hasFiles, cancels, by = nil, false, false, false, false, false, nil, ""
+		jobs, newTurns, becameGr, trip, activity, hasFiles, cancels, by, closed = nil, false, false, false, false, false, nil, "", nil
 		var sibling time.Time // the newest sibling post of the window
 		var skipped []string
 		stg = &admitStage{recent: map[string]recentPrompt{}} // a retried attempt starts over
@@ -563,6 +564,24 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 				}
 			}
 			cls = append(cls, c)
+		}
+		if moved && !sibling.IsZero() {
+			// The turns the copy left open were taken before the copy:
+			// the other copy, which posted here since, finishes them.
+			open, err := tx.OpenTurnsOf(id)
+			if err != nil {
+				return err
+			}
+			for _, tr := range open {
+				in, _, err := tx.Inbound(tr.InboundID)
+				if err != nil {
+					return err
+				}
+				skipped, closed = append(skipped, in.Body), append(closed, tr.ID)
+				if err := e.closeCopied(tx, store.Admitted{TurnID: tr.ID}); err != nil {
+					return err
+				}
+			}
 		}
 		msgs := make([]store.InboundMsg, 0, len(cls))
 		for i := range cls {
@@ -660,6 +679,9 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 		return nil
 	}
 	e.mu.Lock()
+	for _, t := range closed {
+		delete(e.orphans, t) // settled: reconcileTurn leaves it
+	}
 	cs.cursor, cs.seeded, cs.live = w.Cursor, true, true
 	if becameGr {
 		cs.group = true

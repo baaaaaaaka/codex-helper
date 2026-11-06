@@ -68,8 +68,10 @@ func (e *Engine) announceTakeover() error {
 //     nothing.
 //  2. The new copy does not redo the old copy's work: in the first read of
 //     each chat after taking over by a copy, a request followed by a sibling
-//     post was seen by the other copy. It is closed without running, and one
-//     notice in that chat lists what was skipped.
+//     post was seen by the other copy. It is closed without running, as is
+//     a turn the copied store left open in a chat with a sibling post, and
+//     one notice in that chat lists what was skipped. Turns of a chat, and
+//     the reconciling of the ones left open, wait for that read.
 
 // supersededBy returns the host named by a sibling's takeover notice ("" for
 // any other message, or a notice naming this host).
@@ -101,12 +103,13 @@ func (e *Engine) standDown(host string) {
 	e.fail(store.ErrDisabled)
 }
 
-// controlReadLocked reports whether turns may start: not before this
+// readyLocked reports whether a turn of cs may start: not before this
 // process read the control chat once, where another copy's takeover notice
-// stops an old copy that starts again (caller holds e.mu).
-func (e *Engine) controlReadLocked() bool {
-	c := e.convs[e.controlID]
-	return c == nil || c.readOnce || !readStateLocked(c)
+// stops an old copy that starts again; after a takeover, not before it read
+// cs once, where rule 2 closes what the other copy took (caller holds e.mu).
+func (e *Engine) readyLocked(cs *convState) bool {
+	read := func(c *convState) bool { return c == nil || c.readOnce || !readStateLocked(c) }
+	return read(e.convs[e.controlID]) && (e.tookOver == "" || read(cs))
 }
 
 // closeCopied closes a request the other copy already took (rule 2).

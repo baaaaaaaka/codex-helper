@@ -173,3 +173,71 @@ func TestMoveGuardNewCopySkipsTakenRequests(t *testing.T) {
 		t.Fatalf("%d notices in an untouched chat", n)
 	}
 }
+
+// Rule 2 also covers the turns the copied store left open: in a chat where
+// the other copy posted since, they are its to finish, and the new copy
+// neither runs nor settles them; elsewhere they are settled as after any
+// restart.
+func TestMoveGuardNewCopyLeavesTurnsTheCopyLeftOpen(t *testing.T) {
+	host := "host-a"
+	r := newRig(t, func(c *Config) { c.Host, c.TakeoverWhy = host, "stale" })
+	work := r.newWork(t.TempDir())
+	lone := r.newWork(t.TempDir())
+	sib := r.siblingMarkers()
+	release := make(chan struct{})
+	r.ag.mu.Lock()
+	r.ag.block["copied long"] = release
+	r.ag.block["lone long"] = release
+	r.ag.mu.Unlock()
+	r.ch.PostUser(work, "copied long job")
+	r.ch.PostUser(work, "copied queued")
+	r.ch.PostUser(lone, "lone long job")
+	r.wait("turns open in the store", func() bool {
+		turns, _ := r.st.OpenTurns()
+		running := 0
+		for _, tr := range turns {
+			if tr.State == store.TurnRunning {
+				running++
+			}
+		}
+		return len(turns) == 3 && running == 2
+	})
+	r.stop()
+	close(release)
+	r.ag.mu.Lock()
+	for _, req := range r.ag.runs {
+		r.ag.lookup[req.TurnKey] = TurnOutcome{Status: StatusInterrupted}
+		if strings.Contains(req.Text, "copied long") { // Codex finished it: the copied session has the answer
+			r.ag.lookup[req.TurnKey] = TurnOutcome{Status: StatusCompleted, Final: "ANSWER to copied long job (found)"}
+		}
+	}
+	r.ag.mu.Unlock()
+	// The old copy went on and answered in the work chat.
+	r.ch.PostOtherHelper(work, "🤖 Codex: ANSWER to copied long job", sib("1"))
+
+	host = "host-b"
+	r.start()
+	r.wait("notice and settled turn", func() bool {
+		return len(r.own(work, "Not run here")) == 1 &&
+			len(r.own(lone, "Codex request interrupted because the Teams helper stopped")) == 1
+	})
+	r.ch.PostUser(work, "next prompt")
+	r.wait("next answer", func() bool { return len(r.own(work, "ANSWER to next prompt")) == 1 })
+	time.Sleep(300 * time.Millisecond)
+	if n := len(r.own(work, "ANSWER to copied long job (found)")); n != 0 {
+		t.Fatalf("the found answer was posted %d times", n)
+	}
+	if n := r.ag.calls("copied queued"); n != 0 {
+		t.Fatalf("the queued turn ran %d times", n)
+	}
+	if n := len(r.own(work, "interrupted")); n != 0 {
+		t.Fatalf("%d interruption notices in the work chat", n)
+	}
+	note := r.own(work, "Not run here")[0].Text
+	if !strings.HasSuffix(note, "send it again.\n\n- copied long job\n- copied queued") {
+		t.Fatalf("notice %q", note)
+	}
+	if turns, _ := r.st.OpenTurns(); len(turns) != 0 {
+		t.Fatalf("open turns %+v", turns)
+	}
+}
