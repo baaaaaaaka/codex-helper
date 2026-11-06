@@ -105,7 +105,7 @@ func (f *FakeCodex) Handler() http.Handler {
 			case <-r.Context().Done():
 			}
 		}
-		plan := fakecodex.Plan{Seq: seq, Commentary: b.Commentary, Crash: b.Crash, HoldCompletion: b.HoldCompletion, SurviveHelper: b.SurviveHelper}
+		plan := fakecodex.Plan{Seq: seq, Commentary: b.Commentary, MoreCommentary: b.MoreCommentary, Unphased: b.Unphased, Exec: b.Exec, Crash: b.Crash, HoldCompletion: b.HoldCompletion, SurviveHelper: b.SurviveHelper}
 		if b.FailKind == FailActiveWriter {
 			err := behaviorErr(b)
 			plan.RejectStart = err.Error()

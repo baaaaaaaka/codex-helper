@@ -71,6 +71,15 @@ type CodexBehavior struct {
 
 	// Commentary is streamed as a commentary agent message before the final.
 	Commentary string
+	// MoreCommentary is streamed after Commentary, one message each.
+	MoreCommentary []string
+	// Exec are shell commands the turn runs (sh -c, in the turn's cwd, with
+	// the app-server's environment) before it answers, as Codex's shell
+	// tool would. Fake app-server only.
+	Exec []string
+	// Unphased streams every agent message, the final included, without a
+	// phase (Codex does for models without message phases).
+	Unphased bool
 	// FailKind selects how Err is surfaced: "" (turn fails with Err's
 	// message), FailCapacity (turn fails with the model-capacity error),
 	// FailRateLimited, or FailActiveWriter (turn/start is rejected: another

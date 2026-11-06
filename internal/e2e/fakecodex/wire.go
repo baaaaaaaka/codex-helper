@@ -65,6 +65,15 @@ type Plan struct {
 	// RejectStart, if set, is returned as the JSON-RPC error of turn/start.
 	RejectStart string `json:"rejectStart,omitempty"`
 	Commentary  string `json:"commentary,omitempty"`
+	// MoreCommentary is streamed after Commentary, one agent message each.
+	MoreCommentary []string `json:"moreCommentary,omitempty"`
+	// Exec are shell commands (sh -c) the turn runs before it answers, in
+	// the turn's cwd with the app-server's environment, as Codex's shell
+	// tool would. Each gets 60 s; output goes to the app-server log.
+	Exec []string `json:"exec,omitempty"`
+	// Unphased sends every agent message (commentary and final) without a
+	// phase, as Codex streams them for models without message phases.
+	Unphased bool `json:"unphased,omitempty"`
 	// Compactions is how many context compactions the turn reports before
 	// its commentary, each as a contextCompaction item and the legacy
 	// thread/compacted notification (as Codex does).
