@@ -61,8 +61,8 @@ func (idleAgent) Lookup(context.Context, int64, string, string) (engine.TurnOutc
 }
 func (idleAgent) Interrupt(context.Context, int64) error { return nil }
 func (idleAgent) Kill(int64)                             {}
-func (idleAgent) Fork(context.Context, int64, string, string, string) (string, error) {
-	return "", errors.New("no fork")
+func (idleAgent) Fork(context.Context, int64, string, string, string) (engine.Forked, error) {
+	return engine.Forked{}, errors.New("no fork")
 }
 func (idleAgent) Models(context.Context) ([]engine.Model, error) { return nil, nil }
 func (idleAgent) Maintain()                                      {}

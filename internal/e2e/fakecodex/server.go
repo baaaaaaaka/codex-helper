@@ -746,6 +746,11 @@ func (s *server) fork(p map[string]any) (any, *rpcError) {
 			break
 		}
 	}
+	// Codex 0.166 writes the child's rollout at once, with only its
+	// session_meta (no copy of the parent's records: the history is read
+	// through thread/read), and names it in the response (realcodex probe
+	// TestRealCodexForkRollout).
+	s.rolloutLocked(child)
 	s.mu.Unlock()
 	if err := s.cfg.Store.Save(child); err != nil {
 		return nil, invalid("thread/fork: %v", err)

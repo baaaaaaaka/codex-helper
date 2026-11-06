@@ -26,7 +26,7 @@ type Agent interface {
 	// Kill ends the app-server of convID at once (its running turn is lost).
 	Kill(convID int64)
 	// Fork forks threadID after lastTurnID ("" = everything) into a new thread.
-	Fork(ctx context.Context, convID int64, threadID, lastTurnID, cwd string) (string, error)
+	Fork(ctx context.Context, convID int64, threadID, lastTurnID, cwd string) (Forked, error)
 	// Models lists the models Codex offers.
 	Models(ctx context.Context) ([]Model, error)
 	// Maintain reaps idle app-servers.
@@ -34,6 +34,14 @@ type Agent interface {
 	// Close ends every app-server (running turns are lost and reconciled at
 	// the next start).
 	Close()
+}
+
+// Forked is the new thread of a fork: its id and, when Codex names it, its
+// rollout file (it may already hold a copy of the parent's history, as
+// Codex 0.133-0.145 wrote it, or only its own session_meta, as 0.166).
+type Forked struct {
+	ThreadID string
+	Path     string
 }
 
 // TurnRequest is one turn to run.

@@ -167,9 +167,8 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 		return false
 	}
 	e.mu.Lock()
-	title, kind, label, state, cwd, forkParent := cs.title, cs.kind, cs.label, cs.state, cs.cwd, cs.forkParent
+	title, kind, label, state, cwd := cs.title, cs.kind, cs.label, cs.state, cs.cwd
 	retry := e.now().Before(cs.nextRead) && !cs.nextRead.IsZero() && cs.failures > 0
-	intro := e.intro[id]
 	e.mu.Unlock()
 	if state != store.ConvCreating {
 		e.mu.Lock()
@@ -248,13 +247,9 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 			if err := e.announceModelFork(tx, id, label, cwd, info.URL, fork); err != nil {
 				return err
 			}
-		case intro != "":
-			if err := e.enqueueNotice(tx, id, "ready:"+label, intro); err != nil {
-				return err
-			}
-			if err := e.enqueueControlCreated(tx, id, label, info.URL); err != nil {
-				return err
-			}
+		case isForkChild(tx.Meta, id):
+			// `helper fork`: its notices were queued with the
+			// conversation; the link follows its history (fork.go).
 		default:
 			// `new`: v0.1.20's chat-created notice, then its ready anchor.
 			if err := e.enqueueNotice(tx, id, "ready:"+label, textWorkChatCreated(label, cwd)); err != nil {
@@ -264,13 +259,6 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 				return err
 			}
 			if err := e.enqueueControlCreated(tx, id, label, info.URL); err != nil {
-				return err
-			}
-		}
-		// A fork's parent gets its link once (F-WRK-10 step 4; batch A
-		// moves this after the history import).
-		if forkParent != 0 && discovered == "" && !inbox && kind != store.KindControl && e.conv(forkParent) != nil {
-			if err := e.enqueueNotice(tx, forkParent, fmt.Sprintf("fork-done:%d", id), textForkComplete(info.URL)); err != nil {
 				return err
 			}
 		}
@@ -289,7 +277,6 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 		cs.nextRead = e.now().Add(e.t.SafetyRead)
 	}
 	cs.lastActivity = e.now()
-	delete(e.intro, id)
 	e.mu.Unlock()
 	if inbox {
 		wake(e.registryWake) // the card can be published now

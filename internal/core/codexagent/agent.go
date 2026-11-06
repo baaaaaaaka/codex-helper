@@ -267,17 +267,17 @@ func (a *Agent) Interrupt(ctx context.Context, convID int64) error {
 func (a *Agent) Kill(convID int64) { a.pool.Drop(key(convID)) }
 
 // Fork forks threadID after lastTurnID into a new thread.
-func (a *Agent) Fork(ctx context.Context, convID int64, threadID, lastTurnID, cwd string) (string, error) {
+func (a *Agent) Fork(ctx context.Context, convID int64, threadID, lastTurnID, cwd string) (engine.Forked, error) {
 	lease, err := a.pool.Acquire(ctx, key(convID), a.serverConfig(cwd))
 	if err != nil {
-		return "", err
+		return engine.Forked{}, err
 	}
 	defer lease.Release()
 	th, err := lease.Server().ThreadFork(ctx, threadID, lastTurnID, cwd)
 	if err != nil {
-		return "", err
+		return engine.Forked{}, err
 	}
-	return th.ID, nil
+	return engine.Forked{ThreadID: th.ID, Path: th.Path}, nil
 }
 
 // Models lists the models Codex offers (any running or a fresh server).

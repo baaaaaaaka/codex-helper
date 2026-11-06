@@ -137,8 +137,8 @@ func (a *fakeAgent) Interrupt(_ context.Context, conv int64) error {
 }
 
 func (a *fakeAgent) Kill(int64) {}
-func (a *fakeAgent) Fork(context.Context, int64, string, string, string) (string, error) {
-	return "", errors.New("no fork")
+func (a *fakeAgent) Fork(context.Context, int64, string, string, string) (Forked, error) {
+	return Forked{}, errors.New("no fork")
 }
 func (a *fakeAgent) Models(context.Context) ([]Model, error) { return nil, nil }
 func (a *fakeAgent) Maintain()                               {}

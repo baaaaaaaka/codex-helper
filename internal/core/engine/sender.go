@@ -453,7 +453,12 @@ func (e *Engine) send(ctx context.Context, r store.Outbox, chat, token string, f
 	case err == nil:
 		e.rememberOwnPost(r.ConvID, sent.ID)
 		e.noteFinalSent(r.ConvID, r.Kind, sent.Time) // F-TRN-1 (rename.go)
-		if err := e.update(func(tx *store.Tx) error { return tx.MarkSent(r.ID, sent.ID) }); err != nil && !errors.Is(err, store.ErrState) {
+		if err := e.update(func(tx *store.Tx) error {
+			if err := tx.MarkSent(r.ID, sent.ID); err != nil {
+				return err
+			}
+			return e.forkSettled(tx, r) // fork.go: a fork's marker releases its link
+		}); err != nil && !errors.Is(err, store.ErrState) {
 			e.logf("mark sent %d: %v", r.ID, err)
 		}
 		e.forgetFailures(r.ID)
@@ -478,7 +483,12 @@ func (e *Engine) send(ctx context.Context, r store.Outbox, chat, token string, f
 		e.requeue(r.ID, at)
 	case errors.As(err, &rej) && rej.Permanent:
 		e.logf("send %s to conversation %d rejected permanently: %v; dropped", r.DeliveryKey, r.ConvID, err)
-		if err := e.update(func(tx *store.Tx) error { return tx.Drop(r.ID, clipText(err.Error(), 200)) }); err != nil {
+		if err := e.update(func(tx *store.Tx) error {
+			if err := tx.Drop(r.ID, clipText(err.Error(), 200)); err != nil {
+				return err
+			}
+			return e.forkSettled(tx, r) // fork.go
+		}); err != nil {
 			e.logf("drop %d: %v", r.ID, err)
 		}
 		e.forgetFailures(r.ID)
@@ -708,7 +718,10 @@ func (e *Engine) resolveOne(ctx context.Context, id int64) {
 			}
 		}
 		if found != "" {
-			return tx.MarkSent(r.ID, found)
+			if err := tx.MarkSent(r.ID, found); err != nil {
+				return err
+			}
+			return e.forkSettled(tx, r) // fork.go
 		}
 		return nil
 	})
@@ -764,6 +777,9 @@ func (e *Engine) resolveOne(ctx context.Context, id int64) {
 			}
 		}
 		if err := tx.Drop(r.ID, "not found by read-back"); err != nil {
+			return err
+		}
+		if err := e.forkSettled(tx, r); err != nil { // fork.go
 			return err
 		}
 		if r.Kind == store.OutAck || strings.HasPrefix(r.DeliveryKey, "unconfirmed:") {

@@ -55,7 +55,7 @@ const (
 	importReopen = "reopen" // `continue` on a linked chat with unread history
 	importSync   = "sync"   // `helper publish-history`
 	importFull   = "full"   // `helper publish-history full`
-	importQuiet  = "quiet"  // no completion notices (batch E fork history)
+	importFork   = "fork"   // a fork's history: the marker, then the link (fork.go)
 )
 
 // importJob is one queued or running import.
@@ -91,6 +91,11 @@ type importState struct {
 	convs   map[int64]bool // conversations with a job (a cache: the store decides)
 	pending atomic.Bool    // a job waits to be applied
 	retryAt time.Time      // mirror goroutine only
+	// forking counts forks between thread/fork and their transaction;
+	// sweep asks the mirror goroutine to remove retired fork snapshots
+	// (fork.go).
+	forking atomic.Int32
+	sweep   atomic.Bool
 }
 
 var errImportRunning = errors.New("history import is still running")
@@ -135,6 +140,7 @@ func (e *Engine) importLoad() {
 		return
 	}
 	e.imp.loaded = true
+	e.imp.sweep.Store(true) // fork snapshots left by a crash (fork.go)
 	e.imp.convs = map[int64]bool{}
 	for _, j := range jobs {
 		e.imp.convs[j.Conv] = true
@@ -154,10 +160,11 @@ func (e *Engine) importIndexed(conv int64) bool {
 // conversation: errImportRunning when it has one) and returns its id.
 // After tx commits, call importQueued(job.Conv).
 //
-// This is the entry point for other features (batch E fork history, #20):
+// This is the entry point for other features (the fork's history, #20,
+// fork.go):
 //
-//	id, err := e.queueImport(tx, importJob{Conv: conv, Kind: importQuiet,
-//	        Thread: thread, Path: rollout, Rewind: true, KeepTeams: true})
+//	id, err := e.queueImport(tx, importJob{Conv: conv, Kind: importFork,
+//	        Thread: thread, Path: rollout, Rewind: true, KeepTeams: true, NS: ns})
 //	... after commit: e.importQueued(conv)
 //
 // The records of the rollout are then mirrored into conv as catch-up,
@@ -233,6 +240,9 @@ func (e *Engine) importJobOf(conv int64) (importJob, bool) {
 // start of mirrorPoll). A job whose rollout is not found yet is retried
 // with discovery.
 func (e *Engine) importApply(ctx context.Context) {
+	if e.imp.sweep.Swap(false) {
+		e.forkSweep()
+	}
 	if !e.imp.pending.Load() {
 		return
 	}
@@ -552,6 +562,8 @@ func (e *Engine) importFinish(tx *store.Tx, j *importJob) (bool, error) {
 			return false, err
 		}
 		err = e.enqueueNotice(tx, j.Conv, fmt.Sprintf("import:%d:full", j.ID), textFullHistoryDone)
+	case importFork:
+		err = e.forkHistoryDone(tx, j)
 	}
 	return err == nil, err
 }
@@ -568,10 +580,10 @@ func (e *Engine) importChatCreated(tx *store.Tx, id int64, label, url string) (b
 		return false, err
 	}
 	for i, j := range jobs {
-		if j.Conv != id || j.Kind != importNew {
+		if j.Conv != id || (j.Kind != importNew && j.Kind != importFork) {
 			continue
 		}
-		if e.controlID != 0 {
+		if e.controlID != 0 && j.Kind == importNew {
 			if err := e.enqueueNotice(tx, e.controlID, fmt.Sprintf("import:%d:progress", j.ID), textImportPreparing(label, url, false)); err != nil {
 				return true, err
 			}

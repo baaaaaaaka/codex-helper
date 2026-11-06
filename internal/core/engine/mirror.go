@@ -558,7 +558,6 @@ func (e *Engine) newRollout(ctx context.Context, f transcript.Found, atStart boo
 		closed = cs.state == store.ConvClosed || cs.kind == store.KindControl // batch B: control Q&A
 		forked = cs.forkParent != 0
 	}
-	forked = forked || e.forkThreads[meta.ID]
 	delegated := e.delegThreads[meta.ID]
 	e.mu.Unlock()
 	if delegated {
@@ -567,15 +566,22 @@ func (e *Engine) newRollout(ctx context.Context, f transcript.Found, atStart boo
 		src.State = store.SrcIgnored
 		return src, true
 	}
+	if !bound && e.imp.forking.Load() > 0 {
+		// Perhaps the child of a fork not bound yet: look again on the
+		// next pass (fork.go).
+		return store.TranscriptSource{}, false
+	}
 	switch {
 	case bound && closed:
 		src.State = store.SrcIgnored
 		return src, true
 	case bound:
 		src.State, src.ConvID = store.SrcTracking, conv
-		if forked {
-			// A fork's rollout starts with a copy of the parent's history,
-			// which is already in the parent chat.
+		if forked && !isForkChild(e.st.Meta, conv) {
+			// A fork made before this core (converted): its rollout may
+			// start with a copy of the parent's history, which is already
+			// in the parent chat. A fork of this core recorded where its
+			// rollout starts (fork.go), or it starts with its own records.
 			src.Offset = f.Info.Size
 		}
 		e.track(src, catchUpFrom(f.Info, atStart || meta.Time.Before(e.mirror.startedAt)))
