@@ -100,26 +100,23 @@ func (s *Store) CodexTurnIDs() ([]string, error) {
 // OutboxCounts returns the number of outbox rows per state that are not
 // sent yet (queued, sending, unknown; `teams service status`).
 func (s *Store) OutboxCounts() (map[string]int, error) {
-	rows, err := s.r.QueryContext(context.Background(), `SELECT state, COUNT(*) FROM outbox WHERE state IN ('queued','sending','unknown') GROUP BY state`)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	out := map[string]int{}
-	for rows.Next() {
-		var st string
-		var n int
-		if err := rows.Scan(&st, &n); err != nil {
-			return nil, err
-		}
-		out[st] = n
-	}
-	return out, rows.Err()
+	return s.countByState(`SELECT state, COUNT(*) FROM outbox WHERE state IN ('queued','sending','unknown') GROUP BY state`)
 }
 
-// TurnCounts returns the number of turns per state (status and stats).
+// TurnCounts returns the number of turns per state (stats).
 func (s *Store) TurnCounts() (map[string]int, error) {
-	rows, err := s.r.QueryContext(context.Background(), `SELECT state, COUNT(*) FROM turns GROUP BY state`)
+	return s.countByState(`SELECT state, COUNT(*) FROM turns GROUP BY state`)
+}
+
+// OpenTurnCounts returns the number of turns per state that are not
+// finished (queued, starting, running; status). It reads only the
+// turns_open index, not the whole table.
+func (s *Store) OpenTurnCounts() (map[string]int, error) {
+	return s.countByState(`SELECT state, COUNT(*) FROM turns WHERE state IN ('queued','starting','running') GROUP BY state`)
+}
+
+func (s *Store) countByState(query string) (map[string]int, error) {
+	rows, err := s.r.QueryContext(context.Background(), query)
 	if err != nil {
 		return nil, err
 	}

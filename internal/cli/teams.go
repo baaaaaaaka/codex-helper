@@ -16,7 +16,6 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/asr"
 	chteams "github.com/baaaaaaaka/codex-helper/internal/channel/teams"
 	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
-	corestore "github.com/baaaaaaaka/codex-helper/internal/core/store"
 )
 
 const (
@@ -352,12 +351,7 @@ func printTeamsControlChat(out io.Writer) error {
 		_, _ = fmt.Fprintln(out, "Teams control chat: none yet (the helper creates it when it first starts: `cxp teams run`)")
 		return nil
 	}
-	st, err := view.openReadOnly()
-	if err != nil {
-		return err
-	}
-	defer st.Close()
-	c, ok, err := teamsControlConversation(st)
+	c, ok, err := teamsStoredControlChat()
 	if err != nil {
 		return err
 	}
@@ -369,24 +363,11 @@ func printTeamsControlChat(out io.Writer) error {
 	if c.Title != "" {
 		_, _ = fmt.Fprintf(out, "Title: %s\n", c.Title)
 	}
-	if c.ExtURL != "" {
-		_, _ = fmt.Fprintf(out, "Link: %s\n", c.ExtURL)
+	if c.URL != "" {
+		_, _ = fmt.Fprintf(out, "Link: %s\n", c.URL)
 	}
 	_, _ = fmt.Fprintln(out, "Send `help` in the control chat for its commands.")
 	return nil
-}
-
-func teamsControlConversation(st *corestore.Store) (corestore.Conversation, bool, error) {
-	convs, err := st.Conversations()
-	if err != nil {
-		return corestore.Conversation{}, false, err
-	}
-	for _, c := range convs {
-		if c.Kind == corestore.KindControl && c.ExtChatID != "" {
-			return c, true, nil
-		}
-	}
-	return corestore.Conversation{}, false, nil
 }
 
 func newTeamsRunCmd(root *rootOptions) *cobra.Command {
@@ -635,16 +616,13 @@ func defaultRunTeamsDoctorLiveCheck(cmd *cobra.Command, root *rootOptions) error
 	}
 	lease.RetireSuspects(cmd.Context(), cmd.ErrOrStderr())
 	_, _ = fmt.Fprintf(out, "Graph auth: ok as %s\n", name)
-	chat := ""
-	if view, err := teamsReadStoreView(); err == nil && view.exists() {
-		if st, err := view.openReadOnly(); err == nil {
-			if c, ok, _ := teamsControlConversation(st); ok {
-				chat = c.ExtChatID
-			}
-			st.Close()
-		}
+	c, ok, cerr := teamsStoredControlChat()
+	chat := c.ChatID
+	if cerr != nil {
+		_, _ = fmt.Fprintf(out, "Graph chat read: skipped (%v)\n", cerr)
+		return nil
 	}
-	if chat == "" {
+	if !ok || chat == "" {
 		_, _ = fmt.Fprintln(out, "Graph chat read: skipped (no control chat yet)")
 		return nil
 	}

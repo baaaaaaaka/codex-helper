@@ -561,6 +561,13 @@ func serveTeamsNewCore(ctx context.Context, out, errOut io.Writer, root *rootOpt
 		case <-runCtx.Done():
 		}
 	}()
+	// The state read-only commands show (`cxp teams status`, `teams
+	// control`, the bootstrap, upgrades): they never open the store while
+	// this helper holds it.
+	publisher := newTeamsStatusPublisher(st, filepath.Dir(anchor), holder.Gen(), host, errOut)
+	published := make(chan struct{})
+	go func() { defer close(published); publisher.run(runCtx) }()
+	defer func() { cancelRun(); <-published }() // before the store closes
 	stamper := &teamsPollStamper{dir: dir, host: host, version: cfg.Version, lastRead: func() time.Time { return e.Snapshot().LastRead }}
 	requests := newTeamsCLIRequests(runCtx, anchor, e, errOut)
 	defer func() { cancelRun(); requests.wait(10 * time.Second) }() // before the store closes

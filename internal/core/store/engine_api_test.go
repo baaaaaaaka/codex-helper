@@ -70,6 +70,16 @@ func TestEngineAdditions(t *testing.T) {
 	if err != nil || counts[TurnQueued] != 1 || counts[TurnCancelled] != 1 {
 		t.Errorf("TurnCounts %v %v", counts, err)
 	}
+	if open, err := s.OpenTurnCounts(); err != nil || open[TurnQueued] != 1 || len(open) != 1 {
+		t.Errorf("OpenTurnCounts %v %v", open, err)
+	}
+	// The status publisher runs it after commits: it must not scan the
+	// whole turns table.
+	var id, parent, unused int
+	var plan string
+	if err := s.r.QueryRow(`EXPLAIN QUERY PLAN SELECT state, COUNT(*) FROM turns WHERE state IN ('queued','starting','running') GROUP BY state`).Scan(&id, &parent, &unused, &plan); err != nil || !strings.Contains(plan, "turns_open") {
+		t.Errorf("OpenTurnCounts plan %q %v", plan, err)
+	}
 	if oc, err := s.OutboxCounts(); err != nil || oc[OutSending] != 1 || oc[OutQueued] != 1 || len(oc) != 2 {
 		t.Errorf("OutboxCounts %v %v", oc, err)
 	}

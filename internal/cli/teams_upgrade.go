@@ -71,16 +71,13 @@ func teamsHelperOwnerLive(now time.Time) (bool, error) {
 	if !view.exists() {
 		return false, nil
 	}
-	st, err := view.openReadOnly()
-	if err != nil {
+	// No lease: no helper of this version holds the store, so it is read
+	// directly (its owner row).
+	s, err := teamsReadStoreDirect(view)
+	if err != nil || !s.ownerOK || s.owner.HeartbeatAt == 0 {
 		return false, err
 	}
-	defer st.Close()
-	o, ok, err := st.OwnerInfo()
-	if err != nil || !ok || o.HeartbeatAt == 0 {
-		return false, err
-	}
-	return now.Sub(time.UnixMilli(o.HeartbeatAt)) < corestore.OwnerStaleAfter, nil
+	return now.Sub(time.UnixMilli(s.owner.HeartbeatAt)) < corestore.OwnerStaleAfter, nil
 }
 
 // teamsRunningCodexWork counts the requests the helper is running (read
@@ -97,16 +94,11 @@ func teamsRunningCodexWork() (int, error) {
 	if !view.exists() || view.Remote != "" {
 		return 0, nil // another host's helper runs that work, not this host's service
 	}
-	st, err := view.openReadOnly()
+	s, _, err := teamsReadStoreState(view, time.Now())
 	if err != nil {
 		return 0, err
 	}
-	defer st.Close()
-	tc, err := st.TurnCounts()
-	if err != nil {
-		return 0, err
-	}
-	return tc[corestore.TurnStarting] + tc[corestore.TurnRunning], nil
+	return s.Running, nil
 }
 
 // prepareTeamsForHelperUpgrade stops the background service for a local
@@ -125,6 +117,18 @@ func prepareTeamsForHelperUpgrade(ctx context.Context, in io.Reader, out io.Writ
 	waiting := false
 	for {
 		n, err := teamsRunningCodexWork()
+		var unpublished errTeamsStateUnpublished
+		if errors.As(err, &unpublished) {
+			// The running helper has not published its state yet: wait
+			// for it as for running work.
+			if time.Now().After(deadline) {
+				return nil, fmt.Errorf("cannot tell whether the Teams helper is running Codex work: %v; retry the upgrade later, or send `helper update` in the Teams control chat", err)
+			}
+			if err := sleepContext(ctx, teamsUpgradePollInterval); err != nil {
+				return nil, err
+			}
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}

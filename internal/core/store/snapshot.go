@@ -140,7 +140,7 @@ func hashFiles(src string) (fileSums, error) {
 // finishCopy opens the copied files with SQLite (WAL recovery), checks
 // them and folds the WAL into the database file.
 func finishCopy(path string) error {
-	db, err := openDB(path, networkFS(filepath.Dir(path)))
+	db, err := openDB(path, networkFS(filepath.Dir(path)), false)
 	if err != nil {
 		return err
 	}

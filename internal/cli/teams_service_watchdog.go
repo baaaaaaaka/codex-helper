@@ -264,12 +264,14 @@ func collectTeamsServiceWatchdogSnapshot(ctx context.Context, opts teamsServiceW
 	}
 	snapshot.StateFiles = 1
 	snapshot.AuthoritativeStorePath = path
+	// No lease: no helper of this version holds the store, so its owner
+	// row is read directly (and the file closed at once).
 	st, err := corestore.OpenWith(path, corestore.Options{ReadOnly: true})
 	if err != nil {
 		return snapshot, err
 	}
-	defer st.Close()
 	owner, ok, err := st.OwnerInfo()
+	_ = st.Close()
 	if err != nil {
 		return snapshot, err
 	}

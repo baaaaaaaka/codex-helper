@@ -294,34 +294,22 @@ func runTeamsNewCoreWorkflowDisable(out io.Writer, path string) error {
 	return nil
 }
 
-// teamsNewCoreWorkflowConfig reads the Workflow setting from the store
-// ("" file when none is configured).
+// teamsNewCoreWorkflowConfig reads the Workflow setting of the store
+// ("" file when none is configured): what the running helper published,
+// or the store itself while no helper holds it.
 func teamsNewCoreWorkflowConfig(path string) (enabled bool, file string, err error) {
 	view, err := teamsStoreViewAt(path)
 	if err != nil {
 		return false, "", err
 	}
-	if !teamsFileExists(view.DB) {
+	if !view.helperHolds() && !teamsFileExists(view.DB) {
 		return false, "", nil
 	}
-	st, err := view.openReadOnly()
+	s, _, err := teamsReadStoreState(view, time.Now())
 	if err != nil {
-		return false, "", fmt.Errorf("open Teams core store: %w", err)
+		return false, "", fmt.Errorf("read the Teams helper's settings: %w", err)
 	}
-	defer st.Close()
-	on, _, err := st.Meta(migrate.MetaWorkflowEnabled)
-	if err != nil {
-		return false, "", err
-	}
-	file, _, err = st.Meta(migrate.MetaWorkflowSecretFile)
-	if err != nil {
-		return false, "", err
-	}
-	file = strings.TrimSpace(file)
-	if file != "" && !filepath.IsAbs(file) {
-		file = filepath.Join(filepath.Dir(path), filepath.Base(file))
-	}
-	return strings.EqualFold(strings.TrimSpace(on), "true"), file, nil
+	return s.Workflow, s.workflowFile(filepath.Dir(path)), nil
 }
 
 func printTeamsNewCoreWorkflowStatus(out io.Writer, path string) error {
