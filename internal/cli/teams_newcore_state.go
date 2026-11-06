@@ -119,7 +119,7 @@ func readTeamsStoreStatus(st *corestore.Store) (teamsStoreStatus, error) {
 			}
 		}
 	}
-	tc, err := st.TurnCounts()
+	tc, err := st.OpenTurnCounts()
 	if err != nil {
 		return s, err
 	}
