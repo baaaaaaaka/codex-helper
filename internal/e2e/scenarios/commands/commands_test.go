@@ -117,41 +117,7 @@ func TestNewAndFork(t *testing.T) {
 	s.Check("fork replies carry no internal ids or paths", len(leaks) == 0, "none", fmt.Sprint(leaks))
 }
 
-// `helper model`: status, list, switch (applies to the next turn), reset,
-// and an unknown model is refused.
-func TestModelStatusAndSwitch(t *testing.T) {
-	harness.Parallel(t)
-	s := harness.NewScenario(t, "CMD-MODEL", harness.Options{
-		Guarantees: []string{"cmd-model"},
-		Title:      "`helper model` shows, lists, switches and resets the session model",
-	})
-	defer s.Finish()
-	control := steps.ReadyControlChat(s)
-	work, _ := steps.NewWorkChat(s, control, "model")
-
-	status, ok := command(s, work.ID, "helper model", "model")
-	s.Check("`helper model` shows the current model", ok && strings.Contains(status, "gpt-5-codex"), "mentions gpt-5-codex", clip(status, 160))
-	list, ok := command(s, work.ID, "helper model list", "gpt-5-codex")
-	s.Check("`helper model list` lists Codex's models", ok, "lists gpt-5-codex", clip(list, 160))
-	bad, ok := command(s, work.ID, "helper model no-such-model", "unknown model")
-	s.Check("an unknown model is refused", ok, "\"Unknown model\"", clip(bad, 120))
-
-	before, ok1 := ask(s, work.ID, "default")
-	sw, ok := command(s, work.ID, "helper model gpt-5-codex high", "gpt-5-codex")
-	s.Check("`helper model <id> <effort>` is confirmed", ok && strings.Contains(strings.ToLower(sw), "high"), "confirms model and effort", clip(sw, 160))
-	after, ok2 := ask(s, work.ID, "switched")
-	s.Check("the next request uses the chosen model and effort", ok2 && after.Model == "gpt-5-codex" && after.Effort == "high",
-		"model=gpt-5-codex effort=high", fmt.Sprintf("ok=%v model=%q effort=%q", ok2, after.Model, after.Effort))
-	s.Check("the switch keeps the same Codex thread", ok1 && ok2 && before.ThreadID == after.ThreadID, "same thread",
-		fmt.Sprintf("%q -> %q", before.ThreadID, after.ThreadID))
-	reset, ok := command(s, work.ID, "helper model reset", "reset")
-	s.Check("`helper model reset` is confirmed", ok, "\"Model reset\"", clip(reset, 120))
-	last, ok3 := ask(s, work.ID, "reset")
-	// Codex keeps a turn's override for later turns, so the reset sends the
-	// default (gpt-5-codex, medium) explicitly.
-	s.Check("after reset the next request goes back to the Codex default", ok3 && last.Model == "gpt-5-codex" && last.Effort == "medium",
-		"model=gpt-5-codex effort=medium", fmt.Sprintf("ok=%v model=%q effort=%q", ok3, last.Model, last.Effort))
-}
+// `model …` and `effort …` are in model_cmds_test.go (gap batch B).
 
 // `helper stats` and control `stats`: token usage computed from the Codex
 // rollouts, in v0.1.20's layout (F-STA-1).

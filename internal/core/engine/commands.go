@@ -219,7 +219,11 @@ func (e *Engine) cmdNew(ctx context.Context, j cmdJob, arg string) {
 		if err != nil {
 			return err
 		}
-		if err := tx.Bind(store.Thread{ConvID: id, Cwd: dir}); err != nil {
+		th, err := newChatThread(tx, id, dir) // the global defaults (defaults.go, batch B)
+		if err != nil {
+			return err
+		}
+		if err := tx.Bind(th); err != nil {
 			return err
 		}
 		_, err = e.refresh(tx, id)

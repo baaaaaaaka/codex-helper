@@ -220,6 +220,10 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 		if err != nil {
 			return err
 		}
+		fork, err := modelForkOf(tx, id) // batch B: `model fork` (modelcmds.go)
+		if err != nil {
+			return err
+		}
 		switch {
 		case inbox:
 			// Nothing is announced in or about the inbox.
@@ -232,6 +236,10 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 			// chat is queued with its first records (mirrorRead); nothing
 			// goes to the control chat.
 			if err := tx.SetMeta(discoveredKey(id), ""); err != nil {
+				return err
+			}
+		case fork.Src != 0: // batch B
+			if err := e.announceModelFork(tx, id, label, cwd, info.URL, fork); err != nil {
 				return err
 			}
 		case intro != "":

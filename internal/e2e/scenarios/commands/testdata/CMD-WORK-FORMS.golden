@@ -146,8 +146,16 @@
    | <p>model</p>
 -- <msg:22> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Model: <code>gpt-5-codex</code> (Codex default). Reasoning effort: medium (default).</p>
-   | <p>Switch with <code>helper model &lt;model&gt; [effort]</code>, list with <code>helper model list</code>, go back with <code>helper model reset</code>.</p>
+   | <p>Chat: Work<br>
+   | Session: <code>s001</code><br>
+   | Effective: Codex Official (<code>gpt-5-codex</code>)<br>
+   | Selector: <code>default (dynamic Codex account default)</code><br>
+   | Selection: global default<br>
+   | Effective effort: <code>medium</code> (Codex runtime default)<br>
+   | Applies to: new turns in this chat<br>
+   | Global default for new chats: Codex Official (<code>gpt-5-codex</code>) (existing chats are unchanged)<br>
+   | Model profile: Codex Official (<code>gpt-5-codex</code>)<br>
+   | Switchable: yes. Switching preserves the existing Codex thread and portable context, if present.</p>
 -- <msg:23> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>models</p>
@@ -156,8 +164,20 @@
    | <p>models</p>
 -- <msg:24> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Models:</p>
-   | <ul><li><code>gpt-5-codex</code> — GPT-5-Codex (default; efforts: low, medium, high)</li>
+   | <p>Current chat model (Work)<br>
+   | Session: <code>s001</code><br>
+   | Effective: Codex Official (<code>gpt-5-codex</code>)<br>
+   | Selector: <code>default (dynamic Codex account default)</code><br>
+   | Selection: global default<br>
+   | Effective effort: <code>medium</code> (Codex runtime default)<br>
+   | Applies to: new turns in this chat<br>
+   | Global default for new chats: Codex Official (<code>gpt-5-codex</code>) (existing chats are unchanged)</p>
+   | <p>Verified models<br>
+   | &nbsp;&nbsp;global default: GPT-5-Codex (<code>gpt-5-codex</code>)<br>
+   | &nbsp;&nbsp;Codex account default: GPT-5-Codex (<code>gpt-5-codex</code>)</p>
+   | <p>Official Codex models</p>
+   | <ul><li>GPT-5-Codex (<code>gpt-5-codex</code>) [account default] effort=medium</li>
+   | <li>GPT-5-Mini (<code>gpt-5-mini</code>) effort=low</li>
    | </ul>
 -- <msg:25> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
@@ -167,8 +187,13 @@
    | <p>effort</p>
 -- <msg:26> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Model: <code>gpt-5-codex</code> (Codex default). Reasoning effort: medium (default).</p>
-   | <p>Switch with <code>helper model &lt;model&gt; [effort]</code>, list with <code>helper model list</code>, go back with <code>helper model reset</code>.</p>
+   | <p>Current chat effort (Work)<br>
+   | Effective for next turn: <code>medium</code><br>
+   | Source: Codex runtime default<br>
+   | Applies to: turns that start after a change in this chat; a running turn keeps its effort.<br>
+   | Model for this chat: <code>gpt-5-codex</code><br>
+   | Model-advertised default: <code>medium</code><br>
+   | Available: <code>low</code>, <code>medium</code>, <code>high</code></p>
 -- <msg:27> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>efforts</p>
@@ -177,9 +202,12 @@
    | <p>efforts</p>
 -- <msg:28> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Models:</p>
-   | <ul><li><code>gpt-5-codex</code> — GPT-5-Codex (default; efforts: low, medium, high)</li>
+   | <p>Current chat effort choices for GPT-5-Codex:</p>
+   | <ul><li><code>low</code></li>
+   | <li><code>medium</code> (current, model-advertised default)</li>
+   | <li><code>high</code></li>
    | </ul>
+   | <p>Use <code>effort set &lt;value&gt;</code> to switch this chat.</p>
 -- <msg:29> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>default model gpt-5</p>

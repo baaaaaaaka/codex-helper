@@ -472,12 +472,18 @@ func (e *Engine) controlRequest(tx *store.Tx, req TurnRequest, in store.Inbound,
 	c.historyPath = extra.historyPath
 	c.history = ctlHistoryTail(list)
 	req.Text, req.Images = controlPrompt(user, c), images
-	def, err := readGlobalDefaults(tx)
-	if err != nil {
-		return req, ctlRequest{}, err
+	if th.ConvID == 0 {
+		// The first question: as v0.1.20 created its control session,
+		// the chat takes the global defaults (defaults.go).
+		if th, err = newChatThread(tx, req.ConvID, ""); err != nil {
+			return req, ctlRequest{}, err
+		}
+		if err := tx.Bind(th); err != nil {
+			return req, ctlRequest{}, err
+		}
 	}
-	req.Model = firstNonEmpty(th.PendingModel, th.Model, def.Model)
-	req.Effort = firstNonEmpty(th.PendingEffort, th.Effort, def.Effort, ctlEffortFallback)
+	req.Model = selector(firstNonEmpty(th.PendingModel, th.Model))
+	req.Effort = firstNonEmpty(th.PendingEffort, th.Effort, ctlEffortFallback)
 	if req.Cwd == "" {
 		if home, err := os.UserHomeDir(); err == nil {
 			req.Cwd = home

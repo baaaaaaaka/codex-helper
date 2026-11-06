@@ -217,10 +217,12 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 			got, voiceFailed = false, true
 			return tx.FinishTurn(tr.ID, store.TurnFailed, "voice transcription failed", msgs)
 		}
-		req = TurnRequest{ConvID: id, ThreadID: th.ThreadID, Cwd: th.Cwd, Model: th.Model, Effort: th.Effort,
+		// selector: v0.1.20's "default" model profile is the account
+		// default (modelcmds.go, batch B).
+		req = TurnRequest{ConvID: id, ThreadID: th.ThreadID, Cwd: th.Cwd, Model: selector(th.Model), Effort: th.Effort,
 			TurnKey: tr.TurnKey, Text: in.Body}
 		if th.PendingModel != "" {
-			req.Model = th.PendingModel
+			req.Model = selector(th.PendingModel)
 		}
 		if th.PendingEffort != "" {
 			req.Effort = th.PendingEffort

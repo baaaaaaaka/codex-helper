@@ -57,20 +57,12 @@ var workCommands = map[string]cmdHandler{
 		e.cmdRename(ctx, j, cs, p.arg)
 	},
 	cmdSkillsName: func(e *Engine, ctx context.Context, j cmdJob, _ *convState, p parsed) { e.cmdSkills(ctx, j, p.arg) },
+	// `model …` / `effort …` (modelcmds.go, batch B).
 	cmdModelName: func(e *Engine, ctx context.Context, j cmdJob, cs *convState, p parsed) {
-		e.cmdModel(ctx, j, cs, strings.Fields(p.arg))
+		e.cmdModelChat(ctx, j, cs, p.arg)
 	},
 	cmdEffortName: func(e *Engine, ctx context.Context, j cmdJob, cs *convState, p parsed) {
-		// Bare `effort` / `efforts` (v0.1.20 workBareCommandName) show the
-		// status / the list until batch B brings the full effort grammar.
-		switch firstLower(p.arg) {
-		case "", "status", "st":
-			e.cmdModel(ctx, j, cs, nil)
-		case "list", "ls":
-			e.cmdModel(ctx, j, cs, []string{"list"})
-		default:
-			e.cmdModel(ctx, j, cs, append([]string{"effort"}, strings.Fields(p.arg)...))
-		}
+		e.cmdEffortChat(ctx, j, cs, p.arg)
 	},
 	cmdDefault: func(e *Engine, _ context.Context, j cmdJob, _ *convState, _ parsed) {
 		e.reply(j, textWorkDefault, nil)
@@ -131,20 +123,18 @@ var controlCommands = map[string]cmdHandler{
 	},
 	cmdStats:      func(e *Engine, ctx context.Context, j cmdJob, _ *convState, _ parsed) { e.cmdStats(ctx, j, nil) },
 	cmdSkillsName: func(e *Engine, ctx context.Context, j cmdJob, _ *convState, p parsed) { e.cmdSkills(ctx, j, p.arg) },
-	cmdModelName: func(e *Engine, ctx context.Context, j cmdJob, _ *convState, _ parsed) {
-		models, err := e.ag.Models(ctx)
-		if err != nil {
-			e.reply(j, "Codex did not list its models ("+userError(err.Error())+"). Try again later.", nil)
-			return
-		}
-		e.reply(j, modelList(models, store.Thread{})+"\n\nSwitch a session's model in its chat with `helper model <model> [effort]`.", nil)
+	// `model …` / `effort …` (modelcmds.go, batch B).
+	cmdModelName: func(e *Engine, ctx context.Context, j cmdJob, cs *convState, p parsed) {
+		e.cmdModelChat(ctx, j, cs, p.arg)
+	},
+	cmdEffortName: func(e *Engine, ctx context.Context, j cmdJob, cs *convState, p parsed) {
+		e.cmdEffortChat(ctx, j, cs, p.arg)
 	},
 	cmdCancelName: func(e *Engine, ctx context.Context, j cmdJob, cs *convState, p parsed) {
 		e.cmdControlCancel(ctx, j, cs, p.arg) // the control chat's Codex questions (control_qa.go)
 	},
-	cmdDefault: func(e *Engine, _ context.Context, j cmdJob, _ *convState, _ parsed) {
-		// HOOK(batch B): global defaults (F-CTL-11).
-		e.reply(j, "Global default management is not configured for this Teams service.", nil)
+	cmdDefault: func(e *Engine, ctx context.Context, j cmdJob, _ *convState, p parsed) {
+		e.cmdDefaultControl(ctx, j, p.arg) // global defaults (defaults.go, batch B)
 	},
 	cmdSelect: func(e *Engine, _ context.Context, j cmdJob, _ *convState, _ parsed) {
 		// HOOK(batch A): the workspace/session dashboard (F-CTL-1..5).
@@ -162,9 +152,8 @@ var controlCommands = map[string]cmdHandler{
 	cmdAsk: func(e *Engine, _ context.Context, j cmdJob, _ *convState, _ parsed) {
 		e.reply(j, "usage: `ask <question>`", nil)
 	},
-	// HOOK(batch B): the control chat's effort, Workflow webhooks.
-	cmdEffortName: hook("effort"),
-	cmdWebhook:    hook("helper webhook"),
+	// HOOK(batch B): Workflow webhooks.
+	cmdWebhook: hook("helper webhook"),
 }
 
 // hook answers a command a later batch implements. It is never sent to
