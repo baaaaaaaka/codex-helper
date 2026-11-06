@@ -53,8 +53,15 @@ func TestStatusWhileTheHelperRunsAndWithout(t *testing.T) {
 			statusLine(out, "Workflow cards:") != "",
 		"Owner … (live); no Store details note; Running version, Helper update, Sessions 0, Requests, Unsent messages, Workflow cards", details(out), out)
 
-	ctl := run("teams", "control")
-	link := statusLine(ctl.Stdout, "Link: ")
+	// The helper publishes its state after commits, a read behind the
+	// store; the control chat may have been recorded just now.
+	var ctl harness.CLIResult
+	var link string
+	s.Poll(15*time.Second, func() bool {
+		ctl = run("teams", "control")
+		link = statusLine(ctl.Stdout, "Link: ")
+		return link != ""
+	})
 	s.Check("`teams control` while the helper runs prints the control chat link",
 		ctl.Code == 0 && statusLine(ctl.Stdout, "Title: ") == "Title: "+control.Topic &&
 			(strings.Contains(link, control.ID) || strings.Contains(link, url.QueryEscape(control.ID))),
