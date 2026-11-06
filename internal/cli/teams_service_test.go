@@ -6241,7 +6241,8 @@ func TestTeamsServiceInstallPreservesScopedEnvironment(t *testing.T) {
 	t.Setenv("CODEX_HELPER_TEAMS_PROFILE", "work-profile")
 	t.Setenv(appdirs.EnvStateDir, filepath.Join(tmp, "state root"))
 	t.Setenv("CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE", filepath.Join(tmp, "token.json"))
-	// Settings of removed features are not carried into the service.
+	// The scope opt-in is carried into the service (F-SET-2: the helper
+	// refuses broader scopes without it); settings of removed features are not.
 	t.Setenv("CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES", "1")
 	t.Setenv("CODEX_HELPER_TEAMS_READ_TOKEN_CACHE", filepath.Join(tmp, "read-token.json"))
 	t.Setenv(envTeamsASRCommand, filepath.Join(tmp, "bin", "teams-asr"))
@@ -6288,12 +6289,13 @@ func TestTeamsServiceInstallPreservesScopedEnvironment(t *testing.T) {
 		"Environment=" + systemdQuoteArg(envTeamsASRFFmpeg+"="+filepath.Join(tmp, "bin", "ffmpeg")),
 		"Environment=" + systemdQuoteArg("HTTPS_PROXY=http://proxy.example.test:8080"),
 		"Environment=" + systemdQuoteArg("CODEX_HELPER_TEAMS_SERVICE_MODE=background"),
+		"Environment=" + systemdQuoteArg("CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES=1"),
 	} {
 		if !strings.Contains(unit, want) {
 			t.Fatalf("unit missing preserved env %q:\n%s", want, unit)
 		}
 	}
-	for _, gone := range []string{"CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES", "CODEX_HELPER_TEAMS_READ_TOKEN_CACHE"} {
+	for _, gone := range []string{"CODEX_HELPER_TEAMS_READ_TOKEN_CACHE"} {
 		if strings.Contains(unit, gone) {
 			t.Fatalf("unit carries the removed setting %s:\n%s", gone, unit)
 		}
