@@ -372,6 +372,26 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 			}
 		},
 		Activity: touch,
+		// v0.1.20 posted a Codex status when Codex retried within the
+		// turn (a dropped stream it reconnects), at most once per
+		// RetryStatus per turn; it is a progress message (same pacing,
+		// caps and delivery keys) and does not count as Codex output.
+		Retrying: func(message, code string) {
+			touch()
+			if rs.request != "" {
+				return
+			}
+			now := e.now()
+			prog.mu.Lock()
+			due := prog.lastRetry.IsZero() || now.Sub(prog.lastRetry) >= e.t.RetryStatus
+			if due {
+				prog.lastRetry = now
+			}
+			prog.mu.Unlock()
+			if due {
+				e.progress(ctx, cs, tr, prog, textReconnecting(message, code))
+			}
+		},
 		Cancelled: func() bool {
 			e.mu.Lock()
 			defer e.mu.Unlock()
@@ -1083,6 +1103,8 @@ type progressState struct {
 	// queued is the quote of a prompt that waited behind an earlier turn,
 	// until a message of the turn names it.
 	queued string
+	// lastRetry is when the last reconnect status was due (posted or not).
+	lastRetry time.Time
 }
 
 func (e *Engine) progress(ctx context.Context, cs *convState, tr store.Turn, ps *progressState, text string) {

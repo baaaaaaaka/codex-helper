@@ -162,6 +162,7 @@ func (a *Agent) Run(ctx context.Context, req engine.TurnRequest, hooks engine.Tu
 		Progress:  hooks.Progress,
 		Compacted: hooks.Compacted,
 		Activity:  hooks.Activity,
+		Retrying:  hooks.Retrying,
 	})
 	var ns *codex.ErrNotStarted
 	switch {

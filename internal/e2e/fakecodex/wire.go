@@ -15,6 +15,8 @@
 // the binary and harness.FakeCodex.Handler for the brain.
 package fakecodex
 
+import "time"
+
 // Environment variables read by the binary.
 const (
 	// EnvBrainURL is the base URL of the brain (required).
@@ -82,6 +84,22 @@ type Plan struct {
 	// decode while the turn runs on (an error that is neither a JSON-RPC
 	// rejection nor an exit).
 	MalformedStart bool `json:"malformedStart,omitempty"`
+	// Retries are error notifications Codex retries by itself, sent after
+	// the commentary and before the turn's outcome.
+	Retries []Retry `json:"retries,omitempty"`
+}
+
+// Retry is one `error` notification with willRetry (real Codex: a dropped
+// response stream it reconnects, e.g. message "Reconnecting... 1/5",
+// additionalDetails the transport error, codexErrorInfo
+// {"responseStreamDisconnected":{"httpStatusCode":null}}).
+type Retry struct {
+	// Delay is the wait (cancellable) before it is sent, from the previous
+	// one or the commentary.
+	Delay   time.Duration `json:"delay,omitempty"`
+	Message string        `json:"message"`
+	Details string        `json:"details,omitempty"`
+	Info    any           `json:"info,omitempty"` // codexErrorInfo
 }
 
 // AwaitResult is the brain's final answer for a turn (POST /await?seq=N

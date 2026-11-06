@@ -606,6 +606,25 @@ func (s *server) runTurn(rt *runningTurn, t *Thread, turn *Turn) {
 			"type": "agentMessage", "id": newID(), "text": rt.plan.Commentary, "phase": "commentary",
 		}})
 	}
+	for _, r := range rt.plan.Retries {
+		if r.Delay > 0 {
+			timer := time.NewTimer(r.Delay)
+			select {
+			case <-rt.ctx.Done():
+			case <-timer.C:
+			}
+			timer.Stop()
+		}
+		if rt.ctx.Err() != nil {
+			break
+		}
+		var details any
+		if r.Details != "" {
+			details = r.Details
+		}
+		s.notify("error", map[string]any{"threadId": rt.threadID, "turnId": rt.turnID, "willRetry": true,
+			"error": map[string]any{"message": r.Message, "codexErrorInfo": r.Info, "additionalDetails": details}})
+	}
 	res, err := s.await(rt.ctx, rt.plan.Seq)
 	status := StatusCompleted
 	var terr *TurnError

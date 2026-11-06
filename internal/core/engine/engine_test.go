@@ -37,6 +37,8 @@ type fakeAgent struct {
 	notes  []string // commentary streamed by turns whose text contains "progress" (or is a capacity `continue`)
 	// interrupted runs after an interrupt reached a running turn.
 	interrupted func()
+	// during, when set, runs with the turn's hooks once it started.
+	during func(TurnRequest, TurnHooks)
 	// lookupGate, when set, holds Lookup (restart reconciliation) until
 	// it is closed.
 	lookupGate chan struct{}
@@ -71,7 +73,7 @@ func (a *fakeAgent) Run(ctx context.Context, req TurnRequest, h TurnHooks) (Turn
 	}
 	irq := make(chan struct{})
 	a.irq[req.ConvID] = irq
-	out, refuse := a.outcome, a.refuse
+	out, refuse, during := a.outcome, a.refuse, a.during
 	a.mu.Unlock()
 	if refuse != nil {
 		if o, ok := refuse(req); ok {
@@ -79,6 +81,9 @@ func (a *fakeAgent) Run(ctx context.Context, req TurnRequest, h TurnHooks) (Turn
 		}
 	}
 	h.Started(fmt.Sprintf("turn-%d", n))
+	if during != nil {
+		during(req, h)
+	}
 	if wait != nil {
 		select {
 		case <-wait:
