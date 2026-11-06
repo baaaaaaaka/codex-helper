@@ -405,7 +405,11 @@ func TestRepliesBeforeProgressWhenWritesArePaced(t *testing.T) {
 // ahead of the progress backlog of other chats.
 func TestProgressCoalescedWhileWritesArePaced(t *testing.T) {
 	skipWallClockPacingUnderRace(t)
-	r, _ := backlogRig(t, func(c *Config) { c.WriteRate = 4 }, 4, 200, func(int) string { return store.OutProgress })
+	// Each backlog chat sends at most once per ChatRate (1 s): 12 chats
+	// ask for 12 writes/s against 4/s, so the writes are clearly paced.
+	// (4 chats asked for exactly the rate, and a slow runner fell just
+	// under it: nothing was refused and nothing coalesced.)
+	r, _ := backlogRig(t, func(c *Config) { c.WriteRate = 4 }, 12, 200, func(int) string { return store.OutProgress })
 	r.ag.mu.Lock()
 	r.ag.notes = []string{"step A", "step B", "step C"}
 	r.ag.mu.Unlock()
