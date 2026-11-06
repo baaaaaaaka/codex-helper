@@ -40,29 +40,29 @@ func (a *Adapter) ScanActivity(ctx context.Context, since time.Time) ([]channel.
 			return nil, &channel.Rejected{Err: fmt.Errorf("teams: /me/chats nextLink loop")}
 		}
 		seen[next] = true
-		body, err := a.g.get(ctx, next, pageBodyLimit)
-		if err != nil {
-			return nil, err
-		}
 		older := false
-		link, err := decodeChats(body, func(c activityChat) bool {
-			if c.ID == "" || c.Preview == nil || c.Preview.ID == "" {
-				older = true // chats without messages sort last
+		var link string
+		err := a.g.getDecoded(ctx, next, pageBodyLimit, func(body []byte) (err error) {
+			link, err = decodeChats(body, func(c activityChat) bool {
+				if c.ID == "" || c.Preview == nil || c.Preview.ID == "" {
+					older = true // chats without messages sort last
+					return true
+				}
+				t, _ := time.Parse(time.RFC3339Nano, c.Preview.Created)
+				if !since.IsZero() && !t.After(since) {
+					older = true
+					return false
+				}
+				out = append(out, channel.ChatActivity{
+					Chat: c.ID, LastID: c.Preview.ID, Last: t,
+					ByMe: c.Preview.From != nil && c.Preview.From.User != nil && c.Preview.From.User.ID == me.ID,
+				})
 				return true
-			}
-			t, _ := time.Parse(time.RFC3339Nano, c.Preview.Created)
-			if !since.IsZero() && !t.After(since) {
-				older = true
-				return false
-			}
-			out = append(out, channel.ChatActivity{
-				Chat: c.ID, LastID: c.Preview.ID, Last: t,
-				ByMe: c.Preview.From != nil && c.Preview.From.User != nil && c.Preview.From.User.ID == me.ID,
 			})
-			return true
+			return err
 		})
 		if err != nil {
-			return nil, decodeError(next, err)
+			return nil, err
 		}
 		if older {
 			break
