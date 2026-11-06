@@ -75,6 +75,39 @@ func (s *Server) RunTurn(ctx context.Context, p TurnStartParams, poll time.Durat
 		// within compactPair is one compaction reported both ways.
 		lastItem, lastLegacy time.Time
 	)
+	// Progress. Commentary is posted as it comes. An agent message without
+	// a phase (Codex streams those for models without message phases) may
+	// be the final answer, so it is held until a later message or a
+	// compaction shows it was not (v0.1.20's one-message look-behind), and
+	// dropped at the end if it is the final.
+	var (
+		pmu  sync.Mutex
+		held string
+	)
+	progress := func(it Item) {
+		if hooks.Progress == nil || it.Phase == "final_answer" || strings.TrimSpace(it.Text) == "" {
+			return
+		}
+		pmu.Lock()
+		defer pmu.Unlock()
+		if held != "" {
+			hooks.Progress(held)
+		}
+		held = ""
+		if it.Phase == "commentary" {
+			hooks.Progress(it.Text)
+		} else {
+			held = it.Text
+		}
+	}
+	flushHeld := func(final string) {
+		pmu.Lock()
+		defer pmu.Unlock()
+		if held != "" && hooks.Progress != nil && strings.TrimSpace(held) != strings.TrimSpace(final) {
+			hooks.Progress(held)
+		}
+		held = ""
+	}
 	// compacted reports one compaction of the running turn (item: the
 	// contextCompaction item id, "" for thread/compacted).
 	compacted := func(turn, item string) {
@@ -102,6 +135,7 @@ func (s *Server) RunTurn(ctx context.Context, p TurnStartParams, poll time.Durat
 		}
 		mu.Unlock()
 		if !dup && hooks.Compacted != nil {
+			flushHeld("")
 			hooks.Compacted()
 		}
 	}
@@ -130,14 +164,25 @@ func (s *Server) RunTurn(ctx context.Context, p TurnStartParams, poll time.Durat
 				return
 			}
 			if m.Item.Type != "agentMessage" {
+				// Codex went on working: a held message was not the final
+				// (v0.1.20 flushed on command events).
+				switch m.Item.Type {
+				case "commandExecution", "fileChange", "mcpToolCall":
+					mu.Lock()
+					mine := m.TurnID == turnID
+					mu.Unlock()
+					if mine {
+						flushHeld("")
+					}
+				}
 				return
 			}
 			mu.Lock()
 			items[m.TurnID] = append(items[m.TurnID], m.Item)
 			mine := m.TurnID == turnID
 			mu.Unlock()
-			if mine && m.Item.Phase != "final_answer" && hooks.Progress != nil && strings.TrimSpace(m.Item.Text) != "" {
-				hooks.Progress(m.Item.Text)
+			if mine {
+				progress(m.Item)
 			}
 		case "thread/tokenUsage/updated":
 			var m struct {
@@ -180,12 +225,8 @@ func (s *Server) RunTurn(ctx context.Context, p TurnStartParams, poll time.Durat
 	if hooks.Started != nil {
 		hooks.Started(id)
 	}
-	if hooks.Progress != nil {
-		for _, it := range early {
-			if it.Phase != "final_answer" && strings.TrimSpace(it.Text) != "" {
-				hooks.Progress(it.Text)
-			}
-		}
+	for _, it := range early {
+		progress(it)
 	}
 	finish := func(t Turn) (TurnResult, error) {
 		mu.Lock()
@@ -202,6 +243,7 @@ func (s *Server) RunTurn(ctx context.Context, p TurnStartParams, poll time.Durat
 				res.Final = full.Final()
 			}
 		}
+		flushHeld(res.Final)
 		return res, nil
 	}
 	tick := time.NewTicker(poll)
