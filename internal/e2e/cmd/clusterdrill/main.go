@@ -9,6 +9,7 @@
 //	clusterdrill ctl     <path> [key=value ...]
 //	clusterdrill probe   -file <path> (how soon each lookup method sees a file another host created)
 //	clusterdrill tlsproxy -listen 127.0.0.1:443 -to http://cxpd-graph:8080 -ca <file> -instance <tag>
+//	clusterdrill tui     -sessions <dir> -cwd <dir> -prefix x -every 5s [-resume]
 //
 // serve runs the fake Graph and the fake Codex brain (both answer on all
 // interfaces, through a TCP relay to their loopback listeners), writes the
@@ -24,6 +25,12 @@
 // with the headers the test seam would add. It lets a release that
 // predates the seam (v0.1.22-rc.59) run against the fake: its host maps
 // the Microsoft names to 127.0.0.1 and trusts the CA (SSL_CERT_FILE).
+//
+// tui plays a local Codex TUI user: it appends one complete turn every
+// -every to a rollout under -sessions (a new session, or with -resume the
+// newest rollout there, as after moving a home to another machine), with
+// the prompt "TUI prompt E2ETUI-<prefix>-<n>" and the answer "TUI answer for
+// E2ETUI-<prefix>-<n>", and prints each token as it is written.
 //
 // forward is the relay a host runs so that cxp reaches the fake Graph on a
 // loopback address, which the test seam requires. The SUT is only the cxp
@@ -57,6 +64,7 @@ import (
 
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakegraph"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/harness"
+	"github.com/baaaaaaaka/codex-helper/internal/e2e/rollout"
 )
 
 func main() {
@@ -76,6 +84,8 @@ func main() {
 		err = tlsproxy(os.Args[2:])
 	case "probe":
 		err = probe(os.Args[2:])
+	case "tui":
+		err = tui(os.Args[2:])
 	default:
 		err = fmt.Errorf("unknown command %q", os.Args[1])
 	}
@@ -554,4 +564,49 @@ func probe(args []string) error {
 		}
 	}
 	return nil
+}
+
+// tui appends TUI turns to a rollout until killed (see the package comment).
+func tui(args []string) error {
+	fs := flag.NewFlagSet("tui", flag.ExitOnError)
+	sessions := fs.String("sessions", "", "the Codex sessions directory")
+	cwd := fs.String("cwd", "", "the session's working directory")
+	prefix := fs.String("prefix", "T", "token prefix")
+	every := fs.Duration("every", 5*time.Second, "one turn per interval")
+	resume := fs.Bool("resume", false, "append to the newest rollout under -sessions")
+	_ = fs.Parse(args)
+	var w *rollout.Writer
+	if *resume {
+		var newest string
+		var newestMod time.Time
+		_ = filepath.WalkDir(*sessions, func(p string, e os.DirEntry, err error) error {
+			if err != nil || e.IsDir() || !strings.HasSuffix(p, ".jsonl") {
+				return nil
+			}
+			if fi, err := e.Info(); err == nil && fi.ModTime().After(newestMod) {
+				newest, newestMod = p, fi.ModTime()
+			}
+			return nil
+		})
+		if newest == "" {
+			return errors.New("tui: no rollout to resume")
+		}
+		base := strings.TrimSuffix(filepath.Base(newest), ".jsonl")
+		id := base[len(base)-36:] // rollout-<ts>-<36-char id>
+		w = rollout.Open(newest, id, *cwd)
+	} else {
+		var err error
+		if w, err = rollout.New(*sessions, *cwd, rollout.Options{}); err != nil {
+			return err
+		}
+	}
+	fmt.Printf("tui: %s\n", w.Path)
+	for n := 1; ; n++ {
+		time.Sleep(*every)
+		tok := fmt.Sprintf("E2ETUI-%s-%05d", *prefix, n)
+		if _, err := w.AppendTurn(rollout.Turn{Prompt: "TUI prompt " + tok, Answer: "TUI answer for " + tok}); err != nil {
+			return err
+		}
+		fmt.Printf("%s %s\n", time.Now().UTC().Format(time.RFC3339Nano), tok)
+	}
 }
