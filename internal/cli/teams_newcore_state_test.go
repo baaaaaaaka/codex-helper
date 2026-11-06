@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -242,7 +243,9 @@ func TestTeamsStoreHeldOnlyWhileTheHelperIsAlive(t *testing.T) {
 	}
 	v.Info.Head.PID = exitedPIDForTest(t)
 	v.Info.Head.Start = ""
-	if v.helperHolds() {
+	// Windows has no cheap liveness check: an owner counts as alive until
+	// its lease is stale (lease.pidAlive).
+	if runtime.GOOS != "windows" && v.helperHolds() {
 		t.Fatal("an exited helper seen as holding")
 	}
 	v.Info.Head.Host, v.Info.Head.Boot = "other-host", "other-boot"

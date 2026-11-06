@@ -470,9 +470,13 @@ func TestKillStale(t *testing.T) {
 	}
 	victim, bystander, moved := start(), start(), start()
 	waited := make(chan error, 2)
-	go func() { waited <- victim.Wait() }()
+	reaping := false
 	defer func() {
-		for _, c := range []*exec.Cmd{bystander, moved} {
+		cs := []*exec.Cmd{bystander, moved}
+		if !reaping { // skipped before the victim's reaper started
+			cs = append(cs, victim)
+		}
+		for _, c := range cs {
 			_ = c.Process.Kill()
 			_ = c.Wait()
 		}
@@ -485,6 +489,8 @@ func TestKillStale(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	reaping = true
+	go func() { waited <- victim.Wait() }()
 	pidFile := filepath.Join(t.TempDir(), "appservers.json")
 	recs := []pidRecord{
 		{PID: victim.Process.Pid, Start: startTime(victim.Process.Pid)},

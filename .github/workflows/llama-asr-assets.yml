@@ -68,7 +68,7 @@ jobs:
       - name: Run on CentOS 7 (glibc 2.17)
         run: |
           name=llama-asr-$LLAMA_TAG-$ASSET_REV-linux-${{ matrix.arch }}
-          mkdir -p run && tar -xzf out/$name.tar.gz -C run
+          mkdir -p run && tar -xzf "out/$name.tar.gz" -C run
           docker run --rm --network=none -v "$PWD/run":/asr:ro centos:7 sh -euxc "
             cat /etc/redhat-release; ldd --version | head -1
             if ldd /asr/$name/llama-server | grep 'not found'; then exit 1; fi
@@ -104,6 +104,8 @@ jobs:
         run: scripts/ci/llama-asr-fetch-source.sh src
       - name: Build
         run: |
+          # COMMON_CMAKE and matrix.cmake are flag lists: split on purpose.
+          # shellcheck disable=SC2086
           cmake -S src -B build $COMMON_CMAKE ${{ matrix.cmake }} \
             -DCMAKE_INSTALL_RPATH=@loader_path -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON
           # Build everything: with GGML_BACKEND_DL the CPU variants are plugins,
@@ -112,23 +114,23 @@ jobs:
       - name: Package and check
         run: |
           name=llama-asr-$LLAMA_TAG-$ASSET_REV-macos-${{ matrix.arch }}
-          mkdir -p stage/$name out
-          cp build/bin/llama-server stage/$name/
+          mkdir -p "stage/$name" out
+          cp build/bin/llama-server "stage/$name/"
           for f in build/bin/*.dylib build/bin/*.so; do
             [ -e "$f" ] || continue
             case "$(basename "$f")" in libllama-server-impl*) ;; libllama-*-impl*) continue ;; esac
-            cp "$f" stage/$name/
+            cp "$f" "stage/$name/"
           done
-          cp src/LICENSE stage/$name/LICENSE-llama.cpp
+          cp src/LICENSE "stage/$name/LICENSE-llama.cpp"
           # Every non-system dependency must resolve next to the binary.
-          for f in stage/$name/llama-server stage/$name/*.dylib; do
+          for f in "stage/$name/llama-server" "stage/$name"/*.dylib; do
             bad=$(otool -L "$f" | tail -n +2 | awk '{print $1}' | grep -v -E '^(/usr/lib/|/System/Library/|@rpath/|@loader_path/)' || true)
             if [ -n "$bad" ]; then echo "::error::$f depends on $bad"; exit 1; fi
           done
-          xattr -cr stage/$name
-          stage/$name/llama-server --version 2>&1 | tee stage/$name/BUILDINFO.txt
-          (cd stage && tar -czf ../out/$name.tar.gz $name)
-          scripts/ci/llama-asr-pin.sh out/$name.tar.gz macos-${{ matrix.arch }}
+          xattr -cr "stage/$name"
+          "stage/$name/llama-server" --version 2>&1 | tee "stage/$name/BUILDINFO.txt"
+          (cd stage && tar -czf "../out/$name.tar.gz" "$name")
+          scripts/ci/llama-asr-pin.sh "out/$name.tar.gz" macos-${{ matrix.arch }}
       - name: Real-model smoke
         if: inputs.model_smoke
         run: |
@@ -256,6 +258,8 @@ jobs:
           path: artifacts
       - name: Go pins for internal/asr/pins.go
         run: |
+          # The backticks are Markdown, printed as is.
+          # shellcheck disable=SC2016
           {
             echo '### llama-asr pins'
             echo 'Publish the archives below as release `llama-asr-${{ inputs.llama_tag }}-${{ inputs.asset_rev }}`, then set:'

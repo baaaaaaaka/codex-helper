@@ -231,7 +231,8 @@ func TestRewriteDetectionAndRealign(t *testing.T) {
 	lines := strings.SplitAfter(string(data), "\n")
 	var kept []string
 	for _, l := range lines {
-		if strings.Contains(l, "\"one\"") || strings.Contains(l, "a1") {
+		// Quoted: a bare "a1" also turns up inside random hex ids.
+		if strings.Contains(l, "\"one\"") || strings.Contains(l, "\"a1\"") {
 			continue
 		}
 		kept = append(kept, l)
