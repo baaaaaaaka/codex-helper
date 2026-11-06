@@ -255,6 +255,10 @@ type Engine struct {
 	// statsCache is the rollout usage cache of `helper stats` (stats.go).
 	statsOnce  sync.Once
 	statsCache *transcript.UsageCache
+	// dash and imp are the control dashboard and the history imports
+	// (dashboard.go, import.go; batch A).
+	dash dashState
+	imp  importState
 	// scanFirst: after an account read throttle the activity scan gets
 	// the first read when the gate opens (receive.go).
 	scanFirst atomic.Bool

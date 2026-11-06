@@ -12,13 +12,13 @@ func TestControlChatAcceptsV0120Aliases(t *testing.T) {
 	r := newRig(t)
 	ctl := r.control()
 	for _, c := range []struct{ text, want string }{
-		{"st", "sessions ("},
-		{"helper st", "sessions ("},
+		{"st", "Control status:"},
+		{"helper st", "Control status:"},
 		{"h", "Send `help advanced` for all commands."},
 		{"menu", "Send `help advanced` for all commands."},
-		{"s", "No sessions yet"},
-		{"session", "No sessions yet"},
-		{"history", "No sessions yet"},
+		{"s", "No local Codex sessions found"},
+		{"session", "No local Codex sessions found"},
+		{"history", "No local Codex sessions found"},
 	} {
 		before := len(r.own(ctl, c.want))
 		r.ch.PostUser(ctl, c.text)

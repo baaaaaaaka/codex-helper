@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -201,10 +200,14 @@ func (e *Engine) runCommand(ctx context.Context, j cmdJob) {
 // commit together; the chat itself is created by ensureChats, so a restart
 // in between neither loses nor duplicates it.
 func (e *Engine) cmdNew(ctx context.Context, j cmdJob, arg string) {
-	dir, err := checkDir(arg)
-	if err != nil {
-		e.reply(j, err.Error(), nil)
+	req, errText := e.parseNew(ctx, arg) // batch A: v0.1.20 `new` (dashboard.go)
+	if errText != "" {
+		e.reply(j, errText, nil)
 		return
+	}
+	dir, name, titleSource := req.dir, req.title, "user" // `new <dir> -- <title>`
+	if name == "" {
+		name, titleSource = filepath.Base(dir), "auto"
 	}
 	var id int64
 	// No reply of its own: as in v0.1.20, the control chat hears about the
@@ -215,11 +218,15 @@ func (e *Engine) cmdNew(ctx context.Context, j cmdJob, arg string) {
 			return err
 		}
 		id, err = tx.CreateConversation(store.NewConversation{Label: label, Kind: store.KindWork, Channel: e.cfg.ChannelName,
-			Title: chatTitle(label, filepath.Base(dir)), TitleSource: "auto"})
+			Title: chatTitle(label, name), TitleSource: titleSource})
 		if err != nil {
 			return err
 		}
-		if err := tx.Bind(store.Thread{ConvID: id, Cwd: dir}); err != nil {
+		th := store.Thread{ConvID: id, Cwd: dir}
+		if req.model != "" {
+			th.Model, th.ModelSource = req.model, sourceUser
+		}
+		if err := tx.Bind(th); err != nil {
 			return err
 		}
 		_, err = e.refresh(tx, id)
@@ -240,26 +247,6 @@ func chatTitle(label, name string) string {
 		return label
 	}
 	return label + " · " + name
-}
-
-func checkDir(arg string) (string, error) {
-	arg = strings.Trim(strings.TrimSpace(arg), "`\"'")
-	if arg == "" {
-		return "", fmt.Errorf("Usage: `new <directory>`")
-	}
-	if arg == "~" || strings.HasPrefix(arg, "~/") {
-		if home, err := os.UserHomeDir(); err == nil {
-			arg = filepath.Join(home, strings.TrimPrefix(arg, "~"))
-		}
-	}
-	if !filepath.IsAbs(arg) {
-		return "", fmt.Errorf("Use an absolute directory path: `new /path/to/project`")
-	}
-	st, err := os.Stat(arg)
-	if err != nil || !st.IsDir() {
-		return "", fmt.Errorf("Directory not found: `%s`", arg)
-	}
-	return filepath.Clean(arg), nil
 }
 
 // nextLabel allocates the next free sNNN label.

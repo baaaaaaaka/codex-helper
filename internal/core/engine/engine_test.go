@@ -1124,7 +1124,7 @@ func TestSlowCommandDoesNotBlockCancelOrOtherChats(t *testing.T) {
 	r.ch.PostUser(work, "helper cancel")
 	r.wait("cancel reply while model is stuck", func() bool { return len(r.own(work, "Nothing to cancel")) == 1 })
 	r.ch.PostUser(ctl, "status")
-	r.wait("control status while model is stuck", func() bool { return len(r.own(ctl, "sessions (")) == 1 })
+	r.wait("control status while model is stuck", func() bool { return len(r.own(ctl, "Active Work chats")) == 1 })
 	r.ch.PostUser(work, "prompt during model")
 	r.wait("prompt answered while model is stuck", func() bool { return len(r.own(work, "ANSWER to prompt during model")) == 1 })
 	if n := len(r.own(work, "did not list its models")); n != 0 {
