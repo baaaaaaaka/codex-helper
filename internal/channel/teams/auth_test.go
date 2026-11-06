@@ -264,3 +264,34 @@ func TestDelegatedAuthRefreshIsSerialisedAcrossInstances(t *testing.T) {
 		t.Fatalf("second instance refreshed again: %q vs %q, %v", t3, t2, err)
 	}
 }
+
+// F-SET-2: scopes broader than v0.1.20's allowlist fail closed unless the
+// operator opts in.
+func TestResolveAuthConfigRefusesBroaderScopes(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("CODEX_HELPER_STATE_DIR", filepath.Join(root, "state"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(root, "cache"))
+	t.Setenv("CODEX_HELPER_TEAMS_AUTH_CONFIG", filepath.Join(root, "teams-auth.json"))
+	t.Setenv("CODEX_HELPER_TEAMS_TENANT_ID", "tenant")
+	t.Setenv("CODEX_HELPER_TEAMS_CLIENT_ID", "client")
+	t.Setenv("CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE", "")
+	t.Setenv("CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES", "")
+	t.Setenv("CODEX_HELPER_TEAMS_FULL_SCOPES", "User.Read Chat.ReadWrite Mail.Read Mail.Read Sites.FullControl.All")
+	_, err := ResolveAuthConfig("")
+	want := "unexpected Teams Graph scope(s): Mail.Read, Sites.FullControl.All; set CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES=1 to override"
+	if err == nil || err.Error() != want {
+		t.Fatalf("err = %v, want %q", err, want)
+	}
+	t.Setenv("CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES", "yes")
+	if _, err := ResolveAuthConfig(""); err != nil {
+		t.Fatalf("opt-in: %v", err)
+	}
+	t.Setenv("CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES", "")
+	t.Setenv("CODEX_HELPER_TEAMS_FULL_SCOPES", "openid profile offline_access User.Read Chat.Read Chat.Create ChatMessage.Send Files.Read")
+	if _, err := ResolveAuthConfig(""); err != nil {
+		t.Fatalf("allowed scopes: %v", err)
+	}
+	if err := ValidateScopes(DefaultScopes); err != nil {
+		t.Fatalf("defaults: %v", err)
+	}
+}

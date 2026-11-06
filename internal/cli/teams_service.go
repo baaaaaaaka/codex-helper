@@ -3453,6 +3453,7 @@ func teamsServiceEnvironmentAllowlist() []string {
 		"CODEX_HELPER_TEAMS_FULL_CLIENT_ID",
 		"CODEX_HELPER_TEAMS_FULL_SCOPES",
 		"CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE",
+		"CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES",
 		update.EnvRepo,
 		update.EnvInstallPath,
 		update.EnvUpdateIndexURL,
