@@ -143,7 +143,7 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 	e.mu.Lock()
 	cs := e.convs[id]
 	ok := cs != nil && (cs.kind == store.KindWork || cs.kind == store.KindControl) && cs.state == store.ConvActive && !cs.paused &&
-		cs.running == nil && !e.now().Before(cs.capWake) && !e.draining() && !e.stopping.Load()
+		cs.running == nil && !e.now().Before(cs.capWake) && !e.draining() && !e.stopping.Load() && e.readyLocked(cs)
 	var (
 		lastEnd      time.Time
 		batchThrough int64
@@ -966,6 +966,15 @@ func (e *Engine) reconcileTurn(ctx context.Context, cs *convState, tr store.Turn
 		close(rs.done)
 		e.clearRun(cs.id, rs)
 	}()
+	if e.tookOver != "" { // the chat's first read may settle it (takeover.go, rule 2)
+		read := e.awaitFirstRead(ctx, cs)
+		e.mu.Lock()
+		open := e.orphans[tr.ID]
+		e.mu.Unlock()
+		if !read || !open {
+			return
+		}
+	}
 	var out TurnOutcome
 	if threadID == "" {
 		out = TurnOutcome{NotStarted: true, Status: StatusFailed, Error: "no Codex thread yet"}

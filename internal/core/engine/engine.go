@@ -229,12 +229,15 @@ type Engine struct {
 	// tests slow it down).
 	readMeta func(string) (transcript.SessionMeta, error)
 
-	mu        sync.Mutex
-	convs     map[int64]*convState
-	byChat    map[string]int64
-	byThread  map[string]int64
-	prefix    string // turn key prefix
-	preserved bool   // markers survive the channel (self-test)
+	mu       sync.Mutex
+	convs    map[int64]*convState
+	byChat   map[string]int64
+	byThread map[string]int64
+	prefix   string // turn key prefix
+	// tookOver is the host this run took over from by a copy of its state
+	// ("" otherwise; set before the loops start, takeover.go).
+	tookOver  string
+	preserved bool // markers survive the channel (self-test)
 	controlID int64
 	// inboxID is the delegation inbox (Config.Registry); set once at start.
 	inboxID   int64

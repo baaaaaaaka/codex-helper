@@ -23,6 +23,9 @@ type PeerOptions struct {
 	// other host (e.g. SLURM_JOB_ID on a batch-job node). Test switches are
 	// refused as for Options.UserEnv.
 	UserEnv map[string]string
+	// Env runs the peer in another environment, e.g. Env.MovedTo for a
+	// machine whose home is a copy (nil: the scenario's).
+	Env *Env
 }
 
 // NewPeer builds a second SUT on this scenario's state (same HOME, Graph
@@ -32,6 +35,9 @@ type PeerOptions struct {
 func (s *Scenario) NewPeer(peer string, opts PeerOptions) SUT {
 	s.T.Helper()
 	cfg := s.sutConfig(peer, opts.Seam, opts.Args)
+	if opts.Env != nil {
+		cfg.Env = opts.Env
+	}
 	if len(opts.UserEnv) > 0 {
 		env := map[string]string{}
 		for k, v := range s.Opts.UserEnv {

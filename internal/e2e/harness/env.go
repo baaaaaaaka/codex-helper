@@ -65,6 +65,35 @@ func (e *Env) Rollouts() []*rollout.Writer {
 	return append([]*rollout.Writer(nil), e.rollouts...)
 }
 
+// MovedTo is the environment of another machine whose home is home, a
+// copy of this one's (the owner's machine move): every path under e.Home
+// moves there and the runtime directory is the machine's own. The work
+// directories, outside the home, are shared.
+func (e *Env) MovedTo(t testing.TB, home string) *Env {
+	t.Helper()
+	move := func(p string) string {
+		rel, err := filepath.Rel(e.Home, p)
+		if err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
+			return p
+		}
+		return filepath.Join(home, rel)
+	}
+	n := &Env{Root: e.Root, Home: home, StateDir: move(e.StateDir), ConfigDir: move(e.ConfigDir), CacheDir: move(e.CacheDir),
+		DataDir: move(e.DataDir), RuntimeDir: home + ".run", CodexHome: move(e.CodexHome), SessionsDir: move(e.SessionsDir),
+		TokenDir: move(e.TokenDir), WorkRoot: e.WorkRoot, TokenCaches: map[string]string{}, Vars: map[string]string{}}
+	for k, v := range e.TokenCaches {
+		n.TokenCaches[k] = move(v)
+	}
+	for k, v := range e.Vars {
+		n.Vars[k] = move(v)
+	}
+	n.Vars["XDG_RUNTIME_DIR"] = n.RuntimeDir
+	if err := os.MkdirAll(n.RuntimeDir, 0o700); err != nil {
+		t.Fatalf("mkdir %s: %v", n.RuntimeDir, err)
+	}
+	return n
+}
+
 // ClientIDs used for the fake app registrations.
 const (
 	FakeClientID     = "e2e0c11e-0000-4000-8000-000000000001"
