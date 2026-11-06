@@ -289,3 +289,54 @@ func TestDeliveryKeyIdempotency(t *testing.T) {
 		t.Fatal("enqueue without a delivery key succeeded")
 	}
 }
+
+// A read-only open of a store no helper has open (no WAL) creates no file
+// next to it and reads its data; with a helper running it reads live data
+// (R-46).
+func TestReadOnlyOpenCreatesNothing(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "core.sqlite")
+	s, err := Open(path)
+	mustT(t, err)
+	_, err = s.w.Exec(`INSERT INTO meta(key, value) VALUES ('e2e', 'one')`)
+	mustT(t, err)
+	s.Close()
+	list := func() []string {
+		ents, err := os.ReadDir(dir)
+		mustT(t, err)
+		var names []string
+		for _, e := range ents {
+			names = append(names, e.Name())
+		}
+		return names
+	}
+	if names := list(); len(names) != 1 {
+		t.Fatalf("after close: %v", names)
+	}
+	r, err := OpenWith(path, Options{ReadOnly: true})
+	mustT(t, err)
+	v, _, err := r.Meta("e2e")
+	mustT(t, err)
+	r.Close()
+	if v != "one" {
+		t.Fatalf("read %q", v)
+	}
+	if names := list(); len(names) != 1 {
+		t.Fatalf("read-only open created files: %v", names)
+	}
+
+	// While a writer has it open, readers see its commits.
+	w, err := Open(path)
+	mustT(t, err)
+	defer w.Close()
+	_, err = w.w.Exec(`UPDATE meta SET value = 'two' WHERE key = 'e2e'`)
+	mustT(t, err)
+	r, err = OpenWith(path, Options{ReadOnly: true})
+	mustT(t, err)
+	defer r.Close()
+	v, _, err = r.Meta("e2e")
+	mustT(t, err)
+	if v != "two" {
+		t.Fatalf("read %q with a writer open", v)
+	}
+}

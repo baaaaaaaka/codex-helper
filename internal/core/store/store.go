@@ -164,7 +164,18 @@ func OpenWith(path string, opt Options) (*Store, error) {
 			return nil, err
 		}
 	}
-	r, err := sql.Open("sqlite", dsn(path, true))
+	rdsn := dsn(path, true)
+	if opt.ReadOnly {
+		if _, err := os.Stat(path + "-wal"); errors.Is(err, os.ErrNotExist) {
+			// No helper has the store open (SQLite removes the WAL when
+			// the last writer closes it). A read-only connection would
+			// still create -wal and -shm files next to the store and
+			// leave them behind; read the file as immutable instead, so
+			// that status and doctor write nothing (R-46).
+			rdsn += "&immutable=1"
+		}
+	}
+	r, err := sql.Open("sqlite", rdsn)
 	if err != nil {
 		s.Close()
 		return nil, err
