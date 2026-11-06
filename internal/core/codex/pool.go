@@ -319,11 +319,16 @@ func (p *Pool) Close(grace time.Duration) {
 	p.writePIDs()
 }
 
-// pidRecord is one PID file entry.
+// pidRecord is one PID file entry. Boot and NS say which kernel instance
+// and pid namespace the pid belongs to: a home copied to another machine
+// (or a machine that rebooted) carries the file along, and its pids mean
+// nothing there.
 type pidRecord struct {
 	PID   int    `json:"pid"`
 	Start string `json:"start,omitempty"`
 	Key   string `json:"key,omitempty"`
+	Boot  string `json:"boot,omitempty"`
+	NS    string `json:"pidns,omitempty"`
 }
 
 func (p *Pool) writePIDs() {
@@ -334,9 +339,10 @@ func (p *Pool) writePIDs() {
 	defer p.pidMu.Unlock()
 	p.mu.Lock()
 	recs := []pidRecord{}
+	boot, ns := bootID(), pidNamespace()
 	for _, e := range p.servers {
 		if e.srv != nil && !e.srv.Exited() {
-			recs = append(recs, pidRecord{PID: e.srv.PID(), Start: e.start, Key: e.key})
+			recs = append(recs, pidRecord{PID: e.srv.PID(), Start: e.start, Key: e.key, Boot: boot, NS: ns})
 		}
 	}
 	p.mu.Unlock()
@@ -345,6 +351,24 @@ func (p *Pool) writePIDs() {
 	if err := writeFileAtomic(p.cfg.PIDFile, data); err != nil {
 		fmt.Fprintf(p.cfg.Log, "codex: write pid file: %v\n", err)
 	}
+}
+
+// sameProcess reports whether record r still names the live process pid
+// r.PID, given this machine's boot id and pid namespace and the pid's
+// current start time (each "" when unknown).
+func sameProcess(r pidRecord, boot, ns, start string) bool {
+	if r.Boot != "" && boot != "" && r.Boot != boot {
+		return false // another machine, or before a reboot
+	}
+	if r.NS != "" && ns != "" && r.NS != ns {
+		return false // another pid namespace (container)
+	}
+	if start != "" && r.Start != "" {
+		return start == r.Start // else a recycled pid
+	}
+	// The start time cannot be compared: only a matching boot vouches
+	// that the pid was not recycled by another machine.
+	return r.Boot != "" && r.Boot == boot
 }
 
 func writeFileAtomic(path string, data []byte) error {
@@ -379,9 +403,13 @@ func writeFileAtomic(path string, data []byte) error {
 
 // KillStale kills the app-server process groups recorded in pidFile by a
 // previous helper process and waits until they are gone, so that turns
-// are reconciled only once no old server can still change them. A pid
-// whose process now has a different start time was recycled and is left
-// alone. The file is emptied on success.
+// are reconciled only once no old server can still change them. A record
+// is left alone unless it provably names the same process: it must come
+// from this boot and pid namespace (a copied home or a reboot leaves
+// records whose pids mean nothing here), and a pid whose process now has
+// a different start time was recycled. A record that cannot be checked
+// either way (no start time and no boot id) is left alone too. The file
+// is emptied on success.
 func KillStale(pidFile string, wait time.Duration) (killed int, err error) {
 	data, rerr := os.ReadFile(pidFile)
 	if errors.Is(rerr, os.ErrNotExist) {
@@ -397,12 +425,13 @@ func KillStale(pidFile string, wait time.Duration) (killed int, err error) {
 		}
 	}
 	var targets []int
+	boot, ns := bootID(), pidNamespace()
 	for _, r := range recs {
 		if r.PID <= 1 || r.PID == os.Getpid() {
 			continue
 		}
-		if cur := startTime(r.PID); cur != "" && r.Start != "" && cur != r.Start {
-			continue // recycled pid: the leader is a different process
+		if !sameProcess(r, boot, ns, startTime(r.PID)) {
+			continue
 		}
 		if !groupAlive(r.PID) {
 			continue
