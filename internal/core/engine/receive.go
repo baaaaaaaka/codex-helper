@@ -385,9 +385,17 @@ func (e *Engine) read(ctx context.Context, id int64) {
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	defer e.wakeReader() // the next read time is set below
 	cs.reading = false
 	now := e.now()
+	defer func() {
+		// The next read time is set below. The receiver loop wakes at
+		// least every max(Tick, Hot) and then looks at this chat again,
+		// so only a sooner next read needs a wake: an idle chat's safety
+		// read does not wake the loop for a read ten minutes away.
+		if cs.nextRead.Before(now.Add(max(e.t.Tick, e.t.Hot))) {
+			e.wakeReader()
+		}
+	}()
 	if err == nil {
 		cs.failures = 0
 		if !cs.readOnce && cs.firstRead != nil {
