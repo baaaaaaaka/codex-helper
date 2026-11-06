@@ -20,7 +20,9 @@
    | <p>new <root>/work/label</p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Helper v0.1.22 on e2ehost: up 1s; 0 sessions (0 active, 0 parked, 0 running); 0 requests run, 0 answered.</p>
+   | <p>Control status: no linked work chats yet.</p>
+   | <p>Speech recognition: configured.</p>
+   | <p>Next: send <code>projects</code> to choose a workspace, or <code>new &lt;directory&gt;</code> to create a Work chat.</p>
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>✅ Work chat created: s001</p>

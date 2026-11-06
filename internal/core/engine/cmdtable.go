@@ -84,9 +84,13 @@ var workCommands = map[string]cmdHandler{
 	},
 	// `helper file <path>` (F-RND-10, batch E: sendfile.go).
 	cmdSendFile: func(e *Engine, _ context.Context, j cmdJob, cs *convState, p parsed) { e.cmdSendFile(j, cs, p.arg) },
-	// HOOK(batch A): `helper details`, `helper publish-history`.
-	cmdDetails:        hook("helper details"),
-	cmdPublishHistory: hook("helper publish-history"),
+	// Batch A: `helper details`, `helper publish-history` (dashboard.go, import.go).
+	cmdDetails: func(e *Engine, _ context.Context, j cmdJob, cs *convState, _ parsed) {
+		e.reply(j, e.sessionDetails(cs.id), nil)
+	},
+	cmdPublishHistory: func(e *Engine, _ context.Context, j cmdJob, cs *convState, p parsed) {
+		e.cmdPublishHistory(j, cs, p.arg)
+	},
 }
 
 // controlCommands maps a control-chat command to its handler.
@@ -98,9 +102,7 @@ var controlCommands = map[string]cmdHandler{
 		}
 		e.reply(j, controlHelpText, nil)
 	},
-	cmdSessions: func(e *Engine, _ context.Context, j cmdJob, _ *convState, _ parsed) { e.reply(j, e.listText(), nil) },
 	cmdList:     func(e *Engine, _ context.Context, j cmdJob, _ *convState, _ parsed) { e.reply(j, e.listText(), nil) },
-	cmdStatus:   func(e *Engine, _ context.Context, j cmdJob, _ *convState, _ parsed) { e.reply(j, e.statusText(), nil) },
 	cmdNewName:  func(e *Engine, ctx context.Context, j cmdJob, _ *convState, p parsed) { e.cmdNew(ctx, j, p.arg) },
 	cmdParkName: func(e *Engine, _ context.Context, j cmdJob, _ *convState, p parsed) { e.cmdParkLabel(j, p.arg) },
 	cmdRenameName: func(e *Engine, ctx context.Context, j cmdJob, _ *convState, p parsed) {
@@ -148,17 +150,23 @@ var controlCommands = map[string]cmdHandler{
 		// HOOK(batch B): global defaults (F-CTL-11).
 		e.reply(j, "Global default management is not configured for this Teams service.", nil)
 	},
-	cmdSelect: func(e *Engine, _ context.Context, j cmdJob, _ *convState, _ parsed) {
-		// HOOK(batch A): the workspace/session dashboard (F-CTL-1..5).
-		e.reply(j, "I do not have a current list yet. Send `projects` or `sessions` first, then choose a number.", nil)
+	// Batch A: the workspace / session dashboard, `continue`, `open`,
+	// `details`, `status`, `mkdir` (dashboard.go, import.go).
+	cmdSelect:     func(e *Engine, ctx context.Context, j cmdJob, _ *convState, p parsed) { e.cmdSelect(ctx, j, p.arg) },
+	cmdWorkspaces: func(e *Engine, _ context.Context, j cmdJob, _ *convState, _ parsed) { e.cmdWorkspaces(j) },
+	cmdWorkspace: func(e *Engine, _ context.Context, j cmdJob, _ *convState, p parsed) {
+		e.cmdWorkspaceSessions(j, p.arg)
 	},
-	// HOOK(batch A): the workspace / history dashboard.
-	cmdWorkspaces: hook("projects"),
-	cmdWorkspace:  hook("project"),
-	cmdOpen:       hook("open"),
-	cmdPublish:    hook("continue"),
-	cmdMkdir:      hook("mkdir"),
-	cmdDetails:    hook("details"),
+	cmdSessions: func(e *Engine, _ context.Context, j cmdJob, _ *convState, p parsed) {
+		e.cmdWorkspaceSessions(j, p.arg)
+	},
+	cmdStatus: func(e *Engine, _ context.Context, j cmdJob, _ *convState, _ parsed) {
+		e.reply(j, e.activeChatsText(), nil)
+	},
+	cmdOpen:    func(e *Engine, _ context.Context, j cmdJob, _ *convState, p parsed) { e.cmdOpen(j, p.arg) },
+	cmdPublish: func(e *Engine, ctx context.Context, j cmdJob, _ *convState, p parsed) { e.cmdContinue(ctx, j, p.arg) },
+	cmdMkdir:   func(e *Engine, _ context.Context, j cmdJob, _ *convState, p parsed) { e.cmdMkdir(j, p.arg) },
+	cmdDetails: func(e *Engine, _ context.Context, j cmdJob, _ *convState, p parsed) { e.cmdDetails(j, p.arg) },
 	// HOOK(batch B): control Q&A, the control chat's effort, Workflow webhooks.
 	cmdAsk:        hook("ask"),
 	cmdEffortName: hook("effort"),
@@ -188,6 +196,7 @@ func firstLower(arg string) string {
 // runControl runs a control-chat command.
 func (e *Engine) runControl(ctx context.Context, j cmdJob, cs *convState) {
 	p := parseControl(j.text)
+	defer e.dashConsume(p) // batch A: the numbered list lasts one command (dashboard.go)
 	switch p.form {
 	case formCommand:
 		if h := controlCommands[p.name]; h != nil {
@@ -195,13 +204,17 @@ func (e *Engine) runControl(ctx context.Context, j cmdJob, cs *convState) {
 			return
 		}
 	case formText:
+		if looksLikeControlPath(j.text) { // batch A: v0.1.20's path hint (B:4775)
+			e.reply(j, pathHintText(j.text), nil)
+			return
+		}
 		// HOOK(batch B): v0.1.20 forwards this to a Codex question in the
 		// control chat. Until then it answers as v0.1.20's
 		// unknownControlCommandMessage does for text without a prefix.
 		e.reply(j, controlHelpText, nil)
 		return
 	}
-	e.reply(j, unknownControlText(p), nil)
+	e.reply(j, unknownControlText(p, j.text), nil)
 }
 
 // runWork runs a work-chat command. The text is parsed as admission did
@@ -219,15 +232,16 @@ func (e *Engine) runWork(ctx context.Context, j cmdJob, cs *convState) {
 }
 
 // unknownControlText is v0.1.20's unknownControlCommandMessage (B:5271).
-func unknownControlText(p parsed) string {
+func unknownControlText(p parsed, text string) string {
 	switch {
 	case p.name == "":
 		return controlHelpText
 	case p.syntax == synHelper && workOnlyName(p.name):
 		return textWrongChat
 	}
-	// HOOK(batch A): a name with "/" or a leading "." gets v0.1.20's path
-	// hint (controlPathHintMessage).
+	if strings.Contains(p.name, "/") || strings.HasPrefix(p.name, ".") {
+		return pathHintText(text) // batch A: controlPathHintMessage
+	}
 	return fmt.Sprintf("unknown control command: `%s`\n\n%s", p.name, controlHelpText)
 }
 

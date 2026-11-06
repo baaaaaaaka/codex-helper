@@ -220,6 +220,10 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 		if err != nil {
 			return err
 		}
+		imported, err := e.importChatCreated(tx, id, label, info.URL) // `continue` (import.go)
+		if err != nil {
+			return err
+		}
 		switch {
 		case inbox:
 			// Nothing is announced in or about the inbox.
@@ -234,6 +238,8 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 			if err := tx.SetMeta(discoveredKey(id), ""); err != nil {
 				return err
 			}
+		case imported:
+			// Its notices are queued with the conversation (import.go).
 		case intro != "":
 			if err := e.enqueueNotice(tx, id, "ready:"+label, intro); err != nil {
 				return err

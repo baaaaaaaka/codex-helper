@@ -109,6 +109,11 @@ type mirrorFile struct {
 	// records up to it are not posted.
 	held   bool
 	proven int64
+	// ns and keepTeams are set by a history import (import.go): the
+	// delivery key namespace ("" = the thread id) and the file end up to
+	// which helper-run turns are mirrored too.
+	ns        string
+	keepTeams int64
 }
 
 // catchingUp is the one boundary between catch-up and live mirroring
@@ -190,6 +195,7 @@ func (e *Engine) mirrorInit() error {
 		return err
 	}
 	e.mirror = m
+	e.importLoad() // import.go
 	for _, s := range srcs {
 		if s.State != store.SrcTracking || s.ConvID == 0 || !e.convOpen(s.ConvID) {
 			m.known[s.Path] = s.State
@@ -206,6 +212,7 @@ func (e *Engine) mirrorInit() error {
 				f.realign, f.realignAt = true, fromMS(at)
 			}
 		}
+		e.importRestore(f) // import.go
 		m.files[s.Path] = f
 	}
 	e.mirrorHistory()
@@ -656,11 +663,13 @@ func (e *Engine) track(src store.TranscriptSource, catchUp int64) {
 		e.logf("mirror track %s: %v", filepath.Base(src.Path), err)
 		return
 	}
+	f := &mirrorFile{src: src, tracker: transcript.NewTracker(src.ThreadID, src.Offset, src.Line, e.mirrorSkip),
+		catchUpEnd: catchUp, catchUpSet: true}
+	e.importRestore(f) // import.go
 	e.mirror.mu.Lock()
 	delete(e.mirror.known, src.Path)
 	delete(e.mirror.checked, src.Path)
-	e.mirror.files[src.Path] = &mirrorFile{src: src, tracker: transcript.NewTracker(src.ThreadID, src.Offset, src.Line, e.mirrorSkip),
-		catchUpEnd: catchUp, catchUpSet: true}
+	e.mirror.files[src.Path] = f
 	e.mirror.mu.Unlock()
 }
 
@@ -668,10 +677,15 @@ func (e *Engine) track(src store.TranscriptSource, catchUp int64) {
 // its rollout from offset.
 func (e *Engine) mirrorSession(ctx context.Context, src store.TranscriptSource, meta transcript.SessionMeta, offset, catchUp int64) {
 	first := transcript.FirstPrompt(src.Path, firstPromptMax)
-	var id int64
+	var id, bound int64
 	var label string
 	err := e.update(func(tx *store.Tx) error {
+		// A history import (`continue`, import.go) may have bound the
+		// thread meanwhile: track its rollout for that chat instead.
 		var err error
+		if bound, err = e.importBoundConv(tx, meta.ID); err != nil || bound != 0 {
+			return err
+		}
 		label, err = e.nextLabel(tx)
 		if err != nil {
 			return err
@@ -702,6 +716,11 @@ func (e *Engine) mirrorSession(ctx context.Context, src store.TranscriptSource, 
 		e.logf("mirror session %s: %v", meta.ID, err)
 		return
 	}
+	if bound != 0 {
+		src.ConvID, src.State = bound, store.SrcTracking
+		e.track(src, catchUp)
+		return
+	}
 	e.mu.Lock()
 	if cs := e.convs[id]; cs != nil {
 		cs.cwd, cs.threadID = meta.Cwd, meta.ID
@@ -726,6 +745,7 @@ func oneLine(s string, n int) string {
 // mirrorPoll stats the tracked rollouts that are due and reads the changed
 // ones. The stat is tiered (B1): see mirrorStatEvery.
 func (e *Engine) mirrorPoll(ctx context.Context) {
+	e.importApply(ctx) // import.go: queued history imports move their cursors first
 	now := e.now()
 	e.mirror.mu.Lock()
 	var due []*mirrorFile
@@ -870,6 +890,9 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 	if thread == "" {
 		thread = f.src.ThreadID
 	}
+	if f.ns != "" {
+		thread = f.ns // a chat with delivery keys of its own (import.go)
+	}
 	type rendered struct {
 		o    transcript.Output
 		msgs []store.OutMsg
@@ -895,7 +918,7 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 			if f.fails <= 3 || f.fails%20 == 0 {
 				e.logf("mirror render %s (%d in a row, retry in %s): %v", filepath.Base(f.src.Path), f.fails, back, err)
 			}
-			f.tracker = transcript.NewTracker(f.src.ThreadID, f.src.Offset, f.src.Line, e.mirrorSkip)
+			f.tracker = e.mirrorTracker(f)
 			return
 		}
 		rs = append(rs, rendered{o: o, msgs: msgs})
@@ -1011,12 +1034,15 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 				woke = true
 			}
 		}
-		return tx.AdvanceSource(f.src.ID, off, line, info.Size, ms(info.MTime), info.Inode, msgs)
+		if err := tx.AdvanceSource(f.src.ID, off, line, info.Size, ms(info.MTime), info.Inode, msgs); err != nil {
+			return err
+		}
+		return e.importProgress(tx, f, posted) // import.go
 	})
 	if err != nil {
 		e.logf("mirror advance %s: %v", filepath.Base(f.src.Path), err)
 		// Re-read from the persisted position next time.
-		f.tracker = transcript.NewTracker(f.src.ThreadID, f.src.Offset, f.src.Line, e.mirrorSkip)
+		f.tracker = e.mirrorTracker(f)
 		return
 	}
 	f.src.Offset, f.src.Line, f.src.Size, f.src.MTime, f.src.Inode = off, line, info.Size, ms(info.MTime), info.Inode

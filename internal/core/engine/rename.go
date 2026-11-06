@@ -648,8 +648,18 @@ func (e *Engine) autoTitle(ctx context.Context, conv int64, chat string) error {
 		if user, _, err = tx.Meta(fmt.Sprint(metaUserTitle, conv)); err != nil {
 			return err
 		}
-		if first, err = tx.FirstPrompt(conv); err != nil || first != "" {
+		if first, err = tx.FirstPrompt(conv); err != nil {
 			return err
+		}
+		// Batch A: a chat made by `continue` is titled from its local
+		// session (v0.1.20), not from the first prompt sent in Teams.
+		if v, _, err := tx.Meta(importedKey(conv)); err != nil {
+			return err
+		} else if v == "1" {
+			first = ""
+		}
+		if first != "" {
+			return nil
 		}
 		path, err = tx.SourcePath(conv)
 		return err
