@@ -373,7 +373,7 @@ func (e *Engine) read(ctx context.Context, id int64) {
 	e.mu.Unlock()
 	start := e.now()
 	w, err := e.ch.Receive(ctx, chat, cursor)
-	e.count(func(s *engineStats) { s.reads++ })
+	e.count(func(s *engineStats) { s.reads++; s.read(err, e.now()) })
 	if ctx.Err() != nil {
 		return
 	}
@@ -1182,7 +1182,7 @@ func (e *Engine) scanLoop(ctx context.Context) {
 		tick.Reset(every) // the cadence counts from this scan
 		started := e.now()
 		acts, err := e.scanner.ScanActivity(ctx, mark.Add(-scanOverlap))
-		e.count(func(s *engineStats) { s.reads++ })
+		e.count(func(s *engineStats) { s.reads++; s.read(err, e.now()) })
 		if ctx.Err() != nil {
 			return
 		}

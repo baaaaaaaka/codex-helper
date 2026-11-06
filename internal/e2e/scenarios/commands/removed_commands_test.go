@@ -48,14 +48,16 @@ func TestRemovedTeamsCommands(t *testing.T) {
 
 // Removed CLI commands (decision 4: `cxp teams recover`, `probe-chat`, the
 // separate read/write/file tokens, `teams path` modes captured-terminal
-// and service; decision 熔断: the offline breaker CLI). Each exits non-zero
+// and service; decision 熔断: the offline breaker CLI; `drain`, which has
+// no counterpart now that `pause` is an alias of `stop`, scenario
+// PAUSE-ALIAS). Each exits non-zero
 // without touching anything; the kept modes still work.
 func TestRemovedCLICommands(t *testing.T) {
 	harness.NeedsCLI(t)
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "DELETED-CLI", harness.Options{
 		Guarantees: []string{"removed-commands"},
-		Title:      "`cxp teams recover|probe-chat|pause|drain`, `auth read|file-write`, `path mode captured-terminal|service`: unknown, non-zero exit; kept `path mode account-default` works",
+		Title:      "`cxp teams recover|probe-chat|drain`, `auth read|file-write`, `path mode captured-terminal|service`: unknown, non-zero exit; kept `path mode account-default` works",
 		Budget:     60 * time.Second,
 		NoStart:    true,
 	})
@@ -63,7 +65,6 @@ func TestRemovedCLICommands(t *testing.T) {
 	for _, args := range [][]string{
 		{"teams", "recover"},
 		{"teams", "probe-chat"},
-		{"teams", "pause"},
 		{"teams", "drain"},
 		{"teams", "auth", "read"},
 		{"teams", "auth", "file-write"},

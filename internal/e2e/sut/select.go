@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -34,6 +35,7 @@ func Run(m *testing.M) int {
 		return 2
 	}
 	defer os.RemoveAll(dir)
+	binDir = dir
 	cxp, codex := filepath.Join(dir, "cxp"), filepath.Join(dir, "codex")
 	start := time.Now()
 	if err := goBuild(cxp, "./cmd/codex-proxy"); err != nil {
@@ -48,6 +50,37 @@ func Run(m *testing.M) int {
 	harness.CLIBinary = cxp
 	harness.DefaultFactory = Factory(cxp, codex)
 	return harness.RunAndCheckLeaks(m)
+}
+
+var (
+	binDir     string
+	versionsMu sync.Mutex
+	versions   = map[string]string{}
+)
+
+// VersionedCLI returns a cxp binary built like the SUT but reporting
+// version v (a newer release installed while the helper runs the
+// SUT's), built once per test binary.
+func VersionedCLI(v string) (string, error) {
+	versionsMu.Lock()
+	defer versionsMu.Unlock()
+	if p, ok := versions[v]; ok {
+		return p, nil
+	}
+	if binDir == "" {
+		return "", fmt.Errorf("sut: VersionedCLI outside sut.Run")
+	}
+	p := filepath.Join(binDir, "cxp-"+strings.Map(func(r rune) rune {
+		if r == '.' || r == '-' || ('0' <= r && r <= '9') || ('a' <= r && r <= 'z') {
+			return r
+		}
+		return '_'
+	}, v))
+	if err := goBuild(p, "./cmd/codex-proxy", "-ldflags", "-X github.com/baaaaaaaka/codex-helper/internal/cli.version="+v); err != nil {
+		return "", err
+	}
+	versions[v] = p
+	return p, nil
 }
 
 // Factory returns the SUT factory for the cxp binary.

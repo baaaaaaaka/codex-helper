@@ -135,6 +135,9 @@ type CLIAs struct {
 	// timing, so the run is not part of the golden. The scenario records
 	// the settled result with one more run without Poll.
 	Poll bool
+	// Binary runs another cxp build ("" = CLIBinary), e.g. a newer
+	// version installed while the helper still runs the older one.
+	Binary string
 }
 
 // RunCLIAs is RunCLI run as as; the run is part of the golden unless
@@ -159,7 +162,11 @@ func (s *Scenario) runCLIWith(timeout time.Duration, record bool, as CLIAs, args
 	NeedsCLI(s.T)
 	ctx, cancel := context.WithTimeout(s.ctx, timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, CLIBinary, args...)
+	bin := CLIBinary
+	if as.Binary != "" {
+		bin = as.Binary
+	}
+	cmd := exec.CommandContext(ctx, bin, args...)
 	vars := map[string]string{"PATH": os.Getenv("PATH"), "TMPDIR": os.Getenv("TMPDIR")}
 	for k, v := range s.Env.Vars {
 		vars[k] = v

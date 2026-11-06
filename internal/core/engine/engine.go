@@ -245,6 +245,8 @@ type Engine struct {
 	resolverWake chan struct{}
 	mirrorWake   chan struct{}
 	cmdQueue     chan cmdJob
+	once         onceState // `run --once` (once.go)
+	cli          cliState  // command-line requests (clireq.go)
 	cmdMu        sync.Mutex
 	cmdPending   map[int64][]cmdJob // per-conversation command queues; present while a worker runs
 	asrWake      chan struct{}
@@ -343,6 +345,7 @@ type engineStats struct {
 	reads     int
 	sends     int
 	started   time.Time
+	lastRead  time.Time // the last successful read or scan (F-CLI-1 "last poll")
 }
 
 // New validates cfg and returns an Engine (not started).
@@ -775,6 +778,9 @@ type Stats struct {
 	Conversations, Active, Parked, Running int
 	Turns, Completed, Reads, Sends         int
 	Uptime                                 time.Duration
+	// LastRead is when the last read or activity scan of Teams succeeded
+	// (zero before the first one).
+	LastRead time.Time
 }
 
 // Snapshot returns current counters.
@@ -800,8 +806,16 @@ func (e *Engine) Snapshot() Stats {
 	e.stats.mu.Lock()
 	s.Turns, s.Completed, s.Reads, s.Sends = e.stats.turns, e.stats.completed, e.stats.reads, e.stats.sends
 	s.Uptime = e.now().Sub(e.stats.started)
+	s.LastRead = e.stats.lastRead
 	e.stats.mu.Unlock()
 	return s
+}
+
+// read records a successful read or scan at now.
+func (s *engineStats) read(err error, now time.Time) {
+	if err == nil {
+		s.lastRead = now
+	}
 }
 
 func (e *Engine) count(f func(*engineStats)) {

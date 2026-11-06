@@ -171,3 +171,30 @@ func (t *Tx) RecentSent(convID int64, limit int) ([]Outbox, error) {
 	return collect(scanOutbox)(t.rows(`SELECT `+outboxCols+` FROM outbox
 WHERE conv_id = ? AND state = 'sent' ORDER BY seq DESC LIMIT ?`, convID, limit))
 }
+
+// PendingOutboxConvs lists the conversations with outbox rows still to
+// send (queued or sending; unknown rows wait for the resolver).
+func (s *Store) PendingOutboxConvs() ([]int64, error) {
+	rows, err := s.r.QueryContext(context.Background(), `SELECT DISTINCT conv_id FROM outbox WHERE state IN ('queued','sending') ORDER BY conv_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// OutboxByKeyPrefix lists the outbox rows whose delivery key starts with
+// prefix, in order (an index range scan on the unique key; read pool).
+func (s *Store) OutboxByKeyPrefix(prefix string) ([]Outbox, error) {
+	rows, err := s.r.QueryContext(context.Background(), `SELECT `+outboxCols+` FROM outbox
+WHERE delivery_key >= ? AND delivery_key < ? ORDER BY seq`, prefix, prefix+"\U0010FFFF")
+	return collect(scanOutbox)(rows, err)
+}

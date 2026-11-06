@@ -97,6 +97,38 @@ func newTeamsStopCmd() *cobra.Command {
 	}
 }
 
+// newTeamsPauseCmd and newTeamsResumeCmd keep v0.1.20's `cxp teams pause
+// [reason]` and `cxp teams resume` as hidden aliases of `cxp teams stop`
+// and `cxp teams start` (F-TRN-17 / R-40, coordinator ruling): there is
+// one stop concept. The reason v0.1.20 recorded is accepted and not kept;
+// the stop record says who stopped the helper, where and when.
+func newTeamsPauseCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:    "pause [reason]",
+		Short:  "Alias of `cxp teams stop`",
+		Hidden: true,
+		Args:   cobra.ArbitraryArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			if err := rejectTeamsHelperSelfManagementFromChild("stop the Teams helper", "shutdown"); err != nil {
+				return err
+			}
+			return runTeamsStop(cmd.Context(), cmd.OutOrStdout())
+		},
+	}
+}
+
+func newTeamsResumeCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:    "resume",
+		Short:  "Alias of `cxp teams start`",
+		Hidden: true,
+		Args:   cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runTeamsStart(cmd.Context(), cmd.OutOrStdout())
+		},
+	}
+}
+
 func runTeamsStop(ctx context.Context, out io.Writer) error {
 	anchor, err := teamsStopDir()
 	if err != nil {

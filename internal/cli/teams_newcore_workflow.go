@@ -244,17 +244,21 @@ func (n *teamsNewCoreNotifier) DisableWebhook() error {
 const teamsWorkflowWatchEvery = 5 * time.Second
 
 // watch applies a command's request promptly, so the command can report
-// it in effect.
-func (n *teamsNewCoreNotifier) watch(ctx context.Context) {
+// it in effect. also runs on the same tick (the helper's other sidecar
+// files: poll stamp, command-line requests), so they need no timer.
+func (n *teamsNewCoreNotifier) watch(ctx context.Context, also ...func(time.Time)) {
 	t := time.NewTicker(teamsWorkflowWatchEvery)
 	defer t.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-t.C:
+		case now := <-t.C:
 			if _, err := os.Stat(teamsWorkflowRequestPath(n.path)); err == nil {
 				n.apply()
+			}
+			for _, f := range also {
+				f(now)
 			}
 		}
 	}

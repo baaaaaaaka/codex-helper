@@ -1,0 +1,114 @@
+# PUBLISH-HISTORY-CLI: `cxp teams chat publish-history s001 --full --yes`: posts what is missing, then "already published"; --force replays once more
+# cxp black-box transcript; volatile values are numbered placeholders
+
+== chat <chat:1> "🏠 Codex Control - e2ehost"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
+-- <msg:2> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>continue <uuid:1></p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>continue <uuid:1></p>
+-- <msg:3> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>✅ Work chat created: s001</p>
+   | <p>Open Work chat:<br>
+   | <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
+   | <p>Preparing local Codex history now. Long sessions can take a few minutes.<br>
+   | Wait for &#34;Import complete&#34; in the Work chat before sending a new task there.</p>
+-- <msg:4> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Published local Codex session as s001: <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
+   | <p>Open this Teams work chat and send a message there to continue.</p>
+
+== chat <chat:2> "💬 e2ehost - Draft the schema"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Work chat created: s001.<br>
+   | Working directory: <root>/work/publish</p>
+-- <msg:2> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Imported Codex session history</p>
+   | <p>The messages below came from your local Codex session. Reply in this chat to continue from here.</p>
+   | <p>Session: Draft the schema</p>
+-- <msg:3> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
+   | <p>Draft the schema</p>
+-- <msg:4> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>Schema drafted</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+-- <msg:5> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
+   | <p>Index the table</p>
+-- <msg:6> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>Table indexed</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+-- <msg:7> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Import complete. This chat is ready; reply here to continue the Codex session.</p>
+-- <msg:8> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Imported Codex session history</p>
+   | <p>The messages below came from your local Codex session. Reply in this chat to continue from here.</p>
+   | <p>Session: Draft the schema</p>
+-- <msg:9> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Import complete. This chat is ready; reply here to continue the Codex session.</p>
+-- <msg:10> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Full local Codex history is now up to date in this chat.</p>
+-- <msg:11> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Imported Codex session history</p>
+   | <p>The messages below came from your local Codex session. Reply in this chat to continue from here.</p>
+   | <p>Session: Draft the schema</p>
+-- <msg:12> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
+   | <p>Draft the schema</p>
+-- <msg:13> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>Schema drafted</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+-- <msg:14> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
+   | <p>Index the table</p>
+-- <msg:15> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>Table indexed</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+-- <msg:16> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Import complete. This chat is ready; reply here to continue the Codex session.</p>
+-- <msg:17> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Full local Codex history is now up to date in this chat.</p>
+
+== cli
+$ cxp teams chat publish-history s001 --yes
+   exit 1
+   stderr| Error: publishing complete local history requires --full
+$ cxp teams chat publish-history s001 --full
+   exit 1
+   stderr| Error: publishing local history sends messages to Teams; rerun with --yes
+$ cxp teams chat publish-history s999 --full --yes
+   exit 1
+   stdout| Waiting for the running Teams helper...
+   stderr| Error: Teams session not found for "s999"
+$ cxp teams chat publish-history s001 --full --yes
+   exit 0
+   stdout| Waiting for the running Teams helper...
+   stdout| Full local Codex history published to the selected Teams chat.
+$ cxp teams chat publish-history s001 --full --yes
+   exit 0
+   stdout| Waiting for the running Teams helper...
+   stdout| Full local Codex history is already published to this Teams chat.
+$ cxp teams chat publish-history s001 --full --force --yes
+   exit 0
+   stdout| Waiting for the running Teams helper...
+   stdout| Full local Codex history published to the selected Teams chat.

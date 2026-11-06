@@ -145,6 +145,11 @@ func ResolveAuthConfig(profile string) (AuthConfig, error) {
 	if cfg.TenantID == "" || cfg.ClientID == "" {
 		return AuthConfig{}, &channel.AuthRequired{Err: fmt.Errorf("Teams tenant id and client id are not configured (set them in %s)", path)}
 	}
+	if !UnsafeScopesAllowed() {
+		if err := ValidateScopes(cfg.Scopes); err != nil {
+			return AuthConfig{}, err
+		}
+	}
 	if v := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE")); v != "" {
 		cfg.CachePath = expandHome(v)
 		return cfg, nil
@@ -166,6 +171,56 @@ func ResolveAuthConfig(profile string) (AuthConfig, error) {
 		break
 	}
 	return cfg, nil
+}
+
+// allowedScopes is v0.1.20's set of delegated Graph scopes the helper may
+// request. A configured scope outside it fails closed (F-SET-2) unless
+// CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES opts in.
+var allowedScopes = map[string]bool{
+	"openid":                   true,
+	"profile":                  true,
+	"offline_access":           true,
+	"User.Read":                true,
+	"Files.Read":               true,
+	"Chat.Read":                true,
+	"Chat.ReadWrite":           true,
+	"Chat.Create":              true,
+	"ChatMessage.Send":         true,
+	"ChatMember.ReadWrite":     true,
+	"Channel.ReadBasic.All":    true,
+	"ChannelMessage.Read.All":  true,
+	"OnlineMeetings.ReadWrite": true,
+	"Files.ReadWrite":          true,
+}
+
+// ValidateScopes refuses Graph scopes broader than the helper needs, with
+// v0.1.20's message.
+func ValidateScopes(scopes string) error {
+	var unexpected []string
+	seen := map[string]bool{}
+	for _, scope := range strings.Fields(scopes) {
+		if seen[scope] {
+			continue
+		}
+		seen[scope] = true
+		if !allowedScopes[scope] {
+			unexpected = append(unexpected, scope)
+		}
+	}
+	if len(unexpected) > 0 {
+		return fmt.Errorf("unexpected Teams Graph scope(s): %s; set CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES=1 to override", strings.Join(unexpected, ", "))
+	}
+	return nil
+}
+
+// UnsafeScopesAllowed reports the CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES
+// opt-out.
+func UnsafeScopesAllowed() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES"))) {
+	case "1", "true", "yes", "on":
+		return true
+	}
+	return false
 }
 
 type cacheCandidate struct {

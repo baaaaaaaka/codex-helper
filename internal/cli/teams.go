@@ -45,10 +45,14 @@ func newTeamsCmd(root *rootOptions) *cobra.Command {
 		newTeamsSetupCmd(),
 		newTeamsAuthCmd(root),
 		newTeamsControlCmd(),
+		newTeamsChatCmd(),
+		newTeamsSendFileCmd(),
 		newTeamsWorkflowCmd(root),
 		newTeamsRunCmd(root),
 		newTeamsStopCmd(),
 		newTeamsStartCmd(),
+		newTeamsPauseCmd(),
+		newTeamsResumeCmd(),
 		newTeamsStatusCmd(),
 		newTeamsDoctorCmd(root),
 		newTeamsPathCmd(root),
@@ -308,16 +312,28 @@ func newTeamsLogoutCmd() *cobra.Command {
 // newTeamsControlCmd prints this machine's control chat from the helper's
 // store. The helper creates the chat itself when it starts.
 func newTeamsControlCmd() *cobra.Command {
-	var printOnly bool
+	var printOnly, recreate, yes bool
 	cmd := &cobra.Command{
 		Use:   "control",
-		Short: "Show this machine's Teams control chat",
-		Long:  "Show this machine's Teams control chat, read from the helper's local store. The helper creates the control chat when it first starts.",
+		Short: "Show or recreate this machine's Teams control chat",
+		Long:  "Show this machine's Teams control chat, read from the helper's local store. The helper creates the control chat when it first starts. With --recreate --yes the running helper creates a fresh control chat, switches to it and posts a link to it in the old one (which is not deleted).",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if printOnly && recreate {
+				return fmt.Errorf("use only one of --no-create/--print or --recreate")
+			}
+			if recreate {
+				if !yes {
+					return fmt.Errorf("recreating the control chat creates a new Teams chat and sends messages; rerun with --yes")
+				}
+				return runTeamsControlRecreate(cmd.OutOrStdout())
+			}
 			return printTeamsControlChat(cmd.OutOrStdout())
 		},
 	}
+	cmd.Flags().BoolVar(&recreate, "recreate", false, "Create a fresh meeting-based control chat and switch the helper to it; old Teams chats are not deleted")
+	cmd.Flags().BoolVar(&yes, "yes", false, "Confirm that --recreate may create a Teams chat and send an @mention plus a ready message")
+	teamsDrainTimeoutFlag(cmd)
 	// Accepted for scripts written for earlier releases (printing is the
 	// only mode now).
 	cmd.Flags().BoolVar(&printOnly, "print", false, "Print the control chat (the default)")
@@ -386,12 +402,28 @@ func newTeamsRunCmd(root *rootOptions) *cobra.Command {
 	var autoService bool
 	var machineRegistry bool
 	var managedServiceChild bool
+	var interval time.Duration
+	var once bool
 	cmd := &cobra.Command{
 		Use:     "run",
 		Aliases: []string{"listen"},
 		Short:   "Poll Teams chats and route session messages to Codex",
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if cmd.Flags().Changed("interval") && interval <= 0 {
+				return fmt.Errorf("--interval must be positive")
+			}
+			if !cmd.Flags().Changed("interval") {
+				interval = 0 // the helper's own read tiers
+			}
+			if once {
+				// F-CLI-10: one cycle in the foreground, as in v0.1.20: no
+				// background service, machine registry or self-update.
+				if managedServiceChild {
+					return fmt.Errorf("--once cannot be used by the Teams service")
+				}
+				autoService, machineRegistry, autoUpdate = false, false, false
+			}
 			if autoService && !managedServiceChild {
 				// F-SVC-5: a foreground run repairs and starts the background
 				// service where one is supported; the service then runs the
@@ -418,9 +450,13 @@ func newTeamsRunCmd(root *rootOptions) *cobra.Command {
 				autoUpdatePrerelease: autoUpdatePrerelease,
 				codexArgs:            codexArgs,
 				managedServiceChild:  managedServiceChild,
+				interval:             interval,
+				once:                 once,
 			})
 		},
 	}
+	cmd.Flags().DurationVar(&interval, "interval", 5*time.Second, "Polling interval (the control chat and active chats; idle chats are read less often)")
+	cmd.Flags().BoolVar(&once, "once", false, "Poll once, finish the work that brings in, and exit")
 	cmd.Flags().StringVar(&codexPath, "codex-path", "", "Override Codex CLI path")
 	cmd.Flags().StringArrayVar(&codexArgs, "codex-arg", nil, "Extra Codex argument for the app-server (repeatable)")
 	cmd.Flags().StringVar(&asrCommand, "asr-command", "", "Optional local Teams audio/video transcription command; stdout may be plain text or ASRTranscript JSON")
