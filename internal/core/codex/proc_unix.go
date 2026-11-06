@@ -88,23 +88,3 @@ func liveGroupMembers(pgid int) (live, ok bool) {
 	}
 	return false, seen
 }
-
-// startTime returns an identifier of when pid started (Linux: the start
-// time in clock ticks from /proc), or "" when unknown. It guards against
-// killing a recycled pid.
-func startTime(pid int) string {
-	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
-	if err != nil {
-		return ""
-	}
-	s := string(data)
-	i := strings.LastIndexByte(s, ')')
-	if i < 0 {
-		return ""
-	}
-	f := strings.Fields(s[i+1:])
-	if len(f) < 20 {
-		return ""
-	}
-	return f[19] // field 22 overall: starttime
-}

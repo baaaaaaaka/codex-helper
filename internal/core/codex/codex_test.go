@@ -440,16 +440,18 @@ func TestKillStale(t *testing.T) {
 		}
 		return cmd
 	}
-	victim, bystander := start(), start()
+	victim, bystander, moved := start(), start(), start()
 	waited := make(chan error, 2)
 	go func() { waited <- victim.Wait() }()
 	defer func() {
-		_ = bystander.Process.Kill()
-		_ = bystander.Wait()
+		for _, c := range []*exec.Cmd{bystander, moved} {
+			_ = c.Process.Kill()
+			_ = c.Wait()
+		}
 	}()
-	// Wait until /proc shows both.
+	// Wait until /proc shows all three.
 	deadline := time.Now().Add(10 * time.Second)
-	for startTime(victim.Process.Pid) == "" || startTime(bystander.Process.Pid) == "" {
+	for startTime(victim.Process.Pid) == "" || startTime(bystander.Process.Pid) == "" || startTime(moved.Process.Pid) == "" {
 		if time.Now().After(deadline) {
 			t.Skip("no /proc start times on this platform")
 		}
@@ -459,6 +461,9 @@ func TestKillStale(t *testing.T) {
 	recs := []pidRecord{
 		{PID: victim.Process.Pid, Start: startTime(victim.Process.Pid)},
 		{PID: bystander.Process.Pid, Start: "1"}, // recycled pid: leave alone
+		// A home copied from another machine (or a file from before a
+		// reboot): even a matching pid and start time mean nothing here.
+		{PID: moved.Process.Pid, Start: startTime(moved.Process.Pid), Boot: "another-machine"},
 	}
 	data, _ := json.Marshal(recs)
 	if err := os.WriteFile(pidFile, data, 0o600); err != nil {
@@ -478,12 +483,39 @@ func TestKillStale(t *testing.T) {
 	if !groupAlive(bystander.Process.Pid) {
 		t.Fatal("bystander killed")
 	}
+	if bootID() != "" && !groupAlive(moved.Process.Pid) {
+		t.Fatal("killed a pid recorded on another machine")
+	}
 	data, _ = os.ReadFile(pidFile)
 	if string(data) != "[]" {
 		t.Fatalf("pid file %s", data)
 	}
 	if n, err := KillStale(filepath.Join(t.TempDir(), "missing"), time.Second); n != 0 || err != nil {
 		t.Fatalf("missing file: %d %v", n, err)
+	}
+}
+
+func TestSameProcess(t *testing.T) {
+	for _, c := range []struct {
+		name            string
+		r               pidRecord
+		boot, ns, start string
+		want            bool
+	}{
+		{"same boot and start", pidRecord{Start: "7", Boot: "b1", NS: "n1"}, "b1", "n1", "7", true},
+		{"recycled pid", pidRecord{Start: "7", Boot: "b1"}, "b1", "", "8", false},
+		{"leader gone, same boot", pidRecord{Start: "7", Boot: "b1"}, "b1", "", "", true},
+		{"another machine, same start", pidRecord{Start: "7", Boot: "b0"}, "b1", "", "7", false},
+		{"another pid namespace", pidRecord{Start: "7", Boot: "b1", NS: "n0"}, "b1", "n1", "7", false},
+		{"no start times, same boot (macOS)", pidRecord{Boot: "b1"}, "b1", "", "", true},
+		{"no start times, another boot", pidRecord{Boot: "b0"}, "b1", "", "", false},
+		{"nothing to check", pidRecord{}, "", "", "", false},
+		{"old record, start matches", pidRecord{Start: "7"}, "b1", "", "7", true},
+		{"old record, leader gone", pidRecord{Start: "7"}, "b1", "", "", false},
+	} {
+		if got := sameProcess(c.r, c.boot, c.ns, c.start); got != c.want {
+			t.Errorf("%s: sameProcess = %v, want %v", c.name, got, c.want)
+		}
 	}
 }
 
