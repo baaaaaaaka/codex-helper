@@ -234,7 +234,7 @@ Columns: id · status (`keep` / `removed-by-owner` / `ask-owner`, with the owner
 | R-21 | keep | per-chat runners; control never queued | R-11 | — |
 | R-22 | keep | freeze notice once per park (core/engine/annotations.go:106 meta marker, :159 `freeze` with `Present` check in channel/teams/annotate.go:285 `noticeEdit`); other notices once | BREAKER, DUP, IDLE, SILENCE, VOICE, WAKE-SYNTAX, EDIT-FREEZE | — |
 | R-23 | keep | the envelope stays out of Teams and titles (transcript/strip.go:209 `StripHelperPrompt`, discover.go:163); `<oai-mem-citation>` stripped (F-MIR-8, transcript/strip.go:15) | F-TRN-14, F-MIR-8 | — |
-| R-24 | keep | cli/teams_user_path.go, teams_child_guard.go | NONE | — |
+| R-24 | keep | cli/teams_user_path.go, teams_child_guard.go; cli/teams_newcore_codexenv.go:122 (managed Codex for app-servers = the upgrade target), cli/teams_newcore_update.go:77 (unchanged-version upgrade: no restart) | CODEX-MANAGED | — |
 | R-25 | keep | cli/teams_child_guard.go:14 | NONE | — |
 | R-26 | keep | engine/envelope.go:549 `containsRawAPIKey` (v0.1.20 port), :500 `screen` / :537 `refuse`: a prompt or command with a raw key from a human is refused with one unquoted reply, never run or sent to Codex, and its body is stored redacted (receive.go:506); reply text adapted (no `model setup`, owner removed third-party APIs) | R-26 | B:4613 |
 | R-27 | keep | control chat owner-only (receive.go:744); coworker commands refused with v0.1.20's text (receive.go:753), coworker ACK text (:967) | R-43, GROUP-CMDS | — |

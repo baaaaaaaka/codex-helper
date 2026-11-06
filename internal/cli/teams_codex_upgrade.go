@@ -107,19 +107,31 @@ func upgradeTeamsCodex(ctx context.Context, root *rootOptions, out io.Writer) (s
 	if err != nil {
 		return "", err
 	}
-	installOpts := managedCodexUpgradeInstallOptions(upgradeTarget)
+	installOpts, err := teamsManagedCodexInstallOptions(ctx, store, cfg, upgradeTarget, out)
+	if err != nil {
+		return "", err
+	}
+	return upgradeOrInstallManagedCodex(ctx, out, upgradeTarget, installOpts)
+}
+
+// teamsManagedCodexInstallOptions are the install options for the
+// CXP-managed Codex of target: its environment and identity, and the cxp
+// proxy profile for the installer when the helper uses one. The Teams
+// launch (first install) and the Teams upgrade share them.
+func teamsManagedCodexInstallOptions(ctx context.Context, store *config.Store, cfg config.Config, target managedCodexUpgradeTarget, out io.Writer) (codexInstallOptions, error) {
+	installOpts := managedCodexUpgradeInstallOptions(target)
 	if upgradeUsesProxy(cfg) {
 		profile, cfgWithProfile, err := ensureProfileRunFn(ctx, store, "", true, out)
 		if err != nil {
-			return "", err
+			return codexInstallOptions{}, err
 		}
 		installOpts.withInstallerEnv = func(ctx context.Context, runInstall func([]string) error) error {
 			return withProfileInstallEnv(ctx, store, profile, cfgWithProfile.Instances, func(profileEnv []string) error {
-				return runInstall(managedCodexUpgradeProxyEnvironment(upgradeTarget.environment, profileEnv))
+				return runInstall(managedCodexUpgradeProxyEnvironment(target.environment, profileEnv))
 			})
 		}
 	}
-	return upgradeOrInstallManagedCodex(ctx, out, upgradeTarget, installOpts)
+	return installOpts, nil
 }
 
 func resolveTeamsCodexUpgradeTarget(ctx context.Context, cfg config.Config, paths effectivePaths) (managedCodexUpgradeTarget, error) {

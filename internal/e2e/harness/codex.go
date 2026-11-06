@@ -46,6 +46,8 @@ type CodexCall struct {
 	Err     string
 	// Pid is the fake app-server process that ran the call (0 in-process).
 	Pid int
+	// Exe is the Codex executable that ran the call ("" in-process).
+	Exe string
 }
 
 // HasToken reports whether the prompt contained token.

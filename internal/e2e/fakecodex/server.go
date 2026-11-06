@@ -471,7 +471,7 @@ func (s *server) startTurn(p map[string]any) (any, *rpcError) {
 	plan, err := s.begin(BeginRequest{
 		Instance: s.cfg.Instance, Kind: s.cfg.Kind, Pid: os.Getpid(),
 		ThreadID: threadID, TurnID: turnID, ClientID: clientID, Cwd: cwd, Prompt: prompt, Images: images,
-		Model: model, Effort: effort,
+		Model: model, Effort: effort, Exe: executable(),
 	})
 	if err != nil {
 		return nil, &rpcError{Code: -32603, Message: "fake codex brain unavailable: " + err.Error()}
@@ -823,4 +823,13 @@ func (s *server) end(seq int, outcome, msg string) {
 	if err := s.post(ctx, "/end?seq="+strconv.Itoa(seq), EndRequest{Outcome: outcome, Error: msg}, nil); err != nil && !errors.Is(err, context.Canceled) {
 		fmt.Fprintf(s.cfg.Log, "fakecodex: end: %v\n", err)
 	}
+}
+
+// executable is the path this app-server was started from ("" if unknown).
+func executable() string {
+	p, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return p
 }

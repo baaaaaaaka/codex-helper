@@ -40,6 +40,9 @@ type BeginRequest struct {
 	Images   []string `json:"images,omitempty"`
 	Model    string   `json:"model,omitempty"`  // turn/start model override
 	Effort   string   `json:"effort,omitempty"` // turn/start effort override
+	// Exe is the path of the Codex executable that runs the app-server
+	// (which installation the helper chose).
+	Exe string `json:"exe,omitempty"`
 }
 
 // ResumeRequest is sent by the app-server when a thread/resume arrives for a

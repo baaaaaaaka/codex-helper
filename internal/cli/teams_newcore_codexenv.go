@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/config"
 	"github.com/baaaaaaaka/codex-helper/internal/env"
 	"github.com/baaaaaaaka/codex-helper/internal/responsespolicy"
 )
@@ -34,6 +35,7 @@ import (
 // One gateway serves every app-server of the process.
 type teamsNewCoreCodexLaunch struct {
 	Bin       string
+	Identity  *execIdentity
 	Args      []string
 	Configure func(*exec.Cmd) error
 	// Done reports the gateway failing (nil channel: no gateway).
@@ -67,12 +69,21 @@ func newTeamsNewCoreCodexLaunch(ctx context.Context, root *rootOptions, codexBin
 			environ = setEnvValue(environ, k, v)
 		}
 	}
-	bin := codexBin
-	if pathResult, err := resolveTeamsCodexUserPath(ctx, cfg, paths, environ, paths.Home); err != nil {
-		_, _ = fmt.Fprintf(log, "Codex runs with the service PATH: the login-shell PATH could not be resolved: %v\n", err)
+	pathResult, pathErr := resolveTeamsCodexUserPath(ctx, cfg, paths, environ, paths.Home)
+	if pathErr != nil {
+		_, _ = fmt.Fprintf(log, "Codex runs with the service PATH: the login-shell PATH could not be resolved: %v\n", pathErr)
 	} else {
+		environ = setEnvValue(environ, "PATH", pathResult.Path)
+	}
+	if strings.TrimSpace(codexBin) == "" {
+		if codexBin, err = resolveTeamsNewCoreManagedCodex(ctx, store, cfg, codexRuntimeEnvironment(environ, nil, paths.ExecIdentity), paths.ExecIdentity, log); err != nil {
+			return teamsNewCoreCodexLaunch{}, fmt.Errorf("prepare CXP-managed Codex for Teams: %w", err)
+		}
+	}
+	bin := codexBin
+	if pathErr == nil {
 		rt := applyTeamsUserPathRuntime(resolvedCodexRuntime{Command: codexBin, WrapperCommand: codexBin,
-			Environment: setEnvValue(environ, "PATH", pathResult.Path)}, pathResult, log)
+			Environment: environ}, pathResult, log)
 		bin, environ = rt.Command, rt.Environment
 	}
 	gw, err := responsespolicy.StartServer(responsespolicy.ServerOptions{ProxyURL: proxyURL})
@@ -81,8 +92,9 @@ func newTeamsNewCoreCodexLaunch(ctx context.Context, root *rootOptions, codexBin
 	}
 	identity := paths.ExecIdentity
 	return teamsNewCoreCodexLaunch{
-		Bin:  bin,
-		Args: gw.CodexConfigArgs(),
+		Bin:      bin,
+		Identity: identity,
+		Args:     gw.CodexConfigArgs(),
 		Configure: func(cmd *exec.Cmd) error {
 			e, err := applyExecIdentity(cmd, append([]string(nil), environ...), identity)
 			if err != nil {
@@ -98,6 +110,25 @@ func newTeamsNewCoreCodexLaunch(ctx context.Context, root *rootOptions, codexBin
 			_ = gw.Close(sctx)
 		},
 	}, nil
+}
+
+// resolveTeamsNewCoreManagedCodex is the Codex the Teams app-servers run
+// without --codex-path (SPEC R-24): the CXP-managed install, found in the
+// app-server environment (its HOME, CODEX_NPM_PREFIX, identity), else
+// installed there — as the old core did, and the same resolution the Teams
+// Codex upgrade uses, so an upgrade replaces the binary that runs. A
+// `codex` earlier on PATH is not used: it is not what `codex update now`
+// or a too-old rejection upgrades.
+var resolveTeamsNewCoreManagedCodex = func(ctx context.Context, store *config.Store, cfg config.Config, environment []string, identity *execIdentity, log io.Writer) (string, error) {
+	target := resolveManagedCodexUpgradeTarget(ctx, environment, identity)
+	if target.path != "" {
+		return target.path, nil
+	}
+	opts, err := teamsManagedCodexInstallOptions(ctx, store, cfg, target, log)
+	if err != nil {
+		return "", err
+	}
+	return upgradeOrInstallManagedCodex(ctx, log, target, opts)
 }
 
 // teamsNewCoreCodexArgs translates `teams run --codex-arg` for the new

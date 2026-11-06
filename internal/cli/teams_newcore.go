@@ -451,15 +451,10 @@ func serveTeamsNewCore(ctx context.Context, out, errOut io.Writer, root *rootOpt
 		return err
 	}
 
-	// Codex: an explicit --codex-path, else the discovered installation.
+	// Codex: an explicit --codex-path, else the CXP-managed install (the
+	// launch resolves or installs it; SPEC R-24).
 	codexBin := strings.TrimSpace(opts.codexPath)
-	if codexBin == "" {
-		if codexBin, err = ensureCodexInstalled(ctx, "", errOut); err != nil {
-			return err
-		}
-	}
 	server := codex.Config{
-		Bin:  codexBin,
 		Args: []string{"--analytics-default-enabled"},
 		Env:  []string{"CODEX_HOME=" + paths.CodexDir},
 	}
@@ -524,7 +519,7 @@ func serveTeamsNewCore(ctx context.Context, out, errOut io.Writer, root *rootOpt
 		cfg.UpdatePrerelease = opts.autoUpdatePrerelease
 	}
 	if strings.TrimSpace(opts.codexPath) == "" {
-		cfg.CodexUpgrader = teamsNewCoreCodexUpgrader{root: root, log: errOut}
+		cfg.CodexUpgrader = teamsNewCoreCodexUpgrader{root: root, bin: launch.Bin, identity: launch.Identity, log: errOut}
 	}
 	if cfg.Registry {
 		// The registry keys the inbox by the account id: read once (and
