@@ -18,7 +18,7 @@ import (
 
 func openExclusive(t *testing.T, path string) *Store {
 	t.Helper()
-	s, err := OpenWith(path, Options{Now: newClock().now, PIDAlive: alwaysAlive, exclusive: true})
+	s, err := OpenWith(path, Options{Now: newClock().now, PIDAlive: alwaysAlive, Exclusive: true})
 	mustT(t, err)
 	t.Cleanup(func() { s.Close() })
 	return s
@@ -100,7 +100,7 @@ func TestExclusiveModeReadOnlyReadsACopy(t *testing.T) {
 		t.Fatalf("another connection read the store in exclusive mode: %v", err)
 	}
 
-	ro, err := OpenWith(path, Options{ReadOnly: true, exclusive: true})
+	ro, err := OpenWith(path, Options{ReadOnly: true, Exclusive: true})
 	mustT(t, err)
 	if v, ok, err := ro.Meta("k"); err != nil || !ok || v != "1" {
 		t.Fatalf("read-only view: %q %v %v", v, ok, err)
@@ -138,7 +138,7 @@ func TestExclusiveModeReadOnlyReadsACopy(t *testing.T) {
 func TestExclusiveModeCrashKeepsEveryCommit(t *testing.T) {
 	if dir := os.Getenv("STORE_EXCL_CRASH_DIR"); dir != "" {
 		// The child: commit, report, die without closing.
-		s, err := OpenWith(filepath.Join(dir, "core.sqlite"), Options{exclusive: true})
+		s, err := OpenWith(filepath.Join(dir, "core.sqlite"), Options{Exclusive: true})
 		mustT(t, err)
 		_, err = s.Acquire(testIdent(os.Getpid()))
 		mustT(t, err)
@@ -184,7 +184,7 @@ func TestExclusiveModeCrashKeepsEveryCommit(t *testing.T) {
 	c := openExclusive(t, dst)
 	check(c, "copy")
 	// The same host after the crash: opens the file in place.
-	again, err := OpenWith(src, Options{PIDAlive: func(int) bool { return false }, exclusive: true})
+	again, err := OpenWith(src, Options{PIDAlive: func(int) bool { return false }, Exclusive: true})
 	mustT(t, err)
 	defer again.Close()
 	check(again, "in place")

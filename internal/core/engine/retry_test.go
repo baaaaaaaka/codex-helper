@@ -20,7 +20,7 @@ import (
 // process exits and its supervisor restarts it); nothing keeps retrying
 // against a store another process owns.
 func TestOwnershipLossStopsEngine(t *testing.T) {
-	r := newRig(t, func(c *Config) { c.Timing.Heartbeat = 50 * time.Millisecond })
+	r := newSharedRig(t, func(c *Config) { c.Timing.Heartbeat = 50 * time.Millisecond })
 	r.control()
 
 	other, err := store.Open(r.path)

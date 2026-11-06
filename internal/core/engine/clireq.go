@@ -532,6 +532,16 @@ func (e *Engine) cliRebind(ctx context.Context, r CLIRequest, p *cliProgress, co
 		return nil, err
 	}
 	defer release()
+	// Read before the transaction: with the single connection of a
+	// network filesystem a store read inside it waits forever.
+	var src store.TranscriptSource
+	var haveSrc bool
+	var title string
+	if r.History && !control {
+		if src, haveSrc = e.cliSource(p.Conv, cs.threadID); haveSrc {
+			title = e.sessionTitleOf(src.Path, src.ThreadID)
+		}
+	}
 	var queued bool
 	var gone string
 	err = e.update(func(tx *store.Tx) error {
@@ -577,8 +587,7 @@ func (e *Engine) cliRebind(ctx context.Context, r CLIRequest, p *cliProgress, co
 			}
 		}
 		if r.History && !control {
-			src, ok := e.cliSource(p.Conv, cs.threadID)
-			if ok {
+			if haveSrc {
 				ns, _, err := tx.Meta(mirrorNSKey(src.ID))
 				if err != nil {
 					return err
@@ -593,7 +602,7 @@ func (e *Engine) cliRebind(ctx context.Context, r CLIRequest, p *cliProgress, co
 					return err
 				}
 				if err == nil {
-					if err := e.enqueueNotice(tx, p.Conv, fmt.Sprintf("import:%d:title", id), textImportTitle(e.sessionTitleOf(src.Path, src.ThreadID))); err != nil {
+					if err := e.enqueueNotice(tx, p.Conv, fmt.Sprintf("import:%d:title", id), textImportTitle(title)); err != nil {
 						return err
 					}
 					p.Import, queued = id, true
@@ -700,6 +709,7 @@ func (e *Engine) cliPublishHistory(ctx context.Context, r CLIRequest, p *cliProg
 				return CLIResult{Lines: []string{"Full local Codex history is already published to this Teams chat."}}, nil
 			}
 		}
+		title := e.sessionTitleOf(src.Path, src.ThreadID) // reads the store: not inside the transaction
 		running := false
 		err = e.update(func(tx *store.Tx) error {
 			running = false
@@ -721,7 +731,7 @@ func (e *Engine) cliPublishHistory(ctx context.Context, r CLIRequest, p *cliProg
 			if err != nil {
 				return err
 			}
-			if err := e.enqueueNotice(tx, id, fmt.Sprintf("import:%d:title", jid), textImportTitle(e.sessionTitleOf(src.Path, src.ThreadID))); err != nil {
+			if err := e.enqueueNotice(tx, id, fmt.Sprintf("import:%d:title", jid), textImportTitle(title)); err != nil {
 				return err
 			}
 			p.Conv, p.Import, p.Stage = id, jid, cliImporting

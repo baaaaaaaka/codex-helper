@@ -179,6 +179,11 @@ type rig struct {
 	log    *strings.Builder
 	logMu  *sync.Mutex
 	tweak  func(*Config)
+	// shared opens the store in the local-disk mode, where a second Store
+	// on the same file works. Only tests that need another writer set it;
+	// the rest run in the network-filesystem mode (one connection), so a
+	// store read inside a transaction hangs here as it would on NFS.
+	shared bool
 }
 
 type lockedWriter struct {
@@ -193,7 +198,16 @@ func (w lockedWriter) Write(p []byte) (int, error) {
 }
 
 func newRig(t *testing.T, tweak ...func(*Config)) *rig {
-	r := &rig{t: t, ch: channeltest.New(), ag: newAgent(), path: filepath.Join(t.TempDir(), "core.db"), log: &strings.Builder{}, logMu: &sync.Mutex{}}
+	return newRigWith(t, false, tweak...)
+}
+
+// newSharedRig is newRig for a test that opens a second Store on the file.
+func newSharedRig(t *testing.T, tweak ...func(*Config)) *rig {
+	return newRigWith(t, true, tweak...)
+}
+
+func newRigWith(t *testing.T, shared bool, tweak ...func(*Config)) *rig {
+	r := &rig{shared: shared, t: t, ch: channeltest.New(), ag: newAgent(), path: filepath.Join(t.TempDir(), "core.db"), log: &strings.Builder{}, logMu: &sync.Mutex{}}
 	r.tweak = func(c *Config) {
 		for _, f := range tweak {
 			f(c)
@@ -238,7 +252,7 @@ func newRig(t *testing.T, tweak ...func(*Config)) *rig {
 }
 
 func (r *rig) start() {
-	st, err := store.Open(r.path)
+	st, err := store.OpenWith(r.path, store.Options{Exclusive: !r.shared})
 	if err != nil {
 		r.t.Fatal(err)
 	}
