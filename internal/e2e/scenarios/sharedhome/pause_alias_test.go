@@ -41,6 +41,14 @@ func TestPauseAndResumeAreStopAndStart(t *testing.T) {
 	steps.MustPost(s, work.ID, "Before the pause "+first)
 	_, answered := steps.WaitAnswered(s, work.ID, first, steps.AnswerTimeout)
 	s.Check("the helper answers before the pause", answered, "answered", fmt.Sprint(answered))
+	// The automatic title follows the answer. Pause only once it is on the
+	// chat: a rename still queued when the kill switch stops the helper is
+	// lost (the STOP-RESTART flake, fixed separately), and the notice after
+	// `resume` names the chat by its title.
+	s.WaitFor("the automatic chat title", steps.CommandTimeout, func() (bool, string) {
+		c, _ := s.Graph.Chat(work.ID)
+		return strings.Contains(c.Topic, "Before the pause"), fmt.Sprintf("title %q", c.Topic)
+	})
 
 	out, code := s.RunCLI(120*time.Second, "teams", "pause", "lunch", "break")
 	stopped := s.Poll(5*time.Second, func() bool { return !s.SUT.Running() })
