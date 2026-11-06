@@ -49,7 +49,7 @@ func TestEntryControlCommandNotReplayed(t *testing.T) {
 	// A command posted now is answered: the control chat was read past the
 	// old command.
 	steps.MustPost(s, control, "status")
-	_, answered := s.WaitSUTMessage(control, "sessions (", 60*time.Second)
+	_, answered := s.WaitSUTMessage(control, "Speech recognition:", 60*time.Second) // the control status list
 	s.Check("a new control command is answered", answered, "status reply", fmt.Sprint(answered), s.Transcript(control, 8)...)
 	time.Sleep(2 * time.Second)
 

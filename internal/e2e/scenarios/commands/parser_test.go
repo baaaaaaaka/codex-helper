@@ -90,14 +90,14 @@ func TestControlChatCommandForms(t *testing.T) {
 	control := steps.ReadyControlChat(s)
 	before := len(s.Codex.Calls())
 	for _, c := range []struct{ text, want string }{
-		{"!st", "sessions ("},
-		{"/status", "sessions ("},
-		{"helper st", "sessions ("},
+		{"!st", "Control status: no linked work chats yet."},
+		{"/status", "Control status: no linked work chats yet."},
+		{"helper st", "Control status: no linked work chats yet."},
 		{"helper close", "⚠️ Wrong chat"},
 		{"helper retry last", "⚠️ Wrong chat"},
 		{"helper file out.txt", "⚠️ Wrong chat"},
 		{"!frobnicate", "unknown control command: frobnicate"},
-		{"cx p", "is not available in this helper version yet"},
+		{"cx p", "usage: continue <number-or-session-id>"}, // v0.1.20: legacy `p` is continue
 		{"2", "I do not have a current list yet"},
 	} {
 		got, ok := command(s, control.ID, c.text, c.want)
@@ -224,8 +224,8 @@ func TestControlChatAttachments(t *testing.T) {
 	s.Settle(time.Second, 4*time.Second)
 	n := 0
 	for _, m := range s.SUTMessages(control.ID) {
-		if strings.Contains(m.PlainText(), "sessions (") {
-			n++ // a `status` reply
+		if strings.Contains(m.PlainText(), "Speech recognition:") {
+			n++ // a `status` reply (the control status list)
 		}
 	}
 	s.Check("the refused commands do not run", n == 0, "0 status replies", fmt.Sprint(n))
