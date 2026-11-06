@@ -6,16 +6,24 @@
 // writes outside it). No method performs network or Codex I/O, and no
 // caller may perform I/O inside a write transaction: the write lock is held
 // for its duration.
+//
+// On a network filesystem the store has a single connection for reads and
+// writes, in EXCLUSIVE locking mode (see OpenWith). So no Update or View
+// callback may call another method of the Store, and no goroutine may wait
+// for the Store while it holds a lock that such a callback takes: either
+// would wait forever for the one connection.
 package store
 
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -65,6 +73,10 @@ type Options struct {
 	// the owner row: every write transaction checks it first, and Fence
 	// verifies it.
 	Lease Lease
+
+	// exclusive forces the network-filesystem mode on any filesystem
+	// (tests).
+	exclusive bool
 }
 
 // Lease is the owner lease that gates writes (internal/core/lease.Holder).
@@ -95,7 +107,8 @@ func leaseErr(err error) error {
 type Store struct {
 	path string
 	w    *sql.DB // single writer connection, BEGIN IMMEDIATE
-	r    *sql.DB // read-only pool
+	r    *sql.DB // read-only pool; w itself in exclusive mode
+	view string  // read-only on a network filesystem: the private copy's directory
 	now  func() time.Time
 	pid  func(int) bool
 	gen  int64
@@ -109,23 +122,28 @@ type Store struct {
 // Open opens or creates the store at path with production options.
 func Open(path string) (*Store, error) { return OpenWith(path, Options{}) }
 
-func dsn(path string, ro bool) string {
+// pragmas are the connection settings. A network filesystem gets
+// synchronous=FULL: another host may have to take the store over after
+// this one dies, so every commit must be on the server (fsync is an NFS
+// COMMIT), not only in this host's page cache.
+func pragmas(path string, ro bool) []string {
 	sync := "synchronous(NORMAL)"
 	if !ro && networkFS(filepath.Dir(path)) {
-		// On a network filesystem another host may have to take the store
-		// over after this one dies: every commit must be on the server
-		// (fsync is an NFS COMMIT), not only in this host's page cache.
 		sync = "synchronous(FULL)"
 	}
-	q := url.Values{}
-	for _, p := range []string{
+	return []string{
 		"busy_timeout(5000)",
 		"foreign_keys(ON)",
 		sync,
 		"temp_store(MEMORY)",
 		"cache_size(-16000)",
 		"journal_size_limit(67108864)",
-	} {
+	}
+}
+
+func dsn(path string, ro bool) string {
+	q := url.Values{}
+	for _, p := range pragmas(path, ro) {
 		q.Add("_pragma", p)
 	}
 	if ro {
@@ -136,7 +154,86 @@ func dsn(path string, ro bool) string {
 	return "file:" + filepath.ToSlash(path) + "?" + q.Encode()
 }
 
+// openDB opens the writer of the store at path: one connection, the only
+// one in exclusive mode.
+//
+// Exclusive mode is for a network filesystem. In WAL mode every transaction
+// takes and drops fcntl locks on the -shm file, which the connection also
+// maps into memory. On NFS an unlock first waits for the file's in-flight
+// I/O, and with several connections in one process (a writer and a read
+// pool) the others keep dirtying the mapping: the unlock starves and the
+// store stalls for minutes (TAKEOVER-REPORT §9.3, finding 1). With
+// locking_mode=EXCLUSIVE set before the database is first read, SQLite
+// keeps the WAL index in heap memory: there is no -shm, and the file lock
+// is taken once and held until Close. That is safe because only the lease
+// holder opens the store, and only one connection then uses it.
+//
+// A crash leaves the database and its WAL, as in the shared mode; whoever
+// opens them next rebuilds the WAL index from the WAL (CopySnapshot).
+func openDB(path string, exclusive bool) (*sql.DB, error) {
+	if !exclusive {
+		return sql.Open("sqlite", dsn(path, false))
+	}
+	// The driver applies DSN pragmas in name order, and some of them read
+	// the database (cache_size, synchronous). The locking mode must come
+	// before that first read, so the DSN carries only it and the busy
+	// timeout, and the connector applies the rest.
+	q := url.Values{}
+	q.Add("_pragma", "busy_timeout(5000)")
+	q.Add("_pragma", "locking_mode(EXCLUSIVE)")
+	q.Set("_txlock", "immediate")
+	probe, err := sql.Open("sqlite", "")
+	if err != nil {
+		return nil, err
+	}
+	drv := probe.Driver()
+	_ = probe.Close()
+	var after []string
+	for _, p := range pragmas(path, false) {
+		if !strings.HasPrefix(p, "busy_timeout") {
+			after = append(after, "PRAGMA "+p)
+		}
+	}
+	return sql.OpenDB(exclusiveConnector{drv: drv, dsn: "file:" + filepath.ToSlash(path) + "?" + q.Encode(), after: after}), nil
+}
+
+// exclusiveConnector opens a connection with the DSN, then applies the
+// remaining pragmas in order.
+type exclusiveConnector struct {
+	drv   driver.Driver
+	dsn   string
+	after []string
+}
+
+func (c exclusiveConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	conn, err := c.drv.Open(c.dsn)
+	if err != nil {
+		return nil, err
+	}
+	ex, ok := conn.(driver.ExecerContext)
+	if !ok {
+		conn.Close()
+		return nil, errors.New("store: the SQLite driver cannot execute pragmas")
+	}
+	for _, p := range c.after {
+		if _, err := ex.ExecContext(ctx, p, nil); err != nil {
+			conn.Close()
+			return nil, fmt.Errorf("store: %s: %w", p, err)
+		}
+	}
+	return conn, nil
+}
+
+func (c exclusiveConnector) Driver() driver.Driver { return c.drv }
+
 // OpenWith opens or creates the store at path.
+//
+// On a network filesystem (networkFS) the store is opened in exclusive
+// mode (openDB): a single connection serves reads and writes, and other
+// processes cannot open the file while it is open. A read-only Store
+// there never opens the file in use: it copies the database and its WAL
+// into a private temporary directory (as CopySnapshot does) and reads the
+// copy, so a status command neither waits for nor blocks the helper.
 func OpenWith(path string, opt Options) (*Store, error) {
 	s := &Store{path: path, now: opt.Now, pid: opt.PIDAlive, ls: opt.Lease}
 	if s.now == nil {
@@ -150,8 +247,9 @@ func OpenWith(path string, opt Options) (*Store, error) {
 	if fresh && opt.ReadOnly {
 		return nil, fmt.Errorf("store: %s does not exist", path)
 	}
+	exclusive := opt.exclusive || networkFS(filepath.Dir(path))
 	if !opt.ReadOnly {
-		w, err := sql.Open("sqlite", dsn(path, false))
+		w, err := openDB(path, exclusive)
 		if err != nil {
 			return nil, err
 		}
@@ -159,12 +257,29 @@ func OpenWith(path string, opt Options) (*Store, error) {
 		w.SetMaxIdleConns(1)
 		w.SetConnMaxLifetime(0)
 		s.w = w
-		if err := s.prepare(fresh); err != nil {
+		if err := s.prepare(fresh, exclusive); err != nil {
 			w.Close()
 			return nil, err
 		}
+		if exclusive {
+			s.r = w
+			return s, nil
+		}
 	}
-	r, err := sql.Open("sqlite", dsn(path, true))
+	read := path
+	if exclusive {
+		dir, err := os.MkdirTemp("", "cxp-store-view-")
+		if err != nil {
+			return nil, err
+		}
+		s.view = dir
+		read = filepath.Join(dir, filepath.Base(path))
+		if err := copyStable(path, read); err != nil {
+			s.Close()
+			return nil, err
+		}
+	}
+	r, err := sql.Open("sqlite", dsn(read, true))
 	if err != nil {
 		s.Close()
 		return nil, err
@@ -180,8 +295,17 @@ func OpenWith(path string, opt Options) (*Store, error) {
 	return s, nil
 }
 
-func (s *Store) prepare(fresh bool) error {
+func (s *Store) prepare(fresh, exclusive bool) error {
 	ctx := context.Background()
+	if exclusive {
+		var lm string
+		if err := s.w.QueryRowContext(ctx, "PRAGMA locking_mode").Scan(&lm); err != nil {
+			return err
+		}
+		if lm != "exclusive" {
+			return fmt.Errorf("store: locking_mode is %q, want exclusive", lm)
+		}
+	}
 	if fresh {
 		// Settings that must precede the first table.
 		for _, p := range []string{
@@ -289,13 +413,16 @@ func (s *Store) Path() string { return s.path }
 // Close closes all connections.
 func (s *Store) Close() error {
 	var err error
-	if s.r != nil {
+	if s.r != nil && s.r != s.w {
 		err = s.r.Close()
 	}
 	if s.w != nil {
 		if e := s.w.Close(); e != nil {
 			err = e
 		}
+	}
+	if s.view != "" {
+		_ = os.RemoveAll(s.view)
 	}
 	return err
 }
@@ -317,6 +444,7 @@ func (t *Tx) Now() int64 { return t.now }
 
 // Update runs fn in one BEGIN IMMEDIATE transaction after checking that the
 // owner generation is still ours. fn's error rolls the transaction back.
+// fn must not call the Store's methods (see the package comment).
 func (s *Store) Update(fn func(*Tx) error) error {
 	if s.w == nil {
 		return errors.New("store: opened read-only")
@@ -359,6 +487,7 @@ func (s *Store) update(fence bool, fn func(*Tx) error) error {
 }
 
 // View runs fn against the read-only pool inside one read transaction.
+// fn must not call the Store's methods (see the package comment).
 func (s *Store) View(fn func(q Querier) error) error {
 	tx, err := s.r.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
 	if err != nil {
