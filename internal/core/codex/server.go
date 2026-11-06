@@ -237,7 +237,7 @@ func (s *Server) Call(ctx context.Context, method string, params, out any) error
 	}
 	if err := s.write(wireMsg{ID: json.RawMessage(fmt.Sprint(id)), Method: method, Params: raw}); err != nil {
 		drop()
-		if s.Exited() {
+		if s.exitAfterWrite(ctx) {
 			return ErrExited
 		}
 		return fmt.Errorf("codex: write %s: %w", method, err)
@@ -257,6 +257,26 @@ func (s *Server) Call(ctx context.Context, method string, params, out any) error
 		drop()
 		return ctx.Err()
 	}
+}
+
+// writeExitWait bounds how long a failed write waits for the server's exit.
+const writeExitWait = 5 * time.Second
+
+// exitAfterWrite reports whether the server exits within writeExitWait of
+// a failed write. A write fails when the server closed its input, which it
+// does by exiting (a missing Node runtime exits at once): whether the write
+// or the reader sees that first is a race, and the error (shown to the
+// owner by the setup notice, F-TRN-16) is the exit either way.
+func (s *Server) exitAfterWrite(ctx context.Context) bool {
+	t := time.NewTimer(writeExitWait)
+	defer t.Stop()
+	select {
+	case <-s.done:
+		return true
+	case <-t.C:
+	case <-ctx.Done():
+	}
+	return s.Exited()
 }
 
 // Subscribe registers fn for notifications whose params carry threadId ==

@@ -89,7 +89,19 @@ func (e *Engine) dispatchReads(ctx context.Context, jobs chan<- int64) (time.Dur
 		return e.t.Tick, true
 	}
 	due, live := e.orderReads(now)
+	yielded := false
 	for i, id := range due {
+		if !live[i] && e.readWaiters.Load() > 0 {
+			// A chat edit waits for a read token (edits.go waitRead): it
+			// goes before the background reads, after the live ones.
+			e.mu.Lock()
+			if cs := e.convs[id]; cs != nil {
+				cs.reading = false
+			}
+			e.mu.Unlock()
+			yielded = true
+			continue
+		}
 		if ok, wait := e.readTokens.take(); !ok {
 			// Out of read budget: the rest wait for a token, live reads
 			// still first.
@@ -112,6 +124,9 @@ func (e *Engine) dispatchReads(ctx context.Context, jobs chan<- int64) (time.Dur
 		} else {
 			e.liveRun = 0
 		}
+	}
+	if yielded {
+		return e.t.Tick, true // waitRead wakes the receiver when it is done
 	}
 	return e.readSleep(e.untilNextRead(e.now())), true
 }
@@ -139,7 +154,14 @@ func (e *Engine) untilNextRead(now time.Time) time.Duration {
 // readableLocked reports whether a conversation is read at its next read
 // time (not being read already, and in a state that is read).
 func (e *Engine) readableLocked(cs *convState) bool {
-	if cs.chat == "" || cs.reading {
+	return !cs.reading && readStateLocked(cs)
+}
+
+// readStateLocked reports whether a conversation is in a state that is
+// read: bound to a chat, and not a parked, closed or held work chat or a
+// closed control chat (caller holds e.mu).
+func readStateLocked(cs *convState) bool {
+	if cs.chat == "" {
 		return false
 	}
 	if cs.kind == store.KindWork && cs.state != store.ConvActive {
@@ -368,6 +390,10 @@ func (e *Engine) read(ctx context.Context, id int64) {
 	now := e.now()
 	if err == nil {
 		cs.failures = 0
+		if !cs.readOnce && cs.firstRead != nil {
+			cs.readOnce = true
+			close(cs.firstRead) // reconcileTurn waits for it
+		}
 		cs.nextRead = e.nextReadLocked(cs, start, now, safety)
 		if cs.scanLive <= gen {
 			cs.scanLive = 0 // read: the change was before the read started

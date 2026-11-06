@@ -28,6 +28,11 @@ type chatEdit struct {
 	what      string // for the log
 	notBefore time.Time
 	tries     int
+	// deferred is when the edit was first deferred (errEditLater) and
+	// defers how often: a deferral is not a failure and is retried with
+	// backoff until editDeferFor has passed (runEdit).
+	deferred time.Time
+	defers   int
 	// run makes the edit in chat. errEditLater asks for another try.
 	run func(ctx context.Context, chat string) error
 }
@@ -44,6 +49,12 @@ const (
 	editReadWait = 5 * time.Second
 	// flushEditsMax bounds the edits made after a graceful stop.
 	flushEditsMax = 3 * time.Second
+	// editDeferFor bounds how long a deferred edit (its read waited too
+	// long: a read throttle, or live reads using the whole budget) keeps
+	// being tried, editDeferMax the gap between two tries (from Cool,
+	// doubling).
+	editDeferFor = 15 * time.Minute
+	editDeferMax = 2 * time.Minute
 )
 
 // queueEdit adds an edit for conv unless one with the same key waits. It
@@ -140,18 +151,29 @@ func (e *Engine) runEdit(ctx context.Context, conv int64) {
 	switch {
 	case throttled:
 		retry = now.Add(e.retryAfter(th))
+		ed.tries++
 		if th.Scope == channel.ScopeAccount || th.Scope == channel.ScopeUnknown {
 			e.setGate(e.gWrite, retry, ed.what+" throttled")
 			e.paceThrottled(started, retry)
 		}
 	case errors.Is(err, errEditLater):
-		retry = now.Add(e.t.Cool)
+		// Not a failure: the edit was not tried. It is tried again with
+		// backoff for editDeferFor, so a label is not lost to a long
+		// catch-up or a read throttle.
+		if ed.deferred.IsZero() {
+			ed.deferred = now
+		}
+		if now.Sub(ed.deferred) < editDeferFor {
+			retry = now.Add(min(e.t.Cool<<min(ed.defers, 6), editDeferMax))
+			ed.defers++
+		}
 	case errors.Is(err, channel.ErrNotEditable), errors.Is(err, channel.ErrNotFound),
 		errors.As(err, &rej) && rej.Permanent:
+		ed.tries++
 	default:
 		retry = now.Add(e.t.Hot << min(ed.tries+1, 6))
+		ed.tries++
 	}
-	ed.tries++
 	if retry.IsZero() || ed.tries >= editTries {
 		e.logf("%s in conversation %d not made: %v", ed.what, conv, err)
 		return
@@ -167,10 +189,10 @@ func (e *Engine) runEdit(ctx context.Context, conv int64) {
 }
 
 // flushEdits makes the queued edits that are due once the engine has
-// stopped gracefully (a stop or a restart), within limit and under the
-// account write pacing: the queue is in memory, and the label or title of
-// the last moments before a stop would otherwise be lost. Failures are
-// dropped (they are cosmetic); nothing is retried.
+// stopped gracefully (a stop, a restart or the kill switch), within limit
+// and under the account write pacing: the queue is in memory, and the
+// label or title of the last moments before a stop would otherwise be
+// lost. Failures are dropped (they are cosmetic); nothing is retried.
 func (e *Engine) flushEdits(limit time.Duration) {
 	ctx, cancel := context.WithTimeout(context.Background(), limit)
 	defer cancel()
@@ -206,8 +228,21 @@ func (e *Engine) flushEdits(limit time.Duration) {
 }
 
 // waitRead waits for a read token of the account's read pacing (and its
-// gate) for at most limit; errEditLater when that is not enough.
+// gate) for at most limit; errEditLater when that is not enough. While it
+// waits, the receiver dispatches no background read (start-up reads,
+// read-backs, safety reads) and the check of the previous helper's
+// answers (legacy_check.go) reads nothing. An edit is the owner's (the
+// label on the message they just sent), and behind a catch-up of hundreds
+// of reads it would otherwise lose every token to them: the receiver polls
+// the bucket each time a read ends, so it takes a token the moment it
+// accrues. Live reads (the control chat, chats with a running turn or
+// recent owner activity) and the activity scan still compete with it.
 func (e *Engine) waitRead(ctx context.Context, limit time.Duration) error {
+	e.readWaiters.Add(1)
+	defer func() {
+		e.readWaiters.Add(-1)
+		e.wakeReader() // the background reads it held back
+	}()
 	deadline := e.now().Add(limit)
 	for {
 		now := e.now()

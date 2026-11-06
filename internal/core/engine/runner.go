@@ -949,7 +949,9 @@ func (e *Engine) reconcileTurn(ctx context.Context, cs *convState, tr store.Turn
 	var out TurnOutcome
 	if threadID == "" {
 		out = TurnOutcome{NotStarted: true, Status: StatusFailed, Error: "no Codex thread yet"}
-		e.finishReconciled(ctx, cs, tr, out)
+		if e.awaitFirstRead(ctx, cs) {
+			e.finishReconciled(ctx, cs, tr, out)
+		}
 		return
 	}
 	back := time.Second
@@ -989,7 +991,45 @@ func (e *Engine) reconcileTurn(ctx context.Context, cs *convState, tr store.Turn
 		}
 		break
 	}
+	if !e.awaitFirstRead(ctx, cs) {
+		return
+	}
 	e.finishReconciled(ctx, cs, tr, out)
+}
+
+// reconcileReadWait bounds how long a reconciled turn's notice waits for
+// the first read of its chat (awaitFirstRead).
+const reconcileReadWait = time.Minute
+
+// awaitFirstRead waits until this process has read cs's chat once, for at
+// most reconcileReadWait; false when ctx ended. The receiver and reconcile
+// start together, so without it the order of the prompts sent while the
+// helper was down (their acknowledgements) and the notice of the turn the
+// previous process left open depended on which came first. Now the chat is
+// caught up first: what the owner sent meanwhile is admitted and
+// acknowledged, then the open turn ends with its notice, and the queued
+// turns start after it (NextRunnable) in one batch. The chat of a turn
+// being reconciled is read at live priority (cs.running, polledLocked), so
+// the wait is one read. A chat that is not read (parked, unbound) does not
+// wait; one whose reads keep failing waits at most reconcileReadWait.
+func (e *Engine) awaitFirstRead(ctx context.Context, cs *convState) bool {
+	e.mu.Lock()
+	ch := cs.firstRead
+	read := readStateLocked(cs)
+	e.mu.Unlock()
+	if ch == nil || !read {
+		return true
+	}
+	t := time.NewTimer(reconcileReadWait)
+	defer t.Stop()
+	select {
+	case <-ch:
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		e.logf("reconcile in %s: the chat was not read within %s; settling the interrupted turn anyway", cs.label, reconcileReadWait)
+	}
+	return true
 }
 
 func (e *Engine) finishReconciled(ctx context.Context, cs *convState, tr store.Turn, out TurnOutcome) {

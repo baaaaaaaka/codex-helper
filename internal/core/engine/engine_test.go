@@ -175,6 +175,7 @@ type rig struct {
 	path   string
 	cancel context.CancelFunc
 	done   chan error
+	e      *Engine // the running engine (start)
 	log    *strings.Builder
 	logMu  *sync.Mutex
 	tweak  func(*Config)
@@ -253,7 +254,7 @@ func (r *rig) start() {
 		r.t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	r.cancel, r.done = cancel, make(chan error, 1)
+	r.cancel, r.done, r.e = cancel, make(chan error, 1), e
 	go func() { r.done <- e.Run(ctx) }()
 }
 

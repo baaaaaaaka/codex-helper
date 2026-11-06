@@ -281,6 +281,10 @@ type Engine struct {
 	// writeWaiters counts writers in waitWrite: the sender leaves the
 	// account's write tokens to them (sender.go).
 	writeWaiters atomic.Int32
+	// readWaiters counts chat edits in waitRead (edits.go): the receiver
+	// leaves the account's read tokens to them before its background
+	// reads; live reads still go first (receive.go dispatchReads).
+	readWaiters atomic.Int32
 	// starting counts turn starts between the drain check and running
 	// being set (guarded by mu).
 	starting     int
@@ -526,8 +530,13 @@ func (e *Engine) Run(ctx context.Context) error {
 	}()
 	<-ctx.Done()
 	e.wg.Wait()
-	if e.fatal == nil || errors.Is(e.fatal, ErrRestart) {
-		e.flushEdits(flushEditsMax) // a graceful stop keeps the last labels and titles (edits.go)
+	if e.fatal == nil || errors.Is(e.fatal, ErrRestart) || errors.Is(e.fatal, store.ErrDisabled) {
+		// A graceful stop keeps the last labels and titles (edits.go). So
+		// does the kill switch (`cxp teams stop`, `shutdown`): it is the
+		// owner's stop, not a lost ownership, and this process still owns
+		// the chats until it exits; nothing else writes meanwhile. A
+		// fenced or failed process makes none.
+		e.flushEdits(flushEditsMax)
 	}
 	e.ag.Close()
 	if e.fatal != nil {
@@ -725,7 +734,8 @@ func (e *Engine) load() error {
 func (e *Engine) trackLocked(c store.Conversation) *convState {
 	cs := e.convs[c.ID]
 	if cs == nil {
-		cs = &convState{id: c.ID, recent: map[string]recentPrompt{}, seen: map[string]time.Time{}, created: time.UnixMilli(c.CreatedAt)}
+		cs = &convState{id: c.ID, recent: map[string]recentPrompt{}, seen: map[string]time.Time{}, created: time.UnixMilli(c.CreatedAt),
+			firstRead: make(chan struct{})}
 		e.convs[c.ID] = cs
 	}
 	if cs.chat != "" && cs.chat != c.ExtChatID {
