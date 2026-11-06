@@ -528,8 +528,13 @@ func (e *Engine) Run(ctx context.Context) error {
 	}()
 	<-ctx.Done()
 	e.wg.Wait()
-	if e.fatal == nil || errors.Is(e.fatal, ErrRestart) {
-		e.flushEdits(flushEditsMax) // a graceful stop keeps the last labels and titles (edits.go)
+	if e.fatal == nil || errors.Is(e.fatal, ErrRestart) || errors.Is(e.fatal, store.ErrDisabled) {
+		// A graceful stop keeps the last labels and titles (edits.go). So
+		// does the kill switch (`cxp teams stop`, `shutdown`): it is the
+		// owner's stop, not a lost ownership, and this process still owns
+		// the chats until it exits; nothing else writes meanwhile. A
+		// fenced or failed process makes none.
+		e.flushEdits(flushEditsMax)
 	}
 	e.ag.Close()
 	if e.fatal != nil {

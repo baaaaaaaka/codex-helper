@@ -167,10 +167,10 @@ func (e *Engine) runEdit(ctx context.Context, conv int64) {
 }
 
 // flushEdits makes the queued edits that are due once the engine has
-// stopped gracefully (a stop or a restart), within limit and under the
-// account write pacing: the queue is in memory, and the label or title of
-// the last moments before a stop would otherwise be lost. Failures are
-// dropped (they are cosmetic); nothing is retried.
+// stopped gracefully (a stop, a restart or the kill switch), within limit
+// and under the account write pacing: the queue is in memory, and the
+// label or title of the last moments before a stop would otherwise be
+// lost. Failures are dropped (they are cosmetic); nothing is retried.
 func (e *Engine) flushEdits(limit time.Duration) {
 	ctx, cancel := context.WithTimeout(context.Background(), limit)
 	defer cancel()
