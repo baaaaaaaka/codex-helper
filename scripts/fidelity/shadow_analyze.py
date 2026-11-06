@@ -65,8 +65,14 @@ EXPECT_CLASSES = ("post:", "read:short-unverifiable", "DUP:")
 LOCAL_LINK = re.compile(r"\[([^\]\n]*)\]\((?:<(/[^>\n]+)>|(/[^)\s]+))\)")
 
 
+# The helper drops Codex's <oai-mem-citation> metadata blocks from answers
+# (internal/core/transcript/strip.go): key a record without them.
+MEM_CITATION = re.compile(r"<oai-mem-citation>.*?</oai-mem-citation>", re.S | re.I)
+
+
 def letters(s):
-    return NONLETTER.sub("", LOCAL_LINK.sub(lambda m: m.group(2) or m.group(3), s or "")).lower()
+    s = MEM_CITATION.sub("", s or "")
+    return NONLETTER.sub("", LOCAL_LINK.sub(lambda m: m.group(2) or m.group(3), s)).lower()
 
 
 def jl(path):
