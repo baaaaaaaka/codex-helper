@@ -49,6 +49,8 @@ func newTeamsCmd(root *rootOptions) *cobra.Command {
 		newTeamsRunCmd(root),
 		newTeamsStopCmd(),
 		newTeamsStartCmd(),
+		newTeamsPauseCmd(),
+		newTeamsResumeCmd(),
 		newTeamsStatusCmd(),
 		newTeamsDoctorCmd(root),
 		newTeamsPathCmd(root),

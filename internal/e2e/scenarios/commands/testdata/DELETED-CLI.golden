@@ -1,4 +1,4 @@
-# DELETED-CLI: `cxp teams recover|probe-chat|pause|drain`, `auth read|file-write`, `path mode captured-terminal|service`: unknown, non-zero exit; kept `path mode account-default` works
+# DELETED-CLI: `cxp teams recover|probe-chat|drain`, `auth read|file-write`, `path mode captured-terminal|service`: unknown, non-zero exit; kept `path mode account-default` works
 # cxp black-box transcript; volatile values are numbered placeholders
 
 == cli
@@ -8,9 +8,6 @@ $ cxp teams recover
 $ cxp teams probe-chat
    exit 1
    stderr| Error: unknown command "probe-chat" for "cxp teams"
-$ cxp teams pause
-   exit 1
-   stderr| Error: unknown command "pause" for "cxp teams"
 $ cxp teams drain
    exit 1
    stderr| Error: unknown command "drain" for "cxp teams"
