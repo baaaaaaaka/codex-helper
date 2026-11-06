@@ -142,7 +142,7 @@ Columns: id · status (`keep` / `removed-by-owner` / `ask-owner`, with the owner
 | F-WRK-11 | removed-by-owner (DECISIONS 第一级 4 【删除】; 定稿) | n/a | DELETED-CMDS | — |
 | F-WRK-12 | keep | core/engine/receive.go:813/:824 group gating on v0.1.20's @codex pattern (parse.go:494 `stripCodexMention`); bare @codex with no text and no attachment from anyone: v0.1.20 hint (receive.go:748/:816, :857 `bareMention`); the owner's commands count without the mention | R-43, GROUP-CMDS | B:2031 |
 | F-WRK-13 | keep | core/engine/receive.go:753 a coworker's command (any form, after the @codex is stripped) is refused with v0.1.20's owner-only text, quoting the message (v0.1.20 @-mentioned the coworker; the core can only mention the owner); coworker ACK "⏳ Codex received your question. Request accepted." (:967) | GROUP-CMDS | B:8218, B:8328 |
-| F-WRK-14 | keep (owner: 第二级 3 breaker, 第一级 8 `helper unpause`, 定稿) | receive.go:1028 breaker notice; commands.go:519 `cmdUnpause` | BREAKER | SPEC quarantine replaced by the breaker |
+| F-WRK-14 | keep (owner: 第二级 3 breaker, 第一级 8 `helper unpause`, 定稿) | receive.go:1113 `tripBreaker` (notice :1122, control :1126); receive.go:1096 `breakerHit` counts hits at their message times (:1087 `hitTime`, as v0.1.20); receive.go:467/546 the first read of a process (backlog) never counts (finding 8); receive.go:746 a converted old-helper marker whose message id is in the outbox is own; commands.go:280 `cmdUnpause` | BREAKER, BREAKER-BACKLOG | SPEC quarantine replaced by the breaker |
 | F-WRK-15 | removed-by-owner (beacon) | n/a | n/a | — |
 | F-TRN-1 | keep | core/engine/sender.go:441 → rename.go:697 `noteFinalSent` records the answer post's createdDateTime; :746 `afterAnswers` queues `MarkUnread(chat, created − 1 ms)` once per answer (:769) after its owner notification; catch-up answers have no notification, so they are not marked | R-1-2-3, EDIT-UNREAD | v0.1.20 marked unread |
 | F-TRN-2 | keep (owner: 11-05 第二批 排队确认措辞 "⏳ Queued") | silence.go:189 `textQueuedAck` (owner-ux `187b8ca4`), runner.go:260 start notice, silence.go:108 `remindQueued` | R-6 | text deliberately differs (owner) |
@@ -199,7 +199,7 @@ Columns: id · status (`keep` / `removed-by-owner` / `ask-owner`, with the owner
 | F-SVC-8 | keep | core/engine/upgrade.go:491 `cmdHelperUpdate`, cli/teams_auto_update.go:31 | exempt: needs a GitHub release feed and a managed install (CXP_RUNTIME_DISABLE=1 in the suite) | same |
 | F-SVC-9 | keep | cli/managed_install.go | exempt: managed runtime install is disabled in the suite (CXP_RUNTIME_DISABLE=1); release infrastructure | same |
 | F-SVC-10 | keep | core/engine/restart.go:269 `drainNotice` replaces the ACK (receive.go:969) of a message admitted while a restart or an update waits for running work: "…I saved this message and will resume it after …"; the turn stays queued and runs once after the restart; upgrade.go:227 `updateStep` drains | RESTART-DRAIN | SPEC text; v0.1.20 `sendDeferredServiceControlNotice` |
-| F-SVC-11 | keep (owner: 第一级 5 v0.1.20 + rc.59 only) | core/migrate/migrate.go:62 | ENTRY-AUTOMIGRATE, ENTRY-FRESH, ENTRY-MIGRATE, ENTRY-CONTROLSEEN, ENTRY-OLDANSWER, ENTRY-RESUMECHECK, ACCEPT-REALSTORE, CATCHUP-LIVE, SHADOW-REALDATA | new |
+| F-SVC-11 | keep (owner: 第一级 5 v0.1.20 + rc.59 only) | core/migrate/migrate.go:62 | ENTRY-AUTOMIGRATE, ENTRY-FRESH, ENTRY-MIGRATE, ENTRY-CONTROLSEEN, ENTRY-OLDANSWER, ENTRY-RESUMECHECK, ACCEPT-REALSTORE, CATCHUP-LIVE, SHADOW-REALDATA, BREAKER-BACKLOG | new |
 | F-SVC-12 | keep | core/engine/upgrade.go:596 `cmdCodexUpdate` | CODEX-UPGRADE | same |
 | F-CLI-1 | keep | cli/teams_newcore_status.go:84 "Installed version" (this build) next to the store's running version; cli/teams_newcore_poll.go:108 "Pending version: X installed, not running yet …"; :90 "Last poll: <time> (<age> ago)" from core-poll.json, written on the helper's 5 s watcher tick (may lag up to 10 s) | STATUS-VERSIONS | SPEC |
 | F-CLI-2 | keep | cli/teams.go:523 (`--live`, `--appserver-probe`) | NONE | same |
@@ -211,17 +211,17 @@ Columns: id · status (`keep` / `removed-by-owner` / `ask-owner`, with the owner
 | F-CLI-8 | keep (owner: 决定-3) | cli/delegate.go:69 | DELEG-RT | same |
 | F-CLI-9 | removed-by-owner (beacon) | n/a | n/a | — |
 | F-CLI-10 | keep | cli/teams.go:459 `teams run --once`: cli/teams_newcore.go:325 `watchTeamsOnceCycle` stops after one cycle (every chat read once, the work it brought in finished, kept command-line requests done) | RUN-ONCE | SPEC |
-| R-1 | keep | outbox + read-back (see R-5) | R-1-2-3, R-5, R-5a-crash, R-5b, R-36, R-37-out, B-5, DUP-EDGE, DELEG-RT, ENTRY-CONTROLSEEN, ENTRY-OLDANSWER, KILL-SWITCH, STANDBY-LOCKED, STANDBY-TAKEOVER, TAKEOVER-*, STOP-START, SHUTDOWN, STOP-RESTART, STOP-SHARED | — |
+| R-1 | keep | outbox + read-back (see R-5) | R-1-2-3, R-5, R-5a-crash, R-5b, R-36, R-37-out, B-5, DUP-EDGE, DELEG-RT, ENTRY-CONTROLSEEN, ENTRY-OLDANSWER, BREAKER-BACKLOG, KILL-SWITCH, STANDBY-LOCKED, STANDBY-TAKEOVER, TAKEOVER-*, STOP-START, SHUTDOWN, STOP-RESTART, STOP-SHARED | — |
 | R-2 | keep | outbox marker + read-back; global invariant no-duplicate-post | R-1-2-3, R-5, R-5a-crash, R-5b, R-9-10, R-36, B-5, DELEG-RT, NO-WINDOW, IMPORT-CRASH, FORK-CRASH | — |
 | R-3 | keep | inbound dedupe | R-1-2-3, R-4-29, R-4-paging, R-6, R-7, R-37, R-43, DUP, DUP-EDGE, PARK | — |
 | R-4 | keep | receive.go cursor + dispositions | R-4-29, R-4-paging, BREAKER, DELEG-RESTART, PARK | — |
 | R-5 | keep | runner.go:912 `reconcile`; outbox read-back | R-5, R-5a-crash, R-5b, R-4-29, B-5, ACTIVE-WRITER, ACTIVE-WRITER-RESUME, DELEG-RESTART | — |
 | R-6 | keep | per-chat outbox order; global invariant chat-order | R-6, R-36, R-4-paging | — |
-| R-7 | keep | outbox marker identity | R-7, R-5a-crash, BREAKER | — |
+| R-7 | keep | outbox marker identity (receive.go:746 the converted outbox's message ids identify the previous helper's posts) | R-7, R-5a-crash, BREAKER, BREAKER-BACKLOG | — |
 | R-8 | keep | core/engine/annotations.go:35 `labelAdmitted` + channel/teams/annotate.go:50 `Annotate` (F-RND-4): one lossless PATCH per message, never a helper post, never during catch-up | EDIT-LABEL | — |
 | R-9 | keep | mirror.go | R-9-10, NO-WINDOW | window removed by owner |
 | R-10 | keep | mirror.go | R-9-10 | — |
-| R-11 | keep | per-chat isolation | R-11, BREAKER, PARK | — |
+| R-11 | keep | per-chat isolation | R-11, BREAKER, BREAKER-BACKLOG, PARK | — |
 | R-12 | keep | Retry-After handling; global invariant retry-after | R-12, INBOX | — |
 | R-13 | keep | lease + supervisor backoff | SERVICE-STANDBY, STANDBY-LOCKED, STANDBY-TAKEOVER, TAKEOVER-CRASH-MID, TAKEOVER-LEFTOVER, TAKEOVER-SAME-HOST, STOP-RESTART | — |
 | R-14 | keep | tiered reads; global invariants idle-quiet, cpu-budget | IDLE, INBOX, PARK, ACCEPT-REALSTORE, SHADOW-REALDATA | — |

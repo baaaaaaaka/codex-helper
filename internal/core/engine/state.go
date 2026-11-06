@@ -100,8 +100,13 @@ type convState struct {
 	batchThrough int64
 	recent       map[string]recentPrompt // normalized prompt -> last prompt
 	lastDup      int64                   // inbound id of the last duplicate-ignored prompt
-	breaker      []time.Time
-	capWake      time.Time
+	breaker      []time.Time             // message times of recent breaker hits (receive.go)
+	// live: a read of this conversation was admitted by this process, so
+	// later reads carry live messages. The first read carries what arrived
+	// while no helper read the chat (backlog): it never counts toward the
+	// breaker (receive.go, finding 8 of the cluster drills).
+	live    bool
+	capWake time.Time
 
 	// sender
 	sending  bool

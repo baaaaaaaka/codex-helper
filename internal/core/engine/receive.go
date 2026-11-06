@@ -486,6 +486,14 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 		fresh = append(fresh, m)
 	}
 	unchanged := len(fresh) == 0 && w.Cursor == cs.cursor && cs.seeded
+	// The first read of this process holds the backlog: messages that
+	// arrived while no helper read the chat. A self-echo loop needs this
+	// helper's live posts, so the backlog never counts toward the breaker
+	// (finding 8: a burst queued during a 7.5 min gap paused every chat).
+	backlog := !cs.live
+	if unchanged {
+		cs.live = true
+	}
 	e.mu.Unlock()
 	if unchanged {
 		return nil
@@ -561,7 +569,7 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 			if c == nil {
 				continue
 			}
-			if c.suspect && e.breakerHit(id, now, stg) {
+			if c.suspect && !backlog && e.breakerHit(id, hitTime(c.msg, now), stg) {
 				trip = true
 			}
 			switch {
@@ -619,7 +627,7 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 		return err
 	}
 	e.mu.Lock()
-	cs.cursor, cs.seeded = w.Cursor, true
+	cs.cursor, cs.seeded, cs.live = w.Cursor, true, true
 	if becameGr {
 		cs.group = true
 	}
@@ -687,7 +695,7 @@ func (e *Engine) skipBacklog(id int64, cursor string, tl *channel.WindowTooLarge
 	}
 	if move {
 		e.mu.Lock()
-		cs.cursor, cs.seeded = tl.SkipCursor, true
+		cs.cursor, cs.seeded, cs.live = tl.SkipCursor, true, true
 		e.mu.Unlock()
 	}
 	e.wakeSender()
@@ -755,6 +763,18 @@ func (e *Engine) classify(tx *store.Tx, conv int64, kind string, group bool, m c
 				e.rememberOwnPost(conv, m.ID)
 				c.resolved = true // the resolver drops its entry when it sees the row sent
 			}
+			return c, true, nil
+		}
+		// A marker of the previous helper on this store (the converted
+		// v0.1.20 or rc.59 outbox keeps its message ids): this helper's own
+		// post, not a peer's. Without this its last posts, re-read after
+		// the conversion, counted toward the breaker (finding 8).
+		own, err := tx.IsOwn(conv, m.ID, nil, 0)
+		if err != nil {
+			return c, false, err
+		}
+		if own {
+			c.in.Sender = store.SenderSelf
 			return c, true, nil
 		}
 		// Another helper instance's marker.
@@ -1048,7 +1068,7 @@ type admitStage struct {
 	recent  map[string]recentPrompt
 	latest  time.Time // newest prompt time staged in recent
 	lastDup int64
-	hits    int // suspicious messages
+	hits    []time.Time // message times of the suspicious messages
 }
 
 // applyStage applies a committed admit's effects. Called with e.mu held.
@@ -1069,34 +1089,50 @@ func (e *Engine) applyStage(cs *convState, stg *admitStage, now time.Time) {
 	if stg.lastDup != 0 {
 		cs.lastDup = stg.lastDup
 	}
-	if stg.hits > 0 {
-		cs.breaker = append(e.breakerWindow(cs, now), make([]time.Time, stg.hits)...)
-		for i := len(cs.breaker) - stg.hits; i < len(cs.breaker); i++ {
-			cs.breaker[i] = now
+	if len(stg.hits) > 0 {
+		cs.breaker = append(cs.breaker, stg.hits...)
+		newest := cs.breaker[0]
+		for _, t := range cs.breaker {
+			if t.After(newest) {
+				newest = t
+			}
 		}
+		keep := cs.breaker[:0]
+		for _, t := range cs.breaker {
+			if newest.Sub(t) < e.t.BreakerWindow {
+				keep = append(keep, t)
+			}
+		}
+		cs.breaker = keep
 	}
 }
 
-// breakerWindow returns the breaker hits still inside the window. Called
-// with e.mu held.
-func (e *Engine) breakerWindow(cs *convState, now time.Time) []time.Time {
-	keep := cs.breaker[:0]
-	for _, t := range cs.breaker {
-		if now.Sub(t) < e.t.BreakerWindow {
-			keep = append(keep, t)
-		}
+// hitTime is the time a suspicious message counts at: when it was posted,
+// as in v0.1.20 (its activity time). A burst read at once after a gap is
+// spread over the time it was written in; a loop's echoes are seconds apart.
+func hitTime(m channel.InboundMsg, now time.Time) time.Time {
+	if m.Created.IsZero() {
+		return now
 	}
-	return keep
+	return m.Created
 }
 
-// breakerHit stages one suspicious message and reports a trip.
-func (e *Engine) breakerHit(conv int64, now time.Time, stg *admitStage) bool {
+// breakerHit stages one suspicious message posted at at and reports a trip:
+// BreakerCount suspicious messages posted within BreakerWindow of it.
+func (e *Engine) breakerHit(conv int64, at time.Time, stg *admitStage) bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	cs := e.convs[conv]
-	cs.breaker = e.breakerWindow(cs, now)
-	stg.hits++
-	return len(cs.breaker)+stg.hits >= e.t.BreakerCount && !cs.paused
+	stg.hits = append(stg.hits, at)
+	n := 0
+	for _, hits := range [][]time.Time{cs.breaker, stg.hits} {
+		for _, t := range hits {
+			if d := at.Sub(t); d < e.t.BreakerWindow && d > -e.t.BreakerWindow {
+				n++
+			}
+		}
+	}
+	return n >= e.t.BreakerCount && !cs.paused
 }
 
 // tripBreaker pauses auto-start in a conversation and notifies once.
