@@ -402,14 +402,28 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 }
 
 func (g *graph) getJSON(ctx context.Context, path string, limit int64, out any) error {
-	resp, err := g.do(ctx, call{method: http.MethodGet, url: path, limit: limit})
+	body, err := g.get(ctx, path, limit)
 	if err != nil {
 		return err
 	}
-	if err := json.Unmarshal(resp.body, out); err != nil {
-		return &channel.Rejected{Err: fmt.Errorf("graph GET %s: decoding: %w", redactPath(path), err)}
+	if err := json.Unmarshal(body, out); err != nil {
+		return decodeError(path, err)
 	}
 	return nil
+}
+
+// get performs an idempotent GET and returns the response body undecoded.
+func (g *graph) get(ctx context.Context, path string, limit int64) ([]byte, error) {
+	resp, err := g.do(ctx, call{method: http.MethodGet, url: path, limit: limit})
+	if err != nil {
+		return nil, err
+	}
+	return resp.body, nil
+}
+
+// decodeError is the error of a GET response that does not decode.
+func decodeError(path string, err error) error {
+	return &channel.Rejected{Err: fmt.Errorf("graph GET %s: decoding: %w", redactPath(path), err)}
 }
 
 // writeJSON performs a non-idempotent write and decodes the response. A 2xx

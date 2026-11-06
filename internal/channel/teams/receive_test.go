@@ -39,6 +39,8 @@ func TestInboundEmojiKept(t *testing.T) {
 		`x <emoji id="no-alt"></emoji>y`:                              "x y",
 		`<IMG ITEMTYPE='http://schema.skype.com/Emoticon' ALT='(y)'>`: "(y)",
 		`<img src="photo.png" alt="not an emoji">`:                    "",
+		`<EMOJI ALT="😀"></EMOJI> ok`:                                  "😀 ok",
+		`a<CustomEmoji alt=":p:">b`:                                   "a:p:b",
 	}
 	for in, want := range cases {
 		if got := plainText(in); got != want {
@@ -46,6 +48,24 @@ func TestInboundEmojiKept(t *testing.T) {
 		}
 	}
 	noViolations(t, fg)
+}
+
+func TestContainsFold(t *testing.T) {
+	for _, c := range []struct {
+		s, sub string
+		want   bool
+	}{
+		{"<p>x</p>", "emoji", false},
+		{"<EmOjI", "emoji", true},
+		{"x<IMG src", "<img", true},
+		{"<im", "<img", false},
+		{"é<ATTACHMENT id", "<attachment", true},
+		{"", "emoji", false},
+	} {
+		if got := containsFold(c.s, c.sub); got != c.want {
+			t.Errorf("containsFold(%q, %q) = %v", c.s, c.sub, got)
+		}
+	}
 }
 
 func TestReceiveWindowTooLarge(t *testing.T) {
