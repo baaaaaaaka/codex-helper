@@ -10,7 +10,8 @@ DEFAULT_WEIGHT until it gets a measured weight in e2e_shard_weights.json.
 Packing is longest-first onto the lightest shard. Every package lands in
 exactly one shard (the packing is a partition of the list), and every shard
 computes the same plan from the same inputs, so the union of the shard jobs
-is the whole suite.
+is the whole suite. A shard lists its packages heaviest first, which is the
+order `go test` starts them in.
 
 Usage:
   e2e_shards.py --count 3 --index 0        # packages of shard 0, one per line
@@ -73,7 +74,10 @@ def plan(packages: list[str], count: int, weights: dict[str, float]) -> list[lis
         i = min(range(count), key=lambda k: (loads[k], k))
         shards[i].append(pkg)
         loads[i] += weight_of(pkg, weights)
-    return [sorted(s) for s in shards]
+    # Each shard keeps the heaviest-first order: `go test` starts packages in
+    # the order they are named (at most -p at a time), so the long package
+    # starts at once instead of waiting behind short ones for a free slot.
+    return shards
 
 
 def main(argv: list[str] | None = None) -> int:

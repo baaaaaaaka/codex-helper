@@ -93,7 +93,7 @@ func TestCIWorkflowPullRequestTierRunsEverySuiteWithoutWeakeningRequiredChecks(t
 		"shard: [0, 1, 2]",
 		"E2E_SUT: cxp",
 		"python3 scripts/ci/e2e_shards.py --count 3 --index \"${{ matrix.shard }}\"",
-		"go test -count=1 -timeout=600s \"${packages[@]}\"",
+		"go test -count=1 -parallel=8 -timeout=600s \"${packages[@]}\"",
 	)
 
 	platforms := workflowJobBlock(t, workflow, "unit-windows-macos")

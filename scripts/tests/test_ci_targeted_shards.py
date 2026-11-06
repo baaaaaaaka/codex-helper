@@ -366,7 +366,7 @@ class TargetedShardWorkflowTests(unittest.TestCase):
         self.assertIn(
             'python3 scripts/ci/e2e_shards.py --count 3 --index "${{ matrix.shard }}"', job
         )
-        self.assertIn('go test -count=1 -timeout=600s "${packages[@]}"', job)
+        self.assertIn('go test -count=1 -parallel=8 -timeout=600s "${packages[@]}"', job)
         aggregate = job_block(WORKFLOW, "test")
         self.assertIn("      - e2e\n", aggregate)
         self.assertIn('check e2e "${{ needs.e2e.result }}"', aggregate)
@@ -402,6 +402,11 @@ class TargetedShardWorkflowTests(unittest.TestCase):
                 self.assertEqual(len(flat), len(set(flat)))
                 if count <= len(packages):
                     self.assertTrue(all(shards), shards)
+                # Heaviest first, so `go test -p` starts the long package
+                # at once; an unmeasured package counts as DEFAULT_WEIGHT.
+                for shard in shards:
+                    loads = [weights.get(pkg.rsplit("/", 1)[-1], 60) for pkg in shard]
+                    self.assertEqual(loads, sorted(loads, reverse=True), shard)
 
     def test_ubuntu_package_bootstrap_uses_source_isolated_update(self):
         targeted = targeted_job()

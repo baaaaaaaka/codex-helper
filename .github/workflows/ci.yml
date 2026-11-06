@@ -278,8 +278,11 @@ jobs:
             exit 0
           fi
           # The scenarios drive `cxp teams run` against a fake Graph service
-          # and a fake Codex app-server; nothing leaves the runner.
-          go test -count=1 -timeout=600s "${packages[@]}" 2>&1 | tee "$RUNNER_TEMP/e2e.log"
+          # and a fake Codex app-server; nothing leaves the runner. They wait
+          # on the helper's timers far more than they use CPU, so 8 run at
+          # once per package on the 4-CPU runner (per-test times measured
+          # unchanged from -parallel=4; see scripts/ci/e2e_shard_weights.json).
+          go test -count=1 -parallel=8 -timeout=600s "${packages[@]}" 2>&1 | tee "$RUNNER_TEMP/e2e.log"
 
       - name: Upload e2e diagnostics
         if: ${{ failure() }}
