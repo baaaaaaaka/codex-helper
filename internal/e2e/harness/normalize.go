@@ -17,6 +17,7 @@ package harness
 //	E2EANSWER-<n>     the fake Codex's global answer counter
 //	<uuid:N>          UUIDs (Codex thread/turn ids, session ids, GUIDs)
 //	<time:N>          ISO-8601 / "YYYY-MM-DD HH:MM[:SS]" timestamps
+//	<time>            the time of a control-chat history entry in a prompt
 //	<ms:N>, <unix:N>  other millisecond / second Unix stamps
 //	<pid:N>           "pid <n>"
 //	<port:N>          loopback ports
@@ -64,6 +65,9 @@ var genericRules = []struct{ kind, pattern string }{
 	{"uuid", `(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b`},
 	// A Codex rollout path: sessions/YYYY/MM/DD/rollout-<start time>-<thread>.jsonl.
 	{"rollout", `\b\d{4}/\d{2}/\d{2}/rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-`},
+	// An entry of the control-chat history in a control question's
+	// prompt: whether two entries share a second is timing.
+	{"histtime", `- \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z (?:user|helper)/`},
 	{"time", `\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?`},
 	{"time", `\b\d{4}-\d{2}-\d{2}[ _]\d{2}[:\-]\d{2}(?:[:\-]\d{2})?(?: ?(?:UTC|Z|[+-]\d{2}:?\d{2}))?`},
 	{"outbox", `codex-helper-outbox:[A-Za-z0-9._\-]+`},
@@ -176,6 +180,8 @@ func (n *normalizer) norm(text string) string {
 			// The idempotency marker of every helper post: its presence is
 			// behaviour, its value (store prefix + delivery hash) is not.
 			return "codex-helper-outbox:<marker>"
+		case kind == "histtime":
+			return "- <time> " + m[strings.LastIndexByte(m, ' ')+1:]
 		case kind == "answer":
 			// The fake Codex numbers its answers across all threads; with
 			// concurrent chats the number depends on start order.

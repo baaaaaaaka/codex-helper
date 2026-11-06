@@ -804,6 +804,10 @@ func (e *Engine) classify(tx *store.Tx, conv int64, kind string, group bool, m c
 	}
 	if kind == store.KindControl {
 		c.in.Kind, c.control, c.cmd = store.InCommand, true, parseControl(text)
+		// Batch B: a question for Codex (control_qa.go, F-CTL-10).
+		if q, ok := controlQuestion(c.cmd, text, m); ok && e.controlLive(conv, m) {
+			c.in.Kind, c.in.Body = store.InPrompt, q
+		}
 		return c, true, nil
 	}
 	// With other people in the chat the @codex mention is not part of the
@@ -881,6 +885,9 @@ func (e *Engine) markersTrusted() bool {
 // ackPrompt acknowledges a newly admitted prompt (or ignores a duplicate).
 // It reports whether the prompt was a duplicate.
 func (e *Engine) ackPrompt(tx *store.Tx, conv int64, a store.Admitted, c *classified, stg *admitStage) (bool, error) {
+	if c.control { // batch B: a control-chat question (control_qa.go)
+		return false, e.ackControl(tx, conv, a, c)
+	}
 	norm := normalize(c.in.Body)
 	at := c.msg.Created
 	e.mu.Lock()

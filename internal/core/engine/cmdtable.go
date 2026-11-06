@@ -139,10 +139,8 @@ var controlCommands = map[string]cmdHandler{
 		}
 		e.reply(j, modelList(models, store.Thread{})+"\n\nSwitch a session's model in its chat with `helper model <model> [effort]`.", nil)
 	},
-	cmdCancelName: func(e *Engine, _ context.Context, j cmdJob, _ *convState, p parsed) {
-		// The control chat runs no Codex question yet (control Q&A is
-		// batch B): v0.1.20's answers for a control chat with no turn.
-		e.reply(j, controlCancelText(p.arg), nil)
+	cmdCancelName: func(e *Engine, ctx context.Context, j cmdJob, cs *convState, p parsed) {
+		e.cmdControlCancel(ctx, j, cs, p.arg) // the control chat's Codex questions (control_qa.go)
 	},
 	cmdDefault: func(e *Engine, _ context.Context, j cmdJob, _ *convState, _ parsed) {
 		// HOOK(batch B): global defaults (F-CTL-11).
@@ -159,8 +157,12 @@ var controlCommands = map[string]cmdHandler{
 	cmdPublish:    hook("continue"),
 	cmdMkdir:      hook("mkdir"),
 	cmdDetails:    hook("details"),
-	// HOOK(batch B): control Q&A, the control chat's effort, Workflow webhooks.
-	cmdAsk:        hook("ask"),
+	// `ask <question>` is a question for Codex (control_qa.go); a bare
+	// `ask` gets here.
+	cmdAsk: func(e *Engine, _ context.Context, j cmdJob, _ *convState, _ parsed) {
+		e.reply(j, "usage: `ask <question>`", nil)
+	},
+	// HOOK(batch B): the control chat's effort, Workflow webhooks.
 	cmdEffortName: hook("effort"),
 	cmdWebhook:    hook("helper webhook"),
 }
@@ -195,9 +197,9 @@ func (e *Engine) runControl(ctx context.Context, j cmdJob, cs *convState) {
 			return
 		}
 	case formText:
-		// HOOK(batch B): v0.1.20 forwards this to a Codex question in the
-		// control chat. Until then it answers as v0.1.20's
-		// unknownControlCommandMessage does for text without a prefix.
+		// Questions for Codex never get here (control_qa.go); empty text
+		// does (v0.1.20 runControlFallback: the help), and so does a path
+		// (HOOK(batch A): v0.1.20's controlPathHintMessage).
 		e.reply(j, controlHelpText, nil)
 		return
 	}
@@ -237,23 +239,6 @@ func unknownWorkText(p parsed) string {
 		return sessionHelpText
 	}
 	return fmt.Sprintf("unknown work chat command: `%s`\n\n%s", p.name, sessionHelpText)
-}
-
-// controlCancelText is v0.1.20's answer to a control-chat cancel when no
-// control question runs.
-func controlCancelText(arg string) string {
-	first, _ := splitBody(arg)
-	switch first {
-	case "":
-		return "usage: `helper cancel last`, `helper cancel queued`, `helper cancel running`, `helper cancel all`, or `helper cancel <turn-id>`\n\nThese commands apply to the current Control chat Codex question."
-	case "last", "all":
-		return "no running or queued turn is available to cancel in this control chat."
-	case "queued":
-		return "no queued turn is available to cancel in this control chat."
-	case "running":
-		return "no running turn is available to cancel in this control chat."
-	}
-	return "turn not found in this control chat: " + strings.TrimSpace(arg)
 }
 
 // cmdCloseChat closes a work chat (`helper close`, v0.1.20 B:8007): it is

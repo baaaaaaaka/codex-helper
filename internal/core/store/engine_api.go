@@ -156,3 +156,18 @@ WHERE state IN ('queued','starting','running') AND state = 'queued' ORDER BY con
 	}
 	return out, rows.Err()
 }
+
+// RecentOwnerInbound lists the newest owner messages (prompts and
+// commands) of a conversation, newest first (the control chat's Q&A
+// history, gap batch B).
+func (t *Tx) RecentOwnerInbound(convID int64, limit int) ([]Inbound, error) {
+	return collect(scanInbound)(t.rows(`SELECT `+inboundCols+` FROM inbound
+WHERE conv_id = ? AND sender = 'owner' AND kind IN ('prompt','command') ORDER BY id DESC LIMIT ?`, convID, limit))
+}
+
+// RecentSent lists the newest delivered outbox rows of a conversation,
+// newest first (the control chat's Q&A history, gap batch B).
+func (t *Tx) RecentSent(convID int64, limit int) ([]Outbox, error) {
+	return collect(scanOutbox)(t.rows(`SELECT `+outboxCols+` FROM outbox
+WHERE conv_id = ? AND state = 'sent' ORDER BY seq DESC LIMIT ?`, convID, limit))
+}
