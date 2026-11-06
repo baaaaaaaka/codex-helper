@@ -56,7 +56,9 @@ var workCommands = map[string]cmdHandler{
 	cmdRenameName: func(e *Engine, ctx context.Context, j cmdJob, cs *convState, p parsed) {
 		e.cmdRename(ctx, j, cs, p.arg)
 	},
-	cmdSkillsName: func(e *Engine, ctx context.Context, j cmdJob, _ *convState, p parsed) { e.cmdSkills(ctx, j, p.arg) },
+	cmdSkillsName: func(e *Engine, ctx context.Context, j cmdJob, cs *convState, p parsed) {
+		e.cmdSkills(ctx, j, cs, p.arg)
+	},
 	// `model …` / `effort …` (modelcmds.go, batch B).
 	cmdModelName: func(e *Engine, ctx context.Context, j cmdJob, cs *convState, p parsed) {
 		e.cmdModelChat(ctx, j, cs, p.arg)
@@ -121,8 +123,10 @@ var controlCommands = map[string]cmdHandler{
 		}
 		e.cmdFork(ctx, j, target)
 	},
-	cmdStats:      func(e *Engine, ctx context.Context, j cmdJob, _ *convState, _ parsed) { e.cmdStats(ctx, j, nil) },
-	cmdSkillsName: func(e *Engine, ctx context.Context, j cmdJob, _ *convState, p parsed) { e.cmdSkills(ctx, j, p.arg) },
+	cmdStats: func(e *Engine, ctx context.Context, j cmdJob, _ *convState, _ parsed) { e.cmdStats(ctx, j, nil) },
+	cmdSkillsName: func(e *Engine, ctx context.Context, j cmdJob, cs *convState, p parsed) {
+		e.cmdSkills(ctx, j, cs, p.arg)
+	},
 	// `model …` / `effort …` (modelcmds.go, batch B).
 	cmdModelName: func(e *Engine, ctx context.Context, j cmdJob, cs *convState, p parsed) {
 		e.cmdModelChat(ctx, j, cs, p.arg)

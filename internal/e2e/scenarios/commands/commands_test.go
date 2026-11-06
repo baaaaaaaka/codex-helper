@@ -151,12 +151,13 @@ func TestStats(t *testing.T) {
 }
 
 // `skills` in the control chat and `helper skills` in a work chat answer
-// from the local skill subscriptions; remove/push stay in the local CLI.
+// from the local skill subscriptions; `push` reviews in the chat (batch B,
+// SKILLS-PUSH), remove stays in the local CLI.
 func TestSkills(t *testing.T) {
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "CMD-SKILLS", harness.Options{
 		Guarantees: []string{"cmd-skills"},
-		Title:      "`skills` lists skill subscriptions; push/remove point to the local CLI",
+		Title:      "`skills` lists skill subscriptions; push reviews in the chat; remove points to the local CLI",
 	})
 	defer s.Finish()
 	control := steps.ReadyControlChat(s)
@@ -167,8 +168,10 @@ func TestSkills(t *testing.T) {
 	wk, ok := command(s, work.ID, "helper skills", "subscription")
 	s.Check("`helper skills` in a work chat lists subscriptions", ok && strings.Contains(strings.ToLower(wk), "no skill subscriptions"),
 		"\"No skill subscriptions\"", clip(wk, 160))
-	push, ok := command(s, work.ID, "helper skills push", "cxp skills push")
-	s.Check("`helper skills push` points to the local CLI", ok, "\"cxp skills push\"", clip(push, 160))
+	push, ok := command(s, work.ID, "helper skills push", "No local skill changes to push.")
+	s.Check("`helper skills push` reviews in the chat (nothing to push)", ok, "\"No local skill changes to push.\"", clip(push, 160))
+	rm, ok := command(s, work.ID, "helper skills remove demo", "cxp skills remove")
+	s.Check("`helper skills remove` points to the local CLI", ok, "\"cxp skills remove\"", clip(rm, 160))
 	calls := 0
 	for _, c := range s.Codex.Calls() {
 		if strings.Contains(c.Prompt, "skills") {

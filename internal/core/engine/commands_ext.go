@@ -15,6 +15,12 @@ type Skills interface {
 	Command(ctx context.Context, args string) string
 }
 
+// ChatSkills is a Skills whose commands depend on the chat: a `skills
+// push` review belongs to the chat it was made in (gap batch B, F-CTL-17).
+type ChatSkills interface {
+	ChatCommand(ctx context.Context, chat, args string) string
+}
+
 // metaUsagePrefix + conv id holds the session's accumulated turn stats
 // (JSON usageStats). Meta is used so stats need no schema change.
 const metaUsagePrefix = "engine_usage:"
@@ -108,12 +114,21 @@ func findEffort(m Model, effort string) (string, bool) {
 }
 
 // cmdSkills runs the skills backend outside any transaction.
-func (e *Engine) cmdSkills(ctx context.Context, j cmdJob, args string) {
+func (e *Engine) cmdSkills(ctx context.Context, j cmdJob, cs *convState, args string) {
 	if e.cfg.Skills == nil {
 		e.reply(j, "Skills are not available in this helper.", nil)
 		return
 	}
-	text := strings.TrimSpace(e.cfg.Skills.Command(ctx, strings.TrimSpace(args)))
+	var text string
+	if cx, ok := e.cfg.Skills.(ChatSkills); ok && cs != nil { // batch B
+		e.mu.Lock()
+		chat := cs.chat
+		e.mu.Unlock()
+		text = cx.ChatCommand(ctx, chat, strings.TrimSpace(args))
+	} else {
+		text = e.cfg.Skills.Command(ctx, strings.TrimSpace(args))
+	}
+	text = strings.TrimSpace(text)
 	if text == "" {
 		text = "Done."
 	}

@@ -16,7 +16,8 @@ package harness
 //	                  the idempotency marker of a helper post (unnumbered)
 //	E2EANSWER-<n>     the fake Codex's global answer counter
 //	<uuid:N>          UUIDs (Codex thread/turn ids, session ids, GUIDs)
-//	<time:N>          ISO-8601 / "YYYY-MM-DD HH:MM[:SS]" timestamps
+//	<time:N>          ISO-8601 / "YYYY-MM-DD HH:MM[:SS]" / YYYYMMDD-HHMMSS
+//	                  timestamps
 //	<time>            the time of a control-chat history entry in a prompt
 //	<ms:N>, <unix:N>  other millisecond / second Unix stamps
 //	<pid:N>           "pid <n>"
@@ -70,6 +71,9 @@ var genericRules = []struct{ kind, pattern string }{
 	{"histtime", `- \d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z (?:user|helper)/`},
 	{"time", `\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?`},
 	{"time", `\b\d{4}-\d{2}-\d{2}[ _]\d{2}[:\-]\d{2}(?:[:\-]\d{2})?(?: ?(?:UTC|Z|[+-]\d{2}:?\d{2}))?`},
+	// A compact YYYYMMDD-HHMMSS stamp (a `skills push` review branch,
+	// gap batch B).
+	{"time", `\b20\d{6}-\d{6}\b`},
 	{"outbox", `codex-helper-outbox:[A-Za-z0-9._\-]+`},
 	{"answer", `\bE2EANSWER-\d+\b`},
 	{"keep", `sha256:[0-9a-f]{64}`},
