@@ -21,6 +21,9 @@ import (
 const (
 	StopByCLI   = "cli"   // `cxp teams stop`
 	StopByTeams = "teams" // `shutdown` in the Teams control chat
+	// StopBySuperseded: another copy of this state (a copied home) took
+	// over; Host is where the helper now runs (engine takeover.go).
+	StopBySuperseded = "superseded"
 )
 
 // StopRecord is the content of the kill-switch file.
@@ -109,7 +112,7 @@ func ReadStop(dir string) (r StopRecord, ok bool, err error) {
 		v = strings.TrimSpace(v)
 		switch strings.TrimSpace(k) {
 		case "source":
-			if v == StopByCLI || v == StopByTeams {
+			if v == StopByCLI || v == StopByTeams || v == StopBySuperseded {
 				r.Source = v
 			}
 		case "host":
@@ -139,6 +142,9 @@ func RemoveStop(dir string) (removed bool, err error) {
 // file carries no record.
 func (r StopRecord) Describe(path string) string {
 	by := r.by()
+	if r.Source == StopBySuperseded {
+		return "Stopped " + by + ". Start again with `cxp teams start`."
+	}
 	if by == "" {
 		return "Stopped on all machines: the kill-switch file " + path + " exists. Start again with `cxp teams start`."
 	}
@@ -148,6 +154,9 @@ func (r StopRecord) Describe(path string) string {
 // Reason is the stop as a waiting helper reports it.
 func (r StopRecord) Reason() string {
 	by := r.by()
+	if r.Source == StopBySuperseded {
+		return "stopped " + by + " until `cxp teams start`"
+	}
 	if by == "" {
 		return "the kill-switch file " + DisabledFile + " exists"
 	}
@@ -162,6 +171,12 @@ func (r StopRecord) by() string {
 		by = "by `cxp teams stop`"
 	case StopByTeams:
 		by = "by `shutdown` in the Teams control chat"
+	case StopBySuperseded:
+		by = "here: a copy of this state took over and the helper now runs on " + r.Host
+		if !r.At.IsZero() {
+			by += " (" + r.At.Local().Format("2006-01-02 15:04:05 -07:00") + ")"
+		}
+		return by
 	default:
 		return ""
 	}

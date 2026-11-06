@@ -393,6 +393,10 @@ func (e *Engine) read(ctx context.Context, id int64) {
 		if !cs.readOnce && cs.firstRead != nil {
 			cs.readOnce = true
 			close(cs.firstRead) // reconcileTurn waits for it
+			if id == e.controlID {
+				e.runnerAll = true // turns wait for it (controlReadLocked)
+				wake(e.runnerWake)
+			}
 		}
 		cs.nextRead = e.nextReadLocked(cs, start, now, safety)
 		if cs.scanLive <= gen {
@@ -460,6 +464,7 @@ type classified struct {
 	cmd       parsed // the owner's command as parsed at admission (parse.go)
 	suspect   bool   // counts toward the breaker
 	ownMarker bool   // carried our own marker (self-test passed)
+	sibling   bool   // our marker, not our send: another copy of this store (takeover.go)
 	quoteID   string // ext id to quote in replies (group chats)
 	other     bool   // sent by someone else than the owner
 	chatter   bool   // someone else's message not addressed to Codex
@@ -506,11 +511,17 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 		activity bool
 		hasFiles bool
 		stg      *admitStage
+		by       string // a sibling's takeover notice names this host (takeover.go)
 	)
 	inbox := id == e.inboxID && id != 0
+	// The first read after taking over by a copy: requests the other copy
+	// took are closed (takeover.go, rule 2).
+	moved := backlog && e.tookOver != "" && !inbox
 	var cancels []string
 	err := e.update(func(tx *store.Tx) error {
-		jobs, newTurns, becameGr, trip, activity, hasFiles, cancels = nil, false, false, false, false, false, nil
+		jobs, newTurns, becameGr, trip, activity, hasFiles, cancels, by = nil, false, false, false, false, false, nil, ""
+		var sibling time.Time // the newest sibling post of the window
+		var skipped []string
 		stg = &admitStage{recent: map[string]recentPrompt{}} // a retried attempt starts over
 		var cls []classified
 		byID := map[string]*classified{}
@@ -537,6 +548,9 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 			}
 			if !keep {
 				continue
+			}
+			if c.sibling && m.Created.After(sibling) {
+				sibling = m.Created
 			}
 			if c.other && !group {
 				group, becameGr = true, true
@@ -571,6 +585,17 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 			}
 			if c.suspect && !backlog && e.breakerHit(id, hitTime(c.msg, now), stg) {
 				trip = true
+			}
+			if c.sibling && kind == store.KindControl && by == "" {
+				by = e.supersededBy(c.msg)
+			}
+			if moved && c.msg.Created.Before(sibling) && !c.chatter && c.reject == "" &&
+				(a.TurnID != 0 || a.Kind == store.InCommand && a.State == store.InQueued) {
+				skipped = append(skipped, c.in.Body)
+				if err := e.closeCopied(tx, a); err != nil {
+					return err
+				}
+				continue
 			}
 			switch {
 			case c.reject != "" && a.State == store.InQueued:
@@ -621,10 +646,18 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 				return err
 			}
 		}
+		if len(skipped) > 0 {
+			base := fmt.Sprintf("copied:%d:%d", id, e.st.Generation())
+			return e.enqueueNotice(tx, id, base, textCopySkipped(e.tookOver, skipped))
+		}
 		return nil
 	})
 	if err != nil {
 		return err
+	}
+	if by != "" {
+		e.standDown(by)
+		return nil
 	}
 	e.mu.Lock()
 	cs.cursor, cs.seeded, cs.live = w.Cursor, true, true
@@ -763,6 +796,7 @@ func (e *Engine) classify(tx *store.Tx, conv int64, kind string, group bool, m c
 				e.rememberOwnPost(conv, m.ID)
 				c.resolved = true // the resolver drops its entry when it sees the row sent
 			}
+			c.sibling = !ok
 			return c, true, nil
 		}
 		// A marker of the previous helper on this store (the converted
