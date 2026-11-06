@@ -76,6 +76,14 @@ func TestStatusWhileTheHelperRunsAndWithout(t *testing.T) {
 	})
 	s.Check("status follows the helper's state within seconds", ok && time.Since(start) < 15*time.Second,
 		"Sessions: 1 (1 active, 0 parked) within 15s", fmt.Sprintf("%q after %s", statusLine(out, "Sessions:"), time.Since(start).Round(time.Second)), out)
+	// The chat's "Work chat created" may still be queued; the helper sends
+	// it before it stops, so compare against the state once it is sent.
+	const drained = "Unsent messages: 0 queued, 0 sending, 0 unconfirmed"
+	ok = s.Poll(15*time.Second, func() bool {
+		out = run("teams", "status").Stdout
+		return statusLine(out, "Unsent messages:") == drained
+	})
+	s.Check("the helper sends what it queued", ok, drained, statusLine(out, "Unsent messages:"), out)
 	running := details(out)
 
 	s.StopSUT()
