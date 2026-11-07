@@ -2,7 +2,6 @@ package asr
 
 import (
 	"archive/tar"
-	"archive/zip"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -17,7 +16,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -306,11 +304,7 @@ func (s *assetServer) add(name, format string, data []byte) Asset {
 	s.files[name] = data
 	s.mu.Unlock()
 	sum := sha256.Sum256(data)
-	a := Asset{Name: name, URL: s.URL + "/" + name, SHA256: hex.EncodeToString(sum[:]), Size: int64(len(data)), Format: format}
-	if format == FormatWheel {
-		a.Member = "imageio_ffmpeg/binaries/ffmpeg"
-	}
-	return a
+	return Asset{Name: name, URL: s.URL + "/" + name, SHA256: hex.EncodeToString(sum[:]), Size: int64(len(data)), Format: format}
 }
 
 // ---- fake assets ----
@@ -349,20 +343,6 @@ func tarGz(t *testing.T, files map[string][]byte) []byte {
 	return buf.Bytes()
 }
 
-func zipFiles(t *testing.T, files map[string][]byte) []byte {
-	var buf bytes.Buffer
-	zw := zip.NewWriter(&buf)
-	for name, data := range files {
-		w, err := zw.CreateHeader(&zip.FileHeader{Name: name, Method: zip.Store})
-		if err != nil {
-			t.Fatal(err)
-		}
-		w.Write(data)
-	}
-	zw.Close()
-	return buf.Bytes()
-}
-
 type fixture struct {
 	srv      *assetServer
 	manifest Manifest
@@ -383,14 +363,9 @@ var (
 
 func newFixture(t *testing.T, server []byte) *fixture {
 	t.Helper()
-	ffName := "imageio_ffmpeg/binaries/ffmpeg-" + runtime.GOOS + "-v7.0.2"
-	if runtime.GOOS == "windows" {
-		ffName += ".exe"
-	}
 	defaultAssetsOnce.Do(func() {
 		defaultRuntime = tarGz(t, runtimeFiles(self(t)))
-		defaultFFmpeg = zipFiles(t, map[string][]byte{
-			"imageio_ffmpeg/__init__.py": []byte(""), "imageio_ffmpeg/binaries/README.md": []byte("readme"), ffName: self(t)})
+		defaultFFmpeg = tarGz(t, map[string][]byte{exeName("ffmpeg"): self(t), "LICENSE.md": []byte("LGPL")})
 	})
 	runtimeArchive := defaultRuntime
 	if server != nil {
@@ -408,7 +383,7 @@ func newFixture(t *testing.T, server []byte) *fixture {
 		Runtime: f.srv.add("llama-asr-test.tar.gz", FormatTarGz, runtimeArchive),
 		Model:   f.srv.add("model.gguf", FormatFile, append([]byte("GGUF"), bytes.Repeat([]byte("m"), 4000)...)),
 		MMProj:  f.srv.add("mmproj.gguf", FormatFile, append([]byte("GGUF"), bytes.Repeat([]byte("p"), 3000)...)),
-		FFmpeg:  f.srv.add("imageio_ffmpeg-test.whl", FormatWheel, defaultFFmpeg),
+		FFmpeg:  f.srv.add("ffmpeg-audio-test.tar.gz", FormatTarGz, defaultFFmpeg),
 	}
 	return f
 }

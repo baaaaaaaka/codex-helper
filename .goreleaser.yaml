@@ -2,6 +2,12 @@ version: 2
 
 project_name: codex-proxy
 
+git:
+  # The voice asset release (llama-asr-<tag>-<rev>, .github/workflows/llama-asr-assets.yml)
+  # tags a main commit too; it is never a helper version or a changelog base.
+  ignore_tags:
+    - "llama-asr-*"
+
 before:
   hooks:
     - go mod tidy
