@@ -1261,6 +1261,16 @@ func (e *Engine) scanLoop(ctx context.Context) {
 		if e.stopping.Load() {
 			continue // shutdown: no chat is read again
 		}
+		e.mu.Lock()
+		ready := e.controlReadLocked()
+		e.mu.Unlock()
+		if !ready {
+			// The control chat's first read goes first (nothing is
+			// sent before it, takeover.go): a small read budget is not
+			// spent on scans meanwhile; the start-up reads cover what
+			// a scan would show.
+			continue
+		}
 		now := e.now()
 		if until := e.gate(e.gRead); now.Before(until) {
 			reopen.Reset(until.Sub(now))
