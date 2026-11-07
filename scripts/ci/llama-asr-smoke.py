@@ -29,7 +29,19 @@ def free_port():
         return s.getsockname()[1]
 
 
+def log_tail(path, n=60):
+    try:
+        with open(path, errors="replace") as f:
+            return "".join(f.readlines()[-n:])
+    except OSError as e:
+        return str(e)
+
+
 def main(server, model, mmproj, wav, expected):
+    # llama-server runs in its own directory (as internal/asr runs it), so
+    # every path it gets is absolute.
+    server, model, mmproj, wav = (os.path.abspath(p) for p in (server, model, mmproj, wav))
+    logpath = os.path.abspath("llama-server-smoke.log")
     key = secrets.token_hex(24)
     keyfile = os.path.join(tempfile.mkdtemp(), "key")
     with open(keyfile, "w") as f:
@@ -39,14 +51,14 @@ def main(server, model, mmproj, wav, expected):
             "--api-key-file", keyfile, "-t", "4", "-tb", "4", "-c", "2048", "-np", "1", "--threads-http", "2",
             "--no-webui", "--no-warmup", "--device", "none", "--no-mmproj-offload"]
     env = {k: v for k, v in os.environ.items() if not k.startswith("LLAMA_ARG_")}
-    log = open("llama-server-smoke.log", "w")
+    log = open(logpath, "w")
     proc = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, env=env, cwd=os.path.dirname(server))
     base = "http://127.0.0.1:%d" % port
     try:
         start = time.time()
         while True:
             if proc.poll() is not None:
-                raise SystemExit("llama-server exited with %s; see llama-server-smoke.log" % proc.returncode)
+                raise SystemExit("llama-server exited with %s:\n%s" % (proc.returncode, log_tail(logpath)))
             try:
                 with urllib.request.urlopen(base + "/health", timeout=2) as r:
                     if r.status == 200:
@@ -54,7 +66,7 @@ def main(server, model, mmproj, wav, expected):
             except OSError:
                 pass
             if time.time() - start > 300:
-                raise SystemExit("llama-server not healthy after 300 s")
+                raise SystemExit("llama-server not healthy after 300 s:\n%s" % log_tail(logpath))
             time.sleep(0.2)
         print("healthy after %.1f s" % (time.time() - start))
         with open(wav, "rb") as f:

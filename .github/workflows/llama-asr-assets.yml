@@ -157,7 +157,7 @@ jobs:
         include:
           # x64: every CPU variant (loaded at run time) plus the Vulkan plugin,
           # which is kept in gpu/ and only loaded when the helper asks for the GPU.
-          - { arch: x64, runner: windows-2025, vcvars: x64, cmake: "-DCMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_VULKAN=ON" }
+          - { arch: x64, runner: windows-2025, vcvars: x64, cmake: "-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_VULKAN=ON" }
           # arm64: built natively so it can be smoke-tested; armv8.2-a instead of
           # upstream's armv8.7-a so first-generation Windows-on-ARM devices work.
           - { arch: arm64, runner: windows-11-arm, vcvars: arm64, cmake: "-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER_TARGET=arm64-pc-windows-msvc -DCMAKE_CXX_COMPILER_TARGET=arm64-pc-windows-msvc -DCMAKE_C_FLAGS=-march=armv8.2-a -DCMAKE_CXX_FLAGS=-march=armv8.2-a" }
