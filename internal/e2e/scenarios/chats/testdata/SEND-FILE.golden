@@ -1,7 +1,25 @@
 # SEND-FILE: `helper file <rel-path>` uploads a file from the outbound root; escapes are rejected; usage names the root
 # cxp black-box transcript; volatile values are numbered placeholders
 
-== chat <chat:1> "s001 · send-file"
+== chat <chat:1> "🏠 Codex Control - e2ehost"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
+-- <msg:2> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>new <root>/work/send-file</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>new <root>/work/send-file</p>
+-- <msg:3> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>✅ Work chat created: s001</p>
+   | <p>Open this Teams link and send your task there:<br>
+   | <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
+   | <p>If Teams does not show it right away, search for: s001</p>
+
+== chat <chat:2> "💬 e2ehost - New message in send-file"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -65,24 +83,6 @@
 -- <msg:12> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Teams file upload rejected: the file is outside the outbound root. <code>helper file</code> only reads relative files under the Teams outbound root: <root>/home/.local/state/codex-helper/teams/core-files/outbound</p>
-
-== chat <chat:2> "🏠 Codex Control - e2ehost"
-   type: meeting; members: owner
--- <msg:1> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
--- <msg:2> owner (html)
-   | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>new <root>/work/send-file</p>
-   edited 1 time(s); earlier versions:
-   [version 1]
-   | <p>new <root>/work/send-file</p>
--- <msg:3> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>✅ Work chat created: s001</p>
-   | <p>Open this Teams link and send your task there:<br>
-   | <a href="https://teams.microsoft.com/l/chat/<chat:1>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:1>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
-   | <p>If Teams does not show it right away, search for: s001</p>
 
 == uploaded files
 -- /Microsoft Teams Chat Files/codex-<upload:1>/summary.txt

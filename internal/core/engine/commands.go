@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -205,11 +204,19 @@ func (e *Engine) cmdNew(ctx context.Context, j cmdJob, arg string) {
 		e.reply(j, errText, nil)
 		return
 	}
-	dir, name, titleSource := req.dir, req.title, "user" // `new <dir> -- <title>`
-	if name == "" {
-		name, titleSource = filepath.Base(dir), "auto"
+	dir, titleSource := req.dir, "user" // `new <dir> -- <title>`
+	if sanitizeTitle(req.title) == "" {
+		titleSource = "auto"
 	}
 	var id int64
+	// v0.1.20's title of a new chat: "💬 <machine> - New message in
+	// <workspace>" until its first answer names it; `-- <title>` is the
+	// owner's title, kept like `helper rename`.
+	machine := e.machineLabel() // reads the store: not inside the transaction
+	title := workTitle(machine, "", placeholderTitle(dir), dir)
+	if titleSource == "user" {
+		title = workTitle(machine, req.title, "", dir)
+	}
 	// No reply of its own: as in v0.1.20, the control chat hears about the
 	// new chat once it exists ("✅ Work chat created: …", createChat).
 	e.complete(j, func(tx *store.Tx) error {
@@ -218,9 +225,14 @@ func (e *Engine) cmdNew(ctx context.Context, j cmdJob, arg string) {
 			return err
 		}
 		id, err = tx.CreateConversation(store.NewConversation{Label: label, Kind: store.KindWork, Channel: e.cfg.ChannelName,
-			Title: chatTitle(label, name), TitleSource: titleSource})
+			Title: title, TitleSource: titleSource})
 		if err != nil {
 			return err
+		}
+		if titleSource == "user" {
+			if err := tx.SetMeta(fmt.Sprint(metaUserTitle, id), sanitizeTitle(req.title)); err != nil {
+				return err
+			}
 		}
 		th, err := newChatThread(tx, id, dir) // the global defaults (defaults.go, batch B)
 		if err != nil {
@@ -245,11 +257,17 @@ func (e *Engine) cmdNew(ctx context.Context, j cmdJob, arg string) {
 	}
 }
 
-func chatTitle(label, name string) string {
-	if name == "" || name == "." || name == "/" {
-		return label
+// placeholderTitle is v0.1.20's NewWorkChatPlaceholderTitle: the title of
+// a work chat before its first answer names it.
+func placeholderTitle(cwd string) string {
+	ws := ""
+	if base := lastPathElement(cwd); base != "" {
+		ws = sanitizeTitle(base)
 	}
-	return label + " · " + name
+	if ws == "" {
+		ws = "workspace"
+	}
+	return "New message in " + ws
 }
 
 // nextLabel allocates the next free sNNN label.

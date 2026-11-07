@@ -630,6 +630,17 @@ func (s *Scenario) checkLoops(res *invResults, reqs []fakegraph.Request) {
 	}
 }
 
+// NewChatsSummary reports whether m is the helper's control-chat summary
+// of the new chats of sessions caught up at start (owner decision
+// 2026-11-07, amending the silent catch-up of 2026-11-05: Teams lists a
+// new chat only once it is opened, so these chats are announced once, a
+// few summary posts with a link per chat, the first post with an
+// @mention). It is the one owner notification that may name a chat that
+// only caught up; checkCatchUp holds each such chat to one summary.
+func NewChatsSummary(m fakegraph.Message) bool {
+	return m.Origin == fakegraph.OriginSUT && strings.Contains(m.Content, "New local Codex chats (")
+}
+
 // checkCatchUp: records written while no helper ran are caught up
 // silently.
 func (s *Scenario) checkCatchUp(res *invResults, instances []InstanceRecord) {
@@ -660,7 +671,7 @@ func (s *Scenario) checkCatchUp(res *invResults, instances []InstanceRecord) {
 			}
 			catchUpChats[p.chat] = true
 			for _, m := range s.Graph.Messages(p.chat) {
-				if m.Origin == fakegraph.OriginSUT && strings.Contains(m.Content, tok) && (len(m.Mentions) > 0 || strings.Contains(m.Content, "<at ")) {
+				if m.Origin == fakegraph.OriginSUT && !NewChatsSummary(m) && strings.Contains(m.Content, tok) && (len(m.Mentions) > 0 || strings.Contains(m.Content, "<at ")) {
 					res.add(InvCatchUpSilent, "chat %q: caught-up %s %s was posted with an @mention", p.topic, e.Kind, tok)
 				}
 			}
@@ -701,12 +712,22 @@ func (s *Scenario) checkCatchUp(res *invResults, instances []InstanceRecord) {
 				res.add(InvCatchUpSilent, "a Workflow card points at chat %s, which only caught up", s.topic(chat))
 			}
 		}
+		summaries := 0
 		for _, c := range s.Graph.Chats() {
 			for _, m := range s.Graph.Messages(c.ID) {
+				if NewChatsSummary(m) {
+					if names(m.Content) {
+						summaries++
+					}
+					continue
+				}
 				if m.Origin == fakegraph.OriginSUT && (len(m.Mentions) > 0 || strings.Contains(m.Content, "<at ")) && names(m.Content) {
 					res.add(InvCatchUpSilent, "an @mention in chat %s names chat %s, which only caught up: %s", s.topic(c.ID), s.topic(chat), clipBody(m.PlainText()))
 				}
 			}
+		}
+		if summaries > 1 {
+			res.add(InvCatchUpSilent, "chat %s, which only caught up, is announced in %d new-chat summaries", s.topic(chat), summaries)
 		}
 	}
 }

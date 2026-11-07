@@ -1,7 +1,83 @@
 # DELETED-CMDS: `helper restore-thread`, `helper reload`, `helper model provider|catalog`, control `reload`: refused with a pointer to help, no Codex turn
 # cxp black-box transcript; volatile values are numbered placeholders
 
-== chat <chat:1> "s001 · removed"
+== chat <chat:1> "🏠 Codex Control - e2ehost"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
+-- <msg:2> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>new <root>/work/removed</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>new <root>/work/removed</p>
+-- <msg:3> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>✅ Work chat created: s001</p>
+   | <p>Open this Teams link and send your task there:<br>
+   | <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
+   | <p>If Teams does not show it right away, search for: s001</p>
+-- <msg:4> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>reload</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>reload</p>
+-- <msg:5> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>unknown control command: <code>reload</code></p>
+   | <p><strong>🏠 Control chat</strong></p>
+   | <p>Use this chat to choose a workspace and create or continue 💬 Work chats.</p>
+   | <p>Start here:</p>
+   | <ul><li><code>p</code> / <code>projects</code> - choose a workspace</li>
+   | <li><code>n &lt;directory&gt;</code> / <code>new &lt;directory&gt;</code> - create a new Work chat for a directory</li>
+   | <li><code>new &lt;directory&gt; --model &lt;model&gt;</code> - create a Work chat pinned to a model</li>
+   | <li><code>model status|list|switch|reset</code> - inspect or change only this Control chat&#39;s model</li>
+   | <li><code>effort status|list|set|reset</code> - inspect or change this Control chat&#39;s reasoning effort</li>
+   | <li><code>default status</code> / <code>default model ...</code> / <code>default effort ...</code> - manage global defaults for future launches and chats</li>
+   | <li><code>s</code> / <code>sessions</code> - show sessions in the selected workspace</li>
+   | <li><code>c &lt;number&gt;</code> / <code>continue &lt;number&gt;</code> - continue an old local Codex session in Teams</li>
+   | <li><code>st</code> / <code>status</code> - show active Work chats</li>
+   | <li><code>helper rename &lt;title&gt;</code> - rename this Control chat</li>
+   | <li><code>helper rename hostname &lt;name&gt;</code> - rename this machine in all related chat titles</li>
+   | <li><code>skills</code> - list installed skill subscriptions</li>
+   | <li><code>shutdown</code> - stop the helper on all machines until <code>cxp teams start</code> is run on a machine</li>
+   | </ul>
+   | <p>After <code>p</code>, reply with a number such as <code>1</code> to open that workspace. On a workspace page, send <code>new</code> to create a Work chat in that workspace.</p>
+   | <p>For quick helper questions, type the question here. For project work, use a 💬 Work chat.</p>
+   | <p>Send <code>help advanced</code> for all commands.</p>
+-- <msg:6> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>restore-thread</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>restore-thread</p>
+-- <msg:7> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>unknown control command: <code>restore-thread</code></p>
+   | <p><strong>🏠 Control chat</strong></p>
+   | <p>Use this chat to choose a workspace and create or continue 💬 Work chats.</p>
+   | <p>Start here:</p>
+   | <ul><li><code>p</code> / <code>projects</code> - choose a workspace</li>
+   | <li><code>n &lt;directory&gt;</code> / <code>new &lt;directory&gt;</code> - create a new Work chat for a directory</li>
+   | <li><code>new &lt;directory&gt; --model &lt;model&gt;</code> - create a Work chat pinned to a model</li>
+   | <li><code>model status|list|switch|reset</code> - inspect or change only this Control chat&#39;s model</li>
+   | <li><code>effort status|list|set|reset</code> - inspect or change this Control chat&#39;s reasoning effort</li>
+   | <li><code>default status</code> / <code>default model ...</code> / <code>default effort ...</code> - manage global defaults for future launches and chats</li>
+   | <li><code>s</code> / <code>sessions</code> - show sessions in the selected workspace</li>
+   | <li><code>c &lt;number&gt;</code> / <code>continue &lt;number&gt;</code> - continue an old local Codex session in Teams</li>
+   | <li><code>st</code> / <code>status</code> - show active Work chats</li>
+   | <li><code>helper rename &lt;title&gt;</code> - rename this Control chat</li>
+   | <li><code>helper rename hostname &lt;name&gt;</code> - rename this machine in all related chat titles</li>
+   | <li><code>skills</code> - list installed skill subscriptions</li>
+   | <li><code>shutdown</code> - stop the helper on all machines until <code>cxp teams start</code> is run on a machine</li>
+   | </ul>
+   | <p>After <code>p</code>, reply with a number such as <code>1</code> to open that workspace. On a workspace page, send <code>new</code> to create a Work chat in that workspace.</p>
+   | <p>For quick helper questions, type the question here. For project work, use a 💬 Work chat.</p>
+   | <p>Send <code>help advanced</code> for all commands.</p>
+
+== chat <chat:2> "💬 e2ehost - New message in removed"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -99,79 +175,3 @@
    | <li><code>model list</code> - show this chat&#39;s effective model first, then verified profiles</li>
    | <li><code>effort list|status|set|reset</code> - inspect or change this chat&#39;s effort</li>
    | </ul>
-
-== chat <chat:2> "🏠 Codex Control - e2ehost"
-   type: meeting; members: owner
--- <msg:1> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
--- <msg:2> owner (html)
-   | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>new <root>/work/removed</p>
-   edited 1 time(s); earlier versions:
-   [version 1]
-   | <p>new <root>/work/removed</p>
--- <msg:3> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>✅ Work chat created: s001</p>
-   | <p>Open this Teams link and send your task there:<br>
-   | <a href="https://teams.microsoft.com/l/chat/<chat:1>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:1>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
-   | <p>If Teams does not show it right away, search for: s001</p>
--- <msg:4> owner (html)
-   | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>reload</p>
-   edited 1 time(s); earlier versions:
-   [version 1]
-   | <p>reload</p>
--- <msg:5> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>unknown control command: <code>reload</code></p>
-   | <p><strong>🏠 Control chat</strong></p>
-   | <p>Use this chat to choose a workspace and create or continue 💬 Work chats.</p>
-   | <p>Start here:</p>
-   | <ul><li><code>p</code> / <code>projects</code> - choose a workspace</li>
-   | <li><code>n &lt;directory&gt;</code> / <code>new &lt;directory&gt;</code> - create a new Work chat for a directory</li>
-   | <li><code>new &lt;directory&gt; --model &lt;model&gt;</code> - create a Work chat pinned to a model</li>
-   | <li><code>model status|list|switch|reset</code> - inspect or change only this Control chat&#39;s model</li>
-   | <li><code>effort status|list|set|reset</code> - inspect or change this Control chat&#39;s reasoning effort</li>
-   | <li><code>default status</code> / <code>default model ...</code> / <code>default effort ...</code> - manage global defaults for future launches and chats</li>
-   | <li><code>s</code> / <code>sessions</code> - show sessions in the selected workspace</li>
-   | <li><code>c &lt;number&gt;</code> / <code>continue &lt;number&gt;</code> - continue an old local Codex session in Teams</li>
-   | <li><code>st</code> / <code>status</code> - show active Work chats</li>
-   | <li><code>helper rename &lt;title&gt;</code> - rename this Control chat</li>
-   | <li><code>helper rename hostname &lt;name&gt;</code> - rename this machine in all related chat titles</li>
-   | <li><code>skills</code> - list installed skill subscriptions</li>
-   | <li><code>shutdown</code> - stop the helper on all machines until <code>cxp teams start</code> is run on a machine</li>
-   | </ul>
-   | <p>After <code>p</code>, reply with a number such as <code>1</code> to open that workspace. On a workspace page, send <code>new</code> to create a Work chat in that workspace.</p>
-   | <p>For quick helper questions, type the question here. For project work, use a 💬 Work chat.</p>
-   | <p>Send <code>help advanced</code> for all commands.</p>
--- <msg:6> owner (html)
-   | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>restore-thread</p>
-   edited 1 time(s); earlier versions:
-   [version 1]
-   | <p>restore-thread</p>
--- <msg:7> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>unknown control command: <code>restore-thread</code></p>
-   | <p><strong>🏠 Control chat</strong></p>
-   | <p>Use this chat to choose a workspace and create or continue 💬 Work chats.</p>
-   | <p>Start here:</p>
-   | <ul><li><code>p</code> / <code>projects</code> - choose a workspace</li>
-   | <li><code>n &lt;directory&gt;</code> / <code>new &lt;directory&gt;</code> - create a new Work chat for a directory</li>
-   | <li><code>new &lt;directory&gt; --model &lt;model&gt;</code> - create a Work chat pinned to a model</li>
-   | <li><code>model status|list|switch|reset</code> - inspect or change only this Control chat&#39;s model</li>
-   | <li><code>effort status|list|set|reset</code> - inspect or change this Control chat&#39;s reasoning effort</li>
-   | <li><code>default status</code> / <code>default model ...</code> / <code>default effort ...</code> - manage global defaults for future launches and chats</li>
-   | <li><code>s</code> / <code>sessions</code> - show sessions in the selected workspace</li>
-   | <li><code>c &lt;number&gt;</code> / <code>continue &lt;number&gt;</code> - continue an old local Codex session in Teams</li>
-   | <li><code>st</code> / <code>status</code> - show active Work chats</li>
-   | <li><code>helper rename &lt;title&gt;</code> - rename this Control chat</li>
-   | <li><code>helper rename hostname &lt;name&gt;</code> - rename this machine in all related chat titles</li>
-   | <li><code>skills</code> - list installed skill subscriptions</li>
-   | <li><code>shutdown</code> - stop the helper on all machines until <code>cxp teams start</code> is run on a machine</li>
-   | </ul>
-   | <p>After <code>p</code>, reply with a number such as <code>1</code> to open that workspace. On a workspace page, send <code>new</code> to create a Work chat in that workspace.</p>
-   | <p>For quick helper questions, type the question here. For project work, use a 💬 Work chat.</p>
-   | <p>Send <code>help advanced</code> for all commands.</p>

@@ -213,7 +213,9 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 		return false
 	}
 	machine := e.machine() // reads the store: not inside the transaction
+	found := false         // a discovered session's chat (announce.go)
 	err = e.update(func(tx *store.Tx) error {
+		found = false
 		if err := tx.SetChat(id, info.ID, info.URL); err != nil {
 			return err
 		}
@@ -243,6 +245,7 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 			if err := tx.SetMeta(discoveredKey(id), ""); err != nil {
 				return err
 			}
+			found = true
 		case imported:
 			// Its notices are queued with the conversation (import.go).
 		case fork.Src != 0: // batch B
@@ -282,6 +285,9 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 	e.mu.Unlock()
 	if inbox {
 		wake(e.registryWake) // the card can be published now
+	}
+	if found {
+		e.announcePass() // a summary may be complete now
 	}
 	e.wakeReader()
 	e.wakeSender()

@@ -684,6 +684,7 @@ func (e *Engine) track(src store.TranscriptSource, catchUp int64) {
 // its rollout from offset.
 func (e *Engine) mirrorSession(ctx context.Context, src store.TranscriptSource, meta transcript.SessionMeta, offset, catchUp int64) {
 	first := transcript.FirstPrompt(src.Path, firstPromptMax)
+	machine := e.machineLabel() // reads the store: not inside the transaction
 	var id, bound int64
 	var label string
 	err := e.update(func(tx *store.Tx) error {
@@ -697,12 +698,11 @@ func (e *Engine) mirrorSession(ctx context.Context, src store.TranscriptSource, 
 		if err != nil {
 			return err
 		}
-		name := oneLine(first, 48)
-		if name == "" {
-			name = filepath.Base(meta.Cwd)
-		}
+		// v0.1.20's title of a published local session: "💬 <machine> -
+		// <first prompt>" (the directory's name without one); the
+		// automatic title follows the thread name after an answer.
 		id, err = tx.CreateConversation(store.NewConversation{Label: label, Kind: store.KindWork, Channel: e.cfg.ChannelName,
-			Title: chatTitle(label, name), TitleSource: "auto"})
+			Title: workTitle(machine, "", promptTitle(first), meta.Cwd), TitleSource: "auto"})
 		if err != nil {
 			return err
 		}
@@ -944,8 +944,10 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 	}
 	e.mu.Unlock()
 	var posted, notify int
+	var liveThrough int64 // the seq of the last row queued for a live record
 	err = e.update(func(tx *store.Tx) error {
-		posted, woke, created, notify = 0, false, false, 0
+		posted, woke, created, notify, liveThrough = 0, false, false, 0, 0
+		anyLive := false
 		var msgs []store.OutMsg
 		firstLive := false
 		start := 0
@@ -979,6 +981,7 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 			if posted == 0 {
 				firstLive = live
 			}
+			anyLive = anyLive || (live && len(r.msgs) > 0)
 			msgs = append(msgs, r.msgs...)
 			posted++
 			if live && r.o.Kind == transcript.OutputFinal {
@@ -1021,8 +1024,13 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 				}
 				created = true
 				if firstLive {
-					// v0.1.20 local_session_started, for a live session only.
+					// v0.1.20 local_session_started, for a live session
+					// only; a session caught up at start is announced in
+					// the control chat's summary instead (announce.go).
 					if err := addNotify(tx, pendingNotify{Conv: f.src.ConvID, Key: "ready:" + label + ":", Kind: notifyLocal}); err != nil {
+						return err
+					}
+					if err := markAnnounced(tx, f.src.ConvID); err != nil {
 						return err
 					}
 					notify++
@@ -1044,6 +1052,12 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 		if err := tx.AdvanceSource(f.src.ID, off, line, info.Size, ms(info.MTime), info.Inode, msgs); err != nil {
 			return err
 		}
+		if anyLive {
+			var err error
+			if liveThrough, err = tx.LastSeq(f.src.ConvID); err != nil {
+				return err
+			}
+		}
 		return e.importProgress(tx, f, posted) // import.go
 	})
 	if err != nil {
@@ -1060,10 +1074,17 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 	if notify > 0 {
 		wake(e.notifyWake)
 	}
+	if liveThrough > 0 {
+		e.markLive(f.src.ConvID, liveThrough)
+	}
 	if created {
-		// Catch-up: nobody waits for this chat, so its creation goes
-		// with the mirrored messages, after the replies.
-		e.requestChat(f.src.ConvID, sendMirror)
+		// A caught-up session's chat goes with the backlog; a session in
+		// use now gets its chat with the live messages.
+		class := sendMirror
+		if liveThrough > 0 {
+			class = sendLive
+		}
+		e.requestChat(f.src.ConvID, class)
 	}
 	if woke {
 		_ = e.update(func(tx *store.Tx) error { _, err := e.refresh(tx, f.src.ConvID); return err })

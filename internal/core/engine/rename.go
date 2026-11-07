@@ -629,62 +629,15 @@ func autoAllowed(source, title, user string) bool {
 func (e *Engine) autoTitle(ctx context.Context, conv int64, chat string) error {
 	e.titles.run.Lock()
 	defer e.titles.run.Unlock()
-	var (
-		c     store.Conversation
-		th    store.Thread
-		user  string
-		first string
-		path  string
-		found bool
-	)
-	if err := e.update(func(tx *store.Tx) error {
-		var err error
-		if c, found, err = tx.Conversation(conv); err != nil || !found {
-			return err
-		}
-		if th, _, err = tx.Thread(conv); err != nil {
-			return err
-		}
-		if user, _, err = tx.Meta(fmt.Sprint(metaUserTitle, conv)); err != nil {
-			return err
-		}
-		if first, err = tx.FirstPrompt(conv); err != nil {
-			return err
-		}
-		// Batch A: a chat made by `continue` is titled from its local
-		// session (v0.1.20), not from the first prompt sent in Teams.
-		if v, _, err := tx.Meta(importedKey(conv)); err != nil {
-			return err
-		} else if v == "1" {
-			first = ""
-		}
-		if first != "" {
-			return nil
-		}
-		path, err = tx.SourcePath(conv)
-		return err
-	}); err != nil || !found {
+	f, err := e.loadTitleFacts(conv)
+	if err != nil || !f.found {
 		return err
 	}
-	if c.State == store.ConvClosed || !autoAllowed(c.TitleSource, c.Title, user) {
+	c, th := f.c, f.th
+	if c.State == store.ConvClosed || !autoAllowed(c.TitleSource, c.Title, f.user) {
 		return nil
 	}
-	name := ""
-	if th.ThreadID != "" {
-		home := th.CodexHome
-		if home == "" && e.cfg.SessionsDir != "" {
-			home = filepath.Dir(e.cfg.SessionsDir)
-		}
-		if home != "" {
-			name = threadName(filepath.Join(home, "session_index.jsonl"), th.ThreadID)
-		}
-	}
-	if name == "" {
-		name = promptTitle(first)
-	}
-	if name == "" && path != "" {
-		name = promptTitle(transcript.FirstPrompt(path, firstPromptMax))
-	}
+	name := e.autoName(f)
 	if strings.TrimSpace(name) == "" {
 		return nil
 	}
@@ -702,6 +655,72 @@ func (e *Engine) autoTitle(ctx context.Context, conv int64, chat string) error {
 		_, err := e.refresh(tx, conv)
 		return err
 	})
+}
+
+// titleFacts is what a work chat's title is made from.
+type titleFacts struct {
+	c     store.Conversation
+	th    store.Thread
+	user  string // the owner's title (`helper rename`)
+	first string // the owner's first prompt in the chat
+	path  string // the local rollout, when there is no such prompt
+	found bool
+}
+
+func (e *Engine) loadTitleFacts(conv int64) (titleFacts, error) {
+	var f titleFacts
+	err := e.update(func(tx *store.Tx) error {
+		f = titleFacts{}
+		var err error
+		if f.c, f.found, err = tx.Conversation(conv); err != nil || !f.found {
+			return err
+		}
+		if f.th, _, err = tx.Thread(conv); err != nil {
+			return err
+		}
+		if f.user, _, err = tx.Meta(fmt.Sprint(metaUserTitle, conv)); err != nil {
+			return err
+		}
+		if f.first, err = tx.FirstPrompt(conv); err != nil {
+			return err
+		}
+		// Batch A: a chat made by `continue` is titled from its local
+		// session (v0.1.20), not from the first prompt sent in Teams.
+		if v, _, err := tx.Meta(importedKey(conv)); err != nil {
+			return err
+		} else if v == "1" {
+			f.first = ""
+		}
+		if f.first != "" {
+			return nil
+		}
+		f.path, err = tx.SourcePath(conv)
+		return err
+	})
+	return f, err
+}
+
+// autoName is the automatic title text of a work chat: its Codex thread
+// name, else the owner's first prompt, else the first prompt of its local
+// rollout ("" when none).
+func (e *Engine) autoName(f titleFacts) string {
+	name := ""
+	if f.th.ThreadID != "" {
+		home := f.th.CodexHome
+		if home == "" && e.cfg.SessionsDir != "" {
+			home = filepath.Dir(e.cfg.SessionsDir)
+		}
+		if home != "" {
+			name = threadName(filepath.Join(home, "session_index.jsonl"), f.th.ThreadID)
+		}
+	}
+	if name == "" {
+		name = promptTitle(f.first)
+	}
+	if name == "" && f.path != "" {
+		name = promptTitle(transcript.FirstPrompt(f.path, firstPromptMax))
+	}
+	return strings.TrimSpace(name)
 }
 
 // threadName is the newest thread name Codex recorded for thread in its

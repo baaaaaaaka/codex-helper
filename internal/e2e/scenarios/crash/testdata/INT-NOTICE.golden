@@ -43,9 +43,9 @@
    | <a href="https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
    | <p>If Teams does not show it right away, search for: s003</p>
 -- "Codex finished" notices, one line each, sorted (posting order is timing: several chats finish together after the restart)
-   finished: s001 · int-a | request: Next request E2E-INTNOTICE-nexta-4 (@owner)
-   finished: s002 · int-b | request: Next request E2E-INTNOTICE-nextb-5 (@owner)
-   finished: s003 · int-c | request: Quick task E2E-INTNOTICE-idlec-3 (@owner)
+   finished: 💬 e2ehost - New message in int-a | request: Next request E2E-INTNOTICE-nexta-4 (@owner)
+   finished: 💬 e2ehost - New message in int-b | request: Next request E2E-INTNOTICE-nextb-5 (@owner)
+   finished: 💬 e2ehost - New message in int-c | request: Quick task E2E-INTNOTICE-idlec-3 (@owner)
    finished: 💬 e2ehost - Quick task E2E-INTNOTICE-idlec-3 | request: Next request E2E-INTNOTICE-nextc-6 (@owner)
 
 == chat <chat:2> "💬 e2ehost - Long task E2E-INTNOTICE-runa-1"

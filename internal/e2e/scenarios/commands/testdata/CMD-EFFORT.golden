@@ -21,7 +21,7 @@
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>✅ Codex finished</strong></p>
-   | <p><strong>Chat:</strong> s001 · effort<br>
+   | <p><strong>Chat:</strong> 💬 e2ehost - New message in effort<br>
    | <strong>Request:</strong> Please answer E2E-CMDEFFORT-high-1</p>
    | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
    | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
@@ -376,7 +376,7 @@
    prompt|   - <time> helper/notice:
    prompt|   🔧 Helper: E2E Owner
    prompt|   ✅ Codex finished
-   prompt|   Chat: s001 · effort
+   prompt|   Chat: 💬 e2ehost - New message in effort
    prompt|   Request: Please answer E2E-CMDEFFORT-high-1
    prompt|   Next: The answer is ready in the work chat.
    prompt|   Open: Open answer (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)

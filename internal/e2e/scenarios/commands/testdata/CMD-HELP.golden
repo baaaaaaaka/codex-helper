@@ -1,71 +1,7 @@
 # CMD-HELP: control `help` / `help advanced` and work `helper help` / `helper help advanced` are v0.1.20's texts without removed commands
 # cxp black-box transcript; volatile values are numbered placeholders
 
-== chat <chat:1> "s001 · help"
-   type: meeting; members: owner
--- <msg:1> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Work chat created: s001.<br>
-   | Working directory: <root>/work/help</p>
--- <msg:2> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>💬 Work chat is ready.<br>
-   | Send a task in this chat. Codex will start automatically and continue this session.<br>
-   | Status: waiting for your first task.<br>
-   | Session: s001<br>
-   | Project: help<br>
-   | Working directory: <root>/work/help<br>
-   | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
-   | Need more details? Send <code>helper status</code>.</p>
--- <msg:3> owner (html)
-   | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>helper help</p>
-   edited 1 time(s); earlier versions:
-   [version 1]
-   | <p>helper help</p>
--- <msg:4> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>💬 Work chat<br>
-   | Send your task as a regular Teams message. Messages starting with <code>helper</code> or <code>!</code> are helper commands.</p>
-   | <p>Common commands:<br>
-   | <code>helper status</code> or <code>!status</code> - check progress<br>
-   | <code>helper stats</code> or <code>!stats</code> - show Codex token usage from the linked local history, grouped by model and service tier<br>
-   | <code>helper file &lt;relative-path&gt;</code> or <code>!file &lt;relative-path&gt;</code> - upload a file prepared in the helper&#39;s Teams upload folder<br>
-   | <code>helper close</code> or <code>!close</code> - close this Codex session in Teams<br>
-   | <code>helper details</code> or <code>!details</code> - show debug IDs and links<br>
-   | <code>model status</code>, <code>model switch &lt;model&gt;</code>, <code>model reset</code>, or <code>model fork &lt;model&gt;</code> - inspect or change this Work chat model<br>
-   | <code>effort status</code>, <code>effort list</code>, <code>effort set &lt;value&gt;</code>, or <code>effort reset</code> - inspect or change this Work chat&#39;s reasoning effort<br>
-   | <code>default ...</code> - global defaults are Control-chat-only<br>
-   | <code>helper publish-history</code> - import a paused local Codex history backlog<br>
-   | <code>helper publish-history full</code> - publish the complete local Codex history once to this chat<br>
-   | <code>helper skills list</code> / <code>helper skills add &lt;url&gt;</code> / <code>helper skills push</code> / <code>helper skills push confirm</code> - inspect and push skill subscriptions</p>
-   | <p>Send <code>helper help advanced</code> for retry, cancel, and rename commands.</p>
--- <msg:5> owner (html)
-   | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>!help advanced</p>
-   edited 1 time(s); earlier versions:
-   [version 1]
-   | <p>!help advanced</p>
--- <msg:6> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>💬 Work chat advanced help<br>
-   | <code>helper status</code> or <code>!status</code> - check progress<br>
-   | <code>helper stats</code> or <code>!stats</code> - show Codex token usage by model/service-tier combination, cache/context analysis, and rate-limit metadata when Codex recorded it<br>
-   | <code>helper details</code> or <code>!details</code> - show IDs and debug details<br>
-   | <code>helper rename &lt;title&gt;</code> or <code>!rename &lt;title&gt;</code> - rename this Teams chat<br>
-   | <code>helper rename hostname &lt;name&gt;</code> - rename this machine in all related chat titles<br>
-   | <code>helper file &lt;relative-path&gt;</code> or <code>!file &lt;relative-path&gt;</code> - upload a file prepared in the helper&#39;s Teams upload folder<br>
-   | <code>helper close</code> or <code>!close</code> - close this Codex session in Teams<br>
-   | <code>helper park &lt;session-number-or-id&gt;</code> / <code>helper resume &lt;session-number-or-id&gt;</code> / <code>helper unpark &lt;session-number-or-id&gt;</code> - manually pause or resume polling for a Work chat<br>
-   | <code>helper unpause</code> - resume auto-start after a pause (requests sent while paused are not run)<br>
-   | <code>helper fork</code> - copy this session into a new Work chat<br>
-   | <code>helper publish-history</code> or <code>!ph</code> - import a paused local Codex history backlog<br>
-   | <code>helper publish-history full</code> - publish the complete local Codex history once to this chat<br>
-   | advanced commands: <code>helper retry last</code>, <code>helper retry &lt;turn-id&gt;</code> / <code>!retry &lt;turn-id&gt;</code>, or <code>helper cancel last</code>, <code>helper cancel queued</code>, <code>helper cancel running</code>, <code>helper cancel all</code>, <code>helper cancel &lt;turn-id&gt;</code> / <code>!cancel &lt;turn-id&gt;</code><br>
-   | Status words: <code>queued</code>/<code>running</code> means wait, <code>completed</code> means done, <code>failed</code> or <code>interrupted</code> means check recent messages and changed files before <code>helper retry last</code>.<br>
-   | Other text, including unknown slash-prefixed text, is sent to Codex.</p>
-
-== chat <chat:2> "🏠 Codex Control - e2ehost"
+== chat <chat:1> "🏠 Codex Control - e2ehost"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -80,7 +16,7 @@
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>✅ Work chat created: s001</p>
    | <p>Open this Teams link and send your task there:<br>
-   | <a href="https://teams.microsoft.com/l/chat/<chat:1>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:1>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
+   | <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
    | <p>If Teams does not show it right away, search for: s001</p>
 -- <msg:4> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
@@ -166,3 +102,67 @@
    | <code>p</code><br>
    | <code>n /home/baka/project/codex-helper</code><br>
    | <code>m ~<tmp:1></code></p>
+
+== chat <chat:2> "💬 e2ehost - New message in help"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Work chat created: s001.<br>
+   | Working directory: <root>/work/help</p>
+-- <msg:2> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>💬 Work chat is ready.<br>
+   | Send a task in this chat. Codex will start automatically and continue this session.<br>
+   | Status: waiting for your first task.<br>
+   | Session: s001<br>
+   | Project: help<br>
+   | Working directory: <root>/work/help<br>
+   | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
+   | Need more details? Send <code>helper status</code>.</p>
+-- <msg:3> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper help</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper help</p>
+-- <msg:4> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>💬 Work chat<br>
+   | Send your task as a regular Teams message. Messages starting with <code>helper</code> or <code>!</code> are helper commands.</p>
+   | <p>Common commands:<br>
+   | <code>helper status</code> or <code>!status</code> - check progress<br>
+   | <code>helper stats</code> or <code>!stats</code> - show Codex token usage from the linked local history, grouped by model and service tier<br>
+   | <code>helper file &lt;relative-path&gt;</code> or <code>!file &lt;relative-path&gt;</code> - upload a file prepared in the helper&#39;s Teams upload folder<br>
+   | <code>helper close</code> or <code>!close</code> - close this Codex session in Teams<br>
+   | <code>helper details</code> or <code>!details</code> - show debug IDs and links<br>
+   | <code>model status</code>, <code>model switch &lt;model&gt;</code>, <code>model reset</code>, or <code>model fork &lt;model&gt;</code> - inspect or change this Work chat model<br>
+   | <code>effort status</code>, <code>effort list</code>, <code>effort set &lt;value&gt;</code>, or <code>effort reset</code> - inspect or change this Work chat&#39;s reasoning effort<br>
+   | <code>default ...</code> - global defaults are Control-chat-only<br>
+   | <code>helper publish-history</code> - import a paused local Codex history backlog<br>
+   | <code>helper publish-history full</code> - publish the complete local Codex history once to this chat<br>
+   | <code>helper skills list</code> / <code>helper skills add &lt;url&gt;</code> / <code>helper skills push</code> / <code>helper skills push confirm</code> - inspect and push skill subscriptions</p>
+   | <p>Send <code>helper help advanced</code> for retry, cancel, and rename commands.</p>
+-- <msg:5> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>!help advanced</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>!help advanced</p>
+-- <msg:6> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>💬 Work chat advanced help<br>
+   | <code>helper status</code> or <code>!status</code> - check progress<br>
+   | <code>helper stats</code> or <code>!stats</code> - show Codex token usage by model/service-tier combination, cache/context analysis, and rate-limit metadata when Codex recorded it<br>
+   | <code>helper details</code> or <code>!details</code> - show IDs and debug details<br>
+   | <code>helper rename &lt;title&gt;</code> or <code>!rename &lt;title&gt;</code> - rename this Teams chat<br>
+   | <code>helper rename hostname &lt;name&gt;</code> - rename this machine in all related chat titles<br>
+   | <code>helper file &lt;relative-path&gt;</code> or <code>!file &lt;relative-path&gt;</code> - upload a file prepared in the helper&#39;s Teams upload folder<br>
+   | <code>helper close</code> or <code>!close</code> - close this Codex session in Teams<br>
+   | <code>helper park &lt;session-number-or-id&gt;</code> / <code>helper resume &lt;session-number-or-id&gt;</code> / <code>helper unpark &lt;session-number-or-id&gt;</code> - manually pause or resume polling for a Work chat<br>
+   | <code>helper unpause</code> - resume auto-start after a pause (requests sent while paused are not run)<br>
+   | <code>helper fork</code> - copy this session into a new Work chat<br>
+   | <code>helper publish-history</code> or <code>!ph</code> - import a paused local Codex history backlog<br>
+   | <code>helper publish-history full</code> - publish the complete local Codex history once to this chat<br>
+   | advanced commands: <code>helper retry last</code>, <code>helper retry &lt;turn-id&gt;</code> / <code>!retry &lt;turn-id&gt;</code>, or <code>helper cancel last</code>, <code>helper cancel queued</code>, <code>helper cancel running</code>, <code>helper cancel all</code>, <code>helper cancel &lt;turn-id&gt;</code> / <code>!cancel &lt;turn-id&gt;</code><br>
+   | Status words: <code>queued</code>/<code>running</code> means wait, <code>completed</code> means done, <code>failed</code> or <code>interrupted</code> means check recent messages and changed files before <code>helper retry last</code>.<br>
+   | Other text, including unknown slash-prefixed text, is sent to Codex.</p>

@@ -806,6 +806,10 @@ func (e *Engine) publishNew(j cmdJob, s *dashSession, extra func(tx *store.Tx) e
 			if err := tx.SetMeta(discoveredKey(id), ""); err != nil {
 				return err
 			}
+			// `continue` announces this chat itself (announce.go).
+			if err := markAnnounced(tx, id); err != nil {
+				return err
+			}
 		} else {
 			if label, err = e.nextLabel(tx); err != nil {
 				return err

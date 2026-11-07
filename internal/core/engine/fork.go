@@ -88,6 +88,7 @@ func (e *Engine) cmdFork(ctx context.Context, j cmdJob, cs *convState) {
 	e.mu.Lock()
 	label, threadID, cwd, running := cs.label, cs.threadID, cs.cwd, cs.running != nil
 	e.mu.Unlock()
+	machine := e.machineLabel() // reads the store: not inside a transaction
 	if threadID == "" {
 		e.reply(j, "Nothing to fork yet: "+label+" has no Codex conversation. Send a request first.", nil)
 		return
@@ -118,7 +119,7 @@ func (e *Engine) cmdFork(ctx context.Context, j cmdJob, cs *convState) {
 			return err
 		}
 		cid, err := tx.CreateConversation(store.NewConversation{Label: newLabel, Kind: store.KindWork, Channel: e.cfg.ChannelName,
-			Title: chatTitle(newLabel, "fork of "+label), TitleSource: "auto"})
+			Title: workTitle(machine, "", "fork of "+label, cwd), TitleSource: "auto"})
 		if err != nil {
 			return err
 		}

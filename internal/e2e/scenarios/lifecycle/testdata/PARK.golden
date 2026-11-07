@@ -52,14 +52,14 @@
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Resumed s001: its chat is read again.</p>
 -- "Codex finished" notices, one line each, sorted (posting order is timing: several chats finish close together)
-   finished: s001 · park-a | request: First task E2E-PARK-warma-1 (@owner)
-   finished: s002 · park-b | request: First task E2E-PARK-warmb-2 (@owner)
-   finished: s003 · park-c | request: First task E2E-PARK-warmc-3 (@owner)
    finished: 💬 e2ehost - First task E2E-PARK-warma-1 | request: Typed while parked E2E-PARK-whileparked-4 (@owner)
    finished: 💬 e2ehost - First task E2E-PARK-warmb-2 (@owner)
    finished: 💬 e2ehost - First task E2E-PARK-warmb-2 | request: Follow-up after the local work E2E-PARK-afterlocal-10 (@owner)
    finished: 💬 e2ehost - First task E2E-PARK-warmb-2 | request: Typed while parked E2E-PARK-whileparkedb-5 (@owner)
    finished: 💬 e2ehost - First task E2E-PARK-warmc-3 (@owner)
+   finished: 💬 e2ehost - New message in park-a | request: First task E2E-PARK-warma-1 (@owner)
+   finished: 💬 e2ehost - New message in park-b | request: First task E2E-PARK-warmb-2 (@owner)
+   finished: 💬 e2ehost - New message in park-c | request: First task E2E-PARK-warmc-3 (@owner)
 
 == chat <chat:2> "💬 e2ehost - First task E2E-PARK-warma-1"
    type: meeting; members: owner

@@ -946,31 +946,45 @@
    | <p>3 older messages (from more than a day ago) that the previous helper had not sent or could not confirm are not sent now.</p>
    | <p>Local Codex sessions are caught up from now on.</p>
    | <p>The previous data is kept unchanged as a backup. The full report is migration-report.txt next to the helper&#39;s store (<code>cxp teams status</code> shows where).</p>
--- <msg:2> owner (html)
+-- <msg:2> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
+   | <p><strong>🆕 New local Codex chats (16)</strong></p>
+   | <p>These local Codex sessions got Teams work chats while the helper was catching up. Teams lists a new chat only after it is opened: open one here to watch it and continue from its full local context.</p>
+   | <ul><li><strong>s008</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:309>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-00-0</a> (https://teams.microsoft.com/l/chat/<chat:309>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <li><strong>s009</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:310>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-01-0</a> (https://teams.microsoft.com/l/chat/<chat:310>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <li><strong>s010</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:311>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-02-0</a> (https://teams.microsoft.com/l/chat/<chat:311>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <li><strong>s011</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:312>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-03-0</a> (https://teams.microsoft.com/l/chat/<chat:312>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <li><strong>s012</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:313>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-04-0</a> (https://teams.microsoft.com/l/chat/<chat:313>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <li><strong>s013</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:314>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-05-0</a> (https://teams.microsoft.com/l/chat/<chat:314>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <li><strong>s014</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:315>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-06-0</a> (https://teams.microsoft.com/l/chat/<chat:315>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <li><strong>s015</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:316>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-07-0</a> (https://teams.microsoft.com/l/chat/<chat:316>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <li><strong>s016</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:317>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-08-0</a> (https://teams.microsoft.com/l/chat/<chat:317>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <li><strong>s017</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:318>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-09-0</a> (https://teams.microsoft.com/l/chat/<chat:318>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <li><strong>s018</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:319>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-10-0</a> (https://teams.microsoft.com/l/chat/<chat:319>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <li><strong>s019</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:320>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-11-0</a> (https://teams.microsoft.com/l/chat/<chat:320>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <li><strong>s020</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:321>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-12-0</a> (https://teams.microsoft.com/l/chat/<chat:321>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <li><strong>s021</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:322>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-13-0</a> (https://teams.microsoft.com/l/chat/<chat:322>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <li><strong>s022</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:323>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-14-0</a> (https://teams.microsoft.com/l/chat/<chat:323>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <li><strong>s023</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:324>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-15-0</a> (https://teams.microsoft.com/l/chat/<chat:324>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | </ul>
+   mention 0: owner "E2E Owner"
+-- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>new <root>/work/live</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>new <root>/work/live</p>
--- <msg:3> helper (html)
+-- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>✅ Work chat created: s024</p>
    | <p>Open this Teams link and send your task there:<br>
    | <a href="https://teams.microsoft.com/l/chat/<chat:325>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:325>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
    | <p>If Teams does not show it right away, search for: s024</p>
--- <msg:4> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
-   | <p><strong>✅ Codex finished</strong></p>
-   | <p><strong>Chat:</strong> s024 · live<br>
-   | <strong>Request:</strong> Live task E2E-CATCHUPLIVE-first-1</p>
-   | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
-   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:325>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:325>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
-   mention 0: owner "E2E Owner"
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>✅ Codex finished</strong></p>
-   | <p><strong>Chat:</strong> 💬 e2ehost - Live task E2E-CATCHUPLIVE-first-1<br>
-   | <strong>Request:</strong> Follow-up 1 E2E-CATCHUPLIVE-followup1-2</p>
+   | <p><strong>Chat:</strong> 💬 e2ehost - New message in live<br>
+   | <strong>Request:</strong> Live task E2E-CATCHUPLIVE-first-1</p>
    | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
    | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:325>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:325>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
    mention 0: owner "E2E Owner"
@@ -978,11 +992,19 @@
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>✅ Codex finished</strong></p>
    | <p><strong>Chat:</strong> 💬 e2ehost - Live task E2E-CATCHUPLIVE-first-1<br>
-   | <strong>Request:</strong> Follow-up 2 E2E-CATCHUPLIVE-followup2-3</p>
+   | <strong>Request:</strong> Follow-up 1 E2E-CATCHUPLIVE-followup1-2</p>
    | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
    | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:325>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:325>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
    mention 0: owner "E2E Owner"
 -- <msg:7> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
+   | <p><strong>✅ Codex finished</strong></p>
+   | <p><strong>Chat:</strong> 💬 e2ehost - Live task E2E-CATCHUPLIVE-first-1<br>
+   | <strong>Request:</strong> Follow-up 2 E2E-CATCHUPLIVE-followup2-3</p>
+   | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
+   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:325>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:325>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
+   mention 0: owner "E2E Owner"
+-- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>✅ Codex finished</strong></p>
    | <p><strong>Chat:</strong> 💬 e2ehost - Live task E2E-CATCHUPLIVE-first-1<br>
@@ -994,7 +1016,7 @@
 == chat <chat:308> ""
    type: group; members: owner
 
-== chat <chat:309> "s008 · Backlog prompt backlog-p-00-0"
+== chat <chat:309> "💬 e2ehost - Backlog prompt backlog-p-00-0"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -1021,7 +1043,7 @@
    | <p>Backlog answer backlog-a-00-2</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
-== chat <chat:310> "s009 · Backlog prompt backlog-p-01-0"
+== chat <chat:310> "💬 e2ehost - Backlog prompt backlog-p-01-0"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -1048,7 +1070,7 @@
    | <p>Backlog answer backlog-a-01-2</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
-== chat <chat:311> "s010 · Backlog prompt backlog-p-02-0"
+== chat <chat:311> "💬 e2ehost - Backlog prompt backlog-p-02-0"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -1075,7 +1097,7 @@
    | <p>Backlog answer backlog-a-02-2</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
-== chat <chat:312> "s011 · Backlog prompt backlog-p-03-0"
+== chat <chat:312> "💬 e2ehost - Backlog prompt backlog-p-03-0"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -1102,7 +1124,7 @@
    | <p>Backlog answer backlog-a-03-2</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
-== chat <chat:313> "s012 · Backlog prompt backlog-p-04-0"
+== chat <chat:313> "💬 e2ehost - Backlog prompt backlog-p-04-0"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -1129,7 +1151,7 @@
    | <p>Backlog answer backlog-a-04-2</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
-== chat <chat:314> "s013 · Backlog prompt backlog-p-05-0"
+== chat <chat:314> "💬 e2ehost - Backlog prompt backlog-p-05-0"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -1156,7 +1178,7 @@
    | <p>Backlog answer backlog-a-05-2</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
-== chat <chat:315> "s014 · Backlog prompt backlog-p-06-0"
+== chat <chat:315> "💬 e2ehost - Backlog prompt backlog-p-06-0"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -1183,7 +1205,7 @@
    | <p>Backlog answer backlog-a-06-2</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
-== chat <chat:316> "s015 · Backlog prompt backlog-p-07-0"
+== chat <chat:316> "💬 e2ehost - Backlog prompt backlog-p-07-0"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -1210,7 +1232,7 @@
    | <p>Backlog answer backlog-a-07-2</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
-== chat <chat:317> "s016 · Backlog prompt backlog-p-08-0"
+== chat <chat:317> "💬 e2ehost - Backlog prompt backlog-p-08-0"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -1237,7 +1259,7 @@
    | <p>Backlog answer backlog-a-08-2</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
-== chat <chat:318> "s017 · Backlog prompt backlog-p-09-0"
+== chat <chat:318> "💬 e2ehost - Backlog prompt backlog-p-09-0"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -1264,7 +1286,7 @@
    | <p>Backlog answer backlog-a-09-2</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
-== chat <chat:319> "s018 · Backlog prompt backlog-p-10-0"
+== chat <chat:319> "💬 e2ehost - Backlog prompt backlog-p-10-0"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -1291,7 +1313,7 @@
    | <p>Backlog answer backlog-a-10-2</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
-== chat <chat:320> "s019 · Backlog prompt backlog-p-11-0"
+== chat <chat:320> "💬 e2ehost - Backlog prompt backlog-p-11-0"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -1318,7 +1340,7 @@
    | <p>Backlog answer backlog-a-11-2</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
-== chat <chat:321> "s020 · Backlog prompt backlog-p-12-0"
+== chat <chat:321> "💬 e2ehost - Backlog prompt backlog-p-12-0"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -1345,7 +1367,7 @@
    | <p>Backlog answer backlog-a-12-2</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
-== chat <chat:322> "s021 · Backlog prompt backlog-p-13-0"
+== chat <chat:322> "💬 e2ehost - Backlog prompt backlog-p-13-0"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -1372,7 +1394,7 @@
    | <p>Backlog answer backlog-a-13-2</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
-== chat <chat:323> "s022 · Backlog prompt backlog-p-14-0"
+== chat <chat:323> "💬 e2ehost - Backlog prompt backlog-p-14-0"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -1399,7 +1421,7 @@
    | <p>Backlog answer backlog-a-14-2</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
-== chat <chat:324> "s023 · Backlog prompt backlog-p-15-0"
+== chat <chat:324> "💬 e2ehost - Backlog prompt backlog-p-15-0"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>

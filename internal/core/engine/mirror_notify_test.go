@@ -83,6 +83,15 @@ func TestLiveMirroredFinalsNotifyTheOwner(t *testing.T) {
 	if n := len(r.own(ctl, "New local Codex chat detected")); n != 1 {
 		t.Fatalf("%d session notifications", n)
 	}
+	// Announced by its own notification: never again in a summary of
+	// caught-up chats (announce.go), also after a restart.
+	r.stop()
+	r.start()
+	r.control()
+	time.Sleep(500 * time.Millisecond)
+	if n := len(r.own(ctl, "New local Codex chats")); n != 0 {
+		t.Fatalf("a live session's chat was announced again in %d summaries", n)
+	}
 	for _, m := range r.own(local, "") {
 		if m.MentionsOwner {
 			t.Fatalf("work-chat post mentions the owner: %q", m.Text)
@@ -123,6 +132,17 @@ func TestCatchUpFinalsDoNotNotify(t *testing.T) {
 	if n := len(r.own(local, "Codex status")); n != 0 {
 		t.Fatalf("catch-up posted %d status notices", n)
 	}
+	// Owner request 2026-11-07: Teams lists the chat only once it is
+	// opened, so a caught-up session's chat is announced once, in the
+	// control chat's summary of new chats, with a link and one mention;
+	// its title is v0.1.20's.
+	r.wait("caught-up chat announced", func() bool { return len(r.own(ctl, "New local Codex chats (1)")) == 1 })
+	if m := r.own(ctl, "New local Codex chats")[0]; !m.MentionsOwner || !strings.Contains(m.Text, "s001") || !strings.Contains(m.Text, "fake://chat/"+local) {
+		t.Fatalf("summary of new chats: %+v", m)
+	}
+	if info, _ := r.ch.Chat(local); info.Title != "💬 m - prompt old one" {
+		t.Fatalf("caught-up chat titled %q", info.Title)
+	}
 
 	// Live from here on.
 	if _, err := w.AppendTurn(rollout.Turn{Prompt: "prompt new", Commentary: "commentary new", Answer: "answer new"}); err != nil {
@@ -153,5 +173,8 @@ func TestCatchUpFinalsDoNotNotify(t *testing.T) {
 	r.wait("live final after restart notified", func() bool { return r.mentionsCovered(ctl) == 2 })
 	if n := len(r.own(local, "answer")); n != 5 {
 		t.Fatalf("%d answers in the chat, want 5", n)
+	}
+	if n := len(r.own(ctl, "New local Codex chats")); n != 1 {
+		t.Fatalf("%d summaries of new chats across the restart, want 1", n)
 	}
 }

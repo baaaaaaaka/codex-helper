@@ -199,7 +199,7 @@
    text: Workflow card delivery is configured for this control chat.
    action: {"title":"Open chat","type":"Action.OpenUrl","url":"https://teams.microsoft.com/l/chat/<chat:1>/0?tenantId=e2e00000-0000-4000-8000-00000000te57"}
 -- card 2: status 202
-   text: Codex finished: s001 · hook
+   text: Codex finished: 💬 e2ehost - New message in hook
    text: E2EANSWER-<n> answer for E2E-WEBHOOKCTL-final-1
    action: {"title":"Open chat","type":"Action.OpenUrl","url":"https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57"}
 -- card 3: status 202

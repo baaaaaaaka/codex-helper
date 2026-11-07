@@ -1,24 +1,7 @@
 # CONTROL-RECREATE: `cxp teams control --recreate --yes`: a fresh control chat, the old one gets an @mentioned link and is no longer served
 # cxp black-box transcript; volatile values are numbered placeholders
 
-== chat <chat:1> "s001 · after-recreate"
-   type: meeting; members: owner
--- <msg:1> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Work chat created: s001.<br>
-   | Working directory: <root>/work/after-recreate</p>
--- <msg:2> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>💬 Work chat is ready.<br>
-   | Send a task in this chat. Codex will start automatically and continue this session.<br>
-   | Status: waiting for your first task.<br>
-   | Session: s001<br>
-   | Project: after-recreate<br>
-   | Working directory: <root>/work/after-recreate<br>
-   | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
-   | Need more details? Send <code>helper status</code>.</p>
-
-== chat <chat:2> "🏠 Codex Control - e2ehost"
+== chat <chat:1> "🏠 Codex Control - e2ehost"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -27,13 +10,13 @@
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p>🔁 This chat moved</p>
    | <p>Open the new Control chat:<br>
-   | <a href="https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
+   | <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
    | <p>Messages here may not be handled after the switch.</p>
    mention 0: owner "E2E Owner"
 -- <msg:3> owner (html)
    | <p>help</p>
 
-== chat <chat:3> "🏠 Codex Control - e2ehost"
+== chat <chat:2> "🏠 Codex Control - e2ehost"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
@@ -100,8 +83,25 @@
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>✅ Work chat created: s001</p>
    | <p>Open this Teams link and send your task there:<br>
-   | <a href="https://teams.microsoft.com/l/chat/<chat:1>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:1>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
+   | <a href="https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
    | <p>If Teams does not show it right away, search for: s001</p>
+
+== chat <chat:3> "💬 e2ehost - New message in after-recreate"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Work chat created: s001.<br>
+   | Working directory: <root>/work/after-recreate</p>
+-- <msg:2> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>💬 Work chat is ready.<br>
+   | Send a task in this chat. Codex will start automatically and continue this session.<br>
+   | Status: waiting for your first task.<br>
+   | Session: s001<br>
+   | Project: after-recreate<br>
+   | Working directory: <root>/work/after-recreate<br>
+   | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
+   | Need more details? Send <code>helper status</code>.</p>
 
 == cli
 $ cxp teams control --recreate
@@ -110,8 +110,8 @@ $ cxp teams control --recreate
 $ cxp teams control --recreate --yes
    exit 0
    stdout| Waiting for the running Teams helper...
-   stdout| Teams control chat recreated: https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57
+   stdout| Teams control chat recreated: https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57
    stdout| Title: 🏠 Codex Control - e2ehost
-   stdout| Chat ID: <chat:3>
-   stdout| Previous Chat ID: <chat:2>
+   stdout| Chat ID: <chat:2>
+   stdout| Previous Chat ID: <chat:1>
    stdout| The running Teams helper now uses the new control chat.

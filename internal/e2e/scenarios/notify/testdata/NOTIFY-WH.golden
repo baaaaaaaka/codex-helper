@@ -64,7 +64,7 @@
 
 == workflow cards
 -- card 1: status 202
-   text: Codex finished: s001 · notify-wh
+   text: Codex finished: 💬 e2ehost - New message in notify-wh
    text: E2EANSWER-<n> answer for E2E-NOTIFYWH-final1-1
    action: {"title":"Open chat","type":"Action.OpenUrl","url":"https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57"}
 -- card 2: status 202

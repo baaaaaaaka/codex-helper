@@ -216,6 +216,9 @@ func catchUpPosts(s *harness.Scenario, tokens []string) int {
 	n := 0
 	for _, c := range s.Graph.Chats() {
 		for _, m := range s.SUTMessages(c.ID) {
+			if harness.NewChatsSummary(m) {
+				continue // names the chats (their titles), posts no record
+			}
 			text := m.PlainText()
 			for _, tok := range tokens {
 				if strings.Contains(text, tok) {
