@@ -450,9 +450,14 @@ func (e *Engine) read(ctx context.Context, id int64) {
 	}
 	if errors.As(err, &tl) {
 		label := cs.label
+		// Keep the chat out of the read loop until skipBacklog has moved
+		// the cursor: a read started now would walk the too-large window
+		// again from the old cursor.
+		cs.reading = true
 		e.mu.Unlock()
 		moved := e.skipBacklog(id, cursor, tl)
 		e.mu.Lock()
+		cs.reading = false
 		cs.failures = 0
 		if moved {
 			cs.nextRead = now
