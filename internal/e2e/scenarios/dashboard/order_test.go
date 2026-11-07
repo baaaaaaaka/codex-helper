@@ -48,6 +48,10 @@ func TestChatListsMostRecentLast(t *testing.T) {
 		steps.MustPost(s, chatID, "Please answer "+token)
 		_, ok := steps.WaitAnswered(s, chatID, token, steps.AnswerTimeout)
 		s.Check("the "+label+" turn is answered", ok, "answered", strings.Join(s.Transcript(chatID, 4), " | "))
+		// The control chat's "Codex finished" alert follows the answer;
+		// wait for it so the control chat's transcript has one order.
+		_, alerted := s.WaitSUTMessage(control.ID, "Request: Please answer "+token, steps.CommandTimeout)
+		s.Check("the "+label+" alert is in the control chat", alerted, "Codex finished alert", strings.Join(s.Transcript(control.ID, 4), " | "))
 	}
 	ask(beta.ID, "beta")
 	ask(alpha.ID, "alpha")

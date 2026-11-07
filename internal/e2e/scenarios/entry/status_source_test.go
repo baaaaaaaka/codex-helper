@@ -41,7 +41,9 @@ func TestStatusWhileTheHelperRunsAndWithout(t *testing.T) {
 	var out string
 	s.Poll(30*time.Second, func() bool {
 		out = run("teams", "status").Stdout
-		return statusLine(out, "Sessions:") == "Sessions: 0 (0 active, 0 parked)"
+		// The helper publishes its running version shortly after it starts.
+		return statusLine(out, "Sessions:") == "Sessions: 0 (0 active, 0 parked)" &&
+			statusLine(out, "Running version:") != "Running version: unknown"
 	})
 	s.Check("status while the helper runs shows its state in full",
 		strings.Contains(statusLine(out, "Owner:"), "(live)") && statusLine(out, "Store details:") == "" &&
