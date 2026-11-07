@@ -234,7 +234,7 @@ func (e *Engine) cmdNew(ctx context.Context, j cmdJob, arg string) {
 				return err
 			}
 		}
-		th, err := newChatThread(tx, id, dir) // the global defaults (defaults.go, batch B)
+		th, err := e.newChatThread(tx, id, dir) // the global defaults (defaults.go, batch B)
 		if err != nil {
 			return err
 		}
@@ -418,6 +418,7 @@ func (e *Engine) cmdWake(j cmdJob, arg string) {
 }
 
 func (e *Engine) listText() string {
+	at := e.activityTimes()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	var rows []*convState
@@ -429,7 +430,7 @@ func (e *Engine) listText() string {
 	if len(rows) == 0 {
 		return "No sessions yet. Start one with `new <directory>`."
 	}
-	sort.Slice(rows, func(i, j int) bool { return rows[i].label < rows[j].label })
+	sort.Slice(rows, func(i, j int) bool { return byActivity(at, rows[i].id, rows[j].id) }) // activity.go
 	var b strings.Builder
 	b.WriteString("Sessions:\n\n")
 	for _, cs := range rows {

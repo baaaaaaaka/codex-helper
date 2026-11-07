@@ -1,8 +1,11 @@
 package commands
 
 import (
+	"encoding/json"
 	"fmt"
 	"html"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -243,6 +246,9 @@ func TestGlobalDefaults(t *testing.T) {
 	expect(s, control.ID, "default effort list", "Global default effort choices for `gpt-5-mini`", "- `low` (global override, model-advertised default)")
 	expect(s, control.ID, "default effort set medium", "Global default effort: `medium`", "Previous configured effort: `low`")
 	expect(s, control.ID, "default status", "Configured selector: `official:gpt-5-mini`", "Source: global override", "Configured: `medium`")
+	m, eff := configDefaults(s)
+	s.Check("the global defaults are kept in the cxp config, as before the rebuilt core", m == "official:gpt-5-mini" && eff == "medium",
+		"defaults.model official:gpt-5-mini, defaults.reasoningEffort medium", fmt.Sprintf("model=%q reasoningEffort=%q", m, eff))
 	expect(s, control.ID, "default effort set high", "is not supported by global default model", `reasoning effort "high" is not supported by global default model "gpt-5-mini"`)
 	expect(s, control.ID, "default colour set red", "unknown global default", `unknown global default "colour"`)
 	expect(s, control.ID, "default model frob", "unknown default action", `unknown default action "frob"`)
@@ -262,7 +268,73 @@ func TestGlobalDefaults(t *testing.T) {
 	expect(s, control.ID, "default model reset", "Global default model reset to the built-in Codex account default.", "Previous selector: `official:gpt-5-mini`")
 	expect(s, control.ID, "default effort reset", "Global default effort reset (previous configured effort: `medium`).")
 	expect(s, control.ID, "default status", "Configured selector: `default`", "Configured: `unset`")
+	m, eff = configDefaults(s)
+	s.Check("a reset clears the cxp config's defaults", m == "" && eff == "", "no defaults.model, no defaults.reasoningEffort", fmt.Sprintf("model=%q reasoningEffort=%q", m, eff))
 	n2, ok := askNotified(s, control.ID, fresh.ID, "fresh2")
 	s.Check("resetting the defaults does not change a chat created with them", ok && n2.Model == "gpt-5-mini" && n2.Effort == "medium",
 		"gpt-5-mini, medium", fmt.Sprintf("model=%q effort=%q", n2.Model, n2.Effort))
+}
+
+// configPath is the SUT's cxp config file.
+func configPath(s *harness.Scenario) string {
+	return filepath.Join(s.Env.ConfigDir, "codex-proxy", "config.json") // os.UserConfigDir with XDG_CONFIG_HOME
+}
+
+// configDefaults reads the cxp config's global defaults.
+func configDefaults(s *harness.Scenario) (model, effort string) {
+	var cfg struct {
+		Defaults struct {
+			Model           string `json:"model"`
+			ReasoningEffort string `json:"reasoningEffort"`
+		} `json:"defaults"`
+	}
+	if b, err := os.ReadFile(configPath(s)); err == nil {
+		_ = json.Unmarshal(b, &cfg)
+	}
+	return cfg.Defaults.Model, cfg.Defaults.ReasoningEffort
+}
+
+// Global defaults set by an older release (cxp config `defaults.model` /
+// `defaults.reasoningEffort`, as `default model|effort set` wrote them
+// before the rebuilt core) apply to new chats after the upgrade; other
+// config keys are kept when `default` changes them.
+func TestGlobalDefaultsFromTheConfig(t *testing.T) {
+	harness.Parallel(t)
+	s := harness.NewScenario(t, "CMD-DEFAULT-CONFIG", harness.Options{
+		Guarantees: []string{"F-CTL-15"},
+		Title:      "the cxp config's defaults.model official:gpt-5-mini and defaults.reasoningEffort medium, written by an older release: `default status` shows them, a new chat runs on them",
+		Budget:     120 * time.Second,
+		NoStart:    true,
+	})
+	defer s.Finish()
+	cfg := map[string]any{}
+	if b, err := os.ReadFile(configPath(s)); err == nil {
+		if err := json.Unmarshal(b, &cfg); err != nil {
+			t.Fatalf("config: %v", err)
+		}
+	}
+	cfg["defaults"] = map[string]any{"model": "official:gpt-5-mini", "reasoningEffort": "medium", "e2eKeep": "kept"}
+	b, _ := json.MarshalIndent(cfg, "", "  ")
+	if err := os.MkdirAll(filepath.Dir(configPath(s)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath(s), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s.StartSUT()
+	control := steps.ReadyControlChat(s)
+	expect(s, control.ID, "default status", "Configured selector: `official:gpt-5-mini`", "Effective for new chats: `gpt-5-mini`", "Configured: `medium`")
+	fresh, _ := steps.NewWorkChat(s, control, "fresh")
+	n, ok := askNotified(s, control.ID, fresh.ID, "fresh")
+	s.Check("a new chat takes the config's defaults", ok && n.Model == "gpt-5-mini" && n.Effort == "medium",
+		"gpt-5-mini, medium", fmt.Sprintf("model=%q effort=%q", n.Model, n.Effort))
+	expect(s, control.ID, "default effort set low", "Global default effort: `low`", "Previous configured effort: `medium`")
+	var after struct {
+		Defaults map[string]string `json:"defaults"`
+	}
+	raw, _ := os.ReadFile(configPath(s))
+	_ = json.Unmarshal(raw, &after)
+	s.Check("`default effort set` writes the config and keeps its other keys",
+		after.Defaults["model"] == "official:gpt-5-mini" && after.Defaults["reasoningEffort"] == "low" && after.Defaults["e2eKeep"] == "kept",
+		"model official:gpt-5-mini, reasoningEffort low, e2eKeep kept", fmt.Sprintf("%v", after.Defaults))
 }

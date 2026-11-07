@@ -919,6 +919,7 @@ func (e *Engine) activeChatsText() string {
 		label, title, cwd, url, state string
 		used                          time.Time
 	}
+	at := e.activityTimes()
 	e.mu.Lock()
 	var active, held []row
 	closed := 0
@@ -926,7 +927,7 @@ func (e *Engine) activeChatsText() string {
 		if cs.kind != store.KindWork || id == e.inboxID {
 			continue
 		}
-		r := row{id: id, label: cs.label, title: firstNonEmpty(strings.TrimSpace(cs.title), cs.label), cwd: cs.cwd, url: cs.url, state: cs.state, used: cs.lastActivity}
+		r := row{id: id, label: cs.label, title: firstNonEmpty(strings.TrimSpace(cs.title), cs.label), cwd: cs.cwd, url: cs.url, state: cs.state, used: at[id]}
 		switch cs.state {
 		case store.ConvClosed:
 			closed++
@@ -948,8 +949,9 @@ func (e *Engine) activeChatsText() string {
 		kept = append(kept, r)
 	}
 	active = kept
-	sort.Slice(active, func(a, b int) bool { return active[a].id > active[b].id })
-	sort.Slice(held, func(a, b int) bool { return held[a].id < held[b].id })
+	// The most recently active chat last (activity.go).
+	sort.Slice(active, func(a, b int) bool { return byActivity(at, active[a].id, active[b].id) })
+	sort.Slice(held, func(a, b int) bool { return byActivity(at, held[a].id, held[b].id) })
 	asr := "Speech recognition: configured."
 	if e.cfg.Transcriber == nil {
 		asr = "Speech recognition: not ready in this helper process; update or restart the installed helper to enable automatic local ASR."

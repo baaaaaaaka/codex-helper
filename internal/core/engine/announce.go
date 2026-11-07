@@ -122,7 +122,8 @@ func (e *Engine) announcePass() {
 	if ctl == 0 || len(items) == 0 || held {
 		return
 	}
-	sort.Slice(items, func(a, b int) bool { return items[a].id < items[b].id })
+	at := e.activityTimes()
+	sort.Slice(items, func(a, b int) bool { return byActivity(at, items[a].id, items[b].id) }) // activity.go
 	batches := (len(items) + announceBatch - 1) / announceBatch
 	if waiting > 0 && batches > 1 && len(items)%announceBatch != 0 {
 		// More chats are on their way: keep the partial post for them.

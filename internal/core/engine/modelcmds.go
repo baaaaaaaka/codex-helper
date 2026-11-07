@@ -71,12 +71,12 @@ func (e *Engine) loadModelChat(ctx context.Context, cs *convState) (modelChat, s
 		if !ok {
 			// A chat without a thread row yet (the control chat before
 			// its first question) gets the global defaults with it.
-			if th, err = newChatThread(tx, cs.id, ""); err != nil {
+			if th, err = e.newChatThread(tx, cs.id, ""); err != nil {
 				return err
 			}
 		}
 		c.th = th
-		c.defs, err = readGlobalDefaults(tx)
+		c.defs, err = e.readGlobalDefaults(tx)
 		return err
 	})
 	if err != nil {
@@ -455,7 +455,7 @@ func (e *Engine) changeThread(tx *store.Tx, cs *convState, fn func(*store.Thread
 		e.mu.Lock()
 		threadID, cwd := cs.threadID, cs.cwd
 		e.mu.Unlock()
-		if th, err = newChatThread(tx, cs.id, cwd); err != nil {
+		if th, err = e.newChatThread(tx, cs.id, cwd); err != nil {
 			return err
 		}
 		th.ThreadID = threadID

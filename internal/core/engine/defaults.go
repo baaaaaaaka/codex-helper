@@ -11,21 +11,34 @@ import (
 // Global defaults (gap batch B, F-CTL-15): the model and reasoning effort
 // newly created chats start with, managed from the control chat with
 // v0.1.20's `default …` grammar (default_commands.go) and texts
-// (cli/teams_defaults.go). They are kept in the store, not in the cxp
-// config: the rebuilt helper's local launches do not read model defaults,
-// so the texts name Teams chats where v0.1.20 said "future launches".
-// A chat takes them when it is created (`new`, `model fork`, the control
-// chat's first question); existing chats are unchanged.
+// (cli/teams_defaults.go). They live where the helper kept them before
+// the rebuild: the cxp config's `defaults.model` and
+// `defaults.reasoningEffort` (Config.Defaults), so the settings made
+// with an older release still apply. Without a config (engine tests)
+// they are kept in the store. A chat takes them when it is created
+// (`new`, `model fork`, the control chat's first question); existing
+// chats are unchanged.
 const (
 	metaDefaultModel  = "engine_default_model"  // "" unset, "default" the account default, else a model id
 	metaDefaultEffort = "engine_default_effort" // "" unset
 )
 
+// DefaultsFile reads and writes the global defaults. model is "" (unset),
+// "default" (the account default) or a model id; effort "" is unset.
+type DefaultsFile interface {
+	ReadDefaults() (model, effort string, err error)
+	WriteDefaults(model, effort string) error
+}
+
 type globalDefaults struct{ Model, Effort string }
 
-func readGlobalDefaults(tx *store.Tx) (globalDefaults, error) {
+func (e *Engine) readGlobalDefaults(tx *store.Tx) (globalDefaults, error) {
 	var d globalDefaults
 	var err error
+	if f := e.cfg.Defaults; f != nil {
+		d.Model, d.Effort, err = f.ReadDefaults()
+		return d, err
+	}
 	if d.Model, _, err = tx.Meta(metaDefaultModel); err != nil {
 		return d, err
 	}
@@ -33,14 +46,26 @@ func readGlobalDefaults(tx *store.Tx) (globalDefaults, error) {
 	return d, err
 }
 
+func (e *Engine) writeGlobalDefaults(tx *store.Tx, d globalDefaults) error {
+	if f := e.cfg.Defaults; f != nil {
+		return f.WriteDefaults(d.Model, d.Effort)
+	}
+	if err := tx.SetMeta(metaDefaultModel, d.Model); err != nil {
+		return err
+	}
+	return tx.SetMeta(metaDefaultEffort, d.Effort)
+}
+
 // newChatThread is the thread row of a newly created chat: the global
 // default model and effort (v0.1.20 resolveNewSessionModelProfile("") and
 // reasoningEffortFromGlobalDefault; the effort was checked against the
-// default model when it was set).
-func newChatThread(tx *store.Tx, conv int64, cwd string) (store.Thread, error) {
-	d, err := readGlobalDefaults(tx)
+// default model when it was set). A config that cannot be read leaves the
+// chat on the account default rather than failing its creation.
+func (e *Engine) newChatThread(tx *store.Tx, conv int64, cwd string) (store.Thread, error) {
+	d, err := e.readGlobalDefaults(tx)
 	if err != nil {
-		return store.Thread{}, err
+		e.logf("global defaults: %v; the new chat uses the Codex account default", err)
+		d = globalDefaults{}
 	}
 	th := store.Thread{ConvID: conv, Cwd: cwd, Model: selector(d.Model), ModelSource: modelSrcGlobalDefault}
 	if d.Effort != "" {
@@ -149,7 +174,7 @@ func (e *Engine) cmdDefaultControl(ctx context.Context, j cmdJob, arg string) {
 	var d globalDefaults
 	if err := e.update(func(tx *store.Tx) error {
 		var err error
-		d, err = readGlobalDefaults(tx)
+		d, err = e.readGlobalDefaults(tx)
 		return err
 	}); err != nil {
 		e.reply(j, "Could not read the global defaults: "+userError(err.Error()), nil)
@@ -205,10 +230,10 @@ func (e *Engine) cmdDefaultControl(ctx context.Context, j cmdJob, arg string) {
 			return
 		}
 		e.reply(j, "Global default effort: `"+eff+"`\nPrevious configured effort: `"+firstNonEmpty(d.Effort, "unset")+"`\nScope: "+textDefaultScope,
-			func(tx *store.Tx) error { return tx.SetMeta(metaDefaultEffort, eff) })
+			func(tx *store.Tx) error { return e.writeGlobalDefaults(tx, globalDefaults{d.Model, eff}) })
 	case "effort reset":
 		e.reply(j, "Global default effort reset (previous configured effort: `"+firstNonEmpty(d.Effort, "unset")+"`). New chats will use the selected model's advertised default when available, otherwise the Codex runtime fallback. Existing chats are unchanged.",
-			func(tx *store.Tx) error { return tx.SetMeta(metaDefaultEffort, "") })
+			func(tx *store.Tx) error { return e.writeGlobalDefaults(tx, globalDefaults{d.Model, ""}) })
 	}
 }
 
@@ -308,10 +333,5 @@ func (e *Engine) defaultModelSet(j cmdJob, models []Model, d globalDefaults, val
 		}
 		text = strings.Join(lines, "\n")
 	}
-	e.reply(j, text, func(tx *store.Tx) error {
-		if err := tx.SetMeta(metaDefaultModel, stored); err != nil {
-			return err
-		}
-		return tx.SetMeta(metaDefaultEffort, effort)
-	})
+	e.reply(j, text, func(tx *store.Tx) error { return e.writeGlobalDefaults(tx, globalDefaults{stored, effort}) })
 }

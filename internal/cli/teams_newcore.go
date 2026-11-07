@@ -20,6 +20,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
 	"github.com/baaaaaaaka/codex-helper/internal/asr"
 	chteams "github.com/baaaaaaaka/codex-helper/internal/channel/teams"
+	"github.com/baaaaaaaka/codex-helper/internal/config"
 	"github.com/baaaaaaaka/codex-helper/internal/core/codex"
 	"github.com/baaaaaaaka/codex-helper/internal/core/codexagent"
 	"github.com/baaaaaaaka/codex-helper/internal/core/delegate"
@@ -280,7 +281,7 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 	if err != nil {
 		return err
 	}
-	_, paths, err := newRootStore(root, "")
+	cfgStore, paths, err := newRootStore(root, "")
 	if err != nil {
 		return err
 	}
@@ -298,7 +299,7 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 		}
 	}
 	for {
-		err := serveTeamsNewCore(ctx, out, errOut, root, opts, seam, paths, path, migrateFrom, host)
+		err := serveTeamsNewCore(ctx, out, errOut, root, opts, seam, cfgStore, paths, path, migrateFrom, host)
 		var stopped errTeamsStoppedEverywhereNow
 		if !opts.managedServiceChild || !errors.As(err, &stopped) || ctx.Err() != nil {
 			return err
@@ -380,7 +381,7 @@ func errTeamsDisabledAtStart(path string) error {
 
 // serveTeamsNewCore takes the store and serves until stopped.
 func serveTeamsNewCore(ctx context.Context, out, errOut io.Writer, root *rootOptions, opts teamsNewCoreOptions, seam *teamsTestSeam,
-	paths effectivePaths, path, migrateFrom, host string) error {
+	cfgStore *config.Store, paths effectivePaths, path, migrateFrom, host string) error {
 	dir := filepath.Dir(path)
 	// The lease decides which host owns the store; nothing opens the store
 	// with SQLite before it is held (teams_lease.go).
@@ -516,6 +517,7 @@ func serveTeamsNewCore(ctx context.Context, out, errOut io.Writer, root *rootOpt
 		FilesDir:     filepath.Join(dir, "core-files"),
 		ActivityScan: true,
 		Registry:     opts.registry,
+		Defaults:     teamsConfigDefaults{cfgStore},
 		Skills: skillcmd.New(skillcmd.Options{
 			ConfigDir: filepath.Dir(paths.ConfigPath),
 			CacheDir:  skillsCache,

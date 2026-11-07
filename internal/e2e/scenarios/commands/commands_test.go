@@ -39,6 +39,19 @@ func command(s *harness.Scenario, chatID, text, sub string) (string, bool) {
 	return replyAfter(s, chatID, seq, sub, steps.CommandTimeout)
 }
 
+// inOrder reports whether every part occurs in text, in the given order.
+func inOrder(text string, parts ...string) bool {
+	at := 0
+	for _, p := range parts {
+		i := strings.Index(text[at:], p)
+		if i < 0 {
+			return false
+		}
+		at += i + len(p)
+	}
+	return true
+}
+
 func clip(s string, n int) string {
 	s = harness.NormalizeSpace(s)
 	if len(s) > n {
@@ -169,10 +182,16 @@ func TestStats(t *testing.T) {
 		"Session: s001, Codex thread, Latest request: completed", clip(st, 300))
 	s.Check("`helper stats` reports the conversation total from the rollout", strings.Contains(st, "2,560") && strings.Contains(st, "2,400") && strings.Contains(st, "reasoning 40"),
 		"2,560 total, 2,400 input, reasoning 40", clip(st, 300))
-	s.Check("`helper stats` shows model, effort and the unknown tier", strings.Contains(st, "Model: gpt-5-codex") && strings.Contains(st, "Effort: medium") && strings.Contains(st, "Tier: unknown"),
-		"Model: gpt-5-codex, Effort: medium, Tier: unknown", clip(st, 300))
+	s.Check("`helper stats` has the sections and tables of the releases before the rebuilt core",
+		inOrder(st, "🧮 TOTAL (MAIN + SUBAGENTS) · overall:", "| Metric | Overall", "🧠 MAIN AGENT · metadata:", "🧠 MAIN AGENT · snapshots:",
+			"| Metric | Last recorded model usage | Conversation total", "🧠 MAIN AGENT · model/effort detail:", "🧩 SUBAGENTS · NOT USED:"),
+		"TOTAL, MAIN AGENT and SUBAGENTS sections with tables", clip(st, 600))
+	s.Check("`helper stats` shows usage per model and effort, without service tiers",
+		strings.Contains(st, "| gpt-5-codex | medium | 2,400 | N/A | 160 (reasoning 40) | 2,560") && !strings.Contains(st, "Tier"),
+		"gpt-5-codex | medium row, no tier", clip(st, 900))
 	all, ok := command(s, control.ID, "stats", "Scope: all Work chats")
-	s.Check("control `stats` sums the Work chats", ok && strings.Contains(all, "2,560") && strings.Contains(all, "s001: total 2,560"), "s001: total 2,560", clip(all, 300))
+	s.Check("control `stats` sums the Work chats", ok && strings.Contains(all, "🧮 ALL WORK CHATS · overall:") && strings.Contains(all, "| s001 | 2,400 | N/A | 160 (reasoning 40) | 2,560"),
+		"s001 row with 2,560", clip(all, 600))
 	leaks := steps.InternalLeaks(s, all)
 	s.Check("control stats carry no internal ids or paths", len(leaks) == 0, "none", fmt.Sprint(leaks))
 }
