@@ -86,7 +86,7 @@ func (e *Engine) loadModelChat(ctx context.Context, cs *convState) (modelChat, s
 }
 
 // selector is a stored model name: "" (or v0.1.20's "default") is the
-// account default, chosen by Codex when the turn starts.
+// account default of Codex's model/list (TurnSettings).
 func selector(model string) string {
 	if strings.EqualFold(strings.TrimSpace(model), "default") {
 		return ""
@@ -105,6 +105,20 @@ func resolveModel(models []Model, sel string) (Model, bool) {
 }
 
 func (c modelChat) model() (Model, bool) { return resolveModel(c.models, c.modelID()) }
+
+// TurnSettings is the model and effort a turn sends to Codex: the chat's
+// selector resolved as `model status` shows it ("" is the account default
+// of model/list), and its effort, else that model's default. v0.1.20 sent
+// both with every turn; a turn that left them out ran with whatever
+// Codex's own config or the thread chose, which the chat did not show.
+// A selector Codex does not list is sent as it is.
+func TurnSettings(models []Model, sel, effort string) (string, string) {
+	m, ok := resolveModel(models, selector(sel))
+	if !ok {
+		return selector(sel), effort
+	}
+	return m.ID, firstNonEmpty(effort, m.Effort)
+}
 
 // officialLabel is v0.1.20's modelSnapshotExactLabel of a Codex model.
 func officialLabel(models []Model, sel string) string {

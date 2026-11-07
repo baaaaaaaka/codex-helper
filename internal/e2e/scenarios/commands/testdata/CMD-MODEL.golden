@@ -143,7 +143,7 @@
 -- <msg:11> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-CMDMODEL-default-1</p>
-   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:12> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
@@ -350,12 +350,12 @@
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-CMDMODEL-infork-4</p>
-   | <p><strong>🔧 Helper:</strong> model - gpt-5-mini, effort - default, tier - standard</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-mini, effort - low, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == codex turns (per thread; threads by kind, directory and first prompt; turns in start order)
 -- thread <uuid:1> (work, cwd <root>/work/model)
-   turn: answered
+   turn model=gpt-5-codex effort=medium: answered
    prompt| User message:
    prompt| Please answer E2E-CMDMODEL-default-1
    prompt|
@@ -425,7 +425,7 @@
    prompt|
    prompt| Use only relative manifest paths under that directory. Keep your normal answer visible; the helper will upload listed files separately when file-write auth is available.
 -- thread <uuid:2> (work, cwd <root>/work/model)
-   turn model=gpt-5-mini: answered
+   turn model=gpt-5-mini effort=low: answered
    prompt| User message:
    prompt| Please answer E2E-CMDMODEL-infork-4
    prompt|

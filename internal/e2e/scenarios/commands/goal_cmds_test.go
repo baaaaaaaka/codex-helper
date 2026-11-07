@@ -40,7 +40,7 @@ func TestGoalCommands(t *testing.T) {
 	c, ok := askNotified(s, control.ID, work.ID, "before")
 	before := answerText(s, work.ID, c)
 	s.Check("without a goal an answer has the model line and no goal line",
-		ok && strings.Contains(before, "🔧 Helper: model - gpt-5-codex, effort - default, tier - standard 🔧 Helper: ✅ Codex finished responding.") &&
+		ok && strings.Contains(before, "🔧 Helper: model - gpt-5-codex, effort - medium, tier - standard 🔧 Helper: ✅ Codex finished responding.") &&
 			!strings.Contains(before, "Active goal"),
 		"model line before the footer, no goal line", clip(before, 400))
 
@@ -54,7 +54,7 @@ func TestGoalCommands(t *testing.T) {
 	c, ok = askNotified(s, control.ID, work.ID, "withgoal")
 	with := answerText(s, work.ID, c)
 	s.Check("with an active goal an answer has the goal line, then the model line, then the footer",
-		ok && strings.Contains(with, "🎯 Active goal: "+objective+" 🔧 Helper: model - gpt-5-codex, effort - default, tier - standard 🔧 Helper: ✅ Codex finished responding."),
+		ok && strings.Contains(with, "🎯 Active goal: "+objective+" 🔧 Helper: model - gpt-5-codex, effort - medium, tier - standard 🔧 Helper: ✅ Codex finished responding."),
 		"goal line, model line, footer", clip(with, 400))
 
 	steps.MustPost(s, work.ID, "Long job "+run)

@@ -145,7 +145,7 @@
 
 == codex turns (per thread; threads by kind, directory and first prompt; turns in start order)
 -- thread <uuid:1> (work, cwd <root>/home)
-   turn: answered
+   turn model=gpt-5-codex effort=medium: answered
    prompt| You are Agent B completing a CXP cross-machine delegated task.
    prompt|
    prompt| Title: E2E delegated task

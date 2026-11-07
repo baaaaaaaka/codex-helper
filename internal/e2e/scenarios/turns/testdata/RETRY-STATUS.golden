@@ -65,12 +65,12 @@
 -- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>Answered after reconnecting E2E-RETRYSTATUS-retry-1</p>
-   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == codex turns (per thread; threads by kind, directory and first prompt; turns in start order)
 -- thread <uuid:1> (work, cwd <root>/work/retry)
-   turn: answered
+   turn model=gpt-5-codex effort=medium: answered
    prompt| User message:
    prompt| A task over a flaky connection E2E-RETRYSTATUS-retry-1
    prompt|

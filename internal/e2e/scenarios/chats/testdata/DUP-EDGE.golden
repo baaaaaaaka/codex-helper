@@ -106,7 +106,7 @@
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-DUPEDGE-plain-2</p>
-   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:6> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
@@ -129,7 +129,7 @@
 -- <msg:10> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-DUPEDGE-plain-2</p>
-   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:11> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
@@ -156,7 +156,7 @@
 -- <msg:16> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-DUPEDGE-fails-1</p>
-   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:17> owner (html)
    | <p>Look at this E2E-DUPEDGE-image-3</p>
@@ -168,7 +168,7 @@
 -- <msg:19> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-DUPEDGE-image-3</p>
-   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:20> owner (html)
    | <p>Look at this E2E-DUPEDGE-image-3</p>
@@ -180,7 +180,7 @@
 -- <msg:22> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-DUPEDGE-image-3</p>
-   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == chat <chat:3> "💬 e2ehost - Plain repeat E2E-DUPEDGE-plain-2"
@@ -211,12 +211,12 @@
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-DUPEDGE-plain-2</p>
-   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == codex turns (per thread; threads by kind, directory and first prompt; turns in start order)
 -- thread <uuid:1> (work, cwd <root>/work/dupedge)
-   turn: answered
+   turn model=gpt-5-codex effort=medium: answered
    prompt| User message:
    prompt| Plain repeat E2E-DUPEDGE-plain-2
    prompt|
@@ -239,7 +239,7 @@
    prompt| ```
    prompt|
    prompt| Use only relative manifest paths under that directory. Keep your normal answer visible; the helper will upload listed files separately when file-write auth is available.
-   turn: answered
+   turn model=gpt-5-codex effort=medium: answered
    prompt| User message:
    prompt| Plain repeat E2E-DUPEDGE-plain-2
    prompt|
@@ -262,7 +262,7 @@
    prompt| ```
    prompt|
    prompt| Use only relative manifest paths under that directory. Keep your normal answer visible; the helper will upload listed files separately when file-write auth is available.
-   turn: failed
+   turn model=gpt-5-codex effort=medium: failed
    prompt| User message:
    prompt| This one fails first E2E-DUPEDGE-fails-1
    prompt|
@@ -285,7 +285,7 @@
    prompt| ```
    prompt|
    prompt| Use only relative manifest paths under that directory. Keep your normal answer visible; the helper will upload listed files separately when file-write auth is available.
-   turn: answered
+   turn model=gpt-5-codex effort=medium: answered
    prompt| User message:
    prompt| This one fails first E2E-DUPEDGE-fails-1
    prompt|
@@ -308,7 +308,7 @@
    prompt| ```
    prompt|
    prompt| Use only relative manifest paths under that directory. Keep your normal answer visible; the helper will upload listed files separately when file-write auth is available.
-   turn images=1: answered
+   turn model=gpt-5-codex effort=medium images=1: answered
    prompt| User message:
    prompt| Look at this E2E-DUPEDGE-image-3
    prompt|
@@ -334,7 +334,7 @@
    prompt|
    prompt| Attached files saved locally for this turn:
    prompt| - <root>/home/.local/state/codex-helper/teams/core-files/<file:1>/0-attachment-1 (image/png)
-   turn images=1: answered
+   turn model=gpt-5-codex effort=medium images=1: answered
    prompt| User message:
    prompt| Look at this E2E-DUPEDGE-image-3
    prompt|
@@ -361,7 +361,7 @@
    prompt| Attached files saved locally for this turn:
    prompt| - <root>/home/.local/state/codex-helper/teams/core-files/<file:2>/0-attachment-1 (image/png)
 -- thread <uuid:2> (work, cwd <root>/work/dupother)
-   turn: answered
+   turn model=gpt-5-codex effort=medium: answered
    prompt| User message:
    prompt| Plain repeat E2E-DUPEDGE-plain-2
    prompt|

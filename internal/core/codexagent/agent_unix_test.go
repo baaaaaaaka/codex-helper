@@ -32,8 +32,8 @@ func TestMain(m *testing.M) {
 		err := fakecodex.Serve(fakecodex.Config{
 			In: os.Stdin, Out: os.Stdout, Log: io.Discard,
 			Store:       fakecodex.Store{Dir: filepath.Join(home, "e2e-fakecodex")},
-			SessionsDir: filepath.Join(home, "sessions"),
-			Brain:       os.Getenv(fakecodex.EnvBrainURL), Kind: "work",
+			SessionsDir: filepath.Join(home, "sessions"), CodexHome: home,
+			Brain: os.Getenv(fakecodex.EnvBrainURL), Kind: "work",
 		})
 		if err != nil {
 			os.Exit(1)
@@ -249,5 +249,65 @@ func TestGoalInfoAndStopGoal(t *testing.T) {
 	}
 	if res, err := a.StopGoal(ctx, 1, thread); err != nil || res.Paused {
 		t.Fatalf("second stop: %+v %v", res, err)
+	}
+}
+
+// A chat with no model or effort of its own runs with what `model status`
+// shows (engine.TurnSettings): the account default of model/list and its
+// default effort, not the model Codex's config.toml would pick, which
+// model/list does not mark as its default (field report 2026-11-07: the
+// chat showed one model and ran another).
+func TestTurnSendsTheModelTheChatShows(t *testing.T) {
+	brain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/begin":
+			_ = json.NewEncoder(w).Encode(fakecodex.Plan{Seq: 1})
+		case "/await":
+			_ = json.NewEncoder(w).Encode(fakecodex.AwaitResult{Outcome: "answered", Answer: "done"})
+		case "/resume":
+			_ = json.NewEncoder(w).Encode(fakecodex.ResumeDecision{})
+		default:
+			_, _ = w.Write([]byte("{}"))
+		}
+	}))
+	defer func() { brain.CloseClientConnections(); brain.Close() }()
+	exe, err := helperpath.RawExecutable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	config := "model = \"gpt-5-mini\"\nmodel_reasoning_effort = \"high\"\n"
+	if err := os.WriteFile(filepath.Join(home, "config.toml"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := New(Config{Server: codex.Config{Bin: exe, Env: []string{envFake + "=1", "CODEX_HOME=" + home, fakecodex.EnvBrainURL + "=" + brain.URL}, Dir: home},
+		Poll: 100 * time.Millisecond})
+	defer a.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	models, err := a.Models(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var thread string
+	run := func(model, effort string) engine.TurnInfo {
+		t.Helper()
+		out, err := a.Run(ctx, engine.TurnRequest{ConvID: 1, ThreadID: thread, Cwd: home, Model: model, Effort: effort, TurnKey: "k-" + model + effort, Text: "hello"}, engine.TurnHooks{
+			ThreadStarted: func(id string) error { thread = id; return nil },
+		})
+		if err != nil || out.Status != engine.StatusCompleted {
+			t.Fatalf("turn: %+v %v", out, err)
+		}
+		return a.Info(1, thread)
+	}
+	cases := []struct{ model, effort string }{{"", ""}, {"gpt-5-mini", ""}, {"", "high"}}
+	for _, c := range cases {
+		wantModel, wantEffort := engine.TurnSettings(models, c.model, c.effort)
+		if i := run(c.model, c.effort); i.Model != wantModel || i.Effort != wantEffort {
+			t.Fatalf("turn with model %q effort %q ran %s/%s, the chat shows %s/%s", c.model, c.effort, i.Model, i.Effort, wantModel, wantEffort)
+		}
+	}
+	if m, e := engine.TurnSettings(models, "", ""); m != "gpt-5-codex" || e != "medium" {
+		t.Fatalf("account default = %s/%s", m, e)
 	}
 }

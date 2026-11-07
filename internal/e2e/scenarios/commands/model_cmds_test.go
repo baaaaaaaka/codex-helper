@@ -262,7 +262,7 @@ func TestGlobalDefaults(t *testing.T) {
 	expect(s, fresh.ID, "helper model", "Selection: global default", "Effective effort: `medium` (global default)",
 		"Global default for new chats: Codex Official (`gpt-5-mini`)")
 	o, ok := askNotified(s, control.ID, old.ID, "old")
-	s.Check("an existing chat keeps its model", ok && o.Model == "" && o.Effort == "", "Codex default", fmt.Sprintf("model=%q effort=%q", o.Model, o.Effort))
+	s.Check("an existing chat keeps its model (the account default)", ok && o.Model == "gpt-5-codex" && o.Effort == "medium", "gpt-5-codex, medium", fmt.Sprintf("model=%q effort=%q", o.Model, o.Effort))
 	expect(s, old.ID, "helper default status", "can only be used in the Control chat")
 
 	expect(s, control.ID, "default model reset", "Global default model reset to the built-in Codex account default.", "Previous selector: `official:gpt-5-mini`")
@@ -337,4 +337,59 @@ func TestGlobalDefaultsFromTheConfig(t *testing.T) {
 	s.Check("`default effort set` writes the config and keeps its other keys",
 		after.Defaults["model"] == "official:gpt-5-mini" && after.Defaults["reasoningEffort"] == "low" && after.Defaults["e2eKeep"] == "kept",
 		"model official:gpt-5-mini, reasoningEffort low, e2eKeep kept", fmt.Sprintf("%v", after.Defaults))
+}
+
+// MODEL-SHOWN (F-TRN-7; field report 2026-11-07): the model and effort a
+// chat shows are the ones its turns run with. Codex's own config.toml
+// names another model and effort, which model/list does not mark as its
+// default; a chat without a model of its own used to show the account
+// default but leave the turn's model out, so Codex ran the config's model
+// and the answer's footer named another model than `model status`. As
+// v0.1.20 did, every turn sends the model and effort the chat shows.
+func TestModelShownIsTheModelRun(t *testing.T) {
+	harness.Parallel(t)
+	s := harness.NewScenario(t, "MODEL-SHOWN", harness.Options{
+		Guarantees: []string{"F-TRN-7"},
+		Title:      "with another model in Codex's config.toml, a chat's turns run with the model and effort `model status` shows, and the footer names them",
+		Budget:     120 * time.Second,
+		NoStart:    true,
+	})
+	defer s.Finish()
+	config := "model = \"gpt-5-mini\"\nmodel_reasoning_effort = \"high\"\n"
+	if err := os.WriteFile(filepath.Join(s.Env.CodexHome, "config.toml"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s.StartSUT()
+	control := steps.ReadyControlChat(s)
+	work, _ := steps.NewWorkChat(s, control, "shown")
+
+	footer := func(chatID string, c harness.CodexCall) string {
+		for _, m := range s.SUTMessagesContaining(chatID, c.Answer) {
+			if text := harness.NormalizeSpace(m.PlainText()); strings.Contains(text, "Helper: model - ") {
+				return text[strings.Index(text, "Helper: model - "):]
+			}
+		}
+		return ""
+	}
+	expect(s, work.ID, "model", "Chat: Work", "Effective: Codex Official (`gpt-5-codex`)", "Effective effort: `medium` (Codex runtime default)")
+	w, ok := ask(s, work.ID, "work")
+	s.Check("a Work chat's turn runs with the model and effort `model status` shows", ok && w.Model == "gpt-5-codex" && w.Effort == "medium",
+		"gpt-5-codex, medium", fmt.Sprintf("model=%q effort=%q", w.Model, w.Effort))
+	f := footer(work.ID, w)
+	s.Check("the answer's footer names them", strings.HasPrefix(f, "Helper: model - gpt-5-codex, effort - medium,"),
+		"Helper: model - gpt-5-codex, effort - medium, …", clip(f, 200))
+
+	expect(s, work.ID, "helper model switch gpt-5-mini", "Model profile switched for this Work chat",
+		"Effective next-turn model: Codex Official (`gpt-5-mini`)")
+	expect(s, work.ID, "model", "Effective: Codex Official (`gpt-5-mini`)", "Effective effort: `low`")
+	m, ok := ask(s, work.ID, "mini")
+	f = footer(work.ID, m)
+	s.Check("after a switch the turn and its footer follow the chat's model and effort", ok && m.Model == "gpt-5-mini" && m.Effort == "low" &&
+		strings.HasPrefix(f, "Helper: model - gpt-5-mini, effort - low,"), "gpt-5-mini, low", fmt.Sprintf("model=%q effort=%q footer %s", m.Model, m.Effort, clip(f, 200)))
+
+	expect(s, control.ID, "model", "Chat: Control", "Effective: Codex Official (`gpt-5-codex`)", "Effective effort: `low` (helper fallback)")
+	q, ok := askControl(s, control.ID, "ctl")
+	s.Check("a control question runs with the Control chat's model and effort", ok && q.Model == "gpt-5-codex" && q.Effort == "low",
+		"gpt-5-codex, low", fmt.Sprintf("model=%q effort=%q", q.Model, q.Effort))
+	s.Settle(time.Second, 4*time.Second)
 }
