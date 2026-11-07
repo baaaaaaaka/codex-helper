@@ -291,7 +291,27 @@ func (e *Engine) mirrorLoop(ctx context.Context) {
 			e.discoverOld(ctx)
 		}
 		e.mirrorPoll(ctx)
+		e.catchUpReading.Store(e.catchUpPending())
 	}
+}
+
+// catchUpPending reports whether the catch-up still has records to read:
+// the start-up walk is not done, or a rollout was not read up to its
+// catch-up end yet. Its chat may not exist yet, so the new-chat summary
+// waits for it (announcePass).
+func (e *Engine) catchUpPending() bool {
+	m := e.mirror
+	if m.firstPending {
+		return true
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, f := range m.files {
+		if f.catchUpSet && f.tracker.Offset() < f.catchUpEnd {
+			return true
+		}
+	}
+	return false
 }
 
 // firstWalkFiles and firstWalkBudget bound a batch of the start-up walk
