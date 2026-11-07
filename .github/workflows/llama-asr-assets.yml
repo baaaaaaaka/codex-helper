@@ -1,10 +1,19 @@
-# Builds the managed voice-transcription runtime (llama.cpp llama-server and
-# its libraries) for every platform internal/asr supports, checks that each
-# build runs on old/plain systems, and uploads the archives plus pin files.
+# Builds every asset the managed voice transcription backend (internal/asr)
+# downloads, checks each one the way a user's helper runs it, and, when asked,
+# publishes them as the GitHub release internal/asr/pins.go points at:
 #
-# Manual only and NOT part of a release: after reviewing a run, publish the
-# archives as the "llama-asr-<tag>-<rev>" release by hand and copy the pins
-# from the run summary into internal/asr/pins.go.
+#   llama-asr-<tag>-<rev>-<platform>.tar.gz          llama.cpp llama-server + libraries
+#   ffmpeg-audio-<ffmpeg>-<rev>-<platform>.tar.gz    audio-only LGPL ffmpeg
+#   Qwen3-ASR-0.6B-Q8_0.gguf, mmproj-...gguf        the model (Hugging Face is the mirror)
+#   ffmpeg-audio-<ffmpeg>-source.tar.gz              FFmpeg source (LGPL)
+#
+# for linux-x64/arm64 (glibc 2.17), macos-arm64/x64 (13.3) and win-x64/arm64.
+#
+# Manual only and NOT part of a helper release. A run without `publish` is a
+# dry run. With `publish` (main only) the release "llama-asr-<tag>-<rev>" is
+# created as a prerelease that is never "latest"; an existing release is never
+# changed: bump asset_rev instead. Then copy the pins from the run summary
+# into internal/asr/pins.go.
 name: llama-asr-assets
 
 on:
@@ -16,18 +25,19 @@ on:
       llama_commit:
         description: expected commit of the tag
         default: aa46bda89b9a8378ae76bb15fc2ce2f571f0983c
+      ffmpeg_tag:
+        description: FFmpeg release tag
+        default: n7.1.5
+      ffmpeg_commit:
+        description: expected commit of the FFmpeg tag
+        default: 3a0867c2bfda4a4d4309ca1a8cbdc6175e67f587
       asset_rev:
         description: our packaging revision
         default: r1
-      windows_crt:
-        description: "static: link the VC++ runtime into every binary; applocal: ship vcruntime140/msvcp140 next to them"
-        type: choice
-        options: [static, applocal]
-        default: static
-      model_smoke:
-        description: also transcribe a spoken sentence with the real Qwen3-ASR model
+      publish:
+        description: create the release llama-asr-<tag>-<rev> (main only) after every platform passed
         type: boolean
-        default: true
+        default: false
 
 permissions:
   contents: read
@@ -35,11 +45,12 @@ permissions:
 env:
   LLAMA_TAG: ${{ inputs.llama_tag }}
   LLAMA_COMMIT: ${{ inputs.llama_commit }}
+  FFMPEG_TAG: ${{ inputs.ffmpeg_tag }}
+  FFMPEG_COMMIT: ${{ inputs.ffmpeg_commit }}
   ASSET_REV: ${{ inputs.asset_rev }}
   MODEL_URL: https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF/resolve/928ab958557df9aa2ef1c93e0e83c7ad0933fae2
   MODEL_SHA256: bca259818b50ca7c4c05e9bdb35a5dc04fa039653a6d6f3f0f331f96f6aa1971
   MMPROJ_SHA256: 41a342b5e4c514e968cb756de6cd1b7be39eff43c44c57a2ef5fc6522e36603d
-  SMOKE_TEXT: Hello world. Please run the unit tests and then open a pull request.
   # Common to every platform; matches scripts/ci/build-llama-asr.sh.
   COMMON_CMAKE: >-
     -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF
@@ -47,6 +58,27 @@ env:
     -DLLAMA_BUILD_APP=OFF -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_SERVER=ON
 
 jobs:
+  # Spoken samples in the containers Teams clients and phones send.
+  media:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Speak and encode
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q espeak-ng ffmpeg
+          mkdir voice && cd voice
+          espeak-ng -s 150 -w speech.wav "Hello world. Please run the unit tests and then open a pull request."
+          ffmpeg -hide_banner -loglevel error -i speech.wav -ar 16000 -ac 1 -c:a pcm_s16le voice.wav
+          ffmpeg -hide_banner -loglevel error -i speech.wav -ar 48000 -c:a libopus -b:a 32k voice.ogg
+          ffmpeg -hide_banner -loglevel error -i speech.wav -ar 48000 -c:a libopus -b:a 32k voice.webm
+          ffmpeg -hide_banner -loglevel error -i speech.wav -ar 44100 -c:a aac -b:a 96k voice.m4a
+          ffmpeg -hide_banner -loglevel error -i speech.wav -ar 44100 -c:a libmp3lame -b:a 64k voice.mp3
+          rm speech.wav
+          ls -l
+      - uses: actions/upload-artifact@v4
+        with:
+          name: asr-voice
+          path: voice/*
+
   linux:
     name: linux-${{ matrix.arch }} (manylinux2014, glibc 2.17)
     runs-on: ${{ matrix.runner }}
@@ -58,32 +90,37 @@ jobs:
           - { arch: arm64, runner: ubuntu-24.04-arm, image: quay.io/pypa/manylinux2014_aarch64 }
     steps:
       - uses: actions/checkout@v4
-      - name: Build in manylinux2014
+      - name: Fetch FFmpeg
+        run: scripts/ci/ffmpeg-fetch-source.sh ffmpeg-src
+      - name: Build llama.cpp in manylinux2014
         run: |
           mkdir -p out
           docker run --rm -v "$PWD":/work:ro -v "$PWD/out":/out \
             -e LLAMA_TAG -e LLAMA_COMMIT -e ASSET_REV -e ASSET_PLATFORM=linux-${{ matrix.arch }} \
             ${{ matrix.image }} /work/scripts/ci/build-llama-asr.sh
           sudo chown -R "$(id -u):$(id -g)" out
+      - name: Build ffmpeg in manylinux2014
+        run: |
+          mkdir -p stage
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD":/work:ro -v "$PWD/stage":/stage \
+            -e FFMPEG_TAG -e FFMPEG_COMMIT -e ASSET_REV \
+            ${{ matrix.image }} bash -c 'git config --global --add safe.directory /work/ffmpeg-src
+              /work/scripts/ci/build-ffmpeg-audio.sh linux-${{ matrix.arch }} /work/ffmpeg-src /stage'
+          python3 scripts/ci/asr-package.py "stage/ffmpeg-audio-$FFMPEG_TAG-$ASSET_REV-linux-${{ matrix.arch }}" out linux-${{ matrix.arch }}
       - name: Run on CentOS 7 (glibc 2.17)
         run: |
-          name=llama-asr-$LLAMA_TAG-$ASSET_REV-linux-${{ matrix.arch }}
-          mkdir -p run && tar -xzf "out/$name.tar.gz" -C run
+          mkdir -p run
+          for f in out/*.tar.gz; do tar -xzf "$f" -C run; done
+          llama=llama-asr-$LLAMA_TAG-$ASSET_REV-linux-${{ matrix.arch }}
+          ff=ffmpeg-audio-$FFMPEG_TAG-$ASSET_REV-linux-${{ matrix.arch }}
           docker run --rm --network=none -v "$PWD/run":/asr:ro centos:7 sh -euxc "
             cat /etc/redhat-release; ldd --version | head -1
-            if ldd /asr/$name/llama-server | grep 'not found'; then exit 1; fi
-            /asr/$name/llama-server --version"
-      - name: Real-model smoke
-        if: inputs.model_smoke
-        run: |
-          sudo apt-get update -q && sudo apt-get install -y -q espeak-ng
-          espeak-ng -w smoke.wav "$SMOKE_TEXT"
-          scripts/ci/llama-asr-fetch-model.sh models
-          python3 scripts/ci/llama-asr-smoke.py "$PWD/run/llama-asr-$LLAMA_TAG-$ASSET_REV-linux-${{ matrix.arch }}/llama-server" \
-            models/model.gguf models/mmproj.gguf smoke.wav "unit tests"
+            if ldd /asr/$llama/llama-server | grep 'not found'; then exit 1; fi
+            /asr/$llama/llama-server --version
+            /asr/$ff/ffmpeg -hide_banner -version | head -1"
       - uses: actions/upload-artifact@v4
         with:
-          name: llama-asr-linux-${{ matrix.arch }}
+          name: asr-linux-${{ matrix.arch }}
           path: out/*
 
   macos:
@@ -100,9 +137,11 @@ jobs:
           - { arch: x64, runner: macos-15-intel, cmake: "-DGGML_METAL=OFF -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DCMAKE_OSX_DEPLOYMENT_TARGET=13.3" }
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch llama.cpp
-        run: scripts/ci/llama-asr-fetch-source.sh src
-      - name: Build
+      - name: Fetch sources
+        run: |
+          scripts/ci/llama-asr-fetch-source.sh src
+          scripts/ci/ffmpeg-fetch-source.sh ffmpeg-src
+      - name: Build llama.cpp
         run: |
           # COMMON_CMAKE and matrix.cmake are flag lists: split on purpose.
           # shellcheck disable=SC2086
@@ -111,7 +150,7 @@ jobs:
           # Build everything: with GGML_BACKEND_DL the CPU variants are plugins,
           # not link dependencies of llama-server.
           cmake --build build --config Release -j "$(sysctl -n hw.logicalcpu)"
-      - name: Package and check
+      - name: Package llama.cpp
         run: |
           name=llama-asr-$LLAMA_TAG-$ASSET_REV-macos-${{ matrix.arch }}
           mkdir -p "stage/$name" out
@@ -129,25 +168,23 @@ jobs:
           done
           xattr -cr "stage/$name"
           "stage/$name/llama-server" --version 2>&1 | tee "stage/$name/BUILDINFO.txt"
-          (cd stage && tar -czf "../out/$name.tar.gz" "$name")
-          scripts/ci/llama-asr-pin.sh "out/$name.tar.gz" macos-${{ matrix.arch }}
-      - name: Real-model smoke
-        if: inputs.model_smoke
+          python3 scripts/ci/asr-package.py "stage/$name" out macos-${{ matrix.arch }}
+      - name: Build ffmpeg
         run: |
-          say -o smoke.wav --data-format=LEI16@16000 "$SMOKE_TEXT"
-          scripts/ci/llama-asr-fetch-model.sh models
-          python3 scripts/ci/llama-asr-smoke.py "$PWD/stage/llama-asr-$LLAMA_TAG-$ASSET_REV-macos-${{ matrix.arch }}/llama-server" \
-            models/model.gguf models/mmproj.gguf smoke.wav "unit tests"
+          scripts/ci/build-ffmpeg-audio.sh macos-${{ matrix.arch }} ffmpeg-src stage
+          xattr -cr stage
+          python3 scripts/ci/asr-package.py "stage/ffmpeg-audio-$FFMPEG_TAG-$ASSET_REV-macos-${{ matrix.arch }}" out macos-${{ matrix.arch }}
       - uses: actions/upload-artifact@v4
         with:
-          name: llama-asr-macos-${{ matrix.arch }}
+          name: asr-macos-${{ matrix.arch }}
           path: out/*
 
   windows:
-    name: windows-${{ matrix.arch }} (${{ inputs.windows_crt }} CRT)
+    name: windows-${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
-    # pwsh is the Windows runners' default; stated so that actionlint does
-    # not check these PowerShell steps as bash (runs-on is a matrix value).
+    # matrix.runner is always a Windows image (pwsh is available), but actionlint
+    # cannot see that through the matrix; keep the default shell explicit so it
+    # does not check these PowerShell steps as bash (runs-on is a matrix value).
     defaults:
       run:
         shell: pwsh
@@ -157,17 +194,19 @@ jobs:
         include:
           # x64: every CPU variant (loaded at run time) plus the Vulkan plugin,
           # which is kept in gpu/ and only loaded when the helper asks for the GPU.
-          - { arch: x64, runner: windows-2025, vcvars: x64, cmake: "-DCMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_VULKAN=ON" }
+          - { arch: x64, runner: windows-2025, vcvars: x64, msystem: UCRT64, msys: mingw-w64-ucrt-x86_64-gcc, cmake: "-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_VULKAN=ON" }
           # arm64: built natively so it can be smoke-tested; armv8.2-a instead of
           # upstream's armv8.7-a so first-generation Windows-on-ARM devices work.
-          - { arch: arm64, runner: windows-11-arm, vcvars: arm64, cmake: "-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER_TARGET=arm64-pc-windows-msvc -DCMAKE_CXX_COMPILER_TARGET=arm64-pc-windows-msvc -DCMAKE_C_FLAGS=-march=armv8.2-a -DCMAKE_CXX_FLAGS=-march=armv8.2-a" }
+          - { arch: arm64, runner: windows-11-arm, vcvars: arm64, msystem: CLANGARM64, msys: mingw-w64-clang-aarch64-clang, cmake: "-DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER_TARGET=arm64-pc-windows-msvc -DCMAKE_CXX_COMPILER_TARGET=arm64-pc-windows-msvc -DCMAKE_C_FLAGS=-march=armv8.2-a -DCMAKE_CXX_FLAGS=-march=armv8.2-a" }
     env:
       VULKAN_VERSION: 1.4.313.2
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch llama.cpp
+      - name: Fetch sources
         shell: bash
-        run: scripts/ci/llama-asr-fetch-source.sh src
+        run: |
+          scripts/ci/llama-asr-fetch-source.sh src
+          scripts/ci/ffmpeg-fetch-source.sh ffmpeg-src
       - name: Install Ninja
         run: choco install ninja -y --no-progress
       - name: Install Vulkan SDK (build only; not shipped)
@@ -177,17 +216,18 @@ jobs:
           & "$env:RUNNER_TEMP\vulkan.exe" --accept-licenses --default-answer --confirm-command install
           Add-Content $env:GITHUB_ENV "VULKAN_SDK=C:\VulkanSDK\$env:VULKAN_VERSION"
           Add-Content $env:GITHUB_PATH "C:\VulkanSDK\$env:VULKAN_VERSION\bin"
-      - name: Build
+      - name: Build llama.cpp
         shell: cmd
         run: |
           for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath`) do set VSDIR=%%i
           call "%VSDIR%\VC\Auxiliary\Build\vcvarsall.bat" ${{ matrix.vcvars }} || exit /b 1
-          set CRT=-DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
-          if "${{ inputs.windows_crt }}"=="applocal" set CRT=-DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL
+          rem The VC++ runtime is shipped app-local (Package). A static CRT in every
+          rem DLL crashes llama-server (0xC0000409) while it loads the model.
+          set CRT=-DCMAKE_POLICY_DEFAULT_CMP0091=NEW -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL
           cd src
           cmake -S . -B ..\build -G Ninja %COMMON_CMAKE% %CRT% ${{ matrix.cmake }} || exit /b 1
           cmake --build ..\build || exit /b 1
-      - name: Package
+      - name: Package llama.cpp
         run: |
           $name = "llama-asr-$env:LLAMA_TAG-$env:ASSET_REV-win-${{ matrix.arch }}"
           $dst = "stage\$name"
@@ -195,14 +235,16 @@ jobs:
           Copy-Item build\bin\llama-server.exe $dst
           Get-ChildItem build\bin\*.dll | Where-Object { $_.Name -notmatch '^llama-.*-impl\.dll$' -or $_.Name -eq 'llama-server-impl.dll' } | Copy-Item -Destination $dst
           if (Test-Path "$dst\ggml-vulkan.dll") { Move-Item "$dst\ggml-vulkan.dll" "$dst\gpu\" }
+          if (-not (Get-ChildItem "$dst\gpu")) { Remove-Item "$dst\gpu" }
           Copy-Item src\LICENSE "$dst\LICENSE-llama.cpp"
-          if ("${{ inputs.windows_crt }}" -eq "applocal") {
-            $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
-            $crt = Get-ChildItem "$vs\VC\Redist\MSVC\*\${{ matrix.arch }}\Microsoft.VC14*.CRT" -Directory | Sort-Object FullName | Select-Object -Last 1
-            foreach ($dll in "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll") {
-              if (Test-Path "$($crt.FullName)\$dll") { Copy-Item "$($crt.FullName)\$dll" $dst }
-            }
+          # The VC++ runtime (redistributable) next to llama-server, so a
+          # machine without the VC++ Redistributable installed runs it too.
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          $crt = Get-ChildItem "$vs\VC\Redist\MSVC\*\${{ matrix.arch }}\Microsoft.VC14*.CRT" -Directory | Sort-Object FullName | Select-Object -Last 1
+          foreach ($dll in "vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll") {
+            if (Test-Path "$($crt.FullName)\$dll") { Copy-Item "$($crt.FullName)\$dll" $dst }
           }
+          if (-not (Test-Path "$dst\vcruntime140.dll") -or -not (Test-Path "$dst\msvcp140.dll")) { throw "VC++ runtime DLLs not found in $($crt.FullName)" }
           "name=$name" >> $env:GITHUB_ENV
       - name: Check DLL dependencies
         run: |
@@ -211,9 +253,9 @@ jobs:
           $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC\*\bin\$host_\dumpbin.exe" | Select-Object -Last 1
           $dst = "stage\$env:name"
           $shipped = (Get-ChildItem $dst -Recurse -Filter *.dll).Name | ForEach-Object { $_.ToLower() }
-          # In-box Windows DLLs only. api-ms-win-crt-* (the UCRT) is in-box since
-          # Windows 10; vcruntime/msvcp/libomp are not and must never be imported
-          # unless shipped app-local. vulkan-1.dll comes with GPU drivers and is
+          # In-box Windows DLLs and what we ship. api-ms-win-crt-* (the UCRT) is
+          # in-box since Windows 10; vcruntime/msvcp are shipped app-local; libomp
+          # must never be imported. vulkan-1.dll comes with GPU drivers and is
           # only allowed for the optional gpu/ plugin.
           $system = '^(kernel32|user32|advapi32|ws2_32|shell32|ole32|oleaut32|bcrypt|ntdll|shlwapi|crypt32|secur32|dbghelp|psapi|iphlpapi|version|mswsock|winmm|api-ms-win-core-.*|api-ms-win-crt-.*)\.dll$'
           $report = @()
@@ -226,27 +268,77 @@ jobs:
               if ($d -match '^(vcruntime|msvcp|libomp|vcomp)') { $report += "$($f.Name) -> $d" }
             }
           }
-          $summary = if ($report.Count -eq 0) { "no VC++ runtime / OpenMP imports (static CRT)" } else { "VC++ runtime imports (app-local): " + ($report -join ', ') }
+          $summary = "VC++ runtime imports (app-local): " + ($report -join ', ')
           Write-Host $summary
           "Windows ${{ matrix.arch }} CRT: $summary" | Out-File -Append "$dst\BUILDINFO.txt"
           if ($bad) { exit 1 }
-      - name: Smoke
+      - name: Archive llama.cpp
         shell: bash
         run: |
           "stage/$name/llama-server.exe" --version 2>&1 | tee -a "stage/$name/BUILDINFO.txt"
-          mkdir -p out && (cd stage && tar -czf "../out/$name.tar.gz" "$name")
-          scripts/ci/llama-asr-pin.sh "out/$name.tar.gz" "win-${{ matrix.arch }}"
-      - name: Real-model smoke
-        if: inputs.model_smoke
+          python scripts/ci/asr-package.py "stage/$name" out "win-${{ matrix.arch }}"
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          update: false
+          install: make diffutils ${{ matrix.msys }}
+      - name: Build ffmpeg
+        shell: msys2 {0}
+        run: scripts/ci/build-ffmpeg-audio.sh win-${{ matrix.arch }} ffmpeg-src stage
+      - name: Archive ffmpeg
         shell: bash
-        run: |
-          powershell -NoProfile -Command "Add-Type -AssemblyName System.Speech; \$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; \$s.SetOutputToWaveFile('smoke.wav'); \$s.Speak(\$env:SMOKE_TEXT); \$s.Dispose()"
-          scripts/ci/llama-asr-fetch-model.sh models
-          python scripts/ci/llama-asr-smoke.py "$PWD/stage/$name/llama-server.exe" models/model.gguf models/mmproj.gguf smoke.wav "unit tests"
+        run: python scripts/ci/asr-package.py "stage/ffmpeg-audio-$FFMPEG_TAG-$ASSET_REV-win-${{ matrix.arch }}" out "win-${{ matrix.arch }}"
       - uses: actions/upload-artifact@v4
         with:
-          name: llama-asr-win-${{ matrix.arch }}
+          name: asr-win-${{ matrix.arch }}
           path: out/*
+
+  # Each platform's assets through the production code path (download,
+  # verify, unpack, ffmpeg decode, llama-server) with the real model, on a
+  # plain runner of that platform, for every sample container.
+  verify:
+    name: verify ${{ matrix.platform }}
+    needs: [media, linux, macos, windows]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux-x64, runner: ubuntu-24.04 }
+          - { platform: linux-arm64, runner: ubuntu-24.04-arm }
+          - { platform: macos-arm64, runner: macos-15 }
+          - { platform: macos-x64, runner: macos-15-intel }
+          - { platform: win-x64, runner: windows-2025 }
+          - { platform: win-arm64, runner: windows-11-arm }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.11"
+          cache: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: asr-${{ matrix.platform }}
+          path: real
+      - uses: actions/download-artifact@v4
+        with:
+          name: asr-voice
+          path: real
+      - name: Fetch the model
+        run: scripts/ci/llama-asr-fetch-model.sh real
+      - name: Transcribe through internal/asr
+        env:
+          ASR_REAL_DIR: ${{ github.workspace }}/real
+        run: go test ./internal/asr -run '^TestRealModel$' -count=1 -v -timeout 40m
+      - name: Transcribe through internal/asr on CentOS 7 (glibc 2.17)
+        if: startsWith(matrix.platform, 'linux-')
+        run: |
+          CGO_ENABLED=0 go test -c -o asr.test ./internal/asr
+          docker run --rm --network=none -v "$PWD/asr.test":/asr.test:ro -v "$PWD/real":/real:ro \
+            -e ASR_REAL_DIR=/real -e HOME=/tmp centos:7 /asr.test -test.run '^TestRealModel$' -test.count=1 -test.v -test.timeout 40m
 
   pins:
     needs: [linux, macos, windows]
@@ -261,12 +353,72 @@ jobs:
           # The backticks are Markdown, printed as is.
           # shellcheck disable=SC2016
           {
-            echo '### llama-asr pins'
-            echo 'Publish the archives below as release `llama-asr-${{ inputs.llama_tag }}-${{ inputs.asset_rev }}`, then set:'
+            echo '### Voice asset pins'
+            echo 'Release `llama-asr-${{ inputs.llama_tag }}-${{ inputs.asset_rev }}`; set in internal/asr/pins.go:'
             echo '```go'
-            for f in artifacts/*/*.pin.json; do
-              python3 -c 'import json,sys; p=json.load(open(sys.argv[1])); print("\t\"%s\": runtimeAsset(\"%s\", FormatTarGz, \"%s\", %d)," % ({"linux-x64":"linux/amd64","linux-arm64":"linux/arm64","macos-arm64":"darwin/arm64","macos-x64":"darwin/amd64","win-x64":"windows/amd64","win-arm64":"windows/arm64"}[p["platform"]], p["platform"], p["sha256"], p["size"]))' "$f"
-            done
+            python3 - artifacts <<'EOF'
+          import glob, json, os, sys
+          keys = {"linux-x64": "linux/amd64", "linux-arm64": "linux/arm64", "macos-arm64": "darwin/arm64",
+                  "macos-x64": "darwin/amd64", "win-x64": "windows/amd64", "win-arm64": "windows/arm64"}
+          pins = [json.load(open(p)) for p in sorted(glob.glob(os.path.join(sys.argv[1], "*", "*.pin.json")))]
+          for kind, ctor in (("llama-asr-", 'runtimeAsset("%s", FormatTarGz, "%s", %d)'), ("ffmpeg-audio-", 'ffmpegAsset("%s", "%s", %d)')):
+              for p in pins:
+                  if p["name"].startswith(kind):
+                      print('\t"%s": %s,' % (keys[p["platform"]], ctor % (p["platform"], p["sha256"], p["size"])))
+          EOF
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           cat "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    needs: [verify]
+    if: inputs.publish && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE: llama-asr-${{ inputs.llama_tag }}-${{ inputs.asset_rev }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Refuse to touch an existing release
+        run: |
+          if gh release view "$RELEASE" >/dev/null 2>&1 || git ls-remote --exit-code origin "refs/tags/$RELEASE" >/dev/null; then
+            echo "::error::$RELEASE already exists; publish a new asset_rev instead"
+            exit 1
+          fi
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: asr-*-*
+          path: artifacts
+          merge-multiple: true
+      - name: Collect the release files
+        run: |
+          mkdir -p release
+          cp artifacts/*.tar.gz release/
+          scripts/ci/llama-asr-fetch-model.sh release
+          scripts/ci/ffmpeg-fetch-source.sh ffmpeg-src
+          git -C ffmpeg-src archive --format=tar.gz --prefix="ffmpeg-$FFMPEG_TAG/" -o "$PWD/release/ffmpeg-audio-$FFMPEG_TAG-source.tar.gz" HEAD
+          (cd release && sha256sum -- * > SHA256SUMS)
+          ls -l release
+          test "$(find release -name 'llama-asr-*.tar.gz' | wc -l)" = 6
+          test "$(find release -name 'ffmpeg-audio-*-r*-*.tar.gz' | wc -l)" = 6
+      - name: Release notes
+        run: |
+          cat > notes.md <<EOF
+          Voice transcription assets for codex-helper. **Not a helper release**: the helper downloads these files itself the first time a voice message arrives; nothing here needs to be installed by hand.
+
+          | File | What it is | Source / license |
+          | --- | --- | --- |
+          | \`llama-asr-$LLAMA_TAG-$ASSET_REV-<platform>.tar.gz\` | llama.cpp \`llama-server\` and its libraries | [llama.cpp $LLAMA_TAG](https://github.com/ggml-org/llama.cpp/tree/$LLAMA_TAG) (\`$LLAMA_COMMIT\`), MIT |
+          | \`ffmpeg-audio-$FFMPEG_TAG-$ASSET_REV-<platform>.tar.gz\` | audio-only \`ffmpeg\` (decoding only, no network, no GPL parts) | [FFmpeg $FFMPEG_TAG](https://github.com/FFmpeg/FFmpeg/tree/$FFMPEG_TAG) (\`$FFMPEG_COMMIT\`), LGPL-2.1-or-later; source: \`ffmpeg-audio-$FFMPEG_TAG-source.tar.gz\` |
+          | \`Qwen3-ASR-0.6B-Q8_0.gguf\`, \`mmproj-Qwen3-ASR-0.6B-Q8_0.gguf\` | the Qwen3-ASR 0.6B model | copy of [ggml-org/Qwen3-ASR-0.6B-GGUF](https://huggingface.co/ggml-org/Qwen3-ASR-0.6B-GGUF) (same SHA-256), Apache-2.0 |
+
+          Platforms: linux-x64 and linux-arm64 (glibc 2.17 or newer), macos-arm64 and macos-x64 (13.3 or newer), win-x64 and win-arm64 (Windows 10 or newer). Every archive carries its license and BUILDINFO.txt (exact build flags); the Windows runtime archives also carry the Microsoft Visual C++ runtime DLLs (redistributable), so no VC++ Redistributable install is needed. SHA256SUMS lists every file.
+
+          Built and checked by [this run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID): each platform transcribed WAV, Ogg/Opus, WebM/Opus, M4A/AAC and MP3 samples through the helper's own code path; the Linux builds also on CentOS 7.
+          EOF
+      - name: Create the release
+        run: |
+          gh release create "$RELEASE" --target "$GITHUB_SHA" --prerelease --latest=false \
+            --title "Voice transcription assets ($RELEASE)" --notes-file notes.md release/*

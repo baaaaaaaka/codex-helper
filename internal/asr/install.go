@@ -2,7 +2,6 @@ package asr
 
 import (
 	"archive/tar"
-	"archive/zip"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -202,39 +201,48 @@ func (in *installer) cleanTemp(now time.Time) {
 	}
 }
 
-// download fetches a into a temp file and verifies size and SHA-256.
+// download fetches a into a temp file and verifies size and SHA-256. Each
+// URL (a.URL, then the mirrors) gets downloadTries attempts; a missing file
+// (HTTP 4xx) or wrong bytes move on to the next URL at once. The result is
+// permanent only when every URL failed permanently.
 func (in *installer) download(ctx context.Context, a Asset) (string, error) {
 	if err := os.MkdirAll(in.tmp(), 0o700); err != nil {
 		return "", newError(KindCache, "create cache dir", err, "")
 	}
-	var lastErr *Error
-	for attempt := 1; attempt <= downloadTries; attempt++ {
-		file, err := in.downloadOnce(ctx, a)
-		if err == nil {
-			return file, nil
+	var lastErr, transient *Error
+	for _, url := range a.urls() {
+		for attempt := 1; attempt <= downloadTries; attempt++ {
+			file, err := in.downloadOnce(ctx, a, url)
+			if err == nil {
+				return file, nil
+			}
+			lastErr = err
+			if err.Kind != KindDownload || errors.Is(err, errPermanent) || ctx.Err() != nil {
+				break
+			}
+			transient = err
+			select {
+			case <-ctx.Done():
+			case <-time.After(in.backoff * time.Duration(attempt)):
+			}
 		}
-		lastErr = err
-		if err.Kind != KindDownload || errors.Is(err, errPermanent) || ctx.Err() != nil {
-			break
-		}
-		select {
-		case <-ctx.Done():
-		case <-time.After(in.backoff * time.Duration(attempt)):
+		if ctx.Err() != nil {
+			return "", ctxError(ctx, "download "+a.Name)
 		}
 	}
-	if ctx.Err() != nil {
-		return "", ctxError(ctx, "download "+a.Name)
+	if lastErr.Kind == KindDownload && transient != nil {
+		return "", transient // one URL may work later: keep the error retryable
 	}
 	return "", lastErr
 }
 
-func (in *installer) downloadOnce(parent context.Context, a Asset) (string, *Error) {
+func (in *installer) downloadOnce(parent context.Context, a Asset, url string) (string, *Error) {
 	op := "download " + a.Name
 	ctx, cancel := context.WithCancel(parent)
 	defer cancel()
 	stalled := time.AfterFunc(in.stall, cancel) // reset on every read below
 	defer stalled.Stop()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.URL, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", newError(KindDownload, op, err, "")
 	}
@@ -248,7 +256,7 @@ func (in *installer) downloadOnce(parent context.Context, a Asset) (string, *Err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		err := fmt.Errorf("HTTP %d from %s", resp.StatusCode, a.URL)
+		err := fmt.Errorf("HTTP %d from %s", resp.StatusCode, url)
 		if resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusRequestTimeout && resp.StatusCode != http.StatusTooManyRequests {
 			err = fmt.Errorf("%w: %w", errPermanent, err) // the pinned file is missing or forbidden: retrying will not help
 		}
@@ -393,8 +401,6 @@ func unpack(file string, a Asset, stage string) error {
 		return os.Rename(file, filepath.Join(stage, a.Name))
 	case FormatTarGz:
 		return untar(file, stage)
-	case FormatWheel:
-		return unwheel(file, a, stage)
 	}
 	return fmt.Errorf("unknown asset format %q", a.Format)
 }
@@ -447,27 +453,6 @@ func untar(file, stage string) error {
 			return err
 		}
 	}
-}
-
-// unwheel keeps only the ffmpeg binary (a.Member*) of an imageio-ffmpeg wheel.
-func unwheel(file string, a Asset, stage string) error {
-	zr, err := zip.OpenReader(file)
-	if err != nil {
-		return err
-	}
-	defer zr.Close()
-	for _, zf := range zr.File {
-		if zf.FileInfo().IsDir() || !strings.HasPrefix(zf.Name, a.Member) || strings.HasSuffix(zf.Name, ".md") {
-			continue
-		}
-		r, err := zf.Open()
-		if err != nil {
-			return err
-		}
-		defer r.Close()
-		return writeFile(filepath.Join(stage, exeName("ffmpeg")), r, 0o755)
-	}
-	return fmt.Errorf("%s does not contain %s*", a.Name, a.Member)
 }
 
 func writeFile(p string, r io.Reader, mode os.FileMode) error {
