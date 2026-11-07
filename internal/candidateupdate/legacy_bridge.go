@@ -206,14 +206,14 @@ func managedStableReplacementTarget(entry string, runningRuntime string, root st
 	if same, err := sameFileContent(target, runningRuntime); err != nil {
 		return "", "", fmt.Errorf("compare stable entry with running runtime: %w", err)
 	} else if !same {
-		owned, recordErr := managedinstall.RecordOwnsTarget(recordPath, target, runtime.GOOS)
+		owned, recordErr := recordOwnsStableEntry(recordPath, target, runtime.GOOS)
 		if recordErr != nil {
 			return "", "", fmt.Errorf("inspect managed install record: %w", recordErr)
 		}
 		if !owned {
 			return "", "", fmt.Errorf("stable entry target %s does not match the running runtime and is not a recorded managed helper", target)
 		}
-		if _, verifyErr := verifiedPhysicalVersion(target); verifyErr != nil {
+		if _, verifyErr := verifyPhysicalHelper(target); verifyErr != nil {
 			return "", "", fmt.Errorf("stable entry target %s is recorded as managed but is not a verified helper: %w", target, verifyErr)
 		}
 	}
@@ -223,6 +223,26 @@ func managedStableReplacementTarget(entry string, runningRuntime string, root st
 	}
 	return target, expectedHash, nil
 }
+
+// recordOwnsStableEntry reports whether the install record owns target: the
+// recorded codex-proxy itself, or the cxp beside it. install.ps1 writes
+// cxp.exe as a copy of the recorded codex-proxy.exe (a symlink, which
+// resolves to the recorded file, elsewhere). When a deferred replacement of
+// that copy could not run (a Teams supervisor kept it open), the copy keeps
+// an older helper while the active runtime moves on; it still belongs to the
+// same install, and refusing it would block every later update.
+func recordOwnsStableEntry(recordPath string, target string, goos string) (bool, error) {
+	owned, err := managedinstall.RecordOwnsTarget(recordPath, target, goos)
+	if err != nil || owned || !strings.EqualFold(filepath.Base(target), helperruntime.BinaryName(goos)) {
+		return owned, err
+	}
+	sibling := filepath.Join(filepath.Dir(target), helperpath.BinaryName(goos))
+	return managedinstall.RecordOwnsTarget(recordPath, sibling, goos)
+}
+
+// verifyPhysicalHelper is verifiedPhysicalVersion; tests replace it to avoid
+// building a release binary.
+var verifyPhysicalHelper = verifiedPhysicalVersion
 
 func stableEntryTargetPath(entry string, root string) (string, error) {
 	entry = filepath.Clean(strings.TrimSpace(entry))
