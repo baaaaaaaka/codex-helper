@@ -354,8 +354,10 @@ type Engine struct {
 	// orphans are the turns the previous process left starting or
 	// running, until reconcile settles them (under mu). None of them runs:
 	// Prepare stopped the previous app-servers.
-	orphans map[int64]bool
-	stats   engineStats
+	attachReady bool
+	tuiLeases   int // live shared TUI control connections, guarded by mu
+	orphans     map[int64]bool
+	stats       engineStats
 	// Teams edits (edits.go, annotations.go, rename.go): queued chat
 	// edits per conversation, the machine label and the unread marks.
 	edits  map[int64][]*chatEdit
@@ -513,6 +515,7 @@ func (e *Engine) Run(ctx context.Context) error {
 		e.ag.Close()
 		return err
 	}
+	defer func() { e.mu.Lock(); e.attachReady = false; e.mu.Unlock() }()
 	// The turns the previous process left open, read before the runner
 	// starts: a held turn this process starts must not be taken for one
 	// of them ("did not run" posted while it runs).
@@ -527,6 +530,9 @@ func (e *Engine) Run(ctx context.Context) error {
 			e.orphans[tr.ID] = true
 		}
 	}
+	e.mu.Unlock()
+	e.mu.Lock()
+	e.attachReady = true
 	e.mu.Unlock()
 	// Before the receiver's first read: a post of one of them must not be
 	// taken for the owner's.

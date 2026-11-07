@@ -30,6 +30,7 @@ type TurnResult struct {
 // TurnHooks observe a running turn. Each hook runs on its own call path
 // and must not block for long.
 type TurnHooks struct {
+	TurnChanged func() // start/completion notifications, not token deltas
 	// Started is called once turn/start was accepted.
 	Started func(turnID string)
 	// Progress receives commentary agent messages.
@@ -68,9 +69,11 @@ func (s *Server) RunTurn(ctx context.Context, p TurnStartParams, poll time.Durat
 	if poll <= 0 {
 		poll = 5 * time.Second
 	}
+	dispatched := make(chan string, 1)
 	var (
 		mu        sync.Mutex
 		turnID    string
+		candidate string
 		items     = map[string][]Item{} // by turn id
 		usage     = map[string]*Usage{}
 		completed = make(chan Turn, 4)
@@ -119,6 +122,8 @@ func (s *Server) RunTurn(ctx context.Context, p TurnStartParams, poll time.Durat
 		now := time.Now()
 		dup := false
 		switch {
+		case p.Queue && (candidate == "" || (turn != "" && turn != candidate)):
+			dup = true // a queued observer owns no earlier task
 		case turn != "" && turnID != "" && turn != turnID:
 			dup = true // another turn's (a compaction before turn/start answered is this turn's)
 		case item != "" && compacts[item]:
@@ -147,6 +152,9 @@ func (s *Server) RunTurn(ctx context.Context, p TurnStartParams, poll time.Durat
 		if hooks.Activity != nil {
 			hooks.Activity()
 		}
+		if (n.Method == "turn/started" || n.Method == "turn/completed") && hooks.TurnChanged != nil {
+			hooks.TurnChanged()
+		}
 		switch n.Method {
 		case "thread/compacted":
 			var m struct {
@@ -155,12 +163,30 @@ func (s *Server) RunTurn(ctx context.Context, p TurnStartParams, poll time.Durat
 			if json.Unmarshal(n.Params, &m) == nil {
 				compacted(m.TurnID, "")
 			}
-		case "item/completed":
+		case "item/started", "item/completed":
 			var m struct {
 				TurnID string `json:"turnId"`
 				Item   Item   `json:"item"`
 			}
 			if json.Unmarshal(n.Params, &m) != nil {
+				return
+			}
+			if m.Item.Type == "userMessage" && m.Item.ClientID == p.ClientID && p.ClientID != "" {
+				mu.Lock()
+				candidate = m.TurnID
+				mu.Unlock()
+				select {
+				case dispatched <- m.TurnID:
+				default:
+				}
+			}
+			if n.Method != "item/completed" {
+				return
+			}
+			mu.Lock()
+			other := p.Queue && (candidate == "" || m.TurnID != candidate)
+			mu.Unlock()
+			if other {
 				return
 			}
 			if m.Item.Type == "contextCompaction" {
@@ -182,6 +208,10 @@ func (s *Server) RunTurn(ctx context.Context, p TurnStartParams, poll time.Durat
 				return
 			}
 			mu.Lock()
+			if turnID != "" && m.TurnID != turnID {
+				mu.Unlock()
+				return
+			}
 			items[m.TurnID] = append(items[m.TurnID], m.Item)
 			mine := m.TurnID == turnID
 			mu.Unlock()
@@ -197,7 +227,7 @@ func (s *Server) RunTurn(ctx context.Context, p TurnStartParams, poll time.Durat
 				return
 			}
 			mu.Lock()
-			mine := r.turnID == "" || turnID == "" || r.turnID == turnID
+			mine := (r.turnID == "" || turnID == "" || r.turnID == turnID) && (!p.Queue || (candidate != "" && (r.turnID == "" || r.turnID == candidate)))
 			mu.Unlock()
 			if mine {
 				hooks.Retrying(r.message, r.code)
@@ -211,7 +241,9 @@ func (s *Server) RunTurn(ctx context.Context, p TurnStartParams, poll time.Durat
 			}
 			if json.Unmarshal(n.Params, &m) == nil && m.TokenUsage.Last != nil {
 				mu.Lock()
-				usage[m.TurnID] = m.TokenUsage.Last
+				if (!p.Queue || (candidate != "" && m.TurnID == candidate)) && (turnID == "" || turnID == m.TurnID) {
+					usage[m.TurnID] = m.TokenUsage.Last
+				}
 				mu.Unlock()
 			}
 		case "turn/completed":
@@ -228,7 +260,7 @@ func (s *Server) RunTurn(ctx context.Context, p TurnStartParams, poll time.Durat
 	})
 	defer unsub()
 
-	id, err := s.TurnStart(ctx, p)
+	id, err := s.submitTurn(ctx, p, dispatched)
 	if err != nil {
 		var re *RPCError
 		if errors.As(err, &re) {
@@ -277,7 +309,7 @@ func (s *Server) RunTurn(ctx context.Context, p TurnStartParams, poll time.Durat
 			if t, ok := s.turnByID(ctx, p.ThreadID, id); ok && t.Status != StatusInProgress && t.Status != "" {
 				return finish(t)
 			}
-		case <-s.Done():
+		case <-s.fault:
 			return TurnResult{TurnID: id}, ErrExited
 		case <-ctx.Done():
 			return TurnResult{TurnID: id}, ctx.Err()
@@ -304,4 +336,78 @@ func (s *Server) turnByID(ctx context.Context, threadID, turnID string) (Turn, b
 		}
 	}
 	return Turn{}, false
+}
+
+// ErrQueueCancelled means a queued input was removed before dispatch.
+var ErrQueueCancelled = errors.New("codex: queued input cancelled")
+
+func (s *Server) submitTurn(ctx context.Context, p TurnStartParams, dispatched <-chan string) (string, error) {
+	if !p.Queue {
+		return s.TurnStart(ctx, p)
+	}
+	// The queue uses the current session settings, as does native TUI Tab.
+	settings := map[string]any{"threadId": p.ThreadID}
+	if p.Model != "" {
+		settings["model"] = p.Model
+	}
+	if p.Effort != "" {
+		settings["effort"] = p.Effort
+	}
+	if len(settings) > 1 {
+		if err := s.Call(ctx, "thread/settings/update", settings, nil); err != nil {
+			return "", &ErrNotStarted{Err: err}
+		}
+	}
+	id, err := s.QueueAdd(ctx, p)
+	if err != nil {
+		return "", err
+	}
+	if p.Queued != nil {
+		p.Queued(id)
+	}
+	// add may already have dispatched it. start is an acceleration for an
+	// idle thread; busy/not-found is harmless, and never means resend.
+	if err := s.QueueStart(ctx, p.ThreadID, id); err != nil {
+		var re *RPCError
+		if !errors.As(err, &re) {
+			return "", err
+		}
+	}
+	tick := time.NewTicker(5 * time.Second)
+	defer tick.Stop()
+	for {
+		select {
+		case turn := <-dispatched:
+			return turn, nil
+		case <-p.QueueCancelled:
+			return "", ErrQueueCancelled
+		case <-ctx.Done():
+			return "", ctx.Err()
+		case <-s.fault:
+			return "", ErrExited
+		case <-tick.C:
+			// While waiting, inspect only the queue, not previous tasks' large
+			// tool results. History is needed only if dispatch wasn't observed.
+			queued, err := s.queuedInput(ctx, p.ThreadID, p.ClientID)
+			if err != nil {
+				return "", err
+			}
+			if queued != "" {
+				continue
+			}
+			// Recovery from a missed event uses a bounded recent window. Never
+			// re-add an input because a response or notification was lost.
+			turns, err := s.RecentTurns(ctx, p.ThreadID, 5)
+			if err != nil {
+				return "", err
+			}
+			for _, t := range turns {
+				for _, it := range t.Items {
+					if it.Type == "userMessage" && it.ClientID == p.ClientID {
+						return t.ID, nil
+					}
+				}
+			}
+		}
+	}
 }

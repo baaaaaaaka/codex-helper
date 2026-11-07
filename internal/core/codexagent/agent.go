@@ -6,6 +6,7 @@ package codexagent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -31,15 +32,19 @@ type Agent struct {
 	cfg  Config
 	pool *codex.Pool
 
-	mu      sync.Mutex
-	running map[int64]*runningTurn
+	mu         sync.Mutex
+	tuiThreads map[string]int
+	attached   map[int64]int
+	running    map[int64]*runningTurn
 }
 
 type runningTurn struct {
-	srv       *codex.Server
-	threadID  string
-	turnID    string
-	interrupt bool // Interrupt came before Codex accepted the turn
+	srv            *codex.Server
+	threadID       string
+	turnID         string
+	queueID        string
+	queueCancelled chan struct{}
+	interrupt      bool // Interrupt came before Codex accepted the turn
 }
 
 var (
@@ -55,11 +60,25 @@ func New(cfg Config) *Agent {
 	if cfg.Server.Log == nil {
 		cfg.Server.Log = cfg.Log
 	}
-	return &Agent{
-		cfg:     cfg,
-		pool:    codex.NewPool(codex.PoolConfig{Idle: cfg.Idle, PIDFile: cfg.PIDFile, Log: cfg.Log}),
-		running: map[int64]*runningTurn{},
+	a := &Agent{
+		cfg:        cfg,
+		pool:       codex.NewPool(codex.PoolConfig{Idle: cfg.Idle, PIDFile: cfg.PIDFile, Log: cfg.Log}),
+		running:    map[int64]*runningTurn{},
+		attached:   map[int64]int{},
+		tuiThreads: map[string]int{},
 	}
+	if cfg.Server.SharedDir != "" {
+		a.cfg.Server.IgnoreServerRequest = func(raw json.RawMessage) bool {
+			var p struct {
+				ThreadID string `json:"threadId"`
+			}
+			_ = json.Unmarshal(raw, &p)
+			a.mu.Lock()
+			defer a.mu.Unlock()
+			return a.tuiThreads[p.ThreadID] > 0
+		}
+	}
+	return a
 }
 
 func key(conv int64) string { return fmt.Sprintf("conv-%d", conv) }
@@ -132,7 +151,7 @@ func (a *Agent) Run(ctx context.Context, req engine.TurnRequest, hooks engine.Tu
 	for _, img := range req.Images {
 		in = append(in, codex.Input{Image: img})
 	}
-	rt := &runningTurn{srv: srv, threadID: threadID}
+	rt := &runningTurn{srv: srv, threadID: threadID, queueCancelled: make(chan struct{})}
 	a.mu.Lock()
 	a.running[req.ConvID] = rt
 	a.mu.Unlock()
@@ -151,6 +170,19 @@ func (a *Agent) Run(ctx context.Context, req engine.TurnRequest, hooks engine.Tu
 	}
 	res, err := srv.RunTurn(ctx, codex.TurnStartParams{
 		ThreadID: threadID, Input: in, ClientID: req.TurnKey, Cwd: req.Cwd, Model: req.Model, Effort: req.Effort,
+		Queue: req.Queue, QueueCancelled: rt.queueCancelled,
+		Queued: func(id string) {
+			a.mu.Lock()
+			rt.queueID = id
+			pending := rt.interrupt
+			a.mu.Unlock()
+			if hooks.Ready != nil {
+				hooks.Ready()
+			}
+			if pending {
+				_ = a.Interrupt(ctx, req.ConvID)
+			}
+		},
 	}, a.cfg.Poll, codex.TurnHooks{
 		Started: func(id string) {
 			a.mu.Lock()
@@ -170,25 +202,40 @@ func (a *Agent) Run(ctx context.Context, req engine.TurnRequest, hooks engine.Tu
 				hooks.Started(id)
 			}
 		},
-		Progress:  hooks.Progress,
-		Compacted: hooks.Compacted,
-		Activity:  hooks.Activity,
-		Retrying:  hooks.Retrying,
+		Progress:    hooks.Progress,
+		Compacted:   hooks.Compacted,
+		Activity:    hooks.Activity,
+		TurnChanged: hooks.Ready,
+		Retrying:    hooks.Retrying,
 	})
 	var ns *codex.ErrNotStarted
 	switch {
+	case errors.Is(err, codex.ErrQueueCancelled):
+		return engine.TurnOutcome{NotStarted: true, Status: engine.StatusInterrupted, Error: "cancelled before queued input dispatched"}, nil
 	case errors.As(err, &ns):
 		return a.notStarted(ctx, ns.Err)
 	case err != nil && ctx.Err() != nil:
 		return engine.TurnOutcome{CodexTurnID: res.TurnID}, ctx.Err()
 	case errors.Is(err, codex.ErrExited):
-		a.pool.Drop(key(req.ConvID))
+		if a.cfg.Server.SharedDir != "" {
+			select {
+			case <-srv.Done():
+			case <-ctx.Done():
+				return engine.TurnOutcome{}, ctx.Err()
+			case <-time.After(5 * time.Second):
+				return engine.TurnOutcome{CodexTurnID: res.TurnID}, engine.ErrBackendUncertain
+			}
+		}
+		a.dropUnshared(req.ConvID)
 		return engine.TurnOutcome{CodexTurnID: res.TurnID}, engine.ErrUnknownOutcome
 	case err != nil:
+		if a.cfg.Server.SharedDir != "" {
+			return engine.TurnOutcome{CodexTurnID: res.TurnID}, fmt.Errorf("%w: %v", engine.ErrBackendUncertain, err)
+		}
 		// The server may still be running the turn (review M4): kill its
 		// process group before the engine looks the turn up, so the turn
 		// cannot go on and the next turn never runs beside it.
-		a.pool.Drop(key(req.ConvID))
+		a.dropUnshared(req.ConvID)
 		return engine.TurnOutcome{CodexTurnID: res.TurnID}, fmt.Errorf("%w: %v", engine.ErrUnknownOutcome, err)
 	}
 	return outcome(res.TurnID, res.Status, res.Final, res.Err, res.Usage), nil
@@ -248,6 +295,14 @@ func (a *Agent) Lookup(ctx context.Context, convID int64, threadID, turnKey stri
 		return engine.TurnOutcome{}, false, err
 	}
 	defer lease.Release()
+	a.mu.Lock()
+	active := a.running[convID] != nil
+	a.mu.Unlock()
+	if !active && a.cfg.Server.SharedDir != "" {
+		if _, err := lease.Server().RemoveQueuedInput(ctx, threadID, turnKey); err != nil {
+			return engine.TurnOutcome{}, false, err
+		}
+	}
 	t, ok, err := lease.Server().FindTurn(ctx, threadID, turnKey)
 	if err != nil || !ok {
 		return engine.TurnOutcome{}, ok, err
@@ -270,14 +325,42 @@ func (a *Agent) Interrupt(ctx context.Context, convID int64) error {
 		}
 	}
 	a.mu.Unlock()
-	if rt == nil || turnID == "" {
+	if rt == nil {
+		return nil
+	}
+	if turnID == "" {
+		a.mu.Lock()
+		qid := rt.queueID
+		a.mu.Unlock()
+		if qid != "" {
+			deleted, err := rt.srv.QueueDelete(ctx, rt.threadID, qid)
+			if err != nil {
+				return err
+			}
+			if deleted {
+				a.mu.Lock()
+				select {
+				case <-rt.queueCancelled:
+				default:
+					close(rt.queueCancelled)
+				}
+				a.mu.Unlock()
+			}
+		}
 		return nil
 	}
 	return rt.srv.TurnInterrupt(ctx, rt.threadID, turnID)
 }
 
 // Kill ends the app-server of convID.
-func (a *Agent) Kill(convID int64) { a.pool.Drop(key(convID)) }
+func (a *Agent) Kill(convID int64) {
+	a.mu.Lock()
+	attached := a.attached[convID] > 0
+	a.mu.Unlock()
+	if !attached {
+		a.pool.Drop(key(convID))
+	}
+}
 
 // Fork forks threadID after lastTurnID into a new thread.
 func (a *Agent) Fork(ctx context.Context, convID int64, threadID, lastTurnID, cwd string) (engine.Forked, error) {
@@ -410,4 +493,94 @@ func (a *Agent) StopGoal(ctx context.Context, convID int64, threadID string) (en
 		out.Interrupted = true
 	}
 	return out, nil
+}
+
+// Steer appends input without creating another execution observer.
+func (a *Agent) Steer(ctx context.Context, req engine.TurnRequest, expected string) error {
+	srv := a.pool.Peek(key(req.ConvID))
+	if srv == nil || srv.Info(req.ThreadID).Turn != expected {
+		return engine.ErrSteerExpired
+	}
+	input := []codex.Input{}
+	if strings.TrimSpace(req.Text) != "" {
+		input = append(input, codex.Input{Text: req.Text})
+	}
+	for _, im := range req.Images {
+		input = append(input, codex.Input{Image: im})
+	}
+	err := srv.TurnSteer(ctx, codex.TurnStartParams{ThreadID: req.ThreadID, ClientID: req.TurnKey, Input: input}, expected)
+	var re *codex.RPCError
+	if errors.As(err, &re) {
+		low := strings.ToLower(re.Message)
+		if strings.Contains(low, "no active turn") || strings.Contains(low, "no running turn") || strings.Contains(low, "mismatch") || strings.Contains(low, "does not match") || strings.Contains(low, "expected active turn id") {
+			srv.ForgetTurn(req.ThreadID, expected)
+			return engine.ErrSteerExpired
+		}
+		return &engine.InputRejected{Reason: re.Message}
+	}
+	return err
+}
+
+// Attach reuses the conversation's existing pool lease. The native server
+// fans out notifications; the helper does not copy token deltas for TUI.
+func (a *Agent) Attach(ctx context.Context, conv int64, thread, cwd string) (engine.TUIEndpoint, func(), <-chan struct{}, error) {
+	if a.cfg.Server.SharedDir == "" {
+		return engine.TUIEndpoint{}, nil, nil, engine.ErrUnmanagedThread
+	}
+	lease, err := a.pool.AcquireCurrent(ctx, key(conv), a.serverConfig(cwd))
+	if err != nil {
+		return engine.TUIEndpoint{}, nil, nil, err
+	}
+	srv := lease.Server()
+	if thread == "" {
+		var created codex.Thread
+		created, err = srv.ThreadStart(ctx, codex.ThreadStartParams{Cwd: cwd})
+		if err == nil {
+			thread = created.ID
+			lease.Loaded(thread)
+		}
+	} else {
+		err = lease.Load(ctx, thread)
+	}
+	if err != nil {
+		lease.Release()
+		return engine.TUIEndpoint{}, nil, nil, err
+	}
+	ep := srv.Endpoint()
+	a.mu.Lock()
+	a.attached[conv]++
+	a.tuiThreads[thread]++
+	a.mu.Unlock()
+	var once sync.Once
+	release := func() {
+		once.Do(func() {
+			a.mu.Lock()
+			a.attached[conv]--
+			a.tuiThreads[thread]--
+			if a.tuiThreads[thread] == 0 {
+				delete(a.tuiThreads, thread)
+			}
+			if a.attached[conv] == 0 {
+				delete(a.attached, conv)
+			}
+			a.mu.Unlock()
+			srv.AnswerPendingRequests(thread)
+			lease.Release()
+		})
+	}
+	return engine.TUIEndpoint{ThreadID: thread, URL: ep.URL, Token: ep.Token}, release, srv.Done(), nil
+}
+func (a *Agent) Active() bool { return a.pool.Running() }
+
+func (a *Agent) dropUnshared(conv int64) {
+	if a.cfg.Server.SharedDir == "" {
+		a.pool.Drop(key(conv))
+	}
+}
+
+func (a *Agent) CurrentTurn(conv int64, thread string) string {
+	if srv := a.pool.Peek(key(conv)); srv != nil {
+		return srv.Info(thread).Turn
+	}
+	return ""
 }

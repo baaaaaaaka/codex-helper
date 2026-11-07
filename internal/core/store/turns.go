@@ -28,7 +28,7 @@ func (t *Tx) turnKeyPrefix() (string, error) {
 // and effort that apply at enqueue time (R-31). The turn key is
 // '<prefix>-<id>', at most ~32 characters, and is sent to Codex as
 // clientUserMessageId.
-func (t *Tx) newTurn(convID, inboundID int64) (int64, error) {
+func (t *Tx) newTurn(convID, inboundID int64, queue ...bool) (int64, error) {
 	prefix, err := t.turnKeyPrefix()
 	if err != nil {
 		return 0, err
@@ -37,11 +37,20 @@ func (t *Tx) newTurn(convID, inboundID int64) (int64, error) {
 	if err := t.row(`SELECT COALESCE(MAX(id), 0) + 1 FROM turns`).Scan(&id); err != nil {
 		return 0, err
 	}
-	_, err = t.exec(`INSERT INTO turns(id,conv_id,inbound_id,turn_key,state,model,effort,queued_at)
-SELECT ?, ?, ?, ?, 'queued', th.m, th.e, ?
+	queued := true
+	if inboundID != 0 {
+		if err := t.row(`SELECT queued_only FROM inbound WHERE id=?`, inboundID).Scan(&queued); err != nil {
+			return 0, err
+		}
+	}
+	if len(queue) > 0 {
+		queued = queue[0]
+	}
+	_, err = t.exec(`INSERT INTO turns(id,conv_id,inbound_id,turn_key,state,model,effort,queued_at,queued_only)
+SELECT ?, ?, ?, ?, 'queued', th.m, th.e, ?, ?
 FROM (SELECT 1) LEFT JOIN (SELECT COALESCE(pending_model, model) AS m, COALESCE(pending_effort, effort) AS e
                            FROM threads WHERE conv_id = ?) th`,
-		id, convID, nullInt(inboundID), fmt.Sprintf("%s-%d", prefix, id), t.now, convID)
+		id, convID, nullInt(inboundID), fmt.Sprintf("%s-%d", prefix, id), t.now, queued, convID)
 	return id, err
 }
 
@@ -131,8 +140,9 @@ func (t *Tx) MarkStarting(turnID int64, threadID string) error {
 }
 
 // MarkRunning records Codex's acceptance of the turn.
-func (t *Tx) MarkRunning(turnID int64, codexTurnID string) error {
-	return t.turnMove(turnID, []string{TurnStarting}, `state = 'running', codex_turn_id = ?`, nullStr(codexTurnID))
+func (t *Tx) MarkRunning(turnID int64, codexTurnID string, shared ...bool) error {
+	isShared := len(shared) > 0 && shared[0]
+	return t.turnMove(turnID, []string{TurnStarting}, `state = 'running', codex_turn_id = ?, shared=?`, nullStr(codexTurnID), isShared)
 }
 
 // RequeueTurn puts a starting/running turn back to queued for a capacity
@@ -194,4 +204,32 @@ func (t *Tx) FinishTurn(turnID int64, state, errText string, outputs []OutMsg) e
 func (s *Store) OpenTurns() ([]Turn, error) {
 	return collect(scanTurn)(s.r.QueryContext(context.Background(), `SELECT `+turnCols+` FROM turns
 WHERE state IN ('queued','starting','running') ORDER BY conv_id, id`))
+}
+
+// NextSteer selects the oldest ordinary prompt. Explicit queued requests
+// do not delay immediate input, but an ordinary prompt with pending files
+// keeps later ordinary input in order.
+func (t *Tx) NextSteer(convID int64) (Turn, bool, error) {
+	tr, ok, err := one(t.row(`SELECT `+turnCols+` FROM turns WHERE conv_id=? AND state IN ('queued','starting','running') AND state='queued' AND queued_only=0 ORDER BY id LIMIT 1`, convID), scanTurn)
+	if err != nil || !ok {
+		return tr, false, err
+	}
+	var pending bool
+	err = t.row(`SELECT EXISTS(SELECT 1 FROM inbound_files WHERE inbound_id=? AND state='pending')`, tr.InboundID).Scan(&pending)
+	return tr, !pending, err
+}
+
+// MarkSteering distinguishes input delivery from an execution that owns output.
+// Its key lets the mirror identify input-only submissions, including goal turns.
+func (t *Tx) MarkSteering(id int64, thread string) error {
+	if err := t.MarkStarting(id, thread); err != nil {
+		return err
+	}
+	_, err := t.exec(`UPDATE turns SET steering=1,turn_key='cxp-steer-'||turn_key WHERE id=?`, id)
+	return err
+}
+
+// Unsteer is safe only after a definite native rejection (no submission).
+func (t *Tx) Unsteer(id int64) error {
+	return t.turnMove(id, []string{TurnStarting}, `state='queued', steering=0, started_at=NULL, turn_key=substr(turn_key,11)`)
 }

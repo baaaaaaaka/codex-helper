@@ -25,16 +25,18 @@ const CompactText = "Context compacted. Earlier turns were summarized so Codex c
 // "t:<turn>:<kind>:<line>" (final, prompt, status, compact; line is the
 // 1-based line of the record).
 type Output struct {
-	RecordID string
-	Kind     OutputKind
-	User     bool // Kind == OutputPrompt
-	Text     string
-	Time     time.Time
-	TurnID   string
-	End      int64 // end offset of the record
-	Info     Info  // the thread's goal and settings when the record was released
-	line     int64 // 1-based line of the record (ids of id-less records)
-	start    int64
+	helperInput bool
+	localPrompt bool // an identified native TUI input inside a shared turn
+	RecordID    string
+	Kind        OutputKind
+	User        bool // Kind == OutputPrompt
+	Text        string
+	Time        time.Time
+	TurnID      string
+	End         int64 // end offset of the record
+	Info        Info  // the thread's goal and settings when the record was released
+	line        int64 // 1-based line of the record (ids of id-less records)
+	start       int64
 }
 
 // Info is what the rollout said last of its thread's goal and model
@@ -121,13 +123,15 @@ func (t *Tracker) stamp(out []Output, from int) {
 }
 
 type openTurn struct {
-	id        string
-	started   bool // its start record was read (not a scan that began mid-turn)
-	start     int64
-	startLine int64
-	teams     bool
-	decided   bool // the helper/local decision is known
-	finalSeen bool
+	id              string
+	started         bool // its start record was read (not a scan that began mid-turn)
+	start           int64
+	startLine       int64
+	teams           bool
+	inputIdentified bool
+	legacyInput     bool
+	decided         bool // the helper/local decision is known
+	finalSeen       bool
 	// prompted: a prompt record was read; early: decided by a commentary
 	// record of a turn without a prompt (a goal continuation, which Codex
 	// starts by itself), so a prompt steered into it later waits for its
@@ -255,7 +259,7 @@ func (t *Tracker) flush(out []Output) []Output {
 		return out
 	}
 	for _, o := range tr.pending {
-		if tr.teams {
+		if (tr.teams || o.helperInput) && !o.localPrompt {
 			var ok bool
 			if o, ok = t.kept(o); !ok {
 				continue
@@ -334,25 +338,39 @@ func (t *Tracker) apply(out []Output, ev Event, l Line) []Output {
 			t.turn = &openTurn{started: true, start: l.Off, startLine: t.line - 1}
 		}
 		if LegacyTeamsPrompt(text) {
-			t.turn.teams = true
+			t.turn.legacyInput = true
 		}
 		t.turn.prompted = true
-		if t.turn.early {
-			t.turn.decided, t.turn.early = false, false
-		}
-		o := Output{RecordID: ev.RecordID, Kind: OutputPrompt, User: true, Text: text, Time: ev.Time, End: l.End, line: t.line, start: l.Off}
+		t.turn.decided, t.turn.early = false, false
+		o := Output{helperInput: LegacyTeamsPrompt(text), RecordID: ev.RecordID, Kind: OutputPrompt, User: true, Text: text, Time: ev.Time, End: l.End, line: t.line, start: l.Off}
 		out = t.add(out, o, t.turn)
 	case KindUserItem:
 		tr := t.turn
 		if tr == nil {
 			return out
 		}
-		if ev.ClientID != "" && t.skip(ev.ClientID, tr.id) {
-			tr.teams = true
+		if ev.ClientID != "" {
+			own := t.skip(ev.ClientID, "")
+			steer := strings.HasPrefix(ev.ClientID, "cxp-steer-")
+			if !steer && ((own && !tr.inputIdentified) || tr.legacyInput) {
+				tr.teams = true
+			}
+			tr.legacyInput = false
+			tr.inputIdentified = true
+			for i := range tr.pending {
+				o := &tr.pending[i]
+				if o.User {
+					o.helperInput = o.helperInput || own
+					o.localPrompt = !o.helperInput && !t.skip(ev.ClientID, tr.id)
+				}
+			}
 		}
 		tr.decided = true
 		out = t.flush(out)
 	case KindAgentMessage:
+		if t.turn != nil && t.turn.legacyInput {
+			t.turn.teams = true
+		}
 		text := strings.TrimSpace(StripMemCitations(ev.Text)) // F-MIR-8
 		if text == "" {
 			return out

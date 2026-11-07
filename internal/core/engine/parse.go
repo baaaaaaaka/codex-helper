@@ -69,6 +69,7 @@ func (p parsed) isCommand() bool { return p.form != formText }
 
 // Canonical command names. Handlers are keyed by these (commands.go).
 const (
+	cmdQueue          = "queue"
 	cmdHelp           = "help"
 	cmdStatus         = "status"
 	cmdStats          = "stats"
@@ -180,6 +181,7 @@ var workNatural = map[string]string{
 	"fork":     cmdFork,
 	"restart":  cmdRestartName,
 	"shutdown": cmdShutdown, // control-only: answered with a pointer
+	"queue":    cmdQueue,
 	"goal":     cmdGoalName, // goalcmds.go (owner 2026-11-07); not after `codex`
 }
 
@@ -484,7 +486,7 @@ func webhookArgExplicit(arg string) bool {
 func workOnlyName(name string) bool {
 	switch name {
 	case "close", "retry", "cancel", "stop", "send-file", "send-image", "file", "image",
-		"publish-history", "sync-history", "import-history", "stats", "usage", "tokens", "goal":
+		"publish-history", "sync-history", "import-history", "stats", "usage", "tokens", "goal", "queue":
 		return true
 	}
 	return false

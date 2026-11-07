@@ -47,6 +47,9 @@ func (e *Engine) runnerLoop(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
+			if e.trySteer(ctx, id) {
+				continue
+			}
 			select {
 			case sem <- struct{}{}:
 			default:
@@ -219,7 +222,7 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 		// selector: v0.1.20's "default" model profile is the account
 		// default (modelcmds.go, batch B).
 		req = TurnRequest{ConvID: id, ThreadID: th.ThreadID, Cwd: th.Cwd, Model: selector(th.Model), Effort: th.Effort,
-			TurnKey: tr.TurnKey, Text: in.Body}
+			TurnKey: tr.TurnKey, Text: in.Body, Queue: tr.Queue}
 		if th.PendingModel != "" {
 			req.Model = selector(th.PendingModel)
 		}
@@ -352,6 +355,7 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 	touch := func() { rs.lastEvent.Store(ms(e.now())) }
 	touch()
 	hooks := TurnHooks{
+		Ready: func() { e.wakeRunner(id) },
 		Progress: func(text string) {
 			touch()
 			if strings.TrimSpace(text) != "" {
@@ -406,8 +410,13 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 		Started: func(codexTurnID string) {
 			touch()
 			accepted = true
-			e.mirrorSkipTurn(codexTurnID)
-			if err := e.update(func(tx *store.Tx) error { return tx.MarkRunning(tr.ID, codexTurnID) }); err != nil {
+			e.mu.Lock()
+			rs.codexTurnID = codexTurnID
+			e.mu.Unlock()
+			e.wakeRunner(id)
+			_, shared := e.ag.(TUIAgent)
+			e.mirrorSkipTurnMode(codexTurnID, shared)
+			if err := e.update(func(tx *store.Tx) error { return tx.MarkRunning(tr.ID, codexTurnID, shared) }); err != nil {
 				e.logf("mark running %s: %v", cs.label, err)
 			}
 		},
@@ -422,6 +431,19 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 	stopWatch()
 	if ctx.Err() != nil {
 		// Shutting down: nothing is recorded; the next start reconciles.
+		e.clearRun(id, rs)
+		return
+	}
+	if errors.Is(err, ErrBackendUncertain) {
+		e.mu.Lock()
+		cs.paused = true
+		e.mu.Unlock()
+		_ = e.update(func(tx *store.Tx) error {
+			if err := tx.Pause(id, "shared backend disconnected"); err != nil {
+				return err
+			}
+			return e.enqueueNotice(tx, id, fmt.Sprintf("turn:%d:unknown", tr.ID), "The connection to the shared Codex session was lost. The task may still be running in TUI. This chat is paused to avoid sending the request twice; close its TUI windows before restarting the helper to reconcile it.")
+		})
 		e.clearRun(id, rs)
 		return
 	}
@@ -928,12 +950,21 @@ func (e *Engine) cancelRunning(ctx context.Context, id int64) bool {
 // turns are the open turns as of the start, before any turn of this
 // process.
 func (e *Engine) reconcile(ctx context.Context, turns []store.Turn) {
-	sem := make(chan struct{}, e.cfg.Turns)
+
+	groups := map[int64][]store.Turn{}
+	var order []int64
 	for _, tr := range turns {
 		if tr.State == store.TurnQueued {
 			continue
 		}
-		cs := e.conv(tr.ConvID)
+		if len(groups[tr.ConvID]) == 0 {
+			order = append(order, tr.ConvID)
+		}
+		groups[tr.ConvID] = append(groups[tr.ConvID], tr)
+	}
+	sem := make(chan struct{}, e.cfg.Turns)
+	for _, id := range order {
+		cs := e.conv(id)
 		if cs == nil {
 			continue
 		}
@@ -942,13 +973,22 @@ func (e *Engine) reconcile(ctx context.Context, turns []store.Turn) {
 		case <-ctx.Done():
 			return
 		}
+		e.mu.Lock()
+		e.starting++
+		e.mu.Unlock()
 		e.wg.Add(1)
-		go func(tr store.Turn) {
+		go func(rows []store.Turn) {
 			defer e.wg.Done()
-			defer func() { <-sem }()
-			e.reconcileTurn(ctx, cs, tr)
-		}(tr)
+			defer func() { <-sem; e.mu.Lock(); e.starting--; e.mu.Unlock() }()
+			for _, tr := range rows {
+				if ctx.Err() != nil {
+					return
+				}
+				e.reconcileTurn(ctx, cs, tr)
+			}
+		}(groups[id])
 	}
+
 }
 
 func (e *Engine) reconcileTurn(ctx context.Context, cs *convState, tr store.Turn) {
@@ -977,6 +1017,7 @@ func (e *Engine) reconcileTurn(ctx context.Context, cs *convState, tr store.Turn
 		}
 	}
 	var out TurnOutcome
+	delivered := false
 	if threadID == "" {
 		out = TurnOutcome{NotStarted: true, Status: StatusFailed, Error: "no Codex thread yet"}
 		if e.awaitFirstRead(ctx, cs) {
@@ -991,6 +1032,9 @@ func (e *Engine) reconcileTurn(ctx context.Context, cs *convState, tr store.Turn
 			return
 		}
 		switch {
+		case err == nil && ok && tr.Steering:
+			delivered = true
+			out = found
 		case err == nil && !ok:
 			if tr.State == store.TurnRunning {
 				out = TurnOutcome{Status: StatusInterrupted, Error: "not found after restart"}
@@ -999,8 +1043,9 @@ func (e *Engine) reconcileTurn(ctx context.Context, cs *convState, tr store.Turn
 			}
 		case err == nil && found.Status != StatusInProgress:
 			out = found
-			if out.CodexTurnID != "" {
-				e.mirrorSkipTurn(out.CodexTurnID)
+			if out.CodexTurnID != "" && !tr.Steering {
+				_, shared := e.ag.(TUIAgent)
+				e.mirrorSkipTurnMode(out.CodexTurnID, shared)
 			}
 		case attempt >= 4:
 			if err != nil {
@@ -1022,6 +1067,12 @@ func (e *Engine) reconcileTurn(ctx context.Context, cs *convState, tr store.Turn
 		break
 	}
 	if !e.awaitFirstRead(ctx, cs) {
+		return
+	}
+	if tr.Steering && delivered {
+		if err := e.update(func(tx *store.Tx) error { return tx.FinishTurn(tr.ID, store.TurnCompleted, "", nil) }); err != nil {
+			e.logf("settle steer %d: %v", tr.ID, err)
+		}
 		return
 	}
 	e.finishReconciled(ctx, cs, tr, out)

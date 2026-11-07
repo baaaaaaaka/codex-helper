@@ -170,7 +170,7 @@ func TestBreakerIgnoresBacklogAfterGap(t *testing.T) {
 			tok := s.Token(fmt.Sprintf("q%d%d", i+1, k+1))
 			toks[i] = append(toks[i], tok)
 			at := stopped.Add(time.Duration(2*k+i+1) * 30 * time.Second)
-			if err := s.Graph.SeedMessage(chat, fmt.Sprint(at.UnixMilli()), at, "<p>"+html.EscapeString(fmt.Sprintf("Queued while down %d %s", k+1, tok))+"</p>"); err != nil {
+			if err := s.Graph.SeedMessage(chat, fmt.Sprint(at.UnixMilli()), at, "<p>"+html.EscapeString(fmt.Sprintf("helper queue Queued while down %d %s", k+1, tok))+"</p>"); err != nil {
 				t.Fatal(err)
 			}
 		}

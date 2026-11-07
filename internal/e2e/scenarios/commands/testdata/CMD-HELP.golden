@@ -130,6 +130,8 @@
    | <p>💬 Work chat<br>
    | Send your task as a regular Teams message. Messages starting with <code>helper</code> or <code>!</code> are helper commands.</p>
    | <p>Common commands:<br>
+   | Regular messages add input to the current task while it runs; otherwise they start a new task.<br>
+   | <code>helper queue &lt;prompt&gt;</code> - wait for a separate task (attachments supported)<br>
    | <code>helper status</code> or <code>!status</code> - check progress<br>
    | <code>helper stats</code> or <code>!stats</code> - show Codex token usage from the linked local history, grouped by model and service tier<br>
    | <code>helper file &lt;relative-path&gt;</code> or <code>!file &lt;relative-path&gt;</code> - upload a file prepared in the helper&#39;s Teams upload folder<br>
@@ -165,6 +167,7 @@
    | <code>helper goal</code> / <code>helper goal &lt;objective&gt;</code> / <code>helper goal active</code> / <code>helper goal pause</code> - show, set, resume or pause this chat&#39;s Codex goal (Codex keeps working on an active goal by itself; <code>helper cancel</code> pauses it)<br>
    | <code>helper publish-history</code> or <code>!ph</code> - import a paused local Codex history backlog<br>
    | <code>helper publish-history full</code> - publish the complete local Codex history once to this chat<br>
+   | <code>helper queue &lt;prompt&gt;</code> - enqueue a separate task; the prompt is kept as text, including helper commands<br>
    | advanced commands: <code>helper retry last</code>, <code>helper retry &lt;turn-id&gt;</code> / <code>!retry &lt;turn-id&gt;</code>, or <code>helper cancel last</code>, <code>helper cancel queued</code>, <code>helper cancel running</code>, <code>helper cancel all</code>, <code>helper cancel &lt;turn-id&gt;</code> / <code>!cancel &lt;turn-id&gt;</code><br>
    | Status words: <code>queued</code>/<code>running</code> means wait, <code>completed</code> means done, <code>failed</code> or <code>interrupted</code> means check recent messages and changed files before <code>helper retry last</code>.<br>
    | Other text, including unknown slash-prefixed text, is sent to Codex.</p>

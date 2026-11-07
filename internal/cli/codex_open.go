@@ -15,6 +15,8 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
+	"github.com/baaaaaaaka/codex-helper/internal/core/lease"
+	"github.com/baaaaaaaka/codex-helper/internal/core/tuilease"
 	"github.com/baaaaaaaka/codex-helper/internal/env"
 	"github.com/baaaaaaaka/codex-helper/internal/responsespolicy"
 )
@@ -296,13 +298,59 @@ func runCodexTUIInvocationViaBrokerWithHooks(
 		identityPath = nativePath
 	}
 	originalHash, hashErr := hashFileSHA256(identityPath)
+	verifyIdentity := func() error {
+		if hashErr != nil {
+			return nil
+		}
+		currentHash, err := hashFileSHA256(identityPath)
+		if err != nil {
+			return fmt.Errorf("verify original Codex binary after launch: %w", err)
+		}
+		if currentHash != originalHash {
+			return fmt.Errorf("original Codex binary changed while the session was running")
+		}
+		return nil
+	}
 
 	if err := prepareRuntimeMigration(store, paths, codexPath, log); err != nil {
 		return err
 	}
 	extraEnv := mergeCLIEnvironment(runtimeContract.Environment, codexHomeEnv(paths.CodexDir))
+	var shared *tuilease.Lease
+	attachShared := func() error {
+		if len(tuiTail) == 0 || (len(tuiTail) == 2 && tuiTail[0] == "resume") {
+			view, viewErr := teamsReadStoreView()
+			host, _ := teamsHostname()
+			if viewErr == nil && view.Remote == "" && view.Info.Exists && view.Info.Live(time.Now(), lease.ProductionStale) {
+				if len(tuiTail) == 0 {
+					shared, err = tuilease.AcquireNew(ctx, teamsTUIEndpointPath(view.Anchor, host), paths.CodexDir, cwd)
+					if err == nil && shared != nil {
+						if shared.Endpoint.ThreadID == "" {
+							_ = shared.Close()
+							return errors.New("shared backend omitted the new session id")
+						}
+						tuiTail = []string{"resume", shared.Endpoint.ThreadID}
+					}
+				} else {
+					shared, err = tuilease.Acquire(ctx, teamsTUIEndpointPath(view.Anchor, host), paths.CodexDir, tuiTail[1])
+				}
+				if err != nil {
+					return fmt.Errorf("attach to Teams Codex: %w", err)
+				}
+			}
+		}
+		return nil
+	}
+	if beforeBroker == nil {
+		if err := attachShared(); err != nil {
+			return err
+		}
+		if shared != nil {
+			defer shared.Close()
+		}
+	}
 	proxyURL := ""
-	if useProxy {
+	if useProxy && shared == nil {
 		proxyURL, err = codexAppEnsureProxyURLFn(ctx, store, *profile, instances, log)
 		if err != nil {
 			return err
@@ -366,6 +414,20 @@ func runCodexTUIInvocationViaBrokerWithHooks(
 		Timeout:          30 * time.Second,
 		ConfigureCommand: configureIdentity,
 	}
+	launchShared := func() error {
+		extraEnv = setEnvValue(extraEnv, codexrunner.RemoteBrokerAuthTokenEnv, shared.Endpoint.Token)
+		extraEnv = setEnvValue(extraEnv, envCodexSQLiteHome, remoteTUISQLiteHome)
+		args := append([]string{}, tuiGlobalArgs...)
+		args = append(args, "-c", codexRemoteTUIFeatureConfig, "--remote", shared.Endpoint.URL, "--remote-auth-token-env", codexrunner.RemoteBrokerAuthTokenEnv)
+		args = append(args, tuiTail...)
+		runErr := runTargetSupervisedWithOptions(ctx, append([]string{codexPath}, args...), "", nil, shared.Done, runTargetOptions{Cwd: cwd, ExtraEnv: extraEnv, PreserveTTY: true, ExecIdentity: paths.ExecIdentity, Log: log})
+		return errors.Join(runErr, verifyIdentity())
+	}
+
+	if shared != nil {
+		return launchShared()
+	}
+
 	if preflight != nil {
 		if err := preflight(ctx, launchContext, paths.ExecIdentity); err != nil {
 			return err
@@ -377,6 +439,13 @@ func runCodexTUIInvocationViaBrokerWithHooks(
 			return err
 		}
 		tuiTail = updatedTail
+		if err := attachShared(); err != nil {
+			return err
+		}
+		if shared != nil {
+			defer shared.Close()
+			return launchShared()
+		}
 	}
 	broker, err := codexrunner.StartRemoteBroker(ctx, codexrunner.RemoteBrokerOptions{
 		Starter:      starter,
@@ -408,13 +477,5 @@ func runCodexTUIInvocationViaBrokerWithHooks(
 	closeErr := broker.Close(shutdownCtx)
 	cancel()
 
-	var identityErr error
-	if hashErr == nil {
-		if currentHash, err := hashFileSHA256(identityPath); err != nil {
-			identityErr = fmt.Errorf("verify original Codex binary after launch: %w", err)
-		} else if currentHash != originalHash {
-			identityErr = fmt.Errorf("original Codex binary changed while the session was running")
-		}
-	}
-	return errors.Join(runErr, closeErr, identityErr)
+	return errors.Join(runErr, closeErr, verifyIdentity())
 }

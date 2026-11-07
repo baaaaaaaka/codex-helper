@@ -115,6 +115,7 @@ type InboundFile struct {
 
 // InboundMsg is one received message with its pure classification.
 type InboundMsg struct {
+	Queue    bool // explicit queue; ordinary messages may steer a running work turn
 	ExtMsgID string
 	ExtTime  int64
 	Sender   string
@@ -134,6 +135,7 @@ type Admitted struct {
 
 // Inbound is an inbound row.
 type Inbound struct {
+	Queue      bool
 	ID         int64
 	ConvID     int64
 	ExtMsgID   string
@@ -148,6 +150,8 @@ type Inbound struct {
 
 // Turn is a turns row.
 type Turn struct {
+	Queue         bool
+	Steering      bool
 	ID            int64
 	ConvID        int64
 	InboundID     int64

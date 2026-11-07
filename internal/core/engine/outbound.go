@@ -174,11 +174,19 @@ func underDir(dir, p string) error {
 // outbox row per file, and the problems to show. Runs outside any
 // transaction (file I/O).
 func (e *Engine) stageArtifacts(tr store.Turn, final string) (string, []store.OutMsg, []string) {
+	return e.stageArtifactsAt(tr.TurnKey, fmt.Sprint(tr.ID), fmt.Sprintf("turn:%d", tr.ID), final)
+}
+
+// Shared native executions have one stable output directory, independent of
+// how many Teams messages steer them. Mirror output uses its own delivery keys.
+func sharedOutputKey(turn string) string { return "cxp-shared-" + turn }
+
+func (e *Engine) stageArtifactsAt(turnKey, stagingID, deliveryPrefix, final string) (string, []store.OutMsg, []string) {
 	visible, blocks := manifestBlocks(transcript.StripMemCitations(final)) // F-MIR-8
 	if len(blocks) == 0 {
 		return visible, nil, nil
 	}
-	dir := e.outboundDir(tr.TurnKey)
+	dir := e.outboundDir(turnKey)
 	var arts []artifact
 	var problems []string
 	seen := map[string]bool{}
@@ -194,14 +202,14 @@ func (e *Engine) stageArtifacts(tr store.Turn, final string) (string, []store.Ou
 	}
 	var msgs []store.OutMsg
 	for i, a := range arts {
-		staged := filepath.Join(e.cfg.FilesDir, "send", fmt.Sprint(tr.ID), fmt.Sprint(i+1), a.name)
+		staged := filepath.Join(e.cfg.FilesDir, "send", stagingID, fmt.Sprint(i+1), a.name)
 		size, err := snapshot(a.src, staged)
 		if err != nil {
 			problems = append(problems, a.name+": "+err.Error())
 			continue
 		}
 		msgs = append(msgs, store.OutMsg{
-			DeliveryKey: fmt.Sprintf("turn:%d:file:%d", tr.ID, i+1), Kind: store.OutFinal,
+			DeliveryKey: fmt.Sprintf("%s:file:%d", deliveryPrefix, i+1), Kind: store.OutFinal,
 			File: &store.OutFile{LocalPath: staged, Size: size},
 		})
 	}

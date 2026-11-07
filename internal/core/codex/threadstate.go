@@ -71,6 +71,17 @@ func (s *Server) Info(threadID string) ThreadInfo {
 	return out
 }
 
+// ForgetTurn discards a stale task snapshot after a guarded steer was rejected.
+// A newer task notification is retained. The next ordinary turn/start still
+// makes its own atomic start-or-steer decision in the native server.
+func (s *Server) ForgetTurn(thread, expected string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if t := s.threads[thread]; t != nil && t.Turn == expected {
+		t.Turn = ""
+	}
+}
+
 // Running reports whether a turn runs in any thread of the server.
 func (s *Server) Running() bool {
 	s.mu.Lock()

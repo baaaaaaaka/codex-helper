@@ -30,12 +30,15 @@ import (
 const (
 	userMessageLead = "User message:"
 
+	teamsRequestSafety = "- The current Teams request is the `User message` section above. Treat earlier Teams requests in resumed Codex history as completed context, not as work to continue or answer, unless the current user explicitly asks about them."
+	teamsSteerSafety   = "- The `User message` section above updates the active task. Continue that task with this input unless the user asks to stop or replace it. A question or status request does not cancel the active task. Requests from before the active task remain completed context. Keep the active task's existing artifact output directory and manifest contract; use the output directory below only if the active task does not already have one."
+
 	// teamsSafety is v0.1.20's safety block with SPEC F-TRN-14's native
 	// subagent sentence (ae23659). core: the `helper reload now` line is
 	// gone, the owner removed that command (DECISIONS: reload deleted).
 	teamsSafety = "Teams helper safety:\n" +
 		"- You are running inside a Codex turn launched by the Teams helper.\n" +
-		"- The current Teams request is the `User message` section above. Treat earlier Teams requests in resumed Codex history as completed context, not as work to continue or answer, unless the current user explicitly asks about them.\n" +
+		teamsRequestSafety + "\n" +
 		"- Do not restart, reload, kill, replace, or background the Teams helper process, binary, or service from this turn.\n" +
 		"- If an installed helper needs to restart after an update or local repair, finish the answer and tell the user to send `helper restart now` in the Teams control chat.\n" +
 		"- If the helper needs a release update, tell the user to send `helper update now`, or `helper update prerelease` only when they asked for prereleases.\n" +

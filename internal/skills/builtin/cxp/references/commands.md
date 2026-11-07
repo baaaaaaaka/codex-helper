@@ -105,7 +105,9 @@ Control chat commands (a leading `helper` is accepted too):
 
 Work chat commands:
 
-- Regular text, files and voice messages: sent to Codex (voice is transcribed locally).
+- Regular text, files and voice messages: start a task when idle, or add instructions to the active task immediately (steer). Voice is transcribed locally first.
+- `helper queue <prompt>`: run a separate task after the current one. Regular messages can still steer while queued tasks wait.
+- With the local helper running, create or resume through `cxp tui` to share the native backend with Teams. Closing the TUI leaves its task running; updates wait for attached windows to close. Existing independent Codex windows must be closed and reopened to join that backend.
 - `helper cancel` / `helper cancel last`: cancel the newest queued request (or the running one when none is queued); `helper cancel queued`, `helper cancel running`, `helper cancel all`, `helper cancel <turn-id>` (`!cancel <turn-id>`). The reply names the cancelled prompt and what is still queued.
 - `helper retry`: run the last ignored duplicate request again; `helper retry last` runs the last failed, interrupted, not-started or cancelled request again; `helper retry <turn-id>` (`!retry <turn-id>`) runs that one again. A request is never retried automatically.
 - `helper unpause`: resume auto-start after a pause (held requests are not run).

@@ -51,19 +51,19 @@
    | <p>Running job E2E-CANCELCMDS-run-1</p>
 -- <msg:4> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>Queued job E2E-CANCELCMDS-q1-2</p>
+   | <p>helper queue Queued job E2E-CANCELCMDS-q1-2</p>
    edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Queued job E2E-CANCELCMDS-q1-2</p>
+   | <p>helper queue Queued job E2E-CANCELCMDS-q1-2</p>
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
 -- <msg:6> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>Queued job E2E-CANCELCMDS-q2-3</p>
+   | <p>helper queue Queued job E2E-CANCELCMDS-q2-3</p>
    edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Queued job E2E-CANCELCMDS-q2-3</p>
+   | <p>helper queue Queued job E2E-CANCELCMDS-q2-3</p>
 -- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>⏳ <strong>Queued.</strong> Your request will run after the current one finishes.</p>
@@ -71,10 +71,10 @@
    | <p>To cancel it: <code>helper cancel</code> (cancels the newest queued request). To interrupt the running one: <code>helper cancel running</code>.</p>
 -- <msg:8> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>Queued job E2E-CANCELCMDS-q3-4</p>
+   | <p>helper queue Queued job E2E-CANCELCMDS-q3-4</p>
    edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Queued job E2E-CANCELCMDS-q3-4</p>
+   | <p>helper queue Queued job E2E-CANCELCMDS-q3-4</p>
 -- <msg:9> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>⏳ <strong>Queued.</strong> Your request will run after the current one finishes, behind 1 other queued request.</p>

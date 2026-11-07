@@ -449,21 +449,28 @@ func (e *Engine) runCodexUpgrade(ctx context.Context, req codexRequest) {
 // It reports whether the engine is idle; on false the hold is lifted
 // (unless the engine is stopping).
 func (e *Engine) drain(ctx context.Context, limit time.Duration) bool {
-	e.drainFlag.Store(true)
-	wake(e.registryWake)
 	deadline := time.NewTimer(limit)
 	defer deadline.Stop()
 	tick := time.NewTicker(e.t.Tick)
 	defer tick.Stop()
 	for {
-		if !e.busy() {
+		e.mu.Lock()
+		// Keep serving while a TUI is open. Once the last lease closes,
+		// closing admission and entering drain are one atomic decision.
+		if e.tuiLeases == 0 {
+			e.drainFlag.Store(true)
+		}
+		admitted := e.draining()
+		e.mu.Unlock()
+		wake(e.registryWake)
+		if admitted && !e.busy() {
 			return true
 		}
 		select {
 		case <-ctx.Done():
 			return false
 		case <-deadline.C:
-			if !e.busy() {
+			if e.draining() && !e.busy() {
 				return true
 			}
 			e.undrain()
@@ -482,9 +489,12 @@ func (e *Engine) undrain() {
 
 // busy reports whether a turn runs or is being started.
 func (e *Engine) busy() bool {
+	if a, ok := e.ag.(TUIAgent); ok && a.Active() {
+		return true
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.starting > 0 {
+	if e.starting > 0 || e.tuiLeases > 0 {
 		return true
 	}
 	for _, cs := range e.convs {

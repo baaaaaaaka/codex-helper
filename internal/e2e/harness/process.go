@@ -301,6 +301,10 @@ func (s *ProcessSUT) start(wantIntent int) error {
 	fmt.Fprintf(&s.out, "=== e2e: starting %s ===\n", tag)
 
 	cmd := exec.Command(s.spec.Binary, s.spec.Args...)
+	// Shared native backends survive a helper crash until the next helper
+	// reconciles their PID records. They can still hold inherited log pipes;
+	// do not wait for their EOF before allowing that recovery to start.
+	cmd.WaitDelay = time.Second
 	if s.spec.Env != nil {
 		cmd.Env = s.spec.Env(tag)
 	}

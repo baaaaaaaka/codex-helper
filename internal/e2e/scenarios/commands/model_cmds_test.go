@@ -387,6 +387,14 @@ func TestModelShownIsTheModelRun(t *testing.T) {
 	s.Check("after a switch the turn and its footer follow the chat's model and effort", ok && m.Model == "gpt-5-mini" && m.Effort == "low" &&
 		strings.HasPrefix(f, "Helper: model - gpt-5-mini, effort - low,"), "gpt-5-mini, low", fmt.Sprintf("model=%q effort=%q footer %s", m.Model, m.Effort, clip(f, 200)))
 
+	// The answer and its control notification use independent outbox rows.
+	// Wait for both Work completions before recording the control exchange;
+	// their ordering against a later user message is otherwise scheduler-dependent.
+	s.Require("both Work completion notices are delivered", 15*time.Second, func() (bool, string) {
+		n := len(s.SUTMessagesContaining(control.ID, "✅ Codex finished"))
+		return n == 2, fmt.Sprint(n)
+	})
+
 	expect(s, control.ID, "model", "Chat: Control", "Effective: Codex Official (`gpt-5-codex`)", "Effective effort: `low` (helper fallback)")
 	q, ok := askControl(s, control.ID, "ctl")
 	s.Check("a control question runs with the Control chat's model and effort", ok && q.Model == "gpt-5-codex" && q.Effort == "low",

@@ -57,7 +57,7 @@
    | <p>⚠️ Codex did not start because the helper process could not find its Node.js runtime.</p>
    | <p>No user work ran or was duplicated. An administrator should repair or update CXP, then send <code>helper retry last</code> here.</p>
    | <p>Diagnostic for the admin:<br>
-   | Codex could not be started: codex: initialize: codex: app-server exited (app-server stderr: …: &#39;node&#39;: No such file or directory)</p>
+   | Codex could not be started: codex: shared app-server exited before listening: exit status 127 (app-server stderr: …: &#39;node&#39;: No such file or directory)</p>
 -- <msg:6> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper retry last</p>

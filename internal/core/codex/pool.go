@@ -479,3 +479,15 @@ func KillStale(pidFile string, wait time.Duration) (killed int, err error) {
 	}
 	return len(targets), nil
 }
+
+// Running reports native work, including TUI turns and goal continuations.
+func (p *Pool) Running() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, e := range p.servers {
+		if e.srv != nil && !e.srv.Exited() && e.srv.Running() {
+			return true
+		}
+	}
+	return false
+}

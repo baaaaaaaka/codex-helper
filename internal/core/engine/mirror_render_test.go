@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -88,5 +90,39 @@ func TestMirrorRendersV0120Labels(t *testing.T) {
 		if !strings.Contains(content(long[0].Body), "看一下下面这份反馈报告") {
 			t.Fatal("first part lost the record's first line")
 		}
+	}
+}
+
+func TestSharedNativeAnswerStagesSteeredArtifacts(t *testing.T) {
+	ad, err := teams.New(teams.Config{Tokens: fidelityTokens{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := &Engine{ch: ad, cfg: Config{FilesDir: t.TempDir()}}
+	root := e.outboundDir(sharedOutputKey("native-turn"))
+	if err = os.MkdirAll(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(filepath.Join(root, "result.txt"), []byte("result"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	o := transcript.Output{Kind: transcript.OutputFinal, RecordID: "answer", TurnID: "native-turn", Text: "Done.\n```codex-helper-artifacts\n{\"version\":1,\"files\":[{\"path\":\"result.txt\",\"name\":\"result.txt\"}]}\n```"}
+	msgs, err := e.renderMirror(context.Background(), "thread", o, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 2 || msgs[1].File == nil {
+		t.Fatalf("artifact was not staged: %+v", msgs)
+	}
+	if strings.Contains(msgs[0].Body, artifactFence) {
+		t.Fatal("manifest was exposed in visible answer")
+	}
+	data, err := os.ReadFile(msgs[1].File.LocalPath)
+	if err != nil || string(data) != "result" {
+		t.Fatalf("snapshot: %q %v", data, err)
+	}
+	again, err := e.renderMirror(context.Background(), "thread", o, true)
+	if err != nil || again[1].DeliveryKey != msgs[1].DeliveryKey {
+		t.Fatal("artifact delivery is not idempotent")
 	}
 }

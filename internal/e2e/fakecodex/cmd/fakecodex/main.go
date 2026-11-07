@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakecodex"
@@ -56,7 +57,7 @@ func main() {
 			log = io.MultiWriter(os.Stderr, f)
 		}
 	}
-	err := fakecodex.Serve(fakecodex.Config{
+	cfg := fakecodex.Config{
 		In:          os.Stdin,
 		Out:         os.Stdout,
 		Log:         log,
@@ -66,7 +67,27 @@ func main() {
 		Kind:        kind,
 		Instance:    os.Getenv(fakecodex.EnvInstance),
 		CodexHome:   codexHome,
-	})
+	}
+	var listen, tokenFile string
+	for i := 1; i < len(args)-1; i++ {
+		if args[i] == "--listen" {
+			listen = args[i+1]
+		}
+		if args[i] == "--ws-token-file" {
+			tokenFile = args[i+1]
+		}
+	}
+	var err error
+	if strings.HasPrefix(listen, "ws://") {
+		token, readErr := os.ReadFile(tokenFile)
+		if readErr != nil {
+			err = readErr
+		} else {
+			err = fakecodex.ServeWebsocket(cfg, strings.TrimPrefix(listen, "ws://"), string(token))
+		}
+	} else {
+		err = fakecodex.Serve(cfg)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "fakecodex: %v\n", err)
 		os.Exit(1)

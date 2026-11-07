@@ -32,6 +32,8 @@ type Config struct {
 	// OnServerRequest answers app-server initiated requests; nil uses
 	// AutoApprove and rejects everything else.
 	OnServerRequest func(method string, params json.RawMessage) (json.RawMessage, bool, error)
+	// IgnoreServerRequest leaves requests to an attached native TUI.
+	IgnoreServerRequest func(json.RawMessage) bool
 	// Configure, when set, adjusts the command before it starts (the
 	// caller's environment and execution identity); an error fails Start.
 	Configure func(cmd *exec.Cmd) error
@@ -40,6 +42,10 @@ type Config struct {
 	// Pool.AcquireCurrent replaces an idle server started before it
 	// changed. "" = not watched.
 	ConfigFile string
+	// SharedDir enables native authenticated WebSocket clients. Empty keeps stdio.
+	SharedDir string
+	// SecureSharedFile applies the launch identity to private endpoint files.
+	SecureSharedFile func(string) error
 }
 
 // ErrExited is returned for calls on (or turns of) a server that exited.
@@ -63,23 +69,28 @@ type Notification struct {
 
 // Server is one running app-server process.
 type Server struct {
-	cfg Config
-	cmd *exec.Cmd
-	pid int
+	cfg         Config
+	waitProcess func() error // shared startup observes process exit before RPC connects
+	cmd         *exec.Cmd
+	pid         int
+	endpoint    Endpoint
+	cleanup     func()
 
 	wmu sync.Mutex
 	in  io.WriteCloser
 
-	mu      sync.Mutex
-	nextID  int64
-	pending map[int64]chan rpcResult
-	subs    map[string]map[int]func(Notification)
-	threads map[string]*ThreadInfo // threadstate.go
-	subSeq  int
-	exitErr error
+	mu             sync.Mutex
+	serverRequests map[string]wireMsg // requests awaiting a TUI or helper answer
+	nextID         int64
+	pending        map[int64]chan rpcResult
+	subs           map[string]map[int]func(Notification)
+	threads        map[string]*ThreadInfo // threadstate.go
+	subSeq         int
+	exitErr        error
 
-	done chan struct{} // closed after the process exited and the reader stopped
-	wg   sync.WaitGroup
+	fault chan struct{}
+	done  chan struct{} // closed after the process exited and the reader stopped
+	wg    sync.WaitGroup
 }
 
 type rpcResult struct {
@@ -121,6 +132,9 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 			return nil, fmt.Errorf("codex: prepare app-server: %w", err)
 		}
 	}
+	if cfg.SharedDir != "" {
+		return startShared(ctx, cfg, cmd, startErr)
+	}
 	in, err := cmd.StdinPipe()
 	if err != nil {
 		return nil, err
@@ -135,7 +149,7 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 	s := &Server{
 		cfg: cfg, cmd: cmd, pid: cmd.Process.Pid, in: in,
 		pending: map[int64]chan rpcResult{}, subs: map[string]map[int]func(Notification){},
-		done: make(chan struct{}),
+		done: make(chan struct{}), fault: make(chan struct{}),
 	}
 	go s.readLoop(out)
 	if err := s.initialize(ctx); err != nil {
@@ -318,7 +332,13 @@ func (s *Server) readLoop(out io.Reader) {
 			break
 		}
 	}
-	werr := s.cmd.Wait()
+	s.failPending()
+	var werr error
+	if s.waitProcess != nil {
+		werr = s.waitProcess()
+	} else {
+		werr = s.cmd.Wait()
+	}
 	s.wg.Wait() // server-request answers in flight
 	s.mu.Lock()
 	if werr == nil {
@@ -331,6 +351,9 @@ func (s *Server) readLoop(out io.Reader) {
 	for _, ch := range pend {
 		ch <- rpcResult{err: ErrExited}
 	}
+	if s.cleanup != nil {
+		s.cleanup()
+	}
 	close(s.done)
 }
 
@@ -342,6 +365,12 @@ func (s *Server) handleLine(line []byte) {
 	}
 	switch {
 	case m.Method != "" && len(m.ID) > 0:
+		s.mu.Lock()
+		if s.serverRequests == nil {
+			s.serverRequests = map[string]wireMsg{}
+		}
+		s.serverRequests[string(m.ID)] = m
+		s.mu.Unlock()
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
@@ -352,6 +381,16 @@ func (s *Server) handleLine(line []byte) {
 			ThreadID string `json:"threadId"`
 		}
 		_ = json.Unmarshal(m.Params, &p)
+		if m.Method == "serverRequest/resolved" {
+			var resolved struct {
+				RequestID json.RawMessage `json:"requestId"`
+			}
+			if json.Unmarshal(m.Params, &resolved) == nil {
+				s.mu.Lock()
+				delete(s.serverRequests, string(resolved.RequestID))
+				s.mu.Unlock()
+			}
+		}
 		s.track(m.Method, p.ThreadID, m.Params)
 		n := Notification{Method: m.Method, Params: m.Params}
 		s.mu.Lock()
@@ -389,6 +428,16 @@ func (s *Server) handleLine(line []byte) {
 }
 
 func (s *Server) answer(m wireMsg) {
+	if s.cfg.IgnoreServerRequest != nil && s.cfg.IgnoreServerRequest(m.Params) {
+		return
+	}
+	s.mu.Lock()
+	_, pending := s.serverRequests[string(m.ID)]
+	delete(s.serverRequests, string(m.ID))
+	s.mu.Unlock()
+	if !pending {
+		return
+	} // another client resolved it, or detach already answered
 	handler := s.cfg.OnServerRequest
 	if handler == nil {
 		handler = AutoApprove
@@ -408,16 +457,18 @@ func (s *Server) answer(m wireMsg) {
 	}
 }
 
-// Close ends the server: stdin is closed (Codex exits on EOF), then the
-// process group is terminated after grace and killed 2 s later.
+// Close ends the server. Stdio gets an EOF grace period; a shared backend
+// needs an explicit termination signal because client disconnect is not exit.
 func (s *Server) Close(grace time.Duration) {
 	s.wmu.Lock()
 	_ = s.in.Close()
 	s.wmu.Unlock()
-	select {
-	case <-s.done:
-		return
-	case <-time.After(grace):
+	if s.endpoint.URL == "" {
+		select {
+		case <-s.done:
+			return
+		case <-time.After(grace):
+		}
 	}
 	_ = terminateGroup(s.pid)
 	select {
@@ -450,4 +501,28 @@ func IsActiveWriter(err error) bool {
 	}
 	low := strings.ToLower(re.Message)
 	return strings.Contains(low, "active writer") || strings.Contains(low, "in use by another")
+}
+
+func (s *Server) failPending() {
+	s.mu.Lock()
+	s.exitErr = ErrExited
+	pend := s.pending
+	s.pending = map[int64]chan rpcResult{}
+	s.mu.Unlock()
+	for _, ch := range pend {
+		ch <- rpcResult{err: ErrExited}
+	}
+	if s.fault != nil {
+		close(s.fault)
+	}
+}
+
+// Disconnected reports loss of the helper RPC connection, even if native TUI clients remain.
+func (s *Server) Disconnected() bool {
+	select {
+	case <-s.fault:
+		return true
+	default:
+		return false
+	}
 }

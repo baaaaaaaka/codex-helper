@@ -166,7 +166,7 @@ func (s *Server) RecentTurns(ctx context.Context, threadID string, limit int) ([
 func (s *Server) FindTurn(ctx context.Context, threadID, clientID string) (Turn, bool, error) {
 	if turns, err := s.RecentTurns(ctx, threadID, 20); err == nil {
 		for _, t := range turns {
-			if t.ClientID() == clientID {
+			if t.HasClientID(clientID) {
 				return t, true, nil
 			}
 		}
@@ -176,7 +176,7 @@ func (s *Server) FindTurn(ctx context.Context, threadID, clientID string) (Turn,
 		return Turn{}, false, err
 	}
 	for i := len(th.Turns) - 1; i >= 0; i-- {
-		if th.Turns[i].ClientID() == clientID {
+		if th.Turns[i].HasClientID(clientID) {
 			return th.Turns[i], true, nil
 		}
 	}
@@ -197,18 +197,15 @@ type TurnStartParams struct {
 	Cwd      string
 	Model    string
 	Effort   string
+	// Queue starts this input only when the native thread is idle.
+	Queue          bool
+	Queued         func(id string)
+	QueueCancelled <-chan struct{}
 }
 
 // TurnStart starts a turn and returns its id.
 func (s *Server) TurnStart(ctx context.Context, p TurnStartParams) (string, error) {
-	var input []any
-	for _, in := range p.Input {
-		if in.Image != "" {
-			input = append(input, map[string]any{"type": "localImage", "path": in.Image})
-		} else {
-			input = append(input, map[string]any{"type": "text", "text": in.Text, "text_elements": []any{}})
-		}
-	}
+	input := inputs(p.Input)
 	params := map[string]any{"threadId": p.ThreadID, "input": input}
 	if p.ClientID != "" {
 		params["clientUserMessageId"] = p.ClientID
@@ -272,4 +269,13 @@ func (s *Server) Models(ctx context.Context) ([]Model, error) {
 	}
 	err := s.Call(ctx, "model/list", map[string]any{}, &res)
 	return res.Data, err
+}
+
+func (t Turn) HasClientID(id string) bool {
+	for _, it := range t.Items {
+		if it.Type == "userMessage" && it.ClientID == id {
+			return true
+		}
+	}
+	return false
 }

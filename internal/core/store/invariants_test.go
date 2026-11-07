@@ -52,7 +52,7 @@ func TestOpenCreatesSchemaAndRefusesForeignVersions(t *testing.T) {
 	// A newer schema is refused, by writers and readers.
 	s3, err := OpenWith(path, Options{Now: c.now})
 	mustT(t, err)
-	_, err = s3.w.Exec(`PRAGMA user_version = 2`)
+	_, err = s3.w.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, SchemaVersion+1))
 	mustT(t, err)
 	s3.Close()
 	_, err = OpenWith(path, Options{Now: c.now})

@@ -29,6 +29,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/core/migrate"
 	"github.com/baaaaaaaka/codex-helper/internal/core/skillcmd"
 	corestore "github.com/baaaaaaaka/codex-helper/internal/core/store"
+	"github.com/baaaaaaaka/codex-helper/internal/core/tuilease"
 	"github.com/baaaaaaaka/codex-helper/internal/core/voice"
 )
 
@@ -466,7 +467,9 @@ func serveTeamsNewCore(ctx context.Context, out, errOut io.Writer, root *rootOpt
 		Env:  []string{"CODEX_HOME=" + paths.CodexDir},
 		// A changed config.toml (e.g. MCP servers) applies from the next
 		// turn: the conversation's idle app-server is replaced.
-		ConfigFile: filepath.Join(paths.CodexDir, "config.toml"),
+		ConfigFile:       filepath.Join(paths.CodexDir, "config.toml"),
+		SharedDir:        dir,
+		SecureSharedFile: func(path string) error { return ensurePathOwnedByIdentity(path, paths.ExecIdentity) },
 	}
 	extra, err := teamsNewCoreCodexArgs(opts.codexArgs, errOut)
 	if err != nil {
@@ -577,6 +580,11 @@ func serveTeamsNewCore(ctx context.Context, out, errOut io.Writer, root *rootOpt
 	go func() { defer close(published); publisher.run(runCtx) }()
 	defer func() { cancelRun(); <-published }() // before the store closes
 	stamper := &teamsPollStamper{dir: dir, host: host, version: cfg.Version, lastRead: func() time.Time { return e.Snapshot().LastRead }}
+	tuiServer, err := tuilease.Listen(teamsTUIEndpointPath(anchor, host), paths.CodexDir, e, func(path string) error { return ensurePathOwnedByIdentity(path, paths.ExecIdentity) })
+	if err != nil {
+		return err
+	}
+	defer tuiServer.Close()
 	requests := newTeamsCLIRequests(runCtx, anchor, e, errOut)
 	defer func() { cancelRun(); requests.wait(10 * time.Second) }() // before the store closes
 	go notifier.watch(runCtx, stamper.tick, requests.tick)

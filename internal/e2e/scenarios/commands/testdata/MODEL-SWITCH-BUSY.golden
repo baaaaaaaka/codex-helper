@@ -84,10 +84,10 @@
    | The running turn keeps its model.</p>
 -- <msg:7> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>Next task E2E-MODELSWITCHBUSY-queued-2</p>
+   | <p>helper queue Next task E2E-MODELSWITCHBUSY-queued-2</p>
    edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Next task E2E-MODELSWITCHBUSY-queued-2</p>
+   | <p>helper queue Next task E2E-MODELSWITCHBUSY-queued-2</p>
 -- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>⏳ <strong>Queued.</strong> Your request will run after the current one finishes.</p>

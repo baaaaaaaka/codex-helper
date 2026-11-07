@@ -79,7 +79,7 @@ func TestCancelCommands(t *testing.T) {
 	s.WaitCodexCalls(run, 1, steps.AnswerTimeout)
 	for _, q := range []string{q1, q2, q3} {
 		seq := s.Graph.LastSeq()
-		steps.MustPost(s, work.ID, "Queued job "+q)
+		steps.MustPost(s, work.ID, "helper queue Queued job "+q)
 		s.WaitFor("queued ACK for "+q, steps.CommandTimeout, func() (bool, string) {
 			for _, m := range s.SUTMessages(work.ID) {
 				if m.RequestSeq > seq {
@@ -209,11 +209,11 @@ func TestRetryCommands(t *testing.T) {
 	s.WaitCodexCalls(lost, 1, steps.AnswerTimeout)
 	s.Settle(2*time.Second, 8*time.Second)
 	s.CrashSUT()
+	s.StartSUT() // recovery terminates the previous shared backend
 	s.Require("Codex lost the turn with the helper", 15*time.Second, func() (bool, string) {
 		c := s.Codex.CallsWithToken(lost)[0]
 		return c.Outcome != "running", c.Outcome
 	})
-	s.StartSUT()
 	notice, okNotice := s.WaitSUTMessage(work.ID, "Codex request interrupted", 45*time.Second)
 	noticeText := harness.NormalizeSpace(notice.PlainText())
 	s.Check("F-TRN-5 the interrupted prompt gets one notice naming `helper retry last`", okNotice && strings.Contains(noticeText, "helper retry last") && !strings.Contains(noticeText, "resend it."),

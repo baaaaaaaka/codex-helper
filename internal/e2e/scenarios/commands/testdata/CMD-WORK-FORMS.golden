@@ -128,6 +128,8 @@
    | <p>💬 Work chat<br>
    | Send your task as a regular Teams message. Messages starting with <code>helper</code> or <code>!</code> are helper commands.</p>
    | <p>Common commands:<br>
+   | Regular messages add input to the current task while it runs; otherwise they start a new task.<br>
+   | <code>helper queue &lt;prompt&gt;</code> - wait for a separate task (attachments supported)<br>
    | <code>helper status</code> or <code>!status</code> - check progress<br>
    | <code>helper stats</code> or <code>!stats</code> - show Codex token usage from the linked local history, grouped by model and service tier<br>
    | <code>helper file &lt;relative-path&gt;</code> or <code>!file &lt;relative-path&gt;</code> - upload a file prepared in the helper&#39;s Teams upload folder<br>
@@ -232,6 +234,8 @@
    | <p>💬 Work chat<br>
    | Send your task as a regular Teams message. Messages starting with <code>helper</code> or <code>!</code> are helper commands.</p>
    | <p>Common commands:<br>
+   | Regular messages add input to the current task while it runs; otherwise they start a new task.<br>
+   | <code>helper queue &lt;prompt&gt;</code> - wait for a separate task (attachments supported)<br>
    | <code>helper status</code> or <code>!status</code> - check progress<br>
    | <code>helper stats</code> or <code>!stats</code> - show Codex token usage from the linked local history, grouped by model and service tier<br>
    | <code>helper file &lt;relative-path&gt;</code> or <code>!file &lt;relative-path&gt;</code> - upload a file prepared in the helper&#39;s Teams upload folder<br>
@@ -257,6 +261,8 @@
    | <p>💬 Work chat<br>
    | Send your task as a regular Teams message. Messages starting with <code>helper</code> or <code>!</code> are helper commands.</p>
    | <p>Common commands:<br>
+   | Regular messages add input to the current task while it runs; otherwise they start a new task.<br>
+   | <code>helper queue &lt;prompt&gt;</code> - wait for a separate task (attachments supported)<br>
    | <code>helper status</code> or <code>!status</code> - check progress<br>
    | <code>helper stats</code> or <code>!stats</code> - show Codex token usage from the linked local history, grouped by model and service tier<br>
    | <code>helper file &lt;relative-path&gt;</code> or <code>!file &lt;relative-path&gt;</code> - upload a file prepared in the helper&#39;s Teams upload folder<br>

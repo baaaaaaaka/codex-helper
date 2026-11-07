@@ -91,7 +91,8 @@ type convState struct {
 	seen      map[string]time.Time // ext ids admitted or classified recently
 
 	// runner
-	running *runState
+	running  *runState
+	steering bool
 	// lastTurnEnd is when a started turn of this conversation last ended:
 	// a queued turn admitted before it waited behind it (R-35).
 	lastTurnEnd time.Time
@@ -120,9 +121,11 @@ type recentPrompt struct {
 
 // runState is a turn being executed.
 type runState struct {
-	turnID    int64
-	turnKey   string
-	cancelled bool
+	codexTurnID  string
+	steerExpired bool
+	turnID       int64
+	turnKey      string
+	cancelled    bool
 	// lastEvent is the unix ms of the last Codex event (silence tracking).
 	lastEvent atomic.Int64
 	done      chan struct{}

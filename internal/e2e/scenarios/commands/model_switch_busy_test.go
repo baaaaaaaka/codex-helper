@@ -46,7 +46,7 @@ func TestModelSwitchWhileBusy(t *testing.T) {
 		"\"Model profile switched … The running turn keeps its model.\"", clip(norm, 300))
 
 	queued := s.Token("queued")
-	steps.MustPost(s, work.ID, "Next task "+queued)
+	steps.MustPost(s, work.ID, "helper queue Next task "+queued)
 	s.Poll(4*time.Second, func() bool { return len(s.Codex.CallsWithToken(queued)) > 0 })
 	early := len(s.Codex.CallsWithToken(queued))
 	s.Codex.Release(s.Codex.CallsWithToken(running)[0].Seq)

@@ -91,7 +91,7 @@ func scanThread(sc scanner) (Thread, error) {
 	return t, err
 }
 
-const inboundCols = `id,conv_id,ext_msg_id,ext_time,received_at,sender,kind,state,body,turn_id`
+const inboundCols = `id,conv_id,ext_msg_id,ext_time,received_at,sender,kind,state,body,turn_id,queued_only`
 
 func scanInbound(sc scanner) (Inbound, error) {
 	var in Inbound
@@ -106,11 +106,12 @@ func scanInbound(sc scanner) (Inbound, error) {
 	p.raw(&in.State)
 	p.str(&in.Body)
 	p.int(&in.TurnID)
+	p.raw(&in.Queue)
 	err := p.scan(sc)
 	return in, err
 }
 
-const turnCols = `id,conv_id,inbound_id,turn_key,state,thread_id,codex_turn_id,model,effort,attempt,retry_deadline,queued_at,started_at,finished_at,error`
+const turnCols = `id,conv_id,inbound_id,turn_key,state,thread_id,codex_turn_id,model,effort,attempt,retry_deadline,queued_at,started_at,finished_at,error,queued_only,steering`
 
 func scanTurn(sc scanner) (Turn, error) {
 	var t Turn
@@ -130,6 +131,8 @@ func scanTurn(sc scanner) (Turn, error) {
 	p.int(&t.StartedAt)
 	p.int(&t.FinishedAt)
 	p.str(&t.Error)
+	p.raw(&t.Queue)
+	p.raw(&t.Steering)
 	err := p.scan(sc)
 	return t, err
 }

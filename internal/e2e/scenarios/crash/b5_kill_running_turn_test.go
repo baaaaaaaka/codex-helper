@@ -12,8 +12,9 @@ import (
 )
 
 // B-5 (CLEANUP-PLAN §8.1), R-5b, R-32, R-33: kill -9 of the helper while
-// turns are in three different states, then restart. Real Codex drops a
-// turn when its client dies (FIDELITY C4), and so does the fake by default:
+// turns are in three different states, then restart. A disconnected shared
+// backend may survive until parent-death cleanup or the next helper stops
+// its recorded group. Recovery must reconcile these turns without replay:
 //
 //	chat X: turn running and already streaming progress (commentary)
 //	                                  -> interrupted: exactly one
@@ -28,10 +29,6 @@ import (
 // thread. The scenario also records whether the helper gives Codex a Teams
 // turn key (turn/start clientUserMessageId, or a Teams id in the input)
 // that would let it match turns after a restart.
-//
-// (Until M3 chat X used the fake's SurviveHelper knob, a Codex that
-// finishes the turn after its client died; real Codex never does, so no
-// scenario depends on it.)
 func TestB5_KillDuringRunningTurn(t *testing.T) {
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "B-5", harness.Options{
@@ -74,12 +71,12 @@ func TestB5_KillDuringRunningTurn(t *testing.T) {
 	s.Settle(2*time.Second, 8*time.Second) // X's progress reaches the chat
 	s.CrashSUT()
 	killedAt := time.Now()
-	s.Codex.Release(s.Codex.CallsWithToken(tokZ)[0].Seq)
+	s.StartSUT() // recovery kills the previous shared backends before lookup
 	s.Require("Codex lost X and Y and never started Z", 15*time.Second, func() (bool, string) {
 		x, y, z := s.Codex.CallsWithToken(tokX)[0], s.Codex.CallsWithToken(tokY)[0], s.Codex.CallsWithToken(tokZ)[0]
 		return x.Outcome != "running" && y.Outcome != "running" && z.Outcome != "running", "X=" + x.Outcome + " Y=" + y.Outcome + " Z=" + z.Outcome
 	})
-	s.StartSUT()
+	s.Codex.Release(s.Codex.CallsWithToken(tokZ)[0].Seq)
 
 	// R-33 / B-5: each chat reaches a visible terminal state for its turn.
 	s.WaitFor("each chat shows the outcome of its killed turn", 45*time.Second, func() (bool, string) {

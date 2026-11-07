@@ -96,6 +96,9 @@ func hotCycle(t *testing.T, s *Store, c *clock, a int64) func(i int) {
 			if err != nil || len(adm) == 0 {
 				return err
 			}
+			if _, _, err := tx.NextSteer(a); err != nil {
+				return err
+			}
 			next, ok, err := tx.NextRunnable(a)
 			if err != nil || !ok {
 				return err

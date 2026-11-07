@@ -85,9 +85,9 @@ func (t *Tx) AdmitWindow(streamKey string, convID int64, msgs []InboundMsg, newC
 		}
 		state := inboundState(m, conv.PausedAt != 0)
 		var id int64
-		err := t.row(`INSERT INTO inbound(conv_id,ext_msg_id,ext_time,received_at,sender,kind,state,body)
-VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(conv_id, ext_msg_id) DO NOTHING RETURNING id`,
-			convID, m.ExtMsgID, m.ExtTime, t.now, m.Sender, m.Kind, state, nullStr(m.Body)).Scan(&id)
+		err := t.row(`INSERT INTO inbound(conv_id,ext_msg_id,ext_time,received_at,sender,kind,state,body,queued_only)
+VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(conv_id, ext_msg_id) DO NOTHING RETURNING id`,
+			convID, m.ExtMsgID, m.ExtTime, t.now, m.Sender, m.Kind, state, nullStr(m.Body), m.Queue).Scan(&id)
 		if errors.Is(err, sql.ErrNoRows) {
 			continue // already admitted
 		}
@@ -110,7 +110,7 @@ VALUES (?,?,?,?,?,?,?,?)`, id, idx, f.Name, f.ExtRef, nullStr(f.LocalPath), f.Ki
 		}
 		a := Admitted{InboundID: id, ExtMsgID: m.ExtMsgID, Kind: m.Kind, State: state}
 		if m.Kind == InPrompt && state == InQueued {
-			if a.TurnID, err = t.newTurn(convID, id); err != nil {
+			if a.TurnID, err = t.newTurn(convID, id, m.Queue); err != nil {
 				return nil, err
 			}
 			if _, err := t.exec(`UPDATE inbound SET turn_id = ? WHERE id = ?`, a.TurnID, id); err != nil {

@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -30,7 +31,7 @@ const (
 
 type mirrorState struct {
 	mu        sync.Mutex
-	skipTurns map[string]bool // Codex turn ids the helper ran
+	skipTurns map[string]bool // helper-owned Codex turn id -> shared transport
 	files     map[string]*mirrorFile
 	known     map[string]string // path -> state of untracked sources (baseline/ignored/missing)
 	// checked: the file state of each baseline rollout the last discovery
@@ -172,11 +173,14 @@ func infoJSON(i transcript.Info) string {
 }
 
 func (e *Engine) mirrorSkipTurn(codexTurnID string) {
+	e.mirrorSkipTurnMode(codexTurnID, false)
+}
+func (e *Engine) mirrorSkipTurnMode(codexTurnID string, shared bool) {
 	if e.mirror == nil || codexTurnID == "" {
 		return
 	}
 	e.mirror.mu.Lock()
-	e.mirror.skipTurns[codexTurnID] = true
+	e.mirror.skipTurns[codexTurnID] = shared
 	e.mirror.mu.Unlock()
 }
 
@@ -198,18 +202,17 @@ func (e *Engine) mirrorSkip(clientID, turnID string) bool {
 	}
 	e.mirror.mu.Lock()
 	defer e.mirror.mu.Unlock()
-	return e.mirror.skipTurns[turnID]
+	shared, owned := e.mirror.skipTurns[turnID]
+	return owned && (clientID == "" || !shared)
 }
 
 func (e *Engine) mirrorInit() error {
 	m := &mirrorState{skipTurns: map[string]bool{}, files: map[string]*mirrorFile{}, known: map[string]string{}, checked: map[string]transcript.FileInfo{}, unreadable: map[string]transcript.FileInfo{}, startedAt: e.now()}
-	ids, err := e.st.CodexTurnIDs()
+	ids, err := e.st.CodexTurnModes()
 	if err != nil {
 		return err
 	}
-	for _, id := range ids {
-		m.skipTurns[id] = true
-	}
+	m.skipTurns = ids
 	v, _, err := e.st.Meta(metaMirrorInit)
 	if err != nil {
 		return err
@@ -1170,6 +1173,21 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 // A live record (not catch-up) of Codex closes with the goal and model
 // lines of its thread as the rollout said them then (infoNotes).
 func (e *Engine) renderMirror(ctx context.Context, thread string, o transcript.Output, live bool) ([]store.OutMsg, error) {
+	var files []store.OutMsg
+	if o.Kind == transcript.OutputFinal && o.TurnID != "" && e.cfg.FilesDir != "" && strings.Contains(o.Text, "```"+artifactFence) {
+		key := sharedOutputKey(o.TurnID)
+		if _, err := os.Stat(e.outboundDir(key)); err == nil {
+			var problems []string
+			prefix := o.Key(thread, 0)
+			o.Text, files, problems = e.stageArtifactsAt(key, fmt.Sprintf("mirror-%x", sha256.Sum256([]byte(prefix))), prefix, o.Text)
+			if len(problems) > 0 {
+				o.Text = strings.TrimSpace(o.Text + "\n\n_Some files could not be attached:_\n- " + strings.Join(problems, "\n- "))
+			}
+			for i := range files {
+				files[i].Kind = store.OutMirror
+			}
+		}
+	}
 	var doc channel.RichDoc
 	switch {
 	case o.User || o.Kind == transcript.OutputPrompt:
@@ -1191,7 +1209,7 @@ func (e *Engine) renderMirror(ctx context.Context, thread string, o transcript.O
 		out = append(out, store.OutMsg{DeliveryKey: o.Key(thread, p.Index), Kind: store.OutMirror, Part: p.Index, Parts: p.Count,
 			Body: p.Body, BodyHash: hashBytes(p.Hash)})
 	}
-	return out, nil
+	return append(out, files...), nil
 }
 
 // mirrorInfo is the TurnInfo of a mirrored record.

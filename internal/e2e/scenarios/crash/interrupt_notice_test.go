@@ -53,11 +53,11 @@ func TestInterruptionNoticeText(t *testing.T) {
 
 	s.CrashSUT()
 	killedAt := time.Now()
+	s.StartSUT() // recovery terminates the old shared backends
 	s.Require("Codex lost both turns with the helper", 15*time.Second, func() (bool, string) {
 		a, b := s.Codex.CallsWithToken(tokA)[0], s.Codex.CallsWithToken(tokB)[0]
 		return a.Outcome != "running" && b.Outcome != "running", "A=" + a.Outcome + " B=" + b.Outcome
 	})
-	s.StartSUT()
 	s.WaitFor("restart recovery posts a notice in A and B", 45*time.Second, func() (bool, string) {
 		a, b := len(noticesAfter(s, chatA.ID, killedAt)), len(noticesAfter(s, chatB.ID, killedAt))
 		return a > 0 && b > 0, fmt.Sprintf("A=%d B=%d", a, b)

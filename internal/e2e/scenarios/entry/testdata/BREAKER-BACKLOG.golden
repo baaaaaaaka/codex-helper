@@ -74,28 +74,28 @@
    | <!-- codex-helper-outbox:<marker>:old-0-2 -->
 -- <msg:4> seeded (html)
    | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>Queued while down 1 E2E-BREAKERBACKLOG-q11-1</p>
+   | <p>helper queue Queued while down 1 E2E-BREAKERBACKLOG-q11-1</p>
    edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Queued while down 1 E2E-BREAKERBACKLOG-q11-1</p>
+   | <p>helper queue Queued while down 1 E2E-BREAKERBACKLOG-q11-1</p>
 -- <msg:5> seeded (html)
    | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>Queued while down 2 E2E-BREAKERBACKLOG-q12-3</p>
+   | <p>helper queue Queued while down 2 E2E-BREAKERBACKLOG-q12-3</p>
    edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Queued while down 2 E2E-BREAKERBACKLOG-q12-3</p>
+   | <p>helper queue Queued while down 2 E2E-BREAKERBACKLOG-q12-3</p>
 -- <msg:6> seeded (html)
    | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>Queued while down 3 E2E-BREAKERBACKLOG-q13-5</p>
+   | <p>helper queue Queued while down 3 E2E-BREAKERBACKLOG-q13-5</p>
    edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Queued while down 3 E2E-BREAKERBACKLOG-q13-5</p>
+   | <p>helper queue Queued while down 3 E2E-BREAKERBACKLOG-q13-5</p>
 -- <msg:7> seeded (html)
    | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>Queued while down 4 E2E-BREAKERBACKLOG-q14-7</p>
+   | <p>helper queue Queued while down 4 E2E-BREAKERBACKLOG-q14-7</p>
    edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Queued while down 4 E2E-BREAKERBACKLOG-q14-7</p>
+   | <p>helper queue Queued while down 4 E2E-BREAKERBACKLOG-q14-7</p>
 -- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
@@ -185,28 +185,28 @@
    | <!-- codex-helper-outbox:<marker>:old-1-2 -->
 -- <msg:4> seeded (html)
    | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>Queued while down 1 E2E-BREAKERBACKLOG-q21-2</p>
+   | <p>helper queue Queued while down 1 E2E-BREAKERBACKLOG-q21-2</p>
    edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Queued while down 1 E2E-BREAKERBACKLOG-q21-2</p>
+   | <p>helper queue Queued while down 1 E2E-BREAKERBACKLOG-q21-2</p>
 -- <msg:5> seeded (html)
    | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>Queued while down 2 E2E-BREAKERBACKLOG-q22-4</p>
+   | <p>helper queue Queued while down 2 E2E-BREAKERBACKLOG-q22-4</p>
    edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Queued while down 2 E2E-BREAKERBACKLOG-q22-4</p>
+   | <p>helper queue Queued while down 2 E2E-BREAKERBACKLOG-q22-4</p>
 -- <msg:6> seeded (html)
    | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>Queued while down 3 E2E-BREAKERBACKLOG-q23-6</p>
+   | <p>helper queue Queued while down 3 E2E-BREAKERBACKLOG-q23-6</p>
    edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Queued while down 3 E2E-BREAKERBACKLOG-q23-6</p>
+   | <p>helper queue Queued while down 3 E2E-BREAKERBACKLOG-q23-6</p>
 -- <msg:7> seeded (html)
    | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>Queued while down 4 E2E-BREAKERBACKLOG-q24-8</p>
+   | <p>helper queue Queued while down 4 E2E-BREAKERBACKLOG-q24-8</p>
    edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Queued while down 4 E2E-BREAKERBACKLOG-q24-8</p>
+   | <p>helper queue Queued while down 4 E2E-BREAKERBACKLOG-q24-8</p>
 -- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>

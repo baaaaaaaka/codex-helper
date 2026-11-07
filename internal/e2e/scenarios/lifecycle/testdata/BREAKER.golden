@@ -150,22 +150,22 @@
    | Need more details? Send <code>helper status</code>.</p>
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>Quick question 0 E2E-BREAKER-burst0-2</p>
+   | <p>helper queue Quick question 0 E2E-BREAKER-burst0-2</p>
    edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Quick question 0 E2E-BREAKER-burst0-2</p>
+   | <p>helper queue Quick question 0 E2E-BREAKER-burst0-2</p>
 -- <msg:4> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>Quick question 1 E2E-BREAKER-burst1-3</p>
+   | <p>helper queue Quick question 1 E2E-BREAKER-burst1-3</p>
    edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Quick question 1 E2E-BREAKER-burst1-3</p>
+   | <p>helper queue Quick question 1 E2E-BREAKER-burst1-3</p>
 -- <msg:5> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>Quick question 2 E2E-BREAKER-burst2-4</p>
+   | <p>helper queue Quick question 2 E2E-BREAKER-burst2-4</p>
    edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Quick question 2 E2E-BREAKER-burst2-4</p>
+   | <p>helper queue Quick question 2 E2E-BREAKER-burst2-4</p>
 -- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>

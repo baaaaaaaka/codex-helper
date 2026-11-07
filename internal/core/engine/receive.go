@@ -944,6 +944,11 @@ func (e *Engine) classify(tx *store.Tx, conv int64, kind string, group bool, m c
 			return c, true, nil
 		}
 	}
+	if p := parseWork(text); p.name == cmdQueue && (p.arg != "" || len(m.Files) > 0) && (!group || mentioned) {
+		c.in.Queue = true
+		c.in.Body = p.arg
+		return c, true, nil
+	}
 	if c.cmd = parseWork(text); c.cmd.isCommand() {
 		c.in.Kind = store.InCommand
 		return c, true, nil
@@ -1012,6 +1017,13 @@ func (e *Engine) ackPrompt(tx *store.Tx, conv int64, a store.Admitted, c *classi
 		return false, e.ackControl(tx, conv, a, c)
 	}
 	norm := normalize(c.in.Body)
+	if norm != "" {
+		if c.in.Queue {
+			norm = "queue\x00" + norm
+		} else {
+			norm = "auto\x00" + norm
+		}
+	}
 	at := c.msg.Created
 	e.mu.Lock()
 	cs := e.convs[conv]
@@ -1093,6 +1105,11 @@ func (e *Engine) ackPrompt(tx *store.Tx, conv int64, a store.Admitted, c *classi
 	}
 	if ahead {
 		text = textQueuedAck(running, isRunning, before)
+		if !c.in.Queue && isRunning {
+			if _, ok := e.ag.(SteeringAgent); ok {
+				text = "Received. Adding this input to Codex; use `helper queue <prompt>` to wait for the next task."
+			}
+		}
 	} else if c.in.Sender == store.SenderOther {
 		text = textCoworkerAccepted // v0.1.20 queueTeamsPromptAckForMessage (R-27)
 	}

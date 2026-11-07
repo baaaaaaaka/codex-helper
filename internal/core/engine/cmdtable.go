@@ -18,6 +18,9 @@ type cmdHandler func(e *Engine, ctx context.Context, j cmdJob, cs *convState, p 
 
 // workCommands maps a work-chat command to its handler.
 var workCommands = map[string]cmdHandler{
+	cmdQueue: func(e *Engine, _ context.Context, j cmdJob, _ *convState, _ parsed) {
+		e.reply(j, "Usage: `helper queue <prompt>` (attachments are also supported).", nil)
+	},
 	cmdHelp: func(e *Engine, _ context.Context, j cmdJob, _ *convState, p parsed) {
 		if isAdvancedHelpArg(p.arg) {
 			e.reply(j, sessionAdvancedHelpText, nil)
@@ -384,6 +387,8 @@ var sessionHelpText = strings.Join([]string{
 	"Send your task as a regular Teams message. Messages starting with `helper` or `!` are helper commands.",
 	"",
 	"Common commands:",
+	"Regular messages add input to the current task while it runs; otherwise they start a new task.",
+	"`helper queue <prompt>` - wait for a separate task (attachments supported)",
 	"`helper status` or `!status` - check progress",
 	"`helper stats` or `!stats` - show Codex token usage from the linked local history, grouped by model and service tier",
 	"`helper file <relative-path>` or `!file <relative-path>` - upload a file prepared in the helper's Teams upload folder",
@@ -415,6 +420,7 @@ var sessionAdvancedHelpText = strings.Join([]string{
 	"`helper goal` / `helper goal <objective>` / `helper goal active` / `helper goal pause` - show, set, resume or pause this chat's Codex goal (Codex keeps working on an active goal by itself; `helper cancel` pauses it)",
 	"`helper publish-history` or `!ph` - import a paused local Codex history backlog",
 	"`helper publish-history full` - publish the complete local Codex history once to this chat",
+	"`helper queue <prompt>` - enqueue a separate task; the prompt is kept as text, including helper commands",
 	"advanced commands: `helper retry last`, `helper retry <turn-id>` / `!retry <turn-id>`, or `helper cancel last`, `helper cancel queued`, `helper cancel running`, `helper cancel all`, `helper cancel <turn-id>` / `!cancel <turn-id>`",
 	"Status words: `queued`/`running` means wait, `completed` means done, `failed` or `interrupted` means check recent messages and changed files before `helper retry last`.",
 	"Other text, including unknown slash-prefixed text, is sent to Codex.",

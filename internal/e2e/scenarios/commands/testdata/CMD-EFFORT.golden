@@ -484,6 +484,7 @@
    prompt| `helper goal` / `helper goal <objective>` / `helper goal active` / `helper goal pause` - show, set, resume or pause this chat's Codex goal (Codex keeps working on an active goal by itself; `helper cancel` pauses it)
    prompt| `helper publish-history` or `!ph` - import a paused local Codex history backlog
    prompt| `helper publish-history full` - publish the complete local Codex history once to this chat
+   prompt| `helper queue <prompt>` - enqueue a separate task; the prompt is kept as text, including helper commands
    prompt| advanced commands: `helper retry last`, `helper retry <turn-id>` / `!retry <turn-id>`, or `helper cancel last`, `helper cancel queued`, `helper cancel running`, `helper cancel all`, `helper cancel <turn-id>` / `!cancel <turn-id>`
    prompt| Status words: `queued`/`running` means wait, `completed` means done, `failed` or `interrupted` means check recent messages and changed files before `helper retry last`.
    prompt| Other text, including unknown slash-prefixed text, is sent to Codex.

@@ -46,7 +46,7 @@ func TestSelfEchoBreaker(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		tok := s.Token(fmt.Sprintf("burst%d", i))
 		burstToks = append(burstToks, tok)
-		steps.MustPost(s, burst.ID, fmt.Sprintf("Quick question %d %s", i, tok))
+		steps.MustPost(s, burst.ID, fmt.Sprintf("helper queue Quick question %d %s", i, tok))
 	}
 
 	steps.MustPost(s, work.ID, "Long task "+running)

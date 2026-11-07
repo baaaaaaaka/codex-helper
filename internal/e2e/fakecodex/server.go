@@ -39,8 +39,10 @@ type Config struct {
 }
 
 type server struct {
-	cfg  Config
-	http *http.Client
+	submitMu sync.Mutex
+	queued   map[string][]map[string]any
+	cfg      Config
+	http     *http.Client
 
 	outMu sync.Mutex
 	out   *bufio.Writer
@@ -99,6 +101,7 @@ func Serve(cfg Config) error {
 	}
 	s := &server{
 		cfg:      cfg,
+		queued:   map[string][]map[string]any{},
 		http:     &http.Client{Transport: &http.Transport{Proxy: nil}},
 		out:      bufio.NewWriter(cfg.Out),
 		loaded:   map[string]*Thread{},
@@ -339,7 +342,33 @@ func (s *server) dispatch(msg message) (any, *rpcError) {
 	case "thread/fork":
 		return s.fork(p)
 	case "turn/start":
+		s.submitMu.Lock()
+		defer s.submitMu.Unlock()
 		return s.startTurn(p)
+	case "turn/steer":
+		s.submitMu.Lock()
+		defer s.submitMu.Unlock()
+		t, err := s.current(str("threadId"))
+		if err != nil {
+			return nil, invalid("thread not found")
+		}
+		s.mu.Lock()
+		valid := false
+		for _, turn := range t.Turns {
+			if turn.ID == str("expectedTurnId") && turn.Status == StatusInProgress {
+				valid = true
+			}
+		}
+		s.mu.Unlock()
+		if !valid {
+			return nil, invalid("no active turn to steer")
+		}
+		return s.steer(t, str("threadId"), p)
+	case "thread/queue/add", "thread/queue/list", "thread/queue/delete", "thread/queue/start":
+		return s.queue(msg.Method, p)
+	case "thread/settings/update":
+		s.applySettings(str("threadId"), str("model"), str("effort"))
+		return map[string]any{}, nil
 	case "turn/interrupt":
 		return s.interrupt(str("threadId"), str("turnId"))
 	case "thread/goal/get", "thread/goal/set", "thread/goal/clear":
@@ -547,6 +576,7 @@ func (s *server) startTurn(p map[string]any) (any, *rpcError) {
 		// Real Codex announces the turn right after accepting it.
 		time.Sleep(5 * time.Millisecond)
 		s.notify("turn/started", map[string]any{"threadId": threadID, "turn": view})
+		s.notify("item/completed", map[string]any{"threadId": threadID, "turnId": turnID, "item": map[string]any{"type": "userMessage", "clientId": clientID, "id": turnID + "-user", "content": content}})
 		s.runTurn(rt, t, turn)
 	}()
 	if plan.MalformedStart {
@@ -581,13 +611,19 @@ func (s *server) steer(t *Thread, threadID string, p map[string]any) (any, *rpcE
 		s.mu.Unlock()
 		return nil, invalid("thread %s has no running turn to steer", threadID)
 	}
-	running.Items = append(running.Items, map[string]any{"type": "userMessage", "id": newID(), "clientId": nullable(clientID), "content": content})
+	user := map[string]any{"type": "userMessage", "id": newID(), "clientId": nullable(clientID), "content": content}
+	running.Items = append(running.Items, user)
+	if rt := s.running[running.ID]; rt != nil && rt.rollout != nil {
+		_ = rt.rollout.AppendRecord("response_item", map[string]any{"type": "message", "role": "user", "content": content})
+		_ = rt.rollout.AppendRecord("event_msg", map[string]any{"type": "item_completed", "turn_id": running.ID, "item": map[string]any{"type": "UserMessage", "client_id": clientID}})
+	}
 	saveErr := s.cfg.Store.Save(t)
 	turnID := running.ID
 	s.mu.Unlock()
 	if saveErr != nil {
 		fmt.Fprintf(s.cfg.Log, "fakecodex: save: %v\n", saveErr)
 	}
+	s.notify("item/completed", map[string]any{"threadId": threadID, "turnId": turnID, "item": user})
 	fmt.Fprintf(s.cfg.Log, "fakecodex: turn/start on busy thread %s steered into turn %s\n", threadID, turnID)
 	view := turnView(turnID, StatusInProgress, []any{}, nil, 0, 0)
 	view["startedAt"] = nil
@@ -602,6 +638,7 @@ func (s *server) runTurn(rt *runningTurn, t *Thread, turn *Turn) {
 		s.mu.Unlock()
 		rt.cancel()
 		close(rt.done)
+		go s.dispatchQueued(rt.threadID)
 	}()
 	if rt.plan.Crash {
 		s.end(rt.plan.Seq, "crashed", "fake app-server crashed mid-turn")

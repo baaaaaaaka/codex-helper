@@ -81,7 +81,7 @@ func (t *Tx) LastOutbox(convID int64, kind string) (Outbox, bool, error) {
 // CodexTurnIDs lists the Codex turn ids of every turn the helper ran (the
 // mirror skips those turns in rollouts that have no client id).
 func (s *Store) CodexTurnIDs() ([]string, error) {
-	rows, err := s.r.QueryContext(context.Background(), `SELECT codex_turn_id FROM turns WHERE codex_turn_id IS NOT NULL`)
+	rows, err := s.r.QueryContext(context.Background(), `SELECT codex_turn_id FROM turns WHERE codex_turn_id IS NOT NULL AND steering=0`)
 	if err != nil {
 		return nil, err
 	}
@@ -225,4 +225,24 @@ func (s *Store) OutboxByKeyPrefix(prefix string) ([]Outbox, error) {
 	rows, err := s.r.QueryContext(context.Background(), `SELECT `+outboxCols+` FROM outbox
 WHERE delivery_key >= ? AND delivery_key < ? ORDER BY seq`, prefix, prefix+"\U0010FFFF")
 	return collect(scanOutbox)(rows, err)
+}
+
+// CodexTurnModes loads mirror ownership once, without a second copy of turn IDs.
+// The value distinguishes shared turns (keep local user input) from legacy ones.
+func (s *Store) CodexTurnModes() (map[string]bool, error) {
+	rows, err := s.r.QueryContext(context.Background(), `SELECT codex_turn_id,shared FROM turns WHERE codex_turn_id IS NOT NULL AND steering=0`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	modes := map[string]bool{}
+	for rows.Next() {
+		var id string
+		var shared bool
+		if err := rows.Scan(&id, &shared); err != nil {
+			return nil, err
+		}
+		modes[id] = modes[id] || shared
+	}
+	return modes, rows.Err()
 }

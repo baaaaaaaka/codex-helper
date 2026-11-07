@@ -120,6 +120,39 @@ jobs:
           set -euo pipefail
           python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 
+  shared-codex-contract:
+    name: Shared Codex protocol probes
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.11"
+          cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install pinned protocol target
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm install --prefix "$RUNNER_TEMP/shared-codex" --include=optional @openai/codex@0.166.0
+      - name: Probe native multi-client and queue semantics offline
+        shell: bash
+        run: |
+          set -euo pipefail
+          native="$(find "$RUNNER_TEMP/shared-codex/node_modules" -type f -path '*/vendor/*/bin/codex' -print -quit)"
+          test -n "$native"
+          bash scripts/ci/run_shared_codex_contracts.sh "$native" 2>&1 | tee "$RUNNER_TEMP/shared-codex-contract.log"
+      - name: Upload protocol evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: shared-codex-protocol-evidence
+          path: ${{ runner.temp }}/shared-codex-contract.log
+          if-no-files-found: ignore
+
   cross-build:
     name: Cross-OS vet and build
     runs-on: ubuntu-latest
@@ -358,6 +391,7 @@ jobs:
       - cross-build
       - unit-linux
       - race-core
+      - shared-codex-contract
       - e2e
       - unit-windows-macos
     if: ${{ always() }}
@@ -380,6 +414,7 @@ jobs:
           check cross-build "${{ needs.cross-build.result }}"
           check unit-linux "${{ needs.unit-linux.result }}"
           check race-core "${{ needs.race-core.result }}"
+          check shared-codex-contract "${{ needs.shared-codex-contract.result }}"
           check e2e "${{ needs.e2e.result }}"
           check unit-windows-macos "${{ needs.unit-windows-macos.result }}"
           if [ "$failures" -ne 0 ]; then

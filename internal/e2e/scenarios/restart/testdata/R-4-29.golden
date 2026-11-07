@@ -59,10 +59,10 @@
    | <p>Long task E2E-R429-running-1</p>
 -- <msg:4> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>Follow-up E2E-R429-queued-2</p>
+   | <p>helper queue Follow-up E2E-R429-queued-2</p>
    edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Follow-up E2E-R429-queued-2</p>
+   | <p>helper queue Follow-up E2E-R429-queued-2</p>
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
@@ -105,7 +105,7 @@
 
 == codex turns (per thread; threads by kind, directory and first prompt; turns in start order)
 -- thread <uuid:1> (work, cwd <root>/work/r04)
-   turn model=gpt-5-codex effort=medium: abandoned
+   turn model=gpt-5-codex effort=medium: killed
    prompt| User message:
    prompt| Long task E2E-R429-running-1
    prompt|

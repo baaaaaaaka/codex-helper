@@ -203,7 +203,7 @@
    prompt| ```
    prompt|
    prompt| Use only relative manifest paths under that directory. Keep your normal answer visible; the helper will upload listed files separately when file-write auth is available.
-   turn model=gpt-5-codex effort=medium: abandoned
+   turn model=gpt-5-codex effort=medium: killed
    prompt| User message:
    prompt| Long job E2E-RETRYCMDS-lost-2
    prompt|

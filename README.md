@@ -530,12 +530,12 @@ The helper creates a **control chat** for machine-level commands and one
 park and wake them, check status, update the local Codex CLI, and restart or
 update the helper.
 
-A work chat message is acknowledged, queued, and run in the session's Codex
-thread; progress appears while Codex works and the final answer is posted once.
-The owner is mentioned in the control chat when an answer arrives (answers
-that arrive within a few seconds share one mention), or notified with a Teams
-Workflow card when one is configured. Several prompts sent while Codex is busy
-run one after another, and the queue is announced once when it starts.
+A work chat message is acknowledged and sent to its Codex thread. If a task is
+running, regular messages add instructions to that task immediately (steer).
+Use `helper queue <prompt>` to run a separate task after the current one.
+Queued tasks run in order. Progress appears while Codex works, and each task's
+final answer is posted once. The owner receives a control-chat mention or a
+configured Teams Workflow card when an answer arrives.
 
 Teams text, quoted messages, files, pasted images, and supported inline media
 are passed through to Codex. Teams voice or video clips are transcribed locally
@@ -546,6 +546,13 @@ came from automatic speech recognition. Files that Codex lists in a
 If you also use Codex from a local terminal or IDE on a session that has a work
 chat, the helper posts those prompts and answers to the work chat too, so Teams
 stays the shared conversation surface.
+
+When the local Teams helper is running, `cxp tui` creates and resumes local
+sessions through the helper's native app-server. Both interfaces can add input and see progress
+in the same thread. Closing the TUI leaves its task running. Helper updates wait
+for attached TUI windows to close and native tasks to finish. Independent Codex
+windows already open during an update keep their existing backend; close and
+reopen them through `cxp tui` to join the shared backend.
 
 The helper keeps its state in one local SQLite store. A store from v0.1.20 or
 v0.1.22-rc.59 is converted automatically at the first start; the old store is

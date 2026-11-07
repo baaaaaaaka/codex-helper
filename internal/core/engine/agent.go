@@ -96,6 +96,7 @@ type Forked struct {
 
 // TurnRequest is one turn to run.
 type TurnRequest struct {
+	Queue    bool
 	ConvID   int64
 	ThreadID string // "" starts a new thread (reported through ThreadStarted first)
 	Cwd      string
@@ -112,6 +113,7 @@ type TurnHooks struct {
 	// turn does not start unless it returns nil (the binding must be
 	// durable first so a restart continues the same thread).
 	ThreadStarted func(threadID string) error
+	Ready         func() // backend state changed; pending input may now steer
 	// Started is called once Codex accepted the turn.
 	Started func(codexTurnID string)
 	// Progress receives commentary.
@@ -192,3 +194,20 @@ type Transcriber interface {
 
 // ErrTranscribeLater: the transcriber cannot run yet; try again later.
 var ErrTranscribeLater = errors.New("engine: transcription not ready yet")
+
+// SteeringAgent can append input to an exact running turn. A definite
+// finished-target rejection is ErrSteerExpired; other errors are never replayed.
+type SteeringAgent interface {
+	Steer(context.Context, TurnRequest, string) error
+	CurrentTurn(int64, string) string
+}
+
+var ErrSteerExpired = errors.New("Codex turn finished before steering")
+
+// ErrBackendUncertain preserves shared native work after a transport failure.
+var ErrBackendUncertain = errors.New("shared Codex connection lost; input outcome is unknown")
+
+// InputRejected is a definite rejection: no input was accepted.
+type InputRejected struct{ Reason string }
+
+func (e *InputRejected) Error() string { return e.Reason }

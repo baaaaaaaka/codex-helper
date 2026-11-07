@@ -26,13 +26,7 @@
    | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
    | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
    mention 0: owner "E2E Owner"
--- <msg:5> owner (html)
-   | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>model</p>
-   edited 1 time(s); earlier versions:
-   [version 1]
-   | <p>model</p>
--- <msg:6> helper (html)
+-- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>✅ Codex finished</strong></p>
    | <p><strong>Chat:</strong> 💬 e2ehost - Please answer E2E-MODELSHOWN-work-1<br>
@@ -40,6 +34,12 @@
    | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
    | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
    mention 0: owner "E2E Owner"
+-- <msg:6> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>model</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>model</p>
 -- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Chat: Control<br>
@@ -254,8 +254,6 @@
    prompt|   Request: Please answer E2E-MODELSHOWN-work-1
    prompt|   Next: The answer is ready in the work chat.
    prompt|   Open: Open answer (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)
-   prompt|   - <time> user/control_inbound:
-   prompt|   model
    prompt|   - <time> helper/notice:
    prompt|   🔧 Helper: E2E Owner
    prompt|   ✅ Codex finished
@@ -263,6 +261,8 @@
    prompt|   Request: Please answer E2E-MODELSHOWN-mini-2
    prompt|   Next: The answer is ready in the work chat.
    prompt|   Open: Open answer (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)
+   prompt|   - <time> user/control_inbound:
+   prompt|   model
    prompt|   - <time> helper/control:
    prompt|   🔧 Helper:
    prompt|   Chat: Control
@@ -347,6 +347,7 @@
    prompt| `helper goal` / `helper goal <objective>` / `helper goal active` / `helper goal pause` - show, set, resume or pause this chat's Codex goal (Codex keeps working on an active goal by itself; `helper cancel` pauses it)
    prompt| `helper publish-history` or `!ph` - import a paused local Codex history backlog
    prompt| `helper publish-history full` - publish the complete local Codex history once to this chat
+   prompt| `helper queue <prompt>` - enqueue a separate task; the prompt is kept as text, including helper commands
    prompt| advanced commands: `helper retry last`, `helper retry <turn-id>` / `!retry <turn-id>`, or `helper cancel last`, `helper cancel queued`, `helper cancel running`, `helper cancel all`, `helper cancel <turn-id>` / `!cancel <turn-id>`
    prompt| Status words: `queued`/`running` means wait, `completed` means done, `failed` or `interrupted` means check recent messages and changed files before `helper retry last`.
    prompt| Other text, including unknown slash-prefixed text, is sent to Codex.

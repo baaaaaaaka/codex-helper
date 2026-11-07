@@ -31,7 +31,7 @@ func TestR06_AnswersInOrder(t *testing.T) {
 
 	tokens := []string{s.Token("first"), s.Token("second"), s.Token("third")}
 	for i, tok := range tokens {
-		if _, err := s.Graph.PostAsUser(work.ID, fmt.Sprintf("Step %d: %s", i+1, tok)); err != nil {
+		if _, err := s.Graph.PostAsUser(work.ID, fmt.Sprintf("helper queue Step %d: %s", i+1, tok)); err != nil {
 			t.Fatalf("post: %v", err)
 		}
 		time.Sleep(150 * time.Millisecond) // distinct Teams timestamps, same poll window
