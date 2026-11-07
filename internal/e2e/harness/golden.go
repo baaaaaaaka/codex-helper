@@ -52,6 +52,11 @@ type GoldenOptions struct {
 	Masks []Mask
 	// OmitCodex leaves the Codex section out (reason).
 	OmitCodex string
+	// Floating declares helper messages whose place in their chat is a
+	// known race with messages of other senders (Races covers two
+	// adjacent helper messages): they are shown at the end of their chat,
+	// in posting order, and the golden says so.
+	Floating []Float
 	// Races declares pairs of helper messages whose order in a chat is a
 	// known race in cxp: when the two are adjacent in the reverse order,
 	// the golden shows them in the declared order and says so.
@@ -63,6 +68,44 @@ type GoldenOptions struct {
 	// are posted in timing order. Value: the reason. A session notified
 	// twice still shows twice.
 	FinishedNotices string
+}
+
+// Float is a helper message (Text: a substring of its plain text) whose
+// place in its chat is not fixed.
+type Float struct {
+	Text, Reason string
+}
+
+// applyFloating moves the helper messages matching a Float to the end of
+// msgs, keeping their order; it returns the reasons of the Floats used.
+func (o GoldenOptions) applyFloating(msgs []fakegraph.Message) ([]fakegraph.Message, []string) {
+	if len(o.Floating) == 0 {
+		return msgs, nil
+	}
+	var keep, moved []fakegraph.Message
+	var notes []string
+	used := map[int]bool{}
+	for _, m := range msgs {
+		hit := -1
+		if m.Origin == fakegraph.OriginSUT {
+			for i, f := range o.Floating {
+				if strings.Contains(m.PlainText(), f.Text) {
+					hit = i
+					break
+				}
+			}
+		}
+		if hit < 0 {
+			keep = append(keep, m)
+			continue
+		}
+		moved = append(moved, m)
+		if !used[hit] {
+			used[hit] = true
+			notes = append(notes, fmt.Sprintf("%q: %s", o.Floating[hit].Text, o.Floating[hit].Reason))
+		}
+	}
+	return append(keep, moved...), notes
 }
 
 // Race is a declared ordering race between two helper messages of one
@@ -87,6 +130,11 @@ func (o GoldenOptions) validate() error {
 	for _, r := range o.Races {
 		if r.First == "" || r.Second == "" || strings.TrimSpace(r.Reason) == "" {
 			return fmt.Errorf("golden: a race needs both messages and a reason")
+		}
+	}
+	for _, f := range o.Floating {
+		if f.Text == "" || strings.TrimSpace(f.Reason) == "" {
+			return fmt.Errorf("golden: a floating message needs its text and a reason")
 		}
 	}
 	if o.FinishedNotices != "" && strings.TrimSpace(o.FinishedNotices) == "" {
@@ -152,10 +200,14 @@ func (s *Scenario) GoldenTranscript() string {
 		if s.Opts.Golden.FinishedNotices != "" && strings.Contains(c.Topic, ControlChatTopicMarker) {
 			msgs, notices = splitFinishedNotices(msgs, who)
 		}
-		var raced []string
+		var raced, floated []string
 		msgs, raced = s.Opts.Golden.applyRaces(msgs)
 		for _, r := range raced {
 			fmt.Fprintf(&b, "   (declared race, shown in the declared order: %s)\n", r)
+		}
+		msgs, floated = s.Opts.Golden.applyFloating(msgs)
+		for _, r := range floated {
+			fmt.Fprintf(&b, "   (floating message, shown at the end of the chat: %s)\n", r)
 		}
 		// Message placeholders are numbered per chat, so a difference in
 		// one chat does not renumber the others.
