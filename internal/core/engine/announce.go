@@ -56,7 +56,8 @@ type announceItem struct {
 
 // announcePass queues the control-chat summaries of the discovered
 // sessions' chats nobody was told about. While catch-up chats are still
-// being created it waits for a full post, or for announceHold.
+// being created, or the catch-up still reads sessions, it waits for a
+// full post, or for announceHold.
 func (e *Engine) announcePass() {
 	if e.stopping.Load() {
 		return
@@ -103,6 +104,9 @@ func (e *Engine) announcePass() {
 			e.announceSeen[id] = now
 		}
 		items = append(items, announceItem{id: id, label: cs.label, name: announceName(cs, label, e.cfg.Machine), url: cs.url})
+	}
+	if e.catchUpReading.Load() {
+		waiting++ // sessions still being read may get chats too
 	}
 	held := false
 	if waiting > 0 && len(items) < announceBatch {

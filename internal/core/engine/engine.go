@@ -285,8 +285,11 @@ type Engine struct {
 	// process stops it starts no turn, reads no chat and sends only the
 	// control chat up to the shutdown reply, whose delivery keys start with
 	// stopReply (guarded by mu; shutdown.go).
-	stopping  atomic.Bool
-	stopReply string
+	stopping atomic.Bool
+	// catchUpReading: the mirror still has start-up catch-up records to
+	// read (set by mirrorLoop, read by announcePass).
+	catchUpReading atomic.Bool
+	stopReply      string
 	// writeWaiters counts writers in waitWrite: the sender leaves the
 	// account's write tokens to them (sender.go).
 	writeWaiters atomic.Int32

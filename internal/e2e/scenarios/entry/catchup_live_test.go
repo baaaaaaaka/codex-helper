@@ -51,7 +51,9 @@ func TestCatchUpOwnerStaysLive(t *testing.T) {
 		Seam:       harness.Seam{ProductionTiming: true},
 		Invariants: harness.Invariants{CPUBudget: 30 * time.Second},
 		Golden: harness.GoldenOptions{Masks: []harness.Mask{{Pattern: regexp.MustCompile(`queued for \d+ min`), Replace: "queued for <n> min",
-			Reason: "the rc.59 fixture's queued prompts date from 2026-09-01: their age at the reminder depends on the day the suite runs"}}},
+			Reason: "the rc.59 fixture's queued prompts date from 2026-09-01: their age at the reminder depends on the day the suite runs"}},
+			Floating: []harness.Float{{Text: "New local Codex chats", Reason: "the new-chat summary waits until the catch-up has read every session; " +
+				"the owner posts `new` while it still reads, so which comes first depends on the runner's speed"}}},
 	})
 	defer s.Finish()
 

@@ -238,3 +238,69 @@ func TestManyUnannouncedChatsAnnouncedInBatches(t *testing.T) {
 		t.Fatalf("%d chats listed, want %d", len(listed), n)
 	}
 }
+
+// CI 2026-11-07 (CATCHUP-LIVE on main): the summary went out with the 3
+// chats created so far while the catch-up was still reading the other
+// sessions, whose chats came in a second summary. While the catch-up
+// still reads sessions the summary waits (announceHold at most), then
+// lists every chat in one post.
+func TestSummaryWaitsWhileTheCatchUpStillReads(t *testing.T) {
+	const n = 3
+	r := &rig{t: t, ch: channeltest.New(), ag: newAgent(), path: filepath.Join(t.TempDir(), "core.db"), log: &strings.Builder{}, logMu: &sync.Mutex{}}
+	t.Cleanup(r.stop)
+	ctx := context.Background()
+	st, err := store.Open(r.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = st.Import(func(im *store.Importer) error {
+		for i := 0; i < n; i++ {
+			label := fmt.Sprintf("s%03d", i+1)
+			ci, _ := r.ch.CreateChat(ctx, "💬 m - caught up "+label, label)
+			id, err := im.Conversation(store.Conversation{Label: label, Kind: store.KindWork, Channel: "teams", ExtChatID: ci.ID, ExtURL: ci.URL,
+				Title: "💬 m - caught up " + label, TitleSource: "auto", State: store.ConvActive})
+			if err != nil {
+				return err
+			}
+			if err := im.Stream(store.Stream{Key: store.ChatStreamKey("teams", ci.ID), ConvID: id, Cursor: "0", Seeded: true}); err != nil {
+				return err
+			}
+			if err := im.SetMeta(discoveredKey(id), ""); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.Close()
+	// r.start, with the catch-up still reading before the engine runs (no
+	// SessionsDir: no mirror loop resets it).
+	parallelRig(t)
+	if st, err = store.OpenWith(r.path, store.Options{Exclusive: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Acquire(store.Ident{Host: "h", PID: 1, BootID: "b"}); err != nil {
+		t.Fatal(err)
+	}
+	r.st = st
+	e, err := New(Config{Store: st, Channel: r.ch, Agent: r.ag, Timing: FastTiming(20 * time.Millisecond), Machine: "m", Log: lockedWriter{r.logMu, r.log}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.catchUpReading.Store(true)
+	rctx, cancel := context.WithCancel(context.Background())
+	r.cancel, r.done, r.e = cancel, make(chan error, 1), e
+	go func() { r.done <- e.Run(rctx) }()
+	ctl := r.control()
+	time.Sleep(time.Second) // many maintenance passes
+	if got := r.own(ctl, "New local Codex chats"); len(got) != 0 {
+		t.Fatalf("summary posted while the catch-up still reads: %q", got[0].Text)
+	}
+	e.catchUpReading.Store(false)
+	r.wait("the summary", func() bool { return len(r.own(ctl, "New local Codex chats (3)")) == 1 })
+	if got := r.own(ctl, "New local Codex chats"); len(got) != 1 {
+		t.Fatalf("%d summaries, want 1", len(got))
+	}
+}
