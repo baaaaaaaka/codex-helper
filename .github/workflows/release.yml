@@ -277,6 +277,11 @@ jobs:
         shell: pwsh
         run: .\scripts\ci\legacy_runtime_bridge_smoke.ps1
 
+      - name: Stale copied cxp.exe entry update (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: .\scripts\ci\windows_stale_cxp_entry_smoke.ps1
+
       - name: Actual CXP process identity (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash
