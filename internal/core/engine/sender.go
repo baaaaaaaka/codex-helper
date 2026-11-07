@@ -66,6 +66,12 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 	if until := e.gate(e.gWrite); now.Before(until) {
 		return until.Sub(now)
 	}
+	e.mu.Lock()
+	ready := e.controlReadLocked()
+	e.mu.Unlock()
+	if !ready {
+		return 0 // the control chat's first read wakes the sender (receive.go)
+	}
 	type job struct {
 		row    store.Outbox
 		chat   string
