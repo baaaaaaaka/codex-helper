@@ -17,6 +17,8 @@ log() {
 trap 'log "failed at line $LINENO (exit $?)"' ERR
 
 cleanup_pids=()
+status_supervisor_pid=""
+status_child_pid=""
 cleanup_launchd_label=""
 cleanup_systemd_unit=""
 
@@ -84,6 +86,28 @@ wait_for_file_pattern() {
     sleep 1
   done
   log "timed out waiting for $file to match $pattern"
+  [ -f "$file" ] && sed 's/^/[status] /' "$file" || true
+  return 1
+}
+
+# wait_for_status_pids STATUS [OLD_SUPERVISOR OLD_CHILD]: wait until the
+# local supervisor's status file names a supervisor and a running child
+# (child_pid is omitted until the child starts), both different from the
+# old ones after a restart, and set status_supervisor_pid/status_child_pid.
+wait_for_status_pids() {
+  local file="$1" old_supervisor="${2:-}" old_child="${3:-}"
+  local deadline=$((SECONDS + 30)) sup child
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    sup="$(sed -n 's/.*"supervisor_pid": \([1-9][0-9]*\).*/\1/p' "$file" 2>/dev/null | tail -n 1)"
+    child="$(sed -n 's/.*"child_pid": \([1-9][0-9]*\).*/\1/p' "$file" 2>/dev/null | tail -n 1)"
+    if [ -n "$sup" ] && [ -n "$child" ] && [ "$sup" != "$old_supervisor" ] && [ "$child" != "$old_child" ]; then
+      status_supervisor_pid="$sup"
+      status_child_pid="$child"
+      return 0
+    fi
+    sleep 1
+  done
+  log "timed out waiting for $file to name a new supervisor and child (old: ${old_supervisor:-none}/${old_child:-none})"
   [ -f "$file" ] && sed 's/^/[status] /' "$file" || true
   return 1
 }
@@ -371,12 +395,10 @@ EOF
   replace_json_executable "$config" "$fake"
   run_logged "public-enable" "$smoke/enable.log" env -i "${common_env[@]}" "$cxp" teams service enable
   run_logged "public-start" "$smoke/start.log" env -i "${common_env[@]}" "$cxp" teams service start
-  wait_for_file_pattern "$status" '"supervisor_pid"'
-  local public_supervisor_pid
-  public_supervisor_pid="$(sed -n 's/.*"supervisor_pid": \([0-9][0-9]*\).*/\1/p' "$status" | tail -n 1)"
-  if [ -n "$public_supervisor_pid" ]; then
-    cleanup_pids+=("$public_supervisor_pid")
-  fi
+  wait_for_status_pids "$status"
+  local public_supervisor_pid="$status_supervisor_pid"
+  local public_child_pid="$status_child_pid"
+  cleanup_pids+=("$public_supervisor_pid" "$public_child_pid")
   wait_for_lines "$runs" 1
   wait_for_file_pattern "$child_env" 'CODEX_HELPER_TEAMS_SERVICE=1'
   for expected_env in "HTTP_PROXY=http://127.0.0.1:9" "HTTPS_PROXY=http://127.0.0.1:9" "NO_PROXY=*" "XDG_STATE_HOME=$state_home"; do
@@ -398,11 +420,6 @@ EOF
       return 1
     fi
   done
-  local public_child_pid
-  public_child_pid="$(sed -n 's/.*"child_pid": \([0-9][0-9]*\).*/\1/p' "$status" | tail -n 1)"
-  if [ -n "$public_child_pid" ]; then
-    cleanup_pids+=("$public_child_pid")
-  fi
   run_logged "public-status" "$smoke/status.log" env -i "${common_env[@]}" "$cxp" teams service status
   if ! grep -q 'Active: true' "$smoke/status.log"; then
     log "public lifecycle status did not report active"
@@ -411,26 +428,21 @@ EOF
   fi
   rm -f "$child_env"
   run_logged "public-restart" "$smoke/restart.log" env -i "${common_env[@]}" "$cxp" teams service restart
-  if [ -n "$public_child_pid" ] && ! wait_for_pid_gone "$public_child_pid"; then
+  if ! wait_for_pid_gone "$public_child_pid"; then
     log "public lifecycle child pid $public_child_pid remained after restart"
     return 1
   fi
-  if [ -n "$public_supervisor_pid" ] && ! wait_for_pid_gone "$public_supervisor_pid"; then
+  if ! wait_for_pid_gone "$public_supervisor_pid"; then
     log "public lifecycle supervisor pid $public_supervisor_pid remained after restart"
     return 1
   fi
-  [ -n "$public_supervisor_pid" ] && remove_cleanup_pid "$public_supervisor_pid"
-  [ -n "$public_child_pid" ] && remove_cleanup_pid "$public_child_pid"
+  remove_cleanup_pid "$public_supervisor_pid"
+  remove_cleanup_pid "$public_child_pid"
   wait_for_lines "$runs" 2
-  wait_for_file_pattern "$status" '"supervisor_pid"'
-  public_supervisor_pid="$(sed -n 's/.*"supervisor_pid": \([0-9][0-9]*\).*/\1/p' "$status" | tail -n 1)"
-  if [ -n "$public_supervisor_pid" ]; then
-    cleanup_pids+=("$public_supervisor_pid")
-  fi
-  public_child_pid="$(sed -n 's/.*"child_pid": \([0-9][0-9]*\).*/\1/p' "$status" | tail -n 1)"
-  if [ -n "$public_child_pid" ]; then
-    cleanup_pids+=("$public_child_pid")
-  fi
+  wait_for_status_pids "$status" "$public_supervisor_pid" "$public_child_pid"
+  public_supervisor_pid="$status_supervisor_pid"
+  public_child_pid="$status_child_pid"
+  cleanup_pids+=("$public_supervisor_pid" "$public_child_pid")
   wait_for_file_pattern "$child_env" '^CODEX_HELPER_TEAMS_LOCAL_SUPERVISOR_VERSION='
   run_logged "public-status-after-restart" "$smoke/status-after-restart.log" env -i "${common_env[@]}" "$cxp" teams service status
   if ! grep -q 'Active: true' "$smoke/status-after-restart.log"; then
@@ -439,11 +451,11 @@ EOF
     return 1
   fi
   run_logged "public-stop" "$smoke/stop.log" env -i "${common_env[@]}" "$cxp" teams service stop
-  if [ -n "$public_child_pid" ] && ! wait_for_pid_gone "$public_child_pid"; then
+  if ! wait_for_pid_gone "$public_child_pid"; then
     log "public lifecycle child pid $public_child_pid remained after stop"
     return 1
   fi
-  if [ -n "$public_supervisor_pid" ] && ! wait_for_pid_gone "$public_supervisor_pid"; then
+  if ! wait_for_pid_gone "$public_supervisor_pid"; then
     log "public lifecycle supervisor pid $public_supervisor_pid remained after stop"
     return 1
   fi
@@ -453,8 +465,8 @@ EOF
     sed 's/^/[public-status-after-stop] /' "$smoke/status-after-stop.log" || true
     return 1
   fi
-  [ -n "$public_supervisor_pid" ] && remove_cleanup_pid "$public_supervisor_pid"
-  [ -n "$public_child_pid" ] && remove_cleanup_pid "$public_child_pid"
+  remove_cleanup_pid "$public_supervisor_pid"
+  remove_cleanup_pid "$public_child_pid"
 }
 
 local_supervisor_bootstrap_auto_fallback_smoke() {
