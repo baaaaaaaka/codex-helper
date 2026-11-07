@@ -491,15 +491,24 @@ func TestFailureClassBrokenCache(t *testing.T) {
 		const base = 400 * time.Millisecond
 		m := g.managed(t, func(c *ManagedConfig) { c.IntegrityBackoff = base })
 		voice := voiceFile(t, g.dir, "v.ogg", "x")
-		failed := time.Now()
+		// The backoff starts when the download fails, somewhere inside the
+		// call; how long the install takes before that (slow under -race) is
+		// not part of the wait.
+		backoffWithin := func(e *Error, start, end time.Time, want time.Duration, which string) {
+			t.Helper()
+			if e.RetryAt.Before(start.Add(want)) || e.RetryAt.After(end.Add(want)) {
+				t.Fatalf("%s retry at %v, want %v after the failure (call ran %v .. %v)", which,
+					e.RetryAt.Format(time.StampMilli), want, start.Format(time.StampMilli), end.Format(time.StampMilli))
+			}
+		}
+		start := time.Now()
 		_, err := transcribe(t, m, voice, nil, time.Minute)
+		end := time.Now()
 		e := mustKind(t, err, KindIntegrity)
 		if msg := UserMessage(err); !strings.Contains(msg, "checksum") || !strings.Contains(msg, "will not retry setup before") {
 			t.Fatalf("message: %s", msg)
 		}
-		if w := e.RetryAt.Sub(failed); w < base || w > base+5*time.Second {
-			t.Fatalf("first retry in %v, want about %v", w, base)
-		}
+		backoffWithin(e, start, end, base, "first")
 		if _, err := os.Stat(g.installDir(g.manifest.MMProj)); !os.IsNotExist(err) {
 			t.Fatalf("corrupt projector published: %v", err)
 		}
@@ -514,15 +523,14 @@ func TestFailureClassBrokenCache(t *testing.T) {
 		}
 		// After the backoff it tries again, and the next wait doubles.
 		time.Sleep(time.Until(e.RetryAt) + 50*time.Millisecond)
-		failed = time.Now()
+		start = time.Now()
 		_, err = transcribe(t, m, voice, nil, time.Minute)
+		end = time.Now()
 		e = mustKind(t, err, KindIntegrity)
 		if g.hitCount("mmproj.gguf") != hits+1 {
 			t.Fatalf("mmproj requests %d, want %d", g.hitCount("mmproj.gguf"), hits+1)
 		}
-		if w := e.RetryAt.Sub(failed); w < 2*base || w > 2*base+5*time.Second {
-			t.Fatalf("second retry in %v, want about %v", w, 2*base)
-		}
+		backoffWithin(e, start, end, 2*base, "second")
 		g.srv.set(func(s *assetServer) { delete(s.corrupt, "mmproj.gguf") })
 		time.Sleep(time.Until(e.RetryAt) + 50*time.Millisecond)
 		if _, err := transcribe(t, m, voice, nil, time.Minute); err != nil {
