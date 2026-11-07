@@ -79,7 +79,10 @@ fi
 [[ ${#extra_cflags[@]} -gt 0 ]] && configure_flags+=("--extra-cflags=${extra_cflags[*]}")
 [[ ${#extra_ldflags[@]} -gt 0 ]] && configure_flags+=("--extra-ldflags=${extra_ldflags[*]}")
 
-work=$(mktemp -d "${TMPDIR:-/tmp}/ffmpeg-audio.XXXXXX")
+# MSYS2 inherits a Windows-style TMPDIR (C:\...), which make cannot use.
+tmp=${TMPDIR:-/tmp}
+[[ "$tmp" == /* ]] || tmp=/tmp
+work=$(mktemp -d "$tmp/ffmpeg-audio.XXXXXX")
 trap 'rm -rf "$work"' EXIT
 echo "== configuring $name"
 (cd "$work" && "$src/configure" "${configure_flags[@]}") > "$work/configure.log" 2>&1 || {
@@ -88,9 +91,10 @@ echo "== configuring $name"
 grep -q '^License: LGPL version 2.1 or later' "$work/configure.log" || {
   grep '^License' "$work/configure.log" >&2; echo "ffmpeg is not LGPL-only" >&2; exit 1; }
 
-echo "== building"
+echo "== building with $(command -v make) ($(make --version | head -1))"
 make -C "$work" -j "$JOBS" ffmpeg > "$work/build.log" 2>&1 || {
-  grep -E -B2 -A10 'error|Error [0-9]' "$work/build.log" | head -120 >&2; exit 1; }
+  grep -E -B2 -A10 'error|Error [0-9]' "$work/build.log" | head -120 >&2
+  echo "== last lines of the build log" >&2; tail -40 "$work/build.log" >&2; exit 1; }
 
 out="$stage_parent/$name"
 rm -rf "$out"
