@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/channel"
+	"github.com/baaaaaaaka/codex-helper/internal/channel/channeltest"
 	"github.com/baaaaaaaka/codex-helper/internal/core/store"
 )
 
@@ -285,4 +287,29 @@ func TestMoveGuardNewCopyLeavesTurnsTheCopyLeftOpen(t *testing.T) {
 	if turns, _ := r.st.OpenTurns(); len(turns) != 0 {
 		t.Fatalf("open turns %+v", turns)
 	}
+}
+
+// Race CI 2026-11-07 (TestScanStaysWithinTheReadBudget): the activity
+// scan waits for the control chat's first read, and after a read throttle
+// the reads wait for the scan (scanFirst). An account throttle on that
+// first read left both waiting for each other: nothing was read or sent
+// again.
+func TestControlFirstReadAfterAThrottleWithTheScanWaiting(t *testing.T) {
+	r := newRig(t, func(c *Config) {
+		c.Channel = &lagScanner{Fake: c.Channel.(*channeltest.Fake)}
+		c.ActivityScan, c.Timing.ScanInterval = true, 50*time.Millisecond
+	})
+	ctl := r.control()
+	r.stop()
+
+	var throttled atomic.Int32
+	r.ch.ReceiveFault = func(stream string) error {
+		if strings.Contains(stream, ctl) && throttled.Add(1) == 1 {
+			return &channel.Throttled{RetryAfter: 100 * time.Millisecond, Scope: channel.ScopeAccount, Err: errors.New("429")}
+		}
+		return nil
+	}
+	r.ch.PostUser(ctl, "status")
+	r.start()
+	r.wait("the reply after the throttled first read", func() bool { return len(r.own(ctl, "Control status")) == 1 })
 }

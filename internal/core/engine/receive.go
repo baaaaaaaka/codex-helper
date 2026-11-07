@@ -1268,7 +1268,10 @@ func (e *Engine) scanLoop(ctx context.Context) {
 			// The control chat's first read goes first (nothing is
 			// sent before it, takeover.go): a small read budget is not
 			// spent on scans meanwhile; the start-up reads cover what
-			// a scan would show.
+			// a scan would show. Nor do the reads wait for the scan
+			// (scanFirst), which would wait for them in turn.
+			e.scanFirst.Store(false)
+			waiting = false
 			continue
 		}
 		now := e.now()
