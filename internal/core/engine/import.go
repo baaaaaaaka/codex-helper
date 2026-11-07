@@ -427,6 +427,7 @@ func (e *Engine) importApplyOne(j importJob) bool {
 // mirrorTracker is a tracker for f at its persisted cursor.
 func (e *Engine) mirrorTracker(f *mirrorFile) *transcript.Tracker {
 	t := transcript.NewTracker(f.src.ThreadID, f.src.Offset, f.src.Line, e.mirrorSkip)
+	e.restoreInfo(f, t)
 	if f.keepTeams > 0 {
 		t.KeepTeams(f.keepTeams)
 	}

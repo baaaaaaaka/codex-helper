@@ -143,6 +143,7 @@
 -- <msg:20> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-IMPORTAGAIN-teams-turn-1</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:21> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>

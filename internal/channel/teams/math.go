@@ -35,12 +35,19 @@ const (
 	maxMathTotalBytes   = 32 << 10 // per document
 	maxMathFormulas     = 32       // markers per document
 	maxMathBraceDepth   = 64
-	maxImagesPerPart    = 5
-	maxPartImageBytes   = 2 << 20 // PNG bytes per part (base64 grows it by 4/3)
-	maxPNGBytes         = 4 << 20
-	maxPNGSide          = 4096
-	maxPNGPixels        = 8 << 20
-	mathOpen, mathClose = "<m>", "</m>"
+	// Formula images per part. Graph documents no count limit for a
+	// message's hostedContents (owner question 2026-11-07: v0.1.20's 5
+	// was the helper's own choice, the same as its inbound image limit),
+	// so a part takes as many as its HTML budget and maxPartImageBytes allow;
+	// a refused part is posted again with fallbackImagesPerPart images,
+	// then with none (Adapter.Send).
+	maxImagesPerPart      = maxMathFormulas
+	fallbackImagesPerPart = 5
+	maxPartImageBytes     = 2 << 20 // PNG bytes per part (base64 grows it by 4/3; Graph takes ~4 MB per request)
+	maxPNGBytes           = 4 << 20
+	maxPNGSide            = 4096
+	maxPNGPixels          = 8 << 20
+	mathOpen, mathClose   = "<m>", "</m>"
 )
 
 var (

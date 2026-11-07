@@ -80,6 +80,7 @@
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-MOVEDHOME-first-1</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:6> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
@@ -93,6 +94,7 @@
 -- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-MOVEDHOME-gap-4</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == chat <chat:3> "💬 e2ehost - Local question E2E-MOVEDHOME-tuiprompt1-2"
@@ -106,6 +108,7 @@
 -- <msg:3> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>Local answer E2E-MOVEDHOME-tuianswer1-3</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>

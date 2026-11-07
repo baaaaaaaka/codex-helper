@@ -32,8 +32,39 @@ type Output struct {
 	Time     time.Time
 	TurnID   string
 	End      int64 // end offset of the record
+	Info     Info  // the thread's goal and settings when the record was released
 	line     int64 // 1-based line of the record (ids of id-less records)
 	start    int64
+}
+
+// Info is what the rollout said last of its thread's goal and model
+// settings: the goal (thread_goal_updated), the model and effort
+// (turn_context, thread_settings_applied) and the service tier
+// (thread_settings_applied; "" = standard).
+type Info struct {
+	Goal   *Goal  `json:"goal,omitempty"`
+	Model  string `json:"model,omitempty"`
+	Effort string `json:"effort,omitempty"`
+	Tier   string `json:"tier,omitempty"`
+}
+
+func (i *Info) update(u *InfoUpdate) {
+	if u == nil {
+		return
+	}
+	if u.Goal != nil {
+		g := *u.Goal
+		i.Goal = &g
+	}
+	if u.Model != "" {
+		i.Model = u.Model
+	}
+	if u.Effort != nil {
+		i.Effort = *u.Effort
+	}
+	if u.Tier != nil {
+		i.Tier = *u.Tier
+	}
 }
 
 // Key returns the delivery key of part (1-based) of o in thread.
@@ -71,6 +102,22 @@ type Tracker struct {
 	held      *heldCompact // a compacted record that a context_compacted may still replace
 	last      time.Time
 	keep      int64 // KeepTeams: helper-run records ending at or before it are mirrored too
+	info      Info
+}
+
+// Info returns what the records read so far said of the thread's goal and
+// settings.
+func (t *Tracker) Info() Info { return t.info }
+
+// SetInfo seeds Info for a tracker that starts after the records that
+// said it (the mirror persists it with the read position).
+func (t *Tracker) SetInfo(i Info) { t.info = i }
+
+// stamp gives the outputs out[from:] the current Info.
+func (t *Tracker) stamp(out []Output, from int) {
+	for i := from; i < len(out); i++ {
+		out[i].Info = t.info
+	}
 }
 
 type openTurn struct {
@@ -81,7 +128,12 @@ type openTurn struct {
 	teams     bool
 	decided   bool // the helper/local decision is known
 	finalSeen bool
-	pending   []Output
+	// prompted: a prompt record was read; early: decided by a commentary
+	// record of a turn without a prompt (a goal continuation, which Codex
+	// starts by itself), so a prompt steered into it later waits for its
+	// user item again.
+	prompted, early bool
+	pending         []Output
 }
 
 type heldCompact struct {
@@ -188,7 +240,9 @@ func (t *Tracker) Feed(lines []Line) []Output {
 		if !ev.Time.IsZero() && ev.Time.After(t.last) {
 			t.last = ev.Time
 		}
+		n := len(out)
 		out = t.apply(out, ev, l)
+		t.stamp(out, n)
 	}
 	return out
 }
@@ -246,6 +300,7 @@ func (t *Tracker) apply(out []Output, ev Event, l Line) []Output {
 	if ev.ThreadID != "" && t.threadID != "" && ev.Kind != KindSessionMeta && ev.ThreadID != t.threadID {
 		return out // a subagent's item inside this rollout
 	}
+	t.info.update(ev.Info)
 	if t.held != nil && ev.Kind != KindCompact && breaksCompaction(l, ev) {
 		out = t.release(out)
 	}
@@ -281,6 +336,10 @@ func (t *Tracker) apply(out []Output, ev Event, l Line) []Output {
 		if LegacyTeamsPrompt(text) {
 			t.turn.teams = true
 		}
+		t.turn.prompted = true
+		if t.turn.early {
+			t.turn.decided, t.turn.early = false, false
+		}
 		o := Output{RecordID: ev.RecordID, Kind: OutputPrompt, User: true, Text: text, Time: ev.Time, End: l.End, line: t.line, start: l.Off}
 		out = t.add(out, o, t.turn)
 	case KindUserItem:
@@ -304,6 +363,12 @@ func (t *Tracker) apply(out []Output, ev Event, l Line) []Output {
 				// A scan that began mid-turn before any record naming
 				// the turn: held until the turn is known.
 				t.turn = &openTurn{}
+			}
+			if tr := t.turn; tr.started && tr.id != "" && !tr.decided && !tr.prompted {
+				// Codex works without a prompt (goal continuation): its
+				// status goes out as it comes, not at the turn's end.
+				tr.decided, tr.early = true, true
+				out = t.flush(out)
 			}
 			o := Output{RecordID: ev.RecordID, Kind: OutputStatus, Text: text, Time: ev.Time, End: l.End, line: t.line, start: l.Off}
 			return t.add(out, o, t.turn)
@@ -389,7 +454,9 @@ func (t *Tracker) Settle() []Output {
 		tr.teams = true
 	}
 	tr.decided = true
-	return t.flush(nil)
+	out := t.flush(nil)
+	t.stamp(out, 0)
+	return out
 }
 
 // end closes the open turn, releasing its held records.

@@ -24,6 +24,7 @@
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong> <at id="0">E2E Owner</at></p>
    | <p>E2EANSWER-<n> answer for E2E-CTLQAVOICE-voice-1</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - low, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
    mention 0: owner "E2E Owner"
 
@@ -169,6 +170,7 @@
    prompt| `helper park <session-number-or-id>` / `helper resume <session-number-or-id>` / `helper unpark <session-number-or-id>` - manually pause or resume polling for a Work chat
    prompt| `helper unpause` - resume auto-start after a pause (requests sent while paused are not run)
    prompt| `helper fork` - copy this session into a new Work chat
+   prompt| `helper goal` / `helper goal <objective>` / `helper goal active` / `helper goal pause` - show, set, resume or pause this chat's Codex goal (Codex keeps working on an active goal by itself; `helper cancel` pauses it)
    prompt| `helper publish-history` or `!ph` - import a paused local Codex history backlog
    prompt| `helper publish-history full` - publish the complete local Codex history once to this chat
    prompt| advanced commands: `helper retry last`, `helper retry <turn-id>` / `!retry <turn-id>`, or `helper cancel last`, `helper cancel queued`, `helper cancel running`, `helper cancel all`, `helper cancel <turn-id>` / `!cancel <turn-id>`

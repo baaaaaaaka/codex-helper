@@ -94,11 +94,13 @@
 -- <msg:11> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-R429-queued-2</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:12> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>▶️ Queued request: “Sent while helper is down E2E-R429-whiledown-3”</p>
    | <p>E2EANSWER-<n> answer for E2E-R429-whiledown-3</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == codex turns (per thread; threads by kind, directory and first prompt; turns in start order)

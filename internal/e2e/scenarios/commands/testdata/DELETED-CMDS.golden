@@ -112,6 +112,7 @@
    | <code>helper details</code> or <code>!details</code> - show debug IDs and links<br>
    | <code>model status</code>, <code>model switch &lt;model&gt;</code>, <code>model reset</code>, or <code>model fork &lt;model&gt;</code> - inspect or change this Work chat model<br>
    | <code>effort status</code>, <code>effort list</code>, <code>effort set &lt;value&gt;</code>, or <code>effort reset</code> - inspect or change this Work chat&#39;s reasoning effort<br>
+   | <code>helper goal</code> - show this chat&#39;s Codex goal; <code>helper goal &lt;objective&gt;</code> sets it and makes it active; <code>helper goal active</code> / <code>helper goal pause</code> resume or pause it<br>
    | <code>default ...</code> - global defaults are Control-chat-only<br>
    | <code>helper publish-history</code> - import a paused local Codex history backlog<br>
    | <code>helper publish-history full</code> - publish the complete local Codex history once to this chat<br>
@@ -136,6 +137,7 @@
    | <code>helper details</code> or <code>!details</code> - show debug IDs and links<br>
    | <code>model status</code>, <code>model switch &lt;model&gt;</code>, <code>model reset</code>, or <code>model fork &lt;model&gt;</code> - inspect or change this Work chat model<br>
    | <code>effort status</code>, <code>effort list</code>, <code>effort set &lt;value&gt;</code>, or <code>effort reset</code> - inspect or change this Work chat&#39;s reasoning effort<br>
+   | <code>helper goal</code> - show this chat&#39;s Codex goal; <code>helper goal &lt;objective&gt;</code> sets it and makes it active; <code>helper goal active</code> / <code>helper goal pause</code> resume or pause it<br>
    | <code>default ...</code> - global defaults are Control-chat-only<br>
    | <code>helper publish-history</code> - import a paused local Codex history backlog<br>
    | <code>helper publish-history full</code> - publish the complete local Codex history once to this chat<br>

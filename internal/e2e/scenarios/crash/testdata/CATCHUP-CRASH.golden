@@ -199,6 +199,7 @@
 -- <msg:3> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>Live answer 1 E2E-CATCHUPCRASH-Livea-3</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
@@ -352,4 +353,5 @@
 -- <msg:3> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>Probe answer E2E-CATCHUPCRASH-probe-1</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>

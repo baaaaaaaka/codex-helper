@@ -117,19 +117,29 @@ func (s *Server) ThreadStart(ctx context.Context, p ThreadStartParams) (Thread, 
 	if len(p.Config) > 0 {
 		params["config"] = p.Config
 	}
+	var raw json.RawMessage
+	if err := s.Call(ctx, "thread/start", params, &raw); err != nil {
+		return Thread{}, err
+	}
 	var res struct {
 		Thread Thread `json:"thread"`
 	}
-	err := s.Call(ctx, "thread/start", params, &res)
+	err := json.Unmarshal(raw, &res)
+	s.loadedResponse(res.Thread.ID, raw)
 	return res.Thread, err
 }
 
 // ThreadResume loads an existing thread into this server (without turns).
 func (s *Server) ThreadResume(ctx context.Context, threadID string) (Thread, error) {
+	var raw json.RawMessage
+	if err := s.Call(ctx, "thread/resume", map[string]any{"threadId": threadID, "excludeTurns": true}, &raw); err != nil {
+		return Thread{}, err
+	}
 	var res struct {
 		Thread Thread `json:"thread"`
 	}
-	err := s.Call(ctx, "thread/resume", map[string]any{"threadId": threadID, "excludeTurns": true}, &res)
+	err := json.Unmarshal(raw, &res)
+	s.loadedResponse(threadID, raw)
 	return res.Thread, err
 }
 

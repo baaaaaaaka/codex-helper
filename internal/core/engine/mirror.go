@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -114,6 +115,8 @@ type mirrorFile struct {
 	// which helper-run turns are mirrored too.
 	ns        string
 	keepTeams int64
+	// infoSaved is the tracker Info last persisted (srcInfoKey).
+	infoSaved string
 }
 
 // catchingUp is the one boundary between catch-up and live mirroring
@@ -137,6 +140,36 @@ func catchUpFrom(at transcript.FileInfo, atStart bool) int64 {
 }
 
 func realignKey(srcID int64) string { return fmt.Sprintf("%s%d", metaRealignPrefix, srcID) }
+
+// metaSrcInfoPrefix + source id: what the rollout said last of its
+// thread's goal and model settings (transcript.Info, JSON), so a tracker
+// that resumes after those records still knows them.
+const metaSrcInfoPrefix = "engine_srcinfo:"
+
+func srcInfoKey(srcID int64) string { return fmt.Sprintf("%s%d", metaSrcInfoPrefix, srcID) }
+
+// restoreInfo seeds t, a tracker of f at its persisted cursor, with what
+// the records before the cursor said of the goal and settings.
+func (e *Engine) restoreInfo(f *mirrorFile, t *transcript.Tracker) {
+	if f.src.ID == 0 || f.src.Offset == 0 {
+		return
+	}
+	if v, _, err := e.st.Meta(srcInfoKey(f.src.ID)); err == nil && v != "" {
+		var i transcript.Info
+		if json.Unmarshal([]byte(v), &i) == nil {
+			t.SetInfo(i)
+			f.infoSaved = v
+		}
+	}
+}
+
+func infoJSON(i transcript.Info) string {
+	if i == (transcript.Info{}) {
+		return ""
+	}
+	b, _ := json.Marshal(i)
+	return string(b)
+}
 
 func (e *Engine) mirrorSkipTurn(codexTurnID string) {
 	if e.mirror == nil || codexTurnID == "" {
@@ -212,6 +245,7 @@ func (e *Engine) mirrorInit() error {
 				f.realign, f.realignAt = true, fromMS(at)
 			}
 		}
+		e.restoreInfo(f, f.tracker)
 		e.importRestore(f) // import.go
 		m.files[s.Path] = f
 	}
@@ -672,6 +706,7 @@ func (e *Engine) track(src store.TranscriptSource, catchUp int64) {
 	}
 	f := &mirrorFile{src: src, tracker: transcript.NewTracker(src.ThreadID, src.Offset, src.Line, e.mirrorSkip),
 		catchUpEnd: catchUp, catchUpSet: true}
+	e.restoreInfo(f, f.tracker)
 	e.importRestore(f) // import.go
 	e.mirror.mu.Lock()
 	delete(e.mirror.known, src.Path)
@@ -912,7 +947,7 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 		if o.Kind != transcript.OutputPrompt && o.Kind != transcript.OutputFinal && f.catchingUp(o) {
 			continue // catch-up posts prompts and finals only
 		}
-		msgs, err := e.renderMirror(ctx, thread, o)
+		msgs, err := e.renderMirror(ctx, thread, o, !f.catchingUp(o))
 		if err != nil {
 			// Re-read these records from the persisted position after a
 			// backoff (review M7): never lose them.
@@ -945,8 +980,10 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 	e.mu.Unlock()
 	var posted, notify int
 	var liveThrough int64 // the seq of the last row queued for a live record
+	saved := f.infoSaved
 	err = e.update(func(tx *store.Tx) error {
 		posted, woke, created, notify, liveThrough = 0, false, false, 0, 0
+		saved = f.infoSaved
 		anyLive := false
 		var msgs []store.OutMsg
 		firstLive := false
@@ -1052,6 +1089,12 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 		if err := tx.AdvanceSource(f.src.ID, off, line, info.Size, ms(info.MTime), info.Inode, msgs); err != nil {
 			return err
 		}
+		if v := infoJSON(f.tracker.Info()); v != f.infoSaved && f.src.ID != 0 {
+			if err := tx.SetMeta(srcInfoKey(f.src.ID), v); err != nil {
+				return err
+			}
+			saved = v
+		}
 		if anyLive {
 			var err error
 			if liveThrough, err = tx.LastSeq(f.src.ConvID); err != nil {
@@ -1067,6 +1110,7 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 		return
 	}
 	f.src.Offset, f.src.Line, f.src.Size, f.src.MTime, f.src.Inode = off, line, info.Size, ms(info.MTime), info.Inode
+	f.infoSaved = saved
 	f.realign, f.realignAt = realign && more, realignAt
 	if !more {
 		f.info = info
@@ -1101,7 +1145,10 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 // footer, a commentary or compaction notice under "🤖 ⏳ Codex status:"; a
 // long one carries "[part i/n]" in every part's header. None mentions the
 // owner in the work chat.
-func (e *Engine) renderMirror(ctx context.Context, thread string, o transcript.Output) ([]store.OutMsg, error) {
+//
+// A live record (not catch-up) of Codex closes with the goal and model
+// lines of its thread as the rollout said them then (infoNotes).
+func (e *Engine) renderMirror(ctx context.Context, thread string, o transcript.Output, live bool) ([]store.OutMsg, error) {
 	var doc channel.RichDoc
 	switch {
 	case o.User || o.Kind == transcript.OutputPrompt:
@@ -1110,6 +1157,9 @@ func (e *Engine) renderMirror(ctx context.Context, thread string, o transcript.O
 		doc = statusDoc(o.Text) // commentary, compaction: Codex status
 	default:
 		doc = answerDoc(o.Text)
+	}
+	if live && !o.User && o.Kind != transcript.OutputPrompt {
+		doc.Notes = infoNotes(mirrorInfo(o.Info), o.Kind == transcript.OutputFinal)
 	}
 	parts, err := e.ch.Render(ctx, doc)
 	if err != nil {
@@ -1121,4 +1171,13 @@ func (e *Engine) renderMirror(ctx context.Context, thread string, o transcript.O
 			Body: p.Body, BodyHash: hashBytes(p.Hash)})
 	}
 	return out, nil
+}
+
+// mirrorInfo is the TurnInfo of a mirrored record.
+func mirrorInfo(i transcript.Info) TurnInfo {
+	out := TurnInfo{Model: i.Model, Effort: i.Effort, Tier: i.Tier}
+	if i.Goal != nil && i.Goal.Status == GoalActive {
+		out.Goal = i.Goal.Objective
+	}
+	return out
 }

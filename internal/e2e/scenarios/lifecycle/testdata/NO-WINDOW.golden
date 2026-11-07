@@ -41,6 +41,7 @@
 -- <msg:3> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>Probe answer E2E-NOWINDOW-probe-1</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == chat <chat:3> "💬 e2ehost - Session from 121 days ago"

@@ -185,17 +185,24 @@ func (a *Adapter) Send(ctx context.Context, chat string, p channel.Part, token s
 		Created string `json:"createdDateTime"`
 	}
 	err = a.g.writeJSON(ctx, http.MethodPost, path, in, &out)
-	if err != nil && formulaImagesRefused(err) {
-		// Graph refused the formula images (as v0.1.20 handled it): the
-		// message was not stored, so post it again with the TeX code only.
-		if plain, ok := withoutFormulaImages(msg); ok {
-			if p.ReplyTo != "" {
-				in = map[string]any{"messageIds": []string{p.ReplyTo}, "replyMessage": plain}
-			} else {
-				in = plain
-			}
-			err = a.g.writeJSON(ctx, http.MethodPost, path, in, &out)
+	// Graph refused the formula images: the message was not stored, so
+	// post it again with fallbackImagesPerPart images (in case Teams has
+	// an undocumented count limit), then with the TeX code only (as
+	// v0.1.20 did).
+	for _, keep := range []int{fallbackImagesPerPart, 0} {
+		if err == nil || !formulaImagesRefused(err) {
+			break
 		}
+		fewer, ok := withFormulaImages(msg, keep)
+		if !ok {
+			continue
+		}
+		if p.ReplyTo != "" {
+			in = map[string]any{"messageIds": []string{p.ReplyTo}, "replyMessage": fewer}
+		} else {
+			in = fewer
+		}
+		err = a.g.writeJSON(ctx, http.MethodPost, path, in, &out)
 	}
 	if err != nil {
 		return channel.Sent{}, err
@@ -222,17 +229,18 @@ func formulaImagesRefused(err error) bool {
 	return false
 }
 
-var formulaImageRE = regexp.MustCompile(`<p><img src="\.\./hostedContents/[^"]*"[^>]*></p>`)
+var formulaImageRE = regexp.MustCompile(`<p><img src="\.\./hostedContents/([^/"]*)/\$value"[^>]*></p>`)
 
-// withoutFormulaImages drops the hosted formula images from a message body;
-// the TeX code blocks stay. ok is false when there were none.
-func withoutFormulaImages(msg json.RawMessage) (json.RawMessage, bool) {
+// withFormulaImages keeps the first keep hosted formula images of a
+// message body and drops the others (keep 0: all); their TeX code blocks
+// stay. ok is false when the message has no more than keep images.
+func withFormulaImages(msg json.RawMessage, keep int) (json.RawMessage, bool) {
 	var m map[string]json.RawMessage
 	if json.Unmarshal(msg, &m) != nil {
 		return nil, false
 	}
-	var hosted []json.RawMessage
-	if json.Unmarshal(m["hostedContents"], &hosted) != nil || len(hosted) == 0 {
+	var hosted []map[string]any
+	if json.Unmarshal(m["hostedContents"], &hosted) != nil || len(hosted) <= keep {
 		return nil, false
 	}
 	var b struct {
@@ -242,10 +250,26 @@ func withoutFormulaImages(msg json.RawMessage) (json.RawMessage, bool) {
 	if json.Unmarshal(m["body"], &b) != nil {
 		return nil, false
 	}
-	b.Content = formulaImageRE.ReplaceAllString(b.Content, "")
+	kept := map[string]bool{}
+	for _, h := range hosted[:keep] {
+		if id, _ := h["@microsoft.graph.temporaryId"].(string); id != "" {
+			kept[id] = true
+		}
+	}
+	b.Content = formulaImageRE.ReplaceAllStringFunc(b.Content, func(img string) string {
+		if kept[formulaImageRE.FindStringSubmatch(img)[1]] {
+			return img
+		}
+		return ""
+	})
 	raw, _ := json.Marshal(b)
 	m["body"] = raw
-	delete(m, "hostedContents")
+	if keep == 0 {
+		delete(m, "hostedContents")
+	} else {
+		raw, _ := json.Marshal(hosted[:keep])
+		m["hostedContents"] = raw
+	}
 	out, err := json.Marshal(m)
 	return out, err == nil
 }

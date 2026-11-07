@@ -36,6 +36,56 @@ type Agent interface {
 	Close()
 }
 
+// GoalAgent is an Agent that knows Codex thread goals and settings
+// (owner request 2026-11-07; codexagent). Without it the helper shows no
+// goal or model line and `helper goal` answers that Codex has no goals.
+type GoalAgent interface {
+	// Info is what the app-server of convID knows of threadID now: its
+	// active goal and its effective model, effort and tier (zero when
+	// convID has no app-server).
+	Info(convID int64, threadID string) TurnInfo
+	// Goal reads the goal of threadID (change zero) or sets it as the
+	// user: a new objective and/or a status (GoalActive, GoalPaused). An
+	// active goal on an idle thread makes Codex start working on it.
+	Goal(ctx context.Context, convID int64, threadID, cwd string, change GoalState) (GoalState, error)
+	// StopGoal is the goal part of `helper cancel`: it pauses the active
+	// goal of threadID (if the app-server of convID has it loaded) and
+	// interrupts a turn Codex runs by itself in it (a goal continuation).
+	StopGoal(ctx context.Context, convID int64, threadID string) (GoalStopped, error)
+}
+
+// ErrActiveWriter: Codex refused to load the thread because another
+// Codex process is writing to it (GoalAgent.Goal).
+var ErrActiveWriter = errors.New("the session is open in another Codex window that is writing to it")
+
+// TurnInfo is shown with a Codex message: the objective of the active
+// goal ("" when no goal is active) and the effective model settings.
+type TurnInfo struct {
+	Goal                string
+	Model, Effort, Tier string
+	// SelfTurn: Codex runs a turn in the thread that the helper did not
+	// start (a goal continuation).
+	SelfTurn bool
+}
+
+// GoalState is a thread goal (Status "" = no goal).
+type GoalState struct {
+	Objective, Status string
+}
+
+// Goal statuses the helper sets.
+const (
+	GoalActive = "active"
+	GoalPaused = "paused"
+)
+
+// GoalStopped reports what StopGoal did.
+type GoalStopped struct {
+	Paused      bool   // an active goal was paused
+	Interrupted bool   // a turn Codex ran by itself was interrupted
+	Objective   string // the paused goal's objective
+}
+
 // Forked is the new thread of a fork: its id and, when Codex names it, its
 // rollout file (it may already hold a copy of the parent's history, as
 // Codex 0.133-0.145 wrote it, or only its own session_meta, as 0.166).

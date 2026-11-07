@@ -190,3 +190,64 @@ func TestLookupDoesNotStartAConversationServer(t *testing.T) {
 		t.Fatal("Lookup started the conversation's server without its working directory")
 	}
 }
+
+// The goal calls of the agent (2026-11-07): Goal loads the thread on the
+// conversation's server and reads or sets its goal; Info reports the
+// active goal and the model the server knows; StopGoal pauses the goal.
+func TestGoalInfoAndStopGoal(t *testing.T) {
+	brain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/begin":
+			_ = json.NewEncoder(w).Encode(fakecodex.Plan{Seq: 1})
+		case "/await":
+			_ = json.NewEncoder(w).Encode(fakecodex.AwaitResult{Outcome: "answered", Answer: "done"})
+		case "/resume":
+			_ = json.NewEncoder(w).Encode(fakecodex.ResumeDecision{})
+		default:
+			_, _ = w.Write([]byte("{}"))
+		}
+	}))
+	defer func() { brain.CloseClientConnections(); brain.Close() }()
+	exe, err := helperpath.RawExecutable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	a := New(Config{Server: codex.Config{Bin: exe, Env: []string{envFake + "=1", "CODEX_HOME=" + home, fakecodex.EnvBrainURL + "=" + brain.URL}, Dir: home},
+		Poll: 100 * time.Millisecond})
+	defer a.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	var thread string
+	out, err := a.Run(ctx, engine.TurnRequest{ConvID: 1, Cwd: home, TurnKey: "k-1", Text: "hello"}, engine.TurnHooks{
+		ThreadStarted: func(id string) error { thread = id; return nil },
+	})
+	if err != nil || out.Status != engine.StatusCompleted {
+		t.Fatalf("turn: %+v %v", out, err)
+	}
+	if i := a.Info(1, thread); i.Model != "gpt-5-codex" || i.Goal != "" || i.SelfTurn {
+		t.Fatalf("info: %+v", i)
+	}
+	if i := a.Info(2, thread); i != (engine.TurnInfo{}) {
+		t.Fatalf("info of a conversation without a server: %+v", i)
+	}
+	if g, err := a.Goal(ctx, 1, thread, home, engine.GoalState{}); err != nil || g.Status != "" {
+		t.Fatalf("no goal: %+v %v", g, err)
+	}
+	if g, err := a.Goal(ctx, 1, thread, home, engine.GoalState{Objective: "Ship it", Status: engine.GoalActive}); err != nil || g.Status != engine.GoalActive {
+		t.Fatalf("set: %+v %v", g, err)
+	}
+	if i := a.Info(1, thread); i.Goal != "Ship it" {
+		t.Fatalf("info with the goal: %+v", i)
+	}
+	res, err := a.StopGoal(ctx, 1, thread)
+	if err != nil || !res.Paused || res.Interrupted || res.Objective != "Ship it" {
+		t.Fatalf("stop: %+v %v", res, err)
+	}
+	if g, err := a.Goal(ctx, 1, thread, home, engine.GoalState{}); err != nil || g.Status != engine.GoalPaused {
+		t.Fatalf("after stop: %+v %v", g, err)
+	}
+	if res, err := a.StopGoal(ctx, 1, thread); err != nil || res.Paused {
+		t.Fatalf("second stop: %+v %v", res, err)
+	}
+}

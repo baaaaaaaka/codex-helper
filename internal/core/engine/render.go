@@ -126,3 +126,59 @@ func textReconnecting(message, code string) string {
 	}
 	return strings.Join(lines, "\n")
 }
+
+// Goal and model lines (owner request 2026-11-07): every new Codex message
+// (status or answer) of a thread with an active goal closes with
+// "🎯 Active goal: <objective, clipped>", and every new answer with
+// "🔧 Helper: model - X, effort - Y, tier - Z", both before the "Codex
+// finished responding" footer. Messages rendered before are not changed.
+const (
+	labelGoal    = "🎯 Active goal"
+	goalNoteMax  = 80
+	textModelFmt = "model - %s, effort - %s, tier - %s"
+)
+
+// infoNotes are the closing lines of a Codex message given what is known
+// of its thread (answer: the message is an answer, not a status).
+func infoNotes(info TurnInfo, answer bool) []channel.Note {
+	var out []channel.Note
+	if g := strings.TrimSpace(info.Goal); g != "" {
+		out = append(out, channel.Note{Label: labelGoal, Text: shortLine(strings.Join(strings.Fields(g), " "), goalNoteMax)})
+	}
+	if answer && strings.TrimSpace(info.Model) != "" {
+		effort := strings.TrimSpace(info.Effort)
+		if effort == "" {
+			effort = "default"
+		}
+		out = append(out, channel.Note{Label: labelHelper, Text: fmt.Sprintf(textModelFmt, strings.TrimSpace(info.Model), effort, tierName(info.Tier))})
+	}
+	return out
+}
+
+// tierName is the service tier as the owner knows it: Codex sends
+// "priority" for fast (older Codex "fast"), "flex", and nothing or
+// "default" for the standard tier.
+func tierName(tier string) string {
+	switch t := strings.ToLower(strings.TrimSpace(tier)); t {
+	case "", "default", "standard", "auto":
+		return "standard"
+	case "priority", "fast":
+		return "fast"
+	default:
+		return t
+	}
+}
+
+// turnInfo is what the agent knows now of the thread of conv (zero
+// without a GoalAgent).
+func (e *Engine) turnInfo(conv int64) TurnInfo {
+	ga, ok := e.ag.(GoalAgent)
+	if !ok {
+		return TurnInfo{}
+	}
+	th := e.threadOf(conv)
+	if th == "" {
+		return TurnInfo{}
+	}
+	return ga.Info(conv, th)
+}

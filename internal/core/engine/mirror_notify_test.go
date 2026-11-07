@@ -67,10 +67,12 @@ func TestLiveMirroredFinalsNotifyTheOwner(t *testing.T) {
 		"🔧 Helper:\nLocal Codex chat detected: s001.",
 		"🧑\u200d💻 User:\nlive prompt one",
 		"🤖 ⏳ Codex status:\nlive commentary one",
-		"🤖 ✅ Codex answer:\nlive answer one\n🔧 Helper: ✅ Codex finished responding.",
+		// The model line of the turn (2026-11-07; the rollout's
+		// turn_context, no tier recorded: standard).
+		"🤖 ✅ Codex answer:\nlive answer one\n🔧 Helper: model - gpt-5-codex, effort - medium, tier - standard\n🔧 Helper: ✅ Codex finished responding.",
 		"🤖 ⏳ Codex status:\n" + transcript.CompactText,
 		"🧑\u200d💻 User:\nlive prompt two",
-		"🤖 ✅ Codex answer:\nlive answer two\n🔧 Helper: ✅ Codex finished responding.",
+		"🤖 ✅ Codex answer:\nlive answer two\n🔧 Helper: model - gpt-5-codex, effort - medium, tier - standard\n🔧 Helper: ✅ Codex finished responding.",
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("local chat:\n%q\nwant:\n%q", got, want)

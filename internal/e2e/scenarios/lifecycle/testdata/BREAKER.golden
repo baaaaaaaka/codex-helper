@@ -97,6 +97,7 @@
 -- <msg:11> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>Final of the running turn E2E-BREAKER-running-1</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:12> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
@@ -128,6 +129,7 @@
 -- <msg:18> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-BREAKER-afterunpause-7</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == chat <chat:3> "💬 e2ehost - Quick question 0 E2E-BREAKER-burst0-2"
@@ -178,6 +180,7 @@
 -- <msg:9> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-BREAKER-burst0-2</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:10> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -188,11 +191,13 @@
 -- <msg:11> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-BREAKER-burst1-3</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:12> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>▶️ Queued request: “Quick question 2 E2E-BREAKER-burst2-4”</p>
    | <p>E2EANSWER-<n> answer for E2E-BREAKER-burst2-4</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == codex turns (per thread; threads by kind, directory and first prompt; turns in start order)

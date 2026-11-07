@@ -74,6 +74,7 @@ type Server struct {
 	nextID  int64
 	pending map[int64]chan rpcResult
 	subs    map[string]map[int]func(Notification)
+	threads map[string]*ThreadInfo // threadstate.go
 	subSeq  int
 	exitErr error
 
@@ -351,6 +352,7 @@ func (s *Server) handleLine(line []byte) {
 			ThreadID string `json:"threadId"`
 		}
 		_ = json.Unmarshal(m.Params, &p)
+		s.track(m.Method, p.ThreadID, m.Params)
 		n := Notification{Method: m.Method, Params: m.Params}
 		s.mu.Lock()
 		var fns []func(Notification)

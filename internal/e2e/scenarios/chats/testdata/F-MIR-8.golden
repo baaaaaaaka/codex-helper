@@ -66,6 +66,7 @@
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>Visible answer for E2E-FMIR8-cite-1</p>
    | <pre><code>&lt;oai-mem-citation&gt;example kept in a code block&lt;/oai-mem-citation&gt;</code></pre>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
@@ -73,6 +74,7 @@
 -- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>Local answer E2E-FMIR8-tuianswer-5</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == codex turns (per thread; threads by kind, directory and first prompt; turns in start order)

@@ -35,7 +35,7 @@ func TestMirrorRendersV0120Labels(t *testing.T) {
 	}
 	const footer = "<p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>"
 
-	short, err := e.renderMirror(ctx, "th", transcript.Output{RecordID: "r1", User: true, Text: "看一下这个问题"})
+	short, err := e.renderMirror(ctx, "th", transcript.Output{RecordID: "r1", User: true, Text: "看一下这个问题"}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +43,7 @@ func TestMirrorRendersV0120Labels(t *testing.T) {
 		t.Fatalf("short prompt: %q", content(short[0].Body))
 	}
 
-	ans, err := e.renderMirror(ctx, "th", transcript.Output{RecordID: "r3", Text: "Done."})
+	ans, err := e.renderMirror(ctx, "th", transcript.Output{RecordID: "r3", Text: "Done."}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +64,7 @@ func TestMirrorRendersV0120Labels(t *testing.T) {
 		if user {
 			label = "🧑‍💻 User"
 		}
-		long, err := e.renderMirror(ctx, "th", transcript.Output{RecordID: "r2", User: user, Text: b.String()})
+		long, err := e.renderMirror(ctx, "th", transcript.Output{RecordID: "r2", User: user, Text: b.String()}, false)
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -67,7 +67,22 @@ var (
 	reHistoryUser   = regexp.MustCompile(`^\W*User(?:\s*\[part \d+/\d+\])?\s*:`)
 	reHistoryAnswer = regexp.MustCompile(`^\W*(?:Codex answer|Codex final)(?:\s*\[part \d+/\d+\])?\s*:`)
 	reHistoryFooter = regexp.MustCompile(`\W*Helper\s*:\W*Codex finished responding\W*$`)
+	// reHistoryNote: a closing line before the footer (render.go
+	// infoNotes): the active goal, the model line.
+	reHistoryNote = regexp.MustCompile(`^\W*(?:Active goal\s*:|Helper\s*:\s*model - .*, effort - .*, tier - )`)
 )
+
+// stripHistoryNotes removes the closing note lines at the end of text.
+func stripHistoryNotes(text string) string {
+	for {
+		text = strings.TrimRight(text, " \t\r\n")
+		i := strings.LastIndexByte(text, '\n')
+		if i < 0 || !reHistoryNote.MatchString(text[i+1:]) {
+			return text
+		}
+		text = text[:i]
+	}
+}
 
 func readHistoryChecks(get func(string) (string, bool, error)) ([]store.HistoryCheck, error) {
 	v, ok, err := get(store.MetaHistoryChecks)
@@ -107,7 +122,7 @@ func historyMessage(m channel.InboundMsg) (historyMsg, bool) {
 	case reHistoryUser.MatchString(text):
 		prompt, text = true, reHistoryUser.ReplaceAllString(text, "")
 	case reHistoryAnswer.MatchString(text):
-		text = reHistoryFooter.ReplaceAllString(reHistoryAnswer.ReplaceAllString(text, ""), "")
+		text = stripHistoryNotes(reHistoryFooter.ReplaceAllString(reHistoryAnswer.ReplaceAllString(text, ""), ""))
 	default:
 		return historyMsg{}, false
 	}

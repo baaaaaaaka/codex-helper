@@ -66,6 +66,7 @@
 -- <msg:3> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>Local answer E2E-GRAPHOUTAGE-tui1-3</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == chat <chat:3> "💬 e2ehost - Probe session"
@@ -79,6 +80,7 @@
 -- <msg:3> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>Probe answer E2E-GRAPHOUTAGE-probe-1</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == chat <chat:4> "💬 e2ehost - Sent while Teams is down E2E-GRAPHOUTAGE-duringoutage-2"
@@ -109,6 +111,7 @@
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-GRAPHOUTAGE-duringoutage-2</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == codex turns (per thread; threads by kind, directory and first prompt; turns in start order)

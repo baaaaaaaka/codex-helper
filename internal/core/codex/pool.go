@@ -193,7 +193,7 @@ func (p *Pool) AcquireCurrent(ctx context.Context, key string, cfg Config) (*Lea
 		if e := p.servers[key]; e != nil && e.leases == 0 && e.stamp != stamp {
 			select {
 			case <-e.ready:
-				if e.srv != nil {
+				if e.srv != nil && !e.srv.Running() { // never under a running turn
 					delete(p.servers, key)
 					stale = e
 				}
@@ -234,6 +234,19 @@ func (p *Pool) Busy(key string) bool {
 	return e != nil && e.srv != nil && !e.srv.Exited()
 }
 
+// Peek returns the live server of key without leasing it (nil: none). It
+// is for reading what the server knows and for calls that do not need the
+// server kept (an interrupt).
+func (p *Pool) Peek(key string) *Server {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e := p.servers[key]
+	if e == nil || e.srv == nil || e.srv.Exited() {
+		return nil
+	}
+	return e.srv
+}
+
 // Drop kills the server of key now (e.g. after it misbehaved).
 func (p *Pool) Drop(key string) {
 	p.mu.Lock()
@@ -263,6 +276,12 @@ func (p *Pool) Reap() int {
 			continue
 		}
 		if e.srv == nil {
+			continue
+		}
+		if e.leases == 0 && !e.srv.Exited() && e.srv.Running() {
+			// A turn Codex runs by itself (an active goal continues the
+			// thread when it goes idle): kept warm while it runs.
+			e.last = now
 			continue
 		}
 		if e.srv.Exited() || (e.leases == 0 && now.Sub(e.last) >= p.cfg.Idle) {

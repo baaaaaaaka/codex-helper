@@ -585,6 +585,7 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 		out.Final = final
 		if final != "" {
 			doc := answerDoc(named(final))
+			doc.Notes = infoNotes(e.turnInfo(cs.id), true)
 			// Batch B: a control-chat answer mentions the owner itself
 			// (v0.1.20 outboxAlreadyMentionedControlOwner); finalMention
 			// adds no second mention.
@@ -1139,7 +1140,9 @@ func (e *Engine) progress(ctx context.Context, cs *convState, tr store.Turn, ps 
 	if ps.queued != "" {
 		text = textStarting(ps.queued) + "\n\n" + text
 	}
-	msgs, err := e.render(ctx, statusDoc(text), store.OutProgress,
+	doc := statusDoc(text)
+	doc.Notes = infoNotes(e.turnInfo(cs.id), false)
+	msgs, err := e.render(ctx, doc, store.OutProgress,
 		fmt.Sprintf("turn:%d:progress:%d", tr.ID, ps.posted+1))
 	if err != nil {
 		e.logf("progress of %s: %v", cs.label, err)

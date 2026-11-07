@@ -143,6 +143,7 @@
 -- <msg:11> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-CMDMODEL-default-1</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:12> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
@@ -169,6 +170,7 @@
 -- <msg:16> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-CMDMODEL-mini-2</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-mini, effort - low, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:17> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
@@ -306,6 +308,7 @@
 -- <msg:39> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-CMDMODEL-reset-3</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:40> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
@@ -347,6 +350,7 @@
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-CMDMODEL-infork-4</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-mini, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == codex turns (per thread; threads by kind, directory and first prompt; turns in start order)
