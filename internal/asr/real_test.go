@@ -47,7 +47,7 @@ func TestRealModel(t *testing.T) {
 
 	if published {
 		if _, err := DefaultManifest(runtime.GOOS, runtime.GOARCH); err != nil {
-			t.Skipf("voice assets for %s: %v", platform, err) // TODO(pins): fail once the pins are filled
+			t.Fatalf("voice assets for %s: %v", platform, err)
 		}
 	}
 	work := t.TempDir()
