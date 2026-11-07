@@ -1,7 +1,92 @@
 # SKILLS-PUSH: `helper skills push` reviews local skill edits in Teams, `helper skills push confirm` pushes them once to a review branch
 # cxp black-box transcript; volatile values are numbered placeholders
 
-== chat <chat:1> "s001 · skillpush"
+== chat <chat:1> "🏠 Codex Control - e2ehost"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
+-- <msg:2> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>new <root>/work/skillpush</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>new <root>/work/skillpush</p>
+-- <msg:3> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>✅ Work chat created: s001</p>
+   | <p>Open this Teams link and send your task there:<br>
+   | <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
+   | <p>If Teams does not show it right away, search for: s001</p>
+-- <msg:4> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper skills add file://<root>/remote/demo.git</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper skills add file://<root>/remote/demo.git</p>
+-- <msg:5> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Added <strong>demo</strong> from <code>file://<root>/remote/demo.git</code>.</p>
+   | <p>Installed 1 skill(s).</p>
+   | <ul><li><code>demo</code> -&gt; <code>demo__demo</code></li>
+   | </ul>
+-- <msg:6> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper skills push</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper skills push</p>
+-- <msg:7> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>No local skill changes to push.</p>
+-- <msg:8> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper skills push</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper skills push</p>
+-- <msg:9> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p><strong>Skills Push Review</strong></p>
+   | <p>A review-branch push is pending. Review the changes below, then send <code>helper skills push confirm</code> to commit and push from Teams.</p>
+   | <p>Expires: <code><time:1></code></p>
+   | <ul><li><strong>demo</strong><br>
+   | <ul><li>remote: <code>file://<root>/remote/demo.git</code></li>
+   | <li>review target: <code>HEAD:refs/heads/skill/demo-<time:2>-c8ede720b221</code></li>
+   | <li><strong>MODIFIED</strong> <code>skills/demo/SKILL.md</code></li>
+   | </ul>
+   | </li>
+   | </ul>
+-- <msg:10> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper skills push confirm</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper skills push confirm</p>
+-- <msg:11> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p><strong>Skills Push</strong></p>
+   | <p>Mode: review branch</p>
+   | <ul><li><strong>demo</strong>: pushed <code>HEAD:refs/heads/skill/demo-<time:2>-c8ede720b221</code></li>
+   | </ul>
+   | <pre><code>Final staged diff for demo:⏎
+   |  skills/demo/SKILL.md | 1 +⏎
+   |  1 file changed, 1 insertion(+)⏎
+   | ⏎
+   | Remote: file://<root>/remote/demo.git⏎
+   | Ref: HEAD:refs/heads/skill/demo-<time:2>-c8ede720b221⏎
+   | Pushed HEAD:refs/heads/skill/demo-<time:2>-c8ede720b221</code></pre>
+-- <msg:12> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper skills push confirm</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper skills push confirm</p>
+-- <msg:13> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>No pending skills push review. Run <code>helper skills push [name]</code> first.</p>
+
+== chat <chat:2> "💬 e2ehost - New message in skillpush"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -36,10 +121,10 @@
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p><strong>Skills Push Review</strong></p>
    | <p>A review-branch push is pending. Review the changes below, then send <code>helper skills push confirm</code> to commit and push from Teams.</p>
-   | <p>Expires: <code><time:1></code></p>
+   | <p>Expires: <code><time:3></code></p>
    | <ul><li><strong>demo</strong><br>
    | <ul><li>remote: <code>file://<root>/remote/demo.git</code></li>
-   | <li>review target: <code>HEAD:refs/heads/skill/demo-<time:2>-c8ede720b221</code></li>
+   | <li>review target: <code>HEAD:refs/heads/skill/demo-<time:4>-c8ede720b221</code></li>
    | <li><strong>MODIFIED</strong> <code>skills/demo/SKILL.md</code></li>
    | </ul>
    | </li>
@@ -54,88 +139,3 @@
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Pending skills push review is stale: change skills/demo/SKILL.md changed since review</p>
    | <p>Run <code>helper skills push [name]</code> again.</p>
-
-== chat <chat:2> "🏠 Codex Control - e2ehost"
-   type: meeting; members: owner
--- <msg:1> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
--- <msg:2> owner (html)
-   | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>new <root>/work/skillpush</p>
-   edited 1 time(s); earlier versions:
-   [version 1]
-   | <p>new <root>/work/skillpush</p>
--- <msg:3> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>✅ Work chat created: s001</p>
-   | <p>Open this Teams link and send your task there:<br>
-   | <a href="https://teams.microsoft.com/l/chat/<chat:1>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:1>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
-   | <p>If Teams does not show it right away, search for: s001</p>
--- <msg:4> owner (html)
-   | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>helper skills add file://<root>/remote/demo.git</p>
-   edited 1 time(s); earlier versions:
-   [version 1]
-   | <p>helper skills add file://<root>/remote/demo.git</p>
--- <msg:5> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Added <strong>demo</strong> from <code>file://<root>/remote/demo.git</code>.</p>
-   | <p>Installed 1 skill(s).</p>
-   | <ul><li><code>demo</code> -&gt; <code>demo__demo</code></li>
-   | </ul>
--- <msg:6> owner (html)
-   | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>helper skills push</p>
-   edited 1 time(s); earlier versions:
-   [version 1]
-   | <p>helper skills push</p>
--- <msg:7> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>No local skill changes to push.</p>
--- <msg:8> owner (html)
-   | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>helper skills push</p>
-   edited 1 time(s); earlier versions:
-   [version 1]
-   | <p>helper skills push</p>
--- <msg:9> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p><strong>Skills Push Review</strong></p>
-   | <p>A review-branch push is pending. Review the changes below, then send <code>helper skills push confirm</code> to commit and push from Teams.</p>
-   | <p>Expires: <code><time:3></code></p>
-   | <ul><li><strong>demo</strong><br>
-   | <ul><li>remote: <code>file://<root>/remote/demo.git</code></li>
-   | <li>review target: <code>HEAD:refs/heads/skill/demo-<time:4>-c8ede720b221</code></li>
-   | <li><strong>MODIFIED</strong> <code>skills/demo/SKILL.md</code></li>
-   | </ul>
-   | </li>
-   | </ul>
--- <msg:10> owner (html)
-   | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>helper skills push confirm</p>
-   edited 1 time(s); earlier versions:
-   [version 1]
-   | <p>helper skills push confirm</p>
--- <msg:11> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p><strong>Skills Push</strong></p>
-   | <p>Mode: review branch</p>
-   | <ul><li><strong>demo</strong>: pushed <code>HEAD:refs/heads/skill/demo-<time:4>-c8ede720b221</code></li>
-   | </ul>
-   | <pre><code>Final staged diff for demo:⏎
-   |  skills/demo/SKILL.md | 1 +⏎
-   |  1 file changed, 1 insertion(+)⏎
-   | ⏎
-   | Remote: file://<root>/remote/demo.git⏎
-   | Ref: HEAD:refs/heads/skill/demo-<time:4>-c8ede720b221⏎
-   | Pushed HEAD:refs/heads/skill/demo-<time:4>-c8ede720b221</code></pre>
--- <msg:12> owner (html)
-   | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>helper skills push confirm</p>
-   edited 1 time(s); earlier versions:
-   [version 1]
-   | <p>helper skills push confirm</p>
--- <msg:13> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>No pending skills push review. Run <code>helper skills push [name]</code> first.</p>

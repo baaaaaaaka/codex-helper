@@ -53,6 +53,9 @@ var workCommands = map[string]cmdHandler{
 	cmdCancelName: func(e *Engine, ctx context.Context, j cmdJob, cs *convState, p parsed) {
 		e.cmdCancel(ctx, j, cs, firstLower(p.arg))
 	},
+	cmdGoalName: func(e *Engine, ctx context.Context, j cmdJob, cs *convState, p parsed) {
+		e.cmdGoal(ctx, j, cs, p.arg)
+	},
 	cmdRenameName: func(e *Engine, ctx context.Context, j cmdJob, cs *convState, p parsed) {
 		e.cmdRename(ctx, j, cs, p.arg)
 	},
@@ -388,6 +391,7 @@ var sessionHelpText = strings.Join([]string{
 	"`helper details` or `!details` - show debug IDs and links",
 	"`model status`, `model switch <model>`, `model reset`, or `model fork <model>` - inspect or change this Work chat model",
 	"`effort status`, `effort list`, `effort set <value>`, or `effort reset` - inspect or change this Work chat's reasoning effort",
+	"`helper goal` - show this chat's Codex goal; `helper goal <objective>` sets it and makes it active; `helper goal active` / `helper goal pause` resume or pause it",
 	"`default ...` - global defaults are Control-chat-only",
 	"`helper publish-history` - import a paused local Codex history backlog",
 	"`helper publish-history full` - publish the complete local Codex history once to this chat",
@@ -408,6 +412,7 @@ var sessionAdvancedHelpText = strings.Join([]string{
 	"`helper park <session-number-or-id>` / `helper resume <session-number-or-id>` / `helper unpark <session-number-or-id>` - manually pause or resume polling for a Work chat",
 	"`helper unpause` - resume auto-start after a pause (requests sent while paused are not run)",
 	"`helper fork` - copy this session into a new Work chat",
+	"`helper goal` / `helper goal <objective>` / `helper goal active` / `helper goal pause` - show, set, resume or pause this chat's Codex goal (Codex keeps working on an active goal by itself; `helper cancel` pauses it)",
 	"`helper publish-history` or `!ph` - import a paused local Codex history backlog",
 	"`helper publish-history full` - publish the complete local Codex history once to this chat",
 	"advanced commands: `helper retry last`, `helper retry <turn-id>` / `!retry <turn-id>`, or `helper cancel last`, `helper cancel queued`, `helper cancel running`, `helper cancel all`, `helper cancel <turn-id>` / `!cancel <turn-id>`",

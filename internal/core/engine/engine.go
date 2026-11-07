@@ -312,14 +312,25 @@ type Engine struct {
 	// the sender served; the next pass starts after it (round robin).
 	// Sender goroutine only.
 	sendLast [sendClasses]int64
+	// announceSeen is when a discovered session's unannounced chat was
+	// first seen by announcePass (announce.go), under mu; announceRun
+	// serialises the passes.
+	announceSeen map[int64]time.Time
+	announceRun  sync.Mutex
 
 	fatalOnce sync.Once
 	fatal     error
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
 
-	mirror       *mirrorState
-	sendFailures map[int64]int
+	mirror        *mirrorState
+	sendFailures  map[int64]int
+	sendThrottles map[int64]int // throttles of a row in a row (logging only)
+	// liveSeq is, per conversation, the outbox seq of its last row
+	// queued for a live mirrored record: the sender ranks its rows up to
+	// that one as live, not as the catch-up backlog (sendLive). In
+	// memory: after a restart every pending row is the backlog.
+	liveSeq      map[int64]int64
 	requeued     []cmdJob // commands to re-run when the command loop starts
 	unknown      map[int64]*unknownState
 	gates        map[string]time.Time
@@ -644,6 +655,8 @@ func (e *Engine) start(ctx context.Context) error {
 	if err := e.announceTakeover(); err != nil {
 		return fmt.Errorf("engine: announce takeover: %w", err)
 	}
+	e.repairTitles() // titlerepair.go: label titles of chats made before rc.67
+	e.announcePass() // announce.go: chats an earlier process never announced
 	return nil
 }
 

@@ -202,7 +202,7 @@
 -- <msg:32> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>✅ Codex finished</strong></p>
-   | <p><strong>Chat:</strong> s002 · fresh<br>
+   | <p><strong>Chat:</strong> 💬 e2ehost - New message in fresh<br>
    | <strong>Request:</strong> Please answer E2E-CMDDEFAULT-fresh-1</p>
    | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
    | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
@@ -210,7 +210,7 @@
 -- <msg:33> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>✅ Codex finished</strong></p>
-   | <p><strong>Chat:</strong> s001 · old<br>
+   | <p><strong>Chat:</strong> 💬 e2ehost - New message in old<br>
    | <strong>Request:</strong> Please answer E2E-CMDDEFAULT-old-2</p>
    | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
    | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
@@ -293,6 +293,7 @@
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-CMDDEFAULT-fresh-1</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-mini, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:6> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
@@ -324,6 +325,7 @@
 -- <msg:10> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-CMDDEFAULT-fresh2-3</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-mini, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == chat <chat:3> "💬 e2ehost - Please answer E2E-CMDDEFAULT-old-2"
@@ -354,6 +356,7 @@
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-CMDDEFAULT-old-2</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:6> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>

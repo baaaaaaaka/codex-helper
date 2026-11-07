@@ -1,20 +1,50 @@
 # NO-WINDOW: after an outage, sessions updated 20, 121 and 200 days ago are each mirrored once (no window)
 # cxp black-box transcript; volatile values are numbered placeholders
 
-== chat <chat:1> "s002 · Session from 20 days ago"
+== chat <chat:1> "🏠 Codex Control - e2ehost"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Local Codex chat detected: s002.</p>
+   | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
+-- <msg:2> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
+   | <p><strong>💬 New local Codex chat detected</strong></p>
+   | <p><strong>Chat:</strong> 💬 e2ehost - Probe session</p>
+   | <p><strong>Next:</strong> Open this chat to watch the answer and continue from the full local context.</p>
+   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open chat</a> (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
+   mention 0: owner "E2E Owner"
+-- <msg:3> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
+   | <p><strong>✅ Codex finished</strong></p>
+   | <p><strong>Chat:</strong> 💬 e2ehost - Probe session</p>
+   | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
+   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
+   mention 0: owner "E2E Owner"
+-- <msg:4> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
+   | <p><strong>🆕 New local Codex chats (3)</strong></p>
+   | <p>These local Codex sessions got Teams work chats while the helper was catching up. Teams lists a new chat only after it is opened: open one here to watch it and continue from its full local context.</p>
+   | <ul><li><strong>s002</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Session from 20 days ago</a> (https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <li><strong>s003</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Session from 121 days ago</a> (https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <li><strong>s004</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:5>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Session from 200 days ago</a> (https://teams.microsoft.com/l/chat/<chat:5>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | </ul>
+   mention 0: owner "E2E Owner"
+
+== chat <chat:2> "💬 e2ehost - Probe session"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Local Codex chat detected: s001.</p>
 -- <msg:2> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
-   | <p>Session from 20 days ago</p>
+   | <p>Probe session</p>
 -- <msg:3> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
-   | <p>Old answer E2E-NOWINDOW-aged20-2</p>
+   | <p>Probe answer E2E-NOWINDOW-probe-1</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
-== chat <chat:2> "s003 · Session from 121 days ago"
+== chat <chat:3> "💬 e2ehost - Session from 121 days ago"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -27,7 +57,20 @@
    | <p>Old answer E2E-NOWINDOW-aged121-3</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
-== chat <chat:3> "s004 · Session from 200 days ago"
+== chat <chat:4> "💬 e2ehost - Session from 20 days ago"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Local Codex chat detected: s002.</p>
+-- <msg:2> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
+   | <p>Session from 20 days ago</p>
+-- <msg:3> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>Old answer E2E-NOWINDOW-aged20-2</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+
+== chat <chat:5> "💬 e2ehost - Session from 200 days ago"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -38,37 +81,4 @@
 -- <msg:3> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>Old answer E2E-NOWINDOW-aged200-4</p>
-   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
-
-== chat <chat:4> "🏠 Codex Control - e2ehost"
-   type: meeting; members: owner
--- <msg:1> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
--- <msg:2> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
-   | <p><strong>💬 New local Codex chat detected</strong></p>
-   | <p><strong>Chat:</strong> s001 · Probe session</p>
-   | <p><strong>Next:</strong> Open this chat to watch the answer and continue from the full local context.</p>
-   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:5>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open chat</a> (https://teams.microsoft.com/l/chat/<chat:5>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
-   mention 0: owner "E2E Owner"
--- <msg:3> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
-   | <p><strong>✅ Codex finished</strong></p>
-   | <p><strong>Chat:</strong> s001 · Probe session</p>
-   | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
-   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:5>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:5>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
-   mention 0: owner "E2E Owner"
-
-== chat <chat:5> "💬 e2ehost - Probe session"
-   type: meeting; members: owner
--- <msg:1> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Local Codex chat detected: s001.</p>
--- <msg:2> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
-   | <p>Probe session</p>
--- <msg:3> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
-   | <p>Probe answer E2E-NOWINDOW-probe-1</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>

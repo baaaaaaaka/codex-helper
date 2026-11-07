@@ -34,9 +34,9 @@
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Paused auto-start in s001 (possible self-echo loop). Send <code>helper unpause</code> in that chat to resume.</p>
 -- "Codex finished" notices, one line each, sorted (posting order is timing: the s002 burst finishes concurrently with the s001 pause notice in the control chat)
-   finished: s001 · breaker | request: Long task E2E-BREAKER-running-1 (@owner)
-   finished: s002 · burst | request: Quick question 0 E2E-BREAKER-burst0-2 (@owner)
    finished: 💬 e2ehost - Long task E2E-BREAKER-running-1 | request: Prompt after unpause E2E-BREAKER-afterunpause-7 (@owner)
+   finished: 💬 e2ehost - New message in breaker | request: Long task E2E-BREAKER-running-1 (@owner)
+   finished: 💬 e2ehost - New message in burst | request: Quick question 0 E2E-BREAKER-burst0-2 (@owner)
    finished: 💬 e2ehost - Quick question 0 E2E-BREAKER-burst0-2 | request: Quick question 1 E2E-BREAKER-burst1-3 (@owner)
    finished: 💬 e2ehost - Quick question 0 E2E-BREAKER-burst0-2 | request: Quick question 2 E2E-BREAKER-burst2-4 (@owner)
 
@@ -97,6 +97,7 @@
 -- <msg:11> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>Final of the running turn E2E-BREAKER-running-1</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:12> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
@@ -128,6 +129,7 @@
 -- <msg:18> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-BREAKER-afterunpause-7</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == chat <chat:3> "💬 e2ehost - Quick question 0 E2E-BREAKER-burst0-2"
@@ -178,6 +180,7 @@
 -- <msg:9> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-BREAKER-burst0-2</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:10> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -188,11 +191,13 @@
 -- <msg:11> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-BREAKER-burst1-3</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:12> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>▶️ Queued request: “Quick question 2 E2E-BREAKER-burst2-4”</p>
    | <p>E2EANSWER-<n> answer for E2E-BREAKER-burst2-4</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == codex turns (per thread; threads by kind, directory and first prompt; turns in start order)

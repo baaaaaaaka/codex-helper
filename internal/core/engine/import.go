@@ -427,6 +427,7 @@ func (e *Engine) importApplyOne(j importJob) bool {
 // mirrorTracker is a tracker for f at its persisted cursor.
 func (e *Engine) mirrorTracker(f *mirrorFile) *transcript.Tracker {
 	t := transcript.NewTracker(f.src.ThreadID, f.src.Offset, f.src.Line, e.mirrorSkip)
+	e.restoreInfo(f, t)
 	if f.keepTeams > 0 {
 		t.KeepTeams(f.keepTeams)
 	}
@@ -804,6 +805,10 @@ func (e *Engine) publishNew(j cmdJob, s *dashSession, extra func(tx *store.Tx) e
 			}
 			label = c.Label
 			if err := tx.SetMeta(discoveredKey(id), ""); err != nil {
+				return err
+			}
+			// `continue` announces this chat itself (announce.go).
+			if err := markAnnounced(tx, id); err != nil {
 				return err
 			}
 		} else {

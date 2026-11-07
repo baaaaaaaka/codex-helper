@@ -53,6 +53,11 @@ type server struct {
 	mcp      map[string][]string
 	rollouts map[string]*rollout.Writer
 	running  map[string]*runningTurn // by turn id
+	// goals and settings are the thread goals (thread/goal/*) and the
+	// model settings turn/start overrides changed, by thread id. Unlike
+	// real Codex the fake never continues an active goal by itself.
+	goals    map[string]map[string]any
+	settings map[string][2]string // model, effort
 	wg       sync.WaitGroup
 	gone     atomic.Bool // stdin closed: the helper went away
 }
@@ -98,6 +103,8 @@ func Serve(cfg Config) error {
 		out:      bufio.NewWriter(cfg.Out),
 		loaded:   map[string]*Thread{},
 		mcp:      map[string][]string{},
+		goals:    map[string]map[string]any{},
+		settings: map[string][2]string{},
 		rollouts: map[string]*rollout.Writer{},
 		running:  map[string]*runningTurn{},
 	}
@@ -303,6 +310,8 @@ func (s *server) dispatch(msg message) (any, *rpcError) {
 		if v, ok := p["excludeTurns"].(bool); ok && v {
 			include = false
 		}
+		// Like Codex 0.166, the goal snapshot follows the resume.
+		defer s.goalSnapshot(id)
 		return map[string]any{"thread": s.threadView(t, include), "model": "gpt-5-codex", "modelProvider": "openai", "cwd": t.Cwd}, nil
 	case "thread/read":
 		t, err := s.current(str("threadId"))
@@ -333,6 +342,8 @@ func (s *server) dispatch(msg message) (any, *rpcError) {
 		return s.startTurn(p)
 	case "turn/interrupt":
 		return s.interrupt(str("threadId"), str("turnId"))
+	case "thread/goal/get", "thread/goal/set", "thread/goal/clear":
+		return s.goal(msg.Method, str("threadId"), p)
 	}
 	return nil, &rpcError{Code: -32601, Message: "method not found: " + msg.Method}
 }
@@ -483,6 +494,7 @@ func (s *server) startTurn(p map[string]any) (any, *rpcError) {
 	clientID, _ := p["clientUserMessageId"].(string)
 	model, _ := p["model"].(string)
 	effort, _ := p["effort"].(string)
+	s.applySettings(threadID, model, effort)
 	turnID := newID()
 	plan, err := s.begin(BeginRequest{
 		Instance: s.cfg.Instance, Kind: s.cfg.Kind, Pid: os.Getpid(),
@@ -906,4 +918,105 @@ func (s *server) mcpServers() []string {
 		names = append(names, m[2])
 	}
 	return names
+}
+
+// goalSnapshot sends the goal of a thread just resumed, as Codex 0.166
+// does: thread/goal/updated, or thread/goal/cleared when it has none.
+func (s *server) goalSnapshot(threadID string) {
+	s.mu.Lock()
+	g := s.goals[threadID]
+	s.mu.Unlock()
+	if g == nil {
+		s.notify("thread/goal/cleared", map[string]any{"threadId": threadID})
+		return
+	}
+	s.notify("thread/goal/updated", map[string]any{"threadId": threadID, "turnId": nil, "goal": g})
+}
+
+// goal serves thread/goal/get, set and clear on a loaded thread.
+func (s *server) goal(method, threadID string, p map[string]any) (any, *rpcError) {
+	s.mu.Lock()
+	_, loaded := s.loaded[threadID]
+	s.mu.Unlock()
+	if !loaded {
+		return nil, invalid("thread not found: %s", threadID)
+	}
+	now := time.Now().Unix()
+	s.mu.Lock()
+	g := s.goals[threadID]
+	switch method {
+	case "thread/goal/get":
+		s.mu.Unlock()
+		if g == nil {
+			return map[string]any{"goal": nil}, nil
+		}
+		return map[string]any{"goal": g}, nil
+	case "thread/goal/clear":
+		delete(s.goals, threadID)
+		s.mu.Unlock()
+		s.notify("thread/goal/cleared", map[string]any{"threadId": threadID})
+		return map[string]any{"cleared": g != nil}, nil
+	}
+	objective, _ := p["objective"].(string)
+	status, _ := p["status"].(string)
+	if g == nil {
+		if strings.TrimSpace(objective) == "" {
+			s.mu.Unlock()
+			return nil, invalid("thread/goal/set: no goal to update")
+		}
+		g = map[string]any{"threadId": threadID, "objective": "", "status": "active", "tokenBudget": nil,
+			"tokensUsed": 0, "timeUsedSeconds": 0, "createdAt": now}
+	} else {
+		cp := map[string]any{}
+		for k, v := range g {
+			cp[k] = v
+		}
+		g = cp
+	}
+	if strings.TrimSpace(objective) != "" {
+		g["objective"] = objective
+		if status == "" {
+			status = "active"
+		}
+	}
+	if status != "" {
+		g["status"] = status
+	}
+	g["updatedAt"] = now
+	s.goals[threadID] = g
+	s.mu.Unlock()
+	s.notify("thread/goal/updated", map[string]any{"threadId": threadID, "turnId": nil, "goal": g})
+	return map[string]any{"goal": g}, nil
+}
+
+// applySettings records a turn/start model or effort override and, when
+// it changes the thread's settings, sends thread/settings/updated as
+// Codex 0.166 does.
+func (s *server) applySettings(threadID, model, effort string) {
+	if model == "" && effort == "" {
+		return
+	}
+	s.mu.Lock()
+	cur, ok := s.settings[threadID]
+	if !ok {
+		cur = [2]string{"gpt-5-codex", ""}
+	}
+	next := cur
+	if model != "" {
+		next[0] = model
+	}
+	if effort != "" {
+		next[1] = effort
+	}
+	s.settings[threadID] = next
+	s.mu.Unlock()
+	if next == cur {
+		return
+	}
+	var eff any
+	if next[1] != "" {
+		eff = next[1]
+	}
+	s.notify("thread/settings/updated", map[string]any{"threadId": threadID,
+		"threadSettings": map[string]any{"model": next[0], "effort": eff, "serviceTier": nil}})
 }

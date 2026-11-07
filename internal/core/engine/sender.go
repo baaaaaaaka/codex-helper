@@ -104,11 +104,34 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 			}
 		}
 		items := make([]sendItem, 0, len(rows))
+		var urgent map[int64]bool // read once, only when a head is not a reply
 		for _, r := range rows {
 			if stopping && (r.ConvID != ctl || r.Seq > through) {
 				continue // shutdown: nothing after its reply is sent
 			}
-			items = append(items, sendItem{row: r, conv: r.ConvID, class: sendClass(r.Kind)})
+			class := sendClass(r.Kind)
+			if class == sendMirror && r.Seq <= e.liveThrough(r.ConvID) {
+				// Mirrored rows up to a live record (mirror.go): the
+				// local session is in use now; the rows before it go
+				// first, in order, in its rank.
+				class = sendLive
+			}
+			if class != sendReply {
+				// A reply queued behind this head (an answer behind a
+				// progress post) ranks the conversation as a reply: rows
+				// go out in order, so the head goes first, in the reply's
+				// rank, not after a mirrored backlog (priority
+				// inheritance; the s746 answer of rc.66).
+				if urgent == nil {
+					if urgent, err = tx.UrgentConvs(); err != nil {
+						return err
+					}
+				}
+				if urgent[r.ConvID] {
+					class = sendReply
+				}
+			}
+			items = append(items, sendItem{row: r, conv: r.ConvID, class: class})
 		}
 		if !stopping {
 			creates, err := e.dueChats(tx, now, soon)
@@ -121,12 +144,13 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 			items = e.withEdits(items, now, soon) // shutdown: edits wait for the start
 		}
 		// Control chat first; then replies (ACKs, finals, notices,
-		// prompts, chats the owner asked for) before mirrored messages
-		// and chats nobody waits for before progress, so a short write
-		// budget goes to what the user waits for; within a class, round
-		// robin from the conversation after the last one served, so a
-		// backlog in low-id chats never starves the others (review H4,
-		// CORE-DESIGN §3).
+		// prompts, chats the owner asked for), then what is happening
+		// now (progress, live mirrored records), then the backlog (the
+		// catch-up, chats nobody waits for), so a short write budget goes
+		// to what the user waits for; within a class, round robin from
+		// the conversation after the last one served, so a backlog in
+		// low-id chats never starves the others (review H4, CORE-DESIGN
+		// §3).
 		last := e.sendLast
 		rank := func(it sendItem) (int, int) {
 			switch {
@@ -343,18 +367,20 @@ func (e *Engine) dueChats(tx *store.Tx, now time.Time, soon func(time.Duration))
 	return kept, nil
 }
 
-// Send classes, in the order a short write budget serves them.
+// Send classes, in the order a short write budget serves them: what the
+// owner waits for, then what is happening now, then the backlog (owner
+// request 2026-11-07: fresh messages are not held behind a catch-up).
 const (
-	sendReply    = iota // ACKs, finals, notices, prompts, titles
-	sendMirror          // mirrored local-session messages
-	sendProgress        // progress while a turn runs
+	sendReply  = iota // ACKs, finals, notices, prompts, titles
+	sendLive          // progress of a running turn; mirrored live records (liveSeq)
+	sendMirror        // the backlog: records caught up at start, chats nobody waits for, title repairs
 	sendClasses
 )
 
 func sendClass(kind string) int {
 	switch kind {
 	case store.OutProgress:
-		return sendProgress
+		return sendLive
 	case store.OutMirror:
 		return sendMirror
 	}
@@ -476,6 +502,11 @@ func (e *Engine) send(ctx context.Context, r store.Outbox, chat, token string, f
 		e.wakeResolver()
 	case throttled:
 		at := now.Add(e.retryAfter(th) + time.Duration(r.ConvID%5)*e.t.Tick)
+		// A row throttled again and again leaves a trace (rc.66 had
+		// none: a held answer looked like no answer at all).
+		if n := e.throttled(r.ID); n == 3 || n%10 == 0 {
+			e.logf("send %s to conversation %d throttled %d times in a row; retry at %s", r.DeliveryKey, r.ConvID, n, at.Format("15:04:05"))
+		}
 		if th.Scope == channel.ScopeAccount || th.Scope == channel.ScopeUnknown {
 			e.setGate(e.gWrite, at, "send throttled")
 			e.paceThrottled(started, now.Add(e.retryAfter(th)))
@@ -540,9 +571,43 @@ func (e *Engine) failure(id int64) int {
 	return e.sendFailures[id]
 }
 
+// liveThrough is the outbox seq of conv's last row queued for a live
+// mirrored record (0: none pending); a row past it is the backlog again.
+func (e *Engine) liveThrough(conv int64) int64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.liveSeq[conv]
+}
+
+// markLive records that conv's rows through seq are queued for live
+// mirrored records (mirror.go).
+func (e *Engine) markLive(conv, seq int64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.liveSeq == nil {
+		e.liveSeq = map[int64]int64{}
+	}
+	if seq > e.liveSeq[conv] {
+		e.liveSeq[conv] = seq
+	}
+}
+
+// throttled counts the throttle responses to one row, for its log line
+// only: the failure backoff does not grow with them.
+func (e *Engine) throttled(id int64) int {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.sendThrottles == nil {
+		e.sendThrottles = map[int64]int{}
+	}
+	e.sendThrottles[id]++
+	return e.sendThrottles[id]
+}
+
 func (e *Engine) forgetFailures(id int64) {
 	e.mu.Lock()
 	delete(e.sendFailures, id)
+	delete(e.sendThrottles, id)
 	e.mu.Unlock()
 }
 

@@ -191,6 +191,7 @@
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-WEBHOOKCTL-final-1</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == workflow cards
@@ -199,7 +200,7 @@
    text: Workflow card delivery is configured for this control chat.
    action: {"title":"Open chat","type":"Action.OpenUrl","url":"https://teams.microsoft.com/l/chat/<chat:1>/0?tenantId=e2e00000-0000-4000-8000-00000000te57"}
 -- card 2: status 202
-   text: Codex finished: s001 · hook
+   text: Codex finished: 💬 e2ehost - New message in hook
    text: E2EANSWER-<n> answer for E2E-WEBHOOKCTL-final-1
    action: {"title":"Open chat","type":"Action.OpenUrl","url":"https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57"}
 -- card 3: status 202

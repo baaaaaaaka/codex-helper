@@ -21,7 +21,7 @@
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>✅ Codex finished</strong></p>
-   | <p><strong>Chat:</strong> s001 · forms<br>
+   | <p><strong>Chat:</strong> 💬 e2ehost - New message in forms<br>
    | <strong>Request:</strong> /explain Please answer E2E-CMDWORKFORMS-slash-1</p>
    | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
    | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
@@ -135,6 +135,7 @@
    | <code>helper details</code> or <code>!details</code> - show debug IDs and links<br>
    | <code>model status</code>, <code>model switch &lt;model&gt;</code>, <code>model reset</code>, or <code>model fork &lt;model&gt;</code> - inspect or change this Work chat model<br>
    | <code>effort status</code>, <code>effort list</code>, <code>effort set &lt;value&gt;</code>, or <code>effort reset</code> - inspect or change this Work chat&#39;s reasoning effort<br>
+   | <code>helper goal</code> - show this chat&#39;s Codex goal; <code>helper goal &lt;objective&gt;</code> sets it and makes it active; <code>helper goal active</code> / <code>helper goal pause</code> resume or pause it<br>
    | <code>default ...</code> - global defaults are Control-chat-only<br>
    | <code>helper publish-history</code> - import a paused local Codex history backlog<br>
    | <code>helper publish-history full</code> - publish the complete local Codex history once to this chat<br>
@@ -238,6 +239,7 @@
    | <code>helper details</code> or <code>!details</code> - show debug IDs and links<br>
    | <code>model status</code>, <code>model switch &lt;model&gt;</code>, <code>model reset</code>, or <code>model fork &lt;model&gt;</code> - inspect or change this Work chat model<br>
    | <code>effort status</code>, <code>effort list</code>, <code>effort set &lt;value&gt;</code>, or <code>effort reset</code> - inspect or change this Work chat&#39;s reasoning effort<br>
+   | <code>helper goal</code> - show this chat&#39;s Codex goal; <code>helper goal &lt;objective&gt;</code> sets it and makes it active; <code>helper goal active</code> / <code>helper goal pause</code> resume or pause it<br>
    | <code>default ...</code> - global defaults are Control-chat-only<br>
    | <code>helper publish-history</code> - import a paused local Codex history backlog<br>
    | <code>helper publish-history full</code> - publish the complete local Codex history once to this chat<br>
@@ -262,6 +264,7 @@
    | <code>helper details</code> or <code>!details</code> - show debug IDs and links<br>
    | <code>model status</code>, <code>model switch &lt;model&gt;</code>, <code>model reset</code>, or <code>model fork &lt;model&gt;</code> - inspect or change this Work chat model<br>
    | <code>effort status</code>, <code>effort list</code>, <code>effort set &lt;value&gt;</code>, or <code>effort reset</code> - inspect or change this Work chat&#39;s reasoning effort<br>
+   | <code>helper goal</code> - show this chat&#39;s Codex goal; <code>helper goal &lt;objective&gt;</code> sets it and makes it active; <code>helper goal active</code> / <code>helper goal pause</code> resume or pause it<br>
    | <code>default ...</code> - global defaults are Control-chat-only<br>
    | <code>helper publish-history</code> - import a paused local Codex history backlog<br>
    | <code>helper publish-history full</code> - publish the complete local Codex history once to this chat<br>
@@ -288,6 +291,7 @@
 -- <msg:39> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-CMDWORKFORMS-slash-1</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == codex turns (per thread; threads by kind, directory and first prompt; turns in start order)

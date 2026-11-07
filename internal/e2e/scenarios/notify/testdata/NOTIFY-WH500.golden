@@ -21,7 +21,7 @@
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>✅ Codex finished</strong></p>
-   | <p><strong>Chat:</strong> s001 · notify-wh500<br>
+   | <p><strong>Chat:</strong> 💬 e2ehost - New message in notify-wh500<br>
    | <strong>Request:</strong> Short question E2E-NOTIFYWH500-final1-1</p>
    | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
    | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
@@ -63,6 +63,7 @@
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-NOTIFYWH500-final1-1</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:6> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
@@ -76,11 +77,12 @@
 -- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-NOTIFYWH500-final2-2</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == workflow cards
 -- card 1: status 500 (injected fault webhook-500)
-   text: Codex finished: s001 · notify-wh500
+   text: Codex finished: 💬 e2ehost - New message in notify-wh500
    text: E2EANSWER-<n> answer for E2E-NOTIFYWH500-final1-1
    action: {"title":"Open chat","type":"Action.OpenUrl","url":"https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57"}
 -- card 2: status 500 (injected fault webhook-500)

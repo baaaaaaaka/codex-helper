@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"path/filepath"
 	"strings"
 
 	"github.com/baaaaaaaka/codex-helper/internal/core/store"
@@ -621,8 +620,9 @@ func (e *Engine) modelFork(ctx context.Context, j cmdJob, c modelChat, ref strin
 	}
 	eff, effSrc := globalDefaultEffort(c.defs, target)
 	e.mu.Lock()
-	cwd, title := c.cs.cwd, c.cs.title
+	cwd, title, srcLabel := c.cs.cwd, c.cs.title, c.cs.label
 	e.mu.Unlock()
+	machine := e.machineLabel() // reads the store: not inside the transaction
 	if cwd == "" {
 		cwd = c.th.Cwd
 	}
@@ -633,12 +633,9 @@ func (e *Engine) modelFork(ctx context.Context, j cmdJob, c modelChat, ref strin
 		if err != nil {
 			return err
 		}
-		base := filepath.Base(cwd)
-		if cwd == "" {
-			base = strings.TrimSpace(title)
-		}
+		// v0.1.20 forkWorkChatWithModelProfile: the source chat's title.
 		id, err = tx.CreateConversation(store.NewConversation{Label: label, Kind: store.KindWork, Channel: e.cfg.ChannelName,
-			Title: chatTitle(label, base), TitleSource: "auto"})
+			Title: workTitle(machine, "", titleBody(title, srcLabel, machine, e.cfg.Machine), cwd), TitleSource: "auto"})
 		if err != nil {
 			return err
 		}

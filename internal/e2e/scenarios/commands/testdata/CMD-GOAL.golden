@@ -1,0 +1,377 @@
+# CMD-GOAL: `helper goal [<objective>|active|pause]`; goal and model lines on new Codex messages; `helper cancel` pauses the goal
+# cxp black-box transcript; volatile values are numbered placeholders
+
+== chat <chat:1> "🏠 Codex Control - e2ehost"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
+-- <msg:2> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>new <root>/work/goal</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>new <root>/work/goal</p>
+-- <msg:3> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>✅ Work chat created: s001</p>
+   | <p>Open this Teams link and send your task there:<br>
+   | <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
+   | <p>If Teams does not show it right away, search for: s001</p>
+-- <msg:4> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper goal</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper goal</p>
+-- <msg:5> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⚠️ Wrong chat</p>
+   | <p>This is the 🏠 control chat. <code>helper ...</code> commands like <code>helper file</code>, <code>helper retry</code>, and <code>helper close</code> work inside a 💬 Work chat.</p>
+   | <p>To start project work, send <code>new &lt;directory&gt;</code> here, then open the new Work chat and send the task there.</p>
+-- <msg:6> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
+   | <p><strong>✅ Codex finished</strong></p>
+   | <p><strong>Chat:</strong> 💬 e2ehost - New message in goal<br>
+   | <strong>Request:</strong> Please answer E2E-CMDGOAL-before-2</p>
+   | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
+   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
+   mention 0: owner "E2E Owner"
+-- <msg:7> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
+   | <p><strong>✅ Codex finished</strong></p>
+   | <p><strong>Chat:</strong> 💬 e2ehost - Please answer E2E-CMDGOAL-before-2<br>
+   | <strong>Request:</strong> Please answer E2E-CMDGOAL-withgoal-4</p>
+   | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
+   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
+   mention 0: owner "E2E Owner"
+-- <msg:8> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
+   | <p><strong>✅ Codex finished</strong></p>
+   | <p><strong>Chat:</strong> 💬 e2ehost - Please answer E2E-CMDGOAL-before-2<br>
+   | <strong>Request:</strong> Please answer E2E-CMDGOAL-paused-5</p>
+   | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
+   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
+   mention 0: owner "E2E Owner"
+
+== chat <chat:2> "💬 e2ehost - Please answer E2E-CMDGOAL-before-2"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Work chat created: s001.<br>
+   | Working directory: <root>/work/goal</p>
+-- <msg:2> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>💬 Work chat is ready.<br>
+   | Send a task in this chat. Codex will start automatically and continue this session.<br>
+   | Status: waiting for your first task.<br>
+   | Session: s001<br>
+   | Project: goal<br>
+   | Working directory: <root>/work/goal<br>
+   | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
+   | Need more details? Send <code>helper status</code>.</p>
+-- <msg:3> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper goal</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper goal</p>
+-- <msg:4> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>This chat has no Codex thread yet. Send a first request, then set its goal.</p>
+-- <msg:5> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Please answer E2E-CMDGOAL-before-2</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>Please answer E2E-CMDGOAL-before-2</p>
+-- <msg:6> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+-- <msg:7> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>E2EANSWER-<n> answer for E2E-CMDGOAL-before-2</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+-- <msg:8> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper goal</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper goal</p>
+-- <msg:9> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>No goal is set for this chat.</p>
+   | <p><code>helper goal</code> shows the goal of this chat&#39;s Codex thread; <code>helper goal &lt;objective&gt;</code> sets it and makes it active; <code>helper goal active</code> makes it active again; <code>helper goal pause</code> pauses it.</p>
+-- <msg:10> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper goal active</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper goal active</p>
+-- <msg:11> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>No goal is set for this chat.</p>
+   | <p><code>helper goal</code> shows the goal of this chat&#39;s Codex thread; <code>helper goal &lt;objective&gt;</code> sets it and makes it active; <code>helper goal active</code> makes it active again; <code>helper goal pause</code> pauses it.</p>
+-- <msg:12> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper goal Ship the quarterly report E2E-CMDGOAL-objective-3</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper goal Ship the quarterly report E2E-CMDGOAL-objective-3</p>
+-- <msg:13> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>🎯 Goal set.</p>
+   | <p><strong>Goal status:</strong> active</p>
+   | <p><strong>Goal:</strong> Ship the quarterly report E2E-CMDGOAL-objective-3</p>
+   | <p>Codex keeps working on it by itself whenever this chat is idle; its messages appear here. <code>helper goal pause</code> or <code>helper cancel</code> stops it.</p>
+-- <msg:14> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper goal</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper goal</p>
+-- <msg:15> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p><strong>Goal status:</strong> active</p>
+   | <p><strong>Goal:</strong> Ship the quarterly report E2E-CMDGOAL-objective-3</p>
+-- <msg:16> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper goal active</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper goal active</p>
+-- <msg:17> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>The goal is already active.</p>
+   | <p><strong>Goal status:</strong> active</p>
+   | <p><strong>Goal:</strong> Ship the quarterly report E2E-CMDGOAL-objective-3</p>
+   | <p>Codex keeps working on it by itself whenever this chat is idle; its messages appear here. <code>helper goal pause</code> or <code>helper cancel</code> stops it.</p>
+-- <msg:18> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Please answer E2E-CMDGOAL-withgoal-4</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>Please answer E2E-CMDGOAL-withgoal-4</p>
+-- <msg:19> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+-- <msg:20> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>E2EANSWER-<n> answer for E2E-CMDGOAL-withgoal-4</p>
+   | <p><strong>🎯 Active goal:</strong> Ship the quarterly report E2E-CMDGOAL-objective-3</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+-- <msg:21> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Long job E2E-CMDGOAL-goalrun-1</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>Long job E2E-CMDGOAL-goalrun-1</p>
+-- <msg:22> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+-- <msg:23> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
+   | <p>Working through the goal E2E-CMDGOAL-goalrun-1</p>
+   | <p><strong>🎯 Active goal:</strong> Ship the quarterly report E2E-CMDGOAL-objective-3</p>
+-- <msg:24> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper cancel</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper cancel</p>
+-- <msg:25> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>cancel requested for running turn: <code>turn-3</code></p>
+   | <p><strong>Prompt being canceled:</strong><br>
+   | Long job E2E-CMDGOAL-goalrun-1</p>
+   | <p>No other prompts are queued.</p>
+   | <p>⏸️ The goal is paused too, so your next message does not start it again. <code>helper goal active</code> resumes it.</p>
+-- <msg:26> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Codex request canceled.</p>
+-- <msg:27> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper goal</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper goal</p>
+-- <msg:28> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p><strong>Goal status:</strong> paused</p>
+   | <p><strong>Goal:</strong> Ship the quarterly report E2E-CMDGOAL-objective-3</p>
+-- <msg:29> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Please answer E2E-CMDGOAL-paused-5</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>Please answer E2E-CMDGOAL-paused-5</p>
+-- <msg:30> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+-- <msg:31> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>E2EANSWER-<n> answer for E2E-CMDGOAL-paused-5</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+-- <msg:32> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper goal</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper goal</p>
+-- <msg:33> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p><strong>Goal status:</strong> paused</p>
+   | <p><strong>Goal:</strong> Ship the quarterly report E2E-CMDGOAL-objective-3</p>
+-- <msg:34> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper goal active</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper goal active</p>
+-- <msg:35> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>▶️ Goal active again.</p>
+   | <p><strong>Goal status:</strong> active</p>
+   | <p><strong>Goal:</strong> Ship the quarterly report E2E-CMDGOAL-objective-3</p>
+   | <p>Codex keeps working on it by itself whenever this chat is idle; its messages appear here. <code>helper goal pause</code> or <code>helper cancel</code> stops it.</p>
+-- <msg:36> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper cancel</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper cancel</p>
+-- <msg:37> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏸️ No request is running or queued; the active goal is paused, so your next message does not start it again. <code>helper goal active</code> resumes it.</p>
+-- <msg:38> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper goal</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper goal</p>
+-- <msg:39> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p><strong>Goal status:</strong> paused</p>
+   | <p><strong>Goal:</strong> Ship the quarterly report E2E-CMDGOAL-objective-3</p>
+-- <msg:40> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper goal resume</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper goal resume</p>
+-- <msg:41> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>▶️ Goal active again.</p>
+   | <p><strong>Goal status:</strong> active</p>
+   | <p><strong>Goal:</strong> Ship the quarterly report E2E-CMDGOAL-objective-3</p>
+   | <p>Codex keeps working on it by itself whenever this chat is idle; its messages appear here. <code>helper goal pause</code> or <code>helper cancel</code> stops it.</p>
+-- <msg:42> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper goal pause</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper goal pause</p>
+-- <msg:43> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏸️ Goal paused. A turn Codex is already running finishes unless you <code>helper cancel</code> it.</p>
+   | <p><strong>Goal status:</strong> paused</p>
+   | <p><strong>Goal:</strong> Ship the quarterly report E2E-CMDGOAL-objective-3</p>
+   | <p>Codex does not continue it by itself until <code>helper goal active</code>.</p>
+
+== codex turns (per thread; threads by kind, directory and first prompt; turns in start order)
+-- thread <uuid:1> (work, cwd <root>/work/goal)
+   turn: answered
+   prompt| User message:
+   prompt| Please answer E2E-CMDGOAL-before-2
+   prompt|
+   prompt| Teams helper safety:
+   prompt| - You are running inside a Codex turn launched by the Teams helper.
+   prompt| - The current Teams request is the `User message` section above. Treat earlier Teams requests in resumed Codex history as completed context, not as work to continue or answer, unless the current user explicitly asks about them.
+   prompt| - Do not restart, reload, kill, replace, or background the Teams helper process, binary, or service from this turn.
+   prompt| - If an installed helper needs to restart after an update or local repair, finish the answer and tell the user to send `helper restart now` in the Teams control chat.
+   prompt| - If the helper needs a release update, tell the user to send `helper update now`, or `helper update prerelease` only when they asked for prereleases.
+   prompt| - Subagent requests use native Codex subagents. For cross-machine agent delegation, use the cxp skill and its `cxp delegate` workflow when the task needs another signed-in Teams machine.
+   prompt|
+   prompt| Put fractions, sums, integrals, matrices, and display math in <m>TeX</m> on a separate line, never in prose, tables, or lists—even if asked for one line. Use backticks for simple inline/literal TeX. Never use $ or \(...\). Math markers are not artifacts.
+   prompt|
+   prompt| If you need to return generated files or images to the Teams user, write them under this local directory:
+   prompt| <root>/home/.local/state/codex-helper/teams/core-files/outbound/cxp-<key:1>-<turn:1>
+   prompt|
+   prompt| Then include this fenced manifest in your final answer:
+   prompt| ```codex-helper-artifacts
+   prompt| {"version":1,"files":[{"path":"relative/path.ext","name":"display-name.ext"}]}
+   prompt| ```
+   prompt|
+   prompt| Use only relative manifest paths under that directory. Keep your normal answer visible; the helper will upload listed files separately when file-write auth is available.
+   turn: answered
+   prompt| User message:
+   prompt| Please answer E2E-CMDGOAL-withgoal-4
+   prompt|
+   prompt| Teams helper safety:
+   prompt| - You are running inside a Codex turn launched by the Teams helper.
+   prompt| - The current Teams request is the `User message` section above. Treat earlier Teams requests in resumed Codex history as completed context, not as work to continue or answer, unless the current user explicitly asks about them.
+   prompt| - Do not restart, reload, kill, replace, or background the Teams helper process, binary, or service from this turn.
+   prompt| - If an installed helper needs to restart after an update or local repair, finish the answer and tell the user to send `helper restart now` in the Teams control chat.
+   prompt| - If the helper needs a release update, tell the user to send `helper update now`, or `helper update prerelease` only when they asked for prereleases.
+   prompt| - Subagent requests use native Codex subagents. For cross-machine agent delegation, use the cxp skill and its `cxp delegate` workflow when the task needs another signed-in Teams machine.
+   prompt|
+   prompt| Put fractions, sums, integrals, matrices, and display math in <m>TeX</m> on a separate line, never in prose, tables, or lists—even if asked for one line. Use backticks for simple inline/literal TeX. Never use $ or \(...\). Math markers are not artifacts.
+   prompt|
+   prompt| If you need to return generated files or images to the Teams user, write them under this local directory:
+   prompt| <root>/home/.local/state/codex-helper/teams/core-files/outbound/cxp-<key:1>-<turn:2>
+   prompt|
+   prompt| Then include this fenced manifest in your final answer:
+   prompt| ```codex-helper-artifacts
+   prompt| {"version":1,"files":[{"path":"relative/path.ext","name":"display-name.ext"}]}
+   prompt| ```
+   prompt|
+   prompt| Use only relative manifest paths under that directory. Keep your normal answer visible; the helper will upload listed files separately when file-write auth is available.
+   turn: cancelled
+   prompt| User message:
+   prompt| Long job E2E-CMDGOAL-goalrun-1
+   prompt|
+   prompt| Teams helper safety:
+   prompt| - You are running inside a Codex turn launched by the Teams helper.
+   prompt| - The current Teams request is the `User message` section above. Treat earlier Teams requests in resumed Codex history as completed context, not as work to continue or answer, unless the current user explicitly asks about them.
+   prompt| - Do not restart, reload, kill, replace, or background the Teams helper process, binary, or service from this turn.
+   prompt| - If an installed helper needs to restart after an update or local repair, finish the answer and tell the user to send `helper restart now` in the Teams control chat.
+   prompt| - If the helper needs a release update, tell the user to send `helper update now`, or `helper update prerelease` only when they asked for prereleases.
+   prompt| - Subagent requests use native Codex subagents. For cross-machine agent delegation, use the cxp skill and its `cxp delegate` workflow when the task needs another signed-in Teams machine.
+   prompt|
+   prompt| Put fractions, sums, integrals, matrices, and display math in <m>TeX</m> on a separate line, never in prose, tables, or lists—even if asked for one line. Use backticks for simple inline/literal TeX. Never use $ or \(...\). Math markers are not artifacts.
+   prompt|
+   prompt| If you need to return generated files or images to the Teams user, write them under this local directory:
+   prompt| <root>/home/.local/state/codex-helper/teams/core-files/outbound/cxp-<key:1>-<turn:3>
+   prompt|
+   prompt| Then include this fenced manifest in your final answer:
+   prompt| ```codex-helper-artifacts
+   prompt| {"version":1,"files":[{"path":"relative/path.ext","name":"display-name.ext"}]}
+   prompt| ```
+   prompt|
+   prompt| Use only relative manifest paths under that directory. Keep your normal answer visible; the helper will upload listed files separately when file-write auth is available.
+   turn: answered
+   prompt| User message:
+   prompt| Please answer E2E-CMDGOAL-paused-5
+   prompt|
+   prompt| Teams helper safety:
+   prompt| - You are running inside a Codex turn launched by the Teams helper.
+   prompt| - The current Teams request is the `User message` section above. Treat earlier Teams requests in resumed Codex history as completed context, not as work to continue or answer, unless the current user explicitly asks about them.
+   prompt| - Do not restart, reload, kill, replace, or background the Teams helper process, binary, or service from this turn.
+   prompt| - If an installed helper needs to restart after an update or local repair, finish the answer and tell the user to send `helper restart now` in the Teams control chat.
+   prompt| - If the helper needs a release update, tell the user to send `helper update now`, or `helper update prerelease` only when they asked for prereleases.
+   prompt| - Subagent requests use native Codex subagents. For cross-machine agent delegation, use the cxp skill and its `cxp delegate` workflow when the task needs another signed-in Teams machine.
+   prompt|
+   prompt| Put fractions, sums, integrals, matrices, and display math in <m>TeX</m> on a separate line, never in prose, tables, or lists—even if asked for one line. Use backticks for simple inline/literal TeX. Never use $ or \(...\). Math markers are not artifacts.
+   prompt|
+   prompt| If you need to return generated files or images to the Teams user, write them under this local directory:
+   prompt| <root>/home/.local/state/codex-helper/teams/core-files/outbound/cxp-<key:1>-<turn:4>
+   prompt|
+   prompt| Then include this fenced manifest in your final answer:
+   prompt| ```codex-helper-artifacts
+   prompt| {"version":1,"files":[{"path":"relative/path.ext","name":"display-name.ext"}]}
+   prompt| ```
+   prompt|
+   prompt| Use only relative manifest paths under that directory. Keep your normal answer visible; the helper will upload listed files separately when file-write auth is available.

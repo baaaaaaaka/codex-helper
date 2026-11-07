@@ -608,6 +608,25 @@ func (t *Tx) Meta(key string) (string, bool, error) {
 	return v, err == nil, err
 }
 
+// MetaPrefix returns the meta values whose key starts with prefix (an
+// index range scan on the primary key).
+func (t *Tx) MetaPrefix(prefix string) (map[string]string, error) {
+	rows, err := t.rows(`SELECT key, value FROM meta WHERE key >= ? AND key < ?`, prefix, prefix+"\U0010FFFF")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]string{}
+	for rows.Next() {
+		var k, v string
+		if err := rows.Scan(&k, &v); err != nil {
+			return nil, err
+		}
+		out[k] = v
+	}
+	return out, rows.Err()
+}
+
 // SetMeta writes a meta value (only when it changes).
 func (t *Tx) SetMeta(key, value string) error {
 	_, err := t.exec(`INSERT INTO meta(key,value) VALUES (?,?)

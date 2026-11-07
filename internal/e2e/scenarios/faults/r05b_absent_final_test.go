@@ -2,6 +2,7 @@ package faults
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -117,7 +118,7 @@ func TestR05b_AbsentFinalResentOnce(t *testing.T) {
 	s.Check("R-1 exactly one visible notice for the lost answer", n2 == 1, "1 notice", fmt.Sprintf("%d notices", n2), transcript2...)
 	finished := 0
 	for _, m := range s.SUTMessagesContaining(control.ID, "Codex finished") {
-		if strings.Contains(m.PlainText(), "Chat: s002") {
+		if strings.Contains(m.Content, "/l/chat/"+url.QueryEscape(work2.ID)+"/") { // its Open link
 			finished++
 		}
 	}

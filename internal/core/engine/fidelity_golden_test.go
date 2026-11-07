@@ -130,7 +130,7 @@ func fidelityTranscript(t *testing.T, e *Engine, enc *json.Encoder) {
 				if thread == "" {
 					thread = s.Thread
 				}
-				msgs, err := e.renderMirror(ctx, thread, o)
+				msgs, err := e.renderMirror(ctx, thread, o, false)
 				if err != nil {
 					rec["error"] = err.Error()
 				} else {

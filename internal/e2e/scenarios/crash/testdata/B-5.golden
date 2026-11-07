@@ -43,9 +43,9 @@
    | <a href="https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
    | <p>If Teams does not show it right away, search for: s003</p>
 -- "Codex finished" notices, one line each, sorted (posting order is timing: the chats finish together after the restart)
-   finished: s001 · b5-x | request: Next request E2E-B5-nextx-4 (@owner)
-   finished: s002 · b5-y | request: Next request E2E-B5-nexty-5 (@owner)
-   finished: s003 · b5-z | request: Next request E2E-B5-nextz-6 (@owner)
+   finished: 💬 e2ehost - New message in b5-x | request: Next request E2E-B5-nextx-4 (@owner)
+   finished: 💬 e2ehost - New message in b5-y | request: Next request E2E-B5-nexty-5 (@owner)
+   finished: 💬 e2ehost - New message in b5-z | request: Next request E2E-B5-nextz-6 (@owner)
 
 == chat <chat:2> "💬 e2ehost - Long task E2E-B5-lost-2"
    type: meeting; members: owner
@@ -88,6 +88,7 @@
 -- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-B5-nexty-5</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == chat <chat:3> "💬 e2ehost - Long task E2E-B5-notstarted-3"
@@ -130,6 +131,7 @@
 -- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-B5-nextz-6</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == chat <chat:4> "💬 e2ehost - Long task E2E-B5-streaming-1"
@@ -176,6 +178,7 @@
 -- <msg:9> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-B5-nextx-4</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == codex turns (per thread; threads by kind, directory and first prompt; turns in start order)

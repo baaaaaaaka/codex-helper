@@ -43,9 +43,9 @@
    | <a href="https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
    | <p>If Teams does not show it right away, search for: s003</p>
 -- "Codex finished" notices, one line each, sorted (posting order is timing: several chats finish together after the restart)
-   finished: s001 · int-a | request: Next request E2E-INTNOTICE-nexta-4 (@owner)
-   finished: s002 · int-b | request: Next request E2E-INTNOTICE-nextb-5 (@owner)
-   finished: s003 · int-c | request: Quick task E2E-INTNOTICE-idlec-3 (@owner)
+   finished: 💬 e2ehost - New message in int-a | request: Next request E2E-INTNOTICE-nexta-4 (@owner)
+   finished: 💬 e2ehost - New message in int-b | request: Next request E2E-INTNOTICE-nextb-5 (@owner)
+   finished: 💬 e2ehost - New message in int-c | request: Quick task E2E-INTNOTICE-idlec-3 (@owner)
    finished: 💬 e2ehost - Quick task E2E-INTNOTICE-idlec-3 | request: Next request E2E-INTNOTICE-nextc-6 (@owner)
 
 == chat <chat:2> "💬 e2ehost - Long task E2E-INTNOTICE-runa-1"
@@ -89,6 +89,7 @@
 -- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-INTNOTICE-nexta-4</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == chat <chat:3> "💬 e2ehost - Long task E2E-INTNOTICE-runb-2"
@@ -132,6 +133,7 @@
 -- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-INTNOTICE-nextb-5</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == chat <chat:4> "💬 e2ehost - Quick task E2E-INTNOTICE-idlec-3"
@@ -162,6 +164,7 @@
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-INTNOTICE-idlec-3</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:6> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
@@ -175,6 +178,7 @@
 -- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-INTNOTICE-nextc-6</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == codex turns (per thread; threads by kind, directory and first prompt; turns in start order)

@@ -68,6 +68,68 @@ type Event struct {
 	Text     string // message text; TurnComplete: last_agent_message
 	HasLast  bool   // TurnComplete carried a non-null last_agent_message
 	Meta     *SessionMeta
+	Info     *InfoUpdate // turn_context, thread_goal_updated, thread_settings_applied
+}
+
+// InfoUpdate is what a record says of the thread's goal and model
+// settings (nil fields: not said).
+type InfoUpdate struct {
+	Goal         *Goal
+	Model        string
+	Effort, Tier *string
+}
+
+// Goal is a thread goal as a rollout records it.
+type Goal struct {
+	Objective string `json:"objective"`
+	Status    string `json:"status"`
+}
+
+type infoPayload struct {
+	Type     string  `json:"type"`
+	Model    string  `json:"model"`
+	Effort   *string `json:"effort"`
+	Goal     *Goal   `json:"goal"`
+	Settings *struct {
+		Model           string  `json:"model"`
+		ServiceTier     *string `json:"service_tier"`
+		ReasoningEffort *string `json:"reasoning_effort"`
+	} `json:"thread_settings"`
+}
+
+// infoUpdate decodes the goal and settings of a turn_context or event_msg
+// payload (nil: none).
+func infoUpdate(typ string, raw json.RawMessage) *InfoUpdate {
+	var p infoPayload
+	if json.Unmarshal(raw, &p) != nil {
+		return nil
+	}
+	empty := ""
+	switch {
+	case typ == "turn_context":
+		if p.Model == "" {
+			return nil
+		}
+		u := &InfoUpdate{Model: p.Model, Effort: p.Effort}
+		if u.Effort == nil {
+			u.Effort = &empty
+		}
+		return u
+	case p.Type == "thread_goal_updated" && p.Goal != nil:
+		return &InfoUpdate{Goal: p.Goal}
+	case p.Type == "thread_settings_applied" && p.Settings != nil:
+		// A full snapshot: no tier or effort is the standard tier and
+		// the model's default effort.
+		u := &InfoUpdate{Model: p.Settings.Model, Effort: p.Settings.ReasoningEffort, Tier: p.Settings.ServiceTier}
+		if u.Effort == nil {
+			u.Effort = &empty
+		}
+		if u.Tier == nil {
+			u.Tier = &empty
+		}
+		return u
+	}
+	return nil
 }
 
 type envelope struct {
@@ -206,6 +268,7 @@ func Parse(line []byte) Event {
 	switch env.Type {
 	case "turn_context":
 		ev.Kind = KindTurnStarted
+		ev.Info = infoUpdate(env.Type, env.Payload)
 		return ev
 	case "response_item":
 		if p.Type != "message" {
@@ -244,6 +307,18 @@ func Parse(line []byte) Event {
 		} else {
 			ev.Kind = KindTurnRef
 		}
+	case "thread_goal_updated", "thread_settings_applied":
+		// Goal and settings changes: no turn record (thread_id names
+		// the thread, threadId in a goal update).
+		ev := Event{Kind: KindOther, Time: ts, ThreadID: p.ThreadID, Info: infoUpdate(env.Type, env.Payload)}
+		if ev.ThreadID == "" {
+			var camel struct {
+				ThreadID string `json:"threadId"`
+			}
+			_ = json.Unmarshal(env.Payload, &camel)
+			ev.ThreadID = camel.ThreadID
+		}
+		return ev
 	default:
 		if p.TurnID == "" {
 			return Event{Kind: KindOther, Time: ts}
@@ -341,7 +416,7 @@ func parseHead(line []byte, large bool) (Event, bool) {
 				return cheapRef(h), true
 			}
 			return Event{}, false
-		case contextCompactedType:
+		case contextCompactedType, "thread_goal_updated", "thread_settings_applied":
 			return Event{}, false
 		}
 		// Command output, patch, MCP results...: only the turn they

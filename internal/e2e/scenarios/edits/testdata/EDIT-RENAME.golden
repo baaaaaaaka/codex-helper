@@ -1,24 +1,7 @@
 # EDIT-RENAME: control title 🏠; `rename <title>`; `rename hostname <name>` across all chats with a partial failure reported; kept over a restart
 # cxp black-box transcript; volatile values are numbered placeholders
 
-== chat <chat:1> "s002 · host-b"
-   type: meeting; members: owner
--- <msg:1> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Work chat created: s002.<br>
-   | Working directory: <root>/work/host-b</p>
--- <msg:2> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>💬 Work chat is ready.<br>
-   | Send a task in this chat. Codex will start automatically and continue this session.<br>
-   | Status: waiting for your first task.<br>
-   | Session: s002<br>
-   | Project: host-b<br>
-   | Working directory: <root>/work/host-b<br>
-   | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
-   | Need more details? Send <code>helper status</code>.</p>
-
-== chat <chat:2> "🏠 Codex Control - newbox - Ops desk"
+== chat <chat:1> "🏠 Codex Control - newbox - Ops desk"
    type: meeting; members: owner
    title was: "🏠 Codex Control - e2ehost - Ops desk"
    title was: "🏠 Codex Control - newbox - Ops desk"
@@ -67,12 +50,12 @@
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>✅ Work chat created: s002</p>
    | <p>Open this Teams link and send your task there:<br>
-   | <a href="https://teams.microsoft.com/l/chat/<chat:1>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:1>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
+   | <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
    | <p>If Teams does not show it right away, search for: s002</p>
 -- <msg:10> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>✅ Codex finished</strong></p>
-   | <p><strong>Chat:</strong> s001 · host-a<br>
+   | <p><strong>Chat:</strong> 💬 e2ehost - New message in host-a<br>
    | <strong>Request:</strong> Tidy the build E2E-EDITRENAME-a-1</p>
    | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
    | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
@@ -86,11 +69,11 @@
 -- <msg:12> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p><strong>Active Work chats</strong></p>
-   | <p><strong>s002 · host-b</strong> [active]<br>
+   | <p><strong>💬 e2ehost - New message in host-b</strong> [active]<br>
    | &nbsp;&nbsp;<strong>Session:</strong> <code>s002</code><br>
    | &nbsp;&nbsp;<strong>Folder:</strong> <code><root>/work/host-b</code><br>
    | &nbsp;&nbsp;<strong>Last used:</strong> <minute><br>
-   | &nbsp;&nbsp;<strong>Chat:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:1>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">▶ Open chat</a></p>
+   | &nbsp;&nbsp;<strong>Chat:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">▶ Open chat</a></p>
    | <hr/>
    | <p><strong>💬 newbox - Tidy the build E2E-EDITRENAME-a-1</strong> [active]<br>
    | &nbsp;&nbsp;<strong>Session:</strong> <code>s001</code><br>
@@ -108,6 +91,23 @@
    | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
    | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
    mention 0: owner "E2E Owner"
+
+== chat <chat:2> "💬 e2ehost - New message in host-b"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Work chat created: s002.<br>
+   | Working directory: <root>/work/host-b</p>
+-- <msg:2> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>💬 Work chat is ready.<br>
+   | Send a task in this chat. Codex will start automatically and continue this session.<br>
+   | Status: waiting for your first task.<br>
+   | Session: s002<br>
+   | Project: host-b<br>
+   | Working directory: <root>/work/host-b<br>
+   | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
+   | Need more details? Send <code>helper status</code>.</p>
 
 == chat <chat:3> "💬 newbox - Tidy the build E2E-EDITRENAME-a-1"
    type: meeting; members: owner
@@ -139,6 +139,7 @@
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-EDITRENAME-a-1</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:6> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
@@ -153,7 +154,7 @@
    | Control chat: updated<br>
    | Work chats: 1 updated</p>
    | <p>Some chat titles were not updated:</p>
-   | <ul><li>s002: channel: rejected (permanent): graph PATCH /v1.0/chats/<chat:1>: HTTP 403 (ServiceUnavai…</li>
+   | <ul><li>s002: channel: rejected (permanent): graph PATCH /v1.0/chats/<chat:2>: HTTP 403 (ServiceUnavai…</li>
    | </ul>
 -- <msg:8> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
@@ -167,6 +168,7 @@
 -- <msg:10> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-EDITRENAME-after-2</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == codex turns (per thread; threads by kind, directory and first prompt; turns in start order)

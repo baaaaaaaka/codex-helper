@@ -261,3 +261,66 @@ func TestSendRetriesWithoutFormulaImagesWhenGraphRefusesThem(t *testing.T) {
 		t.Fatalf("403 retried: %d POSTs", n)
 	}
 }
+
+// Owner question 2026-11-07: a part carries as many formula images as its
+// size budget allows (v0.1.20's 5 per message was the helper's own
+// choice; Graph documents no count limit). If Graph refuses that many, the
+// part is posted again with the first fallbackImagesPerPart images (the
+// other formulas stay as TeX code), then with none.
+func TestFormulaImagesPerPartAndCountFallback(t *testing.T) {
+	png := tinyPNG(8, 4)
+	m := mathFunc(func(s []string) []MathResult {
+		out := make([]MathResult, len(s))
+		for i := range out {
+			out[i] = MathResult{PNG: png, Width: 8, Height: 4}
+		}
+		return out
+	})
+	var md strings.Builder
+	for i := 0; i < 12; i++ {
+		fmt.Fprintf(&md, "Step %d:\n\n<m>\\frac{a_{%d}}{b}</m>\n\n", i, i)
+	}
+	for _, limit := range []int{-1, fallbackImagesPerPart, 0} {
+		fg, a := newFake(t, fakegraph.Options{}, func(c *Config) { c.Math = m })
+		chat := fg.CreateMeetingChatAsUser("math").ID
+		parts, err := a.Render(context.Background(), channel.RichDoc{Label: "L", Markdown: md.String(), Math: true})
+		if err != nil || len(parts) != 1 || len(decodePart(t, parts[0]).HostedContents) != 12 {
+			t.Fatalf("render: %d parts, %v", len(parts), err)
+		}
+		if limit >= 0 {
+			fg.AddFault(fakegraph.Fault{Name: "too-many-images", Kind: fakegraph.FaultStatus, Status: http.StatusBadRequest, Method: http.MethodPost,
+				Match: func(r fakegraph.Request) bool { return strings.Count(r.Body, "temporaryId") > limit }})
+		}
+		if _, err := a.Send(context.Background(), chat, parts[0], "tok"); err != nil {
+			t.Fatalf("limit %d: send: %v", limit, err)
+		}
+		var got []fakegraph.Message
+		for _, msg := range fg.Messages(chat) {
+			if msg.Origin == fakegraph.OriginSUT {
+				got = append(got, msg)
+			}
+		}
+		want := 12
+		if limit >= 0 {
+			want = limit
+		}
+		if len(got) != 1 || got[0].Hosted != want || strings.Count(got[0].Content, "<img") != want ||
+			strings.Count(got[0].Content, "<pre><code>\\frac{a_") != 12 {
+			t.Fatalf("limit %d: posted %d messages, %v", limit, len(got), got)
+		}
+		for i := 1; i <= want; i++ {
+			if !strings.Contains(got[0].Content, fmt.Sprintf("../hostedContents/%d/$value", i)) {
+				t.Fatalf("limit %d: image %d missing: %s", limit, i, got[0].Content)
+			}
+		}
+		posts := 1
+		if limit == fallbackImagesPerPart {
+			posts = 2
+		} else if limit == 0 {
+			posts = 3
+		}
+		if n := len(fg.Requests(fakegraph.RequestFilter{Method: http.MethodPost})); n < posts {
+			t.Fatalf("limit %d: %d POSTs, want %d", limit, n, posts)
+		}
+	}
+}

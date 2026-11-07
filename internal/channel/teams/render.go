@@ -26,6 +26,7 @@ const (
 	targetPartBytes = 24 << 10
 	markerReserve   = len("<!-- "+markerPrefix+" -->") + 200
 	imgPlaceholder  = "\x00img\x00"
+	imgRefGrowth    = 32 // len("../hostedContents/NN/$value") - len(imgPlaceholder), rounded up
 )
 
 type frag struct {
@@ -53,8 +54,14 @@ func (a *Adapter) Render(ctx context.Context, doc channel.RichDoc) ([]channel.Pa
 	}
 
 	foot := footer(doc.FooterLabel, doc.Footer)
-	// Image placeholders grow to "../hostedContents/N/$value" when packed.
-	reserve := len(header(doc.Label, 999, 999, mention)) + markerReserve + len(attHTML) + len(foot) + maxImagesPerPart*32
+	if len(doc.Notes) > 0 {
+		var notes strings.Builder
+		for _, n := range doc.Notes {
+			notes.WriteString(footer(n.Label, n.Text))
+		}
+		foot = notes.String() + foot
+	}
+	reserve := len(header(doc.Label, 999, 999, mention)) + markerReserve + len(attHTML) + len(foot)
 	budget := targetPartBytes - reserve
 	if budget < 4<<10 {
 		return nil, fmt.Errorf("teams: label and attachments leave no room for content")
@@ -73,12 +80,14 @@ func (a *Adapter) Render(ctx context.Context, doc channel.RichDoc) ([]channel.Pa
 		for _, p := range f.pngs {
 			fb += len(p)
 		}
-		if len(cur) > 0 && (size+len(f.html) > budget || imgs+len(f.pngs) > maxImagesPerPart || imgBytes+fb > maxPartImageBytes) {
+		// Image placeholders grow to "../hostedContents/N/$value" when packed.
+		fs := len(f.html) + len(f.pngs)*imgRefGrowth
+		if len(cur) > 0 && (size+fs > budget || imgs+len(f.pngs) > maxImagesPerPart || imgBytes+fb > maxPartImageBytes) {
 			packs = append(packs, cur)
 			cur, size, imgs, imgBytes = nil, 0, 0, 0
 		}
 		cur = append(cur, f)
-		size += len(f.html)
+		size += fs
 		imgs += len(f.pngs)
 		imgBytes += fb
 	}

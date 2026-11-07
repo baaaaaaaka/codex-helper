@@ -9,28 +9,28 @@
 -- <msg:2> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>💬 New local Codex chat detected</strong></p>
-   | <p><strong>Chat:</strong> s001 · Probe session</p>
+   | <p><strong>Chat:</strong> 💬 e2ehost - Probe session</p>
    | <p><strong>Next:</strong> Open this chat to watch the answer and continue from the full local context.</p>
    | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open chat</a> (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
    mention 0: owner "E2E Owner"
 -- <msg:3> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>✅ Codex finished</strong></p>
-   | <p><strong>Chat:</strong> s001 · Probe session</p>
+   | <p><strong>Chat:</strong> 💬 e2ehost - Probe session</p>
    | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
    | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
    mention 0: owner "E2E Owner"
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>💬 New local Codex chat detected</strong></p>
-   | <p><strong>Chat:</strong> s002 · Question one E2E-MIRREWRITE-oneprompt-2</p>
+   | <p><strong>Chat:</strong> 💬 e2ehost - Question one E2E-MIRREWRITE-oneprompt-2</p>
    | <p><strong>Next:</strong> Open this chat to watch the answer and continue from the full local context.</p>
    | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open chat</a> (https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
    mention 0: owner "E2E Owner"
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>✅ Codex finished</strong></p>
-   | <p><strong>Chat:</strong> s002 · Question one E2E-MIRREWRITE-oneprompt-2</p>
+   | <p><strong>Chat:</strong> 💬 e2ehost - Question one E2E-MIRREWRITE-oneprompt-2</p>
    | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
    | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
    mention 0: owner "E2E Owner"
@@ -67,12 +67,11 @@
 -- <msg:3> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>Probe answer E2E-MIRREWRITE-probe-1</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == chat <chat:3> "💬 e2ehost - Question two E2E-MIRREWRITE-twoprompt-4"
    type: meeting; members: owner
-   title was: "💬 e2ehost - Question one E2E-MIRREWRITE-oneprompt-2"
-   title was: "💬 e2ehost - Question two E2E-MIRREWRITE-twoprompt-4"
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Local Codex chat detected: s002.</p>
@@ -82,6 +81,7 @@
 -- <msg:3> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>Answer one E2E-MIRREWRITE-oneanswer-3</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
@@ -89,6 +89,7 @@
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>Answer two E2E-MIRREWRITE-twoanswer-5</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
@@ -96,6 +97,7 @@
 -- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>Answer three E2E-MIRREWRITE-threeanswer-7</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
@@ -103,4 +105,5 @@
 -- <msg:9> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>Answer four E2E-MIRREWRITE-fouranswer-9</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>

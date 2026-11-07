@@ -51,6 +51,7 @@ func parseTwoPass(line []byte) Event {
 	switch env.Type {
 	case "turn_context":
 		ev.Kind = KindTurnStarted
+		ev.Info = infoUpdate(env.Type, env.Payload)
 		return ev
 	case "response_item":
 		if p.Type != "message" {
@@ -87,6 +88,16 @@ func parseTwoPass(line []byte) Event {
 		} else {
 			ev.Kind = KindTurnRef
 		}
+	case "thread_goal_updated", "thread_settings_applied":
+		ev := Event{Kind: KindOther, Time: ts, ThreadID: p.ThreadID, Info: infoUpdate(env.Type, env.Payload)}
+		if ev.ThreadID == "" {
+			var camel struct {
+				ThreadID string `json:"threadId"`
+			}
+			_ = json.Unmarshal(env.Payload, &camel)
+			ev.ThreadID = camel.ThreadID
+		}
+		return ev
 	default:
 		if p.TurnID == "" {
 			return Event{Kind: KindOther, Time: ts}

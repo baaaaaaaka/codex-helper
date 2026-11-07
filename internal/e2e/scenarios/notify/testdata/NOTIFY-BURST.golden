@@ -43,9 +43,9 @@
    | <a href="https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
    | <p>If Teams does not show it right away, search for: s003</p>
 -- "Codex finished" notices, one line each, sorted (posting order is timing: three finals complete at once)
-   finished: s001 · burst-a | request: Burst question E2E-NOTIFYBURST-burst1-1 (@owner)
-   finished: s002 · burst-b | request: Burst question E2E-NOTIFYBURST-burst2-2 (@owner)
-   finished: s003 · burst-c | request: Burst question E2E-NOTIFYBURST-burst3-3 (@owner)
+   finished: 💬 e2ehost - New message in burst-a | request: Burst question E2E-NOTIFYBURST-burst1-1 (@owner)
+   finished: 💬 e2ehost - New message in burst-b | request: Burst question E2E-NOTIFYBURST-burst2-2 (@owner)
+   finished: 💬 e2ehost - New message in burst-c | request: Burst question E2E-NOTIFYBURST-burst3-3 (@owner)
 
 == chat <chat:2> "💬 e2ehost - Burst question E2E-NOTIFYBURST-burst1-1"
    type: meeting; members: owner
@@ -75,6 +75,7 @@
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-NOTIFYBURST-burst1-1</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == chat <chat:3> "💬 e2ehost - Burst question E2E-NOTIFYBURST-burst2-2"
@@ -105,6 +106,7 @@
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-NOTIFYBURST-burst2-2</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == chat <chat:4> "💬 e2ehost - Burst question E2E-NOTIFYBURST-burst3-3"
@@ -135,6 +137,7 @@
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-NOTIFYBURST-burst3-3</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == codex turns (per thread; threads by kind, directory and first prompt; turns in start order)

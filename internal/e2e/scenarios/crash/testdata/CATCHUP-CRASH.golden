@@ -1,7 +1,48 @@
 # CATCHUP-CRASH: two SIGKILLs during the catch-up of 40 local turns: each record once, in order, silent
 # cxp black-box transcript; volatile values are numbered placeholders
 
-== chat <chat:1> "s003 · Down question 1 E2E-CATCHUPCRASH-Downp-44"
+== chat <chat:1> "🏠 Codex Control - e2ehost"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
+-- <msg:2> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
+   | <p><strong>💬 New local Codex chat detected</strong></p>
+   | <p><strong>Chat:</strong> 💬 e2ehost - Probe session</p>
+   | <p><strong>Next:</strong> Open this chat to watch the answer and continue from the full local context.</p>
+   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open chat</a> (https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
+   mention 0: owner "E2E Owner"
+-- <msg:3> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
+   | <p><strong>✅ Codex finished</strong></p>
+   | <p><strong>Chat:</strong> 💬 e2ehost - Probe session</p>
+   | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
+   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
+   mention 0: owner "E2E Owner"
+-- <msg:4> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
+   | <p><strong>💬 New local Codex chat detected</strong></p>
+   | <p><strong>Chat:</strong> 💬 e2ehost - Live question 1 E2E-CATCHUPCRASH-Livep-2</p>
+   | <p><strong>Next:</strong> Open this chat to watch the answer and continue from the full local context.</p>
+   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open chat</a> (https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
+   mention 0: owner "E2E Owner"
+-- <msg:5> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
+   | <p><strong>✅ Codex finished</strong></p>
+   | <p><strong>Chat:</strong> 💬 e2ehost - Live question 1 E2E-CATCHUPCRASH-Livep-2</p>
+   | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
+   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
+   mention 0: owner "E2E Owner"
+-- <msg:6> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
+   | <p><strong>🆕 New local Codex chats (1)</strong></p>
+   | <p>These local Codex sessions got Teams work chats while the helper was catching up. Teams lists a new chat only after it is opened: open one here to watch it and continue from its full local context.</p>
+   | <ul><li><strong>s003</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Down question 1 E2E-CATCHUPCRASH-Downp-44</a> (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | </ul>
+   mention 0: owner "E2E Owner"
+
+== chat <chat:2> "💬 e2ehost - Down question 1 E2E-CATCHUPCRASH-Downp-44"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -147,40 +188,6 @@
    | <p>Down answer 20 E2E-CATCHUPCRASH-Downa-83</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
-== chat <chat:2> "🏠 Codex Control - e2ehost"
-   type: meeting; members: owner
--- <msg:1> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
--- <msg:2> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
-   | <p><strong>💬 New local Codex chat detected</strong></p>
-   | <p><strong>Chat:</strong> s001 · Probe session</p>
-   | <p><strong>Next:</strong> Open this chat to watch the answer and continue from the full local context.</p>
-   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open chat</a> (https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
-   mention 0: owner "E2E Owner"
--- <msg:3> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
-   | <p><strong>✅ Codex finished</strong></p>
-   | <p><strong>Chat:</strong> s001 · Probe session</p>
-   | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
-   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
-   mention 0: owner "E2E Owner"
--- <msg:4> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
-   | <p><strong>💬 New local Codex chat detected</strong></p>
-   | <p><strong>Chat:</strong> s002 · Live question 1 E2E-CATCHUPCRASH-Livep-2</p>
-   | <p><strong>Next:</strong> Open this chat to watch the answer and continue from the full local context.</p>
-   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open chat</a> (https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
-   mention 0: owner "E2E Owner"
--- <msg:5> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
-   | <p><strong>✅ Codex finished</strong></p>
-   | <p><strong>Chat:</strong> s002 · Live question 1 E2E-CATCHUPCRASH-Livep-2</p>
-   | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
-   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
-   mention 0: owner "E2E Owner"
-
 == chat <chat:3> "💬 e2ehost - Live question 1 E2E-CATCHUPCRASH-Livep-2"
    type: meeting; members: owner
 -- <msg:1> helper (html)
@@ -192,6 +199,7 @@
 -- <msg:3> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>Live answer 1 E2E-CATCHUPCRASH-Livea-3</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
@@ -345,4 +353,5 @@
 -- <msg:3> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>Probe answer E2E-CATCHUPCRASH-probe-1</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>

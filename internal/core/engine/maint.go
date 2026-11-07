@@ -168,6 +168,7 @@ func (e *Engine) maintenanceLoop(ctx context.Context) {
 			e.ag.Maintain()
 			e.remindQueued()
 			e.retryCreating()
+			e.announcePass()
 			e.parkIdle()
 			if e.now().Sub(lastVacuum) > time.Hour {
 				lastVacuum = e.now()

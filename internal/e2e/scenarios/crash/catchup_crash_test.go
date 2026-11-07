@@ -138,10 +138,17 @@ func TestCatchUpSurvivesCrashes(t *testing.T) {
 	}
 	// Everything after the stop is catch-up: no @mention anywhere, no
 	// card (the catch-up-silent invariant exempts a chat that also had
-	// live records, as the live session's has).
+	// live records, as the live session's has), except the one control-chat
+	// summary of the new chats (owner decision 2026-11-07), which names the
+	// session created while down once across both kills.
 	var loud []string
+	summaries := 0
 	for _, c := range s.Graph.Chats() {
 		for _, m := range s.SUTMessages(c.ID) {
+			if harness.NewChatsSummary(m) {
+				summaries++
+				continue
+			}
 			if m.RequestSeq > downSeq && (len(m.Mentions) > 0 || strings.Contains(m.Content, "<at ")) {
 				loud = append(loud, fmt.Sprintf("%s: %.80q", m.Instance, harness.NormalizeSpace(m.PlainText())))
 			}
@@ -156,6 +163,7 @@ func TestCatchUpSurvivesCrashes(t *testing.T) {
 	if n > 3 {
 		loud = append(loud[:3], "…")
 	}
+	s.Check("the new chat is announced in one summary", summaries == 1, "1 summary", fmt.Sprint(summaries))
 	s.Check("the restarts notify nobody", n == 0, "no @mention, no card after the stop", fmt.Sprintf("%d: %s", n, strings.Join(loud, "; ")))
 	s.Check("catch-up never runs Codex", len(s.Codex.Calls()) == 0, "0", fmt.Sprint(len(s.Codex.Calls())))
 }

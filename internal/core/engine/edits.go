@@ -35,6 +35,10 @@ type chatEdit struct {
 	defers   int
 	// run makes the edit in chat. errEditLater asks for another try.
 	run func(ctx context.Context, chat string) error
+	// class ranks an edit made in a chat with nothing to send (sendReply
+	// unless set: the startup title repair goes with the mirrored
+	// messages).
+	class int
 }
 
 // errEditLater: the edit could not be made now (its read would wait too
@@ -82,7 +86,7 @@ func (e *Engine) withEdits(items []sendItem, now time.Time, soon func(time.Durat
 	if len(e.edits) == 0 {
 		return items
 	}
-	due := map[int64]bool{}
+	due := map[int64]int{}
 	for conv, q := range e.edits {
 		cs := e.convs[conv]
 		if cs == nil || len(q) == 0 {
@@ -96,16 +100,16 @@ func (e *Engine) withEdits(items []sendItem, now time.Time, soon func(time.Durat
 			soon(d)
 			continue
 		}
-		due[conv] = true
+		due[conv] = q[0].class
 	}
 	for i := range items {
-		if !items[i].create && due[items[i].conv] {
+		if _, ok := due[items[i].conv]; ok && !items[i].create {
 			items[i].edit = true
 			delete(due, items[i].conv)
 		}
 	}
-	for conv := range due {
-		items = append(items, sendItem{edit: true, conv: conv, class: sendReply})
+	for conv, class := range due {
+		items = append(items, sendItem{edit: true, conv: conv, class: class})
 	}
 	return items
 }

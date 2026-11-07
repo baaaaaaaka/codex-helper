@@ -23,6 +23,9 @@ func TestHistoryMessageLabels(t *testing.T) {
 		{"🧑‍💻 User [part 2/3]:\nrest of it", true, "restofit", true},
 		{"🤖 ✅ Codex answer:\nDone.\n🔧 Helper: ✅ Codex finished responding.", false, "done", true},
 		{"🤖 ✅ Codex answer [part 1/2]:\nfirst half", false, "firsthalf", true},
+		// The goal and model lines before the footer (2026-11-07).
+		{"🤖 ✅ Codex answer:\nDone.\n🎯 Active goal: ship it\n🔧 Helper: model - gpt-5, effort - high, tier - fast\n🔧 Helper: ✅ Codex finished responding.", false, "done", true},
+		{"🤖 ✅ Codex answer:\nThe Active goal: line stays\n🔧 Helper: ✅ Codex finished responding.", false, "theactivegoallinestays", true},
 		{"🤖 ⏳ Codex status:\nworking", false, "", false},
 		{"🔧 Helper:\nWork chat is ready.", false, "", false},
 		{"fix the tests", false, "", false}, // typed in Teams: no label

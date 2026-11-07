@@ -180,6 +180,7 @@ var workNatural = map[string]string{
 	"fork":     cmdFork,
 	"restart":  cmdRestartName,
 	"shutdown": cmdShutdown, // control-only: answered with a pointer
+	"goal":     cmdGoalName, // goalcmds.go (owner 2026-11-07); not after `codex`
 }
 
 // workShort: the short names `/`, `!` and `cx` accept in a work chat
@@ -282,6 +283,9 @@ func parseWork(text string) parsed {
 		return parsed{form: formUnknown, name: name, arg: arg, syntax: syn}
 	}
 	canon := workNatural[name]
+	if canon == cmdGoalName && syn == synCodex {
+		return parsed{syntax: syn} // `codex goal …` stays a prompt
+	}
 	if canon == "" && (syn == synSlash || syn == synBang || syn == synCX) {
 		canon = workShort[name]
 	}
@@ -480,7 +484,7 @@ func webhookArgExplicit(arg string) bool {
 func workOnlyName(name string) bool {
 	switch name {
 	case "close", "retry", "cancel", "stop", "send-file", "send-image", "file", "image",
-		"publish-history", "sync-history", "import-history", "stats", "usage", "tokens":
+		"publish-history", "sync-history", "import-history", "stats", "usage", "tokens", "goal":
 		return true
 	}
 	return false

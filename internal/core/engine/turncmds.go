@@ -103,9 +103,30 @@ const (
 // canceled." (R-20-33).
 func (e *Engine) cmdCancel(ctx context.Context, j cmdJob, cs *convState, arg string) {
 	sel := strings.ToLower(strings.TrimSpace(arg))
-	var interrupt bool
+	var interrupt, stopGoal bool
+	// The goal (goalcmds.go): a cancel that interrupts the running turn,
+	// or finds nothing of the helper's to cancel, pauses an active goal
+	// and stops the turn Codex runs by itself for it.
+	info := e.turnInfo(cs.id)
+	goalReply := func(text string) string {
+		if !interrupt || info.Goal == "" {
+			return text
+		}
+		stopGoal = true
+		return text + "\n\n" + textCancelGoal
+	}
+	nothing := func(text string) string {
+		if info.Goal == "" && !info.SelfTurn {
+			return text
+		}
+		stopGoal = true
+		if info.SelfTurn {
+			return textCancelGoalTurn
+		}
+		return textCancelGoalOnly
+	}
 	err := e.replyIn(j, func(tx *store.Tx) (string, error) {
-		interrupt = false
+		interrupt, stopGoal = false, false
 		e.mu.Lock()
 		var runningID int64
 		if cs.running != nil {
@@ -136,18 +157,19 @@ func (e *Engine) cmdCancel(ctx context.Context, j cmdJob, cs *convState, arg str
 		switch sel {
 		case "all":
 			if len(queued) == 0 && running == nil {
-				return textCancelNone, nil
+				return nothing(textCancelNone), nil
 			}
-			return e.cancelAll(tx, queued, running, &interrupt)
+			text, err := e.cancelAll(tx, queued, running, &interrupt)
+			return goalReply(text), err
 		case "", "last":
 			if target = newestQueued(); target == nil {
 				target = running
 			}
 			if target == nil && sel == "" {
-				return "Nothing to cancel: no request is running or queued.\n\n" + textCancelUsage, nil
+				return nothing("Nothing to cancel: no request is running or queued.\n\n" + textCancelUsage), nil
 			}
 			if target == nil {
-				return textCancelNone, nil
+				return nothing(textCancelNone), nil
 			}
 		case "queued":
 			if target = newestQueued(); target == nil {
@@ -155,7 +177,7 @@ func (e *Engine) cmdCancel(ctx context.Context, j cmdJob, cs *convState, arg str
 			}
 		case "running":
 			if target = running; target == nil {
-				return textCancelNoRunning, nil
+				return nothing(textCancelNoRunning), nil
 			}
 		default:
 			id, ok := parseTurnRef(sel)
@@ -178,8 +200,12 @@ func (e *Engine) cmdCancel(ctx context.Context, j cmdJob, cs *convState, arg str
 				return fmt.Sprintf("turn %s is %s and cannot be canceled.", turnRef(tr.ID), turnStateText(tr.State)), nil
 			}
 		}
-		return e.cancelOne(tx, cs, *target, running != nil && target.ID == running.ID, queued, &interrupt)
+		text, err := e.cancelOne(tx, cs, *target, running != nil && target.ID == running.ID, queued, &interrupt)
+		return goalReply(text), err
 	})
+	if err == nil && stopGoal {
+		e.stopGoal(ctx, cs) // before the interrupt: its end must not restart the goal
+	}
 	if err == nil && interrupt {
 		e.cancelRunning(ctx, cs.id)
 	}

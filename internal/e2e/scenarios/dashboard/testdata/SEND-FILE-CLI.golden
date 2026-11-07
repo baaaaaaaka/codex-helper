@@ -1,7 +1,25 @@
 # SEND-FILE-CLI: `cxp teams send-file`: a file from the outbound root, or a local path with --allow-local-path, sent to s001; refusals; kept while no helper runs
 # cxp black-box transcript; volatile values are numbered placeholders
 
-== chat <chat:1> "s001 · cli-file"
+== chat <chat:1> "🏠 Codex Control - e2ehost"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
+-- <msg:2> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>new <root>/work/cli-file</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>new <root>/work/cli-file</p>
+-- <msg:3> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>✅ Work chat created: s001</p>
+   | <p>Open this Teams link and send your task there:<br>
+   | <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
+   | <p>If Teams does not show it right away, search for: s001</p>
+
+== chat <chat:2> "💬 e2ehost - New message in cli-file"
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -46,24 +64,6 @@
    | <attachment id="<uuid:3>"></attachment>
    attachment: {"contentType":"reference","contentUrl":"https://e2etenant-my.sharepoint.com/personal/owner_e2e_example/Documents/Microsoft%20Teams%20Chat%20Files/codex-<upload:3>/notes.txt","id":"<uuid:3>","name":"notes.txt"}
 
-== chat <chat:2> "🏠 Codex Control - e2ehost"
-   type: meeting; members: owner
--- <msg:1> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
--- <msg:2> owner (html)
-   | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>new <root>/work/cli-file</p>
-   edited 1 time(s); earlier versions:
-   [version 1]
-   | <p>new <root>/work/cli-file</p>
--- <msg:3> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>✅ Work chat created: s001</p>
-   | <p>Open this Teams link and send your task there:<br>
-   | <a href="https://teams.microsoft.com/l/chat/<chat:1>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:1>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
-   | <p>If Teams does not show it right away, search for: s001</p>
-
 == uploaded files
 -- /Microsoft Teams Chat Files/codex-<upload:2>/local.txt
    sha256:16dd141376c649f9de7217580086a79786aaa441c307ab7164d096ce19eae8e4, 34 bytes, writes: put
@@ -76,7 +76,7 @@
 $ cxp teams send-file reports/notes.txt
    exit 1
    stderr| Error: choose a target with --session or --chat-id
-$ cxp teams send-file reports/notes.txt --chat-id <chat:1>
+$ cxp teams send-file reports/notes.txt --chat-id <chat:2>
    exit 1
    stderr| Error: refusing explicit --chat-id without --yes; prefer --session to avoid sending a file to the wrong Teams chat
 $ cxp teams send-file <root>/work/elsewhere/local.txt --session s001
@@ -94,7 +94,7 @@ $ cxp teams send-file reports/notes.txt --session s001
    stdout| Waiting for the running Teams helper...
    stdout| Sent Teams file attachment: notes.txt
    stdout| Target session: s001
-$ cxp teams send-file <root>/work/elsewhere/local.txt --allow-local-path --chat-id <chat:1> --yes --message Local notes E2E-SENDFILECLI-file-1
+$ cxp teams send-file <root>/work/elsewhere/local.txt --allow-local-path --chat-id <chat:2> --yes --message Local notes E2E-SENDFILECLI-file-1
    exit 0
    stdout| Waiting for the running Teams helper...
    stdout| Sent Teams file attachment: local.txt

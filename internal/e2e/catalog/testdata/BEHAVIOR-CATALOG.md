@@ -295,6 +295,7 @@ Scenario `Guarantees` tags that are not catalog ids. `-` = deliberately not a ca
 | D13 | F-RND-7 | design decision D13 (formula) |
 | INC-02 | R-7 | incident family |
 | removed-commands | - | asserts removed commands stay removed |
+| cmd-goal | - | owner request 2026-11-07: `helper goal`, goal and model lines, `helper cancel` pauses the goal (after SPEC) |
 | B-5 | - | E2E plan scenario label |
 | N-2 | - | CORE-DESIGN latency target |
 | N-3 | - | CORE-DESIGN latency target |

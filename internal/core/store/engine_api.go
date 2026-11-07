@@ -188,6 +188,37 @@ func (s *Store) PendingOutboxConvs() ([]int64, error) {
 	return out, rows.Err()
 }
 
+// LastSeq is the seq of conv's last outbox row (0: none).
+func (t *Tx) LastSeq(conv int64) (int64, error) {
+	var n int64
+	err := t.row(`SELECT COALESCE(MAX(seq), 0) FROM outbox WHERE conv_id = ?`, conv).Scan(&n)
+	return n, err
+}
+
+// UrgentConvs lists the conversations with a pending row of a kind the
+// owner waits for: any kind but mirrored messages and progress (an ACK, a
+// final, a notice). The sender ranks such a conversation by that row, also
+// when an older mirrored or progress row is its head: rows go out in order,
+// so a stale progress post must not hold an answer behind a catch-up
+// backlog. The first term matches the outbox_pending partial index.
+func (t *Tx) UrgentConvs() (map[int64]bool, error) {
+	rows, err := t.rows(`SELECT DISTINCT conv_id FROM outbox
+WHERE state IN ('queued','sending','unknown') AND state = 'queued' AND kind NOT IN ('mirror','progress')`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[int64]bool{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out[id] = true
+	}
+	return out, rows.Err()
+}
+
 // OutboxByKeyPrefix lists the outbox rows whose delivery key starts with
 // prefix, in order (an index range scan on the unique key; read pool).
 func (s *Store) OutboxByKeyPrefix(prefix string) ([]Outbox, error) {

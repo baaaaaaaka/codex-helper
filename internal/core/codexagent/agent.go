@@ -42,7 +42,10 @@ type runningTurn struct {
 	interrupt bool // Interrupt came before Codex accepted the turn
 }
 
-var _ engine.Agent = (*Agent)(nil)
+var (
+	_ engine.Agent     = (*Agent)(nil)
+	_ engine.GoalAgent = (*Agent)(nil)
+)
 
 // New returns an agent; nothing starts until a turn runs.
 func New(cfg Config) *Agent {
@@ -309,3 +312,90 @@ func (a *Agent) Maintain() { a.pool.Reap() }
 
 // Close ends every app-server.
 func (a *Agent) Close() { a.pool.Close(2 * time.Second) }
+
+// Info is what the app-server of convID knows of threadID: the active
+// goal (from thread/resume's goal snapshot, goal calls and notifications)
+// and the thread's effective model settings.
+func (a *Agent) Info(convID int64, threadID string) engine.TurnInfo {
+	srv := a.pool.Peek(key(convID))
+	if srv == nil || threadID == "" {
+		return engine.TurnInfo{}
+	}
+	t := srv.Info(threadID)
+	out := engine.TurnInfo{Model: t.Model, Effort: t.Effort, Tier: t.Tier}
+	if t.Goal != nil && t.Goal.Status == codex.GoalActive {
+		out.Goal = t.Goal.Objective
+	}
+	out.SelfTurn = t.Turn != "" && t.Turn != a.ownTurn(convID, srv)
+	return out
+}
+
+// ownTurn is the Codex turn id of the helper's running turn of convID on
+// srv ("" when none or not started yet).
+func (a *Agent) ownTurn(convID int64, srv *codex.Server) string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if rt := a.running[convID]; rt != nil && rt.srv == srv {
+		return rt.turnID
+	}
+	return ""
+}
+
+// Goal reads or sets the goal of threadID on the conversation's
+// app-server (thread/resume first). Setting it active on an idle thread
+// starts Codex working on it in that server; its turns reach the chat
+// through the rollout mirror.
+func (a *Agent) Goal(ctx context.Context, convID int64, threadID, cwd string, change engine.GoalState) (engine.GoalState, error) {
+	lease, err := a.pool.Acquire(ctx, key(convID), a.serverConfig(cwd))
+	if err != nil {
+		return engine.GoalState{}, err
+	}
+	defer lease.Release()
+	if err := lease.Load(ctx, threadID); err != nil {
+		if codex.IsActiveWriter(err) {
+			return engine.GoalState{}, engine.ErrActiveWriter
+		}
+		return engine.GoalState{}, err
+	}
+	srv := lease.Server()
+	if change.Objective == "" && change.Status == "" {
+		g, err := srv.GoalGet(ctx, threadID)
+		if err != nil || g == nil {
+			return engine.GoalState{}, err
+		}
+		return engine.GoalState{Objective: g.Objective, Status: g.Status}, nil
+	}
+	g, err := srv.GoalSet(ctx, threadID, change.Objective, change.Status)
+	if err != nil {
+		return engine.GoalState{}, err
+	}
+	return engine.GoalState{Objective: g.Objective, Status: g.Status}, nil
+}
+
+// StopGoal pauses the active goal of threadID when the conversation's
+// app-server has the thread loaded (Codex's interrupt leaves a goal
+// active; the TUI pauses it the same way before interrupting) and
+// interrupts the turn Codex runs there by itself. A turn the helper runs
+// is left to Interrupt.
+func (a *Agent) StopGoal(ctx context.Context, convID int64, threadID string) (engine.GoalStopped, error) {
+	var out engine.GoalStopped
+	srv := a.pool.Peek(key(convID))
+	if srv == nil || threadID == "" {
+		return out, nil
+	}
+	t := srv.Info(threadID)
+	if t.Goal != nil && t.Goal.Status == codex.GoalActive {
+		g, err := srv.GoalSet(ctx, threadID, "", codex.GoalPaused)
+		if err != nil {
+			return out, err
+		}
+		out.Paused, out.Objective = true, g.Objective
+	}
+	if turn := srv.Info(threadID).Turn; turn != "" && turn != a.ownTurn(convID, srv) {
+		if err := srv.TurnInterrupt(ctx, threadID, turn); err != nil {
+			return out, err
+		}
+		out.Interrupted = true
+	}
+	return out, nil
+}
