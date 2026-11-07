@@ -222,6 +222,13 @@ func (e *Engine) orderReads(now time.Time) ([]int64, []bool) {
 	byAge := func(due []int64) {
 		sort.Slice(due, func(i, j int) bool {
 			a, b := e.convs[due[i]], e.convs[due[j]]
+			if fa, fb := due[i] == e.controlID && !a.readOnce, due[j] == e.controlID && !b.readOnce; fa != fb {
+				// The control chat's first read goes first: until it,
+				// this process starts no turn and sends nothing
+				// (controlReadLocked), not even in a control chat it
+				// just created behind a start-up read of every chat.
+				return fa
+			}
 			if a.scanDue != b.scanDue {
 				return a.scanDue // a change the scan showed goes before timed reads
 			}
@@ -404,6 +411,9 @@ func (e *Engine) read(ctx context.Context, id int64) {
 			if id == e.controlID || e.tookOver != "" {
 				e.runnerAll = true // turns wait for it (readyLocked)
 				wake(e.runnerWake)
+			}
+			if id == e.controlID {
+				wake(e.senderWake) // sends wait for it (controlReadLocked)
 			}
 		}
 		cs.nextRead = e.nextReadLocked(cs, start, now, safety)
@@ -1250,6 +1260,16 @@ func (e *Engine) scanLoop(ctx context.Context) {
 		}
 		if e.stopping.Load() {
 			continue // shutdown: no chat is read again
+		}
+		e.mu.Lock()
+		ready := e.controlReadLocked()
+		e.mu.Unlock()
+		if !ready {
+			// The control chat's first read goes first (nothing is
+			// sent before it, takeover.go): a small read budget is not
+			// spent on scans meanwhile; the start-up reads cover what
+			// a scan would show.
+			continue
 		}
 		now := e.now()
 		if until := e.gate(e.gRead); now.Before(until) {

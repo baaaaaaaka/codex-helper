@@ -108,8 +108,23 @@ func (e *Engine) standDown(host string) {
 // stops an old copy that starts again; after a takeover, not before it read
 // cs once, where rule 2 closes what the other copy took (caller holds e.mu).
 func (e *Engine) readyLocked(cs *convState) bool {
-	read := func(c *convState) bool { return c == nil || c.readOnce || !readStateLocked(c) }
-	return read(e.convs[e.controlID]) && (e.tookOver == "" || read(cs))
+	return e.controlReadLocked() && (e.tookOver == "" || readOnceLocked(cs))
+}
+
+// controlReadLocked reports whether this process has read its control
+// chat once, or has none to read. Until then it starts no turn and sends
+// nothing (sender.go): a copy whose state was copied elsewhere learns of
+// the sibling's takeover notice only from that read, and stands down
+// having posted nothing (rule 1), not after an ACK for a request the
+// other copy owns (caller holds e.mu).
+func (e *Engine) controlReadLocked() bool {
+	return readOnceLocked(e.convs[e.controlID])
+}
+
+// readOnceLocked reports whether cs was read once by this process, or is
+// not in a state that is read (caller holds e.mu).
+func readOnceLocked(c *convState) bool {
+	return c == nil || c.readOnce || !readStateLocked(c)
 }
 
 // closeCopied closes a request the other copy already took (rule 2).

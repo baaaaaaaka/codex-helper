@@ -4,6 +4,7 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -108,6 +109,50 @@ func TestMoveGuardOlderCopyStandsDown(t *testing.T) {
 	}
 	if rec, _, _ := store.ReadStop(dir); rec.Host != "host-c" {
 		t.Fatalf("stop record %+v", rec)
+	}
+}
+
+// Move guard, rule 1, at a start with a request waiting: the older copy
+// may read a work chat before its control chat. It sends nothing until it
+// has read the control chat once (no ACK for a request the other copy
+// owns), and when that read finds the other copy's takeover notice it
+// stands down having posted nothing (the MOVED-LIVE-STOPPED scenario).
+func TestMoveGuardOlderCopySendsNothingBeforeItsControlRead(t *testing.T) {
+	r := newRig(t, func(c *Config) { c.Host = "host-a" })
+	ctl := r.control()
+	work := r.newWork(t.TempDir())
+	sib := r.siblingMarkers()
+	r.stop()
+
+	var held atomic.Bool
+	held.Store(true)
+	r.ch.ReceiveFault = func(stream string) error {
+		if held.Load() && strings.Contains(stream, ctl) {
+			return errors.New("test: control chat reads held")
+		}
+		return nil
+	}
+	r.ch.PostUser(work, "hello")
+	r.ch.PostOtherHelper(ctl, "🔧 Helper: 🔁 The helper now runs on host-b: it took over from host-a, whose helper stopped.", sib("1"))
+	posts := func() int { return len(r.ch.Messages(ctl)) + len(r.ch.Messages(work)) }
+	before := posts()
+	r.start()
+	time.Sleep(time.Second) // many ticks: the work chat is read, its request admitted
+	if n := posts() - before; n != 0 {
+		t.Fatalf("%d posts before the control chat was read", n)
+	}
+	held.Store(false)
+	if err := r.exited(); !errors.Is(err, store.ErrDisabled) {
+		t.Fatalf("Run returned %v, want ErrDisabled", err)
+	}
+	if n := posts() - before; n != 0 {
+		t.Fatalf("%d posts by the copy that stood down", n)
+	}
+	r.ag.mu.Lock()
+	runs := len(r.ag.runs)
+	r.ag.mu.Unlock()
+	if runs != 0 {
+		t.Fatalf("%d turns started", runs)
 	}
 }
 

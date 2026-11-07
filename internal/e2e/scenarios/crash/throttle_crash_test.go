@@ -43,12 +43,22 @@ func TestWriteThrottleSurvivesCrash(t *testing.T) {
 	s.Require("the answer POST is throttled", steps.AnswerTimeout, func() (bool, string) {
 		return fault.Fired() == 1, fmt.Sprintf("fired=%d", fault.Fired())
 	})
+	// The fault counts when the request arrives; the 429 is recorded once
+	// its response is written. The crash comes after the helper had a
+	// moment to take the 429 in: a throttle it never received cannot
+	// outlive the crash (CI: SIGKILL with the POST still in flight, and
+	// the restarted helper rightly knew of no throttle).
 	var throttledAt time.Time
-	for _, r := range s.Graph.Requests(fakegraph.RequestFilter{}) {
-		if r.Fault == "answer-429" {
-			throttledAt = r.At.Add(r.Duration)
+	s.Require("the 429 is answered", 10*time.Second, func() (bool, string) {
+		for _, r := range s.Graph.Requests(fakegraph.RequestFilter{}) {
+			if r.Fault == "answer-429" {
+				throttledAt = r.At.Add(r.Duration)
+				return true, ""
+			}
 		}
-	}
+		return false, "not answered yet"
+	})
+	time.Sleep(time.Second)
 	s.CrashSUT()
 	s.StartSUT()
 	// The throttle is account-wide (no scope header): it also holds the
