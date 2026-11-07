@@ -177,6 +177,9 @@ type Config struct {
 	Registrar Registrar
 	// Skills runs the `skills` command (nil: not available).
 	Skills Skills
+	// Defaults holds the global default model and effort (defaults.go):
+	// the cxp config's `defaults`, as before the rebuild (nil: the store).
+	Defaults DefaultsFile
 	// Updater updates the helper itself: automatic checks every
 	// Timing.UpdateCheck and `helper update` (nil: off). UpdatePrerelease
 	// includes pre-releases in automatic checks.
@@ -287,7 +290,7 @@ type Engine struct {
 	// stopReply (guarded by mu; shutdown.go).
 	stopping atomic.Bool
 	// catchUpReading: the mirror still has start-up catch-up records to
-	// read (set by mirrorLoop, read by announcePass).
+	// read (set at New and by mirrorLoop, read by announcePass).
 	catchUpReading atomic.Bool
 	stopReply      string
 	// writeWaiters counts writers in waitWrite: the sender leaves the
@@ -412,6 +415,11 @@ func New(cfg Config) (*Engine, error) {
 	if sc, ok := cfg.Channel.(channel.ActivityScanner); ok && cfg.ActivityScan && e.t.ScanInterval > 0 {
 		e.scanner = timedScanner{sc}
 	}
+	// The catch-up reads from the start, before the mirror loop's first
+	// pass sets the flag: chats created by that pass (or known from an
+	// earlier process, start-up's announcePass) do not go out in a
+	// summary of their own (CATCHUP-LIVE).
+	e.catchUpReading.Store(cfg.SessionsDir != "")
 	e.readTokens = newPacer(cfg.ReadRate, e.t.PaceIncrease, e.now)
 	e.writeTokens = newPacer(cfg.WriteRate, e.t.PaceIncrease, e.now)
 	if p, ok := cfg.Registrar.(WritePaced); ok {

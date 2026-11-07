@@ -24,9 +24,9 @@
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>🆕 New local Codex chats (3)</strong></p>
    | <p>These local Codex sessions got Teams work chats while the helper was catching up. Teams lists a new chat only after it is opened: open one here to watch it and continue from its full local context.</p>
-   | <ul><li><strong>s002</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Session from 20 days ago</a> (https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <ul><li><strong>s004</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:5>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Session from 200 days ago</a> (https://teams.microsoft.com/l/chat/<chat:5>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
    | <li><strong>s003</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Session from 121 days ago</a> (https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
-   | <li><strong>s004</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:5>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Session from 200 days ago</a> (https://teams.microsoft.com/l/chat/<chat:5>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <li><strong>s002</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Session from 20 days ago</a> (https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
    | </ul>
    mention 0: owner "E2E Owner"
 

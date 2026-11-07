@@ -475,7 +475,7 @@ func (e *Engine) controlRequest(tx *store.Tx, req TurnRequest, in store.Inbound,
 	if th.ConvID == 0 {
 		// The first question: as v0.1.20 created its control session,
 		// the chat takes the global defaults (defaults.go).
-		if th, err = newChatThread(tx, req.ConvID, ""); err != nil {
+		if th, err = e.newChatThread(tx, req.ConvID, ""); err != nil {
 			return req, ctlRequest{}, err
 		}
 		if err := tx.Bind(th); err != nil {

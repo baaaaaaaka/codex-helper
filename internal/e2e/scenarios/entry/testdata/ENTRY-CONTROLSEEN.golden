@@ -49,8 +49,14 @@
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p><strong>Active Work chats</strong></p>
-   | <p><strong>s007</strong> [active]<br>
-   | &nbsp;&nbsp;<strong>Session:</strong> <code>s007</code><br>
+   | <p><strong>s002</strong> [🧊parked]<br>
+   | &nbsp;&nbsp;<strong>Session:</strong> <code>s002</code><br>
+   | &nbsp;&nbsp;<strong>Folder:</strong> <code>/work/b</code><br>
+   | &nbsp;&nbsp;<strong>Last used:</strong> <minute><br>
+   | &nbsp;&nbsp;<strong>Resume parked chat:</strong> send <code>r s002</code></p>
+   | <hr/>
+   | <p><strong>s003</strong> [active]<br>
+   | &nbsp;&nbsp;<strong>Session:</strong> <code>s003</code><br>
    | &nbsp;&nbsp;<strong>Folder:</strong> not recorded<br>
    | &nbsp;&nbsp;<strong>Last used:</strong> <minute></p>
    | <hr/>
@@ -59,16 +65,10 @@
    | &nbsp;&nbsp;<strong>Folder:</strong> not recorded<br>
    | &nbsp;&nbsp;<strong>Last used:</strong> <minute></p>
    | <hr/>
-   | <p><strong>s003</strong> [active]<br>
-   | &nbsp;&nbsp;<strong>Session:</strong> <code>s003</code><br>
+   | <p><strong>s007</strong> [active]<br>
+   | &nbsp;&nbsp;<strong>Session:</strong> <code>s007</code><br>
    | &nbsp;&nbsp;<strong>Folder:</strong> not recorded<br>
    | &nbsp;&nbsp;<strong>Last used:</strong> <minute></p>
-   | <hr/>
-   | <p><strong>s002</strong> [🧊parked]<br>
-   | &nbsp;&nbsp;<strong>Session:</strong> <code>s002</code><br>
-   | &nbsp;&nbsp;<strong>Folder:</strong> <code>/work/b</code><br>
-   | &nbsp;&nbsp;<strong>Last used:</strong> <minute><br>
-   | &nbsp;&nbsp;<strong>Resume parked chat:</strong> send <code>r s002</code></p>
    | <hr/>
    | <p><strong>one</strong> [active]<br>
    | &nbsp;&nbsp;<strong>Session:</strong> <code>s001</code><br>

@@ -37,75 +37,29 @@
    | <p><strong>STATS: Codex tokens</strong></p>
    | <p><strong>Scope:</strong> all Work chats<br>
    | <strong>Work chats with token usage:</strong> 1 of 1</p>
-   | <p><strong>Model usage:</strong></p>
-   | <table><tr><th>Metric</th><th>Conversation total</th></tr>
+   | <p><strong>🧮 ALL WORK CHATS · overall:</strong></p>
+   | <table><tr><th>Metric</th><th>Overall</th></tr>
    | <tr><td><strong>input</strong></td><td>74,493 (cached 28,300, non-cached 46,193)</td></tr>
    | <tr><td><strong>Cache hit rate</strong></td><td>38.0%</td></tr>
    | <tr><td><strong>output</strong></td><td>3,675 (reasoning 729)</td></tr>
    | <tr><td><strong>total</strong></td><td>78,168</td></tr>
    | </table>
-   | <p><strong>Model/tier usage:</strong></p>
-   | <p><strong>Model:</strong> gpt-5-codex<br>
-   | <strong>Tier:</strong> unknown<br>
-   | <strong>input:</strong> 1,200<br>
-   | <strong>output:</strong> 80 (reasoning 20)<br>
-   | <strong>total:</strong> 1,280</p>
-   | <p><strong>Model:</strong> gpt-5.5<br>
-   | <strong>Tier:</strong> priority<br>
-   | <strong>input:</strong> 59,027 (cached 22,700, non-cached 36,327)<br>
-   | <strong>Cache hit rate:</strong> 38.5%<br>
-   | <strong>output:</strong> 2,888 (reasoning 569)<br>
-   | <strong>total:</strong> 61,915</p>
-   | <p><strong>Model:</strong> gpt-5.5-mini<br>
-   | <strong>Tier:</strong> unknown<br>
-   | <strong>input:</strong> 14,266 (cached 5,600, non-cached 8,666)<br>
-   | <strong>Cache hit rate:</strong> 39.3%<br>
-   | <strong>output:</strong> 707 (reasoning 140)<br>
-   | <strong>total:</strong> 14,973</p>
-   | <p><strong>Model/effort usage:</strong></p>
-   | <p><strong>Model:</strong> gpt-5-codex<br>
-   | <strong>Overall:</strong><br>
-   | <strong>input:</strong> 1,200<br>
-   | <strong>output:</strong> 80 (reasoning 20)<br>
-   | <strong>total:</strong> 1,280</p>
-   | <p><strong>Effort:</strong> medium<br>
-   | <strong>input:</strong> 1,200<br>
-   | <strong>output:</strong> 80 (reasoning 20)<br>
-   | <strong>total:</strong> 1,280</p>
-   | <p><strong>Model:</strong> gpt-5.5<br>
-   | <strong>Overall:</strong><br>
-   | <strong>input:</strong> 59,027 (cached 22,700, non-cached 36,327)<br>
-   | <strong>Cache hit rate:</strong> 38.5%<br>
-   | <strong>output:</strong> 2,888 (reasoning 569)<br>
-   | <strong>total:</strong> 61,915</p>
-   | <p><strong>Effort:</strong> low<br>
-   | <strong>input:</strong> 2,103 (cached 300, non-cached 1,803)<br>
-   | <strong>Cache hit rate:</strong> 14.3%<br>
-   | <strong>output:</strong> 60 (reasoning 9)<br>
-   | <strong>total:</strong> 2,163</p>
-   | <p><strong>Effort:</strong> high<br>
-   | <strong>input:</strong> 56,924 (cached 22,400, non-cached 34,524)<br>
-   | <strong>Cache hit rate:</strong> 39.4%<br>
-   | <strong>output:</strong> 2,828 (reasoning 560)<br>
-   | <strong>total:</strong> 59,752</p>
-   | <p><strong>Model:</strong> gpt-5.5-mini<br>
-   | <strong>Overall:</strong><br>
-   | <strong>input:</strong> 14,266 (cached 5,600, non-cached 8,666)<br>
-   | <strong>Cache hit rate:</strong> 39.3%<br>
-   | <strong>output:</strong> 707 (reasoning 140)<br>
-   | <strong>total:</strong> 14,973</p>
-   | <p><strong>Effort:</strong> unknown<br>
-   | <strong>input:</strong> 14,266 (cached 5,600, non-cached 8,666)<br>
-   | <strong>Cache hit rate:</strong> 39.3%<br>
-   | <strong>output:</strong> 707 (reasoning 140)<br>
-   | <strong>total:</strong> 14,973</p>
-   | <p><strong>Per Work chat:</strong></p>
-   | <ul><li><strong>s001:</strong> total 78,168; cache hit rate 38.0%</li>
-   | </ul>
-   | <p><strong>Analysis:</strong></p>
-   | <ul><li><strong>model/tier attribution:</strong> 3 observed combination(s)</li>
-   | <li>2 combination(s), 16,253 total, have missing model or service-tier metadata; they remain <code>unknown</code> instead of being guessed or merged</li>
-   | <li><strong>model/effort attribution:</strong> 3 model(s), 4 per-effort group(s)</li>
+   | <p><strong>🧮 ALL WORK CHATS · model/effort detail:</strong></p>
+   | <table><tr><th>Model</th><th>Effort</th><th>input</th><th>Cache hit rate</th><th>output</th><th>total</th></tr>
+   | <tr><td>gpt-5-codex</td><td>overall</td><td>1,200</td><td>N/A</td><td>80 (reasoning 20)</td><td>1,280</td></tr>
+   | <tr><td>gpt-5-codex</td><td>medium</td><td>1,200</td><td>N/A</td><td>80 (reasoning 20)</td><td>1,280</td></tr>
+   | <tr><td>gpt-5.5</td><td>overall</td><td>59,027 (cached 22,700, non-cached 36,327)</td><td>38.5%</td><td>2,888 (reasoning 569)</td><td>61,915</td></tr>
+   | <tr><td>gpt-5.5</td><td>low</td><td>2,103 (cached 300, non-cached 1,803)</td><td>14.3%</td><td>60 (reasoning 9)</td><td>2,163</td></tr>
+   | <tr><td>gpt-5.5</td><td>high</td><td>56,924 (cached 22,400, non-cached 34,524)</td><td>39.4%</td><td>2,828 (reasoning 560)</td><td>59,752</td></tr>
+   | <tr><td>gpt-5.5-mini</td><td>overall</td><td>14,266 (cached 5,600, non-cached 8,666)</td><td>39.3%</td><td>707 (reasoning 140)</td><td>14,973</td></tr>
+   | <tr><td>gpt-5.5-mini</td><td>unknown</td><td>14,266 (cached 5,600, non-cached 8,666)</td><td>39.3%</td><td>707 (reasoning 140)</td><td>14,973</td></tr>
+   | </table>
+   | <p><strong>🧮 ALL WORK CHATS · per chat:</strong></p>
+   | <table><tr><th>Chat</th><th>input</th><th>Cache hit rate</th><th>output</th><th>total</th></tr>
+   | <tr><td>s001</td><td>74,493 (cached 28,300, non-cached 46,193)</td><td>38.0%</td><td>3,675 (reasoning 729)</td><td>78,168</td></tr>
+   | </table>
+   | <p><strong>🧮 ALL WORK CHATS · analysis:</strong></p>
+   | <ul><li><strong>model/effort attribution:</strong> 3 model(s), 4 per-effort group(s)</li>
    | <li>1 model or effort group(s), 14,973 total, have missing metadata; they remain <code>unknown</code> instead of being guessed or merged</li>
    | </ul>
 
@@ -151,136 +105,71 @@
    | <p><strong>Session:</strong> s001<br>
    | <strong>Codex thread:</strong> <uuid:1><br>
    | <strong>Latest request:</strong> completed<br>
-   | <strong>Latest Codex turn:</strong> <uuid:2><br>
-   | <strong>Source:</strong> token_count at transcript line 221 (<root>/home/.codex/sessions/<day>/rollout-<start>-<uuid:1>.jsonl)<br>
+   | <strong>Latest Codex turn:</strong> <uuid:2></p>
+   | <p><strong>🧮 TOTAL (MAIN + SUBAGENTS) · overall:</strong></p>
+   | <table><tr><th>Metric</th><th>Overall</th></tr>
+   | <tr><td><strong>input</strong></td><td>74,493 (cached 28,300, non-cached 46,193)</td></tr>
+   | <tr><td><strong>Cache hit rate</strong></td><td>38.0%</td></tr>
+   | <tr><td><strong>output</strong></td><td>3,675 (reasoning 729)</td></tr>
+   | <tr><td><strong>total</strong></td><td>78,168</td></tr>
+   | </table>
+   | <p><strong>🧮 TOTAL (MAIN + SUBAGENTS) · model/effort detail:</strong></p>
+   | <table><tr><th>Model</th><th>Effort</th><th>input</th><th>Cache hit rate</th><th>output</th><th>total</th></tr>
+   | <tr><td>gpt-5-codex</td><td>overall</td><td>1,200</td><td>N/A</td><td>80 (reasoning 20)</td><td>1,280</td></tr>
+   | <tr><td>gpt-5-codex</td><td>medium</td><td>1,200</td><td>N/A</td><td>80 (reasoning 20)</td><td>1,280</td></tr>
+   | <tr><td>gpt-5.5</td><td>overall</td><td>59,027 (cached 22,700, non-cached 36,327)</td><td>38.5%</td><td>2,888 (reasoning 569)</td><td>61,915</td></tr>
+   | <tr><td>gpt-5.5</td><td>low</td><td>2,103 (cached 300, non-cached 1,803)</td><td>14.3%</td><td>60 (reasoning 9)</td><td>2,163</td></tr>
+   | <tr><td>gpt-5.5</td><td>high</td><td>56,924 (cached 22,400, non-cached 34,524)</td><td>39.4%</td><td>2,828 (reasoning 560)</td><td>59,752</td></tr>
+   | <tr><td>gpt-5.5-mini</td><td>overall</td><td>14,266 (cached 5,600, non-cached 8,666)</td><td>39.3%</td><td>707 (reasoning 140)</td><td>14,973</td></tr>
+   | <tr><td>gpt-5.5-mini</td><td>unknown</td><td>14,266 (cached 5,600, non-cached 8,666)</td><td>39.3%</td><td>707 (reasoning 140)</td><td>14,973</td></tr>
+   | </table>
+   | <p><strong>🧠 MAIN AGENT · metadata:</strong></p>
+   | <p><strong>Source:</strong> token_count at transcript line 221 (<root>/home/.codex/sessions/<day>/rollout-<start>-<uuid:1>.jsonl)<br>
    | <strong>Reliability:</strong> reconstructed conversation usage from 71 unique Codex <code>token_count</code> update(s) in local history; malformed trailing JSONL lines are ignored and reported below.<br>
    | <strong>Aggregation:</strong> ignored 35 non-advancing usage snapshot(s); observed 35 native cumulative counter reset(s) and 0 recovery event(s).</p>
-   | <p><strong>Model usage:</strong></p>
+   | <p><strong>🧠 MAIN AGENT · snapshots:</strong></p>
    | <table><tr><th>Metric</th><th>Last recorded model usage</th><th>Conversation total</th></tr>
    | <tr><td><strong>input</strong></td><td>1,034 (cached 400, non-cached 634)</td><td>72,390 (cached 28,000, non-cached 44,390)</td></tr>
    | <tr><td><strong>Cache hit rate</strong></td><td>38.7%</td><td>38.7%</td></tr>
    | <tr><td><strong>output</strong></td><td>51 (reasoning 10)</td><td>3,615 (reasoning 720)</td></tr>
    | <tr><td><strong>total</strong></td><td>1,085</td><td>76,005</td></tr>
    | </table>
-   | <p><strong>Model/tier usage:</strong></p>
-   | <p><strong>Model:</strong> gpt-5-codex<br>
-   | <strong>Tier:</strong> unknown<br>
-   | <strong>input:</strong> 1,200<br>
-   | <strong>output:</strong> 80 (reasoning 20)<br>
-   | <strong>total:</strong> 1,280</p>
-   | <p><strong>Model:</strong> gpt-5.5<br>
-   | <strong>Tier:</strong> priority<br>
-   | <strong>input:</strong> 56,924 (cached 22,400, non-cached 34,524)<br>
-   | <strong>Cache hit rate:</strong> 39.4%<br>
-   | <strong>output:</strong> 2,828 (reasoning 560)<br>
-   | <strong>total:</strong> 59,752</p>
-   | <p><strong>Model:</strong> gpt-5.5-mini<br>
-   | <strong>Tier:</strong> unknown<br>
-   | <strong>input:</strong> 14,266 (cached 5,600, non-cached 8,666)<br>
-   | <strong>Cache hit rate:</strong> 39.3%<br>
-   | <strong>output:</strong> 707 (reasoning 140)<br>
-   | <strong>total:</strong> 14,973</p>
-   | <p><strong>Model/effort usage:</strong></p>
-   | <p><strong>Model:</strong> gpt-5-codex<br>
-   | <strong>Overall:</strong><br>
-   | <strong>input:</strong> 1,200<br>
-   | <strong>output:</strong> 80 (reasoning 20)<br>
-   | <strong>total:</strong> 1,280</p>
-   | <p><strong>Effort:</strong> medium<br>
-   | <strong>input:</strong> 1,200<br>
-   | <strong>output:</strong> 80 (reasoning 20)<br>
-   | <strong>total:</strong> 1,280</p>
-   | <p><strong>Model:</strong> gpt-5.5<br>
-   | <strong>Overall:</strong><br>
-   | <strong>input:</strong> 56,924 (cached 22,400, non-cached 34,524)<br>
-   | <strong>Cache hit rate:</strong> 39.4%<br>
-   | <strong>output:</strong> 2,828 (reasoning 560)<br>
-   | <strong>total:</strong> 59,752</p>
-   | <p><strong>Effort:</strong> high<br>
-   | <strong>input:</strong> 56,924 (cached 22,400, non-cached 34,524)<br>
-   | <strong>Cache hit rate:</strong> 39.4%<br>
-   | <strong>output:</strong> 2,828 (reasoning 560)<br>
-   | <strong>total:</strong> 59,752</p>
-   | <p><strong>Model:</strong> gpt-5.5-mini<br>
-   | <strong>Overall:</strong><br>
-   | <strong>input:</strong> 14,266 (cached 5,600, non-cached 8,666)<br>
-   | <strong>Cache hit rate:</strong> 39.3%<br>
-   | <strong>output:</strong> 707 (reasoning 140)<br>
-   | <strong>total:</strong> 14,973</p>
-   | <p><strong>Effort:</strong> unknown<br>
-   | <strong>input:</strong> 14,266 (cached 5,600, non-cached 8,666)<br>
-   | <strong>Cache hit rate:</strong> 39.3%<br>
-   | <strong>output:</strong> 707 (reasoning 140)<br>
-   | <strong>total:</strong> 14,973</p>
-   | <p><strong>Analysis:</strong></p>
+   | <p><strong>🧠 MAIN AGENT · overall:</strong></p>
+   | <table><tr><th>Metric</th><th>Overall</th></tr>
+   | <tr><td><strong>input</strong></td><td>72,390 (cached 28,000, non-cached 44,390)</td></tr>
+   | <tr><td><strong>Cache hit rate</strong></td><td>38.7%</td></tr>
+   | <tr><td><strong>output</strong></td><td>3,615 (reasoning 720)</td></tr>
+   | <tr><td><strong>total</strong></td><td>76,005</td></tr>
+   | </table>
+   | <p><strong>🧠 MAIN AGENT · model/effort detail:</strong></p>
+   | <table><tr><th>Model</th><th>Effort</th><th>input</th><th>Cache hit rate</th><th>output</th><th>total</th></tr>
+   | <tr><td>gpt-5-codex</td><td>overall</td><td>1,200</td><td>N/A</td><td>80 (reasoning 20)</td><td>1,280</td></tr>
+   | <tr><td>gpt-5-codex</td><td>medium</td><td>1,200</td><td>N/A</td><td>80 (reasoning 20)</td><td>1,280</td></tr>
+   | <tr><td>gpt-5.5</td><td>overall</td><td>56,924 (cached 22,400, non-cached 34,524)</td><td>39.4%</td><td>2,828 (reasoning 560)</td><td>59,752</td></tr>
+   | <tr><td>gpt-5.5</td><td>high</td><td>56,924 (cached 22,400, non-cached 34,524)</td><td>39.4%</td><td>2,828 (reasoning 560)</td><td>59,752</td></tr>
+   | <tr><td>gpt-5.5-mini</td><td>overall</td><td>14,266 (cached 5,600, non-cached 8,666)</td><td>39.3%</td><td>707 (reasoning 140)</td><td>14,973</td></tr>
+   | <tr><td>gpt-5.5-mini</td><td>unknown</td><td>14,266 (cached 5,600, non-cached 8,666)</td><td>39.3%</td><td>707 (reasoning 140)</td><td>14,973</td></tr>
+   | </table>
+   | <p><strong>🧠 MAIN AGENT · analysis:</strong></p>
    | <ul><li><strong>model context window:</strong> 258,400; current context uses 0.4%; approx remaining: 257,315</li>
    | <li><strong>Codex baseline-adjusted context remaining:</strong> 100%</li>
    | <li><strong>last reasoning output share:</strong> 19.6% of output tokens</li>
-   | <li><strong>model/tier attribution:</strong> 3 observed combination(s)</li>
-   | <li>2 combination(s), 16,253 total, have missing model or service-tier metadata; they remain <code>unknown</code> instead of being guessed or merged</li>
    | <li><strong>model/effort attribution:</strong> 3 model(s), 3 per-effort group(s)</li>
    | <li>1 model or effort group(s), 14,973 total, have missing metadata; they remain <code>unknown</code> instead of being guessed or merged</li>
    | <li><strong>native latest cumulative total:</strong> 2,169; reconstructed conversation total: 76,005</li>
    | </ul>
    | <p><strong>🧩 SUBAGENTS (1) · overall:</strong></p>
-   | <p><strong>input:</strong> 2,103 (cached 300, non-cached 1,803)<br>
-   | <strong>Cache hit rate:</strong> 14.3%<br>
-   | <strong>output:</strong> 60 (reasoning 9)<br>
-   | <strong>total:</strong> 2,163</p>
+   | <table><tr><th>Metric</th><th>Overall</th></tr>
+   | <tr><td><strong>input</strong></td><td>2,103 (cached 300, non-cached 1,803)</td></tr>
+   | <tr><td><strong>Cache hit rate</strong></td><td>14.3%</td></tr>
+   | <tr><td><strong>output</strong></td><td>60 (reasoning 9)</td></tr>
+   | <tr><td><strong>total</strong></td><td>2,163</td></tr>
+   | </table>
    | <p><strong>🧩 SUBAGENTS (1) · model/effort detail:</strong></p>
-   | <p><strong>Model:</strong> gpt-5.5<br>
-   | <strong>Overall:</strong><br>
-   | <strong>input:</strong> 2,103 (cached 300, non-cached 1,803)<br>
-   | <strong>Cache hit rate:</strong> 14.3%<br>
-   | <strong>output:</strong> 60 (reasoning 9)<br>
-   | <strong>total:</strong> 2,163</p>
-   | <p><strong>Effort:</strong> low<br>
-   | <strong>input:</strong> 2,103 (cached 300, non-cached 1,803)<br>
-   | <strong>Cache hit rate:</strong> 14.3%<br>
-   | <strong>output:</strong> 60 (reasoning 9)<br>
-   | <strong>total:</strong> 2,163</p>
-   | <p><strong>🧮 TOTAL (MAIN + SUBAGENTS) · overall:</strong></p>
-   | <p><strong>input:</strong> 74,493 (cached 28,300, non-cached 46,193)<br>
-   | <strong>Cache hit rate:</strong> 38.0%<br>
-   | <strong>output:</strong> 3,675 (reasoning 729)<br>
-   | <strong>total:</strong> 78,168</p>
-   | <p><strong>🧮 TOTAL (MAIN + SUBAGENTS) · model/effort detail:</strong></p>
-   | <p><strong>Model:</strong> gpt-5-codex<br>
-   | <strong>Overall:</strong><br>
-   | <strong>input:</strong> 1,200<br>
-   | <strong>output:</strong> 80 (reasoning 20)<br>
-   | <strong>total:</strong> 1,280</p>
-   | <p><strong>Effort:</strong> medium<br>
-   | <strong>input:</strong> 1,200<br>
-   | <strong>output:</strong> 80 (reasoning 20)<br>
-   | <strong>total:</strong> 1,280</p>
-   | <p><strong>Model:</strong> gpt-5.5<br>
-   | <strong>Overall:</strong><br>
-   | <strong>input:</strong> 59,027 (cached 22,700, non-cached 36,327)<br>
-   | <strong>Cache hit rate:</strong> 38.5%<br>
-   | <strong>output:</strong> 2,888 (reasoning 569)<br>
-   | <strong>total:</strong> 61,915</p>
-   | <p><strong>Effort:</strong> low<br>
-   | <strong>input:</strong> 2,103 (cached 300, non-cached 1,803)<br>
-   | <strong>Cache hit rate:</strong> 14.3%<br>
-   | <strong>output:</strong> 60 (reasoning 9)<br>
-   | <strong>total:</strong> 2,163</p>
-   | <p><strong>Effort:</strong> high<br>
-   | <strong>input:</strong> 56,924 (cached 22,400, non-cached 34,524)<br>
-   | <strong>Cache hit rate:</strong> 39.4%<br>
-   | <strong>output:</strong> 2,828 (reasoning 560)<br>
-   | <strong>total:</strong> 59,752</p>
-   | <p><strong>Model:</strong> gpt-5.5-mini<br>
-   | <strong>Overall:</strong><br>
-   | <strong>input:</strong> 14,266 (cached 5,600, non-cached 8,666)<br>
-   | <strong>Cache hit rate:</strong> 39.3%<br>
-   | <strong>output:</strong> 707 (reasoning 140)<br>
-   | <strong>total:</strong> 14,973</p>
-   | <p><strong>Effort:</strong> unknown<br>
-   | <strong>input:</strong> 14,266 (cached 5,600, non-cached 8,666)<br>
-   | <strong>Cache hit rate:</strong> 39.3%<br>
-   | <strong>output:</strong> 707 (reasoning 140)<br>
-   | <strong>total:</strong> 14,973</p>
+   | <table><tr><th>Model</th><th>Effort</th><th>input</th><th>Cache hit rate</th><th>output</th><th>total</th></tr>
+   | <tr><td>gpt-5.5</td><td>overall</td><td>2,103 (cached 300, non-cached 1,803)</td><td>14.3%</td><td>60 (reasoning 9)</td><td>2,163</td></tr>
+   | <tr><td>gpt-5.5</td><td>low</td><td>2,103 (cached 300, non-cached 1,803)</td><td>14.3%</td><td>60 (reasoning 9)</td><td>2,163</td></tr>
+   | </table>
 
 == codex turns (per thread; threads by kind, directory and first prompt; turns in start order)
 -- thread <uuid:1> (work, cwd <root>/work/resets)

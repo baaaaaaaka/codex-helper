@@ -51,7 +51,7 @@ func TestV0120ParseCodexTokenStatsPrefersTokenCountAndReportsDiagnostics(t *test
 		t.Fatalf("diagnostics = %#v", got.Diagnostics)
 	}
 
-	rendered := strings.Join(tokenStatsLines(got, nil), "\n")
+	rendered := strings.Join(mainAgentLines(got, nil), "\n")
 	for _, want := range []string{
 		"Last recorded model usage:",
 		"Conversation total:",
@@ -59,7 +59,7 @@ func TestV0120ParseCodexTokenStatsPrefersTokenCountAndReportsDiagnostics(t *test
 		"model context window: 258,400",
 		"current context uses",
 		"Codex baseline-adjusted context remaining:",
-		"Rate limits:",
+		"🧠 MAIN AGENT · rate limits:",
 		"limit name: Codex",
 		"reset 2024-01-01T00:30:00Z",
 		"Diagnostics: skipped",
@@ -117,7 +117,7 @@ func TestV0120ParseCodexTokenStatsReconstructsAcrossNativeResetsAndNonAdvancingS
 	if !got.RateLimits.Present || len(got.RateLimits.Windows) != 1 || got.RateLimits.Windows[0].UsedPercent != 80 {
 		t.Fatalf("rate limits = %#v", got.RateLimits)
 	}
-	rendered := strings.Join(tokenStatsLines(got, nil), "\n")
+	rendered := strings.Join(mainAgentLines(got, nil), "\n")
 	for _, wantText := range []string{
 		"Conversation total:",
 		"total: 250",
@@ -308,7 +308,7 @@ func TestV0120ParseCodexTokenStatsReportsMissingLastWithoutLosingEpochUsage(t *t
 	if got.Info.Total.Total != 170 || got.MissingLast != 1 {
 		t.Fatalf("stats = %#v", got)
 	}
-	if rendered := strings.Join(tokenStatsLines(got, nil), "\n"); !strings.Contains(rendered, "totals remain reconstructed as reset epochs") {
+	if rendered := strings.Join(mainAgentLines(got, nil), "\n"); !strings.Contains(rendered, "totals remain reconstructed as reset epochs") {
 		t.Fatalf("missing recovery warning:\n%s", rendered)
 	}
 }
@@ -411,8 +411,8 @@ func TestV0120FormatCodexTokenStatsHidesMetadataOnlyRateLimits(t *testing.T) {
 	if !got.RateLimits.Present || !got.RateLimits.Credits.Present {
 		t.Fatalf("rate limits = %#v", got.RateLimits)
 	}
-	rendered := strings.Join(tokenStatsLines(got, nil), "\n")
-	if strings.Contains(rendered, "Rate limits:") || strings.Contains(rendered, "credits: available") {
+	rendered := strings.Join(mainAgentLines(got, nil), "\n")
+	if strings.Contains(rendered, "rate limits:") || strings.Contains(rendered, "credits: available") {
 		t.Fatalf("metadata-only rate limits should be hidden:\n%s", rendered)
 	}
 }
@@ -424,7 +424,7 @@ func TestV0120FormatCodexTokenStatsRateOnlyDoesNotClaimUsageReconstruction(t *te
 	if err != nil {
 		t.Fatalf("ParseCodexTokenStats error: %v", err)
 	}
-	rendered := strings.Join(tokenStatsLines(got, nil), "\n")
+	rendered := strings.Join(mainAgentLines(got, nil), "\n")
 	if !strings.Contains(rendered, "metadata was found, but it did not contain a usage snapshot") || !strings.Contains(rendered, "Token usage unavailable") {
 		t.Fatalf("rate-only stats = %q", rendered)
 	}
@@ -461,7 +461,7 @@ func TestV0120ParseCodexTokenStatsFallsBackToUsageFields(t *testing.T) {
 	if got.Info.Last.Input != 100 || got.Info.Last.Cached != 34 || got.Info.Last.Reasoning != 5 || got.Info.Last.Total != 112 {
 		t.Fatalf("fallback usage = %#v", got.Info.Last)
 	}
-	rendered := strings.Join(tokenStatsLines(got, nil), "\n")
+	rendered := strings.Join(mainAgentLines(got, nil), "\n")
 	if !strings.Contains(rendered, "runner usage fallback") {
 		t.Fatalf("fallback formatted stats = %q", rendered)
 	}
@@ -497,20 +497,8 @@ func TestV0120ParseCodexTokenStatsAggregatesUsageByModelAndTier(t *testing.T) {
 	if !reflect.DeepEqual(got.ModelTiers, want) {
 		t.Fatalf("model/tier usages = %#v, want %#v", got.ModelTiers, want)
 	}
-	rendered := strings.Join(tokenStatsLines(got, nil), "\n")
-	for _, wantText := range []string{
-		"Model/tier usage:",
-		"Model: gpt-5.6-luna",
-		"Tier: default",
-		"Tier: priority",
-		"Model: gpt-5.6-sol",
-		"input: 130 (cached 90, non-cached 40)",
-		"total: 160",
-		"model/tier attribution: 3 observed combination(s)",
-	} {
-		if !strings.Contains(rendered, wantText) {
-			t.Fatalf("formatted stats missing %q:\n%s", wantText, rendered)
-		}
+	if rendered := strings.Join(mainAgentLines(got, nil), "\n"); strings.Contains(rendered, "Tier:") {
+		t.Fatalf("stats show service tiers, which 285784d3^ did not:\n%s", rendered)
 	}
 }
 
@@ -533,16 +521,6 @@ func TestV0120ParseCodexTokenStatsKeepsMissingModelTierMetadataUnknown(t *testin
 	}
 	if !reflect.DeepEqual(got.ModelTiers, want) {
 		t.Fatalf("model/tier usages = %#v, want %#v", got.ModelTiers, want)
-	}
-	rendered := strings.Join(tokenStatsLines(got, nil), "\n")
-	for _, wantText := range []string{
-		"Model: model-a",
-		"Tier: unknown",
-		"1 combination(s), 12 total, have missing model or service-tier metadata; they remain `unknown` instead of being guessed or merged",
-	} {
-		if !strings.Contains(rendered, wantText) {
-			t.Fatalf("unknown model/tier diagnostic missing %q:\n%s", wantText, rendered)
-		}
 	}
 }
 

@@ -245,7 +245,38 @@ func TestManyUnannouncedChatsAnnouncedInBatches(t *testing.T) {
 // still reads sessions the summary waits (announceHold at most), then
 // lists every chat in one post.
 func TestSummaryWaitsWhileTheCatchUpStillReads(t *testing.T) {
-	const n = 3
+	r, e := caughtUpChatsRig(t, 3, "")
+	e.catchUpReading.Store(true)
+	ctl := r.startEngine(e)
+	time.Sleep(time.Second) // many maintenance passes
+	if got := r.own(ctl, "New local Codex chats"); len(got) != 0 {
+		t.Fatalf("summary posted while the catch-up still reads: %q", got[0].Text)
+	}
+	e.catchUpReading.Store(false)
+	r.wait("the summary", func() bool { return len(r.own(ctl, "New local Codex chats (3)")) == 1 })
+	if got := r.own(ctl, "New local Codex chats"); len(got) != 1 {
+		t.Fatalf("%d summaries, want 1", len(got))
+	}
+}
+
+// Full e2e suite 2026-11-07 (CATCHUP-LIVE under load): the flag was
+// false until the mirror loop's first pass ended (and at start-up's own
+// announcePass), so chats created by then went out in a summary of their
+// own. The catch-up counts as reading from the start.
+func TestSummaryWaitsForTheMirrorsFirstPass(t *testing.T) {
+	r, e := caughtUpChatsRig(t, 3, t.TempDir()) // the first pass never ends: MirrorStat is an hour
+	ctl := r.startEngine(e)
+	time.Sleep(time.Second)
+	if got := r.own(ctl, "New local Codex chats"); len(got) != 0 {
+		t.Fatalf("summary posted before the mirror's first pass: %q", got[0].Text)
+	}
+}
+
+// caughtUpChatsRig makes a store with n work chats the catch-up created
+// (not announced yet) and an engine on it, not running yet; sessions is
+// the engine's SessionsDir ("" for no mirror).
+func caughtUpChatsRig(t *testing.T, n int, sessions string) (*rig, *Engine) {
+	t.Helper()
 	r := &rig{t: t, ch: channeltest.New(), ag: newAgent(), path: filepath.Join(t.TempDir(), "core.db"), log: &strings.Builder{}, logMu: &sync.Mutex{}}
 	t.Cleanup(r.stop)
 	ctx := context.Background()
@@ -275,8 +306,6 @@ func TestSummaryWaitsWhileTheCatchUpStillReads(t *testing.T) {
 		t.Fatal(err)
 	}
 	st.Close()
-	// r.start, with the catch-up still reading before the engine runs (no
-	// SessionsDir: no mirror loop resets it).
 	parallelRig(t)
 	if st, err = store.OpenWith(r.path, store.Options{Exclusive: true}); err != nil {
 		t.Fatal(err)
@@ -285,22 +314,19 @@ func TestSummaryWaitsWhileTheCatchUpStillReads(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.st = st
-	e, err := New(Config{Store: st, Channel: r.ch, Agent: r.ag, Timing: FastTiming(20 * time.Millisecond), Machine: "m", Log: lockedWriter{r.logMu, r.log}})
+	timing := FastTiming(20 * time.Millisecond)
+	timing.MirrorStat, timing.Discovery = time.Hour, time.Hour
+	e, err := New(Config{Store: st, Channel: r.ch, Agent: r.ag, Timing: timing, Machine: "m", SessionsDir: sessions, Log: lockedWriter{r.logMu, r.log}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.catchUpReading.Store(true)
+	return r, e
+}
+
+// startEngine runs e as the rig's engine and returns the control chat.
+func (r *rig) startEngine(e *Engine) string {
 	rctx, cancel := context.WithCancel(context.Background())
 	r.cancel, r.done, r.e = cancel, make(chan error, 1), e
 	go func() { r.done <- e.Run(rctx) }()
-	ctl := r.control()
-	time.Sleep(time.Second) // many maintenance passes
-	if got := r.own(ctl, "New local Codex chats"); len(got) != 0 {
-		t.Fatalf("summary posted while the catch-up still reads: %q", got[0].Text)
-	}
-	e.catchUpReading.Store(false)
-	r.wait("the summary", func() bool { return len(r.own(ctl, "New local Codex chats (3)")) == 1 })
-	if got := r.own(ctl, "New local Codex chats"); len(got) != 1 {
-		t.Fatalf("%d summaries, want 1", len(got))
-	}
+	return r.control()
 }

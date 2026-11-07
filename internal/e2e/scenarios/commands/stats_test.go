@@ -175,10 +175,16 @@ func TestStatsResetEpochsAndForkChild(t *testing.T) {
 	// appear anywhere: that would be the inherited prefix counted twice.
 	s.Check("the inherited prefix is not counted twice", !strings.Contains(st, thousands(2*main.total+own.total)),
 		"no double-counted total", clip(st, 900))
-	s.Check("requests without model metadata stay unknown", strings.Contains(st, "Tier: unknown") && strings.Contains(st, "Effort: unknown"),
-		"Tier: unknown, Effort: unknown", clip(st, 900))
+	s.Check("requests without effort metadata stay unknown", strings.Contains(st, " | unknown | "),
+		"an effort row `unknown`", clip(st, 1500))
 
 	all, ok := command(s, control.ID, "stats", "Scope: all Work chats")
-	s.Check("control `stats` gives the same Work chat total", ok && strings.Contains(all, "s001: total "+thousands(main.total+own.total)),
-		"s001: total "+thousands(main.total+own.total), clip(all, 400))
+	row := ""
+	for _, l := range strings.Split(all, "\n") {
+		if strings.Contains(l, "| s001 |") {
+			row = strings.TrimSpace(l)
+		}
+	}
+	s.Check("control `stats` gives the same Work chat total", ok && strings.HasSuffix(row, "| "+thousands(main.total+own.total)),
+		"s001 row ending in "+thousands(main.total+own.total), row)
 }

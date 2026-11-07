@@ -1,12 +1,12 @@
 package engine
 
 // `helper stats` (F-STA-1, R-42): token usage computed from the Codex
-// rollouts, as v0.1.20 did (internal/teams/token_stats.go @ 2ae5e748,
-// formatWorkSessionStats and renderCodexTokenStatsHTML), with its texts
-// and layout. Additions that SPEC F-STA-1 keeps from 0.1.22 use 0.1.22's
-// texts: the model/effort section, the aggregation across a chat's
-// threads, and the subagent and total sections (shown only when the chat
-// spawned subagents, so a chat without any reads exactly as in v0.1.20).
+// rollouts, with v0.1.20's parser and texts and the layout the helper had
+// before the rebuilt core (internal/teams/token_stats.go @ 285784d3^,
+// formatWorkSessionStats and renderCodexTokenStatsHTML; owner request
+// 2026-11-07): the total of the main agent and its subagents, the main
+// agent (metadata, usage snapshots, overall, model/effort detail,
+// analysis, rate limits, diagnostics) and the subagents, as tables.
 //
 // The rollouts are read through transcript.UsageCache: a request reads
 // only what was appended since the last one; nothing runs between
@@ -60,7 +60,6 @@ type chatUsage struct {
 	subs     int
 	subTotal transcript.TokenUsage
 	subMods  []transcript.ModelUsage
-	subTiers []transcript.ModelTierUsage
 	subProbs []string
 }
 
@@ -124,7 +123,6 @@ func summarize(label, thread string, u transcript.ChatUsage) chatUsage {
 	}
 	c.subs = len(u.Subagents)
 	var subStats []transcript.ModelUsage
-	var subTiers [][]transcript.ModelTierUsage
 	for _, s := range u.Subagents {
 		switch {
 		case s.Err != nil:
@@ -136,20 +134,20 @@ func summarize(label, thread string, u transcript.ChatUsage) chatUsage {
 		default:
 			c.subTotal, _ = transcript.AddUsage(c.subTotal, s.Stats.Overall())
 			subStats = append(subStats, s.Stats.Models...)
-			subTiers = append(subTiers, s.Stats.ModelTiers)
 		}
 	}
 	if len(c.subProbs) > 0 {
 		// A partial sum would be a plausible-looking but incomplete number
 		// (0.1.22): fail closed.
-		c.subTotal, subStats, subTiers = transcript.TokenUsage{}, nil, nil
+		c.subTotal, subStats = transcript.TokenUsage{}, nil
 	}
 	c.subMods = transcript.SumModels(subStats)
-	c.subTiers = transcript.SumTiers(subTiers...)
 	return c
 }
 
-// workStats is v0.1.20's formatWorkSessionStats.
+// workStats is formatWorkSessionStats as of 285784d3^: the header, then
+// the total of the main agent and its subagents, the main agent, and the
+// subagents.
 func (e *Engine) workStats(ctx context.Context, cs *convState) string {
 	e.mu.Lock()
 	label, thread := cs.label, strings.TrimSpace(cs.threadID)
@@ -187,175 +185,89 @@ func (e *Engine) workStats(ctx context.Context, cs *convState) string {
 		return strings.Join(append(lines, "", "Token stats unavailable: no local Codex transcript is linked to this Work chat."), "\n")
 	}
 	lines = append(lines, "")
-	lines = append(lines, tokenStatsLines(c.main, c.notes)...)
-	if c.subs > 0 {
-		lines = append(lines, "")
-		lines = append(lines, subagentLines(c)...)
-	}
+	lines = append(lines, totalLines(c)...)
+	lines = append(lines, "")
+	lines = append(lines, mainAgentLines(c.main, c.notes)...)
+	lines = append(lines, "")
+	lines = append(lines, subagentLines(c)...)
 	return strings.Join(lines, "\n")
 }
 
-// requestStatus is v0.1.20's userFacingTurnStatus over the core's turn
-// states.
-func requestStatus(state string) string {
-	switch state {
-	case store.TurnQueued:
-		return "queued"
-	case store.TurnStarting, store.TurnRunning:
-		return "running"
-	case store.TurnCompleted:
-		return "completed"
-	case store.TurnFailed, store.TurnNotStarted:
-		return "failed"
-	case store.TurnInterrupted:
-		return "interrupted"
-	case "":
-		return "unknown"
-	}
-	return state
-}
+// The scoped section titles of 285784d3^ (renderStats makes each a table
+// or a list).
+const (
+	totalScope    = "🧮 TOTAL (MAIN + SUBAGENTS) · "
+	mainScope     = "🧠 MAIN AGENT · "
+	subagentScope = "🧩 SUBAGENTS"
+	allChatsScope = "🧮 ALL WORK CHATS · "
+)
 
-// subagentLines are 0.1.22's subagent and total sections
-// (formatCodexSubagentStatsLines, formatCodexTotalStatsLines).
-func subagentLines(c chatUsage) []string {
-	title := fmt.Sprintf("🧩 SUBAGENTS (%d) ·", c.subs)
-	lines := []string{title + " overall:"}
-	if c.subTotal.HasTokens() {
-		lines = append(lines, usageLines(c.subTotal)...)
-	} else {
-		lines = append(lines, "Token usage unavailable: no readable subagent usage event was found.")
-	}
-	lines = append(lines, "", title+" model/effort detail:")
-	if ml := modelUsageLines(c.subMods); len(ml) > 0 {
-		lines = append(lines, ml...)
-	} else {
-		lines = append(lines, "Model/effort breakdown: unavailable")
-	}
-	if len(c.subProbs) > 0 {
-		lines = append(lines, "", title+" diagnostics:")
-		for _, p := range c.subProbs {
-			lines = append(lines, "- "+p)
-		}
-	}
-	const total = "🧮 TOTAL (MAIN + SUBAGENTS)"
-	lines = append(lines, "", total+" · overall:")
-	if !c.complete() {
+// totalLines is formatCodexTotalStatsLines.
+func totalLines(c chatUsage) []string {
+	lines := []string{totalScope + "overall:"}
+	sum, _ := transcript.AddUsage(c.mainOverall(), c.subTotal)
+	if !c.complete() || !sum.HasTokens() {
 		return append(lines, "Token usage unavailable: complete main and subagent usage could not be established.")
 	}
-	sum, _ := transcript.AddUsage(c.mainOverall(), c.subTotal)
 	lines = append(lines, usageLines(sum)...)
-	lines = append(lines, "", total+" · model/effort detail:")
-	if ml := modelUsageLines(transcript.SumModels(c.main.Models, c.subMods)); len(ml) > 0 {
-		lines = append(lines, ml...)
+	lines = append(lines, "", totalScope+"model/effort detail:")
+	return append(lines, modelDetail(transcript.SumModels(c.main.Models, c.subMods))...)
+}
+
+// mainAgentLines is formatCodexMainAgentStatsLines; problems are the
+// chat's source notes (source diagnostics).
+func mainAgentLines(s transcript.TokenStats, problems []string) []string {
+	lines := []string{mainScope + "metadata:"}
+	lines = append(lines, metadataLines(s)...)
+	if !s.HasUsage() {
+		lines = append(lines, "", mainScope+"UNAVAILABLE:",
+			"Status: no Codex usage event was found",
+			"Token usage: not reported",
+			"Cache hit rate: N/A",
+			"Model/effort breakdown: not reported")
 	} else {
-		lines = append(lines, "Model/effort breakdown: unavailable")
+		overall := s.Overall()
+		lines = append(lines, "", mainScope+"snapshots:")
+		if s.Info.Last.HasTokens() {
+			lines = append(lines, "Last recorded model usage:")
+			lines = append(lines, usageLines(s.Info.Last)...)
+		}
+		if s.Info.Total.HasTokens() {
+			lines = append(lines, "Conversation total:")
+			lines = append(lines, usageLines(s.Info.Total)...)
+		}
+		lines = append(lines, "", mainScope+"overall:")
+		lines = append(lines, usageLines(overall)...)
+		lines = append(lines, "", mainScope+"model/effort detail:")
+		lines = append(lines, modelDetail(s.Models)...)
+		info := s.Info
+		info.Total = overall
+		analysis := append(usageAnalysis(info), modelUsageAnalysis(s.Models)...)
+		analysis = append(analysis, aggregationAnalysis(s)...)
+		if len(analysis) > 0 {
+			lines = append(lines, "", mainScope+"analysis:")
+			lines = append(lines, analysis...)
+		}
+	}
+	if rl := rateLimitLines(s.RateLimits); len(rl) > 0 {
+		lines = append(lines, "", mainScope+"rate limits:")
+		lines = append(lines, rl...)
+	}
+	if d := diagnosticLines(s.Diagnostics); len(d) > 0 {
+		lines = append(lines, "", mainScope+"diagnostics:")
+		lines = append(lines, d...)
+	}
+	if len(problems) > 0 {
+		lines = append(lines, "", mainScope+"source diagnostics:")
+		for _, p := range problems {
+			lines = append(lines, "- "+p)
+		}
 	}
 	return lines
 }
 
-// allStats is `stats` in the control chat: every open work chat. v0.1.20
-// had no such report (its control chat answered "Wrong chat"); the core's
-// all-sessions stats are kept, computed from the rollouts the same way.
-func (e *Engine) allStats(ctx context.Context) string {
-	e.mu.Lock()
-	type chat struct {
-		cs            *convState
-		label, thread string
-	}
-	var chats []chat
-	for id, c := range e.convs {
-		if c.kind == store.KindWork && id != e.inboxID && c.state != store.ConvClosed {
-			chats = append(chats, chat{cs: c, label: c.label, thread: strings.TrimSpace(c.threadID)})
-		}
-	}
-	e.mu.Unlock()
-	sort.Slice(chats, func(a, b int) bool { return chats[a].label < chats[b].label })
-	lines := []string{statsTitle, "", "Scope: all Work chats"}
-	threads := make([][]string, len(chats))
-	for i, c := range chats {
-		if c.thread != "" {
-			threads[i] = e.threadsOf(c.cs, c.thread)
-		}
-	}
-	us, err := e.usageOf(ctx, threads)
-	if err != nil {
-		return strings.Join(append(lines, "", "Token stats unavailable: read local Codex transcript failed: "+err.Error()), "\n")
-	}
-	var total transcript.TokenUsage
-	var tiers [][]transcript.ModelTierUsage
-	var models [][]transcript.ModelUsage
-	var per, notes []string
-	counted := 0
-	for i, ch := range chats {
-		c := summarize(ch.label, ch.thread, us[i])
-		switch {
-		case ch.thread == "" || !c.linked && c.readErr == nil:
-			continue
-		case c.readErr != nil:
-			notes = append(notes, ch.label+": read local Codex transcript failed: "+c.readErr.Error())
-			continue
-		case !c.main.HasUsage():
-			continue
-		}
-		counted++
-		chatTotal := c.mainOverall()
-		chatModels, chatTiers := c.main.Models, c.main.ModelTiers
-		if c.subs > 0 {
-			if c.complete() {
-				chatTotal, _ = transcript.AddUsage(chatTotal, c.subTotal)
-				chatModels = transcript.SumModels(chatModels, c.subMods)
-				chatTiers = transcript.SumTiers(chatTiers, c.subTiers)
-			} else {
-				notes = append(notes, ch.label+": subagent usage could not be established and is not included")
-			}
-		}
-		for _, n := range c.notes {
-			notes = append(notes, ch.label+": "+n)
-		}
-		total, _ = transcript.AddUsage(total, chatTotal)
-		tiers = append(tiers, chatTiers)
-		models = append(models, chatModels)
-		item := "- " + ch.label + ": total " + tokenCount(chatTotal.Total)
-		if pct, ok := chatTotal.CachePercent(); ok {
-			item += fmt.Sprintf("; cache hit rate %.1f%%", pct)
-		}
-		per = append(per, item)
-	}
-	lines = append(lines, "", fmt.Sprintf("Work chats with token usage: %d of %d", counted, len(chats)))
-	if counted == 0 {
-		lines = append(lines, "", "Token usage unavailable: no Codex usage event was found in the Work chats' transcripts.")
-		if len(notes) > 0 {
-			lines = append(lines, "", "Analysis:", "")
-			lines = append(lines, notes...)
-		}
-		return strings.Join(lines, "\n")
-	}
-	lines = append(lines, "", "Conversation total:", "")
-	lines = append(lines, usageLines(total)...)
-	sumTiers := transcript.SumTiers(tiers...)
-	if tl := modelTierLines(sumTiers); len(tl) > 0 {
-		lines = append(lines, "", "Model/tier usage:", "")
-		lines = append(lines, tl...)
-	}
-	sumModels := transcript.SumModels(models...)
-	if ml := modelUsageLines(sumModels); len(ml) > 0 {
-		lines = append(lines, "", "Model/effort usage:", "")
-		lines = append(lines, ml...)
-	}
-	lines = append(lines, "", "Per Work chat:", "")
-	lines = append(lines, per...)
-	analysis := append(modelTierAnalysis(sumTiers), modelUsageAnalysis(sumModels)...)
-	analysis = append(analysis, notes...)
-	if len(analysis) > 0 {
-		lines = append(lines, "", "Analysis:", "")
-		lines = append(lines, analysis...)
-	}
-	return strings.Join(lines, "\n")
-}
-
-// tokenStatsLines is v0.1.20's formatCodexTokenStatsLines, with 0.1.22's
-// source aggregation lines and model/effort section.
-func tokenStatsLines(s transcript.TokenStats, notes []string) []string {
+// metadataLines is formatCodexTokenStatsMetadataLines.
+func metadataLines(s transcript.TokenStats) []string {
 	source := strings.TrimSpace(s.Source)
 	if source == "" {
 		source = "unknown"
@@ -386,57 +298,135 @@ func tokenStatsLines(s transcript.TokenStats, notes []string) []string {
 			lines = append(lines, "", fmt.Sprintf("Aggregation: ignored %d non-advancing usage snapshot(s); observed %d native cumulative counter reset(s) and %d recovery event(s).", s.NonAdvancing, s.Resets, s.Recoveries))
 		}
 	default:
-		lines = append(lines, "", "Reliability: Codex `token_count` metadata was found, but it did not contain a usage snapshot.")
-	}
-	if !s.HasUsage() {
-		lines = append(lines, "", "Token usage unavailable: no Codex usage event was found in the linked transcript.")
-		if rl := rateLimitLines(s.RateLimits); len(rl) > 0 {
-			lines = append(lines, "", "Rate limits:")
-			lines = append(lines, rl...)
-		}
-		if d := diagnosticLines(s.Diagnostics); len(d) > 0 {
-			lines = append(lines, "")
-			lines = append(lines, d...)
-		}
-		return lines
-	}
-	if s.Info.Last.HasTokens() {
-		lines = append(lines, "", "Last recorded model usage:", "")
-		lines = append(lines, usageLines(s.Info.Last)...)
-	}
-	if s.Info.Total.HasTokens() && s.Info.Total != s.Info.Last {
-		lines = append(lines, "", "Conversation total:", "")
-		lines = append(lines, usageLines(s.Info.Total)...)
-	}
-	if tl := modelTierLines(s.ModelTiers); len(tl) > 0 {
-		lines = append(lines, "", "Model/tier usage:", "")
-		lines = append(lines, tl...)
-	}
-	if ml := modelUsageLines(s.Models); len(ml) > 0 {
-		lines = append(lines, "", "Model/effort usage:", "")
-		lines = append(lines, ml...)
-	}
-	analysis := usageAnalysis(s.Info)
-	analysis = append(analysis, modelTierAnalysis(s.ModelTiers)...)
-	analysis = append(analysis, modelUsageAnalysis(s.Models)...)
-	analysis = append(analysis, aggregationAnalysis(s)...)
-	analysis = append(analysis, notes...)
-	if len(analysis) > 0 {
-		lines = append(lines, "", "Analysis:", "")
-		lines = append(lines, analysis...)
-	}
-	if rl := rateLimitLines(s.RateLimits); len(rl) > 0 {
-		lines = append(lines, "", "Rate limits:")
-		lines = append(lines, rl...)
-	}
-	if d := diagnosticLines(s.Diagnostics); len(d) > 0 {
-		lines = append(lines, "")
-		lines = append(lines, d...)
+		lines = append(lines, "", "Reliability: Codex `token_count` metadata was found, but it did not contain a usage snapshot.",
+			"", "Token usage unavailable: no Codex usage event was found in the linked transcript.")
 	}
 	return lines
 }
 
-// usageLines is v0.1.20's formatTokenUsageLines.
+// subagentLines is formatCodexSubagentStatsLines, or
+// formatCodexNoSubagentLines for a chat without subagents.
+func subagentLines(c chatUsage) []string {
+	if c.subs == 0 {
+		return []string{
+			subagentScope + " · NOT USED:",
+			"Status: no user-visible subagent transcript was found",
+			"Transcript count: 0",
+			"Token usage: 0",
+			"Cache hit rate: N/A",
+			"Model/effort breakdown: not applicable",
+		}
+	}
+	title := fmt.Sprintf("%s (%d) ·", subagentScope, c.subs)
+	lines := []string{title + " overall:"}
+	if c.subTotal.HasTokens() {
+		lines = append(lines, usageLines(c.subTotal)...)
+	} else {
+		lines = append(lines, "Token usage unavailable: no readable subagent usage event was found.")
+	}
+	lines = append(lines, "", title+" model/effort detail:")
+	lines = append(lines, modelDetail(c.subMods)...)
+	if len(c.subProbs) > 0 {
+		lines = append(lines, "", title+" diagnostics:")
+		for _, p := range c.subProbs {
+			lines = append(lines, "- "+p)
+		}
+	}
+	return lines
+}
+
+func modelDetail(us []transcript.ModelUsage) []string {
+	if ml := modelUsageLines(us); len(ml) > 0 {
+		return ml
+	}
+	return []string{"Model/effort breakdown: unavailable"}
+}
+
+// allStats is `stats` in the control chat: every open work chat, in the
+// work chats' layout (285784d3^ had no such report; its control chat
+// answered "Wrong chat"). The chats are listed by activity, the most
+// recent last (activity.go).
+func (e *Engine) allStats(ctx context.Context) string {
+	at := e.activityTimes()
+	e.mu.Lock()
+	type chat struct {
+		cs            *convState
+		label, thread string
+	}
+	var chats []chat
+	for id, c := range e.convs {
+		if c.kind == store.KindWork && id != e.inboxID && c.state != store.ConvClosed {
+			chats = append(chats, chat{cs: c, label: c.label, thread: strings.TrimSpace(c.threadID)})
+		}
+	}
+	e.mu.Unlock()
+	sort.Slice(chats, func(a, b int) bool { return byActivity(at, chats[a].cs.id, chats[b].cs.id) })
+	lines := []string{statsTitle, "", "Scope: all Work chats"}
+	threads := make([][]string, len(chats))
+	for i, c := range chats {
+		if c.thread != "" {
+			threads[i] = e.threadsOf(c.cs, c.thread)
+		}
+	}
+	us, err := e.usageOf(ctx, threads)
+	if err != nil {
+		return strings.Join(append(lines, "", "Token stats unavailable: read local Codex transcript failed: "+err.Error()), "\n")
+	}
+	var total transcript.TokenUsage
+	var models [][]transcript.ModelUsage
+	var per, notes []string
+	counted := 0
+	for i, ch := range chats {
+		c := summarize(ch.label, ch.thread, us[i])
+		switch {
+		case ch.thread == "" || !c.linked && c.readErr == nil:
+			continue
+		case c.readErr != nil:
+			notes = append(notes, ch.label+": read local Codex transcript failed: "+c.readErr.Error())
+			continue
+		case !c.main.HasUsage():
+			continue
+		}
+		counted++
+		chatTotal, chatModels := c.mainOverall(), c.main.Models
+		if c.subs > 0 {
+			if c.complete() {
+				chatTotal, _ = transcript.AddUsage(chatTotal, c.subTotal)
+				chatModels = transcript.SumModels(chatModels, c.subMods)
+			} else {
+				notes = append(notes, ch.label+": subagent usage could not be established and is not included")
+			}
+		}
+		for _, n := range c.notes {
+			notes = append(notes, ch.label+": "+n)
+		}
+		total, _ = transcript.AddUsage(total, chatTotal)
+		models = append(models, chatModels)
+		per = append(per, "Chat: "+ch.label)
+		per = append(per, usageLines(chatTotal)...)
+	}
+	lines = append(lines, "", fmt.Sprintf("Work chats with token usage: %d of %d", counted, len(chats)))
+	if counted == 0 {
+		lines = append(lines, "", "Token usage unavailable: no Codex usage event was found in the Work chats' transcripts.")
+	} else {
+		sumModels := transcript.SumModels(models...)
+		lines = append(lines, "", allChatsScope+"overall:")
+		lines = append(lines, usageLines(total)...)
+		lines = append(lines, "", allChatsScope+"model/effort detail:")
+		lines = append(lines, modelDetail(sumModels)...)
+		lines = append(lines, "", allChatsScope+"per chat:")
+		lines = append(lines, per...)
+		notes = append(modelUsageAnalysis(sumModels), notes...)
+	}
+	if len(notes) > 0 {
+		lines = append(lines, "", allChatsScope+"analysis:")
+		lines = append(lines, notes...)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// usageLines is formatTokenUsageLines as of 285784d3^ (the cache hit rate
+// row is always there, N/A without input).
 func usageLines(u transcript.TokenUsage) []string {
 	lines := []string{"input: " + tokenCount(u.Input)}
 	if u.Cached > 0 {
@@ -444,6 +434,8 @@ func usageLines(u transcript.TokenUsage) []string {
 	}
 	if pct, ok := u.CachePercent(); ok {
 		lines = append(lines, "", fmt.Sprintf("Cache hit rate: %.1f%%", pct))
+	} else {
+		lines = append(lines, "", "Cache hit rate: N/A")
 	}
 	out := "output: " + tokenCount(u.Output)
 	if u.Reasoning > 0 {
@@ -452,36 +444,24 @@ func usageLines(u transcript.TokenUsage) []string {
 	return append(lines, "", out, "total: "+tokenCount(u.Total))
 }
 
-func modelTierLines(us []transcript.ModelTierUsage) []string {
-	var lines []string
-	for i, u := range us {
-		if i > 0 {
-			lines = append(lines, "")
-		}
-		lines = append(lines, "Model: "+u.Model, "Tier: "+u.Tier)
-		lines = append(lines, usageLines(u.Usage)...)
+// requestStatus is v0.1.20's userFacingTurnStatus over the core's turn
+// states.
+func requestStatus(state string) string {
+	switch state {
+	case store.TurnQueued:
+		return "queued"
+	case store.TurnStarting, store.TurnRunning:
+		return "running"
+	case store.TurnCompleted:
+		return "completed"
+	case store.TurnFailed, store.TurnNotStarted:
+		return "failed"
+	case store.TurnInterrupted:
+		return "interrupted"
+	case "":
+		return "unknown"
 	}
-	return lines
-}
-
-func modelTierAnalysis(us []transcript.ModelTierUsage) []string {
-	if len(us) == 0 {
-		return nil
-	}
-	n := 0
-	var unknown transcript.TokenUsage
-	for _, u := range us {
-		if u.Model != "unknown" && u.Tier != "unknown" {
-			continue
-		}
-		n++
-		unknown, _ = transcript.AddUsage(unknown, u.Usage)
-	}
-	lines := []string{fmt.Sprintf("model/tier attribution: %d observed combination(s)", len(us))}
-	if n > 0 {
-		lines = append(lines, fmt.Sprintf("%d combination(s), %s total, have missing model or service-tier metadata; they remain `unknown` instead of being guessed or merged", n, tokenCount(unknown.EffectiveTotal())))
-	}
-	return lines
+	return state
 }
 
 // modelUsageLines is 0.1.22's formatCodexModelUsageLines.
@@ -686,20 +666,28 @@ func tokenCount(v int64) string {
 	return sign + strings.Join(append([]string{s}, groups...), ",")
 }
 
-// Rendering: v0.1.20's renderCodexTokenStatsHTML, as Markdown for the
-// channel's renderer (which splits long tables keeping their header).
+// Rendering: renderCodexTokenStatsHTML as of 285784d3^, as Markdown for
+// the channel's renderer (which splits long tables keeping their header):
+// the title, the header paragraph, then each scoped section under its
+// bold title as a table (usage, model/effort detail, per chat, status) or
+// a list (analysis, rate limits, diagnostics).
 
-func isStatsHeader(l string) bool {
-	switch l {
-	case "Last recorded model usage:", "Conversation total:", "Model/tier usage:", "Model/effort usage:", "Analysis:", "Rate limits:", "Per Work chat:":
-		return true
+// statsScope returns the kind of a scoped section title ("overall",
+// "snapshots", "model/effort detail", …), "" for any other line
+// (parseStatsScopedSectionHeader).
+func statsScope(l string) string {
+	if !strings.HasSuffix(l, ":") {
+		return ""
 	}
-	return (strings.HasPrefix(l, "🧩 SUBAGENTS") || strings.HasPrefix(l, "🧮 TOTAL")) && strings.HasSuffix(l, ":")
-}
-
-type statsSection struct {
-	header string
-	lines  []string
+	for _, p := range []string{mainScope, totalScope, allChatsScope} {
+		if strings.HasPrefix(l, p) {
+			return strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(l, p), ":"))
+		}
+	}
+	if i := strings.LastIndex(l, " · "); strings.HasPrefix(l, subagentScope) && i >= 0 {
+		return strings.ToLower(strings.TrimSuffix(l[i+len(" · "):], ":"))
+	}
+	return ""
 }
 
 // renderStats renders the text lines of a stats report.
@@ -717,54 +705,183 @@ func renderStats(text string) string {
 		i = 1
 	}
 	var meta []string
-	for ; i < len(lines) && !isStatsHeader(lines[i]); i++ {
+	for ; i < len(lines) && statsScope(lines[i]) == ""; i++ {
 		meta = append(meta, lines[i])
 	}
 	if len(meta) > 0 {
 		blocks = append(blocks, statsParagraph(meta))
 	}
-	var secs []statsSection
 	for i < len(lines) {
-		s := statsSection{header: lines[i]}
-		for i++; i < len(lines) && !isStatsHeader(lines[i]); i++ {
-			s.lines = append(s.lines, lines[i])
+		title, kind := lines[i], statsScope(lines[i])
+		var body []string
+		for i++; i < len(lines) && statsScope(lines[i]) == ""; i++ {
+			body = append(body, lines[i])
 		}
-		secs = append(secs, s)
-	}
-	for k := 0; k < len(secs); k++ {
-		s := secs[k]
-		if s.header == "Last recorded model usage:" || s.header == "Conversation total:" {
-			var last, conv *statsSection
-			pick := func(x *statsSection) {
-				if x.header == "Last recorded model usage:" {
-					last = x
-				} else {
-					conv = x
-				}
-			}
-			pick(&secs[k])
-			if k+1 < len(secs) && (secs[k+1].header == "Last recorded model usage:" || secs[k+1].header == "Conversation total:") && secs[k+1].header != s.header {
-				pick(&secs[k+1])
-				k++
-			}
-			blocks = append(blocks, "**Model usage:**", usageTable(last, conv))
-			continue
-		}
-		blocks = append(blocks, "**"+mdEscapeLine(s.header)+"**")
-		switch {
-		case s.header == "Analysis:" || s.header == "Rate limits:" || s.header == "Per Work chat:" || strings.HasSuffix(s.header, " diagnostics:"):
-			blocks = append(blocks, statsList(s.lines))
-		case s.header == "Model/tier usage:" || s.header == "Model/effort usage:" || strings.HasSuffix(s.header, " model/effort detail:"):
-			blocks = append(blocks, statsGroups(s.lines)...)
-		default:
-			blocks = append(blocks, statsParagraph(s.lines))
+		blocks = append(blocks, "**"+title+"**")
+		if b := statsSection(kind, body); b != "" {
+			blocks = append(blocks, b)
 		}
 	}
 	return strings.Join(blocks, "\n\n")
 }
 
-// statsLine renders "Label: value" with a bold label (v0.1.20
-// renderStatsLineHTML); the value stays inline Markdown.
+// statsSection renders a section's lines by its kind; lines that do not
+// make the table (an "unavailable" line) stay a paragraph.
+func statsSection(kind string, body []string) string {
+	var table string
+	switch kind {
+	case "overall":
+		table = usageTable([]string{"Overall"}, [][]string{body})
+	case "snapshots":
+		// renderStatsUsageSnapshotsHTML: the last snapshot next to the
+		// conversation total.
+		var last, conv []string
+		var heads []string
+		var cols [][]string
+		var cur *[]string
+		for _, l := range body {
+			switch l {
+			case "Last recorded model usage:":
+				cur = &last
+			case "Conversation total:":
+				cur = &conv
+			default:
+				if cur != nil {
+					*cur = append(*cur, l)
+				}
+			}
+		}
+		if len(last) > 0 {
+			heads, cols = append(heads, "Last recorded model usage"), append(cols, last)
+		}
+		if len(conv) > 0 {
+			heads, cols = append(heads, "Conversation total"), append(cols, conv)
+		}
+		table = usageTable(heads, cols)
+	case "model/effort detail":
+		table = rowsTable([]string{"Model", "Effort"}, body, func(label, v string, model *string) []string {
+			switch label {
+			case "model":
+				*model = v
+			case "overall":
+				return []string{*model, "overall"}
+			case "effort":
+				return []string{*model, v}
+			}
+			return nil
+		})
+	case "per chat":
+		table = rowsTable([]string{"Chat"}, body, func(label, v string, _ *string) []string {
+			if label == "chat" {
+				return []string{v}
+			}
+			return nil
+		})
+	case "not used", "unavailable":
+		// renderStatsStatusTableHTML.
+		rows := []string{"| Status | Value |", "| --- | --- |"}
+		for _, l := range body {
+			label, v := statsLabel(l)
+			rows = append(rows, "| **"+cell(firstNonEmpty(label, "Detail"))+"** | "+cell(v)+" |")
+		}
+		return strings.Join(rows, "\n")
+	case "analysis", "rate limits", "diagnostics", "source diagnostics":
+		return statsList(body)
+	}
+	if table != "" {
+		return table
+	}
+	return statsParagraph(body)
+}
+
+var usageMetrics = []struct{ label, key string }{{"input", "input"}, {"Cache hit rate", "cache hit rate"}, {"output", "output"}, {"total", "total"}}
+
+// statsLabel splits "Label: value" (a leading "- " is dropped); the label
+// is "" for a line without one.
+func statsLabel(l string) (string, string) {
+	label, v, ok := strings.Cut(strings.TrimPrefix(strings.TrimSpace(l), "- "), ":")
+	if !ok {
+		return "", strings.TrimSpace(l)
+	}
+	return strings.TrimSpace(label), strings.TrimSpace(v)
+}
+
+func usageValues(lines []string) map[string]string {
+	m := map[string]string{}
+	for _, l := range lines {
+		label, v := statsLabel(l)
+		m[strings.ToLower(label)] = v
+	}
+	return m
+}
+
+// cell keeps a value inside its table cell.
+func cell(v string) string { return strings.ReplaceAll(v, "|", `\|`) }
+
+// usageTable is renderStatsSingleUsageTableHTML and
+// renderStatsUsageComparisonTableHTML: a Metric column, then one column of
+// usage each; "" when no column has a usage value.
+func usageTable(heads []string, cols [][]string) string {
+	vals := make([]map[string]string, len(cols))
+	for i, c := range cols {
+		vals[i] = usageValues(c)
+	}
+	rows := []string{"| Metric | " + strings.Join(heads, " | ") + " |", "|" + strings.Repeat(" --- |", len(heads)+1)}
+	for _, m := range usageMetrics {
+		row, has := "| **"+m.label+"** |", false
+		for _, v := range vals {
+			row += " " + cell(v[m.key]) + " |"
+			has = has || v[m.key] != ""
+		}
+		if has {
+			rows = append(rows, row)
+		}
+	}
+	if len(rows) == 2 {
+		return ""
+	}
+	return strings.Join(rows, "\n")
+}
+
+// rowsTable is renderStatsModelEffortUsageHTML: one row of usage per
+// group of lines. start returns the leading cells of a row that starts at
+// a line (by its lowercase label), nil for any other line; state carries
+// what a line names for the rows after it (the model). "" without rows.
+func rowsTable(heads, body []string, start func(label, value string, state *string) []string) string {
+	type row struct {
+		cells []string
+		lines []string
+	}
+	var rows []row
+	state := ""
+	for _, l := range body {
+		label, v := statsLabel(l)
+		if cells := start(strings.ToLower(label), v, &state); cells != nil {
+			rows = append(rows, row{cells: cells})
+		} else if len(rows) > 0 {
+			rows[len(rows)-1].lines = append(rows[len(rows)-1].lines, l)
+		}
+	}
+	if len(rows) == 0 {
+		return ""
+	}
+	out := []string{"| " + strings.Join(heads, " | ") + " | input | Cache hit rate | output | total |", "|" + strings.Repeat(" --- |", len(heads)+4)}
+	for _, r := range rows {
+		vals := usageValues(r.lines)
+		line := "|"
+		for _, c := range r.cells {
+			line += " " + cell(c) + " |"
+		}
+		for _, m := range usageMetrics {
+			line += " " + cell(vals[m.key]) + " |"
+		}
+		out = append(out, line)
+	}
+	return strings.Join(out, "\n")
+}
+
+// statsLine renders "Label: value" with a bold label (renderStatsLineHTML);
+// the value stays inline Markdown.
 func statsLine(l string) string {
 	label, rest, ok := strings.Cut(strings.TrimSpace(l), ":")
 	label = strings.TrimSpace(label)
@@ -779,7 +896,7 @@ func statsLine(l string) string {
 }
 
 // mdEscapeLine keeps a line from starting a Markdown block (list, heading,
-// quote) where v0.1.20's HTML showed it as text.
+// quote) where the HTML showed it as text.
 func mdEscapeLine(l string) string {
 	if l != "" && strings.ContainsRune("-+*#>|", rune(l[0])) {
 		return `\` + l
@@ -801,76 +918,4 @@ func statsList(lines []string) string {
 		out[i] = "- " + statsLine(strings.TrimPrefix(l, "- "))
 	}
 	return strings.Join(out, "\n")
-}
-
-// statsGroups renders model groups as one paragraph each (v0.1.20
-// renderStatsModelTierUsageHTML); an effort starts a paragraph too.
-func statsGroups(lines []string) []string {
-	var out []string
-	var cur []string
-	flush := func() {
-		if len(cur) > 0 {
-			out = append(out, statsParagraph(cur))
-			cur = nil
-		}
-	}
-	for _, l := range lines {
-		if strings.HasPrefix(l, "Model:") || strings.HasPrefix(l, "Effort:") {
-			flush()
-		}
-		cur = append(cur, l)
-	}
-	flush()
-	return out
-}
-
-// usageTable is v0.1.20's renderStatsUsageComparisonTableHTML.
-func usageTable(last, conv *statsSection) string {
-	type col struct {
-		header string
-		vals   map[string]string
-	}
-	values := func(s *statsSection) map[string]string {
-		m := map[string]string{}
-		for _, l := range s.lines {
-			label, v, _ := strings.Cut(strings.TrimPrefix(l, "- "), ":")
-			m[strings.ToLower(strings.TrimSpace(label))] = strings.TrimSpace(v)
-		}
-		return m
-	}
-	var cols []col
-	if last != nil && len(last.lines) > 0 {
-		cols = append(cols, col{"Last recorded model usage", values(last)})
-	}
-	if conv != nil && len(conv.lines) > 0 {
-		cols = append(cols, col{"Conversation total", values(conv)})
-	}
-	if len(cols) == 0 {
-		return ""
-	}
-	var b strings.Builder
-	b.WriteString("| Metric |")
-	for _, c := range cols {
-		b.WriteString(" " + c.header + " |")
-	}
-	b.WriteString("\n| --- |")
-	for range cols {
-		b.WriteString(" --- |")
-	}
-	for _, row := range []struct{ label, key string }{{"input", "input"}, {"Cache hit rate", "cache hit rate"}, {"output", "output"}, {"total", "total"}} {
-		has := false
-		for _, c := range cols {
-			if c.vals[row.key] != "" {
-				has = true
-			}
-		}
-		if !has {
-			continue
-		}
-		b.WriteString("\n| **" + row.label + "** |")
-		for _, c := range cols {
-			b.WriteString(" " + c.vals[row.key] + " |")
-		}
-	}
-	return b.String()
 }

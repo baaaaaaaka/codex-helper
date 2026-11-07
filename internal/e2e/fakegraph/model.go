@@ -149,6 +149,9 @@ func HTMLToText(s string) string {
 			if strings.HasPrefix(tag, "<br") || strings.HasPrefix(tag, "<p") || strings.HasPrefix(tag, "</p") || strings.HasPrefix(tag, "<li") || strings.HasPrefix(tag, "<div") || strings.HasPrefix(tag, "</div") || strings.HasPrefix(tag, "<tr") || strings.HasPrefix(tag, "<h") {
 				b.WriteByte('\n')
 			}
+			if strings.HasPrefix(tag, "<td") || strings.HasPrefix(tag, "<th") {
+				b.WriteString(" | ") // table cells stay apart
+			}
 		case c == '>' && inTag:
 			inTag = false
 		case !inTag:

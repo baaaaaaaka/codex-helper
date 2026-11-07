@@ -265,6 +265,7 @@ func (e *Engine) convOpen(id int64) bool {
 func (e *Engine) mirrorLoop(ctx context.Context) {
 	if err := e.mirrorInit(); err != nil {
 		e.logf("mirror: %v", err)
+		e.catchUpReading.Store(false) // no catch-up to wait for
 		return
 	}
 	e.startFirstWalk()
