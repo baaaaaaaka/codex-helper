@@ -58,7 +58,7 @@
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-EDITVOICE-voice-1</p>
-   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:6> owner (html)
    | <attachment id="<uuid:2>"></attachment>
@@ -74,7 +74,7 @@
 
 == codex turns (per thread; threads by kind, directory and first prompt; turns in start order)
 -- thread <uuid:3> (work, cwd <root>/work/voice-edit)
-   turn: answered
+   turn model=gpt-5-codex effort=medium: answered
    prompt| User message:
    prompt| Automatic local ASR transcript from Microsoft Teams media. The transcript may contain recognition errors, especially names, code identifiers, paths, commands, acronyms, and mixed Chinese/English terms. Prefer explicit typed text over ASR text when they conflict, and ask for clarification when a critical command or identifier is ambiguous.
    prompt|

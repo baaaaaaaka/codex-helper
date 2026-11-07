@@ -276,7 +276,7 @@ func (s *server) dispatch(msg message) (any, *rpcError) {
 		s.mcp[t.ID] = mcp
 		s.mu.Unlock()
 		s.notify("thread/started", map[string]any{"thread": threadJSON(t, false)})
-		return map[string]any{"thread": threadJSON(t, false), "model": "gpt-5-codex", "modelProvider": "openai", "cwd": t.Cwd}, nil
+		return s.loadedResponse(t.ID, map[string]any{"thread": threadJSON(t, false), "cwd": t.Cwd}, str("model")), nil
 	case "thread/resume":
 		id := str("threadId")
 		t, err := s.cfg.Store.Load(id)
@@ -312,7 +312,7 @@ func (s *server) dispatch(msg message) (any, *rpcError) {
 		}
 		// Like Codex 0.166, the goal snapshot follows the resume.
 		defer s.goalSnapshot(id)
-		return map[string]any{"thread": s.threadView(t, include), "model": "gpt-5-codex", "modelProvider": "openai", "cwd": t.Cwd}, nil
+		return s.loadedResponse(id, map[string]any{"thread": s.threadView(t, include), "cwd": t.Cwd}, ""), nil
 	case "thread/read":
 		t, err := s.current(str("threadId"))
 		if err != nil {
@@ -920,6 +920,61 @@ func (s *server) mcpServers() []string {
 	return names
 }
 
+// configModelRE matches config.toml's top-level `model` and
+// `model_reasoning_effort` keys.
+var configModelRE = regexp.MustCompile(`(?m)^\s*(model|model_reasoning_effort)\s*=\s*"([^"]*)"\s*$`)
+
+// configSettings is the model and effort a thread loads with when nothing
+// overrides them: $CODEX_HOME/config.toml's top-level keys, as real Codex
+// reads them, else the model/list default with no effort. Codex's
+// model/list does not mark the config's model as its default, so the two
+// can differ.
+func (s *server) configSettings() [2]string {
+	out := [2]string{"gpt-5-codex", ""}
+	if s.cfg.CodexHome == "" {
+		return out
+	}
+	data, err := os.ReadFile(filepath.Join(s.cfg.CodexHome, "config.toml"))
+	if err != nil {
+		return out
+	}
+	top := string(data)
+	if i := strings.Index(top, "\n["); i >= 0 {
+		top = top[:i]
+	}
+	for _, m := range configModelRE.FindAllStringSubmatch(top, -1) {
+		if m[1] == "model" {
+			out[0] = m[2]
+		} else {
+			out[1] = m[2]
+		}
+	}
+	return out
+}
+
+// loadedResponse completes a thread/start or thread/resume response with
+// the thread's model settings (model: thread/start's override): what it
+// ran with before, else the config's.
+func (s *server) loadedResponse(threadID string, res map[string]any, model string) map[string]any {
+	s.mu.Lock()
+	cur, ok := s.settings[threadID]
+	s.mu.Unlock()
+	if !ok {
+		cur = s.configSettings()
+	}
+	if model != "" {
+		cur[0] = model
+	}
+	s.mu.Lock()
+	s.settings[threadID] = cur
+	s.mu.Unlock()
+	res["model"], res["modelProvider"], res["reasoningEffort"] = cur[0], "openai", nil
+	if cur[1] != "" {
+		res["reasoningEffort"] = cur[1]
+	}
+	return res
+}
+
 // goalSnapshot sends the goal of a thread just resumed, as Codex 0.166
 // does: thread/goal/updated, or thread/goal/cleared when it has none.
 func (s *server) goalSnapshot(threadID string) {
@@ -999,7 +1054,7 @@ func (s *server) applySettings(threadID, model, effort string) {
 	s.mu.Lock()
 	cur, ok := s.settings[threadID]
 	if !ok {
-		cur = [2]string{"gpt-5-codex", ""}
+		cur = s.configSettings()
 	}
 	next := cur
 	if model != "" {

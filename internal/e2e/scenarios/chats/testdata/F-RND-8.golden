@@ -117,12 +117,12 @@
 -- <msg:11> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-FRND8-atlimit-4</p>
-   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == codex turns (per thread; threads by kind, directory and first prompt; turns in start order)
 -- thread <uuid:12> (work, cwd <root>/work/limits)
-   turn images=5: answered
+   turn model=gpt-5-codex effort=medium images=5: answered
    prompt| User message:
    prompt| Everything at the limit E2E-FRND8-atlimit-4
    prompt|

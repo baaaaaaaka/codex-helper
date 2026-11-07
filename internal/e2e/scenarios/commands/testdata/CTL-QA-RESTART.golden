@@ -26,7 +26,7 @@
 
 == codex turns (per thread; threads by kind, directory and first prompt; turns in start order)
 -- thread <uuid:1> (work, cwd <root>/home)
-   turn effort=low: answered
+   turn model=gpt-5-codex effort=low: answered
    prompt| [codex-helper-control]
    prompt| <codex-helper-control-context version="1">
    prompt| You are handling an unrecognized message from the user's Microsoft Teams control chat for codex-helper.

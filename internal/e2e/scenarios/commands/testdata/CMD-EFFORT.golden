@@ -296,7 +296,7 @@
 
 == codex turns (per thread; threads by kind, directory and first prompt; turns in start order)
 -- thread <uuid:1> (work, cwd <root>/home)
-   turn effort=high: answered
+   turn model=gpt-5-codex effort=high: answered
    prompt| [codex-helper-control]
    prompt| <codex-helper-control-context version="1">
    prompt| You are handling an unrecognized message from the user's Microsoft Teams control chat for codex-helper.
@@ -494,7 +494,7 @@
    prompt| User message:
    prompt| what is E2E-CMDEFFORT-ctlhigh-3?
 -- thread <uuid:2> (work, cwd <root>/work/effort)
-   turn effort=high: answered
+   turn model=gpt-5-codex effort=high: answered
    prompt| User message:
    prompt| Please answer E2E-CMDEFFORT-high-1
    prompt|
@@ -517,7 +517,7 @@
    prompt| ```
    prompt|
    prompt| Use only relative manifest paths under that directory. Keep your normal answer visible; the helper will upload listed files separately when file-write auth is available.
-   turn effort=medium: answered
+   turn model=gpt-5-codex effort=medium: answered
    prompt| User message:
    prompt| Please answer E2E-CMDEFFORT-medium-2
    prompt|
@@ -540,7 +540,7 @@
    prompt| ```
    prompt|
    prompt| Use only relative manifest paths under that directory. Keep your normal answer visible; the helper will upload listed files separately when file-write auth is available.
-   turn effort=medium: answered
+   turn model=gpt-5-codex effort=medium: answered
    prompt| User message:
    prompt| Please answer E2E-CMDEFFORT-after-4
    prompt|

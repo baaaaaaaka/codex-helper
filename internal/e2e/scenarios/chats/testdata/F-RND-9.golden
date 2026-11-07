@@ -79,7 +79,7 @@
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-FRND9-first-1</p>
-   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:6> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
@@ -96,7 +96,7 @@
 -- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-FRND9-forwarded-3</p>
-   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:9> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
@@ -232,7 +232,7 @@
 -- <msg:11> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-FRND9-long-4</p>
-   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:12> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
@@ -247,12 +247,12 @@
 -- <msg:14> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-FRND9-long-4</p>
-   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == codex turns (per thread; threads by kind, directory and first prompt; turns in start order)
 -- thread <uuid:2> (work, cwd <root>/work/quotes)
-   turn: answered
+   turn model=gpt-5-codex effort=medium: answered
    prompt| User message:
    prompt| Draft the release note E2E-FRND9-first-1
    prompt|
@@ -275,7 +275,7 @@
    prompt| ```
    prompt|
    prompt| Use only relative manifest paths under that directory. Keep your normal answer visible; the helper will upload listed files separately when file-write auth is available.
-   turn: answered
+   turn model=gpt-5-codex effort=medium: answered
    prompt| User message:
    prompt| Shorten this one E2E-FRND9-reply-2
    prompt|
@@ -283,7 +283,7 @@
    prompt| 1. From: E2E Owner; Time: <time:2>; Source: Graph full message
    prompt|    🤖 ✅ Codex answer:
    prompt|    E2EANSWER-<n> answer for E2E-FRND9-first-1
-   prompt|    🔧 Helper: model - gpt-5-codex, effort - default, tier - standard
+   prompt|    🔧 Helper: model - gpt-5-codex, effort - medium, tier - standard
    prompt|    🔧 Helper: ✅ Codex finished responding.
    prompt|
    prompt| 2. From: Ann Example; Time: <time:1>; Source: Teams reference preview
@@ -311,7 +311,7 @@
    prompt| ```
    prompt|
    prompt| Use only relative manifest paths under that directory. Keep your normal answer visible; the helper will upload listed files separately when file-write auth is available.
-   turn: answered
+   turn model=gpt-5-codex effort=medium: answered
    prompt| User message:
    prompt| Long specification E2E-FRND9-long-4
    prompt| requirement line with enough words to be long
@@ -394,7 +394,7 @@
    prompt| ```
    prompt|
    prompt| Use only relative manifest paths under that directory. Keep your normal answer visible; the helper will upload listed files separately when file-write auth is available.
-   turn: answered
+   turn model=gpt-5-codex effort=medium: answered
    prompt| User message:
    prompt| Check the spec I quoted E2E-FRND9-quotelong-5
    prompt|

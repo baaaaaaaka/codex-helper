@@ -61,12 +61,12 @@
 -- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>Finished the long task E2E-CAPWINDOW-capwin-1</p>
-   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == codex turns (per thread; threads by kind, directory and first prompt; turns in start order)
 -- thread <uuid:1> (work, cwd <root>/work/capwindow)
-   turn: failed
+   turn model=gpt-5-codex effort=medium: failed
    prompt| User message:
    prompt| Long task hit by capacity twice E2E-CAPWINDOW-capwin-1
    prompt|
@@ -89,7 +89,7 @@
    prompt| ```
    prompt|
    prompt| Use only relative manifest paths under that directory. Keep your normal answer visible; the helper will upload listed files separately when file-write auth is available.
-   turn: failed
+   turn model=gpt-5-codex effort=medium: failed
    prompt| continue
-   turn: answered
+   turn model=gpt-5-codex effort=medium: answered
    prompt| continue

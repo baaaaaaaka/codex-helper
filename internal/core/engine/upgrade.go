@@ -136,8 +136,17 @@ func codexTooOld(text string) bool {
 }
 
 // sameVersion compares release versions with or without the "v" prefix.
+// A release build's version is "0.1.22-rc.68 (<commit>) <date>" (cli's
+// buildVersion); only its first field is the version, as the updater reads
+// it (update.normalizeVersion). Comparing the whole string reported every
+// completed update as an activation failure.
 func sameVersion(a, b string) bool {
-	norm := func(s string) string { return strings.TrimPrefix(strings.TrimSpace(s), "v") }
+	norm := func(s string) string {
+		if f := strings.Fields(s); len(f) > 0 {
+			return strings.TrimPrefix(f[0], "v")
+		}
+		return ""
+	}
 	return norm(a) != "" && norm(a) == norm(b)
 }
 

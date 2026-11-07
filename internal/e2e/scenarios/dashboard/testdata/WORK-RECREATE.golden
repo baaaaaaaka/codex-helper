@@ -80,7 +80,7 @@
 -- <msg:10> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-WORKRECREATE-first-1</p>
-   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:11> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
@@ -153,12 +153,12 @@
 -- <msg:14> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-WORKRECREATE-second-2</p>
-   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - default, tier - standard</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
 == codex turns (per thread; threads by kind, directory and first prompt; turns in start order)
 -- thread <uuid:1> (work, cwd <root>/work/recreate)
-   turn: answered
+   turn model=gpt-5-codex effort=medium: answered
    prompt| User message:
    prompt| Please answer E2E-WORKRECREATE-first-1
    prompt|
@@ -181,7 +181,7 @@
    prompt| ```
    prompt|
    prompt| Use only relative manifest paths under that directory. Keep your normal answer visible; the helper will upload listed files separately when file-write auth is available.
-   turn: answered
+   turn model=gpt-5-codex effort=medium: answered
    prompt| User message:
    prompt| Please answer E2E-WORKRECREATE-second-2
    prompt|

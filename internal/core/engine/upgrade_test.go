@@ -137,8 +137,10 @@ func TestHelperUpdateDrainsInstallsRestartsAndAnnouncesOnce(t *testing.T) {
 		t.Fatalf("installs = %d", up.installed())
 	}
 
+	// A release build reports its commit and build date after the
+	// version (cli's buildVersion), as the field report showed.
 	mu.Lock()
-	version = "v2.0.0"
+	version = "2.0.0 (771b7c5965b13d3a4bed432a143640f0e4b2e7f0) 2026-11-07T12:05:26Z"
 	mu.Unlock()
 	r.start()
 	ctl := r.control()
@@ -167,7 +169,7 @@ func TestHelperUpdateDrainsInstallsRestartsAndAnnouncesOnce(t *testing.T) {
 	if up.installed() != 1 {
 		t.Fatalf("installs = %d after the update", up.installed())
 	}
-	if s, err := ReadStoreStatus(r.st); err != nil || s.RunningVersion != "v2.0.0" || s.UpdateInstalled != "" || s.UpdateScheduled != "" {
+	if s, err := ReadStoreStatus(r.st); err != nil || !sameVersion(s.RunningVersion, "v2.0.0") || s.UpdateInstalled != "" || s.UpdateScheduled != "" {
 		t.Fatalf("store status %+v %v", s, err)
 	}
 }
@@ -357,6 +359,28 @@ func TestCodexTooOldMatches(t *testing.T) {
 		p, s, ok := parseUpdateArg(arg)
 		if [3]bool{p, s, ok} != want {
 			t.Errorf("parseUpdateArg(%q) = %v %v %v", arg, p, s, ok)
+		}
+	}
+}
+
+// sameVersion reads a release build's version string (cli's buildVersion:
+// "<version> (<commit>) <date>") as its version.
+func TestSameVersionReadsBuildVersionStrings(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want bool
+	}{
+		{"v0.1.22-rc.68", "0.1.22-rc.68 (771b7c5965b13d3a4bed432a143640f0e4b2e7f0) 2026-11-07T12:05:26Z", true},
+		{"v0.1.22-rc.68", "0.1.22-rc.68", true},
+		{"0.1.22-rc.68 (abc) 2026-11-07", "v0.1.22-rc.68", true},
+		{"v0.1.22-rc.69", "0.1.22-rc.68 (771b7c5965b13d3a4bed432a143640f0e4b2e7f0) 2026-11-07T12:05:26Z", false},
+		{"v0.1.22-rc.6", "0.1.22-rc.68", false},
+		{"", "", false},
+		{"  ", "v1", false},
+	}
+	for _, c := range cases {
+		if got := sameVersion(c.a, c.b); got != c.want {
+			t.Errorf("sameVersion(%q, %q) = %v, want %v", c.a, c.b, got, c.want)
 		}
 	}
 }

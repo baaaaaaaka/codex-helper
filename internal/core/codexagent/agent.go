@@ -101,6 +101,14 @@ func (a *Agent) Run(ctx context.Context, req engine.TurnRequest, hooks engine.Tu
 	}
 	defer lease.Release()
 	srv := lease.Server()
+	if req.Model == "" || req.Effort == "" {
+		// The model and effort the chat shows (engine.TurnSettings).
+		ms, err := srv.Models(ctx)
+		if err != nil {
+			fmt.Fprintf(a.cfg.Log, "codexagent: model/list before the turn: %v\n", err)
+		}
+		req.Model, req.Effort = engine.TurnSettings(engineModels(ms), req.Model, req.Effort)
+	}
 	threadID := req.ThreadID
 	if threadID == "" {
 		th, err := srv.ThreadStart(ctx, codex.ThreadStartParams{Cwd: req.Cwd, Model: req.Model})
@@ -296,6 +304,10 @@ func (a *Agent) Models(ctx context.Context) ([]engine.Model, error) {
 	if err != nil {
 		return nil, err
 	}
+	return engineModels(ms), nil
+}
+
+func engineModels(ms []codex.Model) []engine.Model {
 	out := make([]engine.Model, 0, len(ms))
 	for _, m := range ms {
 		em := engine.Model{ID: m.ID, DisplayName: m.DisplayName, Default: m.IsDefault, Effort: m.DefaultEffort}
@@ -304,7 +316,7 @@ func (a *Agent) Models(ctx context.Context) ([]engine.Model, error) {
 		}
 		out = append(out, em)
 	}
-	return out, nil
+	return out
 }
 
 // Maintain reaps idle app-servers.

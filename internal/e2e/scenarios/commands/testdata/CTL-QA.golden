@@ -87,7 +87,7 @@
 
 == codex turns (per thread; threads by kind, directory and first prompt; turns in start order)
 -- thread <uuid:1> (work, cwd <root>/home)
-   turn effort=low: answered
+   turn model=gpt-5-codex effort=low: answered
    prompt| [codex-helper-control]
    prompt| <codex-helper-control-context version="1">
    prompt| You are handling an unrecognized message from the user's Microsoft Teams control chat for codex-helper.
@@ -239,7 +239,7 @@
    prompt|
    prompt| User message:
    prompt| what does E2E-CTLQA-ask-2 mean?
-   turn effort=low: answered
+   turn model=gpt-5-codex effort=low: answered
    prompt| [codex-helper-control]
    prompt| <codex-helper-control-context version="1">
    prompt| You are handling an unrecognized message from the user's Microsoft Teams control chat for codex-helper.
@@ -403,7 +403,7 @@
    prompt|
    prompt| User message:
    prompt| How do I start project work? E2E-CTLQA-plain-3
-   turn effort=low: cancelled
+   turn model=gpt-5-codex effort=low: cancelled
    prompt| [codex-helper-control]
    prompt| <codex-helper-control-context version="1">
    prompt| You are handling an unrecognized message from the user's Microsoft Teams control chat for codex-helper.
