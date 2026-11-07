@@ -22,6 +22,7 @@
 # amr, caf), the resample/tempo filters, and the WAV segment output. Nothing
 # GPL or nonfree, no network, no hardware or system libraries.
 set -euo pipefail
+trap 'echo "build-ffmpeg-audio.sh: line $LINENO failed: $BASH_COMMAND" >&2' ERR
 
 platform=${1:?usage: build-ffmpeg-audio.sh PLATFORM SRC STAGE_PARENT}
 src=$(cd "${2:?}" && pwd)
@@ -92,32 +93,24 @@ grep -q '^License: LGPL version 2.1 or later' "$work/configure.log" || {
   grep '^License' "$work/configure.log" >&2; echo "ffmpeg is not LGPL-only" >&2; exit 1; }
 
 echo "== building with $(command -v make) ($(make --version | head -1))"
-make -C "$work" -j "$JOBS" ffmpeg > "$work/build.log" 2>&1 || {
+# Name the target with its suffix: on Windows the program is ffmpeg.exe.
+make -C "$work" -j "$JOBS" "$exe" > "$work/build.log" 2>&1 || {
   grep -E -B2 -A10 'error|Error [0-9]' "$work/build.log" | head -120 >&2
   echo "== last lines of the build log" >&2; tail -40 "$work/build.log" >&2; exit 1; }
 
 out="$stage_parent/$name"
 rm -rf "$out"
 mkdir -p "$out"
+[[ -f "$work/$exe" ]] || { echo "make did not produce $exe:" >&2; ls -la "$work" >&2; exit 1; }
 cp "$work/$exe" "$out/$exe"
-strip "$out/$exe" 2>/dev/null || llvm-strip "$out/$exe"
+stripper=$(command -v strip || command -v llvm-strip) || { echo "no strip or llvm-strip" >&2; exit 1; }
+echo "== stripping with $stripper"
+"$stripper" "$out/$exe"
 if [[ "$platform" == macos-* ]]; then
   codesign --force --sign - "$out/$exe" # stripping drops the linker's ad-hoc signature
 fi
 cp "$src/LICENSE.md" "$out/LICENSE.md"
 cp "$src/COPYING.LGPLv2.1" "$out/COPYING.LGPLv2.1"
-
-# What internal/asr runs must be there; what it never needs must not be.
-"$out/$exe" -hide_banner -version > "$work/version.txt"
-"$out/$exe" -hide_banner -filters > "$work/filters.txt" 2>&1
-for f in atempo aresample; do
-  grep -qw "$f" "$work/filters.txt" || { echo "ffmpeg lacks the $f filter" >&2; exit 1; }
-done
-"$out/$exe" -hide_banner -L > "$work/license.txt"
-grep -q 'GNU Lesser General Public' "$work/license.txt" || { cat "$work/license.txt" >&2; exit 1; }
-if grep -Eq -- '--enable-(gpl|nonfree|version3)' "$work/version.txt"; then
-  echo "ffmpeg was configured with a non-LGPL-2.1 option" >&2; exit 1
-fi
 
 # Shared-library dependencies: only the OS's own.
 case "$platform" in
@@ -147,6 +140,18 @@ case "$platform" in
       esac
     done ;;
 esac
+
+# What internal/asr runs must be there; what it never needs must not be.
+"$out/$exe" -hide_banner -version > "$work/version.txt"
+"$out/$exe" -hide_banner -filters > "$work/filters.txt" 2>&1
+for f in atempo aresample; do
+  grep -qw "$f" "$work/filters.txt" || { echo "ffmpeg lacks the $f filter" >&2; exit 1; }
+done
+"$out/$exe" -hide_banner -L > "$work/license.txt"
+grep -q 'GNU Lesser General Public' "$work/license.txt" || { cat "$work/license.txt" >&2; exit 1; }
+if grep -Eq -- '--enable-(gpl|nonfree|version3)' "$work/version.txt"; then
+  echo "ffmpeg was configured with a non-LGPL-2.1 option" >&2; exit 1
+fi
 
 {
   echo "Audio-only build of FFmpeg for codex-helper voice transcription."
