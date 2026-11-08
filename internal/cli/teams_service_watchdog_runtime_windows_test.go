@@ -22,15 +22,15 @@ func TestTeamsServiceWatchdogRuntimeRefreshRecoversSharingViolation(t *testing.T
 				if err != nil {
 					t.Fatal(err)
 				}
-				// Hold DELETE access as pointer replacement does. Go readers do not
-				// share DELETE, so opening the pointer must fail until this closes.
-				h, err := windows.CreateFile(path, windows.DELETE, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
+				// An external exclusive reader must remain a real sharing error.
+				// The runtime pointer reader itself shares DELETE for activation.
+				h, err := windows.CreateFile(path, windows.GENERIC_READ, 0, nil, windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
 				if err != nil {
 					t.Fatal(err)
 				}
 				if _, readErr := helperruntime.ReadActive(root); !errors.Is(readErr, windows.ERROR_SHARING_VIOLATION) {
 					_ = windows.CloseHandle(h)
-					t.Fatalf("pointer replacement fixture did not produce a sharing violation: %v", readErr)
+					t.Fatalf("exclusive pointer fixture did not produce a sharing violation: %v", readErr)
 				}
 				return func() {
 					if err := windows.CloseHandle(h); err != nil {

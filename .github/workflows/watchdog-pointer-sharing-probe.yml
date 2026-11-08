@@ -1,0 +1,37 @@
+name: Native watchdog pointer sharing probe
+on:
+  push:
+    branches: [probe/watchdog-pointer-sharing]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.11'
+          cache: true
+      - name: Prove the old pointer reader blocks replacement
+        shell: python
+        run: |
+          import json, pathlib, subprocess, os
+          root = pathlib.Path.cwd()
+          tmp = pathlib.Path(os.environ['RUNNER_TEMP'])
+          old = tmp / 'old_pointer_reader.go'
+          old.write_text('package helperruntime\nimport "os"\nfunc openVersionPointerFile(path string)(*os.File,error){return os.Open(path)}\n')
+          overlay = tmp / 'old-reader-overlay.json'
+          overlay.write_text(json.dumps({'Replace':{str(root/'internal/helperruntime/open_pointer_windows.go'):str(old)}}))
+          r = subprocess.run(['go','test','-overlay',str(overlay),'./internal/helperruntime','-run','^TestVersionPointerReplacementWhileReaderOpen$','-count=1','-v'],capture_output=True,text=True)
+          (tmp/'old-reader-red.log').write_text(r.stdout+r.stderr)
+          print(r.stdout+r.stderr)
+          assert r.returncode != 0 and '--- FAIL: TestVersionPointerReplacementWhileReaderOpen' in r.stdout
+          print('OLD_READER_REPLACEMENT_FAILURE_PROVED')
+      - name: Runtime pointer reader regressions
+        shell: bash
+        run: go test ./internal/helperruntime -count=3 -v
+      - name: Native startup group repeated
+        shell: bash
+        run: go test ./internal/cli -run '^Test(TeamsCoreStore|FirstStart|TeamsServiceWatchdog|RunTeamsServiceWatchdog)' -count=3 -v
