@@ -2,7 +2,10 @@ import json
 import os
 from pathlib import Path
 import re
+import shlex
+import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -36,12 +39,20 @@ NAMES = [
 
 class StartupRecoveryGateTests(unittest.TestCase):
     def run_gate(self, mode, *, missing="", fail=False):
-        with tempfile.TemporaryDirectory() as tmp:
+        shell = shutil.which("bash")
+        if os.name == "nt":
+            # PowerShell may find WSL's bash.exe before Git Bash. Use the
+            # same native shell as Actions' shell: bash steps.
+            git = Path(shutil.which("git") or "")
+            shell = next((str(p / "bin/bash.exe") for p in git.parents
+                          if (p / "bin/bash.exe").is_file()), None)
+        self.assertIsNotNone(shell, "native Bash is required for the gate tests")
+        with tempfile.TemporaryDirectory(prefix="cxp recovery gate ") as tmp:
             tmp = Path(tmp)
             fake = tmp / "go"
+            fake_python = tmp / "fake_go.py"
             log = tmp / "calls.jsonl"
-            fake.write_text("""#!/usr/bin/env python3
-import json,os,sys
+            fake_python.write_text("""import json,os,sys
 with open(os.environ['CALL_LOG'],'a') as f:
     f.write(json.dumps(sys.argv[1:])+'\\n')
 if '-list' in sys.argv:
@@ -49,12 +60,18 @@ if '-list' in sys.argv:
     sys.exit(0)
 sys.exit(int(os.environ['FAIL_TEST']))
 """)
+            # Use this interpreter explicitly; Git Bash need not provide
+            # python3, and Windows does not execute Python shebangs itself.
+            fake.write_text("#!/usr/bin/env bash\nexec " +
+                            shlex.quote(Path(sys.executable).as_posix()) + " " +
+                            shlex.quote(fake_python.as_posix()) + ' "$@"\n',
+                            newline="\n")
             fake.chmod(0o700)
             env = os.environ.copy()
-            env.update(CXP_CI_GO_BIN=str(fake), CALL_LOG=str(log),
+            env.update(CXP_CI_GO_BIN=fake.as_posix(), CALL_LOG=str(log),
                        TEST_NAMES=json.dumps(NAMES), MISSING=missing,
                        FAIL_TEST="1" if fail else "0")
-            p = subprocess.run(["bash", str(SCRIPT), mode], cwd=ROOT, env=env,
+            p = subprocess.run([shell, SCRIPT.as_posix(), mode], cwd=ROOT, env=env,
                                capture_output=True, text=True)
             calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
             return p, calls
