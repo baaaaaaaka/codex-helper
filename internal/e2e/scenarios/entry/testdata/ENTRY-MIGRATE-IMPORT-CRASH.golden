@@ -1,0 +1,61 @@
+# ENTRY-MIGRATE-IMPORT-CRASH: a crash with a partially written conversion never publishes it; restart preserves the original chat and thread
+# cxp black-box transcript; volatile values are numbered placeholders
+
+== chat <chat:1> ""
+   type: group; members: owner
+-- <msg:1> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Keep the original conversation E2E-ENTRYMIGRATEIMPORTCRASH-after-import-crash-1</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>Keep the original conversation E2E-ENTRYMIGRATEIMPORTCRASH-after-import-crash-1</p>
+-- <msg:2> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+-- <msg:3> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>E2EANSWER-<n> answer for E2E-ENTRYMIGRATEIMPORTCRASH-after-import-crash-1</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5, effort - high, tier - standard</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+
+== chat <chat:2> ""
+   type: group; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Teams helper data converted from v0.1.22-rc.59</p>
+   | <p>Work chats: 1 (1 active, 0 parked, 0 closed). Past requests: 0.</p>
+   | <p>Local Codex sessions are caught up from now on.</p>
+   | <p>The previous data is kept unchanged as a backup. The full report is migration-report.txt next to the helper&#39;s store (<code>cxp teams status</code> shows where).</p>
+-- <msg:2> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
+   | <p><strong>✅ Codex finished</strong></p>
+   | <p><strong>Chat:</strong> one<br>
+   | <strong>Request:</strong> Keep the original conversation E2E-ENTRYMIGRATEIMPORTCRASH-after-import-crash-1</p>
+   | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
+   mention 0: owner "E2E Owner"
+
+== codex turns (per thread; threads by kind, directory and first prompt; turns in start order)
+-- thread <uuid:1> (work, cwd <root>/work)
+   turn model=gpt-5 effort=high: answered
+   prompt| User message:
+   prompt| Keep the original conversation E2E-ENTRYMIGRATEIMPORTCRASH-after-import-crash-1
+   prompt|
+   prompt| Teams helper safety:
+   prompt| - You are running inside a Codex turn launched by the Teams helper.
+   prompt| - The current Teams request is the `User message` section above. Treat earlier Teams requests in resumed Codex history as completed context, not as work to continue or answer, unless the current user explicitly asks about them.
+   prompt| - Do not restart, reload, kill, replace, or background the Teams helper process, binary, or service from this turn.
+   prompt| - If an installed helper needs to restart after an update or local repair, finish the answer and tell the user to send `helper restart now` in the Teams control chat.
+   prompt| - If the helper needs a release update, tell the user to send `helper update now`, or `helper update prerelease` only when they asked for prereleases.
+   prompt| - Subagent requests use native Codex subagents. For cross-machine agent delegation, use the cxp skill and its `cxp delegate` workflow when the task needs another signed-in Teams machine.
+   prompt|
+   prompt| Put fractions, sums, integrals, matrices, and display math in <m>TeX</m> on a separate line, never in prose, tables, or lists—even if asked for one line. Use backticks for simple inline/literal TeX. Never use $ or \(...\). Math markers are not artifacts.
+   prompt|
+   prompt| If you need to return generated files or images to the Teams user, write them under this local directory:
+   prompt| <root>/home/.local/state/codex-helper/teams/scopes/scope_rc59/core-files/outbound/cxp-fixture0-1
+   prompt|
+   prompt| Then include this fenced manifest in your final answer:
+   prompt| ```codex-helper-artifacts
+   prompt| {"version":1,"files":[{"path":"relative/path.ext","name":"display-name.ext"}]}
+   prompt| ```
+   prompt|
+   prompt| Use only relative manifest paths under that directory. Keep your normal answer visible; the helper will upload listed files separately when file-write auth is available.

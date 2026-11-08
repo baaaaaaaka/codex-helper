@@ -206,6 +206,10 @@ jobs:
           go-version: "1.25.11"
           cache: true
 
+      - name: Teams startup ownership regression gate
+        shell: bash
+        run: bash scripts/ci/test_teams_startup_recovery.sh unit
+
       - name: go test (with coverage)
         shell: bash
         run: |
@@ -267,12 +271,20 @@ jobs:
           # whole-repository race sweep runs in nightly.yml.
           go test -race -count=1 -timeout=15m -parallel=16 ./internal/core/... ./internal/channel/... 2>&1 | tee "$RUNNER_TEMP/race-core.log"
 
+      - name: Teams startup and watchdog race checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          go test -race -count=1 -timeout=5m ./internal/cli -run '^Test(TeamsCoreStore|FirstStart|TeamsServiceWatchdog|RunTeamsServiceWatchdog)' 2>&1 | tee "$RUNNER_TEMP/race-teams-startup.log"
+
       - name: Upload race diagnostics
         if: ${{ failure() }}
         uses: actions/upload-artifact@v4
         with:
           name: race-core-diagnostics
-          path: ${{ runner.temp }}/race-core.log
+          path: |
+            ${{ runner.temp }}/race-core.log
+            ${{ runner.temp }}/race-teams-startup.log
           if-no-files-found: ignore
 
   e2e:
@@ -296,6 +308,15 @@ jobs:
         with:
           go-version: "1.25.11"
           cache: true
+
+      - name: Repeat Teams migration and watchdog recovery contracts
+        if: matrix.shard == 0
+        shell: bash
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          bash scripts/ci/test_teams_startup_recovery.sh e2e 2>&1 | tee "$RUNNER_TEMP/startup-recovery-e2e.log"
 
       - name: Scenarios through the production entry point
         shell: bash
@@ -322,7 +343,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: e2e-diagnostics-${{ matrix.shard }}
-          path: ${{ runner.temp }}/e2e.log
+          path: |
+            ${{ runner.temp }}/e2e.log
+            ${{ runner.temp }}/startup-recovery-e2e.log
           if-no-files-found: ignore
 
   unit-windows-macos:
@@ -344,6 +367,11 @@ jobs:
         with:
           go-version: "1.25.11"
           cache: true
+
+      - name: Teams startup ownership regression gate (native OS)
+        if: matrix.partition == 0
+        shell: bash
+        run: bash scripts/ci/test_teams_startup_recovery.sh unit
 
       - name: go test
         shell: bash

@@ -21,7 +21,7 @@ func TestTeamsStopAndStartAreIdempotentAndRecorded(t *testing.T) {
 	state := t.TempDir()
 	t.Setenv(appdirs.EnvStateDir, state)
 	ctx := context.Background()
-	anchor, _, err := planTeamsCoreStore(state)
+	anchor, err := planTeamsCoreStore(state)
 	if err != nil {
 		t.Fatal(err)
 	}

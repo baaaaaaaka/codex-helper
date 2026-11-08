@@ -17,6 +17,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
 	"github.com/baaaaaaaka/codex-helper/internal/core/lease"
 	corestore "github.com/baaaaaaaka/codex-helper/internal/core/store"
+	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 )
 
 const (
@@ -140,11 +141,37 @@ func newTeamsServiceWatchdogCmd() *cobra.Command {
 	return cmd
 }
 
+// refreshTeamsServiceWatchdogRuntime keeps the long-lived watchdog on the
+// activated runtime before it interprets helper state. Re-enter the stable
+// launcher, reusing the ordinary restart contract and clearing runtime markers.
+func refreshTeamsServiceWatchdogRuntime() (bool, error) {
+	current, ok := helperruntime.Current()
+	if !ok {
+		return false, nil
+	}
+	active, err := helperruntime.ReadActive(current.Root)
+	if err != nil {
+		return false, fmt.Errorf("read watchdog runtime: %w", err)
+	}
+	if active == current.Version {
+		return false, nil
+	}
+	return true, restartSelf()
+}
+
 func runTeamsServiceWatchdogLoop(ctx context.Context, opts teamsServiceWatchdogOptions, interval time.Duration, quiet bool, out io.Writer, errOut io.Writer) error {
 	if interval <= 0 {
 		interval = teamsServiceExternalWatchdogInterval
 	}
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if !opts.DryRun {
+			if changed, err := refreshTeamsServiceWatchdogRuntime(); changed || err != nil {
+				return err
+			}
+		}
 		checkCtx, cancel := context.WithTimeout(ctx, teamsServiceExternalWatchdogCheckTimeout)
 		result, err := runTeamsServiceWatchdogOnce(checkCtx, opts)
 		cancel()

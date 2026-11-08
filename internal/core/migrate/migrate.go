@@ -44,6 +44,9 @@ type Options struct {
 	StaleUnsent time.Duration
 	// Now is the clock (defaults to time.Now).
 	Now func() time.Time
+	// Lease is optional ownership of the conversion. Check gates work and
+	// Verify fences publication; an offline `teams migrate` needs no lease.
+	Lease store.Lease
 
 	registry legacyRegistry
 }
@@ -63,6 +66,16 @@ const (
 // Run converts opt.Source. It returns the report even on failure when one
 // was produced.
 func Run(opt Options) (*Report, error) {
+	return RunContext(context.Background(), opt)
+}
+
+// RunContext converts the store without publishing an interrupted conversion.
+// Cancellation and loss of ownership are checked between conversion stages
+// and after the temporary database is closed, before it is published.
+func RunContext(ctx context.Context, opt Options) (*Report, error) {
+	if err := conversionCheck(ctx, opt.Lease, true); err != nil {
+		return nil, err
+	}
 	if opt.Now == nil {
 		opt.Now = time.Now
 	}
@@ -88,6 +101,16 @@ func Run(opt Options) (*Report, error) {
 		return nil, err
 	}
 	rep.Version = version
+	unlock, err := lockSource(opt.Source, !opt.DryRun)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	if err := conversionCheck(ctx, opt.Lease, false); err != nil {
+		return nil, err
+	}
+	// Inspect the destination while holding the source lock. A converter
+	// paused before taking the lock must not overwrite a completed successor.
 	if _, err := os.Stat(filepath.Join(opt.Source, MarkerName)); err == nil && !opt.DryRun {
 		return nil, fmt.Errorf("migrate: %s already migrated (%s exists)", opt.Source, MarkerName)
 	}
@@ -99,11 +122,6 @@ func Run(opt Options) (*Report, error) {
 	if _, err := os.Stat(final); err == nil {
 		return nil, fmt.Errorf("migrate: %s already exists", final)
 	}
-	unlock, err := lockSource(opt.Source, !opt.DryRun)
-	if err != nil {
-		return nil, err
-	}
-	defer unlock()
 	if !opt.DryRun {
 		if note := writeOldHelperGuard(opt.Source); note != "" {
 			rep.note("%s", note)
@@ -141,7 +159,7 @@ func Run(opt Options) (*Report, error) {
 		return nil, err
 	}
 	c := &converter{
-		l: l, rep: rep, opt: opt, now: now,
+		l: l, rep: rep, opt: opt, now: now, ctx: ctx,
 		sessions: map[string]*sessInfo{}, convByChat: map[string]int64{}, labelOf: map[int64]string{},
 		forkParent: map[string]string{}, holdChild: map[string]bool{}, polls: map[string]legacyPoll{},
 		turns: map[string]*compactTurn{}, extSeen: map[int64]map[string]bool{}, oldestIn: map[int64]int64{},
@@ -177,6 +195,9 @@ func Run(opt Options) (*Report, error) {
 	if err := syncFile(tmp); err != nil {
 		return rep, err
 	}
+	if err := conversionCheck(ctx, opt.Lease, true); err != nil {
+		return rep, err
+	}
 	if err := os.Rename(tmp, final); err != nil {
 		return rep, err
 	}
@@ -188,6 +209,19 @@ func Run(opt Options) (*Report, error) {
 		}
 	}
 	return rep, nil
+}
+
+func conversionCheck(ctx context.Context, owner store.Lease, publish bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if owner == nil {
+		return nil
+	}
+	if publish {
+		return owner.Verify()
+	}
+	return owner.Check()
 }
 
 func writeReport(path string, rep *Report) error {

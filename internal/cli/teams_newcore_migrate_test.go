@@ -90,9 +90,9 @@ func TestFirstStartConvertsOldStore(t *testing.T) {
 			past := time.Now().Add(-90 * 24 * time.Hour)
 			_ = os.Chtimes(filepath.Join(old, "state.json"), past, past)
 
-			path, from, err := planTeamsCoreStore(root)
-			if err != nil || from != scope || path != filepath.Join(scope, migrate.TargetName) {
-				t.Fatalf("plan = %q from %q, %v", path, from, err)
+			path, err := planTeamsCoreStore(root)
+			if err != nil || path != filepath.Join(scope, migrate.TargetName) {
+				t.Fatalf("plan = %q, %v", path, err)
 			}
 			if _, err := resolveTeamsCoreStorePath(root); err == nil || !strings.Contains(err.Error(), "converts it when it starts") {
 				t.Fatalf("read-only commands before the conversion: %v", err)
@@ -100,7 +100,7 @@ func TestFirstStartConvertsOldStore(t *testing.T) {
 			before := dirHashes(t, scope)
 
 			var log strings.Builder
-			if err := migrateTeamsStoreAtStart(context.Background(), from, t.TempDir(), &log); err != nil {
+			if err := migrateTeamsStoreAtStart(context.Background(), scope, nil, t.TempDir(), &log); err != nil {
 				t.Fatalf("convert: %v\n%s", err, log.String())
 			}
 			after := dirHashes(t, scope)
@@ -158,10 +158,10 @@ func TestFirstStartConvertsOldStore(t *testing.T) {
 				t.Errorf("summary shows a path:\n%s", summary)
 			}
 
-			if got, from, err := planTeamsCoreStore(root); err != nil || from != "" || got != path {
-				t.Fatalf("second start plan = %q from %q, %v", got, from, err)
+			if got, err := planTeamsCoreStore(root); err != nil || got != path {
+				t.Fatalf("second start plan = %q, %v", got, err)
 			}
-			if err := migrateTeamsStoreAtStart(context.Background(), scope, t.TempDir(), io.Discard); err != nil {
+			if err := migrateTeamsStoreAtStart(context.Background(), scope, nil, t.TempDir(), io.Discard); err != nil {
 				t.Fatalf("a second conversion attempt is a no-op: %v", err)
 			}
 		})
@@ -176,7 +176,7 @@ func TestFirstStartRefusesAmbiguousOldStores(t *testing.T) {
 		writeFile(t, filepath.Join(root, "teams", "scopes", "scope_new", "state.json"), `{"schema_version":8}`)
 		future := time.Now().Add(time.Hour)
 		_ = os.Chtimes(filepath.Join(root, "teams", "scopes", "scope_new", "state.json"), future, future)
-		if _, _, err := planTeamsCoreStore(root); err == nil || !strings.Contains(err.Error(), "used more recently") {
+		if _, err := planTeamsCoreStore(root); err == nil || !strings.Contains(err.Error(), "used more recently") {
 			t.Fatalf("err = %v", err)
 		}
 	})
@@ -187,7 +187,7 @@ func TestFirstStartRefusesAmbiguousOldStores(t *testing.T) {
 			t.Fatal(err)
 		}
 		writeFile(t, filepath.Join(root, "teams", "scopes", "scope_b", "state.json"), string(raw))
-		if _, _, err := planTeamsCoreStore(root); err == nil || !strings.Contains(err.Error(), "cxp teams migrate --source") {
+		if _, err := planTeamsCoreStore(root); err == nil || !strings.Contains(err.Error(), "cxp teams migrate --source") {
 			t.Fatalf("err = %v", err)
 		}
 	})
@@ -208,7 +208,7 @@ func TestFirstStartConversionFailureBacksOff(t *testing.T) {
 	defer cancel()
 	var log strings.Builder
 	start := time.Now()
-	err := migrateTeamsStoreAtStart(ctx, scope, "", &log)
+	err := migrateTeamsStoreAtStart(ctx, scope, nil, "", &log)
 	if err == nil {
 		t.Fatal("conversion of a broken store succeeded")
 	}

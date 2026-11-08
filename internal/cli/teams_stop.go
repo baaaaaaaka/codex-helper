@@ -35,7 +35,7 @@ func teamsStopDir() (anchor string, err error) {
 	if err != nil {
 		return "", fmt.Errorf("state directory: %w", err)
 	}
-	anchor, _, err = planTeamsCoreStore(stateDir)
+	anchor, err = planTeamsCoreStore(stateDir)
 	if err != nil {
 		return "", err
 	}
@@ -60,7 +60,7 @@ func teamsStoppedLine() string {
 	if err != nil {
 		return ""
 	}
-	anchor, _, err := planTeamsCoreStore(stateDir)
+	anchor, err := planTeamsCoreStore(stateDir)
 	if err != nil {
 		return ""
 	}

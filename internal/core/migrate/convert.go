@@ -1,6 +1,7 @@
 package migrate
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -80,6 +81,7 @@ type compactTurn struct {
 }
 
 type converter struct {
+	ctx context.Context
 	l   *legacy
 	im  *store.Importer
 	rep *Report
@@ -168,6 +170,9 @@ func (c *converter) run() error {
 		{"meta", c.convertMeta},
 	}
 	for _, st := range steps {
+		if err := conversionCheck(c.ctx, c.opt.Lease, false); err != nil {
+			return err
+		}
 		if err := st.fn(); err != nil {
 			return fmt.Errorf("%s: %w", st.name, err)
 		}

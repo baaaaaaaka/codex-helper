@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strings"
 	"syscall"
@@ -82,126 +81,6 @@ func teamsNewCoreChannelConfig(client *http.Client, authCfg chteams.AuthConfig) 
 	return chteams.Config{HTTP: client, Tokens: chteams.NewDelegatedAuth(authCfg, client), TenantID: authCfg.TenantID,
 		SharePointHosts: chteams.SharePointHostsFromEnv(os.Getenv("CODEX_HELPER_TEAMS_ALLOWED_SHAREPOINT_HOSTS")),
 		Math:            &chteams.NodeMath{}}
-}
-
-var migratedMarkerRE = regexp.MustCompile(`^migrated to (.+) at \S+ by cxp teams migrate`)
-
-// errTeamsStoreNotConverted: the store under the state root is from an
-// earlier helper version and is converted when the helper next starts.
-type errTeamsStoreNotConverted struct{ source string }
-
-func (e errTeamsStoreNotConverted) Error() string {
-	return fmt.Sprintf("the Teams store at %s is from an earlier helper version; the helper converts it when it starts (`cxp teams run` or the background service)", e.source)
-}
-
-// resolveTeamsCoreStorePath finds the core.sqlite the helper runs on, for
-// commands that only read or configure it: a store still to be converted
-// is an errTeamsStoreNotConverted.
-func resolveTeamsCoreStorePath(stateDir string) (string, error) {
-	path, from, err := planTeamsCoreStore(stateDir)
-	if err == nil && from != "" {
-		return "", errTeamsStoreNotConverted{source: from}
-	}
-	return path, err
-}
-
-// planTeamsCoreStore finds the core.sqlite to run on under the state root.
-// migrateFrom is set when no converted store exists yet and a single
-// supported older store (v0.1.20 or rc.59) does: the helper converts it
-// at its first start into path (next to it). Stores of an intermediate
-// release, or several candidates, are refused with what to do.
-func planTeamsCoreStore(stateDir string) (path, migrateFrom string, err error) {
-	if p := strings.TrimSpace(os.Getenv(envTeamsCoreStore)); p != "" {
-		p, err := filepath.Abs(p)
-		return p, "", err
-	}
-	exists := func(p string) bool { _, err := os.Stat(p); return err == nil }
-	var found []string
-	add := func(p string) {
-		for _, f := range found {
-			if f == p {
-				return
-			}
-		}
-		found = append(found, p)
-	}
-	for _, dir := range migrate.Candidates(stateDir) {
-		// A lease file means the store is managed there even while the
-		// file in use has another name (a takeover's copy).
-		if p := filepath.Join(dir, migrate.TargetName); exists(p) || exists(lease.Path(p)) {
-			add(p)
-			continue
-		}
-		raw, err := os.ReadFile(filepath.Join(dir, migrate.MarkerName))
-		if err != nil {
-			continue
-		}
-		// Migrated with --out elsewhere: the marker names the target.
-		if m := migratedMarkerRE.FindStringSubmatch(strings.TrimSpace(string(raw))); m != nil && exists(m[1]) {
-			add(m[1])
-		}
-	}
-	fresh := filepath.Join(stateDir, "teams", migrate.TargetName)
-	if exists(fresh) || exists(lease.Path(fresh)) {
-		add(fresh)
-	}
-	switch {
-	case len(found) == 1:
-		return found[0], "", nil
-	case len(found) > 1:
-		return "", "", fmt.Errorf("several Teams core stores exist (%s); set %s to the one to use", strings.Join(found, ", "), envTeamsCoreStore)
-	}
-	src, err := migrate.ChooseSource(migrate.Pending(stateDir))
-	if err != nil {
-		return "", "", err
-	}
-	if src != "" {
-		return filepath.Join(src, migrate.TargetName), src, nil
-	}
-	return fresh, "", nil
-}
-
-// teamsMigrateRetry is the first wait after a failed conversion at start;
-// it doubles up to teamsMigrateRetryMax. The helper waits in-process so a
-// failing conversion of a large store is never repeated at the service
-// manager's restart rate.
-var (
-	teamsMigrateRetry    = 30 * time.Second
-	teamsMigrateRetryMax = 30 * time.Minute
-)
-
-// migrateTeamsStoreAtStart converts the older store at src into
-// src/core.sqlite (read-only on the old store, which stays as the backup;
-// the result is renamed into place only when complete). The conversion
-// leaves a summary in the new store that the engine posts once.
-func migrateTeamsStoreAtStart(ctx context.Context, src, sessionsDir string, log io.Writer) error {
-	wait := teamsMigrateRetry
-	for {
-		if _, err := os.Stat(filepath.Join(src, migrate.TargetName)); err == nil {
-			return nil // converted meanwhile (another start, or `cxp teams migrate`)
-		}
-		_, _ = fmt.Fprintf(log, "Converting the Teams store at %s (first start of this version; the old store is kept unchanged)\n", src)
-		started := time.Now()
-		rep, err := migrate.Run(migrate.Options{Source: src, CodexSessions: sessionsDir, CountBacklog: true})
-		if err == nil {
-			_, _ = fmt.Fprintf(log, "Teams store converted in %s; report: %s\n", time.Since(started).Round(time.Second), filepath.Join(src, migrate.ReportName))
-			return nil
-		}
-		if rep != nil {
-			err = fmt.Errorf("%w (report: %s)", err, filepath.Join(src, migrate.ReportName))
-		}
-		_, _ = fmt.Fprintf(log, "Teams store conversion failed: %v; retrying in %s\n", err, wait)
-		t := time.NewTimer(wait)
-		select {
-		case <-ctx.Done():
-			t.Stop()
-			return err
-		case <-t.C:
-		}
-		if wait *= 2; wait > teamsMigrateRetryMax {
-			wait = teamsMigrateRetryMax
-		}
-	}
 }
 
 // teamsNewCoreWorkflowURL reads the Workflow (owner card) webhook from the
@@ -278,7 +157,7 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 	if err != nil {
 		return err
 	}
-	path, migrateFrom, err := planTeamsCoreStore(stateDir)
+	path, err := planTeamsCoreStore(stateDir)
 	if err != nil {
 		return err
 	}
@@ -300,7 +179,7 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 		}
 	}
 	for {
-		err := serveTeamsNewCore(ctx, out, errOut, root, opts, seam, cfgStore, paths, path, migrateFrom, host)
+		err := serveTeamsNewCore(ctx, out, errOut, root, opts, seam, cfgStore, paths, path, host)
 		var stopped errTeamsStoppedEverywhereNow
 		if !opts.managedServiceChild || !errors.As(err, &stopped) || ctx.Err() != nil {
 			return err
@@ -382,7 +261,7 @@ func errTeamsDisabledAtStart(path string) error {
 
 // serveTeamsNewCore takes the store and serves until stopped.
 func serveTeamsNewCore(ctx context.Context, out, errOut io.Writer, root *rootOptions, opts teamsNewCoreOptions, seam *teamsTestSeam,
-	cfgStore *config.Store, paths effectivePaths, path, migrateFrom, host string) error {
+	cfgStore *config.Store, paths effectivePaths, path, host string) error {
 	dir := filepath.Dir(path)
 	// The lease decides which host owns the store; nothing opens the store
 	// with SQLite before it is held (teams_lease.go).
@@ -398,38 +277,40 @@ func serveTeamsNewCore(ctx context.Context, out, errOut io.Writer, root *rootOpt
 		return fmt.Errorf("acquire Teams core store: %w", err)
 	}
 	defer holder.Release() // after the store is closed (deferred below)
+	runCtx, cancelRun := context.WithCancel(ctx)
+	defer cancelRun()
+	go func() {
+		// Superseded or disabled: stop serving, close the store, exit.
+		select {
+		case <-holder.Lost():
+			cancelRun()
+		case <-runCtx.Done():
+		}
+	}()
 	plan := holder.Plan()
 	if plan.Quiet {
 		_, _ = fmt.Fprintf(errOut, "Teams helper taking over generation %d from %s (%s); waiting %s for it to stop\n",
 			plan.Gen, firstNonEmptyString(plan.From.Host, "an unfinished takeover"), plan.Why, teamsLeaseTiming(seam).Quiet)
 	}
-	if err := holder.WaitQuiet(ctx); err != nil {
+	if err := holder.WaitQuiet(runCtx); err != nil {
 		if ctx.Err() != nil {
 			return nil
 		}
 		return teamsLeaseLostError(err, anchor)
 	}
-	switch {
-	case !plan.InPlace:
-		_, _ = fmt.Fprintf(errOut, "Teams helper copying the store %s to %s\n", plan.Src, plan.DB)
-		if err := corestore.CopySnapshot(plan.Src, plan.DB); err != nil {
-			return fmt.Errorf("take over the Teams core store: %w", err)
-		}
-	case migrateFrom != "" && plan.FromGen == 0:
-		if err := migrateTeamsStoreAtStart(ctx, migrateFrom, filepath.Join(paths.CodexDir, "sessions"), errOut); err != nil {
-			return err
-		}
-	}
-	if err := holder.Activate(); err != nil {
-		return teamsLeaseLostError(err, anchor)
-	}
 	path = plan.DB
-	st, err := corestore.OpenWith(path, corestore.Options{Lease: holder})
+	st, err := openTeamsCoreStore(runCtx, holder, filepath.Join(paths.CodexDir, "sessions"), errOut)
 	if err != nil {
-		return fmt.Errorf("open Teams core store: %w", err)
+		if lerr := holder.Err(); lerr != nil && ctx.Err() == nil {
+			return teamsLeaseLostError(lerr, anchor)
+		}
+		if ctx.Err() != nil {
+			return nil
+		}
+		return err
 	}
 	defer st.Close()
-	if err := teamsAcquireOrWait(ctx, func() error {
+	if err := teamsAcquireOrWait(runCtx, func() error {
 		_, err := st.Acquire(corestore.Ident{Host: host, PID: os.Getpid(), BootID: teamsBootID()})
 		return err
 	}, opts.managedServiceChild, errOut); err != nil {
@@ -444,7 +325,7 @@ func serveTeamsNewCore(ctx context.Context, out, errOut io.Writer, root *rootOpt
 	defer st.Release()
 
 	// Graph: the real adapter with the delegated token cache.
-	graphLease, err := newTeamsGraphHTTPClientLease(ctx, root, errOut)
+	graphLease, err := newTeamsGraphHTTPClientLease(runCtx, root, errOut)
 	if err != nil {
 		return err
 	}
@@ -476,7 +357,7 @@ func serveTeamsNewCore(ctx context.Context, out, errOut io.Writer, root *rootOpt
 		return err
 	}
 	server.Args = append(server.Args, extra...)
-	launch, err := newTeamsNewCoreCodexLaunch(ctx, root, codexBin, errOut)
+	launch, err := newTeamsNewCoreCodexLaunch(runCtx, root, codexBin, errOut)
 	if err != nil {
 		return err
 	}
@@ -562,16 +443,6 @@ func serveTeamsNewCore(ctx context.Context, out, errOut io.Writer, root *rootOpt
 		return err
 	}
 	_, _ = fmt.Fprintf(out, "Teams helper (new core) running on %s\n", path)
-	runCtx, cancelRun := context.WithCancel(ctx)
-	defer cancelRun()
-	go func() {
-		// Superseded or disabled: stop serving, close the store, exit.
-		select {
-		case <-holder.Lost():
-			cancelRun()
-		case <-runCtx.Done():
-		}
-	}()
 	// The state read-only commands show (`cxp teams status`, `teams
 	// control`, the bootstrap, upgrades): they never open the store while
 	// this helper holds it.

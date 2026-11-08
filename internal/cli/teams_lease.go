@@ -224,7 +224,7 @@ func teamsWithLeasedStore(ctx context.Context, anchor string, fn func(*corestore
 func teamsLeaseLostError(err error, anchor string) error {
 	switch {
 	case errors.Is(err, lease.ErrFenced):
-		return fmt.Errorf("Teams helper fenced: another helper took over the Teams state (%v); stopped", err)
+		return fmt.Errorf("Teams helper fenced: another helper took over the Teams state (%w); stopped", err)
 	}
 	return err
 }

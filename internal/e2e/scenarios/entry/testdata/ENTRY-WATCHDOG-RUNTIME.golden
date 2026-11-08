@@ -1,0 +1,2 @@
+# ENTRY-WATCHDOG-RUNTIME: a running watchdog follows runtime activation and rollback through the stable launcher, preserving its PID
+# cxp black-box transcript; volatile values are numbered placeholders
