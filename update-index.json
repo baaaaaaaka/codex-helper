@@ -1,6 +1,47 @@
 {
-  "generated_at": "2026-11-08T11:28:57Z",
+  "generated_at": "2026-11-08T13:43:28Z",
   "releases": [
+    {
+      "assets": [
+        {
+          "name": "README.md"
+        },
+        {
+          "name": "checksums.txt"
+        },
+        {
+          "name": "codex-proxy_0.1.22-rc.81_darwin_amd64"
+        },
+        {
+          "name": "codex-proxy_0.1.22-rc.81_darwin_arm64"
+        },
+        {
+          "name": "codex-proxy_0.1.22-rc.81_linux_amd64"
+        },
+        {
+          "name": "codex-proxy_0.1.22-rc.81_windows_amd64.exe"
+        },
+        {
+          "name": "install.ps1"
+        },
+        {
+          "name": "install.sh"
+        },
+        {
+          "name": "teams-auth-bootstrap.ps1"
+        },
+        {
+          "name": "teams-auth-bootstrap.sh"
+        }
+      ],
+      "draft": false,
+      "name": "v0.1.22-rc.81",
+      "prerelease": true,
+      "priority": "p2",
+      "published_at": "2026-11-08T13:37:16Z",
+      "tag_name": "v0.1.22-rc.81",
+      "version": "0.1.22-rc.81"
+    },
     {
       "assets": [
         {
@@ -4059,47 +4100,6 @@
       "published_at": "2026-07-17T17:34:46Z",
       "tag_name": "v0.1.14-rc.27",
       "version": "0.1.14-rc.27"
-    },
-    {
-      "assets": [
-        {
-          "name": "README.md"
-        },
-        {
-          "name": "checksums.txt"
-        },
-        {
-          "name": "codex-proxy_0.1.14-rc.26_darwin_amd64"
-        },
-        {
-          "name": "codex-proxy_0.1.14-rc.26_darwin_arm64"
-        },
-        {
-          "name": "codex-proxy_0.1.14-rc.26_linux_amd64"
-        },
-        {
-          "name": "codex-proxy_0.1.14-rc.26_windows_amd64.exe"
-        },
-        {
-          "name": "install.ps1"
-        },
-        {
-          "name": "install.sh"
-        },
-        {
-          "name": "teams-auth-bootstrap.ps1"
-        },
-        {
-          "name": "teams-auth-bootstrap.sh"
-        }
-      ],
-      "draft": false,
-      "name": "v0.1.14-rc.26 \u2014 external model catalogs and fail-closed routes",
-      "prerelease": true,
-      "priority": "p2",
-      "published_at": "2026-07-15T19:24:32Z",
-      "tag_name": "v0.1.14-rc.26",
-      "version": "0.1.14-rc.26"
     }
   ],
   "repo": "baaaaaaaka/codex-helper",
