@@ -178,7 +178,9 @@ func TestTranscriptProgressOver100OrderedUnderThrottleAndInGroup(t *testing.T) {
 	r.e.convs[conv].group = true
 	r.e.mu.Unlock()
 	r.ch.PostUser(work, "@codex progress integrity")
-	r.wait("complete answer", func() bool { return len(r.own(work, "ANSWER to")) == 1 })
+	// Keep the production write budget. A race-instrumented CI worker may
+	// publish smaller batches while the reader and sender share its CPUs.
+	r.waitFor("complete answer", time.Minute, func() bool { return len(r.own(work, "ANSWER to")) == 1 })
 	var all strings.Builder
 	for _, m := range r.ch.Messages(work) {
 		if m.Marker != "" {
@@ -648,7 +650,10 @@ func testTranscriptBackpressure(t *testing.T, unknown bool) {
 			t.Fatal(err)
 		}
 	}
-	r.waitFor("all unread progress and final delivered", 20*time.Second, func() bool { return len(r.own(work, "ANSWER to")) == 1 })
+	// At the default account pace, even 63 full batches need about 18 s.
+	// Allow the reader, SQLite race instrumentation, and concurrent rigs to
+	// share the worker without changing the production pace or assertions.
+	r.waitFor("all unread progress and final delivered", 90*time.Second, func() bool { return len(r.own(work, "ANSWER to")) == 1 })
 	var all strings.Builder
 	for _, m := range r.ch.Messages(work) {
 		if m.Marker != "" {
