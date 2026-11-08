@@ -100,7 +100,13 @@ func TestTeamsServiceWatchdogRuntimeProcessUpgradeAndRollback(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := helperruntime.Activate(root, "v9.9.0"); err != nil {
+	// Installer transitions hold the root lock; watchdog reads remain lock-free.
+	activate := func(version string) error {
+		return helperruntime.WithRootLock(t.Context(), root, func() error {
+			return helperruntime.Activate(root, version)
+		})
+	}
+	if err := activate("v9.9.0"); err != nil {
 		t.Fatal(err)
 	}
 	log, err := os.Create(filepath.Join(dir, "output.log"))
@@ -167,7 +173,7 @@ func TestTeamsServiceWatchdogRuntimeProcessUpgradeAndRollback(t *testing.T) {
 	}()
 	start := 0
 	for _, version := range []string{"v9.9.0", "v9.9.1", "v9.9.0"} {
-		if err := helperruntime.Activate(root, version); err != nil {
+		if err := activate(version); err != nil {
 			t.Fatal(err)
 		}
 		deadline := time.Now().Add(15 * time.Second)

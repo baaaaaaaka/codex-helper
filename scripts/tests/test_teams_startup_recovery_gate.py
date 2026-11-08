@@ -12,6 +12,8 @@ from test_ci_targeted_shards import job_block, RELEASE_WORKFLOW, WORKFLOW
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts/ci/test_teams_startup_recovery.sh"
 NAMES = [
+    "TestVersionPointerReplacementWhileReaderOpen",
+    "TestVersionPointerReadsLongPath",
     "TestConversionOwnershipAtEveryCheckpoint",
     "TestConversionCanceledBeforeStartCreatesNothing",
     "TestTeamsCoreStoreDoesNotWriteAfterLeaseLoss",
@@ -57,11 +59,11 @@ sys.exit(int(os.environ['FAIL_TEST']))
             calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
             return p, calls
 
-    def test_native_unit_packages_are_both_run(self):
+    def test_native_unit_packages_are_all_run(self):
         p, calls = self.run_gate("unit")
         self.assertEqual(p.returncode, 0, p.stderr)
         executed = [c for c in calls if "-run" in c]
-        self.assertEqual([c[1] for c in executed], ["./internal/core/migrate", "./internal/cli"])
+        self.assertEqual([c[1] for c in executed], ["./internal/helperruntime", "./internal/core/migrate", "./internal/cli"])
         self.assertTrue(all("-count=1" in c for c in executed))
 
     def test_e2e_contracts_are_repeated(self):
@@ -102,8 +104,9 @@ sys.exit(int(os.environ['FAIL_TEST']))
         race = job_block(WORKFLOW, "race-core")
         patterns = re.findall(r"go test -race[^\n]+-run '([^']+)'", race)
         self.assertTrue(patterns, "startup CLI race step is missing")
+        self.assertIn("./internal/helperruntime -run '^TestVersionPointer'", race)
         for name in NAMES:
-            if name.startswith(("TestTeams", "TestFirstStart")):
+            if name.startswith(("TestTeams", "TestFirstStart", "TestVersionPointer")):
                 with self.subTest(name=name):
                     self.assertTrue(any(re.search(pattern, name) for pattern in patterns))
 

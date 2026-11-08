@@ -24,6 +24,7 @@ run_tests() {
 
 case "$mode" in
   unit)
+    run_tests ./internal/helperruntime '^TestVersionPointer' 'TestVersionPointerReplacementWhileReaderOpen,TestVersionPointerReadsLongPath' 1
     run_tests ./internal/core/migrate '^TestConversion' 'TestConversionOwnershipAtEveryCheckpoint,TestConversionCanceledBeforeStartCreatesNothing' 1
     run_tests ./internal/cli '^Test(TeamsCoreStore|FirstStart|TeamsServiceWatchdog|RunTeamsServiceWatchdog)' 'TestTeamsCoreStoreDoesNotWriteAfterLeaseLoss,TestTeamsCoreStoreLossAfterPreparationStarts,TestTeamsCoreStoreResumesMigrationAfterAbortedStart,TestTeamsCoreStorePreparationAfterMigrationBeforeActivation,TestTeamsServiceWatchdogRefreshesRuntimeBeforeHealthCheck,TestTeamsServiceWatchdogRuntimeRefreshErrorsDoNotStopLoop,TestTeamsServiceWatchdogRuntimeRestartErrorsDoNotStopLoop,TestTeamsServiceWatchdogRuntimeProcessUpgradeAndRollback' 1
     ;;

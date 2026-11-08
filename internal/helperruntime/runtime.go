@@ -266,7 +266,12 @@ func ReadPrevious(root string) (string, error) {
 }
 
 func readVersionPointer(root string, name string) (string, error) {
-	raw, err := os.ReadFile(filepath.Join(filepath.Clean(root), name))
+	file, err := openVersionPointerFile(filepath.Join(filepath.Clean(root), name))
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	raw, err := io.ReadAll(file)
 	if err != nil {
 		return "", err
 	}

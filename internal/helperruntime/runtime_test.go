@@ -3,10 +3,12 @@ package helperruntime
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -415,5 +417,72 @@ func writeExecutable(t *testing.T, path string, body string) {
 	}
 	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestVersionPointerReplacementWhileReaderOpen(t *testing.T) {
+	for _, name := range []string{"active", "previous"} {
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			current := "v1.2.3"
+			if err := writeVersionPointer(root, name, current); err != nil {
+				t.Fatal(err)
+			}
+			for i := 0; i < 10; i++ {
+				reader, err := openVersionPointerFile(filepath.Join(root, name))
+				if err != nil {
+					t.Fatal(err)
+				}
+				next := "v1.2.4"
+				if current == next {
+					next = "v1.2.3"
+				}
+				err = writeVersionPointer(root, name, next)
+				raw, readErr := io.ReadAll(reader)
+				closeErr := reader.Close()
+				if err != nil {
+					t.Fatalf("replace %s while reader remains open: %v", name, err)
+				}
+				if readErr != nil || closeErr != nil || string(raw) != current+"\n" {
+					t.Fatalf("old reader: %q read=%v close=%v", raw, readErr, closeErr)
+				}
+				selected, err := readVersionPointer(root, name)
+				if err != nil || selected != next {
+					t.Fatalf("new reader: %q %v; want %s", selected, err, next)
+				}
+				current = next
+			}
+		})
+	}
+}
+
+func TestVersionPointerReadsLongPath(t *testing.T) {
+	root := t.TempDir()
+	for len(root) < 320 {
+		root = filepath.Join(root, strings.Repeat("runtime-", 8))
+	}
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "active"), []byte("v1.2.3\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ReadActive(root); err != nil || got != "v1.2.3" {
+		t.Fatalf("long pointer: %q %v", got, err)
+	}
+}
+
+func BenchmarkReadVersionPointer(b *testing.B) {
+	root := b.TempDir()
+	const version = "v0.1.22-rc.75"
+	if err := os.WriteFile(filepath.Join(root, "active"), []byte(version+"\n"), 0o600); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if got, err := ReadActive(root); err != nil || got != version {
+			b.Fatalf("pointer %q %v", got, err)
+		}
 	}
 }

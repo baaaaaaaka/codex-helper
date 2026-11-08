@@ -4,20 +4,24 @@ package helperruntime
 
 import (
 	"fmt"
-
-	"golang.org/x/sys/windows"
+	"os"
+	"path/filepath"
 )
 
 func replaceActiveFile(from string, to string) error {
-	fromPtr, err := windows.UTF16PtrFromString(from)
+	dir := filepath.Dir(from)
+	name, err := filepath.Rel(dir, to)
 	if err != nil {
 		return err
 	}
-	toPtr, err := windows.UTF16PtrFromString(to)
+	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return err
 	}
-	if err := windows.MoveFileEx(fromPtr, toPtr, windows.MOVEFILE_REPLACE_EXISTING|windows.MOVEFILE_WRITE_THROUGH); err != nil {
+	defer root.Close()
+	// Root.Rename uses Windows POSIX replacement semantics, so a reader that
+	// shares delete access can keep reading the old file after activation.
+	if err := root.Rename(filepath.Base(from), name); err != nil {
 		return fmt.Errorf("replace active runtime pointer: %w", err)
 	}
 	return nil
