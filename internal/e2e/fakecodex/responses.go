@@ -44,12 +44,24 @@ type ResponsesRequest struct {
 type Responses struct {
 	ts *httptest.Server
 
-	mu      sync.Mutex
-	reqs    []*ResponsesRequest
-	holds   map[string]chan struct{}
-	started map[string]chan struct{}
-	answers map[string]string
-	respSeq int
+	mu       sync.Mutex
+	reqs     []*ResponsesRequest
+	holds    map[string]chan struct{}
+	started  map[string]chan struct{}
+	answers  map[string]string
+	respSeq  int
+	toolOnce *responseToolCall
+}
+
+type responseToolCall struct{ name, args string }
+
+// ToolOnce makes the next offline model response call a native tool. Native
+// contract tests then exercise Codex's own question events and response parser.
+func (r *Responses) ToolOnce(name string, args any) {
+	raw, _ := json.Marshal(args)
+	r.mu.Lock()
+	r.toolOnce = &responseToolCall{name, string(raw)}
+	r.mu.Unlock()
 }
 
 // NewResponses starts the fake on a loopback port.
@@ -132,6 +144,8 @@ func (r *Responses) serve(w http.ResponseWriter, req *http.Request) {
 	r.reqs = append(r.reqs, rec)
 	r.respSeq++
 	respID := fmt.Sprintf("resp_probe_%d", r.respSeq)
+	tool := r.toolOnce
+	r.toolOnce = nil
 	r.mu.Unlock()
 	set := func(f func()) { r.mu.Lock(); f(); r.mu.Unlock() }
 
@@ -182,6 +196,14 @@ func (r *Responses) serve(w http.ResponseWriter, req *http.Request) {
 		return true
 	}
 	send(map[string]any{"type": "response.created", "response": map[string]any{"id": respID}})
+	if tool != nil {
+		item := map[string]any{"type": "function_call", "id": "fc_" + respID, "call_id": "call_" + respID, "name": tool.name, "arguments": tool.args, "status": "completed"}
+		send(map[string]any{"type": "response.output_item.added", "output_index": 0, "item": item})
+		send(map[string]any{"type": "response.output_item.done", "output_index": 0, "item": item})
+		send(map[string]any{"type": "response.completed", "response": map[string]any{"id": respID, "status": "completed", "usage": map[string]any{"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}}})
+		set(func() { rec.Finished = true })
+		return
+	}
 
 	if marker == "failed-event" {
 		send(map[string]any{"type": "response.failed", "response": map[string]any{
@@ -293,7 +315,7 @@ func lastUserText(body []byte) string {
 			}
 			// Codex injects environment context as user messages too; skip
 			// those.
-			if t := b.String(); !strings.HasPrefix(strings.TrimSpace(t), "<") {
+			if t := b.String(); !strings.HasPrefix(strings.TrimSpace(t), "<") || strings.HasPrefix(strings.TrimSpace(t), "<send_user_message_question_reply>") {
 				return t
 			}
 			continue

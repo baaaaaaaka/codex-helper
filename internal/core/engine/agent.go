@@ -3,7 +3,28 @@ package engine
 import (
 	"context"
 	"errors"
+
+	"github.com/baaaaaaaka/codex-helper/internal/core/store"
 )
+
+// QuestionAgent delivers native requests and message events from every loaded
+// thread, including turns initiated by an attached TUI.
+type QuestionAgent interface {
+	SetQuestionHandler(func(QuestionEvent) error)
+	AnswerQuestions(context.Context, string, map[string][]string) error
+	QuestionPending(string) bool
+}
+
+type QuestionEvent struct {
+	Group            store.QuestionGroup
+	Resolved         string
+	ThreadID, TurnID string
+	Interrupted      bool
+	Finished         bool
+	Answered         []string
+}
+
+var ErrQuestionExpired = errors.New("the question is no longer pending")
 
 // Agent runs Codex turns. The engine knows nothing about app-server
 // processes; internal/core/codexagent implements Agent over

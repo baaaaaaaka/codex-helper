@@ -4,7 +4,7 @@ package store
 const ApplicationID = 0x63787031
 
 // SchemaVersion is the PRAGMA user_version this code writes and understands.
-const SchemaVersion = 2
+const SchemaVersion = 3
 
 // migrations[i] upgrades user_version i to i+1. Each step runs in one
 // transaction together with the user_version bump. There is no pointer file.
@@ -16,6 +16,7 @@ var migrations = [][]string{
 		`ALTER TABLE turns ADD COLUMN steering INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE inbound ADD COLUMN queued_only INTEGER NOT NULL DEFAULT 1`,
 		`ALTER TABLE turns ADD COLUMN shared INTEGER NOT NULL DEFAULT 0`},
+	questionSchema,
 }
 
 // schemaV1 is the complete initial schema (STORE-DESIGN.md §3). No triggers
@@ -216,5 +217,5 @@ var schemaV1 = []string{
 var Tables = []string{
 	"meta", "owner", "conversations", "threads", "streams", "turns", "inbound",
 	"inbound_files", "outbox", "outbox_files", "transcript_sources", "forks",
-	"notifications", "gates",
+	"notifications", "gates", "question_groups", "questions", "question_options",
 }

@@ -26,6 +26,9 @@ wire_api = "responses"
 request_max_retries = 0
 stream_max_retries = 0
 stream_idle_timeout_ms = 600000
+
+[features]
+plugins = false
 `, baseURL)
 	return os.WriteFile(filepath.Join(dir, "config.toml"), []byte(cfg), 0o600)
 }

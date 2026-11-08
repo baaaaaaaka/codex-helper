@@ -230,8 +230,23 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 			req.Effort = th.PendingEffort
 		}
 		req.Text, req.Images = codexInput(in.Body, files, e.outboundDir(tr.TurnKey)) // envelope.go (F-TRN-14)
+		questionReply := false
+		if yes, x := tx.IsQuestionReply(in.ID); x != nil {
+			return x
+		} else if yes {
+			questionReply = true
+			origin, x := tx.QuestionInputThread(in.ID)
+			if x != nil {
+				return x
+			}
+			if origin != th.ThreadID {
+				got = false
+				return e.rejectQuestionReply(tx, tr)
+			}
+			req.Text, req.Images = in.Body, nil
+		}
 		// Batch B: the control envelope, model and effort (control_qa.go).
-		if control {
+		if control && !questionReply {
 			if req, ctl, err = e.controlRequest(tx, req, in, files, th); err != nil {
 				return err
 			}

@@ -32,10 +32,13 @@ type Agent struct {
 	cfg  Config
 	pool *codex.Pool
 
-	mu         sync.Mutex
-	tuiThreads map[string]int
-	attached   map[int64]int
-	running    map[int64]*runningTurn
+	mu               sync.Mutex
+	tuiThreads       map[string]int
+	attached         map[int64]int
+	running          map[int64]*runningTurn
+	questionHandler  func(engine.QuestionEvent) error
+	questionRequests map[string]questionRequest
+	questionEpoch    string
 }
 
 type runningTurn struct {
@@ -67,6 +70,10 @@ func New(cfg Config) *Agent {
 		attached:   map[int64]int{},
 		tuiThreads: map[string]int{},
 	}
+	a.questionEpoch = fmt.Sprintf("%d-%p", time.Now().UnixNano(), a)
+	a.questionRequests = map[string]questionRequest{}
+	a.cfg.Server.QuestionRequest = a.onQuestion
+	a.cfg.Server.Observe = a.observeQuestion
 	if cfg.Server.SharedDir != "" {
 		a.cfg.Server.IgnoreServerRequest = func(raw json.RawMessage) bool {
 			var p struct {
@@ -403,7 +410,10 @@ func engineModels(ms []codex.Model) []engine.Model {
 }
 
 // Maintain reaps idle app-servers.
-func (a *Agent) Maintain() { a.pool.Reap() }
+func (a *Agent) Maintain() {
+	a.pool.Reap()
+	a.pruneQuestionRequests()
+}
 
 // Close ends every app-server.
 func (a *Agent) Close() { a.pool.Close(2 * time.Second) }

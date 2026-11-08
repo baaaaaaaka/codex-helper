@@ -136,6 +136,10 @@ func TestShouldActivateEntryVersionDoesNotUndoSameBasePrerelease(t *testing.T) {
 }
 
 func TestLaunchKeepsExplicitSameBasePrereleaseActive(t *testing.T) {
+	// This test mocks the actual launch. Its entry-path assertion must not
+	// inherit the source-test harness's runtime-dispatch disable marker.
+	t.Setenv(EnvDisable, "")
+	t.Setenv(EnvRuntime, "")
 	dir := t.TempDir()
 	entry := filepath.Join(dir, BinaryName(runtime.GOOS))
 	writeExecutable(t, entry, "stable-entry")

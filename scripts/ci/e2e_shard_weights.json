@@ -5,7 +5,9 @@
     "whole-suite run and the CI shard runs. scripts/ci/e2e_shards.py packs whole",
     "packages onto the CI shards by these weights; a package missing here gets the",
     "script's default weight. Refresh after adding or growing a scenario package:",
-    "python3 scripts/ci/e2e_shards.py --count 3 --plan"
+    "python3 scripts/ci/e2e_shards.py --count 3 --plan",
+    "turns was refreshed after adding question scenarios (2026-11-08): 122.4s",
+    "with -parallel=4 in a 2-CPU isolated container, a conservative CI weight."
   ],
   "weights": {
     "commands": 197,
@@ -14,7 +16,7 @@
     "dashboard": 89,
     "cost": 55,
     "lifecycle": 47,
-    "turns": 40,
+    "turns": 123,
     "edits": 37,
     "chats": 33,
     "faults": 32,

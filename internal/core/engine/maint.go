@@ -165,6 +165,7 @@ func (e *Engine) maintenanceLoop(ctx context.Context) {
 				}
 			}
 		case <-mt.C:
+			e.maintainQuestions(ctx)
 			e.ag.Maintain()
 			e.remindQueued()
 			e.retryCreating()

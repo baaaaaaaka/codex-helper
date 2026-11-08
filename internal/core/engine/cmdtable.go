@@ -18,6 +18,7 @@ type cmdHandler func(e *Engine, ctx context.Context, j cmdJob, cs *convState, p 
 
 // workCommands maps a work-chat command to its handler.
 var workCommands = map[string]cmdHandler{
+	cmdAnswer: func(e *Engine, ctx context.Context, j cmdJob, _ *convState, p parsed) { e.cmdAnswer(ctx, j, p.arg) },
 	cmdQueue: func(e *Engine, _ context.Context, j cmdJob, _ *convState, _ parsed) {
 		e.reply(j, "Usage: `helper queue <prompt>` (attachments are also supported).", nil)
 	},
@@ -95,6 +96,7 @@ var workCommands = map[string]cmdHandler{
 
 // controlCommands maps a control-chat command to its handler.
 var controlCommands = map[string]cmdHandler{
+	cmdAnswer: func(e *Engine, ctx context.Context, j cmdJob, _ *convState, p parsed) { e.cmdAnswer(ctx, j, p.arg) },
 	cmdHelp: func(e *Engine, _ context.Context, j cmdJob, _ *convState, p parsed) {
 		if isAdvancedHelpArg(p.arg) {
 			e.reply(j, controlAdvancedHelpText, nil)

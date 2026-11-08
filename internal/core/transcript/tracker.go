@@ -132,6 +132,7 @@ type openTurn struct {
 	legacyInput     bool
 	decided         bool // the helper/local decision is known
 	finalSeen       bool
+	lastAsync       string // bounded by the rollout reader's record limit
 	// prompted: a prompt record was read; early: decided by a commentary
 	// record of a turn without a prompt (a goal continuation, which Codex
 	// starts by itself), so a prompt steered into it later waits for its
@@ -367,7 +368,15 @@ func (t *Tracker) apply(out []Output, ev Event, l Line) []Output {
 		}
 		tr.decided = true
 		out = t.flush(out)
+	case KindAsyncMessage:
+		if t.turn == nil {
+			t.turn = &openTurn{}
+		}
+		t.turn.lastAsync = strings.TrimSpace(StripMemCitations(ev.Text))
 	case KindAgentMessage:
+		if t.turn != nil {
+			t.turn.lastAsync = ""
+		}
 		if t.turn != nil && t.turn.legacyInput {
 			t.turn.teams = true
 		}
@@ -446,7 +455,7 @@ func (t *Tracker) apply(out []Output, ev Event, l Line) []Output {
 		// last_agent_message is the final only for a turn whose start was
 		// read and that had no final_answer item: a scan that began
 		// mid-turn usually begins right after the delivered final.
-		if final := strings.TrimSpace(StripMemCitations(ev.Text)); tr.started && !tr.finalSeen && (!tr.teams || l.End <= t.keep) && final != "" {
+		if final := strings.TrimSpace(StripMemCitations(ev.Text)); tr.started && !tr.finalSeen && (!tr.teams || l.End <= t.keep) && final != "" && final != tr.lastAsync {
 			out = append(out, Output{RecordID: turnRecordID(tr.id, OutputFinal, t.line), Kind: OutputFinal, Text: final, Time: ev.Time, TurnID: tr.id, End: l.End, line: t.line, start: l.Off})
 		}
 		t.turn, t.prev = nil, tr

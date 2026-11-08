@@ -92,7 +92,7 @@ func (s *Server) RunTurn(ctx context.Context, p TurnStartParams, poll time.Durat
 		held string
 	)
 	progress := func(it Item) {
-		if hooks.Progress == nil || it.Phase == "final_answer" || strings.TrimSpace(it.Text) == "" {
+		if hooks.Progress == nil || it.Delivery == "async" || it.Phase == "final_answer" || strings.TrimSpace(it.Text) == "" {
 			return
 		}
 		pmu.Lock()

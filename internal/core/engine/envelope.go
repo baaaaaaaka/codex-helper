@@ -513,6 +513,11 @@ func screen(c *classified) {
 	if c.reject != "" {
 		return // classify refused it (bare @codex, a coworker's command)
 	}
+	if c.cmd.name == cmdAnswer && (len(c.msg.Files) > 0 || hasQuestionAttachment(c.msg.Attachments)) {
+		c.reject = "Question answers support text only. Reply with text or use `helper answer Q<number> --skip`."
+		c.in.Kind = store.InCommand
+		return
+	}
 	if c.control {
 		if text := controlAttachmentRefusal(c); text != "" {
 			c.reject, c.rejectQuote = text, c.quoteID
@@ -565,7 +570,7 @@ func (e *Engine) refuse(tx *store.Tx, conv int64, a store.Admitted, c *classifie
 // there; any other attachment refuses the message, which then runs
 // nothing.
 func controlAttachmentRefusal(c *classified) string {
-	allowRefs := c.cmd.form == formCommand && c.cmd.name == cmdAsk ||
+	allowRefs := c.cmd.form == formCommand && (c.cmd.name == cmdAsk || c.cmd.name == cmdAnswer) ||
 		c.cmd.form == formText && !looksLikeControlPath(c.msg.Text)
 	var refused []string
 	refs := false
@@ -590,6 +595,17 @@ func controlAttachmentRefusal(c *classified) string {
 		return textUnsupportedAttachments(refused) + " Quoted Teams messages in the 🏠 control chat are only supported with `ask <question>` or natural-language fallback prompts; explicit control commands do not consume quoted context."
 	}
 	return textUnsupportedAttachments(refused) + " Files and images belong in a 💬 Work chat; the 🏠 control chat only handles text commands like `projects`, `new <directory>`, `continue <number>`, and `status`."
+}
+
+func hasQuestionAttachment(types []string) bool {
+	for _, typ := range types {
+		switch strings.ToLower(strings.TrimSpace(strings.Split(typ, ";")[0])) {
+		case "messagereference", "forwardedmessagereference":
+		default:
+			return true
+		}
+	}
+	return false
 }
 
 // textUnsupportedAttachments is v0.1.20's UnsupportedAttachmentMessage

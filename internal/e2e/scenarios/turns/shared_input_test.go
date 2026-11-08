@@ -144,6 +144,12 @@ func TestSharedTeamsAndTUIInput(t *testing.T) {
 	tui.call("turn/start", tuiInput(original.ThreadID, "Native task "+external, "tui-start"))
 	s.WaitCodexCalls(external, 1, steps.AnswerTimeout)
 	ext := s.Codex.CallsWithToken(external)[0]
+	// The native prompt mirror and a later Teams acknowledgement use
+	// independent event paths. Observe the prompt before sending the next
+	// input so the transcript has a defined order without delaying production.
+	s.Require("native task prompt is mirrored before Teams adds input", steps.AnswerTimeout, func() (bool, string) {
+		return len(s.SUTMessagesContaining(work.ID, "Native task "+external)) == 1, "waiting for native prompt mirror"
+	})
 	steps.MustPost(s, work.ID, "Teams addition "+foreignExtra)
 	s.WaitFor("Teams steers native execution", 20*time.Second, func() (bool, string) {
 		raw := tui.call("thread/turns/list", map[string]any{"threadId": original.ThreadID, "limit": 5, "sortDirection": "desc"})

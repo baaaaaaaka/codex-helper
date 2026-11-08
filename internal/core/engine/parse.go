@@ -70,6 +70,7 @@ func (p parsed) isCommand() bool { return p.form != formText }
 // Canonical command names. Handlers are keyed by these (commands.go).
 const (
 	cmdQueue          = "queue"
+	cmdAnswer         = "answer"
 	cmdHelp           = "help"
 	cmdStatus         = "status"
 	cmdStats          = "stats"
@@ -160,7 +161,8 @@ var coreControlExtra = map[string]bool{
 // workNatural: the work chat's names after any prefix (v0.1.20
 // workNaturalCommandName :528, plus the core's own commands).
 var workNatural = map[string]string{
-	"": cmdHelp, "help": cmdHelp, "menu": cmdHelp, "?": cmdHelp,
+	"answer": cmdAnswer,
+	"":       cmdHelp, "help": cmdHelp, "menu": cmdHelp, "?": cmdHelp,
 	"status": cmdStatus,
 	"stats":  cmdStats, "usage": cmdStats, "tokens": cmdStats,
 	"close":  cmdClose,
@@ -285,6 +287,9 @@ func parseWork(text string) parsed {
 		return parsed{form: formUnknown, name: name, arg: arg, syntax: syn}
 	}
 	canon := workNatural[name]
+	if canon == cmdAnswer && syn == synCodex {
+		return parsed{syntax: syn}
+	}
 	if canon == cmdGoalName && syn == synCodex {
 		return parsed{syntax: syn} // `codex goal …` stays a prompt
 	}
@@ -328,6 +333,9 @@ func parseControl(text string) parsed {
 	}
 	cmd := func(canon string) parsed {
 		return parsed{form: formCommand, name: canon, arg: listAlias(name, canon, arg), syntax: syn}
+	}
+	if name == cmdAnswer && syn != synCodex {
+		return cmd(cmdAnswer)
 	}
 	if canon := controlAdmin(syn, name, arg); canon != "" {
 		p := cmd(canon)

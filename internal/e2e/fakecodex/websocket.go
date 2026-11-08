@@ -42,7 +42,7 @@ func (h *wsHub) Write(data []byte) (int, error) {
 	}
 	h.mu.Lock()
 	var peers []*wsPeer
-	if len(msg.ID) > 0 {
+	if len(msg.ID) > 0 && msg.Method == "" {
 		var id int
 		_ = json.Unmarshal(msg.ID, &id)
 		if route, ok := h.pending[id]; ok {

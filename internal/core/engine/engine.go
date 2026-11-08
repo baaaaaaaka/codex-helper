@@ -324,10 +324,12 @@ type Engine struct {
 	announceSeen map[int64]time.Time
 	announceRun  sync.Mutex
 
-	fatalOnce sync.Once
-	fatal     error
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
+	fatalOnce       sync.Once
+	questionMu      sync.Mutex
+	questionWaiting map[int64]bool
+	fatal           error
+	cancel          context.CancelFunc
+	wg              sync.WaitGroup
 
 	mirror        *mirrorState
 	sendFailures  map[int64]int
@@ -427,6 +429,9 @@ func New(cfg Config) (*Engine, error) {
 	if p, ok := cfg.Registrar.(WritePaced); ok {
 		p.PaceWrites(e.waitWrite)
 	}
+	if qa, ok := e.ag.(QuestionAgent); ok {
+		qa.SetQuestionHandler(e.questionEvent)
+	}
 	return e, nil
 }
 
@@ -515,6 +520,7 @@ func (e *Engine) Run(ctx context.Context) error {
 		e.ag.Close()
 		return err
 	}
+	e.maintainQuestions(ctx)
 	defer func() { e.mu.Lock(); e.attachReady = false; e.mu.Unlock() }()
 	// The turns the previous process left open, read before the runner
 	// starts: a held turn this process starts must not be taken for one

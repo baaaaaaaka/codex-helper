@@ -39,6 +39,8 @@ type pendingNotify struct {
 // (v0.1.20 local_session_started); "" is a final (turn_completed).
 const notifyLocal = "local"
 
+const notifyQuestion = "question"
+
 // id identifies n in the pending list.
 func (n pendingNotify) id() string {
 	if n.Turn != 0 {
@@ -161,6 +163,17 @@ func (e *Engine) pumpNotify(ctx context.Context) {
 		}
 		keep := list[:0]
 		for _, n := range list {
+			var questionGroup store.QuestionGroup
+			if n.Kind == notifyQuestion {
+				var ok bool
+				questionGroup, ok, err = tx.QuestionGroup(n.Text)
+				if err != nil {
+					return err
+				}
+				if !ok || questionGroup.State != "open" || questionsReady(questionGroup) {
+					continue
+				}
+			}
 			rows, err := tx.PendingOutbox(n.Conv)
 			if err != nil {
 				return err
@@ -169,6 +182,16 @@ func (e *Engine) pumpNotify(ctx context.Context) {
 			// A notification waits for the automatic title of its chat
 			// (rename.go): it names the chat as the owner sees it.
 			waiting := e.retitling(n.Conv)
+			if n.Kind == notifyQuestion {
+				waiting = false
+				for _, q := range questionGroup.Questions {
+					for _, r := range rows {
+						if strings.HasPrefix(r.DeliveryKey, questionPrefix(q.ID)+":") {
+							waiting = true
+						}
+					}
+				}
+			}
 			for _, r := range rows {
 				if strings.HasPrefix(r.DeliveryKey, prefix) {
 					waiting = true
@@ -186,7 +209,9 @@ func (e *Engine) pumpNotify(ctx context.Context) {
 				if gone {
 					continue
 				}
-				answered = append(answered, n) // F-TRN-1, F-WRK-2 (rename.go)
+				if n.Kind != notifyQuestion {
+					answered = append(answered, n)
+				} // questions do not trigger final-answer title changes
 			}
 			keep = append(keep, n)
 			switch {
@@ -240,7 +265,7 @@ func (e *Engine) sendCard(ctx context.Context, n pendingNotify) bool {
 		return true
 	}
 	ev, events := e.cfg.Notifier.(EventNotifier)
-	if n.Kind == notifyLocal && !events {
+	if (n.Kind == notifyLocal || n.Kind == notifyQuestion) && !events {
 		return false // no card for it: the owner is mentioned instead
 	}
 	if err := e.updateNotify(n.id(), func(p *pendingNotify) bool { p.Attempted = true; return true }); err != nil {
@@ -249,7 +274,22 @@ func (e *Engine) sendCard(ctx context.Context, n pendingNotify) bool {
 	}
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	var err error
-	if n.Kind == notifyLocal {
+	if n.Kind == notifyQuestion {
+		var g store.QuestionGroup
+		err = e.update(func(tx *store.Tx) (err error) { g, _, err = tx.QuestionGroup(n.Text); return })
+		if err == nil && (g.State != "open" || questionsReady(g)) {
+			cancel()
+			_ = e.updateNotify(n.id(), func(*pendingNotify) bool { return false })
+			return true
+		}
+		var heading, text string
+		if err == nil {
+			heading, text, err = e.questionNotice(g, firstNonEmpty(title, label))
+		}
+		if err == nil {
+			err = ev.NotifyEvent(cctx, heading, text, url)
+		}
+	} else if n.Kind == notifyLocal {
 		err = ev.NotifyEvent(cctx, "💬 New local Codex chat detected: "+firstNonEmpty(title, label),
 			"Open this chat to watch the answer and continue from the full local context.", url)
 	} else {
@@ -288,7 +328,9 @@ func (e *Engine) sendMentions(set []pendingNotify) {
 			m   []store.OutMsg
 			err error
 		)
-		if n.Kind == notifyLocal {
+		if n.Kind == notifyQuestion {
+			m, err = e.questionMention(n, cs)
+		} else if n.Kind == notifyLocal {
 			m, err = e.localMention(cs)
 		} else {
 			m, err = e.finalMention(n, cs)

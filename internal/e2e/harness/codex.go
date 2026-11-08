@@ -67,10 +67,11 @@ func (c CodexCall) HasToken(token string) bool {
 
 // CodexBehavior is what the fake Codex does for one call.
 type CodexBehavior struct {
-	Answer string        // final answer text; empty = default answer
-	Err    error         // return this error instead of an answer
-	Block  bool          // wait for Release/ReleaseAll or ctx cancellation
-	Delay  time.Duration // sleep (cancellable) before answering
+	Questions *fakecodex.QuestionScript
+	Answer    string        // final answer text; empty = default answer
+	Err       error         // return this error instead of an answer
+	Block     bool          // wait for Release/ReleaseAll or ctx cancellation
+	Delay     time.Duration // sleep (cancellable) before answering
 
 	// The fields below are honoured by the fake app-server binary only
 	// (the in-process Executor maps FailKind to an error and ignores the

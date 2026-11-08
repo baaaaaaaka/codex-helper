@@ -39,10 +39,11 @@ type Config struct {
 }
 
 type server struct {
-	submitMu sync.Mutex
-	queued   map[string][]map[string]any
-	cfg      Config
-	http     *http.Client
+	questions map[string]*pendingQuestion
+	submitMu  sync.Mutex
+	queued    map[string][]map[string]any
+	cfg       Config
+	http      *http.Client
 
 	outMu sync.Mutex
 	out   *bufio.Writer
@@ -100,16 +101,17 @@ func Serve(cfg Config) error {
 		cfg.Log = io.Discard
 	}
 	s := &server{
-		cfg:      cfg,
-		queued:   map[string][]map[string]any{},
-		http:     &http.Client{Transport: &http.Transport{Proxy: nil}},
-		out:      bufio.NewWriter(cfg.Out),
-		loaded:   map[string]*Thread{},
-		mcp:      map[string][]string{},
-		goals:    map[string]map[string]any{},
-		settings: map[string][2]string{},
-		rollouts: map[string]*rollout.Writer{},
-		running:  map[string]*runningTurn{},
+		questions: map[string]*pendingQuestion{},
+		cfg:       cfg,
+		queued:    map[string][]map[string]any{},
+		http:      &http.Client{Transport: &http.Transport{Proxy: nil}},
+		out:       bufio.NewWriter(cfg.Out),
+		loaded:    map[string]*Thread{},
+		mcp:       map[string][]string{},
+		goals:     map[string]map[string]any{},
+		settings:  map[string][2]string{},
+		rollouts:  map[string]*rollout.Writer{},
+		running:   map[string]*runningTurn{},
 	}
 	in := bufio.NewReaderSize(cfg.In, 1<<20)
 	for {
@@ -124,9 +126,9 @@ func Serve(cfg Config) error {
 					defer s.wg.Done()
 					s.handle(msg)
 				}()
+			} else if len(msg.ID) > 0 && msg.Method == "" {
+				s.answerQuestion(msg)
 			}
-			// Notifications (initialized) and responses to server
-			// requests need no handling.
 		}
 		if err != nil {
 			break
@@ -315,6 +317,7 @@ func (s *server) dispatch(msg message) (any, *rpcError) {
 		}
 		// Like Codex 0.166, the goal snapshot follows the resume.
 		defer s.goalSnapshot(id)
+		defer s.replayQuestions(id)
 		return s.loadedResponse(id, map[string]any{"thread": s.threadView(t, include), "cwd": t.Cwd}, ""), nil
 	case "thread/read":
 		t, err := s.current(str("threadId"))
@@ -646,6 +649,7 @@ func (s *server) runTurn(rt *runningTurn, t *Thread, turn *Turn) {
 		s.cfg.Exit(3)
 		return
 	}
+	questionAnswer := s.askQuestions(rt, t, turn)
 	for _, command := range rt.plan.Exec {
 		cctx, cancel := context.WithTimeout(rt.ctx, 60*time.Second)
 		cmd := exec.CommandContext(cctx, "sh", "-c", command)
@@ -695,6 +699,9 @@ func (s *server) runTurn(rt *runningTurn, t *Thread, turn *Turn) {
 			"error": map[string]any{"message": r.Message, "codexErrorInfo": r.Info, "additionalDetails": details}})
 	}
 	res, err := s.await(rt.ctx, rt.plan.Seq)
+	if questionAnswer != "" {
+		res.Answer += "\n\nQUESTION_RESULT " + questionAnswer
+	}
 	status := StatusCompleted
 	var terr *TurnError
 	var final map[string]any

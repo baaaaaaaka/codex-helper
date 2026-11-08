@@ -227,6 +227,13 @@ WHERE delivery_key >= ? AND delivery_key < ? ORDER BY seq`, prefix, prefix+"\U00
 	return collect(scanOutbox)(rows, err)
 }
 
+// OutboxHasKeyPrefix checks publication without loading stored message bodies.
+func (s *Store) OutboxHasKeyPrefix(prefix string) (bool, error) {
+	var yes bool
+	err := s.r.QueryRowContext(context.Background(), `SELECT EXISTS(SELECT 1 FROM outbox WHERE delivery_key>=? AND delivery_key<?)`, prefix, prefix+"\U0010FFFF").Scan(&yes)
+	return yes, err
+}
+
 // CodexTurnModes loads mirror ownership once, without a second copy of turn IDs.
 // The value distinguishes shared turns (keep local user input) from legacy ones.
 func (s *Store) CodexTurnModes() (map[string]bool, error) {

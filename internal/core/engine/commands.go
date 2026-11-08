@@ -58,8 +58,12 @@ func (e *Engine) dispatchCommand(ctx context.Context, j cmdJob) {
 	}
 	e.cmdMu.Lock()
 	defer e.cmdMu.Unlock()
-	q, busy := e.cmdPending[j.conv]
-	e.cmdPending[j.conv] = append(q, j)
+	queueKey := j.conv
+	if answerCommand(kind, j.text) {
+		queueKey = -j.conv
+	}
+	q, busy := e.cmdPending[queueKey]
+	e.cmdPending[queueKey] = append(q, j)
 	if busy {
 		return
 	}
@@ -68,14 +72,14 @@ func (e *Engine) dispatchCommand(ctx context.Context, j cmdJob) {
 		defer e.wg.Done()
 		for {
 			e.cmdMu.Lock()
-			q := e.cmdPending[j.conv]
+			q := e.cmdPending[queueKey]
 			if len(q) == 0 || ctx.Err() != nil {
-				delete(e.cmdPending, j.conv)
+				delete(e.cmdPending, queueKey)
 				e.cmdMu.Unlock()
 				return
 			}
 			next := q[0]
-			e.cmdPending[j.conv] = q[1:]
+			e.cmdPending[queueKey] = q[1:]
 			e.cmdMu.Unlock()
 			e.runCommand(ctx, next)
 		}
@@ -534,4 +538,15 @@ func (e *Engine) confirmRestart(conv int64) {
 		e.logf("restart confirmation: %v", err)
 	}
 	e.wakeSender()
+}
+
+// Answers keep admission order on their own command lane. A slow fork/model
+// command must not block them, and concurrent answer goroutines must not
+// reorder an edit followed by the last answer of a group.
+func answerCommand(kind, text string) bool {
+	if kind == store.KindControl {
+		return parseControl(text).name == cmdAnswer
+	}
+	text, _ = stripCodexMention(text)
+	return parseWork(text).name == cmdAnswer
 }

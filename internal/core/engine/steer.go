@@ -21,7 +21,7 @@ func (e *Engine) trySteer(ctx context.Context, id int64) bool {
 	}
 	e.mu.Lock()
 	cs := e.convs[id]
-	if cs == nil || cs.kind != store.KindWork || cs.state != store.ConvActive || cs.paused || e.draining() || e.stopping.Load() || !e.readyLocked(cs) {
+	if cs == nil || (cs.kind != store.KindWork && cs.kind != store.KindControl) || cs.state != store.ConvActive || cs.paused || e.draining() || e.stopping.Load() || !e.readyLocked(cs) {
 		e.mu.Unlock()
 		return false
 	}
@@ -80,6 +80,24 @@ func (e *Engine) trySteer(ctx context.Context, id int64) bool {
 		}
 		req = TurnRequest{ConvID: id, ThreadID: thread, TurnKey: "cxp-steer-" + tr.TurnKey}
 		req.Text, req.Images = codexInput(in.Body, files, e.outboundDir(outputKey))
+		if yes, x := tx.IsQuestionReply(in.ID); x != nil {
+			return x
+		} else if yes {
+			origin, x := tx.QuestionInputThread(in.ID)
+			if x != nil {
+				return x
+			}
+			if origin != thread {
+				got = false
+				return e.rejectQuestionReply(tx, tr)
+			}
+			req.Text, req.Images = in.Body, nil
+		} else if cs.kind == store.KindControl {
+			// Control Q&A keeps its history envelope. Only native question
+			// replies bypass it and may enter the running control turn.
+			got = false
+			return nil
+		}
 		req.Text = strings.Replace(req.Text, teamsRequestSafety, teamsSteerSafety, 1)
 		tr.TurnKey = req.TurnKey
 		return tx.MarkSteering(tr.ID, thread)

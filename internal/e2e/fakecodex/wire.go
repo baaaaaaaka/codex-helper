@@ -69,7 +69,8 @@ type ResumeDecision struct {
 
 // Plan is the brain's answer to a BeginRequest.
 type Plan struct {
-	Seq int `json:"seq"`
+	Questions *QuestionScript `json:"questions,omitempty"`
+	Seq       int             `json:"seq"`
 	// RejectStart, if set, is returned as the JSON-RPC error of turn/start.
 	RejectStart string `json:"rejectStart,omitempty"`
 	Commentary  string `json:"commentary,omitempty"`
@@ -96,6 +97,23 @@ type Plan struct {
 	// Retries are error notifications Codex retries by itself, sent after
 	// the commentary and before the turn's outcome.
 	Retries []Retry `json:"retries,omitempty"`
+}
+
+// QuestionScript uses the native wire shapes. It is not an engine shortcut:
+// sync answers must arrive as JSON-RPC responses over the client transport.
+type QuestionScript struct {
+	Async     bool           `json:"async"`
+	Blocking  bool           `json:"blocking"`
+	Questions []QuestionSpec `json:"questions"`
+}
+type QuestionSpec struct {
+	ID       string           `json:"id"`
+	Question string           `json:"question"`
+	Options  []QuestionOption `json:"options,omitempty"`
+}
+type QuestionOption struct {
+	Label       string `json:"label"`
+	Description string `json:"description"`
 }
 
 // Retry is one `error` notification with willRetry (real Codex: a dropped

@@ -32,6 +32,9 @@ type Config struct {
 	// OnServerRequest answers app-server initiated requests; nil uses
 	// AutoApprove and rejects everything else.
 	OnServerRequest func(method string, params json.RawMessage) (json.RawMessage, bool, error)
+	// QuestionRequest retains an interactive request instead of auto-answering it.
+	QuestionRequest func(*Server, json.RawMessage, json.RawMessage) bool
+	Observe         func(*Server, Notification)
 	// IgnoreServerRequest leaves requests to an attached native TUI.
 	IgnoreServerRequest func(json.RawMessage) bool
 	// Configure, when set, adjusts the command before it starts (the
@@ -79,14 +82,15 @@ type Server struct {
 	wmu sync.Mutex
 	in  io.WriteCloser
 
-	mu             sync.Mutex
-	serverRequests map[string]wireMsg // requests awaiting a TUI or helper answer
-	nextID         int64
-	pending        map[int64]chan rpcResult
-	subs           map[string]map[int]func(Notification)
-	threads        map[string]*ThreadInfo // threadstate.go
-	subSeq         int
-	exitErr        error
+	mu                sync.Mutex
+	serverRequests    map[string]wireMsg // requests awaiting a TUI or helper answer
+	questionBackendID uint64
+	nextID            int64
+	pending           map[int64]chan rpcResult
+	subs              map[string]map[int]func(Notification)
+	threads           map[string]*ThreadInfo // threadstate.go
+	subSeq            int
+	exitErr           error
 
 	fault chan struct{}
 	done  chan struct{} // closed after the process exited and the reader stopped
@@ -393,6 +397,9 @@ func (s *Server) handleLine(line []byte) {
 		}
 		s.track(m.Method, p.ThreadID, m.Params)
 		n := Notification{Method: m.Method, Params: m.Params}
+		if s.cfg.Observe != nil {
+			s.cfg.Observe(s, n)
+		}
 		s.mu.Lock()
 		var fns []func(Notification)
 		for _, fn := range s.subs[p.ThreadID] {
@@ -428,6 +435,9 @@ func (s *Server) handleLine(line []byte) {
 }
 
 func (s *Server) answer(m wireMsg) {
+	if m.Method == "item/tool/requestUserInput" && s.cfg.QuestionRequest != nil && s.cfg.QuestionRequest(s, m.ID, m.Params) {
+		return
+	}
 	if s.cfg.IgnoreServerRequest != nil && s.cfg.IgnoreServerRequest(m.Params) {
 		return
 	}

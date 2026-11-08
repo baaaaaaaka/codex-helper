@@ -37,6 +37,12 @@ type Turn struct {
 
 // Item is a v2 ThreadItem (only the fields the helper reads).
 type Item struct {
+	Delivery  string          `json:"delivery"`
+	Questions []AsyncQuestion `json:"questions"`
+	Content   []struct {
+		Type string `json:"type"`
+		Text string `json:"text"`
+	} `json:"content"`
 	Type     string `json:"type"`
 	ID       string `json:"id"`
 	Text     string `json:"text"`
@@ -84,7 +90,7 @@ func (t Turn) ClientID() string {
 func (t Turn) Final() string {
 	last, final := "", ""
 	for _, it := range t.Items {
-		if it.Type != "agentMessage" || strings.TrimSpace(it.Text) == "" {
+		if it.Type != "agentMessage" || it.Delivery == "async" || strings.TrimSpace(it.Text) == "" {
 			continue
 		}
 		last = it.Text

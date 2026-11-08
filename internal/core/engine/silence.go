@@ -43,6 +43,13 @@ func (e *Engine) watchSilence(ctx context.Context, cs *convState, tr store.Turn,
 			case <-tick.C:
 			}
 			last := rs.lastEvent.Load()
+			e.mu.Lock()
+			waiting := e.questionWaiting[cs.id]
+			e.mu.Unlock()
+			if waiting {
+				rs.lastEvent.Store(ms(e.now()))
+				continue
+			}
 			if last != episode {
 				episode, hinted = last, 0 // Codex spoke: a new silence starts
 			}

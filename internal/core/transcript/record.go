@@ -29,10 +29,11 @@ const (
 	KindTurnAborted              // event_msg turn_aborted
 	KindTurnRef                  // another event_msg naming the turn (item_completed AgentMessage, ...)
 	KindCompact                  // a context compaction: compacted, event_msg context_compacted
+	KindAsyncMessage             // an async question; suppress its task_complete fallback
 )
 
 func (k Kind) String() string {
-	return [...]string{"other", "session_meta", "turn_started", "user_message", "user_item", "agent_message", "turn_complete", "turn_aborted", "turn_ref", "compact"}[k]
+	return [...]string{"other", "session_meta", "turn_started", "user_message", "user_item", "agent_message", "turn_complete", "turn_aborted", "turn_ref", "compact", "async_message"}[k]
 }
 
 // Record types of a compaction (Event.Phase of a KindCompact event).
@@ -139,6 +140,7 @@ type envelope struct {
 }
 
 type payload struct {
+	Delivery         string       `json:"delivery"`
 	Type             string       `json:"type"`
 	ID               string       `json:"id"`
 	Role             string       `json:"role"`
@@ -284,6 +286,9 @@ func Parse(line []byte) Event {
 			ev.Kind = KindUserMessage
 		case "assistant":
 			ev.Kind = KindAgentMessage
+			if p.Delivery == "async" {
+				ev.Kind = KindAsyncMessage
+			}
 		default:
 			return Event{Kind: KindOther, Time: ts}
 		}

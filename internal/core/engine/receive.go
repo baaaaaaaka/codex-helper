@@ -917,6 +917,38 @@ func (e *Engine) classify(tx *store.Tx, conv int64, kind string, group bool, m c
 		c.quoteID = m.ID
 	}
 	text := strings.TrimSpace(m.Text)
+	// A quote is an explicit question target. Known helper commands retain
+	// their meaning, including queue; forwarded text never selects a question.
+	if p := parseWork(text); p.form == formText && len(m.Quotes) > 0 {
+		var target int64
+		for _, q := range m.Quotes {
+			if q.Forwarded {
+				continue
+			}
+			_, id, err := tx.QuestionByMessage(conv, q.ID)
+			if err != nil {
+				return c, false, err
+			}
+			if id != 0 {
+				if target != 0 && target != id {
+					c.in.Kind, c.reject = store.InCommand, "Quote one question, or use `helper answer Q<number> <answer>`."
+					return c, true, nil
+				}
+				target = id
+			}
+		}
+		if target != 0 {
+			c.control = kind == store.KindControl
+			c.in.Kind = store.InCommand
+			c.in.Body = fmt.Sprintf("helper answer Q%d %s", target, text)
+			// Quoted --skip is a literal answer, not an operation.
+			if text == "--skip" {
+				c.in.Body = fmt.Sprintf("helper answer Q%d -- --skip", target)
+			}
+			c.cmd = parsed{form: formCommand, name: cmdAnswer, arg: strings.TrimPrefix(c.in.Body, "helper answer ")}
+			return c, true, nil
+		}
+	}
 	if conv == e.inboxID && conv != 0 {
 		// Inbox records: classifyInbox picks the requests this engine runs.
 		c.in.Kind, c.chatter = store.InCommand, true
