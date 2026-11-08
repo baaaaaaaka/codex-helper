@@ -17,6 +17,7 @@ be replaced with an empty one.
 | Recover a process killed while building its temporary database | `TestEntryMigrationResumesAfterCrashDuringImport` |
 | A suspended former owner cannot resume retries or publish after takeover | `TestEntryMigrationTakeoverFencesWaitingOwner`; `TestEntryMigrationTakeoverFencesImporter` |
 | Recovery answers in the original Teams chat and Codex thread without creating another control chat | Migration E2E checks plus reviewed transcript goldens |
+| An open runtime pointer reader permits activation and retains its original contents; fresh readers see the new version | `TestVersionPointerReplacementWhileReaderOpen` covers active/previous pointers on every native CI OS; `TestVersionPointerReadsLongPath` preserves extended-length reads |
 | Runtime pointer read errors and failed restarts leave the watchdog alive, skip health collection and recover on the next tick | `TestTeamsServiceWatchdogRuntimeRefreshErrorsDoNotStopLoop`; `TestTeamsServiceWatchdogRuntimeRestartErrorsDoNotStopLoop`; native Windows `TestTeamsServiceWatchdogRuntimeRefreshRecoversSharingViolation` |
 | A running watchdog follows activation and rollback before checking health | Watchdog unit tests; `TestTeamsServiceWatchdogRuntimeProcessUpgradeAndRollback` runs real dispatch/restart on each native CI OS; `TestEntryWatchdogRuntimeUpgradeAndRollback` and `TestEntryWatchdogRuntimeLegacyLauncher` run release binaries through the production CLI on Linux |
 

@@ -104,8 +104,9 @@ sys.exit(int(os.environ['FAIL_TEST']))
         race = job_block(WORKFLOW, "race-core")
         patterns = re.findall(r"go test -race[^\n]+-run '([^']+)'", race)
         self.assertTrue(patterns, "startup CLI race step is missing")
+        self.assertIn("./internal/helperruntime -run '^TestVersionPointer'", race)
         for name in NAMES:
-            if name.startswith(("TestTeams", "TestFirstStart")):
+            if name.startswith(("TestTeams", "TestFirstStart", "TestVersionPointer")):
                 with self.subTest(name=name):
                     self.assertTrue(any(re.search(pattern, name) for pattern in patterns))
 

@@ -471,3 +471,18 @@ func TestVersionPointerReadsLongPath(t *testing.T) {
 		t.Fatalf("long pointer: %q %v", got, err)
 	}
 }
+
+func BenchmarkReadVersionPointer(b *testing.B) {
+	root := b.TempDir()
+	const version = "v0.1.22-rc.75"
+	if err := os.WriteFile(filepath.Join(root, "active"), []byte(version+"\n"), 0o600); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if got, err := ReadActive(root); err != nil || got != version {
+			b.Fatalf("pointer %q %v", got, err)
+		}
+	}
+}
