@@ -152,7 +152,9 @@ func testTeamsServiceWatchdogRuntimeRefreshRecovery(t *testing.T, unavailable fu
 	teamsServiceWatchdogCollectSnapshot = func(context.Context, teamsServiceWatchdogOptions) (teamsServiceWatchdogSnapshot, error) {
 		checks++
 		if logs != 1 {
-			t.Fatalf("health collected before runtime read recovered: logs=%d", logs)
+			current, managed := helperruntime.Current()
+			_, readErr := helperruntime.ReadActive(root)
+			t.Fatalf("health collected before runtime read recovered: logs=%d runtime=%q context=%+v managed=%v pointerErr=%v", logs, os.Getenv(helperruntime.EnvRuntime), current, managed, readErr)
 		}
 		cancel()
 		return teamsServiceWatchdogSnapshot{}, nil
