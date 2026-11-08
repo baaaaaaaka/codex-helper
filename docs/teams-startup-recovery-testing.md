@@ -17,7 +17,7 @@ be replaced with an empty one.
 | Recover a process killed while building its temporary database | `TestEntryMigrationResumesAfterCrashDuringImport` |
 | A suspended former owner cannot resume retries or publish after takeover | `TestEntryMigrationTakeoverFencesWaitingOwner`; `TestEntryMigrationTakeoverFencesImporter` |
 | Recovery answers in the original Teams chat and Codex thread without creating another control chat | Migration E2E checks plus reviewed transcript goldens |
-| A running watchdog follows activation and rollback before checking health | Watchdog unit tests; `TestTeamsServiceWatchdogRuntimeProcessUpgradeAndRollback` runs real dispatch/restart on each native CI OS; `TestEntryWatchdogRuntimeUpgradeAndRollback` runs release binaries through the production CLI on Linux |
+| A running watchdog follows activation and rollback before checking health | Watchdog unit tests; `TestTeamsServiceWatchdogRuntimeProcessUpgradeAndRollback` runs real dispatch/restart on each native CI OS; `TestEntryWatchdogRuntimeUpgradeAndRollback` and `TestEntryWatchdogRuntimeLegacyLauncher` run release binaries through the production CLI on Linux |
 
 The converter fault tests discover the number of ownership checkpoints from a
 successful conversion, then inject each failure at every checkpoint. New
@@ -45,7 +45,7 @@ bash scripts/ci/test_teams_startup_recovery.sh e2e
 Local real-process execution must use the development skill's ephemeral Docker
 harness. These tests must never operate an installed helper or service.
 
-CI runs the unit gate on Linux, Windows and macOS, and repeats the six startup
+CI runs the unit gate on Linux, Windows and macOS, and repeats the seven startup
 E2E scenarios three times on Linux. The core race job also checks the startup
 and watchdog CLI tests. The existing full unit and E2E suites still
 run. The scripts check that every critical test is present before execution;

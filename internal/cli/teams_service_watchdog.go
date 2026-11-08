@@ -149,11 +149,17 @@ func refreshTeamsServiceWatchdogRuntime() (bool, error) {
 	if !ok {
 		return false, nil
 	}
+	// The binary knows its running version. An older launcher may omit the
+	// pinned environment version, making Current's fallback read active.
+	running, ok := helperruntime.NormalizeVersion(version)
+	if !ok {
+		return false, fmt.Errorf("invalid watchdog build version %q", version)
+	}
 	active, err := helperruntime.ReadActive(current.Root)
 	if err != nil {
 		return false, fmt.Errorf("read watchdog runtime: %w", err)
 	}
-	if active == current.Version {
+	if active == running {
 		return false, nil
 	}
 	return true, restartSelf()

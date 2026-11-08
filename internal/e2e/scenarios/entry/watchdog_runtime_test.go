@@ -17,8 +17,27 @@ import (
 // cannot detect a launcher that accidentally keeps the old runtime markers.
 func TestEntryWatchdogRuntimeUpgradeAndRollback(t *testing.T) {
 	harness.Parallel(t)
-	s := harness.NewScenario(t, "ENTRY-WATCHDOG-RUNTIME", harness.Options{
-		Guarantees: []string{"entry-point"}, Title: "a running watchdog follows runtime activation and rollback through the stable launcher, preserving its PID",
+	testWatchdogRuntime(t, watchdogRuntimeCase{
+		id: "ENTRY-WATCHDOG-RUNTIME", title: "a running watchdog follows runtime activation and rollback through the stable launcher, preserving its PID",
+	})
+}
+
+func TestEntryWatchdogRuntimeLegacyLauncher(t *testing.T) {
+	harness.Parallel(t)
+	testWatchdogRuntime(t, watchdogRuntimeCase{
+		id: "ENTRY-WATCHDOG-LEGACY", title: "a watchdog entered by an older launcher without a pinned version follows activation and rollback", legacy: true,
+	})
+}
+
+type watchdogRuntimeCase struct {
+	id, title string
+	legacy    bool
+}
+
+func testWatchdogRuntime(t *testing.T, tc watchdogRuntimeCase) {
+	t.Helper()
+	s := harness.NewScenario(t, tc.id, harness.Options{
+		Guarantees: []string{"entry-point"}, Title: tc.title,
 		Budget: 90 * time.Second, NoStart: true,
 	})
 	defer s.Finish()
@@ -64,13 +83,22 @@ func TestEntryWatchdogRuntimeUpgradeAndRollback(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer log.Close()
-	cmd := exec.Command(entry, "teams", "service", "watchdog", "--loop", "--interval", "50ms", "--quiet")
+	launch := entry
+	if tc.legacy {
+		launch = filepath.Join(root, "versions", "v9.9.0", "cxp")
+	}
+	cmd := exec.Command(launch, "teams", "service", "watchdog", "--loop", "--interval", "50ms", "--quiet")
 	for k, v := range s.Env.Vars {
 		if !strings.HasPrefix(k, "CXP_RUNTIME") && k != "CXP_ENTRY_PATH" {
 			cmd.Env = append(cmd.Env, k+"="+v)
 		}
 	}
 	cmd.Env = append(cmd.Env, "PATH="+os.Getenv("PATH"), "TMPDIR="+os.Getenv("TMPDIR"), "CXP_RUNTIME_FORCE=1")
+	if tc.legacy {
+		// The old entry launches the runtime with these three markers,
+		// without CXP_RUNTIME_VERSION. Use the real versioned executable.
+		cmd.Env = append(cmd.Env, "CXP_RUNTIME=1", "CXP_RUNTIME_ROOT="+root, "CXP_ENTRY_PATH="+entry)
+	}
 	cmd.Stdout, cmd.Stderr = log, log
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)

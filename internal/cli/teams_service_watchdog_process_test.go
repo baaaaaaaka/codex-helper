@@ -55,6 +55,10 @@ func TestTeamsServiceWatchdogRuntimeProcessChild(t *testing.T) {
 		}
 		os.Exit(code)
 	}
+	// These fixture copies share one test binary. Supply the build metadata
+	// that separate release builds embed; the CLI E2E uses actual builds.
+	current, _ := helperruntime.Current()
+	version = current.Version
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	teamsServiceWatchdogStatePath = func() (string, error) { return filepath.Join(dir, "state.json"), nil }

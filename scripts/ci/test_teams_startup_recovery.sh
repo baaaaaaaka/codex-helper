@@ -28,7 +28,7 @@ case "$mode" in
     run_tests ./internal/cli '^Test(TeamsCoreStore|FirstStart|TeamsServiceWatchdog|RunTeamsServiceWatchdog)' 'TestTeamsCoreStoreDoesNotWriteAfterLeaseLoss,TestTeamsCoreStoreLossAfterPreparationStarts,TestTeamsCoreStoreResumesMigrationAfterAbortedStart,TestTeamsCoreStorePreparationAfterMigrationBeforeActivation,TestTeamsServiceWatchdogRefreshesRuntimeBeforeHealthCheck,TestTeamsServiceWatchdogRuntimeProcessUpgradeAndRollback' 1
     ;;
   e2e)
-    run_tests ./internal/e2e/scenarios/entry '^Test(EntryMigration|EntryWatchdogRuntime)' 'TestEntryMigrationResumesAfterInterruptedStart,TestEntryMigrationResumesAfterCrashDuringImport,TestEntryMigrationTakeoverFencesWaitingOwner,TestEntryMigrationTakeoverFencesImporter,TestEntryWatchdogRuntimeUpgradeAndRollback,TestEntryMigrationRefusesMissingPublishedDatabase' 3
+    run_tests ./internal/e2e/scenarios/entry '^Test(EntryMigration|EntryWatchdogRuntime)' 'TestEntryMigrationResumesAfterInterruptedStart,TestEntryMigrationResumesAfterCrashDuringImport,TestEntryMigrationTakeoverFencesWaitingOwner,TestEntryMigrationTakeoverFencesImporter,TestEntryWatchdogRuntimeUpgradeAndRollback,TestEntryWatchdogRuntimeLegacyLauncher,TestEntryMigrationRefusesMissingPublishedDatabase' 3
     ;;
   *)
     echo "usage: $0 [unit|e2e]" >&2

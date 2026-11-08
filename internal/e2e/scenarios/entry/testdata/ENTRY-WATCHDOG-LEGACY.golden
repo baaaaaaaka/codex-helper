@@ -1,0 +1,2 @@
+# ENTRY-WATCHDOG-LEGACY: a watchdog entered by an older launcher without a pinned version follows activation and rollback
+# cxp black-box transcript; volatile values are numbered placeholders

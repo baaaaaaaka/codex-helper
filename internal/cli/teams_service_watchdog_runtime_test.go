@@ -14,14 +14,20 @@ import (
 
 func TestTeamsServiceWatchdogRefreshesRuntimeBeforeHealthCheck(t *testing.T) {
 	lockCLITestHooks(t)
+	previousVersion := version
+	version = "v1.2.3"
+	t.Cleanup(func() { version = previousVersion })
 	for _, tc := range []struct {
-		name, active        string
-		dry, unmanaged      bool
-		wantExec, wantCheck bool
+		name, active           string
+		dry, unmanaged, legacy bool
+		wantExec, wantCheck    bool
 	}{
 		{name: "same version", active: "v1.2.3", wantCheck: true},
 		{name: "upgrade", active: "v1.2.4", wantExec: true},
 		{name: "rollback", active: "v1.2.2", wantExec: true},
+		{name: "legacy launcher same version", active: "v1.2.3", legacy: true, wantCheck: true},
+		{name: "legacy launcher upgrade", active: "v1.2.4", legacy: true, wantExec: true},
+		{name: "legacy launcher rollback", active: "v1.2.2", legacy: true, wantExec: true},
 		{name: "dry run", active: "v1.2.4", dry: true, wantCheck: true},
 		{name: "unmanaged", unmanaged: true, wantCheck: true},
 		{name: "missing pointer"},
@@ -33,6 +39,9 @@ func TestTeamsServiceWatchdogRefreshesRuntimeBeforeHealthCheck(t *testing.T) {
 			t.Setenv(helperruntime.EnvRuntime, "1")
 			t.Setenv(helperruntime.EnvRuntimeRoot, dir)
 			t.Setenv(helperruntime.EnvRuntimeVersion, "v1.2.3")
+			if tc.legacy {
+				t.Setenv(helperruntime.EnvRuntimeVersion, "")
+			}
 			t.Setenv(helperruntime.EnvEntryPath, entry)
 			if tc.unmanaged {
 				t.Setenv(helperruntime.EnvRuntime, "")

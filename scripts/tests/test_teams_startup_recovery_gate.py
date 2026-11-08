@@ -25,6 +25,7 @@ NAMES = [
     "TestEntryMigrationTakeoverFencesWaitingOwner",
     "TestEntryMigrationTakeoverFencesImporter",
     "TestEntryWatchdogRuntimeUpgradeAndRollback",
+    "TestEntryWatchdogRuntimeLegacyLauncher",
     "TestEntryMigrationRefusesMissingPublishedDatabase",
 ]
 
