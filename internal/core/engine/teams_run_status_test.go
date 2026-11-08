@@ -21,7 +21,12 @@ func TestTeamsRunTurnPostsV0120StatusAndAnswer(t *testing.T) {
 	var got []string
 	for _, m := range r.own(work, "") {
 		if strings.HasPrefix(m.Text, "🤖") {
-			got = append(got, m.Text)
+			for i, block := range strings.Split(m.Text, "\n\n🤖 ⏳ Codex status:\n") {
+				if i > 0 {
+					block = "🤖 ⏳ Codex status:\n" + block
+				}
+				got = append(got, block)
+			}
 		}
 		if m.MentionsOwner {
 			t.Errorf("work-chat post mentions the owner: %q", m.Text)

@@ -142,7 +142,7 @@ func (t *Tx) MarkStarting(turnID int64, threadID string) error {
 // MarkRunning records Codex's acceptance of the turn.
 func (t *Tx) MarkRunning(turnID int64, codexTurnID string, shared ...bool) error {
 	isShared := len(shared) > 0 && shared[0]
-	return t.turnMove(turnID, []string{TurnStarting}, `state = 'running', codex_turn_id = ?, shared=?`, nullStr(codexTurnID), isShared)
+	return t.turnMove(turnID, []string{TurnStarting}, `state = 'running', codex_turn_id = ?, shared=?, transcript_done=0`, nullStr(codexTurnID), isShared)
 }
 
 // RequeueTurn puts a starting/running turn back to queued for a capacity
@@ -194,6 +194,13 @@ func (t *Tx) FinishTurn(turnID int64, state, errText string, outputs []OutMsg) e
 		if _, err := t.exec(`UPDATE inbound SET state = 'done' WHERE id = ? AND state IN ('queued','held')`, tr.InboundID); err != nil {
 			return err
 		}
+	}
+	hold := int64(0)
+	if tr.TranscriptProgress && tr.CodexTurnID != "" && !tr.TranscriptDone {
+		hold = tr.ID
+	}
+	for i := range outputs {
+		outputs[i].HoldTurn = hold
 	}
 	_, err = t.Enqueue(tr.ConvID, outputs)
 	return err

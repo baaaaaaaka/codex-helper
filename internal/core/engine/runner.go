@@ -377,6 +377,31 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 	defer close(rs.done)
 	id := cs.id
 	accepted := false
+	transcriptProgress := false
+	if a, ok := e.ag.(TranscriptAgent); ok && a.TranscriptProgress() && e.cfg.SessionsDir != "" && cs.kind == store.KindWork && rs.request == "" {
+		// Persist ownership before allowing the agent to write any record.
+		if err := e.persist(ctx, "assign transcript progress", func(tx *store.Tx) error { return tx.SetTranscriptProgress(tr.ID) }); err != nil {
+			e.logf("assign progress of %s: %v", cs.label, err)
+			e.fail(err)
+			e.clearRun(id, rs)
+			return
+		}
+		tr.TranscriptProgress, transcriptProgress = true, true
+		e.mu.Lock()
+		cs.transcriptOpen = true
+		e.mu.Unlock()
+		e.mirror.mu.Lock()
+		e.mirror.progressClients[tr.TurnKey] = tr.ID
+		e.mirror.mu.Unlock()
+		defer func() {
+			if tr.CodexTurnID != "" {
+				return // the client key also identifies earlier capacity attempts
+			}
+			e.mirror.mu.Lock()
+			delete(e.mirror.progressClients, tr.TurnKey)
+			e.mirror.mu.Unlock()
+		}()
+	}
 	prog := &progressState{queued: rs.queuedPrompt}
 	touch := func() { rs.lastEvent.Store(ms(e.now())) }
 	touch()
@@ -389,15 +414,19 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 				prog.progressed = true
 				prog.mu.Unlock()
 			}
-			if rs.request == "" { // delegated turns post no progress
+			if transcriptProgress {
+				wake(e.mirrorWake)
+			} else if rs.request == "" {
 				e.progress(ctx, cs, tr, prog, text)
 			}
 		},
 		// v0.1.20 posted each compaction as Codex status; it is one more
-		// progress message (same pacing, caps and delivery keys).
+		// progress message (same pacing and durable delivery keys).
 		Compacted: func() {
 			touch()
-			if rs.request == "" {
+			if transcriptProgress {
+				wake(e.mirrorWake)
+			} else if rs.request == "" {
 				e.progress(ctx, cs, tr, prog, textCompacted)
 			}
 		},
@@ -405,7 +434,7 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 		// v0.1.20 posted a Codex status when Codex retried within the
 		// turn (a dropped stream it reconnects), at most once per
 		// RetryStatus per turn; it is a progress message (same pacing,
-		// caps and delivery keys) and does not count as Codex output.
+		// delivery keys) and does not count as Codex output.
 		Retrying: func(message, code string) {
 			touch()
 			if rs.request != "" {
@@ -419,7 +448,7 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 			}
 			prog.mu.Unlock()
 			if due {
-				e.progress(ctx, cs, tr, prog, textReconnecting(message, code))
+				e.progressRecord(ctx, cs, tr, prog, textReconnecting(message, code), false)
 			}
 		},
 		Cancelled: func() bool {
@@ -442,8 +471,15 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 			e.wakeRunner(id)
 			_, shared := e.ag.(TUIAgent)
 			e.mirrorSkipTurnMode(codexTurnID, shared)
-			if err := e.update(func(tx *store.Tx) error { return tx.MarkRunning(tr.ID, codexTurnID, shared) }); err != nil {
+			tr.CodexTurnID = codexTurnID
+			if transcriptProgress {
+				e.mirror.mu.Lock()
+				e.mirror.progressTurns[codexTurnID] = tr.ID
+				e.mirror.mu.Unlock()
+			}
+			if err := e.persist(ctx, "record native acceptance", func(tx *store.Tx) error { return tx.MarkRunning(tr.ID, codexTurnID, shared) }); err != nil {
 				e.logf("mark running %s: %v", cs.label, err)
+				e.fail(err)
 			}
 		},
 	}
@@ -453,8 +489,8 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 		}
 	}
 	stopWatch := e.watchSilence(ctx, cs, tr, rs)
+	defer stopWatch()
 	out, err := e.ag.Run(ctx, req, hooks)
-	stopWatch()
 	if ctx.Err() != nil {
 		// Shutting down: nothing is recorded; the next start reconciles.
 		e.clearRun(id, rs)
@@ -681,6 +717,16 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 		return nil
 	}) {
 		return
+	}
+	if tr.TranscriptProgress {
+		if tr.CodexTurnID == "" {
+			// Rejection before native acceptance has no source terminal to
+			// release publication ownership. It also created no held final.
+			e.mu.Lock()
+			cs.transcriptOpen = false
+			e.mu.Unlock()
+		}
+		wake(e.mirrorWake)
 	}
 	if state == store.TurnCompleted {
 		e.count(func(s *engineStats) { s.completed++ })
@@ -1140,6 +1186,18 @@ func (e *Engine) awaitFirstRead(ctx context.Context, cs *convState) bool {
 }
 
 func (e *Engine) finishReconciled(ctx context.Context, cs *convState, tr store.Turn, out TurnOutcome) {
+	// A crash may occur after turn/start was accepted but before Started
+	// persisted its native id. Recover that acceptance before the reader barrier.
+	if tr.TranscriptProgress && tr.State == store.TurnStarting && out.CodexTurnID != "" && !out.NotStarted {
+		_, shared := e.ag.(TUIAgent)
+		if err := e.persist(ctx, "recover native acceptance", func(tx *store.Tx) error { return tx.MarkRunning(tr.ID, out.CodexTurnID, shared) }); err != nil {
+			e.fail(err)
+			return
+		}
+		tr.CodexTurnID = out.CodexTurnID
+		tr.State = store.TurnRunning
+		wake(e.mirrorWake)
+	}
 	if cs.id == e.inboxID {
 		out.Capacity = false
 		e.finishDelegation(ctx, cs, tr, out, false)
@@ -1163,20 +1221,7 @@ func (e *Engine) finishReconciled(ctx context.Context, cs *convState, tr store.T
 	e.finish(ctx, cs, tr, out, false, "")
 }
 
-// Progress (commentary while a turn runs). Each commentary message becomes
-// one chat message before the final, except:
-//   - group chats (other people present): none;
-//   - coalescing (CORE-DESIGN §3): when other turns wait behind this one in
-//     the conversation, the account's writes are paced below the demand
-//     (pace.go), or the account write gate closed within the last 5 min,
-//     at most one progress message per turn;
-//   - at most maxProgress per turn.
-// The final is always complete; progress only shows the turn is alive.
-
-const (
-	maxProgress         = 20
-	progressCoalesceFor = 5 * time.Minute
-)
+// Progress callbacks are serialized and durably enqueued without content caps.
 
 // progressState counts one turn's progress messages. Progress callbacks can
 // come from more than one goroutine (the agent's reader and its replay of
@@ -1195,61 +1240,71 @@ type progressState struct {
 }
 
 func (e *Engine) progress(ctx context.Context, cs *convState, tr store.Turn, ps *progressState, text string) {
+	e.progressRecord(ctx, cs, tr, ps, text, true)
+}
+func (e *Engine) progressRecord(ctx context.Context, cs *convState, tr store.Turn, ps *progressState, text string, merge bool) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
 	text = strings.TrimSpace(transcript.StripMemCitations(text)) // F-MIR-8
-	e.mu.Lock()
-	group := cs.group
-	e.mu.Unlock()
-	if text == "" || group || ps.posted >= maxProgress {
-		return
-	}
-	now := e.now()
-	// Paced account writes (the write rate is below the demand) or a
-	// recent write throttle: one progress message per turn.
-	coalesce := e.writeTokens.limited()
-	if until := e.gate(e.gWrite); !until.IsZero() && now.Sub(until) < progressCoalesceFor {
-		coalesce = true
-	}
-	if coalesce && ps.posted >= 1 {
+	if text == "" {
 		return
 	}
 	if ps.queued != "" {
 		text = textStarting(ps.queued) + "\n\n" + text
 	}
-	doc := statusDoc(text)
-	doc.Notes = infoNotes(e.turnInfo(cs.id), false)
-	msgs, err := e.render(ctx, doc, store.OutProgress,
-		fmt.Sprintf("turn:%d:progress:%d", tr.ID, ps.posted+1))
-	if err != nil {
-		e.logf("progress of %s: %v", cs.label, err)
-		return
-	}
-	queued := false
-	err = e.update(func(tx *store.Tx) error {
-		queued = false
-		if ps.posted >= 1 {
-			open, err := tx.OpenTurnsOf(cs.id)
-			if err != nil {
+	for attempt := 0; ctx.Err() == nil; attempt++ {
+		doc := statusDoc(text)
+		doc.Notes = infoNotes(e.turnInfo(cs.id), false)
+		msgs, err := e.render(ctx, doc, store.OutProgress,
+			fmt.Sprintf("turn:%d:progress:%d", tr.ID, ps.posted+1))
+		if err != nil {
+			if attempt < 3 || attempt%20 == 0 {
+				e.logf("progress of %s: %v; retaining for retry", cs.label, err)
+			}
+			if !e.waitProgress(ctx, attempt) {
+				return
+			}
+			continue
+		}
+		if merge {
+			for i := range msgs {
+				msgs[i].ProgressGroup = fmt.Sprintf("turn:%d", tr.ID)
+			}
+		}
+		queued := false
+		err = e.update(func(tx *store.Tx) error {
+			queued = false
+			if _, err := tx.Enqueue(cs.id, msgs); err != nil {
 				return err
 			}
-			if len(open) > 1 {
-				return nil // turns wait behind this one: one progress message is enough
+			queued = true
+			return nil
+		})
+		if err != nil {
+			if attempt < 3 || attempt%20 == 0 {
+				e.logf("progress of %s: %v; retaining for retry", cs.label, err)
 			}
+			if !e.waitProgress(ctx, attempt) {
+				return
+			}
+			continue
 		}
-		if _, err := tx.Enqueue(cs.id, msgs); err != nil {
-			return err
+		if queued {
+			ps.posted++
+			ps.queued = ""
+			e.wakeSender()
 		}
-		queued = true
-		return nil
-	})
-	if err != nil {
-		e.logf("progress of %s: %v", cs.label, err)
 		return
 	}
-	if queued {
-		ps.posted++
-		ps.queued = ""
-		e.wakeSender()
+}
+
+func (e *Engine) waitProgress(ctx context.Context, attempt int) bool {
+	t := time.NewTimer(min(e.t.Hot<<min(attempt, 8), e.t.MaxBackoff))
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
 	}
 }

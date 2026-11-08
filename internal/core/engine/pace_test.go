@@ -409,8 +409,8 @@ func TestRepliesBeforeProgressWhenWritesArePaced(t *testing.T) {
 }
 
 // While the account's writes are paced below the demand (no 429 needed),
-// a turn posts at most one progress message; its ACK and final still go
-// ahead of the progress backlog of other chats.
+// a turn preserves all progress while combining adjacent records; its ACK
+// and final still go ahead of the progress backlog of other chats.
 func TestProgressCoalescedWhileWritesArePaced(t *testing.T) {
 	skipWallClockPacingUnderRace(t)
 	// Each backlog chat sends at most once per ChatRate (1 s): 12 chats
@@ -430,8 +430,13 @@ func TestProgressCoalescedWhileWritesArePaced(t *testing.T) {
 			n++
 		}
 	}
-	if n != 1 {
-		t.Fatalf("%d progress messages while the account's writes are paced, want 1", n)
+	if n < 1 || n > 3 {
+		t.Fatalf("unexpected progress message count %d", n)
+	}
+	for _, text := range []string{"step A", "step B", "step C"} {
+		if len(r.own(work, text)) != 1 {
+			t.Fatalf("missing or duplicate %q", text)
+		}
 	}
 }
 

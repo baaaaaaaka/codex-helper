@@ -338,3 +338,10 @@ type ActivityScanner interface {
 	// limit). The order and times are the service's.
 	ScanActivity(ctx context.Context, since time.Time) ([]ChatActivity, error)
 }
+
+// PartCombiner optionally combines complete rendered progress parts, preserving
+// every visible block. It declines unsafe or oversized combinations. The core
+// freezes accepted payloads and membership before attempting any channel write.
+type PartCombiner interface {
+	CombineProgress([]Part) (Part, bool)
+}

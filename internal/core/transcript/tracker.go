@@ -1,6 +1,9 @@
 package transcript
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -9,6 +12,7 @@ import (
 type OutputKind string
 
 const (
+	OutputEnd     OutputKind = "end"     // internal durable ordering barrier; never rendered
 	OutputPrompt  OutputKind = "prompt"  // a user prompt
 	OutputFinal   OutputKind = "final"   // the final answer of a turn
 	OutputStatus  OutputKind = "status"  // commentary (assistant message, phase commentary)
@@ -25,18 +29,19 @@ const CompactText = "Context compacted. Earlier turns were summarized so Codex c
 // "t:<turn>:<kind>:<line>" (final, prompt, status, compact; line is the
 // 1-based line of the record).
 type Output struct {
-	helperInput bool
-	localPrompt bool // an identified native TUI input inside a shared turn
-	RecordID    string
-	Kind        OutputKind
-	User        bool // Kind == OutputPrompt
-	Text        string
-	Time        time.Time
-	TurnID      string
-	End         int64 // end offset of the record
-	Info        Info  // the thread's goal and settings when the record was released
-	line        int64 // 1-based line of the record (ids of id-less records)
-	start       int64
+	helperInput    bool
+	localPrompt    bool   // an identified native TUI input inside a shared turn
+	LegacyRecordID string // line-based key used by older helpers
+	RecordID       string
+	Kind           OutputKind
+	User           bool // Kind == OutputPrompt
+	Text           string
+	Time           time.Time
+	TurnID         string
+	End            int64 // end offset of the record
+	Info           Info  // the thread's goal and settings when the record was released
+	line           int64 // 1-based line of the record (ids of id-less records)
+	start          int64
 }
 
 // Info is what the rollout said last of its thread's goal and model
@@ -95,8 +100,10 @@ type Skip func(clientID, turnID string) bool
 // held record), or the read position when nothing is open, so a restart
 // re-reads at most the open turn and regenerates the same record ids.
 type Tracker struct {
-	threadID string
-	skip     Skip
+	stableIDs      bool
+	threadID       string
+	skip           Skip
+	helperProgress func(string, string) bool
 
 	off, line int64 // next read position
 	turn      *openTurn
@@ -119,11 +126,16 @@ func (t *Tracker) SetInfo(i Info) { t.info = i }
 func (t *Tracker) stamp(out []Output, from int) {
 	for i := from; i < len(out); i++ {
 		out[i].Info = t.info
+		if !t.stableIDs && out[i].LegacyRecordID != "" {
+			out[i].RecordID = out[i].LegacyRecordID
+			out[i].LegacyRecordID = ""
+		}
 	}
 }
 
 type openTurn struct {
 	id              string
+	clientID        string
 	started         bool // its start record was read (not a scan that began mid-turn)
 	start           int64
 	startLine       int64
@@ -132,13 +144,15 @@ type openTurn struct {
 	legacyInput     bool
 	decided         bool // the helper/local decision is known
 	finalSeen       bool
-	lastAsync       string // bounded by the rollout reader's record limit
+	unphased        *Output // one-message look-behind; bounded independently of turn length
+	lastAsync       string  // bounded by the rollout reader's record limit
 	// prompted: a prompt record was read; early: decided by a commentary
 	// record of a turn without a prompt (a goal continuation, which Codex
 	// starts by itself), so a prompt steered into it later waits for its
 	// user item again.
 	prompted, early bool
 	pending         []Output
+	fallback        map[OutputKind]int64
 }
 
 type heldCompact struct {
@@ -162,8 +176,31 @@ func NewTracker(threadID string, off, line int64, skip Skip) *Tracker {
 // that kept no record of them). Their prompts lose the helper's envelope.
 func (t *Tracker) KeepTeams(until int64) { t.keep = until }
 
+// StableFallbackIDs uses turn-local occurrences for id-less records, with
+// legacy line keys as aliases. Enable for durable mirroring, not old converters.
+func (t *Tracker) StableFallbackIDs() { t.stableIDs = true }
+
+// HelperProgress enables only commentary and compactions of executions whose
+// runner delegates progress to this reader. Prompts and final artifacts still
+// belong to the runner; legacy helper executions remain excluded.
+func (t *Tracker) HelperProgress(enabled func(string) bool) {
+	t.helperProgress = func(_ string, turn string) bool { return enabled(turn) }
+}
+
+// HelperProgressByClient recognizes ownership even before the native started callback.
+func (t *Tracker) HelperProgressByClient(enabled func(string, string) bool) {
+	t.helperProgress = enabled
+}
+
 // kept returns o, a record of a helper-run turn, when KeepTeams keeps it.
-func (t *Tracker) kept(o Output) (Output, bool) {
+func (t *Tracker) kept(o Output, tr *openTurn) (Output, bool) {
+	client := ""
+	if tr != nil {
+		client = tr.clientID
+	}
+	if (o.Kind == OutputStatus || o.Kind == OutputCompact) && t.helperProgress != nil && t.helperProgress(client, o.TurnID) {
+		return o, true
+	}
 	if o.End > t.keep {
 		return o, false
 	}
@@ -215,9 +252,9 @@ func (t *Tracker) Resume() (offset, line int64) {
 	return offset, line
 }
 
-// Restart rereads a rewritten file from its beginning. The caller drops
-// the outputs that were already delivered (by record id) and those before
-// the last delivered record (realignment by record id, §3.9).
+// Restart rereads a rewritten file from its beginning. The caller checks
+// every output part's durable identity; a later represented record does
+// not hide an earlier missing one.
 func (t *Tracker) Restart() {
 	t.off, t.line, t.turn, t.prev, t.held = 0, 0, nil, nil, nil
 }
@@ -260,9 +297,10 @@ func (t *Tracker) flush(out []Output) []Output {
 		return out
 	}
 	for _, o := range tr.pending {
+		o = resolve(o, tr)
 		if (tr.teams || o.helperInput) && !o.localPrompt {
 			var ok bool
-			if o, ok = t.kept(o); !ok {
+			if o, ok = t.kept(o, tr); !ok {
 				continue
 			}
 		}
@@ -284,7 +322,7 @@ func (t *Tracker) add(out []Output, o Output, tr *openTurn) []Output {
 	case !tr.teams:
 		out = append(out, resolve(o, tr))
 	default:
-		if k, ok := t.kept(o); ok {
+		if k, ok := t.kept(resolve(o, tr), tr); ok {
 			out = append(out, resolve(k, tr))
 		}
 	}
@@ -353,6 +391,9 @@ func (t *Tracker) apply(out []Output, ev Event, l Line) []Output {
 		if ev.ClientID != "" {
 			own := t.skip(ev.ClientID, "")
 			steer := strings.HasPrefix(ev.ClientID, "cxp-steer-")
+			if !steer && (tr.clientID == "" || own) {
+				tr.clientID = ev.ClientID
+			}
 			if !steer && ((own && !tr.inputIdentified) || tr.legacyInput) {
 				tr.teams = true
 			}
@@ -384,6 +425,7 @@ func (t *Tracker) apply(out []Output, ev Event, l Line) []Output {
 		if text == "" {
 			return out
 		}
+		out = t.flushUnphased(out, false)
 		switch ev.Phase {
 		case "commentary":
 			if t.turn == nil {
@@ -400,6 +442,15 @@ func (t *Tracker) apply(out []Output, ev Event, l Line) []Output {
 			o := Output{RecordID: ev.RecordID, Kind: OutputStatus, Text: text, Time: ev.Time, End: l.End, line: t.line, start: l.Off}
 			return t.add(out, o, t.turn)
 		case "final_answer":
+		case "":
+			if !t.stableIDs {
+				return out
+			} // legacy converter selection stays compatible
+			if t.turn == nil {
+				t.turn = &openTurn{}
+			}
+			t.turn.unphased = &Output{RecordID: ev.RecordID, Kind: OutputStatus, Text: text, Time: ev.Time, End: l.End, line: t.line, start: l.Off}
+			return out
 		default:
 			return out
 		}
@@ -422,13 +473,10 @@ func (t *Tracker) apply(out []Output, ev Event, l Line) []Output {
 		tr.finalSeen, tr.decided = true, true
 		out = t.flush(out)
 		if !tr.teams || l.End <= t.keep {
-			id := ev.RecordID
-			if id == "" {
-				id = turnRecordID(tr.id, OutputFinal, t.line)
-			}
-			out = append(out, Output{RecordID: id, Kind: OutputFinal, Text: text, Time: ev.Time, TurnID: tr.id, End: l.End, line: t.line, start: l.Off})
+			out = append(out, resolve(Output{RecordID: ev.RecordID, Kind: OutputFinal, Text: text, Time: ev.Time, End: l.End, line: t.line, start: l.Off}, tr))
 		}
 	case KindCompact:
+		out = t.flushUnphased(out, false)
 		o := Output{Kind: OutputCompact, Text: CompactText, Time: ev.Time, End: l.End, line: t.line, start: l.Off}
 		tr := t.turn
 		if tr == nil {
@@ -451,16 +499,25 @@ func (t *Tracker) apply(out []Output, ev Event, l Line) []Output {
 			return out
 		}
 		tr.decided = true
+		out = t.flush(out) // held prompts must precede a last unphased answer
+		if tr.unphased != nil {
+			final := strings.TrimSpace(StripMemCitations(ev.Text))
+			isFinal := final == "" || final == tr.unphased.Text
+			out = t.flushUnphased(out, isFinal)
+		}
 		out = t.flush(out)
 		// last_agent_message is the final only for a turn whose start was
 		// read and that had no final_answer item: a scan that began
 		// mid-turn usually begins right after the delivered final.
 		if final := strings.TrimSpace(StripMemCitations(ev.Text)); tr.started && !tr.finalSeen && (!tr.teams || l.End <= t.keep) && final != "" && final != tr.lastAsync {
-			out = append(out, Output{RecordID: turnRecordID(tr.id, OutputFinal, t.line), Kind: OutputFinal, Text: final, Time: ev.Time, TurnID: tr.id, End: l.End, line: t.line, start: l.Off})
+			out = append(out, resolve(Output{Kind: OutputFinal, Text: final, Time: ev.Time, End: l.End, line: t.line, start: l.Off}, tr))
 		}
+		out = t.progressEnd(out, tr, l.End)
 		t.turn, t.prev = nil, tr
 	case KindTurnAborted:
+		tr := t.turn
 		out = t.end(out)
+		out = t.progressEnd(out, tr, l.End)
 	}
 	return out
 }
@@ -488,6 +545,7 @@ func (t *Tracker) Settle() []Output {
 
 // end closes the open turn, releasing its held records.
 func (t *Tracker) end(out []Output) []Output {
+	out = t.flushUnphased(out, false)
 	if t.turn != nil {
 		t.turn.decided = true
 		out = t.flush(out)
@@ -503,6 +561,39 @@ func resolve(o Output, tr *openTurn) Output {
 	}
 	if o.RecordID == "" {
 		o.RecordID = turnRecordID(o.TurnID, o.Kind, o.line)
+		if tr != nil && tr.id != "" && tr.started {
+			// Turn-local occurrence, independent of unrelated file line shifts.
+			// Repeated identical text remains distinct. Old line keys remain
+			// valid aliases, so upgrades never resend already represented parts.
+			if tr.fallback == nil {
+				tr.fallback = map[OutputKind]int64{}
+			}
+			tr.fallback[o.Kind]++
+			o.LegacyRecordID = o.RecordID
+			sum := sha256.Sum256([]byte(o.Text))
+			o.RecordID = "t:" + tr.id + ":" + string(o.Kind) + ":o:" + strconv.FormatInt(tr.fallback[o.Kind], 10) + ":" + hex.EncodeToString(sum[:8])
+		}
 	}
 	return o
+}
+
+func (t *Tracker) flushUnphased(out []Output, final bool) []Output {
+	tr := t.turn
+	if tr == nil || tr.unphased == nil {
+		return out
+	}
+	o := *tr.unphased
+	tr.unphased = nil
+	if final {
+		o.Kind = OutputFinal
+		tr.finalSeen = true
+	}
+	return t.add(out, o, tr)
+}
+
+func (t *Tracker) progressEnd(out []Output, tr *openTurn, end int64) []Output {
+	if tr != nil && t.helperProgress != nil && t.helperProgress(tr.clientID, tr.id) {
+		return append(out, Output{Kind: OutputEnd, TurnID: tr.id, End: end})
+	}
+	return out
 }

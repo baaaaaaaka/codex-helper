@@ -26,6 +26,10 @@ func TestGraphOutageWhileRunning(t *testing.T) {
 		Guarantees: []string{"R-11", "R-9", "R-2"},
 		Title:      "Graph returns 503 to everything for 25 s: no restart, no storm; afterwards the prompt is answered once and a new local session gets one chat",
 		Budget:     120 * time.Second,
+		Golden: harness.GoldenOptions{Races: []harness.Race{{
+			First: "Sent while Teams is down", Second: "💬 New local Codex chat detected",
+			Reason: "independent work completion and local-session discovery recover concurrently after the outage",
+		}}},
 		// Polling goes on at the poll cadence through an outage so that
 		// recovery takes one poll (SC-09a); over a 25 s outage the same
 		// chat list and message reads fail more than CapFailingRepeats

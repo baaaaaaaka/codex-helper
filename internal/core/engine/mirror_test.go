@@ -246,6 +246,15 @@ func TestMirrorStatIsTiered(t *testing.T) {
 	stats := map[string][]time.Time{}
 	infos := map[string]transcript.FileInfo{}
 	e := &Engine{t: tm, now: func() time.Time { return now }, log: io.Discard, convs: map[int64]*convState{}}
+	st, err := store.Open(filepath.Join(t.TempDir(), "core.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if _, err := st.Acquire(store.Ident{Host: "h", PID: 1, BootID: "b"}); err != nil {
+		t.Fatal(err)
+	}
+	e.st = st
 	e.statFile = func(p string) (transcript.FileInfo, error) {
 		stats[p] = append(stats[p], now)
 		return infos[p], nil

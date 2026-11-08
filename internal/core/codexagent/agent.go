@@ -594,3 +594,5 @@ func (a *Agent) CurrentTurn(conv int64, thread string) string {
 	}
 	return ""
 }
+
+func (*Agent) TranscriptProgress() bool { return true }

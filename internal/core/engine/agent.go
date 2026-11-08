@@ -232,3 +232,7 @@ var ErrBackendUncertain = errors.New("shared Codex connection lost; input outcom
 type InputRejected struct{ Reason string }
 
 func (e *InputRejected) Error() string { return e.Reason }
+
+// TranscriptAgent records completed commentary before Run returns. Its durable
+// rollout is the sole source of progress when the work chat has a mirror.
+type TranscriptAgent interface{ TranscriptProgress() bool }

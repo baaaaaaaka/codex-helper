@@ -24,16 +24,20 @@ import (
 // tick and no store access.
 
 const (
-	mirrorChunk    = 1 << 20 // bytes read per Read call
-	mirrorPassMax  = 8 << 20 // bytes read per file per pass
-	firstPromptMax = 256 << 10
+	mirrorChunk      = 1 << 20 // bytes read per Read call
+	mirrorPassMax    = 8 << 20 // bytes read per file per pass
+	firstPromptMax   = 256 << 10
+	mirrorRecordsMax = 256
 )
 
 type mirrorState struct {
-	mu        sync.Mutex
-	skipTurns map[string]bool // helper-owned Codex turn id -> shared transport
-	files     map[string]*mirrorFile
-	known     map[string]string // path -> state of untracked sources (baseline/ignored/missing)
+	bound           []string // bindings waiting for the reader to reconsider a pre-discovered source
+	mu              sync.Mutex
+	progressClients map[string]int64
+	progressTurns   map[string]int64
+	skipTurns       map[string]bool // helper-owned Codex turn id -> shared transport
+	files           map[string]*mirrorFile
+	known           map[string]string // path -> state of untracked sources (baseline/ignored/missing)
 	// checked: the file state of each baseline rollout the last discovery
 	// pass looked at and left as baseline; an unchanged file is skipped
 	// without a store transaction (review L11).
@@ -124,10 +128,9 @@ type mirrorFile struct {
 // (coordinator decision, parity round 2026-11-05). A record that already
 // existed when its source began catching up is catch-up: the source was
 // behind its end when the engine started (a converted store included), or
-// it is an old session found by discovery. Catch-up posts prompts and
-// finals only and notifies nobody. A record past that end is live and is
-// mirrored as v0.1.20 did: status and compaction posts too, and an owner
-// notification for each final.
+// it is an old session found by discovery. Catch-up preserves all selected
+// content and notifies nobody. A record past that end is live and can
+// produce an owner notification for its final.
 func (f *mirrorFile) catchingUp(o transcript.Output) bool { return o.End <= f.catchUpEnd }
 
 // catchUpFrom sets the catch-up end of a rollout first seen in state at:
@@ -187,6 +190,9 @@ func (e *Engine) mirrorSkipTurnMode(codexTurnID string, shared bool) {
 // mirrorBound is called when a conversation gets a (new) thread.
 func (e *Engine) mirrorBound(threadID string, conv int64) {
 	if e.mirror != nil {
+		e.mirror.mu.Lock()
+		e.mirror.bound = append(e.mirror.bound, threadID)
+		e.mirror.mu.Unlock()
 		wake(e.mirrorWake)
 	}
 }
@@ -213,6 +219,10 @@ func (e *Engine) mirrorInit() error {
 		return err
 	}
 	m.skipTurns = ids
+	m.progressTurns, m.progressClients, err = e.st.TranscriptProgressTurns()
+	if err != nil {
+		return err
+	}
 	v, _, err := e.st.Meta(metaMirrorInit)
 	if err != nil {
 		return err
@@ -240,7 +250,7 @@ func (e *Engine) mirrorInit() error {
 			}
 			continue
 		}
-		f := &mirrorFile{src: s, tracker: transcript.NewTracker(s.ThreadID, s.Offset, s.Line, e.mirrorSkip),
+		f := &mirrorFile{src: s, tracker: e.newMirrorTracker(s.ThreadID, s.Offset, s.Line, e.mirrorSkip),
 			info: transcript.FileInfo{Size: s.Size, MTime: fromMS(s.MTime), Inode: s.Inode}}
 		if v, _, err := e.st.Meta(realignKey(s.ID)); err == nil && v != "" {
 			var at int64
@@ -261,17 +271,20 @@ func (e *Engine) convOpen(id int64) bool {
 	defer e.mu.Unlock()
 	cs := e.convs[id]
 	// The control chat's Codex questions are not mirrored (batch B).
-	return cs != nil && cs.state != store.ConvClosed && cs.kind != store.KindControl
+	return cs != nil && (cs.state != store.ConvClosed || cs.transcriptOpen) && cs.kind != store.KindControl
 }
 
 // mirrorLoop watches $CODEX_HOME/sessions.
 func (e *Engine) mirrorLoop(ctx context.Context) {
-	if err := e.mirrorInit(); err != nil {
-		e.logf("mirror: %v", err)
-		e.catchUpReading.Store(false) // no catch-up to wait for
-		return
+	if e.mirror == nil {
+		if err := e.mirrorInit(); err != nil {
+			e.logf("mirror: %v", err)
+			e.catchUpReading.Store(false)
+			return
+		}
 	}
 	e.startFirstWalk()
+	var discoverAfter time.Time
 	stat := time.NewTicker(e.t.MirrorStat)
 	defer stat.Stop()
 	disc := time.NewTicker(e.t.Discovery)
@@ -287,13 +300,17 @@ func (e *Engine) mirrorLoop(ctx context.Context) {
 			// (W1b).
 			e.discoverFirst(ctx)
 		case <-e.mirrorWake:
-			e.discover(ctx)
+			if !e.now().Before(discoverAfter) {
+				e.discover(ctx)
+				discoverAfter = e.now().Add(e.t.MirrorStat)
+			}
 		case <-e.historyWake:
 			e.mirrorHistory() // a resume history check was decided
 		case <-disc.C:
 			e.discover(ctx)
 			e.discoverOld(ctx)
 		}
+		e.reconsiderBoundSources(ctx)
 		e.mirrorPoll(ctx)
 		e.catchUpReading.Store(e.catchUpPending())
 	}
@@ -605,15 +622,11 @@ func (e *Engine) newRollout(ctx context.Context, f transcript.Found, atStart boo
 	delete(e.mirror.unreadable, f.Path)
 	e.mirror.mu.Unlock()
 	src := store.TranscriptSource{Path: f.Path, ThreadID: meta.ID, Size: f.Info.Size, MTime: ms(f.Info.MTime), Inode: f.Info.Inode}
-	if meta.Subagent() {
-		src.State = store.SrcIgnored
-		return src, true
-	}
 	e.mu.Lock()
 	conv, bound := e.byThread[meta.ID]
 	var closed, forked bool
 	if cs := e.convs[conv]; bound && cs != nil {
-		closed = cs.state == store.ConvClosed || cs.kind == store.KindControl // batch B: control Q&A
+		closed = (cs.state == store.ConvClosed && !cs.transcriptOpen) || cs.kind == store.KindControl // batch B: control Q&A
 		forked = cs.forkParent != 0
 	}
 	delegated := e.delegThreads[meta.ID]
@@ -621,6 +634,10 @@ func (e *Engine) newRollout(ctx context.Context, f transcript.Found, atStart boo
 	if delegated {
 		// A delegated task's thread: its result goes to the requester,
 		// it is not a local session (no chat of its own).
+		src.State = store.SrcIgnored
+		return src, true
+	}
+	if !bound && meta.Subagent() {
 		src.State = store.SrcIgnored
 		return src, true
 	}
@@ -728,7 +745,7 @@ func (e *Engine) track(src store.TranscriptSource, catchUp int64) {
 		e.logf("mirror track %s: %v", filepath.Base(src.Path), err)
 		return
 	}
-	f := &mirrorFile{src: src, tracker: transcript.NewTracker(src.ThreadID, src.Offset, src.Line, e.mirrorSkip),
+	f := &mirrorFile{src: src, tracker: e.newMirrorTracker(src.ThreadID, src.Offset, src.Line, e.mirrorSkip),
 		catchUpEnd: catchUp, catchUpSet: true}
 	e.restoreInfo(f, f.tracker)
 	e.importRestore(f) // import.go
@@ -796,7 +813,7 @@ func (e *Engine) mirrorSession(ctx context.Context, src store.TranscriptSource, 
 	e.mirror.mu.Lock()
 	delete(e.mirror.known, src.Path)
 	delete(e.mirror.checked, src.Path)
-	e.mirror.files[src.Path] = &mirrorFile{src: src, tracker: transcript.NewTracker(meta.ID, offset, src.Line, e.mirrorSkip),
+	e.mirror.files[src.Path] = &mirrorFile{src: src, tracker: e.newMirrorTracker(meta.ID, offset, src.Line, e.mirrorSkip),
 		catchUpEnd: catchUp, catchUpSet: true}
 	e.mirror.mu.Unlock()
 	// The chat is created with the first record to mirror (mirrorRead).
@@ -849,10 +866,22 @@ func (e *Engine) mirrorPoll(ctx context.Context) {
 				f.catchUpEnd = info.Size
 			}
 		}
-		if f.held || (sameFile(info, f.info) && f.tracker.Offset() >= info.Size) {
+		if f.held {
+			continue
+		}
+		if sameFile(info, f.info) && f.tracker.Offset() >= info.Size {
+			e.settleProgressAtEOF(f, info, now)
+			continue
+		}
+		if !e.convOpen(f.src.ConvID) {
+			e.mirrorRead(ctx, f, info)
 			continue
 		}
 		if now.Before(f.retryAt) {
+			continue
+		}
+		blocked, err := e.st.PendingAtLeast(f.src.ConvID, mirrorRecordsMax)
+		if err != nil || blocked {
 			continue
 		}
 		e.mirrorRead(ctx, f, info)
@@ -929,7 +958,8 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 	}
 	var outs []transcript.Output
 	read := int64(0)
-	for read < mirrorPassMax {
+	records := 0
+	for read < mirrorPassMax && records < mirrorRecordsMax {
 		lines, next, err := transcript.Read(fh, f.tracker.Offset(), mirrorChunk)
 		if err != nil {
 			e.logf("mirror read %s: %v", filepath.Base(f.src.Path), err)
@@ -939,6 +969,11 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 			f.tracker.Advance(next)
 			break
 		}
+		if len(lines) > mirrorRecordsMax-records {
+			lines = lines[:mirrorRecordsMax-records]
+			next = lines[len(lines)-1].End
+		}
+		records += len(lines)
 		outs = append(outs, f.tracker.Feed(lines)...)
 		f.tracker.Advance(next)
 		read += next - lines[0].Off
@@ -949,7 +984,7 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 		// record will decide a turn still held (abandoned, s671).
 		outs = append(outs, f.tracker.Settle()...)
 	}
-	more := f.tracker.Offset() < info.Size && read >= mirrorPassMax
+	more := f.tracker.Offset() < info.Size && (read >= mirrorPassMax || records >= mirrorRecordsMax)
 
 	// Render outside the transaction.
 	thread := f.tracker.ThreadID()
@@ -965,11 +1000,22 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 	}
 	var rs []rendered
 	for _, o := range outs {
-		if o.End <= f.proven {
+		if o.Kind == transcript.OutputEnd {
+			rs = append(rs, rendered{o: o})
+			continue
+		}
+		if o.End <= f.proven && (o.Kind == transcript.OutputPrompt || o.Kind == transcript.OutputFinal) {
 			continue // found in the chat's history (history_check.go)
 		}
-		if o.Kind != transcript.OutputPrompt && o.Kind != transcript.OutputFinal && f.catchingUp(o) {
-			continue // catch-up posts prompts and finals only
+		if o.Kind != transcript.OutputFinal || !strings.Contains(o.Text, "```"+artifactFence) {
+			complete, err := e.st.RepresentedRecord(transcript.MirrorKeyPrefix(thread, o.RecordID))
+			if err != nil {
+				f.tracker = e.mirrorTracker(f)
+				return
+			}
+			if complete {
+				continue
+			}
 		}
 		msgs, err := e.renderMirror(ctx, thread, o, !f.catchingUp(o))
 		if err != nil {
@@ -1003,40 +1049,37 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 	}
 	e.mu.Unlock()
 	var posted, notify int
+	released := false
 	var liveThrough int64 // the seq of the last row queued for a live record
 	saved := f.infoSaved
 	err = e.update(func(tx *store.Tx) error {
 		posted, woke, created, notify, liveThrough = 0, false, false, 0, 0
+		released = false
 		saved = f.infoSaved
 		anyLive := false
 		var msgs []store.OutMsg
 		firstLive := false
-		start := 0
-		if realign {
-			// Realign: in this pass, drop everything up to the last record
-			// already delivered.
-			last := -1
-			for i, r := range rs {
-				ok, err := tx.Delivered(transcript.MirrorKeyPrefix(thread, r.o.RecordID))
-				if err != nil {
+		for _, r := range rs {
+			if r.o.Kind == transcript.OutputEnd {
+				if _, err := tx.Enqueue(f.src.ConvID, msgs); err != nil {
 					return err
 				}
-				if ok {
-					last = i
+				msgs = nil
+				e.mirror.mu.Lock()
+				local := e.mirror.progressTurns[r.o.TurnID]
+				e.mirror.mu.Unlock()
+				if err := tx.CompleteTranscriptProgress(local, r.o.TurnID); err != nil {
+					return err
 				}
+				released = true
+				continue
 			}
-			start = last + 1
-		}
-		for _, r := range rs[start:] {
-			ok, err := tx.Delivered(transcript.MirrorKeyPrefix(thread, r.o.RecordID))
+			ok, err := tx.RecordedParts(r.msgs)
 			if err != nil {
 				return err
 			}
 			if ok {
 				continue
-			}
-			if realign && (r.o.Time.IsZero() || !r.o.Time.After(realignAt)) {
-				continue // in the file before the rewrite: already handled
 			}
 			live := !f.catchingUp(r.o)
 			if posted == 0 {
@@ -1133,6 +1176,21 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 		f.tracker = e.mirrorTracker(f)
 		return
 	}
+	for _, r := range rs {
+		if r.o.Kind != transcript.OutputEnd {
+			continue
+		}
+		e.mirror.mu.Lock()
+		local := e.mirror.progressTurns[r.o.TurnID]
+		e.mirror.mu.Unlock()
+		if done, err := e.st.TranscriptProgressDone(local); err == nil && done {
+			e.mu.Lock()
+			if cs := e.convs[f.src.ConvID]; cs != nil && (cs.running == nil || cs.running.turnID == local) {
+				cs.transcriptOpen = false
+			}
+			e.mu.Unlock()
+		}
+	}
 	f.src.Offset, f.src.Line, f.src.Size, f.src.MTime, f.src.Inode = off, line, info.Size, ms(info.MTime), info.Inode
 	f.infoSaved = saved
 	f.realign, f.realignAt = realign && more, realignAt
@@ -1158,7 +1216,7 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 		_ = e.update(func(tx *store.Tx) error { _, err := e.refresh(tx, f.src.ConvID); return err })
 		e.logf("mirror: woke %d (local activity)", f.src.ConvID)
 	}
-	if posted > 0 || woke {
+	if posted > 0 || woke || released {
 		e.heat(f.src.ConvID)
 		e.wakeSender()
 	}
@@ -1199,15 +1257,37 @@ func (e *Engine) renderMirror(ctx context.Context, thread string, o transcript.O
 	}
 	if live && !o.User && o.Kind != transcript.OutputPrompt {
 		doc.Notes = infoNotes(mirrorInfo(o.Info), o.Kind == transcript.OutputFinal)
+		// Helper-owned progress keeps the runner's live goal annotation.
+		// Goal changes can arrive through the native API before rollout metadata.
+		owned := false
+		if e.mirror != nil {
+			e.mirror.mu.Lock()
+			owned = e.mirror.progressTurns[o.TurnID] != 0
+			e.mirror.mu.Unlock()
+		}
+		if owned && (o.Kind == transcript.OutputStatus || o.Kind == transcript.OutputCompact) {
+			e.mu.Lock()
+			conv := e.byThread[thread]
+			e.mu.Unlock()
+			doc.Notes = infoNotes(e.turnInfo(conv), false)
+		}
 	}
 	parts, err := e.ch.Render(ctx, doc)
 	if err != nil {
 		return nil, err
 	}
+	group := ""
+	if (o.Kind == transcript.OutputStatus || o.Kind == transcript.OutputCompact) && o.TurnID != "" {
+		group = "mirror:" + thread + ":" + o.TurnID
+	}
 	out := make([]store.OutMsg, 0, len(parts))
 	for _, p := range parts {
-		out = append(out, store.OutMsg{DeliveryKey: o.Key(thread, p.Index), Kind: store.OutMirror, Part: p.Index, Parts: p.Count,
-			Body: p.Body, BodyHash: hashBytes(p.Hash)})
+		alternate := ""
+		if o.LegacyRecordID != "" {
+			alternate = transcript.MirrorKey(thread, o.LegacyRecordID, p.Index)
+		}
+		out = append(out, store.OutMsg{AlternateKey: alternate, DeliveryKey: o.Key(thread, p.Index), Kind: store.OutMirror, Part: p.Index, Parts: p.Count,
+			Body: p.Body, BodyHash: hashBytes(p.Hash), ProgressGroup: group})
 	}
 	return append(out, files...), nil
 }

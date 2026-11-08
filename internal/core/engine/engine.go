@@ -62,6 +62,7 @@ type Timing struct {
 	// R-19: hints after this much Codex silence in a running turn (0
 	// disables each). A silent turn is never stopped (F-TRN-18).
 	SilenceHint, SilenceStuck time.Duration
+	SilenceRepeat             time.Duration // repeated visible still-working hint; 0 disables repetition
 	// R-35: reminder cadence for a turn that stays queued (0 disables).
 	QueueReminder time.Duration
 	// ThrottleFloor is the wait after a throttle response that names no
@@ -94,7 +95,7 @@ func ProductionTiming() Timing {
 		ResolveDelay: 5 * time.Second, ResolveTries: 3, ResolveAbsent: 2 * time.Minute, CapacityRetry: 5 * time.Minute, CapacityBackoff: 10 * time.Second,
 		Heartbeat: 30 * time.Second, Maintenance: time.Minute, ChatRate: time.Second,
 		DuplicateFor: 3 * time.Minute, BreakerWindow: time.Minute, BreakerCount: 3,
-		SilenceHint: 7 * time.Minute, SilenceStuck: 15 * time.Minute,
+		SilenceHint: 2 * time.Minute, SilenceRepeat: 5 * time.Minute, SilenceStuck: 15 * time.Minute,
 		QueueReminder: 10 * time.Minute,
 		ThrottleFloor: 10 * time.Second,
 		PaceIncrease:  30 * time.Second,
@@ -317,7 +318,8 @@ type Engine struct {
 	// sendLast is, per send class (sendClass), the last work conversation
 	// the sender served; the next pass starts after it (round robin).
 	// Sender goroutine only.
-	sendLast [sendClasses]int64
+	sendLast       [sendClasses]int64
+	sendForeground int
 	// announceSeen is when a discovered session's unannounced chat was
 	// first seen by announcePass (announce.go), under mu; announceRun
 	// serialises the passes.
@@ -520,23 +522,43 @@ func (e *Engine) Run(ctx context.Context) error {
 		e.ag.Close()
 		return err
 	}
-	e.maintainQuestions(ctx)
-	defer func() { e.mu.Lock(); e.attachReady = false; e.mu.Unlock() }()
 	// The turns the previous process left open, read before the runner
 	// starts: a held turn this process starts must not be taken for one
 	// of them ("did not run" posted while it runs).
 	open, err := e.st.OpenTurns()
 	if err != nil {
-		e.logf("reconcile: %v", err)
+		return fmt.Errorf("load open requests: %w", err)
 	}
 	e.mu.Lock()
 	e.orphans = map[int64]bool{}
 	for _, tr := range open {
 		if tr.State != store.TurnQueued {
 			e.orphans[tr.ID] = true
+			if tr.TranscriptProgress {
+				if cs := e.convs[tr.ConvID]; cs != nil {
+					cs.transcriptOpen = true
+				}
+			}
 		}
 	}
 	e.mu.Unlock()
+	// Completed native tasks can have a final waiting in the existing outbox.
+	heldConvs, err := e.st.HeldProgressConversations()
+	if err != nil {
+		return err
+	}
+	for _, id := range heldConvs {
+		if cs := e.convs[id]; cs != nil {
+			cs.transcriptOpen = true
+		}
+	}
+	if e.cfg.SessionsDir != "" {
+		if err := e.mirrorInit(); err != nil {
+			return err
+		}
+	}
+	e.maintainQuestions(ctx)
+	defer func() { e.mu.Lock(); e.attachReady = false; e.mu.Unlock() }()
 	e.mu.Lock()
 	e.attachReady = true
 	e.mu.Unlock()
@@ -640,7 +662,7 @@ func (e *Engine) start(ctx context.Context) error {
 				return err
 			}
 			for _, r := range rows {
-				if r.State == store.OutSending {
+				if r.State == store.OutSending && (r.BatchHead == 0 || r.BatchHead == r.ID) {
 					if err := tx.MarkUnknown(r.ID, "helper stopped during send"); err != nil {
 						return err
 					}

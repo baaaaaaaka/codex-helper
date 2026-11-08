@@ -131,8 +131,10 @@ func TestCatchUpFinalsDoNotNotify(t *testing.T) {
 	if n := len(r.own(ctl, "New local Codex chat detected")); n != 0 {
 		t.Fatalf("session found at start notified (%d)", n)
 	}
-	if n := len(r.own(local, "Codex status")); n != 0 {
-		t.Fatalf("catch-up posted %d status notices", n)
+	for _, text := range []string{"commentary old one", "commentary old two"} {
+		if len(r.own(local, text)) != 1 {
+			t.Fatalf("missing catch-up status %q", text)
+		}
 	}
 	// Owner request 2026-11-07: Teams lists the chat only once it is
 	// opened, so a caught-up session's chat is announced once, in the
@@ -151,7 +153,7 @@ func TestCatchUpFinalsDoNotNotify(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.wait("live final notified", func() bool { return r.mentionsCovered(ctl) == 1 })
-	if got := r.own(local, "Codex status"); len(got) != 1 || got[0].Text != "🤖 ⏳ Codex status:\ncommentary new" {
+	if got := r.own(local, "commentary new"); len(got) != 1 {
 		t.Fatalf("live status notices: %+v", got)
 	}
 
@@ -166,8 +168,8 @@ func TestCatchUpFinalsDoNotNotify(t *testing.T) {
 	if n := r.mentionsCovered(ctl); n != 1 {
 		t.Fatalf("mentions cover %d finals after the restart catch-up, want 1", n)
 	}
-	if n := len(r.own(local, "Codex status")); n != 1 {
-		t.Fatalf("%d status notices after the restart catch-up, want 1 (the live one)", n)
+	if n := len(r.own(local, "commentary while down")); n != 1 {
+		t.Fatalf("restart catch-up commentary count %d", n)
 	}
 	if _, err := w.AppendTurn(rollout.Turn{Prompt: "prompt after", Answer: "answer after"}); err != nil {
 		t.Fatal(err)

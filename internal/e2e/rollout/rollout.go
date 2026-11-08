@@ -269,6 +269,7 @@ func (w *Writer) Written() []Written {
 
 // Turn describes one turn to append.
 type Turn struct {
+	Unphased bool
 	// ID is the Codex turn id. Empty generates one.
 	ID string
 	// ClientID is the turn/start clientUserMessageId, recorded as client_id
@@ -415,7 +416,7 @@ func (w *Writer) finishRecords(open OpenTurn, turn Turn) []map[string]any {
 		recs = append(recs, w.agent(turnID, "commentary", turn.Commentary)...)
 	}
 	w.logWritten("answer", turn.Answer)
-	recs = append(recs, w.agent(turnID, "final_answer", turn.Answer)...)
+	recs = append(recs, w.agent(turnID, finalPhase(turn.Unphased), turn.Answer)...)
 	recs = append(recs,
 		line(w.tick(), "event_msg", map[string]any{
 			"type": "token_count",
@@ -483,4 +484,11 @@ func (w *Writer) hex(n int) string {
 // look last-updated in the past.
 func (w *Writer) SetModTime(t time.Time) error {
 	return os.Chtimes(w.Path, t, t)
+}
+
+func finalPhase(unphased bool) string {
+	if unphased {
+		return ""
+	}
+	return "final_answer"
 }

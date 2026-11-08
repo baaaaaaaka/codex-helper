@@ -111,7 +111,7 @@ func scanInbound(sc scanner) (Inbound, error) {
 	return in, err
 }
 
-const turnCols = `id,conv_id,inbound_id,turn_key,state,thread_id,codex_turn_id,model,effort,attempt,retry_deadline,queued_at,started_at,finished_at,error,queued_only,steering`
+const turnCols = `id,conv_id,inbound_id,turn_key,state,thread_id,codex_turn_id,model,effort,attempt,retry_deadline,queued_at,started_at,finished_at,error,queued_only,steering,transcript_progress,transcript_done`
 
 func scanTurn(sc scanner) (Turn, error) {
 	var t Turn
@@ -133,11 +133,13 @@ func scanTurn(sc scanner) (Turn, error) {
 	p.str(&t.Error)
 	p.raw(&t.Queue)
 	p.raw(&t.Steering)
+	p.raw(&t.TranscriptProgress)
+	p.raw(&t.TranscriptDone)
 	err := p.scan(sc)
 	return t, err
 }
 
-const outboxCols = `id,conv_id,delivery_key,seq,kind,part,parts,body,body_hash,mention,reply_to,state,attempt_token,ext_msg_id,next_attempt_at,created_at,sent_at,note,hash_algo`
+const outboxCols = `id,conv_id,delivery_key,seq,kind,part,parts,body,body_hash,mention,reply_to,state,attempt_token,ext_msg_id,next_attempt_at,created_at,sent_at,note,hash_algo,progress_group,batch_head,batch_body,hold_turn`
 
 func scanOutbox(sc scanner) (Outbox, error) {
 	var o Outbox
@@ -161,7 +163,14 @@ func scanOutbox(sc scanner) (Outbox, error) {
 	p.int(&o.SentAt)
 	p.str(&o.Note)
 	p.str(&o.HashAlgo)
+	p.str(&o.ProgressGroup)
+	p.int(&o.BatchHead)
+	p.str(&o.BatchBody)
+	p.int(&o.HoldTurn)
 	err := p.scan(sc)
+	if o.BatchBody != "" {
+		o.Body = o.BatchBody
+	}
 	return o, err
 }
 

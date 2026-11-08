@@ -160,6 +160,8 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 		last := e.sendLast
 		rank := func(it sendItem) (int, int) {
 			switch {
+			case !stopping && e.sendForeground >= 8 && it.class == sendMirror && it.row.ID != 0 && now.Sub(fromMS(it.row.CreatedAt)) >= 2*time.Minute:
+				return -1, 0
 			case it.conv == ctl:
 				return 0, 0
 			case it.conv > last[it.class]:
@@ -265,6 +267,11 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 			if r.ConvID != ctl {
 				e.sendLast[it.class] = r.ConvID
 			}
+			if it.class == sendMirror {
+				e.sendForeground = 0
+			} else {
+				e.sendForeground++
+			}
 			var fp *store.OutFile
 			if isFile {
 				fp = &f
@@ -272,6 +279,11 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 					jobs = append(jobs, job{row: r, chat: chat, file: fp, upload: true})
 					continue
 				}
+			}
+			r, err = e.progressBatch(tx, r, ms(now))
+			if err != nil {
+				<-sem
+				return err
 			}
 			tok, err := tx.BeginSend(r.ID)
 			if err != nil {
@@ -473,19 +485,20 @@ func (e *Engine) send(ctx context.Context, r store.Outbox, chat, token string, f
 		e.mu.Unlock()
 		e.wakeSender()
 	}()
-	if ctx.Err() != nil && err != nil {
-		return // the row stays sending; the next start marks it unknown
-	}
 	var (
 		rej  *channel.Rejected
 		auth *channel.AuthRequired
 	)
 	th, throttled := channel.AsThrottled(err)
+	if ctx.Err() != nil && err != nil && !throttled && !errors.As(err, &rej) && !errors.As(err, &auth) {
+		return // cancellation without a definite rejection: reconcile on restart
+	}
 	switch {
 	case err == nil:
+		e.noteVisible(r)
 		e.rememberOwnPost(r.ConvID, sent.ID)
 		e.noteFinalSent(r.ConvID, r.Kind, sent.Time) // F-TRN-1 (rename.go)
-		if err := e.update(func(tx *store.Tx) error {
+		if err := e.persist(ctx, "record send outcome", func(tx *store.Tx) error {
 			if err := tx.MarkSent(r.ID, sent.ID); err != nil {
 				return err
 			}
@@ -500,7 +513,7 @@ func (e *Engine) send(ctx context.Context, r store.Outbox, chat, token string, f
 		}
 	case channel.IsAmbiguous(err):
 		e.logf("send %s to conversation %d: outcome unknown (%v); resolving by read-back", r.DeliveryKey, r.ConvID, err)
-		if err := e.update(func(tx *store.Tx) error { return tx.MarkUnknown(r.ID, clipText(err.Error(), 200)) }); err != nil {
+		if err := e.persist(ctx, "record send outcome", func(tx *store.Tx) error { return tx.MarkUnknown(r.ID, clipText(err.Error(), 200)) }); err != nil {
 			e.logf("mark unknown %d: %v", r.ID, err)
 		}
 		e.forgetFailures(r.ID)
@@ -517,14 +530,20 @@ func (e *Engine) send(ctx context.Context, r store.Outbox, chat, token string, f
 			e.setGate(e.gWrite, at, "send throttled")
 			e.paceThrottled(started, now.Add(e.retryAfter(th)))
 		}
-		e.requeue(r.ID, at)
+		e.requeue(ctx, r.ID, at)
 	case errors.As(err, &rej) && rej.Permanent:
 		e.logf("send %s to conversation %d rejected permanently: %v; dropped", r.DeliveryKey, r.ConvID, err)
-		if err := e.update(func(tx *store.Tx) error {
+		if err := e.persist(ctx, "record permanent rejection", func(tx *store.Tx) error {
 			if err := tx.Drop(r.ID, clipText(err.Error(), 200)); err != nil {
 				return err
 			}
-			return e.forkSettled(tx, r) // fork.go
+			if err := e.forkSettled(tx, r); err != nil {
+				return err
+			}
+			if r.Kind == store.OutProgress || r.Kind == store.OutMirror || r.Kind == store.OutFinal {
+				return e.enqueueNotice(tx, e.controlID, fmt.Sprintf("delivery-failed:%d", r.ID), fmt.Sprintf("Message delivery failed permanently in %s (message reference %d). Its complete content is retained locally; later messages may continue. Reason: %s", e.deliveryChatLabel(r.ConvID), r.ID, userError(err.Error())))
+			}
+			return nil
 		}); err != nil {
 			e.logf("drop %d: %v", r.ID, err)
 		}
@@ -532,7 +551,7 @@ func (e *Engine) send(ctx context.Context, r store.Outbox, chat, token string, f
 		e.wakeRunner(r.ConvID)
 	case errors.As(err, &auth):
 		e.logf("send needs sign-in: %v", err)
-		e.requeue(r.ID, now.Add(e.t.MaxBackoff))
+		e.requeue(ctx, r.ID, now.Add(e.t.MaxBackoff))
 	default:
 		n := e.failure(r.ID)
 		back := e.t.Hot << min(n, 8)
@@ -542,7 +561,7 @@ func (e *Engine) send(ctx context.Context, r store.Outbox, chat, token string, f
 		if n <= 3 || n%10 == 0 {
 			e.logf("send %s to conversation %d failed (%d): %v; retry in %s", r.DeliveryKey, r.ConvID, n, err, back)
 		}
-		e.requeue(r.ID, now.Add(back))
+		e.requeue(ctx, r.ID, now.Add(back))
 	}
 }
 
@@ -555,8 +574,8 @@ func (e *Engine) retryAfter(th *channel.Throttled) time.Duration {
 	return e.t.ThrottleFloor
 }
 
-func (e *Engine) requeue(id int64, at time.Time) {
-	if err := e.update(func(tx *store.Tx) error { return tx.Requeue(id, ms(at)) }); err != nil {
+func (e *Engine) requeue(ctx context.Context, id int64, at time.Time) {
+	if err := e.persist(ctx, "requeue rejected send", func(tx *store.Tx) error { return tx.Requeue(id, ms(at)) }); err != nil {
 		e.logf("requeue %d: %v", id, err)
 		return
 	}
@@ -638,10 +657,9 @@ func (e *Engine) noteUnknown(id int64, at time.Time) {
 // resolverLoop resolves unknown sends by reading the chat back. A send
 // found there (by its marker, or by its content hash when markers are not
 // trusted) becomes sent. One that is still not found after ResolveTries
-// reads spanning at least ResolveAbsent is absent: a final or mirror row is
-// sent again once (STORE-DESIGN §3.7, owner decision "read back; resend the
-// final if it is absent"); anything else, or a resend that is again absent,
-// is dropped with one visible notice.
+// reads spanning ResolveAbsent produces an operator notice. Content stays
+// unknown and is checked at MaxBackoff cadence; listing absence never causes
+// a blind resend or a silent drop. Other chats keep their normal send slots.
 func (e *Engine) resolverLoop(ctx context.Context) {
 	if rows, err := e.st.UnknownOutbox(); err == nil {
 		for _, r := range rows {
@@ -804,6 +822,7 @@ func (e *Engine) resolveOne(ctx context.Context, id int64) {
 		return
 	}
 	if found != "" {
+		e.noteVisible(r)
 		e.logf("unknown send %s resolved by read-back: delivered", r.DeliveryKey)
 		e.mu.Lock()
 		delete(e.unknown, id)
@@ -824,29 +843,23 @@ func (e *Engine) resolveOne(ctx context.Context, id int64) {
 	if tries < e.t.ResolveTries || now.Before(absentAt) {
 		return
 	}
-	// Authoritatively absent.
-	resent := false
-	err = e.update(func(tx *store.Tx) error {
-		resent = false
-		text := textUnconfirmed
-		if r.Kind == store.OutFinal || r.Kind == store.OutMirror {
-			_, done, err := tx.Meta(resentKey(r.ID))
-			if err != nil {
-				return err
-			}
-			text = textUnconfirmedRetried
-			if !done {
-				tok := r.AttemptToken
-				if tok == "" {
-					tok = resentNoToken
-				}
-				if err := tx.SetMeta(resentKey(r.ID), tok); err != nil {
-					return err
-				}
-				resent = true
-				return tx.Requeue(r.ID, 0) // BeginSend gives a fresh token and marker
-			}
+	// A listing can lag or be incomplete: absence is not proof of rejection.
+	// Keep content unknown, preserve its batch, and block only this chat.
+	if r.Kind == store.OutProgress || r.Kind == store.OutMirror || r.Kind == store.OutFinal {
+		if err := e.update(func(tx *store.Tx) error {
+			return e.enqueueNotice(tx, e.controlID, fmt.Sprintf("delivery-unknown:%d", r.ID), fmt.Sprintf("Delivery unconfirmed in %s (message reference %d). The complete message is retained and this chat's delivery is waiting for confirmation. The helper will keep checking without resending it automatically.", e.deliveryChatLabel(r.ConvID), r.ID))
+		}); err != nil {
+			e.logf("report unknown %d: %v", r.ID, err)
 		}
+		e.mu.Lock()
+		u.next = now.Add(e.t.MaxBackoff)
+		e.mu.Unlock()
+		e.wakeSender()
+		return
+	}
+	// Non-content acknowledgements/notices keep their existing settlement.
+	err = e.update(func(tx *store.Tx) error {
+		text := textUnconfirmed
 		if err := tx.Drop(r.ID, "not found by read-back"); err != nil {
 			return err
 		}
@@ -862,11 +875,7 @@ func (e *Engine) resolveOne(ctx context.Context, id int64) {
 		e.logf("settle unknown %d: %v", id, err)
 		return
 	}
-	if resent {
-		e.logf("unknown send %s not found after %d read-backs over %s; sending it again once", r.DeliveryKey, tries, now.Sub(u.since).Round(time.Second))
-	} else {
-		e.logf("unknown send %s not found after %d read-backs; dropped", r.DeliveryKey, tries)
-	}
+	e.logf("unknown non-content send %s not found after %d read-backs; dropped with an explicit outcome", r.DeliveryKey, tries)
 	e.mu.Lock()
 	delete(e.unknown, id)
 	e.mu.Unlock()
@@ -1003,4 +1012,14 @@ func (e *Engine) dropFile(r store.Outbox, name string) {
 	e.forgetFailures(r.ID)
 	e.wakeRunner(r.ConvID)
 	e.wakeSender()
+}
+
+// Show the stable work-chat label, so an operator can identify a blocked chat.
+func (e *Engine) deliveryChatLabel(id int64) string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if cs := e.convs[id]; cs != nil && cs.label != "" {
+		return cs.label
+	}
+	return fmt.Sprintf("chat %d", id)
 }

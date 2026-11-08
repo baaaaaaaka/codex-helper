@@ -660,6 +660,9 @@ func (s *server) runTurn(rt *runningTurn, t *Thread, turn *Turn) {
 		fmt.Fprintf(s.cfg.Log, "fakecodex: exec %q: %v\n", command, err)
 	}
 	for i := 0; i < rt.plan.Compactions; i++ {
+		if rt.rollout != nil {
+			_ = rt.rollout.AppendRecord("event_msg", map[string]any{"type": "context_compacted", "turn_id": rt.turnID})
+		}
 		s.notify("item/completed", map[string]any{"threadId": rt.threadID, "turnId": rt.turnID, "completedAtMs": time.Now().UnixMilli(), "item": map[string]any{
 			"type": "contextCompaction", "id": newID(),
 		}})
@@ -675,8 +678,14 @@ func (s *server) runTurn(rt *runningTurn, t *Thread, turn *Turn) {
 		if text == "" {
 			continue
 		}
+		id := newID()
+		if rt.rollout != nil {
+			// Unphased streams still produce phased rollout records after the
+			// native one-message look-behind decides commentary vs final.
+			_ = rt.rollout.AppendRecord("response_item", map[string]any{"type": "message", "role": "assistant", "id": id, "phase": phase("commentary"), "content": []any{map[string]any{"type": "output_text", "text": text}}})
+		}
 		s.notify("item/completed", map[string]any{"threadId": rt.threadID, "turnId": rt.turnID, "completedAtMs": time.Now().UnixMilli(), "item": map[string]any{
-			"type": "agentMessage", "id": newID(), "text": text, "phase": phase("commentary"),
+			"type": "agentMessage", "id": id, "text": text, "phase": phase("commentary"),
 		}})
 	}
 	for _, r := range rt.plan.Retries {
@@ -745,7 +754,7 @@ func (s *server) runTurn(rt *runningTurn, t *Thread, turn *Turn) {
 		if final != nil {
 			answer = res.Answer
 		}
-		werr := rt.rollout.FinishTurn(rt.open, rollout.Turn{Commentary: rt.plan.Commentary, Answer: answer, Aborted: status != StatusCompleted})
+		werr := rt.rollout.FinishTurn(rt.open, rollout.Turn{Unphased: rt.plan.Unphased, Answer: answer, Aborted: status != StatusCompleted})
 		if werr != nil {
 			fmt.Fprintf(s.cfg.Log, "fakecodex: rollout: %v\n", werr)
 		}

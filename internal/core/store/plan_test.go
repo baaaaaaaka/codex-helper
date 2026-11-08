@@ -16,20 +16,27 @@ import (
 // hotFiles hold the runtime API. Every SQL statement in them is checked.
 // vacuum.go (maintenance) and import.go (one-shot converter) are not hot
 // paths.
-var hotFiles = []string{"store.go", "owner.go", "conversations.go", "receive.go", "turns.go", "outbox.go", "transcripts.go"}
+var hotFiles = []string{"store.go", "owner.go", "conversations.go", "receive.go", "turns.go", "outbox.go", "engine_api.go", "batch.go", "held_progress.go", "transcripts.go"}
 
 // fragmentCompletions are representative full statements for SQL that the
 // code assembles from fragments (convUpdate, turnMove, outMove).
 var fragmentCompletions = map[string]string{
 	"UPDATE conversations SET ": `UPDATE conversations SET state = 'parked', parked_at = ?, updated_at = ? WHERE id = ? AND state IN (?)`,
 	"UPDATE turns SET ":         `UPDATE turns SET state = 'starting', thread_id = ? WHERE id = ? AND state IN (?,?,?)`,
-	"UPDATE outbox SET ":        `UPDATE outbox SET state = 'sent', ext_msg_id = ? WHERE id = ? AND state IN (?,?)`,
+	"UPDATE outbox SET ":        `UPDATE outbox SET state = 'sent', ext_msg_id = ? WHERE (id = ? OR batch_head = ?) AND state IN (?,?)`,
+	`SELECT EXISTS(SELECT 1 FROM outbox WHERE delivery_key >= ? AND delivery_key < ? AND state = 'dropped'`: `SELECT EXISTS(SELECT 1 FROM outbox WHERE delivery_key >= ? AND delivery_key < ? AND state = 'dropped')`,
 }
 
-// fullLoads are statements that intentionally read a whole hot table: they
-// run once at startup to build the in-memory stat index.
+// fullLoads are startup ownership indexes and explicitly requested history
+// queries. Periodic runtime paths must not use them.
 var fullLoads = map[string]bool{
-	`SELECT ` + sourceCols + ` FROM transcript_sources ORDER BY id`: true,
+	`SELECT ` + sourceCols + ` FROM transcript_sources ORDER BY id`:                                                                                                                true,
+	`SELECT codex_turn_id FROM turns WHERE codex_turn_id IS NOT NULL AND steering=0`:                                                                                               true,
+	`SELECT codex_turn_id,shared FROM turns WHERE codex_turn_id IS NOT NULL AND steering=0`:                                                                                        true,
+	`SELECT id,COALESCE(codex_turn_id,''),CASE WHEN state='starting' OR codex_turn_id IS NOT NULL THEN turn_key ELSE '' END FROM turns WHERE transcript_progress=1 AND steering=0`: true,
+	// Explicit historical statistics; the periodic status uses OpenTurnCounts.
+	`SELECT state, COUNT(*) FROM turns GROUP BY state`:                              true,
+	`SELECT ` + turnCols + ` FROM turns WHERE conv_id = ? ORDER BY id DESC LIMIT ?`: true,
 }
 
 // sqlStatements extracts the SQL string expressions from the hot files,

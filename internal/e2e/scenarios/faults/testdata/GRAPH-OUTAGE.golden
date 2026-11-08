@@ -3,6 +3,7 @@
 
 == chat <chat:1> "🏠 Codex Control - e2ehost"
    type: meeting; members: owner
+   (declared race, shown in the declared order: independent work completion and local-session discovery recover concurrently after the outage)
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>

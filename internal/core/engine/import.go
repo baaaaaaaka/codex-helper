@@ -28,7 +28,7 @@ import (
 //   - nothing is lost: the job and the cursor are in the store; a crash, a
 //     restart or a takeover re-reads from the persisted cursor and the job
 //     finishes when the cursor reaches the file end it recorded;
-//   - it is catch-up: prompts and finals only, nobody notified (catchingUp
+//   - it is catch-up: includes progress, nobody notified (catchingUp
 //     covers the whole imported range);
 //   - it is paced like any mirrored message (send class sendMirror, behind
 //     the control chat and the replies), a pass of mirrorPassMax per stat
@@ -426,7 +426,7 @@ func (e *Engine) importApplyOne(j importJob) bool {
 
 // mirrorTracker is a tracker for f at its persisted cursor.
 func (e *Engine) mirrorTracker(f *mirrorFile) *transcript.Tracker {
-	t := transcript.NewTracker(f.src.ThreadID, f.src.Offset, f.src.Line, e.mirrorSkip)
+	t := e.newMirrorTracker(f.src.ThreadID, f.src.Offset, f.src.Line, e.mirrorSkip)
 	e.restoreInfo(f, t)
 	if f.keepTeams > 0 {
 		t.KeepTeams(f.keepTeams)

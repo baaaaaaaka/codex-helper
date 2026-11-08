@@ -195,7 +195,7 @@ func (s *Scenario) GoldenTranscript() string {
 				fmt.Fprintf(&b, "   title was: %q\n", n.norm(t))
 			}
 		}
-		msgs := s.Graph.Messages(c.ID)
+		msgs := logicalProgressMessages(s.Graph.Messages(c.ID))
 		var notices []string
 		if s.Opts.Golden.FinishedNotices != "" && strings.Contains(c.Topic, ControlChatTopicMarker) {
 			msgs, notices = splitFinishedNotices(msgs, who)
@@ -646,4 +646,43 @@ func (o GoldenOptions) applyRaces(msgs []fakegraph.Message) ([]fakegraph.Message
 		}
 	}
 	return msgs, reasons
+}
+
+// Render complete progress blocks as logical messages so timing-dependent
+// transport packing does not change the golden. Raw POST counts and ordering
+// are checked by the scenarios; no content or repeated block is discarded.
+func logicalProgressMessages(msgs []fakegraph.Message) []fakegraph.Message {
+	var out []fakegraph.Message
+	const heading = "<p><strong>🤖 ⏳ Codex status:</strong></p>"
+	for _, m := range msgs {
+		if m.Origin != fakegraph.OriginSUT || len(m.Mentions) != 0 || !strings.Contains(m.Content, "<hr>") || !strings.Contains(m.Content, heading) {
+			out = append(out, m)
+			continue
+		}
+		blocks := strings.Split(m.Content, "<hr>")
+		safe := true
+		for _, b := range blocks {
+			if !strings.Contains(b, heading) {
+				safe = false
+			}
+		}
+		if !safe {
+			out = append(out, m)
+			continue
+		}
+		marker := ""
+		if i := strings.Index(m.Content, "-->"); strings.HasPrefix(m.Content, "<!-- codex-helper-outbox:") && i >= 0 {
+			marker = m.Content[:i+3]
+		}
+		for i, b := range blocks {
+			part := m
+			part.ID = fmt.Sprintf("%s-progress-%d", m.ID, i)
+			if i > 0 {
+				b = marker + b
+			}
+			part.Content = strings.TrimSpace(b)
+			out = append(out, part)
+		}
+	}
+	return out
 }

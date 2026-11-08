@@ -33,7 +33,11 @@ func (e *Engine) watchSilence(ctx context.Context, cs *convState, tr store.Turn,
 		defer e.wg.Done()
 		tick := time.NewTicker(every)
 		defer tick.Stop()
-		episode, hinted := rs.lastEvent.Load(), 0
+		activityEpisode := rs.lastEvent.Load()
+		visible := fromMS(activityEpisode)
+		var lastHint time.Time
+		hints := 0
+		stuck := false
 		for {
 			select {
 			case <-stop:
@@ -42,40 +46,54 @@ func (e *Engine) watchSilence(ctx context.Context, cs *convState, tr store.Turn,
 				return
 			case <-tick.C:
 			}
+			now := e.now()
 			last := rs.lastEvent.Load()
 			e.mu.Lock()
-			waiting := e.questionWaiting[cs.id]
+			waiting, seen := e.questionWaiting[cs.id], cs.lastVisible
 			e.mu.Unlock()
 			if waiting {
-				rs.lastEvent.Store(ms(e.now()))
+				rs.lastEvent.Store(ms(now))
+				visible, lastHint, hints = now, time.Time{}, 0
 				continue
 			}
-			if last != episode {
-				episode, hinted = last, 0 // Codex spoke: a new silence starts
+			if seen.After(visible) {
+				visible, lastHint, hints = seen, time.Time{}, 0
 			}
-			quiet := e.now().Sub(fromMS(last))
-			switch {
-			case e.t.SilenceStuck > 0 && quiet >= e.t.SilenceStuck && hinted < 2:
-				hinted = 2
-				e.silenceNotice(cs.id, fmt.Sprintf("turn:%d:silence:%d:2", tr.ID, episode), textStuck(quiet))
-			case e.t.SilenceHint > 0 && quiet >= e.t.SilenceHint && hinted < 1:
-				hinted = 1
-				e.silenceNotice(cs.id, fmt.Sprintf("turn:%d:silence:%d:1", tr.ID, episode), textSilent)
+			if last != activityEpisode {
+				activityEpisode, stuck = last, false
+			}
+			quiet := now.Sub(fromMS(last))
+			if e.t.SilenceStuck > 0 && quiet >= e.t.SilenceStuck && !stuck {
+				stuck = e.silenceNotice(cs.id, fmt.Sprintf("turn:%d:silence:%d:stuck", tr.ID, last), textStuck(quiet))
+				continue
+			}
+			if e.t.SilenceHint <= 0 || now.Sub(visible) < e.t.SilenceHint || (hints > 0 && (e.t.SilenceRepeat <= 0 || now.Sub(lastHint) < e.t.SilenceRepeat)) {
+				continue
+			}
+			// Do not add periodic hints behind undelivered substantive output.
+			pending, err := e.st.PendingProgress(cs.id)
+			if err != nil || pending {
+				continue
+			}
+			if e.silenceNotice(cs.id, fmt.Sprintf("turn:%d:visible:%d:%d", tr.ID, ms(visible), hints+1), textSilent) {
+				lastHint = now
+				hints++
 			}
 		}
 	}()
 	return func() { close(stop) }
 }
 
-func (e *Engine) silenceNotice(conv int64, key, text string) {
+func (e *Engine) silenceNotice(conv int64, key, text string) bool {
 	if conv == e.inboxID {
-		return // the inbox carries protocol records only
+		return true // the inbox carries protocol records only
 	}
 	if err := e.update(func(tx *store.Tx) error { return e.enqueueStatus(tx, conv, key, text) }); err != nil {
 		e.logf("silence hint in %d: %v", conv, err)
-		return
+		return false
 	}
 	e.wakeSender()
+	return true
 }
 
 // remindQueued posts a reminder for every turn still queued after each
@@ -248,4 +266,15 @@ func minutes(d time.Duration) string {
 		return fmt.Sprintf("%d s", int(d.Round(time.Second)/time.Second))
 	}
 	return fmt.Sprintf("%d min", int(d.Round(time.Minute)/time.Minute))
+}
+
+func (e *Engine) noteVisible(r store.Outbox) {
+	if r.Kind != store.OutProgress && r.Kind != store.OutMirror && r.Kind != store.OutFinal {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if cs := e.convs[r.ConvID]; cs != nil {
+		cs.lastVisible = e.now()
+	}
 }

@@ -150,23 +150,25 @@ type Inbound struct {
 
 // Turn is a turns row.
 type Turn struct {
-	Queue         bool
-	Steering      bool
-	ID            int64
-	ConvID        int64
-	InboundID     int64
-	TurnKey       string
-	State         string
-	ThreadID      string
-	CodexTurnID   string
-	Model         string
-	Effort        string
-	Attempt       int
-	RetryDeadline int64
-	QueuedAt      int64
-	StartedAt     int64
-	FinishedAt    int64
-	Error         string
+	TranscriptProgress bool
+	TranscriptDone     bool
+	Queue              bool
+	Steering           bool
+	ID                 int64
+	ConvID             int64
+	InboundID          int64
+	TurnKey            string
+	State              string
+	ThreadID           string
+	CodexTurnID        string
+	Model              string
+	Effort             string
+	Attempt            int
+	RetryDeadline      int64
+	QueuedAt           int64
+	StartedAt          int64
+	FinishedAt         int64
+	Error              string
 }
 
 // OutFile is the upload state of an outbound file.
@@ -181,19 +183,26 @@ type OutFile struct {
 
 // OutMsg is one rendered part to enqueue.
 type OutMsg struct {
-	DeliveryKey string
-	Kind        string
-	Part        int // 1-based; 0 means 1
-	Parts       int // 0 means 1
-	Body        string
-	BodyHash    []byte
-	Mention     bool
-	ReplyTo     string
-	File        *OutFile
+	HoldTurn      int64  // final waits in this outbox until its transcript prefix commits
+	AlternateKey  string // legacy identity; checked atomically, never body-only dedupe
+	ProgressGroup string // same execution; only complete adjacent progress records may combine
+	DeliveryKey   string
+	Kind          string
+	Part          int // 1-based; 0 means 1
+	Parts         int // 0 means 1
+	Body          string
+	BodyHash      []byte
+	Mention       bool
+	ReplyTo       string
+	File          *OutFile
 }
 
 // Outbox is an outbox row.
 type Outbox struct {
+	HoldTurn      int64
+	BatchHead     int64
+	BatchBody     string
+	ProgressGroup string // same execution; only complete adjacent progress records may combine
 	ID            int64
 	ConvID        int64
 	DeliveryKey   string

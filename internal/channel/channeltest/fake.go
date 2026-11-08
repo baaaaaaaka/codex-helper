@@ -484,3 +484,18 @@ func (f *Fake) receiveFault(stream string) error {
 }
 
 var _ channel.Channel = (*Fake)(nil)
+
+func (f *Fake) CombineProgress(parts []channel.Part) (channel.Part, bool) {
+	var bodies []string
+	for _, p := range parts {
+		if p.Index != 1 || p.Count != 1 || p.Mention || p.ReplyTo != "" {
+			return channel.Part{}, false
+		}
+		bodies = append(bodies, p.Body)
+	}
+	body := strings.Join(bodies, "\n\n")
+	if len(parts) < 2 || len(body) > f.Caps().MaxPartBytes {
+		return channel.Part{}, false
+	}
+	return channel.Part{Index: 1, Count: 1, Body: body, Size: len(body), Hash: channel.TextHash(body)}, true
+}

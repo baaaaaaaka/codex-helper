@@ -18,13 +18,13 @@ func (t *Tx) OutboxByHash(convID int64, hash []byte, since int64) ([]Outbox, err
 		return nil, nil
 	}
 	return collect(scanOutbox)(t.rows(`SELECT `+outboxCols+` FROM outbox
-WHERE conv_id = ? AND body_hash = ? AND state IN ('sending','sent','unknown') AND created_at >= ? AND hash_algo IS NULL ORDER BY seq`,
+WHERE conv_id = ? AND body_hash = ? AND state IN ('sending','sent','unknown') AND created_at >= ? AND hash_algo IS NULL AND (batch_head IS NULL OR batch_head=id) ORDER BY seq`,
 		convID, hash, since))
 }
 
 // OutboxByToken finds the row carrying an attempt token (marker read-back).
 func (t *Tx) OutboxByToken(convID int64, token string) (Outbox, bool, error) {
-	return one(t.row(`SELECT `+outboxCols+` FROM outbox WHERE conv_id = ? AND attempt_token = ?`, convID, token), scanOutbox)
+	return one(t.row(`SELECT `+outboxCols+` FROM outbox WHERE conv_id = ? AND attempt_token = ? ORDER BY seq LIMIT 1`, convID, token), scanOutbox)
 }
 
 // Delivered reports whether any outbox row's delivery key starts with
@@ -172,7 +172,7 @@ WHERE conv_id = ? AND state = 'sent' ORDER BY seq DESC LIMIT ?`, convID, limit))
 // PendingOutboxConvs lists the conversations with outbox rows still to
 // send (queued or sending; unknown rows wait for the resolver).
 func (s *Store) PendingOutboxConvs() ([]int64, error) {
-	rows, err := s.r.QueryContext(context.Background(), `SELECT DISTINCT conv_id FROM outbox WHERE state IN ('queued','sending') ORDER BY conv_id`)
+	rows, err := s.r.QueryContext(context.Background(), `SELECT DISTINCT conv_id FROM outbox WHERE state IN ('queued','sending','unknown') AND state IN ('queued','sending') ORDER BY conv_id`)
 	if err != nil {
 		return nil, err
 	}
@@ -252,4 +252,106 @@ func (s *Store) CodexTurnModes() (map[string]bool, error) {
 		modes[id] = modes[id] || shared
 	}
 	return modes, rows.Err()
+}
+
+// SetTranscriptProgress assigns commentary publication to the incremental reader.
+// Old turns retain callback ownership, preventing automatic replay on upgrade.
+func (t *Tx) SetTranscriptProgress(id int64) error {
+	_, err := t.exec(`UPDATE turns SET transcript_progress=1,transcript_done=0 WHERE id=?`, id)
+	return err
+}
+
+func (s *Store) TranscriptProgressTurns() (map[string]int64, map[string]int64, error) {
+	// Capacity retries replace codex_turn_id. The stable client key still owns
+	// unread records from earlier attempts, including after a restart.
+	rows, err := s.r.QueryContext(context.Background(), `SELECT id,COALESCE(codex_turn_id,''),CASE WHEN state='starting' OR codex_turn_id IS NOT NULL THEN turn_key ELSE '' END FROM turns WHERE transcript_progress=1 AND steering=0`)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+	ids := map[string]int64{}
+	clients := map[string]int64{}
+	for rows.Next() {
+		var id, client string
+		var localID int64
+		if err := rows.Scan(&localID, &id, &client); err != nil {
+			return nil, nil, err
+		}
+		if id != "" {
+			ids[id] = localID
+		}
+		if client != "" {
+			clients[client] = localID
+		}
+	}
+	return ids, clients, rows.Err()
+}
+
+// RecordedParts checks representation, not delivery confirmation. Queued and
+// unknown parts must not be duplicated; a dropped part remains an explicit failure.
+func (t *Tx) RecordedParts(msgs []OutMsg) (bool, error) {
+	for _, m := range msgs {
+		var yes bool
+		if err := t.row(`SELECT EXISTS(SELECT 1 FROM outbox WHERE delivery_key=? OR (delivery_key=? AND body_hash IS ? AND body IS ?))`, m.DeliveryKey, m.AlternateKey, m.BodyHash, nullStr(m.Body)).Scan(&yes); err != nil {
+			return false, err
+		}
+		if !yes {
+			return false, nil
+		}
+	}
+	return len(msgs) > 0, nil
+}
+
+// PendingAtLeast uses the partial pending index and reads no message bodies.
+func (s *Store) PendingAtLeast(conv int64, limit int) (bool, error) {
+	var n int
+	err := s.r.QueryRowContext(context.Background(), `SELECT count(*) FROM (SELECT id FROM outbox WHERE conv_id=? AND state IN ('queued','sending','unknown') AND hold_turn IS NULL LIMIT ?)`, conv, limit).Scan(&n)
+	return n >= limit, err
+}
+
+// PendingProgress prevents still-working notices from piling up behind content.
+func (s *Store) PendingProgress(conv int64) (bool, error) {
+	var yes bool
+	err := s.r.QueryRowContext(context.Background(), `SELECT EXISTS(SELECT 1 FROM outbox WHERE conv_id=? AND state IN ('queued','sending','unknown') AND (kind='progress' OR progress_group IS NOT NULL OR delivery_key LIKE 'turn:%:visible:%' OR delivery_key LIKE 'turn:%:silence:%'))`, conv).Scan(&yes)
+	return yes, err
+}
+
+// CompleteTranscriptProgress is committed with the terminal source position and
+// all preceding output parts. The primary key keeps each terminal O(log history).
+func (t *Tx) CompleteTranscriptProgress(id int64, nativeID string) error {
+	tr, ok, err := t.Turn(id)
+	if err != nil {
+		return err
+	}
+	if !ok || tr.State == TurnStarting {
+		return fmt.Errorf("native acceptance for turn %d is not durable yet", id)
+	}
+	// An earlier capacity attempt can end after its successor starts.
+	if tr.CodexTurnID != nativeID || tr.State == TurnQueued {
+		return nil
+	}
+	if !terminalTurnState(tr.State) {
+		// The reader can observe the terminal before Run returns. Do not let
+		// a subsequent local turn overtake the runner's not-yet-stored final.
+		return fmt.Errorf("native outcome for turn %d is not durable yet", id)
+	}
+	_, err = t.exec(`UPDATE turns SET transcript_done=1 WHERE id=? AND codex_turn_id=? AND transcript_progress=1 AND transcript_done=0`, id, nativeID)
+	if err != nil {
+		return err
+	}
+	return t.ReleaseHeldProgress(tr.ConvID, id)
+}
+func (s *Store) TranscriptProgressDone(id int64) (bool, error) {
+	var done bool
+	err := s.r.QueryRowContext(context.Background(), `SELECT transcript_done FROM turns WHERE id=?`, id).Scan(&done)
+	return done, err
+}
+
+// RepresentedRecord avoids rendering an already complete record during replay.
+// It counts every declared part, including pending/unknown/explicit failures;
+// it does not call that proof of delivery. The key range uses the unique index.
+func (s *Store) RepresentedRecord(prefix string) (bool, error) {
+	var minPart, maxPart, minTotal, maxTotal, count int
+	err := s.r.QueryRowContext(context.Background(), `SELECT COALESCE(MIN(part),0),COALESCE(MAX(part),0),COALESCE(MIN(parts),0),COALESCE(MAX(parts),0),COUNT(DISTINCT part) FROM outbox WHERE delivery_key>=? AND delivery_key<? AND body IS NOT NULL`, prefix, prefix+"\U0010FFFF").Scan(&minPart, &maxPart, &minTotal, &maxTotal, &count)
+	return minPart == 1 && minTotal > 0 && minTotal == maxTotal && maxPart == maxTotal && count == maxTotal, err
 }

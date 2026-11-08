@@ -18,7 +18,7 @@ func (t *Tx) Enqueue(convID int64, msgs []OutMsg) (int, error) {
 			return n, errors.New("store: outbox message without delivery key")
 		}
 		var exists int
-		if err := t.row(`SELECT EXISTS(SELECT 1 FROM outbox WHERE delivery_key = ?)`, m.DeliveryKey).Scan(&exists); err != nil {
+		if err := t.row(`SELECT EXISTS(SELECT 1 FROM outbox WHERE delivery_key = ? OR (delivery_key = ? AND body_hash IS ? AND body IS ?))`, m.DeliveryKey, m.AlternateKey, m.BodyHash, nullStr(m.Body)).Scan(&exists); err != nil {
 			return n, err
 		}
 		if exists != 0 {
@@ -32,10 +32,10 @@ func (t *Tx) Enqueue(convID int64, msgs []OutMsg) (int, error) {
 			parts = 1
 		}
 		var id int64
-		err := t.row(`INSERT INTO outbox(conv_id,delivery_key,seq,kind,part,parts,body,body_hash,mention,reply_to,state,created_at)
-VALUES (?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM outbox WHERE conv_id = ?), ?, ?, ?, ?, ?, ?, ?, 'queued', ?)
+		err := t.row(`INSERT INTO outbox(conv_id,delivery_key,seq,kind,part,parts,body,body_hash,mention,reply_to,state,created_at,progress_group,hold_turn)
+VALUES (?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM outbox WHERE conv_id = ?), ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
 RETURNING id`, convID, m.DeliveryKey, convID, m.Kind, part, parts, nullStr(m.Body), m.BodyHash, m.Mention,
-			nullStr(m.ReplyTo), t.now).Scan(&id)
+			nullStr(m.ReplyTo), t.now, nullStr(m.ProgressGroup), nullInt(m.HoldTurn)).Scan(&id)
 		if err != nil {
 			return n, err
 		}
@@ -55,7 +55,7 @@ VALUES (?,?,?,?,?,?,?)`, id, f.LocalPath, f.Size, nullStr(f.UploadURL), nullInt(
 // conversation (R-11); unknown rows are never returned.
 func (t *Tx) NextSendable(now int64) ([]Outbox, error) {
 	return collect(scanOutbox)(t.rows(`SELECT `+outboxCols+` FROM outbox
-WHERE id IN (SELECT (SELECT p.id FROM outbox p WHERE p.conv_id = h.conv_id AND p.state IN ('queued','sending','unknown')
+WHERE id IN (SELECT (SELECT p.id FROM outbox p WHERE p.conv_id = h.conv_id AND p.state IN ('queued','sending','unknown') AND p.hold_turn IS NULL
                      ORDER BY p.seq LIMIT 1)
              FROM (SELECT DISTINCT conv_id FROM outbox WHERE state IN ('queued','sending','unknown')) h)
   AND state = 'queued' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
@@ -83,11 +83,11 @@ func (t *Tx) BeginSend(id int64) (string, error) {
 	if !ok {
 		return "", fmt.Errorf("%w: outbox %d", ErrNotFound, id)
 	}
-	if o.State != OutQueued {
+	if o.State != OutQueued || o.HoldTurn != 0 {
 		return "", fmt.Errorf("%w: outbox %d is %s", ErrState, id, o.State)
 	}
 	var ahead int
-	if err := t.row(`SELECT EXISTS(SELECT 1 FROM outbox WHERE conv_id = ? AND state IN ('queued','sending','unknown') AND seq < ?)`,
+	if err := t.row(`SELECT EXISTS(SELECT 1 FROM outbox WHERE conv_id = ? AND state IN ('queued','sending','unknown') AND hold_turn IS NULL AND seq < ?)`,
 		o.ConvID, o.Seq).Scan(&ahead); err != nil {
 		return "", err
 	}
@@ -127,8 +127,8 @@ func (t *Tx) Drop(id int64, note string) error {
 }
 
 func (t *Tx) outMove(id int64, from []string, set string, args ...any) error {
-	q := `UPDATE outbox SET ` + set + ` WHERE id = ? AND state IN (` + placeholders(len(from)) + `)`
-	args = append(args, id)
+	q := `UPDATE outbox SET ` + set + ` WHERE (id = ? OR batch_head = ?) AND state IN (` + placeholders(len(from)) + `)`
+	args = append(args, id, id)
 	for _, s := range from {
 		args = append(args, s)
 	}
@@ -161,7 +161,7 @@ func (t *Tx) IsOwn(convID int64, extMsgID string, bodyHash []byte, since int64) 
 	}
 	if len(bodyHash) > 0 {
 		err := t.row(`SELECT EXISTS(SELECT 1 FROM outbox WHERE conv_id = ? AND body_hash = ?
-AND state IN ('sending','sent','unknown') AND created_at >= ? AND hash_algo IS NULL)`, convID, bodyHash, since).Scan(&hit)
+AND state IN ('sending','sent','unknown') AND created_at >= ? AND hash_algo IS NULL AND (batch_head IS NULL OR batch_head=id))`, convID, bodyHash, since).Scan(&hit)
 		return hit != 0, err
 	}
 	return false, nil
@@ -170,7 +170,7 @@ AND state IN ('sending','sent','unknown') AND created_at >= ? AND hash_algo IS N
 // UnknownOutbox lists unknown rows (read-back resolution at start).
 func (s *Store) UnknownOutbox() ([]Outbox, error) {
 	return collect(scanOutbox)(s.r.QueryContext(context.Background(), `SELECT `+outboxCols+` FROM outbox
-WHERE state IN ('queued','sending','unknown') AND state = 'unknown' ORDER BY conv_id, seq`))
+WHERE state IN ('queued','sending','unknown') AND state = 'unknown' AND (batch_head IS NULL OR batch_head = id) ORDER BY conv_id, seq`))
 }
 
 // OutboxFile reads the upload state of an outbox row.
