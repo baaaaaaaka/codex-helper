@@ -16,6 +16,7 @@ const (
 
 // Thread is the subset of the v2 Thread the helper uses.
 type Thread struct {
+	Name       string `json:"name"`
 	ID         string `json:"id"`
 	Path       string `json:"path"`
 	Cwd        string `json:"cwd"`

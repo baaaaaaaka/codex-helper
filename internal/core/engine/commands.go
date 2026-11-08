@@ -532,6 +532,9 @@ func (e *Engine) confirmRestart(conv int64) {
 		if _, err := tx.Enqueue(conv, msgs); err != nil {
 			return err
 		}
+		if err := e.addServiceNotify(tx, conv, fmt.Sprintf("restart:%d", rc.inbound), textRestarted); err != nil {
+			return err
+		}
 		return tx.SetMeta(metaRestart, "")
 	})
 	if err != nil {

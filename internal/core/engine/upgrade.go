@@ -201,6 +201,9 @@ func (e *Engine) announceUpdate() error {
 		if _, err := tx.Enqueue(conv, msgs); err != nil {
 			return err
 		}
+		if err := e.addServiceNotify(tx, conv, fmt.Sprintf("update-done:%s:%s:%d", p.Tag, p.From, p.Inbound), text); err != nil {
+			return err
+		}
 		return tx.SetMeta(metaUpdatePending, "")
 	})
 }

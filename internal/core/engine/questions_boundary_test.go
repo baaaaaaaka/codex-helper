@@ -270,10 +270,10 @@ type questionNotifier struct {
 }
 
 func (*questionNotifier) Available() bool { return true }
-func (*questionNotifier) NotifyFinal(context.Context, string, string, string, string) error {
-	return nil
-}
-func (n *questionNotifier) NotifyEvent(context.Context, string, string, string) error {
+func (n *questionNotifier) Notify(_ context.Context, notice channel.OwnerNotice) error {
+	if !strings.Contains(notice.Heading, "question") {
+		return nil
+	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.count++

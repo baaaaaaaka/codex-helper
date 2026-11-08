@@ -62,7 +62,9 @@
    | Project: otherchat<br>
    | Working directory: <root>/work/otherchat<br>
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
-   | Need more details? Send <code>helper status</code>.</p>
+   | Need more details? Send <code>helper status</code>.<br>
+   | Model: Codex account default<br>
+   | Reasoning effort: model default</p>
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Another question during the throttle E2E-THROTTLECRASH-meanwhile-2</p>
@@ -93,7 +95,9 @@
    | Project: throttlecrash<br>
    | Working directory: <root>/work/throttlecrash<br>
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
-   | Need more details? Send <code>helper status</code>.</p>
+   | Need more details? Send <code>helper status</code>.<br>
+   | Model: Codex account default<br>
+   | Reasoning effort: model default</p>
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Answer me through the throttle E2E-THROTTLECRASH-throttled-1</p>

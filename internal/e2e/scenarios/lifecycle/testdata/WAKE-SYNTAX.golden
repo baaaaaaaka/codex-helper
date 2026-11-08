@@ -130,7 +130,9 @@
    | Project: wake-a<br>
    | Working directory: <root>/work/wake-a<br>
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
-   | Need more details? Send <code>helper status</code>.</p>
+   | Need more details? Send <code>helper status</code>.<br>
+   | Model: Codex account default<br>
+   | Reasoning effort: model default</p>
 -- <msg:3> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>This chat was resumed: messages here are read again. Requests sent while it was parked run now.</p>
@@ -150,7 +152,9 @@
    | Project: wake-b<br>
    | Working directory: <root>/work/wake-b<br>
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
-   | Need more details? Send <code>helper status</code>.</p>
+   | Need more details? Send <code>helper status</code>.<br>
+   | Model: Codex account default<br>
+   | Reasoning effort: model default</p>
 -- <msg:3> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>This chat was resumed: messages here are read again. Requests sent while it was parked run now.</p>
@@ -170,7 +174,9 @@
    | Project: wake-c<br>
    | Working directory: <root>/work/wake-c<br>
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
-   | Need more details? Send <code>helper status</code>.</p>
+   | Need more details? Send <code>helper status</code>.<br>
+   | Model: Codex account default<br>
+   | Reasoning effort: model default</p>
 -- <msg:3> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>This chat was resumed: messages here are read again. Requests sent while it was parked run now.</p>

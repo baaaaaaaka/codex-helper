@@ -16,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
+	"github.com/baaaaaaaka/codex-helper/internal/channel"
 	chteams "github.com/baaaaaaaka/codex-helper/internal/channel/teams"
 	"github.com/baaaaaaaka/codex-helper/internal/core/migrate"
 	corestore "github.com/baaaaaaaka/codex-helper/internal/core/store"
@@ -184,12 +185,8 @@ func (n *teamsNewCoreNotifier) url() string {
 
 func (n *teamsNewCoreNotifier) Available() bool { return n.url() != "" }
 
-func (n *teamsNewCoreNotifier) NotifyFinal(ctx context.Context, conv, title, text, url string) error {
-	return chteams.NewWorkflowNotifier(n.url(), n.client).NotifyFinal(ctx, conv, title, text, url)
-}
-
-func (n *teamsNewCoreNotifier) NotifyEvent(ctx context.Context, heading, text, url string) error {
-	return chteams.NewWorkflowNotifier(n.url(), n.client).NotifyEvent(ctx, heading, text, url)
+func (n *teamsNewCoreNotifier) Notify(ctx context.Context, notice channel.OwnerNotice) error {
+	return chteams.NewWorkflowNotifier(n.url(), n.client).Notify(ctx, notice)
 }
 
 // The control chat's `helper webhook …` (engine.WebhookSettings, gap batch
@@ -359,8 +356,7 @@ func runTeamsNewCoreWorkflowTest(cmd *cobra.Command, root *rootOptions, path, we
 	}
 	defer func() { _ = lease.Close(context.Background()) }()
 	n := chteams.NewWorkflowNotifier(strings.TrimSpace(string(raw)), lease.Client)
-	if err := n.NotifyFinal(cmd.Context(), "", "notification test",
-		"This is a test card from `cxp teams workflow test`. A card like this arrives when Codex finishes a Teams request.", ""); err != nil {
+	if err := n.Notify(cmd.Context(), channel.OwnerNotice{Heading: "✅ Codex helper notification test", Hint: "Workflow card delivery is configured."}); err != nil {
 		return err
 	}
 	_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Teams workflow test card accepted.")

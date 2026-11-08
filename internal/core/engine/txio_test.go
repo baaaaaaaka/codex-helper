@@ -51,7 +51,7 @@ func (n *probeNotifier) Available() bool {
 	return true
 }
 
-func (n *probeNotifier) NotifyFinal(context.Context, string, string, string, string) error {
+func (n *probeNotifier) Notify(context.Context, channel.OwnerNotice) error {
 	n.cards.Add(1)
 	return nil
 }

@@ -62,7 +62,9 @@
    | Project: burst-a<br>
    | Working directory: <root>/work/burst-a<br>
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
-   | Need more details? Send <code>helper status</code>.</p>
+   | Need more details? Send <code>helper status</code>.<br>
+   | Model: Codex account default<br>
+   | Reasoning effort: model default</p>
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Burst question E2E-NOTIFYBURST-burst1-1</p>
@@ -93,7 +95,9 @@
    | Project: burst-b<br>
    | Working directory: <root>/work/burst-b<br>
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
-   | Need more details? Send <code>helper status</code>.</p>
+   | Need more details? Send <code>helper status</code>.<br>
+   | Model: Codex account default<br>
+   | Reasoning effort: model default</p>
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Burst question E2E-NOTIFYBURST-burst2-2</p>
@@ -124,7 +128,9 @@
    | Project: burst-c<br>
    | Working directory: <root>/work/burst-c<br>
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
-   | Need more details? Send <code>helper status</code>.</p>
+   | Need more details? Send <code>helper status</code>.<br>
+   | Model: Codex account default<br>
+   | Reasoning effort: model default</p>
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Burst question E2E-NOTIFYBURST-burst3-3</p>

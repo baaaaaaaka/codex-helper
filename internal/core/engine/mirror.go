@@ -1092,7 +1092,7 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 				// A live final: the owner is notified once it is posted
 				// (Workflow card, else a control-chat @mention), as for
 				// a Teams-run final; catch-up finals notify nobody.
-				if err := addNotify(tx, pendingNotify{Conv: f.src.ConvID, Key: transcript.MirrorKeyPrefix(thread, r.o.RecordID),
+				if err := e.addNotify(tx, pendingNotify{Conv: f.src.ConvID, Key: transcript.MirrorKeyPrefix(thread, r.o.RecordID),
 					Text: clipText(r.o.Text, 400)}); err != nil {
 					return err
 				}
@@ -1131,7 +1131,7 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 					// v0.1.20 local_session_started, for a live session
 					// only; a session caught up at start is announced in
 					// the control chat's summary instead (announce.go).
-					if err := addNotify(tx, pendingNotify{Conv: f.src.ConvID, Key: "ready:" + label + ":", Kind: notifyLocal}); err != nil {
+					if err := e.addNotify(tx, pendingNotify{Conv: f.src.ConvID, Key: "ready:" + label + ":", Kind: notifyLocal}); err != nil {
 						return err
 					}
 					if err := markAnnounced(tx, f.src.ConvID); err != nil {

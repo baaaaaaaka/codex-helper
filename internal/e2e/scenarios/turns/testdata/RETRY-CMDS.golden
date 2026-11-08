@@ -50,7 +50,9 @@
    | Project: retry-cmds<br>
    | Working directory: <root>/work/retry-cmds<br>
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
-   | Need more details? Send <code>helper status</code>.</p>
+   | Need more details? Send <code>helper status</code>.<br>
+   | Model: Codex account default<br>
+   | Reasoning effort: model default</p>
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Flaky job E2E-RETRYCMDS-fail-1</p>

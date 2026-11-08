@@ -85,6 +85,26 @@ func processAlive(pid int) bool {
 //	POST /end?seq=N    EndRequest
 func (f *FakeCodex) Handler() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("POST /title", func(w http.ResponseWriter, r *http.Request) {
+		var req fakecodex.TitleRequest
+		if json.NewDecoder(r.Body).Decode(&req) != nil {
+			http.Error(w, "bad title", 400)
+			return
+		}
+		f.mu.Lock()
+		f.titleCalls = append(f.titleCalls, req)
+		fn := f.titleScript
+		f.mu.Unlock()
+		result := fakecodex.TitleResult{}
+		if fn != nil {
+			result = fn(req)
+		}
+		if result.Hold {
+			<-r.Context().Done()
+			return
+		}
+		writeJSON(w, result)
+	})
 	mux.HandleFunc("POST /begin", func(w http.ResponseWriter, r *http.Request) {
 		var req fakecodex.BeginRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {

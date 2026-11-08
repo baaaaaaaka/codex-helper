@@ -899,7 +899,7 @@ func (e *Engine) filePart(ctx context.Context, f store.OutFile) (channel.Part, e
 		return channel.Part{}, fmt.Errorf("upload reference: %w", err)
 	}
 	name := firstNonEmpty(ref.Name, filepath.Base(f.LocalPath))
-	parts, err := e.ch.Render(ctx, channel.RichDoc{Label: labelStatus, Markdown: "📎 " + name,
+	parts, err := e.ch.Render(ctx, channel.RichDoc{Label: labelAnswer, Markdown: "📎 " + name,
 		Files: []channel.FileRef{{Kind: ref.Kind, Name: name, Size: ref.Size, ContentType: ref.ContentType, Ref: ref.Ref}}})
 	if err != nil {
 		return channel.Part{}, err

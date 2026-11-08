@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/channel"
 	"github.com/baaaaaaaka/codex-helper/internal/core/store"
 )
 
@@ -38,6 +39,9 @@ type pendingNotify struct {
 // notifyLocal is the Kind of a live discovered session's notification
 // (v0.1.20 local_session_started); "" is a final (turn_completed).
 const notifyLocal = "local"
+const notifyReady = "ready"
+const notifyService = "service"
+const notifyAttention = "attention"
 
 const notifyQuestion = "question"
 
@@ -91,7 +95,7 @@ func writeNotify(tx *store.Tx, list []pendingNotify) error {
 }
 
 // addNotify records the notification of a finished turn in tx.
-func addNotify(tx *store.Tx, n pendingNotify) error {
+func (e *Engine) addNotify(tx *store.Tx, n pendingNotify) error {
 	list, err := readNotify(tx)
 	if err != nil {
 		return err
@@ -101,7 +105,11 @@ func addNotify(tx *store.Tx, n pendingNotify) error {
 			return nil
 		}
 	}
-	return writeNotify(tx, append(list, n))
+	if err := writeNotify(tx, append(list, n)); err != nil {
+		return err
+	}
+	wake(e.notifyWake) // registration must not wait for the maintenance timer
+	return nil
 }
 
 // updateNotify applies fn to the entry id (removing it when fn returns
@@ -163,6 +171,9 @@ func (e *Engine) pumpNotify(ctx context.Context) {
 		}
 		keep := list[:0]
 		for _, n := range list {
+			if (n.Kind == notifyReady || n.Kind == notifyService || n.Kind == notifyAttention) && !card && !n.Attempted {
+				continue
+			}
 			var questionGroup store.QuestionGroup
 			if n.Kind == notifyQuestion {
 				var ok bool
@@ -209,7 +220,7 @@ func (e *Engine) pumpNotify(ctx context.Context) {
 				if gone {
 					continue
 				}
-				if n.Kind != notifyQuestion {
+				if n.Kind == "" || n.Kind == notifyLocal {
 					answered = append(answered, n)
 				} // questions do not trigger final-answer title changes
 			}
@@ -258,15 +269,16 @@ func (e *Engine) sendCard(ctx context.Context, n pendingNotify) bool {
 	var label, title, url string
 	if cs != nil {
 		label, title, url = cs.label, cs.title, cs.url
+		if n.Kind == notifyService {
+			if control := e.convs[e.controlID]; control != nil {
+				title, url = control.title, control.url
+			}
+		}
 	}
 	e.mu.Unlock()
 	if cs == nil {
 		_ = e.updateNotify(n.id(), func(*pendingNotify) bool { return false })
 		return true
-	}
-	ev, events := e.cfg.Notifier.(EventNotifier)
-	if (n.Kind == notifyLocal || n.Kind == notifyQuestion) && !events {
-		return false // no card for it: the owner is mentioned instead
 	}
 	if err := e.updateNotify(n.id(), func(p *pendingNotify) bool { p.Attempted = true; return true }); err != nil {
 		e.logf("notify %s: %v", label, err)
@@ -287,13 +299,25 @@ func (e *Engine) sendCard(ctx context.Context, n pendingNotify) bool {
 			heading, text, err = e.questionNotice(g, firstNonEmpty(title, label))
 		}
 		if err == nil {
-			err = ev.NotifyEvent(cctx, heading, text, url)
+			err = e.cfg.Notifier.Notify(cctx, channel.OwnerNotice{Heading: heading, ChatTitle: firstNonEmpty(title, label), Hint: text, URL: url})
 		}
-	} else if n.Kind == notifyLocal {
-		err = ev.NotifyEvent(cctx, "💬 New local Codex chat detected: "+firstNonEmpty(title, label),
-			"Open this chat to watch the answer and continue from the full local context.", url)
 	} else {
-		err = e.cfg.Notifier.NotifyFinal(cctx, label, title, n.Text, url)
+		notice := channel.OwnerNotice{Heading: "✅ Codex finished", ChatTitle: firstNonEmpty(title, label), Request: n.Request, Hint: "The answer is ready in the work chat.", Button: "Open answer", URL: url}
+		switch n.Kind {
+		case notifyService:
+			notice.Heading, notice.Hint, notice.Request, notice.Button = n.Request, n.Text, "", "Open Control"
+		case notifyAttention:
+			notice.Heading, notice.Hint, notice.Button = "⚠️ Codex needs attention", n.Text, "Open chat"
+		case notifyLocal:
+			notice.Heading = "💬 New local Codex chat detected"
+			notice.Hint = "Open this chat to watch the answer and continue from the full local context."
+			notice.Button = "Open chat"
+		case notifyReady:
+			notice.Heading = "💬 Codex chat ready"
+			notice.Hint = "Open this chat to start or continue the task."
+			notice.Button = "Open chat"
+		}
+		err = e.cfg.Notifier.Notify(cctx, notice)
 	}
 	cancel()
 	if ctx.Err() != nil {
@@ -319,6 +343,10 @@ func (e *Engine) sendMentions(set []pendingNotify) {
 	for _, n := range set {
 		e.mu.Lock()
 		cs := e.convs[n.Conv]
+		title, url := "", ""
+		if cs != nil {
+			title, url = cs.title, cs.url
+		}
 		e.mu.Unlock()
 		ids = append(ids, n.id())
 		if cs == nil {
@@ -330,6 +358,12 @@ func (e *Engine) sendMentions(set []pendingNotify) {
 		)
 		if n.Kind == notifyQuestion {
 			m, err = e.questionMention(n, cs)
+		} else if n.Kind == notifyService {
+			m, err = e.render(context.Background(), channel.RichDoc{Label: n.Request, Markdown: n.Text, Mention: true}, store.OutNotice, "notify:"+n.Key)
+		} else if n.Kind == notifyAttention {
+			m, err = e.render(context.Background(), channel.RichDoc{Label: "⚠️ Codex needs attention", Markdown: n.Text + "\n\n" + url, Mention: true}, store.OutNotice, fmt.Sprintf("notify:attention:%d", n.Turn))
+		} else if n.Kind == notifyReady {
+			m, err = e.render(context.Background(), channel.RichDoc{Label: "💬 Codex chat ready", Markdown: title + "\n\n" + url, Mention: true}, store.OutNotice, "notify:"+n.Key)
 		} else if n.Kind == notifyLocal {
 			m, err = e.localMention(cs)
 		} else {
@@ -368,4 +402,14 @@ func (e *Engine) sendMentions(set []pendingNotify) {
 		return
 	}
 	e.wakeSender()
+}
+
+// addServiceNotify accompanies an already durable lifecycle confirmation.
+// With no webhook, that existing confirmation is sufficient.
+func (e *Engine) addServiceNotify(tx *store.Tx, conv int64, key, text string) error {
+	if e.cfg.Notifier == nil {
+		return nil
+	}
+	heading, hint, _ := strings.Cut(text, "\n\n")
+	return e.addNotify(tx, pendingNotify{Conv: conv, Key: key + ":", Kind: notifyService, Request: heading, Text: hint})
 }

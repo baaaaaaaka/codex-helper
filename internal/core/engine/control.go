@@ -260,8 +260,17 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 			if err := e.enqueueNotice(tx, id, "ready:"+label, textWorkChatCreated(label, cwd)); err != nil {
 				return err
 			}
-			if err := e.enqueueNotice(tx, id, "anchor:"+label, textWorkChatReady(label, cwd)); err != nil {
+			th, _, err := tx.Thread(id)
+			if err != nil {
 				return err
+			}
+			if err := e.enqueueNotice(tx, id, "anchor:"+label, textWorkChatReady(label, cwd)+"\nModel: "+firstNonEmpty(th.Model, "Codex account default")+"\nReasoning effort: "+firstNonEmpty(th.Effort, "model default")); err != nil {
+				return err
+			}
+			if e.cfg.Notifier != nil {
+				if err := e.addNotify(tx, pendingNotify{Conv: id, Key: "anchor:" + label + ":", Kind: notifyReady}); err != nil {
+					return err
+				}
 			}
 			if err := e.enqueueControlCreated(tx, id, label, info.URL); err != nil {
 				return err

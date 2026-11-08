@@ -661,6 +661,9 @@ func (e *Engine) modelFork(ctx context.Context, j cmdJob, c modelChat, ref strin
 		if err := tx.SetMeta(modelForkKey(id), string(b)); err != nil {
 			return err
 		}
+		if err := tx.SetMeta(forkChildKey(id), "1"); err != nil {
+			return err
+		}
 		_, err = e.refresh(tx, id)
 		return err
 	})

@@ -278,7 +278,7 @@ func (e *Engine) publishQuestions(ctx context.Context, g store.QuestionGroup) er
 		}
 		if n > 0 {
 			added = n
-			return addNotify(tx, pendingNotify{Conv: g.ConvID, Key: "questions:" + g.Key, Kind: notifyQuestion, Text: g.Key})
+			return e.addNotify(tx, pendingNotify{Conv: g.ConvID, Key: "questions:" + g.Key, Kind: notifyQuestion, Text: g.Key})
 		}
 		return nil
 	})

@@ -32,6 +32,10 @@ type Agent struct {
 	cfg  Config
 	pool *codex.Pool
 
+	titleWG          sync.WaitGroup
+	titleCancel      context.CancelFunc
+	titleConv        int64
+	closed           bool
 	mu               sync.Mutex
 	tuiThreads       map[string]int
 	attached         map[int64]int
@@ -135,6 +139,7 @@ func (a *Agent) Run(ctx context.Context, req engine.TurnRequest, hooks engine.Tu
 		}
 		req.Model, req.Effort = engine.TurnSettings(engineModels(ms), req.Model, req.Effort)
 	}
+	newThread := req.ThreadID == ""
 	threadID := req.ThreadID
 	if threadID == "" {
 		th, err := srv.ThreadStart(ctx, codex.ThreadStartParams{Cwd: req.Cwd, Model: req.Model})
@@ -207,6 +212,9 @@ func (a *Agent) Run(ctx context.Context, req engine.TurnRequest, hooks engine.Tu
 			}
 			if hooks.Started != nil {
 				hooks.Started(id)
+			}
+			if req.GenerateTitle && newThread && hooks.Title != nil && !pending {
+				a.startTitle(ctx, req, threadID, lease, hooks.Title)
 			}
 		},
 		Progress:    hooks.Progress,
@@ -322,6 +330,7 @@ func (a *Agent) Lookup(ctx context.Context, convID int64, threadID, turnKey stri
 // (TurnHooks.Cancelled) or, once turn/start was sent, is interrupted as
 // soon as Codex reports it started.
 func (a *Agent) Interrupt(ctx context.Context, convID int64) error {
+	a.CancelTitle(convID)
 	a.mu.Lock()
 	rt := a.running[convID]
 	var turnID string
@@ -361,6 +370,7 @@ func (a *Agent) Interrupt(ctx context.Context, convID int64) error {
 
 // Kill ends the app-server of convID.
 func (a *Agent) Kill(convID int64) {
+	a.CancelTitle(convID)
 	a.mu.Lock()
 	attached := a.attached[convID] > 0
 	a.mu.Unlock()
@@ -416,7 +426,16 @@ func (a *Agent) Maintain() {
 }
 
 // Close ends every app-server.
-func (a *Agent) Close() { a.pool.Close(2 * time.Second) }
+func (a *Agent) Close() {
+	a.mu.Lock()
+	a.closed = true
+	if a.titleCancel != nil {
+		a.titleCancel()
+	}
+	a.mu.Unlock()
+	a.titleWG.Wait()
+	a.pool.Close(2 * time.Second)
+}
 
 // Info is what the app-server of convID knows of threadID: the active
 // goal (from thread/resume's goal snapshot, goal calls and notifications)

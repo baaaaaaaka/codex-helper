@@ -117,15 +117,17 @@ type Forked struct {
 
 // TurnRequest is one turn to run.
 type TurnRequest struct {
-	Queue    bool
-	ConvID   int64
-	ThreadID string // "" starts a new thread (reported through ThreadStarted first)
-	Cwd      string
-	Model    string
-	Effort   string
-	TurnKey  string // sent as clientUserMessageId
-	Text     string
-	Images   []string
+	GenerateTitle bool   // only a newly created ordinary Teams work thread
+	TitleText     string // unwrapped first user request
+	Queue         bool
+	ConvID        int64
+	ThreadID      string // "" starts a new thread (reported through ThreadStarted first)
+	Cwd           string
+	Model         string
+	Effort        string
+	TurnKey       string // sent as clientUserMessageId
+	Text          string
+	Images        []string
 }
 
 // TurnHooks observe a running turn.
@@ -134,7 +136,8 @@ type TurnHooks struct {
 	// turn does not start unless it returns nil (the binding must be
 	// durable first so a restart continues the same thread).
 	ThreadStarted func(threadID string) error
-	Ready         func() // backend state changed; pending input may now steer
+	Title         func(context.Context, func(context.Context) (string, error)) error // serialize saving a generated name with manual renames
+	Ready         func()                                                             // backend state changed; pending input may now steer
 	// Started is called once Codex accepted the turn.
 	Started func(codexTurnID string)
 	// Progress receives commentary.
@@ -236,3 +239,6 @@ func (e *InputRejected) Error() string { return e.Reason }
 // TranscriptAgent records completed commentary before Run returns. Its durable
 // rollout is the sole source of progress when the work chat has a mirror.
 type TranscriptAgent interface{ TranscriptProgress() bool }
+
+// TitleAgent cancels best-effort naming when the owner takes control.
+type TitleAgent interface{ CancelTitle(int64) }

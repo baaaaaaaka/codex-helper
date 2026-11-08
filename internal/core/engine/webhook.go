@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/channel"
 	"github.com/baaaaaaaka/codex-helper/internal/core/store"
 )
 
@@ -209,11 +210,7 @@ func (e *Engine) webhookTest(ctx context.Context, j cmdJob, cs *convState, ws We
 	}
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	if ev, ok := e.cfg.Notifier.(EventNotifier); ok {
-		err = ev.NotifyEvent(cctx, "✅ Codex helper notification test", "Workflow card delivery is configured for this control chat.", link)
-	} else {
-		err = e.cfg.Notifier.NotifyFinal(cctx, "", "notification test", "Workflow card delivery is configured for this control chat.", link)
-	}
+	err = e.cfg.Notifier.Notify(cctx, channel.OwnerNotice{Heading: "✅ Codex helper notification test", Hint: "Workflow card delivery is configured for this control chat.", URL: link})
 	if err != nil {
 		e.reply(j, "⚠️ Workflow webhook test failed.\n\n"+userError(err.Error()), nil)
 		return

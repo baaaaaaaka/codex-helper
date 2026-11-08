@@ -94,7 +94,9 @@
    | Project: idle-0<br>
    | Working directory: <root>/work/idle-0<br>
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
-   | Need more details? Send <code>helper status</code>.</p>
+   | Need more details? Send <code>helper status</code>.<br>
+   | Model: Codex account default<br>
+   | Reasoning effort: model default</p>
 
 == chat <chat:3> "💬 e2ehost - New message in idle-1"
    type: meeting; members: owner
@@ -111,7 +113,9 @@
    | Project: idle-1<br>
    | Working directory: <root>/work/idle-1<br>
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
-   | Need more details? Send <code>helper status</code>.</p>
+   | Need more details? Send <code>helper status</code>.<br>
+   | Model: Codex account default<br>
+   | Reasoning effort: model default</p>
 
 == chat <chat:4> "💬 e2ehost - New message in idle-2"
    type: meeting; members: owner
@@ -128,7 +132,9 @@
    | Project: idle-2<br>
    | Working directory: <root>/work/idle-2<br>
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
-   | Need more details? Send <code>helper status</code>.</p>
+   | Need more details? Send <code>helper status</code>.<br>
+   | Model: Codex account default<br>
+   | Reasoning effort: model default</p>
 
 == chat <chat:5> "💬 e2ehost - New message in idle-3"
    type: meeting; members: owner
@@ -145,7 +151,9 @@
    | Project: idle-3<br>
    | Working directory: <root>/work/idle-3<br>
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
-   | Need more details? Send <code>helper status</code>.</p>
+   | Need more details? Send <code>helper status</code>.<br>
+   | Model: Codex account default<br>
+   | Reasoning effort: model default</p>
 
 == chat <chat:6> "💬 e2ehost - New message in idle-4"
    type: meeting; members: owner
@@ -162,7 +170,9 @@
    | Project: idle-4<br>
    | Working directory: <root>/work/idle-4<br>
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
-   | Need more details? Send <code>helper status</code>.</p>
+   | Need more details? Send <code>helper status</code>.<br>
+   | Model: Codex account default<br>
+   | Reasoning effort: model default</p>
 
 == chat <chat:7> "💬 e2ehost - New message in idle-5"
    type: meeting; members: owner
@@ -179,4 +189,6 @@
    | Project: idle-5<br>
    | Working directory: <root>/work/idle-5<br>
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
-   | Need more details? Send <code>helper status</code>.</p>
+   | Need more details? Send <code>helper status</code>.<br>
+   | Model: Codex account default<br>
+   | Reasoning effort: model default</p>

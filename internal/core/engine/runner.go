@@ -377,6 +377,14 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 	defer close(rs.done)
 	id := cs.id
 	accepted := false
+	req.GenerateTitle = req.ThreadID == "" && cs.kind == store.KindWork && rs.request == "" && id != e.inboxID
+	if req.GenerateTitle {
+		if title, _, err := e.st.Meta(fmt.Sprint(metaUserTitle, id)); err != nil || title != "" || isForkChild(e.st.Meta, id) {
+			req.GenerateTitle = false
+		} else {
+			req.TitleText = promptTitle(req.Text)
+		}
+	}
 	transcriptProgress := false
 	if a, ok := e.ag.(TranscriptAgent); ok && a.TranscriptProgress() && e.cfg.SessionsDir != "" && cs.kind == store.KindWork && rs.request == "" {
 		// Persist ownership before allowing the agent to write any record.
@@ -406,6 +414,9 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 	touch := func() { rs.lastEvent.Store(ms(e.now())) }
 	touch()
 	hooks := TurnHooks{
+		Title: func(c context.Context, save func(context.Context) (string, error)) error {
+			return e.generatedTitle(c, id, save)
+		},
 		Ready: func() { e.wakeRunner(id) },
 		Progress: func(text string) {
 			touch()
@@ -707,12 +718,16 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 				return err
 			}
 		}
-		if notify {
+		if notify || state == store.TurnFailed || state == store.TurnNotStarted {
 			in, _, err := tx.Inbound(tr.InboundID)
 			if err != nil {
 				return err
 			}
-			return addNotify(tx, pendingNotify{Turn: tr.ID, Conv: cs.id, Text: clipText(out.Final, 400), Request: requestSummary(in.Body)})
+			kind, text := "", clipText(out.Final, 400)
+			if !notify {
+				kind, text = notifyAttention, "The request did not finish. Open the chat for details and retry instructions."
+			}
+			return e.addNotify(tx, pendingNotify{Turn: tr.ID, Conv: cs.id, Kind: kind, Text: text, Request: requestSummary(in.Body)})
 		}
 		return nil
 	}) {

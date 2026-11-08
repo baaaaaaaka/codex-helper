@@ -26,6 +26,9 @@ var markerRE = regexp.MustCompile(`probe:(finalhold|hold|http|failed-event)(?::(
 
 // ResponsesRequest is one request the fake model received.
 type ResponsesRequest struct {
+	ToolNames []string
+	Schema    json.RawMessage
+	Effort    string
 	UserText  string // input actually presented to the model, not just accepted by app-server
 	Model     string
 	At        time.Time
@@ -137,9 +140,26 @@ func (r *Responses) serve(w http.ResponseWriter, req *http.Request) {
 	rec := &ResponsesRequest{At: time.Now(), Method: req.Method, Path: req.URL.Path, UserText: lastUserText(body)}
 	var envelope struct {
 		Model string `json:"model"`
+		Tools []struct {
+			Name string `json:"name"`
+			Type string `json:"type"`
+		} `json:"tools"`
+		Reasoning struct {
+			Effort string `json:"effort"`
+		} `json:"reasoning"`
+		Text struct {
+			Format struct {
+				Schema json.RawMessage `json:"schema"`
+			} `json:"format"`
+		} `json:"text"`
 	}
 	_ = json.Unmarshal(body, &envelope)
 	rec.Model = envelope.Model
+	rec.Effort = envelope.Reasoning.Effort
+	rec.Schema = envelope.Text.Format.Schema
+	for _, tool := range envelope.Tools {
+		rec.ToolNames = append(rec.ToolNames, tool.Type+":"+tool.Name)
+	}
 	r.mu.Lock()
 	r.reqs = append(r.reqs, rec)
 	r.respSeq++
@@ -215,6 +235,18 @@ func (r *Responses) serve(w http.ResponseWriter, req *http.Request) {
 	}
 
 	answer := "ANSWER(" + truncateResponse(lastUserText(body), 40) + ")"
+	var structured struct {
+		Text struct {
+			Format struct {
+				Name   string          `json:"name"`
+				Schema json.RawMessage `json:"schema"`
+			} `json:"format"`
+		} `json:"text"`
+	}
+	_ = json.Unmarshal(body, &structured)
+	if strings.Contains(string(structured.Text.Format.Schema), `"title"`) {
+		answer = `{"title":"Native title contract"}`
+	}
 	if marker == "hold" {
 		answer = Answer(arg)
 		hold, started := r.chans(arg)

@@ -292,3 +292,15 @@ func requireStepNotContains(t *testing.T, text string, forbidden ...string) {
 		}
 	}
 }
+
+func TestCITitleProtocolContractSelection(t *testing.T) {
+	workflow := readWorkflow(t, "ci.yml")
+	requireStepContains(t, workflowJobBlock(t, workflow, "shared-codex-contract"), "bash scripts/ci/run_shared_codex_contracts.sh")
+	raw, err := os.ReadFile("scripts/ci/run_shared_codex_contracts.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "-test.run 'TestRealCodex(Shared|NativeQueue|Title)'") {
+		t.Fatal("native title contract is not selected by CI")
+	}
+}

@@ -131,12 +131,14 @@ var TokenPattern = regexp.MustCompile(`E2E[A-Z0-9]*-[A-Za-z0-9]+(?:-[A-Za-z0-9]+
 
 // FakeCodex is a scripted, recording stand-in for Codex.
 type FakeCodex struct {
-	mu      sync.Mutex
-	calls   []*CodexCall
-	script  func(CodexCall) CodexBehavior
-	gates   map[int]chan struct{}
-	release map[int]bool
-	all     bool
+	titleScript func(fakecodex.TitleRequest) fakecodex.TitleResult
+	titleCalls  []fakecodex.TitleRequest
+	mu          sync.Mutex
+	calls       []*CodexCall
+	script      func(CodexCall) CodexBehavior
+	gates       map[int]chan struct{}
+	release     map[int]bool
+	all         bool
 
 	behaviors map[int]CodexBehavior
 
@@ -429,3 +431,15 @@ func (f *FakeCodex) resume(call ResumeCall) string {
 
 // ErrScripted is a generic scripted Codex failure.
 var ErrScripted = errors.New("e2e scripted codex failure")
+
+// SetTitleScript scripts cosmetic requests separately from normal turns.
+func (f *FakeCodex) SetTitleScript(fn func(fakecodex.TitleRequest) fakecodex.TitleResult) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.titleScript = fn
+}
+func (f *FakeCodex) TitleCalls() []fakecodex.TitleRequest {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]fakecodex.TitleRequest(nil), f.titleCalls...)
+}

@@ -2202,7 +2202,11 @@ type cardNotifier struct {
 }
 
 func (n *cardNotifier) Available() bool { return true }
-func (n *cardNotifier) NotifyFinal(_ context.Context, conv, title, text, url string) error {
+func (n *cardNotifier) Notify(_ context.Context, notice channel.OwnerNotice) error {
+	if notice.Heading != "✅ Codex finished" {
+		return nil
+	}
+	text := notice.Request
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.cards = append(n.cards, text)
@@ -2251,7 +2255,7 @@ func TestOwnerCardFollowsTheFinalAcrossRestart(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	if len(n.cards) != 1 || n.early != 0 || !strings.Contains(n.cards[0], "ANSWER to card me") {
+	if len(n.cards) != 1 || n.early != 0 || n.cards[0] != "card me" {
 		t.Fatalf("cards %q, %d before the answer", n.cards, n.early)
 	}
 	if m := len(r.own(r.chatOf("control"), "Codex finished")); m != 0 {

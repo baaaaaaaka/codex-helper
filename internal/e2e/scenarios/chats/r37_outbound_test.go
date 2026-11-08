@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakecodex"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakegraph"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/harness"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/steps"
@@ -34,11 +35,13 @@ var outboundDirRE = regexp.MustCompile(`write them under this local directory:\s
 func TestR37_AgentFilesReachChat(t *testing.T) {
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "R-37-out", harness.Options{
-		Guarantees: []string{"R-37", "F-RND-10", "R-1"},
-		Title:      "files the agent lists in its artifact manifest reach the chat once, byte-identical, with the right names",
-		Budget:     120 * time.Second,
+		Guarantees:      []string{"R-37", "F-RND-10", "R-1"},
+		Title:           "files the agent lists in its artifact manifest reach the chat once, byte-identical, with the right names",
+		WorkflowWebhook: true,
+		Budget:          120 * time.Second,
 	})
 	defer s.Finish()
+	s.Codex.SetTitleScript(func(fakecodex.TitleRequest) fakecodex.TitleResult { return fakecodex.TitleResult{Hold: true} })
 	tok := s.Token("artifacts")
 	small := []byte(strings.Repeat("id,value\n", 200) + "end " + tok + "\n")
 	large := make([]byte, 12<<20+12345)
@@ -98,12 +101,27 @@ func TestR37_AgentFilesReachChat(t *testing.T) {
 		return len(matching(small)) > 0 && len(matching(large)) > 0,
 			fmt.Sprintf("%d attachments, drive: %d items", len(s.Graph.OutboundFiles(work.ID)), len(s.Graph.DriveItems()))
 	})
+	s.WaitFor("completion card while title is held", 15*time.Second, func() (bool, string) {
+		for _, card := range s.Graph.WorkflowCards() {
+			if strings.Contains(card.Text(), "✅ Codex finished") && strings.Contains(card.Text(), tok) {
+				return true, ""
+			}
+		}
+		return false, "not delivered"
+	})
+	s.Check("one held naming request does not delay files or notification", len(s.Codex.TitleCalls()) == 1, "1", fmt.Sprint(len(s.Codex.TitleCalls())))
 	s.Settle(3*time.Second, 15*time.Second)
 
 	mu.Lock()
 	s.Note("outbound dir from prompt: %q; write error: %q", promptDir, writeErr)
 	mu.Unlock()
 	files := s.Graph.OutboundFiles(work.ID)
+	for _, m := range s.Graph.Messages(work.ID) {
+		if m.Origin == fakegraph.OriginSUT && len(m.Attachments) > 0 {
+			text := strings.TrimSpace(m.PlainText())
+			s.Check("answer attachments carry completed label", strings.HasPrefix(text, "🤖 ✅ Codex answer:"), "🤖 ✅ Codex answer:", text)
+		}
+	}
 	var uploads []string
 	for _, it := range s.Graph.DriveItems() {
 		uploads = append(uploads, fmt.Sprintf("%s writes=%v fragments=%d size=%d", it.Path, it.Writes, it.Fragments, len(it.Data)))

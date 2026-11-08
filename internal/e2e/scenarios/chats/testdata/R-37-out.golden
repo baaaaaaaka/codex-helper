@@ -18,22 +18,6 @@
    | <p>Open this Teams link and send your task there:<br>
    | <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
    | <p>If Teams does not show it right away, search for: s001</p>
--- <msg:4> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
-   | <p><strong>✅ Codex finished</strong></p>
-   | <p><strong>Chat:</strong> 💬 e2ehost - New message in r37-out<br>
-   | <strong>Request:</strong> Export the report and the dataset as files E2E-R37out-artifacts-1</p>
-   | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
-   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
-   mention 0: owner "E2E Owner"
--- <msg:5> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
-   | <p><strong>✅ Codex finished</strong></p>
-   | <p><strong>Chat:</strong> 💬 e2ehost - Export the report and the dataset as files E2E-R37out-artifac<br>
-   | <strong>Request:</strong> Send an updated report under the same name E2E-R37out-conflict-2</p>
-   | <p><strong>Next:</strong> The answer is ready in the work chat.</p>
-   | <p><strong>Open:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Open answer</a> (https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</p>
-   mention 0: owner "E2E Owner"
 
 == chat <chat:2> "💬 e2ehost - Export the report and the dataset as files E2E-R37out-artifac"
    type: meeting; members: owner
@@ -50,7 +34,9 @@
    | Project: r37-out<br>
    | Working directory: <root>/work/r37-out<br>
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
-   | Need more details? Send <code>helper status</code>.</p>
+   | Need more details? Send <code>helper status</code>.<br>
+   | Model: Codex account default<br>
+   | Reasoning effort: model default</p>
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Export the report and the dataset as files E2E-R37out-artifacts-1</p>
@@ -66,12 +52,12 @@
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:6> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>📎 quarterly report.csv</p>
    | <attachment id="<uuid:1>"></attachment>
    attachment: {"contentType":"reference","contentUrl":"https://e2etenant-my.sharepoint.com/personal/owner_e2e_example/Documents/Microsoft%20Teams%20Chat%20Files/codex-<upload:1>/quarterly%20report.csv","id":"<uuid:1>","name":"quarterly report.csv"}
 -- <msg:7> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>📎 dataset-large.bin</p>
    | <attachment id="<uuid:2>"></attachment>
    attachment: {"contentType":"reference","contentUrl":"https://e2etenant-my.sharepoint.com/personal/owner_e2e_example/Documents/Microsoft%20Teams%20Chat%20Files/codex-<upload:2>/dataset-large.bin","id":"<uuid:2>","name":"dataset-large.bin"}
@@ -90,10 +76,34 @@
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:11> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>📎 quarterly report.csv</p>
    | <attachment id="<uuid:3>"></attachment>
    attachment: {"contentType":"reference","contentUrl":"https://e2etenant-my.sharepoint.com/personal/owner_e2e_example/Documents/Microsoft%20Teams%20Chat%20Files/codex-<upload:3>/quarterly%20report.csv","id":"<uuid:3>","name":"quarterly report.csv"}
+
+== workflow cards
+-- card 1: status 202
+   text: 💬 Codex chat ready
+   text: Chat
+   text: 💬 e2ehost - New message in r37-out
+   text: Open this chat to start or continue the task.
+   action: {"title":"Open chat","type":"Action.OpenUrl","url":"https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57"}
+-- card 2: status 202
+   text: ✅ Codex finished
+   text: Chat
+   text: 💬 e2ehost - New message in r37-out
+   text: Request
+   text: Export the report and the dataset as files E2E-R37out-artifacts-1
+   text: The answer is ready in the work chat.
+   action: {"title":"Open answer","type":"Action.OpenUrl","url":"https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57"}
+-- card 3: status 202
+   text: ✅ Codex finished
+   text: Chat
+   text: 💬 e2ehost - Export the report and the dataset as files E2E-R37out-artifac
+   text: Request
+   text: Send an updated report under the same name E2E-R37out-conflict-2
+   text: The answer is ready in the work chat.
+   action: {"title":"Open answer","type":"Action.OpenUrl","url":"https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57"}
 
 == uploaded files
 -- /Microsoft Teams Chat Files/codex-<upload:2>/dataset-large.bin
@@ -151,3 +161,9 @@
    prompt| ```
    prompt|
    prompt| Use only relative manifest paths under that directory. Keep your normal answer visible; the helper will upload listed files separately when file-write auth is available.
+
+== cli
+$ cxp teams workflow enable --webhook-url-file <root>/workflow-webhook-url
+   exit 0
+   stdout| Teams workflow notifications enabled.
+   stdout| Webhook URL file: configured (ok)

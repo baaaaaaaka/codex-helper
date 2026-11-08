@@ -90,6 +90,17 @@ func runNotify(t *testing.T, nc notifyCase) {
 	}
 	control := steps.ReadyControlChat(s)
 	work, _ := steps.NewWorkChat(s, control, strings.ToLower(nc.id))
+	if nc.webhook {
+		s.WaitFor("ready card", 15*time.Second, func() (bool, string) {
+			for _, c := range s.Graph.WorkflowCards() {
+				if strings.Contains(c.Text(), "💬 Codex chat ready") {
+					return true, ""
+				}
+			}
+			return false, "not sent"
+		})
+		s.Settle(2*time.Second, 10*time.Second)
+	}
 	for i := 1; i <= 2; i++ {
 		tok := s.Token(fmt.Sprintf("final%d", i))
 		seen := map[string]bool{}

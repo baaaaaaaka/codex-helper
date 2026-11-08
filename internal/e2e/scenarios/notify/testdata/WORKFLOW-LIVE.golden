@@ -50,7 +50,9 @@
    | Project: wflive<br>
    | Working directory: <root>/work/wflive<br>
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
-   | Need more details? Send <code>helper status</code>.</p>
+   | Need more details? Send <code>helper status</code>.<br>
+   | Model: Codex account default<br>
+   | Reasoning effort: model default</p>
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Short question E2E-WORKFLOWLIVE-final1-1</p>
@@ -96,9 +98,13 @@
 
 == workflow cards
 -- card 1: status 202
-   text: Codex finished: 💬 e2ehost - Short question E2E-WORKFLOWLIVE-final1-1
-   text: E2EANSWER-<n> answer for E2E-WORKFLOWLIVE-final2-2
-   action: {"title":"Open chat","type":"Action.OpenUrl","url":"https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57"}
+   text: ✅ Codex finished
+   text: Chat
+   text: 💬 e2ehost - Short question E2E-WORKFLOWLIVE-final1-1
+   text: Request
+   text: Short question E2E-WORKFLOWLIVE-final2-2
+   text: The answer is ready in the work chat.
+   action: {"title":"Open answer","type":"Action.OpenUrl","url":"https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57"}
 
 == codex turns (per thread; threads by kind, directory and first prompt; turns in start order)
 -- thread <uuid:1> (work, cwd <root>/work/wflive)

@@ -345,3 +345,9 @@ type ActivityScanner interface {
 type PartCombiner interface {
 	CombineProgress([]Part) (Part, bool)
 }
+
+// OwnerNotice is a small, transport-independent owner notification. Empty
+// optional fields are omitted; the heading always describes the event.
+type OwnerNotice struct {
+	Heading, ChatTitle, Request, Hint, Button, URL string
+}

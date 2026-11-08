@@ -42,7 +42,9 @@
    | Project: group<br>
    | Working directory: <root>/work/group<br>
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
-   | Need more details? Send <code>helper status</code>.</p>
+   | Need more details? Send <code>helper status</code>.<br>
+   | Model: Codex account default<br>
+   | Reasoning effort: model default</p>
 -- <msg:3> coworker (html)
    | <p>@codex</p>
 -- <msg:4> helper (html)

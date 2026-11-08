@@ -105,6 +105,7 @@ func TestModelCommands(t *testing.T) {
 	for _, c := range s.Graph.Chats() {
 		known[c.ID] = true
 	}
+	titlesBeforeFork := len(s.Codex.TitleCalls())
 	seq := s.Graph.LastSeq()
 	steps.MustPost(s, work.ID, "helper model fork gpt-5-mini")
 	link, linked := replyAfter(s, work.ID, seq, "Forked Work chat", steps.CommandTimeout)
@@ -132,6 +133,7 @@ func TestModelCommands(t *testing.T) {
 	}
 
 	s.Settle(time.Second, 4*time.Second)
+	s.Check("model fork does not generate a new title", len(s.Codex.TitleCalls()) == titlesBeforeFork, fmt.Sprint(titlesBeforeFork), fmt.Sprint(len(s.Codex.TitleCalls())))
 	var replies []string
 	for _, id := range []string{work.ID, control.ID} {
 		for _, m := range s.SUTMessages(id) {

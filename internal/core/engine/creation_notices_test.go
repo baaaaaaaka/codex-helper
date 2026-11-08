@@ -59,6 +59,8 @@ func TestCreationNoticesAreV0120(t *testing.T) {
 			"Working directory: " + dir,
 			"Commands: `helper status` or `!status`, `helper stats`, `helper help`, `helper close` to close this Codex session in Teams.",
 			"Need more details? Send `helper status`.",
+			"Model: Codex account default",
+			"Reasoning effort: model default",
 		}, "\n"),
 	}
 	got := r.own(work, "")

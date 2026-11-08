@@ -178,7 +178,9 @@
    | Project: hook<br>
    | Working directory: <root>/work/hook<br>
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
-   | Need more details? Send <code>helper status</code>.</p>
+   | Need more details? Send <code>helper status</code>.<br>
+   | Model: Codex account default<br>
+   | Reasoning effort: model default</p>
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Short question E2E-WEBHOOKCTL-final-1</p>
@@ -200,10 +202,20 @@
    text: Workflow card delivery is configured for this control chat.
    action: {"title":"Open chat","type":"Action.OpenUrl","url":"https://teams.microsoft.com/l/chat/<chat:1>/0?tenantId=e2e00000-0000-4000-8000-00000000te57"}
 -- card 2: status 202
-   text: Codex finished: 💬 e2ehost - New message in hook
-   text: E2EANSWER-<n> answer for E2E-WEBHOOKCTL-final-1
+   text: 💬 Codex chat ready
+   text: Chat
+   text: 💬 e2ehost - New message in hook
+   text: Open this chat to start or continue the task.
    action: {"title":"Open chat","type":"Action.OpenUrl","url":"https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57"}
 -- card 3: status 202
+   text: ✅ Codex finished
+   text: Chat
+   text: 💬 e2ehost - New message in hook
+   text: Request
+   text: Short question E2E-WEBHOOKCTL-final-1
+   text: The answer is ready in the work chat.
+   action: {"title":"Open answer","type":"Action.OpenUrl","url":"https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57"}
+-- card 4: status 202
    text: ✅ Codex helper notification test
    text: Workflow card delivery is configured for this control chat.
    action: {"title":"Open chat","type":"Action.OpenUrl","url":"https://teams.microsoft.com/l/chat/<chat:1>/0?tenantId=e2e00000-0000-4000-8000-00000000te57"}

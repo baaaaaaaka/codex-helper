@@ -350,6 +350,9 @@ func (e *Engine) cmdRename(ctx context.Context, j cmdJob, cs *convState, arg str
 		e.reply(j, "usage: `helper rename <title>`", nil)
 		return
 	}
+	if a, ok := e.ag.(TitleAgent); ok {
+		a.CancelTitle(cs.id)
+	}
 	e.titles.run.Lock()
 	defer e.titles.run.Unlock()
 	e.mu.Lock()
@@ -627,6 +630,10 @@ func autoAllowed(source, title, user string) bool {
 // first prompt in the chat, else the first prompt of its local rollout.
 // The sender took its write token.
 func (e *Engine) autoTitle(ctx context.Context, conv int64, chat string) error {
+	return e.autoTitleName(ctx, conv, chat, "")
+}
+
+func (e *Engine) autoTitleName(ctx context.Context, conv int64, chat, name string) error {
 	e.titles.run.Lock()
 	defer e.titles.run.Unlock()
 	f, err := e.loadTitleFacts(conv)
@@ -637,7 +644,9 @@ func (e *Engine) autoTitle(ctx context.Context, conv int64, chat string) error {
 	if c.State == store.ConvClosed || !autoAllowed(c.TitleSource, c.Title, f.user) {
 		return nil
 	}
-	name := e.autoName(f)
+	if name == "" {
+		name = e.autoName(f)
+	}
 	if strings.TrimSpace(name) == "" {
 		return nil
 	}
@@ -841,4 +850,29 @@ func (e *Engine) afterAnswers(list []pendingNotify) {
 		e.queueAutoTitle(n.Conv)
 		e.wakeSender()
 	}
+}
+
+// generatedTitle runs only on completion of the one optional naming request.
+// No polling, persistent task, or wait on answer delivery is introduced.
+func (e *Engine) generatedTitle(ctx context.Context, conv int64, save func(context.Context) (string, error)) error {
+	if ctx.Err() != nil || !e.titles.run.TryLock() {
+		return nil
+	}
+	f, err := e.loadTitleFacts(conv)
+	if err != nil || !f.found || f.c.State == store.ConvClosed || !autoAllowed(f.c.TitleSource, f.c.Title, f.user) {
+		e.titles.run.Unlock()
+		return err
+	}
+	if ctx.Err() != nil {
+		e.titles.run.Unlock()
+		return ctx.Err()
+	}
+	name, err := save(ctx)
+	e.titles.run.Unlock()
+	if err != nil || strings.TrimSpace(name) == "" {
+		return err
+	}
+	e.queueEdit(conv, chatEdit{key: "title", what: "chat title", run: func(c context.Context, chat string) error { return e.autoTitleName(c, conv, chat, name) }})
+	e.wakeSender()
+	return nil
 }

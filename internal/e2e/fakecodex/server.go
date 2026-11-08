@@ -39,6 +39,7 @@ type Config struct {
 }
 
 type server struct {
+	temporary map[string]*temporaryTitle
 	questions map[string]*pendingQuestion
 	submitMu  sync.Mutex
 	queued    map[string][]map[string]any
@@ -101,6 +102,7 @@ func Serve(cfg Config) error {
 		cfg.Log = io.Discard
 	}
 	s := &server{
+		temporary: map[string]*temporaryTitle{},
 		questions: map[string]*pendingQuestion{},
 		cfg:       cfg,
 		queued:    map[string][]map[string]any{},
@@ -143,6 +145,9 @@ func Serve(cfg Config) error {
 // onHelperGone handles stdin EOF: the helper exited or was killed.
 func (s *server) onHelperGone() {
 	s.mu.Lock()
+	for _, tmp := range s.temporary {
+		tmp.cancel()
+	}
 	var survive, abandon []*runningTurn
 	for _, rt := range s.running {
 		if rt.plan.SurviveHelper {
@@ -233,7 +238,7 @@ func (s *server) dispatch(msg message) (any, *rpcError) {
 	str := func(k string) string { v, _ := p[k].(string); return strings.TrimSpace(v) }
 	switch msg.Method {
 	case "initialize":
-		return map[string]any{"userAgent": "codex_vscode/0.58.0 (e2e fake)"}, nil
+		return map[string]any{"userAgent": "codex_vscode/0.166.0 (e2e fake)"}, nil
 	case "thread/list":
 		threads, err := s.cfg.Store.List()
 		if err != nil {
@@ -269,7 +274,26 @@ func (s *server) dispatch(msg message) (any, *rpcError) {
 			"id": "gpt-5-mini", "model": "gpt-5-mini", "displayName": "GPT-5-Mini", "description": "e2e",
 			"isDefault": false, "supportedReasoningEfforts": small, "defaultReasoningEffort": "low",
 		}}, "nextCursor": nil}, nil
+	case "config/read":
+		mcp := map[string]any{}
+		for _, name := range s.mcpServers() {
+			mcp[name] = map[string]any{"enabled": true}
+		}
+		return map[string]any{"config": map[string]any{"mcp_servers": mcp}}, nil
+	case "thread/name/set":
+		return s.setName(str("threadId"), str("name"))
+	case "thread/unsubscribe":
+		s.mu.Lock()
+		if tmp := s.temporary[str("threadId")]; tmp != nil {
+			tmp.cancel()
+			delete(s.temporary, str("threadId"))
+		}
+		s.mu.Unlock()
+		return map[string]any{}, nil
 	case "thread/start":
+		if ephemeral, _ := p["ephemeral"].(bool); ephemeral {
+			return s.startTemporaryTitle(p)
+		}
 		now := time.Now().Unix()
 		t := &Thread{ID: newID(), Cwd: str("cwd"), CreatedAt: now, UpdatedAt: now, Turns: []*Turn{}}
 		if err := s.cfg.Store.Save(t); err != nil {
@@ -345,6 +369,12 @@ func (s *server) dispatch(msg message) (any, *rpcError) {
 	case "thread/fork":
 		return s.fork(p)
 	case "turn/start":
+		s.mu.Lock()
+		tmp := s.temporary[str("threadId")]
+		s.mu.Unlock()
+		if tmp != nil {
+			return s.runTemporaryTitle(tmp, p)
+		}
 		s.submitMu.Lock()
 		defer s.submitMu.Unlock()
 		return s.startTurn(p)
@@ -373,6 +403,15 @@ func (s *server) dispatch(msg message) (any, *rpcError) {
 		s.applySettings(str("threadId"), str("model"), str("effort"))
 		return map[string]any{}, nil
 	case "turn/interrupt":
+		s.mu.Lock()
+		tmp := s.temporary[str("threadId")]
+		if tmp != nil {
+			tmp.cancel()
+		}
+		s.mu.Unlock()
+		if tmp != nil {
+			return map[string]any{}, nil
+		}
 		return s.interrupt(str("threadId"), str("turnId"))
 	case "thread/goal/get", "thread/goal/set", "thread/goal/clear":
 		return s.goal(msg.Method, str("threadId"), p)

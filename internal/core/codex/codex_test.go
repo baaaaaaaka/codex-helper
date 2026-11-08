@@ -38,8 +38,8 @@ func TestMain(m *testing.M) {
 		err := fakecodex.Serve(fakecodex.Config{
 			In: os.Stdin, Out: os.Stdout, Log: io.Discard,
 			Store:       fakecodex.Store{Dir: filepath.Join(home, "e2e-fakecodex")},
-			SessionsDir: filepath.Join(home, "sessions"),
-			Brain:       os.Getenv(fakecodex.EnvBrainURL), Kind: "work",
+			SessionsDir: filepath.Join(home, "sessions"), CodexHome: home,
+			Brain: os.Getenv(fakecodex.EnvBrainURL), Kind: "work",
 		})
 		if err != nil {
 			os.Exit(1)

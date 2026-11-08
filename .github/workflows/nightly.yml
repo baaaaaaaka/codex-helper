@@ -1087,6 +1087,17 @@ jobs:
             '{"schema":3,"os":"${{ matrix.os }}","codex_version":"${{ matrix.codex-version }}","authentication":"synthetic-chatgpt","external_account_credentials":false,"official_binary":true,"default_responses_websocket":true,"analytics_enabled":true,"contracts":["app-server-schema","per-turn-model","per-turn-reasoning-effort","metadata-only-resume","explicit-cancel-interrupt","same-thread-resume-after-cancel","turn-summary-final-integrity","resume-context-preserved","thread-rename-history-index","remote-tui-pty","production-remote-broker-bearer","manual-approval-byte-transparent","manual-headless-fail-closed","aaa-explicit","cli-probe","standard-user-approval","approval-request-matrix","analytics-user-approved","responses-websocket","responses-only-proxy-routing","chatgpt-origin-preserved","structured-cloud-config-errors"]}' \
             > "$RUNNER_TEMP/codex-runtime-contract.json"
 
+      - name: Isolated title generation or older-version fallback
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm_root="$(npm root -g)"
+          if [ "${{ runner.os }}" = Windows ]; then npm_root="$(cygpath -u "$npm_root")"; fi
+          native="$(find "$npm_root" -type f -path '*/vendor/*' \( -name codex -o -name codex.exe \) -print -quit)"
+          test -n "$native"
+          if [ "${{ runner.os }}" = Windows ]; then native="$(cygpath -w "$native")"; fi
+          E2E_REAL_CODEX="$native" go test ./internal/core/codex -run '^TestRealCodexTitle' -count=1 -v -timeout=120s
+
       - name: Upload runtime contract proof
         uses: actions/upload-artifact@v4
         with:

@@ -72,6 +72,8 @@ type Notification struct {
 
 // Server is one running app-server process.
 type Server struct {
+	userAgent   string          // initialize response; no extra version subprocess
+	temporary   map[string]bool // under mu: cosmetic requests never interact with the user
 	cfg         Config
 	waitProcess func() error // shared startup observes process exit before RPC connects
 	cmd         *exec.Cmd
@@ -221,9 +223,13 @@ func (s *Server) initialize(ctx context.Context) error {
 		"clientInfo":   map[string]string{"name": s.cfg.ClientName, "version": "0"},
 		"capabilities": map[string]any{"experimentalApi": true},
 	}
-	if err := s.Call(ctx, "initialize", params, nil); err != nil {
+	var initialized struct {
+		UserAgent string `json:"userAgent"`
+	}
+	if err := s.Call(ctx, "initialize", params, &initialized); err != nil {
 		return fmt.Errorf("codex: initialize: %w", err)
 	}
+	s.userAgent = initialized.UserAgent
 	return s.write(wireMsg{Method: "initialized", Params: json.RawMessage(`{}`)})
 }
 
@@ -435,6 +441,21 @@ func (s *Server) handleLine(line []byte) {
 }
 
 func (s *Server) answer(m wireMsg) {
+	var p struct {
+		Thread string `json:"threadId"`
+	}
+	_ = json.Unmarshal(m.Params, &p)
+	s.mu.Lock()
+	hidden := s.temporary[p.Thread]
+	if hidden {
+		delete(s.serverRequests, string(m.ID))
+	}
+	s.mu.Unlock()
+	if hidden {
+		_ = s.write(wireMsg{ID: m.ID, Error: &RPCError{Code: -32601, Message: "interaction disabled for temporary title"}})
+		return
+	}
+
 	if m.Method == "item/tool/requestUserInput" && s.cfg.QuestionRequest != nil && s.cfg.QuestionRequest(s, m.ID, m.Params) {
 		return
 	}

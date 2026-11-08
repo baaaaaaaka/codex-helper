@@ -154,7 +154,9 @@
    | Project: fresh-proj<br>
    | Working directory: <root>/home/fresh-proj<br>
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
-   | Need more details? Send <code>helper status</code>.</p>
+   | Need more details? Send <code>helper status</code>.<br>
+   | Model: Codex account default<br>
+   | Reasoning effort: model default</p>
 
 == chat <chat:3> "💬 e2ehost - New message in opened"
    type: meeting; members: owner
@@ -171,7 +173,9 @@
    | Project: opened<br>
    | Working directory: <root>/work/opened<br>
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
-   | Need more details? Send <code>helper status</code>.</p>
+   | Need more details? Send <code>helper status</code>.<br>
+   | Model: Codex account default<br>
+   | Reasoning effort: model default</p>
 
 == chat <chat:4> "💬 e2ehost - Pinned chat"
    type: meeting; members: owner
@@ -188,4 +192,6 @@
    | Project: pinned<br>
    | Working directory: <root>/work/pinned<br>
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
-   | Need more details? Send <code>helper status</code>.</p>
+   | Need more details? Send <code>helper status</code>.<br>
+   | Model: gpt-5-codex<br>
+   | Reasoning effort: model default</p>

@@ -491,3 +491,18 @@ func (p *Pool) Running() bool {
 	}
 	return false
 }
+
+// Retain keeps this exact server alive for a bounded auxiliary request. It
+// never starts or replaces a process, unlike Acquire.
+func (l *Lease) Retain() (*Lease, error) {
+	l.p.mu.Lock()
+	defer l.p.mu.Unlock()
+	if l.p.closed {
+		return nil, ErrPoolClosed
+	}
+	if l.e.srv.Exited() {
+		return nil, ErrExited
+	}
+	l.e.leases++
+	return &Lease{p: l.p, e: l.e}, nil
+}

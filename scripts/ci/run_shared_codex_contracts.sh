@@ -25,5 +25,5 @@ for contract_suite in probe client; do
   -w /work \
   "${CXP_CONTRACT_IMAGE:-golang:1.25.11-bookworm}" \
   "/contracts/$contract_suite" -test.v -test.count=3 -test.timeout=180s \
-  -test.run 'TestRealCodex(Shared|NativeQueue)'
+  -test.run 'TestRealCodex(Shared|NativeQueue|Title)'
 done

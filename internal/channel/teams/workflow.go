@@ -12,6 +12,9 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"unicode/utf8"
+
+	"github.com/baaaaaaaka/codex-helper/internal/channel"
 )
 
 // WorkflowNotifier posts owner notifications as an Adaptive Card to a
@@ -38,45 +41,27 @@ func (w *WorkflowNotifier) Available() bool { return w != nil && w.url != "" }
 // maxCardBytes is the Workflow request size limit (28 KB) with headroom.
 const maxCardBytes = 24 << 10
 
-// NotifyFinal posts one "Codex finished" card.
-func (w *WorkflowNotifier) NotifyFinal(ctx context.Context, conv, title, text, url string) error {
+// Notify posts one card. Delivery policy belongs to the engine.
+func (w *WorkflowNotifier) Notify(ctx context.Context, n channel.OwnerNotice) error {
 	if !w.Available() {
 		return fmt.Errorf("teams: no workflow webhook configured")
 	}
-	heading := "Codex finished"
-	if title != "" {
-		heading += ": " + title
-	} else if conv != "" {
-		heading += ": " + conv
-	}
-	return w.post(ctx, heading, text, url)
-}
-
-// NotifyEvent posts a card with heading, text and an "Open chat" button
-// (v0.1.20's local_session_started card).
-func (w *WorkflowNotifier) NotifyEvent(ctx context.Context, heading, text, url string) error {
-	if !w.Available() {
-		return fmt.Errorf("teams: no workflow webhook configured")
-	}
-	return w.post(ctx, heading, text, url)
-}
-
-func (w *WorkflowNotifier) post(ctx context.Context, heading, text, url string) error {
-	body := []any{
-		map[string]any{"type": "TextBlock", "text": heading, "weight": "Bolder", "wrap": true},
-	}
-	if t := strings.TrimSpace(text); t != "" {
-		if len(t) > 2000 {
-			t = t[:2000] + "…"
+	body := []any{map[string]any{"type": "TextBlock", "text": cardText(n.Heading, 160), "weight": "Bolder", "wrap": true}}
+	for _, field := range []struct{ label, text string }{{"Chat", n.ChatTitle}, {"Request", n.Request}, {"", n.Hint}} {
+		if strings.TrimSpace(field.text) == "" {
+			continue
 		}
-		body = append(body, map[string]any{"type": "TextBlock", "text": t, "wrap": true})
+		if field.label != "" {
+			body = append(body, map[string]any{"type": "TextBlock", "text": field.label, "isSubtle": true, "spacing": "Medium", "wrap": true})
+		}
+		body = append(body, map[string]any{"type": "TextBlock", "text": cardText(field.text, 2000), "wrap": true})
 	}
 	card := map[string]any{
 		"$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
 		"type":    "AdaptiveCard", "version": "1.4", "body": body,
 	}
-	if url != "" {
-		card["actions"] = []any{map[string]any{"type": "Action.OpenUrl", "title": "Open chat", "url": url}}
+	if n.URL != "" {
+		card["actions"] = []any{map[string]any{"type": "Action.OpenUrl", "title": firstCardText(n.Button, "Open chat"), "url": n.URL}}
 	}
 	msg := map[string]any{
 		"type": "message",
@@ -108,6 +93,25 @@ func (w *WorkflowNotifier) post(ctx context.Context, heading, text, url string) 
 		return fmt.Errorf("teams: workflow webhook answered %s", resp.Status)
 	}
 	return nil
+}
+
+// Bound by bytes without splitting UTF-8; the card itself has a second size gate.
+func cardText(s string, max int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= max {
+		return s
+	}
+	n := max - 3
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n] + "…"
+}
+func firstCardText(s, fallback string) string {
+	if s = strings.TrimSpace(s); s != "" {
+		return s
+	}
+	return fallback
 }
 
 // ReadWebhookURLFile reads the Workflow webhook URL from the private file
