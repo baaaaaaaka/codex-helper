@@ -364,31 +364,42 @@ func TestConsecutiveNativeTurnsPublishEveryFinal(t *testing.T) {
 }
 
 func TestShutdownPreservesDefiniteSendRejection(t *testing.T) {
-	r := newRig(t)
+	r := newRig(t, func(c *Config) {
+		c.Channel.(*channeltest.Fake).SendFault = func(_ string, p channel.Part) (bool, error) {
+			if strings.Contains(p.Body, "shutdown-rejected") {
+				return false, &channel.Throttled{Scope: channel.ScopeChat, RetryAfter: time.Hour}
+			}
+			return false, nil
+		}
+	})
 	work := r.newWork(t.TempDir())
 	conv := convIDForTest(r, work)
-	r.ch.SendFault = func(_ string, p channel.Part) (bool, error) {
-		if strings.Contains(p.Body, "shutdown-rejected") {
-			return false, &channel.Throttled{Scope: channel.ScopeChat, RetryAfter: time.Hour}
-		}
-		return false, nil
-	}
 	var row store.Outbox
 	var token string
-	if err := r.e.update(func(tx *store.Tx) error {
-		if _, err := tx.Enqueue(conv, []store.OutMsg{{DeliveryKey: "shutdown-rejected", Kind: store.OutProgress, Body: "shutdown-rejected", ProgressGroup: "g"}}); err != nil {
+	// The ready message can be visible before its send result commits.
+	// Wait for that commit and prepare the test send in the same transaction,
+	// so the manual BeginSend obeys the production conversation FIFO.
+	r.wait("startup sends committed", func() bool {
+		if err := r.e.update(func(tx *store.Tx) error {
+			pending, err := tx.PendingOutbox(conv)
+			if err != nil || len(pending) != 0 {
+				return err
+			}
+			if _, err := tx.Enqueue(conv, []store.OutMsg{{DeliveryKey: "shutdown-rejected", Kind: store.OutProgress, Body: "shutdown-rejected", ProgressGroup: "g"}}); err != nil {
+				return err
+			}
+			rows, err := tx.PendingOutbox(conv)
+			if err != nil {
+				return err
+			}
+			row = rows[len(rows)-1]
+			token, err = tx.BeginSend(row.ID)
 			return err
+		}); err != nil {
+			t.Fatal(err)
 		}
-		rows, err := tx.PendingOutbox(conv)
-		if err != nil {
-			return err
-		}
-		row = rows[len(rows)-1]
-		token, err = tx.BeginSend(row.ID)
-		return err
-	}); err != nil {
-		t.Fatal(err)
-	}
+		return token != ""
+	})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // the definite 429 arrives concurrently with shutdown
 	r.e.send(ctx, row, work, token, nil)
