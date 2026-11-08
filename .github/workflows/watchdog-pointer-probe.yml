@@ -16,4 +16,4 @@ jobs:
           cache: true
       - name: Reproduce the exclusive pointer precondition and recovery
         shell: bash
-        run: bash scripts/ci/test_teams_startup_recovery.sh unit
+        run: go test ./internal/cli -run '^Test(TeamsCoreStore|FirstStart|TeamsServiceWatchdog|RunTeamsServiceWatchdog)' -count=1 -v
