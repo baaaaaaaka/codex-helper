@@ -51,7 +51,9 @@ func TestR04_R29_RestartPreservesWork(t *testing.T) {
 
 	s.StopSUT()
 	s.Note("stopped after %d SUT messages in work chat", beforeStop)
-	steps.MustPost(s, work.ID, "Sent while helper is down "+tokC)
+	// Both messages must request independent tasks. Ordinary input may steer
+	// B if it is still running when the restart admits C.
+	steps.MustPost(s, work.ID, "helper queue Sent while helper is down "+tokC)
 	time.Sleep(500 * time.Millisecond)
 
 	restartAt := time.Now()

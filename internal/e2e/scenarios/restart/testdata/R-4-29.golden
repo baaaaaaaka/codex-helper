@@ -73,10 +73,10 @@
    | <p>To cancel it: <code>helper cancel</code> (cancels the newest queued request). To interrupt the running one: <code>helper cancel running</code>.</p>
 -- <msg:7> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>Sent while helper is down E2E-R429-whiledown-3</p>
+   | <p>helper queue Sent while helper is down E2E-R429-whiledown-3</p>
    edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Sent while helper is down E2E-R429-whiledown-3</p>
+   | <p>helper queue Sent while helper is down E2E-R429-whiledown-3</p>
 -- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>⏳ <strong>Queued.</strong> Your request will run when the current work in this chat finishes, behind 1 other queued request.</p>
