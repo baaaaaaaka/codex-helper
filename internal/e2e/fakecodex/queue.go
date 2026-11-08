@@ -1,5 +1,7 @@
 package fakecodex
 
+import "maps"
+
 func (s *server) queue(method string, p map[string]any) (any, *rpcError) {
 	thread, _ := p["threadId"].(string)
 	id, _ := p["queuedSubmissionId"].(string)
@@ -12,7 +14,7 @@ func (s *server) queue(method string, p map[string]any) (any, *rpcError) {
 		go s.dispatchQueued(thread)
 		return map[string]any{"queuedSubmission": q}, nil
 	case "thread/queue/list":
-		return map[string]any{"data": s.queued[thread], "nextCursor": nil}, nil
+		return map[string]any{"data": append([]map[string]any(nil), s.queued[thread]...), "nextCursor": nil}, nil
 	case "thread/queue/delete":
 		for i, q := range s.queued[thread] {
 			if q["id"] == id {
@@ -36,7 +38,7 @@ func (s *server) queue(method string, p map[string]any) (any, *rpcError) {
 		if len(s.queued[thread]) == 0 {
 			return nil, invalid("queued submission not found")
 		}
-		q := s.queued[thread][0]
+		q := maps.Clone(s.queued[thread][0])
 		s.queued[thread] = s.queued[thread][1:]
 		q["model"] = settings[0]
 		q["effort"] = settings[1]
@@ -55,7 +57,9 @@ func (s *server) dispatchQueued(thread string) {
 	if t == nil || busy || len(s.queued[thread]) == 0 || s.gone.Load() {
 		return
 	}
-	q := s.queued[thread][0]
+	// Queue responses are serialized after submitMu is released. Keep their
+	// submission maps immutable while constructing the dispatched turn.
+	q := maps.Clone(s.queued[thread][0])
 	s.queued[thread] = s.queued[thread][1:]
 	q["model"] = settings[0]
 	q["effort"] = settings[1]
