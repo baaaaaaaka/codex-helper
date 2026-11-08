@@ -48,6 +48,16 @@ func TestStatusRunningInstalledAndLastPoll(t *testing.T) {
 	steps.MustPost(s, chat.ID, "Status task "+tok)
 	_, ok := steps.WaitAnswered(s, chat.ID, tok, steps.AnswerTimeout)
 	s.Check("the helper serves the owner", ok, "answered", fmt.Sprint(ok))
+	// The control chat's "Codex finished" alert and the work chat's new
+	// title follow the answer; the helper is stopped below, so wait for
+	// both or the transcript depends on how fast the runner is.
+	_, alerted := s.WaitSUTMessage(control.ID, "Request: Status task "+tok, steps.CommandTimeout)
+	s.Check("the finished alert is in the control chat", alerted, "Codex finished alert", strings.Join(s.Transcript(control.ID, 4), " | "))
+	titled := s.WaitFor("work chat title", steps.CommandTimeout, func() (bool, string) {
+		c, _ := s.Graph.Chat(chat.ID)
+		return strings.HasSuffix(c.Topic, " - Status task "+tok), fmt.Sprintf("title %q", c.Topic)
+	})
+	s.Check("the work chat is titled after the prompt", titled, "… - Status task "+tok, chat.ID)
 
 	status := func(bin string) string {
 		return s.RunCLIAs(20*time.Second, harness.CLIAs{Poll: true, Binary: bin}, "teams", "status").Stdout

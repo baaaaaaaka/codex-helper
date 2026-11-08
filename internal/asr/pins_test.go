@@ -99,21 +99,15 @@ func TestPinsCoverEveryPlatform(t *testing.T) {
 		if want := "ffmpeg-audio-" + FFmpegTag + "-" + runtimeRev + "-" + platform + ".tar.gz"; ff.Name != want || ff.URL != release+want || ff.Format != FormatTarGz {
 			t.Errorf("%s ffmpeg = %s %s %s", key, ff.Name, ff.URL, ff.Format)
 		}
-		// One workflow run publishes both; a half-filled platform is a mistake.
-		if (rt.SHA256 == "") != (ff.SHA256 == "") {
-			t.Errorf("%s: runtime and ffmpeg pins are not filled together", key)
-		}
+		// Every platform is published: a user on any of them gets voice
+		// transcription with nothing installed.
 		for _, a := range []Asset{rt, ff} {
-			if a.SHA256 != "" && (!sha.MatchString(a.SHA256) || a.Size <= 0) {
+			if !sha.MatchString(a.SHA256) || a.Size <= 0 {
 				t.Errorf("%s: bad pin %+v", key, a)
 			}
 		}
 		goos, goarch, _ := strings.Cut(key, "/")
 		mf, err := DefaultManifest(goos, goarch)
-		if rt.SHA256 == "" {
-			mustKind(t, err, KindUnsupported)
-			continue
-		}
 		if err != nil {
 			t.Fatalf("%s: %v", key, err)
 		}

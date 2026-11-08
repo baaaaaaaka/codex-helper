@@ -329,6 +329,10 @@ jobs:
           path: real
       - name: Fetch the model
         run: scripts/ci/llama-asr-fetch-model.sh real
+      - name: Fetch Go modules
+        # cmd/go has panicked mid-download on the Windows ARM64 runner
+        # (lockedfile ... became unreachable); a second try gets past it.
+        run: for i in 1 2 3; do go list -deps -test ./internal/asr >/dev/null && exit 0; echo "module fetch failed (try $i)"; sleep 10; done; exit 1
       - name: Transcribe through internal/asr
         env:
           ASR_REAL_DIR: ${{ github.workspace }}/real

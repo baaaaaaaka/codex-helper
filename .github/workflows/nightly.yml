@@ -1418,6 +1418,10 @@ jobs:
         with:
           name: nightly-voice-samples
           path: voice
+      - name: Fetch Go modules
+        # cmd/go has panicked mid-download on the Windows ARM64 runner
+        # (lockedfile ... became unreachable); a second try gets past it.
+        run: for i in 1 2 3; do go list -deps -test ./internal/asr >/dev/null && exit 0; echo "module fetch failed (try $i)"; sleep 10; done; exit 1
       - name: Download from the release and transcribe
         env:
           ASR_REAL_DIR: ${{ github.workspace }}/voice
