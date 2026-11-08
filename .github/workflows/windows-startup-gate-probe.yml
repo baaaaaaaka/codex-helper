@@ -1,0 +1,22 @@
+name: Native startup gate script probe
+on:
+  push:
+    branches: [probe/windows-startup-gate]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.11'
+          cache: true
+      - name: Startup gate from native PowerShell
+        shell: pwsh
+        run: py -3 -m unittest discover -s scripts/tests -p test_teams_startup_recovery_gate.py
+      - name: Complete Windows script suite
+        shell: pwsh
+        run: py -3 -m unittest discover -s scripts/tests -p 'test_*.py'
