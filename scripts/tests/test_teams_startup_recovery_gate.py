@@ -19,6 +19,8 @@ NAMES = [
     "TestTeamsCoreStoreResumesMigrationAfterAbortedStart",
     "TestTeamsCoreStorePreparationAfterMigrationBeforeActivation",
     "TestTeamsServiceWatchdogRefreshesRuntimeBeforeHealthCheck",
+    "TestTeamsServiceWatchdogRuntimeRefreshErrorsDoNotStopLoop",
+    "TestTeamsServiceWatchdogRuntimeRestartErrorsDoNotStopLoop",
     "TestTeamsServiceWatchdogRuntimeProcessUpgradeAndRollback",
     "TestEntryMigrationResumesAfterInterruptedStart",
     "TestEntryMigrationResumesAfterCrashDuringImport",

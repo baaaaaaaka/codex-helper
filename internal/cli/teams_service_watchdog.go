@@ -147,6 +147,9 @@ func newTeamsServiceWatchdogCmd() *cobra.Command {
 func refreshTeamsServiceWatchdogRuntime() (bool, error) {
 	current, ok := helperruntime.Current()
 	if !ok {
+		if os.Getenv(helperruntime.EnvRuntime) == "1" {
+			return false, errors.New("read watchdog runtime: managed context is unavailable")
+		}
 		return false, nil
 	}
 	// The binary knows its running version. An older launcher may omit the
@@ -162,7 +165,7 @@ func refreshTeamsServiceWatchdogRuntime() (bool, error) {
 	if active == running {
 		return false, nil
 	}
-	return true, restartSelf()
+	return true, restartSelfWithResolvedExecutableAndEnv(current.EntryPath, helperruntime.LauncherEnvironment(os.Environ()))
 }
 
 func runTeamsServiceWatchdogLoop(ctx context.Context, opts teamsServiceWatchdogOptions, interval time.Duration, quiet bool, out io.Writer, errOut io.Writer) error {
@@ -173,25 +176,34 @@ func runTeamsServiceWatchdogLoop(ctx context.Context, opts teamsServiceWatchdogO
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if !opts.DryRun {
-			if changed, err := refreshTeamsServiceWatchdogRuntime(); changed || err != nil {
-				return err
-			}
+		changed, err := runTeamsServiceWatchdogIteration(ctx, opts, quiet, out)
+		if changed && err == nil {
+			return nil
 		}
-		checkCtx, cancel := context.WithTimeout(ctx, teamsServiceExternalWatchdogCheckTimeout)
-		result, err := runTeamsServiceWatchdogOnce(checkCtx, opts)
-		cancel()
-		if err != nil {
-			if errOut != nil {
-				_, _ = fmt.Fprintf(errOut, "Teams service watchdog error: %v\n", err)
-			}
-		} else if !quiet {
-			printTeamsServiceWatchdogResult(out, result)
+		if err != nil && errOut != nil {
+			_, _ = fmt.Fprintf(errOut, "Teams service watchdog error: %v\n", err)
 		}
 		if err := sleepContext(ctx, interval); err != nil {
 			return err
 		}
 	}
+}
+
+// Refresh and health collection share the loop's retry policy. An unreadable
+// runtime pointer must not stop the watchdog or let an old build judge health.
+func runTeamsServiceWatchdogIteration(ctx context.Context, opts teamsServiceWatchdogOptions, quiet bool, out io.Writer) (bool, error) {
+	if !opts.DryRun {
+		if changed, err := refreshTeamsServiceWatchdogRuntime(); changed || err != nil {
+			return changed, err
+		}
+	}
+	checkCtx, cancel := context.WithTimeout(ctx, teamsServiceExternalWatchdogCheckTimeout)
+	defer cancel()
+	result, err := runTeamsServiceWatchdogOnce(checkCtx, opts)
+	if err == nil && !quiet {
+		printTeamsServiceWatchdogResult(out, result)
+	}
+	return false, err
 }
 
 func runTeamsServiceWatchdogOnce(ctx context.Context, opts teamsServiceWatchdogOptions) (teamsServiceWatchdogResult, error) {

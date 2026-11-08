@@ -3,9 +3,12 @@ package cli
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -78,7 +81,7 @@ func TestTeamsServiceWatchdogRefreshesRuntimeBeforeHealthCheck(t *testing.T) {
 				cancel()
 				return teamsServiceWatchdogSnapshot{}, nil
 			}
-			err := runTeamsServiceWatchdogLoop(ctx, teamsServiceWatchdogOptions{DryRun: tc.dry}, time.Millisecond, true, io.Discard, io.Discard)
+			_, err := runTeamsServiceWatchdogIteration(ctx, teamsServiceWatchdogOptions{DryRun: tc.dry}, true, io.Discard)
 			if (calls == 1) != tc.wantExec || (checks == 1) != tc.wantCheck {
 				t.Fatalf("execs=%d checks=%d err=%v", calls, checks, err)
 			}
@@ -89,5 +92,122 @@ func TestTeamsServiceWatchdogRefreshesRuntimeBeforeHealthCheck(t *testing.T) {
 				t.Fatal("runtime error ignored")
 			}
 		})
+	}
+}
+
+// A failed refresh must skip health collection and retry on the next loop tick.
+// Repair the pointer only when the loop reports its first refresh error.
+func TestTeamsServiceWatchdogRuntimeRefreshErrorsDoNotStopLoop(t *testing.T) {
+	for _, legacy := range []bool{false, true} {
+		t.Run(fmt.Sprintf("legacy=%v", legacy), func(t *testing.T) {
+			for _, invalid := range []string{"", "not a version"} {
+				t.Run("pointer="+invalid, func(t *testing.T) {
+					testTeamsServiceWatchdogRuntimeRefreshRecovery(t, func(root string) func() {
+						if legacy {
+							t.Setenv(helperruntime.EnvRuntimeVersion, "")
+						}
+						if invalid == "" {
+							if err := os.Remove(filepath.Join(root, "active")); err != nil {
+								t.Fatal(err)
+							}
+						} else {
+							writeFile(t, filepath.Join(root, "active"), invalid)
+						}
+						return func() { writeFile(t, filepath.Join(root, "active"), "v1.2.3") }
+					})
+				})
+			}
+		})
+	}
+}
+
+type watchdogErrorWriter func([]byte) (int, error)
+
+func (w watchdogErrorWriter) Write(p []byte) (int, error) { return w(p) }
+
+func testTeamsServiceWatchdogRuntimeRefreshRecovery(t *testing.T, unavailable func(string) func()) {
+	t.Helper()
+	lockCLITestHooks(t)
+	root := t.TempDir()
+	t.Setenv(helperruntime.EnvRuntime, "1")
+	t.Setenv(helperruntime.EnvRuntimeRoot, root)
+	t.Setenv(helperruntime.EnvRuntimeVersion, "v1.2.3")
+	t.Setenv(helperruntime.EnvEntryPath, filepath.Join(root, "cxp"))
+	writeFile(t, filepath.Join(root, "active"), "v1.2.3")
+	restore := unavailable(root)
+	var restored sync.Once
+	recoverPointer := func() { restored.Do(restore) }
+	t.Cleanup(recoverPointer)
+	prevVersion := version
+	prevCollect, prevPath := teamsServiceWatchdogCollectSnapshot, teamsServiceWatchdogStatePath
+	t.Cleanup(func() {
+		version = prevVersion
+		teamsServiceWatchdogCollectSnapshot, teamsServiceWatchdogStatePath = prevCollect, prevPath
+	})
+	version = "v1.2.3"
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	checks, logs := 0, 0
+	teamsServiceWatchdogStatePath = func() (string, error) { return filepath.Join(root, "watchdog.json"), nil }
+	teamsServiceWatchdogCollectSnapshot = func(context.Context, teamsServiceWatchdogOptions) (teamsServiceWatchdogSnapshot, error) {
+		checks++
+		if logs != 1 {
+			t.Fatalf("health collected before runtime read recovered: logs=%d", logs)
+		}
+		cancel()
+		return teamsServiceWatchdogSnapshot{}, nil
+	}
+	errOut := watchdogErrorWriter(func(p []byte) (int, error) {
+		logs++
+		if !strings.Contains(string(p), "read watchdog runtime:") {
+			t.Fatalf("unexpected refresh error: %s", p)
+		}
+		if checks != 0 {
+			t.Fatal("health collected while runtime pointer was unreadable")
+		}
+		recoverPointer()
+		return len(p), nil
+	})
+	err := runTeamsServiceWatchdogLoop(ctx, teamsServiceWatchdogOptions{}, time.Millisecond, true, io.Discard, errOut)
+	if !errors.Is(err, context.Canceled) || checks != 1 || logs != 1 {
+		t.Fatalf("refresh recovery: checks=%d logs=%d err=%v", checks, logs, err)
+	}
+}
+
+func TestTeamsServiceWatchdogRuntimeRestartErrorsDoNotStopLoop(t *testing.T) {
+	lockCLITestHooks(t)
+	root := t.TempDir()
+	t.Setenv(helperruntime.EnvRuntime, "1")
+	t.Setenv(helperruntime.EnvRuntimeRoot, root)
+	t.Setenv(helperruntime.EnvRuntimeVersion, "v1.2.3")
+	t.Setenv(helperruntime.EnvEntryPath, filepath.Join(root, "cxp"))
+	writeFile(t, filepath.Join(root, "active"), "v1.2.4")
+	prevVersion, prevExec, prevStart := version, execSelf, startSelf
+	prevCollect := teamsServiceWatchdogCollectSnapshot
+	t.Cleanup(func() {
+		version, execSelf, startSelf = prevVersion, prevExec, prevStart
+		teamsServiceWatchdogCollectSnapshot = prevCollect
+	})
+	version = "v1.2.3"
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	calls := 0
+	restartErr := errors.New("injected restart failure")
+	restart := func(string, []string, []string) error {
+		calls++
+		if calls == 2 {
+			cancel()
+		}
+		return restartErr
+	}
+	execSelf, startSelf = restart, restart
+	teamsServiceWatchdogCollectSnapshot = func(context.Context, teamsServiceWatchdogOptions) (teamsServiceWatchdogSnapshot, error) {
+		t.Fatal("old runtime checked health after failed restart")
+		return teamsServiceWatchdogSnapshot{}, nil
+	}
+	var errOut strings.Builder
+	err := runTeamsServiceWatchdogLoop(ctx, teamsServiceWatchdogOptions{}, time.Millisecond, true, io.Discard, &errOut)
+	if !errors.Is(err, context.Canceled) || calls != 2 || strings.Count(errOut.String(), restartErr.Error()) != 2 {
+		t.Fatalf("restart retry: calls=%d err=%v logs=%q", calls, err, errOut.String())
 	}
 }
