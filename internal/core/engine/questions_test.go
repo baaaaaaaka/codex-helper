@@ -179,6 +179,7 @@ func TestQuestionAsyncIdleAndSkip(t *testing.T) {
 			if err := a.emit(g); err != nil {
 				t.Fatal(err)
 			}
+			r.wait("question delivered", func() bool { return len(r.own(work, "Question from Codex")) == 1 })
 			answer := "my custom answer"
 			if skip {
 				answer = "--skip"
@@ -229,6 +230,9 @@ func TestQuestionUnknownDeliveryNeverReplays(t *testing.T) {
 	if err := a.emit(questionGroup(false, 1)); err != nil {
 		t.Fatal(err)
 	}
+	// The status edit requires a delivered message. Answering before publication
+	// can intentionally suppress the entire question; that path is tested apart.
+	r.wait("question delivered", func() bool { return len(r.own(work, "Question from Codex")) == 1 })
 	r.ch.PostUser(work, "helper answer Q1 A")
 	r.wait("submitted", func() bool { return a.nreplies() == 1 })
 	r.wait("unknown notice", func() bool { return len(r.own(work, "Delivery unconfirmed")) > 0 })

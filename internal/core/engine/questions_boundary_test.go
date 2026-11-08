@@ -501,6 +501,48 @@ func TestQuestionRenderingDoesNotBlockNativeEventsOrOtherChats(t *testing.T) {
 	}
 }
 
+func TestQuestionUnknownDeliveryBeforePublicationNeverReplays(t *testing.T) {
+	a := newQuestionAgent()
+	a.failure = fmt.Errorf("connection lost after write")
+	entered, release := make(chan struct{}, 1), make(chan struct{})
+	var unblock sync.Once
+	defer unblock.Do(func() { close(release) })
+	r := newRig(t, func(c *Config) {
+		c.Agent, c.Senders = a, 2
+		c.Channel = &questionRenderChannel{Fake: c.Channel.(*channeltest.Fake), entered: entered, release: release}
+	})
+	r.ag = a.fakeAgent
+	work := r.newWork(t.TempDir())
+	r.ch.PostUser(work, "seed")
+	r.wait("seed", func() bool { return len(r.own(work, "ANSWER to seed")) > 0 })
+	g := questionGroup(false, 1)
+	if err := a.emit(g); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("question renderer did not start")
+	}
+	r.ch.PostUser(work, "helper answer Q1 A")
+	r.wait("unknown result persisted before publication", func() bool {
+		return readQuestion(t, r.e, g.Key).State == "uncertain"
+	})
+	r.e.maintainQuestions(context.Background())
+	r.ch.PostUser(work, "helper answer Q1 B")
+	unblock.Do(func() { close(release) })
+	r.wait("second answer refused", func() bool { return len(r.own(work, "already resolved")) > 0 })
+	conv := readQuestion(t, r.e, g.Key).ConvID
+	r.wait("renderer released", func() bool {
+		r.e.mu.Lock()
+		defer r.e.mu.Unlock()
+		return !r.e.convs[conv].sending
+	})
+	if a.nreplies() != 1 || len(r.own(work, "Question from Codex")) != 0 {
+		t.Fatal("uncertain answer replayed or stale question published")
+	}
+}
+
 func TestQuestionMaintenanceDoesNotRenderExistingMessages(t *testing.T) {
 	a := newQuestionAgent()
 	var ch *questionRenderChannel
