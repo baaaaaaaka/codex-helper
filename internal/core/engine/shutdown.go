@@ -41,17 +41,15 @@ func (e *Engine) cmdShutdown(ctx context.Context, j cmdJob) {
 	if rec.Host == "" {
 		rec.Host = e.cfg.Machine
 	}
-	if _, err := store.WriteStop(filepath.Dir(e.st.Path()), rec); err != nil {
-		e.logf("shutdown: %v", err)
-		e.reply(j, "Shutdown failed: the stop could not be recorded ("+userError(err.Error())+"). The helper keeps running; run `cxp teams stop` on a machine that shares its state.", nil)
-		return
-	}
 	// The reply's parts are keyed cmd:<inbound>:<part> (reply, render).
 	prefix := fmt.Sprintf("cmd:%d:", j.inbound)
 	e.mu.Lock()
 	again := e.stopReply != ""
 	if !again {
 		e.stopReply = prefix
+		// Publish local shutdown intent before the kill switch. Otherwise a
+		// heartbeat can observe our own file and exit before the reply.
+		e.stopping.Store(true)
 	}
 	e.mu.Unlock()
 	if again {
@@ -60,8 +58,18 @@ func (e *Engine) cmdShutdown(ctx context.Context, j cmdJob) {
 		e.complete(j, func(*store.Tx) error { return nil })
 		return
 	}
+	if _, err := store.WriteStop(filepath.Dir(e.st.Path()), rec); err != nil {
+		e.mu.Lock()
+		e.stopReply = ""
+		e.stopping.Store(false)
+		e.runnerAll = true
+		e.mu.Unlock()
+		e.wakeRunner()
+		e.logf("shutdown: %v", err)
+		e.reply(j, "Shutdown failed: the stop could not be recorded ("+userError(err.Error())+"). The helper keeps running; run `cxp teams stop` on a machine that shares its state.", nil)
+		return
+	}
 	e.logf("shutdown requested: stopped on all machines")
-	e.stopping.Store(true)
 	e.reply(j, textShutdown, nil)
 	deadline := e.now().Add(shutdownReplyWait)
 	for e.now().Before(deadline) && e.pendingKeys(j.conv, prefix) {

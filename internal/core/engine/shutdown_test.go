@@ -2,6 +2,7 @@ package engine
 
 import (
 	"errors"
+	"io"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -13,6 +14,65 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/channel/channeltest"
 	"github.com/baaaaaaaka/codex-helper/internal/core/store"
 )
+
+type shutdownBarrierLog struct {
+	io.Writer
+	published chan<- struct{}
+	resume    <-chan struct{}
+}
+
+func (w shutdownBarrierLog) Write(p []byte) (int, error) {
+	if strings.Contains(string(p), "shutdown requested: stopped on all machines") {
+		close(w.published)
+		<-w.resume
+	}
+	return w.Writer.Write(p)
+}
+
+// Pause the command after publishing DISABLED, exactly where the heartbeat
+// used to mistake this process's shutdown for an external stop.
+func TestShutdownIntentPrecedesPublishedStop(t *testing.T) {
+	published, resume := make(chan struct{}), make(chan struct{})
+	r := newRig(t, func(c *Config) {
+		c.Timing.Heartbeat = 5 * time.Millisecond
+		c.Log = shutdownBarrierLog{c.Log, published, resume}
+	})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(resume) }) }
+	t.Cleanup(unblock)
+	ctl := r.control()
+	r.ch.PostUser(ctl, "shutdown")
+	select {
+	case <-published:
+	case <-time.After(10 * time.Second):
+		t.Fatal("shutdown did not publish the stop record")
+	}
+	if err := r.st.Heartbeat(); !errors.Is(err, store.ErrDisabled) {
+		t.Fatalf("heartbeat after publication = %v, want ErrDisabled", err)
+	}
+	if !r.e.stopping.Load() {
+		t.Fatal("published stop is visible to heartbeat before local shutdown intent")
+	}
+	r.e.mu.Lock()
+	prefix := r.e.stopReply
+	r.e.mu.Unlock()
+	if prefix == "" {
+		t.Fatal("published stop has no protected reply")
+	}
+	unblock()
+	select {
+	case err := <-r.done:
+		r.done <- err // for r.stop
+		if !errors.Is(err, store.ErrDisabled) {
+			t.Fatalf("shutdown returned %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("shutdown did not finish after its reply")
+	}
+	if n := len(r.own(ctl, "Stopped on all machines")); n != 1 {
+		t.Fatalf("shutdown reply count = %d, want 1", n)
+	}
+}
 
 // Owner ruling 2026-11-05: `shutdown` in the control chat stops the helper
 // on all machines like `cxp teams stop`. It records the stop in the
