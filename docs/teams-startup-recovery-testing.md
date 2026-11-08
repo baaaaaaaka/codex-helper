@@ -20,6 +20,9 @@ be replaced with an empty one.
 | An open runtime pointer reader permits activation and retains its original contents; fresh readers see the new version | `TestVersionPointerReplacementWhileReaderOpen` covers active/previous pointers on every native CI OS; `TestVersionPointerReadsLongPath` preserves extended-length reads |
 | Runtime pointer read errors and failed restarts leave the watchdog alive, skip health collection and recover on the next tick | `TestTeamsServiceWatchdogRuntimeRefreshErrorsDoNotStopLoop`; `TestTeamsServiceWatchdogRuntimeRestartErrorsDoNotStopLoop`; native Windows `TestTeamsServiceWatchdogRuntimeRefreshRecoversSharingViolation` |
 | A running watchdog follows activation and rollback before checking health | Watchdog unit tests; `TestTeamsServiceWatchdogRuntimeProcessUpgradeAndRollback` runs real dispatch/restart on each native CI OS; `TestEntryWatchdogRuntimeUpgradeAndRollback` and `TestEntryWatchdogRuntimeLegacyLauncher` run release binaries through the production CLI on Linux |
+| A local shutdown protects its final reply before publishing the shared stop; a failed write resumes work | `TestShutdownIntentPrecedesPublishedStop`; `TestShutdownRecordFailureResumesWork`; shutdown E2E scenarios |
+| Input admitted between steering and starting still targets the active native turn; uncertain delivery pauses without replay | `TestInputAdmittedBetweenSteerAndStart` explicitly controls the boundary without sleeps, also covering explicit queued and idle execution; `TestUncertainSteerPausesWithoutReplay`; shared Teams/TUI input E2E |
+| Fake Codex response encoding cannot race with queue dispatch or deletion | `TestQueueResponsesRemainUnchangedAfterDispatchAndDelete`; complete fake Codex package race check |
 
 The converter fault tests discover the number of ownership checkpoints from a
 successful conversion, then inject each failure at every checkpoint. New
@@ -56,6 +59,9 @@ missing tests and failed Go commands propagate failure. The existing final
 CI aggregate depends on the unit and E2E jobs.
 The release workflow reuses this CI workflow and requires it before packaging;
 the workflow tests also guard that dependency.
+The full engine unit and core race jobs include the shutdown and input-admission
+boundary tests. The race job separately runs the fake Codex package, so test
+backend concurrency failures also block the CI aggregate and release.
 
 These tests do not replace a real shared-filesystem compatibility test or an
 installed service-manager upgrade test. They do not repair an empty database

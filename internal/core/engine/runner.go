@@ -178,6 +178,7 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 		// voiceFailed: the next turn was a voice message that could not
 		// be transcribed; it was answered with the reason, not started.
 		voiceFailed bool
+		steerReady  bool       // ordinary input arrived after this pass's steer check
 		ctl         ctlRequest // batch B: a control question's history
 	)
 	err := e.update(func(tx *store.Tx) error {
@@ -251,6 +252,13 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 				return err
 			}
 		}
+		// Admission can happen between trySteer and this transaction. Do
+		// not claim that new ordinary input as an execution when it belongs
+		// to an active native turn; the next pass delivers it through Steer.
+		if agent, ok := e.ag.(SteeringAgent); ok && !tr.Queue && (!control || questionReply) && agent.CurrentTurn(id, th.ThreadID) != "" {
+			got, steerReady = false, true
+			return nil
+		}
 		if continuesPrompt(tr, th.ThreadID) {
 			req.Text, req.Images = continueText, nil
 		}
@@ -300,6 +308,9 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 		e.wakeRunner(id) // the next queued turn, if any
 	}
 	if !got {
+		if steerReady {
+			e.wakeRunner(id)
+		}
 		return false
 	}
 	if control {
