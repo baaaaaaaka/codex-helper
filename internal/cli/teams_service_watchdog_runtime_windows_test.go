@@ -3,7 +3,6 @@ package cli
 import (
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"testing"
 
@@ -23,23 +22,15 @@ func TestTeamsServiceWatchdogRuntimeRefreshRecoversSharingViolation(t *testing.T
 				if err != nil {
 					t.Fatal(err)
 				}
-				// A real exclusive handle makes ReadActive fail with a sharing violation.
-				h, err := windows.CreateFile(path, windows.GENERIC_READ, 0, nil, windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
+				// Hold DELETE access as pointer replacement does. Go readers do not
+				// share DELETE, so opening the pointer must fail until this closes.
+				h, err := windows.CreateFile(path, windows.DELETE, windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE, nil, windows.OPEN_EXISTING, windows.FILE_ATTRIBUTE_NORMAL, 0)
 				if err != nil {
 					t.Fatal(err)
 				}
 				if _, readErr := helperruntime.ReadActive(root); !errors.Is(readErr, windows.ERROR_SHARING_VIOLATION) {
-					var held, opened windows.ByHandleFileInformation
-					heldErr := windows.GetFileInformationByHandle(h, &held)
-					var openedErr error
-					if f, err := os.Open(filepath.Join(root, "active")); err == nil {
-						openedErr = windows.GetFileInformationByHandle(windows.Handle(f.Fd()), &opened)
-						f.Close()
-					} else {
-						openedErr = err
-					}
 					_ = windows.CloseHandle(h)
-					t.Fatalf("pointer lock precondition: read=%v handle=%v held=%+v/%v opened=%+v/%v root=%q", readErr, h, held, heldErr, opened, openedErr, root)
+					t.Fatalf("pointer replacement fixture did not produce a sharing violation: %v", readErr)
 				}
 				return func() {
 					if err := windows.CloseHandle(h); err != nil {
