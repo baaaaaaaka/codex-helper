@@ -43,10 +43,10 @@ Use `cxp proxy` only when the user is asking about SSH/network routing.
 ## Teams Helper
 
 - `cxp teams setup`: local setup checklist (no network).
-- `cxp teams auth config --tenant-id <tenant-id> --client-id <client-id>`: save the Teams Graph tenant and public client ID.
-- `cxp teams auth` (or `cxp teams auth login`): sign in with a Microsoft device code in a foreground terminal; one delegated token covers reading and sending chat messages, meeting chats and file uploads. Add `--force` for a fresh login.
-- `cxp teams auth status`: show the local sign-in state and token expiry without printing tokens.
-- `cxp teams auth logout`: remove the local Teams token cache.
+- `cxp teams auth config --tenant-id <tenant-id> --read-client-id <read-id> --client-id <write-id>`: save the tenant and optional separate read and full client IDs. The read ID defaults to the full ID.
+- `cxp teams auth read` and `cxp teams auth full`: sign in with Microsoft device codes in a foreground terminal. Read tokens handle idempotent Graph reads; full tokens handle writes. Use one login when both IDs match. Add `--force` for a fresh login.
+- `cxp teams auth read-status` and `cxp teams auth full-status`: show local cache state and expiry without printing tokens. `status` remains an alias for `full-status`.
+- `cxp teams auth read-logout` and `cxp teams auth full-logout`: remove the matching local token cache. `logout` remains an alias for `full-logout`.
 - `cxp teams run`: start the helper. Where supported it installs and starts the background service, which keeps the helper running after terminal close; the helper creates this machine's control chat when it first starts. `--once` polls once in the foreground, finishes the work that brings in (and any kept command-line request) and exits; `--interval` sets the polling interval.
 - `cxp teams status`: show the helper store, owner, control chat, sessions and queues. When the helper is stopped on all machines, the first line says by whom and how to start it again.
 - `cxp teams stop`: stop the helper on all machines that share this state directory until `cxp teams start` (it creates the kill-switch file `DISABLED` next to the store; the running helper stops at its next heartbeat and standbys and services stay idle). `shutdown` in the Teams control chat does the same.

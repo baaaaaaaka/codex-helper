@@ -224,6 +224,69 @@ func TestResolveAuthConfigReadsExistingCaches(t *testing.T) {
 	}
 }
 
+func TestResolveReadAuthConfigFallsBackOrUsesSeparateCache(t *testing.T) {
+	root := t.TempDir()
+	state := filepath.Join(root, "state")
+	configPath := filepath.Join(root, "teams-auth.json")
+	t.Setenv("CODEX_HELPER_STATE_DIR", state)
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(root, "cache"))
+	t.Setenv("HOME", filepath.Join(root, "home"))
+	t.Setenv("LocalAppData", filepath.Join(root, "cache"))
+	t.Setenv("CODEX_HELPER_TEAMS_AUTH_CONFIG", configPath)
+	for _, key := range []string{
+		"CODEX_HELPER_TEAMS_AUTH_PROFILE", "CODEX_HELPER_TEAMS_PROFILE",
+		"CODEX_HELPER_TEAMS_TENANT_ID", "CODEX_HELPER_TEAMS_CLIENT_ID",
+		"CODEX_HELPER_TEAMS_FULL_TENANT_ID", "CODEX_HELPER_TEAMS_FULL_CLIENT_ID",
+		"CODEX_HELPER_TEAMS_FULL_SCOPES", "CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE",
+		"CODEX_HELPER_TEAMS_READ_TENANT_ID", "CODEX_HELPER_TEAMS_READ_CLIENT_ID",
+		"CODEX_HELPER_TEAMS_READ_SCOPES", "CODEX_HELPER_TEAMS_READ_TOKEN_CACHE",
+	} {
+		t.Setenv(key, "")
+	}
+	writeConfig := func(readID string) {
+		t.Helper()
+		doc := map[string]any{
+			"tenant_id": "tenant-a",
+			"full":      map[string]string{"client_id": "write-client"},
+		}
+		if readID != "" {
+			doc["read"] = map[string]string{"client_id": readID}
+		}
+		raw, err := json.Marshal(doc)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(configPath, raw, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writeConfig("")
+	fullCfg, err := ResolveAuthConfig("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	readCfg, err := ResolveReadAuthConfig("")
+	if err != nil || readCfg.ClientID != fullCfg.ClientID || readCfg.CachePath != fullCfg.CachePath {
+		t.Fatalf("read config should reuse full auth: read=%+v full=%+v err=%v", readCfg, fullCfg, err)
+	}
+
+	writeConfig("read-client")
+	readCfg, err = ResolveReadAuthConfig("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantReadCache := filepath.Join(state, "teams", "profiles", "default", readCacheName)
+	if readCfg.ClientID != "read-client" || readCfg.Scopes != DefaultReadScopes || readCfg.CachePath != wantReadCache || readCfg.CachePath == fullCfg.CachePath {
+		t.Fatalf("separate read config = %+v, want cache %s", readCfg, wantReadCache)
+	}
+
+	writeCache(t, wantReadCache, TokenCache{RefreshToken: "read-refresh"})
+	readCfg, err = ResolveReadAuthConfig("")
+	if err != nil || readCfg.CachePath != wantReadCache {
+		t.Fatalf("existing read cache not reused: %+v %v", readCfg, err)
+	}
+}
+
 // Two token sources on one cache (service + CLI, or two machines on a shared
 // home) must not both spend the refresh token: the second one waits for the
 // cache lock, re-reads the cache and uses the token the first one stored.

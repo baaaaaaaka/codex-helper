@@ -35,10 +35,11 @@ const (
 )
 
 type graph struct {
-	base   *url.URL
-	http   *http.Client
-	tokens TokenSource
-	sleep  func(context.Context, time.Duration) error
+	base       *url.URL
+	http       *http.Client
+	tokens     TokenSource
+	readTokens TokenSource
+	sleep      func(context.Context, time.Duration) error
 	// timeout bounds one request; transfer one download or large upload
 	// body. Zero: no bound beyond ctx.
 	timeout, transfer time.Duration
@@ -120,13 +121,14 @@ func retryableRead(err error) bool {
 
 // once performs one request, refreshing the token once on 401 for reads.
 func (g *graph) once(ctx context.Context, c call) (response, error) {
+	tokens := g.tokenSource(c)
 	resp, stale, err := g.send(ctx, c)
 	if err != nil || resp.status != http.StatusUnauthorized || c.noAuth {
 		return resp, err
 	}
 	// 401: the request was not applied. Refresh so the next attempt works;
 	// retry here only for reads (writes are never retried internally).
-	tok, rerr := g.tokens.Refresh(ctx, stale)
+	tok, rerr := tokens.Refresh(ctx, stale)
 	if rerr != nil {
 		return response{}, authErr(rerr)
 	}
@@ -157,7 +159,7 @@ func (g *graph) send(ctx context.Context, c call) (response, string, error) {
 	}
 	var token string
 	if !c.noAuth {
-		token, err = g.tokens.Token(ctx)
+		token, err = g.tokenSource(c).Token(ctx)
 		if err != nil {
 			return response{}, "", authErr(err)
 		}
@@ -253,6 +255,13 @@ func (g *graph) send(ctx context.Context, c call) (response, string, error) {
 		return resp, token, nil
 	}
 	return response{}, token, g.classify(c, resp)
+}
+
+func (g *graph) tokenSource(c call) TokenSource {
+	if !c.write && g.readTokens != nil {
+		return g.readTokens
+	}
+	return g.tokens
 }
 
 // classify maps a non-2xx, non-401 status onto the channel error classes.

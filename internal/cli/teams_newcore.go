@@ -77,10 +77,14 @@ type teamsNewCoreOptions struct {
 // formulas are drawn with the managed MathJax renderer (NodeMath, as in
 // v0.1.20); while it installs, or when Node.js is missing, they show as TeX
 // code.
-func teamsNewCoreChannelConfig(client *http.Client, authCfg chteams.AuthConfig) chteams.Config {
-	return chteams.Config{HTTP: client, Tokens: chteams.NewDelegatedAuth(authCfg, client), TenantID: authCfg.TenantID,
+func teamsNewCoreChannelConfig(client *http.Client, authCfg chteams.AuthConfig, readCfgs ...chteams.AuthConfig) chteams.Config {
+	cfg := chteams.Config{HTTP: client, Tokens: chteams.NewDelegatedAuth(authCfg, client), TenantID: authCfg.TenantID,
 		SharePointHosts: chteams.SharePointHostsFromEnv(os.Getenv("CODEX_HELPER_TEAMS_ALLOWED_SHAREPOINT_HOSTS")),
 		Math:            &chteams.NodeMath{}}
+	if len(readCfgs) > 0 && readCfgs[0].ClientID != authCfg.ClientID {
+		cfg.ReadTokens = chteams.NewDelegatedAuth(readCfgs[0], client)
+	}
+	return cfg
 }
 
 // teamsNewCoreWorkflowURL reads the Workflow (owner card) webhook from the
@@ -335,7 +339,11 @@ func serveTeamsNewCore(ctx context.Context, out, errOut io.Writer, root *rootOpt
 	if err != nil {
 		return fmt.Errorf("Teams auth: %w", err)
 	}
-	ch, err := chteams.New(teamsNewCoreChannelConfig(client, authCfg))
+	readCfg, err := chteams.ResolveReadAuthConfig("")
+	if err != nil {
+		return fmt.Errorf("Teams read auth: %w", err)
+	}
+	ch, err := chteams.New(teamsNewCoreChannelConfig(client, authCfg, readCfg))
 	if err != nil {
 		return err
 	}

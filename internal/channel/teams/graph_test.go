@@ -81,6 +81,61 @@ func TestThrottledScopeFromServer(t *testing.T) {
 	}
 }
 
+type rotatingTestTokens struct {
+	token     string
+	refreshed string
+	refreshes int
+}
+
+func (s *rotatingTestTokens) Token(context.Context) (string, error) { return s.token, nil }
+func (s *rotatingTestTokens) Refresh(context.Context, string) (string, error) {
+	s.refreshes++
+	s.token = s.refreshed
+	return s.token, nil
+}
+
+func TestGraphUsesReadAndFullTokensForTheirCalls(t *testing.T) {
+	var requests []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.Method+":"+r.Header.Get("Authorization"))
+		if r.Method == http.MethodGet && r.Header.Get("Authorization") == "Bearer read-old" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if r.Method == http.MethodPost {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+	base, err := url.Parse(server.URL + "/v1.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	full := &rotatingTestTokens{token: "full-old", refreshed: "full-new"}
+	read := &rotatingTestTokens{token: "read-old", refreshed: "read-new"}
+	g := &graph{base: base, http: server.Client(), tokens: full, readTokens: read, sleep: noSleep}
+	if _, err := g.do(context.Background(), call{method: http.MethodGet, url: "/me"}); err != nil {
+		t.Fatalf("read after token refresh: %v", err)
+	}
+	if _, err := g.do(context.Background(), call{method: http.MethodPost, url: "/chats", write: true}); err == nil {
+		t.Fatal("write with 401 unexpectedly succeeded")
+	}
+	want := []string{"GET:Bearer read-old", "GET:Bearer read-new", "POST:Bearer full-old"}
+	if len(requests) != len(want) {
+		t.Fatalf("requests = %v, want %v", requests, want)
+	}
+	for i := range want {
+		if requests[i] != want[i] {
+			t.Fatalf("requests = %v, want %v", requests, want)
+		}
+	}
+	if read.refreshes != 1 || full.refreshes != 1 {
+		t.Fatalf("read refreshes=%d full refreshes=%d, want one each", read.refreshes, full.refreshes)
+	}
+}
+
 func TestUnparseableAcceptedResponseIsAmbiguous(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		io.Copy(io.Discard, r.Body)
