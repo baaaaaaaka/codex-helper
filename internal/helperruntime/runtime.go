@@ -98,11 +98,32 @@ func Launch(version string, args []string) (exitCode int, handled bool, err erro
 	}
 	root := filepath.Join(filepath.Dir(physical), ".cxp-runtime")
 	entry := filepath.Join(filepath.Dir(physical), BinaryName(runtime.GOOS))
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	lock, err := lockRoot(ctx, root)
-	if err != nil {
-		return 0, false, err
+	if boot, bootErr := ReadBoot(root); bootErr == nil {
+		return launchBoot(root, entry, args, boot)
+	} else if !errors.Is(bootErr, os.ErrNotExist) {
+		// Even a corrupt/unknown boot record cannot prevent the stable full CLI
+		// from running. Do not repair it or run pending activation at startup.
+		return 0, false, nil
+	}
+	// Ordinary startup is read-only and never waits behind an installer. The
+	// slow path below remains only for initial legacy migration/entry upgrades.
+	if active, readErr := ReadActive(root); readErr == nil && !shouldActivateEntryVersion(normalized, active) {
+		if target, targetErr := checkedRuntime(root, active); targetErr == nil {
+			return launchRuntimeFn(target, append([]string{target}, args[1:]...), setRuntimeEnvironment(os.Environ(), root, entry, active))
+		}
+		return 0, false, nil
+	}
+	// First-install migration is optional at startup. If another process owns
+	// it or this directory is read-only, run the complete stable CLI directly.
+	if _, readErr := ReadActive(root); readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+		return 0, false, nil
+	}
+	if err := os.MkdirAll(root, 0755); err != nil {
+		return 0, false, nil
+	}
+	lock := flock.New(filepath.Join(root, "runtime.lock"))
+	if acquired, err := lock.TryLock(); err != nil || !acquired {
+		return 0, false, nil
 	}
 	locked := true
 	defer func() {
@@ -258,22 +279,46 @@ func VersionPath(root string, version string, goos string) string {
 }
 
 func ReadActive(root string) (string, error) {
+	if s, err := ReadBoot(root); err == nil {
+		return s.Good, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
 	return readVersionPointer(root, "active")
 }
 
 func ReadPrevious(root string) (string, error) {
+	if s, err := ReadBoot(root); err == nil {
+		if s.Previous == "" {
+			return "", os.ErrNotExist
+		}
+		return s.Previous, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", err
+	}
 	return readVersionPointer(root, "previous")
 }
 
 func readVersionPointer(root string, name string) (string, error) {
-	file, err := openVersionPointerFile(filepath.Join(filepath.Clean(root), name))
+	path := filepath.Join(filepath.Clean(root), name)
+	info, err := os.Lstat(path)
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() || info.Size() > 256 {
+		return "", fmt.Errorf("invalid cxp runtime pointer")
+	}
+	file, err := openVersionPointerFile(path)
 	if err != nil {
 		return "", err
 	}
 	defer file.Close()
-	raw, err := io.ReadAll(file)
+	raw, err := io.ReadAll(io.LimitReader(file, 257))
 	if err != nil {
 		return "", err
+	}
+	if len(raw) > 256 {
+		return "", fmt.Errorf("cxp runtime pointer too large")
 	}
 	value, ok := NormalizeVersion(string(raw))
 	if !ok {
@@ -294,6 +339,20 @@ func writeVersionPointer(root string, name string, version string) error {
 	normalized, ok := NormalizeVersion(version)
 	if !ok {
 		return fmt.Errorf("invalid cxp runtime version %q", version)
+	}
+	if s, err := ReadBoot(root); err == nil {
+		// Explicit updates/rollbacks invalidate a pending automatic trial. All
+		// existing callers hold the runtime mutation lock for these transitions.
+		if name == "active" {
+			s.Previous, s.Good = s.Good, normalized
+			s.Candidate = nil
+		} else {
+			s.Previous = normalized
+		}
+		s.Generation++
+		return writeBoot(root, s)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
 	root = filepath.Clean(root)
 	if err := os.MkdirAll(root, 0o755); err != nil {
@@ -345,7 +404,7 @@ func InstallVersion(root string, source string, version string, goos string, pre
 		return "", fmt.Errorf("invalid cxp runtime version %q", version)
 	}
 	if same, err := sameFileContent(source, target); err == nil && same {
-		return target, nil
+		return target, syncVersionDirs(root, target)
 	} else if err == nil {
 		return "", fmt.Errorf("immutable cxp runtime %s already exists with different content", target)
 	} else if !errors.Is(err, os.ErrNotExist) {
@@ -382,15 +441,25 @@ func InstallVersion(root string, source string, version string, goos string, pre
 	}
 	if err := os.Rename(tmpPath, target); err != nil {
 		if same, sameErr := sameFileContent(source, target); sameErr == nil && same {
-			return target, nil
+			return target, syncVersionDirs(root, target)
 		}
 		return "", err
 	}
 	cleanup = false
+	return target, syncVersionDirs(root, target)
+}
+
+func syncVersionDirs(root, target string) error {
 	if err := syncDir(filepath.Dir(target)); err != nil {
-		return "", err
+		return err
 	}
-	return target, nil
+	// A synced executable and leaf directory are insufficient when the
+	// version directory was just created. Publish all directory entries before
+	// any boot record can refer to them.
+	if err := syncDir(filepath.Join(root, "versions")); err != nil {
+		return err
+	}
+	return syncDir(root)
 }
 
 // PublishDownloaded atomically publishes an already validated candidate and
@@ -433,7 +502,7 @@ func WithoutRuntimeMarkers(env []string) []string {
 	for _, value := range env {
 		name, _, _ := strings.Cut(value, "=")
 		blocked := false
-		for _, runtimeName := range []string{EnvRuntime, EnvRuntimeRoot, EnvRuntimeVersion, EnvEntryPath, EnvDisable, EnvForce} {
+		for _, runtimeName := range []string{EnvRuntime, EnvRuntimeRoot, EnvRuntimeVersion, EnvEntryPath, EnvDisable, EnvForce, EnvBootManaged, envBootAddress, envBootToken} {
 			if strings.EqualFold(name, runtimeName) {
 				blocked = true
 				break

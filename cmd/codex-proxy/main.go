@@ -23,6 +23,9 @@ func main() {
 }
 
 func runMain(args []string) int {
+	if code, handled := helperruntime.HandleProtocolProbe(args, os.Stdout); handled {
+		return code
+	}
 	if exitCode, handled := cli.HandleWindowsAppInstallWorker(args, os.Stdin, os.Stdout, os.Stderr); handled {
 		return exitCode
 	}
@@ -66,7 +69,11 @@ func runMain(args []string) int {
 		}
 		return exitCode
 	}
-	if _, ok := helperruntime.Current(); ok {
+	if err := helperruntime.PrepareBoot(); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "Error: runtime startup: %v\n", err)
+		return 1
+	}
+	if _, ok := helperruntime.Current(); ok && os.Getenv(helperruntime.EnvBootManaged) != "1" {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		err := candidateupdate.ResumePending(ctx, cli.RuntimeVersion())
 		cancel()

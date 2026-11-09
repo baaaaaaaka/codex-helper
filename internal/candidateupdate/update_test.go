@@ -53,6 +53,48 @@ func TestApplyRejectsCandidateHashMismatchBeforeWritingState(t *testing.T) {
 	}
 }
 
+func TestApplyVerificationFailureLeavesEntryAndDefaultUntouched(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("inert POSIX version fixture")
+	}
+	dir := t.TempDir()
+	root := filepath.Join(dir, ".cxp-runtime")
+	entry := filepath.Join(dir, helperruntime.BinaryName(runtime.GOOS))
+	candidate := filepath.Join(dir, "candidate")
+	writeVersionScript(t, entry, "1.0.0")
+	writeVersionScript(t, candidate, "9.9.9")
+	before, err := os.ReadFile(entry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := helperruntime.InstallVersion(root, entry, "v1.0.0", runtime.GOOS, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := helperruntime.Activate(root, "v1.0.0"); err != nil {
+		t.Fatal(err)
+	}
+	hash, err := fileSHA256(candidate)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := candidateExecutablePath
+	candidateExecutablePath = func() (string, error) { return candidate, nil }
+	t.Cleanup(func() { candidateExecutablePath = old })
+	_, err = Apply(context.Background(), Context{Schema: ProtocolVersion, CandidateSHA256: hash, SourceVersion: "v1.0.0", TargetVersion: "v2.0.0", RuntimeRoot: root, EntryPath: entry, RecordPath: filepath.Join(dir, "install.json"), RequestID: "bad-version"}, "v2.0.0")
+	if err == nil {
+		t.Fatal("mismatched immutable runtime accepted")
+	}
+	if got, err := helperruntime.ReadActive(root); err != nil || got != "v1.0.0" {
+		t.Fatalf("%s %v", got, err)
+	}
+	if after, err := os.ReadFile(entry); err != nil || !bytes.Equal(before, after) {
+		t.Fatal("stable entry changed before verification")
+	}
+	if _, err := os.Stat(filepath.Join(root, "pending-update.json")); !os.IsNotExist(err) {
+		t.Fatalf("pending activation after verification error: %v", err)
+	}
+}
+
 func TestApplyVerifiesPublishedRuntimeInsteadOfStableEntry(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX executable fixture")
@@ -124,6 +166,84 @@ func TestApplyVerifiesPublishedRuntimeInsteadOfStableEntry(t *testing.T) {
 	out, err := exec.Command(entry, "--version").CombinedOutput()
 	if err != nil || !strings.Contains(string(out), "0.1.14") || strings.Contains(string(out), "rc.20") {
 		t.Fatalf("preserved stable entry output = %q, %v", out, err)
+	}
+}
+
+func TestSafeBootManualApplyPreservesBootstrapAndUsesSingleRecord(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("inert POSIX version fixture")
+	}
+	dir := t.TempDir()
+	root := filepath.Join(dir, ".cxp-runtime")
+	entry := filepath.Join(dir, helperruntime.BinaryName(runtime.GOOS))
+	candidate := filepath.Join(dir, "candidate")
+	writeVersionScript(t, entry, "1.0.0")
+	writeVersionScript(t, candidate, "2.0.0")
+	if _, err := helperruntime.InstallVersion(root, entry, "v1.0.0", runtime.GOOS, false); err != nil {
+		t.Fatal(err)
+	}
+	boot := helperruntime.BootState{Schema: 1, Generation: 1, Good: "v1.0.0", Candidate: &helperruntime.BootCandidate{Version: "v3.0.0", SHA256: strings.Repeat("0", 64)}}
+	raw, _ := json.Marshal(boot)
+	if err := helperruntime.WriteAtomicState(root, helperruntime.BootFile, raw); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(entry)
+	hash, _ := fileSHA256(candidate)
+	old := candidateExecutablePath
+	candidateExecutablePath = func() (string, error) { return candidate, nil }
+	t.Cleanup(func() { candidateExecutablePath = old })
+	result, err := Apply(context.Background(), Context{Schema: 1, CandidateSHA256: hash, SourceVersion: "v1.0.0", TargetVersion: "v2.0.0", RuntimeRoot: root, EntryPath: entry, RecordPath: filepath.Join(dir, "install.json"), RequestID: "safe-manual"}, "v2.0.0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after, _ := os.ReadFile(entry); !bytes.Equal(before, after) || result.stableEntryRepair != nil {
+		t.Fatal("manual update replaced the protected bootstrap")
+	}
+	got, err := helperruntime.ReadBoot(root)
+	if err != nil || got.Good != "v2.0.0" || got.Previous != "v1.0.0" || got.Candidate != nil || got.Generation != 2 {
+		t.Fatalf("%+v %v", got, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, PendingFileName)); !os.IsNotExist(err) {
+		t.Fatalf("legacy pending marker was written: %v", err)
+	}
+	// Even a malformed pre-existing legacy marker cannot drive safe startup.
+	if err := os.WriteFile(filepath.Join(root, PendingFileName), []byte("{broken"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(helperruntime.EnvRuntime, "1")
+	t.Setenv(helperruntime.EnvRuntimeRoot, root)
+	t.Setenv(helperruntime.EnvRuntimeVersion, "v2.0.0")
+	t.Setenv(helperruntime.EnvEntryPath, entry)
+	if err := ResumePending(context.Background(), "v2.0.0"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSafeBootInvokeRejectsLegacyCandidateBeforeAnyMutation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("inert POSIX protocol fixture")
+	}
+	dir := t.TempDir()
+	root := filepath.Join(dir, ".cxp-runtime")
+	if err := os.Mkdir(root, 0700); err != nil {
+		t.Fatal(err)
+	}
+	raw := []byte(`{"schema":1,"generation":1,"good":"v1.0.0"}`)
+	if err := os.WriteFile(filepath.Join(root, helperruntime.BootFile), raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	candidate := filepath.Join(dir, "legacy-candidate")
+	writeVersionScript(t, candidate, "2.0.0")
+	if _, err := Invoke(context.Background(), candidate, Context{RuntimeRoot: root}, 0); err == nil {
+		t.Fatal("candidate without safe-boot support was invoked")
+	}
+	after, _ := os.ReadFile(filepath.Join(root, helperruntime.BootFile))
+	if !bytes.Equal(raw, after) {
+		t.Fatal("legacy candidate changed startup record")
+	}
+	files, err := os.ReadDir(dir)
+	if err != nil || len(files) != 2 {
+		t.Fatalf("invocation context left behind: %v %v", files, err)
 	}
 }
 

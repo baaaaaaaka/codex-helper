@@ -80,6 +80,8 @@ type Options struct {
 	RefreshInterval time.Duration
 	PersistAAA      func(bool) error
 	DefaultCwd      string
+	// OnReady runs once after drawing the first frame, before handling input.
+	OnReady func() error
 }
 
 type uiEvent struct {
@@ -416,6 +418,7 @@ func SelectSession(ctx context.Context, opts Options) (*Selection, error) {
 		postUIEventWithRetry(ctx, done, screen, &uiEvent{when: time.Now(), kind: "quit"})
 	}()
 
+	ready := false
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -423,6 +426,14 @@ func SelectSession(ctx context.Context, opts Options) (*Selection, error) {
 		state.applyWorkerResults()
 		if err := draw(screen, state, opts, previewCh); err != nil {
 			return nil, err
+		}
+		if !ready {
+			ready = true
+			if opts.OnReady != nil {
+				if err := opts.OnReady(); err != nil {
+					return nil, err
+				}
+			}
 		}
 		ev := screen.PollEvent()
 

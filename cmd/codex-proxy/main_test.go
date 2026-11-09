@@ -8,7 +8,24 @@ import (
 	"testing"
 
 	"github.com/baaaaaaaka/codex-helper/internal/candidateupdate"
+	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 )
+
+func TestRunMainHandlesBootProtocolBeforeRuntimeDispatch(t *testing.T) {
+	previousPreflight, previousLaunch, previousExecute := runLegacyUpdaterVersionPreflight, launchHelperRuntime, executeCLI
+	t.Cleanup(func() {
+		runLegacyUpdaterVersionPreflight, launchHelperRuntime, executeCLI = previousPreflight, previousLaunch, previousExecute
+	})
+	runLegacyUpdaterVersionPreflight = func() error { t.Fatal("protocol probe invoked legacy repair"); return nil }
+	launchHelperRuntime = func(string, []string) (int, bool, error) {
+		t.Fatal("protocol probe dispatched an installed runtime")
+		return 0, false, nil
+	}
+	executeCLI = func() int { t.Fatal("protocol probe initialized the CLI"); return 0 }
+	if code := runMain([]string{"cxp", helperruntime.ProtocolProbeFlag}); code != 0 {
+		t.Fatal(code)
+	}
+}
 
 func TestRunMainHandlesCandidateUpdateBeforeRuntimeDispatch(t *testing.T) {
 	previousPreflight := runLegacyUpdaterVersionPreflight

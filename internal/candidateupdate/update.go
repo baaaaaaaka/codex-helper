@@ -97,6 +97,13 @@ func Invoke(ctx context.Context, candidate string, request Context, timeout time
 	if candidate == "" || candidate == "." {
 		return Result{}, fmt.Errorf("candidate path is empty")
 	}
+	if _, err := helperruntime.ReadBoot(request.RuntimeRoot); err == nil {
+		if err := helperruntime.ProbeProtocol(ctx, candidate); err != nil {
+			return Result{}, err
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return Result{}, err
+	}
 	request.Schema = ProtocolVersion
 	request.CandidatePath = candidate
 	if strings.TrimSpace(request.CandidateSHA256) == "" {
@@ -191,6 +198,15 @@ func Apply(ctx context.Context, request Context, buildVersion string) (Result, e
 	}
 	var result Result
 	err = helperruntime.WithRootLock(ctx, request.RuntimeRoot, func() error {
+		// Validate the final immutable path before changing any launcher or
+		// default. A failed update must not leave the next start pointing at it.
+		installed, err := helperruntime.InstallVersion(request.RuntimeRoot, executable, request.TargetVersion, runtime.GOOS, false)
+		if err != nil {
+			return err
+		}
+		if err := verifyImmutableRuntime(ctx, installed, request.TargetVersion); err != nil {
+			return err
+		}
 		var reconcileErr error
 		result, reconcileErr = reconcileLocked(request, executable, false)
 		return reconcileErr
@@ -203,10 +219,6 @@ func Apply(ctx context.Context, request Context, buildVersion string) (Result, e
 	// older stable launcher or a user-preserved shim that is intentionally not
 	// rewritten during this transition. The parent independently verifies the
 	// active pointer, expected runtime path, and regular-file state.
-	targetVersion, _ := helperruntime.NormalizeVersion(request.TargetVersion)
-	if err := verifyImmutableRuntime(ctx, result.RuntimePath, targetVersion); err != nil {
-		return Result{}, err
-	}
 	if err := scheduleDeferredStableEntryRepair(result); err != nil {
 		return Result{}, err
 	}
@@ -219,6 +231,13 @@ func ResumePending(ctx context.Context, currentVersion string) error {
 	current, ok := helperruntime.Current()
 	if !ok {
 		return nil
+	}
+	// boot.json is the sole authority once safe boot is enabled. A legacy
+	// pending marker must never re-activate a rejected automatic candidate.
+	if _, err := helperruntime.ReadBoot(current.Root); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
 	}
 	pendingPath := filepath.Join(current.Root, PendingFileName)
 	pending, err := readPending(pendingPath)
@@ -301,6 +320,11 @@ func ResumePending(ctx context.Context, currentVersion string) error {
 }
 
 func reconcileLocked(request Context, source string, resuming bool) (Result, error) {
+	_, bootErr := helperruntime.ReadBoot(request.RuntimeRoot)
+	bootManaged := bootErr == nil
+	if bootErr != nil && !errors.Is(bootErr, os.ErrNotExist) {
+		return Result{}, bootErr
+	}
 	targetVersion, _ := helperruntime.NormalizeVersion(request.TargetVersion)
 	targetPath := helperruntime.VersionPath(request.RuntimeRoot, targetVersion, runtime.GOOS)
 	if targetPath == "" {
@@ -357,7 +381,11 @@ func reconcileLocked(request Context, source string, resuming bool) (Result, err
 	if entryStatErr != nil && !errors.Is(entryStatErr, os.ErrNotExist) {
 		return Result{}, fmt.Errorf("inspect stable cxp entry: %w", entryStatErr)
 	}
-	if err := helperruntime.EnsureStableEntry(installed, request.EntryPath, runtime.GOOS); err != nil {
+	if bootManaged {
+		if !entryWasPresent {
+			return Result{}, fmt.Errorf("safe boot entry is missing; restore it with the installer")
+		}
+	} else if err := helperruntime.EnsureStableEntry(installed, request.EntryPath, runtime.GOOS); err != nil {
 		return Result{}, fmt.Errorf("ensure stable cxp entry: %w", err)
 	}
 	// A first install with no prior active runtime may be upgrading an
@@ -374,7 +402,7 @@ func reconcileLocked(request Context, source string, resuming bool) (Result, err
 	// post-parent/managed repair path; only non-resuming updates may refresh it
 	// synchronously here.
 	deferWindowsResumeEntryRepair := runtime.GOOS == "windows" && resuming && previous == targetVersion
-	if previous != "" && entryWasPresent && !deferWindowsResumeEntryRepair && (strings.TrimSpace(request.SourceVersion) != "" || !resuming) {
+	if !bootManaged && previous != "" && entryWasPresent && !deferWindowsResumeEntryRepair && (strings.TrimSpace(request.SourceVersion) != "" || !resuming) {
 		previousRuntime := helperruntime.VersionPath(request.RuntimeRoot, entryRuntimeVersion, runtime.GOOS)
 		entryAlreadyContainsCandidate := false
 		if target, targetErr := stableEntryTargetPath(request.EntryPath, request.RuntimeRoot); targetErr != nil {
@@ -408,12 +436,12 @@ func reconcileLocked(request Context, source string, resuming bool) (Result, err
 	// Publish recovery intent only after the immutable target and stable entry
 	// are usable. A previous runtime can then safely finish the transition if
 	// this candidate exits before switching active.
-	if !resuming {
+	if !bootManaged && !resuming {
 		if err := writePending(filepath.Join(request.RuntimeRoot, PendingFileName), pending); err != nil {
 			return Result{}, err
 		}
 	}
-	if previous != "" && previous != targetVersion {
+	if !bootManaged && previous != "" && previous != targetVersion {
 		if err := helperruntime.SetPrevious(request.RuntimeRoot, previous); err != nil {
 			return Result{}, fmt.Errorf("record previous runtime: %w", err)
 		}
@@ -555,15 +583,11 @@ func updateInstallRecord(request Context, targetVersion string) error {
 }
 
 func verifyImmutableRuntime(ctx context.Context, runtimePath string, targetVersion string) error {
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
 	runtimePath = filepath.Clean(strings.TrimSpace(runtimePath))
 	if runtimePath == "" || runtimePath == "." {
 		return fmt.Errorf("verify immutable runtime: runtime path is empty")
 	}
-	cmd := exec.CommandContext(ctx, runtimePath, "--version")
-	cmd.Env = append(helperruntime.LauncherEnvironment(os.Environ()), helperruntime.EnvDisable+"=1")
-	out, err := cmd.CombinedOutput()
+	out, err := helperruntime.ProbeExecutable(ctx, runtimePath, []string{"--version"}, 15*time.Second)
 	if err != nil {
 		return fmt.Errorf("verify immutable runtime %s: %w: %s", runtimePath, err, strings.TrimSpace(string(out)))
 	}

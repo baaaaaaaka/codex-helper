@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -313,6 +312,15 @@ func PerformUpdate(ctx context.Context, opts UpdateOptions) (ApplyResult, error)
 		}
 	}
 	if runtimeRoot != "" && runtimeRoot != "." {
+		if _, err := helperruntime.ReadBoot(runtimeRoot); err == nil {
+			if err := helperruntime.ProbeProtocol(ctx, tmpPath); err != nil {
+				_ = os.Remove(tmpPath)
+				return ApplyResult{}, err
+			}
+		} else if !os.IsNotExist(err) {
+			_ = os.Remove(tmpPath)
+			return ApplyResult{}, err
+		}
 		entryPath := strings.TrimSpace(opts.RuntimeEntryPath)
 		if entryPath == "" {
 			entryPath = filepath.Join(filepath.Dir(runtimeRoot), helperruntime.BinaryName(runtime.GOOS))
@@ -708,15 +716,7 @@ func validateDownloadedBinary(ctx context.Context, path string, version string, 
 	if runtime.GOOS != "windows" && info.Mode()&0o111 == 0 {
 		return fmt.Errorf("validate downloaded binary: file is not executable %s", path)
 	}
-	cmdCtx := ctx
-	cancel := func() {}
-	if timeout > 0 {
-		cmdCtx, cancel = context.WithTimeout(ctx, timeout)
-	}
-	defer cancel()
-	cmd := exec.CommandContext(cmdCtx, path, "--version")
-	cmd.Env = append(helperruntime.LauncherEnvironment(os.Environ()), helperruntime.EnvDisable+"=1")
-	out, err := cmd.CombinedOutput()
+	out, err := helperruntime.ProbeExecutable(ctx, path, []string{"--version"}, timeout)
 	output := trimValidationOutput(string(out))
 	if err != nil {
 		return fmt.Errorf("validate downloaded binary: %w: %s", err, output)

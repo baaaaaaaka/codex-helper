@@ -6,6 +6,7 @@ import (
 	"io"
 
 	"github.com/baaaaaaaka/codex-helper/internal/config"
+	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 )
 
 func ensureProfile(
@@ -22,6 +23,9 @@ func ensureProfile(
 
 	var created *config.Profile
 	if len(cfg.Profiles) == 0 && autoInit {
+		if err := helperruntime.BeforeInteractiveSetup(); err != nil {
+			return config.Profile{}, cfg, err
+		}
 		p, err := initProfileInteractiveFunc(ctx, store)
 		if err != nil {
 			return config.Profile{}, cfg, err

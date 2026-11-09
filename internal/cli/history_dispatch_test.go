@@ -161,7 +161,10 @@ func TestRunHistoryTuiStartsDailyAutoSyncWithoutBlockingSelection(t *testing.T) 
 	ensureProxyPreferenceFunc = func(context.Context, *config.Store, string, io.Writer) (bool, config.Config, error) {
 		return false, config.Config{Version: config.CurrentVersion}, nil
 	}
-	selectSession = func(_ context.Context, _ tui.Options) (*tui.Selection, error) {
+	selectSession = func(_ context.Context, opts tui.Options) (*tui.Selection, error) {
+		if err := opts.OnReady(); err != nil {
+			return nil, err
+		}
 		deadline := time.Now().Add(historyDispatchTestTimeout(3 * time.Second))
 		for {
 			data, _ := os.ReadFile(filepath.Join(targetSkill, "SKILL.md"))

@@ -28,6 +28,8 @@ common commands, standard approvals, Teams basics, and upgrade basics.
   security boundaries and risks.
 - [Codex compatibility](codex_compatibility.md): generated compatibility data
   from release monitoring.
+- [TUI update safety](tui_auto_update.md): automatic update protocol, recovery,
+  bounded storage, publisher trust, and native test gates.
 
 ## Design and implementation trackers
 

@@ -742,6 +742,20 @@ codex-proxy skills migrate --dry-run
 
 ## Upgrade
 
+Installed local TUIs prepare eligible CXP updates quietly after the first
+frame, and keep checking while a Codex session is open. A new window can try
+the prepared version; existing windows keep running. Network or download
+failures do not delay startup. A failed trial falls back to the previous good
+version and is not automatically retried. The stable launcher stays intact.
+
+Set `CXP_AUTO_UPDATE=0` to disable TUI checks and pending automatic trials.
+Setting `CODEX_PROXY_VERSION` to a specific version also disables this path.
+Automatic TUI updates use only stable `p0`/`p1` releases whose native package
+tests passed. They do not update Codex itself or restart the Teams service.
+Older physical launchers need one explicit install/upgrade before this feature
+can be enabled. See [TUI update safety](docs/tui_auto_update.md) for recovery,
+storage limits, the trust boundary, and test commands.
+
 Upgrade from GitHub Releases:
 
 ```bash

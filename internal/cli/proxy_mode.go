@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/baaaaaaaka/codex-helper/internal/config"
+	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 )
 
 var proxyPreferencePromptAllowed = func() bool {
@@ -86,6 +87,9 @@ func ensureProxyPreferenceWithReaderMode(
 		return enabled, cfg, nil
 	}
 
+	if err := helperruntime.BeforeInteractiveSetup(); err != nil {
+		return false, cfg, err
+	}
 	if out != nil {
 		_, _ = fmt.Fprintln(out, "codex-proxy can route Codex traffic through an SSH tunnel when your network requires it.")
 		_, _ = fmt.Fprintln(out, "If you don't need a proxy, choose \"no\" to connect directly.")

@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "repo": "owner/name",
+  "version": "v2.0.0",
+  "protocol": 1,
+  "priority": "p0",
+  "published_at": "2026-11-09T00:00:00Z",
+  "assets": {
+    "linux/amd64": {"name":"codex-proxy_2.0.0_linux_amd64","sha256":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824","size":5},
+    "darwin/amd64": {"name":"codex-proxy_2.0.0_darwin_amd64","sha256":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824","size":5},
+    "darwin/arm64": {"name":"codex-proxy_2.0.0_darwin_arm64","sha256":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824","size":5},
+    "windows/amd64": {"name":"codex-proxy_2.0.0_windows_amd64.exe","sha256":"2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824","size":5}
+  }
+}

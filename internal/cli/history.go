@@ -15,6 +15,7 @@ import (
 
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
+	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 	"github.com/baaaaaaaka/codex-helper/internal/tui"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
 )
@@ -29,6 +30,7 @@ var (
 	ensureProfileFunc          = ensureProfile
 	persistProxyPreferenceFunc = persistProxyPreference
 	initProfileInteractiveFunc = initProfileInteractive
+	startTUIAutoUpdateFn       = startTUIAutoUpdate
 )
 
 const defaultRefreshInterval = 5 * time.Second
@@ -263,14 +265,19 @@ func newHistoryOpenCmd(root *rootOptions, codexDir *string, codexPath *string, p
 
 func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, codexDir string, codexPath string, refreshInterval time.Duration) error {
 	ctx, stop := withSignalContext(cmd.Context())
-	defer stop()
 	defer func() { _ = codexhistory.CloseCaches() }()
+	defer func() {
+		if ctx.Err() != nil {
+			helperruntime.CancelStartup()
+		}
+		stop()
+	}()
 
 	store, paths, err := newRootStore(root, codexDir)
 	if err != nil {
 		return err
 	}
-	startSkillsDailyAutoSync(ctx, paths)
+	backgroundStarted := false
 
 	for {
 		useProxy, cfg, err := historyProxyPreference(ctx, store, profileRef, cmd.ErrOrStderr())
@@ -296,6 +303,12 @@ func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, cod
 		agentAutoApprove := resolveAAAEnabled(cfg)
 
 		defaultCwd, _ := os.Getwd()
+		var checkUpdate func(context.Context) update.Status
+		if _, managed := helperruntime.Current(); !managed && helperruntime.AutoUpdateAllowed() {
+			checkUpdate = func(ctx context.Context) update.Status {
+				return update.CheckForUpdate(ctx, update.CheckOptions{InstalledVersion: version, Timeout: 8 * time.Second})
+			}
+		}
 		selection, err := selectSession(ctx, tui.Options{
 			LoadProjects: func(ctx context.Context) ([]codexhistory.Project, error) {
 				return loadHistoryTuiProjects(ctx, paths.CodexDir)
@@ -306,15 +319,21 @@ func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, cod
 			AAAEnabled:      agentAutoApprove,
 			RefreshInterval: refreshInterval,
 			DefaultCwd:      defaultCwd,
+			OnReady: func() error {
+				if err := helperruntime.Ready(); err != nil {
+					return err
+				}
+				if !backgroundStarted {
+					backgroundStarted = true
+					startSkillsDailyAutoSync(ctx, paths)
+					startTUIAutoUpdateFn(ctx)
+				}
+				return nil
+			},
 			PersistAAA: func(enabled bool) error {
 				return persistAAAEnabled(store, enabled)
 			},
-			CheckUpdate: func(ctx context.Context) update.Status {
-				return update.CheckForUpdate(ctx, update.CheckOptions{
-					InstalledVersion: version,
-					Timeout:          8 * time.Second,
-				})
-			},
+			CheckUpdate: checkUpdate,
 		})
 		if err != nil {
 			var upd tui.UpdateRequested

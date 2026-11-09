@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 from datetime import datetime, timezone
@@ -12,6 +13,8 @@ from typing import Any
 PRIORITY_BODY_RE = re.compile(r"<!--\s*codex-helper-release:\s*(\{.*?\})\s*-->", re.DOTALL)
 PRIORITY_ASSET_RE = re.compile(r"^codex-helper-auto-update-(p[012])(?:\.(?:txt|json))?$")
 VALID_PRIORITIES = {"p0", "p1", "p2"}
+TUI_BOOT_PROTOCOL = 1
+TUI_PLATFORMS = ("linux/amd64", "darwin/amd64", "darwin/arm64", "windows/amd64")
 
 
 def normalize_priority(value: Any) -> str | None:
@@ -186,6 +189,45 @@ def update_index(repo: str, release: dict[str, Any], existing: dict[str, Any], g
     }
 
 
+def tui_manifest(repo: str, release: dict[str, Any], asset_dir: Path,
+                 generated_at: str) -> dict[str, Any] | None:
+    """Called only after source, native boot and packaged-binary release gates."""
+    tag = release_tag(release)
+    if (release_draft(release) or release_prerelease(release)
+            or not re.fullmatch(r"v(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)", tag)):
+        return None
+    names = {asset["name"] for asset in release_assets(release)}
+    priority = release_priority(release, release_assets(release))
+    if priority == "p2":
+        return None
+    issued = datetime.fromisoformat(generated_at.replace("Z", "+00:00"))
+    published_raw = str(release.get("publishedAt") or release.get("published_at") or "")
+    published = datetime.fromisoformat(published_raw.replace("Z", "+00:00"))
+    if issued.tzinfo is None or published.tzinfo is None or published > issued:
+        raise ValueError("invalid TUI manifest publication time")
+    assets = {}
+    for platform in TUI_PLATFORMS:
+        os_name, arch = platform.split("/")
+        name = f"codex-proxy_{tag[1:]}_{os_name}_{arch}"
+        if os_name == "windows":
+            name += ".exe"
+        if name not in names:
+            raise ValueError(f"TUI release asset missing: {name}")
+        path = asset_dir / name
+        size = path.stat().st_size
+        if not path.is_file() or not 0 < size <= 256 << 20:
+            raise ValueError(f"invalid TUI release asset: {name}")
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        assets[platform] = {"name": name, "sha256": digest.hexdigest(), "size": size}
+    stamp = lambda value: value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+    return {"schema": 1, "repo": repo, "version": tag,
+            "protocol": TUI_BOOT_PROTOCOL, "priority": priority,
+            "published_at": stamp(published), "assets": assets}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Update the static codex-helper release index.")
     parser.add_argument("--repo", required=True)
@@ -194,6 +236,9 @@ def main() -> int:
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--generated-at", default="")
     parser.add_argument("--max-releases", type=int, default=100)
+    parser.add_argument("--tui-output", type=Path)
+    parser.add_argument("--tui-existing", type=Path)
+    parser.add_argument("--asset-dir", type=Path)
     args = parser.parse_args()
 
     generated_at = args.generated_at.strip() or datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -205,6 +250,21 @@ def main() -> int:
     with args.output.open("w", encoding="utf-8") as fh:
         json.dump(out, fh, indent=2, sort_keys=True)
         fh.write("\n")
+    if args.tui_output is not None:
+        if args.asset_dir is None:
+            parser.error("--tui-output requires --asset-dir")
+        manifest = tui_manifest(args.repo, release, args.asset_dir, generated_at)
+        previous = None
+        if args.tui_existing and args.tui_existing.exists():
+            previous = json.loads(args.tui_existing.read_text(encoding="utf-8"))
+            if (previous.get("schema") != 1
+                    or str(previous.get("repo", "")).lower() != args.repo.lower()):
+                raise ValueError("invalid previous TUI manifest")
+        if previous and (manifest is None or comparable_version(previous["version"]) > comparable_version(manifest["version"])):
+            manifest = previous
+        if manifest:
+            args.tui_output.parent.mkdir(parents=True, exist_ok=True)
+            args.tui_output.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return 0
 
 
