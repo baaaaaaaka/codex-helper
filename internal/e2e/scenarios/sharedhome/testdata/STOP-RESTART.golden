@@ -144,4 +144,4 @@ $ cxp teams stop
 $ cxp teams start
    exit 0
    stdout| Started the Teams helper again on all machines (it was: Stopped on all machines by `cxp teams stop` (host-a, <time:1>); removed <root>/home/.local/state/codex-helper/teams/DISABLED).
-   stdout| No Teams service is installed on this machine. A helper standing by on any machine (the last one ran on host-a) resumes within a minute; if none is, run `cxp teams run`, or install the service with `cxp teams service install`.
+   stdout| <helper pickup advice>
