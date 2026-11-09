@@ -15,6 +15,7 @@
 -- <msg:3> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-ENTRYMIGRATEMISSINGDB-before-loss-1</p>
+   | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5, effort - high, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 

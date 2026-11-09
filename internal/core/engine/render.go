@@ -143,14 +143,21 @@ const (
 func infoNotes(info TurnInfo, answer bool) []channel.Note {
 	var out []channel.Note
 	if g := strings.TrimSpace(info.Goal); g != "" {
-		out = append(out, channel.Note{Label: labelGoal, Text: shortLine(strings.Join(strings.Fields(g), " "), goalNoteMax), SeparatorBefore: true})
+		out = append(out, channel.Note{
+			Label: labelGoal, Text: shortLine(strings.Join(strings.Fields(g), " "), goalNoteMax),
+		})
 	}
 	if answer && strings.TrimSpace(info.Model) != "" {
 		effort := strings.TrimSpace(info.Effort)
 		if effort == "" {
 			effort = "default"
 		}
-		out = append(out, channel.Note{Label: labelHelper, Text: fmt.Sprintf(textModelFmt, strings.TrimSpace(info.Model), effort, tierName(info.Tier))})
+		out = append(out, channel.Note{
+			Label: labelHelper, Text: fmt.Sprintf(textModelFmt, strings.TrimSpace(info.Model), effort, tierName(info.Tier)),
+		})
+	}
+	if len(out) > 0 {
+		out[0].SeparatorBefore = true
 	}
 	return out
 }

@@ -75,6 +75,7 @@
    | <p>Result for E2E-FORMULA-during-1:</p>
    | <pre><code>\frac{a}{b}</code></pre>
    | <p>Done.</p>
+   | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:6> owner (html)
@@ -92,6 +93,7 @@
    | <pre><code>\frac{a}{b}</code></pre>
    | <p><img src="../hostedContents/1/$value" alt="Rendered TeX formula"></p>
    | <p>Done.</p>
+   | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
    hosted: sha256:eab0f2ecea867f9a52ab78f345253a66d443e360cda914db0e6de845dc5d59f5
@@ -109,6 +111,7 @@
    | <p>Result for E2E-FORMULA-refused-3:</p>
    | <pre><code>\frac{a}{b}</code></pre>
    | <p>Done.</p>
+   | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 

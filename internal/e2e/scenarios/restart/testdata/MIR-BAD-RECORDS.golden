@@ -60,6 +60,7 @@
 -- <msg:3> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>Earlier answer E2E-MIRBADRECORDS-firstanswer-3</p>
+   | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:4> helper (html)
@@ -71,6 +72,7 @@
 -- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>The screenshot shows a crash E2E-MIRBADRECORDS-shotanswer-6</p>
+   | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:7> helper (html)
@@ -79,6 +81,7 @@
 -- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>First half of the answer, then more text, then more text, then more text, then more text, then more text, then more text, then more text, then more text, then more text, then more text, then more text, then more text, then more text, then more text, then more text, then more text, then more text, then more text, then more text, then more text, then more text, then more text, then more text, then more text, then more text, then more text, then more text, then more text, then more text, then more text, then more text, then more text, then more text, then more text, then more text, then more text, then more text, then more text, then more text, then more text, and the end E2E-MIRBADRECORDS-splitanswer-8</p>
+   | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 
@@ -93,5 +96,6 @@
 -- <msg:3> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>Probe answer E2E-MIRBADRECORDS-probe-1</p>
+   | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>

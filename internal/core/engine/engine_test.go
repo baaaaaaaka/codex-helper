@@ -2426,3 +2426,31 @@ func TestCapacityRetrySendsContinueOnceCodexRecordedThePrompt(t *testing.T) {
 		t.Fatalf("%d answers, want 1", len(got))
 	}
 }
+
+func TestReconnectFailureRetriesWithContinue(t *testing.T) {
+	r := newRig(t, func(c *Config) {
+		c.Timing.CapacityRetry = 5 * time.Second
+		c.Timing.CapacityBackoff = 10 * time.Millisecond
+	})
+	var mu sync.Mutex
+	attempts := 0
+	r.ag.outcome = func(req TurnRequest) (TurnOutcome, error) {
+		mu.Lock()
+		attempts++
+		attempt := attempts
+		mu.Unlock()
+		if attempt == 1 {
+			return TurnOutcome{Status: StatusFailed, ReconnectExhausted: true, Error: "responseStreamDisconnected"}, nil
+		}
+		return TurnOutcome{Status: StatusCompleted, Final: "DONE after reconnect"}, nil
+	}
+	work := r.newWork(t.TempDir())
+	r.ch.PostUser(work, "recover after a dropped connection")
+	r.wait("connection retry notice", func() bool {
+		return len(r.own(work, "could not reconnect after its automatic retries")) == 1
+	})
+	r.wait("answer", func() bool { return len(r.own(work, "DONE after reconnect")) == 1 })
+	if got, all := r.ag.calls("recover after a dropped connection"), r.ag.texts(); got != 1 || len(all) != 2 || all[1] != "continue" {
+		t.Fatalf("attempts %q, want the prompt once then `continue`", all)
+	}
+}
