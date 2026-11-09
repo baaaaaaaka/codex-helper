@@ -20,6 +20,7 @@
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong> <at id="0">E2E Owner</at></p>
    | <p>E2EANSWER-<n> answer for E2E-CTLQA-ask-2</p>
+   | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - low, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
    mention 0: owner "E2E Owner"
@@ -37,6 +38,7 @@
 -- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong> <at id="0">E2E Owner</at></p>
    | <p>E2EANSWER-<n> answer for E2E-CTLQA-plain-3</p>
+   | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - low, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
    mention 0: owner "E2E Owner"
@@ -321,6 +323,7 @@
    prompt|   - <time> helper/final:
    prompt|   🤖 ✅ Codex answer: E2E Owner
    prompt|   E2EANSWER-<n> answer for E2E-CTLQA-ask-2
+   prompt|   ———
    prompt|   🔧 Helper: model - gpt-5-codex, effort - low, tier - standard
    prompt|   🔧 Helper: ✅ Codex finished responding.
    prompt|
@@ -486,6 +489,7 @@
    prompt|   - <time> helper/final:
    prompt|   🤖 ✅ Codex answer: E2E Owner
    prompt|   E2EANSWER-<n> answer for E2E-CTLQA-ask-2
+   prompt|   ———
    prompt|   🔧 Helper: model - gpt-5-codex, effort - low, tier - standard
    prompt|   🔧 Helper: ✅ Codex finished responding.
    prompt|   - <time> user/control_inbound:
@@ -498,6 +502,7 @@
    prompt|   - <time> helper/final:
    prompt|   🤖 ✅ Codex answer: E2E Owner
    prompt|   E2EANSWER-<n> answer for E2E-CTLQA-plain-3
+   prompt|   ———
    prompt|   🔧 Helper: model - gpt-5-codex, effort - low, tier - standard
    prompt|   🔧 Helper: ✅ Codex finished responding.
    prompt|   - <time> user/control_inbound:

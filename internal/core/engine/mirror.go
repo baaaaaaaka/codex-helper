@@ -1277,7 +1277,7 @@ func (e *Engine) renderMirror(ctx context.Context, thread string, o transcript.O
 		return nil, err
 	}
 	group := ""
-	if (o.Kind == transcript.OutputStatus || o.Kind == transcript.OutputCompact) && o.TurnID != "" {
+	if o.Kind == transcript.OutputStatus && o.TurnID != "" {
 		group = "mirror:" + thread + ":" + o.TurnID
 	}
 	out := make([]store.OutMsg, 0, len(parts))

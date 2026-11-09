@@ -76,6 +76,22 @@ func (e *TurnError) Capacity() bool {
 	return strings.Contains(msg, "at capacity") || strings.Contains(msg, "429 too many requests")
 }
 
+// ReconnectExhausted reports a terminal network connection failure after
+// Codex's own retries. Codex emits responseStreamDisconnected for retry
+// notifications while reconnecting; the final turn can report that code,
+// responseStreamConnectionFailed, or httpConnectionFailed.
+func (e *TurnError) ReconnectExhausted() bool {
+	if e == nil {
+		return false
+	}
+	switch errorInfoCode(e.CodexErrorInfo) {
+	case "responseStreamDisconnected", "responseStreamConnectionFailed", "httpConnectionFailed":
+		return true
+	default:
+		return false
+	}
+}
+
 // ClientID returns the clientId of the turn's user message.
 func (t Turn) ClientID() string {
 	for _, it := range t.Items {

@@ -51,8 +51,8 @@ type Timing struct {
 	ResolveDelay    time.Duration // wait before reading back an unknown send
 	ResolveTries    int
 	ResolveAbsent   time.Duration // read-backs span this long after an ambiguous send before "absent" is authoritative (Graph listing lag)
-	CapacityRetry   time.Duration // window from the first capacity error
-	CapacityBackoff time.Duration // first capacity retry delay (doubles)
+	CapacityRetry   time.Duration // retry window for capacity and exhausted-connection failures
+	CapacityBackoff time.Duration // first retry delay (doubles)
 	Heartbeat       time.Duration
 	Maintenance     time.Duration // agent reap / vacuum cadence
 	ChatRate        time.Duration // min gap between two sends to one chat

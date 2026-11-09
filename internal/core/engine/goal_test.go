@@ -120,7 +120,7 @@ func TestGoalAndModelLinesAndGoalCommand(t *testing.T) {
 	r.ch.PostUser(work, "first question")
 	r.wait("first answer", func() bool { return len(r.own(work, "ANSWER to first question")) == 1 })
 	ans := lastOwn(r, work, "ANSWER to first question")
-	if !strings.Contains(ans, "\n🔧 Helper: model - gpt-test, effort - high, tier - fast\n🔧 Helper: ✅ Codex finished responding.") || strings.Contains(ans, "Active goal") || strings.Contains(ans, "\n---\n") {
+	if !strings.Contains(ans, "\n---\n🔧 Helper: model - gpt-test, effort - high, tier - fast\n🔧 Helper: ✅ Codex finished responding.") || strings.Contains(ans, "Active goal") || strings.Count(ans, "\n---\n") != 1 {
 		t.Fatalf("answer without a goal: %q", ans)
 	}
 
@@ -153,7 +153,7 @@ func TestGoalAndModelLinesAndGoalCommand(t *testing.T) {
 	if len([]rune(gl)) > len([]rune("🎯 Active goal: "))+goalNoteMax+1 || !strings.HasSuffix(gl, "…") {
 		t.Fatalf("goal line not clipped: %q", gl)
 	}
-	if d, i, j, k := strings.Index(ans, "\n---\n"), strings.Index(ans, "🎯 Active goal"), strings.Index(ans, "model - gpt-test"), strings.Index(ans, "Codex finished responding"); !(d > 0 && d < i && i < j && j < k) {
+	if divider, goal, model, finished := strings.Index(ans, "\n---\n"), strings.Index(ans, "🎯 Active goal"), strings.Index(ans, "model - gpt-test"), strings.Index(ans, "Codex finished responding"); !(divider > 0 && divider < goal && goal < model && model < finished) {
 		t.Fatalf("order of the closing lines: %q", ans)
 	}
 
