@@ -39,13 +39,11 @@ primary URL and precede the built-in model fallback. Pins never change when
 adding a mirror. HTTP, credentials and query strings in a base are rejected.
 The service installer preserves this setting like the other ASR settings.
 
-No extra hosting repository is created automatically. The asset workflow's
-optional `mirror_repository` input and `ASR_MIRROR_TOKEN` secret publish the
-same local release files to an existing GitHub repository and download them
-again to verify every checksum before publishing the primary release. An
-existing mirror release is only accepted if its checksums match; it is never
-overwritten. Use the printed, verified base URL for the client setting.
-Without that input/setting the default sources remain unchanged: runtime and
+Mirror hosting is provisioned separately. Copy the exact published files
+without rebuilding them; the client verifies every completed download against
+the existing pinned checksum. No hosting repository, extra credential or
+cross-repository publishing workflow is added by this change.
+Without the mirror setting the default sources remain unchanged: runtime and
 FFmpeg on GitHub, and models on GitHub with Hugging Face as fallback.
 A second GitHub repository provides another copy, not an independent CDN.
 The directory setting also supports mirrors hosted outside GitHub.
