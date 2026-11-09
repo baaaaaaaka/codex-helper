@@ -817,7 +817,7 @@ func (e *Engine) notified(list []pendingNotify) []pendingNotify {
 
 func (e *Engine) afterAnswers(list []pendingNotify) {
 	for _, n := range list {
-		if n.Kind != "" {
+		if n.Kind != "" && n.Kind != notifyQuestion {
 			continue // a discovered session's notice, not an answer
 		}
 		id := n.id()
@@ -840,12 +840,16 @@ func (e *Engine) afterAnswers(list []pendingNotify) {
 		e.mu.Unlock()
 		if e.ch.Caps().MarkUnread {
 			readAt := time.Time{}
-			if !at.IsZero() {
+			if n.Kind != notifyQuestion && !at.IsZero() {
 				readAt = at.Add(-time.Millisecond)
 			}
 			e.queueEdit(n.Conv, chatEdit{key: "unread:" + id, what: "unread mark", run: func(ctx context.Context, chat string) error {
 				return e.ch.MarkUnread(ctx, chat, readAt)
 			}})
+		}
+		if n.Kind == notifyQuestion {
+			e.wakeSender()
+			continue
 		}
 		e.queueAutoTitle(n.Conv)
 		e.wakeSender()

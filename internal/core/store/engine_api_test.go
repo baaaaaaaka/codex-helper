@@ -88,6 +88,70 @@ func TestEngineAdditions(t *testing.T) {
 	}
 }
 
+func TestLatestQuestionMarkerSkipsUserMirrorsAndHelperNotices(t *testing.T) {
+	s, _ := openTest(t)
+	var conv int64
+	mustT(t, s.Update(func(tx *Tx) error {
+		var err error
+		conv, err = tx.CreateConversation(NewConversation{Label: "s001", Kind: KindWork, Channel: "teams", ExtChatID: "chat"})
+		if err != nil {
+			return err
+		}
+		_, err = tx.Enqueue(conv, []OutMsg{
+			{DeliveryKey: "final:1", Kind: OutFinal, Body: "agent answer"},
+			{DeliveryKey: "mirror:user", Kind: OutMirror, Body: `<strong>🧑‍💻 User:</strong> user prompt`},
+			{DeliveryKey: "question:1:body:1", Kind: OutNotice, Body: "agent question"},
+			{DeliveryKey: "mirror:agent", Kind: OutMirror, Body: `<strong>🤖 ✅ Codex answer:</strong> local answer`},
+			{DeliveryKey: "helper:notice", Kind: OutNotice, Body: "helper notice"},
+		})
+		if err != nil {
+			return err
+		}
+		rows, err := tx.PendingOutbox(conv)
+		if err != nil {
+			return err
+		}
+		for _, row := range rows {
+			token, err := tx.BeginSend(row.ID)
+			if err != nil {
+				return err
+			}
+			_ = token
+			if err := tx.MarkSent(row.ID, row.DeliveryKey); err != nil {
+				return err
+			}
+		}
+		latest, ok, err := tx.LatestQuestionMarkerMessage(conv)
+		if err != nil || !ok || latest.DeliveryKey != "mirror:agent" {
+			t.Fatalf("latest question message %+v, %v, %v", latest, ok, err)
+		}
+		_, err = tx.Enqueue(conv, []OutMsg{
+			{DeliveryKey: "mirror:user-later", Kind: OutMirror, Body: `<strong>🧑‍💻 User:</strong> later user prompt`},
+			{DeliveryKey: "notice:ordinary", Kind: OutNotice, Body: "not an agent message"},
+		})
+		if err != nil {
+			return err
+		}
+		rows, err = tx.PendingOutbox(conv)
+		if err != nil {
+			return err
+		}
+		for _, row := range rows {
+			if _, err := tx.BeginSend(row.ID); err != nil {
+				return err
+			}
+			if err := tx.MarkSent(row.ID, row.DeliveryKey); err != nil {
+				return err
+			}
+		}
+		latest, ok, err = tx.LatestQuestionMarkerMessage(conv)
+		if err != nil || !ok || latest.DeliveryKey != "mirror:agent" {
+			t.Fatalf("helper notice became marker target: %+v, %v, %v", latest, ok, err)
+		}
+		return nil
+	}))
+}
+
 func TestQueuedTurnConvs(t *testing.T) {
 	s, _ := openTest(t)
 	var a, b, c int64

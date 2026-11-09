@@ -290,6 +290,12 @@ type Annotator interface {
 	Annotate(ctx context.Context, chat, id string, a Annotation) error
 }
 
+// MessagePrefixEditor adds or removes one first-line marker on a message
+// posted by this account. It must preserve the rest of the message.
+type MessagePrefixEditor interface {
+	SetMessagePrefix(ctx context.Context, chat, id, prefix string, present bool) error
+}
+
 // Annotation is one in-place edit (Annotator). Label alone is the user
 // marker; Clips adds a voice transcript (the label too, when missing);
 // Notice appends a document below the message.

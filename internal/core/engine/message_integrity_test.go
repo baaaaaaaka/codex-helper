@@ -292,7 +292,7 @@ func TestUnconfirmedLegacyProgressIsRetained(t *testing.T) {
 	}
 }
 
-func TestStillWorkingUsesVisibleClockWhileToolsAreActive(t *testing.T) {
+func TestSilenceClockResetsWithCodexActivity(t *testing.T) {
 	r := newRig(t, func(c *Config) {
 		c.Timing.SilenceHint = 100 * time.Millisecond
 		c.Timing.SilenceRepeat = 150 * time.Millisecond
@@ -311,8 +311,8 @@ func TestStillWorkingUsesVisibleClockWhileToolsAreActive(t *testing.T) {
 	work := r.newWork(t.TempDir())
 	r.ch.PostUser(work, "active tools")
 	r.wait("answer", func() bool { return len(r.own(work, "ANSWER to active tools")) == 1 })
-	if n := len(r.own(work, "Still working")); n < 2 || n > 5 {
-		t.Fatalf("visible-clock hints %d", n)
+	if n := len(r.own(work, "Still working")); n != 0 {
+		t.Fatalf("got %d silence hints while Codex activity kept resetting the clock", n)
 	}
 	if len(r.own(work, "It may be stuck")) != 0 {
 		t.Fatal("active tools were called stuck")

@@ -634,6 +634,12 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value WHERE value <> excluded.va
 	return err
 }
 
+// DeleteMeta removes one meta value.
+func (t *Tx) DeleteMeta(key string) error {
+	_, err := t.exec(`DELETE FROM meta WHERE key=?`, key)
+	return err
+}
+
 // Meta reads a meta value through the read pool.
 func (s *Store) Meta(key string) (string, bool, error) {
 	var v string

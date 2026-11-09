@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/channel/teams"
+	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakegraph"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/harness"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/steps"
 )
@@ -19,7 +21,7 @@ func TestWakeSyntax(t *testing.T) {
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "WAKE-SYNTAX", harness.Options{
 		Guarantees: []string{"F-CTL-park", "R-22"},
-		Title:      "`r 1` wakes s001 only, `unpark <id>` and `resume <n>` work, a second `r` says it is active, an unknown number points to `list`",
+		Title:      "`r <n>`, `unpark <id>`, and `resume <n>` wake a session and include its direct Work chat link; a second `r` says it is active, an unknown number points to `list`",
 		Budget:     90 * time.Second,
 	})
 	defer s.Finish()
@@ -63,14 +65,26 @@ func TestWakeSyntax(t *testing.T) {
 		}
 		return false
 	}
+	hasLinkedReply := func(session, url string) bool {
+		for _, m := range s.SUTMessages(control.ID) {
+			if strings.Contains(m.PlainText(), "Resumed "+session) && strings.Contains(m.Content, `href="`+url+`"`) {
+				return true
+			}
+		}
+		return false
+	}
 
 	r1 := say("r " + num(ids[0]))
 	s.Check("`r <n>` wakes that session", has(r1, "Resumed "+ids[0]), "Resumed "+ids[0], fmt.Sprintf("%q", r1))
+	urlA := teams.ChatURL(a.ID, fakegraph.TenantID)
+	s.Check("the wake reply includes a clickable link to the resumed Work chat", has(r1, "Open Work chat: "+urlA) && hasLinkedReply(ids[0], urlA), "Open Work chat: "+urlA, fmt.Sprintf("%q", r1))
 	r1again := say("r " + ids[0])
 	s.Check("`r <id>` of an active session does not wake it again", !has(r1again, "Resumed") && len(r1again) == 1,
 		"one reply that it is not parked", fmt.Sprintf("%q", r1again))
 	unpark := say("unpark " + ids[1])
 	s.Check("`unpark <id>` wakes a parked session (v0.1.20 alias)", has(unpark, "Resumed "+ids[1]), "Resumed "+ids[1], fmt.Sprintf("%q", unpark))
+	urlB := teams.ChatURL(b.ID, fakegraph.TenantID)
+	s.Check("`unpark` includes a clickable link to its resumed Work chat", has(unpark, "Open Work chat: "+urlB) && hasLinkedReply(ids[1], urlB), "Open Work chat: "+urlB, fmt.Sprintf("%q", unpark))
 	resume := say("resume " + num(ids[2]))
 	s.Check("`resume <n>` wakes a parked session", has(resume, "Resumed "+ids[2]), "Resumed "+ids[2], fmt.Sprintf("%q", resume))
 	unknown := say("r 97")

@@ -224,6 +224,42 @@ func (f *Fake) Edit(_ context.Context, chatID, id string, p channel.Part, token 
 	return &channel.Rejected{Permanent: true, Err: fmt.Errorf("message %s/%s: %w", chatID, id, channel.ErrNotFound)}
 }
 
+// SetMessagePrefix updates the first line of one of this account's messages.
+func (f *Fake) SetMessagePrefix(_ context.Context, chatID, id, prefix string, present bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c := f.chats[chatID]
+	if c == nil {
+		return &channel.Rejected{Permanent: true, Err: fmt.Errorf("chat %s: %w", chatID, channel.ErrNotFound)}
+	}
+	for i, s := range c.msgs {
+		if s.msg.ID != id {
+			continue
+		}
+		if !s.msg.ByOwner {
+			return &channel.Rejected{Permanent: true, Err: fmt.Errorf("message %s was not posted by the owner", id)}
+		}
+		lines := strings.SplitN(s.msg.Text, "\n", 2)
+		marked := strings.TrimSpace(lines[0]) == prefix
+		if marked == present {
+			return nil
+		}
+		if present {
+			s.msg.Text = prefix + "\n" + s.msg.Text
+		} else if len(lines) == 2 {
+			s.msg.Text = lines[1]
+		} else {
+			s.msg.Text = ""
+		}
+		s.msg.Hash, s.msg.Edited = channel.TextHash(s.msg.Text), true
+		f.seq++
+		s.seq, s.msg.Modified = f.seq, f.now()
+		c.msgs = append(append(c.msgs[:i:i], c.msgs[i+1:]...), s)
+		return nil
+	}
+	return &channel.Rejected{Permanent: true, Err: fmt.Errorf("message %s/%s: %w", chatID, id, channel.ErrNotFound)}
+}
+
 // MarkUnread records readAt for the chat; see Unread.
 func (f *Fake) MarkUnread(_ context.Context, chatID string, readAt time.Time) error {
 	f.mu.Lock()

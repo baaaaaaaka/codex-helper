@@ -152,3 +152,69 @@ func TestEditHTMLPreservesAttachmentsAndMentions(t *testing.T) {
 	}
 	noViolations(t, fg)
 }
+
+func TestSetMessagePrefixIsIdempotentAndPreservesBodyContext(t *testing.T) {
+	ctx := context.Background()
+	fg, a := newFake(t, fakegraph.Options{})
+	chat := fg.CreateMeetingChatAsUser("question marker").ID
+	src := filepath.Join(t.TempDir(), "question.txt")
+	if err := os.WriteFile(src, []byte("question attachment"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ref, err := a.UploadFile(ctx, src, "question.txt", nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := renderOne(t, a, channel.RichDoc{Label: "❓ Q1 · Question from Codex", Markdown: "Choose one", Mention: true, Files: []channel.FileRef{ref}})
+	sent, err := a.Send(ctx, chat, p, "q1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	original := fg.Messages(chat)[0].Content
+	const prefix = "❓Pending agent question"
+	if err := a.SetMessagePrefix(ctx, chat, sent.ID, prefix, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SetMessagePrefix(ctx, chat, sent.ID, prefix, true); err != nil {
+		t.Fatal(err)
+	}
+	message := fg.Messages(chat)[0]
+	if message.PatchCount != 1 || !strings.HasPrefix(strings.TrimSpace(message.PlainText()), prefix) || !strings.Contains(message.PlainText(), "Choose one") || len(message.Attachments) != 1 || len(message.Mentions) != 1 {
+		t.Fatalf("prefixed message %+v", message)
+	}
+	if err := a.SetMessagePrefix(ctx, chat, sent.ID, prefix, false); err != nil {
+		t.Fatal(err)
+	}
+	message = fg.Messages(chat)[0]
+	if message.PatchCount != 2 || message.Content != original || strings.HasPrefix(strings.TrimSpace(message.PlainText()), prefix) || !strings.Contains(message.PlainText(), "Choose one") || len(message.Attachments) != 1 || len(message.Mentions) != 1 {
+		t.Fatalf("prefix removal lost content: %+v", message)
+	}
+
+	// Question status edits replace the body. Re-applying the prefix must keep
+	// the updated status, then removing it must leave that status intact.
+	plain, err := a.Send(ctx, chat, renderOne(t, a, channel.RichDoc{Label: "❓ Q2 · Question from Codex", Markdown: "Another question"}), "q2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SetMessagePrefix(ctx, chat, plain.ID, prefix, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.EditHTML(ctx, chat, plain.ID, func(string) (string, bool) { return "<p>Resolved</p>", true }); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SetMessagePrefix(ctx, chat, plain.ID, prefix, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.SetMessagePrefix(ctx, chat, plain.ID, prefix, false); err != nil {
+		t.Fatal(err)
+	}
+	message = fg.Messages(chat)[1]
+	if message.PatchCount != 4 || strings.HasPrefix(strings.TrimSpace(message.PlainText()), prefix) || !strings.Contains(message.PlainText(), "Resolved") {
+		t.Fatalf("updated message %+v", message)
+	}
+	other, _ := fg.PostAsCoworker(chat, "not mine")
+	if err := a.SetMessagePrefix(ctx, chat, other.ID, prefix, true); !errors.Is(err, channel.ErrNotEditable) {
+		t.Fatalf("prefix coworker message: %v", err)
+	}
+	noViolations(t, fg)
+}

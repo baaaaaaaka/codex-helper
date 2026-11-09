@@ -582,4 +582,13 @@ func TestGatesAndMeta(t *testing.T) {
 	if n := countWhere(t, s, `SELECT count(*) FROM gates`); n != 2 {
 		t.Fatalf("gates rows %d", n)
 	}
+	mustT(t, s.Update(func(tx *Tx) error {
+		if err := tx.SetMeta("temporary", "id"); err != nil {
+			return err
+		}
+		return tx.DeleteMeta("temporary")
+	}))
+	if _, ok, err := s.Meta("temporary"); err != nil || ok {
+		t.Fatalf("deleted meta still present: %v %v", ok, err)
+	}
 }

@@ -77,6 +77,24 @@ func (e *Engine) queueEdit(conv int64, ed chatEdit) {
 	e.edits[conv] = append(e.edits[conv], &ed)
 }
 
+// queueEditLast refreshes a coalesced edit after newer edits to the same
+// message, while retaining one queued operation per key.
+func (e *Engine) queueEditLast(conv int64, ed chatEdit) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.edits == nil {
+		e.edits = map[int64][]*chatEdit{}
+	}
+	queue := e.edits[conv]
+	for i, queued := range queue {
+		if queued.key == ed.key {
+			queue = append(queue[:i], queue[i+1:]...)
+			break
+		}
+	}
+	e.edits[conv] = append(queue, &ed)
+}
+
 // withEdits marks the send items of conversations with a due edit as
 // edits, and adds an item for such a conversation that has no row to
 // send. An edit not due yet sets when to look again.

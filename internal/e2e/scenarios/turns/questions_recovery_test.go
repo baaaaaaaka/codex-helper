@@ -69,8 +69,20 @@ func TestQuestionsRestartExpiresOrphanRPC(t *testing.T) {
 	s.Require("first question delivered", steps.AnswerTimeout, func() (bool, string) {
 		return len(s.SUTMessagesContaining(work.ID, "Question from Codex")) == 1, "waiting"
 	})
+	s.Require("pending question is marked", steps.AnswerTimeout, func() (bool, string) {
+		questions := s.SUTMessagesContaining(work.ID, "Question from Codex")
+		return len(questions) == 1 && hasPendingQuestionMarker(questions[0]), "waiting for first-line marker"
+	})
 	s.StopSUT()
 	s.StartSUT()
+	s.Require("orphan question cleanup clears marker after restart", steps.AnswerTimeout, func() (bool, string) {
+		for _, m := range s.SUTMessages(work.ID) {
+			if hasPendingQuestionMarker(m) {
+				return false, "marker remains on " + m.ID
+			}
+		}
+		return true, "pending marker removed"
+	})
 	steps.MustPost(s, work.ID, "helper answer Q1 B")
 	s.Require("orphan reply refused", steps.AnswerTimeout, func() (bool, string) {
 		return len(s.SUTMessagesContaining(work.ID, "already resolved")) > 0, "waiting for recovered closed question"

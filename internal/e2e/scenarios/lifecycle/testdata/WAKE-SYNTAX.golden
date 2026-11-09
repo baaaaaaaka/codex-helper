@@ -1,4 +1,4 @@
-# WAKE-SYNTAX: `r 1` wakes s001 only, `unpark <id>` and `resume <n>` work, a second `r` says it is active, an unknown number points to `list`
+# WAKE-SYNTAX: `r <n>`, `unpark <id>`, and `resume <n>` wake a session and include its direct Work chat link; a second `r` says it is active, an unknown number points to `list`
 # cxp black-box transcript; volatile values are numbered placeholders
 
 == chat <chat:1> "🏠 Codex Control - e2ehost"
@@ -77,7 +77,9 @@
    | <p>r 1</p>
 -- <msg:15> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Resumed s001: its chat is read again.</p>
+   | <p>Resumed s001.</p>
+   | <p>Open Work chat: <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
+   | <p>Messages in that chat will be read again.</p>
 -- <msg:16> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>r s001</p>
@@ -95,7 +97,9 @@
    | <p>unpark s002</p>
 -- <msg:19> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Resumed s002: its chat is read again.</p>
+   | <p>Resumed s002.</p>
+   | <p>Open Work chat: <a href="https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
+   | <p>Messages in that chat will be read again.</p>
 -- <msg:20> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>resume 3</p>
@@ -104,7 +108,9 @@
    | <p>resume 3</p>
 -- <msg:21> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Resumed s003: its chat is read again.</p>
+   | <p>Resumed s003.</p>
+   | <p>Open Work chat: <a href="https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
+   | <p>Messages in that chat will be read again.</p>
 -- <msg:22> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>r 97</p>

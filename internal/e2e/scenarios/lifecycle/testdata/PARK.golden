@@ -50,7 +50,9 @@
    | <p>r s001</p>
 -- <msg:9> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Resumed s001: its chat is read again.</p>
+   | <p>Resumed s001.</p>
+   | <p>Open Work chat: <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
+   | <p>Messages in that chat will be read again.</p>
 -- "Codex finished" notices, one line each, sorted (posting order is timing: several chats finish close together)
    finished: 💬 e2ehost - First task E2E-PARK-warma-1 | request: Typed while parked E2E-PARK-whileparked-4 (@owner)
    finished: 💬 e2ehost - First task E2E-PARK-warmb-2 (@owner)

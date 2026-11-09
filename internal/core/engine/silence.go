@@ -34,7 +34,6 @@ func (e *Engine) watchSilence(ctx context.Context, cs *convState, tr store.Turn,
 		tick := time.NewTicker(every)
 		defer tick.Stop()
 		activityEpisode := rs.lastEvent.Load()
-		visible := fromMS(activityEpisode)
 		var lastHint time.Time
 		hints := 0
 		stuck := false
@@ -49,25 +48,23 @@ func (e *Engine) watchSilence(ctx context.Context, cs *convState, tr store.Turn,
 			now := e.now()
 			last := rs.lastEvent.Load()
 			e.mu.Lock()
-			waiting, seen := e.questionWaiting[cs.id], cs.lastVisible
+			waiting := e.questionWaiting[cs.id]
 			e.mu.Unlock()
 			if waiting {
-				rs.lastEvent.Store(ms(now))
-				visible, lastHint, hints = now, time.Time{}, 0
-				continue
-			}
-			if seen.After(visible) {
-				visible, lastHint, hints = seen, time.Time{}, 0
+				last = ms(now)
+				rs.lastEvent.Store(last)
 			}
 			if last != activityEpisode {
-				activityEpisode, stuck = last, false
+				activityEpisode, lastHint, hints, stuck = last, time.Time{}, 0, false
 			}
 			quiet := now.Sub(fromMS(last))
-			if e.t.SilenceStuck > 0 && quiet >= e.t.SilenceStuck && !stuck {
-				stuck = e.silenceNotice(cs.id, fmt.Sprintf("turn:%d:silence:%d:stuck", tr.ID, last), textStuck(quiet))
-				continue
-			}
-			if e.t.SilenceHint <= 0 || now.Sub(visible) < e.t.SilenceHint || (hints > 0 && (e.t.SilenceRepeat <= 0 || now.Sub(lastHint) < e.t.SilenceRepeat)) {
+			regularDue := e.t.SilenceHint > 0 && quiet >= e.t.SilenceHint && (hints == 0 || (e.t.SilenceRepeat > 0 && now.Sub(lastHint) >= e.t.SilenceRepeat))
+			// Keep the standalone stuck threshold when regular hints or their
+			// repeat cadence are disabled. Otherwise stuck wording uses the next
+			// regular send, which gives the default schedule its ~17-minute time.
+			stuckDue := e.t.SilenceStuck > 0 && quiet >= e.t.SilenceStuck && !stuck &&
+				(e.t.SilenceHint <= 0 || e.t.SilenceRepeat <= 0 || hints == 0)
+			if !regularDue && !stuckDue {
 				continue
 			}
 			// Do not add periodic hints behind undelivered substantive output.
@@ -75,9 +72,12 @@ func (e *Engine) watchSilence(ctx context.Context, cs *convState, tr store.Turn,
 			if err != nil || pending {
 				continue
 			}
-			if e.silenceNotice(cs.id, fmt.Sprintf("turn:%d:visible:%d:%d", tr.ID, ms(visible), hints+1), textSilent) {
+			if e.silenceNotice(cs.id, fmt.Sprintf("turn:%d:silence:%d:%d", tr.ID, activityEpisode, hints+1), textSilence(quiet, e.t.SilenceCancelHint, e.t.SilenceStuck)) {
 				lastHint = now
 				hints++
+				if e.t.SilenceStuck > 0 && quiet >= e.t.SilenceStuck {
+					stuck = true
+				}
 			}
 		}
 	}()
@@ -157,7 +157,19 @@ func (e *Engine) remindQueued() {
 
 // Texts of R-19 (v0.1.20 codexIdleStatusMessage + codexIdleStatusCancelHint
 // and codexSuspectedStuckMessage, B:92-99).
-const textSilent = "Still working. No new Codex update yet.\n\nThis is taking longer than usual. To stop the running request, send `helper cancel running` in this chat."
+const textSilent = "Still working. No new Codex update yet."
+
+const textSilenceCancel = "This is taking longer than usual. To stop the running request, send `helper cancel running` in this chat."
+
+func textSilence(quiet, cancelHintAfter, stuckAfter time.Duration) string {
+	if stuckAfter > 0 && quiet >= stuckAfter {
+		return textStuck(quiet)
+	}
+	if cancelHintAfter > 0 && quiet >= cancelHintAfter {
+		return textSilent + "\n\n" + textSilenceCancel
+	}
+	return textSilent
+}
 
 func textStuck(quiet time.Duration) string {
 	return "Codex has not produced any update for " + quietDuration(quiet) + ". It may be stuck.\n\nI will not retry automatically. To stop the running request, send `helper cancel running` in this chat."
@@ -261,15 +273,4 @@ func minutes(d time.Duration) string {
 		return fmt.Sprintf("%d s", int(d.Round(time.Second)/time.Second))
 	}
 	return fmt.Sprintf("%d min", int(d.Round(time.Minute)/time.Minute))
-}
-
-func (e *Engine) noteVisible(r store.Outbox) {
-	if r.Kind != store.OutProgress && r.Kind != store.OutMirror && r.Kind != store.OutFinal {
-		return
-	}
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if cs := e.convs[r.ConvID]; cs != nil {
-		cs.lastVisible = e.now()
-	}
 }

@@ -175,15 +175,17 @@ func (e *Engine) pumpNotify(ctx context.Context) {
 				continue
 			}
 			var questionGroup store.QuestionGroup
+			questionDone := false
 			if n.Kind == notifyQuestion {
 				var ok bool
 				questionGroup, ok, err = tx.QuestionGroup(n.Text)
 				if err != nil {
 					return err
 				}
-				if !ok || questionGroup.State != "open" || questionsReady(questionGroup) {
+				if !ok {
 					continue
 				}
+				questionDone = questionGroup.State != "open" || questionsReady(questionGroup)
 			}
 			rows, err := tx.PendingOutbox(n.Conv)
 			if err != nil {
@@ -210,6 +212,19 @@ func (e *Engine) pumpNotify(ctx context.Context) {
 				}
 			}
 			if !waiting {
+				if n.Kind == notifyQuestion && questionDone {
+					for _, q := range questionGroup.Questions {
+						sent, err := tx.SentUnder(questionPrefix(q.ID) + ":")
+						if err != nil {
+							return err
+						}
+						if sent {
+							answered = append(answered, n)
+							break
+						}
+					}
+					continue // resolved before notification: mark unread, no chat mention
+				}
 				// An answer that was never confirmed delivered is not
 				// announced: the chat carries the "could not be
 				// confirmed" notice instead (R-5b).
@@ -220,9 +235,9 @@ func (e *Engine) pumpNotify(ctx context.Context) {
 				if gone {
 					continue
 				}
-				if n.Kind == "" || n.Kind == notifyLocal {
+				if n.Kind == "" || n.Kind == notifyLocal || n.Kind == notifyQuestion {
 					answered = append(answered, n)
-				} // questions do not trigger final-answer title changes
+				} // questions mark the work chat unread, but do not retitle it
 			}
 			keep = append(keep, n)
 			switch {

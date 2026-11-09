@@ -1,4 +1,4 @@
-# SILENCE: a silent Codex turn: one hint at SilenceHint, one at SilenceStuck, never stopped by the helper; `helper cancel running` stops it and the chat keeps working
+# SILENCE: a silent Codex turn: notices at 2 min then every 5 min, cancel guidance from 7 min and stuck wording from 15 min (first due around 17 min); never stopped by the helper
 # cxp black-box transcript; volatile values are numbered placeholders
 
 == chat <chat:1> "🏠 Codex Control - e2ehost"
@@ -57,36 +57,47 @@
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
    | <p>Still working. No new Codex update yet.</p>
-   | <p>This is taking longer than usual. To stop the running request, send <code>helper cancel running</code> in this chat.</p>
 -- <msg:6> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
+   | <p>Still working. No new Codex update yet.</p>
+   | <p>This is taking longer than usual. To stop the running request, send <code>helper cancel running</code> in this chat.</p>
+-- <msg:7> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
+   | <p>Still working. No new Codex update yet.</p>
+   | <p>This is taking longer than usual. To stop the running request, send <code>helper cancel running</code> in this chat.</p>
+-- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
    | <p>Codex has not produced any update for less than 1m. It may be stuck.</p>
    | <p>I will not retry automatically. To stop the running request, send <code>helper cancel running</code> in this chat.</p>
--- <msg:7> owner (html)
+-- <msg:9> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
+   | <p>Codex has not produced any update for less than 1m. It may be stuck.</p>
+   | <p>I will not retry automatically. To stop the running request, send <code>helper cancel running</code> in this chat.</p>
+-- <msg:10> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper cancel running</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>helper cancel running</p>
--- <msg:8> helper (html)
+-- <msg:11> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>cancel requested for running turn: <code>turn-1</code></p>
    | <p><strong>Prompt being canceled:</strong><br>
    | A task that goes silent E2E-SILENCE-silent-1</p>
    | <p>No other prompts are queued.</p>
--- <msg:9> helper (html)
+-- <msg:12> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Codex request canceled.</p>
--- <msg:10> owner (html)
+-- <msg:13> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Next prompt E2E-SILENCE-next-2</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>Next prompt E2E-SILENCE-next-2</p>
--- <msg:11> helper (html)
+-- <msg:14> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:12> helper (html)
+-- <msg:15> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-SILENCE-next-2</p>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>

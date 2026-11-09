@@ -84,6 +84,16 @@ func (c timedChannel) Edit(ctx context.Context, chat, id string, p channel.Part,
 	return c.Channel.Edit(ctx, chat, id, p, token)
 }
 
+func (c timedChannel) SetMessagePrefix(ctx context.Context, chat, id, prefix string, present bool) error {
+	editor, ok := c.Channel.(channel.MessagePrefixEditor)
+	if !ok {
+		return channel.ErrNotEditable
+	}
+	ctx, cancel := bounded(ctx, callTimeout)
+	defer cancel()
+	return editor.SetMessagePrefix(ctx, chat, id, prefix, present)
+}
+
 func (c timedChannel) MarkUnread(ctx context.Context, chat string, readAt time.Time) error {
 	ctx, cancel := bounded(ctx, callTimeout)
 	defer cancel()

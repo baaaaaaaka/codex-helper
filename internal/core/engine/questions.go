@@ -129,8 +129,8 @@ func (e *Engine) questionEvent(ev QuestionEvent) error {
 		if err != nil {
 			return err
 		}
-		e.queueQuestionPublish(stored)
 		e.refreshQuestionWaiting()
+		e.queueQuestionPublish(stored)
 		return nil
 	}
 	var changed []store.QuestionGroup
@@ -370,19 +370,40 @@ func (e *Engine) editQuestions(g store.QuestionGroup) {
 			return nil
 		}})
 	}
+	e.queueQuestionMarker(g.ConvID)
 	e.wakeSender()
 }
 
 func (e *Engine) refreshQuestionWaiting() {
-	var convs []int64
-	_ = e.update(func(tx *store.Tx) (err error) { convs, err = tx.WaitingQuestionConversations(); return })
+	var convs, pendingConvs []int64
+	if err := e.update(func(tx *store.Tx) (err error) {
+		convs, err = tx.WaitingQuestionConversations()
+		if err != nil {
+			return err
+		}
+		pendingConvs, err = tx.PendingQuestionConversations()
+		return err
+	}); err != nil {
+		return
+	}
 	waiting := map[int64]bool{}
 	for _, conv := range convs {
 		waiting[conv] = true
 	}
+	pending := map[int64]bool{}
+	for _, conv := range pendingConvs {
+		pending[conv] = true
+	}
 	e.mu.Lock()
+	previous := e.questionPending
 	e.questionWaiting = waiting
+	e.questionPending = pending
 	e.mu.Unlock()
+	for conv := range previous {
+		if !pending[conv] {
+			e.queueQuestionMarker(conv)
+		}
+	}
 }
 
 func (e *Engine) cmdAnswer(ctx context.Context, j cmdJob, arg string) {
