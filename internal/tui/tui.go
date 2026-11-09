@@ -69,6 +69,7 @@ const (
 )
 
 type Options struct {
+	// LoadProjects returns a snapshot; callers must not mutate its slices after return.
 	LoadProjects    func(context.Context) ([]codexhistory.Project, error)
 	Version         string
 	CheckUpdate     func(context.Context) update.Status
@@ -234,6 +235,16 @@ type sessionObjectSelectionIdentity struct {
 }
 
 type uiState struct {
+	views             listViews
+	projectRevision   uint64
+	expansionRevision uint64
+	workers           *uiWorkers
+	layoutSubmitted   string
+	layoutRequest     string
+	layoutPending     bool
+	previewCacheOrder []string
+	previewCacheBytes int
+
 	projects         []codexhistory.Project
 	loadError        error
 	loadingProjects  bool
@@ -376,6 +387,7 @@ func SelectSession(ctx context.Context, opts Options) (*Selection, error) {
 	}
 
 	previewCh := make(chan previewEvent, 8)
+	state.workers = newUIWorkers(loadCtx, done, screen, opts)
 
 	if opts.RefreshInterval > 0 {
 		interval := opts.RefreshInterval
@@ -396,11 +408,19 @@ func SelectSession(ctx context.Context, opts Options) (*Selection, error) {
 	}
 
 	go func() {
-		<-ctx.Done()
+		select {
+		case <-done:
+			return
+		case <-ctx.Done():
+		}
 		postUIEventWithRetry(ctx, done, screen, &uiEvent{when: time.Now(), kind: "quit"})
 	}()
 
 	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		state.applyWorkerResults()
 		if err := draw(screen, state, opts, previewCh); err != nil {
 			return nil, err
 		}
@@ -418,6 +438,7 @@ func SelectSession(ctx context.Context, opts Options) (*Selection, error) {
 						cancelLoadingTicker()
 						state.loadingProjects = false
 						state.projects = ev.projects
+						state.projectRevision++
 						state.loadError = ev.err
 					default:
 						goto nextEvent
@@ -665,13 +686,11 @@ func handleKey(
 		listFocus = state.lastListFocus
 	}
 
-	projects := buildProjectItems(state.projects, opts.DefaultCwd)
-	filteredProjects := filterProjects(projects, state.projectFilter)
+	filteredProjects := state.projectItems(opts)
 	state.projectState.clamp(len(filteredProjects))
 	selectedProject := selectedProject(filteredProjects, state.projectState.selected)
 
-	sessions := buildSessionItems(selectedProject, state.expandedSessions)
-	filteredSessions := filterSessions(sessions, state.sessionFilter)
+	filteredSessions := state.sessionItems(selectedProject)
 	state.sessionState.clamp(len(filteredSessions))
 	selectedItem, selectedOk := selectedSessionItem(filteredSessions, state.sessionState.selected)
 	selectedSession, selectedSubagent, selectedIsNew := sessionSelection(selectedItem)
@@ -703,8 +722,8 @@ func handleKey(
 			return nil, nil
 		}
 		state.expandedSessions[parentID] = !state.expandedSessions[parentID]
-		sessions = buildSessionItems(selectedProject, state.expandedSessions)
-		filteredSessions = filterSessions(sessions, state.sessionFilter)
+		state.expansionRevision++
+		filteredSessions = state.sessionItems(selectedProject)
 		state.sessionState.clamp(len(filteredSessions))
 		if idx := findSessionIndex(filteredSessions, parentID); idx >= 0 {
 			state.sessionState.selected = idx
@@ -760,7 +779,9 @@ func handleKey(
 
 	if state.focus == "preview" && isPreviewNavKey(ev) {
 		lines := wrappedPreviewLinesForSelection(state, selectedProject, selectedSession, selectedSubagent, selectedIsNew, opts, max(0, layoutMode.preview.w-2))
-		applyPreviewNavigation(&state.previewState, len(lines), max(0, layoutMode.preview.h-2), ev)
+		if !state.layoutPending {
+			applyPreviewNavigation(&state.previewState, len(lines), max(0, layoutMode.preview.h-2), ev)
+		}
 		return nil, nil
 	}
 
@@ -786,7 +807,9 @@ func handleKey(
 
 	if state.focus == "preview" {
 		lines := wrappedPreviewLinesForSelection(state, selectedProject, selectedSession, selectedSubagent, selectedIsNew, opts, max(0, layoutMode.preview.w-2))
-		applyPreviewNavigation(&state.previewState, len(lines), max(0, layoutMode.preview.h-2), ev)
+		if !state.layoutPending {
+			applyPreviewNavigation(&state.previewState, len(lines), max(0, layoutMode.preview.h-2), ev)
+		}
 		return nil, nil
 	}
 
@@ -794,6 +817,10 @@ func handleKey(
 }
 
 func refreshState(ctx context.Context, state *uiState, opts Options) {
+	if state.workers != nil {
+		state.workers.requestRefresh(false)
+		return
+	}
 	projects, err := opts.LoadProjects(ctx)
 	if err != nil {
 		state.loadError = err
@@ -801,6 +828,7 @@ func refreshState(ctx context.Context, state *uiState, opts Options) {
 	}
 	state.loadError = nil
 	state.projects = projects
+	state.projectRevision++
 	state.projectState = listState{}
 	state.sessionState = listState{}
 	state.previewState = previewState{}
@@ -809,6 +837,10 @@ func refreshState(ctx context.Context, state *uiState, opts Options) {
 }
 
 func refreshStatePreserveSelection(ctx context.Context, state *uiState, opts Options) {
+	if state.workers != nil {
+		state.workers.requestRefresh(true)
+		return
+	}
 	selection := state.currentSelection
 	projects, err := opts.LoadProjects(ctx)
 	if err != nil {
@@ -817,6 +849,7 @@ func refreshStatePreserveSelection(ctx context.Context, state *uiState, opts Opt
 	}
 	state.loadError = nil
 	state.projects = projects
+	state.projectRevision++
 	state.pendingSelection = selection
 }
 
@@ -870,8 +903,7 @@ func computeLayout(screen tcell.Screen, statusHeight int) layout {
 func draw(screen tcell.Screen, state *uiState, opts Options, previewCh chan<- previewEvent) error {
 	screen.Clear()
 
-	projects := buildProjectItems(state.projects, opts.DefaultCwd)
-	filteredProjects := filterProjects(projects, state.projectFilter)
+	filteredProjects := state.projectItems(opts)
 	selectedProject, filteredSessions, selectedItem, selectedOk := resolveSelectionForDraw(state, filteredProjects)
 	selectedSession, selectedSubagent, selectedIsNew := sessionSelection(selectedItem)
 	if !selectedOk {
@@ -891,6 +923,8 @@ func draw(screen tcell.Screen, state *uiState, opts Options, previewCh chan<- pr
 
 	if selectedSession != nil || selectedSubagent != nil {
 		ensurePreview(screen, state, opts, selectedSession, selectedSubagent, previewCh)
+	} else if state.workers != nil {
+		state.selectPreviewRead("")
 	}
 
 	proxyLabel := "Proxy mode (Ctrl+P): off"
@@ -1060,10 +1094,12 @@ func draw(screen tcell.Screen, state *uiState, opts Options, previewCh chan<- pr
 	drawBox(screen, layoutMode.preview, "Preview", state.focus == "preview", previewFilter)
 	lines := wrappedPreviewLinesForSelection(state, selectedProject, selectedSession, selectedSubagent, selectedIsNew, opts, max(0, layoutMode.preview.w-2))
 	viewH := max(0, layoutMode.preview.h-2)
-	state.previewState.scroll = clamp(state.previewState.scroll, 0, max(0, len(lines)-viewH))
+	if !state.layoutPending {
+		state.previewState.scroll = clamp(state.previewState.scroll, 0, max(0, len(lines)-viewH))
+	}
 
 	previewKey := state.previewLines.key + "|search:" + state.previewSearch
-	if previewKey != state.previewSearchKey {
+	if state.workers == nil && previewKey != state.previewSearchKey {
 		state.previewSearchKey = previewKey
 		if state.previewSearch != "" {
 			state.previewMatches = previewFindMatches(lines, state.previewSearch)
@@ -1084,7 +1120,11 @@ func draw(screen tcell.Screen, state *uiState, opts Options, previewCh chan<- pr
 		lineAttrs[matchLine] = tcell.StyleDefault.Reverse(true)
 	}
 
-	drawPreview(screen, layoutMode.preview, lines, state.previewState.scroll, lineAttrs)
+	previewScroll := state.previewState.scroll
+	if state.layoutPending {
+		previewScroll = 0
+	}
+	drawPreview(screen, layoutMode.preview, lines, previewScroll, lineAttrs)
 
 	drawStatusLines(screen, statusLines)
 	screen.Show()
@@ -1102,13 +1142,19 @@ func ensurePreview(
 	cacheKey := previewCacheKey(session, subagent)
 	filePath := previewFilePath(session, subagent)
 	if cacheKey == "" || filePath == "" {
+		if state.workers != nil {
+			state.selectPreviewRead("")
+		}
 		return
+	}
+	if state.workers != nil {
+		state.selectPreviewRead(cacheKey)
 	}
 	maxMessages := opts.PreviewMessages
 	meta, err := previewCacheMetaFor(filePath, maxMessages)
 	if err != nil {
 		state.previewError[cacheKey] = previewErrorEntry{message: err.Error(), meta: meta}
-		delete(state.previewCache, cacheKey)
+		state.forgetPreview(cacheKey)
 		delete(state.previewLoading, cacheKey)
 		return
 	}
@@ -1127,6 +1173,10 @@ func ensurePreview(
 	delete(state.previewError, cacheKey)
 	state.previewLoading[cacheKey] = meta
 
+	if state.workers != nil {
+		state.workers.read.submit(previewReadJob{key: cacheKey, meta: meta})
+		return
+	}
 	go func(key string, path string, meta previewCacheMeta) {
 		text, err := codexhistory.ReadSessionPreviewText(path, meta.maxMessages, 0)
 		previewCh <- previewEvent{cacheKey: key, meta: meta, text: text, err: err}
@@ -1162,7 +1212,7 @@ func applyPreviewEvent(state *uiState, ev previewEvent) {
 		state.previewError[ev.cacheKey] = previewErrorEntry{message: ev.err.Error(), meta: ev.meta}
 		return
 	}
-	state.previewCache[ev.cacheKey] = previewCacheEntry{text: ev.text, meta: ev.meta, revision: previewMetaRevision(ev.meta)}
+	state.rememberPreview(ev.cacheKey, previewCacheEntry{text: ev.text, meta: ev.meta, revision: previewMetaRevision(ev.meta)})
 	delete(state.previewError, ev.cacheKey)
 }
 
@@ -1563,7 +1613,7 @@ func resolveSelectionForDraw(state *uiState, projects []projectItem) (codexhisto
 	state.projectState.clamp(len(projects))
 	project := selectedProject(projects, state.projectState.selected)
 
-	sessions := filterSessions(buildSessionItems(project, state.expandedSessions), state.sessionFilter)
+	sessions := state.sessionItems(project)
 	if projectRestored && pending.session.kind != "" {
 		if sessionIdx := findSessionSelectionIndex(sessions, pending.session); sessionIdx >= 0 {
 			state.sessionState.selected = sessionIdx
@@ -2012,6 +2062,9 @@ func wrappedPreviewLinesForSelection(
 ) []string {
 	if state == nil {
 		return nil
+	}
+	if state.workers != nil {
+		return state.asyncPreviewLines(project, session, subagent, selectedIsNew, opts, width)
 	}
 	key := previewLinesCacheKey(state, project, session, subagent, selectedIsNew, opts, width)
 	if key != "" && state.previewLines.key == key {
@@ -2691,6 +2744,10 @@ func buildWrappedLines(lines []string, width int) []string {
 }
 
 func wrapText(s string, width int) []string {
+	return wrapTextContext(context.Background(), s, width)
+}
+
+func wrapTextContext(ctx context.Context, s string, width int) []string {
 	if width <= 0 {
 		return nil
 	}
@@ -2699,13 +2756,19 @@ func wrapText(s string, width int) []string {
 	}
 	out := []string{}
 	for _, ln := range strings.Split(s, "\n") {
+		if ctx.Err() != nil {
+			return nil
+		}
 		if ln == "" {
 			out = append(out, "")
 			continue
 		}
 		var buf strings.Builder
 		curWidth := 0
-		for _, ch := range ln {
+		for offset, ch := range ln {
+			if offset&4095 == 0 && ctx.Err() != nil {
+				return nil
+			}
 			chWidth := runewidth.RuneWidth(ch)
 			if chWidth == 0 {
 				buf.WriteRune(ch)

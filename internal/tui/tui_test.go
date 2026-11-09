@@ -313,7 +313,9 @@ func TestHandleKeyForksOnlyMainSession(t *testing.T) {
 		t.Fatalf("fork selection = %#v", selection)
 	}
 
-	state.expandedSessions["sess-1"] = true
+	if _, err := handleKey(context.Background(), screen, state, Options{}, tcell.NewEventKey(tcell.KeyCtrlO, 0, 0)); err != nil {
+		t.Fatal(err)
+	}
 	state.sessionState.selected = 2
 	selection, err = handleKey(context.Background(), screen, state, Options{}, tcell.NewEventKey(tcell.KeyRune, 'f', 0))
 	if err != nil {

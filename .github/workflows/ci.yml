@@ -271,6 +271,10 @@ jobs:
           # whole-repository race sweep runs in nightly.yml.
           go test -race -count=1 -timeout=15m -parallel=16 ./internal/core/... ./internal/channel/... 2>&1 | tee "$RUNNER_TEMP/race-core.log"
 
+      - name: TUI asynchronous state and worker race checks
+        shell: bash
+        run: go test -race -count=1 -timeout=5m ./internal/tui
+
       - name: Teams startup and watchdog race checks
         shell: bash
         run: |
