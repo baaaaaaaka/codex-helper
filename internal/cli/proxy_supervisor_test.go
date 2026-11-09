@@ -102,7 +102,8 @@ func TestProxySupervisorAdoptsExistingDaemonBeforeStartingChild(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
-	inst := config.Instance{ID: "adopt-existing", ProfileID: "p1", OwnerToken: "owner-1", BrokerEpoch: "epoch-1", DaemonPID: 4242}
+	daemonPID := os.Getpid() + 1
+	inst := config.Instance{ID: "adopt-existing", ProfileID: "p1", OwnerToken: "owner-1", BrokerEpoch: "epoch-1", DaemonPID: daemonPID}
 	if err := store.Save(config.Config{Version: config.CurrentVersion, Instances: []config.Instance{inst}}); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
@@ -114,8 +115,8 @@ func TestProxySupervisorAdoptsExistingDaemonBeforeStartingChild(t *testing.T) {
 	proxyExecutable = func() (string, error) { return "/bin/sh", nil }
 	alive := true
 	waitCalls := 0
-	proxyProcessAlive = func(pid int) bool { return alive && pid == inst.DaemonPID }
-	proxyLooksLikeProxyDaemon = func(pid int) (bool, error) { return pid == inst.DaemonPID, nil }
+	proxyProcessAlive = func(pid int) bool { return alive && pid == daemonPID }
+	proxyLooksLikeProxyDaemon = func(pid int) (bool, error) { return pid == daemonPID, nil }
 	proxySupervisorWait = func(context.Context, time.Duration) error {
 		waitCalls++
 		if waitCalls == 1 {
