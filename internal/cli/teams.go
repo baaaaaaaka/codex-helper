@@ -86,8 +86,8 @@ func newTeamsSetupCmd() *cobra.Command {
 			out := cmd.OutOrStdout()
 			for _, line := range []string{
 				"Teams setup checklist",
-				"1. Configure your tenant and Teams Graph client ID with `cxp teams auth config --tenant-id <tenant-id> --client-id <client-id>`.",
-				"2. Run `cxp teams auth` in a foreground terminal and finish the Microsoft device login (Teams read, send, meeting chats and file upload).",
+				"1. Configure your tenant and Teams Graph client IDs with `cxp teams auth config --tenant-id <tenant-id> --read-client-id <read-client-id> --client-id <write-client-id>`.",
+				"2. Run `cxp teams auth read` and `cxp teams auth full` in a foreground terminal when the read and write client IDs differ. If they match, run `cxp teams auth full` once.",
 				"3. Run `cxp teams doctor --live` to verify Graph access for your account.",
 				"4. Run `cxp teams service doctor` to check the background service backend for this platform.",
 				"5. Start the helper with `cxp teams run`; where supported it installs and starts the background service, which keeps the helper running after the terminal closes. The helper creates this machine's control chat when it first starts.",
@@ -101,14 +101,14 @@ func newTeamsSetupCmd() *cobra.Command {
 	}
 }
 
-// Auth: one delegated token for everything the helper does.
+// Auth uses a full delegated token for Graph writes and an optional read token.
 
 func newTeamsAuthCmd(root *rootOptions) *cobra.Command {
 	var force bool
 	cmd := &cobra.Command{
 		Use:   "auth",
 		Short: "Sign in to Microsoft Graph for Teams chat access",
-		Long:  "Sign in to Microsoft Graph with a device code (in a foreground terminal). One delegated token covers reading and sending chat messages, meeting chats and file uploads.",
+		Long:  "Sign in to Microsoft Graph with a device code in a foreground terminal. The full token handles writes. An optional read token handles Graph reads.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runTeamsAuthLogin(cmd, root, force)
@@ -125,7 +125,7 @@ func newTeamsAuthCmd(root *rootOptions) *cobra.Command {
 		},
 	}
 	login.Flags().BoolVar(&force, "force", false, "Force a fresh device-code login")
-	cmd.AddCommand(login, newTeamsAuthConfigCmd(), newTeamsAuthStatusCmd(), newTeamsLogoutCmd())
+	cmd.AddCommand(login, newTeamsAuthReadCmd(root), newTeamsAuthConfigCmd(), newTeamsAuthStatusCmd(), newTeamsAuthReadStatusCmd(), newTeamsLogoutCmd(), newTeamsAuthReadLogoutCmd())
 	return cmd
 }
 
@@ -134,6 +134,18 @@ func runTeamsAuthLogin(cmd *cobra.Command, root *rootOptions, force bool) error 
 	if err != nil {
 		return err
 	}
+	return runTeamsAuthLoginWithConfig(cmd, root, force, cfg, "Authenticated as")
+}
+
+func runTeamsAuthReadLogin(cmd *cobra.Command, root *rootOptions, force bool) error {
+	cfg, err := chteams.ResolveReadAuthConfig("")
+	if err != nil {
+		return err
+	}
+	return runTeamsAuthLoginWithConfig(cmd, root, force, cfg, "Authenticated read access as")
+}
+
+func runTeamsAuthLoginWithConfig(cmd *cobra.Command, root *rootOptions, force bool, cfg chteams.AuthConfig, label string) error {
 	lease, err := newTeamsGraphHTTPClientLease(cmd.Context(), root, cmd.ErrOrStderr())
 	if err != nil {
 		return err
@@ -155,13 +167,27 @@ func runTeamsAuthLogin(cmd *cobra.Command, root *rootOptions, force bool) error 
 		return err
 	}
 	lease.RetireSuspects(ctx, cmd.ErrOrStderr())
-	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Authenticated as %s\n", name)
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s %s\n", label, name)
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Token cache: %s\n", cfg.CachePath)
 	return nil
 }
 
+func newTeamsAuthReadCmd(root *rootOptions) *cobra.Command {
+	var force bool
+	cmd := &cobra.Command{
+		Use:   "read",
+		Short: "Sign in to Microsoft Graph for Teams reads",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runTeamsAuthReadLogin(cmd, root, force)
+		},
+	}
+	cmd.Flags().BoolVar(&force, "force", false, "Force a fresh device-code login")
+	return cmd
+}
+
 func newTeamsAuthConfigCmd() *cobra.Command {
-	var tenantID, clientID, scopes string
+	var tenantID, clientID, readClientID, scopes, readScopes string
 	cmd := &cobra.Command{
 		Use:   "config",
 		Short: "Configure local Teams Graph tenant and client IDs",
@@ -181,8 +207,14 @@ func newTeamsAuthConfigCmd() *cobra.Command {
 					set["client_id"] = clientID
 				}
 			}
+			if cmd.Flags().Changed("read-client-id") {
+				set["read_client_id"] = readClientID
+			}
 			if cmd.Flags().Changed("scopes") {
 				set["scopes"] = scopes
+			}
+			if cmd.Flags().Changed("read-scopes") {
+				set["read_scopes"] = readScopes
 			}
 			if len(set) > 0 {
 				if err := writeTeamsAuthConfig(path, set); err != nil {
@@ -198,6 +230,14 @@ func newTeamsAuthConfigCmd() *cobra.Command {
 				return nil
 			}
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Tenant ID: configured")
+			readCfg, readErr := chteams.ResolveReadAuthConfig("")
+			if readErr == nil {
+				if readCfg.ClientID == cfg.ClientID {
+					_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Read client ID: using full client")
+				} else {
+					_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Read client ID: configured")
+				}
+			}
 			_, _ = fmt.Fprintln(cmd.OutOrStdout(), "Client ID: configured")
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Scopes: %s\n", cfg.Scopes)
 			return nil
@@ -207,13 +247,15 @@ func newTeamsAuthConfigCmd() *cobra.Command {
 	cmd.Flags().StringVar(&clientID, "client-id", "", "Public client id of the Teams Graph app")
 	cmd.Flags().StringVar(&clientID, "full-client-id", "", "Alias for --client-id")
 	cmd.Flags().StringVar(&clientID, "chat-client-id", "", "Alias for --client-id")
+	cmd.Flags().StringVar(&readClientID, "read-client-id", "", "Public client id for Teams Graph reads; defaults to --client-id")
 	cmd.Flags().StringVar(&scopes, "scopes", "", "Override the delegated Graph scopes")
+	cmd.Flags().StringVar(&readScopes, "read-scopes", "", "Override the delegated Graph read scopes")
 	_ = cmd.Flags().MarkHidden("full-client-id")
 	_ = cmd.Flags().MarkHidden("chat-client-id")
 	return cmd
 }
 
-// writeTeamsAuthConfig sets tenant_id and full.client_id/scopes in
+// writeTeamsAuthConfig sets tenant_id and read/full client IDs and scopes in
 // teams-auth.json, keeping every other field (profiles, settings of
 // earlier releases) as it is.
 func writeTeamsAuthConfig(path string, set map[string]string) error {
@@ -241,6 +283,21 @@ func writeTeamsAuthConfig(path string, set map[string]string) error {
 	}
 	if len(full) > 0 {
 		doc["full"], _ = json.Marshal(full)
+	}
+	read := map[string]json.RawMessage{}
+	if raw, ok := doc["read"]; ok {
+		if err := json.Unmarshal(raw, &read); err != nil {
+			return fmt.Errorf("read Teams auth config %s: %w", path, err)
+		}
+	}
+	for _, k := range []string{"read_client_id", "read_scopes"} {
+		if v, ok := set[k]; ok {
+			field := strings.TrimPrefix(k, "read_")
+			read[field], _ = json.Marshal(strings.TrimSpace(v))
+		}
+	}
+	if len(read) > 0 {
+		doc["read"], _ = json.Marshal(read)
 	}
 	raw, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
@@ -278,6 +335,23 @@ func newTeamsAuthStatusCmd() *cobra.Command {
 	}
 }
 
+func newTeamsAuthReadStatusCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "read-status",
+		Short: "Show the local Teams read sign-in state (never the token)",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			cfg, err := chteams.ResolveReadAuthConfig("")
+			if err != nil {
+				return err
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams read auth: %s\n", teamsTokenCacheStatus(cfg.CachePath, time.Now()))
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Read token cache: %s\n", cfg.CachePath)
+			return nil
+		},
+	}
+}
+
 func newTeamsLogoutCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:     "logout",
@@ -303,6 +377,41 @@ func newTeamsLogoutCmd() *cobra.Command {
 				return err
 			}
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Removed Teams token cache: %s\n", cfg.CachePath)
+			return nil
+		},
+	}
+}
+
+func newTeamsAuthReadLogoutCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "read-logout",
+		Short: "Remove the local Teams read token cache",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			readCfg, err := chteams.ResolveReadAuthConfig("")
+			if err != nil {
+				return err
+			}
+			fullCfg, err := chteams.ResolveAuthConfig("")
+			if err != nil {
+				return err
+			}
+			if filepath.Clean(readCfg.CachePath) == filepath.Clean(fullCfg.CachePath) {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams read auth uses the full token cache: %s\n", readCfg.CachePath)
+				return nil
+			}
+			if tok, err := chteams.ReadTokenCache(readCfg.CachePath); err == nil && tok.AccessToken == "" && tok.RefreshToken == "" {
+				return fmt.Errorf("%s does not look like a Teams token cache; not removed", readCfg.CachePath)
+			} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("%v; not removed (it does not look like a Teams token cache)", err)
+			}
+			if err := os.Remove(readCfg.CachePath); errors.Is(err, os.ErrNotExist) {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams read token cache already absent: %s\n", readCfg.CachePath)
+				return nil
+			} else if err != nil {
+				return err
+			}
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Removed Teams read token cache: %s\n", readCfg.CachePath)
 			return nil
 		},
 	}
@@ -600,12 +709,16 @@ func defaultRunTeamsDoctorLiveCheck(cmd *cobra.Command, root *rootOptions) error
 		_, _ = fmt.Fprintf(out, "Graph auth: not configured (%v)\n", err)
 		return err
 	}
+	readCfg, err := chteams.ResolveReadAuthConfig("")
+	if err != nil {
+		return fmt.Errorf("Teams read auth: %w", err)
+	}
 	lease, err := newTeamsGraphHTTPClientLease(cmd.Context(), root, cmd.ErrOrStderr())
 	if err != nil {
 		return err
 	}
 	defer func() { _ = lease.Close(context.Background()) }()
-	ch, err := chteams.New(chteams.Config{HTTP: lease.Client, Tokens: chteams.NewDelegatedAuth(cfg, lease.Client), TenantID: cfg.TenantID})
+	ch, err := chteams.New(teamsNewCoreChannelConfig(lease.Client, cfg, readCfg))
 	if err != nil {
 		return err
 	}

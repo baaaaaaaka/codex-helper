@@ -64,8 +64,10 @@ temporary `go run` binary.
 
 ## 3. Configure And Sign In
 
-The interactive setup script asks for the tenant ID and client ID, signs in,
-verifies the local token cache, and bootstraps the background service:
+The interactive setup script asks for the tenant ID and write client ID. You
+can also pass a separate read client ID with `--read-client-id` (or
+`-ReadClientId` on PowerShell). It signs in to both clients only when their IDs
+differ, verifies the caches, and bootstraps the background service:
 
 Linux, macOS, or WSL:
 
@@ -86,23 +88,29 @@ To do the same steps by hand:
 ```sh
 codex-proxy teams auth config \
   --tenant-id "<tenant-id>" \
+  --read-client-id "<read-client-id>" \
   --client-id "<teams-graph-public-client-id>"
-codex-proxy teams auth
-codex-proxy teams auth status
+codex-proxy teams auth read
+codex-proxy teams auth full
+codex-proxy teams auth read-status
+codex-proxy teams auth full-status
 ```
 
-`teams auth` prints a Microsoft device login URL and code. Open the URL, enter
-the code, and complete SSO and MFA. One delegated token covers everything the
-helper does: reading and sending chat messages, meeting chats, and file
-uploads. `--scopes` on `teams auth config` overrides the delegated scopes when
-your tenant needs a different set.
+`teams auth read` and `teams auth full` print Microsoft device login URLs and
+codes. Open each URL, enter the code, and complete SSO and MFA. The read token
+handles idempotent Graph reads. The full token handles Graph writes and all
+operations that need write scopes. If both client IDs match, configure that ID
+for both and run only `codex-proxy teams auth full`. `--read-scopes` and
+`--scopes` override the respective delegated scopes when your tenant needs a
+different set.
 
 The helper creates standalone online meetings only as chat carriers; it does
 not add calendar entries for normal use.
 
 Token caches are local secrets. They are stored under the user cache directory
 with private file permissions. Do not copy them to another machine and do not
-commit them. `codex-proxy teams auth logout` removes the local cache.
+commit them. `codex-proxy teams auth logout` removes the full cache;
+`codex-proxy teams auth read-logout` removes the separate read cache.
 
 ## 4. Verify
 

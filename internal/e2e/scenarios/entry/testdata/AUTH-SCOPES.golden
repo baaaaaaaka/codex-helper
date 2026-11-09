@@ -16,11 +16,13 @@ $ cxp teams auth config
    exit 0
    stdout| Teams auth config: <root>/home/.config/codex-helper/teams-auth.json
    stdout| Tenant ID: configured
+   stdout| Read client ID: configured
    stdout| Client ID: configured
    stdout| Scopes: openid profile offline_access User.Read Chat.ReadWrite Mail.Read Sites.FullControl.All
 $ cxp teams auth config --scopes 
    exit 0
    stdout| Saved Teams auth config: <root>/home/.config/codex-helper/teams-auth.json
    stdout| Tenant ID: configured
+   stdout| Read client ID: configured
    stdout| Client ID: configured
    stdout| Scopes: openid profile offline_access User.Read Chat.ReadWrite OnlineMeetings.ReadWrite Files.ReadWrite

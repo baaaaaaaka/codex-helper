@@ -1280,6 +1280,19 @@ func defaultTeamsServiceAuthPreflight() error {
 	if tok.RefreshToken == "" {
 		return fmt.Errorf("Teams sign-in is not ready for the background service; run `cxp teams auth login` in a foreground terminal first")
 	}
+	readCfg, err := chteams.ResolveReadAuthConfig("")
+	if err != nil {
+		return err
+	}
+	if filepath.Clean(readCfg.CachePath) != filepath.Clean(cfg.CachePath) {
+		readTok, err := chteams.ReadTokenCache(readCfg.CachePath)
+		if err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("Teams read sign-in cache is not usable for the background service: %w; run `cxp teams auth read --force` in a foreground terminal first", err)
+		}
+		if readTok.RefreshToken == "" {
+			return fmt.Errorf("Teams read sign-in is not ready for the background service; run `cxp teams auth read` in a foreground terminal first")
+		}
+	}
 	return nil
 }
 
@@ -3167,6 +3180,7 @@ func normalizeTeamsServicePathEnvironment(env map[string]string, invocationDir s
 		"CODEX_HELPER_CONFIG",
 		"CODEX_HELPER_TEAMS_AUTH_CONFIG",
 		"CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE",
+		"CODEX_HELPER_TEAMS_READ_TOKEN_CACHE",
 		envTeamsASRLlamaModel,
 		envTeamsASRLlamaMMProj,
 		update.EnvInstallPath,
@@ -3440,6 +3454,10 @@ func teamsServiceEnvironmentAllowlist() []string {
 		"CODEX_HELPER_TEAMS_FULL_CLIENT_ID",
 		"CODEX_HELPER_TEAMS_FULL_SCOPES",
 		"CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE",
+		"CODEX_HELPER_TEAMS_READ_TENANT_ID",
+		"CODEX_HELPER_TEAMS_READ_CLIENT_ID",
+		"CODEX_HELPER_TEAMS_READ_SCOPES",
+		"CODEX_HELPER_TEAMS_READ_TOKEN_CACHE",
 		"CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES",
 		update.EnvRepo,
 		update.EnvInstallPath,

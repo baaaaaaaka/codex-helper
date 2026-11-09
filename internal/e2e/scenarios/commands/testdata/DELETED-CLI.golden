@@ -1,4 +1,4 @@
-# DELETED-CLI: `cxp teams recover|probe-chat|drain`, `auth read|file-write`, `path mode captured-terminal|service`: unknown, non-zero exit; kept `path mode account-default` works
+# DELETED-CLI: `cxp teams recover|probe-chat|drain`, `auth file-write`, `path mode captured-terminal|service`: unknown; auth read commands work; kept `path mode account-default` works
 # cxp black-box transcript; volatile values are numbered placeholders
 
 == cli
@@ -11,21 +11,23 @@ $ cxp teams probe-chat
 $ cxp teams drain
    exit 1
    stderr| Error: unknown command "drain" for "cxp teams"
-$ cxp teams auth read
-   exit 1
-   stderr| Error: unknown command "read" for "cxp teams auth"
 $ cxp teams auth file-write
    exit 1
    stderr| Error: unknown command "file-write" for "cxp teams auth"
-$ cxp teams auth read-status
-   exit 1
-   stderr| Error: unknown command "read-status" for "cxp teams auth"
 $ cxp teams path mode captured-terminal
    exit 1
    stderr| Error: unknown Teams Codex PATH mode "captured-terminal"
 $ cxp teams path mode service
    exit 1
    stderr| Error: unknown Teams Codex PATH mode "service"
+$ cxp teams auth read
+   exit 0
+   stdout| Authenticated read access as E2E Owner
+   stdout| Token cache: <root>/home/.local/state/e2e-tokens/teams-read-token.json
+$ cxp teams auth read-status
+   exit 0
+   stdout| Teams read auth: logged in (access token valid for 2h0m0s)
+   stdout| Read token cache: <root>/home/.local/state/e2e-tokens/teams-read-token.json
 $ cxp teams path mode account-default
    exit 0
    stdout| Teams Codex PATH mode: account-default

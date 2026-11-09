@@ -3173,6 +3173,61 @@ func TestTeamsServiceAuthPreflightRequiresForegroundLogin(t *testing.T) {
 	}
 }
 
+func TestTeamsServiceAuthPreflightRequiresBothSplitCaches(t *testing.T) {
+	lockCLITestHooks(t)
+	tmp := t.TempDir()
+	isolateTeamsUserDirsForTest(t, tmp)
+	fullCache := filepath.Join(tmp, "full-token.json")
+	readCache := filepath.Join(tmp, "read-token.json")
+	t.Setenv("CODEX_HELPER_TEAMS_FULL_TENANT_ID", "")
+	t.Setenv("CODEX_HELPER_TEAMS_FULL_CLIENT_ID", "write-client")
+	t.Setenv("CODEX_HELPER_TEAMS_FULL_SCOPES", "")
+	t.Setenv("CODEX_HELPER_TEAMS_READ_CLIENT_ID", "read-client")
+	t.Setenv("CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE", fullCache)
+	t.Setenv("CODEX_HELPER_TEAMS_READ_TOKEN_CACHE", readCache)
+	if err := os.WriteFile(fullCache, []byte(`{"refresh_token":"full-refresh"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := defaultTeamsServiceAuthPreflight(); err == nil || !strings.Contains(err.Error(), "teams auth read") {
+		t.Fatalf("missing read cache error = %v, want read login instruction", err)
+	}
+	if err := os.WriteFile(readCache, []byte(`{"refresh_token":"read-refresh"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := defaultTeamsServiceAuthPreflight(); err != nil {
+		t.Fatalf("valid split caches rejected: %v", err)
+	}
+}
+
+func TestTeamsServiceCarriesReadAuthEnvironment(t *testing.T) {
+	tmp := t.TempDir()
+	for key, value := range map[string]string{
+		"CODEX_HELPER_TEAMS_READ_TENANT_ID":   "read-tenant",
+		"CODEX_HELPER_TEAMS_READ_CLIENT_ID":   "read-client",
+		"CODEX_HELPER_TEAMS_READ_SCOPES":      "User.Read Chat.Read Files.Read",
+		"CODEX_HELPER_TEAMS_READ_TOKEN_CACHE": "./read-token.json",
+	} {
+		t.Setenv(key, value)
+	}
+	env, err := teamsServiceEnvironmentForWorkingDir(tmp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := normalizeTeamsServicePathEnvironment(env, tmp); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]string{
+		"CODEX_HELPER_TEAMS_READ_TENANT_ID":   "read-tenant",
+		"CODEX_HELPER_TEAMS_READ_CLIENT_ID":   "read-client",
+		"CODEX_HELPER_TEAMS_READ_SCOPES":      "User.Read Chat.Read Files.Read",
+		"CODEX_HELPER_TEAMS_READ_TOKEN_CACHE": filepath.Join(tmp, "read-token.json"),
+	} {
+		if env[key] != want {
+			t.Errorf("service env %s = %q, want %q", key, env[key], want)
+		}
+	}
+}
+
 func TestTeamsServiceStartRequiresAuthPreflight(t *testing.T) {
 	lockCLITestHooks(t)
 
@@ -6280,6 +6335,7 @@ func TestTeamsServiceInstallPreservesScopedEnvironment(t *testing.T) {
 		"Environment=" + systemdQuoteArg(appdirs.EnvStateDir+"="+filepath.Join(tmp, "state root")),
 		"Environment=" + systemdQuoteArg("CODEX_HELPER_TEAMS_PROFILE=work-profile"),
 		"Environment=" + systemdQuoteArg("CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE="+filepath.Join(tmp, "token.json")),
+		"Environment=" + systemdQuoteArg("CODEX_HELPER_TEAMS_READ_TOKEN_CACHE="+filepath.Join(tmp, "read-token.json")),
 		"Environment=" + systemdQuoteArg(envTeamsASRCommand+"="+filepath.Join(tmp, "bin", "teams-asr")),
 		"Environment=" + systemdQuoteArg(envTeamsASRArgsJSON+`=["--input={input}","--threads={threads}"]`),
 		"Environment=" + systemdQuoteArg(envTeamsASRLlamaBinary+"="+filepath.Join(tmp, "bin", "llama-mtmd-cli")),
@@ -6293,11 +6349,6 @@ func TestTeamsServiceInstallPreservesScopedEnvironment(t *testing.T) {
 	} {
 		if !strings.Contains(unit, want) {
 			t.Fatalf("unit missing preserved env %q:\n%s", want, unit)
-		}
-	}
-	for _, gone := range []string{"CODEX_HELPER_TEAMS_READ_TOKEN_CACHE"} {
-		if strings.Contains(unit, gone) {
-			t.Fatalf("unit carries the removed setting %s:\n%s", gone, unit)
 		}
 	}
 }

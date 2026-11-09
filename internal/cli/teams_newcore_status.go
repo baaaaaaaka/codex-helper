@@ -97,6 +97,12 @@ func printTeamsCoreStatus(out io.Writer, now time.Time) error {
 		_, _ = fmt.Fprintf(out, "Auth: not ready (%v)\n", err)
 	default:
 		_, _ = fmt.Fprintf(out, "Auth: %s\n", teamsTokenCacheStatus(cfg.CachePath, now))
+		readCfg, readErr := chteams.ResolveReadAuthConfig("")
+		if readErr != nil {
+			_, _ = fmt.Fprintf(out, "Read auth: not ready (%v)\n", readErr)
+		} else if filepath.Clean(readCfg.CachePath) != filepath.Clean(cfg.CachePath) {
+			_, _ = fmt.Fprintf(out, "Read auth: %s\n", teamsTokenCacheStatus(readCfg.CachePath, now))
+		}
 	}
 	writeTeamsCoreStoreStatus(out, now)
 	return nil

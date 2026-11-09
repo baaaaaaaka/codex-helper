@@ -1,5 +1,5 @@
 // Package teams is the Microsoft Teams adapter of the channel boundary,
-// talking to Microsoft Graph with one delegated user token.
+// talking to Microsoft Graph with delegated user tokens.
 //
 // The helper posts as the signed-in user, so its own messages come back in
 // Receive (Caps.SelfEcho) and are recognised by the core through the outbox
@@ -23,12 +23,14 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/channel"
 )
 
-// Config configures an Adapter. Only Tokens is required.
+// Config configures an Adapter. Tokens is required; ReadTokens is optional.
 type Config struct {
 	GraphURL string       // default https://graph.microsoft.com/v1.0
 	HTTP     *http.Client // default: no client-wide timeout; each request gets RequestTimeout or TransferTimeout
 	Tokens   TokenSource
-	TenantID string // for chat links
+	// ReadTokens handles idempotent Graph reads. Nil reuses Tokens.
+	ReadTokens TokenSource
+	TenantID   string // for chat links
 
 	// Math renders TeX to PNG. nil renders every formula as a code block.
 	Math MathRenderer
@@ -120,7 +122,7 @@ func New(cfg Config) (*Adapter, error) {
 	if cfg.Sleep == nil {
 		cfg.Sleep = sleepCtx
 	}
-	return &Adapter{cfg: cfg, g: &graph{base: base, http: cfg.HTTP, tokens: cfg.Tokens, sleep: cfg.Sleep, timeout: cfg.RequestTimeout, transfer: cfg.TransferTimeout}}, nil
+	return &Adapter{cfg: cfg, g: &graph{base: base, http: cfg.HTTP, tokens: cfg.Tokens, readTokens: cfg.ReadTokens, sleep: cfg.Sleep, timeout: cfg.RequestTimeout, transfer: cfg.TransferTimeout}}, nil
 }
 
 func (a *Adapter) Caps() channel.Caps {
