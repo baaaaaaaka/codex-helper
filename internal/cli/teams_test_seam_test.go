@@ -56,12 +56,14 @@ func TestTeamsTestSeamTimingProfiles(t *testing.T) {
 	if got, rate := s.timing(); got != engine.ProductionTiming() || rate != 0 {
 		t.Fatalf("default timing = %+v rate %v, want production", got, rate)
 	}
-	s, err = parseTeamsTestSeam("endpoint=http://[::1]:1234; timing=fast:250ms; timing.SilenceHint=3s; timing.RefusalRecheck=500ms")
+	s, err = parseTeamsTestSeam("endpoint=http://[::1]:1234; timing=fast:250ms; timing.SilenceHint=3s; timing.SilenceRepeat=5s; timing.SilenceCancelHint=7s; timing.RefusalRecheck=500ms")
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := engine.FastTiming(250 * time.Millisecond)
 	want.SilenceHint = 3 * time.Second
+	want.SilenceRepeat = 5 * time.Second
+	want.SilenceCancelHint = 7 * time.Second
 	if got, rate := s.timing(); got != want || rate != 16 {
 		t.Fatalf("fast timing = %+v rate %v, want %+v rate 16", got, rate, want)
 	}

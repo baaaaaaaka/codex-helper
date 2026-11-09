@@ -37,6 +37,14 @@ func (t *Tx) Delivered(prefix string) (bool, error) {
 	return hit != 0, err
 }
 
+// SentUnder reports whether a row under prefix has a confirmed external id.
+func (t *Tx) SentUnder(prefix string) (bool, error) {
+	var hit bool
+	err := t.row(`SELECT EXISTS(SELECT 1 FROM outbox WHERE delivery_key>=? AND delivery_key<?
+AND state='sent' AND ext_msg_id IS NOT NULL AND ext_msg_id<>'')`, prefix, prefix+"\U0010FFFF").Scan(&hit)
+	return hit, err
+}
+
 // DroppedUnder reports whether an outbox row whose delivery key starts with
 // prefix was dropped (never confirmed delivered). kinds, when given, limits
 // the rows considered to those kinds.
@@ -167,6 +175,16 @@ WHERE conv_id = ? AND sender = 'owner' AND kind IN ('prompt','command') ORDER BY
 func (t *Tx) RecentSent(convID int64, limit int) ([]Outbox, error) {
 	return collect(scanOutbox)(t.rows(`SELECT `+outboxCols+` FROM outbox
 WHERE conv_id = ? AND state = 'sent' ORDER BY seq DESC LIMIT ?`, convID, limit))
+}
+
+// LatestQuestionMarkerMessage returns the newest sent Codex output or
+// published native question message in a conversation.
+func (t *Tx) LatestQuestionMarkerMessage(convID int64) (Outbox, bool, error) {
+	return one(t.row(`SELECT `+outboxCols+` FROM outbox
+WHERE conv_id=? AND state='sent' AND ext_msg_id IS NOT NULL AND ext_msg_id<>''
+AND (kind IN ('progress','final') OR (kind='mirror' AND (body LIKE '%<strong>🤖 ✅ Codex answer:%' OR body LIKE '%<strong>🤖 ⏳ Codex status:%'))
+ OR (kind='notice' AND delivery_key LIKE 'question:%'))
+ORDER BY seq DESC LIMIT 1`, convID), scanOutbox)
 }
 
 // PendingOutboxConvs lists the conversations with outbox rows still to

@@ -70,6 +70,19 @@ func TestAnEditWaitingForAReadGoesBeforeTheBackgroundReads(t *testing.T) {
 	}
 }
 
+func TestQueueEditLastMovesMarkerBehindMessageStatusEdit(t *testing.T) {
+	e := priorityEngine()
+	e.queueEdit(5, chatEdit{key: "question-marker", what: "old marker"})
+	e.queueEdit(5, chatEdit{key: "question:1", what: "question status"})
+	e.queueEditLast(5, chatEdit{key: "question-marker", what: "refreshed marker"})
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	queue := e.edits[5]
+	if len(queue) != 2 || queue[0].key != "question:1" || queue[1].key != "question-marker" || queue[1].what != "refreshed marker" {
+		t.Fatalf("edit order after refresh: %+v", queue)
+	}
+}
+
 // An edit deferred because its read could not get a token in time is not
 // a failed try: it is tried again with backoff for editDeferFor, also
 // after more deferrals than editTries, and dropped only then.

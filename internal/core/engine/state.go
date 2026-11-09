@@ -112,8 +112,7 @@ type convState struct {
 	// sender
 	sending        bool
 	lastSend       time.Time
-	lastVisible    time.Time // last confirmed Codex content, independent of native activity
-	transcriptOpen bool      // finish an accepted native execution even if its chat closes
+	transcriptOpen bool // finish an accepted native execution even if its chat closes
 }
 
 type recentPrompt struct {

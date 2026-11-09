@@ -401,13 +401,17 @@ func (e *Engine) cmdWake(j cmdJob, arg string) {
 		return
 	}
 	e.mu.Lock()
-	state, label := target.state, target.label
+	state, label, url := target.state, target.label, target.url
 	e.mu.Unlock()
 	if state != store.ConvParked {
 		e.reply(j, label+" is "+state+"; nothing to wake.", nil)
 		return
 	}
-	e.reply(j, "Resumed "+label+": its chat is read again.", func(tx *store.Tx) error {
+	message := "Resumed " + label + ": its chat is read again."
+	if url != "" {
+		message = fmt.Sprintf("Resumed %s.\n\nOpen Work chat: %s\n\nMessages in that chat will be read again.", label, url)
+	}
+	e.reply(j, message, func(tx *store.Tx) error {
 		if err := tx.Wake(target.id); err != nil {
 			return err
 		}

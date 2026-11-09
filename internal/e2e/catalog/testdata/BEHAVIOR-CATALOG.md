@@ -161,7 +161,7 @@ Columns: id · status (`keep` / `removed-by-owner` / `ask-owner`, with the owner
 | F-TRN-15 | keep | runner.go progress streaming; stream reconnect status (v0.1.20 text, once per 5 min per turn): core/codex/turn.go:146 + retry.go `parseRetry`, engine/runner.go:379 `Retrying`, render.go `textReconnecting` | R-20-33, B-5, RETRY-STATUS, TURN-UNPHASED, TURN-PROGRESS-INTEGRITY | same |
 | F-TRN-16 | keep | core/engine/setuperr.go:19 `setupClass` (Node.js missing, config route, launch failure), :42 `textNotStartedTurn` / :69 `textFailedTurn` (v0.1.20 missingNodeRuntime / codexConfiguration / infraLaunchFailure notices + "Diagnostic for the admin"), used by runner.go:541/:567; core/codex/server.go:110 keeps the app-server's start-up stderr tail so the class is visible; never retried automatically | SETUP-ERR | SPEC text "⚠️ I couldn't start Codex due to a setup issue on my side…"; no auth-specific class (v0.1.20 had none) |
 | F-TRN-17 | keep (Q-19 default: keep `pause/resume`, drain internal; coordinator ruling batch G: hidden aliases of `teams stop/start`) | cli/teams_stop.go:105 `teams pause [reason]` (hidden alias of `teams stop`), :120 `teams resume` (hidden alias of `teams start`); the reason is accepted, not kept; `drain` stays removed | PAUSE-ALIAS | v0.1.20 `teams pause/resume/drain` (pause = kill switch now: it stops reading instead of deferring) |
-| F-TRN-18 | keep | core/engine/silence.go:16 `watchSilence`: hints at SilenceHint / SilenceStuck (:137 v0.1.20 "…It may be stuck. I will not retry automatically…" text), never stops a silent turn (StallLimit removed; coordinator ruling: match v0.1.20) | SILENCE | v0.1.20 never killed (B:92-99) |
+| F-TRN-18 | keep | core/engine/silence.go `watchSilence`: activity-based notices start at SilenceHint, repeat at SilenceRepeat, add cancel guidance at SilenceCancelHint, and use stuck wording from SilenceStuck; never stops a silent turn | SILENCE | v0.1.20 never killed (B:92-99) |
 | F-TRN-19 | removed-by-owner (beacon) | n/a | n/a | — |
 | F-MIR-1 | keep | mirror.go:288 detection | R-9-10 | "Local Codex chat detected" per 11-05 |
 | F-MIR-2 | keep | mirror.go | R-9-10 | same |
@@ -720,9 +720,9 @@ Send `helper help advanced` for retry, cancel, and rename commands.
 - Start notice (`formatQueuedTurnStartNotice` B:11702): "▶️ **Codex is starting this queued request.**\n\n**▶️ Now running:**\n<summary>\n\n---\n\n**⏳ Still queued:**\n<list|No other queued requests.>"
 
 #### 18. Long-turn hints (B:92-99, used in `sendIdleStatus` B:12037)
-- Idle status starts at 2 min and repeats every 5 min: "Still working. No new Codex update yet."
-- At ≥7 min it appends "\n\nThis is taking longer than usual. To stop the running request, send `helper cancel running` in this chat."
-- At ≥15 min the message is replaced by "Codex has not produced any update for %s. It may be stuck.\n\nI will not retry automatically. To stop the running request, send `helper cancel running` in this chat." (duration such as "15m").
+- The quiet clock resets on any Codex event. The first status is due after 2 min, then every 5 min: "Still working. No new Codex update yet."
+- At ≥7 min of silence, that status appends "\n\nThis is taking longer than usual. To stop the running request, send `helper cancel running` in this chat."
+- At ≥15 min of silence the status uses "Codex has not produced any update for %s. It may be stuck.\n\nI will not retry automatically. To stop the running request, send `helper cancel running` in this chat." (duration such as "17m"). The first scheduled stuck-worded status is normally at about 17 min, because the 15 min threshold falls between the 12 and 17 min sends. Stuck-worded statuses continue every 5 min. A pending question or content/notice pauses status delivery; the helper never stops a silent turn by itself.
 
 #### 19. Coworkers and bare @codex
 - `rejectExternalWorkCommand` B:8218 @mentions the author: "Only the helper owner can run helper commands in this Work chat. Send a normal question or task here and I will pass it to Codex."

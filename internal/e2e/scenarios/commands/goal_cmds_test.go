@@ -14,14 +14,15 @@ import (
 // and pauses the Codex goal of a Work chat's thread; while the goal is
 // active every Codex status and answer carries a "🎯 Active goal:" line,
 // and every answer a "🔧 Helper: model - …, effort - …, tier - …" line,
-// both before the "finished responding" footer; `helper cancel` pauses
+// a divider separates the body and goal; both goal and model lines are
+// before the "finished responding" footer; `helper cancel` pauses
 // an active goal (Codex's interrupt does not), also when nothing of the
 // helper's runs; the Control chat refuses `helper goal`.
 func TestGoalCommands(t *testing.T) {
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "CMD-GOAL", harness.Options{
 		Guarantees: []string{"cmd-goal"},
-		Title:      "`helper goal [<objective>|active|pause]`; goal and model lines on new Codex messages; `helper cancel` pauses the goal",
+		Title:      "`helper goal [<objective>|active|pause]`; a divider separates message bodies from the active goal; `helper cancel` pauses the goal",
 		Budget:     180 * time.Second,
 	})
 	defer s.Finish()
@@ -56,6 +57,17 @@ func TestGoalCommands(t *testing.T) {
 	s.Check("with an active goal an answer has the goal line, then the model line, then the footer",
 		ok && strings.Contains(with, "🎯 Active goal: "+objective+" 🔧 Helper: model - gpt-5-codex, effort - medium, tier - standard 🔧 Helper: ✅ Codex finished responding."),
 		"goal line, model line, footer", clip(with, 400))
+	answers := s.SUTMessagesContaining(work.ID, c.Answer)
+	if ok && c.Answer != "" && len(answers) > 0 {
+		content := answers[len(answers)-1].Content
+		bodyAt, dividerAt, goalAt := strings.Index(content, c.Answer), strings.Index(content, "<hr/>"), strings.Index(content, "🎯 Active goal:")
+		s.Check("the active-goal divider follows the answer body and precedes the goal note",
+			bodyAt >= 0 && dividerAt > bodyAt && goalAt > dividerAt && strings.Count(content, "<hr/>") == 1,
+			"answer body <hr/> active goal", clip(content, 500))
+	} else {
+		s.Check("the active-goal divider follows the answer body and precedes the goal note", false,
+			"answer body <hr/> active goal", "answer message not found")
+	}
 
 	steps.MustPost(s, work.ID, "Long job "+run)
 	s.WaitCodexCalls(run, 1, steps.AnswerTimeout)

@@ -77,11 +77,13 @@ type teamsTestSeam struct {
 // fast profile. Each is a user-visible duration of the helper; the names
 // are the seam's contract (a rewrite maps them to its own settings).
 var teamsTestSeamTimingKnobs = map[string]func(*engine.Timing, time.Duration){
-	// SilenceHint, SilenceStuck: the "still working" hint and the "may be
-	// stuck" notice of a silent turn (7 min, 15 min). A silent turn is never
-	// stopped (F-TRN-18), so there is no stall knob.
-	"SilenceHint":  func(t *engine.Timing, d time.Duration) { t.SilenceHint = d },
-	"SilenceStuck": func(t *engine.Timing, d time.Duration) { t.SilenceStuck = d },
+	// SilenceHint, SilenceRepeat, SilenceCancelHint and SilenceStuck: the
+	// staged notices of a silent turn (2 min, then every 5 min; cancel guidance
+	// from 7 min; stuck wording from 15 min). It is never stopped (F-TRN-18).
+	"SilenceHint":       func(t *engine.Timing, d time.Duration) { t.SilenceHint = d },
+	"SilenceRepeat":     func(t *engine.Timing, d time.Duration) { t.SilenceRepeat = d },
+	"SilenceCancelHint": func(t *engine.Timing, d time.Duration) { t.SilenceCancelHint = d },
+	"SilenceStuck":      func(t *engine.Timing, d time.Duration) { t.SilenceStuck = d },
 	// DuplicateFor: the window in which a repeated prompt is ignored (3 min).
 	"DuplicateFor": func(t *engine.Timing, d time.Duration) { t.DuplicateFor = d },
 	// Heartbeat: the store owner's heartbeat (30 s), which bounds how soon

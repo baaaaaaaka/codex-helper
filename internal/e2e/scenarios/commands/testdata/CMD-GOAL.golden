@@ -1,4 +1,4 @@
-# CMD-GOAL: `helper goal [<objective>|active|pause]`; goal and model lines on new Codex messages; `helper cancel` pauses the goal
+# CMD-GOAL: `helper goal [<objective>|active|pause]`; a divider separates message bodies from the active goal; `helper cancel` pauses the goal
 # cxp black-box transcript; volatile values are numbered placeholders
 
 == chat <chat:1> "🏠 Codex Control - e2ehost"
@@ -161,6 +161,7 @@
 -- <msg:20> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-CMDGOAL-withgoal-4</p>
+   | <hr/>
    | <p><strong>🎯 Active goal:</strong> Ship the quarterly report E2E-CMDGOAL-objective-3</p>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
@@ -176,6 +177,7 @@
 -- <msg:23> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
    | <p>Working through the goal E2E-CMDGOAL-goalrun-1</p>
+   | <hr/>
    | <p><strong>🎯 Active goal:</strong> Ship the quarterly report E2E-CMDGOAL-objective-3</p>
 -- <msg:24> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>

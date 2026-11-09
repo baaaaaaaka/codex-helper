@@ -142,6 +142,98 @@ func TestQuestionSyncCollectsAndSubmitsOnce(t *testing.T) {
 	}
 }
 
+func TestPendingQuestionMarkerTracksLatestMessageAndRecovers(t *testing.T) {
+	if !isQuestionMarkerMessage(store.Outbox{Kind: store.OutMirror, Part: 1, Parts: 1, Body: `<strong>🤖 ✅ Codex answer:</strong>`}) ||
+		isQuestionMarkerMessage(store.Outbox{Kind: store.OutMirror, Part: 1, Parts: 1, Body: `<strong>🧑‍💻 User:</strong>`}) {
+		t.Fatal("agent mirror output should qualify; user mirror input should not")
+	}
+	r, a, work := questionRig(t)
+	r.wait("seed answer unread mark", func() bool {
+		_, n := r.ch.Unread(work)
+		return n > 0
+	})
+	_, unreadBefore := r.ch.Unread(work)
+	g := questionGroup(false, 2)
+	if err := a.emit(g); err != nil {
+		t.Fatal(err)
+	}
+	r.wait("latest question marked", func() bool {
+		marked := pendingQuestionTexts(r, work)
+		return len(marked) == 1 && strings.Contains(marked[0], "使用哪个环境？ 1")
+	})
+	r.wait("question marks chat unread once", func() bool {
+		_, n := r.ch.Unread(work)
+		return n == unreadBefore+1
+	})
+
+	// Updating the marked question body must retain the first-line marker while
+	// another question in the group remains unanswered.
+	r.ch.PostUser(work, "helper answer Q2 B")
+	r.wait("status edit keeps marker", func() bool {
+		for _, text := range pendingQuestionTexts(r, work) {
+			if strings.Contains(text, "Answer recorded") && strings.Contains(text, "使用哪个环境？ 1") {
+				return true
+			}
+		}
+		return false
+	})
+
+	r.e.mu.Lock()
+	conv := r.e.byChat[work]
+	r.e.mu.Unlock()
+	if err := r.e.update(func(tx *store.Tx) error {
+		_, err := tx.Enqueue(conv, []store.OutMsg{{DeliveryKey: "test:agent-after-question", Kind: store.OutMirror, Part: 1, Parts: 1, Body: "<strong>🤖 ✅ Codex answer:</strong>\nfollow up"}})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	r.e.wakeSender()
+	r.wait("new agent message takes marker", func() bool {
+		marked := pendingQuestionTexts(r, work)
+		return len(marked) == 1 && strings.Contains(marked[0], "follow up")
+	})
+
+	// Simulate a lost cosmetic edit. Startup must restore the one persisted
+	// target without scanning or reposting chat messages.
+	marked := pendingQuestionTexts(r, work)
+	markerID := ""
+	for _, message := range r.ch.Messages(work) {
+		if message.Text == marked[0] {
+			markerID = message.ID
+		}
+	}
+	if markerID == "" {
+		t.Fatal("could not find persisted marker target")
+	}
+	r.stop()
+	if err := r.ch.SetMessagePrefix(context.Background(), work, markerID, questionMarkerPrefix, false); err != nil {
+		t.Fatal(err)
+	}
+	r.start()
+	r.wait("marker restored after restart", func() bool {
+		marked := pendingQuestionTexts(r, work)
+		return len(marked) == 1 && strings.Contains(marked[0], "follow up")
+	})
+
+	r.ch.PostUser(work, "helper answer Q1 A")
+	r.wait("resolved group clears marker", func() bool {
+		return len(pendingQuestionTexts(r, work)) == 0 && a.nreplies() == 1
+	})
+	if _, n := r.ch.Unread(work); n != unreadBefore+1 {
+		t.Fatalf("question unread count changed after resolution: %d -> %d", unreadBefore, n)
+	}
+}
+
+func pendingQuestionTexts(r *rig, chat string) []string {
+	var out []string
+	for _, m := range r.ch.Messages(chat) {
+		if strings.HasPrefix(m.Text, questionMarkerPrefix+"\n") {
+			out = append(out, m.Text)
+		}
+	}
+	return out
+}
+
 func TestQuestionAsyncUsesNativeReplyAndSteer(t *testing.T) {
 	r, a, work := questionRig(t)
 	a.smu.Lock()

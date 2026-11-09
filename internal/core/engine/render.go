@@ -143,7 +143,7 @@ const (
 func infoNotes(info TurnInfo, answer bool) []channel.Note {
 	var out []channel.Note
 	if g := strings.TrimSpace(info.Goal); g != "" {
-		out = append(out, channel.Note{Label: labelGoal, Text: shortLine(strings.Join(strings.Fields(g), " "), goalNoteMax)})
+		out = append(out, channel.Note{Label: labelGoal, Text: shortLine(strings.Join(strings.Fields(g), " "), goalNoteMax), SeparatorBefore: true})
 	}
 	if answer && strings.TrimSpace(info.Model) != "" {
 		effort := strings.TrimSpace(info.Effort)

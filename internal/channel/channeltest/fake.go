@@ -119,6 +119,9 @@ func (f *Fake) Render(_ context.Context, doc channel.RichDoc) ([]channel.Part, e
 		body := label + ":\n" + c
 		if i == len(chunks)-1 {
 			for _, n := range doc.Notes {
+				if n.SeparatorBefore {
+					body += "\n---"
+				}
 				if n.Text != "" {
 					body += "\n" + n.Label + ": " + n.Text
 				}
@@ -219,6 +222,42 @@ func (f *Fake) Edit(_ context.Context, chatID, id string, p channel.Part, token 
 		f.seq++
 		m.Modified = f.now()
 		c.msgs = append(append(c.msgs[:i:i], c.msgs[i+1:]...), stored{seq: f.seq, msg: m})
+		return nil
+	}
+	return &channel.Rejected{Permanent: true, Err: fmt.Errorf("message %s/%s: %w", chatID, id, channel.ErrNotFound)}
+}
+
+// SetMessagePrefix updates the first line of one of this account's messages.
+func (f *Fake) SetMessagePrefix(_ context.Context, chatID, id, prefix string, present bool) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c := f.chats[chatID]
+	if c == nil {
+		return &channel.Rejected{Permanent: true, Err: fmt.Errorf("chat %s: %w", chatID, channel.ErrNotFound)}
+	}
+	for i, s := range c.msgs {
+		if s.msg.ID != id {
+			continue
+		}
+		if !s.msg.ByOwner {
+			return &channel.Rejected{Permanent: true, Err: fmt.Errorf("message %s was not posted by the owner", id)}
+		}
+		lines := strings.SplitN(s.msg.Text, "\n", 2)
+		marked := strings.TrimSpace(lines[0]) == prefix
+		if marked == present {
+			return nil
+		}
+		if present {
+			s.msg.Text = prefix + "\n" + s.msg.Text
+		} else if len(lines) == 2 {
+			s.msg.Text = lines[1]
+		} else {
+			s.msg.Text = ""
+		}
+		s.msg.Hash, s.msg.Edited = channel.TextHash(s.msg.Text), true
+		f.seq++
+		s.seq, s.msg.Modified = f.seq, f.now()
+		c.msgs = append(append(c.msgs[:i:i], c.msgs[i+1:]...), s)
 		return nil
 	}
 	return &channel.Rejected{Permanent: true, Err: fmt.Errorf("message %s/%s: %w", chatID, id, channel.ErrNotFound)}

@@ -120,7 +120,7 @@ func TestGoalAndModelLinesAndGoalCommand(t *testing.T) {
 	r.ch.PostUser(work, "first question")
 	r.wait("first answer", func() bool { return len(r.own(work, "ANSWER to first question")) == 1 })
 	ans := lastOwn(r, work, "ANSWER to first question")
-	if !strings.Contains(ans, "\n🔧 Helper: model - gpt-test, effort - high, tier - fast\n🔧 Helper: ✅ Codex finished responding.") || strings.Contains(ans, "Active goal") {
+	if !strings.Contains(ans, "\n🔧 Helper: model - gpt-test, effort - high, tier - fast\n🔧 Helper: ✅ Codex finished responding.") || strings.Contains(ans, "Active goal") || strings.Contains(ans, "\n---\n") {
 		t.Fatalf("answer without a goal: %q", ans)
 	}
 
@@ -136,15 +136,15 @@ func TestGoalAndModelLinesAndGoalCommand(t *testing.T) {
 		t.Fatalf("goal set reply: %q", m)
 	}
 
-	// Status and answer with the goal: the goal line, clipped to one
-	// line, before the model line and the footer.
+	// Status and answer with the goal: a divider separates the body from
+	// the clipped goal line, before the model line and the footer.
 	r.ag.mu.Lock()
 	r.ag.notes = []string{"looking around"}
 	r.ag.mu.Unlock()
 	r.ch.PostUser(work, "progress please")
 	r.wait("second answer", func() bool { return len(r.own(work, "ANSWER to progress please")) == 1 })
 	st := lastOwn(r, work, "looking around")
-	if !strings.Contains(st, "\n🎯 Active goal: Ship the release with every test green") || strings.Contains(st, "model - ") {
+	if !strings.Contains(st, "\n---\n🎯 Active goal: Ship the release with every test green") || strings.Contains(st, "model - ") {
 		t.Fatalf("status with a goal: %q", st)
 	}
 	ans = lastOwn(r, work, "ANSWER to progress please")
@@ -153,7 +153,7 @@ func TestGoalAndModelLinesAndGoalCommand(t *testing.T) {
 	if len([]rune(gl)) > len([]rune("🎯 Active goal: "))+goalNoteMax+1 || !strings.HasSuffix(gl, "…") {
 		t.Fatalf("goal line not clipped: %q", gl)
 	}
-	if i, j, k := strings.Index(ans, "🎯 Active goal"), strings.Index(ans, "model - gpt-test"), strings.Index(ans, "Codex finished responding"); !(i > 0 && i < j && j < k) {
+	if d, i, j, k := strings.Index(ans, "\n---\n"), strings.Index(ans, "🎯 Active goal"), strings.Index(ans, "model - gpt-test"), strings.Index(ans, "Codex finished responding"); !(d > 0 && d < i && i < j && j < k) {
 		t.Fatalf("order of the closing lines: %q", ans)
 	}
 
@@ -296,10 +296,10 @@ func TestMirroredRecordsCarryGoalAndModelLines(t *testing.T) {
 	r.wait("answer", func() bool { return len(r.own(chat, "local answer")) == 1 })
 	ans := lastOwn(r, chat, "local answer")
 	// turn_context (written by the turn) said gpt-5-codex / medium last.
-	if !strings.Contains(ans, "\n🎯 Active goal: Make the build green\n🔧 Helper: model - gpt-5-codex, effort - medium, tier - flex\n🔧 Helper: ✅ Codex finished responding.") {
+	if !strings.Contains(ans, "\n---\n🎯 Active goal: Make the build green\n🔧 Helper: model - gpt-5-codex, effort - medium, tier - flex\n🔧 Helper: ✅ Codex finished responding.") {
 		t.Fatalf("mirrored answer: %q", ans)
 	}
-	if st := lastOwn(r, chat, "local status"); !strings.Contains(st, "\n🎯 Active goal: Make the build green") || strings.Contains(st, "model - ") {
+	if st := lastOwn(r, chat, "local status"); !strings.Contains(st, "\n---\n🎯 Active goal: Make the build green") || strings.Contains(st, "model - ") {
 		t.Fatalf("mirrored status: %q", st)
 	}
 	if p := lastOwn(r, chat, "local prompt"); strings.Contains(p, "Active goal") {

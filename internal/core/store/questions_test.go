@@ -142,3 +142,36 @@ func TestQuestionsRetentionKeepsQueuedReplyProvenance(t *testing.T) {
 		return nil
 	}))
 }
+
+func TestPendingQuestionConversations(t *testing.T) {
+	s, _ := openTest(t)
+	blocking, async, resolved := newWork(t, s, "blocking"), newWork(t, s, "async"), newWork(t, s, "resolved")
+	mustT(t, s.Update(func(tx *Tx) error {
+		for _, g := range []QuestionGroup{
+			{Key: "blocking", ConvID: blocking, Questions: []Question{{NativeID: "b", Title: "Blocking"}}},
+			{Key: "async", ConvID: async, Async: true, Questions: []Question{{NativeID: "a", Title: "Async"}}},
+			{Key: "resolved", ConvID: resolved, Questions: []Question{{NativeID: "r", Title: "Resolved"}}},
+		} {
+			if _, err := tx.AddQuestionGroup(g); err != nil {
+				return err
+			}
+		}
+		if err := tx.SetQuestionState("resolved", "resolved"); err != nil {
+			return err
+		}
+		convs, err := tx.PendingQuestionConversations()
+		if err != nil || len(convs) != 2 || convs[0] != blocking || convs[1] != async {
+			t.Fatalf("pending conversations %v, %v", convs, err)
+		}
+		if yes, err := tx.HasPendingQuestion(blocking); err != nil || !yes {
+			t.Fatalf("blocking pending %v, %v", yes, err)
+		}
+		if err := tx.RecordQuestionAnswer(1, 0, "A", false); err != nil {
+			return err
+		}
+		if yes, err := tx.HasPendingQuestion(blocking); err != nil || yes {
+			t.Fatalf("answered question pending %v, %v", yes, err)
+		}
+		return nil
+	}))
+}

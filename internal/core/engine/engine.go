@@ -59,10 +59,11 @@ type Timing struct {
 	DuplicateFor    time.Duration // duplicate prompt guard
 	BreakerWindow   time.Duration
 	BreakerCount    int
-	// R-19: hints after this much Codex silence in a running turn (0
-	// disables each). A silent turn is never stopped (F-TRN-18).
-	SilenceHint, SilenceStuck time.Duration
-	SilenceRepeat             time.Duration // repeated visible still-working hint; 0 disables repetition
+	// R-19: notices after this much Codex silence in a running turn (0
+	// disables each threshold). Notices repeat at SilenceRepeat; a silent
+	// turn is never stopped (F-TRN-18).
+	SilenceHint, SilenceCancelHint, SilenceStuck time.Duration
+	SilenceRepeat                                time.Duration // 0 disables repetition
 	// R-35: reminder cadence for a turn that stays queued (0 disables).
 	QueueReminder time.Duration
 	// ThrottleFloor is the wait after a throttle response that names no
@@ -95,7 +96,8 @@ func ProductionTiming() Timing {
 		ResolveDelay: 5 * time.Second, ResolveTries: 3, ResolveAbsent: 2 * time.Minute, CapacityRetry: 5 * time.Minute, CapacityBackoff: 10 * time.Second,
 		Heartbeat: 30 * time.Second, Maintenance: time.Minute, ChatRate: time.Second,
 		DuplicateFor: 3 * time.Minute, BreakerWindow: time.Minute, BreakerCount: 3,
-		SilenceHint: 2 * time.Minute, SilenceRepeat: 5 * time.Minute, SilenceStuck: 15 * time.Minute,
+		SilenceHint: 2 * time.Minute, SilenceRepeat: 5 * time.Minute,
+		SilenceCancelHint: 7 * time.Minute, SilenceStuck: 15 * time.Minute,
 		QueueReminder: 10 * time.Minute,
 		ThrottleFloor: 10 * time.Second,
 		PaceIncrease:  30 * time.Second,
@@ -323,6 +325,7 @@ type Engine struct {
 	fatalOnce       sync.Once
 	questionMu      sync.Mutex
 	questionWaiting map[int64]bool
+	questionPending map[int64]bool
 	fatal           error
 	cancel          context.CancelFunc
 	wg              sync.WaitGroup
@@ -552,6 +555,7 @@ func (e *Engine) Run(ctx context.Context) error {
 		}
 	}
 	e.maintainQuestions(ctx)
+	e.resumeQuestionMarkers()
 	defer func() { e.mu.Lock(); e.attachReady = false; e.mu.Unlock() }()
 	e.mu.Lock()
 	e.attachReady = true

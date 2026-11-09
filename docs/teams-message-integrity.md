@@ -87,11 +87,25 @@ duplicates after every ambiguous network failure.
 
 ## Visibility and resource bounds
 
-Still-working notices use the last confirmed visible content, separately from
-native tool activity. Defaults are two minutes for the first notice and five
-minutes between repeats. Native activity still controls the 15-minute stuck
-notice. An open native question or pending content/notice prevents periodic
-notices from accumulating behind the backlog.
+Still-working notices use the time since the last Codex event. Defaults are
+two minutes for the first notice and five minutes between repeats. Notices
+include cancel guidance from seven minutes of silence. From the 15-minute
+stuck threshold, the next scheduled notice uses the stuck wording. With the
+default cadence, notices are due at 2, 7, 12, and 17 minutes, so the first
+stuck wording normally appears at about 17 minutes. An open native question
+or pending content/notice prevents periodic notices from accumulating behind
+the backlog.
+
+While a chat has an unanswered native question, one first-line
+`❓Pending agent question` marker sits on its latest sent Codex final,
+progress message, agent-labeled local mirror, or question message. A new agent
+message moves the marker; question status edits restore it after replacing the
+message body. Answering or closing the last pending question removes it. The
+store keeps only that message's external id per chat, and startup reconciles
+pending questions and saved ids without reading chat history. The delivered
+question also marks its work chat unread once; this uses the existing
+notification/edit queue. Local user-prompt mirrors, incoming user or coworker
+messages, and ordinary helper notices are not marked.
 
 The reader processes at most 256 source records and its existing 8 MiB byte
 budget per file per pass. Its existing line-size rules still apply. At 256
@@ -129,13 +143,17 @@ These are measurements on this machine, not transport throughput guarantees.
 - Engine: 120 progress records under throttle and group mode, restart without
   duplicates, pre-callback rollout writes, pre-acceptance restart, source binding
   races, uncertain sends with late read-back, local-state retries, and visible
-  still-working notices while tools remain active. A 1,000-record blocked source
+  silence-clock reset while Codex emits activity. A 1,000-record blocked source
   tests both definite throttling and uncertain sends: bounded pending rows,
   held-final restart, final ordering, and execution in another chat with only
   one native slot. Rejection before acceptance releases transient ownership.
   Consecutive native turns publish finals with maintenance disabled, and a
   definite rejection during shutdown remains retryable.
   Restart replay also preserves progress from an earlier capacity attempt.
+- Question marker: latest-message movement, question status edits, one unread
+  mark, cleanup after resolution, and marker repair after restart.
+- Teams adapter: idempotent prefix add/remove, author check, and preservation
+  of message body, attachments, and mentions.
 - Process e2e: 120 records with 429 and restart, accepted merged POST followed
   by process crash, historical commentary/compaction through two restarts, and
   an unconfirmed final that blocks only its own chat.

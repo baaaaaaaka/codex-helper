@@ -13,6 +13,12 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/steps"
 )
 
+const pendingQuestionMarker = "❓Pending agent question"
+
+func hasPendingQuestionMarker(m fakegraph.Message) bool {
+	return strings.HasPrefix(strings.TrimSpace(m.PlainText()), pendingQuestionMarker+"\n")
+}
+
 func scriptedQuestions(async bool, n int) *fakecodex.QuestionScript {
 	qs := &fakecodex.QuestionScript{Async: async, Blocking: true}
 	for i := 0; i < n; i++ {
@@ -39,20 +45,46 @@ func TestQuestionsSyncQuoteMultiAndNotification(t *testing.T) {
 		return len(s.SUTMessagesContaining(work.ID, "Question from Codex")) == 2, "waiting for two question messages"
 	})
 	questions := s.SUTMessagesContaining(work.ID, "Question from Codex")
+	marked := 0
+	for _, m := range s.SUTMessages(work.ID) {
+		if hasPendingQuestionMarker(m) {
+			marked++
+			if m.ID != questions[len(questions)-1].ID {
+				s.Check("only the latest agent question carries the marker", false, questions[len(questions)-1].ID, m.ID)
+			}
+		}
+	}
+	s.Check("latest question has the first-line marker", marked == 1 && hasPendingQuestionMarker(questions[len(questions)-1]), "one marked latest question", fmt.Sprintf("%d marked message(s)", marked))
 	s.Require("owner notified once for the group", steps.AnswerTimeout, func() (bool, string) {
 		return len(s.SUTMessagesContaining(ctl.ID, "Codex has 2 questions")) == 1, "waiting for owner mention"
 	})
-	_, err := s.Graph.PostWithQuotesAsUser(work.ID, "B", fakegraph.QuoteSpec{MessageID: questions[0].ID})
+	s.Require("question marks its work chat unread once", steps.AnswerTimeout, func() (bool, string) {
+		requests := s.Graph.Requests(fakegraph.RequestFilter{Method: "POST", Route: "POST /chats/{chat}/markChatUnreadForUser", ChatID: work.ID, OnlyOK: true})
+		return len(requests) == 1, fmt.Sprintf("%d unread marks", len(requests))
+	})
+	_, err := s.Graph.PostWithQuotesAsUser(work.ID, "B", fakegraph.QuoteSpec{MessageID: questions[1].ID})
 	if err != nil {
 		t.Fatal(err)
 	}
 	s.Require("partial answer recorded without finishing", steps.CommandTimeout, func() (bool, string) {
 		return len(s.SUTMessagesContaining(work.ID, "Answer recorded")) > 0, "waiting for answer record"
 	})
-	steps.MustPost(s, work.ID, "helper answer Q2 --skip")
+	s.Require("status edit keeps marker on the latest pending question", steps.CommandTimeout, func() (bool, string) {
+		updated := messageByID(s.Graph.Messages(work.ID), questions[1].ID)
+		return hasPendingQuestionMarker(updated) && strings.Contains(updated.PlainText(), "Answer recorded"), "Q2: " + strings.Join(strings.Fields(updated.PlainText()), " ")
+	})
+	steps.MustPost(s, work.ID, "helper answer Q1 --skip")
 	s.Require("answer reaches original RPC", steps.AnswerTimeout, func() (bool, string) {
 		msgs := s.SUTMessagesContaining(work.ID, "QUESTION_RESULT")
 		return len(msgs) == 1 && strings.Contains(msgs[0].PlainText(), "PRODUCTION"), "waiting for original tool response"
+	})
+	s.Require("resolved question clears the marker", steps.AnswerTimeout, func() (bool, string) {
+		for _, m := range s.SUTMessages(work.ID) {
+			if hasPendingQuestionMarker(m) {
+				return false, "marker still present on " + m.ID
+			}
+		}
+		return true, "no marked message"
 	})
 	calls := s.Codex.CallsWithToken(token)
 	s.Check("one execution for the whole interaction", len(calls) == 1, "one native turn", fmt.Sprint(len(calls)))
@@ -61,6 +93,66 @@ func TestQuestionsSyncQuoteMultiAndNotification(t *testing.T) {
 		return len(s.SUTMessagesContaining(work.ID, "already resolved")) > 0, "waiting for closed-question response"
 	})
 	s.Check("only one question notification", len(s.SUTMessagesContaining(ctl.ID, "Codex has 2 questions")) == 1, "one group notification", "notification count checked")
+	marks := s.Graph.Requests(fakegraph.RequestFilter{Method: "POST", Route: "POST /chats/{chat}/markChatUnreadForUser", ChatID: work.ID, OnlyOK: true})
+	var firstMark struct {
+		ReadAt string `json:"lastMessageReadDateTime"`
+	}
+	if len(marks) > 0 {
+		_ = json.Unmarshal([]byte(marks[0].Body), &firstMark)
+	}
+	s.Check("question unread mark is not repeated", len(marks) == 2 && firstMark.ReadAt == "", "one zero-threshold question mark plus final-answer mark", fmt.Sprintf("%d unread request(s), first readAt %q", len(marks), firstMark.ReadAt))
+}
+
+func TestAsyncQuestionMarkerMovesToNextAgentMessage(t *testing.T) {
+	harness.Parallel(t)
+	s := harness.NewScenario(t, "QUESTIONS-MARKER-MOVE", harness.Options{Golden: harness.GoldenOptions{Skip: "The marker is an in-place message edit; explicit assertions verify the single current target."}, Title: "An async question marker moves from the question to the next agent answer", Budget: 90 * time.Second})
+	defer s.Finish()
+	token := s.Token("question")
+	s.Codex.SetScript(func(c harness.CodexCall) harness.CodexBehavior {
+		if c.HasToken(token) {
+			return harness.CodexBehavior{Questions: scriptedQuestions(true, 1), Answer: "continued after question", Delay: 2 * time.Second}
+		}
+		return harness.CodexBehavior{}
+	})
+	ctl := steps.ReadyControlChat(s)
+	work, _ := steps.NewWorkChat(s, ctl, "question-marker-move")
+	steps.MustPost(s, work.ID, "Ask "+token)
+	s.Require("question initially carries the marker", steps.AnswerTimeout, func() (bool, string) {
+		questions := s.SUTMessagesContaining(work.ID, "Question from Codex")
+		return len(questions) == 1 && hasPendingQuestionMarker(questions[0]), "waiting for marked question"
+	})
+	s.Require("Codex sends its next agent message", steps.AnswerTimeout, func() (bool, string) {
+		return len(s.SUTMessagesContaining(work.ID, "continued after question")) == 1, "waiting for the final answer"
+	})
+	s.Require("only the latest agent message remains marked", steps.CommandTimeout, func() (bool, string) {
+		questions := s.SUTMessagesContaining(work.ID, "Question from Codex")
+		answers := s.SUTMessagesContaining(work.ID, "continued after question")
+		var marked []fakegraph.Message
+		for _, m := range s.SUTMessages(work.ID) {
+			if hasPendingQuestionMarker(m) {
+				marked = append(marked, m)
+			}
+		}
+		questionMarked, answerMarked := false, false
+		if len(questions) > 0 {
+			questionMarked = hasPendingQuestionMarker(questions[0])
+		}
+		if len(answers) > 0 {
+			answerMarked = hasPendingQuestionMarker(answers[0])
+		}
+		ok := len(questions) == 1 && len(answers) == 1 && len(marked) == 1 &&
+			marked[0].ID == answers[0].ID && !questionMarked
+		return ok, fmt.Sprintf("%d marked message(s), question=%v answer=%v", len(marked), questionMarked, answerMarked)
+	})
+}
+
+func messageByID(messages []fakegraph.Message, id string) fakegraph.Message {
+	for _, m := range messages {
+		if m.ID == id {
+			return m
+		}
+	}
+	return fakegraph.Message{}
 }
 
 func TestQuestionsAsyncSteerQueueAndLateReply(t *testing.T) {

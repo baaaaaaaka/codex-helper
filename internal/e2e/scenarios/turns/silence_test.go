@@ -10,20 +10,20 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/steps"
 )
 
-// Silence hints and no stall kill (R-19, F-TRN-18; owner/coordinator
-// ruling: v0.1.20 parity). A silent Codex gets one hint at 7 min and one
-// at 15 min ("I will not retry automatically. To stop the running request,
-// send `helper cancel running`") and is never stopped by the helper: it
-// runs on until the user cancels it. The thresholds are scaled down
-// through the test seam's timing knobs (3 s / 6 s); the turn is then left
-// silent well past the old 10 s stall bound of this scenario.
+// Silence hints and no stall kill (R-19, F-TRN-18). A silent Codex gets
+// notices at 2 min, then every 5 min; cancel guidance starts at 7 min and
+// stuck wording starts at the 15 min threshold. Since sends remain on the
+// 5 min cadence, the first stuck-worded notice is due around 17 min. The
+// seam scales those waits while preserving their spacing.
 func TestSilenceHintsAndNoStallKill(t *testing.T) {
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "SILENCE", harness.Options{
 		Guarantees: []string{"R-19", "R-20", "R-22", "F-TRN-18"},
-		Title:      "a silent Codex turn: one hint at SilenceHint, one at SilenceStuck, never stopped by the helper; `helper cancel running` stops it and the chat keeps working",
+		Title:      "a silent Codex turn: notices at 2 min then every 5 min, cancel guidance from 7 min and stuck wording from 15 min (first due around 17 min); never stopped by the helper",
 		Budget:     90 * time.Second,
-		Seam:       harness.Seam{Knobs: map[string]string{"SilenceHint": "3s", "SilenceStuck": "6s"}},
+		Seam: harness.Seam{Knobs: map[string]string{
+			"SilenceHint": "2s", "SilenceRepeat": "5s", "SilenceCancelHint": "7s", "SilenceStuck": "15s",
+		}},
 	})
 	defer s.Finish()
 	silent := s.Token("silent")
@@ -41,33 +41,48 @@ func TestSilenceHintsAndNoStallKill(t *testing.T) {
 	})
 	started := s.Codex.CallsWithToken(silent)[0].Started
 
-	const hint, stuck, noRetry = "Still working. No new Codex update yet", "It may be stuck", "I will not retry automatically. To stop the running request, send helper cancel running"
-	firstAt := func(sub string) time.Duration {
+	const hint, cancelGuidance, stuck, noRetry = "Still working. No new Codex update yet", "This is taking longer than usual", "It may be stuck", "I will not retry automatically. To stop the running request, send helper cancel running"
+	timesAt := func(sub string) []time.Duration {
+		var times []time.Duration
 		for _, m := range s.SUTMessages(work.ID) {
 			if strings.Contains(harness.NormalizeSpace(m.PlainText()), sub) {
-				return m.Created.Sub(started).Round(100 * time.Millisecond)
+				times = append(times, m.Created.Sub(started))
 			}
 		}
-		return -1
+		return times
 	}
-	s.Poll(30*time.Second, func() bool { return len(s.SUTMessagesContaining(work.ID, stuck)) > 0 })
-	// Well past the former 10 s stall bound: the turn still runs.
-	for time.Since(started) < 16*time.Second {
-		s.Settle(time.Second, 2*time.Second)
+	firstAt := func(sub string) time.Duration {
+		times := timesAt(sub)
+		if len(times) == 0 {
+			return -1
+		}
+		return times[0].Round(100 * time.Millisecond)
 	}
-	tr := s.Transcript(work.ID, 15)
+	s.Poll(30*time.Second, func() bool { return len(s.SUTMessagesContaining(work.ID, stuck)) >= 2 })
+	// The threshold is 15 s in this scaled scenario. The 17 s cadence point
+	// must use stuck wording, then repeat once at 22 s; both leave it running.
+	tr := s.Transcript(work.ID, 20)
 	nh, ns := len(s.SUTMessagesContaining(work.ID, hint)), len(s.SUTMessagesContaining(work.ID, stuck))
-	th, ts := firstAt(hint), firstAt(stuck)
-	s.Check("one silence hint after SilenceHint", nh == 1 && th >= 2500*time.Millisecond && th < 6*time.Second,
-		"1 hint, 3 s after the start", fmt.Sprintf("%d hints, first at %s", nh, th), tr...)
-	s.Check("one 'may be stuck' notice after SilenceStuck", ns == 1 && ts >= 5500*time.Millisecond && ts < 10*time.Second,
-		"1 notice, 6 s after the start", fmt.Sprintf("%d notices, first at %s", ns, ts))
-	s.Check("the 'may be stuck' notice says the helper will not retry and how to stop it (v0.1.20)",
-		len(s.SUTMessagesContaining(work.ID, noRetry)) == 1, "1 notice with "+noRetry, fmt.Sprint(len(s.SUTMessagesContaining(work.ID, noRetry))))
+	th, tc, ts := firstAt(hint), firstAt(cancelGuidance), firstAt(stuck)
+	cn, nr := len(s.SUTMessagesContaining(work.ID, cancelGuidance)), len(s.SUTMessagesContaining(work.ID, noRetry))
+	hintTimes := timesAt(hint)
+	repeatsEveryFive := len(hintTimes) == 3 &&
+		hintTimes[1]-hintTimes[0] >= 4500*time.Millisecond && hintTimes[1]-hintTimes[0] < 6200*time.Millisecond &&
+		hintTimes[2]-hintTimes[1] >= 4500*time.Millisecond && hintTimes[2]-hintTimes[1] < 6200*time.Millisecond
+	s.Check("the first status is due after SilenceHint", nh == 3 && th >= 1500*time.Millisecond && th < 4*time.Second,
+		"3 notices at about 2, 7, and 12 s", fmt.Sprintf("%d still-working notices, first at %s", nh, th), tr...)
+	s.Check("notices repeat every SilenceRepeat", repeatsEveryFive,
+		"about 5 s between the three still-working notices", fmt.Sprintf("notice times %v", hintTimes))
+	s.Check("cancel guidance starts at 7 s, not on the first notice", cn == 2 && tc >= 6*time.Second && tc < 10*time.Second,
+		"2 notices with cancel guidance, first at about 7 s", fmt.Sprintf("%d notices, first at %s", cn, tc))
+	s.Check("the first stuck wording is due at the 17 s cadence point", ns == 2 && ts >= 16*time.Second && ts < 20*time.Second,
+		"2 stuck-worded notices, first at about 17 s and next at 22 s", fmt.Sprintf("%d notices, first at %s", ns, ts))
+	s.Check("stuck notices say the helper will not retry and how to stop it",
+		nr == 2, "2 notices with "+noRetry, fmt.Sprint(nr))
 	outcome := steps.Outcome(s.Codex.CallsWithToken(silent))
 	stops := len(s.SUTMessagesContaining(work.ID, "stopped")) + len(s.SUTMessagesContaining(work.ID, "canceled")) + len(s.SUTMessagesContaining(work.ID, "interrupted"))
 	s.Check("the helper never stops a silent turn by itself", outcome == "running" && stops == 0,
-		"Codex turn still running, no stop notice after 16 s", fmt.Sprintf("codex outcome %s; %d stop notices", outcome, stops))
+		"Codex turn still running, no stop notice after 22 s", fmt.Sprintf("codex outcome %s; %d stop notices", outcome, stops))
 
 	steps.MustPost(s, work.ID, "helper cancel running")
 	cancelled := s.Poll(steps.CommandTimeout, func() bool { return len(s.SUTMessagesContaining(work.ID, "Codex request canceled.")) == 1 })
@@ -81,6 +96,6 @@ func TestSilenceHintsAndNoStallKill(t *testing.T) {
 	_, ok := steps.WaitAnswered(s, work.ID, next, steps.AnswerTimeout)
 	s.Check("the chat keeps working after the cancel", ok, "next prompt answered", fmt.Sprint(ok))
 	s.Settle(time.Second, 4*time.Second)
-	s.Check("a turn that answers in time gets no hint", len(s.SUTMessagesContaining(work.ID, hint)) == 1,
-		"still 1 hint in the chat", fmt.Sprint(len(s.SUTMessagesContaining(work.ID, hint))))
+	s.Check("the cancelled turn gets no later silence notices", len(s.SUTMessagesContaining(work.ID, hint)) == 3 && len(s.SUTMessagesContaining(work.ID, stuck)) == 2,
+		"the notice counts stay at 3 still-working and 2 stuck", fmt.Sprintf("%d still-working, %d stuck", len(s.SUTMessagesContaining(work.ID, hint)), len(s.SUTMessagesContaining(work.ID, stuck))))
 }

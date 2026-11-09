@@ -191,6 +191,36 @@ func (t *Tx) WaitingQuestionConversations() ([]int64, error) {
 	return out, rows.Err()
 }
 
+// PendingQuestionConversations lists chats with at least one unanswered
+// question, including async questions. It reads no question content.
+func (t *Tx) PendingQuestionConversations() ([]int64, error) {
+	rows, err := t.rows(`SELECT DISTINCT g.conv_id FROM question_groups g
+WHERE g.state IN ('open','submitting') AND EXISTS (
+ SELECT 1 FROM questions q WHERE q.group_key=g.key AND q.answer IS NULL AND q.skipped=0
+ ) ORDER BY g.conv_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var conv int64
+		if err := rows.Scan(&conv); err != nil {
+			return nil, err
+		}
+		out = append(out, conv)
+	}
+	return out, rows.Err()
+}
+
+// HasPendingQuestion reports whether conv has an unanswered question.
+func (t *Tx) HasPendingQuestion(conv int64) (bool, error) {
+	var yes bool
+	err := t.row(`SELECT EXISTS(SELECT 1 FROM question_groups g JOIN questions q ON q.group_key=g.key
+WHERE g.conv_id=? AND g.state IN ('open','submitting') AND q.answer IS NULL AND q.skipped=0)`, conv).Scan(&yes)
+	return yes, err
+}
+
 func (t *Tx) questionGroups(query string, args ...any) ([]QuestionGroup, error) {
 	rows, err := t.rows(query, args...)
 	if err != nil {

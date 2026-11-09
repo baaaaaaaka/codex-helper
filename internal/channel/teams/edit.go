@@ -89,6 +89,66 @@ func (a *Adapter) EditHTML(ctx context.Context, chat, id string, rewrite func(ht
 	return a.g.writeJSON(ctx, http.MethodPatch, messagePath(chat, id), in, nil)
 }
 
+// SetMessagePrefix adds or removes a separate first paragraph on one of this
+// account's messages. It keeps attachments, mentions, and the existing body.
+func (a *Adapter) SetMessagePrefix(ctx context.Context, chat, id, prefix string, present bool) error {
+	if strings.TrimSpace(id) == "" || strings.TrimSpace(prefix) == "" {
+		return &channel.Rejected{Permanent: true, Err: fmt.Errorf("message prefix needs an id and text: %w", channel.ErrNotEditable)}
+	}
+	me, err := a.me(ctx)
+	if err != nil {
+		return err
+	}
+	var m annotatedMessage
+	if err := a.g.getJSON(ctx, messagePath(chat, id), smallBodyLimit, &m); err != nil {
+		return err
+	}
+	if m.Deleted != nil && *m.Deleted != "" || m.MessageType != "" && m.MessageType != "message" {
+		return fmt.Errorf("message %s is not a visible message: %w", id, channel.ErrNotEditable)
+	}
+	if m.From == nil || m.From.User == nil || !strings.EqualFold(m.From.User.ID, me.ID) {
+		return fmt.Errorf("message %s is not the signed-in account's: %w", id, channel.ErrNotEditable)
+	}
+	content := m.Body.Content
+	isHTML := m.Body.ContentType == "" || strings.EqualFold(m.Body.ContentType, "html")
+	if !isHTML {
+		content = asHTML(content, false)
+	}
+	next, changed := messagePrefixEdit(content, prefix, present)
+	if !changed {
+		return nil
+	}
+	in := map[string]any{"body": map[string]string{"contentType": "html", "content": next}}
+	if len(m.Attachments) > 0 {
+		in["attachments"] = m.Attachments
+	}
+	if len(m.Mentions) > 0 {
+		in["mentions"] = m.Mentions
+	}
+	return a.g.writeJSON(ctx, http.MethodPatch, messagePath(chat, id), in, nil)
+}
+
+func messagePrefixEdit(content, prefix string, present bool) (string, bool) {
+	start := len(content) - len(strings.TrimLeft(content, " \t\r\n"))
+	body := content[start:]
+	first, _, _ := strings.Cut(strings.TrimSpace(plainText(body)), "\n")
+	marked := strings.TrimSpace(first) == prefix
+	if present {
+		if marked {
+			return content, false
+		}
+		return "<p><strong>" + esc(prefix) + "</strong></p>" + content, true
+	}
+	if !marked {
+		return content, false
+	}
+	match := leadingParagraphRE.FindStringIndex(body)
+	if match == nil || strings.TrimSpace(plainText(body[match[0]:match[1]])) != prefix {
+		return content, false
+	}
+	return content[:start] + body[match[1]:], true
+}
+
 // MarkUnread marks chat unread for the owner (POST
 // /chats/{chat}/markChatUnreadForUser) so a posted answer notifies like a
 // message from someone else. Messages created after readAt count as unread;

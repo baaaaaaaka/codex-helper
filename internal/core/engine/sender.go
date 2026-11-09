@@ -495,16 +495,20 @@ func (e *Engine) send(ctx context.Context, r store.Outbox, chat, token string, f
 	}
 	switch {
 	case err == nil:
-		e.noteVisible(r)
 		e.rememberOwnPost(r.ConvID, sent.ID)
 		e.noteFinalSent(r.ConvID, r.Kind, sent.Time) // F-TRN-1 (rename.go)
-		if err := e.persist(ctx, "record send outcome", func(tx *store.Tx) error {
+		persistErr := e.persist(ctx, "record send outcome", func(tx *store.Tx) error {
 			if err := tx.MarkSent(r.ID, sent.ID); err != nil {
 				return err
 			}
 			return e.forkSettled(tx, r) // fork.go: a fork's marker releases its link
-		}); err != nil && !errors.Is(err, store.ErrState) {
-			e.logf("mark sent %d: %v", r.ID, err)
+		})
+		if persistErr != nil {
+			if !errors.Is(persistErr, store.ErrState) {
+				e.logf("mark sent %d: %v", r.ID, persistErr)
+			}
+		} else if isQuestionMarkerMessage(r) && e.questionIsPending(r.ConvID) {
+			e.queueQuestionMarker(r.ConvID)
 		}
 		e.forgetFailures(r.ID)
 		e.wakeRunner(r.ConvID)
@@ -822,8 +826,10 @@ func (e *Engine) resolveOne(ctx context.Context, id int64) {
 		return
 	}
 	if found != "" {
-		e.noteVisible(r)
 		e.logf("unknown send %s resolved by read-back: delivered", r.DeliveryKey)
+		if isQuestionMarkerMessage(r) && e.questionIsPending(r.ConvID) {
+			e.queueQuestionMarker(r.ConvID)
+		}
 		e.mu.Lock()
 		delete(e.unknown, id)
 		e.mu.Unlock()

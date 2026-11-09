@@ -18,7 +18,7 @@ separated by `;`:
 | `endpoint` | `http://<loopback>:<port>` (required) | every HTTP request of cxp's Teams HTTP client (Graph, `login.microsoftonline.com`, SharePoint upload URLs, the Workflow webhook) goes to this URL instead; method, path, query, headers and body are unchanged, the original scheme and host travel in `X-Cxp-Test-Original-Scheme` / `X-Cxp-Test-Original-Host` |
 | `instance` | any tag | sent as `X-Cxp-Test-Instance` on every such request, so the fake can tell helper instances apart |
 | `timing` | `production` (default) or `fast:<duration>` | `fast:250ms` shortens the poll and mirror cadences to multiples of 250 ms (`engine.FastTiming`) and scales the account read rate with it |
-| `timing.<Knob>` | a positive duration | shortens one user-visible wait: `SilenceHint`, `SilenceStuck`, `StallLimit`, `DuplicateFor`, `Heartbeat`, `CapacityRetry`, `CapacityBackoff`, `RefusalRecheck`, `Takeover` (the stale bound of the shared-home lease; its other intervals scale with it) |
+| `timing.<Knob>` | a positive duration | shortens one user-visible wait: `SilenceHint`, `SilenceRepeat`, `SilenceCancelHint`, `SilenceStuck`, `DuplicateFor`, `Heartbeat`, `CapacityRetry`, `CapacityBackoff`, `RefusalRecheck`, `Takeover` (the stale bound of the shared-home lease; its other intervals scale with it) |
 | `hostname` | a name | the host identity used for the store owner, per-host files and the default machine label, so two helpers in one container act as two hosts sharing one home |
 | `cpuprofile` | an absolute directory | diagnostic: the helper writes consecutive one-minute CPU profiles there (`cpu-<pid>-<unix start>.pprof`); used by the real-data shadow run (`E2E_SHADOW_CPUPROFILE`) |
 

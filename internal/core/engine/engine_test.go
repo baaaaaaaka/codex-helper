@@ -494,8 +494,9 @@ func TestDuplicateGuardSkipsFailedAndAttachments(t *testing.T) {
 func TestWakeAliases(t *testing.T) {
 	r := newRig(t)
 	ctl := r.control()
+	workIDs := make([]string, 0, 2)
 	for i := 0; i < 2; i++ {
-		r.newWork(t.TempDir())
+		workIDs = append(workIDs, r.newWork(t.TempDir()))
 	}
 	for _, c := range []struct{ park, wake, label string }{
 		{"park s001", "unpark s001", "s001"},
@@ -510,6 +511,14 @@ func TestWakeAliases(t *testing.T) {
 		})
 		r.ch.PostUser(ctl, c.wake)
 		r.wait(c.wake, func() bool { return len(r.own(ctl, "Resumed "+c.label)) == n+1 })
+		chatID := workIDs[0]
+		if c.label == "s002" {
+			chatID = workIDs[1]
+		}
+		info, ok := r.ch.Chat(chatID)
+		if !ok || !strings.Contains(r.own(ctl, "Resumed "+c.label)[n].Text, "Open Work chat: "+info.URL) {
+			t.Errorf("wake %q did not include the work chat URL %q", c.wake, info.URL)
+		}
 	}
 }
 
@@ -1111,13 +1120,11 @@ func TestSlowCommandDoesNotBlockCancelOrOtherChats(t *testing.T) {
 	}
 }
 
-// R-19 / F-TRN-18 (review M5): a silent Codex turn gets one hint at each
-// silence threshold and is never stopped by the helper (v0.1.20: "I will
-// not retry automatically"); only `helper cancel running` stops it, and
-// the chat then runs its next request.
+// R-19 / F-TRN-18: the recurring status changes to stuck wording at the
+// first scheduled send after the threshold, and never stops the turn.
 func TestSilentTurnHintsAndIsNeverStopped(t *testing.T) {
 	r := newRig(t, func(c *Config) {
-		c.Timing.SilenceHint, c.Timing.SilenceStuck = 400*time.Millisecond, 900*time.Millisecond
+		c.Timing.SilenceHint, c.Timing.SilenceRepeat, c.Timing.SilenceStuck = 400*time.Millisecond, 2*time.Second, 900*time.Millisecond
 	})
 	r.ag.mu.Lock()
 	r.ag.block["hang forever"] = make(chan struct{})
@@ -1125,7 +1132,7 @@ func TestSilentTurnHintsAndIsNeverStopped(t *testing.T) {
 	work := r.newWork(t.TempDir())
 	r.ch.PostUser(work, "hang forever")
 	r.wait("stuck hint", func() bool { return len(r.own(work, "It may be stuck")) == 1 })
-	time.Sleep(2 * time.Second) // well past both thresholds: still running
+	time.Sleep(500 * time.Millisecond) // the turn remains running after the stuck notice
 	if n := len(r.own(work, "canceled")) + len(r.own(work, "interrupted")) + len(r.own(work, "stopped")); n != 0 {
 		t.Fatalf("a silent turn was stopped (%d notices)", n)
 	}
@@ -1137,7 +1144,8 @@ func TestSilentTurnHintsAndIsNeverStopped(t *testing.T) {
 		"Still working. No new Codex update yet":                     1,
 		"It may be stuck":                                            1,
 		"I will not retry automatically":                             1,
-		"send `helper cancel running`":                               2,
+		"This is taking longer than usual":                           0,
+		"send `helper cancel running`":                               1,
 		"Codex request interrupted because the Teams helper stopped": 0,
 	} {
 		if got := len(r.own(work, sub)); got != want {
@@ -1149,6 +1157,28 @@ func TestSilentTurnHintsAndIsNeverStopped(t *testing.T) {
 		if got := r.own(work, sub); len(got) != 1 || !strings.HasPrefix(got[0].Text, "🤖 ⏳ Codex status:\n") {
 			t.Errorf("hint %q: %+v", sub, got)
 		}
+	}
+}
+
+func TestSilenceMessageStages(t *testing.T) {
+	const cancelAt, stuckAt = 7 * time.Minute, 15 * time.Minute
+	for _, tc := range []struct {
+		name, want, absent string
+		quiet              time.Duration
+	}{
+		{"first notice", textSilent, textSilenceCancel, 2 * time.Minute},
+		{"before cancel guidance", textSilent, textSilenceCancel, cancelAt - time.Second},
+		{"cancel guidance starts", textSilent + "\n\n" + textSilenceCancel, "It may be stuck", cancelAt},
+		{"cancel guidance continues", textSilent + "\n\n" + textSilenceCancel, "It may be stuck", stuckAt - time.Second},
+		{"stuck threshold", textStuck(stuckAt), textSilenceCancel, stuckAt},
+		{"first scheduled stuck notice", textStuck(17 * time.Minute), textSilenceCancel, 17 * time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := textSilence(tc.quiet, cancelAt, stuckAt)
+			if got != tc.want || strings.Contains(got, tc.absent) {
+				t.Fatalf("textSilence(%s) = %q, want %q and no %q", tc.quiet, got, tc.want, tc.absent)
+			}
+		})
 	}
 }
 

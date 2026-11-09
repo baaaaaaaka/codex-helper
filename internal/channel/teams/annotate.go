@@ -25,9 +25,10 @@ import (
 // the body lacks it.
 
 var (
-	attachmentTagRE = regexp.MustCompile(`(?i)<attachment\b[^>]*\bid\s*=\s*"([^"]*)"`)
-	imgTagRE        = regexp.MustCompile(`(?i)<img\b[^>]*>`)
-	imgAltRE        = regexp.MustCompile(`(?i)\balt\s*=\s*"([^"]*)"`)
+	attachmentTagRE    = regexp.MustCompile(`(?i)<attachment\b[^>]*\bid\s*=\s*"([^"]*)"`)
+	imgTagRE           = regexp.MustCompile(`(?i)<img\b[^>]*>`)
+	imgAltRE           = regexp.MustCompile(`(?i)\balt\s*=\s*"([^"]*)"`)
+	leadingParagraphRE = regexp.MustCompile(`(?is)^\s*<p\b[^>]*>.*?</p\s*>`)
 )
 
 const formulaAlt = "Rendered TeX formula"
