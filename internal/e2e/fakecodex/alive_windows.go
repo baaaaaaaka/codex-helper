@@ -2,15 +2,10 @@
 
 package fakecodex
 
-import "os"
+import "github.com/baaaaaaaka/codex-helper/internal/proc"
 
-// pidAlive: on Windows FindProcess opens the process and fails when it is
-// gone.
+// Opening a process can succeed after it exits while a handle is retained.
+// Use the exit-code check shared with the production process helpers.
 func pidAlive(pid int) bool {
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return false
-	}
-	_ = p.Release()
-	return true
+	return proc.IsAlive(pid)
 }
