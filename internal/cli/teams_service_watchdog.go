@@ -270,7 +270,8 @@ func defaultTeamsServiceWatchdogStorePath() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	path, err := resolveTeamsCoreStorePath(stateDir)
+	// Observe a renewing startup claim even before conversion publishes a DB.
+	path, err := planTeamsCoreStore(stateDir)
 	if err != nil {
 		return "", nil // the helper refuses to start and says why
 	}

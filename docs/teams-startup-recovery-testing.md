@@ -67,3 +67,34 @@ These tests do not replace a real shared-filesystem compatibility test or an
 installed service-manager upgrade test. They do not repair an empty database
 already published by an older defective version. An old watchdog must first
 be switched to code that contains the runtime-refresh behavior.
+
+## Historical systemd watchdog repair
+
+On Linux, a managed main service repairs a running pre-rc.73 watchdog from
+its own immutable runtime root after acquiring a renewing startup claim and
+before waiting or converting the store. It checks systemd's MainPID against
+itself, rechecks both instances and the selected runtime, and restarts only
+`codex-helper-teams-watchdog.service`. A stopped watchdog, foreground helper,
+foreign installation, or modern watchdog is left alone. The check has a
+20-second total budget; failures are diagnosed without stopping the healthy
+main service or rolling back data. No lease or conversion timing changes.
+
+`TestLegacyTeamsWatchdogHandoff` covers the decision and failure boundaries.
+`TestEntryMigrationPreservesChatWithStoppedWatchdog` uses the production CLI,
+real migration and fake Graph/Codex to verify the original chat/thread response
+when the service manager reports that the watchdog is intentionally stopped.
+CI repeats this scenario three times in the first E2E shard. The dedicated
+`watchdog-systemd` job tests the actual watchdog handoff with the fixed
+SHA-256-verified v0.1.20 release executable and a real user service manager on
+an ephemeral GitHub-hosted Linux runner. It refuses existing units and verifies
+the watchdog runs from the new runtime while the main process survives. The
+aggregate CI/release gate requires that job.
+A full historical Teams-command upgrade remains a separate compatibility
+limitation; the E2E here exercises the new startup after activation.
+
+The repair adds bounded service queries at managed startup only. Modern
+watchdogs require two MainPID reads and one executable inspection; there is
+no new periodic repair, JSON rewrite, durable marker or history scan. The
+watchdog anchor lookup replaces the existing resolved-store lookup, allowing
+a fresh claimed lease to be observed before a database exists. A stale
+startup claim still triggers the existing recovery policy.

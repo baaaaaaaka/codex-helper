@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/core/lease"
 	corestore "github.com/baaaaaaaka/codex-helper/internal/core/store"
 )
 
@@ -640,5 +641,43 @@ func TestStartTeamsPrimaryServiceDoesNotTouchWatchdogSchedule(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestTeamsServiceWatchdogObservesUnpublishedMigrationClaim(t *testing.T) {
+	root, scope := migrateFixture(t, "v0120", "json")
+	t.Setenv("CODEX_HELPER_STATE_DIR", root)
+	anchor := filepath.Join(scope, "core.sqlite")
+	t.Setenv(envTeamsCoreStore, anchor)
+	host, err := teamsHostname()
+	if err != nil {
+		t.Fatal(err)
+	}
+	holder, err := lease.Acquire(context.Background(), lease.Config{Anchor: anchor, Self: lease.Local(host, teamsBootID())})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Release()
+	path, err := defaultTeamsServiceWatchdogStorePath()
+	if err != nil || path != anchor {
+		t.Fatalf("startup anchor: %q, %v", path, err)
+	}
+	info, err := lease.Read(path)
+	if err != nil || !info.HeadOK || info.CurrentGen != 0 {
+		t.Fatalf("claim: %+v %v", info, err)
+	}
+	snapshot := teamsServiceWatchdogLeaseSnapshot(teamsServiceWatchdogSnapshot{Installed: true, Active: true}, teamsStoreView{Info: info}, normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: time.Now()}))
+	// A live startup claim is healthy without opening the missing database.
+	decision := evaluateTeamsServiceWatchdog(snapshot, teamsServiceWatchdogState{ConsecutiveStale: 100}, teamsServiceWatchdogOptions{Now: time.Now()})
+	if decision.Action != teamsServiceWatchdogActionNoop {
+		t.Fatalf("startup decision: %+v", decision)
+	}
+	later := time.Now().Add(10 * time.Minute)
+	stale := teamsServiceWatchdogLeaseSnapshot(teamsServiceWatchdogSnapshot{Installed: true, Active: true}, teamsStoreView{Info: info}, normalizeTeamsServiceWatchdogOptions(teamsServiceWatchdogOptions{Now: later}))
+	if d := evaluateTeamsServiceWatchdog(stale, teamsServiceWatchdogState{ConsecutiveStale: 100}, teamsServiceWatchdogOptions{Now: later}); d.Action != teamsServiceWatchdogActionRestart {
+		t.Fatalf("stale startup did not recover: %+v", d)
+	}
+	if _, err := os.Stat(anchor); !os.IsNotExist(err) {
+		t.Fatalf("watchdog created DB: %v", err)
 	}
 }

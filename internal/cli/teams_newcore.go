@@ -291,6 +291,10 @@ func serveTeamsNewCore(ctx context.Context, out, errOut io.Writer, root *rootOpt
 		case <-runCtx.Done():
 		}
 	}()
+	// Publish a renewing startup claim before the new watchdog checks health.
+	if err := refreshLegacyTeamsWatchdog(runCtx); err != nil {
+		_, _ = fmt.Fprintf(errOut, "Teams watchdog runtime repair failed: %v\n", err)
+	}
 	plan := holder.Plan()
 	if plan.Quiet {
 		_, _ = fmt.Fprintf(errOut, "Teams helper taking over generation %d from %s (%s); waiting %s for it to stop\n",
