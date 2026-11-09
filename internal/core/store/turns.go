@@ -213,13 +213,23 @@ func (s *Store) OpenTurns() ([]Turn, error) {
 WHERE state IN ('queued','starting','running') ORDER BY conv_id, id`))
 }
 
-// NextSteer selects the oldest ordinary prompt. Explicit queued requests
-// do not delay immediate input, but an ordinary prompt with pending files
-// keeps later ordinary input in order.
-func (t *Tx) NextSteer(convID int64) (Turn, bool, error) {
+// NextSteer selects the oldest ordinary prompt received after the active
+// helper turn started. Explicit queued requests do not delay immediate
+// input, but an older ordinary prompt or one with pending files keeps later
+// ordinary input in order.
+func (t *Tx) NextSteer(convID, activeTurnID int64) (Turn, bool, error) {
 	tr, ok, err := one(t.row(`SELECT `+turnCols+` FROM turns WHERE conv_id=? AND state IN ('queued','starting','running') AND state='queued' AND queued_only=0 ORDER BY id LIMIT 1`, convID), scanTurn)
 	if err != nil || !ok {
 		return tr, false, err
+	}
+	if activeTurnID != 0 {
+		var startedAt int64
+		if err := t.row(`SELECT started_at FROM turns WHERE id=?`, activeTurnID).Scan(&startedAt); err != nil {
+			return tr, false, err
+		}
+		if tr.QueuedAt <= startedAt {
+			return tr, false, nil
+		}
 	}
 	var pending bool
 	err = t.row(`SELECT EXISTS(SELECT 1 FROM inbound_files WHERE inbound_id=? AND state='pending')`, tr.InboundID).Scan(&pending)

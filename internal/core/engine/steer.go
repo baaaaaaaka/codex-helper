@@ -26,6 +26,10 @@ func (e *Engine) trySteer(ctx context.Context, id int64) bool {
 		return false
 	}
 	rs := cs.running
+	activeTurnID := int64(0)
+	if rs != nil {
+		activeTurnID = rs.turnID
+	}
 	if cs.steering {
 		e.mu.Unlock()
 		return true
@@ -58,7 +62,7 @@ func (e *Engine) trySteer(ctx context.Context, id int64) bool {
 	got := false
 	err := e.update(func(tx *store.Tx) error {
 		var err error
-		tr, got, err = tx.NextSteer(id)
+		tr, got, err = tx.NextSteer(id, activeTurnID)
 		if err != nil || !got {
 			return err
 		}
