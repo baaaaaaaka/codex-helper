@@ -254,6 +254,43 @@ func TestTeamsAuthConfigWritesLocalClientIDs(t *testing.T) {
 	}
 }
 
+func TestTeamsAuthConfigWritesSeparateReadClient(t *testing.T) {
+	lockCLITestHooks(t)
+	tmp := t.TempDir()
+	configBase, _ := isolateTeamsUserDirsForTest(t, tmp)
+	configPath := filepath.Join(configBase, "codex-helper", "teams-auth.json")
+	out := executeRootForTeamsTest(t,
+		"teams", "auth", "config",
+		"--tenant-id", "tenant-config",
+		"--read-client-id", "read-client-config",
+		"--read-scopes", "User.Read Chat.Read Files.Read",
+		"--full-client-id", "write-client-config",
+		"--client-id", "write-client-config",
+	)
+	if !strings.Contains(out, "Read client ID: configured") {
+		t.Fatalf("auth config did not report split read client:\n%s", out)
+	}
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Read struct {
+			ClientID string `json:"client_id"`
+			Scopes   string `json:"scopes"`
+		} `json:"read"`
+		Full struct {
+			ClientID string `json:"client_id"`
+		} `json:"full"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc.Read.ClientID != "read-client-config" || doc.Read.Scopes != "User.Read Chat.Read Files.Read" || doc.Full.ClientID != "write-client-config" {
+		t.Fatalf("auth config = %s", raw)
+	}
+}
+
 func TestTeamsDoctorLiveUsesExplicitOptIn(t *testing.T) {
 	lockCLITestHooks(t)
 

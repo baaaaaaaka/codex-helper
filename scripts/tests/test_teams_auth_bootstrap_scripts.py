@@ -40,7 +40,7 @@ class TeamsAuthBootstrapScriptTests(unittest.TestCase):
         self.assertNotIn("-ExecutionPolicy Bypass", readme)
         self.assertNotIn("Invoke-Expression", readme)
 
-    def test_bash_script_interactive_flow_configures_one_client(self) -> None:
+    def test_bash_script_interactive_flow_uses_legacy_single_client_commands(self) -> None:
         bash = shutil.which("bash")
         if not bash:
             self.skipTest("bash not available")
@@ -59,10 +59,10 @@ class TeamsAuthBootstrapScriptTests(unittest.TestCase):
                     done >> "$CODEX_HELPER_TEST_LOG"
                     printf '\\n' >> "$CODEX_HELPER_TEST_LOG"
                     case "$*" in
-                      "teams auth login")
+                      "teams auth full")
                         echo "Authenticated Teams full access as CI <ci@example.test>"
                         ;;
-                      "teams auth status")
+                      "teams auth full-status")
                         echo "Teams full auth cache: present"
                         ;;
                       "teams service bootstrap --no-open-control")
@@ -106,9 +106,9 @@ class TeamsAuthBootstrapScriptTests(unittest.TestCase):
             self.assertEqual(
                 lines,
                 [
-                    "[teams][auth][config][--tenant-id][tenant-ci][--client-id][client-ci]",
-                    "[teams][auth][login]",
-                    "[teams][auth][status]",
+                    "[teams][auth][config][--tenant-id][tenant-ci][--read-client-id][client-ci][--full-client-id][client-ci][--client-id][client-ci]",
+                    "[teams][auth][full]",
+                    "[teams][auth][full-status]",
                     "[teams][service][bootstrap][--no-open-control]",
                 ],
             )
@@ -133,28 +133,41 @@ class TeamsAuthBootstrapScriptTests(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("tenant id is required", proc.stderr)
 
-    def test_bash_script_rejects_split_read_client(self) -> None:
+    def test_bash_script_restores_split_clients_with_legacy_commands(self) -> None:
         bash = shutil.which("bash")
         if not bash:
             self.skipTest("bash not available")
 
-        proc = subprocess.run(
-            [
-                bash,
-                str(BASH_SCRIPT),
-                "--codex-proxy",
-                "codex-proxy",
-                "--tenant-id",
-                "tenant-ci",
-                "--read-client-id",
-                "read-client-ci",
-            ],
-            input="",
-            text=True,
-            capture_output=True,
-        )
-        self.assertEqual(proc.returncode, 2)
-        self.assertIn("--read-client-id is no longer supported", proc.stderr)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            log = root / "commands.log"
+            fake = root / "codex-proxy"
+            fake.write_text(
+                "#!/usr/bin/env bash\nset -euo pipefail\nfor arg in \"$@\"; do printf '[%s]' \"$arg\"; done >> \"$CODEX_HELPER_TEST_LOG\"\nprintf '\\n' >> \"$CODEX_HELPER_TEST_LOG\"\n",
+                encoding="utf-8",
+            )
+            fake.chmod(0o755)
+            env = os.environ.copy()
+            env["CODEX_HELPER_TEST_LOG"] = str(log)
+            proc = subprocess.run(
+                [bash, str(BASH_SCRIPT), "--codex-proxy", str(fake), "--tenant-id", "tenant-ci",
+                 "--read-client-id", "read-client-ci", "--write-client-id", "write-client-ci"],
+                text=True,
+                capture_output=True,
+                env=env,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(
+                log.read_text(encoding="utf-8").splitlines(),
+                [
+                    "[teams][auth][config][--tenant-id][tenant-ci][--read-client-id][read-client-ci][--full-client-id][write-client-ci][--client-id][write-client-ci]",
+                    "[teams][auth][read]",
+                    "[teams][auth][full]",
+                    "[teams][auth][read-status]",
+                    "[teams][auth][full-status]",
+                    "[teams][service][bootstrap]",
+                ],
+            )
 
     def test_bash_script_write_client_id_is_the_client_id(self) -> None:
         bash = shutil.which("bash")
@@ -202,14 +215,14 @@ class TeamsAuthBootstrapScriptTests(unittest.TestCase):
             self.assertEqual(
                 lines,
                 [
-                    "[teams][auth][config][--tenant-id][tenant-ci][--client-id][write-client-ci]",
-                    "[teams][auth][login]",
-                    "[teams][auth][status]",
+                    "[teams][auth][config][--tenant-id][tenant-ci][--read-client-id][write-client-ci][--full-client-id][write-client-ci][--client-id][write-client-ci]",
+                    "[teams][auth][full]",
+                    "[teams][auth][full-status]",
                     "[teams][service][bootstrap]",
                 ],
             )
 
-    def test_powershell_script_interactive_flow_configures_one_client(self) -> None:
+    def test_powershell_script_interactive_flow_uses_legacy_single_client_commands(self) -> None:
         powershell = shutil.which("pwsh") or shutil.which("powershell")
         if not powershell:
             self.skipTest("PowerShell not available")
@@ -225,9 +238,9 @@ class TeamsAuthBootstrapScriptTests(unittest.TestCase):
                     $line = ($Rest | ForEach-Object { "[$_]" }) -join ""
                     Add-Content -Path $env:CODEX_HELPER_TEST_LOG -Value $line
                     $joined = $Rest -join " "
-                    if ($joined -eq "teams auth login") {
+                    if ($joined -eq "teams auth full") {
                       Write-Output "Authenticated Teams full access as CI <ci@example.test>"
-                    } elseif ($joined -eq "teams auth status") {
+                    } elseif ($joined -eq "teams auth full-status") {
                       Write-Output "Teams full auth cache: present"
                     } elseif ($joined -eq "teams service bootstrap --no-open-control") {
                       Write-Output "Teams service bootstrap ready: ci"
@@ -277,35 +290,54 @@ class TeamsAuthBootstrapScriptTests(unittest.TestCase):
             self.assertEqual(
                 lines,
                 [
-                    "[teams][auth][config][--tenant-id][tenant-ci][--client-id][client-ci]",
-                    "[teams][auth][login]",
-                    "[teams][auth][status]",
+                    "[teams][auth][config][--tenant-id][tenant-ci][--read-client-id][client-ci][--full-client-id][client-ci][--client-id][client-ci]",
+                    "[teams][auth][full]",
+                    "[teams][auth][full-status]",
                     "[teams][service][bootstrap][--no-open-control]",
                 ],
             )
 
-    def test_powershell_script_rejects_split_read_client(self) -> None:
+    def test_powershell_script_restores_split_clients_with_legacy_commands(self) -> None:
         powershell = shutil.which("pwsh") or shutil.which("powershell")
         if not powershell:
             self.skipTest("PowerShell not available")
 
-        proc = subprocess.run(
-            [
-                powershell,
-                "-NoProfile",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-File",
-                str(POWERSHELL_SCRIPT),
-                "-CodexProxy",
-                "codex-proxy",
-                "-TenantId",
-                "tenant-ci",
-                "-ReadClientId",
-                "read-client-ci",
-            ],
-            text=True,
-            capture_output=True,
-        )
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("-ReadClientId is no longer supported", proc.stdout + proc.stderr)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            log = root / "commands.log"
+            fake = root / "fake-codex-proxy.ps1"
+            fake.write_text(
+                textwrap.dedent(
+                    """\
+                    param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Rest)
+                    $line = ($Rest | ForEach-Object { "[$_]" }) -join ""
+                    Add-Content -Path $env:CODEX_HELPER_TEST_LOG -Value $line
+                    exit 0
+                    """
+                ),
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env["CODEX_HELPER_TEST_LOG"] = str(log)
+            proc = subprocess.run(
+                [
+                    powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(POWERSHELL_SCRIPT),
+                    "-CodexProxy", str(fake), "-TenantId", "tenant-ci", "-ReadClientId", "read-client-ci",
+                    "-WriteClientId", "write-client-ci",
+                ],
+                text=True,
+                capture_output=True,
+                env=env,
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(
+                log.read_text(encoding="utf-8").splitlines(),
+                [
+                    "[teams][auth][config][--tenant-id][tenant-ci][--read-client-id][read-client-ci][--full-client-id][write-client-ci][--client-id][write-client-ci]",
+                    "[teams][auth][read]",
+                    "[teams][auth][full]",
+                    "[teams][auth][read-status]",
+                    "[teams][auth][full-status]",
+                    "[teams][service][bootstrap]",
+                ],
+            )

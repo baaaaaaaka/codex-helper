@@ -11,25 +11,28 @@ helper service.
 Options:
   --codex-proxy PATH    codex-proxy/cxp executable to run
   --tenant-id ID        Microsoft Entra tenant ID
-  --client-id ID        Teams Graph public client ID
+  --client-id ID        Teams Graph write-capable public client ID
   --write-client-id ID  alias for --client-id (--chat-client-id is accepted too)
+  --read-client-id ID   optional Teams Graph read-only public client ID
   --no-open-control     pass --no-open-control to teams service bootstrap
   -h, --help            show this help
 
-One delegated token covers reading and sending chat messages, meeting chats
-and file uploads; separate read-only clients are no longer used.
+The read client defaults to the write client. If you configure a separate
+read client, the script signs in to both clients.
 
 Environment defaults:
   CODEX_HELPER_TEAMS_SETUP_CXP
   CODEX_HELPER_TEAMS_SETUP_TENANT_ID or CODEX_HELPER_TEAMS_TENANT_ID
   CODEX_HELPER_TEAMS_SETUP_CLIENT_ID, CODEX_HELPER_TEAMS_SETUP_WRITE_CLIENT_ID,
   CODEX_HELPER_TEAMS_SETUP_CHAT_CLIENT_ID, or CODEX_HELPER_TEAMS_CLIENT_ID
+  CODEX_HELPER_TEAMS_SETUP_READ_CLIENT_ID or CODEX_HELPER_TEAMS_READ_CLIENT_ID
 EOF
 }
 
 codex_proxy="${CODEX_HELPER_TEAMS_SETUP_CXP:-}"
 tenant_id="${CODEX_HELPER_TEAMS_SETUP_TENANT_ID:-${CODEX_HELPER_TEAMS_TENANT_ID:-}}"
 client_id="${CODEX_HELPER_TEAMS_SETUP_CLIENT_ID:-${CODEX_HELPER_TEAMS_SETUP_WRITE_CLIENT_ID:-${CODEX_HELPER_TEAMS_SETUP_CHAT_CLIENT_ID:-${CODEX_HELPER_TEAMS_CLIENT_ID:-}}}}"
+read_client_id="${CODEX_HELPER_TEAMS_SETUP_READ_CLIENT_ID:-${CODEX_HELPER_TEAMS_READ_CLIENT_ID:-}}"
 no_open_control=0
 
 while [ "$#" -gt 0 ]; do
@@ -50,8 +53,9 @@ while [ "$#" -gt 0 ]; do
       shift 2
       ;;
     --read-client-id)
-      echo "--read-client-id is no longer supported: the helper signs in once with one client ID; pass --client-id with the write-capable client" >&2
-      exit 2
+      [ "$#" -ge 2 ] || { echo "missing value for --read-client-id" >&2; exit 2; }
+      read_client_id="$2"
+      shift 2
       ;;
     --no-open-control)
       no_open_control=1
@@ -119,19 +123,30 @@ section "STEP 1/4: Configure Teams Graph auth"
 resolve_codex_proxy
 tenant_id="$(prompt_required "tenant id" "Microsoft Entra tenant ID" "$tenant_id")"
 client_id="$(prompt_required "client id" "Teams Graph public client ID" "$client_id")"
+if [ -z "${read_client_id//[[:space:]]/}" ]; then
+  read_client_id="$client_id"
+fi
 
 printf 'Using: %s\n' "$codex_proxy"
 printf 'This writes local auth metadata only. Client IDs are not secrets.\n'
 run_cxp teams auth config \
   --tenant-id "$tenant_id" \
+  --read-client-id "$read_client_id" \
+  --full-client-id "$client_id" \
   --client-id "$client_id"
 
 section "STEP 2/4: Sign in with Microsoft device login"
 printf 'A device login code may appear next. Open the shown URL, enter the code, and finish SSO/MFA.\n'
-run_cxp teams auth login
+if [ "$read_client_id" != "$client_id" ]; then
+  run_cxp teams auth read
+fi
+run_cxp teams auth full
 
 section "STEP 3/4: Verify local Teams auth cache"
-run_cxp teams auth status
+if [ "$read_client_id" != "$client_id" ]; then
+  run_cxp teams auth read-status
+fi
+run_cxp teams auth full-status
 
 section "STEP 4/4: Bootstrap the Teams helper service"
 printf 'If Windows or WSL asks for permission, follow the prompt. When bootstrap asks for confirmation, type yes and press Enter.\n'

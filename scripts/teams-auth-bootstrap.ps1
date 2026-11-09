@@ -24,18 +24,20 @@ helper service.
 Options:
   -CodexProxy PATH   codex-proxy/cxp executable to run
   -TenantId ID       Microsoft Entra tenant ID
-  -ClientId ID       Teams Graph public client ID
+  -ClientId ID       Teams Graph write-capable public client ID
+  -ReadClientId ID   optional Teams Graph read-only public client ID
                     (-WriteClientId and -ChatClientId are accepted as aliases)
   -NoOpenControl     pass --no-open-control to teams service bootstrap
 
-One delegated token covers reading and sending chat messages, meeting chats
-and file uploads; separate read-only clients are no longer used.
+The read client defaults to the write client. If you configure a separate
+read client, the script signs in to both clients.
 
 Environment defaults:
   CODEX_HELPER_TEAMS_SETUP_CXP
   CODEX_HELPER_TEAMS_SETUP_TENANT_ID or CODEX_HELPER_TEAMS_TENANT_ID
   CODEX_HELPER_TEAMS_SETUP_CLIENT_ID, CODEX_HELPER_TEAMS_SETUP_WRITE_CLIENT_ID,
   CODEX_HELPER_TEAMS_SETUP_CHAT_CLIENT_ID, or CODEX_HELPER_TEAMS_CLIENT_ID
+  CODEX_HELPER_TEAMS_SETUP_READ_CLIENT_ID or CODEX_HELPER_TEAMS_READ_CLIENT_ID
 "@
 }
 
@@ -92,11 +94,6 @@ if ($MyInvocation.BoundParameters.ContainsKey("Help")) {
   exit 0
 }
 
-if ($PSBoundParameters.ContainsKey("ReadClientId")) {
-  Write-Error "-ReadClientId is no longer supported: the helper signs in once with one client ID; pass -ClientId with the write-capable client" -ErrorAction Continue
-  exit 2
-}
-
 if ([string]::IsNullOrWhiteSpace($TenantId)) {
   $TenantId = if (-not [string]::IsNullOrWhiteSpace($env:CODEX_HELPER_TEAMS_SETUP_TENANT_ID)) {
     $env:CODEX_HELPER_TEAMS_SETUP_TENANT_ID
@@ -116,26 +113,45 @@ if ([string]::IsNullOrWhiteSpace($ClientId)) {
     }
   }
 }
+if ([string]::IsNullOrWhiteSpace($ReadClientId)) {
+  foreach ($candidate in @($env:CODEX_HELPER_TEAMS_SETUP_READ_CLIENT_ID, $env:CODEX_HELPER_TEAMS_READ_CLIENT_ID)) {
+    if (-not [string]::IsNullOrWhiteSpace($candidate)) {
+      $ReadClientId = $candidate
+      break
+    }
+  }
+}
 
 Write-Section "STEP 1/4: Configure Teams Graph auth"
 Resolve-CodexProxy
 $TenantId = Prompt-Required "tenant id" "Microsoft Entra tenant ID" $TenantId
 $ClientId = Prompt-Required "client id" "Teams Graph public client ID" $ClientId
+if ([string]::IsNullOrWhiteSpace($ReadClientId)) {
+  $ReadClientId = $ClientId
+}
 
 Write-Host "Using: $CodexProxy"
 Write-Host "This writes local auth metadata only. Client IDs are not secrets."
 Invoke-Cxp @(
   "teams", "auth", "config",
   "--tenant-id", $TenantId,
+  "--read-client-id", $ReadClientId,
+  "--full-client-id", $ClientId,
   "--client-id", $ClientId
 )
 
 Write-Section "STEP 2/4: Sign in with Microsoft device login"
 Write-Host "A device login code may appear next. Open the shown URL, enter the code, and finish SSO/MFA."
-Invoke-Cxp @("teams", "auth", "login")
+if ($ReadClientId -ne $ClientId) {
+  Invoke-Cxp @("teams", "auth", "read")
+}
+Invoke-Cxp @("teams", "auth", "full")
 
 Write-Section "STEP 3/4: Verify local Teams auth cache"
-Invoke-Cxp @("teams", "auth", "status")
+if ($ReadClientId -ne $ClientId) {
+  Invoke-Cxp @("teams", "auth", "read-status")
+}
+Invoke-Cxp @("teams", "auth", "full-status")
 
 Write-Section "STEP 4/4: Bootstrap the Teams helper service"
 Write-Host "If Windows or WSL asks for permission, follow the prompt. When bootstrap asks for confirmation, type yes and press Enter."

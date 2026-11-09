@@ -827,7 +827,16 @@ func openDelegateRegistry(opts *delegateOptions) (*delegateRegistrySession, erro
 		_ = closeSession(context.Background())
 		return nil, err
 	}
-	adapter, err := chteams.New(chteams.Config{HTTP: httpClient.Client, Tokens: chteams.NewDelegatedAuth(cfg, httpClient.Client), TenantID: cfg.TenantID})
+	readCfg, err := chteams.ResolveReadAuthConfig("")
+	if err != nil {
+		_ = closeSession(context.Background())
+		return nil, err
+	}
+	adapterCfg := chteams.Config{HTTP: httpClient.Client, Tokens: chteams.NewDelegatedAuth(cfg, httpClient.Client), TenantID: cfg.TenantID}
+	if readCfg.ClientID != cfg.ClientID {
+		adapterCfg.ReadTokens = chteams.NewDelegatedAuth(readCfg, httpClient.Client)
+	}
+	adapter, err := chteams.New(adapterCfg)
 	if err != nil {
 		_ = closeSession(context.Background())
 		return nil, err

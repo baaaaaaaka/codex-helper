@@ -19,8 +19,9 @@ import (
 	"github.com/gofrs/flock"
 )
 
-// Delegated authentication: one Microsoft Entra delegated token for
-// everything the adapter does (read, write, files, meetings).
+// Delegated authentication: one full token for writes and, optionally, a
+// separate read token. When the read client is absent or matches the full
+// client, the full token also handles reads.
 //
 // Files read, in order (first usable wins):
 //
@@ -35,13 +36,17 @@ import (
 // Refreshed tokens are written back to the file they were read from
 // (0600, atomic rename, symlinks refused). Configuration comes from
 // $CODEX_HELPER_TEAMS_AUTH_CONFIG or <user config>/codex-helper/teams-auth.json
-// (tenant_id, full.client_id/scopes, falling back to chat_write.client_id),
-// with CODEX_HELPER_TEAMS_{FULL_,}{TENANT_ID,CLIENT_ID} and
-// CODEX_HELPER_TEAMS_FULL_SCOPES env overrides.
+// (tenant_id, optional read and full client IDs/scopes, with full falling
+// back to chat_write), with CODEX_HELPER_TEAMS_READ_* and
+// CODEX_HELPER_TEAMS_FULL_* env overrides.
+// The optional read token uses teams-read-token.json under the profile state
+// directory; if its client ID is absent or matches full, it reuses full.
 
 const (
+	DefaultReadScopes  = "openid profile offline_access User.Read Chat.Read Files.Read"
 	DefaultScopes      = "openid profile offline_access User.Read Chat.ReadWrite OnlineMeetings.ReadWrite Files.ReadWrite"
 	defaultLoginURL    = "https://login.microsoftonline.com"
+	readCacheName      = "teams-read-token.json"
 	fullCacheName      = "teams-full-token.json"
 	chatWriteCacheName = "teams-chat-write-token.json"
 	accessTokenSkew    = 2 * time.Minute
@@ -78,6 +83,7 @@ type TokenCache struct {
 
 type authFile struct {
 	TenantID  string                 `json:"tenant_id,omitempty"`
+	Read      authCred               `json:"read,omitempty"`
 	ChatWrite authCred               `json:"chat_write,omitempty"`
 	Full      authCred               `json:"full,omitempty"`
 	Profiles  map[string]authProfile `json:"profiles,omitempty"`
@@ -85,6 +91,7 @@ type authFile struct {
 
 type authProfile struct {
 	TenantID  string   `json:"tenant_id,omitempty"`
+	Read      authCred `json:"read,omitempty"`
 	ChatWrite authCred `json:"chat_write,omitempty"`
 	Full      authCred `json:"full,omitempty"`
 }
@@ -120,20 +127,16 @@ func AuthConfigPath() (string, error) {
 // active profile) from teams-auth.json, the environment and the existing
 // token caches. It never contacts the network.
 func ResolveAuthConfig(profile string) (AuthConfig, error) {
-	if profile == "" {
-		profile = AuthProfile()
-	}
-	var file authFile
-	path, err := AuthConfigPath()
+	file, path, err := loadAuthConfigFile()
 	if err != nil {
 		return AuthConfig{}, err
 	}
-	if raw, err := os.ReadFile(path); err == nil {
-		if err := json.Unmarshal(raw, &file); err != nil {
-			return AuthConfig{}, fmt.Errorf("read Teams auth config %s: %w", path, err)
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return AuthConfig{}, err
+	return resolveFullAuthConfig(profile, file, path)
+}
+
+func resolveFullAuthConfig(profile string, file authFile, path string) (AuthConfig, error) {
+	if profile == "" {
+		profile = AuthProfile()
 	}
 	p := file.Profiles[profile]
 	cfg := AuthConfig{
@@ -171,6 +174,76 @@ func ResolveAuthConfig(profile string) (AuthConfig, error) {
 		break
 	}
 	return cfg, nil
+}
+
+// ResolveReadAuthConfig returns a separate read credential when configured.
+// Otherwise, it reuses the full credential and token cache.
+func ResolveReadAuthConfig(profile string) (AuthConfig, error) {
+	if profile == "" {
+		profile = AuthProfile()
+	}
+	file, path, err := loadAuthConfigFile()
+	if err != nil {
+		return AuthConfig{}, err
+	}
+	fullCfg, err := resolveFullAuthConfig(profile, file, path)
+	if err != nil {
+		return AuthConfig{}, err
+	}
+	p := file.Profiles[profile]
+	clientID := first(os.Getenv("CODEX_HELPER_TEAMS_READ_CLIENT_ID"), p.Read.ClientID, file.Read.ClientID)
+	if clientID == "" || strings.TrimSpace(clientID) == strings.TrimSpace(fullCfg.ClientID) {
+		return fullCfg, nil
+	}
+	cfg := AuthConfig{
+		TenantID: first(os.Getenv("CODEX_HELPER_TEAMS_READ_TENANT_ID"), os.Getenv("CODEX_HELPER_TEAMS_TENANT_ID"), p.TenantID, file.TenantID, fullCfg.TenantID),
+		ClientID: strings.TrimSpace(clientID),
+		Scopes:   first(os.Getenv("CODEX_HELPER_TEAMS_READ_SCOPES"), p.Read.Scopes, file.Read.Scopes, DefaultReadScopes),
+	}
+	if cfg.TenantID == "" {
+		return AuthConfig{}, &channel.AuthRequired{Err: fmt.Errorf("Teams read tenant id is not configured (set it in %s)", path)}
+	}
+	if !UnsafeScopesAllowed() {
+		if err := ValidateScopes(cfg.Scopes); err != nil {
+			return AuthConfig{}, err
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_READ_TOKEN_CACHE")); v != "" {
+		cfg.CachePath = expandHome(v)
+	} else {
+		candidates, err := readCacheCandidates(profile)
+		if err != nil {
+			return AuthConfig{}, err
+		}
+		cfg.CachePath = candidates[0]
+		for _, candidate := range candidates {
+			tok, err := readTokenCache(candidate)
+			if err == nil && (tok.AccessToken != "" || tok.RefreshToken != "") {
+				cfg.CachePath = candidate
+				break
+			}
+		}
+	}
+	if filepath.Clean(cfg.CachePath) == filepath.Clean(fullCfg.CachePath) {
+		return AuthConfig{}, errors.New("Teams read and full token caches must use different files when their client IDs differ")
+	}
+	return cfg, nil
+}
+
+func loadAuthConfigFile() (authFile, string, error) {
+	path, err := AuthConfigPath()
+	if err != nil {
+		return authFile{}, "", err
+	}
+	var file authFile
+	if raw, err := os.ReadFile(path); err == nil {
+		if err := json.Unmarshal(raw, &file); err != nil {
+			return authFile{}, "", fmt.Errorf("read Teams auth config %s: %w", path, err)
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return authFile{}, "", err
+	}
+	return file, path, nil
 }
 
 // allowedScopes is v0.1.20's set of delegated Graph scopes the helper may
@@ -245,6 +318,25 @@ func cacheCandidates(profile string) ([]cacheCandidate, error) {
 			if p, err := appdirs.LegacyCachePath(name); err == nil {
 				out = append(out, cacheCandidate{p, reduced})
 			}
+		}
+	}
+	return out, nil
+}
+
+func readCacheCandidates(profile string) ([]string, error) {
+	safe := safePathPart(profile)
+	var out []string
+	p, err := appdirs.StatePath("teams", "profiles", safe, readCacheName)
+	if err != nil {
+		return nil, err
+	}
+	out = append(out, p)
+	if p, err := appdirs.LegacyCachePath("teams", "profiles", safe, readCacheName); err == nil {
+		out = append(out, p)
+	}
+	if profile == "default" {
+		if p, err := appdirs.LegacyCachePath(readCacheName); err == nil {
+			out = append(out, p)
 		}
 	}
 	return out, nil

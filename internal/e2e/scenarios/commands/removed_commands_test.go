@@ -57,7 +57,7 @@ func TestRemovedCLICommands(t *testing.T) {
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "DELETED-CLI", harness.Options{
 		Guarantees: []string{"removed-commands"},
-		Title:      "`cxp teams recover|probe-chat|drain`, `auth read|file-write`, `path mode captured-terminal|service`: unknown, non-zero exit; kept `path mode account-default` works",
+		Title:      "`cxp teams recover|probe-chat|drain`, `auth file-write`, `path mode captured-terminal|service`: unknown; auth read commands work; kept `path mode account-default` works",
 		Budget:     60 * time.Second,
 		NoStart:    true,
 	})
@@ -66,9 +66,7 @@ func TestRemovedCLICommands(t *testing.T) {
 		{"teams", "recover"},
 		{"teams", "probe-chat"},
 		{"teams", "drain"},
-		{"teams", "auth", "read"},
 		{"teams", "auth", "file-write"},
-		{"teams", "auth", "read-status"},
 		{"teams", "path", "mode", "captured-terminal"},
 		{"teams", "path", "mode", "service"},
 	} {
@@ -78,6 +76,12 @@ func TestRemovedCLICommands(t *testing.T) {
 			code != 0 && (strings.Contains(low, "unknown") || strings.Contains(low, "accepts 0 arg")),
 			"non-zero exit, unknown", fmt.Sprintf("exit %d: %s", code, clip(out, 160)))
 	}
-	out, code := s.RunCLI(20*time.Second, "teams", "path", "mode", "account-default")
+	out, code := s.RunCLI(20*time.Second, "teams", "auth", "read")
+	s.Check("restored `cxp teams auth read` works", code == 0 && strings.Contains(out, "Authenticated read access"),
+		"exit 0 and signs in", fmt.Sprintf("exit %d: %s", code, clip(out, 160)))
+	out, code = s.RunCLI(20*time.Second, "teams", "auth", "read-status")
+	s.Check("restored `cxp teams auth read-status` works", code == 0 && strings.Contains(out, "Teams read auth:"),
+		"exit 0 and reports cache state", fmt.Sprintf("exit %d: %s", code, clip(out, 160)))
+	out, code = s.RunCLI(20*time.Second, "teams", "path", "mode", "account-default")
 	s.Check("kept `cxp teams path mode account-default` works", code == 0, "exit 0", fmt.Sprintf("exit %d: %s", code, clip(out, 160)))
 }
