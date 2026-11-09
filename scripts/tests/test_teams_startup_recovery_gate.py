@@ -17,7 +17,7 @@ SCRIPT = ROOT / "scripts/ci/test_teams_startup_recovery.sh"
 NAMES = [
     "TestLegacyTeamsWatchdogHandoff",
     "TestTeamsServiceWatchdogObservesUnpublishedMigrationClaim",
-    "TestEntryLegacyWatchdogHandoff",
+    "TestEntryMigrationPreservesChatWithStoppedWatchdog",
     "TestVersionPointerReplacementWhileReaderOpen",
     "TestVersionPointerReadsLongPath",
     "TestConversionOwnershipAtEveryCheckpoint",

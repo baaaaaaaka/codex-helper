@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# The process E2E uses an executable-identity fixture. The real systemd gate
-# also needs a fixed historical binary; rebuilding current source with an old
-# version string would include the refresh logic under test.
-go test ./internal/e2e/scenarios/entry -list '^TestEntryLegacyWatchdogHandoff$' | grep -Fx 'TestEntryLegacyWatchdogHandoff'
-go test ./internal/e2e/scenarios/entry -run '^TestEntryLegacyWatchdogHandoff$' -count=3 -timeout=5m -v
+# The migration E2E reports the watchdog as intentionally stopped. The real
+# systemd gate separately uses the fixed historical binary; rebuilding current
+# source with an old version string would include the refresh logic under test.
+go test ./internal/e2e/scenarios/entry -list '^TestEntryMigrationPreservesChatWithStoppedWatchdog$' | grep -Fx 'TestEntryMigrationPreservesChatWithStoppedWatchdog'
+go test ./internal/e2e/scenarios/entry -run '^TestEntryMigrationPreservesChatWithStoppedWatchdog$' -count=3 -timeout=5m -v
 
 if [[ ${CXP_TEST_REAL_SYSTEMD:-0} == 1 ]]; then
   scratch=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:?set TMPDIR to a writable executable directory}}/cxp-legacy-watchdog.XXXXXX")
