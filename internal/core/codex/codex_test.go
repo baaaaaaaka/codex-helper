@@ -332,6 +332,27 @@ func TestRunTurnRejectedAndCapacity(t *testing.T) {
 	}
 }
 
+func TestTurnErrorReconnectExhausted(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		info string
+		want bool
+	}{
+		{"disconnected stream", `{"responseStreamDisconnected":{"httpStatusCode":null}}`, true},
+		{"stream connection failed", `{"responseStreamConnectionFailed":{"httpStatusCode":502}}`, true},
+		{"HTTP connection failed", `{"httpConnectionFailed":{"httpStatusCode":502}}`, true},
+		{"capacity", `"serverOverloaded"`, false},
+		{"missing classification", ``, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := &TurnError{CodexErrorInfo: json.RawMessage(tc.info)}
+			if got := e.ReconnectExhausted(); got != tc.want {
+				t.Fatalf("ReconnectExhausted() = %t, want %t", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestRunTurnInterrupt(t *testing.T) {
 	s, b, cfg := startFake(t)
 	ctx := tctx(t)

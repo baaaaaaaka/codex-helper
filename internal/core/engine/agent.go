@@ -173,13 +173,16 @@ type TurnOutcome struct {
 	Error       string
 	// Capacity marks a model-capacity failure (retried within 5 minutes).
 	Capacity bool
+	// ReconnectExhausted marks a terminal network connection failure
+	// after Codex's own reconnect attempts. The engine retries it like capacity.
+	ReconnectExhausted bool
 	// NotStarted: turn/start was rejected; the turn certainly did not run.
 	NotStarted bool
 	// ActiveWriter: another Codex process holds the thread (e.g. the TUI).
 	ActiveWriter bool
 	Usage        Usage
 	// Progressed: Codex streamed output during the turn (set by the
-	// engine). A capacity failure after progress restarts the retry window.
+	// engine). A retryable failure after progress restarts the retry window.
 	Progressed bool
 }
 

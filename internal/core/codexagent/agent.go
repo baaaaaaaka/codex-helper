@@ -285,6 +285,7 @@ func outcome(turnID, status, final string, terr *codex.TurnError, u *codex.Usage
 	if terr != nil {
 		o.Error = terr.Message
 		o.Capacity = terr.Capacity()
+		o.ReconnectExhausted = terr.ReconnectExhausted()
 	}
 	if u != nil {
 		o.Usage = engine.Usage{Input: u.Input, Cached: u.Cached, Output: u.Output, Reasoning: u.Reasoning, Total: u.Total}

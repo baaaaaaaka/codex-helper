@@ -333,11 +333,11 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 	return true
 }
 
-// continueText is the prompt of a capacity retry whose request Codex
+// continueText is the prompt of an automatic retry whose request Codex
 // already recorded in the thread (owner ruling 2026-11-05).
 const continueText = "continue"
 
-// continuesPrompt reports whether a turn is a capacity retry of an attempt
+// continuesPrompt reports whether a turn is an automatic retry of an attempt
 // Codex accepted in threadID: its prompt is already part of that thread,
 // so the retry sends continueText instead of the prompt again. A retry of
 // an attempt Codex never started (or one in another thread) resends the
@@ -429,14 +429,15 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 				e.progress(ctx, cs, tr, prog, text)
 			}
 		},
-		// v0.1.20 posted each compaction as Codex status; it is one more
-		// progress message (same pacing and durable delivery keys).
+		// Keep each compaction notice separate from adjacent commentary.
+		// Ordinary progress can share a transport message, but a compaction
+		// marks a distinct event in the turn.
 		Compacted: func() {
 			touch()
 			if transcriptProgress {
 				wake(e.mirrorWake)
 			} else if rs.request == "" {
-				e.progress(ctx, cs, tr, prog, textCompacted)
+				e.progressRecord(ctx, cs, tr, prog, textCompacted, false)
 			}
 		},
 		Activity: touch,
@@ -604,7 +605,7 @@ func (e *Engine) bindThread(id int64, threadID string) error {
 // same transaction as the turn's end.
 func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out TurnOutcome, cancelled bool) {
 	if cs.id == e.inboxID {
-		if out.Capacity && (out.NotStarted || out.Status == StatusFailed) && !cancelled && e.capacityRetry(cs, tr, out) {
+		if retryableFailure(out) && !cancelled && e.failureRetry(cs, tr, out) {
 			return
 		}
 		e.finishDelegation(ctx, cs, tr, out, cancelled)
@@ -627,12 +628,12 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 			text = textCancelledRunning + " Codex had already finished; its answer was discarded."
 		}
 		msgs, err = e.notice(base+":cancelled", text)
-	case out.Capacity && (out.NotStarted || out.Status == StatusFailed):
-		if e.capacityRetry(cs, tr, out) {
+	case retryableFailure(out):
+		if e.failureRetry(cs, tr, out) {
 			return
 		}
 		state, errText = store.TurnFailed, out.Error
-		msgs, err = e.statusNotice(base+":failed", "Codex is over capacity and the request did not run within 5 minutes of retrying. Resend it later.")
+		msgs, err = e.statusNotice(base+":failed", retryWindowExpiredText(out))
 	case out.Status != StatusCompleted && codexTooOld(out.Error):
 		// Codex rejected the request as too old for the model: upgrade
 		// it after running turns end; `helper retry last` runs it again.
@@ -793,12 +794,31 @@ func finalStoreError(err error) bool {
 	return false
 }
 
-// capacityRetry requeues a capacity failure inside the retry window
-// measured from the first capacity error; an attempt that made progress
-// starts a new window (08-11: reset after substantive progress), so the
-// window bounds waiting for capacity, not the length of a task. It reports
-// whether it requeued.
-func (e *Engine) capacityRetry(cs *convState, tr store.Turn, out TurnOutcome) bool {
+func retryableFailure(out TurnOutcome) bool {
+	// A capacity rejection can happen before turn/start; a connection failure
+	// is retryable only after Codex accepted and then failed the turn.
+	return (out.Capacity && (out.NotStarted || out.Status == StatusFailed)) ||
+		(out.ReconnectExhausted && !out.NotStarted && out.Status == StatusFailed)
+}
+
+func retryWindowExpiredText(out TurnOutcome) string {
+	if out.ReconnectExhausted {
+		return "Codex could not reconnect after its automatic retries, and the request did not complete within 5 minutes of retrying. Resend it later."
+	}
+	return "Codex is over capacity and the request did not run within 5 minutes of retrying. Resend it later."
+}
+
+func retryNoticeText(out TurnOutcome) string {
+	if out.ReconnectExhausted {
+		return "Codex could not reconnect after its automatic retries; the request will be retried automatically for up to 5 minutes."
+	}
+	return "Codex is at capacity right now; the request will be retried automatically for up to 5 minutes."
+}
+
+// failureRetry requeues a capacity or exhausted-connection failure inside
+// the existing retry window. Progress starts a new window, which bounds
+// recovery wait rather than task duration. It reports whether it requeued.
+func (e *Engine) failureRetry(cs *convState, tr store.Turn, out TurnOutcome) bool {
 	now := e.now()
 	deadline := fromMS(tr.RetryDeadline)
 	renew := out.Progressed && !deadline.IsZero()
@@ -841,8 +861,7 @@ func (e *Engine) capacityRetry(cs *convState, tr store.Turn, out TurnOutcome) bo
 			return err
 		}
 		if first && cs.id != e.inboxID { // the inbox carries protocol records only
-			return e.enqueueStatus(tx, cs.id, fmt.Sprintf("turn:%d:capacity", tr.ID),
-				"Codex is at capacity right now; the request will be retried automatically for up to 5 minutes.")
+			return e.enqueueStatus(tx, cs.id, fmt.Sprintf("turn:%d:retry", tr.ID), retryNoticeText(out))
 		}
 		return nil
 	})
@@ -853,7 +872,11 @@ func (e *Engine) capacityRetry(cs *convState, tr store.Turn, out TurnOutcome) bo
 	e.mu.Lock()
 	cs.capWake = now.Add(back)
 	e.mu.Unlock()
-	e.logf("turn %d in %s hit capacity (attempt %d); retrying in %s", tr.ID, cs.label, tr.Attempt, back)
+	kind := "capacity"
+	if out.ReconnectExhausted {
+		kind = "connection retry exhaustion"
+	}
+	e.logf("turn %d in %s hit %s (attempt %d); retrying in %s", tr.ID, cs.label, kind, tr.Attempt, back)
 	return true
 }
 
@@ -1207,7 +1230,7 @@ func (e *Engine) finishReconciled(ctx context.Context, cs *convState, tr store.T
 		e.finishDelegation(ctx, cs, tr, out, false)
 		return
 	}
-	if out.NotStarted && !out.Capacity && !out.ActiveWriter {
+	if out.NotStarted && !retryableFailure(out) && !out.ActiveWriter {
 		msgs, err := e.statusNotice(fmt.Sprintf("turn:%d:notstarted", tr.ID), textNotStarted)
 		if err == nil {
 			err = e.update(func(tx *store.Tx) error { return tx.FinishTurn(tr.ID, store.TurnNotStarted, out.Error, msgs) })
@@ -1217,9 +1240,10 @@ func (e *Engine) finishReconciled(ctx context.Context, cs *convState, tr store.T
 		}
 		return
 	}
-	if out.Capacity {
-		// A capacity failure found after restart is reported, not retried.
+	if retryableFailure(out) {
+		// A recoverable failure found after restart is reported, not retried.
 		out.Capacity = false
+		out.ReconnectExhausted = false
 		out.Status = StatusFailed
 	}
 	e.finish(ctx, cs, tr, out, false)
