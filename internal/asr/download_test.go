@@ -208,7 +208,10 @@ func TestDownloadSlowSourceYieldsWithPrefix(t *testing.T) {
 	in := newInstaller(t.TempDir(), nil)
 	in.slowWindow = 50 * time.Millisecond
 	in.minRate = 1 << 20
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	in.logf = t.Logf
+	// Bound a broken failover without treating shared-runner scheduling or
+	// Windows file sync time as part of the 50 ms slow-source window.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	_, err := in.download(ctx, a)
 	if err != nil {
