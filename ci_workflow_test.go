@@ -84,7 +84,7 @@ func TestCIWorkflowPullRequestTierRunsEverySuiteWithoutWeakeningRequiredChecks(t
 
 	race := workflowJobBlock(t, workflow, "race-core")
 	requireStepContains(t, race,
-		"go test -race -count=1 -timeout=15m -parallel=16 ./internal/core/... ./internal/channel/...",
+		"go test -race -p=1 -count=1 -timeout=15m -parallel=8 ./internal/core/... ./internal/channel/... ./internal/asr",
 	)
 
 	e2e := workflowJobBlock(t, workflow, "e2e")
