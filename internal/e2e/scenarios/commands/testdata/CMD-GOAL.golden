@@ -161,6 +161,7 @@
 -- <msg:20> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-CMDGOAL-withgoal-4</p>
+   | <hr/>
    | <p><strong>🎯 Active goal:</strong> Ship the quarterly report E2E-CMDGOAL-objective-3</p>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
