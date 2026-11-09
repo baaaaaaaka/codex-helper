@@ -68,7 +68,8 @@ jobs:
           # The real runtime and model are not downloaded here; those tests
           # skip without local assets.
           go test ./internal/asr ./internal/core/voice -count=1 -v
-          go test ./internal/cli -count=1 -run 'Test(TeamsASR(ArgsFromEnvAndServiceOverrides|TranscriberDefaultsToManagedQwenRuntime|TranscriberReadsManagedLlamaEnv)|TeamsServiceInstallPreservesScopedEnvironment)$' -v
+          go test ./internal/cli -count=1 -run 'Test(TeamsASR(MirrorConfigAndServiceEnvironment|ArgsFromEnvAndServiceOverrides|TranscriberDefaultsToManagedQwenRuntime|TranscriberReadsManagedLlamaEnv)|TeamsServiceInstallPreservesScopedEnvironment)$' -v
+          go test ./internal/core/engine ./internal/channel/teams -count=1 -run '^Test(Membership|Members|ApplicationAndMissingSender)' -v
 
   teams-model-profile-preflight:
     name: Teams app-server and proxy preflight (${{ matrix.os }})

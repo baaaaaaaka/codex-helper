@@ -21,6 +21,9 @@ type ManagedConfig struct {
 	CacheDir string    // default <user cache dir>/codex-helper/asr
 	Device   string    // "cpu" (default, as before) or "gpu"/"auto"/"vulkan"/"metal": GPU when one loads
 	Manifest *Manifest // default DefaultManifest(runtime.GOOS, runtime.GOARCH)
+	// MirrorBaseURLs hold byte-identical copies of every asset in Manifest.
+	MirrorBaseURLs []string
+	Logf           func(string, ...any) // stage/progress diagnostics; never logs signed URLs
 
 	// Local overrides for offline hosts; each one skips its download.
 	ServerPath, ModelPath, MMProjPath, FFmpegPath string
@@ -118,6 +121,7 @@ func NewManaged(cfg ManagedConfig) *Managed {
 	m := &Managed{cfg: cfg, in: newInstaller(cfg.CacheDir, cfg.HTTPClient),
 		setupFailures: map[string]error{}}
 	m.in.stall = cfg.StallTimeout
+	m.in.logf = cfg.Logf
 	reapOrphans(cfg.CacheDir)
 	m.in.progress = m.touch
 	m.closeCtx, m.closeFn = context.WithCancel(context.Background())
@@ -372,6 +376,11 @@ func (m *Managed) install(ctx context.Context, run *setupRun) (*paths, error) {
 		if mf, err = DefaultManifest(runtime.GOOS, runtime.GOARCH); err != nil {
 			return nil, err
 		}
+	}
+	var mirrorErr error
+	mf, mirrorErr = withMirrorBases(mf, c.MirrorBaseURLs)
+	if mirrorErr != nil {
+		return nil, mirrorErr
 	}
 	m.mu.Lock()
 	m.mf = mf

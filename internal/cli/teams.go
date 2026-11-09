@@ -19,6 +19,7 @@ import (
 )
 
 const (
+	envTeamsASRMirrors     = "CODEX_HELPER_TEAMS_ASR_MIRRORS"
 	envTeamsASRCommand     = "CODEX_HELPER_TEAMS_ASR_COMMAND"
 	envTeamsASRArgsJSON    = "CODEX_HELPER_TEAMS_ASR_ARGS_JSON"
 	envTeamsASRLlamaBinary = "CODEX_HELPER_TEAMS_ASR_LLAMA_BINARY"
@@ -617,16 +618,17 @@ func teamsASRServiceEnvironmentOverrides(command string, args []string) map[stri
 // environment (offline overrides; the device defaults to the CPU).
 func teamsASRManagedConfig() asr.ManagedConfig {
 	return asr.ManagedConfig{
-		Device:     firstNonEmptyString(strings.TrimSpace(os.Getenv(envTeamsASRLlamaDevice)), "cpu"),
-		ServerPath: strings.TrimSpace(os.Getenv(envTeamsASRLlamaBinary)),
-		ModelPath:  strings.TrimSpace(os.Getenv(envTeamsASRLlamaModel)),
-		MMProjPath: strings.TrimSpace(os.Getenv(envTeamsASRLlamaMMProj)),
-		FFmpegPath: strings.TrimSpace(os.Getenv(envTeamsASRFFmpeg)),
+		MirrorBaseURLs: strings.FieldsFunc(os.Getenv(envTeamsASRMirrors), func(r rune) bool { return r == ',' || r == ' ' || r == '\n' }),
+		Device:         firstNonEmptyString(strings.TrimSpace(os.Getenv(envTeamsASRLlamaDevice)), "cpu"),
+		ServerPath:     strings.TrimSpace(os.Getenv(envTeamsASRLlamaBinary)),
+		ModelPath:      strings.TrimSpace(os.Getenv(envTeamsASRLlamaModel)),
+		MMProjPath:     strings.TrimSpace(os.Getenv(envTeamsASRLlamaMMProj)),
+		FFmpegPath:     strings.TrimSpace(os.Getenv(envTeamsASRFFmpeg)),
 	}
 }
 
 func teamsASRManagedEnvironmentKeys() []string {
-	return []string{envTeamsASRLlamaBinary, envTeamsASRLlamaModel, envTeamsASRLlamaMMProj, envTeamsASRLlamaDevice, envTeamsASRFFmpeg}
+	return []string{envTeamsASRLlamaBinary, envTeamsASRLlamaModel, envTeamsASRLlamaMMProj, envTeamsASRLlamaDevice, envTeamsASRFFmpeg, envTeamsASRMirrors}
 }
 
 func newTeamsStatusCmd() *cobra.Command {

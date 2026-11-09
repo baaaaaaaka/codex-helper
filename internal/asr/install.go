@@ -58,21 +58,29 @@ type manifestFile struct {
 }
 
 type installer struct {
-	root     string
-	client   *http.Client
-	backoff  time.Duration
-	stall    time.Duration // abort a download attempt that receives nothing for this long
-	progress func()        // optional; called when bytes arrive or an install step finishes
-	noLock   bool          // tests: behave like an NFS mount without working locks
-	mu       sync.Mutex
-	verified map[string]bool // install dirs verified by this process
+	root       string
+	client     *http.Client
+	backoff    time.Duration
+	stall      time.Duration // abort a download attempt that receives nothing for this long
+	logf       func(string, ...any)
+	slowWindow time.Duration
+	minRate    int64
+	preferred  string
+	progress   func() // optional; called when bytes arrive or an install step finishes
+	noLock     bool   // tests: behave like an NFS mount without working locks
+	mu         sync.Mutex
+	verified   map[string]bool // install dirs verified by this process
 }
 
 func newInstaller(root string, client *http.Client) *installer {
 	if client == nil {
-		client = http.DefaultClient
+		transport := http.DefaultTransport.(*http.Transport).Clone()
+		transport.ResponseHeaderTimeout = 15 * time.Second
+		transport.TLSHandshakeTimeout = 10 * time.Second
+		transport.MaxIdleConnsPerHost = 2
+		client = &http.Client{Transport: transport}
 	}
-	return &installer{root: root, client: client, backoff: time.Second, stall: time.Minute, verified: map[string]bool{}}
+	return &installer{root: root, client: client, backoff: time.Second, stall: time.Minute, verified: map[string]bool{}, slowWindow: 30 * time.Second, minRate: 128 << 10}
 }
 
 // installed reports whether a verified install of a exists (no download).
@@ -111,9 +119,7 @@ func (in *installer) ensure(ctx context.Context, a Asset, validate func(dir stri
 	if in.installed(a) {
 		return dir, nil
 	}
-	in.quarantine(dir) // half-written, corrupted or from an older layout (no-op if absent)
-
-	unlock := in.lock(ctx, a.dirName())
+	unlock, locked := in.lock(ctx, a.dirName())
 	defer unlock()
 	if verifyInstall(dir, a) == nil { // another process/host finished meanwhile
 		return in.markVerified(dir), nil
@@ -121,12 +127,19 @@ func (in *installer) ensure(ctx context.Context, a Asset, validate func(dir stri
 	if err := ctx.Err(); err != nil {
 		return "", ctxError(ctx, "install "+a.Name)
 	}
+	in.quarantine(dir) // rechecked under the asset lock; never move a concurrent valid install
 
-	file, err := in.download(ctx, a)
+	part := filepath.Join(in.tmp(), "part-"+a.dirName())
+	if !locked {
+		part = filepath.Join(in.tmp(), "private-"+a.dirName()+"-"+randomHex(6))
+		defer os.Remove(part)
+	}
+	file, err := in.downloadTo(ctx, a, part)
 	if err != nil {
 		return "", err
 	}
 	defer os.Remove(file)
+	installStart := time.Now()
 	stage, err := os.MkdirTemp(in.tmp(), "stage-")
 	if err != nil {
 		return "", newError(KindCache, "create staging dir", err, "")
@@ -150,6 +163,7 @@ func (in *installer) ensure(ctx context.Context, a Asset, validate func(dir stri
 		}
 		return "", newError(KindCache, "publish "+a.Name, err, "")
 	}
+	in.log("asset=%s installed elapsed=%s", a.Name, time.Since(installStart).Round(time.Millisecond))
 	return in.markVerified(dir), nil
 }
 
@@ -177,17 +191,17 @@ func (in *installer) quarantine(dir string) {
 // lock takes the per-asset advisory lock, waiting until ctx ends. Lock
 // errors (e.g. NFS without lock support) are ignored: correctness does not
 // depend on the lock, it only avoids duplicate downloads.
-func (in *installer) lock(ctx context.Context, name string) func() {
+func (in *installer) lock(ctx context.Context, name string) (func(), bool) {
 	dir := filepath.Join(in.root, "locks")
 	if in.noLock || os.MkdirAll(dir, 0o700) != nil {
-		return func() {}
+		return func() {}, false
 	}
 	l := flock.New(filepath.Join(dir, name+".lock"))
 	ok, err := l.TryLockContext(ctx, 250*time.Millisecond)
 	if err != nil || !ok {
-		return func() {}
+		return func() {}, false
 	}
-	return func() { _ = l.Unlock() }
+	return func() { _ = l.Unlock() }, true
 }
 
 // cleanTemp removes leftovers (interrupted downloads, staging dirs,
@@ -196,95 +210,27 @@ func (in *installer) cleanTemp(now time.Time) {
 	entries, _ := os.ReadDir(in.tmp())
 	for _, e := range entries {
 		if info, err := e.Info(); err == nil && now.Sub(info.ModTime()) > staleTempAge {
+			if strings.HasPrefix(e.Name(), "part-") {
+				// A different helper may have just resumed an old prefix.
+				// Do not unlink it while that helper holds the asset lock.
+				lockPath := filepath.Join(in.root, "locks", strings.TrimPrefix(e.Name(), "part-")+".lock")
+				l := flock.New(lockPath)
+				ok, err := l.TryLock()
+				if err != nil || !ok {
+					continue
+				}
+				// Recheck age after locking: a resume may have completed
+				// between the first stat and this lock acquisition.
+				part := filepath.Join(in.tmp(), e.Name())
+				if latest, err := os.Stat(part); err == nil && now.Sub(latest.ModTime()) > staleTempAge {
+					_ = os.RemoveAll(part)
+				}
+				_ = l.Unlock()
+				continue
+			}
 			_ = os.RemoveAll(filepath.Join(in.tmp(), e.Name()))
 		}
 	}
-}
-
-// download fetches a into a temp file and verifies size and SHA-256. Each
-// URL (a.URL, then the mirrors) gets downloadTries attempts; a missing file
-// (HTTP 4xx) or wrong bytes move on to the next URL at once. The result is
-// permanent only when every URL failed permanently.
-func (in *installer) download(ctx context.Context, a Asset) (string, error) {
-	if err := os.MkdirAll(in.tmp(), 0o700); err != nil {
-		return "", newError(KindCache, "create cache dir", err, "")
-	}
-	var lastErr, transient *Error
-	for _, url := range a.urls() {
-		for attempt := 1; attempt <= downloadTries; attempt++ {
-			file, err := in.downloadOnce(ctx, a, url)
-			if err == nil {
-				return file, nil
-			}
-			lastErr = err
-			if err.Kind != KindDownload || errors.Is(err, errPermanent) || ctx.Err() != nil {
-				break
-			}
-			transient = err
-			select {
-			case <-ctx.Done():
-			case <-time.After(in.backoff * time.Duration(attempt)):
-			}
-		}
-		if ctx.Err() != nil {
-			return "", ctxError(ctx, "download "+a.Name)
-		}
-	}
-	if lastErr.Kind == KindDownload && transient != nil {
-		return "", transient // one URL may work later: keep the error retryable
-	}
-	return "", lastErr
-}
-
-func (in *installer) downloadOnce(parent context.Context, a Asset, url string) (string, *Error) {
-	op := "download " + a.Name
-	ctx, cancel := context.WithCancel(parent)
-	defer cancel()
-	stalled := time.AfterFunc(in.stall, cancel) // reset on every read below
-	defer stalled.Stop()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return "", newError(KindDownload, op, err, "")
-	}
-	req.Header.Set("User-Agent", "codex-helper-asr")
-	resp, err := in.client.Do(req)
-	if err != nil {
-		if parent.Err() == nil && ctx.Err() != nil {
-			return "", newError(KindDownload, op, err, fmt.Sprintf("no response for %s", in.stall))
-		}
-		return "", newError(KindDownload, op, err, "")
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		err := fmt.Errorf("HTTP %d from %s", resp.StatusCode, url)
-		if resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusRequestTimeout && resp.StatusCode != http.StatusTooManyRequests {
-			err = fmt.Errorf("%w: %w", errPermanent, err) // the pinned file is missing or forbidden: retrying will not help
-		}
-		return "", newError(KindDownload, op, err, "")
-	}
-	f, err := os.CreateTemp(in.tmp(), "dl-")
-	if err != nil {
-		return "", newError(KindCache, op, err, "")
-	}
-	h := sha256.New()
-	body := &stallReader{r: resp.Body, t: stalled, d: in.stall, on: in.report}
-	n, copyErr := io.Copy(io.MultiWriter(f, h), io.LimitReader(body, a.Size+1))
-	closeErr := f.Close()
-	fail := func(e *Error) (string, *Error) { _ = os.Remove(f.Name()); return "", e }
-	switch {
-	case copyErr != nil && parent.Err() == nil && ctx.Err() != nil:
-		return fail(newError(KindDownload, op, copyErr, fmt.Sprintf("no data received for %s", in.stall)))
-	case copyErr != nil:
-		return fail(newError(KindDownload, op, copyErr, ""))
-	case closeErr != nil:
-		return fail(newError(KindCache, op, closeErr, ""))
-	case n != a.Size:
-		return fail(newError(KindIntegrity, op, fmt.Errorf("got %d bytes, pinned size is %d", n, a.Size), ""))
-	}
-	if got := hex.EncodeToString(h.Sum(nil)); !strings.EqualFold(got, a.SHA256) {
-		return fail(newError(KindIntegrity, op, fmt.Errorf("sha256 %s, pinned %s", got, a.SHA256), ""))
-	}
-	return f.Name(), nil
 }
 
 // errPermanent marks download failures that retrying cannot fix (HTTP 4xx).
@@ -294,24 +240,6 @@ func (in *installer) report() {
 	if in.progress != nil {
 		in.progress()
 	}
-}
-
-// stallReader re-arms the stall timer and reports progress whenever bytes
-// arrive.
-type stallReader struct {
-	r  io.Reader
-	t  *time.Timer
-	d  time.Duration
-	on func()
-}
-
-func (s *stallReader) Read(p []byte) (int, error) {
-	n, err := s.r.Read(p)
-	if n > 0 {
-		s.t.Reset(s.d)
-		s.on()
-	}
-	return n, err
 }
 
 // verifyInstall checks dir against its manifest and the pin: every file is

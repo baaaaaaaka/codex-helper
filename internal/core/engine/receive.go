@@ -380,6 +380,9 @@ func (e *Engine) read(ctx context.Context, id int64) {
 	e.mu.Unlock()
 	start := e.now()
 	w, err := e.ch.Receive(ctx, chat, cursor)
+	if err == nil {
+		err = e.currentParticipants(ctx, id, chat, &w)
+	}
 	e.count(func(s *engineStats) { s.reads++; s.read(err, e.now()) })
 	if ctx.Err() != nil {
 		return
@@ -505,6 +508,10 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 	e.mu.Lock()
 	cs := e.convs[id]
 	label, kind, group := cs.label, cs.kind, cs.group
+	oldGroup := group
+	if w.OtherParticipants != nil {
+		group = *w.OtherParticipants
+	}
 	var fresh []channel.InboundMsg
 	now := e.now()
 	for _, m := range w.Msgs {
@@ -513,7 +520,7 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 		}
 		fresh = append(fresh, m)
 	}
-	unchanged := len(fresh) == 0 && w.Cursor == cs.cursor && cs.seeded
+	unchanged := len(fresh) == 0 && w.Cursor == cs.cursor && cs.seeded && group == oldGroup
 	// The first read of this process holds the backlog: messages that
 	// arrived while no helper read the chat. A self-echo loop needs this
 	// helper's live posts, so the backlog never counts toward the breaker
@@ -529,7 +536,6 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 	var (
 		jobs     []cmdJob
 		newTurns bool
-		becameGr bool
 		trip     bool
 		activity bool
 		hasFiles bool
@@ -543,7 +549,7 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 	moved := backlog && e.tookOver != "" && !inbox
 	var cancels []string
 	err := e.update(func(tx *store.Tx) error {
-		jobs, newTurns, becameGr, trip, activity, hasFiles, cancels, by, closed = nil, false, false, false, false, false, nil, "", nil
+		jobs, newTurns, trip, activity, hasFiles, cancels, by, closed = nil, false, false, false, false, nil, "", nil
 		var sibling time.Time // the newest sibling post of the window
 		var skipped []string
 		stg = &admitStage{recent: map[string]recentPrompt{}} // a retried attempt starts over
@@ -576,8 +582,8 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 			if c.sibling && m.Created.After(sibling) {
 				sibling = m.Created
 			}
-			if c.other && !group {
-				group, becameGr = true, true
+			if c.other && !group && w.OtherParticipants == nil {
+				group = true
 			}
 			screen(&c) // raw API keys, attachment limits (envelope.go)
 			if c.in.Kind == store.InPrompt && !c.chatter && (c.in.Sender == store.SenderOwner || c.in.Sender == store.SenderOther) {
@@ -615,8 +621,12 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 		if err != nil {
 			return err
 		}
-		if becameGr {
-			if err := tx.SetMeta(fmt.Sprintf("%s%d", metaGroupPrefix, id), "1"); err != nil {
+		if group != oldGroup {
+			value := "0"
+			if group {
+				value = "1"
+			}
+			if err := tx.SetMeta(fmt.Sprintf("%s%d", metaGroupPrefix, id), value); err != nil {
 				return err
 			}
 		}
@@ -706,9 +716,7 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 		delete(e.orphans, t) // settled: reconcileTurn leaves it
 	}
 	cs.cursor, cs.seeded, cs.live = w.Cursor, true, true
-	if becameGr {
-		cs.group = true
-	}
+	cs.group = group
 	e.applyStage(cs, stg, now)
 	for _, m := range fresh {
 		cs.seen[m.ID] = now
@@ -864,8 +872,14 @@ func (e *Engine) classify(tx *store.Tx, conv int64, kind string, group bool, m c
 		return c, true, nil
 	}
 	if !m.ByOwner {
-		c.other = true
+		c.other = m.From != "" && !strings.HasPrefix(m.From, "app:")
 		c.in.Sender = store.SenderOther
+		if !c.other {
+			// Workflows/bots and missing identities are not other human
+			// members, nor may they invoke Codex by mentioning the owner.
+			c.in.Kind = store.InSystem
+			return c, true, nil
+		}
 		c.quoteID = m.ID
 		// The control chat and the delegation inbox ignore non-owners, even
 		// when they mention Codex (R-27).

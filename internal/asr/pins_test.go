@@ -41,7 +41,7 @@ func TestDownloadFallsBackToMirrors(t *testing.T) {
 		{"primary serves", ok, ok, 1, 0},
 		{"primary missing (404)", missing, ok, 1, 1},
 		{"primary serves wrong bytes", corrupt, ok, 1, 1},
-		{"primary down (503)", down, ok, downloadTries, 1},
+		{"primary down (503)", down, ok, 1, 1},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			in, a, p, m := setup(t, c.primary, c.mirror)

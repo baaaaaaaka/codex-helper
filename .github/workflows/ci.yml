@@ -269,7 +269,7 @@ jobs:
           # The core packages check for leaked goroutines when their tests
           # end; run them as a whole so that check sees every test. The
           # whole-repository race sweep runs in nightly.yml.
-          go test -race -count=1 -timeout=15m -parallel=16 ./internal/core/... ./internal/channel/... 2>&1 | tee "$RUNNER_TEMP/race-core.log"
+          go test -race -count=1 -timeout=15m -parallel=16 ./internal/core/... ./internal/channel/... ./internal/asr 2>&1 | tee "$RUNNER_TEMP/race-core.log"
 
       - name: TUI asynchronous state and worker race checks
         shell: bash

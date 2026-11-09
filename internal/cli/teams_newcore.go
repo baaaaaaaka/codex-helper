@@ -443,7 +443,9 @@ func serveTeamsNewCore(ctx context.Context, out, errOut io.Writer, root *rootOpt
 	if err != nil {
 		return err
 	}
-	tr := voice.New(asr.New(opts.asrCommand, asrArgs, teamsASRManagedConfig()), "")
+	asrCfg := teamsASRManagedConfig()
+	asrCfg.Logf = func(format string, args ...any) { fmt.Fprintf(errOut, format+"\n", args...) }
+	tr := voice.New(asr.New(opts.asrCommand, asrArgs, asrCfg), "")
 	defer func() { _ = tr.Close() }()
 	cfg.Transcriber = tr
 	notifier := &teamsNewCoreNotifier{st: st, path: path, client: client, log: errOut}
