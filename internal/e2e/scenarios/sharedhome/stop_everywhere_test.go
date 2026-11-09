@@ -2,6 +2,7 @@ package sharedhome
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -194,11 +195,21 @@ func TestShutdownFromTheControlChat(t *testing.T) {
 func TestStoppedAcrossAHelperRestart(t *testing.T) {
 	harness.NeedsCLI(t)
 	harness.Parallel(t)
+	// Removing DISABLED lets B acquire the lease before or after the CLI
+	// reads it for pickup advice. Both messages are valid; recovery below
+	// must still be answered by B exactly once.
+	const running = "The helper on host-a is running; it resumes within a minute."
+	const standby = "No Teams service is installed on this machine. A helper standing by on any machine (the last one ran on host-a) resumes within a minute; if none is, run `cxp teams run`, or install the service with `cxp teams service install`."
 	s := harness.NewScenario(t, "STOP-RESTART", harness.Options{
 		Guarantees: []string{"F-XM-4", "R-13", "R-1"},
 		Title:      "stopped across a restart: a foreground start exits and a service-run helper stands by, with no Graph traffic, until `cxp teams start`",
 		Budget:     150 * time.Second,
 		Seam:       stopSeam("host-a"),
+		Golden: harness.GoldenOptions{Masks: []harness.Mask{{
+			Pattern: regexp.MustCompile(`(?m)^   stdout\| (?:` + regexp.QuoteMeta(running) + `|` + regexp.QuoteMeta(standby) + `)$`),
+			Replace: "   stdout| <helper pickup advice>",
+			Reason:  "standby lease acquisition races the CLI pickup advice read",
+		}}},
 		Invariants: harness.Invariants{Except: []harness.Exception{
 			{Invariant: harness.InvCleanStop, Match: `^cxp-[12] exited on its own with "exit status 1"$`,
 				Reason: "the point of the scenario: the stopped owner exits, and a foreground start while stopped is refused"},

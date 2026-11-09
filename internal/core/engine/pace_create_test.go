@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -24,6 +25,17 @@ type writeLog struct {
 	at      []time.Time
 	creates []string // titles, in order
 	posts   []string
+	// received is configured before the rig starts, when a test needs to
+	// distinguish delivery to the helper from posting to the fake server.
+	received func(channel.Window)
+}
+
+func (w *writeLog) Receive(ctx context.Context, chat, cursor string) (channel.Window, error) {
+	window, err := w.Fake.Receive(ctx, chat, cursor)
+	if err == nil && w.received != nil {
+		w.received(window)
+	}
+	return window, err
 }
 
 func (w *writeLog) note(create bool, body string) {
@@ -187,19 +199,31 @@ func TestEveryWriteIsPacedIncludingChatCreation(t *testing.T) {
 func TestRepliesBeforeCatchUpChatCreation(t *testing.T) {
 	skipWallClockPacingUnderRace(t)
 	const creating = 40
-	r, w := creatingRig(t, func(c *Config) { c.WriteRate, c.ReadRate = 4, 1000 }, 0, creating, 1)
-	ctl := r.control()
-	_, before := w.count("")
 	dir := filepath.Join(t.TempDir(), "livework")
 	if err := os.Mkdir(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	var before atomic.Int64
+	before.Store(-1)
+	r, w := creatingRig(t, func(c *Config) {
+		c.WriteRate, c.ReadRate = 4, 1000
+		log := c.Channel.(*writeLog)
+		log.received = func(window channel.Window) {
+			for _, m := range window.Msgs {
+				if m.ByOwner && m.Text == "new "+dir {
+					_, n := log.count("")
+					before.CompareAndSwap(-1, int64(n))
+				}
+			}
+		}
+	}, 0, creating, 1)
+	ctl := r.control()
 	r.ch.PostUser(ctl, "new "+dir)
 	r.waitFor("work chat", 20*time.Second, func() bool { return w.createdBefore("livework") >= 0 })
-	// The control chat and the catch-up chats created before `new` was
-	// read, plus at most a write or two in flight when it was.
-	if n := w.createdBefore("livework") - before; n > 3 {
-		t.Fatalf("%d catch-up chats were created after `new` and before its chat", n)
+	// Count from delivery to the helper: it cannot prioritize a command
+	// still waiting on the fake server. Allow the writes already in flight.
+	if n := int64(w.createdBefore("livework")) - before.Load(); before.Load() < 0 || n > 3 {
+		t.Fatalf("%d catch-up chats were created after receiving `new` and before its chat (read baseline %d)", n, before.Load())
 	}
 	r.wait("work chat created", func() bool { return len(r.own(ctl, "Work chat created")) == 1 })
 	var work string

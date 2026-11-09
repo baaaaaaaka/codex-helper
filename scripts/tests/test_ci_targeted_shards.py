@@ -344,7 +344,7 @@ class TargetedShardWorkflowTests(unittest.TestCase):
         )
         self.assertIn(f"-exclude-prefix={E2E_SCENARIOS_PREFIX}", race)
         self.assertIn(
-            "go test -race -count=1 -timeout=15m -parallel=16 ./internal/core/... ./internal/channel/...",
+            "go test -race -p=1 -count=1 -timeout=15m -parallel=8 ./internal/core/... ./internal/channel/... ./internal/asr",
             job_block(WORKFLOW, "race-core"),
         )
 
