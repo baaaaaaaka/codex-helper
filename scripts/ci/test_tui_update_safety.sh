@@ -50,8 +50,11 @@ else
     echo "critical native boot tests were not selected" >&2
     exit 1
   fi
-  go test -tags cxp_boot_e2e ./internal/update -list '^TestTUIAutoNativeDownloadThenRealNextInvocation$' \
-    | grep -q '^TestTUIAutoNativeDownloadThenRealNextInvocation$'
+  update_tests="$(go test -tags cxp_boot_e2e ./internal/update -list '^TestTUIAutoNativeDownloadThenRealNextInvocation$')"
+  if ! grep -Fxq 'TestTUIAutoNativeDownloadThenRealNextInvocation' <<<"$update_tests"; then
+    echo "critical native TUI update test was not selected" >&2
+    exit 1
+  fi
   go test -tags cxp_boot_e2e ./internal/helperruntime ./internal/update \
     -run '^Test(BootE2E|TUIAutoNative)' -count=1 -timeout=180s -v
 fi
