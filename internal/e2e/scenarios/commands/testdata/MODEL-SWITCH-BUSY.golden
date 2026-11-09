@@ -101,21 +101,24 @@
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:10> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>▶️ <strong>Next to run</strong><br>
+   | “Next task E2E-MODELSWITCHBUSY-queued-2”</p>
+-- <msg:11> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
-   | <p>▶️ Queued request: “Next task E2E-MODELSWITCHBUSY-queued-2”</p>
    | <p>E2EANSWER-<n> answer for E2E-MODELSWITCHBUSY-queued-2</p>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-mini, effort - low, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:11> owner (html)
+-- <msg:12> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>After the crash E2E-MODELSWITCHBUSY-aftercrash-3</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>After the crash E2E-MODELSWITCHBUSY-aftercrash-3</p>
--- <msg:12> helper (html)
+-- <msg:13> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:13> helper (html)
+-- <msg:14> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-MODELSWITCHBUSY-aftercrash-3</p>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-mini, effort - low, tier - standard</p>

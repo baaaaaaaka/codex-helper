@@ -89,9 +89,11 @@
    | <p>Check recent messages and changed files first. If no final answer appears, resend the message or use <code>helper retry last</code>.</p>
 -- <msg:10> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>▶️ Codex is starting your 2 queued requests, one after another:</p>
-   | <ol><li>“Follow-up E2E-R429-queued-2”</li>
-   | <li>“Sent while helper is down E2E-R429-whiledown-3”</li>
+   | <p>▶️ <strong>Next to run</strong><br>
+   | “Follow-up E2E-R429-queued-2”</p>
+   | <hr/>
+   | <p>⏳ <strong>Still queued (1)</strong></p>
+   | <ol><li>“Sent while helper is down E2E-R429-whiledown-3”</li>
    | </ol>
 -- <msg:11> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
@@ -100,7 +102,6 @@
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:12> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
-   | <p>▶️ Queued request: “Sent while helper is down E2E-R429-whiledown-3”</p>
    | <p>E2EANSWER-<n> answer for E2E-R429-whiledown-3</p>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>

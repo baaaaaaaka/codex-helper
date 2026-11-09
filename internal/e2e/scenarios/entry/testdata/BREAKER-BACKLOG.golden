@@ -118,9 +118,11 @@
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:13> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>▶️ Codex is starting your 3 queued requests, one after another:</p>
-   | <ol><li>“Queued while down 2 E2E-BREAKERBACKLOG-q12-3”</li>
-   | <li>“Queued while down 3 E2E-BREAKERBACKLOG-q13-5”</li>
+   | <p>▶️ <strong>Next to run</strong><br>
+   | “Queued while down 2 E2E-BREAKERBACKLOG-q12-3”</p>
+   | <hr/>
+   | <p>⏳ <strong>Still queued (2)</strong></p>
+   | <ol><li>“Queued while down 3 E2E-BREAKERBACKLOG-q13-5”</li>
    | <li>“Queued while down 4 E2E-BREAKERBACKLOG-q14-7”</li>
    | </ol>
 -- <msg:14> helper (html)
@@ -130,13 +132,11 @@
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:15> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
-   | <p>▶️ Queued request: “Queued while down 3 E2E-BREAKERBACKLOG-q13-5”</p>
    | <p>E2EANSWER-<n> answer for E2E-BREAKERBACKLOG-q13-5</p>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:16> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
-   | <p>▶️ Queued request: “Queued while down 4 E2E-BREAKERBACKLOG-q14-7”</p>
    | <p>E2EANSWER-<n> answer for E2E-BREAKERBACKLOG-q14-7</p>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
@@ -147,13 +147,11 @@
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:18> peer-helper (html)
    | <p><strong>🤖 ✅ Codex answer:</strong></p>
-   | <p>▶️ Queued request: “Queued while down 3 E2E-BREAKERBACKLOG-q13-5”</p>
    | <p>E2EANSWER-<n> answer for E2E-BREAKERBACKLOG-q13-5</p>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:19> peer-helper (html)
    | <p><strong>🤖 ✅ Codex answer:</strong></p>
-   | <p>▶️ Queued request: “Queued while down 4 E2E-BREAKERBACKLOG-q14-7”</p>
    | <p>E2EANSWER-<n> answer for E2E-BREAKERBACKLOG-q14-7</p>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
@@ -229,9 +227,11 @@
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:13> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>▶️ Codex is starting your 3 queued requests, one after another:</p>
-   | <ol><li>“Queued while down 2 E2E-BREAKERBACKLOG-q22-4”</li>
-   | <li>“Queued while down 3 E2E-BREAKERBACKLOG-q23-6”</li>
+   | <p>▶️ <strong>Next to run</strong><br>
+   | “Queued while down 2 E2E-BREAKERBACKLOG-q22-4”</p>
+   | <hr/>
+   | <p>⏳ <strong>Still queued (2)</strong></p>
+   | <ol><li>“Queued while down 3 E2E-BREAKERBACKLOG-q23-6”</li>
    | <li>“Queued while down 4 E2E-BREAKERBACKLOG-q24-8”</li>
    | </ol>
 -- <msg:14> helper (html)
@@ -241,13 +241,11 @@
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:15> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
-   | <p>▶️ Queued request: “Queued while down 3 E2E-BREAKERBACKLOG-q23-6”</p>
    | <p>E2EANSWER-<n> answer for E2E-BREAKERBACKLOG-q23-6</p>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:16> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
-   | <p>▶️ Queued request: “Queued while down 4 E2E-BREAKERBACKLOG-q24-8”</p>
    | <p>E2EANSWER-<n> answer for E2E-BREAKERBACKLOG-q24-8</p>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>

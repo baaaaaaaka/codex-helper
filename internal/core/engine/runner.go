@@ -173,7 +173,6 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 		req     TurnRequest
 		got     bool
 		request string // delegation request text (inbox turns)
-		queued  string // quote of a prompt that waited (folded notice)
 		batch   int64  // last turn of a batch start notice
 		// voiceFailed: the next turn was a voice message that could not
 		// be transcribed; it was answered with the reason, not started.
@@ -183,7 +182,7 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 	)
 	err := e.update(func(tx *store.Tx) error {
 		var err error
-		queued, batch, voiceFailed = "", 0, false
+		batch, voiceFailed = 0, false
 		tr, got, err = tx.NextRunnable(id)
 		if err != nil || !got {
 			return err
@@ -268,23 +267,16 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 		if lastEnd.IsZero() || ms(lastEnd) <= tr.QueuedAt {
 			return nil
 		}
-		// It was queued behind the turn that just ended (R-35). A
-		// single queued request is named at the head of its first
-		// message (progress or answer), not in a notice of its own;
-		// when several wait, one notice lists them all as they start.
+		// It was queued behind the turn that just ended (R-35). One
+		// notice names the next request and any requests still queued.
 		if tr.ID <= batchThrough {
-			queued = quotePrompt(in.Body)
 			return nil
 		}
 		open, err := tx.OpenTurnsOf(id)
 		if err != nil {
 			return err
 		}
-		if len(open) < 2 {
-			queued = quotePrompt(in.Body)
-			return nil
-		}
-		prompts := make([]string, 0, len(open))
+		prompts := make([]string, 0, max(1, len(open)))
 		for _, o := range open {
 			body := in.Body
 			if o.ID != tr.ID {
@@ -296,7 +288,13 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 			}
 			prompts = append(prompts, quotePrompt(body))
 		}
-		batch = open[len(open)-1].ID
+		if len(prompts) == 0 {
+			prompts = append(prompts, quotePrompt(in.Body))
+		}
+		batch = tr.ID
+		if len(open) > 0 {
+			batch = open[len(open)-1].ID
+		}
 		return e.enqueueNotice(tx, id, fmt.Sprintf("turn:%d:starting", tr.ID), textStartingBatch(prompts))
 	})
 	if err != nil {
@@ -316,7 +314,7 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 	if control {
 		e.afterControlStart(ctl) // batch B
 	}
-	rs := &runState{turnID: tr.ID, turnKey: tr.TurnKey, done: make(chan struct{}), request: request, queuedPrompt: queued}
+	rs := &runState{turnID: tr.ID, turnKey: tr.TurnKey, done: make(chan struct{}), request: request}
 	e.mu.Lock()
 	cs.running = rs
 	if batch > cs.batchThrough {
@@ -410,7 +408,7 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 			e.mirror.mu.Unlock()
 		}()
 	}
-	prog := &progressState{queued: rs.queuedPrompt}
+	prog := &progressState{}
 	touch := func() { rs.lastEvent.Store(ms(e.now())) }
 	touch()
 	hooks := TurnHooks{
@@ -545,10 +543,9 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 	cancelled := rs.cancelled
 	e.mu.Unlock()
 	prog.mu.Lock()
-	queued := prog.queued // not yet named in a progress message
 	out.Progressed = out.Progressed || prog.progressed
 	prog.mu.Unlock()
-	e.finish(ctx, cs, tr, out, cancelled, queued)
+	e.finish(ctx, cs, tr, out, cancelled)
 	e.clearRun(id, rs)
 }
 
@@ -605,7 +602,7 @@ func (e *Engine) bindThread(id int64, threadID string) error {
 
 // finish records the outcome of a turn: the final or one notice, in the
 // same transaction as the turn's end.
-func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out TurnOutcome, cancelled bool, queued string) {
+func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out TurnOutcome, cancelled bool) {
 	if cs.id == e.inboxID {
 		if out.Capacity && (out.NotStarted || out.Status == StatusFailed) && !cancelled && e.capacityRetry(cs, tr, out) {
 			return
@@ -622,14 +619,6 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 		upgrade        bool
 	)
 	base := fmt.Sprintf("turn:%d", tr.ID)
-	// A prompt that waited behind an earlier turn and was not named in a
-	// progress message is named at the head of the outcome (R-35).
-	named := func(text string) string {
-		if queued == "" {
-			return text
-		}
-		return textQueuedOutcome(queued) + "\n\n" + text
-	}
 	switch {
 	case cancelled:
 		state, errText = store.TurnCancelled, "cancelled by the user"
@@ -637,13 +626,13 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 		if out.Status == StatusCompleted {
 			text = textCancelledRunning + " Codex had already finished; its answer was discarded."
 		}
-		msgs, err = e.notice(base+":cancelled", named(text))
+		msgs, err = e.notice(base+":cancelled", text)
 	case out.Capacity && (out.NotStarted || out.Status == StatusFailed):
 		if e.capacityRetry(cs, tr, out) {
 			return
 		}
 		state, errText = store.TurnFailed, out.Error
-		msgs, err = e.statusNotice(base+":failed", named("Codex is over capacity and the request did not run within 5 minutes of retrying. Resend it later."))
+		msgs, err = e.statusNotice(base+":failed", "Codex is over capacity and the request did not run within 5 minutes of retrying. Resend it later.")
 	case out.Status != StatusCompleted && codexTooOld(out.Error):
 		// Codex rejected the request as too old for the model: upgrade
 		// it after running turns end; `helper retry last` runs it again.
@@ -655,7 +644,7 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 		if e.cfg.CodexUpgrader != nil {
 			text, upgrade = textCodexTooOld, true
 		}
-		msgs, err = e.statusNotice(base+":codex-too-old", named(text+"\n\nCodex said: "+userError(out.Error)))
+		msgs, err = e.statusNotice(base+":codex-too-old", text+"\n\nCodex said: "+userError(out.Error))
 		if upgrade {
 			extra = func(tx *store.Tx) error {
 				return e.requestCodexUpgrade(tx, &codexTarget{Conv: cs.id, Inbound: tr.InboundID}, nil)
@@ -663,10 +652,10 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 		}
 	case out.ActiveWriter:
 		state, errText = store.TurnFailed, out.Error
-		msgs, err = e.statusNotice(base+":active", named(textActive))
+		msgs, err = e.statusNotice(base+":active", textActive)
 	case out.NotStarted:
 		state, errText = store.TurnNotStarted, out.Error
-		msgs, err = e.statusNotice(base+":notstarted", named(textNotStartedTurn(out.Error))) // setuperr.go (F-TRN-16)
+		msgs, err = e.statusNotice(base+":notstarted", textNotStartedTurn(out.Error)) // setuperr.go (F-TRN-16)
 	case out.Status == StatusCompleted:
 		state = store.TurnCompleted
 		visible, files, problems := e.stageArtifacts(tr, out.Final)
@@ -679,7 +668,7 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 		}
 		out.Final = final
 		if final != "" {
-			doc := answerDoc(named(final))
+			doc := answerDoc(final)
 			doc.Notes = infoNotes(e.turnInfo(cs.id), true)
 			// Batch B: a control-chat answer mentions the owner itself
 			// (v0.1.20 outboxAlreadyMentionedControlOwner); finalMention
@@ -697,14 +686,14 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 		notify = err == nil
 	case out.Status == StatusInterrupted:
 		state, errText = store.TurnInterrupted, out.Error
-		msgs, err = e.statusNotice(base+":interrupted", named(textInterrupted))
+		msgs, err = e.statusNotice(base+":interrupted", textInterrupted)
 	default:
 		state, errText = store.TurnFailed, out.Error
-		msgs, err = e.statusNotice(base+":failed", named(textFailedTurn(out.Error))) // setuperr.go (F-TRN-16)
+		msgs, err = e.statusNotice(base+":failed", textFailedTurn(out.Error)) // setuperr.go (F-TRN-16)
 	}
 	if err != nil {
 		e.logf("render outcome of turn %d: %v", tr.ID, err)
-		msgs, _ = e.statusNotice(base+":failed", named("The answer could not be rendered for this chat. Resend the request if you still need it."))
+		msgs, _ = e.statusNotice(base+":failed", "The answer could not be rendered for this chat. Resend the request if you still need it.")
 	}
 	if !e.commitFinish(ctx, tr, func(tx *store.Tx) error {
 		if err := tx.FinishTurn(tr.ID, state, errText, msgs); err != nil {
@@ -1233,7 +1222,7 @@ func (e *Engine) finishReconciled(ctx context.Context, cs *convState, tr store.T
 		out.Capacity = false
 		out.Status = StatusFailed
 	}
-	e.finish(ctx, cs, tr, out, false, "")
+	e.finish(ctx, cs, tr, out, false)
 }
 
 // Progress callbacks are serialized and durably enqueued without content caps.
@@ -1247,9 +1236,6 @@ type progressState struct {
 	posted int
 	// progressed: Codex streamed non-empty output during the turn.
 	progressed bool
-	// queued is the quote of a prompt that waited behind an earlier turn,
-	// until a message of the turn names it.
-	queued string
 	// lastRetry is when the last reconnect status was due (posted or not).
 	lastRetry time.Time
 }
@@ -1263,9 +1249,6 @@ func (e *Engine) progressRecord(ctx context.Context, cs *convState, tr store.Tur
 	text = strings.TrimSpace(transcript.StripMemCitations(text)) // F-MIR-8
 	if text == "" {
 		return
-	}
-	if ps.queued != "" {
-		text = textStarting(ps.queued) + "\n\n" + text
 	}
 	for attempt := 0; ctx.Err() == nil; attempt++ {
 		doc := statusDoc(text)
@@ -1306,7 +1289,6 @@ func (e *Engine) progressRecord(ctx context.Context, cs *convState, tr store.Tur
 		}
 		if queued {
 			ps.posted++
-			ps.queued = ""
 			e.wakeSender()
 		}
 		return

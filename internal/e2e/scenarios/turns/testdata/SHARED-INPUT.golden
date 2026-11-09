@@ -98,24 +98,27 @@
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:11> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>▶️ <strong>Next to run</strong><br>
+   | “Later task E2E-SHAREDINPUT-queued-2”</p>
+-- <msg:12> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
-   | <p>▶️ Queued request: “Later task E2E-SHAREDINPUT-queued-2”</p>
    | <p>E2EANSWER-<n> answer for E2E-SHAREDINPUT-queued-2</p>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:12> helper (html)
+-- <msg:13> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
    | <p>Native task E2E-SHAREDINPUT-external-5</p>
--- <msg:13> owner (html)
+-- <msg:14> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Teams addition E2E-SHAREDINPUT-foreignextra-6</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>Teams addition E2E-SHAREDINPUT-foreignextra-6</p>
--- <msg:14> helper (html)
+-- <msg:15> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:15> helper (html)
+-- <msg:16> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-SHAREDINPUT-external-5</p>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>

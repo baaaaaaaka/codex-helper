@@ -1173,28 +1173,27 @@ func TestQueuedTurnRemindedAndAnnouncedWhenStarting(t *testing.T) {
 	}
 	close(release)
 	r.wait("second job answered", func() bool { return len(r.own(work, "ANSWER to second job")) == 1 })
-	// A single queued request is named at the head of its first message
-	// (here the answer: the turn posts no progress), not in a notice.
-	if n := len(r.own(work, "ueued request: “second job”")); n != 1 {
-		t.Errorf("%d messages name the queued request as it starts, want 1", n)
+	// A single queued request gets its own start notice; its answer stays plain.
+	starting := r.own(work, "Next to run")
+	if len(starting) != 1 || !strings.Contains(starting[0].Text, "“second job”") || strings.Contains(starting[0].Text, "Still queued") {
+		t.Errorf("start notice for one queued request: %v", starting)
 	}
-	if n := len(r.own(work, "▶️ Queued request: “second job”\n\nANSWER to second job")); n != 1 {
-		t.Errorf("the answer of the queued request does not name it first")
+	if a := r.own(work, "ANSWER to second job"); len(a) != 1 || strings.Contains(a[0].Text, "Queued request") {
+		t.Errorf("queued request answer has a special prefix: %v", a)
 	}
-	if n := len(r.own(work, "ueued request: “first job”")); n != 0 {
-		t.Errorf("%d starting notices for a request that did not wait", n)
-	}
+	startingBeforeThird := len(starting)
 	r.ch.PostUser(work, "third job")
 	r.wait("third job answered", func() bool { return len(r.own(work, "ANSWER to third job")) == 1 })
+	if n := len(r.own(work, "Next to run")); n != startingBeforeThird {
+		t.Errorf("a request that did not wait added %d queue notices", n-startingBeforeThird)
+	}
 	if n := len(r.own(work, "“third job”")); n != 0 {
 		t.Errorf("a request that did not wait got %d queue notices", n)
 	}
 }
 
-// Benchmark F5: a backlog of queued requests in one chat starts with one
-// notice listing them, and each later request is named at the head of its
-// first message: at most two posts per request (its ACK and its answer)
-// plus the one notice.
+// Benchmark F5: a backlog starts with one notice that separates the next
+// request from the prompts still queued; answers keep their normal format.
 func TestQueuedBacklogStartsWithOneNotice(t *testing.T) {
 	r := newRig(t)
 	release := make(chan struct{})
@@ -1216,27 +1215,29 @@ func TestQueuedBacklogStartsWithOneNotice(t *testing.T) {
 		j := j
 		r.wait("answer to "+j, func() bool { return len(r.own(work, "ANSWER to "+j)) == 1 })
 	}
-	batch := r.own(work, "starting your 4 queued requests")
+	batch := r.own(work, "Next to run")
 	if len(batch) != 1 {
 		t.Fatalf("%d batch notices, want 1", len(batch))
+	}
+	wantSections := "**Next to run**\n“job 1”\n\n---\n\n⏳ **Still queued (3)**\n1. “job 2”"
+	if !strings.Contains(batch[0].Text, wantSections) {
+		t.Errorf("batch notice does not separate the next request from the queue:\n%s", batch[0].Text)
 	}
 	for _, j := range jobs {
 		if !strings.Contains(batch[0].Text, "“"+j+"”") {
 			t.Errorf("batch notice does not list %q:\n%s", j, batch[0].Text)
 		}
 	}
-	if n := len(r.own(work, "starting this queued request: “job 1”")) + len(r.own(work, "Queued request: “job 1”")); n != 0 {
-		t.Errorf("the first request of the batch is named again in %d messages", n)
+	if !strings.Contains(batch[0].Text, "**Next to run**\n“job 1”") || strings.Contains(batch[0].Text, "“job 0”") {
+		t.Errorf("batch notice does not identify the next request:\n%s", batch[0].Text)
 	}
-	for _, j := range []string{"job 2", "job 4"} {
-		if a := r.own(work, "ANSWER to "+j); !strings.Contains(a[0].Text, "▶️ Queued request: “"+j+"”\n\nANSWER to "+j) {
-			t.Errorf("answer of %q does not name it first:\n%s", j, a[0].Text)
+	for _, j := range jobs {
+		if a := r.own(work, "ANSWER to "+j); len(a) != 1 || strings.Contains(a[0].Text, "Queued request") {
+			t.Errorf("answer of %q has a queue-specific prefix: %v", j, a)
 		}
 	}
-	if p := r.own(work, "step A (job 3 progress)"); len(p) != 1 || !strings.Contains(p[0].Text, "▶️ Codex is starting this queued request: “job 3 progress”\n\nstep A") {
-		t.Errorf("first progress of a queued request does not name it: %v", p)
-	} else if a := r.own(work, "ANSWER to job 3 progress"); strings.Contains(a[0].Text, "Queued request") {
-		t.Errorf("answer names the request again after its progress did")
+	if p := r.own(work, "step A (job 3 progress)"); len(p) != 1 || strings.Contains(p[0].Text, "starting this queued request") {
+		t.Errorf("progress of a queued request has a queue-specific prefix: %v", p)
 	}
 	posts := len(r.own(work, "")) - before
 	turns := 1 + len(jobs)

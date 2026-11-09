@@ -96,8 +96,8 @@ type convState struct {
 	// lastTurnEnd is when a started turn of this conversation last ended:
 	// a queued turn admitted before it waited behind it (R-35).
 	lastTurnEnd time.Time
-	// batchThrough is the last turn named by a "starting your N queued
-	// requests" notice: the turns up to it get no notice of their own.
+	// batchThrough is the last turn named by the latest queue-start notice;
+	// those turns need no separate notice as they start.
 	batchThrough int64
 	recent       map[string]recentPrompt // normalized prompt -> last prompt
 	lastDup      int64                   // inbound id of the last duplicate-ignored prompt
@@ -134,9 +134,6 @@ type runState struct {
 	// request is the delegation request text of a delegated turn ("" for
 	// an ordinary turn).
 	request string
-	// queuedPrompt is the quote of a prompt that waited behind an earlier
-	// turn: it heads the turn's first message (R-35, folded).
-	queuedPrompt string
 }
 
 func randHex(n int) string {

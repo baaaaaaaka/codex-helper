@@ -172,12 +172,6 @@ func quietDuration(d time.Duration) string {
 	return strings.TrimSuffix(r.String(), "0s")
 }
 
-// textStarting names a queued request at the head of its first progress
-// message; quoted is a quotePrompt.
-func textStarting(quoted string) string {
-	return "▶️ Codex is starting this queued request: " + quoted
-}
-
 // textQueuedAck acknowledges a request that waits behind another one in
 // the same chat (owner ruling 2026-11-05: short, says when it runs and how
 // to cancel it). isRunning reports whether a request of the chat runs (or
@@ -219,21 +213,22 @@ func promptLine(p string) string {
 	return p
 }
 
-// textQueuedOutcome names a queued request at the head of its answer or
-// outcome notice when no progress message named it.
-func textQueuedOutcome(quoted string) string {
-	return "▶️ Queued request: " + quoted
-}
-
-// textStartingBatch is the one notice when several queued requests start
-// one after another (the first is starting now).
+// textStartingBatch is the one notice when one or more queued requests start.
 func textStartingBatch(quoted []string) string {
-	const show = 10
+	if len(quoted) == 0 {
+		return ""
+	}
+	const show = 9
 	var b strings.Builder
-	fmt.Fprintf(&b, "▶️ Codex is starting your %d queued requests, one after another:\n", len(quoted))
-	for i, q := range quoted {
+	fmt.Fprintf(&b, "▶️ **Next to run**\n%s", quoted[0])
+	if len(quoted) == 1 {
+		return b.String()
+	}
+	remaining := len(quoted) - 1
+	fmt.Fprintf(&b, "\n\n---\n\n⏳ **Still queued (%d)**", remaining)
+	for i, q := range quoted[1:] {
 		if i == show {
-			fmt.Fprintf(&b, "\n…and %d more.", len(quoted)-show)
+			fmt.Fprintf(&b, "\n…and %d more.", remaining-show)
 			break
 		}
 		fmt.Fprintf(&b, "\n%d. %s", i+1, q)

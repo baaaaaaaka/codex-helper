@@ -190,9 +190,11 @@
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:10> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>▶️ Codex is starting your 2 queued requests, one after another:</p>
-   | <ol><li>“Quick question 1 E2E-BREAKER-burst1-3”</li>
-   | <li>“Quick question 2 E2E-BREAKER-burst2-4”</li>
+   | <p>▶️ <strong>Next to run</strong><br>
+   | “Quick question 1 E2E-BREAKER-burst1-3”</p>
+   | <hr/>
+   | <p>⏳ <strong>Still queued (1)</strong></p>
+   | <ol><li>“Quick question 2 E2E-BREAKER-burst2-4”</li>
    | </ol>
 -- <msg:11> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
@@ -201,7 +203,6 @@
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:12> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
-   | <p>▶️ Queued request: “Quick question 2 E2E-BREAKER-burst2-4”</p>
    | <p>E2EANSWER-<n> answer for E2E-BREAKER-burst2-4</p>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
