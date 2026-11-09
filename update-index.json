@@ -1,6 +1,47 @@
 {
-  "generated_at": "2026-11-09T04:02:11Z",
+  "generated_at": "2026-11-09T10:34:12Z",
   "releases": [
+    {
+      "assets": [
+        {
+          "name": "README.md"
+        },
+        {
+          "name": "checksums.txt"
+        },
+        {
+          "name": "codex-proxy_0.1.22-rc.87_darwin_amd64"
+        },
+        {
+          "name": "codex-proxy_0.1.22-rc.87_darwin_arm64"
+        },
+        {
+          "name": "codex-proxy_0.1.22-rc.87_linux_amd64"
+        },
+        {
+          "name": "codex-proxy_0.1.22-rc.87_windows_amd64.exe"
+        },
+        {
+          "name": "install.ps1"
+        },
+        {
+          "name": "install.sh"
+        },
+        {
+          "name": "teams-auth-bootstrap.ps1"
+        },
+        {
+          "name": "teams-auth-bootstrap.sh"
+        }
+      ],
+      "draft": false,
+      "name": "v0.1.22-rc.87",
+      "prerelease": true,
+      "priority": "p2",
+      "published_at": "2026-11-09T10:20:28Z",
+      "tag_name": "v0.1.22-rc.87",
+      "version": "0.1.22-rc.87"
+    },
     {
       "assets": [
         {
@@ -4059,47 +4100,6 @@
       "published_at": "2026-07-21T04:51:34Z",
       "tag_name": "v0.1.16-rc.1",
       "version": "0.1.16-rc.1"
-    },
-    {
-      "assets": [
-        {
-          "name": "README.md"
-        },
-        {
-          "name": "checksums.txt"
-        },
-        {
-          "name": "codex-proxy_0.1.15_darwin_amd64"
-        },
-        {
-          "name": "codex-proxy_0.1.15_darwin_arm64"
-        },
-        {
-          "name": "codex-proxy_0.1.15_linux_amd64"
-        },
-        {
-          "name": "codex-proxy_0.1.15_windows_amd64.exe"
-        },
-        {
-          "name": "install.ps1"
-        },
-        {
-          "name": "install.sh"
-        },
-        {
-          "name": "teams-auth-bootstrap.ps1"
-        },
-        {
-          "name": "teams-auth-bootstrap.sh"
-        }
-      ],
-      "draft": false,
-      "name": "v0.1.15",
-      "prerelease": false,
-      "priority": "p2",
-      "published_at": "2026-07-20T13:55:02Z",
-      "tag_name": "v0.1.15",
-      "version": "0.1.15"
     }
   ],
   "repo": "baaaaaaaka/codex-helper",
