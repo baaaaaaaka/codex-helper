@@ -183,7 +183,9 @@ func TestDownloadCompletePartialIsVerifiedBeforeReuse(t *testing.T) {
 }
 
 func TestDownloadSlowSourceYieldsWithPrefix(t *testing.T) {
-	data := []byte(strings.Repeat("voice", 1000))
+	// Keep the fast fixture below a TCP segment. A multi-packet response
+	// can pause on Windows long enough to trip an accelerated test timer.
+	data := []byte(strings.Repeat("voice", 200))
 	var slowHits atomic.Int32
 	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		slowHits.Add(1)
@@ -206,11 +208,10 @@ func TestDownloadSlowSourceYieldsWithPrefix(t *testing.T) {
 	a := downloadAsset(slow.URL, data)
 	a.Mirrors = []string{fast.URL}
 	in := newInstaller(t.TempDir(), nil)
-	in.slowWindow = 50 * time.Millisecond
+	in.slowWindow = time.Second
 	in.minRate = 1 << 20
 	in.logf = t.Logf
-	// Bound a broken failover without treating shared-runner scheduling or
-	// Windows file sync time as part of the 50 ms slow-source window.
+	// Bound a broken failover separately from the accelerated slow window.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	_, err := in.download(ctx, a)
