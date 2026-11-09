@@ -118,15 +118,17 @@ type RichDoc struct {
 	// "FooterLabel: Footer" (v0.1.20's "🔧 Helper: ✅ Codex finished
 	// responding." under an answer). Plain text.
 	FooterLabel, Footer string
-	// Notes are closing lines after the body of the last part, before the
-	// footer, each shown as "Label: Text" (the active goal and the model
-	// of a Codex message). Plain text.
+	// Notes are closing lines after the body of the last part and before the
+	// footer, each shown as "Label: Text" (the active goal and model). A note
+	// can request a visual separator before it.
 	Notes []Note
 }
 
-// Note is one closing line of a document (RichDoc.Notes).
+// Note is one closing line of a document (RichDoc.Notes). SeparatorBefore
+// inserts a visual divider before the note when the channel supports it.
 type Note struct {
-	Label, Text string
+	Label, Text     string
+	SeparatorBefore bool
 }
 
 // Part is one rendered, sendable message.

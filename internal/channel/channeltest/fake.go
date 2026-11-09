@@ -119,6 +119,9 @@ func (f *Fake) Render(_ context.Context, doc channel.RichDoc) ([]channel.Part, e
 		body := label + ":\n" + c
 		if i == len(chunks)-1 {
 			for _, n := range doc.Notes {
+				if n.SeparatorBefore {
+					body += "\n---"
+				}
 				if n.Text != "" {
 					body += "\n" + n.Label + ": " + n.Text
 				}

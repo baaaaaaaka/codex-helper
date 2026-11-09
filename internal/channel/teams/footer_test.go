@@ -52,3 +52,22 @@ func TestRenderFooterOnLastPart(t *testing.T) {
 		t.Fatalf("unexpected footer: %q", c)
 	}
 }
+
+func TestRenderNoteSeparatorBeforeActiveGoal(t *testing.T) {
+	_, a := newFake(t, fakegraph.Options{})
+	parts, err := a.Render(context.Background(), channel.RichDoc{
+		Label: "🤖 ✅ Codex answer", Markdown: "Done.",
+		Notes: []channel.Note{
+			{Label: "🎯 Active goal", Text: "ship it", SeparatorBefore: true},
+			{Label: "🔧 Helper", Text: "model - gpt-test, effort - high, tier - fast"},
+		},
+		FooterLabel: "🔧 Helper", Footer: "✅ Codex finished responding.",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const want = "<p><strong>🤖 ✅ Codex answer:</strong></p><p>Done.</p><hr/><p><strong>🎯 Active goal:</strong> ship it</p><p><strong>🔧 Helper:</strong> model - gpt-test, effort - high, tier - fast</p><p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>"
+	if got := decodePart(t, parts[0]).Body.Content; got != want {
+		t.Fatalf("rendered notes:\n got %s\nwant %s", got, want)
+	}
+}

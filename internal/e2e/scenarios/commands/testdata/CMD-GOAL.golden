@@ -1,4 +1,4 @@
-# CMD-GOAL: `helper goal [<objective>|active|pause]`; goal and model lines on new Codex messages; `helper cancel` pauses the goal
+# CMD-GOAL: `helper goal [<objective>|active|pause]`; a divider separates message bodies from the active goal; `helper cancel` pauses the goal
 # cxp black-box transcript; volatile values are numbered placeholders
 
 == chat <chat:1> "🏠 Codex Control - e2ehost"

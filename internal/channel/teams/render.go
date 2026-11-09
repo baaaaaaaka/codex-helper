@@ -57,6 +57,9 @@ func (a *Adapter) Render(ctx context.Context, doc channel.RichDoc) ([]channel.Pa
 	if len(doc.Notes) > 0 {
 		var notes strings.Builder
 		for _, n := range doc.Notes {
+			if n.SeparatorBefore {
+				notes.WriteString("<hr/>")
+			}
 			notes.WriteString(footer(n.Label, n.Text))
 		}
 		foot = notes.String() + foot
