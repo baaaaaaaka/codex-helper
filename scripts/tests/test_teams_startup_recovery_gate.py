@@ -15,6 +15,9 @@ from test_ci_targeted_shards import job_block, RELEASE_WORKFLOW, WORKFLOW
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts/ci/test_teams_startup_recovery.sh"
 NAMES = [
+    "TestLegacyTeamsWatchdogHandoff",
+    "TestTeamsServiceWatchdogObservesUnpublishedMigrationClaim",
+    "TestEntryLegacyWatchdogHandoff",
     "TestVersionPointerReplacementWhileReaderOpen",
     "TestVersionPointerReadsLongPath",
     "TestConversionOwnershipAtEveryCheckpoint",
@@ -123,13 +126,25 @@ sys.exit(int(os.environ['FAIL_TEST']))
         self.assertTrue(patterns, "startup CLI race step is missing")
         self.assertIn("./internal/helperruntime -run '^TestVersionPointer'", race)
         for name in NAMES:
-            if name.startswith(("TestTeams", "TestFirstStart", "TestVersionPointer")):
+            if name.startswith(("TestLegacy", "TestTeams", "TestFirstStart", "TestVersionPointer")):
                 with self.subTest(name=name):
                     self.assertTrue(any(re.search(pattern, name) for pattern in patterns))
 
+    def test_historical_watchdog_regression_is_required(self):
+        self.assertIn("bash scripts/ci/test_legacy_watchdog_handoff.sh", job_block(WORKFLOW, "e2e"))
+        script = (ROOT / "scripts/ci/test_legacy_watchdog_handoff.sh").read_text()
+        self.assertIn("fe71a0c790b55ece0d5567cef05dcd6ce911f6f2a0c72b6a3c2ac2e4e81693b7", script)
+        self.assertIn("sha256sum --check --strict", script)
+        self.assertIn("export CXP_LEGACY_WATCHDOG_BINARY=", script)
+        self.assertIn("-count=3", script)
+        systemd = job_block(WORKFLOW, "watchdog-systemd")
+        self.assertIn('CXP_TEST_REAL_SYSTEMD: "1"', systemd)
+        self.assertIn("bash scripts/ci/test_legacy_watchdog_handoff.sh", systemd)
+        self.assertIn("bash scripts/ci/test_watchdog_systemd.sh", script)
+
     def test_final_ci_aggregate_requires_the_recovery_jobs(self):
         aggregate = job_block(WORKFLOW, "test")
-        for job in ("unit-linux", "unit-windows-macos", "e2e", "race-core"):
+        for job in ("unit-linux", "unit-windows-macos", "e2e", "race-core", "watchdog-systemd"):
             with self.subTest(job=job):
                 self.assertIn("      - " + job + "\n", aggregate)
                 self.assertIn("${{ needs." + job + ".result }}", aggregate)
