@@ -38,6 +38,10 @@ on:
         description: create the release llama-asr-<tag>-<rev> (main only) after every platform passed
         type: boolean
         default: false
+      mirror_repository:
+        description: optional existing owner/repo for byte-identical assets; requires ASR_MIRROR_TOKEN
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -423,6 +427,19 @@ jobs:
           Built and checked by [this run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID): each platform transcribed WAV, Ogg/Opus, WebM/Opus, M4A/AAC and MP3 samples through the helper's own code path; the Linux builds also on CentOS 7.
           EOF
       - name: Create the release
+        # Mirror publication is opt-in: never create a hosting repository or
+        # invent a URL that clients cannot download. Verify before publishing
+        # the primary release, and reuse an existing mirror only if identical.
+        env:
+          MIRROR_REPOSITORY: ${{ inputs.mirror_repository }}
+          MIRROR_TOKEN: ${{ secrets.ASR_MIRROR_TOKEN }}
         run: |
+          if [[ -n "$MIRROR_REPOSITORY" ]]; then
+            if [[ "${MIRROR_REPOSITORY,,}" == "${GITHUB_REPOSITORY,,}" ]]; then
+              echo '::error::The mirror must be a different existing repository'
+              exit 1
+            fi
+            GH_TOKEN="$MIRROR_TOKEN" bash scripts/ci/publish-asr-mirror.sh release "$MIRROR_REPOSITORY" "$RELEASE"
+          fi
           gh release create "$RELEASE" --target "$GITHUB_SHA" --prerelease --latest=false \
             --title "Voice transcription assets ($RELEASE)" --notes-file notes.md release/*

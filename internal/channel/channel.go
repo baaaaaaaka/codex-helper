@@ -153,6 +153,15 @@ type Window struct {
 	Msgs     []InboundMsg // oldest first
 	Cursor   string       // pass to the next Receive; never behind the input cursor
 	Requests int          // service requests used (for read budgets)
+	// OtherParticipants is an authoritative current membership snapshot.
+	// nil means this channel can only infer membership from messages.
+	OtherParticipants *bool
+}
+
+// ParticipantReader distinguishes current membership from historical senders.
+// An empty or incomplete member list must not be reported as owner-only.
+type ParticipantReader interface {
+	OtherParticipants(ctx context.Context, chat string) (bool, error)
 }
 
 // MsgKind classifies an inbound message.

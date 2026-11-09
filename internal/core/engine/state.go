@@ -46,6 +46,9 @@ type convState struct {
 	id                                   int64
 	label, kind, state, chat, url, title string
 	paused, group                        bool
+	membersChecked                       time.Time
+	membersKnown                         bool
+	membersOther                         bool
 	cwd, threadID                        string
 	forkParent                           int64
 	created                              time.Time

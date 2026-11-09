@@ -82,12 +82,8 @@ func (e *Engine) labelVoice(conv int64, in store.Inbound, clips []voiceClip) {
 	if len(clips) == 0 || in.Sender != store.SenderOwner || in.ExtMsgID == "" || conv == e.inboxID {
 		return
 	}
-	e.mu.Lock()
-	cs := e.convs[conv]
-	group := cs == nil || cs.group
-	e.mu.Unlock()
 	ann, ok := e.annotator()
-	if group || !ok {
+	if !ok {
 		return
 	}
 	var out []channel.Clip
@@ -103,6 +99,19 @@ func (e *Engine) labelVoice(conv int64, in store.Inbound, clips []voiceClip) {
 	}
 	id := in.ExtMsgID
 	e.queueEdit(conv, chatEdit{key: "voice:" + id, what: "voice transcript", run: func(ctx context.Context, chat string) error {
+		// A pending voice can finish before startup's first member check.
+		// Defer through the existing edit queue, then use current state.
+		e.mu.Lock()
+		cs := e.convs[conv]
+		ready := cs != nil && cs.readOnce
+		group := cs == nil || cs.group
+		e.mu.Unlock()
+		if !ready {
+			return errEditLater
+		}
+		if group {
+			return nil
+		}
 		if err := e.waitRead(ctx, editReadWait); err != nil {
 			return err
 		}
