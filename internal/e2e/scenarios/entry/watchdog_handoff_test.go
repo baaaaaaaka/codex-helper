@@ -89,6 +89,9 @@ elif 'restart' in a:
 	defer s.Finish()
 	scope, raw, ids := migrationRecoveryFixture(s, 0)
 	cmd := exec.Command(old, args...)
+	// A systemd-owned watchdog is outside the main helper's process group.
+	// Keep the fixture isolated so scenario cleanup cannot retire it first.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	for k, v := range s.Env.Vars {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
