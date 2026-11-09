@@ -1443,6 +1443,10 @@ func TestReadThrottleReleasesScanFirstThenPacedReads(t *testing.T) {
 	r := newRig(t, func(c *Config) {
 		sc = &stormScanner{Fake: c.Channel.(*channeltest.Fake)}
 		c.Channel, c.ActivityScan = sc, true
+		// This integration check measures the account pacer's spacing. A
+		// single reader keeps worker scheduling from bunching requests that
+		// already received tokens before the throttle was observed.
+		c.Readers = 1
 		c.Timing.ScanInterval = 5 * time.Second // the scan after the gate is not a tick
 	})
 	r.control()
