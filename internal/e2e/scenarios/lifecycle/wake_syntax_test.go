@@ -2,11 +2,11 @@ package lifecycle
 
 import (
 	"fmt"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/baaaaaaaka/codex-helper/internal/channel/teams"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakegraph"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/harness"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/steps"
@@ -76,14 +76,14 @@ func TestWakeSyntax(t *testing.T) {
 
 	r1 := say("r " + num(ids[0]))
 	s.Check("`r <n>` wakes that session", has(r1, "Resumed "+ids[0]), "Resumed "+ids[0], fmt.Sprintf("%q", r1))
-	urlA := teams.ChatURL(a.ID, fakegraph.TenantID)
+	urlA := teamsChatURL(a.ID)
 	s.Check("the wake reply includes a clickable link to the resumed Work chat", has(r1, "Open Work chat: "+urlA) && hasLinkedReply(ids[0], urlA), "Open Work chat: "+urlA, fmt.Sprintf("%q", r1))
 	r1again := say("r " + ids[0])
 	s.Check("`r <id>` of an active session does not wake it again", !has(r1again, "Resumed") && len(r1again) == 1,
 		"one reply that it is not parked", fmt.Sprintf("%q", r1again))
 	unpark := say("unpark " + ids[1])
 	s.Check("`unpark <id>` wakes a parked session (v0.1.20 alias)", has(unpark, "Resumed "+ids[1]), "Resumed "+ids[1], fmt.Sprintf("%q", unpark))
-	urlB := teams.ChatURL(b.ID, fakegraph.TenantID)
+	urlB := teamsChatURL(b.ID)
 	s.Check("`unpark` includes a clickable link to its resumed Work chat", has(unpark, "Open Work chat: "+urlB) && hasLinkedReply(ids[1], urlB), "Open Work chat: "+urlB, fmt.Sprintf("%q", unpark))
 	resume := say("resume " + num(ids[2]))
 	s.Check("`resume <n>` wakes a parked session", has(resume, "Resumed "+ids[2]), "Resumed "+ids[2], fmt.Sprintf("%q", resume))
@@ -95,4 +95,8 @@ func TestWakeSyntax(t *testing.T) {
 		notices += len(s.SUTMessagesContaining(ch, "This chat was resumed"))
 	}
 	s.Check("each woken chat gets one resumed notice", notices == 3, "3 notices (one per chat)", fmt.Sprint(notices))
+}
+
+func teamsChatURL(chatID string) string {
+	return "https://teams.microsoft.com/l/chat/" + url.QueryEscape(chatID) + "/0?tenantId=" + url.QueryEscape(fakegraph.TenantID)
 }
