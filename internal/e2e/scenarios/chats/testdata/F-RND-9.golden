@@ -289,6 +289,7 @@
    prompt| 1. From: E2E Owner; Time: <time:2>; Source: Graph full message
    prompt|    🤖 ✅ Codex answer:
    prompt|    E2EANSWER-<n> answer for E2E-FRND9-first-1
+   prompt|
    prompt|    ———
    prompt|    🔧 Helper: model - gpt-5-codex, effort - medium, tier - standard
    prompt|    🔧 Helper: ✅ Codex finished responding.

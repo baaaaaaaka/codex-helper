@@ -323,6 +323,7 @@
    prompt|   - <time> helper/final:
    prompt|   🤖 ✅ Codex answer: E2E Owner
    prompt|   E2EANSWER-<n> answer for E2E-CTLQA-ask-2
+   prompt|
    prompt|   ———
    prompt|   🔧 Helper: model - gpt-5-codex, effort - low, tier - standard
    prompt|   🔧 Helper: ✅ Codex finished responding.
@@ -489,6 +490,7 @@
    prompt|   - <time> helper/final:
    prompt|   🤖 ✅ Codex answer: E2E Owner
    prompt|   E2EANSWER-<n> answer for E2E-CTLQA-ask-2
+   prompt|
    prompt|   ———
    prompt|   🔧 Helper: model - gpt-5-codex, effort - low, tier - standard
    prompt|   🔧 Helper: ✅ Codex finished responding.
@@ -502,6 +504,7 @@
    prompt|   - <time> helper/final:
    prompt|   🤖 ✅ Codex answer: E2E Owner
    prompt|   E2EANSWER-<n> answer for E2E-CTLQA-plain-3
+   prompt|
    prompt|   ———
    prompt|   🔧 Helper: model - gpt-5-codex, effort - low, tier - standard
    prompt|   🔧 Helper: ✅ Codex finished responding.
