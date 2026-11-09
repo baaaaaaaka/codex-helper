@@ -35,6 +35,10 @@ func TestProgressIntegrityUnderThrottleAndRestart(t *testing.T) {
 	fault := s.Graph.AddFault(fakegraph.Fault{Name: "progress-429", Kind: fakegraph.FaultStatus, Method: "POST", ChatID: work.ID, Status: 429, RetryAfter: time.Second, Times: 1, Match: func(r fakegraph.Request) bool { return strings.Contains(r.Body, "RECORD-") }})
 	steps.MustPost(s, work.ID, "@codex exercise progress "+tok)
 	s.Require("the final arrives after progress", 60*time.Second, func() (bool, string) { return len(s.SUTMessagesContaining(work.ID, answer)) == 1, "waiting for final" })
+	s.Require("the helper completion notice is delivered", steps.AnswerTimeout, func() (bool, string) {
+		n := len(s.SUTMessagesContaining(control.ID, "Codex finished"))
+		return n == 1, fmt.Sprintf("%d completion notice(s)", n)
+	})
 	check := func(stage string) {
 		var all strings.Builder
 		posts := 0
