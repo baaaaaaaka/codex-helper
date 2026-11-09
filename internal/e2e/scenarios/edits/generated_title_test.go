@@ -27,6 +27,13 @@ func TestGeneratedTitle(t *testing.T) {
 	work, _ := steps.NewWorkChat(s, control, "generated-title")
 	tok, _, _ := ask(s, work.ID, "Fix the login flow and add regression coverage", "first")
 	s.WaitSUTMessage(control.ID, "Codex finished", steps.CommandTimeout)
+	// The prompt title update is asynchronous with the finished notice. Wait
+	// for it before releasing generated-title work so the transcript has a
+	// deterministic title history on slow runners.
+	s.Require("first-prompt title applied before generated title", steps.CommandTimeout, func() (bool, string) {
+		got := topic(s, work.ID)
+		return strings.Contains(got, "Fix the login flow"), fmt.Sprintf("title %q", got)
+	})
 	once.Do(func() { close(release) })
 	want := "💬 " + harness.MachineLabel + " - 登录修复"
 	s.Check("generated title applied", waitTopic(s, work.ID, want, steps.CommandTimeout), want, topic(s, work.ID))

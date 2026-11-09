@@ -45,6 +45,7 @@
 
 == chat <chat:2> "💬 e2ehost - My choice"
    type: meeting; members: owner
+   title was: "💬 e2ehost - Fix the login flow and add regression coverage E2E-EDITGENERA"
    title was: "💬 e2ehost - 登录修复"
    title was: "💬 e2ehost - My choice"
 -- <msg:1> helper (html)
