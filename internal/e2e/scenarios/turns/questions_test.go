@@ -44,17 +44,23 @@ func TestQuestionsSyncQuoteMultiAndNotification(t *testing.T) {
 	s.Require("questions visible before turn completion", steps.AnswerTimeout, func() (bool, string) {
 		return len(s.SUTMessagesContaining(work.ID, "Question from Codex")) == 2, "waiting for two question messages"
 	})
-	questions := s.SUTMessagesContaining(work.ID, "Question from Codex")
-	marked := 0
-	for _, m := range s.SUTMessages(work.ID) {
-		if hasPendingQuestionMarker(m) {
-			marked++
-			if m.ID != questions[len(questions)-1].ID {
-				s.Check("only the latest agent question carries the marker", false, questions[len(questions)-1].ID, m.ID)
+	s.Require("only the latest agent question carries the marker", steps.CommandTimeout, func() (bool, string) {
+		latest := s.SUTMessagesContaining(work.ID, "Question from Codex")
+		if len(latest) < 2 {
+			return false, fmt.Sprintf("%d question messages", len(latest))
+		}
+		marked := 0
+		markedID := ""
+		for _, m := range s.SUTMessages(work.ID) {
+			if hasPendingQuestionMarker(m) {
+				marked++
+				markedID = m.ID
 			}
 		}
-	}
-	s.Check("latest question has the first-line marker", marked == 1 && hasPendingQuestionMarker(questions[len(questions)-1]), "one marked latest question", fmt.Sprintf("%d marked message(s)", marked))
+		latestID := latest[len(latest)-1].ID
+		return marked == 1 && markedID == latestID, fmt.Sprintf("%d marked message(s), latest=%s marked=%s", marked, latestID, markedID)
+	})
+	questions := s.SUTMessagesContaining(work.ID, "Question from Codex")
 	s.Require("owner notified once for the group", steps.AnswerTimeout, func() (bool, string) {
 		return len(s.SUTMessagesContaining(ctl.ID, "Codex has 2 questions")) == 1, "waiting for owner mention"
 	})
