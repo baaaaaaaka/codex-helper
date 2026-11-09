@@ -587,16 +587,20 @@ func verifyImmutableRuntime(ctx context.Context, runtimePath string, targetVersi
 	if runtimePath == "" || runtimePath == "." {
 		return fmt.Errorf("verify immutable runtime: runtime path is empty")
 	}
+	normalizedTarget, ok := helperruntime.NormalizeVersion(targetVersion)
+	if !ok {
+		return fmt.Errorf("verify immutable runtime: invalid target version %q", targetVersion)
+	}
 	out, err := helperruntime.ProbeExecutable(ctx, runtimePath, []string{"--version"}, 15*time.Second)
 	if err != nil {
 		return fmt.Errorf("verify immutable runtime %s: %w: %s", runtimePath, err, strings.TrimSpace(string(out)))
 	}
 	for _, field := range strings.Fields(string(out)) {
-		if version, ok := helperruntime.NormalizeVersion(field); ok && version == targetVersion {
+		if version, ok := helperruntime.NormalizeVersion(field); ok && version == normalizedTarget {
 			return nil
 		}
 	}
-	return fmt.Errorf("immutable runtime version output %q does not contain %s", strings.TrimSpace(string(out)), targetVersion)
+	return fmt.Errorf("immutable runtime version output %q does not contain %s", strings.TrimSpace(string(out)), normalizedTarget)
 }
 
 func readContext(path string) (Context, error) {

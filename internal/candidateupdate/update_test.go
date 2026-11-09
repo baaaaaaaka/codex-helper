@@ -142,7 +142,7 @@ func TestApplyVerifiesPublishedRuntimeInsteadOfStableEntry(t *testing.T) {
 		Schema:          ProtocolVersion,
 		CandidateSHA256: candidateHash,
 		SourceVersion:   "v0.1.14",
-		TargetVersion:   "v0.1.14-rc.20",
+		TargetVersion:   "0.1.14-rc.20",
 		RuntimeRoot:     root,
 		EntryPath:       entry,
 		RecordPath:      filepath.Join(dir, "install.json"),
@@ -158,7 +158,7 @@ func TestApplyVerifiesPublishedRuntimeInsteadOfStableEntry(t *testing.T) {
 	if active, readErr := helperruntime.ReadActive(root); readErr != nil || active != "v0.1.14-rc.20" {
 		t.Fatalf("active = %q, %v", active, readErr)
 	}
-	if err := verifyImmutableRuntime(context.Background(), result.RuntimePath, "v0.1.14-rc.20"); err != nil {
+	if err := verifyImmutableRuntime(context.Background(), result.RuntimePath, "0.1.14-rc.20"); err != nil {
 		t.Fatalf("published immutable runtime verification: %v", err)
 	}
 	// The preserved stable entry is deliberately still the old physical
