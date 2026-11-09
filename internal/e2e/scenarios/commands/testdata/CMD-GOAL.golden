@@ -177,6 +177,7 @@
 -- <msg:23> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
    | <p>Working through the goal E2E-CMDGOAL-goalrun-1</p>
+   | <hr/>
    | <p><strong>🎯 Active goal:</strong> Ship the quarterly report E2E-CMDGOAL-objective-3</p>
 -- <msg:24> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
