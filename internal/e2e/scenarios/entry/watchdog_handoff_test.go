@@ -19,7 +19,6 @@ import (
 
 // Only the service manager is substituted. The main helper's startup,
 // lease, migration, /proc inspection and replacement watchdog are real.
-// CI additionally supplies the checksummed v0.1.20 release executable.
 func TestEntryLegacyWatchdogHandoff(t *testing.T) {
 	dir := t.TempDir()
 	root := filepath.Join(dir, ".cxp-runtime")
@@ -46,22 +45,27 @@ func TestEntryLegacyWatchdogHandoff(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(root, "active"), []byte("v9.9.1\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	legacy := os.Getenv("CXP_LEGACY_WATCHDOG_BINARY")
-	args := []string{"60"}
-	if legacy == "" {
-		legacy = "/bin/sleep" // executable-identity fixture, not a historical compatibility claim
-	} else {
-		args = []string{"teams", "service", "watchdog", "--loop", "--interval", "100ms", "--quiet"}
-	}
-	copyExe(legacy, old)
+	copyExe("/bin/sleep", old) // stable executable-identity fixture
 	manager := filepath.Join(dir, "systemctl")
 	script := `#!/usr/bin/python3
-import os,sys,signal,subprocess,json
+import os,sys,signal,subprocess,json,time
 from pathlib import Path
 d=Path(__file__).parent
 a=sys.argv[1:]
 with (d/'calls').open('a') as f: f.write(json.dumps(a)+'\n')
-if 'show' in a:
+if a[:2] == ['--user','start'] and a[-1]=='codex-helper-teams-watchdog.service':
+    binary=d/'.cxp-runtime/versions/v0.1.20/cxp'
+    p=subprocess.Popen([str(binary),'3600'],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+    (d/'wdpid').write_text(str(p.pid))
+    for _ in range(200):
+        try:
+            if os.readlink(f'/proc/{p.pid}/exe') == str(binary): break
+        except FileNotFoundError:
+            pass
+        time.sleep(0.01)
+    else:
+        raise RuntimeError('legacy watchdog fixture did not enter its executable')
+elif 'show' in a:
     print(os.getppid() if a[-1]=='codex-helper-teams.service' else (d/'wdpid').read_text().strip())
 elif 'restart' in a:
     assert a == ['--user','restart','codex-helper-teams-watchdog.service'], a
@@ -88,27 +92,15 @@ elif 'restart' in a:
 	})
 	defer s.Finish()
 	scope, raw, ids := migrationRecoveryFixture(s, 0)
-	cmd := exec.Command(old, args...)
-	// A systemd-owned watchdog is outside the main helper's process group.
-	// Keep the fixture isolated so scenario cleanup cannot retire it first.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	for k, v := range s.Env.Vars {
-		cmd.Env = append(cmd.Env, k+"="+v)
+	if out, err := exec.Command(manager, "--user", "start", "codex-helper-teams-watchdog.service").CombinedOutput(); err != nil {
+		t.Fatalf("start legacy watchdog fixture: %v: %s", err, out)
 	}
-	cmd.Env = append(cmd.Env, "CXP_RUNTIME_DISABLE=1")
-	if err := cmd.Start(); err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
 	pidfile := filepath.Join(dir, "wdpid")
-	if err := os.WriteFile(pidfile, []byte(strconv.Itoa(cmd.Process.Pid)), 0600); err != nil {
-		t.Fatal(err)
-	}
 	defer func() {
 		raw, _ := os.ReadFile(pidfile)
 		pid, _ := strconv.Atoi(strings.TrimSpace(string(raw)))
 		exe, _ := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
-		if exe == current {
+		if exe == current || exe == old {
 			_ = syscall.Kill(pid, syscall.SIGTERM)
 		}
 	}()

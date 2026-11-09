@@ -82,12 +82,11 @@ main service or rolling back data. No lease or conversion timing changes.
 `TestLegacyTeamsWatchdogHandoff` covers the decision and failure boundaries.
 `TestEntryLegacyWatchdogHandoff` uses the production CLI, real processes and
 /proc, a service-manager substitute, and fake Graph/Codex to verify migration
-and the original chat/thread response. The normal fixture uses an executable
-identity stand-in; `scripts/ci/test_legacy_watchdog_handoff.sh` supplies the
-fixed SHA-256-verified v0.1.20 release and repeats this scenario three times.
-That step is required by CI's first E2E shard, which also gates releases.
-The dedicated `watchdog-systemd` job additionally runs the same repair with
-a real user service manager and the historical watchdog on an ephemeral
+and the original chat/thread response. Its fake service manager starts an
+isolated executable-identity stand-in so the old process stays alive until the
+handoff. CI repeats this scenario three times in the first E2E shard.
+The dedicated `watchdog-systemd` job uses the fixed SHA-256-verified v0.1.20
+release executable with a real user service manager on an ephemeral
 GitHub-hosted Linux runner. It refuses existing units and verifies that the
 main process survives. The aggregate CI/release gate requires that job.
 A full historical Teams-command upgrade remains a separate compatibility
