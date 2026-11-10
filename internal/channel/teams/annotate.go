@@ -3,6 +3,7 @@ package teams
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
@@ -58,6 +59,10 @@ func (a *Adapter) Annotate(ctx context.Context, chat, id string, an channel.Anno
 	}
 	var m annotatedMessage
 	if err := a.g.getJSON(ctx, messagePath(chat, id), smallBodyLimit, &m); err != nil {
+		var rejected *channel.Rejected
+		if an.Confirmation != nil && errors.As(err, &rejected) && rejected.Permanent {
+			return fmt.Errorf("confirmation read refused (%v): %w", err, channel.ErrNotEditable)
+		}
 		return err
 	}
 	if m.Deleted != nil && *m.Deleted != "" || m.MessageType != "" && m.MessageType != "message" {
@@ -76,6 +81,8 @@ func (a *Adapter) Annotate(ctx context.Context, chat, id string, an channel.Anno
 	isHTML := m.Body.ContentType == "" || strings.EqualFold(m.Body.ContentType, "html")
 	var next string
 	switch {
+	case an.Confirmation != nil:
+		next, err = confirmationEdit(content, isHTML, atts, an)
 	case len(an.Clips) > 0:
 		next, err = transcriptEdit(content, isHTML, atts, an)
 	case an.Notice != nil:
@@ -93,7 +100,14 @@ func (a *Adapter) Annotate(ctx context.Context, chat, id string, an channel.Anno
 	if len(m.Mentions) > 0 {
 		in["mentions"] = m.Mentions
 	}
-	return a.g.writeJSON(ctx, http.MethodPatch, messagePath(chat, id), in, nil)
+	err = a.g.writeJSON(ctx, http.MethodPatch, messagePath(chat, id), in, nil)
+	// A definite refusal can safely fall back to POST; uncertain PATCH outcomes
+	// must instead retry the idempotent confirmation.
+	var rejected *channel.Rejected
+	if an.Confirmation != nil && errors.As(err, &rejected) && rejected.Permanent {
+		return fmt.Errorf("confirmation edit refused (%v): %w", err, channel.ErrNotEditable)
+	}
+	return err
 }
 
 // labelHTML is the label line v0.1.20 put above an annotated message.

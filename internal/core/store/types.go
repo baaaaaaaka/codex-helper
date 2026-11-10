@@ -185,6 +185,7 @@ type OutFile struct {
 
 // OutMsg is one rendered part to enqueue.
 type OutMsg struct {
+	AppendTo      string // original owner prompt; empty sends a separate message
 	HoldTurn      int64  // final waits in this outbox until its transcript prefix commits
 	AlternateKey  string // legacy identity; checked atomically, never body-only dedupe
 	ProgressGroup string // same execution; only complete adjacent progress records may combine
@@ -201,6 +202,7 @@ type OutMsg struct {
 
 // Outbox is an outbox row.
 type Outbox struct {
+	AppendTo      string
 	HoldTurn      int64
 	BatchHead     int64
 	BatchBody     string

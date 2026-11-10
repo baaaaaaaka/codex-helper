@@ -48,8 +48,14 @@
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Long running E2E-R2033-stuck-1</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
+   | <p>Long running E2E-R2033-stuck-1</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Long running E2E-R2033-stuck-1</p>
 -- <msg:4> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
@@ -59,26 +65,26 @@
    | <p>helper cancel last</p>
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:6> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>cancel requested for running turn: <code>turn-1</code></p>
    | <p><strong>Prompt being canceled:</strong><br>
    | Long running E2E-R2033-stuck-1</p>
    | <p>No other prompts are queued.</p>
--- <msg:7> helper (html)
+-- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Codex request canceled.</p>
--- <msg:8> owner (html)
+-- <msg:7> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Next request E2E-R2033-next-2</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:2> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Next request E2E-R2033-next-2</p>
--- <msg:9> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:10> helper (html)
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Next request E2E-R2033-next-2</p>
+-- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-R2033-next-2</p>
    | <hr/>

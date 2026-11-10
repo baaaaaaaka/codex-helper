@@ -1108,7 +1108,7 @@ func (e *Engine) ackPrompt(tx *store.Tx, conv int64, a store.Admitted, c *classi
 		stg.lastDup = a.InboundID
 	}
 	if dup {
-		msgs, err := e.noticeReply(store.OutNotice, fmt.Sprintf("dup:%d", a.InboundID), textDuplicate, c.quoteID)
+		msgs, err := e.promptConfirmation(c, store.OutNotice, fmt.Sprintf("dup:%d", a.InboundID), textDuplicate, c.quoteID)
 		if err != nil {
 			return true, err
 		}
@@ -1168,7 +1168,7 @@ func (e *Engine) ackPrompt(tx *store.Tx, conv int64, a store.Admitted, c *classi
 	if notice := e.drainNotice(); notice != "" {
 		text = notice // batch E, F-SVC-10: restart.go
 	}
-	msgs, err := e.noticeReply(store.OutAck, fmt.Sprintf("ack:%d", a.InboundID), text, c.quoteID)
+	msgs, err := e.promptConfirmation(c, store.OutAck, fmt.Sprintf("ack:%d", a.InboundID), text, c.quoteID)
 	if err != nil {
 		return false, err
 	}
@@ -1195,7 +1195,7 @@ func (e *Engine) earlierSuppresses(tx *store.Tx, inbound int64) (bool, error) {
 }
 
 func (e *Engine) ackHeld(tx *store.Tx, conv int64, a store.Admitted, c *classified) error {
-	msgs, err := e.noticeReply(store.OutAck, fmt.Sprintf("ack:%d", a.InboundID), textHeld, c.quoteID)
+	msgs, err := e.promptConfirmation(c, store.OutAck, fmt.Sprintf("ack:%d", a.InboundID), textHeld, c.quoteID)
 	if err != nil {
 		return err
 	}

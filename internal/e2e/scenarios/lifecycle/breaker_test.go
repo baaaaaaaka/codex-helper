@@ -53,7 +53,7 @@ func TestSelfEchoBreaker(t *testing.T) {
 	s.Require("running turn reached Codex", steps.AnswerTimeout, func() (bool, string) {
 		return len(s.Codex.CallsWithToken(running)) == 1, "not yet"
 	})
-	if _, ok := s.WaitSUTMessage(work.ID, "Request accepted", 15*time.Second); !ok {
+	if !steps.WaitPromptConfirmation(s, work.ID, "Request accepted", 15*time.Second) {
 		return
 	}
 	s.Settle(2*time.Second, 6*time.Second)
@@ -66,6 +66,16 @@ func TestSelfEchoBreaker(t *testing.T) {
 	var echoed []string
 	var helperMsgs []fakegraph.Message
 	sut := s.SUTMessages(work.ID)
+	// The initial receipt now lives on the owner prompt. Echo only its helper
+	// section, as another helper would post it, rather than the user prefix.
+	for _, m := range steps.PromptConfirmations(s, work.ID, "Request accepted") {
+		if m.Origin == fakegraph.OriginUser {
+			if _, body, ok := strings.Cut(m.Content, "<hr/>"); ok {
+				m.Content = body
+				sut = append(sut, m)
+			}
+		}
+	}
 	for i := len(sut) - 1; i >= 0 && len(helperMsgs) < 3; i-- {
 		if strings.Contains(sut[i].Content, "Helper") {
 			helperMsgs = append(helperMsgs, sut[i])

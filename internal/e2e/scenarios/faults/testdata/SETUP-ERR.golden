@@ -48,30 +48,33 @@
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Build the report E2E-SETUPERR-setup-1</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Build the report E2E-SETUPERR-setup-1</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Build the report E2E-SETUPERR-setup-1</p>
 -- <msg:4> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
    | <p>⚠️ Codex did not start because the helper process could not find its Node.js runtime.</p>
    | <p>No user work ran or was duplicated. An administrator should repair or update CXP, then send <code>helper retry last</code> here.</p>
    | <p>Diagnostic for the admin:<br>
    | Codex could not be started: codex: shared app-server exited before listening: exit status 127 (app-server stderr: …: &#39;node&#39;: No such file or directory)</p>
--- <msg:6> owner (html)
+-- <msg:5> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper retry last</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>helper retry last</p>
--- <msg:7> helper (html)
+-- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Running <code>turn-1</code> again as <code>turn-2</code>.</p>
    | <p><strong>Prompt:</strong><br>
    | Build the report E2E-SETUPERR-setup-1</p>
--- <msg:8> helper (html)
+-- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-SETUPERR-setup-1</p>
    | <hr/>

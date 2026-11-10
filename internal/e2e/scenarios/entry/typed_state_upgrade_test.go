@@ -51,7 +51,7 @@ func TestEntryTypedSQLiteUpgradePreservesAttemptedNotice(t *testing.T) {
 	}
 	// Configure through the real CLI only after the old database exists.
 	// Workflow configuration itself opens the core store and must exercise
-	// the same upgrade as helper startup, rather than create a fresh v6 DB.
+	// the same upgrade as helper startup, rather than create a fresh v7 DB.
 	s.WorkflowWebhookURL = s.Graph.NewWorkflowWebhook()
 	s.EnableWorkflow(s.WorkflowWebhookURL)
 	s.Graph.SeedChat("19:control@thread.v2", "Control")
@@ -87,7 +87,7 @@ func TestEntryTypedSQLiteUpgradePreservesAttemptedNotice(t *testing.T) {
 	if err := db.QueryRow(`SELECT text FROM cli_result_lines WHERE request_id='completed' AND position=0`).Scan(&result); err != nil {
 		t.Fatal(err)
 	}
-	s.Check("upgrade committed typed state and removed old keys", version == 6 && oldKeys == 0 && result == "original result", "v6; no old keys; original result", fmt.Sprintf("version=%d old=%d result=%q", version, oldKeys, result))
+	s.Check("upgrade committed typed state and removed old keys", version == 7 && oldKeys == 0 && result == "original result", "v7; no old keys; original result", fmt.Sprintf("version=%d old=%d result=%q", version, oldKeys, result))
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}

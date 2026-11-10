@@ -76,26 +76,32 @@
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Crash in the middle E2E-CODEXLOST-crash-2</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Crash in the middle E2E-CODEXLOST-crash-2</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Crash in the middle E2E-CODEXLOST-crash-2</p>
 -- <msg:4> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
    | <p>Codex request interrupted because the Teams helper stopped, restarted, or lost its execution context before it could verify a final Codex result.</p>
    | <p>Check recent messages and changed files first. If no final answer appears, resend the message or use <code>helper retry last</code>.</p>
--- <msg:6> owner (html)
+-- <msg:5> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Next question E2E-CODEXLOST-nextb-4</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:2> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Next question E2E-CODEXLOST-nextb-4</p>
--- <msg:7> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:8> helper (html)
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Next question E2E-CODEXLOST-nextb-4</p>
+-- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-CODEXLOST-nextb-4</p>
    | <hr/>
@@ -123,28 +129,34 @@
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Finish quietly E2E-CODEXLOST-lost-1</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:3> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Finish quietly E2E-CODEXLOST-lost-1</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Finish quietly E2E-CODEXLOST-lost-1</p>
 -- <msg:4> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-CODEXLOST-lost-1</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:6> owner (html)
+-- <msg:5> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Next question E2E-CODEXLOST-nexta-3</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:4> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Next question E2E-CODEXLOST-nexta-3</p>
--- <msg:7> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:8> helper (html)
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Next question E2E-CODEXLOST-nexta-3</p>
+-- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-CODEXLOST-nexta-3</p>
    | <hr/>

@@ -68,26 +68,32 @@
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Long task E2E-B5-lost-2</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Long task E2E-B5-lost-2</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Long task E2E-B5-lost-2</p>
 -- <msg:4> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
    | <p>Codex request interrupted because the Teams helper stopped, restarted, or lost its execution context before it could verify a final Codex result.</p>
    | <p>Check recent messages and changed files first. If no final answer appears, resend the message or use <code>helper retry last</code>.</p>
--- <msg:6> owner (html)
+-- <msg:5> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Next request E2E-B5-nexty-5</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:2> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Next request E2E-B5-nexty-5</p>
--- <msg:7> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:8> helper (html)
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Next request E2E-B5-nexty-5</p>
+-- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-B5-nexty-5</p>
    | <hr/>
@@ -115,25 +121,31 @@
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Long task E2E-B5-notstarted-3</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:3> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Long task E2E-B5-notstarted-3</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Long task E2E-B5-notstarted-3</p>
 -- <msg:4> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
    | <p>The previous request did not run: the helper stopped before Codex accepted it. Send <code>helper retry last</code> to run it, or resend it.</p>
--- <msg:6> owner (html)
+-- <msg:5> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Next request E2E-B5-nextz-6</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:4> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Next request E2E-B5-nextz-6</p>
--- <msg:7> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:8> helper (html)
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Next request E2E-B5-nextz-6</p>
+-- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-B5-nextz-6</p>
    | <hr/>
@@ -161,29 +173,35 @@
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Long task E2E-B5-streaming-1</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:5> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Long task E2E-B5-streaming-1</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Long task E2E-B5-streaming-1</p>
 -- <msg:4> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
    | <p>Looking at the files now.</p>
--- <msg:6> helper (html)
+-- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
    | <p>Codex request interrupted because the Teams helper stopped, restarted, or lost its execution context before it could verify a final Codex result.</p>
    | <p>Check recent messages and changed files first. If no final answer appears, resend the message or use <code>helper retry last</code>.</p>
--- <msg:7> owner (html)
+-- <msg:6> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Next request E2E-B5-nextx-4</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:6> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Next request E2E-B5-nextx-4</p>
--- <msg:8> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:9> helper (html)
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Next request E2E-B5-nextx-4</p>
+-- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-B5-nextx-4</p>
    | <hr/>

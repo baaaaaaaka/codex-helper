@@ -71,30 +71,33 @@
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Use the newest model E2E-CODEXUPGRADE-tooold-1</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Use the newest model E2E-CODEXUPGRADE-tooold-1</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Use the newest model E2E-CODEXUPGRADE-tooold-1</p>
 -- <msg:4> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
    | <p>⚠️ Codex CLI needs an update</p>
    | <p>Codex rejected this request because the installed CLI is too old for the selected model.</p>
    | <p>Automatic Codex upgrade isn&#39;t enabled here, so an administrator needs to update Codex — no action needed from you. Once it&#39;s updated, send <code>helper retry last</code> here.</p>
    | <p>Codex said: The &#39;gpt-9&#39; model requires a newer version of Codex. Please upgrade to the latest app or CLI and try again.</p>
--- <msg:6> owner (html)
+-- <msg:5> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper retry last</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>helper retry last</p>
--- <msg:7> helper (html)
+-- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Running <code>turn-1</code> again as <code>turn-2</code>.</p>
    | <p><strong>Prompt:</strong><br>
    | Use the newest model E2E-CODEXUPGRADE-tooold-1</p>
--- <msg:8> helper (html)
+-- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>Answered after the update E2E-CODEXUPGRADE-tooold-1</p>
    | <hr/>

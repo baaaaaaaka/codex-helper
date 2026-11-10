@@ -94,6 +94,26 @@ duplicates after every ambiguous network failure.
 
 ## Visibility and resource bounds
 
+The owner's initial prompt confirmation is appended below the original Teams
+message, after a horizontal rule. This includes acceptance, additional input,
+queueing, duplicate suppression, held requests, restart or upgrade deferral,
+and Control-chat questions. Later notices, command replies, Codex output, and
+other members' confirmations keep their separate messages.
+
+The confirmation stays in the existing outbox. Its optional `append_to` target
+selects an idempotent edit, not a second delivery queue. The edit preserves
+attachments and mentions. Unsupported content, messages that cannot be edited,
+confirmations that do not fit, and unavailable edit-read budgets use the
+separate-message path so read throttles do not hold later answers. That fallback
+is stored before POST. An uncertain PATCH is retried with the same confirmation
+key; an uncertain POST still uses the normal read-back rules. A successful edit
+does not register the user's message as a helper post. Voice transcript edits
+preserve the confirmation, and confirmation edits preserve the media card.
+
+Schema version 7 adds one nullable column without rewriting history. Existing
+outbox rows have no target and retain their original delivery method. A build
+that supports only an older schema cannot open the upgraded store.
+
 Still-working notices use the time since the last Codex event. Defaults are
 two minutes for the first notice and five minutes between repeats. Notices
 include cancel guidance from seven minutes of silence. From the 15-minute

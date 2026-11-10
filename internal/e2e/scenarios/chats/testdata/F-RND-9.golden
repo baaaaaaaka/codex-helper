@@ -72,37 +72,43 @@
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Draft the release note E2E-FRND9-first-1</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Draft the release note E2E-FRND9-first-1</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Draft the release note E2E-FRND9-first-1</p>
 -- <msg:4> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-FRND9-first-1</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:6> owner (html)
+-- <msg:5> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
-   | <attachment id="<msg:5>"></attachment><attachment id="<uuid:1>"></attachment><attachment id="<ms:1>"></attachment><p>Shorten this one E2E-FRND9-reply-2</p>
-   attachment: {"content":"{\"messageId\":\"<msg:5>\",\"messagePreview\":\"E2EANSWER…\",\"messageSender\":{\"application\":null,\"device\":null,\"user\":{\"displayName\":\"E2E Owner\",\"id\":\"\",\"userIdentityType\":\"aadUser\"}}}","contentType":"messageReference","contentUrl":null,"id":"<msg:5>","name":null}
+   | <attachment id="<msg:4>"></attachment><attachment id="<uuid:1>"></attachment><attachment id="<ms:1>"></attachment><p>Shorten this one E2E-FRND9-reply-2</p>
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:2> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   attachment: {"content":"{\"messageId\":\"<msg:4>\",\"messagePreview\":\"E2EANSWER…\",\"messageSender\":{\"application\":null,\"device\":null,\"user\":{\"displayName\":\"E2E Owner\",\"id\":\"\",\"userIdentityType\":\"aadUser\"}}}","contentType":"messageReference","contentUrl":null,"id":"<msg:4>","name":null}
    attachment: {"content":"{\"originalChatId\":\"<chat:3>\",\"originalMessageContent\":\"\\u003cp\\u003eForwarded note from the design chat E2E-FRND9-forwarded-3\\u003c/p\\u003e\",\"originalMessageId\":\"<ms:2>\",\"originalMessageSender\":{\"application\":null,\"device\":null,\"user\":{\"displayName\":\"Ann Example\",\"id\":\"\",\"userIdentityType\":\"aadUser\"}},\"originalSentDateTime\":\"<time:1>\"}","contentType":"forwardedMessageReference","contentUrl":null,"id":"<uuid:1>","name":null}
    attachment: {"content":"{\"messageId\":\"<ms:1>\",\"messagePreview\":\"an older message that was deleted\",\"messageSender\":{\"application\":null,\"device\":null,\"user\":{\"displayName\":\"E2E Owner\",\"id\":\"\",\"userIdentityType\":\"aadUser\"}}}","contentType":"messageReference","contentUrl":null,"id":"<ms:1>","name":null}
-   edited 1 time(s); earlier versions:
+   edited 2 time(s); earlier versions:
    [version 1]
-   | <attachment id="<msg:5>"></attachment><attachment id="<uuid:1>"></attachment><attachment id="<ms:1>"></attachment><p>Shorten this one E2E-FRND9-reply-2</p>
--- <msg:7> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:8> helper (html)
+   | <attachment id="<msg:4>"></attachment><attachment id="<uuid:1>"></attachment><attachment id="<ms:1>"></attachment><p>Shorten this one E2E-FRND9-reply-2</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <attachment id="<msg:4>"></attachment><attachment id="<uuid:1>"></attachment><attachment id="<ms:1>"></attachment><p>Shorten this one E2E-FRND9-reply-2</p>
+-- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-FRND9-forwarded-3</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:9> owner (html)
+-- <msg:7> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Long specification E2E-FRND9-long-4<br>
    | requirement line with enough words to be long<br>
@@ -166,7 +172,10 @@
    | requirement line with enough words to be long<br>
    | requirement line with enough words to be long<br>
    | </p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:3> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Long specification E2E-FRND9-long-4<br>
    | requirement line with enough words to be long<br>
@@ -230,26 +239,90 @@
    | requirement line with enough words to be long<br>
    | requirement line with enough words to be long<br>
    | </p>
--- <msg:10> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:11> helper (html)
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Long specification E2E-FRND9-long-4<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | requirement line with enough words to be long<br>
+   | </p>
+-- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-FRND9-long-4</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:12> owner (html)
+-- <msg:9> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
-   | <attachment id="<msg:9>"></attachment><p>Check the spec I quoted E2E-FRND9-quotelong-5</p>
-   attachment: {"content":"{\"messageId\":\"<msg:9>\",\"messagePreview\":\"Long specification E2E-FRND9-long-4\",\"messageSender\":{\"application\":null,\"device\":null,\"user\":{\"displayName\":\"E2E Owner\",\"id\":\"\",\"userIdentityType\":\"aadUser\"}}}","contentType":"messageReference","contentUrl":null,"id":"<msg:9>","name":null}
-   edited 1 time(s); earlier versions:
-   [version 1]
-   | <attachment id="<msg:9>"></attachment><p>Check the spec I quoted E2E-FRND9-quotelong-5</p>
--- <msg:13> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <attachment id="<msg:7>"></attachment><p>Check the spec I quoted E2E-FRND9-quotelong-5</p>
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:4> --><p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:14> helper (html)
+   attachment: {"content":"{\"messageId\":\"<msg:7>\",\"messagePreview\":\"Long specification E2E-FRND9-long-4\",\"messageSender\":{\"application\":null,\"device\":null,\"user\":{\"displayName\":\"E2E Owner\",\"id\":\"\",\"userIdentityType\":\"aadUser\"}}}","contentType":"messageReference","contentUrl":null,"id":"<msg:7>","name":null}
+   edited 2 time(s); earlier versions:
+   [version 1]
+   | <attachment id="<msg:7>"></attachment><p>Check the spec I quoted E2E-FRND9-quotelong-5</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <attachment id="<msg:7>"></attachment><p>Check the spec I quoted E2E-FRND9-quotelong-5</p>
+-- <msg:10> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-FRND9-long-4</p>
    | <hr/>

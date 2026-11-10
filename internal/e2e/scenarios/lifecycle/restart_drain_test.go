@@ -53,7 +53,12 @@ func TestHelperRestartDrain(t *testing.T) {
 	waiting, okWaiting := commandIn(s, control.ID, "helper restart now", "Codex work is still active")
 	s.Check("R-18 `helper restart now` while work runs waits for it",
 		okWaiting && strings.Contains(waiting, "I will restart the helper when the running work finishes"), "⏳ Codex work is still active. I will restart …", clip(waiting, 200))
-	saved, okSaved := commandIn(s, chatB.ID, "Held job "+held, "I saved this message")
+	steps.MustPost(s, chatB.ID, "Held job "+held)
+	okSaved := steps.WaitPromptConfirmation(s, chatB.ID, "I saved this message", steps.CommandTimeout)
+	var saved string
+	if notices := steps.PromptConfirmations(s, chatB.ID, "I saved this message"); len(notices) > 0 {
+		saved = harness.NormalizeSpace(notices[0].PlainText())
+	}
 	s.Check("F-SVC-10 a prompt sent while the restart waits gets the saved-message notice",
 		okSaved && strings.HasSuffix(saved, "helper restart in progress. I saved this message and will resume it after the helper is back online."),
 		"helper restart in progress. I saved this message and will resume it after the helper is back online.", saved)
@@ -75,8 +80,8 @@ func TestHelperRestartDrain(t *testing.T) {
 		restarted && secondInst != firstInst && len(s.SUTMessagesContaining(control.ID, "Helper restart completed")) == 1, "a new instance; 1 notice",
 		fmt.Sprintf("restarted=%v notices=%d", restarted, len(s.SUTMessagesContaining(control.ID, "Helper restart completed"))))
 	s.Check("F-SVC-10 the saved prompt runs once, in the new process, and is answered once",
-		okHeld && len(heldCalls) == 1 && heldCalls[0].Instance != firstInst && len(steps.AnswerPosts(s, chatB.ID, held)) == 1 && len(s.SUTMessagesContaining(chatB.ID, "I saved this message")) == 1,
-		"1 call after the restart, 1 answer, 1 notice", fmt.Sprintf("calls=%d answers=%d notices=%d", len(heldCalls), len(steps.AnswerPosts(s, chatB.ID, held)), len(s.SUTMessagesContaining(chatB.ID, "I saved this message"))),
+		okHeld && len(heldCalls) == 1 && heldCalls[0].Instance != firstInst && len(steps.AnswerPosts(s, chatB.ID, held)) == 1 && len(steps.PromptConfirmations(s, chatB.ID, "I saved this message")) == 1,
+		"1 call after the restart, 1 answer, 1 notice", fmt.Sprintf("calls=%d answers=%d notices=%d", len(heldCalls), len(steps.AnswerPosts(s, chatB.ID, held)), len(steps.PromptConfirmations(s, chatB.ID, "I saved this message"))),
 		s.Transcript(chatB.ID, 8)...)
 
 	steps.MustPost(s, chatA.ID, "Forced job "+forced)

@@ -58,40 +58,46 @@
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>A task with a held cosmetic request E2E-EDITTITLEHELD-first-1</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>A task with a held cosmetic request E2E-EDITTITLEHELD-first-1</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>A task with a held cosmetic request E2E-EDITTITLEHELD-first-1</p>
 -- <msg:4> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-EDITTITLEHELD-first-1</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:6> owner (html)
+-- <msg:5> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper rename Owner title</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>helper rename Owner title</p>
--- <msg:7> helper (html)
+-- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Work chat renamed.</p>
    | <p>New title:<br>
    | 💬 e2ehost - Owner title</p>
    | <p>Use <code>helper details</code> to see the full Teams title and link.</p>
--- <msg:8> owner (html)
+-- <msg:7> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Another task E2E-EDITTITLEHELD-second-2</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:2> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Another task E2E-EDITTITLEHELD-second-2</p>
--- <msg:9> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:10> helper (html)
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Another task E2E-EDITTITLEHELD-second-2</p>
+-- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-EDITTITLEHELD-second-2</p>
    | <hr/>

@@ -66,28 +66,31 @@
 -- <msg:10> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>ask what is E2E-CMDEFFORT-ctlhigh-3?</p>
-   edited 1 time(s); earlier versions:
-   [version 1]
-   | <p>ask what is E2E-CMDEFFORT-ctlhigh-3?</p>
--- <msg:11> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
    | <p>❓ <strong>Codex received your control-chat question.</strong></p>
    | <p>This message is not a helper command, so <strong>Codex will answer it here after helper-local preparation succeeds</strong>. The request has been accepted; attachments or Teams voice/video may still be processed before Codex starts.</p>
    | <p>To stop this control-chat request, send <code>helper cancel turn-3</code> here. For project work, send <code>new &lt;directory&gt;</code>, then send the task inside the new 💬 Work chat.</p>
--- <msg:12> helper (html)
+   edited 2 time(s); earlier versions:
+   [version 1]
+   | <p>ask what is E2E-CMDEFFORT-ctlhigh-3?</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>ask what is E2E-CMDEFFORT-ctlhigh-3?</p>
+-- <msg:11> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong> <at id="0">E2E Owner</at></p>
    | <p>E2EANSWER-<n> answer for E2E-CMDEFFORT-ctlhigh-3</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - high, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
    mention 0: owner "E2E Owner"
--- <msg:13> owner (html)
+-- <msg:12> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>efforts</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>efforts</p>
--- <msg:14> helper (html)
+-- <msg:13> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Current chat effort choices for GPT-5-Codex:</p>
    | <ul><li><code>low</code></li>
@@ -95,13 +98,13 @@
    | <li><code>high</code> (current)</li>
    | </ul>
    | <p>Use <code>effort set &lt;value&gt;</code> to switch this chat.</p>
--- <msg:15> owner (html)
+-- <msg:14> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>effort reset</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>effort reset</p>
--- <msg:16> helper (html)
+-- <msg:15> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Reasoning effort updated for this Control chat<br>
    | Previous: <code>high</code><br>
@@ -109,7 +112,7 @@
    | Model: <code>gpt-5-codex</code><br>
    | Source: model-advertised default<br>
    | Applies to turns that start after this change in this chat; a running turn keeps its effort.</p>
--- <msg:17> helper (html)
+-- <msg:16> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>✅ Codex finished</strong></p>
    | <p><strong>Chat:</strong> 💬 e2ehost - Please answer E2E-CMDEFFORT-high-1<br>
@@ -191,25 +194,28 @@
 -- <msg:11> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Please answer E2E-CMDEFFORT-high-1</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:2> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Please answer E2E-CMDEFFORT-high-1</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Please answer E2E-CMDEFFORT-high-1</p>
 -- <msg:12> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:13> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-CMDEFFORT-high-1</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - high, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:14> owner (html)
+-- <msg:13> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper effort low</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>helper effort low</p>
--- <msg:15> helper (html)
+-- <msg:14> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Reasoning effort updated for this Work chat<br>
    | Previous: <code>high</code><br>
@@ -217,13 +223,13 @@
    | Model: <code>gpt-5-codex</code><br>
    | Source: chat override<br>
    | Applies to turns that start after this change in this chat; a running turn keeps its effort.</p>
--- <msg:16> owner (html)
+-- <msg:15> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper model effort status</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>helper model effort status</p>
--- <msg:17> helper (html)
+-- <msg:16> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Current chat effort (Work)<br>
    | Effective for next turn: <code>low</code><br>
@@ -232,22 +238,22 @@
    | Model for this chat: <code>gpt-5-codex</code><br>
    | Model-advertised default: <code>medium</code><br>
    | Available: <code>low</code>, <code>medium</code>, <code>high</code></p>
--- <msg:18> owner (html)
+-- <msg:17> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper effort turbo</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>helper effort turbo</p>
--- <msg:19> helper (html)
+-- <msg:18> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>reasoning effort &#34;turbo&#34; is not supported by model &#34;gpt-5-codex&#34;; available values: <code>low</code>, <code>medium</code>, <code>high</code></p>
--- <msg:20> owner (html)
+-- <msg:19> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper effort help</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>helper effort help</p>
--- <msg:21> helper (html)
+-- <msg:20> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Reasoning effort commands:</p>
    | <ul><li><code>effort status</code> - show this chat&#39;s current effort</li>
@@ -255,13 +261,13 @@
    | <li><code>effort set &lt;value&gt;</code> - switch future turns in this chat</li>
    | <li><code>effort reset</code> - use the current model&#39;s advertised default</li>
    | </ul>
--- <msg:22> owner (html)
+-- <msg:21> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper effort reset</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>helper effort reset</p>
--- <msg:23> helper (html)
+-- <msg:22> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Reasoning effort updated for this Work chat<br>
    | Previous: <code>low</code><br>
@@ -269,31 +275,37 @@
    | Model: <code>gpt-5-codex</code><br>
    | Source: model-advertised default<br>
    | Applies to turns that start after this change in this chat; a running turn keeps its effort.</p>
--- <msg:24> owner (html)
+-- <msg:23> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Please answer E2E-CMDEFFORT-medium-2</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:3> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Please answer E2E-CMDEFFORT-medium-2</p>
--- <msg:25> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:26> helper (html)
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Please answer E2E-CMDEFFORT-medium-2</p>
+-- <msg:24> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-CMDEFFORT-medium-2</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:27> owner (html)
+-- <msg:25> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Please answer E2E-CMDEFFORT-after-4</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:4> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Please answer E2E-CMDEFFORT-after-4</p>
--- <msg:28> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:29> helper (html)
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Please answer E2E-CMDEFFORT-after-4</p>
+-- <msg:26> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-CMDEFFORT-after-4</p>
    | <hr/>

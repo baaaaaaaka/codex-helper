@@ -68,7 +68,7 @@ func TestUnknownAcceptedFinalAllowsQueuedTaskWhileReadsFail(t *testing.T) {
 	s.WaitCodexCalls(first, 1, steps.AnswerTimeout)
 	steps.MustPost(s, work.ID, "helper queue Following request "+next)
 	s.Require("second request admitted", steps.CommandTimeout, func() (bool, string) {
-		return len(s.SUTMessagesContaining(work.ID, "Queued.")) > 0, "queued acknowledgment pending"
+		return len(steps.PromptConfirmations(s, work.ID, "Queued.")) > 0, "queued acknowledgment pending"
 	})
 	reads := s.Graph.AddFault(fakegraph.Fault{Name: "message-reads-unavailable", Kind: fakegraph.FaultStatus, Status: 503, Method: "GET", Route: "GET /chats/{chat}/messages", ChatID: work.ID})
 	lost := s.Graph.AddFault(fakegraph.Fault{Name: "accepted-final-response-lost", Kind: fakegraph.FaultAcceptedLost, Method: "POST", ChatID: work.ID, Match: steps.AnswerPostMatcher(first), Times: 1})

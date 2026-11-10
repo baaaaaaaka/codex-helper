@@ -64,8 +64,14 @@
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Long task E2E-MODELSWITCHBUSY-running-1</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
+   | <p>Long task E2E-MODELSWITCHBUSY-running-1</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Long task E2E-MODELSWITCHBUSY-running-1</p>
 -- <msg:4> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
@@ -75,52 +81,55 @@
    | <p>helper model switch gpt-5-mini</p>
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:6> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Model profile switched for this Work chat<br>
    | Previous: Codex Official (<code>gpt-5-codex</code>)<br>
    | Effective next-turn model: Codex Official (<code>gpt-5-mini</code>)<br>
    | Selection: chat override</p>
    | <p>The next message will continue the current Codex thread with its portable context preserved.<br>
    | The running turn keeps its model.</p>
--- <msg:7> owner (html)
+-- <msg:6> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper queue Next task E2E-MODELSWITCHBUSY-queued-2</p>
-   edited 1 time(s); earlier versions:
-   [version 1]
-   | <p>helper queue Next task E2E-MODELSWITCHBUSY-queued-2</p>
--- <msg:8> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:2> --><p><strong>🔧 Helper:</strong></p>
    | <p>⏳ <strong>Queued.</strong> Your request will run after the current one finishes.</p>
    | <p><strong>Running now:</strong> Long task E2E-MODELSWITCHBUSY-running-1</p>
    | <p>To cancel it: <code>helper cancel</code> (cancels the newest queued request). To interrupt the running one: <code>helper cancel running</code>.</p>
--- <msg:9> helper (html)
+   edited 2 time(s); earlier versions:
+   [version 1]
+   | <p>helper queue Next task E2E-MODELSWITCHBUSY-queued-2</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper queue Next task E2E-MODELSWITCHBUSY-queued-2</p>
+-- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-MODELSWITCHBUSY-running-1</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:10> helper (html)
+-- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>▶️ <strong>Next to run</strong><br>
    | “Next task E2E-MODELSWITCHBUSY-queued-2”</p>
--- <msg:11> helper (html)
+-- <msg:9> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-MODELSWITCHBUSY-queued-2</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-mini, effort - low, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:12> owner (html)
+-- <msg:10> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>After the crash E2E-MODELSWITCHBUSY-aftercrash-3</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:3> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>After the crash E2E-MODELSWITCHBUSY-aftercrash-3</p>
--- <msg:13> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:14> helper (html)
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>After the crash E2E-MODELSWITCHBUSY-aftercrash-3</p>
+-- <msg:11> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-MODELSWITCHBUSY-aftercrash-3</p>
    | <hr/>

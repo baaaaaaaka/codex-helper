@@ -75,53 +75,59 @@
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Please answer E2E-EDITLABEL-prompt-1</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Please answer E2E-EDITLABEL-prompt-1</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Please answer E2E-EDITLABEL-prompt-1</p>
 -- <msg:4> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-EDITLABEL-prompt-1</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+-- <msg:5> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper status</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper status</p>
 -- <msg:6> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>helper status</p>
-   edited 1 time(s); earlier versions:
+   | <p>Read the attached notes E2E-EDITLABEL-file-2</p>
+   | <attachment id="<uuid:1>"></attachment><hr/>
+   | <!-- cxp-prompt-confirmation:<id:2> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   attachment: {"content":null,"contentType":"reference","contentUrl":"https://e2etenant-my.sharepoint.com/personal/owner_e2e_example/Documents/Microsoft%20Teams%20Chat%20Files/notes.txt","id":"<uuid:1>","name":"notes.txt","teamsAppId":null,"thumbnailUrl":null}
+   edited 2 time(s); earlier versions:
    [version 1]
-   | <p>helper status</p>
--- <msg:7> owner (html)
+   | <p>Read the attached notes E2E-EDITLABEL-file-2</p>
+   | <attachment id="<uuid:1>"></attachment>
+   [version 2]
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Read the attached notes E2E-EDITLABEL-file-2</p>
    | <attachment id="<uuid:1>"></attachment>
-   attachment: {"content":null,"contentType":"reference","contentUrl":"https://e2etenant-my.sharepoint.com/personal/owner_e2e_example/Documents/Microsoft%20Teams%20Chat%20Files/notes.txt","id":"<uuid:1>","name":"notes.txt","teamsAppId":null,"thumbnailUrl":null}
-   edited 1 time(s); earlier versions:
-   [version 1]
-   | <p>Read the attached notes E2E-EDITLABEL-file-2</p>
-   | <attachment id="<uuid:1>"></attachment>
--- <msg:8> helper (html)
+-- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>s001 (active): idle, 0 queued. Directory: <code><root>/work/label</code>.</p>
--- <msg:9> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:10> helper (html)
+-- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-EDITLABEL-file-2</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:11> owner (html)
+-- <msg:9> owner (html)
    | <p>Describe this image E2E-EDITLABEL-image-3</p>
-   | <p><img src="https://graph.microsoft.com/v1.0/chats/<chat:2>/messages/<msg:11>/hostedContents/aWQ9eF8wLXd1cy1kMTEtZTJl/$value" width="64" height="64" alt="image" itemid="0"></p>
+   | <p><img src="https://graph.microsoft.com/v1.0/chats/<chat:2>/messages/<msg:9>/hostedContents/aWQ9eF8wLXd1cy1kMTEtZTJl/$value" width="64" height="64" alt="image" itemid="0"></p>
    hosted: sha256:2b1da20a14b97d8f01f0a809d9f7d53eeefc59df6312eaa5a0c8b5c1228d1d7f
--- <msg:12> helper (html)
+-- <msg:10> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:13> helper (html)
+-- <msg:11> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-EDITLABEL-image-3</p>
    | <hr/>

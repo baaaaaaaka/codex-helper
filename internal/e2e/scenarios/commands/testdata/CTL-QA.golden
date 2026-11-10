@@ -9,81 +9,90 @@
 -- <msg:2> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>ask what does E2E-CTLQA-ask-2 mean?</p>
-   edited 1 time(s); earlier versions:
-   [version 1]
-   | <p>ask what does E2E-CTLQA-ask-2 mean?</p>
--- <msg:3> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
    | <p>❓ <strong>Codex received your control-chat question.</strong></p>
    | <p>This message is not a helper command, so <strong>Codex will answer it here after helper-local preparation succeeds</strong>. The request has been accepted; attachments or Teams voice/video may still be processed before Codex starts.</p>
    | <p>To stop this control-chat request, send <code>helper cancel turn-1</code> here. For project work, send <code>new &lt;directory&gt;</code>, then send the task inside the new 💬 Work chat.</p>
--- <msg:4> helper (html)
+   edited 2 time(s); earlier versions:
+   [version 1]
+   | <p>ask what does E2E-CTLQA-ask-2 mean?</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>ask what does E2E-CTLQA-ask-2 mean?</p>
+-- <msg:3> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong> <at id="0">E2E Owner</at></p>
    | <p>E2EANSWER-<n> answer for E2E-CTLQA-ask-2</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - low, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
    mention 0: owner "E2E Owner"
--- <msg:5> owner (html)
+-- <msg:4> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>How do I start project work? E2E-CTLQA-plain-3</p>
-   edited 1 time(s); earlier versions:
-   [version 1]
-   | <p>How do I start project work? E2E-CTLQA-plain-3</p>
--- <msg:6> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:2> --><p><strong>🔧 Helper:</strong></p>
    | <p>❓ <strong>Codex received your control-chat question.</strong></p>
    | <p>This message is not a helper command, so <strong>Codex will answer it here after helper-local preparation succeeds</strong>. The request has been accepted; attachments or Teams voice/video may still be processed before Codex starts.</p>
    | <p>To stop this control-chat request, send <code>helper cancel turn-2</code> here. For project work, send <code>new &lt;directory&gt;</code>, then send the task inside the new 💬 Work chat.</p>
--- <msg:7> helper (html)
+   edited 2 time(s); earlier versions:
+   [version 1]
+   | <p>How do I start project work? E2E-CTLQA-plain-3</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>How do I start project work? E2E-CTLQA-plain-3</p>
+-- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong> <at id="0">E2E Owner</at></p>
    | <p>E2EANSWER-<n> answer for E2E-CTLQA-plain-3</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - low, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
    mention 0: owner "E2E Owner"
--- <msg:8> owner (html)
+-- <msg:6> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>ask</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>ask</p>
--- <msg:9> helper (html)
+-- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>usage: <code>ask &lt;question&gt;</code></p>
--- <msg:10> owner (html)
+-- <msg:8> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>please think about E2E-CTLQA-slow-1</p>
-   edited 1 time(s); earlier versions:
-   [version 1]
-   | <p>please think about E2E-CTLQA-slow-1</p>
--- <msg:11> owner (html)
-   | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>helper cancel running</p>
-   edited 1 time(s); earlier versions:
-   [version 1]
-   | <p>helper cancel running</p>
--- <msg:12> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:3> --><p><strong>🔧 Helper:</strong></p>
    | <p>❓ <strong>Codex received your control-chat question.</strong></p>
    | <p>This message is not a helper command, so <strong>Codex will answer it here after helper-local preparation succeeds</strong>. The request has been accepted; attachments or Teams voice/video may still be processed before Codex starts.</p>
    | <p>To stop this control-chat request, send <code>helper cancel turn-3</code> here. For project work, send <code>new &lt;directory&gt;</code>, then send the task inside the new 💬 Work chat.</p>
--- <msg:13> helper (html)
+   edited 2 time(s); earlier versions:
+   [version 1]
+   | <p>please think about E2E-CTLQA-slow-1</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>please think about E2E-CTLQA-slow-1</p>
+-- <msg:9> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper cancel running</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper cancel running</p>
+-- <msg:10> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>cancel requested for running turn: <code>turn-3</code></p>
    | <p><strong>Prompt being canceled:</strong><br>
    | please think about E2E-CTLQA-slow-1</p>
    | <p>No other prompts are queued.</p>
--- <msg:14> owner (html)
+-- <msg:11> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper cancel last</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>helper cancel last</p>
--- <msg:15> helper (html)
+-- <msg:12> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Codex request canceled.</p>
--- <msg:16> helper (html)
+-- <msg:13> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>no running or queued turn is available to cancel in this control chat.</p>
 

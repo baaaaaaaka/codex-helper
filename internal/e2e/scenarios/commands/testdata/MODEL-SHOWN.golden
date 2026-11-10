@@ -55,15 +55,18 @@
 -- <msg:8> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>ask what is E2E-MODELSHOWN-ctl-3?</p>
-   edited 1 time(s); earlier versions:
-   [version 1]
-   | <p>ask what is E2E-MODELSHOWN-ctl-3?</p>
--- <msg:9> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
    | <p>❓ <strong>Codex received your control-chat question.</strong></p>
    | <p>This message is not a helper command, so <strong>Codex will answer it here after helper-local preparation succeeds</strong>. The request has been accepted; attachments or Teams voice/video may still be processed before Codex starts.</p>
    | <p>To stop this control-chat request, send <code>helper cancel turn-3</code> here. For project work, send <code>new &lt;directory&gt;</code>, then send the task inside the new 💬 Work chat.</p>
--- <msg:10> helper (html)
+   edited 2 time(s); earlier versions:
+   [version 1]
+   | <p>ask what is E2E-MODELSHOWN-ctl-3?</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>ask what is E2E-MODELSHOWN-ctl-3?</p>
+-- <msg:9> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong> <at id="0">E2E Owner</at></p>
    | <p>E2EANSWER-<n> answer for E2E-MODELSHOWN-ctl-3</p>
    | <hr/>
@@ -110,38 +113,41 @@
 -- <msg:5> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Please answer E2E-MODELSHOWN-work-1</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:2> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Please answer E2E-MODELSHOWN-work-1</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Please answer E2E-MODELSHOWN-work-1</p>
 -- <msg:6> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-MODELSHOWN-work-1</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:8> owner (html)
+-- <msg:7> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper model switch gpt-5-mini</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>helper model switch gpt-5-mini</p>
--- <msg:9> helper (html)
+-- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Model profile switched for this Work chat<br>
    | Previous: Codex Official (<code>gpt-5-codex</code>)<br>
    | Effective next-turn model: Codex Official (<code>gpt-5-mini</code>)<br>
    | Selection: chat override</p>
    | <p>The next message will continue the current Codex thread with its portable context preserved.</p>
--- <msg:10> owner (html)
+-- <msg:9> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>model</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>model</p>
--- <msg:11> helper (html)
+-- <msg:10> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Chat: Work<br>
    | Session: <code>s001</code><br>
@@ -153,16 +159,19 @@
    | Global default for new chats: Codex Official (<code>gpt-5-codex</code>) (existing chats are unchanged)<br>
    | Model profile: Codex Official (<code>gpt-5-mini</code>)<br>
    | Switchable: yes. Switching preserves the existing Codex thread and portable context, if present.</p>
--- <msg:12> owner (html)
+-- <msg:11> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Please answer E2E-MODELSHOWN-mini-2</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:3> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Please answer E2E-MODELSHOWN-mini-2</p>
--- <msg:13> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:14> helper (html)
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Please answer E2E-MODELSHOWN-mini-2</p>
+-- <msg:12> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-MODELSHOWN-mini-2</p>
    | <hr/>

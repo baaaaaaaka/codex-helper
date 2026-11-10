@@ -40,44 +40,50 @@
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Export the report and the dataset as files E2E-R37out-artifacts-1</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Export the report and the dataset as files E2E-R37out-artifacts-1</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Export the report and the dataset as files E2E-R37out-artifacts-1</p>
 -- <msg:4> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER here are the two files you asked for E2E-R37out-artifacts-1</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:6> helper (html)
+-- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>📎 quarterly report.csv</p>
    | <attachment id="<uuid:1>"></attachment>
    attachment: {"contentType":"reference","contentUrl":"https://e2etenant-my.sharepoint.com/personal/owner_e2e_example/Documents/Microsoft%20Teams%20Chat%20Files/codex-<upload:1>/quarterly%20report.csv","id":"<uuid:1>","name":"quarterly report.csv"}
--- <msg:7> helper (html)
+-- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>📎 dataset-large.bin</p>
    | <attachment id="<uuid:2>"></attachment>
    attachment: {"contentType":"reference","contentUrl":"https://e2etenant-my.sharepoint.com/personal/owner_e2e_example/Documents/Microsoft%20Teams%20Chat%20Files/codex-<upload:2>/dataset-large.bin","id":"<uuid:2>","name":"dataset-large.bin"}
--- <msg:8> owner (html)
+-- <msg:7> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Send an updated report under the same name E2E-R37out-conflict-2</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:2> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Send an updated report under the same name E2E-R37out-conflict-2</p>
--- <msg:9> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:10> helper (html)
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Send an updated report under the same name E2E-R37out-conflict-2</p>
+-- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER here is the updated report E2E-R37out-conflict-2</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:11> helper (html)
+-- <msg:9> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>📎 quarterly report.csv</p>
    | <attachment id="<uuid:3>"></attachment>

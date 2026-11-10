@@ -139,7 +139,7 @@ func scanTurn(sc scanner) (Turn, error) {
 	return t, err
 }
 
-const outboxCols = `id,conv_id,delivery_key,seq,kind,part,parts,body,body_hash,mention,reply_to,state,attempt_token,ext_msg_id,next_attempt_at,created_at,sent_at,note,hash_algo,progress_group,batch_head,batch_body,hold_turn`
+const outboxCols = `id,conv_id,delivery_key,seq,kind,part,parts,body,body_hash,mention,reply_to,state,attempt_token,ext_msg_id,next_attempt_at,created_at,sent_at,note,hash_algo,progress_group,batch_head,batch_body,hold_turn,append_to`
 
 func scanOutbox(sc scanner) (Outbox, error) {
 	var o Outbox
@@ -167,6 +167,7 @@ func scanOutbox(sc scanner) (Outbox, error) {
 	p.int(&o.BatchHead)
 	p.str(&o.BatchBody)
 	p.int(&o.HoldTurn)
+	p.str(&o.AppendTo)
 	err := p.scan(sc)
 	if o.BatchBody != "" {
 		o.Body = o.BatchBody

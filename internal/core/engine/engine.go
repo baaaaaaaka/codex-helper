@@ -709,6 +709,15 @@ func (e *Engine) start(ctx context.Context) error {
 				return err
 			}
 			for _, r := range rows {
+				if r.State == store.OutSending && r.AppendTo != "" {
+					// Appending is idempotent, unlike POST. Check the original
+					// message on retry if PATCH completed just before the crash.
+					// Retain a retry timestamp so this is not a fresh append.
+					if err := tx.Requeue(r.ID, ms(e.now())); err != nil {
+						return err
+					}
+					continue
+				}
 				if r.State == store.OutSending && (r.BatchHead == 0 || r.BatchHead == r.ID) {
 					if err := tx.MarkUnknown(r.ID, "helper stopped during send"); err != nil {
 						return err

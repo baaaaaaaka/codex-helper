@@ -57,29 +57,32 @@
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Please answer E2E-CMDCLOSE-before-1</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Please answer E2E-CMDCLOSE-before-1</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Please answer E2E-CMDCLOSE-before-1</p>
 -- <msg:4> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-CMDCLOSE-before-1</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:6> owner (html)
+-- <msg:5> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper close</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>helper close</p>
--- <msg:7> helper (html)
+-- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Session closed. The helper will no longer read or respond in this Teams chat.</p>
    | <p>This chat remains visible in Teams. Use the 🏠 control chat to open or create another work chat.</p>
--- <msg:8> owner (html)
+-- <msg:7> owner (html)
    | <p>Please answer E2E-CMDCLOSE-after-2</p>
 
 == codex turns (per thread; threads by kind, directory and first prompt; turns in start order)

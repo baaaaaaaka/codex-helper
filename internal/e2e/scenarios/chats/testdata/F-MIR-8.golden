@@ -55,26 +55,29 @@
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>What did we decide last week E2E-FMIR8-cite-1</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>What did we decide last week E2E-FMIR8-cite-1</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>What did we decide last week E2E-FMIR8-cite-1</p>
 -- <msg:4> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
    | <p>Checking the notes from memory E2E-FMIR8-cite-1</p>
--- <msg:6> helper (html)
+-- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>Visible answer for E2E-FMIR8-cite-1</p>
    | <pre><code>&lt;oai-mem-citation&gt;example kept in a code block&lt;/oai-mem-citation&gt;</code></pre>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:7> helper (html)
+-- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
    | <p>Continue locally E2E-FMIR8-tuiprompt-6</p>
--- <msg:8> helper (html)
+-- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>Local answer E2E-FMIR8-tuianswer-5</p>
    | <hr/>

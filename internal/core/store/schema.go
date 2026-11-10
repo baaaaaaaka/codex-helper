@@ -4,7 +4,7 @@ package store
 const ApplicationID = 0x63787031
 
 // SchemaVersion is the PRAGMA user_version this code writes and understands.
-const SchemaVersion = 6
+const SchemaVersion = 7
 
 // migrations[i] upgrades user_version i to i+1. Each step runs in one
 // transaction together with the user_version bump. There is no pointer file.
@@ -28,6 +28,7 @@ var migrations = [][]string{
 	// independent of their count, without changing any rows or delivery states.
 	{`CREATE INDEX outbox_active ON outbox(conv_id, seq) WHERE state IN ('queued','sending')`},
 	engineStateSchema,
+	{`ALTER TABLE outbox ADD COLUMN append_to TEXT`},
 }
 
 // schemaV1 is the complete initial schema (STORE-DESIGN.md §3). No triggers

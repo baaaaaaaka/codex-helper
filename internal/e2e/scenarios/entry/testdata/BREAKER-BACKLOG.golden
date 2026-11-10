@@ -75,49 +75,61 @@
 -- <msg:4> seeded (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper queue Queued while down 1 E2E-BREAKERBACKLOG-q11-1</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
+   | <p>helper queue Queued while down 1 E2E-BREAKERBACKLOG-q11-1</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper queue Queued while down 1 E2E-BREAKERBACKLOG-q11-1</p>
 -- <msg:5> seeded (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper queue Queued while down 2 E2E-BREAKERBACKLOG-q12-3</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:2> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ <strong>Queued.</strong> Your request will run when the current work in this chat finishes, behind 1 other queued request.</p>
+   | <p>To cancel it: <code>helper cancel</code> (cancels the newest queued request).</p>
+   edited 2 time(s); earlier versions:
    [version 1]
+   | <p>helper queue Queued while down 2 E2E-BREAKERBACKLOG-q12-3</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper queue Queued while down 2 E2E-BREAKERBACKLOG-q12-3</p>
 -- <msg:6> seeded (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper queue Queued while down 3 E2E-BREAKERBACKLOG-q13-5</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:3> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ <strong>Queued.</strong> Your request will run when the current work in this chat finishes, behind 2 other queued requests.</p>
+   | <p>To cancel it: <code>helper cancel</code> (cancels the newest queued request).</p>
+   edited 2 time(s); earlier versions:
    [version 1]
+   | <p>helper queue Queued while down 3 E2E-BREAKERBACKLOG-q13-5</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper queue Queued while down 3 E2E-BREAKERBACKLOG-q13-5</p>
 -- <msg:7> seeded (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper queue Queued while down 4 E2E-BREAKERBACKLOG-q14-7</p>
-   edited 1 time(s); earlier versions:
-   [version 1]
-   | <p>helper queue Queued while down 4 E2E-BREAKERBACKLOG-q14-7</p>
--- <msg:8> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:9> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ <strong>Queued.</strong> Your request will run when the current work in this chat finishes, behind 1 other queued request.</p>
-   | <p>To cancel it: <code>helper cancel</code> (cancels the newest queued request).</p>
--- <msg:10> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ <strong>Queued.</strong> Your request will run when the current work in this chat finishes, behind 2 other queued requests.</p>
-   | <p>To cancel it: <code>helper cancel</code> (cancels the newest queued request).</p>
--- <msg:11> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:4> --><p><strong>🔧 Helper:</strong></p>
    | <p>⏳ <strong>Queued.</strong> Your request will run when the current work in this chat finishes, behind 3 other queued requests.</p>
    | <p>To cancel it: <code>helper cancel</code> (cancels the newest queued request).</p>
--- <msg:12> helper (html)
+   edited 2 time(s); earlier versions:
+   [version 1]
+   | <p>helper queue Queued while down 4 E2E-BREAKERBACKLOG-q14-7</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper queue Queued while down 4 E2E-BREAKERBACKLOG-q14-7</p>
+-- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-BREAKERBACKLOG-q11-1</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:13> helper (html)
+-- <msg:9> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>▶️ <strong>Next to run</strong><br>
    | “Queued while down 2 E2E-BREAKERBACKLOG-q12-3”</p>
@@ -126,54 +138,57 @@
    | <ol><li>“Queued while down 3 E2E-BREAKERBACKLOG-q13-5”</li>
    | <li>“Queued while down 4 E2E-BREAKERBACKLOG-q14-7”</li>
    | </ol>
--- <msg:14> helper (html)
+-- <msg:10> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-BREAKERBACKLOG-q12-3</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:15> helper (html)
+-- <msg:11> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-BREAKERBACKLOG-q13-5</p>
+   | <hr/>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+-- <msg:12> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>E2EANSWER-<n> answer for E2E-BREAKERBACKLOG-q14-7</p>
+   | <hr/>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+-- <msg:13> peer-helper (html)
+   | <p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>E2EANSWER-<n> answer for E2E-BREAKERBACKLOG-q12-3</p>
+   | <hr/>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+-- <msg:14> peer-helper (html)
+   | <p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>E2EANSWER-<n> answer for E2E-BREAKERBACKLOG-q13-5</p>
+   | <hr/>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
+   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+-- <msg:15> peer-helper (html)
+   | <p><strong>🤖 ✅ Codex answer:</strong></p>
+   | <p>E2EANSWER-<n> answer for E2E-BREAKERBACKLOG-q14-7</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:16> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
-   | <p>E2EANSWER-<n> answer for E2E-BREAKERBACKLOG-q14-7</p>
-   | <hr/>
-   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
-   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:17> peer-helper (html)
-   | <p><strong>🤖 ✅ Codex answer:</strong></p>
-   | <p>E2EANSWER-<n> answer for E2E-BREAKERBACKLOG-q12-3</p>
-   | <hr/>
-   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
-   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:18> peer-helper (html)
-   | <p><strong>🤖 ✅ Codex answer:</strong></p>
-   | <p>E2EANSWER-<n> answer for E2E-BREAKERBACKLOG-q13-5</p>
-   | <hr/>
-   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
-   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:19> peer-helper (html)
-   | <p><strong>🤖 ✅ Codex answer:</strong></p>
-   | <p>E2EANSWER-<n> answer for E2E-BREAKERBACKLOG-q14-7</p>
-   | <hr/>
-   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
-   | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:20> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Paused auto-start of new requests: several messages that look like helper output arrived in a short time (possible self-echo loop). Messages are still read and held. Send <code>helper unpause</code> to resume.</p>
--- <msg:21> owner (html)
+-- <msg:17> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Prompt while paused E2E-BREAKERBACKLOG-held-9</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:5> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Request held: this chat is paused, so new requests do not run. It will not run later by itself; resend it once the chat is resumed.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Prompt while paused E2E-BREAKERBACKLOG-held-9</p>
--- <msg:22> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Request held: this chat is paused, so new requests do not run. It will not run later by itself; resend it once the chat is resumed.</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Prompt while paused E2E-BREAKERBACKLOG-held-9</p>
 
 == chat <chat:10> "💬 e2ehost - Queued while down 1 E2E-BREAKERBACKLOG-q21-2"
    type: group; members: owner
@@ -191,49 +206,61 @@
 -- <msg:4> seeded (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper queue Queued while down 1 E2E-BREAKERBACKLOG-q21-2</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:6> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
+   | <p>helper queue Queued while down 1 E2E-BREAKERBACKLOG-q21-2</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper queue Queued while down 1 E2E-BREAKERBACKLOG-q21-2</p>
 -- <msg:5> seeded (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper queue Queued while down 2 E2E-BREAKERBACKLOG-q22-4</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:7> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ <strong>Queued.</strong> Your request will run when the current work in this chat finishes, behind 1 other queued request.</p>
+   | <p>To cancel it: <code>helper cancel</code> (cancels the newest queued request).</p>
+   edited 2 time(s); earlier versions:
    [version 1]
+   | <p>helper queue Queued while down 2 E2E-BREAKERBACKLOG-q22-4</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper queue Queued while down 2 E2E-BREAKERBACKLOG-q22-4</p>
 -- <msg:6> seeded (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper queue Queued while down 3 E2E-BREAKERBACKLOG-q23-6</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:8> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ <strong>Queued.</strong> Your request will run when the current work in this chat finishes, behind 2 other queued requests.</p>
+   | <p>To cancel it: <code>helper cancel</code> (cancels the newest queued request).</p>
+   edited 2 time(s); earlier versions:
    [version 1]
+   | <p>helper queue Queued while down 3 E2E-BREAKERBACKLOG-q23-6</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper queue Queued while down 3 E2E-BREAKERBACKLOG-q23-6</p>
 -- <msg:7> seeded (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper queue Queued while down 4 E2E-BREAKERBACKLOG-q24-8</p>
-   edited 1 time(s); earlier versions:
-   [version 1]
-   | <p>helper queue Queued while down 4 E2E-BREAKERBACKLOG-q24-8</p>
--- <msg:8> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:9> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ <strong>Queued.</strong> Your request will run when the current work in this chat finishes, behind 1 other queued request.</p>
-   | <p>To cancel it: <code>helper cancel</code> (cancels the newest queued request).</p>
--- <msg:10> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ <strong>Queued.</strong> Your request will run when the current work in this chat finishes, behind 2 other queued requests.</p>
-   | <p>To cancel it: <code>helper cancel</code> (cancels the newest queued request).</p>
--- <msg:11> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:9> --><p><strong>🔧 Helper:</strong></p>
    | <p>⏳ <strong>Queued.</strong> Your request will run when the current work in this chat finishes, behind 3 other queued requests.</p>
    | <p>To cancel it: <code>helper cancel</code> (cancels the newest queued request).</p>
--- <msg:12> helper (html)
+   edited 2 time(s); earlier versions:
+   [version 1]
+   | <p>helper queue Queued while down 4 E2E-BREAKERBACKLOG-q24-8</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper queue Queued while down 4 E2E-BREAKERBACKLOG-q24-8</p>
+-- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-BREAKERBACKLOG-q21-2</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:13> helper (html)
+-- <msg:9> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>▶️ <strong>Next to run</strong><br>
    | “Queued while down 2 E2E-BREAKERBACKLOG-q22-4”</p>
@@ -242,34 +269,37 @@
    | <ol><li>“Queued while down 3 E2E-BREAKERBACKLOG-q23-6”</li>
    | <li>“Queued while down 4 E2E-BREAKERBACKLOG-q24-8”</li>
    | </ol>
--- <msg:14> helper (html)
+-- <msg:10> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-BREAKERBACKLOG-q22-4</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:15> helper (html)
+-- <msg:11> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-BREAKERBACKLOG-q23-6</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:16> helper (html)
+-- <msg:12> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-BREAKERBACKLOG-q24-8</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:17> owner (html)
+-- <msg:13> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Prompt in the other chat E2E-BREAKERBACKLOG-other-10</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:10> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Prompt in the other chat E2E-BREAKERBACKLOG-other-10</p>
--- <msg:18> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:19> helper (html)
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Prompt in the other chat E2E-BREAKERBACKLOG-other-10</p>
+-- <msg:14> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-BREAKERBACKLOG-other-10</p>
    | <hr/>

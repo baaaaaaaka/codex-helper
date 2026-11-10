@@ -32,10 +32,10 @@ func (t *Tx) Enqueue(convID int64, msgs []OutMsg) (int, error) {
 			parts = 1
 		}
 		var id int64
-		err := t.row(`INSERT INTO outbox(conv_id,delivery_key,seq,kind,part,parts,body,body_hash,mention,reply_to,state,created_at,progress_group,hold_turn)
-VALUES (?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM outbox WHERE conv_id = ?), ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?)
+		err := t.row(`INSERT INTO outbox(conv_id,delivery_key,seq,kind,part,parts,body,body_hash,mention,reply_to,state,created_at,progress_group,hold_turn,append_to)
+VALUES (?, ?, (SELECT COALESCE(MAX(seq), 0) + 1 FROM outbox WHERE conv_id = ?), ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
 RETURNING id`, convID, m.DeliveryKey, convID, m.Kind, part, parts, nullStr(m.Body), m.BodyHash, m.Mention,
-			nullStr(m.ReplyTo), t.now, nullStr(m.ProgressGroup), nullInt(m.HoldTurn)).Scan(&id)
+			nullStr(m.ReplyTo), t.now, nullStr(m.ProgressGroup), nullInt(m.HoldTurn), nullStr(m.AppendTo)).Scan(&id)
 		if err != nil {
 			return n, err
 		}
@@ -106,6 +106,12 @@ func (t *Tx) BeginSend(id int64) (string, error) {
 	}
 	tok := hex.EncodeToString(b[:])
 	return tok, t.outMove(id, []string{OutQueued}, `state = 'sending', attempt_token = ?`, tok)
+}
+
+// SeparateConfirmation durably selects the ordinary POST path before sending.
+// A crash after POST must use normal unknown-send recovery, never append again.
+func (t *Tx) SeparateConfirmation(id int64) error {
+	return t.outMove(id, []string{OutSending}, `append_to = NULL`)
 }
 
 // MarkSent records the channel message id of a sending (or resolved unknown) row.
