@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/candidateupdate"
 	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 	"github.com/baaaaaaaka/codex-helper/internal/updatestate"
 	"github.com/gofrs/flock"
@@ -274,7 +275,7 @@ func stageTUIRelease(ctx context.Context, current helperruntime.Context, base st
 	if err := helperruntime.ProbeProtocol(ctx, path); err != nil {
 		return err
 	}
-	if err := helperruntime.ProbeProtocol(ctx, current.EntryPath); err != nil {
+	if err := candidateupdate.CheckBootstrapEntry(ctx, current.Root, current.EntryPath); err != nil {
 		return fmt.Errorf("safe boot requires a current installed launcher: %w", err)
 	}
 	if _, err := helperruntime.ReadBoot(current.Root); err != nil {

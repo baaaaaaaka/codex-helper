@@ -443,3 +443,59 @@ func readUpdateCheckForTest(root string) (tuiCheckState, error) {
 	defer s.Close()
 	return s.Check()
 }
+
+func TestTUIAutoAcceptsOnlyVerifiedMigrationForwarder(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("inert POSIX probes; native image locking runs in upgrade E2E")
+	}
+	for _, tampered := range []bool{false, true} {
+		t.Run(fmt.Sprint(tampered), func(t *testing.T) {
+			c := tuiUpdateFixture(t)
+			if err := os.WriteFile(c.EntryPath, []byte("#!/bin/sh\nprintf '1\\n'\n"), 0755); err != nil {
+				t.Fatal(err)
+			}
+			source, err := os.ReadFile(c.RuntimePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := sha256.Sum256(source)
+			digest := hex.EncodeToString(h[:])
+			if tampered {
+				digest = strings.Repeat("0", 64)
+			}
+			s, err := updatestate.Open(c.Root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = s.SavePending(updatestate.Pending{Schema: 1, RuntimeRoot: c.Root, EntryPath: c.EntryPath, TargetVersion: c.Version, TargetActive: c.RuntimePath, TargetSHA256: digest, RequestID: "sqlite-bootstrap:fixture"})
+			s.Close()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(c.Root, "active"), []byte(c.Version+"\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			payload := []byte("#!/bin/sh\nif [ \"$1\" = \"--cxp-boot-protocol\" ]; then printf '2\\n'; else printf 'cxp version 2.0.0\\n'; fi\n")
+			now := time.Now().UTC()
+			manifest := tuiManifestFixture(t, payload, now)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/manifest" {
+					json.NewEncoder(w).Encode(manifest)
+					return
+				}
+				w.Write(payload)
+			}))
+			defer server.Close()
+			restore := overrideGitHubBases(server.URL)
+			defer restore()
+			err = checkAndStageTUI(context.Background(), c, server.URL+"/manifest", now)
+			if (err != nil) != tampered {
+				t.Fatalf("tampered=%v: %v", tampered, err)
+			}
+			boot, readErr := helperruntime.ReadBoot(c.Root)
+			if readErr != nil || boot.Good != c.Version || (boot.Candidate != nil) == tampered {
+				t.Fatal("unexpected native selection", boot, readErr)
+			}
+		})
+	}
+}

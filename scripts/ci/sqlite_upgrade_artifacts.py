@@ -64,6 +64,7 @@ def main():
         install.mkdir()
         entry = install / ("cxp" + suffix)
         shutil.copy2(previous, entry)
+        original_entry = entry.stat()
         assert old.lstrip("v") in run(entry, "--version").stdout
         protocol = run(entry, "--cxp-boot-protocol", check=False).stdout.strip()
         if protocol == "2":
@@ -98,10 +99,11 @@ def main():
         if protocol != "2":
             expected = hashlib.sha256(current.read_bytes()).digest()
             deadline = time.monotonic() + 15
-            while hashlib.sha256(entry.read_bytes()).digest() != expected:
+            while os.path.samestat(original_entry, entry.stat()):
                 assert time.monotonic() < deadline, "physical bootstrap migration did not converge"
                 time.sleep(0.1)
-                run(entry, "--config", config, "proxy", "prune")
+            assert hashlib.sha256(entry.read_bytes()).digest() == expected, "unexpected replacement bytes"
+            run(entry, "--config", config, "proxy", "prune")
 
         # Frozen state, independent of the new serializer. The real released
         # CLI imports it and a fresh invocation must read native state only.

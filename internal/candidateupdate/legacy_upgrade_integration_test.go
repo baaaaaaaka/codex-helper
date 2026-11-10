@@ -84,6 +84,22 @@ func copyUpgradeBinary(t *testing.T, source, target string) {
 	}
 }
 
+// f.Stat captures the Windows file ID immediately; os.Stat can defer that
+// lookup until SameFile, after the path has already been replaced.
+func upgradeEntryIdentity(t *testing.T, path string) os.FileInfo {
+	t.Helper()
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := f.Stat()
+	f.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info
+}
+
 func TestCandidateLegacyOriginalUpdaterCompletesSQLiteCutover(t *testing.T) {
 	fixture := legacyEnvironment(t)
 	candidate := buildUpgradeCandidate(t, "v9.99.0")
@@ -129,6 +145,7 @@ func TestCandidateLegacyOriginalUpdaterCompletesSQLiteCutover(t *testing.T) {
 			entry := filepath.Join(dir, helperruntime.BinaryName(runtime.GOOS))
 			root := filepath.Join(dir, ".cxp-runtime")
 			copyUpgradeBinary(t, tc.source, entry)
+			originalEntry := upgradeEntryIdentity(t, entry)
 			out := runUpgradeCLI(t, entry, false, "--version")
 			if !strings.Contains(string(out), strings.TrimPrefix(tc.version, "v")) {
 				t.Fatal(string(out))
@@ -218,16 +235,25 @@ func TestCandidateLegacyOriginalUpdaterCompletesSQLiteCutover(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
-			deadline := time.Now().Add(15 * time.Second)
-			for {
-				if _, err := os.Stat(filepath.Join(root, "active")); os.IsNotExist(err) {
-					break
+			if !tc.native {
+				// Allow quiescence: launching the old image on every poll
+				// would keep creating the mappings the Windows worker awaits.
+				deadline := time.Now().Add(15 * time.Second)
+				for {
+					now := upgradeEntryIdentity(t, entry)
+					if !os.SameFile(originalEntry, now) {
+						break
+					}
+					if time.Now().After(deadline) {
+						log, _ := os.ReadFile(filepath.Join(root, "bootstrap-migration.log"))
+						t.Fatalf("physical bootstrap did not converge after launcher exit; worker: %s", log)
+					}
+					time.Sleep(100 * time.Millisecond)
 				}
-				if time.Now().After(deadline) {
-					t.Fatal("legacy entry repair did not converge")
-				}
-				time.Sleep(100 * time.Millisecond)
 				runUpgradeCLI(t, entry, false, "--config", config, "proxy", "prune")
+			}
+			if _, err := os.Stat(filepath.Join(root, "active")); !os.IsNotExist(err) {
+				t.Fatal("migration cleanup did not converge", err)
 			}
 			wantHash := hex.EncodeToString(digest[:])
 			if tc.native {
