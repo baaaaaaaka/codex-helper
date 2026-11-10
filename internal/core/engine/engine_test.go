@@ -1435,22 +1435,20 @@ func (s *stormScanner) Receive(ctx context.Context, stream, cursor string) (chan
 	return s.Fake.Receive(ctx, stream, cursor)
 }
 
-// Benchmark S1/S2: after an account read throttle the first request when
-// the Retry-After ends is the activity scan (it serves every chat), and the
-// chat reads then resume one at a time at the paced rate, not as a burst.
-func TestReadThrottleReleasesScanFirstThenPacedReads(t *testing.T) {
+// After an account read throttle the activity scan serves every chat before
+// per-chat polling resumes. The pacer's recovery rate and burst bounds are
+// tested with a controlled clock in pace_test.go: worker scheduling can delay
+// a permitted read past the next token grant, so channel-call timestamps are
+// not an accurate observation of token spacing.
+func TestReadThrottleResumesWithActivityScan(t *testing.T) {
 	var sc *stormScanner
 	r := newRig(t, func(c *Config) {
 		sc = &stormScanner{Fake: c.Channel.(*channeltest.Fake)}
 		c.Channel, c.ActivityScan = sc, true
-		// This integration check measures the account pacer's spacing. A
-		// single reader keeps worker scheduling from bunching requests that
-		// already received tokens before the throttle was observed.
-		c.Readers = 1
-		c.Timing.ScanInterval = 5 * time.Second // the scan after the gate is not a tick
+		c.Timing.ScanInterval = 5 * time.Second  // the scan after the gate is not a tick
+		c.Timing.PaceIncrease = 30 * time.Second // keep recovery active throughout this scenario
 	})
 	r.control()
-	time.Sleep(300 * time.Millisecond)
 	sc.mu.Lock()
 	sc.storm = true
 	sc.mu.Unlock()
@@ -1464,11 +1462,27 @@ func TestReadThrottleReleasesScanFirstThenPacedReads(t *testing.T) {
 		}
 		return false
 	})
-	time.Sleep(200 * time.Millisecond)
+	// Recording the fake's 429 precedes the receiver applying that result.
+	// Wait for the actual recovery state before lifting the injected fault.
+	r.wait("account throttle installed", func() bool {
+		r.e.readTokens.mu.Lock()
+		defer r.e.readTokens.mu.Unlock()
+		return !r.e.readTokens.cut.IsZero()
+	})
 	sc.mu.Lock()
 	sc.storm = false
 	sc.mu.Unlock()
-	time.Sleep(3 * time.Second)
+	r.wait("scan and chat reads resume after the throttle", func() bool {
+		sc.mu.Lock()
+		defer sc.mu.Unlock()
+		last := -1
+		for i, o := range sc.ops {
+			if o.throttled {
+				last = i
+			}
+		}
+		return len(sc.ops[last+1:]) >= 4
+	})
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	last := -1
@@ -1478,9 +1492,6 @@ func TestReadThrottleReleasesScanFirstThenPacedReads(t *testing.T) {
 		}
 	}
 	after := sc.ops[last+1:]
-	if len(after) < 4 {
-		t.Fatalf("only %d requests in the 3 s after the storm", len(after))
-	}
 	if after[0].what != "scan" {
 		var seq []string
 		for _, o := range after[:min(len(after), 6)] {
@@ -1488,18 +1499,14 @@ func TestReadThrottleReleasesScanFirstThenPacedReads(t *testing.T) {
 		}
 		t.Fatalf("first requests after the read gate opened: %v, want the scan first", seq)
 	}
-	var reads []time.Time
+	reads := 0
 	for _, o := range after[1:] {
 		if o.what == "read" {
-			reads = append(reads, o.at)
+			reads++
 		}
 	}
-	// The read pacer stepped down to 3.75/s with a burst of one: about
-	// 267 ms between reads (the control chat polls every 20 ms otherwise).
-	for i := 1; i < len(reads) && i < 6; i++ {
-		if gap := reads[i].Sub(reads[i-1]); gap < 200*time.Millisecond {
-			t.Fatalf("reads %d and %d after the Retry-After only %s apart: a burst", i-1, i, gap)
-		}
+	if reads < 3 {
+		t.Fatalf("only %d chat reads after recovery; operations: %+v", reads, after)
 	}
 }
 

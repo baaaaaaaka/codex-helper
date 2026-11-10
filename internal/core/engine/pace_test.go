@@ -157,6 +157,86 @@ func TestPacerBurstIsOneAfterACut(t *testing.T) {
 	}
 }
 
+// The recovery contract applies to token grants, including after a scheduler
+// pause, and ends at the configured quiet-period boundary. No wall-clock
+// sleep or worker-start timestamp is needed to exercise either side.
+func TestPacerRecoveryWindowWithDelayedScheduler(t *testing.T) {
+	for _, quiet := range []time.Duration{600 * time.Millisecond, 30 * time.Second} {
+		t.Run(quiet.String(), func(t *testing.T) {
+			clk := &testClock{t: time.Unix(1000, 0)}
+			p := newPacer(4, quiet, clk.now)
+			resume := clk.now().Add(time.Second)
+			p.throttled(clk.now(), resume)
+			clk.add(time.Second - time.Nanosecond)
+			if ok, _ := p.take(); ok {
+				t.Fatal("request granted before Retry-After")
+			}
+			clk.add(quiet) // delayed worker wakes just before the recovery window ends
+			if ok, _ := p.take(); !ok {
+				t.Fatal("no request granted after the scheduler pause")
+			}
+			if ok, _ := p.take(); ok {
+				t.Fatal("scheduler pause accumulated a burst during recovery")
+			}
+			clk.add(quiet + time.Second) // recovery ended; a normal burst may accrue
+			granted := 0
+			for i := 0; i < 4; i++ {
+				if ok, _ := p.take(); ok {
+					granted++
+				}
+			}
+			if granted != 3 {
+				t.Fatalf("normal burst after recovery: %d grants, want 3 at 3.75/s", granted)
+			}
+		})
+	}
+}
+
+// Keep coverage of the connection between the receiver and the pacer. A
+// correct pacer alone would not catch a receiver that stopped consulting it.
+func TestReadDispatchHonorsRecoveryBudget(t *testing.T) {
+	clk := &testClock{t: time.Unix(1000, 0)}
+	e := priorityEngine()
+	e.now = clk.now
+	e.readTokens = newPacer(4, 30*time.Second, clk.now)
+	for id := int64(1); id <= 8; id++ {
+		e.addConv(id, &convState{nextRead: clk.now()})
+	}
+	resume := clk.now().Add(time.Second)
+	e.readTokens.throttled(clk.now(), resume)
+	e.scanFirst.Store(true)
+	clk.add(2 * time.Second) // a delayed receiver now has one recovered token
+	dispatch := func() []int64 {
+		jobs := make(chan int64, 16)
+		if _, ok := e.dispatchReads(context.Background(), jobs); !ok {
+			t.Fatal("read dispatch canceled")
+		}
+		close(jobs)
+		var ids []int64
+		for id := range jobs {
+			ids = append(ids, id)
+		}
+		return ids
+	}
+	if got := dispatch(); len(got) != 0 {
+		t.Fatalf("chat reads preceded the recovery scan: %v", got)
+	}
+	// Model completion of the scan: it consumes the reserved token and
+	// releases the receiver. There is no chat-read token left yet.
+	e.readTokens.borrow()
+	e.scanFirst.Store(false)
+	if got := dispatch(); len(got) != 0 {
+		t.Fatalf("reads dispatched without recovery tokens: %v", got)
+	}
+	clk.add(300 * time.Millisecond)
+	if got := dispatch(); len(got) != 1 {
+		t.Fatalf("one recovered token dispatched %v, want one chat", got)
+	}
+	if got := dispatch(); len(got) != 0 {
+		t.Fatalf("a recovery token was reused: %v", got)
+	}
+}
+
 // After a Retry-After the writes resume one at a time at the paced rate,
 // not as a burst of everything that waited.
 func TestPacerReleasesGraduallyAfterRetryAfter(t *testing.T) {

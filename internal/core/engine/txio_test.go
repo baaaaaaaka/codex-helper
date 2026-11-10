@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -19,53 +20,78 @@ import (
 // callee that writes the store itself would deadlock on the one writer
 // connection.
 
-// writerFree reports whether a write transaction can start within 2 s. It
-// cannot when the calling goroutine itself holds one; other goroutines'
-// transactions are short.
-func writerFree(st *store.Store) bool {
-	done := make(chan struct{})
+// writerFree tries a real store write. The timeout bounds a regression that
+// deadlocks on the caller's transaction; it is not a latency assertion.
+func writerFree(st *store.Store) error {
+	done := make(chan error, 1)
 	go func() {
-		_ = st.Update(func(*store.Tx) error { return nil })
-		close(done)
+		done <- st.Update(func(*store.Tx) error { return nil })
 	}()
 	select {
-	case <-done:
-		return true
-	case <-time.After(2 * time.Second):
-		return false
+	case err := <-done:
+		return err
+	case <-time.After(5 * time.Second):
+		return errors.New("store write blocked while probing an external call")
 	}
 }
 
 // probeNotifier's Available reads files and may write the store (the CLI
 // applies a pending Workflow change there).
 type probeNotifier struct {
-	st    atomic.Pointer[store.Store]
-	inTx  atomic.Int32
-	cards atomic.Int32
+	st        *store.Store
+	available int
+	cards     int
+	err       error
 }
 
 func (n *probeNotifier) Available() bool {
-	if st := n.st.Load(); st != nil && !writerFree(st) {
-		n.inTx.Add(1)
-	}
+	n.available++
+	n.err = errors.Join(n.err, writerFree(n.st))
 	return true
 }
 
 func (n *probeNotifier) Notify(context.Context, channel.OwnerNotice) error {
-	n.cards.Add(1)
+	n.cards++
 	return nil
 }
 
 func TestNotifierAvailabilityIsCheckedOutsideTheWriteTransaction(t *testing.T) {
-	n := &probeNotifier{}
-	r := newRig(t, func(c *Config) { c.Notifier = n })
-	n.st.Store(r.st)
-	work := r.newWork(t.TempDir())
-	r.ch.PostUser(work, "card me")
-	r.wait("answer", func() bool { return len(r.own(work, "ANSWER to card me")) == 1 })
-	r.wait("card", func() bool { return n.cards.Load() == 1 })
-	if c := n.inTx.Load(); c != 0 {
-		t.Fatalf("the Workflow availability was checked %d times inside a write transaction", c)
+	// Run the notification pump alone. This checks the transaction boundary
+	// without starting receivers, senders or unrelated startup notifications.
+	st, err := store.Open(filepath.Join(t.TempDir(), "core.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if _, err := st.Acquire(store.Ident{Host: "h", PID: 1, BootID: "b"}); err != nil {
+		t.Fatal(err)
+	}
+	defer st.Release()
+	n := &probeNotifier{st: st}
+	e, err := New(Config{Store: st, Channel: channeltest.New(), Agent: newAgent(), Notifier: n})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Seed one due notification, so the test also proves the availability
+	// result is used by a real delivery, without counting startup cards.
+	var conv int64
+	if err := e.update(func(tx *store.Tx) error {
+		var err error
+		conv, err = tx.CreateConversation(store.NewConversation{Label: "control", Kind: store.KindControl, Channel: "teams", ExtChatID: "control"})
+		if err != nil {
+			return err
+		}
+		return e.addNotify(tx, pendingNotify{Conv: conv, Key: "boundary-probe", Kind: notifyService, Request: "test", Text: "transaction boundary"})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	e.convs[conv] = &convState{id: conv, kind: store.KindControl, chat: "control"}
+	e.pumpNotify(context.Background())
+	if n.available == 0 || n.cards != 1 {
+		t.Fatalf("availability checks=%d, delivered cards=%d; want a checked, delivered notification", n.available, n.cards)
+	}
+	if n.err != nil {
+		t.Fatalf("availability could not write the store outside the engine transaction: %v", n.err)
 	}
 }
 
@@ -81,7 +107,7 @@ type probeRenderChannel struct {
 func (c *probeRenderChannel) Render(ctx context.Context, doc channel.RichDoc) ([]channel.Part, error) {
 	if doc.Math && c.st != nil {
 		c.render.Add(1)
-		if !writerFree(c.st) {
+		if writerFree(c.st) != nil {
 			c.inTx.Add(1)
 		}
 	}
