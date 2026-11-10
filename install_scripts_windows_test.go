@@ -5,7 +5,6 @@ package installtest
 import (
 	"bytes"
 	"crypto/sha256"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -14,7 +13,32 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
+	"github.com/baaaaaaaka/codex-helper/internal/managedinstall"
 )
+
+// These installer fixtures execute only their argument protocol. Actual runtime
+// activation is covered by the released-artifact upgrade matrix.
+func TestMain(m *testing.M) {
+	if code, handled := managedinstall.HandleInstallerCommand(os.Args, os.Stdout, os.Stderr); handled {
+		os.Exit(code)
+	}
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "--version":
+			fmt.Println("codex-proxy 1.2.3")
+			os.Exit(0)
+		case "--cxp-install-bootstrap":
+			os.Exit(0)
+		}
+	}
+	if name := strings.ToLower(filepath.Base(os.Args[0])); name == "cxp.exe" || name == "codex-proxy.exe" {
+		// Other installer probes (such as builtin skills) are inert here.
+		os.Exit(0)
+	}
+	os.Exit(m.Run())
+}
 
 func TestInstallPs1LatestViaRedirect(t *testing.T) {
 	runInstallPs1(t, false, false)
@@ -193,7 +217,7 @@ func TestInstallPs1ChecksumDownloadFailureRemainsBestEffort(t *testing.T) {
 	tag := "v1.2.3"
 	verNoV := strings.TrimPrefix(tag, "v")
 	asset := fmt.Sprintf("codex-proxy_%s_windows_amd64.exe", verNoV)
-	assetData := []byte("fake-binary")
+	assetData := buildWindowsCodexProxyAsset(t)
 	checksum := sha256.Sum256(assetData)
 
 	server := newInstallServerWithChecksumStatus(t, repo, tag, asset, assetData, false, checksum, http.StatusNotFound)
@@ -277,7 +301,7 @@ func TestInstallPs1ChecksumMismatchFailsBeforeReplacingBinaries(t *testing.T) {
 
 func TestInstallPs1ChecksumWithoutTargetAssetRowRemainsBestEffort(t *testing.T) {
 	asset := "codex-proxy_1.2.3_windows_amd64.exe"
-	assetData := []byte("fake-binary")
+	assetData := buildWindowsCodexProxyAsset(t)
 	otherChecksum := sha256.Sum256([]byte("other-asset"))
 	server := newInstallServerWithChecksumManifest(t, "owner/name", "v1.2.3", asset, assetData, false, fmt.Sprintf("%x  another-asset.exe\n", otherChecksum), http.StatusOK)
 	defer server.Close()
@@ -299,7 +323,7 @@ func TestInstallPs1ChecksumWithoutTargetAssetRowRemainsBestEffort(t *testing.T) 
 }
 
 func TestInstallPs1ConcurrentDownloadsUseIsolatedTemporaryPaths(t *testing.T) {
-	assetData := []byte("concurrent-fake-binary")
+	assetData := buildWindowsCodexProxyAsset(t)
 	checksum := sha256.Sum256(assetData)
 	server := newInstallServer(t, "owner/name", "v1.2.3", "codex-proxy_1.2.3_windows_amd64.exe", assetData, false, checksum)
 	defer server.Close()
@@ -448,7 +472,7 @@ func TestInstallPs1RemovesLegacyCodexClpExe(t *testing.T) {
 	tag := "v1.2.3"
 	verNoV := strings.TrimPrefix(tag, "v")
 	asset := fmt.Sprintf("codex-proxy_%s_windows_amd64.exe", verNoV)
-	assetData := []byte("fake-binary")
+	assetData := buildWindowsCodexProxyAsset(t)
 	checksum := sha256.Sum256(assetData)
 
 	server := newInstallServer(t, repo, tag, asset, assetData, false, checksum)
@@ -519,7 +543,7 @@ func TestInstallPs1RemovesLegacyCodexClaudeProxyAndClpCmd(t *testing.T) {
 	tag := "v1.2.3"
 	verNoV := strings.TrimPrefix(tag, "v")
 	asset := fmt.Sprintf("codex-proxy_%s_windows_amd64.exe", verNoV)
-	assetData := []byte("fake-binary")
+	assetData := buildWindowsCodexProxyAsset(t)
 	checksum := sha256.Sum256(assetData)
 
 	server := newInstallServer(t, repo, tag, asset, assetData, false, checksum)
@@ -590,7 +614,7 @@ func TestInstallPs1PreservesExternalClpCmdReferencingClaudeProxy(t *testing.T) {
 	tag := "v1.2.3"
 	verNoV := strings.TrimPrefix(tag, "v")
 	asset := fmt.Sprintf("codex-proxy_%s_windows_amd64.exe", verNoV)
-	assetData := []byte("fake-binary")
+	assetData := buildWindowsCodexProxyAsset(t)
 	checksum := sha256.Sum256(assetData)
 
 	server := newInstallServer(t, repo, tag, asset, assetData, false, checksum)
@@ -656,33 +680,13 @@ func TestInstallPs1PreservesExternalClpCmdReferencingClaudeProxy(t *testing.T) {
 
 func buildWindowsCodexProxyAsset(t *testing.T) []byte {
 	t.Helper()
-	workDir := t.TempDir()
-	sourcePath := filepath.Join(workDir, "main.go")
-	exePath := filepath.Join(workDir, "codex-proxy.exe")
-	source := `package main
-
-import (
-	"fmt"
-	"os"
-)
-
-func main() {
-	if len(os.Args) > 1 && os.Args[1] == "--version" {
-		fmt.Println("codex-proxy 1.2.3")
-	}
-}
-`
-	if err := os.WriteFile(sourcePath, []byte(source), 0o644); err != nil {
-		t.Fatalf("write fake codex-proxy source: %v", err)
-	}
-	cmd := exec.Command("go", "build", "-o", exePath, sourcePath)
-	output, err := cmd.CombinedOutput()
+	exe, err := helperpath.RawExecutable()
 	if err != nil {
-		t.Fatalf("build fake codex-proxy.exe: %v\n%s", err, string(output))
+		t.Fatal(err)
 	}
-	data, err := os.ReadFile(exePath)
+	data, err := os.ReadFile(exe)
 	if err != nil {
-		t.Fatalf("read fake codex-proxy.exe: %v", err)
+		t.Fatalf("read inert installer fixture: %v", err)
 	}
 	return data
 }
@@ -703,7 +707,7 @@ func runInstallPs1(t *testing.T, apiFail bool, pathAlreadySet bool) {
 	tag := "v1.2.3"
 	verNoV := strings.TrimPrefix(tag, "v")
 	asset := fmt.Sprintf("codex-proxy_%s_windows_amd64.exe", verNoV)
-	assetData := []byte("fake-binary")
+	assetData := buildWindowsCodexProxyAsset(t)
 	checksum := sha256.Sum256(assetData)
 
 	server := newInstallServer(t, repo, tag, asset, assetData, apiFail, checksum)
@@ -795,26 +799,9 @@ func runInstallPs1(t *testing.T, apiFail bool, pathAlreadySet bool) {
 	if cmdText != wantCxpCmd {
 		t.Fatalf("cxp.cmd content mismatch\ngot:\n%q\nwant:\n%q", cmdText, wantCxpCmd)
 	}
-	recordData, err := os.ReadFile(filepath.Join(appData, "codex-helper", "install.json"))
+	record, err := managedinstall.LoadRecord(filepath.Join(appData, "codex-helper", "install.sqlite"))
 	if err != nil {
-		t.Fatalf("read install record: %v", err)
-	}
-	if len(recordData) >= 3 && recordData[0] == 0xef && recordData[1] == 0xbb && recordData[2] == 0xbf {
-		t.Fatalf("install record should be UTF-8 without BOM")
-	}
-	var record struct {
-		SchemaVersion int      `json:"schema_version"`
-		TargetPath    string   `json:"target_path"`
-		TargetSource  string   `json:"target_source"`
-		TargetState   string   `json:"target_state"`
-		Repo          string   `json:"repo"`
-		Version       string   `json:"version"`
-		GOOS          string   `json:"goos"`
-		GOARCH        string   `json:"goarch"`
-		Shims         []string `json:"shims"`
-	}
-	if err := json.Unmarshal(recordData, &record); err != nil {
-		t.Fatalf("parse install record: %v\n%s", err, recordData)
+		t.Fatalf("read native install record: %v", err)
 	}
 	expectedTarget := filepath.Join(installDirResolved, "codex-proxy.exe")
 	expectedShim := filepath.Join(installDirResolved, "cxp.exe")

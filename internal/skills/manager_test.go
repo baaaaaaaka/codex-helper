@@ -101,6 +101,7 @@ func TestNewManagerDoesNotResolveMissingHomesToDot(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
+	t.Cleanup(func() { _ = mgr.Store.Close() })
 	if mgr.HomeDir == "." || mgr.CodexDir == "." {
 		t.Fatalf("manager resolved empty paths to dot: home=%q codex=%q", mgr.HomeDir, mgr.CodexDir)
 	}

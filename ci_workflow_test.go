@@ -50,9 +50,9 @@ func TestCIWorkflowPullRequestTierRunsEverySuiteWithoutWeakeningRequiredChecks(t
 		"GOOS=\"$goos\" go vet \"${packages[@]}\"",
 	)
 	requireStepContains(t, workflowStepBlock(t, cross, "Cross-compile check"),
-		"GOOS=darwin  GOARCH=arm64 go build",
-		"GOOS=darwin  GOARCH=amd64 go build",
-		"GOOS=windows GOARCH=amd64 go build",
+		"for target in darwin/arm64 darwin/amd64 windows/amd64",
+		`GOOS="$goos" GOARCH="$goarch" go list`,
+		`GOOS="$goos" GOARCH="$goarch" go build "${packages[@]}"`,
 		"GOOS=linux   GOARCH=arm64 go build ./...",
 	)
 

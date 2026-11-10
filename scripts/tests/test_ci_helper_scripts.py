@@ -237,6 +237,7 @@ class CIHelperScriptTests(unittest.TestCase):
         self.assertIn("post-parent repair did not converge", script)
         self.assertIn("Assert-Version $cxpExe $TargetTag $true", script)
         self.assertIn("Assert-Version $cxpCmd $TargetTag", script)
+        self.assertIn("$Repo/v0.1.13-rc.53/install.ps1", script)
 
         self.assertIn("OLD_TAG: v0.1.12", ci)
         self.assertIn("TARGET_TAG: v0.1.13-rc.53", ci)

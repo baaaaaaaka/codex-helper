@@ -294,7 +294,14 @@ func TestUnconfirmedLegacyProgressIsRetained(t *testing.T) {
 }
 
 func TestSilenceClockResetsWithCodexActivity(t *testing.T) {
+	var clock atomic.Int64
 	r := newRig(t, func(c *Config) {
+		c.Now = func() time.Time {
+			if n := clock.Load(); n != 0 {
+				return time.Unix(0, n)
+			}
+			return time.Now()
+		}
 		c.Timing.SilenceHint = 100 * time.Millisecond
 		c.Timing.SilenceRepeat = 150 * time.Millisecond
 		c.Timing.SilenceStuck = 500 * time.Millisecond
@@ -302,10 +309,14 @@ func TestSilenceClockResetsWithCodexActivity(t *testing.T) {
 	})
 	r.ag.mu.Lock()
 	r.ag.during = func(_ TurnRequest, h TurnHooks) {
-		end := time.Now().Add(650 * time.Millisecond)
-		for time.Now().Before(end) {
+		// Advance logical time across several silence thresholds. Scheduler
+		// pauses under -race cannot manufacture an inactive interval: each
+		// advance is smaller than the threshold and followed by real activity.
+		clock.Store(time.Now().UnixNano())
+		for range 40 {
+			clock.Add(int64(20 * time.Millisecond))
 			h.Activity()
-			time.Sleep(20 * time.Millisecond)
+			time.Sleep(5 * time.Millisecond)
 		}
 	}
 	r.ag.mu.Unlock()

@@ -137,11 +137,12 @@ try {
     Remove-Item ("Env:" + $name) -ErrorAction SilentlyContinue
   }
 
-  # This regression deliberately runs two historical versions. Their installer
-  # is part of that frozen fixture; the SQLite-only installer rejects old code.
+  # Use the frozen transition-era installer: v0.1.12's own installer predates
+  # cxp.exe. rc.53 seeds the duplicate executable that this historical bug
+  # requires, while the SQLite-only installer deliberately rejects old code.
   $installer = Join-Path $root "historical-install.ps1"
-  Invoke-WebRequest -Uri "https://raw.githubusercontent.com/$Repo/$OldTag/install.ps1" -OutFile $installer
-  Write-Host "Installing the historical fixture with its matching installer: $OldTag"
+  Invoke-WebRequest -Uri "https://raw.githubusercontent.com/$Repo/v0.1.13-rc.53/install.ps1" -OutFile $installer
+  Write-Host "Installing $OldTag with the frozen cxp.exe transition installer v0.1.13-rc.53"
   & $installer -Repo $Repo -Version $OldTag -InstallDir $installDir
   if (!$?) {
     throw "install.ps1 failed"

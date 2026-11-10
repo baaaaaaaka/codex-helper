@@ -20,6 +20,19 @@ import (
 )
 
 func TestCandidateNativeInstallUpdateAndRecovery(t *testing.T) {
+	// Keep Go's caches outside the synthetic account. Module cache directories
+	// are read-only and cannot be removed by TempDir cleanup on native CI.
+	cacheOutput, err := exec.Command("go", "env", "GOMODCACHE", "GOCACHE").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Cache paths may contain spaces (notably on Windows).
+	caches := strings.Split(strings.TrimSpace(strings.ReplaceAll(string(cacheOutput), "\r\n", "\n")), "\n")
+	if len(caches) != 2 {
+		t.Fatalf("unexpected Go cache paths: %q", cacheOutput)
+	}
+	t.Setenv("GOMODCACHE", caches[0])
+	t.Setenv("GOCACHE", caches[1])
 	dir := t.TempDir()
 	home := filepath.Join(dir, "home")
 	if err := os.MkdirAll(home, 0700); err != nil {

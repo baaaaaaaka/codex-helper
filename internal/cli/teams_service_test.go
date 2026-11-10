@@ -5793,7 +5793,11 @@ func withTeamsServiceTestHooks(t *testing.T, hooks teamsServiceTestHooks) {
 	// makes later backend selection sticky; never let one test leak it.
 	if configPath, err := teamsServiceLocalSupervisorConfigPath(); err == nil {
 		if _, statErr := os.Stat(configPath); os.IsNotExist(statErr) {
-			t.Cleanup(func() { _ = os.Remove(configPath) })
+			t.Cleanup(func() {
+				if err := deleteNativeSupervisorConfig(configPath); err != nil {
+					t.Errorf("clean supervisor fixture: %v", err)
+				}
+			})
 		}
 	}
 	t.Setenv(envTeamsCodexChild, "")

@@ -191,7 +191,7 @@ try {
   if ($Mode -eq "managed") {
     # The standard account resets PATH to the machine environment. Pass the
     # hosted runner's interpreter explicitly, without its credentials or PATH.
-    $python = (Get-Command python -CommandType Application -ErrorAction Stop).Source
+    $python = (Get-Command python -CommandType Application -ErrorAction Stop | Select-Object -First 1).Source
     $childProxy = Join-Path $smokeRoot "recording-proxy.exe"
     $childApp = Join-Path $smokeRoot "fake-chatgpt.exe"
     Copy-Item -LiteralPath $RecordingProxy -Destination $childProxy

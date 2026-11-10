@@ -34,7 +34,7 @@ case "$mode" in
     run_tests ./internal/cli '^Test(TeamsCommandsReadThePublished|TeamsRemoteStoreState|TeamsStatusPublisher)' 'TestTeamsCommandsReadThePublishedStateWhileAHelperHoldsTheStore,TestTeamsRemoteStoreStateUsesThePublishedFile,TestTeamsStatusPublisherFollowsCommits' 1
     run_tests ./internal/updatestate '^TestUpdateSQLite' 'TestUpdateSQLiteMigrationAndQuiet,TestUpdateSQLiteMigrationRollsBackAndReadOnly,TestUpdateSQLiteInvocationAndActivationEntry,TestUpdateSQLiteInvocationCrashRetention,TestUpdateSQLiteMissingPublishedDatabase' 1
     run_tests ./internal/sqlitestate '^TestPublication' 'TestPublicationMissingDatabaseFailsClosed,TestPublicationRejectsInvalidMarkerAndEmptyDatabase' 1
-    run_tests ./internal/core/codex '^Test(PIDSQLite|ConcurrentPIDFileWrites)' 'TestPIDSQLiteMigrationAndQuietWrites,TestPIDSQLiteMigrationRollsBack,TestPIDSQLiteKeyTransactionRollsBack,TestConcurrentPIDFileWritesStayValid' 1
+    run_tests ./internal/core/codex '^Test(PIDSQLite|ConcurrentPIDFileWrites)' 'TestPIDSQLiteMigrationAndQuietWrites,TestPIDSQLiteMigrationRollsBack,TestPIDSQLiteKeyTransactionRollsBack,TestConcurrentPIDFileWritesStayValid,TestPIDSQLiteIndependentOpeners' 1
     run_tests ./internal/cli '^TestWindowsAppSQLite' 'TestWindowsAppSQLiteMigrationAndQuiet,TestWindowsAppSQLiteMigrationRollback' 1
     run_tests ./internal/asr '^TestASRSQLite' 'TestASRSQLiteServerRecords,TestASRSQLiteServerMigrationRollback,TestASRSQLiteInstallManifest,TestASRSQLiteInstallMigration' 1
     run_tests ./internal/managedinstall '^TestInstallSQLite' 'TestInstallSQLiteMigrationAndQuiet,TestInstallSQLiteRejectsBadSources,TestInstallSQLiteInstallerEntry' 1

@@ -816,8 +816,7 @@ func TestFinalizeHelperUpdateResultRejectsUnrunnableStableDispatcher(t *testing.
 	if err := helperruntime.Activate(root, "v1.2.4"); err != nil {
 		t.Fatal(err)
 	}
-	quotedRoot := strings.ReplaceAll(root, "'", "'\\''")
-	writeCLIFile(t, installPath, "#!/bin/sh\nprintf 'v1.2.3\\n' > '"+quotedRoot+"/active'\nexit 23\n", 0o755)
+	writeCLIFile(t, installPath, "#!/bin/sh\nexit 23\n", 0o755)
 	writeCLIFile(t, runtimePath, upgradeCXPShimTestScript("1.2.4"), 0o755)
 
 	err := finalizeHelperUpdateResult(update.ApplyResult{
@@ -848,13 +847,18 @@ func TestFinalizeHelperUpdateResultRejectsStableDispatcherThatReactivatesOlderRu
 		t.Fatal(err)
 	}
 	quotedRoot := strings.ReplaceAll(root, "'", "'\\''")
+	exe, err := helperpath.RawExecutable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	quotedExe := strings.ReplaceAll(exe, "'", "'\\''")
 	stableScript := "#!/bin/sh\n" +
-		"python3 -c 'import sqlite3,sys; d=sqlite3.connect(sys.argv[1]); d.execute(\"UPDATE boot SET good=?\",(\"v1.2.3\",)); d.commit()' '" + quotedRoot + "/boot.sqlite'\n" +
+		"set -e\nCXP_TEST_REGRESS_BOOT='" + quotedRoot + "' '" + quotedExe + "' -test.run='^TestStableDispatcherNativeBootChild$'\n" +
 		"echo 'codex-proxy version 1.2.3 (old dispatcher)'\n"
 	writeCLIFile(t, installPath, stableScript, 0o755)
 	writeCLIFile(t, runtimePath, upgradeCXPShimTestScript("1.2.4"), 0o755)
 
-	err := finalizeHelperUpdateResult(update.ApplyResult{
+	err = finalizeHelperUpdateResult(update.ApplyResult{
 		Version:          "1.2.4",
 		InstallPath:      installPath,
 		RuntimePath:      runtimePath,
@@ -865,6 +869,16 @@ func TestFinalizeHelperUpdateResultRejectsStableDispatcherThatReactivatesOlderRu
 	}
 	if active, readErr := helperruntime.ReadActive(root); readErr != nil || active != "v1.2.4" {
 		t.Fatalf("active after rejected stable probe = %q, %v; want target restored", active, readErr)
+	}
+}
+
+func TestStableDispatcherNativeBootChild(t *testing.T) {
+	root := os.Getenv("CXP_TEST_REGRESS_BOOT")
+	if root == "" {
+		return
+	}
+	if err := helperruntime.Activate(root, "v1.2.3"); err != nil {
+		t.Fatal(err)
 	}
 }
 

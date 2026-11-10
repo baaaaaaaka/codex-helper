@@ -185,10 +185,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mapfile -t packages < <(go list -f '{{if .GoFiles}}{{.ImportPath}}{{end}}' ./... | grep -v '/internal/e2e/')
-          GOOS=darwin  GOARCH=arm64 go build "${packages[@]}"
-          GOOS=darwin  GOARCH=amd64 go build "${packages[@]}"
-          GOOS=windows GOARCH=amd64 go build "${packages[@]}"
+          for target in darwin/arm64 darwin/amd64 windows/amd64; do
+            goos=${target%/*}
+            goarch=${target#*/}
+            mapfile -t packages < <(GOOS="$goos" GOARCH="$goarch" go list -f '{{if .GoFiles}}{{.ImportPath}}{{end}}' ./... | grep -v '/internal/e2e/')
+            GOOS="$goos" GOARCH="$goarch" go build "${packages[@]}"
+          done
           GOOS=linux   GOARCH=arm64 go build ./...
 
   unit-linux:
@@ -250,7 +252,9 @@ jobs:
   race-core:
     name: Race test (core and channel)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # The serial core pass took 17 minutes on a hosted runner before ASR,
+    # TUI and startup checks. Each package retains its own 15m/5m timeout.
+    timeout-minutes: 40
 
     steps:
       - name: Checkout

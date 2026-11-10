@@ -961,7 +961,11 @@ func runInstallSh(t *testing.T, apiFail bool, pathAlreadySet bool) {
 	if !strings.Contains(string(cxpVersion), "codex-proxy 1.2.3") {
 		t.Fatalf("unexpected cxp --version output: %s", string(cxpVersion))
 	}
-	record, err := managedinstall.LoadRecord(filepath.Join(homeDir, ".config", "codex-helper", "install.sqlite"))
+	configDir := filepath.Join(homeDir, ".config")
+	if runtime.GOOS == "darwin" {
+		configDir = filepath.Join(homeDir, "Library", "Application Support")
+	}
+	record, err := managedinstall.LoadRecord(filepath.Join(configDir, "codex-helper", "install.sqlite"))
 	if err != nil {
 		t.Fatalf("read native install record: %v", err)
 	}

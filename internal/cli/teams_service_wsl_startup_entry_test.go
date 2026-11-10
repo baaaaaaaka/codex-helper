@@ -24,6 +24,11 @@ func buildTeamsServiceWSLStartupFallbackConfig(taskName string, args []string) s
 func isolateTeamsServiceLocalSupervisorDirsForTest(t *testing.T) {
 	t.Helper()
 	tmp := t.TempDir()
+	// os.UserConfigDir uses HOME on macOS and APPDATA on Windows. XDG alone
+	// does not isolate the supervisor config on those native runners.
+	t.Setenv("HOME", tmp)
+	t.Setenv("USERPROFILE", tmp)
+	t.Setenv("APPDATA", filepath.Join(tmp, "config"))
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(tmp, "config"))
 	t.Setenv("XDG_STATE_HOME", filepath.Join(tmp, "state"))
 }

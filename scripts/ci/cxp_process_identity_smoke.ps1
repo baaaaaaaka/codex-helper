@@ -38,7 +38,13 @@ function Assert-FreshLauncherDispatchesActiveRuntime {
   } finally {
     Pop-Location
   }
-  Set-Content -LiteralPath (Join-Path $runtimeRoot "active") -NoNewline -Value "v$targetVersion"
+  # Publish the native boot record with the verified target, then leave an
+  # older physical entry in place, as an ordinary candidate update does.
+  Copy-Item -Force -LiteralPath $targetRuntime -Destination $entry
+  & $entry --cxp-install-bootstrap --target $entry
+  Copy-Item -Force -LiteralPath $oldRuntime -Destination $entry
+  $boot = Join-Path $runtimeRoot "boot.sqlite"
+  $bootHash = (Get-FileHash -LiteralPath $boot -Algorithm SHA256).Hash
 
   try {
     $env:CXP_RUNTIME = "1"
@@ -61,8 +67,8 @@ function Assert-FreshLauncherDispatchesActiveRuntime {
   if ($freshOutput -notmatch [regex]::Escape($targetVersion)) {
     throw "fresh stable launcher did not dispatch active runtime $targetVersion`: $freshOutput"
   }
-  if ((Get-Content -Raw (Join-Path $runtimeRoot "active")).Trim() -ne "v$targetVersion") {
-    throw "fresh stable launcher changed the active runtime pointer"
+  if ((Get-FileHash -LiteralPath $boot -Algorithm SHA256).Hash -ne $bootHash) {
+    throw "fresh stable launcher changed the native boot selection"
   }
 }
 
@@ -89,13 +95,13 @@ try {
     -ArgumentList @("run", "--", "ping.exe", "-n", "600", "127.0.0.1") `
     -RedirectStandardInput $stdin -RedirectStandardOutput $stdout -RedirectStandardError $stderr -PassThru
 
-  $active = Join-Path $root ".cxp-runtime\active"
+  $boot = Join-Path $root ".cxp-runtime\boot.sqlite"
   $ready = $false
   for ($attempt = 0; $attempt -lt 300; $attempt++) {
     if ($process.HasExited) {
       throw "CXP process exited before runtime activation: $(Get-Content -Raw -LiteralPath $stderr -ErrorAction SilentlyContinue)"
     }
-    if (Test-Path -LiteralPath $active) {
+    if (Test-Path -LiteralPath $boot) {
       $ready = $true
       break
     }
