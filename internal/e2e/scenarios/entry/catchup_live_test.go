@@ -50,8 +50,12 @@ func TestCatchUpOwnerStaysLive(t *testing.T) {
 		NoStart:    true,
 		Seam:       harness.Seam{ProductionTiming: true},
 		Invariants: harness.Invariants{CPUBudget: 30 * time.Second},
-		Golden: harness.GoldenOptions{Masks: []harness.Mask{{Pattern: regexp.MustCompile(`queued for \d+ min`), Replace: "queued for <n> min",
-			Reason: "the rc.59 fixture's queued prompts date from 2026-09-01: their age at the reminder depends on the day the suite runs"}},
+		Golden: harness.GoldenOptions{Masks: []harness.Mask{
+			{Pattern: regexp.MustCompile(`queued for \d+ min`), Replace: "queued for <n> min",
+				Reason: "the rc.59 fixture's queued prompts date from 2026-09-01: their age at the reminder depends on the day the suite runs"},
+			{Pattern: regexp.MustCompile(`\bs0(?:0[89]|1[0-9]|2[0-4])\b`), Replace: "<new-session-alias>",
+				Reason: "after the fixture's seven aliases, the 16 catch-up chats and the owner's new chat share the alias counter; their allocation order is concurrent"},
+		},
 			Floating: []harness.Float{{Text: "New local Codex chats", Reason: "the new-chat summary waits until the catch-up has read every session; " +
 				"the owner posts `new` while it still reads, so which comes first depends on the runner's speed"}}},
 	})
