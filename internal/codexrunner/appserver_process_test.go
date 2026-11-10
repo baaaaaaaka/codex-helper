@@ -779,8 +779,9 @@ func runMCPJSONLProcessHelper(args []string) int {
 					}
 					time.Sleep(5 * time.Millisecond)
 				}
-				writeMCPJSONLResult(&outputMu, requestCopy.ID, map[string]any{})
 				_ = os.WriteFile(reloadCompletePath, []byte(strconv.Itoa(count+1)), 0o600)
+				// Publish completion before the response allows the next reload.
+				writeMCPJSONLResult(&outputMu, requestCopy.ID, map[string]any{})
 			}
 		}()
 	}

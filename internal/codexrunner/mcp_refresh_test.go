@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -261,7 +262,7 @@ func TestAppServerRunnerMCPRefreshThroughJSONLProcess(t *testing.T) {
 	if err := os.WriteFile(configPath, []byte("first-change"), 0o600); err != nil {
 		t.Fatalf("write first config change: %v", err)
 	}
-	waitForMCPRefreshFileValue(t, reloadCountPath, "1", 3*time.Second)
+	waitForMCPRefreshFileCount(t, reloadCountPath, 1, 3*time.Second)
 	for i := 0; i < 100; i++ {
 		writeMCPRefreshTestConfig(t, configPath, fmt.Sprintf("burst-change-%03d-%s", i, strings.Repeat("x", i)))
 	}
@@ -301,7 +302,9 @@ func TestAppServerRunnerMCPRefreshThroughJSONLProcess(t *testing.T) {
 	if err := os.WriteFile(releasePath, []byte("release"), 0o600); err != nil {
 		t.Fatalf("release child-process reload: %v", err)
 	}
-	waitForMCPRefreshFileValue(t, reloadCompletePath, "2", 3*time.Second)
+	// The watcher may observe several distinct states during the burst. Strict
+	// coalescing is checked separately with the observed-state synchronization.
+	waitForMCPRefreshFileCount(t, reloadCompletePath, 2, 3*time.Second)
 	if _, err := runner.StartTurn(context.Background(), StartTurnInput{
 		ThreadID:  "jsonl-after-refresh",
 		TurnInput: TurnInput{Prompt: "prompt after child-process reload completed"},
@@ -679,16 +682,20 @@ func waitForAppServerMethod(t *testing.T, transport *fakeAppServerTransport, met
 	t.Fatalf("timed out waiting for app-server method %q", method)
 }
 
-func waitForMCPRefreshFileValue(t *testing.T, path, want string, timeout time.Duration) {
+func waitForMCPRefreshFileCount(t *testing.T, path string, want int, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
+	var last string
 	for time.Now().Before(deadline) {
-		if raw, err := os.ReadFile(path); err == nil && strings.TrimSpace(string(raw)) == want {
-			return
+		if raw, err := os.ReadFile(path); err == nil {
+			last = strings.TrimSpace(string(raw))
+			if count, err := strconv.Atoi(last); err == nil && count >= want {
+				return
+			}
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	t.Fatalf("timed out waiting for %s to contain %q", path, want)
+	t.Fatalf("timed out waiting for %s to reach %d; last value %q", path, want, last)
 }
 
 func assertMCPRefreshFileValueRemains(t *testing.T, path, want string, duration time.Duration) {
