@@ -56,78 +56,95 @@
    | <attachment id="<uuid:1>"></attachment><p><strong>🎙️ Speech-to-text transcript (automatic; may contain recognition errors):</strong></p>
    | <p><em>Clip: voice.ogg</em></p>
    | <p>transcribed: please list the files E2E-VOICE-voiceok-1</p>
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
    hosted: sha256:0615efb2d15eaf68b0386cd0d8c61ab7667c8b6d745de94f5f0faaa5e95c4ca1
    attachment: {"content":"{\"duration\":\"PT3S\",\"media\":[{\"url\":\"https://graph.microsoft.com/v1.0/chats/<chat:2>/messages/<msg:3>/hostedContents/aWQ9dm9pY2UtJTAzZA0009/$value\"}]}","contentType":"application/vnd.microsoft.card.audio","contentUrl":null,"id":"<uuid:1>","name":"voice.ogg","teamsAppId":null,"thumbnailUrl":null}
-   edited 1 time(s); earlier versions:
+   edited 2 time(s); earlier versions:
    [version 1]
    | <attachment id="<uuid:1>"></attachment>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <attachment id="<uuid:1>"></attachment><p><strong>🎙️ Speech-to-text transcript (automatic; may contain recognition errors):</strong></p>
+   | <p><em>Clip: voice.ogg</em></p>
+   | <p>transcribed: please list the files E2E-VOICE-voiceok-1</p>
 -- <msg:4> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-VOICE-voiceok-1</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:6> owner (html)
-   | <attachment id="<uuid:2>"></attachment>
-   hosted: sha256:dba36bffa5cab0f922d087a3aeb179f9d4e745df40b323e1b1471402848c8a3e
-   attachment: {"content":"{\"duration\":\"PT3S\",\"media\":[{\"url\":\"https://graph.microsoft.com/v1.0/chats/<chat:2>/messages/<msg:6>/hostedContents/aWQ9dm9pY2UtJTAzZA0010/$value\"}]}","contentType":"application/vnd.microsoft.card.audio","contentUrl":null,"id":"<uuid:2>","name":"clip0.ogg","teamsAppId":null,"thumbnailUrl":null}
--- <msg:7> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+-- <msg:5> owner (html)
+   | <attachment id="<uuid:2>"></attachment><hr/>
+   | <!-- cxp-prompt-confirmation:<id:2> --><p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:8> helper (html)
+   hosted: sha256:dba36bffa5cab0f922d087a3aeb179f9d4e745df40b323e1b1471402848c8a3e
+   attachment: {"content":"{\"duration\":\"PT3S\",\"media\":[{\"url\":\"https://graph.microsoft.com/v1.0/chats/<chat:2>/messages/<msg:5>/hostedContents/aWQ9dm9pY2UtJTAzZA0010/$value\"}]}","contentType":"application/vnd.microsoft.card.audio","contentUrl":null,"id":"<uuid:2>","name":"clip0.ogg","teamsAppId":null,"thumbnailUrl":null}
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <attachment id="<uuid:2>"></attachment>
+-- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>The voice message was not sent to Codex.</p>
    | <p>Voice transcription failed: no speech was recognised in the recording. Next: resend the recording closer to the microphone, or type the message.</p>
--- <msg:9> owner (html)
-   | <attachment id="<uuid:3>"></attachment>
-   hosted: sha256:dba36bffa5cab0f922d087a3aeb179f9d4e745df40b323e1b1471402848c8a3e
-   attachment: {"content":"{\"duration\":\"PT3S\",\"media\":[{\"url\":\"https://graph.microsoft.com/v1.0/chats/<chat:2>/messages/<msg:9>/hostedContents/aWQ9dm9pY2UtJTAzZA0011/$value\"}]}","contentType":"application/vnd.microsoft.card.audio","contentUrl":null,"id":"<uuid:3>","name":"clip1.ogg","teamsAppId":null,"thumbnailUrl":null}
--- <msg:10> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+-- <msg:7> owner (html)
+   | <attachment id="<uuid:3>"></attachment><hr/>
+   | <!-- cxp-prompt-confirmation:<id:3> --><p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:11> helper (html)
+   hosted: sha256:dba36bffa5cab0f922d087a3aeb179f9d4e745df40b323e1b1471402848c8a3e
+   attachment: {"content":"{\"duration\":\"PT3S\",\"media\":[{\"url\":\"https://graph.microsoft.com/v1.0/chats/<chat:2>/messages/<msg:7>/hostedContents/aWQ9dm9pY2UtJTAzZA0011/$value\"}]}","contentType":"application/vnd.microsoft.card.audio","contentUrl":null,"id":"<uuid:3>","name":"clip1.ogg","teamsAppId":null,"thumbnailUrl":null}
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <attachment id="<uuid:3>"></attachment>
+-- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>The voice message was not sent to Codex.</p>
    | <p>Voice transcription failed: the voice recognition program cannot run on this machine (missing system library or incompatible CPU/OS). Next: update the helper; if it persists, report the error from the helper&#39;s log, or configure --asr-command.</p>
--- <msg:12> owner (html)
-   | <attachment id="<uuid:4>"></attachment>
-   hosted: sha256:dba36bffa5cab0f922d087a3aeb179f9d4e745df40b323e1b1471402848c8a3e
-   attachment: {"content":"{\"duration\":\"PT3S\",\"media\":[{\"url\":\"https://graph.microsoft.com/v1.0/chats/<chat:2>/messages/<msg:12>/hostedContents/aWQ9dm9pY2UtJTAzZA0012/$value\"}]}","contentType":"application/vnd.microsoft.card.audio","contentUrl":null,"id":"<uuid:4>","name":"clip2.ogg","teamsAppId":null,"thumbnailUrl":null}
--- <msg:13> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+-- <msg:9> owner (html)
+   | <attachment id="<uuid:4>"></attachment><hr/>
+   | <!-- cxp-prompt-confirmation:<id:4> --><p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:14> helper (html)
+   hosted: sha256:dba36bffa5cab0f922d087a3aeb179f9d4e745df40b323e1b1471402848c8a3e
+   attachment: {"content":"{\"duration\":\"PT3S\",\"media\":[{\"url\":\"https://graph.microsoft.com/v1.0/chats/<chat:2>/messages/<msg:9>/hostedContents/aWQ9dm9pY2UtJTAzZA0012/$value\"}]}","contentType":"application/vnd.microsoft.card.audio","contentUrl":null,"id":"<uuid:4>","name":"clip2.ogg","teamsAppId":null,"thumbnailUrl":null}
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <attachment id="<uuid:4>"></attachment>
+-- <msg:10> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>The voice message was not sent to Codex.</p>
    | <p>Voice transcription failed: voice recognition failed. Next: resend the message; if it keeps failing, check the helper&#39;s log for the error.</p>
--- <msg:15> owner (html)
-   | <attachment id="<uuid:5>"></attachment>
-   hosted: sha256:dba36bffa5cab0f922d087a3aeb179f9d4e745df40b323e1b1471402848c8a3e
-   attachment: {"content":"{\"duration\":\"PT3S\",\"media\":[{\"url\":\"https://graph.microsoft.com/v1.0/chats/<chat:2>/messages/<msg:15>/hostedContents/aWQ9dm9pY2UtJTAzZA0013/$value\"}]}","contentType":"application/vnd.microsoft.card.audio","contentUrl":null,"id":"<uuid:5>","name":"clip3.ogg","teamsAppId":null,"thumbnailUrl":null}
--- <msg:16> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+-- <msg:11> owner (html)
+   | <attachment id="<uuid:5>"></attachment><hr/>
+   | <!-- cxp-prompt-confirmation:<id:5> --><p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:17> helper (html)
+   hosted: sha256:dba36bffa5cab0f922d087a3aeb179f9d4e745df40b323e1b1471402848c8a3e
+   attachment: {"content":"{\"duration\":\"PT3S\",\"media\":[{\"url\":\"https://graph.microsoft.com/v1.0/chats/<chat:2>/messages/<msg:11>/hostedContents/aWQ9dm9pY2UtJTAzZA0013/$value\"}]}","contentType":"application/vnd.microsoft.card.audio","contentUrl":null,"id":"<uuid:5>","name":"clip3.ogg","teamsAppId":null,"thumbnailUrl":null}
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <attachment id="<uuid:5>"></attachment>
+-- <msg:12> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>The voice message was not sent to Codex.</p>
    | <p>Voice transcription failed: voice transcription is not set up on this helper. Next: update or restart the helper; if you configured --asr-command, check that the command exists.</p>
--- <msg:18> owner (html)
+-- <msg:13> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
-   | <attachment id="<uuid:6>"></attachment><p><strong>🎙️ Speech-to-text transcript (automatic; may contain recognition errors):</strong></p>
+   | <attachment id="<uuid:6>"></attachment><hr/>
+   | <!-- cxp-prompt-confirmation:<id:6> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   | <p><strong>🎙️ Speech-to-text transcript (automatic; may contain recognition errors):</strong></p>
    | <p><em>Clip: again.ogg</em></p>
    | <p>transcribed: and again E2E-VOICE-again-2</p>
    hosted: sha256:9ce0a9374f491da9b4ddda599f582d7e09ab2b5de29ee06886a796718c4cf429
-   attachment: {"content":"{\"duration\":\"PT3S\",\"media\":[{\"url\":\"https://graph.microsoft.com/v1.0/chats/<chat:2>/messages/<msg:18>/hostedContents/aWQ9dm9pY2UtJTAzZA0014/$value\"}]}","contentType":"application/vnd.microsoft.card.audio","contentUrl":null,"id":"<uuid:6>","name":"again.ogg","teamsAppId":null,"thumbnailUrl":null}
-   edited 1 time(s); earlier versions:
+   attachment: {"content":"{\"duration\":\"PT3S\",\"media\":[{\"url\":\"https://graph.microsoft.com/v1.0/chats/<chat:2>/messages/<msg:13>/hostedContents/aWQ9dm9pY2UtJTAzZA0014/$value\"}]}","contentType":"application/vnd.microsoft.card.audio","contentUrl":null,"id":"<uuid:6>","name":"again.ogg","teamsAppId":null,"thumbnailUrl":null}
+   edited 2 time(s); earlier versions:
    [version 1]
    | <attachment id="<uuid:6>"></attachment>
--- <msg:19> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   [version 2]
+   | <attachment id="<uuid:6>"></attachment><hr/>
+   | <!-- cxp-prompt-confirmation:<id:6> --><p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:20> helper (html)
+-- <msg:14> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-VOICE-again-2</p>
    | <hr/>

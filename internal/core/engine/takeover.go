@@ -141,6 +141,7 @@ func textCopySkipped(from string, bodies []string) string {
 	fmt.Fprintf(&b, "⏭️ Not run here: the helper on %s already took these requests after its state was copied to this machine. If one of them got no answer, send it again.\n", from)
 	for _, p := range bodies {
 		p = strings.TrimPrefix(strings.TrimSpace(p), labelUser+":") // the other copy labelled it
+		p, _, _ = strings.Cut(p, "\n———\n"+labelHelper+":")         // exclude its appended receipt
 		b.WriteString("\n- " + firstNonEmpty(promptLine(p), "(no text)"))
 	}
 	return b.String()

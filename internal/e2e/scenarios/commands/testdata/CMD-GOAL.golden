@@ -84,203 +84,215 @@
 -- <msg:5> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Please answer E2E-CMDGOAL-before-2</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Please answer E2E-CMDGOAL-before-2</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Please answer E2E-CMDGOAL-before-2</p>
 -- <msg:6> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-CMDGOAL-before-2</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:8> owner (html)
+-- <msg:7> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper goal</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>helper goal</p>
--- <msg:9> helper (html)
+-- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>No goal is set for this chat.</p>
    | <p><code>helper goal</code> shows the goal of this chat&#39;s Codex thread; <code>helper goal &lt;objective&gt;</code> sets it and makes it active; <code>helper goal active</code> makes it active again; <code>helper goal pause</code> pauses it.</p>
--- <msg:10> owner (html)
+-- <msg:9> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper goal active</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>helper goal active</p>
--- <msg:11> helper (html)
+-- <msg:10> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>No goal is set for this chat.</p>
    | <p><code>helper goal</code> shows the goal of this chat&#39;s Codex thread; <code>helper goal &lt;objective&gt;</code> sets it and makes it active; <code>helper goal active</code> makes it active again; <code>helper goal pause</code> pauses it.</p>
--- <msg:12> owner (html)
+-- <msg:11> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper goal Ship the quarterly report E2E-CMDGOAL-objective-3</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>helper goal Ship the quarterly report E2E-CMDGOAL-objective-3</p>
--- <msg:13> helper (html)
+-- <msg:12> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>🎯 Goal set.</p>
    | <p><strong>Goal status:</strong> active</p>
    | <p><strong>Goal:</strong> Ship the quarterly report E2E-CMDGOAL-objective-3</p>
    | <p>Codex keeps working on it by itself whenever this chat is idle; its messages appear here. <code>helper goal pause</code> or <code>helper cancel</code> stops it.</p>
--- <msg:14> owner (html)
+-- <msg:13> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper goal</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>helper goal</p>
--- <msg:15> helper (html)
+-- <msg:14> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p><strong>Goal status:</strong> active</p>
    | <p><strong>Goal:</strong> Ship the quarterly report E2E-CMDGOAL-objective-3</p>
--- <msg:16> owner (html)
+-- <msg:15> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper goal active</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>helper goal active</p>
--- <msg:17> helper (html)
+-- <msg:16> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>The goal is already active.</p>
    | <p><strong>Goal status:</strong> active</p>
    | <p><strong>Goal:</strong> Ship the quarterly report E2E-CMDGOAL-objective-3</p>
    | <p>Codex keeps working on it by itself whenever this chat is idle; its messages appear here. <code>helper goal pause</code> or <code>helper cancel</code> stops it.</p>
--- <msg:18> owner (html)
+-- <msg:17> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Please answer E2E-CMDGOAL-withgoal-4</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:2> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Please answer E2E-CMDGOAL-withgoal-4</p>
--- <msg:19> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:20> helper (html)
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Please answer E2E-CMDGOAL-withgoal-4</p>
+-- <msg:18> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-CMDGOAL-withgoal-4</p>
    | <hr/>
    | <p><strong>🎯 Active goal:</strong> Ship the quarterly report E2E-CMDGOAL-objective-3</p>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:21> owner (html)
+-- <msg:19> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Long job E2E-CMDGOAL-goalrun-1</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:3> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Long job E2E-CMDGOAL-goalrun-1</p>
--- <msg:22> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:23> helper (html)
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Long job E2E-CMDGOAL-goalrun-1</p>
+-- <msg:20> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
    | <p>Working through the goal E2E-CMDGOAL-goalrun-1</p>
    | <hr/>
    | <p><strong>🎯 Active goal:</strong> Ship the quarterly report E2E-CMDGOAL-objective-3</p>
--- <msg:24> owner (html)
+-- <msg:21> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper cancel</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>helper cancel</p>
--- <msg:25> helper (html)
+-- <msg:22> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>cancel requested for running turn: <code>turn-3</code></p>
    | <p><strong>Prompt being canceled:</strong><br>
    | Long job E2E-CMDGOAL-goalrun-1</p>
    | <p>No other prompts are queued.</p>
    | <p>⏸️ The goal is paused too, so your next message does not start it again. <code>helper goal active</code> resumes it.</p>
--- <msg:26> helper (html)
+-- <msg:23> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Codex request canceled.</p>
--- <msg:27> owner (html)
+-- <msg:24> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper goal</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>helper goal</p>
--- <msg:28> helper (html)
+-- <msg:25> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p><strong>Goal status:</strong> paused</p>
    | <p><strong>Goal:</strong> Ship the quarterly report E2E-CMDGOAL-objective-3</p>
--- <msg:29> owner (html)
+-- <msg:26> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Please answer E2E-CMDGOAL-paused-5</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:4> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Please answer E2E-CMDGOAL-paused-5</p>
--- <msg:30> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:31> helper (html)
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Please answer E2E-CMDGOAL-paused-5</p>
+-- <msg:27> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-CMDGOAL-paused-5</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+-- <msg:28> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper goal</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper goal</p>
+-- <msg:29> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p><strong>Goal status:</strong> paused</p>
+   | <p><strong>Goal:</strong> Ship the quarterly report E2E-CMDGOAL-objective-3</p>
+-- <msg:30> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper goal active</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper goal active</p>
+-- <msg:31> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>▶️ Goal active again.</p>
+   | <p><strong>Goal status:</strong> active</p>
+   | <p><strong>Goal:</strong> Ship the quarterly report E2E-CMDGOAL-objective-3</p>
+   | <p>Codex keeps working on it by itself whenever this chat is idle; its messages appear here. <code>helper goal pause</code> or <code>helper cancel</code> stops it.</p>
 -- <msg:32> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>helper goal</p>
+   | <p>helper cancel</p>
    edited 1 time(s); earlier versions:
    [version 1]
-   | <p>helper goal</p>
+   | <p>helper cancel</p>
 -- <msg:33> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p><strong>Goal status:</strong> paused</p>
-   | <p><strong>Goal:</strong> Ship the quarterly report E2E-CMDGOAL-objective-3</p>
+   | <p>⏸️ No request is running or queued; the active goal is paused, so your next message does not start it again. <code>helper goal active</code> resumes it.</p>
 -- <msg:34> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>helper goal active</p>
+   | <p>helper goal</p>
    edited 1 time(s); earlier versions:
    [version 1]
-   | <p>helper goal active</p>
+   | <p>helper goal</p>
 -- <msg:35> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>▶️ Goal active again.</p>
-   | <p><strong>Goal status:</strong> active</p>
-   | <p><strong>Goal:</strong> Ship the quarterly report E2E-CMDGOAL-objective-3</p>
-   | <p>Codex keeps working on it by itself whenever this chat is idle; its messages appear here. <code>helper goal pause</code> or <code>helper cancel</code> stops it.</p>
--- <msg:36> owner (html)
-   | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>helper cancel</p>
-   edited 1 time(s); earlier versions:
-   [version 1]
-   | <p>helper cancel</p>
--- <msg:37> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏸️ No request is running or queued; the active goal is paused, so your next message does not start it again. <code>helper goal active</code> resumes it.</p>
--- <msg:38> owner (html)
-   | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>helper goal</p>
-   edited 1 time(s); earlier versions:
-   [version 1]
-   | <p>helper goal</p>
--- <msg:39> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p><strong>Goal status:</strong> paused</p>
    | <p><strong>Goal:</strong> Ship the quarterly report E2E-CMDGOAL-objective-3</p>
--- <msg:40> owner (html)
+-- <msg:36> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper goal resume</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>helper goal resume</p>
--- <msg:41> helper (html)
+-- <msg:37> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>▶️ Goal active again.</p>
    | <p><strong>Goal status:</strong> active</p>
    | <p><strong>Goal:</strong> Ship the quarterly report E2E-CMDGOAL-objective-3</p>
    | <p>Codex keeps working on it by itself whenever this chat is idle; its messages appear here. <code>helper goal pause</code> or <code>helper cancel</code> stops it.</p>
--- <msg:42> owner (html)
+-- <msg:38> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper goal pause</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>helper goal pause</p>
--- <msg:43> helper (html)
+-- <msg:39> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>⏸️ Goal paused. A turn Codex is already running finishes unless you <code>helper cancel</code> it.</p>
    | <p><strong>Goal status:</strong> paused</p>

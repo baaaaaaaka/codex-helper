@@ -48,56 +48,62 @@
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>A task that goes silent E2E-SILENCE-silent-1</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>A task that goes silent E2E-SILENCE-silent-1</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>A task that goes silent E2E-SILENCE-silent-1</p>
 -- <msg:4> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
+   | <p>Still working. No new Codex update yet.</p>
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
    | <p>Still working. No new Codex update yet.</p>
+   | <p>This is taking longer than usual. To stop the running request, send <code>helper cancel running</code> in this chat.</p>
 -- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
    | <p>Still working. No new Codex update yet.</p>
    | <p>This is taking longer than usual. To stop the running request, send <code>helper cancel running</code> in this chat.</p>
 -- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
-   | <p>Still working. No new Codex update yet.</p>
-   | <p>This is taking longer than usual. To stop the running request, send <code>helper cancel running</code> in this chat.</p>
+   | <p>Codex has not produced any update for less than 1m. It may be stuck.</p>
+   | <p>I will not retry automatically. To stop the running request, send <code>helper cancel running</code> in this chat.</p>
 -- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
    | <p>Codex has not produced any update for less than 1m. It may be stuck.</p>
    | <p>I will not retry automatically. To stop the running request, send <code>helper cancel running</code> in this chat.</p>
--- <msg:9> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
-   | <p>Codex has not produced any update for less than 1m. It may be stuck.</p>
-   | <p>I will not retry automatically. To stop the running request, send <code>helper cancel running</code> in this chat.</p>
--- <msg:10> owner (html)
+-- <msg:9> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper cancel running</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>helper cancel running</p>
--- <msg:11> helper (html)
+-- <msg:10> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>cancel requested for running turn: <code>turn-1</code></p>
    | <p><strong>Prompt being canceled:</strong><br>
    | A task that goes silent E2E-SILENCE-silent-1</p>
    | <p>No other prompts are queued.</p>
--- <msg:12> helper (html)
+-- <msg:11> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Codex request canceled.</p>
--- <msg:13> owner (html)
+-- <msg:12> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Next prompt E2E-SILENCE-next-2</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:2> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Next prompt E2E-SILENCE-next-2</p>
--- <msg:14> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:15> helper (html)
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Next prompt E2E-SILENCE-next-2</p>
+-- <msg:13> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-SILENCE-next-2</p>
    | <hr/>

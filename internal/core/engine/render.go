@@ -66,6 +66,16 @@ func (e *Engine) noticeReply(kind, base, text, replyTo string) ([]store.OutMsg, 
 	return e.render(context.Background(), channel.RichDoc{Label: labelHelper, Markdown: text, ReplyTo: replyTo}, kind, base)
 }
 
+// promptConfirmation marks only the owner's initial prompt response for append.
+// Multi-part confirmations keep the ordinary delivery path as one complete reply.
+func (e *Engine) promptConfirmation(c *classified, kind, base, text, replyTo string) ([]store.OutMsg, error) {
+	msgs, err := e.noticeReply(kind, base, text, replyTo)
+	if err == nil && len(msgs) == 1 && c.in.Sender == store.SenderOwner && c.delegation == "" {
+		msgs[0].AppendTo = c.in.ExtMsgID
+	}
+	return msgs, err
+}
+
 // enqueueNotice renders and enqueues a notice in tx.
 // enqueueStatus enqueues a turn-progress notice that v0.1.20 posted as
 // Codex status (its codex-status kind: still working, may be stuck,

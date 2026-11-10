@@ -32,7 +32,8 @@ func TestR01_R02_R03_AnswerExactlyOnce(t *testing.T) {
 	chatsAfterNew := len(s.Graph.Chats())
 
 	token := s.Token("msg")
-	if _, err := s.Graph.PostAsUser(work.ID, "Please reply to "+token); err != nil {
+	prompt, err := s.Graph.PostAsUser(work.ID, "Please reply to "+token)
+	if err != nil {
 		t.Fatalf("post: %v", err)
 	}
 	s.WaitCodexCalls(token, 1, steps.AnswerTimeout)
@@ -55,8 +56,10 @@ func TestR01_R02_R03_AnswerExactlyOnce(t *testing.T) {
 	}
 	transcript := s.Transcript(work.ID, 30)
 	s.Check("R-1/R-2 final answer appears exactly once", finals == 1, "1 message containing the answer", fmt.Sprintf("%d", finals), transcript...)
-	acks := steps.CountContaining(s.SUTMessages(work.ID), "Request accepted")
+	acks := len(steps.PromptConfirmations(s, work.ID, "Request accepted"))
 	s.Check("R-2 exactly one ACK", acks == 1, "1 ACK", fmt.Sprintf("%d ACKs", acks), transcript...)
+	confirmations := steps.PromptConfirmations(s, work.ID, "Request accepted")
+	s.Check("the ACK is appended to the original prompt", len(confirmations) == 1 && confirmations[0].ID == prompt.ID && len(s.SUTMessagesContaining(work.ID, "Request accepted")) == 0, "one edited owner prompt, zero ACK posts", fmt.Sprintf("%+v", confirmations))
 	s.Check("F-CTL-4 `new` creates exactly one work chat", chatsAfterNew == 2, "2 chats (control + work)", fmt.Sprintf("%d chats", chatsAfterNew))
 	s.Check("F-CTL-1 one control chat", controlChats == 1, "1", fmt.Sprint(controlChats))
 	posts := s.Graph.Requests(fakegraph.RequestFilter{Route: "POST /chats/{chat}/messages", ChatID: work.ID})

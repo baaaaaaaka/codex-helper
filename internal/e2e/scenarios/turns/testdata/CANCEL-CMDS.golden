@@ -48,52 +48,64 @@
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Running job E2E-CANCELCMDS-run-1</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
+   | <p>Running job E2E-CANCELCMDS-run-1</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Running job E2E-CANCELCMDS-run-1</p>
 -- <msg:4> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper queue Queued job E2E-CANCELCMDS-q1-2</p>
-   edited 1 time(s); earlier versions:
-   [version 1]
-   | <p>helper queue Queued job E2E-CANCELCMDS-q1-2</p>
--- <msg:5> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:6> owner (html)
-   | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>helper queue Queued job E2E-CANCELCMDS-q2-3</p>
-   edited 1 time(s); earlier versions:
-   [version 1]
-   | <p>helper queue Queued job E2E-CANCELCMDS-q2-3</p>
--- <msg:7> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:2> --><p><strong>🔧 Helper:</strong></p>
    | <p>⏳ <strong>Queued.</strong> Your request will run after the current one finishes.</p>
    | <p><strong>Running now:</strong> Running job E2E-CANCELCMDS-run-1</p>
    | <p>To cancel it: <code>helper cancel</code> (cancels the newest queued request). To interrupt the running one: <code>helper cancel running</code>.</p>
--- <msg:8> owner (html)
-   | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>helper queue Queued job E2E-CANCELCMDS-q3-4</p>
-   edited 1 time(s); earlier versions:
+   edited 2 time(s); earlier versions:
    [version 1]
-   | <p>helper queue Queued job E2E-CANCELCMDS-q3-4</p>
--- <msg:9> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>helper queue Queued job E2E-CANCELCMDS-q1-2</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper queue Queued job E2E-CANCELCMDS-q1-2</p>
+-- <msg:5> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper queue Queued job E2E-CANCELCMDS-q2-3</p>
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:3> --><p><strong>🔧 Helper:</strong></p>
    | <p>⏳ <strong>Queued.</strong> Your request will run after the current one finishes, behind 1 other queued request.</p>
    | <p><strong>Running now:</strong> Running job E2E-CANCELCMDS-run-1</p>
    | <p>To cancel it: <code>helper cancel</code> (cancels the newest queued request). To interrupt the running one: <code>helper cancel running</code>.</p>
--- <msg:10> owner (html)
+   edited 2 time(s); earlier versions:
+   [version 1]
+   | <p>helper queue Queued job E2E-CANCELCMDS-q2-3</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper queue Queued job E2E-CANCELCMDS-q2-3</p>
+-- <msg:6> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper queue Queued job E2E-CANCELCMDS-q3-4</p>
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:4> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ <strong>Queued.</strong> Your request will run after the current one finishes, behind 2 other queued requests.</p>
+   | <p><strong>Running now:</strong> Running job E2E-CANCELCMDS-run-1</p>
+   | <p>To cancel it: <code>helper cancel</code> (cancels the newest queued request). To interrupt the running one: <code>helper cancel running</code>.</p>
+   edited 2 time(s); earlier versions:
+   [version 1]
+   | <p>helper queue Queued job E2E-CANCELCMDS-q3-4</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper queue Queued job E2E-CANCELCMDS-q3-4</p>
+-- <msg:7> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper cancel last</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>helper cancel last</p>
--- <msg:11> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ <strong>Queued.</strong> Your request will run after the current one finishes, behind 2 other queued requests.</p>
-   | <p><strong>Running now:</strong> Running job E2E-CANCELCMDS-run-1</p>
-   | <p>To cancel it: <code>helper cancel</code> (cancels the newest queued request). To interrupt the running one: <code>helper cancel running</code>.</p>
--- <msg:12> helper (html)
+-- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>turn canceled: <code>turn-4</code></p>
    | <p><strong>Canceled prompt:</strong><br>
@@ -102,13 +114,13 @@
    | <ol><li>Queued job E2E-CANCELCMDS-q1-2</li>
    | <li>Queued job E2E-CANCELCMDS-q2-3</li>
    | </ol>
--- <msg:13> owner (html)
+-- <msg:9> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper cancel turn-3</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>helper cancel turn-3</p>
--- <msg:14> helper (html)
+-- <msg:10> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>turn canceled: <code>turn-3</code></p>
    | <p><strong>Canceled prompt:</strong><br>
@@ -116,82 +128,85 @@
    | <p><strong>Still queued:</strong></p>
    | <ol><li>Queued job E2E-CANCELCMDS-q1-2</li>
    | </ol>
--- <msg:15> owner (html)
+-- <msg:11> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>!cancel turn-3</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>!cancel turn-3</p>
--- <msg:16> helper (html)
+-- <msg:12> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>turn turn-3 is canceled and cannot be canceled.</p>
--- <msg:17> owner (html)
+-- <msg:13> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper cancel turn-999999</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>helper cancel turn-999999</p>
--- <msg:18> helper (html)
+-- <msg:14> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>turn not found in this session: turn-999999</p>
--- <msg:19> owner (html)
+-- <msg:15> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper cancel queued</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>helper cancel queued</p>
--- <msg:20> helper (html)
+-- <msg:16> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>turn canceled: <code>turn-2</code></p>
    | <p><strong>Canceled prompt:</strong><br>
    | Queued job E2E-CANCELCMDS-q1-2</p>
    | <p>No other prompts are queued.</p>
--- <msg:21> owner (html)
+-- <msg:17> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper cancel queued</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>helper cancel queued</p>
--- <msg:22> helper (html)
+-- <msg:18> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>no queued turn is available to cancel in this session.</p>
--- <msg:23> owner (html)
+-- <msg:19> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper cancel all</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>helper cancel all</p>
--- <msg:24> helper (html)
+-- <msg:20> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>cancel all requested for this Work chat.</p>
    | <p><strong>Running requests cancel requested:</strong></p>
    | <ol><li>Running job E2E-CANCELCMDS-run-1</li>
    | </ol>
    | <p>No queued prompts remain.</p>
--- <msg:25> helper (html)
+-- <msg:21> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Codex request canceled.</p>
--- <msg:26> owner (html)
+-- <msg:22> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper cancel</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>helper cancel</p>
--- <msg:27> helper (html)
+-- <msg:23> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Nothing to cancel: no request is running or queued.</p>
    | <p>usage: <code>helper cancel last</code>, <code>helper cancel queued</code>, <code>helper cancel running</code>, <code>helper cancel all</code>, <code>helper cancel &lt;turn-id&gt;</code>, or <code>!cancel &lt;turn-id&gt;</code></p>
    | <p>These commands apply to this Work chat.</p>
--- <msg:28> owner (html)
+-- <msg:24> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Next request E2E-CANCELCMDS-next-5</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:5> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Next request E2E-CANCELCMDS-next-5</p>
--- <msg:29> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:30> helper (html)
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Next request E2E-CANCELCMDS-next-5</p>
+-- <msg:25> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-CANCELCMDS-next-5</p>
    | <hr/>

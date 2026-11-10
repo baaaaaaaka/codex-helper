@@ -313,6 +313,10 @@ type MessagePrefixEditor interface {
 // marker; Clips adds a voice transcript (the label too, when missing);
 // Notice appends a document below the message.
 type Annotation struct {
+	// Confirmation appends one already rendered initial prompt confirmation.
+	// ConfirmationKey is stable across delivery attempts, separate from own-post markers.
+	Confirmation    *Part
+	ConfirmationKey string
 	// Label heads the message as its own line ("🧑‍💻 User:") unless the
 	// message already starts with it. Without Clips, a message carrying a
 	// voice or video clip is not labelled (it gets its transcript).

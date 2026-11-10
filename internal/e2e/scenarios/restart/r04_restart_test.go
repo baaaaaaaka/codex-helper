@@ -44,7 +44,7 @@ func TestR04_R29_RestartPreservesWork(t *testing.T) {
 	s.WaitCodexCalls(tokA, 1, steps.AnswerTimeout)
 	steps.MustPost(s, work.ID, "helper queue Follow-up "+tokB)
 	s.WaitFor("B acknowledged as queued", steps.AnswerTimeout, func() (bool, string) {
-		n := len(s.SUTMessagesContaining(work.ID, "queued"))
+		n := len(steps.PromptConfirmations(s, work.ID, "Queued."))
 		return n > 0, fmt.Sprintf("%d queued notices", n)
 	})
 	beforeStop := len(s.SUTMessages(work.ID))

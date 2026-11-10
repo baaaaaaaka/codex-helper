@@ -472,7 +472,23 @@ func (e *Engine) send(ctx context.Context, r store.Outbox, chat, token string, f
 		p = fp
 	}
 	started := e.now()
-	sent, err := e.ch.Send(ctx, chat, p, e.marker(token))
+	var sent channel.Sent
+	var err error
+	appended := r.AppendTo != ""
+	if appended {
+		err = e.appendConfirmation(ctx, r, chat, p)
+		if errors.Is(err, channel.ErrNotEditable) || errors.Is(err, channel.ErrNotFound) {
+			// Persist the fallback before POST, including for channels without edits.
+			err = e.persist(ctx, "select separate confirmation", func(tx *store.Tx) error { return tx.SeparateConfirmation(r.ID) })
+			if err == nil {
+				appended = false
+				err = e.waitWrite(ctx)
+			}
+		}
+	}
+	if !appended && err == nil {
+		sent, err = e.ch.Send(ctx, chat, p, e.marker(token))
+	}
 	now := e.now()
 	e.count(func(s *engineStats) { s.sends++ })
 	defer func() {
@@ -515,6 +531,10 @@ func (e *Engine) send(ctx context.Context, r store.Outbox, chat, token string, f
 		if r.Kind != store.OutAck {
 			e.heat(r.ConvID)
 		}
+	case appended && channel.IsAmbiguous(err):
+		// PATCH may already have landed. Retry the same confirmation key;
+		// never feed an append into POST's unknown-outcome resolver.
+		e.requeue(ctx, r.ID, now.Add(e.t.Hot))
 	case channel.IsAmbiguous(err):
 		e.logf("send %s to conversation %d: outcome unknown (%v); resolving by read-back", r.DeliveryKey, r.ConvID, err)
 		if err := e.persist(ctx, "record send outcome", func(tx *store.Tx) error {

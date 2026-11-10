@@ -134,25 +134,28 @@
 -- <msg:18> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Please answer E2E-IMPORTAGAIN-teams-turn-1</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Please answer E2E-IMPORTAGAIN-teams-turn-1</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Please answer E2E-IMPORTAGAIN-teams-turn-1</p>
 -- <msg:19> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:20> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-IMPORTAGAIN-teams-turn-1</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:21> owner (html)
+-- <msg:20> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper close</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>helper close</p>
--- <msg:22> helper (html)
+-- <msg:21> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Session closed. The helper will no longer read or respond in this Teams chat.</p>
    | <p>This chat remains visible in Teams. Use the 🏠 control chat to open or create another work chat.</p>

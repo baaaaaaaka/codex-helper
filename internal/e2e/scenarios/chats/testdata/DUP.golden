@@ -55,37 +55,43 @@
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Run the nightly check E2E-DUP-same-1</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Run the nightly check E2E-DUP-same-1</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Run the nightly check E2E-DUP-same-1</p>
 -- <msg:4> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-DUP-same-1</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
+-- <msg:5> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Run the nightly check E2E-DUP-same-1</p>
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:2> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Duplicate request ignored (same text within 3 minutes). Send <code>helper retry</code> to run it again.</p>
+   edited 2 time(s); earlier versions:
+   [version 1]
+   | <p>Run the nightly check E2E-DUP-same-1</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Run the nightly check E2E-DUP-same-1</p>
 -- <msg:6> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>Run the nightly check E2E-DUP-same-1</p>
+   | <p>helper retry</p>
    edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Run the nightly check E2E-DUP-same-1</p>
+   | <p>helper retry</p>
 -- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Duplicate request ignored (same text within 3 minutes). Send <code>helper retry</code> to run it again.</p>
--- <msg:8> owner (html)
-   | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>helper retry</p>
-   edited 1 time(s); earlier versions:
-   [version 1]
-   | <p>helper retry</p>
--- <msg:9> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Running the ignored request again.</p>
--- <msg:10> helper (html)
+-- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-DUP-same-1</p>
    | <hr/>

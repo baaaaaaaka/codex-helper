@@ -48,23 +48,26 @@
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>A task over a flaky connection E2E-RETRYSTATUS-retry-1</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>A task over a flaky connection E2E-RETRYSTATUS-retry-1</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>A task over a flaky connection E2E-RETRYSTATUS-retry-1</p>
 -- <msg:4> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
    | <p>Connection dropped. Codex is reconnecting.</p>
    | <p>Reconnecting... 1/5: stream disconnected before completion: error sending request for url (<a href="http://127.0.0.1:<port:1>/_cxp/">http://127.0.0.1:<port:1>/_cxp/</a>&lt;redacted&gt;/v1/responses)<br>
    | Reason: responseStreamDisconnected</p>
--- <msg:6> helper (html)
+-- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
    | <p>Connection dropped. Codex is reconnecting.</p>
    | <p>Reconnecting... 3/5<br>
    | Reason: responseStreamDisconnected</p>
--- <msg:7> helper (html)
+-- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>Answered after reconnecting E2E-RETRYSTATUS-retry-1</p>
    | <hr/>

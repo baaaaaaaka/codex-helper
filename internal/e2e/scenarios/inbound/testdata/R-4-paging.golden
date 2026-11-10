@@ -56,8 +56,14 @@
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Older request E2E-R4paging-pageone-1</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
+   | <p>Older request E2E-R4paging-pageone-1</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Older request E2E-R4paging-pageone-1</p>
 -- <msg:4> system systemEventMessage (html)
    | <systemEventMessage/>
@@ -122,27 +128,27 @@
 -- <msg:34> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Newer request E2E-R4paging-pagetwo-2</p>
-   edited 1 time(s); earlier versions:
-   [version 1]
-   | <p>Newer request E2E-R4paging-pagetwo-2</p>
--- <msg:35> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:36> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:2> --><p><strong>🔧 Helper:</strong></p>
    | <p>⏳ <strong>Queued.</strong> Your request will run when the current work in this chat finishes, behind 1 other queued request.</p>
    | <p>To cancel it: <code>helper cancel</code> (cancels the newest queued request).</p>
--- <msg:37> helper (html)
+   edited 2 time(s); earlier versions:
+   [version 1]
+   | <p>Newer request E2E-R4paging-pagetwo-2</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Newer request E2E-R4paging-pagetwo-2</p>
+-- <msg:35> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-R4paging-pageone-1</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:38> helper (html)
+-- <msg:36> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>▶️ <strong>Next to run</strong><br>
    | “Newer request E2E-R4paging-pagetwo-2”</p>
--- <msg:39> helper (html)
+-- <msg:37> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-R4paging-pagetwo-2</p>
    | <hr/>

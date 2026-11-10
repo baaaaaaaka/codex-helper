@@ -153,7 +153,7 @@ func TestUserLabel(t *testing.T) {
 	s.Check("a message with a pasted image is not edited (the edit could lose the image)", ie.PatchCount == 0 && ie.Hosted == im.Hosted,
 		"0 edits", fmt.Sprintf("%d edits; text %q", ie.PatchCount, clip(ie.PlainText(), 120)))
 
-	// Exactly one edit per labelled message, none of a helper post.
+	// One label edit per message, plus one receipt edit per prompt; no helper post.
 	edits := map[string]int{}
 	for _, c := range []string{control.ID, work.ID} {
 		for _, r := range patches(s, c, from) {
@@ -168,8 +168,12 @@ func TestUserLabel(t *testing.T) {
 		}
 	}
 	twice := 0
-	for _, n := range edits {
-		if n > 1 {
+	for path, n := range edits {
+		want := 1
+		if strings.HasSuffix(path, "/messages/"+pm.ID) || strings.HasSuffix(path, "/messages/"+fe.ID) {
+			want = 2 // user label, then initial prompt receipt
+		}
+		if n != want {
 			twice++
 		}
 	}
@@ -179,8 +183,8 @@ func TestUserLabel(t *testing.T) {
 		}
 	}
 	// Five: the four above and the `new label` command that made the work chat.
-	s.Check("each labelled message is edited once and labelled once", twice == 0 && len(edits) == 5,
-		"5 messages, 1 edit each", fmt.Sprintf("%d messages edited: %v", len(edits), edits))
+	s.Check("each message is labelled once; prompts also get one receipt", twice == 0 && len(edits) == 5,
+		"5 messages: 2 edits per prompt, 1 per command", fmt.Sprintf("%d messages edited: %v", len(edits), edits))
 }
 
 // 1x1 transparent PNG.
@@ -193,7 +197,7 @@ var tinyPNG = []byte{0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00,
 // annotateIncomingUserMessageWithASRTranscripts): once the clip is
 // transcribed, the voice message itself is edited to carry the user label
 // and the transcript under the clip, the audio card kept. A clip whose
-// transcription failed is not edited.
+// transcription failed keeps only its initial receipt.
 func TestVoiceTranscriptEdit(t *testing.T) {
 	harness.NeedsCLI(t) // the voice path is wired in the cxp entry point only
 	harness.Parallel(t)
@@ -205,7 +209,7 @@ func TestVoiceTranscriptEdit(t *testing.T) {
 	}
 	s := harness.NewScenario(t, "EDIT-VOICE", harness.Options{
 		Guarantees: []string{"F-RND-11"},
-		Title:      "a transcribed voice message is edited to show its transcript under the clip; a failed one is not edited",
+		Title:      "voice messages keep their initial receipt; a successful transcription adds one transcript under the clip",
 		Budget:     120 * time.Second,
 		UserEnv:    map[string]string{"CODEX_HELPER_TEAMS_ASR_COMMAND": script},
 	})
@@ -242,9 +246,9 @@ func TestVoiceTranscriptEdit(t *testing.T) {
 	})
 	s.Settle(2*time.Second, 10*time.Second)
 	se, _ := message(s, work.ID, silent.ID)
-	s.Check("a clip with no speech is not edited", se.PatchCount == 0, "0 edits", fmt.Sprintf("%d edits: %q", se.PatchCount, clip(se.PlainText(), 160)))
+	s.Check("a clip with no speech keeps only the initial receipt", se.PatchCount == 1 && !strings.Contains(se.PlainText(), "Speech-to-text transcript"), "1 receipt edit, no transcript", fmt.Sprintf("%d edits: %q", se.PatchCount, clip(se.PlainText(), 160)))
 	ve2, _ := message(s, work.ID, vm.ID)
-	s.Check("the transcript edit is made once", ve2.PatchCount == 1, "1 edit", fmt.Sprint(ve2.PatchCount))
+	s.Check("the transcript and receipt are each appended once", ve2.PatchCount == 2 && strings.Count(ve2.PlainText(), "transcribed: please list the files "+tok) == 1 && strings.Count(ve2.PlainText(), "Request accepted") == 1, "1 transcript edit and 1 receipt edit", fmt.Sprint(ve2.PatchCount))
 }
 
 // The freeze notice (F-WRK-5 / R-22, v0.1.20 parkIdleWorkChat): a work

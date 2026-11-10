@@ -67,8 +67,8 @@ func TestControlQuestion(t *testing.T) {
 	s.Check("`ask` runs one Codex turn and the answer is posted in the control chat", answered && len(calls) == 1,
 		"1 call, answered", fmt.Sprintf("calls=%d answered=%v", len(calls), answered), s.Transcript(control.ID, 6)...)
 	s.Check("the question gets v0.1.20's control ACK naming its turn",
-		steps.CountContaining(sutAfter(s, control.ID, from), controlAck) == 1 &&
-			steps.CountContaining(sutAfter(s, control.ID, from), "helper cancel turn-") == 1,
+		len(steps.PromptConfirmations(s, control.ID, controlAck)) == 1 &&
+			steps.CountContaining(steps.PromptConfirmations(s, control.ID, controlAck), "helper cancel turn-") == 1,
 		"1 ACK with `helper cancel turn-<n>`", strings.Join(s.Transcript(control.ID, 4), " | "))
 	s.Check("the prompt is v0.1.20's control envelope without `ask`",
 		strings.HasPrefix(c1.Prompt, "[codex-helper-control]\n<codex-helper-control-context version=\"1\">") &&
@@ -159,7 +159,7 @@ func TestControlQuestionAcrossRestart(t *testing.T) {
 	}
 	calls := s.Codex.CallsWithToken(q)
 	msgs := s.SUTMessages(control.ID)
-	acks := steps.CountContaining(msgs, controlAck)
+	acks := len(steps.PromptConfirmations(s, control.ID, controlAck))
 	answers := 0
 	if len(calls) == 1 && calls[0].Answer != "" {
 		answers = steps.CountContaining(msgs, calls[0].Answer)
@@ -188,7 +188,6 @@ func TestControlVoiceQuestion(t *testing.T) {
 	defer s.Finish()
 	control := steps.ReadyControlChat(s)
 	q := s.Token("voice")
-	from := s.Graph.LastSeq()
 	if _, err := s.Graph.PostVoiceAsUser(control.ID, "question.ogg", []byte("what is "+q+"?")); err != nil {
 		t.Fatal(err)
 	}
@@ -204,6 +203,6 @@ func TestControlVoiceQuestion(t *testing.T) {
 	s.Check("the prompt is the control envelope carrying the transcript",
 		strings.HasPrefix(prompt, "[codex-helper-control]\n") && strings.Contains(prompt, "transcribed: what is "+q+"?"),
 		"control envelope + transcript", clip(prompt, 300))
-	s.Check("one control ACK", steps.CountContaining(sutAfter(s, control.ID, from), controlAck) == 1, "1 ACK",
+	s.Check("one control ACK", len(steps.PromptConfirmations(s, control.ID, controlAck)) == 1, "1 ACK",
 		strings.Join(s.Transcript(control.ID, 4), " | "))
 }

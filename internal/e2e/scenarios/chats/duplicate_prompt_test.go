@@ -29,10 +29,10 @@ func TestDuplicatePromptIgnoredThenRetried(t *testing.T) {
 	steps.MustPost(s, work.ID, text)
 	steps.WaitAnswered(s, work.ID, tok, steps.AnswerTimeout)
 	steps.MustPost(s, work.ID, text)
-	_, noticed := s.WaitSUTMessage(work.ID, "Duplicate request ignored", 20*time.Second)
+	noticed := steps.WaitPromptConfirmation(s, work.ID, "Duplicate request ignored", 20*time.Second)
 	s.Settle(2*time.Second, 10*time.Second)
 	callsBefore := len(s.Codex.CallsWithToken(tok))
-	notices := len(s.SUTMessagesContaining(work.ID, "Duplicate request ignored"))
+	notices := len(steps.PromptConfirmations(s, work.ID, "Duplicate request ignored"))
 
 	retrySeq := s.Graph.LastSeq()
 	steps.MustPost(s, work.ID, "helper retry")

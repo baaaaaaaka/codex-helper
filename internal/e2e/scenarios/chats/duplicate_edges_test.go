@@ -39,7 +39,7 @@ func TestDuplicateGuardEdges(t *testing.T) {
 	work, _ := steps.NewWorkChat(s, control, "dupedge")
 	other, _ := steps.NewWorkChat(s, control, "dupother")
 	const dupNotice = "Duplicate request ignored"
-	dupNotices := func() int { return len(s.SUTMessagesContaining(work.ID, dupNotice)) }
+	dupNotices := func() int { return len(steps.PromptConfirmations(s, work.ID, dupNotice)) }
 	// answers waits until the work chat shows n answers for tok, so the
 	// next user message follows the helper's posts (a fixed transcript).
 	answers := func(tok string, n int) {
@@ -51,7 +51,7 @@ func TestDuplicateGuardEdges(t *testing.T) {
 	steps.MustPost(s, work.ID, "Plain repeat "+plain)
 	steps.WaitAnswered(s, work.ID, plain, steps.AnswerTimeout)
 	steps.MustPost(s, work.ID, "Plain repeat "+plain)
-	_, ignored := s.WaitSUTMessage(work.ID, dupNotice, 15*time.Second)
+	ignored := steps.WaitPromptConfirmation(s, work.ID, dupNotice, 15*time.Second)
 	s.Check("a plain repeat within the window is ignored with one notice", ignored && len(s.Codex.CallsWithToken(plain)) == 1,
 		"1 turn, 1 notice", fmt.Sprintf("turns=%d notices=%d", len(s.Codex.CallsWithToken(plain)), dupNotices()))
 

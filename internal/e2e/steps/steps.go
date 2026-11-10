@@ -99,6 +99,29 @@ func CountContaining(msgs []fakegraph.Message, sub string) int {
 	return n
 }
 
+// PromptConfirmations finds initial receipts, either appended to the owner's
+// prompt or posted separately when that prompt cannot be edited.
+func PromptConfirmations(s *harness.Scenario, chatID, sub string) []fakegraph.Message {
+	var out []fakegraph.Message
+	for _, m := range s.Graph.Messages(chatID) {
+		if m.Origin != fakegraph.OriginSUT && !(m.Origin == fakegraph.OriginUser && strings.Contains(m.Content, "<hr") && strings.Contains(m.PlainText(), "🔧 Helper:")) {
+			continue
+		}
+		if strings.Contains(harness.NormalizeSpace(m.PlainText()), harness.NormalizeSpace(sub)) {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// WaitPromptConfirmation waits for the initial receipt, without requiring POST.
+func WaitPromptConfirmation(s *harness.Scenario, chatID, sub string, timeout time.Duration) bool {
+	s.T.Helper()
+	return s.WaitFor("prompt confirmation containing "+sub, timeout, func() (bool, string) {
+		return len(PromptConfirmations(s, chatID, sub)) > 0, "confirmation pending"
+	})
+}
+
 // AnswerPostMatcher matches a recorded POST whose body carries the fake
 // Codex answer for token.
 func AnswerPostMatcher(token string) func(fakegraph.Request) bool {

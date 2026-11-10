@@ -69,16 +69,19 @@
 -- <msg:6> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Please review the attached notes E2E-R37-file-2</p>
-   | <attachment id="<uuid:1>"></attachment>
+   | <attachment id="<uuid:1>"></attachment><hr/>
+   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
    attachment: {"content":null,"contentType":"reference","contentUrl":"https://e2etenant-my.sharepoint.com/personal/owner_e2e_example/Documents/Microsoft%20Teams%20Chat%20Files/design%20notes.txt","id":"<uuid:1>","name":"design notes.txt","teamsAppId":null,"thumbnailUrl":null}
-   edited 1 time(s); earlier versions:
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Please review the attached notes E2E-R37-file-2</p>
    | <attachment id="<uuid:1>"></attachment>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Please review the attached notes E2E-R37-file-2</p>
+   | <attachment id="<uuid:1>"></attachment>
 -- <msg:7> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-R37-file-2</p>
    | <hr/>

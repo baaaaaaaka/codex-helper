@@ -56,28 +56,31 @@
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>First solo request E2E-R43-warm-1</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>First solo request E2E-R43-warm-1</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>First solo request E2E-R43-warm-1</p>
 -- <msg:4> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-R43-warm-1</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:6> coworker (html)
+-- <msg:5> coworker (html)
    | <p>Just chatting with you here E2E-R43-coplain-2</p>
--- <msg:7> owner (html)
+-- <msg:6> owner (html)
    | <p>Sure, talk later E2E-R43-ownerplain-3</p>
--- <msg:8> coworker (html)
+-- <msg:7> coworker (html)
    | <p>@codex please summarise the build log E2E-R43-mention-4</p>
--- <msg:9> helper quoting <msg:8> (html)
+-- <msg:8> helper quoting <msg:7> (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex received your question. Request accepted.</p>
--- <msg:10> helper (html)
+-- <msg:9> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-R43-mention-4</p>
    | <hr/>

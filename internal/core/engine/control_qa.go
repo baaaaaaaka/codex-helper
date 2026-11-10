@@ -75,7 +75,7 @@ func ctlTurnRef(id int64) string { return fmt.Sprintf("turn-%d", id) }
 // ackControl acknowledges a control-chat question. v0.1.20 had no
 // duplicate check for control questions: each one is answered.
 func (e *Engine) ackControl(tx *store.Tx, conv int64, a store.Admitted, c *classified) error {
-	msgs, err := e.noticeReply(store.OutAck, fmt.Sprintf("ack:%d", a.InboundID), textControlAck(a.TurnID), c.quoteID)
+	msgs, err := e.promptConfirmation(c, store.OutAck, fmt.Sprintf("ack:%d", a.InboundID), textControlAck(a.TurnID), c.quoteID)
 	if err != nil {
 		return err
 	}

@@ -78,11 +78,10 @@ func TestCancelCommands(t *testing.T) {
 	steps.MustPost(s, work.ID, "Running job "+run)
 	s.WaitCodexCalls(run, 1, steps.AnswerTimeout)
 	for _, q := range []string{q1, q2, q3} {
-		seq := s.Graph.LastSeq()
 		steps.MustPost(s, work.ID, "helper queue Queued job "+q)
 		s.WaitFor("queued ACK for "+q, steps.CommandTimeout, func() (bool, string) {
-			for _, m := range s.SUTMessages(work.ID) {
-				if m.RequestSeq > seq {
+			for _, m := range steps.PromptConfirmations(s, work.ID, "Queued.") {
+				if strings.Contains(m.PlainText(), q) {
 					return true, ""
 				}
 			}

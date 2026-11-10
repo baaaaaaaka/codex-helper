@@ -6,28 +6,34 @@
 -- <msg:1> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Keep the original conversation E2E-ENTRYMIGRATETAKEOVER-taken-over-1</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Keep the original conversation E2E-ENTRYMIGRATETAKEOVER-taken-over-1</p>
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Keep the original conversation E2E-ENTRYMIGRATETAKEOVER-taken-over-1</p>
 -- <msg:2> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:3> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-ENTRYMIGRATETAKEOVER-taken-over-1</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5, effort - high, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:4> owner (html)
+-- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Keep the original conversation E2E-ENTRYMIGRATETAKEOVER-after-thaw-2</p>
-   edited 1 time(s); earlier versions:
+   | <hr/>
+   | <!-- cxp-prompt-confirmation:<id:2> --><p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   edited 2 time(s); earlier versions:
    [version 1]
    | <p>Keep the original conversation E2E-ENTRYMIGRATETAKEOVER-after-thaw-2</p>
--- <msg:5> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:6> helper (html)
+   [version 2]
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>Keep the original conversation E2E-ENTRYMIGRATETAKEOVER-after-thaw-2</p>
+-- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-ENTRYMIGRATETAKEOVER-after-thaw-2</p>
    | <hr/>
