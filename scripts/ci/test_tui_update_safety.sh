@@ -7,7 +7,7 @@ case "$mode" in unit|e2e|all) ;; *) echo "usage: $0 [unit|e2e|all]" >&2; exit 2 
 
 if [[ "$mode" != e2e ]]; then
   go test ./internal/helperruntime ./internal/update ./internal/candidateupdate ./internal/tui ./internal/cli ./cmd/codex-proxy \
-    -run '^Test(SafeBoot|TUIAuto|TUIBoot|SelectSessionReadiness|ApplyVerification|RunMainHandlesBootProtocol)' -count=1
+    -run '^Test(SQLiteBootstrap|SafeBoot|TUIAuto|TUIBoot|SelectSessionReadiness|ApplyVerification|RunMainHandlesBootProtocol)' -count=1
 fi
 [[ "$mode" != unit ]] || exit 0
 

@@ -97,7 +97,7 @@ func TestControlQuestion(t *testing.T) {
 	s.Check("plain control text is a Codex question", answered && len(calls) == 1, "1 call, answered", fmt.Sprintf("calls=%d answered=%v", len(calls), answered))
 	s.Check("the prompt carries the recent control-chat history", strings.Contains(prompt, "- recent_control_chat_history:") &&
 		strings.Contains(prompt, "user/control_inbound:\n  what does "+q1+" mean?") &&
-		strings.Contains(prompt, "control-chat-history.jsonl"),
+		strings.Contains(prompt, "control-chat-history.txt"),
 		"the first question in the history", clip(prompt, 200))
 	s.Check("the same control thread continues", len(calls) == 1 && c1.ThreadID != "" && calls[0].ThreadID == c1.ThreadID,
 		"one thread", fmt.Sprintf("%q vs %q", c1.ThreadID, func() string {

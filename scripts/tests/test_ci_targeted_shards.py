@@ -312,6 +312,7 @@ class TargetedShardWorkflowTests(unittest.TestCase):
                     "CXP preview SQLite actual syscall write budget (Linux only)",
                     "CXP cache v2 real NFS concurrency smoke (Linux only)",
                     "Codex runner benchmark smoke",
+                    "Core typed state benchmark smoke",
                     "TUI and session history benchmark smoke",
                 ]
             ),

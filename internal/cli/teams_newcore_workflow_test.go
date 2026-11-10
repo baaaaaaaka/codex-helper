@@ -91,7 +91,12 @@ func TestTeamsNewCoreWorkflowConfig(t *testing.T) {
 	}
 	// The helper publishes its state for read-only commands.
 	newTeamsStatusPublisher(st, filepath.Dir(path), h.Gen(), host, io.Discard).publish(time.Now())
-	n := &teamsNewCoreNotifier{st: st, path: path, log: io.Discard}
+	mail, err := openTeamsExchange(path, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mail.Close()
+	n := &teamsNewCoreNotifier{mail: mail, st: st, path: path, log: io.Discard}
 	if !n.Available() {
 		t.Fatal("helper notifier off while enabled")
 	}
@@ -109,8 +114,8 @@ func TestTeamsNewCoreWorkflowConfig(t *testing.T) {
 	if n.Available() {
 		t.Fatal("pending disable not applied by the helper's notifier")
 	}
-	if _, err := os.Stat(teamsWorkflowRequestPath(path)); !os.IsNotExist(err) {
-		t.Fatalf("request left after apply: %v", err)
+	if _, _, pending, err := mail.Workflow(); err != nil || pending {
+		t.Fatalf("request left after apply: %v %v", pending, err)
 	}
 
 	teamsWorkflowApplyWait = 10 * time.Second

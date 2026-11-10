@@ -3,9 +3,11 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -22,6 +24,7 @@ type delegateOptions struct {
 	root                 *rootOptions
 	ctx                  context.Context
 	storePath            string
+	stores               map[string]*delegation.WorkerDB
 	routeStorePath       string
 	registryCache        string
 	jsonOutput           bool
@@ -57,6 +60,31 @@ type delegateOptions struct {
 	now                  func() time.Time
 	loadCandidates       func(*delegateOptions) ([]delegation.Candidate, error)
 	openRegistry         func(*delegateOptions) (*delegateRegistrySession, error)
+}
+
+func (opts *delegateOptions) storeScope() func() {
+	opts.stores = map[string]*delegation.WorkerDB{}
+	return func() {
+		for _, db := range opts.stores {
+			_ = db.Close()
+		}
+		opts.stores = nil
+	}
+}
+func (opts *delegateOptions) openStore(path string) (*delegation.WorkerDB, func(), error) {
+	path = filepath.Clean(path)
+	if db := opts.stores[path]; db != nil {
+		return db, func() {}, nil
+	}
+	db, err := delegation.OpenWorkerDB(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	if opts.stores != nil {
+		opts.stores[path] = db
+		return db, func() {}, nil
+	}
+	return db, func() { _ = db.Close() }, nil
 }
 
 const defaultDelegateClaimRecheckDelay = 5 * time.Second
@@ -95,6 +123,7 @@ func newDelegateResolveCmd(opts *delegateOptions) *cobra.Command {
 		Short: "Resolve candidate machines for a natural-language delegation request",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.ctx = cmd.Context()
+			defer opts.storeScope()()
 			result, err := runDelegateResolve(opts)
 			if err != nil {
 				return err
@@ -118,6 +147,7 @@ func newDelegateStartCmd(opts *delegateOptions) *cobra.Command {
 		Short: "Create an idempotent delegation request",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.ctx = cmd.Context()
+			defer opts.storeScope()()
 			result, err := runDelegateStart(opts)
 			if err != nil {
 				return err
@@ -145,6 +175,7 @@ func newDelegateStatusCmd(opts *delegateOptions) *cobra.Command {
 		Short: "Show a delegation state",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.ctx = cmd.Context()
+			defer opts.storeScope()()
 			result, err := runDelegateStatus(opts)
 			if err != nil {
 				return err
@@ -163,6 +194,7 @@ func newDelegateWaitCmd(opts *delegateOptions) *cobra.Command {
 		Short: "Wait for a delegation to reach a terminal state",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.ctx = cmd.Context()
+			defer opts.storeScope()()
 			result, err := runDelegateWait(opts)
 			if err != nil {
 				return err
@@ -183,6 +215,7 @@ func newDelegateCancelCmd(opts *delegateOptions) *cobra.Command {
 		Short: "Cancel an open delegation",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.ctx = cmd.Context()
+			defer opts.storeScope()()
 			result, err := runDelegateCancel(opts)
 			if err != nil {
 				return err
@@ -202,6 +235,7 @@ func newDelegateClaimCmd(opts *delegateOptions) *cobra.Command {
 		Short: "Claim an open delegation for a worker",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.ctx = cmd.Context()
+			defer opts.storeScope()()
 			result, err := runDelegateClaim(opts)
 			if err != nil {
 				return err
@@ -225,6 +259,7 @@ func newDelegateResultCmd(opts *delegateOptions) *cobra.Command {
 		Short: "Publish a terminal delegation result for a winning claim",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.ctx = cmd.Context()
+			defer opts.storeScope()()
 			result, err := runDelegateResult(opts)
 			if err != nil {
 				return err
@@ -252,6 +287,7 @@ func newDelegateProgressCmd(opts *delegateOptions) *cobra.Command {
 		Short: "Publish an intermediate delegation progress status for a winning claim",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.ctx = cmd.Context()
+			defer opts.storeScope()()
 			result, err := runDelegateStatusRecord(opts, delegation.StateRunning)
 			if err != nil {
 				return err
@@ -269,6 +305,7 @@ func newDelegateQuestionCmd(opts *delegateOptions) *cobra.Command {
 		Short: "Publish an intermediate delegation question for the source agent",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.ctx = cmd.Context()
+			defer opts.storeScope()()
 			result, err := runDelegateStatusRecord(opts, delegation.StateQuestion)
 			if err != nil {
 				return err
@@ -309,6 +346,7 @@ func newDelegateMachinePublishOnceCmd(opts *delegateOptions) *cobra.Command {
 		Short: "Publish one machine capability heartbeat to the Teams registry",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			opts.ctx = cmd.Context()
+			defer opts.storeScope()()
 			result, err := runDelegateMachinePublishOnce(opts)
 			if err != nil {
 				return err
@@ -379,7 +417,15 @@ func runDelegateResolve(opts *delegateOptions) (delegation.ResolveResult, error)
 	if err != nil {
 		return delegation.ResolveResult{}, err
 	}
-	threadStore, _ := loadDelegateRouteStore(opts)
+	path, err := delegateRouteStorePath(opts)
+	if err != nil {
+		return delegation.ResolveResult{}, err
+	}
+	db, closeDB, err := opts.openStore(path)
+	if err != nil {
+		return delegation.ResolveResult{}, err
+	}
+	defer closeDB()
 	query := strings.TrimSpace(opts.query)
 	for i := range candidates {
 		scoreCandidate(query, &candidates[i])
@@ -400,7 +446,11 @@ func runDelegateResolve(opts *delegateOptions) (delegation.ResolveResult, error)
 			} else {
 				candidates[i].NotStartableReasons = append(candidates[i].NotStartableReasons, threadErr.Error())
 			}
-			candidates[i].ThreadCandidates = reusableThreadCandidates(threadStore, candidates[i], opts, now, 3)
+			threads, err := db.ReusableThreads(opts.context(), candidates[i].MachineID, opts.sourceSession, opts.workspaceFingerprint, now, 3)
+			if err != nil {
+				return delegation.ResolveResult{}, err
+			}
+			candidates[i].ThreadCandidates = reusableThreadCandidates(threads, candidates[i], opts, now, 3)
 		}
 		if candidates[i].State != "online" {
 			candidates[i].NotStartableReasons = appendMissing(candidates[i].NotStartableReasons, "machine is not online")
@@ -477,29 +527,25 @@ func runDelegateStart(opts *delegateOptions) (delegateStartResult, error) {
 	if err != nil {
 		return delegateStartResult{}, err
 	}
-	store, err := delegation.LoadStore(path)
+	db, closeDB, err := opts.openStore(path)
 	if err != nil {
 		return delegateStartResult{}, err
 	}
-	idempotent := false
-	for _, existing := range store.Records {
-		if existing.Kind == delegation.RequestKind && existing.SourceKey == record.SourceKey {
-			record = existing
-			idempotent = true
-			break
-		}
-	}
-	if !idempotent {
-		store.Records = append(store.Records, record)
-		if hasThread {
-			upsertStartedRemoteThread(&store, record, threadPayload, now)
-		}
-		store.Prune(opts.now().UTC(), delegation.DefaultStoreRetention)
-		if _, err := delegation.SaveStore(path, store); err != nil {
+	defer closeDB()
+	var thread *delegation.RemoteThread
+	if hasThread {
+		existing, _, err := db.RemoteThread(opts.context(), record.RemoteThreadID)
+		if err != nil {
 			return delegateStartResult{}, err
 		}
+		value := startedRemoteThread(existing, record, threadPayload, now)
+		thread = &value
 	}
-	state := delegation.Reduce(recordsForID(store.Records, record.DelegationID), now)
+	record, records, idempotent, err := db.Start(opts.context(), record, thread, now)
+	if err != nil {
+		return delegateStartResult{}, err
+	}
+	state := delegation.Reduce(records, now)
 	return delegateStartResult{
 		DelegationID:   record.DelegationID,
 		Status:         state.Status,
@@ -527,11 +573,16 @@ func runDelegateStatus(opts *delegateOptions) (delegation.State, error) {
 	if err != nil {
 		return delegation.State{}, err
 	}
-	store, err := delegation.LoadStore(path)
+	db, closeDB, err := opts.openStore(path)
 	if err != nil {
 		return delegation.State{}, err
 	}
-	state := delegation.Reduce(recordsForID(store.Records, opts.delegationID), opts.now().UTC())
+	defer closeDB()
+	records, err := db.Records(opts.context(), opts.delegationID)
+	if err != nil {
+		return delegation.State{}, err
+	}
+	state := delegation.Reduce(records, opts.now().UTC())
 	_ = syncDelegateRemoteThreadFromState(opts, state)
 	return state, nil
 }
@@ -573,16 +624,17 @@ func runDelegateCancel(opts *delegateOptions) (delegation.State, error) {
 	if err != nil {
 		return delegation.State{}, err
 	}
-	store, err := delegation.LoadStore(path)
+	db, closeDB, err := opts.openStore(path)
 	if err != nil {
 		return delegation.State{}, err
 	}
+	defer closeDB()
 	record := delegation.NewTombstoneRecord(opts.delegationID, opts.reason, opts.now().UTC())
-	store.Records = append(store.Records, record)
-	if _, err := delegation.SaveStore(path, store); err != nil {
+	records, err := db.Append(opts.context(), record, opts.now().UTC())
+	if err != nil {
 		return delegation.State{}, err
 	}
-	return delegation.Reduce(recordsForID(store.Records, opts.delegationID), opts.now().UTC()), nil
+	return delegation.Reduce(records, opts.now().UTC()), nil
 }
 
 func runDelegateClaim(opts *delegateOptions) (delegateClaimResult, error) {
@@ -819,8 +871,14 @@ func openDelegateRegistry(opts *delegateOptions) (*delegateRegistrySession, erro
 	if err != nil {
 		return nil, err
 	}
+	var registryDB *machineregistry.CacheDB
+	var adapter *chteams.Adapter
 	closeSession := func(ctx context.Context) error {
-		return httpClient.Close(ctx)
+		var authErr error
+		if adapter != nil {
+			authErr = adapter.Close()
+		}
+		return errors.Join(authErr, httpClient.Close(ctx), registryDB.Close())
 	}
 	cfg, err := chteams.ResolveAuthConfig("")
 	if err != nil {
@@ -836,7 +894,7 @@ func openDelegateRegistry(opts *delegateOptions) (*delegateRegistrySession, erro
 	if readCfg.ClientID != cfg.ClientID {
 		adapterCfg.ReadTokens = chteams.NewDelegatedAuth(readCfg, httpClient.Client)
 	}
-	adapter, err := chteams.New(adapterCfg)
+	adapter, err = chteams.New(adapterCfg)
 	if err != nil {
 		_ = closeSession(context.Background())
 		return nil, err
@@ -856,10 +914,16 @@ func openDelegateRegistry(opts *delegateOptions) (*delegateRegistrySession, erro
 		_ = closeSession(context.Background())
 		return nil, err
 	}
+	registryDB, err = machineregistry.OpenCacheDB(cachePath)
+	if err != nil {
+		_ = closeSession(context.Background())
+		return nil, err
+	}
 	store := machineregistry.Store{
-		Graph:     graph,
-		CachePath: cachePath,
-		Now:       opts.now,
+		Graph:         graph,
+		CachePath:     cachePath,
+		CacheDatabase: registryDB,
+		Now:           opts.now,
 	}
 	ensured, err := store.Ensure(ctx, cfg.TenantID, userID)
 	if err != nil {
@@ -1044,7 +1108,12 @@ func appendDelegateInboxRecordWithOutbox(opts *delegateOptions, session *delegat
 	if err != nil {
 		return nil, err
 	}
-	existing, reserved, err := delegation.ReserveOutbox(opts.context(), path, record, chatID, opts.now().UTC())
+	db, closeDB, err := opts.openStore(path)
+	if err != nil {
+		return nil, err
+	}
+	defer closeDB()
+	existing, reserved, err := db.ReserveOutbox(opts.context(), record, chatID, opts.now().UTC())
 	if err != nil {
 		return nil, err
 	}
@@ -1062,8 +1131,8 @@ func appendDelegateInboxRecordWithOutbox(opts *delegateOptions, session *delegat
 		return nil, fmt.Errorf("delegation record %s already has durable POST witness (%s); refusing automatic replay", record.RecordID, existing.Status)
 	}
 	// ReserveOutbox is the durable Pending transition. Do not perform a
-	// second read/modify/write here: it only adds JSON lock contention and
-	// could regress the reservation under a legacy caller.
+	// second pending transition here: the committed fence already records
+	// the attempt, including a possible crash before the Graph call.
 	msg, sendErr := session.graph.SendHTML(opts.context(), chatID, delegation.RenderRecordHTML(record))
 	if sendErr != nil {
 		records, readErr := readDelegateInboxRecords(opts, session, chatID)
@@ -1097,16 +1166,17 @@ func appendDelegateInboxRecordWithOutbox(opts *delegateOptions, session *delegat
 	return records, nil
 }
 
-func saveDelegateOutbox(opts *delegateOptions, record delegation.Record, status string, chatID string, inboxRef string, messageID string, errText string) error {
+func saveDelegateOutbox(opts *delegateOptions, record delegation.Record, status, chatID, inboxRef, messageID, errText string) error {
 	path, err := delegateRouteStorePath(opts)
 	if err != nil {
 		return err
 	}
-	if delegation.StorePathUsesSQLite(path) {
-		return delegation.UpsertOutboxSQLite(path, record, status, chatID, inboxRef, messageID, errText, opts.now().UTC(), delegation.DefaultStoreRetention)
+	db, closeDB, err := opts.openStore(path)
+	if err != nil {
+		return err
 	}
-	record.InboxRef = firstNonEmptyString(record.InboxRef, inboxRef)
-	return delegation.UpsertWorkerOutboxJSON(path, record, status, chatID, messageID, errText, opts.now().UTC())
+	defer closeDB()
+	return db.UpsertOutbox(opts.context(), record, status, chatID, inboxRef, messageID, errText, opts.now().UTC(), delegation.DefaultStoreRetention)
 }
 
 func containsDelegateRecordID(records []delegation.Record, recordID string) bool {
@@ -1213,21 +1283,15 @@ func loadDelegateRoute(opts *delegateOptions, delegationID string) (delegation.R
 	if err != nil {
 		return delegation.Route{}, err
 	}
-	if delegation.StorePathUsesSQLite(path) {
-		route, ok, err := delegation.RouteSQLite(path, delegationID)
-		if err != nil {
-			return delegation.Route{}, err
-		}
-		if !ok {
-			return delegation.Route{}, fmt.Errorf("delegation %s route not found in %s", delegationID, path)
-		}
-		return route, nil
-	}
-	store, err := delegation.LoadStore(path)
+	db, closeDB, err := opts.openStore(path)
 	if err != nil {
 		return delegation.Route{}, err
 	}
-	route, ok := store.RouteForID(delegationID)
+	defer closeDB()
+	route, ok, err := db.Route(opts.context(), delegationID)
+	if err != nil {
+		return delegation.Route{}, err
+	}
 	if !ok {
 		return delegation.Route{}, fmt.Errorf("delegation %s route not found in %s", delegationID, path)
 	}
@@ -1239,25 +1303,25 @@ func saveDelegateRoute(opts *delegateOptions, route delegation.Route) error {
 	if err != nil {
 		return err
 	}
-	if delegation.StorePathUsesSQLite(path) {
-		return delegation.UpsertRouteSQLite(path, route)
-	}
-	store, err := delegation.LoadStore(path)
+	db, closeDB, err := opts.openStore(path)
 	if err != nil {
 		return err
 	}
-	store.UpsertRoute(route)
-	store.Prune(opts.now().UTC(), delegation.DefaultStoreRetention)
-	_, err = delegation.SaveStore(path, store)
-	return err
+	defer closeDB()
+	return db.UpsertRoute(opts.context(), route)
 }
 
-func loadDelegateRouteStore(opts *delegateOptions) (delegation.Store, error) {
+func loadDelegateRemoteThread(opts *delegateOptions, id string) (delegation.RemoteThread, bool, error) {
 	path, err := delegateRouteStorePath(opts)
 	if err != nil {
-		return delegation.Store{}, err
+		return delegation.RemoteThread{}, false, err
 	}
-	return delegation.LoadStore(path)
+	db, closeDB, err := opts.openStore(path)
+	if err != nil {
+		return delegation.RemoteThread{}, false, err
+	}
+	defer closeDB()
+	return db.RemoteThread(opts.context(), id)
 }
 
 func resolveDelegateStartThread(opts *delegateOptions, candidate delegation.CandidateTokenPayload, spec delegation.TaskSpec, now time.Time) (delegation.ThreadTokenPayload, bool, error) {
@@ -1283,11 +1347,10 @@ func resolveDelegateStartThread(opts *delegateOptions, candidate delegation.Cand
 		return delegation.ThreadTokenPayload{}, false, fmt.Errorf("thread token workspace %q does not match requested workspace %q", payload.WorkspaceFingerprint, opts.workspaceFingerprint)
 	}
 	if payload.Policy == delegation.ThreadPolicyReuse {
-		store, err := loadDelegateRouteStore(opts)
+		thread, ok, err := loadDelegateRemoteThread(opts, payload.ThreadID)
 		if err != nil {
 			return delegation.ThreadTokenPayload{}, false, err
 		}
-		thread, ok := store.RemoteThreadForID(payload.ThreadID)
 		if !ok {
 			return delegation.ThreadTokenPayload{}, false, fmt.Errorf("remote thread %s is not known locally; run delegate resolve again or start a new thread", payload.ThreadID)
 		}
@@ -1301,11 +1364,7 @@ func resolveDelegateStartThread(opts *delegateOptions, candidate delegation.Cand
 	return payload, true, nil
 }
 
-func upsertStartedRemoteThread(store *delegation.Store, record delegation.Record, payload delegation.ThreadTokenPayload, now time.Time) {
-	if store == nil || strings.TrimSpace(record.RemoteThreadID) == "" {
-		return
-	}
-	existing, _ := store.RemoteThreadForID(record.RemoteThreadID)
+func startedRemoteThread(existing delegation.RemoteThread, record delegation.Record, payload delegation.ThreadTokenPayload, now time.Time) delegation.RemoteThread {
 	thread := existing
 	thread.ThreadID = strings.TrimSpace(record.RemoteThreadID)
 	thread.MachineID = strings.TrimSpace(record.MachineID)
@@ -1324,7 +1383,7 @@ func upsertStartedRemoteThread(store *delegation.Store, record delegation.Record
 	if strings.TrimSpace(thread.ExpiresAt) == "" {
 		thread.ExpiresAt = now.Add(delegation.DefaultStoreRetention).UTC().Format(time.RFC3339Nano)
 	}
-	store.UpsertRemoteThread(thread)
+	return thread
 }
 
 func saveDelegateStartedRemoteThread(opts *delegateOptions, record delegation.Record, now time.Time) error {
@@ -1332,38 +1391,18 @@ func saveDelegateStartedRemoteThread(opts *delegateOptions, record delegation.Re
 	if err != nil {
 		return err
 	}
-	if delegation.StorePathUsesSQLite(path) {
-		store := delegation.Store{}
-		if existing, ok, err := delegation.RemoteThreadSQLite(path, record.RemoteThreadID); err != nil {
-			return err
-		} else if ok {
-			store.UpsertRemoteThread(existing)
-		}
-		upsertStartedRemoteThread(&store, record, delegation.ThreadTokenPayload{
-			Policy:           record.ThreadPolicy,
-			ThreadID:         record.RemoteThreadID,
-			MachineID:        record.MachineID,
-			ThreadGeneration: record.ThreadGeneration,
-		}, now)
-		thread, ok := store.RemoteThreadForID(record.RemoteThreadID)
-		if !ok {
-			return nil
-		}
-		return delegation.UpsertRemoteThreadSQLite(path, thread)
-	}
-	store, err := delegation.LoadStore(path)
+	db, closeDB, err := opts.openStore(path)
 	if err != nil {
 		return err
 	}
-	upsertStartedRemoteThread(&store, record, delegation.ThreadTokenPayload{
-		Policy:           record.ThreadPolicy,
-		ThreadID:         record.RemoteThreadID,
-		MachineID:        record.MachineID,
-		ThreadGeneration: record.ThreadGeneration,
-	}, now)
-	store.Prune(now, delegation.DefaultStoreRetention)
-	_, err = delegation.SaveStore(path, store)
-	return err
+	defer closeDB()
+	return db.ChangeThread(opts.context(), record.RemoteThreadID, func(current *delegation.RemoteThread) error {
+		if current.State == delegation.RemoteThreadStateActive && current.ActiveDelegationID != "" && current.ActiveDelegationID != record.DelegationID {
+			return nil
+		}
+		*current = startedRemoteThread(*current, record, delegation.ThreadTokenPayload{Policy: record.ThreadPolicy, ThreadID: record.RemoteThreadID, MachineID: record.MachineID, ThreadGeneration: record.ThreadGeneration}, now)
+		return nil
+	})
 }
 
 func syncDelegateRemoteThreadFromState(opts *delegateOptions, state delegation.State) error {
@@ -1377,10 +1416,18 @@ func syncDelegateRemoteThreadFromState(opts *delegateOptions, state delegation.S
 	if err != nil {
 		return err
 	}
-	if delegation.StorePathUsesSQLite(path) {
-		thread, _, err := delegation.RemoteThreadSQLite(path, state.Request.RemoteThreadID)
-		if err != nil {
-			return err
+	db, closeDB, err := opts.openStore(path)
+	if err != nil {
+		return err
+	}
+	defer closeDB()
+	return db.ChangeThread(opts.context(), state.Request.RemoteThreadID, func(current *delegation.RemoteThread) error {
+		thread := *current
+		if thread.ActiveDelegationID != "" && thread.ActiveDelegationID != state.Request.DelegationID {
+			return nil
+		}
+		if thread.Generation != "" && state.Request.ThreadGeneration != "" && thread.Generation != state.Request.ThreadGeneration {
+			return nil
 		}
 		terminalRecordID := ""
 		if state.Terminal != nil {
@@ -1412,47 +1459,9 @@ func syncDelegateRemoteThreadFromState(opts *delegateOptions, state delegation.S
 		if strings.TrimSpace(thread.ExpiresAt) == "" {
 			thread.ExpiresAt = now.Add(delegation.DefaultStoreRetention).UTC().Format(time.RFC3339Nano)
 		}
-		return delegation.UpsertRemoteThreadSQLite(path, thread)
-	}
-	store, err := delegation.LoadStore(path)
-	if err != nil {
-		return err
-	}
-	thread, _ := store.RemoteThreadForID(state.Request.RemoteThreadID)
-	terminalRecordID := ""
-	if state.Terminal != nil {
-		terminalRecordID = strings.TrimSpace(state.Terminal.RecordID)
-	}
-	if terminalRecordID != "" &&
-		strings.TrimSpace(thread.LastTerminalRecordID) == terminalRecordID &&
-		thread.State == delegation.RemoteThreadStateIdle &&
-		strings.TrimSpace(thread.ActiveDelegationID) == "" {
+		*current = thread
 		return nil
-	}
-	now := opts.now().UTC()
-	thread.ThreadID = strings.TrimSpace(state.Request.RemoteThreadID)
-	thread.MachineID = strings.TrimSpace(state.Request.MachineID)
-	thread.SourceSessionID = strings.TrimSpace(firstNonEmptyString(thread.SourceSessionID, state.Request.SourceSessionID))
-	thread.State = delegation.RemoteThreadStateIdle
-	thread.ActiveDelegationID = ""
-	thread.Generation = strings.TrimSpace(firstNonEmptyString(thread.Generation, state.Request.ThreadGeneration, delegation.NewThreadGeneration(thread.ThreadID, now)))
-	thread.Title = firstNonEmptyString(thread.Title, state.Request.Spec.Title, state.Request.Spec.Objective)
-	thread.UpdatedAt = now.Format(time.RFC3339Nano)
-	thread.LastUsedAt = thread.UpdatedAt
-	if strings.TrimSpace(thread.CreatedAt) == "" {
-		thread.CreatedAt = state.Request.CreatedAt
-	}
-	if state.Terminal != nil {
-		applyThreadUpdateFromTerminal(&thread, *state.Terminal)
-		thread.LastTerminalRecordID = strings.TrimSpace(state.Terminal.RecordID)
-	}
-	if strings.TrimSpace(thread.ExpiresAt) == "" {
-		thread.ExpiresAt = now.Add(delegation.DefaultStoreRetention).UTC().Format(time.RFC3339Nano)
-	}
-	store.UpsertRemoteThread(thread)
-	store.Prune(now, delegation.DefaultStoreRetention)
-	_, err = delegation.SaveStore(path, store)
-	return err
+	})
 }
 
 func applyThreadUpdateFromTerminal(thread *delegation.RemoteThread, terminal delegation.Record) {
@@ -1484,11 +1493,10 @@ func applyThreadUpdateFromTerminal(thread *delegation.RemoteThread, terminal del
 	}
 }
 
-func reusableThreadCandidates(store delegation.Store, candidate delegation.Candidate, opts *delegateOptions, now time.Time, limit int) []delegation.RemoteThreadCandidate {
+func reusableThreadCandidates(threads []delegation.RemoteThread, candidate delegation.Candidate, opts *delegateOptions, now time.Time, limit int) []delegation.RemoteThreadCandidate {
 	if limit <= 0 {
 		limit = 3
 	}
-	threads := store.RemoteThreadsForMachine(candidate.MachineID)
 	out := make([]delegation.RemoteThreadCandidate, 0, limit)
 	for _, thread := range threads {
 		if err := validateReusableThread(thread, candidate.MachineID, opts, now); err != nil {
@@ -1599,7 +1607,7 @@ func delegateWaitShouldReturn(until string, status string) bool {
 
 func delegateRouteStorePath(opts *delegateOptions) (string, error) {
 	if opts != nil && strings.TrimSpace(opts.routeStorePath) != "" {
-		return opts.routeStorePath, nil
+		return delegateStorePath(opts.routeStorePath)
 	}
 	if opts != nil && strings.TrimSpace(opts.storePath) != "" {
 		return delegateStorePath(opts.storePath)
@@ -1625,16 +1633,12 @@ func appendDelegateLocalRecord(opts *delegateOptions, record delegation.Record) 
 	if err != nil {
 		return nil, err
 	}
-	store, err := delegation.LoadStore(path)
+	db, closeDB, err := opts.openStore(path)
 	if err != nil {
 		return nil, err
 	}
-	store.Records = append(store.Records, record)
-	store.Prune(opts.now().UTC(), delegation.DefaultStoreRetention)
-	if _, err := delegation.SaveStore(path, store); err != nil {
-		return nil, err
-	}
-	return store.Records, nil
+	defer closeDB()
+	return db.Append(opts.context(), record, opts.now().UTC())
 }
 
 func buildDelegateMachineCard(opts *delegateOptions, cache machineregistry.Cache) (machineregistry.MachineCard, error) {

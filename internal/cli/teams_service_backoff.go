@@ -2,11 +2,9 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"time"
 
@@ -72,53 +70,50 @@ type teamsServiceRestartRecord struct {
 
 // teamsServiceRestartRecordPath is per host: hosts sharing a home share the
 // store directory.
-func teamsServiceRestartRecordPath(storeDir, host string) string {
-	name := "service-restarts.json"
-	if host = safeWindowsTaskNamePart(host, 64); host != "" {
-		name = "service-restarts." + host + ".json"
-	}
-	return filepath.Join(storeDir, name)
+func teamsServiceRestartRecordPath(storeDir, host string) teamsServiceRestartLocation {
+	return teamsServiceRestartLocation{Database: filepath.Join(storeDir, "service-state.sqlite"), Host: safeWindowsTaskNamePart(host, 64)}
 }
-
-func readTeamsServiceRestartRecord(path string) teamsServiceRestartRecord {
-	var rec teamsServiceRestartRecord
-	if data, err := os.ReadFile(path); err == nil {
-		_ = json.Unmarshal(data, &rec)
-	}
-	return rec
+func readTeamsServiceRestartRecord(path teamsServiceRestartLocation) (teamsServiceRestartRecord, error) {
+	return loadTeamsServiceRestartRecord(path)
 }
-
-func writeTeamsServiceRestartRecord(path string, rec teamsServiceRestartRecord) error {
-	data, err := json.Marshal(rec)
+func writeTeamsServiceRestartRecord(path teamsServiceRestartLocation, rec teamsServiceRestartRecord) error {
+	st, err := openTeamsServiceState(path.Database, nil)
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
-		return err
-	}
-	return os.Rename(tmp, path)
+	defer st.Close()
+	return st.SaveRestart(path.Host, rec)
 }
 
 // teamsServiceStartBackoff paces a service-managed helper at start (see the
 // comment above). It returns ctx's error if the helper is stopped while
 // waiting.
-func teamsServiceStartBackoff(ctx context.Context, path string, errOut io.Writer) error {
-	rec := readTeamsServiceRestartRecord(path)
+func teamsServiceStartBackoff(ctx context.Context, path teamsServiceRestartLocation, errOut io.Writer) error {
+	st, err := openTeamsServiceState(path.Database, nil)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	rec, err := st.Restart(path.Host)
+	if err != nil {
+		return err
+	}
 	now := teamsServiceBackoffNow()
 	n := 0
 	if !rec.LastStart.IsZero() && now.Sub(rec.LastStart) < teamsCrashLoopHealthyRun {
 		n = rec.Streak + 1
 	}
 	if extra := teamsCrashLoopDelay(n) - teamsCrashLoopBase; extra > 0 {
-		_ = writeTeamsServiceRestartRecord(path, teamsServiceRestartRecord{Streak: n, LastStart: rec.LastStart, WaitUntil: now.Add(extra)})
+		if err = st.SaveRestart(path.Host, teamsServiceRestartRecord{Streak: n, LastStart: rec.LastStart, WaitUntil: now.Add(extra)}); err != nil {
+			return err
+		}
 		_, _ = fmt.Fprintf(errOut, "Teams helper restarted %d times in a row within %s of starting; waiting %s before it starts again\n",
 			n, teamsCrashLoopHealthyRun, extra.Round(time.Second))
 		if err := teamsServiceBackoffSleep(ctx, extra); err != nil {
 			return err
 		}
 	}
-	return writeTeamsServiceRestartRecord(path, teamsServiceRestartRecord{Streak: n, LastStart: teamsServiceBackoffNow()})
+	return st.SaveRestart(path.Host, teamsServiceRestartRecord{Streak: n, LastStart: teamsServiceBackoffNow()})
 }
 
 // teamsRefusalReason names an expected refusal to take the store ("" for any

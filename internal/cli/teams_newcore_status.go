@@ -96,12 +96,12 @@ func printTeamsCoreStatus(out io.Writer, now time.Time) error {
 	case err != nil:
 		_, _ = fmt.Fprintf(out, "Auth: not ready (%v)\n", err)
 	default:
-		_, _ = fmt.Fprintf(out, "Auth: %s\n", teamsTokenCacheStatus(cfg.CachePath, now))
+		_, _ = fmt.Fprintf(out, "Auth: %s\n", teamsTokenCacheStatus(cfg.Cache, now))
 		readCfg, readErr := chteams.ResolveReadAuthConfig("")
 		if readErr != nil {
 			_, _ = fmt.Fprintf(out, "Read auth: not ready (%v)\n", readErr)
-		} else if filepath.Clean(readCfg.CachePath) != filepath.Clean(cfg.CachePath) {
-			_, _ = fmt.Fprintf(out, "Read auth: %s\n", teamsTokenCacheStatus(readCfg.CachePath, now))
+		} else if readCfg.Cache != cfg.Cache {
+			_, _ = fmt.Fprintf(out, "Read auth: %s\n", teamsTokenCacheStatus(readCfg.Cache, now))
 		}
 	}
 	writeTeamsCoreStoreStatus(out, now)
@@ -109,7 +109,7 @@ func printTeamsCoreStatus(out io.Writer, now time.Time) error {
 }
 
 // teamsTokenCacheStatus describes a token cache without its contents.
-func teamsTokenCacheStatus(path string, now time.Time) string {
+func teamsTokenCacheStatus(path chteams.TokenLocation, now time.Time) string {
 	tok, err := chteams.ReadTokenCache(path)
 	switch {
 	case errors.Is(err, os.ErrNotExist):

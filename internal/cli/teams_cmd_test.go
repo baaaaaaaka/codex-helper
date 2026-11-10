@@ -2,7 +2,7 @@ package cli
 
 import (
 	"bytes"
-	"encoding/json"
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -217,7 +217,7 @@ func TestTeamsAuthConfigWritesLocalClientIDs(t *testing.T) {
 		"--chat-client-id", "chat-client-config",
 	)
 	for _, want := range []string{
-		"Saved Teams auth config: " + configPath,
+		"Saved Teams auth config: " + strings.TrimSuffix(configPath, ".json") + ".sqlite",
 		"Tenant ID: configured",
 		"Client ID: configured",
 	} {
@@ -225,26 +225,12 @@ func TestTeamsAuthConfigWritesLocalClientIDs(t *testing.T) {
 			t.Fatalf("auth config output missing %q:\n%s", want, out)
 		}
 	}
-	raw, err := os.ReadFile(configPath)
-	if err != nil {
-		t.Fatal(err)
+	doc := readAuthConfigRow(t, configPath)
+	if doc.TenantID != "tenant-config" || doc.FullClient != "chat-client-config" || doc.FullScopes != "User.Read" || doc.ReadClient != "old-read" {
+		t.Fatalf("saved auth config = %#v", doc)
 	}
-	var doc struct {
-		TenantID string `json:"tenant_id"`
-		Read     struct {
-			ClientID string `json:"client_id"`
-		} `json:"read"`
-		Full struct {
-			ClientID string `json:"client_id"`
-			Scopes   string `json:"scopes"`
-		} `json:"full"`
-	}
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		t.Fatal(err)
-	}
-	if doc.TenantID != "tenant-config" || doc.Full.ClientID != "chat-client-config" || doc.Full.Scopes != "User.Read" || doc.Read.ClientID != "old-read" {
-		t.Fatalf("saved auth config = %s", raw)
-	}
+	configPath = strings.TrimSuffix(configPath, ".json") + ".sqlite"
+
 	info, err := os.Stat(configPath)
 	if err != nil {
 		t.Fatalf("stat auth config: %v", err)
@@ -270,25 +256,11 @@ func TestTeamsAuthConfigWritesSeparateReadClient(t *testing.T) {
 	if !strings.Contains(out, "Read client ID: configured") {
 		t.Fatalf("auth config did not report split read client:\n%s", out)
 	}
-	raw, err := os.ReadFile(configPath)
-	if err != nil {
-		t.Fatal(err)
+	doc := readAuthConfigRow(t, configPath)
+	if doc.ReadClient != "read-client-config" || doc.ReadScopes != "User.Read Chat.Read Files.Read" || doc.FullClient != "write-client-config" {
+		t.Fatalf("auth config = %#v", doc)
 	}
-	var doc struct {
-		Read struct {
-			ClientID string `json:"client_id"`
-			Scopes   string `json:"scopes"`
-		} `json:"read"`
-		Full struct {
-			ClientID string `json:"client_id"`
-		} `json:"full"`
-	}
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		t.Fatal(err)
-	}
-	if doc.Read.ClientID != "read-client-config" || doc.Read.Scopes != "User.Read Chat.Read Files.Read" || doc.Full.ClientID != "write-client-config" {
-		t.Fatalf("auth config = %s", raw)
-	}
+
 }
 
 func TestTeamsDoctorLiveUsesExplicitOptIn(t *testing.T) {
@@ -350,4 +322,21 @@ func TestTeamsDoctorLiveUsesExplicitOptIn(t *testing.T) {
 	if !strings.Contains(out, "Codex app-server: ok") {
 		t.Fatalf("doctor --appserver-probe missing probe output:\n%s", out)
 	}
+}
+
+type authConfigFixtureRow struct{ TenantID, ReadClient, ReadScopes, FullClient, FullScopes string }
+
+func readAuthConfigRow(t *testing.T, path string) authConfigFixtureRow {
+	t.Helper()
+	path = strings.TrimSuffix(path, ".json") + ".sqlite"
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var row authConfigFixtureRow
+	if err = db.QueryRow(`SELECT tenant_id,read_client_id,read_scopes,full_client_id,full_scopes FROM auth_profiles WHERE profile=''`).Scan(&row.TenantID, &row.ReadClient, &row.ReadScopes, &row.FullClient, &row.FullScopes); err != nil {
+		t.Fatal(err)
+	}
+	return row
 }

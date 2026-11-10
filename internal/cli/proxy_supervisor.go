@@ -59,6 +59,7 @@ func newProxySupervisorRunCmd(root *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			defer store.Close()
 			return runProxySupervisor(cmd.Context(), store, instanceID, ownerToken)
 		},
 	}
@@ -80,6 +81,7 @@ func newProxySupervisorRenderCmd(root *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			defer store.Close()
 			if instanceID == "" && len(args) > 0 {
 				instanceID = args[0]
 			}
@@ -292,22 +294,14 @@ func waitForExistingProxyDaemon(ctx context.Context, store *config.Store, instan
 		if err := proxySupervisorOwnerCurrent(store, instanceID, ownerToken); err != nil {
 			return err
 		}
-		cfg, err := store.Load()
+		inst, ok, err := store.Instance(instanceID)
 		if err != nil {
 			return err
 		}
-		alive := false
-		for _, inst := range cfg.Instances {
-			if inst.ID == instanceID && inst.DaemonPID > 0 && inst.DaemonPID != os.Getpid() {
-				alive = proxyProcessAlive(inst.DaemonPID)
-				if alive {
-					// A persisted PID can be reused after a crash. Do not adopt an
-					// unrelated process merely because kill(pid, 0) succeeds.
-					looksLike, lookErr := proxyLooksLikeProxyDaemon(inst.DaemonPID)
-					alive = lookErr == nil && looksLike
-				}
-				break
-			}
+		alive := ok && inst.DaemonPID > 0 && inst.DaemonPID != os.Getpid() && proxyProcessAlive(inst.DaemonPID)
+		if alive {
+			looksLike, err := proxyLooksLikeProxyDaemon(inst.DaemonPID)
+			alive = err == nil && looksLike
 		}
 		if !alive {
 			return nil
@@ -319,23 +313,20 @@ func waitForExistingProxyDaemon(ctx context.Context, store *config.Store, instan
 }
 
 func proxySupervisorOwnerCurrent(store *config.Store, instanceID, ownerToken string) error {
-	cfg, err := store.Load()
+	inst, ok, err := store.Instance(instanceID)
 	if err != nil {
 		return err
 	}
-	for _, inst := range cfg.Instances {
-		if inst.ID != instanceID {
-			continue
-		}
-		if inst.OwnerToken != ownerToken {
-			return manager.ErrInstanceOwnershipLost
-		}
-		if inst.RecoveryBudget.Blocked {
-			return ErrProxyRecoveryBlocked
-		}
-		return nil
+	if !ok {
+		return fmt.Errorf("proxy instance %q no longer exists", instanceID)
 	}
-	return fmt.Errorf("proxy instance %q no longer exists", instanceID)
+	if inst.OwnerToken != ownerToken {
+		return manager.ErrInstanceOwnershipLost
+	}
+	if inst.RecoveryBudget.Blocked {
+		return ErrProxyRecoveryBlocked
+	}
+	return nil
 }
 
 func recordProxySupervisorAttempt(store *config.Store, instanceID, ownerToken string, now time.Time, cause error) (bool, error) {
@@ -343,51 +334,37 @@ func recordProxySupervisorAttempt(store *config.Store, instanceID, ownerToken st
 		return false, errors.New("proxy supervisor: nil config store")
 	}
 	blocked := false
-	err := store.Update(func(cfg *config.Config) error {
-		for i := range cfg.Instances {
-			inst := &cfg.Instances[i]
-			if inst.ID != instanceID {
-				continue
-			}
-			if inst.OwnerToken != ownerToken {
-				return manager.ErrInstanceOwnershipLost
-			}
-			budget := inst.RecoveryBudget
-			if budget.RestartWindowStartedAt.IsZero() || now.Before(budget.RestartWindowStartedAt) || now.Sub(budget.RestartWindowStartedAt) > proxySupervisorRestartWindow {
-				budget.RestartWindowStartedAt = now
-				budget.RestartAttempts = 0
-			}
-			budget.RestartAttempts++
-			if budget.RestartAttempts >= proxySupervisorRestartBurst {
-				budget.Blocked = true
-				budget.BlockedAt = now
-				budget.LastReason = fmt.Sprintf("proxy supervisor restart budget exceeded: cause=%v", cause)
-				blocked = true
-			}
-			inst.RecoveryBudget = budget
-			return nil
+	err := store.ChangeInstance(instanceID, func(inst *config.Instance) error {
+		if inst.OwnerToken != ownerToken {
+			return manager.ErrInstanceOwnershipLost
 		}
-		return fmt.Errorf("proxy instance %q no longer exists", instanceID)
+		budget := inst.RecoveryBudget
+		if budget.RestartWindowStartedAt.IsZero() || now.Before(budget.RestartWindowStartedAt) || now.Sub(budget.RestartWindowStartedAt) > proxySupervisorRestartWindow {
+			budget.RestartWindowStartedAt = now
+			budget.RestartAttempts = 0
+		}
+		budget.RestartAttempts++
+		if budget.RestartAttempts >= proxySupervisorRestartBurst {
+			budget.Blocked = true
+			budget.BlockedAt = now
+			budget.LastReason = fmt.Sprintf("proxy supervisor restart budget exceeded: cause=%v", cause)
+			blocked = true
+		}
+		inst.RecoveryBudget = budget
+		return nil
 	})
 	return blocked, err
 }
 
 func markProxySupervisorBlocked(store *config.Store, instanceID, ownerToken string, now time.Time, reason string) error {
-	return store.Update(func(cfg *config.Config) error {
-		for i := range cfg.Instances {
-			inst := &cfg.Instances[i]
-			if inst.ID != instanceID {
-				continue
-			}
-			if inst.OwnerToken != ownerToken {
-				return manager.ErrInstanceOwnershipLost
-			}
-			inst.RecoveryBudget.Blocked = true
-			inst.RecoveryBudget.BlockedAt = now
-			inst.RecoveryBudget.LastReason = reason
-			return nil
+	return store.ChangeInstance(instanceID, func(inst *config.Instance) error {
+		if inst.OwnerToken != ownerToken {
+			return manager.ErrInstanceOwnershipLost
 		}
-		return fmt.Errorf("proxy instance %q no longer exists", instanceID)
+		inst.RecoveryBudget.Blocked = true
+		inst.RecoveryBudget.BlockedAt = now
+		inst.RecoveryBudget.LastReason = reason
+		return nil
 	})
 }
 

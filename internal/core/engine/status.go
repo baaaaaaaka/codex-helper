@@ -1,7 +1,6 @@
 package engine
 
 import (
-	"encoding/json"
 	"strings"
 
 	"github.com/baaaaaaaka/codex-helper/internal/core/store"
@@ -28,32 +27,24 @@ type StoreStatus struct {
 // ReadStoreStatus reads StoreStatus from a store (read-only use is fine).
 func ReadStoreStatus(st *store.Store) (StoreStatus, error) {
 	var s StoreStatus
-	get := func(key string) (string, error) {
-		v, _, err := st.Meta(key)
-		return strings.TrimSpace(v), err
-	}
-	var err error
-	if s.RunningVersion, err = get(metaRunningVersion); err != nil {
-		return s, err
-	}
-	tag := func(key string) (string, error) {
-		raw, err := get(key)
-		if err != nil || raw == "" {
-			return "", err
+	err := st.Read(func(tx *store.Tx) error {
+		version, _, err := tx.Meta(metaRunningVersion)
+		if err != nil {
+			return err
 		}
-		var r updateRequest
-		if json.Unmarshal([]byte(raw), &r) != nil {
-			return "", nil
+		s.RunningVersion = strings.TrimSpace(version)
+		installed, _, err := tx.UpdatePending()
+		if err != nil {
+			return err
 		}
-		return r.Tag, nil
-	}
-	if s.UpdateInstalled, err = tag(metaUpdatePending); err != nil {
-		return s, err
-	}
-	if s.UpdateScheduled, err = tag(metaUpdateRequest); err != nil {
-		return s, err
-	}
-	c, err := get(metaCodexUpgrade)
-	s.CodexUpgrade = c != ""
+		s.UpdateInstalled = installed.Tag
+		scheduled, _, err := tx.UpdateRequest()
+		if err != nil {
+			return err
+		}
+		s.UpdateScheduled = scheduled.Tag
+		_, s.CodexUpgrade, err = tx.CodexRequest()
+		return err
+	})
 	return s, err
 }

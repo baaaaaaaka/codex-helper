@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"html"
 	"os"
@@ -93,7 +92,7 @@ const (
 	ctlHistoryPrompt   = 20
 	ctlHistoryChars    = 8000
 	ctlHistoryEntryMax = 12000
-	ctlHistoryFile     = "control-chat-history.jsonl"
+	ctlHistoryFile     = "control-chat-history.txt"
 	ctlEffortFallback  = "low" // DefaultControlFallbackReasoningEffort
 )
 
@@ -286,13 +285,13 @@ func ctlRedact(text string) string {
 // ctlHistoryEntry is one line of the control-chat history file (v0.1.20
 // controlChatHistoryEntry).
 type ctlHistoryEntry struct {
-	Version   int       `json:"version"`
-	ChatID    string    `json:"chat_id,omitempty"`
-	MessageID string    `json:"message_id,omitempty"`
-	Direction string    `json:"direction,omitempty"`
-	Kind      string    `json:"kind,omitempty"`
-	CreatedAt time.Time `json:"created_at,omitempty"`
-	Text      string    `json:"text,omitempty"`
+	Version   int
+	ChatID    string
+	MessageID string
+	Direction string
+	Kind      string
+	CreatedAt time.Time
+	Text      string
 	// late: posted with or after the current question (its ACK, a
 	// reply sent while it waited); left out of the prompt's tail, so the
 	// prompt does not depend on what was delivered by the time it starts.
@@ -368,19 +367,22 @@ func (e *Engine) ctlHistoryPath() string {
 	return filepath.Join(filepath.Dir(e.st.Path()), ctlHistoryFile)
 }
 
-// writeCtlHistory replaces the history file (private, written atomically)
-// for Codex to read when a question needs older context.
+// writeCtlHistory publishes a bounded plain-text export for Codex to read.
+// The database is the sole source; this file is never loaded as runtime state.
 func writeCtlHistory(path string, list []ctlHistoryEntry) error {
 	if path == "" {
 		return nil
 	}
 	var b strings.Builder
+	b.WriteString("Control chat history (export version 1)\n\n")
+	oneLine := strings.NewReplacer("\r", " ", "\n", " ")
 	for _, en := range list {
-		line, err := json.Marshal(en)
-		if err != nil {
-			return err
+		fmt.Fprintf(&b, "[%s] %s/%s · chat %s · message %s\n", en.CreatedAt.UTC().Format(time.RFC3339Nano), en.Direction, en.Kind, oneLine.Replace(en.ChatID), oneLine.Replace(en.MessageID))
+		for _, line := range strings.Split(en.Text, "\n") {
+			b.WriteString("  ")
+			b.WriteString(line)
+			b.WriteByte('\n')
 		}
-		b.Write(line)
 		b.WriteByte('\n')
 	}
 	tmp := path + ".tmp"

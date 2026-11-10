@@ -700,9 +700,6 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 		if err := tx.FinishTurn(tr.ID, state, errText, msgs); err != nil {
 			return err
 		}
-		if err := recordUsage(tx, cs.id, state, out.Usage); err != nil {
-			return err
-		}
 		if extra != nil {
 			if err := extra(tx); err != nil {
 				return err
@@ -740,10 +737,6 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 	cs.capWake = time.Time{}
 	cs.lastTurnEnd = e.now()
 	e.mu.Unlock()
-	if notify {
-		e.notifyN.Add(1)
-		wake(e.notifyWake)
-	}
 	if upgrade {
 		wake(e.updateWake)
 	}

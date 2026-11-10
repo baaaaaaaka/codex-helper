@@ -51,7 +51,7 @@ type driveItem struct {
 	WebDavURL string `json:"webDavUrl"`
 }
 
-// driveRef is the opaque FileRef.Ref of an uploaded file.
+// driveRef contains concrete uploaded reference fields. Ref holds only item ID.
 type driveRef struct {
 	ItemID       string `json:"item"`
 	AttachmentID string `json:"att"`
@@ -59,13 +59,12 @@ type driveRef struct {
 	Name         string `json:"name"`
 }
 
-func parseDriveRef(ref string) (driveRef, error) {
-	var d driveRef
-	raw, ok := strings.CutPrefix(ref, "drive:")
-	if !ok || json.Unmarshal([]byte(raw), &d) != nil || d.AttachmentID == "" || d.URL == "" {
-		return driveRef{}, fmt.Errorf("teams: %q is not an uploaded file reference", ref)
+func parseDriveRef(ref channel.FileRef) (driveRef, error) {
+	item, ok := strings.CutPrefix(ref.Ref, "drive:")
+	if !ok || item == "" || strings.HasPrefix(item, "{") || ref.AttachmentID == "" || ref.URL == "" {
+		return driveRef{}, fmt.Errorf("teams: %q is not a native uploaded file reference", ref.Ref)
 	}
-	return d, nil
+	return driveRef{ItemID: item, AttachmentID: ref.AttachmentID, URL: ref.URL, Name: ref.Name}, nil
 }
 
 func (it driveItem) ref() (channel.FileRef, error) {
@@ -74,8 +73,7 @@ func (it driveItem) ref() (channel.FileRef, error) {
 	if it.ID == "" || att == "" || u == "" {
 		return channel.FileRef{}, errors.New("drive item response lacks id, eTag GUID or URL")
 	}
-	raw, _ := json.Marshal(driveRef{ItemID: it.ID, AttachmentID: att, URL: u, Name: it.Name})
-	return channel.FileRef{Kind: channel.FileDoc, Name: it.Name, Size: it.Size, Ref: "drive:" + string(raw)}, nil
+	return channel.FileRef{Kind: channel.FileDoc, Name: it.Name, Size: it.Size, Ref: "drive:" + it.ID, AttachmentID: att, URL: u}, nil
 }
 
 // UploadFile uploads src as name. See the package comment above for layout.
@@ -280,7 +278,7 @@ func (a *Adapter) FetchFile(ctx context.Context, ref channel.FileRef, dst string
 		}
 		src = "/shares/u!" + base64.RawURLEncoding.EncodeToString([]byte(raw)) + "/driveItem/content"
 	case strings.HasPrefix(ref.Ref, "drive:"):
-		d, err := parseDriveRef(ref.Ref)
+		d, err := parseDriveRef(ref)
 		if err != nil {
 			return ref, &channel.Rejected{Permanent: true, Err: err}
 		}

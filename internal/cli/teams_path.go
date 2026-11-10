@@ -38,6 +38,7 @@ func newTeamsPathStatusCmd(root *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			defer store.Close()
 			cfg, err := store.Load()
 			if err != nil {
 				return err
@@ -101,7 +102,8 @@ func newTeamsPathModeCmd(root *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := store.Update(func(cfg *config.Config) error {
+			defer store.Close()
+			if err := store.ChangeSettings(func(cfg *config.Config) error {
 				if mode == string(userpath.ModeExplicit) && cfg.TeamsCodexPath.ExplicitPath == "" {
 					return fmt.Errorf("mode %s requires a saved PATH; use `cxp teams path explicit <PATH>`", mode)
 				}
@@ -148,7 +150,8 @@ func newTeamsPathShellCmd(root *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if err := store.Update(func(cfg *config.Config) error {
+			defer store.Close()
+			if err := store.ChangeSettings(func(cfg *config.Config) error {
 				cfg.TeamsCodexPath.Mode = string(userpath.ModeAccountDefault)
 				cfg.TeamsCodexPath.ShellOverride = shell
 				return nil
@@ -170,7 +173,8 @@ func updateTeamsPathConfig(root *rootOptions, cmd *cobra.Command, mode, pathValu
 	if err != nil {
 		return err
 	}
-	if err := store.Update(func(cfg *config.Config) error {
+	defer store.Close()
+	if err := store.ChangeSettings(func(cfg *config.Config) error {
 		cfg.TeamsCodexPath.Mode = mode
 		cfg.TeamsCodexPath.ExplicitPath = pathValue
 		return nil

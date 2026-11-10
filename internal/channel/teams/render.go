@@ -584,7 +584,7 @@ func outboundAttachments(files []channel.FileRef) ([]map[string]string, string, 
 	var atts []map[string]string
 	var tags strings.Builder
 	for _, f := range files {
-		d, err := parseDriveRef(f.Ref)
+		d, err := parseDriveRef(f)
 		if err != nil {
 			return nil, "", err
 		}

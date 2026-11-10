@@ -160,6 +160,7 @@ func TestRunCodexAppAuthDirectUsesAppServerAuthHome(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 	if err := store.Save(config.Config{Version: config.CurrentVersion, ProxyEnabled: boolPtr(false)}); err != nil {
 		t.Fatalf("save config: %v", err)
 	}
@@ -226,6 +227,7 @@ func TestRunCodexAppAuthExplicitProfileUsesProxyFlow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 	profile := config.Profile{ID: "p1", Name: "dev"}
 	enabled := true
 	if err := store.Save(config.Config{Version: config.CurrentVersion, ProxyEnabled: &enabled, Profiles: []config.Profile{profile}}); err != nil {

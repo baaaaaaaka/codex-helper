@@ -26,6 +26,7 @@ func TestSelftestReadsValidConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 	if err := store.Save(config.Config{}); err != nil {
 		t.Fatalf("Save: %v", err)
 	}

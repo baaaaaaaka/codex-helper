@@ -38,6 +38,7 @@ func runUpgradeCodexAppFromRoot(cmd *cobra.Command, root *rootOptions) error {
 	if err != nil {
 		return err
 	}
+	defer store.Close()
 	cfg, err := store.Load()
 	if err != nil {
 		return err

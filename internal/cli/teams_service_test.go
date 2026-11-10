@@ -3,7 +3,6 @@ package cli
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -20,6 +19,7 @@ import (
 	"github.com/gofrs/flock"
 
 	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
+	chteams "github.com/baaaaaaaka/codex-helper/internal/channel/teams"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
@@ -1181,7 +1181,7 @@ func TestTeamsServiceLocalSupervisorEnableStartStatus(t *testing.T) {
 		"Active: true",
 		"SupervisorPID:",
 		"Autostart: not guaranteed after machine/container reboot",
-		cliStatePathForTest(t, "teams", "service", "local-supervisor", "run", teamsServiceLocalSupervisorStatusName),
+		cliStatePathForTest(t, "teams", "service", "service-state.sqlite"),
 	} {
 		if !strings.Contains(statusOut.String(), want) {
 			t.Fatalf("status output missing %q:\n%s", want, statusOut.String())
@@ -1285,7 +1285,7 @@ func TestTeamsServiceLocalSupervisorRuntimeDirIgnoresXDGRuntimeDir(t *testing.T)
 	if err != nil {
 		t.Fatalf("status path: %v", err)
 	}
-	want := cliStatePathForTest(t, "teams", "service", "local-supervisor", "run", teamsServiceLocalSupervisorStatusName)
+	want := cliStatePathForTest(t, "teams", "service", "service-state.sqlite")
 	if statusPath != want {
 		t.Fatalf("status path = %q, want stable state-root path %q", statusPath, want)
 	}
@@ -1314,12 +1314,15 @@ func TestTeamsServiceLocalSupervisorRuntimeDirMigratesLegacyStatusWhenNewDirExis
 	if err != nil {
 		t.Fatalf("status path: %v", err)
 	}
-	wantStatus := filepath.Join(newDir, teamsServiceLocalSupervisorStatusName)
+	wantStatus := cliStatePathForTest(t, "teams", "service", "service-state.sqlite")
 	if statusPath != wantStatus {
 		t.Fatalf("status path = %q, want %q", statusPath, wantStatus)
 	}
-	assertCLIFileContent(t, wantStatus, `{"version":1,"state":"running"}`)
-	assertCLIFileContent(t, legacyStatus, `{"version":1,"state":"running"}`)
+	status, found, err := readTeamsServiceLocalSupervisorStatus()
+	if err != nil || !found || status.State != "running" {
+		t.Fatalf("imported status %#v/%v/%v", status, found, err)
+	}
+	assertCLIFileContent(t, legacyStatus+".migrated", `{"version":1,"state":"running"}`)
 	if _, err := os.Stat(filepath.Join(newDir, teamsServiceLocalSupervisorLockName)); !os.IsNotExist(err) {
 		t.Fatalf("lock file should not be copied, stat err = %v", err)
 	}
@@ -1355,10 +1358,13 @@ func TestTeamsServiceLocalSupervisorRuntimeDirRefreshesStaleNewStatusCI(t *testi
 	if err != nil {
 		t.Fatalf("status path: %v", err)
 	}
-	if statusPath != newStatus {
-		t.Fatalf("status path = %q, want %q", statusPath, newStatus)
+	if statusPath != cliStatePathForTest(t, "teams", "service", "service-state.sqlite") {
+		t.Fatalf("unexpected native path %q", statusPath)
 	}
-	assertCLIFileContent(t, newStatus, `{"version":1,"state":"running","supervisor_pid":222}`)
+	status, found, err := readTeamsServiceLocalSupervisorStatus()
+	if err != nil || !found || status.SupervisorPID != 222 {
+		t.Fatalf("latest legacy status %#v/%v/%v", status, found, err)
+	}
 }
 
 func TestTeamsServiceLocalSupervisorRuntimeDirRefreshesCorruptNewStatusCI(t *testing.T) {
@@ -1381,14 +1387,11 @@ func TestTeamsServiceLocalSupervisorRuntimeDirRefreshesCorruptNewStatusCI(t *tes
 		t.Fatalf("write corrupt new status: %v", err)
 	}
 
-	statusPath, err := teamsServiceLocalSupervisorStatusPath()
-	if err != nil {
-		t.Fatalf("status path: %v", err)
+	if _, _, err := readTeamsServiceLocalSupervisorStatus(); err == nil {
+		t.Fatal("corrupt migration source accepted")
 	}
-	if statusPath != newStatus {
-		t.Fatalf("status path = %q, want %q", statusPath, newStatus)
-	}
-	assertCLIFileContent(t, newStatus, `{"version":1,"state":"running","supervisor_pid":222}`)
+	assertCLIFileContent(t, newStatus, `{"version":`)
+	assertCLIFileContent(t, legacyStatus, `{"version":1,"state":"running","supervisor_pid":222}`)
 }
 
 func TestTeamsServiceLocalSupervisorStartRequiresReadyStatus(t *testing.T) {
@@ -2244,20 +2247,20 @@ func TestTeamsServiceLocalSupervisorRejectsSymlinkStatusLockAndLogFiles(t *testi
 	}
 }
 
-func TestTeamsServiceLocalSupervisorFileAtomicReplacesExistingFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "status.json")
-	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
-		t.Fatalf("write old file: %v", err)
+func TestTeamsServiceLocalSupervisorConfigReplacesExistingSpec(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "supervisor.sqlite")
+	cfg := teamsServiceLocalSupervisorConfig{Version: 1, Enabled: true, Spec: teamsServiceSpec{Executable: "/first", Environment: map[string]string{"OLD": "value"}}}
+	if err := writeTeamsServiceLocalSupervisorConfig(path, cfg); err != nil {
+		t.Fatal(err)
 	}
-	if err := writeTeamsServiceLocalSupervisorFileAtomic(path, []byte("new"), 0o600); err != nil {
-		t.Fatalf("atomic write: %v", err)
+	cfg.Spec.Executable = "/second"
+	cfg.Spec.Environment = map[string]string{"NEW": "other"}
+	if err := writeTeamsServiceLocalSupervisorConfig(path, cfg); err != nil {
+		t.Fatal(err)
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read replaced file: %v", err)
-	}
-	if string(data) != "new" {
-		t.Fatalf("file content = %q, want new", data)
+	actual, err := readTeamsServiceLocalSupervisorConfig(path)
+	if err != nil || actual.Spec.Executable != "/second" || actual.Spec.Environment["NEW"] != "other" || len(actual.Spec.Environment) != 1 {
+		t.Fatalf("replacement spec %#v/%v", actual, err)
 	}
 }
 
@@ -3191,7 +3194,7 @@ func TestTeamsServiceAuthPreflightRequiresBothSplitCaches(t *testing.T) {
 	if err := defaultTeamsServiceAuthPreflight(); err == nil || !strings.Contains(err.Error(), "teams auth read") {
 		t.Fatalf("missing read cache error = %v, want read login instruction", err)
 	}
-	if err := os.WriteFile(readCache, []byte(`{"refresh_token":"read-refresh"}`), 0o600); err != nil {
+	if err := chteams.WriteTokenCache(chteams.TokenLocation{Database: filepath.Join(tmp, "teams-tokens.sqlite"), Slot: "read-token.json"}, chteams.TokenCache{RefreshToken: "read-refresh"}); err != nil {
 		t.Fatal(err)
 	}
 	if err := defaultTeamsServiceAuthPreflight(); err != nil {
@@ -4831,7 +4834,7 @@ func TestTeamsServiceBootstrapSchedulesPendingHelperActivationBeforeStartingOldW
 		teamsServiceWindowsTaskName,
 		teamsServiceWindowsWatchdogTaskName,
 		"$want='0.1.0-rc.73'",
-		".activation.json",
+		"--cxp-record-activation",
 		"Move-Item -Force",
 		"if (Test-DestVersion) { $ready=$true }",
 		"Write-Status 'failed'",
@@ -5260,7 +5263,7 @@ func TestTeamsServiceStartAndRestartActivatePendingWindowsHelperBeforeOldEntry(t
 				t.Fatalf("%s detached name = %q, want powershell.exe", tc.name, detachedName)
 			}
 			joined := strings.Join(detachedArgs, " ")
-			for _, want := range []string{pending, exe, "$want='0.1.0-rc.74'", ".activation.json", "Move-Item -Force", "Write-Status 'failed'", "Enable-ScheduledTask", "Start-CodexHelperScheduledTaskIfStopped"} {
+			for _, want := range []string{pending, exe, "$want='0.1.0-rc.74'", "--cxp-record-activation", "Move-Item -Force", "Write-Status 'failed'", "Enable-ScheduledTask", "Start-CodexHelperScheduledTaskIfStopped"} {
 				if !strings.Contains(joined, want) {
 					t.Fatalf("%s activation command missing %q:\n%s", tc.name, want, joined)
 				}
@@ -6389,13 +6392,9 @@ func TestTeamsServiceInstallWritesLocalSupervisorConfigWhenSystemdUserUnavailabl
 	}
 
 	configPath := filepath.Join(configBase, "codex-helper", "teams", teamsServiceLocalSupervisorConfigName)
-	data, err := os.ReadFile(configPath)
+	cfg, err := readTeamsServiceLocalSupervisorConfig(configPath)
 	if err != nil {
 		t.Fatalf("read local supervisor config: %v", err)
-	}
-	var cfg teamsServiceLocalSupervisorConfig
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		t.Fatalf("unmarshal local supervisor config: %v\n%s", err, data)
 	}
 	if cfg.Enabled {
 		t.Fatal("install should write local supervisor config disabled")

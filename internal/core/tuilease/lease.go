@@ -14,11 +14,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
+	"database/sql"
 	"github.com/baaaaaaaka/codex-helper/internal/core/engine"
+	"github.com/baaaaaaaka/codex-helper/internal/sqlitestate"
 )
 
 type descriptor struct {
@@ -97,29 +98,12 @@ func Listen(path, codexHome string, e Attacher, secureFile func(string) error) (
 		}
 	})
 	srv := &Server{http: &http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 5 * time.Second}, listener: l, path: path}
-	data, _ := json.Marshal(d)
-	// The descriptor changes only with the helper's lifetime, never per token.
-	tmp, createErr := os.CreateTemp(filepath.Dir(path), ".tui-endpoint-*")
-	if createErr != nil {
-		l.Close()
-		return nil, createErr
-	}
-	defer os.Remove(tmp.Name())
-	_, err = tmp.Write(data)
-	closeErr := tmp.Close()
-	if err == nil {
-		err = closeErr
-	}
-	if err == nil && secureFile != nil {
-		err = secureFile(tmp.Name())
-	}
-	if err == nil {
-		err = os.Rename(tmp.Name(), path)
-	}
-	if err != nil {
+	// The descriptor changes only with the helper's lifetime.
+	if err = writeDescriptor(path, d, secureFile); err != nil {
 		l.Close()
 		return nil, err
 	}
+
 	go func() { _ = srv.http.Serve(l) }()
 	return srv, nil
 }
@@ -142,17 +126,14 @@ func AcquireNew(ctx context.Context, path, codexHome, cwd string) (*Lease, error
 	return acquire(ctx, path, codexHome, `{"cwd":`+quoted(cwd)+`}`)
 }
 func acquire(ctx context.Context, path, codexHome, payload string) (*Lease, error) {
-	raw, err := os.ReadFile(path)
+	d, err := readDescriptor(path)
 	if os.IsNotExist(err) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	var d descriptor
-	if err = json.Unmarshal(raw, &d); err != nil {
-		return nil, err
-	}
+
 	if d.CodexHome != codexHome {
 		return nil, nil
 	}
@@ -197,3 +178,30 @@ func acquire(ctx context.Context, path, codexHome, payload string) (*Lease, erro
 	return &Lease{Endpoint: ep, body: resp.Body, Done: done}, nil
 }
 func quoted(s string) string { b, _ := json.Marshal(s); return string(b) }
+
+func writeDescriptor(path string, d descriptor, secure func(string) error) error {
+	return sqlitestate.PublishSnapshot(path, secure, func(tx *sql.Tx) error {
+		if _, err := tx.Exec(`CREATE TABLE endpoint(id INTEGER PRIMARY KEY CHECK(id=1), url TEXT NOT NULL, token TEXT NOT NULL, codex_home TEXT NOT NULL)`); err != nil {
+			return err
+		}
+		_, err := tx.Exec(`INSERT INTO endpoint VALUES(1,?,?,?)`, d.URL, d.Token, d.CodexHome)
+		return err
+	})
+}
+func readDescriptor(path string) (descriptor, error) {
+	var d descriptor
+	db, err := sqlitestate.OpenSnapshot(path, 64*1024)
+	if err != nil {
+		return d, err
+	}
+	defer db.Close()
+	var v int
+	if err = db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
+		return d, err
+	}
+	if v != 1 {
+		return d, errors.New("unsupported TUI endpoint schema")
+	}
+	err = db.QueryRow(`SELECT url,token,codex_home FROM endpoint WHERE id=1`).Scan(&d.URL, &d.Token, &d.CodexHome)
+	return d, err
+}

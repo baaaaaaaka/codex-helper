@@ -50,37 +50,11 @@ trap {
 
 function Write-InstallRecord([string]$targetPath, [string]$shimPath, [string]$repo, [string]$version, [string]$goarch) {
   try {
-    $configBase = $env:APPDATA
-    if ([string]::IsNullOrWhiteSpace($configBase)) {
-      $configBase = [Environment]::GetFolderPath('ApplicationData')
-    }
-    if ([string]::IsNullOrWhiteSpace($configBase)) {
-      Write-Warning "Could not write install record: ApplicationData is unavailable"
-      return
-    }
-    $recordDir = Join-Path $configBase "codex-helper"
-    $recordPath = Join-Path $recordDir "install.json"
-    New-Item -ItemType Directory -Force -Path $recordDir | Out-Null
-    $record = [ordered]@{
-      schema_version = 1
-      target_path = $targetPath
-      target_source = "installer"
-      target_state = "managed"
-      repo = $repo
-      version = $version
-      goos = "windows"
-      goarch = $goarch
-      shims = @($shimPath)
-      updated_at = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-    }
-    $tmpRecord = $recordPath + ".tmp." + [Guid]::NewGuid().ToString("N")
-    $recordJson = ($record | ConvertTo-Json -Depth 4) + [Environment]::NewLine
-    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText($tmpRecord, $recordJson, $utf8NoBom)
-    Move-Item -Force -LiteralPath $tmpRecord -Destination $recordPath -ErrorAction Stop
-    $script:InstallRecordDetail = "Install record: $recordPath"
+    $detail = & $targetPath --cxp-record-install --target $targetPath --shim $shimPath --repo $repo --version $version --goos windows --goarch $goarch
+    if ($LASTEXITCODE -ne 0) { throw "native SQLite install writer exited with $LASTEXITCODE" }
+    $script:InstallRecordDetail = ($detail -join [Environment]::NewLine)
   } catch {
-    Write-Warning "Could not write install record: $($_.Exception.Message)"
+    Write-Warning "Could not write native SQLite install record: $($_.Exception.Message)"
   }
 }
 
@@ -572,6 +546,8 @@ $cxpContent = "@echo off`r`n`"%~dp0cxp.exe`" %*`r`n"
 Invoke-DiskWrite -Label "cxp shim install" -PathValue $cxpCmd -DefaultReason "Failed to install cxp shim: $cxpCmd" -Action {
   Set-Content -Path $cxpCmd -Value $cxpContent -Encoding ASCII
 }
+& $dst --cxp-install-bootstrap --target $dst
+if ($LASTEXITCODE -ne 0) { throw "Could not establish the SQLite bootstrap; stop old writers and rerun the installer" }
 $builtinSkillDetail = ""
 if ($env:CODEX_PROXY_SKIP_BUILTIN_SKILLS -eq "1") {
   $builtinSkillDetail = "Built-in cxp skill install skipped by CODEX_PROXY_SKIP_BUILTIN_SKILLS=1"

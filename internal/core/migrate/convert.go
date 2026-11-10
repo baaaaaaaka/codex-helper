@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"sort"
 	"strconv"
@@ -1045,7 +1044,7 @@ func (c *converter) convertOutbox() error {
 			}
 			var f *store.OutFile
 			if o.AttachmentPath != "" && (co.state == store.OutQueued || co.state == store.OutUnknown) {
-				f = &store.OutFile{LocalPath: o.AttachmentPath, Size: o.AttachmentSize, UploadedBytes: o.AttachmentUploadOffset, ExtItemID: o.DriveItemID}
+				f = &store.OutFile{LocalPath: o.AttachmentPath, Size: o.AttachmentSize, UploadedBytes: o.AttachmentUploadOffset, Ref: store.FileReference{Ref: o.DriveItemID}}
 				if exp := ms(o.AttachmentUploadExpiry); o.AttachmentUploadURL != "" && exp > c.ms() {
 					f.UploadURL, f.UploadExpiresAt = o.AttachmentUploadURL, exp
 				} else {
@@ -1075,12 +1074,8 @@ func (c *converter) convertOutbox() error {
 			}
 		}
 	}
-	if len(c.finalChecks) > 0 {
-		b, err := json.Marshal(c.finalChecks)
-		if err != nil {
-			return err
-		}
-		if err := c.im.SetMeta(store.MetaLegacyFinalChecks, string(b)); err != nil {
+	for _, check := range c.finalChecks {
+		if err := c.im.AnswerCheck(check); err != nil {
 			return err
 		}
 	}

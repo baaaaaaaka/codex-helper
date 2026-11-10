@@ -103,8 +103,8 @@ VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(conv_id, ext_msg_id) DO NOTHING RETURNING
 			if fs == "" {
 				fs = "pending"
 			}
-			if _, err := t.exec(`INSERT INTO inbound_files(inbound_id,idx,name,ext_ref,local_path,kind,state,error)
-VALUES (?,?,?,?,?,?,?,?)`, id, idx, f.Name, f.ExtRef, nullStr(f.LocalPath), f.Kind, fs, nullStr(f.Error)); err != nil {
+			f.State = fs
+			if err := t.insertInboundFile(id, idx, f); err != nil {
 				return nil, err
 			}
 		}
@@ -165,7 +165,7 @@ WHERE conv_id = ? AND state IN ('queued','held') ORDER BY ext_time, id`, convID)
 
 // InboundFiles lists the attachments of an inbound row.
 func (t *Tx) InboundFiles(inboundID int64) ([]InboundFile, error) {
-	rows, err := t.rows(`SELECT idx,name,ext_ref,local_path,kind,state,error FROM inbound_files WHERE inbound_id = ? ORDER BY idx`, inboundID)
+	rows, err := t.rows(`SELECT idx,name,ref,local_path,kind,state,error,ref_kind,ref_name,ref_size,ref_content_type,ref_attachment_id,ref_url,quote_n,quote_id,quote_from,quote_time,quote_text,quote_forwarded,quote_resolved,resolved_from,resolved_time,resolved_text,resolved_fetched,resolved_full_path FROM inbound_files WHERE inbound_id = ? ORDER BY idx`, inboundID)
 	if err != nil {
 		return nil, err
 	}
@@ -174,10 +174,19 @@ func (t *Tx) InboundFiles(inboundID int64) ([]InboundFile, error) {
 	for rows.Next() {
 		var f InboundFile
 		var lp, e sql.NullString
-		if err := rows.Scan(&f.Idx, &f.Name, &f.ExtRef, &lp, &f.Kind, &f.State, &e); err != nil {
+		var q QuoteReference
+		var qt QuoteText
+		var resolved bool
+		if err := rows.Scan(&f.Idx, &f.Name, &f.Ref.Ref, &lp, &f.Kind, &f.State, &e, &f.Ref.Kind, &f.Ref.Name, &f.Ref.Size, &f.Ref.ContentType, &f.Ref.AttachmentID, &f.Ref.URL, &q.N, &q.ID, &q.From, &q.Time, &q.Text, &q.Fwd, &resolved, &qt.From, &qt.Time, &qt.Text, &qt.Fetched, &qt.FullPath); err != nil {
 			return nil, err
 		}
 		f.LocalPath, f.Error = lp.String, e.String
+		if q.N != 0 {
+			f.Quote = &q
+		}
+		if resolved {
+			f.ResolvedQuote = &qt
+		}
 		out = append(out, f)
 	}
 	return out, rows.Err()

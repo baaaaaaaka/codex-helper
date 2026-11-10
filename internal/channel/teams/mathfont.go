@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -26,8 +25,7 @@ import (
 // TeX code block. Pinned fonts are downloaded on demand, only when a
 // formula needs a rune they cover, verified by size and SHA-256, and
 // installed atomically next to the runtime as
-// fonts/<id>-<version>/{<file>,font.json,LICENSE.txt} (the layout of the
-// previous helper, so its installed fonts are reused).
+// fonts/<id>-<version>/{<file>,font.sqlite,LICENSE.txt} (older metadata is migrated once).
 
 // FontAsset is a pinned font file the math renderer may download.
 type FontAsset struct {
@@ -152,13 +150,11 @@ func (n *NodeMath) verifyFont(root string, a FontAsset) (renderFont, error) {
 	if ok && stamp.size == st.Size() && stamp.mtime.Equal(st.ModTime()) {
 		return rf, nil
 	}
-	raw, err := os.ReadFile(filepath.Join(dir, "font.json"))
+	mk, err := readFontMarker(dir)
 	if err != nil {
 		return renderFont{}, err
 	}
-	var mk fontMarker
-	if json.Unmarshal(raw, &mk) != nil || mk.Kind != fontMarkerKind || mk.ID != a.ID || mk.Version != a.Version ||
-		mk.Filename != a.Filename || mk.Size != a.Size || !strings.EqualFold(mk.SHA256, a.SHA256) {
+	if mk.Kind != fontMarkerKind || mk.ID != a.ID || mk.Version != a.Version || mk.Filename != a.Filename || mk.Size != a.Size || !strings.EqualFold(mk.SHA256, a.SHA256) {
 		return renderFont{}, errors.New("math font marker does not match")
 	}
 	if a.License != "" {
@@ -342,9 +338,7 @@ func (n *NodeMath) installFont(ctx context.Context, root string, a FontAsset, wa
 			return renderFont{}, err
 		}
 	}
-	mk, _ := json.Marshal(fontMarker{Kind: fontMarkerKind, ID: a.ID, Version: a.Version, Filename: a.Filename,
-		Size: a.Size, SHA256: strings.ToLower(a.SHA256), Installed: time.Now().UTC().Format(time.RFC3339)})
-	if err := os.WriteFile(filepath.Join(stage, "font.json"), mk, 0o600); err != nil {
+	if err := writeFontMarker(stage, fontMarker{Kind: fontMarkerKind, ID: a.ID, Version: a.Version, Filename: a.Filename, Size: a.Size, SHA256: strings.ToLower(a.SHA256), Installed: time.Now().UTC().Format(time.RFC3339)}); err != nil {
 		return renderFont{}, err
 	}
 	target := fontDir(root, a)

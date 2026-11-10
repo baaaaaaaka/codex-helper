@@ -48,6 +48,7 @@ func newTeamsNewCoreCodexLaunch(ctx context.Context, root *rootOptions, codexBin
 	if err != nil {
 		return teamsNewCoreCodexLaunch{}, err
 	}
+	defer store.Close()
 	cfg, err := store.Load()
 	if err != nil {
 		return teamsNewCoreCodexLaunch{}, err

@@ -328,5 +328,6 @@ func newRootStore(root *rootOptions, codexDirOverride string) (*config.Store, ef
 	if err != nil {
 		return nil, effectivePaths{}, fmt.Errorf("open config store: %w", err)
 	}
+	paths.ConfigPath = store.Path()
 	return store, paths, nil
 }

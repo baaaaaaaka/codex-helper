@@ -55,7 +55,33 @@ SELECT 1,'old:'||i,i,'mirror',?,'sent',1 FROM n`, body)
 	after, err := os.Stat(path)
 	mustT(t, err)
 	t.Logf("migration over %d bytes outbox: %s, disk growth %d bytes", before.Size(), time.Since(started), after.Size()-before.Size())
-	if after.Size()-before.Size() > 128<<10 {
+	// Typed state adds empty tables/index roots. Measure that fixed schema
+	// cost separately; the budget still rejects growth proportional to 20,000
+	// historical bodies (or a new index over those historical rows).
+	emptyPath := filepath.Join(t.TempDir(), "empty-v3.sqlite")
+	empty, err := sql.Open("sqlite", emptyPath)
+	mustT(t, err)
+	for _, migration := range migrations[:3] {
+		for _, q := range migration {
+			_, err = empty.Exec(q)
+			mustT(t, err)
+		}
+	}
+	_, err = empty.Exec(fmt.Sprintf("PRAGMA application_id=%d;PRAGMA user_version=3", ApplicationID))
+	mustT(t, err)
+	mustT(t, empty.Close())
+	emptyBefore, err := os.Stat(emptyPath)
+	mustT(t, err)
+	emptyStore, err := Open(emptyPath)
+	mustT(t, err)
+	_, err = emptyStore.w.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
+	mustT(t, err)
+	mustT(t, emptyStore.Close())
+	emptyAfter, err := os.Stat(emptyPath)
+	mustT(t, err)
+	fixedGrowth := emptyAfter.Size() - emptyBefore.Size()
+	t.Logf("fixed typed schema growth: %d bytes", fixedGrowth)
+	if after.Size()-before.Size()-fixedGrowth > 128<<10 {
 		t.Fatal("migration rewrote historical bodies or built a full-history index")
 	}
 }

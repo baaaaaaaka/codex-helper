@@ -12,6 +12,7 @@ from pathlib import Path
 import pty
 import select
 import shutil
+import sqlite3
 import signal
 import struct
 import tempfile
@@ -136,24 +137,35 @@ def installed(binary: Path):
             for term in terms:
                 term.close()
             runtime.chmod(0o755)
-            for file in (runtime / "boot.json", runtime / "runtime.lock"):
+            for file in (runtime / "boot.sqlite", runtime / "runtime.lock"):
                 if file.exists():
                     file.chmod(0o600)
 
 
 def record(runtime: Path, candidate: Path | None = None, good="v1.0.0", generation=1):
-    data = {"schema": 1, "generation": generation, "good": good}
-    if candidate is not None:
-        data["candidate"] = {"version": candidate.parent.name,
-                             "sha256": hashlib.sha256(candidate.read_bytes()).hexdigest()}
-    path = runtime / "boot.json"
-    temp = runtime / "test-record"
-    temp.write_text(json.dumps(data))
+    path = runtime / "boot.sqlite"
+    temp = runtime / "test-record.sqlite"
+    temp.unlink(missing_ok=True)
+    with sqlite3.connect(temp) as db:
+        db.execute("PRAGMA page_size=1024")
+        db.execute("CREATE TABLE boot(id INTEGER PRIMARY KEY CHECK(id=1),protocol INTEGER NOT NULL,generation TEXT NOT NULL,good TEXT NOT NULL,previous TEXT NOT NULL,candidate_version TEXT,candidate_sha256 TEXT,candidate_attempt TEXT)")
+        db.execute("INSERT INTO boot VALUES(1,2,?,?, '',?,?,?)",
+                   (str(generation), good, candidate.parent.name if candidate else None,
+                    hashlib.sha256(candidate.read_bytes()).hexdigest() if candidate else None,
+                    "" if candidate else None))
+        db.execute("PRAGMA user_version=1")
+    temp.chmod(0o600)
     temp.replace(path)
+    (runtime / "boot.sqlite.published").write_text("CXP-SQLITE-1\n")
 
 
 def read_record(runtime: Path):
-    return json.loads((runtime / "boot.json").read_text())
+    with sqlite3.connect((runtime / "boot.sqlite").as_uri()+"?mode=ro", uri=True) as db:
+        row = db.execute("SELECT protocol,generation,good,previous,candidate_version,candidate_sha256,candidate_attempt FROM boot WHERE id=1").fetchone()
+    result = dict(schema=row[0], generation=int(row[1]), good=row[2], previous=row[3])
+    if row[4] is not None:
+        result["candidate"] = dict(version=row[4], sha256=row[5], attempt=row[6])
+    return result
 
 
 def main():
@@ -183,28 +195,28 @@ def main():
         old.quit()
         # A busy/read-only update directory must not delay ordinary startup.
         record(runtime, runtime / "versions/v3.0.0/cxp", good="v2.0.0", generation=4)
-        before = (runtime / "boot.json").read_bytes()
+        before = (runtime / "boot.sqlite").read_bytes()
         with (runtime / "runtime.lock").open("rb") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             runtime.chmod(0o555)
             (runtime / "runtime.lock").chmod(0o444)
-            (runtime / "boot.json").chmod(0o444)
+            (runtime / "boot.sqlite").chmod(0o444)
             next_window = start()
             next_window.until(next_window.interactive, "read-only/busy startup")
             next_window.quit()
-        assert before == (runtime / "boot.json").read_bytes(), "startup needed a repair write"
+        assert before == (runtime / "boot.sqlite").read_bytes(), "startup needed a repair write"
         runtime.chmod(0o755)
-        (runtime / "boot.json").chmod(0o600)
+        (runtime / "boot.sqlite").chmod(0o600)
         env["CXP_AUTO_UPDATE"] = "off"
         manual = start()
         manual.until(manual.interactive, "automatic updates disabled")
         manual.quit()
-        assert before == (runtime / "boot.json").read_bytes(), "opt-out still consumed candidate"
-        (runtime / "boot.json").write_text("{broken")
+        assert before == (runtime / "boot.sqlite").read_bytes(), "opt-out still consumed candidate"
+        (runtime / "boot.sqlite").write_text("{broken")
         base = start()
-        base.until(base.interactive, "corrupt record base fallback")
-        base.quit()
-        assert (runtime / "boot.json").read_text() == "{broken"
+        base.wait_exit(1)
+        assert b"invalid bootstrap state" in base.output, base.output[-3000:]
+        assert (runtime / "boot.sqlite").read_text() == "{broken"
     # --version succeeds for this candidate, but real startup exits before READY.
     with installed(binary) as (root, runtime, env, start):
         candidate = runtime / "versions/v2.0.0/cxp"

@@ -20,7 +20,7 @@ cannot consume or confirm a TUI trial.
 
 ## One authoritative record
 
-`boot.json` is a bounded, versioned record with a generation, a confirmed `good`
+`boot.sqlite` is a bounded native SQLite snapshot (boot protocol 2) with a generation, a confirmed `good`
 version, an optional `previous` version, and an optional candidate digest and
 attempt token. Once it exists, legacy `active`, `previous`, install records, and
 `pending-update.json` cannot select the startup version.
@@ -56,8 +56,9 @@ Before handoff, a crash or a 10-second deadline terminates the owned process tre
 restores the terminal, and starts A in the same invocation. Recovery does not
 require a successful state write, lock, cleanup, or network request. Each
 invocation makes at most one fallback attempt. If the confirmed version itself
-fails startup, its retained previous version can be used. Missing or corrupt
-records and unavailable runtime files fall back to the full bootstrap CLI.
+fails startup, its retained previous version can be used. A fresh installation without boot evidence can use the full bootstrap CLI.
+Corrupt, incompatible, or lost published boot state stops before application
+setup. An unavailable candidate instead uses the confirmed runtime.
 
 Ctrl+C and termination cancel the invocation. Errors after handoff do not replay
 the command or user input. Human setup prompts use a separate `SETUP` handoff:
@@ -79,7 +80,9 @@ asset name, size, and SHA-256. Before executing any downloaded code, the worker
 checks the complete size and digest. It then runs bounded, inert version and
 protocol probes, and publishes the immutable file before the boot record. The
 physical bootstrap must support this protocol before the first record is
-created. An older physical launcher requires an explicit installer or upgrade.
+created. An older physical launcher requires the explicit installer. Only that entry
+may import legacy boot selection; incompatible legacy rollback targets are
+not retained. Stop or isolate old writers before business-state migration.
 Safe candidate-owned upgrades preserve that bootstrap and reject candidates
 that lack the boot protocol.
 
@@ -97,7 +100,7 @@ releases must remain readable by retained fallback versions.
 
 ## Bounded I/O and failure handling
 
-Startup reads a record of at most 8 KiB and checks the selected local executable.
+Startup reads a record of at most 64 KiB and checks the selected local executable.
 It does not download, wait for an update lock, hash every confirmed executable,
 or rewrite unchanged state. A trial hashes its candidate once after its claim.
 Small record writes use a synced temporary file, platform atomic replacement,
@@ -113,7 +116,7 @@ partial download path. Before downloading it requires space for both copies plus
 64 MiB of headroom, and rechecks before installation. Insufficient or unknown
 free space defers the update. This preflight cannot reserve space against other
 processes writing concurrently. Probes have deadlines, a 16 KiB output bound, bounded pipe
-waiting, and process-tree cleanup. Diagnostics stay in bounded `auto-check.json`;
+waiting, and process-tree cleanup. Cooldown and diagnostics occupy one row in `update-state.sqlite`;
 there is no startup popup or update log stream in the TUI.
 
 The first version deliberately has no automatic deletion of published runtimes:
@@ -151,7 +154,7 @@ endpoint, real dispatcher invocations, process kills, and fresh follow-up
 starts. Production-CLI terminal tests use PTY on Linux/macOS and ConPTY on
 Windows. They exercise first-frame promotion and crash recovery through the
 actual installed entry. POSIX tests additionally cover an old live window,
-busy/read-only state, opt-out, corrupt-record fallback, Ctrl+C, and terminal
+busy/read-only state, opt-out, corrupt-record refusal, Ctrl+C, and terminal
 mode restoration.
 
 PR CI runs Linux amd64, macOS arm64 and amd64, Windows 2022 and Windows 2025,

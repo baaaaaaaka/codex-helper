@@ -91,6 +91,19 @@ func TestProgressBatchAtomicRetryAndResolution(t *testing.T) {
 		t.Fatalf("unknown heads: %+v", unknown)
 	}
 	mustT(t, s.Update(func(tx *Tx) error {
+		heads, err := tx.NextSendable(tx.Now())
+		if err != nil {
+			return err
+		}
+		if len(heads) != 1 || heads[0].DeliveryKey != "final" {
+			t.Fatalf("unknown batch blocked final: %+v", heads)
+		}
+		if _, err := tx.BeginSend(heads[0].ID); err != nil {
+			return err
+		}
+		return tx.MarkSent(heads[0].ID, "final-one")
+	}))
+	mustT(t, s.Update(func(tx *Tx) error {
 		if err := tx.MarkSent(rows[0].ID, "external-one"); err != nil {
 			return err
 		}
@@ -107,8 +120,8 @@ func TestProgressBatchAtomicRetryAndResolution(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if len(heads) != 1 || heads[0].DeliveryKey != "final" {
-			t.Fatalf("final overtook progress: %+v", heads)
+		if len(heads) != 1 || heads[0].DeliveryKey != "late" {
+			t.Fatalf("late batch resolution changed next output: %+v", heads)
 		}
 		return nil
 	}))

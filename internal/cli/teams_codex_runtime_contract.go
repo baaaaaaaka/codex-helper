@@ -34,6 +34,7 @@ func resolveTeamsCodexRuntimeContract(ctx context.Context, root *rootOptions, ra
 	if err != nil {
 		return teamsCodexRuntimeContract{}, err
 	}
+	defer store.Close()
 	paths, err = resolveEffectiveLaunchPaths(store.Path(), paths.CodexDir, workDir)
 	if err != nil {
 		return teamsCodexRuntimeContract{}, err

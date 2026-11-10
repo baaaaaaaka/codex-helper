@@ -7,7 +7,7 @@ func resolveAAAEnabled(cfg config.Config) bool {
 }
 
 func persistAAAEnabled(store *config.Store, enabled bool) error {
-	return store.Update(func(cfg *config.Config) error {
+	return store.ChangeSettings(func(cfg *config.Config) error {
 		cfg.AgentAutoApproveEnabled = &enabled
 		return nil
 	})

@@ -30,10 +30,6 @@ func Execute() int {
 		}
 		return 0
 	}
-	if err := legacyUpdaterVersionPreflight(); err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "Error: helper update compatibility check failed: %v\n", err)
-		return 1
-	}
 	cmd := newRootCmd()
 	return exitCodeFor(cmd.Execute())
 }

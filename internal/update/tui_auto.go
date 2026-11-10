@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
+	"github.com/baaaaaaaka/codex-helper/internal/updatestate"
 	"github.com/gofrs/flock"
 	"golang.org/x/mod/semver"
 )
@@ -72,11 +73,7 @@ func VerifyTUIManifest(raw []byte, repo string, now time.Time) (TUIManifest, err
 	return m, nil
 }
 
-type tuiCheckState struct {
-	Next      time.Time `json:"next"`
-	Failures  int       `json:"failures,omitempty"`
-	LastError string    `json:"last_error,omitempty"`
-}
+type tuiCheckState = updatestate.Check
 
 type tuiRateLimit struct {
 	next   time.Time
@@ -99,14 +96,14 @@ func checkAndStageTUI(ctx context.Context, current helperruntime.Context, endpoi
 		return err
 	}
 	defer l.Unlock()
-	statePath := filepath.Join(current.Root, "auto-check.json")
-	var state tuiCheckState
-	if f, err := os.Open(statePath); err == nil {
-		_ = json.NewDecoder(io.LimitReader(f, 8192)).Decode(&state)
-		_ = f.Close()
+	store, err := updatestate.Open(current.Root)
+	if err != nil {
+		return err
 	}
-	if state.Failures < 0 || state.Failures > 6 {
-		state.Failures = 0
+	defer store.Close()
+	state, err := store.Check()
+	if err != nil {
+		return err
 	}
 	if now.Before(state.Next) && state.Next.Before(now.Add(25*time.Hour)) {
 		return nil
@@ -118,13 +115,7 @@ func checkAndStageTUI(ctx context.Context, current helperruntime.Context, endpoi
 	// Persist the cooldown before sending any request. A read-only/full state
 	// directory must not turn many old windows into a retry storm.
 	state.Next = now.Add(DefaultAutoUpdateCheckInterval)
-	save := func() error {
-		b, err := json.Marshal(state)
-		if err != nil {
-			return err
-		}
-		return helperruntime.WriteAtomicState(current.Root, "auto-check.json", b)
-	}
+	save := func() error { return store.SaveCheck(state) }
 	if err := save(); err != nil {
 		return err
 	}
@@ -283,13 +274,10 @@ func stageTUIRelease(ctx context.Context, current helperruntime.Context, base st
 	if err := helperruntime.ProbeProtocol(ctx, path); err != nil {
 		return err
 	}
-	if _, err := helperruntime.ReadBoot(current.Root); errors.Is(err, os.ErrNotExist) {
-		// A new runtime may still have been launched by an older physical
-		// dispatcher. Never publish a record that dispatcher cannot read.
-		if err := helperruntime.ProbeProtocol(ctx, current.EntryPath); err != nil {
-			return fmt.Errorf("safe boot requires a current installed launcher: %w", err)
-		}
-	} else if err != nil {
+	if err := helperruntime.ProbeProtocol(ctx, current.EntryPath); err != nil {
+		return fmt.Errorf("safe boot requires a current installed launcher: %w", err)
+	}
+	if _, err := helperruntime.ReadBoot(current.Root); err != nil {
 		return err
 	}
 	if err := checkTUIDiskSpace(current.Root, asset.Size); err != nil {

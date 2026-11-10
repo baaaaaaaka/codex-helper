@@ -21,6 +21,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/core/internal/leakcheck"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakecodex"
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
+	"github.com/baaaaaaaka/codex-helper/internal/sqlitestate"
 )
 
 const envFake = "CODEXAGENT_TEST_FAKE_CODEX"
@@ -75,18 +76,12 @@ func TestUnknownStartErrorKillsTheServer(t *testing.T) {
 	var pid int
 	_, err = a.Run(ctx, engine.TurnRequest{ConvID: 1, Cwd: home, TurnKey: "k-1", Text: "hello"}, engine.TurnHooks{
 		ThreadStarted: func(string) error {
-			data, err := os.ReadFile(pidFile)
+			db, err := sqlitestate.Open(pidFile+".sqlite", true)
 			if err != nil {
 				return err
 			}
-			var recs []struct {
-				PID int `json:"pid"`
-			}
-			if err := json.Unmarshal(data, &recs); err != nil || len(recs) != 1 {
-				return errors.New("pid file: " + string(data))
-			}
-			pid = recs[0].PID
-			return nil
+			defer db.Close()
+			return db.QueryRow(`SELECT pid FROM app_servers`).Scan(&pid)
 		},
 	})
 	if !errors.Is(err, engine.ErrUnknownOutcome) {

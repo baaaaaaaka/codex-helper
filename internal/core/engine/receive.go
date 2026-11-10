@@ -843,6 +843,7 @@ func (e *Engine) classify(tx *store.Tx, conv int64, kind string, group bool, m c
 				if err := tx.MarkSent(r.ID, m.ID); err != nil {
 					return c, false, err
 				}
+				tx.NotificationDeliveryChanged(r.ConvID, r.DeliveryKey)
 				if err := e.forkSettled(tx, r); err != nil { // fork.go
 					return c, false, err
 				}

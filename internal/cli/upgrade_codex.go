@@ -58,6 +58,7 @@ func runUpgradeCodexFromRoot(cmd *cobra.Command, root *rootOptions) error {
 	if err != nil {
 		return fmt.Errorf("open config store: %w", err)
 	}
+	defer store.Close()
 	cfg, err := store.Load()
 	if err != nil {
 		return err

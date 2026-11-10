@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -37,7 +38,10 @@ func TestRunCodexSessionAttachesBeforeOpeningAnotherWriter(t *testing.T) {
 	testSharedTUILaunch(t, "resume")
 }
 func TestRunCodexNewSessionUsesSharedBackend(t *testing.T) { testSharedTUILaunch(t, "new") }
-func TestRunCodexForkAttachesAfterCreation(t *testing.T)   { testSharedTUILaunch(t, "fork") }
+func TestRunCodexSessionRefusesMissingLiveHelperEndpoint(t *testing.T) {
+	testSharedTUILaunch(t, "missing")
+}
+func TestRunCodexForkAttachesAfterCreation(t *testing.T) { testSharedTUILaunch(t, "fork") }
 func testSharedTUILaunch(t *testing.T, mode string) {
 	fixture := writeCodexTUIBrokerFixture(t)
 	cfg := newCodexOpenTestStore(t)
@@ -64,11 +68,14 @@ func testSharedTUILaunch(t *testing.T, mode string) {
 		t.Fatal(err)
 	}
 	target := &sharedTUIFixture{released: make(chan struct{}), done: make(chan struct{})}
-	server, err := tuilease.Listen(teamsTUIEndpointPath(anchor, host), os.Getenv("CODEX_HOME"), target, nil)
-	if err != nil {
-		t.Fatal(err)
+	if mode != "missing" {
+		server, err := tuilease.Listen(teamsTUIEndpointPath(anchor, host), os.Getenv("CODEX_HOME"), target, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer server.Close()
 	}
-	defer server.Close()
+
 	// The existing backend has its own SQLite home. The TUI fixture waits
 	// for this file, but must never start another app-server or migration.
 	if err = os.WriteFile(fixture.appSQLiteHome, []byte("existing backend"), 0600); err != nil {
@@ -89,6 +96,17 @@ func testSharedTUILaunch(t *testing.T, mode string) {
 		}, io.Discard)
 	} else {
 		err = runCodexSession(context.Background(), &rootOptions{configPath: cfg.Path()}, cfg, &config.Profile{Name: "shared"}, nil, codexhistory.Session{SessionID: thread, ProjectPath: fixture.workDir}, codexhistory.Project{Path: fixture.workDir}, fixture.path, "", true, io.Discard)
+	}
+	if mode == "missing" {
+		if err == nil || !strings.Contains(err.Error(), "compatible TUI endpoint") {
+			t.Fatalf("missing live endpoint fell back: %v", err)
+		}
+		for _, path := range []string{fixture.migrationArgs, fixture.appServerArgs, fixture.tuiArgs} {
+			if _, err := os.Stat(path); !os.IsNotExist(err) {
+				t.Fatalf("opened another writer: %s %v", path, err)
+			}
+		}
+		return
 	}
 	if err != nil {
 		t.Fatal(err)

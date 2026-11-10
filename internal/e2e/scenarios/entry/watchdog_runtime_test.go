@@ -66,14 +66,13 @@ func testWatchdogRuntime(t *testing.T, tc watchdogRuntimeCase) {
 			}
 		}
 	}
-	// Set the documented runtime pointer atomically as an installer does.
-	// Keep this fixture independent of the product runtime implementation.
+	var generation uint64
+	previous := ""
 	activate := func(version string) error {
-		tmp := filepath.Join(root, "active.next")
-		if err := os.WriteFile(tmp, []byte(version+"\n"), 0o600); err != nil {
-			return err
-		}
-		return os.Rename(tmp, filepath.Join(root, "active"))
+		generation++
+		err := publishBootFixture(root, version, previous, generation)
+		previous = version
+		return err
 	}
 	if err := activate("v9.9.0"); err != nil {
 		t.Fatal(err)

@@ -19,32 +19,15 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 	"github.com/baaaaaaaka/codex-helper/internal/managedinstall"
-	"golang.org/x/mod/semver"
+	"github.com/baaaaaaaka/codex-helper/internal/updatestate"
 )
 
 const (
-	ProtocolVersion      = 1
-	InternalCommand      = "__internal-update-apply"
-	PendingFileName      = "pending-update.json"
-	firstProtocolVersion = "v0.1.13-rc.36"
+	ProtocolVersion = 1
+	InternalCommand = "__internal-update-apply"
 )
 
-func SupportsProtocol(version string) bool {
-	normalized, ok := helperruntime.NormalizeVersion(version)
-	return ok && semver.Compare(normalized, firstProtocolVersion) >= 0
-}
-
-type Context struct {
-	Schema          int    `json:"schema"`
-	CandidatePath   string `json:"candidate_path"`
-	CandidateSHA256 string `json:"candidate_sha256"`
-	SourceVersion   string `json:"source_version,omitempty"`
-	TargetVersion   string `json:"target_version"`
-	RuntimeRoot     string `json:"runtime_root"`
-	EntryPath       string `json:"entry_path"`
-	RecordPath      string `json:"record_path,omitempty"`
-	RequestID       string `json:"request_id"`
-}
+type Context = updatestate.Invocation
 
 type Result struct {
 	Version         string `json:"version"`
@@ -52,42 +35,10 @@ type Result struct {
 	EntryPath       string `json:"entry_path"`
 	RestartRequired bool   `json:"restart_required"`
 	Noop            bool   `json:"noop,omitempty"`
-
-	// stableEntryRepair is deliberately kept out of the candidate-update ABI.
-	// On Windows the stable cxp.exe can still be held by the launcher that
-	// started the current immutable runtime. In that case reconcileLocked
-	// records enough state for the current process to arm a post-parent repair
-	// worker before it returns the JSON result to its caller.
-	stableEntryRepair *stableEntryRepair `json:"-"`
 }
 
-type stableEntryRepair struct {
-	SourcePath            string
-	TargetPath            string
-	ExpectedCurrentSHA256 string
-	SourceSHA256          string
-}
-
-var (
-	replaceManagedStableEntryFn = replaceManagedStableEntry
-	// candidateExecutablePath is injectable only so the candidate-owned state
-	// transition can be tested with a real executable fixture. In production it
-	// always resolves the candidate process itself, never an inherited stable
-	// entry or the caller's executable path.
-	candidateExecutablePath = helperpath.RawExecutable
-)
-
-type Pending struct {
-	Schema         int    `json:"schema"`
-	TargetVersion  string `json:"target_version"`
-	TargetSHA256   string `json:"target_sha256"`
-	PreviousActive string `json:"previous_active,omitempty"`
-	TargetActive   string `json:"target_active"`
-	RuntimeRoot    string `json:"runtime_root"`
-	EntryPath      string `json:"entry_path"`
-	RecordPath     string `json:"record_path,omitempty"`
-	RequestID      string `json:"request_id"`
-}
+// Resolves the executing candidate, never a stable launcher inherited from its parent.
+var candidateExecutablePath = helperpath.RawExecutable
 
 // Invoke asks a downloaded candidate to own the managed-runtime state
 // transition. The caller remains responsible only for download, validation,
@@ -97,12 +48,16 @@ func Invoke(ctx context.Context, candidate string, request Context, timeout time
 	if candidate == "" || candidate == "." {
 		return Result{}, fmt.Errorf("candidate path is empty")
 	}
-	if _, err := helperruntime.ReadBoot(request.RuntimeRoot); err == nil {
-		if err := helperruntime.ProbeProtocol(ctx, candidate); err != nil {
-			return Result{}, err
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
+	// Probe both executable ABIs before creating invocation or installation
+	// state. An incompatible physical dispatcher needs the explicit installer.
+	if err := helperruntime.ProbeProtocol(ctx, candidate); err != nil {
 		return Result{}, err
+	}
+	if err := helperruntime.ProbeProtocol(ctx, request.EntryPath); err != nil {
+		return Result{}, err
+	}
+	if _, err := helperruntime.ReadBoot(request.RuntimeRoot); err != nil {
+		return Result{}, fmt.Errorf("%w: %v", helperruntime.ErrBootstrapState, err)
 	}
 	request.Schema = ProtocolVersion
 	request.CandidatePath = candidate
@@ -117,7 +72,7 @@ func Invoke(ctx context.Context, candidate string, request Context, timeout time
 	if err != nil {
 		return Result{}, err
 	}
-	defer os.Remove(contextPath)
+	defer deleteInvocationContext(contextPath, request.RequestID)
 
 	cmdCtx := ctx
 	cancel := func() {}
@@ -125,7 +80,7 @@ func Invoke(ctx context.Context, candidate string, request Context, timeout time
 		cmdCtx, cancel = context.WithTimeout(ctx, timeout)
 	}
 	defer cancel()
-	cmd := exec.CommandContext(cmdCtx, candidate, InternalCommand, "--protocol=1", "--context-file="+contextPath)
+	cmd := exec.CommandContext(cmdCtx, candidate, InternalCommand, "--protocol=2", "--state-db="+contextPath, "--request-id="+request.RequestID)
 	cmd.Env = append(helperruntime.LauncherEnvironment(os.Environ()), helperruntime.EnvDisable+"=1")
 	var stdout bytes.Buffer
 	var stderr bytes.Buffer
@@ -149,22 +104,25 @@ func HandleInternalCommand(args []string, buildVersion string, stdout io.Writer,
 	}
 	protocol := ""
 	contextPath := ""
+	requestID := ""
 	for _, arg := range args[2:] {
 		switch {
 		case strings.HasPrefix(arg, "--protocol="):
 			protocol = strings.TrimPrefix(arg, "--protocol=")
-		case strings.HasPrefix(arg, "--context-file="):
-			contextPath = strings.TrimPrefix(arg, "--context-file=")
+		case strings.HasPrefix(arg, "--state-db="):
+			contextPath = strings.TrimPrefix(arg, "--state-db=")
+		case strings.HasPrefix(arg, "--request-id="):
+			requestID = strings.TrimPrefix(arg, "--request-id=")
 		default:
 			_, _ = fmt.Fprintf(stderr, "candidate update: unsupported argument %q\n", arg)
 			return 2, true
 		}
 	}
-	if protocol != "1" || strings.TrimSpace(contextPath) == "" {
-		_, _ = fmt.Fprintln(stderr, "candidate update: protocol=1 and context-file are required")
+	if protocol != "2" || strings.TrimSpace(contextPath) == "" || requestID == "" {
+		_, _ = fmt.Fprintln(stderr, "candidate update: protocol=2, state-db and request-id are required")
 		return 2, true
 	}
-	request, err := readContext(contextPath)
+	request, err := readContext(contextPath, requestID)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "candidate update: %v\n", err)
 		return 1, true
@@ -196,6 +154,12 @@ func Apply(ctx context.Context, request Context, buildVersion string) (Result, e
 	if !strings.EqualFold(actualHash, strings.TrimSpace(request.CandidateSHA256)) {
 		return Result{}, fmt.Errorf("candidate sha256 = %s, want %s", actualHash, request.CandidateSHA256)
 	}
+	if err := helperruntime.ProbeProtocol(ctx, request.EntryPath); err != nil {
+		return Result{}, err
+	}
+	if _, err := helperruntime.ReadBoot(request.RuntimeRoot); err != nil {
+		return Result{}, fmt.Errorf("%w: %v", helperruntime.ErrBootstrapState, err)
+	}
 	var result Result
 	err = helperruntime.WithRootLock(ctx, request.RuntimeRoot, func() error {
 		// Validate the final immutable path before changing any launcher or
@@ -208,162 +172,44 @@ func Apply(ctx context.Context, request Context, buildVersion string) (Result, e
 			return err
 		}
 		var reconcileErr error
-		result, reconcileErr = reconcileLocked(request, executable, false)
+		result, reconcileErr = reconcileLocked(request, executable)
 		return reconcileErr
 	})
 	if err != nil {
 		return Result{}, err
 	}
-	// The immutable runtime is the durable object that the parent will activate
-	// and use after restart. Do not probe request.EntryPath here: it may be an
-	// older stable launcher or a user-preserved shim that is intentionally not
-	// rewritten during this transition. The parent independently verifies the
-	// active pointer, expected runtime path, and regular-file state.
-	if err := scheduleDeferredStableEntryRepair(result); err != nil {
-		return Result{}, err
-	}
 	return result, nil
 }
 
-// ResumePending converges an interrupted candidate-owned update from the
-// active runtime itself. It is safe to call on every managed-runtime startup.
-func ResumePending(ctx context.Context, currentVersion string) error {
+// CheckNativeBootstrap checks admission without replaying old pending intent.
+func CheckNativeBootstrap() error {
 	current, ok := helperruntime.Current()
 	if !ok {
 		return nil
 	}
-	// boot.json is the sole authority once safe boot is enabled. A legacy
-	// pending marker must never re-activate a rejected automatic candidate.
-	if _, err := helperruntime.ReadBoot(current.Root); err == nil {
-		return nil
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	pendingPath := filepath.Join(current.Root, PendingFileName)
-	pending, err := readPending(pendingPath)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
+	// Native boot is the sole authority. Legacy pending intent cannot replay
+	// after an explicit protocol upgrade, including a lost native database.
+	_, err := helperruntime.ReadBoot(current.Root)
 	if err != nil {
-		return err
+		return fmt.Errorf("%w: %v", helperruntime.ErrBootstrapState, err)
 	}
-	want, ok := helperruntime.NormalizeVersion(pending.TargetVersion)
-	if !ok {
-		return fmt.Errorf("pending update has invalid target version %q", pending.TargetVersion)
-	}
-	got, ok := helperruntime.NormalizeVersion(currentVersion)
-	if !ok {
-		return nil
-	}
-	previous, previousOK := helperruntime.NormalizeVersion(pending.PreviousActive)
-	if got != want && (!previousOK || got != previous) {
-		return nil
-	}
-	request := Context{
-		Schema:          ProtocolVersion,
-		CandidatePath:   pending.TargetActive,
-		CandidateSHA256: pending.TargetSHA256,
-		SourceVersion:   pending.PreviousActive,
-		TargetVersion:   pending.TargetVersion,
-		RuntimeRoot:     pending.RuntimeRoot,
-		EntryPath:       pending.EntryPath,
-		RecordPath:      pending.RecordPath,
-		RequestID:       pending.RequestID,
-	}
-	if !samePath(request.RuntimeRoot, current.Root) || !samePath(request.EntryPath, current.EntryPath) {
-		return fmt.Errorf("pending update belongs to a different managed runtime")
-	}
-	if err := validateStateContext(request); err != nil {
-		return fmt.Errorf("validate pending update: %w", err)
-	}
-	expectedTarget := helperruntime.VersionPath(current.Root, want, runtime.GOOS)
-	if !samePath(pending.TargetActive, expectedTarget) {
-		return fmt.Errorf("pending update target %s does not match managed runtime %s", pending.TargetActive, expectedTarget)
-	}
-	return helperruntime.WithRootLock(ctx, current.Root, func() error {
-		latest, err := readPending(pendingPath)
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		if err != nil {
-			return err
-		}
-		if latest.RequestID != pending.RequestID || latest.TargetVersion != pending.TargetVersion {
-			return nil
-		}
-		active, err := helperruntime.ReadActive(current.Root)
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("read active runtime during pending recovery: %w", err)
-		}
-		if err == nil && active != got && active != want {
-			return nil
-		}
-		targetHash, err := fileSHA256(expectedTarget)
-		if err != nil {
-			return fmt.Errorf("hash pending update target: %w", err)
-		}
-		if !strings.EqualFold(targetHash, pending.TargetSHA256) {
-			return fmt.Errorf("pending update target sha256 = %s, want %s", targetHash, pending.TargetSHA256)
-		}
-		result, err := reconcileLocked(request, pending.TargetActive, true)
-		if err != nil {
-			return err
-		}
-		if err := scheduleDeferredStableEntryRepair(result); err != nil {
-			return err
-		}
-		if err := os.Remove(pendingPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return fmt.Errorf("remove completed pending update: %w", err)
-		}
-		return syncDirectory(current.Root)
-	})
+	return nil
 }
 
-func reconcileLocked(request Context, source string, resuming bool) (Result, error) {
-	_, bootErr := helperruntime.ReadBoot(request.RuntimeRoot)
-	bootManaged := bootErr == nil
-	if bootErr != nil && !errors.Is(bootErr, os.ErrNotExist) {
-		return Result{}, bootErr
+func reconcileLocked(request Context, source string) (Result, error) {
+	boot, err := helperruntime.ReadBoot(request.RuntimeRoot)
+	if err != nil {
+		return Result{}, fmt.Errorf("%w: %v", helperruntime.ErrBootstrapState, err)
 	}
 	targetVersion, _ := helperruntime.NormalizeVersion(request.TargetVersion)
-	targetPath := helperruntime.VersionPath(request.RuntimeRoot, targetVersion, runtime.GOOS)
-	if targetPath == "" {
-		return Result{}, fmt.Errorf("derive target runtime path")
-	}
-	previous := ""
-	entryRuntimeVersion := ""
-	if active, err := helperruntime.ReadActive(request.RuntimeRoot); err == nil {
-		previous = active
-		entryRuntimeVersion = active
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return Result{}, fmt.Errorf("read active runtime: %w", err)
-	}
-	if source := strings.TrimSpace(request.SourceVersion); source != "" {
-		normalizedSource, ok := helperruntime.NormalizeVersion(source)
+	if sourceVersion := strings.TrimSpace(request.SourceVersion); sourceVersion != "" {
+		normalizedSource, ok := helperruntime.NormalizeVersion(sourceVersion)
 		if !ok {
-			return Result{}, fmt.Errorf("invalid source version %q", request.SourceVersion)
+			return Result{}, fmt.Errorf("invalid source version %q", sourceVersion)
 		}
-		if previous == "" {
-			return Result{}, fmt.Errorf("active runtime %s disappeared while preparing %s", normalizedSource, targetVersion)
+		if boot.Good != normalizedSource && boot.Good != targetVersion {
+			return Result{}, fmt.Errorf("active runtime changed from %s to %s while preparing %s", normalizedSource, boot.Good, targetVersion)
 		}
-		if previous != normalizedSource && previous != targetVersion {
-			return Result{}, fmt.Errorf("active runtime changed from %s to %s while preparing %s", normalizedSource, previous, targetVersion)
-		}
-		// During pending recovery active may already be the target while the
-		// stable entry is still owned by the previous runtime. Validate and
-		// repair that entry against the pending source, not against active.
-		entryRuntimeVersion = normalizedSource
-	}
-	pending := Pending{
-		Schema:         ProtocolVersion,
-		TargetVersion:  targetVersion,
-		TargetSHA256:   strings.ToLower(strings.TrimSpace(request.CandidateSHA256)),
-		PreviousActive: previous,
-		TargetActive:   targetPath,
-		RuntimeRoot:    request.RuntimeRoot,
-		EntryPath:      request.EntryPath,
-		RecordPath:     request.RecordPath,
-		RequestID:      request.RequestID,
 	}
 	installed, err := helperruntime.InstallVersion(request.RuntimeRoot, source, targetVersion, runtime.GOOS, false)
 	if err != nil {
@@ -371,80 +217,14 @@ func reconcileLocked(request Context, source string, resuming bool) (Result, err
 	}
 	installedHash, err := fileSHA256(installed)
 	if err != nil {
-		return Result{}, fmt.Errorf("hash immutable runtime: %w", err)
+		return Result{}, err
 	}
 	if !strings.EqualFold(installedHash, request.CandidateSHA256) {
 		return Result{}, fmt.Errorf("immutable runtime sha256 = %s, want %s", installedHash, request.CandidateSHA256)
 	}
-	_, entryStatErr := os.Lstat(request.EntryPath)
-	entryWasPresent := entryStatErr == nil
-	if entryStatErr != nil && !errors.Is(entryStatErr, os.ErrNotExist) {
-		return Result{}, fmt.Errorf("inspect stable cxp entry: %w", entryStatErr)
-	}
-	if bootManaged {
-		if !entryWasPresent {
-			return Result{}, fmt.Errorf("safe boot entry is missing; restore it with the installer")
-		}
-	} else if err := helperruntime.EnsureStableEntry(installed, request.EntryPath, runtime.GOOS); err != nil {
-		return Result{}, fmt.Errorf("ensure stable cxp entry: %w", err)
-	}
-	// A first install with no prior active runtime may be upgrading an
-	// explicitly supplied, user-owned entry. Do not overwrite that entry. Once
-	// a managed runtime already owns the profile, refresh only the physical
-	// launcher that still contains that runtime. The same rule applies when
-	// resuming a first-install pending marker.
-	var deferredRepair *stableEntryRepair
-	// A Windows legacy bridge may be running the candidate as a child of the
-	// previous immutable runtime. Once that child has activated the target,
-	// rewriting cxp.exe during ResumePending is both unnecessary and unsafe:
-	// the old launcher is still the parent-owned entry and already dispatches
-	// through the active pointer. Leave physical-entry repair to the normal
-	// post-parent/managed repair path; only non-resuming updates may refresh it
-	// synchronously here.
-	deferWindowsResumeEntryRepair := runtime.GOOS == "windows" && resuming && previous == targetVersion
-	if !bootManaged && previous != "" && entryWasPresent && !deferWindowsResumeEntryRepair && (strings.TrimSpace(request.SourceVersion) != "" || !resuming) {
-		previousRuntime := helperruntime.VersionPath(request.RuntimeRoot, entryRuntimeVersion, runtime.GOOS)
-		entryAlreadyContainsCandidate := false
-		if target, targetErr := stableEntryTargetPath(request.EntryPath, request.RuntimeRoot); targetErr != nil {
-			return Result{}, fmt.Errorf("inspect managed stable cxp entry: %w", targetErr)
-		} else if same, sameErr := sameFileContent(target, installed); sameErr == nil && same {
-			entryAlreadyContainsCandidate = true
-		} else if sameErr != nil && !errors.Is(sameErr, os.ErrNotExist) {
-			return Result{}, fmt.Errorf("compare managed stable cxp entry with candidate: %w", sameErr)
-		}
-		if !entryAlreadyContainsCandidate {
-			plan, err := prepareManagedStableEntryRepair(request.EntryPath, previousRuntime, request.RuntimeRoot, request.RecordPath)
-			if err != nil {
-				return Result{}, fmt.Errorf("inspect managed stable cxp entry: %w", err)
-			}
-			if err := replaceManagedStableEntryFn(source, request.EntryPath, previousRuntime, request.RuntimeRoot, request.RecordPath); err != nil {
-				if !shouldDeferStableEntryRepair(err) {
-					return Result{}, fmt.Errorf("refresh managed stable cxp entry: %w", err)
-				}
-				// The immutable runtime is the durable source for the worker. The
-				// downloaded candidate is removed by update.PerformUpdate as soon
-				// as Invoke returns.
-				deferredRepair = &stableEntryRepair{
-					SourcePath:            installed,
-					TargetPath:            plan.TargetPath,
-					ExpectedCurrentSHA256: plan.ExpectedCurrentSHA256,
-					SourceSHA256:          installedHash,
-				}
-			}
-		}
-	}
-	// Publish recovery intent only after the immutable target and stable entry
-	// are usable. A previous runtime can then safely finish the transition if
-	// this candidate exits before switching active.
-	if !bootManaged && !resuming {
-		if err := writePending(filepath.Join(request.RuntimeRoot, PendingFileName), pending); err != nil {
-			return Result{}, err
-		}
-	}
-	if !bootManaged && previous != "" && previous != targetVersion {
-		if err := helperruntime.SetPrevious(request.RuntimeRoot, previous); err != nil {
-			return Result{}, fmt.Errorf("record previous runtime: %w", err)
-		}
+	info, err := os.Stat(request.EntryPath)
+	if err != nil || !info.Mode().IsRegular() {
+		return Result{}, fmt.Errorf("safe boot entry is missing or invalid; restore it with the installer: %v", err)
 	}
 	if err := helperruntime.Activate(request.RuntimeRoot, targetVersion); err != nil {
 		return Result{}, fmt.Errorf("activate target runtime: %w", err)
@@ -452,57 +232,7 @@ func reconcileLocked(request Context, source string, resuming bool) (Result, err
 	if err := updateInstallRecord(request, targetVersion); err != nil {
 		return Result{}, err
 	}
-	return Result{
-		Version:     strings.TrimPrefix(targetVersion, "v"),
-		RuntimePath: installed,
-		EntryPath:   request.EntryPath,
-		// Managed runtimes are already activated atomically. The caller still
-		// performs its normal service restart, but no file replacement is
-		// pending and the legacy RestartRequired path must not be selected.
-		RestartRequired:   false,
-		Noop:              previous == targetVersion,
-		stableEntryRepair: deferredRepair,
-	}, nil
-}
-
-// replaceManagedStableEntry updates the physical managed launcher while
-// preserving a user-authored shim or multi-hop symlink around it. The current
-// entry must still contain the runtime that owns this update; otherwise the
-// updater fails closed rather than overwriting an unrelated executable.
-func replaceManagedStableEntry(candidate string, entry string, runningRuntime string, root string, recordPath string) error {
-	plan, err := prepareManagedStableEntryRepair(entry, runningRuntime, root, recordPath)
-	if err != nil {
-		return err
-	}
-	if same, err := sameFileContent(candidate, plan.TargetPath); err == nil && same {
-		return nil
-	}
-	if err := copyExecutableAtomically(candidate, plan.TargetPath, plan.ExpectedCurrentSHA256); err != nil {
-		return err
-	}
-	actualHash, err := fileSHA256(plan.TargetPath)
-	if err != nil {
-		return fmt.Errorf("verify managed stable entry: %w", err)
-	}
-	candidateHash, err := fileSHA256(candidate)
-	if err != nil {
-		return fmt.Errorf("hash candidate after stable entry replacement: %w", err)
-	}
-	if !strings.EqualFold(actualHash, candidateHash) {
-		return fmt.Errorf("managed stable entry hash = %s, want candidate %s", actualHash, candidateHash)
-	}
-	return nil
-}
-
-func prepareManagedStableEntryRepair(entry string, runningRuntime string, root string, recordPath string) (stableEntryRepair, error) {
-	target, expectedHash, err := managedStableReplacementTarget(entry, runningRuntime, root, recordPath)
-	if err != nil {
-		return stableEntryRepair{}, err
-	}
-	return stableEntryRepair{
-		TargetPath:            target,
-		ExpectedCurrentSHA256: expectedHash,
-	}, nil
+	return Result{Version: strings.TrimPrefix(targetVersion, "v"), RuntimePath: installed, EntryPath: request.EntryPath, Noop: boot.Good == targetVersion}, nil
 }
 
 func validateContext(request Context, buildVersion string) error {
@@ -603,123 +333,35 @@ func verifyImmutableRuntime(ctx context.Context, runtimePath string, targetVersi
 	return fmt.Errorf("immutable runtime version output %q does not contain %s", strings.TrimSpace(string(out)), normalizedTarget)
 }
 
-func readContext(path string) (Context, error) {
-	var request Context
-	info, err := os.Lstat(path)
+func readContext(path, id string) (Context, error) {
+	if filepath.Base(path) != updatestate.Filename {
+		return Context{}, fmt.Errorf("invalid update state database path")
+	}
+	store, err := updatestate.OpenRead(filepath.Dir(path))
 	if err != nil {
-		return request, fmt.Errorf("inspect context: %w", err)
+		return Context{}, err
 	}
-	if !info.Mode().IsRegular() {
-		return request, fmt.Errorf("context is not a regular file")
-	}
-	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
-		return request, fmt.Errorf("context permissions %04o expose update state", info.Mode().Perm())
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return request, fmt.Errorf("read context: %w", err)
-	}
-	if err := json.Unmarshal(data, &request); err != nil {
-		return request, fmt.Errorf("decode context: %w", err)
-	}
-	return request, nil
+	defer store.Close()
+	return store.Invocation(id)
 }
-
 func writeInvocationContext(candidate string, request Context) (string, error) {
-	dir := filepath.Dir(candidate)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", err
-	}
-	f, err := os.CreateTemp(dir, ".cxp-update-context-")
+	store, err := updatestate.Open(request.RuntimeRoot)
 	if err != nil {
-		return "", fmt.Errorf("create candidate update context: %w", err)
-	}
-	path := f.Name()
-	cleanup := true
-	defer func() {
-		_ = f.Close()
-		if cleanup {
-			_ = os.Remove(path)
-		}
-	}()
-	if err := f.Chmod(0o600); err != nil {
 		return "", err
 	}
-	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(request); err != nil {
+	defer store.Close()
+	if err = store.SaveInvocation(request); err != nil {
 		return "", err
 	}
-	if err := f.Sync(); err != nil {
-		return "", err
-	}
-	if err := f.Close(); err != nil {
-		return "", err
-	}
-	cleanup = false
-	return path, nil
+	return filepath.Join(request.RuntimeRoot, updatestate.Filename), nil
 }
-
-func readPending(path string) (Pending, error) {
-	var pending Pending
-	info, err := os.Lstat(path)
+func deleteInvocationContext(path, id string) error {
+	store, err := updatestate.Open(filepath.Dir(path))
 	if err != nil {
-		return pending, err
-	}
-	if !info.Mode().IsRegular() {
-		return pending, fmt.Errorf("pending update %s is not a regular file", path)
-	}
-	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
-		return pending, fmt.Errorf("pending update %s permissions %04o are unsafe", path, info.Mode().Perm())
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return pending, err
-	}
-	if err := json.Unmarshal(data, &pending); err != nil {
-		return pending, fmt.Errorf("decode pending update %s: %w", path, err)
-	}
-	if pending.Schema != ProtocolVersion {
-		return pending, fmt.Errorf("pending update schema = %d, want %d", pending.Schema, ProtocolVersion)
-	}
-	return pending, nil
-}
-
-func writePending(path string, pending Pending) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	f, err := os.CreateTemp(filepath.Dir(path), ".pending-update-")
-	if err != nil {
-		return fmt.Errorf("create pending update: %w", err)
-	}
-	tmp := f.Name()
-	cleanup := true
-	defer func() {
-		_ = f.Close()
-		if cleanup {
-			_ = os.Remove(tmp)
-		}
-	}()
-	if err := f.Chmod(0o600); err != nil {
-		return err
-	}
-	enc := json.NewEncoder(f)
-	enc.SetIndent("", "  ")
-	if err := enc.Encode(pending); err != nil {
-		return err
-	}
-	if err := f.Sync(); err != nil {
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	if err := replaceStateFile(tmp, path); err != nil {
-		return fmt.Errorf("publish pending update: %w", err)
-	}
-	cleanup = false
-	return syncDirectory(filepath.Dir(path))
+	defer store.Close()
+	return store.DeleteInvocation(id)
 }
 
 func fileSHA256(path string) (string, error) {

@@ -185,7 +185,7 @@
    prompt| - control_chat_id: `<chat:1>`
    prompt|
    prompt| Control chat context:
-   prompt| - local_history_file: `<root>/home/.local/state/codex-helper/teams/control-chat-history.jsonl`
+   prompt| - local_history_file: `<root>/home/.local/state/codex-helper/teams/control-chat-history.txt`
    prompt|   Read this file only if the current user message appears to need older control-chat context.
    prompt| - recent_control_chat_history:
    prompt|   - <time> helper/notice:

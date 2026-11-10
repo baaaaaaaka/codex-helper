@@ -16,8 +16,7 @@ const (
 	metaMirrorInit     = "engine_mirror_initialized"
 	metaRealignPrefix  = "engine_realign:" // + source id: unix ms of the realign point while a rewritten rollout is re-read
 	metaRehashed       = "engine_legacy_rehashed"
-	metaRestart        = "engine_restart_confirm" // "<conv>:<inbound>:<quote>" of a pending `helper restart`
-	metaInbox          = "engine_inbox_conv"      // conversation id of the delegation inbox
+	metaInbox          = "engine_inbox_conv" // conversation id of the delegation inbox
 	// metaDiscoveredPrefix + conversation id: a work conversation the
 	// mirror created for a local session discovered on disk, until its
 	// chat is created (no `new` notices, no control-chat notice):

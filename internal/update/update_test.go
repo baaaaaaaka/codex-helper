@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -329,13 +330,16 @@ func TestPerformUpdateExplicitVersion(t *testing.T) {
 
 func TestPerformUpdatePublishesImmutableRuntimeAndSwitchesActive(t *testing.T) {
 	requireRuntimeAsset(t)
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX protocol fixture; native update covered by boot E2E")
+	}
 	tag := "v1.2.6"
 	ver := "1.2.6"
 	asset, err := assetName(ver, runtime.GOOS, runtime.GOARCH)
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload := []byte("runtime-v1.2.6")
+	payload := []byte("#!/bin/sh\nif [ \"${1-}\" = \"--cxp-boot-protocol\" ]; then echo 2; else echo \"cxp version 1.2.6\"; fi\n")
 	server := newReleaseServer(t, tag, asset, payload)
 	defer server.Close()
 	restore := overrideGitHubBases(server.URL)
@@ -344,7 +348,14 @@ func TestPerformUpdatePublishesImmutableRuntimeAndSwitchesActive(t *testing.T) {
 	base := t.TempDir()
 	root := filepath.Join(base, ".cxp-runtime")
 	entry := filepath.Join(base, helperruntime.BinaryName(runtime.GOOS))
-	if err := os.WriteFile(entry, []byte("stable-entry"), 0o755); err != nil {
+	stableEntry := []byte("#!/bin/sh\nif [ \"${1-}\" = \"--cxp-boot-protocol\" ]; then echo 2; else echo \"cxp version 1.2.5\"; fi\n")
+	if err := os.WriteFile(entry, stableEntry, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := helperruntime.InstallVersion(root, entry, "v1.2.5", runtime.GOOS, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := helperruntime.Activate(root, "v1.2.5"); err != nil {
 		t.Fatal(err)
 	}
 	res, err := PerformUpdate(context.Background(), UpdateOptions{
@@ -373,7 +384,7 @@ func TestPerformUpdatePublishesImmutableRuntimeAndSwitchesActive(t *testing.T) {
 		t.Fatalf("active = %q, %v", active, err)
 	}
 	entryData, err := os.ReadFile(entry)
-	if err != nil || string(entryData) != "stable-entry" {
+	if err != nil || string(entryData) != string(stableEntry) {
 		t.Fatalf("stable entry changed: %q, %v", entryData, err)
 	}
 }
@@ -381,6 +392,9 @@ func TestPerformUpdatePublishesImmutableRuntimeAndSwitchesActive(t *testing.T) {
 func TestPerformUpdateDelegatesManagedTransitionToCandidate(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell candidate fixture is POSIX-only")
+	}
+	if _, err := exec.LookPath("python3"); err != nil {
+		t.Skip("synthetic candidate uses Python SQLite fixture")
 	}
 	tag := "v0.1.13-rc.36"
 	ver := "0.1.13-rc.36"
@@ -396,25 +410,39 @@ func TestPerformUpdateDelegatesManagedTransitionToCandidate(t *testing.T) {
 	payload := []byte(fmt.Sprintf(`#!/bin/sh
 set -eu
 case "${1-}" in
-  --version)
-    echo 'codex-proxy version %s'
-    ;;
+  --cxp-boot-protocol) echo 2 ;;
+  --version) echo 'codex-proxy version %s' ;;
   __internal-update-apply)
     mkdir -p %q
     cp "$0" %q
     chmod 700 %q
-    printf '%%s\n' %q >%q
     : >%q
-    printf '{"version":"%s","runtime_path":"%s","entry_path":"%s","restart_required":false}\n'
+    python3 - "$@" <<'PYFIXTURE'
+import json, pathlib, sqlite3, sys
+args = dict(arg[2:].split("=",1) for arg in sys.argv[2:])
+assert args["protocol"] == "2"
+with sqlite3.connect(pathlib.Path(args["state-db"]).as_uri()+"?mode=ro", uri=True) as db:
+    request = db.execute("SELECT target_version,runtime_root,entry_path FROM update_invocations WHERE request_id=?", (args["request-id"],)).fetchone()
+assert request is not None
+version, root, entry = request
+version = "v" + version.lstrip("v")
+with sqlite3.connect(pathlib.Path(root)/"boot.sqlite") as db:
+    generation, good = db.execute("SELECT generation,good FROM boot WHERE id=1").fetchone()
+    db.execute("UPDATE boot SET generation=?,previous=?,good=? WHERE id=1", (str(int(generation)+1),good,version))
+print(json.dumps(dict(version=version.lstrip("v"),runtime_path=str(pathlib.Path(root)/"versions"/version/"cxp"),entry_path=entry,restart_required=False)))
+PYFIXTURE
     ;;
   *) exit 2 ;;
 esac
-`, ver, filepath.Dir(runtimePath), runtimePath, runtimePath, tag, filepath.Join(root, "active"), marker, ver, runtimePath, entry))
+`, ver, filepath.Dir(runtimePath), runtimePath, runtimePath, marker))
 	server := newReleaseServer(t, tag, asset, payload)
 	defer server.Close()
 	restore := overrideGitHubBases(server.URL)
 	defer restore()
-	if err := os.WriteFile(entry, []byte("stable-entry"), 0o700); err != nil {
+	if err := os.WriteFile(entry, []byte("#!/bin/sh\necho 2\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := helperruntime.Activate(root, "v0.1.13-rc.35"); err != nil {
 		t.Fatal(err)
 	}
 	res, err := PerformUpdate(context.Background(), UpdateOptions{

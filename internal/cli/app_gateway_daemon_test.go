@@ -2,16 +2,16 @@ package cli
 
 import (
 	"context"
+	"database/sql"
 	"errors"
-	"os"
 	"path/filepath"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/appgateway"
 	"github.com/baaaaaaaka/codex-helper/internal/config"
+	"github.com/baaaaaaaka/codex-helper/internal/sqlitestate"
 	"github.com/baaaaaaaka/codex-helper/internal/stack"
 )
 
@@ -21,6 +21,7 @@ func TestRunAppGatewayDaemonKeepsStableFrontendWhileBackendRuns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { store.Close() })
 	profile := config.Profile{ID: "profile-a", Name: "profile-a", Host: "127.0.0.1", Port: 1}
 	if err := store.Save(config.Config{Version: config.CurrentVersion, Profiles: []config.Profile{profile}}); err != nil {
 		t.Fatal(err)
@@ -63,6 +64,7 @@ func TestRunAppGatewayDaemonKeepsStableFrontendWhileBackendRuns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { registry.Close() })
 	var reg appgateway.Registration
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -118,6 +120,7 @@ func TestRunAppGatewayDaemonDoesNotConsumeLegacyBlockedBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { store.Close() })
 	profile := config.Profile{ID: "profile-a", Name: "profile-a", Host: "127.0.0.1", Port: 1}
 	if err := store.Save(config.Config{Version: config.CurrentVersion, Profiles: []config.Profile{profile}, Instances: []config.Instance{{ID: "old", ProfileID: profile.ID, RecoveryBudget: config.ProxyRecoveryBudget{Blocked: true}}}}); err != nil {
 		t.Fatal(err)
@@ -140,6 +143,7 @@ func TestRunAppGatewayDaemonDoesNotConsumeLegacyBlockedBudget(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { registry.Close() })
 	deadline := time.Now().Add(5 * time.Second)
 	var reg appgateway.Registration
 	for time.Now().Before(deadline) {
@@ -172,6 +176,7 @@ func TestRunAppGatewayDaemonModernStandbyDNSGapThenRecoveryKeepsClientPort(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { store.Close() })
 	profile := config.Profile{ID: "profile-a", Name: "profile-a", Host: "corp-alias", Port: 22}
 	legacyBudget := config.ProxyRecoveryBudget{Blocked: true, RequestAttempts: 7}
 	if err := store.Save(config.Config{
@@ -269,6 +274,7 @@ func TestRunAppGatewayDaemonModernStandbyDNSGapThenRecoveryKeepsClientPort(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { registry.Close() })
 	select {
 	case <-firstProbeStarted:
 	case <-time.After(10 * time.Second):
@@ -361,19 +367,13 @@ func TestRunAppGatewayDaemonModernStandbyDNSGapThenRecoveryKeepsClientPort(t *te
 	if len(finalCfg.Instances) != 1 || finalCfg.Instances[0].RecoveryBudget != legacyBudget {
 		t.Fatalf("legacy budget/instance changed: %#v", finalCfg.Instances)
 	}
-	eventFiles, err := filepath.Glob(filepath.Join(stateDir, "*.jsonl"))
-	if err != nil || len(eventFiles) != 1 {
-		t.Fatalf("event files = %v/%v", eventFiles, err)
-	}
-	events, err := os.ReadFile(eventFiles[0])
-	if err != nil {
-		t.Fatal(err)
-	}
+	counts := gatewayEventCounts(t, stateDir)
 	for _, want := range []string{"network-not-ready", "backend-ready", "backend-exited"} {
-		if !strings.Contains(string(events), `"event":"`+want+`"`) {
-			t.Fatalf("event log missing %q: %s", want, events)
+		if counts[want] == 0 {
+			t.Fatalf("missing event %s: %v", want, counts)
 		}
 	}
+
 }
 
 func TestRunAppGatewayDaemonBoundsBackendRecoveryBeforeCooldown(t *testing.T) {
@@ -382,6 +382,7 @@ func TestRunAppGatewayDaemonBoundsBackendRecoveryBeforeCooldown(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { store.Close() })
 	profile := config.Profile{ID: "profile-a", Name: "profile-a", Host: "corp-alias", Port: 22}
 	if err := store.Save(config.Config{Version: config.CurrentVersion, Profiles: []config.Profile{profile}}); err != nil {
 		t.Fatal(err)
@@ -420,6 +421,7 @@ func TestRunAppGatewayDaemonBoundsBackendRecoveryBeforeCooldown(t *testing.T) {
 		if registryErr != nil {
 			t.Fatal(registryErr)
 		}
+		t.Cleanup(func() { registry.Close() })
 		blocked := waitForAppGatewayRegistration(t, registry, profile.ID, func(reg appgateway.Registration) bool {
 			return reg.State == appgateway.StateBlocked && reg.RecoveryBlocked
 		})
@@ -446,20 +448,11 @@ func TestRunAppGatewayDaemonBoundsBackendRecoveryBeforeCooldown(t *testing.T) {
 	if starts.Load() != appGatewayBackendMaxAttempts || probes.Load() != appGatewayBackendMaxAttempts || sleeps.Load() != appGatewayBackendMaxAttempts+1 {
 		t.Fatalf("recovery bounds starts/probes/sleeps = %d/%d/%d", starts.Load(), probes.Load(), sleeps.Load())
 	}
-	files, err := filepath.Glob(filepath.Join(stateDir, "*.jsonl"))
-	if err != nil || len(files) != 1 {
-		t.Fatalf("event files = %v/%v", files, err)
+	counts := gatewayEventCounts(t, stateDir)
+	if counts["backend-start-failed"] != appGatewayBackendMaxAttempts || counts["recovery-blocked"] != 1 {
+		t.Fatalf("event counts %v", counts)
 	}
-	events, err := os.ReadFile(files[0])
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := strings.Count(string(events), `"event":"backend-start-failed"`); got != appGatewayBackendMaxAttempts {
-		t.Fatalf("backend failure events = %d, want %d", got, appGatewayBackendMaxAttempts)
-	}
-	if got := strings.Count(string(events), `"event":"recovery-blocked"`); got != 1 {
-		t.Fatalf("recovery blocked events = %d, want one", got)
-	}
+
 }
 
 func TestRunAppGatewayDaemonBackendSwapKeepsFrontendPort(t *testing.T) {
@@ -468,6 +461,7 @@ func TestRunAppGatewayDaemonBackendSwapKeepsFrontendPort(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { store.Close() })
 	profile := config.Profile{ID: "profile-a", Name: "profile-a", Host: "corp-alias", Port: 22}
 	if err := store.Save(config.Config{Version: config.CurrentVersion, Profiles: []config.Profile{profile}}); err != nil {
 		t.Fatal(err)
@@ -505,6 +499,7 @@ func TestRunAppGatewayDaemonBackendSwapKeepsFrontendPort(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { registry.Close() })
 	ready := waitForAppGatewayRegistration(t, registry, profile.ID, func(reg appgateway.Registration) bool {
 		return reg.State == appgateway.StateReady
 	})
@@ -535,6 +530,7 @@ func TestRunAppGatewayDaemonRestartReusesStablePort(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { store.Close() })
 	profile := config.Profile{ID: "profile-a", Name: "profile-a", Host: "corp-alias", Port: 22}
 	if err := store.Save(config.Config{Version: config.CurrentVersion, Profiles: []config.Profile{profile}}); err != nil {
 		t.Fatal(err)
@@ -555,6 +551,7 @@ func TestRunAppGatewayDaemonRestartReusesStablePort(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { registry.Close() })
 	runOnce := func() int {
 		ctx, cancel := context.WithCancel(context.Background())
 		done := make(chan error, 1)
@@ -613,4 +610,35 @@ func waitForAppGatewayHealth(t *testing.T, port int, wantOK bool) appgateway.Hea
 	}
 	t.Fatalf("timed out waiting for health=%t: %#v/%v", wantOK, last, lastErr)
 	return appgateway.Health{}
+}
+
+func gatewayEventCounts(t *testing.T, dir string) map[string]int {
+	t.Helper()
+	db, err := sqlitestate.Open(filepath.Join(dir, "gateway.sqlite"), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	return scanGatewayEventCounts(t, db)
+}
+func scanGatewayEventCounts(t *testing.T, db *sql.DB) map[string]int {
+	t.Helper()
+	rows, err := db.Query(`SELECT event_name, COUNT(*) FROM gateway_events GROUP BY event_name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	counts := map[string]int{}
+	for rows.Next() {
+		var name string
+		var n int
+		if err = rows.Scan(&name, &n); err != nil {
+			t.Fatal(err)
+		}
+		counts[name] = n
+	}
+	if err = rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return counts
 }

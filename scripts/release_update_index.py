@@ -13,7 +13,7 @@ from typing import Any
 PRIORITY_BODY_RE = re.compile(r"<!--\s*codex-helper-release:\s*(\{.*?\})\s*-->", re.DOTALL)
 PRIORITY_ASSET_RE = re.compile(r"^codex-helper-auto-update-(p[012])(?:\.(?:txt|json))?$")
 VALID_PRIORITIES = {"p0", "p1", "p2"}
-TUI_BOOT_PROTOCOL = 1
+TUI_BOOT_PROTOCOL = 2
 TUI_PLATFORMS = ("linux/amd64", "darwin/amd64", "darwin/arm64", "windows/amd64")
 
 

@@ -9,7 +9,7 @@ import (
 
 func TestSafeBootProtocolProbeIsInertAndExact(t *testing.T) {
 	var out bytes.Buffer
-	if code, handled := HandleProtocolProbe([]string{"cxp", ProtocolProbeFlag}, &out); !handled || code != 0 || out.String() != "1\n" {
+	if code, handled := HandleProtocolProbe([]string{"cxp", ProtocolProbeFlag}, &out); !handled || code != 0 || out.String() != "2\n" {
 		t.Fatalf("%d %v %q", code, handled, out.String())
 	}
 	for _, args := range [][]string{{"cxp"}, {"cxp", ProtocolProbeFlag, "tui"}, {"cxp", "tui", ProtocolProbeFlag}} {

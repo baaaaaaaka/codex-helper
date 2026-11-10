@@ -38,7 +38,7 @@ func TestUnchangedPollAndScanWriteNothing(t *testing.T) {
 	}
 	poll()
 	scan()
-	mustT(t, s.Update(func(tx *Tx) error { return tx.SetMeta("k", "v") }))
+	mustT(t, s.Update(func(tx *Tx) error { return tx.SetMeta("machine_label", "v") }))
 	// Let the WAL settle: a checkpoint so later growth is visible.
 	_, err := s.w.Exec(`PRAGMA wal_checkpoint(PASSIVE)`)
 	mustT(t, err)
@@ -72,7 +72,7 @@ func TestUnchangedPollAndScanWriteNothing(t *testing.T) {
 		c.add(time.Second)
 		poll()
 		scan()
-		mustT(t, s.Update(func(tx *Tx) error { return tx.SetMeta("k", "v") }))
+		mustT(t, s.Update(func(tx *Tx) error { return tx.SetMeta("machine_label", "v") }))
 		mustT(t, s.Update(func(tx *Tx) error {
 			_, err := tx.NextSendable(c.now().UnixMilli())
 			return err

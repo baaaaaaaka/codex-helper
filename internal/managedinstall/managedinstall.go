@@ -1,16 +1,13 @@
 package managedinstall
 
 import (
-	"bytes"
 	"debug/buildinfo"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
-	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 )
@@ -133,7 +130,7 @@ func Resolve(opts Options) (Target, error) {
 				}
 			}
 		} else if !errors.Is(err, os.ErrNotExist) {
-			warnings = append(warnings, "install record ignored: "+err.Error())
+			return Target{}, fmt.Errorf("read install record: %w", err)
 		}
 	} else {
 		warnings = append(warnings, "install record unavailable: "+recordPathErr.Error())
@@ -188,88 +185,12 @@ func Resolve(opts Options) (Target, error) {
 	return Target{}, fmt.Errorf("resolve managed install target: no candidate paths")
 }
 
-func LoadRecord(path string) (Record, error) {
-	path = strings.TrimSpace(path)
-	if path == "" {
-		var err error
-		path, err = DefaultRecordPath()
-		if err != nil {
-			return Record{}, err
-		}
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return Record{}, err
-	}
-	data = bytes.TrimPrefix(data, []byte{0xef, 0xbb, 0xbf})
-	var record Record
-	if err := json.Unmarshal(data, &record); err != nil {
-		return Record{}, fmt.Errorf("read install record %s: %w", path, err)
-	}
-	if record.SchemaVersion > RecordSchemaVersion {
-		return Record{}, fmt.Errorf("install record %s requires schema %d, supported %d", path, record.SchemaVersion, RecordSchemaVersion)
-	}
-	return record, nil
-}
-
-func SaveRecord(path string, record Record) error {
-	path = strings.TrimSpace(path)
-	if path == "" {
-		var err error
-		path, err = DefaultRecordPath()
-		if err != nil {
-			return err
-		}
-	}
-	if record.SchemaVersion == 0 {
-		record.SchemaVersion = RecordSchemaVersion
-	}
-	if record.UpdatedAt == "" {
-		record.UpdatedAt = time.Now().UTC().Format(time.RFC3339)
-	}
-	data, err := json.MarshalIndent(record, "", "  ")
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.Remove(tmpPath)
-		}
-	}()
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Chmod(tmpPath, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		return err
-	}
-	cleanup = false
-	return nil
-}
-
 func DefaultRecordPath() (string, error) {
 	base, err := os.UserConfigDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(base, "codex-helper", "install.json"), nil
+	return filepath.Join(base, "codex-helper", "install.sqlite"), nil
 }
 
 func DefaultInstallPath(opts Options) (string, error) {
@@ -396,10 +317,10 @@ func (opts Options) withDefaults() Options {
 
 func defaultRecordPath(opts Options) (string, error) {
 	if strings.TrimSpace(opts.RecordPath) != "" {
-		return filepath.Clean(opts.RecordPath), nil
+		return recordPath(opts.RecordPath)
 	}
 	if strings.TrimSpace(opts.ConfigDir) != "" {
-		return filepath.Join(opts.ConfigDir, "codex-helper", "install.json"), nil
+		return filepath.Join(opts.ConfigDir, "codex-helper", "install.sqlite"), nil
 	}
 	return DefaultRecordPath()
 }

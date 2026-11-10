@@ -2,6 +2,7 @@ package turns
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/harness"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/steps"
 	"github.com/gorilla/websocket"
+	_ "modernc.org/sqlite"
 )
 
 type tuiClient struct {
@@ -58,18 +60,23 @@ func attachTUIRequest(s *harness.Scenario, thread, cwd string) *tuiClient {
 	s.T.Helper()
 	var descriptor string
 	_ = filepath.WalkDir(s.Env.StateDir, func(path string, d os.DirEntry, err error) error {
-		if err == nil && !d.IsDir() && strings.HasPrefix(d.Name(), "tui-endpoint-") {
+		if err == nil && !d.IsDir() && strings.HasPrefix(d.Name(), "tui-endpoint-") && strings.HasSuffix(d.Name(), ".sqlite") {
 			descriptor = path
 		}
 		return nil
 	})
-	raw, err := os.ReadFile(descriptor)
+	db, err := sql.Open("sqlite", descriptor+"?mode=ro")
 	if err != nil {
 		s.T.Fatal(err)
 	}
 	var endpoint struct{ URL, Token, ThreadID string }
-	if err = json.Unmarshal(raw, &endpoint); err != nil {
+	err = db.QueryRow(`SELECT url,token FROM endpoint WHERE id=1`).Scan(&endpoint.URL, &endpoint.Token)
+	closeErr := db.Close()
+	if err != nil {
 		s.T.Fatal(err)
+	}
+	if closeErr != nil {
+		s.T.Fatal(closeErr)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	req, _ := http.NewRequestWithContext(ctx, "POST", endpoint.URL+"/attach", strings.NewReader(`{"threadId":`+fmt.Sprintf("%q", thread)+`,"cwd":`+fmt.Sprintf("%q", cwd)+`}`))

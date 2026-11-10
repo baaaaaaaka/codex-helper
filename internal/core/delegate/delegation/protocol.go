@@ -1,14 +1,11 @@
 package delegation
 
 import (
-	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -613,6 +610,12 @@ func (s *Store) UpsertRemoteThread(thread RemoteThread) {
 	if thread.ThreadID == "" {
 		return
 	}
+	thread = normalizeRemoteThread(thread, s.RemoteThreads[thread.ThreadID])
+	s.RemoteThreads[thread.ThreadID] = thread
+}
+
+func normalizeRemoteThread(thread, existing RemoteThread) RemoteThread {
+	thread.ThreadID = strings.TrimSpace(thread.ThreadID)
 	if strings.TrimSpace(thread.State) == "" {
 		thread.State = RemoteThreadStateIdle
 	}
@@ -620,19 +623,15 @@ func (s *Store) UpsertRemoteThread(thread RemoteThread) {
 	thread.Summary = truncateRunes(strings.TrimSpace(thread.Summary), MaxRemoteThreadSummaryRunes)
 	thread.LastResultSummary = truncateRunes(strings.TrimSpace(thread.LastResultSummary), MaxRemoteThreadSummaryRunes)
 	if strings.TrimSpace(thread.CreatedAt) == "" {
-		if existing, ok := s.RemoteThreads[thread.ThreadID]; ok {
-			thread.CreatedAt = existing.CreatedAt
-		}
+		thread.CreatedAt = existing.CreatedAt
 	}
 	if strings.TrimSpace(thread.Generation) == "" {
-		if existing, ok := s.RemoteThreads[thread.ThreadID]; ok {
-			thread.Generation = existing.Generation
-		}
+		thread.Generation = existing.Generation
 	}
 	if strings.TrimSpace(thread.SummaryHash) == "" {
 		thread.SummaryHash = ThreadSummaryHash(thread.Title, thread.Summary, thread.LastResultSummary)
 	}
-	s.RemoteThreads[thread.ThreadID] = thread
+	return thread
 }
 
 func (s *Store) UpsertExecution(fence ExecutionFence) {
@@ -1076,183 +1075,6 @@ func ValidatePath(path []string, nextMachineID string) error {
 		return fmt.Errorf("delegation hop limit exceeded")
 	}
 	return nil
-}
-
-func LoadStore(path string) (Store, error) {
-	if strings.TrimSpace(path) == "" {
-		return newStore(), nil
-	}
-	if storePathUsesSQLite(path) {
-		return loadSQLiteStore(path)
-	}
-	var raw []byte
-	var err error
-	for attempt := 0; attempt < 5; attempt++ {
-		raw, err = os.ReadFile(path)
-		if err == nil || os.IsNotExist(err) {
-			break
-		}
-		// Windows can briefly reject a reader while an atomic replacement is
-		// publishing the next store snapshot. Retrying here also protects
-		// antivirus/indexer sharing violations without weakening JSON checks.
-		if attempt < 4 {
-			time.Sleep(time.Duration(attempt+1) * 5 * time.Millisecond)
-		}
-	}
-	if err != nil {
-		if os.IsNotExist(err) {
-			return newStore(), nil
-		}
-		return Store{}, err
-	}
-	if len(bytes.TrimSpace(raw)) == 0 {
-		return newStore(), nil
-	}
-	var store Store
-	if err := json.Unmarshal(raw, &store); err != nil {
-		return Store{}, err
-	}
-	if store.SchemaVersion == 0 {
-		store.SchemaVersion = 1
-	}
-	store.EnsureRoutes()
-	store.EnsureRemoteThreads()
-	store.EnsureExecutions()
-	store.EnsureOutbox()
-	store.EnsureInboxCursors()
-	store.EnsureInboxBackoffs()
-	return store, nil
-}
-
-func SaveStore(path string, store Store) (bool, error) {
-	if strings.TrimSpace(path) == "" {
-		return false, nil
-	}
-	if storePathUsesSQLite(path) {
-		return saveSQLiteStore(path, store)
-	}
-	store.SchemaVersion = 1
-	store.EnsureRoutes()
-	store.EnsureRemoteThreads()
-	store.EnsureExecutions()
-	store.EnsureOutbox()
-	store.EnsureInboxCursors()
-	store.EnsureInboxBackoffs()
-	raw, err := json.MarshalIndent(store, "", "  ")
-	if err != nil {
-		return false, err
-	}
-	raw = append(raw, '\n')
-	if existing, err := os.ReadFile(path); err == nil && bytes.Equal(existing, raw) {
-		return false, nil
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return false, err
-	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".delegation-*.tmp")
-	if err != nil {
-		return false, err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if _, err := tmp.Write(raw); err != nil {
-		_ = tmp.Close()
-		return false, err
-	}
-	if err := tmp.Close(); err != nil {
-		return false, err
-	}
-	if err := os.Rename(tmpName, path); err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-func (s *Store) Prune(now time.Time, retention time.Duration) {
-	if s == nil {
-		return
-	}
-	if now.IsZero() {
-		now = time.Now().UTC()
-	}
-	if retention <= 0 {
-		retention = DefaultStoreRetention
-	}
-	cutoff := now.Add(-retention)
-	prunedDelegations := map[string]bool{}
-	if len(s.Records) > 0 {
-		byID := map[string][]Record{}
-		for _, record := range s.Records {
-			if id := strings.TrimSpace(record.DelegationID); id != "" {
-				byID[id] = append(byID[id], record)
-			}
-		}
-		for id, records := range byID {
-			state := Reduce(records, now)
-			if !terminalOrExpiredState(state) {
-				continue
-			}
-			if t := stateTime(state); !t.IsZero() && t.Before(cutoff) {
-				prunedDelegations[id] = true
-			}
-		}
-		if len(prunedDelegations) > 0 {
-			next := s.Records[:0]
-			for _, record := range s.Records {
-				if !prunedDelegations[record.DelegationID] {
-					next = append(next, record)
-				}
-			}
-			s.Records = next
-		}
-	}
-	for id, outbox := range s.Outbox {
-		if prunedDelegations[outbox.DelegationID] || pruneOutboxRecord(outbox, cutoff) {
-			delete(s.Outbox, id)
-		}
-	}
-	for id := range s.Routes {
-		if prunedDelegations[id] {
-			delete(s.Routes, id)
-		}
-	}
-	for id, thread := range s.RemoteThreads {
-		expiresAt := parseRecordTime(thread.ExpiresAt)
-		updatedAt := parseRecordTime(firstNonEmptyString(thread.LastUsedAt, thread.UpdatedAt, thread.CreatedAt))
-		if thread.State != RemoteThreadStateActive && ((!expiresAt.IsZero() && expiresAt.Before(cutoff)) || (!updatedAt.IsZero() && updatedAt.Before(cutoff))) {
-			delete(s.RemoteThreads, id)
-		}
-	}
-	for id, execution := range s.Executions {
-		if prunedDelegations[id] || (terminalExecutionStatus(execution.Status) && parseRecordTime(execution.UpdatedAt).Before(cutoff)) {
-			delete(s.Executions, id)
-		}
-	}
-	for chatID, cursor := range s.InboxCursors {
-		updatedAt := parseRecordTime(cursor.UpdatedAt)
-		if !updatedAt.IsZero() && updatedAt.Before(cutoff) {
-			delete(s.InboxCursors, chatID)
-		}
-	}
-	for chatID, backoff := range s.InboxBackoffs {
-		blockedUntil := parseRecordTime(backoff.BlockedUntil)
-		updatedAt := parseRecordTime(backoff.UpdatedAt)
-		if (!blockedUntil.IsZero() && blockedUntil.Before(cutoff)) || (!updatedAt.IsZero() && updatedAt.Before(cutoff)) {
-			delete(s.InboxBackoffs, chatID)
-		}
-	}
-}
-
-func newStore() Store {
-	return Store{
-		SchemaVersion: 1,
-		Routes:        map[string]Route{},
-		RemoteThreads: map[string]RemoteThread{},
-		Executions:    map[string]ExecutionFence{},
-		Outbox:        map[string]OutboxRecord{},
-		InboxCursors:  map[string]InboxCursor{},
-		InboxBackoffs: map[string]InboxBackoff{},
-	}
 }
 
 func terminalOrExpiredState(state State) bool {

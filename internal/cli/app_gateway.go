@@ -117,6 +117,7 @@ func newProxyAppGatewayCmd(root *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			defer store.Close()
 			if strings.TrimSpace(stateDir) == "" {
 				stateDir, err = appGatewayRegistryDirFn()
 				if err != nil {
@@ -217,6 +218,7 @@ func ensureCodexAppGatewayURLLocked(ctx context.Context, store *config.Store, pr
 	if err != nil {
 		return "", err
 	}
+	defer registry.Close()
 	fingerprint := appGatewayProfileFingerprint(profile)
 	// Preserve an already-running legacy session. Its port is retained in the
 	// new registration so a later daemon exit can be adopted without a random
@@ -525,6 +527,7 @@ func runAppGatewayDaemonWithDeps(parentCtx context.Context, store *config.Store,
 	if err != nil {
 		return err
 	}
+	defer registry.Close()
 	reg, err := registry.Ensure(ctx, profile.ID, appGatewayProfileFingerprint(profile))
 	if err != nil {
 		return err

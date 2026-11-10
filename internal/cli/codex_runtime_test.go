@@ -151,6 +151,7 @@ func TestLiveCodexExecFacadeUsesOriginalBinaryAndAssignedGPU(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { store.Close() })
 	direct := false
 	if err := store.Save(config.Config{ProxyEnabled: &direct, RuntimeGeneration: currentRuntimeGeneration}); err != nil {
 		t.Fatal(err)

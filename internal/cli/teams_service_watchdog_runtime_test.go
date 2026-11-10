@@ -50,7 +50,13 @@ func TestTeamsServiceWatchdogRefreshesRuntimeBeforeHealthCheck(t *testing.T) {
 				t.Setenv(helperruntime.EnvRuntime, "")
 			}
 			if tc.active != "" {
-				writeFile(t, filepath.Join(dir, "active"), tc.active)
+				if _, ok := helperruntime.NormalizeVersion(tc.active); ok {
+					if err := helperruntime.Activate(dir, tc.active); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					writeFile(t, filepath.Join(dir, helperruntime.BootFile), tc.active)
+				}
 			}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
@@ -103,17 +109,27 @@ func TestTeamsServiceWatchdogRuntimeRefreshErrorsDoNotStopLoop(t *testing.T) {
 			for _, invalid := range []string{"", "not a version"} {
 				t.Run("pointer="+invalid, func(t *testing.T) {
 					testTeamsServiceWatchdogRuntimeRefreshRecovery(t, func(root string) func() {
+						path := filepath.Join(root, helperruntime.BootFile)
+						original, err := os.ReadFile(path)
+						if err != nil {
+							t.Fatal(err)
+						}
 						if legacy {
 							t.Setenv(helperruntime.EnvRuntimeVersion, "")
 						}
 						if invalid == "" {
-							if err := os.Remove(filepath.Join(root, "active")); err != nil {
+							if err := os.Remove(path); err != nil {
 								t.Fatal(err)
 							}
 						} else {
-							writeFile(t, filepath.Join(root, "active"), invalid)
+							writeFile(t, path, invalid)
 						}
-						return func() { writeFile(t, filepath.Join(root, "active"), "v1.2.3") }
+						return func() {
+							t.Setenv(helperruntime.EnvRuntimeVersion, "v1.2.3")
+							if err := os.WriteFile(path, original, 0600); err != nil {
+								t.Fatal(err)
+							}
+						}
 					})
 				})
 			}
@@ -133,7 +149,9 @@ func testTeamsServiceWatchdogRuntimeRefreshRecovery(t *testing.T, unavailable fu
 	t.Setenv(helperruntime.EnvRuntimeRoot, root)
 	t.Setenv(helperruntime.EnvRuntimeVersion, "v1.2.3")
 	t.Setenv(helperruntime.EnvEntryPath, filepath.Join(root, "cxp"))
-	writeFile(t, filepath.Join(root, "active"), "v1.2.3")
+	if err := helperruntime.Activate(root, "v1.2.3"); err != nil {
+		t.Fatal(err)
+	}
 	restore := unavailable(root)
 	var restored sync.Once
 	recoverPointer := func() { restored.Do(restore) }
@@ -183,7 +201,9 @@ func TestTeamsServiceWatchdogRuntimeRestartErrorsDoNotStopLoop(t *testing.T) {
 	t.Setenv(helperruntime.EnvRuntimeRoot, root)
 	t.Setenv(helperruntime.EnvRuntimeVersion, "v1.2.3")
 	t.Setenv(helperruntime.EnvEntryPath, filepath.Join(root, "cxp"))
-	writeFile(t, filepath.Join(root, "active"), "v1.2.4")
+	if err := helperruntime.Activate(root, "v1.2.4"); err != nil {
+		t.Fatal(err)
+	}
 	prevVersion, prevExec, prevStart := version, execSelf, startSelf
 	prevCollect := teamsServiceWatchdogCollectSnapshot
 	t.Cleanup(func() {

@@ -25,7 +25,7 @@ func TestLeaseGatesWrites(t *testing.T) {
 	defer s.Close()
 	_, err = s.Acquire(testIdent(100))
 	mustT(t, err)
-	mustT(t, s.Update(func(tx *Tx) error { return tx.SetMeta("k", "1") }))
+	mustT(t, s.Update(func(tx *Tx) error { return tx.SetMeta("machine_label", "1") }))
 	if l.checks != 2 {
 		t.Fatalf("checks %d, want one per write transaction", l.checks)
 	}
@@ -47,7 +47,7 @@ func TestLeaseGatesWrites(t *testing.T) {
 		t.Fatalf("Fence must verify the lease (%d)", l.verifys)
 	}
 	l.check = lease.ErrFenced
-	wantErr(t, s.Update(func(tx *Tx) error { return tx.SetMeta("k", "2") }), ErrFenced)
+	wantErr(t, s.Update(func(tx *Tx) error { return tx.SetMeta("machine_label", "2") }), ErrFenced)
 	if s.Update(func(*Tx) error { return nil }) != ErrFenced {
 		t.Fatal("the engine compares fence errors with ==")
 	}
@@ -60,7 +60,7 @@ func TestLeaseGatesWrites(t *testing.T) {
 	if s.Fence() != ErrFenced {
 		t.Fatal("fence")
 	}
-	if v, _, _ := s.Meta("k"); v != "1" {
+	if v, _, _ := s.Meta("machine_label"); v != "1" {
 		t.Fatalf("meta %q: a fenced write landed", v)
 	}
 }
@@ -76,9 +76,9 @@ func TestCopySnapshotOfAnOpenStore(t *testing.T) {
 	_, err = s.Acquire(testIdent(1))
 	mustT(t, err)
 	for i := range 50 {
-		mustT(t, s.Update(func(tx *Tx) error { return tx.SetMeta("k", string(rune('a'+i%26))) }))
+		mustT(t, s.Update(func(tx *Tx) error { return tx.SetMeta("machine_label", string(rune('a'+i%26))) }))
 	}
-	mustT(t, s.Update(func(tx *Tx) error { return tx.SetMeta("last", "yes") }))
+	mustT(t, s.Update(func(tx *Tx) error { return tx.SetMeta("engine_control_user_title", "yes") }))
 	if fi, err := os.Stat(src + "-wal"); err != nil || fi.Size() == 0 {
 		t.Fatalf("the test needs commits in the WAL: %v", err)
 	}
@@ -92,7 +92,7 @@ func TestCopySnapshotOfAnOpenStore(t *testing.T) {
 	c, err := OpenWith(dst, Options{Now: newClock().now})
 	mustT(t, err)
 	defer c.Close()
-	if v, ok, err := c.Meta("last"); err != nil || !ok || v != "yes" {
+	if v, ok, err := c.Meta("engine_control_user_title"); err != nil || !ok || v != "yes" {
 		t.Fatalf("copy lost a commit: %q %v %v", v, ok, err)
 	}
 }
@@ -107,10 +107,10 @@ func TestCopySnapshotOfATornWAL(t *testing.T) {
 	mustT(t, err)
 	_, err = s.Acquire(testIdent(1))
 	mustT(t, err)
-	mustT(t, s.Update(func(tx *Tx) error { return tx.SetMeta("first", "1") }))
+	mustT(t, s.Update(func(tx *Tx) error { return tx.SetMeta("machine_id", "1") }))
 	fi, _ := os.Stat(live + "-wal")
 	keep := fi.Size()
-	mustT(t, s.Update(func(tx *Tx) error { return tx.SetMeta("second", "2") }))
+	mustT(t, s.Update(func(tx *Tx) error { return tx.SetMeta("scope_id", "2") }))
 	// The host's view of the files at the moment it died.
 	src := filepath.Join(dir, "core.sqlite")
 	for _, sfx := range []string{"", "-wal"} {
@@ -127,10 +127,10 @@ func TestCopySnapshotOfATornWAL(t *testing.T) {
 	c, err := OpenWith(dst, Options{Now: newClock().now})
 	mustT(t, err)
 	defer c.Close()
-	if v, ok, _ := c.Meta("first"); !ok || v != "1" {
+	if v, ok, _ := c.Meta("machine_id"); !ok || v != "1" {
 		t.Fatal("lost a complete commit")
 	}
-	if _, ok, _ := c.Meta("second"); ok {
+	if _, ok, _ := c.Meta("scope_id"); ok {
 		t.Fatal("kept a torn commit")
 	}
 }

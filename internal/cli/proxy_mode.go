@@ -54,7 +54,7 @@ func ensureProxyPreferenceWithReaderMode(
 		// If proxy was enabled but no profile was ever created, treat as
 		// incomplete setup — clear the flag and re-ask from scratch.
 		if *cfg.ProxyEnabled && len(cfg.Profiles) == 0 {
-			_ = store.Update(func(c *config.Config) error {
+			_ = store.ChangeSettings(func(c *config.Config) error {
 				c.ProxyEnabled = nil
 				return nil
 			})
@@ -108,7 +108,7 @@ func ensureProxyPreferenceWithReaderMode(
 }
 
 func persistProxyPreference(store *config.Store, enabled bool) error {
-	return store.Update(func(cfg *config.Config) error {
+	return store.ChangeSettings(func(cfg *config.Config) error {
 		cfg.ProxyEnabled = boolPtr(enabled)
 		return nil
 	})

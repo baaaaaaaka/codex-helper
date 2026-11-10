@@ -4,244 +4,77 @@ import (
 	"errors"
 	"os"
 	"os/exec"
-	"reflect"
 	"testing"
 
 	"github.com/baaaaaaaka/codex-helper/internal/candidateupdate"
 	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 )
 
-func TestRunMainHandlesBootProtocolBeforeRuntimeDispatch(t *testing.T) {
-	previousPreflight, previousLaunch, previousExecute := runLegacyUpdaterVersionPreflight, launchHelperRuntime, executeCLI
-	t.Cleanup(func() {
-		runLegacyUpdaterVersionPreflight, launchHelperRuntime, executeCLI = previousPreflight, previousLaunch, previousExecute
-	})
-	runLegacyUpdaterVersionPreflight = func() error { t.Fatal("protocol probe invoked legacy repair"); return nil }
+func stubEntrypoint(t *testing.T) {
+	t.Helper()
+	launch, execute := launchHelperRuntime, executeCLI
+	t.Cleanup(func() { launchHelperRuntime, executeCLI = launch, execute })
 	launchHelperRuntime = func(string, []string) (int, bool, error) {
-		t.Fatal("protocol probe dispatched an installed runtime")
+		t.Fatal("unexpected runtime dispatch")
 		return 0, false, nil
 	}
-	executeCLI = func() int { t.Fatal("protocol probe initialized the CLI"); return 0 }
+	executeCLI = func() int { t.Fatal("unexpected CLI initialization"); return 0 }
+}
+
+func TestRunMainHandlesBootProtocolBeforeRuntimeDispatch(t *testing.T) {
+	stubEntrypoint(t)
 	if code := runMain([]string{"cxp", helperruntime.ProtocolProbeFlag}); code != 0 {
 		t.Fatal(code)
 	}
 }
 
 func TestRunMainHandlesCandidateUpdateBeforeRuntimeDispatch(t *testing.T) {
-	previousPreflight := runLegacyUpdaterVersionPreflight
-	previousLaunch := launchHelperRuntime
-	previousExecute := executeCLI
-	t.Cleanup(func() {
-		runLegacyUpdaterVersionPreflight = previousPreflight
-		launchHelperRuntime = previousLaunch
-		executeCLI = previousExecute
-	})
-	runLegacyUpdaterVersionPreflight = func() error {
-		t.Fatal("legacy preflight ran for internal candidate update")
-		return nil
-	}
-	launchHelperRuntime = func(string, []string) (int, bool, error) {
-		t.Fatal("runtime dispatch ran for internal candidate update")
-		return 0, false, nil
-	}
-	executeCLI = func() int {
-		t.Fatal("CLI ran for internal candidate update")
-		return 0
-	}
-	if got := runMain([]string{"candidate", candidateupdate.InternalCommand, "--unsupported"}); got != 2 {
-		t.Fatalf("runMain exit code = %d, want 2", got)
+	stubEntrypoint(t)
+	if code := runMain([]string{"candidate", candidateupdate.InternalCommand, "--unsupported"}); code != 2 {
+		t.Fatal(code)
 	}
 }
 
 func TestRunMainHandlesAppInstallWorkerBeforeRuntimeDispatch(t *testing.T) {
-	previousPreflight, previousLaunch, previousExecute, previousInput := runLegacyUpdaterVersionPreflight, launchHelperRuntime, executeCLI, os.Stdin
-	t.Cleanup(func() {
-		runLegacyUpdaterVersionPreflight, launchHelperRuntime, executeCLI, os.Stdin = previousPreflight, previousLaunch, previousExecute, previousInput
-	})
+	stubEntrypoint(t)
+	previousInput := os.Stdin
+	t.Cleanup(func() { os.Stdin = previousInput })
 	input, err := os.CreateTemp(t.TempDir(), "invalid-request")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer input.Close()
 	os.Stdin = input
-	runLegacyUpdaterVersionPreflight = func() error { t.Fatal("worker invoked legacy preflight"); return nil }
-	launchHelperRuntime = func(string, []string) (int, bool, error) {
-		t.Fatal("worker invoked runtime dispatch")
-		return 0, false, nil
-	}
-	executeCLI = func() int { t.Fatal("worker invoked root CLI"); return 0 }
 	if code := runMain([]string{"cxp", "--cxp-internal-windows-app-install"}); code != 1 {
-		t.Fatalf("invalid worker request exit code = %d", code)
+		t.Fatal(code)
 	}
 }
 
-func TestRunMainHandlesPostParentRepairBeforeRuntimeDispatch(t *testing.T) {
-	previousPreflight := runLegacyUpdaterVersionPreflight
-	previousLaunch := launchHelperRuntime
-	previousExecute := executeCLI
-	t.Cleanup(func() {
-		runLegacyUpdaterVersionPreflight = previousPreflight
-		launchHelperRuntime = previousLaunch
-		executeCLI = previousExecute
-	})
-	runLegacyUpdaterVersionPreflight = func() error {
-		t.Fatal("legacy preflight ran for post-parent repair")
-		return nil
-	}
-	launchHelperRuntime = func(string, []string) (int, bool, error) {
-		t.Fatal("runtime dispatch ran for post-parent repair")
-		return 0, false, nil
-	}
-	executeCLI = func() int {
-		t.Fatal("CLI ran for post-parent repair")
-		return 0
-	}
-	if got := runMain([]string{"candidate", candidateupdate.PostParentRepairCommand, "--unsupported"}); got != 2 {
-		t.Fatalf("runMain exit code = %d, want 2", got)
-	}
-}
-
-func TestRunMainRunsLegacyPreflightBeforeRuntimeDispatch(t *testing.T) {
-	previousPreflight := runLegacyUpdaterVersionPreflight
-	previousLaunch := launchHelperRuntime
-	previousExecute := executeCLI
-	t.Cleanup(func() {
-		runLegacyUpdaterVersionPreflight = previousPreflight
-		launchHelperRuntime = previousLaunch
-		executeCLI = previousExecute
-	})
-
-	var events []string
-	runLegacyUpdaterVersionPreflight = func() error {
-		events = append(events, "preflight")
-		return nil
-	}
-	launchHelperRuntime = func(_ string, args []string) (int, bool, error) {
-		events = append(events, "runtime:"+args[0])
-		return 0, false, nil
-	}
-	executeCLI = func() int {
-		events = append(events, "cli")
-		return 17
-	}
-
-	if got := runMain([]string{"candidate", "--version"}); got != 17 {
-		t.Fatalf("runMain exit code = %d, want 17", got)
-	}
-	want := []string{"preflight", "runtime:candidate", "cli"}
-	if !reflect.DeepEqual(events, want) {
-		t.Fatalf("events = %#v, want %#v", events, want)
-	}
-}
-
-func TestRunMainSchedulesLegacyDirectRepairAfterSuccessfulRuntimeDispatch(t *testing.T) {
-	previousPreflight := runLegacyUpdaterVersionPreflight
-	previousLaunch := launchHelperRuntime
-	previousSchedule := scheduleLegacyDirectEntryRepair
-	previousExecute := executeCLI
-	t.Cleanup(func() {
-		runLegacyUpdaterVersionPreflight = previousPreflight
-		launchHelperRuntime = previousLaunch
-		scheduleLegacyDirectEntryRepair = previousSchedule
-		executeCLI = previousExecute
-	})
-	var events []string
-	runLegacyUpdaterVersionPreflight = func() error {
-		events = append(events, "preflight")
-		return nil
-	}
-	launchHelperRuntime = func(_ string, _ []string) (int, bool, error) {
-		events = append(events, "runtime")
-		return 0, true, nil
-	}
-	scheduleLegacyDirectEntryRepair = func(_ []string, _ string) error {
-		events = append(events, "schedule")
-		return nil
-	}
-	executeCLI = func() int {
-		t.Fatal("CLI ran after handled runtime dispatch")
-		return 1
-	}
-	if got := runMain([]string{"candidate", "--version"}); got != 0 {
-		t.Fatalf("runMain exit code = %d, want 0", got)
-	}
-	want := []string{"preflight", "runtime", "schedule"}
-	if !reflect.DeepEqual(events, want) {
-		t.Fatalf("events = %#v, want %#v", events, want)
-	}
-}
-
-func TestRunMainRejectsLegacyCandidateWhenRepairCannotArm(t *testing.T) {
-	previousPreflight := runLegacyUpdaterVersionPreflight
-	previousLaunch := launchHelperRuntime
-	previousSchedule := scheduleLegacyDirectEntryRepair
-	previousExecute := executeCLI
-	t.Cleanup(func() {
-		runLegacyUpdaterVersionPreflight = previousPreflight
-		launchHelperRuntime = previousLaunch
-		scheduleLegacyDirectEntryRepair = previousSchedule
-		executeCLI = previousExecute
-	})
-	runLegacyUpdaterVersionPreflight = func() error { return nil }
-	launchHelperRuntime = func(string, []string) (int, bool, error) { return 0, true, nil }
-	scheduleLegacyDirectEntryRepair = func([]string, string) error { return errors.New("worker not ready") }
-	executeCLI = func() int {
-		t.Fatal("CLI ran after handled runtime dispatch")
-		return 0
-	}
-	if got := runMain([]string{"candidate", "--version"}); got != 1 {
-		t.Fatalf("runMain exit code = %d, want 1", got)
-	}
-}
-
-func TestRunMainDoesNotScheduleRepairAfterFailedRuntimeCommand(t *testing.T) {
-	previousPreflight := runLegacyUpdaterVersionPreflight
-	previousLaunch := launchHelperRuntime
-	previousSchedule := scheduleLegacyDirectEntryRepair
-	previousExecute := executeCLI
-	t.Cleanup(func() {
-		runLegacyUpdaterVersionPreflight = previousPreflight
-		launchHelperRuntime = previousLaunch
-		scheduleLegacyDirectEntryRepair = previousSchedule
-		executeCLI = previousExecute
-	})
-	runLegacyUpdaterVersionPreflight = func() error { return nil }
+func TestRunMainReturnsHandledRuntimeExitCode(t *testing.T) {
+	stubEntrypoint(t)
 	launchHelperRuntime = func(string, []string) (int, bool, error) { return 9, true, nil }
-	scheduleLegacyDirectEntryRepair = func([]string, string) error {
-		t.Fatal("repair scheduled after the runtime command failed")
-		return nil
-	}
-	executeCLI = func() int {
-		t.Fatal("CLI ran after handled runtime dispatch")
-		return 0
-	}
-	if got := runMain([]string{"candidate", "--version"}); got != 9 {
-		t.Fatalf("runMain exit code = %d, want 9", got)
+	if code := runMain([]string{"cxp", "--version"}); code != 9 {
+		t.Fatal(code)
 	}
 }
 
-func TestRunMainPreflightFailureStopsBeforeRuntimeDispatch(t *testing.T) {
-	previousPreflight := runLegacyUpdaterVersionPreflight
-	previousLaunch := launchHelperRuntime
-	previousExecute := executeCLI
-	t.Cleanup(func() {
-		runLegacyUpdaterVersionPreflight = previousPreflight
-		launchHelperRuntime = previousLaunch
-		executeCLI = previousExecute
-	})
-
-	runLegacyUpdaterVersionPreflight = func() error { return errors.New("unsafe legacy state") }
+func TestRunMainBootstrapFailureStopsBeforeCLI(t *testing.T) {
+	stubEntrypoint(t)
 	launchHelperRuntime = func(string, []string) (int, bool, error) {
-		t.Fatal("runtime dispatch ran after a failed compatibility preflight")
-		return 0, false, nil
+		return 0, false, errors.Join(helperruntime.ErrBootstrapState, errors.New("corrupt database"))
 	}
-	executeCLI = func() int {
-		t.Fatal("CLI ran after a failed compatibility preflight")
-		return 0
+	if code := runMain([]string{"cxp", "--version"}); code != 1 {
+		t.Fatal(code)
 	}
+}
 
-	if got := runMain([]string{"candidate", "--version"}); got != 1 {
-		t.Fatalf("runMain exit code = %d, want 1", got)
+func TestRunMainRejectsLegacyDownloadBeforeRuntimeDispatch(t *testing.T) {
+	stubEntrypoint(t)
+	// Old updaters already used runtime-disable. That must not bypass refusal.
+	t.Setenv(helperruntime.EnvDisable, "1")
+	t.Setenv(helperruntime.EnvProbeProtocol, "")
+	if code := runMain([]string{".codex-proxy_0.1.99_linux_amd64", "--version"}); code != 1 {
+		t.Fatal(code)
 	}
 }
 

@@ -112,12 +112,24 @@ fixture_skill_config="$fixture_config_dir/skill-subscriptions.json"
 fixture_codex="$root/old-shape-codex"
 fixture_home="$root/old-shape-home"
 mkdir -p "$fixture_config_dir" "$fixture_codex" "$fixture_home"
-HOME="$fixture_home" XDG_CONFIG_HOME="$fixture_home/.config" XDG_CACHE_HOME="$fixture_home/.cache" \
-  "${helper_cmd[@]}" --config "$fixture_config" skills --codex-dir "$fixture_codex" add "$repo" --name oldshape --ref HEAD --path skills/review --target codex-home --yes
-awk '!/"target_kind":/ && !/"target_root":/' "$fixture_skill_config" > "$fixture_skill_config.tmp"
-mv "$fixture_skill_config.tmp" "$fixture_skill_config"
+# A frozen old-shape subscription, not a current CLI write with fields
+# removed. The managed export is handwritten in the same old format.
+cat > "$fixture_skill_config" <<EOF_LEGACY
+{"version":1,"sources":[{"id":"oldshape-fixture","name":"oldshape","url":"$repo","remote_url":"$repo","ref":"HEAD","path":"skills/review","auto_sync":false,"added_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-01T00:00:00Z"}]}
+EOF_LEGACY
 oldshape_legacy="$fixture_codex/skills/oldshape__review"
 oldshape_agents="$fixture_home/.agents/skills/oldshape__review"
+mkdir -p "$oldshape_legacy"
+cp "$repo/skills/review/SKILL.md" "$oldshape_legacy/SKILL.md"
+if command -v sha256sum >/dev/null 2>&1; then
+  oldshape_hash="$(sha256sum "$oldshape_legacy/SKILL.md" | cut -d ' ' -f1)"
+else
+  oldshape_hash="$(shasum -a 256 "$oldshape_legacy/SKILL.md" | cut -d ' ' -f1)"
+fi
+oldshape_size="$(wc -c < "$oldshape_legacy/SKILL.md" | tr -d ' ')"
+cat > "$oldshape_legacy/.cxp-skill-manifest.json" <<EOF_MANIFEST
+{"version":1,"source_id":"oldshape-fixture","source_name":"oldshape","remote_url":"$repo","ref":"HEAD","commit":"frozen","skill_name":"review","source_path":"skills/review","export_name":"oldshape__review","exported_at":"2026-01-01T00:00:00Z","files":[{"rel_path":"SKILL.md","sha256":"$oldshape_hash","size":$oldshape_size,"mode":420}]}
+EOF_MANIFEST
 test -f "$oldshape_legacy/SKILL.md"
 oldshape_list_output="$(HOME="$fixture_home" XDG_CONFIG_HOME="$fixture_home/.config" XDG_CACHE_HOME="$fixture_home/.cache" \
   "${helper_cmd[@]}" --config "$fixture_config" skills --codex-dir "$fixture_codex" list)"

@@ -1,9 +1,11 @@
 package commands
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"html"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +15,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakegraph"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/harness"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/steps"
+	_ "modernc.org/sqlite"
 )
 
 // askControl asks a control-chat question and returns its Codex call.
@@ -284,16 +287,16 @@ func configPath(s *harness.Scenario) string {
 
 // configDefaults reads the cxp config's global defaults.
 func configDefaults(s *harness.Scenario) (model, effort string) {
-	var cfg struct {
-		Defaults struct {
-			Model           string `json:"model"`
-			ReasoningEffort string `json:"reasoningEffort"`
-		} `json:"defaults"`
+	native := strings.TrimSuffix(configPath(s), ".json") + ".sqlite"
+	db, err := sql.Open("sqlite", (&url.URL{Scheme: "file", Path: "/" + strings.TrimPrefix(filepath.ToSlash(native), "/"), RawQuery: "mode=ro"}).String())
+	if err != nil {
+		s.T.Fatal(err)
 	}
-	if b, err := os.ReadFile(configPath(s)); err == nil {
-		_ = json.Unmarshal(b, &cfg)
+	defer db.Close()
+	if err := db.QueryRow(`SELECT defaults_model,defaults_effort FROM config_header WHERE id=1`).Scan(&model, &effort); err != nil {
+		s.T.Fatal(err)
 	}
-	return cfg.Defaults.Model, cfg.Defaults.ReasoningEffort
+	return model, effort
 }
 
 // Global defaults set by an older release (cxp config `defaults.model` /
@@ -316,6 +319,7 @@ func TestGlobalDefaultsFromTheConfig(t *testing.T) {
 		}
 	}
 	cfg["defaults"] = map[string]any{"model": "official:gpt-5-mini", "reasoningEffort": "medium", "e2eKeep": "kept"}
+	cfg["proxyEnabled"] = false
 	b, _ := json.MarshalIndent(cfg, "", "  ")
 	if err := os.MkdirAll(filepath.Dir(configPath(s)), 0o700); err != nil {
 		t.Fatal(err)
@@ -331,14 +335,19 @@ func TestGlobalDefaultsFromTheConfig(t *testing.T) {
 	s.Check("a new chat takes the config's defaults", ok && n.Model == "gpt-5-mini" && n.Effort == "medium",
 		"gpt-5-mini, medium", fmt.Sprintf("model=%q effort=%q", n.Model, n.Effort))
 	expect(s, control.ID, "default effort set low", "Global default effort: `low`", "Previous configured effort: `medium`")
-	var after struct {
-		Defaults map[string]string `json:"defaults"`
+	model, effort := configDefaults(s)
+	db, err := sql.Open("sqlite", (&url.URL{Scheme: "file", Path: "/" + strings.TrimPrefix(filepath.ToSlash(strings.TrimSuffix(configPath(s), ".json")+".sqlite"), "/"), RawQuery: "mode=ro"}).String())
+	if err != nil {
+		t.Fatal(err)
 	}
-	raw, _ := os.ReadFile(configPath(s))
-	_ = json.Unmarshal(raw, &after)
-	s.Check("`default effort set` writes the config and keeps its other keys",
-		after.Defaults["model"] == "official:gpt-5-mini" && after.Defaults["reasoningEffort"] == "low" && after.Defaults["e2eKeep"] == "kept",
-		"model official:gpt-5-mini, reasoningEffort low, e2eKeep kept", fmt.Sprintf("%v", after.Defaults))
+	defer db.Close()
+	var proxyEnabled bool
+	if err := db.QueryRow(`SELECT proxy_enabled FROM config_header WHERE id=1`).Scan(&proxyEnabled); err != nil {
+		t.Fatal(err)
+	}
+	s.Check("default change preserves the other native configuration fields", model == "official:gpt-5-mini" && effort == "low" && !proxyEnabled, "original model; effort low; proxy disabled", fmt.Sprintf("%s %s proxy=%v", model, effort, proxyEnabled))
+	archived, err := os.ReadFile(configPath(s) + ".migrated")
+	s.Check("retired unknown fields remain in the original migration archive", err == nil && strings.Contains(string(archived), "e2eKeep"), "original legacy evidence", fmt.Sprint(err))
 }
 
 // MODEL-SHOWN (F-TRN-7; field report 2026-11-07): the model and effort a

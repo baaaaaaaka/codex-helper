@@ -3,7 +3,6 @@ package cli
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -173,11 +172,9 @@ func TestTeamsCommandsReadThePublishedStateWhileAHelperHoldsTheStore(t *testing.
 	}
 
 	// A file of another generation is not this helper's.
-	raw, _ := os.ReadFile(teamsStatusFilePath(dir))
-	var p teamsPublishedStatus
-	_ = json.Unmarshal(raw, &p)
+	p := readTeamsStatusFileForTest(t, dir)
 	p.Gen = h.Gen() + 7
-	if err := writeTeamsJSONFile(teamsStatusFilePath(dir), p); err != nil {
+	if err := writeTeamsStatusSnapshot(teamsStatusFilePath(dir), p); err != nil {
 		t.Fatal(err)
 	}
 	if _, _, err := teamsReadStoreState(view, time.Now()); !errors.As(err, &unpublished) {
@@ -274,7 +271,7 @@ func TestTeamsRemoteStoreStateUsesThePublishedFile(t *testing.T) {
 	if _, _, err := teamsReadStoreState(v, time.Now()); err == nil || !strings.Contains(err.Error(), "has not published") {
 		t.Fatalf("held, nothing published: %v", err)
 	}
-	if err := writeTeamsJSONFile(teamsStatusFilePath(dir), teamsPublishedStatus{V: 1, Gen: 5, Host: "other-host", PID: 77, At: time.Now().UnixMilli(),
+	if err := writeTeamsStatusSnapshot(teamsStatusFilePath(dir), teamsPublishedStatus{V: 1, Gen: 5, Host: "other-host", PID: 77, At: time.Now().UnixMilli(),
 		State: teamsStoreStatus{Sessions: 4, Active: 3, Control: &teamsControlChat{ChatID: "c9", URL: "https://x.invalid/c9"}}}); err != nil {
 		t.Fatal(err)
 	}

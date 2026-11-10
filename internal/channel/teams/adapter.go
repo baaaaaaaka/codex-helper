@@ -383,3 +383,16 @@ func (a *Adapter) PayloadText(body string) string {
 	}
 	return strings.TrimSpace(plainText(m.Body.Content))
 }
+
+// Close releases connections owned by the delegated token sources. HTTP
+// clients keep their existing caller-owned lifetime.
+func (a *Adapter) Close() error {
+	var errs []error
+	if auth, ok := a.cfg.Tokens.(*DelegatedAuth); ok {
+		errs = append(errs, auth.Close())
+	}
+	if auth, ok := a.cfg.ReadTokens.(*DelegatedAuth); ok {
+		errs = append(errs, auth.Close())
+	}
+	return errors.Join(errs...)
+}

@@ -3,7 +3,6 @@ package teams
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -256,8 +255,7 @@ func TestRenderSplitsLongDocuments(t *testing.T) {
 
 func TestRenderAttachesFilesToLastPart(t *testing.T) {
 	_, a := newFake(t, fakegraph.Options{})
-	ref, _ := json.Marshal(driveRef{ItemID: "item", AttachmentID: "0a1b2c3d-0000-4000-8000-000000000001", URL: "https://t.sharepoint.com/f/report.pdf", Name: "report.pdf"})
-	doc := channel.RichDoc{Label: "L", Markdown: strings.Repeat("word\n", 8000), Files: []channel.FileRef{{Name: "report.pdf", Ref: "drive:" + string(ref)}}}
+	doc := channel.RichDoc{Label: "L", Markdown: strings.Repeat("word\n", 8000), Files: []channel.FileRef{{Name: "report.pdf", Ref: "drive:item", AttachmentID: "0a1b2c3d-0000-4000-8000-000000000001", URL: "https://t.sharepoint.com/f/report.pdf"}}}
 	parts, err := a.Render(context.Background(), doc)
 	if err != nil {
 		t.Fatal(err)

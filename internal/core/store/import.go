@@ -136,9 +136,9 @@ ON CONFLICT(delivery_key) DO NOTHING RETURNING id`,
 		return 0, false, fmt.Errorf("outbox %s: %w", o.DeliveryKey, err)
 	}
 	if f != nil {
-		if _, err := im.t.exec(`INSERT INTO outbox_files(outbox_id,local_path,size,upload_url,upload_expires_at,uploaded_bytes,ext_item_id)
-VALUES (?,?,?,?,?,?,?)`, id, f.LocalPath, f.Size, nullStr(f.UploadURL), nullInt(f.UploadExpiresAt), f.UploadedBytes, nullStr(f.ExtItemID)); err != nil {
+		if err := im.t.insertOutboxFile(id, *f); err != nil {
 			return 0, false, err
+
 		}
 	}
 	return id, true, nil

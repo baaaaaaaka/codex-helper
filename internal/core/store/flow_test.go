@@ -125,11 +125,11 @@ func TestOutboxOrderAndPerConversationBlocking(t *testing.T) {
 	if m := next(); m[a] != "" || m[b] != "b1" {
 		t.Fatalf("heads while a1 sending %v", m)
 	}
-	// unknown keeps blocking a and is never offered again.
+	// Unknown is retained without holding a2 behind it.
 	mustT(t, s.Update(func(tx *Tx) error { return tx.MarkUnknown(1, "timeout") }))
 	for i := 0; i < 3; i++ {
 		c.add(OwnerStaleAfter)
-		if m := next(); m[a] != "" || m[b] != "b1" {
+		if m := next(); m[a] != "a2" || m[b] != "b1" {
 			t.Fatalf("heads while a1 unknown %v", m)
 		}
 	}
@@ -140,10 +140,10 @@ func TestOutboxOrderAndPerConversationBlocking(t *testing.T) {
 		}
 		return tx.MarkSent(3, "mb1")
 	}))
-	if m := next(); m[b] != "b2" || m[a] != "" {
+	if m := next(); m[b] != "b2" || m[a] != "a2" {
 		t.Fatalf("heads after b1 sent %v", m)
 	}
-	// Resolution by read-back: a1 found -> sent; a2 becomes the head.
+	// Late resolution settles a1 without changing the active a2 head.
 	mustT(t, s.Update(func(tx *Tx) error { return tx.MarkSent(1, "ma1") }))
 	if m := next(); m[a] != "a2" {
 		t.Fatalf("heads after a1 resolved %v", m)
@@ -390,7 +390,7 @@ func TestNextRunnableBlocking(t *testing.T) {
 	s, _ := openTest(t)
 	a := newWork(t, s, "a")
 	f := InboundMsg{ExtMsgID: "p1", ExtTime: 1, Sender: SenderOwner, Kind: InPrompt,
-		Files: []InboundFile{{Idx: 0, Name: "x.png", ExtRef: "r", Kind: "image"}}}
+		Files: []InboundFile{{Idx: 0, Name: "x.png", Ref: FileReference{Ref: "r"}, Kind: "image"}}}
 	mustT(t, s.Update(func(tx *Tx) error {
 		_, err := tx.AdmitWindow("k", a, []InboundMsg{f, prompt("p2", 2)}, "c")
 		return err
@@ -583,12 +583,12 @@ func TestGatesAndMeta(t *testing.T) {
 		t.Fatalf("gates rows %d", n)
 	}
 	mustT(t, s.Update(func(tx *Tx) error {
-		if err := tx.SetMeta("temporary", "id"); err != nil {
+		if err := tx.SetMeta("engine_user_title:999998", "id"); err != nil {
 			return err
 		}
-		return tx.DeleteMeta("temporary")
+		return tx.DeleteMeta("engine_user_title:999998")
 	}))
-	if _, ok, err := s.Meta("temporary"); err != nil || ok {
+	if _, ok, err := s.Meta("engine_user_title:999998"); err != nil || ok {
 		t.Fatalf("deleted meta still present: %v %v", ok, err)
 	}
 }

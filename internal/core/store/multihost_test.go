@@ -46,13 +46,13 @@ func TestMultiHostCopyOfAFrozenWriter(t *testing.T) {
 		_, err = s.Acquire(Ident{Host: "writer", PID: os.Getpid(), BootID: "b"})
 		mustT(t, err)
 		for i := 1; i <= n; i++ {
-			mustT(t, s.Update(func(tx *Tx) error { return tx.SetMeta(fmt.Sprintf("k%06d", i), strconv.Itoa(i)) }))
+			mustT(t, s.Update(func(tx *Tx) error { return tx.SetMeta(fmt.Sprintf("engine_user_title:%d", i), strconv.Itoa(i)) }))
 			// The commit returned: record it where the copier can see it.
 			mustT(t, writeSynced(ack, strconv.Itoa(i)))
 		}
 		big := strings.Repeat("x", 48<<20) // beyond cache_size: spills into the WAL
 		_ = s.Update(func(tx *Tx) error {
-			if err := tx.SetMeta("big", big); err != nil {
+			if err := tx.SetMeta("engine_user_title:999999", big); err != nil {
 				return err
 			}
 			mustT(t, writeSynced(frozen, "1"))
@@ -86,14 +86,14 @@ func TestMultiHostCopyOfAFrozenWriter(t *testing.T) {
 		defer c.Close()
 		missing := 0
 		for i := 1; i <= acked; i++ {
-			if v, ok, err := c.Meta(fmt.Sprintf("k%06d", i)); err != nil || !ok || v != strconv.Itoa(i) {
+			if v, ok, err := c.Meta(fmt.Sprintf("engine_user_title:%d", i)); err != nil || !ok || v != strconv.Itoa(i) {
 				missing++
 			}
 		}
 		if missing > 0 {
 			t.Fatalf("%d of %d acknowledged commits missing from the copy", missing, acked)
 		}
-		if _, ok, _ := c.Meta("big"); ok {
+		if _, ok, _ := c.Meta("engine_user_title:999999"); ok {
 			t.Fatal("the frozen transaction's data is in the copy")
 		}
 		t.Logf("all %d acknowledged commits in the copy; the frozen write is not", acked)

@@ -194,7 +194,7 @@ func TestMigrateLegacySkillsRejectsUnsafeLegacyExportName(t *testing.T) {
 		t.Fatalf("read manifest ok=%v err=%v", ok, err)
 	}
 	manifest.ExportName = "../escaped"
-	if err := writeJSONFile(manifestPath, manifest); err != nil {
+	if err := writeManifest(manifestPath, manifest); err != nil {
 		t.Fatalf("tamper manifest: %v", err)
 	}
 
@@ -277,7 +277,7 @@ func TestMigrateLegacySkillsRejectsUnsafeManifestRelPath(t *testing.T) {
 		t.Fatal("manifest has no files")
 	}
 	manifest.Files[0].RelPath = "../outside"
-	if err := writeJSONFile(manifestPath, manifest); err != nil {
+	if err := writeManifest(manifestPath, manifest); err != nil {
 		t.Fatalf("tamper manifest: %v", err)
 	}
 

@@ -174,6 +174,7 @@ func runCodexApp(cmd *cobra.Command, root *rootOptions, opts codexAppOptions) er
 	if err != nil {
 		return err
 	}
+	defer store.Close()
 
 	useProxy := false
 	var cfg config.Config

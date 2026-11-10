@@ -1,7 +1,6 @@
 package machineregistry
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -11,8 +10,6 @@ import (
 	"fmt"
 	"html"
 	"net/http"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -223,6 +220,7 @@ type Cache struct {
 type Store struct {
 	Graph           Graph
 	CachePath       string
+	CacheDatabase   *CacheDB
 	Subject         string
 	WindowDuration  time.Duration
 	RefreshInterval time.Duration
@@ -238,7 +236,7 @@ type EnsureResult struct {
 }
 
 func DefaultCachePath() (string, error) {
-	return appdirs.StatePath("teams", "machine-registry.json")
+	return appdirs.StatePath("teams", "machine-registry.sqlite")
 }
 
 func RegistryKey(tenantID string, userID string) string {
@@ -436,7 +434,7 @@ func (s Store) Ensure(ctx context.Context, tenantID string, userID string) (Ensu
 		return EnsureResult{}, fmt.Errorf("registry graph is required")
 	}
 	now := s.now()
-	cache, err := LoadCache(s.CachePath)
+	cache, err := s.loadCache()
 	if err != nil {
 		return EnsureResult{}, err
 	}
@@ -452,7 +450,7 @@ func (s Store) Ensure(ctx context.Context, tenantID string, userID string) (Ensu
 					next := cache
 					next.SchemaVersion = 1
 					next.ValidatedAt = firstNonZeroTime(next.ValidatedAt, now)
-					written, err := SaveCache(s.CachePath, next)
+					written, err := s.SaveCache(next)
 					if err != nil {
 						return EnsureResult{}, err
 					}
@@ -489,7 +487,7 @@ func (s Store) Ensure(ctx context.Context, tenantID string, userID string) (Ensu
 		next.RefreshedAt = now
 		next.NextRefreshAt = now.Add(s.refreshInterval())
 	}
-	written, err := SaveCache(s.CachePath, next)
+	written, err := s.SaveCache(next)
 	if err != nil {
 		return EnsureResult{}, err
 	}
@@ -518,7 +516,7 @@ func (s Store) EnsureInbox(ctx context.Context, cache Cache, machineID string) (
 					next := cache
 					next.SchemaVersion = 1
 					next.InboxValidatedAt = firstNonZeroTime(next.InboxValidatedAt, now)
-					written, err := SaveCache(s.CachePath, next)
+					written, err := s.SaveCache(next)
 					if err != nil {
 						return cache, Chat{}, OnlineMeeting{}, false, err
 					}
@@ -546,7 +544,7 @@ func (s Store) EnsureInbox(ctx context.Context, cache Cache, machineID string) (
 	next.InboxValidatedAt = now
 	next.InboxRefreshedAt = now
 	next.InboxNextRefreshAt = now.Add(s.refreshInterval())
-	written, err := SaveCache(s.CachePath, next)
+	written, err := s.SaveCache(next)
 	if err != nil {
 		return cache, Chat{}, OnlineMeeting{}, false, err
 	}
@@ -577,7 +575,7 @@ func (s Store) RefreshMeeting(ctx context.Context, cache Cache) (Cache, bool, er
 	next.MeetingEndDateTime = strings.TrimSpace(meeting.EndDateTime)
 	next.RefreshedAt = now
 	next.NextRefreshAt = now.Add(s.refreshInterval())
-	written, err := SaveCache(s.CachePath, next)
+	written, err := s.SaveCache(next)
 	return next, written, err
 }
 
@@ -613,7 +611,7 @@ func (s Store) Publish(ctx context.Context, cache Cache, card MachineCard) (Cach
 	written := false
 	if !sameCache(cache, next) {
 		var err error
-		written, err = SaveCache(s.CachePath, next)
+		written, err = s.SaveCache(next)
 		if err != nil {
 			return cache, PublishResult{}, false, err
 		}
@@ -633,51 +631,6 @@ func (s Store) Observe(ctx context.Context, cache Cache, top int, now time.Time)
 		now = s.now()
 	}
 	return Observe(ctx, s.Graph, chatID, cache.RegistryKey, top, now)
-}
-
-func LoadCache(path string) (Cache, error) {
-	if strings.TrimSpace(path) == "" {
-		return Cache{}, nil
-	}
-	raw, err := os.ReadFile(path)
-	if os.IsNotExist(err) {
-		return Cache{}, nil
-	}
-	if err != nil {
-		return Cache{}, err
-	}
-	if len(bytes.TrimSpace(raw)) == 0 {
-		return Cache{}, nil
-	}
-	var cache Cache
-	if err := json.Unmarshal(raw, &cache); err != nil {
-		return Cache{}, err
-	}
-	return cache, nil
-}
-
-func SaveCache(path string, cache Cache) (bool, error) {
-	if strings.TrimSpace(path) == "" {
-		return false, nil
-	}
-	raw, err := json.MarshalIndent(cache, "", "  ")
-	if err != nil {
-		return false, err
-	}
-	raw = append(raw, '\n')
-	if existing, err := os.ReadFile(path); err == nil && bytes.Equal(existing, raw) {
-		return false, nil
-	} else if err != nil && !os.IsNotExist(err) {
-		return false, err
-	}
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return false, err
-	}
-	if err := writeCacheFileAtomically(path, raw, 0o600); err != nil {
-		return false, err
-	}
-	return true, nil
 }
 
 func (s Store) now() time.Time {
@@ -833,9 +786,25 @@ func shortHash(value string, bytes int) string {
 }
 
 func sameCache(left Cache, right Cache) bool {
-	leftRaw, _ := json.Marshal(left)
-	rightRaw, _ := json.Marshal(right)
-	return bytes.Equal(leftRaw, rightRaw)
+	if !left.InboxValidatedAt.Equal(right.InboxValidatedAt) ||
+		!left.InboxRefreshedAt.Equal(right.InboxRefreshedAt) ||
+		!left.InboxNextRefreshAt.Equal(right.InboxNextRefreshAt) ||
+		!left.SlotCreatedAt.Equal(right.SlotCreatedAt) ||
+		!left.NextSlotRotationAt.Equal(right.NextSlotRotationAt) ||
+		!left.ValidatedAt.Equal(right.ValidatedAt) ||
+		!left.RefreshedAt.Equal(right.RefreshedAt) ||
+		!left.NextRefreshAt.Equal(right.NextRefreshAt) {
+		return false
+	}
+	left.InboxValidatedAt, right.InboxValidatedAt = time.Time{}, time.Time{}
+	left.InboxRefreshedAt, right.InboxRefreshedAt = time.Time{}, time.Time{}
+	left.InboxNextRefreshAt, right.InboxNextRefreshAt = time.Time{}, time.Time{}
+	left.SlotCreatedAt, right.SlotCreatedAt = time.Time{}, time.Time{}
+	left.NextSlotRotationAt, right.NextSlotRotationAt = time.Time{}, time.Time{}
+	left.ValidatedAt, right.ValidatedAt = time.Time{}, time.Time{}
+	left.RefreshedAt, right.RefreshedAt = time.Time{}, time.Time{}
+	left.NextRefreshAt, right.NextRefreshAt = time.Time{}, time.Time{}
+	return left == right
 }
 
 func firstNonEmptyString(values ...string) string {

@@ -130,12 +130,16 @@ func TestRuntimeProcessIdentityLinux(t *testing.T) {
 			if got := strings.TrimSpace(observed[0]); got != "cxp" {
 				t.Fatalf("comm = %q, want cxp", got)
 			}
-			if !strings.HasSuffix(observed[1], "/.cxp-runtime/versions/v1.2.3/cxp") {
+			wantVersion := "v1.2.3"
+			if tc.preseed {
+				wantVersion = "v1.0.0"
+			} // A newer dispatcher cannot undo explicit native selection.
+			if !strings.HasSuffix(observed[1], "/.cxp-runtime/versions/"+wantVersion+"/cxp") {
 				t.Fatalf("exe = %q", observed[1])
 			}
 			runtimeRoot := filepath.Clean(filepath.Join(filepath.Dir(observed[1]), "..", ".."))
-			if active, err := ReadActive(runtimeRoot); err != nil || active != "v1.2.3" {
-				t.Fatalf("active runtime = %q, %v; want v1.2.3", active, err)
+			if active, err := ReadActive(runtimeRoot); err != nil || active != wantVersion {
+				t.Fatalf("active runtime = %q, %v; want %s", active, err, wantVersion)
 			}
 			if tc.multiHop {
 				if got, err := os.Readlink(entry); err != nil || got != filepath.Join("links", "second") {

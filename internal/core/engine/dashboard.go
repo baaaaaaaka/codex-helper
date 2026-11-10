@@ -37,10 +37,7 @@ import (
 // periodic work.
 
 const (
-	// metaDashView is the numbered list the owner's next number refers to
-	// (JSON dashView; "" = none).
-	metaDashView = "engine_dashboard_view"
-	dashViewTTL  = 10 * time.Minute
+	dashViewTTL = 10 * time.Minute
 )
 
 const (
@@ -66,19 +63,9 @@ type dashMeta struct {
 }
 
 // dashView is v0.1.20's DashboardView.
-type dashView struct {
-	Kind      string     `json:"kind"`
-	Workspace string     `json:"workspace,omitempty"` // the selected workspace id
-	Items     []dashItem `json:"items,omitempty"`
-	Expires   int64      `json:"expires"` // unix ms
-}
+type dashView = store.DashboardView
 
-type dashItem struct {
-	N         int    `json:"n"`
-	Kind      string `json:"kind"`
-	Workspace string `json:"workspace"`
-	Thread    string `json:"thread,omitempty"`
-}
+type dashItem = store.DashboardItem
 
 type dashSession struct {
 	thread, path, cwd, workspace string
@@ -113,11 +100,9 @@ func (e *Engine) dashLoad() *dashView {
 	e.dash.mu.Unlock()
 	// Read outside dash.mu: dashStore takes it inside a store transaction.
 	var view *dashView
-	if v, ok, err := e.st.Meta(metaDashView); err == nil && ok && v != "" {
-		var dv dashView
-		if json.Unmarshal([]byte(v), &dv) == nil {
-			view = &dv
-		}
+	if err := e.st.Read(func(tx *store.Tx) (err error) { view, err = tx.DashboardView(); return }); err != nil {
+		e.logf("dashboard: %v", err)
+		return nil
 	}
 	e.dash.mu.Lock()
 	defer e.dash.mu.Unlock()
@@ -131,15 +116,7 @@ func (e *Engine) dashLoad() *dashView {
 // remembers it once that transaction commits.
 func (e *Engine) dashStore(v *dashView) func(tx *store.Tx) error {
 	return func(tx *store.Tx) error {
-		val := ""
-		if v != nil {
-			b, err := json.Marshal(v)
-			if err != nil {
-				return err
-			}
-			val = string(b)
-		}
-		if err := tx.SetMeta(metaDashView, val); err != nil {
+		if err := tx.SetDashboardView(v); err != nil {
 			return err
 		}
 		e.dash.mu.Lock()

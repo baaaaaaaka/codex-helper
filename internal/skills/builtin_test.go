@@ -325,6 +325,7 @@ func newBuiltinTestManager(t *testing.T) *Manager {
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
+	t.Cleanup(func() { mgr.Store.Close() })
 	return mgr
 }
 

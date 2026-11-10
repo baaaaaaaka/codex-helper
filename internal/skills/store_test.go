@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 )
@@ -14,6 +13,7 @@ func TestStoreConcurrentUpdateKeepsAllSources(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 	const n = 16
 	var wg sync.WaitGroup
 	for i := 0; i < n; i++ {
@@ -54,31 +54,20 @@ func TestStoreConcurrentUpdateKeepsAllSources(t *testing.T) {
 }
 
 func TestStoreRejectsCorruptJSONAndUnsupportedVersions(t *testing.T) {
-	store, err := NewStore(filepath.Join(t.TempDir(), "config"))
-	if err != nil {
-		t.Fatalf("new store: %v", err)
-	}
-	if err := os.WriteFile(store.ConfigPath(), []byte("{not json"), 0o600); err != nil {
-		t.Fatalf("write corrupt config: %v", err)
-	}
-	if _, err := store.LoadConfig(); err == nil || !strings.Contains(err.Error(), "parse skill-subscriptions.json") {
-		t.Fatalf("LoadConfig corrupt error = %v", err)
-	}
-
-	store, err = NewStore(filepath.Join(t.TempDir(), "config"))
-	if err != nil {
-		t.Fatalf("new store: %v", err)
-	}
-	if err := os.WriteFile(store.ConfigPath(), []byte(`{"version":99,"sources":[]}`), 0o600); err != nil {
-		t.Fatalf("write unsupported config: %v", err)
-	}
-	if _, err := store.LoadConfig(); err == nil || !strings.Contains(err.Error(), "unsupported skill subscriptions version") {
-		t.Fatalf("LoadConfig unsupported error = %v", err)
-	}
-	if err := os.WriteFile(store.StatePath(), []byte(`{"version":99,"sources":[]}`), 0o600); err != nil {
-		t.Fatalf("write unsupported state: %v", err)
-	}
-	if _, err := store.LoadState(); err == nil || !strings.Contains(err.Error(), "unsupported skill subscription state version") {
-		t.Fatalf("LoadState unsupported error = %v", err)
+	for _, tc := range []struct{ name, file, input string }{
+		{"corrupt", ConfigFilename, "{not json"},
+		{"future-config", ConfigFilename, `{"version":99,"sources":[]}`},
+		{"future-state", StateFilename, `{"version":99,"sources":[]}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, tc.file), []byte(tc.input), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if db, err := NewStore(dir); err == nil {
+				db.Close()
+				t.Fatal("accepted invalid legacy input")
+			}
+		})
 	}
 }

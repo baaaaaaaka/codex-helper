@@ -142,7 +142,7 @@ func openTeamsCoreStore(ctx context.Context, holder *lease.Holder, sessionsDir s
 	if err := holder.Verify(); err != nil {
 		return nil, teamsLeaseLostError(err, plan.DB)
 	}
-	st, err := corestore.OpenWith(plan.DB, corestore.Options{Lease: holder})
+	st, err := corestore.OpenWith(plan.DB, corestore.Options{Lease: holder, RequireExisting: plan.FromGen != 0})
 	if err != nil {
 		return nil, fmt.Errorf("open Teams core store: %w", err)
 	}

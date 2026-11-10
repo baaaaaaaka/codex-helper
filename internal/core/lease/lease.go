@@ -47,7 +47,6 @@ package lease
 
 import (
 	"encoding/binary"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/crc32"
@@ -117,54 +116,89 @@ type Record struct {
 }
 
 const (
-	recordVersion = 1
+	recordVersion = 2
 	slotSize      = 1024
 	slotHeader    = 10 // magic(4) + length(2) + crc32(4)
-	slotMagic     = "CXL1"
+	slotMagic     = "CXL2"
 )
 
-// encode renders r into one slot.
+// encode changes only the slot representation. Ownership, fixed slot offsets,
+// CRC and byte-wise liveness checks are unchanged. Coordination cannot depend
+// on opening the business database whose ownership these records establish.
 func encode(r Record) ([]byte, error) {
-	r.V = recordVersion
-	js, err := json.Marshal(r)
-	if err != nil {
-		return nil, err
+	b := make([]byte, slotHeader, slotSize)
+	b = binary.BigEndian.AppendUint64(b, uint64(r.Gen))
+	b = binary.BigEndian.AppendUint64(b, uint64(r.PID))
+	b = binary.BigEndian.AppendUint64(b, uint64(r.Beat))
+	b = binary.BigEndian.AppendUint64(b, uint64(r.Wall))
+	if r.Batch {
+		b = append(b, 1)
+	} else {
+		b = append(b, 0)
 	}
-	if len(js) > slotSize-slotHeader {
-		return nil, fmt.Errorf("lease: record of %d bytes does not fit a slot", len(js))
+	for _, field := range []string{string(r.State), r.Host, r.Boot, r.PIDNS, r.Start, r.Nonce, r.DB, r.From, r.Why, r.Mode} {
+		if len(field) > slotSize || len(b)+2+len(field) > slotSize {
+			return nil, fmt.Errorf("lease: record does not fit a slot")
+		}
+		b = binary.BigEndian.AppendUint16(b, uint16(len(field)))
+		b = append(b, field...)
 	}
-	buf := make([]byte, slotSize)
-	copy(buf, slotMagic)
-	binary.BigEndian.PutUint16(buf[4:], uint16(len(js)))
-	binary.BigEndian.PutUint32(buf[6:], crc32.ChecksumIEEE(js))
-	copy(buf[slotHeader:], js)
-	return buf, nil
+	copy(b, slotMagic)
+	binary.BigEndian.PutUint16(b[4:], uint16(len(b)-slotHeader))
+	binary.BigEndian.PutUint32(b[6:], crc32.ChecksumIEEE(b[slotHeader:]))
+	return append(b, make([]byte, slotSize-len(b))...), nil
 }
 
-// decode parses a slot: ok is false for an empty slot, err non-nil for a
-// slot with data that is not a complete record of this version (being
-// written, torn, or from a newer helper).
+// decode keeps invalid/nonempty slots visible to the existing fencing logic.
+// Historical version-one slots are read by the migration decoder only; no
+// writer rewrites another generation's slot or emits the retired format.
 func decode(slot []byte) (r Record, ok bool, err error) {
 	if isEmpty(slot) {
 		return Record{}, false, nil
 	}
-	if len(slot) < slotHeader || string(slot[:4]) != slotMagic {
+	if len(slot) < slotHeader {
+		return Record{}, true, errors.New("lease: truncated slot")
+	}
+	magic := string(slot[:4])
+	if magic != slotMagic && magic != "CXL1" {
 		return Record{}, true, errors.New("lease: unknown slot format")
 	}
 	n := int(binary.BigEndian.Uint16(slot[4:]))
-	if slotHeader+n > len(slot) {
+	if n > slotSize-slotHeader || slotHeader+n > len(slot) {
 		return Record{}, true, errors.New("lease: truncated slot")
 	}
-	js := slot[slotHeader : slotHeader+n]
-	if crc32.ChecksumIEEE(js) != binary.BigEndian.Uint32(slot[6:]) {
+	body := slot[slotHeader : slotHeader+n]
+	if crc32.ChecksumIEEE(body) != binary.BigEndian.Uint32(slot[6:]) {
 		return Record{}, true, errors.New("lease: slot checksum mismatch (being written?)")
 	}
-	if err := json.Unmarshal(js, &r); err != nil {
-		return Record{}, true, err
+	if magic == "CXL1" {
+		return decodeLegacySlot(body)
 	}
-	if r.V != recordVersion {
-		return Record{}, true, fmt.Errorf("lease: record version %d", r.V)
+	if len(body) < 33 {
+		return Record{}, true, errors.New("lease: short record")
 	}
+	r = Record{V: recordVersion, Gen: int64(binary.BigEndian.Uint64(body)), PID: int(binary.BigEndian.Uint64(body[8:])), Beat: int64(binary.BigEndian.Uint64(body[16:])), Wall: int64(binary.BigEndian.Uint64(body[24:])), Batch: body[32] == 1}
+	if body[32] > 1 {
+		return Record{}, true, errors.New("lease: invalid batch flag")
+	}
+	body = body[33:]
+	state := ""
+	for _, field := range []*string{&state, &r.Host, &r.Boot, &r.PIDNS, &r.Start, &r.Nonce, &r.DB, &r.From, &r.Why, &r.Mode} {
+		if len(body) < 2 {
+			return Record{}, true, errors.New("lease: short field")
+		}
+		n = int(binary.BigEndian.Uint16(body))
+		body = body[2:]
+		if n > len(body) {
+			return Record{}, true, errors.New("lease: truncated field")
+		}
+		*field = string(body[:n])
+		body = body[n:]
+	}
+	if len(body) != 0 {
+		return Record{}, true, errors.New("lease: trailing record fields")
+	}
+	r.State = State(state)
 	return r, true, nil
 }
 

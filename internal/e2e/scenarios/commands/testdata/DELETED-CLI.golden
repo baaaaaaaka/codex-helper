@@ -23,11 +23,11 @@ $ cxp teams path mode service
 $ cxp teams auth read
    exit 0
    stdout| Authenticated read access as E2E Owner
-   stdout| Token cache: <root>/home/.local/state/e2e-tokens/teams-read-token.json
+   stdout| Token cache: <root>/home/.local/state/e2e-tokens/teams-tokens.sqlite#read
 $ cxp teams auth read-status
    exit 0
    stdout| Teams read auth: logged in (access token valid for 2h0m0s)
-   stdout| Read token cache: <root>/home/.local/state/e2e-tokens/teams-read-token.json
+   stdout| Read token cache: <root>/home/.local/state/e2e-tokens/teams-tokens.sqlite#read
 $ cxp teams path mode account-default
    exit 0
    stdout| Teams Codex PATH mode: account-default

@@ -127,6 +127,7 @@ func runCodexAppAuth(cmd *cobra.Command, root *rootOptions, opts codexAppAuthOpt
 	if err != nil {
 		return err
 	}
+	defer store.Close()
 
 	useProxy := false
 	var cfg config.Config

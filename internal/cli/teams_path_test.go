@@ -34,6 +34,7 @@ func TestTeamsPathExplicitAndModeCommandsPersistPolicy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { store.Close() })
 	cfg, err := store.Load()
 	if err != nil {
 		t.Fatal(err)
@@ -120,6 +121,7 @@ func TestTeamsPathShellDefaultClearsOverride(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { store.Close() })
 	if err := store.Save(config.Config{TeamsCodexPath: config.TeamsCodexPathPolicy{Mode: "account-default", ShellOverride: "/bin/zsh"}}); err != nil {
 		t.Fatal(err)
 	}

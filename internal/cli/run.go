@@ -92,6 +92,7 @@ func runLike(cmd *cobra.Command, root *rootOptions, autoInit bool) error {
 	if err != nil {
 		return err
 	}
+	defer store.Close()
 	if profileRef != "" {
 		profile, cfg, err := ensureProfileRunFn(ctx, store, profileRef, autoInit, cmd.OutOrStdout())
 		if err != nil {

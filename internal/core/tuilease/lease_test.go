@@ -2,7 +2,6 @@ package tuilease
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
@@ -32,7 +31,7 @@ func TestTUILeaseLifetimeAndAuthentication(t *testing.T) {
 	for _, backendStops := range []bool{false, true} {
 		t.Run(map[bool]string{false: "client-close", true: "backend-exit"}[backendStops], func(t *testing.T) {
 			f := &fakeAttach{acquired: make(chan string, 1), released: make(chan struct{}, 1), done: make(chan struct{})}
-			path := filepath.Join(t.TempDir(), "endpoint.json")
+			path := filepath.Join(t.TempDir(), "endpoint.sqlite")
 			s, err := Listen(path, "/private/codex", f, nil)
 			if err != nil {
 				t.Fatal(err)
@@ -42,9 +41,10 @@ func TestTUILeaseLifetimeAndAuthentication(t *testing.T) {
 			if runtime.GOOS != "windows" && stat.Mode().Perm() != 0600 {
 				t.Fatal(stat.Mode())
 			}
-			raw, _ := os.ReadFile(path)
-			var d descriptor
-			_ = json.Unmarshal(raw, &d)
+			d, err := readDescriptor(path)
+			if err != nil {
+				t.Fatal(err)
+			}
 			resp, err := http.Post(d.URL+"/attach", "application/json", nil)
 			if err != nil {
 				t.Fatal(err)
@@ -92,7 +92,7 @@ func TestTUILeaseFallbackOnlyForUnmanagedThread(t *testing.T) {
 			if rejected {
 				f.err = errors.New("still recovering")
 			}
-			path := filepath.Join(t.TempDir(), "endpoint.json")
+			path := filepath.Join(t.TempDir(), "endpoint.sqlite")
 			s, err := Listen(path, "/codex", f, nil)
 			if err != nil {
 				t.Fatal(err)
@@ -113,9 +113,8 @@ func TestTUILeaseFallbackOnlyForUnmanagedThread(t *testing.T) {
 func TestDescriptorRejectsRemoteAndCredentialURLs(t *testing.T) {
 	for _, endpoint := range []string{"http://127.0.0.1:80@remote.invalid", "http://remote.invalid:80", "https://127.0.0.1:80", "http://127.0.0.1:80/path"} {
 		t.Run(endpoint, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "endpoint.json")
-			data, _ := json.Marshal(descriptor{URL: endpoint, Token: "private", CodexHome: "/codex"})
-			if err := os.WriteFile(path, data, 0600); err != nil {
+			path := filepath.Join(t.TempDir(), "endpoint.sqlite")
+			if err := writeDescriptor(path, descriptor{URL: endpoint, Token: "private", CodexHome: "/codex"}, nil); err != nil {
 				t.Fatal(err)
 			}
 			lease, err := Acquire(context.Background(), path, "/codex", "thread")

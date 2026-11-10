@@ -185,6 +185,7 @@ func TestRunCodexAppDirectLaunchesDesktopApp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 	if err := store.Save(config.Config{Version: config.CurrentVersion, ProxyEnabled: boolPtr(false)}); err != nil {
 		t.Fatalf("save config: %v", err)
 	}
@@ -265,6 +266,7 @@ func TestRunCodexAppProxyLaunchUsesLongLivedProxy(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 	if err := store.Save(config.Config{Version: config.CurrentVersion}); err != nil {
 		t.Fatalf("save config: %v", err)
 	}
@@ -364,6 +366,7 @@ func TestRunCodexAppExplicitProfilePreservesDisabledPreference(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 	if err := store.Save(config.Config{Version: config.CurrentVersion, ProxyEnabled: boolPtr(false)}); err != nil {
 		t.Fatalf("save config: %v", err)
 	}
@@ -426,6 +429,7 @@ func TestRunCodexAppDoesNotPersistProxyPreferenceWhenProfileSetupFails(t *testin
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 	if err := store.Save(config.Config{Version: config.CurrentVersion}); err != nil {
 		t.Fatalf("save config: %v", err)
 	}

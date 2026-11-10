@@ -535,6 +535,7 @@ func newTestManager(t *testing.T) *Manager {
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
+	t.Cleanup(func() { mgr.Store.Close() })
 	return mgr
 }
 

@@ -2,12 +2,12 @@ package teams
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -19,14 +19,14 @@ import (
 
 func writeCache(t *testing.T, path string, tok TokenCache) {
 	t.Helper()
-	if err := WriteTokenCache(path, tok); err != nil {
+	if err := WriteTokenCache(testTokenLocation(path), tok); err != nil {
 		t.Fatal(err)
 	}
 }
 
 func readCache(t *testing.T, path string) TokenCache {
 	t.Helper()
-	tok, err := readTokenCache(path)
+	tok, err := ReadTokenCache(testTokenLocation(path))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,8 +37,9 @@ func authAdapter(t *testing.T, fg *fakegraph.Server, cachePath string) (*Adapter
 	t.Helper()
 	auth := NewDelegatedAuth(AuthConfig{
 		TenantID: fakegraph.TenantID, ClientID: "client", Scopes: DefaultScopes,
-		CachePath: cachePath, LoginURL: fg.URL(),
+		Cache: testTokenLocation(cachePath), LoginURL: fg.URL(),
 	}, &http.Client{Transport: loginHostTransport{http.DefaultTransport}})
+	t.Cleanup(func() { auth.Close() })
 	a, err := New(Config{GraphURL: fg.URL() + "/v1.0", Tokens: auth, Sleep: noSleep})
 	if err != nil {
 		t.Fatal(err)
@@ -61,7 +62,10 @@ func TestDelegatedAuthRefreshesOn401ForReads(t *testing.T) {
 	if tok.AccessToken == "revoked" || tok.RefreshToken == refresh || tok.RefreshToken == "" {
 		t.Fatalf("cache not refreshed: %+v", tok)
 	}
-	st, _ := os.Stat(path)
+	st, err := os.Stat(testTokenLocation(path).Database)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if runtime.GOOS != "windows" && st.Mode().Perm() != 0o600 { // no Unix modes on Windows
 		t.Fatalf("cache mode %v", st.Mode())
 	}
@@ -126,11 +130,12 @@ func TestDelegatedAuthProactiveRefreshAndFailures(t *testing.T) {
 	}
 	link := filepath.Join(dir, "link.json")
 	if err := os.Symlink(path, link); err == nil {
-		_, auth = authAdapter(t, fg, link)
+		auth = NewDelegatedAuth(AuthConfig{Cache: TokenLocation{Database: link, Slot: "full"}}, nil)
+		t.Cleanup(func() { auth.Close() })
 		if _, err := auth.Token(ctx); !errors.As(err, &ar) {
 			t.Fatalf("symlink cache: %v", err)
 		}
-		if err := WriteTokenCache(link, TokenCache{}); err == nil {
+		if err := WriteTokenCache(TokenLocation{Database: link, Slot: "link"}, TokenCache{}); err == nil {
 			t.Fatal("wrote through a symlink")
 		}
 	}
@@ -152,75 +157,80 @@ func TestResolveAuthConfigReadsExistingCaches(t *testing.T) {
 	cache := filepath.Join(root, "cache")
 	cfgPath := filepath.Join(root, "teams-auth.json")
 	t.Setenv("CODEX_HELPER_STATE_DIR", state)
-	// The user cache dir is XDG_CACHE_HOME on Linux, ~/Library/Caches on
-	// macOS and %LocalAppData% on Windows: point all of them into root.
 	t.Setenv("XDG_CACHE_HOME", cache)
 	t.Setenv("HOME", filepath.Join(root, "home"))
 	t.Setenv("LocalAppData", cache)
 	t.Setenv("CODEX_HELPER_TEAMS_AUTH_CONFIG", cfgPath)
-	for _, k := range []string{"CODEX_HELPER_TEAMS_AUTH_PROFILE", "CODEX_HELPER_TEAMS_PROFILE", "CODEX_HELPER_TEAMS_FULL_TENANT_ID",
-		"CODEX_HELPER_TEAMS_TENANT_ID", "CODEX_HELPER_TEAMS_FULL_CLIENT_ID", "CODEX_HELPER_TEAMS_CLIENT_ID",
-		"CODEX_HELPER_TEAMS_FULL_SCOPES", "CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE"} {
+	for _, k := range []string{"CODEX_HELPER_TEAMS_AUTH_PROFILE", "CODEX_HELPER_TEAMS_PROFILE", "CODEX_HELPER_TEAMS_FULL_TENANT_ID", "CODEX_HELPER_TEAMS_TENANT_ID", "CODEX_HELPER_TEAMS_FULL_CLIENT_ID", "CODEX_HELPER_TEAMS_CLIENT_ID", "CODEX_HELPER_TEAMS_FULL_SCOPES", "CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE", "CODEX_HELPER_TEAMS_READ_TOKEN_CACHE"} {
 		t.Setenv(k, "")
 	}
-
-	if _, err := ResolveAuthConfig(""); err == nil {
-		t.Fatal("expected error without tenant/client")
-	}
-	raw, _ := json.Marshal(map[string]any{
-		"tenant_id":  "tenant-a",
-		"chat_write": map[string]string{"client_id": "chat-client"},
-		"profiles":   map[string]any{"work": map[string]any{"full": map[string]string{"client_id": "work-client"}}},
-	})
-	if err := os.WriteFile(cfgPath, raw, 0o600); err != nil {
+	raw := `{"tenant_id":"tenant-a","chat_write":{"client_id":"chat-client"},"profiles":{"work":{"full":{"client_id":"work-client"}}}}`
+	if err := os.WriteFile(cfgPath, []byte(raw), 0600); err != nil {
 		t.Fatal(err)
 	}
-
-	primary := filepath.Join(state, "teams", "profiles", "default", "teams-full-token.json")
-	cfg, err := ResolveAuthConfig("")
-	if err != nil || cfg.TenantID != "tenant-a" || cfg.ClientID != "chat-client" || cfg.Scopes != DefaultScopes || cfg.CachePath != primary {
-		t.Fatalf("no caches: %+v %v", cfg, err)
-	}
-
-	// Pre-profile default cache from older builds.
 	legacy, err := appdirs.LegacyCachePath("teams-full-token.json")
 	if err != nil {
 		t.Fatal(err)
 	}
-	writeCache(t, legacy, TokenCache{RefreshToken: "r"})
-	if cfg, _ := ResolveAuthConfig(""); cfg.CachePath != legacy {
-		t.Fatalf("legacy cache not used: %s", cfg.CachePath)
+	if err = os.MkdirAll(filepath.Dir(legacy), 0700); err != nil {
+		t.Fatal(err)
 	}
-
-	// Chat-write cache only counts when it already carries the full scopes.
-	os.Remove(legacy)
-	chatW := filepath.Join(state, "teams", "profiles", "default", "teams-chat-write-token.json")
-	writeCache(t, chatW, TokenCache{RefreshToken: "r", Scope: "User.Read Chat.ReadWrite"})
-	if cfg, _ := ResolveAuthConfig(""); cfg.CachePath != primary {
-		t.Fatalf("reduced-scope chat cache used: %s", cfg.CachePath)
+	if err = os.WriteFile(legacy, []byte(`{"refresh_token":"old-refresh","expires_at":9007199254740993}`), 0600); err != nil {
+		t.Fatal(err)
 	}
-	writeCache(t, chatW, TokenCache{RefreshToken: "r", Scope: "openid User.Read Chat.ReadWrite OnlineMeetings.ReadWrite Files.ReadWrite.All"})
-	if cfg, _ := ResolveAuthConfig(""); cfg.CachePath != chatW {
-		t.Fatalf("full-scope chat cache not used: %s", cfg.CachePath)
+	cfg, err := ResolveAuthConfig("")
+	primary := TokenLocation{Database: filepath.Join(state, "teams", "profiles", "default", "teams-tokens.sqlite"), Slot: "full"}
+	if err != nil || cfg.TenantID != "tenant-a" || cfg.ClientID != "chat-client" || cfg.Scopes != DefaultScopes || cfg.Cache != primary {
+		t.Fatalf("config %#v/%v", cfg, err)
 	}
-	writeCache(t, primary, TokenCache{RefreshToken: "r"})
-	if cfg, _ := ResolveAuthConfig(""); cfg.CachePath != primary {
-		t.Fatalf("full cache must win: %s", cfg.CachePath)
+	tok, err := ReadTokenCache(cfg.Cache)
+	if err != nil || tok.RefreshToken != "old-refresh" || tok.ExpiresAt != 9007199254740993 {
+		t.Fatalf("legacy token %#v/%v", tok, err)
 	}
-
-	// Profiles and env overrides.
-	cfg, _ = ResolveAuthConfig("work")
-	if cfg.ClientID != "work-client" || cfg.CachePath != filepath.Join(state, "teams", "profiles", "work", "teams-full-token.json") {
-		t.Fatalf("profile: %+v", cfg)
+	if _, err = os.Stat(legacy + ".migrated"); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(legacy, []byte("poisoned"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err = RemoveTokenCache(context.Background(), primary); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err = ResolveAuthConfig(""); err != nil || cfg.Cache != primary {
+		t.Fatalf("native authority %#v/%v", cfg, err)
+	}
+	chat := primary
+	chat.Slot = "chat_write"
+	if err = WriteTokenCache(chat, TokenCache{RefreshToken: "r", Scope: "User.Read Chat.ReadWrite"}); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err = ResolveAuthConfig(""); err != nil || cfg.Cache != primary {
+		t.Fatalf("reduced scope %#v/%v", cfg, err)
+	}
+	if err = WriteTokenCache(chat, TokenCache{RefreshToken: "r", Scope: "openid User.Read Chat.ReadWrite OnlineMeetings.ReadWrite Files.ReadWrite.All"}); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err = ResolveAuthConfig(""); err != nil || cfg.Cache != chat {
+		t.Fatalf("full scope chat %#v/%v", cfg, err)
+	}
+	if err = WriteTokenCache(primary, TokenCache{RefreshToken: "r"}); err != nil {
+		t.Fatal(err)
+	}
+	if cfg, err = ResolveAuthConfig(""); err != nil || cfg.Cache != primary {
+		t.Fatalf("full precedence %#v/%v", cfg, err)
+	}
+	cfg, err = ResolveAuthConfig("work")
+	if err != nil || cfg.ClientID != "work-client" || cfg.Cache.Database != filepath.Join(state, "teams", "profiles", "work", "teams-tokens.sqlite") {
+		t.Fatalf("profile %#v/%v", cfg, err)
 	}
 	t.Setenv("CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE", filepath.Join(root, "explicit.json"))
 	t.Setenv("CODEX_HELPER_TEAMS_CLIENT_ID", "env-client")
-	cfg, _ = ResolveAuthConfig("")
-	if cfg.CachePath != filepath.Join(root, "explicit.json") || cfg.ClientID != "env-client" {
-		t.Fatalf("env: %+v", cfg)
+	cfg, err = ResolveAuthConfig("")
+	if err != nil || cfg.Cache.Database != filepath.Join(root, "teams-tokens.sqlite") || cfg.Cache.Slot != "explicit.json" || cfg.ClientID != "env-client" {
+		t.Fatalf("override %#v/%v", cfg, err)
 	}
 	if safePathPart("a b/ü") != "a_b__" || safePathPart(" ") != "default" {
-		t.Fatalf("safePathPart = %q", safePathPart("a b/ü"))
+		t.Fatal("safePathPart")
 	}
 }
 
@@ -245,28 +255,18 @@ func TestResolveReadAuthConfigFallsBackOrUsesSeparateCache(t *testing.T) {
 	}
 	writeConfig := func(readID string) {
 		t.Helper()
-		doc := map[string]any{
-			"tenant_id": "tenant-a",
-			"full":      map[string]string{"client_id": "write-client"},
-		}
-		if readID != "" {
-			doc["read"] = map[string]string{"client_id": readID}
-		}
-		raw, err := json.Marshal(doc)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(configPath, raw, 0o600); err != nil {
+		if err := UpdateAuthConfig(configPath, map[string]string{"tenant_id": "tenant-a", "client_id": "write-client", "read_client_id": readID}); err != nil {
 			t.Fatal(err)
 		}
 	}
+
 	writeConfig("")
 	fullCfg, err := ResolveAuthConfig("")
 	if err != nil {
 		t.Fatal(err)
 	}
 	readCfg, err := ResolveReadAuthConfig("")
-	if err != nil || readCfg.ClientID != fullCfg.ClientID || readCfg.CachePath != fullCfg.CachePath {
+	if err != nil || readCfg.ClientID != fullCfg.ClientID || readCfg.Cache != fullCfg.Cache {
 		t.Fatalf("read config should reuse full auth: read=%+v full=%+v err=%v", readCfg, fullCfg, err)
 	}
 
@@ -275,14 +275,16 @@ func TestResolveReadAuthConfigFallsBackOrUsesSeparateCache(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantReadCache := filepath.Join(state, "teams", "profiles", "default", readCacheName)
-	if readCfg.ClientID != "read-client" || readCfg.Scopes != DefaultReadScopes || readCfg.CachePath != wantReadCache || readCfg.CachePath == fullCfg.CachePath {
+	wantReadCache := TokenLocation{Database: filepath.Join(state, "teams", "profiles", "default", "teams-tokens.sqlite"), Slot: "read"}
+	if readCfg.ClientID != "read-client" || readCfg.Scopes != DefaultReadScopes || readCfg.Cache != wantReadCache || readCfg.Cache == fullCfg.Cache {
 		t.Fatalf("separate read config = %+v, want cache %s", readCfg, wantReadCache)
 	}
 
-	writeCache(t, wantReadCache, TokenCache{RefreshToken: "read-refresh"})
+	if err := WriteTokenCache(wantReadCache, TokenCache{RefreshToken: "read-refresh"}); err != nil {
+		t.Fatal(err)
+	}
 	readCfg, err = ResolveReadAuthConfig("")
-	if err != nil || readCfg.CachePath != wantReadCache {
+	if err != nil || readCfg.Cache != wantReadCache {
 		t.Fatalf("existing read cache not reused: %+v %v", readCfg, err)
 	}
 }
@@ -318,7 +320,7 @@ func TestDelegatedAuthRefreshIsSerialisedAcrossInstances(t *testing.T) {
 	if got := countRequests(fg, "POST /{tenant}/oauth2/v2.0/token"); got != 1 {
 		t.Fatalf("%d refreshes, want 1", got)
 	}
-	if _, err := os.Stat(path + ".lock"); err != nil {
+	if _, err := os.Stat(testTokenLocation(path).lockPath()); err != nil {
 		t.Fatalf("lock file: %v", err)
 	}
 
@@ -366,4 +368,17 @@ func TestResolveAuthConfigRefusesBroaderScopes(t *testing.T) {
 	if err := ValidateScopes(DefaultScopes); err != nil {
 		t.Fatalf("defaults: %v", err)
 	}
+}
+
+func testTokenLocation(path string) TokenLocation {
+	slot := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	switch slot {
+	case "teams-full-token":
+		slot = "full"
+	case "teams-read-token":
+		slot = "read"
+	case "teams-chat-write-token":
+		slot = "chat_write"
+	}
+	return TokenLocation{Database: filepath.Join(filepath.Dir(path), "teams-tokens.sqlite"), Slot: slot}
 }

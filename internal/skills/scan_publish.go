@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -22,7 +21,8 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const manifestFilename = ".cxp-skill-manifest.json"
+const manifestFilename = ".cxp-skill-manifest.sqlite"
+const legacyManifestFilename = ".cxp-skill-manifest.json"
 const gitLFSPointerVersion = "version https://git-lfs.github.com/spec/v1"
 const skillsLFSRemoteName = "cxp-skills-lfs"
 
@@ -619,30 +619,6 @@ func manifestForTree(source Source, commit string, tree skillTree, targetPath st
 	}
 }
 
-func writeManifest(path string, manifest exportManifest) error {
-	data, err := json.MarshalIndent(manifest, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal skill manifest: %w", err)
-	}
-	data = append(data, '\n')
-	return atomicWriteFile(path, data, 0o600)
-}
-
-func readExportManifest(path string) (exportManifest, bool, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return exportManifest{}, false, nil
-		}
-		return exportManifest{}, false, fmt.Errorf("read skill manifest %s: %w", path, err)
-	}
-	var manifest exportManifest
-	if err := json.Unmarshal(data, &manifest); err != nil {
-		return exportManifest{}, false, fmt.Errorf("parse skill manifest %s: %w", path, err)
-	}
-	return manifest, true, nil
-}
-
 func pruneRemovedManagedSkills(targetRoot string, sourceID string, keep map[string]bool) error {
 	entries, err := os.ReadDir(targetRoot)
 	if err != nil {
@@ -759,7 +735,7 @@ func localChangesForManifest(root string, manifest exportManifest) ([]LocalChang
 			return err
 		}
 		rel = filepath.ToSlash(rel)
-		if rel == manifestFilename {
+		if rel == manifestFilename || rel == legacyManifestFilename || rel == legacyManifestFilename+".migrated" {
 			return nil
 		}
 		if _, ok := known[rel]; ok {

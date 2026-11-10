@@ -86,7 +86,7 @@ func (e *Engine) cmdShutdown(ctx context.Context, j cmdJob) {
 // control chat ctl (0 when none is pending): while the helper stops, the
 // control chat is sent up to it, in order, and nothing after it.
 func shutdownThrough(tx *store.Tx, ctl int64, prefix string) (int64, error) {
-	rows, err := tx.PendingOutbox(ctl)
+	rows, err := tx.ActiveOutbox(ctl)
 	if err != nil {
 		return 0, err
 	}
@@ -104,7 +104,7 @@ func shutdownThrough(tx *store.Tx, ctl int64, prefix string) (int64, error) {
 func (e *Engine) pendingKeys(conv int64, prefix string) bool {
 	pending := true
 	_ = e.update(func(tx *store.Tx) error {
-		rows, err := tx.PendingOutbox(conv)
+		rows, err := tx.ActiveOutbox(conv)
 		if err != nil {
 			return err
 		}

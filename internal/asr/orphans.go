@@ -1,11 +1,7 @@
 package asr
 
 import (
-	"encoding/json"
-	"fmt"
 	"os"
-	"path/filepath"
-	"strings"
 )
 
 // A helper that dies without Close (SIGKILL, crash, power loss of a
@@ -36,62 +32,52 @@ func hostName() string {
 	return h
 }
 
-// recordServer notes a started server and returns the record's path ("" if
-// the platform cannot identify processes).
-func recordServer(root string, pid int) string {
+// recordServer retains one connection for this server's lifetime. Platforms
+// without process identities retain their existing parent-death protection.
+func recordServer(root string, pid int) (*serverRegistration, error) {
 	id, ok := processID(pid)
 	owner, ownerOK := processID(os.Getpid())
 	if !ok || !ownerOK {
-		return ""
+		return nil, nil
+	}
+	db, err := openServerRecords(root)
+	if err != nil {
+		return nil, err
 	}
 	rec := serverRecord{Host: hostName(), PID: pid, ID: id, OwnerPID: os.Getpid(), OwnerID: owner}
-	data, _ := json.Marshal(rec)
-	dir := filepath.Join(root, "run")
-	if os.MkdirAll(dir, 0o700) != nil {
-		return ""
+	if err = db.put(rec); err != nil {
+		db.Close()
+		return nil, err
 	}
-	safe := strings.Map(func(r rune) rune {
-		if r == '.' || r == '-' || r >= '0' && r <= '9' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' {
-			return r
-		}
-		return '_'
-	}, rec.Host)
-	path := filepath.Join(dir, fmt.Sprintf("%s-%d.json", safe, pid))
-	tmp := path + ".tmp"
-	if os.WriteFile(tmp, data, 0o600) != nil || os.Rename(tmp, path) != nil {
-		os.Remove(tmp)
-		return ""
-	}
-	return path
+	return &serverRegistration{db: db, rec: rec}, nil
 }
 
-// reapOrphans stops servers recorded on this host whose helper is no longer
-// running. Records of other hosts sharing the cache are left alone.
-func reapOrphans(root string) {
-	dir := filepath.Join(root, "run")
-	entries, _ := os.ReadDir(dir)
-	host := hostName()
-	for _, e := range entries {
-		if !strings.HasSuffix(e.Name(), ".json") {
-			continue
-		}
-		path := filepath.Join(dir, e.Name())
-		data, err := os.ReadFile(path)
+// reapOrphans reads only this host's records in bounded pages. No database
+// transaction spans process inspection or termination.
+func reapOrphans(root string) error {
+	db, err := openServerRecords(root)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	var after int
+	for {
+		records, err := db.page(hostName(), after)
 		if err != nil {
-			continue
+			return err
 		}
-		var rec serverRecord
-		if json.Unmarshal(data, &rec) != nil {
-			os.Remove(path)
-			continue
+		if len(records) == 0 {
+			return nil
 		}
-		if rec.Host != host {
-			continue
+		for _, rec := range records {
+			after = rec.PID
+			if id, ok := processID(rec.OwnerPID); ok && id == rec.OwnerID {
+				continue
+			}
+			killIfMatches(rec.PID, rec.ID)
+			if err = db.remove(rec); err != nil {
+				return err
+			}
 		}
-		if id, ok := processID(rec.OwnerPID); ok && id == rec.OwnerID {
-			continue // its helper is still running
-		}
-		killIfMatches(rec.PID, rec.ID)
-		os.Remove(path)
 	}
 }

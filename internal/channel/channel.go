@@ -230,12 +230,14 @@ const (
 
 // FileRef is an inbound or outbound file.
 type FileRef struct {
-	Kind        FileKind
-	Name        string
-	Size        int64 // 0 when unknown
-	ContentType string
-	Ref         string // opaque adapter handle
-	Note        string // reason for FileUnsupported
+	Kind         FileKind
+	Name         string
+	Size         int64 // 0 when unknown
+	ContentType  string
+	Ref          string // scalar adapter handle
+	AttachmentID string // uploaded reference attachment identity
+	URL          string // uploaded reference URL
+	Note         string // reason for FileUnsupported
 }
 
 // UploadSession is resumable upload state the core persists between attempts.

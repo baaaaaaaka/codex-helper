@@ -1,8 +1,8 @@
 package appgateway
 
 import (
-	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -16,7 +16,7 @@ import (
 )
 
 func TestRegistryEnsurePersistsStablePortOutsideLegacyConfig(t *testing.T) {
-	r, err := NewRegistry(t.TempDir())
+	r, err := newTestRegistry(t, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +43,7 @@ func TestRegistryEnsurePersistsStablePortOutsideLegacyConfig(t *testing.T) {
 }
 
 func TestRegistryRejectsCorruptAndInvalidState(t *testing.T) {
-	r, err := NewRegistry(t.TempDir())
+	r, err := newTestRegistry(t, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -63,7 +63,7 @@ func TestRegistryLoadReadOnlyDoesNotCreateStateOrWaitForLock(t *testing.T) {
 	if _, err := os.Stat(dir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("read created state directory: %v", err)
 	}
-	r, err := NewRegistry(t.TempDir())
+	r, err := newTestRegistry(t, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,8 +90,8 @@ func TestRegistryLoadReadOnlyDoesNotCreateStateOrWaitForLock(t *testing.T) {
 	}
 }
 
-func TestRegistryLoadReadOnlyValidatesScopeAndReadsBackupWithoutRepair(t *testing.T) {
-	r, err := NewRegistry(t.TempDir())
+func TestRegistryLoadReadOnlyValidatesStoredScope(t *testing.T) {
+	r, err := newTestRegistry(t, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,34 +99,26 @@ func TestRegistryLoadReadOnlyValidatesScopeAndReadsBackupWithoutRepair(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Save(reg); err != nil {
-		t.Fatal(err)
-	} // Creates a valid backup.
-	if err := os.WriteFile(r.path("p1"), []byte("broken"), 0600); err != nil {
+	if _, err = r.db.Exec(`UPDATE registrations SET id='invalid-id' WHERE profile_id=?`, reg.ProfileID); err != nil {
 		t.Fatal(err)
 	}
-	got, err := LoadReadOnly(r.Dir(), "p1")
-	if err != nil || got.ID != reg.ID {
-		t.Fatalf("backup snapshot = %+v/%v", got, err)
+	if _, err = LoadReadOnly(r.Dir(), "p1"); !errors.Is(err, ErrInvalidRegistration) {
+		t.Fatalf("invalid native scope accepted: %v", err)
 	}
-	raw, err := os.ReadFile(r.path("p1"))
-	if err != nil || string(raw) != "broken" {
-		t.Fatalf("diagnostic repaired primary: %q/%v", raw, err)
+	if _, err = LoadReadOnly(r.Dir(), "other"); !errors.Is(err, ErrRegistrationNotFound) {
+		t.Fatalf("wrong scope: %v", err)
 	}
-	backup, err := os.ReadFile(r.path("p1") + ".bak")
-	if err != nil {
+	var id string
+	if err = r.db.QueryRow(`SELECT id FROM registrations WHERE profile_id='p1'`).Scan(&id); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(r.path("other-profile"), backup, 0600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := LoadReadOnly(r.Dir(), "other-profile"); !errors.Is(err, ErrInvalidRegistration) {
-		t.Fatalf("wrong-profile snapshot accepted: %v", err)
+	if id != "invalid-id" {
+		t.Fatal("diagnostic repaired state")
 	}
 }
 
 func TestRegistryFirstMigrationMayAdoptLegacyPortButReadyPortIsImmutable(t *testing.T) {
-	r, err := NewRegistry(t.TempDir())
+	r, err := newTestRegistry(t, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -158,7 +150,7 @@ func TestRegistryFirstMigrationMayAdoptLegacyPortButReadyPortIsImmutable(t *test
 }
 
 func TestRegistryLeaseIsIndependentFromStateWrites(t *testing.T) {
-	r, err := NewRegistry(t.TempDir())
+	r, err := newTestRegistry(t, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +182,7 @@ func TestRegistryLeaseIsIndependentFromStateWrites(t *testing.T) {
 }
 
 func TestRegistryRejectsSecondLifetimeLease(t *testing.T) {
-	r, err := NewRegistry(t.TempDir())
+	r, err := newTestRegistry(t, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,100 +202,102 @@ func TestRegistryRejectsSecondLifetimeLease(t *testing.T) {
 }
 
 func TestRegistryAppendEventIsTimestampedAndDurable(t *testing.T) {
-	r, err := NewRegistry(t.TempDir())
+	dir := t.TempDir()
+	r, err := newTestRegistry(t, dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := r.AppendEvent(Event{ProfileID: "profile-a", Event: "frontend-start", HTTPPort: 3804, State: StatePending}); err != nil {
+	if err = r.AppendEvent(Event{ProfileID: "profile-a", Event: "frontend-start", HTTPPort: 3804, State: StatePending}); err != nil {
 		t.Fatal(err)
 	}
-	b, err := os.ReadFile(filepath.Join(r.Dir(), profileFilePart("profile-a")+".jsonl"))
+	if err = r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := newTestRegistry(t, dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(b) == 0 || !bytes.Contains(b, []byte(`"event":"frontend-start"`)) || !bytes.Contains(b, []byte(`"at":`)) {
-		t.Fatalf("event log = %s", b)
+	var event, at string
+	var port int
+	if err = reopened.db.QueryRow(`SELECT event_name,at,http_port FROM gateway_events WHERE profile_id='profile-a'`).Scan(&event, &at, &port); err != nil {
+		t.Fatal(err)
+	}
+	if event != "frontend-start" || at == "" || port != 3804 {
+		t.Fatalf("event %q %q %d", event, at, port)
 	}
 }
 
-func TestRegistryLoadsLastBackupAfterPrimaryCorruption(t *testing.T) {
-	r, err := NewRegistry(t.TempDir())
+func TestRegistryMigratesLegacyBackupAfterPrimaryCorruption(t *testing.T) {
+	dir := t.TempDir()
+	profile := "profile-a"
+	path := filepath.Join(dir, profileFilePart(profile)+".json")
+	v := Registration{Schema: 1, ID: profileFilePart(profile), ProfileID: profile, HTTPPort: 3804, State: StateReady, LastError: "original backup"}
+	raw, err := json.Marshal(v)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reg, err := r.Ensure(context.Background(), "profile-a", "fp")
+	if err = os.WriteFile(path, []byte("{"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(path+".bak", raw, 0600); err != nil {
+		t.Fatal(err)
+	}
+	r, err := newTestRegistry(t, dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reg.LastError = "committed"
-	if err := r.Save(reg); err != nil {
+	got, err := r.Load(profile)
+	if err != nil || got.LastError != "original backup" {
+		t.Fatalf("migration %#v %v", got, err)
+	}
+	if err = os.WriteFile(path, []byte("poisoned leftover"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(r.path(reg.ProfileID), []byte("{"), 0o600); err != nil {
+	if _, err = r.Load(profile); err != nil {
 		t.Fatal(err)
 	}
-	recovered, err := r.Load(reg.ProfileID)
-	if err != nil {
+	if _, err = os.Stat(path + ".migrated"); err != nil {
 		t.Fatal(err)
-	}
-	if recovered.LastError != "" {
-		t.Fatalf("recovered registration unexpectedly used corrupt replacement: %#v", recovered)
-	}
-	if _, err := os.Stat(r.path(reg.ProfileID) + ".bak"); err != nil {
-		t.Fatalf("registration backup missing: %v", err)
 	}
 }
 
 func TestRegistryRejectsWhenPrimaryAndBackupAreBothCorrupt(t *testing.T) {
-	r, err := NewRegistry(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
+	dir := t.TempDir()
+	path := filepath.Join(dir, profileFilePart("p")+".json")
+	for _, suffix := range []string{"", ".bak"} {
+		if err := os.WriteFile(path+suffix, []byte("broken"), 0600); err != nil {
+			t.Fatal(err)
+		}
 	}
-	reg, err := r.Ensure(context.Background(), "profile-a", "fp")
-	if err != nil {
-		t.Fatal(err)
-	}
-	reg.LastError = "committed"
-	if err := r.Save(reg); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(r.path(reg.ProfileID), []byte("{"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(r.path(reg.ProfileID)+".bak", []byte("not-json"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := r.Load(reg.ProfileID); err == nil {
-		t.Fatal("corrupt primary and backup were accepted")
+	if r, err := NewRegistry(dir); err == nil {
+		r.Close()
+		t.Fatal("accepted corrupt legacy state")
 	}
 }
 
 func TestRegistryEventLogRotatesAndRemainsBounded(t *testing.T) {
-	r, err := NewRegistry(t.TempDir())
+	r, err := newTestRegistry(t, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
 	large := strings.Repeat("x", eventLogMaxBytes/2)
 	for i := 0; i < 3; i++ {
-		if err := r.AppendEvent(Event{ProfileID: "profile-a", Event: "recovery-attempt", Details: large}); err != nil {
+		if err = r.AppendEvent(Event{ProfileID: "profile-a", Event: "recovery-attempt", Details: large}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	current, err := os.Stat(r.eventPath("profile-a"))
-	if err != nil {
+	var rows, batches int
+	var bytes int64
+	if err = r.db.QueryRow(`SELECT count(*),count(DISTINCT batch),sum(length(details)+128) FROM gateway_events`).Scan(&rows, &batches, &bytes); err != nil {
 		t.Fatal(err)
 	}
-	backup, err := os.Stat(r.eventPath("profile-a") + ".1")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if current.Size() > int64(eventLogMaxBytes) || backup.Size() > int64(eventLogMaxBytes) {
-		t.Fatalf("event log exceeded bound: current=%d backup=%d", current.Size(), backup.Size())
+	if rows != 2 || batches != 2 || bytes > 2*eventLogMaxBytes {
+		t.Fatalf("unbounded events rows=%d batches=%d bytes=%d", rows, batches, bytes)
 	}
 }
 
 func TestRegistryConcurrentStateWritesRemainReadable(t *testing.T) {
-	r, err := NewRegistry(t.TempDir())
+	r, err := newTestRegistry(t, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -337,7 +331,7 @@ func TestRegistryConcurrentStateWritesRemainReadable(t *testing.T) {
 
 func TestRegistryLoadHonorsRegistrationLock(t *testing.T) {
 	dir := t.TempDir()
-	writer, err := NewRegistry(dir)
+	writer, err := newTestRegistry(t, dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -355,7 +349,7 @@ func TestRegistryLoadHonorsRegistrationLock(t *testing.T) {
 	}
 	defer func() { _ = lock.Unlock() }()
 
-	reader, err := NewRegistry(dir)
+	reader, err := newTestRegistry(t, dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -387,7 +381,7 @@ func TestRegistryLoadHonorsRegistrationLock(t *testing.T) {
 }
 
 func TestRegistryLeaseCanBeReacquiredAfterRelease(t *testing.T) {
-	r, err := NewRegistry(t.TempDir())
+	r, err := newTestRegistry(t, t.TempDir())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -404,4 +398,13 @@ func TestRegistryLeaseCanBeReacquiredAfterRelease(t *testing.T) {
 		t.Fatalf("reacquire lease: %v", err)
 	}
 	reacquired()
+}
+
+func newTestRegistry(t *testing.T, dir string) (*Registry, error) {
+	t.Helper()
+	r, err := NewRegistry(dir)
+	if err == nil {
+		t.Cleanup(func() { r.Close() })
+	}
+	return r, err
 }

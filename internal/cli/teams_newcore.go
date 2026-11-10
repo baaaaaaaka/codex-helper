@@ -169,6 +169,7 @@ func runTeamsNewCore(cmd *cobra.Command, root *rootOptions, opts teamsNewCoreOpt
 	if err != nil {
 		return err
 	}
+	defer cfgStore.Close()
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
@@ -352,6 +353,7 @@ func serveTeamsNewCore(ctx context.Context, out, errOut io.Writer, root *rootOpt
 		return err
 	}
 
+	defer ch.Close()
 	// Codex: an explicit --codex-path, else the CXP-managed install (the
 	// launch resolves or installs it; SPEC R-24).
 	codexBin := strings.TrimSpace(opts.codexPath)
@@ -448,7 +450,12 @@ func serveTeamsNewCore(ctx context.Context, out, errOut io.Writer, root *rootOpt
 	tr := voice.New(asr.New(opts.asrCommand, asrArgs, asrCfg), "")
 	defer func() { _ = tr.Close() }()
 	cfg.Transcriber = tr
-	notifier := &teamsNewCoreNotifier{st: st, path: path, client: client, log: errOut}
+	mail, err := openTeamsExchange(anchor, false)
+	if err != nil {
+		return fmt.Errorf("open Teams CLI exchange: %w", err)
+	}
+	defer mail.Close()
+	notifier := &teamsNewCoreNotifier{mail: mail, st: st, path: path, client: client, log: errOut}
 	notifier.url() // applies a pending change and reports a broken setting once
 	cfg.Notifier = notifier
 
@@ -470,7 +477,7 @@ func serveTeamsNewCore(ctx context.Context, out, errOut io.Writer, root *rootOpt
 		return err
 	}
 	defer tuiServer.Close()
-	requests := newTeamsCLIRequests(runCtx, anchor, e, errOut)
+	requests := newTeamsCLIRequests(runCtx, anchor, e, errOut, mail)
 	defer func() { cancelRun(); requests.wait(10 * time.Second) }() // before the store closes
 	go notifier.watch(runCtx, stamper.tick, requests.tick)
 	gatewayFailed := make(chan struct{})

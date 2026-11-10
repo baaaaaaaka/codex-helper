@@ -118,7 +118,10 @@ codex-proxy init
 ```
 
 配置保存在 OS 用户配置目录下（Linux 通常是
-`~/.config/codex-proxy/config.json`）。
+`~/.config/codex-proxy/config.sqlite`）。配置和 CXP 自有运行状态使用原生 SQLite 表。
+旧 `--config ...json` 路径仅用于定位迁移源，不再选择 JSON 后端。
+从旧格式升级前，需要停止或隔离旧版本写入者，再使用显式安装器。
+详见[切换与恢复说明](docs/architecture/sqlite-only-boundaries.md#cutover-and-recovery)。
 
 ## 要求
 
@@ -210,7 +213,7 @@ codex-proxy proxy doctor
 
 常用 flags:
 
-- `--config /path/to/config.json` 覆盖 config file 路径
+- `--config /path/to/config.sqlite` 覆盖 config file 路径
 - `tui` / `history tui` 支持 `--codex-dir`、`--codex-path`、`--profile` 和 `--refresh-interval`（默认 `5s`，用 `0` 禁用）
 - `history open` 支持 `--codex-dir`、`--codex-path` 和 `--profile`
 - `history list` / `history show` 支持 `--codex-dir`

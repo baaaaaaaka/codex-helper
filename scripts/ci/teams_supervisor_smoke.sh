@@ -91,16 +91,15 @@ wait_for_file_pattern() {
 }
 
 # wait_for_status_pids STATUS [OLD_SUPERVISOR OLD_CHILD]: wait until the
-# local supervisor's status file names a supervisor and a running child
+# native service row names a supervisor and a running child
 # (child_pid is omitted until the child starts), both different from the
 # old ones after a restart, and set status_supervisor_pid/status_child_pid.
 wait_for_status_pids() {
   local file="$1" old_supervisor="${2:-}" old_child="${3:-}"
-  local deadline=$((SECONDS + 30)) sup child
+  local deadline=$((SECONDS + 30)) sup child pgid
   while [ "$SECONDS" -lt "$deadline" ]; do
-    sup="$(sed -n 's/.*"supervisor_pid": \([1-9][0-9]*\).*/\1/p' "$file" 2>/dev/null | tail -n 1)"
-    child="$(sed -n 's/.*"child_pid": \([1-9][0-9]*\).*/\1/p' "$file" 2>/dev/null | tail -n 1)"
-    if [ -n "$sup" ] && [ -n "$child" ] && [ "$sup" != "$old_supervisor" ] && [ "$child" != "$old_child" ]; then
+    read -r sup child pgid <<<"$(read_supervisor_pids "$file")"
+    if [ "${sup:-0}" -gt 0 ] && [ "${child:-0}" -gt 0 ] && [ "$sup" != "$old_supervisor" ] && [ "$child" != "$old_child" ]; then
       status_supervisor_pid="$sup"
       status_child_pid="$child"
       return 0
@@ -108,8 +107,20 @@ wait_for_status_pids() {
     sleep 1
   done
   log "timed out waiting for $file to name a new supervisor and child (old: ${old_supervisor:-none}/${old_child:-none})"
-  [ -f "$file" ] && sed 's/^/[status] /' "$file" || true
+  read_supervisor_pids "$file"
   return 1
+}
+
+read_supervisor_pids() {
+  python3 - "$1" <<'PY'
+import pathlib, socket, sqlite3, sys
+try:
+    with sqlite3.connect(pathlib.Path(sys.argv[1]).resolve().as_uri() + '?mode=ro', uri=True) as db:
+        row = db.execute('SELECT supervisor_pid, child_pid, supervisor_pgid FROM service_supervisors WHERE host=?', (socket.gethostname(),)).fetchone()
+    print(*(row or (0, 0, 0)))
+except sqlite3.Error:
+    print(0, 0, 0)
+PY
 }
 
 wait_for_pid_gone() {
@@ -162,12 +173,12 @@ EOF
   chmod 600 "$path"
 }
 
-replace_json_executable() {
-  local path="$1"
-  local executable="$2"
-  local escaped
-  escaped="$(printf '%s' "$executable" | sed 's/[\/&]/\\&/g')"
-  sed -i.bak "0,/\"Executable\": \"[^\"]*\"/s//\"Executable\": \"$escaped\"/" "$path"
+replace_supervisor_executable() {
+  python3 - "$1" "$2" <<'PY'
+import pathlib, sqlite3, sys
+with sqlite3.connect(pathlib.Path(sys.argv[1]).resolve().as_uri() + '?mode=rw', uri=True) as db:
+    assert db.execute('UPDATE supervisor_config SET executable=? WHERE id=1', (sys.argv[2],)).rowcount == 1
+PY
 }
 
 write_probe_loop() {
@@ -204,7 +215,7 @@ local_supervisor_smoke() {
     log "CODEX_HELPER_CI_CXP is not executable: $cxp"
     return 1
   fi
-  for required in setsid ps sed; do
+  for required in setsid ps sed python3; do
     if ! command -v "$required" >/dev/null 2>&1; then
       log "::warning::missing required command for detached local-supervisor smoke: $required; skipping shell-level detach probe"
       return 0
@@ -223,7 +234,7 @@ local_supervisor_smoke() {
   local fake="$smoke/fake-cxp"
   local supervisor_log="$smoke/supervisor.log"
   local duplicate_log="$smoke/duplicate.log"
-  local status="$state_home/codex-helper/teams/service/local-supervisor/run/local-supervisor-status.json"
+  local status="$state_home/codex-helper/teams/service/service-state.sqlite"
   mkdir -p "$home" "$config_home" "$cache_home" "$state_home" "$runtime_dir" "$other_runtime_dir"
 
   cat >"$fake" <<'EOS'
@@ -260,15 +271,17 @@ EOS
 }
 EOF
 
-  HOME="$home" XDG_CONFIG_HOME="$config_home" XDG_CACHE_HOME="$cache_home" XDG_STATE_HOME="$state_home" XDG_RUNTIME_DIR="$runtime_dir" \
+  HOME="$home" XDG_CONFIG_HOME="$config_home" XDG_CACHE_HOME="$cache_home" XDG_STATE_HOME="$state_home" CODEX_HELPER_STATE_DIR="$state_home/codex-helper" XDG_RUNTIME_DIR="$runtime_dir" \
     setsid "$cxp" teams service local-supervisor --config "$config" >"$supervisor_log" 2>&1 &
   local supervisor_pid="$!"
   cleanup_pids+=("$supervisor_pid")
 
-  wait_for_file_pattern "$status" '"supervisor_pid"'
-  wait_for_lines "$runs" 2
+  if ! wait_for_lines "$runs" 2; then
+    sed 's/^/[supervisor] /' "$supervisor_log" || true
+    return 1
+  fi
 
-  if HOME="$home" XDG_CONFIG_HOME="$config_home" XDG_CACHE_HOME="$cache_home" XDG_STATE_HOME="$state_home" XDG_RUNTIME_DIR="$other_runtime_dir" \
+  if HOME="$home" XDG_CONFIG_HOME="$config_home" XDG_CACHE_HOME="$cache_home" XDG_STATE_HOME="$state_home" CODEX_HELPER_STATE_DIR="$state_home/codex-helper" XDG_RUNTIME_DIR="$other_runtime_dir" \
     setsid "$cxp" teams service local-supervisor --config "$config" >"$duplicate_log" 2>&1; then
     log "duplicate local supervisor unexpectedly acquired the lock"
     return 1
@@ -280,10 +293,10 @@ EOF
   fi
 
   local pgid
-  pgid="$(sed -n 's/.*"supervisor_pgid": \([0-9][0-9]*\).*/\1/p' "$status" | tail -n 1)"
-  if [ -z "$pgid" ]; then
+  read -r status_supervisor_pid status_child_pid pgid <<<"$(read_supervisor_pids "$status")"
+  if [ "${pgid:-0}" -le 0 ]; then
     log "could not parse supervisor_pgid from status"
-    sed 's/^/[status] /' "$status" || true
+    read_supervisor_pids "$status"
     return 1
   fi
   local my_pgid
@@ -342,8 +355,8 @@ local_supervisor_public_lifecycle_smoke() {
   local runs="$smoke/public-child-runs.log"
   local child_env="$smoke/public-child-env.log"
   local fake="$smoke/fake-cxp"
-  local config="$config_home/codex-helper/teams/local-supervisor.json"
-  local status="$state_home/codex-helper/teams/service/local-supervisor/run/local-supervisor-status.json"
+  local config="$config_home/codex-helper/teams/local-supervisor.sqlite"
+  local status="$state_home/codex-helper/teams/service/service-state.sqlite"
   mkdir -p "$home" "$config_home" "$cache_home" "$state_home" "$runtime_dir"
   write_token_cache "$cache_home/read-token.json"
   write_token_cache "$cache_home/write-token.json"
@@ -392,7 +405,7 @@ EOF
   (umask 077 && printf '{"refresh_token":"ci-placeholder-not-a-token"}\n' >"$cache_home/full-token.json")
 
   run_logged "public-install" "$smoke/install.log" env -i "${common_env[@]}" "$cxp" teams service install
-  replace_json_executable "$config" "$fake"
+  replace_supervisor_executable "$config" "$fake"
   run_logged "public-enable" "$smoke/enable.log" env -i "${common_env[@]}" "$cxp" teams service enable
   run_logged "public-start" "$smoke/start.log" env -i "${common_env[@]}" "$cxp" teams service start
   wait_for_status_pids "$status"
@@ -509,7 +522,7 @@ local_supervisor_bootstrap_auto_fallback_smoke() {
     sed 's/^/[bootstrap] /' "$smoke/bootstrap.log" || true
     return 1
   fi
-  if [ ! -f "$config_home/codex-helper/teams/local-supervisor.json" ]; then
+  if [ ! -f "$config_home/codex-helper/teams/local-supervisor.sqlite" ]; then
     log "bootstrap auto-fallback did not write local-supervisor config"
     sed 's/^/[bootstrap] /' "$smoke/bootstrap.log" || true
     return 1

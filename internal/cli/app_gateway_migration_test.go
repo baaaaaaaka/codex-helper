@@ -46,6 +46,7 @@ func TestEnsureCodexAppGatewayURLPreservesHealthyLegacyPort(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { registry.Close() })
 	reg, err := registry.Load(profile.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -84,6 +85,7 @@ func TestEnsureCodexAppGatewayURLAdoptsPrunedDesktopPort(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { registry.Close() })
 	reg, err := registry.Load(profile.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -149,6 +151,7 @@ func TestEnsureCodexAppGatewayURLAcceptsPendingStableGatewayWithoutDuplicate(t *
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { registry.Close() })
 	reg, err := registry.Ensure(context.Background(), profile.ID, "fingerprint")
 	if err != nil {
 		t.Fatal(err)
@@ -186,6 +189,7 @@ func TestEnsureCodexAppGatewayURLRejectsWrongStableGatewayIdentity(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { registry.Close() })
 	reg, err := registry.Ensure(context.Background(), profile.ID, "fingerprint")
 	if err != nil {
 		t.Fatal(err)
@@ -212,6 +216,7 @@ func TestEnsureAppGatewayProcessDoesNotDuplicatePartialServiceInstall(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { registry.Close() })
 	reg, err := registry.Ensure(context.Background(), profile.ID, "fingerprint")
 	if err != nil {
 		t.Fatal(err)
@@ -242,6 +247,7 @@ func TestEnsureCodexAppGatewayURLConcurrentCallsReuseOnePendingGateway(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { registry.Close() })
 	reg, err := registry.Ensure(context.Background(), profile.ID, "fingerprint")
 	if err != nil {
 		t.Fatal(err)
@@ -309,6 +315,7 @@ func appGatewayTestStore(t *testing.T, instances []config.Instance) (*config.Sto
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { store.Close() })
 	profile := config.Profile{ID: "profile-a", Name: "profile-a", Host: "host", Port: 22}
 	if err := store.Save(config.Config{Version: config.CurrentVersion, Profiles: []config.Profile{profile}, Instances: instances}); err != nil {
 		t.Fatal(err)

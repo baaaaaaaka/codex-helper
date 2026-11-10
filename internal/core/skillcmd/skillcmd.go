@@ -25,8 +25,10 @@ type Options struct {
 
 // Command implements engine.Skills.
 type Command struct {
-	opts Options
-	mu   sync.Mutex // the push reviews file (push.go)
+	opts   Options
+	mu     sync.Mutex // one chat push/confirm operation
+	initMu sync.Mutex
+	mgr    *skills.Manager
 }
 
 // New returns the skills command backend.
@@ -128,14 +130,22 @@ func (c *Command) resolved() (Options, error) {
 }
 
 func (c *Command) manager(ctx context.Context) (*skills.Manager, string, error) {
-	o, err := c.resolved()
-	if err != nil {
-		return nil, "", err
+	c.initMu.Lock()
+	if c.mgr == nil {
+		o, err := c.resolved()
+		if err != nil {
+			c.initMu.Unlock()
+			return nil, "", err
+		}
+		mgr, err := skills.NewManager(skills.ManagerOptions{ConfigDir: o.ConfigDir, CacheDir: o.CacheDir, CodexDir: o.CodexDir, HomeDir: o.HomeDir})
+		if err != nil {
+			c.initMu.Unlock()
+			return nil, "", err
+		}
+		c.mgr = mgr
 	}
-	mgr, err := skills.NewManager(skills.ManagerOptions{ConfigDir: o.ConfigDir, CacheDir: o.CacheDir, CodexDir: o.CodexDir, HomeDir: o.HomeDir})
-	if err != nil {
-		return nil, "", err
-	}
+	mgr := c.mgr
+	c.initMu.Unlock()
 	mctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	report, err := mgr.MigrateLegacySkills(mctx, skills.MigrationOptions{IncludeBuiltins: true})
@@ -261,4 +271,14 @@ func firstNonEmpty(v ...string) string {
 		}
 	}
 	return ""
+}
+
+// Close runs after the engine has drained all command workers.
+func (c *Command) Close() error {
+	c.initMu.Lock()
+	defer c.initMu.Unlock()
+	if c.mgr == nil {
+		return nil
+	}
+	return c.mgr.Store.Close()
 }

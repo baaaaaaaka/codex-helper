@@ -1,7 +1,7 @@
 package helperruntime
 
 // Automatic updates never replace the stable entry or the legacy active pointer.
-// Once present, boot.json is the sole authority for runtime selection. A trial
+// Once present, boot.sqlite is the sole authority for runtime selection. A trial
 // consumes its opportunity before execution while Good still names the old
 // runtime. Failure recovery therefore requires no successful write.
 
@@ -9,7 +9,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -19,15 +18,17 @@ import (
 	"strings"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/sqlitestate"
 	"github.com/gofrs/flock"
 	"golang.org/x/mod/semver"
 )
 
-const BootFile = "boot.json"
+const BootFile = "boot.sqlite"
+const maxBootRecordSize = 64 * 1024
 
 // Raise the protocol before admitting an automatic release with incompatible
 // config/state migrations. Older bootstraps will keep their known-good runtime.
-const BootProtocol = 1
+const BootProtocol = 2
 const EnvBootManaged = "CXP_BOOT_MANAGED"
 
 type BootCandidate struct {
@@ -45,40 +46,7 @@ type BootState struct {
 }
 
 func ReadBoot(root string) (BootState, error) {
-	path := filepath.Join(root, BootFile)
-	info, err := os.Lstat(path)
-	if err != nil {
-		return BootState{}, err
-	}
-	// Reject non-files before Open: opening a damaged FIFO record would wait
-	// for a writer and block startup before the post-open validation ran.
-	if !info.Mode().IsRegular() || info.Size() > 8192 {
-		return BootState{}, fmt.Errorf("invalid boot record")
-	}
-	f, err := openVersionPointerFile(path)
-	if err != nil {
-		return BootState{}, err
-	}
-	defer f.Close()
-	info, err = f.Stat()
-	if err != nil {
-		return BootState{}, err
-	}
-	if !info.Mode().IsRegular() || info.Size() > 8192 {
-		return BootState{}, fmt.Errorf("invalid boot record")
-	}
-	var s BootState
-	d := json.NewDecoder(io.LimitReader(f, 8193))
-	if err := d.Decode(&s); err != nil {
-		return s, err
-	}
-	if d.Decode(new(any)) != io.EOF {
-		return s, fmt.Errorf("trailing boot record data")
-	}
-	if err := validateBoot(s); err != nil {
-		return s, err
-	}
-	return s, nil
+	return readNativeBoot(root)
 }
 
 func validateBoot(s BootState) error {
@@ -115,17 +83,25 @@ func writeBoot(root string, s BootState) error {
 	if err := validateBoot(s); err != nil {
 		return err
 	}
-	b, err := json.Marshal(s)
+	b, err := encodeNativeBoot(root, s)
 	if err != nil {
 		return err
 	}
-	return WriteAtomicState(root, BootFile, b)
+	if err = WriteAtomicState(root, BootFile, b); err != nil {
+		return err
+	}
+	db, err := sqlitestate.Open(filepath.Join(root, BootFile), true)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	return sqlitestate.Seal(db)
 }
 
 // WriteAtomicState writes a small, fixed-name record beside the runtime. Callers
 // serialize mutations; startup readers require neither a lock nor write access.
 func WriteAtomicState(root, base string, b []byte) error {
-	if base == "" || base == "." || base == ".." || filepath.Base(base) != base || len(b) > 8192 {
+	if base == "" || base == "." || base == ".." || filepath.Base(base) != base || len(b) > maxBootRecordSize {
 		return fmt.Errorf("invalid state record")
 	}
 	if err := cleanupBootTemps(root, "."+base+"-"); err != nil {
@@ -174,17 +150,10 @@ func StageBootCandidate(ctx context.Context, current Context, base string, gener
 	}
 	return WithRootLock(ctx, current.Root, func() error {
 		s, err := ReadBoot(current.Root)
-		legacy := errors.Is(err, os.ErrNotExist)
-		if legacy {
-			active, readErr := readVersionPointer(current.Root, "active")
-			if readErr != nil {
-				return readErr
-			}
-			s = BootState{Schema: BootProtocol, Generation: 1, Good: active}
-		} else if err != nil {
-			return err
+		if err != nil {
+			return fmt.Errorf("%w: initialize the native bootstrap with the installer: %v", ErrBootstrapState, err)
 		}
-		if s.Good != base || (legacy && generation != 0) || (!legacy && generation != s.Generation) {
+		if s.Good != base || generation != s.Generation {
 			return fmt.Errorf("runtime selection changed during download")
 		}
 		if semver.Compare(version, s.Good) <= 0 {
@@ -389,11 +358,7 @@ func BootSnapshot(root string) (string, uint64, error) {
 	if err == nil {
 		return s.Good, s.Generation, nil
 	}
-	if !errors.Is(err, os.ErrNotExist) {
-		return "", 0, err
-	}
-	v, err := readVersionPointer(root, "active")
-	return v, 0, err
+	return "", 0, err
 }
 
 // A small constant bound is independent of network request/update timeouts.

@@ -3,11 +3,7 @@ package delegation
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"os"
-	"sort"
 	"strings"
 	"time"
 )
@@ -17,332 +13,141 @@ type WorkerStorePruneLimits struct {
 	TerminalOutboxLimit    int
 }
 
-func StorePathUsesSQLite(path string) bool {
-	return storePathUsesSQLite(path)
+// Fixed-width UTC ordering preserves the original timestamp string and its
+// nanosecond precision while allowing indexed retention and stable ordering.
+func delegationTimeOrder(raw string) string {
+	t := parseRecordTime(raw)
+	if t.IsZero() {
+		return ""
+	}
+	return t.UTC().Format("2006-01-02T15:04:05.000000000Z")
 }
 
-func TryStartWorkerSQLite(path string, request Record, claim Record, now time.Time, limits WorkerStorePruneLimits) (bool, error) {
-	if !storePathUsesSQLite(path) {
-		return false, fmt.Errorf("delegation store %q is not sqlite", path)
-	}
-	if err := materializeSQLiteStoreFromLegacy(path); err != nil {
-		return false, err
-	}
-	unlock := lockDelegationSQLiteProcess(path)
-	defer unlock()
-	db, err := openDelegationSQLiteStore(path, true)
-	if err != nil {
-		return false, err
-	}
-	defer db.Close()
-	ctx := context.Background()
-	if err := ensureDelegationSQLiteSchema(ctx, db); err != nil {
-		return false, err
-	}
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return false, err
-	}
-	defer tx.Rollback()
-	if existing, ok, err := sqliteExecutionForIDTx(ctx, tx, request.DelegationID); err != nil {
-		return false, err
-	} else if ok {
-		if existing.ClaimID == claim.ClaimID && existing.ClaimEpoch == claim.ClaimEpoch && existing.WorkerInstanceID == claim.WorkerInstanceID {
-			return false, nil
+func (s *WorkerDB) TryStart(ctx context.Context, request, claim Record, now time.Time, limits WorkerStorePruneLimits) (bool, error) {
+	started := false
+	err := s.transaction(ctx, true, func(tx *sql.Tx) error {
+		existing, ok, err := readExecutionFenceTx(ctx, tx, request.DelegationID)
+		if err != nil {
+			return err
 		}
-		if workerTerminalOrRunningStatus(existing.Status) {
-			return false, nil
+		if ok && ((existing.ClaimID == claim.ClaimID && existing.ClaimEpoch == claim.ClaimEpoch && existing.WorkerInstanceID == claim.WorkerInstanceID) || workerTerminalOrRunningStatus(existing.Status)) {
+			return nil
 		}
-	}
-	if threadID := strings.TrimSpace(request.RemoteThreadID); threadID != "" {
-		if thread, ok, err := sqliteRemoteThreadForIDTx(ctx, tx, threadID); err != nil {
-			return false, err
-		} else if ok {
-			activeID := strings.TrimSpace(thread.ActiveDelegationID)
-			if thread.State == RemoteThreadStateActive && activeID != "" && activeID != strings.TrimSpace(request.DelegationID) {
-				return false, nil
+		thread, threadExists, err := readRemoteThreadTx(ctx, tx, request.RemoteThreadID)
+		if err != nil {
+			return err
+		}
+		if threadExists && thread.State == RemoteThreadStateActive && thread.ActiveDelegationID != "" && thread.ActiveDelegationID != strings.TrimSpace(request.DelegationID) {
+			return nil
+		}
+		nowText := now.UTC().Format(time.RFC3339Nano)
+		if _, err = putExecutionFenceTx(ctx, tx, ExecutionFence{DelegationID: request.DelegationID, ClaimID: claim.ClaimID, ClaimEpoch: claim.ClaimEpoch, WorkerInstanceID: claim.WorkerInstanceID, MachineID: claim.MachineID, Status: StateRunning, StartedAt: nowText, UpdatedAt: nowText}); err != nil {
+			return err
+		}
+		next := workerActiveRemoteThread(request, now)
+		if next.ThreadID != "" {
+			if threadExists {
+				next.SourceSessionID = strings.TrimSpace(firstNonEmptyString(thread.SourceSessionID, next.SourceSessionID))
+				next.Generation = strings.TrimSpace(firstNonEmptyString(thread.Generation, next.Generation))
+				next.Title = firstNonEmptyString(thread.Title, next.Title)
+				next.CreatedAt = firstNonEmptyString(next.CreatedAt, thread.CreatedAt)
+				next.ExpiresAt = firstNonEmptyString(next.ExpiresAt, thread.ExpiresAt)
+			}
+			if _, err = putRemoteThreadTx(ctx, tx, next); err != nil {
+				return err
 			}
 		}
-	}
-	now = now.UTC()
-	nowText := now.Format(time.RFC3339Nano)
-	if err := sqliteUpsertJSONTx(ctx, tx, "executions", strings.TrimSpace(request.DelegationID), ExecutionFence{
-		DelegationID:     request.DelegationID,
-		ClaimID:          claim.ClaimID,
-		ClaimEpoch:       claim.ClaimEpoch,
-		WorkerInstanceID: claim.WorkerInstanceID,
-		MachineID:        claim.MachineID,
-		Status:           StateRunning,
-		StartedAt:        nowText,
-		UpdatedAt:        nowText,
-	}); err != nil {
-		return false, err
-	}
-	if thread := workerActiveRemoteThread(request, now); strings.TrimSpace(thread.ThreadID) != "" {
-		if existing, ok, err := sqliteRemoteThreadForIDTx(ctx, tx, thread.ThreadID); err != nil {
-			return false, err
-		} else if ok {
-			thread.SourceSessionID = strings.TrimSpace(firstNonEmptyString(existing.SourceSessionID, thread.SourceSessionID))
-			thread.Generation = strings.TrimSpace(firstNonEmptyString(existing.Generation, thread.Generation))
-			thread.Title = firstNonEmptyString(existing.Title, thread.Title)
-			if strings.TrimSpace(thread.CreatedAt) == "" {
-				thread.CreatedAt = existing.CreatedAt
-			}
-			if strings.TrimSpace(thread.ExpiresAt) == "" {
-				thread.ExpiresAt = existing.ExpiresAt
-			}
+		if err = pruneWorkerSQLiteStateTx(ctx, tx, limits); err != nil {
+			return err
 		}
-		if err := sqliteUpsertJSONTx(ctx, tx, "remote_threads", thread.ThreadID, thread); err != nil {
-			return false, err
-		}
-	}
-	if err := pruneWorkerSQLiteStateTx(ctx, tx, limits); err != nil {
-		return false, err
-	}
-	if err := tx.Commit(); err != nil {
-		return false, err
-	}
-	chmodDelegationSQLiteFiles(path)
-	return true, nil
+		started = true
+		return nil
+	})
+	return started, err
 }
 
-// reserveOutboxSQLite uses a write-first transaction so two processes cannot
-// both observe an absent outbox row and then proceed to the non-idempotent
-// Graph POST. The exact raw JSON compare on the update branch also protects a
-// legacy unattempted row from an ABA replacement between read and reserve.
-func reserveOutboxSQLite(ctx context.Context, path string, record Record, chatID string, now time.Time) (OutboxRecord, bool, error) {
-	var zero OutboxRecord
-	if ctx == nil {
-		ctx = context.Background()
+// The writer lock precedes the read and the Graph POST follows the commit.
+// SQLite serializes this decision across processes; no blob comparison or
+// second application lock is needed to prevent an ABA replacement.
+func (s *WorkerDB) ReserveOutbox(ctx context.Context, record Record, chatID string, now time.Time) (OutboxRecord, bool, error) {
+	var out OutboxRecord
+	reserved := false
+	if strings.TrimSpace(record.RecordID) == "" {
+		return out, false, fmt.Errorf("delegation record id is required")
 	}
-	path = strings.TrimSpace(path)
-	record.RecordID = strings.TrimSpace(record.RecordID)
-	if path == "" || record.RecordID == "" {
-		return zero, false, nil
-	}
-	if err := materializeSQLiteStoreFromLegacy(path); err != nil {
-		return zero, false, err
-	}
-	unlock := lockDelegationSQLiteProcess(path)
-	defer unlock()
-	db, err := openDelegationSQLiteStore(path, true)
-	if err != nil {
-		return zero, false, err
-	}
-	defer db.Close()
-	if err := ensureDelegationSQLiteSchema(ctx, db); err != nil {
-		return zero, false, err
-	}
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return zero, false, err
-	}
-	defer tx.Rollback()
-
-	first := nextWorkerOutbox(OutboxRecord{}, record, OutboxPending, chatID, "", "", now)
-	firstRaw, err := json.Marshal(first)
-	if err != nil {
-		return zero, false, err
-	}
-	result, err := tx.ExecContext(ctx, `INSERT INTO outbox(id, json) VALUES (?, ?) ON CONFLICT(id) DO NOTHING`, record.RecordID, firstRaw)
-	if err != nil {
-		return zero, false, err
-	}
-	if affected, err := result.RowsAffected(); err != nil {
-		return zero, false, err
-	} else if affected == 1 {
-		if err := tx.Commit(); err != nil {
-			return zero, false, err
+	err := s.transaction(ctx, true, func(tx *sql.Tx) error {
+		existing, ok, err := readOutboxRecordTx(ctx, tx, record.RecordID)
+		if err != nil {
+			return err
 		}
-		chmodDelegationSQLiteFiles(path)
-		return first, true, nil
-	}
-
-	var existingRaw []byte
-	if err := tx.QueryRowContext(ctx, `SELECT json FROM outbox WHERE id = ?`, record.RecordID).Scan(&existingRaw); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return zero, false, fmt.Errorf("delegation outbox %q disappeared during reservation", record.RecordID)
+		out = existing
+		if ok && outboxHasDeliveryWitness(existing) {
+			return nil
 		}
-		return zero, false, err
-	}
-	var existing OutboxRecord
-	if err := json.Unmarshal(existingRaw, &existing); err != nil {
-		return zero, false, err
-	}
-	if outboxHasDeliveryWitness(existing) {
-		return existing, false, nil
-	}
-	next := nextWorkerOutbox(existing, record, OutboxPending, chatID, "", "", now)
-	nextRaw, err := json.Marshal(next)
-	if err != nil {
-		return zero, false, err
-	}
-	result, err = tx.ExecContext(ctx, `UPDATE outbox SET json = ? WHERE id = ? AND json = ?`, nextRaw, record.RecordID, existingRaw)
-	if err != nil {
-		return zero, false, err
-	}
-	affected, err := result.RowsAffected()
-	if err != nil {
-		return zero, false, err
-	}
-	if affected != 1 {
-		return existing, false, fmt.Errorf("delegation outbox %q changed during reservation", record.RecordID)
-	}
-	if err := tx.Commit(); err != nil {
-		return zero, false, err
-	}
-	chmodDelegationSQLiteFiles(path)
-	return next, true, nil
+		out = nextWorkerOutbox(existing, record, OutboxPending, chatID, "", "", now)
+		if _, err = putOutboxRecordTx(ctx, tx, out); err != nil {
+			return err
+		}
+		reserved = true
+		return nil
+	})
+	return out, reserved, err
 }
 
-func UpsertOutboxSQLite(path string, record Record, status string, chatID string, inboxRef string, messageID string, errText string, now time.Time, retention time.Duration) error {
-	if !storePathUsesSQLite(path) {
-		return fmt.Errorf("delegation store %q is not sqlite", path)
-	}
-	if err := materializeSQLiteStoreFromLegacy(path); err != nil {
+func (s *WorkerDB) UpsertOutbox(ctx context.Context, record Record, status, chatID, inboxRef, messageID, errText string, now time.Time, retention time.Duration) error {
+	return s.transaction(ctx, true, func(tx *sql.Tx) error {
+		existing, _, err := readOutboxRecordTx(ctx, tx, record.RecordID)
+		if err != nil {
+			return err
+		}
+		record.InboxRef = strings.TrimSpace(inboxRef)
+		next := nextWorkerOutbox(existing, record, status, chatID, messageID, errText, now)
+		if _, err = putOutboxRecordTx(ctx, tx, next); err != nil {
+			return err
+		}
+		return pruneOutboxSQLiteByRetentionTx(ctx, tx, now, retention)
+	})
+}
+
+func pruneWorkerSQLiteStateTx(ctx context.Context, tx *sql.Tx, limits WorkerStorePruneLimits) error {
+	var routesExist bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM routes)`).Scan(&routesExist); err != nil {
 		return err
 	}
-	unlock := lockDelegationSQLiteProcess(path)
-	defer unlock()
-	db, err := openDelegationSQLiteStore(path, true)
-	if err != nil {
+	if routesExist {
+		return nil
+	}
+	if _, err := tx.ExecContext(ctx, `DELETE FROM remote_threads WHERE state<>'active'`); err != nil {
 		return err
 	}
-	defer db.Close()
-	ctx := context.Background()
-	if err := ensureDelegationSQLiteSchema(ctx, db); err != nil {
-		return err
+	if limits.TerminalExecutionLimit > 0 {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM executions WHERE id IN (SELECT id FROM executions WHERE status IN ('complete','blocked','canceled','expired','conflict','reuse_rejected') ORDER BY updated_order DESC,id LIMIT -1 OFFSET ?)`, limits.TerminalExecutionLimit); err != nil {
+			return err
+		}
 	}
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
+	if limits.TerminalOutboxLimit > 0 {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM outbox WHERE id IN (SELECT id FROM outbox WHERE status IN ('visible','failed') ORDER BY updated_order DESC,id LIMIT -1 OFFSET ?)`, limits.TerminalOutboxLimit); err != nil {
+			return err
+		}
 	}
-	defer tx.Rollback()
-	if err := upsertOutboxSQLiteTx(ctx, tx, record, status, chatID, inboxRef, messageID, errText, now); err != nil {
-		return err
-	}
-	if err := pruneOutboxSQLiteByRetentionTx(ctx, tx, now.UTC(), retention); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	chmodDelegationSQLiteFiles(path)
 	return nil
 }
 
-func RouteSQLite(path string, delegationID string) (Route, bool, error) {
-	return sqliteLoadByID[Route](path, "routes", delegationID)
+func pruneOutboxSQLiteByRetentionTx(ctx context.Context, tx *sql.Tx, now time.Time, retention time.Duration) error {
+	if retention <= 0 {
+		retention = DefaultStoreRetention
+	}
+	_, err := tx.ExecContext(ctx, `DELETE FROM outbox WHERE status IN ('visible','failed') AND updated_order>'' AND updated_order<?`, delegationTimeOrder(now.UTC().Add(-retention).Format(time.RFC3339Nano)))
+	return err
 }
 
-func UpsertRouteSQLite(path string, route Route) error {
-	if strings.TrimSpace(route.DelegationID) == "" {
-		return nil
+func workerTerminalOrRunningStatus(status string) bool {
+	switch strings.TrimSpace(status) {
+	case StateRunning, StateComplete, StateBlocked, StateCanceled, StateReuseRejected:
+		return true
+	default:
+		return false
 	}
-	if existing, ok, err := RouteSQLite(path, route.DelegationID); err != nil {
-		return err
-	} else if ok && strings.TrimSpace(route.CreatedAt) == "" {
-		route.CreatedAt = existing.CreatedAt
-	}
-	tmp := Store{}
-	tmp.UpsertRoute(route)
-	route, _ = tmp.RouteForID(route.DelegationID)
-	return sqliteUpsertSingle(path, "routes", route.DelegationID, route)
-}
-
-func RemoteThreadSQLite(path string, threadID string) (RemoteThread, bool, error) {
-	return sqliteLoadByID[RemoteThread](path, "remote_threads", threadID)
-}
-
-func UpsertRemoteThreadSQLite(path string, thread RemoteThread) error {
-	if strings.TrimSpace(thread.ThreadID) == "" {
-		return nil
-	}
-	tmp := Store{}
-	if existing, ok, err := RemoteThreadSQLite(path, thread.ThreadID); err != nil {
-		return err
-	} else if ok {
-		tmp.UpsertRemoteThread(existing)
-	}
-	tmp.UpsertRemoteThread(thread)
-	thread, _ = tmp.RemoteThreadForID(thread.ThreadID)
-	return sqliteUpsertSingle(path, "remote_threads", thread.ThreadID, thread)
-}
-
-func sqliteLoadByID[T any](path string, table string, id string) (T, bool, error) {
-	var zero T
-	if !storePathUsesSQLite(path) {
-		return zero, false, fmt.Errorf("delegation store %q is not sqlite", path)
-	}
-	id = strings.TrimSpace(id)
-	if id == "" {
-		return zero, false, nil
-	}
-	if err := materializeSQLiteStoreFromLegacy(path); err != nil {
-		return zero, false, err
-	}
-	unlock := lockDelegationSQLiteProcess(path)
-	defer unlock()
-	if exists, err := osStatSQLite(path); err != nil {
-		return zero, false, err
-	} else if !exists {
-		return zero, false, nil
-	}
-	db, err := openDelegationSQLiteStore(path, true)
-	if err != nil {
-		return zero, false, err
-	}
-	defer db.Close()
-	ctx := context.Background()
-	if err := ensureDelegationSQLiteSchema(ctx, db); err != nil {
-		return zero, false, err
-	}
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return zero, false, err
-	}
-	defer tx.Rollback()
-	value, ok, err := sqliteJSONForIDTx[T](ctx, tx, table, id)
-	if err != nil {
-		return zero, false, err
-	}
-	if err := tx.Commit(); err != nil {
-		return zero, false, err
-	}
-	return value, ok, nil
-}
-
-func sqliteUpsertSingle[T any](path string, table string, id string, value T) error {
-	if !storePathUsesSQLite(path) {
-		return fmt.Errorf("delegation store %q is not sqlite", path)
-	}
-	if err := materializeSQLiteStoreFromLegacy(path); err != nil {
-		return err
-	}
-	unlock := lockDelegationSQLiteProcess(path)
-	defer unlock()
-	db, err := openDelegationSQLiteStore(path, true)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-	ctx := context.Background()
-	if err := ensureDelegationSQLiteSchema(ctx, db); err != nil {
-		return err
-	}
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	if err := sqliteUpsertJSONTx(ctx, tx, table, id, value); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	chmodDelegationSQLiteFiles(path)
-	return nil
 }
 
 func workerActiveRemoteThread(request Record, now time.Time) RemoteThread {
@@ -374,291 +179,146 @@ func workerIdleRemoteThread(request Record, now time.Time) RemoteThread {
 	}
 }
 
-func sqliteExecutionForIDTx(ctx context.Context, tx *sql.Tx, id string) (ExecutionFence, bool, error) {
-	return sqliteJSONForIDTx[ExecutionFence](ctx, tx, "executions", id)
+func (s *WorkerDB) Route(ctx context.Context, id string) (Route, bool, error) {
+	var v Route
+	var ok bool
+	err := s.transaction(ctx, false, func(tx *sql.Tx) error { var err error; v, ok, err = readRouteTx(ctx, tx, id); return err })
+	return v, ok, err
 }
 
-func sqliteRemoteThreadForIDTx(ctx context.Context, tx *sql.Tx, id string) (RemoteThread, bool, error) {
-	return sqliteJSONForIDTx[RemoteThread](ctx, tx, "remote_threads", id)
-}
-
-func sqliteOutboxForIDTx(ctx context.Context, tx *sql.Tx, id string) (OutboxRecord, bool, error) {
-	return sqliteJSONForIDTx[OutboxRecord](ctx, tx, "outbox", id)
-}
-
-func upsertOutboxSQLiteTx(ctx context.Context, tx *sql.Tx, record Record, status string, chatID string, inboxRef string, messageID string, errText string, now time.Time) error {
-	nowText := now.UTC().Format(time.RFC3339Nano)
-	existing, _, err := sqliteOutboxForIDTx(ctx, tx, record.RecordID)
-	if err != nil {
-		return err
-	}
-	attempts := existing.Attempts
-	if status == OutboxPending {
-		attempts++
-	}
-	createdAt := existing.CreatedAt
-	if strings.TrimSpace(createdAt) == "" {
-		createdAt = nowText
-	}
-	if strings.TrimSpace(messageID) == "" {
-		messageID = existing.MessageID
-	}
-	next := OutboxRecord{
-		RecordID:     record.RecordID,
-		DelegationID: record.DelegationID,
-		ChatID:       strings.TrimSpace(chatID),
-		InboxRef:     strings.TrimSpace(inboxRef),
-		Status:       strings.TrimSpace(status),
-		MessageID:    strings.TrimSpace(messageID),
-		Attempts:     attempts,
-		Error:        strings.TrimSpace(errText),
-		CreatedAt:    createdAt,
-		UpdatedAt:    nowText,
-	}
-	return sqliteUpsertJSONTx(ctx, tx, "outbox", next.RecordID, next)
-}
-
-func sqliteJSONForIDTx[T any](ctx context.Context, tx *sql.Tx, table string, id string) (T, bool, error) {
-	var zero T
-	id = strings.TrimSpace(id)
-	if id == "" {
-		return zero, false, nil
-	}
-	var raw []byte
-	err := tx.QueryRowContext(ctx, "SELECT json FROM "+table+" WHERE id = ?", id).Scan(&raw)
-	if errors.Is(err, sql.ErrNoRows) {
-		return zero, false, nil
-	}
-	if err != nil {
-		return zero, false, err
-	}
-	var value T
-	if err := json.Unmarshal(raw, &value); err != nil {
-		return zero, false, err
-	}
-	return value, true, nil
-}
-
-func sqliteUpsertJSONTx[T any](ctx context.Context, tx *sql.Tx, table string, id string, value T) error {
-	id = strings.TrimSpace(id)
-	if id == "" {
-		return nil
-	}
-	raw, err := json.Marshal(value)
-	if err != nil {
-		return err
-	}
-	var existing []byte
-	err = tx.QueryRowContext(ctx, "SELECT json FROM "+table+" WHERE id = ?", id).Scan(&existing)
-	if err == nil && string(existing) == string(raw) {
-		return nil
-	}
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return err
-	}
-	_, err = tx.ExecContext(ctx, "INSERT INTO "+table+"(id, json) VALUES (?, ?) ON CONFLICT(id) DO UPDATE SET json = excluded.json", id, raw)
-	return err
-}
-
-func sqliteDeleteTx(ctx context.Context, tx *sql.Tx, table string, id string) error {
-	id = strings.TrimSpace(id)
-	if id == "" {
-		return nil
-	}
-	_, err := tx.ExecContext(ctx, "DELETE FROM "+table+" WHERE id = ?", id)
-	return err
-}
-
-func sqliteRoutesExistTx(ctx context.Context, tx *sql.Tx) (bool, error) {
-	var id string
-	err := tx.QueryRowContext(ctx, `SELECT id FROM routes LIMIT 1`).Scan(&id)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	return err == nil, err
-}
-
-func pruneWorkerSQLiteStateTx(ctx context.Context, tx *sql.Tx, limits WorkerStorePruneLimits) error {
-	routesExist, err := sqliteRoutesExistTx(ctx, tx)
-	if err != nil || routesExist {
-		return err
-	}
-	if err := pruneWorkerSQLiteIdleRemoteThreadsTx(ctx, tx); err != nil {
-		return err
-	}
-	if err := pruneWorkerSQLiteExecutionsTx(ctx, tx, limits.TerminalExecutionLimit); err != nil {
-		return err
-	}
-	return pruneWorkerSQLiteOutboxTx(ctx, tx, limits.TerminalOutboxLimit)
-}
-
-func pruneWorkerSQLiteIdleRemoteThreadsTx(ctx context.Context, tx *sql.Tx) error {
-	rows, err := tx.QueryContext(ctx, `SELECT id, json FROM remote_threads`)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	var deleteIDs []string
-	for rows.Next() {
-		var id string
-		var raw []byte
-		if err := rows.Scan(&id, &raw); err != nil {
-			return err
-		}
-		var thread RemoteThread
-		if err := json.Unmarshal(raw, &thread); err != nil {
-			return err
-		}
-		if strings.TrimSpace(thread.State) != RemoteThreadStateActive {
-			deleteIDs = append(deleteIDs, id)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	for _, id := range deleteIDs {
-		if err := sqliteDeleteTx(ctx, tx, "remote_threads", id); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func pruneWorkerSQLiteExecutionsTx(ctx context.Context, tx *sql.Tx, limit int) error {
-	if limit <= 0 {
-		return nil
-	}
-	entries, err := workerSQLitePruneEntries(ctx, tx, "executions", func(raw []byte) (time.Time, bool, error) {
-		var execution ExecutionFence
-		if err := json.Unmarshal(raw, &execution); err != nil {
-			return time.Time{}, false, err
-		}
-		if !terminalExecutionStatus(execution.Status) {
-			return time.Time{}, false, nil
-		}
-		return parseRecordTime(execution.UpdatedAt), true, nil
-	})
-	if err != nil {
-		return err
-	}
-	return pruneWorkerSQLiteEntries(ctx, tx, "executions", entries, limit)
-}
-
-func pruneWorkerSQLiteOutboxTx(ctx context.Context, tx *sql.Tx, limit int) error {
-	if limit <= 0 {
-		return nil
-	}
-	entries, err := workerSQLitePruneEntries(ctx, tx, "outbox", func(raw []byte) (time.Time, bool, error) {
-		var outbox OutboxRecord
-		if err := json.Unmarshal(raw, &outbox); err != nil {
-			return time.Time{}, false, err
-		}
-		if outbox.Status != OutboxVisible && outbox.Status != OutboxFailed {
-			return time.Time{}, false, nil
-		}
-		return parseRecordTime(outbox.UpdatedAt), true, nil
-	})
-	if err != nil {
-		return err
-	}
-	return pruneWorkerSQLiteEntries(ctx, tx, "outbox", entries, limit)
-}
-
-func pruneOutboxSQLiteByRetentionTx(ctx context.Context, tx *sql.Tx, now time.Time, retention time.Duration) error {
-	if retention <= 0 {
-		retention = DefaultStoreRetention
-	}
-	cutoff := now.UTC().Add(-retention)
-	rows, err := tx.QueryContext(ctx, `SELECT id, json FROM outbox`)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	var deleteIDs []string
-	for rows.Next() {
-		var id string
-		var raw []byte
-		if err := rows.Scan(&id, &raw); err != nil {
-			return err
-		}
-		var outbox OutboxRecord
-		if err := json.Unmarshal(raw, &outbox); err != nil {
-			return err
-		}
-		if pruneOutboxRecord(outbox, cutoff) {
-			deleteIDs = append(deleteIDs, id)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	for _, id := range deleteIDs {
-		if err := sqliteDeleteTx(ctx, tx, "outbox", id); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-type workerSQLitePruneEntry struct {
-	id string
-	at time.Time
-}
-
-func workerSQLitePruneEntries(ctx context.Context, tx *sql.Tx, table string, include func([]byte) (time.Time, bool, error)) ([]workerSQLitePruneEntry, error) {
-	rows, err := tx.QueryContext(ctx, "SELECT id, json FROM "+table)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var entries []workerSQLitePruneEntry
-	for rows.Next() {
-		var id string
-		var raw []byte
-		if err := rows.Scan(&id, &raw); err != nil {
-			return nil, err
-		}
-		at, ok, err := include(raw)
+func (s *WorkerDB) UpsertRoute(ctx context.Context, v Route) error {
+	return s.transaction(ctx, true, func(tx *sql.Tx) error {
+		existing, ok, err := readRouteTx(ctx, tx, v.DelegationID)
 		if err != nil {
-			return nil, err
-		}
-		if ok {
-			entries = append(entries, workerSQLitePruneEntry{id: id, at: at})
-		}
-	}
-	return entries, rows.Err()
-}
-
-func pruneWorkerSQLiteEntries(ctx context.Context, tx *sql.Tx, table string, entries []workerSQLitePruneEntry, limit int) error {
-	if len(entries) <= limit {
-		return nil
-	}
-	sort.Slice(entries, func(i, j int) bool {
-		return entries[i].at.After(entries[j].at)
-	})
-	for _, entry := range entries[limit:] {
-		if err := sqliteDeleteTx(ctx, tx, table, entry.id); err != nil {
 			return err
 		}
-	}
-	return nil
-}
-
-func workerTerminalOrRunningStatus(status string) bool {
-	switch strings.TrimSpace(status) {
-	case StateRunning, StateComplete, StateBlocked, StateCanceled, StateReuseRejected:
-		return true
-	default:
-		return false
-	}
-}
-
-func osStatSQLite(path string) (bool, error) {
-	if _, err := os.Stat(path); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return false, nil
+		if ok && strings.TrimSpace(v.CreatedAt) == "" {
+			v.CreatedAt = existing.CreatedAt
 		}
+		if strings.TrimSpace(v.CreatedAt) == "" {
+			v.CreatedAt = v.UpdatedAt
+		}
+		_, err = putRouteTx(ctx, tx, v)
+		return err
+	})
+}
+
+func (s *WorkerDB) RemoteThread(ctx context.Context, id string) (RemoteThread, bool, error) {
+	var v RemoteThread
+	var ok bool
+	err := s.transaction(ctx, false, func(tx *sql.Tx) error { var err error; v, ok, err = readRemoteThreadTx(ctx, tx, id); return err })
+	return v, ok, err
+}
+
+func (s *WorkerDB) UpsertRemoteThread(ctx context.Context, v RemoteThread) error {
+	return s.transaction(ctx, true, func(tx *sql.Tx) error {
+		existing, _, err := readRemoteThreadTx(ctx, tx, v.ThreadID)
+		if err != nil {
+			return err
+		}
+		v = normalizeRemoteThread(v, existing)
+		_, err = putRemoteThreadTx(ctx, tx, v)
+		return err
+	})
+}
+
+func (s *WorkerDB) Execution(ctx context.Context, id string) (ExecutionFence, bool, error) {
+	var v ExecutionFence
+	var ok bool
+	err := s.transaction(ctx, false, func(tx *sql.Tx) error { var err error; v, ok, err = readExecutionFenceTx(ctx, tx, id); return err })
+	return v, ok, err
+}
+
+func (s *WorkerDB) Outbox(ctx context.Context, id string) (OutboxRecord, bool, error) {
+	var v OutboxRecord
+	var ok bool
+	err := s.transaction(ctx, false, func(tx *sql.Tx) error { var err error; v, ok, err = readOutboxRecordTx(ctx, tx, id); return err })
+	return v, ok, err
+}
+
+func (s *WorkerDB) InboxCursor(ctx context.Context, id string) (InboxCursor, bool, error) {
+	var v InboxCursor
+	var ok bool
+	err := s.transaction(ctx, false, func(tx *sql.Tx) error { var err error; v, ok, err = readInboxCursorTx(ctx, tx, id); return err })
+	return v, ok, err
+}
+
+func (s *WorkerDB) UpsertInboxCursor(ctx context.Context, v InboxCursor) error {
+	return s.transaction(ctx, true, func(tx *sql.Tx) error {
+		_, err := putInboxCursorTx(ctx, tx, v)
+		return err
+	})
+}
+
+func (s *WorkerDB) InboxBackoff(ctx context.Context, id string) (InboxBackoff, bool, error) {
+	var v InboxBackoff
+	var ok bool
+	err := s.transaction(ctx, false, func(tx *sql.Tx) error { var err error; v, ok, err = readInboxBackoffTx(ctx, tx, id); return err })
+	return v, ok, err
+}
+
+func (s *WorkerDB) UpsertInboxBackoff(ctx context.Context, v InboxBackoff) error {
+	return s.transaction(ctx, true, func(tx *sql.Tx) error {
+		_, err := putInboxBackoffTx(ctx, tx, v)
+		return err
+	})
+}
+
+func TryStartWorkerSQLite(path string, request, claim Record, now time.Time, limits WorkerStorePruneLimits) (bool, error) {
+	s, err := OpenWorkerDB(path)
+	if err != nil {
 		return false, err
 	}
-	return true, nil
+	defer s.Close()
+	return s.TryStart(context.Background(), request, claim, now, limits)
+}
+func reserveOutboxSQLite(ctx context.Context, path string, record Record, chatID string, now time.Time) (OutboxRecord, bool, error) {
+	s, err := OpenWorkerDB(path)
+	if err != nil {
+		return OutboxRecord{}, false, err
+	}
+	defer s.Close()
+	return s.ReserveOutbox(ctx, record, chatID, now)
+}
+func UpsertOutboxSQLite(path string, record Record, status, chatID, inboxRef, messageID, errText string, now time.Time, retention time.Duration) error {
+	s, err := OpenWorkerDB(path)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	return s.UpsertOutbox(context.Background(), record, status, chatID, inboxRef, messageID, errText, now, retention)
+}
+
+func RouteSQLite(path, id string) (Route, bool, error) {
+	s, err := OpenWorkerDB(path)
+	if err != nil {
+		return Route{}, false, err
+	}
+	defer s.Close()
+	return s.Route(context.Background(), id)
+}
+func UpsertRouteSQLite(path string, v Route) error {
+	s, err := OpenWorkerDB(path)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	return s.UpsertRoute(context.Background(), v)
+}
+
+func RemoteThreadSQLite(path, id string) (RemoteThread, bool, error) {
+	s, err := OpenWorkerDB(path)
+	if err != nil {
+		return RemoteThread{}, false, err
+	}
+	defer s.Close()
+	return s.RemoteThread(context.Background(), id)
+}
+func UpsertRemoteThreadSQLite(path string, v RemoteThread) error {
+	s, err := OpenWorkerDB(path)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	return s.UpsertRemoteThread(context.Background(), v)
 }

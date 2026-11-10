@@ -50,6 +50,7 @@ func newSkillsInstallBuiltinCmd(root *rootOptions, codexDir *string) *cobra.Comm
 			if err != nil {
 				return err
 			}
+			defer mgr.Store.Close()
 			name := ""
 			if len(args) > 0 {
 				name = args[0]
@@ -105,6 +106,7 @@ func newSkillsAddCmd(root *rootOptions, codexDir *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			defer mgr.Store.Close()
 			runSkillsSelfHeal(ctx, mgr, cmd.ErrOrStderr())
 			auto := !noAutoSync
 			parsed, err := skills.ParseURL(args[0], skills.URLParseOptions{Name: name, Ref: ref, Path: subPath})
@@ -174,6 +176,7 @@ func newSkillsMigrateCmd(root *rootOptions, codexDir *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			defer mgr.Store.Close()
 			if !yes && !dryRun {
 				oldRoot, err := mgr.TargetRoot(skills.TargetCodexHome)
 				if err != nil {
@@ -214,6 +217,7 @@ func newSkillsListCmd(root *rootOptions, codexDir *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			defer mgr.Store.Close()
 			runSkillsSelfHeal(cmd.Context(), mgr, cmd.ErrOrStderr())
 			entries, err := mgr.List(cmd.Context())
 			if err != nil {
@@ -247,6 +251,7 @@ func newSkillsSyncCmd(root *rootOptions, codexDir *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			defer mgr.Store.Close()
 			runSkillsSelfHeal(ctx, mgr, cmd.ErrOrStderr())
 			name := ""
 			if len(args) > 0 {
@@ -288,6 +293,7 @@ func newSkillsRemoveCmd(root *rootOptions, codexDir *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			defer mgr.Store.Close()
 			runSkillsSelfHeal(ctx, mgr, cmd.ErrOrStderr())
 			source, err := mgr.Remove(ctx, args[0])
 			if err != nil {
@@ -311,6 +317,7 @@ func newSkillsDoctorCmd(root *rootOptions, codexDir *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			defer mgr.Store.Close()
 			runSkillsSelfHeal(cmd.Context(), mgr, cmd.ErrOrStderr())
 			entries, err := mgr.List(cmd.Context())
 			if err != nil {
@@ -356,6 +363,7 @@ func newSkillsPushCmd(root *rootOptions, codexDir *string) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			defer mgr.Store.Close()
 			runSkillsSelfHeal(ctx, mgr, cmd.ErrOrStderr())
 			name := ""
 			if len(args) > 0 {
@@ -369,7 +377,11 @@ func newSkillsPushCmd(root *rootOptions, codexDir *string) *cobra.Command {
 }
 
 func newSkillsManager(root *rootOptions, codexDir string, out io.Writer) (*skills.Manager, error) {
-	_, paths, err := newRootStore(root, codexDir)
+	override := ""
+	if root != nil {
+		override = root.configPath
+	}
+	paths, err := resolveEffectivePaths(override, codexDir, "")
 	if err != nil {
 		return nil, err
 	}
@@ -396,7 +408,8 @@ func startSkillsDailyAutoSync(ctx context.Context, paths effectivePaths) {
 		return
 	}
 	runSkillsSelfHeal(ctx, mgr, io.Discard)
-	mgr.StartDailyAutoSync(ctx)
+	done := mgr.StartDailyAutoSync(ctx)
+	go func() { <-done; mgr.Store.Close() }()
 }
 
 func runSkillsSelfHeal(ctx context.Context, mgr *skills.Manager, out io.Writer) {
@@ -485,16 +498,13 @@ func printSkillMigrationReport(out io.Writer, report skills.MigrationReport) {
 func printSkillMigrationStatus(out io.Writer, mgr *skills.Manager) {
 	path := mgr.MigrationStatusPath()
 	_, _ = fmt.Fprintf(out, "Migration status file: %s\n", path)
-	data, err := os.ReadFile(path)
+	report, ok, err := mgr.Store.MigrationReport()
 	if err != nil {
-		if os.IsNotExist(err) {
-			_, _ = fmt.Fprintln(out, "Migration: not run")
-		}
+		fmt.Fprintf(out, "Migration: unreadable status (%v)\n", err)
 		return
 	}
-	var report skills.MigrationReport
-	if err := json.Unmarshal(data, &report); err != nil {
-		_, _ = fmt.Fprintf(out, "Migration: unreadable status (%v)\n", err)
+	if !ok {
+		fmt.Fprintln(out, "Migration: not run")
 		return
 	}
 	ended := "unknown time"
@@ -651,6 +661,7 @@ func runSkillsTextMenu(ctx context.Context, root *rootOptions, codexDir string, 
 	if err != nil {
 		return err
 	}
+	defer mgr.Store.Close()
 	reader := bufio.NewReader(in)
 	for {
 		_, _ = fmt.Fprintln(out, "\nSkills")

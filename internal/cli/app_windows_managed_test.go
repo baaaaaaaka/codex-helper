@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"io"
 	"net"
@@ -596,50 +595,13 @@ func TestWindowsManagedAppLaunchScriptClearsRuntimeMarkersBeforeInheritance(t *t
 	}
 }
 
-func TestWindowsManagedAppCorruptStateTriggersVerifiedReinstall(t *testing.T) {
-	lockCLITestHooks(t)
+func TestWindowsManagedAppCorruptStateFailsClosed(t *testing.T) {
 	root := t.TempDir()
-	packagePath := filepath.Join(t.TempDir(), "ChatGPT.msix")
-	writeTestCodexWindowsManagedMSIX(t, packagePath, "CN=TestPublisher", "app/ChatGPT.exe", []byte("verified-child"))
-	if err := os.WriteFile(filepath.Join(root, codexWindowsManagedCurrentState), []byte("{not-json"), 0o600); err != nil {
-		t.Fatalf("write corrupt managed state: %v", err)
+	if err := os.WriteFile(filepath.Join(root, codexWindowsManagedCurrentState), []byte("corrupt"), 0600); err != nil {
+		t.Fatal(err)
 	}
-	prevDownload := codexAppDownloadPackageFn
-	prevOutput := codexAppCommandOutput
-	prevGOOS := codexAppGOOS
-	prevWSL := codexAppIsWSL
-	t.Cleanup(func() {
-		codexAppDownloadPackageFn = prevDownload
-		codexAppCommandOutput = prevOutput
-		codexAppGOOS = prevGOOS
-		codexAppIsWSL = prevWSL
-	})
-	codexAppGOOS = func() string { return "windows" }
-	codexAppIsWSL = func() bool { return false }
-	downloads := 0
-	codexAppDownloadPackageFn = func(_ context.Context, opts codexAppDownloadOptions) error {
-		downloads++
-		data, err := os.ReadFile(packagePath)
-		if err != nil {
-			return err
-		}
-		return os.WriteFile(opts.Path, data, 0o600)
-	}
-	codexAppCommandOutput = func(_ context.Context, _ string, args ...string) ([]byte, error) {
-		if strings.Contains(strings.Join(args, " "), "Get-AuthenticodeSignature") {
-			return []byte("CN=TestPublisher\n"), nil
-		}
-		return nil, errors.New("unexpected PowerShell command")
-	}
-	state, err := ensureCodexWindowsManagedInstall(context.Background(), root, codexDesktopAppOptions{Log: io.Discard})
-	if err != nil {
-		t.Fatalf("reinstall after corrupt state: %v", err)
-	}
-	if downloads != 1 || !isCodexWindowsManagedSHA256(state.ExecutableSHA256) {
-		t.Fatalf("reinstall downloads=%d state=%#v", downloads, state)
-	}
-	if _, ok, err := readValidCodexWindowsManagedState(root); err != nil || !ok {
-		t.Fatalf("published state valid=%v err=%v", ok, err)
+	if _, _, err := readValidCodexWindowsManagedState(root); err == nil {
+		t.Fatal("damaged native state accepted as cache miss")
 	}
 }
 
@@ -1060,13 +1022,10 @@ func TestWindowsManagedAppStaleDeadLockIsReclaimed(t *testing.T) {
 	now := time.Date(2026, 7, 29, 0, 0, 0, 0, time.UTC)
 	codexWindowsManagedNow = func() time.Time { return now }
 	codexWindowsManagedProcessAlive = func(pid int) bool { return pid == 4242 }
-	owner, err := json.Marshal(codexWindowsManagedLockMetadata{PID: 999999, CreatedAt: now.Add(-codexWindowsManagedLockStaleAfter - time.Second)})
-	if err != nil {
-		t.Fatalf("marshal stale owner: %v", err)
+	if err := writeWindowsManagedLockOwner(lockPath, codexWindowsManagedLockMetadata{PID: 999999, CreatedAt: now.Add(-codexWindowsManagedLockStaleAfter - time.Second)}); err != nil {
+		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(lockPath, codexWindowsManagedLockOwner), append(owner, '\n'), 0o600); err != nil {
-		t.Fatalf("write stale owner: %v", err)
-	}
+
 	reclaimed, err := reclaimStaleCodexWindowsManagedLock(lockPath)
 	if err != nil || !reclaimed {
 		t.Fatalf("stale lock reclaimed=%v err=%v", reclaimed, err)
@@ -1093,12 +1052,8 @@ func TestWindowsManagedAppLiveOrUnknownLockIsNeverDeletedAndWaitIsBounded(t *tes
 				t.Fatalf("create lock: %v", err)
 			}
 			if tc.owner != nil {
-				data, err := json.Marshal(tc.owner)
-				if err != nil {
-					t.Fatalf("marshal owner: %v", err)
-				}
-				if err := os.WriteFile(filepath.Join(lockPath, codexWindowsManagedLockOwner), append(data, '\n'), 0o600); err != nil {
-					t.Fatalf("write owner: %v", err)
+				if err := writeWindowsManagedLockOwner(lockPath, *tc.owner); err != nil {
+					t.Fatal(err)
 				}
 			}
 			oldNow := codexWindowsManagedNow

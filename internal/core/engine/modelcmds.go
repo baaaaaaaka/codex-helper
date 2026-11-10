@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -657,8 +656,7 @@ func (e *Engine) modelFork(ctx context.Context, j cmdJob, c modelChat, ref strin
 			Effort: eff, EffortSource: effSrc}); err != nil {
 			return err
 		}
-		b, _ := json.Marshal(modelForkNote{Src: c.cs.id, Model: name})
-		if err := tx.SetMeta(modelForkKey(id), string(b)); err != nil {
+		if err := tx.SetModelForkNote(id, modelForkNote{Src: c.cs.id, Model: name}); err != nil {
 			return err
 		}
 		if err := tx.SetMeta(forkChildKey(id), "1"); err != nil {
@@ -679,21 +677,11 @@ func (e *Engine) modelFork(ctx context.Context, j cmdJob, c modelChat, ref strin
 
 // modelForkNote records, until its chat exists, which chat asked for a
 // `model fork` and with which model.
-type modelForkNote struct {
-	Src   int64  `json:"src"`
-	Model string `json:"model"`
-}
-
-func modelForkKey(conv int64) string { return fmt.Sprintf("engine_model_fork_%d", conv) }
+type modelForkNote = store.ModelForkNote
 
 func modelForkOf(tx *store.Tx, conv int64) (modelForkNote, error) {
-	var n modelForkNote
-	v, ok, err := tx.Meta(modelForkKey(conv))
-	if err != nil || !ok || v == "" {
-		return n, err
-	}
-	_ = json.Unmarshal([]byte(v), &n)
-	return n, nil
+	n, _, err := tx.ModelForkNote(conv)
+	return n, err
 }
 
 // announceModelFork posts v0.1.20's notices of a `model fork` chat: its
@@ -711,7 +699,7 @@ func (e *Engine) announceModelFork(tx *store.Tx, id int64, label, cwd, url strin
 		fmt.Sprintf("Forked Work chat %s with model profile %s:\n%s", label, n.Model, url)); err != nil {
 		return err
 	}
-	return tx.SetMeta(modelForkKey(id), "")
+	return tx.DeleteModelForkNote(id)
 }
 
 // cmdEffortChat is `effort …` in either chat.

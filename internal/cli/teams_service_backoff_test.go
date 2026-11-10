@@ -110,12 +110,15 @@ func TestServiceStartBackoffRecordsTheWaitForTheWatchdog(t *testing.T) {
 	if err := teamsServiceStartBackoff(context.Background(), path, &bytes.Buffer{}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("stopped while waiting: err = %v", err)
 	}
-	rec := readTeamsServiceRestartRecord(path)
+	rec, err := readTeamsServiceRestartRecord(path)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if want := c.now.Add(teamsCrashLoopDelay(5) - teamsCrashLoopBase); !rec.WaitUntil.Equal(want) || rec.Streak != 5 {
 		t.Fatalf("record = %+v, want streak 5 waiting until %s", rec, want)
 	}
-	if filepath.Base(path) != "service-restarts.host-a.json" {
-		t.Fatalf("record is not per host: %s", path)
+	if filepath.Base(path.Database) != "service-state.sqlite" || path.Host != "host-a" {
+		t.Fatalf("record is not per host: %#v", path)
 	}
 }
 

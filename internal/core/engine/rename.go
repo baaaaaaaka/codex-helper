@@ -607,7 +607,7 @@ func (e *Engine) retitled(conv int64) {
 	e.mu.Lock()
 	delete(e.titles.retitling, conv)
 	e.mu.Unlock()
-	e.wakeNotify()
+	e.wakeNotify(store.NotificationScope{Conv: conv})
 }
 
 // autoAllowed is sessionAllowsAutoTitleUpdate.
@@ -792,25 +792,18 @@ func (e *Engine) notified(list []pendingNotify) []pendingNotify {
 	if len(list) == 0 {
 		return nil
 	}
-	v, _, err := e.st.Meta(metaNotify)
-	if err != nil {
-		return nil
-	}
-	var pending []pendingNotify
-	if v != "" {
-		if err := json.Unmarshal([]byte(v), &pending); err != nil {
-			return nil
-		}
-	}
-	still := map[string]bool{}
-	for _, p := range pending {
-		still[p.id()] = true
-	}
 	var out []pendingNotify
-	for _, n := range list {
-		if !still[n.id()] {
-			out = append(out, n)
+	if err := e.st.Read(func(tx *store.Tx) error {
+		for _, n := range list {
+			if _, ok, err := tx.Notification(n.id()); err != nil {
+				return err
+			} else if !ok {
+				out = append(out, n)
+			}
 		}
+		return nil
+	}); err != nil {
+		return nil
 	}
 	return out
 }

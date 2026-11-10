@@ -1,6 +1,8 @@
 package entry
 
 import (
+	"bytes"
+	"database/sql"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -130,6 +132,17 @@ func TestEntryMigrationTakeoverFencesImporter(t *testing.T) {
 
 func TestEntryMigrationRefusesMissingPublishedDatabase(t *testing.T) {
 	harness.Parallel(t)
+	testEntryMigrationRefusesLostDatabase(t, "missing")
+}
+
+func TestEntryMigrationRefusesEmptyPublishedDatabase(t *testing.T) {
+	harness.Parallel(t)
+	for _, kind := range []string{"empty", "schema-zero"} {
+		t.Run(kind, func(t *testing.T) { testEntryMigrationRefusesLostDatabase(t, kind) })
+	}
+}
+
+func testEntryMigrationRefusesLostDatabase(t *testing.T, kind string) {
 	s := harness.NewScenario(t, "ENTRY-MIGRATE-MISSING-DB", harness.Options{
 		Guarantees: []string{"entry-point"},
 		Title:      "loss of an already published database stops startup; the old backup is never mistaken for current data or replaced by an empty store",
@@ -149,12 +162,38 @@ func TestEntryMigrationRefusesMissingPublishedDatabase(t *testing.T) {
 	if err := os.Remove(filepath.Join(scope, "core.sqlite")); err != nil {
 		t.Fatal(err)
 	}
+	path := filepath.Join(scope, "core.sqlite")
+	if kind == "empty" {
+		if err := os.WriteFile(path, nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+	} else if kind == "schema-zero" {
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = db.Exec(`PRAGMA application_id=0x63787031`)
+		db.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	before, _ := os.ReadFile(path)
 	seq := s.Graph.LastSeq()
 	s.StartSUT()
 	exited := s.Poll(15*time.Second, func() bool { return !s.SUT.Running() })
-	s.Check("startup refuses an empty replacement", exited && strings.Contains(s.SUT.Output(), "refusing to create an empty store"), "exits with missing-store error", s.OutputTail(500))
-	_, err = os.Stat(filepath.Join(scope, "core.sqlite"))
-	s.Check("the missing current database is not recreated", os.IsNotExist(err), "no database", fmt.Sprint(err))
+	expected := "refusing to create an empty store"
+	if kind != "missing" {
+		expected = "unknown schema version"
+	}
+	s.Check("startup refuses an empty replacement", exited && strings.Contains(s.SUT.Output(), expected), "exits with lost-store error", s.OutputTail(500))
+	if kind == "missing" {
+		_, err = os.Stat(path)
+		s.Check("the missing current database is not recreated", os.IsNotExist(err), "no database", fmt.Sprint(err))
+	} else {
+		after, err := os.ReadFile(path)
+		s.Check("the rejected database is unchanged", err == nil && bytes.Equal(before, after), "same database bytes", fmt.Sprint(err))
+	}
 	requests := s.Graph.Requests(fakegraph.RequestFilter{Since: seq})
 	s.Check("the failed restart never contacts Teams", len(requests) == 0, "no Graph requests", fmt.Sprint(len(requests)))
 	after, err := os.ReadFile(filepath.Join(scope, "MIGRATED-TO-core.sqlite"))

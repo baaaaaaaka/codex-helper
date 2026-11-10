@@ -104,13 +104,15 @@ type Stream struct {
 
 // InboundFile is one attachment of an inbound message.
 type InboundFile struct {
-	Idx       int
-	Name      string
-	ExtRef    string
-	LocalPath string
-	Kind      string // file | image | voice
-	State     string // pending | ready | failed
-	Error     string
+	Idx           int
+	Name          string
+	Ref           FileReference
+	Quote         *QuoteReference
+	ResolvedQuote *QuoteText
+	LocalPath     string
+	Kind          string // file | image | voice
+	State         string // pending | ready | failed
+	Error         string
 }
 
 // InboundMsg is one received message with its pure classification.
@@ -178,7 +180,7 @@ type OutFile struct {
 	UploadURL       string
 	UploadExpiresAt int64
 	UploadedBytes   int64
-	ExtItemID       string
+	Ref             FileReference
 }
 
 // OutMsg is one rendered part to enqueue.

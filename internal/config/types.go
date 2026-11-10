@@ -1,29 +1,13 @@
 package config
 
 import (
-	"encoding/json"
 	"time"
 )
 
-// CurrentVersion is the schema generation this binary stamps into configs it
-// writes. Generation 6 adds the extensible global defaults container. The
-// field is additive and keeps the reader floor unchanged, while the newer
-// write generation prevents an older helper from silently dropping defaults it
-// does not understand.
-const CurrentVersion = 6
-
-// MinReaderVersion is the minimum reader generation required to SAFELY read a
-// config written by this binary. Raise it ONLY for breaking schema changes
-// (removed/renamed/semantically-changed fields). Additive changes MUST leave it
-// unchanged so older binaries can still read newer configs — encoding/json
-// ignores unknown fields, so an additive change does not require a newer reader.
-// See (*Store).loadUnlocked for the gate.
-const MinReaderVersion = 1
-
-// SupportedReaderVersion is the newest reader floor this binary can satisfy. A
-// config whose minReader exceeds it is rejected with ErrStaleReader (this build
-// is too old to read it). It moves together with MinReaderVersion when a
-// breaking change lands.
+// Generation 7 is the native SQLite configuration. Legacy document formats
+// are accepted only by the one-time importer, never by the runtime store.
+const CurrentVersion = 7
+const MinReaderVersion = 7
 const SupportedReaderVersion = MinReaderVersion
 
 type Config struct {
@@ -33,29 +17,23 @@ type Config struct {
 	// initialized the generation-1 broker runtime. RuntimeCleanupPending keeps
 	// post-commit compatibility cleanup retryable without making an activated
 	// installation fall back to the retired runner.
-	RuntimeGeneration       int        `json:"runtimeGeneration,omitempty"`
-	RuntimeMigrationID      string     `json:"runtimeMigrationId,omitempty"`
-	RuntimeMigratedAt       time.Time  `json:"runtimeMigratedAt,omitempty"`
-	RuntimeCleanupPending   bool       `json:"runtimeCleanupPending,omitempty"`
-	ProxyEnabled            *bool      `json:"proxyEnabled,omitempty"`
-	AgentAutoApproveEnabled *bool      `json:"agentAutoApproveEnabled,omitempty"`
-	Profiles                []Profile  `json:"profiles"`
-	Instances               []Instance `json:"instances,omitempty"`
-	// The model settings of earlier releases (global defaults, model
-	// profiles, catalogs and third-party providers) are no longer used. They
-	// are kept verbatim so a rewrite does not drop them for an older binary
-	// that shares this config.
-	Defaults              json.RawMessage      `json:"defaults,omitempty"`
-	DefaultModelProfile   json.RawMessage      `json:"defaultModelProfile,omitempty"`
-	ModelProfiles         json.RawMessage      `json:"modelProfiles,omitempty"`
-	ModelConfigVersion    json.RawMessage      `json:"modelConfigVersion,omitempty"`
-	ModelCredentials      json.RawMessage      `json:"modelCredentials,omitempty"`
-	ModelProviders        json.RawMessage      `json:"modelProviders,omitempty"`
-	Models                json.RawMessage      `json:"models,omitempty"`
-	ModelSources          json.RawMessage      `json:"modelSources,omitempty"`
-	ModelCatalogs         json.RawMessage      `json:"modelCatalogs,omitempty"`
-	ModelProviderBindings json.RawMessage      `json:"modelProviderBindings,omitempty"`
-	TeamsCodexPath        TeamsCodexPathPolicy `json:"teamsCodexPath,omitempty"`
+	RuntimeGeneration       int                  `json:"runtimeGeneration,omitempty"`
+	RuntimeMigrationID      string               `json:"runtimeMigrationId,omitempty"`
+	RuntimeMigratedAt       time.Time            `json:"runtimeMigratedAt,omitempty"`
+	RuntimeCleanupPending   bool                 `json:"runtimeCleanupPending,omitempty"`
+	ProxyEnabled            *bool                `json:"proxyEnabled,omitempty"`
+	AgentAutoApproveEnabled *bool                `json:"agentAutoApproveEnabled,omitempty"`
+	Profiles                []Profile            `json:"profiles"`
+	Instances               []Instance           `json:"instances,omitempty"`
+	Defaults                GlobalDefaults       `json:"defaults,omitempty"`
+	TeamsCodexPath          TeamsCodexPathPolicy `json:"teamsCodexPath,omitempty"`
+}
+
+// GlobalDefaults contains only currently supported runtime settings. Retired
+// providers/catalogs and unknown legacy keys remain in the migration archive.
+type GlobalDefaults struct {
+	Model           string `json:"model,omitempty"`
+	ReasoningEffort string `json:"reasoningEffort,omitempty"`
 }
 
 // TeamsCodexPathPolicy controls which executable search path is exposed to

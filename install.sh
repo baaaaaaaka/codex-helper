@@ -125,50 +125,14 @@ fi
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
 
-json_escape() {
-  printf '%s' "${1:-}" | sed 's/\\/\\\\/g; s/"/\\"/g'
-}
-
 write_install_record() {
   target_path="$1"
   shim_path="$2"
-  config_base="${XDG_CONFIG_HOME:-${HOME:-}/.config}"
-  if [ -z "${config_base:-}" ]; then
-    echo "Warning: could not write install record: HOME/XDG_CONFIG_HOME is empty" >&2
-    return 0
+  if detail=$(CXP_RUNTIME_DISABLE=1 "$target_path" --cxp-record-install --target "$target_path" --shim "$shim_path" --repo "$repo" --version "$version" --goos "$os" --goarch "$arch"); then
+    INSTALL_RECORD_DETAIL="$detail"
+  else
+    echo "Warning: could not write native SQLite install record" >&2
   fi
-  record_dir="$config_base/codex-helper"
-  record_path="$record_dir/install.json"
-  tmp_record="$record_path.tmp.$$"
-  updated_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || true)"
-  mkdir -p "$record_dir" 2>/dev/null || {
-    echo "Warning: could not create install record directory: $record_dir" >&2
-    return 0
-  }
-  cat >"$tmp_record" <<EOF_RECORD || {
-{
-  "schema_version": 1,
-  "target_path": "$(json_escape "$target_path")",
-  "target_source": "installer",
-  "target_state": "managed",
-  "repo": "$(json_escape "$repo")",
-  "version": "$(json_escape "$version")",
-  "goos": "$(json_escape "$os")",
-  "goarch": "$(json_escape "$arch")",
-  "shims": ["$(json_escape "$shim_path")"],
-  "updated_at": "$(json_escape "$updated_at")"
-}
-EOF_RECORD
-    echo "Warning: could not write install record temp file: $tmp_record" >&2
-    return 0
-  }
-  chmod 0600 "$tmp_record" 2>/dev/null || true
-  mv -f "$tmp_record" "$record_path" 2>/dev/null || {
-    rm -f "$tmp_record" 2>/dev/null || true
-    echo "Warning: could not publish install record: $record_path" >&2
-    return 0
-  }
-  INSTALL_RECORD_DETAIL="Install record: $record_path"
 }
 
 is_positive_integer() {
@@ -920,8 +884,14 @@ for legacy_name in claude-proxy clp; do
   fi
 done
 
+# A format-breaking upgrade requires a compatible physical bootstrap before
+# any ordinary CLI invocation can migrate business state.
+if ! CXP_RUNTIME_DISABLE=1 "$dst" --cxp-install-bootstrap --target "$dst"; then
+  fail_install "Could not establish the SQLite bootstrap; stop old writers and rerun the installer"
+fi
 update_shell_config
 install_builtin_skills
+
 write_install_record "$dst" "$cxp_dst"
 INSTALL_SUCCESS_DETAILS="$(cat <<EOF
 Installed: $dst

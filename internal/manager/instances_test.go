@@ -15,6 +15,7 @@ func TestInstanceRecordHeartbeatRemove(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 
 	inst := config.Instance{
 		ID:         "i1",
@@ -63,6 +64,7 @@ func TestOwnedInstanceOpsFenceStaleDaemon(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 	inst := config.Instance{
 		ID:          "owned-1",
 		ProfileID:   "p1",
@@ -135,6 +137,7 @@ func TestInstanceOpsErrorPaths(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 
 	t.Run("Heartbeat missing instance", func(t *testing.T) {
 		if err := Heartbeat(store, "missing", time.Now()); err == nil {

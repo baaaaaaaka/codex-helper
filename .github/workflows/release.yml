@@ -18,7 +18,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Enumerate supported formal releases
+      - name: Enumerate formal releases and the frozen SQLite cutover predecessor
         env:
           GH_TOKEN: ${{ github.token }}
           TARGET_TAG: ${{ github.ref_name }}
@@ -29,8 +29,9 @@ jobs:
           old_tags="$(python3 scripts/ci/helper_release_matrix.py \
             --releases "$RUNNER_TEMP/helper-releases.json" \
             --minimum v0.1.20 \
+            --include v0.1.22-rc.96 \
             --exclude "$TARGET_TAG" \
-            --matrix-multiplier 5 \
+            --matrix-multiplier 4 \
             --max-jobs 256)"
           echo "old_tags=$old_tags" >> "$GITHUB_OUTPUT"
         id: matrix
@@ -250,7 +251,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go test ./cmd/codex-proxy -count=1 -run 'TestRunMain(HandlesCandidateUpdateBeforeRuntimeDispatch|RunsLegacyPreflightBeforeRuntimeDispatch|PreflightFailureStopsBeforeRuntimeDispatch)$' -v
+          go test ./cmd/codex-proxy -count=1 -run '^TestRunMain(HandlesBootProtocolBeforeRuntimeDispatch|HandlesCandidateUpdateBeforeRuntimeDispatch|BootstrapFailureStopsBeforeCLI|RejectsLegacyDownloadBeforeRuntimeDispatch)$' -v
           go test ./internal/helperruntime -count=1 -run 'Test(NormalizeVersion|LauncherEnvironment.*|InstallVersion.*|PublishDownloaded.*|EnsureStableEntry.*|Current.*|RecoverPrevious.*|RuntimeProcessIdentity.*)$' -v
           go test ./internal/candidateupdate -count=1 -v
           go test ./internal/update -count=1 -run 'Test(Probe.*|PerformUpdatePublishesImmutableRuntimeAndSwitchesActive|ReplaceBinaryReplacesIdleExistingDestinationWindows)$' -v
@@ -261,16 +262,6 @@ jobs:
         if: runner.os != 'Windows'
         shell: bash
         run: bash scripts/ci/candidate_owned_update_smoke.sh
-
-      - name: Legacy rc.28-rc.35 runtime bridge (Linux/macOS)
-        if: runner.os != 'Windows'
-        shell: bash
-        run: bash scripts/ci/legacy_runtime_bridge_smoke.sh
-
-      - name: Legacy rc.28-rc.35 runtime bridge and restart recovery (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: .\scripts\ci\legacy_runtime_bridge_smoke.ps1
 
       - name: Stale copied cxp.exe entry update (Windows)
         if: runner.os == 'Windows'
@@ -353,7 +344,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cli_pattern='Test(UpgradeCmd(DefaultDoesNot(TouchTeamsServiceOrRequestUAC|RestartTeamsServiceAfterUpdateError)|IgnoresBrokenEnvInstallPathAndUnifiesAliases|UnifiesDefaultInstallAliasWhenCurrentGoBinWins|CreatesMissingCXPShimForManagedDefault|RepairsStaleCXPRegularFileForManagedDefault)|RewriteLegacyCXPProfile.*|EnsureCXPShimForInstallPath(RepairsStalePOSIXSymlink|CreatesWindowsCmdShim|RepairsWindowsCmdShim|KeepsNonHelperWindowsCmd)|TeamsReleaseAutoUpdaterApply(UsesRunningGoBinAndUnifiesManagedDefault|CreatesMissingCXPShim|UnifiesBrokenEnvAliases)|TeamsServiceInstall(SkipsBrokenEnvInstallPathAndRepairsManagedDefault|CreatesMissingManagedDefaultBeforeRepointingFromGoBin|CreatesMissingCXPShimWhenManagedTargetCurrent)|HandleUpdateAndRestartUnifiesCXPShimBeforeExec|RestartTeamsHelperAfterActivationPendingUsesInstalledPath|LegacyUpdater.*)$'
+          cli_pattern='Test(UpgradeCmd(DefaultDoesNot(TouchTeamsServiceOrRequestUAC|RestartTeamsServiceAfterUpdateError)|IgnoresBrokenEnvInstallPathAndUnifiesAliases|UnifiesDefaultInstallAliasWhenCurrentGoBinWins|CreatesMissingCXPShimForManagedDefault|RepairsStaleCXPRegularFileForManagedDefault)|RewriteLegacyCXPProfile.*|EnsureCXPShimForInstallPath(RepairsStalePOSIXSymlink|CreatesWindowsCmdShim|RepairsWindowsCmdShim|KeepsNonHelperWindowsCmd)|TeamsReleaseAutoUpdaterApply(UsesRunningGoBinAndUnifiesManagedDefault|CreatesMissingCXPShim|UnifiesBrokenEnvAliases)|TeamsServiceInstall(SkipsBrokenEnvInstallPathAndRepairsManagedDefault|CreatesMissingManagedDefaultBeforeRepointingFromGoBin|CreatesMissingCXPShimWhenManagedTargetCurrent)|HandleUpdateAndRestartUnifiesCXPShimBeforeExec|RestartTeamsHelperAfterActivationPendingUsesInstalledPath)$'
           go test ./internal/cli -count=1 -run "$cli_pattern" -v
 
   # A release publishes only a commit that passes both test tiers: the
@@ -692,7 +683,7 @@ jobs:
           if (Test-Path -LiteralPath $legacyGitSkill) { throw "upgrade did not hide legacy git subscription directory" }
 
   helper-upgrade-compat-smoke:
-    name: Helper upgrade compat (${{ matrix.target.os }}, ${{ matrix.target.service_backend }}, ${{ matrix.old_tag }} -> current)
+    name: SQLite artifact cutover (${{ matrix.target.os }}, ${{ matrix.old_tag }} -> current)
     runs-on: ${{ matrix.target.os }}
     needs: [goreleaser, discover-helper-releases]
     strategy:
@@ -701,34 +692,26 @@ jobs:
         old_tag: ${{ fromJSON(needs.discover-helper-releases.outputs.old_tags) }}
         target:
           - os: ubuntu-latest
-            service_backend: local-supervisor
-          - os: ubuntu-latest
-            service_backend: systemd-user
           - os: macos-15
-            service_backend: launchd
           - os: windows-2022
-            service_backend: windows-task
           - os: windows-2025
-            service_backend: windows-task
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Split-entry upgrade convergence (Linux/macOS)
+      - name: Old updater refusal and explicit SQLite cutover (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash
         env:
           REPO: ${{ github.repository }}
           OLD_TAG: ${{ matrix.old_tag }}
           TARGET_TAG: ${{ github.ref_name }}
-          FETCHER: curl
-          SERVICE_BACKEND: ${{ matrix.target.service_backend }}
         run: |
           set -euo pipefail
           bash scripts/ci/helper_upgrade_compat_smoke.sh
 
-      - name: Split-entry upgrade convergence (Windows)
+      - name: Old updater refusal and explicit SQLite cutover (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         env:
@@ -739,9 +722,6 @@ jobs:
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
           .\scripts\ci\helper_upgrade_compat_smoke.ps1
-          if ($env:OLD_TAG -eq "v0.1.12") {
-            .\scripts\ci\windows_locked_cxp_self_upgrade.ps1 -ExpectedState Converged
-          }
 
   install-container-smoke:
     name: Install smoke (containers)

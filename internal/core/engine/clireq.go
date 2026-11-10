@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -21,7 +20,7 @@ import (
 // request next to the store and the helper hands it to CLIRequest.
 //
 // A request runs once per id. Every step is keyed by the id (the chat
-// creation key, the delivery keys, the progress kept in meta), so a request
+// creation key, the delivery keys, the progress kept in SQL), so a request
 // delivered again after a restart resumes where it stopped and returns the
 // saved result once it is done.
 
@@ -47,16 +46,11 @@ type CLIRequest struct {
 }
 
 // CLIResult is what the command prints: Lines on success, Error otherwise.
-type CLIResult struct {
-	Lines []string `json:"lines,omitempty"`
-	Error string   `json:"error,omitempty"`
-}
+type CLIResult = store.CLIResult
 
 // ErrCLIRetry: the request was not finished (the engine is not ready or is
 // stopping); hand it in again later.
 var ErrCLIRetry = errors.New("engine: request not finished; retry later")
-
-const metaCLIPrefix = "engine_cli:" // + request id: cliProgress
 
 // cliMovedWait bounds the wait for the "chat moved" link in the old chat
 // before the chat is switched anyway (the old chat may be the broken one).
@@ -70,17 +64,7 @@ const (
 	cliSending   = "sending"   // send-file: the file is queued
 )
 
-type cliProgress struct {
-	Stage  string     `json:"stage,omitempty"`
-	Conv   int64      `json:"conv,omitempty"`
-	Old    string     `json:"old,omitempty"`
-	Chat   string     `json:"chat,omitempty"`
-	URL    string     `json:"url,omitempty"`
-	Title  string     `json:"title,omitempty"`
-	Name   string     `json:"name,omitempty"`
-	Import int64      `json:"import,omitempty"`
-	Result *CLIResult `json:"result,omitempty"`
-}
+type cliProgress = store.CLIProgress
 
 // cliState runs one request at a time.
 type cliState struct {
@@ -131,12 +115,8 @@ func (e *Engine) CLIRequest(ctx context.Context, r CLIRequest) (CLIResult, error
 		e.cli.mu.Unlock()
 	}()
 	var p cliProgress
-	if v, ok, err := e.st.Meta(metaCLIPrefix + r.ID); err != nil {
+	if err := e.st.Read(func(tx *store.Tx) (err error) { p, _, err = tx.CLIProgress(r.ID); return }); err != nil {
 		return CLIResult{}, err
-	} else if ok && v != "" {
-		if err := json.Unmarshal([]byte(v), &p); err != nil {
-			return CLIResult{}, fmt.Errorf("request %s: %w", r.ID, err)
-		}
 	}
 	if p.Result != nil {
 		return *p.Result, nil
@@ -181,11 +161,7 @@ func (e *Engine) cliReady() bool {
 }
 
 func (e *Engine) saveCLI(tx *store.Tx, id string, p *cliProgress) error {
-	b, err := json.Marshal(p)
-	if err != nil {
-		return err
-	}
-	return tx.SetMeta(metaCLIPrefix+id, string(b))
+	return tx.SetCLIProgress(id, *p)
 }
 
 func (e *Engine) cliSleep(ctx context.Context, d time.Duration) error {

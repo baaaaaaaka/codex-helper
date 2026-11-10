@@ -96,7 +96,7 @@ function Assert-InstallRecord([string]$RecordPath, [string]$TargetPath, [string]
 }
 
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\.."))
-$installer = Join-Path $repoRoot "install.ps1"
+$installer = $null
 $base = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { [IO.Path]::GetTempPath() }
 $root = Join-Path $base ("locked-cxp-self-upgrade-" + [guid]::NewGuid().ToString("N"))
 $fixtureHome = Join-Path $root "home"
@@ -137,7 +137,11 @@ try {
     Remove-Item ("Env:" + $name) -ErrorAction SilentlyContinue
   }
 
-  Write-Host "Installing the historical fixture with the current installer: $OldTag"
+  # This regression deliberately runs two historical versions. Their installer
+  # is part of that frozen fixture; the SQLite-only installer rejects old code.
+  $installer = Join-Path $root "historical-install.ps1"
+  Invoke-WebRequest -Uri "https://raw.githubusercontent.com/$Repo/$OldTag/install.ps1" -OutFile $installer
+  Write-Host "Installing the historical fixture with its matching installer: $OldTag"
   & $installer -Repo $Repo -Version $OldTag -InstallDir $installDir
   if (!$?) {
     throw "install.ps1 failed"

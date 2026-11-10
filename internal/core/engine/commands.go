@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -460,7 +459,7 @@ func (e *Engine) statusText() string {
 		e.cfg.Version, e.machineLabel(), s.Uptime.Round(time.Second), s.Conversations, s.Active, s.Parked, s.Running, s.Turns, s.Completed)
 	if e.draining() {
 		text += " New requests wait for an update (it waits for running requests to finish)."
-	} else if v, ok, err := e.st.Meta(metaUpdateRequest); err == nil && ok && v != "" {
+	} else if s, err := ReadStoreStatus(e.st); err == nil && s.UpdateScheduled != "" {
 		text += " A helper update is scheduled (`update status`)."
 	}
 	return text
@@ -470,7 +469,7 @@ func (e *Engine) workStatus(cs *convState) string {
 	e.mu.Lock()
 	label, state, cwd, running, paused := cs.label, cs.state, cs.cwd, cs.running != nil, cs.paused
 	e.mu.Unlock()
-	var queued int
+	var queued, unsent, unconfirmed int
 	_ = e.update(func(tx *store.Tx) error {
 		open, err := tx.OpenTurnsOf(cs.id)
 		for _, t := range open {
@@ -478,6 +477,10 @@ func (e *Engine) workStatus(cs *convState) string {
 				queued++
 			}
 		}
+		if err != nil {
+			return err
+		}
+		unsent, unconfirmed, err = tx.DeliveryCounts(cs.id)
 		return err
 	})
 	run := "idle"
@@ -488,7 +491,11 @@ func (e *Engine) workStatus(cs *convState) string {
 	if paused {
 		p = " Auto-start is paused (`helper unpause`)."
 	}
-	return fmt.Sprintf("%s (%s): %s, %d queued. Directory: `%s`.%s", label, state, run, queued, cwd, p)
+	text := fmt.Sprintf("%s (%s): %s, %d queued. Directory: `%s`.%s", label, state, run, queued, cwd, p)
+	if unconfirmed > 0 {
+		text += fmt.Sprintf(" Delivery: %d awaiting send, %d unconfirmed (retained without automatic resend; later messages can continue).", unsent, unconfirmed)
+	}
+	return text
 }
 
 // restartConfirm is a `helper restart` confirmation the new process owes.
@@ -500,18 +507,12 @@ type restartConfirm struct {
 // loadRestartConfirm reads a pending restart confirmation left by the
 // previous process.
 func (e *Engine) loadRestartConfirm() {
-	v, ok, err := e.st.Meta(metaRestart)
-	if err != nil || !ok || v == "" {
+	v, ok, err := e.st.RestartConfirmation()
+	if err != nil || !ok {
 		return
 	}
-	parts := strings.SplitN(v, ":", 3)
-	if len(parts) != 3 {
-		return
-	}
-	conv, _ := strconv.ParseInt(parts[0], 10, 64)
-	inbound, _ := strconv.ParseInt(parts[1], 10, 64)
 	e.mu.Lock()
-	e.restart = restartConfirm{conv: conv, inbound: inbound, quote: parts[2]}
+	e.restart = restartConfirm{conv: v.Conv, inbound: v.Inbound, quote: v.Quote}
 	e.mu.Unlock()
 }
 
@@ -539,7 +540,7 @@ func (e *Engine) confirmRestart(conv int64) {
 		if err := e.addServiceNotify(tx, conv, fmt.Sprintf("restart:%d", rc.inbound), textRestarted); err != nil {
 			return err
 		}
-		return tx.SetMeta(metaRestart, "")
+		return tx.DeleteRestartConfirmation()
 	})
 	if err != nil {
 		e.logf("restart confirmation: %v", err)

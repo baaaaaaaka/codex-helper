@@ -3,17 +3,13 @@ package skillcmd
 // `skills push` from a chat (gap batch B, F-CTL-17): v0.1.20's two-step
 // review (`helper skills push [--direct] [name]`) and `helper skills push
 // [--direct] confirm` (teams/skills_commands.go), with its texts. The
-// pending review is kept per chat for 30 minutes in a private file next
-// to the skill subscription config; confirm pushes only the reviewed
+// pending review is kept per chat for 30 minutes in the skill database; confirm pushes only the reviewed
 // changes and refuses a review the local edits no longer match.
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -22,9 +18,8 @@ import (
 )
 
 const (
-	pushReviewTTL   = 30 * time.Minute
-	pushReviewsFile = "teams-skill-push-reviews.json"
-	pushUsage       = "usage: `helper skills push [--direct] [name]` or `helper skills push [--direct] confirm`"
+	pushReviewTTL = 30 * time.Minute
+	pushUsage     = "usage: `helper skills push [--direct] [name]` or `helper skills push [--direct] confirm`"
 )
 
 type pushArgs struct {
@@ -54,36 +49,9 @@ func parsePushArgs(rest string) (pushArgs, error) {
 }
 
 // pushReview is v0.1.20's teamstore.SkillPushReview.
-type pushReview struct {
-	Chat      string         `json:"chat"`
-	Name      string         `json:"name,omitempty"`
-	Direct    bool           `json:"direct,omitempty"`
-	CreatedAt time.Time      `json:"created_at"`
-	ExpiresAt time.Time      `json:"expires_at"`
-	Sources   []reviewSource `json:"sources"`
-}
-
-type reviewSource struct {
-	SourceID      string         `json:"source_id"`
-	SourceName    string         `json:"source_name"`
-	RemoteURL     string         `json:"remote_url,omitempty"`
-	Ref           string         `json:"ref,omitempty"`
-	BaseCommit    string         `json:"base_commit"`
-	ReviewRefSpec string         `json:"review_refspec"`
-	Changes       []reviewChange `json:"changes"`
-}
-
-type reviewChange struct {
-	Kind       string `json:"kind"`
-	RelPath    string `json:"rel_path"`
-	SourcePath string `json:"source_path"`
-	Commit     string `json:"commit,omitempty"`
-	OldSHA256  string `json:"old_sha256,omitempty"`
-	NewSHA256  string `json:"new_sha256,omitempty"`
-	OldMode    uint32 `json:"old_mode,omitempty"`
-	NewMode    uint32 `json:"new_mode,omitempty"`
-	Size       int64  `json:"size,omitempty"`
-}
+type pushReview = skills.PushReview
+type reviewSource = skills.ReviewSource
+type reviewChange = skills.ReviewChange
 
 // groupBySource is v0.1.20's skills.GroupLocalChangesBySource.
 func groupBySource(changes []skills.LocalChange) map[string][]skills.LocalChange {
@@ -134,102 +102,14 @@ func buildReview(chat, name string, direct bool, changes []skills.LocalChange, n
 	return r, nil
 }
 
-// The reviews file maps a chat to its pending review.
-func (c *Command) reviewsPath() (string, error) {
-	o, err := c.resolved()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(o.ConfigDir, pushReviewsFile), nil
+// Reviews share the subscription module database. The command's manager
+// owns its connection; no review operation loads another chat's changes.
+func (c *Command) loadReview(db *skills.Store, chat string) (pushReview, bool, error) {
+	return db.Review(chat, time.Now())
 }
-
-func (c *Command) loadReviews() (map[string]pushReview, error) {
-	p, err := c.reviewsPath()
-	if err != nil {
-		return nil, err
-	}
-	raw, err := os.ReadFile(p)
-	if errors.Is(err, os.ErrNotExist) {
-		return map[string]pushReview{}, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	out := map[string]pushReview{}
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return map[string]pushReview{}, nil // unreadable: no pending review
-	}
-	return out, nil
-}
-
-// updateReviews applies fn to the reviews file (under c.mu).
-func (c *Command) updateReviews(fn func(map[string]pushReview)) error {
-	all, err := c.loadReviews()
-	if err != nil {
-		return err
-	}
-	fn(all)
-	p, err := c.reviewsPath()
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
-		return err
-	}
-	raw, err := json.MarshalIndent(all, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, p); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
-}
-
-func (c *Command) loadReview(chat string) (pushReview, bool, error) {
-	all, err := c.loadReviews()
-	if err != nil {
-		return pushReview{}, false, err
-	}
-	r, ok := all[chat]
-	if !ok {
-		return pushReview{}, false, nil
-	}
-	if !r.ExpiresAt.IsZero() && time.Now().After(r.ExpiresAt) {
-		_ = c.updateReviews(func(m map[string]pushReview) { delete(m, chat) })
-		return pushReview{}, false, nil
-	}
-	return r, true, nil
-}
-
-func (c *Command) clearReview(chat string) {
-	_ = c.updateReviews(func(m map[string]pushReview) { delete(m, chat) })
-}
-
-func (c *Command) removeReviewSource(chat, sourceID string) error {
-	return c.updateReviews(func(m map[string]pushReview) {
-		r, ok := m[chat]
-		if !ok {
-			return
-		}
-		var next []reviewSource
-		for _, s := range r.Sources {
-			if s.SourceID != sourceID {
-				next = append(next, s)
-			}
-		}
-		if len(next) == 0 {
-			delete(m, chat)
-			return
-		}
-		r.Sources = next
-		m[chat] = r
-	})
+func (c *Command) clearReview(db *skills.Store, chat string) { _ = db.DeleteReview(chat) }
+func (c *Command) removeReviewSource(db *skills.Store, chat, sourceID string) error {
+	return db.DeleteReviewSource(chat, sourceID)
 }
 
 // push runs `skills push …` for chat.
@@ -257,14 +137,14 @@ func (c *Command) push(ctx context.Context, chat string, mgr *skills.Manager, re
 	if args.Direct && !reviewHasDirect(r) {
 		return "skills push review failed: `--direct` requires every reviewed subscription to use an explicit branch ref."
 	}
-	if err := c.updateReviews(func(m map[string]pushReview) { m[chat] = r }); err != nil {
+	if err := mgr.Store.SaveReview(r); err != nil {
 		return "skills push review failed: " + err.Error()
 	}
 	return formatReview(r)
 }
 
 func (c *Command) confirmPush(ctx context.Context, chat string, mgr *skills.Manager, args pushArgs) string {
-	r, ok, err := c.loadReview(chat)
+	r, ok, err := c.loadReview(mgr.Store, chat)
 	if err != nil {
 		return "skills push confirm failed: " + err.Error()
 	}
@@ -286,7 +166,7 @@ func (c *Command) confirmPush(ctx context.Context, chat string, mgr *skills.Mana
 		}
 	}
 	if err := reviewStillMatches(r, current); err != nil {
-		c.clearReview(chat)
+		c.clearReview(mgr.Store, chat)
 		return "Pending skills push review is stale: " + err.Error() + "\n\nRun `helper skills push [name]` again."
 	}
 	grouped := groupBySource(current)
@@ -299,7 +179,7 @@ func (c *Command) confirmPush(ctx context.Context, chat string, mgr *skills.Mana
 	for _, s := range r.Sources {
 		sc := grouped[s.SourceID]
 		if len(sc) == 0 {
-			c.clearReview(chat)
+			c.clearReview(mgr.Store, chat)
 			return "Pending skills push review is stale: source " + s.SourceName + " no longer has the reviewed changes.\n\nRun `helper skills push [name]` again."
 		}
 		opts := skills.PushLocalChangesOptions{Direct: direct, Out: &log}
@@ -317,7 +197,7 @@ func (c *Command) confirmPush(ctx context.Context, chat string, mgr *skills.Mana
 		if res.Pushed {
 			pushed = append(pushed, res)
 		}
-		if err := c.removeReviewSource(chat, s.SourceID); err != nil {
+		if err := c.removeReviewSource(mgr.Store, chat, s.SourceID); err != nil {
 			return "skills push state update failed after push: " + err.Error()
 		}
 	}

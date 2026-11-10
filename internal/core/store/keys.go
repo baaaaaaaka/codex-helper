@@ -26,26 +26,6 @@ const MetaMigratedFrom = "migrated_from"
 // control chat once and clears it in the same transaction.
 const MetaMigrationSummary = "migration_summary"
 
-// MetaLegacyFinalChecks is the meta key holding the converter's list of
-// LegacyFinalCheck: the previous helper's answers whose send outcome was
-// unknown. The engine checks each once against the chat's history at first
-// start and resends it only when it is absent (owner ruling 2026-11-05,
-// Q1). An entry decided as sent stays, with Found set, so that post is
-// recognised as the helper's own whenever it is read; an entry resent or
-// given up is removed.
-const MetaLegacyFinalChecks = "legacy_final_checks"
-
-// MetaHistoryChecks is the meta key holding the converter's list of
-// HistoryCheck: converted rollouts whose catch-up starts before the
-// previous helper's furthest position with no delivery proof for what lies
-// between (STORE-DESIGN §9.4: old positions are no proof). At first start
-// the engine reads each one's chat history once, before that rollout's
-// catch-up posts anything, and resumes after the newest record it finds
-// posted there (canary rerun brief 2026-11-06: s001 posted at least 267
-// records the previous helper had already posted). The decision stays in
-// the list (Done), so a restart never checks again.
-const MetaHistoryChecks = "legacy_history_checks"
-
 // HistoryCheck is one converted rollout whose resume point is checked
 // against its chat's history.
 type HistoryCheck struct {

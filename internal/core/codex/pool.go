@@ -3,15 +3,12 @@ package codex
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
-	"runtime"
-	"sort"
 	"sync"
 	"time"
 )
@@ -40,7 +37,9 @@ type Pool struct {
 
 	// pidMu serializes PID file writes from snapshot to rename, so an
 	// older snapshot can never replace a newer one (review M3).
-	pidMu sync.Mutex
+	pidMu     sync.Mutex
+	pidStore  *sql.DB
+	pidClosed bool
 }
 
 type entry struct {
@@ -131,7 +130,7 @@ func (p *Pool) Acquire(ctx context.Context, key string, cfg Config) (*Lease, err
 				if e.err != nil || e.srv.Exited() {
 					delete(p.servers, key)
 					p.mu.Unlock()
-					p.writePIDs()
+					p.writePIDs(key)
 					continue
 				}
 				e.leases++
@@ -168,7 +167,7 @@ func (p *Pool) Acquire(ctx context.Context, key string, cfg Config) (*Lease, err
 		if err != nil {
 			return nil, err
 		}
-		p.writePIDs()
+		p.writePIDs(key)
 		if closed {
 			srv.Kill()
 			return nil, ErrPoolClosed
@@ -204,7 +203,7 @@ func (p *Pool) AcquireCurrent(ctx context.Context, key string, cfg Config) (*Lea
 		if stale != nil {
 			fmt.Fprintf(p.cfg.Log, "codex: %s changed; restarting app-server %s (pid %d) for the next turn\n", cfg.ConfigFile, key, stale.srv.PID())
 			stale.srv.Close(5 * time.Second)
-			p.writePIDs()
+			p.writePIDs(key)
 		}
 	}
 	return p.Acquire(ctx, key, cfg)
@@ -259,7 +258,7 @@ func (p *Pool) Drop(key string) {
 	p.mu.Unlock()
 	if e != nil {
 		e.srv.Kill()
-		p.writePIDs()
+		p.writePIDs(key)
 	}
 }
 
@@ -302,7 +301,11 @@ func (p *Pool) Reap() int {
 		}(e)
 	}
 	wg.Wait()
-	p.writePIDs()
+	keys := make([]string, 0, len(victims))
+	for _, e := range victims {
+		keys = append(keys, e.key)
+	}
+	p.writePIDs(keys...)
 	return len(victims)
 }
 
@@ -336,7 +339,18 @@ func (p *Pool) Close(grace time.Duration) {
 		}(e)
 	}
 	wg.Wait()
-	p.writePIDs()
+	keys := make([]string, 0, len(all))
+	for _, e := range all {
+		keys = append(keys, e.key)
+	}
+	p.writePIDs(keys...)
+	p.pidMu.Lock()
+	p.pidClosed = true
+	if p.pidStore != nil {
+		_ = p.pidStore.Close()
+		p.pidStore = nil
+	}
+	p.pidMu.Unlock()
 }
 
 // pidRecord is one PID file entry. Boot and NS say which kernel instance
@@ -349,28 +363,6 @@ type pidRecord struct {
 	Key   string `json:"key,omitempty"`
 	Boot  string `json:"boot,omitempty"`
 	NS    string `json:"pidns,omitempty"`
-}
-
-func (p *Pool) writePIDs() {
-	if p.cfg.PIDFile == "" {
-		return
-	}
-	p.pidMu.Lock()
-	defer p.pidMu.Unlock()
-	p.mu.Lock()
-	recs := []pidRecord{}
-	boot, ns := bootID(), pidNamespace()
-	for _, e := range p.servers {
-		if e.srv != nil && !e.srv.Exited() {
-			recs = append(recs, pidRecord{PID: e.srv.PID(), Start: e.start, Key: e.key, Boot: boot, NS: ns})
-		}
-	}
-	p.mu.Unlock()
-	sort.Slice(recs, func(i, j int) bool { return recs[i].PID < recs[j].PID })
-	data, _ := json.Marshal(recs)
-	if err := writeFileAtomic(p.cfg.PIDFile, data); err != nil {
-		fmt.Fprintf(p.cfg.Log, "codex: write pid file: %v\n", err)
-	}
 }
 
 // sameProcess reports whether record r still names the live process pid
@@ -389,95 +381,6 @@ func sameProcess(r pidRecord, boot, ns, start string) bool {
 	// The start time cannot be compared: only a matching boot vouches
 	// that the pid was not recycled by another machine.
 	return r.Boot != "" && r.Boot == boot
-}
-
-func writeFileAtomic(path string, data []byte) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	// A unique temp file per write: two writers never share (and so never
-	// interleave into) one file.
-	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
-	if err != nil {
-		return err
-	}
-	tmp := f.Name()
-	_, werr := f.Write(data)
-	if serr := f.Sync(); werr == nil {
-		werr = serr
-	}
-	if cerr := f.Close(); werr == nil {
-		werr = cerr
-	}
-	if werr == nil {
-		werr = os.Chmod(tmp, 0o600)
-	}
-	if werr == nil {
-		werr = os.Rename(tmp, path)
-		// Windows refuses (access denied) a rename onto a file another
-		// writer is replacing at that moment; that writer is done shortly.
-		for i := 0; werr != nil && runtime.GOOS == "windows" && i < 50; i++ {
-			time.Sleep(10 * time.Millisecond)
-			werr = os.Rename(tmp, path)
-		}
-	}
-	if werr != nil {
-		_ = os.Remove(tmp)
-	}
-	return werr
-}
-
-// KillStale kills the app-server process groups recorded in pidFile by a
-// previous helper process and waits until they are gone, so that turns
-// are reconciled only once no old server can still change them. A record
-// is left alone unless it provably names the same process: it must come
-// from this boot and pid namespace (a copied home or a reboot leaves
-// records whose pids mean nothing here), and a pid whose process now has
-// a different start time was recycled. A record that cannot be checked
-// either way (no start time and no boot id) is left alone too. The file
-// is emptied on success.
-func KillStale(pidFile string, wait time.Duration) (killed int, err error) {
-	data, rerr := os.ReadFile(pidFile)
-	if errors.Is(rerr, os.ErrNotExist) {
-		return 0, nil
-	}
-	if rerr != nil {
-		return 0, rerr
-	}
-	var recs []pidRecord
-	if len(data) > 0 {
-		if jerr := json.Unmarshal(data, &recs); jerr != nil {
-			return 0, fmt.Errorf("codex: pid file %s: %w", pidFile, jerr)
-		}
-	}
-	var targets []int
-	boot, ns := bootID(), pidNamespace()
-	for _, r := range recs {
-		if r.PID <= 1 || r.PID == os.Getpid() {
-			continue
-		}
-		if !sameProcess(r, boot, ns, startTime(r.PID)) {
-			continue
-		}
-		if !groupAlive(r.PID) {
-			continue
-		}
-		_ = killGroup(r.PID)
-		targets = append(targets, r.PID)
-	}
-	deadline := time.Now().Add(wait)
-	for _, pid := range targets {
-		for groupAlive(pid) {
-			if time.Now().After(deadline) {
-				return len(targets), fmt.Errorf("codex: old app-server group %d still alive", pid)
-			}
-			time.Sleep(20 * time.Millisecond)
-		}
-	}
-	if err := writeFileAtomic(pidFile, []byte("[]")); err != nil {
-		return len(targets), err
-	}
-	return len(targets), nil
 }
 
 // Running reports native work, including TUI turns and goal continuations.

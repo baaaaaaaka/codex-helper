@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -60,35 +59,12 @@ type legacyAnswer struct {
 	want string
 }
 
-func readLegacyChecks(tx *store.Tx) ([]store.LegacyFinalCheck, error) {
-	v, ok, err := tx.Meta(store.MetaLegacyFinalChecks)
-	if err != nil || !ok || v == "" {
-		return nil, err
-	}
-	var list []store.LegacyFinalCheck
-	if err := json.Unmarshal([]byte(v), &list); err != nil {
-		return nil, nil // unreadable: nothing can be done with it
-	}
-	return list, nil
-}
-
-func writeLegacyChecks(tx *store.Tx, list []store.LegacyFinalCheck) error {
-	if len(list) == 0 {
-		return tx.SetMeta(store.MetaLegacyFinalChecks, "")
-	}
-	b, err := json.Marshal(list)
-	if err != nil {
-		return err
-	}
-	return tx.SetMeta(store.MetaLegacyFinalChecks, string(b))
-}
-
 // loadLegacyAnswers reads the list before the loops start.
 func (e *Engine) loadLegacyAnswers(ctx context.Context) {
 	var list []store.LegacyFinalCheck
-	if err := e.update(func(tx *store.Tx) error {
+	if err := e.st.Read(func(tx *store.Tx) error {
 		var err error
-		list, err = readLegacyChecks(tx)
+		list, err = tx.AnswerChecks()
 		return err
 	}); err != nil {
 		e.logf("answer history check: %v", err)
@@ -153,19 +129,16 @@ func (e *Engine) legacyOwn(tx *store.Tx, conv int64, m channel.InboundMsg) (bool
 			}
 			continue
 		}
-		list, err := readLegacyChecks(tx)
+		saved, exists, err := tx.AnswerCheck(a.c.Key)
 		if err != nil {
 			return false, err
 		}
-		for j := range list {
-			if list[j].Key == a.c.Key && list[j].Found == "" {
-				list[j].Found = m.ID
-				if err := writeLegacyChecks(tx, list); err != nil {
-					return false, err
-				}
-				e.logf("answer of the previous helper from %s (%s): found in the chat's history (%s): not sent",
-					time.UnixMilli(a.c.Created).UTC().Format(time.RFC3339), a.c.Key, m.ID)
+		if exists && saved.Found == "" {
+			saved.Found = m.ID
+			if err := tx.SetAnswerCheck(saved); err != nil {
+				return false, err
 			}
+			e.logf("answer of the previous helper from %s (%s): found in the chat's history (%s): not sent", time.UnixMilli(a.c.Created).UTC().Format(time.RFC3339), a.c.Key, m.ID)
 		}
 		a.c.Found = m.ID
 		return true, nil
@@ -270,30 +243,28 @@ func (e *Engine) checkLegacyFinal(ctx context.Context, a legacyAnswer) error {
 func (e *Engine) decideLegacyFinal(c store.LegacyFinalCheck, resend []store.OutMsg, found, outcome string) error {
 	decided, listed := false, true
 	err := e.update(func(tx *store.Tx) error {
-		list, err := readLegacyChecks(tx)
+		saved, exists, err := tx.AnswerCheck(c.Key)
 		if err != nil {
 			return err
 		}
-		i := slices.IndexFunc(list, func(p store.LegacyFinalCheck) bool { return p.Key == c.Key })
-		if i < 0 || list[i].Found != "" {
-			decided, listed = true, i >= 0
+		if !exists || saved.Found != "" {
+			decided, listed = true, exists
 			if listed {
-				found = list[i].Found
+				found = saved.Found
 			}
 			return nil
 		}
 		if found != "" {
-			list[i].Found = found
-		} else {
-			listed = false
-			list = slices.Delete(list, i, i+1)
-			if len(resend) > 0 {
-				if _, err := tx.Enqueue(c.ConvID, resend); err != nil {
-					return err
-				}
+			saved.Found = found
+			return tx.SetAnswerCheck(saved)
+		}
+		listed = false
+		if len(resend) > 0 {
+			if _, err := tx.Enqueue(c.ConvID, resend); err != nil {
+				return err
 			}
 		}
-		return writeLegacyChecks(tx, list)
+		return tx.DeleteAnswerCheck(c.Key)
 	})
 	if err != nil {
 		return err

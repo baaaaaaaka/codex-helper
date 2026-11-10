@@ -4,7 +4,7 @@ package store
 const ApplicationID = 0x63787031
 
 // SchemaVersion is the PRAGMA user_version this code writes and understands.
-const SchemaVersion = 4
+const SchemaVersion = 6
 
 // migrations[i] upgrades user_version i to i+1. Each step runs in one
 // transaction together with the user_version bump. There is no pointer file.
@@ -24,6 +24,10 @@ var migrations = [][]string{
 		`ALTER TABLE outbox ADD COLUMN batch_body TEXT`,
 		`ALTER TABLE outbox ADD COLUMN hold_turn INTEGER`,
 		`CREATE INDEX outbox_batch ON outbox(batch_head) WHERE batch_head IS NOT NULL`},
+	// Retained unknown outcomes are history for scheduling. Keep active lookups
+	// independent of their count, without changing any rows or delivery states.
+	{`CREATE INDEX outbox_active ON outbox(conv_id, seq) WHERE state IN ('queued','sending')`},
+	engineStateSchema,
 }
 
 // schemaV1 is the complete initial schema (STORE-DESIGN.md §3). No triggers
@@ -224,5 +228,5 @@ var schemaV1 = []string{
 var Tables = []string{
 	"meta", "owner", "conversations", "threads", "streams", "turns", "inbound",
 	"inbound_files", "outbox", "outbox_files", "transcript_sources", "forks",
-	"notifications", "gates", "question_groups", "questions", "question_options",
+	"restart_confirmation", "freeze_notices", "notifications", "pending_notifications", "cli_requests", "cli_result_lines", "codex_upgrade", "codex_upgrade_targets", "dashboard_view", "dashboard_items", "source_info", "delegated_threads", "import_jobs", "update_requests", "update_pending", "restart_requests", "model_fork_notes", "answer_checks", "history_checks", "gates", "question_groups", "questions", "question_options",
 }

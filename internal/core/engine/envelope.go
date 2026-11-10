@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -110,13 +109,7 @@ type localFile struct{ path, name, contentType string }
 type promptClip struct{ name, text string }
 
 // quoteText is one referenced message as given to Codex.
-type quoteText struct {
-	From     string `json:"from,omitempty"`
-	Time     string `json:"time,omitempty"`
-	Text     string `json:"text,omitempty"`
-	Fetched  bool   `json:"fetched,omitempty"`
-	FullPath string `json:"full,omitempty"`
-}
+type quoteText = store.QuoteText
 
 // codexInput builds the Codex input of a prompt: the text and the image
 // inputs.
@@ -136,8 +129,7 @@ func codexInput(body string, files []store.InboundFile, root string) (string, []
 			quotes = append(quotes, qt)
 			continue
 		}
-		var ref fileRef
-		_ = json.Unmarshal([]byte(f.ExtRef), &ref)
+		ref := f.Ref
 		switch {
 		case f.State != "ready":
 			failed = append(failed, fmt.Sprintf("- %s: %s", f.Name, firstNonEmpty(f.Error, "not available")))
@@ -299,7 +291,7 @@ func withLocalFiles(text string, files []localFile) string {
 // Content-Type header is not kept, so a known extension or (for a pasted
 // image) the image's own bytes stand in for it; the table is fixed so the
 // prompt does not depend on the host's mime.types.
-func listedType(f store.InboundFile, ref fileRef) string {
+func listedType(f store.InboundFile, ref store.FileReference) string {
 	if ct := strings.TrimSpace(ref.ContentType); ct != "" {
 		switch strings.ToLower(strings.TrimSpace(strings.Split(ct, ";")[0])) {
 		case "application/octet-stream", "binary/octet-stream", "reference", "messagereference", "forwardedmessagereference":
@@ -350,56 +342,36 @@ func codexImageType(ct string) bool {
 // --- Quotes (F-RND-9) ---
 //
 // A quoted or forwarded message is an inbound_files row (kind "file",
-// ext_ref {"q":…}) after the message's files, so it survives deferral and a
+// quote columns) after the message's files, so it survives deferral and a
 // restart like a file. asrLoop resolves it (fetchQuote): a messageReference
 // is read in full from the same chat; a forward, or a message that cannot
-// be read, keeps the Teams preview. The resolved text is kept as JSON in the
-// row's local file.
+// be read, keeps the Teams preview. Resolved text is stored in the same row.
 
-type quoteRef struct {
-	N    int    `json:"n"` // 1-based among the message's quotes
-	ID   string `json:"id,omitempty"`
-	From string `json:"from,omitempty"`
-	Time string `json:"time,omitempty"`
-	Text string `json:"text,omitempty"`
-	Fwd  bool   `json:"fwd,omitempty"`
-}
+type quoteRef = store.QuoteReference
 
 // admittedFiles is the inbound_files rows of a prompt: its attachments,
 // then its quotes.
 func admittedFiles(m channel.InboundMsg) []store.InboundFile {
 	out := inboundFiles(m.Files)
 	for j, q := range m.Quotes {
-		data, _ := json.Marshal(struct {
-			Q quoteRef `json:"q"`
-		}{quoteRef{N: j + 1, ID: q.ID, From: q.FromName, Time: q.Time, Text: q.Text, Fwd: q.Forwarded}})
 		out = append(out, store.InboundFile{Idx: len(m.Files) + j, Name: fmt.Sprintf("referenced message %d", j+1),
-			ExtRef: string(data), Kind: "file", State: "pending"})
+			Quote: &store.QuoteReference{N: j + 1, ID: q.ID, From: q.FromName, Time: q.Time, Text: q.Text, Fwd: q.Forwarded}, Kind: "file", State: "pending"})
 	}
 	return out
 }
 
 // quoteOf reports whether f is a quote row.
 func quoteOf(f store.InboundFile) (quoteRef, bool) {
-	if !strings.HasPrefix(f.ExtRef, `{"q":`) {
+	if f.Quote == nil {
 		return quoteRef{}, false
 	}
-	var row struct {
-		Q *quoteRef `json:"q"`
-	}
-	if json.Unmarshal([]byte(f.ExtRef), &row) != nil || row.Q == nil {
-		return quoteRef{}, false
-	}
-	return *row.Q, true
+	return *f.Quote, true
 }
 
 // quoteForPrompt is a quote row as given to Codex.
 func quoteForPrompt(f store.InboundFile, q quoteRef) quoteText {
-	if f.State == "ready" && f.LocalPath != "" {
-		var qt quoteText
-		if data, err := os.ReadFile(f.LocalPath); err == nil && json.Unmarshal(data, &qt) == nil {
-			return qt
-		}
+	if f.State == "ready" && f.ResolvedQuote != nil {
+		return *f.ResolvedQuote
 	}
 	qt := quoteText{From: q.From, Time: q.Time, Text: q.Text}
 	if strings.TrimSpace(qt.Text) == "" {
@@ -413,14 +385,14 @@ func quoteForPrompt(f store.InboundFile, q quoteRef) quoteText {
 }
 
 // fetchQuote resolves a quote row (fetchOne's contract).
-func (e *Engine) fetchQuote(ctx context.Context, inboundID int64, f store.InboundFile, q quoteRef) (string, string, string) {
+func (e *Engine) fetchQuote(ctx context.Context, inboundID int64, f store.InboundFile, q quoteRef) (string, *store.QuoteText, string) {
 	if e.cfg.FilesDir == "" {
-		return "ready", "", "" // the preview is used
+		return "ready", nil, "" // the preview is used
 	}
 	qt := quoteText{From: q.From, Time: q.Time, Text: strings.TrimSpace(q.Text)}
 	if !q.Fwd && q.ID != "" {
 		var chat string
-		if err := e.update(func(tx *store.Tx) error {
+		if err := e.st.Read(func(tx *store.Tx) error {
 			in, _, err := tx.Inbound(inboundID)
 			if err != nil {
 				return err
@@ -429,7 +401,7 @@ func (e *Engine) fetchQuote(ctx context.Context, inboundID int64, f store.Inboun
 			chat = c.ExtChatID
 			return err
 		}); err != nil || chat == "" {
-			return "", "", ""
+			return "", nil, ""
 		}
 		m, err := e.ch.Get(ctx, chat, q.ID)
 		var rej *channel.Rejected
@@ -458,7 +430,7 @@ func (e *Engine) fetchQuote(ctx context.Context, inboundID int64, f store.Inboun
 			if ctx.Err() == nil {
 				e.logf("quote %d/%d (will retry): %v", inboundID, f.Idx, err)
 			}
-			return "", "", ""
+			return "", nil, ""
 		}
 	}
 	if qt.Text == "" {
@@ -467,7 +439,7 @@ func (e *Engine) fetchQuote(ctx context.Context, inboundID int64, f store.Inboun
 	dir := filepath.Join(e.cfg.FilesDir, fmt.Sprint(inboundID))
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		e.logf("quote dir: %v", err)
-		return "", "", ""
+		return "", nil, ""
 	}
 	if len([]rune(qt.Text)) > maxQuoteRunes {
 		full := filepath.Join(dir, fmt.Sprintf("referenced-message-%03d.txt", q.N))
@@ -481,16 +453,11 @@ func (e *Engine) fetchQuote(ctx context.Context, inboundID int64, f store.Inboun
 		}
 		b.WriteString("\n" + quoteSource(qt.Fetched) + "\n\n" + qt.Text + "\n")
 		if err := os.WriteFile(full, []byte(b.String()), 0o600); err != nil {
-			return "", "", ""
+			return "", nil, ""
 		}
 		qt.FullPath = full
 	}
-	data, _ := json.Marshal(qt)
-	local := filepath.Join(dir, fmt.Sprintf("%d-quote.json", f.Idx))
-	if err := os.WriteFile(local, data, 0o600); err != nil {
-		return "", "", ""
-	}
-	return "ready", local, ""
+	return "ready", &qt, ""
 }
 
 // --- Admission screen (F-RND-8, R-26) ---

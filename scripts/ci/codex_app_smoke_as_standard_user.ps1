@@ -60,7 +60,7 @@ if ($SettingsPath) {
     Write-Host "Standard-user environment probe passed"
     switch ($Mode) {
       "managed" {
-        & (Join-Path $PSScriptRoot "codex_app_managed_install_smoke.ps1") -Helper $Helper -RecordingProxy ([string]$settings.RecordingProxy) -FakeChatGPT ([string]$settings.FakeChatGPT)
+        & (Join-Path $PSScriptRoot "codex_app_managed_install_smoke.ps1") -Helper $Helper -RecordingProxy ([string]$settings.RecordingProxy) -FakeChatGPT ([string]$settings.FakeChatGPT) -Python ([string]$settings.Python)
       }
       "store" {
         $windowsPowerShell = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
@@ -187,14 +187,18 @@ try {
   Copy-Item -LiteralPath $TokenProbe -Destination $childProbe
   $childProxy = ""
   $childApp = ""
+  $python = ""
   if ($Mode -eq "managed") {
+    # The standard account resets PATH to the machine environment. Pass the
+    # hosted runner's interpreter explicitly, without its credentials or PATH.
+    $python = (Get-Command python -CommandType Application -ErrorAction Stop).Source
     $childProxy = Join-Path $smokeRoot "recording-proxy.exe"
     $childApp = Join-Path $smokeRoot "fake-chatgpt.exe"
     Copy-Item -LiteralPath $RecordingProxy -Destination $childProxy
     Copy-Item -LiteralPath $FakeChatGPT -Destination $childApp
   }
   $settings = Join-Path $smokeRoot "settings.json"
-  @{ AccountSid = $account.SID.Value; WorkingDirectory = $work; RecordingProxy = $childProxy; FakeChatGPT = $childApp; PackageFamilyName = $packageFamily } | ConvertTo-Json | Set-Content -LiteralPath $settings -Encoding UTF8
+  @{ AccountSid = $account.SID.Value; WorkingDirectory = $work; RecordingProxy = $childProxy; FakeChatGPT = $childApp; Python = $python; PackageFamilyName = $packageFamily } | ConvertTo-Json | Set-Content -LiteralPath $settings -Encoding UTF8
   $credential = [PSCredential]::new("$env:COMPUTERNAME\$accountName", $password)
   $childScript = Join-Path $smokeRoot "codex_app_smoke_as_standard_user.ps1"
   $arguments = "-NoLogo -NoProfile -NonInteractive -File `"$childScript`" -Helper `"$childHelper`" -TokenProbe `"$childProbe`" -Mode $Mode -SettingsPath `"$settings`""

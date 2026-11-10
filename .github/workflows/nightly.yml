@@ -134,16 +134,6 @@ jobs:
         shell: bash
         run: bash scripts/ci/candidate_owned_update_smoke.sh
 
-      - name: Legacy rc.28-rc.35 runtime bridge (Linux/macOS)
-        if: matrix.shard == 'platform-integration' && runner.os != 'Windows'
-        shell: bash
-        run: bash scripts/ci/legacy_runtime_bridge_smoke.sh
-
-      - name: Legacy rc.28-rc.35 runtime bridge and restart recovery (Windows)
-        if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
-        shell: pwsh
-        run: .\scripts\ci\legacy_runtime_bridge_smoke.ps1
-
       - name: Stale copied cxp.exe entry update (Windows)
         if: matrix.shard == 'platform-integration' && runner.os == 'Windows'
         shell: pwsh
@@ -174,6 +164,7 @@ jobs:
         run: |
           set -euo pipefail
           bash scripts/ci/session_preview_sqlite_io_smoke.sh
+          bash scripts/ci/sqlite_state_io_smoke.sh
 
       - name: CXP cache v2 real NFS concurrency smoke (Linux only)
         if: matrix.shard == 'state-perf' && runner.os == 'Linux'
@@ -401,6 +392,16 @@ jobs:
         run: |
           go test ./internal/codexrunner -run '^$' -bench 'Benchmark(CompletedFinalAgentMessageForTurnsList|AppServerProtocolFinalNotifications)$' -benchtime=100x -count=1 -benchmem
 
+      - name: Core typed state benchmark smoke
+        if: matrix.shard == 'state-perf' && runner.os == 'Linux'
+        shell: bash
+        run: |
+          go test ./internal/core/store -run '^$' -bench '^Benchmark(NotificationCandidates|CLIProgressLookup)$' -benchtime=10x -count=1 -benchmem
+          go test ./internal/core/delegate/delegation -run '^$' -bench '^BenchmarkWorkerSQLitePointOperations$' -benchtime=10x -count=1 -benchmem
+          go test ./internal/config -run '^$' -bench '^BenchmarkConfigSQLiteHeartbeat$' -benchtime=100x -count=1 -benchmem
+          go test ./internal/skills -run '^$' -bench '^BenchmarkSkillsSQLiteSourceState$' -benchtime=100x -count=1 -benchmem
+          go test ./internal/sqlitestate -run '^$' -bench '^BenchmarkSQLiteSnapshot(Publication|Read)$' -benchtime=100x -count=1 -benchmem
+
       - name: TUI and session history benchmark smoke
         if: matrix.shard == 'state-perf' && runner.os == 'Linux'
         shell: bash
@@ -543,7 +544,7 @@ jobs:
           path: |
             ${{ runner.temp }}/cxp-desktop-smoke-*/**/*.log
             ${{ runner.temp }}/cxp-desktop-smoke-*/**/*.out
-            ${{ runner.temp }}/cxp-desktop-smoke-*/**/managed/current.json
+            ${{ runner.temp }}/cxp-desktop-smoke-*/**/managed/current.sqlite
           if-no-files-found: ignore
           retention-days: 7
 

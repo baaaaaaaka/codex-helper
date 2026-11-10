@@ -77,7 +77,7 @@ func bootProcessFixture(t *testing.T) (Context, string) {
 	}
 	h := sha256.Sum256(bytes)
 	c := Context{Root: root, EntryPath: entry, Version: "v1.0.0", RuntimePath: VersionPath(root, "v1.0.0", runtime.GOOS)}
-	if err := StageBootCandidate(context.Background(), c, "v1.0.0", 0, entry, "v2.0.0", hex.EncodeToString(h[:])); err != nil {
+	if err := StageBootCandidate(context.Background(), c, "v1.0.0", 1, entry, "v2.0.0", hex.EncodeToString(h[:])); err != nil {
 		t.Fatal(err)
 	}
 	return c, dir

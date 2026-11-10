@@ -9,12 +9,14 @@ import (
 
 func newTest(t *testing.T) *Command {
 	d := t.TempDir()
-	return New(Options{
+	c := New(Options{
 		ConfigDir: filepath.Join(d, "config"),
 		CacheDir:  filepath.Join(d, "cache"),
 		CodexDir:  filepath.Join(d, "codex"),
 		HomeDir:   filepath.Join(d, "home"),
 	})
+	t.Cleanup(func() { c.Close() })
+	return c
 }
 
 func TestListEmpty(t *testing.T) {
@@ -53,6 +55,7 @@ func TestUsageAndAddParsing(t *testing.T) {
 func TestRepliesCarryNoLocalPaths(t *testing.T) {
 	d := t.TempDir()
 	c := New(Options{ConfigDir: filepath.Join(d, "config"), CacheDir: filepath.Join(d, "cache"), CodexDir: filepath.Join(d, "codex"), HomeDir: d})
+	t.Cleanup(func() { c.Close() })
 	for _, a := range []string{"", "list", "sync", "help"} {
 		if got := c.Command(context.Background(), a); strings.Contains(got, d) {
 			t.Fatalf("%q leaks a path: %q", a, got)

@@ -13,7 +13,7 @@ func TestSteerSelectionPreservesExplicitQueueAndPendingFiles(t *testing.T) {
 		admitted, err = tx.AdmitWindow("test", id, []InboundMsg{
 			{ExtMsgID: "1", ExtTime: 1, Sender: SenderOwner, Kind: InPrompt, Body: "first"},
 			{ExtMsgID: "2", ExtTime: 2, Sender: SenderOwner, Kind: InPrompt, Body: "queued", Queue: true},
-			{ExtMsgID: "3", ExtTime: 3, Sender: SenderOwner, Kind: InPrompt, Body: "image", Files: []InboundFile{{Name: "image", Kind: "image", ExtRef: "ref", State: "pending"}}},
+			{ExtMsgID: "3", ExtTime: 3, Sender: SenderOwner, Kind: InPrompt, Body: "image", Files: []InboundFile{{Name: "image", Kind: "image", Ref: FileReference{Ref: "ref"}, State: "pending"}}},
 			{ExtMsgID: "4", ExtTime: 4, Sender: SenderOwner, Kind: InPrompt, Body: "last"},
 		}, "cursor")
 		return

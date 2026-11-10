@@ -322,6 +322,11 @@ func runCodexTUIInvocationViaBrokerWithHooks(
 			view, viewErr := teamsReadStoreView()
 			host, _ := teamsHostname()
 			if viewErr == nil && view.Remote == "" && view.Info.Exists && view.Info.Live(time.Now(), lease.ProductionStale) {
+				// A live helper without its native descriptor is not admission to
+				// start a competing writer (including during a legacy cutover).
+				if _, statErr := os.Lstat(teamsTUIEndpointPath(view.Anchor, host)); statErr != nil {
+					return fmt.Errorf("local Teams helper has not published a compatible TUI endpoint: %w", statErr)
+				}
 				if len(tuiTail) == 0 {
 					shared, err = tuilease.AcquireNew(ctx, teamsTUIEndpointPath(view.Anchor, host), paths.CodexDir, cwd)
 					if err == nil && shared != nil {

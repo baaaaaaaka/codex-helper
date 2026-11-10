@@ -961,6 +961,7 @@ func TestRunLikePersistsProxyEnabledAfterProfileSetup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 
 	prevRunWithProfile := runWithProfileFn
 	prevRunTarget := runTargetWithFallbackWithOptionsFn
@@ -1039,6 +1040,7 @@ func TestRunLikeExplicitProfilePersistsProxyEnabledAfterProfileSetup(t *testing.
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 
 	prevRunWithProfile := runWithProfileFn
 	prevRunTarget := runTargetWithFallbackWithOptionsFn
@@ -1214,6 +1216,7 @@ func TestRunWithProfileOptionsLoadErrorFallsThrough(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 
 	origStackStart := stackStart
 	defer func() { stackStart = origStackStart }()

@@ -1,9 +1,9 @@
 package managedinstall
 
 import (
-	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -379,21 +379,28 @@ func TestResolveRejectsCurrentCXPEntryWhenSiblingManagedTargetMissing(t *testing
 	}
 }
 
-func TestSaveRecordWritesJSONWithoutBOM(t *testing.T) {
+func TestSaveRecordWritesNativeSQLite(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "install.json")
 	if err := SaveRecord(path, Record{TargetPath: "/tmp/codex-proxy"}); err != nil {
-		t.Fatalf("SaveRecord: %v", err)
+		t.Fatal(err)
 	}
-	data, err := os.ReadFile(path)
+	native, err := recordPath(path)
 	if err != nil {
-		t.Fatalf("read record: %v", err)
+		t.Fatal(err)
 	}
-	if hasUTF8BOM(data) {
-		t.Fatalf("SaveRecord wrote UTF-8 BOM: % x", data[:3])
+	data, err := os.ReadFile(native)
+	if err != nil {
+		t.Fatal(err)
 	}
-	var record Record
-	if err := json.Unmarshal(data, &record); err != nil {
-		t.Fatalf("saved record is not plain JSON: %v\n%s", err, data)
+	if !strings.HasPrefix(string(data), "SQLite format 3\x00") {
+		t.Fatal("record is not SQLite")
+	}
+	if _, err = os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("writer produced legacy JSON")
+	}
+	record, err := LoadRecord(path)
+	if err != nil || record.TargetPath != "/tmp/codex-proxy" {
+		t.Fatalf("record %#v/%v", record, err)
 	}
 }
 

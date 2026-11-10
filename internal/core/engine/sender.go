@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -242,7 +241,7 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 				e.mu.Lock()
 				at := e.uploadAt[r.ID]
 				e.mu.Unlock()
-				if d := at.Sub(now); d > 0 && f.ExtItemID == "" {
+				if d := at.Sub(now); d > 0 && f.Ref.Ref == "" {
 					soon(d)
 					continue
 				}
@@ -275,7 +274,7 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 			var fp *store.OutFile
 			if isFile {
 				fp = &f
-				if f.ExtItemID == "" {
+				if f.Ref.Ref == "" {
 					jobs = append(jobs, job{row: r, chat: chat, file: fp, upload: true})
 					continue
 				}
@@ -512,16 +511,24 @@ func (e *Engine) send(ctx context.Context, r store.Outbox, chat, token string, f
 		}
 		e.forgetFailures(r.ID)
 		e.wakeRunner(r.ConvID)
+		e.wakeDeliveryNotify(r)
 		if r.Kind != store.OutAck {
 			e.heat(r.ConvID)
 		}
 	case channel.IsAmbiguous(err):
 		e.logf("send %s to conversation %d: outcome unknown (%v); resolving by read-back", r.DeliveryKey, r.ConvID, err)
-		if err := e.persist(ctx, "record send outcome", func(tx *store.Tx) error { return tx.MarkUnknown(r.ID, clipText(err.Error(), 200)) }); err != nil {
+		if err := e.persist(ctx, "record send outcome", func(tx *store.Tx) error {
+			if err := tx.MarkUnknown(r.ID, clipText(err.Error(), 200)); err != nil {
+				return err
+			}
+			return e.reportUnknown(tx, r)
+		}); err != nil {
 			e.logf("mark unknown %d: %v", r.ID, err)
 		}
 		e.forgetFailures(r.ID)
 		e.noteUnknown(r.ID, now)
+		e.wakeRunner(r.ConvID)
+		e.wakeDeliveryNotify(r)
 		e.wakeResolver()
 	case throttled:
 		at := now.Add(e.retryAfter(th) + time.Duration(r.ConvID%5)*e.t.Tick)
@@ -553,6 +560,7 @@ func (e *Engine) send(ctx context.Context, r store.Outbox, chat, token string, f
 		}
 		e.forgetFailures(r.ID)
 		e.wakeRunner(r.ConvID)
+		e.wakeDeliveryNotify(r)
 	case errors.As(err, &auth):
 		e.logf("send needs sign-in: %v", err)
 		e.requeue(ctx, r.ID, now.Add(e.t.MaxBackoff))
@@ -834,6 +842,7 @@ func (e *Engine) resolveOne(ctx context.Context, id int64) {
 		delete(e.unknown, id)
 		e.mu.Unlock()
 		e.wakeRunner(r.ConvID)
+		e.wakeDeliveryNotify(r)
 		e.wakeSender()
 		return
 	}
@@ -850,10 +859,10 @@ func (e *Engine) resolveOne(ctx context.Context, id int64) {
 		return
 	}
 	// A listing can lag or be incomplete: absence is not proof of rejection.
-	// Keep content unknown, preserve its batch, and block only this chat.
+	// Keep content unknown and preserve its batch. Later messages continue.
 	if r.Kind == store.OutProgress || r.Kind == store.OutMirror || r.Kind == store.OutFinal {
 		if err := e.update(func(tx *store.Tx) error {
-			return e.enqueueNotice(tx, e.controlID, fmt.Sprintf("delivery-unknown:%d", r.ID), fmt.Sprintf("Delivery unconfirmed in %s (message reference %d). The complete message is retained and this chat's delivery is waiting for confirmation. The helper will keep checking without resending it automatically.", e.deliveryChatLabel(r.ConvID), r.ID))
+			return e.reportUnknown(tx, r)
 		}); err != nil {
 			e.logf("report unknown %d: %v", r.ID, err)
 		}
@@ -886,7 +895,16 @@ func (e *Engine) resolveOne(ctx context.Context, id int64) {
 	delete(e.unknown, id)
 	e.mu.Unlock()
 	e.wakeRunner(r.ConvID)
+	e.wakeDeliveryNotify(r)
 	e.wakeSender()
+}
+
+// reportUnknown uses the existing durable notice key, including across restart.
+func (e *Engine) reportUnknown(tx *store.Tx, r store.Outbox) error {
+	if r.Kind != store.OutProgress && r.Kind != store.OutMirror && r.Kind != store.OutFinal {
+		return nil
+	}
+	return e.enqueueNotice(tx, e.controlID, fmt.Sprintf("delivery-unknown:%d", r.ID), fmt.Sprintf("Delivery unconfirmed in %s (message reference %d). The complete message is retained. Later messages can continue; this message will not be resent automatically.", e.deliveryChatLabel(r.ConvID), r.ID))
 }
 
 // resentKey is the engine meta key recording that an absent final or mirror
@@ -900,13 +918,10 @@ const (
 
 // filePart renders the message that carries an uploaded outbound file.
 func (e *Engine) filePart(ctx context.Context, f store.OutFile) (channel.Part, error) {
-	var ref fileRef
-	if err := json.Unmarshal([]byte(f.ExtItemID), &ref); err != nil {
-		return channel.Part{}, fmt.Errorf("upload reference: %w", err)
-	}
+	ref := f.Ref
 	name := firstNonEmpty(ref.Name, filepath.Base(f.LocalPath))
 	parts, err := e.ch.Render(ctx, channel.RichDoc{Label: labelAnswer, Markdown: "📎 " + name,
-		Files: []channel.FileRef{{Kind: ref.Kind, Name: name, Size: ref.Size, ContentType: ref.ContentType, Ref: ref.Ref}}})
+		Files: []channel.FileRef{{Kind: channel.FileKind(ref.Kind), Name: name, Size: ref.Size, ContentType: ref.ContentType, Ref: ref.Ref, AttachmentID: ref.AttachmentID, URL: ref.URL}}})
 	if err != nil {
 		return channel.Part{}, err
 	}
@@ -957,8 +972,8 @@ func (e *Engine) upload(ctx context.Context, r store.Outbox, f store.OutFile) {
 	th, throttled := channel.AsThrottled(err)
 	switch {
 	case err == nil:
-		data, _ := json.Marshal(fileRef{Kind: ref.Kind, Name: name, Size: ref.Size, ContentType: ref.ContentType, Ref: ref.Ref})
-		if err := e.update(func(tx *store.Tx) error { return tx.SetUpload(r.ID, "", 0, f.Size, string(data)) }); err != nil {
+		ref.Name = name
+		if err := e.update(func(tx *store.Tx) error { return tx.SetUploadedFile(r.ID, f.Size, fileReference(ref)) }); err != nil {
 			e.logf("record upload %s: %v", r.DeliveryKey, err)
 		}
 		e.mu.Lock()
@@ -1017,10 +1032,11 @@ func (e *Engine) dropFile(r store.Outbox, name string) {
 	e.mu.Unlock()
 	e.forgetFailures(r.ID)
 	e.wakeRunner(r.ConvID)
+	e.wakeDeliveryNotify(r)
 	e.wakeSender()
 }
 
-// Show the stable work-chat label, so an operator can identify a blocked chat.
+// Show the stable work-chat label, so an operator can identify the affected chat.
 func (e *Engine) deliveryChatLabel(id int64) string {
 	e.mu.Lock()
 	defer e.mu.Unlock()

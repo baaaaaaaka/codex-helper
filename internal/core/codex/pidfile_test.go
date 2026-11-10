@@ -1,59 +1,56 @@
 package codex
 
 import (
-	"encoding/json"
-	"os"
+	"fmt"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 )
 
-// Review M3: concurrent PID file writes never leave a corrupt file or a
-// stray temp file (they used to share one ".tmp" file and could interleave).
+func testPIDRecords(t *testing.T, path string) []pidRecord {
+	t.Helper()
+	db, err := openPIDDatabase(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := readPIDPage(db, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rows
+}
 func TestConcurrentPIDFileWritesStayValid(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "pids.json")
+	path := filepath.Join(t.TempDir(), "pids.sqlite")
 	var wg sync.WaitGroup
 	for i := 0; i < 64; i++ {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
-			recs := make([]pidRecord, i%7)
-			for k := range recs {
-				recs[k] = pidRecord{PID: 1000 + k, Key: strings.Repeat("k", i)}
+			db, err := openPIDDatabase(path)
+			if err != nil {
+				t.Error(err)
+				return
 			}
-			data, _ := json.Marshal(recs)
-			if err := writeFileAtomic(path, data); err != nil {
+			defer db.Close()
+			if _, err = db.Exec(pidPut, 1000+i, "start", fmt.Sprint(i), "boot", "ns"); err != nil {
 				t.Error(err)
 			}
 		}(i)
 	}
 	wg.Wait()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var recs []pidRecord
-	if err := json.Unmarshal(data, &recs); err != nil {
-		t.Fatalf("PID file corrupt after concurrent writes: %v: %q", err, data)
-	}
-	ents, _ := os.ReadDir(dir)
-	if len(ents) != 1 {
-		var names []string
-		for _, e := range ents {
-			names = append(names, e.Name())
-		}
-		t.Fatalf("files left: %v", names)
+	recs := testPIDRecords(t, path)
+	if len(recs) != 64 {
+		t.Fatalf("records %d", len(recs))
 	}
 	p := NewPool(PoolConfig{PIDFile: path})
 	defer p.Close(0)
-	for i := 0; i < 16; i++ {
+	for i := 0; i < 64; i++ {
 		wg.Add(1)
-		go func() { defer wg.Done(); p.writePIDs() }()
+		go func(i int) { defer wg.Done(); p.writePIDs(fmt.Sprint(i)) }(i)
 	}
 	wg.Wait()
-	if data, _ := os.ReadFile(path); string(data) != "[]" {
-		t.Fatalf("PID file of an empty pool: %q", data)
+	if len(testPIDRecords(t, path)) != 0 {
+		t.Fatal("removed keys still recorded")
 	}
 }

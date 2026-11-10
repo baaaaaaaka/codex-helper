@@ -89,7 +89,7 @@ func TestObserveMessagesPrefersHigherRevisionOverNewerTimestamp(t *testing.T) {
 }
 
 func TestSaveCacheNoopDoesNotRewrite(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "registry.json")
+	path := filepath.Join(t.TempDir(), "registry.sqlite")
 	cache := Cache{SchemaVersion: 1, RegistryKey: "registry-1", RegistryChatID: "chat-1"}
 	written, err := SaveCache(path, cache)
 	if err != nil || !written {
@@ -125,7 +125,7 @@ func TestSaveCacheNoopDoesNotRewrite(t *testing.T) {
 func TestCacheReplaceFileWithRetryRetriesRetryableErrors(t *testing.T) {
 	retryErr := errors.New("access denied")
 	attempts := 0
-	err := cacheReplaceFileWithRetry("tmp", "registry.json", func(string, string) error {
+	err := cacheReplaceFileWithRetry("tmp", "registry.sqlite", func(string, string) error {
 		attempts++
 		if attempts < 4 {
 			return retryErr
@@ -143,7 +143,7 @@ func TestCacheReplaceFileWithRetryRetriesRetryableErrors(t *testing.T) {
 }
 
 func TestWriteCacheFileAtomicallyCleansFailedReplace(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "registry.json")
+	path := filepath.Join(t.TempDir(), "registry.sqlite")
 	replaceErr := errors.New("replace failed")
 	prev := cacheReplaceFile
 	t.Cleanup(func() { cacheReplaceFile = prev })
@@ -184,7 +184,7 @@ func TestWriteCacheFileAtomicallyCleansFailedReplace(t *testing.T) {
 func TestStoreEnsureCreatesLongWindowAndCaches(t *testing.T) {
 	graph := newFakeRegistryGraph()
 	now := time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC)
-	path := filepath.Join(t.TempDir(), "registry.json")
+	path := filepath.Join(t.TempDir(), "registry.sqlite")
 	store := Store{
 		Graph:           graph,
 		CachePath:       path,
@@ -226,7 +226,7 @@ func TestStoreEnsureCreatesLongWindowAndCaches(t *testing.T) {
 func TestStoreEnsureInboxCachesLocatorAndObservePreservesIt(t *testing.T) {
 	graph := newFakeRegistryGraph()
 	now := time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC)
-	path := filepath.Join(t.TempDir(), "registry.json")
+	path := filepath.Join(t.TempDir(), "registry.sqlite")
 	store := Store{
 		Graph:     graph,
 		CachePath: path,
@@ -311,7 +311,7 @@ func TestObserveMessagesUsesGraphModifiedTimeForLiveness(t *testing.T) {
 func TestStoreEnsureDoesNotRepairCacheOnTransientValidationError(t *testing.T) {
 	graph := newFakeRegistryGraph()
 	now := time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC)
-	path := filepath.Join(t.TempDir(), "registry.json")
+	path := filepath.Join(t.TempDir(), "registry.sqlite")
 	store := Store{
 		Graph:     graph,
 		CachePath: path,
@@ -346,7 +346,7 @@ func TestStoreEnsureDoesNotRepairCacheOnTransientValidationError(t *testing.T) {
 func TestRefreshMeetingWindowSkipsUntilDueAndPersistsOnRefresh(t *testing.T) {
 	graph := newFakeRegistryGraph()
 	now := time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC)
-	path := filepath.Join(t.TempDir(), "registry.json")
+	path := filepath.Join(t.TempDir(), "registry.sqlite")
 	store := Store{
 		Graph:           graph,
 		CachePath:       path,
@@ -391,7 +391,7 @@ func TestRefreshMeetingWindowSkipsUntilDueAndPersistsOnRefresh(t *testing.T) {
 func TestStorePublishPatchesSlotWithoutCacheRewrite(t *testing.T) {
 	graph := newFakeRegistryGraph()
 	now := time.Unix(1000, 0).UTC()
-	path := filepath.Join(t.TempDir(), "registry.json")
+	path := filepath.Join(t.TempDir(), "registry.sqlite")
 	store := Store{Graph: graph, CachePath: path}
 	cache := Cache{SchemaVersion: 1, RegistryChatID: "chat-registry", RegistryKey: "registry-1"}
 
@@ -432,7 +432,7 @@ func TestStorePublishPatchesSlotWithoutCacheRewrite(t *testing.T) {
 
 func TestStorePublishFallbackPersistsReplacementSlot(t *testing.T) {
 	graph := newFakeRegistryGraph()
-	path := filepath.Join(t.TempDir(), "registry.json")
+	path := filepath.Join(t.TempDir(), "registry.sqlite")
 	store := Store{Graph: graph, CachePath: path}
 	cache := Cache{SchemaVersion: 1, RegistryChatID: "chat-registry", RegistryKey: "registry-1"}
 	now := time.Unix(1000, 0).UTC()
@@ -454,7 +454,7 @@ func TestStorePublishFallbackPersistsReplacementSlot(t *testing.T) {
 
 func TestStorePublishDoesNotAppendOnTransientPatchFailure(t *testing.T) {
 	graph := newFakeRegistryGraph()
-	path := filepath.Join(t.TempDir(), "registry.json")
+	path := filepath.Join(t.TempDir(), "registry.sqlite")
 	store := Store{Graph: graph, CachePath: path}
 	cache := Cache{SchemaVersion: 1, RegistryChatID: "chat-registry", RegistryKey: "registry-1"}
 	now := time.Unix(1000, 0).UTC()

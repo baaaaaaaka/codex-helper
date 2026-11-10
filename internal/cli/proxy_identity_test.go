@@ -15,6 +15,7 @@ func TestClaimLegacyProxyInstancePersistsOwnerLease(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 	if err := store.Save(config.Config{
 		Version:   config.CurrentVersion,
 		Instances: []config.Instance{{ID: "legacy-1", ProfileID: "p1"}},
@@ -48,6 +49,7 @@ func TestClaimProxyInstanceReclaimsDeadExpiredOwnerWithoutReusingPorts(t *testin
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 	now := time.Unix(200, 0)
 	old := config.Instance{
 		ID: "stale-1", ProfileID: "p1", BrokerID: "broker-stable", BrokerEpoch: "epoch-old", OwnerToken: "token-old",
@@ -83,6 +85,7 @@ func TestClaimProxyInstanceDoesNotFenceLiveOwner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 	now := time.Unix(300, 0)
 	inst := config.Instance{ID: "live-1", OwnerToken: "token-live", OwnerLastSeenAt: now.Add(-time.Hour), OwnerLeaseExpiresAt: now.Add(-time.Hour), DaemonPID: 42}
 	if err := store.Save(config.Config{Version: config.CurrentVersion, Instances: []config.Instance{inst}}); err != nil {

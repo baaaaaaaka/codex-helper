@@ -287,7 +287,7 @@ func (e *Engine) publishQuestions(ctx context.Context, g store.QuestionGroup) er
 			e.editQuestions(current) // a draft changed while its first body rendered
 		}
 		e.wakeSender()
-		wake(e.notifyWake)
+		e.wakeNotify(store.NotificationScope{ID: "questions:" + g.Key})
 	}
 	return err
 }
@@ -532,7 +532,7 @@ func (e *Engine) cmdAnswer(ctx context.Context, j cmdJob, arg string) {
 	}
 	e.editQuestions(g)
 	e.refreshQuestionWaiting()
-	wake(e.notifyWake)
+	e.wakeNotify(store.NotificationScope{ID: "questions:" + g.Key})
 	if g.Async {
 		e.wakeRunner(j.conv)
 		return
@@ -684,11 +684,11 @@ func (e *Engine) questionNotice(g store.QuestionGroup, title string) (heading, t
 	heading, text = questionNotification(g, title)
 	err = e.update(func(tx *store.Tx) error {
 		for _, q := range g.Questions {
-			gone, err := tx.DroppedUnder(questionPrefix(q.ID) + ":")
+			state, err := tx.UnconfirmedUnder(questionPrefix(q.ID) + ":")
 			if err != nil {
 				return err
 			}
-			if gone {
+			if state != "" {
 				heading = "⚠️ Codex question delivery unconfirmed"
 				text = title + "\n\nOpen the chat to check the question, or answer in Codex TUI."
 				break

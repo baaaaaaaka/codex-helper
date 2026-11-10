@@ -45,13 +45,12 @@ func TestTeamsNewCoreServiceStatusReadsStore(t *testing.T) {
 			migrate.MetaWorkflowEnabled: "true",
 			delegate.MetaMachineID:      "machine:0011",
 			"engine_running_version":    "v9.9.9",
-			"engine_update_request":     `{"tag":"v10.0.0"}`,
 		} {
 			if err := tx.SetMeta(k, v); err != nil {
 				return err
 			}
 		}
-		return nil
+		return tx.SetUpdateRequest(corestore.UpdateRequest{Tag: "v10.0.0"})
 	})
 	if err != nil {
 		t.Fatal(err)

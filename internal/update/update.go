@@ -312,20 +312,23 @@ func PerformUpdate(ctx context.Context, opts UpdateOptions) (ApplyResult, error)
 		}
 	}
 	if runtimeRoot != "" && runtimeRoot != "." {
-		if _, err := helperruntime.ReadBoot(runtimeRoot); err == nil {
-			if err := helperruntime.ProbeProtocol(ctx, tmpPath); err != nil {
-				_ = os.Remove(tmpPath)
-				return ApplyResult{}, err
-			}
-		} else if !os.IsNotExist(err) {
+		if err := helperruntime.ProbeProtocol(ctx, tmpPath); err != nil {
 			_ = os.Remove(tmpPath)
 			return ApplyResult{}, err
+		}
+		if _, err := helperruntime.ReadBoot(runtimeRoot); err != nil {
+			_ = os.Remove(tmpPath)
+			return ApplyResult{}, fmt.Errorf("%w: %v", helperruntime.ErrBootstrapState, err)
 		}
 		entryPath := strings.TrimSpace(opts.RuntimeEntryPath)
 		if entryPath == "" {
 			entryPath = filepath.Join(filepath.Dir(runtimeRoot), helperruntime.BinaryName(runtime.GOOS))
 		}
-		if opts.CandidateOwnedApply && candidateupdate.SupportsProtocol(verNoV) {
+		if err := helperruntime.ProbeProtocol(ctx, entryPath); err != nil {
+			_ = os.Remove(tmpPath)
+			return ApplyResult{}, err
+		}
+		if opts.CandidateOwnedApply {
 			requestID := fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
 			result, applyErr := candidateupdate.Invoke(ctx, tmpPath, candidateupdate.Context{
 				SourceVersion: currentRuntimeVersion(runtimeRoot),

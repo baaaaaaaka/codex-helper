@@ -211,6 +211,7 @@ func newHistoryOpenCmd(root *rootOptions, codexDir *string, codexPath *string, p
 			if err != nil {
 				return err
 			}
+			defer store.Close()
 
 			useProxy, cfg, err := historyProxyPreference(ctx, store, *profileRef, cmd.ErrOrStderr())
 			if err != nil {
@@ -277,6 +278,7 @@ func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, cod
 	if err != nil {
 		return err
 	}
+	defer store.Close()
 	backgroundStarted := false
 
 	for {

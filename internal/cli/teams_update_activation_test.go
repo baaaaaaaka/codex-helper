@@ -89,8 +89,8 @@ func TestWindowsTeamsPendingHelperActivationTreatsMoveFailuresAsFatal(t *testing
 				"pending helper still exists after Move-Item",
 				"move attempt ' + ($i + 1) + ' failed",
 				"formal helper locked by process(es)",
-				"Set-Content -LiteralPath $tmp -Encoding UTF8 -ErrorAction Stop",
-				"Move-Item -Force -LiteralPath $tmp -Destination $statusPath -ErrorAction Stop",
+				"--cxp-record-activation --source $src --dest $dest --want $want --status $s --message $m",
+				"if ($LASTEXITCODE -ne 0) { throw ('native status writer exited with ' + $LASTEXITCODE) }",
 			} {
 				if !strings.Contains(script, want) {
 					t.Fatalf("activation script missing fatal-move fragment %q:\n%s", want, script)
@@ -157,8 +157,8 @@ func TestWindowsTeamsPendingHelperActivationSafetyInvariantsStress(t *testing.T)
 func assertWindowsActivationScriptSafetyInvariants(t *testing.T, script string) {
 	t.Helper()
 	commands := windowsPowerShellMoveItemCommands(script)
-	if len(commands) < 2 {
-		t.Fatalf("activation script Move-Item commands = %#v, want at least source and status moves", commands)
+	if len(commands) != 1 {
+		t.Fatalf("activation script Move-Item commands = %#v, want the single executable replacement", commands)
 	}
 	for _, command := range commands {
 		if !strings.Contains(command, "-ErrorAction Stop") {

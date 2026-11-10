@@ -37,8 +37,23 @@ NAMES = [
     "TestEntryWatchdogRuntimeUpgradeAndRollback",
     "TestEntryWatchdogRuntimeLegacyLauncher",
     "TestEntryMigrationRefusesMissingPublishedDatabase",
+    "TestEntryMigrationRefusesEmptyPublishedDatabase",
+    "TestConfigSQLiteReadOnlyRequiresMigration",
+    "TestPublishedCoreStoreNeverInitializesLostSchema",
 ]
 
+
+# Fake cmd/go must enumerate every required name. The actual CI gate uses
+# cmd/go's real -list output, so source existence is checked there.
+CONTRACTS = {"unit": [], "e2e": []}
+mode = None
+for line in SCRIPT.read_text().splitlines():
+    if line.strip() in ("unit)", "e2e)"):
+        mode = line.strip()[:-1]
+    if line.strip().startswith("run_tests "):
+        args = shlex.split(line)
+        CONTRACTS[mode].append(args[1:])
+ALL_NAMES = sorted({name for entries in CONTRACTS.values() for _, _, names, _ in entries for name in names.split(",")})
 
 class StartupRecoveryGateTests(unittest.TestCase):
     def run_gate(self, mode, *, missing="", fail=False):
@@ -72,7 +87,7 @@ sys.exit(int(os.environ['FAIL_TEST']))
             fake.chmod(0o700)
             env = os.environ.copy()
             env.update(CXP_CI_GO_BIN=fake.as_posix(), CALL_LOG=str(log),
-                       TEST_NAMES=json.dumps(NAMES), MISSING=missing,
+                       TEST_NAMES=json.dumps(ALL_NAMES), MISSING=missing,
                        FAIL_TEST="1" if fail else "0")
             p = subprocess.run([shell, SCRIPT.as_posix(), mode], cwd=ROOT, env=env,
                                capture_output=True, text=True)
@@ -83,15 +98,16 @@ sys.exit(int(os.environ['FAIL_TEST']))
         p, calls = self.run_gate("unit")
         self.assertEqual(p.returncode, 0, p.stderr)
         executed = [c for c in calls if "-run" in c]
-        self.assertEqual([c[1] for c in executed], ["./internal/helperruntime", "./internal/core/migrate", "./internal/cli"])
+        self.assertEqual([c[1] for c in executed], [entry[0] for entry in CONTRACTS["unit"]])
+        self.assertTrue({"./internal/helperruntime", "./internal/core/store", "./internal/core/migrate", "./internal/updatestate", "./internal/config", "./internal/cli"}.issubset(c[1] for c in executed))
         self.assertTrue(all("-count=1" in c for c in executed))
 
     def test_e2e_contracts_are_repeated(self):
         p, calls = self.run_gate("e2e")
         self.assertEqual(p.returncode, 0, p.stderr)
         executed = [c for c in calls if "-run" in c]
-        self.assertEqual(len(executed), 1)
-        self.assertIn("-count=3", executed[0])
+        self.assertEqual(len(executed), len(CONTRACTS["e2e"]))
+        self.assertTrue(all("-count=3" in c for c in executed))
 
     def test_each_required_test_must_exist(self):
         for name in NAMES:
@@ -124,7 +140,7 @@ sys.exit(int(os.environ['FAIL_TEST']))
         race = job_block(WORKFLOW, "race-core")
         patterns = re.findall(r"go test -race[^\n]+-run '([^']+)'", race)
         self.assertTrue(patterns, "startup CLI race step is missing")
-        self.assertIn("./internal/helperruntime -run '^TestVersionPointer'", race)
+        self.assertIn("./internal/helperruntime -run '^Test(VersionPointer|SQLiteBootstrap)'", race)
         for name in NAMES:
             if name.startswith(("TestLegacy", "TestTeams", "TestFirstStart", "TestVersionPointer")):
                 with self.subTest(name=name):

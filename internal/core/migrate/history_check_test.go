@@ -2,7 +2,6 @@ package migrate
 
 import (
 	"context"
-	"encoding/json"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -146,11 +145,12 @@ func TestNoProofResumeCheckedAgainstHistory(t *testing.T) {
 				}
 			}
 			// The decision is recorded: a restart does not check again.
-			v, _, _ := st.Meta(store.MetaHistoryChecks)
-			var list []store.HistoryCheck
-			_ = json.Unmarshal([]byte(v), &list)
+			list, err := st.HistoryChecks()
+			if err != nil {
+				t.Fatal(err)
+			}
 			if len(list) != 1 || list[0].Path != path || list[0].From != 0 || list[0].To != ckpt || !list[0].Done {
-				t.Fatalf("history checks: %s", v)
+				t.Fatalf("history checks: %+v", list)
 			}
 		})
 	}

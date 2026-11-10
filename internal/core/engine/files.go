@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -19,13 +18,8 @@ import (
 // (NextRunnable). asrLoop downloads them (and transcribes voice) outside
 // any transaction, then records the outcome.
 
-// fileRef is the persisted form of a channel.FileRef (inbound_files.ext_ref).
-type fileRef struct {
-	Kind        channel.FileKind `json:"k"`
-	Name        string           `json:"n"`
-	Size        int64            `json:"s,omitempty"`
-	ContentType string           `json:"t,omitempty"`
-	Ref         string           `json:"r"`
+func fileReference(r channel.FileRef) store.FileReference {
+	return store.FileReference{Kind: int(r.Kind), Name: r.Name, Size: r.Size, ContentType: r.ContentType, Ref: r.Ref, AttachmentID: r.AttachmentID, URL: r.URL}
 }
 
 // inboundFiles turns a message's attachments into inbound_files rows.
@@ -33,8 +27,7 @@ type fileRef struct {
 func inboundFiles(refs []channel.FileRef) []store.InboundFile {
 	var out []store.InboundFile
 	for i, r := range refs {
-		data, _ := json.Marshal(fileRef{Kind: r.Kind, Name: r.Name, Size: r.Size, ContentType: r.ContentType, Ref: r.Ref})
-		f := store.InboundFile{Idx: i, Name: r.Name, ExtRef: string(data), Kind: "file", State: "pending"}
+		f := store.InboundFile{Idx: i, Name: r.Name, Ref: fileReference(r), Kind: "file", State: "pending"}
 		if f.Name == "" {
 			f.Name = fmt.Sprintf("attachment-%d", i+1)
 		}
@@ -90,7 +83,7 @@ func (e *Engine) fetchInbound(ctx context.Context, inboundID int64) {
 		in    store.Inbound
 		files []store.InboundFile
 	)
-	if err := e.update(func(tx *store.Tx) error {
+	if err := e.st.Read(func(tx *store.Tx) error {
 		var err error
 		in, _, err = tx.Inbound(inboundID)
 		if err != nil {
@@ -118,7 +111,13 @@ func (e *Engine) fetchInbound(ctx context.Context, inboundID int64) {
 		if f.State != "pending" || ctx.Err() != nil {
 			continue
 		}
-		state, local, msg := e.fetchOne(ctx, inboundID, f)
+		var state, local, msg string
+		var resolved *store.QuoteText
+		if q, ok := quoteOf(f); ok {
+			state, resolved, msg = e.fetchQuote(ctx, inboundID, f, q)
+		} else {
+			state, local, msg = e.fetchOne(ctx, inboundID, f)
+		}
 		if ctx.Err() != nil {
 			return
 		}
@@ -155,7 +154,13 @@ func (e *Engine) fetchInbound(ctx context.Context, inboundID int64) {
 			if left == 0 {
 				e.labelVoice(in.ConvID, in, clips)
 			}
-			return tx.SetInboundFile(inboundID, f.Idx, state, local, msg)
+			if err := tx.SetInboundFile(inboundID, f.Idx, state, local, msg); err != nil {
+				return err
+			}
+			if resolved != nil {
+				return tx.SetResolvedQuote(inboundID, f.Idx, *resolved)
+			}
+			return nil
 		}); err != nil {
 			e.logf("record attachment %d/%d: %v", inboundID, f.Idx, err)
 		}
@@ -177,13 +182,7 @@ const textVoiceWait = "Voice recognition is being set up on this machine (first 
 // fetchOne downloads (and for voice transcribes) one attachment. It returns
 // the new state ("" = retry later), the local path and an error text.
 func (e *Engine) fetchOne(ctx context.Context, inboundID int64, f store.InboundFile) (string, string, string) {
-	if q, ok := quoteOf(f); ok { // a quoted message (envelope.go)
-		return e.fetchQuote(ctx, inboundID, f, q)
-	}
-	var ref fileRef
-	if err := json.Unmarshal([]byte(f.ExtRef), &ref); err != nil {
-		return "failed", "", "the attachment reference is unreadable"
-	}
+	ref := f.Ref
 	if e.cfg.FilesDir == "" {
 		return "failed", "", "attachments are not enabled"
 	}
@@ -193,7 +192,7 @@ func (e *Engine) fetchOne(ctx context.Context, inboundID int64, f store.InboundF
 		return "", "", ""
 	}
 	dst := filepath.Join(dir, fmt.Sprintf("%d-%s", f.Idx, safeName(f.Name)))
-	got, err := e.ch.FetchFile(ctx, channel.FileRef{Kind: ref.Kind, Name: ref.Name, Size: ref.Size, ContentType: ref.ContentType, Ref: ref.Ref}, dst)
+	got, err := e.ch.FetchFile(ctx, channel.FileRef{Kind: channel.FileKind(ref.Kind), Name: ref.Name, Size: ref.Size, ContentType: ref.ContentType, Ref: ref.Ref, AttachmentID: ref.AttachmentID, URL: ref.URL}, dst)
 	if err != nil {
 		var rej *channel.Rejected
 		if errors.As(err, &rej) && rej.Permanent || errors.Is(err, channel.ErrNotFound) {

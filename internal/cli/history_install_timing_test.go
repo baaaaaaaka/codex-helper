@@ -18,6 +18,7 @@ func TestRunHistoryTuiDoesNotRequireCodexBeforeSelection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 	if err := store.Update(func(c *config.Config) error {
 		enabled := false
 		c.ProxyEnabled = &enabled
@@ -48,6 +49,7 @@ func TestRunHistoryTuiLoadProjectsHonorsContext(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 	if err := store.Update(func(c *config.Config) error {
 		enabled := false
 		c.ProxyEnabled = &enabled

@@ -57,7 +57,7 @@ func TestCodexInputListsAttachments(t *testing.T) {
 	}
 	files := []store.InboundFile{
 		{Idx: 0, Name: "pic.png", Kind: "image", State: "ready", LocalPath: "/x/0-pic.png"},
-		{Idx: 1, Name: "design notes.txt", Kind: "file", State: "ready", LocalPath: "/x/1-design notes.txt", ExtRef: `{"t":"text/plain"}`},
+		{Idx: 1, Name: "design notes.txt", Kind: "file", State: "ready", LocalPath: "/x/1-design notes.txt", Ref: store.FileReference{ContentType: "text/plain"}},
 		{Idx: 2, Name: "v.ogg", Kind: "voice", State: "ready", LocalPath: voice},
 		{Idx: 3, Name: "gone.pdf", Kind: "file", State: "failed", Error: "the attachment could not be downloaded"},
 	}

@@ -10,7 +10,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -43,7 +42,7 @@ func bootFixture(t *testing.T) (Context, string, string) {
 func stageBootFixture(t *testing.T) (Context, BootState) {
 	t.Helper()
 	c, source, digest := bootFixture(t)
-	if err := StageBootCandidate(context.Background(), c, "v1.0.0", 0, source, "v2.0.0", digest); err != nil {
+	if err := StageBootCandidate(context.Background(), c, "v1.0.0", 1, source, "v2.0.0", digest); err != nil {
 		t.Fatal(err)
 	}
 	s, err := ReadBoot(c.Root)
@@ -55,11 +54,14 @@ func stageBootFixture(t *testing.T) (Context, BootState) {
 
 func TestSafeBootStageDoesNotChangeEntryOrLegacyActive(t *testing.T) {
 	c, source, digest := bootFixture(t)
+	if err := os.WriteFile(filepath.Join(c.Root, "active"), []byte("v1.0.0\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(c.EntryPath, []byte("independent recovery entry"), 0755); err != nil {
 		t.Fatal(err)
 	}
 	before, _ := os.ReadFile(c.RuntimePath)
-	if err := StageBootCandidate(context.Background(), c, "v1.0.0", 0, source, "v2.0.0", digest); err != nil {
+	if err := StageBootCandidate(context.Background(), c, "v1.0.0", 1, source, "v2.0.0", digest); err != nil {
 		t.Fatal(err)
 	}
 	if v, _ := ReadActive(c.Root); v != "v1.0.0" {
@@ -88,9 +90,19 @@ func TestSafeBootRecordReadersAllowAtomicReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 	old, err := io.ReadAll(reader)
-	if err != nil || !strings.Contains(string(old), `"generation":2`) {
-		t.Fatalf("reader lost the old complete record: %s %v", old, err)
+	if err != nil {
+		t.Fatal(err)
 	}
+	// The retained reader sees the old complete native database. Query its
+	// generation independently; do not inspect encoded SQLite bytes as text.
+	oldRoot := t.TempDir()
+	if err = os.WriteFile(filepath.Join(oldRoot, BootFile), old, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if oldState, err := ReadBoot(oldRoot); err != nil || oldState.Generation != s.Generation-1 {
+		t.Fatalf("old snapshot generation %d: %v", oldState.Generation, err)
+	}
+
 	got, err := ReadBoot(c.Root)
 	if err != nil || got.Generation != s.Generation {
 		t.Fatalf("new reader did not get new complete record: %+v %v", got, err)
@@ -245,7 +257,7 @@ func TestSafeBootRejectsMalformedRecords(t *testing.T) {
 }
 
 func TestSafeBootMarkersDoNotLeakToWorkloads(t *testing.T) {
-	got := WithoutRuntimeMarkers([]string{envBootAddress + "=127.0.0.1:1", envBootToken + "=secret", EnvBootManaged + "=1", "KEEP=yes"})
+	got := WithoutRuntimeMarkers([]string{envBootAddress + "=127.0.0.1:1", envBootToken + "=secret", EnvBootManaged + "=1", EnvProbeProtocol + "=2", "KEEP=yes"})
 	if len(got) != 1 || got[0] != "KEEP=yes" {
 		t.Fatal(got)
 	}
@@ -253,7 +265,7 @@ func TestSafeBootMarkersDoNotLeakToWorkloads(t *testing.T) {
 
 func BenchmarkSafeBootRead(b *testing.B) {
 	root := b.TempDir()
-	if err := writeBoot(root, BootState{Schema: 1, Generation: 1, Good: "v1.0.0"}); err != nil {
+	if err := writeBoot(root, BootState{Schema: BootProtocol, Generation: 1, Good: "v1.0.0"}); err != nil {
 		b.Fatal(err)
 	}
 	b.ReportAllocs()
@@ -382,10 +394,10 @@ func TestSafeBootMissingOrTamperedCandidateIsNeverRetried(t *testing.T) {
 
 func TestSafeBootLegacyDownloadCannotOverwriteConcurrentBootRecord(t *testing.T) {
 	c, source, digest := bootFixture(t)
-	if err := StageBootCandidate(context.Background(), c, "v1.0.0", 0, source, "v2.0.0", digest); err != nil {
+	if err := StageBootCandidate(context.Background(), c, "v1.0.0", 1, source, "v2.0.0", digest); err != nil {
 		t.Fatal(err)
 	}
-	if err := StageBootCandidate(context.Background(), c, "v1.0.0", 0, source, "v3.0.0", digest); err == nil {
+	if err := StageBootCandidate(context.Background(), c, "v1.0.0", 1, source, "v3.0.0", digest); err == nil {
 		t.Fatal("stale legacy generation accepted")
 	}
 }
@@ -397,10 +409,10 @@ func TestSafeBootRetentionLimitDoesNotDeleteRunningVersions(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := StageBootCandidate(context.Background(), c, "v1.0.0", 0, source, "v9.0.0", digest); err == nil {
+	if err := StageBootCandidate(context.Background(), c, "v1.0.0", 1, source, "v9.0.0", digest); err == nil {
 		t.Fatal("unbounded retained versions")
 	}
-	if _, err := ReadBoot(c.Root); !os.IsNotExist(err) {
+	if baseline, err := ReadBoot(c.Root); err != nil || baseline.Good != "v1.0.0" || baseline.Candidate != nil || baseline.Generation != 1 {
 		t.Fatal("changed boot selection", err)
 	}
 	for i := 1; i <= 8; i++ {
@@ -410,7 +422,7 @@ func TestSafeBootRetentionLimitDoesNotDeleteRunningVersions(t *testing.T) {
 	}
 }
 
-func TestSafeBootCorruptRecordRunsStableBaseWithoutRepair(t *testing.T) {
+func TestSafeBootCorruptRecordFailsClosedWithoutRepair(t *testing.T) {
 	c, _ := stageBootFixture(t)
 	if err := os.WriteFile(c.EntryPath, []byte("stable base"), 0755); err != nil {
 		t.Fatal(err)
@@ -425,7 +437,7 @@ func TestSafeBootCorruptRecordRunsStableBaseWithoutRepair(t *testing.T) {
 	t.Setenv(EnvDisable, "")
 	t.Setenv(EnvRuntime, "")
 	t.Setenv(EnvForce, "1")
-	if code, handled, err := Launch("v1.0.0", []string{c.EntryPath, "tui"}); err != nil || handled || code != 0 {
+	if code, handled, err := Launch("v1.0.0", []string{c.EntryPath, "tui"}); !errors.Is(err, ErrBootstrapState) || handled || code != 0 {
 		t.Fatalf("%d %v %v", code, handled, err)
 	}
 	if after, _ := os.ReadFile(filepath.Join(c.Root, BootFile)); string(after) != string(raw) {
@@ -476,13 +488,13 @@ func TestSafeBootCannotPublishThroughEscapingSymlink(t *testing.T) {
 		}
 		t.Fatal(err)
 	}
-	if err := StageBootCandidate(context.Background(), c, "v1.0.0", 0, source, "v2.0.0", digest); err == nil {
+	if err := StageBootCandidate(context.Background(), c, "v1.0.0", 1, source, "v2.0.0", digest); err == nil {
 		t.Fatal("published outside managed root")
 	}
 	if b, err := os.ReadFile(path); err != nil || string(b) != "preserved outside entry" {
 		t.Fatal("outside entry changed")
 	}
-	if _, err := ReadBoot(c.Root); !os.IsNotExist(err) {
+	if baseline, err := ReadBoot(c.Root); err != nil || baseline.Good != "v1.0.0" || baseline.Candidate != nil || baseline.Generation != 1 {
 		t.Fatal("published unsafe candidate", err)
 	}
 }

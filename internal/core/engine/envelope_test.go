@@ -2,7 +2,6 @@ package engine
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -43,18 +42,14 @@ func TestCodexInputMatchesV0120(t *testing.T) {
 		}
 		return p
 	}
-	nq := 0
 	quote := func(idx int, qt quoteText) store.InboundFile {
-		data, _ := json.Marshal(qt)
-		nq++
-		return store.InboundFile{Idx: idx, Name: "referenced message", Kind: "file", State: "ready",
-			ExtRef: `{"q":{"n":1}}`, LocalPath: write(fmt.Sprintf("quote-%d.json", nq), string(data))}
+		return store.InboundFile{Idx: idx, Name: "referenced message", Kind: "file", State: "ready", Quote: &store.QuoteReference{N: 1}, ResolvedQuote: &qt}
 	}
-	img := store.InboundFile{Idx: 0, Name: "attachment-1", Kind: "image", State: "ready", LocalPath: "/in/0-attachment-1.png", ExtRef: `{"k":1,"r":"x"}`}
-	doc := store.InboundFile{Idx: 1, Name: "design notes.txt", Kind: "file", State: "ready", LocalPath: "/in/1-design notes.txt", ExtRef: `{"k":0,"n":"design notes.txt","r":"y"}`}
+	img := store.InboundFile{Idx: 0, Name: "attachment-1", Kind: "image", State: "ready", LocalPath: "/in/0-attachment-1.png", Ref: store.FileReference{Kind: 1, Ref: "x"}}
+	doc := store.InboundFile{Idx: 1, Name: "design notes.txt", Kind: "file", State: "ready", LocalPath: "/in/1-design notes.txt", Ref: store.FileReference{Name: "design notes.txt", Ref: "y"}}
 	long := strings.Repeat("long quoted line with words ", 100)
 	voice := func(idx int, name, text string) store.InboundFile {
-		return store.InboundFile{Idx: idx, Name: name, Kind: "voice", State: "ready", LocalPath: write(name+".txt", text), ExtRef: `{"k":2,"n":"` + name + `","r":"v"}`}
+		return store.InboundFile{Idx: idx, Name: name, Kind: "voice", State: "ready", LocalPath: write(name+".txt", text), Ref: store.FileReference{Kind: 2, Name: name, Ref: "v"}}
 	}
 	cases := map[string]struct {
 		body  string
@@ -104,8 +99,8 @@ func TestCodexInputWithoutRootIsUserSectionOnly(t *testing.T) {
 func TestCodexInputListsUnusableAttachmentsAndFailedQuotes(t *testing.T) {
 	files := []store.InboundFile{
 		{Idx: 0, Name: "gone.pdf", Kind: "file", State: "failed", Error: "the attachment could not be downloaded"},
-		{Idx: 1, Name: "referenced message 1", Kind: "file", State: "failed", ExtRef: `{"q":{"n":1,"id":"m1","from":"Ann","text":"preview text"}}`},
-		{Idx: 2, Name: "referenced message 2", Kind: "file", State: "failed", ExtRef: `{"q":{"n":2,"id":"m2"}}`},
+		{Idx: 1, Name: "referenced message 1", Kind: "file", State: "failed", Quote: &store.QuoteReference{N: 1, ID: "m1", From: "Ann", Text: "preview text"}},
+		{Idx: 2, Name: "referenced message 2", Kind: "file", State: "failed", Quote: &store.QuoteReference{N: 2, ID: "m2"}},
 	}
 	got, images := codexInput("Please look", files, "/out")
 	if len(images) != 0 {

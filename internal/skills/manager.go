@@ -132,23 +132,14 @@ func (m *Manager) addUnlocked(ctx context.Context, rawURL string, opts AddOption
 		AddedAt:    now,
 		UpdatedAt:  now,
 	}
-	var existingAdded time.Time
-	if cfg, err := m.Store.LoadConfig(); err == nil {
-		for _, existing := range cfg.Sources {
-			if existing.ID == source.ID {
-				existingAdded = existing.AddedAt
-				break
-			}
-		}
+	existing, ok, err := m.Store.Source(source.ID)
+	if err != nil {
+		return Source{}, SyncResult{}, err
 	}
-	if !existingAdded.IsZero() {
-		source.AddedAt = existingAdded
+	if ok && !existing.AddedAt.IsZero() {
+		source.AddedAt = existing.AddedAt
 	}
-	if err := m.Store.Update(func(cfg *Config, st *State) error {
-		cfg.Sources = upsertSource(cfg.Sources, source)
-		st.Sources = upsertState(st.Sources, SourceState{ID: source.ID, Status: StatusSyncing})
-		return nil
-	}); err != nil {
+	if err := m.Store.PutSubscription(source, SourceState{ID: source.ID, Status: StatusSyncing}); err != nil {
 		return Source{}, SyncResult{}, err
 	}
 	result := m.syncOne(ctx, source, false)
@@ -169,24 +160,19 @@ func (m *Manager) Remove(ctx context.Context, idOrName string) (Source, error) {
 }
 
 func (m *Manager) removeUnlocked(ctx context.Context, idOrName string) (Source, error) {
-	var removed *Source
-	if err := m.Store.Update(func(cfg *Config, st *State) error {
-		var next []Source
-		next, removed = removeSource(cfg.Sources, idOrName)
-		if removed == nil {
-			return fmt.Errorf("skill source %q not found", idOrName)
-		}
-		if err := removeManagedSkills(removed.TargetRoot, removed.ID); err != nil {
-			return err
-		}
-		cfg.Sources = next
-		st.Sources = removeState(st.Sources, removed.ID)
-		return nil
-	}); err != nil {
+	cfg, err := m.Store.LoadConfig()
+	if err != nil {
 		return Source{}, err
 	}
+	_, removed := removeSource(cfg.Sources, idOrName)
 	if removed == nil {
 		return Source{}, fmt.Errorf("skill source %q not found", idOrName)
+	}
+	if err := removeManagedSkills(removed.TargetRoot, removed.ID); err != nil {
+		return Source{}, err
+	}
+	if err := m.Store.DeleteSubscription(removed.ID); err != nil {
+		return Source{}, err
 	}
 	_ = ctx
 	return *removed, nil
@@ -266,23 +252,21 @@ func (m *Manager) syncUnlocked(ctx context.Context, opts SyncOptions) ([]SyncRes
 
 func (m *Manager) syncOne(ctx context.Context, source Source, auto bool) SyncResult {
 	result := SyncResult{Source: source}
-	_ = m.Store.UpdateState(func(st *State) error {
-		current, _ := sourceStateByID(*st, source.ID)
-		current.ID = source.ID
-		current.Status = StatusSyncing
-		current.LastError = ""
-		st.Sources = upsertState(st.Sources, current)
-		return nil
-	})
-	if st, err := m.Store.LoadState(); err == nil {
-		if current, ok := sourceStateByID(st, source.ID); ok {
-			changes, err := m.LocalChangesForSource(source, current)
-			if err != nil {
-				return m.recordSyncFailure(source, result, err, auto)
-			}
-			if len(changes) > 0 {
-				return m.recordSyncFailure(source, result, fmt.Errorf("local modifications detected in %s; run `cxp skills push` before syncing", source.Name), auto)
-			}
+	if err := m.Store.SetSyncing(source.ID); err != nil {
+		result.Error = err
+		return result
+	}
+	current, ok, err := m.Store.SourceState(source.ID)
+	if err != nil {
+		return m.recordSyncFailure(source, result, err, auto)
+	}
+	if ok {
+		changes, err := m.LocalChangesForSource(source, current)
+		if err != nil {
+			return m.recordSyncFailure(source, result, err, auto)
+		}
+		if len(changes) > 0 {
+			return m.recordSyncFailure(source, result, fmt.Errorf("local modifications detected in %s; run `cxp skills push` before syncing", source.Name), auto)
 		}
 	}
 	mirror, err := ensureBareMirror(ctx, m.Git, m.CacheDir, source)
@@ -311,14 +295,7 @@ func (m *Manager) syncOne(ctx context.Context, source Source, auto bool) SyncRes
 	if auto {
 		state.LastAutoSyncDay = todayString()
 	}
-	if err := m.Store.UpdateState(func(st *State) error {
-		previous, ok := sourceStateByID(*st, source.ID)
-		if ok && state.LastAutoSyncDay == "" {
-			state.LastAutoSyncDay = previous.LastAutoSyncDay
-		}
-		st.Sources = upsertState(st.Sources, state)
-		return nil
-	}); err != nil {
+	if err := m.Store.SaveSync(state); err != nil {
 		result.Error = err
 		return result
 	}
@@ -348,18 +325,13 @@ func (m *Manager) recordSyncFailure(source Source, result SyncResult, err error,
 	if auto {
 		state.LastAutoSyncDay = todayString()
 	}
-	_ = m.Store.UpdateState(func(st *State) error {
-		previous, ok := sourceStateByID(*st, source.ID)
-		if ok {
-			state.LastCommit = previous.LastCommit
-			state.InstalledSkills = previous.InstalledSkills
-			if state.LastAutoSyncDay == "" {
-				state.LastAutoSyncDay = previous.LastAutoSyncDay
-			}
-		}
-		st.Sources = upsertState(st.Sources, state)
-		return nil
-	})
+	saveErr := m.Store.SaveFailure(state)
+	if previous, ok, loadErr := m.Store.SourceState(source.ID); loadErr == nil && ok {
+		state = previous
+	} else {
+		saveErr = errors.Join(saveErr, loadErr)
+	}
+	err = errors.Join(err, saveErr)
 	result.State = state
 	result.Error = err
 	return result
@@ -443,14 +415,12 @@ func (m *Manager) LocalChangesForSource(source Source, state SourceState) ([]Loc
 	return all, nil
 }
 
-func (m *Manager) StartDailyAutoSync(ctx context.Context) {
+func (m *Manager) StartDailyAutoSync(ctx context.Context) <-chan struct{} {
+	done := make(chan struct{})
 	cfg, err := m.Store.LoadConfig()
 	if err != nil {
-		return
-	}
-	st, err := m.Store.LoadState()
-	if err != nil {
-		return
+		close(done)
+		return done
 	}
 	today := todayString()
 	var selected []Source
@@ -459,16 +429,21 @@ func (m *Manager) StartDailyAutoSync(ctx context.Context) {
 			continue
 		}
 		source = normalizeSourceRemoteForGit(source)
-		state, _ := sourceStateByID(st, source.ID)
-		if state.LastAutoSyncDay == today {
+		day, err := m.Store.LastAutoSyncDay(source.ID)
+		if err != nil {
+			continue
+		}
+		if day == today {
 			continue
 		}
 		selected = append(selected, source)
 	}
 	if len(selected) == 0 {
-		return
+		close(done)
+		return done
 	}
 	go func() {
+		defer close(done)
 		var wg sync.WaitGroup
 		for _, source := range selected {
 			source := source
@@ -483,6 +458,7 @@ func (m *Manager) StartDailyAutoSync(ctx context.Context) {
 		}
 		wg.Wait()
 	}()
+	return done
 }
 
 func todayString() string {

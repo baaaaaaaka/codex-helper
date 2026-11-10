@@ -21,12 +21,12 @@ import (
 //  3. The child chat gets its notice, then the parent's visible history up
 //     to that cutoff, then rc.6's marker "History import complete. The new
 //     Codex chat is ready.".
-//  4. Once the marker is delivered (every earlier message of the child chat
-//     is then settled: a chat's outbox is sent strictly in order), the
+//  4. Once the marker is delivered (earlier messages were attempted; any
+//     unconfirmed outcomes remain retained with delivery warnings), the
 //     parent gets "✅ Fork complete. Open the new Codex chat: <url>" and the
 //     control chat its "Work chat created" notice, in the transaction that
 //     marks the marker sent (forkSettled): the link never comes before the
-//     history, and it comes once.
+//     history attempts, and it comes once.
 //
 // The history comes from the parent's rollout, not the child's: Codex
 // 0.166 writes no copy of the parent's records into the child's rollout
@@ -459,7 +459,7 @@ func (e *Engine) forkSweep() {
 	if err != nil {
 		return
 	}
-	jobs, err := loadImports(e.st.Meta)
+	jobs, err := e.st.ImportJobs()
 	if err != nil {
 		return
 	}

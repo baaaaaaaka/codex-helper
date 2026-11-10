@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"os"
 	"strconv"
@@ -79,56 +78,23 @@ const (
 	metaDelegThreadPrefix = "engine_deleg_thread:" // turn id -> Codex thread id
 	metaDelegRemotePrefix = "engine_deleg_remote:" // requester's remote thread id -> Codex thread id
 	metaDelegWorker       = "engine_deleg_worker"  // this engine's stable worker instance id
-	metaDelegThreads      = "engine_deleg_threads" // JSON list of delegated Codex thread ids (never mirrored)
 )
-
-// maxDelegThreads bounds the remembered delegated threads (the oldest are
-// dropped; their rollouts are long settled by then).
-const maxDelegThreads = 1000
 
 // loadDelegThreads reads the delegated thread ids at start.
 func (e *Engine) loadDelegThreads() error {
-	v, _, err := e.st.Meta(metaDelegThreads)
-	if err != nil || v == "" {
+	var ids []string
+	if err := e.st.Read(func(tx *store.Tx) (err error) { ids, err = tx.DelegatedThreads(); return }); err != nil {
 		return err
 	}
-	var ids []string
-	if json.Unmarshal([]byte(v), &ids) != nil {
-		return nil
-	}
 	e.mu.Lock()
+	defer e.mu.Unlock()
 	for _, id := range ids {
 		e.delegThreads[id] = true
 	}
-	e.mu.Unlock()
 	return nil
 }
 
-// addDelegThread records a delegated thread in tx.
-func addDelegThread(tx *store.Tx, threadID string) error {
-	v, _, err := tx.Meta(metaDelegThreads)
-	if err != nil {
-		return err
-	}
-	var ids []string
-	if v != "" {
-		_ = json.Unmarshal([]byte(v), &ids)
-	}
-	for _, id := range ids {
-		if id == threadID {
-			return nil
-		}
-	}
-	ids = append(ids, threadID)
-	if len(ids) > maxDelegThreads {
-		ids = ids[len(ids)-maxDelegThreads:]
-	}
-	b, err := json.Marshal(ids)
-	if err != nil {
-		return err
-	}
-	return tx.SetMeta(metaDelegThreads, string(b))
-}
+func addDelegThread(tx *store.Tx, threadID string) error { return tx.AddDelegatedThread(threadID) }
 
 // textDelegInterrupted is the result of a delegated task cut short by a
 // helper restart (it is never re-run).
@@ -443,7 +409,7 @@ func (e *Engine) finishDelegation(ctx context.Context, cs *convState, tr store.T
 		if err := tx.FinishTurn(tr.ID, state, errText, msgs); err != nil {
 			return err
 		}
-		return recordUsage(tx, cs.id, state, out.Usage)
+		return nil
 	}) {
 		return
 	}

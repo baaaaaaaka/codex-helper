@@ -14,7 +14,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/baaaaaaaka/codex-helper/internal/appdirs"
 	"github.com/baaaaaaaka/codex-helper/internal/channel"
 	"github.com/gofrs/flock"
 )
@@ -23,33 +22,14 @@ import (
 // separate read token. When the read client is absent or matches the full
 // client, the full token also handles reads.
 //
-// Files read, in order (first usable wins):
-//
-//  1. $CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE, if set (and nothing else).
-//  2. <state>/teams/profiles/<profile>/teams-full-token.json
-//  3. <user cache>/codex-helper/teams/profiles/<profile>/teams-full-token.json (pre-state-dir builds)
-//  4. default profile only: <user cache>/codex-helper/teams-full-token.json (pre-profile builds)
-//  5. the same three locations for teams-chat-write-token.json, but only if
-//     the cached token's scope already covers the full feature set (older
-//     builds logged in once with full scopes under the chat-write name).
-//
-// Refreshed tokens are written back to the file they were read from
-// (0600, atomic rename, symlinks refused). Configuration comes from
-// $CODEX_HELPER_TEAMS_AUTH_CONFIG or <user config>/codex-helper/teams-auth.json
-// (tenant_id, optional read and full client IDs/scopes, with full falling
-// back to chat_write), with CODEX_HELPER_TEAMS_READ_* and
-// CODEX_HELPER_TEAMS_FULL_* env overrides.
-// The optional read token uses teams-read-token.json under the profile state
-// directory; if its client ID is absent or matches full, it reuses full.
+// Profiles use one native token database; full/read credentials are distinct
+// rows. Historical paths are consulted only by the atomic migration module.
 
 const (
-	DefaultReadScopes  = "openid profile offline_access User.Read Chat.Read Files.Read"
-	DefaultScopes      = "openid profile offline_access User.Read Chat.ReadWrite OnlineMeetings.ReadWrite Files.ReadWrite"
-	defaultLoginURL    = "https://login.microsoftonline.com"
-	readCacheName      = "teams-read-token.json"
-	fullCacheName      = "teams-full-token.json"
-	chatWriteCacheName = "teams-chat-write-token.json"
-	accessTokenSkew    = 2 * time.Minute
+	DefaultReadScopes = "openid profile offline_access User.Read Chat.Read Files.Read"
+	DefaultScopes     = "openid profile offline_access User.Read Chat.ReadWrite OnlineMeetings.ReadWrite Files.ReadWrite"
+	defaultLoginURL   = "https://login.microsoftonline.com"
+	accessTokenSkew   = 2 * time.Minute
 )
 
 // TokenSource supplies delegated Graph access tokens.
@@ -64,14 +44,14 @@ type TokenSource interface {
 
 // AuthConfig identifies the delegated login.
 type AuthConfig struct {
-	TenantID  string
-	ClientID  string
-	Scopes    string
-	CachePath string
-	LoginURL  string // default https://login.microsoftonline.com (tests point it at a fake)
+	TenantID string
+	ClientID string
+	Scopes   string
+	Cache    TokenLocation
+	LoginURL string // default https://login.microsoftonline.com (tests point it at a fake)
 }
 
-// TokenCache is the on-disk format shared with earlier releases.
+// TokenCache holds credential fields. JSON tags belong to the OAuth/import boundary.
 type TokenCache struct {
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`
@@ -111,23 +91,23 @@ func AuthProfile() string {
 	return "default"
 }
 
-// AuthConfigPath returns the teams-auth.json location.
+// AuthConfigPath returns the native Teams auth configuration database.
 func AuthConfigPath() (string, error) {
 	if v := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_AUTH_CONFIG")); v != "" {
-		return expandHome(v), nil
+		return authDatabasePath(expandHome(v)), nil
 	}
 	base, err := os.UserConfigDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(base, "codex-helper", "teams-auth.json"), nil
+	return filepath.Join(base, "codex-helper", "teams-auth.sqlite"), nil
 }
 
 // ResolveAuthConfig builds the delegated auth config for profile ("" = the
 // active profile) from teams-auth.json, the environment and the existing
 // token caches. It never contacts the network.
 func ResolveAuthConfig(profile string) (AuthConfig, error) {
-	file, path, err := loadAuthConfigFile()
+	file, path, err := loadAuthConfigFile(profile)
 	if err != nil {
 		return AuthConfig{}, err
 	}
@@ -154,24 +134,30 @@ func resolveFullAuthConfig(profile string, file authFile, path string) (AuthConf
 		}
 	}
 	if v := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_FULL_TOKEN_CACHE")); v != "" {
-		cfg.CachePath = expandHome(v)
+		var err error
+		cfg.Cache, err = resolveTokenOverride(v, "full")
+		return cfg, err
+	}
+	var err error
+	cfg.Cache, err = resolveProfileToken(profile, "full")
+	if err != nil {
+		return cfg, err
+	}
+	tok, err := ReadTokenCache(cfg.Cache)
+	if err == nil && (tok.AccessToken != "" || tok.RefreshToken != "") {
 		return cfg, nil
 	}
-	cands, err := cacheCandidates(profile)
-	if err != nil {
-		return AuthConfig{}, err
+	if err != nil && !os.IsNotExist(err) {
+		return cfg, err
 	}
-	cfg.CachePath = cands[0].path
-	for _, c := range cands {
-		tok, err := readTokenCache(c.path)
-		if err != nil || (tok.AccessToken == "" && tok.RefreshToken == "") {
-			continue
-		}
-		if c.reduced && !coversScopes(tok.Scope, "User.Read Chat.ReadWrite OnlineMeetings.ReadWrite Files.ReadWrite") {
-			continue
-		}
-		cfg.CachePath = c.path
-		break
+	alternate := cfg.Cache
+	alternate.Slot = "chat_write"
+	tok, err = ReadTokenCache(alternate)
+	if err != nil && !os.IsNotExist(err) {
+		return cfg, err
+	}
+	if err == nil && (tok.AccessToken != "" || tok.RefreshToken != "") && coversScopes(tok.Scope, "User.Read Chat.ReadWrite OnlineMeetings.ReadWrite Files.ReadWrite") {
+		cfg.Cache = alternate
 	}
 	return cfg, nil
 }
@@ -182,7 +168,7 @@ func ResolveReadAuthConfig(profile string) (AuthConfig, error) {
 	if profile == "" {
 		profile = AuthProfile()
 	}
-	file, path, err := loadAuthConfigFile()
+	file, path, err := loadAuthConfigFile(profile)
 	if err != nil {
 		return AuthConfig{}, err
 	}
@@ -209,41 +195,29 @@ func ResolveReadAuthConfig(profile string) (AuthConfig, error) {
 		}
 	}
 	if v := strings.TrimSpace(os.Getenv("CODEX_HELPER_TEAMS_READ_TOKEN_CACHE")); v != "" {
-		cfg.CachePath = expandHome(v)
+		cfg.Cache, err = resolveTokenOverride(v, "read")
 	} else {
-		candidates, err := readCacheCandidates(profile)
-		if err != nil {
-			return AuthConfig{}, err
-		}
-		cfg.CachePath = candidates[0]
-		for _, candidate := range candidates {
-			tok, err := readTokenCache(candidate)
-			if err == nil && (tok.AccessToken != "" || tok.RefreshToken != "") {
-				cfg.CachePath = candidate
-				break
-			}
-		}
+		cfg.Cache, err = resolveProfileToken(profile, "read")
 	}
-	if filepath.Clean(cfg.CachePath) == filepath.Clean(fullCfg.CachePath) {
-		return AuthConfig{}, errors.New("Teams read and full token caches must use different files when their client IDs differ")
+	if err != nil {
+		return cfg, err
+	}
+	if cfg.Cache == fullCfg.Cache {
+		return AuthConfig{}, errors.New("Teams read and full credentials must use different token rows when their client IDs differ")
 	}
 	return cfg, nil
 }
 
-func loadAuthConfigFile() (authFile, string, error) {
+func loadAuthConfigFile(profile string) (authFile, string, error) {
+	if profile == "" {
+		profile = AuthProfile()
+	}
 	path, err := AuthConfigPath()
 	if err != nil {
 		return authFile{}, "", err
 	}
-	var file authFile
-	if raw, err := os.ReadFile(path); err == nil {
-		if err := json.Unmarshal(raw, &file); err != nil {
-			return authFile{}, "", fmt.Errorf("read Teams auth config %s: %w", path, err)
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return authFile{}, "", err
-	}
-	return file, path, nil
+	file, err := loadNativeAuthConfig(path, profile)
+	return file, path, err
 }
 
 // allowedScopes is v0.1.20's set of delegated Graph scopes the helper may
@@ -296,52 +270,6 @@ func UnsafeScopesAllowed() bool {
 	return false
 }
 
-type cacheCandidate struct {
-	path    string
-	reduced bool // chat-write cache: only usable if its scopes cover the full set
-}
-
-func cacheCandidates(profile string) ([]cacheCandidate, error) {
-	safe := safePathPart(profile)
-	var out []cacheCandidate
-	for _, name := range []string{fullCacheName, chatWriteCacheName} {
-		reduced := name == chatWriteCacheName
-		p, err := appdirs.StatePath("teams", "profiles", safe, name)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, cacheCandidate{p, reduced})
-		if p, err := appdirs.LegacyCachePath("teams", "profiles", safe, name); err == nil {
-			out = append(out, cacheCandidate{p, reduced})
-		}
-		if profile == "default" {
-			if p, err := appdirs.LegacyCachePath(name); err == nil {
-				out = append(out, cacheCandidate{p, reduced})
-			}
-		}
-	}
-	return out, nil
-}
-
-func readCacheCandidates(profile string) ([]string, error) {
-	safe := safePathPart(profile)
-	var out []string
-	p, err := appdirs.StatePath("teams", "profiles", safe, readCacheName)
-	if err != nil {
-		return nil, err
-	}
-	out = append(out, p)
-	if p, err := appdirs.LegacyCachePath("teams", "profiles", safe, readCacheName); err == nil {
-		out = append(out, p)
-	}
-	if profile == "default" {
-		if p, err := appdirs.LegacyCachePath(readCacheName); err == nil {
-			out = append(out, p)
-		}
-	}
-	return out, nil
-}
-
 func coversScopes(have, need string) bool {
 	set := map[string]bool{}
 	for _, s := range strings.Fields(have) {
@@ -363,8 +291,9 @@ type DelegatedAuth struct {
 	http *http.Client
 	now  func() time.Time
 
-	mu  sync.Mutex
-	cur TokenCache
+	mu    sync.Mutex
+	cur   TokenCache
+	store *tokenStore
 }
 
 // NewDelegatedAuth returns a TokenSource for cfg. client may be nil.
@@ -381,7 +310,7 @@ func (a *DelegatedAuth) Token(ctx context.Context) (string, error) {
 	if a.fresh(a.cur) {
 		return a.cur.AccessToken, nil
 	}
-	// Re-read the file: the login command or another process may have
+	// Re-read the row: the login command or another process may have
 	// refreshed it.
 	if err := a.load(); err != nil {
 		return "", err
@@ -409,7 +338,14 @@ func (a *DelegatedAuth) fresh(t TokenCache) bool {
 }
 
 func (a *DelegatedAuth) load() error {
-	tok, err := readTokenCache(a.cfg.CachePath)
+	if a.store == nil {
+		var err error
+		a.store, err = openExistingTokens(a.cfg.Cache.Database)
+		if err != nil {
+			return &channel.AuthRequired{Err: err}
+		}
+	}
+	tok, err := readNativeToken(a.store.db, a.cfg.Cache.Slot)
 	if errors.Is(err, os.ErrNotExist) {
 		return &channel.AuthRequired{Err: errors.New("Teams token cache is missing; run `cxp teams auth login`")}
 	}
@@ -420,15 +356,12 @@ func (a *DelegatedAuth) load() error {
 	return nil
 }
 
-// refreshLocked refreshes under the cross-process cache lock
-// (<cache>.lock, flock). Holding it, the cache is read again: another
-// process (the service, the CLI, a second machine on a shared home) may
-// have refreshed while we waited, and refreshing again with the rotated
-// refresh token would waste it. Binaries older than this lock never take
-// it; they still replace the cache atomically, so the worst case with them
-// is one extra refresh, as before.
+// refreshLocked retains the existing cross-process refresh lock across OAuth
+// I/O, then commits the new token with one point write. No SQLite transaction
+// spans the network request. Readers reload after acquiring the lock so a
+// rotated refresh token is never consumed twice by competing processes.
 func (a *DelegatedAuth) refreshLocked(ctx context.Context, stale string) (string, error) {
-	unlock, err := lockFile(ctx, a.cfg.CachePath+".lock")
+	unlock, err := lockFile(ctx, a.cfg.Cache.lockPath())
 	if err != nil {
 		return "", &channel.Rejected{Err: fmt.Errorf("lock Teams token cache: %w", err)}
 	}
@@ -458,7 +391,7 @@ func (a *DelegatedAuth) refreshLocked(ctx context.Context, stale string) (string
 	if tok.RefreshToken == "" {
 		tok.RefreshToken = a.cur.RefreshToken
 	}
-	if err := WriteTokenCache(a.cfg.CachePath, tok); err != nil {
+	if _, err := a.store.db.Exec(tokenPut, tokenArgs(a.cfg.Cache.Slot, tok)...); err != nil {
 		return "", fmt.Errorf("save Teams token cache: %w", err)
 	}
 	a.cur = tok
@@ -483,7 +416,7 @@ func lockFile(ctx context.Context, path string) (func(), error) {
 }
 
 // DeviceLogin runs the device-code flow, prints the instructions to out and
-// stores the token in cfg.CachePath. It is the only interactive path.
+// stores the token in cfg.Cache. It is the only interactive path.
 func DeviceLogin(ctx context.Context, cfg AuthConfig, client *http.Client, out io.Writer) error {
 	if client == nil {
 		client = &http.Client{Timeout: 60 * time.Second}
@@ -518,12 +451,12 @@ func DeviceLogin(ctx context.Context, cfg AuthConfig, client *http.Client, out i
 		var oe *oauthError
 		switch {
 		case err == nil:
-			unlock, lerr := lockFile(ctx, cfg.CachePath+".lock")
+			unlock, lerr := lockFile(ctx, cfg.Cache.lockPath())
 			if lerr != nil {
 				return lerr
 			}
 			defer unlock()
-			return WriteTokenCache(cfg.CachePath, tok)
+			return WriteTokenCache(cfg.Cache, tok)
 		case errors.As(err, &oe) && oe.Code == "authorization_pending":
 		case errors.As(err, &oe) && oe.Code == "slow_down":
 			interval += 5 * time.Second
@@ -597,62 +530,16 @@ func postFormRaw(ctx context.Context, client *http.Client, cfg AuthConfig, endpo
 	return json.Unmarshal(data, out)
 }
 
-// ReadTokenCache reads a token cache (for status output; callers never
-// print the tokens).
-func ReadTokenCache(path string) (TokenCache, error) { return readTokenCache(path) }
-
-func readTokenCache(path string) (TokenCache, error) {
-	info, err := os.Lstat(path)
-	if err != nil {
-		return TokenCache{}, err
+// Close releases the retained credential connection after all callers drain.
+func (a *DelegatedAuth) Close() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.store == nil {
+		return nil
 	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return TokenCache{}, fmt.Errorf("Teams token cache %s is not a regular file", path)
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return TokenCache{}, err
-	}
-	var tok TokenCache
-	if err := json.Unmarshal(data, &tok); err != nil {
-		return TokenCache{}, fmt.Errorf("Teams token cache %s: %w", path, err)
-	}
-	if info.Mode().Perm()&0o077 != 0 {
-		_ = os.Chmod(path, 0o600)
-	}
-	return tok, nil
-}
-
-// WriteTokenCache stores tok at path atomically with mode 0600.
-func WriteTokenCache(path string, tok TokenCache) error {
-	if info, err := os.Lstat(path); err == nil && info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("Teams token cache %s must not be a symlink", path)
-	}
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	data, err := json.MarshalIndent(tok, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp, err := os.CreateTemp(dir, ".teams-token-*.tmp")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmp.Name(), path)
+	err := a.store.db.Close()
+	a.store = nil
+	return err
 }
 
 // safePathPart matches the profile directory naming of earlier releases.

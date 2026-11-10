@@ -26,7 +26,7 @@ func TestAcquireAgainstAStalledWriterIsARefusal(t *testing.T) {
 		done <- a.Update(func(tx *Tx) error {
 			close(inTx)
 			<-resume // the owner is frozen here, holding the write lock
-			return tx.SetMeta("k", "v")
+			return tx.SetMeta("machine_label", "v")
 		})
 	}()
 	<-inTx

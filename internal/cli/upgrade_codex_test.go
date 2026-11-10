@@ -153,6 +153,7 @@ func TestRootUpgradeCodexPrefersManagedInstallOverPATHCodex(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { store.Close() })
 	if err := store.Save(config.Config{Version: config.CurrentVersion, ProxyEnabled: boolPtr(false)}); err != nil {
 		t.Fatal(err)
 	}
@@ -207,6 +208,7 @@ func TestRootUpgradeCodexInstallsManagedWhenOnlyPATHCodexExists(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { store.Close() })
 	if err := store.Save(config.Config{Version: config.CurrentVersion, ProxyEnabled: boolPtr(false)}); err != nil {
 		t.Fatal(err)
 	}
@@ -260,6 +262,7 @@ func TestRootUpgradeCodexExplicitPathPreservesExternalUpgrade(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { store.Close() })
 	if err := store.Save(config.Config{Version: config.CurrentVersion, ProxyEnabled: boolPtr(false)}); err != nil {
 		t.Fatal(err)
 	}
@@ -299,6 +302,7 @@ func TestRootUpgradeCodexExplicitPathCanRepairNonfunctionalExecutable(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { store.Close() })
 	if err := store.Save(config.Config{Version: config.CurrentVersion, ProxyEnabled: boolPtr(false)}); err != nil {
 		t.Fatal(err)
 	}

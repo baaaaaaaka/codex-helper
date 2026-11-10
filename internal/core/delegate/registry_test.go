@@ -151,8 +151,9 @@ func rig(t *testing.T) (*meetings, *Registry, engine.RegistryCard, *time.Time) {
 	ch := newMeetings()
 	now := time.Date(2026, 11, 4, 12, 0, 0, 0, time.UTC)
 	reg := NewRegistry(RegistryConfig{Channel: ch, TenantID: testTenant, MachineID: testMachine, Label: "build-box",
-		Host: "build-box", Version: "v1.2.3", CachePath: filepath.Join(t.TempDir(), "machine-registry.json"),
+		Host: "build-box", Version: "v1.2.3", CachePath: filepath.Join(t.TempDir(), "machine-registry.sqlite"),
 		Now: func() time.Time { return now }})
+	t.Cleanup(func() { reg.Close() })
 	// The engine created the inbox chat with the inbox key and a 24 h window.
 	key := InboxKey(testTenant, "owner-1", testMachine)
 	info, _, _ := ch.CreateMeetingChat(context.Background(), "CXP Machine Inbox build-box", key, now, now.Add(24*time.Hour))

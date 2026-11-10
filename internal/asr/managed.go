@@ -122,7 +122,9 @@ func NewManaged(cfg ManagedConfig) *Managed {
 		setupFailures: map[string]error{}}
 	m.in.stall = cfg.StallTimeout
 	m.in.logf = cfg.Logf
-	reapOrphans(cfg.CacheDir)
+	if err := reapOrphans(cfg.CacheDir); err != nil {
+		m.in.log("orphan cleanup: %v", err)
+	}
 	m.in.progress = m.touch
 	m.closeCtx, m.closeFn = context.WithCancel(context.Background())
 	return m
@@ -604,7 +606,9 @@ func (m *Managed) startServerLocked(ctx context.Context, p *paths) error {
 		return nil
 	}
 	m.stopServerLocked()
-	reapOrphans(m.cfg.CacheDir)
+	if err := reapOrphans(m.cfg.CacheDir); err != nil {
+		return newError(KindCache, "read ASR server records", err, "")
+	}
 	srv, err := startLlamaServer(ctx, p, m.device(), m.cfg.CacheDir, m.in.tmp(), m.cfg.LoadTimeout)
 	if err != nil {
 		return err

@@ -14,7 +14,7 @@ var ErrInstanceOwnershipLost = errors.New("proxy instance ownership lost")
 
 // ErrInstanceNotFound lets lifecycle callers distinguish a daemon that
 // removed its own record during shutdown from an ownership conflict.
-var ErrInstanceNotFound = errors.New("proxy instance not found")
+var ErrInstanceNotFound = config.ErrInstanceNotFound
 
 // MergeProxyRecoveryBudget merges a snapshot produced by a daemon with the
 // value currently persisted by another lifecycle participant (for example a
@@ -102,36 +102,19 @@ func IsProxyOwnerLeaseStale(inst config.Instance, now time.Time, lease time.Dura
 	return now.Sub(last) >= lease
 }
 
-func RecordInstance(store *config.Store, inst config.Instance) error {
-	return store.Update(func(cfg *config.Config) error {
-		cfg.UpsertInstance(inst)
-		return nil
-	})
-}
-
-func RemoveInstance(store *config.Store, instanceID string) error {
-	return store.Update(func(cfg *config.Config) error {
-		cfg.RemoveInstance(instanceID)
-		return nil
-	})
-}
-
-func Heartbeat(store *config.Store, instanceID string, now time.Time) error {
-	return store.Update(func(cfg *config.Config) error {
-		for i := range cfg.Instances {
-			if cfg.Instances[i].ID == instanceID {
-				cfg.Instances[i].LastSeenAt = now
-				if cfg.Instances[i].OwnerToken != "" {
-					if cfg.Instances[i].OwnerAcquiredAt.IsZero() {
-						cfg.Instances[i].OwnerAcquiredAt = now
-					}
-					cfg.Instances[i].OwnerLastSeenAt = now
-					cfg.Instances[i].OwnerLeaseExpiresAt = now.Add(DefaultProxyOwnerLease)
-				}
-				return nil
+func RecordInstance(store *config.Store, inst config.Instance) error { return store.PutInstance(inst) }
+func RemoveInstance(store *config.Store, id string) error            { return store.DeleteInstance(id) }
+func Heartbeat(store *config.Store, id string, now time.Time) error {
+	return store.ChangeInstance(id, func(inst *config.Instance) error {
+		inst.LastSeenAt = now
+		if inst.OwnerToken != "" {
+			if inst.OwnerAcquiredAt.IsZero() {
+				inst.OwnerAcquiredAt = now
 			}
+			inst.OwnerLastSeenAt = now
+			inst.OwnerLeaseExpiresAt = now.Add(DefaultProxyOwnerLease)
 		}
-		return fmt.Errorf("%w: %q", ErrInstanceNotFound, instanceID)
+		return nil
 	})
 }
 
@@ -143,21 +126,14 @@ func UpdateOwnedInstance(store *config.Store, instanceID, ownerToken, brokerEpoc
 	if store == nil {
 		return fmt.Errorf("update owned instance: nil store")
 	}
-	return store.Update(func(cfg *config.Config) error {
-		for i := range cfg.Instances {
-			inst := &cfg.Instances[i]
-			if inst.ID != instanceID {
-				continue
-			}
-			if ownerToken == "" || brokerEpoch == "" || inst.OwnerToken != ownerToken || inst.BrokerEpoch != brokerEpoch {
-				return ErrInstanceOwnershipLost
-			}
-			if fn != nil {
-				return fn(inst)
-			}
-			return nil
+	return store.ChangeInstance(instanceID, func(inst *config.Instance) error {
+		if ownerToken == "" || brokerEpoch == "" || inst.OwnerToken != ownerToken || inst.BrokerEpoch != brokerEpoch {
+			return ErrInstanceOwnershipLost
 		}
-		return fmt.Errorf("%w: %q", ErrInstanceNotFound, instanceID)
+		if fn != nil {
+			return fn(inst)
+		}
+		return nil
 	})
 }
 
@@ -180,17 +156,10 @@ func RemoveOwnedInstance(store *config.Store, instanceID, ownerToken, brokerEpoc
 	if store == nil {
 		return fmt.Errorf("remove owned instance: nil store")
 	}
-	return store.Update(func(cfg *config.Config) error {
-		for _, inst := range cfg.Instances {
-			if inst.ID != instanceID {
-				continue
-			}
-			if ownerToken == "" || brokerEpoch == "" || inst.OwnerToken != ownerToken || inst.BrokerEpoch != brokerEpoch {
-				return ErrInstanceOwnershipLost
-			}
-			cfg.RemoveInstance(instanceID)
-			return nil
+	return store.DeleteInstanceWhen(instanceID, func(inst config.Instance) error {
+		if ownerToken == "" || brokerEpoch == "" || inst.OwnerToken != ownerToken || inst.BrokerEpoch != brokerEpoch {
+			return ErrInstanceOwnershipLost
 		}
-		return fmt.Errorf("%w: %q", ErrInstanceNotFound, instanceID)
+		return nil
 	})
 }

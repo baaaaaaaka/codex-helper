@@ -14,6 +14,10 @@ import (
 
 const ProtocolProbeFlag = "--cxp-boot-protocol"
 
+// EnvProbeProtocol distinguishes the native candidate probe from historical
+// updaters, which also set EnvDisable while validating downloads.
+const EnvProbeProtocol = "CXP_RUNTIME_PROBE_PROTOCOL"
+
 // HandleProtocolProbe precedes all runtime dispatch and application setup.
 func HandleProtocolProbe(args []string, out io.Writer) (int, bool) {
 	if len(args) != 2 || args[1] != ProtocolProbeFlag {
@@ -69,7 +73,7 @@ func ProbeExecutable(ctx context.Context, path string, args []string, timeout ti
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, path, args...)
-	cmd.Env = append(LauncherEnvironment(os.Environ()), EnvDisable+"=1")
+	cmd.Env = append(LauncherEnvironment(os.Environ()), EnvDisable+"=1", EnvProbeProtocol+"="+strconv.Itoa(BootProtocol))
 	cmd.WaitDelay = 500 * time.Millisecond
 	var output probeOutput
 	cmd.Stdout, cmd.Stderr = &output, &output

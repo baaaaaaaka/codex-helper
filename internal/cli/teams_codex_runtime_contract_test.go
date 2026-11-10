@@ -39,6 +39,7 @@ func TestTeamsCodexRuntimeContractFindsManagedCodexOutsideServicePATH(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { store.Close() })
 	if err := store.Save(config.Config{Version: config.CurrentVersion}); err != nil {
 		t.Fatal(err)
 	}
@@ -70,6 +71,7 @@ func TestTeamsCodexRuntimeContractSilentlyInstallsMissingManagedCodex(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { store.Close() })
 	if err := store.Save(config.Config{Version: config.CurrentVersion}); err != nil {
 		t.Fatal(err)
 	}

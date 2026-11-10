@@ -45,11 +45,11 @@ AND state='sent' AND ext_msg_id IS NOT NULL AND ext_msg_id<>'')`, prefix, prefix
 	return hit, err
 }
 
-// DroppedUnder reports whether an outbox row whose delivery key starts with
-// prefix was dropped (never confirmed delivered). kinds, when given, limits
-// the rows considered to those kinds.
-func (t *Tx) DroppedUnder(prefix string, kinds ...string) (bool, error) {
-	q := `SELECT EXISTS(SELECT 1 FROM outbox WHERE delivery_key >= ? AND delivery_key < ? AND state = 'dropped'`
+// UnconfirmedUnder returns unknown, dropped, or empty when neither exists.
+// Dropped takes precedence: an incomplete answer must not be announced ready.
+// kinds, when given, limits the rows considered to those kinds.
+func (t *Tx) UnconfirmedUnder(prefix string, kinds ...string) (string, error) {
+	q := `SELECT COALESCE(MIN(state),'') FROM outbox WHERE delivery_key >= ? AND delivery_key < ? AND state IN ('unknown','dropped')`
 	args := []any{prefix, prefix + "\U0010FFFF"}
 	if len(kinds) > 0 {
 		q += ` AND kind IN (?` + strings.Repeat(`,?`, len(kinds)-1) + `)`
@@ -57,9 +57,9 @@ func (t *Tx) DroppedUnder(prefix string, kinds ...string) (bool, error) {
 			args = append(args, k)
 		}
 	}
-	var hit int
-	err := t.row(q+`)`, args...).Scan(&hit)
-	return hit != 0, err
+	var state string
+	err := t.row(q, args...).Scan(&state)
+	return state, err
 }
 
 // RetryTurn creates a new queued turn for an inbound prompt whose earlier
@@ -109,6 +109,13 @@ func (s *Store) CodexTurnIDs() ([]string, error) {
 // sent yet (queued, sending, unknown; `teams service status`).
 func (s *Store) OutboxCounts() (map[string]int, error) {
 	return s.countByState(`SELECT state, COUNT(*) FROM outbox WHERE state IN ('queued','sending','unknown') GROUP BY state`)
+}
+
+// DeliveryCounts reports active and unconfirmed output without loading bodies.
+func (t *Tx) DeliveryCounts(conv int64) (active, unknown int, err error) {
+	err = t.row(`SELECT COALESCE(SUM(state IN ('queued','sending')),0), COALESCE(SUM(state='unknown'),0)
+FROM outbox WHERE conv_id=? AND state IN ('queued','sending','unknown')`, conv).Scan(&active, &unknown)
+	return
 }
 
 // TurnCounts returns the number of turns per state (stats).
@@ -190,7 +197,7 @@ ORDER BY seq DESC LIMIT 1`, convID), scanOutbox)
 // PendingOutboxConvs lists the conversations with outbox rows still to
 // send (queued or sending; unknown rows wait for the resolver).
 func (s *Store) PendingOutboxConvs() ([]int64, error) {
-	rows, err := s.r.QueryContext(context.Background(), `SELECT DISTINCT conv_id FROM outbox WHERE state IN ('queued','sending','unknown') AND state IN ('queued','sending') ORDER BY conv_id`)
+	rows, err := s.r.QueryContext(context.Background(), `SELECT DISTINCT conv_id FROM outbox WHERE state IN ('queued','sending') ORDER BY conv_id`)
 	if err != nil {
 		return nil, err
 	}
@@ -218,10 +225,10 @@ func (t *Tx) LastSeq(conv int64) (int64, error) {
 // final, a notice). The sender ranks such a conversation by that row, also
 // when an older mirrored or progress row is its head: rows go out in order,
 // so a stale progress post must not hold an answer behind a catch-up
-// backlog. The first term matches the outbox_pending partial index.
+// backlog. The first term matches the outbox_active partial index.
 func (t *Tx) UrgentConvs() (map[int64]bool, error) {
 	rows, err := t.rows(`SELECT DISTINCT conv_id FROM outbox
-WHERE state IN ('queued','sending','unknown') AND state = 'queued' AND kind NOT IN ('mirror','progress')`)
+WHERE state IN ('queued','sending') AND state = 'queued' AND kind NOT IN ('mirror','progress')`)
 	if err != nil {
 		return nil, err
 	}
@@ -323,14 +330,14 @@ func (t *Tx) RecordedParts(msgs []OutMsg) (bool, error) {
 // PendingAtLeast uses the partial pending index and reads no message bodies.
 func (s *Store) PendingAtLeast(conv int64, limit int) (bool, error) {
 	var n int
-	err := s.r.QueryRowContext(context.Background(), `SELECT count(*) FROM (SELECT id FROM outbox WHERE conv_id=? AND state IN ('queued','sending','unknown') AND hold_turn IS NULL LIMIT ?)`, conv, limit).Scan(&n)
+	err := s.r.QueryRowContext(context.Background(), `SELECT count(*) FROM (SELECT id FROM outbox WHERE conv_id=? AND state IN ('queued','sending') AND hold_turn IS NULL LIMIT ?)`, conv, limit).Scan(&n)
 	return n >= limit, err
 }
 
 // PendingProgress prevents still-working notices from piling up behind content.
 func (s *Store) PendingProgress(conv int64) (bool, error) {
 	var yes bool
-	err := s.r.QueryRowContext(context.Background(), `SELECT EXISTS(SELECT 1 FROM outbox WHERE conv_id=? AND state IN ('queued','sending','unknown') AND (kind='progress' OR progress_group IS NOT NULL OR delivery_key LIKE 'turn:%:visible:%' OR delivery_key LIKE 'turn:%:silence:%'))`, conv).Scan(&yes)
+	err := s.r.QueryRowContext(context.Background(), `SELECT EXISTS(SELECT 1 FROM outbox WHERE conv_id=? AND state IN ('queued','sending') AND (kind='progress' OR progress_group IS NOT NULL OR delivery_key LIKE 'turn:%:visible:%' OR delivery_key LIKE 'turn:%:silence:%'))`, conv).Scan(&yes)
 	return yes, err
 }
 

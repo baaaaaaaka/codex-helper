@@ -3,7 +3,6 @@ package engine
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -120,8 +119,8 @@ type mirrorFile struct {
 	// which helper-run turns are mirrored too.
 	ns        string
 	keepTeams int64
-	// infoSaved is the tracker Info last persisted (srcInfoKey).
-	infoSaved string
+	// infoSaved is the tracker settings last persisted.
+	infoSaved store.SourceInfo
 }
 
 // catchingUp is the one boundary between catch-up and live mirroring
@@ -145,34 +144,31 @@ func catchUpFrom(at transcript.FileInfo, atStart bool) int64 {
 
 func realignKey(srcID int64) string { return fmt.Sprintf("%s%d", metaRealignPrefix, srcID) }
 
-// metaSrcInfoPrefix + source id: what the rollout said last of its
-// thread's goal and model settings (transcript.Info, JSON), so a tracker
-// that resumes after those records still knows them.
-const metaSrcInfoPrefix = "engine_srcinfo:"
-
-func srcInfoKey(srcID int64) string { return fmt.Sprintf("%s%d", metaSrcInfoPrefix, srcID) }
-
-// restoreInfo seeds t, a tracker of f at its persisted cursor, with what
-// the records before the cursor said of the goal and settings.
+// restoreInfo seeds a resumed tracker from typed, last-observed settings.
 func (e *Engine) restoreInfo(f *mirrorFile, t *transcript.Tracker) {
 	if f.src.ID == 0 || f.src.Offset == 0 {
 		return
 	}
-	if v, _, err := e.st.Meta(srcInfoKey(f.src.ID)); err == nil && v != "" {
-		var i transcript.Info
-		if json.Unmarshal([]byte(v), &i) == nil {
-			t.SetInfo(i)
-			f.infoSaved = v
-		}
+	var saved store.SourceInfo
+	var ok bool
+	if err := e.st.Read(func(tx *store.Tx) (err error) { saved, ok, err = tx.SourceInfo(f.src.ID); return }); err != nil || !ok {
+		return
 	}
+	i := transcript.Info{Model: saved.Model, Effort: saved.Effort, Tier: saved.Tier}
+	if saved.HasGoal {
+		i.Goal = &transcript.Goal{Objective: saved.GoalObjective, Status: saved.GoalStatus}
+	}
+	t.SetInfo(i)
+	f.infoSaved = saved
 }
 
-func infoJSON(i transcript.Info) string {
-	if i == (transcript.Info{}) {
-		return ""
+func sourceInfo(i transcript.Info) store.SourceInfo {
+	n := store.SourceInfo{Model: i.Model, Effort: i.Effort, Tier: i.Tier, HasGoal: i.Goal != nil}
+	if i.Goal != nil {
+		n.GoalObjective = i.Goal.Objective
+		n.GoalStatus = i.Goal.Status
 	}
-	b, _ := json.Marshal(i)
-	return string(b)
+	return n
 }
 
 func (e *Engine) mirrorSkipTurn(codexTurnID string) {
@@ -1048,12 +1044,12 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 		label, creating = cs.label, cs.state == store.ConvCreating
 	}
 	e.mu.Unlock()
-	var posted, notify int
+	var posted int
 	released := false
 	var liveThrough int64 // the seq of the last row queued for a live record
 	saved := f.infoSaved
 	err = e.update(func(tx *store.Tx) error {
-		posted, woke, created, notify, liveThrough = 0, false, false, 0, 0
+		posted, woke, created, liveThrough = 0, false, false, 0
 		released = false
 		saved = f.infoSaved
 		anyLive := false
@@ -1096,7 +1092,6 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 					Text: clipText(r.o.Text, 400)}); err != nil {
 					return err
 				}
-				notify++
 			}
 		}
 		// Realignment lasts until a pass reaches the end of the file, across
@@ -1137,7 +1132,6 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 					if err := markAnnounced(tx, f.src.ConvID); err != nil {
 						return err
 					}
-					notify++
 				}
 			}
 		}
@@ -1156,8 +1150,8 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 		if err := tx.AdvanceSource(f.src.ID, off, line, info.Size, ms(info.MTime), info.Inode, msgs); err != nil {
 			return err
 		}
-		if v := infoJSON(f.tracker.Info()); v != f.infoSaved && f.src.ID != 0 {
-			if err := tx.SetMeta(srcInfoKey(f.src.ID), v); err != nil {
+		if v := sourceInfo(f.tracker.Info()); v != f.infoSaved && f.src.ID != 0 {
+			if err := tx.SetSourceInfo(f.src.ID, v); err != nil {
 				return err
 			}
 			saved = v
@@ -1196,9 +1190,6 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 	f.realign, f.realignAt = realign && more, realignAt
 	if !more {
 		f.info = info
-	}
-	if notify > 0 {
-		wake(e.notifyWake)
 	}
 	if liveThrough > 0 {
 		e.markLive(f.src.ConvID, liveThrough)

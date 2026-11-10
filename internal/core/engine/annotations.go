@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
@@ -119,16 +118,10 @@ func (e *Engine) labelVoice(conv int64, in store.Inbound, clips []voiceClip) {
 	}})
 }
 
-// metaFreezePrefix + conversation id: "<parked_at>" while the freeze
-// notice of that park is owed, "done:<parked_at>" once made.
-const metaFreezePrefix = "engine_freeze:"
-
-func freezeKey(conv int64) string { return metaFreezePrefix + strconv.FormatInt(conv, 10) }
-
 // owesFreeze records in tx that the park of conv at parkedAt owes its
 // freeze notice.
 func owesFreeze(tx *store.Tx, conv, parkedAt int64) error {
-	return tx.SetMeta(freezeKey(conv), strconv.FormatInt(parkedAt, 10))
+	return tx.SetFreezeNotice(conv, store.FreezeNotice{ParkedAt: parkedAt})
 }
 
 // resumeFreezes queues the freeze notices owed by parked chats (a restart
@@ -142,7 +135,7 @@ func (e *Engine) resumeFreezes() {
 		if c.State != store.ConvParked {
 			continue
 		}
-		if v, ok, _ := e.st.Meta(freezeKey(c.ID)); ok && v == strconv.FormatInt(c.ParkedAt, 10) {
+		if v, ok, _ := e.st.FreezeNotice(c.ID); ok && !v.Done && v.ParkedAt == c.ParkedAt {
 			e.queueFreeze(c.ID, c.ParkedAt)
 		}
 	}
@@ -195,9 +188,9 @@ func (e *Engine) freeze(ctx context.Context, conv, parkedAt int64, chat string) 
 	if !parked {
 		return nil // woken before the notice: nothing to say
 	}
-	if v, _, err := e.st.Meta(freezeKey(conv)); err != nil {
+	if v, ok, err := e.st.FreezeNotice(conv); err != nil {
 		return err
-	} else if v != strconv.FormatInt(parkedAt, 10) {
+	} else if !ok || v.Done || v.ParkedAt != parkedAt {
 		return nil // made, or a later park owes its own
 	}
 	text := freezeText(label, url, e.t.ParkAfter)
@@ -265,7 +258,7 @@ func (e *Engine) freeze(ctx context.Context, conv, parkedAt int64, chat string) 
 				return err
 			}
 		}
-		return tx.SetMeta(freezeKey(conv), "done:"+strconv.FormatInt(parkedAt, 10))
+		return tx.CompleteFreezeNotice(conv, parkedAt)
 	})
 	if err == nil && !appended {
 		e.wakeSender()

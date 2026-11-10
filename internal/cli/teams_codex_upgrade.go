@@ -99,6 +99,7 @@ func upgradeTeamsCodex(ctx context.Context, root *rootOptions, out io.Writer) (s
 	if err != nil {
 		return "", err
 	}
+	defer store.Close()
 	cfg, err := store.Load()
 	if err != nil {
 		return "", err

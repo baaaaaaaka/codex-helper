@@ -24,12 +24,42 @@ run_tests() {
 
 case "$mode" in
   unit)
+    run_tests ./internal/core/store '^TestPublishedCoreStore' 'TestPublishedCoreStoreNeverInitializesLostSchema' 1
+    run_tests ./internal/helperruntime '^TestSQLiteBootstrap' 'TestSQLiteBootstrapExplicitMigrationDropsIncompatibleRollback,TestSQLiteBootstrapMigrationFailurePreservesLegacy,TestSQLiteBootstrapAutomaticUpdateRequiresExplicitMigration,TestSQLiteBootstrapRetryAfterCommittedBeforeArchive' 1
+    run_tests ./internal/cli '^TestTeamsExchangeSQLite' 'TestTeamsExchangeSQLiteAtomicCompletionAndConditionalAck,TestTeamsExchangeSQLiteLegacyAtomicMigration' 1
+    run_tests ./internal/sqlitestate '^TestSQLiteOnly' 'TestSQLiteOnlyPersistenceBoundary' 1
+    run_tests ./internal/sqlitestate '^TestSQLiteSnapshot' 'TestSQLiteSnapshotAtomicFailureAndReadOnly' 1
+    run_tests ./internal/core/lease '^TestLeaseNativeSlot' 'TestLeaseNativeSlotAndLegacyTakeoverEvidence' 1
+    run_tests ./internal/core/tuilease '^Test(TUILease|Descriptor)' 'TestTUILeaseLifetimeAndAuthentication,TestTUILeaseFallbackOnlyForUnmanagedThread,TestDescriptorRejectsRemoteAndCredentialURLs' 1
+    run_tests ./internal/cli '^Test(TeamsCommandsReadThePublished|TeamsRemoteStoreState|TeamsStatusPublisher)' 'TestTeamsCommandsReadThePublishedStateWhileAHelperHoldsTheStore,TestTeamsRemoteStoreStateUsesThePublishedFile,TestTeamsStatusPublisherFollowsCommits' 1
+    run_tests ./internal/updatestate '^TestUpdateSQLite' 'TestUpdateSQLiteMigrationAndQuiet,TestUpdateSQLiteMigrationRollsBackAndReadOnly,TestUpdateSQLiteInvocationAndActivationEntry,TestUpdateSQLiteInvocationCrashRetention,TestUpdateSQLiteMissingPublishedDatabase' 1
+    run_tests ./internal/sqlitestate '^TestPublication' 'TestPublicationMissingDatabaseFailsClosed,TestPublicationRejectsInvalidMarkerAndEmptyDatabase' 1
+    run_tests ./internal/core/codex '^Test(PIDSQLite|ConcurrentPIDFileWrites)' 'TestPIDSQLiteMigrationAndQuietWrites,TestPIDSQLiteMigrationRollsBack,TestPIDSQLiteKeyTransactionRollsBack,TestConcurrentPIDFileWritesStayValid' 1
+    run_tests ./internal/cli '^TestWindowsAppSQLite' 'TestWindowsAppSQLiteMigrationAndQuiet,TestWindowsAppSQLiteMigrationRollback' 1
+    run_tests ./internal/asr '^TestASRSQLite' 'TestASRSQLiteServerRecords,TestASRSQLiteServerMigrationRollback,TestASRSQLiteInstallManifest,TestASRSQLiteInstallMigration' 1
+    run_tests ./internal/managedinstall '^TestInstallSQLite' 'TestInstallSQLiteMigrationAndQuiet,TestInstallSQLiteRejectsBadSources,TestInstallSQLiteInstallerEntry' 1
+    run_tests ./internal/channel/teams '^TestFontSQLite' 'TestFontSQLiteMigrationAndReadOnly,TestFontSQLiteMigrationRejectsBadInputs' 1
+    run_tests ./internal/sqlitestate '^TestOpen' 'TestOpenConcurrentAndReadOnly,TestOpenRejectsNonFilesAndWAL' 1
+    run_tests ./internal/config '^TestConfigSQLite' 'TestConfigSQLiteReadOnlyRequiresMigration,TestConfigSQLiteMigrationAndQuietWrites,TestConfigSQLiteMigrationRollsBack,TestConfigSQLitePointQueryUsesIndex,TestConfigSQLiteMissingPublishedDatabase,TestConfigSQLitePointEditsPreserveUnrelatedCollections,TestConfigSQLitePrunePreservesConcurrentProgress,TestConfigSQLitePruneBatchRollsBack' 1
+    run_tests ./internal/cli '^TestServiceSQLite' 'TestServiceSQLiteLegacyMigrationAndQuietWrites,TestServiceSQLiteMigrationRollbackAndCorruption,TestServiceSQLiteReadonlyDoesNotCreateState' 1
+    run_tests ./internal/cli '^TestSupervisorSQLite' 'TestSupervisorSQLiteLegacyIdentityAndConfig,TestSupervisorSQLiteQuietAndChildRollback,TestSupervisorSQLiteConfigChildRollbackAndQuiet' 1
+    run_tests ./internal/channel/teams '^Test(AuthSQLite|DelegatedAuth)' 'TestAuthSQLiteMigrationAtomicAndQuiet,TestAuthSQLiteMigrationRollsBack,TestAuthSQLiteFutureCorruptAndMissingFailClosed,TestAuthSQLiteCustomLegacyPathsKeepDistinctCredentials,TestDelegatedAuthRefreshIsSerialisedAcrossInstances' 1
+    run_tests ./internal/appgateway '^TestGatewaySQLite' 'TestGatewaySQLiteMigrationAndQuietWrites,TestGatewaySQLiteMigrationRollsBackAndRejectsCorruption,TestGatewaySQLiteConcurrentInitialization' 1
+    run_tests ./internal/skills '^TestSkillsSQLite' 'TestSkillsSQLiteMigrationAndQuietWrites,TestSkillsSQLiteMigrationRollsBack,TestSkillsSQLiteSubscriptionRollbackAndReviewIsolation,TestSkillsSQLiteManifestMigrationAndPublication' 1
+    run_tests ./internal/core/delegate/machineregistry '^TestRegistryCacheSQLite' 'TestRegistryCacheSQLiteMigrationAndQuietReads,TestRegistryCacheSQLiteRejectsBadInputs' 1
+    run_tests ./internal/core/delegate/delegation '^Test(WorkerSQLite|ReserveOutbox|SQLiteWorker)' 'TestWorkerSQLiteMigrationPreservesSafetyEvidence,TestWorkerSQLiteMigrationRollsBack,TestWorkerSQLiteLegacyJSONFailureIsAtomic,TestWorkerSQLiteUnchangedReadAndWriteAreQuiet,TestWorkerSQLiteRetentionMatchesExistingPolicy,TestWorkerSQLiteRetentionSeeksPastMissingTimestamps,TestWorkerSQLiteArchiveIsAfterAuthoritySwitch,TestWorkerSQLiteConcurrentStartAndGenerationRollback,TestWorkerSQLiteReservationAcrossProcesses,TestReserveOutboxAllowsOnlyOneConcurrentNonIdempotentOwner' 1
+    run_tests ./internal/core/store '^Test(EngineStateMigration|EngineManagementMigration|EngineImportMigration|EngineUploadedReferenceMigration|EngineBadUploadedReference|EngineTypedStateUnchanged|EngineMeta|EngineWAL|Notification)' 'TestEngineStateMigrationFrozenV5,TestEngineStateMigrationRollsBack,TestEngineWALRecoversAfterRetainedReader,TestEngineManagementMigration,TestEngineTypedStateUnchangedWritesNothing,TestEngineImportMigrationPreservesArrayOrder,TestEngineUploadedReferenceMigration,TestEngineBadUploadedReferenceRollsBack,TestNotificationEventQueriesUsePointIndexes,TestEngineMetaRejectsFormerObjects,TestEngineMetaScalarBoundaryAndServiceEvidence,TestEngineMetaUnmappedLegacyStateRollsBack,TestNotificationUnknownBacklogDoesNotHideReady,TestNotificationCardAttemptIsDurable' 1
     run_tests ./internal/helperruntime '^TestVersionPointer' 'TestVersionPointerReplacementWhileReaderOpen,TestVersionPointerReadsLongPath' 1
+    run_tests ./internal/candidateupdate '^TestNativeUpdateRejectsHistoricalVersionProbe$' 'TestNativeUpdateRejectsHistoricalVersionProbe' 1
     run_tests ./internal/core/migrate '^TestConversion' 'TestConversionOwnershipAtEveryCheckpoint,TestConversionCanceledBeforeStartCreatesNothing' 1
     run_tests ./internal/cli '^Test(LegacyTeamsWatchdogHandoff|TeamsCoreStore|FirstStart|TeamsServiceWatchdog|RunTeamsServiceWatchdog)' 'TestLegacyTeamsWatchdogHandoff,TestTeamsServiceWatchdogObservesUnpublishedMigrationClaim,TestTeamsCoreStoreDoesNotWriteAfterLeaseLoss,TestTeamsCoreStoreLossAfterPreparationStarts,TestTeamsCoreStoreResumesMigrationAfterAbortedStart,TestTeamsCoreStorePreparationAfterMigrationBeforeActivation,TestTeamsServiceWatchdogRefreshesRuntimeBeforeHealthCheck,TestTeamsServiceWatchdogRuntimeRefreshErrorsDoNotStopLoop,TestTeamsServiceWatchdogRuntimeRestartErrorsDoNotStopLoop,TestTeamsServiceWatchdogRuntimeProcessUpgradeAndRollback' 1
     ;;
   e2e)
-    run_tests ./internal/e2e/scenarios/entry '^Test(EntryMigration|EntryWatchdogRuntime)' 'TestEntryMigrationPreservesChatWithStoppedWatchdog,TestEntryMigrationResumesAfterInterruptedStart,TestEntryMigrationResumesAfterCrashDuringImport,TestEntryMigrationTakeoverFencesWaitingOwner,TestEntryMigrationTakeoverFencesImporter,TestEntryWatchdogRuntimeUpgradeAndRollback,TestEntryWatchdogRuntimeLegacyLauncher,TestEntryMigrationRefusesMissingPublishedDatabase' 3
+    run_tests ./internal/e2e/scenarios/notify '^TestNotifySQLite' 'TestNotifySQLiteUnknownBacklogDoesNotHideNewFinal,TestNotifySQLiteAcceptedCardCrashDoesNotRetry' 3
+    run_tests ./internal/e2e/scenarios/entry '^TestStatusRunningInstalledAndLastPoll$' 'TestStatusRunningInstalledAndLastPoll' 3
+    run_tests ./internal/e2e/scenarios/commands '^TestSkills' 'TestSkillsPushFromTeams,TestSkillsSQLiteLegacyUpgradeFromCLI' 3
+    run_tests ./internal/e2e/scenarios/delegation '^TestDelegationSQLiteMigration' 'TestDelegationSQLiteMigrationPreservesUnknownPOST' 3
+    run_tests ./internal/e2e/scenarios/entry '^Test(EntryMigration|EntryWatchdogRuntime|EntryTypedSQLite)' 'TestEntryTypedSQLiteUpgradePreservesAttemptedNotice,TestEntryMigrationPreservesChatWithStoppedWatchdog,TestEntryMigrationResumesAfterInterruptedStart,TestEntryMigrationResumesAfterCrashDuringImport,TestEntryMigrationTakeoverFencesWaitingOwner,TestEntryMigrationTakeoverFencesImporter,TestEntryWatchdogRuntimeUpgradeAndRollback,TestEntryWatchdogRuntimeLegacyLauncher,TestEntryMigrationRefusesMissingPublishedDatabase,TestEntryMigrationRefusesEmptyPublishedDatabase' 3
     ;;
   *)
     echo "usage: $0 [unit|e2e]" >&2

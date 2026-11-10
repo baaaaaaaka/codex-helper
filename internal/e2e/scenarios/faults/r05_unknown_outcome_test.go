@@ -19,8 +19,8 @@ import (
 // answered: the ambiguous row is settled from the read-back marker or held
 // without blocking later work forever).
 //
-// The dropped-before-accept case (Graph never stores it) is R-5b: per the
-// owner decision the absent final is read back and sent again once.
+// The dropped-before-accept case (Graph never stores it) is R-5b: the absent
+// final remains retained without being sent again.
 func TestR05_LostResponseNeverReposted(t *testing.T) {
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "R-5", harness.Options{

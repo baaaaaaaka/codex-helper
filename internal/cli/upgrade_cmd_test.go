@@ -849,7 +849,7 @@ func TestFinalizeHelperUpdateResultRejectsStableDispatcherThatReactivatesOlderRu
 	}
 	quotedRoot := strings.ReplaceAll(root, "'", "'\\''")
 	stableScript := "#!/bin/sh\n" +
-		"printf 'v1.2.3\\n' > '" + quotedRoot + "/active'\n" +
+		"python3 -c 'import sqlite3,sys; d=sqlite3.connect(sys.argv[1]); d.execute(\"UPDATE boot SET good=?\",(\"v1.2.3\",)); d.commit()' '" + quotedRoot + "/boot.sqlite'\n" +
 		"echo 'codex-proxy version 1.2.3 (old dispatcher)'\n"
 	writeCLIFile(t, installPath, stableScript, 0o755)
 	writeCLIFile(t, runtimePath, upgradeCXPShimTestScript("1.2.4"), 0o755)
@@ -2548,7 +2548,7 @@ func TestScheduleDelayedTeamsServiceStartUsesWindowsPendingActivation(t *testing
 		teamsServiceWindowsWatchdogTaskName,
 		teamsServiceWindowsTaskName,
 		"$want='1.2.3'",
-		".activation.json",
+		"--cxp-record-activation",
 		"Move-Item -Force",
 		"if (Test-DestVersion) { $ready=$true }",
 		"Write-Status 'failed'",
@@ -2605,7 +2605,7 @@ func TestUpgradeFinalizerRefreshesWindowsServiceBeforePendingActivation(t *testi
 		}
 	}
 	activation := strings.Join(detachedArgs, " ")
-	for _, want := range []string{pending, exe, ".activation.json", "Move-Item -Force", "Write-Status 'failed'", "Enable-ScheduledTask", "Start-CodexHelperScheduledTaskIfStopped"} {
+	for _, want := range []string{pending, exe, "--cxp-record-activation", "Move-Item -Force", "Write-Status 'failed'", "Enable-ScheduledTask", "Start-CodexHelperScheduledTaskIfStopped"} {
 		if !strings.Contains(activation, want) {
 			t.Fatalf("activation command missing %q:\n%s", want, activation)
 		}

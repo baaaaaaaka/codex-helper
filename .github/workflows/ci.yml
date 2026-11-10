@@ -281,8 +281,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go test -race -count=1 -timeout=5m ./internal/helperruntime -run '^TestVersionPointer' 2>&1 | tee "$RUNNER_TEMP/race-runtime-pointers.log"
-          go test -race -count=1 -timeout=5m ./internal/cli -run '^Test(LegacyTeamsWatchdogHandoff|TeamsCoreStore|FirstStart|TeamsServiceWatchdog|RunTeamsServiceWatchdog)' 2>&1 | tee "$RUNNER_TEMP/race-teams-startup.log"
+          go test -race -count=1 -timeout=5m ./internal/helperruntime -run '^Test(VersionPointer|SQLiteBootstrap)' 2>&1 | tee "$RUNNER_TEMP/race-runtime-pointers.log"
+          go test -race -count=1 -timeout=5m ./internal/cli -run '^Test(TeamsExchangeSQLite|TeamsStatusPublisher|ServiceSQLite|SupervisorSQLite|WindowsAppSQLite|LegacyTeamsWatchdogHandoff|TeamsCoreStore|FirstStart|TeamsServiceWatchdog|RunTeamsServiceWatchdog)' 2>&1 | tee "$RUNNER_TEMP/race-teams-startup.log"
 
       - name: E2E fake Codex queue race checks
         shell: bash

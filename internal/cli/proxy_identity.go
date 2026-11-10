@@ -34,32 +34,25 @@ func claimProxyInstance(store *config.Store, instanceID string, now time.Time, p
 	if store == nil {
 		return proxyBrokerIdentity{}, fmt.Errorf("claim proxy instance: nil store")
 	}
-	if err := store.Update(func(cfg *config.Config) error {
-		for i := range cfg.Instances {
-			inst := &cfg.Instances[i]
-			if inst.ID != instanceID {
-				continue
-			}
-			if inst.OwnerToken != "" && !manager.IsProxyOwnerLeaseStale(*inst, now, manager.DefaultProxyOwnerLease, processAlive) {
-				return manager.ErrInstanceOwnershipLost
-			}
-			if inst.BrokerID == "" {
-				inst.BrokerID = identity.BrokerID
-			}
-			inst.BrokerEpoch = identity.BrokerEpoch
-			inst.OwnerToken = identity.OwnerToken
-			inst.OwnerAcquiredAt = now
-			inst.OwnerLastSeenAt = now
-			inst.OwnerLeaseExpiresAt = now.Add(manager.DefaultProxyOwnerLease)
-			inst.DaemonPID = 0
-			// A stale daemon no longer owns its listeners. Do not ask the new
-			// owner to bind a port that may have been reused by another process.
-			inst.HTTPPort = 0
-			inst.SocksPort = 0
-			inst.LastSeenAt = now
-			return nil
+	if err := store.ChangeInstance(instanceID, func(inst *config.Instance) error {
+		if inst.OwnerToken != "" && !manager.IsProxyOwnerLeaseStale(*inst, now, manager.DefaultProxyOwnerLease, processAlive) {
+			return manager.ErrInstanceOwnershipLost
 		}
-		return fmt.Errorf("instance %q not found", instanceID)
+		if inst.BrokerID == "" {
+			inst.BrokerID = identity.BrokerID
+		}
+		inst.BrokerEpoch = identity.BrokerEpoch
+		inst.OwnerToken = identity.OwnerToken
+		inst.OwnerAcquiredAt = now
+		inst.OwnerLastSeenAt = now
+		inst.OwnerLeaseExpiresAt = now.Add(manager.DefaultProxyOwnerLease)
+		inst.DaemonPID = 0
+		// A stale daemon no longer owns its listeners. Do not ask the new
+		// owner to bind a port that may have been reused by another process.
+		inst.HTTPPort = 0
+		inst.SocksPort = 0
+		inst.LastSeenAt = now
+		return nil
 	}); err != nil {
 		return proxyBrokerIdentity{}, err
 	}

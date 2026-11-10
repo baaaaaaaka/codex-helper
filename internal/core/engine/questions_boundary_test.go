@@ -646,12 +646,21 @@ func TestQuestionAsyncControlReplySteersWithNativeEnvelope(t *testing.T) {
 }
 
 func TestQuestionDroppedBodyStillNotifiesWithoutResolvingRPC(t *testing.T) {
+	for _, unknown := range []bool{false, true} {
+		t.Run(fmt.Sprint("unknown=", unknown), func(t *testing.T) { testUnconfirmedQuestionBody(t, unknown) })
+	}
+}
+
+func testUnconfirmedQuestionBody(t *testing.T, unknown bool) {
 	a := newQuestionAgent()
 	n := &questionNotifier{}
 	r := newRig(t, func(c *Config) {
 		c.Agent, c.Notifier = a, n
 		c.Channel.(*channeltest.Fake).SendFault = func(_ string, p channel.Part) (bool, error) {
 			if strings.Contains(p.Body, "Question from Codex") {
+				if unknown {
+					return false, &channel.Ambiguous{Err: fmt.Errorf("response lost")}
+				}
 				return false, &channel.Rejected{Permanent: true, Err: fmt.Errorf("body rejected")}
 			}
 			return false, nil

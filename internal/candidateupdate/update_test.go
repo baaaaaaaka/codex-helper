@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,24 +15,8 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 	"github.com/baaaaaaaka/codex-helper/internal/managedinstall"
+	"github.com/baaaaaaaka/codex-helper/internal/updatestate"
 )
-
-func TestSupportsProtocolStartsAtRC36(t *testing.T) {
-	for _, tc := range []struct {
-		version string
-		want    bool
-	}{
-		{version: "v0.1.13-rc.35"},
-		{version: "0.1.13-rc.36", want: true},
-		{version: "v0.1.13-rc.37", want: true},
-		{version: "v0.1.13", want: true},
-		{version: "invalid"},
-	} {
-		if got := SupportsProtocol(tc.version); got != tc.want {
-			t.Fatalf("SupportsProtocol(%q) = %v, want %v", tc.version, got, tc.want)
-		}
-	}
-}
 
 func TestApplyRejectsCandidateHashMismatchBeforeWritingState(t *testing.T) {
 	dir := t.TempDir()
@@ -126,17 +111,14 @@ func TestApplyVerifiesPublishedRuntimeInsteadOfStableEntry(t *testing.T) {
 	}
 
 	previousCandidateExecutablePath := candidateExecutablePath
-	previousReplaceManagedStableEntry := replaceManagedStableEntryFn
 	t.Cleanup(func() {
 		candidateExecutablePath = previousCandidateExecutablePath
-		replaceManagedStableEntryFn = previousReplaceManagedStableEntry
 	})
 	candidateExecutablePath = func() (string, error) { return candidate, nil }
 	// This models a split install whose stable launcher is intentionally kept
 	// by the owner of the running process. Apply must still validate and return
 	// the newly published immutable runtime instead of rejecting its version
 	// because the preserved launcher reports the old stable version.
-	replaceManagedStableEntryFn = func(string, string, string, string, string) error { return nil }
 
 	result, err := Apply(context.Background(), Context{
 		Schema:          ProtocolVersion,
@@ -182,39 +164,42 @@ func TestSafeBootManualApplyPreservesBootstrapAndUsesSingleRecord(t *testing.T) 
 	if _, err := helperruntime.InstallVersion(root, entry, "v1.0.0", runtime.GOOS, false); err != nil {
 		t.Fatal(err)
 	}
-	boot := helperruntime.BootState{Schema: 1, Generation: 1, Good: "v1.0.0", Candidate: &helperruntime.BootCandidate{Version: "v3.0.0", SHA256: strings.Repeat("0", 64)}}
-	raw, _ := json.Marshal(boot)
-	if err := helperruntime.WriteAtomicState(root, helperruntime.BootFile, raw); err != nil {
+	if err := helperruntime.Activate(root, "v1.0.0"); err != nil {
+		t.Fatal(err)
+	}
+	hash, _ := fileSHA256(candidate)
+	current := helperruntime.Context{Root: root, EntryPath: entry, Version: "v1.0.0"}
+	if err := helperruntime.StageBootCandidate(context.Background(), current, "v1.0.0", 1, candidate, "v3.0.0", hash); err != nil {
 		t.Fatal(err)
 	}
 	before, _ := os.ReadFile(entry)
-	hash, _ := fileSHA256(candidate)
+	hash, _ = fileSHA256(candidate)
 	old := candidateExecutablePath
 	candidateExecutablePath = func() (string, error) { return candidate, nil }
 	t.Cleanup(func() { candidateExecutablePath = old })
-	result, err := Apply(context.Background(), Context{Schema: 1, CandidateSHA256: hash, SourceVersion: "v1.0.0", TargetVersion: "v2.0.0", RuntimeRoot: root, EntryPath: entry, RecordPath: filepath.Join(dir, "install.json"), RequestID: "safe-manual"}, "v2.0.0")
+	_, err := Apply(context.Background(), Context{Schema: 1, CandidateSHA256: hash, SourceVersion: "v1.0.0", TargetVersion: "v2.0.0", RuntimeRoot: root, EntryPath: entry, RecordPath: filepath.Join(dir, "install.json"), RequestID: "safe-manual"}, "v2.0.0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if after, _ := os.ReadFile(entry); !bytes.Equal(before, after) || result.stableEntryRepair != nil {
+	if after, _ := os.ReadFile(entry); !bytes.Equal(before, after) {
 		t.Fatal("manual update replaced the protected bootstrap")
 	}
 	got, err := helperruntime.ReadBoot(root)
-	if err != nil || got.Good != "v2.0.0" || got.Previous != "v1.0.0" || got.Candidate != nil || got.Generation != 2 {
+	if err != nil || got.Good != "v2.0.0" || got.Previous != "v1.0.0" || got.Candidate != nil || got.Generation != 3 {
 		t.Fatalf("%+v %v", got, err)
 	}
-	if _, err := os.Stat(filepath.Join(root, PendingFileName)); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(root, updatestate.Filename)); !os.IsNotExist(err) {
 		t.Fatalf("legacy pending marker was written: %v", err)
 	}
 	// Even a malformed pre-existing legacy marker cannot drive safe startup.
-	if err := os.WriteFile(filepath.Join(root, PendingFileName), []byte("{broken"), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "pending-update.json"), []byte("{broken"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv(helperruntime.EnvRuntime, "1")
 	t.Setenv(helperruntime.EnvRuntimeRoot, root)
 	t.Setenv(helperruntime.EnvRuntimeVersion, "v2.0.0")
 	t.Setenv(helperruntime.EnvEntryPath, entry)
-	if err := ResumePending(context.Background(), "v2.0.0"); err != nil {
+	if err := CheckNativeBootstrap(); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -256,7 +241,10 @@ func TestHandleInternalCommandAppliesCurrentCandidate(t *testing.T) {
 	entry := filepath.Join(dir, helperruntime.BinaryName(runtime.GOOS))
 	candidate := filepath.Join(dir, "candidate")
 	recordPath := filepath.Join(dir, "config", "install.json")
-	writeDynamicLauncher(t, entry, root)
+	writeVersionScript(t, entry, "1.0.0")
+	if err := helperruntime.Activate(root, "v1.0.0"); err != nil {
+		t.Fatal(err)
+	}
 	writeVersionScript(t, candidate, "9.8.7")
 	hash, err := fileSHA256(candidate)
 	if err != nil {
@@ -275,9 +263,8 @@ func TestHandleInternalCommandAppliesCurrentCandidate(t *testing.T) {
 		RecordPath:      recordPath,
 		RequestID:       "handler-request",
 	}
-	contextPath := filepath.Join(dir, "context.json")
-	data, _ := json.Marshal(request)
-	if err := os.WriteFile(contextPath, data, 0o600); err != nil {
+	contextPath, err := writeInvocationContext(candidate, request)
+	if err != nil {
 		t.Fatal(err)
 	}
 	var stdout bytes.Buffer
@@ -285,8 +272,9 @@ func TestHandleInternalCommandAppliesCurrentCandidate(t *testing.T) {
 	code, handled := HandleInternalCommand([]string{
 		"candidate",
 		InternalCommand,
-		"--protocol=1",
-		"--context-file=" + contextPath,
+		"--protocol=2",
+		"--state-db=" + contextPath,
+		"--request-id=" + request.RequestID,
 	}, "v9.8.7", &stdout, &stderr)
 	if !handled || code != 0 {
 		t.Fatalf("handled=%v code=%d stderr=%q", handled, code, stderr.String())
@@ -309,6 +297,9 @@ func TestReconcileInstallIsIdempotentAndTracksPrevious(t *testing.T) {
 	entry := filepath.Join(dir, helperruntime.BinaryName(runtime.GOOS))
 	recordPath := filepath.Join(dir, "config", "install.json")
 	writeDynamicLauncher(t, entry, root)
+	if err := helperruntime.Activate(root, "v0.9.0"); err != nil {
+		t.Fatal(err)
+	}
 
 	v1 := filepath.Join(dir, "candidate-v1")
 	writeExecutable(t, v1, "candidate-v1")
@@ -327,7 +318,7 @@ func TestReconcileInstallIsIdempotentAndTracksPrevious(t *testing.T) {
 		RequestID:       "request-v1",
 	}
 	if err := helperruntime.WithRootLock(context.Background(), root, func() error {
-		_, err := reconcileLocked(req1, v1, false)
+		_, err := reconcileLocked(req1, v1)
 		return err
 	}); err != nil {
 		t.Fatal(err)
@@ -356,16 +347,16 @@ func TestReconcileInstallIsIdempotentAndTracksPrevious(t *testing.T) {
 		RecordPath:      recordPath,
 		RequestID:       "request-v2",
 	}
-	apply := func(resuming bool, source string) error {
+	apply := func(source string) error {
 		return helperruntime.WithRootLock(context.Background(), root, func() error {
-			_, err := reconcileLocked(req2, source, resuming)
+			_, err := reconcileLocked(req2, source)
 			return err
 		})
 	}
-	if err := apply(false, v2); err != nil {
+	if err := apply(v2); err != nil {
 		t.Fatal(err)
 	}
-	if err := apply(true, helperruntime.VersionPath(root, "v2.0.0", runtime.GOOS)); err != nil {
+	if err := apply(helperruntime.VersionPath(root, "v2.0.0", runtime.GOOS)); err != nil {
 		t.Fatalf("idempotent reconcile: %v", err)
 	}
 	if active, err := helperruntime.ReadActive(root); err != nil || active != "v2.0.0" {
@@ -381,12 +372,12 @@ func TestReconcileInstallIsIdempotentAndTracksPrevious(t *testing.T) {
 	if record.Version != "2.0.0" {
 		t.Fatalf("record version = %q", record.Version)
 	}
-	if _, err := os.Stat(filepath.Join(root, PendingFileName)); err != nil {
-		t.Fatalf("pending update missing before startup recovery: %v", err)
+	if _, err := os.Stat(filepath.Join(root, updatestate.Filename)); !os.IsNotExist(err) {
+		t.Fatalf("native update created obsolete pending intent: %v", err)
 	}
 }
 
-func TestReconcileRefreshesManagedStableEntryAndPreservesShim(t *testing.T) {
+func TestReconcilePreservesBootstrapAndShim(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("symlink topology is covered by native Windows CI")
 	}
@@ -423,7 +414,7 @@ func TestReconcileRefreshesManagedStableEntryAndPreservesShim(t *testing.T) {
 		RequestID:       "managed-entry-refresh",
 	}
 	if err := helperruntime.WithRootLock(context.Background(), root, func() error {
-		_, err := reconcileLocked(request, candidate, false)
+		_, err := reconcileLocked(request, candidate)
 		return err
 	}); err != nil {
 		t.Fatal(err)
@@ -431,7 +422,7 @@ func TestReconcileRefreshesManagedStableEntryAndPreservesShim(t *testing.T) {
 	if link, err := os.Readlink(entry); err != nil || link != filepath.Base(canonical) {
 		t.Fatalf("stable shim changed: %q, %v", link, err)
 	}
-	if data, err := os.ReadFile(canonical); err != nil || string(data) != "new-runtime" {
+	if data, err := os.ReadFile(canonical); err != nil || string(data) != "old-runtime" {
 		t.Fatalf("managed stable target = %q, %v", data, err)
 	}
 	if active, err := helperruntime.ReadActive(root); err != nil || active != "v0.1.14-rc.19" {
@@ -442,7 +433,7 @@ func TestReconcileRefreshesManagedStableEntryAndPreservesShim(t *testing.T) {
 	}
 }
 
-func TestReconcileRefreshesManagedStableEntry(t *testing.T) {
+func TestReconcilePreservesBootstrap(t *testing.T) {
 	dir := t.TempDir()
 	root := filepath.Join(dir, ".cxp-runtime")
 	entry := filepath.Join(dir, helperruntime.BinaryName(runtime.GOOS))
@@ -472,12 +463,12 @@ func TestReconcileRefreshesManagedStableEntry(t *testing.T) {
 		RequestID:       "managed-entry-refresh-regular",
 	}
 	if err := helperruntime.WithRootLock(context.Background(), root, func() error {
-		_, err := reconcileLocked(request, candidate, false)
+		_, err := reconcileLocked(request, candidate)
 		return err
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if data, err := os.ReadFile(entry); err != nil || string(data) != "new-runtime" {
+	if data, err := os.ReadFile(entry); err != nil || string(data) != "old-runtime" {
 		t.Fatalf("managed stable entry = %q, %v", data, err)
 	}
 	if active, err := helperruntime.ReadActive(root); err != nil || active != "v0.1.14-rc.19" {
@@ -485,13 +476,13 @@ func TestReconcileRefreshesManagedStableEntry(t *testing.T) {
 	}
 }
 
-func TestReconcileRefusesUnmanagedStableEntryBeforeActivation(t *testing.T) {
+func TestReconcileRequiresPresentBootstrapBeforeActivation(t *testing.T) {
 	dir := t.TempDir()
 	root := filepath.Join(dir, ".cxp-runtime")
 	entry := filepath.Join(dir, helperruntime.BinaryName(runtime.GOOS))
 	oldRuntime := filepath.Join(dir, "old-runtime")
 	candidate := filepath.Join(dir, "candidate")
-	writeExecutable(t, entry, "unrelated-entry")
+	// A missing dispatcher requires the explicit installer.
 	writeExecutable(t, oldRuntime, "old-runtime")
 	writeExecutable(t, candidate, "new-runtime")
 	if _, err := helperruntime.InstallVersion(root, oldRuntime, "v0.1.14", runtime.GOOS, false); err != nil {
@@ -514,17 +505,17 @@ func TestReconcileRefusesUnmanagedStableEntryBeforeActivation(t *testing.T) {
 			EntryPath:       entry,
 			RecordPath:      filepath.Join(dir, "install.json"),
 			RequestID:       "unmanaged-entry",
-		}, candidate, false)
+		}, candidate)
 		return err
 	})
-	if err == nil || !strings.Contains(err.Error(), "does not match") {
+	if err == nil || !strings.Contains(err.Error(), "safe boot entry") {
 		t.Fatalf("reconcile error = %v, want managed-entry refusal", err)
 	}
 	if active, readErr := helperruntime.ReadActive(root); readErr != nil || active != "v0.1.14" {
 		t.Fatalf("active runtime changed after refusal: %q, %v", active, readErr)
 	}
-	if data, readErr := os.ReadFile(entry); readErr != nil || string(data) != "unrelated-entry" {
-		t.Fatalf("unmanaged entry changed: %q, %v", data, readErr)
+	if _, readErr := os.Stat(entry); !os.IsNotExist(readErr) {
+		t.Fatal("created missing entry", readErr)
 	}
 }
 
@@ -557,7 +548,7 @@ func TestReconcileRejectsStaleSourceAfterConcurrentActivation(t *testing.T) {
 		RequestID:       "stale-source",
 	}
 	err = helperruntime.WithRootLock(context.Background(), root, func() error {
-		_, reconcileErr := reconcileLocked(request, candidate, false)
+		_, reconcileErr := reconcileLocked(request, candidate)
 		return reconcileErr
 	})
 	if err == nil || !strings.Contains(err.Error(), "active runtime changed") {
@@ -569,7 +560,7 @@ func TestReconcileRejectsStaleSourceAfterConcurrentActivation(t *testing.T) {
 	if _, statErr := os.Stat(helperruntime.VersionPath(root, "v3.0.0", runtime.GOOS)); !os.IsNotExist(statErr) {
 		t.Fatalf("stale candidate was published: %v", statErr)
 	}
-	if _, statErr := os.Stat(filepath.Join(root, PendingFileName)); !os.IsNotExist(statErr) {
+	if _, statErr := os.Stat(filepath.Join(root, updatestate.Filename)); !os.IsNotExist(statErr) {
 		t.Fatalf("stale candidate wrote pending state: %v", statErr)
 	}
 }
@@ -594,10 +585,10 @@ func TestReconcileRejectsDisappearedSourceRuntime(t *testing.T) {
 		RequestID:       "missing-source",
 	}
 	err = helperruntime.WithRootLock(context.Background(), root, func() error {
-		_, reconcileErr := reconcileLocked(request, candidate, false)
+		_, reconcileErr := reconcileLocked(request, candidate)
 		return reconcileErr
 	})
-	if err == nil || !strings.Contains(err.Error(), "disappeared") {
+	if err == nil || !errors.Is(err, helperruntime.ErrBootstrapState) {
 		t.Fatalf("error = %v", err)
 	}
 	if _, statErr := os.Stat(helperruntime.VersionPath(root, "v2.0.0", runtime.GOOS)); !os.IsNotExist(statErr) {
@@ -605,246 +596,58 @@ func TestReconcileRejectsDisappearedSourceRuntime(t *testing.T) {
 	}
 }
 
-func TestResumePendingRemovesMarkerAfterConvergence(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("POSIX launcher fixture")
-	}
-	dir := t.TempDir()
-	root := filepath.Join(dir, ".cxp-runtime")
-	entry := filepath.Join(dir, helperruntime.BinaryName(runtime.GOOS))
-	recordPath := filepath.Join(dir, "config", "install.json")
-	writeDynamicLauncher(t, entry, root)
-	source := filepath.Join(dir, "candidate")
-	writeExecutable(t, source, "candidate")
-	hash, _ := fileSHA256(source)
-	request := Context{
-		Schema:          ProtocolVersion,
-		CandidatePath:   source,
-		CandidateSHA256: hash,
-		TargetVersion:   "v2.0.0",
-		RuntimeRoot:     root,
-		EntryPath:       entry,
-		RecordPath:      recordPath,
-		RequestID:       "resume-request",
-	}
-	if err := helperruntime.WithRootLock(context.Background(), root, func() error {
-		_, err := reconcileLocked(request, source, false)
-		return err
-	}); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv(helperruntime.EnvRuntime, "1")
-	t.Setenv(helperruntime.EnvRuntimeRoot, root)
-	t.Setenv(helperruntime.EnvRuntimeVersion, "v2.0.0")
-	t.Setenv(helperruntime.EnvEntryPath, entry)
-	if err := ResumePending(context.Background(), "v2.0.0"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(filepath.Join(root, PendingFileName)); !os.IsNotExist(err) {
-		t.Fatalf("pending marker still exists: %v", err)
-	}
-}
-
-func TestResumePendingPreviousRuntimeCompletesPublishBeforeActivationCrash(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("POSIX launcher fixture")
-	}
-	dir := t.TempDir()
-	root := filepath.Join(dir, ".cxp-runtime")
-	entry := filepath.Join(dir, helperruntime.BinaryName(runtime.GOOS))
-	recordPath := filepath.Join(dir, "config", "install.json")
-	writeDynamicLauncher(t, entry, root)
-	v1 := filepath.Join(dir, "v1")
-	v2 := filepath.Join(dir, "v2")
-	writeExecutable(t, v1, "v1")
-	writeExecutable(t, v2, "v2")
-	if _, err := helperruntime.InstallVersion(root, v1, "v1.0.0", runtime.GOOS, false); err != nil {
-		t.Fatal(err)
-	}
-	target, err := helperruntime.InstallVersion(root, v2, "v2.0.0", runtime.GOOS, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := helperruntime.Activate(root, "v1.0.0"); err != nil {
-		t.Fatal(err)
-	}
-	hash, _ := fileSHA256(target)
-	if err := writePending(filepath.Join(root, PendingFileName), Pending{
-		Schema:         ProtocolVersion,
-		TargetVersion:  "v2.0.0",
-		TargetSHA256:   hash,
-		PreviousActive: "v1.0.0",
-		TargetActive:   target,
-		RuntimeRoot:    root,
-		EntryPath:      entry,
-		RecordPath:     recordPath,
-		RequestID:      "publish-before-activate",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(entry, []byte("v1"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv(helperruntime.EnvRuntime, "1")
-	t.Setenv(helperruntime.EnvRuntimeRoot, root)
-	t.Setenv(helperruntime.EnvRuntimeVersion, "v1.0.0")
-	t.Setenv(helperruntime.EnvEntryPath, entry)
-	if err := ResumePending(context.Background(), "v1.0.0"); err != nil {
-		t.Fatal(err)
-	}
-	if active, err := helperruntime.ReadActive(root); err != nil || active != "v2.0.0" {
-		t.Fatalf("active = %q, %v", active, err)
-	}
-	if previous, err := helperruntime.ReadPrevious(root); err != nil || previous != "v1.0.0" {
-		t.Fatalf("previous = %q, %v", previous, err)
-	}
-	if _, err := os.Stat(filepath.Join(root, PendingFileName)); !os.IsNotExist(err) {
-		t.Fatalf("pending marker still exists: %v", err)
-	}
-}
-
-func TestResumePendingRepairsStableEntryAfterTargetAlreadyActive(t *testing.T) {
-	dir := t.TempDir()
-	root := filepath.Join(dir, ".cxp-runtime")
-	entry := filepath.Join(dir, helperruntime.BinaryName(runtime.GOOS))
-	recordPath := filepath.Join(dir, "config", "install.json")
-	v1 := filepath.Join(dir, "v1")
-	v2 := filepath.Join(dir, "v2")
-	writeExecutable(t, v1, "v1")
-	writeExecutable(t, v2, "v2")
-	if _, err := helperruntime.InstallVersion(root, v1, "v1.0.0", runtime.GOOS, false); err != nil {
-		t.Fatal(err)
-	}
-	target, err := helperruntime.InstallVersion(root, v2, "v2.0.0", runtime.GOOS, false)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := helperruntime.Activate(root, "v2.0.0"); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(entry, []byte("v1"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	hash, err := fileSHA256(target)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := writePending(filepath.Join(root, PendingFileName), Pending{
-		Schema:         ProtocolVersion,
-		TargetVersion:  "v2.0.0",
-		TargetSHA256:   hash,
-		PreviousActive: "v1.0.0",
-		TargetActive:   target,
-		RuntimeRoot:    root,
-		EntryPath:      entry,
-		RecordPath:     recordPath,
-		RequestID:      "stable-entry-repair-after-activation",
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	t.Setenv(helperruntime.EnvRuntime, "1")
-	t.Setenv(helperruntime.EnvRuntimeRoot, root)
-	t.Setenv(helperruntime.EnvRuntimeVersion, "v2.0.0")
-	t.Setenv(helperruntime.EnvEntryPath, entry)
-	if err := ResumePending(context.Background(), "v2.0.0"); err != nil {
-		t.Fatal(err)
-	}
-	wantEntry := "v2"
-	if runtime.GOOS == "windows" {
-		// A legacy Windows candidate can still be a child of the old launcher;
-		// ResumePending must not rewrite that parent-owned entry.
-		wantEntry = "v1"
-	}
-	if data, err := os.ReadFile(entry); err != nil || string(data) != wantEntry {
-		t.Fatalf("stable entry = %q, %v; want %q", data, err, wantEntry)
-	}
-	if active, err := helperruntime.ReadActive(root); err != nil || active != "v2.0.0" {
-		t.Fatalf("active = %q, %v", active, err)
-	}
-	if _, err := os.Stat(filepath.Join(root, PendingFileName)); !os.IsNotExist(err) {
-		t.Fatalf("pending marker still exists: %v", err)
-	}
-}
-
-func TestResumePendingRejectsMissingPublishedTarget(t *testing.T) {
-	dir := t.TempDir()
-	root := filepath.Join(dir, ".cxp-runtime")
-	entry := filepath.Join(dir, helperruntime.BinaryName(runtime.GOOS))
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := helperruntime.Activate(root, "v1.0.0"); err != nil {
-		t.Fatal(err)
-	}
-	pendingPath := filepath.Join(root, PendingFileName)
-	if err := writePending(pendingPath, Pending{
-		Schema:         ProtocolVersion,
-		TargetVersion:  "v2.0.0",
-		TargetSHA256:   strings.Repeat("a", 64),
-		PreviousActive: "v1.0.0",
-		TargetActive:   helperruntime.VersionPath(root, "v2.0.0", runtime.GOOS),
-		RuntimeRoot:    root,
-		EntryPath:      entry,
-		RequestID:      "missing-target",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv(helperruntime.EnvRuntime, "1")
-	t.Setenv(helperruntime.EnvRuntimeRoot, root)
-	t.Setenv(helperruntime.EnvRuntimeVersion, "v1.0.0")
-	t.Setenv(helperruntime.EnvEntryPath, entry)
-	err := ResumePending(context.Background(), "v1.0.0")
-	if err == nil || !strings.Contains(err.Error(), "hash pending update target") {
-		t.Fatalf("error = %v", err)
-	}
-	if active, readErr := helperruntime.ReadActive(root); readErr != nil || active != "v1.0.0" {
-		t.Fatalf("active = %q, %v", active, readErr)
-	}
-	if _, statErr := os.Stat(pendingPath); statErr != nil {
-		t.Fatalf("pending recovery state was removed after failure: %v", statErr)
-	}
-}
-
-func TestResumePendingRejectsUnsafePermissions(t *testing.T) {
-	dir := t.TempDir()
-	root := filepath.Join(dir, ".cxp-runtime")
-	entry := filepath.Join(dir, helperruntime.BinaryName(runtime.GOOS))
-	if err := os.MkdirAll(root, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	pendingPath := filepath.Join(root, PendingFileName)
-	if err := os.WriteFile(pendingPath, []byte(`{"schema":1}`), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv(helperruntime.EnvRuntime, "1")
-	t.Setenv(helperruntime.EnvRuntimeRoot, root)
-	t.Setenv(helperruntime.EnvRuntimeVersion, "v2.0.0")
-	t.Setenv(helperruntime.EnvEntryPath, entry)
-	err := ResumePending(context.Background(), "v2.0.0")
-	if runtime.GOOS != "windows" {
-		if err == nil || !strings.Contains(err.Error(), "permissions") {
-			t.Fatalf("error = %v", err)
-		}
-	}
-}
-
-func TestWritePendingAtomicallyReplacesExistingState(t *testing.T) {
-	path := filepath.Join(t.TempDir(), PendingFileName)
-	first := Pending{Schema: ProtocolVersion, TargetVersion: "v1.0.0", RequestID: "first"}
-	second := Pending{Schema: ProtocolVersion, TargetVersion: "v2.0.0", RequestID: "second"}
-	if err := writePending(path, first); err != nil {
-		t.Fatal(err)
-	}
-	if err := writePending(path, second); err != nil {
-		t.Fatal(err)
-	}
-	got, err := readPending(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.RequestID != "second" || got.TargetVersion != "v2.0.0" {
-		t.Fatalf("pending = %#v", got)
+func TestSafeBootNeverReplaysLegacyPending(t *testing.T) {
+	for _, mode := range []string{"unpublished-target", "already-active", "corrupt-intent", "lost-native"} {
+		t.Run(mode, func(t *testing.T) {
+			dir := t.TempDir()
+			root := filepath.Join(dir, ".cxp-runtime")
+			entry := filepath.Join(dir, helperruntime.BinaryName(runtime.GOOS))
+			if err := helperruntime.Activate(root, "v1.0.0"); err != nil {
+				t.Fatal(err)
+			}
+			if mode == "already-active" {
+				if err := helperruntime.Activate(root, "v2.0.0"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before, _ := os.ReadFile(filepath.Join(root, helperruntime.BootFile))
+			legacy := []byte(`{"schema":1,"target_version":"v2.0.0","previous_active":"v1.0.0","request_id":"old-in-flight"}`)
+			if mode == "corrupt-intent" {
+				legacy = []byte("{broken")
+			}
+			path := filepath.Join(root, "pending-update.json")
+			if err := os.WriteFile(path, legacy, 0644); err != nil {
+				t.Fatal(err)
+			}
+			if mode == "lost-native" {
+				if err := os.Remove(filepath.Join(root, helperruntime.BootFile)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			t.Setenv(helperruntime.EnvRuntime, "1")
+			t.Setenv(helperruntime.EnvRuntimeRoot, root)
+			t.Setenv(helperruntime.EnvRuntimeVersion, "v1.0.0")
+			t.Setenv(helperruntime.EnvEntryPath, entry)
+			err := CheckNativeBootstrap()
+			if mode == "lost-native" {
+				if !errors.Is(err, helperruntime.ErrBootstrapState) {
+					t.Fatal(err)
+				}
+			} else {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if after, _ := os.ReadFile(filepath.Join(root, helperruntime.BootFile)); !bytes.Equal(before, after) {
+					t.Fatal("legacy intent changed native selection")
+				}
+			}
+			if got, _ := os.ReadFile(path); !bytes.Equal(got, legacy) {
+				t.Fatal("changed legacy evidence during startup")
+			}
+			if _, err := os.Stat(filepath.Join(root, updatestate.Filename)); !os.IsNotExist(err) {
+				t.Fatal("startup created update database")
+			}
+		})
 	}
 }
 
@@ -889,185 +692,6 @@ func TestSamePathResolvesMultiHopRuntimeSymlinks(t *testing.T) {
 	}
 }
 
-func TestLegacyRuntimeNeedsBridgeUsesExactAffectedRange(t *testing.T) {
-	for _, tc := range []struct {
-		version string
-		want    bool
-	}{
-		{version: "v0.1.13-rc.27"},
-		{version: "v0.1.13-rc.28", want: true},
-		{version: "v0.1.13-rc.31", want: true},
-		{version: "v0.1.13-rc.35", want: true},
-		{version: "v0.1.13-rc.36"},
-		{version: "v0.1.13"},
-	} {
-		if got := legacyRuntimeNeedsBridge(tc.version); got != tc.want {
-			t.Fatalf("legacyRuntimeNeedsBridge(%q) = %v, want %v", tc.version, got, tc.want)
-		}
-	}
-}
-
-func TestLegacyBridgeOwnsOnlyCurrentRuntimeCandidate(t *testing.T) {
-	root := filepath.Join(t.TempDir(), ".cxp-runtime")
-	current := helperruntime.Context{Root: root}
-	targetVersion := "v0.1.13-rc.39"
-	expectedDir := filepath.Dir(helperruntime.VersionPath(root, targetVersion, runtime.GOOS))
-	owned := filepath.Join(expectedDir, ".codex-proxy_0.1.13-rc.39_candidate")
-	external := filepath.Join(filepath.Dir(root), "managed", ".codex-proxy_0.1.13-rc.39_candidate")
-
-	if !legacyBridgeOwnsCandidate(current, targetVersion, owned) {
-		t.Fatalf("candidate in current immutable runtime directory should be bridge-owned: %s", owned)
-	}
-	if legacyBridgeOwnsCandidate(current, targetVersion, external) {
-		t.Fatalf("candidate for an external install target must not mutate current runtime: %s", external)
-	}
-}
-
-func TestDetachLegacyExternalCandidateRuntimePreventsDispatchAndResume(t *testing.T) {
-	root := filepath.Join(t.TempDir(), ".cxp-runtime")
-	t.Setenv(helperruntime.EnvRuntime, "1")
-	t.Setenv(helperruntime.EnvRuntimeRoot, root)
-	t.Setenv(helperruntime.EnvRuntimeVersion, "v0.1.13-rc.31")
-	t.Setenv(helperruntime.EnvEntryPath, filepath.Join(t.TempDir(), "cxp"))
-	t.Setenv(helperruntime.EnvForce, "1")
-	t.Setenv(helperruntime.EnvDisable, "")
-
-	if _, ok := helperruntime.Current(); !ok {
-		t.Fatal("test runtime context was not active before detach")
-	}
-	if err := detachLegacyExternalCandidateRuntime(); err != nil {
-		t.Fatalf("detach external candidate: %v", err)
-	}
-	if _, ok := helperruntime.Current(); ok {
-		t.Fatal("external candidate retained current runtime identity")
-	}
-	if got := os.Getenv(helperruntime.EnvDisable); got != "1" {
-		t.Fatalf("runtime disable = %q, want 1", got)
-	}
-	for _, name := range []string{
-		helperruntime.EnvRuntime,
-		helperruntime.EnvRuntimeRoot,
-		helperruntime.EnvRuntimeVersion,
-		helperruntime.EnvEntryPath,
-		helperruntime.EnvForce,
-	} {
-		if value, ok := os.LookupEnv(name); ok {
-			t.Fatalf("%s remained set to %q after detach", name, value)
-		}
-	}
-}
-
-func TestStableReplacementTargetPreservesManagedSymlinkLeaf(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("symlink fixture")
-	}
-	dir := t.TempDir()
-	root := filepath.Join(dir, ".cxp-runtime")
-	running := filepath.Join(root, "versions", "v0.1.13-rc.31", "cxp")
-	managed := filepath.Join(dir, "managed-launcher")
-	entry := filepath.Join(dir, "cxp")
-	if err := os.MkdirAll(filepath.Dir(running), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	writeExecutable(t, running, "old-runtime")
-	writeExecutable(t, managed, "old-runtime")
-	if err := os.Symlink(filepath.Base(managed), entry); err != nil {
-		t.Fatal(err)
-	}
-	target, expectedHash, err := legacyStableReplacementTarget(entry, running, root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !samePath(target, managed) {
-		t.Fatalf("target = %q, want %q", target, managed)
-	}
-	newCandidate := filepath.Join(dir, "candidate")
-	writeExecutable(t, newCandidate, "new-runtime")
-	if err := copyExecutableAtomically(newCandidate, target, expectedHash); err != nil {
-		t.Fatal(err)
-	}
-	if link, err := os.Readlink(entry); err != nil || link != filepath.Base(managed) {
-		t.Fatalf("entry symlink changed: %q, %v", link, err)
-	}
-	data, err := os.ReadFile(managed)
-	if err != nil || string(data) != "new-runtime" {
-		t.Fatalf("managed launcher = %q, %v", data, err)
-	}
-}
-
-func TestStableReplacementTargetRejectsImmutableRuntimeSymlink(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("symlink fixture")
-	}
-	dir := t.TempDir()
-	root := filepath.Join(dir, ".cxp-runtime")
-	running := filepath.Join(root, "versions", "v0.1.13-rc.31", "cxp")
-	entry := filepath.Join(dir, "cxp")
-	if err := os.MkdirAll(filepath.Dir(running), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	writeExecutable(t, running, "old-runtime")
-	if err := os.Symlink(running, entry); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := legacyStableReplacementTarget(entry, running, root); err == nil || !strings.Contains(err.Error(), "immutable runtime") {
-		t.Fatalf("error = %v", err)
-	}
-}
-
-func TestStableReplacementTargetRejectsImmutableRuntimeThroughSymlinkedRoot(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("symlink fixture")
-	}
-	dir := t.TempDir()
-	storage := filepath.Join(dir, "runtime-storage")
-	root := filepath.Join(dir, "install", ".cxp-runtime")
-	running := filepath.Join(root, "versions", "v0.1.13-rc.31", "cxp")
-	physicalRunning := filepath.Join(storage, "versions", "v0.1.13-rc.31", "cxp")
-	entry := filepath.Join(dir, "install", "cxp")
-	if err := os.MkdirAll(filepath.Dir(physicalRunning), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.MkdirAll(filepath.Dir(root), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(storage, root); err != nil {
-		t.Fatal(err)
-	}
-	writeExecutable(t, physicalRunning, "old-runtime")
-	if err := os.Symlink(physicalRunning, entry); err != nil {
-		t.Fatal(err)
-	}
-	if _, _, err := legacyStableReplacementTarget(entry, running, root); err == nil || !strings.Contains(err.Error(), "immutable runtime") {
-		t.Fatalf("error = %v", err)
-	}
-}
-
-func TestStableReplacementRejectsTargetChangedAfterValidation(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("POSIX replacement fixture")
-	}
-	dir := t.TempDir()
-	root := filepath.Join(dir, ".cxp-runtime")
-	running := filepath.Join(root, "versions", "v0.1.13-rc.31", "cxp")
-	entry := filepath.Join(dir, "cxp")
-	if err := os.MkdirAll(filepath.Dir(running), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	writeExecutable(t, running, "old-runtime")
-	writeExecutable(t, entry, "old-runtime")
-	target, expectedHash, err := legacyStableReplacementTarget(entry, running, root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	writeExecutable(t, entry, "changed-runtime")
-	candidate := filepath.Join(dir, "candidate")
-	writeExecutable(t, candidate, "new-runtime")
-	if err := copyExecutableAtomically(candidate, target, expectedHash); err == nil || !strings.Contains(err.Error(), "changed") {
-		t.Fatalf("error = %v", err)
-	}
-}
-
 func writeDynamicLauncher(t *testing.T, path string, root string) {
 	t.Helper()
 	quotedRoot := strings.ReplaceAll(root, "'", "'\\''")
@@ -1080,6 +704,7 @@ func writeDynamicLauncher(t *testing.T, path string, root string) {
 func writeVersionScript(t *testing.T, path string, version string) {
 	t.Helper()
 	script := "#!/bin/sh\n" +
+		"if [ \"${1-}\" = \"--cxp-boot-protocol\" ]; then echo 2; exit 0; fi\n" +
 		"if [ \"${1-}\" = \"--version\" ]; then\n" +
 		"  echo 'codex-proxy version " + version + "'\n" +
 		"  exit 0\n" +

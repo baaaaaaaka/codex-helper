@@ -23,8 +23,9 @@ parts after preceding progress and before subsequent source records. Identities,
 files, and payloads stay unchanged. Committing the terminal wakes delivery even
 when it contains no progress, without waiting for a maintenance tick.
 Restart restores the hold without executing
-the completed task again. A next native task in the same chat still waits behind
-pending substantive output, as before.
+the completed task again. A next native task in the same chat waits behind
+substantive output still queued or sending. Unknown outcomes remain available
+for reconciliation.
 If a terminal is visible before the runner stores its outcome, the reader waits
 at that boundary; subsequent local turns cannot pass the unfinished final.
 The source cursor and all output parts commit in the same transaction. A failed
@@ -64,17 +65,23 @@ Echo detection uses the actual combined transport hash, not hashes of member
 messages that were never sent individually.
 
 There is no merge timer, second durable queue, or independent send budget.
-Within a chat, later content cannot pass an unknown head. Other chats keep
-their own send slots. After eight foreground slots, an aged catch-up head can
-obtain a paced slot, so continuous live traffic does not starve catch-up.
+Within a chat, queued and sending content keeps its order. Unknown outcomes
+retain their complete content and attempt identity without blocking later
+sends or tasks. A delayed remote acceptance may become visible out of order;
+the helper never replays an unknown POST to repair that uncertainty. Other
+chats keep their own send slots. After eight foreground slots, an aged catch-up
+head can obtain a paced slot, so continuous live traffic does not starve catch-up.
 
 ## Uncertain external delivery
 
 A connection failure after POST cannot establish whether Teams accepted it.
 Absence from a later listing is also not proof of rejection. Substantive
-content therefore stays unknown, with one control warning and low-rate
-read-back. It is neither blindly resent nor silently discarded. A later
-matching marker or transport hash can settle the whole batch.
+content therefore stays unknown, with one durable control warning per
+uncertain transport and low-rate read-back. Unknown rows are excluded from
+active delivery backpressure, other notifications' waits and automatic parking waits.
+The content is neither blindly resent nor silently discarded. A later matching
+marker or transport hash can settle the whole batch. An "answer ready" notice
+waits only for its own final to be confirmed; later notifications can continue.
 An explicit rejection received during shutdown still returns the attempt to
 the retry queue; cancellation alone cannot turn a known 429 into an unknown send.
 
@@ -137,16 +144,18 @@ These are measurements on this machine, not transport throughput guarantees.
 
 - Store: atomic batch rollback, immutable retry, whole-batch settlement,
   missing split parts, legacy aliases, echo identity, bounded batch selection,
-  migration defaults and disk growth, and indexed hot queries.
+  migration defaults and disk growth, indexed hot queries, and read-only active
+  scheduling with 100,000 retained unknown rows.
 - Transcript: selective ownership, client identity before native callbacks,
   unphased look-behind, and fallback identities through unrelated line shifts.
 - Engine: 120 progress records under throttle and group mode, restart without
   duplicates, pre-callback rollout writes, pre-acceptance restart, source binding
   races, uncertain sends with late read-back, local-state retries, and visible
-  silence-clock reset while Codex emits activity. A 1,000-record blocked source
-  tests both definite throttling and uncertain sends: bounded pending rows,
-  held-final restart, final ordering, and execution in another chat with only
-  one native slot. Rejection before acceptance releases transient ownership.
+  silence-clock reset while Codex emits activity. A 1,000-record source tests
+  bounded backpressure during definite throttling and continued publication
+  during uncertain sends, with retained source records across restart.
+  Held-final restart, final ordering, and execution in another chat with only
+  one native slot remain covered. Rejection before acceptance releases transient ownership.
   Consecutive native turns publish finals with maintenance disabled, and a
   definite rejection during shutdown remains retryable.
   Restart replay also preserves progress from an earlier capacity attempt.
@@ -156,7 +165,9 @@ These are measurements on this machine, not transport throughput guarantees.
   of message body, attachments, and mentions.
 - Process e2e: 120 records with 429 and restart, accepted merged POST followed
   by process crash, historical commentary/compaction through two restarts, and
-  an unconfirmed final that blocks only its own chat.
+  an unconfirmed final followed by status and a new answer in the same chat.
+  Further cases exercise cancellation behind unknown progress, a queued task
+  during read-back failure, and a missing merged batch across restart.
 
 The CI scenario job discovers whole scenario packages with
 `scripts/ci/e2e_shards.py`; these new scenarios are in existing packages and
@@ -165,3 +176,9 @@ only complete transport progress blocks into logical messages. Repeated
 blocks remain repeated, and raw POST counts, ordering, throttle, and restart
 invariants are checked separately. Unit tests run in the existing unit and
 race jobs.
+
+The active-outbox index in schema v5 keeps scheduling independent of retained
+unknown history. The migration adds only an index; it does not rewrite message
+bodies or add delivery states. Schema-v4-only binaries cannot open a v5 store.
+Task completion means execution finished, not that every message was delivered.
+Work-chat status reports unconfirmed output separately when it exists.

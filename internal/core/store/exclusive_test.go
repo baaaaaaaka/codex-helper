@@ -52,7 +52,7 @@ func TestExclusiveModeHasNoSharedMemory(t *testing.T) {
 					return
 				default:
 				}
-				if _, _, err := s.Meta("k000001"); err != nil {
+				if _, _, err := s.Meta("engine_user_title:1"); err != nil {
 					errs <- err
 					return
 				}
@@ -64,7 +64,7 @@ func TestExclusiveModeHasNoSharedMemory(t *testing.T) {
 		}()
 	}
 	for i := 1; i <= 200; i++ {
-		mustT(t, s.Update(func(tx *Tx) error { return tx.SetMeta(fmt.Sprintf("k%06d", i), strconv.Itoa(i)) }))
+		mustT(t, s.Update(func(tx *Tx) error { return tx.SetMeta(fmt.Sprintf("engine_user_title:%d", i), strconv.Itoa(i)) }))
 	}
 	close(stop)
 	wg.Wait()
@@ -89,7 +89,7 @@ func TestExclusiveModeReadOnlyIsRefusedWhileTheOwnerHasIt(t *testing.T) {
 	s := openExclusive(t, path)
 	_, err := s.Acquire(testIdent(1))
 	mustT(t, err)
-	mustT(t, s.Update(func(tx *Tx) error { return tx.SetMeta("k", "1") }))
+	mustT(t, s.Update(func(tx *Tx) error { return tx.SetMeta("machine_label", "1") }))
 
 	other, err := sql.Open("sqlite", "file:"+filepath.ToSlash(path)+"?_pragma=busy_timeout(0)&mode=ro")
 	mustT(t, err)
@@ -104,7 +104,7 @@ func TestExclusiveModeReadOnlyIsRefusedWhileTheOwnerHasIt(t *testing.T) {
 		}
 		t.Fatalf("read-only open next to the owner: %v, want ErrBusy", err)
 	}
-	if v, _, err := s.Meta("k"); err != nil || v != "1" {
+	if v, _, err := s.Meta("machine_label"); err != nil || v != "1" {
 		t.Fatalf("owner after the refused open: %q %v", v, err)
 	}
 }
@@ -119,16 +119,16 @@ func TestExclusiveModeReadOnlyOpensDirectlyAndTheOwnerWaits(t *testing.T) {
 	s := openExclusive(t, path)
 	_, err := s.Acquire(testIdent(1))
 	mustT(t, err)
-	mustT(t, s.Update(func(tx *Tx) error { return tx.SetMeta("k", "1") }))
+	mustT(t, s.Update(func(tx *Tx) error { return tx.SetMeta("machine_label", "1") }))
 	mustT(t, s.Release())
 	mustT(t, s.Close())
 
 	ro, err := OpenWith(path, Options{ReadOnly: true, Exclusive: true})
 	mustT(t, err)
-	if v, ok, err := ro.Meta("k"); err != nil || !ok || v != "1" {
+	if v, ok, err := ro.Meta("machine_label"); err != nil || !ok || v != "1" {
 		t.Fatalf("read-only: %q %v %v", v, ok, err)
 	}
-	if err := ro.Update(func(tx *Tx) error { return tx.SetMeta("k", "2") }); err == nil {
+	if err := ro.Update(func(tx *Tx) error { return tx.SetMeta("machine_label", "2") }); err == nil {
 		t.Fatal("a read-only Store wrote")
 	}
 	if _, err := ro.r.Exec(`INSERT INTO meta(key,value) VALUES ('x','y')`); err == nil {
@@ -170,7 +170,7 @@ func TestExclusiveModeReadOnlyOpensDirectlyAndTheOwnerWaits(t *testing.T) {
 	if _, err := o.s.Acquire(testIdent(2)); err != nil {
 		t.Fatal(err)
 	}
-	mustT(t, o.s.Update(func(tx *Tx) error { return tx.SetMeta("k", "3") }))
+	mustT(t, o.s.Update(func(tx *Tx) error { return tx.SetMeta("machine_label", "3") }))
 }
 
 // A command that keeps the file longer than openLockWait makes the owner's
@@ -222,7 +222,7 @@ func TestChangesSignalsCommits(t *testing.T) {
 			t.Fatalf("exclusive=%v: %d signals after a rollback", excl, n)
 		}
 		for i := 0; i < 3; i++ {
-			mustT(t, s.Update(func(tx *Tx) error { return tx.SetMeta("k", strconv.Itoa(i)) }))
+			mustT(t, s.Update(func(tx *Tx) error { return tx.SetMeta("machine_label", strconv.Itoa(i)) }))
 		}
 		if n := drain(); n != 1 {
 			t.Fatalf("exclusive=%v: %d signals after 3 commits, want 1 (coalesced)", excl, n)
@@ -249,7 +249,7 @@ func TestExclusiveModeCrashKeepsEveryCommit(t *testing.T) {
 		_, err = s.Acquire(testIdent(os.Getpid()))
 		mustT(t, err)
 		for i := 1; i <= 300; i++ {
-			mustT(t, s.Update(func(tx *Tx) error { return tx.SetMeta(fmt.Sprintf("k%06d", i), strconv.Itoa(i)) }))
+			mustT(t, s.Update(func(tx *Tx) error { return tx.SetMeta(fmt.Sprintf("engine_user_title:%d", i), strconv.Itoa(i)) }))
 		}
 		mustT(t, writeSynced(filepath.Join(dir, "acked"), "300"))
 		os.Exit(3)
@@ -274,7 +274,7 @@ func TestExclusiveModeCrashKeepsEveryCommit(t *testing.T) {
 	check := func(s *Store, what string) {
 		t.Helper()
 		for i := 1; i <= 300; i++ {
-			if v, ok, err := s.Meta(fmt.Sprintf("k%06d", i)); err != nil || !ok || v != strconv.Itoa(i) {
+			if v, ok, err := s.Meta(fmt.Sprintf("engine_user_title:%d", i)); err != nil || !ok || v != strconv.Itoa(i) {
 				t.Fatalf("%s: commit %d lost: %q %v %v", what, i, v, ok, err)
 			}
 		}

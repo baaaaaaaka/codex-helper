@@ -101,9 +101,15 @@ func Launch(version string, args []string) (exitCode int, handled bool, err erro
 	if boot, bootErr := ReadBoot(root); bootErr == nil {
 		return launchBoot(root, entry, args, boot)
 	} else if !errors.Is(bootErr, os.ErrNotExist) {
-		// Even a corrupt/unknown boot record cannot prevent the stable full CLI
-		// from running. Do not repair it or run pending activation at startup.
-		return 0, false, nil
+		// Incompatible/corrupt state cannot fall through to application setup.
+		return 0, false, fmt.Errorf("%w: %v", ErrBootstrapState, bootErr)
+	}
+	for _, legacy := range []string{"active", "previous"} {
+		if _, err := os.Lstat(filepath.Join(root, legacy)); err == nil {
+			return 0, false, ErrBootstrapState
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return 0, false, fmt.Errorf("%w: %v", ErrBootstrapState, err)
+		}
 	}
 	// Ordinary startup is read-only and never waits behind an installer. The
 	// slow path below remains only for initial legacy migration/entry upgrades.
@@ -284,7 +290,7 @@ func ReadActive(root string) (string, error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", err
 	}
-	return readVersionPointer(root, "active")
+	return "", os.ErrNotExist
 }
 
 func ReadPrevious(root string) (string, error) {
@@ -296,35 +302,7 @@ func ReadPrevious(root string) (string, error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", err
 	}
-	return readVersionPointer(root, "previous")
-}
-
-func readVersionPointer(root string, name string) (string, error) {
-	path := filepath.Join(filepath.Clean(root), name)
-	info, err := os.Lstat(path)
-	if err != nil {
-		return "", err
-	}
-	if !info.Mode().IsRegular() || info.Size() > 256 {
-		return "", fmt.Errorf("invalid cxp runtime pointer")
-	}
-	file, err := openVersionPointerFile(path)
-	if err != nil {
-		return "", err
-	}
-	defer file.Close()
-	raw, err := io.ReadAll(io.LimitReader(file, 257))
-	if err != nil {
-		return "", err
-	}
-	if len(raw) > 256 {
-		return "", fmt.Errorf("cxp runtime pointer too large")
-	}
-	value, ok := NormalizeVersion(string(raw))
-	if !ok {
-		return "", fmt.Errorf("invalid cxp %s runtime value %q", name, strings.TrimSpace(string(raw)))
-	}
-	return value, nil
+	return "", os.ErrNotExist
 }
 
 func Activate(root string, version string) error {
@@ -344,9 +322,17 @@ func writeVersionPointer(root string, name string, version string) error {
 		// Explicit updates/rollbacks invalidate a pending automatic trial. All
 		// existing callers hold the runtime mutation lock for these transitions.
 		if name == "active" {
-			s.Previous, s.Good = s.Good, normalized
+			if s.Good == normalized && s.Candidate == nil {
+				return nil
+			}
+			if s.Good != normalized {
+				s.Previous, s.Good = s.Good, normalized
+			}
 			s.Candidate = nil
 		} else {
+			if s.Previous == normalized {
+				return nil
+			}
 			s.Previous = normalized
 		}
 		s.Generation++
@@ -354,37 +340,22 @@ func writeVersionPointer(root string, name string, version string) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	root = filepath.Clean(root)
-	if err := os.MkdirAll(root, 0o755); err != nil {
+	if name != "active" {
+		return ErrBootstrapState
+	}
+	if err := os.MkdirAll(root, 0755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(root, "."+name+"-")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.Remove(tmpPath)
+	// Only a fresh installation may initialize here. Legacy selection belongs
+	// to the explicit installer and can never become a native rollback target.
+	for _, legacy := range []string{"active", "previous"} {
+		if _, err := os.Lstat(filepath.Join(root, legacy)); err == nil {
+			return ErrBootstrapState
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
 		}
-	}()
-	if _, err := io.WriteString(tmp, normalized+"\n"); err != nil {
-		_ = tmp.Close()
-		return err
 	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := replaceActiveFile(tmpPath, filepath.Join(root, name)); err != nil {
-		return err
-	}
-	cleanup = false
-	return syncDir(root)
+	return writeBoot(root, BootState{Schema: BootProtocol, Generation: 1, Good: normalized})
 }
 
 // WithRootLock serializes a complete managed-runtime state transition. The
@@ -502,7 +473,7 @@ func WithoutRuntimeMarkers(env []string) []string {
 	for _, value := range env {
 		name, _, _ := strings.Cut(value, "=")
 		blocked := false
-		for _, runtimeName := range []string{EnvRuntime, EnvRuntimeRoot, EnvRuntimeVersion, EnvEntryPath, EnvDisable, EnvForce, EnvBootManaged, envBootAddress, envBootToken} {
+		for _, runtimeName := range []string{EnvRuntime, EnvRuntimeRoot, EnvRuntimeVersion, EnvEntryPath, EnvDisable, EnvForce, EnvBootManaged, EnvProbeProtocol, envBootAddress, envBootToken} {
 			if strings.EqualFold(name, runtimeName) {
 				blocked = true
 				break

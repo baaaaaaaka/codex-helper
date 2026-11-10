@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -30,10 +31,14 @@ var teamsGraphProxyLocalStatusTimeout = 500 * time.Millisecond
 var teamsGraphProxyLocalStatusOverallTimeout = 2 * time.Second
 
 func (l teamsGraphHTTPClientLease) Close(ctx context.Context) error {
-	if l.close == nil {
-		return nil
+	var err error
+	if l.close != nil {
+		err = l.close(ctx)
 	}
-	return l.close(ctx)
+	if l.store != nil {
+		err = errors.Join(err, l.store.Close())
+	}
+	return err
 }
 
 func (l teamsGraphHTTPClientLease) RetireSuspects(ctx context.Context, out io.Writer) {
@@ -71,6 +76,12 @@ func newTeamsGraphHTTPClientLease(ctx context.Context, root *rootOptions, out io
 	if err != nil {
 		return teamsGraphHTTPClientLease{}, err
 	}
+	retained := false
+	defer func() {
+		if !retained {
+			store.Close()
+		}
+	}()
 	cfg, err := store.Load()
 	if err != nil {
 		return teamsGraphHTTPClientLease{}, err
@@ -123,6 +134,7 @@ func newTeamsGraphHTTPClientLease(ctx context.Context, root *rootOptions, out io
 	if out != nil {
 		_, _ = fmt.Fprintf(out, "Teams Graph proxy: using %s\n", proxyURL)
 	}
+	retained = true
 	return teamsGraphHTTPClientLease{Client: client, ProxyURL: proxyURL, Mode: "proxy-stack", close: st.Close, store: store, suspectReusableProxies: suspects}, nil
 }
 

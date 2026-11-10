@@ -7,8 +7,8 @@ package appgateway
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
@@ -81,11 +81,12 @@ type Event struct {
 	Details           string    `json:"details,omitempty"`
 }
 
-// Registry stores one bounded file per profile. dir is injected so unit tests
-// do not touch the user's state; the CLI supplies appdirs.StatePath.
+// Registry owns one typed module database. The per-profile lifetime and
+// operation locks remain independent of database transactions.
 type Registry struct {
 	dir string
 	mu  sync.Mutex
+	db  *sql.DB
 }
 
 func NewRegistry(dir string) (*Registry, error) {
@@ -96,7 +97,11 @@ func NewRegistry(dir string) (*Registry, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("create app gateway state directory: %w", err)
 	}
-	return &Registry{dir: dir}, nil
+	db, err := openGatewayDatabase(dir, false)
+	if err != nil {
+		return nil, err
+	}
+	return &Registry{dir: dir, db: db}, nil
 }
 
 func (r *Registry) Dir() string {
@@ -111,16 +116,9 @@ func profileFilePart(profileID string) string {
 	return hex.EncodeToString(h[:])
 }
 
-func (r *Registry) path(profileID string) string {
-	return filepath.Join(r.dir, profileFilePart(profileID)+".json")
-}
-
-func (r *Registry) eventPath(profileID string) string {
-	return filepath.Join(r.dir, profileFilePart(profileID)+".jsonl")
-}
-
+func (r *Registry) path(_ string) string { return filepath.Join(r.dir, "gateway.sqlite") }
 func (r *Registry) lockPath(profileID string) string {
-	return r.path(profileID) + ".lock"
+	return filepath.Join(r.dir, profileFilePart(profileID)+".json.lock")
 }
 
 func (r *Registry) acquireRegistrationLock(ctx context.Context, profileID string) (*flock.Flock, error) {
@@ -139,7 +137,7 @@ func (r *Registry) acquireRegistrationLock(ctx context.Context, profileID string
 }
 
 func (r *Registry) leasePath(profileID string) string {
-	return r.path(profileID) + ".lease"
+	return filepath.Join(r.dir, profileFilePart(profileID)+".json.lease")
 }
 
 // AcquireLease fences duplicate Frontend processes. The lease is held for the
@@ -202,44 +200,15 @@ func LoadReadOnly(dir, profileID string) (Registration, error) {
 	if dir == "" || filepath.Clean(dir) == "." || profileID == "" {
 		return Registration{}, fmt.Errorf("%w: directory and profile id are required", ErrInvalidRegistration)
 	}
-	r := &Registry{dir: filepath.Clean(dir)}
-	reg, err := r.readRegistration(profileID)
-	if err == nil && reg.ProfileID != profileID {
-		return Registration{}, fmt.Errorf("%w: registration belongs to a different profile", ErrInvalidRegistration)
-	}
-	return reg, err
-}
-
-func (r *Registry) readRegistration(profileID string) (Registration, error) {
-	path := r.path(profileID)
-	b, err := os.ReadFile(path)
-	if err == nil {
-		if reg, decodeErr := decodeRegistration(b); decodeErr == nil {
-			return reg, nil
-		} else if backup, backupErr := os.ReadFile(path + ".bak"); backupErr == nil {
-			if reg, restoreErr := decodeRegistration(backup); restoreErr == nil {
-				return reg, nil
-			}
-			return Registration{}, decodeErr
-		} else {
-			return Registration{}, decodeErr
-		}
-	}
+	db, err := openGatewayDatabase(filepath.Clean(dir), true)
 	if errors.Is(err, os.ErrNotExist) {
 		return Registration{}, ErrRegistrationNotFound
 	}
-	return Registration{}, fmt.Errorf("read app gateway registration: %w", err)
-}
-
-func decodeRegistration(b []byte) (Registration, error) {
-	var reg Registration
-	if err := json.Unmarshal(b, &reg); err != nil {
-		return Registration{}, fmt.Errorf("parse app gateway registration: %w", err)
-	}
-	if err := Validate(reg); err != nil {
+	if err != nil {
 		return Registration{}, err
 	}
-	return reg, nil
+	defer db.Close()
+	return (&Registry{dir: filepath.Clean(dir), db: db}).readRegistration(profileID)
 }
 
 // Ensure creates or updates a registration without changing a previously
@@ -362,135 +331,6 @@ func (r *Registry) Save(reg Registration) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.save(reg)
-}
-
-// AppendEvent records a bounded-size lifecycle line. Callers should emit only
-// state transitions and recovery attempts, not every request, so wake storms
-// cannot turn the audit file into an unbounded write loop.
-func (r *Registry) AppendEvent(event Event) error {
-	if r == nil {
-		return errors.New("nil app gateway registry")
-	}
-	event.ProfileID = strings.TrimSpace(event.ProfileID)
-	if event.ProfileID == "" {
-		return fmt.Errorf("%w: event profile id is required", ErrInvalidRegistration)
-	}
-	if strings.TrimSpace(event.RegistrationID) == "" {
-		event.RegistrationID = profileFilePart(event.ProfileID)
-	}
-	if strings.TrimSpace(event.Event) == "" {
-		return errors.New("app gateway event name is required")
-	}
-	if event.At.IsZero() {
-		event.At = time.Now().UTC()
-	}
-	b, err := json.Marshal(event)
-	if err != nil {
-		return fmt.Errorf("marshal app gateway event: %w", err)
-	}
-	b = append(b, '\n')
-	lock := flock.New(r.eventPath(event.ProfileID) + ".lock")
-	locked, err := lock.TryLockContext(context.Background(), 5*time.Second)
-	if err != nil {
-		return fmt.Errorf("lock app gateway event log: %w", err)
-	}
-	if !locked {
-		return errors.New("app gateway event log lock was not acquired")
-	}
-	defer func() { _ = lock.Unlock() }()
-	if info, statErr := os.Stat(r.eventPath(event.ProfileID)); statErr == nil && info.Size()+int64(len(b)) > eventLogMaxBytes {
-		backup := r.eventPath(event.ProfileID) + ".1"
-		_ = os.Remove(backup)
-		if err := os.Rename(r.eventPath(event.ProfileID), backup); err != nil {
-			return fmt.Errorf("rotate app gateway event log: %w", err)
-		}
-	} else if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
-		return fmt.Errorf("stat app gateway event log: %w", statErr)
-	}
-	f, err := os.OpenFile(r.eventPath(event.ProfileID), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
-	if err != nil {
-		return fmt.Errorf("open app gateway event log: %w", err)
-	}
-	defer f.Close()
-	if _, err := f.Write(b); err != nil {
-		return fmt.Errorf("write app gateway event: %w", err)
-	}
-	if err := f.Sync(); err != nil {
-		return fmt.Errorf("flush app gateway event: %w", err)
-	}
-	return nil
-}
-
-func (r *Registry) save(reg Registration) error {
-	if err := Validate(reg); err != nil {
-		return err
-	}
-	reg.Schema = CurrentSchema
-	reg.UpdatedAt = time.Now()
-	b, err := json.MarshalIndent(reg, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal app gateway registration: %w", err)
-	}
-	b = append(b, '\n')
-	tmp, err := os.CreateTemp(r.dir, ".registration-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create app gateway registration temporary file: %w", err)
-	}
-	tmpName := tmp.Name()
-	defer func() { _ = os.Remove(tmpName) }()
-	if err := tmp.Chmod(0o600); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("protect app gateway registration: %w", err)
-	}
-	if _, err := tmp.Write(b); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("write app gateway registration: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("flush app gateway registration: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close app gateway registration: %w", err)
-	}
-	// Keep the last committed registration available for deterministic repair
-	// after a power loss. The backup is replaced atomically in the same
-	// directory before the new state becomes visible.
-	if previous, readErr := os.ReadFile(r.path(reg.ProfileID)); readErr == nil {
-		if _, decodeErr := decodeRegistration(previous); decodeErr == nil {
-			backup, createErr := os.CreateTemp(r.dir, ".registration-backup-*.tmp")
-			if createErr != nil {
-				return fmt.Errorf("create app gateway registration backup: %w", createErr)
-			}
-			backupName := backup.Name()
-			defer func() { _ = os.Remove(backupName) }()
-			if err := backup.Chmod(0o600); err != nil {
-				_ = backup.Close()
-				return fmt.Errorf("protect app gateway registration backup: %w", err)
-			}
-			if _, err := backup.Write(previous); err != nil {
-				_ = backup.Close()
-				return fmt.Errorf("write app gateway registration backup: %w", err)
-			}
-			if err := backup.Sync(); err != nil {
-				_ = backup.Close()
-				return fmt.Errorf("flush app gateway registration backup: %w", err)
-			}
-			if err := backup.Close(); err != nil {
-				return fmt.Errorf("close app gateway registration backup: %w", err)
-			}
-			if err := os.Rename(backupName, r.path(reg.ProfileID)+".bak"); err != nil {
-				return fmt.Errorf("commit app gateway registration backup: %w", err)
-			}
-		}
-	} else if !errors.Is(readErr, os.ErrNotExist) {
-		return fmt.Errorf("read previous app gateway registration: %w", readErr)
-	}
-
-	if err := os.Rename(tmpName, r.path(reg.ProfileID)); err != nil {
-		return fmt.Errorf("commit app gateway registration: %w", err)
-	}
-	return nil
 }
 
 func Validate(reg Registration) error {

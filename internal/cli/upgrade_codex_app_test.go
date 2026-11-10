@@ -105,6 +105,7 @@ func TestRootUpgradeCodexAppAcceptsProfileArgument(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new config store: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 	profile := config.Profile{ID: "profile-a", Name: "CI recording proxy", Host: "127.0.0.1", Port: 1}
 	if err := store.Save(config.Config{Version: config.CurrentVersion, Profiles: []config.Profile{profile}}); err != nil {
 		t.Fatalf("save config: %v", err)
@@ -133,8 +134,8 @@ func TestRootUpgradeCodexAppAcceptsProfileArgument(t *testing.T) {
 	}
 	const wantProxyURL = "http://127.0.0.1:1234"
 	codexAppEnsureProxyURLFn = func(_ context.Context, gotStore *config.Store, gotProfile config.Profile, _ []config.Instance, _ io.Writer) (string, error) {
-		if gotStore.Path() != configPath {
-			t.Fatalf("config store path = %q, want %q", gotStore.Path(), configPath)
+		if gotStore.Path() != store.Path() {
+			t.Fatalf("config store path = %q, want %q", gotStore.Path(), store.Path())
 		}
 		if gotProfile.ID != profile.ID {
 			t.Fatalf("profile = %#v, want %#v", gotProfile, profile)

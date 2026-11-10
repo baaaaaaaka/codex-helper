@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -82,18 +81,6 @@ func stripHistoryNotes(text string) string {
 		}
 		text = text[:i]
 	}
-}
-
-func readHistoryChecks(get func(string) (string, bool, error)) ([]store.HistoryCheck, error) {
-	v, ok, err := get(store.MetaHistoryChecks)
-	if err != nil || !ok || v == "" {
-		return nil, err
-	}
-	var list []store.HistoryCheck
-	if err := json.Unmarshal([]byte(v), &list); err != nil {
-		return nil, nil // unreadable: nothing can be done with it
-	}
-	return list, nil
 }
 
 // historyRec is a compared record: its kind, visible text and end offset.
@@ -305,7 +292,7 @@ func historyResume(recs []historyRec, msgs []historyMsg) (resume int64, found in
 // historyCheckLoop decides the listed rollouts, one at a time, after
 // ResolveDelay (the first polls of the chats come first).
 func (e *Engine) historyCheckLoop(ctx context.Context) {
-	list, err := readHistoryChecks(e.st.Meta)
+	list, err := e.st.HistoryChecks()
 	if err != nil {
 		e.logf("resume history check: %v", err)
 		return
@@ -492,21 +479,16 @@ func (e *Engine) decideHistory(c store.HistoryCheck, resume int64, outcome strin
 	}
 	decided := false
 	err := e.update(func(tx *store.Tx) error {
-		list, err := readHistoryChecks(tx.Meta)
+		saved, exists, err := tx.HistoryCheck(c.Path)
 		if err != nil {
 			return err
 		}
-		i := slices.IndexFunc(list, func(p store.HistoryCheck) bool { return p.Path == c.Path })
-		if i < 0 || list[i].Done {
+		if !exists || saved.Done {
 			decided = true
 			return nil
 		}
-		list[i].Done, list[i].Resume, list[i].Outcome = true, resume, outcome
-		b, err := json.Marshal(list)
-		if err != nil {
-			return err
-		}
-		return tx.SetMeta(store.MetaHistoryChecks, string(b))
+		saved.Done, saved.Resume, saved.Outcome = true, resume, outcome
+		return tx.SetHistoryCheck(saved)
 	})
 	if err == nil && !decided {
 		e.logf("resume history check of %s: %s", c.Path, outcome)
@@ -518,7 +500,7 @@ func (e *Engine) decideHistory(c store.HistoryCheck, resume int64, outcome strin
 // goroutine): a pending one is held, a decided one skips the records up to
 // its resume point.
 func (e *Engine) mirrorHistory() {
-	list, err := readHistoryChecks(e.st.Meta)
+	list, err := e.st.HistoryChecks()
 	if err != nil {
 		e.logf("mirror: %v", err)
 		return

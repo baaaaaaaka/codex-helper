@@ -215,7 +215,7 @@ func (e *Engine) parkIdle() {
 			if err != nil || len(open) > 0 {
 				return err
 			}
-			pending, err := tx.PendingOutbox(id)
+			pending, err := tx.ActiveOutbox(id)
 			if err != nil || len(pending) > 0 {
 				return err
 			}

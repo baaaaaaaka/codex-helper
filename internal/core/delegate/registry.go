@@ -136,6 +136,13 @@ func InboxKey(tenantID, ownerID, machineID string) string {
 func (r *Registry) Publish(ctx context.Context, card engine.RegistryCard) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.store.CacheDatabase == nil {
+		db, err := machineregistry.OpenCacheDB(r.cfg.CachePath)
+		if err != nil {
+			return err
+		}
+		r.store.CacheDatabase = db
+	}
 	if r.owner == "" {
 		id, _, err := r.cfg.Channel.Owner(ctx)
 		if err != nil {
@@ -205,10 +212,16 @@ func (r *Registry) keepInbox(ctx context.Context, cache machineregistry.Cache, c
 	next.InboxValidatedAt = now
 	next.InboxRefreshedAt = now
 	next.InboxNextRefreshAt = now.Add(machineregistry.DefaultRefreshInterval)
-	if _, err := machineregistry.SaveCache(r.cfg.CachePath, next); err != nil {
+	if _, err := r.store.SaveCache(next); err != nil {
 		return cache, err
 	}
 	return next, nil
+}
+
+func (r *Registry) Close() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.store.CacheDatabase.Close()
 }
 
 func (r *Registry) card(cache machineregistry.Cache, draining bool) machineregistry.MachineCard {

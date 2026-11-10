@@ -103,6 +103,7 @@ func newProxyStartCmd(root *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			defer store.Close()
 			return withProxyStartupLockError(cmd.Context(), store, func() error {
 				return runProxyStartCommand(cmd, store, foreground)
 			})
@@ -248,6 +249,7 @@ func newProxyDaemonCmd(root *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			defer store.Close()
 			if ownerToken == "" {
 				return runProxyDaemonFunc(cmd.Context(), store, instanceID)
 			}
@@ -328,19 +330,12 @@ func runProxyDaemonWithOwnerTokenMode(parentCtx context.Context, store *config.S
 	// Persist the identity before opening any listeners. This makes a legacy
 	// record explicit before it can be reused, and lets a replacement daemon
 	// fence the previous process by changing the epoch/token pair.
-	if err := store.Update(func(cfg *config.Config) error {
-		for i := range cfg.Instances {
-			if cfg.Instances[i].ID != instanceID {
-				continue
-			}
-			live := &cfg.Instances[i]
-			if strictOwnership && live.OwnerToken != "" && live.OwnerToken != ownerToken {
-				return manager.ErrInstanceOwnershipLost
-			}
-			*live = inst
-			return nil
+	if err := store.ChangeInstance(instanceID, func(live *config.Instance) error {
+		if strictOwnership && live.OwnerToken != "" && live.OwnerToken != ownerToken {
+			return manager.ErrInstanceOwnershipLost
 		}
-		return fmt.Errorf("instance %q not found", instanceID)
+		*live = inst
+		return nil
 	}); err != nil {
 		return err
 	}
@@ -371,15 +366,9 @@ func runProxyDaemonWithOwnerTokenMode(parentCtx context.Context, store *config.S
 				return nil
 			})
 		}
-		return store.Update(func(cfg *config.Config) error {
-			for i := range cfg.Instances {
-				if cfg.Instances[i].ID != instanceID {
-					continue
-				}
-				cfg.Instances[i].RecoveryBudget = manager.MergeProxyRecoveryBudget(cfg.Instances[i].RecoveryBudget, budget)
-				return nil
-			}
-			return fmt.Errorf("instance %q not found", instanceID)
+		return store.ChangeInstance(instanceID, func(inst *config.Instance) error {
+			inst.RecoveryBudget = manager.MergeProxyRecoveryBudget(inst.RecoveryBudget, budget)
+			return nil
 		})
 	}
 	if inst.HTTPPort > 0 {
@@ -500,6 +489,7 @@ func newProxyStopCmd(root *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			defer store.Close()
 			cfg, err := store.Load()
 			if err != nil {
 				return err
@@ -580,27 +570,22 @@ func newProxyPruneCmd(root *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			defer store.Close()
 
-			removed := 0
-			unchanged := errors.New("no dead proxy records")
-
-			if err := store.Update(func(cfg *config.Config) error {
-				out := cfg.Instances[:0]
-				now := proxyNow()
-				for _, inst := range cfg.Instances {
-					alive, inspectErr := proxyProcessStatus(inst.DaemonPID)
-					if !inst.RecoveryBudget.Blocked && !proxyInstanceStarting(inst, now) && !alive && inspectErr == nil {
-						removed++
-						continue
-					}
-					out = append(out, inst)
+			cfg, err := store.Load()
+			if err != nil {
+				return err
+			}
+			var dead []config.Instance
+			now := proxyNow()
+			for _, inst := range cfg.Instances {
+				alive, inspectErr := proxyProcessStatus(inst.DaemonPID)
+				if !inst.RecoveryBudget.Blocked && !proxyInstanceStarting(inst, now) && !alive && inspectErr == nil {
+					dead = append(dead, inst)
 				}
-				cfg.Instances = out
-				if removed == 0 {
-					return unchanged
-				}
-				return nil
-			}); err != nil && !errors.Is(err, unchanged) {
+			}
+			removed, err := store.DeleteUnchangedInstances(dead)
+			if err != nil {
 				return err
 			}
 
@@ -624,6 +609,7 @@ func newProxyResetCmd(root *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			defer store.Close()
 
 			var oldInstances []config.Instance
 			profiles := 0

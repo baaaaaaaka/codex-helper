@@ -10,7 +10,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -30,9 +29,9 @@ const (
 	codexWindowsManagedStagingDir     = ".staging"
 	codexWindowsManagedVersionsDir    = "versions"
 	codexWindowsManagedLockDir        = "install.lockdir"
-	codexWindowsManagedCurrentState   = "current.json"
+	codexWindowsManagedCurrentState   = "current.sqlite"
 	codexWindowsManagedArch           = "x64"
-	codexWindowsManagedLockOwner      = "owner.json"
+	codexWindowsManagedLockOwner      = "owner.sqlite"
 	codexWindowsManagedLockStaleAfter = 10 * time.Minute
 )
 
@@ -72,14 +71,11 @@ type codexWindowsManagedLockMetadata struct {
 // treated as unknown and left in place; a bounded caller context can then
 // report the contention instead of deleting another process's lock.
 func reclaimStaleCodexWindowsManagedLock(lockPath string) (bool, error) {
-	data, err := os.ReadFile(filepath.Join(lockPath, codexWindowsManagedLockOwner))
-	if err != nil {
+	owner, err := readWindowsManagedLockOwner(lockPath)
+	if err != nil || owner.PID <= 0 || owner.CreatedAt.IsZero() {
 		return false, nil
 	}
-	var owner codexWindowsManagedLockMetadata
-	if err := json.Unmarshal(data, &owner); err != nil || owner.PID <= 0 || owner.CreatedAt.IsZero() {
-		return false, nil
-	}
+
 	if codexWindowsManagedNow().Sub(owner.CreatedAt) < codexWindowsManagedLockStaleAfter || codexWindowsManagedProcessAlive(owner.PID) {
 		return false, nil
 	}
@@ -324,8 +320,8 @@ func ensureCodexWindowsManagedInstall(ctx context.Context, root string, opts cod
 }
 
 // upgradeCodexWindowsManagedInstall fetches and verifies the current official
-// MSIX even when current.json is valid. A refresh publishes a new immutable
-// runtime directory and switches current.json only after extraction succeeds,
+// MSIX even when current.sqlite is valid. A refresh publishes a new immutable
+// runtime directory and switches current.sqlite only after extraction succeeds,
 // so a running process can finish on the old runtime without being replaced.
 func upgradeCodexWindowsManagedInstall(ctx context.Context, root string, opts codexDesktopAppOptions) (codexWindowsManagedInstallState, bool, error) {
 	return ensureCodexWindowsManagedInstallWithRefresh(ctx, root, opts, true)
@@ -366,15 +362,11 @@ func ensureCodexWindowsManagedInstallWithRefresh(ctx context.Context, root strin
 		err := os.Mkdir(lockPath, 0o700)
 		if err == nil {
 			owner := codexWindowsManagedLockMetadata{PID: os.Getpid(), CreatedAt: codexWindowsManagedNow().UTC()}
-			data, marshalErr := json.Marshal(owner)
-			if marshalErr != nil {
-				_ = os.RemoveAll(lockPath)
-				return codexWindowsManagedInstallState{}, false, fmt.Errorf("encode managed ChatGPT install lock: %w", marshalErr)
-			}
-			if writeErr := os.WriteFile(filepath.Join(lockPath, codexWindowsManagedLockOwner), append(data, '\n'), 0o600); writeErr != nil {
+			if writeErr := writeWindowsManagedLockOwner(lockPath, owner); writeErr != nil {
 				_ = os.RemoveAll(lockPath)
 				return codexWindowsManagedInstallState{}, false, fmt.Errorf("write managed ChatGPT install lock: %w", writeErr)
 			}
+
 			break
 		}
 		if !errors.Is(err, os.ErrExist) {
@@ -500,19 +492,9 @@ func ensureCodexWindowsManagedInstallWithRefresh(ctx context.Context, root strin
 }
 
 func readValidCodexWindowsManagedState(root string) (codexWindowsManagedInstallState, bool, error) {
-	data, err := os.ReadFile(filepath.Join(root, codexWindowsManagedCurrentState))
-	if os.IsNotExist(err) {
-		return codexWindowsManagedInstallState{}, false, nil
-	}
-	if err != nil {
-		return codexWindowsManagedInstallState{}, false, err
-	}
-	var state codexWindowsManagedInstallState
-	if err := json.Unmarshal(data, &state); err != nil {
-		// current.json is an atomically published cache hint, not the source of
-		// truth.  A torn/manual edit must trigger a fresh verified install rather
-		// than turning a recoverable cache miss into a hard launch failure.
-		return codexWindowsManagedInstallState{}, false, nil
+	state, found, err := loadWindowsAppState(root)
+	if err != nil || !found {
+		return state, found, err
 	}
 	relativeRuntime := filepath.ToSlash(strings.TrimSpace(state.RuntimeRelative))
 	if state.PackageName != codexDesktopWindowsPackageName || strings.TrimSpace(state.PackageVersion) == "" || !strings.EqualFold(state.Architecture, codexWindowsManagedArch) || strings.TrimSpace(state.Publisher) == "" || !isCodexWindowsManagedSHA256(state.PackageSHA256) || !isCodexWindowsManagedSHA256(state.ExecutableSHA256) || relativeRuntime == "" || !strings.HasPrefix(relativeRuntime, codexWindowsManagedVersionsDir+"/") || filepath.IsAbs(filepath.FromSlash(relativeRuntime)) || strings.HasPrefix(relativeRuntime, "../") || strings.Contains(relativeRuntime, ":") {
@@ -538,18 +520,6 @@ func isCodexWindowsManagedSHA256(value string) bool {
 	}
 	_, err := hex.DecodeString(value)
 	return err == nil
-}
-
-func writeCodexWindowsManagedState(root string, state codexWindowsManagedInstallState) error {
-	data, err := json.MarshalIndent(state, "", "  ")
-	if err != nil {
-		return err
-	}
-	path := filepath.Join(root, codexWindowsManagedCurrentState)
-	if err := writeFileAtomically(path, append(data, '\n'), 0o600); err != nil {
-		return fmt.Errorf("publish managed ChatGPT state: %w", err)
-	}
-	return nil
 }
 
 func verifyCodexWindowsManagedPackage(ctx context.Context, packagePath string) (codexWindowsManagedManifest, string, error) {

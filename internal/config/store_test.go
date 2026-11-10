@@ -1,15 +1,11 @@
 package config
 
 import (
-	"bytes"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
 	"runtime"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -21,6 +17,7 @@ func TestStore_LoadMissingReturnsDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 
 	cfg, err := store.Load()
 	if err != nil {
@@ -37,6 +34,7 @@ func TestStore_SaveAndLoadRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 
 	now := time.Now().UTC().Truncate(time.Second)
 	in := Config{
@@ -73,50 +71,34 @@ func TestStore_SaveAndLoadRoundTrip(t *testing.T) {
 // The model settings of earlier releases are no longer read, but a rewrite
 // keeps them verbatim (an older binary may share the config), and a model
 // config the old validation would have refused no longer blocks loading.
-func TestStore_KeepsRetiredModelSettingsVerbatim(t *testing.T) {
+func TestStoreArchivesRetiredModelSettingsVerbatim(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "config.json")
-	legacy := `{"version":6,"minReader":1,"profiles":[],` +
-		`"defaults":{"model":"profile:work","reasoningEffort":"high"},` +
-		`"defaultModelProfile":"work",` +
-		`"modelProfiles":{"work":{"provider":"deepseek","revision":1,"unknownField":true}},` +
-		`"modelCatalogs":{"c":{"git":"https://example.invalid/m.git"}},` +
-		`"modelProviderBindings":{"p":{"apiKeyRef":"secret:p"}}}`
-	if err := os.WriteFile(path, []byte(legacy), 0o600); err != nil {
+	legacy := `{"version":6,"minReader":1,"profiles":[],"defaults":{"model":"profile:work","reasoningEffort":"high","other":"archived"},"modelProfiles":{"work":{"provider":"retired","unknownField":true}},"modelProviderBindings":{"p":{"apiKeyRef":"secret:p"}}}`
+	if err := os.WriteFile(path, []byte(legacy), 0600); err != nil {
 		t.Fatal(err)
 	}
 	store, err := NewStore(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := store.Update(func(cfg *Config) error {
-		cfg.Profiles = append(cfg.Profiles, Profile{ID: "p1", Name: "n1", Host: "h", Port: 22, User: "u"})
-		return nil
-	}); err != nil {
+	t.Cleanup(func() { store.Close() })
+	defer store.Close()
+	if err = store.Update(func(c *Config) error { c.Profiles = append(c.Profiles, Profile{ID: "p1"}); return nil }); err != nil {
 		t.Fatal(err)
 	}
-	raw, err := os.ReadFile(path)
+	raw, err := os.ReadFile(path + ".migrated")
 	if err != nil {
 		t.Fatal(err)
 	}
-	var doc map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &doc); err != nil {
+	if string(raw) != legacy {
+		t.Fatal("retired settings were not archived byte-for-byte")
+	}
+	cfg, err := store.Load()
+	if err != nil {
 		t.Fatal(err)
 	}
-	for key, want := range map[string]string{
-		"defaults":              `{"model":"profile:work","reasoningEffort":"high"}`,
-		"defaultModelProfile":   `"work"`,
-		"modelProfiles":         `{"work":{"provider":"deepseek","revision":1,"unknownField":true}}`,
-		"modelCatalogs":         `{"c":{"git":"https://example.invalid/m.git"}}`,
-		"modelProviderBindings": `{"p":{"apiKeyRef":"secret:p"}}`,
-	} {
-		var got, exp any
-		if err := json.Unmarshal(doc[key], &got); err != nil {
-			t.Fatalf("%s: %v (%s)", key, err, doc[key])
-		}
-		_ = json.Unmarshal([]byte(want), &exp)
-		if !reflect.DeepEqual(got, exp) {
-			t.Fatalf("%s = %s, want %s", key, doc[key], want)
-		}
+	if cfg.Defaults.Model != "profile:work" || cfg.Defaults.ReasoningEffort != "high" || len(cfg.Profiles) != 1 {
+		t.Fatalf("native config %#v", cfg)
 	}
 }
 
@@ -130,6 +112,7 @@ func TestStore_LoadMigratesVersionOneConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 	cfg, err := store.Load()
 	if err != nil {
 		t.Fatalf("Load: %v", err)
@@ -143,12 +126,13 @@ func TestStore_LoadMigratesVersionOneConfig(t *testing.T) {
 }
 
 func TestStore_NewGenerationConfigKeepsAccountDefaultZeroValue(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "config.json")
-	if err := os.WriteFile(path, []byte(fmt.Sprintf(`{"version":%d,"minReader":%d,"profiles":[]}`, CurrentVersion, MinReaderVersion)), 0o600); err != nil {
+	store, err := NewStore(filepath.Join(t.TempDir(), "config.sqlite"))
+	if err != nil {
 		t.Fatal(err)
 	}
-	store, err := NewStore(path)
-	if err != nil {
+	t.Cleanup(func() { store.Close() })
+	defer store.Close()
+	if err = store.Save(Config{}); err != nil {
 		t.Fatal(err)
 	}
 	cfg, err := store.Load()
@@ -156,35 +140,32 @@ func TestStore_NewGenerationConfigKeepsAccountDefaultZeroValue(t *testing.T) {
 		t.Fatal(err)
 	}
 	if cfg.TeamsCodexPath.Mode != "" {
-		t.Fatalf("generation-%d zero-value TeamsCodexPath mode = %q, want empty account-default", CurrentVersion, cfg.TeamsCodexPath.Mode)
+		t.Fatalf("unexpected path policy %#v", cfg.TeamsCodexPath)
 	}
 }
 
 func TestStore_LoadAcceptsNewerAdditiveConfig(t *testing.T) {
-	// A future binary wrote a higher generation with only additive changes
-	// (reader floor unchanged). An older binary must read it, not die — and the
-	// unknown field must be ignored without error.
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.json")
-	body := fmt.Sprintf(`{"version":%d,"minReader":%d,"profiles":[{"id":"p1","name":"n1"}],"someFutureField":{"x":1}}`,
-		CurrentVersion+1, MinReaderVersion)
-	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-	store, err := NewStore(path)
+	store, err := NewStore(filepath.Join(t.TempDir(), "config.sqlite"))
 	if err != nil {
-		t.Fatalf("NewStore: %v", err)
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	defer store.Close()
+	if err = store.Save(Config{Profiles: []Profile{{ID: "p1"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.db.Exec(`UPDATE config_header SET version=? WHERE id=1`, CurrentVersion+1); err != nil {
+		t.Fatal(err)
 	}
 	cfg, err := store.Load()
 	if err != nil {
-		t.Fatalf("Load: %v", err)
+		t.Fatal(err)
 	}
-	if len(cfg.Profiles) != 1 || cfg.Profiles[0].ID != "p1" {
-		t.Fatalf("Profiles=%#v", cfg.Profiles)
+	if cfg.Version != CurrentVersion+1 || len(cfg.Profiles) != 1 {
+		t.Fatalf("future additive read %#v", cfg)
 	}
-	// The newer write-generation stamp is preserved (not downgraded on read).
-	if cfg.Version != CurrentVersion+1 {
-		t.Fatalf("Version=%d want %d", cfg.Version, CurrentVersion+1)
+	if err = store.Save(cfg); err == nil {
+		t.Fatal("older writer overwrote newer config")
 	}
 }
 
@@ -195,6 +176,7 @@ func TestStore_SaveStampsReaderFloor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 	if err := store.Save(Config{}); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
@@ -211,76 +193,51 @@ func TestStore_SaveStampsReaderFloor(t *testing.T) {
 }
 
 func TestStoreSaveCommitsApprovalBrokerGeneration(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "config.json")
-	store, err := NewStore(path)
+	store, err := NewStore(filepath.Join(t.TempDir(), "config.sqlite"))
 	if err != nil {
-		t.Fatalf("NewStore: %v", err)
+		t.Fatal(err)
 	}
-	if err := store.Save(Config{}); err != nil {
-		t.Fatalf("Save: %v", err)
+	t.Cleanup(func() { store.Close() })
+	defer store.Close()
+	if err = store.Save(Config{}); err != nil {
+		t.Fatal(err)
 	}
-	var raw struct {
-		Version   int `json:"version"`
-		MinReader int `json:"minReader"`
+	var writer, reader int
+	if err = store.db.QueryRow(`SELECT version,min_reader FROM config_header WHERE id=1`).Scan(&writer, &reader); err != nil {
+		t.Fatal(err)
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read config: %v", err)
-	}
-	if err := json.Unmarshal(data, &raw); err != nil {
-		t.Fatalf("unmarshal config: %v", err)
-	}
-	if raw.Version != CurrentVersion {
-		t.Fatalf("Version=%d want %d", raw.Version, CurrentVersion)
-	}
-	if raw.MinReader != MinReaderVersion {
-		t.Fatalf("MinReader=%d want %d", raw.MinReader, MinReaderVersion)
+	if writer != CurrentVersion || reader != MinReaderVersion {
+		t.Fatalf("writer %d reader %d", writer, reader)
 	}
 }
 
 func TestStoreMigrationDropsLegacyExecutionModeField(t *testing.T) {
-	for _, legacyField := range []string{`,"yoloEnabled":true`, `,"yoloEnabled":false`, ``} {
-		name := "missing"
-		if strings.Contains(legacyField, "true") {
-			name = "true"
-		} else if strings.Contains(legacyField, "false") {
-			name = "false"
-		}
-		t.Run(name, func(t *testing.T) {
-			dir := t.TempDir()
-			path := filepath.Join(dir, "config.json")
-			document := `{"version":2,"minReader":1,"proxyEnabled":true,"profiles":[]` + legacyField + `}`
-			if err := os.WriteFile(path, []byte(document), 0o600); err != nil {
+	for _, field := range []string{`,"yoloEnabled":true`, `,"yoloEnabled":false`, ``} {
+		t.Run(field, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.json")
+			raw := `{"version":2,"minReader":1,"proxyEnabled":true,"profiles":[]` + field + `}`
+			if err := os.WriteFile(path, []byte(raw), 0600); err != nil {
 				t.Fatal(err)
 			}
 			store, err := NewStore(path)
 			if err != nil {
 				t.Fatal(err)
 			}
+			t.Cleanup(func() { store.Close() })
+			defer store.Close()
 			cfg, err := store.Load()
 			if err != nil {
 				t.Fatal(err)
 			}
-			if err := store.Save(cfg); err != nil {
+			if cfg.Version != CurrentVersion || cfg.MinReader != MinReaderVersion || cfg.ProxyEnabled == nil || !*cfg.ProxyEnabled {
+				t.Fatalf("migrated config %#v", cfg)
+			}
+			var count int
+			if err = store.db.QueryRow(`SELECT count(*) FROM pragma_table_info('config_header') WHERE name LIKE '%yolo%'`).Scan(&count); err != nil {
 				t.Fatal(err)
 			}
-			raw, err := os.ReadFile(path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if bytes.Contains(raw, []byte("yoloEnabled")) {
-				t.Fatalf("legacy field survived migration: %s", raw)
-			}
-			var header struct {
-				Version   int `json:"version"`
-				MinReader int `json:"minReader"`
-			}
-			if err := json.Unmarshal(raw, &header); err != nil {
-				t.Fatal(err)
-			}
-			if header.Version != CurrentVersion || header.MinReader != MinReaderVersion {
-				t.Fatalf("migration header = %#v, want generation %d readable by generation-%d readers", header, CurrentVersion, MinReaderVersion)
+			if count != 0 {
+				t.Fatal("retired execution mode survived")
 			}
 		})
 	}
@@ -302,6 +259,7 @@ func TestStoreRejectsUnknownBreakingReaderFloorAfterAdditiveWriterBump(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { store.Close() })
 	if _, err := store.Load(); err == nil {
 		t.Fatal("Load accepted a config with an unsupported breaking reader floor")
 	} else {
@@ -309,7 +267,7 @@ func TestStoreRejectsUnknownBreakingReaderFloorAfterAdditiveWriterBump(t *testin
 		if !errors.As(err, &stale) {
 			t.Fatalf("Load error = %T %v, want StaleReaderError", err, err)
 		}
-		if stale.FileMinReader != MinReaderVersion+1 || stale.Supported != MinReaderVersion {
+		if stale.FileMinReader != MinReaderVersion+1 || stale.Supported != 1 {
 			t.Fatalf("stale reader error = %#v", stale)
 		}
 	}
@@ -323,12 +281,12 @@ func TestDefaultPathForHome(t *testing.T) {
 		t.Fatalf("DefaultPathForHome: %v", err)
 	}
 
-	want := filepath.Join(home, ".config", "codex-proxy", "config.json")
+	want := filepath.Join(home, ".config", "codex-proxy", "config.sqlite")
 	switch runtime.GOOS {
 	case "windows":
-		want = filepath.Join(home, "AppData", "Roaming", "codex-proxy", "config.json")
+		want = filepath.Join(home, "AppData", "Roaming", "codex-proxy", "config.sqlite")
 	case "darwin":
-		want = filepath.Join(home, "Library", "Application Support", "codex-proxy", "config.json")
+		want = filepath.Join(home, "Library", "Application Support", "codex-proxy", "config.sqlite")
 	}
 	if got != want {
 		t.Fatalf("DefaultPathForHome = %q, want %q", got, want)
@@ -341,6 +299,7 @@ func TestStore_UpdateIsSerialized(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 
 	const n = 25
 	var wg sync.WaitGroup
@@ -391,6 +350,7 @@ func TestStore_ErrorPaths(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewStore: %v", err)
 		}
+		t.Cleanup(func() { store.Close() })
 		if _, err := store.Load(); err == nil {
 			t.Fatalf("expected parse error")
 		}
@@ -406,6 +366,7 @@ func TestStore_ErrorPaths(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewStore: %v", err)
 		}
+		t.Cleanup(func() { store.Close() })
 		if _, err := store.Load(); err == nil {
 			t.Fatalf("expected corrupt-config error for negative version")
 		}
@@ -421,6 +382,7 @@ func TestStore_ErrorPaths(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewStore: %v", err)
 		}
+		t.Cleanup(func() { store.Close() })
 		_, err = store.Load()
 		if !errors.Is(err, ErrStaleReader) {
 			t.Fatalf("expected ErrStaleReader, got %v", err)
@@ -437,6 +399,7 @@ func TestStore_ErrorPaths(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewStore: %v", err)
 		}
+		t.Cleanup(func() { store.Close() })
 		if err := store.Save(Config{}); err == nil {
 			t.Fatalf("expected refuse-to-overwrite error")
 		}
@@ -448,6 +411,7 @@ func TestStore_ErrorPaths(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewStore: %v", err)
 		}
+		t.Cleanup(func() { store.Close() })
 		if err := store.Update(func(cfg *Config) error {
 			cfg.Version = CurrentVersion
 			return fmt.Errorf("boom")
@@ -475,7 +439,8 @@ func TestNewStoreDefaultPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore error: %v", err)
 	}
-	want := filepath.Join(base, "codex-proxy", "config.json")
+	t.Cleanup(func() { store.Close() })
+	want := filepath.Join(base, "codex-proxy", "config.sqlite")
 	if store.Path() != want {
 		t.Fatalf("expected path %q, got %q", want, store.Path())
 	}

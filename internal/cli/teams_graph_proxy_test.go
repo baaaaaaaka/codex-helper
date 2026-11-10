@@ -646,6 +646,7 @@ func newTeamsGraphProxyTestStore(t *testing.T, cfg config.Config) *config.Store 
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 	if err := store.Save(cfg); err != nil {
 		t.Fatalf("save store: %v", err)
 	}

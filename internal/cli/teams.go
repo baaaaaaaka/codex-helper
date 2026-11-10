@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -153,7 +152,7 @@ func runTeamsAuthLoginWithConfig(cmd *cobra.Command, root *rootOptions, force bo
 	}
 	defer func() { _ = lease.Close(context.Background()) }()
 	ctx := cmd.Context()
-	tok, readErr := chteams.ReadTokenCache(cfg.CachePath)
+	tok, readErr := chteams.ReadTokenCache(cfg.Cache)
 	if force || readErr != nil || tok.RefreshToken == "" {
 		if err := chteams.DeviceLogin(ctx, cfg, lease.Client, cmd.OutOrStdout()); err != nil {
 			return err
@@ -163,13 +162,14 @@ func runTeamsAuthLoginWithConfig(cmd *cobra.Command, root *rootOptions, force bo
 	if err != nil {
 		return err
 	}
+	defer ch.Close()
 	_, name, err := ch.Owner(ctx)
 	if err != nil {
 		return err
 	}
 	lease.RetireSuspects(ctx, cmd.ErrOrStderr())
 	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "%s %s\n", label, name)
-	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Token cache: %s\n", cfg.CachePath)
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Token cache: %s\n", cfg.Cache)
 	return nil
 }
 
@@ -256,66 +256,9 @@ func newTeamsAuthConfigCmd() *cobra.Command {
 	return cmd
 }
 
-// writeTeamsAuthConfig sets tenant_id and read/full client IDs and scopes in
-// teams-auth.json, keeping every other field (profiles, settings of
-// earlier releases) as it is.
+// writeTeamsAuthConfig edits the native defaults row without replacing profiles.
 func writeTeamsAuthConfig(path string, set map[string]string) error {
-	doc := map[string]json.RawMessage{}
-	if raw, err := os.ReadFile(path); err == nil {
-		if err := json.Unmarshal(raw, &doc); err != nil {
-			return fmt.Errorf("read Teams auth config %s: %w", path, err)
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	if v, ok := set["tenant_id"]; ok {
-		doc["tenant_id"], _ = json.Marshal(strings.TrimSpace(v))
-	}
-	full := map[string]json.RawMessage{}
-	if raw, ok := doc["full"]; ok {
-		if err := json.Unmarshal(raw, &full); err != nil {
-			return fmt.Errorf("read Teams auth config %s: %w", path, err)
-		}
-	}
-	for _, k := range []string{"client_id", "scopes"} {
-		if v, ok := set[k]; ok {
-			full[k], _ = json.Marshal(strings.TrimSpace(v))
-		}
-	}
-	if len(full) > 0 {
-		doc["full"], _ = json.Marshal(full)
-	}
-	read := map[string]json.RawMessage{}
-	if raw, ok := doc["read"]; ok {
-		if err := json.Unmarshal(raw, &read); err != nil {
-			return fmt.Errorf("read Teams auth config %s: %w", path, err)
-		}
-	}
-	for _, k := range []string{"read_client_id", "read_scopes"} {
-		if v, ok := set[k]; ok {
-			field := strings.TrimPrefix(k, "read_")
-			read[field], _ = json.Marshal(strings.TrimSpace(v))
-		}
-	}
-	if len(read) > 0 {
-		doc["read"], _ = json.Marshal(read)
-	}
-	raw, err := json.MarshalIndent(doc, "", "  ")
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, append(raw, '\n'), 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	return chteams.UpdateAuthConfig(path, set)
 }
 
 func newTeamsAuthStatusCmd() *cobra.Command {
@@ -329,8 +272,8 @@ func newTeamsAuthStatusCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams auth: %s\n", teamsTokenCacheStatus(cfg.CachePath, time.Now()))
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Token cache: %s\n", cfg.CachePath)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams auth: %s\n", teamsTokenCacheStatus(cfg.Cache, time.Now()))
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Token cache: %s\n", cfg.Cache)
 			return nil
 		},
 	}
@@ -346,8 +289,8 @@ func newTeamsAuthReadStatusCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams read auth: %s\n", teamsTokenCacheStatus(cfg.CachePath, time.Now()))
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Read token cache: %s\n", cfg.CachePath)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams read auth: %s\n", teamsTokenCacheStatus(cfg.Cache, time.Now()))
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Read token cache: %s\n", cfg.Cache)
 			return nil
 		},
 	}
@@ -366,18 +309,18 @@ func newTeamsLogoutCmd() *cobra.Command {
 			}
 			// The cache path can be overridden: never remove a file that
 			// is not a token cache.
-			if tok, err := chteams.ReadTokenCache(cfg.CachePath); err == nil && tok.AccessToken == "" && tok.RefreshToken == "" {
-				return fmt.Errorf("%s does not look like a Teams token cache; not removed", cfg.CachePath)
+			if tok, err := chteams.ReadTokenCache(cfg.Cache); err == nil && tok.AccessToken == "" && tok.RefreshToken == "" {
+				return fmt.Errorf("%s does not look like a Teams token cache; not removed", cfg.Cache)
 			} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 				return fmt.Errorf("%v; not removed (it does not look like a Teams token cache)", err)
 			}
-			if err := os.Remove(cfg.CachePath); errors.Is(err, os.ErrNotExist) {
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams token cache already absent: %s\n", cfg.CachePath)
+			if err := chteams.RemoveTokenCache(cmd.Context(), cfg.Cache); errors.Is(err, os.ErrNotExist) {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams token cache already absent: %s\n", cfg.Cache)
 				return nil
 			} else if err != nil {
 				return err
 			}
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Removed Teams token cache: %s\n", cfg.CachePath)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Removed Teams token cache: %s\n", cfg.Cache)
 			return nil
 		},
 	}
@@ -397,22 +340,22 @@ func newTeamsAuthReadLogoutCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			if filepath.Clean(readCfg.CachePath) == filepath.Clean(fullCfg.CachePath) {
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams read auth uses the full token cache: %s\n", readCfg.CachePath)
+			if readCfg.Cache == fullCfg.Cache {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams read auth uses the full token cache: %s\n", readCfg.Cache)
 				return nil
 			}
-			if tok, err := chteams.ReadTokenCache(readCfg.CachePath); err == nil && tok.AccessToken == "" && tok.RefreshToken == "" {
-				return fmt.Errorf("%s does not look like a Teams token cache; not removed", readCfg.CachePath)
+			if tok, err := chteams.ReadTokenCache(readCfg.Cache); err == nil && tok.AccessToken == "" && tok.RefreshToken == "" {
+				return fmt.Errorf("%s does not look like a Teams token cache; not removed", readCfg.Cache)
 			} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 				return fmt.Errorf("%v; not removed (it does not look like a Teams token cache)", err)
 			}
-			if err := os.Remove(readCfg.CachePath); errors.Is(err, os.ErrNotExist) {
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams read token cache already absent: %s\n", readCfg.CachePath)
+			if err := chteams.RemoveTokenCache(cmd.Context(), readCfg.Cache); errors.Is(err, os.ErrNotExist) {
+				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Teams read token cache already absent: %s\n", readCfg.Cache)
 				return nil
 			} else if err != nil {
 				return err
 			}
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Removed Teams read token cache: %s\n", readCfg.CachePath)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "Removed Teams read token cache: %s\n", readCfg.Cache)
 			return nil
 		},
 	}

@@ -720,10 +720,22 @@ func TestUnknownAnswerListedForHistoryCheck(t *testing.T) {
 				})
 				eq(t, "o2", qs(t, db, `SELECT state || '/' || note FROM outbox WHERE delivery_key = 'legacy-outbox:o2'`),
 					"dropped/migrated: send outcome unknown (sending); checked against the chat history at first start, resent only if absent")
-				var list []store.LegacyFinalCheck
-				if err := json.Unmarshal([]byte(qs(t, db, `SELECT value FROM meta WHERE key = ?`, store.MetaLegacyFinalChecks)), &list); err != nil {
+				rows, err := db.Query(`SELECT key,conv_id,legacy_id,ext_msg_id,created,body,reply_to,found FROM answer_checks ORDER BY key`)
+				if err != nil {
 					t.Fatal(err)
 				}
+				var list []store.LegacyFinalCheck
+				for rows.Next() {
+					var c store.LegacyFinalCheck
+					if err := rows.Scan(&c.Key, &c.ConvID, &c.LegacyID, &c.ExtMsgID, &c.Created, &c.Body, &c.ReplyTo, &c.Found); err != nil {
+						t.Fatal(err)
+					}
+					list = append(list, c)
+				}
+				if err := rows.Err(); err != nil {
+					t.Fatal(err)
+				}
+				rows.Close()
 				s001 := qi(t, db, `SELECT id FROM conversations WHERE label = 's001'`)
 				want := store.LegacyFinalCheck{Key: "legacy-outbox:o2", ConvID: s001, LegacyID: "o2",
 					Created: time.Date(2026, 9, 1, 10, 0, 20, 0, time.UTC).UnixMilli(), Body: "maybe posted"}

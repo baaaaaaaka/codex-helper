@@ -43,7 +43,7 @@ const (
 	teamsServiceWindowsTaskXMLName            = "codex-helper-teams-task.xml"
 	teamsServiceWindowsWatchdogTaskXMLName    = "codex-helper-teams-watchdog-task.xml"
 	teamsServiceWSLTaskConfigName             = "codex-helper-teams-wsl-task.txt"
-	teamsServiceLocalSupervisorConfigName     = "local-supervisor.json"
+	teamsServiceLocalSupervisorConfigName     = "local-supervisor.sqlite"
 	teamsServiceLocalSupervisorStatusName     = "local-supervisor-status.json"
 	teamsServiceLocalSupervisorActivationName = "local-supervisor-activation.json"
 	teamsServiceLocalSupervisorLockName       = "local-supervisor.lock"
@@ -1273,7 +1273,7 @@ func defaultTeamsServiceAuthPreflight() error {
 	if err != nil {
 		return err
 	}
-	tok, err := chteams.ReadTokenCache(cfg.CachePath)
+	tok, err := chteams.ReadTokenCache(cfg.Cache)
 	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("Teams sign-in cache is not usable for the background service: %w; run `cxp teams auth login --force` in a foreground terminal first", err)
 	}
@@ -1284,8 +1284,8 @@ func defaultTeamsServiceAuthPreflight() error {
 	if err != nil {
 		return err
 	}
-	if filepath.Clean(readCfg.CachePath) != filepath.Clean(cfg.CachePath) {
-		readTok, err := chteams.ReadTokenCache(readCfg.CachePath)
+	if readCfg.Cache != cfg.Cache {
+		readTok, err := chteams.ReadTokenCache(readCfg.Cache)
 		if err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("Teams read sign-in cache is not usable for the background service: %w; run `cxp teams auth read --force` in a foreground terminal first", err)
 		}

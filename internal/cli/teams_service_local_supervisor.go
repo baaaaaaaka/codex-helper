@@ -52,6 +52,7 @@ type teamsServiceLocalSupervisorProcessIdentity struct {
 }
 
 type teamsServiceLocalSupervisorStatus struct {
+	native             *teamsServiceStateDB
 	Version            int                                         `json:"version"`
 	ConfigPath         string                                      `json:"config_path,omitempty"`
 	LogPath            string                                      `json:"log_path,omitempty"`
@@ -218,12 +219,14 @@ func (b teamsServiceLocalSupervisorBackend) Uninstall(ctx context.Context) (stri
 			return "", fmt.Errorf("remove the Windows Startup entry during local-supervisor uninstall: %w", err)
 		}
 	}
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+	if err := deleteNativeSupervisorConfig(path); err != nil {
 		return "", err
 	}
 	statusPath, _ := teamsServiceLocalSupervisorStatusPath()
 	if strings.TrimSpace(statusPath) != "" {
-		_ = os.Remove(statusPath)
+		if err := deleteNativeSupervisorStatus(); err != nil {
+			return "", err
+		}
 	}
 	return path, nil
 }
@@ -279,7 +282,11 @@ func (b teamsServiceLocalSupervisorBackend) Installed() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return teamsServiceFileExists(path)
+	_, err = readTeamsServiceLocalSupervisorConfig(path)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return err == nil, err
 }
 
 func (b teamsServiceLocalSupervisorBackend) Active(_ context.Context) (bool, error) {
@@ -616,7 +623,13 @@ func runTeamsServiceLocalSupervisor(ctx context.Context, configPath string) erro
 	if exe, err := helperpath.RawExecutable(); err == nil && strings.TrimSpace(exe) != "" {
 		supervisorExecutable = exe
 	}
+	stateDB, err := openTeamsWatchdogState()
+	if err != nil {
+		return err
+	}
+	defer stateDB.Close()
 	status := teamsServiceLocalSupervisorStatus{
+		native:             stateDB,
 		Version:            teamsServiceLocalSupervisorStatusVersion,
 		ConfigPath:         configPath,
 		LogPath:            logPath,
@@ -1440,12 +1453,14 @@ func removeDisabledTeamsServiceLocalSupervisorConfigIfInactive() error {
 	if !ok {
 		return nil
 	}
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+	if err := deleteNativeSupervisorConfig(path); err != nil {
 		return err
 	}
 	statusPath, _ := teamsServiceLocalSupervisorStatusPath()
 	if strings.TrimSpace(statusPath) != "" {
-		_ = os.Remove(statusPath)
+		if err := deleteNativeSupervisorStatus(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -1549,115 +1564,55 @@ func renderTeamsServiceLocalSupervisorConfig(spec teamsServiceSpec, enabled bool
 }
 
 func readTeamsServiceLocalSupervisorConfig(path string) (teamsServiceLocalSupervisorConfig, error) {
-	if err := validateTeamsServiceLocalSupervisorRegularFile(path, "local supervisor config", false); err != nil {
-		return teamsServiceLocalSupervisorConfig{}, err
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return teamsServiceLocalSupervisorConfig{}, err
-	}
-	var cfg teamsServiceLocalSupervisorConfig
-	if err := json.Unmarshal(data, &cfg); err != nil {
-		return teamsServiceLocalSupervisorConfig{}, err
-	}
-	if cfg.Version == 0 {
-		cfg.Version = teamsServiceLocalSupervisorConfigVersion
-	}
-	if strings.TrimSpace(cfg.Spec.Executable) == "" {
-		return teamsServiceLocalSupervisorConfig{}, fmt.Errorf("local supervisor config missing executable: %s", path)
-	}
-	return cfg, nil
+	return readNativeSupervisorConfig(path)
 }
-
 func writeTeamsServiceLocalSupervisorConfig(path string, cfg teamsServiceLocalSupervisorConfig) error {
-	if strings.TrimSpace(path) == "" {
-		return fmt.Errorf("local supervisor config path is required")
-	}
-	if err := ensureTeamsServiceLocalSupervisorDir(filepath.Dir(path)); err != nil {
-		return err
-	}
-	data, err := json.MarshalIndent(cfg, "", "  ")
+	store, err := openTeamsSupervisorConfig(path)
 	if err != nil {
 		return err
 	}
-	data = append(data, '\n')
-	return writeTeamsServiceLocalSupervisorFileAtomic(path, data, 0o600)
+	defer store.db.Close()
+	return store.Save(cfg)
 }
-
 func readTeamsServiceLocalSupervisorStatus() (teamsServiceLocalSupervisorStatus, bool, error) {
-	path, err := teamsServiceLocalSupervisorStatusPath()
+	store, err := openTeamsServiceStateForRead()
 	if err != nil {
-		return teamsServiceLocalSupervisorStatus{}, false, err
+		return teamsServiceLocalSupervisorStatus{}, false, fmt.Errorf("%w: %v", errTeamsServiceLocalSupervisorStatusMalformed, err)
 	}
-	if err := validateTeamsServiceLocalSupervisorRegularFile(path, "local supervisor status", true); err != nil {
-		if os.IsNotExist(err) {
-			return teamsServiceLocalSupervisorStatus{}, false, nil
-		}
-		return teamsServiceLocalSupervisorStatus{}, false, err
+	if store == nil {
+		return teamsServiceLocalSupervisorStatus{}, false, nil
 	}
-	data, err := os.ReadFile(path)
+	defer store.Close()
+	value, ok, err := store.SupervisorStatus()
 	if err != nil {
-		if os.IsNotExist(err) {
-			return teamsServiceLocalSupervisorStatus{}, false, nil
-		}
-		return teamsServiceLocalSupervisorStatus{}, false, err
+		return value, false, fmt.Errorf("%w: %v", errTeamsServiceLocalSupervisorStatusMalformed, err)
 	}
-	var status teamsServiceLocalSupervisorStatus
-	if err := json.Unmarshal(data, &status); err != nil {
-		return teamsServiceLocalSupervisorStatus{}, false, fmt.Errorf("%w: %s: %v", errTeamsServiceLocalSupervisorStatusMalformed, path, err)
-	}
-	return status, true, nil
+	return value, ok, nil
 }
-
 func writeTeamsServiceLocalSupervisorStatus(status teamsServiceLocalSupervisorStatus) error {
-	path, err := teamsServiceLocalSupervisorStatusPath()
-	if err != nil {
-		return err
+	store := status.native
+	if store == nil {
+		var err error
+		store, err = openTeamsWatchdogState()
+		if err != nil {
+			return err
+		}
+		defer store.Close()
 	}
-	if err := ensureTeamsServiceLocalSupervisorDir(filepath.Dir(path)); err != nil {
-		return err
-	}
-	data, err := json.MarshalIndent(status, "", "  ")
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
-	return writeTeamsServiceLocalSupervisorFileAtomic(path, data, 0o600)
+	return store.SaveSupervisorStatus(status)
 }
-
 func readTeamsServiceLocalSupervisorActivation() (teamsServiceLocalSupervisorActivation, bool, error) {
-	path, err := teamsServiceLocalSupervisorActivationPath()
+	store, err := openTeamsServiceStateForRead()
 	if err != nil {
 		return teamsServiceLocalSupervisorActivation{}, false, err
 	}
-	if err := validateTeamsServiceLocalSupervisorRegularFile(path, "local supervisor activation", true); err != nil {
-		if os.IsNotExist(err) {
-			return teamsServiceLocalSupervisorActivation{}, false, nil
-		}
-		return teamsServiceLocalSupervisorActivation{}, false, err
+	if store == nil {
+		return teamsServiceLocalSupervisorActivation{}, false, nil
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return teamsServiceLocalSupervisorActivation{}, false, nil
-		}
-		return teamsServiceLocalSupervisorActivation{}, false, err
-	}
-	var activation teamsServiceLocalSupervisorActivation
-	if err := json.Unmarshal(data, &activation); err != nil {
-		return teamsServiceLocalSupervisorActivation{}, false, fmt.Errorf("local supervisor activation is malformed: %s: %v", path, err)
-	}
-	return activation, true, nil
+	defer store.Close()
+	return store.Activation()
 }
-
 func writeTeamsServiceLocalSupervisorActivation(activation teamsServiceLocalSupervisorActivation) error {
-	path, err := teamsServiceLocalSupervisorActivationPath()
-	if err != nil {
-		return err
-	}
-	if err := ensureTeamsServiceLocalSupervisorDir(filepath.Dir(path)); err != nil {
-		return err
-	}
 	if activation.Version == 0 {
 		activation.Version = teamsServiceLocalSupervisorActivationVersion
 	}
@@ -1668,33 +1623,12 @@ func writeTeamsServiceLocalSupervisorActivation(activation teamsServiceLocalSupe
 	if activation.UpdatedAt.IsZero() {
 		activation.UpdatedAt = time.Now()
 	}
-	data, err := json.MarshalIndent(activation, "", "  ")
+	store, err := openTeamsWatchdogState()
 	if err != nil {
 		return err
 	}
-	data = append(data, '\n')
-	return writeTeamsServiceLocalSupervisorFileAtomic(path, data, 0o600)
-}
-
-func writeTeamsServiceLocalSupervisorFileAtomic(path string, data []byte, perm os.FileMode) error {
-	if strings.TrimSpace(path) == "" {
-		return fmt.Errorf("local supervisor file path is required")
-	}
-	dir := filepath.Dir(path)
-	if err := ensureTeamsServiceLocalSupervisorDir(dir); err != nil {
-		return err
-	}
-	if err := validateTeamsServiceLocalSupervisorRegularFile(path, "local supervisor file", true); err != nil {
-		return err
-	}
-	if err := writeFileAtomically(path, data, perm); err != nil {
-		return err
-	}
-	if dirFile, err := os.Open(dir); err == nil {
-		_ = dirFile.Sync()
-		_ = dirFile.Close()
-	}
-	return nil
+	defer store.Close()
+	return store.SaveActivation(activation)
 }
 
 func openTeamsServiceLocalSupervisorLog(path string) (*os.File, error) {
@@ -1866,19 +1800,10 @@ func teamsServiceLocalSupervisorConfigPath() (string, error) {
 }
 
 func teamsServiceLocalSupervisorStatusPath() (string, error) {
-	dir, err := teamsServiceLocalSupervisorRuntimeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, teamsServiceLocalSupervisorStatusName), nil
+	return defaultTeamsServiceWatchdogStatePath()
 }
-
 func teamsServiceLocalSupervisorActivationPath() (string, error) {
-	dir, err := teamsServiceLocalSupervisorRuntimeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, teamsServiceLocalSupervisorActivationName), nil
+	return defaultTeamsServiceWatchdogStatePath()
 }
 
 func teamsServiceLocalSupervisorLockPath() (string, error) {
@@ -1906,39 +1831,7 @@ func teamsServiceLocalSupervisorConfigDir() (string, error) {
 }
 
 func teamsServiceLocalSupervisorRuntimeDir() (string, error) {
-	dir, err := appdirs.StatePath("teams", "service", "local-supervisor", "run")
-	if err != nil {
-		return "", err
-	}
-	configBase, configErr := teamsServiceLocalSupervisorConfigDir()
-	if configErr != nil {
-		return dir, nil
-	}
-	legacyDir := filepath.Join(configBase, "run", "local-supervisor")
-	resolvedDir, err := appdirs.ResolveMigratedDirWithRequired(dir, legacyDir, teamsServiceLocalSupervisorStatusName)
-	if err != nil {
-		return "", err
-	}
-	statusPath := filepath.Join(resolvedDir, teamsServiceLocalSupervisorStatusName)
-	legacyStatusPath := filepath.Join(legacyDir, teamsServiceLocalSupervisorStatusName)
-	if filepath.Clean(resolvedDir) == filepath.Clean(dir) && filepath.Clean(dir) != filepath.Clean(legacyDir) && !teamsServiceLocalSupervisorStatusFileValid(statusPath) && teamsServiceLocalSupervisorStatusFileValid(legacyStatusPath) {
-		if err := appdirs.CopyFileReplacing(statusPath, legacyStatusPath); err != nil {
-			return legacyDir, nil
-		}
-	}
-	return resolvedDir, nil
-}
-
-func teamsServiceLocalSupervisorStatusFileValid(path string) bool {
-	if err := validateTeamsServiceLocalSupervisorRegularFile(path, "local supervisor status", true); err != nil {
-		return false
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return false
-	}
-	var status teamsServiceLocalSupervisorStatus
-	return json.Unmarshal(data, &status) == nil
+	return appdirs.StatePath("teams", "service", "local-supervisor", "run")
 }
 
 func teamsServiceLocalSupervisorLogDir() (string, error) {

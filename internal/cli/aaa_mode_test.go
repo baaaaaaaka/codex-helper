@@ -3,7 +3,6 @@ package cli
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/baaaaaaaka/codex-helper/internal/config"
@@ -20,6 +19,7 @@ func TestPersistAAAEnabledRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { store.Close() })
 	if err := persistAAAEnabled(store, true); err != nil {
 		t.Fatal(err)
 	}
@@ -52,6 +52,7 @@ func TestLegacyYoloPreferenceDoesNotEnableAAA(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { store.Close() })
 	cfg, err := store.Load()
 	if err != nil {
 		t.Fatal(err)
@@ -62,11 +63,12 @@ func TestLegacyYoloPreferenceDoesNotEnableAAA(t *testing.T) {
 	if err := store.Save(cfg); err != nil {
 		t.Fatal(err)
 	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
+	raw, err := os.ReadFile(path + ".migrated")
+	if err != nil || string(raw) != string(legacy) {
+		t.Fatalf("legacy archive = %q/%v", raw, err)
 	}
-	if string(raw) == "" || strings.Contains(strings.ToLower(string(raw)), "yoloenabled") || strings.Contains(strings.ToLower(string(raw)), "agentautoapproveenabled") {
-		t.Fatalf("migrated default config retained an execution-mode preference: %s", raw)
+	cfg, err = store.Load()
+	if err != nil || resolveAAAEnabled(cfg) || cfg.AgentAutoApproveEnabled != nil {
+		t.Fatalf("migrated preference %#v/%v", cfg, err)
 	}
 }

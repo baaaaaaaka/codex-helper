@@ -21,6 +21,7 @@ func TestRunHistoryTuiPersistsProxyEnabledAfterProfileSetup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 
 	prevEnsureProxy := ensureProxyPreferenceFunc
 	prevEnsureProfile := ensureProfileFunc
@@ -82,6 +83,7 @@ func TestRunHistoryTuiDoesNotPersistProxyEnabledWhenProfileSetupFails(t *testing
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 
 	prevEnsureProxy := ensureProxyPreferenceFunc
 	prevEnsureProfile := ensureProfileFunc
@@ -132,6 +134,7 @@ func TestRunHistoryTuiToggleEnablePersistsAfterInitSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 
 	disabled := false
 	if err := persistProxyPreference(store, disabled); err != nil {
@@ -205,6 +208,7 @@ func TestRunHistoryTuiToggleEnableDoesNotPersistWhenInitFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 
 	disabled := false
 	if err := persistProxyPreference(store, disabled); err != nil {
@@ -270,6 +274,7 @@ func TestHistoryOpenPersistsProxyEnabledAfterProfileSetup(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 
 	prevEnsureProxy := ensureProxyPreferenceFunc
 	prevEnsureProfile := ensureProfileFunc
@@ -355,6 +360,7 @@ func TestHistoryOpenExplicitProfileUsesProxyDespiteDisabledPreference(t *testing
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 	profile := config.Profile{ID: "p1", Name: "dev", Host: "example.com", Port: 22, User: "coder"}
 	if err := store.Save(config.Config{
 		Version:      config.CurrentVersion,
@@ -450,6 +456,7 @@ func TestRunHistoryTuiExplicitProfileUsesProxyDespiteDisabledPreference(t *testi
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 	profile := config.Profile{ID: "p1", Name: "dev", Host: "example.com", Port: 22, User: "coder"}
 	if err := store.Save(config.Config{
 		Version:      config.CurrentVersion,

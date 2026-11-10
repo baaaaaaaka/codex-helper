@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -254,6 +253,8 @@ func TestUnconfirmedContentRetainedAcrossRestartAndLateReadBack(t *testing.T) {
 	if len(attempts()) != 1 {
 		t.Fatal("restart caused blind resend")
 	}
+	r.ch.PostUser(work, "same chat continues")
+	r.wait("same chat answers before late visibility", func() bool { return len(r.own(work, "ANSWER to same chat continues")) == 1 })
 	// Simulate a late Graph visibility result for the original accepted attempt.
 	_, err = r.ch.Send(context.Background(), work, channel.Part{Index: 1, Count: 1, Body: row.Body, Hash: fmt.Sprintf("%x", row.BodyHash)}, r.e.marker(row.AttemptToken))
 	if err != nil {
@@ -557,12 +558,10 @@ func TestRestartRecoversAcceptanceBeforeTranscriptBarrier(t *testing.T) {
 }
 
 func TestTranscriptBackpressureLeavesUnreadContentForLaterDelivery(t *testing.T) {
-	for _, unknown := range []bool{false, true} {
-		t.Run(fmt.Sprintf("unknown=%v", unknown), func(t *testing.T) { testTranscriptBackpressure(t, unknown) })
-	}
+	testTranscriptBackpressure(t)
 }
 
-func testTranscriptBackpressure(t *testing.T, unknown bool) {
+func testTranscriptBackpressure(t *testing.T) {
 	var throttled atomic.Bool
 	var attempts atomic.Int32
 	throttled.Store(true)
@@ -575,9 +574,6 @@ func testTranscriptBackpressure(t *testing.T, unknown bool) {
 		c.Channel.(*channeltest.Fake).SendFault = func(_ string, p channel.Part) (bool, error) {
 			if throttled.Load() && strings.Contains(p.Body, "pressure-") {
 				attempts.Add(1)
-				if unknown {
-					return false, &channel.Ambiguous{Err: errors.New("accepted outcome not visible yet")}
-				}
 				return false, &channel.Throttled{Scope: channel.ScopeChat, RetryAfter: 50 * time.Millisecond}
 			}
 			return false, nil
@@ -645,22 +641,6 @@ func testTranscriptBackpressure(t *testing.T, unknown bool) {
 		t.Fatalf("restart replayed completed native execution: %d runs", runs)
 	}
 	throttled.Store(false)
-	if unknown {
-		if n := attempts.Load(); n != 1 {
-			t.Fatalf("blocked progress was blindly resent: %d attempts", n)
-		}
-		rows, err := r.st.UnknownOutbox()
-		if err != nil || len(rows) != 1 {
-			t.Fatalf("unknown batch lost across restart: %+v %v", rows, err)
-		}
-		row := rows[0]
-		// Graph eventually exposes the original attempt. This does not
-		// represent another helper POST; its original marker is preserved.
-		_, err = r.ch.Send(context.Background(), work, channel.Part{Index: 1, Count: 1, Body: row.Body, Hash: fmt.Sprintf("%x", row.BodyHash)}, r.e.marker(row.AttemptToken))
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
 	// At the default account pace, even 63 full batches need about 18 s.
 	// Allow the reader, SQLite race instrumentation, and concurrent rigs to
 	// share the worker without changing the production pace or assertions.

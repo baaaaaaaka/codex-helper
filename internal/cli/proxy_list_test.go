@@ -3,7 +3,6 @@ package cli
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -45,6 +44,7 @@ func TestProxyListIncludesGatewayWithoutReinterpretingDeadLegacyRecord(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { registry.Close() })
 	reg, err := registry.EnsureWithPort(context.Background(), "p1", "fingerprint", 46843)
 	if err != nil {
 		t.Fatal(err)
@@ -144,9 +144,19 @@ func TestProxyListPreservesHealthDetailsAndIdentity(t *testing.T) {
 func TestProxyListReadOnlyAndDoesNotWaitForConfigLock(t *testing.T) {
 	lockCLITestHooks(t)
 	dir := t.TempDir()
-	path := filepath.Join(dir, "config.json")
-	content := []byte(`{"version":6,"profiles":[]}`)
-	if err := os.WriteFile(path, content, 0400); err != nil {
+	path := filepath.Join(dir, "config.sqlite")
+	store, err := config.NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = store.Load(); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
 		t.Fatal(err)
 	}
 	// The diagnostic should not create a lock in the first place.
@@ -218,8 +228,8 @@ func TestProxyListBoundedConcurrencyAndCancellation(t *testing.T) {
 		return appgateway.Health{}, ctx.Err()
 	}
 	cfg := config.Config{Version: config.CurrentVersion}
-	for range 20 {
-		cfg.Instances = append(cfg.Instances, config.Instance{ID: "slow", DaemonPID: 11, HTTPPort: 12345})
+	for i := range 20 {
+		cfg.Instances = append(cfg.Instances, config.Instance{ID: fmt.Sprintf("slow-%d", i), DaemonPID: 11, HTTPPort: 12345})
 	}
 	store := newTempStore(t)
 	if err := store.Save(cfg); err != nil {
@@ -340,11 +350,15 @@ func TestProxyListReportsRegistrationErrorsAlongsideOtherRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	reg, err := registry.Ensure(context.Background(), "p1", "fp")
+	t.Cleanup(func() { registry.Close() })
+	_, err = registry.Ensure(context.Background(), "p1", "fp")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, reg.ID+".json"), []byte("broken"), 0600); err != nil {
+	if err := registry.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "gateway.sqlite"), []byte("broken"), 0600); err != nil {
 		t.Fatal(err)
 	}
 	store := newTempStore(t)
@@ -365,9 +379,15 @@ func TestProxyListDoesNotCreateMissingGatewayRegistry(t *testing.T) {
 	oldDir := appGatewayRegistryDirFn
 	t.Cleanup(func() { appGatewayRegistryDirFn = oldDir })
 	appGatewayRegistryDirFn = func() (string, error) { return dir, nil }
-	path := filepath.Join(t.TempDir(), "config.json")
-	content, _ := json.Marshal(config.Config{Version: config.CurrentVersion, Profiles: []config.Profile{{ID: "p1", Name: "profile"}}})
-	if err := os.WriteFile(path, content, 0400); err != nil {
+	path := filepath.Join(t.TempDir(), "config.sqlite")
+	store, err := config.NewStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Save(config.Config{Version: config.CurrentVersion, Profiles: []config.Profile{{ID: "p1", Name: "profile"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = store.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if err := proxyListTestCmd(path, context.Background(), io.Discard).Execute(); err != nil {
@@ -420,8 +440,8 @@ func TestProxyListTotalBudgetBoundsQueuedProbes(t *testing.T) {
 		return appgateway.Health{}, probeCtx.Err()
 	}
 	cfg := config.Config{Version: config.CurrentVersion}
-	for range 100 {
-		cfg.Instances = append(cfg.Instances, config.Instance{ID: "slow", DaemonPID: 11, HTTPPort: 12345})
+	for i := range 100 {
+		cfg.Instances = append(cfg.Instances, config.Instance{ID: fmt.Sprintf("slow-%d", i), DaemonPID: 11, HTTPPort: 12345})
 	}
 	store := newTempStore(t)
 	if err := store.Save(cfg); err != nil {

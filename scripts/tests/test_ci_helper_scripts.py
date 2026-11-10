@@ -207,51 +207,19 @@ class CIHelperScriptTests(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("Attempts must be >= 1", proc.stderr + proc.stdout)
 
-    def test_helper_upgrade_fixture_models_stable_cxp_entries(self) -> None:
-        script = (CI_DIR / "helper_upgrade_compat_smoke.sh").read_text(encoding="utf-8")
-
-        self.assertIn("symlink|stale-symlink|missing)", script)
-        self.assertNotIn("symlink|stale-symlink|missing|current-missing-cxp)", script)
-        self.assertIn(
-            'managed cxp should be a stable executable for seed mode $seed_mode',
-            script,
-        )
-        self.assertIn(
-            "current managed helper did not publish a stable cxp executable",
-            script,
-        )
-
-    def test_windows_upgrade_fixture_seeds_valid_and_repairs_broken_canonical_shims(self) -> None:
-        script = (CI_DIR / "helper_upgrade_compat_smoke.ps1").read_text(encoding="utf-8")
-
-        valid_start = script.index('"existing-cmd" {')
-        broken_start = script.index('"existing-cmd-missing-exe" {')
-        broken_end = script.index('"stale-helper-cmd" {', broken_start)
-        valid_block = script[valid_start:broken_start]
-        broken_block = script[broken_start:broken_end]
-        self.assertIn("Download-Binary $OldTag $cxpExe", valid_block)
-        self.assertLess(
-            valid_block.index("Download-Binary $OldTag $cxpExe"),
-            valid_block.index("Assert-Version $cxp $OldTag"),
-        )
-        self.assertIn("Remove-Item -Force -LiteralPath $cxpExe", broken_block)
-        self.assertNotIn("Assert-Version $cxp $OldTag", broken_block)
-        self.assertIn(
-            'Run-UpgradeScenario "existing-cxp-cmd-missing-exe" "existing-cmd-missing-exe"',
-            script,
-        )
-
-    def test_windows_legacy_external_target_upgrade_retries_transient_failures(self) -> None:
-        script = (CI_DIR / "helper_upgrade_compat_smoke.ps1").read_text(encoding="utf-8")
-
-        start = script.index("function Invoke-LegacyExternalTargetUpgrade")
-        end = script.index("function Download-Binary", start)
-        block = script[start:end]
-        self.assertIn("$attempts = 5", block)
-        self.assertIn("for ($attempt = 1; $attempt -le $attempts; $attempt++)", block)
-        self.assertIn("Start-Sleep -Seconds 5", block)
-        self.assertIn("legacy external-target update failed for an unexpected reason", block)
-        self.assertIn("after verified binary replacement", block)
+    def test_upgrade_artifact_contract_is_shared_across_platforms(self) -> None:
+        # Both native runners must exercise actual published artifacts through
+        # the same migration/admission contract. Source version overrides are
+        # covered separately by the native candidate test.
+        for name in ("helper_upgrade_compat_smoke.sh", "helper_upgrade_compat_smoke.ps1"):
+            script = (CI_DIR / name).read_text(encoding="utf-8")
+            self.assertIn("sqlite_upgrade_artifacts.py", script)
+        script = (CI_DIR / "sqlite_upgrade_artifacts.py").read_text(encoding="utf-8")
+        compile(script, "sqlite_upgrade_artifacts.py", "exec")
+        self.assertIn("checksums.txt", script)
+        self.assertIn('download(old), download(target)', script)
+        self.assertIn('"--cxp-install-bootstrap"', script)
+        self.assertIn('"proxy", "list"', script)
 
     def test_windows_locked_cxp_regression_and_release_gates_are_both_wired(self) -> None:
         script = (CI_DIR / "windows_locked_cxp_self_upgrade.ps1").read_text(
@@ -275,11 +243,11 @@ class CIHelperScriptTests(unittest.TestCase):
         self.assertIn(
             "windows_locked_cxp_self_upgrade.ps1 -ExpectedState Split", ci
         )
-        self.assertIn('if ($env:OLD_TAG -eq "v0.1.12")', release)
-        self.assertIn(
-            "windows_locked_cxp_self_upgrade.ps1 -ExpectedState Converged",
-            release,
-        )
+        # Current releases have a new protocol. The old Split characterization
+        # stays frozen in nightly; current compatibility uses the native
+        # locked-entry test and the released-artifact migration contract.
+        self.assertIn("windows_stale_cxp_entry_smoke.ps1", release)
+        self.assertIn("helper_upgrade_compat_smoke.ps1", release)
 
 
 if __name__ == "__main__":

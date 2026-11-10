@@ -335,7 +335,7 @@ func TestReuseRejectedIsTerminalResult(t *testing.T) {
 
 func TestRemoteThreadsPersistSortAndPrune(t *testing.T) {
 	now := time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC)
-	path := filepath.Join(t.TempDir(), "delegation.json")
+	path := filepath.Join(t.TempDir(), "delegation.sqlite")
 	store := Store{}
 	store.UpsertRemoteThread(RemoteThread{
 		ThreadID:           "rth-old",
@@ -384,7 +384,7 @@ func TestRemoteThreadsPersistSortAndPrune(t *testing.T) {
 }
 
 func TestStoreSaveIsContentSensitive(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "delegation.json")
+	path := filepath.Join(t.TempDir(), "delegation.sqlite")
 	req := mustRequest(t, time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC))
 	store := Store{Records: []Record{req}}
 	store.UpsertOutbox(OutboxRecord{RecordID: req.RecordID, DelegationID: req.DelegationID, ChatID: "chat-inbox", Status: OutboxVisible, Attempts: 1})
@@ -473,8 +473,8 @@ func TestSQLiteStoreSaveIsContentSensitiveAndImportsLegacyJSON(t *testing.T) {
 		t.Fatalf("loaded legacy records = %#v", loaded.Records)
 	}
 	written, err := SaveStore(sqlitePath, loaded)
-	if err != nil || !written {
-		t.Fatalf("first sqlite SaveStore written=%v err=%v", written, err)
+	if err != nil || written {
+		t.Fatalf("unchanged imported sqlite fixture SaveStore written=%v err=%v", written, err)
 	}
 	if _, err := os.Stat(sqlitePath); err != nil {
 		t.Fatalf("sqlite store was not created: %v", err)
@@ -530,7 +530,7 @@ func TestSQLiteRowLevelUpsertSkipsIdenticalPayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin first tx: %v", err)
 	}
-	if err := sqliteUpsertJSONTx(ctx, tx, "inbox_cursors", cursor.ChatID, cursor); err != nil {
+	if _, err := putInboxCursorTx(ctx, tx, cursor); err != nil {
 		_ = tx.Rollback()
 		t.Fatalf("first upsert: %v", err)
 	}
@@ -543,7 +543,7 @@ func TestSQLiteRowLevelUpsertSkipsIdenticalPayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin second tx: %v", err)
 	}
-	if err := sqliteUpsertJSONTx(ctx, tx, "inbox_cursors", cursor.ChatID, cursor); err != nil {
+	if _, err := putInboxCursorTx(ctx, tx, cursor); err != nil {
 		_ = tx.Rollback()
 		t.Fatalf("second upsert: %v", err)
 	}
@@ -560,7 +560,7 @@ func TestSQLiteRowLevelUpsertSkipsIdenticalPayload(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin third tx: %v", err)
 	}
-	if err := sqliteUpsertJSONTx(ctx, tx, "inbox_cursors", cursor.ChatID, cursor); err != nil {
+	if _, err := putInboxCursorTx(ctx, tx, cursor); err != nil {
 		_ = tx.Rollback()
 		t.Fatalf("third upsert: %v", err)
 	}

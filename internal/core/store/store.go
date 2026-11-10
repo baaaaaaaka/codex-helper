@@ -14,7 +14,7 @@
 // would wait forever for the one connection. The file lock is held from
 // open to Close, so no other process opens the store meanwhile; a command
 // that needs the state of a running helper reads what the helper
-// publishes instead (internal/cli, core-status.json).
+// publishes instead (internal/cli, core-status.sqlite).
 package store
 
 import (
@@ -74,6 +74,9 @@ type Options struct {
 	// takes the file's exclusive lock like any open there (OpenWith), so
 	// the caller must close it promptly.
 	ReadOnly bool
+	// RequireExisting is set when the lease already published this store.
+	// Such a file must have an existing core schema, even after corruption.
+	RequireExisting bool
 	// Lease, when set, is the owner lease of a store in a directory that
 	// hosts may share (internal/core/lease). It replaces the heartbeat in
 	// the owner row: every write transaction checks it first, and Fence
@@ -121,10 +124,11 @@ type Store struct {
 	pid  func(int) bool
 	gen  int64
 
-	lease  sync.Mutex // guards beat and fenced; held by Heartbeat, Fence, Acquire, Release
-	beat   time.Time  // start of the last successful heartbeat or acquire
-	fenced bool       // a heartbeat found a newer generation
-	ls     Lease      // the owner lease (nil: the owner row's heartbeat)
+	lease           sync.Mutex // guards beat and fenced; held by Heartbeat, Fence, Acquire, Release
+	beat            time.Time  // start of the last successful heartbeat or acquire
+	fenced          bool       // a heartbeat found a newer generation
+	ls              Lease      // the owner lease (nil: the owner row's heartbeat)
+	requireExisting bool
 
 	changed chan struct{} // signalled after each commit (Changes)
 }
@@ -258,7 +262,7 @@ func (c exclusiveConnector) Driver() driver.Driver { return c.drv }
 // holds it (the lease) and closes it at once. A helper that starts
 // meanwhile waits for it (openLockWait).
 func OpenWith(path string, opt Options) (*Store, error) {
-	s := &Store{path: path, now: opt.Now, pid: opt.PIDAlive, ls: opt.Lease, changed: make(chan struct{}, 1)}
+	s := &Store{path: path, now: opt.Now, pid: opt.PIDAlive, ls: opt.Lease, requireExisting: opt.RequireExisting, changed: make(chan struct{}, 1)}
 	if s.now == nil {
 		s.now = time.Now
 	}
@@ -267,7 +271,7 @@ func OpenWith(path string, opt Options) (*Store, error) {
 	}
 	_, statErr := os.Stat(path)
 	fresh := errors.Is(statErr, os.ErrNotExist)
-	if fresh && opt.ReadOnly {
+	if fresh && (opt.ReadOnly || opt.RequireExisting) {
 		return nil, fmt.Errorf("store: %s does not exist", path)
 	}
 	exclusive := opt.Exclusive || networkFS(filepath.Dir(path))
@@ -370,6 +374,13 @@ func (s *Store) openReadOnly(exclusive bool) (*Store, error) {
 
 func (s *Store) prepare(fresh, exclusive bool) error {
 	ctx := context.Background()
+	if s.requireExisting {
+		// Check before enabling WAL or running any schema initialization. A
+		// published empty/truncated file is lost state, never a fresh install.
+		if err := checkVersion(s.w, true); err != nil {
+			return err
+		}
+	}
 	if exclusive {
 		var lm string
 		if err := s.w.QueryRowContext(ctx, "PRAGMA locking_mode").Scan(&lm); err != nil {
@@ -416,7 +427,7 @@ func checkVersion(db *sql.DB, allowOlder bool) error {
 	if app != ApplicationID {
 		return fmt.Errorf("%w: application_id %#x", ErrUnknownVersion, app)
 	}
-	if ver > SchemaVersion || (!allowOlder && ver != SchemaVersion) {
+	if ver < 1 || ver > SchemaVersion || (!allowOlder && ver != SchemaVersion) {
 		return fmt.Errorf("%w: user_version %d (this build understands %d)", ErrUnknownVersion, ver, SchemaVersion)
 	}
 	return nil
@@ -462,6 +473,12 @@ func (s *Store) migrate(ctx context.Context) error {
 				return fmt.Errorf("store: migration %d: %w", v+1, err)
 			}
 		}
+		if v == 5 {
+			if err := migrateEngineState(tx); err != nil {
+				tx.Rollback()
+				return fmt.Errorf("store: migration 6: %w", err)
+			}
+		}
 		if v == 0 {
 			now := s.ms()
 			if _, err := tx.ExecContext(ctx, `INSERT INTO meta(key,value) VALUES ('created_at', ?)`, fmt.Sprint(now)); err != nil {
@@ -502,11 +519,13 @@ func (s *Store) ms() int64 { return s.now().UnixMilli() }
 // Generation returns the owner generation acquired by this Store (0 if none).
 func (s *Store) Generation() int64 { return s.gen }
 
-// Tx is one write transaction. It is only valid inside Update.
+// Tx is valid only inside an Update or Read callback. A Read callback must
+// use queries only; its connection is opened read-only.
 type Tx struct {
-	tx  *sql.Tx
-	s   *Store
-	now int64
+	addedNotifications []NotificationScope // event hints, published only after commit
+	tx                 *sql.Tx
+	s                  *Store
+	now                int64
 }
 
 // Now returns the transaction's clock in unix ms.
@@ -579,6 +598,12 @@ func (s *Store) View(fn func(q Querier) error) error {
 	return fn(tx)
 }
 
+// Read runs typed store queries in a short read transaction without waking
+// state publishers. The callback must not write or perform external I/O.
+func (s *Store) Read(fn func(*Tx) error) error {
+	return s.View(func(q Querier) error { return fn(&Tx{tx: q.(*sql.Tx), s: s, now: s.ms()}) })
+}
+
 // Querier is the read surface shared by *sql.DB, *sql.Tx and *sql.Conn.
 type Querier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
@@ -629,6 +654,11 @@ func (t *Tx) MetaPrefix(prefix string) (map[string]string, error) {
 
 // SetMeta writes a meta value (only when it changes).
 func (t *Tx) SetMeta(key, value string) error {
+	// These former object/collection keys have concrete SQL APIs. Reject an
+	// accidentally missed caller rather than resurrecting two authorities.
+	if !scalarMetaKey(key) {
+		return fmt.Errorf("store: %s requires a concrete state API", key)
+	}
 	_, err := t.exec(`INSERT INTO meta(key,value) VALUES (?,?)
 ON CONFLICT(key) DO UPDATE SET value = excluded.value WHERE value <> excluded.value`, key, value)
 	return err

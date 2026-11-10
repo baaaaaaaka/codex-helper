@@ -117,3 +117,44 @@ func TestAcceptedProgressBatchCrashRecovery(t *testing.T) {
 	}
 	s.Check("all members survive once in order", ok && strings.Index(text, answer) > last, "100 progress records exactly once, then final", fmt.Sprint(ok), s.Transcript(work.ID, 12)...)
 }
+
+func TestUnknownProgressBatchAllowsFinalAcrossRestart(t *testing.T) {
+	harness.Parallel(t)
+	s := harness.NewScenario(t, "TURN-UNKNOWN-BATCH", harness.Options{Title: "an absent progress batch remains retained while the final and next task are delivered", Budget: 100 * time.Second, Golden: harness.GoldenOptions{Skip: "Explicit assertions check the exact failed batch, final, next task, and POST count."}})
+	defer s.Finish()
+	control := steps.ReadyControlChat(s)
+	work, _ := steps.NewWorkChat(s, control, "unknown-batch")
+	tok := s.Token("unknownbatch")
+	answer := "Completed " + s.Token("batchfinal")
+	var notes []string
+	for i := 0; i < 100; i++ {
+		notes = append(notes, fmt.Sprintf("UNKNOWN-BATCH-%03d-%s", i, tok))
+	}
+	s.Codex.SetScript(func(c harness.CodexCall) harness.CodexBehavior {
+		if c.HasToken(tok) {
+			return harness.CodexBehavior{MoreCommentary: notes, Answer: answer}
+		}
+		return harness.CodexBehavior{}
+	})
+	fault := s.Graph.AddFault(fakegraph.Fault{Name: "merged-batch-absent", Kind: fakegraph.FaultDropBeforeAccept, Method: "POST", ChatID: work.ID, Times: 1, Match: func(r fakegraph.Request) bool {
+		return strings.Contains(r.Body, notes[1]) && strings.Contains(r.Body, notes[2])
+	}})
+	steps.MustPost(s, work.ID, "Produce progress "+tok)
+	s.Require("final passes unknown batch", 60*time.Second, func() (bool, string) {
+		return fault.Fired() == 1 && len(s.SUTMessagesContaining(work.ID, answer)) == 1, "final pending or merged fault not hit"
+	})
+	s.StopSUT()
+	s.StartSUT()
+	next := s.Token("afterbatch")
+	steps.MustPost(s, work.ID, "Following task "+next)
+	_, ok := steps.WaitAnswered(s, work.ID, next, steps.AnswerTimeout)
+	s.Check("following task works once", ok && len(s.Codex.CallsWithToken(next)) == 1, "one following answer", fmt.Sprint(ok))
+	failed := 0
+	for _, p := range s.Graph.Requests(fakegraph.RequestFilter{Method: "POST", ChatID: work.ID}) {
+		if strings.Contains(p.Body, notes[1]) || strings.Contains(p.Body, notes[2]) {
+			failed++
+		}
+	}
+	s.Check("unknown batch is never replayed or split", failed == 1 && len(s.SUTMessagesContaining(work.ID, notes[1])) == 0 && len(s.SUTMessagesContaining(work.ID, notes[2])) == 0, "one merged attempt, absent members", fmt.Sprint(failed))
+	s.Check("completed source task did not rerun", len(s.Codex.CallsWithToken(tok)) == 1, "one execution", fmt.Sprint(len(s.Codex.CallsWithToken(tok))))
+}

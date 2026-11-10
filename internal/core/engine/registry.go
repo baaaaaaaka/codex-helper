@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"io"
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/channel"
@@ -35,6 +36,9 @@ const (
 // registryLoop publishes the card every Timing.Registry once the inbox chat
 // exists, and a draining card when the engine stops.
 func (e *Engine) registryLoop(ctx context.Context) {
+	if closer, ok := e.cfg.Registrar.(io.Closer); ok {
+		defer closer.Close()
+	}
 	var backoff time.Duration
 	t := time.NewTimer(0)
 	defer t.Stop()

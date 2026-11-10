@@ -10,18 +10,18 @@
 == cli
 $ cxp teams auth config --scopes openid profile offline_access User.Read Chat.ReadWrite Mail.Read Sites.FullControl.All
    exit 0
-   stdout| Saved Teams auth config: <root>/home/.config/codex-helper/teams-auth.json
+   stdout| Saved Teams auth config: <root>/home/.config/codex-helper/teams-auth.sqlite
    stdout| Not ready: unexpected Teams Graph scope(s): Mail.Read, Sites.FullControl.All; set CODEX_HELPER_TEAMS_ALLOW_UNSAFE_SCOPES=1 to override
 $ cxp teams auth config
    exit 0
-   stdout| Teams auth config: <root>/home/.config/codex-helper/teams-auth.json
+   stdout| Teams auth config: <root>/home/.config/codex-helper/teams-auth.sqlite
    stdout| Tenant ID: configured
    stdout| Read client ID: configured
    stdout| Client ID: configured
    stdout| Scopes: openid profile offline_access User.Read Chat.ReadWrite Mail.Read Sites.FullControl.All
 $ cxp teams auth config --scopes 
    exit 0
-   stdout| Saved Teams auth config: <root>/home/.config/codex-helper/teams-auth.json
+   stdout| Saved Teams auth config: <root>/home/.config/codex-helper/teams-auth.sqlite
    stdout| Tenant ID: configured
    stdout| Read client ID: configured
    stdout| Client ID: configured

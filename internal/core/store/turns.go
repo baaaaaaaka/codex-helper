@@ -91,7 +91,7 @@ func (t *Tx) NextRunnable(convID int64) (Turn, bool, error) {
 		}
 	}
 	var blocked int
-	if err := t.row(`SELECT EXISTS(SELECT 1 FROM outbox WHERE conv_id = ? AND state IN ('queued','sending','unknown')
+	if err := t.row(`SELECT EXISTS(SELECT 1 FROM outbox WHERE conv_id = ? AND state IN ('queued','sending')
 AND kind <> 'ack' AND NOT (delivery_key LIKE 'turn:%' AND CAST(substr(delivery_key, 6) AS INTEGER) >= ?))`, convID, head.ID).Scan(&blocked); err != nil {
 		return Turn{}, false, err
 	}

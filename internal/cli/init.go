@@ -33,6 +33,7 @@ func newInitCmd(root *rootOptions) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			defer store.Close()
 
 			prof, err := initProfileInteractiveFunc(cmd.Context(), store)
 			if err != nil {
@@ -184,10 +185,7 @@ func initProfileInteractiveWithDeps(
 		}
 	}
 
-	if err := store.Update(func(cfg *config.Config) error {
-		cfg.UpsertProfile(prof)
-		return nil
-	}); err != nil {
+	if err := store.PutProfile(prof); err != nil {
 		return config.Profile{}, err
 	}
 
@@ -269,10 +267,7 @@ func initProfileFromSSHConfig(
 			}
 			continue
 		}
-		if err := store.Update(func(cfg *config.Config) error {
-			cfg.UpsertProfile(prof)
-			return nil
-		}); err != nil {
+		if err := store.PutProfile(prof); err != nil {
 			return config.Profile{}, false, err
 		}
 		return prof, true, nil

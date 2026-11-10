@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -12,6 +11,7 @@ import (
 
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
 	"github.com/baaaaaaaka/codex-helper/internal/update"
+	"github.com/baaaaaaaka/codex-helper/internal/updatestate"
 )
 
 type teamsPendingHelperActivation struct {
@@ -26,12 +26,7 @@ var (
 	teamsUpdatePendingHelperActivationOwned       = teamsPendingHelperActivationOwnerMatches
 )
 
-type teamsPendingHelperActivationOwner struct {
-	Version       int       `json:"version"`
-	Kind          string    `json:"kind"`
-	TargetVersion string    `json:"target_version"`
-	CreatedAt     time.Time `json:"created_at"`
-}
+type teamsPendingHelperActivationOwner = updatestate.ActivationOwner
 
 func discoverTeamsPendingHelperActivation(ctx context.Context, installPath string, targetVersion string) (teamsPendingHelperActivation, bool, error) {
 	if teamsServiceGOOS() != "windows" {
@@ -175,57 +170,30 @@ func helperVersionFromPendingPath(pendingPath string) string {
 	return ""
 }
 
-func teamsPendingHelperActivationOwnerPath(pendingPath string) string {
-	pendingPath = strings.TrimSpace(pendingPath)
-	if pendingPath == "" {
-		return ""
-	}
-	return pendingPath + ".teams-activation.json"
-}
-
 func writeTeamsPendingHelperActivationOwner(pendingPath string, version string) error {
-	path := teamsPendingHelperActivationOwnerPath(pendingPath)
+	pendingPath = strings.TrimSpace(pendingPath)
 	version = strings.TrimPrefix(strings.TrimSpace(version), "v")
-	if path == "" || version == "" {
+	if pendingPath == "" || version == "" {
 		return fmt.Errorf("pending helper activation owner requires path and version")
 	}
-	raw, err := json.Marshal(teamsPendingHelperActivationOwner{
-		Version:       1,
-		Kind:          "teams-helper-update",
-		TargetVersion: version,
-		CreatedAt:     time.Now(),
-	})
+	store, err := updatestate.Open(filepath.Dir(pendingPath))
 	if err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	defer store.Close()
+	return store.SaveOwner(pendingPath, teamsPendingHelperActivationOwner{Version: 1, Kind: "teams-helper-update", TargetVersion: version, CreatedAt: time.Now()})
 }
-
 func teamsPendingHelperActivationOwnerMatches(pendingPath string, version string) bool {
-	path := teamsPendingHelperActivationOwnerPath(pendingPath)
-	if path == "" {
+	if strings.TrimSpace(pendingPath) == "" {
 		return false
 	}
-	raw, err := os.ReadFile(path)
+	store, err := updatestate.OpenRead(filepath.Dir(pendingPath))
 	if err != nil {
 		return false
 	}
-	var owner teamsPendingHelperActivationOwner
-	if err := json.Unmarshal(raw, &owner); err != nil {
-		return false
-	}
-	if !strings.EqualFold(strings.TrimSpace(owner.Kind), "teams-helper-update") {
-		return false
-	}
-	return update.VersionMatchesTarget(owner.TargetVersion, version)
+	defer store.Close()
+	owner, err := store.Owner(pendingPath)
+	return err == nil && strings.EqualFold(strings.TrimSpace(owner.Kind), "teams-helper-update") && update.VersionMatchesTarget(owner.TargetVersion, version)
 }
 
 func windowsTeamsDestVersionProbePowerShell() string {
@@ -291,14 +259,13 @@ func windowsTeamsPendingHelperActivationPowerShell(pendingPath string, installPa
 		"$src=" + powershellSingleQuote(pendingPath) + "; " +
 		"$dest=" + powershellSingleQuote(installPath) + "; " +
 		"$want=" + powershellSingleQuote(strings.TrimPrefix(strings.TrimSpace(version), "v")) + "; " +
-		"$statusPath=$src + '.activation.json'; " +
 		"$parent=" + fmt.Sprintf("%d", currentProcessID()) + "; " +
 		"$tasks=@(" + powershellSingleQuote(teamsServiceWindowsWatchdogTaskName) + "," + powershellSingleQuote(teamsServiceWindowsTaskName) + "); " +
 		"$logDir=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'codex-helper\\updates'; " +
 		"New-Item -ItemType Directory -Force -Path $logDir | Out-Null; " +
 		"$log=Join-Path $logDir 'teams-helper-activation.log'; " +
 		"function Log([string]$m) { try { Add-Content -LiteralPath $log -Value ((Get-Date).ToString('o') + ' ' + $m) } catch {} }; " +
-		"function Write-Status([string]$s,[string]$m) { try { $tmp=$statusPath + '.tmp'; [pscustomobject]@{version=1;status=$s;message=$m;source=$src;dest=$dest;want=$want;updated_at=(Get-Date).ToString('o')} | ConvertTo-Json -Compress | Set-Content -LiteralPath $tmp -Encoding UTF8 -ErrorAction Stop; Move-Item -Force -LiteralPath $tmp -Destination $statusPath -ErrorAction Stop } catch { Log ('status write failed: ' + $_.Exception.Message) } }; " +
+		"function Write-Status([string]$s,[string]$m) { try { $writer=$src; if (-not (Test-Path -LiteralPath $writer)) { $writer=$dest }; & $writer --cxp-record-activation --source $src --dest $dest --want $want --status $s --message $m | Out-Null; if ($LASTEXITCODE -ne 0) { throw ('native status writer exited with ' + $LASTEXITCODE) } } catch { Log ('status write failed: ' + $_.Exception.Message) } }; " +
 		"Log ('activation starting src=' + $src + ' dest=' + $dest + ' want=' + $want + ' parent=' + $parent); " +
 		"Write-Status 'running' 'activation started'; " +
 		"try { Wait-Process -Id $parent -Timeout 120 -ErrorAction SilentlyContinue } catch { Log ('parent wait failed: ' + $_.Exception.Message) }; " +
@@ -322,7 +289,6 @@ func windowsTeamsPendingHelperProcessRestartPowerShell(pendingPath string, insta
 		"$src=" + powershellSingleQuote(pendingPath) + "; " +
 		"$dest=" + powershellSingleQuote(installPath) + "; " +
 		"$want=" + powershellSingleQuote(strings.TrimPrefix(strings.TrimSpace(version), "v")) + "; " +
-		"$statusPath=$src + '.activation.json'; " +
 		"$argList=" + powershellArrayLiteral(args) + "; " +
 		"$parent=" + fmt.Sprintf("%d", currentProcessID()) + "; " +
 		"$logDir=Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'codex-helper\\updates'; " +
@@ -331,7 +297,7 @@ func windowsTeamsPendingHelperProcessRestartPowerShell(pendingPath string, insta
 		"$stdoutLog=Join-Path $logDir 'teams-helper-process-restart.stdout.log'; " +
 		"$stderrLog=Join-Path $logDir 'teams-helper-process-restart.stderr.log'; " +
 		"function Log([string]$m) { try { Add-Content -LiteralPath $log -Value ((Get-Date).ToString('o') + ' ' + $m) } catch {} }; " +
-		"function Write-Status([string]$s,[string]$m) { try { $tmp=$statusPath + '.tmp'; [pscustomobject]@{version=1;status=$s;message=$m;source=$src;dest=$dest;want=$want;updated_at=(Get-Date).ToString('o')} | ConvertTo-Json -Compress | Set-Content -LiteralPath $tmp -Encoding UTF8 -ErrorAction Stop; Move-Item -Force -LiteralPath $tmp -Destination $statusPath -ErrorAction Stop } catch { Log ('status write failed: ' + $_.Exception.Message) } }; " +
+		"function Write-Status([string]$s,[string]$m) { try { $writer=$src; if (-not (Test-Path -LiteralPath $writer)) { $writer=$dest }; & $writer --cxp-record-activation --source $src --dest $dest --want $want --status $s --message $m | Out-Null; if ($LASTEXITCODE -ne 0) { throw ('native status writer exited with ' + $LASTEXITCODE) } } catch { Log ('status write failed: ' + $_.Exception.Message) } }; " +
 		"Log ('process restart starting src=' + $src + ' dest=' + $dest + ' want=' + $want + ' parent=' + $parent); " +
 		"Write-Status 'running' 'activation started'; " +
 		"try { Wait-Process -Id $parent -Timeout 120 -ErrorAction SilentlyContinue } catch { Log ('parent wait failed: ' + $_.Exception.Message) }; " +

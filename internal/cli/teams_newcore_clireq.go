@@ -4,13 +4,11 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -21,9 +19,9 @@ import (
 // Commands that act through the running helper (gap batch G: `teams
 // control --recreate`, `teams chat recreate`, `teams chat publish-history`,
 // `teams send-file`). The command never opens the store a helper holds: it
-// leaves a request file in cli-requests/ next to the store; the helper
+// submits a row to the independent exchange database; the helper
 // picks it up on its 5 s watcher tick (the one that applies Workflow
-// changes), hands it to engine.CLIRequest and writes <id>.result.json,
+// changes), hands it to engine.CLIRequest and publishes result rows in the exchange database,
 // which the command prints. A request left while no helper runs is run by
 // the next one, on this host or (shared home) on another.
 
@@ -39,29 +37,12 @@ func teamsCLIRequestDir(anchor string) string {
 	return filepath.Join(filepath.Dir(anchor), teamsCLIRequestDirName)
 }
 
-func teamsCLIResultPath(dir, id string) string { return filepath.Join(dir, id+".result.json") }
-func teamsCLIStageDir(dir, id string) string   { return filepath.Join(dir, id+".d") }
+func teamsCLIStageDir(dir, id string) string { return filepath.Join(dir, id+".d") }
 
 func newTeamsCLIRequestID(now time.Time) string {
 	var b [4]byte
 	_, _ = rand.Read(b[:])
 	return fmt.Sprintf("%d-%s", now.UnixMilli(), hex.EncodeToString(b[:]))
-}
-
-func writeTeamsJSONFile(path string, v any) error {
-	raw, err := json.Marshal(v)
-	if err != nil {
-		return err
-	}
-	tmp := fmt.Sprintf("%s.%d.tmp", path, os.Getpid())
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
 }
 
 // teamsCLISubmission is a request a command is about to leave.
@@ -101,26 +82,32 @@ func submitTeamsCLIRequest(out io.Writer, sub teamsCLISubmission) error {
 		}
 		sub.req.File = file
 	}
-	reqPath := filepath.Join(dir, sub.req.ID+".json")
-	if err := writeTeamsJSONFile(reqPath, sub.req); err != nil {
+	mail, err := openTeamsExchange(view.Anchor, false)
+	if err != nil {
 		_ = os.RemoveAll(teamsCLIStageDir(dir, sub.req.ID))
 		return err
 	}
+	defer mail.Close()
+	if err = mail.Submit(sub.req); err != nil {
+		_ = os.RemoveAll(teamsCLIStageDir(dir, sub.req.ID))
+		return err
+	}
+
 	if !view.Info.Exists || !view.Info.Live(now, lease.ProductionStale) {
 		_, _ = fmt.Fprintln(out, "The Teams helper is not running. The request is kept and runs when the helper starts (`cxp teams start`, or `cxp teams run --once` to run it once now).")
 		return nil
 	}
 	_, _ = fmt.Fprintln(out, "Waiting for the running Teams helper...")
 	deadline := now.Add(teamsCLIRequestWait)
-	resPath := teamsCLIResultPath(dir, sub.req.ID)
 	for time.Now().Before(deadline) {
-		raw, err := os.ReadFile(resPath)
-		if err == nil {
-			var res engine.CLIResult
-			if err := json.Unmarshal(raw, &res); err != nil {
-				return fmt.Errorf("read the helper's result: %w", err)
+		res, ok, err := mail.Result(sub.req.ID)
+		if err != nil {
+			return fmt.Errorf("read the helper's result: %w", err)
+		}
+		if ok {
+			if err = mail.Ack(sub.req.ID); err != nil {
+				return err
 			}
-			_ = os.Remove(resPath)
 			_ = os.RemoveAll(teamsCLIStageDir(dir, sub.req.ID))
 			if res.Error != "" {
 				return errors.New(res.Error)
@@ -139,10 +126,11 @@ func submitTeamsCLIRequest(out io.Writer, sub teamsCLISubmission) error {
 // teamsCLIRequests is the helper's side: it runs the requests it finds,
 // one goroutine per request (the engine runs them one at a time).
 type teamsCLIRequests struct {
-	dir string
-	e   *engine.Engine
-	ctx context.Context
-	log io.Writer
+	mail *teamsExchangeStore
+	dir  string
+	e    *engine.Engine
+	ctx  context.Context
+	log  io.Writer
 
 	mu       sync.Mutex
 	inflight map[string]bool
@@ -150,29 +138,42 @@ type teamsCLIRequests struct {
 	wg       sync.WaitGroup
 }
 
-func newTeamsCLIRequests(ctx context.Context, anchor string, e *engine.Engine, log io.Writer) *teamsCLIRequests {
-	return &teamsCLIRequests{dir: teamsCLIRequestDir(anchor), e: e, ctx: ctx, log: log,
+func newTeamsCLIRequests(ctx context.Context, anchor string, e *engine.Engine, log io.Writer, mail *teamsExchangeStore) *teamsCLIRequests {
+	return &teamsCLIRequests{mail: mail, dir: teamsCLIRequestDir(anchor), e: e, ctx: ctx, log: log,
 		inflight: map[string]bool{}, logged: map[string]string{}}
 }
 
 // tick starts the requests found and drops results nobody read. It runs
 // on the helper's watcher tick (no timer of its own).
 func (q *teamsCLIRequests) tick(now time.Time) {
-	entries, err := os.ReadDir(q.dir)
-	if err != nil {
-		return // no request was ever left
+	for {
+		expired, err := q.mail.Expire(now.Add(-teamsCLIResultKeep))
+		if err != nil {
+			fmt.Fprintf(q.log, "Teams CLI exchange cleanup: %v\n", err)
+			return
+		}
+		for _, id := range expired {
+			_ = os.RemoveAll(teamsCLIStageDir(q.dir, id))
+		}
+		if len(expired) < 128 {
+			break
+		}
 	}
-	for _, ent := range entries {
-		name := ent.Name()
-		switch {
-		case strings.HasSuffix(name, ".result.json"):
-			if info, err := ent.Info(); err == nil && now.Sub(info.ModTime()) > teamsCLIResultKeep {
-				id := strings.TrimSuffix(name, ".result.json")
-				_ = os.Remove(filepath.Join(q.dir, name))
-				_ = os.RemoveAll(teamsCLIStageDir(q.dir, id))
-			}
-		case strings.HasSuffix(name, ".json") && !ent.IsDir():
-			q.start(strings.TrimSuffix(name, ".json"))
+	// Page through keys, closing each cursor before starting work. A running
+	// first page cannot starve requests on later pages.
+	after := ""
+	for {
+		ids, err := q.mail.IDs(after)
+		if err != nil {
+			fmt.Fprintf(q.log, "Teams CLI exchange read: %v\n", err)
+			return
+		}
+		for _, id := range ids {
+			q.start(id)
+			after = id
+		}
+		if len(ids) < 128 {
+			return
 		}
 	}
 }
@@ -193,14 +194,13 @@ func (q *teamsCLIRequests) start(id string) {
 			delete(q.inflight, id)
 			q.mu.Unlock()
 		}()
-		reqPath := filepath.Join(q.dir, id+".json")
-		raw, err := os.ReadFile(reqPath)
-		if err != nil {
+		r, ok, err := q.mail.Request(id)
+		if err != nil || !ok {
 			return
 		}
-		var r engine.CLIRequest
+
 		res := engine.CLIResult{}
-		if err := json.Unmarshal(raw, &r); err != nil || r.ID != id {
+		if r.ID != id {
 			res.Error = "the request file is not readable by this helper version"
 		} else {
 			res, err = q.e.CLIRequest(q.ctx, r)
@@ -215,11 +215,10 @@ func (q *teamsCLIRequests) start(id string) {
 				return // handed in again at the next tick
 			}
 		}
-		if err := writeTeamsJSONFile(teamsCLIResultPath(q.dir, id), res); err != nil {
+		if err := q.mail.Complete(id, res, time.Now()); err != nil {
 			_, _ = fmt.Fprintf(q.log, "Teams command-line request %s: write result: %v\n", id, err)
 			return
 		}
-		_ = os.Remove(reqPath)
 		q.mu.Lock()
 		delete(q.logged, id)
 		q.mu.Unlock()
@@ -235,16 +234,9 @@ func (q *teamsCLIRequests) pending() bool {
 	if n > 0 {
 		return true
 	}
-	entries, err := os.ReadDir(q.dir)
-	if err != nil {
-		return false
-	}
-	for _, ent := range entries {
-		if name := ent.Name(); strings.HasSuffix(name, ".json") && !strings.HasSuffix(name, ".result.json") && !ent.IsDir() {
-			return true
-		}
-	}
-	return false
+	pending, err := q.mail.Pending()
+	return pending || err != nil // never declare a damaged/unreadable mailbox drained
+
 }
 
 // wait waits (bounded) for the running requests after the engine stopped:

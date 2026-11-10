@@ -413,7 +413,7 @@ func TestPoolWarmReapAndPIDFile(t *testing.T) {
 	now := time.Unix(1_000_000, 0)
 	var nmu sync.Mutex
 	clock := func() time.Time { nmu.Lock(); defer nmu.Unlock(); return now }
-	pidFile := filepath.Join(home, "run", "appservers.json")
+	pidFile := filepath.Join(home, "run", "appservers.sqlite")
 	p := NewPool(PoolConfig{Idle: 10 * time.Minute, PIDFile: pidFile, Now: clock})
 	defer p.Close(5 * time.Second)
 	ctx := tctx(t)
@@ -434,10 +434,9 @@ func TestPoolWarmReapAndPIDFile(t *testing.T) {
 	if err != nil || l2.Server() != l1.Server() {
 		t.Fatalf("second lease: %v", err)
 	}
-	var recs []pidRecord
-	data, _ := os.ReadFile(pidFile)
-	if json.Unmarshal(data, &recs) != nil || len(recs) != 1 || recs[0].PID != l1.Server().PID() {
-		t.Fatalf("pid file %s", data)
+	recs := testPIDRecords(t, pidFile)
+	if len(recs) != 1 || recs[0].PID != l1.Server().PID() {
+		t.Fatalf("process records %#v", recs)
 	}
 	l1.Release()
 	l2.Release()
@@ -452,9 +451,8 @@ func TestPoolWarmReapAndPIDFile(t *testing.T) {
 	if n := p.Reap(); n != 1 || !srv.Exited() || p.Size() != 0 {
 		t.Fatalf("reap: %d exited=%v size=%d", n, srv.Exited(), p.Size())
 	}
-	data, _ = os.ReadFile(pidFile)
-	if strings.TrimSpace(string(data)) != "[]" {
-		t.Fatalf("pid file after reap %s", data)
+	if recs := testPIDRecords(t, pidFile); len(recs) != 0 {
+		t.Fatalf("process records after reap %#v", recs)
 	}
 	// A new server must resume the thread before a turn.
 	l3, err := p.Acquire(ctx, "conv-1", cfg)
@@ -541,9 +539,8 @@ func TestKillStale(t *testing.T) {
 	if bootID() != "" && !groupAlive(moved.Process.Pid) {
 		t.Fatal("killed a pid recorded on another machine")
 	}
-	data, _ = os.ReadFile(pidFile)
-	if string(data) != "[]" {
-		t.Fatalf("pid file %s", data)
+	if recs := testPIDRecords(t, pidFile); len(recs) != 0 {
+		t.Fatalf("process records after cleanup %#v", recs)
 	}
 	if n, err := KillStale(filepath.Join(t.TempDir(), "missing"), time.Second); n != 0 || err != nil {
 		t.Fatalf("missing file: %d %v", n, err)

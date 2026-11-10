@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -43,38 +42,19 @@ type CodexUpgrader interface {
 
 // Meta keys of updates.
 const (
-	metaUpdateNext    = "engine_update_next_check" // unix ms of the next automatic release check
-	metaUpdateRequest = "engine_update_request"    // JSON updateRequest: a release waiting for drain and install
-	metaUpdatePending = "engine_update_pending"    // JSON updateRequest: installed, announced by the next process
-	metaUpdateSkip    = "engine_update_skip"       // tag whose activation failed: automatic checks skip it
-	metaCodexUpgrade  = "engine_codex_upgrade"     // JSON codexRequest: a Codex CLI upgrade waiting for drain
+	metaUpdateNext = "engine_update_next_check" // unix ms of the next automatic release check
+	metaUpdateSkip = "engine_update_skip"       // tag whose activation failed: automatic checks skip it
 )
 
 // updateRequest is a helper release to install, and the command that asked
 // for it (Conv 0: an automatic update, announced in the control chat).
-type updateRequest struct {
-	Tag        string `json:"tag"`
-	Prerelease bool   `json:"prerelease,omitempty"`
-	Conv       int64  `json:"conv,omitempty"`
-	Inbound    int64  `json:"inbound,omitempty"`
-	Quote      string `json:"quote,omitempty"`
-	From       string `json:"from,omitempty"` // version that installed it
-}
+type updateRequest = store.UpdateRequest
 
 // codexRequest is a pending Codex CLI upgrade: the command that asked for
 // it (Conv 0: none) and the requests Codex rejected as too old.
-type codexRequest struct {
-	ID      string        `json:"id"`
-	Conv    int64         `json:"conv,omitempty"`
-	Inbound int64         `json:"inbound,omitempty"`
-	Quote   string        `json:"quote,omitempty"`
-	Targets []codexTarget `json:"targets,omitempty"`
-}
+type codexRequest = store.CodexRequest
 
-type codexTarget struct {
-	Conv    int64 `json:"conv"`
-	Inbound int64 `json:"inbound"`
-}
+type codexTarget = store.CodexTarget
 
 // User-visible update texts (the old core's, without paths).
 const (
@@ -150,25 +130,6 @@ func sameVersion(a, b string) bool {
 	return norm(a) != "" && norm(a) == norm(b)
 }
 
-func metaJSON(tx *store.Tx, key string, v any) (bool, error) {
-	raw, ok, err := tx.Meta(key)
-	if err != nil || !ok || strings.TrimSpace(raw) == "" {
-		return false, err
-	}
-	if err := json.Unmarshal([]byte(raw), v); err != nil {
-		return false, nil // unreadable: treated as absent
-	}
-	return true, nil
-}
-
-func setMetaJSON(tx *store.Tx, key string, v any) error {
-	raw, err := json.Marshal(v)
-	if err != nil {
-		return err
-	}
-	return tx.SetMeta(key, string(raw))
-}
-
 // announceUpdate posts, once, the outcome of the helper update the
 // previous process installed: completed when this process runs the target
 // version, else activation failed (R-16, R-17). The notice and the end of
@@ -176,7 +137,7 @@ func setMetaJSON(tx *store.Tx, key string, v any) error {
 func (e *Engine) announceUpdate() error {
 	return e.update(func(tx *store.Tx) error {
 		var p updateRequest
-		ok, err := metaJSON(tx, metaUpdatePending, &p)
+		ok, err := readUpdatePending(tx, &p)
 		if err != nil || !ok {
 			return err
 		}
@@ -204,7 +165,7 @@ func (e *Engine) announceUpdate() error {
 		if err := e.addServiceNotify(tx, conv, fmt.Sprintf("update-done:%s:%s:%d", p.Tag, p.From, p.Inbound), text); err != nil {
 			return err
 		}
-		return tx.SetMeta(metaUpdatePending, "")
+		return tx.DeleteUpdatePending()
 	})
 }
 
@@ -244,10 +205,10 @@ func (e *Engine) updateStep(ctx context.Context) time.Duration {
 	)
 	err := e.update(func(tx *store.Tx) error {
 		var err error
-		if haveC, err = metaJSON(tx, metaCodexUpgrade, &creq); err != nil {
+		if haveC, err = readCodexRequest(tx, &creq); err != nil {
 			return err
 		}
-		if have, err = metaJSON(tx, metaUpdateRequest, &hreq); err != nil {
+		if have, err = readUpdateRequest(tx, &hreq); err != nil {
 			return err
 		}
 		v, _, err := tx.Meta(metaUpdateNext)
@@ -290,7 +251,7 @@ func (e *Engine) updateStep(ctx context.Context) time.Duration {
 		}
 		// Automatic: no scheduled notice; the next process announces
 		// the outcome once.
-		return setMetaJSON(tx, metaUpdateRequest, updateRequest{Tag: offer.Tag, Prerelease: e.cfg.UpdatePrerelease})
+		return tx.SetUpdateRequest(updateRequest{Tag: offer.Tag, Prerelease: e.cfg.UpdatePrerelease})
 	})
 	if err != nil {
 		e.logf("update: %v", err)
@@ -309,7 +270,7 @@ func (e *Engine) runHelperUpdate(ctx context.Context, req updateRequest) {
 	failed := func(text string) {
 		e.undrain()
 		err := e.update(func(tx *store.Tx) error {
-			if err := tx.SetMeta(metaUpdateRequest, ""); err != nil {
+			if err := tx.DeleteUpdateRequest(); err != nil {
 				return err
 			}
 			if req.Conv == 0 || e.conv(req.Conv) == nil {
@@ -347,10 +308,10 @@ func (e *Engine) runHelperUpdate(ctx context.Context, req updateRequest) {
 	}
 	req.From = e.cfg.Version
 	err := e.update(func(tx *store.Tx) error {
-		if err := setMetaJSON(tx, metaUpdatePending, req); err != nil {
+		if err := tx.SetUpdatePending(req); err != nil {
 			return err
 		}
-		return tx.SetMeta(metaUpdateRequest, "")
+		return tx.DeleteUpdateRequest()
 	})
 	if err != nil {
 		e.logf("update: record %s: %v", req.Tag, err)
@@ -366,7 +327,7 @@ func (e *Engine) runHelperUpdate(ctx context.Context, req updateRequest) {
 // Codex rejected (target), or for a command (conv/inbound/quote).
 func (e *Engine) requestCodexUpgrade(tx *store.Tx, target *codexTarget, cmd *cmdJob) error {
 	var req codexRequest
-	if _, err := metaJSON(tx, metaCodexUpgrade, &req); err != nil {
+	if _, err := readCodexRequest(tx, &req); err != nil {
 		return err
 	}
 	if req.ID == "" {
@@ -378,7 +339,7 @@ func (e *Engine) requestCodexUpgrade(tx *store.Tx, target *codexTarget, cmd *cmd
 	if cmd != nil && req.Conv == 0 {
 		req.Conv, req.Inbound, req.Quote = cmd.conv, cmd.inbound, cmd.quote
 	}
-	return setMetaJSON(tx, metaCodexUpgrade, req)
+	return tx.SetCodexRequest(req)
 }
 
 // runCodexUpgrade drains, upgrades the Codex CLI, posts the outcome to the
@@ -432,7 +393,7 @@ func (e *Engine) runCodexUpgrade(ctx context.Context, req codexRequest) {
 				return err
 			}
 		}
-		return tx.SetMeta(metaCodexUpgrade, "")
+		return tx.DeleteCodexRequest()
 	})
 	if err != nil {
 		e.logf("codex upgrade: record outcome: %v", err)
@@ -537,7 +498,7 @@ func (e *Engine) cmdHelperUpdate(ctx context.Context, j cmdJob, arg string) {
 		return
 	}
 	e.reply(j, helperUpdateScheduled(offer.Tag, prerelease), func(tx *store.Tx) error {
-		return setMetaJSON(tx, metaUpdateRequest, updateRequest{Tag: offer.Tag, Prerelease: prerelease,
+		return tx.SetUpdateRequest(updateRequest{Tag: offer.Tag, Prerelease: prerelease,
 			Conv: j.conv, Inbound: j.inbound, Quote: j.quote})
 	})
 	wake(e.updateWake)
@@ -582,13 +543,13 @@ func (e *Engine) updateStatus() string {
 	)
 	_ = e.update(func(tx *store.Tx) error {
 		var err error
-		if hr, err = metaJSON(tx, metaUpdateRequest, &req); err != nil {
+		if hr, err = readUpdateRequest(tx, &req); err != nil {
 			return err
 		}
-		if hp, err = metaJSON(tx, metaUpdatePending, &pend); err != nil {
+		if hp, err = readUpdatePending(tx, &pend); err != nil {
 			return err
 		}
-		hc, err = metaJSON(tx, metaCodexUpgrade, &creq)
+		hc, err = readCodexRequest(tx, &creq)
 		return err
 	})
 	lines := []string{"## ⬇️ Helper update status", "", "Running: `" + e.cfg.Version + "`"}
@@ -633,4 +594,35 @@ func fmtDuration(d time.Duration) string {
 		return plural(int(d/time.Minute), "minute", "minutes")
 	}
 	return d.Round(time.Second).String()
+}
+
+func readUpdateRequest(tx *store.Tx, p *updateRequest) (bool, error) {
+	n, ok, err := tx.UpdateRequest()
+	*p = n
+	return ok, err
+}
+func readUpdatePending(tx *store.Tx, p *updateRequest) (bool, error) {
+	n, ok, err := tx.UpdatePending()
+	*p = n
+	return ok, err
+}
+func readRestartRequest(tx *store.Tx, p *restartRequest) (bool, error) {
+	n, ok, err := tx.RestartRequest()
+	*p = n
+	return ok, err
+}
+func readCodexRequest(tx *store.Tx, p *codexRequest) (bool, error) {
+	n, ok, err := tx.CodexRequest()
+	*p = n
+	return ok, err
+}
+func (e *Engine) hasRestartRequest() bool {
+	var ok bool
+	err := e.st.Read(func(tx *store.Tx) (err error) { _, ok, err = tx.RestartRequest(); return })
+	return err == nil && ok
+}
+func (e *Engine) hasCodexRequest() bool {
+	var ok bool
+	err := e.st.Read(func(tx *store.Tx) (err error) { _, ok, err = tx.CodexRequest(); return })
+	return err == nil && ok
 }

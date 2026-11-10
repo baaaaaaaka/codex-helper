@@ -1,9 +1,7 @@
 package cli
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -27,7 +25,7 @@ import (
 // host or another) a command never opens the store file: on a network
 // filesystem the helper holds the file's lock for its whole life, and on
 // any filesystem the file may belong to another host. It reads the state
-// the helper publishes instead: core-status.json next to the lease, which
+// the helper publishes instead: core-status.sqlite next to the lease, which
 // the helper rewrites (tmp + rename) after a commit changes what it holds.
 // Nothing runs while the store does not change. The file names the lease
 // generation that wrote it, so a command can tell a current file from one
@@ -38,7 +36,7 @@ import (
 // read-only, and closes it at once (on a network filesystem that takes the
 // file's lock for that moment; a helper starting meanwhile waits for it).
 
-const teamsStatusFileName = "core-status.json"
+const teamsStatusFileName = "core-status.sqlite"
 
 func teamsStatusFilePath(dir string) string { return filepath.Join(dir, teamsStatusFileName) }
 
@@ -79,7 +77,7 @@ type teamsControlChat struct {
 	URL    string `json:"url,omitempty"`
 }
 
-// teamsPublishedStatus is core-status.json.
+// teamsPublishedStatus is core-status.sqlite.
 type teamsPublishedStatus struct {
 	V     int              `json:"v"`
 	Gen   int64            `json:"gen"` // the lease generation that wrote it
@@ -163,15 +161,14 @@ func readTeamsPublishedStatus(dir string) (teamsPublishedStatus, bool) {
 	if d, err := os.Open(dir); err == nil {
 		_ = d.Close()
 	}
-	var p teamsPublishedStatus
-	raw, err := os.ReadFile(teamsStatusFilePath(dir))
-	if err != nil || json.Unmarshal(raw, &p) != nil || p.V != 1 || p.Gen == 0 {
+	p, err := readTeamsStatusSnapshot(teamsStatusFilePath(dir))
+	if err != nil || p.V != 1 || p.Gen == 0 {
 		return teamsPublishedStatus{}, false
 	}
 	return p, true
 }
 
-// teamsStatusPublisher is the helper's side: it keeps core-status.json
+// teamsStatusPublisher is the helper's side: it keeps core-status.sqlite
 // equal to the store's state. It reads the store after commits
 // (Store.Changes): at once after the first commit of a quiet store, then,
 // while commits keep coming, no more often than every
@@ -186,8 +183,8 @@ type teamsStatusPublisher struct {
 	host string
 	log  io.Writer
 
-	last   []byte // the state last written
-	failed string // the last error logged
+	last   *teamsStoreStatus // the state last written
+	failed string            // the last error logged
 }
 
 // teamsStatusPublishGap folds the commits of a burst into one read.
@@ -214,13 +211,12 @@ func newTeamsStatusPublisher(st *corestore.Store, dir string, gen int64, host st
 func (p *teamsStatusPublisher) publish(now time.Time) {
 	s, err := readTeamsStoreStatus(p.st)
 	if err == nil {
-		body, _ := json.Marshal(s)
-		if bytes.Equal(body, p.last) {
+		if p.last != nil && sameTeamsStoreStatus(s, *p.last) {
 			return
 		}
-		err = writeTeamsJSONFile(teamsStatusFilePath(p.dir), teamsPublishedStatus{V: 1, Gen: p.gen, Host: p.host, PID: os.Getpid(), At: now.UnixMilli(), State: s})
+		err = writeTeamsStatusSnapshot(teamsStatusFilePath(p.dir), teamsPublishedStatus{V: 1, Gen: p.gen, Host: p.host, PID: os.Getpid(), At: now.UnixMilli(), State: s})
 		if err == nil {
-			p.last, p.failed = body, ""
+			p.last, p.failed = &s, ""
 			return
 		}
 	}
@@ -421,4 +417,17 @@ func teamsStatusDetailLines(s teamsStoreStatus, view teamsStoreView, now time.Ti
 		add("Registry machine: %s", s.MachineID)
 	}
 	return lines
+}
+
+func sameTeamsStoreStatus(a, b teamsStoreStatus) bool {
+	if (a.Control == nil) != (b.Control == nil) {
+		return false
+	}
+	if a.Control != nil && *a.Control != *b.Control {
+		return false
+	}
+	a.Control, b.Control = nil, nil
+	a.owner, b.owner = corestore.Owner{}, corestore.Owner{}
+	a.ownerOK, b.ownerOK = false, false
+	return a == b
 }

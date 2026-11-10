@@ -79,6 +79,7 @@ func TestRunHistoryTuiLoadsAndPersistsAAA(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { store.Close() })
 	enabled := true
 	proxyDisabled := false
 	if err := store.Save(config.Config{ProxyEnabled: &proxyDisabled, AgentAutoApproveEnabled: &enabled}); err != nil {
@@ -471,7 +472,7 @@ func TestHistoryListCmdPrintsDiscoveredProjects(t *testing.T) {
 	helperSessionID := "aaaaaaaa-bbbb-cccc-dddd-ffffffffffff"
 	tempHelperSessionID := "aaaaaaaa-bbbb-cccc-dddd-999999999999"
 	projectDir := t.TempDir()
-	tempHelperProjectDir := filepath.Join(os.TempDir(), "codex-helper-real-probe")
+	tempHelperProjectDir := "/tmp/codex-helper-real-probe"
 	writeCodexSessionFile(t, codexDir, sessionID, projectDir, "build the release")
 	writeCodexSessionFile(t, codexDir, helperSessionID, projectDir, "[codex-helper-control] helper control prompt")
 	writeCodexSessionFile(t, codexDir, tempHelperSessionID, tempHelperProjectDir, "Reply exactly DEFAULT-PROBE-OK")

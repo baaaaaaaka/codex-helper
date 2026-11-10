@@ -2,7 +2,7 @@
   "schema": 1,
   "repo": "owner/name",
   "version": "v2.0.0",
-  "protocol": 1,
+  "protocol": 2,
   "priority": "p0",
   "published_at": "2026-11-09T00:00:00Z",
   "assets": {

@@ -179,7 +179,7 @@ func TestDelegateResolveDefaultsToInjectedRegistryCandidateLoader(t *testing.T) 
 
 func TestDelegateResolveReturnsRemoteThreadReuseCandidates(t *testing.T) {
 	now := time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC)
-	routeStorePath := filepath.Join(t.TempDir(), "routes.json")
+	routeStorePath := filepath.Join(t.TempDir(), "routes.sqlite")
 	store := delegation.Store{}
 	store.UpsertRemoteThread(delegation.RemoteThread{
 		ThreadID:             "rth-existing",
@@ -195,7 +195,7 @@ func TestDelegateResolveReturnsRemoteThreadReuseCandidates(t *testing.T) {
 		ExpiresAt:            now.Add(time.Hour).Format(time.RFC3339Nano),
 		Generation:           "thread-gen",
 	})
-	if _, err := delegation.SaveStore(routeStorePath, store); err != nil {
+	if _, err := saveDelegateSQLiteFixture(routeStorePath, store); err != nil {
 		t.Fatalf("SaveStore: %v", err)
 	}
 	candidatesPath := writeJSONFile(t, "candidates.json", []delegation.Candidate{{
@@ -243,7 +243,7 @@ func TestDelegateResolveReturnsRemoteThreadReuseCandidates(t *testing.T) {
 
 func TestDelegateResolveFiltersUnavailableRemoteThreadCandidates(t *testing.T) {
 	now := time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC)
-	routeStorePath := filepath.Join(t.TempDir(), "routes.json")
+	routeStorePath := filepath.Join(t.TempDir(), "routes.sqlite")
 	store := delegation.Store{}
 	for _, thread := range []delegation.RemoteThread{
 		{
@@ -285,7 +285,7 @@ func TestDelegateResolveFiltersUnavailableRemoteThreadCandidates(t *testing.T) {
 	} {
 		store.UpsertRemoteThread(thread)
 	}
-	if _, err := delegation.SaveStore(routeStorePath, store); err != nil {
+	if _, err := saveDelegateSQLiteFixture(routeStorePath, store); err != nil {
 		t.Fatalf("SaveStore: %v", err)
 	}
 	candidatesPath := writeJSONFile(t, "candidates.json", []delegation.Candidate{{
@@ -399,7 +399,7 @@ func TestDelegateResolveMatchesCapabilitiesAndBindsCandidateMetadata(t *testing.
 
 func TestDelegateStartIsIdempotentAndCancelIsReduced(t *testing.T) {
 	now := time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC)
-	storePath := filepath.Join(t.TempDir(), "delegation.json")
+	storePath := filepath.Join(t.TempDir(), "delegation.sqlite")
 	taskPath := writeJSONFile(t, "task.json", delegation.TaskSpec{
 		Title:          "Check remote logs",
 		Objective:      "Inspect machine B logs and return final-or-blocked.",
@@ -429,12 +429,12 @@ func TestDelegateStartIsIdempotentAndCancelIsReduced(t *testing.T) {
 	if first.DelegationID == "" || first.DelegationID != second.DelegationID || second.Idempotent != true {
 		t.Fatalf("start results first=%#v second=%#v", first, second)
 	}
-	store, err := delegation.LoadStore(storePath)
+	records, err := readDelegateTestRecords(storePath, first.DelegationID)
 	if err != nil {
-		t.Fatalf("LoadStore: %v", err)
+		t.Fatal(err)
 	}
-	if len(store.Records) != 1 {
-		t.Fatalf("records = %#v, want one idempotent request", store.Records)
+	if len(records) != 1 {
+		t.Fatalf("records=%#v, want one idempotent request", records)
 	}
 
 	state, err := runDelegateCancel(&delegateOptions{
@@ -453,7 +453,7 @@ func TestDelegateStartIsIdempotentAndCancelIsReduced(t *testing.T) {
 
 func TestDelegateStartBindsNewThreadTokenAndTracksRemoteThread(t *testing.T) {
 	now := time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC)
-	storePath := filepath.Join(t.TempDir(), "delegation.json")
+	storePath := filepath.Join(t.TempDir(), "delegation.sqlite")
 	taskPath := writeJSONFile(t, "task.json", delegation.TaskSpec{
 		Title:     "Remote logs",
 		Objective: "Inspect the remote logs.",
@@ -487,11 +487,10 @@ func TestDelegateStartBindsNewThreadTokenAndTracksRemoteThread(t *testing.T) {
 	if result.State.Request == nil || result.State.Request.RemoteThreadID != threadPayload.ThreadID || result.State.Request.ThreadGeneration == "" {
 		t.Fatalf("request = %#v, want thread fields", result.State.Request)
 	}
-	store, err := delegation.LoadStore(storePath)
+	thread, ok, err := readDelegateTestThread(storePath, threadPayload.ThreadID)
 	if err != nil {
-		t.Fatalf("LoadStore: %v", err)
+		t.Fatal(err)
 	}
-	thread, ok := store.RemoteThreadForID(threadPayload.ThreadID)
 	if !ok || thread.State != delegation.RemoteThreadStateActive || thread.ActiveDelegationID != result.DelegationID ||
 		thread.SourceSessionID != "session-a" || thread.WorkspaceFingerprint != "workspace-1" {
 		t.Fatalf("thread = %#v ok=%v, want active tracked thread", thread, ok)
@@ -516,7 +515,7 @@ func TestDelegateStartRejectsInvalidThreadTokens(t *testing.T) {
 		t.Fatalf("EncodeThreadToken wrong machine: %v", err)
 	}
 	_, err = runDelegateStart(&delegateOptions{
-		storePath:      filepath.Join(t.TempDir(), "delegation.json"),
+		storePath:      filepath.Join(t.TempDir(), "delegation.sqlite"),
 		candidateToken: candidateToken,
 		newThreadToken: wrongMachineToken,
 		taskFile:       taskPath,
@@ -538,7 +537,7 @@ func TestDelegateStartRejectsInvalidThreadTokens(t *testing.T) {
 		t.Fatalf("EncodeThreadToken reuse: %v", err)
 	}
 	_, err = runDelegateStart(&delegateOptions{
-		storePath:      filepath.Join(t.TempDir(), "delegation.json"),
+		storePath:      filepath.Join(t.TempDir(), "delegation.sqlite"),
 		candidateToken: candidateToken,
 		threadToken:    reuseToken,
 		taskFile:       taskPath,
@@ -548,7 +547,7 @@ func TestDelegateStartRejectsInvalidThreadTokens(t *testing.T) {
 		t.Fatalf("missing reuse thread err = %v, want local validation failure", err)
 	}
 
-	activeStorePath := filepath.Join(t.TempDir(), "active-routes.json")
+	activeStorePath := filepath.Join(t.TempDir(), "active-routes.sqlite")
 	activeStore := delegation.Store{}
 	activeStore.UpsertRemoteThread(delegation.RemoteThread{
 		ThreadID:           "rth-active",
@@ -559,7 +558,7 @@ func TestDelegateStartRejectsInvalidThreadTokens(t *testing.T) {
 		UpdatedAt:          now.Format(time.RFC3339Nano),
 		ExpiresAt:          now.Add(time.Hour).Format(time.RFC3339Nano),
 	})
-	if _, err := delegation.SaveStore(activeStorePath, activeStore); err != nil {
+	if _, err := saveDelegateSQLiteFixture(activeStorePath, activeStore); err != nil {
 		t.Fatalf("SaveStore active: %v", err)
 	}
 	activeToken, err := delegation.EncodeThreadToken(delegation.ThreadTokenPayload{
@@ -574,7 +573,7 @@ func TestDelegateStartRejectsInvalidThreadTokens(t *testing.T) {
 		t.Fatalf("EncodeThreadToken active: %v", err)
 	}
 	_, err = runDelegateStart(&delegateOptions{
-		storePath:      filepath.Join(t.TempDir(), "delegation.json"),
+		storePath:      filepath.Join(t.TempDir(), "delegation.sqlite"),
 		routeStorePath: activeStorePath,
 		candidateToken: candidateToken,
 		threadToken:    activeToken,
@@ -625,7 +624,7 @@ func TestDelegateInboxBackedLifecycle(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewCandidateToken: %v", err)
 	}
-	routeStorePath := filepath.Join(t.TempDir(), "routes.json")
+	routeStorePath := filepath.Join(t.TempDir(), "routes.sqlite")
 	startOpts := &delegateOptions{
 		candidateToken: token,
 		taskFile:       taskPath,
@@ -716,7 +715,7 @@ func TestDelegateClaimLosingRaceDoesNotAdviseExecution(t *testing.T) {
 			t.Fatalf("seed %s: %v", record.Kind, err)
 		}
 	}
-	routeStorePath := filepath.Join(t.TempDir(), "routes.json")
+	routeStorePath := filepath.Join(t.TempDir(), "routes.sqlite")
 	store := delegation.Store{SchemaVersion: 1}
 	store.UpsertRoute(delegation.Route{
 		DelegationID:    req.DelegationID,
@@ -726,7 +725,7 @@ func TestDelegateClaimLosingRaceDoesNotAdviseExecution(t *testing.T) {
 		InboxGeneration: "gen-b",
 		UpdatedAt:       now.Format(time.RFC3339Nano),
 	})
-	if _, err := delegation.SaveStore(routeStorePath, store); err != nil {
+	if _, err := saveDelegateSQLiteFixture(routeStorePath, store); err != nil {
 		t.Fatalf("save route: %v", err)
 	}
 
@@ -769,7 +768,7 @@ func TestDelegateQuestionPublishesIntermediateStatusRecord(t *testing.T) {
 	if _, err := graph.SendHTML(context.Background(), "chat-inbox-ref-b", delegation.RenderRecordHTML(claim)); err != nil {
 		t.Fatalf("seed claim: %v", err)
 	}
-	routeStorePath := filepath.Join(t.TempDir(), "routes.json")
+	routeStorePath := filepath.Join(t.TempDir(), "routes.sqlite")
 	store := delegation.Store{SchemaVersion: 1}
 	store.UpsertRoute(delegation.Route{
 		DelegationID:    req.DelegationID,
@@ -779,7 +778,7 @@ func TestDelegateQuestionPublishesIntermediateStatusRecord(t *testing.T) {
 		InboxGeneration: "gen-b",
 		UpdatedAt:       now.Format(time.RFC3339Nano),
 	})
-	if _, err := delegation.SaveStore(routeStorePath, store); err != nil {
+	if _, err := saveDelegateSQLiteFixture(routeStorePath, store); err != nil {
 		t.Fatalf("save route: %v", err)
 	}
 	result, err := runDelegateStatusRecord(&delegateOptions{
@@ -806,7 +805,7 @@ func TestDelegateQuestionPublishesIntermediateStatusRecord(t *testing.T) {
 
 func TestDelegateWaitDefaultReturnsOnQuestion(t *testing.T) {
 	now := time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC)
-	storePath := filepath.Join(t.TempDir(), "delegation.json")
+	storePath := filepath.Join(t.TempDir(), "delegation.sqlite")
 	req := mustDelegateRequestForCLITest(t, now)
 	claim, err := delegation.NewClaimRecord(req.DelegationID, "machine-b", "worker-b-1", 1, now.Add(time.Minute))
 	if err != nil {
@@ -816,7 +815,7 @@ func TestDelegateWaitDefaultReturnsOnQuestion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("question: %v", err)
 	}
-	if _, err := delegation.SaveStore(storePath, delegation.Store{Records: []delegation.Record{req, claim, question}}); err != nil {
+	if _, err := saveDelegateSQLiteFixture(storePath, delegation.Store{Records: []delegation.Record{req, claim, question}}); err != nil {
 		t.Fatalf("SaveStore: %v", err)
 	}
 	state, err := runDelegateWait(&delegateOptions{
@@ -864,7 +863,7 @@ func TestDelegateStatusSyncsRemoteThreadFromTerminalUpdate(t *testing.T) {
 			t.Fatalf("seed %s: %v", record.Kind, err)
 		}
 	}
-	routeStorePath := filepath.Join(t.TempDir(), "routes.json")
+	routeStorePath := filepath.Join(t.TempDir(), "routes.sqlite")
 	store := delegation.Store{}
 	store.UpsertRoute(delegation.Route{
 		DelegationID:     req.DelegationID,
@@ -888,7 +887,7 @@ func TestDelegateStatusSyncsRemoteThreadFromTerminalUpdate(t *testing.T) {
 		UpdatedAt:          now.Format(time.RFC3339Nano),
 		ExpiresAt:          now.Add(time.Hour).Format(time.RFC3339Nano),
 	})
-	if _, err := delegation.SaveStore(routeStorePath, store); err != nil {
+	if _, err := saveDelegateSQLiteFixture(routeStorePath, store); err != nil {
 		t.Fatalf("save route store: %v", err)
 	}
 	state, err := runDelegateStatus(&delegateOptions{
@@ -903,11 +902,10 @@ func TestDelegateStatusSyncsRemoteThreadFromTerminalUpdate(t *testing.T) {
 	if state.Status != delegation.StateComplete {
 		t.Fatalf("state = %#v, want complete", state)
 	}
-	loaded, err := delegation.LoadStore(routeStorePath)
+	thread, ok, err := readDelegateTestThread(routeStorePath, req.RemoteThreadID)
 	if err != nil {
-		t.Fatalf("LoadStore: %v", err)
+		t.Fatal(err)
 	}
-	thread, ok := loaded.RemoteThreadForID(req.RemoteThreadID)
 	if !ok || thread.State != delegation.RemoteThreadStateIdle || thread.ActiveDelegationID != "" ||
 		thread.Title != "Updated remote thread" || !strings.Contains(thread.Summary, "Looked at the new logs.") ||
 		thread.LastResultSummary != "fresh result" {
@@ -927,11 +925,10 @@ func TestDelegateStatusSyncsRemoteThreadFromTerminalUpdate(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("second status: %v", err)
 	}
-	loaded, err = delegation.LoadStore(routeStorePath)
+	thread, ok, err = readDelegateTestThread(routeStorePath, req.RemoteThreadID)
 	if err != nil {
-		t.Fatalf("LoadStore after second status: %v", err)
+		t.Fatal(err)
 	}
-	thread, ok = loaded.RemoteThreadForID(req.RemoteThreadID)
 	if !ok || thread.UpdatedAt != firstUpdatedAt || thread.LastUsedAt != firstLastUsedAt || thread.LastTerminalRecordID != firstTerminalID {
 		t.Fatalf("thread after second status = %#v ok=%v, want unchanged terminal sync", thread, ok)
 	}
@@ -953,7 +950,7 @@ func TestDelegateRouteSQLiteLoadMaterializesLegacyJSON(t *testing.T) {
 		CreatedAt:       now.Add(-time.Minute).Format(time.RFC3339Nano),
 		UpdatedAt:       now.Format(time.RFC3339Nano),
 	})
-	if _, err := delegation.SaveStore(legacyPath, store); err != nil {
+	if _, err := saveDelegateSQLiteFixture(legacyPath, store); err != nil {
 		t.Fatalf("SaveStore legacy: %v", err)
 	}
 	route, err := loadDelegateRoute(&delegateOptions{
@@ -999,7 +996,7 @@ func TestDelegateInboxStatusReadsPagedResult(t *testing.T) {
 			t.Fatalf("seed noise %d: %v", i, err)
 		}
 	}
-	routeStorePath := filepath.Join(t.TempDir(), "routes.json")
+	routeStorePath := filepath.Join(t.TempDir(), "routes.sqlite")
 	store := delegation.Store{SchemaVersion: 1}
 	store.UpsertRoute(delegation.Route{
 		DelegationID:    req.DelegationID,
@@ -1009,7 +1006,7 @@ func TestDelegateInboxStatusReadsPagedResult(t *testing.T) {
 		InboxGeneration: "gen-b",
 		UpdatedAt:       now.Format(time.RFC3339Nano),
 	})
-	if _, err := delegation.SaveStore(routeStorePath, store); err != nil {
+	if _, err := saveDelegateSQLiteFixture(routeStorePath, store); err != nil {
 		t.Fatalf("save route: %v", err)
 	}
 	state, err := runDelegateStatus(&delegateOptions{
@@ -1070,7 +1067,7 @@ func TestDelegateInboxStartTreatsCommitThenTimeoutAsVisible(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewCandidateTokenForCandidate: %v", err)
 	}
-	routeStorePath := filepath.Join(t.TempDir(), "routes.json")
+	routeStorePath := filepath.Join(t.TempDir(), "routes.sqlite")
 	opts := &delegateOptions{
 		candidateToken: token,
 		taskFile:       taskPath,
@@ -1087,11 +1084,10 @@ func TestDelegateInboxStartTreatsCommitThenTimeoutAsVisible(t *testing.T) {
 	if result.Status != delegation.StateOpen || result.Idempotent {
 		t.Fatalf("result = %#v, want visible open non-idempotent start", result)
 	}
-	store, err := delegation.LoadStore(routeStorePath)
+	outbox, ok, err := readDelegateTestOutbox(routeStorePath, result.State.Request.RecordID)
 	if err != nil {
-		t.Fatalf("LoadStore: %v", err)
+		t.Fatal(err)
 	}
-	outbox, ok := store.OutboxForRecordID(result.State.Request.RecordID)
 	if !ok || outbox.Status != delegation.OutboxVisible || outbox.Attempts != 1 {
 		t.Fatalf("outbox = %#v ok=%v, want visible after one attempted send", outbox, ok)
 	}
@@ -1109,7 +1105,7 @@ func TestDelegateInboxUnknownPOSTIsNotRetriedAfterVisibilityReadFailure(t *testi
 	graph := newFakeDelegateRegistryGraph()
 	graph.sendErrBeforeCommit = errors.New("transport outcome unknown")
 	graph.listErrAfterSend = errors.New("visibility read unavailable")
-	path := filepath.Join(t.TempDir(), "routes.json")
+	path := filepath.Join(t.TempDir(), "routes.sqlite")
 	request := mustDelegateRequestForCLITest(t, now)
 	request.InboxRef = "inbox-ref-b"
 	session := &delegateRegistrySession{graph: graph, chatID: "chat-inbox-ref-b", close: func(context.Context) error { return nil }}
@@ -1117,11 +1113,10 @@ func TestDelegateInboxUnknownPOSTIsNotRetriedAfterVisibilityReadFailure(t *testi
 	if _, err := appendDelegateInboxRecordWithOutbox(opts, session, session.chatID, request.InboxRef, request); err == nil {
 		t.Fatal("unknown POST was reported as successful")
 	}
-	store, err := delegation.LoadStore(path)
+	outbox, ok, err := readDelegateTestOutbox(path, request.RecordID)
 	if err != nil {
-		t.Fatalf("load unknown outbox: %v", err)
+		t.Fatal(err)
 	}
-	outbox, ok := store.OutboxForRecordID(request.RecordID)
 	if !ok || outbox.Status != delegation.OutboxUnknown || outbox.Attempts != 1 {
 		t.Fatalf("unknown outbox = %#v ok=%v, want unknown with one attempt", outbox, ok)
 	}
@@ -1188,7 +1183,7 @@ func TestDelegateStartRejectsStaleCandidateTokenGeneration(t *testing.T) {
 		sourceTurn:     "turn-1",
 		now:            func() time.Time { return now },
 		openRegistry:   open,
-		routeStorePath: filepath.Join(t.TempDir(), "routes.json"),
+		routeStorePath: filepath.Join(t.TempDir(), "routes.sqlite"),
 	})
 	if err == nil || !strings.Contains(err.Error(), "inbox generation changed") {
 		t.Fatalf("start err = %v, want stale generation rejection", err)
@@ -1207,7 +1202,7 @@ func TestDelegateInboxCancelBeatsLateResult(t *testing.T) {
 	if _, err := graph.SendHTML(context.Background(), "chat-inbox-ref-b", delegation.RenderRecordHTML(req)); err != nil {
 		t.Fatalf("seed request: %v", err)
 	}
-	routeStorePath := filepath.Join(t.TempDir(), "routes.json")
+	routeStorePath := filepath.Join(t.TempDir(), "routes.sqlite")
 	store := delegation.Store{SchemaVersion: 1}
 	store.UpsertRoute(delegation.Route{
 		DelegationID:    req.DelegationID,
@@ -1217,7 +1212,7 @@ func TestDelegateInboxCancelBeatsLateResult(t *testing.T) {
 		InboxGeneration: "gen-b",
 		UpdatedAt:       now.Format(time.RFC3339Nano),
 	})
-	if _, err := delegation.SaveStore(routeStorePath, store); err != nil {
+	if _, err := saveDelegateSQLiteFixture(routeStorePath, store); err != nil {
 		t.Fatalf("save route: %v", err)
 	}
 	state, err := runDelegateCancel(&delegateOptions{
@@ -1375,7 +1370,7 @@ func TestDelegateStartRejectsLoopingPath(t *testing.T) {
 		t.Fatalf("NewCandidateToken: %v", err)
 	}
 	_, err = runDelegateStart(&delegateOptions{
-		storePath:      filepath.Join(t.TempDir(), "delegation.json"),
+		storePath:      filepath.Join(t.TempDir(), "delegation.sqlite"),
 		candidateToken: token,
 		taskFile:       taskPath,
 		path:           []string{"machine-a", "machine-b"},
@@ -1389,7 +1384,7 @@ func TestDelegateStartRejectsLoopingPath(t *testing.T) {
 func BenchmarkDelegateResolveWithManyRemoteThreads(b *testing.B) {
 	now := time.Date(2026, 6, 20, 10, 0, 0, 0, time.UTC)
 	dir := b.TempDir()
-	routeStorePath := filepath.Join(dir, "routes.json")
+	routeStorePath := filepath.Join(dir, "routes.sqlite")
 	store := delegation.Store{}
 	for i := 0; i < 1000; i++ {
 		store.UpsertRemoteThread(delegation.RemoteThread{
@@ -1406,7 +1401,7 @@ func BenchmarkDelegateResolveWithManyRemoteThreads(b *testing.B) {
 			Generation:           fmt.Sprintf("gen-%04d", i),
 		})
 	}
-	if _, err := delegation.SaveStore(routeStorePath, store); err != nil {
+	if _, err := saveDelegateSQLiteFixture(routeStorePath, store); err != nil {
 		b.Fatalf("SaveStore: %v", err)
 	}
 	candidatesPath := filepath.Join(dir, "candidates.json")
@@ -1470,7 +1465,7 @@ func BenchmarkDelegateOutboxSQLiteWriteAmplification(b *testing.B) {
 						ExpiresAt:            base.Add(time.Hour).Format(time.RFC3339Nano),
 					})
 				}
-				if _, err := delegation.SaveStore(routeStorePath, store); err != nil {
+				if _, err := saveDelegateSQLiteFixture(routeStorePath, store); err != nil {
 					b.Fatalf("seed route store: %v", err)
 				}
 			}
@@ -1697,4 +1692,50 @@ func (g *fakeMachineRegistryGraph) GetOnlineMeeting(_ context.Context, meetingID
 
 func (g *fakeMachineRegistryGraph) UpdateOnlineMeetingWindow(context.Context, string, time.Time, time.Time) (machineregistry.OnlineMeeting, error) {
 	return machineregistry.OnlineMeeting{ID: "meeting-registry", ChatThreadID: "chat-registry"}, nil
+}
+
+func saveDelegateSQLiteFixture(path string, store delegation.Store) (bool, error) {
+	raw, err := json.Marshal(store)
+	if err != nil {
+		return false, err
+	}
+	legacy := path
+	if strings.HasSuffix(path, ".sqlite") {
+		legacy = strings.TrimSuffix(path, ".sqlite") + ".json"
+	}
+	if err = os.WriteFile(legacy, raw, 0600); err != nil {
+		return false, err
+	}
+	if legacy == path {
+		return true, nil
+	}
+	db, err := delegation.OpenWorkerDB(path)
+	if err != nil {
+		return false, err
+	}
+	return true, db.Close()
+}
+func readDelegateTestRecords(path, id string) ([]delegation.Record, error) {
+	db, err := delegation.OpenWorkerDB(path)
+	if err != nil {
+		return nil, err
+	}
+	defer db.Close()
+	return db.Records(context.Background(), id)
+}
+func readDelegateTestThread(path, id string) (delegation.RemoteThread, bool, error) {
+	db, err := delegation.OpenWorkerDB(path)
+	if err != nil {
+		return delegation.RemoteThread{}, false, err
+	}
+	defer db.Close()
+	return db.RemoteThread(context.Background(), id)
+}
+func readDelegateTestOutbox(path, id string) (delegation.OutboxRecord, bool, error) {
+	db, err := delegation.OpenWorkerDB(path)
+	if err != nil {
+		return delegation.OutboxRecord{}, false, err
+	}
+	defer db.Close()
+	return db.Outbox(context.Background(), id)
 }

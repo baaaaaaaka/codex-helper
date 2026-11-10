@@ -35,7 +35,7 @@ type llamaServer struct {
 	url     string
 	key     string
 	keyFile string
-	record  string // orphan record (see orphans.go), removed on stop
+	record  *serverRegistration // exact process record, removed on stop
 	stderr  *boundedBuffer
 	exited  chan struct{}
 	client  *http.Client
@@ -97,9 +97,13 @@ func tryStartServer(ctx context.Context, p *paths, device, root, tmp string, loa
 		_ = os.Remove(keyFile)
 		return nil, classifyRun("start llama-server", err, "", KindCache)
 	}
-	s.record = recordServer(root, s.proc.cmd.Process.Pid)
 	var waitErr error
 	go func() { waitErr = s.proc.cmd.Wait(); close(s.exited) }()
+	s.record, err = recordServer(root, s.proc.cmd.Process.Pid)
+	if err != nil {
+		s.stop()
+		return nil, newError(KindCache, "record ASR server", err, "")
+	}
 
 	ctx, cancel := context.WithTimeout(ctx, loadTimeout)
 	defer cancel()
@@ -205,8 +209,10 @@ func (s *llamaServer) stop() {
 	}
 	s.proc.release()
 	_ = os.Remove(s.keyFile)
-	if s.record != "" {
-		_ = os.Remove(s.record)
+	if s.record != nil {
+		_ = s.record.db.remove(s.record.rec)
+		_ = s.record.db.Close()
+		s.record = nil
 	}
 }
 

@@ -2,7 +2,6 @@ package migrate
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -429,12 +428,9 @@ func TestUnknownAnswerCheckedAgainstHistoryOnce(t *testing.T) {
 			// checks lists the converter's entries; undecided counts those
 			// neither resent nor found.
 			checks := func(st *store.Store) []store.LegacyFinalCheck {
-				v, _, _ := st.Meta(store.MetaLegacyFinalChecks)
-				var list []store.LegacyFinalCheck
-				if v != "" {
-					if err := json.Unmarshal([]byte(v), &list); err != nil {
-						t.Fatal(err)
-					}
+				list, err := st.AnswerChecks()
+				if err != nil {
+					t.Fatal(err)
 				}
 				return list
 			}

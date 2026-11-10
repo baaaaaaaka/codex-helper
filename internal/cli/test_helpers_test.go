@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -23,6 +24,18 @@ func TestMain(m *testing.M) {
 		for {
 			time.Sleep(time.Hour)
 		}
+	}
+	// An installed Teams invocation can launch these tests. Never let its
+	// runtime identity make an inert watchdog test exec the installed entry.
+	// This explicit fixture owns only its temporary immutable runtime.
+	if os.Getenv(watchdogProcessFixture) != "1" && os.Getenv("CODEX_HELPER_RUN_ENV_HELPER") != "1" {
+		for _, item := range os.Environ() {
+			name, _, _ := strings.Cut(item, "=")
+			if strings.HasPrefix(name, "CXP_RUNTIME") || strings.HasPrefix(name, "CXP_BOOT_") || name == "CXP_ENTRY_PATH" {
+				_ = os.Unsetenv(name)
+			}
+		}
+		_ = os.Setenv("CXP_RUNTIME_DISABLE", "1")
 	}
 	tmp, err := os.MkdirTemp("", "codex-helper-cli-tests-")
 	if err != nil {
@@ -74,6 +87,7 @@ func newTempStore(t *testing.T) *config.Store {
 	if err != nil {
 		t.Fatalf("new store: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 	return store
 }
 

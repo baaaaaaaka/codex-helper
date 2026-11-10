@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -9,13 +10,13 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/candidateupdate"
 	"github.com/baaaaaaaka/codex-helper/internal/cli"
 	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
+	"github.com/baaaaaaaka/codex-helper/internal/managedinstall"
+	"github.com/baaaaaaaka/codex-helper/internal/updatestate"
 )
 
 var (
-	runLegacyUpdaterVersionPreflight = cli.LegacyUpdaterVersionPreflight
-	launchHelperRuntime              = helperruntime.Launch
-	scheduleLegacyDirectEntryRepair  = candidateupdate.ScheduleLegacyDirectSelfUpdateRepair
-	executeCLI                       = cli.Execute
+	launchHelperRuntime = helperruntime.Launch
+	executeCLI          = cli.Execute
 )
 
 func main() {
@@ -23,6 +24,15 @@ func main() {
 }
 
 func runMain(args []string) int {
+	if code, handled := helperruntime.HandleBootstrapInstall(args, cli.RuntimeVersion(), os.Stderr); handled {
+		return code
+	}
+	if code, handled := updatestate.HandleActivationCommand(args, os.Stderr); handled {
+		return code
+	}
+	if code, handled := managedinstall.HandleInstallerCommand(args, os.Stdout, os.Stderr); handled {
+		return code
+	}
 	if code, handled := helperruntime.HandleProtocolProbe(args, os.Stdout); handled {
 		return code
 	}
@@ -40,33 +50,21 @@ func runMain(args []string) int {
 		_, _ = fmt.Fprintf(os.Stdout, "Recovered previous cxp runtime %s. Restart the helper to use it.\n", version)
 		return 0
 	}
-	if exitCode, handled := candidateupdate.HandlePostParentRepairCommand(args, os.Stdout, os.Stderr); handled {
-		return exitCode
-	}
 	if exitCode, handled := candidateupdate.HandleInternalCommand(args, cli.RuntimeVersion(), os.Stdout, os.Stderr); handled {
 		return exitCode
 	}
-	if err := candidateupdate.LegacyVersionBridge(args, cli.RuntimeVersion()); err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "Error: legacy runtime update bridge failed: %v\n", err)
-		return 1
-	}
-	// This compatibility check intentionally precedes immutable-runtime
-	// dispatch. v0.1.12 validates downloaded candidates without setting
-	// CXP_RUNTIME_DISABLE, and dispatching first would hide the candidate's
-	// temporary path and bypass the repair entirely.
-	if err := runLegacyUpdaterVersionPreflight(); err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "Error: helper update compatibility check failed: %v\n", err)
+	if err := candidateupdate.RejectLegacyUpdate(args); err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "Error: incompatible updater: %v\n", err)
 		return 1
 	}
 	if exitCode, handled, err := launchHelperRuntime(cli.RuntimeVersion(), args); err != nil {
+		if errors.Is(err, helperruntime.ErrBootstrapState) {
+			fmt.Fprintf(os.Stderr, "Error: runtime startup: %v\n", err)
+			return 1
+		}
 		_, _ = fmt.Fprintf(os.Stderr, "Warning: cxp runtime activation failed; continuing with the current executable: %v\n", err)
 	} else if handled {
-		if exitCode == 0 {
-			if err := scheduleLegacyDirectEntryRepair(args, cli.RuntimeVersion()); err != nil {
-				_, _ = fmt.Fprintf(os.Stderr, "Error: schedule legacy Windows cxp entry repair: %v\n", err)
-				return 1
-			}
-		}
+
 		return exitCode
 	}
 	if err := helperruntime.PrepareBoot(); err != nil {
@@ -74,11 +72,10 @@ func runMain(args []string) int {
 		return 1
 	}
 	if _, ok := helperruntime.Current(); ok && os.Getenv(helperruntime.EnvBootManaged) != "1" {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		err := candidateupdate.ResumePending(ctx, cli.RuntimeVersion())
-		cancel()
+		err := candidateupdate.CheckNativeBootstrap()
 		if err != nil {
-			_, _ = fmt.Fprintf(os.Stderr, "Warning: pending cxp update recovery failed; continuing with the active runtime: %v\n", err)
+			_, _ = fmt.Fprintf(os.Stderr, "Error: cxp runtime admission failed: %v\n", err)
+			return 1
 		}
 	}
 	return executeCLI()

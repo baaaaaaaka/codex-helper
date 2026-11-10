@@ -127,7 +127,10 @@ codex-proxy init
 ```
 
 Config is stored under your OS user config directory (Linux typically
-`~/.config/codex-proxy/config.json`).
+`~/.config/codex-proxy/config.sqlite`). Configuration and CXP-owned runtime state use native SQLite tables.
+An old `--config ...json` path is a migration locator, not a JSON backend.
+Before upgrading from an older format, stop or isolate its writers and use the
+explicit installer. See [storage cutover and recovery](docs/architecture/sqlite-only-boundaries.md#cutover-and-recovery).
 
 ## Requirements
 
@@ -222,7 +225,7 @@ walk through the normal flows in order.
 
 Common flags:
 
-- `--config /path/to/config.json` overrides the config file location
+- `--config /path/to/config.sqlite` overrides the config file location
 - `tui` / `history tui` support `--codex-dir`, `--codex-path`, `--profile`, and `--refresh-interval` (default `5s`, use `0` to disable)
 - `history open` supports `--codex-dir`, `--codex-path`, and `--profile`
 - `history list` / `history show` support `--codex-dir`

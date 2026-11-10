@@ -152,7 +152,7 @@ func TestServiceNoticeCardUsesControlLink(t *testing.T) {
 	r := newRig(t, func(c *Config) { c.Notifier = n; c.Version = "v2.0.0" })
 	ctl := r.control()
 	if err := r.e.update(func(tx *store.Tx) error {
-		return setMetaJSON(tx, metaUpdatePending, updateRequest{Tag: "v2.0.0", From: "v1.0.0", Conv: r.e.controlID, Inbound: 17})
+		return tx.SetUpdatePending(updateRequest{Tag: "v2.0.0", From: "v1.0.0", Conv: r.e.controlID, Inbound: 17})
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -199,9 +199,13 @@ func TestNoticeEventHeadingsAndActions(t *testing.T) {
 		{notifyService, "✅ Helper restart completed", "Open Control"},
 	} {
 		t.Run(tc.heading, func(t *testing.T) {
-			if !r.e.sendCard(context.Background(), pendingNotify{Conv: conv, Kind: tc.kind, Request: tc.heading}) {
-				t.Fatal("card not handled")
+			before := n.count(tc.heading)
+			if err := r.e.update(func(tx *store.Tx) error {
+				return r.e.addNotify(tx, pendingNotify{Conv: conv, Key: "event:" + tc.heading, Kind: tc.kind, Request: tc.heading})
+			}); err != nil {
+				t.Fatal(err)
 			}
+			r.wait("event card", func() bool { return n.count(tc.heading) > before })
 			n.mu.Lock()
 			got := n.notices[len(n.notices)-1]
 			n.mu.Unlock()

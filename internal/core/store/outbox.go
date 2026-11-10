@@ -40,8 +40,7 @@ RETURNING id`, convID, m.DeliveryKey, convID, m.Kind, part, parts, nullStr(m.Bod
 			return n, err
 		}
 		if f := m.File; f != nil {
-			if _, err := t.exec(`INSERT INTO outbox_files(outbox_id,local_path,size,upload_url,upload_expires_at,uploaded_bytes,ext_item_id)
-VALUES (?,?,?,?,?,?,?)`, id, f.LocalPath, f.Size, nullStr(f.UploadURL), nullInt(f.UploadExpiresAt), f.UploadedBytes, nullStr(f.ExtItemID)); err != nil {
+			if err := t.insertOutboxFile(id, *f); err != nil {
 				return n, err
 			}
 		}
@@ -51,13 +50,13 @@ VALUES (?,?,?,?,?,?,?)`, id, f.LocalPath, f.Size, nullStr(f.UploadURL), nullInt(
 }
 
 // NextSendable returns, for every conversation, its head pending row when
-// that row is queued and due. A sending or unknown head blocks only its own
-// conversation (R-11); unknown rows are never returned.
+// that row is queued and due. Only queued/sending rows hold the order;
+// unknown outcomes are retained for reconciliation without blocking delivery.
 func (t *Tx) NextSendable(now int64) ([]Outbox, error) {
 	return collect(scanOutbox)(t.rows(`SELECT `+outboxCols+` FROM outbox
-WHERE id IN (SELECT (SELECT p.id FROM outbox p WHERE p.conv_id = h.conv_id AND p.state IN ('queued','sending','unknown') AND p.hold_turn IS NULL
+WHERE id IN (SELECT (SELECT p.id FROM outbox p WHERE p.conv_id = h.conv_id AND p.state IN ('queued','sending') AND p.hold_turn IS NULL
                      ORDER BY p.seq LIMIT 1)
-             FROM (SELECT DISTINCT conv_id FROM outbox WHERE state IN ('queued','sending','unknown')) h)
+             FROM (SELECT DISTINCT conv_id FROM outbox WHERE state IN ('queued','sending')) h)
   AND state = 'queued' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
 ORDER BY conv_id`, now))
 }
@@ -71,6 +70,13 @@ func (t *Tx) Outbox(id int64) (Outbox, bool, error) {
 func (t *Tx) PendingOutbox(convID int64) ([]Outbox, error) {
 	return collect(scanOutbox)(t.rows(`SELECT `+outboxCols+` FROM outbox
 WHERE conv_id = ? AND state IN ('queued','sending','unknown') ORDER BY seq`, convID))
+}
+
+// ActiveOutbox lists work still awaiting a send outcome. Unknown rows remain
+// in PendingOutbox for diagnostics, ownership and recovery, not scheduling.
+func (t *Tx) ActiveOutbox(convID int64) ([]Outbox, error) {
+	return collect(scanOutbox)(t.rows(`SELECT `+outboxCols+` FROM outbox
+WHERE conv_id = ? AND state IN ('queued','sending') ORDER BY seq`, convID))
 }
 
 // BeginSend marks the conversation's head queued row as sending with a fresh
@@ -87,7 +93,7 @@ func (t *Tx) BeginSend(id int64) (string, error) {
 		return "", fmt.Errorf("%w: outbox %d is %s", ErrState, id, o.State)
 	}
 	var ahead int
-	if err := t.row(`SELECT EXISTS(SELECT 1 FROM outbox WHERE conv_id = ? AND state IN ('queued','sending','unknown') AND hold_turn IS NULL AND seq < ?)`,
+	if err := t.row(`SELECT EXISTS(SELECT 1 FROM outbox WHERE conv_id = ? AND state IN ('queued','sending') AND hold_turn IS NULL AND seq < ?)`,
 		o.ConvID, o.Seq).Scan(&ahead); err != nil {
 		return "", err
 	}
@@ -108,8 +114,8 @@ func (t *Tx) MarkSent(id int64, extMsgID string) error {
 		`state = 'sent', ext_msg_id = ?, sent_at = ?, next_attempt_at = NULL`, nullStr(extMsgID), t.now)
 }
 
-// MarkUnknown records an ambiguous send outcome; the row then blocks its
-// conversation until resolved and is never re-sent automatically.
+// MarkUnknown records an ambiguous send outcome. It no longer holds the
+// conversation's order and is never re-sent automatically.
 func (t *Tx) MarkUnknown(id int64, note string) error {
 	return t.outMove(id, []string{OutSending}, `state = 'unknown', note = ?`, nullStr(note))
 }
@@ -182,15 +188,21 @@ func (t *Tx) OutboxFile(outboxID int64) (OutFile, bool, error) {
 	p.str(&f.UploadURL)
 	p.int(&f.UploadExpiresAt)
 	p.raw(&f.UploadedBytes)
-	p.str(&f.ExtItemID)
-	return one(t.row(`SELECT local_path,size,upload_url,upload_expires_at,uploaded_bytes,ext_item_id FROM outbox_files WHERE outbox_id = ?`, outboxID),
+	p.str(&f.Ref.Ref)
+	p.raw(&f.Ref.Kind)
+	p.raw(&f.Ref.Name)
+	p.raw(&f.Ref.Size)
+	p.raw(&f.Ref.ContentType)
+	p.raw(&f.Ref.AttachmentID)
+	p.raw(&f.Ref.URL)
+	return one(t.row(`SELECT local_path,size,upload_url,upload_expires_at,uploaded_bytes,ref,ref_kind,ref_name,ref_size,ref_content_type,ref_attachment_id,ref_url FROM outbox_files WHERE outbox_id = ?`, outboxID),
 		func(sc scanner) (OutFile, error) { err := p.scan(sc); return f, err })
 }
 
 // SetUpload records upload-session progress of an outbound file.
 func (t *Tx) SetUpload(outboxID int64, uploadURL string, expiresAt, uploaded int64, extItemID string) error {
 	n, err := affected(t.exec(`UPDATE outbox_files SET upload_url = ?, upload_expires_at = ?, uploaded_bytes = ?,
-ext_item_id = COALESCE(?, ext_item_id) WHERE outbox_id = ?`, nullStr(uploadURL), nullInt(expiresAt), uploaded, nullStr(extItemID), outboxID))
+ref = COALESCE(?, ref) WHERE outbox_id = ?`, nullStr(uploadURL), nullInt(expiresAt), uploaded, nullStr(extItemID), outboxID))
 	if err == nil && n == 0 {
 		err = fmt.Errorf("%w: outbox file %d", ErrNotFound, outboxID)
 	}

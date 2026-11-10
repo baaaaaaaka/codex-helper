@@ -1,7 +1,8 @@
 package config
 
 import (
-	"encoding/json"
+	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -10,7 +11,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/gofrs/flock"
+	"github.com/baaaaaaaka/codex-helper/internal/sqlitestate"
 )
 
 // ErrStaleReader indicates the on-disk config requires a newer codex-helper
@@ -38,9 +39,9 @@ func (e *StaleReaderError) Error() string {
 func (e *StaleReaderError) Is(target error) bool { return target == ErrStaleReader }
 
 type Store struct {
-	mu   sync.Mutex
-	path string
-	lock *flock.Flock
+	mu           sync.Mutex
+	path, legacy string
+	db           *sql.DB
 }
 
 func DefaultPath() (string, error) {
@@ -48,7 +49,7 @@ func DefaultPath() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("get user config dir: %w", err)
 	}
-	return filepath.Join(base, "codex-proxy", "config.json"), nil
+	return filepath.Join(base, "codex-proxy", "config.sqlite"), nil
 }
 
 func DefaultPathForHome(home string) (string, error) {
@@ -66,46 +67,77 @@ func DefaultPathForHome(home string) (string, error) {
 	default:
 		base = filepath.Join(home, ".config")
 	}
-	return filepath.Join(base, "codex-proxy", "config.json"), nil
+	return filepath.Join(base, "codex-proxy", "config.sqlite"), nil
 }
 
 func NewStore(pathOverride string) (*Store, error) {
-	path := pathOverride
+	path := strings.TrimSpace(pathOverride)
 	if path == "" {
-		p, err := DefaultPath()
+		var err error
+		path, err = DefaultPath()
 		if err != nil {
 			return nil, err
 		}
-		path = p
 	}
-
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("create config dir: %w", err)
+	path, legacy := configDatabasePaths(path)
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+		return nil, err
 	}
-
-	return &Store{
-		path: path,
-		lock: flock.New(path + ".lock"),
-	}, nil
+	return &Store{path: path, legacy: legacy}, nil
 }
 
+// An old --config filename remains a path alias. It never selects a legacy
+// storage backend. Unknown historical suffixes use a separate .sqlite file.
+func configDatabasePaths(path string) (string, string) {
+	if strings.EqualFold(filepath.Ext(path), ".sqlite") {
+		return path, strings.TrimSuffix(path, filepath.Ext(path)) + ".json"
+	}
+	if strings.EqualFold(filepath.Ext(path), ".json") {
+		return strings.TrimSuffix(path, filepath.Ext(path)) + ".sqlite", path
+	}
+	return path + ".sqlite", path
+}
 func (s *Store) Path() string { return s.path }
-
+func (s *Store) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db == nil {
+		return nil
+	}
+	return s.db.Close()
+}
+func (s *Store) ensureDB() error {
+	if s.db != nil {
+		return nil
+	}
+	db, err := openConfigDatabase(s.path, false)
+	if err != nil {
+		return err
+	}
+	if err = migrateConfigDatabase(db, s.legacy); err != nil {
+		db.Close()
+		return err
+	}
+	s.db = db
+	return nil
+}
 func (s *Store) Load() (Config, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	if err := s.lock.Lock(); err != nil {
-		return Config{}, fmt.Errorf("lock config: %w", err)
+	if err := s.ensureDB(); err != nil {
+		return Config{}, err
 	}
-	defer func() { _ = s.lock.Unlock() }()
-
-	return s.loadUnlocked()
+	tx, err := s.db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return Config{}, err
+	}
+	defer tx.Rollback()
+	cfg, err := readConfigTx(tx)
+	if err != nil {
+		return cfg, err
+	}
+	return cfg, tx.Commit()
 }
-
-// LoadPathReadOnly parses a config file without creating its parent directory
-// or lock file. Diagnostic commands should use this instead of NewStore.Load.
 func LoadPathReadOnly(path string) (Config, error) {
 	path = strings.TrimSpace(path)
 	if path == "" {
@@ -115,117 +147,75 @@ func LoadPathReadOnly(path string) (Config, error) {
 			return Config{}, err
 		}
 	}
-	return (&Store{path: path}).loadUnlocked()
+	path, legacy := configDatabasePaths(path)
+	if _, err := sqlitestate.Inspect(path); errors.Is(err, os.ErrNotExist) {
+		if _, legacyErr := os.Lstat(legacy); legacyErr == nil {
+			return Config{}, fmt.Errorf("configuration at %s requires SQLite migration before read-only access", legacy)
+		} else if !errors.Is(legacyErr, os.ErrNotExist) {
+			return Config{}, legacyErr
+		}
+		return Config{Version: CurrentVersion, MinReader: MinReaderVersion}, nil
+	} else if err != nil {
+		return Config{}, err
+	}
+	db, err := openConfigDatabase(path, true)
+	if err != nil {
+		return Config{}, err
+	}
+	defer db.Close()
+	tx, err := db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return Config{}, err
+	}
+	defer tx.Rollback()
+	var version int
+	if err = tx.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
+		return Config{}, err
+	}
+	if version != 1 {
+		return Config{}, fmt.Errorf("unsupported config database version %d", version)
+	}
+	cfg, err := readConfigTx(tx)
+	if err != nil {
+		return cfg, err
+	}
+	return cfg, tx.Commit()
 }
-
 func (s *Store) Save(cfg Config) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if err := s.lock.Lock(); err != nil {
-		return fmt.Errorf("lock config: %w", err)
-	}
-	defer func() { _ = s.lock.Unlock() }()
-
-	return s.saveUnlocked(cfg)
+	return s.write(func(tx *sql.Tx) error { return saveConfigTx(tx, cfg) })
 }
-
 func (s *Store) Update(fn func(*Config) error) error {
+	return s.write(func(tx *sql.Tx) error {
+		cfg, err := readConfigTx(tx)
+		if err != nil {
+			return err
+		}
+		if err = fn(&cfg); err != nil {
+			return err
+		}
+		return saveConfigTx(tx, cfg)
+	})
+}
+func (s *Store) write(fn func(*sql.Tx) error) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-
-	if err := s.lock.Lock(); err != nil {
-		return fmt.Errorf("lock config: %w", err)
+	if err := s.ensureDB(); err != nil {
+		return err
 	}
-	defer func() { _ = s.lock.Unlock() }()
-
-	cfg, err := s.loadUnlocked()
+	tx, err := s.db.BeginTx(context.Background(), nil)
 	if err != nil {
 		return err
 	}
-
-	if err := fn(&cfg); err != nil {
+	defer tx.Rollback()
+	header, err := readConfigHeader(tx)
+	if err != nil {
 		return err
 	}
-
-	return s.saveUnlocked(cfg)
-}
-
-func (s *Store) loadUnlocked() (Config, error) {
-	b, err := os.ReadFile(s.path)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return Config{Version: CurrentVersion}, nil
-		}
-		return Config{}, fmt.Errorf("read config: %w", err)
+	if header.Version > CurrentVersion {
+		return fmt.Errorf("refuse to overwrite newer config version %d", header.Version)
 	}
-
-	var cfg Config
-	if err := json.Unmarshal(b, &cfg); err != nil {
-		return Config{}, fmt.Errorf("parse config: %w", err)
+	if err = fn(tx); err != nil {
+		return err
 	}
-
-	// Three-state gate. Compatibility is decided by the reader floor, not by
-	// version equality, so an additive future config (higher version, same
-	// floor) reads fine instead of bricking an older binary.
-	if cfg.Version < 0 || cfg.MinReader < 0 {
-		return Config{}, fmt.Errorf("corrupt config: negative version (version=%d minReader=%d)", cfg.Version, cfg.MinReader)
-	}
-	floor := cfg.MinReader
-	if floor == 0 {
-		// Legacy files (pre-minReader) and version 1 predate breaking changes.
-		floor = MinReaderVersion
-	}
-	if floor > SupportedReaderVersion {
-		return Config{}, &StaleReaderError{
-			FileMinReader: floor,
-			Supported:     SupportedReaderVersion,
-			WriterVersion: cfg.Version,
-		}
-	}
-	// Migrate legacy write-generation stamps in memory. Newer additive
-	// generations (Version > CurrentVersion) are left as-is and read tolerantly.
-	if cfg.Version == 0 || cfg.Version == 1 {
-		cfg.Version = CurrentVersion
-	}
-	return cfg, nil
-}
-
-func (s *Store) saveUnlocked(cfg Config) error {
-	// Never let an older binary clobber a newer-generation file: that would
-	// silently drop fields this build does not know about. Fail loudly instead;
-	// the operator/service should upgrade rather than corrupt the config.
-	if existing, err := os.ReadFile(s.path); err == nil {
-		var onDisk struct {
-			Version int `json:"version"`
-		}
-		if json.Unmarshal(existing, &onDisk) == nil && onDisk.Version > CurrentVersion {
-			return fmt.Errorf(
-				"refuse to overwrite newer config (on-disk version %d > this build %d); upgrade codex-helper",
-				onDisk.Version, CurrentVersion,
-			)
-		}
-	}
-
-	// Stamp this binary's own write generation and reader floor; the caller does
-	// not control these.
-	cfg.Version = CurrentVersion
-	cfg.MinReader = MinReaderVersion
-
-	dir := filepath.Dir(s.path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("create config dir: %w", err)
-	}
-
-	b, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal config: %w", err)
-	}
-	b = append(b, '\n')
-
-	if err := atomicWriteFile(s.path, b, 0o600); err != nil {
-		return fmt.Errorf("atomic write config: %w", err)
-	}
-
-	return nil
+	return tx.Commit()
 }

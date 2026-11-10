@@ -47,6 +47,26 @@ func TestSharedSchemaUpgradeKeepsExistingQueuedRequests(t *testing.T) {
 // Check the migration's disk volume on a history-sized table. This catches
 // an accidental table rebuild, rather than relying on a machine-speed limit.
 func TestSharedSchemaMigrationDoesNotRewriteHistory(t *testing.T) {
+	empty := filepath.Join(t.TempDir(), "empty-v1.sqlite")
+	legacy, err := sql.Open("sqlite", empty)
+	mustT(t, err)
+	for _, q := range schemaV1 {
+		_, err = legacy.Exec(q)
+		mustT(t, err)
+	}
+	_, err = legacy.Exec(fmt.Sprintf("PRAGMA application_id=%d", ApplicationID))
+	mustT(t, err)
+	_, err = legacy.Exec("PRAGMA user_version=1")
+	mustT(t, err)
+	mustT(t, legacy.Close())
+	e0, err := os.Stat(empty)
+	mustT(t, err)
+	upgraded, err := Open(empty)
+	mustT(t, err)
+	mustT(t, upgraded.Close())
+	e1, err := os.Stat(empty)
+	mustT(t, err)
+	fixedGrowth := e1.Size() - e0.Size()
 	path := filepath.Join(t.TempDir(), "large-v1.sqlite")
 	db, err := sql.Open("sqlite", path)
 	mustT(t, err)
@@ -75,7 +95,7 @@ func TestSharedSchemaMigrationDoesNotRewriteHistory(t *testing.T) {
 	after, err := os.Stat(path)
 	mustT(t, err)
 	t.Logf("migration: %d bytes history, %s, file growth %d bytes", before.Size(), time.Since(start), after.Size()-before.Size())
-	if delta := after.Size() - before.Size(); delta > 64<<10 {
-		t.Fatalf("migration rewrote or expanded history by %d bytes", delta)
+	if delta := after.Size() - before.Size(); delta-fixedGrowth > 64<<10 {
+		t.Fatalf("migration grew by %d bytes beyond %d bytes fixed schema allocation", delta-fixedGrowth, fixedGrowth)
 	}
 }

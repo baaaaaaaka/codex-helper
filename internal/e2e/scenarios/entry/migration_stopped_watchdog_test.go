@@ -38,7 +38,7 @@ func TestEntryMigrationPreservesChatWithStoppedWatchdog(t *testing.T) {
 		t.Fatal(err)
 	}
 	copyExe(built, current)
-	if err := os.WriteFile(filepath.Join(root, "active"), []byte("v9.9.1\n"), 0600); err != nil {
+	if err := publishBootFixture(root, "v9.9.1", "", 1); err != nil {
 		t.Fatal(err)
 	}
 	manager := filepath.Join(dir, "systemctl")

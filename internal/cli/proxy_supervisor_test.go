@@ -20,6 +20,7 @@ func TestProxySupervisorBoundsChildRestartAttempts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 	inst := config.Instance{ID: "supervised-1", ProfileID: "p1", OwnerToken: "owner-1", BrokerEpoch: "epoch-1"}
 	if err := store.Save(config.Config{Version: config.CurrentVersion, Instances: []config.Instance{inst}}); err != nil {
 		t.Fatalf("Save: %v", err)
@@ -59,6 +60,7 @@ func TestProxySupervisorStopsAfterDurableBudgetBlock(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 	inst := config.Instance{ID: "blocked-supervisor", ProfileID: "p1", OwnerToken: "owner-1", BrokerEpoch: "epoch-1"}
 	if err := store.Save(config.Config{Version: config.CurrentVersion, Instances: []config.Instance{inst}}); err != nil {
 		t.Fatalf("Save: %v", err)
@@ -102,6 +104,7 @@ func TestProxySupervisorAdoptsExistingDaemonBeforeStartingChild(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewStore: %v", err)
 	}
+	t.Cleanup(func() { store.Close() })
 	daemonPID := os.Getpid() + 1
 	inst := config.Instance{ID: "adopt-existing", ProfileID: "p1", OwnerToken: "owner-1", BrokerEpoch: "epoch-1", DaemonPID: daemonPID}
 	if err := store.Save(config.Config{Version: config.CurrentVersion, Instances: []config.Instance{inst}}); err != nil {

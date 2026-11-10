@@ -194,7 +194,7 @@ func TestTeamsServiceWatchdogKeepsLiveManagedChildWaitingForOwnerPastPollThresho
 func TestTeamsServiceWatchdogStateRoundTripAndCorruptReset(t *testing.T) {
 	lockCLITestHooks(t)
 
-	path := filepath.Join(t.TempDir(), "watchdog.json")
+	path := filepath.Join(t.TempDir(), "watchdog.sqlite")
 	prevPath := teamsServiceWatchdogStatePath
 	t.Cleanup(func() { teamsServiceWatchdogStatePath = prevPath })
 	teamsServiceWatchdogStatePath = func() (string, error) { return path, nil }
@@ -215,20 +215,17 @@ func TestTeamsServiceWatchdogStateRoundTripAndCorruptReset(t *testing.T) {
 	if err := os.WriteFile(path, []byte("{broken"), 0o600); err != nil {
 		t.Fatalf("write corrupt state: %v", err)
 	}
-	got, err = loadTeamsServiceWatchdogState()
-	if err != nil {
-		t.Fatalf("load corrupt state should reset without failing: %v", err)
+	if _, err = loadTeamsServiceWatchdogState(); err == nil {
+		t.Fatal("corrupt watchdog state was silently reset")
 	}
-	if got != (teamsServiceWatchdogState{}) {
-		t.Fatalf("corrupt state = %+v, want zero", got)
-	}
+
 }
 
 func TestRunTeamsServiceWatchdogOnceStableNoopDoesNotRewriteState(t *testing.T) {
 	lockCLITestHooks(t)
 
 	firstNow := time.Date(2026, 7, 31, 1, 0, 0, 0, time.UTC)
-	path := filepath.Join(t.TempDir(), "watchdog.json")
+	path := filepath.Join(t.TempDir(), "watchdog.sqlite")
 	prevPath := teamsServiceWatchdogStatePath
 	prevCollect := teamsServiceWatchdogCollectSnapshot
 	t.Cleanup(func() {
@@ -280,7 +277,7 @@ func TestRunTeamsServiceWatchdogOnceStartsServiceAndDryRunDoesNot(t *testing.T) 
 	lockCLITestHooks(t)
 
 	now := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
-	path := filepath.Join(t.TempDir(), "watchdog.json")
+	path := filepath.Join(t.TempDir(), "watchdog.sqlite")
 	prevPath := teamsServiceWatchdogStatePath
 	prevCollect := teamsServiceWatchdogCollectSnapshot
 	prevStart := teamsServiceWatchdogStartService
@@ -339,7 +336,7 @@ func TestRunTeamsServiceWatchdogOnceRestartsAfterConsecutiveStaleState(t *testin
 	lockCLITestHooks(t)
 
 	now := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
-	path := filepath.Join(t.TempDir(), "watchdog.json")
+	path := filepath.Join(t.TempDir(), "watchdog.sqlite")
 	prevPath := teamsServiceWatchdogStatePath
 	prevCollect := teamsServiceWatchdogCollectSnapshot
 	prevStart := teamsServiceWatchdogStartService
@@ -404,7 +401,7 @@ func TestRunTeamsServiceWatchdogOnceSuccessfulRestartCooldownSuppressesRestartSt
 	lockCLITestHooks(t)
 
 	now := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
-	path := filepath.Join(t.TempDir(), "watchdog.json")
+	path := filepath.Join(t.TempDir(), "watchdog.sqlite")
 	prevPath := teamsServiceWatchdogStatePath
 	prevCollect := teamsServiceWatchdogCollectSnapshot
 	prevStart := teamsServiceWatchdogStartService
@@ -458,7 +455,7 @@ func TestRunTeamsServiceWatchdogOnceDoesNotCooldownFailedRestart(t *testing.T) {
 	lockCLITestHooks(t)
 
 	now := time.Date(2026, 5, 10, 12, 0, 0, 0, time.UTC)
-	path := filepath.Join(t.TempDir(), "watchdog.json")
+	path := filepath.Join(t.TempDir(), "watchdog.sqlite")
 	prevPath := teamsServiceWatchdogStatePath
 	prevCollect := teamsServiceWatchdogCollectSnapshot
 	prevStart := teamsServiceWatchdogStartService
@@ -528,7 +525,7 @@ func TestRunTeamsServiceWatchdogOnceDoesNotCooldownFailedRestart(t *testing.T) {
 func TestRunTeamsServiceWatchdogLoopRepeatsAndLogsQuietErrors(t *testing.T) {
 	lockCLITestHooks(t)
 
-	path := filepath.Join(t.TempDir(), "watchdog.json")
+	path := filepath.Join(t.TempDir(), "watchdog.sqlite")
 	prevPath := teamsServiceWatchdogStatePath
 	prevCollect := teamsServiceWatchdogCollectSnapshot
 	prevStart := teamsServiceWatchdogStartService

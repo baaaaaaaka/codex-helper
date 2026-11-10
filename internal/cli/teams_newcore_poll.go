@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -15,7 +14,7 @@ import (
 // poll"). It is not kept in the store: the store takes no periodic
 // write, and status reads the file even when the store is in use on
 // another host.
-const teamsPollStampName = "core-poll.json"
+const teamsPollStampName = "core-poll.sqlite"
 
 // teamsPollStampEvery bounds how often the helper rewrites the file while
 // it reads Teams: "last poll" is at most this much older than the truth.
@@ -31,29 +30,12 @@ type teamsPollStamp struct {
 func teamsPollStampPath(dir string) string { return filepath.Join(dir, teamsPollStampName) }
 
 func writeTeamsPollStamp(dir string, s teamsPollStamp) error {
-	raw, err := json.Marshal(s)
-	if err != nil {
-		return err
-	}
-	path := teamsPollStampPath(dir)
-	tmp := fmt.Sprintf("%s.%d.tmp", path, os.Getpid())
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	return writeTeamsPollSnapshot(teamsPollStampPath(dir), s)
 }
 
 func readTeamsPollStamp(dir string) (teamsPollStamp, bool) {
-	var s teamsPollStamp
-	raw, err := os.ReadFile(teamsPollStampPath(dir))
-	if err != nil || json.Unmarshal(raw, &s) != nil || s.At == 0 {
-		return teamsPollStamp{}, false
-	}
-	return s, true
+	s, err := readTeamsPollSnapshot(teamsPollStampPath(dir))
+	return s, err == nil && s.At != 0
 }
 
 // teamsPollStamper rewrites the file when the engine has read Teams since

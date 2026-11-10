@@ -26,6 +26,7 @@ func TestRuntimeMigrationPreparesBeforeReadyHookCommits(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { store.Close() })
 	if err := store.Save(config.Config{}); err != nil {
 		t.Fatal(err)
 	}
@@ -54,6 +55,7 @@ func TestRuntimeMigrationReadyHookFailsClosedWhenGenerationCommitFails(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { store.Close() })
 	if err := store.Save(config.Config{}); err != nil {
 		t.Fatal(err)
 	}
@@ -88,6 +90,7 @@ func TestRuntimeMigrationDefersLegacyCleanupUntilReadyAndPreservesConfig(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { store.Close() })
 	proxyEnabled := true
 	if err := store.Save(config.Config{ProxyEnabled: &proxyEnabled}); err != nil {
 		t.Fatal(err)
@@ -149,6 +152,7 @@ func TestRuntimeMigrationReadyCleanupBlockerCommitsAndRetriesWithoutFallback(t *
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { store.Close() })
 	if err := store.Save(config.Config{}); err != nil {
 		t.Fatal(err)
 	}
@@ -207,6 +211,7 @@ func TestRuntimeMigrationPrepareAllowsLiveSessionPrivateBinary(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { store.Close() })
 	if err := store.Save(config.Config{}); err != nil {
 		t.Fatal(err)
 	}
@@ -259,6 +264,7 @@ func TestRuntimeMigrationPrepareReportsFreshSharedAuthLease(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { store.Close() })
 	if err := store.Save(config.Config{}); err != nil {
 		t.Fatal(err)
 	}
@@ -294,6 +300,7 @@ func TestRuntimeMigrationPrepareReportsRecentUnverifiableSharedAuthLease(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { store.Close() })
 	if err := store.Save(config.Config{}); err != nil {
 		t.Fatal(err)
 	}
@@ -327,6 +334,7 @@ func TestRuntimeMigrationPrepareIgnoresStaleSharedAuthLeaseWithReusedPID(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { store.Close() })
 	if err := store.Save(config.Config{}); err != nil {
 		t.Fatal(err)
 	}
@@ -362,6 +370,7 @@ func TestRuntimeMigrationPrepareRejectsCodexWithoutRemoteTUI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { store.Close() })
 	if err := store.Save(config.Config{}); err != nil {
 		t.Fatal(err)
 	}
@@ -410,6 +419,7 @@ func TestInstalledCodexRuntimeMigrationDefersLivePrivateArtifacts(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { store.Close() })
 	if err := store.Save(config.Config{}); err != nil {
 		t.Fatal(err)
 	}

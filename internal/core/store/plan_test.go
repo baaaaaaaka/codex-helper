@@ -16,7 +16,7 @@ import (
 // hotFiles hold the runtime API. Every SQL statement in them is checked.
 // vacuum.go (maintenance) and import.go (one-shot converter) are not hot
 // paths.
-var hotFiles = []string{"store.go", "owner.go", "conversations.go", "receive.go", "turns.go", "outbox.go", "engine_api.go", "batch.go", "held_progress.go", "transcripts.go"}
+var hotFiles = []string{"store.go", "owner.go", "conversations.go", "receive.go", "turns.go", "outbox.go", "engine_api.go", "batch.go", "held_progress.go", "transcripts.go", "notifications.go", "engine_rows.go", "engine_collections.go", "delegated_threads.go", "attachments.go"}
 
 // fragmentCompletions are representative full statements for SQL that the
 // code assembles from fragments (convUpdate, turnMove, outMove).
@@ -24,7 +24,6 @@ var fragmentCompletions = map[string]string{
 	"UPDATE conversations SET ": `UPDATE conversations SET state = 'parked', parked_at = ?, updated_at = ? WHERE id = ? AND state IN (?)`,
 	"UPDATE turns SET ":         `UPDATE turns SET state = 'starting', thread_id = ? WHERE id = ? AND state IN (?,?,?)`,
 	"UPDATE outbox SET ":        `UPDATE outbox SET state = 'sent', ext_msg_id = ? WHERE (id = ? OR batch_head = ?) AND state IN (?,?)`,
-	`SELECT EXISTS(SELECT 1 FROM outbox WHERE delivery_key >= ? AND delivery_key < ? AND state = 'dropped'`: `SELECT EXISTS(SELECT 1 FROM outbox WHERE delivery_key >= ? AND delivery_key < ? AND state = 'dropped')`,
 }
 
 // fullLoads are startup ownership indexes and explicitly requested history
@@ -137,7 +136,7 @@ func evalStr(e ast.Expr, consts map[string]string) (string, bool) {
 // re-hashed, and is empty after the first start.
 var (
 	hotTables    = regexp.MustCompile(`^SCAN (inbound|outbox|turns|transcript_sources)\b`)
-	partialIndex = regexp.MustCompile(`USING (COVERING )?INDEX (outbox_pending|turns_open|inbound_open|outbox_legacy_hash)\b`)
+	partialIndex = regexp.MustCompile(`USING (COVERING )?INDEX (outbox_active|outbox_pending|turns_open|inbound_open|outbox_legacy_hash)\b`)
 )
 
 // TestHotQueriesUseIndexes runs EXPLAIN QUERY PLAN on every SQL statement of

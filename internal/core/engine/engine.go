@@ -258,9 +258,10 @@ type Engine struct {
 	cmdPending   map[int64][]cmdJob // per-conversation command queues; present while a worker runs
 	asrWake      chan struct{}
 	notifyWake   chan struct{}
-	scanWake     chan struct{} // a read throttle: the scan waits for the gate (receive.go)
-	historyWake  chan struct{} // a resume history check was decided (history_check.go)
-	notifyN      atomic.Int64  // pending owner notifications (notify.go)
+	notifyMu     sync.Mutex
+	notifyDirty  []store.NotificationScope // bounded/coalesced event hints; not durable state
+	scanWake     chan struct{}             // a read throttle: the scan waits for the gate (receive.go)
+	historyWake  chan struct{}             // a resume history check was decided (history_check.go)
 	// statsCache is the rollout usage cache of `helper stats` (stats.go).
 	statsOnce  sync.Once
 	statsCache *transcript.UsageCache
@@ -468,7 +469,17 @@ func (e *Engine) fail(err error) {
 
 // update runs fn in a store write transaction; ErrFenced stops the engine.
 func (e *Engine) update(fn func(*store.Tx) error) error {
-	err := e.st.Update(fn)
+	var notices []store.NotificationScope
+	err := e.st.Update(func(tx *store.Tx) error {
+		if err := fn(tx); err != nil {
+			return err
+		}
+		notices = tx.NotificationChanges()
+		return nil
+	})
+	if err == nil && len(notices) > 0 {
+		e.wakeNotify(notices...)
+	}
 	if errors.Is(err, store.ErrFenced) || errors.Is(err, store.ErrNotAcquired) {
 		e.fail(err)
 	}
@@ -490,10 +501,36 @@ func (e *Engine) wakeReader() { wake(e.readWake) }
 
 // wakeNotify: an outbox row left the queue; a pending owner notification
 // may be due.
-func (e *Engine) wakeNotify() {
-	if e.notifyN.Load() > 0 {
-		wake(e.notifyWake)
+func (e *Engine) wakeNotify(scopes ...store.NotificationScope) {
+	e.notifyMu.Lock()
+	defer e.notifyMu.Unlock()
+	if len(scopes) == 0 {
+		scopes = []store.NotificationScope{{}}
 	}
+	for _, scope := range scopes {
+		if len(e.notifyDirty) == 1 && e.notifyDirty[0] == (store.NotificationScope{}) {
+			break
+		}
+		if scope == (store.NotificationScope{}) || len(e.notifyDirty) >= 128 {
+			e.notifyDirty = []store.NotificationScope{{}}
+			break
+		}
+		found := false
+		for _, saved := range e.notifyDirty {
+			if saved == scope {
+				found = true
+				break
+			}
+		}
+		if !found {
+			e.notifyDirty = append(e.notifyDirty, scope)
+		}
+	}
+	wake(e.notifyWake)
+}
+
+func (e *Engine) wakeDeliveryNotify(r store.Outbox) {
+	e.wakeNotify(store.DeliveryNotificationScopes(r.ConvID, r.DeliveryKey)...)
 }
 func (e *Engine) wakeResolver() { wake(e.resolverWake) }
 
@@ -505,12 +542,15 @@ func (e *Engine) wakeRunner(ids ...int64) {
 	}
 	e.mu.Unlock()
 	wake(e.runnerWake)
-	e.wakeNotify() // the same events (a row left the outbox) can make a notification due
 }
 
 // Run starts the engine and blocks until ctx ends or a fatal error. The
 // caller must have acquired the store.
 func (e *Engine) Run(ctx context.Context) error {
+	if c, ok := e.cfg.Skills.(io.Closer); ok {
+		defer c.Close()
+	}
+
 	ctx, cancel := context.WithCancel(ctx)
 	e.cancel = cancel
 	defer cancel()
@@ -650,8 +690,17 @@ func (e *Engine) start(ctx context.Context) error {
 	if err := e.rehashLegacy(); err != nil {
 		return fmt.Errorf("engine: re-hash legacy outbox: %w", err)
 	}
+	if err := e.ensureInbox(); err != nil {
+		return err
+	}
+	if err := e.loadDelegThreads(); err != nil {
+		return err
+	}
+	if err := e.ensureControl(ctx); err != nil {
+		return err
+	}
 	// Rows that were being sent when the previous process died have an
-	// unknown outcome.
+	// unknown outcome. The control conversation must exist for their warnings.
 	var unknown int
 	if err := e.update(func(tx *store.Tx) error {
 		for id := range e.convs {
@@ -664,6 +713,9 @@ func (e *Engine) start(ctx context.Context) error {
 					if err := tx.MarkUnknown(r.ID, "helper stopped during send"); err != nil {
 						return err
 					}
+					if err := e.reportUnknown(tx, r); err != nil {
+						return err
+					}
 					unknown++
 				}
 			}
@@ -674,15 +726,6 @@ func (e *Engine) start(ctx context.Context) error {
 	}
 	if unknown > 0 {
 		e.logf("%d sends in flight at the last stop are unknown; resolving by read-back", unknown)
-	}
-	if err := e.ensureInbox(); err != nil {
-		return err
-	}
-	if err := e.loadDelegThreads(); err != nil {
-		return err
-	}
-	if err := e.ensureControl(ctx); err != nil {
-		return err
 	}
 	e.resumeCreating()
 	e.resumeFreezes()

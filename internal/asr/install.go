@@ -2,13 +2,11 @@ package asr
 
 import (
 	"archive/tar"
-	"bytes"
 	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,7 +15,6 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -28,7 +25,7 @@ import (
 // Cache layout (safe to share between hosts, e.g. an NFS home):
 //
 //	<root>/<asset>-<sha12>/            one verified install per pinned asset
-//	<root>/<asset>-<sha12>/.asr-install.json   manifest, written before publish
+//	<root>/<asset>-<sha12>/.asr-install.sqlite manifest, written before publish
 //	<root>/tmp/                        downloads, staging dirs, quarantined installs
 //	<root>/locks/                      advisory locks (best effort; NFS may lack them)
 //
@@ -37,25 +34,12 @@ import (
 // two hosts racing on the same asset both end up with the same content.
 
 const (
-	manifestName   = ".asr-install.json"
+	manifestName   = ".asr-install.sqlite"
 	hashOnUseLimit = 128 << 20 // files up to this size are re-hashed on first use per process
 	staleTempAge   = 24 * time.Hour
 	maxExtract     = 4 << 30
 	downloadTries  = 3
 )
-
-type installManifest struct {
-	Asset     string         `json:"asset"`
-	SHA256    string         `json:"sha256"`
-	Installed string         `json:"installed"`
-	Files     []manifestFile `json:"files"`
-}
-
-type manifestFile struct {
-	Path   string `json:"path"`
-	Size   int64  `json:"size"`
-	SHA256 string `json:"sha256"`
-}
 
 type installer struct {
 	root       string
@@ -246,64 +230,6 @@ func (in *installer) report() {
 // present with the recorded size, and files up to hashOnUseLimit (the
 // binaries) are re-hashed. Large model files were hashed at download time;
 // a corrupted model is caught when llama-server fails to load it.
-func verifyInstall(dir string, a Asset) error {
-	data, err := os.ReadFile(filepath.Join(dir, manifestName))
-	if err != nil {
-		return err
-	}
-	var m installManifest
-	if err := json.Unmarshal(data, &m); err != nil {
-		return fmt.Errorf("install manifest unreadable: %w", err)
-	}
-	if !strings.EqualFold(m.SHA256, a.SHA256) || len(m.Files) == 0 {
-		return errors.New("install manifest does not match the pinned asset")
-	}
-	for _, f := range m.Files {
-		p := filepath.Join(dir, filepath.FromSlash(f.Path))
-		info, err := os.Stat(p)
-		if err != nil {
-			return err
-		}
-		if info.Size() != f.Size {
-			return fmt.Errorf("%s: size %d, manifest %d", f.Path, info.Size(), f.Size)
-		}
-		if f.Size <= hashOnUseLimit {
-			if sum, err := fileSHA256(p); err != nil || sum != f.SHA256 {
-				return fmt.Errorf("%s: checksum mismatch", f.Path)
-			}
-		}
-	}
-	return nil
-}
-
-func writeManifest(stage string, a Asset) error {
-	m := installManifest{Asset: a.Name, SHA256: a.SHA256, Installed: time.Now().UTC().Format(time.RFC3339)}
-	err := filepath.WalkDir(stage, func(p string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return err
-		}
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-		rel, _ := filepath.Rel(stage, p)
-		sum := a.SHA256 // a FormatFile asset was hashed while downloading
-		if a.Format != FormatFile || rel != a.Name {
-			if sum, err = fileSHA256(p); err != nil {
-				return err
-			}
-		}
-		m.Files = append(m.Files, manifestFile{Path: filepath.ToSlash(rel), Size: info.Size(), SHA256: sum})
-		return nil
-	})
-	if err != nil {
-		return err
-	}
-	sort.Slice(m.Files, func(i, j int) bool { return m.Files[i].Path < m.Files[j].Path })
-	data, _ := json.MarshalIndent(m, "", " ")
-	return writeFile(filepath.Join(stage, manifestName), bytes.NewReader(data), 0o644)
-}
-
 // publish renames stage to dir. A rename onto an existing directory fails,
 // which is how a lost race is detected. Windows scanners briefly lock fresh
 // files, so sharing violations are retried.

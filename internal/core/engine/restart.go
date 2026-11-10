@@ -21,20 +21,13 @@ import (
 //   - `helper restart force` restarts at once; running turns are
 //     interrupted and reported once by the next process (F-TRN-5).
 //
-// The request is durable (metaRestartRequest, committed with the reply):
+// The request is durable (restart_requests, committed with the reply):
 // a process that stops while waiting is replaced by one that waits again.
 // The restart itself records the confirmation the next process owes
-// (metaRestart) in the transaction that clears the request, so "✅ Helper
+// (restart_confirmation) in the transaction that clears the request, so "✅ Helper
 // restart completed" is posted exactly once.
 
-const metaRestartRequest = "engine_restart_request" // JSON restartRequest: a `helper restart now|force` not yet done
-
-type restartRequest struct {
-	Conv    int64  `json:"conv"`
-	Inbound int64  `json:"inbound"`
-	Quote   string `json:"quote,omitempty"`
-	Force   bool   `json:"force,omitempty"`
-}
+type restartRequest = store.RestartRequest
 
 // Texts (v0.1.20 unless noted).
 const (
@@ -97,7 +90,7 @@ func (e *Engine) cmdRestart(ctx context.Context, j cmdJob, arg string) {
 		// An update waits for running work (or installs): it restarts
 		// the helper itself.
 		text := textRestartBlockedUpdate
-		if v, ok, err := e.st.Meta(metaCodexUpgrade); err == nil && ok && v != "" {
+		if e.hasCodexRequest() {
 			text = textRestartBlockedCodex
 		}
 		e.reply(j, text, nil)
@@ -109,12 +102,12 @@ func (e *Engine) cmdRestart(ctx context.Context, j cmdJob, arg string) {
 	}
 	err := e.replyIn(j, func(tx *store.Tx) (string, error) {
 		var prev restartRequest
-		if ok, err := metaJSON(tx, metaRestartRequest, &prev); err != nil {
+		if ok, err := readRestartRequest(tx, &prev); err != nil {
 			return "", err
 		} else if ok && !force {
 			return "⏳ A helper restart is already waiting for the running work to finish.\n\nDebug only: `helper restart force` may interrupt active work.", nil
 		}
-		return text, setMetaJSON(tx, metaRestartRequest, restartRequest{Conv: j.conv, Inbound: j.inbound, Quote: j.quote, Force: force})
+		return text, tx.SetRestartRequest(restartRequest{Conv: j.conv, Inbound: j.inbound, Quote: j.quote, Force: force})
 	})
 	if err != nil {
 		return
@@ -124,7 +117,7 @@ func (e *Engine) cmdRestart(ctx context.Context, j cmdJob, arg string) {
 
 // resumeRestart continues a restart request left by the previous process.
 func (e *Engine) resumeRestart(ctx context.Context) {
-	if v, ok, err := e.st.Meta(metaRestartRequest); err == nil && ok && v != "" {
+	if e.hasRestartRequest() {
 		e.startRestart(ctx)
 	}
 }
@@ -156,9 +149,9 @@ func (e *Engine) runRestart(ctx context.Context) {
 	var req restartRequest
 	for {
 		var have bool
-		if err := e.update(func(tx *store.Tx) error {
+		if err := e.st.Read(func(tx *store.Tx) error {
 			var err error
-			have, err = metaJSON(tx, metaRestartRequest, &req)
+			have, err = readRestartRequest(tx, &req)
 			return err
 		}); err != nil || !have {
 			e.restartDrain.Store(false)
@@ -187,10 +180,10 @@ func (e *Engine) runRestart(ctx context.Context) {
 	// so the confirmation after the restart follows it (bounded wait).
 	e.waitOutboxIdle(ctx, 15*time.Second)
 	err := e.update(func(tx *store.Tx) error {
-		if err := tx.SetMeta(metaRestart, fmt.Sprintf("%d:%d:%s", req.Conv, req.Inbound, req.Quote)); err != nil {
+		if err := tx.SetRestartConfirmation(store.RestartConfirmation{Conv: req.Conv, Inbound: req.Inbound, Quote: req.Quote}); err != nil {
 			return err
 		}
-		return tx.SetMeta(metaRestartRequest, "")
+		return tx.DeleteRestartRequest()
 	})
 	if err != nil {
 		e.logf("restart: %v", err)
@@ -216,7 +209,7 @@ func (e *Engine) restartTimedOut(req restartRequest) {
 func (e *Engine) restartNotice(req restartRequest, text string, clear bool) {
 	err := e.update(func(tx *store.Tx) error {
 		if clear {
-			if err := tx.SetMeta(metaRestartRequest, ""); err != nil {
+			if err := tx.DeleteRestartRequest(); err != nil {
 				return err
 			}
 		}
@@ -250,8 +243,9 @@ func (e *Engine) waitOutboxIdle(ctx context.Context, limit time.Duration) {
 		if err != nil {
 			return
 		}
-		notify, _, err := e.st.Meta(metaNotify)
-		if err != nil || n["queued"]+n["sending"] == 0 && notify == "" {
+		var notify bool
+		err = e.st.Read(func(tx *store.Tx) (err error) { notify, err = tx.HasNotifications(); return })
+		if err != nil || n["queued"]+n["sending"] == 0 && !notify {
 			return
 		}
 		select {

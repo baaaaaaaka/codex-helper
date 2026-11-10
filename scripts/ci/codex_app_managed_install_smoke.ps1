@@ -2,7 +2,8 @@ param(
   [Parameter(Mandatory = $true)]
   [string]$Helper,
   [string]$RecordingProxy = "",
-  [string]$FakeChatGPT = ""
+  [string]$FakeChatGPT = "",
+  [string]$Python = "python"
 )
 
 $ErrorActionPreference = "Stop"
@@ -141,10 +142,12 @@ try {
     throw "managed install left a ChatGPT/Codex process running after cleanup"
   }
 
-  $statePath = Join-Path $managedRoot "current.json"
-  if (!(Test-Path -LiteralPath $statePath -PathType Leaf)) { throw "managed backend did not publish current.json" }
-  $state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
-  $runtime = Join-Path $managedRoot ([string]$state.runtime)
+  $statePath = Join-Path $managedRoot "current.sqlite"
+  if (!(Test-Path -LiteralPath $statePath -PathType Leaf)) { throw "managed backend did not publish current.sqlite" }
+  $readRuntime = 'import pathlib,sqlite3,sys; db=sqlite3.connect(pathlib.Path(sys.argv[1]).resolve().as_uri()+"?mode=ro",uri=True); print(db.execute("SELECT runtime_relative FROM installed_app WHERE id=1").fetchone()[0]); db.close()'
+  $runtimeRelative = & $Python -c $readRuntime $statePath
+  if ($LASTEXITCODE -ne 0) { throw "reading managed app SQLite state failed" }
+  $runtime = Join-Path $managedRoot ([string]$runtimeRelative)
   $managedExe = Join-Path $runtime "app\ChatGPT.exe"
   if (!(Test-Path -LiteralPath $managedExe -PathType Leaf)) { throw "managed runtime has no ChatGPT.exe: $managedExe" }
   if ($managedExe -like "*\WindowsApps\*") { throw "managed ChatGPT executable unexpectedly resides below WindowsApps: $managedExe" }
@@ -152,7 +155,7 @@ try {
   $rootHelpPath = Join-Path $base "root-help.out"
   $rootHelp = Invoke-SmokeProcess -FilePath $Helper -Arguments @("--help") -OutputPath $rootHelpPath
   if ($rootHelp -notmatch "--upgrade-codex-app") { throw "built helper root help does not expose --upgrade-codex-app" }
-  $stateBeforeUpgrade = Get-Content -Raw -LiteralPath $statePath
+  $stateBeforeUpgrade = (Get-FileHash -LiteralPath $statePath -Algorithm SHA256).Hash
   $oldRuntime = $runtime
   $oldManagedExe = $managedExe
   $proxyLogBeforeUpgrade = if (Test-Path -LiteralPath $proxyLog -PathType Leaf) { Get-Content -Raw -LiteralPath $proxyLog } else { "" }
@@ -169,18 +172,19 @@ try {
   if (-not $updatePublished -and $upgradeText -notmatch "Codex desktop app is already up to date") {
     throw "managed app update did not report a verified package result`n$upgradeText"
   }
-  $stateAfterUpgrade = Get-Content -Raw -LiteralPath $statePath
+  $stateAfterUpgrade = (Get-FileHash -LiteralPath $statePath -Algorithm SHA256).Hash
   if (-not $updatePublished -and $stateAfterUpgrade -ne $stateBeforeUpgrade) {
-    throw "unchanged managed app update rewrote current.json"
+    throw "unchanged managed app update rewrote current.sqlite"
   }
   if ($updatePublished -and $stateAfterUpgrade -eq $stateBeforeUpgrade) {
-    throw "managed app update reported a publish without changing current.json"
+    throw "managed app update reported a publish without changing current.sqlite"
   }
   if ($updatePublished -and !(Test-Path -LiteralPath $oldManagedExe -PathType Leaf)) {
     throw "managed app update removed the old runtime: $oldRuntime"
   }
-  $state = Get-Content -Raw -LiteralPath $statePath | ConvertFrom-Json
-  $runtime = Join-Path $managedRoot ([string]$state.runtime)
+  $runtimeRelative = & $Python -c $readRuntime $statePath
+  if ($LASTEXITCODE -ne 0) { throw "reading updated managed app SQLite state failed" }
+  $runtime = Join-Path $managedRoot ([string]$runtimeRelative)
   $managedExe = Join-Path $runtime "app\ChatGPT.exe"
   if (!(Test-Path -LiteralPath $managedExe -PathType Leaf)) { throw "managed app update left no current ChatGPT.exe: $managedExe" }
   $proxyLogAfterUpgrade = Get-Content -Raw -LiteralPath $proxyLog
@@ -199,8 +203,9 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "building fake ChatGPT child failed" }
   }
   Copy-Item -LiteralPath $fakeExe -Destination $managedExe -Force
-  $state.executableSha256 = (Get-FileHash -LiteralPath $managedExe -Algorithm SHA256).Hash.ToLowerInvariant()
-  $state | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $statePath -Encoding UTF8
+  $executableHash = (Get-FileHash -LiteralPath $managedExe -Algorithm SHA256).Hash.ToLowerInvariant()
+  & $Python -c 'import pathlib,sqlite3,sys; db=sqlite3.connect(pathlib.Path(sys.argv[1]).resolve().as_uri()+"?mode=rw",uri=True); assert db.execute("UPDATE installed_app SET executable_sha256=? WHERE id=1",(sys.argv[2],)).rowcount==1; db.commit(); db.close()' $statePath $executableHash
+  if ($LASTEXITCODE -ne 0) { throw "updating managed fake executable hash failed" }
 
   $existingProcessIds = @{}
   Get-Process -Name $desktopProcessNames -ErrorAction SilentlyContinue | ForEach-Object { $existingProcessIds[$_.Id] = $true }

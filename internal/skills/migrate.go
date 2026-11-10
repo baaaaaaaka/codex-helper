@@ -2,12 +2,12 @@ package skills
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -69,7 +69,7 @@ type migrationSkillCandidate struct {
 }
 
 func (m *Manager) MigrationStatusPath() string {
-	return filepath.Join(m.ConfigDir, MigrationStatusFilename)
+	return m.Store.StatePath()
 }
 
 func (m *Manager) MigrateLegacySkills(ctx context.Context, opts MigrationOptions) (MigrationReport, error) {
@@ -144,7 +144,7 @@ func (m *Manager) migrateLegacySkillsUnlocked(ctx context.Context, opts Migratio
 	if opts.DryRun {
 		report.Status = MigrationStatusDryRun
 	}
-	if err := writeJSONFile(m.MigrationStatusPath(), report); err != nil {
+	if err := m.Store.SaveMigrationReport(report); err != nil {
 		return report, err
 	}
 	return report, nil
@@ -312,31 +312,7 @@ func (m *Manager) migrateBuiltinUnlocked(codexRoot, agentsRoot string, opts Migr
 }
 
 func (m *Manager) retargetSource(sourceID, agentsRoot string, installed []InstalledSkill) error {
-	return m.Store.Update(func(cfg *Config, st *State) error {
-		for i := range cfg.Sources {
-			if cfg.Sources[i].ID == sourceID {
-				cfg.Sources[i].TargetKind = TargetAgents
-				cfg.Sources[i].TargetRoot = agentsRoot
-				cfg.Sources[i].UpdatedAt = nowUTC()
-			}
-		}
-		state, ok := sourceStateByID(*st, sourceID)
-		if !ok {
-			state = SourceState{ID: sourceID, Status: StatusReady}
-		}
-		if len(installed) > 0 {
-			state.InstalledSkills = installed
-		} else {
-			for i := range state.InstalledSkills {
-				state.InstalledSkills[i].TargetPath = filepath.Join(agentsRoot, state.InstalledSkills[i].ExportName)
-			}
-		}
-		if state.Status == "" || state.Status == StatusSyncing {
-			state.Status = StatusReady
-		}
-		st.Sources = upsertState(st.Sources, state)
-		return nil
-	})
+	return m.Store.Retarget(sourceID, agentsRoot, installed)
 }
 
 func migrationCandidatesForSource(oldRoot, newRoot string, source Source, state SourceState) ([]migrationSkillCandidate, error) {
@@ -582,9 +558,10 @@ func moveLegacySkillToBackup(oldRoot, oldPath string) (string, error) {
 func manifestsEquivalentForMigration(a, b exportManifest) bool {
 	a.ExportedAt = time.Time{}
 	b.ExportedAt = time.Time{}
-	adata, _ := json.Marshal(a)
-	bdata, _ := json.Marshal(b)
-	return string(adata) == string(bdata)
+	files := slices.Equal(a.Files, b.Files)
+	a.Files = nil
+	b.Files = nil
+	return files && a.Version == b.Version && a.SourceID == b.SourceID && a.SourceName == b.SourceName && a.RemoteURL == b.RemoteURL && a.Ref == b.Ref && a.Commit == b.Commit && a.SkillName == b.SkillName && a.SourcePath == b.SourcePath && a.ExportName == b.ExportName
 }
 
 func installedSkillFromManifest(manifest exportManifest, targetPath string) InstalledSkill {

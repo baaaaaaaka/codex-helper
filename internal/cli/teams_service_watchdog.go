@@ -2,7 +2,6 @@ package cli
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -172,11 +171,21 @@ func runTeamsServiceWatchdogLoop(ctx context.Context, opts teamsServiceWatchdogO
 	if interval <= 0 {
 		interval = teamsServiceExternalWatchdogInterval
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	var store *teamsServiceStateDB
+	defer func() {
+		if store != nil {
+			store.Close()
+		}
+	}()
+
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		changed, err := runTeamsServiceWatchdogIteration(ctx, opts, quiet, out)
+		changed, err := runTeamsServiceWatchdogIterationWithStore(ctx, opts, quiet, out, &store)
 		if changed && err == nil {
 			return nil
 		}
@@ -192,6 +201,15 @@ func runTeamsServiceWatchdogLoop(ctx context.Context, opts teamsServiceWatchdogO
 // Refresh and health collection share the loop's retry policy. An unreadable
 // runtime pointer must not stop the watchdog or let an old build judge health.
 func runTeamsServiceWatchdogIteration(ctx context.Context, opts teamsServiceWatchdogOptions, quiet bool, out io.Writer) (bool, error) {
+	var store *teamsServiceStateDB
+	defer func() {
+		if store != nil {
+			store.Close()
+		}
+	}()
+	return runTeamsServiceWatchdogIterationWithStore(ctx, opts, quiet, out, &store)
+}
+func runTeamsServiceWatchdogIterationWithStore(ctx context.Context, opts teamsServiceWatchdogOptions, quiet bool, out io.Writer, store **teamsServiceStateDB) (bool, error) {
 	if !opts.DryRun {
 		if changed, err := refreshTeamsServiceWatchdogRuntime(); changed || err != nil {
 			return changed, err
@@ -199,7 +217,7 @@ func runTeamsServiceWatchdogIteration(ctx context.Context, opts teamsServiceWatc
 	}
 	checkCtx, cancel := context.WithTimeout(ctx, teamsServiceExternalWatchdogCheckTimeout)
 	defer cancel()
-	result, err := runTeamsServiceWatchdogOnce(checkCtx, opts)
+	result, err := runTeamsServiceWatchdogOnceWithStore(checkCtx, opts, store)
 	if err == nil && !quiet {
 		printTeamsServiceWatchdogResult(out, result)
 	}
@@ -207,12 +225,40 @@ func runTeamsServiceWatchdogIteration(ctx context.Context, opts teamsServiceWatc
 }
 
 func runTeamsServiceWatchdogOnce(ctx context.Context, opts teamsServiceWatchdogOptions) (teamsServiceWatchdogResult, error) {
+	var store *teamsServiceStateDB
+	defer func() {
+		if store != nil {
+			store.Close()
+		}
+	}()
+	return runTeamsServiceWatchdogOnceWithStore(ctx, opts, &store)
+}
+func runTeamsServiceWatchdogOnceWithStore(ctx context.Context, opts teamsServiceWatchdogOptions, owned **teamsServiceStateDB) (teamsServiceWatchdogResult, error) {
 	opts = normalizeTeamsServiceWatchdogOptions(opts)
 	snapshot, err := teamsServiceWatchdogCollectSnapshot(ctx, opts)
 	if err != nil {
 		return teamsServiceWatchdogResult{}, err
 	}
-	state, err := loadTeamsServiceWatchdogState()
+	var state teamsServiceWatchdogState
+	var store *teamsServiceStateDB
+	if opts.DryRun {
+		path, e := teamsServiceWatchdogStatePath()
+		if e != nil {
+			return teamsServiceWatchdogResult{}, e
+		}
+		state, err = loadTeamsServiceWatchdogNative(path)
+	} else {
+		store = *owned
+		if store == nil {
+			store, err = openTeamsWatchdogState()
+			if err == nil {
+				*owned = store
+			}
+		}
+		if err == nil {
+			state, err = store.Watchdog()
+		}
+	}
 	if err != nil {
 		return teamsServiceWatchdogResult{}, err
 	}
@@ -224,7 +270,7 @@ func runTeamsServiceWatchdogOnce(ctx context.Context, opts teamsServiceWatchdogO
 	}
 	if decision.Action == teamsServiceWatchdogActionStart || decision.Action == teamsServiceWatchdogActionRestart {
 		pending := teamsServiceWatchdogPendingActionState(next)
-		if err := saveTeamsServiceWatchdogState(pending); err != nil {
+		if err := store.SaveWatchdog(pending); err != nil {
 			return teamsServiceWatchdogResult{}, err
 		}
 		if err := teamsServiceWatchdogStartService(ctx, decision.Action == teamsServiceWatchdogActionRestart); err != nil {
@@ -232,7 +278,7 @@ func runTeamsServiceWatchdogOnce(ctx context.Context, opts teamsServiceWatchdogO
 			return result, err
 		}
 		result.State = next
-		if err := saveTeamsServiceWatchdogState(next); err != nil {
+		if err := store.SaveWatchdog(next); err != nil {
 			return teamsServiceWatchdogResult{}, err
 		}
 		return result, nil
@@ -241,7 +287,7 @@ func runTeamsServiceWatchdogOnce(ctx context.Context, opts teamsServiceWatchdogO
 		result.State = state
 		return result, nil
 	}
-	if err := saveTeamsServiceWatchdogState(next); err != nil {
+	if err := store.SaveWatchdog(next); err != nil {
 		return teamsServiceWatchdogResult{}, err
 	}
 	return result, nil
@@ -300,7 +346,11 @@ func collectTeamsServiceWatchdogSnapshot(ctx context.Context, opts teamsServiceW
 		snapshot.Disabled = true
 	}
 	if host, err := teamsHostname(); err == nil {
-		snapshot.BackoffUntil = readTeamsServiceRestartRecord(teamsServiceRestartRecordPath(filepath.Dir(path), host)).WaitUntil
+		rec, e := readTeamsServiceRestartRecord(teamsServiceRestartRecordPath(filepath.Dir(path), host))
+		if e != nil {
+			return snapshot, e
+		}
+		snapshot.BackoffUntil = rec.WaitUntil
 	}
 	if view, err := teamsStoreViewAt(path); err == nil && view.Info.Exists {
 		return teamsServiceWatchdogLeaseSnapshot(snapshot, view, opts), nil
@@ -459,56 +509,6 @@ func teamsServiceWatchdogStateSemanticallyEqual(left, right teamsServiceWatchdog
 	left.UpdatedAt = time.Time{}
 	right.UpdatedAt = time.Time{}
 	return left == right
-}
-
-func loadTeamsServiceWatchdogState() (teamsServiceWatchdogState, error) {
-	path, err := teamsServiceWatchdogStatePath()
-	if err != nil {
-		return teamsServiceWatchdogState{}, err
-	}
-	data, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
-		return teamsServiceWatchdogState{}, nil
-	}
-	if err != nil {
-		return teamsServiceWatchdogState{}, err
-	}
-	var state teamsServiceWatchdogState
-	if err := json.Unmarshal(data, &state); err != nil {
-		return teamsServiceWatchdogState{}, nil
-	}
-	return state, nil
-}
-
-func saveTeamsServiceWatchdogState(state teamsServiceWatchdogState) error {
-	path, err := teamsServiceWatchdogStatePath()
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return err
-	}
-	data, err := json.MarshalIndent(state, "", "  ")
-	if err != nil {
-		return err
-	}
-	data = append(data, '\n')
-	return os.WriteFile(path, data, 0o600)
-}
-
-func defaultTeamsServiceWatchdogStatePath() (string, error) {
-	path, err := appdirs.StatePath("teams", "service", "service-watchdog.json")
-	if err != nil {
-		return "", err
-	}
-	var legacyPaths []string
-	if legacyPath, legacyErr := appdirs.LegacyCachePath("teams", "service-watchdog.json"); legacyErr == nil {
-		legacyPaths = append(legacyPaths, legacyPath)
-	}
-	if legacyPath, legacyErr := appdirs.LegacyConfigPath("teams", "service-watchdog.json"); legacyErr == nil {
-		legacyPaths = append(legacyPaths, legacyPath)
-	}
-	return appdirs.ResolveMigratedFile(path, legacyPaths...)
 }
 
 func printTeamsServiceWatchdogResult(out io.Writer, result teamsServiceWatchdogResult) {

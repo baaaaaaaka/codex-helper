@@ -140,15 +140,20 @@ local dirty edit
     $env:XDG_CONFIG_HOME = Join-Path $fixtureHome ".config"
     $env:XDG_CACHE_HOME = Join-Path $fixtureHome ".cache"
     $env:LOCALAPPDATA = Join-Path $fixtureHome "AppData\Local"
-    & $helperExe @helperArgs --config $fixtureConfig skills --codex-dir $fixtureCodex add $repo --name oldshape --ref HEAD --path skills/review --target codex-home --yes
-    $oldShapeConfig = Get-Content -Raw -LiteralPath $fixtureSkillConfig | ConvertFrom-Json
-    foreach ($source in $oldShapeConfig.sources) {
-        $source.PSObject.Properties.Remove("target_kind")
-        $source.PSObject.Properties.Remove("target_root")
-    }
-    $oldShapeConfig | ConvertTo-Json -Depth 32 | Set-Content -LiteralPath $fixtureSkillConfig -NoNewline -Encoding UTF8
+    # Frozen legacy input. The new CLI must not produce the old fixture itself.
+    @{
+        version = 1
+        sources = @(@{ id = "oldshape-fixture"; name = "oldshape"; url = $repo; remote_url = $repo; ref = "HEAD"; path = "skills/review"; auto_sync = $false; added_at = "2026-01-01T00:00:00Z"; updated_at = "2026-01-01T00:00:00Z" })
+    } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $fixtureSkillConfig -NoNewline -Encoding UTF8
     $oldShapeLegacy = Join-Path $fixtureCodex "skills\oldshape__review"
     $oldShapeAgents = Join-Path $fixtureHome ".agents\skills\oldshape__review"
+    New-Item -ItemType Directory -Force -Path $oldShapeLegacy | Out-Null
+    $oldShapeFile = Join-Path $oldShapeLegacy "SKILL.md"
+    Copy-Item -LiteralPath (Join-Path $repo "skills\review\SKILL.md") -Destination $oldShapeFile
+    @{
+        version = 1; source_id = "oldshape-fixture"; source_name = "oldshape"; remote_url = $repo; ref = "HEAD"; commit = "frozen"; skill_name = "review"; source_path = "skills/review"; export_name = "oldshape__review"; exported_at = "2026-01-01T00:00:00Z"
+        files = @(@{ rel_path = "SKILL.md"; sha256 = (Get-FileHash -LiteralPath $oldShapeFile -Algorithm SHA256).Hash.ToLowerInvariant(); size = (Get-Item -LiteralPath $oldShapeFile).Length; mode = 420 })
+    } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $oldShapeLegacy ".cxp-skill-manifest.json") -NoNewline -Encoding UTF8
     if (!(Test-Path -LiteralPath (Join-Path $oldShapeLegacy "SKILL.md"))) { throw "old-shape legacy skill missing before migration" }
     $oldShapeList = & $helperExe @helperArgs --config $fixtureConfig skills --codex-dir $fixtureCodex list
     if (($oldShapeList -join "`n") -notmatch "target agents") { throw "old-shape self-heal did not retarget to agents: $oldShapeList" }

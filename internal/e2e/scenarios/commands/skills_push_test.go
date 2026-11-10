@@ -1,7 +1,9 @@
 package commands
 
 import (
+	"database/sql"
 	"fmt"
+	_ "modernc.org/sqlite"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -104,6 +106,23 @@ func TestSkillsPushFromTeams(t *testing.T) {
 
 	// The review survives a restart.
 	s.StopSUT()
+	dbPath := filepath.Join(s.Env.ConfigDir, "codex-proxy", "skills.sqlite")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var count int
+	if err = db.QueryRow(`SELECT count(*) FROM push_reviews WHERE chat=?`, control.ID).Scan(&count); err != nil {
+		db.Close()
+		t.Fatal(err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s.Check("review is a native SQLite row before restart", count == 1, "one review", fmt.Sprint(count))
+	if err = os.WriteFile(filepath.Join(filepath.Dir(dbPath), "teams-skill-push-reviews.json"), []byte("poisoned legacy review"), 0600); err != nil {
+		t.Fatal(err)
+	}
 	s.StartSUT()
 	expect(s, control.ID, "helper skills push confirm", "Skills Push", "Mode: review branch",
 		"demo: pushed HEAD:refs/heads/skill/demo-", "Final staged diff for demo:", "Pushed HEAD:refs/heads/skill/demo-")

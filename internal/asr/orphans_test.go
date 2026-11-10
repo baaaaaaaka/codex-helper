@@ -113,10 +113,18 @@ func waitGone(t *testing.T, pid int, what string) {
 	}
 }
 
-func runRecords(t *testing.T, root string) []string {
+func runRecords(t *testing.T, root string) []serverRecord {
 	t.Helper()
-	matches, _ := filepath.Glob(filepath.Join(root, "run", "*.json"))
-	return matches
+	db, err := openServerRecords(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err := db.page(hostName(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return rows
 }
 
 // A helper that dies without Close must not leave llama-server running.
@@ -200,11 +208,23 @@ func TestOrphanedServer(t *testing.T) {
 		if !alive(pid) {
 			t.Fatal("a process that reused a recorded PID was killed")
 		}
-		if _, err := os.Stat(reused); !os.IsNotExist(err) {
-			t.Fatal("stale record was not removed")
+		if records := runRecords(t, f.cache); len(records) != 0 {
+			t.Fatal("stale native record was not removed")
 		}
-		if _, err := os.Stat(other); err != nil {
-			t.Fatal("another host's record was removed")
+		if _, err := os.Stat(reused + ".migrated"); err != nil {
+			t.Fatal("old record not archived", err)
+		}
+		db, err := openServerRecords(f.cache)
+		if err != nil {
+			t.Fatal(err)
+		}
+		records, err := db.page("some-other-host", 0)
+		db.Close()
+		if err != nil || len(records) != 1 {
+			t.Fatal("another host's native record was removed")
+		}
+		if _, err := os.Stat(other + ".migrated"); err != nil {
+			t.Fatal("other-host migration archive", err)
 		}
 	})
 

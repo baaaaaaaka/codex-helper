@@ -4,7 +4,6 @@ package installtest
 
 import (
 	"crypto/sha256"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -12,7 +11,17 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
+	"github.com/baaaaaaaka/codex-helper/internal/managedinstall"
 )
+
+func TestMain(m *testing.M) {
+	if code, handled := managedinstall.HandleInstallerCommand(os.Args, os.Stdout, os.Stderr); handled {
+		os.Exit(code)
+	}
+	os.Exit(m.Run())
+}
 
 func TestInstallShLatestUsesRedirectBeforeAPI(t *testing.T) {
 	run := newInstallShRun(t, false, false)
@@ -880,7 +889,12 @@ func runInstallSh(t *testing.T, apiFail bool, pathAlreadySet bool) {
 	version := "v1.2.3"
 	verNoV := strings.TrimPrefix(version, "v")
 	asset := fmt.Sprintf("codex-proxy_%s_%s_%s", verNoV, runtime.GOOS, runtime.GOARCH)
-	assetData := []byte("#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then\n  echo codex-proxy 1.2.3\n  exit 0\nfi\nexit 0\n")
+	writer, err := helperpath.RawExecutable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	quotedWriter := "'" + strings.ReplaceAll(writer, "'", "'\\''") + "'"
+	assetData := []byte("#!/bin/sh\nif [ \"$1\" = \"--cxp-record-install\" ]; then exec " + quotedWriter + " \"$@\"; fi\nif [ \"$1\" = \"--version\" ]; then echo codex-proxy 1.2.3; exit 0; fi\nexit 0\n")
 	checksum := sha256.Sum256(assetData)
 	checksums := fmt.Sprintf("%x  %s\n", checksum, asset)
 	apiJSON := fmt.Sprintf("{\"tag_name\":\"%s\"}", version)
@@ -947,23 +961,9 @@ func runInstallSh(t *testing.T, apiFail bool, pathAlreadySet bool) {
 	if !strings.Contains(string(cxpVersion), "codex-proxy 1.2.3") {
 		t.Fatalf("unexpected cxp --version output: %s", string(cxpVersion))
 	}
-	recordData, err := os.ReadFile(filepath.Join(homeDir, ".config", "codex-helper", "install.json"))
+	record, err := managedinstall.LoadRecord(filepath.Join(homeDir, ".config", "codex-helper", "install.sqlite"))
 	if err != nil {
-		t.Fatalf("read install record: %v", err)
-	}
-	var record struct {
-		SchemaVersion int      `json:"schema_version"`
-		TargetPath    string   `json:"target_path"`
-		TargetSource  string   `json:"target_source"`
-		TargetState   string   `json:"target_state"`
-		Repo          string   `json:"repo"`
-		Version       string   `json:"version"`
-		GOOS          string   `json:"goos"`
-		GOARCH        string   `json:"goarch"`
-		Shims         []string `json:"shims"`
-	}
-	if err := json.Unmarshal(recordData, &record); err != nil {
-		t.Fatalf("parse install record: %v\n%s", err, recordData)
+		t.Fatalf("read native install record: %v", err)
 	}
 	if record.SchemaVersion != 1 ||
 		record.TargetPath != installed ||

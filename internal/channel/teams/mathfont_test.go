@@ -116,7 +116,7 @@ func TestMathFontDownloadedOnDemand(t *testing.T) {
 		t.Fatalf("renderer was not re-run with the font: %s", log)
 	}
 	fd := fontDir(root, a)
-	for _, f := range []string{a.Filename, "font.json", "LICENSE.txt"} {
+	for _, f := range []string{a.Filename, fontDatabaseName, "LICENSE.txt"} {
 		if _, err := os.Stat(filepath.Join(fd, f)); err != nil {
 			t.Fatalf("installed font lacks %s", f)
 		}

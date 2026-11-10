@@ -12,7 +12,7 @@ func TestReserveOutboxAllowsOnlyOneConcurrentNonIdempotentOwner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new claim: %v", err)
 	}
-	for _, suffix := range []string{"json", "sqlite"} {
+	for _, suffix := range []string{"sqlite"} {
 		t.Run(suffix, func(t *testing.T) {
 			path := t.TempDir() + "/worker-state." + suffix
 			if suffix == "sqlite" {
@@ -79,8 +79,8 @@ func TestReserveOutboxAllowsOnlyOneConcurrentNonIdempotentOwner(t *testing.T) {
 	}
 }
 
-func TestJSONWorkerStoreAuxiliaryWritesPreserveDurableSafetyState(t *testing.T) {
-	path := t.TempDir() + "/worker-state.json"
+func TestSQLiteWorkerStoreAuxiliaryWritesPreserveDurableSafetyState(t *testing.T) {
+	path := t.TempDir() + "/worker-state.sqlite"
 	record, err := NewClaimRecord("delegation-auxiliary-writes", "machine-a", "worker-a", 1, time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatalf("new claim: %v", err)
@@ -89,6 +89,12 @@ func TestJSONWorkerStoreAuxiliaryWritesPreserveDurableSafetyState(t *testing.T) 
 		t.Fatalf("initial reservation reserved=%v err=%v", reserved, err)
 	}
 
+	worker, err := OpenWorkerDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer worker.Close()
+
 	const writers = 24
 	errs := make(chan error, writers*2)
 	var done sync.WaitGroup
@@ -96,7 +102,7 @@ func TestJSONWorkerStoreAuxiliaryWritesPreserveDurableSafetyState(t *testing.T) 
 	for i := 0; i < writers; i++ {
 		go func(i int) {
 			defer done.Done()
-			err := UpsertInboxBackoffJSON(path, InboxBackoff{
+			err := worker.UpsertInboxBackoff(context.Background(), InboxBackoff{
 				ChatID:       "chat-inbox",
 				BlockedUntil: time.Date(2026, 9, 14, 12, 1, i, 0, time.UTC).Format(time.RFC3339Nano),
 				Reason:       "429 writer",
@@ -108,7 +114,7 @@ func TestJSONWorkerStoreAuxiliaryWritesPreserveDurableSafetyState(t *testing.T) 
 		}(i)
 		go func(i int) {
 			defer done.Done()
-			err := UpsertInboxCursorJSON(path, InboxCursor{
+			err := worker.UpsertInboxCursor(context.Background(), InboxCursor{
 				ChatID:            "chat-inbox",
 				LastHeadMessageID: "head-" + time.Date(2026, 9, 14, 12, 0, i, 0, time.UTC).Format("150405"),
 				UpdatedAt:         time.Date(2026, 9, 14, 12, 2, i, 0, time.UTC).Format(time.RFC3339Nano),
@@ -140,8 +146,8 @@ func TestJSONWorkerStoreAuxiliaryWritesPreserveDurableSafetyState(t *testing.T) 
 	}
 }
 
-func TestJSONWorkerStoreExecutionUpdatesAreAtomicWithAuxiliaryWrites(t *testing.T) {
-	path := t.TempDir() + "/worker-state.json"
+func TestSQLiteWorkerStoreExecutionUpdatesAreAtomicWithAuxiliaryWrites(t *testing.T) {
+	path := t.TempDir() + "/worker-state.sqlite"
 	record, err := NewClaimRecord("delegation-execution-update", "machine-a", "worker-a", 1, time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatalf("new claim: %v", err)
@@ -150,6 +156,12 @@ func TestJSONWorkerStoreExecutionUpdatesAreAtomicWithAuxiliaryWrites(t *testing.
 		t.Fatalf("initial reservation reserved=%v err=%v", reserved, err)
 	}
 
+	worker, err := OpenWorkerDB(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer worker.Close()
+
 	const writers = 16
 	errs := make(chan error, writers*3)
 	var done sync.WaitGroup
@@ -157,22 +169,14 @@ func TestJSONWorkerStoreExecutionUpdatesAreAtomicWithAuxiliaryWrites(t *testing.
 	for i := 0; i < writers; i++ {
 		go func(i int) {
 			defer done.Done()
-			err := UpdateStoreJSON(context.Background(), path, func(store *Store) error {
-				store.UpsertExecution(ExecutionFence{
-					DelegationID: record.DelegationID,
-					ClaimID:      record.RecordID,
-					Status:       StateRunning,
-					UpdatedAt:    time.Date(2026, 9, 14, 12, 3, i, 0, time.UTC).Format(time.RFC3339Nano),
-				})
-				return nil
-			})
+			_, err := worker.TryStart(context.Background(), Record{DelegationID: record.DelegationID}, Record{ClaimID: record.RecordID}, time.Date(2026, 9, 14, 12, 3, i, 0, time.UTC), WorkerStorePruneLimits{})
 			if err != nil {
 				errs <- err
 			}
 		}(i)
 		go func(i int) {
 			defer done.Done()
-			err := UpsertInboxCursorJSON(path, InboxCursor{
+			err := worker.UpsertInboxCursor(context.Background(), InboxCursor{
 				ChatID:            "chat-inbox",
 				LastHeadMessageID: "head-execution-" + time.Date(2026, 9, 14, 12, 0, i, 0, time.UTC).Format("150405"),
 				UpdatedAt:         time.Date(2026, 9, 14, 12, 4, i, 0, time.UTC).Format(time.RFC3339Nano),
@@ -183,7 +187,7 @@ func TestJSONWorkerStoreExecutionUpdatesAreAtomicWithAuxiliaryWrites(t *testing.
 		}(i)
 		go func(i int) {
 			defer done.Done()
-			err := UpsertInboxBackoffJSON(path, InboxBackoff{
+			err := worker.UpsertInboxBackoff(context.Background(), InboxBackoff{
 				ChatID:       "chat-inbox",
 				BlockedUntil: time.Date(2026, 9, 14, 12, 5, i, 0, time.UTC).Format(time.RFC3339Nano),
 				Reason:       "execution update race",

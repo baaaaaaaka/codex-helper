@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -38,11 +37,10 @@ import (
 // keys (a closed chat of the same session) gets a key namespace of its
 // own (metaMirrorNS): the new chat receives the history again, once.
 //
-// The jobs are a JSON list in meta (few, short-lived). Nothing runs while
+// Jobs are typed rows, keyed by ID and conversation. Nothing runs while
 // none is queued: the mirror loop checks one atomic flag per pass.
 
 const (
-	metaImports        = "engine_imports"
 	metaImportSeq      = "engine_import_seq"
 	metaMirrorNSPrefix = "engine_mirror_ns:"    // + source id: the delivery key namespace ("" = the thread id)
 	metaFullHistPrefix = "engine_full_history:" // + conv id: "1" once a full import completed
@@ -59,31 +57,7 @@ const (
 )
 
 // importJob is one queued or running import.
-type importJob struct {
-	ID     int64  `json:"id"`
-	Conv   int64  `json:"conv"`
-	Kind   string `json:"kind"`
-	Thread string `json:"thread,omitempty"`
-	Path   string `json:"path,omitempty"`
-	// Rewind reads the rollout again from its start; else from the cursor.
-	Rewind bool `json:"rewind,omitempty"`
-	// KeepTeams also posts the helper-run turns (up to Until): a new chat
-	// has none of them.
-	KeepTeams bool `json:"keep_teams,omitempty"`
-	// NS is the delivery key namespace of the source ("" = the thread id).
-	NS string `json:"ns,omitempty"`
-	// Applied once the cursor was moved; Src is the source, Until the
-	// file end then: the job is done when the cursor reaches it.
-	Applied bool  `json:"applied,omitempty"`
-	Src     int64 `json:"src,omitempty"`
-	Until   int64 `json:"until,omitempty"`
-	Posted  int   `json:"posted,omitempty"`
-	// Resumed: the parked chat was woken by the command (reopen text).
-	Resumed bool `json:"resumed,omitempty"`
-	// Reached: the cursor reached Until before the chat existed; the job
-	// finishes when the chat is created.
-	Reached bool `json:"reached,omitempty"`
-}
+type importJob = store.ImportJob
 
 type importState struct {
 	mu      sync.Mutex
@@ -104,29 +78,6 @@ func mirrorNSKey(src int64) string  { return fmt.Sprintf("%s%d", metaMirrorNSPre
 func importedKey(conv int64) string { return fmt.Sprintf("%s%d", metaImportedPrefix, conv) }
 func fullHistKey(conv int64) string { return fmt.Sprintf("%s%d", metaFullHistPrefix, conv) }
 
-func loadImports(get func(string) (string, bool, error)) ([]importJob, error) {
-	v, _, err := get(metaImports)
-	if err != nil || v == "" {
-		return nil, err
-	}
-	var jobs []importJob
-	if err := json.Unmarshal([]byte(v), &jobs); err != nil {
-		return nil, fmt.Errorf("import jobs: %w", err)
-	}
-	return jobs, nil
-}
-
-func saveImports(tx *store.Tx, jobs []importJob) error {
-	if len(jobs) == 0 {
-		return tx.SetMeta(metaImports, "")
-	}
-	b, err := json.Marshal(jobs)
-	if err != nil {
-		return err
-	}
-	return tx.SetMeta(metaImports, string(b))
-}
-
 // importLoad fills the cache from the store once (mirrorInit).
 func (e *Engine) importLoad() {
 	e.imp.mu.Lock()
@@ -136,7 +87,7 @@ func (e *Engine) importLoad() {
 		return
 	}
 	// Read outside imp.mu: transactions take it (importChatCreated).
-	jobs, err := loadImports(e.st.Meta)
+	jobs, err := e.st.ImportJobs()
 	if err != nil {
 		e.logf("import: %v", err)
 		return
@@ -183,23 +134,21 @@ func (e *Engine) importIndexed(conv int64) bool {
 // the file end when the job is applied. Path may be empty when the thread
 // already has a transcript source.
 func (e *Engine) queueImport(tx *store.Tx, job importJob) (int64, error) {
-	jobs, err := loadImports(tx.Meta)
-	if err != nil {
+	// Retire only this conversation's stale job. Unrelated active jobs need
+	// neither loading nor rewriting when a new import is queued.
+	if prev, ok, err := tx.ImportJobForConv(job.Conv); err != nil {
 		return 0, err
-	}
-	kept := jobs[:0]
-	for _, j := range jobs {
-		c, ok, err := tx.Conversation(j.Conv)
+	} else if ok {
+		c, exists, err := tx.Conversation(prev.Conv)
 		if err != nil {
 			return 0, err
 		}
-		if !ok || c.State == store.ConvClosed {
-			continue // its chat was closed: the job ends with it
-		}
-		if j.Conv == job.Conv {
+		if exists && c.State != store.ConvClosed {
 			return 0, errImportRunning
 		}
-		kept = append(kept, j)
+		if err := tx.DeleteImportJob(prev.ID); err != nil {
+			return 0, err
+		}
 	}
 	v, _, err := tx.Meta(metaImportSeq)
 	if err != nil {
@@ -213,7 +162,7 @@ func (e *Engine) queueImport(tx *store.Tx, job importJob) (int64, error) {
 	}
 	job.ID = seq
 	job.Applied, job.Src, job.Until, job.Posted, job.Reached = false, 0, 0, 0, false
-	return seq, saveImports(tx, append(kept, job))
+	return seq, tx.SetImportJob(job)
 }
 
 // importQueued wakes the mirror loop for a job committed for conv.
@@ -234,16 +183,8 @@ func (e *Engine) importJobOf(conv int64) (importJob, bool) {
 	if !e.importIndexed(conv) {
 		return importJob{}, false
 	}
-	jobs, err := loadImports(e.st.Meta)
-	if err != nil {
-		return importJob{}, false
-	}
-	for _, j := range jobs {
-		if j.Conv == conv {
-			return j, true
-		}
-	}
-	return importJob{}, false
+	j, ok, err := e.st.ImportJobForConv(conv)
+	return j, ok && err == nil
 }
 
 // importApply moves the cursors of queued jobs (mirror goroutine, at the
@@ -264,7 +205,7 @@ func (e *Engine) importApply(ctx context.Context) {
 		return
 	}
 	e.imp.pending.Store(false)
-	jobs, err := loadImports(e.st.Meta)
+	jobs, err := e.st.ImportJobs()
 	if err != nil {
 		e.logf("import: %v", err)
 		return
@@ -323,26 +264,20 @@ func (e *Engine) importApplyOne(j importJob) bool {
 	install := false
 	err = e.update(func(tx *store.Tx) error {
 		install = false
-		jobs, err := loadImports(tx.Meta)
+		current, ok, err := tx.ImportJob(j.ID)
 		if err != nil {
 			return err
 		}
-		i := -1
-		for k := range jobs {
-			if jobs[k].ID == j.ID {
-				i = k
-			}
-		}
-		if i < 0 || jobs[i].Applied {
+		if !ok || current.Applied {
 			return nil
 		}
-		job = jobs[i]
+		job = current
 		c, ok, err := tx.Conversation(job.Conv)
 		if err != nil {
 			return err
 		}
 		if !ok || c.State == store.ConvClosed {
-			return saveImports(tx, append(jobs[:i:i], jobs[i+1:]...))
+			return tx.DeleteImportJob(job.ID)
 		}
 		cur, ok, err := tx.Source(path)
 		if err != nil {
@@ -378,7 +313,6 @@ func (e *Engine) importApplyOne(j importJob) bool {
 			return err
 		}
 		job.Applied, job.Src, job.Until = true, id, info.Size
-		jobs[i] = job
 		install = true
 		if src.Offset >= job.Until {
 			done, err := e.importFinish(tx, &job)
@@ -386,11 +320,10 @@ func (e *Engine) importApplyOne(j importJob) bool {
 				return err
 			}
 			if done {
-				return saveImports(tx, append(jobs[:i:i], jobs[i+1:]...))
+				return tx.DeleteImportJob(job.ID)
 			}
-			jobs[i] = job
 		}
-		return saveImports(tx, jobs)
+		return tx.SetImportJob(job)
 	})
 	if err != nil {
 		e.logf("import %d: %v", j.ID, err)
@@ -447,21 +380,15 @@ func (e *Engine) importRestore(f *mirrorFile) {
 	if !e.importIndexed(f.src.ConvID) {
 		return
 	}
-	jobs, err := loadImports(e.st.Meta)
-	if err != nil {
+	j, ok, err := e.st.ImportJobForConv(f.src.ConvID)
+	if err != nil || !ok || !j.Applied || j.Src != f.src.ID {
 		return
 	}
-	for _, j := range jobs {
-		if j.Applied && j.Src == f.src.ID && j.Conv == f.src.ConvID {
-			if j.KeepTeams {
-				f.keepTeams = j.Until
-				f.tracker.KeepTeams(j.Until)
-			}
-			// The imported range is catch-up (a source restored at start
-			// adds what the file holds then, mirrorPoll).
-			f.catchUpEnd = max(f.catchUpEnd, j.Until)
-		}
+	if j.KeepTeams {
+		f.keepTeams = j.Until
+		f.tracker.KeepTeams(j.Until)
 	}
+	f.catchUpEnd = max(f.catchUpEnd, j.Until)
 }
 
 // importProgress records a mirror pass of f in its job (mirrorRead's
@@ -471,28 +398,24 @@ func (e *Engine) importProgress(tx *store.Tx, f *mirrorFile, posted int) error {
 	if !e.importIndexed(f.src.ConvID) {
 		return nil
 	}
-	jobs, err := loadImports(tx.Meta)
+	j, ok, err := tx.ImportJobForConv(f.src.ConvID)
 	if err != nil {
 		return err
 	}
-	for i, j := range jobs {
-		if !j.Applied || j.Src != f.src.ID || j.Conv != f.src.ConvID {
-			continue
-		}
-		j.Posted += posted
-		if f.tracker.Offset() >= j.Until {
-			done, err := e.importFinish(tx, &j)
-			if err != nil {
-				return err
-			}
-			if done {
-				return saveImports(tx, append(jobs[:i:i], jobs[i+1:]...))
-			}
-		}
-		jobs[i] = j
-		return saveImports(tx, jobs)
+	if !ok || !j.Applied || j.Src != f.src.ID {
+		return nil
 	}
-	return nil
+	j.Posted += posted
+	if f.tracker.Offset() >= j.Until {
+		done, err := e.importFinish(tx, &j)
+		if err != nil {
+			return err
+		}
+		if done {
+			return tx.DeleteImportJob(j.ID)
+		}
+	}
+	return tx.SetImportJob(j)
 }
 
 // Import texts (v0.1.20).
@@ -586,31 +509,28 @@ func (e *Engine) importChatCreated(tx *store.Tx, id int64, label, url string) (b
 	if !e.importIndexed(id) {
 		return false, nil
 	}
-	jobs, err := loadImports(tx.Meta)
+	j, ok, err := tx.ImportJobForConv(id)
 	if err != nil {
 		return false, err
 	}
-	for i, j := range jobs {
-		if j.Conv != id || (j.Kind != importNew && j.Kind != importFork) {
-			continue
-		}
-		if e.controlID != 0 && j.Kind == importNew {
-			if err := e.enqueueNotice(tx, e.controlID, fmt.Sprintf("import:%d:progress", j.ID), textImportPreparing(label, url, false)); err != nil {
-				return true, err
-			}
-		}
-		if j.Reached {
-			done, err := e.importFinish(tx, &j)
-			if err != nil {
-				return true, err
-			}
-			if done {
-				return true, saveImports(tx, append(jobs[:i:i], jobs[i+1:]...))
-			}
-		}
-		return true, nil
+	if !ok || (j.Kind != importNew && j.Kind != importFork) {
+		return false, nil
 	}
-	return false, nil
+	if e.controlID != 0 && j.Kind == importNew {
+		if err := e.enqueueNotice(tx, e.controlID, fmt.Sprintf("import:%d:progress", j.ID), textImportPreparing(label, url, false)); err != nil {
+			return true, err
+		}
+	}
+	if j.Reached {
+		done, err := e.importFinish(tx, &j)
+		if err != nil {
+			return true, err
+		}
+		if done {
+			return true, tx.DeleteImportJob(j.ID)
+		}
+	}
+	return true, nil
 }
 
 // ---- `continue` ----

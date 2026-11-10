@@ -220,12 +220,8 @@ func (c *converter) convertSources() error {
 			return err
 		}
 	}
-	if len(c.histChecks) > 0 {
-		b, err := json.Marshal(c.histChecks)
-		if err != nil {
-			return err
-		}
-		if err := c.im.SetMeta(store.MetaHistoryChecks, string(b)); err != nil {
+	for _, check := range c.histChecks {
+		if err := c.im.HistoryCheck(check); err != nil {
 			return err
 		}
 	}

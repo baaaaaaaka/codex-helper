@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
+	"github.com/baaaaaaaka/codex-helper/internal/updatestate"
 	"github.com/gofrs/flock"
 )
 
@@ -149,7 +150,7 @@ func TestTUIAutoBadDownloadNeverChangesDefaultOrExecutes(t *testing.T) {
 			if _, err := os.Stat(marker); !os.IsNotExist(err) {
 				t.Fatalf("unverified executable ran: %v", err)
 			}
-			if _, err := helperruntime.ReadBoot(c.Root); !os.IsNotExist(err) {
+			if baseline, err := helperruntime.ReadBoot(c.Root); err != nil || baseline.Good != "v1.0.0" || baseline.Candidate != nil || baseline.Generation != 1 {
 				t.Fatalf("failed download published boot record: %v", err)
 			}
 		})
@@ -186,7 +187,7 @@ func TestTUIAutoInsufficientOrUnknownDiskSpaceDefersBeforeDownload(t *testing.T)
 			if err := checkAndStageTUI(context.Background(), c, server.URL+"/manifest", now); err == nil {
 				t.Fatal("update did not defer")
 			}
-			if _, err := helperruntime.ReadBoot(c.Root); !os.IsNotExist(err) {
+			if baseline, err := helperruntime.ReadBoot(c.Root); err != nil || baseline.Good != "v1.0.0" || baseline.Candidate != nil || baseline.Generation != 1 {
 				t.Fatalf("deferred update changed boot record: %v", err)
 			}
 			if active, err := helperruntime.ReadActive(c.Root); err != nil || active != "v1.0.0" {
@@ -205,8 +206,8 @@ func TestTUIAutoCheckIsSharedAndPersistsBackoffBeforeNetwork(t *testing.T) {
 	var calls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
-		b, err := os.ReadFile(filepath.Join(c.Root, "auto-check.json"))
-		if err != nil || !strings.Contains(string(b), "next") {
+		state, err := readUpdateCheckForTest(c.Root)
+		if err != nil || !state.Next.After(now) {
 			t.Error("network before durable cooldown")
 		}
 		w.Header().Set("Retry-After", "7200")
@@ -222,12 +223,12 @@ func TestTUIAutoCheckIsSharedAndPersistsBackoffBeforeNetwork(t *testing.T) {
 	if calls.Load() != 1 {
 		t.Fatalf("request storm: %d", calls.Load())
 	}
-	var state tuiCheckState
-	b, err := os.ReadFile(filepath.Join(c.Root, "auto-check.json"))
+	state, err := readUpdateCheckForTest(c.Root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := json.Unmarshal(b, &state); err != nil {
+	b, err := os.ReadFile(filepath.Join(c.Root, updatestate.Filename))
+	if err != nil {
 		t.Fatal(err)
 	}
 	if state.Failures != 1 || state.Next.Before(now.Add(2*time.Hour)) {
@@ -237,7 +238,7 @@ func TestTUIAutoCheckIsSharedAndPersistsBackoffBeforeNetwork(t *testing.T) {
 	if err := checkAndStageTUI(context.Background(), c, server.URL+"/manifest", now.Add(time.Minute)); err != nil {
 		t.Fatal(err)
 	}
-	after, _ := os.ReadFile(filepath.Join(c.Root, "auto-check.json"))
+	after, _ := os.ReadFile(filepath.Join(c.Root, updatestate.Filename))
 	if string(after) != before || calls.Load() != 1 {
 		t.Fatal("unchanged cooldown rewrote state or requested network")
 	}
@@ -278,7 +279,7 @@ func TestTUIAutoBusyOrUnwritableStateSendsNoRequest(t *testing.T) {
 				}
 				defer l.Unlock()
 			} else {
-				if err := os.Mkdir(filepath.Join(c.Root, "auto-check.json"), 0700); err != nil {
+				if err := os.Mkdir(filepath.Join(c.Root, updatestate.Filename), 0700); err != nil {
 					t.Fatal(err)
 				}
 			}
@@ -296,8 +297,8 @@ func TestTUIAutoStagesOnceAndKeepsStableEntry(t *testing.T) {
 	}
 	c := tuiUpdateFixture(t)
 	now := time.Now().UTC()
-	payload := []byte("#!/bin/sh\nif [ \"$1\" = \"--cxp-boot-protocol\" ]; then printf '1\\n'; else printf 'cxp version 2.0.0\\n'; fi\n")
-	if err := os.WriteFile(c.EntryPath, []byte("#!/bin/sh\nprintf '1\\n'\n"), 0755); err != nil {
+	payload := []byte("#!/bin/sh\nif [ \"$1\" = \"--cxp-boot-protocol\" ]; then printf '2\\n'; else printf 'cxp version 2.0.0\\n'; fi\n")
+	if err := os.WriteFile(c.EntryPath, []byte("#!/bin/sh\nprintf '2\\n'\n"), 0755); err != nil {
 		t.Fatal(err)
 	}
 	m := tuiManifestFixture(t, payload, now)
@@ -333,7 +334,7 @@ func TestTUIAutoOlderPhysicalLauncherCannotEnableSafeBoot(t *testing.T) {
 	}
 	c := tuiUpdateFixture(t)
 	now := time.Now().UTC()
-	payload := []byte("#!/bin/sh\nif [ \"$1\" = \"--cxp-boot-protocol\" ]; then printf '1\\n'; else printf 'cxp version 2.0.0\\n'; fi\n")
+	payload := []byte("#!/bin/sh\nif [ \"$1\" = \"--cxp-boot-protocol\" ]; then printf '2\\n'; else printf 'cxp version 2.0.0\\n'; fi\n")
 	m := tuiManifestFixture(t, payload, now)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/manifest" {
@@ -348,7 +349,7 @@ func TestTUIAutoOlderPhysicalLauncherCannotEnableSafeBoot(t *testing.T) {
 	if err := checkAndStageTUI(context.Background(), c, server.URL+"/manifest", now); err == nil || !strings.Contains(err.Error(), "current installed launcher") {
 		t.Fatal(err)
 	}
-	if _, err := helperruntime.ReadBoot(c.Root); !os.IsNotExist(err) {
+	if baseline, err := helperruntime.ReadBoot(c.Root); err != nil || baseline.Good != "v1.0.0" || baseline.Candidate != nil || baseline.Generation != 1 {
 		t.Fatalf("old bootstrap received a new boot record: %v", err)
 	}
 	if v, err := helperruntime.ReadActive(c.Root); err != nil || v != "v1.0.0" {
@@ -432,4 +433,13 @@ func TestTUIAutoNetworkCancellationLeavesOldVersionUsable(t *testing.T) {
 	if v, err := helperruntime.ReadActive(c.Root); err != nil || v != "v1.0.0" {
 		t.Fatalf("%s %v", v, err)
 	}
+}
+
+func readUpdateCheckForTest(root string) (tuiCheckState, error) {
+	s, err := updatestate.OpenRead(root)
+	if err != nil {
+		return tuiCheckState{}, err
+	}
+	defer s.Close()
+	return s.Check()
 }

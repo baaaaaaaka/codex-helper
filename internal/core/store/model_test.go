@@ -125,7 +125,7 @@ func (m *model) unpause(conv int64) int {
 	return len(held)
 }
 
-func pendingOut(st string) bool { return st == OutQueued || st == OutSending || st == OutUnknown }
+func pendingOut(st string) bool { return st == OutQueued || st == OutSending }
 func openTurn(st string) bool   { return st == TurnQueued || st == TurnStarting || st == TurnRunning }
 
 func (m *model) nextRunnable(conv int64) (int64, bool) {

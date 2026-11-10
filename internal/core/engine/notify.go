@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -12,7 +11,7 @@ import (
 )
 
 // Owner notifications of finals (review L8). The turn's end records a
-// pending notification in the store (meta engine_notify), so a crash does
+// pending notification row in the store, so a crash does
 // not lose it; it is sent only once every part of the final has left the
 // outbox, so the card or mention never arrives before the answer.
 //
@@ -20,21 +19,7 @@ import (
 // delivered. On failure, or when the helper stopped during the post, the
 // owner gets one control-chat @mention instead (its delivery key dedupes).
 
-const metaNotify = "engine_notify"
-
-type pendingNotify struct {
-	Turn int64 `json:"turn"`
-	Conv int64 `json:"conv"`
-	// Key identifies a notification that is not a Teams-run turn's final
-	// and is the delivery-key prefix of the posts it waits for: a live
-	// mirrored final ("mirror:<thread>:<record>:") or the notice of a live
-	// discovered session ("ready:<label>:", Kind notifyLocal).
-	Key       string `json:"key,omitempty"`
-	Kind      string `json:"kind,omitempty"`
-	Text      string `json:"text,omitempty"`
-	Request   string `json:"request,omitempty"`   // the prompt, summarised (requestSummary)
-	Attempted bool   `json:"attempted,omitempty"` // the card post was started
-}
+type pendingNotify store.PendingNotification
 
 // notifyLocal is the Kind of a live discovered session's notification
 // (v0.1.20 local_session_started); "" is a final (turn_completed).
@@ -61,74 +46,28 @@ func (n pendingNotify) waitPrefix() string {
 	return n.Key
 }
 
-// undelivered reports whether a post n announces was dropped unconfirmed:
+// unconfirmed reports the unresolved delivery state of output n announces:
 // a part of a turn's answer (its text or files), or any post of a keyed
 // notification.
-func (n pendingNotify) undelivered(tx *store.Tx) (bool, error) {
+func (n pendingNotify) unconfirmed(tx *store.Tx) (string, error) {
+	// Questions still need their existing attention notification; questionNotice
+	// changes its wording when the body itself could not be confirmed.
+	if n.Kind == notifyQuestion {
+		return "", nil
+	}
 	if n.Turn != 0 {
-		return tx.DroppedUnder(n.waitPrefix(), store.OutFinal)
+		return tx.UnconfirmedUnder(n.waitPrefix(), store.OutFinal)
 	}
-	return tx.DroppedUnder(n.waitPrefix())
+	return tx.UnconfirmedUnder(n.waitPrefix())
 }
 
-func readNotify(tx *store.Tx) ([]pendingNotify, error) {
-	v, ok, err := tx.Meta(metaNotify)
-	if err != nil || !ok || v == "" {
-		return nil, err
-	}
-	var list []pendingNotify
-	if err := json.Unmarshal([]byte(v), &list); err != nil {
-		return nil, nil // unreadable: nothing can be done with it
-	}
-	return list, nil
-}
-
-func writeNotify(tx *store.Tx, list []pendingNotify) error {
-	if len(list) == 0 {
-		return tx.SetMeta(metaNotify, "")
-	}
-	b, err := json.Marshal(list)
-	if err != nil {
-		return err
-	}
-	return tx.SetMeta(metaNotify, string(b))
-}
-
-// addNotify records the notification of a finished turn in tx.
+// addNotify registers one row in the same transaction as its final.
 func (e *Engine) addNotify(tx *store.Tx, n pendingNotify) error {
-	list, err := readNotify(tx)
-	if err != nil {
-		return err
-	}
-	for _, p := range list {
-		if p.id() == n.id() {
-			return nil
-		}
-	}
-	if err := writeNotify(tx, append(list, n)); err != nil {
-		return err
-	}
-	wake(e.notifyWake) // registration must not wait for the maintenance timer
-	return nil
+	return tx.AddNotification(store.PendingNotification(n))
 }
 
-// updateNotify applies fn to the entry id (removing it when fn returns
-// false).
-func (e *Engine) updateNotify(id string, fn func(*pendingNotify) bool) error {
-	return e.update(func(tx *store.Tx) error {
-		list, err := readNotify(tx)
-		if err != nil {
-			return err
-		}
-		out := list[:0]
-		for _, p := range list {
-			if p.id() == id && !fn(&p) {
-				continue
-			}
-			out = append(out, p)
-		}
-		return writeNotify(tx, out)
-	})
+func (e *Engine) deleteNotify(id string) error {
+	return e.update(func(tx *store.Tx) error { return tx.DeleteNotification(id) })
 }
 
 // notifyLoop sends due notifications. It is woken by a turn's end and by
@@ -136,19 +75,28 @@ func (e *Engine) updateNotify(id string, fn func(*pendingNotify) bool) error {
 func (e *Engine) notifyLoop(ctx context.Context) {
 	safety := time.NewTicker(e.t.Maintenance)
 	defer safety.Stop()
+	e.pumpNotify(ctx) // startup recovery, including events lost in a crash
 	for {
-		e.pumpNotify(ctx)
 		select {
 		case <-ctx.Done():
 			return
 		case <-e.notifyWake:
 		case <-safety.C:
+			e.wakeNotify()
 		}
 		// Coalesce bursts of sender wakes.
 		select {
 		case <-ctx.Done():
 			return
 		case <-time.After(e.t.Tick):
+		}
+		e.notifyMu.Lock()
+		scopes := e.notifyDirty
+		e.notifyDirty = nil
+		e.notifyMu.Unlock()
+		card := e.cfg.Notifier != nil && e.cfg.Notifier.Available()
+		for _, scope := range scopes {
+			e.pumpNotifyAvailable(ctx, scope, card)
 		}
 	}
 }
@@ -158,107 +106,139 @@ func (e *Engine) notifyLoop(ctx context.Context) {
 // control-chat @mention of its own. Finals are never merged into one
 // notification.
 func (e *Engine) pumpNotify(ctx context.Context) {
-	var cards, mentions, answered []pendingNotify
-	pending := 0
-	// Outside the transaction: Available reads the Workflow setting files
-	// and may apply a pending change (a store write of its own).
+	e.pumpNotifyScope(ctx, store.NotificationScope{})
+}
+
+func (e *Engine) pumpNotifyScope(ctx context.Context, scope store.NotificationScope) {
+	// Outside the transaction: Available can apply a pending Workflow setting.
 	card := e.cfg.Notifier != nil && e.cfg.Notifier.Available()
-	err := e.update(func(tx *store.Tx) error {
-		cards, mentions, answered, pending = cards[:0], mentions[:0], answered[:0], 0
-		list, err := readNotify(tx)
-		if err != nil {
-			return err
-		}
-		keep := list[:0]
-		for _, n := range list {
-			if (n.Kind == notifyReady || n.Kind == notifyService || n.Kind == notifyAttention) && !card && !n.Attempted {
-				continue
-			}
-			var questionGroup store.QuestionGroup
-			questionDone := false
-			if n.Kind == notifyQuestion {
-				var ok bool
-				questionGroup, ok, err = tx.QuestionGroup(n.Text)
-				if err != nil {
-					return err
-				}
-				if !ok {
-					continue
-				}
-				questionDone = questionGroup.State != "open" || questionsReady(questionGroup)
-			}
-			rows, err := tx.PendingOutbox(n.Conv)
+	e.pumpNotifyAvailable(ctx, scope, card)
+}
+
+func (e *Engine) pumpNotifyAvailable(ctx context.Context, scope store.NotificationScope, card bool) {
+	var cards, mentions, answered []pendingNotify
+	var removed []string
+	more := false
+	err := e.st.Read(func(tx *store.Tx) error {
+		var after int64
+		bytes := 0
+		for {
+			list, last, err := tx.NotificationPageFor(scope, after, 128, !card)
 			if err != nil {
 				return err
 			}
-			prefix := n.waitPrefix()
-			// A notification waits for the automatic title of its chat
-			// (rename.go): it names the chat as the owner sees it.
-			waiting := e.retitling(n.Conv)
-			if n.Kind == notifyQuestion {
-				waiting = false
-				for _, q := range questionGroup.Questions {
-					for _, r := range rows {
-						if strings.HasPrefix(r.DeliveryKey, questionPrefix(q.ID)+":") {
-							waiting = true
-						}
-					}
-				}
+			if len(list) == 0 {
+				return nil
 			}
-			for _, r := range rows {
-				if strings.HasPrefix(r.DeliveryKey, prefix) {
-					waiting = true
-					break
+			after = last
+			for _, saved := range list {
+				n := pendingNotify(saved)
+				if len(cards)+len(mentions)+len(removed) >= 128 || bytes >= 1<<20 {
+					more = true
+					return nil
 				}
-			}
-			if !waiting {
-				if n.Kind == notifyQuestion && questionDone {
-					for _, q := range questionGroup.Questions {
-						sent, err := tx.SentUnder(questionPrefix(q.ID) + ":")
-						if err != nil {
-							return err
-						}
-						if sent {
-							answered = append(answered, n)
-							break
-						}
+				if (n.Kind == notifyReady || n.Kind == notifyService || n.Kind == notifyAttention) && !card && !n.Attempted {
+					removed = append(removed, n.id())
+					continue
+				}
+				var questionGroup store.QuestionGroup
+				questionDone := false
+				if n.Kind == notifyQuestion {
+					var ok bool
+					questionGroup, ok, err = tx.QuestionGroup(n.Text)
+					if err != nil {
+						return err
 					}
-					continue // resolved before notification: mark unread, no chat mention
+					if !ok {
+						removed = append(removed, n.id())
+						continue
+					}
+					questionDone = questionGroup.State != "open" || questionsReady(questionGroup)
 				}
-				// An answer that was never confirmed delivered is not
-				// announced: the chat carries the "could not be
-				// confirmed" notice instead (R-5b).
-				gone, err := n.undelivered(tx)
+				active, err := tx.ActiveUnder(n.waitPrefix())
 				if err != nil {
 					return err
 				}
-				if gone {
-					continue
+				// A notification waits for the automatic title of its chat
+				// (rename.go): it names the chat as the owner sees it.
+				waiting := e.retitling(n.Conv)
+				if n.Kind == notifyQuestion {
+					waiting = false
+					for _, q := range questionGroup.Questions {
+						hit, err := tx.ActiveUnder(questionPrefix(q.ID) + ":")
+						if err != nil {
+							return err
+						}
+						waiting = waiting || hit
+					}
 				}
-				if n.Kind == "" || n.Kind == notifyLocal || n.Kind == notifyQuestion {
-					answered = append(answered, n)
-				} // questions mark the work chat unread, but do not retitle it
-			}
-			keep = append(keep, n)
-			switch {
-			case waiting:
-			case card && !n.Attempted:
-				cards = append(cards, n)
-			default:
-				mentions = append(mentions, n)
+				waiting = waiting || active
+
+				if !waiting {
+					if n.Kind == notifyQuestion && questionDone {
+						for _, q := range questionGroup.Questions {
+							sent, err := tx.SentUnder(questionPrefix(q.ID) + ":")
+							if err != nil {
+								return err
+							}
+							if sent {
+								answered = append(answered, n)
+								break
+							}
+						}
+						removed = append(removed, n.id())
+						continue // resolved before notification: mark unread, no chat mention
+					}
+					// Only this notification waits for its own unconfirmed
+					// answer. Other notifications, sends and tasks continue.
+					state, err := n.unconfirmed(tx)
+					if err != nil {
+						return err
+					}
+					if state == store.OutDropped {
+						removed = append(removed, n.id())
+						continue
+					}
+					if state == store.OutUnknown {
+						continue
+					}
+					if n.Kind == "" || n.Kind == notifyLocal || n.Kind == notifyQuestion {
+						answered = append(answered, n)
+					} // questions mark the work chat unread, but do not retitle it
+				}
+				if !waiting {
+					bytes += len(n.Text) + len(n.Request) + len(n.Key)
+				}
+				switch {
+				case waiting:
+				case card && !n.Attempted:
+					cards = append(cards, n)
+				default:
+					mentions = append(mentions, n)
+				}
 			}
 		}
-		pending = len(keep)
-		if len(keep) < len(list) {
-			return writeNotify(tx, keep)
-		}
-		return nil
 	})
 	if err != nil {
 		e.logf("owner notifications: %v", err)
 		return
 	}
-	e.notifyN.Store(int64(pending))
+	if len(removed) > 0 {
+		if err := e.update(func(tx *store.Tx) error {
+			for _, id := range removed {
+				if err := tx.DeleteNotification(id); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			e.logf("owner notifications: %v", err)
+			return
+		}
+	}
+	if more {
+		e.wakeNotify(scope)
+	}
 	// After the notifications named their chats (rename.go).
 	defer func() { e.afterAnswers(e.notified(answered)) }()
 	for _, n := range cards {
@@ -292,21 +272,25 @@ func (e *Engine) sendCard(ctx context.Context, n pendingNotify) bool {
 	}
 	e.mu.Unlock()
 	if cs == nil {
-		_ = e.updateNotify(n.id(), func(*pendingNotify) bool { return false })
+		_ = e.deleteNotify(n.id())
 		return true
 	}
-	if err := e.updateNotify(n.id(), func(p *pendingNotify) bool { p.Attempted = true; return true }); err != nil {
+	var claimed bool
+	if err := e.update(func(tx *store.Tx) (err error) { claimed, err = tx.AttemptNotification(n.id()); return }); err != nil {
 		e.logf("notify %s: %v", label, err)
+		return true
+	}
+	if !claimed {
 		return true
 	}
 	cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	var err error
 	if n.Kind == notifyQuestion {
 		var g store.QuestionGroup
-		err = e.update(func(tx *store.Tx) (err error) { g, _, err = tx.QuestionGroup(n.Text); return })
+		err = e.st.Read(func(tx *store.Tx) (err error) { g, _, err = tx.QuestionGroup(n.Text); return })
 		if err == nil && (g.State != "open" || questionsReady(g)) {
 			cancel()
-			_ = e.updateNotify(n.id(), func(*pendingNotify) bool { return false })
+			_ = e.deleteNotify(n.id())
 			return true
 		}
 		var heading, text string
@@ -339,7 +323,7 @@ func (e *Engine) sendCard(ctx context.Context, n pendingNotify) bool {
 		return true // the next start mentions the owner instead
 	}
 	if err == nil {
-		if err := e.updateNotify(n.id(), func(*pendingNotify) bool { return false }); err != nil {
+		if err := e.deleteNotify(n.id()); err != nil {
 			e.logf("notify %s: %v", label, err)
 		}
 		return true
@@ -396,21 +380,12 @@ func (e *Engine) sendMentions(set []pendingNotify) {
 				return err
 			}
 		}
-		list, err := readNotify(tx)
-		if err != nil {
-			return err
-		}
-		done := map[string]bool{}
 		for _, id := range ids {
-			done[id] = true
-		}
-		out := list[:0]
-		for _, p := range list {
-			if !done[p.id()] {
-				out = append(out, p)
+			if err := tx.DeleteNotification(id); err != nil {
+				return err
 			}
 		}
-		return writeNotify(tx, out)
+		return nil
 	})
 	if err != nil {
 		e.logf("owner notification: %v", err)

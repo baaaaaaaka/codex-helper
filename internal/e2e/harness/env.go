@@ -5,8 +5,10 @@
 package harness
 
 import (
-	"encoding/json"
+	"database/sql"
+
 	"fmt"
+	_ "modernc.org/sqlite"
 	"os"
 	"path/filepath"
 	"strings"
@@ -149,8 +151,8 @@ func NewEnv(t testing.TB, g *fakegraph.Server) *Env {
 	}
 	for _, kind := range []string{"chat", "read", "file-write", "full"} {
 		access, refresh := g.IssueTokens(kind)
-		path := filepath.Join(e.TokenDir, "teams-"+kind+"-token.json")
-		writeTokenCache(t, path, access, refresh, scopes[kind], time.Now().Add(2*time.Hour))
+		path := filepath.Join(e.TokenDir, "teams-tokens.sqlite")
+		writeTokenCache(t, path, kind, access, refresh, scopes[kind], time.Now().Add(2*time.Hour))
 		e.TokenCaches[kind] = path
 	}
 
@@ -192,41 +194,32 @@ func NewEnv(t testing.TB, g *fakegraph.Server) *Env {
 	return e
 }
 
-func writeTokenCache(t testing.TB, path, access, refresh, scope string, expires time.Time) {
+// Synthetic native fixture, independent of the production migration writer.
+func writeTokenCache(t testing.TB, path, slot, access, refresh, scope string, expires time.Time) {
 	t.Helper()
-	data, err := json.MarshalIndent(map[string]any{
-		"access_token":  access,
-		"refresh_token": refresh,
-		"expires_at":    expires.Unix(),
-		"expires_in":    int64(time.Until(expires) / time.Second),
-		"scope":         scope,
-		"token_type":    "Bearer",
-	}, "", "  ")
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
-		t.Fatalf("marshal token cache: %v", err)
+		t.Fatal(err)
 	}
-	if err := os.WriteFile(path, data, 0o600); err != nil {
-		t.Fatalf("write token cache: %v", err)
+	defer db.Close()
+	_, err = db.Exec(`CREATE TABLE IF NOT EXISTS tokens(slot TEXT PRIMARY KEY CHECK(slot<>''),access_token TEXT NOT NULL,refresh_token TEXT NOT NULL,expires_at INTEGER NOT NULL,expires_in INTEGER NOT NULL,scope TEXT NOT NULL,token_type TEXT NOT NULL); CREATE TABLE IF NOT EXISTS token_imports(source_path TEXT PRIMARY KEY); PRAGMA user_version=1;`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.Exec(`INSERT INTO tokens VALUES(?,?,?,?,?,?,?)`, slot, access, refresh, expires.Unix(), int64(time.Until(expires)/time.Second), scope, "Bearer")
+	if err != nil {
+		t.Fatal(err)
 	}
 }
-
-// ExpireToken rewrites a token cache so the access token is expired, forcing
-// a refresh through the fake token endpoint.
 func (e *Env) ExpireToken(t testing.TB, kind string) {
 	t.Helper()
-	path := e.TokenCaches[kind]
-	data, err := os.ReadFile(path)
+	db, err := sql.Open("sqlite", e.TokenCaches[kind])
 	if err != nil {
-		t.Fatalf("read token cache: %v", err)
+		t.Fatal(err)
 	}
-	var tok map[string]any
-	if err := json.Unmarshal(data, &tok); err != nil {
-		t.Fatalf("decode token cache: %v", err)
-	}
-	tok["expires_at"] = time.Now().Add(-time.Hour).Unix()
-	out, _ := json.MarshalIndent(tok, "", "  ")
-	if err := os.WriteFile(path, out, 0o600); err != nil {
-		t.Fatalf("write token cache: %v", err)
+	defer db.Close()
+	if _, err = db.Exec(`UPDATE tokens SET expires_at=? WHERE slot=?`, time.Now().Add(-time.Hour).Unix(), kind); err != nil {
+		t.Fatal(err)
 	}
 }
 
