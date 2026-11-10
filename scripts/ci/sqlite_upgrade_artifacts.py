@@ -6,6 +6,7 @@ The explicit installer then admits protocol two; legacy rollback is not rearmed.
 All fixtures and download bytes live in one disposable directory.
 """
 import hashlib
+from contextlib import closing
 import json
 import os
 from pathlib import Path
@@ -80,7 +81,7 @@ def main():
         shutil.copy2(current, entry)
         run(entry, "--cxp-install-bootstrap", "--target", entry)
         runtime = install / ".cxp-runtime"
-        with sqlite3.connect(f"{(runtime / 'boot.sqlite').as_uri()}?mode=ro", uri=True) as db:
+        with closing(sqlite3.connect(f"{(runtime / 'boot.sqlite').as_uri()}?mode=ro", uri=True)) as db:
             record = db.execute("SELECT protocol,good,previous FROM boot").fetchone()
             assert record[0] == 2 and record[1].lstrip("v") == target.lstrip("v"), record
             if protocol != "2":
@@ -98,7 +99,7 @@ def main():
         native = config.with_suffix(".sqlite")
         assert native.is_file(), "real CLI did not create native config"
         assert Path(str(config) + ".migrated").read_bytes() == raw, "lost legacy evidence"
-        with sqlite3.connect(f"{native.as_uri()}?mode=ro", uri=True) as db:
+        with closing(sqlite3.connect(f"{native.as_uri()}?mode=ro", uri=True)) as db:
             assert db.execute("SELECT name FROM profiles WHERE id='old-profile'").fetchone() == ("preserved-profile",)
         config.write_bytes(b"poisoned legacy source")
         run(entry, "--config", config, "proxy", "list")
