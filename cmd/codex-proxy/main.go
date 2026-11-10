@@ -53,9 +53,11 @@ func runMain(args []string) int {
 	if exitCode, handled := candidateupdate.HandleInternalCommand(args, cli.RuntimeVersion(), os.Stdout, os.Stderr); handled {
 		return exitCode
 	}
-	if err := candidateupdate.RejectLegacyUpdate(args); err != nil {
-		_, _ = fmt.Fprintf(os.Stderr, "Error: incompatible updater: %v\n", err)
-		return 1
+	if code, handled := candidateupdate.HandleUpgradeRepair(args, os.Stdout, os.Stderr); handled {
+		return code
+	}
+	if code, handled := candidateupdate.HandleLegacyMigration(args, cli.RuntimeVersion(), os.Stdout, os.Stderr); handled {
+		return code
 	}
 	if exitCode, handled, err := launchHelperRuntime(cli.RuntimeVersion(), args); err != nil {
 		if errors.Is(err, helperruntime.ErrBootstrapState) {

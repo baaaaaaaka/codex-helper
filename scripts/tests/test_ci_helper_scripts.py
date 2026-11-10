@@ -220,6 +220,31 @@ class CIHelperScriptTests(unittest.TestCase):
         self.assertIn('download(old), download(target)', script)
         self.assertIn('"--cxp-install-bootstrap"', script)
         self.assertIn('"proxy", "list"', script)
+        self.assertIn('automatic.returncode == 0', script)
+        after_update = script.split('automatic = run(', 1)[1]
+        self.assertNotIn('shutil.copy2(current, entry)', after_update)
+        self.assertNotIn('run(entry, "--cxp-install-bootstrap"', after_update)
+
+    def test_historical_updater_runs_before_publication_on_every_native_os(self) -> None:
+        ci = (WORKFLOW_DIR / "ci.yml").read_text(encoding="utf-8")
+        release = (WORKFLOW_DIR / "release.yml").read_text(encoding="utf-8")
+        for workflow in (ci, release):
+            self.assertIn("windows-2022", workflow)
+            self.assertIn("windows-2025", workflow)
+            self.assertIn("macos-15", workflow)
+            self.assertIn("test_tui_update_safety.sh", workflow)
+        owner = (CI_DIR / "test_tui_update_safety.sh").read_text(encoding="utf-8")
+        self.assertIn("bash scripts/ci/test_legacy_upgrade.sh", owner)
+        driver = (CI_DIR / "test_legacy_upgrade.sh").read_text(encoding="utf-8")
+        self.assertIn("-tags cxp_boot_e2e", driver)
+        self.assertIn("-list '^TestCandidateLegacy'", driver)
+        self.assertIn("-run '^TestCandidateLegacy'", driver)
+        prepare = (CI_DIR / "prepare_legacy_upgrade.py").read_text(encoding="utf-8")
+        self.assertIn("27a1c281395d7fdf86217fa5423ee4ece1a73a60", prepare)
+        self.assertIn("b1cd1dd5b82fc333f555dc0544b7a5bb75e2f56e", prepare)
+        self.assertIn("upgrade_fixture.go", prepare)
+        self.assertIn("--include v0.1.22-rc.96", release)
+        self.assertIn("--include v0.1.22-rc.104", release)
 
     def test_windows_locked_cxp_regression_and_release_gates_are_both_wired(self) -> None:
         script = (CI_DIR / "windows_locked_cxp_self_upgrade.ps1").read_text(

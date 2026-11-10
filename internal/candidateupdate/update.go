@@ -48,12 +48,11 @@ func Invoke(ctx context.Context, candidate string, request Context, timeout time
 	if candidate == "" || candidate == "." {
 		return Result{}, fmt.Errorf("candidate path is empty")
 	}
-	// Probe both executable ABIs before creating invocation or installation
-	// state. An incompatible physical dispatcher needs the explicit installer.
+	// Probe both ABIs before creating invocation or installation state.
 	if err := helperruntime.ProbeProtocol(ctx, candidate); err != nil {
 		return Result{}, err
 	}
-	if err := helperruntime.ProbeProtocol(ctx, request.EntryPath); err != nil {
+	if err := CheckBootstrapEntry(ctx, request.RuntimeRoot, request.EntryPath); err != nil {
 		return Result{}, err
 	}
 	if _, err := helperruntime.ReadBoot(request.RuntimeRoot); err != nil {
@@ -101,6 +100,9 @@ func Invoke(ctx context.Context, candidate string, request Context, timeout time
 func HandleInternalCommand(args []string, buildVersion string, stdout io.Writer, stderr io.Writer) (int, bool) {
 	if len(args) < 2 || args[1] != InternalCommand {
 		return 0, false
+	}
+	if code, handled := handleLegacyUpdate(args, buildVersion, stdout, stderr); handled {
+		return code, true
 	}
 	protocol := ""
 	contextPath := ""
@@ -154,7 +156,7 @@ func Apply(ctx context.Context, request Context, buildVersion string) (Result, e
 	if !strings.EqualFold(actualHash, strings.TrimSpace(request.CandidateSHA256)) {
 		return Result{}, fmt.Errorf("candidate sha256 = %s, want %s", actualHash, request.CandidateSHA256)
 	}
-	if err := helperruntime.ProbeProtocol(ctx, request.EntryPath); err != nil {
+	if err := CheckBootstrapEntry(ctx, request.RuntimeRoot, request.EntryPath); err != nil {
 		return Result{}, err
 	}
 	if _, err := helperruntime.ReadBoot(request.RuntimeRoot); err != nil {

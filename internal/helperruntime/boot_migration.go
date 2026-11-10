@@ -9,7 +9,7 @@ import (
 	"strings"
 )
 
-// Only the explicit installer reads protocol-one JSON. Its Good/Previous
+// Only bootstrap migration reads protocol-one JSON. Its Good/Previous
 // runtimes cannot become protocol-two rollback targets. Old trial evidence is
 // retained in the archived source, never rearmed by migration.
 func readLegacyBootForInstall(root string) (s BootState, found bool, err error) {

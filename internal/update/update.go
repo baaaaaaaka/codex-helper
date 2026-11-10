@@ -324,7 +324,7 @@ func PerformUpdate(ctx context.Context, opts UpdateOptions) (ApplyResult, error)
 		if entryPath == "" {
 			entryPath = filepath.Join(filepath.Dir(runtimeRoot), helperruntime.BinaryName(runtime.GOOS))
 		}
-		if err := helperruntime.ProbeProtocol(ctx, entryPath); err != nil {
+		if err := candidateupdate.CheckBootstrapEntry(ctx, runtimeRoot, entryPath); err != nil {
 			_ = os.Remove(tmpPath)
 			return ApplyResult{}, err
 		}

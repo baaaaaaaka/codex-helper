@@ -347,7 +347,7 @@ func writeVersionPointer(root string, name string, version string) error {
 		return err
 	}
 	// Only a fresh installation may initialize here. Legacy selection belongs
-	// to the explicit installer and can never become a native rollback target.
+	// to bootstrap migration and can never become a native rollback target.
 	for _, legacy := range []string{"active", "previous"} {
 		if _, err := os.Lstat(filepath.Join(root, legacy)); err == nil {
 			return ErrBootstrapState

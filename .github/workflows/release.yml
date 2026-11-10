@@ -30,6 +30,7 @@ jobs:
             --releases "$RUNNER_TEMP/helper-releases.json" \
             --minimum v0.1.20 \
             --include v0.1.22-rc.96 \
+            --include v0.1.22-rc.104 \
             --exclude "$TARGET_TAG" \
             --matrix-multiplier 4 \
             --max-jobs 256)"
@@ -251,7 +252,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go test ./cmd/codex-proxy -count=1 -run '^TestRunMain(HandlesBootProtocolBeforeRuntimeDispatch|HandlesCandidateUpdateBeforeRuntimeDispatch|BootstrapFailureStopsBeforeCLI|RejectsLegacyDownloadBeforeRuntimeDispatch)$' -v
+          go test ./cmd/codex-proxy -count=1 -run '^TestRunMain(HandlesBootProtocolBeforeRuntimeDispatch|HandlesCandidateUpdateBeforeRuntimeDispatch|BootstrapFailureStopsBeforeCLI|AcceptsLegacyDownloadProbeBeforeRuntimeDispatch)$' -v
           go test ./internal/helperruntime -count=1 -run 'Test(NormalizeVersion|LauncherEnvironment.*|InstallVersion.*|PublishDownloaded.*|EnsureStableEntry.*|Current.*|RecoverPrevious.*|RuntimeProcessIdentity.*)$' -v
           go test ./internal/candidateupdate -count=1 -v
           go test ./internal/update -count=1 -run 'Test(Probe.*|PerformUpdatePublishesImmutableRuntimeAndSwitchesActive|ReplaceBinaryReplacesIdleExistingDestinationWindows)$' -v
@@ -417,6 +418,11 @@ jobs:
             platform: windows_amd64.exe
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - uses: actions/setup-go@v5
         with:
           go-version: "1.25.11"
@@ -700,7 +706,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Old updater refusal and explicit SQLite cutover (Linux/macOS)
+      - name: Original updater completes automatic SQLite cutover (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash
         env:
@@ -711,7 +717,7 @@ jobs:
           set -euo pipefail
           bash scripts/ci/helper_upgrade_compat_smoke.sh
 
-      - name: Old updater refusal and explicit SQLite cutover (Windows)
+      - name: Original updater completes automatic SQLite cutover (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         env:

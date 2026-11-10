@@ -7,7 +7,7 @@ case "$mode" in unit|e2e|all) ;; *) echo "usage: $0 [unit|e2e|all]" >&2; exit 2 
 
 if [[ "$mode" != e2e ]]; then
   go test ./internal/helperruntime ./internal/update ./internal/candidateupdate ./internal/tui ./internal/cli ./cmd/codex-proxy \
-    -run '^Test(SQLiteBootstrap|SafeBoot|TUIAuto|TUIBoot|SelectSessionReadiness|ApplyVerification|RunMainHandlesBootProtocol)' -count=1
+    -run '^Test(Legacy|Historical|SQLiteBootstrap|SafeBoot|TUIAuto|TUIBoot|SelectSessionReadiness|ApplyVerification|RunMainHandlesBootProtocol)' -count=1
 fi
 [[ "$mode" != unit ]] || exit 0
 
@@ -62,3 +62,7 @@ fi
 if [[ "${OS:-}" != Windows_NT ]]; then
   python3 scripts/ci/tui_update_pty.py --binary "$CXP_TUI_SUT_BINARY" --fault-fixture "$CXP_BOOT_FIXTURE"
 fi
+
+# This must run before publication, against a frozen historical caller rather
+# than a current source build with an old version string.
+bash scripts/ci/test_legacy_upgrade.sh

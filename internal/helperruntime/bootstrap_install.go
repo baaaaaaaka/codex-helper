@@ -62,6 +62,10 @@ func HandleBootstrapInstall(args []string, version string, stderr io.Writer) (in
 }
 
 func installNativeBootstrap(ctx context.Context, root, source, version string) error {
+	return installBootstrap(ctx, root, source, version, true)
+}
+
+func installBootstrap(ctx context.Context, root, source, version string, allowNativeChange bool) error {
 	version, ok := NormalizeVersion(version)
 	if !ok {
 		return fmt.Errorf("invalid bootstrap version")
@@ -69,6 +73,9 @@ func installNativeBootstrap(ctx context.Context, root, source, version string) e
 	return WithRootLock(ctx, root, func() error {
 		s, err := ReadBoot(root)
 		native := err == nil
+		if native && s.Good != version && !allowNativeChange {
+			return fmt.Errorf("native bootstrap changed while admitting legacy upgrade")
+		}
 		if !native {
 			// ReadBoot deliberately refuses legacy state at runtime. Only absence of
 			// native publication admits the migration-only legacy decoder here.
@@ -93,7 +100,7 @@ func installNativeBootstrap(ctx context.Context, root, source, version string) e
 		if _, err = InstallVersion(root, source, version, runtime.GOOS, false); err != nil {
 			return err
 		}
-		if native && s.Good == version && s.Candidate == nil {
+		if native && s.Good == version && (s.Candidate == nil || !allowNativeChange) {
 			// A prior attempt can have committed before sealing or archiving.
 			db, err := sqlitestate.Open(filepath.Join(root, BootFile), true)
 			if err != nil {

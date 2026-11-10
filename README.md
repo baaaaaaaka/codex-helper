@@ -129,8 +129,9 @@ codex-proxy init
 Config is stored under your OS user config directory (Linux typically
 `~/.config/codex-proxy/config.sqlite`). Configuration and CXP-owned runtime state use native SQLite tables.
 An old `--config ...json` path is a migration locator, not a JSON backend.
-Before upgrading from an older format, stop or isolate its writers and use the
-explicit installer. See [storage cutover and recovery](docs/architecture/sqlite-only-boundaries.md#cutover-and-recovery).
+Supported older versions upgrade automatically through a one-time migration.
+Old writers finish before business state is migrated. See
+[storage cutover and recovery](docs/architecture/sqlite-only-boundaries.md#cutover-and-recovery).
 
 ## Requirements
 

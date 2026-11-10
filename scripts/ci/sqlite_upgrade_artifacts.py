@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Upgrade released binaries in an isolated CI profile, never the runner's install.
 
-Protocol-one updaters must refuse the incompatible candidate before replacement.
-The explicit installer then admits protocol two; legacy rollback is not rearmed.
+The original updater must complete the upgrade without installer intervention.
+The new runtime performs the one-time cutover; legacy rollback is not rearmed.
 All fixtures and download bytes live in one disposable directory.
 """
 import hashlib
@@ -15,6 +15,7 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
+import time
 import urllib.request
 
 
@@ -67,19 +68,26 @@ def main():
         protocol = run(entry, "--cxp-boot-protocol", check=False).stdout.strip()
         if protocol == "2":
             run(entry, "--cxp-install-bootstrap", "--target", entry)
-        before = hashlib.sha256(entry.read_bytes()).digest()
-        automatic = run(entry, "upgrade", "--repo", repo, "--version", target, "--install-path", entry, check=False)
-        if protocol != "2":
-            assert automatic.returncode != 0, "legacy updater admitted incompatible SQLite release"
-            assert "SQLite bootstrap" in automatic.stdout or "bootstrap" in automatic.stdout.lower(), "failure did not reach bootstrap admission"
-            assert hashlib.sha256(entry.read_bytes()).digest() == before, "old updater changed entry before admission"
         else:
-            assert automatic.returncode == 0, "compatible updater failed"
-
-        # Stopped old writer: this is the explicit installer boundary, not an
-        # automatic candidate activation or an implicit downgrade mechanism.
-        shutil.copy2(current, entry)
-        run(entry, "--cxp-install-bootstrap", "--target", entry)
+            # This is the protocol-one layout that caused the regression,
+            # not merely a newly copied standalone executable.
+            runtime = install / ".cxp-runtime"
+            runtime.mkdir(exist_ok=True)
+            boot = runtime / "boot.json"
+            boot.write_text(json.dumps({"schema": 1, "generation": 8, "good": old}), encoding="utf-8")
+            boot.chmod(0o600)
+        config = root / "legacy-config.json"
+        raw = b'{"version":6,"minReader":1,"runtimeGeneration":1,"profiles":[{"id":"old-profile","name":"preserved-profile","sshArgs":["-o","BatchMode=yes"]}],"instances":[]}'
+        config.write_bytes(raw)
+        config.chmod(0o600)
+        if protocol != "2":
+            run(entry, "--config", config, "proxy", "list")
+        automatic = run(entry, "--config", config, "upgrade", "--repo", repo, "--version", target, "--install-path", entry, check=False)
+        assert automatic.returncode == 0, "original updater failed; manual replacement is not an upgrade"
+        assert target.lstrip("v") in run(entry, "--version").stdout
+        # A normal writable CLI invocation must finish its own migration.
+        # Never copy the candidate or invoke the installer to rescue this test.
+        run(entry, "--config", config, "proxy", "prune")
         runtime = install / ".cxp-runtime"
         with closing(sqlite3.connect(f"{(runtime / 'boot.sqlite').as_uri()}?mode=ro", uri=True)) as db:
             record = db.execute("SELECT protocol,good,previous FROM boot").fetchone()
@@ -87,13 +95,16 @@ def main():
             if protocol != "2":
                 assert not record[2], "protocol-one runtime became a rollback target"
         assert target.lstrip("v") in run(entry, "--version").stdout
+        if protocol != "2":
+            expected = hashlib.sha256(current.read_bytes()).digest()
+            deadline = time.monotonic() + 15
+            while hashlib.sha256(entry.read_bytes()).digest() != expected:
+                assert time.monotonic() < deadline, "physical bootstrap migration did not converge"
+                time.sleep(0.1)
+                run(entry, "--config", config, "proxy", "prune")
 
         # Frozen state, independent of the new serializer. The real released
         # CLI imports it and a fresh invocation must read native state only.
-        config = root / "legacy-config.json"
-        raw = b'{"version":6,"minReader":1,"runtimeGeneration":1,"profiles":[{"id":"old-profile","name":"preserved-profile","sshArgs":["-o","BatchMode=yes"]}],"instances":[]}'
-        config.write_bytes(raw)
-        config.chmod(0o600)
         run(entry, "--config", config, "proxy", "prune")  # frozen fixture has no instances
         run(entry, "--config", config, "proxy", "list")
         native = config.with_suffix(".sqlite")

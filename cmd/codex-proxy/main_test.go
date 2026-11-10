@@ -52,6 +52,7 @@ func TestRunMainHandlesAppInstallWorkerBeforeRuntimeDispatch(t *testing.T) {
 
 func TestRunMainReturnsHandledRuntimeExitCode(t *testing.T) {
 	stubEntrypoint(t)
+	t.Setenv(helperruntime.EnvDisable, "")
 	launchHelperRuntime = func(string, []string) (int, bool, error) { return 9, true, nil }
 	if code := runMain([]string{"cxp", "--version"}); code != 9 {
 		t.Fatal(code)
@@ -60,6 +61,7 @@ func TestRunMainReturnsHandledRuntimeExitCode(t *testing.T) {
 
 func TestRunMainBootstrapFailureStopsBeforeCLI(t *testing.T) {
 	stubEntrypoint(t)
+	t.Setenv(helperruntime.EnvDisable, "")
 	launchHelperRuntime = func(string, []string) (int, bool, error) {
 		return 0, false, errors.Join(helperruntime.ErrBootstrapState, errors.New("corrupt database"))
 	}
@@ -68,12 +70,12 @@ func TestRunMainBootstrapFailureStopsBeforeCLI(t *testing.T) {
 	}
 }
 
-func TestRunMainRejectsLegacyDownloadBeforeRuntimeDispatch(t *testing.T) {
+func TestRunMainAcceptsLegacyDownloadProbeBeforeRuntimeDispatch(t *testing.T) {
 	stubEntrypoint(t)
-	// Old updaters already used runtime-disable. That must not bypass refusal.
+	// Historical validation is pure and must not initialize application state.
 	t.Setenv(helperruntime.EnvDisable, "1")
 	t.Setenv(helperruntime.EnvProbeProtocol, "")
-	if code := runMain([]string{".codex-proxy_0.1.99_linux_amd64", "--version"}); code != 1 {
+	if code := runMain([]string{".codex-proxy_0.1.99_linux_amd64", "--version"}); code != 0 {
 		t.Fatal(code)
 	}
 }

@@ -80,9 +80,10 @@ asset name, size, and SHA-256. Before executing any downloaded code, the worker
 checks the complete size and digest. It then runs bounded, inert version and
 protocol probes, and publishes the immutable file before the boot record. The
 physical bootstrap must support this protocol before the first record is
-created. An older physical launcher requires the explicit installer. Only that entry
-may import legacy boot selection; incompatible legacy rollback targets are
-not retained. Stop or isolate old writers before business-state migration.
+created. Supported historical launchers cross the protocol boundary through the
+migration adapter, which transfers startup ownership before native state writes
+and replaces the physical launcher once its old image is released. Incompatible
+legacy rollback targets are not retained. Old writers finish before business-state migration.
 Safe candidate-owned upgrades preserve that bootstrap and reject candidates
 that lack the boot protocol.
 
@@ -95,7 +96,7 @@ This uses GitHub HTTPS and repository release permissions as the publisher trust
 root. A digest in this manifest is **not** an offline signature or protection
 against a compromised publisher account. CI needs no new signing secret. Any
 future incompatible configuration or state migration must change the boot
-protocol and require a matching explicitly installed bootstrap. Automatic
+protocol and provide a tested automatic bootstrap migration. Automatic
 releases must remain readable by retained fallback versions.
 
 ## Bounded I/O and failure handling

@@ -99,28 +99,33 @@ exit. New invocations reap at most 128 inputs older than seven days in their
 insertion transaction; they never replay execution from an expired input.
 Boot state and source-version fencing remain authoritative.
 
-Boot protocol 2 and config reader floor 7 require explicit installer cutover
-from older formats. The verified physical executable admits itself using
---cxp-install-bootstrap before normal CLI initialization. The one-time importer
-archives protocol-one boot evidence and drops incompatible rollback/trial targets.
-The native boot.sqlite snapshot is the sole selection authority. Updates probe
-both candidate and physical bootstrap before creating update state. Legacy
-pending JSON cannot activate a runtime or recover a lost native database.
-Interrupted sealing or archival can be retried through the explicit installer.
+Boot protocol 2 and config reader floor 7 retain automatic upgrades from supported
+historical updaters. Version probes are inert. Historical protocol probes negotiate
+the migration-only ABI; native probes explicitly request protocol 2. The one-time
+adapter reads a private, bounded protocol-one invocation, verifies the executing
+candidate and source version, then publishes its immutable runtime and a native
+Pending receipt in the existing updater database. It writes the historical
+caller's read-back receipt without migrating application databases: the old helper
+must still write its final completion record and exit.
 
-Historical downloaded-candidate version checks are refused unless the caller
-supplies the protocol-two probe marker. Old updaters also set runtime-disable,
-so that variable is not an admission bypass. The marker is ephemeral, carries
-no credentials, and is removed from user subprocesses. Obsolete automatic
-legacy preflight, post-parent repair and stable-entry replacement paths have
-been removed; they are not alternative runtime storage backends.
+The first normal invocation reuses native bootstrap publication and archives
+protocol-one boot evidence without retaining incompatible rollback targets. A
+historical TUI trial transfers SETUP ownership before native writes, preventing
+its old supervisor from replaying the old Good. On Windows an already-mapped
+launcher is repaired after its actual kernel process handle signals exit. A
+fixed migration forwarder remains valid until physical entries converge; it
+dispatches through boot.sqlite and never tracks later updates in legacy state.
+A transient kernel token deduplicates the Windows worker. It waits on mapped
+process handles, including a restarted service, without polling. Deferred copy
+retries are bounded.
+Cleanup removes the one-time receipt and performs the deferred best-effort builtin
+skill refresh. There is no dual write runtime backend or new persistent state machine.
 
-Cutover requires old writers to have exited or be isolated. This implementation
-does not claim that incrementing user_version can constrain a historical writer
-that ignores it. The release artifact gate exercises actual old binaries and
-checks refusal before replacement, then explicit bootstrap/config migration.
-Released artifacts and native OS runs remain required evidence; changing the
-version embedded in a new build only tests the new protocol's behavior.
+The native boot.sqlite snapshot remains the sole selection authority after
+admission. Native corruption or publication loss cannot replay legacy receipt
+intent. Migration admission is fenced against a newer native Good, and native
+updates preserve an already-native physical dispatcher. Old writers must finish
+before business-state migration; user_version alone cannot constrain them.
 
 ## Explicit non-state JSON boundaries
 
@@ -140,9 +145,14 @@ CLI race tests, and three repetitions of critical migration/crash/notification
 E2E. Native Windows and macOS jobs check path, lock and publication semantics;
 cross compilation does not replace those runs. The existing nightly NFS smoke
 also puts the native lease, snapshots and CLI mailbox on its verified mount.
-Release checks actual checksum-verified old and new artifacts for updater refusal,
-explicit cutover and native configuration reopen. A source build with a changed
-version string is not evidence for that historical compatibility check.
+Before publication, four native OS jobs build fixed rc.96 and rc.104 source with only a
+local HTTP test transport and run their unchanged CLI/updaters, both legacy bootstrap
+layouts, final old-core write, and TUI supervisor handoff. Release additionally
+runs checksum-verified, unmodified historical binaries' original upgrade commands
+against the published candidate, including rc.96 and the native rc.104 predecessor.
+Both gates require automatic success without copying a new entry or invoking an
+installer to rescue the test. A current build with an old version string cannot
+substitute for either historical caller contract.
 
 ## Verification and performance contract
 
@@ -214,8 +224,8 @@ Watchdog migration ownership remains part of the existing lease contract.
 Keep a consistent backup before migration. With every writer stopped and all
 handles closed, back up the complete state and matching runtime/configuration.
 For a live SQLite database use its supported backup API; copying only the main
-file can omit committed WAL data. The installer admits the verified physical
-bootstrap explicitly before the new CLI may initialize application state.
+file can omit committed WAL data. The installer or automatic migration bridge admits the verified native
+bootstrap before the new CLI may initialize application state.
 Production installation and service changes are a separate operator action.
 
 Downgrade is not an automatic recovery path. After native migration, restoring

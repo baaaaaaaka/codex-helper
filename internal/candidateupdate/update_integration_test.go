@@ -139,7 +139,7 @@ func TestCandidateNativeInstallUpdateAndRecovery(t *testing.T) {
 	}
 	cmd := exec.Command(second, InternalCommand, "--protocol=1", "--context-file="+filepath.Join(dir, "not-present.json"))
 	cmd.Env = append(helperruntime.WithoutRuntimeMarkers(os.Environ()), helperruntime.EnvDisable+"=1")
-	if out, err := cmd.CombinedOutput(); err == nil || !strings.Contains(string(out), "unsupported argument") {
-		t.Fatalf("legacy transport admitted: %v %s", err, out)
+	if out, err := cmd.CombinedOutput(); err == nil || !strings.Contains(string(out), "legacy upgrade migration:") {
+		t.Fatalf("missing legacy request must fail before mutation: %v %s", err, out)
 	}
 }

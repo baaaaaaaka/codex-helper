@@ -8,6 +8,7 @@ import (
 )
 
 func TestSafeBootProtocolProbeIsInertAndExact(t *testing.T) {
+	t.Setenv(EnvProbeProtocol, "2")
 	var out bytes.Buffer
 	if code, handled := HandleProtocolProbe([]string{"cxp", ProtocolProbeFlag}, &out); !handled || code != 0 || out.String() != "2\n" {
 		t.Fatalf("%d %v %q", code, handled, out.String())
@@ -17,6 +18,15 @@ func TestSafeBootProtocolProbeIsInertAndExact(t *testing.T) {
 		if _, handled := HandleProtocolProbe(args, &out); handled || out.Len() != 0 {
 			t.Fatal(args)
 		}
+	}
+}
+
+func TestHistoricalBootProtocolProbe(t *testing.T) {
+	t.Setenv(EnvDisable, "1")
+	t.Setenv(EnvProbeProtocol, "")
+	var out bytes.Buffer
+	if code, handled := HandleProtocolProbe([]string{"candidate", ProtocolProbeFlag}, &out); !handled || code != 0 || out.String() != "1\n" {
+		t.Fatalf("%d %v %q", code, handled, out.String())
 	}
 }
 

@@ -120,7 +120,7 @@ codex-proxy init
 配置保存在 OS 用户配置目录下（Linux 通常是
 `~/.config/codex-proxy/config.sqlite`）。配置和 CXP 自有运行状态使用原生 SQLite 表。
 旧 `--config ...json` 路径仅用于定位迁移源，不再选择 JSON 后端。
-从旧格式升级前，需要停止或隔离旧版本写入者，再使用显式安装器。
+受支持的旧版本通过一次迁移自动升级；业务状态迁移前，旧版本先完成最后的写入并退出。
 详见[切换与恢复说明](docs/architecture/sqlite-only-boundaries.md#cutover-and-recovery)。
 
 ## 要求

@@ -26,8 +26,8 @@ import (
 const BootFile = "boot.sqlite"
 const maxBootRecordSize = 64 * 1024
 
-// Raise the protocol before admitting an automatic release with incompatible
-// config/state migrations. Older bootstraps will keep their known-good runtime.
+// A protocol change also needs a migration bridge for supported historical
+// updaters; refusing their download is not an automatic upgrade contract.
 const BootProtocol = 2
 const EnvBootManaged = "CXP_BOOT_MANAGED"
 

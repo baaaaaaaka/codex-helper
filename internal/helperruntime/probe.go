@@ -23,15 +23,21 @@ func HandleProtocolProbe(args []string, out io.Writer) (int, bool) {
 	if len(args) != 2 || args[1] != ProtocolProbeFlag {
 		return 0, false
 	}
-	_, err := fmt.Fprintln(out, BootProtocol)
+	protocol := BootProtocol
+	// Historical update probes already set runtime-disable, but have no native
+	// probe marker. The candidate also implements their migration-only ABI.
+	if os.Getenv(EnvDisable) == "1" && os.Getenv(EnvProbeProtocol) == "" {
+		protocol = 1
+	}
+	_, err := fmt.Fprintln(out, protocol)
 	if err != nil {
 		return 1, true
 	}
 	return 0, true
 }
 
-// ProbeProtocol prevents older candidate-owned updaters from replacing the
-// protected bootstrap. Changing this protocol requires an explicit installer.
+// ProbeProtocol checks native runtime compatibility. Historical callers enter
+// through the migration-only ABI instead of a second runtime backend.
 func ProbeProtocol(ctx context.Context, path string) error {
 	out, err := ProbeExecutable(ctx, path, []string{ProtocolProbeFlag}, 10*time.Second)
 	if err != nil {
