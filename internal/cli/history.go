@@ -266,12 +266,16 @@ func newHistoryOpenCmd(root *rootOptions, codexDir *string, codexPath *string, p
 
 func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, codexDir string, codexPath string, refreshInterval time.Duration) error {
 	ctx, stop := withSignalContext(cmd.Context())
+	var skillsDone <-chan struct{}
 	defer func() { _ = codexhistory.CloseCaches() }()
 	defer func() {
 		if ctx.Err() != nil {
 			helperruntime.CancelStartup()
 		}
 		stop()
+		if skillsDone != nil {
+			<-skillsDone // The background owner closes SQLite before exit.
+		}
 	}()
 
 	store, paths, err := newRootStore(root, codexDir)
@@ -327,7 +331,7 @@ func runHistoryTui(cmd *cobra.Command, root *rootOptions, profileRef string, cod
 				}
 				if !backgroundStarted {
 					backgroundStarted = true
-					startSkillsDailyAutoSync(ctx, paths)
+					skillsDone = startSkillsDailyAutoSync(ctx, paths)
 					startTUIAutoUpdateFn(ctx)
 				}
 				return nil

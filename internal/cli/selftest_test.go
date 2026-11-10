@@ -30,8 +30,19 @@ func TestSelftestReadsValidConfig(t *testing.T) {
 	if err := store.Save(config.Config{}); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(store.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := runSelftest(t, path); err != nil {
 		t.Fatalf("selftest should pass on a readable config: %v", err)
+	}
+	after, err := os.ReadFile(store.Path())
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("selftest changed native config: %v", err)
 	}
 }
 
@@ -40,6 +51,10 @@ func TestSelftestMissingConfigIsOK(t *testing.T) {
 	dir := t.TempDir()
 	if err := runSelftest(t, filepath.Join(dir, "config.json")); err != nil {
 		t.Fatalf("selftest should pass with no config: %v", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("selftest created configuration state: %v, %v", entries, err)
 	}
 }
 

@@ -129,6 +129,7 @@ func TestNewSkillsManagerUsesEffectivePaths(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newSkillsManager: %v", err)
 	}
+	t.Cleanup(func() { mgr.Store.Close() })
 	wantCache, err := defaultSkillsCacheDir()
 	if err != nil {
 		t.Fatalf("default skills cache dir: %v", err)
@@ -407,6 +408,7 @@ func newCLISkillsManager(t *testing.T) *skills.Manager {
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
+	t.Cleanup(func() { mgr.Store.Close() })
 	return mgr
 }
 

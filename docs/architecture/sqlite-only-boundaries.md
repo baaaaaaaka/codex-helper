@@ -164,6 +164,14 @@ loading outbox bodies. Recovery scans remain proportional to pending records;
 small LIMIT values alone do not prove bounded scanning. Keep existing publisher
 and poll throttling. Do not force VACUUM or checkpoint per operation.
 
+A successful core Store.Update still coalesces a publication signal even when
+all guarded SQL statements affect zero rows. Such a transaction may trigger a
+throttled status aggregation; equal status still suppresses the snapshot write.
+Pure reads use Store.Read and do not signal. The 250 ms–5 s gap limits frequency,
+not aggregate scan size or a hard CPU ceiling for arbitrarily large active sets.
+This retained mechanism is a remaining source of read amplification, distinct
+from rewriting business history or loading outbox bodies per notification.
+
 The existing unknown-delivery resolver still performs separate Graph checks
 for pending sends. A large unknown backlog therefore retains proportional
 network work; this storage change does not alter its retry policy. The backlog

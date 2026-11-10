@@ -141,6 +141,7 @@ func TestRunHistoryTuiStartsDailyAutoSyncWithoutBlockingSelection(t *testing.T) 
 	if err != nil {
 		t.Fatalf("new skills manager: %v", err)
 	}
+	t.Cleanup(func() { mgr.Store.Close() })
 	source, result, err := mgr.Add(context.Background(), repo, skills.AddOptions{Name: "acme", Ref: "HEAD", Path: "skills/review"})
 	if err != nil {
 		t.Fatalf("add skill source: %v", err)

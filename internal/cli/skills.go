@@ -402,14 +402,21 @@ func newSkillsManagerForPaths(paths effectivePaths, out io.Writer) (*skills.Mana
 	})
 }
 
-func startSkillsDailyAutoSync(ctx context.Context, paths effectivePaths) {
+func startSkillsDailyAutoSync(ctx context.Context, paths effectivePaths) <-chan struct{} {
+	finished := make(chan struct{})
 	mgr, err := newSkillsManagerForPaths(paths, io.Discard)
 	if err != nil {
-		return
+		close(finished)
+		return finished
 	}
 	runSkillsSelfHeal(ctx, mgr, io.Discard)
 	done := mgr.StartDailyAutoSync(ctx)
-	go func() { <-done; mgr.Store.Close() }()
+	go func() {
+		<-done
+		mgr.Store.Close()
+		close(finished)
+	}()
+	return finished
 }
 
 func runSkillsSelfHeal(ctx context.Context, mgr *skills.Manager, out io.Writer) {
