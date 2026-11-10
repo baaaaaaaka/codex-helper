@@ -1636,7 +1636,22 @@ func TestScanRunsOncePerIntervalAfterTheGateReopens(t *testing.T) {
 		sc.mu.Lock()
 		sc.storm = false
 		sc.mu.Unlock()
-		time.Sleep(readStretch*every + time.Second) // the scan interval is stretched after a read throttle (S3)
+		// Wait for the observations this round checks before throttling
+		// again. A fixed sleep can expire before the second scan on a
+		// loaded runner and the next throttle then erases that pair.
+		r.waitFor("two scans after the gate reopens", 20*time.Second, func() bool {
+			sc.mu.Lock()
+			defer sc.mu.Unlock()
+			throttled, scans := false, 0
+			for _, o := range sc.ops[n:] {
+				if o.throttled {
+					throttled, scans = true, 0
+				} else if throttled && o.what == "scan" {
+					scans++
+				}
+			}
+			return scans >= 2
+		})
 	}
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
