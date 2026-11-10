@@ -143,6 +143,23 @@ class TargetedShardWorkflowTests(unittest.TestCase):
                 plans = run_plans(race=race, partition_count=partition_count)
                 complete_plan = plans["complete"]
                 self.assertTrue(complete_plan)
+                fairness_jobs = [
+                    job for job in complete_plan
+                    if "TestSenderServesChatsRoundRobin" in job
+                ]
+                self.assertEqual(len(fairness_jobs), 1, fairness_jobs)
+                args = [json.loads(arg) for arg in re.findall(
+                    r'"(?:[^"\\]|\\.)*"', fairness_jobs[0]
+                )]
+                selection = args[args.index("-run") + 1]
+                self.assertIsNotNone(re.fullmatch(
+                    selection, "TestSenderServesChatsRoundRobin"
+                ))
+                self.assertIsNone(re.fullmatch(
+                    selection, "TestSenderServesChatsRoundRobinExtra"
+                ))
+                self.assertIn("(1 test names): go", fairness_jobs[0])
+                self.assertIn("estimated-exclusive=true", fairness_jobs[0])
                 self.assertTrue(
                     any(
                         # An exclusive test built on every OS.

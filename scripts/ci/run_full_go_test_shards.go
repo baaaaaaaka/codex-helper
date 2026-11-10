@@ -41,6 +41,12 @@ var runnableNamePattern = regexp.MustCompile(`^(Test|Example|Fuzz)[A-Za-z0-9_]*$
 // process rather than allowing unrelated tests to make their timing assertions
 // nondeterministic.
 var isolatedRunnableNames = map[string]map[string]bool{
+	"./internal/core/engine": {
+		// Thirty durable sends across twelve chats must finish within the
+		// existing liveness window. Keep unrelated SQLite race shards from
+		// consuming that scheduler and filesystem budget.
+		"TestSenderServesChatsRoundRobin": true,
+	},
 	"./internal/cli": {
 		// This fixture starts a real Codex-shaped process tree and asserts
 		// bounded process-group cancellation. Keep it out of the ordinary
@@ -84,6 +90,9 @@ var isolatedRunnableNames = map[string]map[string]bool{
 // runner's scheduler and filesystem while a finite liveness observation is in
 // progress.
 var exclusiveRunnableNames = map[string]map[string]bool{
+	"./internal/core/engine": {
+		"TestSenderServesChatsRoundRobin": true,
+	},
 	"./internal/cli": {
 		"TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup":     true,
 		"TestRunAppGatewayDaemonKeepsStableFrontendWhileBackendRuns":            true,
@@ -536,6 +545,9 @@ func isLargePackage(packageName string) bool {
 }
 
 func isolatedRunnableNamesForPackage(packageName string) map[string]bool {
+	if strings.HasSuffix(packageName, "/internal/core/engine") {
+		return isolatedRunnableNames["./internal/core/engine"]
+	}
 	if names, ok := isolatedRunnableNames[packageName]; ok {
 		return names
 	}
@@ -586,9 +598,9 @@ func autoIsolatedRunnableName(packageName, name string) bool {
 // autoIsolatedRunnableName. Process isolation protects package globals and
 // temporary stores; host exclusivity is reserved for fixtures whose semantic
 // deadline observes runner-wide scheduling, process trees, or host I/O. Most
-// outbox fairness tests can therefore remain in their own process while
-// sharing the bounded worker pool with ordinary shards; explicitly durable
-// outbox regressions stay in the reviewed exclusive map above.
+// tests can therefore share the bounded worker pool with ordinary shards.
+// The durable round-robin liveness fixture stays in the reviewed exclusive
+// map above, with its existing deadline and fairness assertions unchanged.
 func autoExclusiveRunnableName(packageName, name string) bool {
 	if isCodexRunnerPackage(packageName) {
 		return strings.HasPrefix(name, "TestAppServerProcessCloseTerminates")
@@ -602,6 +614,9 @@ func isCodexRunnerPackage(packageName string) bool {
 }
 
 func exclusiveRunnableNamesForPackage(packageName string) map[string]bool {
+	if strings.HasSuffix(packageName, "/internal/core/engine") {
+		return exclusiveRunnableNames["./internal/core/engine"]
+	}
 	if names, ok := exclusiveRunnableNames[packageName]; ok {
 		return names
 	}
