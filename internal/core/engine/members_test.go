@@ -45,17 +45,22 @@ func TestMembershipRestoresSingleUserVoiceAnnotations(t *testing.T) {
 	var ch *memberTestChannel
 	r := newRig(t, func(c *Config) {
 		ch = &memberTestChannel{Fake: c.Channel.(*channeltest.Fake), annotations: map[string]channel.Annotation{}}
+		ch.other.Store(true)
 		c.Channel = ch
 		c.Transcriber = asr
 		c.FilesDir = t.TempDir()
 	})
 	work := r.newWork(t.TempDir())
 	conv := convIDForTest(r, work)
-	if err := r.e.update(func(tx *store.Tx) error { return tx.SetMeta(fmt.Sprintf("%s%d", metaGroupPrefix, conv), "1") }); err != nil {
-		t.Fatal(err)
-	}
+	// Let a real membership window persist the old group state. Mutating the
+	// database and live cache separately can race an in-flight owner-only
+	// window and leave the fixture inconsistent before the repair is tested.
+	r.wait("initial group membership", func() bool {
+		v, _, err := r.st.Meta(fmt.Sprintf("%s%d", metaGroupPrefix, conv))
+		return err == nil && v == "1"
+	})
+	ch.other.Store(false)
 	r.e.mu.Lock()
-	r.e.convs[conv].group = true
 	r.e.convs[conv].membersKnown = false
 	r.e.mu.Unlock()
 	ref := r.ch.AddFile("voice.ogg", []byte("OggS..."))
