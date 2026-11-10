@@ -35,6 +35,11 @@ func TestR05b_UnconfirmedFinalRetained(t *testing.T) {
 	steps.MustPost(s, work.ID, "Next request "+following)
 	_, ok := steps.WaitAnswered(s, work.ID, following, steps.AnswerTimeout)
 	s.Check("same chat executes and answers once", ok && len(s.Codex.CallsWithToken(following)) == 1, "one answer, one execution", fmt.Sprint(ok))
+	// Completion publication and the next control command are asynchronous.
+	// Wait for this request's notice so their transcript order is deliberate.
+	s.Require("following completion notice arrives", 30*time.Second, func() (bool, string) {
+		return len(s.SUTMessagesContaining(control.ID, following)) == 1, "completion notice pending"
+	})
 	other, _ := steps.NewWorkChat(s, control, "other-delivery")
 	next := s.Token("unrelated")
 	steps.MustPost(s, other.ID, "Answer independently "+next)

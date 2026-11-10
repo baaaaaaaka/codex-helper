@@ -185,7 +185,7 @@ high-water RSS, system-call writes and sampled peak directory size.
 
 | Workload | Observed cost / regression boundary |
 | --- | --- |
-| 100 config heartbeats, at each history size | 3,332,400 bytes in pwrite calls, 300 sync calls, 100 transactions |
+| 100 config heartbeats, at each history size | 1,692,400 bytes in pwrite calls, 300 sync calls, 100 transactions |
 | 100 config settings edits, at each history size | 1,692,400 bytes in pwrite calls, 300 sync calls, 100 transactions |
 | Read-only and same-value config operations | zero mutation system calls |
 | 100 complete core turn/send/card storage chains, with 100,000 unknown notices | about 216 ms wall / 242 ms CPU; 4.99 MB cumulative allocation; about 16.3 MB physical writes |
@@ -233,3 +233,12 @@ backup. Sampling is a lower bound, not a capacity ceiling. The core's old
 streaming members; its measured process high-water RSS was about 352 MiB.
 Delegation's row-wise conversion used about 22 MiB. Do not apply the latter
 memory figure to the core upgrade or claim that migration memory is constant.
+
+Existing instance edits use a fixed UPDATE for non-indexed fields. The
+profile association is updated separately in the same transaction only when
+changed, and order is preserved. This avoids dirtying the two listing indexes
+on heartbeats. The earlier UPSERT measurement was 3,332,400 bytes per 100
+heartbeats; the revised path measures 1,692,400 at all three history scales.
+This is syscall byte volume including rollback journals, not NAND writes.
+The three sync calls per transaction and the 10-second heartbeat period are
+unchanged. The syscall gate rejects the previous index rewrite volume.

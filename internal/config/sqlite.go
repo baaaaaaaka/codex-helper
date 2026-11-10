@@ -88,6 +88,10 @@ func scanProfile(row interface{ Scan(...any) error }) (Profile, error) {
 const instanceColumns = `id,profile_id,kind,broker_id,broker_epoch,owner_token,owner_acquired_at,owner_last_seen_at,owner_lease_expires_at,recovery_budget_restart_window_started_at,recovery_budget_restart_attempts,recovery_budget_request_window_started_at,recovery_budget_request_attempts,recovery_budget_blocked,recovery_budget_blocked_at,recovery_budget_last_reason,http_port,socks_port,daemon_pid,started_at,last_seen_at,model_profile_name,model_unified,model_provider,model_public_model,model_base_url,model_api_key_ref,model_ssh_proxy,model_upstream_proxy_id,model_revision,model_proxy_key,model_profile_captured`
 const instancePut = `INSERT INTO instances(position,id,profile_id,kind,broker_id,broker_epoch,owner_token,owner_acquired_at,owner_last_seen_at,owner_lease_expires_at,recovery_budget_restart_window_started_at,recovery_budget_restart_attempts,recovery_budget_request_window_started_at,recovery_budget_request_attempts,recovery_budget_blocked,recovery_budget_blocked_at,recovery_budget_last_reason,http_port,socks_port,daemon_pid,started_at,last_seen_at,model_profile_name,model_unified,model_provider,model_public_model,model_base_url,model_api_key_ref,model_ssh_proxy,model_upstream_proxy_id,model_revision,model_proxy_key,model_profile_captured) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET profile_id=excluded.profile_id,kind=excluded.kind,broker_id=excluded.broker_id,broker_epoch=excluded.broker_epoch,owner_token=excluded.owner_token,owner_acquired_at=excluded.owner_acquired_at,owner_last_seen_at=excluded.owner_last_seen_at,owner_lease_expires_at=excluded.owner_lease_expires_at,recovery_budget_restart_window_started_at=excluded.recovery_budget_restart_window_started_at,recovery_budget_restart_attempts=excluded.recovery_budget_restart_attempts,recovery_budget_request_window_started_at=excluded.recovery_budget_request_window_started_at,recovery_budget_request_attempts=excluded.recovery_budget_request_attempts,recovery_budget_blocked=excluded.recovery_budget_blocked,recovery_budget_blocked_at=excluded.recovery_budget_blocked_at,recovery_budget_last_reason=excluded.recovery_budget_last_reason,http_port=excluded.http_port,socks_port=excluded.socks_port,daemon_pid=excluded.daemon_pid,started_at=excluded.started_at,last_seen_at=excluded.last_seen_at,model_profile_name=excluded.model_profile_name,model_unified=excluded.model_unified,model_provider=excluded.model_provider,model_public_model=excluded.model_public_model,model_base_url=excluded.model_base_url,model_api_key_ref=excluded.model_api_key_ref,model_ssh_proxy=excluded.model_ssh_proxy,model_upstream_proxy_id=excluded.model_upstream_proxy_id,model_revision=excluded.model_revision,model_proxy_key=excluded.model_proxy_key,model_profile_captured=excluded.model_profile_captured,position=excluded.position WHERE (position,id,profile_id,kind,broker_id,broker_epoch,owner_token,owner_acquired_at,owner_last_seen_at,owner_lease_expires_at,recovery_budget_restart_window_started_at,recovery_budget_restart_attempts,recovery_budget_request_window_started_at,recovery_budget_request_attempts,recovery_budget_blocked,recovery_budget_blocked_at,recovery_budget_last_reason,http_port,socks_port,daemon_pid,started_at,last_seen_at,model_profile_name,model_unified,model_provider,model_public_model,model_base_url,model_api_key_ref,model_ssh_proxy,model_upstream_proxy_id,model_revision,model_proxy_key,model_profile_captured) IS NOT (excluded.position,excluded.id,excluded.profile_id,excluded.kind,excluded.broker_id,excluded.broker_epoch,excluded.owner_token,excluded.owner_acquired_at,excluded.owner_last_seen_at,excluded.owner_lease_expires_at,excluded.recovery_budget_restart_window_started_at,excluded.recovery_budget_restart_attempts,excluded.recovery_budget_request_window_started_at,excluded.recovery_budget_request_attempts,excluded.recovery_budget_blocked,excluded.recovery_budget_blocked_at,excluded.recovery_budget_last_reason,excluded.http_port,excluded.socks_port,excluded.daemon_pid,excluded.started_at,excluded.last_seen_at,excluded.model_profile_name,excluded.model_unified,excluded.model_provider,excluded.model_public_model,excluded.model_base_url,excluded.model_api_key_ref,excluded.model_ssh_proxy,excluded.model_upstream_proxy_id,excluded.model_revision,excluded.model_proxy_key,excluded.model_profile_captured)`
 
+// Existing rows keep their order. Exclude indexed profile_id unless it changes;
+// assigning it unchanged still dirties listing indexes in SQLite.
+const instanceUpdate = `UPDATE instances SET kind=?,broker_id=?,broker_epoch=?,owner_token=?,owner_acquired_at=?,owner_last_seen_at=?,owner_lease_expires_at=?,recovery_budget_restart_window_started_at=?,recovery_budget_restart_attempts=?,recovery_budget_request_window_started_at=?,recovery_budget_request_attempts=?,recovery_budget_blocked=?,recovery_budget_blocked_at=?,recovery_budget_last_reason=?,http_port=?,socks_port=?,daemon_pid=?,started_at=?,last_seen_at=?,model_profile_name=?,model_unified=?,model_provider=?,model_public_model=?,model_base_url=?,model_api_key_ref=?,model_ssh_proxy=?,model_upstream_proxy_id=?,model_revision=?,model_proxy_key=?,model_profile_captured=? WHERE id=?`
+
 func instanceArgs(v Instance) []any {
 	return []any{v.ID, v.ProfileID, v.Kind, v.BrokerID, v.BrokerEpoch, v.OwnerToken, configTime(v.OwnerAcquiredAt), configTime(v.OwnerLastSeenAt), configTime(v.OwnerLeaseExpiresAt), configTime(v.RecoveryBudget.RestartWindowStartedAt), v.RecoveryBudget.RestartAttempts, configTime(v.RecoveryBudget.RequestWindowStartedAt), v.RecoveryBudget.RequestAttempts, v.RecoveryBudget.Blocked, configTime(v.RecoveryBudget.BlockedAt), v.RecoveryBudget.LastReason, v.HTTPPort, v.SocksPort, v.DaemonPID, configTime(v.StartedAt), configTime(v.LastSeenAt), v.ModelProfileName, v.ModelUnified, v.ModelProvider, v.ModelPublicModel, v.ModelBaseURL, v.ModelAPIKeyRef, v.ModelSSHProxy, v.ModelUpstreamProxyID, v.ModelRevision, v.ModelProxyKey, configTime(v.ModelProfileCaptured)}
 }
@@ -348,23 +352,28 @@ var ErrInstanceNotFound = errors.New("proxy instance not found")
 
 func (s *Store) ChangeInstance(id string, fn func(*Instance) error) error {
 	return s.write(func(tx *sql.Tx) error {
-		var position int
-		if err := tx.QueryRow(`SELECT position FROM instances WHERE id=?`, id).Scan(&position); err == sql.ErrNoRows {
+		v, err := scanInstance(tx.QueryRow(`SELECT `+instanceColumns+` FROM instances WHERE id=?`, id))
+		if err == sql.ErrNoRows {
 			return fmt.Errorf("%w: %q", ErrInstanceNotFound, id)
 		} else if err != nil {
 			return err
 		}
-		v, err := scanInstance(tx.QueryRow(`SELECT `+instanceColumns+` FROM instances WHERE id=?`, id))
-		if err != nil {
-			return err
-		}
+		before := instanceArgs(v)
 		if err = fn(&v); err != nil {
 			return err
 		}
 		if v.ID != id {
 			return fmt.Errorf("cannot change instance identity")
 		}
-		_, err = tx.Exec(instancePut, append([]any{position}, instanceArgs(v)...)...)
+		after := instanceArgs(v)
+		if before[1] != after[1] {
+			if _, err = tx.Exec(`UPDATE instances SET profile_id=? WHERE id=?`, v.ProfileID, id); err != nil {
+				return err
+			}
+		}
+		if !slices.Equal(before[2:], after[2:]) {
+			_, err = tx.Exec(instanceUpdate, append(after[2:], id)...)
+		}
 		return err
 	})
 }

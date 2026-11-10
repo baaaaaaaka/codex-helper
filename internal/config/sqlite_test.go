@@ -2,6 +2,7 @@ package config
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,47 @@ import (
 	"testing"
 	"time"
 )
+
+func TestInstanceEditAvoidsUnchangedIndexesAndRollsBack(t *testing.T) {
+	st, err := NewStore(filepath.Join(t.TempDir(), "config.sqlite"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	initial := Instance{ID: "i", ProfileID: "old", OwnerToken: "holder", BrokerEpoch: "epoch"}
+	if err = st.PutInstance(initial); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = st.db.Exec(`CREATE TRIGGER reject_unchanged_index BEFORE UPDATE OF position,profile_id ON instances
+		WHEN NEW.position=OLD.position AND NEW.profile_id=OLD.profile_id BEGIN SELECT RAISE(ABORT,'unchanged index'); END`); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now().Round(0)
+	if err = st.ChangeInstance("i", func(v *Instance) error { v.LastSeenAt = now; return nil }); err != nil {
+		t.Fatalf("heartbeat updated listing indexes: %v", err)
+	}
+	if err = st.ChangeInstance("i", func(v *Instance) error { v.ProfileID = "new"; v.SocksPort = 1234; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := st.Instance("i")
+	if err != nil || !ok || got.ProfileID != "new" || got.SocksPort != 1234 || !got.LastSeenAt.Equal(now) || got.OwnerToken != "holder" {
+		t.Fatalf("lost edit: %#v %v %v", got, ok, err)
+	}
+	if _, err = st.db.Exec(`CREATE TRIGGER reject_instance_edit BEFORE UPDATE OF socks_port ON instances
+		WHEN NEW.socks_port=9999 BEGIN SELECT RAISE(ABORT,'injected'); END`); err != nil {
+		t.Fatal(err)
+	}
+	if err = st.ChangeInstance("i", func(v *Instance) error { v.ProfileID = "must roll back"; v.SocksPort = 9999; return nil }); err == nil {
+		t.Fatal("accepted injected edit failure")
+	}
+	got, ok, err = st.Instance("i")
+	if err != nil || !ok || got.ProfileID != "new" || got.SocksPort != 1234 {
+		t.Fatalf("partial reassociation: %#v %v %v", got, ok, err)
+	}
+	if err = st.ChangeInstance("missing", func(*Instance) error { t.Fatal("called missing callback"); return nil }); !errors.Is(err, ErrInstanceNotFound) {
+		t.Fatalf("missing instance: %v", err)
+	}
+}
 
 func TestConfigSQLiteMigrationAndQuietWrites(t *testing.T) {
 	dir := t.TempDir()

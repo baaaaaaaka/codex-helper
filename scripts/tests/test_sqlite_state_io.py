@@ -48,7 +48,7 @@ class SQLiteStateIOTests(unittest.TestCase):
 
     def test_excessive_heartbeat_writes_are_rejected(self):
         with self.assertRaises(AssertionError):
-            self.verify(self.trace(heartbeat_bytes=4 * 1024 * 1024))
+            self.verify(self.trace(heartbeat_bytes=3332400))
 
     def test_missing_phase_is_rejected(self):
         with self.assertRaises(AssertionError):

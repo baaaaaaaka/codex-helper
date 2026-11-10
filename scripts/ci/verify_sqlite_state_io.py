@@ -41,10 +41,11 @@ def verify(path):
         assert not any(phases[name][op + "_calls"] for op in writes), (name, phases[name])
     # 100 single-object changes; this remains independent of 100k other rows.
     # Include rollback journal headers/pages and leave room for page splits.
+    # A heartbeat must not also dirty the two unchanged listing indexes.
     for name in ("heartbeat", "settings"):
         changes = phases[name]
         assert changes["pwrite64_bytes"] > 0, f"{name} did not reach storage"
-        assert changes["pwrite64_bytes"] < 4 * 1024 * 1024, changes
+        assert changes["pwrite64_bytes"] < 2 * 1024 * 1024, changes
         assert changes["fsync_calls"] + changes["fdatasync_calls"] <= 400, changes
     for name, counts in phases.items():
         print(name, " ".join(f"{key}={value}" for key, value in sorted(counts.items())))
