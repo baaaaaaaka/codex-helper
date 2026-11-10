@@ -93,15 +93,24 @@ func TestLiveMirrorNotHeldByCatchUpBacklog(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	backlog := 0
+	livePrompt := false
 	for _, b := range order[before:] {
 		switch {
+		case strings.HasPrefix(b, labelUser+":\nlive prompt now"):
+			livePrompt = true
 		case strings.Contains(b, "backlog bl:"):
-			backlog++
+			if livePrompt {
+				backlog++
+			}
 		case strings.Contains(b, "live answer now"):
-			// The chat's creation, its notice and the prompt went first;
-			// a few backlog sends may run while the session is read.
+			// Backlog sends while the helper discovers the new session do
+			// not show that a live answer waited behind the backlog. Measure
+			// from the observable prompt instead.
+			if !livePrompt {
+				t.Fatal("the live answer was sent before its prompt")
+			}
 			if backlog > 8 {
-				t.Fatalf("%d backlog messages went between the live turn and its answer; order:\n%s", backlog, strings.Join(order[before:], "\n"))
+				t.Fatalf("%d backlog messages went between the live prompt and its answer; order:\n%s", backlog, strings.Join(order[before:], "\n"))
 			}
 			if left := backlogChats*backlogRows - strings.Count(strings.Join(order, "\n"), "backlog bl:"); left < 100 {
 				t.Fatalf("the backlog was nearly sent (%d left): the test proves nothing", left)
