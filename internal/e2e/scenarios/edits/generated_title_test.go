@@ -52,9 +52,11 @@ func TestGeneratedTitle(t *testing.T) {
 	s.Check("saved to original Codex thread", err == nil && th.Name == "登录修复", "登录修复", fmt.Sprintf("%+v %v", th, err))
 	s.StopSUT()
 	s.StartSUT()
-	ask(s, work.ID, "Continue the tests", "second")
+	second, _, _ := ask(s, work.ID, "Continue the tests", "second")
 	s.Check("restart and existing thread do not generate again", len(s.Codex.TitleCalls()) == 1, "1", fmt.Sprint(len(s.Codex.TitleCalls())))
-	s.WaitSUTMessage(control.ID, "Codex finished", steps.CommandTimeout)
+	// Wait for this completion notice before renaming; the first turn's
+	// notice is still present and would let the rename race this snapshot.
+	s.WaitSUTMessage(control.ID, "Continue the tests "+second, steps.CommandTimeout)
 	command(s, work.ID, "helper rename My choice", "Work chat renamed.")
 	ask(s, work.ID, "One more task", "third")
 	s.Check("manual title wins", topic(s, work.ID) == "💬 "+harness.MachineLabel+" - My choice", "manual title", topic(s, work.ID))
