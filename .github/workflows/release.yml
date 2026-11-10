@@ -420,8 +420,6 @@ jobs:
             platform: linux_amd64
           - os: macos-15
             platform: darwin_arm64
-          - os: macos-15-intel
-            platform: darwin_amd64
           - os: windows-2022
             platform: windows_amd64.exe
           - os: windows-2025
