@@ -955,10 +955,10 @@
    | <p>new <root>/work/live</p>
 -- <msg:3> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>✅ Work chat created: s024</p>
+   | <p>✅ Work chat created: <new-session-alias></p>
    | <p>Open this Teams link and send your task there:<br>
    | <a href="https://teams.microsoft.com/l/chat/<chat:325>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:325>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
-   | <p>If Teams does not show it right away, search for: s024</p>
+   | <p>If Teams does not show it right away, search for: <new-session-alias></p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>✅ Codex finished</strong></p>
@@ -995,22 +995,22 @@
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>🆕 New local Codex chats (16)</strong></p>
    | <p>These local Codex sessions got Teams work chats while the helper was catching up. Teams lists a new chat only after it is opened: open one here to watch it and continue from its full local context.</p>
-   | <ul><li><strong>s023</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:324>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-15-0</a> (https://teams.microsoft.com/l/chat/<chat:324>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
-   | <li><strong>s022</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:323>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-14-0</a> (https://teams.microsoft.com/l/chat/<chat:323>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
-   | <li><strong>s021</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:322>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-13-0</a> (https://teams.microsoft.com/l/chat/<chat:322>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
-   | <li><strong>s020</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:321>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-12-0</a> (https://teams.microsoft.com/l/chat/<chat:321>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
-   | <li><strong>s019</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:320>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-11-0</a> (https://teams.microsoft.com/l/chat/<chat:320>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
-   | <li><strong>s018</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:319>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-10-0</a> (https://teams.microsoft.com/l/chat/<chat:319>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
-   | <li><strong>s017</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:318>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-09-0</a> (https://teams.microsoft.com/l/chat/<chat:318>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
-   | <li><strong>s016</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:317>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-08-0</a> (https://teams.microsoft.com/l/chat/<chat:317>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
-   | <li><strong>s015</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:316>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-07-0</a> (https://teams.microsoft.com/l/chat/<chat:316>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
-   | <li><strong>s014</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:315>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-06-0</a> (https://teams.microsoft.com/l/chat/<chat:315>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
-   | <li><strong>s013</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:314>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-05-0</a> (https://teams.microsoft.com/l/chat/<chat:314>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
-   | <li><strong>s012</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:313>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-04-0</a> (https://teams.microsoft.com/l/chat/<chat:313>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
-   | <li><strong>s011</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:312>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-03-0</a> (https://teams.microsoft.com/l/chat/<chat:312>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
-   | <li><strong>s010</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:311>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-02-0</a> (https://teams.microsoft.com/l/chat/<chat:311>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
-   | <li><strong>s009</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:310>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-01-0</a> (https://teams.microsoft.com/l/chat/<chat:310>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
-   | <li><strong>s008</strong> · <a href="https://teams.microsoft.com/l/chat/<chat:309>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-00-0</a> (https://teams.microsoft.com/l/chat/<chat:309>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <ul><li><strong><new-session-alias></strong> · <a href="https://teams.microsoft.com/l/chat/<chat:324>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-15-0</a> (https://teams.microsoft.com/l/chat/<chat:324>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <li><strong><new-session-alias></strong> · <a href="https://teams.microsoft.com/l/chat/<chat:323>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-14-0</a> (https://teams.microsoft.com/l/chat/<chat:323>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <li><strong><new-session-alias></strong> · <a href="https://teams.microsoft.com/l/chat/<chat:322>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-13-0</a> (https://teams.microsoft.com/l/chat/<chat:322>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <li><strong><new-session-alias></strong> · <a href="https://teams.microsoft.com/l/chat/<chat:321>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-12-0</a> (https://teams.microsoft.com/l/chat/<chat:321>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <li><strong><new-session-alias></strong> · <a href="https://teams.microsoft.com/l/chat/<chat:320>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-11-0</a> (https://teams.microsoft.com/l/chat/<chat:320>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <li><strong><new-session-alias></strong> · <a href="https://teams.microsoft.com/l/chat/<chat:319>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-10-0</a> (https://teams.microsoft.com/l/chat/<chat:319>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <li><strong><new-session-alias></strong> · <a href="https://teams.microsoft.com/l/chat/<chat:318>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-09-0</a> (https://teams.microsoft.com/l/chat/<chat:318>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <li><strong><new-session-alias></strong> · <a href="https://teams.microsoft.com/l/chat/<chat:317>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-08-0</a> (https://teams.microsoft.com/l/chat/<chat:317>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <li><strong><new-session-alias></strong> · <a href="https://teams.microsoft.com/l/chat/<chat:316>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-07-0</a> (https://teams.microsoft.com/l/chat/<chat:316>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <li><strong><new-session-alias></strong> · <a href="https://teams.microsoft.com/l/chat/<chat:315>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-06-0</a> (https://teams.microsoft.com/l/chat/<chat:315>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <li><strong><new-session-alias></strong> · <a href="https://teams.microsoft.com/l/chat/<chat:314>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-05-0</a> (https://teams.microsoft.com/l/chat/<chat:314>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <li><strong><new-session-alias></strong> · <a href="https://teams.microsoft.com/l/chat/<chat:313>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-04-0</a> (https://teams.microsoft.com/l/chat/<chat:313>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <li><strong><new-session-alias></strong> · <a href="https://teams.microsoft.com/l/chat/<chat:312>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-03-0</a> (https://teams.microsoft.com/l/chat/<chat:312>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <li><strong><new-session-alias></strong> · <a href="https://teams.microsoft.com/l/chat/<chat:311>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-02-0</a> (https://teams.microsoft.com/l/chat/<chat:311>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <li><strong><new-session-alias></strong> · <a href="https://teams.microsoft.com/l/chat/<chat:310>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-01-0</a> (https://teams.microsoft.com/l/chat/<chat:310>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
+   | <li><strong><new-session-alias></strong> · <a href="https://teams.microsoft.com/l/chat/<chat:309>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Backlog prompt backlog-p-00-0</a> (https://teams.microsoft.com/l/chat/<chat:309>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)</li>
    | </ul>
    mention 0: owner "E2E Owner"
 
@@ -1021,7 +1021,7 @@
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Local Codex chat detected: s008.</p>
+   | <p>Local Codex chat detected: <new-session-alias>.</p>
 -- <msg:2> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
    | <p>Backlog prompt backlog-p-00-0</p>
@@ -1048,7 +1048,7 @@
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Local Codex chat detected: s009.</p>
+   | <p>Local Codex chat detected: <new-session-alias>.</p>
 -- <msg:2> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
    | <p>Backlog prompt backlog-p-01-0</p>
@@ -1075,7 +1075,7 @@
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Local Codex chat detected: s010.</p>
+   | <p>Local Codex chat detected: <new-session-alias>.</p>
 -- <msg:2> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
    | <p>Backlog prompt backlog-p-02-0</p>
@@ -1102,7 +1102,7 @@
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Local Codex chat detected: s011.</p>
+   | <p>Local Codex chat detected: <new-session-alias>.</p>
 -- <msg:2> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
    | <p>Backlog prompt backlog-p-03-0</p>
@@ -1129,7 +1129,7 @@
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Local Codex chat detected: s012.</p>
+   | <p>Local Codex chat detected: <new-session-alias>.</p>
 -- <msg:2> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
    | <p>Backlog prompt backlog-p-04-0</p>
@@ -1156,7 +1156,7 @@
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Local Codex chat detected: s013.</p>
+   | <p>Local Codex chat detected: <new-session-alias>.</p>
 -- <msg:2> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
    | <p>Backlog prompt backlog-p-05-0</p>
@@ -1183,7 +1183,7 @@
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Local Codex chat detected: s014.</p>
+   | <p>Local Codex chat detected: <new-session-alias>.</p>
 -- <msg:2> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
    | <p>Backlog prompt backlog-p-06-0</p>
@@ -1210,7 +1210,7 @@
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Local Codex chat detected: s015.</p>
+   | <p>Local Codex chat detected: <new-session-alias>.</p>
 -- <msg:2> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
    | <p>Backlog prompt backlog-p-07-0</p>
@@ -1237,7 +1237,7 @@
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Local Codex chat detected: s016.</p>
+   | <p>Local Codex chat detected: <new-session-alias>.</p>
 -- <msg:2> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
    | <p>Backlog prompt backlog-p-08-0</p>
@@ -1264,7 +1264,7 @@
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Local Codex chat detected: s017.</p>
+   | <p>Local Codex chat detected: <new-session-alias>.</p>
 -- <msg:2> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
    | <p>Backlog prompt backlog-p-09-0</p>
@@ -1291,7 +1291,7 @@
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Local Codex chat detected: s018.</p>
+   | <p>Local Codex chat detected: <new-session-alias>.</p>
 -- <msg:2> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
    | <p>Backlog prompt backlog-p-10-0</p>
@@ -1318,7 +1318,7 @@
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Local Codex chat detected: s019.</p>
+   | <p>Local Codex chat detected: <new-session-alias>.</p>
 -- <msg:2> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
    | <p>Backlog prompt backlog-p-11-0</p>
@@ -1345,7 +1345,7 @@
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Local Codex chat detected: s020.</p>
+   | <p>Local Codex chat detected: <new-session-alias>.</p>
 -- <msg:2> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
    | <p>Backlog prompt backlog-p-12-0</p>
@@ -1372,7 +1372,7 @@
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Local Codex chat detected: s021.</p>
+   | <p>Local Codex chat detected: <new-session-alias>.</p>
 -- <msg:2> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
    | <p>Backlog prompt backlog-p-13-0</p>
@@ -1399,7 +1399,7 @@
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Local Codex chat detected: s022.</p>
+   | <p>Local Codex chat detected: <new-session-alias>.</p>
 -- <msg:2> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
    | <p>Backlog prompt backlog-p-14-0</p>
@@ -1426,7 +1426,7 @@
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Local Codex chat detected: s023.</p>
+   | <p>Local Codex chat detected: <new-session-alias>.</p>
 -- <msg:2> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🧑‍💻 User:</strong></p>
    | <p>Backlog prompt backlog-p-15-0</p>
@@ -1453,14 +1453,14 @@
    type: meeting; members: owner
 -- <msg:1> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>Work chat created: s024.<br>
+   | <p>Work chat created: <new-session-alias>.<br>
    | Working directory: <root>/work/live</p>
 -- <msg:2> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>💬 Work chat is ready.<br>
    | Send a task in this chat. Codex will start automatically and continue this session.<br>
    | Status: waiting for your first task.<br>
-   | Session: s024<br>
+   | Session: <new-session-alias><br>
    | Project: live<br>
    | Working directory: <root>/work/live<br>
    | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
