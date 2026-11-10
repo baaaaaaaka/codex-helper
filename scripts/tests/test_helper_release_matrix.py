@@ -26,11 +26,24 @@ class HelperReleaseMatrixTests(unittest.TestCase):
             ["v0.0.38", "v0.1.0"],
         )
 
+    def test_upgrade_sources_start_at_v0_1_20_and_ignore_rescue_prereleases(self):
+        releases = [
+            {"tagName": "v0.1.19", "isPrerelease": False, "isDraft": False},
+            {"tagName": "v0.1.20", "isPrerelease": False, "isDraft": False},
+            {"tagName": "v0.1.21", "isPrerelease": False, "isDraft": False},
+            {"tagName": "v0.1.22", "isPrerelease": False, "isDraft": False},
+            {"tagName": "v0.1.13-rc.35", "isPrerelease": True, "isDraft": False},
+        ]
+        self.assertEqual(
+            MODULE.select_tags(releases, "v0.1.20", "v0.1.22-rc.96"),
+            ["v0.1.20", "v0.1.21"],
+        )
+
     def test_rejects_non_formal_minimum(self):
         with self.assertRaises(ValueError):
             MODULE.select_tags([], "v0.1.0-rc.1", "")
 
-    def test_includes_fixed_vulnerable_prereleases(self):
+    def test_includes_explicit_prereleases_when_requested(self):
         affected = [f"v0.1.13-rc.{value}" for value in range(28, 36)]
         releases = [
             {"tagName": "v0.1.12", "isPrerelease": False, "isDraft": False},

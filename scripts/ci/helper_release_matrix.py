@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a reproducible matrix from formal releases and fixed rescue tags."""
+"""Build a reproducible matrix from formal releases and explicit migration tags."""
 
 from __future__ import annotations
 
@@ -91,7 +91,7 @@ def validate_matrix_size(tags: list[str], multiplier: int, maximum: int) -> None
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--releases", required=True)
-    parser.add_argument("--minimum", default="v0.0.38")
+    parser.add_argument("--minimum", default="v0.1.20")
     parser.add_argument("--exclude", default="")
     parser.add_argument("--include", action="append", default=[])
     parser.add_argument("--matrix-multiplier", type=int, default=1)
