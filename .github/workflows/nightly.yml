@@ -1320,13 +1320,22 @@ jobs:
             -v "$PWD/dist:/dist:ro" -v "$PWD:/src:ro" -w /src/internal/channel/teams "$img" \
             /dist/codex_channel_teams_test -test.count=1
           echo "==> $img (Teams detached supervisor smoke as non-root uid 1000)"
-          docker run --rm --user 1000:1000 \
+          docker run --rm \
+            -e DISTRO_PACKAGE_ARGS="$DISTRO_PACKAGE_ARGS" \
             -e HOME=/tmp/codex-home \
             -e RUNNER_TEMP=/tmp/codex-runner-temp \
             -e CODEX_HELPER_CI_CXP=/dist/codex-proxy \
             -v "$PWD/dist:/dist:ro" \
-            -v "$PWD/scripts/ci:/ci:ro" "$img" \
-            bash /ci/teams_supervisor_smoke.sh
+            -v "$PWD/scripts/ci:/ci:ro" "$img" bash -lc '
+              set -euo pipefail
+              # Install the SQLite fixture interpreter, then retain the
+              # original non-root identity for every helper lifecycle call.
+              # shellcheck disable=SC2086
+              bash /ci/install_container_packages.sh $DISTRO_PACKAGE_ARGS
+              python3 -c "import sqlite3"
+              exec setpriv --reuid=1000 --regid=1000 --clear-groups \
+                bash -ec "test \"\$UID\" -eq 1000; exec bash /ci/teams_supervisor_smoke.sh"
+            '
 
       - name: Codex upgrade smoke in Linux containers (system/local)
         shell: bash
