@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -152,8 +153,18 @@ func TestMirrorRealignsRewrittenRolloutAcrossPasses(t *testing.T) {
 	if _, err := w.AppendTurn(rollout.Turn{Prompt: "third local prompt", Answer: "third local answer"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Rename(tmp, dst); err != nil {
-		t.Fatal(err)
+	// Windows readers can briefly deny replacement while inspecting a rollout.
+	// Retry only that permission error; keep replacement atomic and bounded.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		err := os.Rename(tmp, dst)
+		if err == nil {
+			break
+		}
+		if runtime.GOOS != "windows" || !os.IsPermission(err) || time.Now().After(deadline) {
+			t.Fatal(err)
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	r.wait("third answer mirrored", func() bool { return len(r.own(chat, "third local answer")) == 1 })
 	time.Sleep(500 * time.Millisecond)

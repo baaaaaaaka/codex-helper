@@ -294,29 +294,24 @@ func TestUnconfirmedLegacyProgressIsRetained(t *testing.T) {
 }
 
 func TestSilenceClockResetsWithCodexActivity(t *testing.T) {
-	var clock atomic.Int64
+	var elapsed atomic.Int64
 	r := newRig(t, func(c *Config) {
-		c.Now = func() time.Time {
-			if n := clock.Load(); n != 0 {
-				return time.Unix(0, n)
-			}
-			return time.Now()
-		}
-		c.Timing.SilenceHint = 100 * time.Millisecond
-		c.Timing.SilenceRepeat = 150 * time.Millisecond
-		c.Timing.SilenceStuck = 500 * time.Millisecond
+		// Keep real time moving so poll/send scheduling also makes progress.
+		c.Now = func() time.Time { return time.Now().Add(time.Duration(elapsed.Load())) }
+		c.Timing.SilenceHint = 5 * time.Second
+		c.Timing.SilenceRepeat = 7500 * time.Millisecond
+		c.Timing.SilenceStuck = 25 * time.Second
 		c.Timing.ChatRate = time.Millisecond
 	})
 	r.ag.mu.Lock()
 	r.ag.during = func(_ TurnRequest, h TurnHooks) {
-		// Advance logical time across several silence thresholds. Scheduler
-		// pauses under -race cannot manufacture an inactive interval: each
-		// advance is smaller than the threshold and followed by real activity.
-		clock.Store(time.Now().UnixNano())
+		// Cross several silence thresholds without tiny wall-clock deadlines.
+		// Each advance is smaller than the threshold and followed by activity;
+		// without resetting lastEvent, the real watcher would emit a hint.
 		for range 40 {
-			clock.Add(int64(20 * time.Millisecond))
+			elapsed.Add(int64(time.Second))
 			h.Activity()
-			time.Sleep(5 * time.Millisecond)
+			time.Sleep(50 * time.Millisecond)
 		}
 	}
 	r.ag.mu.Unlock()
@@ -598,7 +593,7 @@ func testTranscriptBackpressure(t *testing.T) {
 	work := r.newWork(t.TempDir())
 	conv := convIDForTest(r, work)
 	r.ch.PostUser(work, "progress under pressure")
-	r.wait("reader reaches pending high-water mark", func() bool {
+	r.waitFor("reader reaches pending high-water mark", 90*time.Second, func() bool {
 		yes, _ := r.st.PendingAtLeast(conv, mirrorRecordsMax)
 		return yes
 	})

@@ -2,6 +2,7 @@ package entry
 
 import (
 	"database/sql"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -38,5 +39,17 @@ func publishBootFixture(root, good, previous string, generation uint64) error {
 	if err = os.Rename(path, filepath.Join(root, "boot.sqlite")); err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(root, "boot.sqlite.published"), []byte("CXP-SQLITE-1\n"), 0600)
+	// The first publication is completed before the watchdog is started.
+	// Later activations must not truncate its immutable publication seal.
+	marker := filepath.Join(root, "boot.sqlite.published")
+	const magic = "CXP-SQLITE-1\n"
+	if raw, err := os.ReadFile(marker); err == nil {
+		if string(raw) != magic {
+			return fmt.Errorf("invalid fixture publication marker")
+		}
+		return nil
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	return os.WriteFile(marker, []byte(magic), 0600)
 }

@@ -22,19 +22,24 @@ func readNativeBoot(root string) (s BootState, err error) {
 		if _, oldErr := os.Lstat(filepath.Join(root, "boot.json")); oldErr == nil {
 			return s, ErrBootstrapState
 		} else if !os.IsNotExist(oldErr) {
-			return s, fmt.Errorf("%w: %v", ErrBootstrapState, oldErr)
+			return s, fmt.Errorf("%w: %w", ErrBootstrapState, oldErr)
 		}
 		return s, err
 	}
 	if err != nil {
-		return s, fmt.Errorf("%w: %v", ErrBootstrapState, err)
+		return s, fmt.Errorf("%w: %w", ErrBootstrapState, err)
 	}
 	if !info.Mode().IsRegular() || info.Size() > maxBootRecordSize {
 		return s, ErrBootstrapState
 	}
 	db, err := sqlitestate.OpenSnapshot(path, maxBootRecordSize)
 	if err != nil {
-		return s, fmt.Errorf("%w: %v", ErrBootstrapState, err)
+		if os.IsNotExist(err) {
+			// The file existed above. Its loss cannot admit fresh-install
+			// fallback, even if it disappears between inspection and open.
+			return s, fmt.Errorf("%w: %v", ErrBootstrapState, err)
+		}
+		return s, fmt.Errorf("%w: %w", ErrBootstrapState, err)
 	}
 	defer db.Close()
 	var v int

@@ -25,7 +25,7 @@ run_tests() {
 case "$mode" in
   unit)
     run_tests ./internal/core/store '^TestPublishedCoreStore' 'TestPublishedCoreStoreNeverInitializesLostSchema' 1
-    run_tests ./internal/helperruntime '^TestSQLiteBootstrap' 'TestSQLiteBootstrapExplicitMigrationDropsIncompatibleRollback,TestSQLiteBootstrapMigrationFailurePreservesLegacy,TestSQLiteBootstrapAutomaticUpdateRequiresExplicitMigration,TestSQLiteBootstrapRetryAfterCommittedBeforeArchive' 1
+    run_tests ./internal/helperruntime '^TestSQLiteBootstrap' 'TestSQLiteBootstrapPublishedLossIsNotFreshInstall,TestSQLiteBootstrapExplicitMigrationDropsIncompatibleRollback,TestSQLiteBootstrapMigrationFailurePreservesLegacy,TestSQLiteBootstrapAutomaticUpdateRequiresExplicitMigration,TestSQLiteBootstrapRetryAfterCommittedBeforeArchive' 1
     run_tests ./internal/cli '^TestTeamsExchangeSQLite' 'TestTeamsExchangeSQLiteAtomicCompletionAndConditionalAck,TestTeamsExchangeSQLiteLegacyAtomicMigration' 1
     run_tests ./internal/sqlitestate '^TestSQLiteOnly' 'TestSQLiteOnlyPersistenceBoundary' 1
     run_tests ./internal/sqlitestate '^TestSQLiteSnapshot' 'TestSQLiteSnapshotAtomicFailureAndReadOnly' 1

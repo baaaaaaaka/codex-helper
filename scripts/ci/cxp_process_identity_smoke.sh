@@ -67,7 +67,13 @@ assert_fresh_launcher_dispatches_active_runtime() {
       -o "$target_runtime" \
       ./cmd/codex-proxy
   )
-  printf 'v%s\n' "$target_version" >"$runtime_root/active"
+  # Seed native boot with the verified target, then restore the older entry.
+  install -m 0755 "$target_runtime" "$entry"
+  "$entry" --cxp-install-bootstrap --target "$entry"
+  install -m 0755 "$old_runtime" "$entry"
+  local boot="$runtime_root/boot.sqlite"
+  local boot_before="$fixture/boot-before.sqlite"
+  cp "$boot" "$boot_before"
 
   local stale_output
   stale_output="$(
@@ -99,19 +105,19 @@ assert_fresh_launcher_dispatches_active_runtime() {
     echo "fresh stable launcher did not dispatch active runtime $target_version" >&2
     exit 1
   fi
-  test "$(tr -d '\r\n' <"$runtime_root/active")" = "v$target_version"
+  cmp "$boot_before" "$boot"
 }
 
 wait_for_runtime() {
   local current_pid="$1"
-  local active="$root/.cxp-runtime/active"
+  local boot="$root/.cxp-runtime/boot.sqlite"
   for _ in $(seq 1 200); do
     if ! kill -0 "$current_pid" 2>/dev/null; then
       cat "$root/stderr.log" >&2 || true
       echo "CXP process exited before runtime activation" >&2
       exit 1
     fi
-    if [[ -s "$active" ]]; then
+    if [[ -s "$boot" ]]; then
       case "$(uname -s)" in
         Linux)
           if [[ "$(readlink "/proc/$current_pid/exe" 2>/dev/null || true)" == *"/.cxp-runtime/versions/"* ]]; then
@@ -142,9 +148,9 @@ assert_fresh_launcher_dispatches_active_runtime
 for entry in cxp codex-proxy; do
   : >"$root/stdout.log"
   : >"$root/stderr.log"
+  # A long-lived CXP process with no network or account: `cxp run` in
+  # direct mode (stdin is not a terminal) waiting on a child.
   HOME="$root/home" XDG_STATE_HOME="$root/state" \
-    # A long-lived CXP process with no network or account: `cxp run` in
-    # direct mode (stdin is not a terminal) waiting on a child.
     "$root/$entry" run -- sleep 600 \
       </dev/null >"$root/stdout.log" 2>"$root/stderr.log" &
   pid=$!

@@ -40,6 +40,7 @@ NAMES = [
     "TestEntryMigrationRefusesEmptyPublishedDatabase",
     "TestConfigSQLiteReadOnlyRequiresMigration",
     "TestPublishedCoreStoreNeverInitializesLostSchema",
+    "TestSQLiteBootstrapPublishedLossIsNotFreshInstall",
 ]
 
 

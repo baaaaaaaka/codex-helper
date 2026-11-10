@@ -10,6 +10,22 @@ import (
 	"testing"
 )
 
+func TestSQLiteBootstrapPublishedLossIsNotFreshInstall(t *testing.T) {
+	root := t.TempDir()
+	if _, err := ReadBoot(root); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fresh install: %v", err)
+	}
+	if err := Activate(root, "v1.0.0"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(root, BootFile)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadBoot(root); !errors.Is(err, ErrBootstrapState) || errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("lost publication could admit fresh-install fallback: %v", err)
+	}
+}
+
 func TestSQLiteBootstrapExplicitMigrationDropsIncompatibleRollback(t *testing.T) {
 	root := t.TempDir()
 	// Frozen protocol-one evidence: do not generate this using the new writer.
