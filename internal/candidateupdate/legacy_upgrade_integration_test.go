@@ -84,22 +84,6 @@ func copyUpgradeBinary(t *testing.T, source, target string) {
 	}
 }
 
-// f.Stat captures the Windows file ID immediately; os.Stat can defer that
-// lookup until SameFile, after the path has already been replaced.
-func upgradeEntryIdentity(t *testing.T, path string) os.FileInfo {
-	t.Helper()
-	f, err := os.Open(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	info, err := f.Stat()
-	f.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
-	return info
-}
-
 func TestCandidateLegacyOriginalUpdaterCompletesSQLiteCutover(t *testing.T) {
 	fixture := legacyEnvironment(t)
 	candidate := buildUpgradeCandidate(t, "v9.99.0")
@@ -145,7 +129,10 @@ func TestCandidateLegacyOriginalUpdaterCompletesSQLiteCutover(t *testing.T) {
 			entry := filepath.Join(dir, helperruntime.BinaryName(runtime.GOOS))
 			root := filepath.Join(dir, ".cxp-runtime")
 			copyUpgradeBinary(t, tc.source, entry)
-			originalEntry := upgradeEntryIdentity(t, entry)
+			originalEntry, statErr := os.Stat(entry)
+			if statErr != nil {
+				t.Fatal(statErr)
+			}
 			out := runUpgradeCLI(t, entry, false, "--version")
 			if !strings.Contains(string(out), strings.TrimPrefix(tc.version, "v")) {
 				t.Fatal(string(out))
@@ -238,10 +225,15 @@ func TestCandidateLegacyOriginalUpdaterCompletesSQLiteCutover(t *testing.T) {
 			if !tc.native {
 				// Allow quiescence: launching the old image on every poll
 				// would keep creating the mappings the Windows worker awaits.
+				// Metadata avoids read handles racing its atomic replacement;
+				// exact bytes are checked below after normal CLI cleanup.
 				deadline := time.Now().Add(15 * time.Second)
 				for {
-					now := upgradeEntryIdentity(t, entry)
-					if !os.SameFile(originalEntry, now) {
+					now, statErr := os.Stat(entry)
+					if statErr != nil && !deferUpgradeEntry(statErr) {
+						t.Fatal(statErr)
+					}
+					if statErr == nil && (now.Size() != originalEntry.Size() || !now.ModTime().Equal(originalEntry.ModTime())) {
 						break
 					}
 					if time.Now().After(deadline) {

@@ -99,7 +99,14 @@ def main():
         if protocol != "2":
             expected = hashlib.sha256(current.read_bytes()).digest()
             deadline = time.monotonic() + 15
-            while os.path.samestat(original_entry, entry.stat()):
+            while True:
+                try:
+                    observed = entry.stat()
+                    if (observed.st_size, observed.st_mtime_ns) != (original_entry.st_size, original_entry.st_mtime_ns):
+                        break
+                except OSError as error:
+                    if system != "windows" or getattr(error, "winerror", None) not in (5, 32, 33):
+                        raise
                 assert time.monotonic() < deadline, "physical bootstrap migration did not converge"
                 time.sleep(0.1)
             assert hashlib.sha256(entry.read_bytes()).digest() == expected, "unexpected replacement bytes"
