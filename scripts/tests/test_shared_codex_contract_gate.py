@@ -23,7 +23,7 @@ out=$1
 cat > "$out" <<'SCRIPT'
 #!/bin/bash
 case "$0" in
-  */probe) echo TestRealCodexNewChatTUI ;;
+  */probe) printf '%s\\n' TestRealCodexNewChatTUI TestRealCodexGatewayRecoveryTUI ;;
   */agent) echo TestRealCodexSharedTUIThreadBinding ;;
 esac
 SCRIPT
@@ -33,7 +33,7 @@ chmod +x "$out"
             docker = bin_dir / "docker"
             docker.write_text('''#!/bin/bash
 case "$*" in
- *TestRealCodexNewChatTUI*) printf '%s\\n' "$FAKE_RESULT" ;;
+ *GatewayRecovery*) printf '%s\\n' "$FAKE_RESULT" ;;
  *) echo PASS ;;
 esac
 ''')
@@ -42,7 +42,8 @@ esac
             codex.write_text("#!/bin/sh\nexit 0\n")
             codex.chmod(0o755)
             env = dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ.get("PATH", ""), TMPDIR=tmp)
-            for output, expected in (("--- PASS: TestRealCodexNewChatTUI (0.1s)", True),
+            for output, expected in (("--- PASS: TestRealCodexNewChatTUI (0.1s)\n--- PASS: TestRealCodexGatewayRecoveryTUI (0.1s)", True),
+                                     ("--- PASS: TestRealCodexNewChatTUI (0.1s)\n--- SKIP: TestRealCodexGatewayRecoveryTUI (0.1s)", False),
                                      ("--- SKIP: TestRealCodexNewChatTUI (0.0s)", False),
                                      ("testing: warning: no tests to run", False)):
                 result = subprocess.run(["bash", "scripts/ci/run_shared_codex_contracts.sh", str(codex)],

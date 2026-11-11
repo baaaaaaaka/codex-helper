@@ -22,6 +22,7 @@ CGO_ENABLED=0 go build -o "$contract_scratch/cxp" ./cmd/codex-proxy
 # A renamed or platform-excluded acceptance test must not become a green
 # "no tests to run" result. Listing tests does not start any native processes.
 "$contract_scratch/probe" -test.list '^TestRealCodexNewChatTUI$' | grep -qx TestRealCodexNewChatTUI
+"$contract_scratch/probe" -test.list '^TestRealCodexGatewayRecoveryTUI$' | grep -qx TestRealCodexGatewayRecoveryTUI
 "$contract_scratch/agent" -test.list '^TestRealCodexSharedTUIThreadBinding$' | grep -qx TestRealCodexSharedTUIThreadBinding
 for contract_suite in probe client agent; do
   docker run --rm --network none \
@@ -41,9 +42,13 @@ docker run --rm --network none \
   -e E2E_REAL_CODEX=/codex -e E2E_CXP_BIN=/contracts/cxp \
   -w /work "${CXP_CONTRACT_IMAGE:-golang:1.25.11-bookworm}" \
   /contracts/probe -test.v -test.count=1 -test.timeout=180s \
-  -test.run '^TestRealCodexNewChatTUI$' | tee "$contract_scratch/new-chat.log"
+  -test.run '^TestRealCodex(NewChat|GatewayRecovery)TUI$' | tee "$contract_scratch/new-chat.log"
 # A listed test may still skip at runtime; the acceptance gate must execute it.
 if ! grep -Eq '^--- PASS: TestRealCodexNewChatTUI( |$)' "$contract_scratch/new-chat.log"; then
   echo 'New chat acceptance did not pass or was skipped' >&2
+  exit 1
+fi
+if ! grep -Eq '^--- PASS: TestRealCodexGatewayRecoveryTUI( |$)' "$contract_scratch/new-chat.log"; then
+  echo 'Gateway recovery acceptance did not pass or was skipped' >&2
   exit 1
 fi

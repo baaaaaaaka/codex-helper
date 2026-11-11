@@ -293,7 +293,7 @@ func runCodexNativeInvocation(ctx context.Context, store *config.Store, profile 
 	opts.ExtraEnv = codexRuntimeEnvironmentOverlay(opts.ExtraEnv, runtimeContract.Environment)
 	proxyURL := ""
 	if useProxy {
-		proxyURL, err = codexAppEnsureProxyURLFn(ctx, store, *profile, instances, opts.Log)
+		proxyURL, err = ensureCodexTUIProxyURL(ctx, store, *profile, instances, opts.Log)
 		if err != nil {
 			return err
 		}
