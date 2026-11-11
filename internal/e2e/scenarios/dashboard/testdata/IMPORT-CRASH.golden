@@ -1,4 +1,4 @@
-# IMPORT-CRASH: kill -9 in the middle of a history import; after the restart every record is posted exactly once
+# IMPORT-CRASH: kill -9 in the middle of a history import, with a record accepted by Teams and unrecorded; after the restart every record is posted exactly once
 # cxp black-box transcript; volatile values are numbered placeholders
 
 == chat <chat:1> "🏠 Codex Control - e2ehost"
@@ -23,6 +23,9 @@
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Published local Codex session as s001: <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
    | <p>Open this Teams work chat and send a message there to continue.</p>
+-- <msg:5> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Delivery unconfirmed in s001 (message reference 14). The complete message is retained. Later messages can continue; this message will not be resent automatically.</p>
 
 == chat <chat:2> "💬 e2ehost - Long session prompt number 01"
    type: meeting; members: owner

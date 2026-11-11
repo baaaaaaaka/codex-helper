@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakegraph"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/harness"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/steps"
 )
@@ -86,15 +87,20 @@ func lastSUT(s *harness.Scenario, chatID string) string {
 }
 
 // IMPORT-CRASH: the helper is killed while a long history import is being
-// posted; after the restart the import finishes and every record is in
-// the chat exactly once, with one "Import complete" and one control-chat
-// result.
+// posted, at the moment Teams has stored a record the helper has not yet
+// recorded as sent; after the restart the import finishes and every record
+// is in the chat exactly once (the held one is never posted again), with
+// one "Import complete", one control-chat result and one notice that the
+// held send was unconfirmed at the restart.
+//
+// The kill lands in that window deterministically: a kill at an arbitrary
+// moment makes the control chat depend on whether a send was in flight.
 func TestImportSurvivesACrash(t *testing.T) {
 	harness.Parallel(t)
 	const turns = 40
 	s := harness.NewScenario(t, "IMPORT-CRASH", harness.Options{
 		Guarantees: []string{"F-MIR-5", "R-2"},
-		Title:      "kill -9 in the middle of a history import; after the restart every record is posted exactly once",
+		Title:      "kill -9 in the middle of a history import, with a record accepted by Teams and unrecorded; after the restart every record is posted exactly once",
 		Budget:     4 * time.Minute,
 		NoStart:    true,
 	})
@@ -107,15 +113,17 @@ func TestImportSurvivesACrash(t *testing.T) {
 		texts = append(texts, p, a)
 	}
 	local := localSession(s, dir, base, pairs...)
+	const held = "Long session answer number 05"
+	hold := s.Graph.AddFault(fakegraph.Fault{Name: "import-record-accepted-hold", Kind: fakegraph.FaultAcceptedHold, Method: "POST", Times: 1,
+		Match: func(r fakegraph.Request) bool { return strings.Contains(r.Body, held) }})
 
 	s.StartSUT()
 	control := steps.ReadyControlChat(s)
 	before := chatsNow(s)
 	steps.MustPost(s, control.ID, "continue "+local.SessionID)
 	work := newChat(s, before, "the import's chat")
-	s.Require("the import is being posted", steps.CommandTimeout, func() (bool, string) {
-		n := countIn(s, work.ID, "Long session answer number")
-		return n >= 4, fmt.Sprintf("%d answers posted", n)
+	s.Require("a record of the import is accepted by Teams and held", steps.CommandTimeout, func() (bool, string) {
+		return hold.Fired() == 1, fmt.Sprintf("fired=%d, %d answers posted", hold.Fired(), countIn(s, work.ID, "Long session answer number"))
 	})
 	posted := countIn(s, work.ID, "Long session")
 	complete := countIn(s, work.ID, "Import complete")
@@ -129,5 +137,12 @@ func TestImportSurvivesACrash(t *testing.T) {
 	s.WaitSUTMessage(control.ID, "Published local Codex session as s001", steps.CommandTimeout)
 	s.Settle(2*time.Second, 20*time.Second)
 	onceEach(s, work.ID, "the imported chat", append(texts, "Work chat created: s001", "Imported Codex session history", "Import complete")...)
-	onceEach(s, control.ID, "the control chat", "✅ Work chat created: s001", "Published local Codex session as s001")
+	onceEach(s, control.ID, "the control chat", "✅ Work chat created: s001", "Published local Codex session as s001", "Delivery unconfirmed in s001")
+	posts := 0
+	for _, r := range s.Graph.Requests(fakegraph.RequestFilter{Method: "POST", ChatID: work.ID}) {
+		if strings.Contains(r.Body, held) {
+			posts++
+		}
+	}
+	s.Check("the held record is never posted again", posts == 1, "1 POST", fmt.Sprintf("%d POSTs", posts))
 }
