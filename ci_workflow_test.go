@@ -76,25 +76,28 @@ func TestCIWorkflowPullRequestTierRunsEverySuiteWithoutWeakeningRequiredChecks(t
 	requireStepContains(t, collector,
 		"migration_process_pattern='^TestMigrateCodexRolloutBeforeTUIHonorsCancellationAndProcessGroup$'",
 		"*/internal/e2e/scenarios/*) ;;",
-		"test -timeout=20m -parallel=16 -skip \"$isolated_skip_pattern\" -coverprofile=\"$coverage_file\" \"${packages[@]}\"",
+		"test -count=1 -timeout=20m -parallel=16 -skip \"$isolated_skip_pattern\" -coverprofile=\"$coverage_file\" \"${packages[@]}\"",
 		"test ./internal/cli -timeout=2m -parallel=16 -count=1 -run \"$migration_process_pattern\"",
 		"status=${PIPESTATUS[0]}",
 		"failures+=(\"$label\")",
 	)
 
-	race := workflowJobBlock(t, workflow, "race-core")
-	requireStepContains(t, race,
-		"go test -race -p=1 -count=1 -timeout=15m -parallel=8 ./internal/core/... ./internal/channel/... ./internal/asr",
-	)
+	race := workflowJobBlock(t, workflow, "race-core-exec")
+	requireStepContains(t, race, `group: [migrate, store, engine]`,
+		`bash scripts/ci/race_core_packages.sh "${{ matrix.group }}"`)
+	requireStepContains(t, workflowJobBlock(t, workflow, "race-core"),
+		"needs: [race-core-exec]", `${{ needs.race-core-exec.result }}`)
 
 	e2e := workflowJobBlock(t, workflow, "e2e")
 	requireStepContains(t, e2e,
-		"runs-on: ubuntu-latest",
-		"shard: [0, 1, 2]",
-		"E2E_SUT: cxp",
-		"python3 scripts/ci/e2e_shards.py --count 3 --index \"${{ matrix.shard }}\"",
-		"go test -count=1 -parallel=8 -timeout=600s \"${packages[@]}\"",
+		"runs-on: ubuntu-latest", "shard: [0, 1, 2]", "E2E_SUT: cxp",
+		`bash scripts/ci/run_e2e_shard.sh "${{ matrix.shard }}"`,
 	)
+	e2eScript, err := os.ReadFile("scripts/ci/run_e2e_shard.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireStepContains(t, string(e2eScript), `go test -count=1 -parallel=8 -timeout=600s "${packages[@]}"`)
 
 	platforms := workflowJobBlock(t, workflow, "unit-windows-macos")
 	requireStepContains(t, platforms,

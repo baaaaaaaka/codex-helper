@@ -90,7 +90,7 @@ run_suite \
   "Full Go test" \
   "$runner_temp/full-go-test.log" \
   "$coverage_file" \
-  test -timeout=20m -parallel=16 -skip "$isolated_skip_pattern" -coverprofile="$coverage_file" "${packages[@]}"
+  test -count=1 -timeout=20m -parallel=16 -skip "$isolated_skip_pattern" -coverprofile="$coverage_file" "${packages[@]}"
 
 run_suite \
   "Isolated migration process" \

@@ -19,7 +19,26 @@ run_tests() {
       exit 1
     fi
   done
-  "$go_bin" test "$package" -run "$pattern" -count="$count" -timeout=5m -v
+  # The migration-recovery scenario is a critical real-process acceptance
+  # gate. Existence alone is insufficient: a runtime skip must fail closed.
+  local critical=TestEntryMigrationResumesAfterInterruptedStart
+  if [[ ",$required," != *",$critical,"* ]]; then
+    "$go_bin" test "$package" -run "$pattern" -count="$count" -timeout=5m -v
+    return
+  fi
+  local output
+  output="$(mktemp "${TMPDIR:-/tmp}/cxp-recovery-gate.XXXXXX")"
+  if ! "$go_bin" test "$package" -run "$pattern" -count="$count" -timeout=5m -v | tee "$output"; then
+    rm -f "$output"
+    return 1
+  fi
+  local passed
+  passed="$(awk -v name="$critical" '$1 == "---" && $2 == "PASS:" && $3 == name { n++ } END { print n+0 }' "$output")"
+  rm -f "$output"
+  if [[ "$passed" -ne "$count" ]]; then
+    echo "required recovery test passed $passed times, expected $count: $critical" >&2
+    return 1
+  fi
 }
 
 case "$mode" in

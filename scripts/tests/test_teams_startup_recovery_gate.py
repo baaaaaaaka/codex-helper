@@ -57,7 +57,7 @@ for line in SCRIPT.read_text().splitlines():
 ALL_NAMES = sorted({name for entries in CONTRACTS.values() for _, _, names, _ in entries for name in names.split(",")})
 
 class StartupRecoveryGateTests(unittest.TestCase):
-    def run_gate(self, mode, *, missing="", fail=False):
+    def run_gate(self, mode, *, missing="", fail=False, skip=False):
         shell = shutil.which("bash")
         if os.name == "nt":
             # PowerShell may find WSL's bash.exe before Git Bash. Use the
@@ -77,6 +77,11 @@ with open(os.environ['CALL_LOG'],'a') as f:
 if '-list' in sys.argv:
     print('\\n'.join(n for n in json.loads(os.environ['TEST_NAMES']) if n != os.environ['MISSING']))
     sys.exit(0)
+if any('Test(EntryMigration|EntryWatchdogRuntime|EntryTypedSQLite)' in arg for arg in sys.argv):
+    count = next((int(arg.split('=', 1)[1]) for arg in sys.argv if arg.startswith('-count=')), 1)
+    verdict = 'SKIP' if os.environ['SKIP_RESULT'] == '1' else 'PASS'
+    for _ in range(0 if os.environ['SKIP_RESULT'] == '2' else count):
+        print('--- ' + verdict + ': TestEntryMigrationResumesAfterInterruptedStart (0.01s)')
 sys.exit(int(os.environ['FAIL_TEST']))
 """)
             # Use this interpreter explicitly; Git Bash need not provide
@@ -89,7 +94,7 @@ sys.exit(int(os.environ['FAIL_TEST']))
             env = os.environ.copy()
             env.update(CXP_CI_GO_BIN=fake.as_posix(), CALL_LOG=str(log),
                        TEST_NAMES=json.dumps(ALL_NAMES), MISSING=missing,
-                       FAIL_TEST="1" if fail else "0")
+                       FAIL_TEST="1" if fail else "0", SKIP_RESULT=str(skip))
             p = subprocess.run([shell, SCRIPT.as_posix(), mode], cwd=ROOT, env=env,
                                capture_output=True, text=True)
             calls = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
@@ -123,6 +128,13 @@ sys.exit(int(os.environ['FAIL_TEST']))
             p, _ = self.run_gate(mode, fail=True)
             self.assertNotEqual(p.returncode, 0)
 
+    def test_critical_recovery_skip_is_not_success(self):
+        for result in (1, 2):  # skipped or no execution output
+            with self.subTest(result=result):
+                p, _ = self.run_gate("e2e", skip=result)
+                self.assertNotEqual(p.returncode, 0)
+                self.assertIn("required recovery test passed 0 times", p.stderr)
+
     def test_unknown_mode_is_an_error(self):
         p, calls = self.run_gate("typo")
         self.assertEqual(p.returncode, 2)
@@ -138,7 +150,7 @@ sys.exit(int(os.environ['FAIL_TEST']))
         self.assertIn("bash scripts/ci/test_teams_startup_recovery.sh e2e", job_block(WORKFLOW, "e2e"))
 
     def test_ci_race_pattern_selects_startup_and_runtime_process(self):
-        race = job_block(WORKFLOW, "race-core")
+        race = job_block(WORKFLOW, "race-core-exec")
         patterns = re.findall(r"go test -race[^\n]+-run '([^']+)'", race)
         self.assertTrue(patterns, "startup CLI race step is missing")
         self.assertIn("./internal/helperruntime -run '^Test(VersionPointer|SQLiteBootstrap)'", race)

@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 
 # Keep room for systemctl's runtime socket suffix below the Unix socket limit.
+smoke_prepare_started=$SECONDS
 smoke_temp_base="${RUNNER_TEMP:-${TMPDIR:-/tmp}}"
 mkdir -p "$smoke_temp_base"
 root="$(mktemp -d "$smoke_temp_base/cxp-ts.XXXXXX")"
@@ -14,6 +15,8 @@ log() {
   printf '[teams-supervisor-smoke] %s\n' "$*"
 }
 
+log "preparation completed in $((SECONDS - smoke_prepare_started))s"
+smoke_run_started=$SECONDS
 trap 'log "failed at line $LINENO (exit $?)"' ERR
 
 cleanup_pids=()
@@ -39,6 +42,8 @@ remove_cleanup_pid() {
 }
 
 cleanup() {
+  local cleanup_started=$SECONDS
+  log "execution completed in $((cleanup_started - smoke_run_started))s"
   for pid in "${cleanup_pids[@]:-}"; do
     [ -n "$pid" ] || continue
     kill "$pid" >/dev/null 2>&1 || true
@@ -53,6 +58,7 @@ cleanup() {
     systemctl --user daemon-reload >/dev/null 2>&1 || true
   fi
   rm -rf "$root"
+  log "cleanup completed in $((SECONDS - cleanup_started))s"
 }
 trap cleanup EXIT
 

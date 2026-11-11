@@ -41,4 +41,9 @@ docker run --rm --network none \
   -e E2E_REAL_CODEX=/codex -e E2E_CXP_BIN=/contracts/cxp \
   -w /work "${CXP_CONTRACT_IMAGE:-golang:1.25.11-bookworm}" \
   /contracts/probe -test.v -test.count=1 -test.timeout=180s \
-  -test.run '^TestRealCodexNewChatTUI$'
+  -test.run '^TestRealCodexNewChatTUI$' | tee "$contract_scratch/new-chat.log"
+# A listed test may still skip at runtime; the acceptance gate must execute it.
+if ! grep -Eq '^--- PASS: TestRealCodexNewChatTUI( |$)' "$contract_scratch/new-chat.log"; then
+  echo 'New chat acceptance did not pass or was skipped' >&2
+  exit 1
+fi

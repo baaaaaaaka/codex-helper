@@ -253,8 +253,12 @@ jobs:
         shell: bash
         run: bash scripts/tests/run_teams_runtime_safety_shard.sh isolation
 
-  race-core:
-    name: Race test (core and channel)
+  race-core-exec:
+    name: Race test (core and channel / ${{ matrix.group }})
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [migrate, store, engine]
     runs-on: ubuntu-latest
     # The serial core pass took 17 minutes on a hosted runner before ASR,
     # TUI and startup checks. Each package retains its own 15m/5m timeout.
@@ -279,13 +283,15 @@ jobs:
           # whole-repository race sweep runs in nightly.yml.
           # Keep SQLite-heavy packages from competing with one another under
           # race instrumentation on shared runners. All tests still run.
-          go test -race -p=1 -count=1 -timeout=15m -parallel=8 ./internal/core/... ./internal/channel/... ./internal/asr 2>&1 | tee "$RUNNER_TEMP/race-core.log"
+          bash scripts/ci/race_core_packages.sh "${{ matrix.group }}" 2>&1 | tee "$RUNNER_TEMP/race-core.log"
 
       - name: TUI asynchronous state and worker race checks
+        if: matrix.group == 'engine'
         shell: bash
         run: go test -race -count=1 -timeout=5m ./internal/tui
 
       - name: Teams startup and watchdog race checks
+        if: matrix.group == 'engine'
         shell: bash
         run: |
           set -euo pipefail
@@ -293,6 +299,7 @@ jobs:
           go test -race -count=1 -timeout=5m ./internal/cli -run '^Test(TeamsExchangeSQLite|TeamsStatusPublisher|ServiceSQLite|SupervisorSQLite|WindowsAppSQLite|LegacyTeamsWatchdogHandoff|TeamsCoreStore|FirstStart|TeamsServiceWatchdog|RunTeamsServiceWatchdog)' 2>&1 | tee "$RUNNER_TEMP/race-teams-startup.log"
 
       - name: E2E fake Codex queue race checks
+        if: matrix.group == 'engine'
         shell: bash
         run: |
           set -euo pipefail
@@ -302,13 +309,24 @@ jobs:
         if: ${{ failure() }}
         uses: actions/upload-artifact@v4
         with:
-          name: race-core-diagnostics
+          name: race-core-diagnostics-${{ matrix.group }}
           path: |
             ${{ runner.temp }}/race-core.log
             ${{ runner.temp }}/race-teams-startup.log
             ${{ runner.temp }}/race-runtime-pointers.log
             ${{ runner.temp }}/race-fake-codex-queue.log
           if-no-files-found: ignore
+
+  race-core:
+    name: Race test (core and channel)
+    runs-on: ubuntu-latest
+    needs: [race-core-exec]
+    if: ${{ always() }}
+    steps:
+      - name: Verify all race groups
+        env:
+          RACE_RESULT: ${{ needs.race-core-exec.result }}
+        run: test "$RACE_RESULT" = success
 
   e2e:
     name: End-to-end scenarios (shard ${{ matrix.shard }} of 3)
@@ -355,18 +373,7 @@ jobs:
           TMPDIR: ${{ runner.temp }}
         run: |
           set -euo pipefail
-          python3 scripts/ci/e2e_shards.py --count 3 --plan
-          mapfile -t packages < <(python3 scripts/ci/e2e_shards.py --count 3 --index "${{ matrix.shard }}")
-          if [ "${#packages[@]}" -eq 0 ]; then
-            echo "shard ${{ matrix.shard }} has no scenario package"
-            exit 0
-          fi
-          # The scenarios drive `cxp teams run` against a fake Graph service
-          # and a fake Codex app-server; nothing leaves the runner. They wait
-          # on the helper's timers far more than they use CPU, so 8 run at
-          # once per package on the 4-CPU runner (per-test times measured
-          # unchanged from -parallel=4; see scripts/ci/e2e_shard_weights.json).
-          go test -count=1 -parallel=8 -timeout=600s "${packages[@]}" 2>&1 | tee "$RUNNER_TEMP/e2e.log"
+          bash scripts/ci/run_e2e_shard.sh "${{ matrix.shard }}" 2>&1 | tee "$RUNNER_TEMP/e2e.log"
 
       - name: Upload e2e diagnostics
         if: ${{ failure() }}
@@ -438,7 +445,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: full-go-test-diagnostics-${{ matrix.os }}-${{ matrix.partition }}
-          path: ${{ runner.temp }}/full-go-test*.log
+          path: |
+            ${{ runner.temp }}/full-go-test*.log
+            ${{ runner.temp }}/cxp-ci-job-*.log
           if-no-files-found: ignore
 
   tui-update-safety:

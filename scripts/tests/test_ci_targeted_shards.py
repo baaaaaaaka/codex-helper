@@ -43,6 +43,32 @@ def step_blocks(job: str) -> dict[str, str]:
 
 
 class TargetedShardWorkflowTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "Linux race grouping uses Bash")
+    def test_race_groups_cover_original_packages_once(self):
+        original = subprocess.check_output(
+            ["go", "list", "./internal/core/...", "./internal/channel/...", "./internal/asr"],
+            cwd=ROOT, text=True,
+        ).splitlines()
+        groups = [subprocess.check_output(
+            ["bash", "scripts/ci/race_core_packages.sh", group, "--plan"],
+            cwd=ROOT, text=True,
+        ).splitlines() for group in ("migrate", "store", "engine")]
+        selected = [package for group in groups for package in group]
+        self.assertEqual(len(selected), len(set(selected)), "package repeated")
+        self.assertEqual(set(original), set(selected), "package omitted or added")
+        aggregate = job_block(WORKFLOW, "race-core")
+        self.assertIn("needs: [race-core-exec]", aggregate)
+        self.assertIn("needs.race-core-exec.result", aggregate)
+        self.assertIn('test "$RACE_RESULT" = success', aggregate)
+
+    def test_full_runner_streams_failure_before_job_finishes(self):
+        subprocess.run(
+            ["go", "test", "./scripts/ci/run_full_go_test_shards.go",
+             "./scripts/ci/run_full_go_test_shards_stream_test.go",
+             "-run", "^TestJob", "-count=1"],
+            cwd=ROOT, check=True, text=True, capture_output=True, timeout=120,
+        )
+
     @unittest.skipUnless(os.name == "posix", "POSIX credential guard")
     def test_credential_guard_rejects_inputs_when_ripgrep_is_unavailable(self):
         block = step_blocks(job_block(WORKFLOW, "lint"))[
@@ -362,8 +388,8 @@ class TargetedShardWorkflowTests(unittest.TestCase):
         )
         self.assertIn(f"-exclude-prefix={E2E_SCENARIOS_PREFIX}", race)
         self.assertIn(
-            "go test -race -p=1 -count=1 -timeout=15m -parallel=8 ./internal/core/... ./internal/channel/... ./internal/asr",
-            job_block(WORKFLOW, "race-core"),
+            'bash scripts/ci/race_core_packages.sh "${{ matrix.group }}"',
+            job_block(WORKFLOW, "race-core-exec"),
         )
 
     def test_e2e_scenarios_run_once_on_linux_through_the_production_entry_point(self):
@@ -372,14 +398,28 @@ class TargetedShardWorkflowTests(unittest.TestCase):
         self.assertIn("shard: [0, 1, 2]", job)
         self.assertIn("E2E_SUT: cxp", job)
         self.assertIn(
-            'python3 scripts/ci/e2e_shards.py --count 3 --index "${{ matrix.shard }}"', job
+            'bash scripts/ci/run_e2e_shard.sh "${{ matrix.shard }}"', job
         )
-        self.assertIn('go test -count=1 -parallel=8 -timeout=600s "${packages[@]}"', job)
+        self.assertIn('go test -count=1 -parallel=8 -timeout=600s "${packages[@]}"', (ROOT / "scripts/ci/run_e2e_shard.sh").read_text())
         aggregate = job_block(WORKFLOW, "test")
         self.assertIn("      - e2e\n", aggregate)
         self.assertIn('check e2e "${{ needs.e2e.result }}"', aggregate)
         collector = LINUX_FULL_GO_TEST_COLLECT.read_text(encoding="utf-8")
         self.assertIn("*/internal/e2e/scenarios/*) ;;", collector)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX shell fixtures")
+    def test_e2e_runner_fails_on_discovery_error_or_empty_selection(self):
+        with tempfile.TemporaryDirectory(prefix="e2e-plan-") as tmp:
+            tools = pathlib.Path(tmp)
+            python = tools / "python3"
+            python.write_text("#!/bin/bash\nif [[ \"$*\" == *--plan* ]]; then exit 0; fi\nexit \"${FAKE_EXIT:-0}\"\n")
+            python.chmod(0o755)
+            env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ.get("PATH", ""))
+            for status in ("0", "7"):
+                result = subprocess.run(["bash", "scripts/ci/run_e2e_shard.sh", "0"],
+                                        cwd=ROOT, env=dict(env, FAKE_EXIT=status),
+                                        text=True, capture_output=True)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
 
     def test_e2e_shards_partition_every_scenario_package_exactly_once(self):
         prefix = "github.com/baaaaaaaka/codex-helper/internal/e2e/scenarios/"
@@ -460,7 +500,7 @@ class TargetedShardWorkflowTests(unittest.TestCase):
         race = job_block(NIGHTLY_WORKFLOW, "race-test")
         self.assertIn('tee "$RUNNER_TEMP/race-test.log"', race)
         self.assertIn("Upload race diagnostics", race)
-        self.assertIn("Upload race diagnostics", job_block(WORKFLOW, "race-core"))
+        self.assertIn("Upload race diagnostics", job_block(WORKFLOW, "race-core-exec"))
 
         aggregate = job_block(WORKFLOW, "test")
         self.assertIn("    name: Test\n", aggregate)
