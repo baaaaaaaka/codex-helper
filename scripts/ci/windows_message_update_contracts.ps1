@@ -23,26 +23,14 @@ Remove-Item Function:Get-ScheduledTask, Function:Disable-ScheduledTask
 $scratch = Join-Path $env:RUNNER_TEMP ('cxp-installer-contract-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $scratch | Out-Null
 $locked = $null
+$registered = @()
 try {
-    $binary = Join-Path $scratch 'codex-proxy.exe'
-    Copy-Item $env:ComSpec $binary
-    $locked = Start-Process -FilePath $binary -ArgumentList '/c ping -n 60 127.0.0.1 >nul' -PassThru -WindowStyle Hidden
-    $refused = $false
-    try { Wait-CodexProxyInstallPathReleased $binary -attempts 2 -delayMs 10 } catch {
-        $refused = $_.Exception.Message.Contains($binary) -and $_.Exception.Message.Contains([string]$locked.Id)
-    }
-    if (-not $refused) { throw 'Installer accepted a running target or hid its identity' }
-    # The busy entry has not been replaced or deleted.
-    if ((Get-FileHash $binary).Hash -ne (Get-FileHash $env:ComSpec).Hash) { throw 'Busy entry was changed' }
-    Stop-Process -Id $locked.Id -Force
-    $locked.WaitForExit(); $locked = $null
-    Wait-CodexProxyInstallPathReleased $binary -attempts 2 -delayMs 10
     $fixture = Join-Path $scratch 'cxp.exe'
     go build -o $fixture (Join-Path $repo 'internal/cli/testdata/servicefixture')
     if ($LASTEXITCODE -ne 0) { throw 'Could not build inert native service fixture' }
-    function Start-Fixture([string]$arguments) {
+    function Start-Fixture([string]$path, [string]$arguments) {
         $p = New-Object System.Diagnostics.Process
-        $p.StartInfo.FileName = $fixture
+        $p.StartInfo.FileName = $path
         $p.StartInfo.Arguments = $arguments
         $p.StartInfo.UseShellExecute = $false
         $p.StartInfo.CreateNoWindow = $true
@@ -53,22 +41,58 @@ try {
         if (-not $ready.Wait(5000) -or $ready.Result -ne 'ready') { $p.Kill(); throw 'Fixture did not start' }
         return $p
     }
-    function Get-ScheduledTask { [CmdletBinding()]param(); return @() }
-    $service = Start-Fixture 'teams service watchdog --loop --interval 10s --quiet'
-    $tui = Start-Fixture ''
+    $binary = Join-Path $scratch 'codex-proxy.exe'
+    Copy-Item $fixture $binary
+    $locked = Start-Fixture $binary ''
+    $refused = $false
+    try { Wait-CodexProxyInstallPathReleased $binary -attempts 2 -delayMs 10 } catch {
+        $refused = $_.Exception.Message.Contains($binary) -and $_.Exception.Message.Contains([string]$locked.Id)
+    }
+    if (-not $refused) { throw 'Installer accepted a running target or hid its identity' }
+    # The busy entry has not been replaced or deleted.
+    if ((Get-FileHash $binary).Hash -ne (Get-FileHash $fixture).Hash) { throw 'Busy entry was changed' }
+    Stop-Process -Id $locked.Id -Force
+    $locked.WaitForExit(); $locked = $null
+    Wait-CodexProxyInstallPathReleased $binary -attempts 2 -delayMs 10
+    # Hosted CI is ephemeral. Refuse to touch any pre-existing helper task;
+    # register our own inert actions and exercise the actual scheduler cmdlets.
+    $names = @('Codex Helper Teams Watchdog', 'Codex Helper Teams Bridge')
+    $existing = @(Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.TaskName -in $names -and $_.TaskPath -eq '\' })
+    if ($existing.Count) { throw 'Refusing to replace existing helper tasks' }
+    $action = New-ScheduledTaskAction -Execute (Join-Path $PSHOME 'powershell.exe') -Argument '-NoProfile -NonInteractive -Command Start-Sleep -Seconds 60'
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount
+    foreach ($name in $names) {
+        Register-ScheduledTask -TaskName $name -Action $action -Principal $principal -ErrorAction Stop | Out-Null
+        $registered += $name
+        Start-ScheduledTask -TaskName $name -ErrorAction Stop
+        for ($i = 0; $i -lt 50 -and (Get-ScheduledTask -TaskName $name).State -ne 'Running'; $i++) { Start-Sleep -Milliseconds 100 }
+        if ((Get-ScheduledTask -TaskName $name).State -ne 'Running') { throw "Task did not start: $name" }
+    }
+    $service = Start-Fixture $fixture 'teams service watchdog --loop --interval 10s --quiet'
+    $tui = Start-Fixture $fixture ''
     try {
         Stop-CodexProxyTeamsTasksForInstall @($fixture)
         if (-not $service.WaitForExit(5000)) { throw 'Detached watchdog survived installer maintenance' }
         if ($tui.HasExited) { throw 'Installer killed an unrelated interactive session' }
+        foreach ($name in $names) {
+            for ($i = 0; $i -lt 50 -and (Get-ScheduledTask -TaskName $name).State -ne 'Disabled'; $i++) { Start-Sleep -Milliseconds 100 }
+            if ((Get-ScheduledTask -TaskName $name -ErrorAction Stop).State -ne 'Disabled') { throw "Task can restart after maintenance: $name" }
+            $blocked = $false
+            try { Start-ScheduledTask -TaskName $name -ErrorAction Stop } catch { $blocked = $true }
+            if (-not $blocked) { throw "Disabled task restarted: $name" }
+        }
     } finally {
         foreach ($p in @($service, $tui)) {
             if (-not $p.HasExited) { $p.Kill(); $p.WaitForExit() }
             $p.Dispose()
         }
-        Remove-Item Function:Get-ScheduledTask
     }
-    Write-Host 'PASS: denied tasks, native locks, detached watchdog cleanup and interactive-session preservation'
+    Write-Host 'PASS: denied tasks, native locks, actual task disable/stop, detached watchdog cleanup and interactive-session preservation'
 } finally {
     if ($null -ne $locked -and -not $locked.HasExited) { Stop-Process -Id $locked.Id -Force }
+    foreach ($name in $registered) {
+        Stop-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue
+    }
     Remove-Item -LiteralPath $scratch -Recurse -Force
 }

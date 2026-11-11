@@ -63,7 +63,9 @@ state, ports and fake Graph/model services; unit tests also run locally.
   preserved bytes/order despite URL normalization. Client visual inspection is
   separate from these API/HTML checks.
 - Native Windows CI owns non-terminating PowerShell permission errors, an actual
-  executable lock, detached watchdog cleanup and interactive-session preservation.
+  executable lock, real Scheduled Task disable/stop, detached watchdog cleanup
+  and interactive-session preservation. The task fixture refuses to replace
+  pre-existing helper tasks and removes only tasks registered by the test.
   The boot gate adds a checksummed published rc.83 physical entry plus a frozen
   rc.96 runtime, and tests explicit bootstrap recovery with configuration intact.
   Linux cross-compilation is not native Windows execution evidence.
