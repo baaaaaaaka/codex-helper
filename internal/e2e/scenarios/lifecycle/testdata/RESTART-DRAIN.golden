@@ -122,13 +122,11 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Held job E2E-RESTARTDRAIN-held-2</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>helper restart in progress. I saved this message and will resume it after the helper is back online.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Held job E2E-RESTARTDRAIN-held-2</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Held job E2E-RESTARTDRAIN-held-2</p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
@@ -159,13 +157,11 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Long job E2E-RESTARTDRAIN-long-1</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:3>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:3>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Long job E2E-RESTARTDRAIN-long-1</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Long job E2E-RESTARTDRAIN-long-1</p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
@@ -177,13 +173,11 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Forced job E2E-RESTARTDRAIN-forced-3</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:3>/<msg:5>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:3>/<msg:5>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Forced job E2E-RESTARTDRAIN-forced-3</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Forced job E2E-RESTARTDRAIN-forced-3</p>
 -- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
@@ -193,13 +187,11 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>After the restart E2E-RESTARTDRAIN-after-4</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:3>/<msg:7>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:3>/<msg:7>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>After the restart E2E-RESTARTDRAIN-after-4</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>After the restart E2E-RESTARTDRAIN-after-4</p>
 -- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>

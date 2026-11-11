@@ -12,6 +12,10 @@ import (
 // The caller records completion without an external post id: the original
 // message must remain a user message for own-post recognition.
 func (e *Engine) appendConfirmation(ctx context.Context, r store.Outbox, chat string, p channel.Part) error {
+	label, err := e.confirmationLabel(r.ConvID)
+	if err != nil {
+		return err
+	}
 	ann, ok := e.annotator()
 	if !ok {
 		return channel.ErrNotEditable
@@ -24,5 +28,20 @@ func (e *Engine) appendConfirmation(ctx context.Context, r store.Outbox, chat st
 		}
 		return err
 	}
-	return ann.Annotate(ctx, chat, r.AppendTo, channel.Annotation{Confirmation: &p, ConfirmationKey: r.DeliveryKey})
+	return ann.Annotate(ctx, chat, r.AppendTo, channel.Annotation{Confirmation: &p, ConfirmationKey: r.DeliveryKey, Label: label, At: fromMS(r.CreatedAt).Local()})
+}
+
+// Recovered receipts wait for the first membership check. Do not add owner
+// labels in shared chats; media labels belong to transcript annotation.
+func (e *Engine) confirmationLabel(conv int64) (string, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cs := e.convs[conv]
+	if cs != nil && !cs.readOnce {
+		return "", errEditLater
+	}
+	if conv == e.inboxID || cs == nil || cs.group {
+		return "", nil
+	}
+	return labelUser, nil
 }

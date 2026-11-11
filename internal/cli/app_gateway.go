@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -23,6 +25,7 @@ import (
 )
 
 const (
+	appGatewayTUIReadyTimeout    = time.Minute
 	appGatewayBackendRetryWindow = 10 * time.Minute
 	appGatewayBackendMaxAttempts = 8
 	appGatewayBackendMaxBackoff  = time.Minute
@@ -189,6 +192,68 @@ func ensureCodexAppGatewayURL(ctx context.Context, store *config.Store, profile 
 	return withProxyStartupLock(ctx, store, func() (string, error) {
 		return ensureCodexAppGatewayURLLocked(ctx, store, profile, legacyInstances, log)
 	})
+}
+
+// Desktop clients can survive backend recovery; a new TUI must not start
+// account initialization until its existing listener can route requests.
+func ensureCodexTUIProxyURL(ctx context.Context, store *config.Store, profile config.Profile, instances []config.Instance, log io.Writer) (string, error) {
+	proxyURL, err := codexAppEnsureProxyURLFn(ctx, store, profile, instances, log)
+	if err != nil {
+		return "", err
+	}
+	u, err := url.Parse(proxyURL)
+	if err != nil {
+		return "", fmt.Errorf("invalid TUI proxy URL: %w", err)
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		return "", fmt.Errorf("invalid TUI proxy port: %w", err)
+	}
+	dir, err := appGatewayRegistryDirFn()
+	if err != nil {
+		return "", err
+	}
+	reg, err := appgateway.LoadReadOnly(dir, profile.ID)
+	if err != nil {
+		return "", fmt.Errorf("read TUI gateway identity: %w", err)
+	}
+	if reg.HTTPPort != port {
+		return "", fmt.Errorf("TUI proxy port %d differs from registered port %d", port, reg.HTTPPort)
+	}
+	if log != nil {
+		fmt.Fprintln(log, "waiting for App Gateway SSH backend before starting Codex...")
+	}
+	if err := waitForTUIAppGateway(ctx, reg); err != nil {
+		return "", fmt.Errorf("%w; gateway log: %s", err, appGatewayLogPath(dir, profile.ID))
+	}
+	return proxyURL, nil
+}
+
+func waitForTUIAppGateway(ctx context.Context, reg appgateway.Registration) error {
+	ctx, cancel := context.WithTimeout(ctx, appGatewayTUIReadyTimeout)
+	defer cancel()
+	ticker := time.NewTicker(codexAppProxyPollInterval)
+	defer ticker.Stop()
+	reason := "backend has not responded"
+	for {
+		health, err := appgateway.Probe(ctx, reg.HTTPPort, 500*time.Millisecond)
+		if err == nil {
+			if health.InstanceID != reg.ID && (reg.ReplacedInstanceID == "" || health.InstanceID != reg.ReplacedInstanceID) {
+				return fmt.Errorf("TUI gateway port %d is owned by %q, want %q", reg.HTTPPort, health.InstanceID, reg.ID)
+			}
+			if health.OK {
+				return nil
+			}
+			reason = health.Error
+		} else if ctx.Err() == nil {
+			reason = err.Error()
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("waiting for TUI gateway on port %d: %s: %w", reg.HTTPPort, reason, ctx.Err())
+		case <-ticker.C:
+		}
+	}
 }
 
 func ensureCodexAppGatewayURLLocked(ctx context.Context, store *config.Store, profile config.Profile, legacyInstances []config.Instance, log io.Writer) (string, error) {

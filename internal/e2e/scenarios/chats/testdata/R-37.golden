@@ -54,34 +54,37 @@
    | Model: Codex account default<br>
    | Reasoning effort: model default</p>
 -- <msg:3> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>What is in this picture? E2E-R37-image-1</p>
    | <p><img src="https://graph.microsoft.com/v1.0/chats/<chat:2>/messages/<msg:3>/hostedContents/aWQ9eF8wLXd1cy1kMTEtZTJl/$value" width="64" height="64" alt="image" itemid="0"></p>
-   hosted: sha256:4ff6ab670a58c14270e034e2090d9a432caa263a14e0a25785386b0c12f880b5
--- <msg:4> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <hr/>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:5> helper (html)
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   hosted: sha256:4ff6ab670a58c14270e034e2090d9a432caa263a14e0a25785386b0c12f880b5
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>What is in this picture? E2E-R37-image-1</p>
+   | <p><img src="https://graph.microsoft.com/v1.0/chats/<chat:2>/messages/<msg:3>/hostedContents/aWQ9eF8wLXd1cy1kMTEtZTJl/$value" width="64" height="64" alt="image" itemid="0"></p>
+-- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-R37-image-1</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:6> owner (html)
+-- <msg:5> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Please review the attached notes E2E-R37-file-2</p>
    | <attachment id="<uuid:1>"></attachment><hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:6>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:5>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
    attachment: {"content":null,"contentType":"reference","contentUrl":"https://e2etenant-my.sharepoint.com/personal/owner_e2e_example/Documents/Microsoft%20Teams%20Chat%20Files/design%20notes.txt","id":"<uuid:1>","name":"design notes.txt","teamsAppId":null,"thumbnailUrl":null}
-   edited 2 time(s); earlier versions:
+   edited 1 time(s); earlier versions:
    [version 1]
    | <p>Please review the attached notes E2E-R37-file-2</p>
    | <attachment id="<uuid:1>"></attachment>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>Please review the attached notes E2E-R37-file-2</p>
-   | <attachment id="<uuid:1>"></attachment>
--- <msg:7> helper (html)
+-- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-R37-file-2</p>
    | <hr/>

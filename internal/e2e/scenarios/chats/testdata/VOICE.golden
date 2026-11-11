@@ -54,10 +54,11 @@
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <attachment id="<uuid:1>"></attachment><hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
    | <p><strong>🎙️ Speech-to-text transcript (automatic; may contain recognition errors):</strong></p>
-   | <p><em>Clip: voice.ogg</em></p>
+   | <p><em><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D#cxp-transcript%<b64:1>">Clip: voice.ogg</a></em></p>
    | <p>transcribed: please list the files E2E-VOICE-voiceok-1</p>
    hosted: sha256:0615efb2d15eaf68b0386cd0d8c61ab7667c8b6d745de94f5f0faaa5e95c4ca1
    attachment: {"content":"{\"duration\":\"PT3S\",\"media\":[{\"url\":\"https://graph.microsoft.com/v1.0/chats/<chat:2>/messages/<msg:3>/hostedContents/aWQ9dm9pY2UtJTAzZA0009/$value\"}]}","contentType":"application/vnd.microsoft.card.audio","contentUrl":null,"id":"<uuid:1>","name":"voice.ogg","teamsAppId":null,"thumbnailUrl":null}
@@ -66,8 +67,9 @@
    | <attachment id="<uuid:1>"></attachment>
    [version 2]
    | <attachment id="<uuid:1>"></attachment><hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-VOICE-voiceok-1</p>
@@ -76,8 +78,9 @@
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:5> owner (html)
    | <attachment id="<uuid:2>"></attachment><hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:5>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:5>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
    hosted: sha256:dba36bffa5cab0f922d087a3aeb179f9d4e745df40b323e1b1471402848c8a3e
    attachment: {"content":"{\"duration\":\"PT3S\",\"media\":[{\"url\":\"https://graph.microsoft.com/v1.0/chats/<chat:2>/messages/<msg:5>/hostedContents/aWQ9dm9pY2UtJTAzZA0010/$value\"}]}","contentType":"application/vnd.microsoft.card.audio","contentUrl":null,"id":"<uuid:2>","name":"clip0.ogg","teamsAppId":null,"thumbnailUrl":null}
    edited 1 time(s); earlier versions:
@@ -89,8 +92,9 @@
    | <p>Voice transcription failed: no speech was recognised in the recording. Next: resend the recording closer to the microphone, or type the message.</p>
 -- <msg:7> owner (html)
    | <attachment id="<uuid:3>"></attachment><hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:7>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:7>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
    hosted: sha256:dba36bffa5cab0f922d087a3aeb179f9d4e745df40b323e1b1471402848c8a3e
    attachment: {"content":"{\"duration\":\"PT3S\",\"media\":[{\"url\":\"https://graph.microsoft.com/v1.0/chats/<chat:2>/messages/<msg:7>/hostedContents/aWQ9dm9pY2UtJTAzZA0011/$value\"}]}","contentType":"application/vnd.microsoft.card.audio","contentUrl":null,"id":"<uuid:3>","name":"clip1.ogg","teamsAppId":null,"thumbnailUrl":null}
    edited 1 time(s); earlier versions:
@@ -102,8 +106,9 @@
    | <p>Voice transcription failed: the voice recognition program cannot run on this machine (missing system library or incompatible CPU/OS). Next: update the helper; if it persists, report the error from the helper&#39;s log, or configure --asr-command.</p>
 -- <msg:9> owner (html)
    | <attachment id="<uuid:4>"></attachment><hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:9>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:9>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
    hosted: sha256:dba36bffa5cab0f922d087a3aeb179f9d4e745df40b323e1b1471402848c8a3e
    attachment: {"content":"{\"duration\":\"PT3S\",\"media\":[{\"url\":\"https://graph.microsoft.com/v1.0/chats/<chat:2>/messages/<msg:9>/hostedContents/aWQ9dm9pY2UtJTAzZA0012/$value\"}]}","contentType":"application/vnd.microsoft.card.audio","contentUrl":null,"id":"<uuid:4>","name":"clip2.ogg","teamsAppId":null,"thumbnailUrl":null}
    edited 1 time(s); earlier versions:
@@ -115,8 +120,9 @@
    | <p>Voice transcription failed: voice recognition failed. Next: resend the message; if it keeps failing, check the helper&#39;s log for the error.</p>
 -- <msg:11> owner (html)
    | <attachment id="<uuid:5>"></attachment><hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:11>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:11>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
    hosted: sha256:dba36bffa5cab0f922d087a3aeb179f9d4e745df40b323e1b1471402848c8a3e
    attachment: {"content":"{\"duration\":\"PT3S\",\"media\":[{\"url\":\"https://graph.microsoft.com/v1.0/chats/<chat:2>/messages/<msg:11>/hostedContents/aWQ9dm9pY2UtJTAzZA0013/$value\"}]}","contentType":"application/vnd.microsoft.card.audio","contentUrl":null,"id":"<uuid:5>","name":"clip3.ogg","teamsAppId":null,"thumbnailUrl":null}
    edited 1 time(s); earlier versions:
@@ -129,10 +135,11 @@
 -- <msg:13> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <attachment id="<uuid:6>"></attachment><hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:13>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:13>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
    | <p><strong>🎙️ Speech-to-text transcript (automatic; may contain recognition errors):</strong></p>
-   | <p><em>Clip: again.ogg</em></p>
+   | <p><em><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:13>?context=%7B%22contextType%22%3A%22chat%22%7D#cxp-transcript%<b64:2>">Clip: again.ogg</a></em></p>
    | <p>transcribed: and again E2E-VOICE-again-2</p>
    hosted: sha256:9ce0a9374f491da9b4ddda599f582d7e09ab2b5de29ee06886a796718c4cf429
    attachment: {"content":"{\"duration\":\"PT3S\",\"media\":[{\"url\":\"https://graph.microsoft.com/v1.0/chats/<chat:2>/messages/<msg:13>/hostedContents/aWQ9dm9pY2UtJTAzZA0014/$value\"}]}","contentType":"application/vnd.microsoft.card.audio","contentUrl":null,"id":"<uuid:6>","name":"again.ogg","teamsAppId":null,"thumbnailUrl":null}
@@ -141,8 +148,9 @@
    | <attachment id="<uuid:6>"></attachment>
    [version 2]
    | <attachment id="<uuid:6>"></attachment><hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:13>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:13>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
 -- <msg:14> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-VOICE-again-2</p>

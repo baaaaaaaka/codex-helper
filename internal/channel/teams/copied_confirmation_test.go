@@ -3,8 +3,10 @@ package teams
 import (
 	"context"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/channel"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakegraph"
@@ -27,22 +29,25 @@ func TestPromptConfirmationCopiedHTMLLostPatchRestart(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			p := renderOne(t, a, channel.RichDoc{Label: "🔧 Helper", Markdown: "⏳ Codex is working. Request accepted."})
-			an := channel.Annotation{Confirmation: &p, ConfirmationKey: "ack:same-local-key"}
+			p := renderOne(t, a, channel.RichDoc{Label: "🔧 Helper", Markdown: "⏳ Codex is working. Request accepted.\n\nReceived at 2026-11-11 15:06:35 UTC+08:00"})
+			an := channel.Annotation{Confirmation: &p, ConfirmationKey: "ack:same-local-key", Label: testLabel, At: time.Unix(1, 0)}
 			fg.AddFault(fakegraph.Fault{Name: "lost", Kind: fakegraph.FaultAcceptedLost, Route: "PATCH /chats/{chat}/messages/{message}", Times: 1})
 			if err := a.Annotate(ctx, chat, owner.ID, an); !channel.IsAmbiguous(err) {
 				t.Fatalf("lost PATCH: %v", err)
 			}
 			got := fg.Messages(chat)[0]
-			if got.PatchCount != 1 || !strings.HasPrefix(got.Content, original+"<hr/>") {
+			if got.PatchCount != 1 || !strings.HasPrefix(got.Content, labelHTML(testLabel)+original+"<hr/>") {
 				t.Fatalf("original changed or receipt missing: %s", got.Content)
 			}
 			if strings.Count(got.PlainText(), "Request accepted.") != 2 {
 				t.Fatal("old receipt suppressed new receipt")
 			}
+			if !strings.Contains(got.Content, ">2026-11-11 15:06:35 UTC+08:00</a>") {
+				t.Fatal("persistent reception time missing")
+			}
+			an.At = time.Now().Add(24 * time.Hour) // delivery/restart time is not reception time
 			// A later transcript/label edit and HTML reserialization must keep identity.
-			normalized := strings.ReplaceAll(got.Content, `<a href="`, `<a title='request' href='`)
-			normalized = strings.ReplaceAll(normalized, `"><strong>`, `'><strong>`)
+			normalized := regexp.MustCompile(`<a href="([^"]+)">`).ReplaceAllString(got.Content, `<a title='request' href='$1'>`)
 			// Exercise the normalizing parser without relying on serialized attributes.
 			next, err := confirmationEdit(chat, owner.ID, normalized, true, nil, an)
 			if err != nil || next != "" {

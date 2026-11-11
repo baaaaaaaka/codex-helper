@@ -41,11 +41,11 @@ func HandleProtocolProbe(args []string, out io.Writer) (int, bool) {
 func ProbeProtocol(ctx context.Context, path string) error {
 	out, err := ProbeExecutable(ctx, path, []string{ProtocolProbeFlag}, 10*time.Second)
 	if err != nil {
-		return fmt.Errorf("probe boot protocol: %w", err)
+		return fmt.Errorf("probe boot protocol for %s: %w; output: %s; rerun the installer to update the bootstrap", path, err, strings.TrimSpace(string(out)))
 	}
 	protocol, err := strconv.Atoi(strings.TrimSpace(string(out)))
 	if err != nil || protocol != BootProtocol {
-		return fmt.Errorf("incompatible boot protocol; use the installer to change the bootstrap")
+		return fmt.Errorf("incompatible boot protocol for %s: got %q, want %d; use the installer to change the bootstrap", path, strings.TrimSpace(string(out)), BootProtocol)
 	}
 	return nil
 }

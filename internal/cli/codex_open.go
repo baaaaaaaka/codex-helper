@@ -356,7 +356,7 @@ func runCodexTUIInvocationViaBrokerWithHooks(
 	}
 	proxyURL := ""
 	if useProxy && shared == nil {
-		proxyURL, err = codexAppEnsureProxyURLFn(ctx, store, *profile, instances, log)
+		proxyURL, err = ensureCodexTUIProxyURL(ctx, store, *profile, instances, log)
 		if err != nil {
 			return err
 		}

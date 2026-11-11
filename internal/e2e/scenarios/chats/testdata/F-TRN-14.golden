@@ -50,14 +50,11 @@
    | <p>Summarise the build log  <br>
    | and list the failing tests E2E-FTRN14-envelope-1</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Summarise the build log  <br>
-   | and list the failing tests E2E-FTRN14-envelope-1</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Summarise the build log  <br>
    | and list the failing tests E2E-FTRN14-envelope-1</p>
 -- <msg:4> helper (html)

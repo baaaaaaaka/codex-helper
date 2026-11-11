@@ -434,6 +434,11 @@ jobs:
             exit 1
           fi
 
+      - name: Installer error and native file-lock contracts (Windows)
+        if: runner.os == 'Windows' && matrix.partition == 0
+        shell: powershell
+        run: .\scripts\ci\windows_message_update_contracts.ps1
+
       - name: Teams test user-directory isolation guard (Windows)
         if: runner.os == 'Windows' && matrix.partition == 0
         shell: pwsh

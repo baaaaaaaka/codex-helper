@@ -3,11 +3,9 @@ package teams
 import (
 	"encoding/json"
 	"fmt"
-	"net/url"
 	"strings"
 
 	"github.com/baaaaaaaka/codex-helper/internal/channel"
-	"golang.org/x/net/html"
 )
 
 // confirmationEdit appends one initial receipt, identified by its target message
@@ -32,22 +30,31 @@ func confirmationEdit(chat, id, content string, isHTML bool, atts []graphAttachm
 	if json.Unmarshal([]byte(p.Body), &part) != nil || part.Body.ContentType != "html" || part.Body.Content == "" || len(part.Hosted)+len(part.Attachments)+len(part.Mentions) != 0 {
 		return refuse()
 	}
-	// A normal Teams message link survives comment stripping and markup
-	// normalization. Its target identifies this request; copied old receipts
-	// point at a different message. Never infer identity from receipt text.
-	link := "https://teams.microsoft.com/l/message/" + url.PathEscape(chat) + "/" + url.PathEscape(id) + "?context=%7B%22contextType%22%3A%22chat%22%7D"
-	if hasConfirmationLink(content, link) {
-		return "", nil
+	link := annotationLink(chat, id, "")
+	// Old receipts have a linked Helper header followed by this receipt's
+	// first paragraph. An unrelated self-link or helper example is not proof.
+	first := leadingParagraphRE.FindString(part.Body.Content)
+	rest := strings.TrimSpace(strings.TrimPrefix(part.Body.Content, first))
+	legacyText := strings.Join(strings.Fields(plainText(leadingParagraphRE.FindString(rest))), " ")
+	hasReceipt := hasAnnotationStamp(content, link, "Received at", legacyText)
+	for _, at := range atts {
+		if isMediaCard(at) {
+			an.Label = ""
+			break
+		} // transcripts own media labels
 	}
-	part.Body.Content = strings.Replace(part.Body.Content, "<p>", `<p><a href="`+esc(link)+`">`, 1)
-	part.Body.Content = strings.Replace(part.Body.Content, "</p>", "</a></p>", 1)
+	if hasReceipt && (an.Label == "" || hasLabel(content, an.Label)) {
+		return "", nil // unchanged retries need no attachment scan or PATCH
+	}
 	if !isHTML && len(atts) > 0 && strings.TrimSpace(content) != "" {
 		return refuse()
 	}
+	original := content
 	content = asHTML(content, isHTML)
 	// Voice cards sometimes have no placeholder. Preserve them exactly as the
 	// existing transcript edit does; all other attachments must already be shown.
 	check := append([]graphAttachment(nil), atts...)
+	shown := attachmentIDs(content)
 	for i, at := range check {
 		if !isMediaCard(at) {
 			continue
@@ -55,46 +62,36 @@ func confirmationEdit(chat, id, content string, isHTML bool, atts []graphAttachm
 		if strings.TrimSpace(at.ID) == "" {
 			return refuse()
 		}
-		shown := false
-		for _, tag := range attachmentTagRE.FindAllStringSubmatch(content, -1) {
-			if tag[1] == at.ID {
-				shown = true
-			}
-		}
-		if !shown {
+		if shown[at.ID] == 0 {
 			content += `<attachment id="` + esc(at.ID) + `"></attachment>`
 		}
 		check[i].ContentType = "reference" // validation only; raw cards are sent unchanged
 		check[i].Content = ""              // the preserved media card owns its hosted URL
 	}
-	if attachmentContext(content, check) && !losslessAttachments(content, check) {
+	if !losslessAttachments(content, check) {
 		return refuse()
 	}
-	next := content + "<hr/>" + part.Body.Content
+	body := part.Body.Content
+	// New receipts persist their displayed time with the rendered outbox body.
+	// Old pending outbox rows use their original creation time on delivery.
+	if start := strings.LastIndex(body, "<p>Received at "); start >= 0 {
+		stamp := strings.TrimSuffix(body[start+len("<p>Received at "):], "</p>")
+		body = body[:start] + `<p>Received at <a href="` + esc(link) + `">` + stamp + `</a></p>`
+	} else {
+		body += timeStamp("Received at", link, an.At)
+	}
+	next := content
+	if !hasReceipt {
+		next += "<hr/>" + body
+	}
+	if an.Label != "" && !hasLabel(content, an.Label) {
+		next = labelHTML(an.Label) + next
+	}
+	if next == original {
+		return "", nil
+	}
 	if len(next)+markerReserve > maxPartBytes {
 		return refuse()
 	}
 	return next, nil
-}
-
-// Tokenize attributes, rather than comparing serialized HTML: Teams can change
-// quoting, entity escaping and attribute order without changing the link.
-func hasConfirmationLink(content, link string) bool {
-	z := html.NewTokenizer(strings.NewReader(content))
-	for {
-		switch z.Next() {
-		case html.ErrorToken:
-			return false
-		case html.StartTagToken:
-			t := z.Token()
-			if t.Data != "a" {
-				continue
-			}
-			for _, a := range t.Attr {
-				if a.Key == "href" && a.Val == link {
-					return true
-				}
-			}
-		}
-	}
 }

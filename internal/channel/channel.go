@@ -317,6 +317,9 @@ type Annotation struct {
 	// ConfirmationKey is stable across delivery attempts, separate from own-post markers.
 	Confirmation    *Part
 	ConfirmationKey string
+	// At and Key identify an annotation event; At never changes on retry.
+	At  time.Time
+	Key string
 	// Label heads the message as its own line ("🧑‍💻 User:") unless the
 	// message already starts with it. Without Clips, a message carrying a
 	// voice or video clip is not labelled (it gets its transcript).
@@ -324,10 +327,8 @@ type Annotation struct {
 	// ClipsLabel heads the transcripts of the message's voice clips.
 	ClipsLabel string
 	Clips      []Clip
-	// Notice is appended below the message. Present: the message already
-	// shows the notice when its text contains every one of these strings.
-	Notice  *RichDoc
-	Present []string
+	// Notice is appended below the message, identified by Key.
+	Notice *RichDoc
 }
 
 // Clip is the transcript of one voice or video clip of a message.

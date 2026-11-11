@@ -4,6 +4,7 @@ package candidateupdate
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -313,4 +314,56 @@ func TestCandidateLegacyTUITrialTransfersBeforeNativeWrites(t *testing.T) {
 		t.Fatalf("trial did not migrate safely: %+v %v", boot, err)
 	}
 	runUpgradeCLI(t, entry, false, "proxy", "prune")
+}
+
+// Unlike a current binary with an old version string, this frozen entry has
+// runtime dispatch but does not implement the protocol probe at all.
+func TestCandidateLegacyPreProtocolEntryRecovery(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("native Windows installer contract")
+	}
+	newer := legacyEnvironment(t)
+	outer := os.Getenv("CXP_PRE_PROTOCOL_FIXTURE")
+	if outer == "" {
+		t.Fatal("CXP_PRE_PROTOCOL_FIXTURE is required")
+	}
+	install := t.TempDir()
+	entry := filepath.Join(install, "cxp.exe")
+	root := filepath.Join(install, ".cxp-runtime")
+	copyUpgradeBinary(t, outer, entry)
+	copyUpgradeBinary(t, newer, helperruntime.VersionPath(root, "v0.1.22-rc.96", runtime.GOOS))
+	if err := os.WriteFile(filepath.Join(root, "active"), []byte("v0.1.22-rc.96\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// Normal dispatch sees the newer runtime. A disabled-runtime probe must
+	// expose the true physical entry, including its diagnostic output.
+	if got := runUpgradeCLI(t, entry, false, helperruntime.ProtocolProbeFlag); strings.TrimSpace(string(got)) != "1" {
+		t.Fatalf("newer runtime probe: %s", got)
+	}
+	err := helperruntime.ProbeProtocol(context.Background(), entry)
+	if err == nil || !strings.Contains(err.Error(), "unknown flag") || !strings.Contains(err.Error(), entry) {
+		t.Fatalf("physical entry diagnostic: %v", err)
+	}
+	config := filepath.Join(install, "config.json")
+	original := []byte(`{"profiles":[{"id":"preserved","name":"unchanged"}]}`)
+	if err := os.WriteFile(config, original, 0600); err != nil {
+		t.Fatal(err)
+	}
+	candidate := buildUpgradeCandidate(t, "v9.99.0")
+	// Explicit installation is the supported bootstrap replacement path. The
+	// ordinary updater must never skip protocol admission to mutate this entry.
+	copyUpgradeBinary(t, candidate, entry)
+	runUpgradeCLI(t, entry, false, "--cxp-install-bootstrap", "--target", entry)
+	if err := helperruntime.ProbeProtocol(context.Background(), entry); err != nil {
+		t.Fatal(err)
+	}
+	if got := runUpgradeCLI(t, entry, false, "--version"); !strings.Contains(string(got), "9.99.0") {
+		t.Fatal(string(got))
+	}
+	if got, err := os.ReadFile(config); err != nil || !bytes.Equal(got, original) {
+		t.Fatal("configuration changed", err)
+	}
+	if _, err := os.Stat(helperruntime.VersionPath(root, "v0.1.22-rc.96", runtime.GOOS)); err != nil {
+		t.Fatal("old runtime data removed", err)
+	}
 }

@@ -47,11 +47,12 @@
 -- <msg:3> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <attachment id="<uuid:1>"></attachment><p><strong>🎙️ Speech-to-text transcript (automatic; may contain recognition errors):</strong></p>
-   | <p><em>Clip: voice.ogg</em></p>
+   | <p><em><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D#cxp-transcript%<b64:1>">Clip: voice.ogg</a></em></p>
    | <p>transcribed: please list the files E2E-EDITVOICE-voice-1</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
    hosted: sha256:59cc7de6306d7a933282cb52e04846e9d8492c58de61447460d68fa65e86f9ed
    attachment: {"content":"{\"duration\":\"PT3S\",\"media\":[{\"url\":\"https://graph.microsoft.com/v1.0/chats/<chat:2>/messages/<msg:3>/hostedContents/aWQ9dm9pY2UtJTAzZA0009/$value\"}]}","contentType":"application/vnd.microsoft.card.audio","contentUrl":null,"id":"<uuid:1>","name":"voice.ogg","teamsAppId":null,"thumbnailUrl":null}
    edited 2 time(s); earlier versions:
@@ -60,7 +61,7 @@
    [version 2]
    | <p><strong>🧑‍💻 User:</strong></p>
    | <attachment id="<uuid:1>"></attachment><p><strong>🎙️ Speech-to-text transcript (automatic; may contain recognition errors):</strong></p>
-   | <p><em>Clip: voice.ogg</em></p>
+   | <p><em><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D#cxp-transcript%<b64:1>">Clip: voice.ogg</a></em></p>
    | <p>transcribed: please list the files E2E-EDITVOICE-voice-1</p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
@@ -70,8 +71,9 @@
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:5> owner (html)
    | <attachment id="<uuid:2>"></attachment><hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:5>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:5>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
    hosted: sha256:e6c18fdbe59783dfefef3595cd288bcb7ce912d36854b5e8faaef31235d9031b
    attachment: {"content":"{\"duration\":\"PT3S\",\"media\":[{\"url\":\"https://graph.microsoft.com/v1.0/chats/<chat:2>/messages/<msg:5>/hostedContents/aWQ9dm9pY2UtJTAzZA0010/$value\"}]}","contentType":"application/vnd.microsoft.card.audio","contentUrl":null,"id":"<uuid:2>","name":"quiet.ogg","teamsAppId":null,"thumbnailUrl":null}
    edited 1 time(s); earlier versions:

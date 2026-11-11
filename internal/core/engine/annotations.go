@@ -32,7 +32,7 @@ const asrLabel = "🎙️ Speech-to-text transcript (automatic; may contain reco
 // labelAdmitted queues the user label of an admitted message the helper
 // acts on. Called in the admission transaction.
 func (e *Engine) labelAdmitted(conv int64, group bool, a store.Admitted, c *classified) {
-	if c == nil || group || c.chatter || c.delegation != "" || c.in.Sender != store.SenderOwner ||
+	if c == nil || c.confirmed || group || c.chatter || c.delegation != "" || c.in.Sender != store.SenderOwner ||
 		conv == e.inboxID || hasVoice(c.msg.Files) {
 		return
 	}
@@ -235,8 +235,9 @@ func (e *Engine) freeze(ctx context.Context, conv, parkedAt int64, chat string) 
 					return err
 				}
 				err := ann.Annotate(ctx, chat, newest.ID, channel.Annotation{
-					Notice:  &channel.RichDoc{Label: labelHelper, Markdown: text},
-					Present: []string{"This chat is paused", "r " + label},
+					Notice: &channel.RichDoc{Label: labelHelper, Markdown: text},
+					Key:    fmt.Sprintf("freeze:%d", parkedAt),
+					At:     fromMS(parkedAt).Local(),
 				})
 				switch {
 				case err == nil:
@@ -254,7 +255,8 @@ func (e *Engine) freeze(ctx context.Context, conv, parkedAt int64, chat string) 
 	}
 	err := e.update(func(tx *store.Tx) error {
 		if !appended {
-			if err := e.enqueueNotice(tx, conv, fmt.Sprintf("freeze:%d", parkedAt), text); err != nil {
+			stamp := fromMS(parkedAt).Local().Format("2006-01-02 15:04:05 UTC-07:00")
+			if err := e.enqueueNotice(tx, conv, fmt.Sprintf("freeze:%d", parkedAt), text+"\n\nPaused at "+stamp); err != nil {
 				return err
 			}
 		}

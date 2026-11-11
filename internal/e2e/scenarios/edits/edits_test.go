@@ -98,13 +98,12 @@ func ask(s *harness.Scenario, chat, prompt, label string) (string, fakegraph.Mes
 // every owner message the helper acts on — a control-chat command, a
 // work-chat prompt, a `helper` command, a message with a file — is edited
 // once to start with "🧑‍💻 User:", its text and attachments kept. A
-// message the edit could lose something of (a pasted image) is left alone,
-// and the helper's own posts are never labelled.
+// pasted image retains its hosted bytes. Helper posts are never labelled.
 func TestUserLabel(t *testing.T) {
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "EDIT-LABEL", harness.Options{
 		Guarantees: []string{"F-RND-4", "R-8"},
-		Title:      "owner messages the helper acts on get the 🧑‍💻 User label by one lossless edit; images are left alone",
+		Title:      "owner messages retain their content and receive label and initial receipt in one edit",
 		Budget:     120 * time.Second,
 	})
 	defer s.Finish()
@@ -150,10 +149,10 @@ func TestUserLabel(t *testing.T) {
 	steps.WaitAnswered(s, work.ID, itok, steps.AnswerTimeout)
 	s.Settle(2*time.Second, 10*time.Second)
 	ie, _ := message(s, work.ID, im.ID)
-	s.Check("a message with a pasted image is not edited (the edit could lose the image)", ie.PatchCount == 0 && ie.Hosted == im.Hosted,
-		"0 edits", fmt.Sprintf("%d edits; text %q", ie.PatchCount, clip(ie.PlainText(), 120)))
+	s.Check("a pasted image retains its bytes while receiving the label and receipt", ie.PatchCount == 1 && ie.Hosted == im.Hosted && strings.HasPrefix(ie.Content, "<p><strong>"+userLabel) && strings.Contains(ie.Content, "Received at"),
+		"1 edit; hosted image, label and receipt preserved", fmt.Sprintf("%d edits; text %q", ie.PatchCount, clip(ie.PlainText(), 120)))
 
-	// One label edit per message, plus one receipt edit per prompt; no helper post.
+	// One edit per ordinary message includes both label and receipt; no helper post.
 	edits := map[string]int{}
 	for _, c := range []string{control.ID, work.ID} {
 		for _, r := range patches(s, c, from) {
@@ -169,22 +168,19 @@ func TestUserLabel(t *testing.T) {
 	}
 	twice := 0
 	for path, n := range edits {
-		want := 1
-		if strings.HasSuffix(path, "/messages/"+pm.ID) || strings.HasSuffix(path, "/messages/"+fe.ID) {
-			want = 2 // user label, then initial prompt receipt
-		}
-		if n != want {
+		_ = path
+		if n != 1 {
 			twice++
 		}
 	}
-	for _, m := range []fakegraph.Message{labelled, pm, hm, fe} {
+	for _, m := range []fakegraph.Message{labelled, pm, hm, fe, ie} {
 		if strings.Count(m.PlainText(), "User:") != 1 {
 			twice++
 		}
 	}
-	// Five: the four above and the `new label` command that made the work chat.
-	s.Check("each message is labelled once; prompts also get one receipt", twice == 0 && len(edits) == 5,
-		"5 messages: 2 edits per prompt, 1 per command", fmt.Sprintf("%d messages edited: %v", len(edits), edits))
+	// Six: the five above and the command that made the work chat.
+	s.Check("each ordinary message gets exactly one combined edit", twice == 0 && len(edits) == 6,
+		"6 messages: 1 edit each", fmt.Sprintf("%d messages edited: %v", len(edits), edits))
 }
 
 // 1x1 transparent PNG.

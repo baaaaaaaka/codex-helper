@@ -3,8 +3,10 @@ package teams
 import (
 	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/channel"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakegraph"
@@ -34,9 +36,9 @@ func TestAnnotateLabel(t *testing.T) {
 	if err := a.Annotate(ctx, chat, other.ID, channel.Annotation{Label: testLabel}); !errors.Is(err, channel.ErrNotEditable) {
 		t.Fatalf("coworker: %v", err)
 	}
-	// A pasted image could be lost: refused.
+	// Pasted images retain their original HTML; Graph needs no re-upload.
 	img, _ := fg.PostImageAsUser(chat, "look", []byte{0x89, 'P', 'N', 'G'})
-	if err := a.Annotate(ctx, chat, img.ID, channel.Annotation{Label: testLabel}); !errors.Is(err, channel.ErrNotEditable) {
+	if err := a.Annotate(ctx, chat, img.ID, channel.Annotation{Label: testLabel}); err != nil {
 		t.Fatalf("image: %v", err)
 	}
 	// A file reference is kept.
@@ -48,7 +50,7 @@ func TestAnnotateLabel(t *testing.T) {
 		if mm.ID == f.ID && (mm.PatchCount != 1 || len(mm.Attachments) != 1 || !strings.Contains(mm.Content, "<attachment")) {
 			t.Fatalf("file message %+v", mm)
 		}
-		if (mm.ID == other.ID || mm.ID == img.ID) && mm.PatchCount != 0 {
+		if (mm.ID == other.ID) && mm.PatchCount != 0 {
 			t.Fatalf("refused message patched: %+v", mm)
 		}
 	}
@@ -93,23 +95,24 @@ func TestAnnotateNotice(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	before := fg.Messages(chat)[0]
 	an := channel.Annotation{Notice: &channel.RichDoc{Label: "🔧 Helper", Markdown: "🧊 This chat is paused\nSend: `r s001`"},
-		Present: []string{"This chat is paused", "r s001"}}
+		Key: "freeze:1", At: time.Unix(1, 0)}
 	if err := a.Annotate(ctx, chat, sent.ID, an); err != nil {
 		t.Fatal(err)
 	}
 	got := fg.Messages(chat)[0]
 	if got.PatchCount != 1 || !strings.Contains(got.PlainText(), "done") || !strings.Contains(got.PlainText(), "This chat is paused") ||
-		len(got.Mentions) != len(fg.Messages(chat)[0].Mentions) {
+		!reflect.DeepEqual(got.Mentions, before.Mentions) {
 		t.Fatalf("notice edit %+v", got)
 	}
-	// Present: not added twice.
+	// Same pause event is not added twice.
 	if err := a.Annotate(ctx, chat, sent.ID, an); err != nil || fg.Messages(chat)[0].PatchCount != 1 {
 		t.Fatalf("second notice: %v", err)
 	}
-	// A message with a pasted image is not edited.
+	// A message with a pasted image keeps it.
 	img, _ := fg.PostImageAsUser(chat, "look", []byte{0x89, 'P', 'N', 'G'})
-	if err := a.Annotate(ctx, chat, img.ID, an); !errors.Is(err, channel.ErrNotEditable) {
+	if err := a.Annotate(ctx, chat, img.ID, an); err != nil {
 		t.Fatalf("image notice: %v", err)
 	}
 	noViolations(t, fg)

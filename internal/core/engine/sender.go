@@ -478,6 +478,18 @@ func (e *Engine) send(ctx context.Context, r store.Outbox, chat, token string, f
 	if appended {
 		err = e.appendConfirmation(ctx, r, chat, p)
 		if errors.Is(err, channel.ErrNotEditable) || errors.Is(err, channel.ErrNotFound) {
+			// The initial receipt normally owns the label. If it must be posted
+			// separately, restore the existing cosmetic label path.
+			label, _ := e.confirmationLabel(r.ConvID)
+			if ann, ok := e.annotator(); ok && label != "" {
+				target := r.AppendTo
+				e.queueEdit(r.ConvID, chatEdit{key: "label:" + target, what: "user label", run: func(ctx context.Context, chat string) error {
+					if err := e.waitRead(ctx, editReadWait); err != nil {
+						return err
+					}
+					return ann.Annotate(ctx, chat, target, channel.Annotation{Label: labelUser})
+				}})
+			}
 			// Persist the fallback before POST, including for channels without edits.
 			err = e.persist(ctx, "select separate confirmation", func(tx *store.Tx) error { return tx.SeparateConfirmation(r.ID) })
 			if err == nil {

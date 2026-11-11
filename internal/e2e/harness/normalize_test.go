@@ -40,3 +40,15 @@ func TestUnifiedDiffShowsChangedLines(t *testing.T) {
 		}
 	}
 }
+
+func TestNormalizerPreservesReceiptLinksAndPauseIdentity(t *testing.T) {
+	n := (*Scenario)(nil).newNormalizer()
+	input := `<p>Received at <a href="https://teams/x">2026-11-11 15:06:35 UTC+08:00</a></p> ` +
+		`<p>Paused at 2026-11-11 15:06:36 UTC+08:00</p> #cxp-freeze%3A111 #cxp-freeze%3A222 #cxp-freeze%3A111`
+	got := n.norm(input)
+	for _, want := range []string{`Received at <a href="https://teams/x"><event-time></a>`, `Paused at <event-time>`, `#cxp-freeze%3A<pause:1> #cxp-freeze%3A<pause:2> #cxp-freeze%3A<pause:1>`} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("normalizer hid annotation structure: %s", got)
+		}
+	}
+}

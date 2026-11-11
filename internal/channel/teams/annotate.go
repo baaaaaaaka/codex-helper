@@ -2,9 +2,11 @@ package teams
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"golang.org/x/net/html"
 	"net/http"
 	"regexp"
 	"strings"
@@ -16,23 +18,10 @@ import (
 // (annotateIncomingUserMessage, annotateIncomingUserMessageWithASRTranscripts,
 // appendFreezeNoticeToLatestMessage): one GET of the message, then one
 // PATCH that sends the message's attachments and mentions back unchanged.
-//
-// The user label is added only when the edit is lossless: no hosted
-// images, no cards, and every attachment a reference whose <attachment>
-// placeholder is in the body exactly once (messageAttachmentContextLosslessPatchable).
-// The freeze notice additionally accepts the formula images this helper
-// renders (alt "Rendered TeX formula", hostedContentOnlyMessageContext).
-// The transcript edit keeps the voice card and adds its placeholder when
-// the body lacks it.
-
-var (
-	attachmentTagRE    = regexp.MustCompile(`(?i)<attachment\b[^>]*\bid\s*=\s*"([^"]*)"`)
-	imgTagRE           = regexp.MustCompile(`(?i)<img\b[^>]*>`)
-	imgAltRE           = regexp.MustCompile(`(?i)\balt\s*=\s*"([^"]*)"`)
-	leadingParagraphRE = regexp.MustCompile(`(?is)^\s*<p\b[^>]*>.*?</p\s*>`)
-)
-
-const formulaAlt = "Rendered TeX formula"
+// Existing hosted images are preserved by retaining their original HTML.
+// Cards remain restricted to the supported reference and voice/video forms.
+var leadingParagraphRE = regexp.MustCompile(`(?is)^\s*<p\b[^>]*>.*?</p\s*>`)
+var splitLabelRE = regexp.MustCompile(`^ \[part [1-9][0-9]*/[1-9][0-9]*\]:$`)
 
 type annotatedMessage struct {
 	MessageType string  `json:"messageType"`
@@ -84,14 +73,21 @@ func (a *Adapter) Annotate(ctx context.Context, chat, id string, an channel.Anno
 	case an.Confirmation != nil:
 		next, err = confirmationEdit(chat, id, content, isHTML, atts, an)
 	case len(an.Clips) > 0:
-		next, err = transcriptEdit(content, isHTML, atts, an)
+		next, err = transcriptEdit(chat, id, content, isHTML, atts, an)
 	case an.Notice != nil:
+		if an.Key == "" {
+			return fmt.Errorf("notice needs an event key: %w", channel.ErrNotEditable)
+		}
+		an.Key = annotationLink(chat, id, an.Key)
 		next, err = a.noticeEdit(ctx, content, isHTML, atts, an)
 	default:
 		next, err = labelEdit(content, isHTML, atts, an.Label)
 	}
 	if err != nil || next == "" {
 		return err
+	}
+	if len(next)+markerReserve > maxPartBytes {
+		return fmt.Errorf("annotation exceeds message size: %w", channel.ErrNotEditable)
 	}
 	in := map[string]any{"body": map[string]string{"contentType": "html", "content": next}}
 	if len(m.Attachments) > 0 {
@@ -121,8 +117,42 @@ func hasLabel(content, label string) bool {
 	if label == "" {
 		return false
 	}
-	text := strings.TrimSpace(plainText(content))
-	return strings.HasPrefix(text, label+":") || strings.HasPrefix(text, label+" [part ")
+	matches := func(text string) bool {
+		text = strings.TrimSpace(text)
+		return text == label+":" || strings.HasPrefix(text, label) && splitLabelRE.MatchString(strings.TrimPrefix(text, label))
+	}
+	if !strings.HasPrefix(strings.TrimSpace(content), "<") {
+		first, _, _ := strings.Cut(content, "\n")
+		return matches(first)
+	}
+	// Read the first visible block through harmless wrappers. Never accept a
+	// code example, quote, or partial first paragraph as the helper's label.
+	z := html.NewTokenizer(strings.NewReader(content))
+	var text strings.Builder
+	for {
+		switch z.Next() {
+		case html.ErrorToken:
+			return false
+		case html.TextToken:
+			text.Write(z.Text())
+		case html.StartTagToken, html.SelfClosingTagToken:
+			switch z.Token().Data {
+			case "blockquote", "pre", "code", "img", "attachment", "hr":
+				return false
+			case "br":
+				if strings.TrimSpace(text.String()) != "" {
+					return matches(text.String())
+				}
+			}
+		case html.EndTagToken:
+			switch z.Token().Data {
+			case "p", "div":
+				if strings.TrimSpace(text.String()) != "" {
+					return matches(text.String())
+				}
+			}
+		}
+	}
 }
 
 // asHTML is a body as HTML: a text body is escaped, line breaks kept.
@@ -146,73 +176,51 @@ func isMediaCard(at graphAttachment) bool {
 	return false
 }
 
-// attachmentContext: the message carries attachments, hosted images or
-// attachment placeholders (messageHasTeamsAttachmentContext).
-func attachmentContext(content string, atts []graphAttachment) bool {
-	return len(atts) > 0 || hostedRE.MatchString(content) || strings.Contains(strings.ToLower(content), "<attachment")
+// attachmentIDs reads only actual placeholders, decoding HTML attributes.
+// The original HTML is never reserialized. Images need no upload or rewrite.
+func attachmentIDs(content string) map[string]int {
+	ids := map[string]int{}
+	z := html.NewTokenizer(strings.NewReader(content))
+	for {
+		switch z.Next() {
+		case html.ErrorToken:
+			return ids
+		case html.StartTagToken, html.SelfClosingTagToken:
+			t := z.Token()
+			if t.Data == "attachment" {
+				ids[strings.TrimSpace(attr(t, "id"))]++
+			}
+		}
+	}
 }
 
-// losslessAttachments: every attachment is a reference shown by exactly
-// one placeholder, and there are no hosted images or cards
-// (messageAttachmentContextLosslessPatchable).
+func attr(t html.Token, key string) string {
+	for _, a := range t.Attr {
+		if a.Key == key {
+			return a.Val
+		}
+	}
+	return ""
+}
+
+// Every supported attachment must retain its placeholder. Inline
+// images are already in the unchanged body and do not make an edit unsafe.
 func losslessAttachments(content string, atts []graphAttachment) bool {
-	if len(atts) == 0 || hostedRE.MatchString(content) {
-		return false
-	}
-	ids := attachmentTagRE.FindAllStringSubmatch(content, -1)
-	if len(ids) == 0 || len(ids) != len(atts) {
-		return false
-	}
-	seen := map[string]bool{}
-	for _, m := range ids {
-		id := strings.TrimSpace(m[1])
-		if id == "" || seen[id] {
-			return false
-		}
-		seen[id] = true
-	}
+	ids := attachmentIDs(content)
 	for _, at := range atts {
-		if hostedRE.MatchString(at.Content) {
+		id := strings.TrimSpace(at.ID)
+		if id == "" || ids[id] < 1 {
 			return false
 		}
+		ids[id]--
 		switch contentType(at) {
 		case "reference", "messagereference", "forwardedmessagereference":
 		default:
 			return false
 		}
-		if !seen[strings.TrimSpace(at.ID)] {
-			return false
-		}
 	}
-	return true
-}
-
-// formulaImagesOnly: the only attachment context is hosted images, each an
-// image this helper rendered for a formula (hostedContentOnlyMessageContext).
-func formulaImagesOnly(content string, atts []graphAttachment) bool {
-	if len(atts) > 0 || strings.Contains(strings.ToLower(content), "<attachment") {
-		return false
-	}
-	ids := hostedRE.FindAllStringSubmatch(content, -1)
-	if len(ids) == 0 {
-		return false
-	}
-	covered := map[string]bool{}
-	for _, tag := range imgTagRE.FindAllString(content, -1) {
-		srcs := hostedRE.FindAllStringSubmatch(tag, -1)
-		if len(srcs) == 0 {
-			continue
-		}
-		alt := imgAltRE.FindStringSubmatch(tag)
-		if alt == nil || strings.TrimSpace(alt[1]) != formulaAlt {
-			return false
-		}
-		for _, s := range srcs {
-			covered[s[1]] = true
-		}
-	}
-	for _, id := range ids {
-		if !covered[id[1]] {
+	for _, count := range ids {
+		if count != 0 {
 			return false
 		}
 	}
@@ -229,7 +237,7 @@ func labelEdit(content string, isHTML bool, atts []graphAttachment, label string
 			return "", fmt.Errorf("a voice or video message gets its transcript instead: %w", channel.ErrNotEditable)
 		}
 	}
-	if attachmentContext(content, atts) {
+	if len(atts) > 0 || isHTML {
 		if !losslessAttachments(content, atts) || !isHTML {
 			return "", fmt.Errorf("the edit could lose an attachment: %w", channel.ErrNotEditable)
 		}
@@ -241,31 +249,35 @@ func labelEdit(content string, isHTML bool, atts []graphAttachment, label string
 
 // transcriptEdit adds the transcripts of a voice message
 // (userAnnotatedASRTranscriptMessageHTML).
-func transcriptEdit(content string, isHTML bool, atts []graphAttachment, an channel.Annotation) (string, error) {
+func transcriptEdit(chat, id, content string, isHTML bool, atts []graphAttachment, an channel.Annotation) (string, error) {
 	if content != "" {
 		content = asHTML(content, isHTML)
 	}
-	if an.ClipsLabel != "" && strings.Contains(plainText(content), an.ClipsLabel) {
+	clips := clipsHTML(an.ClipsLabel, an.Clips)
+	link := annotationLink(chat, id, fmt.Sprintf("transcript:%x", sha256.Sum256([]byte(clips))))
+	if hasAnnotationStamp(content, link, "Clip", "") || hasAnnotationStamp(content, link, "Clip:", "") {
+		if an.Label != "" && !hasLabel(content, an.Label) {
+			return labelHTML(an.Label) + content, nil
+		}
 		return "", nil
 	}
+	clips = strings.Replace(clips, "<em>", `<em><a href="`+esc(link)+`">`, 1)
+	clips = strings.Replace(clips, "</em>", "</a></em>", 1)
 	var b strings.Builder
 	if an.Label != "" && !hasLabel(content, an.Label) {
 		b.WriteString(labelHTML(an.Label))
 	}
 	b.WriteString(content)
-	shown := map[string]bool{}
-	for _, m := range attachmentTagRE.FindAllStringSubmatch(content, -1) {
-		shown[strings.TrimSpace(m[1])] = true
-	}
+	shown := attachmentIDs(content)
 	for _, at := range atts {
 		id := strings.TrimSpace(at.ID)
-		if !isMediaCard(at) || id == "" || shown[id] {
+		if !isMediaCard(at) || id == "" || shown[id] > 0 {
 			continue
 		}
-		shown[id] = true
+		shown[id] = 1
 		b.WriteString(`<attachment id="` + esc(id) + `"></attachment>`)
 	}
-	b.WriteString(clipsHTML(an.ClipsLabel, an.Clips))
+	b.WriteString(clips)
 	return b.String(), nil
 }
 
@@ -301,20 +313,13 @@ func (a *Adapter) noticeEdit(ctx context.Context, content string, isHTML bool, a
 	if content == "" {
 		return "", fmt.Errorf("the message is empty: %w", channel.ErrNotEditable)
 	}
-	if len(an.Present) > 0 {
-		text := strings.Join(strings.Fields(plainText(content)), " ")
-		all := true
-		for _, p := range an.Present {
-			if !strings.Contains(text, strings.Join(strings.Fields(p), " ")) {
-				all = false
-				break
-			}
-		}
-		if all {
-			return "", nil
-		}
+	if an.Key == "" {
+		return "", fmt.Errorf("notice needs an event identity: %w", channel.ErrNotEditable)
 	}
-	if attachmentContext(content, atts) && !losslessAttachments(content, atts) && !formulaImagesOnly(content, atts) {
+	if hasAnnotationStamp(content, an.Key, "Paused at", "") {
+		return "", nil
+	}
+	if !losslessAttachments(content, atts) {
 		return "", fmt.Errorf("the edit could lose an attachment: %w", channel.ErrNotEditable)
 	}
 	doc := *an.Notice
@@ -335,5 +340,5 @@ func (a *Adapter) noticeEdit(ctx context.Context, content string, isHTML bool, a
 	if err := json.Unmarshal([]byte(parts[0].Body), &p); err != nil || len(p.Hosted) > 0 {
 		return "", fmt.Errorf("the notice cannot be added by an edit: %w", channel.ErrNotEditable)
 	}
-	return asHTML(content, isHTML) + "<p>&nbsp;</p>" + p.Body.Content, nil
+	return asHTML(content, isHTML) + "<p>&nbsp;</p>" + p.Body.Content + timeStamp("Paused at", an.Key, an.At), nil
 }

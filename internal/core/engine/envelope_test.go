@@ -188,7 +188,7 @@ func TestScreen(t *testing.T) {
 		{"6 media", channel.InboundMsg{Files: append(files(channel.FileImage, 4), files(channel.FileVoice, 2)...)}, textTooManyHosted, "q"},
 		{"5 files", channel.InboundMsg{Files: append(files(channel.FileDoc, 5), files(channel.FileUnsupported, 3)...)}, "", ""},
 		{"6 files", channel.InboundMsg{Files: files(channel.FileDoc, 6)}, textTooManyFiles, "q"},
-		{"4 quotes", channel.InboundMsg{Quotes: make([]channel.Quote, 4)}, textTooManyQuotes, "q"},
+		{"many quotes", channel.InboundMsg{Quotes: make([]channel.Quote, 20)}, "", ""},
 		{"key", channel.InboundMsg{Text: "use sk-1234567890abcdef1234", Files: files(channel.FileImage, 9)}, textRawAPIKey, ""},
 	} {
 		c := prompt(tc.msg)

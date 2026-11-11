@@ -5,6 +5,7 @@ No production contract code is copied from HEAD or patched in the old source.
 The published-artifact release gate additionally runs the unmodified old binary.
 """
 import argparse
+import hashlib
 import io
 import os
 from pathlib import Path
@@ -19,11 +20,26 @@ NATIVE_COMMIT = "b1cd1dd5b82fc333f555dc0544b7a5bb75e2f56e"  # v0.1.22-rc.104
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--scratch", required=True)
-    parser.add_argument("--baseline", choices=("legacy", "native"), default="legacy")
+    parser.add_argument("--baseline", choices=("legacy", "native", "pre-protocol"), default="legacy")
     parser.add_argument("--archive", default="")
     args = parser.parse_args()
     repo = Path(__file__).resolve().parents[2]
     scratch = Path(args.scratch).resolve()
+    if args.baseline == "pre-protocol":
+        if os.name != "nt":
+            raise RuntimeError("pre-protocol binary fixture requires Windows")
+        binary = scratch / "rc83.exe"
+        expected = "5ab3b226f1891ca619d63de8c9344b8d692eb7cde31c500806d22742725d2897"
+        url = "https://github.com/baaaaaaaka/codex-helper/releases/download/v0.1.22-rc.83/codex-proxy_0.1.22-rc.83_windows_amd64.exe"
+        digest = hashlib.sha256()
+        with urllib.request.urlopen(url, timeout=120) as response, binary.open("wb") as output:
+            while chunk := response.read(1 << 20):
+                digest.update(chunk)
+                output.write(chunk)
+        if digest.hexdigest() != expected:
+            raise RuntimeError("pre-protocol release fixture checksum mismatch")
+        print(binary, flush=True)
+        return
     commit, label = (COMMIT, "rc96") if args.baseline == "legacy" else (NATIVE_COMMIT, "rc104")
     archive_path = args.archive or os.environ.get("CXP_LEGACY_ARCHIVE" if args.baseline == "legacy" else "CXP_NATIVE_ARCHIVE", "")
     source = scratch / (label + "-source")

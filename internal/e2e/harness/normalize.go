@@ -61,12 +61,17 @@ type normalizer struct {
 
 type exactRule struct{ from, to string }
 
+// Receipt times share one second under arbitrary scheduler timing. Their
+// exact format, persistence and zone are verified by dedicated adapter tests.
+var receiptTimeRE = regexp.MustCompile(`((?:Received|Paused) at (?:<a [^>]*>)?)\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC[+-]\d{2}:\d{2}`)
+
 // minuteRE is a whole minute-resolution time (see <minute>).
 var minuteRE = regexp.MustCompile(`^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$`)
 
 // genericRules are tried left to right on every text (first match wins
 // at a position); each names the placeholder kind.
 var genericRules = []struct{ kind, pattern string }{
+	{"pause", `#cxp-freeze%3A[0-9]+`},
 	{"chat", `19:[A-Za-z0-9_\-]+@(?:thread\.v2|thread\.tacv2|unq\.gbl\.spaces)`},
 	{"chaturl", `19%3[Aa][A-Za-z0-9_\-]+%40(?:thread\.v2|thread\.tacv2|unq\.gbl\.spaces)`},
 	{"uuid", `(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b`},
@@ -163,6 +168,7 @@ func (n *normalizer) norm(text string) string {
 	if text == "" {
 		return ""
 	}
+	text = receiptTimeRE.ReplaceAllString(text, "${1}<event-time>")
 	return n.re.ReplaceAllStringFunc(text, func(m string) string {
 		if p, ok := n.ids[m]; ok {
 			return p
@@ -178,6 +184,8 @@ func (n *normalizer) norm(text string) string {
 		switch {
 		case strings.HasPrefix(kind, "exact:"):
 			return strings.TrimPrefix(kind, "exact:")
+		case kind == "pause":
+			return "#cxp-freeze%3A" + n.placeholder("pause", "\x00"+m)
 		case kind == "keep":
 			return m
 		case kind == "pid":

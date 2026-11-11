@@ -100,13 +100,11 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Plain repeat E2E-DUPEDGE-plain-2</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Plain repeat E2E-DUPEDGE-plain-2</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Plain repeat E2E-DUPEDGE-plain-2</p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
@@ -118,25 +116,21 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Plain repeat E2E-DUPEDGE-plain-2</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:5>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>Duplicate request ignored (same text within 3 minutes). Send <code>helper retry</code> to run it again.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:5>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Plain repeat E2E-DUPEDGE-plain-2</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Plain repeat E2E-DUPEDGE-plain-2</p>
 -- <msg:6> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Plain repeat E2E-DUPEDGE-plain-2</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:6>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:6>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Plain repeat E2E-DUPEDGE-plain-2</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Plain repeat E2E-DUPEDGE-plain-2</p>
 -- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
@@ -148,13 +142,11 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>This one fails first E2E-DUPEDGE-fails-1</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:8>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:8>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>This one fails first E2E-DUPEDGE-fails-1</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>This one fails first E2E-DUPEDGE-fails-1</p>
 -- <msg:9> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
@@ -164,13 +156,11 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>This one fails first E2E-DUPEDGE-fails-1</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:10>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:10>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>This one fails first E2E-DUPEDGE-fails-1</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>This one fails first E2E-DUPEDGE-fails-1</p>
 -- <msg:11> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
@@ -179,26 +169,38 @@
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:12> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Look at this E2E-DUPEDGE-image-3</p>
    | <p><img src="https://graph.microsoft.com/v1.0/chats/<chat:2>/messages/<msg:12>/hostedContents/aWQ9eF8wLXd1cy1kMTEtZTJl/$value" width="64" height="64" alt="image" itemid="0"></p>
-   hosted: sha256:4ff6ab670a58c14270e034e2090d9a432caa263a14e0a25785386b0c12f880b5
--- <msg:13> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <hr/>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:14> helper (html)
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:12>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   hosted: sha256:4ff6ab670a58c14270e034e2090d9a432caa263a14e0a25785386b0c12f880b5
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>Look at this E2E-DUPEDGE-image-3</p>
+   | <p><img src="https://graph.microsoft.com/v1.0/chats/<chat:2>/messages/<msg:12>/hostedContents/aWQ9eF8wLXd1cy1kMTEtZTJl/$value" width="64" height="64" alt="image" itemid="0"></p>
+-- <msg:13> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-DUPEDGE-image-3</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
--- <msg:15> owner (html)
+-- <msg:14> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Look at this E2E-DUPEDGE-image-3</p>
-   | <p><img src="https://graph.microsoft.com/v1.0/chats/<chat:2>/messages/<msg:15>/hostedContents/aWQ9eF8wLXd1cy1kMTEtZTJl/$value" width="64" height="64" alt="image" itemid="0"></p>
-   hosted: sha256:32ed92064e32d1f655e7255bb6cfa930111ad378a405fa6470d5ebbf2e97c4c6
--- <msg:16> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p><img src="https://graph.microsoft.com/v1.0/chats/<chat:2>/messages/<msg:14>/hostedContents/aWQ9eF8wLXd1cy1kMTEtZTJl/$value" width="64" height="64" alt="image" itemid="0"></p>
+   | <hr/>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:17> helper (html)
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:14>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   hosted: sha256:32ed92064e32d1f655e7255bb6cfa930111ad378a405fa6470d5ebbf2e97c4c6
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>Look at this E2E-DUPEDGE-image-3</p>
+   | <p><img src="https://graph.microsoft.com/v1.0/chats/<chat:2>/messages/<msg:14>/hostedContents/aWQ9eF8wLXd1cy1kMTEtZTJl/$value" width="64" height="64" alt="image" itemid="0"></p>
+-- <msg:15> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-DUPEDGE-image-3</p>
    | <hr/>
@@ -227,13 +229,11 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Plain repeat E2E-DUPEDGE-plain-2</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:3>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:3>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Plain repeat E2E-DUPEDGE-plain-2</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Plain repeat E2E-DUPEDGE-plain-2</p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>

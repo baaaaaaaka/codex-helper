@@ -1954,7 +1954,7 @@ func (teamsServiceWindowsTaskBackend) Run(ctx context.Context, action string) ([
 		return teamsServiceRunPowerShell(ctx, teamsServiceWindowsEnableTasksPowerShell())
 	case "disable":
 		resolveWatchdog := teamsServiceWindowsResolveWatchdogTaskPowerShell()
-		return teamsServiceRunPowerShell(ctx, resolveWatchdog+"if ($null -ne $watchdogTask) { Disable-ScheduledTask -TaskName "+watchdogTask+" | Out-Null }; Disable-ScheduledTask -TaskName "+task+" | Out-Null")
+		return teamsServiceRunPowerShell(ctx, resolveWatchdog+"if ($null -ne $watchdogTask) { Disable-ScheduledTask -TaskName "+watchdogTask+" -ErrorAction Stop | Out-Null }; Disable-ScheduledTask -TaskName "+task+" -ErrorAction Stop | Out-Null")
 	case "status":
 		resolveWatchdog := teamsServiceWindowsResolveWatchdogTaskPowerShell()
 		return teamsServiceRunPowerShell(ctx, "$task = Get-ScheduledTask -TaskName "+task+"; $info = Get-ScheduledTaskInfo -TaskName "+task+"; $task | Format-List TaskName,State; $info | Format-List LastRunTime,LastTaskResult,NextRunTime; "+resolveWatchdog+"if ($null -ne $watchdogTask) { $watchdogInfo = Get-ScheduledTaskInfo -TaskName "+watchdogTask+"; $watchdogTask | Format-List TaskName,State; $watchdogInfo | Format-List LastRunTime,LastTaskResult,NextRunTime } else { Write-Output 'Watchdog task not installed' }")
@@ -1962,11 +1962,11 @@ func (teamsServiceWindowsTaskBackend) Run(ctx context.Context, action string) ([
 		return teamsServiceRunPowerShell(ctx, teamsServiceWindowsStartTasksPowerShell())
 	case "stop":
 		cleanupBridgeChildren := teamsServiceWindowsStopBridgeChildrenPowerShell(task)
-		return teamsServiceRunPowerShell(ctx, "Stop-ScheduledTask -TaskName "+watchdogTask+" -ErrorAction SilentlyContinue; Stop-ScheduledTask -TaskName "+task+" -ErrorAction SilentlyContinue; "+cleanupBridgeChildren)
+		return teamsServiceRunPowerShell(ctx, teamsServiceWindowsStopTasksPowerShell()+cleanupBridgeChildren)
 	case "restart":
 		resolveWatchdog := teamsServiceWindowsResolveWatchdogTaskPowerShell()
 		cleanupBridgeChildren := teamsServiceWindowsStopBridgeChildrenPowerShell(task)
-		return teamsServiceRunPowerShell(ctx, teamsServiceStartScheduledTaskIfStoppedFunctionPowerShell()+teamsServiceWaitScheduledTaskStoppedFunctionPowerShell()+"Stop-ScheduledTask -TaskName "+task+" -ErrorAction SilentlyContinue; "+cleanupBridgeChildren+"Enable-ScheduledTask -TaskName "+task+" | Out-Null; if (-not (Wait-CodexHelperScheduledTaskStopped "+task+" 20)) { throw 'Teams bridge Scheduled Task did not stop before restart' }; "+resolveWatchdog+"if ($null -ne $watchdogTask) { Enable-ScheduledTask -TaskName "+watchdogTask+" | Out-Null }; Start-CodexHelperScheduledTaskIfStopped "+task+"; if ($null -ne $watchdogTask) { Start-CodexHelperScheduledTaskIfStopped "+watchdogTask+" }")
+		return teamsServiceRunPowerShell(ctx, teamsServiceStartScheduledTaskIfStoppedFunctionPowerShell()+teamsServiceWaitScheduledTaskStoppedFunctionPowerShell()+"Stop-ScheduledTask -TaskName "+task+" -ErrorAction Stop; "+cleanupBridgeChildren+"Enable-ScheduledTask -TaskName "+task+" -ErrorAction Stop | Out-Null; if (-not (Wait-CodexHelperScheduledTaskStopped "+task+" 20)) { throw 'Teams bridge Scheduled Task did not stop before restart' }; "+resolveWatchdog+"if ($null -ne $watchdogTask) { Enable-ScheduledTask -TaskName "+watchdogTask+" -ErrorAction Stop | Out-Null }; Start-CodexHelperScheduledTaskIfStopped "+task+"; if ($null -ne $watchdogTask) { Start-CodexHelperScheduledTaskIfStopped "+watchdogTask+" }")
 	default:
 		return nil, fmt.Errorf("unsupported Teams service action for Task Scheduler: %s", action)
 	}
@@ -1977,20 +1977,28 @@ func (teamsServiceWindowsTaskBackend) RunPrimary(ctx context.Context, action str
 	cleanupBridgeChildren := teamsServiceWindowsStopBridgeChildrenPowerShell(task)
 	switch action {
 	case "enable":
-		return teamsServiceRunPowerShell(ctx, "Enable-ScheduledTask -TaskName "+task+" | Out-Null")
+		return teamsServiceRunPowerShell(ctx, "Enable-ScheduledTask -TaskName "+task+" -ErrorAction Stop | Out-Null")
 	case "disable":
-		return teamsServiceRunPowerShell(ctx, "Disable-ScheduledTask -TaskName "+task+" | Out-Null")
+		return teamsServiceRunPowerShell(ctx, "Disable-ScheduledTask -TaskName "+task+" -ErrorAction Stop | Out-Null")
 	case "status":
 		return teamsServiceRunPowerShell(ctx, "$task = Get-ScheduledTask -TaskName "+task+"; $info = Get-ScheduledTaskInfo -TaskName "+task+"; $task | Format-List TaskName,State; $info | Format-List LastRunTime,LastTaskResult,NextRunTime")
 	case "start":
-		return teamsServiceRunPowerShell(ctx, teamsServiceStartScheduledTaskIfStoppedFunctionPowerShell()+"Enable-ScheduledTask -TaskName "+task+" | Out-Null; $bridgeTask = Get-ScheduledTask -TaskName "+task+"; if ($bridgeTask.State -ne 'Running') { "+cleanupBridgeChildren+"Start-CodexHelperScheduledTaskIfStopped "+task+" }")
+		return teamsServiceRunPowerShell(ctx, teamsServiceStartScheduledTaskIfStoppedFunctionPowerShell()+"Enable-ScheduledTask -TaskName "+task+" -ErrorAction Stop | Out-Null; $bridgeTask = Get-ScheduledTask -TaskName "+task+"; if ($bridgeTask.State -ne 'Running') { "+cleanupBridgeChildren+"Start-CodexHelperScheduledTaskIfStopped "+task+" }")
 	case "stop":
-		return teamsServiceRunPowerShell(ctx, "Stop-ScheduledTask -TaskName "+task+" -ErrorAction SilentlyContinue; "+cleanupBridgeChildren)
+		return teamsServiceRunPowerShell(ctx, "Stop-ScheduledTask -TaskName "+task+" -ErrorAction Stop; "+cleanupBridgeChildren)
 	case "restart":
-		return teamsServiceRunPowerShell(ctx, teamsServiceStartScheduledTaskIfStoppedFunctionPowerShell()+teamsServiceWaitScheduledTaskStoppedFunctionPowerShell()+"Stop-ScheduledTask -TaskName "+task+" -ErrorAction SilentlyContinue; "+cleanupBridgeChildren+"Enable-ScheduledTask -TaskName "+task+" | Out-Null; if (-not (Wait-CodexHelperScheduledTaskStopped "+task+" 20)) { throw 'Teams bridge Scheduled Task did not stop before restart' }; Start-CodexHelperScheduledTaskIfStopped "+task)
+		return teamsServiceRunPowerShell(ctx, teamsServiceStartScheduledTaskIfStoppedFunctionPowerShell()+teamsServiceWaitScheduledTaskStoppedFunctionPowerShell()+"Stop-ScheduledTask -TaskName "+task+" -ErrorAction Stop; "+cleanupBridgeChildren+"Enable-ScheduledTask -TaskName "+task+" -ErrorAction Stop | Out-Null; if (-not (Wait-CodexHelperScheduledTaskStopped "+task+" 20)) { throw 'Teams bridge Scheduled Task did not stop before restart' }; Start-CodexHelperScheduledTaskIfStopped "+task)
 	default:
 		return nil, fmt.Errorf("unsupported primary Teams service action for Task Scheduler: %s", action)
 	}
+}
+
+// Resolve the optional watchdog before stopping it. Enumerating tasks distinguishes
+// an absent task from a denied task operation, unlike SilentlyContinue.
+func teamsServiceWindowsStopTasksPowerShell() string {
+	watchdog := powershellSingleQuote(teamsServiceWindowsWatchdogTaskName)
+	bridge := powershellSingleQuote(teamsServiceWindowsTaskName)
+	return "$watchdogTask = Get-ScheduledTask -ErrorAction Stop | Where-Object { $_.TaskName -eq " + watchdog + " -and $_.TaskPath -eq '\\' }; if ($null -ne $watchdogTask) { Stop-ScheduledTask -TaskName " + watchdog + " -ErrorAction Stop; " + teamsServiceWindowsStopBridgeChildrenPowerShell(watchdog) + " }; Stop-ScheduledTask -TaskName " + bridge + " -ErrorAction Stop; "
 }
 
 func teamsServiceWindowsResolveWatchdogTaskPowerShell() string {
@@ -2002,7 +2010,7 @@ func teamsServiceWindowsEnableTasksPowerShell() string {
 	task := powershellSingleQuote(teamsServiceWindowsTaskName)
 	watchdogTask := powershellSingleQuote(teamsServiceWindowsWatchdogTaskName)
 	resolveWatchdog := teamsServiceWindowsResolveWatchdogTaskPowerShell()
-	return "Enable-ScheduledTask -TaskName " + task + " | Out-Null; " + resolveWatchdog + "if ($null -ne $watchdogTask) { Enable-ScheduledTask -TaskName " + watchdogTask + " | Out-Null }"
+	return "Enable-ScheduledTask -TaskName " + task + " -ErrorAction Stop | Out-Null; " + resolveWatchdog + "if ($null -ne $watchdogTask) { Enable-ScheduledTask -TaskName " + watchdogTask + " -ErrorAction Stop | Out-Null }"
 }
 
 func teamsServiceWindowsStartTasksPowerShell() string {
@@ -2011,9 +2019,9 @@ func teamsServiceWindowsStartTasksPowerShell() string {
 	resolveWatchdog := teamsServiceWindowsResolveWatchdogTaskPowerShell()
 	cleanupBridgeChildren := teamsServiceWindowsStopBridgeChildrenPowerShell(task)
 	return teamsServiceStartScheduledTaskIfStoppedFunctionPowerShell() +
-		"Enable-ScheduledTask -TaskName " + task + " | Out-Null; " +
+		"Enable-ScheduledTask -TaskName " + task + " -ErrorAction Stop | Out-Null; " +
 		resolveWatchdog +
-		"if ($null -ne $watchdogTask) { Enable-ScheduledTask -TaskName " + watchdogTask + " | Out-Null }; " +
+		"if ($null -ne $watchdogTask) { Enable-ScheduledTask -TaskName " + watchdogTask + " -ErrorAction Stop | Out-Null }; " +
 		"$bridgeTask = Get-ScheduledTask -TaskName " + task + "; " +
 		"if ($bridgeTask.State -ne 'Running') { " + cleanupBridgeChildren + "Start-CodexHelperScheduledTaskIfStopped " + task + " }; " +
 		"if ($null -ne $watchdogTask) { Start-CodexHelperScheduledTaskIfStopped " + watchdogTask + " }"
@@ -2059,12 +2067,12 @@ func teamsServiceWindowsStopBridgeChildrenPowerShell(taskNameExpr string) string
 	parts := []string{
 		`function Convert-CodexHelperSingleQuotedPowerShellLiteral([string]$value) { if ($null -eq $value) { return '' }; return $value.Replace("''", "'") };`,
 		`function Convert-CodexHelperCommandForMatch([string]$value) { if ([string]::IsNullOrWhiteSpace($value)) { return '' }; $norm = $value.Replace([char]34, ' ').Replace([char]39, ' '); $norm = [regex]::Replace($norm, '\s+', ' ').Trim(); return ' ' + $norm + ' ' };`,
-		`function Test-CodexHelperTeamsBridgeCommand([string]$cmd, [string]$expectedArgs) { if ([string]::IsNullOrWhiteSpace($cmd) -or [string]::IsNullOrWhiteSpace($expectedArgs)) { return $false }; $norm = Convert-CodexHelperCommandForMatch $cmd; $expected = Convert-CodexHelperCommandForMatch $expectedArgs; return ($norm -match '(?i)\steams\s+(run|listen)\s' -and $norm -notmatch '(?i)\s--once\s' -and $norm.IndexOf($expected, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) };`,
+		`function Test-CodexHelperTeamsBridgeCommand([string]$cmd, [string]$expectedArgs) { if ([string]::IsNullOrWhiteSpace($cmd) -or [string]::IsNullOrWhiteSpace($expectedArgs)) { return $false }; $norm = Convert-CodexHelperCommandForMatch $cmd; $expected = Convert-CodexHelperCommandForMatch $expectedArgs; return ($norm -match '(?i)\steams\s+(run|listen|service\s+watchdog)\s' -and $norm -notmatch '(?i)\s--once\s' -and $norm.IndexOf($expected, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) };`,
 		`function Set-CodexHelperCleanupExeCandidate($identity, [string]$candidate) { if ([string]::IsNullOrWhiteSpace($candidate) -or -not [string]::IsNullOrWhiteSpace([string]$identity['Exe'])) { return }; try { $full = [IO.Path]::GetFullPath($candidate); $leaf = [IO.Path]::GetFileName($full); if (($leaf -ieq 'codex-proxy.exe' -or $leaf -ieq 'cxp.exe') -and (Test-Path -LiteralPath $full)) { $identity['Exe'] = $full } } catch { } };`,
 		`function Add-CodexHelperCleanupIdentity($identity, [string]$text) { if ([string]::IsNullOrWhiteSpace($text)) { return }; foreach ($pattern in @("Start-Process\s+-FilePath\s+'((?:''|[^'])*)'", "&\s+'((?:''|[^'])*)'")) { foreach ($m in [regex]::Matches($text, $pattern, 'IgnoreCase')) { Set-CodexHelperCleanupExeCandidate $identity (Convert-CodexHelperSingleQuotedPowerShellLiteral $m.Groups[1].Value) } }; foreach ($m in [regex]::Matches($text, ([string][char]36 + "argumentLine\s*=\s+'((?:''|[^'])*)'"), 'IgnoreCase')) { $identity['Args'] = Convert-CodexHelperSingleQuotedPowerShellLiteral $m.Groups[1].Value; break } };`,
-		`function Get-CodexHelperBridgeTaskIdentity([string]$taskName) { $identity = @{ Exe = ''; Args = '' }; try { $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; if ($null -eq $task) { return $identity }; foreach ($action in @($task.Actions)) { Set-CodexHelperCleanupExeCandidate $identity ([string]$action.Execute); $arguments = [string]$action.Arguments; Add-CodexHelperCleanupIdentity $identity $arguments; foreach ($m in [regex]::Matches($arguments, '"([^"]+\.vbs)"')) { $vbs = $m.Groups[1].Value; try { $ps1 = [IO.Path]::ChangeExtension($vbs, '.ps1'); if (Test-Path -LiteralPath $ps1) { Add-CodexHelperCleanupIdentity $identity (Get-Content -LiteralPath $ps1 -Raw -ErrorAction SilentlyContinue) } } catch { } } } } catch { }; return $identity };`,
+		`function Get-CodexHelperBridgeTaskIdentity([string]$taskName) { $identity = @{ Exe = ''; Args = '' }; try { $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue; if ($null -eq $task) { return $identity }; foreach ($action in @($task.Actions)) { Set-CodexHelperCleanupExeCandidate $identity ([string]$action.Execute); $arguments = [string]$action.Arguments; if ($arguments -match '^teams\s+(run|listen|service\s+watchdog)\s') { $identity['Args'] = $arguments }; Add-CodexHelperCleanupIdentity $identity $arguments; foreach ($m in [regex]::Matches($arguments, '"([^"]+\.vbs)"')) { $vbs = $m.Groups[1].Value; try { $ps1 = [IO.Path]::ChangeExtension($vbs, '.ps1'); if (Test-Path -LiteralPath $ps1) { Add-CodexHelperCleanupIdentity $identity (Get-Content -LiteralPath $ps1 -Raw -ErrorAction SilentlyContinue) } } catch { } } } } catch { }; return $identity };`,
 		`$bridgeIdentityForCleanup = Get-CodexHelperBridgeTaskIdentity $bridgeTaskNameForCleanup; $expectedBridgeExeForCleanup = [string]$bridgeIdentityForCleanup['Exe']; $expectedBridgeArgsForCleanup = [string]$bridgeIdentityForCleanup['Args'];`,
-		`if (-not [string]::IsNullOrWhiteSpace($expectedBridgeExeForCleanup) -and -not [string]::IsNullOrWhiteSpace($expectedBridgeArgsForCleanup)) { try { Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object { $proc = $_; $cmd = [string]$proc.CommandLine; if ($proc.ProcessId -ne $PID -and (Test-CodexHelperTeamsBridgeCommand $cmd $expectedBridgeArgsForCleanup)) { $matchesBridgeExeForCleanup = $false; try { $matchesBridgeExeForCleanup = ([IO.Path]::GetFullPath([string]$proc.ExecutablePath) -ieq $expectedBridgeExeForCleanup) } catch { $matchesBridgeExeForCleanup = $false }; if ($matchesBridgeExeForCleanup) { Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue } } } } catch { } };`,
+		`if (-not [string]::IsNullOrWhiteSpace($expectedBridgeExeForCleanup) -and -not [string]::IsNullOrWhiteSpace($expectedBridgeArgsForCleanup)) { try { Get-CimInstance Win32_Process -ErrorAction Stop | ForEach-Object { $proc = $_; $cmd = [string]$proc.CommandLine; if ($proc.ProcessId -ne $PID -and (Test-CodexHelperTeamsBridgeCommand $cmd $expectedBridgeArgsForCleanup)) { $matchesBridgeExeForCleanup = $false; try { $matchesBridgeExeForCleanup = ([IO.Path]::GetFullPath([string]$proc.ExecutablePath) -ieq $expectedBridgeExeForCleanup) } catch { $matchesBridgeExeForCleanup = $false }; if ($matchesBridgeExeForCleanup) { Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop; $remaining = Get-Process -Id $proc.ProcessId -ErrorAction SilentlyContinue; if ($null -ne $remaining) { $remaining | Wait-Process -Timeout 5 -ErrorAction Stop } } } } } catch { throw "Cannot stop task-owned Teams processes: $_" } };`,
 	}
 	return "$bridgeTaskNameForCleanup = " + taskNameExpr + "; " + strings.Join(parts, " ")
 }

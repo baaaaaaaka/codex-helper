@@ -7,13 +7,11 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Keep the original conversation E2E-ENTRYMIGRATEIMPORTCRASH-after-import-crash-1</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:1>/<msg:1>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:1>/<msg:1>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Keep the original conversation E2E-ENTRYMIGRATEIMPORTCRASH-after-import-crash-1</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Keep the original conversation E2E-ENTRYMIGRATEIMPORTCRASH-after-import-crash-1</p>
 -- <msg:2> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>

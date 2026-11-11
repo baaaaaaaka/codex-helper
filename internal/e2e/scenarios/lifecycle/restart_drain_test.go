@@ -60,7 +60,7 @@ func TestHelperRestartDrain(t *testing.T) {
 		saved = harness.NormalizeSpace(notices[0].PlainText())
 	}
 	s.Check("F-SVC-10 a prompt sent while the restart waits gets the saved-message notice",
-		okSaved && strings.HasSuffix(saved, "helper restart in progress. I saved this message and will resume it after the helper is back online."),
+		okSaved && strings.Contains(saved, "helper restart in progress. I saved this message and will resume it after the helper is back online.") && strings.Contains(saved, "Received at "),
 		"helper restart in progress. I saved this message and will resume it after the helper is back online.", saved)
 	time.Sleep(3 * time.Second) // room for a (wrong) start before the restart
 	early := len(s.Codex.CallsWithToken(held))

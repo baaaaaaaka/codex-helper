@@ -1,4 +1,4 @@
-# EDIT-LABEL: owner messages the helper acts on get the 🧑‍💻 User label by one lossless edit; images are left alone
+# EDIT-LABEL: owner messages retain their content and receive label and initial receipt in one edit
 # cxp black-box transcript; volatile values are numbered placeholders
 
 == chat <chat:1> "🏠 Codex Control - e2ehost"
@@ -76,13 +76,11 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Please answer E2E-EDITLABEL-prompt-1</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Please answer E2E-EDITLABEL-prompt-1</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Please answer E2E-EDITLABEL-prompt-1</p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
@@ -100,15 +98,12 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Read the attached notes E2E-EDITLABEL-file-2</p>
    | <attachment id="<uuid:1>"></attachment><hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:6>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:6>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
    attachment: {"content":null,"contentType":"reference","contentUrl":"https://e2etenant-my.sharepoint.com/personal/owner_e2e_example/Documents/Microsoft%20Teams%20Chat%20Files/notes.txt","id":"<uuid:1>","name":"notes.txt","teamsAppId":null,"thumbnailUrl":null}
-   edited 2 time(s); earlier versions:
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Read the attached notes E2E-EDITLABEL-file-2</p>
-   | <attachment id="<uuid:1>"></attachment>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Read the attached notes E2E-EDITLABEL-file-2</p>
    | <attachment id="<uuid:1>"></attachment>
 -- <msg:7> helper (html)
@@ -121,13 +116,19 @@
    | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:9> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Describe this image E2E-EDITLABEL-image-3</p>
    | <p><img src="https://graph.microsoft.com/v1.0/chats/<chat:2>/messages/<msg:9>/hostedContents/aWQ9eF8wLXd1cy1kMTEtZTJl/$value" width="64" height="64" alt="image" itemid="0"></p>
-   hosted: sha256:2b1da20a14b97d8f01f0a809d9f7d53eeefc59df6312eaa5a0c8b5c1228d1d7f
--- <msg:10> helper (html)
-   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <hr/>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
--- <msg:11> helper (html)
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:9>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   hosted: sha256:2b1da20a14b97d8f01f0a809d9f7d53eeefc59df6312eaa5a0c8b5c1228d1d7f
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>Describe this image E2E-EDITLABEL-image-3</p>
+   | <p><img src="https://graph.microsoft.com/v1.0/chats/<chat:2>/messages/<msg:9>/hostedContents/aWQ9eF8wLXd1cy1kMTEtZTJl/$value" width="64" height="64" alt="image" itemid="0"></p>
+-- <msg:10> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-EDITLABEL-image-3</p>
    | <hr/>

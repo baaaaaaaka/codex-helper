@@ -80,8 +80,11 @@ func TestPromptConfirmationLostPatchAndRefusals(t *testing.T) {
 	}
 	other, _ := fg.PostAsCoworker(chat, "hello")
 	img, _ := fg.PostImageAsUser(chat, "look", []byte{0x89, 'P', 'N', 'G'})
+	if err := a.Annotate(ctx, chat, img.ID, an); err != nil {
+		t.Fatal(err)
+	}
 	long, _ := fg.PostAsUser(chat, strings.Repeat("x", maxPartBytes))
-	for _, id := range []string{other.ID, img.ID, long.ID, "missing"} {
+	for _, id := range []string{other.ID, long.ID, "missing"} {
 		err := a.Annotate(ctx, chat, id, an)
 		if !errors.Is(err, channel.ErrNotEditable) && !errors.Is(err, channel.ErrNotFound) {
 			t.Fatalf("unsafe edit %s: %v", id, err)

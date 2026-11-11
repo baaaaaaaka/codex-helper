@@ -209,3 +209,58 @@ func TestPromptConfirmationRestartAfterAppliedPatch(t *testing.T) {
 		t.Fatal("recovery duplicated confirmation")
 	}
 }
+
+type mergedConfirmationChannel struct {
+	*channeltest.Fake
+	mu    sync.Mutex
+	edits map[string][]channel.Annotation
+}
+
+func (c *mergedConfirmationChannel) Annotate(_ context.Context, _, id string, a channel.Annotation) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.edits[id] = append(c.edits[id], a)
+	return nil
+}
+func TestPromptConfirmationMergesLabelAndPersistsTime(t *testing.T) {
+	var ch *mergedConfirmationChannel
+	r := newRig(t, func(c *Config) {
+		ch = &mergedConfirmationChannel{Fake: c.Channel.(*channeltest.Fake), edits: map[string][]channel.Annotation{}}
+		c.Channel = ch
+	})
+	work := r.newWork(t.TempDir())
+	m := r.ch.PostUser(work, "one edit receipt")
+	r.wait("answer delivered", func() bool { return len(r.own(work, "ANSWER to")) == 1 })
+	ch.mu.Lock()
+	edits := append([]channel.Annotation(nil), ch.edits[m.ID]...)
+	ch.mu.Unlock()
+	if len(edits) != 1 || edits[0].Label != labelUser || edits[0].Confirmation == nil {
+		t.Fatalf("ordinary prompt must have one combined edit: %+v", edits)
+	}
+	rows, err := r.st.OutboxByKeyPrefix("ack:")
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("%+v %v", rows, err)
+	}
+	stamp := "Received at " + fromMS(rows[0].CreatedAt).Local().Format("2006-01-02 15:04:05 UTC-07:00")
+	if !strings.Contains(rows[0].Body, stamp) || !strings.Contains(edits[0].Confirmation.Body, stamp) {
+		t.Fatalf("receipt did not persist first reception time: %s", rows[0].Body)
+	}
+}
+
+func TestPromptConfirmationLabelScope(t *testing.T) {
+	r := newRig(t)
+	work := r.newWork(t.TempDir())
+	conv := convIDForTest(r, work)
+	if got, err := r.e.confirmationLabel(conv); err != nil || got != labelUser {
+		t.Fatal(got, err)
+	}
+	r.e.mu.Lock()
+	r.e.convs[conv].group = true
+	r.e.mu.Unlock()
+	if got, err := r.e.confirmationLabel(conv); err != nil || got != "" {
+		t.Fatal("label in group", got, err)
+	}
+	if got, err := r.e.confirmationLabel(r.e.inboxID); err != nil || got != "" {
+		t.Fatal("label in inbox", got, err)
+	}
+}
