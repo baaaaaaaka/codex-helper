@@ -5,7 +5,9 @@ package realcodex
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -16,7 +18,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/baaaaaaaka/codex-helper/internal/appgateway"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakegraph"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/harness"
 )
@@ -44,21 +45,16 @@ func TestRealCodexGatewayRecoveryTUI(t *testing.T) {
 	if err := os.WriteFile(config, []byte(`{"version":6,"proxyEnabled":true,"agentAutoApproveEnabled":false,"profiles":[{"id":"recovery","name":"recovery","host":"localhost","port":22,"user":"owner"}]}`), 0600); err != nil {
 		t.Fatal(err)
 	}
-	registry, err := appgateway.NewRegistry(filepath.Join(env.Vars["CODEX_HELPER_STATE_DIR"], "app-gateway", "registrations"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer registry.Close()
 	var ready atomic.Bool
 	var waiting atomic.Bool
 	observed := make(chan struct{}, 8)
-	var identity string
+	identity := fmt.Sprintf("%x", sha256.Sum256([]byte("recovery")))
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ok := ready.Load()
 		if !ok {
 			w.WriteHeader(http.StatusServiceUnavailable)
 		}
-		_ = json.NewEncoder(w).Encode(appgateway.Health{InstanceID: identity, OK: ok, Error: "controlled SSH recovery"})
+		_ = json.NewEncoder(w).Encode(map[string]any{"instanceId": identity, "ok": ok, "error": "controlled SSH recovery"})
 		if waiting.Load() && !ok {
 			select {
 			case observed <- struct{}{}:
@@ -68,11 +64,19 @@ func TestRealCodexGatewayRecoveryTUI(t *testing.T) {
 	}))
 	defer srv.Close()
 	port, _ := strconv.Atoi(strings.Split(srv.Listener.Addr().String(), ":")[1])
-	reg, err := registry.EnsureWithPort(context.Background(), "recovery", "", port)
+	// A historical on-disk fixture is independent of product writers. The
+	// child imports it through the supported startup path before reuse.
+	registryDir := filepath.Join(env.Vars["CODEX_HELPER_STATE_DIR"], "app-gateway", "registrations")
+	if err := os.MkdirAll(registryDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	registration, err := json.Marshal(map[string]any{"schema": 1, "id": identity, "profileId": "recovery", "httpPort": port, "state": "pending"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	identity = reg.ID // initialized before the child can make its first request
+	if err := os.WriteFile(filepath.Join(registryDir, identity+".json"), registration, 0600); err != nil {
+		t.Fatal(err)
+	}
 	srv.Start()
 	vars := env.Vars
 	vars["PATH"], vars["TERM"], vars["PROBE_API_KEY"], vars["CXP_AUTO_UPDATE"] = "/usr/local/bin:/usr/bin:/bin", "xterm-256color", "probe-key", "0"
