@@ -18,6 +18,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"regexp"
@@ -979,29 +980,61 @@ func runParallelJobs(jobs []testJob, testTimeout time.Duration) []jobResult {
 	return collected
 }
 
+// jobOutput serializes console writes so concurrent tasks retain their labels,
+// while keeping the original bytes in a per-task diagnostic file.
+type jobOutput struct {
+	label string
+	file  *os.File
+}
+
+var jobOutputMu sync.Mutex
+
+func (w *jobOutput) Write(p []byte) (int, error) {
+	if _, err := w.file.Write(p); err != nil {
+		return 0, err
+	}
+	jobOutputMu.Lock()
+	defer jobOutputMu.Unlock()
+	if _, err := fmt.Fprintf(os.Stdout, "[%s] ", w.label); err != nil {
+		return 0, err
+	}
+	if _, err := os.Stdout.Write(p); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
 func executeJob(job testJob, testTimeout time.Duration) jobResult {
 	startedAt := time.Now()
-	// The Go test watchdog is the semantic deadline. A small outer grace keeps
-	// the runner from killing the wrapper at the exact instant it is collecting
-	// the test process's timeout report.
+	result := jobResult{label: job.label}
+	dir := os.Getenv("RUNNER_TEMP")
+	if dir == "" {
+		dir = os.TempDir()
+	}
+	log, err := os.CreateTemp(dir, "cxp-ci-job-*.log")
+	if err != nil {
+		result.err = fmt.Errorf("create job log: %w", err)
+		result.duration = time.Since(startedAt)
+		return result
+	}
+	fmt.Printf("job %s log: %s\n", job.label, log.Name())
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout+3*time.Minute)
 	defer cancel()
 	command := exec.CommandContext(ctx, "go", job.args...)
-	var output bytes.Buffer
-	command.Stdout = &output
-	command.Stderr = &output
-	err := command.Run()
+	var output io.Writer = &jobOutput{label: job.label, file: log}
+	command.Stdout, command.Stderr = output, output
+	err = command.Run()
 	if ctx.Err() != nil {
 		err = fmt.Errorf("outer timeout after %s: %w", testTimeout+3*time.Minute, ctx.Err())
 	}
-	if err != nil {
-		return jobResult{
-			label:    job.label,
-			err:      fmt.Errorf("%w\n%s", err, strings.TrimSpace(output.String())),
-			duration: time.Since(startedAt),
-		}
+	if closeErr := log.Close(); closeErr != nil {
+		err = errors.Join(err, fmt.Errorf("close job log: %w", closeErr))
 	}
-	return jobResult{label: job.label, duration: time.Since(startedAt)}
+	if err != nil {
+		result.err = fmt.Errorf("%w (job log: %s)", err, log.Name())
+	}
+	result.duration = time.Since(startedAt)
+	return result
 }
 
 // excludePackages drops the packages whose import path starts with one of
