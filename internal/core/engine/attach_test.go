@@ -31,10 +31,11 @@ func TestNewTUIBindsNativeThreadOrClosesUnboundConversation(t *testing.T) {
 		t.Run(map[bool]string{false: "creation-failed", true: "native-created"}[created], func(t *testing.T) {
 			a := &tuiAgent{fakeAgent: newAgent(), done: make(chan struct{})}
 			r := newRig(t, func(c *Config) { c.Agent = a; c.SessionsDir = t.TempDir() })
-			r.wait("TUI admission ready", func() bool {
+			r.wait("TUI admission after first control read", func() bool {
 				r.e.mu.Lock()
 				defer r.e.mu.Unlock()
-				return r.e.attachReady
+				control := r.e.convs[r.e.controlID]
+				return r.e.attachReady && control != nil && control.readOnce
 			})
 			ep, release, _, err := r.e.AttachNew(context.Background(), t.TempDir())
 			if err != nil {
