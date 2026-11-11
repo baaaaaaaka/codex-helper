@@ -13,6 +13,10 @@ export CXP_LEGACY_FIXTURE="$TMPDIR/rc96"
 export CXP_NATIVE_FIXTURE="$TMPDIR/rc104"
 [[ "${OS:-}" != Windows_NT ]] || CXP_LEGACY_FIXTURE="$TMPDIR/rc96.exe"
 [[ "${OS:-}" != Windows_NT ]] || CXP_NATIVE_FIXTURE="$TMPDIR/rc104.exe"
+if [[ "${OS:-}" == Windows_NT ]]; then
+  python3 scripts/ci/prepare_legacy_upgrade.py --baseline pre-protocol --scratch "$TMPDIR"
+  export CXP_PRE_PROTOCOL_FIXTURE="$TMPDIR/rc83.exe"
+fi
 selected="$(go test -tags cxp_boot_e2e ./internal/candidateupdate -list '^TestCandidateLegacy')"
 [[ "$(grep -c '^TestCandidateLegacy' <<<"$selected")" -ge 2 ]] || { echo 'legacy upgrade tests not selected' >&2; exit 1; }
 go test -tags cxp_boot_e2e ./internal/candidateupdate -run '^TestCandidateLegacy' -count=1 -timeout=5m -v

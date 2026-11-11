@@ -150,58 +150,47 @@ function Get-CodexProxySHA256Hex([string]$path) {
 }
 
 function Get-CodexProxyProcessesForPath([string]$path) {
-  if ([string]::IsNullOrWhiteSpace($path)) {
-    return @()
-  }
-  try {
-    $target = [IO.Path]::GetFullPath($path)
-  } catch {
-    return @()
-  }
+  if ([string]::IsNullOrWhiteSpace($path)) { return @() }
+  $target = [IO.Path]::GetFullPath($path)
   $processName = [IO.Path]::GetFileName($target)
-  if ($processName -ine "codex-proxy.exe" -and $processName -ine "cxp.exe") {
-    return @()
-  }
-  try {
-    return @(Get-CimInstance Win32_Process -Filter "Name = '$processName'" -ErrorAction SilentlyContinue | Where-Object {
-      try {
-        -not [string]::IsNullOrWhiteSpace($_.ExecutablePath) -and ([IO.Path]::GetFullPath($_.ExecutablePath) -ieq $target)
-      } catch {
-        $false
-      }
-    })
-  } catch {
-    return @()
-  }
+  if ($processName -ine "codex-proxy.exe" -and $processName -ine "cxp.exe") { return @() }
+  return @(Get-CimInstance Win32_Process -Filter "Name = '$processName'" -ErrorAction Stop | Where-Object {
+    -not [string]::IsNullOrWhiteSpace($_.ExecutablePath) -and ([IO.Path]::GetFullPath($_.ExecutablePath) -ieq $target)
+  })
 }
 
-function Stop-CodexProxyTeamsTasksForInstall {
+function Stop-CodexProxyTeamsTasksForInstall([string[]]$paths) {
+  # Stop the watchdog first. A denied task operation must not be disguised as
+  # a successful stop, or the watchdog can race the binary replacement.
+  $tasks = @(Get-ScheduledTask -ErrorAction Stop)
   foreach ($taskName in @("Codex Helper Teams Watchdog", "Codex Helper Teams Bridge")) {
-    try {
-      $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-      if ($null -ne $task) {
-        Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    $task = $tasks | Where-Object { $_.TaskName -eq $taskName -and $_.TaskPath -eq "\" }
+    if ($null -ne $task) {
+      Disable-ScheduledTask -TaskName $taskName -ErrorAction Stop | Out-Null
+      Stop-ScheduledTask -TaskName $taskName -ErrorAction Stop
+    }
+  }
+  # Scheduled tasks can leave detached children. Only stop Teams service
+  # commands from the two exact destinations being replaced, never user TUIs.
+  foreach ($path in $paths) {
+    foreach ($proc in @(Get-CodexProxyProcessesForPath $path)) {
+      $exe = [regex]::Escape([string]$proc.ExecutablePath)
+      if ($proc.CommandLine -match ('^\s*"?' + $exe + '"?\s+teams\s+(run|listen|service\s+watchdog)\b') -and $proc.CommandLine -notmatch '\s--once\b') {
+        Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop
       }
-    } catch {
-      # Best effort only. If the binary is still locked, the final Move-Item
-      # error remains the authoritative install failure.
     }
   }
 }
 
-function Wait-CodexProxyInstallPathReleased([string]$path) {
-  for ($i = 0; $i -lt 120; $i++) {
+function Wait-CodexProxyInstallPathReleased([string]$path, [int]$attempts = 120, [int]$delayMs = 500) {
+  for ($i = 0; $i -lt $attempts; $i++) {
     $procs = @(Get-CodexProxyProcessesForPath $path)
-    if ($procs.Count -eq 0) {
-      return
-    }
-    if ($i -eq 0) {
-      $ids = ($procs | ForEach-Object { $_.ProcessId }) -join ", "
-      Write-Host "Waiting for existing codex-proxy process(es) to exit: $ids"
-    }
-    Start-Sleep -Milliseconds 500
+    if ($procs.Count -eq 0) { return }
+    $ids = ($procs | ForEach-Object { $_.ProcessId }) -join ", "
+    if ($i -eq 0) { Write-Host "Waiting for existing codex-proxy process(es) to exit: $ids" }
+    Start-Sleep -Milliseconds $delayMs
   }
-  Write-Warning "codex-proxy.exe is still running from $path; install may fail if Windows keeps the file locked."
+  throw "Cannot replace $path: processes $ids are still running. Close their sessions and rerun the installer. No binary was replaced."
 }
 
 function Test-IsCodexOwnedLegacyFile([string]$path) {
@@ -521,9 +510,12 @@ if (-not [string]::IsNullOrWhiteSpace($expected)) {
 }
 
 $dst = Join-Path $installDirResolved "codex-proxy.exe"
-if (@(Get-CodexProxyProcessesForPath $dst).Count -gt 0) {
-  Stop-CodexProxyTeamsTasksForInstall
+$cxpExe = Join-Path $installDirResolved "cxp.exe"
+if (@(Get-CodexProxyProcessesForPath $dst).Count -gt 0 -or @(Get-CodexProxyProcessesForPath $cxpExe).Count -gt 0) {
+  Stop-CodexProxyTeamsTasksForInstall -paths @($dst, $cxpExe)
+  # Check both destinations before changing either one.
   Wait-CodexProxyInstallPathReleased $dst
+  Wait-CodexProxyInstallPathReleased $cxpExe
 }
 Invoke-DiskWrite -Label "codex-proxy binary install" -PathValue $dst -DefaultReason "Failed to move codex-proxy into $dst" -Action {
   Move-Item -Force -LiteralPath $tmp -Destination $dst -ErrorAction Stop
@@ -532,11 +524,6 @@ Invoke-DiskWrite -Label "codex-proxy binary install" -PathValue $dst -DefaultRea
   }
 }
 
-$cxpExe = Join-Path $installDirResolved "cxp.exe"
-if (@(Get-CodexProxyProcessesForPath $cxpExe).Count -gt 0) {
-  Stop-CodexProxyTeamsTasksForInstall
-  Wait-CodexProxyInstallPathReleased $cxpExe
-}
 Invoke-DiskWrite -Label "cxp executable install" -PathValue $cxpExe -DefaultReason "Failed to install cxp executable: $cxpExe" -Action {
   Copy-Item -Force -LiteralPath $dst -Destination $cxpExe -ErrorAction Stop
 }
