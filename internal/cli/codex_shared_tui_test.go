@@ -19,9 +19,10 @@ import (
 )
 
 type sharedTUIFixture struct {
-	thread   string
-	released chan struct{}
-	done     chan struct{}
+	thread    string
+	newThread string
+	released  chan struct{}
+	done      chan struct{}
 }
 
 func (f *sharedTUIFixture) Attach(_ context.Context, thread string) (engine.TUIEndpoint, func(), <-chan struct{}, error) {
@@ -30,14 +31,20 @@ func (f *sharedTUIFixture) Attach(_ context.Context, thread string) (engine.TUIE
 }
 
 func (f *sharedTUIFixture) AttachNew(ctx context.Context, cwd string) (engine.TUIEndpoint, func(), <-chan struct{}, error) {
-	ep, release, done, err := f.Attach(ctx, "11111111-2222-3333-4444-555555555555")
-	ep.ThreadID = f.thread
+	ep, release, done, err := f.Attach(ctx, "")
+	ep.ThreadID = f.newThread
 	return ep, release, done, err
 }
 func TestRunCodexSessionAttachesBeforeOpeningAnotherWriter(t *testing.T) {
 	testSharedTUILaunch(t, "resume")
 }
 func TestRunCodexNewSessionUsesSharedBackend(t *testing.T) { testSharedTUILaunch(t, "new") }
+func TestRunCodexNewSessionIgnoresDifferentHelperHome(t *testing.T) {
+	testSharedTUILaunch(t, "different-home")
+}
+func TestRunCodexNewSessionRefusesLegacyHelperHandoff(t *testing.T) {
+	testSharedTUILaunch(t, "legacy-new")
+}
 func TestRunCodexSessionRefusesMissingLiveHelperEndpoint(t *testing.T) {
 	testSharedTUILaunch(t, "missing")
 }
@@ -68,8 +75,15 @@ func testSharedTUILaunch(t *testing.T, mode string) {
 		t.Fatal(err)
 	}
 	target := &sharedTUIFixture{released: make(chan struct{}), done: make(chan struct{})}
+	if mode == "legacy-new" {
+		target.newThread = "pre-created-thread"
+	}
 	if mode != "missing" {
-		server, err := tuilease.Listen(teamsTUIEndpointPath(anchor, host), os.Getenv("CODEX_HOME"), target, nil)
+		helperHome := os.Getenv("CODEX_HOME")
+		if mode == "different-home" {
+			helperHome = t.TempDir()
+		}
+		server, err := tuilease.Listen(teamsTUIEndpointPath(anchor, host), helperHome, target, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -88,8 +102,11 @@ func testSharedTUILaunch(t *testing.T, mode string) {
 	}
 	t.Cleanup(func() { codexAppEnsureProxyURLFn = originalProxy })
 	thread := "11111111-2222-3333-4444-555555555555"
-	if mode == "new" {
-		err = runCodexNewSession(context.Background(), &rootOptions{configPath: cfg.Path()}, cfg, &config.Profile{Name: "shared"}, nil, fixture.workDir, fixture.path, "", true, io.Discard)
+	if mode == "new" || mode == "legacy-new" || mode == "different-home" {
+		thread = ""
+	}
+	if thread == "" {
+		err = runCodexNewSession(context.Background(), &rootOptions{configPath: cfg.Path()}, cfg, &config.Profile{Name: "shared"}, nil, fixture.workDir, fixture.path, "", mode != "different-home", io.Discard)
 	} else if mode == "fork" {
 		err = runCodexTUIInvocationViaBrokerWithHook(context.Background(), &rootOptions{configPath: cfg.Path()}, cfg, nil, nil, fixture.workDir, fixture.path, "", false, false, nil, nil, nil, func(context.Context, codexrunner.AppServerTransportStarter, codexrunner.AppServerLaunchContext) ([]string, error) {
 			return []string{"resume", thread}, nil
@@ -97,8 +114,12 @@ func testSharedTUILaunch(t *testing.T, mode string) {
 	} else {
 		err = runCodexSession(context.Background(), &rootOptions{configPath: cfg.Path()}, cfg, &config.Profile{Name: "shared"}, nil, codexhistory.Session{SessionID: thread, ProjectPath: fixture.workDir}, codexhistory.Project{Path: fixture.workDir}, fixture.path, "", true, io.Discard)
 	}
-	if mode == "missing" {
-		if err == nil || !strings.Contains(err.Error(), "compatible TUI endpoint") {
+	if mode == "missing" || mode == "legacy-new" {
+		want := "compatible TUI endpoint"
+		if mode == "legacy-new" {
+			want = "legacy New chat handoff"
+		}
+		if err == nil || !strings.Contains(err.Error(), want) {
 			t.Fatalf("missing live endpoint fell back: %v", err)
 		}
 		for _, path := range []string{fixture.migrationArgs, fixture.appServerArgs, fixture.tuiArgs} {
@@ -106,16 +127,37 @@ func testSharedTUILaunch(t *testing.T, mode string) {
 				t.Fatalf("opened another writer: %s %v", path, err)
 			}
 		}
+		if mode == "legacy-new" {
+			select {
+			case <-target.released:
+			case <-time.After(3 * time.Second):
+				t.Fatal("legacy TUI lease leaked")
+			}
+		}
 		return
 	}
 	if err != nil {
 		t.Fatal(err)
 	}
+	if mode == "different-home" {
+		assertStandardBrokerLaunch(t, fixture)
+		assertNoCodexRolloutMigration(t, fixture)
+		select {
+		case <-target.released:
+			t.Fatal("attached to a different Codex home")
+		default:
+		}
+		return
+	}
 	if target.thread != thread {
 		t.Fatalf("attached %q", target.thread)
 	}
 	args := readArgLines(t, fixture.tuiArgs)
-	if len(args) != 8 || args[3] != "ws://127.0.0.1:34567" || args[7] != thread {
+	wantArgs := 8
+	if mode == "new" {
+		wantArgs = 6
+	}
+	if len(args) != wantArgs || args[3] != "ws://127.0.0.1:34567" || (mode != "new" && args[7] != thread) {
 		t.Fatal(args)
 	}
 	token, err := os.ReadFile(fixture.tuiAuthToken)

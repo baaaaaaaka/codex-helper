@@ -19,7 +19,7 @@ type TUIEndpoint struct {
 	Token    string `json:"token"`
 }
 type TUIAgent interface {
-	Attach(context.Context, int64, string, string) (TUIEndpoint, func(), <-chan struct{}, error)
+	Attach(context.Context, int64, string, string, func(string) error) (TUIEndpoint, func(), <-chan struct{}, error)
 	Active() bool
 }
 
@@ -105,23 +105,21 @@ func (e *Engine) attachTUI(ctx context.Context, thread, cwd string) (TUIEndpoint
 		}
 		return TUIEndpoint{}, nil, nil, err
 	}
-	endpoint, release, done, err := a.Attach(ctx, convID, thread, workDir)
-	if err == nil && thread == "" {
-		if endpoint.ThreadID == "" {
-			err = errors.New("backend omitted new thread id")
-		} else {
-			err = e.update(func(tx *store.Tx) error {
-				if x := tx.Bind(store.Thread{ConvID: convID, ThreadID: endpoint.ThreadID, Cwd: workDir}); x != nil {
-					return x
-				}
-				e.mu.Lock()
-				cs.threadID = endpoint.ThreadID
-				e.byThread[endpoint.ThreadID] = convID
-				e.mu.Unlock()
-				return nil
-			})
+	// The TUI creates its new thread on this backend. Bind its native
+	// thread/started event before subsequent input and approval events are read.
+	bind := func(id string) error {
+		if err := e.update(func(tx *store.Tx) error {
+			return tx.Bind(store.Thread{ConvID: convID, ThreadID: id, Cwd: workDir})
+		}); err != nil {
+			return err
 		}
+		e.mu.Lock()
+		cs.threadID = id
+		e.byThread[id] = convID
+		e.mu.Unlock()
+		return nil
 	}
+	endpoint, release, done, err := a.Attach(ctx, convID, thread, workDir, bind)
 	if err != nil {
 		if release != nil {
 			release()
@@ -139,7 +137,28 @@ func (e *Engine) attachTUI(ctx context.Context, thread, cwd string) (TUIEndpoint
 		return TUIEndpoint{}, nil, nil, err
 	}
 	var leaseOnce sync.Once
-	return endpoint, func() { leaseOnce.Do(func() { release(); releaseCount() }) }, done, nil
+	return endpoint, func() {
+		leaseOnce.Do(func() {
+			release() // stops thread/started callbacks before checking the binding
+			if thread == "" {
+				e.mu.Lock()
+				unbound := cs.threadID == ""
+				e.mu.Unlock()
+				if unbound {
+					if err := e.update(func(tx *store.Tx) error {
+						if err := tx.Close(convID); err != nil {
+							return err
+						}
+						_, err := e.refresh(tx, convID)
+						return err
+					}); err != nil {
+						e.logf("close unbound TUI conversation: %v", err)
+					}
+				}
+			}
+			releaseCount()
+		})
+	}, done, nil
 }
 
 // A local session can be opened before the mirror has created its Work chat.

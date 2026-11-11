@@ -232,6 +232,11 @@ jobs:
           go test ./internal/cli -run 'Test(ProbeCodexIntegration|InstalledCodexRuntimeMigrationDefersLivePrivateArtifacts)' -count=1 -v
           go test ./internal/responsespolicy -run TestServerRoutesResponsesAndLeavesNonResponsesTrafficUnchanged -count=1 -v
           go test ./internal/codexrunner -run 'Test(InstalledCodex(StandardApproval|MetadataOnlyResume|ExplicitCancelInterrupt)Runtime|PolicyStarterPreservesUserChatGPTOriginAndAddsOnlyResponsesGateway|AppServerRunner(PreservesBoundedCloudConfigErrorData|DefaultApprovalModeFailsClosed|AutomaticApprovalModeIsExplicit)|AutomaticApprovalResultMatrix|RemoteBrokerManualModeRelaysApprovalRequestsAndResponsesByteTransparent)' -count=1 -v
+          if [ "${{ runner.os }}" = Linux ]; then
+            native="$(find "$(npm root -g)" -type f -path '*/vendor/*/bin/codex' -print -quit)"
+            test -n "$native"
+            bash scripts/ci/run_shared_codex_contracts.sh "$native"
+          fi
 
       - name: Teams app-server probe (Linux/macOS)
         if: runner.os != 'Windows'

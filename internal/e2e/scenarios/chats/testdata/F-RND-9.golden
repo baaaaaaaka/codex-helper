@@ -73,7 +73,7 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Draft the release note E2E-FRND9-first-1</p>
    | <hr/>
-   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
+   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
    | <p>⏳ Codex is working. Request accepted.</p>
    edited 2 time(s); earlier versions:
    [version 1]
@@ -91,7 +91,7 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <attachment id="<msg:4>"></attachment><attachment id="<uuid:1>"></attachment><attachment id="<ms:1>"></attachment><p>Shorten this one E2E-FRND9-reply-2</p>
    | <hr/>
-   | <!-- cxp-prompt-confirmation:<id:2> --><p><strong>🔧 Helper:</strong></p>
+   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:5>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
    | <p>⏳ Codex is working. Request accepted.</p>
    attachment: {"content":"{\"messageId\":\"<msg:4>\",\"messagePreview\":\"E2EANSWER…\",\"messageSender\":{\"application\":null,\"device\":null,\"user\":{\"displayName\":\"E2E Owner\",\"id\":\"\",\"userIdentityType\":\"aadUser\"}}}","contentType":"messageReference","contentUrl":null,"id":"<msg:4>","name":null}
    attachment: {"content":"{\"originalChatId\":\"<chat:3>\",\"originalMessageContent\":\"\\u003cp\\u003eForwarded note from the design chat E2E-FRND9-forwarded-3\\u003c/p\\u003e\",\"originalMessageId\":\"<ms:2>\",\"originalMessageSender\":{\"application\":null,\"device\":null,\"user\":{\"displayName\":\"Ann Example\",\"id\":\"\",\"userIdentityType\":\"aadUser\"}},\"originalSentDateTime\":\"<time:1>\"}","contentType":"forwardedMessageReference","contentUrl":null,"id":"<uuid:1>","name":null}
@@ -173,7 +173,7 @@
    | requirement line with enough words to be long<br>
    | </p>
    | <hr/>
-   | <!-- cxp-prompt-confirmation:<id:3> --><p><strong>🔧 Helper:</strong></p>
+   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:7>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
    | <p>⏳ Codex is working. Request accepted.</p>
    edited 2 time(s); earlier versions:
    [version 1]
@@ -313,7 +313,7 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <attachment id="<msg:7>"></attachment><p>Check the spec I quoted E2E-FRND9-quotelong-5</p>
    | <hr/>
-   | <!-- cxp-prompt-confirmation:<id:4> --><p><strong>🔧 Helper:</strong></p>
+   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:9>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
    | <p>⏳ Codex is working. Request accepted.</p>
    attachment: {"content":"{\"messageId\":\"<msg:7>\",\"messagePreview\":\"Long specification E2E-FRND9-long-4\",\"messageSender\":{\"application\":null,\"device\":null,\"user\":{\"displayName\":\"E2E Owner\",\"id\":\"\",\"userIdentityType\":\"aadUser\"}}}","contentType":"messageReference","contentUrl":null,"id":"<msg:7>","name":null}
    edited 2 time(s); earlier versions:

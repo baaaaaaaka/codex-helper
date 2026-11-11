@@ -85,7 +85,7 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Please answer E2E-CMDGOAL-before-2</p>
    | <hr/>
-   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
+   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:5>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
    | <p>⏳ Codex is working. Request accepted.</p>
    edited 2 time(s); earlier versions:
    [version 1]
@@ -157,7 +157,7 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Please answer E2E-CMDGOAL-withgoal-4</p>
    | <hr/>
-   | <!-- cxp-prompt-confirmation:<id:2> --><p><strong>🔧 Helper:</strong></p>
+   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:17>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
    | <p>⏳ Codex is working. Request accepted.</p>
    edited 2 time(s); earlier versions:
    [version 1]
@@ -176,7 +176,7 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Long job E2E-CMDGOAL-goalrun-1</p>
    | <hr/>
-   | <!-- cxp-prompt-confirmation:<id:3> --><p><strong>🔧 Helper:</strong></p>
+   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:19>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
    | <p>⏳ Codex is working. Request accepted.</p>
    edited 2 time(s); earlier versions:
    [version 1]
@@ -219,7 +219,7 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Please answer E2E-CMDGOAL-paused-5</p>
    | <hr/>
-   | <!-- cxp-prompt-confirmation:<id:4> --><p><strong>🔧 Helper:</strong></p>
+   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:26>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
    | <p>⏳ Codex is working. Request accepted.</p>
    edited 2 time(s); earlier versions:
    [version 1]

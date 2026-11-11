@@ -64,7 +64,7 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Initial task E2E-SHAREDINPUT-first-1</p>
    | <hr/>
-   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
+   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
    | <p>⏳ Codex is working. Request accepted.</p>
    edited 2 time(s); earlier versions:
    [version 1]
@@ -76,7 +76,7 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper queue Later task E2E-SHAREDINPUT-queued-2</p>
    | <hr/>
-   | <!-- cxp-prompt-confirmation:<id:2> --><p><strong>🔧 Helper:</strong></p>
+   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:4>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
    | <p>⏳ <strong>Queued.</strong> Your request will run after the current one finishes.</p>
    | <p><strong>Running now:</strong> Initial task E2E-SHAREDINPUT-first-1</p>
    | <p>To cancel it: <code>helper cancel</code> (cancels the newest queued request). To interrupt the running one: <code>helper cancel running</code>.</p>
@@ -90,7 +90,7 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Change direction E2E-SHAREDINPUT-extra-3</p>
    | <hr/>
-   | <!-- cxp-prompt-confirmation:<id:3> --><p><strong>🔧 Helper:</strong></p>
+   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:5>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
    | <p>Received. Adding this input to Codex; use <code>helper queue &lt;prompt&gt;</code> to wait for the next task.</p>
    edited 2 time(s); earlier versions:
    [version 1]
@@ -124,7 +124,7 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Teams addition E2E-SHAREDINPUT-foreignextra-6</p>
    | <hr/>
-   | <!-- cxp-prompt-confirmation:<id:4> --><p><strong>🔧 Helper:</strong></p>
+   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:11>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
    | <p>⏳ Codex is working. Request accepted.</p>
    edited 2 time(s); earlier versions:
    [version 1]

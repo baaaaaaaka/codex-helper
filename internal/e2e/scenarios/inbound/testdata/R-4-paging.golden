@@ -57,7 +57,7 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Older request E2E-R4paging-pageone-1</p>
    | <hr/>
-   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
+   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
    | <p>⏳ Codex is working. Request accepted.</p>
    edited 2 time(s); earlier versions:
    [version 1]
@@ -129,7 +129,7 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Newer request E2E-R4paging-pagetwo-2</p>
    | <hr/>
-   | <!-- cxp-prompt-confirmation:<id:2> --><p><strong>🔧 Helper:</strong></p>
+   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:34>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
    | <p>⏳ <strong>Queued.</strong> Your request will run when the current work in this chat finishes, behind 1 other queued request.</p>
    | <p>To cancel it: <code>helper cancel</code> (cancels the newest queued request).</p>
    edited 2 time(s); earlier versions:

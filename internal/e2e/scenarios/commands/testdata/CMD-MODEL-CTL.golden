@@ -64,7 +64,7 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>ask what is E2E-CMDMODELCTL-ctlmini-1?</p>
    | <hr/>
-   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
+   | <p><a href="https://teams.microsoft.com/l/message/<chat:1>/<msg:8>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
    | <p>❓ <strong>Codex received your control-chat question.</strong></p>
    | <p>This message is not a helper command, so <strong>Codex will answer it here after helper-local preparation succeeds</strong>. The request has been accepted; attachments or Teams voice/video may still be processed before Codex starts.</p>
    | <p>To stop this control-chat request, send <code>helper cancel turn-1</code> here. For project work, send <code>new &lt;directory&gt;</code>, then send the task inside the new 💬 Work chat.</p>

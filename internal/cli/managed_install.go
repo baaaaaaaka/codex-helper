@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
@@ -1071,16 +1072,13 @@ func repairHelperInstallSelfLoopFromPrevious(path string, goos string) (bool, er
 	if info.Mode()&os.ModeSymlink == 0 {
 		return false, nil
 	}
-	target, err := os.Readlink(path)
-	if err != nil {
-		return false, err
-	}
-	resolvedTarget := target
-	if !filepath.IsAbs(resolvedTarget) {
-		resolvedTarget = filepath.Join(filepath.Dir(path), resolvedTarget)
-	}
-	if !sameHelperInstallLocation(resolvedTarget, path, goos) {
+	// A resolving alias is healthy, even though Stat(alias) and Stat(target)
+	// identify the same file. File identity is not a cycle detector.
+	if _, err = os.Stat(path); err == nil || os.IsNotExist(err) {
 		return false, nil
+	}
+	if !errors.Is(err, syscall.ELOOP) {
+		return false, err
 	}
 	previous := path + ".prev"
 	probe := helperpath.ProbePath(previous, helperpath.Options{GOOS: goos})

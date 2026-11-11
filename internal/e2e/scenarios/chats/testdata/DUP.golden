@@ -56,7 +56,7 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Run the nightly check E2E-DUP-same-1</p>
    | <hr/>
-   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
+   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
    | <p>⏳ Codex is working. Request accepted.</p>
    edited 2 time(s); earlier versions:
    [version 1]
@@ -74,7 +74,7 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Run the nightly check E2E-DUP-same-1</p>
    | <hr/>
-   | <!-- cxp-prompt-confirmation:<id:2> --><p><strong>🔧 Helper:</strong></p>
+   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:5>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
    | <p>Duplicate request ignored (same text within 3 minutes). Send <code>helper retry</code> to run it again.</p>
    edited 2 time(s); earlier versions:
    [version 1]

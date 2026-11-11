@@ -1,21 +1,18 @@
 package teams
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"regexp"
+	"net/url"
 	"strings"
 
 	"github.com/baaaaaaaka/codex-helper/internal/channel"
+	"golang.org/x/net/html"
 )
 
-var confirmationSeparator = regexp.MustCompile(`(?i)<hr\b[^>]*>`)
-
-// confirmationEdit appends one initial receipt. Its marker deliberately differs
-// from the outbox own-post marker: the edited message still belongs to the user.
-func confirmationEdit(content string, isHTML bool, atts []graphAttachment, an channel.Annotation) (string, error) {
+// confirmationEdit appends one initial receipt, identified by its target message
+// link. This is not an own-post marker: the message still belongs to the user.
+func confirmationEdit(chat, id, content string, isHTML bool, atts []graphAttachment, an channel.Annotation) (string, error) {
 	refuse := func() (string, error) {
 		return "", fmt.Errorf("confirmation cannot be appended losslessly: %w", channel.ErrNotEditable)
 	}
@@ -35,22 +32,15 @@ func confirmationEdit(content string, isHTML bool, atts []graphAttachment, an ch
 	if json.Unmarshal([]byte(p.Body), &part) != nil || part.Body.ContentType != "html" || part.Body.Content == "" || len(part.Hosted)+len(part.Attachments)+len(part.Mentions) != 0 {
 		return refuse()
 	}
-	sum := sha256.Sum256([]byte(an.ConfirmationKey))
-	marker := "<!-- cxp-prompt-confirmation:" + hex.EncodeToString(sum[:16]) + " -->"
-	if strings.Contains(content, marker) {
+	// A normal Teams message link survives comment stripping and markup
+	// normalization. Its target identifies this request; copied old receipts
+	// point at a different message. Never infer identity from receipt text.
+	link := "https://teams.microsoft.com/l/message/" + url.PathEscape(chat) + "/" + url.PathEscape(id) + "?context=%7B%22contextType%22%3A%22chat%22%7D"
+	if hasConfirmationLink(content, link) {
 		return "", nil
 	}
-	// Teams can strip comments or normalize markup. Recognize the complete
-	// confirmation after a separator too, including when ASR was appended later.
-	normalize := func(s string) string { return strings.Join(strings.Fields(plainText(s)), " ") }
-	expected := normalize(part.Body.Content)
-	sections := confirmationSeparator.Split(content, -1)
-	for _, section := range sections[1:] {
-		visible := normalize(section)
-		if visible == expected || strings.HasPrefix(visible, expected+" ") {
-			return "", nil
-		}
-	}
+	part.Body.Content = strings.Replace(part.Body.Content, "<p>", `<p><a href="`+esc(link)+`">`, 1)
+	part.Body.Content = strings.Replace(part.Body.Content, "</p>", "</a></p>", 1)
 	if !isHTML && len(atts) > 0 && strings.TrimSpace(content) != "" {
 		return refuse()
 	}
@@ -80,9 +70,31 @@ func confirmationEdit(content string, isHTML bool, atts []graphAttachment, an ch
 	if attachmentContext(content, check) && !losslessAttachments(content, check) {
 		return refuse()
 	}
-	next := content + "<hr/>" + marker + part.Body.Content
+	next := content + "<hr/>" + part.Body.Content
 	if len(next)+markerReserve > maxPartBytes {
 		return refuse()
 	}
 	return next, nil
+}
+
+// Tokenize attributes, rather than comparing serialized HTML: Teams can change
+// quoting, entity escaping and attribute order without changing the link.
+func hasConfirmationLink(content, link string) bool {
+	z := html.NewTokenizer(strings.NewReader(content))
+	for {
+		switch z.Next() {
+		case html.ErrorToken:
+			return false
+		case html.StartTagToken:
+			t := z.Token()
+			if t.Data != "a" {
+				continue
+			}
+			for _, a := range t.Attr {
+				if a.Key == "href" && a.Val == link {
+					return true
+				}
+			}
+		}
+	}
 }

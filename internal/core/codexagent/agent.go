@@ -553,7 +553,7 @@ func (a *Agent) Steer(ctx context.Context, req engine.TurnRequest, expected stri
 
 // Attach reuses the conversation's existing pool lease. The native server
 // fans out notifications; the helper does not copy token deltas for TUI.
-func (a *Agent) Attach(ctx context.Context, conv int64, thread, cwd string) (engine.TUIEndpoint, func(), <-chan struct{}, error) {
+func (a *Agent) Attach(ctx context.Context, conv int64, thread, cwd string, bind func(string) error) (engine.TUIEndpoint, func(), <-chan struct{}, error) {
 	if a.cfg.Server.SharedDir == "" {
 		return engine.TUIEndpoint{}, nil, nil, engine.ErrUnmanagedThread
 	}
@@ -562,14 +562,7 @@ func (a *Agent) Attach(ctx context.Context, conv int64, thread, cwd string) (eng
 		return engine.TUIEndpoint{}, nil, nil, err
 	}
 	srv := lease.Server()
-	if thread == "" {
-		var created codex.Thread
-		created, err = srv.ThreadStart(ctx, codex.ThreadStartParams{Cwd: cwd})
-		if err == nil {
-			thread = created.ID
-			lease.Loaded(thread)
-		}
-	} else {
+	if thread != "" {
 		err = lease.Load(ctx, thread)
 	}
 	if err != nil {
@@ -579,16 +572,70 @@ func (a *Agent) Attach(ctx context.Context, conv int64, thread, cwd string) (eng
 	ep := srv.Endpoint()
 	a.mu.Lock()
 	a.attached[conv]++
-	a.tuiThreads[thread]++
+	if thread != "" {
+		a.tuiThreads[thread]++
+	}
 	a.mu.Unlock()
+	// Register before publishing the endpoint. Native notifications and server
+	// requests are read in order, so binding completes before approvals route.
+	attached, cancel := context.WithCancel(ctx)
+	go func() {
+		select {
+		case <-srv.Done():
+			cancel()
+		case <-attached.Done():
+		}
+	}()
+	var mu sync.Mutex
+	closed := false
+	unsubscribe := func() {}
+	if thread == "" {
+		unsubscribe = srv.Subscribe("", func(n codex.Notification) {
+			if n.Method != "thread/started" {
+				return
+			}
+			var p struct {
+				Thread struct {
+					ID        string
+					Ephemeral bool
+				}
+			}
+			// This new conversation has its own leased server. Native Codex
+			// can canonicalize cwd, so directory spelling is not its identity.
+			if json.Unmarshal(n.Params, &p) != nil || p.Thread.ID == "" || p.Thread.Ephemeral {
+				return
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if closed || thread != "" {
+				return
+			}
+			thread = p.Thread.ID
+			lease.Loaded(thread)
+			a.mu.Lock()
+			a.tuiThreads[thread]++
+			a.mu.Unlock()
+			if err := bind(thread); err != nil {
+				fmt.Fprintf(a.cfg.Log, "codexagent: bind new TUI thread: %v\n", err)
+				cancel()
+			}
+		})
+	}
 	var once sync.Once
 	release := func() {
 		once.Do(func() {
+			unsubscribe()
+			mu.Lock()
+			defer mu.Unlock()
+			closed = true
+			cancel()
 			a.mu.Lock()
 			a.attached[conv]--
-			a.tuiThreads[thread]--
-			if a.tuiThreads[thread] == 0 {
-				delete(a.tuiThreads, thread)
+			if thread != "" {
+				a.tuiThreads[thread]--
+				if a.tuiThreads[thread] == 0 {
+					delete(a.tuiThreads, thread)
+				}
 			}
 			if a.attached[conv] == 0 {
 				delete(a.attached, conv)
@@ -598,7 +645,7 @@ func (a *Agent) Attach(ctx context.Context, conv int64, thread, cwd string) (eng
 			lease.Release()
 		})
 	}
-	return engine.TUIEndpoint{ThreadID: thread, URL: ep.URL, Token: ep.Token}, release, srv.Done(), nil
+	return engine.TUIEndpoint{ThreadID: thread, URL: ep.URL, Token: ep.Token}, release, attached.Done(), nil
 }
 func (a *Agent) Active() bool { return a.pool.Running() }
 

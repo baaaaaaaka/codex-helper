@@ -100,7 +100,7 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Plain repeat E2E-DUPEDGE-plain-2</p>
    | <hr/>
-   | <!-- cxp-prompt-confirmation:<id:1> --><p><strong>🔧 Helper:</strong></p>
+   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
    | <p>⏳ Codex is working. Request accepted.</p>
    edited 2 time(s); earlier versions:
    [version 1]
@@ -118,7 +118,7 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Plain repeat E2E-DUPEDGE-plain-2</p>
    | <hr/>
-   | <!-- cxp-prompt-confirmation:<id:2> --><p><strong>🔧 Helper:</strong></p>
+   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:5>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
    | <p>Duplicate request ignored (same text within 3 minutes). Send <code>helper retry</code> to run it again.</p>
    edited 2 time(s); earlier versions:
    [version 1]
@@ -130,7 +130,7 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Plain repeat E2E-DUPEDGE-plain-2</p>
    | <hr/>
-   | <!-- cxp-prompt-confirmation:<id:3> --><p><strong>🔧 Helper:</strong></p>
+   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:6>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
    | <p>⏳ Codex is working. Request accepted.</p>
    edited 2 time(s); earlier versions:
    [version 1]
@@ -148,7 +148,7 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>This one fails first E2E-DUPEDGE-fails-1</p>
    | <hr/>
-   | <!-- cxp-prompt-confirmation:<id:4> --><p><strong>🔧 Helper:</strong></p>
+   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:8>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
    | <p>⏳ Codex is working. Request accepted.</p>
    edited 2 time(s); earlier versions:
    [version 1]
@@ -164,7 +164,7 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>This one fails first E2E-DUPEDGE-fails-1</p>
    | <hr/>
-   | <!-- cxp-prompt-confirmation:<id:5> --><p><strong>🔧 Helper:</strong></p>
+   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:10>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
    | <p>⏳ Codex is working. Request accepted.</p>
    edited 2 time(s); earlier versions:
    [version 1]
@@ -227,7 +227,7 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Plain repeat E2E-DUPEDGE-plain-2</p>
    | <hr/>
-   | <!-- cxp-prompt-confirmation:<id:6> --><p><strong>🔧 Helper:</strong></p>
+   | <p><a href="https://teams.microsoft.com/l/message/<chat:3>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
    | <p>⏳ Codex is working. Request accepted.</p>
    edited 2 time(s); earlier versions:
    [version 1]

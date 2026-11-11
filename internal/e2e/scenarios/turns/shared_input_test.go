@@ -99,13 +99,21 @@ func attachTUIRequest(s *harness.Scenario, thread, cwd string) *tuiClient {
 	if err != nil {
 		s.T.Fatal(err)
 	}
-	if thread == "" {
-		thread = endpoint.ThreadID
-	}
 	tui := &tuiClient{thread: thread, t: s.T, c: c, lease: resp.Body}
 	s.T.Cleanup(tui.close)
 	tui.call("initialize", map[string]any{"clientInfo": map[string]any{"name": "native-tui-contract", "version": "0"}, "capabilities": map[string]any{"experimentalApi": true}})
-	tui.call("thread/resume", map[string]any{"threadId": thread, "excludeTurns": true})
+	if thread == "" {
+		var started struct{ Thread struct{ ID string } }
+		if err := json.Unmarshal(tui.call("thread/start", map[string]any{"cwd": cwd}), &started); err != nil {
+			s.T.Fatal(err)
+		}
+		tui.thread = started.Thread.ID
+		if tui.thread == "" {
+			s.T.Fatal("new TUI did not create a thread")
+		}
+	} else {
+		tui.call("thread/resume", map[string]any{"threadId": thread, "excludeTurns": true})
+	}
 	return tui
 }
 func tuiInput(thread, prompt, client string) map[string]any {

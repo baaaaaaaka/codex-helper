@@ -329,18 +329,18 @@ func runCodexTUIInvocationViaBrokerWithHooks(
 				}
 				if len(tuiTail) == 0 {
 					shared, err = tuilease.AcquireNew(ctx, teamsTUIEndpointPath(view.Anchor, host), paths.CodexDir, cwd)
-					if err == nil && shared != nil {
-						if shared.Endpoint.ThreadID == "" {
-							_ = shared.Close()
-							return errors.New("shared backend omitted the new session id")
-						}
-						tuiTail = []string{"resume", shared.Endpoint.ThreadID}
-					}
 				} else {
 					shared, err = tuilease.Acquire(ctx, teamsTUIEndpointPath(view.Anchor, host), paths.CodexDir, tuiTail[1])
 				}
 				if err != nil {
 					return fmt.Errorf("attach to Teams Codex: %w", err)
+				}
+				if len(tuiTail) == 0 && shared != nil && shared.Endpoint.ThreadID != "" {
+					// Older helpers bind a pre-created thread. Starting a different
+					// thread on that endpoint would silently lose helper ownership.
+					shared.Close()
+					shared = nil
+					return fmt.Errorf("shared Teams helper uses the legacy New chat handoff; update and restart the helper")
 				}
 			}
 		}

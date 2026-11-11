@@ -311,7 +311,8 @@ func (s *Server) exitAfterWrite(ctx context.Context) bool {
 
 // Subscribe registers fn for notifications whose params carry threadId ==
 // threadID ("" receives every notification). fn runs on the reader
-// goroutine and must not block. The returned func unsubscribes.
+// goroutine. It may update local state, but must not call RPCs or wait for
+// server events. The returned func unsubscribes.
 func (s *Server) Subscribe(threadID string, fn func(Notification)) func() {
 	s.mu.Lock()
 	defer s.mu.Unlock()

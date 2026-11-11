@@ -82,7 +82,7 @@ func (a *Adapter) Annotate(ctx context.Context, chat, id string, an channel.Anno
 	var next string
 	switch {
 	case an.Confirmation != nil:
-		next, err = confirmationEdit(content, isHTML, atts, an)
+		next, err = confirmationEdit(chat, id, content, isHTML, atts, an)
 	case len(an.Clips) > 0:
 		next, err = transcriptEdit(content, isHTML, atts, an)
 	case an.Notice != nil:

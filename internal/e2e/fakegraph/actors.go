@@ -201,6 +201,11 @@ func (s *Server) PostSystemEvent(chatID string) (Message, error) {
 // EditAsUser replaces a message body the way a user edit would, bumping
 // lastModifiedDateTime.
 func (s *Server) EditAsUser(chatID, messageID, text string) error {
+	return s.EditHTMLAsUser(chatID, messageID, TextToHTML(text))
+}
+
+// EditHTMLAsUser also models the Teams client reserializing a rich message.
+func (s *Server) EditHTMLAsUser(chatID, messageID, content string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	c := s.chats[chatID]
@@ -210,7 +215,7 @@ func (s *Server) EditAsUser(chatID, messageID, text string) error {
 	for _, m := range c.Messages {
 		if m.ID == messageID {
 			m.PatchHistory = append(m.PatchHistory, m.Content)
-			m.Content = TextToHTML(text)
+			m.Content = content
 			m.ContentType = "html"
 			m.Modified = s.nextStampLocked()
 			return nil
