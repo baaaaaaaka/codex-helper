@@ -3,6 +3,7 @@ package entry
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -193,8 +194,31 @@ func TestCatchUpOwnerStaysLive(t *testing.T) {
 	s.Note("longest gap between control-chat reads until the catch-up's reads ended: %s (at %s)", gap.Round(10*time.Millisecond), at)
 	s.Check("the control chat is read every poll interval during the catch-up", gap <= controlPoll+readSlack,
 		"<= "+(controlPoll+readSlack).String(), gap.Round(10*time.Millisecond).String())
-	s.Check("each catch-up record is posted once", catchUpPosts(s, tokens) == len(tokens), fmt.Sprint(len(tokens)), fmt.Sprint(catchUpPosts(s, tokens)))
 	s.Settle(5*time.Second, 60*time.Second)
+	var posts []catchUpPost
+	for _, chat := range s.Graph.Chats() {
+		for _, message := range s.SUTMessages(chat.ID) {
+			if !harness.NewChatsSummary(message) {
+				posts = append(posts, catchUpPost{chat.ID, chat.Topic, message.PlainText()})
+			}
+		}
+	}
+	var summaries []string
+	for _, message := range s.SUTMessages(control) {
+		if harness.NewChatsSummary(message) {
+			summaries = append(summaries, message.Content)
+		}
+	}
+	if err := validateCatchUpSummary(catchUpSessions, posts, summaries); err != nil {
+		s.Check("catch-up summaries link to their unique session chats", false, "one unique alias and correct chat per session", err.Error())
+	} else {
+		s.Check("catch-up summaries link to their unique session chats", true, "one unique alias and correct chat per session", "verified")
+	}
+	if err := validateCatchUpPosts(tokens, posts); err != nil {
+		s.Check("each catch-up record belongs to its own chat exactly once", false, "all records in the corresponding session chat", err.Error())
+	} else {
+		s.Check("each catch-up record belongs to its own chat exactly once", true, "all records in the corresponding session chat", "verified")
+	}
 }
 
 func mustJSON(t *testing.T, v any) json.RawMessage {
@@ -301,4 +325,74 @@ func maxReadGap(s *harness.Scenario, chat string, end time.Time) (time.Duration,
 		}
 	}
 	return gap, at.Sub(reads[0].At).Round(time.Second).String()
+}
+
+// catchUpPost holds the externally visible chat identity and message.
+type catchUpPost struct{ chatID, topic, text string }
+
+// validateCatchUpPosts verifies each record independently and ties it to the
+// session identified by the first prompt in the chat title. It does not infer
+// correctness from the total number of posts.
+func validateCatchUpPosts(tokens []string, posts []catchUpPost) error {
+	for _, token := range tokens {
+		var kind string
+		var session, turn int
+		if _, err := fmt.Sscanf(token, "backlog-%1s-%02d-%d", &kind, &session, &turn); err != nil {
+			return fmt.Errorf("invalid token %q: %w", token, err)
+		}
+		want := fmt.Sprintf("backlog-p-%02d-0", session)
+		count := 0
+		for _, post := range posts {
+			if strings.Contains(post.text, token) {
+				count += strings.Count(post.text, token)
+				if !strings.Contains(post.topic, want) {
+					return fmt.Errorf("%s in wrong chat %s (%s), expected %s", token, post.chatID, post.topic, want)
+				}
+			}
+		}
+		if count != 1 {
+			return fmt.Errorf("%s appeared %d times", token, count)
+		}
+	}
+	return nil
+}
+
+// validateCatchUpSummary checks the alias, title and link together so that
+// normalization cannot hide swapped links or duplicate aliases.
+func validateCatchUpSummary(sessions int, posts []catchUpPost, summaries []string) error {
+	items := regexp.MustCompile(`(?s)<li\b[^>]*>.*?</li>`).FindAllString(strings.Join(summaries, "\n"), -1)
+	aliasRE := regexp.MustCompile(`<strong>([^<]+)</strong>`)
+	aliases := map[string]bool{}
+	for i := 0; i < sessions; i++ {
+		token := fmt.Sprintf("backlog-p-%02d-0", i)
+		chatID := ""
+		for _, post := range posts {
+			if strings.Contains(post.text, token) {
+				chatID = post.chatID
+				break
+			}
+		}
+		if chatID == "" {
+			return fmt.Errorf("no chat for %s", token)
+		}
+		matches := 0
+		for _, item := range items {
+			if !strings.Contains(item, token) {
+				continue
+			}
+			matches++
+			if !strings.Contains(item, chatID) && !strings.Contains(item, url.QueryEscape(chatID)) && !strings.Contains(item, url.PathEscape(chatID)) {
+				return fmt.Errorf("summary for %s has wrong chat link", token)
+			}
+			alias := aliasRE.FindStringSubmatch(item)
+			if len(alias) != 2 || aliases[alias[1]] {
+				return fmt.Errorf("missing or duplicate alias for %s", token)
+			}
+			aliases[alias[1]] = true
+		}
+		if matches != 1 {
+			return fmt.Errorf("summary for %s appears %d times", token, matches)
+		}
+	}
+	return nil
 }
