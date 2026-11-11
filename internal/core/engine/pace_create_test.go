@@ -172,8 +172,10 @@ func creatingRig(t *testing.T, tweak func(*Config), active, creating, rows int) 
 // Real-store acceptance (2026-11-05): a first start on a migrated store
 // made 303 Graph writes in 60 s, 243 posts plus 60 chat creations; the
 // creations went around the account's write pacer. Every write, a chat
-// creation included, now takes a token from the one pacer, so the writes
-// in any window d stay within the bucket plus rate×d.
+// creation included, now takes a token from the one pacer. Worker start
+// times may lag token admission, so an observed write window includes at
+// most Senders jobs admitted before the window, in addition to the bucket
+// plus rate×d. This bound must also hold under a delayed race scheduler.
 func TestEveryWriteIsPacedIncludingChatCreation(t *testing.T) {
 	const rate, active, creating, rows = 20.0, 10, 40, 2
 	r, w := creatingRig(t, func(c *Config) { c.WriteRate = rate }, active, creating, rows)
@@ -183,11 +185,11 @@ func TestEveryWriteIsPacedIncludingChatCreation(t *testing.T) {
 		return n == want && c >= creating
 	})
 	for _, d := range []time.Duration{100 * time.Millisecond, 250 * time.Millisecond, time.Second, 2 * time.Second} {
-		limit := int(rate) + int(rate*d.Seconds()) + 2 // bucket + refill, +2 for edges
+		limit := int(rate) + int(rate*d.Seconds()) + r.e.cfg.Senders + 2 // bucket + refill + admitted workers + edges
 		n := w.maxIn(d)
 		t.Logf("max %d writes in %v (limit %d)", n, d, limit)
 		if n > limit {
-			t.Errorf("%d writes in %v, want at most %d at %.0f/s (bucket %.0f)", n, d, limit, rate, rate)
+			t.Errorf("%d writes in %v, want at most %d at %.0f/s (bucket %.0f, workers %d)", n, d, limit, rate, rate, r.e.cfg.Senders)
 		}
 	}
 }

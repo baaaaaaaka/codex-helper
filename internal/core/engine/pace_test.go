@@ -382,7 +382,7 @@ func backlogRig(t *testing.T, tweak func(*Config), chats, rows int, kindOf func(
 // is coalesced). Under -race on a small CI runner the engine falls behind
 // the wall clock and those orders and counts are not meaningful; the
 // fake-clock pacer tests cover the same logic deterministically, and
-// upper bounds on writes (which slowness cannot break) still run.
+// upper bounds on writes (including already admitted workers) still run.
 func skipWallClockPacingUnderRace(t *testing.T) {
 	t.Helper()
 	if raceEnabled {
