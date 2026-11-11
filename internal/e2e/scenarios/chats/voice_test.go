@@ -26,10 +26,12 @@ func TestVoiceExternalCommand(t *testing.T) {
 	harness.Parallel(t)
 	tools := t.TempDir()
 	mode := filepath.Join(tools, "mode")
+	gate := filepath.Join(tools, "asr-ready")
 	script := filepath.Join(tools, "asr.sh")
 	body := `#!/bin/sh
 case "$(cat '` + mode + `' 2>/dev/null)" in
-ok) printf 'transcribed: %s\n' "$(cat "$1")" ;;
+ok) while [ ! -f '` + gate + `' ]; do sleep 0.02; done
+    printf 'transcribed: %s\n' "$(cat "$1")" ;;
 empty) exit 0 ;;
 native) echo "asr: error while loading shared libraries: libggml.so: cannot open shared object file: No such file or directory" >&2; exit 127 ;;
 crash) echo "asr: recogniser crashed" >&2; exit 3 ;;
@@ -53,11 +55,36 @@ esac
 	defer s.Finish()
 	control := steps.ReadyControlChat(s)
 	work, _ := steps.NewWorkChat(s, control, "voice")
+	// Hold successful transcription until the current message's receipt is
+	// visible. Otherwise two independent edits race to define the snapshot's
+	// version history. This also checks feedback while recognition is pending.
+	postHeldVoice := func(name, text, token string) {
+		t.Helper()
+		if err := os.Remove(gate); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		msg, err := s.Graph.PostVoiceAsUser(work.ID, name, []byte(text))
+		if err != nil {
+			t.Fatal(err)
+		}
+		confirmed := s.Poll(steps.AnswerTimeout, func() bool {
+			for _, m := range s.Graph.Messages(work.ID) {
+				if m.ID == msg.ID {
+					return strings.Contains(m.Content, "Request accepted.")
+				}
+			}
+			return false
+		})
+		turns := len(s.Codex.CallsWithToken(token))
+		s.Check(name+": receipt visible while ASR is pending", confirmed && turns == 0,
+			"current receipt and no model call before ASR completes", fmt.Sprintf("receipt=%v turns=%d", confirmed, turns))
+		if err := os.WriteFile(gate, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
 
 	ok := s.Token("voiceok")
-	if _, err := s.Graph.PostVoiceAsUser(work.ID, "voice.ogg", []byte("please list the files "+ok)); err != nil {
-		t.Fatal(err)
-	}
+	postHeldVoice("voice.ogg", "please list the files "+ok, ok)
 	_, answered := steps.WaitAnswered(s, work.ID, ok, steps.AnswerTimeout)
 	prompt := ""
 	if cs := s.Codex.CallsWithToken(ok); len(cs) > 0 {
@@ -107,9 +134,7 @@ esac
 
 	setMode("ok")
 	again := s.Token("again")
-	if _, err := s.Graph.PostVoiceAsUser(work.ID, "again.ogg", []byte("and again "+again)); err != nil {
-		t.Fatal(err)
-	}
+	postHeldVoice("again.ogg", "and again "+again, again)
 	_, ok2 := steps.WaitAnswered(s, work.ID, again, steps.AnswerTimeout)
 	s.Check("after the recogniser is back a clip is answered again", ok2, "answered", fmt.Sprint(ok2))
 }
