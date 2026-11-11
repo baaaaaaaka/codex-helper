@@ -50,8 +50,9 @@
 -- <msg:4> owner (html)
    | <p>@codex exercise progress E2E-TURNPROGRESSINTEGRITY-integrity-1</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:4>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:4>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>@codex exercise progress E2E-TURNPROGRESSINTEGRITY-integrity-1</p>

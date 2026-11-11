@@ -68,13 +68,11 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Please answer E2E-EDITFREEZE-first-1</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Please answer E2E-EDITFREEZE-first-1</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Please answer E2E-EDITFREEZE-first-1</p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
@@ -90,6 +88,7 @@
    | <p>▶️ <strong>Continue chat:</strong><br>
    | Step 1: Open <a href="https://teams.microsoft.com/l/chat/<chat:1>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Control chat</a> (https://teams.microsoft.com/l/chat/<chat:1>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)<br>
    | Step 2: Send: <code>r s001</code></p>
+   | <p>Paused at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:4>?context=%7B%22contextType%22%3A%22chat%22%7D#cxp-freeze%3A<pause:1>"><event-time></a></p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
@@ -101,13 +100,11 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Typed while parked E2E-EDITFREEZE-held-2</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:5>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:5>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Typed while parked E2E-EDITFREEZE-held-2</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Typed while parked E2E-EDITFREEZE-held-2</p>
 -- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -126,6 +123,7 @@
    | <p>▶️ <strong>Continue chat:</strong><br>
    | Step 1: Open <a href="https://teams.microsoft.com/l/chat/<chat:1>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">Control chat</a> (https://teams.microsoft.com/l/chat/<chat:1>/0?tenantId=e2e00000-0000-4000-8000-00000000te57)<br>
    | Step 2: Send: <code>r s001</code></p>
+   | <p>Paused at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:7>?context=%7B%22contextType%22%3A%22chat%22%7D#cxp-freeze%3A<pause:2>"><event-time></a></p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>

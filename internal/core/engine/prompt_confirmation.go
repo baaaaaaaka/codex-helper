@@ -24,5 +24,17 @@ func (e *Engine) appendConfirmation(ctx context.Context, r store.Outbox, chat st
 		}
 		return err
 	}
-	return ann.Annotate(ctx, chat, r.AppendTo, channel.Annotation{Confirmation: &p, ConfirmationKey: r.DeliveryKey})
+	return ann.Annotate(ctx, chat, r.AppendTo, channel.Annotation{Confirmation: &p, ConfirmationKey: r.DeliveryKey, Label: e.confirmationLabel(r.ConvID), At: fromMS(r.CreatedAt).Local()})
+}
+
+// Membership is already known before admission. Do not add owner labels in
+// shared chats; media messages defer their label to transcript annotation.
+func (e *Engine) confirmationLabel(conv int64) string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	cs := e.convs[conv]
+	if conv == e.inboxID || cs == nil || !cs.readOnce || cs.group {
+		return ""
+	}
+	return labelUser
 }

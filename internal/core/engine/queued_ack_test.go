@@ -33,13 +33,13 @@ func TestQueuedAckIsShortAndCancelRunningKeepsQueue(t *testing.T) {
 		"",
 		"To cancel it: `helper cancel` (cancels the newest queued request). To interrupt the running one: `helper cancel running`.",
 	}, "\n")
-	if got := r.own(work, "**Queued.**")[0].Text; got != want {
+	if got := r.own(work, "**Queued.**")[0].Text; strings.Split(got, "\n\nReceived at ")[0] != want {
 		t.Fatalf("queued ACK:\n%s\nwant:\n%s", got, want)
 	}
 	r.ch.PostUser(work, "third job")
 	r.wait("second queued ACK", func() bool { return len(r.own(work, "**Queued.**")) == 2 })
 	want = strings.Replace(want, "finishes.", "finishes, behind 1 other queued request.", 1)
-	if got := r.own(work, "**Queued.**")[1].Text; got != want {
+	if got := r.own(work, "**Queued.**")[1].Text; strings.Split(got, "\n\nReceived at ")[0] != want {
 		t.Fatalf("queued ACK behind another queued request:\n%s\nwant:\n%s", got, want)
 	}
 	if n := len(r.own(work, "Request accepted")); n != 1 {
@@ -124,7 +124,7 @@ func TestQueuedAckAfterRestartDoesNotListTheInterruptedTurn(t *testing.T) {
 		t.Fatalf("the ACK lists the turn the previous process left running:\n%s", ack)
 	}
 	if want := "🔧 Helper:\n⏳ **Queued.** Your request will run when the current work in this chat finishes, behind 1 other queued request.\n\n" +
-		"To cancel it: `helper cancel` (cancels the newest queued request)."; ack != want {
+		"To cancel it: `helper cancel` (cancels the newest queued request)."; strings.Split(ack, "\n\nReceived at ")[0] != want {
 		t.Fatalf("queued ACK after restart:\n%s\nwant:\n%s", ack, want)
 	}
 	r.wait("interruption notice", func() bool {

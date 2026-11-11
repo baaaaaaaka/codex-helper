@@ -1471,13 +1471,11 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Live task E2E-CATCHUPLIVE-first-1</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:325>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:325>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Live task E2E-CATCHUPLIVE-first-1</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Live task E2E-CATCHUPLIVE-first-1</p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
@@ -1489,13 +1487,11 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Follow-up 1 E2E-CATCHUPLIVE-followup1-2</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:325>/<msg:5>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:325>/<msg:5>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Follow-up 1 E2E-CATCHUPLIVE-followup1-2</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Follow-up 1 E2E-CATCHUPLIVE-followup1-2</p>
 -- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
@@ -1507,13 +1503,11 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Follow-up 2 E2E-CATCHUPLIVE-followup2-3</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:325>/<msg:7>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:325>/<msg:7>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Follow-up 2 E2E-CATCHUPLIVE-followup2-3</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Follow-up 2 E2E-CATCHUPLIVE-followup2-3</p>
 -- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
@@ -1525,13 +1519,11 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Follow-up 3 E2E-CATCHUPLIVE-followup3-4</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:325>/<msg:9>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:325>/<msg:9>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Follow-up 3 E2E-CATCHUPLIVE-followup3-4</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Follow-up 3 E2E-CATCHUPLIVE-followup3-4</p>
 -- <msg:10> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>

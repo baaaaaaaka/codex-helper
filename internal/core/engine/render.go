@@ -69,9 +69,13 @@ func (e *Engine) noticeReply(kind, base, text, replyTo string) ([]store.OutMsg, 
 // promptConfirmation marks only the owner's initial prompt response for append.
 // Multi-part confirmations keep the ordinary delivery path as one complete reply.
 func (e *Engine) promptConfirmation(c *classified, kind, base, text, replyTo string) ([]store.OutMsg, error) {
+	if c.receivedAt != 0 {
+		text += "\n\nReceived at " + fromMS(c.receivedAt).Local().Format("2006-01-02 15:04:05 UTC-07:00")
+	}
 	msgs, err := e.noticeReply(kind, base, text, replyTo)
 	if err == nil && len(msgs) == 1 && c.in.Sender == store.SenderOwner && c.delegation == "" {
 		msgs[0].AppendTo = c.in.ExtMsgID
+		c.confirmed = true
 	}
 	return msgs, err
 }

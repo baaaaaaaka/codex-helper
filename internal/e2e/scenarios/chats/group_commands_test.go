@@ -69,7 +69,7 @@ func TestGroupChatMentionsAndCoworkerCommands(t *testing.T) {
 	token := s.Token("coworker")
 	id, seq := coworker("@codex Please answer " + token)
 	got, quoted, ok := reply(seq, "Request accepted")
-	s.Check("a coworker's request gets the coworker ACK", ok && strings.HasSuffix(got, "⏳ Codex received your question. Request accepted.") && len(quoted) == 1 && quoted[0] == id,
+	s.Check("a coworker's request gets the coworker ACK", ok && strings.Contains(got, "⏳ Codex received your question. Request accepted.") && strings.Contains(got, "Received at ") && len(quoted) == 1 && quoted[0] == id,
 		"⏳ Codex received your question. Request accepted. (quoting the request)", fmt.Sprintf("%s quoted=%v", got, quoted))
 	_, answered := steps.WaitAnswered(s, work.ID, token, steps.AnswerTimeout)
 	s.Check("the coworker's request is answered", answered, "answered", fmt.Sprint(answered))

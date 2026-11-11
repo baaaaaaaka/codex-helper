@@ -61,11 +61,9 @@ const (
 const (
 	maxHostedPerMessage = 5 // pasted images and voice/video clips
 	maxFilesPerMessage  = 5 // SharePoint/OneDrive files
-	maxQuotesPerMessage = 3 // quoted or forwarded messages
 
 	textTooManyHosted = "Teams message has more than 5 inline Teams media attachments. Please send fewer media items in one message."
 	textTooManyFiles  = "Teams message has more than 5 file attachments. Please send fewer files in one message."
-	textTooManyQuotes = "Teams message has more than 3 quoted/referenced messages. Please send fewer references in one message."
 )
 
 // textRawAPIKey answers a message with a raw API key (R-26). The first
@@ -509,8 +507,6 @@ func screen(c *classified) {
 		c.reject = textTooManyHosted
 	case docs > maxFilesPerMessage:
 		c.reject = textTooManyFiles
-	case len(c.msg.Quotes) > maxQuotesPerMessage:
-		c.reject = textTooManyQuotes
 	default:
 		return
 	}

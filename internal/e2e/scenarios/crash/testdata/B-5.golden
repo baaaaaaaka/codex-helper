@@ -69,13 +69,11 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Long task E2E-B5-lost-2</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Long task E2E-B5-lost-2</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Long task E2E-B5-lost-2</p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
@@ -85,13 +83,11 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Next request E2E-B5-nexty-5</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:5>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:5>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Next request E2E-B5-nexty-5</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Next request E2E-B5-nexty-5</p>
 -- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
@@ -122,13 +118,11 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Long task E2E-B5-notstarted-3</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:3>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:3>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Long task E2E-B5-notstarted-3</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Long task E2E-B5-notstarted-3</p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
@@ -137,13 +131,11 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Next request E2E-B5-nextz-6</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:3>/<msg:5>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:3>/<msg:5>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Next request E2E-B5-nextz-6</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Next request E2E-B5-nextz-6</p>
 -- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
@@ -174,13 +166,11 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Long task E2E-B5-streaming-1</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:4>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:4>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Long task E2E-B5-streaming-1</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Long task E2E-B5-streaming-1</p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ⏳ Codex status:</strong></p>
@@ -193,13 +183,11 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Next request E2E-B5-nextx-4</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:4>/<msg:6>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:4>/<msg:6>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Next request E2E-B5-nextx-4</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Next request E2E-B5-nextx-4</p>
 -- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>

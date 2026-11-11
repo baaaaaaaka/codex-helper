@@ -69,13 +69,11 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Burst question E2E-NOTIFYBURST-burst1-1</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Burst question E2E-NOTIFYBURST-burst1-1</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Burst question E2E-NOTIFYBURST-burst1-1</p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
@@ -106,13 +104,11 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Burst question E2E-NOTIFYBURST-burst2-2</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:3>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:3>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Burst question E2E-NOTIFYBURST-burst2-2</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Burst question E2E-NOTIFYBURST-burst2-2</p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
@@ -143,13 +139,11 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Burst question E2E-NOTIFYBURST-burst3-3</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:4>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:4>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Burst question E2E-NOTIFYBURST-burst3-3</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Burst question E2E-NOTIFYBURST-burst3-3</p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>

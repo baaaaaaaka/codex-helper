@@ -341,7 +341,7 @@ func (a *Adapter) inboundFiles(chat string, gm graphMessage) ([]channel.FileRef,
 			files = append(files, channel.FileRef{Kind: channel.FileUnsupported, Name: at.Name, Note: "unsupported attachment type " + ct})
 		}
 	}
-	// The per-message limits (5 media, 5 files, 3 quotes) are the engine's
+	// The per-message media and file limits are the engine's
 	// (SPEC F-RND-8): an over-limit message is refused, not truncated.
 	return files, quotes
 }

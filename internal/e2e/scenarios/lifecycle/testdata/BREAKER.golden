@@ -62,17 +62,16 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Long task E2E-BREAKER-running-1</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
    | <p>Long task E2E-BREAKER-running-1</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>Long task E2E-BREAKER-running-1</p>
 -- <msg:4> peer-helper (html)
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
 -- <msg:5> peer-helper (html)
    | <p><strong>🔧 Helper:</strong></p>
    | <p>💬 Work chat is ready.<br>
@@ -96,13 +95,11 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Prompt while paused E2E-BREAKER-held-5</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:8>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>Request held: this chat is paused, so new requests do not run. It will not run later by itself; resend it once the chat is resumed.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:8>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Prompt while paused E2E-BREAKER-held-5</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Prompt while paused E2E-BREAKER-held-5</p>
 -- <msg:9> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
@@ -114,13 +111,11 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Prompt after restart E2E-BREAKER-afterrestart-6</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:10>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>Request held: this chat is paused, so new requests do not run. It will not run later by itself; resend it once the chat is resumed.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:10>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Prompt after restart E2E-BREAKER-afterrestart-6</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Prompt after restart E2E-BREAKER-afterrestart-6</p>
 -- <msg:11> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
@@ -135,13 +130,11 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Prompt after unpause E2E-BREAKER-afterunpause-7</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:13>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:13>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Prompt after unpause E2E-BREAKER-afterunpause-7</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Prompt after unpause E2E-BREAKER-afterunpause-7</p>
 -- <msg:14> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
@@ -172,39 +165,33 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper queue Quick question 0 E2E-BREAKER-burst0-2</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:3>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:3>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>helper queue Quick question 0 E2E-BREAKER-burst0-2</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper queue Quick question 0 E2E-BREAKER-burst0-2</p>
 -- <msg:4> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper queue Quick question 1 E2E-BREAKER-burst1-3</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:3>/<msg:4>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ <strong>Queued.</strong> Your request will run when the current work in this chat finishes, behind 1 other queued request.</p>
    | <p>To cancel it: <code>helper cancel</code> (cancels the newest queued request).</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:3>/<msg:4>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>helper queue Quick question 1 E2E-BREAKER-burst1-3</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper queue Quick question 1 E2E-BREAKER-burst1-3</p>
 -- <msg:5> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper queue Quick question 2 E2E-BREAKER-burst2-4</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:3>/<msg:5>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ <strong>Queued.</strong> Your request will run when the current work in this chat finishes, behind 2 other queued requests.</p>
    | <p>To cancel it: <code>helper cancel</code> (cancels the newest queued request).</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:3>/<msg:5>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>helper queue Quick question 2 E2E-BREAKER-burst2-4</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper queue Quick question 2 E2E-BREAKER-burst2-4</p>
 -- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>

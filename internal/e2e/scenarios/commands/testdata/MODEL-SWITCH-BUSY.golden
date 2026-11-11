@@ -65,13 +65,11 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Long task E2E-MODELSWITCHBUSY-running-1</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>Long task E2E-MODELSWITCHBUSY-running-1</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Long task E2E-MODELSWITCHBUSY-running-1</p>
 -- <msg:4> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
@@ -91,15 +89,13 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper queue Next task E2E-MODELSWITCHBUSY-queued-2</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:6>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ <strong>Queued.</strong> Your request will run after the current one finishes.</p>
    | <p><strong>Running now:</strong> Long task E2E-MODELSWITCHBUSY-running-1</p>
    | <p>To cancel it: <code>helper cancel</code> (cancels the newest queued request). To interrupt the running one: <code>helper cancel running</code>.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:6>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>helper queue Next task E2E-MODELSWITCHBUSY-queued-2</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper queue Next task E2E-MODELSWITCHBUSY-queued-2</p>
 -- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
@@ -121,13 +117,11 @@
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>After the crash E2E-MODELSWITCHBUSY-aftercrash-3</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:10>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
-   edited 2 time(s); earlier versions:
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:10>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   edited 1 time(s); earlier versions:
    [version 1]
-   | <p>After the crash E2E-MODELSWITCHBUSY-aftercrash-3</p>
-   [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>After the crash E2E-MODELSWITCHBUSY-aftercrash-3</p>
 -- <msg:11> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>

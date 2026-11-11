@@ -7,9 +7,14 @@
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
 -- <msg:2> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
    | <p>status</p>
    | <p><img src="https://graph.microsoft.com/v1.0/chats/<chat:1>/messages/<msg:2>/hostedContents/aWQ9eF8wLXd1cy1kMTEtZTJl/$value" width="64" height="64" alt="image" itemid="0"></p>
    hosted: sha256:b5e82ab5f73de5263733b316d0c411293a0895e6958a410f435617a38d8085b1
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>status</p>
+   | <p><img src="https://graph.microsoft.com/v1.0/chats/<chat:1>/messages/<msg:2>/hostedContents/aWQ9eF8wLXd1cy1kMTEtZTJl/$value" width="64" height="64" alt="image" itemid="0"></p>
 -- <msg:3> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>I could not process 1 Teams attachment(s): Teams-hosted inline content. Supported inputs are plain text plus Teams-hosted inline/reference file attachments that the current Graph scopes can download. For generated files from Codex, use <code>helper file &lt;relative-path&gt;</code> from the Teams outbound root. Files and images belong in a 💬 Work chat; the 🏠 control chat only handles text commands like <code>projects</code>, <code>new &lt;directory&gt;</code>, <code>continue &lt;number&gt;</code>, and <code>status</code>.</p>

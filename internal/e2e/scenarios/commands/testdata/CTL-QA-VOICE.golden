@@ -9,13 +9,14 @@
 -- <msg:2> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <attachment id="<uuid:1>"></attachment><p><strong>🎙️ Speech-to-text transcript (automatic; may contain recognition errors):</strong></p>
-   | <p><em>Clip: question.ogg</em></p>
+   | <p><em><a href="https://teams.microsoft.com/l/message/<chat:1>/<msg:2>?context=%7B%22contextType%22%3A%22chat%22%7D#cxp-transcript%3Aca8dc9189fa1ac0ccbf19d9739bd1028">Clip: question.ogg</a></em></p>
    | <p>transcribed: what is E2E-CTLQAVOICE-voice-1?</p>
    | <hr/>
-   | <p><a href="https://teams.microsoft.com/l/message/<chat:1>/<msg:2>?context=%7B%22contextType%22%3A%22chat%22%7D"><strong>🔧 Helper:</strong></a></p>
+   | <p><strong>🔧 Helper:</strong></p>
    | <p>❓ <strong>Codex received your control-chat question.</strong></p>
    | <p>This message is not a helper command, so <strong>Codex will answer it here after helper-local preparation succeeds</strong>. The request has been accepted; attachments or Teams voice/video may still be processed before Codex starts.</p>
    | <p>To stop this control-chat request, send <code>helper cancel turn-1</code> here. For project work, send <code>new &lt;directory&gt;</code>, then send the task inside the new 💬 Work chat.</p>
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:1>/<msg:2>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
    hosted: sha256:d8db9aac23499b5fcff104c7eb892d9956ae237d6a070e22a12d2c84466922c2
    attachment: {"content":"{\"duration\":\"PT3S\",\"media\":[{\"url\":\"https://graph.microsoft.com/v1.0/chats/<chat:1>/messages/<msg:2>/hostedContents/aWQ9dm9pY2UtJTAzZA0007/$value\"}]}","contentType":"application/vnd.microsoft.card.audio","contentUrl":null,"id":"<uuid:1>","name":"question.ogg","teamsAppId":null,"thumbnailUrl":null}
    edited 2 time(s); earlier versions:
@@ -24,7 +25,7 @@
    [version 2]
    | <p><strong>🧑‍💻 User:</strong></p>
    | <attachment id="<uuid:1>"></attachment><p><strong>🎙️ Speech-to-text transcript (automatic; may contain recognition errors):</strong></p>
-   | <p><em>Clip: question.ogg</em></p>
+   | <p><em><a href="https://teams.microsoft.com/l/message/<chat:1>/<msg:2>?context=%7B%22contextType%22%3A%22chat%22%7D#cxp-transcript%3Aca8dc9189fa1ac0ccbf19d9739bd1028">Clip: question.ogg</a></em></p>
    | <p>transcribed: what is E2E-CTLQAVOICE-voice-1?</p>
 -- <msg:3> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong> <at id="0">E2E Owner</at></p>

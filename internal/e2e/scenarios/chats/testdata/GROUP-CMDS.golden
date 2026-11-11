@@ -65,6 +65,7 @@
 -- <msg:10> helper quoting <msg:9> (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex received your question. Request accepted.</p>
+   | <p>Received at <event-time></p>
 -- <msg:11> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-GROUPCMDS-coworker-1</p>

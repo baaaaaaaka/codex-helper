@@ -484,17 +484,19 @@ func (e *Engine) read(ctx context.Context, id int64) {
 
 // classified is a received message with its classification.
 type classified struct {
-	msg       channel.InboundMsg
-	in        store.InboundMsg
-	control   bool   // received in the control chat
-	cmd       parsed // the owner's command as parsed at admission (parse.go)
-	suspect   bool   // counts toward the breaker
-	ownMarker bool   // carried our own marker (self-test passed)
-	sibling   bool   // our marker, not our send: another copy of this store (takeover.go)
-	quoteID   string // ext id to quote in replies (group chats)
-	other     bool   // sent by someone else than the owner
-	chatter   bool   // someone else's message not addressed to Codex
-	resolved  bool   // resolved one of our unknown sends
+	receivedAt int64 // admission transaction time, persisted in the receipt body
+	confirmed  bool  // initial receipt owns the user label
+	msg        channel.InboundMsg
+	in         store.InboundMsg
+	control    bool   // received in the control chat
+	cmd        parsed // the owner's command as parsed at admission (parse.go)
+	suspect    bool   // counts toward the breaker
+	ownMarker  bool   // carried our own marker (self-test passed)
+	sibling    bool   // our marker, not our send: another copy of this store (takeover.go)
+	quoteID    string // ext id to quote in replies (group chats)
+	other      bool   // sent by someone else than the owner
+	chatter    bool   // someone else's message not addressed to Codex
+	resolved   bool   // resolved one of our unknown sends
 	// delegation is the id of a delegation request this engine takes (inbox).
 	delegation string
 	// reject answers a refused message instead of running it, quoting
@@ -635,6 +637,7 @@ func (e *Engine) admit(ctx context.Context, id int64, w channel.Window) error {
 			if c == nil {
 				continue
 			}
+			c.receivedAt = tx.Now()
 			if c.suspect && !backlog && e.breakerHit(id, hitTime(c.msg, now), stg) {
 				trip = true
 			}

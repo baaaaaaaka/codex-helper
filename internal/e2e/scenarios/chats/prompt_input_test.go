@@ -112,11 +112,12 @@ func TestQuotedMessages(t *testing.T) {
 	files := map[string]string{} // token -> content of the referenced-message file, read at turn start
 	fullRE := regexp.MustCompile(`Full referenced message saved locally for Codex to read: (\S[^\n]*)\n`)
 	s.Codex.SetScript(func(c harness.CodexCall) harness.CodexBehavior {
-		if m := fullRE.FindStringSubmatch(c.Prompt); m != nil {
+		for _, m := range fullRE.FindAllStringSubmatch(c.Prompt, -1) {
 			data, err := os.ReadFile(m[1])
 			mu.Lock()
 			for _, tok := range c.Tokens {
 				files[tok] = fmt.Sprintf("%s%v", data, errOrNil(err))
+				files[tok+":"+filepath.Base(m[1])] = files[tok]
 			}
 			mu.Unlock()
 		}
@@ -214,6 +215,28 @@ func TestQuotedMessages(t *testing.T) {
 		(strings.Contains(file, "\nSource: Graph full message\n\nLong specification "+longTok+"\n") ||
 			strings.Contains(file, "\nSource: Graph full message\n\n🧑‍💻 User:\nLong specification "+longTok+"\n")) &&
 		strings.Count(file, "requirement line with enough words to be long") == 60, "header + full text", clip(file, 300))
+
+	// Several references in one request combine the old failure boundaries:
+	// repeated long messages, a failed read and a forward between valid reads.
+	many := s.Token("many")
+	if _, err := s.Graph.PostWithQuotesAsUser(work.ID, "Compare all five "+many,
+		fakegraph.QuoteSpec{MessageID: longMsg.ID, Preview: "long first", SenderName: "E2E Owner"},
+		fakegraph.QuoteSpec{MessageID: answerID, Preview: "answer", SenderName: "E2E Owner"},
+		fakegraph.QuoteSpec{MessageID: "1700000000123", Preview: "missing third", SenderName: "E2E Owner"},
+		fakegraph.QuoteSpec{MessageID: "1700000000999", Forwarded: true, Preview: "forward fourth", SenderName: "Ann Example"},
+		fakegraph.QuoteSpec{MessageID: longMsg.ID, Preview: "long again", SenderName: "E2E Owner"}); err != nil {
+		t.Fatal(err)
+	}
+	_, answered := steps.WaitAnswered(s, work.ID, many, steps.AnswerTimeout)
+	pm := prompt(many)
+	mu.Lock()
+	firstFile, lastFile := files[many+":referenced-message-001.txt"], files[many+":referenced-message-005.txt"]
+	mu.Unlock()
+	s.Check("five mixed references run without losing or mismatching long files", answered &&
+		strings.Contains(pm, "3. From: E2E Owner; Source: Teams reference preview\n   missing third") &&
+		strings.Contains(pm, "4. From: Ann Example;") && strings.Contains(pm, "5. From: E2E Owner;") &&
+		firstFile != "" && firstFile == lastFile && strings.Count(firstFile, "requirement line with enough words to be long") == 60,
+		"five ordered references, identical full files for repeated long reference", clip(pm, 300))
 }
 
 func errOrNil(err error) string {
@@ -223,14 +246,13 @@ func errOrNil(err error) string {
 	return ""
 }
 
-// TestAttachmentLimits: F-RND-8. More than 5 media items, 5 files or 3
-// quotes in one message is refused with v0.1.20's text, before any
-// acknowledgement or Codex turn; a message at the limits runs.
+// TestAttachmentLimits: media and file limits remain; references have no
+// separate count limit. Many references must reach Codex in source order.
 func TestAttachmentLimits(t *testing.T) {
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "F-RND-8", harness.Options{
 		Guarantees: []string{"F-RND-8", "R-37"},
-		Title:      "per message: 5 images/clips, 5 files and 3 quotes run; one more of any is refused with v0.1.20's text and no turn",
+		Title:      "media and file limits reject overflow; twenty references run in source order",
 		Budget:     120 * time.Second,
 	})
 	defer s.Finish()
@@ -267,7 +289,6 @@ func TestAttachmentLimits(t *testing.T) {
 	}{
 		{"6 images", 6, 0, 0, "Teams message has more than 5 inline Teams media attachments. Please send fewer media items in one message."},
 		{"6 files", 0, 6, 0, "Teams message has more than 5 file attachments. Please send fewer files in one message."},
-		{"4 quotes", 0, 0, 4, "Teams message has more than 3 quoted/referenced messages. Please send fewer references in one message."},
 	}
 	for _, c := range cases {
 		tok := s.Token("over")
@@ -288,18 +309,26 @@ func TestAttachmentLimits(t *testing.T) {
 		s.Check("F-RND-8 "+c.name+": no Codex turn", len(s.Codex.CallsWithToken(tok)) == 0, "0 turns", fmt.Sprint(len(s.Codex.CallsWithToken(tok))))
 	}
 	at := s.Token("atlimit")
-	if _, err := s.Graph.PostAttachmentsAsUser(work.ID, "Everything at the limit "+at, images(5), docs(5), quotes(3)...); err != nil {
+	if _, err := s.Graph.PostAttachmentsAsUser(work.ID, "Everything at the limit "+at, images(5), docs(5), quotes(20)...); err != nil {
 		t.Fatal(err)
 	}
 	_, answered := steps.WaitAnswered(s, work.ID, at, steps.AnswerTimeout)
-	var images5, files5, quotes3 bool
+	var images5, files5, quotes20 bool
 	if cs := s.Codex.CallsWithToken(at); len(cs) == 1 {
 		images5 = len(cs[0].Images) == 5
 		files5 = strings.Count(cs[0].Prompt, "\n- ") >= 10 && strings.Contains(cs[0].Prompt, "(original name: notes-5.txt; text/plain)")
-		quotes3 = strings.Contains(cs[0].Prompt, "\n3. From: E2E Owner; Source: Teams reference preview\n   quoted 3\n")
+		quotes20 = true
+		last := -1
+		for n := 1; n <= 20; n++ {
+			at := strings.Index(cs[0].Prompt, fmt.Sprintf("\n%d. From: E2E Owner; Source: Teams reference preview\n   quoted %d\n", n, n))
+			if at <= last {
+				quotes20 = false
+			}
+			last = at
+		}
 	}
-	s.Check("F-RND-8 5 images, 5 files and 3 quotes in one message run one turn with all of them", answered && images5 && files5 && quotes3,
-		"answered; 5 image inputs, 5 files listed, 3 quotes", fmt.Sprintf("answered=%v images=%v files=%v quotes=%v", answered, images5, files5, quotes3), s.Transcript(work.ID, 12)...)
+	s.Check("F-RND-8 5 images, 5 files and 20 quotes in one message run one turn with all of them", answered && images5 && files5 && quotes20,
+		"answered; 5 image inputs, 5 files listed, 20 ordered quotes", fmt.Sprintf("answered=%v images=%v files=%v quotes=%v", answered, images5, files5, quotes20), s.Transcript(work.ID, 12)...)
 }
 
 // TestMemoryCitationsHidden: F-MIR-8 / R-23. Codex's <oai-mem-citation>
