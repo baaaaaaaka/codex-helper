@@ -238,7 +238,10 @@ func streamSkillLegacySources(path string, visit func(json.RawMessage) error) er
 				return err
 			}
 		default:
-			return fmt.Errorf("unknown skill subscription field %q", name)
+			var ignored json.RawMessage
+			if err = d.Decode(&ignored); err != nil {
+				return err
+			}
 		}
 	}
 	if err = skillLegacyToken(d, '}'); err != nil {

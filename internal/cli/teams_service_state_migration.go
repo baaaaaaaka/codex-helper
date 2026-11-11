@@ -78,7 +78,6 @@ func decodeLegacyService(path string, value any) error {
 	}
 	defer f.Close()
 	d := json.NewDecoder(f)
-	d.DisallowUnknownFields()
 	if err = d.Decode(value); err != nil {
 		return err
 	}

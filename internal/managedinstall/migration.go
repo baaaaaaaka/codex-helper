@@ -55,7 +55,6 @@ func migrateRecord(db *sql.DB, path string) error {
 			reader.Discard(3)
 		}
 		d := json.NewDecoder(reader)
-		d.DisallowUnknownFields()
 		var r *Record
 		if err = d.Decode(&r); err != nil {
 			return err

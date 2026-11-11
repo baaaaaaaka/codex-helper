@@ -111,6 +111,31 @@ func TestAuthSQLiteMigrationAtomicAndQuiet(t *testing.T) {
 	}
 }
 
+// A chat-write cache saved as the raw Azure AD token response plus expires_at
+// was read by v0.1.20 and must not stop the service after an update.
+func TestAuthSQLiteMigrationIgnoresUnusedTokenFields(t *testing.T) {
+	dir := t.TempDir()
+	legacy := filepath.Join(dir, "teams-chat-write-token.json")
+	raw := "{\n  \"token_type\": \"Bearer\",\n  \"scope\": \"Chat.ReadWrite\",\n  \"expires_in\": 4469,\n  \"ext_expires_in\": 4469,\n  \"access_token\": \"access\",\n  \"refresh_token\": \"refresh\",\n  \"id_token\": \"header.claims.signature\",\n  \"expires_at\": 1785842712\n}\n"
+	if err := os.WriteFile(legacy, []byte(raw), 0600); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "tokens.sqlite")
+	st, err := openTokens(path, []legacyTokenSource{{legacy, "chat_write"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st.db.Close()
+	tok, err := ReadTokenCache(TokenLocation{Database: path, Slot: "chat_write"})
+	want := TokenCache{AccessToken: "access", RefreshToken: "refresh", ExpiresAt: 1785842712, ExpiresIn: 4469, Scope: "Chat.ReadWrite", TokenType: "Bearer"}
+	if err != nil || tok != want {
+		t.Fatalf("token %#v/%v", tok, err)
+	}
+	if b, err := os.ReadFile(legacy + ".migrated"); err != nil || string(b) != raw {
+		t.Fatalf("archive %q/%v", b, err)
+	}
+}
+
 func TestAuthSQLiteMigrationRollsBack(t *testing.T) {
 	for _, raw := range []string{`null`, `{`, `{} trailing`, `{"profiles":{"work":{},"work":{}}}`, `{"profiles":{"one":{},"two":null}}`} {
 		t.Run("config/"+raw, func(t *testing.T) {

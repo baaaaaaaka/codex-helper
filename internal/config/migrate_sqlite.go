@@ -180,10 +180,9 @@ func importLegacyConfig(tx *sql.Tx, reader io.Reader) (Config, error) {
 			if err == nil && token != json.Delim(']') {
 				err = fmt.Errorf("invalid config collection")
 			}
-		case "defaultModelProfile", "modelProfiles", "modelConfigVersion", "modelCredentials", "modelProviders", "models", "modelSources", "modelCatalogs", "modelProviderBindings", "yoloEnabled":
-			err = skipRetiredConfigValue(d)
 		default:
-			return v, fmt.Errorf("unknown legacy config field %q", name)
+			// Retired (model*, yoloEnabled) and unrecognized fields are not used.
+			err = skipRetiredConfigValue(d)
 		}
 		if err != nil {
 			return v, err

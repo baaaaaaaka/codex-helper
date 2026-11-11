@@ -1,6 +1,8 @@
 package appgateway
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -64,8 +66,10 @@ func migrateGatewayDatabase(db *sql.DB, dir string) error {
 		}
 		imported = append(imported, path)
 	}
-	// Import the previous log first, then the current log. Decode one record
-	// at a time and apply the same bounded retention as native event appends.
+	// Import the previous log first, then the current log, one line at a time
+	// with the same bounded retention as native event appends. Old releases
+	// only appended to these diagnostic logs and never read them, so a torn
+	// line from an interrupted append is skipped; the archive keeps its bytes.
 	for _, entry := range entries {
 		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
 			continue
@@ -79,22 +83,24 @@ func migrateGatewayDatabase(db *sql.DB, dir string) error {
 			if err != nil {
 				return err
 			}
-			d := json.NewDecoder(f)
+			r := bufio.NewReader(f)
 			for {
+				line, readErr := r.ReadBytes('\n')
+				if readErr != nil && !errors.Is(readErr, io.EOF) {
+					err = readErr
+					break
+				}
 				var v *Event
-				err = d.Decode(&v)
-				if errors.Is(err, io.EOF) {
-					err = nil
-					break
+				if len(bytes.TrimSpace(line)) != 0 && json.Unmarshal(line, &v) == nil {
+					if v == nil || strings.TrimSpace(v.ProfileID) == "" || profileFilePart(v.ProfileID)+".jsonl" != entry.Name() {
+						err = fmt.Errorf("invalid legacy gateway event scope")
+						break
+					}
+					if err = appendGatewayEvent(tx, *v); err != nil {
+						break
+					}
 				}
-				if err != nil {
-					break
-				}
-				if v == nil || strings.TrimSpace(v.ProfileID) == "" || profileFilePart(v.ProfileID)+".jsonl" != entry.Name() {
-					err = fmt.Errorf("invalid legacy gateway event scope")
-					break
-				}
-				if err = appendGatewayEvent(tx, *v); err != nil {
+				if readErr != nil {
 					break
 				}
 			}

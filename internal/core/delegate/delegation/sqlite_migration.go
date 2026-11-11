@@ -180,7 +180,11 @@ func importDelegationJSON(ctx context.Context, writer *delegationImportStatement
 			known = known || key == table
 		}
 		if !known {
-			return fmt.Errorf("unknown legacy delegation field %q", key)
+			var ignored json.RawMessage
+			if err = d.Decode(&ignored); err != nil {
+				return err
+			}
+			continue
 		}
 		open, close := json.Delim('{'), json.Delim('}')
 		if key == "records" {

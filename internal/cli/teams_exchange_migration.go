@@ -27,7 +27,6 @@ func decodeLegacyTeamsExchange(path string, v any) error {
 	}
 	defer f.Close()
 	d := json.NewDecoder(f)
-	d.DisallowUnknownFields()
 	if err = d.Decode(v); err != nil {
 		return err
 	}

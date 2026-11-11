@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -108,6 +109,45 @@ func TestGatewaySQLiteMigrationAndQuietWrites(t *testing.T) {
 	}
 	if got.LastError != "原始故障" || len(got.LegacyPorts) != 2 {
 		t.Fatalf("partial registration commit %#v", got)
+	}
+}
+
+// Old releases only appended to the event logs; an interrupted append left a
+// torn line that must not stop the helper from starting after an update.
+func TestGatewaySQLiteMigrationSkipsTornEventLines(t *testing.T) {
+	dir := t.TempDir()
+	log := filepath.Join(dir, profileFilePart("p")+".jsonl")
+	previous := `{"at":"2026-08-23T00:42:38Z","profileId":"p","event":"before"}` + "\n" +
+		`{"at":"2026-08-23T00:42:39.06582513Z","registrationId":"5651{"at":"2026-08-23T00:42:53Z","profileId":"p","event":"torn"}` + "\n" +
+		`{"at":"2026-08-23T00:42:54Z","profileId":"p","event":"after"}` + "\n"
+	if err := os.WriteFile(log+".1", []byte(previous), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(log, []byte(`{"at":"2026-11-10T00:00:00Z","profileId":"p","event":"current"}`+"\n"+`{"at":"2026-11-10T00:00:01Z","prof`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	r, err := newTestRegistry(t, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := r.db.Query(`SELECT event_name FROM gateway_events ORDER BY seq`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got []string
+	for rows.Next() {
+		var name string
+		if err = rows.Scan(&name); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, name)
+	}
+	if strings.Join(got, ",") != "before,after,current" {
+		t.Fatalf("events %v", got)
+	}
+	if b, err := os.ReadFile(log + ".1.migrated"); err != nil || string(b) != previous {
+		t.Fatalf("archive %q/%v", b, err)
 	}
 }
 

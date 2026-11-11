@@ -88,7 +88,6 @@ func decodeASRLegacy(path string, out any) error {
 	}
 	defer f.Close()
 	d := json.NewDecoder(f)
-	d.DisallowUnknownFields()
 	if err = d.Decode(out); err != nil {
 		return err
 	}

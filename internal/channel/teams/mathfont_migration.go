@@ -25,7 +25,6 @@ func migrateFontMarker(dir string) error {
 	}
 	defer f.Close()
 	d := json.NewDecoder(f)
-	d.DisallowUnknownFields()
 	var m *fontMarker
 	if err = d.Decode(&m); err != nil {
 		return err

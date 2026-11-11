@@ -55,7 +55,6 @@ func migrateInstallManifest(dir string) error {
 	}
 	defer stmt.Close()
 	d := json.NewDecoder(f)
-	d.DisallowUnknownFields()
 	token, err := d.Token()
 	if err != nil || token != json.Delim('{') {
 		return fmt.Errorf("invalid ASR manifest object")
@@ -103,7 +102,8 @@ func migrateInstallManifest(dir string) error {
 			}
 			_, err = d.Token()
 		default:
-			return fmt.Errorf("unknown ASR manifest field %q", key)
+			var ignored json.RawMessage
+			err = d.Decode(&ignored)
 		}
 		if err != nil {
 			return err

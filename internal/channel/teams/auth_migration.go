@@ -245,12 +245,20 @@ func migrateTokens(db *sql.DB, sources []legacyTokenSource) error {
 		if err != nil {
 			return err
 		}
+		// Match v0.1.20: ignore fields CXP does not use (raw token responses carry
+		// ext_expires_in and id_token) but require a token-shaped object.
 		d := json.NewDecoder(f)
-		d.DisallowUnknownFields()
+		var raw json.RawMessage
 		var token *TokenCache
-		err = d.Decode(&token)
+		err = d.Decode(&raw)
 		if err == nil {
 			err = endAuthJSON(d)
+		}
+		if err == nil {
+			err = json.Unmarshal(raw, &token)
+		}
+		if err == nil && token != nil && !legacyTokenFieldsPresent(raw) {
+			err = errors.New("no Teams token fields")
 		}
 		f.Close()
 		if err != nil {
@@ -276,6 +284,21 @@ func migrateTokens(db *sql.DB, sources []legacyTokenSource) error {
 		return err
 	}
 	return archiveAuthSources(imported)
+}
+func legacyTokenFieldsPresent(raw json.RawMessage) bool {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil {
+		return false
+	}
+	if len(fields) == 0 {
+		return true
+	}
+	for _, key := range []string{"access_token", "refresh_token", "expires_at", "expires_in", "scope", "token_type"} {
+		if _, ok := fields[key]; ok {
+			return true
+		}
+	}
+	return false
 }
 func legacyOverrideSources(path string) []legacyTokenSource {
 	paths := []string{path}

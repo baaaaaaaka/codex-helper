@@ -47,7 +47,6 @@ func migratePIDDatabase(db *sql.DB, path string) error {
 		}
 		defer f.Close()
 		d := json.NewDecoder(f)
-		d.DisallowUnknownFields()
 		token, err := d.Token()
 		// Empty old files existed before the first successful server start.
 		if err != io.EOF {
