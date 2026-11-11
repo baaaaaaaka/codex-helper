@@ -37,6 +37,18 @@ func TestMessageEditHTMLVariants(t *testing.T) {
 	}
 }
 
+func TestMessageEditLabelSurvivesHTMLWrappers(t *testing.T) {
+	for _, body := range []string{
+		`<div><p><strong>🧑‍💻 User:</strong></p><p>request</p></div>`,
+		`<!-- normalized --><div><p><span>🧑‍💻 User:</span></p><p>request</p></div>`,
+	} {
+		next, err := labelEdit(body, true, nil, testLabel)
+		if err != nil || next != "" {
+			t.Fatalf("normalization duplicated the user label: %s %v", next, err)
+		}
+	}
+}
+
 func TestMessageEditSelfLinkIsNotReceipt(t *testing.T) {
 	ctx := context.Background()
 	fg, a := newFake(t, fakegraph.Options{})
@@ -124,6 +136,14 @@ func TestMessageEditEventIdentity(t *testing.T) {
 	}
 	if got := fg.Messages(chat)[1]; got.PatchCount != 1 || strings.Count(got.Content, "actual transcript") != 1 {
 		t.Fatal(got.Content)
+	}
+	for _, text := range []string{"🙂", "😢"} {
+		if err := a.Annotate(ctx, chat, v.ID, channel.Annotation{Clips: []channel.Clip{{Name: "voice.ogg", Text: text}}, ClipsLabel: "Transcript"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := fg.Messages(chat)[1]; got.PatchCount != 3 || !strings.Contains(got.Content, "😢") {
+		t.Fatal("transcript identity discarded meaningful symbols", got.Content)
 	}
 }
 

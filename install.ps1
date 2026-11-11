@@ -190,7 +190,7 @@ function Wait-CodexProxyInstallPathReleased([string]$path, [int]$attempts = 120,
     if ($i -eq 0) { Write-Host "Waiting for existing codex-proxy process(es) to exit: $ids" }
     Start-Sleep -Milliseconds $delayMs
   }
-  throw "Cannot replace $path: processes $ids are still running. Close their sessions and rerun the installer. No binary was replaced."
+  throw "Cannot replace ${path}: processes $ids are still running. Close their sessions and rerun the installer. No binary was replaced."
 }
 
 function Test-IsCodexOwnedLegacyFile([string]$path) {

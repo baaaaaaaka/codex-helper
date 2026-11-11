@@ -117,4 +117,15 @@ func TestRealCodexGatewayRecoveryTUI(t *testing.T) {
 	waitNative(t, ctx, "native Codex input after recovery", func() bool { return strings.Contains(w.text(), "›") })
 	w.submit(t, ctx, "gateway-recovered-first")
 	waitNative(t, ctx, "first response after recovery", func() bool { return strings.Contains(w.text(), "ANSWER(gateway-recovered-first)") })
+	// Let CXP close its standalone broker before deleting the temporary home.
+	// SIGKILLing the PTY wrapper can leave native SQLite writers behind.
+	w.send(t, "\x04")
+	waitNative(t, ctx, "CXP and its broker exit", func() bool {
+		select {
+		case <-w.done:
+			return true
+		default:
+			return false
+		}
+	})
 }

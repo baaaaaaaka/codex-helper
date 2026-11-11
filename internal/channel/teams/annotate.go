@@ -2,6 +2,7 @@ package teams
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -116,24 +117,42 @@ func hasLabel(content, label string) bool {
 	if label == "" {
 		return false
 	}
-	// Only a complete leading paragraph/line is a label; quoted examples and
-	// partial split headers do not suppress the real user header.
-	first := leadingParagraphRE.FindString(content)
-	if first == "" {
-		if strings.Contains(content, "<") {
-			return false
-		}
-		first, _, _ = strings.Cut(content, "\n")
+	matches := func(text string) bool {
+		text = strings.TrimSpace(text)
+		return text == label+":" || strings.HasPrefix(text, label) && splitLabelRE.MatchString(strings.TrimPrefix(text, label))
 	}
-	// An inline code example is user content, even when it is the first line.
-	z := html.NewTokenizer(strings.NewReader(first))
-	for tt := z.Next(); tt != html.ErrorToken; tt = z.Next() {
-		if tt == html.StartTagToken && z.Token().Data == "code" {
+	if !strings.HasPrefix(strings.TrimSpace(content), "<") {
+		first, _, _ := strings.Cut(content, "\n")
+		return matches(first)
+	}
+	// Read the first visible block through harmless wrappers. Never accept a
+	// code example, quote, or partial first paragraph as the helper's label.
+	z := html.NewTokenizer(strings.NewReader(content))
+	var text strings.Builder
+	for {
+		switch z.Next() {
+		case html.ErrorToken:
 			return false
+		case html.TextToken:
+			text.Write(z.Text())
+		case html.StartTagToken, html.SelfClosingTagToken:
+			switch z.Token().Data {
+			case "blockquote", "pre", "code", "img", "attachment", "hr":
+				return false
+			case "br":
+				if strings.TrimSpace(text.String()) != "" {
+					return matches(text.String())
+				}
+			}
+		case html.EndTagToken:
+			switch z.Token().Data {
+			case "p", "div":
+				if strings.TrimSpace(text.String()) != "" {
+					return matches(text.String())
+				}
+			}
 		}
 	}
-	text := strings.TrimSpace(plainText(first))
-	return text == label+":" || strings.HasPrefix(text, label) && splitLabelRE.MatchString(strings.TrimPrefix(text, label))
 }
 
 // asHTML is a body as HTML: a text body is escaped, line breaks kept.
@@ -235,7 +254,7 @@ func transcriptEdit(chat, id, content string, isHTML bool, atts []graphAttachmen
 		content = asHTML(content, isHTML)
 	}
 	clips := clipsHTML(an.ClipsLabel, an.Clips)
-	link := annotationLink(chat, id, "transcript:"+channel.TextHash(clips))
+	link := annotationLink(chat, id, fmt.Sprintf("transcript:%x", sha256.Sum256([]byte(clips))))
 	if hasAnnotationStamp(content, link, "Clip", "") || hasAnnotationStamp(content, link, "Clip:", "") {
 		if an.Label != "" && !hasLabel(content, an.Label) {
 			return labelHTML(an.Label) + content, nil

@@ -41,18 +41,21 @@ state, ports and fake Graph/model services; unit tests also run locally.
 
 - Adapter/engine unit and race tests cover copied receipts, applied-but-lost
   PATCH, normalized HTML, restart, current-message links, screenshots, mentions,
-  incomplete labels, code examples, different pause events and stable time.
+  incomplete labels, Graph wrapper elements, code examples, different pause
+  events, symbol-only transcripts and stable time. Transcript identity hashes
+  exact clip content rather than text normalized for fuzzy matching.
   The adapter checks the actual single message GET and PATCH, not only a mock
   method invocation. Pre-fix HTML/screenshot/self-link regressions failed.
 - All three scripts/ci/run_e2e_shard.sh entry points passed (177 scenario
   reports). Reviewed goldens reflect the merged edit, screenshots, timestamp
   links and reference policy. TestQuotedMessages also combines repeated long
   references, a failed read, a forward and distinct full-file paths.
-- scripts/ci/run_shared_codex_contracts.sh uses native Codex 0.167.1 and PTY.
+- scripts/ci/run_shared_codex_contracts.sh uses native Codex 0.166.0/0.167.1 and PTY.
   New chat covers first/second turns, approvals, two windows and resume.
   GatewayRecoveryTUI controls recovery, checks no app-server starts beforehand,
   then verifies the native input interface and first response. The gate rejects
-  skipped or missing acceptance tests.
+  skipped or missing acceptance tests. Both versions passed the isolated gateway
+  acceptance test locally, including normal TUI and broker shutdown.
 - Restoring listener-only readiness deliberately made TestTUIGatewayWaitsForBackend
   fail. Its handshake requires a second failed probe before recovery is released.
 - Owner-only Graph PATCH/GET preserved receipt, pause and transcript links
@@ -64,6 +67,11 @@ state, ports and fake Graph/model services; unit tests also run locally.
   The boot gate adds a checksummed published rc.83 physical entry plus a frozen
   rc.96 runtime, and tests explicit bootstrap recovery with configuration intact.
   Linux cross-compilation is not native Windows execution evidence.
+- The full Linux coverage entry passed except the existing chmod-000 test under
+  root. That package and the E2E import boundary passed in an ordinary-user
+  container. Native CI is required before merge; first-run failures found a
+  PowerShell interpolation error, escaped Windows diagnostic paths and abrupt
+  test shutdown. These were corrected rather than skipped.
 
 Why old CI missed these defects: screenshot refusal and two edits were encoded
 as expected behavior; HTML fixtures used one serialization; self-links/text were
