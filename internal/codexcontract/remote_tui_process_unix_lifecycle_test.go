@@ -6,8 +6,12 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/baaaaaaaka/codex-helper/internal/proc"
 )
 
 func TestUnixRemoteTUIProcessStopTerminatesDescendants(t *testing.T) {
@@ -17,6 +21,7 @@ func TestUnixRemoteTUIProcessStopTerminatesDescendants(t *testing.T) {
 	command := filepath.Join(root, "codex-fixture")
 	fixture := `#!/bin/sh
 (
+  trap 'sleep 0.1; printf x >> "$CXP_DESCENDANT_MARKER"; exit 0' HUP
   while :; do
     printf x >> "$CXP_DESCENDANT_MARKER"
     sleep 0.02
@@ -54,6 +59,35 @@ wait
 
 	process.Stop()
 	_ = process.Wait()
+	if ctx.Err() != nil {
+		t.Fatal("Stop did not finish before context cancellation")
+	}
+	raw, err := os.ReadFile(childPID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || pid <= 1 {
+		t.Fatalf("invalid descendant pid %q: %v", raw, err)
+	}
+	// Wait reaps script, not its separate PTY session. Signal delivery and
+	// descendant exit are asynchronous; a last write before exit is allowed.
+	// Require actual termination within a bound, rather than guessing from
+	// two file sizes immediately after the supervisor exits.
+	deadline = time.Now().Add(3 * time.Second)
+	for {
+		alive, err := proc.CheckAlive(pid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !alive {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("remote TUI descendant %d remained alive after Stop", pid)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	before, err := os.Stat(marker)
 	if err != nil {
 		t.Fatal(err)
