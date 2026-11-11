@@ -480,7 +480,8 @@ func (e *Engine) send(ctx context.Context, r store.Outbox, chat, token string, f
 		if errors.Is(err, channel.ErrNotEditable) || errors.Is(err, channel.ErrNotFound) {
 			// The initial receipt normally owns the label. If it must be posted
 			// separately, restore the existing cosmetic label path.
-			if ann, ok := e.annotator(); ok && e.confirmationLabel(r.ConvID) != "" {
+			label, _ := e.confirmationLabel(r.ConvID)
+			if ann, ok := e.annotator(); ok && label != "" {
 				target := r.AppendTo
 				e.queueEdit(r.ConvID, chatEdit{key: "label:" + target, what: "user label", run: func(ctx context.Context, chat string) error {
 					if err := e.waitRead(ctx, editReadWait); err != nil {

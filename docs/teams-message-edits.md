@@ -43,7 +43,9 @@ state, ports and fake Graph/model services; unit tests also run locally.
   PATCH, normalized HTML, restart, current-message links, screenshots, mentions,
   incomplete labels, Graph wrapper elements, code examples, different pause
   events, symbol-only transcripts and stable time. Transcript identity hashes
-  exact clip content rather than text normalized for fuzzy matching.
+  exact clip content rather than text normalized for fuzzy matching. A controlled
+  first-membership check covers recovered receipts before and after admission;
+  the premature-edit regression failed before the fix.
   The adapter checks the actual single message GET and PATCH, not only a mock
   method invocation. Pre-fix HTML/screenshot/self-link regressions failed.
 - All three scripts/ci/run_e2e_shard.sh entry points passed (177 scenario

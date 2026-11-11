@@ -193,6 +193,34 @@ func TestMembershipRefreshIsBoundedAndReversible(t *testing.T) {
 	}
 }
 
+func TestMembershipConfirmationWaitsForFirstRead(t *testing.T) {
+	ch := &memberTestChannel{Fake: channeltest.New(), annotations: map[string]channel.Annotation{}}
+	e := &Engine{
+		cfg: Config{Channel: ch}, ch: timedChannel{ch}, now: time.Now,
+		convs:      map[int64]*convState{1: {group: true}},
+		readTokens: newPacer(100, time.Minute, time.Now),
+	}
+	row := store.Outbox{ConvID: 1, AppendTo: "recovered", DeliveryKey: "ack:recovered"}
+	if err := e.appendConfirmation(context.Background(), row, "chat", channel.Part{}); !errors.Is(err, errEditLater) || len(ch.annotations) != 0 {
+		t.Fatalf("receipt was edited before membership: %v %+v", err, ch.annotations)
+	}
+	e.convs[1].readOnce, e.convs[1].group = true, false
+	if err := e.appendConfirmation(context.Background(), row, "chat", channel.Part{}); err != nil {
+		t.Fatal(err)
+	}
+	if an := ch.annotations["chat/recovered"]; an.Label != labelUser || an.Confirmation == nil {
+		t.Fatal("recovered receipt lost its user label", an)
+	}
+	e.convs[1].group = true
+	row.AppendTo = "shared"
+	if err := e.appendConfirmation(context.Background(), row, "chat", channel.Part{}); err != nil {
+		t.Fatal(err)
+	}
+	if an := ch.annotations["chat/shared"]; an.Label != "" || an.Confirmation == nil {
+		t.Fatal("receipt ignored current group membership", an)
+	}
+}
+
 func TestMembershipVoiceEditWaitsForFirstReadAndChecksCurrentGroup(t *testing.T) {
 	ch := &memberTestChannel{Fake: channeltest.New(), annotations: map[string]channel.Annotation{}}
 	e := &Engine{

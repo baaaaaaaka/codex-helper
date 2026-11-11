@@ -251,16 +251,16 @@ func TestPromptConfirmationLabelScope(t *testing.T) {
 	r := newRig(t)
 	work := r.newWork(t.TempDir())
 	conv := convIDForTest(r, work)
-	if got := r.e.confirmationLabel(conv); got != labelUser {
-		t.Fatal(got)
+	if got, err := r.e.confirmationLabel(conv); err != nil || got != labelUser {
+		t.Fatal(got, err)
 	}
 	r.e.mu.Lock()
 	r.e.convs[conv].group = true
 	r.e.mu.Unlock()
-	if got := r.e.confirmationLabel(conv); got != "" {
-		t.Fatal("label in group", got)
+	if got, err := r.e.confirmationLabel(conv); err != nil || got != "" {
+		t.Fatal("label in group", got, err)
 	}
-	if got := r.e.confirmationLabel(r.e.inboxID); got != "" {
-		t.Fatal("label in inbox", got)
+	if got, err := r.e.confirmationLabel(r.e.inboxID); err != nil || got != "" {
+		t.Fatal("label in inbox", got, err)
 	}
 }
