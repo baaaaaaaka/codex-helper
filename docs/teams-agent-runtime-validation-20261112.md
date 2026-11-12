@@ -102,6 +102,14 @@ change or nested installation from the agent's read-only CLI commands.
 
 ## Rollout limits
 
+The rc.3 Release CI reported a transcript mismatch in the existing
+`TestModelSwitchWhileBusy`. Its functional checks passed, but its simulated
+crash could interrupt the queued turn's separate control-chat notification.
+The test now waits for that notification before the crash. This makes the
+required event ordering explicit while retaining the full golden transcript,
+the crash, model-persistence assertions and all invariants. A new rc.4 tag is
+used for the corrected candidate; the failed rc.3 tag is not moved.
+
 An already running app-server keeps its original environment. This source
 change takes effect when the updated helper starts a new app-server through
 the normal control-chat lifecycle. No running host helper was restarted,

@@ -52,6 +52,13 @@ func TestModelSwitchWhileBusy(t *testing.T) {
 	s.Codex.Release(s.Codex.CallsWithToken(running)[0].Seq)
 	steps.WaitAnswered(s, work.ID, running, steps.AnswerTimeout)
 	steps.WaitAnswered(s, work.ID, queued, steps.AnswerTimeout)
+	// The work-chat answer and control-chat notification are sent separately.
+	// Finish the latter before crashing so this scenario tests persistence of
+	// the model selection, rather than an in-flight notification recovery.
+	s.Require("the queued turn's control notification is delivered", steps.CommandTimeout, func() (bool, string) {
+		_, ok := s.WaitSUTMessage(control.ID, "Request: Next task "+queued, time.Second)
+		return ok, "queued turn notification not yet delivered"
+	})
 
 	s.CrashSUT()
 	s.StartSUT()
