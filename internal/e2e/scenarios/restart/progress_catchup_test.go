@@ -2,18 +2,16 @@ package restart
 
 import (
 	"fmt"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/baaaaaaaka/codex-helper/internal/core/lease"
-	"github.com/baaaaaaaka/codex-helper/internal/core/store"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/harness"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/steps"
 )
 
 func TestCatchUpKeepsCommentaryAndCompaction(t *testing.T) {
+	harness.NeedsCLI(t)
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "MIR-PROGRESS-CATCHUP", harness.Options{Guarantees: []string{"F-MIR-4", "R-1", "R-2"}, Title: "commentary written while helper is stopped is caught up once before its answer", Budget: 90 * time.Second})
 	defer s.Finish()
@@ -59,22 +57,15 @@ func TestCatchUpKeepsCommentaryAndCompaction(t *testing.T) {
 	s.Check("history preserves complete source order across two restarts", ok, "prompt, progress, answer once each", fmt.Sprint(ok), s.Transcript(chat, 12)...)
 }
 
-// Graph can expose a message before its send outcome is committed. Do not
-// stop the helper in that gap when this scenario tests history catch-up.
+// A Graph message can be visible before its send outcome is committed.
+// Observe the running helper's published delivery status before restarting.
 func waitMirrorOutbox(t *testing.T, s *harness.Scenario) {
 	t.Helper()
-	anchor := filepath.Join(s.Env.StateDir, "codex-helper", "teams", "core.sqlite")
-	s.Require("mirror sends are durably settled", 30*time.Second, func() (bool, string) {
-		info, err := lease.Read(anchor)
-		if err != nil || info.CurrentGen == 0 {
-			return false, fmt.Sprint(err)
-		}
-		st, err := store.OpenWith(info.DB, store.Options{ReadOnly: true, RequireExisting: true})
-		if err != nil {
-			return false, err.Error()
-		}
-		defer st.Close()
-		counts, err := st.OutboxCounts()
-		return err == nil && len(counts) == 0, fmt.Sprintf("counts=%v err=%v", counts, err)
+	if !s.Settle(time.Second, 10*time.Second) {
+		t.Fatal("Graph writes did not settle")
+	}
+	s.Require("mirror sends are settled", 30*time.Second, func() (bool, string) {
+		result := s.RunCLIAs(10*time.Second, harness.CLIAs{Poll: true}, "teams", "status")
+		return result.Code == 0 && strings.Contains(result.Stdout, "Unsent messages: 0 queued, 0 sending, 0 unconfirmed"), result.Combined
 	})
 }
