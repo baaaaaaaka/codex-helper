@@ -1,4 +1,4 @@
-# IDLE: 6 idle work chats: chat reads independent of N, no writes, CPU <= 1% of a core
+# IDLE: 6 recently created work chats: bounded reads, no writes, CPU <= 1% of a core
 # cxp black-box transcript; volatile values are numbered placeholders
 
 == chat <chat:1> "🏠 Codex Control - e2ehost"

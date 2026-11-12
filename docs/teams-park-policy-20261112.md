@@ -167,3 +167,12 @@ chat without relaxing its bounds. The catalog test passed locally, and the
 affected entry and lifecycle scenarios passed in the isolated Docker harness
 (44.928s and 29.302s). A new commit and candidate tag carry these corrections;
 the original candidate tag is unchanged.
+
+The v0.1.23-rc.6 release CI also found that the idle-cost scenario assumed
+newly created work chats were covered only by the activity scan. The approved
+cooling tiers instead read recent chats every 2 seconds, and older active chats
+at 5, 10 or 30 seconds. The scenario now checks a per-chat upper bound for
+the recent tier, while retaining its no-write and CPU checks. This change
+does not preserve the former aggregate-read budget: periodic reads now scale
+with eligible chat count, within the unchanged account-wide limiter. The
+updated cost scenario passed in the isolated Docker harness (60.695s).
