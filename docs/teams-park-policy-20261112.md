@@ -194,3 +194,9 @@ passed. The transcript comparison now recognizes exactly those two notice forms;
 the behavior assertions and the rest of the snapshot remain in place.
 The scenario passed three consecutive runs in the isolated Docker harness
 (50.895s total).
+
+The v0.1.23-rc.9 release race suite observed a confirmation on the channel
+before its asynchronous outbox transaction committed. The durable-fallback test
+now waits for the sent outbox state before checking its exact message ID and
+other fields; its persistence assertions are unchanged. Ten local race runs
+of that scenario passed (35.253s).

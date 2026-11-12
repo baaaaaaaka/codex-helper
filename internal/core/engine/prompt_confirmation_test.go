@@ -114,6 +114,12 @@ func TestPromptConfirmationDurableFallback(t *testing.T) {
 	work := r.newWork(t.TempDir())
 	r.ch.PostUser(work, "fallback receipt")
 	r.wait("separate fallback", func() bool { return len(r.own(work, "Request accepted")) == 1 })
+	// The external post can be observed before the sender commits its outbox
+	// update. Wait for the durable state before asserting its exact contents.
+	r.wait("fallback persisted", func() bool {
+		rows, err := r.st.OutboxByKeyPrefix("ack:")
+		return err == nil && len(rows) == 1 && rows[0].State == store.OutSent
+	})
 	rows, err := r.st.OutboxByKeyPrefix("ack:")
 	if err != nil || len(rows) != 1 || rows[0].AppendTo != "" || rows[0].State != store.OutSent || rows[0].ExtMsgID == "" {
 		t.Fatalf("fallback not persisted: %+v %v", rows, err)
