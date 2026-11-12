@@ -176,3 +176,13 @@ the recent tier, while retaining its no-write and CPU checks. This change
 does not preserve the former aggregate-read budget: periodic reads now scale
 with eligible chat count, within the unchanged account-wide limiter. The
 updated cost scenario passed in the isolated Docker harness (60.695s).
+
+The v0.1.23-rc.7 main CI passed, but the release workflow encountered two
+hosted-runner startup timeouts outside the Teams policy change: a PowerShell
+account-path probe exceeded 15 seconds and a race-instrumented cancellation
+fixture did not publish its child PID within 5 seconds. Their test-only startup
+allowances were increased to 30 and 20 seconds respectively; the cancellation
+fixture now reports an early process exit directly. Product timeouts and the
+process-group cleanup assertions are unchanged. Five local race repetitions of
+the cancellation test and the userpath package tests passed. The PowerShell live check
+requires the native release runner; it was not run on the development host.

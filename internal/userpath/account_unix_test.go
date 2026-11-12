@@ -99,7 +99,7 @@ func TestAccountDefaultLiveShellMatrix(t *testing.T) {
 					"XDG_CONFIG_HOME=" + filepath.Join(target.Home, ".config"),
 				},
 				HelperExecutable: helper,
-				Timeout:          15 * time.Second,
+				Timeout:          30 * time.Second,
 			})
 			if err != nil {
 				t.Fatal(err)

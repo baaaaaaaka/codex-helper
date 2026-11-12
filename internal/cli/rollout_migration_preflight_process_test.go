@@ -61,11 +61,16 @@ exit 64
 	// into a false "did not start" failure.  Redirection creates the file before
 	// printf has finished writing it, so existence alone is not a readiness
 	// signal on macOS.
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(20 * time.Second)
 	var pid int
 	var pidReadErr error
 	var pidParseErr error
 	for {
+		select {
+		case err := <-result:
+			t.Fatalf("migration exited before its child was ready: %v", err)
+		default:
+		}
 		pidRaw, readErr := os.ReadFile(childPIDPath)
 		pidReadErr = readErr
 		if readErr == nil {
