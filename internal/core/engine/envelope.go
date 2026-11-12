@@ -412,7 +412,7 @@ func (e *Engine) fetchQuote(ctx context.Context, inboundID int64, f store.Inboun
 			if !m.Created.IsZero() {
 				qt.Time = m.Created.UTC().Format("2006-01-02T15:04:05.000Z")
 			}
-			if t := strings.TrimSpace(m.Text); t != "" {
+			if t := strings.TrimSpace(channel.WithLinks(m.Text, m.Links)); t != "" {
 				qt.Text = t
 			}
 		case errors.Is(err, channel.ErrNotFound), errors.As(err, &rej) && rej.Permanent:
@@ -470,13 +470,24 @@ func screen(c *classified) {
 		(c.in.Kind != store.InPrompt && c.in.Kind != store.InCommand) {
 		return
 	}
-	if containsRawAPIKey(c.msg.Text) {
+	if containsRawAPIKey(channel.WithLinks(c.msg.Text, c.msg.Links)) {
 		c.reject, c.rejectQuote = textRawAPIKey, ""
 		c.in.Kind, c.in.Body = store.InCommand, redactedBody
 		return
 	}
 	if c.reject != "" {
 		return // classify refused it (bare @codex, a coworker's command)
+	}
+	if c.in.Kind == store.InPrompt {
+		c.in.Body = channel.WithLinks(c.in.Body, c.msg.Links)
+	} else if c.cmd.name == cmdAnswer {
+		// The answer is sent to Codex too. Keep the explicit --skip operation
+		// intact; quoted literal --skip is already escaped by classify.
+		fields := strings.Fields(c.cmd.arg)
+		if len(fields) > 1 && strings.Join(fields[1:], " ") != "--skip" {
+			c.in.Body = channel.WithLinks(c.in.Body, c.msg.Links)
+			c.cmd.arg = channel.WithLinks(c.cmd.arg, c.msg.Links)
+		}
 	}
 	if c.cmd.name == cmdAnswer && (len(c.msg.Files) > 0 || hasQuestionAttachment(c.msg.Attachments)) {
 		c.reject = "Question answers support text only. Reply with text or use `helper answer Q<number> --skip`."

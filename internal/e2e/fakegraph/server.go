@@ -493,6 +493,10 @@ func matchGraphRoute(method, p string) routeMatch {
 		return m
 	}
 	switch {
+	case len(parts) == 1 && parts[0] == "$batch" && method == http.MethodPost:
+		return set("/$batch")
+	case len(parts) == 2 && parts[0] == "search" && parts[1] == "query" && method == http.MethodPost:
+		return set("/search/query")
 	case len(parts) == 4 && parts[0] == "me" && parts[1] == "drive" && parts[2] == "items" && method == http.MethodGet:
 		m.extra = parts[3]
 		return set("/me/drive/items/{id}")
@@ -607,6 +611,10 @@ func (s *Server) handleLogin(route routeMatch, r *http.Request, body []byte) res
 
 func (s *Server) handleGraph(route routeMatch, q url.Values, body []byte, rec *Request) response {
 	switch route.name {
+	case "POST /$batch":
+		return s.readBatch(body, rec)
+	case "POST /search/query":
+		return s.searchMessages(body, rec)
 	case "GET /me":
 		if v := checkSelect(q, "id", "displayName", "userPrincipalName", "mail", "givenName", "surname", "jobTitle", "officeLocation"); v != "" {
 			return violationResponse(rec, "graph-contract", v)

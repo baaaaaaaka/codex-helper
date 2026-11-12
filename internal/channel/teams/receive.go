@@ -259,6 +259,7 @@ func (a *Adapter) convert(chat string, gm graphMessage, owner string) channel.In
 	}
 	if strings.EqualFold(gm.Body.ContentType, "html") {
 		m.Text = plainText(content)
+		m.Links = namedLinks(content)
 	} else {
 		m.Text = strings.TrimSpace(markerRE.ReplaceAllString(content, ""))
 	}
@@ -378,7 +379,7 @@ func quoteFrom(at graphAttachment) channel.Quote {
 	return channel.Quote{
 		ID:       first(c.MessageID, c.OriginalID, at.ID),
 		FromName: first(name(c.MessageSender), name(c.OriginalSender)),
-		Text:     first(c.MessagePreview, plainText(c.OriginalText)),
+		Text:     channel.WithLinks(first(c.MessagePreview, plainText(c.OriginalText)), namedLinks(c.OriginalText)),
 		Time:     strings.TrimSpace(c.OriginalTime),
 	}
 }

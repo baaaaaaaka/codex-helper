@@ -63,6 +63,10 @@ type call struct {
 	// buf, when set, holds the response body instead of a new slice; the
 	// body is then valid only until buf is reused (getDecoded).
 	buf *bytes.Buffer
+	// readRedirect exposes a download Location to the bounded reader, which
+	// follows it separately without Graph credentials. Other callers keep
+	// their existing redirect behavior.
+	readRedirect bool
 }
 
 type response struct {
@@ -109,6 +113,9 @@ func (g *graph) do(ctx context.Context, c call) (response, error) {
 
 // retryableRead: transport failures and plain 5xx (not throttling).
 func retryableRead(err error) bool {
+	if errors.Is(err, errReadBudget) {
+		return false
+	}
 	if _, ok := channel.AsThrottled(err); ok {
 		return false
 	}
@@ -252,6 +259,9 @@ func (g *graph) send(ctx context.Context, c call) (response, string, error) {
 		return resp, token, nil
 	}
 	if hr.StatusCode == http.StatusUnauthorized {
+		return resp, token, nil
+	}
+	if c.readRedirect && hr.StatusCode >= 300 && hr.StatusCode < 400 {
 		return resp, token, nil
 	}
 	return response{}, token, g.classify(c, resp)

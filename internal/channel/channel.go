@@ -197,6 +197,7 @@ type InboundMsg struct {
 	MentionsOwner bool   // the owner is @mentioned
 	Edited        bool   // the author edited it after posting
 	Text          string // plain text, "\n" line breaks
+	Links         []Link // named hyperlinks, kept separately from command text and echo hashes
 	Hash          string // TextHash(Text)
 	Marker        string // hidden helper marker found in the message ("" if none or stripped)
 	Files         []FileRef
@@ -207,6 +208,12 @@ type InboundMsg struct {
 	// "Teams-hosted inline content" per inline image of the body. The
 	// control chat, which takes text only, refuses a message by these.
 	Attachments []string
+}
+
+// Link associates visible anchor text with its destination.
+type Link struct {
+	Text string
+	URL  string
 }
 
 // Quote is a message quoted or forwarded inside an inbound message.

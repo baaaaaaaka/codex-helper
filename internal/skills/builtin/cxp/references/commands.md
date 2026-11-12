@@ -70,6 +70,14 @@ Use `cxp proxy` only when the user is asking about SSH/network routing.
 
 From a Teams-launched Codex child turn, do not restart, update, kill, replace, or background the running helper directly. Tell the user to send `helper restart now` after local upgrades or `helper update now` / `helper update prerelease` for release updates.
 
+## Teams Resource Reads
+
+For Graph discussion reads, use `cxp teams read <URL|ref> [--before N] [--latest N]`
+or channel `--replies`; `cxp teams search <query>` locates candidates and
+`cxp teams fetch <attachment-ref> --output <path>` downloads selected content.
+All support `--json`; read/search return cursors for incomplete ranges.
+See [Teams reading](teams-read.md) for selection, costs, permissions, and failures.
+
 ## Cross-Machine Delegation
 
 Use these from a Codex turn when the user naturally asks another signed-in Teams machine or remote agent to inspect part of the task. Load `references/delegation.md` for the full workflow.

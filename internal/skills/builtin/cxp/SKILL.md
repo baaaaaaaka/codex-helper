@@ -14,6 +14,12 @@ CXP-managed skill operations (install-builtin, list, add, sync,
 doctor, push, or remove). Do not trigger for conceptual history, generic skill
 authoring, source changes, or unrelated GPU/scheduler work.
 
+For a Teams conversation/message link, reading discussion context, finding a
+message, or downloading a Teams attachment, load `references/teams-read.md`.
+Use `cxp teams read`, `search`, and `fetch` with the current read identity.
+Choose history/replies explicitly for the user's objective; these commands do
+not require a running helper and do not send messages or change session bindings.
+
 Read live help: `cxp --help`, `cxp <command> --help`, and `cxp <command> <subcommand> --help`. For the command map and workflows, load `references/commands.md`.
 
 For natural-language cross-machine requests, load `references/delegation.md`. Use `cxp delegate resolve/start/status/wait/cancel --json`; do not scan raw Teams registry messages.

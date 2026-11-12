@@ -43,6 +43,17 @@ violation instead of guessing.
 | A14 | A posted reference attachment must point at a drive item (`contentUrl` = its `webUrl`/`webDavUrl`), carry the GUID of that item's eTag as `id`, have a `name`, and be referenced by an `<attachment id>` tag | Rejected as `graph-contract` otherwise. Real Teams' exact checks are not documented; the eTag-GUID rule is what Teams clients do | R-37-out |
 | A15 | Teams Workflow webhook (M3): pre-signed `https://<env>.environment.api.powerplatform.com:443/powerautomate/automations/direct/workflows/<id>/triggers/manual/paths/invoke?api-version=1&sp=...&sv=1.0&sig=...`; POST `application/json` `{"type":"message","attachments":[{"contentType":"application/vnd.microsoft.card.adaptive","content":{"type":"AdaptiveCard","version":...}}]}` up to 28 KB, no `Authorization` | 202 Accepted with an empty body; wrong `sig` 401; unknown workflow 404; anything else `workflow-contract`. Faults by `Host: fakegraph.WorkflowHost`. The card is recorded, not posted into a chat | NOTIFY |
 
+## Read CLI subset
+
+The read CLI scenarios additionally model GET-only JSON batches (1..20 items,
+individual statuses) and literal `chatMessage` searches with offset paging,
+partial resources and `moreResultsAvailable`. Search does not model KQL,
+indexing delay, channel reply parents or real relevance ranking. The fake's
+search total is page size and is not an oracle for the actual service's total.
+Production planning is based on the separate real Graph experiments; package
+tests cover channel routes, ignored filters, sparse pages, download redirects,
+range failures, changed versions, and mixed batch failures.
+
 ## Not modelled at all
 
 - Channel messages, chat creation by other users, message deletion and
