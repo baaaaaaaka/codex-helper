@@ -1,6 +1,8 @@
 # cxp Command Reference
 
-`cxp` is the short command installed next to `codex-proxy`. Both invoke the same binary. Prefer `cxp` in user-facing examples, but use `codex-proxy` or `$CODEX_HELPER_CLI_PATH` when `cxp` is not visible in the current process PATH.
+`cxp` is the short command installed next to `codex-proxy`. Both invoke the same binary. Prefer `cxp` in user-facing examples. In Teams turns use the supplied stable installation entry even if `cxp` is on PATH: `"$CODEX_HELPER_CLI_PATH"` in POSIX shells, or `& $env:CODEX_HELPER_CLI_PATH` in PowerShell. The entry selects its installation's current confirmed runtime. Do not run an immutable version-directory binary directly or switch to a different installation when the supplied entry fails.
+
+The same supplied entry works when `cxp` is not visible in the current process PATH.
 
 ## General Checks
 

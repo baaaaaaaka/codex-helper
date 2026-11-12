@@ -5,7 +5,14 @@ description: "Operate installed CXP/codex-proxy/codex-helper: SSH/proxy profiles
 
 # cxp
 
-Use `cxp` (or `codex-proxy`); in Teams turns prefer `$CODEX_HELPER_CLI_PATH` because service PATH may differ.
+Use `cxp` (or `codex-proxy`). In Teams turns use the supplied installation entry:
+POSIX shells: `"$CODEX_HELPER_CLI_PATH" teams read --help`;
+PowerShell: `& $env:CODEX_HELPER_CLI_PATH teams read --help`.
+Quote the path because it may contain spaces. A managed helper supplies its
+own stable entry; each invocation selects that installation's current confirmed
+runtime, which can be newer than the running helper. Service PATH may select
+another installation. If the supplied entry is missing or cannot run, report the
+path and error; do not guess a version-directory binary or another PATH entry.
 
 Trigger for installed CXP operations, even if they do not name CXP:
 standard approvals, Teams helper/control/work chats, cross-machine delegation, SSH/proxy profiles,

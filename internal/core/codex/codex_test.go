@@ -29,6 +29,9 @@ const (
 // TestMain doubles as the fake Codex binary (the test binary re-executed
 // with envFake) and as a long sleeper for the PID file tests.
 func TestMain(m *testing.M) {
+	if len(os.Args) >= 4 && os.Args[1] == "app-server" && os.Args[2] == "--test-runtime-environment" {
+		os.Exit(writeRuntimeEnvironmentFixture(os.Args[3]))
+	}
 	switch {
 	case os.Getenv(envSleeper) == "1":
 		time.Sleep(time.Minute)

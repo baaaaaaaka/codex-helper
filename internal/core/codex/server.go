@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 )
 
 // Config describes how to launch an app-server.
@@ -138,6 +140,12 @@ func Start(ctx context.Context, cfg Config) (*Server, error) {
 			return nil, fmt.Errorf("codex: prepare app-server: %w", err)
 		}
 	}
+	// Runtime markers belong to the helper, including when Configure changes
+	// identity or restores inherited environment. Keep an explicitly empty env.
+	if cmd.Env == nil {
+		cmd.Env = os.Environ()
+	}
+	cmd.Env = helperruntime.WithoutRuntimeMarkers(cmd.Env)
 	if cfg.SharedDir != "" {
 		return startShared(ctx, cfg, cmd, startErr)
 	}

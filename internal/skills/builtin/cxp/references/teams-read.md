@@ -1,6 +1,8 @@
 # Teams resources, search, and attachments
 
-Use the installed CLI (`$CODEX_HELPER_CLI_PATH` in Teams turns) and check its
+Use the installed CLI (the supplied stable entry in Teams turns:
+`"$CODEX_HELPER_CLI_PATH"` in POSIX shells or `& $env:CODEX_HELPER_CLI_PATH`
+in PowerShell) and check its
 `teams read|search|fetch --help` when flags or version support are uncertain.
 These are generic read capabilities. Select the scope for the current user
 request; there is no default task-handoff workflow or automatic history fetch.

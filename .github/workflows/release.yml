@@ -241,12 +241,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cli_pattern='Test(TeamsStandardRuntimeRefreshesManagedNodePATHAfterExecutorCreation|TeamsAppServerReceivesUserPathInsteadOfServiceOrManagedRuntime|ApplyTeamsUserPathRuntime.*|ResolveTeamsCodexUserPath.*|CommandLooksNative.*|RunCodexNewSessionUsesManagedNodeWithoutSystemNode|CodexRuntimeEnvironment.*|MergeCLIEnvironment.*|CodexAppAuthIdentityRuntimeEnvPrependsTargetManagedNode|RunTargetOnceWithOptionsRemovesRuntimeMarkers|StartCodexDesktopProcessPassesProxyArgAndEnv)$'
+          cli_pattern='Test(TeamsCodexChildEnv.*|TeamsStandardRuntimeRefreshesManagedNodePATHAfterExecutorCreation|TeamsAppServerReceivesUserPathInsteadOfServiceOrManagedRuntime|ApplyTeamsUserPathRuntime.*|ResolveTeamsCodexUserPath.*|CommandLooksNative.*|RunCodexNewSessionUsesManagedNodeWithoutSystemNode|CodexRuntimeEnvironment.*|MergeCLIEnvironment.*|CodexAppAuthIdentityRuntimeEnvPrependsTargetManagedNode|RunTargetOnceWithOptionsRemovesRuntimeMarkers|StartCodexDesktopProcessPassesProxyArgAndEnv)$'
           process_pattern='Test(MergeAppServerProcessEnv.*|AppServerProcessStarter(RemovesInheritedRuntimeMarkers|RemovesRuntimeMarkersAfterConfiguration|NilConfiguredEnvironmentKeepsSanitizedParent)|AppServerRunnerRetries(LaunchFailureBeforeInitialization|TransportFailureDuringInitialization))$'
           go test ./internal/cli -count=1 -run '^TestNativeWindowsHTTPClient.*$' -v
           go test ./internal/cli -count=1 -run '^TestCodexAppAuthWindowsProxyBrowserScriptPassesIndependentArgsIntegration$' -v
           go test ./internal/cli -count=1 -run "$cli_pattern" -v
           go test ./internal/codexrunner -count=1 -run "$process_pattern" -v
+          go test ./internal/core/codex -count=1 -run '^TestStartRemovesRuntimeMarkers$' -v
 
       - name: CXP immutable runtime and process identity
         shell: bash

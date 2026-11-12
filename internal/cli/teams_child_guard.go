@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/baaaaaaaka/codex-helper/internal/helperpath"
+	"github.com/baaaaaaaka/codex-helper/internal/helperruntime"
 )
 
 const (
@@ -27,18 +28,24 @@ func teamsCodexChildEnv() []string {
 		envTeamsCodexChild + "=1",
 		envTeamsCodexParentPID + "=" + strconv.Itoa(os.Getpid()),
 	}
-	exe, err := teamsChildExecutablePath()
-	if err != nil {
-		return env
+	var exe string
+	if current, managed := helperruntime.Current(); managed {
+		// An immutable runtime is not an installation entry: invoking it with
+		// clean child environment would bootstrap a nested runtime directory.
+		// Keep the owning entry even if it disappears; never select another
+		// installation from PATH or fall back to the immutable executable.
+		exe = current.EntryPath
+	} else {
+		raw, err := teamsChildExecutablePath()
+		if err != nil || strings.TrimSpace(raw) == "" {
+			return env
+		}
+		resolved, err := helperpath.StableRunnablePathFromSources(raw, teamsServiceArgv0(), helperpath.Options{GOOS: teamsServiceGOOS()})
+		if err != nil {
+			return env
+		}
+		exe = resolved.Path
 	}
-	if strings.TrimSpace(exe) == "" {
-		return env
-	}
-	resolved, err := helperpath.StableRunnablePathFromSources(exe, teamsServiceArgv0(), helperpath.Options{GOOS: teamsServiceGOOS()})
-	if err != nil {
-		return env
-	}
-	exe = resolved.Path
 	env = append(env, envTeamsHelperCLIPath+"="+exe)
 	dir := filepath.Dir(exe)
 	if strings.TrimSpace(dir) == "" || dir == "." {
