@@ -1,4 +1,4 @@
-# RUN-INTERVAL: `cxp teams run --interval 3s`: an idle helper reads Teams every 3 s instead of the default pace, and still answers
+# RUN-INTERVAL: `cxp teams run --interval 3s`: the control chat is read every 3 s instead of the default pace, and the helper still answers
 # cxp black-box transcript; volatile values are numbered placeholders
 
 == chat <chat:1> "🏠 Codex Control - e2ehost"

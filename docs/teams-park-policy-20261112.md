@@ -155,3 +155,15 @@ complete Codex package passed without race instrumentation in the isolated
 container; all remaining Codex tests passed with race instrumentation on the
 host. The container has no C compiler, so it cannot run Go race binaries. Native
 platform and complete race coverage remain part of the release CI gates.
+
+## Candidate CI corrections
+
+The v0.1.23-rc.5 CI found three test integration errors: the new lifecycle
+scenario's behavior catalog mapping was inaccurate, one migration assertion
+still expected schema 7, and the `--interval` scenario counted work-chat and
+other GETs instead of control-chat reads. The catalog mapping and schema
+expectation were corrected, and the interval assertion now measures the control
+chat without relaxing its bounds. The catalog test passed locally, and the
+affected entry and lifecycle scenarios passed in the isolated Docker harness
+(44.928s and 29.302s). A new commit and candidate tag carry these corrections;
+the original candidate tag is unchanged.

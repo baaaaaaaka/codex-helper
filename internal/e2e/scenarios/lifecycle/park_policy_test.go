@@ -11,7 +11,7 @@ import (
 
 func TestParkPolicyCommandsAndRestart(t *testing.T) {
 	harness.Parallel(t)
-	s := harness.NewScenario(t, "PARK-POLICY", harness.Options{Guarantees: []string{"F-WRK-5", "F-WRK-6", "F-WRK-7"}, Title: "automatic park policy persists and preserves manual park", Budget: 120 * time.Second})
+	s := harness.NewScenario(t, "PARK-POLICY", harness.Options{Guarantees: []string{"F-WRK-6"}, Title: "automatic park policy persists and preserves manual park", Budget: 120 * time.Second})
 	defer s.Finish()
 	control := steps.ReadyControlChat(s)
 	chat, _ := steps.NewWorkChat(s, control, "park-policy")

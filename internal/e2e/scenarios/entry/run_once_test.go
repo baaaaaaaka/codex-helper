@@ -65,14 +65,14 @@ func TestRunOnce(t *testing.T) {
 }
 
 // RUN-INTERVAL (F-CLI-3): `cxp teams run --interval 3s` reads Teams at
-// that pace: an idle helper makes a few reads where the default pace
-// makes many, and still answers the owner.
+// that pace: its control chat receives a few reads where the default pace
+// makes many, and the helper still answers the owner.
 func TestRunInterval(t *testing.T) {
 	harness.NeedsCLI(t)
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "RUN-INTERVAL", harness.Options{
 		Guarantees: []string{"F-CLI-3"},
-		Title:      "`cxp teams run --interval 3s`: an idle helper reads Teams every 3 s instead of the default pace, and still answers",
+		Title:      "`cxp teams run --interval 3s`: the control chat is read every 3 s instead of the default pace, and the helper still answers",
 		Budget:     180 * time.Second,
 	})
 	defer s.Finish()
@@ -80,7 +80,7 @@ func TestRunInterval(t *testing.T) {
 	chat, _ := steps.NewWorkChat(s, control, "interval")
 	s.Settle(time.Second, 6*time.Second)
 	gets := func(instance string, from int64) int {
-		return len(s.Graph.Requests(fakegraph.RequestFilter{Since: from, Method: "GET", Instance: instance}))
+		return len(s.Graph.Requests(fakegraph.RequestFilter{Since: from, Method: "GET", Route: "GET /chats/{chat}/messages", ChatID: control.ID, Instance: instance}))
 	}
 	const window = 9 * time.Second
 	from := s.Graph.LastSeq()
@@ -99,7 +99,7 @@ func TestRunInterval(t *testing.T) {
 	from = s.Graph.LastSeq()
 	s.Poll(window, func() bool { return false })
 	paced := gets(slow.Instance(), from)
-	s.Check("an idle helper with --interval 3s reads Teams a few times in 9 s, far less than at the default pace",
+	s.Check("the control chat with --interval 3s is read a few times in 9 s, far less than at the default pace",
 		paced >= 1 && paced <= 12 && base >= 3*paced, "1..12 reads, default ≥ 3×", fmt.Sprintf("--interval 3s: %d reads; default pace: %d", paced, base))
 
 	tok := s.Token("paced")
