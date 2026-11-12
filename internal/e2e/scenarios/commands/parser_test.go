@@ -127,7 +127,7 @@ func TestHelperClose(t *testing.T) {
 	// retitle may be dropped with the closed chat (a golden race).
 	s.WaitFor("the work chat is retitled after the first answer", steps.CommandTimeout, func() (bool, string) {
 		c, _ := s.Graph.Chat(work.ID)
-		return strings.HasPrefix(c.Topic, "💬 "), c.Topic
+		return strings.Contains(c.Topic, "Please answer E2E-CMDCLOSE-before-"), c.Topic
 	})
 
 	got, ok := command(s, work.ID, "helper close", "Session closed")
