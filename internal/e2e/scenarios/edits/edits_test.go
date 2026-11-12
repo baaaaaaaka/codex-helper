@@ -199,7 +199,9 @@ func TestVoiceTranscriptEdit(t *testing.T) {
 	harness.Parallel(t)
 	tools := t.TempDir()
 	script := filepath.Join(tools, "asr.sh")
-	body := "#!/bin/sh\ncase \"$(cat \"$1\")\" in\n*silence*) exit 0 ;;\nesac\nprintf 'transcribed: %s\\n' \"$(cat \"$1\")\"\n"
+	release := filepath.Join(tools, "release-asr")
+	gate := "'" + strings.ReplaceAll(release, "'", "'\"'\"'") + "'"
+	body := "#!/bin/sh\nwhile [ ! -f " + gate + " ]; do sleep 0.05; done\ncase \"$(cat \"$1\")\" in\n*silence*) exit 0 ;;\nesac\nprintf 'transcribed: %s\\n' \"$(cat \"$1\")\"\n"
 	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -217,6 +219,14 @@ func TestVoiceTranscriptEdit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Hold ASR until the initial receipt is visible, so the test exercises
+	// the ordering that used to append the transcript inside Helper's section.
+	initial, accepted := waitEdited(s, work.ID, vm.ID, "Request accepted.", steps.CommandTimeout)
+	s.Check("confirmation is visible before ASR is released", accepted && !strings.Contains(initial.PlainText(), "transcribed:"),
+		"initial receipt without a transcript", initial.PlainText())
+	if err := os.WriteFile(release, []byte("release"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	_, answered := steps.WaitAnswered(s, work.ID, tok, steps.AnswerTimeout)
 	ve, ok := waitEdited(s, work.ID, vm.ID, "transcribed: please list the files "+tok, steps.CommandTimeout)
 	text := harness.NormalizeSpace(ve.PlainText())
@@ -224,6 +234,10 @@ func TestVoiceTranscriptEdit(t *testing.T) {
 		strings.HasPrefix(text, userLabel) && strings.Contains(text, "Speech-to-text transcript (automatic; may contain recognition errors):") &&
 		strings.Contains(text, "Clip: voice.ogg"), "label, transcript heading, clip name and text",
 		fmt.Sprintf("answered=%v text=%q", answered, clip(text, 300)))
+	user, helper, separated := strings.Cut(ve.Content, "<hr/>")
+	s.Check("the transcript precedes the confirmation separator", separated && strings.Contains(user, "transcribed: please list the files "+tok) &&
+		strings.Contains(helper, "Request accepted.") && !strings.Contains(helper, "transcribed:"),
+		"user label, clip, transcript, separator, helper receipt", ve.PlainText())
 	s.Check("the audio card is kept", len(ve.Attachments) == len(vm.Attachments) && strings.Contains(ve.Content, "<attachment"),
 		"the card and its placeholder", fmt.Sprintf("%d attachments; content %q", len(ve.Attachments), clip(ve.Content, 200)))
 

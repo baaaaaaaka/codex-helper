@@ -109,6 +109,9 @@ is stored before POST. An uncertain PATCH is retried with the same confirmation
 key; an uncertain POST still uses the normal read-back rules. A successful edit
 does not register the user's message as a helper post. Voice transcript edits
 preserve the confirmation, and confirmation edits preserve the media card.
+The transcript stays above the confirmation's horizontal rule even when ASR
+finishes after the receipt is sent. User-authored rules and quoted receipts
+remain in their original positions.
 
 Schema version 7 adds one nullable column without rewriting history. Existing
 outbox rows have no target and retain their original delivery method. A build
