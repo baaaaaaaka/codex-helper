@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/baaaaaaaka/codex-helper/internal/continuation"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/harness"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/steps"
 )
@@ -106,7 +105,7 @@ func checkRetriesContinue(s *harness.Scenario, chatID string, calls []harness.Co
 		case i < sent:
 			ok = ok && c.HasToken(tok)
 		default:
-			ok = ok && c.Prompt == continuation.Prompt && !c.HasToken(tok) && strings.Contains(c.Prompt, "Keep the previous response language unless the user requests otherwise.") && c.ThreadID == calls[sent-1].ThreadID
+			ok = ok && c.Prompt == harness.ExpectedContinuationPrompt && !c.HasToken(tok) && strings.Contains(c.Prompt, "Keep the previous response language unless the user requests otherwise.") && c.ThreadID == calls[sent-1].ThreadID
 		}
 		ok = ok && c.ClientID == calls[0].ClientID && c.ClientID != ""
 	}

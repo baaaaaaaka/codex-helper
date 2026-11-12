@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/baaaaaaaka/codex-helper/internal/continuation"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/harness"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/steps"
 )
@@ -25,7 +24,7 @@ func TestModelSwitchWhileBusy(t *testing.T) {
 		if c.HasToken(original) {
 			return harness.CodexBehavior{Block: true}
 		}
-		if c.Prompt == continuation.Prompt {
+		if c.Prompt == harness.ExpectedContinuationPrompt {
 			return harness.CodexBehavior{Block: true, Answer: resumedAnswer}
 		}
 		return harness.CodexBehavior{}
@@ -39,7 +38,7 @@ func TestModelSwitchWhileBusy(t *testing.T) {
 	var resumed harness.CodexCall
 	s.Require("continuation starts without another user message", steps.AnswerTimeout, func() (bool, string) {
 		for _, c := range s.Codex.Calls() {
-			if c.Prompt == continuation.Prompt {
+			if c.Prompt == harness.ExpectedContinuationPrompt {
 				resumed = c
 				return true, ""
 			}
@@ -75,7 +74,7 @@ func TestModelSwitchWhileBusy(t *testing.T) {
 	s.Check("queued and restarted work retain settings", len(q) == 1 && len(a) == 1 && q[0].Model == "gpt-5-mini" && a[0].Model == "gpt-5-mini" && q[0].ThreadID == first.ThreadID && a[0].ThreadID == first.ThreadID, "new model, same thread", fmt.Sprintf("queued=%+v after=%+v", q, a))
 	s.Check("original task answered once", len(steps.AnswerPosts(s, work.ID, original)) == 1, "one answer", fmt.Sprint(len(steps.AnswerPosts(s, work.ID, original))))
 	for _, m := range s.SUTMessages(work.ID) {
-		if strings.Contains(m.PlainText(), "🧑‍💻 User") && strings.Contains(m.PlainText(), continuation.Prompt) {
+		if strings.Contains(m.PlainText(), "🧑‍💻 User") && strings.Contains(m.PlainText(), harness.ExpectedContinuationPrompt) {
 			s.Check("internal continuation is not mirrored", false, "no user mirror", m.PlainText())
 		}
 	}

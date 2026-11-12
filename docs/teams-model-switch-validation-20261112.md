@@ -4,6 +4,8 @@
 
 2026-11-13 发布候选：将补丁应用到上游 `b6ee90ed6e728654fc3e97a8c3ae8f8b8ded6fe2`，应用无冲突；上游未修改本补丁涉及的核心包。隔离 Docker 上 Teams channel 单元测试通过，E2E 第二、第三分片通过。第一分片暴露 `CMD-EFFORT` 的历史截断位置随临时路径长度变化：功能断言通过，golden 在被截断的行末相差数个字符。该场景只规范化紧邻截断标记的那一行，并额外断言用户收到的完整说明；修正后按 CI 入口重跑第一分片，五个包全部通过。
 
+`rc.15` 云端 CI 进一步发现两个遗漏：黑盒 E2E 不得直接导入产品内部提示词包，内置 skill 命令表仍需列出兼容别名。修正为在 E2E harness 独立声明预期协议文本，并补充 `helper model <model> [effort]`。修正后执行 CI 原入口 `bash scripts/ci/run_linux_full_go_test_collect.sh`、两个受影响 E2E 场景及黑盒边界和 skill 测试，均通过。首次本地覆盖率重跑把临时构建目录放在源码树内，导致格式、源码扫描与进程路径测试失败；将临时目录移到容器 HOME 下后完整重跑通过。
+
 ## 实现与范围
 
 - 基于上游 main `b4b9ca122b2924912ddb4bc52a0dd428c54c9a5c`，分支 `investigate/teams-model-switch-20261112`。工作目录：`/home/baka/.local/state/cxp-model-review.a21C6mrW/worktree`。所有变更尚未提交，原用户 worktree 未修改。
