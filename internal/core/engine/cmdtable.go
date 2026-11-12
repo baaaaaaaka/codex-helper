@@ -32,15 +32,9 @@ var workCommands = map[string]cmdHandler{
 	cmdStatus: func(e *Engine, _ context.Context, j cmdJob, cs *convState, _ parsed) {
 		e.reply(j, e.workStatus(cs), nil)
 	},
-	cmdStats: func(e *Engine, ctx context.Context, j cmdJob, cs *convState, _ parsed) { e.cmdStats(ctx, j, cs) },
-	cmdClose: func(e *Engine, _ context.Context, j cmdJob, cs *convState, _ parsed) { e.cmdCloseChat(j, cs) },
-	cmdParkName: func(e *Engine, _ context.Context, j cmdJob, cs *convState, p parsed) {
-		if p.arg != "" {
-			e.cmdParkLabel(j, p.arg) // `helper park <session>` (v0.1.20)
-			return
-		}
-		e.cmdPark(j, cs)
-	},
+	cmdStats:    func(e *Engine, ctx context.Context, j cmdJob, cs *convState, _ parsed) { e.cmdStats(ctx, j, cs) },
+	cmdClose:    func(e *Engine, _ context.Context, j cmdJob, cs *convState, _ parsed) { e.cmdCloseChat(j, cs) },
+	cmdParkName: func(e *Engine, _ context.Context, j cmdJob, cs *convState, p parsed) { e.cmdParkPolicy(j, cs, p.arg) },
 	cmdResume: func(e *Engine, _ context.Context, j cmdJob, cs *convState, p parsed) {
 		if p.arg != "" {
 			e.cmdWake(j, p.arg) // `helper resume <session>` (v0.1.20)
@@ -106,7 +100,7 @@ var controlCommands = map[string]cmdHandler{
 	},
 	cmdList:     func(e *Engine, _ context.Context, j cmdJob, _ *convState, _ parsed) { e.reply(j, e.listText(), nil) },
 	cmdNewName:  func(e *Engine, ctx context.Context, j cmdJob, _ *convState, p parsed) { e.cmdNew(ctx, j, p.arg) },
-	cmdParkName: func(e *Engine, _ context.Context, j cmdJob, _ *convState, p parsed) { e.cmdParkLabel(j, p.arg) },
+	cmdParkName: func(e *Engine, _ context.Context, j cmdJob, cs *convState, p parsed) { e.cmdParkPolicy(j, cs, p.arg) },
 	cmdRenameName: func(e *Engine, ctx context.Context, j cmdJob, _ *convState, p parsed) {
 		e.cmdRename(ctx, j, nil, p.arg)
 	},
@@ -347,6 +341,7 @@ var controlAdvancedHelpText = strings.Join([]string{
 	"Other control commands:",
 	"- `st` / `status` - list active Teams work chats",
 	"- `d <number>` / `details <number>` - show technical IDs and details",
+	"- `park <session-number-or-id> on|off|status` - configure automatic idle parking (default on; off keeps the cold polling tier)",
 	"- `park <session-number-or-id>` / `resume <session-number-or-id>` / `unpark <session-number-or-id>` - manually pause or resume polling for a Work chat",
 	"- `fork <session>` - copy a session into a new Work chat",
 	"- `m <directory>` / `mkdir <directory>` - create a directory only",
@@ -396,6 +391,7 @@ var sessionHelpText = strings.Join([]string{
 	"`helper file <relative-path>` or `!file <relative-path>` - upload a file prepared in the helper's Teams upload folder",
 	"`helper close` or `!close` - close this Codex session in Teams",
 	"`helper details` or `!details` - show debug IDs and links",
+	"`helper park on|off|status` - configure automatic idle parking (default on)",
 	"`model status`, `model switch <model>`, `model reset`, or `model fork <model>` - inspect or change this Work chat model",
 	"`effort status`, `effort list`, `effort set <value>`, or `effort reset` - inspect or change this Work chat's reasoning effort",
 	"`helper goal` - show this chat's Codex goal; `helper goal <objective>` sets it and makes it active; `helper goal active` / `helper goal pause` resume or pause it",
@@ -416,6 +412,7 @@ var sessionAdvancedHelpText = strings.Join([]string{
 	"`helper rename hostname <name>` - rename this machine in all related chat titles",
 	"`helper file <relative-path>` or `!file <relative-path>` - upload a file prepared in the helper's Teams upload folder",
 	"`helper close` or `!close` - close this Codex session in Teams",
+	"`helper park on|off|status` - configure automatic idle parking (default on; off survives restarts)",
 	"`helper park <session-number-or-id>` / `helper resume <session-number-or-id>` / `helper unpark <session-number-or-id>` - manually pause or resume polling for a Work chat",
 	"`helper unpause` - resume auto-start after a pause (requests sent while paused are not run)",
 	"`helper fork` - copy this session into a new Work chat",

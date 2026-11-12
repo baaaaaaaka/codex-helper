@@ -841,15 +841,18 @@ func (e *Engine) sessionDetails(conv int64) string {
 	e.mu.Lock()
 	label, state, title, cwd, thread, url := cs.label, cs.state, cs.title, cs.cwd, cs.threadID, cs.url
 	running := cs.running != nil
+	autoParkOff := cs.autoParkOff
 	e.mu.Unlock()
-	polling := "listening" // parked too (v0.1.20 userFacingChatState)
+	polling := "listening"
 	switch state {
+	case store.ConvParked:
+		polling = "parked"
 	case store.ConvClosed:
 		polling = "closed"
 	case store.ConvHold:
 		polling = "held"
 	}
-	lines := []string{"Session: " + label, "Chat polling: " + polling, "Title: " + firstNonEmpty(strings.TrimSpace(title), label)}
+	lines := []string{"Session: " + label, "Chat polling: " + polling, "Title: " + firstNonEmpty(strings.TrimSpace(title), label), "Auto park: " + autoParkValue(autoParkOff)}
 	if cwd != "" {
 		lines = append(lines, "Working directory: "+cwd)
 	}
@@ -895,6 +898,7 @@ func (e *Engine) activeChatsText() string {
 		id                            int64
 		label, title, cwd, url, state string
 		used                          time.Time
+		autoParkOff                   bool
 	}
 	at := e.activityTimes()
 	e.mu.Lock()
@@ -904,7 +908,7 @@ func (e *Engine) activeChatsText() string {
 		if cs.kind != store.KindWork || id == e.inboxID {
 			continue
 		}
-		r := row{id: id, label: cs.label, title: firstNonEmpty(strings.TrimSpace(cs.title), cs.label), cwd: cs.cwd, url: cs.url, state: cs.state, used: at[id]}
+		r := row{id: id, label: cs.label, title: firstNonEmpty(strings.TrimSpace(cs.title), cs.label), cwd: cs.cwd, url: cs.url, state: cs.state, used: at[id], autoParkOff: cs.autoParkOff}
 		switch cs.state {
 		case store.ConvClosed:
 			closed++
@@ -939,7 +943,7 @@ func (e *Engine) activeChatsText() string {
 		}
 		out := []string{"## ⚠️ Quarantined Work chats"}
 		for _, r := range held {
-			out = append(out, fmt.Sprintf("- **%s** — session `%s`; held after the data conversion, so the helper does not read it.", firstNonEmpty(strings.TrimSpace(r.title), r.label), r.label))
+			out = append(out, fmt.Sprintf("- **%s** — session `%s`; held after the data conversion, so the helper does not read it.", firstNonEmpty(strings.TrimSpace(r.title), r.label), r.label)+" Auto park: "+autoParkValue(r.autoParkOff)+".")
 		}
 		return out
 	}
@@ -970,7 +974,7 @@ func (e *Engine) activeChatsText() string {
 			status = "🧊parked"
 		}
 		lines = append(lines, fmt.Sprintf("**%s** [%s]", r.title, status))
-		meta := []string{"**Session:** " + inlineCode(r.label)}
+		meta := []string{"**Session:** " + inlineCode(r.label), "**Auto park:** " + autoParkValue(r.autoParkOff)}
 		if r.cwd != "" {
 			meta = append(meta, "**Folder:** "+inlineCode(r.cwd))
 		} else {

@@ -87,7 +87,7 @@ type Timing struct {
 func ProductionTiming() Timing {
 	return Timing{
 		Tick: 250 * time.Millisecond,
-		Hot:  time.Second, Warm: 5 * time.Second, Cool: 10 * time.Second, Cold: 30 * time.Second,
+		Hot:  2 * time.Second, Warm: 5 * time.Second, Cool: 10 * time.Second, Cold: 30 * time.Second,
 		HotFor: 2 * time.Minute, WarmFor: 15 * time.Minute, CoolFor: 4 * time.Hour, ParkAfter: 48 * time.Hour,
 		Control: 5 * time.Second, ScanInterval: 5 * time.Second, SafetyRead: 10 * time.Minute, MaxBackoff: 5 * time.Minute,
 		MirrorStat: 2 * time.Second, Discovery: 10 * time.Second, FullWalk: 10 * time.Minute,
@@ -162,7 +162,7 @@ type Config struct {
 	// FilesDir receives inbound attachments.
 	FilesDir string
 	// ActivityScan uses the channel's ActivityScanner (one account-wide
-	// read per interval) instead of per-chat tier polling for idle chats.
+	// read per interval) to advance per-chat tier polls when messages change.
 	ActivityScan bool
 	// Registry enables the cross-machine delegation inbox.
 	Registry bool
@@ -217,7 +217,7 @@ type Engine struct {
 	// gRead and gWrite are the keys of the account-wide gates.
 	gRead, gWrite string
 	// scanner is set when the channel supports an activity scan (scan
-	// mode): idle chats are then read only when the scan shows a change.
+	// mode): scan changes advance the normal per-chat tier reads.
 	scanner channel.ActivityScanner
 	ag      Agent
 	t       Timing
@@ -252,8 +252,9 @@ type Engine struct {
 	resolverWake chan struct{}
 	mirrorWake   chan struct{}
 	cmdQueue     chan cmdJob
-	once         onceState // `run --once` (once.go)
-	cli          cliState  // command-line requests (clireq.go)
+	once         onceState  // `run --once` (once.go)
+	cli          cliState   // command-line requests (clireq.go)
+	parkPolicyMu sync.Mutex // serialises policy commit and cache publication
 	cmdMu        sync.Mutex
 	cmdPending   map[int64][]cmdJob // per-conversation command queues; present while a worker runs
 	asrWake      chan struct{}
@@ -868,6 +869,7 @@ func (e *Engine) trackLocked(c store.Conversation) *convState {
 	}
 	cs.label, cs.kind, cs.state, cs.chat, cs.url, cs.title = c.Label, c.Kind, c.State, c.ExtChatID, c.ExtURL, c.Title
 	cs.paused = c.PausedAt != 0
+	cs.autoParkOff = c.AutoParkOff
 	if c.ExtChatID != "" {
 		e.byChat[c.ExtChatID] = c.ID
 	}
@@ -947,3 +949,7 @@ func (e *Engine) count(f func(*engineStats)) {
 }
 
 func normalize(s string) string { return strings.ToLower(strings.Join(strings.Fields(s), " ")) }
+
+// retryBase preserves the old retry cadence when receive polling slows to 2s.
+// Short explicit/test intervals still shorten retries as they did before.
+func (e *Engine) retryBase() time.Duration { return min(e.t.Hot, time.Second) }

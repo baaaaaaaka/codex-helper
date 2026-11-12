@@ -134,6 +134,7 @@
    | <p>Session: s003<br>
    | Chat polling: listening<br>
    | Title: 💬 e2ehost - Pinned chat<br>
+   | Auto park: on<br>
    | Working directory: <root>/work/pinned<br>
    | Model profile: gpt-5-codex<br>
    | Teams chat: <a href="https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a><br>

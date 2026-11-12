@@ -173,3 +173,29 @@ func (s *Store) Conversations() ([]Conversation, error) {
 func (s *Store) Threads() ([]Thread, error) {
 	return collect(scanThread)(s.r.QueryContext(context.Background(), `SELECT `+threadCols+` FROM threads ORDER BY conv_id`))
 }
+
+// SetAutoPark changes only the policy, never the activity timestamp or state.
+// Repeating the same setting does not write a row.
+func (t *Tx) SetAutoPark(id int64, enabled bool) error {
+	c, ok, err := t.Conversation(id)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return ErrNotFound
+	}
+	if c.Kind != KindWork {
+		return fmt.Errorf("auto park is only configurable for work chats")
+	}
+	if c.AutoParkOff == !enabled {
+		return nil
+	}
+	_, err = t.exec(`UPDATE conversations SET auto_park_off = ? WHERE id = ?`, !enabled, id)
+	return err
+}
+
+// AutoPark conditionally parks an active chat. Manual Park ignores this policy.
+func (t *Tx) AutoPark(id int64) (bool, error) {
+	n, err := affected(t.exec(`UPDATE conversations SET state = 'parked', parked_at = ?, updated_at = ? WHERE id = ? AND kind = 'work' AND state = 'active' AND auto_park_off = 0`, t.now, t.now, id))
+	return n != 0, err
+}

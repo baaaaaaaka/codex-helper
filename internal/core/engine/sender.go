@@ -546,7 +546,7 @@ func (e *Engine) send(ctx context.Context, r store.Outbox, chat, token string, f
 	case appended && channel.IsAmbiguous(err):
 		// PATCH may already have landed. Retry the same confirmation key;
 		// never feed an append into POST's unknown-outcome resolver.
-		e.requeue(ctx, r.ID, now.Add(e.t.Hot))
+		e.requeue(ctx, r.ID, now.Add(e.retryBase()))
 	case channel.IsAmbiguous(err):
 		e.logf("send %s to conversation %d: outcome unknown (%v); resolving by read-back", r.DeliveryKey, r.ConvID, err)
 		if err := e.persist(ctx, "record send outcome", func(tx *store.Tx) error {
@@ -598,7 +598,7 @@ func (e *Engine) send(ctx context.Context, r store.Outbox, chat, token string, f
 		e.requeue(ctx, r.ID, now.Add(e.t.MaxBackoff))
 	default:
 		n := e.failure(r.ID)
-		back := e.t.Hot << min(n, 8)
+		back := e.retryBase() << min(n, 8)
 		if back > e.t.MaxBackoff {
 			back = e.t.MaxBackoff
 		}
@@ -1028,7 +1028,7 @@ func (e *Engine) upload(ctx context.Context, r store.Outbox, f store.OutFile) {
 			e.dropFile(r, name)
 			return
 		}
-		back := e.t.Hot << min(n, 8)
+		back := e.retryBase() << min(n, 8)
 		if back > e.t.MaxBackoff {
 			back = e.t.MaxBackoff
 		}

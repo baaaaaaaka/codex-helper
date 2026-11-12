@@ -192,6 +192,8 @@ func TestSafetyReadsSpreadOverTheWindow(t *testing.T) {
 	t0 := time.Date(2026, 11, 5, 9, 0, 0, 0, time.UTC)
 	const chats, waves = 362, 6
 	e := priorityEngine()
+	// Exercise the existing jitter over a long custom cold period.
+	e.t.Cold = period
 	reads := make([][]time.Time, waves)
 	for id := int64(1); id <= chats; id++ {
 		cs := e.addConv(id, &convState{lastUser: t0.Add(-time.Hour)})
@@ -254,7 +256,7 @@ func TestOnlyIdleChatsTakeASafetyRead(t *testing.T) {
 	if got := e.nextReadLocked(hot, now, now, true); !got.Equal(now.Add(e.t.Hot)) || !hot.safeAt.IsZero() {
 		t.Errorf("hot chat next read after %s, want %s", got.Sub(now), e.t.Hot)
 	}
-	want := now.Add(e.t.SafetyRead - safetyJitter(3, e.t.SafetyRead))
+	want := now.Add(e.t.Cold - safetyJitter(3, e.t.Cold))
 	if got := e.nextReadLocked(idle, now, now, false); !got.Equal(want) {
 		t.Errorf("idle chat next read after %s, want %s", got.Sub(now), want.Sub(now))
 	}

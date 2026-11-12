@@ -86,24 +86,28 @@
    | <p><strong>Active Work chats</strong></p>
    | <p><strong>💬 e2ehost - Plan the old release</strong> [active]<br>
    | &nbsp;&nbsp;<strong>Session:</strong> <code>s003</code><br>
+   | &nbsp;&nbsp;<strong>Auto park:</strong> on<br>
    | &nbsp;&nbsp;<strong>Folder:</strong> <code><root>/work/imported</code><br>
    | &nbsp;&nbsp;<strong>Last used:</strong> <minute><br>
    | &nbsp;&nbsp;<strong>Chat:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:3>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">▶ Open chat</a></p>
    | <hr/>
    | <p><strong>💬 e2ehost - Please answer E2E-DASHORDER-beta-1</strong> [active]<br>
    | &nbsp;&nbsp;<strong>Session:</strong> <code>s002</code><br>
+   | &nbsp;&nbsp;<strong>Auto park:</strong> on<br>
    | &nbsp;&nbsp;<strong>Folder:</strong> <code><root>/work/beta</code><br>
    | &nbsp;&nbsp;<strong>Last used:</strong> <minute><br>
    | &nbsp;&nbsp;<strong>Chat:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:5>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">▶ Open chat</a></p>
    | <hr/>
    | <p><strong>💬 e2ehost - Please answer E2E-DASHORDER-alpha-2</strong> [active]<br>
    | &nbsp;&nbsp;<strong>Session:</strong> <code>s001</code><br>
+   | &nbsp;&nbsp;<strong>Auto park:</strong> on<br>
    | &nbsp;&nbsp;<strong>Folder:</strong> <code><root>/work/alpha</code><br>
    | &nbsp;&nbsp;<strong>Last used:</strong> <minute><br>
    | &nbsp;&nbsp;<strong>Chat:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:4>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">▶ Open chat</a></p>
    | <hr/>
    | <p><strong>💬 e2ehost - New message in gamma</strong> [active]<br>
    | &nbsp;&nbsp;<strong>Session:</strong> <code>s004</code><br>
+   | &nbsp;&nbsp;<strong>Auto park:</strong> on<br>
    | &nbsp;&nbsp;<strong>Folder:</strong> <code><root>/work/gamma</code><br>
    | &nbsp;&nbsp;<strong>Last used:</strong> <minute><br>
    | &nbsp;&nbsp;<strong>Chat:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">▶ Open chat</a></p>
@@ -119,10 +123,10 @@
 -- <msg:16> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Sessions:</p>
-   | <ul><li>s003 — 💬 e2ehost - Plan the old release (active)</li>
-   | <li>s002 — 💬 e2ehost - Please answer E2E-DASHORDER-beta-1 (active)</li>
-   | <li>s001 — 💬 e2ehost - Please answer E2E-DASHORDER-alpha-2 (active)</li>
-   | <li>s004 — 💬 e2ehost - New message in gamma (active)</li>
+   | <ul><li>s003 — 💬 e2ehost - Plan the old release (active; auto park: on)</li>
+   | <li>s002 — 💬 e2ehost - Please answer E2E-DASHORDER-beta-1 (active; auto park: on)</li>
+   | <li>s001 — 💬 e2ehost - Please answer E2E-DASHORDER-alpha-2 (active; auto park: on)</li>
+   | <li>s004 — 💬 e2ehost - New message in gamma (active; auto park: on)</li>
    | </ul>
 -- <msg:17> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>

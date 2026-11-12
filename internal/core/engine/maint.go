@@ -201,7 +201,7 @@ func (e *Engine) parkIdle() {
 	e.mu.Lock()
 	var ids []int64
 	for id, cs := range e.convs {
-		if cs.kind == store.KindWork && cs.state == store.ConvActive && cs.running == nil && id != e.inboxID &&
+		if cs.kind == store.KindWork && cs.state == store.ConvActive && !cs.autoParkOff && cs.running == nil && id != e.inboxID &&
 			now.Sub(cs.lastActivity) > e.t.ParkAfter {
 			ids = append(ids, id)
 		}
@@ -211,6 +211,15 @@ func (e *Engine) parkIdle() {
 		var parkedAt int64
 		err := e.update(func(tx *store.Tx) error {
 			parkedAt = 0
+			// The candidate may have changed since the initial scan. Policy is
+			// checked again by AutoPark in this same write transaction.
+			e.mu.Lock()
+			cs := e.convs[id]
+			eligible := cs != nil && cs.state == store.ConvActive && cs.running == nil && !cs.reading && now.Sub(cs.lastActivity) > e.t.ParkAfter
+			e.mu.Unlock()
+			if !eligible {
+				return nil
+			}
 			open, err := tx.OpenTurnsOf(id)
 			if err != nil || len(open) > 0 {
 				return err
@@ -219,7 +228,8 @@ func (e *Engine) parkIdle() {
 			if err != nil || len(pending) > 0 {
 				return err
 			}
-			if err := tx.Park(id); err != nil {
+			did, err := tx.AutoPark(id)
+			if err != nil || !did {
 				return err
 			}
 			c, err := e.refresh(tx, id)

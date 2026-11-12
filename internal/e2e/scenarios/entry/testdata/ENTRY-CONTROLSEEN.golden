@@ -51,34 +51,39 @@
    | <p><strong>Active Work chats</strong></p>
    | <p><strong>s002</strong> [🧊parked]<br>
    | &nbsp;&nbsp;<strong>Session:</strong> <code>s002</code><br>
+   | &nbsp;&nbsp;<strong>Auto park:</strong> on<br>
    | &nbsp;&nbsp;<strong>Folder:</strong> <code>/work/b</code><br>
    | &nbsp;&nbsp;<strong>Last used:</strong> <minute><br>
    | &nbsp;&nbsp;<strong>Resume parked chat:</strong> send <code>r s002</code></p>
    | <hr/>
    | <p><strong>s003</strong> [active]<br>
    | &nbsp;&nbsp;<strong>Session:</strong> <code>s003</code><br>
+   | &nbsp;&nbsp;<strong>Auto park:</strong> on<br>
    | &nbsp;&nbsp;<strong>Folder:</strong> not recorded<br>
    | &nbsp;&nbsp;<strong>Last used:</strong> <minute></p>
    | <hr/>
    | <p><strong>s004</strong> [active]<br>
    | &nbsp;&nbsp;<strong>Session:</strong> <code>s004</code><br>
+   | &nbsp;&nbsp;<strong>Auto park:</strong> on<br>
    | &nbsp;&nbsp;<strong>Folder:</strong> not recorded<br>
    | &nbsp;&nbsp;<strong>Last used:</strong> <minute></p>
    | <hr/>
    | <p><strong>s007</strong> [active]<br>
    | &nbsp;&nbsp;<strong>Session:</strong> <code>s007</code><br>
+   | &nbsp;&nbsp;<strong>Auto park:</strong> on<br>
    | &nbsp;&nbsp;<strong>Folder:</strong> not recorded<br>
    | &nbsp;&nbsp;<strong>Last used:</strong> <minute></p>
    | <hr/>
    | <p><strong>one</strong> [active]<br>
    | &nbsp;&nbsp;<strong>Session:</strong> <code>s001</code><br>
+   | &nbsp;&nbsp;<strong>Auto park:</strong> on<br>
    | &nbsp;&nbsp;<strong>Folder:</strong> <code>/work/a</code><br>
    | &nbsp;&nbsp;<strong>Last used:</strong> <minute><br>
    | &nbsp;&nbsp;<strong>Model profile:</strong> gpt-5</p>
    | <hr/>
    | <p>2 closed work chat(s) hidden. The helper no longer reads or responds in closed chats.</p>
    | <p><strong>⚠️ Quarantined Work chats</strong></p>
-   | <ul><li><strong>s006</strong> — session <code>s006</code>; held after the data conversion, so the helper does not read it.</li>
+   | <ul><li><strong>s006</strong> — session <code>s006</code>; held after the data conversion, so the helper does not read it. Auto park: on.</li>
    | </ul>
    | <p>Speech recognition: configured.<br>
    | Next: open one of these Teams chats to continue work, or send <code>new &lt;directory&gt;</code> to create another Work chat.</p>

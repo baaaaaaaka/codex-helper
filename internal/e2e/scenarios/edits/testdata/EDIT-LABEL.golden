@@ -108,7 +108,7 @@
    | <attachment id="<uuid:1>"></attachment>
 -- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>s001 (active): idle, 0 queued. Directory: <code><root>/work/label</code>.</p>
+   | <p>s001 (active): idle, 0 queued. Directory: <code><root>/work/label</code>. Auto park: on.</p>
 -- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-EDITLABEL-file-2</p>

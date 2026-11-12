@@ -26,6 +26,7 @@ import (
 
 // CLI request operations.
 const (
+	CLISetParkPolicy   = "park-policy"
 	CLIRecreateControl = "recreate-control"
 	CLIRecreateChat    = "recreate-chat"
 	CLIPublishHistory  = "publish-history"
@@ -42,7 +43,7 @@ type CLIRequest struct {
 	Activate bool   `json:"activate,omitempty"` // recreate: reactivate a held session
 	Force    bool   `json:"force,omitempty"`    // publish-history: replay into a fresh namespace
 	File     string `json:"file,omitempty"`     // send-file: the file the command staged
-	Message  string `json:"message,omitempty"`  // send-file: text posted with the file
+	Message  string `json:"message,omitempty"`  // send-file text, or park-policy on/off/status
 }
 
 // CLIResult is what the command prints: Lines on success, Error otherwise.
@@ -114,6 +115,10 @@ func (e *Engine) CLIRequest(ctx context.Context, r CLIRequest) (CLIResult, error
 		e.cli.busy = false
 		e.cli.mu.Unlock()
 	}()
+	// Status is read-only: do not create a durable CLI progress/result row.
+	if r.Op == CLISetParkPolicy && strings.EqualFold(r.Message, "status") {
+		return e.cliParkPolicy(r)
+	}
 	var p cliProgress
 	if err := e.st.Read(func(tx *store.Tx) (err error) { p, _, err = tx.CLIProgress(r.ID); return }); err != nil {
 		return CLIResult{}, err
@@ -126,6 +131,8 @@ func (e *Engine) CLIRequest(ctx context.Context, r CLIRequest) (CLIResult, error
 		err error
 	)
 	switch r.Op {
+	case CLISetParkPolicy:
+		res, err = e.cliParkPolicy(r)
 	case CLIRecreateControl:
 		res, err = e.cliRecreate(ctx, r, &p, true)
 	case CLIRecreateChat:
@@ -433,7 +440,7 @@ func (e *Engine) cliCreateChat(ctx context.Context, title, key string) (channel.
 		if errors.As(err, &rej) && rej.Permanent {
 			return channel.ChatInfo{}, &CLIResult{Error: fmt.Sprintf("create the new Teams chat: %v", err)}, nil
 		}
-		wait := min(e.t.Hot<<min(n+1, 8), e.t.MaxBackoff)
+		wait := min(e.retryBase()<<min(n+1, 8), e.t.MaxBackoff)
 		if th, ok := channel.AsThrottled(err); ok {
 			wait = e.retryAfter(th)
 			if th.Scope == channel.ScopeAccount || th.Scope == channel.ScopeUnknown {

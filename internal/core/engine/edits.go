@@ -193,7 +193,7 @@ func (e *Engine) runEdit(ctx context.Context, conv int64) {
 		errors.As(err, &rej) && rej.Permanent:
 		ed.tries++
 	default:
-		retry = now.Add(e.t.Hot << min(ed.tries+1, 6))
+		retry = now.Add(e.retryBase() << min(ed.tries+1, 6))
 		ed.tries++
 	}
 	if retry.IsZero() || ed.tries >= editTries {

@@ -102,7 +102,9 @@ func TestImportSurvivesACrash(t *testing.T) {
 		Guarantees: []string{"F-MIR-5", "R-2"},
 		Title:      "kill -9 in the middle of a history import, with a record accepted by Teams and unrecorded; after the restart every record is posted exactly once",
 		Budget:     4 * time.Minute,
-		NoStart:    true,
+		// Leave room for multiple HTTP pages per accelerated logical read.
+		Interval: 500 * time.Millisecond,
+		NoStart:  true,
 	})
 	defer s.Finish()
 	dir := s.Env.WorkDir(t, "long")

@@ -53,7 +53,7 @@
    | <p>!status</p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>s001 (active): idle, 0 queued. Directory: <code><root>/work/forms</code>.</p>
+   | <p>s001 (active): idle, 0 queued. Directory: <code><root>/work/forms</code>. Auto park: on.</p>
 -- <msg:5> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>/status</p>
@@ -62,7 +62,7 @@
    | <p>/status</p>
 -- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>s001 (active): idle, 0 queued. Directory: <code><root>/work/forms</code>.</p>
+   | <p>s001 (active): idle, 0 queued. Directory: <code><root>/work/forms</code>. Auto park: on.</p>
 -- <msg:7> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>cx st</p>
@@ -71,7 +71,7 @@
    | <p>cx st</p>
 -- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>s001 (active): idle, 0 queued. Directory: <code><root>/work/forms</code>.</p>
+   | <p>s001 (active): idle, 0 queued. Directory: <code><root>/work/forms</code>. Auto park: on.</p>
 -- <msg:9> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>codex status</p>
@@ -80,7 +80,7 @@
    | <p>codex status</p>
 -- <msg:10> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>s001 (active): idle, 0 queued. Directory: <code><root>/work/forms</code>.</p>
+   | <p>s001 (active): idle, 0 queued. Directory: <code><root>/work/forms</code>. Auto park: on.</p>
 -- <msg:11> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Helper: status</p>
@@ -89,7 +89,7 @@
    | <p>Helper: status</p>
 -- <msg:12> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>s001 (active): idle, 0 queued. Directory: <code><root>/work/forms</code>.</p>
+   | <p>s001 (active): idle, 0 queued. Directory: <code><root>/work/forms</code>. Auto park: on.</p>
 -- <msg:13> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>!st</p>
@@ -98,7 +98,7 @@
    | <p>!st</p>
 -- <msg:14> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>s001 (active): idle, 0 queued. Directory: <code><root>/work/forms</code>.</p>
+   | <p>s001 (active): idle, 0 queued. Directory: <code><root>/work/forms</code>. Auto park: on.</p>
 -- <msg:15> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>!x</p>
@@ -137,6 +137,7 @@
    | <code>helper file &lt;relative-path&gt;</code> or <code>!file &lt;relative-path&gt;</code> - upload a file prepared in the helper&#39;s Teams upload folder<br>
    | <code>helper close</code> or <code>!close</code> - close this Codex session in Teams<br>
    | <code>helper details</code> or <code>!details</code> - show debug IDs and links<br>
+   | <code>helper park on|off|status</code> - configure automatic idle parking (default on)<br>
    | <code>model status</code>, <code>model switch &lt;model&gt;</code>, <code>model reset</code>, or <code>model fork &lt;model&gt;</code> - inspect or change this Work chat model<br>
    | <code>effort status</code>, <code>effort list</code>, <code>effort set &lt;value&gt;</code>, or <code>effort reset</code> - inspect or change this Work chat&#39;s reasoning effort<br>
    | <code>helper goal</code> - show this chat&#39;s Codex goal; <code>helper goal &lt;objective&gt;</code> sets it and makes it active; <code>helper goal active</code> / <code>helper goal pause</code> resume or pause it<br>
@@ -243,6 +244,7 @@
    | <code>helper file &lt;relative-path&gt;</code> or <code>!file &lt;relative-path&gt;</code> - upload a file prepared in the helper&#39;s Teams upload folder<br>
    | <code>helper close</code> or <code>!close</code> - close this Codex session in Teams<br>
    | <code>helper details</code> or <code>!details</code> - show debug IDs and links<br>
+   | <code>helper park on|off|status</code> - configure automatic idle parking (default on)<br>
    | <code>model status</code>, <code>model switch &lt;model&gt;</code>, <code>model reset</code>, or <code>model fork &lt;model&gt;</code> - inspect or change this Work chat model<br>
    | <code>effort status</code>, <code>effort list</code>, <code>effort set &lt;value&gt;</code>, or <code>effort reset</code> - inspect or change this Work chat&#39;s reasoning effort<br>
    | <code>helper goal</code> - show this chat&#39;s Codex goal; <code>helper goal &lt;objective&gt;</code> sets it and makes it active; <code>helper goal active</code> / <code>helper goal pause</code> resume or pause it<br>
@@ -270,6 +272,7 @@
    | <code>helper file &lt;relative-path&gt;</code> or <code>!file &lt;relative-path&gt;</code> - upload a file prepared in the helper&#39;s Teams upload folder<br>
    | <code>helper close</code> or <code>!close</code> - close this Codex session in Teams<br>
    | <code>helper details</code> or <code>!details</code> - show debug IDs and links<br>
+   | <code>helper park on|off|status</code> - configure automatic idle parking (default on)<br>
    | <code>model status</code>, <code>model switch &lt;model&gt;</code>, <code>model reset</code>, or <code>model fork &lt;model&gt;</code> - inspect or change this Work chat model<br>
    | <code>effort status</code>, <code>effort list</code>, <code>effort set &lt;value&gt;</code>, or <code>effort reset</code> - inspect or change this Work chat&#39;s reasoning effort<br>
    | <code>helper goal</code> - show this chat&#39;s Codex goal; <code>helper goal &lt;objective&gt;</code> sets it and makes it active; <code>helper goal active</code> / <code>helper goal pause</code> resume or pause it<br>

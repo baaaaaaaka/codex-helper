@@ -57,6 +57,7 @@ const (
 
 // Conversation is one chat (control or work).
 type Conversation struct {
+	AutoParkOff    bool // false by default, including migrated and newly forked chats
 	ID             int64
 	Label          string
 	Kind           string

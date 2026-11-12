@@ -307,7 +307,7 @@ func (e *Engine) historyCheckLoop(ctx context.Context) {
 			if err == nil || ctx.Err() != nil {
 				break
 			}
-			back := min(e.t.Hot<<min(failures+1, 10), e.t.MaxBackoff)
+			back := min(e.retryBase()<<min(failures+1, 10), e.t.MaxBackoff)
 			e.logf("resume history check of %s: %v; retrying in %s", c.Path, err, back)
 			if !sleepCtx(ctx, back) {
 				return

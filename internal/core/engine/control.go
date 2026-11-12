@@ -195,7 +195,7 @@ func (e *Engine) createChat(ctx context.Context, id int64) bool {
 	info, err := e.ch.CreateChat(ctx, title, key)
 	if err != nil {
 		now := e.now()
-		next := now.Add(min(e.t.Hot<<min(cs.failures+1, 8), e.t.MaxBackoff))
+		next := now.Add(min(e.retryBase()<<min(cs.failures+1, 8), e.t.MaxBackoff))
 		if th, ok := channel.AsThrottled(err); ok {
 			// A chat creation spends the account's write budget like a
 			// send: an account throttle slows every write.

@@ -251,6 +251,7 @@
    prompt| Other control commands:
    prompt| - `st` / `status` - list active Teams work chats
    prompt| - `d <number>` / `details <number>` - show technical IDs and details
+   prompt| - `park <session-number-or-id> on|off|status` - configure automatic idle parking (default on; off keeps the cold polling tier)
    prompt| - `park <session-number-or-id>` / `resume <session-number-or-id>` / `unpark <session-number-or-id>` - manually pause or resume polling for a Work chat
    prompt| - `fork <session>` - copy a session into a new Work chat
    prompt| - `m <directory>` / `mkdir <directory>` - create a directory only
@@ -299,6 +300,7 @@
    prompt| `helper rename hostname <name>` - rename this machine in all related chat titles
    prompt| `helper file <relative-path>` or `!file <relative-path>` - upload a file prepared in the helper's Teams upload folder
    prompt| `helper close` or `!close` - close this Codex session in Teams
+   prompt| `helper park on|off|status` - configure automatic idle parking (default on; off survives restarts)
    prompt| `helper park <session-number-or-id>` / `helper resume <session-number-or-id>` / `helper unpark <session-number-or-id>` - manually pause or resume polling for a Work chat
    prompt| `helper unpause` - resume auto-start after a pause (requests sent while paused are not run)
    prompt| `helper fork` - copy this session into a new Work chat

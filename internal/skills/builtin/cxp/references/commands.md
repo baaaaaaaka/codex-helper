@@ -103,6 +103,7 @@ Control chat commands (a leading `helper` is accepted too):
 - `list`: list sessions with their labels (for example `s003`).
 - `r <session>`: wake a parked session.
 - `park <session>`: stop reading a session's chat until it is woken.
+- `park <session> on|off|status`: configure automatic idle parking; all work chats default to on.
 - `fork <session>`: copy a session into a new work chat.
 - `model`: list the models Codex offers.
 - `stats`: requests and token usage of all sessions.
@@ -122,6 +123,9 @@ Work chat commands:
 - `helper retry`: run the last ignored duplicate request again; `helper retry last` runs the last failed, interrupted, not-started or cancelled request again; `helper retry <turn-id>` (`!retry <turn-id>`) runs that one again. A request is never retried automatically.
 - `helper unpause`: resume auto-start after a pause (held requests are not run).
 - `helper park`: stop reading this chat until woken.
+- `helper park on|off|status`: configure automatic idle parking for this chat. Off survives restarts but does not prevent manual park.
+- From a terminal: `cxp teams service park <session> on|off|status`. Setting off on a parked chat does not wake it; use `r <session>` from the control chat.
+- Direct reads cool through 2s (under 2min), 5s (under 15min), 10s (under 4h), then 30s. Running requests stay at 2s; the control chat stays at 5s. After 48h idle, on permits automatic park, while off continues the cold tier. Activity scans can trigger earlier reads; pacing and backoff still apply.
 - `helper status`: session status.
 - `helper fork`: copy this session into a new work chat (also while a request runs; the copy stops at the last finished request), then post the new chat's link.
 - `helper model`, `helper model list`, `helper model <model> [effort]`, `helper model reset`: show or switch this session's model.

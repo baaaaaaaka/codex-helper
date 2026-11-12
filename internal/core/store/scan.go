@@ -43,7 +43,7 @@ func (p *nullPack) scan(sc scanner) error {
 	return nil
 }
 
-const convCols = `id,label,kind,channel,ext_chat_id,ext_url,title,title_source,state,parked_at,paused_at,paused_reason,paused_notified,created_at,updated_at`
+const convCols = `id,label,kind,channel,ext_chat_id,ext_url,title,title_source,state,parked_at,paused_at,paused_reason,paused_notified,created_at,updated_at,auto_park_off`
 
 func scanConv(sc scanner) (Conversation, error) {
 	var c Conversation
@@ -63,6 +63,7 @@ func scanConv(sc scanner) (Conversation, error) {
 	p.raw(&c.PausedNotified)
 	p.raw(&c.CreatedAt)
 	p.raw(&c.UpdatedAt)
+	p.raw(&c.AutoParkOff)
 	err := p.scan(sc)
 	return c, err
 }

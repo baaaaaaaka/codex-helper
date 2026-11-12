@@ -173,7 +173,7 @@ func (e *Engine) legacyCheckLoop(ctx context.Context) {
 			if err == nil || ctx.Err() != nil {
 				break
 			}
-			back := min(e.t.Hot<<min(failures+1, 10), e.t.MaxBackoff)
+			back := min(e.retryBase()<<min(failures+1, 10), e.t.MaxBackoff)
 			e.logf("answer history check of %s: %v; retrying in %s", a.c.Key, err, back)
 			if !sleepCtx(ctx, back) {
 				return

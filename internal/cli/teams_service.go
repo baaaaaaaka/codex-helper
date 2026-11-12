@@ -106,6 +106,7 @@ func newTeamsServiceCmd(root *rootOptions) *cobra.Command {
 		Args:  cobra.NoArgs,
 	}
 	cmd.AddCommand(
+		newTeamsServiceParkCmd(),
 		newTeamsServiceInstallCmd(),
 		newTeamsServiceBootstrapCmd(root),
 		newTeamsServiceUninstallCmd(),

@@ -45,6 +45,7 @@ type convState struct {
 	id                                   int64
 	label, kind, state, chat, url, title string
 	paused, group                        bool
+	autoParkOff                          bool
 	membersChecked                       time.Time
 	membersKnown                         bool
 	membersOther                         bool

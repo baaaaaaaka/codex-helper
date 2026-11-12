@@ -68,6 +68,7 @@
    | <p>Other control commands:</p>
    | <ul><li><code>st</code> / <code>status</code> - list active Teams work chats</li>
    | <li><code>d &lt;number&gt;</code> / <code>details &lt;number&gt;</code> - show technical IDs and details</li>
+   | <li><code>park &lt;session-number-or-id&gt; on|off|status</code> - configure automatic idle parking (default on; off keeps the cold polling tier)</li>
    | <li><code>park &lt;session-number-or-id&gt;</code> / <code>resume &lt;session-number-or-id&gt;</code> / <code>unpark &lt;session-number-or-id&gt;</code> - manually pause or resume polling for a Work chat</li>
    | <li><code>fork &lt;session&gt;</code> - copy a session into a new Work chat</li>
    | <li><code>m &lt;directory&gt;</code> / <code>mkdir &lt;directory&gt;</code> - create a directory only</li>
@@ -139,6 +140,7 @@
    | <code>helper file &lt;relative-path&gt;</code> or <code>!file &lt;relative-path&gt;</code> - upload a file prepared in the helper&#39;s Teams upload folder<br>
    | <code>helper close</code> or <code>!close</code> - close this Codex session in Teams<br>
    | <code>helper details</code> or <code>!details</code> - show debug IDs and links<br>
+   | <code>helper park on|off|status</code> - configure automatic idle parking (default on)<br>
    | <code>model status</code>, <code>model switch &lt;model&gt;</code>, <code>model reset</code>, or <code>model fork &lt;model&gt;</code> - inspect or change this Work chat model<br>
    | <code>effort status</code>, <code>effort list</code>, <code>effort set &lt;value&gt;</code>, or <code>effort reset</code> - inspect or change this Work chat&#39;s reasoning effort<br>
    | <code>helper goal</code> - show this chat&#39;s Codex goal; <code>helper goal &lt;objective&gt;</code> sets it and makes it active; <code>helper goal active</code> / <code>helper goal pause</code> resume or pause it<br>
@@ -163,6 +165,7 @@
    | <code>helper rename hostname &lt;name&gt;</code> - rename this machine in all related chat titles<br>
    | <code>helper file &lt;relative-path&gt;</code> or <code>!file &lt;relative-path&gt;</code> - upload a file prepared in the helper&#39;s Teams upload folder<br>
    | <code>helper close</code> or <code>!close</code> - close this Codex session in Teams<br>
+   | <code>helper park on|off|status</code> - configure automatic idle parking (default on; off survives restarts)<br>
    | <code>helper park &lt;session-number-or-id&gt;</code> / <code>helper resume &lt;session-number-or-id&gt;</code> / <code>helper unpark &lt;session-number-or-id&gt;</code> - manually pause or resume polling for a Work chat<br>
    | <code>helper unpause</code> - resume auto-start after a pause (requests sent while paused are not run)<br>
    | <code>helper fork</code> - copy this session into a new Work chat<br>

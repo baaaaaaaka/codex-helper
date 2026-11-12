@@ -81,12 +81,12 @@
    | <p>@codex !status</p>
 -- <msg:15> helper quoting <msg:14> (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>s001 (active): idle, 0 queued. Directory: <code><root>/work/group</code>.</p>
+   | <p>s001 (active): idle, 0 queued. Directory: <code><root>/work/group</code>. Auto park: on.</p>
 -- <msg:16> owner (html)
    | <p>!status</p>
 -- <msg:17> helper quoting <msg:16> (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>s001 (active): idle, 0 queued. Directory: <code><root>/work/group</code>.</p>
+   | <p>s001 (active): idle, 0 queued. Directory: <code><root>/work/group</code>. Auto park: on.</p>
 
 == codex turns (per thread; threads by kind, directory and first prompt; turns in start order)
 -- thread <uuid:1> (work, cwd <root>/work/group)

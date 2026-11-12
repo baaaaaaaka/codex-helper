@@ -175,6 +175,7 @@
    | <p><strong>Active Work chats</strong></p>
    | <p><strong>💬 e2ehost - Plan the alpha release</strong> [active]<br>
    | &nbsp;&nbsp;<strong>Session:</strong> <code>s001</code><br>
+   | &nbsp;&nbsp;<strong>Auto park:</strong> on<br>
    | &nbsp;&nbsp;<strong>Folder:</strong> <code><root>/work/alpha</code><br>
    | &nbsp;&nbsp;<strong>Last used:</strong> <minute><br>
    | &nbsp;&nbsp;<strong>Chat:</strong> <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">▶ Open chat</a></p>
@@ -238,6 +239,7 @@
    | <p>Session: s001<br>
    | Chat polling: listening<br>
    | Title: 💬 e2ehost - Plan the alpha release<br>
+   | Auto park: on<br>
    | Working directory: <root>/work/alpha<br>
    | Codex thread: <uuid:1><br>
    | Teams chat: <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a><br>

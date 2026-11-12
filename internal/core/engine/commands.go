@@ -448,7 +448,7 @@ func (e *Engine) listText() string {
 		if cs.paused {
 			st += ", paused"
 		}
-		fmt.Fprintf(&b, "- %s — %s (%s)\n", cs.label, cs.title, st)
+		fmt.Fprintf(&b, "- %s — %s (%s; auto park: %s)\n", cs.label, cs.title, st, autoParkValue(cs.autoParkOff))
 	}
 	return b.String()
 }
@@ -468,6 +468,7 @@ func (e *Engine) statusText() string {
 func (e *Engine) workStatus(cs *convState) string {
 	e.mu.Lock()
 	label, state, cwd, running, paused := cs.label, cs.state, cs.cwd, cs.running != nil, cs.paused
+	autoParkOff := cs.autoParkOff
 	e.mu.Unlock()
 	var queued, unsent, unconfirmed int
 	_ = e.update(func(tx *store.Tx) error {
@@ -491,7 +492,7 @@ func (e *Engine) workStatus(cs *convState) string {
 	if paused {
 		p = " Auto-start is paused (`helper unpause`)."
 	}
-	text := fmt.Sprintf("%s (%s): %s, %d queued. Directory: `%s`.%s", label, state, run, queued, cwd, p)
+	text := fmt.Sprintf("%s (%s): %s, %d queued. Directory: `%s`.%s Auto park: %s.", label, state, run, queued, cwd, p, autoParkValue(autoParkOff))
 	if unconfirmed > 0 {
 		text += fmt.Sprintf(" Delivery: %d awaiting send, %d unconfirmed (retained without automatic resend; later messages can continue).", unsent, unconfirmed)
 	}

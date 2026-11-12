@@ -762,7 +762,7 @@ func (e *Engine) commitFinish(ctx context.Context, tr store.Turn, fn func(tx *st
 			e.logf("finish turn %d: %v", tr.ID, err)
 			return false
 		}
-		back := e.t.Hot << min(attempt, 8)
+		back := e.retryBase() << min(attempt, 8)
 		if back > e.t.MaxBackoff {
 			back = e.t.MaxBackoff
 		}
@@ -1313,7 +1313,7 @@ func (e *Engine) progressRecord(ctx context.Context, cs *convState, tr store.Tur
 }
 
 func (e *Engine) waitProgress(ctx context.Context, attempt int) bool {
-	t := time.NewTimer(min(e.t.Hot<<min(attempt, 8), e.t.MaxBackoff))
+	t := time.NewTimer(min(e.retryBase()<<min(attempt, 8), e.t.MaxBackoff))
 	defer t.Stop()
 	select {
 	case <-ctx.Done():

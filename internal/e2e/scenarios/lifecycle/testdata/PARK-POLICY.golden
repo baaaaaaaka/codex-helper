@@ -1,0 +1,93 @@
+# PARK-POLICY: automatic park policy persists and preserves manual park
+# cxp black-box transcript; volatile values are numbered placeholders
+
+== chat <chat:1> "🏠 Codex Control - e2ehost"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
+-- <msg:2> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>new <root>/work/park-policy</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>new <root>/work/park-policy</p>
+-- <msg:3> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>✅ Work chat created: s001</p>
+   | <p>Open this Teams link and send your task there:<br>
+   | <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
+   | <p>If Teams does not show it right away, search for: s001</p>
+-- <msg:4> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>park s001</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>park s001</p>
+-- <msg:5> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Parked s001: its chat is no longer read. Messages sent to it while it is parked are read and run once it wakes. Wake it with <code>r s001</code>, or by using the session in Codex.</p>
+-- <msg:6> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>r s001</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>r s001</p>
+-- <msg:7> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Resumed s001.</p>
+   | <p>Open Work chat: <a href="https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57">https://teams.microsoft.com/l/chat/<chat:2>/0?tenantId=e2e00000-0000-4000-8000-00000000te57</a></p>
+   | <p>Messages in that chat will be read again.</p>
+
+== chat <chat:2> "💬 e2ehost - New message in park-policy"
+   type: meeting; members: owner
+-- <msg:1> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Work chat created: s001.<br>
+   | Working directory: <root>/work/park-policy</p>
+-- <msg:2> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>💬 Work chat is ready.<br>
+   | Send a task in this chat. Codex will start automatically and continue this session.<br>
+   | Status: waiting for your first task.<br>
+   | Session: s001<br>
+   | Project: park-policy<br>
+   | Working directory: <root>/work/park-policy<br>
+   | Commands: <code>helper status</code> or <code>!status</code>, <code>helper stats</code>, <code>helper help</code>, <code>helper close</code> to close this Codex session in Teams.<br>
+   | Need more details? Send <code>helper status</code>.<br>
+   | Model: Codex account default<br>
+   | Reasoning effort: model default</p>
+-- <msg:3> owner (html)
+   | <p><strong>🧑‍💻 User:</strong></p>
+   | <p>helper park off</p>
+   edited 1 time(s); earlier versions:
+   [version 1]
+   | <p>helper park off</p>
+-- <msg:4> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>s001: Auto park: off. Chat state: active. This setting survives helper restarts. When active and cooled down, this chat is read every 30 seconds, subject to read pacing and backoff. Manual park is still available.</p>
+-- <msg:5> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>This chat was resumed: messages here are read again. Requests sent while it was parked run now.</p>
+
+== cli
+$ cxp teams service park s001 status
+   exit 0
+   stdout| Waiting for the running Teams helper...
+   stdout| s001: Auto park: on. Chat state: active. Idle chats can be parked automatically after the normal inactivity timeout.
+$ cxp teams service park s001 status
+   exit 0
+   stdout| Waiting for the running Teams helper...
+   stdout| s001: Auto park: off. Chat state: active. This setting survives helper restarts. When active and cooled down, this chat is read every 30 seconds, subject to read pacing and backoff. Manual park is still available.
+$ cxp teams service park s001 status
+   exit 0
+   stdout| Waiting for the running Teams helper...
+   stdout| s001: Auto park: off. Chat state: active. This setting survives helper restarts. When active and cooled down, this chat is read every 30 seconds, subject to read pacing and backoff. Manual park is still available.
+$ cxp teams service park s001 off
+   exit 0
+   stdout| Waiting for the running Teams helper...
+   stdout| s001: Auto park: off. Chat state: parked. This setting survives helper restarts. When active and cooled down, this chat is read every 30 seconds, subject to read pacing and backoff. Manual park is still available. The chat remains parked. Send `r s001` in the control chat to wake it; queued messages can then run.
+$ cxp teams service park s001 on
+   exit 0
+   stdout| Waiting for the running Teams helper...
+   stdout| s001: Auto park: on. Chat state: active. Idle chats can be parked automatically after the normal inactivity timeout.

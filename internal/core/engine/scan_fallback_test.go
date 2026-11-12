@@ -63,18 +63,20 @@ func (s *failScanner) readsIn(stream string, from, to time.Time) int {
 // prompt in an idle work chat must not wait for the SafetyRead. After the
 // scan has failed for scanBlindAfter, the idle chats are read directly at
 // the fallback interval (12 scan intervals here); once the scan works
-// again they go back to the SafetyRead.
+// again they go back to the normal receive tiers.
 func TestScanFailuresFallBackToDirectReads(t *testing.T) {
 	var sc *failScanner
 	r := newRig(t, func(c *Config) {
 		sc = &failScanner{Fake: c.Channel.(*channeltest.Fake)}
 		c.Channel, c.ActivityScan = sc, true
 		c.Timing.HotFor, c.Timing.SafetyRead, c.Timing.ScanInterval = 200*time.Millisecond, time.Minute, 50*time.Millisecond
+		c.Timing.WarmFor, c.Timing.CoolFor = 400*time.Millisecond, 600*time.Millisecond
+		c.Timing.Warm, c.Timing.Cool, c.Timing.Cold = 100*time.Millisecond, 200*time.Millisecond, 300*time.Millisecond
 		c.ReadRate = 100 // a scan every 50 ms must not take every read token
 	})
 	work := r.newWork(t.TempDir())
 	r.control()
-	time.Sleep(time.Second) // the work chat goes idle: read only at the SafetyRead (>= 30 s away)
+	time.Sleep(time.Second) // the work chat reaches the cold receive tier
 	sc.set(true)
 	time.Sleep(500 * time.Millisecond) // failing for longer than scanBlindAfter (300 ms)
 	posted := time.Now()
@@ -90,7 +92,7 @@ func TestScanFailuresFallBackToDirectReads(t *testing.T) {
 	time.Sleep(time.Second) // a working scan; the chat cools down (HotFor), one fallback read may remain
 	from := time.Now()
 	time.Sleep(2 * time.Second)
-	if n := sc.readsIn(work, from, time.Now()); n != 0 {
-		t.Fatalf("%d direct reads of the idle work chat in 2 s after the scan works again, want 0 (SafetyRead)", n)
+	if n := sc.readsIn(work, from, time.Now()); n < 4 || n > 9 {
+		t.Fatalf("%d direct reads of the idle work chat in 2 s after recovery, want cold tier (300ms)", n)
 	}
 }
