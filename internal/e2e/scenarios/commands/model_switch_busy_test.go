@@ -2,88 +2,81 @@ package commands
 
 import (
 	"fmt"
-	"html"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/continuation"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/harness"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/steps"
 )
 
-// A model switch while a turn runs leaves that turn alone and applies from
-// the next one, on the same Codex thread, also after a crash (R-31).
-//
-// History: model and effort switches that changed the running turn under
-// Codex, or that the queued prompt never saw (SPEC R-31: "the running
-// turn completes on the old model, and the next turn's turn/start.model
-// is gpt-x"). CMD-MODEL only switches an idle chat.
+// Busy settings changes interrupt and automatically continue the same task;
+// the original prompt is not replayed. Explicit queued work still waits.
 func TestModelSwitchWhileBusy(t *testing.T) {
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "MODEL-SWITCH-BUSY", harness.Options{
-		Guarantees: []string{"R-31"},
-		Title:      "`model switch gpt-5-mini` during a running turn: that turn keeps gpt-5-codex, the queued prompt and later ones (also after SIGKILL) run on gpt-5-mini, same thread",
-		Budget:     120 * time.Second,
+		Guarantees: []string{"R-31"}, Title: "busy model/effort switch automatically continues the same thread without replay; queued work waits and settings survive restart", Budget: 120 * time.Second,
 	})
 	defer s.Finish()
-	running := s.Token("running")
+	original := s.Token("running")
+	resumedAnswer := "E2EANSWER-resumed task completed " + original
 	s.Codex.SetScript(func(c harness.CodexCall) harness.CodexBehavior {
-		if c.HasToken(running) {
+		if c.HasToken(original) {
 			return harness.CodexBehavior{Block: true}
+		}
+		if c.Prompt == continuation.Prompt {
+			return harness.CodexBehavior{Block: true, Answer: resumedAnswer}
 		}
 		return harness.CodexBehavior{}
 	})
 	control := steps.ReadyControlChat(s)
 	work, _ := steps.NewWorkChat(s, control, "modelbusy")
-
-	steps.MustPost(s, work.ID, "Long task "+running)
-	s.Require("the long turn reached Codex", steps.AnswerTimeout, func() (bool, string) {
-		return len(s.Codex.CallsWithToken(running)) == 1, "not yet"
+	steps.MustPost(s, work.ID, "Long task "+original)
+	s.Require("original reached Codex", steps.AnswerTimeout, func() (bool, string) { return len(s.Codex.CallsWithToken(original)) == 1, "not started" })
+	reply, ok := command(s, work.ID, "model use gpt-5-mini low", "Model profile switched")
+	s.Check("switch promises automatic continuation", ok && strings.Contains(reply, "continue automatically"), "automatic continuation", clip(reply, 300))
+	var resumed harness.CodexCall
+	s.Require("continuation starts without another user message", steps.AnswerTimeout, func() (bool, string) {
+		for _, c := range s.Codex.Calls() {
+			if c.Prompt == continuation.Prompt {
+				resumed = c
+				return true, ""
+			}
+		}
+		return false, "no continuation"
 	})
-	reply, ok := command(s, work.ID, "helper model switch gpt-5-mini", "Model profile switched")
-	norm := html.UnescapeString(harness.NormalizeSpace(reply))
-	s.Check("the switch is accepted and says the running turn keeps its model", ok && strings.Contains(norm, "The running turn keeps its model"),
-		"\"Model profile switched … The running turn keeps its model.\"", clip(norm, 300))
-
+	first := s.Codex.CallsWithToken(original)[0]
+	s.Check("original was interrupted without being replayed", first.Outcome == "cancelled" && len(s.Codex.CallsWithToken(original)) == 1, "one interrupted original", fmt.Sprintf("%s, %d calls", first.Outcome, len(s.Codex.CallsWithToken(original))))
+	s.Check("continuation uses new settings on same thread", resumed.Model == "gpt-5-mini" && resumed.Effort == "low" && resumed.ThreadID == first.ThreadID && resumed.ClientID != "" && resumed.ClientID != first.ClientID, "gpt-5-mini/low, same thread, distinct execution", fmt.Sprintf("%+v", resumed))
+	s.Check("old execution ended before continuation", !first.Ended.IsZero() && !resumed.Started.Before(first.Ended), "no overlapping execution", first.Ended.String()+" -> "+resumed.Started.String())
 	queued := s.Token("queued")
 	steps.MustPost(s, work.ID, "helper queue Next task "+queued)
-	s.Poll(4*time.Second, func() bool { return len(s.Codex.CallsWithToken(queued)) > 0 })
-	early := len(s.Codex.CallsWithToken(queued))
-	s.Codex.Release(s.Codex.CallsWithToken(running)[0].Seq)
-	steps.WaitAnswered(s, work.ID, running, steps.AnswerTimeout)
-	steps.WaitAnswered(s, work.ID, queued, steps.AnswerTimeout)
-	// The work-chat answer and control-chat notification are sent separately.
-	// Finish the latter before crashing so this scenario tests persistence of
-	// the model selection, rather than an in-flight notification recovery.
-	s.Require("the queued turn's control notification is delivered", steps.CommandTimeout, func() (bool, string) {
-		_, ok := s.WaitSUTMessage(control.ID, "Request: Next task "+queued, time.Second)
-		return ok, "queued turn notification not yet delivered"
+	s.Require("queued request acknowledged", steps.CommandTimeout, func() (bool, string) {
+		return len(steps.PromptConfirmations(s, work.ID, "Queued.")) > 0, "no queued acknowledgement"
 	})
-
+	s.Check("queued receipt names the original active task", len(steps.PromptConfirmations(s, work.ID, "Running now: Long task "+original)) == 1, "original task label", "receipt task label")
+	s.Check("explicit queue waits behind continuation", len(s.Codex.CallsWithToken(queued)) == 0, "not started", fmt.Sprint(len(s.Codex.CallsWithToken(queued))))
+	s.Codex.Release(resumed.Seq)
+	s.Require("resumed answer delivered once", steps.AnswerTimeout, func() (bool, string) {
+		return len(steps.AnswerPosts(s, work.ID, original)) == 1 && len(s.SUTMessagesContaining(work.ID, resumedAnswer)) == 1, "resumed answer pending or duplicated"
+	})
+	steps.WaitAnswered(s, work.ID, queued, steps.AnswerTimeout)
+	s.Require("queued completion notification delivered", steps.CommandTimeout, func() (bool, string) {
+		return len(s.SUTMessagesContaining(control.ID, "Request: Next task "+queued)) > 0, "notification pending"
+	})
 	s.CrashSUT()
 	s.StartSUT()
 	after := s.Token("aftercrash")
 	steps.MustPost(s, work.ID, "After the crash "+after)
 	steps.WaitAnswered(s, work.ID, after, steps.AnswerTimeout)
 	s.Settle(2*time.Second, 8*time.Second)
-
-	one := func(tok string) harness.CodexCall {
-		if c := s.Codex.CallsWithToken(tok); len(c) == 1 {
-			return c[0]
+	q, a := s.Codex.CallsWithToken(queued), s.Codex.CallsWithToken(after)
+	s.Check("queued and restarted work retain settings", len(q) == 1 && len(a) == 1 && q[0].Model == "gpt-5-mini" && a[0].Model == "gpt-5-mini" && q[0].ThreadID == first.ThreadID && a[0].ThreadID == first.ThreadID, "new model, same thread", fmt.Sprintf("queued=%+v after=%+v", q, a))
+	s.Check("original task answered once", len(steps.AnswerPosts(s, work.ID, original)) == 1, "one answer", fmt.Sprint(len(steps.AnswerPosts(s, work.ID, original))))
+	for _, m := range s.SUTMessages(work.ID) {
+		if strings.Contains(m.PlainText(), "🧑‍💻 User") && strings.Contains(m.PlainText(), continuation.Prompt) {
+			s.Check("internal continuation is not mirrored", false, "no user mirror", m.PlainText())
 		}
-		return harness.CodexCall{}
 	}
-	r, q, a := one(running), one(queued), one(after)
-	s.Check("the queued prompt waits for the running turn", early == 0, "not started while the turn runs", fmt.Sprintf("%d calls", early))
-	// The chat had no model selection when the turn started: turn/start
-	// leaves the model to Codex's account default.
-	s.Check("the running turn is neither restarted nor moved to the new model", len(s.Codex.CallsWithToken(running)) == 1 && (r.Model == "" || r.Model == "gpt-5-codex"),
-		"1 Codex call on the account default", fmt.Sprintf("%d calls, model=%q", len(s.Codex.CallsWithToken(running)), r.Model))
-	s.Check("the next turn runs on the new model and its effort, on the same thread",
-		q.Model == "gpt-5-mini" && q.Effort == "low" && q.ThreadID != "" && q.ThreadID == r.ThreadID,
-		"gpt-5-mini, low, same thread", fmt.Sprintf("model=%q effort=%q thread %q -> %q", q.Model, q.Effort, r.ThreadID, q.ThreadID))
-	s.Check("the switch survives a crash", a.Model == "gpt-5-mini" && a.ThreadID == r.ThreadID,
-		"gpt-5-mini, same thread", fmt.Sprintf("model=%q thread %q", a.Model, a.ThreadID))
-	n := len(steps.AnswerPosts(s, work.ID, running)) + len(steps.AnswerPosts(s, work.ID, queued)) + len(steps.AnswerPosts(s, work.ID, after))
-	s.Check("each prompt is answered once", n == 3, "3 answers", fmt.Sprint(n), s.Transcript(work.ID, 12)...)
 }

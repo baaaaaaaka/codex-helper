@@ -48,7 +48,7 @@
    | Selector: <code>default (dynamic Codex account default)</code><br>
    | Selection: global default<br>
    | Effective effort: <code>low</code> (helper fallback)<br>
-   | Applies to: new turns in this chat<br>
+   | Applies to: this chat; active work is interrupted and continued<br>
    | Global default for new chats: Codex Official (<code>gpt-5-codex</code>) (existing chats are unchanged)<br>
    | Model profile: Codex Official (<code>gpt-5-codex</code>)<br>
    | Switchable: yes. Switching preserves the existing Codex thread and portable context, if present.</p>
@@ -104,7 +104,7 @@
    | Selector: <code>default (dynamic Codex account default)</code><br>
    | Selection: global default<br>
    | Effective effort: <code>medium</code> (Codex runtime default)<br>
-   | Applies to: new turns in this chat<br>
+   | Applies to: this chat; active work is interrupted and continued<br>
    | Global default for new chats: Codex Official (<code>gpt-5-codex</code>) (existing chats are unchanged)<br>
    | Model profile: Codex Official (<code>gpt-5-codex</code>)<br>
    | Switchable: yes. Switching preserves the existing Codex thread and portable context, if present.</p>
@@ -133,10 +133,10 @@
 -- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Model profile switched for this Work chat<br>
-   | Previous: Codex Official (<code>gpt-5-codex</code>)<br>
-   | Effective next-turn model: Codex Official (<code>gpt-5-mini</code>)<br>
-   | Selection: chat override</p>
-   | <p>The next message will continue the current Codex thread with its portable context preserved.</p>
+   | Target model: Codex Official (<code>gpt-5-mini</code>)<br>
+   | Target effort: <code>low</code><br>
+   | Selection: chat override<br>
+   | These settings apply when this chat next starts work.</p>
 -- <msg:9> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>model</p>
@@ -151,7 +151,7 @@
    | Selector: <code>official:gpt-5-mini</code><br>
    | Selection: chat override<br>
    | Effective effort: <code>low</code> (model-advertised default)<br>
-   | Applies to: new turns in this chat<br>
+   | Applies to: this chat; active work is interrupted and continued<br>
    | Global default for new chats: Codex Official (<code>gpt-5-codex</code>) (existing chats are unchanged)<br>
    | Model profile: Codex Official (<code>gpt-5-mini</code>)<br>
    | Switchable: yes. Switching preserves the existing Codex thread and portable context, if present.</p>
@@ -279,7 +279,7 @@
    prompt|   Selector: default (dynamic Codex account default)
    prompt|   Selection: global default
    prompt|   Effective effort: low (helper fallback)
-   prompt|   Applies to: new turns in this chat
+   prompt|   Applies to: this chat; active work is interrupted and continued
    prompt|   Global default for new chats: Codex Official (gpt-5-codex) (existing chats are unchanged)
    prompt|   Model profile: Codex Official (gpt-5-codex)
    prompt|   Switchable: yes. Switching preserves the existing Codex thread and portable context, if present.

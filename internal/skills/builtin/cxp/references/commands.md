@@ -26,7 +26,7 @@ The same supplied entry works when `cxp` is not visible in the current process P
 
 ## Models
 
-CXP launches the official Codex CLI and uses the models Codex offers for the signed-in account. Choose a model the way Codex does (`/model` in the TUI, `-m <model>` for `codex exec`). In Teams, send `model` in the control chat to list the models and `helper model <model> [effort]` in a work chat to switch that session. Third-party model profiles, catalogs and the local Responses adapter were removed; configs that still contain them load normally and keep the settings untouched.
+CXP launches the official Codex CLI and uses the models Codex offers for the signed-in account. Choose a model the way Codex does (`/model` in the TUI, `-m <model>` for `codex exec`). In Teams, send `model` in the control chat to list the models and `helper model use <model> [effort]` in a work chat to switch that session. Third-party model profiles, catalogs and the local Responses adapter were removed; configs that still contain them load normally and keep the settings untouched.
 
 ## Proxy Profiles
 
@@ -128,8 +128,8 @@ Work chat commands:
 - Direct reads cool through 2s (under 2min), 5s (under 15min), 10s (under 4h), then 30s. Running requests stay at 2s; the control chat stays at 5s. After 48h idle, on permits automatic park, while off continues the cold tier. Activity scans can trigger earlier reads; pacing and backoff still apply.
 - `helper status`: session status.
 - `helper fork`: copy this session into a new work chat (also while a request runs; the copy stops at the last finished request), then post the new chat's link.
-- `helper model`, `helper model list`, `helper model <model> [effort]`, `helper model reset`: show or switch this session's model.
-- `helper effort <effort>`: switch this session's reasoning effort.
+- `helper model`, `helper model list`, `helper model use <model> [effort]`, `helper model reset`: show or switch this session's model.
+- `helper effort <effort>`: switch this session's reasoning effort. Model/effort changes interrupt helper-owned active work, then continue on the same Codex thread with the latest valid settings. Pending current-task input takes priority over an internal continuation. Completed or cancelled tasks stay stopped. An unknown outcome pauses the chat; attached TUI/external execution and active native goals are outside this switch contract.
 - `helper stats`: requests and token usage of this session.
 - `helper skills`: skill subscriptions.
 - `helper file <relative-path>` / `!file <relative-path>`: send one file from the Teams outbound root (the bare command shows the root).

@@ -148,14 +148,14 @@ func placeholders(n int) string {
 // Bind writes the Codex binding of a conversation. It is called for explicit
 // new/fork and by migration; a restart never changes it.
 func (t *Tx) Bind(th Thread) error {
-	_, err := t.exec(`INSERT INTO threads(`+threadCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+	_, err := t.exec(`INSERT INTO threads(`+threadCols+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 ON CONFLICT(conv_id) DO UPDATE SET thread_id=excluded.thread_id, cwd=excluded.cwd, codex_home=excluded.codex_home,
   profile=excluded.profile, model=excluded.model, model_source=excluded.model_source, effort=excluded.effort,
   effort_source=excluded.effort_source, pending_model=excluded.pending_model, pending_effort=excluded.pending_effort,
-  sandbox=excluded.sandbox, model_pin=excluded.model_pin, fork_parent=excluded.fork_parent, updated_at=excluded.updated_at`,
+  sandbox=excluded.sandbox, model_pin=excluded.model_pin, fork_parent=excluded.fork_parent, updated_at=excluded.updated_at, settings_version=excluded.settings_version`,
 		th.ConvID, nullStr(th.ThreadID), th.Cwd, nullStr(th.CodexHome), nullStr(th.Profile), nullStr(th.Model),
 		nullStr(th.ModelSource), nullStr(th.Effort), nullStr(th.EffortSource), nullStr(th.PendingModel),
-		nullStr(th.PendingEffort), nullStr(th.Sandbox), nullStr(th.ModelPin), nullInt(th.ForkParent), t.now)
+		nullStr(th.PendingEffort), nullStr(th.Sandbox), nullStr(th.ModelPin), nullInt(th.ForkParent), t.now, th.SettingsVersion)
 	return err
 }
 

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/continuation"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/harness"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/steps"
 )
@@ -16,7 +17,7 @@ import (
 // turn is answered within 5 minutes of the FIRST capacity error; the user
 // gets the answer once and no failure message. Here Codex fails the turn
 // twice with the capacity error and then succeeds. Codex recorded the
-// prompt with the first attempt, so both retries send `continue` on the
+// prompt with the first attempt, so both retries send the shared instruction on the
 // same thread (owner ruling 2026-11-05); every call on that thread after
 // the first failure counts as a retry.
 func TestCapacityRetryWithinFiveMinutes(t *testing.T) {
@@ -93,7 +94,7 @@ var mirroredContinue = regexp.MustCompile(`(?is)\bUser\b\W*continue\b`)
 
 // checkRetriesContinue checks the owner ruling of 2026-11-05: the prompt
 // reaches Codex only until Codex records it (the first sent calls carry
-// it), every later retry sends the literal `continue` on the same thread
+// it), every later retry sends the short continuation instruction on the same thread
 // with the turn's own client id, and that continuation is never mirrored
 // to Teams as a prompt typed in Codex.
 func checkRetriesContinue(s *harness.Scenario, chatID string, calls []harness.CodexCall, tok string, sent int) {
@@ -105,7 +106,7 @@ func checkRetriesContinue(s *harness.Scenario, chatID string, calls []harness.Co
 		case i < sent:
 			ok = ok && c.HasToken(tok)
 		default:
-			ok = ok && c.Prompt == "continue" && c.ThreadID == calls[sent-1].ThreadID
+			ok = ok && c.Prompt == continuation.Prompt && !c.HasToken(tok) && strings.Contains(c.Prompt, "Keep the previous response language unless the user requests otherwise.") && c.ThreadID == calls[sent-1].ThreadID
 		}
 		ok = ok && c.ClientID == calls[0].ClientID && c.ClientID != ""
 	}

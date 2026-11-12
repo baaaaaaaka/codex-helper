@@ -77,21 +77,22 @@ type Conversation struct {
 
 // Thread is the Codex binding of a work conversation.
 type Thread struct {
-	ConvID        int64
-	ThreadID      string
-	Cwd           string
-	CodexHome     string
-	Profile       string
-	Model         string
-	ModelSource   string
-	Effort        string
-	EffortSource  string
-	PendingModel  string
-	PendingEffort string
-	Sandbox       string
-	ModelPin      string
-	ForkParent    int64
-	UpdatedAt     int64
+	SettingsVersion int64
+	ConvID          int64
+	ThreadID        string
+	Cwd             string
+	CodexHome       string
+	Profile         string
+	Model           string
+	ModelSource     string
+	Effort          string
+	EffortSource    string
+	PendingModel    string
+	PendingEffort   string
+	Sandbox         string
+	ModelPin        string
+	ForkParent      int64
+	UpdatedAt       int64
 }
 
 // Stream is a durable receive cursor.
@@ -153,6 +154,8 @@ type Inbound struct {
 
 // Turn is a turns row.
 type Turn struct {
+	ResumeFrom         int64
+	OutputKey          string
 	TranscriptProgress bool
 	TranscriptDone     bool
 	Queue              bool

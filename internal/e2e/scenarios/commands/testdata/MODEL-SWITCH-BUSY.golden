@@ -1,4 +1,4 @@
-# MODEL-SWITCH-BUSY: `model switch gpt-5-mini` during a running turn: that turn keeps gpt-5-codex, the queued prompt and later ones (also after SIGKILL) run on gpt-5-mini, same thread
+# MODEL-SWITCH-BUSY: busy model/effort switch automatically continues the same thread without replay; queued work waits and settings survive restart
 # cxp black-box transcript; volatile values are numbered placeholders
 
 == chat <chat:1> "🏠 Codex Control - e2ehost"
@@ -73,18 +73,17 @@
    | <p>Long task E2E-MODELSWITCHBUSY-running-1</p>
 -- <msg:4> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>helper model switch gpt-5-mini</p>
+   | <p>model use gpt-5-mini low</p>
    edited 1 time(s); earlier versions:
    [version 1]
-   | <p>helper model switch gpt-5-mini</p>
+   | <p>model use gpt-5-mini low</p>
 -- <msg:5> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Model profile switched for this Work chat<br>
-   | Previous: Codex Official (<code>gpt-5-codex</code>)<br>
-   | Effective next-turn model: Codex Official (<code>gpt-5-mini</code>)<br>
-   | Selection: chat override</p>
-   | <p>The next message will continue the current Codex thread with its portable context preserved.<br>
-   | The running turn keeps its model.</p>
+   | Target model: Codex Official (<code>gpt-5-mini</code>)<br>
+   | Target effort: <code>low</code><br>
+   | Selection: chat override<br>
+   | The active task will stop and continue automatically with these settings.</p>
 -- <msg:6> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper queue Next task E2E-MODELSWITCHBUSY-queued-2</p>
@@ -99,9 +98,9 @@
    | <p>helper queue Next task E2E-MODELSWITCHBUSY-queued-2</p>
 -- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
-   | <p>E2EANSWER-<n> answer for E2E-MODELSWITCHBUSY-running-1</p>
+   | <p>E2EANSWER-resumed task completed E2E-MODELSWITCHBUSY-running-1</p>
    | <hr/>
-   | <p><strong>🔧 Helper:</strong> model - gpt-5-codex, effort - medium, tier - standard</p>
+   | <p><strong>🔧 Helper:</strong> model - gpt-5-mini, effort - low, tier - standard</p>
    | <p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>
 -- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
@@ -132,7 +131,7 @@
 
 == codex turns (per thread; threads by kind, directory and first prompt; turns in start order)
 -- thread <uuid:1> (work, cwd <root>/work/modelbusy)
-   turn model=gpt-5-codex effort=medium: answered
+   turn model=gpt-5-codex effort=medium: cancelled
    prompt| User message:
    prompt| Long task E2E-MODELSWITCHBUSY-running-1
    prompt|
@@ -155,6 +154,8 @@
    prompt| ```
    prompt|
    prompt| Use only relative manifest paths under that directory. Keep your normal answer visible; the helper will upload listed files separately when file-write auth is available.
+   turn model=gpt-5-mini effort=low: answered
+   prompt| Continue the active unfinished task from its current state. Keep the previous response language unless the user requests otherwise. Verify interrupted actions before retrying; do not repeat completed work.
    turn model=gpt-5-mini effort=low: answered
    prompt| User message:
    prompt| Next task E2E-MODELSWITCHBUSY-queued-2

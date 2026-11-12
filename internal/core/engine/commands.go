@@ -183,6 +183,7 @@ func (e *Engine) complete(j cmdJob, extra func(tx *store.Tx) error) {
 }
 
 func (e *Engine) runCommand(ctx context.Context, j cmdJob) {
+	defer e.wakeRunner(j.conv)
 	cs := e.conv(j.conv)
 	if cs == nil {
 		return

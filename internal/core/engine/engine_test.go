@@ -2358,7 +2358,7 @@ func TestCapacityWindowRestartsAfterProgress(t *testing.T) {
 	// Codex recorded the prompt with the first attempt: the retries
 	// continue the thread instead of sending it again (owner ruling
 	// 2026-11-05).
-	if got, all := r.ag.calls("long progress task"), r.ag.texts(); got != 1 || len(all) != 3 || all[1] != "continue" || all[2] != "continue" {
+	if got, all := r.ag.calls("long progress task"), r.ag.texts(); got != 1 || len(all) != 3 || all[1] != continueText || all[2] != continueText {
 		t.Fatalf("attempts %q, want the prompt once and then `continue` twice", all)
 	}
 }
@@ -2375,7 +2375,7 @@ func TestCapacityWindowBoundsWaitingWithoutProgress(t *testing.T) {
 	work := r.newWork(t.TempDir())
 	r.ch.PostUser(work, "never fits")
 	r.wait("failure notice", func() bool { return len(r.own(work, "over capacity")) == 1 })
-	if got, all := r.ag.calls("never fits"), r.ag.texts(); got != 1 || len(all) < 2 || all[1] != "continue" {
+	if got, all := r.ag.calls("never fits"), r.ag.texts(); got != 1 || len(all) < 2 || all[1] != continueText {
 		t.Fatalf("attempts %q, want the prompt once and `continue` retries before the failure", all)
 	}
 	// The retry notice is Codex status, as v0.1.20's codex-status kind.
@@ -2430,7 +2430,7 @@ func TestCapacityRetrySendsContinueOnceCodexRecordedThePrompt(t *testing.T) {
 		t.Fatalf("%d attempts, want 5: %+v", len(runs), runs)
 	}
 	for i, run := range runs {
-		want := "continue"
+		want := continueText
 		if i < 3 {
 			if !strings.HasPrefix(run.Text, "User message:\nfit me in") {
 				t.Fatalf("attempt %d sent %q, want the prompt (Codex had not recorded it)", i+1, run.Text)
@@ -2476,7 +2476,7 @@ func TestReconnectFailureRetriesWithContinue(t *testing.T) {
 		return len(r.own(work, "could not reconnect after its automatic retries")) == 1
 	})
 	r.wait("answer", func() bool { return len(r.own(work, "DONE after reconnect")) == 1 })
-	if got, all := r.ag.calls("recover after a dropped connection"), r.ag.texts(); got != 1 || len(all) != 2 || all[1] != "continue" {
+	if got, all := r.ag.calls("recover after a dropped connection"), r.ag.texts(); got != 1 || len(all) != 2 || all[1] != continueText {
 		t.Fatalf("attempts %q, want the prompt once then `continue`", all)
 	}
 }

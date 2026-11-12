@@ -45,7 +45,7 @@
    | <p>Current chat effort (Control)<br>
    | Effective for next turn: <code>low</code><br>
    | Source: helper fallback<br>
-   | Applies to: turns that start after a change in this chat; a running turn keeps its effort.<br>
+   | Applies to: turns that start after a change in this chat; an active task is interrupted and continued with the new settings.<br>
    | Model for this chat: <code>gpt-5-codex</code><br>
    | Model-advertised default: <code>medium</code><br>
    | Available: <code>low</code>, <code>medium</code>, <code>high</code></p>
@@ -62,7 +62,8 @@
    | Effective for next turn: <code>high</code><br>
    | Model: <code>gpt-5-codex</code><br>
    | Source: chat override<br>
-   | Applies to turns that start after this change in this chat; a running turn keeps its effort.</p>
+   | Applies to turns that start after this change in this chat; an active task is interrupted and continued with the new settings.<br>
+   | These settings apply when this chat next starts work.</p>
 -- <msg:10> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>ask what is E2E-CMDEFFORT-ctlhigh-3?</p>
@@ -109,7 +110,8 @@
    | Effective for next turn: <code>medium</code><br>
    | Model: <code>gpt-5-codex</code><br>
    | Source: model-advertised default<br>
-   | Applies to turns that start after this change in this chat; a running turn keeps its effort.</p>
+   | Applies to turns that start after this change in this chat; an active task is interrupted and continued with the new settings.<br>
+   | These settings apply when this chat next starts work.</p>
 -- <msg:16> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong> <at id="0">E2E Owner</at></p>
    | <p><strong>✅ Codex finished</strong></p>
@@ -148,7 +150,7 @@
    | <p>Current chat effort (Work)<br>
    | Effective for next turn: <code>medium</code><br>
    | Source: Codex runtime default<br>
-   | Applies to: turns that start after a change in this chat; a running turn keeps its effort.<br>
+   | Applies to: turns that start after a change in this chat; an active task is interrupted and continued with the new settings.<br>
    | Model for this chat: <code>gpt-5-codex</code><br>
    | Model-advertised default: <code>medium</code><br>
    | Available: <code>low</code>, <code>medium</code>, <code>high</code></p>
@@ -188,7 +190,8 @@
    | Effective for next turn: <code>high</code><br>
    | Model: <code>gpt-5-codex</code><br>
    | Source: chat override<br>
-   | Applies to turns that start after this change in this chat; a running turn keeps its effort.</p>
+   | Applies to turns that start after this change in this chat; an active task is interrupted and continued with the new settings.<br>
+   | These settings apply when this chat next starts work.</p>
 -- <msg:11> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Please answer E2E-CMDEFFORT-high-1</p>
@@ -218,7 +221,8 @@
    | Effective for next turn: <code>low</code><br>
    | Model: <code>gpt-5-codex</code><br>
    | Source: chat override<br>
-   | Applies to turns that start after this change in this chat; a running turn keeps its effort.</p>
+   | Applies to turns that start after this change in this chat; an active task is interrupted and continued with the new settings.<br>
+   | These settings apply when this chat next starts work.</p>
 -- <msg:15> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper model effort status</p>
@@ -230,7 +234,7 @@
    | <p>Current chat effort (Work)<br>
    | Effective for next turn: <code>low</code><br>
    | Source: chat override<br>
-   | Applies to: turns that start after a change in this chat; a running turn keeps its effort.<br>
+   | Applies to: turns that start after a change in this chat; an active task is interrupted and continued with the new settings.<br>
    | Model for this chat: <code>gpt-5-codex</code><br>
    | Model-advertised default: <code>medium</code><br>
    | Available: <code>low</code>, <code>medium</code>, <code>high</code></p>
@@ -254,7 +258,7 @@
    | <p>Reasoning effort commands:</p>
    | <ul><li><code>effort status</code> - show this chat&#39;s current effort</li>
    | <li><code>effort list</code> - list model-advertised choices</li>
-   | <li><code>effort set &lt;value&gt;</code> - switch future turns in this chat</li>
+   | <li><code>effort set &lt;value&gt;</code> - switch this chat and continue an active task</li>
    | <li><code>effort reset</code> - use the current model&#39;s advertised default</li>
    | </ul>
 -- <msg:21> owner (html)
@@ -270,7 +274,8 @@
    | Effective for next turn: <code>medium</code><br>
    | Model: <code>gpt-5-codex</code><br>
    | Source: model-advertised default<br>
-   | Applies to turns that start after this change in this chat; a running turn keeps its effort.</p>
+   | Applies to turns that start after this change in this chat; an active task is interrupted and continued with the new settings.<br>
+   | These settings apply when this chat next starts work.</p>
 -- <msg:23> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Please answer E2E-CMDEFFORT-medium-2</p>
@@ -408,7 +413,7 @@
    prompt|   Current chat effort (Control)
    prompt|   Effective for next turn: low
    prompt|   Source: helper fallback
-   prompt|   Applies to: turns that start after a change in this chat; a running turn keeps its effort.
+   prompt|   Applies to: turns that start after a change in this chat; an active task is interrupted and continued with the new settings.
    prompt|   Model for this chat: gpt-5-codex
    prompt|   Model-advertised default: medium
    prompt|   Available: low, medium, high
@@ -421,7 +426,8 @@
    prompt|   Effective for next turn: high
    prompt|   Model: gpt-5-codex
    prompt|   Source: chat override
-   prompt|   Applies to turns that start after this change in this chat; a running turn keeps its effort.
+   prompt|   Applies to turns that start after this change in this chat; [truncated]
+   prompt| ... truncated for prompt size ...
    prompt|
    prompt| Relevant cxp / Teams helper help digest:
    prompt| Control chat quick help:

@@ -285,7 +285,7 @@
    | Selector: <code>default (dynamic Codex account default)</code><br>
    | Selection: global default<br>
    | Effective effort: <code>medium</code> (Codex runtime default)<br>
-   | Applies to: new turns in this chat<br>
+   | Applies to: this chat; active work is interrupted and continued<br>
    | Global default for new chats: Codex Official (<code>gpt-5-codex</code>) (existing chats are unchanged)<br>
    | Model profile: Codex Official (<code>gpt-5-codex</code>)<br>
    | Switchable: yes. Switching preserves the existing Codex thread and portable context, if present.</p>

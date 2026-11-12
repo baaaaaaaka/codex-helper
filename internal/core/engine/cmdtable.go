@@ -273,6 +273,13 @@ func (e *Engine) cmdCloseChat(j cmdJob, cs *convState) {
 				}
 			}
 		}
+		if sw, yes, err := tx.ModelSwitch(cs.id); err != nil {
+			return err
+		} else if yes {
+			if err = tx.EndModelSwitch(cs.id, sw.SourceTurn, sw.SourceAttempt); err != nil {
+				return err
+			}
+		}
 		if err := tx.Close(cs.id); err != nil {
 			return err
 		}
@@ -392,7 +399,7 @@ var sessionHelpText = strings.Join([]string{
 	"`helper close` or `!close` - close this Codex session in Teams",
 	"`helper details` or `!details` - show debug IDs and links",
 	"`helper park on|off|status` - configure automatic idle parking (default on)",
-	"`model status`, `model switch <model>`, `model reset`, or `model fork <model>` - inspect or change this Work chat model",
+	"`model status`, `model use <model> [effort]`, `model reset`, or `model fork <model>` - inspect or change this Work chat model",
 	"`effort status`, `effort list`, `effort set <value>`, or `effort reset` - inspect or change this Work chat's reasoning effort",
 	"`helper goal` - show this chat's Codex goal; `helper goal <objective>` sets it and makes it active; `helper goal active` / `helper goal pause` resume or pause it",
 	"`default ...` - global defaults are Control-chat-only",

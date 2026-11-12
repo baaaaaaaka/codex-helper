@@ -62,6 +62,18 @@ func (e *Engine) trySteer(ctx context.Context, id int64) bool {
 	got := false
 	err := e.update(func(tx *store.Tx) error {
 		var err error
+		blocked, x := pendingSettings(tx, id, cs.kind == store.KindControl)
+		if x != nil {
+			return x
+		}
+		if blocked {
+			return nil
+		}
+		if _, yes, x := tx.ModelSwitch(id); x != nil {
+			return x
+		} else if yes {
+			return nil
+		}
 		tr, got, err = tx.NextSteer(id, activeTurnID)
 		if err != nil || !got {
 			return err

@@ -46,6 +46,7 @@ type Agent struct {
 }
 
 type runningTurn struct {
+	clientID       string
 	srv            *codex.Server
 	threadID       string
 	turnID         string
@@ -163,7 +164,7 @@ func (a *Agent) Run(ctx context.Context, req engine.TurnRequest, hooks engine.Tu
 	for _, img := range req.Images {
 		in = append(in, codex.Input{Image: img})
 	}
-	rt := &runningTurn{srv: srv, threadID: threadID, queueCancelled: make(chan struct{})}
+	rt := &runningTurn{clientID: req.TurnKey, srv: srv, threadID: threadID, queueCancelled: make(chan struct{})}
 	a.mu.Lock()
 	a.running[req.ConvID] = rt
 	a.mu.Unlock()
@@ -331,9 +332,23 @@ func (a *Agent) Lookup(ctx context.Context, convID int64, threadID, turnKey stri
 // (TurnHooks.Cancelled) or, once turn/start was sent, is interrupted as
 // soon as Codex reports it started.
 func (a *Agent) Interrupt(ctx context.Context, convID int64) error {
-	a.CancelTitle(convID)
+	return a.interruptExecution(ctx, convID, "")
+}
+
+// InterruptExecution never redirects a delayed switch to a later execution.
+func (a *Agent) InterruptExecution(ctx context.Context, convID int64, clientID string) error {
+	return a.interruptExecution(ctx, convID, clientID)
+}
+func (a *Agent) interruptExecution(ctx context.Context, convID int64, clientID string) error {
+	if clientID == "" {
+		a.CancelTitle(convID)
+	}
 	a.mu.Lock()
 	rt := a.running[convID]
+	if clientID != "" && rt != nil && rt.clientID != clientID {
+		a.mu.Unlock()
+		return nil
+	}
 	var turnID string
 	if rt != nil {
 		turnID = rt.turnID
@@ -663,3 +678,10 @@ func (a *Agent) CurrentTurn(conv int64, thread string) string {
 }
 
 func (*Agent) TranscriptProgress() bool { return true }
+
+// ModelSwitchAllowed excludes independently attached execution owners.
+func (a *Agent) ModelSwitchAllowed(convID int64) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.attached[convID] == 0
+}

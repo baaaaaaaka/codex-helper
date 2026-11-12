@@ -15,7 +15,7 @@ import (
 // catalogs, key intake and `model doctor` were removed by the owner.
 //
 // The chat's model and effort live on its thread row; a turn reads them
-// when it starts, so a change applies to every turn that starts after it
+// when it starts. Changes interrupt and continue helper-owned active work
 // (v0.1.20 captured them when a turn was queued).
 
 // Selection sources stored on the thread (v0.1.20's values, which migrated
@@ -37,14 +37,16 @@ const textModelRemoved = "Third-party model setup was removed from this helper; 
 
 // modelChat is what a model or effort command knows about its chat.
 type modelChat struct {
-	cs      *convState
-	kind    string // "Work" or "Control"
-	control bool
-	label   string
-	running bool
-	th      store.Thread
-	defs    globalDefaults
-	models  []Model
+	cs                          *convState
+	kind                        string // "Work" or "Control"
+	control                     bool
+	label                       string
+	running                     bool
+	switching                   bool
+	currentModel, currentEffort string
+	th                          store.Thread
+	defs                        globalDefaults
+	models                      []Model
 }
 
 // loadModelChat reads the chat's thread, the global defaults and the Codex
@@ -62,6 +64,8 @@ func (e *Engine) loadModelChat(ctx context.Context, cs *convState) (modelChat, s
 		return c, "Codex did not list its models (" + userError(err.Error()) + "). Try again later."
 	}
 	c.models = models
+	info := e.turnInfo(cs.id)
+	c.currentModel, c.currentEffort = info.Model, info.Effort
 	err = e.update(func(tx *store.Tx) error {
 		th, ok, err := tx.Thread(cs.id)
 		if err != nil {
@@ -75,6 +79,9 @@ func (e *Engine) loadModelChat(ctx context.Context, cs *convState) (modelChat, s
 			}
 		}
 		c.th = th
+		if _, c.switching, err = tx.ModelSwitch(cs.id); err != nil {
+			return err
+		}
 		c.defs, err = e.readGlobalDefaults(tx)
 		return err
 	})
@@ -202,7 +209,7 @@ func (c modelChat) summary() []string {
 		"Selector: `" + selectorLabel(c.modelID()) + "`",
 		"Selection: " + modelSourceLabel(c.th.ModelSource),
 		"Effective effort: `" + eff + "` (" + effortSourceLabel(src) + ")",
-		"Applies to: new turns in this chat",
+		"Applies to: this chat; active work is interrupted and continued",
 		"Global default for new chats: " + officialLabel(c.models, selector(c.defs.Model)) + " (existing chats are unchanged)",
 	}
 }
@@ -213,8 +220,14 @@ func (c modelChat) modelStatusText() string {
 	lines := []string{"Chat: " + c.kind}
 	lines = append(lines, c.summary()[1:]...)
 	lines = append(lines, "Model profile: "+officialLabel(c.models, c.modelID()))
+	if c.switching {
+		lines = append(lines, "Switch: pending; the saved target is not yet confirmed active.")
+	}
 	if c.running {
-		lines = append(lines, "Switchable: yes. The running turn keeps its model; a switch applies from the next turn and preserves the Codex thread.")
+		lines = append(lines, "Current execution model: "+firstNonEmpty(c.currentModel, "not yet reported")+"; effort: "+firstNonEmpty(c.currentEffort, "not yet reported"))
+	}
+	if c.running {
+		lines = append(lines, "Switchable: yes. An active task is interrupted and continued on the same Codex thread.")
 	} else {
 		lines = append(lines, "Switchable: yes. Switching preserves the existing Codex thread and portable context, if present.")
 	}
@@ -256,7 +269,8 @@ func modelWorkUsage() string {
 	return strings.Join([]string{
 		"Work chat model commands:",
 		"- `model status` - show this chat's pinned profile",
-		"- `model switch <name>` - switch this chat while preserving its Codex thread",
+		"- `model use <model> [effort]` - switch this chat and continue an active task",
+		"- `model switch <name>` - alias for `model use`",
 		"- `model reset` - switch this chat to the global default",
 		"- `model fork <name>` - create a new Work chat with another profile",
 		"- `model list` - show this chat's effective model first, then verified profiles",
@@ -269,7 +283,8 @@ func modelControlUsage() string {
 		"Model commands:",
 		"- `model list` - show this chat's effective model first, then verified models (global default is labeled separately)",
 		"- `model status` - show this Control chat's effective model, selection source, effort, and any active/queued model",
-		"- `model switch <model>` - switch this Control chat",
+		"- `model use <model> [effort]` - switch this Control chat and continue active work",
+		"- `model switch <model>` - alias for `model use`",
 		"- `model reset` - switch this Control chat to the global default",
 		"- `default model set <model>` - set the global default",
 		"- `new <directory> --model <model>` - create a chat pinned to a model",
@@ -335,7 +350,7 @@ func (e *Engine) cmdModelChat(ctx context.Context, j cmdJob, cs *convState, arg 
 			return
 		}
 		if rest == "" {
-			e.reply(j, "usage: `model switch <model>`", nil)
+			e.reply(j, "usage: `model use <model> [effort]`", nil)
 			return
 		}
 		e.modelSwitch(j, c, rest, modelSrcChatOverride)
@@ -410,51 +425,59 @@ func (c modelChat) effortForSwitch(target Model) (string, string, string) {
 // global default (`model reset`).
 func (e *Engine) modelSwitch(j cmdJob, c modelChat, ref, source string) {
 	sel, target := "", Model{}
+	explicitEffort := ""
 	if source == modelSrcGlobalDefault {
 		sel = selector(c.defs.Model)
 		target, _ = resolveModel(c.models, sel)
 	} else {
 		var failed string
-		if sel, target, failed = c.targetModel(ref); failed != "" {
+		sel, target, explicitEffort, failed = c.modelAndEffort(ref)
+		if failed != "" {
 			e.reply(j, failed, nil)
 			return
 		}
 	}
-	if sel == "" && c.modelID() != "" && target.ID != "" {
-		// Codex keeps a turn's model for the thread's later turns, so
-		// going back to the account default names it.
+	if sel == "" && target.ID != "" {
 		sel = target.ID
 	}
-	prev := officialLabel(c.models, c.modelID())
-	next := officialLabel(c.models, sel)
 	eff, effSrc, notice := c.effortForSwitch(target)
-	var text string
-	if strings.EqualFold(sel, c.modelID()) {
-		if c.th.ModelSource == source {
-			e.reply(j, "Model profile already selected for this "+c.kind+" chat: "+next+"\nSelection: "+modelSourceLabel(source), nil)
-			return
-		}
-		text = "Model selection for this " + c.kind + " chat is now " + modelSourceLabel(source) + ": " + next
-	} else {
-		threadNotice := "The next message will start a Codex thread with the selected model."
-		if c.th.ThreadID != "" {
-			threadNotice = "The next message will continue the current Codex thread with its portable context preserved."
-		}
-		text = "Model profile switched for this " + c.kind + " chat\nPrevious: " + prev + "\nEffective next-turn model: " + next +
-			"\nSelection: " + modelSourceLabel(source) + "\n\n" + threadNotice
-		if c.running {
-			text += "\nThe running turn keeps its model."
-		}
+	if explicitEffort != "" {
+		eff, effSrc = explicitEffort, effortSrcExplicit
 	}
-	if notice != "" {
+	text := "Model profile switched for this " + c.kind + " chat\nTarget model: " + officialLabel(c.models, sel) + "\nTarget effort: `" + eff + "`\nSelection: " + modelSourceLabel(source)
+	oldModel, oldEffort := TurnSettings(c.models, c.modelID(), c.th.Effort)
+	newModel, newEffort := TurnSettings(c.models, sel, eff)
+	if oldModel == newModel && oldEffort == newEffort && c.th.ModelSource == source {
+		text = "Model profile already selected for this " + c.kind + " chat: " + officialLabel(c.models, sel) + "\nSelection: " + modelSourceLabel(source)
+	}
+	if notice != "" && explicitEffort == "" {
 		text += "\n\n" + notice
 	}
-	e.reply(j, text, func(tx *store.Tx) error {
-		return e.changeThread(tx, c.cs, func(th *store.Thread) {
-			th.Model, th.ModelSource, th.PendingModel = sel, source, ""
-			th.Effort, th.EffortSource, th.PendingEffort = eff, effSrc, ""
-		})
-	})
+	e.applyModelEffort(j, c, sel, source, eff, effSrc, text)
+}
+
+// modelAndEffort first resolves the complete name, preserving display names
+// containing spaces. Only then may the last token be an explicit effort.
+func (c modelChat) modelAndEffort(ref string) (string, Model, string, string) {
+	ref = strings.Trim(strings.TrimSpace(ref), "`")
+	sel, m, failed := c.targetModel(ref)
+	if failed == "" {
+		return sel, m, "", ""
+	}
+	fields := strings.Fields(ref)
+	if len(fields) < 2 {
+		return "", Model{}, "", failed
+	}
+	name := strings.Join(fields[:len(fields)-1], " ")
+	sel, m, failed = c.targetModel(name)
+	if failed != "" {
+		return "", Model{}, "", failed
+	}
+	eff, ok := findEffort(m, fields[len(fields)-1])
+	if !ok {
+		return "", Model{}, "", fmt.Sprintf("reasoning effort %q is not supported by model %q; available values: %s", fields[len(fields)-1], m.ID, effortNames(m))
+	}
+	return sel, m, eff, ""
 }
 
 // changeThread applies fn to the conversation's thread row, creating it
@@ -524,7 +547,7 @@ func reasoningEffortUsage() string {
 		"Reasoning effort commands:",
 		"- `effort status` - show this chat's current effort",
 		"- `effort list` - list model-advertised choices",
-		"- `effort set <value>` - switch future turns in this chat",
+		"- `effort set <value>` - switch this chat and continue an active task",
 		"- `effort reset` - use the current model's advertised default",
 	}, "\n")
 }
@@ -544,7 +567,7 @@ func (c modelChat) effortStatusText(m Model, known bool) string {
 		"Current chat effort (" + c.kind + ")",
 		"Effective for next turn: `" + eff + "`",
 		"Source: " + effortSourceLabel(src),
-		"Applies to: turns that start after a change in this chat; a running turn keeps its effort.",
+		"Applies to: turns that start after a change in this chat; an active task is interrupted and continued with the new settings.",
 	}
 	if !known {
 		return strings.Join(append(lines, "Dynamic list unavailable: Codex did not list this chat's model"), "\n")
@@ -592,13 +615,9 @@ func (e *Engine) effortSet(j cmdJob, c modelChat, m Model, known bool, requested
 		return
 	}
 	prev := firstNonEmpty(c.th.PendingEffort, c.th.Effort, "unset")
-	text := fmt.Sprintf("Reasoning effort updated for this %s chat\nPrevious: `%s`\nEffective for next turn: `%s`\nModel: `%s`\nSource: %s\nApplies to turns that start after this change in this chat; a running turn keeps its effort.",
+	text := fmt.Sprintf("Reasoning effort updated for this %s chat\nPrevious: `%s`\nEffective for next turn: `%s`\nModel: `%s`\nSource: %s\nApplies to turns that start after this change in this chat; an active task is interrupted and continued with the new settings.",
 		c.kind, prev, eff, m.ID, effortSourceLabel(source))
-	e.reply(j, text, func(tx *store.Tx) error {
-		return e.changeThread(tx, c.cs, func(th *store.Thread) {
-			th.Effort, th.EffortSource, th.PendingEffort = eff, source, ""
-		})
-	})
+	e.applyModelEffort(j, c, c.modelID(), c.th.ModelSource, eff, source, text)
 }
 
 // globalDefaultEffort is v0.1.20's ResolveDefaultReasoningEffort for a

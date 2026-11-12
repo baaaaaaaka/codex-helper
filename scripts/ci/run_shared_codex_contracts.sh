@@ -24,6 +24,9 @@ CGO_ENABLED=0 go build -o "$contract_scratch/cxp" ./cmd/codex-proxy
 "$contract_scratch/probe" -test.list '^TestRealCodexNewChatTUI$' | grep -qx TestRealCodexNewChatTUI
 "$contract_scratch/probe" -test.list '^TestRealCodexGatewayRecoveryTUI$' | grep -qx TestRealCodexGatewayRecoveryTUI
 "$contract_scratch/agent" -test.list '^TestRealCodexSharedTUIThreadBinding$' | grep -qx TestRealCodexSharedTUIThreadBinding
+for critical_test in TestRealCodexSharedModelSwitch TestRealCodexSharedSwitchInputBoundary; do
+ "$contract_scratch/client" -test.list "^${critical_test}$" | grep -qx "$critical_test"
+done
 for contract_suite in probe client agent; do
   docker run --rm --network none \
   -v "$contract_scratch:/contracts:ro" \
@@ -32,7 +35,13 @@ for contract_suite in probe client agent; do
   -w /work \
   "${CXP_CONTRACT_IMAGE:-golang:1.25.11-bookworm}" \
   "/contracts/$contract_suite" -test.v -test.count=3 -test.timeout=180s \
-  -test.run 'TestRealCodex(Shared|NativeQueue|Title)'
+  -test.run 'TestRealCodex(Shared|NativeQueue|Title)' | tee "$contract_scratch/$contract_suite.log"
+done
+for critical_test in TestRealCodexSharedModelSwitch TestRealCodexSharedSwitchInputBoundary; do
+ if ! grep -Eq "^--- PASS: ${critical_test}( |$)" "$contract_scratch/client.log"; then
+  echo "Model switch contract did not pass or was skipped: $critical_test" >&2
+  exit 1
+ fi
 done
 # The selector-to-first-response path is a product acceptance test. Keep it
 # separate from observations about native zero-input resume behavior.

@@ -68,7 +68,7 @@ func scanConv(sc scanner) (Conversation, error) {
 	return c, err
 }
 
-const threadCols = `conv_id,thread_id,cwd,codex_home,profile,model,model_source,effort,effort_source,pending_model,pending_effort,sandbox,model_pin,fork_parent,updated_at`
+const threadCols = `conv_id,thread_id,cwd,codex_home,profile,model,model_source,effort,effort_source,pending_model,pending_effort,sandbox,model_pin,fork_parent,updated_at,settings_version`
 
 func scanThread(sc scanner) (Thread, error) {
 	var t Thread
@@ -88,6 +88,7 @@ func scanThread(sc scanner) (Thread, error) {
 	p.str(&t.ModelPin)
 	p.int(&t.ForkParent)
 	p.raw(&t.UpdatedAt)
+	p.raw(&t.SettingsVersion)
 	err := p.scan(sc)
 	return t, err
 }
@@ -112,7 +113,7 @@ func scanInbound(sc scanner) (Inbound, error) {
 	return in, err
 }
 
-const turnCols = `id,conv_id,inbound_id,turn_key,state,thread_id,codex_turn_id,model,effort,attempt,retry_deadline,queued_at,started_at,finished_at,error,queued_only,steering,transcript_progress,transcript_done`
+const turnCols = `id,conv_id,inbound_id,turn_key,state,thread_id,codex_turn_id,model,effort,attempt,retry_deadline,queued_at,started_at,finished_at,error,queued_only,steering,transcript_progress,transcript_done,resume_from,output_key`
 
 func scanTurn(sc scanner) (Turn, error) {
 	var t Turn
@@ -136,6 +137,8 @@ func scanTurn(sc scanner) (Turn, error) {
 	p.raw(&t.Steering)
 	p.raw(&t.TranscriptProgress)
 	p.raw(&t.TranscriptDone)
+	p.int(&t.ResumeFrom)
+	p.str(&t.OutputKey)
 	err := p.scan(sc)
 	return t, err
 }

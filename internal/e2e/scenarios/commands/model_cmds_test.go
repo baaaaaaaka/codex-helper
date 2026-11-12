@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -78,8 +79,8 @@ func TestModelCommands(t *testing.T) {
 	before, ok1 := ask(s, work.ID, "default")
 
 	expect(s, work.ID, "helper model switch gpt-5-mini", "Model profile switched for this Work chat",
-		"Previous: Codex Official (`gpt-5-codex`)", "Effective next-turn model: Codex Official (`gpt-5-mini`)", "Selection: chat override",
-		"The next message will continue the current Codex thread")
+		"Target model: Codex Official (`gpt-5-mini`)", "Target effort: `low`", "Selection: chat override",
+		"These settings apply when this chat next starts work.")
 	mini, ok2 := ask(s, work.ID, "mini")
 	s.Check("the next turn runs on the chosen model with its default effort, on the same thread",
 		ok1 && ok2 && mini.Model == "gpt-5-mini" && mini.Effort == "low" && mini.ThreadID == before.ThreadID,
@@ -92,7 +93,7 @@ func TestModelCommands(t *testing.T) {
 		"Your explicit reasoning effort `high` is not supported by the target model; it was reset to `low`.")
 	expect(s, work.ID, "helper model switch no-such-model", "Unknown model")
 	expect(s, work.ID, "helper model no-such-model", "Work chat model commands:", "`model fork <name>`")
-	expect(s, work.ID, "helper model switch", "usage: `model switch <model>`")
+	expect(s, work.ID, "helper model switch", "usage: `model use <model> [effort]`")
 	expect(s, work.ID, "helper model provider", "Unknown model command `provider`", "Third-party model setup was removed")
 
 	expect(s, work.ID, "helper model reset", "Model profile switched for this Work chat", "Selection: global default")
@@ -165,7 +166,7 @@ func TestControlModelCommands(t *testing.T) {
 	control := steps.ReadyControlChat(s)
 	expect(s, control.ID, "model", "Chat: Control", "Effective effort: `low` (helper fallback)")
 	expect(s, control.ID, "model list", "Verified models", "Current chat model (Control)")
-	expect(s, control.ID, "model switch gpt-5-mini", "Model profile switched for this Control chat", "Effective next-turn model: Codex Official (`gpt-5-mini`)")
+	expect(s, control.ID, "model switch gpt-5-mini", "Model profile switched for this Control chat", "Target model: Codex Official (`gpt-5-mini`)")
 	q, ok := askControl(s, control.ID, "ctlmini")
 	s.Check("a control question runs on the Control chat's model", ok && q.Model == "gpt-5-mini" && q.Effort == "low",
 		"gpt-5-mini, low", fmt.Sprintf("model=%q effort=%q", q.Model, q.Effort))
@@ -191,6 +192,11 @@ func TestEffortCommands(t *testing.T) {
 		Guarantees: []string{"F-TRN-8"},
 		Title:      "`effort status|list|set|reset` in a Work chat and in the Control chat, with v0.1.20's texts; the next turn uses the effort",
 		Budget:     180 * time.Second,
+		Golden: harness.GoldenOptions{Masks: []harness.Mask{{
+			Pattern: regexp.MustCompile(`(?m)^(   prompt\|   Applies to turns that start after this change in this chat;)[^\n]*(\n   prompt\| \.\.\. truncated for prompt size \.\.\.)`),
+			Replace: `${1} [truncated]${2}`,
+			Reason:  "The control history's byte limit cuts this line at a position affected by temporary path length; the full reply is checked separately.",
+		}}},
 	})
 	defer s.Finish()
 	control := steps.ReadyControlChat(s)
@@ -214,7 +220,8 @@ func TestEffortCommands(t *testing.T) {
 	s.Check("after `effort reset` the next turn runs at the model's default", ok && md.Effort == "medium", "effort medium", fmt.Sprintf("effort=%q", md.Effort))
 
 	expect(s, control.ID, "effort", "Current chat effort (Control)", "Effective for next turn: `low`", "Source: helper fallback")
-	expect(s, control.ID, "effort set high", "Reasoning effort updated for this Control chat", "Effective for next turn: `high`")
+	expect(s, control.ID, "effort set high", "Reasoning effort updated for this Control chat", "Effective for next turn: `high`",
+		"Applies to turns that start after this change in this chat; an active task is interrupted and continued with the new settings.")
 	q, ok := askControl(s, control.ID, "ctlhigh")
 	s.Check("a control question runs at the Control chat's effort", ok && q.Effort == "high", "effort high", fmt.Sprintf("effort=%q", q.Effort))
 	expect(s, control.ID, "efforts", "Current chat effort choices for GPT-5-Codex:", "- `high` (current)")
@@ -391,7 +398,7 @@ func TestModelShownIsTheModelRun(t *testing.T) {
 		"Helper: model - gpt-5-codex, effort - medium, …", clip(f, 200))
 
 	expect(s, work.ID, "helper model switch gpt-5-mini", "Model profile switched for this Work chat",
-		"Effective next-turn model: Codex Official (`gpt-5-mini`)")
+		"Target model: Codex Official (`gpt-5-mini`)")
 	expect(s, work.ID, "model", "Effective: Codex Official (`gpt-5-mini`)", "Effective effort: `low`")
 	m, ok := ask(s, work.ID, "mini")
 	f = footer(work.ID, m)

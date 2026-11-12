@@ -20,7 +20,7 @@
    | Selector: <code>default (dynamic Codex account default)</code><br>
    | Selection: global default<br>
    | Effective effort: <code>low</code> (helper fallback)<br>
-   | Applies to: new turns in this chat<br>
+   | Applies to: this chat; active work is interrupted and continued<br>
    | Global default for new chats: Codex Official (<code>gpt-5-codex</code>) (existing chats are unchanged)<br>
    | Model profile: Codex Official (<code>gpt-5-codex</code>)<br>
    | Switchable: yes. Switching preserves the existing Codex thread and portable context, if present.</p>
@@ -38,7 +38,7 @@
    | Selector: <code>default (dynamic Codex account default)</code><br>
    | Selection: global default<br>
    | Effective effort: <code>low</code> (helper fallback)<br>
-   | Applies to: new turns in this chat<br>
+   | Applies to: this chat; active work is interrupted and continued<br>
    | Global default for new chats: Codex Official (<code>gpt-5-codex</code>) (existing chats are unchanged)</p>
    | <p>Verified models<br>
    | &nbsp;&nbsp;global default: GPT-5-Codex (<code>gpt-5-codex</code>)<br>
@@ -56,10 +56,10 @@
 -- <msg:7> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Model profile switched for this Control chat<br>
-   | Previous: Codex Official (<code>gpt-5-codex</code>)<br>
-   | Effective next-turn model: Codex Official (<code>gpt-5-mini</code>)<br>
-   | Selection: chat override</p>
-   | <p>The next message will start a Codex thread with the selected model.</p>
+   | Target model: Codex Official (<code>gpt-5-mini</code>)<br>
+   | Target effort: <code>low</code><br>
+   | Selection: chat override<br>
+   | These settings apply when this chat next starts work.</p>
 -- <msg:8> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>ask what is E2E-CMDMODELCTL-ctlmini-1?</p>
@@ -99,7 +99,8 @@
    | <p>Model commands:</p>
    | <ul><li><code>model list</code> - show this chat&#39;s effective model first, then verified models (global default is labeled separately)</li>
    | <li><code>model status</code> - show this Control chat&#39;s effective model, selection source, effort, and any active/queued model</li>
-   | <li><code>model switch &lt;model&gt;</code> - switch this Control chat</li>
+   | <li><code>model use &lt;model&gt; [effort]</code> - switch this Control chat and continue active work</li>
+   | <li><code>model switch &lt;model&gt;</code> - alias for <code>model use</code></li>
    | <li><code>model reset</code> - switch this Control chat to the global default</li>
    | <li><code>default model set &lt;model&gt;</code> - set the global default</li>
    | <li><code>new &lt;directory&gt; --model &lt;model&gt;</code> - create a chat pinned to a model</li>
@@ -114,10 +115,10 @@
 -- <msg:15> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Model profile switched for this Control chat<br>
-   | Previous: Codex Official (<code>gpt-5-mini</code>)<br>
-   | Effective next-turn model: Codex Official (<code>gpt-5-codex</code>)<br>
-   | Selection: global default</p>
-   | <p>The next message will continue the current Codex thread with its portable context preserved.</p>
+   | Target model: Codex Official (<code>gpt-5-codex</code>)<br>
+   | Target effort: <code>medium</code><br>
+   | Selection: global default<br>
+   | These settings apply when this chat next starts work.</p>
 
 == codex turns (per thread; threads by kind, directory and first prompt; turns in start order)
 -- thread <uuid:1> (work, cwd <root>/home)
@@ -202,7 +203,7 @@
    prompt|   Selector: default (dynamic Codex account default)
    prompt|   Selection: global default
    prompt|   Effective effort: low (helper fallback)
-   prompt|   Applies to: new turns in this chat
+   prompt|   Applies to: this chat; active work is interrupted and continued
    prompt|   Global default for new chats: Codex Official (gpt-5-codex) (existing chats are unchanged)
    prompt|   Model profile: Codex Official (gpt-5-codex)
    prompt|   Switchable: yes. Switching preserves the existing Codex thread and portable context, if present.
@@ -216,7 +217,7 @@
    prompt|   Selector: default (dynamic Codex account default)
    prompt|   Selection: global default
    prompt|   Effective effort: low (helper fallback)
-   prompt|   Applies to: new turns in this chat
+   prompt|   Applies to: this chat; active work is interrupted and continued
    prompt|   Global default for new chats: Codex Official (gpt-5-codex) (existing chats are unchanged)
    prompt|   Verified models
    prompt|   global default: GPT-5-Codex (gpt-5-codex)
@@ -229,10 +230,10 @@
    prompt|   - <time> helper/control:
    prompt|   🔧 Helper:
    prompt|   Model profile switched for this Control chat
-   prompt|   Previous: Codex Official (gpt-5-codex)
-   prompt|   Effective next-turn model: Codex Official (gpt-5-mini)
+   prompt|   Target model: Codex Official (gpt-5-mini)
+   prompt|   Target effort: low
    prompt|   Selection: chat override
-   prompt|   The next message will start a Codex thread with the selected model.
+   prompt|   These settings apply when this chat next starts work.
    prompt|
    prompt| Relevant cxp / Teams helper help digest:
    prompt| Control chat quick help:

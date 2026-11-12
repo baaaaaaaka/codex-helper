@@ -6,6 +6,8 @@ import (
 	"math/rand"
 	"strings"
 	"time"
+
+	"github.com/baaaaaaaka/codex-helper/internal/continuation"
 )
 
 const (
@@ -20,7 +22,7 @@ const (
 	// app-server protocol requires non-empty input for a new turn, so use a
 	// small continuation instruction rather than resubmitting the original
 	// user prompt or sending an invalid empty input.
-	capacityRetryContinuationPrompt = "Continue the previous task from where you left off. Do not repeat commands or actions that have already completed."
+	capacityRetryContinuationPrompt = continuation.Prompt
 )
 
 var errCapacityRetryDeadline = errors.New("codex capacity retry deadline exceeded")

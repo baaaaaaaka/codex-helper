@@ -518,8 +518,14 @@ func (e *Engine) cmdControlCancel(ctx context.Context, j cmdJob, cs *convState, 
 	sel := strings.ToLower(strings.TrimSpace(arg))
 	var interrupt bool
 	var text string
+	var cancelID int64
 	err := e.update(func(tx *store.Tx) error {
 		interrupt = false
+		e.mu.Lock()
+		if cs.running != nil {
+			cancelID = cs.running.turnID
+		}
+		e.mu.Unlock()
 		var err error
 		text, err = e.controlCancel(tx, cs, sel, strings.TrimSpace(arg), &interrupt)
 		if err != nil {
@@ -539,7 +545,7 @@ func (e *Engine) cmdControlCancel(ctx context.Context, j cmdJob, cs *convState, 
 	}
 	e.wakeSender()
 	if err == nil && interrupt {
-		e.cancelRunning(ctx, cs.id)
+		e.cancelRunningFor(ctx, cs.id, cancelID)
 	}
 	e.wakeRunner(cs.id)
 }
@@ -554,9 +560,27 @@ func (e *Engine) controlCancel(tx *store.Tx, cs *convState, sel, raw string, int
 		runningID = cs.running.turnID
 	}
 	e.mu.Unlock()
+	sw, switching, x := tx.ModelSwitch(cs.id)
+	if x != nil {
+		return "", x
+	}
+	if runningID == 0 && switching {
+		runningID = sw.SourceTurn
+		if sw.Continuation != 0 {
+			runningID = sw.Continuation
+		}
+	}
 	open, err := tx.OpenTurnsOf(cs.id)
 	if err != nil {
 		return "", err
+	}
+	if runningID == 0 {
+		for _, tr := range open {
+			if tr.ResumeFrom != 0 || tr.State == store.TurnStarting || tr.State == store.TurnRunning {
+				runningID = tr.ID
+				break
+			}
+		}
 	}
 	var queued []store.Turn
 	var running *store.Turn
@@ -564,8 +588,17 @@ func (e *Engine) controlCancel(tx *store.Tx, cs *convState, sel, raw string, int
 		switch {
 		case open[i].ID == runningID:
 			running = &open[i]
-		case open[i].State == store.TurnQueued:
+		case open[i].State == store.TurnQueued && open[i].ResumeFrom == 0:
 			queued = append(queued, open[i])
+		}
+	}
+	if running == nil && switching {
+		tr, found, x := tx.Turn(runningID)
+		if x != nil {
+			return "", x
+		}
+		if found {
+			running = &tr
 		}
 	}
 	var target *store.Turn
@@ -622,7 +655,11 @@ func (e *Engine) controlCancel(tx *store.Tx, cs *convState, sel, raw string, int
 	action, label := "turn canceled", "**Canceled prompt:**"
 	if isRunning {
 		action, label = "cancel requested for running turn", "**Prompt being canceled:**"
-		*interrupt = true
+		var x error
+		*interrupt, x = e.cancelModelHandoff(tx, cs, *target)
+		if x != nil {
+			return "", x
+		}
 	} else if err := tx.FinishTurn(target.ID, store.TurnCancelled, "cancelled by the user", nil); err != nil {
 		return "", err
 	}
@@ -660,7 +697,11 @@ func (e *Engine) ctlCancelAll(tx *store.Tx, queued []store.Turn, running *store.
 	}
 	lines := []string{"cancel all requested for this Control chat."}
 	if running != nil {
-		*interrupt = true
+		var x error
+		*interrupt, x = e.cancelModelHandoff(tx, e.conv(running.ConvID), *running)
+		if x != nil {
+			return "", x
+		}
 		list, err := ctlPromptList(tx, []store.Turn{*running})
 		if err != nil {
 			return "", err
@@ -695,14 +736,7 @@ func ctlParseTurnRef(s string) (int64, bool) {
 
 // ctlTurnPrompt is turnPromptSummary: one line, at most 180 characters.
 func ctlTurnPrompt(tx *store.Tx, tr store.Turn) (string, error) {
-	if tr.InboundID == 0 {
-		return "", nil
-	}
-	in, ok, err := tx.Inbound(tr.InboundID)
-	if err != nil || !ok {
-		return "", err
-	}
-	return promptLine(in.Body), nil
+	return turnPrompt(tx, tr)
 }
 
 // ctlPromptList is formatTurnPromptList.

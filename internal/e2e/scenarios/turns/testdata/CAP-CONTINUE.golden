@@ -114,6 +114,6 @@
    prompt|
    prompt| Use only relative manifest paths under that directory. Keep your normal answer visible; the helper will upload listed files separately when file-write auth is available.
    turn model=gpt-5-codex effort=medium: rejected
-   prompt| continue
+   prompt| Continue the active unfinished task from its current state. Keep the previous response language unless the user requests otherwise. Verify interrupted actions before retrying; do not repeat completed work.
    turn model=gpt-5-codex effort=medium: answered
-   prompt| continue
+   prompt| Continue the active unfinished task from its current state. Keep the previous response language unless the user requests otherwise. Verify interrupted actions before retrying; do not repeat completed work.

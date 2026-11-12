@@ -178,6 +178,9 @@ type TurnOutcome struct {
 	ReconnectExhausted bool
 	// NotStarted: turn/start was rejected; the turn certainly did not run.
 	NotStarted bool
+	// Unconfirmed distinguishes an absent history result from a definite
+	// pre-submission rejection. A model handoff must pause in this case.
+	Unconfirmed bool
 	// ActiveWriter: another Codex process holds the thread (e.g. the TUI).
 	ActiveWriter bool
 	Usage        Usage

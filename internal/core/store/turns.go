@@ -84,7 +84,26 @@ func (t *Tx) NextRunnable(convID int64) (Turn, bool, error) {
 	if err != nil || len(open) == 0 {
 		return Turn{}, false, err
 	}
-	head := open[0]
+	// A continuation precedes explicitly queued new tasks. Claimed ordinary
+	// inputs are delivered by that execution, never as separate requests.
+	sw, switching, err := t.ModelSwitch(convID)
+	if err != nil {
+		return Turn{}, false, err
+	}
+	candidates, err := collect(scanTurn)(t.rows(`SELECT `+turnCols+` FROM turns WHERE conv_id=? AND state IN ('queued','starting','running') AND NOT EXISTS(SELECT 1 FROM continuation_inputs WHERE input_turn=turns.id) ORDER BY id`, convID))
+	if err != nil {
+		return Turn{}, false, err
+	}
+	if len(candidates) == 0 {
+		return Turn{}, false, nil
+	}
+	head := candidates[0]
+	if switching && sw.Continuation != 0 {
+		head, _, err = t.Turn(sw.Continuation)
+		if err != nil {
+			return Turn{}, false, err
+		}
+	}
 	for _, tr := range open {
 		if tr.State != TurnQueued {
 			return Turn{}, false, nil
@@ -218,7 +237,7 @@ WHERE state IN ('queued','starting','running') ORDER BY conv_id, id`))
 // input, but an older ordinary prompt or one with pending files keeps later
 // ordinary input in order.
 func (t *Tx) NextSteer(convID, activeTurnID int64) (Turn, bool, error) {
-	tr, ok, err := one(t.row(`SELECT `+turnCols+` FROM turns WHERE conv_id=? AND state IN ('queued','starting','running') AND state='queued' AND queued_only=0 ORDER BY id LIMIT 1`, convID), scanTurn)
+	tr, ok, err := one(t.row(`SELECT `+turnCols+` FROM turns WHERE conv_id=? AND state IN ('queued','starting','running') AND state='queued' AND queued_only=0 AND NOT EXISTS(SELECT 1 FROM continuation_inputs WHERE input_turn=turns.id) ORDER BY id LIMIT 1`, convID), scanTurn)
 	if err != nil || !ok {
 		return tr, false, err
 	}

@@ -174,7 +174,7 @@ func underDir(dir, p string) error {
 // outbox row per file, and the problems to show. Runs outside any
 // transaction (file I/O).
 func (e *Engine) stageArtifacts(tr store.Turn, final string) (string, []store.OutMsg, []string) {
-	return e.stageArtifactsAt(tr.TurnKey, fmt.Sprint(tr.ID), fmt.Sprintf("turn:%d", tr.ID), final)
+	return e.stageArtifactsAt(turnOutputKey(tr), fmt.Sprint(tr.ID), fmt.Sprintf("turn:%d", tr.ID), final)
 }
 
 // Shared native executions have one stable output directory, independent of

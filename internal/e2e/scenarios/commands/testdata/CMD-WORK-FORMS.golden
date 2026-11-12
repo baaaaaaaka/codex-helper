@@ -138,7 +138,7 @@
    | <code>helper close</code> or <code>!close</code> - close this Codex session in Teams<br>
    | <code>helper details</code> or <code>!details</code> - show debug IDs and links<br>
    | <code>helper park on|off|status</code> - configure automatic idle parking (default on)<br>
-   | <code>model status</code>, <code>model switch &lt;model&gt;</code>, <code>model reset</code>, or <code>model fork &lt;model&gt;</code> - inspect or change this Work chat model<br>
+   | <code>model status</code>, <code>model use &lt;model&gt; [effort]</code>, <code>model reset</code>, or <code>model fork &lt;model&gt;</code> - inspect or change this Work chat model<br>
    | <code>effort status</code>, <code>effort list</code>, <code>effort set &lt;value&gt;</code>, or <code>effort reset</code> - inspect or change this Work chat&#39;s reasoning effort<br>
    | <code>helper goal</code> - show this chat&#39;s Codex goal; <code>helper goal &lt;objective&gt;</code> sets it and makes it active; <code>helper goal active</code> / <code>helper goal pause</code> resume or pause it<br>
    | <code>default ...</code> - global defaults are Control-chat-only<br>
@@ -160,7 +160,7 @@
    | Selector: <code>default (dynamic Codex account default)</code><br>
    | Selection: global default<br>
    | Effective effort: <code>medium</code> (Codex runtime default)<br>
-   | Applies to: new turns in this chat<br>
+   | Applies to: this chat; active work is interrupted and continued<br>
    | Global default for new chats: Codex Official (<code>gpt-5-codex</code>) (existing chats are unchanged)<br>
    | Model profile: Codex Official (<code>gpt-5-codex</code>)<br>
    | Switchable: yes. Switching preserves the existing Codex thread and portable context, if present.</p>
@@ -178,7 +178,7 @@
    | Selector: <code>default (dynamic Codex account default)</code><br>
    | Selection: global default<br>
    | Effective effort: <code>medium</code> (Codex runtime default)<br>
-   | Applies to: new turns in this chat<br>
+   | Applies to: this chat; active work is interrupted and continued<br>
    | Global default for new chats: Codex Official (<code>gpt-5-codex</code>) (existing chats are unchanged)</p>
    | <p>Verified models<br>
    | &nbsp;&nbsp;global default: GPT-5-Codex (<code>gpt-5-codex</code>)<br>
@@ -198,7 +198,7 @@
    | <p>Current chat effort (Work)<br>
    | Effective for next turn: <code>medium</code><br>
    | Source: Codex runtime default<br>
-   | Applies to: turns that start after a change in this chat; a running turn keeps its effort.<br>
+   | Applies to: turns that start after a change in this chat; an active task is interrupted and continued with the new settings.<br>
    | Model for this chat: <code>gpt-5-codex</code><br>
    | Model-advertised default: <code>medium</code><br>
    | Available: <code>low</code>, <code>medium</code>, <code>high</code></p>
@@ -245,7 +245,7 @@
    | <code>helper close</code> or <code>!close</code> - close this Codex session in Teams<br>
    | <code>helper details</code> or <code>!details</code> - show debug IDs and links<br>
    | <code>helper park on|off|status</code> - configure automatic idle parking (default on)<br>
-   | <code>model status</code>, <code>model switch &lt;model&gt;</code>, <code>model reset</code>, or <code>model fork &lt;model&gt;</code> - inspect or change this Work chat model<br>
+   | <code>model status</code>, <code>model use &lt;model&gt; [effort]</code>, <code>model reset</code>, or <code>model fork &lt;model&gt;</code> - inspect or change this Work chat model<br>
    | <code>effort status</code>, <code>effort list</code>, <code>effort set &lt;value&gt;</code>, or <code>effort reset</code> - inspect or change this Work chat&#39;s reasoning effort<br>
    | <code>helper goal</code> - show this chat&#39;s Codex goal; <code>helper goal &lt;objective&gt;</code> sets it and makes it active; <code>helper goal active</code> / <code>helper goal pause</code> resume or pause it<br>
    | <code>default ...</code> - global defaults are Control-chat-only<br>
@@ -273,7 +273,7 @@
    | <code>helper close</code> or <code>!close</code> - close this Codex session in Teams<br>
    | <code>helper details</code> or <code>!details</code> - show debug IDs and links<br>
    | <code>helper park on|off|status</code> - configure automatic idle parking (default on)<br>
-   | <code>model status</code>, <code>model switch &lt;model&gt;</code>, <code>model reset</code>, or <code>model fork &lt;model&gt;</code> - inspect or change this Work chat model<br>
+   | <code>model status</code>, <code>model use &lt;model&gt; [effort]</code>, <code>model reset</code>, or <code>model fork &lt;model&gt;</code> - inspect or change this Work chat model<br>
    | <code>effort status</code>, <code>effort list</code>, <code>effort set &lt;value&gt;</code>, or <code>effort reset</code> - inspect or change this Work chat&#39;s reasoning effort<br>
    | <code>helper goal</code> - show this chat&#39;s Codex goal; <code>helper goal &lt;objective&gt;</code> sets it and makes it active; <code>helper goal active</code> / <code>helper goal pause</code> resume or pause it<br>
    | <code>default ...</code> - global defaults are Control-chat-only<br>

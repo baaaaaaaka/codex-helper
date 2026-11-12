@@ -153,7 +153,8 @@ func (s *Store) countByState(query string) (map[string]int, error) {
 func (s *Store) QueuedTurnConvs() ([]int64, error) {
 	// The first term matches the turns_open partial index.
 	rows, err := s.r.QueryContext(context.Background(), `SELECT DISTINCT conv_id FROM turns
-WHERE state IN ('queued','starting','running') AND state = 'queued' ORDER BY conv_id`)
+WHERE state IN ('queued','starting','running') AND state = 'queued'
+UNION SELECT conv_id FROM model_switches ORDER BY conv_id`)
 	if err != nil {
 		return nil, err
 	}

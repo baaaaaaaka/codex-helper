@@ -1137,7 +1137,7 @@ func (e *Engine) ackPrompt(tx *store.Tx, conv int64, a store.Admitted, c *classi
 		}
 		ahead = true
 		// A turn waiting to retry at Codex capacity is the current one.
-		if t.State == store.TurnQueued && t.RetryDeadline == 0 {
+		if t.State == store.TurnQueued && t.RetryDeadline == 0 && t.ResumeFrom == 0 {
 			before++
 			continue
 		}
@@ -1145,10 +1145,8 @@ func (e *Engine) ackPrompt(tx *store.Tx, conv int64, a store.Admitted, c *classi
 			continue
 		}
 		isRunning = true
-		if in, ok, err := tx.Inbound(t.InboundID); err != nil {
+		if running, err = turnPrompt(tx, t); err != nil {
 			return false, err
-		} else if ok {
-			running = in.Body
 		}
 	}
 	if ahead {

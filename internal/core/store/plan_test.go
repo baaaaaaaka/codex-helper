@@ -16,7 +16,7 @@ import (
 // hotFiles hold the runtime API. Every SQL statement in them is checked.
 // vacuum.go (maintenance) and import.go (one-shot converter) are not hot
 // paths.
-var hotFiles = []string{"store.go", "owner.go", "conversations.go", "receive.go", "turns.go", "outbox.go", "engine_api.go", "batch.go", "held_progress.go", "transcripts.go", "notifications.go", "engine_rows.go", "engine_collections.go", "delegated_threads.go", "attachments.go"}
+var hotFiles = []string{"store.go", "owner.go", "conversations.go", "receive.go", "turns.go", "outbox.go", "engine_api.go", "batch.go", "held_progress.go", "transcripts.go", "notifications.go", "engine_rows.go", "engine_collections.go", "delegated_threads.go", "attachments.go", "model_switch.go"}
 
 // fragmentCompletions are representative full statements for SQL that the
 // code assembles from fragments (convUpdate, turnMove, outMove).

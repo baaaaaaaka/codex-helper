@@ -129,7 +129,9 @@ type runState struct {
 	steerExpired bool
 	turnID       int64
 	turnKey      string
+	clientKey    string
 	cancelled    bool
+	switching    bool
 	// lastEvent is the unix ms of the last Codex event (silence tracking).
 	lastEvent atomic.Int64
 	done      chan struct{}

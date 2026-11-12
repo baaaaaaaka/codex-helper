@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/channel"
+	"github.com/baaaaaaaka/codex-helper/internal/continuation"
 	"github.com/baaaaaaaka/codex-helper/internal/core/store"
 	"github.com/baaaaaaaka/codex-helper/internal/core/transcript"
 )
@@ -46,6 +47,9 @@ func (e *Engine) runnerLoop(ctx context.Context) {
 		for _, id := range e.takeDirty(all) {
 			if ctx.Err() != nil {
 				return
+			}
+			if e.tryModelSwitch(ctx, id) {
+				continue
 			}
 			if e.trySteer(ctx, id) {
 				continue
@@ -177,11 +181,30 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 		// voiceFailed: the next turn was a voice message that could not
 		// be transcribed; it was answered with the reason, not started.
 		voiceFailed bool
+		switchIssue *store.Turn
 		steerReady  bool       // ordinary input arrived after this pass's steer check
 		ctl         ctlRequest // batch B: a control question's history
 	)
 	err := e.update(func(tx *store.Tx) error {
 		var err error
+		blocked, x := pendingSettings(tx, id, control)
+		if x != nil {
+			return x
+		}
+		if blocked {
+			return nil
+		}
+		ready, x := e.prepareModelContinuation(tx, cs)
+		if x != nil {
+			if sw, yes, lookup := tx.ModelSwitch(id); lookup == nil && yes {
+				source, _, _ := tx.Turn(sw.SourceTurn)
+				switchIssue = &source
+			}
+			return x
+		}
+		if !ready {
+			return nil
+		}
 		batch, voiceFailed = 0, false
 		tr, got, err = tx.NextRunnable(id)
 		if err != nil || !got {
@@ -189,6 +212,9 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 		}
 		if id == e.inboxID {
 			req, request, got, err = e.startDelegation(tx, id, tr)
+			if got {
+				tr.Attempt++
+			}
 			if got && continuesPrompt(tr, req.ThreadID) {
 				req.Text, req.Images = continueText, nil
 			}
@@ -197,6 +223,42 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 		th, _, err := tx.Thread(id)
 		if err != nil {
 			return err
+		}
+		if tr.ResumeFrom != 0 {
+			ready, x := e.claimContinuationInputs(tx, cs, tr)
+			if x != nil {
+				return x
+			}
+			if !ready {
+				got = false
+				return nil
+			}
+			req = TurnRequest{ConvID: id, ThreadID: th.ThreadID, Cwd: th.Cwd, Model: selector(th.Model), Effort: th.Effort, TurnKey: tr.TurnKey}
+			if control {
+				req.Effort = firstNonEmpty(req.Effort, ctlEffortFallback)
+				if req.Cwd == "" {
+					req.Cwd, _ = os.UserHomeDir()
+				}
+			}
+			if req, err = e.continuationRequest(tx, tr, req); err != nil {
+				return err
+			}
+			if err = tx.MarkStarting(tr.ID, th.ThreadID); err != nil {
+				return err
+			}
+			tr.Attempt++
+			tr.ThreadID = th.ThreadID
+			sw, yes, x := tx.ModelSwitch(id)
+			if x != nil {
+				return x
+			}
+			if !yes {
+				return nil
+			} // automatic or explicitly requested retry
+			if sw.Continuation != tr.ID {
+				return fmt.Errorf("continuation lost its handoff")
+			}
+			return tx.EndModelSwitch(id, sw.SourceTurn, sw.SourceAttempt)
 		}
 		in, _, err := tx.Inbound(tr.InboundID)
 		if err != nil {
@@ -229,7 +291,7 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 		if th.PendingEffort != "" {
 			req.Effort = th.PendingEffort
 		}
-		req.Text, req.Images = codexInput(in.Body, files, e.outboundDir(tr.TurnKey)) // envelope.go (F-TRN-14)
+		req.Text, req.Images = codexInput(in.Body, files, e.outboundDir(turnOutputKey(tr))) // envelope.go (F-TRN-14)
 		questionReply := false
 		if yes, x := tx.IsQuestionReply(in.ID); x != nil {
 			return x
@@ -264,6 +326,8 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 		if err := tx.MarkStarting(tr.ID, th.ThreadID); err != nil {
 			return err
 		}
+		tr.Attempt++
+		tr.ThreadID = th.ThreadID
 		if lastEnd.IsZero() || ms(lastEnd) <= tr.QueuedAt {
 			return nil
 		}
@@ -298,6 +362,9 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 		return e.enqueueNotice(tx, id, fmt.Sprintf("turn:%d:starting", tr.ID), textStartingBatch(prompts))
 	})
 	if err != nil {
+		if switchIssue != nil {
+			e.pauseModelSwitch(cs, *switchIssue, "the source task or thread changed")
+		}
 		e.logf("start turn in %d: %v", id, err)
 		return false
 	}
@@ -311,10 +378,10 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 		}
 		return false
 	}
-	if control {
+	if control && tr.ResumeFrom == 0 {
 		e.afterControlStart(ctl) // batch B
 	}
-	rs := &runState{turnID: tr.ID, turnKey: tr.TurnKey, done: make(chan struct{}), request: request}
+	rs := &runState{turnID: tr.ID, turnKey: turnOutputKey(tr), clientKey: tr.TurnKey, done: make(chan struct{}), request: request}
 	e.mu.Lock()
 	cs.running = rs
 	if batch > cs.batchThrough {
@@ -335,7 +402,7 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 
 // continueText is the prompt of an automatic retry whose request Codex
 // already recorded in the thread (owner ruling 2026-11-05).
-const continueText = "continue"
+const continueText = continuation.Prompt
 
 // continuesPrompt reports whether a turn is an automatic retry of an attempt
 // Codex accepted in threadID: its prompt is already part of that thread,
@@ -374,6 +441,21 @@ func voiceFailure(body string, files []store.InboundFile) string {
 func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req TurnRequest, rs *runState) {
 	defer close(rs.done)
 	id := cs.id
+	// Cancellation can commit after admission but before cs.running is
+	// registered. With rs now visible, verify that earlier cancellation
+	// before calling the backend; later cancellation uses its normal hook.
+	ready := false
+	if err := e.st.Read(func(tx *store.Tx) error {
+		current, found, err := tx.Turn(tr.ID)
+		ready = found && current.State == store.TurnStarting && current.Attempt == tr.Attempt
+		return err
+	}); err != nil {
+		e.fail(err)
+	}
+	if !ready {
+		e.clearRun(id, rs)
+		return
+	}
 	accepted := false
 	req.GenerateTitle = req.ThreadID == "" && cs.kind == store.KindWork && rs.request == "" && id != e.inboxID
 	if req.GenerateTitle {
@@ -464,13 +546,17 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 		Cancelled: func() bool {
 			e.mu.Lock()
 			defer e.mu.Unlock()
-			return rs.cancelled
+			return rs.cancelled || rs.switching
 		},
 		ThreadStarted: func(threadID string) error {
 			if rs.request != "" {
 				return e.bindDelegThread(tr, rs.request, threadID)
 			}
-			return e.bindThread(id, threadID)
+			if err := e.bindThread(id, threadID); err != nil {
+				return err
+			}
+			tr.ThreadID = threadID
+			return nil
 		},
 		Started: func(codexTurnID string) {
 			touch()
@@ -487,13 +573,21 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 				e.mirror.progressTurns[codexTurnID] = tr.ID
 				e.mirror.mu.Unlock()
 			}
-			if err := e.persist(ctx, "record native acceptance", func(tx *store.Tx) error { return tx.MarkRunning(tr.ID, codexTurnID, shared) }); err != nil {
+			if err := e.persist(ctx, "record native acceptance", func(tx *store.Tx) error {
+				if err := tx.BindTurnSettings(tr.ID, tr.ThreadID, req.Model, req.Effort); err != nil {
+					return err
+				}
+				if err := tx.MarkRunning(tr.ID, codexTurnID, shared); err != nil {
+					return err
+				}
+				return tx.AcceptContinuationInputs(tr.ID)
+			}); err != nil {
 				e.logf("mark running %s: %v", cs.label, err)
 				e.fail(err)
 			}
 		},
 	}
-	if dir := e.outboundDir(tr.TurnKey); dir != "" {
+	if dir := e.outboundDir(turnOutputKey(tr)); dir != "" {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			e.logf("output directory of %s: %v", cs.label, err)
 		}
@@ -519,6 +613,11 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 		e.clearRun(id, rs)
 		return
 	}
+	if errors.Is(err, ErrUnknownOutcome) && tr.ResumeFrom != 0 {
+		e.pauseContinuation(cs, tr, "the native start outcome is unknown")
+		e.clearRun(id, rs)
+		return
+	}
 	if errors.Is(err, ErrUnknownOutcome) {
 		e.logf("turn %d in %s: %v; looking it up", tr.ID, cs.label, err)
 		threadID := req.ThreadID
@@ -533,8 +632,22 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 		case lerr == nil && ok && found.Status != StatusInProgress:
 			out = found
 		case lerr == nil && !ok && !accepted:
-			out = TurnOutcome{NotStarted: true, Status: StatusFailed, Error: "not recorded by Codex"}
+			out = TurnOutcome{NotStarted: true, Unconfirmed: true, Status: StatusFailed, Error: "not recorded by Codex"}
 		default:
+			switching := false
+			if x := e.update(func(tx *store.Tx) error {
+				sw, yes, x := tx.ModelSwitch(id)
+				switching = yes && sw.SourceTurn == tr.ID && sw.SourceAttempt == tr.Attempt
+				return x
+			}); x != nil {
+				e.fail(x)
+				return
+			}
+			if switching {
+				e.pauseModelSwitch(cs, tr, "the execution outcome is unknown")
+				e.clearRun(id, rs)
+				return
+			}
 			out = TurnOutcome{Status: StatusInterrupted, Error: "Codex stopped during the turn"}
 		}
 	} else if err != nil {
@@ -604,6 +717,9 @@ func (e *Engine) bindThread(id int64, threadID string) error {
 // finish records the outcome of a turn: the final or one notice, in the
 // same transaction as the turn's end.
 func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out TurnOutcome, cancelled bool) {
+	if e.settleModelSwitch(ctx, cs, tr, out, cancelled) {
+		return
+	}
 	if cs.id == e.inboxID {
 		if retryableFailure(out) && !cancelled && e.failureRetry(cs, tr, out) {
 			return
@@ -700,13 +816,18 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 		if err := tx.FinishTurn(tr.ID, state, errText, msgs); err != nil {
 			return err
 		}
+		if state == store.TurnCompleted || state == store.TurnCancelled {
+			if err := tx.EndModelSwitch(cs.id, tr.ID, tr.Attempt); err != nil {
+				return err
+			}
+		}
 		if extra != nil {
 			if err := extra(tx); err != nil {
 				return err
 			}
 		}
 		if notify || state == store.TurnFailed || state == store.TurnNotStarted {
-			in, _, err := tx.Inbound(tr.InboundID)
+			summary, err := turnPrompt(tx, tr)
 			if err != nil {
 				return err
 			}
@@ -714,7 +835,7 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 			if !notify {
 				kind, text = notifyAttention, "The request did not finish. Open the chat for details and retry instructions."
 			}
-			return e.addNotify(tx, pendingNotify{Turn: tr.ID, Conv: cs.id, Kind: kind, Text: text, Request: requestSummary(in.Body)})
+			return e.addNotify(tx, pendingNotify{Turn: tr.ID, Conv: cs.id, Kind: kind, Text: text, Request: requestSummary(summary)})
 		}
 		return nil
 	}) {
@@ -821,7 +942,9 @@ func (e *Engine) failureRetry(cs *convState, tr store.Turn, out TurnOutcome) boo
 	if !now.Before(deadline) {
 		return false
 	}
-	attempt := tr.Attempt
+	// Attempt includes the currently admitted execution; backoff counts
+	// earlier attempts so the first retry keeps the existing initial delay.
+	attempt := max(tr.Attempt-1, 0)
 	if out.Progressed {
 		attempt = 0
 	}
@@ -999,11 +1122,17 @@ func clipText(s string, n int) string {
 // cancelTurn cancels the running turn of a conversation: turn/interrupt,
 // then kill after CancelWait. It reports whether a turn was running.
 func (e *Engine) cancelRunning(ctx context.Context, id int64) bool {
+	return e.cancelRunningFor(ctx, id, 0)
+}
+func (e *Engine) cancelRunningFor(ctx context.Context, id, expected int64) bool {
 	e.mu.Lock()
 	cs := e.convs[id]
 	var rs *runState
 	if cs != nil {
 		rs = cs.running
+	}
+	if rs != nil && expected != 0 && rs.turnID != expected {
+		rs = nil
 	}
 	if rs != nil {
 		rs.cancelled = true
@@ -1013,11 +1142,23 @@ func (e *Engine) cancelRunning(ctx context.Context, id int64) bool {
 		return false
 	}
 	ictx, cancel := context.WithTimeout(ctx, e.t.CancelWait)
-	err := e.ag.Interrupt(ictx, id)
+	var err error
+	if targeted, ok := e.ag.(interface {
+		InterruptExecution(context.Context, int64, string) error
+	}); ok && rs.clientKey != "" {
+		err = targeted.InterruptExecution(ictx, id, rs.clientKey)
+	} else {
+		err = e.ag.Interrupt(ictx, id)
+	}
 	cancel()
 	if err != nil {
 		e.logf("interrupt %d: %v; stopping its Codex process", id, err)
-		e.ag.Kill(id)
+		e.mu.Lock()
+		same := cs.running == rs
+		e.mu.Unlock()
+		if same {
+			e.ag.Kill(id)
+		}
 		return true
 	}
 	e.wg.Add(1)
@@ -1028,7 +1169,12 @@ func (e *Engine) cancelRunning(ctx context.Context, id int64) bool {
 		case <-ctx.Done():
 		case <-time.After(e.t.CancelWait):
 			e.logf("turn in %d did not stop after interrupt; stopping its Codex process", id)
-			e.ag.Kill(id)
+			e.mu.Lock()
+			same := cs.running == rs
+			e.mu.Unlock()
+			if same {
+				e.ag.Kill(id)
+			}
 		}
 	}()
 	return true
@@ -1088,7 +1234,8 @@ func (e *Engine) reconcileTurn(ctx context.Context, cs *convState, tr store.Turn
 	if threadID == "" {
 		threadID = e.turnThread(cs, tr)
 	}
-	rs := &runState{turnID: tr.ID, turnKey: tr.TurnKey, done: make(chan struct{})}
+	tr.ThreadID = threadID
+	rs := &runState{turnID: tr.ID, turnKey: turnOutputKey(tr), clientKey: tr.TurnKey, done: make(chan struct{})}
 	e.mu.Lock()
 	cs.running = rs
 	e.mu.Unlock()
@@ -1128,10 +1275,14 @@ func (e *Engine) reconcileTurn(ctx context.Context, cs *convState, tr store.Turn
 			delivered = true
 			out = found
 		case err == nil && !ok:
+			if tr.ResumeFrom != 0 {
+				e.pauseContinuation(cs, tr, "recovery could not confirm the submitted continuation")
+				return
+			}
 			if tr.State == store.TurnRunning {
 				out = TurnOutcome{Status: StatusInterrupted, Error: "not found after restart"}
 			} else {
-				out = TurnOutcome{NotStarted: true, Status: StatusFailed, Error: "not recorded by Codex"}
+				out = TurnOutcome{NotStarted: true, Unconfirmed: true, Status: StatusFailed, Error: "not recorded by Codex"}
 			}
 		case err == nil && found.Status != StatusInProgress:
 			out = found
@@ -1140,6 +1291,23 @@ func (e *Engine) reconcileTurn(ctx context.Context, cs *convState, tr store.Turn
 				e.mirrorSkipTurnMode(out.CodexTurnID, shared)
 			}
 		case attempt >= 4:
+			if tr.ResumeFrom != 0 {
+				e.pauseContinuation(cs, tr, "recovery could not confirm a terminal continuation")
+				return
+			}
+			switching := false
+			if x := e.update(func(tx *store.Tx) error {
+				sw, yes, x := tx.ModelSwitch(cs.id)
+				switching = yes && sw.SourceTurn == tr.ID && sw.SourceAttempt == tr.Attempt
+				return x
+			}); x != nil {
+				e.fail(x)
+				return
+			}
+			if switching {
+				e.pauseModelSwitch(cs, tr, "recovery could not confirm a terminal execution")
+				return
+			}
 			if err != nil {
 				e.logf("reconcile turn %d in %s: %v", tr.ID, cs.label, err)
 			}
@@ -1206,6 +1374,24 @@ func (e *Engine) awaitFirstRead(ctx context.Context, cs *convState) bool {
 }
 
 func (e *Engine) finishReconciled(ctx context.Context, cs *convState, tr store.Turn, out TurnOutcome) {
+	if tr.ResumeFrom != 0 && out.CodexTurnID != "" && !out.NotStarted {
+		_, shared := e.ag.(TUIAgent)
+		if err := e.persist(ctx, "recover continuation acceptance", func(tx *store.Tx) error {
+			if tr.State == store.TurnStarting {
+				if err := tx.MarkRunning(tr.ID, out.CodexTurnID, shared); err != nil {
+					return err
+				}
+			}
+			return tx.AcceptContinuationInputs(tr.ID)
+		}); err != nil {
+			e.fail(err)
+			return
+		}
+		tr.CodexTurnID, tr.State = out.CodexTurnID, store.TurnRunning
+	}
+	if e.settleModelSwitch(ctx, cs, tr, out, false) {
+		return
+	}
 	// A crash may occur after turn/start was accepted but before Started
 	// persisted its native id. Recover that acceptance before the reader barrier.
 	if tr.TranscriptProgress && tr.State == store.TurnStarting && out.CodexTurnID != "" && !out.NotStarted {

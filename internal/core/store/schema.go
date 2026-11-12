@@ -4,7 +4,7 @@ package store
 const ApplicationID = 0x63787031
 
 // SchemaVersion is the PRAGMA user_version this code writes and understands.
-const SchemaVersion = 8
+const SchemaVersion = 9
 
 // migrations[i] upgrades user_version i to i+1. Each step runs in one
 // transaction together with the user_version bump. There is no pointer file.
@@ -30,6 +30,23 @@ var migrations = [][]string{
 	engineStateSchema,
 	{`ALTER TABLE outbox ADD COLUMN append_to TEXT`},
 	{`ALTER TABLE conversations ADD COLUMN auto_park_off INTEGER NOT NULL DEFAULT 0`},
+	{`ALTER TABLE threads ADD COLUMN settings_version INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE turns ADD COLUMN resume_from INTEGER`,
+		`ALTER TABLE turns ADD COLUMN output_key TEXT`,
+		`CREATE TABLE model_switches (
+    conv_id INTEGER PRIMARY KEY REFERENCES conversations(id),
+    source_turn INTEGER NOT NULL REFERENCES turns(id),
+    source_attempt INTEGER NOT NULL,
+    thread_id TEXT NOT NULL,
+    continuation INTEGER REFERENCES turns(id)
+  )`,
+		`CREATE TABLE continuation_inputs (
+    execution_id INTEGER NOT NULL REFERENCES turns(id),
+    input_turn INTEGER NOT NULL UNIQUE REFERENCES turns(id),
+    PRIMARY KEY(execution_id,input_turn)
+  ) WITHOUT ROWID`,
+		`CREATE INDEX turns_steered ON turns(conv_id,codex_turn_id) WHERE steering=1`,
+		`CREATE INDEX turns_task ON turns(output_key,id) WHERE output_key IS NOT NULL`},
 }
 
 // schemaV1 is the complete initial schema (STORE-DESIGN.md §3). No triggers
@@ -230,5 +247,5 @@ var schemaV1 = []string{
 var Tables = []string{
 	"meta", "owner", "conversations", "threads", "streams", "turns", "inbound",
 	"inbound_files", "outbox", "outbox_files", "transcript_sources", "forks",
-	"restart_confirmation", "freeze_notices", "notifications", "pending_notifications", "cli_requests", "cli_result_lines", "codex_upgrade", "codex_upgrade_targets", "dashboard_view", "dashboard_items", "source_info", "delegated_threads", "import_jobs", "update_requests", "update_pending", "restart_requests", "model_fork_notes", "answer_checks", "history_checks", "gates", "question_groups", "questions", "question_options",
+	"restart_confirmation", "freeze_notices", "notifications", "pending_notifications", "cli_requests", "cli_result_lines", "codex_upgrade", "codex_upgrade_targets", "dashboard_view", "dashboard_items", "source_info", "delegated_threads", "import_jobs", "update_requests", "update_pending", "restart_requests", "model_fork_notes", "answer_checks", "history_checks", "gates", "question_groups", "questions", "question_options", "model_switches", "continuation_inputs",
 }

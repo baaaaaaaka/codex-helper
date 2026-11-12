@@ -59,6 +59,16 @@ func (e *Engine) replyIn(j cmdJob, fn func(tx *store.Tx) (string, error)) error 
 // turnPrompt is v0.1.20's turnPromptSummary: the prompt on one line,
 // backticks replaced, at most 180 characters ("" for attachments only).
 func turnPrompt(tx *store.Tx, tr store.Turn) (string, error) {
+	for tr.InboundID == 0 && tr.ResumeFrom != 0 {
+		parent, ok, err := tx.Turn(tr.ResumeFrom)
+		if err != nil {
+			return "", err
+		}
+		if !ok {
+			return "", nil
+		}
+		tr = parent
+	}
 	if tr.InboundID == 0 {
 		return "", nil
 	}
@@ -104,6 +114,7 @@ const (
 func (e *Engine) cmdCancel(ctx context.Context, j cmdJob, cs *convState, arg string) {
 	sel := strings.ToLower(strings.TrimSpace(arg))
 	var interrupt, stopGoal bool
+	var cancelID int64
 	// The goal (goalcmds.go): a cancel that interrupts the running turn,
 	// or finds nothing of the helper's to cancel, pauses an active goal
 	// and stops the turn Codex runs by itself for it.
@@ -132,10 +143,29 @@ func (e *Engine) cmdCancel(ctx context.Context, j cmdJob, cs *convState, arg str
 		if cs.running != nil {
 			runningID = cs.running.turnID
 		}
+		cancelID = runningID
 		e.mu.Unlock()
+		sw, switching, x := tx.ModelSwitch(cs.id)
+		if x != nil {
+			return "", x
+		}
+		if runningID == 0 && switching {
+			runningID = sw.SourceTurn
+			if sw.Continuation != 0 {
+				runningID = sw.Continuation
+			}
+		}
 		open, err := tx.OpenTurnsOf(cs.id)
 		if err != nil {
 			return "", err
+		}
+		if runningID == 0 {
+			for _, tr := range open {
+				if tr.ResumeFrom != 0 || tr.State == store.TurnStarting || tr.State == store.TurnRunning {
+					runningID = tr.ID
+					break
+				}
+			}
 		}
 		var queued []store.Turn
 		var running *store.Turn
@@ -143,8 +173,17 @@ func (e *Engine) cmdCancel(ctx context.Context, j cmdJob, cs *convState, arg str
 			switch {
 			case open[i].ID == runningID:
 				running = &open[i]
-			case open[i].State == store.TurnQueued:
+			case open[i].State == store.TurnQueued && open[i].ResumeFrom == 0:
 				queued = append(queued, open[i])
+			}
+		}
+		if running == nil && switching && runningID != 0 {
+			tr, found, x := tx.Turn(runningID)
+			if x != nil {
+				return "", x
+			}
+			if found {
+				running = &tr
 			}
 		}
 		newestQueued := func() *store.Turn {
@@ -207,7 +246,7 @@ func (e *Engine) cmdCancel(ctx context.Context, j cmdJob, cs *convState, arg str
 		e.stopGoal(ctx, cs) // before the interrupt: its end must not restart the goal
 	}
 	if err == nil && interrupt {
-		e.cancelRunning(ctx, cs.id)
+		e.cancelRunningFor(ctx, cs.id, cancelID)
 	}
 	e.wakeRunner(cs.id)
 }
@@ -217,7 +256,11 @@ func (e *Engine) cancelOne(tx *store.Tx, cs *convState, tr store.Turn, isRunning
 	action, label := "turn canceled", "**Canceled prompt:**"
 	if isRunning {
 		action, label = "cancel requested for running turn", "**Prompt being canceled:**"
-		*interrupt = true
+		var err error
+		*interrupt, err = e.cancelModelHandoff(tx, cs, tr)
+		if err != nil {
+			return "", err
+		}
 	} else if err := tx.FinishTurn(tr.ID, store.TurnCancelled, "cancelled by the user", nil); err != nil {
 		return "", err
 	}
@@ -259,7 +302,12 @@ func (e *Engine) cancelAll(tx *store.Tx, queued []store.Turn, running *store.Tur
 	}
 	lines := []string{"cancel all requested for this Work chat."}
 	if running != nil {
-		*interrupt = true
+		cs := e.conv(running.ConvID)
+		var err error
+		*interrupt, err = e.cancelModelHandoff(tx, cs, *running)
+		if err != nil {
+			return "", err
+		}
 		list, err := turnPromptList(tx, []store.Turn{*running})
 		if err != nil {
 			return "", err
@@ -302,7 +350,7 @@ const (
 func retryable(tr store.Turn) bool {
 	switch tr.State {
 	case store.TurnFailed, store.TurnInterrupted, store.TurnNotStarted, store.TurnCancelled:
-		return tr.InboundID != 0
+		return tr.InboundID != 0 || tr.ResumeFrom != 0
 	}
 	return false
 }
@@ -333,6 +381,11 @@ func (e *Engine) cmdRetry(j cmdJob, cs *convState, arg string) {
 	var started, usedDup bool
 	err := e.replyIn(j, func(tx *store.Tx) (string, error) {
 		started, usedDup = false, false
+		if _, yes, x := tx.ModelSwitch(cs.id); x != nil {
+			return "", x
+		} else if yes {
+			return "A model switch is still pending. Cancel the active task before requesting a manual retry.", nil
+		}
 		recent, err := tx.RecentTurns(cs.id, retryHorizon)
 		if err != nil {
 			return "", err
@@ -343,6 +396,11 @@ func (e *Engine) cmdRetry(j cmdJob, cs *convState, arg string) {
 		var target *store.Turn
 		for i := range recent {
 			tr := recent[i]
+			if _, later, x := tx.TaskSuccessor(tr); x != nil {
+				return "", x
+			} else if later {
+				continue
+			}
 			if _, seen := newer[tr.InboundID]; seen && tr.InboundID != 0 {
 				continue // an older run of a prompt that ran again
 			}
@@ -363,13 +421,18 @@ func (e *Engine) cmdRetry(j cmdJob, cs *convState, arg string) {
 			if !found || tr.ConvID != cs.id {
 				return "turn not found in this session: " + strings.TrimSpace(arg), nil
 			}
+			if next, later, x := tx.TaskSuccessor(tr); x != nil {
+				return "", x
+			} else if later {
+				return fmt.Sprintf("turn %s already continued as `%s`.", turnRef(tr.ID), turnRef(next.ID)), nil
+			}
 			if !retryable(tr) {
 				if tr.InboundID == 0 && tr.State != store.TurnCompleted && !openTurnState(tr.State) {
 					return "retry cannot find the original Teams message for " + turnRef(tr.ID), nil
 				}
 				return fmt.Sprintf("turn %s is %s; only failed or interrupted turns can be retried.", turnRef(tr.ID), turnStateText(tr.State)), nil
 			}
-			if last, ok := newer[tr.InboundID]; ok && last.ID != tr.ID {
+			if last, ok := newer[tr.InboundID]; tr.InboundID != 0 && ok && last.ID != tr.ID {
 				return fmt.Sprintf("turn %s was already run again as `%s`; only failed or interrupted turns can be retried.", turnRef(tr.ID), turnRef(last.ID)), nil
 			} else if !ok {
 				// Older than the horizon: check the prompt's own turn.
@@ -387,6 +450,14 @@ func (e *Engine) cmdRetry(j cmdJob, cs *convState, arg string) {
 				return e.retryDuplicateIn(tx, cs, dup, &started)
 			}
 			return textRetryNone, nil
+		}
+		if target.ResumeFrom != 0 {
+			id, x := tx.RetryContinuation(*target)
+			if x != nil {
+				return "", x
+			}
+			started = true
+			return fmt.Sprintf("Continuing `%s` again as `%s` without replaying the original request.", turnRef(target.ID), turnRef(id)), nil
 		}
 		in, ok, err := tx.Inbound(target.InboundID)
 		if err != nil {
