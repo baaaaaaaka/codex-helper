@@ -366,7 +366,7 @@
    prompt| Do not claim that a helper command was executed unless you actually performed the work yourself.
    prompt|
    prompt| Current helper state:
-   prompt| - helper_version: `v0.1.22`
+   prompt| - helper_version: `v0.1.23`
    prompt| - control_chat_title: `🏠 Codex Control - e2ehost`
    prompt| - control_chat_id: `<chat:1>`
    prompt| - active_work_chats:

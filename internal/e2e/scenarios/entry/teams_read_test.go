@@ -10,10 +10,34 @@ import (
 	"testing"
 	"time"
 
-	chteams "github.com/baaaaaaaka/codex-helper/internal/channel/teams"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakegraph"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/harness"
 )
+
+// These response views describe the public CLI JSON contract independently
+// of product types. E2E tests reach the product only through its executable.
+type teamsReadCLIResponse struct {
+	Version  int `json:"version"`
+	Messages []struct {
+		Text        string `json:"text"`
+		Attachments []struct {
+			Ref string `json:"ref"`
+		} `json:"attachments"`
+	} `json:"messages"`
+	Ranges []struct {
+		NextCursor string `json:"next_cursor"`
+	} `json:"ranges"`
+	Usage struct {
+		Requests int `json:"requests"`
+	} `json:"usage"`
+}
+type teamsSearchCLIResponse struct {
+	Version int `json:"version"`
+	Hits    []struct {
+		Ref string `json:"ref"`
+	} `json:"hits"`
+	NextCursor string `json:"next_cursor"`
+}
 
 func TestTeamsReadSearchFetchWithoutHelper(t *testing.T) {
 	harness.Parallel(t)
@@ -38,14 +62,14 @@ func TestTeamsReadSearchFetchWithoutHelper(t *testing.T) {
 	run := func(args ...string) harness.CLIResult {
 		return s.RunCLIAs(20*time.Second, harness.CLIAs{Poll: true}, args...)
 	}
-	read := func(args ...string) chteams.ReadResult {
+	read := func(args ...string) teamsReadCLIResponse {
 		t.Helper()
 		res := run(append([]string{"teams", "read"}, args...)...)
 		if res.Code != 0 {
 			t.Fatalf("read failed: %s", res.Combined)
 		}
-		var out chteams.ReadResult
-		if e := json.Unmarshal([]byte(res.Stdout), &out); e != nil {
+		var out teamsReadCLIResponse
+		if e := json.Unmarshal([]byte(res.Stdout), &out); e != nil || out.Version != 1 {
 			t.Fatalf("invalid read JSON: %v %s", e, res.Combined)
 		}
 		return out
@@ -61,15 +85,15 @@ func TestTeamsReadSearchFetchWithoutHelper(t *testing.T) {
 	rest := read("--cursor", paged.Ranges[0].NextCursor, "--json")
 	s.Check("page budget resumes without losing messages", len(paged.Messages) == 1 && len(rest.Messages) == 2, "1 then 2 messages", fmt.Sprintf("%d then %d", len(paged.Messages), len(rest.Messages)))
 	found := run("teams", "search", "needle", "--limit", "2", "--json")
-	var search chteams.SearchResult
-	if found.Code != 0 || json.Unmarshal([]byte(found.Stdout), &search) != nil || len(search.Hits) != 2 {
+	var search teamsSearchCLIResponse
+	if found.Code != 0 || json.Unmarshal([]byte(found.Stdout), &search) != nil || search.Version != 1 || len(search.Hits) != 2 {
 		t.Fatalf("search failed %s", found.Combined)
 	}
 	precise := read(search.Hits[0].Ref, search.Hits[1].Ref, "--json")
 	s.Check("search candidates return to original messages in one batch", len(precise.Messages) == 2 && precise.Usage.Requests == 2, "2 messages; 2 logical requests", fmt.Sprintf("%d messages; %d requests", len(precise.Messages), precise.Usage.Requests))
 	more := run("teams", "search", "--cursor", search.NextCursor, "--json")
-	var last chteams.SearchResult
-	if more.Code != 0 || json.Unmarshal([]byte(more.Stdout), &last) != nil || len(last.Hits) != 1 {
+	var last teamsSearchCLIResponse
+	if more.Code != 0 || json.Unmarshal([]byte(more.Stdout), &last) != nil || last.Version != 1 || len(last.Hits) != 1 {
 		t.Fatalf("search paging failed %s", more.Combined)
 	}
 	for _, item := range []struct{ id, body string }{{file.ID, "exact file bytes"}, {image.ID, "exact image bytes"}} {

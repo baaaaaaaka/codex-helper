@@ -3,7 +3,7 @@
 基线：`68dba0d7`；分支：`investigate/teams-links-20261112`。
 工作区：`/home/baka/.local/state/cxp-teams-links.e28JgFAX/worktree`。
 以下记录本地功能验收时的工作区状态；提交和 prerelease 发布随后由独立发布流程完成。
-运行中的 Teams helper 未安装或重启。发布说明见 `docs/releases/v0.1.23-rc.1.md`。
+运行中的 Teams helper 未安装或重启。发布说明见 `docs/releases/v0.1.23-rc.2.md`。
 源码／测试／skill／CI 共 29 个改动文件的聚合 SHA-256：
 `28138546a043892aca3fbd2d86a14becf2107426786efd228eccc8b9b0124c5b`
 （路径排序，以路径、NUL、内容、NUL 依次输入；研究及验收文档不计入）。
@@ -138,3 +138,24 @@ read/search 的消息表、缓存、去重与响应预算仅在本次调用内�
 `v0.1.23`。同步 GitHub main 后基线仍为 `68dba0d7`，无需合并其他改动。
 功能源码指纹与上轮验收一致；本轮额外变更为版本号、发布说明和本记录。
 提交、标签、CI 与 Release 的最终结果由 GitHub 对应对象记录；不把准备阶段当作已经发布。
+
+### RC.1 CI 发现的测试边界问题
+
+main CI `43158071182` 的 Linux 与 macOS 分区报告 `TestBlackBoxBoundary` 失败：
+新增 entry E2E 为解码 JSON 引入了产品包 `internal/channel/teams`。此前局部单测和
+E2E 场景自身未运行根 E2E 包的边界测试，因此本地验收漏掉该约束。
+修复为测试内独立的 CLI JSON 响应视图，保留全部场景断言，并增加 version=1 断言；
+未修改白名单或放宽边界规则。产品实现没有变化。
+RC.1 的发布运行被停止；保留原标签，不重用或移动，后续以新提交和 `v0.1.23-rc.2` 验证。
+
+RC.1 还发现升级基础版本后的 E2E 快照差异：委派记录、空闲 inbox 与控制问答中的
+版本仍为 v0.1.22。逐项只将当前 helper 版本改为 v0.1.23；保留迁移历史版本及其他
+内容。委派场景功能断言原本全部通过，复验会覆盖 commands/cost/delegation 三个包。
+边界测试和 read/search/fetch 场景的 Docker 复验已通过。
+
+RC.2 修复后的受影响包 Docker 复验（Go 1.25.11，CGO_ENABLED=0，
+GOFLAGS=-p=2，GOMAXPROCS=2，go test -p=1 -count=1 -v -timeout=600s）：
+commands 310.495s、cost 55.201s、delegation 20.213s 全部通过。初次默认并行
+复验在 TestMain 编译阶段遇到 fork/exec resource temporarily unavailable；限制编译
+并发后完成，不属于沙箱权限或产品功能失败。边界测试及 entry read/search/fetch 场景
+另以 -count=1 在 Docker 通过；主机边界测试、vet、diff --check 也通过。

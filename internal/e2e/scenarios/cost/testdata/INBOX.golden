@@ -21,7 +21,7 @@
    record|     "teams-registry"
    record|   ],
    record|   "capability_fingerprint": "<hex:1>",
-   record|   "cxp_version": "v0.1.22",
+   record|   "cxp_version": "v0.1.23",
    record|   "draining": true,
    record|   "expires_at": "<time:1>",
    record|   "heartbeat_interval_seconds": 300,
