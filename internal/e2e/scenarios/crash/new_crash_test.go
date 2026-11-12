@@ -2,6 +2,7 @@ package crash
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -19,12 +20,35 @@ import (
 // U-I01 "a second chat for the same session", 4e1d31b) came from chat
 // creation that was not idempotent across a crash; the rebuilt core keys
 // createOrGet by a stable externalId for exactly this.
+const newCrashCommand = "   | <p>new <root>/work/newcrash</p>\n"
+
+var newCrashCommandEdit = regexp.MustCompile(
+	`(?:   \| <p><strong>🧑‍💻 User:</strong></p>\n)?` + regexp.QuoteMeta(newCrashCommand) +
+		`(?:   edited 1 time\(s\); earlier versions:\n   \[version 1\]\n` + regexp.QuoteMeta(newCrashCommand) + `)?`)
+
+func TestNewCrashCommandMask(t *testing.T) {
+	label := "   | <p><strong>🧑‍💻 User:</strong></p>\n"
+	history := "   edited 1 time(s); earlier versions:\n   [version 1]\n" + newCrashCommand
+	for _, input := range []string{newCrashCommand, label + newCrashCommand + history} {
+		if got := newCrashCommandEdit.ReplaceAllString(input, newCrashCommand); got != newCrashCommand {
+			t.Fatalf("unexpected command snapshot: %q", got)
+		}
+	}
+	if newCrashCommandEdit.MatchString("   | <p>new another-directory</p>\n") {
+		t.Fatal("mask must preserve other commands")
+	}
+}
+
 func TestNewSurvivesCrashDuringChatCreation(t *testing.T) {
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "NEW-CRASH", harness.Options{
 		Guarantees: []string{"R-39", "R-2"},
 		Title:      "SIGKILL between Teams creating the work chat for `new` and the helper recording it: one chat, announced once, working",
 		Budget:     120 * time.Second,
+		Golden: harness.GoldenOptions{Masks: []harness.Mask{{
+			Pattern: newCrashCommandEdit, Replace: newCrashCommand,
+			Reason: "the crash can interrupt the independent user-label edit",
+		}}},
 	})
 	defer s.Finish()
 	control := steps.ReadyControlChat(s)

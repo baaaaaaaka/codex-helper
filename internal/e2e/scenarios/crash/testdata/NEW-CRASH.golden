@@ -7,10 +7,6 @@
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Codex control chat is ready on e2ehost. Send <code>new &lt;directory&gt;</code> to start a session, or <code>help</code>.</p>
 -- <msg:2> owner (html)
-   | <p><strong>🧑‍💻 User:</strong></p>
-   | <p>new <root>/work/newcrash</p>
-   edited 1 time(s); earlier versions:
-   [version 1]
    | <p>new <root>/work/newcrash</p>
 -- <msg:3> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
