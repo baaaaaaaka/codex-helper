@@ -59,10 +59,10 @@
    [version 1]
    | <attachment id="<uuid:1>"></attachment>
    [version 2]
-   | <p><strong>🧑‍💻 User:</strong></p>
-   | <attachment id="<uuid:1>"></attachment><p><strong>🎙️ Speech-to-text transcript (automatic; may contain recognition errors):</strong></p>
-   | <p><em><a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D#cxp-transcript%<b64:1>">Clip: voice.ogg</a></em></p>
-   | <p>transcribed: please list the files E2E-EDITVOICE-voice-1</p>
+   | <attachment id="<uuid:1>"></attachment><hr/>
+   | <p><strong>🔧 Helper:</strong></p>
+   | <p>⏳ Codex is working. Request accepted.</p>
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:3>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-EDITVOICE-voice-1</p>

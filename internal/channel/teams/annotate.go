@@ -267,7 +267,8 @@ func transcriptEdit(chat, id, content string, isHTML bool, atts []graphAttachmen
 	if an.Label != "" && !hasLabel(content, an.Label) {
 		b.WriteString(labelHTML(an.Label))
 	}
-	b.WriteString(content)
+	user, confirmation := splitPromptConfirmation(content, annotationLink(chat, id, ""))
+	b.WriteString(user)
 	shown := attachmentIDs(content)
 	for _, at := range atts {
 		id := strings.TrimSpace(at.ID)
@@ -278,6 +279,7 @@ func transcriptEdit(chat, id, content string, isHTML bool, atts []graphAttachmen
 		b.WriteString(`<attachment id="` + esc(id) + `"></attachment>`)
 	}
 	b.WriteString(clips)
+	b.WriteString(confirmation)
 	return b.String(), nil
 }
 

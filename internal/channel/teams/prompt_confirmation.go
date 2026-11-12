@@ -6,7 +6,63 @@ import (
 	"strings"
 
 	"github.com/baaaaaaaka/codex-helper/internal/channel"
+	"golang.org/x/net/html"
 )
+
+// splitPromptConfirmation keeps later user annotations above the receipt's
+// rule. Match the Helper header and this message's stamp in the same section;
+// ordinary rules, quoted examples and another message's receipt stay user HTML.
+// Slice the original bytes so attachments and Teams HTML are not reserialized.
+func splitPromptConfirmation(content, link string) (string, string) {
+	z := html.NewTokenizer(strings.NewReader(content))
+	offset, blocked, rule, afterRule := 0, 0, -1, 0
+	linked := false
+	confirmed := func(end int) bool {
+		if rule < 0 || !linked {
+			return false
+		}
+		section := content[afterRule:end]
+		return hasLabel(section, "🔧 Helper") &&
+			(hasAnnotationStamp(section, link, "Received at", "") ||
+				// Older receipts linked the Helper header instead of the time.
+				hasAnnotationStamp(section, link, "🔧", ""))
+	}
+	for {
+		token := z.Next()
+		start := offset
+		offset += len(z.Raw())
+		switch token {
+		case html.ErrorToken:
+			if confirmed(len(content)) {
+				return content[:rule], content[rule:]
+			}
+			return content, ""
+		case html.StartTagToken, html.SelfClosingTagToken:
+			t := z.Token()
+			switch t.Data {
+			case "blockquote", "pre", "code":
+				blocked++
+			case "a":
+				linked = linked || blocked == 0 && attr(t, "href") == link
+			case "hr":
+				if blocked == 0 {
+					if confirmed(start) {
+						return content[:rule], content[rule:]
+					}
+					rule, afterRule = start, offset
+					linked = false
+				}
+			}
+		case html.EndTagToken:
+			switch z.Token().Data {
+			case "blockquote", "pre", "code":
+				if blocked > 0 {
+					blocked--
+				}
+			}
+		}
+	}
+}
 
 // confirmationEdit appends one initial receipt, identified by its target message
 // link. This is not an own-post marker: the message still belongs to the user.
