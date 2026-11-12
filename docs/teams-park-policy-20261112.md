@@ -186,3 +186,11 @@ fixture now reports an early process exit directly. Product timeouts and the
 process-group cleanup assertions are unchanged. Five local race repetitions of
 the cancellation test and the userpath package tests passed. The PowerShell live check
 requires the native release runner; it was not run on the development host.
+
+The v0.1.23-rc.8 main CI found a timing-dependent FIFO scenario transcript:
+the second request's queue notice differs depending on whether the first turn
+has started. All FIFO, single-execution, non-overlap and answer-order assertions
+passed. The transcript comparison now recognizes exactly those two notice forms;
+the behavior assertions and the rest of the snapshot remain in place.
+The scenario passed three consecutive runs in the isolated Docker harness
+(50.895s total).

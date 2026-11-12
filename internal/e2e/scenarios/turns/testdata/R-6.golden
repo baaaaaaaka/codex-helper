@@ -76,8 +76,7 @@
    | <p>helper queue Step 2: E2E-R6-second-2</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong></p>
-   | <p>⏳ <strong>Queued.</strong> Your request will run when the current work in this chat finishes, behind 1 other queued request.</p>
-   | <p>To cancel it: <code>helper cancel</code> (cancels the newest queued request).</p>
+   | <queue status depends on when the first turn starts>
    | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:4>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
    edited 1 time(s); earlier versions:
    [version 1]

@@ -2,6 +2,7 @@ package turns
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -15,9 +16,17 @@ import (
 // in Teams in the same order as the prompts.
 func TestR06_AnswersInOrder(t *testing.T) {
 	harness.Parallel(t)
+	const queuePrefix = "   | <p>helper queue Step 2: E2E-R6-second-2</p>\n   | <hr/>\n   | <p><strong>🔧 Helper:</strong></p>\n"
+	const beforeStart = "   | <p>⏳ <strong>Queued.</strong> Your request will run when the current work in this chat finishes, behind 1 other queued request.</p>\n   | <p>To cancel it: <code>helper cancel</code> (cancels the newest queued request).</p>\n"
+	const afterStart = "   | <p>⏳ <strong>Queued.</strong> Your request will run after the current one finishes.</p>\n   | <p><strong>Running now:</strong> Step 1: E2E-R6-first-1</p>\n   | <p>To cancel it: <code>helper cancel</code> (cancels the newest queued request). To interrupt the running one: <code>helper cancel running</code>.</p>\n"
 	s := harness.NewScenario(t, "R-6", harness.Options{
 		Guarantees: []string{"R-6", "R-30", "R-3"},
 		Title:      "three prompts in one chat are executed FIFO and answered in order",
+		Golden: harness.GoldenOptions{Masks: []harness.Mask{{
+			Pattern: regexp.MustCompile(regexp.QuoteMeta(queuePrefix) + "(?:" + regexp.QuoteMeta(beforeStart) + "|" + regexp.QuoteMeta(afterStart) + ")"),
+			Replace: queuePrefix + "   | <queue status depends on when the first turn starts>\n",
+			Reason:  "the first turn can start before or after the second request is acknowledged",
+		}}},
 	})
 	defer s.Finish()
 	// Make each turn take a little time so later prompts arrive while
