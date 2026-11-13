@@ -6,6 +6,8 @@
 
 `rc.15` 云端 CI 进一步发现两个遗漏：黑盒 E2E 不得直接导入产品内部提示词包，内置 skill 命令表仍需列出兼容别名。修正为在 E2E harness 独立声明预期协议文本，并补充 `helper model <model> [effort]`。修正后执行 CI 原入口 `bash scripts/ci/run_linux_full_go_test_collect.sh`、两个受影响 E2E 场景及黑盒边界和 skill 测试，均通过。首次本地覆盖率重跑把临时构建目录放在源码树内，导致格式、源码扫描与进程路径测试失败；将临时目录移到容器 HOME 下后完整重跑通过。
 
+`rc.16` 的主线 CI 通过，但 Release 中两项 macOS ARM64 作业在启动前被取消；GitHub check annotations 明确报告 hosted runner 多次分配失败和 ARM64 容量紧张。后续 GitHub 容量恢复后，在 `0322431bda80b13dc9694144e8d87792d673b73f` 手动运行的 [Nightly](https://github.com/baaaaaaaka/codex-helper/actions/runs/43338523846) 全部通过，包括原先取消的 macOS 平台集成和 ARM64 语音资产作业。该提交与 `rc.16` 的差异仅为 Codex 兼容性文档更新；未更改或跳过任何 CI 检查。GitHub 容量仍可能再次变化。
+
 ## 实现与范围
 
 - 基于上游 main `b4b9ca122b2924912ddb4bc52a0dd428c54c9a5c`，分支 `investigate/teams-model-switch-20261112`。工作目录：`/home/baka/.local/state/cxp-model-review.a21C6mrW/worktree`。所有变更尚未提交，原用户 worktree 未修改。
