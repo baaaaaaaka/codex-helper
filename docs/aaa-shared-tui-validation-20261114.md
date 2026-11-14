@@ -119,6 +119,17 @@ The selected 100 ms CLI approval test also passed with race instrumentation.
 After the mask fix, `scripts/ci/run_e2e_shard.sh` passed for shards 0, 1 and 2
 in fresh isolated Docker execution with `-count=1`; all 15 scenario packages
 ran. The unchanged full Linux suite was not repeated after this test-only edit.
+The first remote CI run exposed an outdated fake output in
+`test_shared_codex_contract_gate.py`: it omitted the new mandatory AAA test.
+The fixture now includes it and explicitly checks skipped or missing AAA
+results. Its focused test passed, as did the full Python script suite in an
+isolated Linux container (149 tests, 9 skipped, including unavailable
+PowerShell-dependent cases). Remote CI provides the PowerShell environment.
+The first remote E2E shard 1 also exposed a restart-test race: Graph made a
+message visible before its send result was committed, so stopping immediately
+could produce a legitimate unconfirmed-delivery notice. The scenario now
+waits for the existing outbox-status check before stopping. The affected shard
+passed again in the isolated Linux container after that test-only change.
 Native Codex 0.166.0 and remote GitHub CI remain to be verified.
 
 ## Memory and disk audit

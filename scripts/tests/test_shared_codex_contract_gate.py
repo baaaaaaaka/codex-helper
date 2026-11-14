@@ -23,7 +23,7 @@ out=$1
 cat > "$out" <<'SCRIPT'
 #!/bin/bash
 case "$0" in
-  */probe) printf '%s\\n' TestRealCodexNewChatTUI TestRealCodexGatewayRecoveryTUI ;;
+  */probe) printf '%s\\n' TestRealCodexNewChatTUI TestRealCodexGatewayRecoveryTUI TestRealCodexAAASharedTUI ;;
   */agent) echo TestRealCodexSharedTUIThreadBinding ;;
   */client) printf '%s\\n' TestRealCodexSharedModelSwitch TestRealCodexSharedSwitchInputBoundary ;;
 esac
@@ -44,10 +44,12 @@ esac
             codex.write_text("#!/bin/sh\nexit 0\n")
             codex.chmod(0o755)
             env = dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ.get("PATH", ""), TMPDIR=tmp)
-            passed_ui = "--- PASS: TestRealCodexNewChatTUI (0.1s)\n--- PASS: TestRealCodexGatewayRecoveryTUI (0.1s)"
+            passed_ui = "--- PASS: TestRealCodexNewChatTUI (0.1s)\n--- PASS: TestRealCodexGatewayRecoveryTUI (0.1s)\n--- PASS: TestRealCodexAAASharedTUI (0.1s)"
             passed_switch = "--- PASS: TestRealCodexSharedModelSwitch (0.1s)\n--- PASS: TestRealCodexSharedSwitchInputBoundary (0.1s)"
             cases = (
                 (passed_ui, passed_switch, True),
+                (passed_ui.replace("--- PASS: TestRealCodexAAASharedTUI", "--- SKIP: TestRealCodexAAASharedTUI"), passed_switch, False),
+                (passed_ui.replace("\n--- PASS: TestRealCodexAAASharedTUI (0.1s)", ""), passed_switch, False),
                 ("--- PASS: TestRealCodexNewChatTUI (0.1s)\n--- SKIP: TestRealCodexGatewayRecoveryTUI (0.1s)", passed_switch, False),
                 ("--- SKIP: TestRealCodexNewChatTUI (0.0s)", passed_switch, False),
                 ("testing: warning: no tests to run", passed_switch, False),

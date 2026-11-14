@@ -81,6 +81,8 @@ func TestR09_R10_MirrorTUIRollout(t *testing.T) {
 	})
 
 	// R-10: stop, append a third turn, create a brand-new session, restart.
+	// A visible Graph message can precede the committed send outcome.
+	waitMirrorOutbox(t, s)
 	s.StopSUT()
 	p3, a3 := s.Token("tuiprompt3"), s.Token("tuianswer3")
 	r.AppendTurn(t, "Third local question "+p3, "", "Third local answer "+a3)
