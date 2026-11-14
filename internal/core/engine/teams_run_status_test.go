@@ -2,6 +2,7 @@ package engine
 
 import (
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -46,15 +47,27 @@ func TestTeamsRunTurnPostsV0120StatusAndAnswer(t *testing.T) {
 // as v0.1.20's Codex status, at most once per RetryStatus per turn; a
 // delegated turn posts none.
 func TestRetryingPostsV0120ReconnectStatusRateLimited(t *testing.T) {
-	r := newRig(t, func(c *Config) { c.Timing.RetryStatus = 300 * time.Millisecond })
+	var frozen atomic.Int64
+	r := newRig(t, func(c *Config) {
+		c.Timing.RetryStatus = 300 * time.Millisecond
+		c.Now = func() time.Time {
+			if at := frozen.Load(); at != 0 {
+				return time.Unix(0, at)
+			}
+			return time.Now()
+		}
+	})
 	r.ag.mu.Lock()
 	r.ag.during = func(req TurnRequest, h TurnHooks) {
 		if !strings.Contains(req.Text, "flaky") {
 			return
 		}
+		// Freeze event time independently of storage and scheduler latency.
+		frozen.Store(time.Now().UnixNano())
+		defer frozen.Store(0)
 		h.Retrying("Reconnecting... 1/5: stream disconnected before completion", "responseStreamDisconnected")
 		h.Retrying("Reconnecting... 2/5", "responseStreamDisconnected") // within RetryStatus: not posted
-		time.Sleep(400 * time.Millisecond)
+		frozen.Add(int64(400 * time.Millisecond))
 		h.Retrying("", "")
 		h.Retrying("connection dropped. codex is reconnecting.", "")
 	}

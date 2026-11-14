@@ -176,6 +176,13 @@ passed three consecutive local race runs. The first candidate's main CI passed,
 but its release workflow failed the nightly race partition; that tag is not
 reused.
 
+The next candidate's nightly race partition exposed a wall-clock assumption
+in the retry-status rate-limit test: synchronous persistence could take longer
+than its 300-millisecond interval under load. The test now freezes and advances
+the engine clock around the notifications, retaining the same expected status
+messages. The affected test and the Codex-ownership test passed ten local race
+runs. The second candidate tag is not reused.
+
 The WSL Docker CLI symlink and socket are absent. The Windows Docker CLI can
 access the Linux Docker backend with the required interop permission. The
 bundled harness uses a disposable container with a fresh test configuration.
