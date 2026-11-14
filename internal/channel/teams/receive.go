@@ -88,7 +88,7 @@ func (a *Adapter) HistoryPage(ctx context.Context, chat string, since time.Time,
 		Value    []graphMessage `json:"value"`
 		NextLink string         `json:"@odata.nextLink"`
 	}
-	if err := a.g.getJSON(ctx, next, pageBodyLimit, &page); err != nil {
+	if err := a.g.monitorJSON(ctx, next, pageBodyLimit, &page); err != nil {
 		return nil, "", err
 	}
 	if page.NextLink == next {
@@ -153,7 +153,7 @@ func (a *Adapter) walk(ctx context.Context, chat string, since time.Time) ([]cha
 			Value    []graphMessage `json:"value"`
 			NextLink string         `json:"@odata.nextLink"`
 		}
-		if err := a.g.getJSON(ctx, next, pageBodyLimit, &page); err != nil {
+		if err := a.g.monitorJSON(ctx, next, pageBodyLimit, &page); err != nil {
 			return nil, time.Time{}, pages, err
 		}
 		pages++
@@ -540,7 +540,7 @@ func (a *Adapter) Recent(ctx context.Context, chat string, limit int) ([]channel
 			Value    []graphMessage `json:"value"`
 			NextLink string         `json:"@odata.nextLink"`
 		}
-		if err := a.g.getJSON(ctx, next, pageBodyLimit, &page); err != nil {
+		if err := a.g.monitorJSON(ctx, next, pageBodyLimit, &page); err != nil {
 			return nil, err
 		}
 		for _, gm := range page.Value {

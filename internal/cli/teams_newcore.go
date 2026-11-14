@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/signal"
@@ -83,6 +84,8 @@ func teamsNewCoreChannelConfig(client *http.Client, authCfg chteams.AuthConfig, 
 		Math:            &chteams.NodeMath{}}
 	if len(readCfgs) > 0 && readCfgs[0].ClientID != authCfg.ClientID {
 		cfg.ReadTokens = chteams.NewDelegatedAuth(readCfgs[0], client)
+		cfg.ReadFallback = true
+		cfg.ReadFallbackLog = log.Printf
 	}
 	return cfg
 }

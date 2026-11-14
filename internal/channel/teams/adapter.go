@@ -28,6 +28,9 @@ type Config struct {
 	GraphURL string       // default https://graph.microsoft.com/v1.0
 	HTTP     *http.Client // default: no client-wide timeout; each request gets RequestTimeout or TransferTimeout
 	Tokens   TokenSource
+	// ReadFallback permits same-identity full credentials for helper polling after a read 429.
+	ReadFallback    bool
+	ReadFallbackLog func(string, ...any)
 	// ReadTokens handles idempotent Graph reads. Nil reuses Tokens.
 	ReadTokens TokenSource
 	TenantID   string // for chat links
@@ -122,7 +125,11 @@ func New(cfg Config) (*Adapter, error) {
 	if cfg.Sleep == nil {
 		cfg.Sleep = sleepCtx
 	}
-	return &Adapter{cfg: cfg, g: &graph{base: base, http: cfg.HTTP, tokens: cfg.Tokens, readTokens: cfg.ReadTokens, sleep: cfg.Sleep, timeout: cfg.RequestTimeout, transfer: cfg.TransferTimeout}}, nil
+	g := &graph{base: base, http: cfg.HTTP, tokens: cfg.Tokens, readTokens: cfg.ReadTokens, sleep: cfg.Sleep, timeout: cfg.RequestTimeout, transfer: cfg.TransferTimeout}
+	if cfg.ReadFallback && cfg.ReadTokens != nil {
+		g.readRoute = newReadRoute(cfg.Now, cfg.Sleep, cfg.ReadFallbackLog)
+	}
+	return &Adapter{cfg: cfg, g: g}, nil
 }
 
 func (a *Adapter) Caps() channel.Caps {
@@ -148,7 +155,7 @@ func (a *Adapter) Owner(ctx context.Context) (id, name string, err error) {
 		return o.ID, o.Name, nil
 	}
 	var me identity
-	if err := a.g.getJSON(ctx, "/me?$select=id,displayName,userPrincipalName", smallBodyLimit, &me); err != nil {
+	if err := a.g.monitorJSON(ctx, "/me?$select=id,displayName,userPrincipalName", smallBodyLimit, &me); err != nil {
 		return "", "", err
 	}
 	if me.ID == "" {
@@ -316,7 +323,7 @@ func (a *Adapter) Get(ctx context.Context, chat, id string) (channel.InboundMsg,
 		return channel.InboundMsg{}, err
 	}
 	var gm graphMessage
-	if err := a.g.getJSON(ctx, "/chats/"+url.PathEscape(chat)+"/messages/"+url.PathEscape(id), smallBodyLimit, &gm); err != nil {
+	if err := a.g.monitorJSON(ctx, "/chats/"+url.PathEscape(chat)+"/messages/"+url.PathEscape(id), smallBodyLimit, &gm); err != nil {
 		return channel.InboundMsg{}, err
 	}
 	return a.convert(chat, gm, me.ID), nil
