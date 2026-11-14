@@ -42,7 +42,7 @@ func (a *Adapter) ScanActivity(ctx context.Context, since time.Time) ([]channel.
 		seen[next] = true
 		older := false
 		var link string
-		err := a.g.getDecoded(ctx, next, pageBodyLimit, func(body []byte) (err error) {
+		err := a.g.monitorDecoded(ctx, next, pageBodyLimit, func(body []byte) (err error) {
 			link, err = decodeChats(body, func(c activityChat) bool {
 				if c.ID == "" || c.Preview == nil || c.Preview.ID == "" {
 					older = true // chats without messages sort last

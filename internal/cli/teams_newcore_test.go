@@ -253,3 +253,23 @@ func TestNewCoreChannelRendersFormulas(t *testing.T) {
 		t.Fatalf("Teams channel Math = %T, want the managed NodeMath renderer", cfg.Math)
 	}
 }
+
+func TestTeamsNewCoreReadFallbackRequiresSeparateClients(t *testing.T) {
+	full := chteams.AuthConfig{TenantID: "tenant", ClientID: "full"}
+	for _, tc := range []struct {
+		name string
+		read []chteams.AuthConfig
+		want bool
+	}{
+		{"no-reader", nil, false},
+		{"same-app", []chteams.AuthConfig{full}, false},
+		{"different-app", []chteams.AuthConfig{{TenantID: "tenant", ClientID: "read"}}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := teamsNewCoreChannelConfig(http.DefaultClient, full, tc.read...)
+			if cfg.ReadFallback != tc.want {
+				t.Fatalf("fallback=%v, want %v", cfg.ReadFallback, tc.want)
+			}
+		})
+	}
+}

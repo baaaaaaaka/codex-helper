@@ -39,6 +39,7 @@ type graph struct {
 	http       *http.Client
 	tokens     TokenSource
 	readTokens TokenSource
+	readRoute  *readRoute
 	sleep      func(context.Context, time.Duration) error
 	// timeout bounds one request; transfer one download or large upload
 	// body. Zero: no bound beyond ctx.
@@ -67,6 +68,8 @@ type call struct {
 	// follows it separately without Graph credentials. Other callers keep
 	// their existing redirect behavior.
 	readRedirect bool
+	monitor      bool // helper polling only; never generic read/search or transfers
+	borrowed     bool // full credential borrowed for a monitor read
 }
 
 type response struct {
@@ -102,7 +105,7 @@ func (g *graph) do(ctx context.Context, c call) (response, error) {
 				return response{}, &channel.Rejected{Err: err}
 			}
 		}
-		resp, err := g.once(ctx, c)
+		resp, err := g.readOnce(ctx, c)
 		if err == nil || !retryableRead(err) {
 			return resp, err
 		}
@@ -129,7 +132,17 @@ func retryableRead(err error) bool {
 // once performs one request, refreshing the token once on 401 for reads.
 func (g *graph) once(ctx context.Context, c call) (response, error) {
 	tokens := g.tokenSource(c)
-	resp, stale, err := g.send(ctx, c)
+	resp, err := g.onceWithTokens(ctx, c, tokens)
+	if c.write && g.readRoute != nil {
+		if th, ok := channel.AsThrottled(err); ok && th.Scope != channel.ScopeChat && th.Scope != channel.ScopeCall {
+			g.readRoute.blockFull(th.RetryAfter)
+		}
+	}
+	return resp, err
+}
+
+func (g *graph) onceWithTokens(ctx context.Context, c call, tokens TokenSource) (response, error) {
+	resp, stale, err := g.sendWithTokens(ctx, c, tokens)
 	if err != nil || resp.status != http.StatusUnauthorized || c.noAuth {
 		return resp, err
 	}
@@ -142,7 +155,7 @@ func (g *graph) once(ctx context.Context, c call) (response, error) {
 	if c.write || tok == "" {
 		return response{}, &channel.Rejected{Err: g.statusErr(c, resp)}
 	}
-	resp, _, err = g.send(ctx, c)
+	resp, _, err = g.sendWithTokens(ctx, c, tokens)
 	if err == nil && resp.status == http.StatusUnauthorized {
 		return response{}, &channel.AuthRequired{Err: g.statusErr(c, resp)}
 	}
@@ -157,16 +170,16 @@ func authErr(err error) error {
 	return &channel.Rejected{Err: fmt.Errorf("token refresh: %w", err)}
 }
 
-// send returns the raw response for 2xx and 401, and a classified error for
+// sendWithTokens returns the raw response for 2xx and 401, and a classified error for
 // everything else.
-func (g *graph) send(ctx context.Context, c call) (response, string, error) {
+func (g *graph) sendWithTokens(ctx context.Context, c call, tokens TokenSource) (response, string, error) {
 	target, err := g.resolveCall(c)
 	if err != nil {
 		return response{}, "", &channel.Rejected{Permanent: true, Err: err}
 	}
 	var token string
 	if !c.noAuth {
-		token, err = g.tokenSource(c).Token(ctx)
+		token, err = tokens.Token(ctx)
 		if err != nil {
 			return response{}, "", authErr(err)
 		}
@@ -212,6 +225,14 @@ func (g *graph) send(ctx context.Context, c call) (response, string, error) {
 			}
 		},
 	}))
+	if c.borrowed {
+		if err := g.readRoute.waitFull(ctx); err != nil {
+			return response{}, token, &channel.Rejected{Err: err}
+		}
+	}
+	if c.borrowed {
+		g.readRoute.fullRequests.Add(1)
+	}
 	hr, err := g.http.Do(req)
 	if err != nil {
 		err = fmt.Errorf("graph %s %s: %w", c.method, redactPath(target), err)
@@ -448,13 +469,25 @@ const bodyBufKeep = 4 << 20
 // getDecoded performs an idempotent GET and hands the response body to
 // decode, which must not keep it (json.Unmarshal copies what it keeps).
 func (g *graph) getDecoded(ctx context.Context, path string, limit int64, decode func([]byte) error) error {
+	return g.getDecodedFor(ctx, path, limit, decode, false)
+}
+
+func (g *graph) monitorJSON(ctx context.Context, path string, limit int64, out any) error {
+	return g.monitorDecoded(ctx, path, limit, func(body []byte) error { return json.Unmarshal(body, out) })
+}
+
+func (g *graph) monitorDecoded(ctx context.Context, path string, limit int64, decode func([]byte) error) error {
+	return g.getDecodedFor(ctx, path, limit, decode, true)
+}
+
+func (g *graph) getDecodedFor(ctx context.Context, path string, limit int64, decode func([]byte) error, monitor bool) error {
 	buf := bodyBufs.Get().(*bytes.Buffer)
 	defer func() {
 		if buf.Cap() <= bodyBufKeep {
 			bodyBufs.Put(buf)
 		}
 	}()
-	resp, err := g.do(ctx, call{method: http.MethodGet, url: path, limit: limit, buf: buf})
+	resp, err := g.do(ctx, call{method: http.MethodGet, url: path, limit: limit, buf: buf, monitor: monitor})
 	if err != nil {
 		return err
 	}
