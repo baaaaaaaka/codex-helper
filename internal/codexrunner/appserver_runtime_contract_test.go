@@ -38,6 +38,7 @@ type runtimeContractAdapter struct {
 	toolName          string
 	restoredHistory   bool
 	expectedEffort    string
+	commandCompleted  <-chan struct{}
 }
 
 type runtimeMetadataResumeAdapter struct {
@@ -123,7 +124,7 @@ func runtimeProviderRequestText(request responsesadapter.ProviderRequest) string
 	return out.String()
 }
 
-func (a *runtimeContractAdapter) Stream(_ context.Context, request responsesadapter.ProviderRequest) (<-chan responsesadapter.ProviderEvent, error) {
+func (a *runtimeContractAdapter) Stream(ctx context.Context, request responsesadapter.ProviderRequest) (<-chan responsesadapter.ProviderEvent, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.expectedEffort != "" && request.ReasoningEffort != a.expectedEffort {
@@ -168,6 +169,18 @@ func (a *runtimeContractAdapter) Stream(_ context.Context, request responsesadap
 	}
 	if !a.restoredHistory {
 		return nil, fmt.Errorf("provider request did not contain the completed contract tool call")
+	}
+	if a.commandCompleted != nil {
+		// Older Codex versions can return the tool output before publishing the
+		// command completion notification. Keep the synthetic model response
+		// open until that notification so its turn analytics include the tool.
+		waitCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+		defer cancel()
+		select {
+		case <-a.commandCompleted:
+		case <-waitCtx.Done():
+			return nil, fmt.Errorf("waiting for command completion: %w", waitCtx.Err())
+		}
 	}
 	return runtimeContractEvents(
 		responsesadapter.ProviderEvent{Kind: responsesadapter.ProviderEventTextDelta, Delta: "contract complete"},
@@ -222,7 +235,8 @@ func runtimeContractCommand(sentinel string) string {
 	if runtime.GOOS == "windows" {
 		return "Set-Content -LiteralPath '" + strings.ReplaceAll(sentinel, "'", "''") + "' -Value '" + runtimeContractMarker + "' -NoNewline"
 	}
-	return "printf '%s' '" + runtimeContractMarker + "' > '" + strings.ReplaceAll(sentinel, "'", "'\"'\"'") + "'"
+	// Exercise the older Codex path that publishes completion asynchronously.
+	return "sleep 1; printf '%s' '" + runtimeContractMarker + "' > '" + strings.ReplaceAll(sentinel, "'", "'\"'\"'") + "'"
 }
 
 func sameJSONObject(left, right string) bool {
@@ -262,7 +276,9 @@ func TestInstalledCodexStandardApprovalRuntime(t *testing.T) {
 		t.Fatal(err)
 	}
 	sentinel := filepath.Join(root, "outside-workspace.txt")
-	adapter := &runtimeContractAdapter{sentinel: sentinel, workingDir: workingDir, expectedEffort: "xhigh"}
+	commandCompleted := make(chan struct{})
+	var commandCompletedOnce sync.Once
+	adapter := &runtimeContractAdapter{sentinel: sentinel, workingDir: workingDir, expectedEffort: "xhigh", commandCompleted: commandCompleted}
 	var providerMu sync.Mutex
 	var providerRequests, providerWebSockets, providerWebSocketMessages int
 	var analyticsRequests [][]byte
@@ -333,6 +349,11 @@ func TestInstalledCodexStandardApprovalRuntime(t *testing.T) {
 		Prompt:          "Use the available shell tool exactly once, then report completion.",
 		WorkingDir:      workingDir,
 		ReasoningEffort: "xhigh",
+		EventHandler: func(event StreamEvent) {
+			if event.Kind == StreamEventCommandCompleted {
+				commandCompletedOnce.Do(func() { close(commandCompleted) })
+			}
+		},
 	})
 	if err != nil {
 		adapter.mu.Lock()

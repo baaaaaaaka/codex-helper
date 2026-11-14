@@ -139,12 +139,20 @@ The `v0.1.23-rc.19` main CI passed the real native Codex 0.166.0 and
 remains to be verified.
 
 The `v0.1.23-rc.20` main CI passed. Its Linux Codex 0.131.0 release
-contract observed the approved command but timed out after five seconds
-waiting for Codex's asynchronous command analytics; the same version passed
-locally, and the macOS and Windows 0.131.0 matrix entries passed remotely.
-The contract still requires both user approval and the completed-command
-event, but now allows 20 seconds and reads the received events from a
-mutex-protected snapshot.
+contract observed the approved command but missed its command analytics. A
+20-second deadline in `rc.21` did not fix it. Codex 0.131.0 emits some command
+completion notifications asynchronously; its analytics reducer drops those
+arriving after the turn has completed. The immediate synthetic model response
+could therefore finish the turn before the notification. On Ubuntu 26.04,
+extending the command by one second reproduced the missing event three times.
+The fixture now waits for the actual command completion notification before
+returning the model response, with a 20-second deadline and request cancellation.
+The slow Unix command keeps this ordering under test, and the same original
+Codex 0.131.0 and 0.167.1 binaries each passed the contract three times in an
+isolated Ubuntu 26.04 container with the change. The
+checks still require both user approval and completed-command analytics, and
+read received events from a mutex-protected snapshot. The remote matrix must
+also pass before release.
 
 ## Memory and disk audit
 
