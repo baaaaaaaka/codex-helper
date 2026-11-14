@@ -1,8 +1,10 @@
 package commands
 
 import (
+	"database/sql"
 	"fmt"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +12,7 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakegraph"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/harness"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/steps"
+	_ "modernc.org/sqlite"
 )
 
 // testCards counts the cards the fake Workflow accepted whose texts
@@ -95,6 +98,20 @@ func TestWebhookFromControlChat(t *testing.T) {
 	s.Poll(20*time.Second, func() bool { return len(s.Graph.AcceptedWorkflowCards()) > before })
 	s.Check("a final after `helper webhook <url>` is announced by a card, without a restart", len(s.Graph.AcceptedWorkflowCards()) == before+1,
 		fmt.Sprint(before+1)+" cards", fmt.Sprint(len(s.Graph.AcceptedWorkflowCards())))
+
+	// The fake endpoint can accept a card before the helper commits its
+	// outcome. Stopping in that window correctly triggers a fallback mention.
+	dbURL := (&url.URL{Scheme: "file", Path: filepath.Join(s.Env.StateDir, "codex-helper", "teams", "core.sqlite")}).String() + "?mode=ro"
+	db, err := sql.Open("sqlite", dbURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	s.Require("final card outcome is committed", 30*time.Second, func() (bool, string) {
+		var pending bool
+		err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM pending_notifications WHERE request = ?)", "Short question "+tok).Scan(&pending)
+		return err == nil && !pending, fmt.Sprintf("pending=%t, error=%v", pending, err)
+	})
 
 	// A test sent while the helper is down: one card and one reply, even
 	// across a second restart.

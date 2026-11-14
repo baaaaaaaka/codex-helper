@@ -130,7 +130,13 @@ message visible before its send result was committed, so stopping immediately
 could produce a legitimate unconfirmed-delivery notice. The scenario now
 waits for the existing outbox-status check before stopping. The affected shard
 passed again in the isolated Linux container after that test-only change.
-Native Codex 0.166.0 and remote GitHub CI remain to be verified.
+The next release run exposed the same restart boundary for a Workflow card:
+the fake endpoint accepted it before the helper committed the delivery result.
+The webhook scenario now waits for that notification to leave the read-only
+pending-notification view before stopping; its full E2E shard passed locally.
+The `v0.1.23-rc.19` main CI passed the real native Codex 0.166.0 and
+0.167.1 shared-contract jobs; the replacement release's full remote CI
+remains to be verified.
 
 ## Memory and disk audit
 
