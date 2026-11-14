@@ -167,6 +167,15 @@ above rechecked every affected recovery/capacity/reconnect path.
 
 ## Unverified integration paths
 
+The first release candidate's nightly race run exposed an existing unlocked
+conversation-kind read during task startup and a 30-second timeout in the
+high-concurrency write-pacing test. Task startup now snapshots the conversation
+kind and label under the engine mutex. The pacing test allows 90 seconds for
+catch-up while retaining its independent rate assertions. Both affected tests
+passed three consecutive local race runs. The first candidate's main CI passed,
+but its release workflow failed the nightly race partition; that tag is not
+reused.
+
 The WSL Docker CLI symlink and socket are absent. The Windows Docker CLI can
 access the Linux Docker backend with the required interop permission. The
 bundled harness uses a disposable container with a fresh test configuration.

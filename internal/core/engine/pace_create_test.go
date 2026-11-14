@@ -180,7 +180,9 @@ func TestEveryWriteIsPacedIncludingChatCreation(t *testing.T) {
 	const rate, active, creating, rows = 20.0, 10, 40, 2
 	r, w := creatingRig(t, func(c *Config) { c.WriteRate = rate }, active, creating, rows)
 	want := (active + creating) * rows
-	r.waitFor("catch-up delivered", 30*time.Second, func() bool {
+	// Race-instrumented CI runs many shards at once on a shared runner.
+	// The wait only bounds completion; pacing is checked independently below.
+	r.waitFor("catch-up delivered", 90*time.Second, func() bool {
 		n, c := w.count("catch-up backlog")
 		return n == want && c >= creating
 	})

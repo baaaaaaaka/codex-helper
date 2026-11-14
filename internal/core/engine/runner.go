@@ -478,6 +478,9 @@ func voiceFailure(body string, files []store.InboundFile) string {
 func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req TurnRequest, rs *runState) {
 	defer close(rs.done)
 	id := cs.id
+	e.mu.Lock()
+	kind, label := cs.kind, cs.label
+	e.mu.Unlock()
 	// Cancellation can commit after admission but before cs.running is
 	// registered. With rs now visible, verify that earlier cancellation
 	// before calling the backend; later cancellation uses its normal hook.
@@ -494,7 +497,7 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 		return
 	}
 	accepted := false
-	req.GenerateTitle = req.ThreadID == "" && cs.kind == store.KindWork && rs.request == "" && id != e.inboxID
+	req.GenerateTitle = req.ThreadID == "" && kind == store.KindWork && rs.request == "" && id != e.inboxID
 	if req.GenerateTitle {
 		if title, _, err := e.st.Meta(fmt.Sprint(metaUserTitle, id)); err != nil || title != "" || isForkChild(e.st.Meta, id) {
 			req.GenerateTitle = false
@@ -503,10 +506,10 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 		}
 	}
 	transcriptProgress := false
-	if a, ok := e.ag.(TranscriptAgent); ok && a.TranscriptProgress() && e.cfg.SessionsDir != "" && cs.kind == store.KindWork && rs.request == "" {
+	if a, ok := e.ag.(TranscriptAgent); ok && a.TranscriptProgress() && e.cfg.SessionsDir != "" && kind == store.KindWork && rs.request == "" {
 		// Persist ownership before allowing the agent to write any record.
 		if err := e.persist(ctx, "assign transcript progress", func(tx *store.Tx) error { return tx.SetTranscriptProgress(tr.ID) }); err != nil {
-			e.logf("assign progress of %s: %v", cs.label, err)
+			e.logf("assign progress of %s: %v", label, err)
 			e.fail(err)
 			e.clearRun(id, rs)
 			return
@@ -632,14 +635,14 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 				}
 				return tx.AcceptContinuationInputs(tr.ID)
 			}); err != nil {
-				e.logf("mark running %s: %v", cs.label, err)
+				e.logf("mark running %s: %v", label, err)
 				e.fail(err)
 			}
 		},
 	}
 	if dir := e.outboundDir(turnOutputKey(tr)); dir != "" {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
-			e.logf("output directory of %s: %v", cs.label, err)
+			e.logf("output directory of %s: %v", label, err)
 		}
 	}
 	stopWatch := e.watchSilence(ctx, cs, tr, rs)
@@ -669,7 +672,7 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 		return
 	}
 	if errors.Is(err, ErrUnknownOutcome) {
-		e.logf("turn %d in %s: %v; looking it up", tr.ID, cs.label, err)
+		e.logf("turn %d in %s: %v; looking it up", tr.ID, label, err)
 		threadID := req.ThreadID
 		if threadID == "" {
 			threadID = e.turnThread(cs, tr)
