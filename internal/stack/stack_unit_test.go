@@ -504,11 +504,29 @@ func TestReservationEnsuresDifferentPorts(t *testing.T) {
 // Start retry / canRetry behaviour
 // ---------------------------------------------------------------------------
 
-// fakeFailingSSHScript returns a shell script that increments a counter file
-// and then exits immediately with a failure code. This makes tunnel startup
-// deterministically fail before the SOCKS port can become ready.
 func fakeFailingSSHScript(counterFile string) string {
 	return fmt.Sprintf("#!/bin/sh\necho x >> '%s'\nexit 1\n", counterFile)
+}
+
+// failedStartTunnel reports an immediate tunnel exit without relying on OS
+// process scheduling. Process lifecycle behavior is tested in the SSH package.
+type failedStartTunnel struct{ done chan struct{} }
+
+func (t *failedStartTunnel) Start() error             { close(t.done); return nil }
+func (t *failedStartTunnel) Stop(time.Duration) error { return nil }
+func (t *failedStartTunnel) Done() <-chan struct{}    { return t.done }
+func (t *failedStartTunnel) Wait() error              { return fmt.Errorf("test tunnel exited") }
+
+func countFailedTunnels(t *testing.T) *int {
+	t.Helper()
+	count := new(int)
+	previousFactory := newStackTunnel
+	newStackTunnel = func(config.Profile, int) (tunnelProcess, error) {
+		*count++
+		return &failedStartTunnel{done: make(chan struct{})}, nil
+	}
+	t.Cleanup(func() { newStackTunnel = previousFactory })
+	return count
 }
 
 func TestStartRetriesWithAutoPort(t *testing.T) {
@@ -516,17 +534,7 @@ func TestStartRetriesWithAutoPort(t *testing.T) {
 		t.Skip("skip on windows")
 	}
 
-	dir := t.TempDir()
-	counterFile := filepath.Join(dir, "counter")
-	script := filepath.Join(dir, "ssh")
-	// This test checks only the auto-port retry decision. Use an immediate
-	// failure so process-group signal timing cannot make the invocation count
-	// nondeterministic; the blocking/descendant cleanup contract is covered by
-	// the SSH package's process-tree tests.
-	if err := os.WriteFile(script, []byte(fakeFailingSSHScript(counterFile)), 0o700); err != nil {
-		t.Fatalf("write script: %v", err)
-	}
-	t.Setenv("PATH", dir)
+	count := countFailedTunnels(t)
 
 	profile := config.Profile{
 		Host:    "example.com",
@@ -546,11 +554,9 @@ func TestStartRetriesWithAutoPort(t *testing.T) {
 		t.Fatalf("expected error with non-functional SSH")
 	}
 
-	data, _ := os.ReadFile(counterFile)
-	count := strings.Count(string(data), "x")
 	// maxPortRetries=3 → 4 attempts (initial + 3 retries).
-	if count != 4 {
-		t.Fatalf("expected 4 SSH invocations (initial + 3 retries), got %d", count)
+	if *count != 4 || !strings.Contains(err.Error(), "test tunnel exited") {
+		t.Fatalf("expected 4 failed tunnel attempts, got %d, error: %v", *count, err)
 	}
 }
 
@@ -559,17 +565,7 @@ func TestStartExplicitPortDoesNotRetry(t *testing.T) {
 		t.Skip("skip on windows")
 	}
 
-	dir := t.TempDir()
-	counterFile := filepath.Join(dir, "counter")
-	script := filepath.Join(dir, "ssh")
-	// Use an immediate failure so the invocation is recorded before Start
-	// returns.  A blocking helper plus a short readiness/stop window makes this
-	// assertion depend on child-process scheduling under -race and hosted CI,
-	// even though it tests only the explicit-port retry decision.
-	if err := os.WriteFile(script, []byte(fakeFailingSSHScript(counterFile)), 0o700); err != nil {
-		t.Fatalf("write script: %v", err)
-	}
-	t.Setenv("PATH", dir)
+	count := countFailedTunnels(t)
 
 	// Use a port that is free. The fake SSH never opens the SOCKS listener, so
 	// Start should fail after a single invocation without retrying the explicit
@@ -599,10 +595,8 @@ func TestStartExplicitPortDoesNotRetry(t *testing.T) {
 		t.Fatalf("expected error with non-functional SSH")
 	}
 
-	data, _ := os.ReadFile(counterFile)
-	count := strings.Count(string(data), "x")
-	if count != 1 {
-		t.Fatalf("expected 1 SSH invocation (no retry with explicit port), got %d", count)
+	if *count != 1 || !strings.Contains(err.Error(), "test tunnel exited") {
+		t.Fatalf("expected 1 failed tunnel attempt (no retry with explicit port), got %d, error: %v", *count, err)
 	}
 }
 

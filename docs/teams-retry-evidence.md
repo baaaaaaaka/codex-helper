@@ -183,6 +183,15 @@ the engine clock around the notifications, retaining the same expected status
 messages. The affected test and the Codex-ownership test passed ten local race
 runs. The second candidate tag is not reused.
 
+The third candidate's release CI failed an unrelated explicit-port proxy retry
+test because its fake SSH process recorded no invocation; the prior fixture did
+not record enough detail to distinguish startup delay from other early errors.
+The retry decision tests now inject an
+immediately failed tunnel and assert both the failure and attempt count;
+separate SSH process tests retain lifecycle coverage. Both retry tests passed
+50 local race runs, and the full stack package passed three runs in Docker.
+The third candidate tag is not reused.
+
 The WSL Docker CLI symlink and socket are absent. The Windows Docker CLI can
 access the Linux Docker backend with the required interop permission. The
 bundled harness uses a disposable container with a fresh test configuration.
