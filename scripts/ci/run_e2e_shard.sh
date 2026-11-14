@@ -11,6 +11,9 @@ if [[ -z "$packages_text" ]]; then
   echo "E2E shard $1 selected no scenario packages" >&2
   exit 1
 fi
-mapfile -t packages <<< "$packages_text"
+packages=()
+while IFS= read -r package; do
+  packages+=("$package")
+done <<< "$packages_text"
 export E2E_SUT=cxp
 exec go test -v -count=1 -parallel=8 -timeout=600s "${packages[@]}"
