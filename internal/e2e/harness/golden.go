@@ -68,6 +68,36 @@ type GoldenOptions struct {
 	// are posted in timing order. Value: the reason. A session notified
 	// twice still shows twice.
 	FinishedNotices string
+	// OptionalControl notices have scenario-specific assertions outside the
+	// golden, because their presence depends on a documented crash window.
+	OptionalControl []OptionalControlNotice
+}
+
+type OptionalControlNotice struct {
+	Pattern *regexp.Regexp
+	Reason  string
+}
+
+func (o GoldenOptions) omitOptionalControl(msgs []fakegraph.Message) []fakegraph.Message {
+	if len(o.OptionalControl) == 0 {
+		return msgs
+	}
+	keep := make([]fakegraph.Message, 0, len(msgs))
+	for _, m := range msgs {
+		omit := false
+		if m.Origin == fakegraph.OriginSUT && len(m.Mentions) == 0 {
+			for _, rule := range o.OptionalControl {
+				if rule.Pattern.MatchString(NormalizeSpace(m.PlainText())) {
+					omit = true
+					break
+				}
+			}
+		}
+		if !omit {
+			keep = append(keep, m)
+		}
+	}
+	return keep
 }
 
 // Float is a helper message (Text: a substring of its plain text) whose
@@ -122,6 +152,11 @@ type Mask struct {
 }
 
 func (o GoldenOptions) validate() error {
+	for _, n := range o.OptionalControl {
+		if n.Pattern == nil || strings.TrimSpace(n.Reason) == "" {
+			return fmt.Errorf("golden: an optional control notice needs a pattern and a reason")
+		}
+	}
 	for k, r := range o.UnorderedChats {
 		if strings.TrimSpace(r) == "" {
 			return fmt.Errorf("golden: UnorderedChats[%q] needs a reason", k)
@@ -196,6 +231,9 @@ func (s *Scenario) GoldenTranscript() string {
 			}
 		}
 		msgs := logicalProgressMessages(s.Graph.Messages(c.ID))
+		if strings.Contains(c.Topic, ControlChatTopicMarker) {
+			msgs = s.Opts.Golden.omitOptionalControl(msgs)
+		}
 		var notices []string
 		if s.Opts.Golden.FinishedNotices != "" && strings.Contains(c.Topic, ControlChatTopicMarker) {
 			msgs, notices = splitFinishedNotices(msgs, who)

@@ -2,6 +2,7 @@ package crash
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +11,8 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/harness"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/steps"
 )
+
+var catchupUnknownNotice = regexp.MustCompile(`^🔧 Helper: Delivery unconfirmed in s00[23] \(message reference ([0-9]+)\)\. The complete message is retained\. Later messages can continue; this message will not be resent automatically\.$`)
 
 // SIGKILL twice in the middle of the silent catch-up after an outage: every
 // local record still arrives exactly once, in order, and silently, with no
@@ -30,9 +33,13 @@ func TestCatchUpSurvivesCrashes(t *testing.T) {
 		Guarantees: []string{"R-2", "R-10", "F-MIR-4"},
 		Title:      "two SIGKILLs during the catch-up of 40 local turns: each record once, in order, silent",
 		Budget:     180 * time.Second,
+		Golden: harness.GoldenOptions{OptionalControl: []harness.OptionalControlNotice{{
+			Pattern: catchupUnknownNotice,
+			Reason:  "a kill can leave a send outcome unknown; this scenario checks each notice separately",
+		}}},
 	})
 	defer s.Finish()
-	steps.ReadyControlChat(s)
+	control := steps.ReadyControlChat(s)
 	if !steps.HistoryWatchReady(s) {
 		s.Check("history watcher initialised", false, "probe session mirrored", "never mirrored")
 		return
@@ -165,7 +172,46 @@ func TestCatchUpSurvivesCrashes(t *testing.T) {
 	}
 	s.Check("the new chat is announced in one summary", summaries == 1, "1 summary", fmt.Sprint(summaries))
 	s.Check("the restarts notify nobody", n == 0, "no @mention, no card after the stop", fmt.Sprintf("%d: %s", n, strings.Join(loud, "; ")))
+	// A kill can interrupt a send before its result is persisted. Check any
+	// resulting safety notices without making their presence timing-dependent.
+	var unknown []string
+	refs := make(map[string]bool)
+	for _, m := range s.SUTMessages(control.ID) {
+		text := harness.NormalizeSpace(m.PlainText())
+		if !strings.Contains(text, "Delivery unconfirmed") {
+			continue
+		}
+		match := catchupUnknownNotice.FindStringSubmatch(text)
+		if len(match) != 2 || len(m.Mentions) != 0 {
+			unknown = append(unknown, text)
+			continue
+		}
+		if refs[match[1]] {
+			unknown = append(unknown, "duplicate reference "+match[1])
+		}
+		refs[match[1]] = true
+	}
+	if len(refs) > 4 { // at most one in-flight send per chat at each of two kills
+		unknown = append(unknown, fmt.Sprintf("%d distinct notices", len(refs)))
+	}
+	s.Check("ambiguous-send notices are bounded, unique and accurate", len(unknown) == 0, "at most four valid notices", strings.Join(unknown, "; "))
 	s.Check("catch-up never runs Codex", len(s.Codex.Calls()) == 0, "0", fmt.Sprint(len(s.Codex.Calls())))
+}
+
+func TestCatchupUnknownNoticePattern(t *testing.T) {
+	valid := "🔧 Helper: Delivery unconfirmed in s002 (message reference 39). The complete message is retained. Later messages can continue; this message will not be resent automatically."
+	if got := catchupUnknownNotice.FindStringSubmatch(valid); len(got) != 2 || got[1] != "39" {
+		t.Fatalf("valid notice: %q", got)
+	}
+	for _, invalid := range []string{
+		strings.Replace(valid, "s002", "s004", 1),
+		strings.Replace(valid, "will not be resent", "will be resent", 1),
+		valid + " extra",
+	} {
+		if catchupUnknownNotice.MatchString(invalid) {
+			t.Fatalf("accepted unexpected notice: %q", invalid)
+		}
+	}
 }
 
 func firstID(cs []fakegraph.ChatInfo) string {

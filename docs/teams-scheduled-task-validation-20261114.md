@@ -36,6 +36,17 @@ restored backoff, and the fake agent showed the unintended second call. The
 runtime guard and its behavior are unchanged. Native Windows CI must rerun
 the test; the `rc.31` release run was cancelled and the tag is not reused.
 
+The `rc.32` release run 43612194227 failed the `CATCHUP-CRASH` golden
+because a kill left a send unconfirmed and the existing delivery-safety
+notice appeared in the control chat. The scenario's exactly-once, ordering,
+and no-mention checks passed. The scenario now accepts that optional notice
+only when its complete text names one of the two test sessions, has no
+mention, has a unique message reference, and remains bounded by the two
+simultaneous sends across each of two kills. Other messages still use the
+unchanged golden. The optional-message rendering test and a notice-pattern
+test passed locally; actual crash and recovery execution must pass in isolated
+GitHub CI. The `rc.32` release run was cancelled and its tag is not reused.
+
 ## Scope and user behavior
 
 This change observes native Codex evidence. Codex continues to own execution
