@@ -13,4 +13,4 @@ if [[ -z "$packages_text" ]]; then
 fi
 mapfile -t packages <<< "$packages_text"
 export E2E_SUT=cxp
-exec go test -count=1 -parallel=8 -timeout=600s "${packages[@]}"
+exec go test -v -count=1 -parallel=8 -timeout=600s "${packages[@]}"

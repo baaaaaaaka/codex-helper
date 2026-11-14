@@ -228,13 +228,14 @@ jobs:
           CODEX_RUNTIME_E2E_TEST: "1"
         run: |
           set -euo pipefail
+          if [ "${{ runner.os }}" = Linux ]; then
+            native="$(python3 scripts/ci/find_native_codex.py "$(npm root -g)" "$CODEX_VERSION")"
+          fi
           go test ./internal/codexcontract -run 'TestInstalledCodex(RuntimeContract|RemoteTUI.*Handshake)' -count=1 -v
           go test ./internal/cli -run 'Test(ProbeCodexIntegration|InstalledCodexRuntimeMigrationDefersLivePrivateArtifacts)' -count=1 -v
           go test ./internal/responsespolicy -run TestServerRoutesResponsesAndLeavesNonResponsesTrafficUnchanged -count=1 -v
           go test ./internal/codexrunner -run 'Test(InstalledCodex(StandardApproval|MetadataOnlyResume|ExplicitCancelInterrupt)Runtime|PolicyStarterPreservesUserChatGPTOriginAndAddsOnlyResponsesGateway|AppServerRunner(PreservesBoundedCloudConfigErrorData|DefaultApprovalModeFailsClosed|AutomaticApprovalModeIsExplicit)|AutomaticApprovalResultMatrix|RemoteBrokerManualModeRelaysApprovalRequestsAndResponsesByteTransparent)' -count=1 -v
           if [ "${{ runner.os }}" = Linux ]; then
-            native="$(find "$(npm root -g)" -type f -path '*/vendor/*/bin/codex' -print -quit)"
-            test -n "$native"
             bash scripts/ci/run_shared_codex_contracts.sh "$native"
           fi
 

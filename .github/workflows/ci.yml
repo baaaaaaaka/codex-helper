@@ -142,12 +142,22 @@ jobs:
         run: |
           set -euo pipefail
           npm install --prefix "$RUNNER_TEMP/shared-codex" --include=optional "@openai/codex@${{ matrix.codex }}"
+      - name: Check oldest supported Codex approval contract
+        if: matrix.codex == '0.166.0'
+        shell: bash
+        env:
+          CODEX_RUNTIME_E2E_TEST: "1"
+        run: |
+          set -euo pipefail
+          npm install --prefix "$RUNNER_TEMP/legacy-codex" --include=optional @openai/codex@0.131.0
+          export PATH="$RUNNER_TEMP/legacy-codex/node_modules/.bin:$PATH"
+          go test ./internal/codexrunner -run '^TestInstalledCodexStandardApprovalRuntime$' -count=1 -v 2>&1 | tee "$RUNNER_TEMP/legacy-approval.log"
+          grep -q '^--- PASS: TestInstalledCodexStandardApprovalRuntime ' "$RUNNER_TEMP/legacy-approval.log"
       - name: Probe native multi-client and queue semantics offline
         shell: bash
         run: |
           set -euo pipefail
-          native="$(find "$RUNNER_TEMP/shared-codex/node_modules" -type f -path '*/vendor/*/bin/codex' -print -quit)"
-          test -n "$native"
+          native="$(python3 scripts/ci/find_native_codex.py "$RUNNER_TEMP/shared-codex/node_modules" "${{ matrix.codex }}")"
           bash scripts/ci/run_shared_codex_contracts.sh "$native" 2>&1 | tee "$RUNNER_TEMP/shared-codex-contract.log"
       - name: Upload protocol evidence
         if: ${{ always() }}
@@ -357,6 +367,15 @@ jobs:
           go-version: "1.25.11"
           cache: true
 
+      - name: Scenarios through the production entry point
+        shell: bash
+        env:
+          E2E_SUT: cxp
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          set -euo pipefail
+          bash scripts/ci/run_e2e_shard.sh "${{ matrix.shard }}" 2>&1 | tee "$RUNNER_TEMP/e2e.log"
+
       - name: Repeat Teams migration and watchdog recovery contracts
         if: matrix.shard == 0
         shell: bash
@@ -372,15 +391,6 @@ jobs:
         env:
           TMPDIR: ${{ runner.temp }}
         run: bash scripts/ci/test_legacy_watchdog_handoff.sh
-
-      - name: Scenarios through the production entry point
-        shell: bash
-        env:
-          E2E_SUT: cxp
-          TMPDIR: ${{ runner.temp }}
-        run: |
-          set -euo pipefail
-          bash scripts/ci/run_e2e_shard.sh "${{ matrix.shard }}" 2>&1 | tee "$RUNNER_TEMP/e2e.log"
 
       - name: Upload e2e diagnostics
         if: ${{ failure() }}

@@ -400,7 +400,7 @@ class TargetedShardWorkflowTests(unittest.TestCase):
         self.assertIn(
             'bash scripts/ci/run_e2e_shard.sh "${{ matrix.shard }}"', job
         )
-        self.assertIn('go test -count=1 -parallel=8 -timeout=600s "${packages[@]}"', (ROOT / "scripts/ci/run_e2e_shard.sh").read_text())
+        self.assertIn('go test -v -count=1 -parallel=8 -timeout=600s "${packages[@]}"', (ROOT / "scripts/ci/run_e2e_shard.sh").read_text())
         aggregate = job_block(WORKFLOW, "test")
         self.assertIn("      - e2e\n", aggregate)
         self.assertIn('check e2e "${{ needs.e2e.result }}"', aggregate)
@@ -420,6 +420,22 @@ class TargetedShardWorkflowTests(unittest.TestCase):
                                         cwd=ROOT, env=dict(env, FAKE_EXIT=status),
                                         text=True, capture_output=True)
                 self.assertNotEqual(result.returncode, 0, result.stdout)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX shell fixtures")
+    def test_e2e_runner_propagates_test_failure_with_verbose_output(self):
+        with tempfile.TemporaryDirectory(prefix="e2e-output-") as tmp:
+            tools = pathlib.Path(tmp)
+            python = tools / "python3"
+            python.write_text("#!/bin/bash\nif [[ \"$*\" == *--index* ]]; then echo example/package; fi\n")
+            python.chmod(0o755)
+            go = tools / "go"
+            go.write_text("#!/bin/bash\n[[ \" $* \" == *' -v '* ]] || exit 3\necho '--- FAIL: example'\nexit 7\n")
+            go.chmod(0o755)
+            env = dict(os.environ, PATH=str(tools) + os.pathsep + os.environ.get("PATH", ""))
+            result = subprocess.run(["bash", "scripts/ci/run_e2e_shard.sh", "0"],
+                                    cwd=ROOT, env=env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 7, result.stderr)
+            self.assertIn("--- FAIL: example", result.stdout)
 
     def test_e2e_shards_partition_every_scenario_package_exactly_once(self):
         prefix = "github.com/baaaaaaaka/codex-helper/internal/e2e/scenarios/"
