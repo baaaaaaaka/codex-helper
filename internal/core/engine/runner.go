@@ -563,6 +563,9 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 			}
 		},
 		Activity: touch,
+		Waiting: func(itemID string, duration time.Duration, started bool) {
+			e.nativeWait(cs.id, tr.ID, rs, itemID, duration, started)
+		},
 		// v0.1.20 posted a Codex status when Codex retried within the
 		// turn (a dropped stream it reconnects), at most once per
 		// RetryStatus per turn; it is a progress message (same pacing,
@@ -788,6 +791,9 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 		e.finishDelegation(ctx, cs, tr, out, cancelled)
 		return
 	}
+	e.mu.Lock()
+	waited := cs.running != nil && cs.running.turnID == tr.ID && cs.running.waitID != ""
+	e.mu.Unlock()
 	var (
 		state, errText string
 		msgs           []store.OutMsg
@@ -847,6 +853,9 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 		out.Final = final
 		if final != "" {
 			doc := answerDoc(final)
+			if waited {
+				doc.Label = "🕒 Codex answer after an in-session wait"
+			}
 			doc.Notes = infoNotes(e.turnInfo(cs.id), true)
 			// Batch B: a control-chat answer mentions the owner itself
 			// (v0.1.20 outboxAlreadyMentionedControlOwner); finalMention
@@ -893,6 +902,9 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 				return err
 			}
 			kind, text := "", clipText(out.Final, 400)
+			if waited {
+				kind = notifyWait
+			}
 			if !notify {
 				kind, text = notifyAttention, "The request did not finish. Open the chat for details and retry instructions."
 			}
@@ -1086,11 +1098,18 @@ func (e *Engine) finalMention(n pendingNotify, cs *convState) ([]store.OutMsg, e
 	if ctl == 0 || cs.id == ctl { // batch B: a control answer carries its own mention
 		return nil, nil
 	}
-	text := "**✅ Codex finished**\n\n**Chat:** " + mdInline(name)
+	heading, next := resultNotice(n.Kind)
+	text := "**" + heading + "**\n\n**Chat:** " + mdInline(name)
+	if n.Kind == notifyScheduled {
+		source, _, _ := strings.Cut(n.Text, "\n")
+		if source != heading {
+			text += "\n**Source:** " + mdInline(source)
+		}
+	}
 	if req := n.Request; req != "" && !redundantRequest(req, name) {
 		text += "\n**Request:** " + mdInline(req)
 	}
-	text += "\n\n**Next:** The answer is ready in the work chat."
+	text += "\n\n**Next:** " + next
 	if url != "" {
 		text += "\n\n**Open:** [Open answer](" + url + ")"
 	}

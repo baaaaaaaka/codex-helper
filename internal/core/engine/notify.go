@@ -28,6 +28,9 @@ const notifyReady = "ready"
 const notifyService = "service"
 const notifyAttention = "attention"
 
+const notifyScheduled = "scheduled"
+const notifyWait = "wait"
+
 const notifyQuestion = "question"
 
 // id identifies n in the pending list.
@@ -202,7 +205,7 @@ func (e *Engine) pumpNotifyAvailable(ctx context.Context, scope store.Notificati
 					if state == store.OutUnknown {
 						continue
 					}
-					if n.Kind == "" || n.Kind == notifyLocal || n.Kind == notifyQuestion {
+					if n.Kind == "" || n.Kind == notifyScheduled || n.Kind == notifyWait || n.Kind == notifyLocal || n.Kind == notifyQuestion {
 						answered = append(answered, n)
 					} // questions mark the work chat unread, but do not retitle it
 				}
@@ -301,8 +304,14 @@ func (e *Engine) sendCard(ctx context.Context, n pendingNotify) bool {
 			err = e.cfg.Notifier.Notify(cctx, channel.OwnerNotice{Heading: heading, ChatTitle: firstNonEmpty(title, label), Hint: text, URL: url})
 		}
 	} else {
-		notice := channel.OwnerNotice{Heading: "✅ Codex finished", ChatTitle: firstNonEmpty(title, label), Request: n.Request, Hint: "The answer is ready in the work chat.", Button: "Open answer", URL: url}
+		heading, hint := resultNotice(n.Kind)
+		notice := channel.OwnerNotice{Heading: heading, ChatTitle: firstNonEmpty(title, label), Request: n.Request, Hint: hint, Button: "Open answer", URL: url}
 		switch n.Kind {
+		case notifyScheduled:
+			notice.Request, _, _ = strings.Cut(n.Text, "\n")
+			if notice.Request == notice.Heading {
+				notice.Request = ""
+			}
 		case notifyService:
 			notice.Heading, notice.Hint, notice.Request, notice.Button = n.Request, n.Text, "", "Open Control"
 		case notifyAttention:

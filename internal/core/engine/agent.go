@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/core/store"
 )
@@ -147,6 +148,8 @@ type TurnHooks struct {
 	// Activity is called on any Codex event of the running turn (silence
 	// hints and the stall bound, R-19). It must not block.
 	Activity func()
+	// Waiting reports a native in-session wait, not a persisted schedule.
+	Waiting func(itemID string, duration time.Duration, started bool)
 	// Retrying is called when Codex reports an error it retries by itself
 	// (a dropped stream it reconnects), with its message and reason code.
 	Retrying func(message, code string)

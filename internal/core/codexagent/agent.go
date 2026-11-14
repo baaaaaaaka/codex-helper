@@ -234,6 +234,7 @@ func (a *Agent) Run(ctx context.Context, req engine.TurnRequest, hooks engine.Tu
 		Progress:    hooks.Progress,
 		Compacted:   hooks.Compacted,
 		Activity:    hooks.Activity,
+		Waiting:     hooks.Waiting,
 		TurnChanged: hooks.Ready,
 		Retrying:    hooks.Retrying,
 	})

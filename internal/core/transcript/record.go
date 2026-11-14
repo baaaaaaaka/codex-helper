@@ -70,6 +70,7 @@ type Event struct {
 	HasLast  bool   // TurnComplete carried a non-null last_agent_message
 	Meta     *SessionMeta
 	Info     *InfoUpdate // turn_context, thread_goal_updated, thread_settings_applied
+	Schedule *Schedule   // host-marked scheduled input, not inferred from text
 }
 
 // InfoUpdate is what a record says of the thread's goal and model
@@ -284,6 +285,9 @@ func Parse(line []byte) Event {
 		switch p.Role {
 		case "user":
 			ev.Kind = KindUserMessage
+			if len(p.Content) == 1 && p.Content[0].Type == "input_text" {
+				ev.Schedule = heartbeat(env.Payload, ev.Text)
+			}
 		case "assistant":
 			ev.Kind = KindAgentMessage
 			if p.Delivery == "async" {
@@ -297,6 +301,7 @@ func Parse(line []byte) Event {
 	switch p.Type {
 	case "task_started":
 		ev.Kind = KindTurnStarted
+		ev.Schedule = scheduledTurn(env.Payload, p.TurnID)
 	case "task_complete":
 		ev.Kind = KindTurnComplete
 		if p.LastAgentMessage != nil {

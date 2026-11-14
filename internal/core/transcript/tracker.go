@@ -38,9 +38,10 @@ type Output struct {
 	Text           string
 	Time           time.Time
 	TurnID         string
-	End            int64 // end offset of the record
-	Info           Info  // the thread's goal and settings when the record was released
-	line           int64 // 1-based line of the record (ids of id-less records)
+	End            int64     // end offset of the record
+	Info           Info      // the thread's goal and settings when the record was released
+	Schedule       *Schedule // evidence for this output's turn only
+	line           int64     // 1-based line of the record (ids of id-less records)
 	start          int64
 }
 
@@ -134,6 +135,8 @@ func (t *Tracker) stamp(out []Output, from int) {
 }
 
 type openTurn struct {
+	schedule        *Schedule
+	humanInput      bool
 	id              string
 	clientID        string
 	started         bool // its start record was read (not a scan that began mid-turn)
@@ -362,26 +365,47 @@ func (t *Tracker) apply(out []Output, ev Event, l Line) []Output {
 		}
 	case KindTurnStarted:
 		if t.turn != nil && ev.TurnID != "" && t.turn.id == ev.TurnID {
+			if ev.Schedule != nil && t.turn.schedule == nil {
+				t.turn.schedule = ev.Schedule
+			}
 			return out // turn_context after task_started
 		}
 		out = t.end(out)
 		t.turn = &openTurn{id: ev.TurnID, started: true, start: l.Off, startLine: t.line - 1,
-			teams: ev.TurnID != "" && t.skip("", ev.TurnID)}
+			teams: ev.TurnID != "" && t.skip("", ev.TurnID), schedule: ev.Schedule}
 	case KindUserMessage:
 		text := strings.TrimSpace(ev.Text)
-		if text == "" || IsBoilerplate(text) {
+		if text == "" || ev.Schedule == nil && IsBoilerplate(text) {
 			return out
 		}
 		if t.turn == nil {
 			// A prompt without a turn record (very old rollouts): its own turn.
 			t.turn = &openTurn{started: true, start: l.Off, startLine: t.line - 1}
 		}
+		if ev.Schedule != nil {
+			s := *ev.Schedule
+			s.Mixed = t.turn.humanInput || t.turn.schedule != nil && (t.turn.schedule.Mixed || t.turn.schedule.ID != "" && t.turn.schedule.ID != s.ID)
+			t.turn.schedule = &s
+		} else {
+			if t.turn.schedule == nil {
+				t.turn.humanInput = true
+			}
+			if t.turn.schedule != nil && t.turn.prompted {
+				t.turn.schedule.Mixed = true
+			}
+		}
 		if LegacyTeamsPrompt(text) {
 			t.turn.legacyInput = true
 		}
+		scheduleInput := ev.Schedule != nil || t.turn.schedule != nil && !t.turn.prompted
 		t.turn.prompted = true
 		t.turn.decided, t.turn.early = false, false
 		o := Output{helperInput: LegacyTeamsPrompt(text), RecordID: ev.RecordID, Kind: OutputPrompt, User: true, Text: text, Time: ev.Time, End: l.End, line: t.line, start: l.Off}
+		if t.turn.schedule != nil {
+			s := *t.turn.schedule
+			s.Input = scheduleInput
+			o.Schedule = &s
+		}
 		out = t.add(out, o, t.turn)
 	case KindUserItem:
 		tr := t.turn
@@ -558,6 +582,10 @@ func (t *Tracker) end(out []Output) []Output {
 func resolve(o Output, tr *openTurn) Output {
 	if tr != nil {
 		o.TurnID = tr.id
+		if tr.schedule != nil && o.Kind != OutputPrompt && o.Schedule == nil {
+			s := *tr.schedule
+			o.Schedule = &s
+		}
 	}
 	if o.RecordID == "" {
 		o.RecordID = turnRecordID(o.TurnID, o.Kind, o.line)

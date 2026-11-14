@@ -134,6 +134,9 @@ type runState struct {
 	switching    bool
 	// lastEvent is the unix ms of the last Codex event (silence tracking).
 	lastEvent atomic.Int64
+	// Native wait evidence, guarded by Engine.mu; zero for ordinary turns.
+	waitID    string
+	waitUntil time.Time
 	done      chan struct{}
 	// request is the delegation request text of a delegated turn ("" for
 	// an ordinary turn).

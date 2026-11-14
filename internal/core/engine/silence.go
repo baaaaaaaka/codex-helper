@@ -37,6 +37,7 @@ func (e *Engine) watchSilence(ctx context.Context, cs *convState, tr store.Turn,
 		var lastHint time.Time
 		hints := 0
 		stuck := false
+		waitHint := false
 		for {
 			select {
 			case <-stop:
@@ -46,10 +47,19 @@ func (e *Engine) watchSilence(ctx context.Context, cs *convState, tr store.Turn,
 			case <-tick.C:
 			}
 			now := e.now()
-			last := rs.lastEvent.Load()
 			e.mu.Lock()
 			waiting := e.questionWaiting[cs.id]
+			waitUntil, waitSeen := rs.waitUntil, rs.waitID != ""
+			last := rs.lastEvent.Load()
 			e.mu.Unlock()
+			if !waitUntil.IsZero() {
+				if now.Before(waitUntil) {
+					continue
+				}
+				if ms(waitUntil) > last {
+					last = ms(waitUntil)
+				}
+			}
 			if waiting {
 				last = ms(now)
 				rs.lastEvent.Store(last)
@@ -58,6 +68,22 @@ func (e *Engine) watchSilence(ctx context.Context, cs *convState, tr store.Turn,
 				activityEpisode, lastHint, hints, stuck = last, time.Time{}, 0, false
 			}
 			quiet := now.Sub(fromMS(last))
+			// Only explicit native waits use the quieter policy. Ordinary turns
+			// retain the existing repeated hints, wording and thresholds.
+			if waitSeen {
+				after := e.t.SilenceHint
+				if after <= 0 {
+					after = e.t.SilenceStuck
+				}
+				if !waitHint && after > 0 && quiet >= after {
+					pending, err := e.st.PendingProgress(cs.id)
+					if err != nil || pending {
+						continue
+					}
+					waitHint = e.silenceNotice(cs.id, fmt.Sprintf("turn:%d:wait-silence", tr.ID), "This run has not reported a result. You can keep waiting, or send `helper cancel running` to stop this run.")
+				}
+				continue
+			}
 			regularDue := e.t.SilenceHint > 0 && quiet >= e.t.SilenceHint && (hints == 0 || (e.t.SilenceRepeat > 0 && now.Sub(lastHint) >= e.t.SilenceRepeat))
 			// Keep the standalone stuck threshold when regular hints or their
 			// repeat cadence are disabled. Otherwise stuck wording uses the next

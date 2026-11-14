@@ -42,6 +42,8 @@ type TurnHooks struct {
 	// Activity is called for every notification about the thread (any
 	// sign of life: deltas, items, token counts), for silence tracking.
 	Activity func()
+	// Waiting reports only native clock.sleep items, scoped to this turn.
+	Waiting func(itemID string, duration time.Duration, started bool)
 	// Retrying is called for each error notification of the turn that
 	// Codex will retry by itself (willRetry: a dropped stream, a
 	// reconnect), with the composed, sanitized message and reason code.
@@ -81,6 +83,12 @@ func (s *Server) RunTurn(ctx context.Context, p TurnStartParams, poll time.Durat
 		// The last unpaired item and legacy notification: one of each
 		// within compactPair is one compaction reported both ways.
 		lastItem, lastLegacy time.Time
+		earlySleep           *struct {
+			turn     string
+			id       string
+			duration time.Duration
+			started  bool
+		}
 	)
 	// Progress. Commentary is posted as it comes. An agent message without
 	// a phase (Codex streams those for models without message phases) may
@@ -148,6 +156,28 @@ func (s *Server) RunTurn(ctx context.Context, p TurnStartParams, poll time.Durat
 			hooks.Compacted()
 		}
 	}
+	sleepItem := func(turn string, it Item, raw json.RawMessage, started bool) {
+		duration, ok := nativeSleepDuration(it, raw)
+		if hooks.Waiting == nil || turn == "" || !ok {
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if turnID == "" {
+			if !p.Queue && candidate == "" || candidate != "" && candidate == turn {
+				earlySleep = &struct {
+					turn     string
+					id       string
+					duration time.Duration
+					started  bool
+				}{turn, it.ID, duration, started}
+			}
+			return
+		}
+		if turnID == turn {
+			hooks.Waiting(it.ID, duration, started)
+		}
+	}
 	unsub := s.Subscribe(p.ThreadID, func(n Notification) {
 		if hooks.Activity != nil {
 			hooks.Activity()
@@ -181,6 +211,13 @@ func (s *Server) RunTurn(ctx context.Context, p TurnStartParams, poll time.Durat
 				}
 			}
 			if n.Method != "item/completed" {
+				if m.Item.Type == "sleep" {
+					sleepItem(m.TurnID, m.Item, n.Params, true)
+				}
+				return
+			}
+			if m.Item.Type == "sleep" {
+				sleepItem(m.TurnID, m.Item, n.Params, false)
 				return
 			}
 			mu.Lock()
@@ -270,6 +307,10 @@ func (s *Server) RunTurn(ctx context.Context, p TurnStartParams, poll time.Durat
 	}
 	mu.Lock()
 	turnID = id
+	if earlySleep != nil && earlySleep.turn == id {
+		hooks.Waiting(earlySleep.id, earlySleep.duration, earlySleep.started)
+	}
+	earlySleep = nil
 	early := append([]Item(nil), items[id]...)
 	mu.Unlock()
 	if hooks.Started != nil {
@@ -315,6 +356,21 @@ func (s *Server) RunTurn(ctx context.Context, p TurnStartParams, poll time.Durat
 			return TurnResult{TurnID: id}, ctx.Err()
 		}
 	}
+}
+
+func nativeSleepDuration(it Item, params json.RawMessage) (time.Duration, bool) {
+	if it.Type != "sleep" || it.ID == "" {
+		return 0, false
+	}
+	var p struct {
+		Item struct {
+			Duration int64 `json:"durationMs"`
+		} `json:"item"`
+	}
+	if json.Unmarshal(params, &p) != nil || p.Item.Duration <= 0 || p.Item.Duration > 43200000 {
+		return 0, false
+	}
+	return time.Duration(p.Item.Duration) * time.Millisecond, true
 }
 
 func (s *Server) turnByID(ctx context.Context, threadID, turnID string) (Turn, bool) {

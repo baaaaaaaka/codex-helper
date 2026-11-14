@@ -1088,8 +1088,14 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 				// A live final: the owner is notified once it is posted
 				// (Workflow card, else a control-chat @mention), as for
 				// a Teams-run final; catch-up finals notify nobody.
-				if err := e.addNotify(tx, pendingNotify{Conv: f.src.ConvID, Key: transcript.MirrorKeyPrefix(thread, r.o.RecordID),
-					Text: clipText(r.o.Text, 400)}); err != nil {
+				text := r.o.Text
+				kind := ""
+				if r.o.Schedule != nil {
+					kind = notifyScheduled
+					text = scheduledLabel(r.o) + "\n" + text
+				}
+				if err := e.addNotify(tx, pendingNotify{Conv: f.src.ConvID, Kind: kind, Key: transcript.MirrorKeyPrefix(thread, r.o.RecordID),
+					Text: clipText(text, 400)}); err != nil {
 					return err
 				}
 			}
@@ -1246,6 +1252,7 @@ func (e *Engine) renderMirror(ctx context.Context, thread string, o transcript.O
 	default:
 		doc = answerDoc(o.Text)
 	}
+	doc = scheduledDoc(doc, o)
 	if live && !o.User && o.Kind != transcript.OutputPrompt {
 		doc.Notes = infoNotes(mirrorInfo(o.Info), o.Kind == transcript.OutputFinal)
 		// Helper-owned progress keeps the runner's live goal annotation.
