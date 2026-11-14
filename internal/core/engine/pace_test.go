@@ -450,6 +450,10 @@ func TestRepliesBeforeProgressWhenWritesArePaced(t *testing.T) {
 	const chats = 12
 	r, _ := backlogRig(t, func(c *Config) {
 		c.WriteRate = 4
+		// One sender makes the observed channel order the admission order.
+		// With several workers a later job can reach Send before an earlier
+		// one, even though the sender admitted the higher-priority job first.
+		c.Senders = 1
 		c.Channel.(*channeltest.Fake).SendFault = func(_ string, p channel.Part) (bool, error) {
 			mu.Lock()
 			order = append(order, p.Body)
@@ -485,6 +489,61 @@ func TestRepliesBeforeProgressWhenWritesArePaced(t *testing.T) {
 				t.Fatalf("%d progress messages went before a final under a short write budget; order:\n%s", progress, strings.Join(order, "\n"))
 			}
 		}
+	}
+}
+
+// A foreground writer waiting for the account budget takes the next token
+// ahead of the background sender. Hold the writer after it registers, then
+// make a token available; this checks the admission decision independently
+// of the order in which concurrent channel workers happen to start.
+func TestWaitingWriterGetsNextWriteToken(t *testing.T) {
+	clk := &testClock{t: time.Unix(1000, 0)}
+	e := priorityEngine()
+	e.writeTokens = newPacer(1, time.Minute, clk.now)
+	if ok, _ := e.writeTokens.take(); !ok {
+		t.Fatal("initial token unavailable")
+	}
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var first, releaseOnce sync.Once
+	e.now = func() time.Time {
+		first.Do(func() {
+			close(entered)
+			<-release
+		})
+		return clk.now()
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- e.waitWrite(ctx) }()
+	defer func() {
+		cancel()
+		releaseOnce.Do(func() { close(release) })
+		if done != nil {
+			<-done
+		}
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("foreground writer did not enter")
+	}
+	clk.add(time.Second)
+	if ok, _ := e.takeWrite(); ok {
+		t.Fatal("background sender took a token while a foreground writer was waiting")
+	}
+	releaseOnce.Do(func() { close(release) })
+	select {
+	case err := <-done:
+		done = nil
+		if err != nil {
+			t.Fatalf("foreground writer: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("foreground writer did not receive the token")
+	}
+	if ok, _ := e.takeWrite(); ok {
+		t.Fatal("foreground writer did not consume the token")
 	}
 }
 

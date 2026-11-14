@@ -244,3 +244,30 @@ audit led to separate optional parsing and smaller output metadata.
   and live Teams delivery remain unverified. Cross-platform vet is not native
   Windows/macOS execution. GitHub CI has not been triggered for this unsubmitted
   worktree.
+
+## Write-priority test follow-up
+
+PR CI run 43613467156 failed two existing macOS pacing tests: a progress
+worker reached the fake channel before a previously admitted final, and five
+catch-up chat creations were observed after the `new` command was received.
+The sender admits jobs in priority order but runs up to eight channel workers
+concurrently; observed channel call order is not the same as admission order.
+The interval from receiving a command also includes command processing before
+the foreground writer begins waiting for a token.
+
+The final-versus-progress test now uses one sender so the channel order checks
+the actual admission order. The chat-creation test keeps concurrent senders
+and treats the configured sender count as a responsiveness budget, rather than
+claiming that the observed count proves exact priority. A new controlled test
+pauses a registered foreground writer, makes a token available, and verifies
+that the background sender cannot take it and the foreground writer does.
+Other tests continue to exercise concurrent sender pacing.
+
+On Linux, the controlled test passed 20 times with the race detector; the two
+end-to-end pacing tests passed 15 times. In a separate disposable worktree,
+removing the foreground-waiter check made the controlled test fail, and
+reversing the final/progress classes made the single-sender test fail. Removing
+the foreground-waiter check did not make the chat-creation integration test
+fail in one trial; the controlled test, not that timing-dependent trial, is
+the evidence for the exact next-token guarantee. Native macOS behavior requires
+the PR CI run.

@@ -225,9 +225,12 @@ func TestRepliesBeforeCatchUpChatCreation(t *testing.T) {
 	r.ch.PostUser(ctl, "new "+dir)
 	r.waitFor("work chat", 20*time.Second, func() bool { return w.createdBefore("livework") >= 0 })
 	// Count from delivery to the helper: it cannot prioritize a command
-	// still waiting on the fake server. Allow the writes already in flight.
-	if n := int64(w.createdBefore("livework")) - before.Load(); before.Load() < 0 || n > 3 {
-		t.Fatalf("%d catch-up chats were created after receiving `new` and before its chat (read baseline %d)", n, before.Load())
+	// still waiting on the fake server. Allow the configured worker count
+	// for concurrent writes and command processing. This is a responsiveness
+	// check, not an exact admission-order bound; the controlled
+	// TestWaitingWriterGetsNextWriteToken checks the next-token guarantee.
+	if n := int64(w.createdBefore("livework")) - before.Load(); before.Load() < 0 || n > int64(r.e.cfg.Senders) {
+		t.Fatalf("%d catch-up chats were created after receiving `new` and before its chat (read baseline %d; %d senders)", n, before.Load(), r.e.cfg.Senders)
 	}
 	r.wait("work chat created", func() bool { return len(r.own(ctl, "Work chat created")) == 1 })
 	var work string
