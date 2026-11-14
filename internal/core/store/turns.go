@@ -209,6 +209,13 @@ func (t *Tx) FinishTurn(turnID int64, state, errText string, outputs []OutMsg) e
 		`state = ?, finished_at = ?, error = ?`, state, t.now, nullStr(errText)); err != nil {
 		return err
 	}
+	// Close live retry ownership atomically with the result/outbox. Recovery
+	// probes retain their distinct observations (including still-active).
+	if _, err := t.exec(`UPDATE turn_recovery SET retry_owner='none', decision=?,
+        observation=?, observed_at=?, next_attempt_at=0
+        WHERE turn_id=? AND decision IN ('observe','retry')`, state, state, t.now, turnID); err != nil {
+		return err
+	}
 	if tr.InboundID != 0 {
 		if _, err := t.exec(`UPDATE inbound SET state = 'done' WHERE id = ? AND state IN ('queued','held')`, tr.InboundID); err != nil {
 			return err

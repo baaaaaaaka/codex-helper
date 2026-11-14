@@ -36,6 +36,8 @@ type Agent struct {
 	titleCancel      context.CancelFunc
 	titleConv        int64
 	closed           bool
+	prepared         bool
+	stopped          map[int64]bool
 	mu               sync.Mutex
 	tuiThreads       map[string]int
 	attached         map[int64]int
@@ -72,6 +74,7 @@ func New(cfg Config) *Agent {
 		cfg:        cfg,
 		pool:       codex.NewPool(codex.PoolConfig{Idle: cfg.Idle, PIDFile: cfg.PIDFile, Log: cfg.Log}),
 		running:    map[int64]*runningTurn{},
+		stopped:    map[int64]bool{},
 		attached:   map[int64]int{},
 		tuiThreads: map[string]int{},
 	}
@@ -104,7 +107,14 @@ func (a *Agent) Prepare(ctx context.Context) error {
 	if a.cfg.PIDFile == "" {
 		return nil
 	}
+	a.mu.Lock()
+	a.prepared = false
+	a.mu.Unlock()
+	hadRegistry := codex.HasManagedPIDState(a.cfg.PIDFile)
 	n, err := codex.KillStale(a.cfg.PIDFile, 15*time.Second)
+	a.mu.Lock()
+	a.prepared = err == nil && hadRegistry
+	a.mu.Unlock()
 	if n > 0 {
 		fmt.Fprintf(a.cfg.Log, "codexagent: killed %d app-server(s) left by the previous helper\n", n)
 	}
@@ -123,6 +133,9 @@ func (a *Agent) serverConfig(cwd string) codex.Config {
 // Run executes one turn, on an app-server that read the current Codex
 // config (Pool.AcquireCurrent).
 func (a *Agent) Run(ctx context.Context, req engine.TurnRequest, hooks engine.TurnHooks) (engine.TurnOutcome, error) {
+	a.mu.Lock()
+	delete(a.stopped, req.ConvID)
+	a.mu.Unlock()
 	lease, err := a.pool.AcquireCurrent(ctx, key(req.ConvID), a.serverConfig(req.Cwd))
 	if err != nil {
 		if ctx.Err() != nil {
@@ -243,7 +256,7 @@ func (a *Agent) Run(ctx context.Context, req engine.TurnRequest, hooks engine.Tu
 			}
 		}
 		a.dropUnshared(req.ConvID)
-		return engine.TurnOutcome{CodexTurnID: res.TurnID}, engine.ErrUnknownOutcome
+		return engine.TurnOutcome{CodexTurnID: res.TurnID, ResumeAfterInterruption: a.rememberStopped(req.ConvID, srv), Error: srv.ExitReason()}, engine.ErrUnknownOutcome
 	case err != nil:
 		if a.cfg.Server.SharedDir != "" {
 			return engine.TurnOutcome{CodexTurnID: res.TurnID}, fmt.Errorf("%w: %v", engine.ErrBackendUncertain, err)
@@ -252,7 +265,7 @@ func (a *Agent) Run(ctx context.Context, req engine.TurnRequest, hooks engine.Tu
 		// process group before the engine looks the turn up, so the turn
 		// cannot go on and the next turn never runs beside it.
 		a.dropUnshared(req.ConvID)
-		return engine.TurnOutcome{CodexTurnID: res.TurnID}, fmt.Errorf("%w: %v", engine.ErrUnknownOutcome, err)
+		return engine.TurnOutcome{CodexTurnID: res.TurnID, ResumeAfterInterruption: a.rememberStopped(req.ConvID, srv), Error: err.Error()}, fmt.Errorf("%w: %v", engine.ErrUnknownOutcome, err)
 	}
 	return outcome(res.TurnID, res.Status, res.Final, res.Err, res.Usage), nil
 }
@@ -280,8 +293,10 @@ func outcome(turnID, status, final string, terr *codex.TurnError, u *codex.Usage
 		o.Status = engine.StatusInterrupted
 	case codex.StatusInProgress:
 		o.Status = engine.StatusInProgress
-	default:
+	case codex.StatusFailed:
 		o.Status = engine.StatusFailed
+	default:
+		o.Status = engine.StatusUnknown
 	}
 	if terr != nil {
 		o.Error = terr.Message
@@ -684,4 +699,23 @@ func (a *Agent) ModelSwitchAllowed(convID int64) bool {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.attached[convID] == 0
+}
+
+func (a *Agent) rememberStopped(convID int64, srv *codex.Server) bool {
+	stopped := srv.Exited()
+	if stopped {
+		a.mu.Lock()
+		a.stopped[convID] = true
+		a.mu.Unlock()
+	}
+	return stopped
+}
+
+// RecoveryExecutorStopped excludes active native/TUI execution. Startup needs
+// retained process evidence; a live failure can attest its own executor's exit.
+func (a *Agent) RecoveryExecutorStopped(convID int64) bool {
+	a.mu.Lock()
+	ready := (a.prepared || a.stopped[convID]) && a.cfg.PIDFile != "" && a.attached[convID] == 0 && a.running[convID] == nil
+	a.mu.Unlock()
+	return ready && a.pool.Peek(key(convID)) == nil
 }

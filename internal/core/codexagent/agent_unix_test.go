@@ -74,7 +74,7 @@ func TestUnknownStartErrorKillsTheServer(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	var pid int
-	_, err = a.Run(ctx, engine.TurnRequest{ConvID: 1, Cwd: home, TurnKey: "k-1", Text: "hello"}, engine.TurnHooks{
+	out, err := a.Run(ctx, engine.TurnRequest{ConvID: 1, Cwd: home, TurnKey: "k-1", Text: "hello"}, engine.TurnHooks{
 		ThreadStarted: func(string) error {
 			db, err := sqlitestate.Open(pidFile+".sqlite", true)
 			if err != nil {
@@ -86,6 +86,9 @@ func TestUnknownStartErrorKillsTheServer(t *testing.T) {
 	})
 	if !errors.Is(err, engine.ErrUnknownOutcome) {
 		t.Fatalf("Run: %v, want ErrUnknownOutcome", err)
+	}
+	if !out.ResumeAfterInterruption || out.Error == "" || !a.RecoveryExecutorStopped(1) {
+		t.Fatalf("stopped executor did not preserve recovery evidence: %+v", out)
 	}
 	if pid == 0 {
 		t.Fatal("no app-server pid recorded")

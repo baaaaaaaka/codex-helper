@@ -43,6 +43,9 @@ run_tests() {
 
 case "$mode" in
   unit)
+    run_tests ./internal/core/store '^TestRecovery' 'TestRecoveryEvidenceBoundedAtomicAndDurable,TestRecoveryPointReadsDoNotWrite,TestRecoveryBudgetAndCancelSurviveProbeAndReopen' 1
+    run_tests ./internal/core/engine '^TestRecovery' 'TestRecoveryCancelDuringLookupIsRetained,TestRecoveryCodexOwnsRetryUntilTerminal,TestRecoveryRestartRetainsRejectedBackoff,TestRecoveryRestartSettlesByEvidence,TestRecoveryUnconfirmedNeverRetries,TestRecoveryStoppedExecutorContinuesWithWarning,TestRecoveryCommittedCancelSurvivesBeforeInterrupt,TestRecoveryInterruptionBudgetStopsRepeatedCrashes,TestRecoveryQueuedContinuationHonorsCancelAndThreadChange' 1
+    run_tests ./internal/core/codexagent '^TestRecovery' 'TestRecoveryMissingRegistryDoesNotProveExecutorStopped,TestRecoveryAttachedOrRunningExecutorBlocksContinuation,TestRecoveryUnknownStatusDoesNotBecomeRetryableFailure' 1
     run_tests ./internal/core/store '^TestPublishedCoreStore' 'TestPublishedCoreStoreNeverInitializesLostSchema' 1
     run_tests ./internal/helperruntime '^TestSQLiteBootstrap' 'TestSQLiteBootstrapPublishedLossIsNotFreshInstall,TestSQLiteBootstrapExplicitMigrationDropsIncompatibleRollback,TestSQLiteBootstrapMigrationFailurePreservesLegacy,TestSQLiteBootstrapAutomaticUpdateRequiresExplicitMigration,TestSQLiteBootstrapRetryAfterCommittedBeforeArchive' 1
     run_tests ./internal/cli '^TestTeamsExchangeSQLite' 'TestTeamsExchangeSQLiteAtomicCompletionAndConditionalAck,TestTeamsExchangeSQLiteLegacyAtomicMigration' 1

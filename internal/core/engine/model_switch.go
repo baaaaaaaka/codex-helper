@@ -429,6 +429,10 @@ func turnOutputKey(tr store.Turn) string {
 // cancelModelHandoff also recognizes the interval with no native running turn.
 // Queue-only cancellation never calls it.
 func (e *Engine) cancelModelHandoff(tx *store.Tx, cs *convState, target store.Turn) (bool, error) {
+	// Commit cancellation with the command reply, before native interruption.
+	if err := tx.RequestRecoveryCancel(target.ID); err != nil {
+		return false, err
+	}
 	sw, yes, err := tx.ModelSwitch(cs.id)
 	if err != nil {
 		return false, err

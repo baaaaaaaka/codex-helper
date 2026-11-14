@@ -224,6 +224,20 @@ func (s *Server) Exited() bool {
 	}
 }
 
+// ExitReason is a process-exit diagnostic, not an OOM diagnosis. In particular
+// a SIGKILL can have many causes. Never manufacture an OOM label from it.
+func (s *Server) ExitReason() string {
+	if !s.Exited() {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.exitErr == nil {
+		return ""
+	}
+	return s.exitErr.Error()
+}
+
 func (s *Server) initialize(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()

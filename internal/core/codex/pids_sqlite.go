@@ -18,6 +18,19 @@ func pidDatabasePath(path string) string {
 	}
 	return path + ".sqlite"
 }
+
+// HasManagedPIDState distinguishes an empty but retained registry from lost
+// process evidence. Absence must not authorize post-crash task continuation.
+func HasManagedPIDState(path string) bool {
+	if path == "" {
+		return false
+	}
+	if _, err := os.Stat(pidDatabasePath(path)); err == nil {
+		return true
+	}
+	_, err := os.Stat(legacyPIDPath(path))
+	return err == nil
+}
 func openPIDDatabase(path string) (*sql.DB, error) {
 	native := pidDatabasePath(path)
 	if err := os.MkdirAll(filepath.Dir(native), 0700); err != nil {

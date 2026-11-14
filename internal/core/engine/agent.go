@@ -163,14 +163,24 @@ const (
 	StatusFailed      = "failed"
 	StatusInterrupted = "interrupted"
 	StatusInProgress  = "inProgress"
+	StatusUnknown     = "unknown"
 )
+
+// RecoveryAgent confirms the previous managed executor has stopped. This is
+// not proof about remote jobs or external side effects; the recovery prompt
+// explicitly asks the model to reconcile those before continuing.
+type RecoveryAgent interface {
+	RecoveryExecutorStopped(convID int64) bool
+}
 
 // TurnOutcome is how a turn ended (or what Lookup found).
 type TurnOutcome struct {
-	CodexTurnID string
-	Status      string
-	Final       string
-	Error       string
+	// ResumeAfterInterruption marks a transport/process interruption, not a user cancellation.
+	ResumeAfterInterruption bool
+	CodexTurnID             string
+	Status                  string
+	Final                   string
+	Error                   string
 	// Capacity marks a model-capacity failure (retried within 5 minutes).
 	Capacity bool
 	// ReconnectExhausted marks a terminal network connection failure

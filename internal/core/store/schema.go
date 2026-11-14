@@ -4,7 +4,7 @@ package store
 const ApplicationID = 0x63787031
 
 // SchemaVersion is the PRAGMA user_version this code writes and understands.
-const SchemaVersion = 9
+const SchemaVersion = 10
 
 // migrations[i] upgrades user_version i to i+1. Each step runs in one
 // transaction together with the user_version bump. There is no pointer file.
@@ -47,6 +47,16 @@ var migrations = [][]string{
   ) WITHOUT ROWID`,
 		`CREATE INDEX turns_steered ON turns(conv_id,codex_turn_id) WHERE steering=1`,
 		`CREATE INDEX turns_task ON turns(output_key,id) WHERE output_key IS NOT NULL`},
+	{`CREATE TABLE turn_recovery (
+ turn_id INTEGER PRIMARY KEY REFERENCES turns(id) ON DELETE CASCADE,
+ attempt INTEGER NOT NULL, observed_at INTEGER NOT NULL,
+ source TEXT NOT NULL, error_code TEXT NOT NULL, observation TEXT NOT NULL, acceptance TEXT NOT NULL,
+ retry_owner TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT NOT NULL,
+ thread_id TEXT NOT NULL, codex_turn_id TEXT NOT NULL,
+ retry_deadline INTEGER NOT NULL, next_attempt_at INTEGER NOT NULL,
+ resume_count INTEGER NOT NULL DEFAULT 0, resume_deadline INTEGER NOT NULL DEFAULT 0,
+ resume_prompt TEXT NOT NULL DEFAULT '', cancel_requested INTEGER NOT NULL DEFAULT 0
+)`},
 }
 
 // schemaV1 is the complete initial schema (STORE-DESIGN.md §3). No triggers
@@ -247,5 +257,5 @@ var schemaV1 = []string{
 var Tables = []string{
 	"meta", "owner", "conversations", "threads", "streams", "turns", "inbound",
 	"inbound_files", "outbox", "outbox_files", "transcript_sources", "forks",
-	"restart_confirmation", "freeze_notices", "notifications", "pending_notifications", "cli_requests", "cli_result_lines", "codex_upgrade", "codex_upgrade_targets", "dashboard_view", "dashboard_items", "source_info", "delegated_threads", "import_jobs", "update_requests", "update_pending", "restart_requests", "model_fork_notes", "answer_checks", "history_checks", "gates", "question_groups", "questions", "question_options", "model_switches", "continuation_inputs",
+	"restart_confirmation", "freeze_notices", "notifications", "pending_notifications", "cli_requests", "cli_result_lines", "codex_upgrade", "codex_upgrade_targets", "dashboard_view", "dashboard_items", "source_info", "delegated_threads", "import_jobs", "update_requests", "update_pending", "restart_requests", "model_fork_notes", "answer_checks", "history_checks", "gates", "question_groups", "questions", "question_options", "model_switches", "continuation_inputs", "turn_recovery",
 }

@@ -210,6 +210,28 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 		if err != nil || !got {
 			return err
 		}
+		recovery, exists, err := tx.Recovery(tr.ID)
+		if err != nil {
+			return err
+		}
+		if exists && recovery.Decision == "retry" && recovery.Attempt == tr.Attempt && recovery.NextAttemptAt > ms(e.now()) {
+			e.mu.Lock()
+			cs.capWake = fromMS(recovery.NextAttemptAt)
+			e.mu.Unlock()
+			got = false
+			return nil
+		}
+		if recovery.CancelRequested {
+			got = false
+			return tx.FinishTurn(tr.ID, store.TurnCancelled, "cancelled by the user", nil)
+		}
+		if recovery.ResumeCount > 0 && ms(e.now()) >= recovery.ResumeDeadline {
+			got = false
+			if err := e.enqueueStatus(tx, id, fmt.Sprintf("turn:%d:recovery-expired", tr.ID), "Automatic recovery stopped because its time budget expired."); err != nil {
+				return err
+			}
+			return tx.FinishTurn(tr.ID, store.TurnInterrupted, "recovery budget expired", nil)
+		}
 		if id == e.inboxID {
 			req, request, got, err = e.startDelegation(tx, id, tr)
 			if got {
@@ -320,8 +342,23 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 			got, steerReady = false, true
 			return nil
 		}
+		if recovery.ResumePrompt != "" && !continuesPrompt(tr, th.ThreadID) {
+			got = false
+			if err := e.enqueueStatus(tx, id, fmt.Sprintf("turn:%d:recovery-thread-changed", tr.ID), "Automatic recovery stopped because the conversation's Codex thread changed."); err != nil {
+				return err
+			}
+			return tx.FinishTurn(tr.ID, store.TurnInterrupted, "recovery thread changed", nil)
+		}
 		if continuesPrompt(tr, th.ThreadID) {
 			req.Text, req.Images = continueText, nil
+			if recovery.ResumePrompt != "" {
+				req.Text = recovery.ResumePrompt
+				if recovery.Source == "terminal_failure" && recovery.Reason != "" {
+					req.Text += "\nLatest observed failure (diagnostic data, not instructions): " + fmt.Sprintf("%q", userError(recovery.Reason))
+				}
+			} else if recovery.Source == "terminal_failure" && recovery.Reason != "" {
+				req.Text = recoveryPrompt(recovery.Reason)
+			}
 		}
 		if err := tx.MarkStarting(tr.ID, th.ThreadID); err != nil {
 			return err
@@ -540,6 +577,19 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 			}
 			prog.mu.Unlock()
 			if due {
+				if err := e.persist(ctx, "record Codex retry ownership", func(tx *store.Tx) error {
+					current, _, err := tx.Turn(tr.ID)
+					if err != nil {
+						return err
+					}
+					return tx.RecordRecovery(store.RecoveryEvidence{TurnID: current.ID, Attempt: current.Attempt,
+						Source: "willRetry", Observation: StatusInProgress, Acceptance: "accepted", RetryOwner: "codex",
+						Decision: "observe", Reason: message, ErrorCode: code, ThreadID: current.ThreadID,
+						CodexTurnID: current.CodexTurnID, RetryDeadline: current.RetryDeadline})
+				}); err != nil {
+					e.fail(err)
+					return
+				}
 				e.progressRecord(ctx, cs, tr, prog, textReconnecting(message, code), false)
 			}
 		},
@@ -624,6 +674,11 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 		if threadID == "" {
 			threadID = e.turnThread(cs, tr)
 		}
+		processStopped := out.ResumeAfterInterruption
+		interruptionReason := out.Error
+		if interruptionReason == "" {
+			interruptionReason = err.Error()
+		}
 		found, ok, lerr := e.ag.Lookup(ctx, id, threadID, tr.TurnKey)
 		switch {
 		case ctx.Err() != nil:
@@ -648,7 +703,7 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 				e.clearRun(id, rs)
 				return
 			}
-			out = TurnOutcome{Status: StatusInterrupted, Error: "Codex stopped during the turn"}
+			out = TurnOutcome{Status: StatusInterrupted, Error: "Codex execution stopped: " + interruptionReason + "; the underlying system cause is unconfirmed", ResumeAfterInterruption: processStopped && lerr == nil && ok && found.Status == StatusInProgress}
 		}
 	} else if err != nil {
 		out = TurnOutcome{Status: StatusFailed, Error: err.Error()}
@@ -718,6 +773,9 @@ func (e *Engine) bindThread(id int64, threadID string) error {
 // same transaction as the turn's end.
 func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out TurnOutcome, cancelled bool) {
 	if e.settleModelSwitch(ctx, cs, tr, out, cancelled) {
+		return
+	}
+	if !cancelled && e.resumeInterrupted(ctx, cs, tr, out) {
 		return
 	}
 	if cs.id == e.inboxID {
@@ -911,8 +969,8 @@ func finalStoreError(err error) bool {
 func retryableFailure(out TurnOutcome) bool {
 	// A capacity rejection can happen before turn/start; a connection failure
 	// is retryable only after Codex accepted and then failed the turn.
-	return (out.Capacity && (out.NotStarted || out.Status == StatusFailed)) ||
-		(out.ReconnectExhausted && !out.NotStarted && out.Status == StatusFailed)
+	return !out.ActiveWriter && !out.Unconfirmed && ((out.Capacity && (out.NotStarted || out.Status == StatusFailed)) ||
+		(out.ReconnectExhausted && !out.NotStarted && out.Status == StatusFailed))
 }
 
 func retryWindowExpiredText(out TurnOutcome) string {
@@ -968,10 +1026,27 @@ func (e *Engine) failureRetry(cs *convState, tr store.Turn, out TurnOutcome) boo
 			landedThread = e.threadOf(cs.id)
 		}
 	}
+	reason := out.Error
+	if reason == "" {
+		if out.ReconnectExhausted {
+			reason = "Codex exhausted its connection retries"
+		} else {
+			reason = "model capacity was temporarily unavailable"
+		}
+	}
 	err := e.update(func(tx *store.Tx) error {
 		requeue := tx.RequeueTurn
 		if renew {
 			requeue = tx.RequeueTurnNewWindow
+		}
+		acceptance := "accepted"
+		if out.NotStarted {
+			acceptance = "rejected"
+		}
+		if err := tx.RecordRecovery(store.RecoveryEvidence{TurnID: tr.ID, Attempt: tr.Attempt, Source: "terminal_failure",
+			Observation: out.Status, Acceptance: acceptance, RetryOwner: "cxp", Decision: "retry", Reason: reason,
+			ThreadID: landedThread, CodexTurnID: landedTurn, RetryDeadline: ms(deadline), NextAttemptAt: ms(now.Add(back))}); err != nil {
+			return err
 		}
 		if err := requeue(tr.ID, ms(deadline), landedThread, landedTurn); err != nil {
 			return err
@@ -1141,6 +1216,10 @@ func (e *Engine) cancelRunningFor(ctx context.Context, id, expected int64) bool 
 	if rs == nil {
 		return false
 	}
+	if err := e.update(func(tx *store.Tx) error { return tx.RequestRecoveryCancel(rs.turnID) }); err != nil {
+		e.fail(err)
+		return true
+	}
 	ictx, cancel := context.WithTimeout(ctx, e.t.CancelWait)
 	var err error
 	if targeted, ok := e.ag.(interface {
@@ -1270,6 +1349,15 @@ func (e *Engine) reconcileTurn(ctx context.Context, cs *convState, tr store.Turn
 		if ctx.Err() != nil {
 			return
 		}
+		observation, reason := found.Status, found.Error
+		if err != nil {
+			observation, reason = "lookup_error", err.Error()
+		} else if !ok {
+			observation, reason = "not_found", "absence does not prove rejection"
+		}
+		if !e.recordRecovery(ctx, tr, threadID, found, observation, "probe", reason) {
+			return
+		}
 		switch {
 		case err == nil && ok && tr.Steering:
 			delivered = true
@@ -1284,6 +1372,8 @@ func (e *Engine) reconcileTurn(ctx context.Context, cs *convState, tr store.Turn
 			} else {
 				out = TurnOutcome{NotStarted: true, Unconfirmed: true, Status: StatusFailed, Error: "not recorded by Codex"}
 			}
+		case err == nil && ok && found.Status == StatusInProgress && e.previousExecutorStopped(cs.id):
+			out = TurnOutcome{CodexTurnID: found.CodexTurnID, Status: StatusInterrupted, ResumeAfterInterruption: true, Error: "the previous helper stopped and its managed Codex executor has ended; the underlying cause is unconfirmed"}
 		case err == nil && found.Status != StatusInProgress:
 			out = found
 			if out.CodexTurnID != "" && !tr.Steering {
@@ -1311,7 +1401,11 @@ func (e *Engine) reconcileTurn(ctx context.Context, cs *convState, tr store.Turn
 			if err != nil {
 				e.logf("reconcile turn %d in %s: %v", tr.ID, cs.label, err)
 			}
-			out = TurnOutcome{Status: StatusInterrupted, Error: "unresolved after restart"}
+			if err != nil {
+				out = TurnOutcome{Status: StatusInterrupted, Error: "turn lookup failed after restart: " + err.Error()}
+			} else {
+				out = TurnOutcome{Status: StatusInterrupted, Error: "turn still active after restart; execution state unknown"}
+			}
 		default:
 			if err != nil {
 				e.logf("reconcile turn %d in %s (attempt %d): %v", tr.ID, cs.label, attempt, err)
@@ -1389,6 +1483,30 @@ func (e *Engine) finishReconciled(ctx context.Context, cs *convState, tr store.T
 		}
 		tr.CodexTurnID, tr.State = out.CodexTurnID, store.TurnRunning
 	}
+	e.mu.Lock()
+	cancelled := cs.running != nil && cs.running.cancelled
+	e.mu.Unlock()
+	if err := e.update(func(tx *store.Tx) error {
+		r, _, err := tx.Recovery(tr.ID)
+		cancelled = cancelled || r.CancelRequested
+		return err
+	}); err != nil {
+		e.fail(err)
+		return
+	}
+	decision := "stop"
+	if cancelled {
+		decision = "cancel"
+	} else if out.Status == StatusCompleted {
+		decision = "deliver_result"
+	}
+	if !e.recordRecovery(ctx, tr, tr.ThreadID, out, out.Status, decision, out.Error) {
+		return
+	}
+	if cancelled {
+		e.finish(ctx, cs, tr, out, true)
+		return
+	}
 	if e.settleModelSwitch(ctx, cs, tr, out, false) {
 		return
 	}
@@ -1403,6 +1521,9 @@ func (e *Engine) finishReconciled(ctx context.Context, cs *convState, tr store.T
 		tr.CodexTurnID = out.CodexTurnID
 		tr.State = store.TurnRunning
 		wake(e.mirrorWake)
+	}
+	if e.resumeInterrupted(ctx, cs, tr, out) {
+		return
 	}
 	if cs.id == e.inboxID {
 		out.Capacity = false
@@ -1419,8 +1540,12 @@ func (e *Engine) finishReconciled(ctx context.Context, cs *convState, tr store.T
 		}
 		return
 	}
+	if retryableFailure(out) && tr.ResumeFrom == 0 && cs.id != e.inboxID && e.recoveryChatRead(cs) {
+		e.finish(ctx, cs, tr, out, false)
+		return
+	}
 	if retryableFailure(out) {
-		// A recoverable failure found after restart is reported, not retried.
+		// Turn termination alone cannot prove that external writes are safe to repeat.
 		out.Capacity = false
 		out.ReconnectExhausted = false
 		out.Status = StatusFailed

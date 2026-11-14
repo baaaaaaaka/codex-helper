@@ -89,11 +89,11 @@ func TestCapacityRetryWithinFiveMinutes(t *testing.T) {
 
 // mirroredContinue matches a mirrored Codex prompt ("🧑‍💻 User: …") that is
 // the `continue` retry.
-var mirroredContinue = regexp.MustCompile(`(?is)\bUser\b\W*continue\b`)
+var mirroredContinue = regexp.MustCompile(`(?is)\bUser\b\W*(?:continue\b|\[CXP automatic recovery\])`)
 
 // checkRetriesContinue checks the owner ruling of 2026-11-05: the prompt
 // reaches Codex only until Codex records it (the first sent calls carry
-// it), every later retry sends the short continuation instruction on the same thread
+// it), every later retry sends a recovery instruction with failure context on the same thread
 // with the turn's own client id, and that continuation is never mirrored
 // to Teams as a prompt typed in Codex.
 func checkRetriesContinue(s *harness.Scenario, chatID string, calls []harness.CodexCall, tok string, sent int) {
@@ -105,7 +105,8 @@ func checkRetriesContinue(s *harness.Scenario, chatID string, calls []harness.Co
 		case i < sent:
 			ok = ok && c.HasToken(tok)
 		default:
-			ok = ok && c.Prompt == harness.ExpectedContinuationPrompt && !c.HasToken(tok) && strings.Contains(c.Prompt, "Keep the previous response language unless the user requests otherwise.") && c.ThreadID == calls[sent-1].ThreadID
+			warned := strings.HasPrefix(c.Prompt, "[CXP automatic recovery]") && strings.Contains(c.Prompt, "Observed failure") && strings.Contains(c.Prompt, "verify uncertain operation results")
+			ok = ok && warned && !c.HasToken(tok) && strings.Contains(c.Prompt, "Keep the previous response language unless the user requests otherwise.") && c.ThreadID == calls[sent-1].ThreadID
 		}
 		ok = ok && c.ClientID == calls[0].ClientID && c.ClientID != ""
 	}
