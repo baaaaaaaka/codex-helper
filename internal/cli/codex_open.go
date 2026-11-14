@@ -419,11 +419,30 @@ func runCodexTUIInvocationViaBrokerWithHooks(
 		Timeout:          30 * time.Second,
 		ConfigureCommand: configureIdentity,
 	}
-	launchShared := func() error {
-		extraEnv = setEnvValue(extraEnv, codexrunner.RemoteBrokerAuthTokenEnv, shared.Endpoint.Token)
+	launchShared := func() (launchErr error) {
+		endpointURL, endpointToken := shared.Endpoint.URL, shared.Endpoint.Token
+		if agentAutoApprove {
+			// Reuse the same approval broker as standalone launches, but attach
+			// its transport to the existing server instead of starting a writer.
+			broker, err := codexrunner.StartRemoteBroker(ctx, codexrunner.RemoteBrokerOptions{
+				Starter:      codexrunner.RemoteAppServerStarter{URL: endpointURL, Token: endpointToken},
+				ApprovalMode: approvalModeForAAA(agentAutoApprove),
+				Log:          log,
+			})
+			if err != nil {
+				return err
+			}
+			defer func() {
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				launchErr = errors.Join(launchErr, broker.Close(shutdownCtx))
+			}()
+			endpointURL, endpointToken = broker.URL(), broker.AuthToken()
+		}
+		extraEnv = setEnvValue(extraEnv, codexrunner.RemoteBrokerAuthTokenEnv, endpointToken)
 		extraEnv = setEnvValue(extraEnv, envCodexSQLiteHome, remoteTUISQLiteHome)
 		args := append([]string{}, tuiGlobalArgs...)
-		args = append(args, "-c", codexRemoteTUIFeatureConfig, "--remote", shared.Endpoint.URL, "--remote-auth-token-env", codexrunner.RemoteBrokerAuthTokenEnv)
+		args = append(args, "-c", codexRemoteTUIFeatureConfig, "--remote", endpointURL, "--remote-auth-token-env", codexrunner.RemoteBrokerAuthTokenEnv)
 		args = append(args, tuiTail...)
 		runErr := runTargetSupervisedWithOptions(ctx, append([]string{codexPath}, args...), "", nil, shared.Done, runTargetOptions{Cwd: cwd, ExtraEnv: extraEnv, PreserveTTY: true, ExecIdentity: paths.ExecIdentity, Log: log})
 		return errors.Join(runErr, verifyIdentity())

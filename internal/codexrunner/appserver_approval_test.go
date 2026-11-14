@@ -118,8 +118,8 @@ func TestAppServerRunnerAutomaticApprovalModeIsExplicit(t *testing.T) {
 }
 
 func TestDefaultApprovalDelayIsFixed(t *testing.T) {
-	if DefaultApprovalDelay != 500*time.Millisecond {
-		t.Fatalf("DefaultApprovalDelay = %s, want fixed 500ms", DefaultApprovalDelay)
+	if DefaultApprovalDelay != 100*time.Millisecond {
+		t.Fatalf("DefaultApprovalDelay = %s, want fixed 100ms", DefaultApprovalDelay)
 	}
 }
 

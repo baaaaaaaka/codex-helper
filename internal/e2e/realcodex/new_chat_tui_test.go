@@ -27,7 +27,13 @@ import (
 
 // A real helper, real CXP selector and real Codex TUI. Only the remote Graph
 // and model services are fakes. Run inside the offline contract container.
-func TestRealCodexNewChatTUI(t *testing.T) {
+func TestRealCodexNewChatTUI(t *testing.T) { testRealCodexNewChatTUI(t, false) }
+
+// This must complete the real approval-producing turn without sending an
+// approval key. The manual variant above still requires a human response.
+func TestRealCodexAAASharedTUI(t *testing.T) { testRealCodexNewChatTUI(t, true) }
+
+func testRealCodexNewChatTUI(t *testing.T, aaa bool) {
 	native := codexBin(t)
 	cxp := os.Getenv("E2E_CXP_BIN")
 	if cxp == "" {
@@ -48,7 +54,7 @@ func TestRealCodexNewChatTUI(t *testing.T) {
 	if err := os.MkdirAll(filepath.Dir(config), 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(config, []byte(`{"version":6,"proxyEnabled":false,"agentAutoApproveEnabled":false,"profiles":[]}`), 0600); err != nil {
+	if err := os.WriteFile(config, []byte(fmt.Sprintf(`{"version":6,"proxyEnabled":false,"agentAutoApproveEnabled":%t,"profiles":[]}`, aaa)), 0600); err != nil {
 		t.Fatal(err)
 	}
 	vars := map[string]string{}
@@ -67,7 +73,7 @@ func TestRealCodexNewChatTUI(t *testing.T) {
 	sort.Strings(processEnv)
 	helper := harness.NewProcessSUT(harness.SUTConfig{Env: env}, harness.ProcessSpec{
 		Name: "native-new-chat", Binary: cxp, Dir: env.Home,
-		Args: []string{"teams", "run", "--codex-path", native, "--machine-registry=false", "--auto-update=false", "--auto-service=false"},
+		Args: []string{"--config", config, "teams", "run", "--codex-path", native, "--machine-registry=false", "--auto-update=false", "--auto-service=false"},
 		Env:  func(string) []string { return processEnv },
 	})
 	ctx, cancel := context.WithTimeout(context.Background(), 110*time.Second)
@@ -108,7 +114,7 @@ func TestRealCodexNewChatTUI(t *testing.T) {
 	})
 	// Fresh empty windows must not create model requests or a Teams Work chat.
 	emptyDir := env.WorkDir(t, "empty")
-	empty := startNativePTY(t, ctx, cxp, []string{"history", "tui", "--codex-path", native, "--refresh-interval", "0"}, emptyDir, processEnv)
+	empty := startNativePTY(t, ctx, cxp, []string{"--config", config, "history", "tui", "--codex-path", native, "--refresh-interval", "0"}, emptyDir, processEnv)
 	openNativeNew(t, ctx, empty)
 	empty.stop()
 	if len(resp.Requests()) != 0 || len(fg.Chats()) != 1 {
@@ -119,7 +125,7 @@ func TestRealCodexNewChatTUI(t *testing.T) {
 	dirs := []string{env.WorkDir(t, "first"), env.WorkDir(t, "second")}
 	windows := make([]*nativePTY, 2)
 	for i, dir := range dirs {
-		windows[i] = startNativePTY(t, ctx, cxp, []string{"history", "tui", "--codex-path", native, "--refresh-interval", "0"}, dir, processEnv)
+		windows[i] = startNativePTY(t, ctx, cxp, []string{"--config", config, "history", "tui", "--codex-path", native, "--refresh-interval", "0"}, dir, processEnv)
 		openNativeNew(t, ctx, windows[i])
 	}
 	if len(resp.Requests()) != 0 {
@@ -157,7 +163,7 @@ func TestRealCodexNewChatTUI(t *testing.T) {
 		}
 		prompt := fmt.Sprintf("native-window-%d-first", i)
 		w.submit(t, ctx, prompt)
-		if i == 0 {
+		if i == 0 && !aaa {
 			waitNative(t, ctx, "native TUI approval", func() bool { return strings.Contains(w.text(), "Would you like to run") })
 			if strings.Contains(windows[1].text(), "native-approval-command") {
 				t.Fatal("approval routed to another window")
@@ -165,6 +171,9 @@ func TestRealCodexNewChatTUI(t *testing.T) {
 			w.send(t, "\r") // approve only the harmless printf inside this offline container
 		}
 		waitNative(t, ctx, "first response in native TUI", func() bool { return strings.Contains(w.text(), "ANSWER("+prompt+")") })
+		if aaa && strings.Contains(w.text(), "Would you like to run") {
+			t.Fatal("AAA leaked approval to native TUI")
+		}
 	}
 	windows[0].submit(t, ctx, "native-window-0-second")
 	waitNative(t, ctx, "second response in same TUI", func() bool { return strings.Contains(windows[0].text(), "ANSWER(native-window-0-second)") })
@@ -249,7 +258,7 @@ func TestRealCodexNewChatTUI(t *testing.T) {
 	}
 	// Close a real native window, then resume its persisted thread through CXP.
 	windows[0].stop()
-	resumed := startNativePTY(t, ctx, cxp, []string{"history", "open", ids[dirs[0]], "--codex-path", native}, dirs[0], processEnv)
+	resumed := startNativePTY(t, ctx, cxp, []string{"--config", config, "history", "open", ids[dirs[0]], "--codex-path", native}, dirs[0], processEnv)
 	waitNative(t, ctx, "resumed native input", func() bool { return strings.Contains(resumed.text(), "›") })
 	resumed.submit(t, ctx, "native-resumed-third")
 	waitNative(t, ctx, "response after resume", func() bool { return strings.Contains(resumed.text(), "ANSWER(native-resumed-third)") })

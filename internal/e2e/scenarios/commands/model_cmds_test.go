@@ -193,9 +193,9 @@ func TestEffortCommands(t *testing.T) {
 		Title:      "`effort status|list|set|reset` in a Work chat and in the Control chat, with v0.1.20's texts; the next turn uses the effort",
 		Budget:     180 * time.Second,
 		Golden: harness.GoldenOptions{Masks: []harness.Mask{{
-			Pattern: regexp.MustCompile(`(?m)^(   prompt\|   Applies to turns that start after this change in this chat;)[^\n]*(\n   prompt\| \.\.\. truncated for prompt size \.\.\.)`),
-			Replace: `${1} [truncated]${2}`,
-			Reason:  "The control history's byte limit cuts this line at a position affected by temporary path length; the full reply is checked separately.",
+			Pattern: regexp.MustCompile(`(?m)^(   prompt\|   Applies to turns that start after this change in this chat;)[^\n]*(?:\n   prompt\|   These settings apply when this chat next starts work\.)?(?:\n   prompt\| \.\.\. truncated for prompt size \.\.\.)?`),
+			Replace: "${1} [truncated]\n   prompt| ... truncated for prompt size ...",
+			Reason:  "Temporary path length determines whether the control history is truncated; the full reply is checked separately.",
 		}}},
 	})
 	defer s.Finish()

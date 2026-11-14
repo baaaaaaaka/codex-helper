@@ -3,11 +3,15 @@ package cli
 import (
 	"context"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/gorilla/websocket"
 
 	"github.com/baaaaaaaka/codex-helper/internal/codexhistory"
 	"github.com/baaaaaaaka/codex-helper/internal/codexrunner"
@@ -19,6 +23,7 @@ import (
 )
 
 type sharedTUIFixture struct {
+	url       string
 	thread    string
 	newThread string
 	released  chan struct{}
@@ -27,7 +32,7 @@ type sharedTUIFixture struct {
 
 func (f *sharedTUIFixture) Attach(_ context.Context, thread string) (engine.TUIEndpoint, func(), <-chan struct{}, error) {
 	f.thread = thread
-	return engine.TUIEndpoint{URL: "ws://127.0.0.1:34567", Token: "existing-backend-capability"}, func() { close(f.released) }, f.done, nil
+	return engine.TUIEndpoint{URL: f.url, Token: "existing-backend-capability"}, func() { close(f.released) }, f.done, nil
 }
 
 func (f *sharedTUIFixture) AttachNew(ctx context.Context, cwd string) (engine.TUIEndpoint, func(), <-chan struct{}, error) {
@@ -36,22 +41,50 @@ func (f *sharedTUIFixture) AttachNew(ctx context.Context, cwd string) (engine.TU
 	return ep, release, done, err
 }
 func TestRunCodexSessionAttachesBeforeOpeningAnotherWriter(t *testing.T) {
-	testSharedTUILaunch(t, "resume")
+	testSharedTUILaunch(t, "resume", false)
 }
-func TestRunCodexNewSessionUsesSharedBackend(t *testing.T) { testSharedTUILaunch(t, "new") }
+func TestRunCodexNewSessionUsesSharedBackend(t *testing.T) { testSharedTUILaunch(t, "new", false) }
 func TestRunCodexNewSessionIgnoresDifferentHelperHome(t *testing.T) {
-	testSharedTUILaunch(t, "different-home")
+	testSharedTUILaunch(t, "different-home", false)
 }
 func TestRunCodexNewSessionRefusesLegacyHelperHandoff(t *testing.T) {
-	testSharedTUILaunch(t, "legacy-new")
+	testSharedTUILaunch(t, "legacy-new", false)
 }
 func TestRunCodexSessionRefusesMissingLiveHelperEndpoint(t *testing.T) {
-	testSharedTUILaunch(t, "missing")
+	testSharedTUILaunch(t, "missing", false)
 }
-func TestRunCodexForkAttachesAfterCreation(t *testing.T) { testSharedTUILaunch(t, "fork") }
-func testSharedTUILaunch(t *testing.T, mode string) {
+func TestRunCodexForkAttachesAfterCreation(t *testing.T) { testSharedTUILaunch(t, "fork", false) }
+func TestSharedTUIAAALaunch(t *testing.T) {
+	for _, mode := range []string{"resume", "new", "fork"} {
+		t.Run(mode, func(t *testing.T) { testSharedTUILaunch(t, mode, true) })
+	}
+}
+func testSharedTUILaunch(t *testing.T, mode string, aaa bool) {
+
 	fixture := writeCodexTUIBrokerFixture(t)
 	cfg := newCodexOpenTestStore(t)
+	if err := persistAAAEnabled(cfg, aaa); err != nil {
+		t.Fatal(err)
+	}
+	upgrader := websocket.Upgrader{}
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer existing-backend-capability" {
+			http.Error(w, "unauthorized", 401)
+			return
+		}
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer upstream.Close()
+	upstreamURL := "ws" + strings.TrimPrefix(upstream.URL, "http")
 	t.Setenv("CODEX_HELPER_STATE_DIR", t.TempDir())
 	anchor, _, err := teamsNewCoreCLIStorePath()
 	if err != nil {
@@ -74,7 +107,7 @@ func testSharedTUILaunch(t *testing.T, mode string) {
 	if err = holder.Activate(); err != nil {
 		t.Fatal(err)
 	}
-	target := &sharedTUIFixture{released: make(chan struct{}), done: make(chan struct{})}
+	target := &sharedTUIFixture{url: upstreamURL, released: make(chan struct{}), done: make(chan struct{})}
 	if mode == "legacy-new" {
 		target.newThread = "pre-created-thread"
 	}
@@ -108,7 +141,7 @@ func testSharedTUILaunch(t *testing.T, mode string) {
 	if thread == "" {
 		err = runCodexNewSession(context.Background(), &rootOptions{configPath: cfg.Path()}, cfg, &config.Profile{Name: "shared"}, nil, fixture.workDir, fixture.path, "", mode != "different-home", io.Discard)
 	} else if mode == "fork" {
-		err = runCodexTUIInvocationViaBrokerWithHook(context.Background(), &rootOptions{configPath: cfg.Path()}, cfg, nil, nil, fixture.workDir, fixture.path, "", false, false, nil, nil, nil, func(context.Context, codexrunner.AppServerTransportStarter, codexrunner.AppServerLaunchContext) ([]string, error) {
+		err = runCodexTUIInvocationViaBrokerWithHook(context.Background(), &rootOptions{configPath: cfg.Path()}, cfg, nil, nil, fixture.workDir, fixture.path, "", false, aaa, nil, nil, nil, func(context.Context, codexrunner.AppServerTransportStarter, codexrunner.AppServerLaunchContext) ([]string, error) {
 			return []string{"resume", thread}, nil
 		}, io.Discard)
 	} else {
@@ -157,11 +190,18 @@ func testSharedTUILaunch(t *testing.T, mode string) {
 	if mode == "new" {
 		wantArgs = 6
 	}
-	if len(args) != wantArgs || args[3] != "ws://127.0.0.1:34567" || (mode != "new" && args[7] != thread) {
+	if len(args) != wantArgs || (mode != "new" && args[7] != thread) {
 		t.Fatal(args)
 	}
 	token, err := os.ReadFile(fixture.tuiAuthToken)
-	if err != nil || string(token) != "existing-backend-capability\n" {
+	if err != nil {
+		t.Fatal(err)
+	}
+	if aaa {
+		if args[3] == upstreamURL || strings.TrimSpace(string(token)) == "existing-backend-capability" {
+			t.Fatal("AAA bypassed the approval broker")
+		}
+	} else if args[3] != upstreamURL || string(token) != "existing-backend-capability\n" {
 		t.Fatalf("capability not forwarded: %v", err)
 	}
 	for _, path := range []string{fixture.migrationArgs, fixture.appServerArgs} {

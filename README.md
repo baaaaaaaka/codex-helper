@@ -249,11 +249,13 @@ codex-proxy run --aaa -- codex
 codex-proxy run --aaa -- codex exec "..."
 ```
 
-AAA answers supported approval requests after a fixed 500 ms delay. Without
+AAA answers supported approval requests after a fixed 100 ms delay. Without
 AAA, non-interactive `codex exec` facade requests fail closed because no human
 reviewer is attached. Teams is an unattended surface and therefore enables
 the same automatic handler explicitly; they do not inherit the local TUI
 preference. The `--aaa` flag is consumed by CXP and is never passed to Codex.
+AAA also applies when the TUI attaches to an existing Teams shared session;
+its approval broker connects to that backend without starting another app-server.
 
 This runtime requires Codex CLI 0.131.0 or newer; older managed/PATH installs
 are upgraded automatically before the first brokered turn. The release compatibility

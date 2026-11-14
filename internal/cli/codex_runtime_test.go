@@ -83,8 +83,8 @@ esac
 	if err != nil {
 		t.Fatalf("runCodexCLIInvocation: %v", err)
 	}
-	if elapsed < 500*time.Millisecond || elapsed > 3*time.Second {
-		t.Fatalf("approval elapsed = %s, want fixed 500ms plus startup overhead", elapsed)
+	if elapsed < codexrunner.DefaultApprovalDelay || elapsed > 3*time.Second {
+		t.Fatalf("approval elapsed = %s, want at least the default approval delay and at most 3s", elapsed)
 	}
 	text := output.String()
 	if !strings.Contains(text, `"type":"item.completed"`) || !strings.Contains(text, `"text":"runtime done"`) || !strings.Contains(text, `"type":"turn.completed"`) {

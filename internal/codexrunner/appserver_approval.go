@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-const DefaultApprovalDelay = 500 * time.Millisecond
+const DefaultApprovalDelay = 100 * time.Millisecond
 
 // ApprovalMode controls whether a headless app-server client may resolve
 // approval requests automatically. The zero value is deliberately manual so a

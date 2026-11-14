@@ -285,6 +285,13 @@ jobs:
           # race instrumentation on shared runners. All tests still run.
           bash scripts/ci/race_core_packages.sh "${{ matrix.group }}" 2>&1 | tee "$RUNNER_TEMP/race-core.log"
 
+      - name: Shared TUI AAA and approval transport regressions
+        if: matrix.group == 'engine'
+        shell: bash
+        run: |
+          go test -race -count=1 -timeout=5m ./internal/codexrunner -run '^Test(SharedRemoteBroker|RemoteAppServer|RemoteBroker|AutomaticApproval|DefaultApprovalDelay)'
+          go test -race -count=1 -timeout=5m ./internal/cli -run '^Test(SharedTUIAAA|RunCodexExecFacadeUsesStandardApprovalAfterFixedDelay|RunCodex(SessionAttaches|NewSession(UsesShared|IgnoresDifferent|RefusesLegacy)|SessionRefusesMissing|ForkAttaches))'
+
       - name: TUI asynchronous state and worker race checks
         if: matrix.group == 'engine'
         shell: bash
