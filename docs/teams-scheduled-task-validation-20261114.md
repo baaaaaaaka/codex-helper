@@ -15,6 +15,15 @@ GitHub CI. The host still has no Docker daemon, so no local helper lifecycle
 test was substituted. Live Teams delivery and real native Codex scheduling
 remain separate, unverified integration paths.
 
+Candidate CI run 43604855415 passed its platform and E2E jobs. Main CI run
+43605859080 then failed `TestR09_R10_MirrorTUIRollout`: its golden expected
+the control-chat summary for the down-time session, but the snapshot did not
+contain that asynchronously delivered message. All scenario checks passed.
+The test now waits for that session's summary before comparing the unchanged
+golden, so an absent summary still fails rather than being accepted. The
+restart scenario package compiled locally with `-run '^$'`; actual lifecycle
+execution remains assigned to isolated GitHub CI.
+
 ## Scope and user behavior
 
 This change observes native Codex evidence. Codex continues to own execution

@@ -98,6 +98,16 @@ func TestR09_R10_MirrorTUIRollout(t *testing.T) {
 	s.WaitFor("down-time session discovered", 30*time.Second, func() (bool, string) {
 		return len(steps.ChatsWithSUTText(s, a4)) > 0, "down-time session not mirrored yet"
 	})
+	// The control-chat summary is delivered independently of the work-chat
+	// answer. The golden includes it, so wait for the specific new session.
+	s.WaitFor("down-time session summary delivered", 30*time.Second, func() (bool, string) {
+		for _, msg := range s.SUTMessagesContaining(control.ID, p4) {
+			if strings.Contains(msg.PlainText(), "New local Codex chats") {
+				return true, ""
+			}
+		}
+		return false, "down-time session summary not delivered yet"
+	})
 	s.Settle(3*time.Second, 15*time.Second)
 
 	tr := s.Transcript(chat.ID, 30)
