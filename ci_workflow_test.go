@@ -97,7 +97,7 @@ func TestCIWorkflowPullRequestTierRunsEverySuiteWithoutWeakeningRequiredChecks(t
 	if err != nil {
 		t.Fatal(err)
 	}
-	requireStepContains(t, string(e2eScript), `go test -count=1 -parallel=8 -timeout=600s "${packages[@]}"`)
+	requireStepContains(t, string(e2eScript), `go test -v -count=1 -parallel=8 -timeout=600s "${packages[@]}"`)
 
 	platforms := workflowJobBlock(t, workflow, "unit-windows-macos")
 	requireStepContains(t, platforms,
