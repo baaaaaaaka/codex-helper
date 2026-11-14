@@ -23,8 +23,8 @@ class NativeCodexLookupTests(unittest.TestCase):
         self.package = self.root / '@openai' / ('codex-linux-x64' if machine == 'x86_64' else 'codex-linux-arm64')
         self.triple = machine + '-unknown-linux-musl'
 
-    def binary(self, folder, version='0.131.0'):
-        binary = self.package / 'vendor' / self.triple / folder / 'codex'
+    def binary(self, folder, version='0.131.0', package=None):
+        binary = (package or self.package) / 'vendor' / self.triple / folder / 'codex'
         binary.parent.mkdir(parents=True, exist_ok=True)
         binary.write_text('#!/bin/sh\necho codex-cli ' + version + '\n')
         binary.chmod(0o755)
@@ -41,6 +41,13 @@ class NativeCodexLookupTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.strip(), str(binary))
                 binary.unlink()
+
+    def test_global_install_nested_dependency(self):
+        nested = self.wrapper / 'node_modules' / '@openai' / self.package.name
+        binary = self.binary('codex', package=nested)
+        result = self.run_lookup()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), str(binary))
 
     def test_missing_and_wrong_version_fail(self):
         self.assertNotEqual(self.run_lookup().returncode, 0)

@@ -20,9 +20,11 @@ def main():
     if metadata.get('version') != expected:
         raise ValueError(f'wrapper version {metadata.get("version")!r}, expected {expected!r}')
     triple = f'{arch[1]}-unknown-linux-musl'
-    native_package = root / '@openai' / f'codex-linux-{arch[0]}'
+    package_name = f'codex-linux-{arch[0]}'
+    native_packages = (wrapper / 'node_modules' / '@openai' / package_name,
+                       root / '@openai' / package_name)
     # Older versions use codex/codex; recent versions use bin/codex.
-    for package in (native_package, wrapper):
+    for package in (*native_packages, wrapper):
         for subdir in ('bin', 'codex'):
             binary = package / 'vendor' / triple / subdir / 'codex'
             if not binary.is_file() or not os.access(binary, os.X_OK):
