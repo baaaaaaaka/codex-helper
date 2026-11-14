@@ -138,6 +138,14 @@ The `v0.1.23-rc.19` main CI passed the real native Codex 0.166.0 and
 0.167.1 shared-contract jobs; the replacement release's full remote CI
 remains to be verified.
 
+The `v0.1.23-rc.20` main CI passed. Its Linux Codex 0.131.0 release
+contract observed the approved command but timed out after five seconds
+waiting for Codex's asynchronous command analytics; the same version passed
+locally, and the macOS and Windows 0.131.0 matrix entries passed remotely.
+The contract still requires both user approval and the completed-command
+event, but now allows 20 seconds and reads the received events from a
+mutex-protected snapshot.
+
 ## Memory and disk audit
 
 The added adapter connects once per AAA TUI attachment. It retains one 32 KiB

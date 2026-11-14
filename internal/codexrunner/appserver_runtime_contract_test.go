@@ -381,14 +381,16 @@ func TestInstalledCodexStandardApprovalRuntime(t *testing.T) {
 	// Codex sends analytics asynchronously. Older supported builds can finish
 	// the turn before flushing the command-completion event even though the
 	// review event has already arrived. Wait only for the exact event required
-	// by this contract, with a short hard deadline so telemetry regressions still
-	// fail deterministically instead of becoming timing-dependent flakes.
-	analyticsDeadline := time.Now().Add(5 * time.Second)
+	// by this contract, with a hard deadline so telemetry regressions still
+	// fail deterministically even when a busy CI runner delays the flush.
+	analyticsDeadline := time.Now().Add(20 * time.Second)
 	var analytics []byte
+	var analyticsSnapshot [][]byte
 	for {
 		providerMu.Lock()
-		analytics = bytes.Join(analyticsRequests, []byte("\n"))
+		analyticsSnapshot = append([][]byte(nil), analyticsRequests...)
 		providerMu.Unlock()
+		analytics = bytes.Join(analyticsSnapshot, []byte("\n"))
 		if bytes.Contains(analytics, []byte(`"codex_command_execution_event"`)) || time.Now().After(analyticsDeadline) {
 			break
 		}
@@ -397,7 +399,7 @@ func TestInstalledCodexStandardApprovalRuntime(t *testing.T) {
 	if len(analytics) == 0 {
 		t.Fatal("analytics was enabled but original Codex sent no analytics contract payload")
 	}
-	if !json.Valid(analyticsRequests[0]) || !bytes.Contains(analytics, []byte(`"events"`)) {
+	if !json.Valid(analyticsSnapshot[0]) || !bytes.Contains(analytics, []byte(`"events"`)) {
 		t.Fatalf("invalid analytics contract payload: %s", analytics)
 	}
 	lowerAnalytics := bytes.ToLower(analytics)
@@ -420,7 +422,7 @@ func TestInstalledCodexStandardApprovalRuntime(t *testing.T) {
 		t.Fatalf("analytics payload leaked authentication material: %s", analytics)
 	}
 	var sawUserApproval, sawUserApprovedCommand bool
-	for _, raw := range analyticsRequests {
+	for _, raw := range analyticsSnapshot {
 		var payload struct {
 			Events []struct {
 				Type   string         `json:"event_type"`
