@@ -24,6 +24,18 @@ golden, so an absent summary still fails rather than being accepted. The
 restart scenario package compiled locally with `-run '^$'`; actual lifecycle
 execution remains assigned to isolated GitHub CI.
 
+The `rc.31` release run 43608729413 failed the Windows 2022
+`TestRecoveryRestartRetainsRejectedBackoff`: its two-second wall-clock
+backoff could expire while the engine was stopping and restarting. The test
+now freezes the injected clock before persisting the backoff, waits for the
+persisted deadline to be restored, checks that the retry has not started,
+then advances past the deadline and wakes the scheduler. The changed test
+passed ten Linux race runs. In a separate disposable worktree, replacing the
+persisted-deadline guard with `false` made the test fail while waiting for the
+restored backoff, and the fake agent showed the unintended second call. The
+runtime guard and its behavior are unchanged. Native Windows CI must rerun
+the test; the `rc.31` release run was cancelled and the tag is not reused.
+
 ## Scope and user behavior
 
 This change observes native Codex evidence. Codex continues to own execution

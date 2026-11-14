@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -91,20 +92,34 @@ func TestRecoveryCodexOwnsRetryUntilTerminal(t *testing.T) {
 }
 
 func TestRecoveryRestartRetainsRejectedBackoff(t *testing.T) {
-	r := newRig(t, func(c *Config) { c.Timing.CapacityBackoff = 2 * time.Second; c.Timing.CapacityRetry = 10 * time.Second })
+	var frozen, offset atomic.Int64
+	r := newRig(t, func(c *Config) {
+		c.Timing.CapacityBackoff = 2 * time.Second
+		c.Timing.CapacityRetry = 10 * time.Second
+		c.Now = func() time.Time {
+			if at := frozen.Load(); at != 0 {
+				return time.Unix(0, at)
+			}
+			return time.Now().Add(time.Duration(offset.Load()))
+		}
+	})
 	work := r.newWork(t.TempDir())
 	r.ag.mu.Lock()
 	r.ag.refuse = func(req TurnRequest) (TurnOutcome, bool) {
+		// Freeze before the retry is persisted, independently of restart time.
+		frozen.Store(time.Now().UnixNano())
 		return TurnOutcome{NotStarted: true, Status: StatusFailed, Capacity: true, Error: "capacity"}, true
 	}
 	r.ag.mu.Unlock()
 	r.ch.PostUser(work, "rejected capacity")
 	var before store.RecoveryEvidence
+	var turn store.Turn
 	r.wait("durable retry", func() bool {
 		turns, _ := r.st.OpenTurns()
 		if len(turns) != 1 || turns[0].State != store.TurnQueued {
 			return false
 		}
+		turn = turns[0]
 		_ = r.st.Update(func(tx *store.Tx) error { before, _, _ = tx.Recovery(turns[0].ID); return nil })
 		return before.Decision == "retry"
 	})
@@ -113,12 +128,23 @@ func TestRecoveryRestartRetainsRejectedBackoff(t *testing.T) {
 	r.ag.refuse = nil
 	r.ag.mu.Unlock()
 	r.start()
+	r.wait("persisted backoff restored", func() bool {
+		r.e.mu.Lock()
+		defer r.e.mu.Unlock()
+		cs := r.e.convs[turn.ConvID]
+		return cs != nil && ms(cs.capWake) == before.NextAttemptAt
+	})
 	time.Sleep(250 * time.Millisecond)
 	if n := r.ag.calls("rejected capacity"); n != 1 {
 		t.Fatalf("restart bypassed backoff: %d calls", n)
 	}
+	// Advance beyond the persisted deadline, resume the clock and wake the
+	// scheduler. This checks both sides of the boundary without wall-time races.
+	offset.Store(int64(time.Until(time.UnixMilli(before.NextAttemptAt)) + time.Second))
+	frozen.Store(0)
+	r.e.wakeRunner(turn.ConvID)
 	r.wait("answer after due time", func() bool { return len(r.own(work, "ANSWER to rejected capacity")) == 1 })
-	if time.Now().UnixMilli() < before.NextAttemptAt {
+	if r.e.now().UnixMilli() < before.NextAttemptAt {
 		t.Fatal("retried before persisted due time")
 	}
 	if before.Acceptance != "rejected" || before.RetryDeadline == 0 || before.NextAttemptAt == 0 {
