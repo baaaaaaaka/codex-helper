@@ -1,6 +1,7 @@
 package entry
 
 import (
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -40,6 +41,27 @@ func TestEntryFreshInstall(t *testing.T) {
 	steps.MustPost(s, chat.ID, "Entry task "+tok)
 	_, ok := steps.WaitAnswered(s, chat.ID, tok, steps.AnswerTimeout)
 	s.Check("work is served through the production entry point", ok, "answered", fmt.Sprint(ok), s.Transcript(chat.ID, 6)...)
+	// Graph may expose a message before the sender has recorded the POST
+	// response. Stop only after the completion notice and its outbox state
+	// have settled; otherwise this ordinary restart can interrupt a delivery.
+	_, notified := s.WaitSUTMessage(control.ID, "Request: Entry task "+tok, steps.CommandTimeout)
+	if !notified {
+		t.Fatal("completion notice did not arrive before restart")
+	}
+	db, err := sql.Open("sqlite", "file:"+filepath.Join(teamsDir(s), "core.sqlite")+"?mode=ro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if !s.WaitFor("outbox deliveries settled before restart", steps.CommandTimeout, func() (bool, string) {
+		var pending int
+		if err := db.QueryRow(`SELECT count(*) FROM outbox WHERE state IN ('queued','sending','unknown')`).Scan(&pending); err != nil {
+			return false, err.Error()
+		}
+		return pending == 0, fmt.Sprintf("%d pending deliveries", pending)
+	}) {
+		t.Fatal("outbox did not settle before restart")
+	}
 
 	s.StopSUT()
 	s.StartSUT()
@@ -57,7 +79,7 @@ func TestEntryFreshInstall(t *testing.T) {
 	}
 	same := len(paths) == 2 && paths[0] == want && paths[1] == want
 	s.Check("both starts run on the store in the Teams state directory", same, want+" twice", fmt.Sprintf("%q", paths))
-	_, err := os.Stat(want)
+	_, err = os.Stat(want)
 	s.Check("the store exists there", err == nil, "core.sqlite present", fmt.Sprint(err))
 	var controls int
 	for _, c := range s.Graph.Chats() {
