@@ -99,3 +99,39 @@ The corrected breaker fixture passed on Linux/WSL Go 1.26.3:
 check confirmed current upstream main `1a949daaa46c50d3de1f9ac5cff8a1fef342de85`
 was already included. There are no new production-path performance or disk
 writes: the added receipt reads run only inside this test fixture.
+
+
+## Crash-recovery fixture polling follow-up
+
+RC.42's [main CI](https://github.com/baaaaaaaka/codex-helper/actions/runs/43835662510)
+passed all 22 jobs. Its [Release run](https://github.com/baaaaaaaka/codex-helper/actions/runs/43836719561)
+found one additional E2E fixture limit: `TestForkHistorySurvivesACrash`
+passed every behavioral assertion and all other invariants, but used 5.229834 s
+CPU against the unchanged 5 s budget. The 80-record parent import and fork
+recovery made 1,798 Graph requests, including 338 chat-list and 1,272 message-list
+reads. The fixture's 500 ms polling repeatedly reads growing history faster
+than the one-message-per-second write pace. All six native Codex contract jobs
+passed on Linux, macOS, and Windows, for latest and 0.131.0.
+
+The correction changes only this fixture's `Interval` to one second, matching
+its existing history write pace. It preserves 40 turns (80 records), the
+condition-gated crash after four answers, every ordering/deduplication/recovery
+assertion, the 5 s CPU budget, rate and no-loop caps, and production timing.
+No production code changes. This reduces unnecessary reads instead of raising
+a resource limit or shrinking the history workload. RC.42's tag remains fixed;
+the correction uses a new commit and RC.43.
+
+Validation uses the bundled ephemeral Docker harness and Go 1.25.11, with
+`E2E_SUT=cxp go test ./internal/e2e/scenarios/commands -run '^TestForkHistorySurvivesACrash$' -count=3 -v -timeout=15m`.
+The first sandbox invocation could not reach Docker Desktop. The same harness
+command succeeded with precise escalation for that interface; this is a sandbox
+boundary, not a test or daemon defect. No daemon settings, privileges inside the
+container, or host helper processes were changed.
+
+All three repetitions passed in 528.000 s. They used 1.967391 s, 1.986209 s,
+and 1.956585 s helper CPU, with 1,052, 1,052, and 1,051 Graph requests. All
+behavioral checks and every invariant passed, including the unchanged 5 s CPU
+limit. The earlier full local shard's same 500 ms fixture recorded 1,798
+requests and 2.635446 s CPU; these are separate runs, not a controlled benchmark.
+The request reduction follows from the slower test polling, without reducing
+the history records checked. Formatting and `git diff --check` also pass.

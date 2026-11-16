@@ -154,10 +154,10 @@ func TestForkHistorySurvivesACrash(t *testing.T) {
 		Guarantees: []string{"F-WRK-10", "R-41", "R-2"},
 		Title:      "kill -9 in the middle of a fork's history; after the restart every record is posted exactly once, then the marker, then the link",
 		Budget:     5 * time.Minute,
-		// History pages multiply each logical read. A 250ms hot poll can
-		// exceed the HTTP no-loop cap after own posts warm the full tiers.
-		// Keep accelerated timing without weakening that cap.
-		Interval: 500 * time.Millisecond,
+		// History pages multiply each logical read. Poll once per second,
+		// matching the history write pace, to keep this 80-record crash
+		// fixture within the unchanged CPU and HTTP no-loop budgets.
+		Interval: time.Second,
 		NoStart:  true,
 	})
 	defer s.Finish()
