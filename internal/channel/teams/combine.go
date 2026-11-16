@@ -2,6 +2,7 @@ package teams
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 
 	"github.com/baaaaaaaka/codex-helper/internal/channel"
@@ -11,11 +12,23 @@ import (
 // images, mentions or attachments are left alone: their identifiers/references
 // cannot safely be concatenated. Math and rich payloads still send normally.
 func (a *Adapter) CombineProgress(parts []channel.Part) (channel.Part, bool) {
-	if len(parts) < 2 {
+	return a.combineParts(parts, false)
+}
+
+func (a *Adapter) CombineRecovery(parts []channel.Part) (channel.Part, bool) {
+	return a.combineParts(parts, true)
+}
+
+func (a *Adapter) combineParts(parts []channel.Part, recovery bool) (channel.Part, bool) {
+	if len(parts) == 0 || (!recovery && len(parts) < 2) {
 		return channel.Part{}, false
 	}
 	var html strings.Builder
-	for i, p := range parts {
+	if recovery {
+		html.WriteString("<p><strong>Recovered history</strong></p>")
+	}
+	for i := 0; i < len(parts); i++ {
+		p := parts[i]
 		if p.Index != 1 || p.Count != 1 || p.Mention || p.ReplyTo != "" {
 			return channel.Part{}, false
 		}
@@ -32,6 +45,16 @@ func (a *Adapter) CombineProgress(parts []channel.Part) (channel.Part, bool) {
 		}
 		if i > 0 {
 			html.WriteString("<hr>")
+		}
+		if recovery {
+			n := 1
+			for i+n < len(parts) && parts[i+n] == p {
+				n++
+			}
+			if n > 1 {
+				fmt.Fprintf(&html, "<p>Repeated %d times:</p>", n)
+				i += n - 1
+			}
 		}
 		html.WriteString(body.Content)
 		if html.Len()+markerReserve > targetPartBytes {

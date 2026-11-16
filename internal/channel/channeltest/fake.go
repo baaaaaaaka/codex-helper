@@ -525,15 +525,38 @@ func (f *Fake) receiveFault(stream string) error {
 var _ channel.Channel = (*Fake)(nil)
 
 func (f *Fake) CombineProgress(parts []channel.Part) (channel.Part, bool) {
+	return f.combineParts(parts, false)
+}
+
+func (f *Fake) CombineRecovery(parts []channel.Part) (channel.Part, bool) {
+	return f.combineParts(parts, true)
+}
+
+func (f *Fake) combineParts(parts []channel.Part, recovery bool) (channel.Part, bool) {
 	var bodies []string
-	for _, p := range parts {
+	if recovery {
+		bodies = append(bodies, "Recovered history")
+	}
+	for i := 0; i < len(parts); i++ {
+		p := parts[i]
 		if p.Index != 1 || p.Count != 1 || p.Mention || p.ReplyTo != "" {
 			return channel.Part{}, false
 		}
-		bodies = append(bodies, p.Body)
+		body := p.Body
+		if recovery {
+			n := 1
+			for i+n < len(parts) && parts[i+n] == p {
+				n++
+			}
+			if n > 1 {
+				body = fmt.Sprintf("Repeated %d times:\n", n) + body
+				i += n - 1
+			}
+		}
+		bodies = append(bodies, body)
 	}
 	body := strings.Join(bodies, "\n\n")
-	if len(parts) < 2 || len(body) > f.Caps().MaxPartBytes {
+	if len(parts) == 0 || (!recovery && len(parts) < 2) || len(body) > f.Caps().MaxPartBytes {
 		return channel.Part{}, false
 	}
 	return channel.Part{Index: 1, Count: 1, Body: body, Size: len(body), Hash: channel.TextHash(body)}, true

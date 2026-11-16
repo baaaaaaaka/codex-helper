@@ -377,6 +377,13 @@ type PartCombiner interface {
 	CombineProgress([]Part) (Part, bool)
 }
 
+// RecoveryCombiner optionally packs recovery parts. Consecutive identical
+// blocks may be represented once with an explicit repetition count. Original
+// records and their individual delivery identities remain in the outbox.
+type RecoveryCombiner interface {
+	CombineRecovery([]Part) (Part, bool)
+}
+
 // OwnerNotice is a small, transport-independent owner notification. Empty
 // optional fields are omitted; the heading always describes the event.
 type OwnerNotice struct {

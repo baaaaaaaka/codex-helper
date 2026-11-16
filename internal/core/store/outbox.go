@@ -49,16 +49,55 @@ RETURNING id`, convID, m.DeliveryKey, convID, m.Kind, part, parts, nullStr(m.Bod
 	return n, nil
 }
 
+// activeSendOrder preserves ordinary FIFO, but lets queued recovery yield to
+// current messages. An in-flight row always owns the conversation. The partial
+// active index limits this ordering to pending rows, never retained history.
+const activeSendOrder = `CASE WHEN state='sending' THEN 0 WHEN kind='mirror' AND progress_group GLOB 'recovery:*' THEN 2 ELSE 1 END, seq`
+const sendHeadSQL = `SELECT id FROM outbox WHERE conv_id=? AND state IN ('queued','sending') AND hold_turn IS NULL ORDER BY ` + activeSendOrder + ` LIMIT 1`
+const recoveryHeadSQL = `SELECT id FROM outbox WHERE conv_id=? AND state IN ('queued','sending') AND hold_turn IS NULL ORDER BY CASE WHEN state='sending' THEN 0 ELSE 1 END, seq LIMIT 1`
+
 // NextSendable returns, for every conversation, its head pending row when
-// that row is queued and due. Only queued/sending rows hold the order;
+// that row is queued and due. Queued recovery yields to current messages;
+// ordinary FIFO and in-flight ownership are preserved. Only queued/sending
+// rows hold the order;
 // unknown outcomes are retained for reconciliation without blocking delivery.
 func (t *Tx) NextSendable(now int64) ([]Outbox, error) {
-	return collect(scanOutbox)(t.rows(`SELECT `+outboxCols+` FROM outbox
+	return t.nextSendable(now, false)
+}
+
+// NextSendableWithRecovery gives an aged recovery head one normal write slot.
+// The sender uses its existing foreground fairness counter, not another queue.
+func (t *Tx) NextSendableWithRecovery(now int64) ([]Outbox, error) {
+	return t.nextSendable(now, true)
+}
+
+const recoveryFairWaitMS = 2 * 60 * 1000
+
+func (t *Tx) nextSendable(now int64, recoveryTurn bool) ([]Outbox, error) {
+	// Keep the indexed FIFO lookup on the normal path. Only a recovery head
+	// needs the bounded active-row ordering; ordinary polling never sorts.
+	rows, err := collect(scanOutbox)(t.rows(`SELECT `+outboxCols+` FROM outbox
 WHERE id IN (SELECT (SELECT p.id FROM outbox p WHERE p.conv_id = h.conv_id AND p.state IN ('queued','sending') AND p.hold_turn IS NULL
                      ORDER BY p.seq LIMIT 1)
              FROM (SELECT DISTINCT conv_id FROM outbox WHERE state IN ('queued','sending')) h)
-  AND state = 'queued' AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+  AND state='queued' AND (next_attempt_at IS NULL OR next_attempt_at<=? OR (kind='mirror' AND progress_group GLOB 'recovery:*'))
 ORDER BY conv_id`, now))
+	if err != nil {
+		return nil, err
+	}
+	ready := rows[:0]
+	for _, row := range rows {
+		if row.Recovery() && row.State == OutQueued && !(recoveryTurn && row.NextAttemptAt <= now && now-row.CreatedAt >= recoveryFairWaitMS) {
+			row, _, err = one(t.row(`SELECT `+outboxCols+` FROM outbox WHERE conv_id=? AND state IN ('queued','sending') AND hold_turn IS NULL ORDER BY `+activeSendOrder+` LIMIT 1`, row.ConvID), scanOutbox)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if row.State == OutQueued && row.NextAttemptAt <= now {
+			ready = append(ready, row)
+		}
+	}
+	return ready, nil
 }
 
 // Outbox reads one outbox row.
@@ -82,6 +121,15 @@ WHERE conv_id = ? AND state IN ('queued','sending') ORDER BY seq`, convID))
 // BeginSend marks the conversation's head queued row as sending with a fresh
 // attempt token (embedded as the read-back marker).
 func (t *Tx) BeginSend(id int64) (string, error) {
+	return t.beginSend(id, false)
+}
+
+// BeginRecoverySend validates the aged recovery exception selected above.
+func (t *Tx) BeginRecoverySend(id int64) (string, error) {
+	return t.beginSend(id, true)
+}
+
+func (t *Tx) beginSend(id int64, recoveryTurn bool) (string, error) {
 	o, ok, err := t.Outbox(id)
 	if err != nil {
 		return "", err
@@ -92,13 +140,22 @@ func (t *Tx) BeginSend(id int64) (string, error) {
 	if o.State != OutQueued || o.HoldTurn != 0 {
 		return "", fmt.Errorf("%w: outbox %d is %s", ErrState, id, o.State)
 	}
-	var ahead int
-	if err := t.row(`SELECT EXISTS(SELECT 1 FROM outbox WHERE conv_id = ? AND state IN ('queued','sending') AND hold_turn IS NULL AND seq < ?)`,
-		o.ConvID, o.Seq).Scan(&ahead); err != nil {
+	var ahead bool
+	if err := t.row(`SELECT EXISTS(SELECT 1 FROM outbox WHERE conv_id=? AND state IN ('queued','sending') AND hold_turn IS NULL AND seq<?)`, o.ConvID, o.Seq).Scan(&ahead); err != nil {
 		return "", err
 	}
-	if ahead != 0 {
-		return "", fmt.Errorf("%w: outbox %d is not the head of conversation %d", ErrState, id, o.ConvID)
+	if ahead || o.Recovery() {
+		query := sendHeadSQL
+		if recoveryTurn && o.Recovery() && t.now-o.CreatedAt >= recoveryFairWaitMS {
+			query = recoveryHeadSQL
+		}
+		var head int64
+		if err := t.row(query, o.ConvID).Scan(&head); err != nil {
+			return "", err
+		}
+		if head != id {
+			return "", fmt.Errorf("%w: outbox %d is not the head of conversation %d", ErrState, id, o.ConvID)
+		}
 	}
 	var b [12]byte
 	if _, err := rand.Read(b[:]); err != nil {

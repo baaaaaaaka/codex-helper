@@ -14,6 +14,14 @@ func (e *Engine) progressBatch(tx *store.Tx, head store.Outbox, now int64) (stor
 	if !ok || head.ProgressGroup == "" || head.BatchHead != 0 {
 		return head, nil
 	}
+	combine := combiner.CombineProgress
+	if head.Recovery() {
+		recoverer, ok := e.cfg.Channel.(channel.RecoveryCombiner)
+		if !ok {
+			return head, nil
+		}
+		combine = recoverer.CombineRecovery
+	}
 	rows, err := tx.ProgressBatchCandidates(head, now)
 	if err != nil {
 		return head, err
@@ -23,16 +31,16 @@ func (e *Engine) progressBatch(tx *store.Tx, head store.Outbox, now int64) (stor
 	count := 1
 	for i, r := range rows {
 		parts = append(parts, channel.Part{Index: r.Part, Count: r.Parts, Body: r.Body, Hash: hex.EncodeToString(r.BodyHash), Mention: r.Mention, ReplyTo: r.ReplyTo, Size: len(r.Body)})
-		if i == 0 {
+		if i == 0 && !head.Recovery() {
 			continue
 		}
-		p, ok := combiner.CombineProgress(parts)
+		p, ok := combine(parts)
 		if !ok {
 			break
 		}
 		merged, count = p, i+1
 	}
-	if count < 2 {
+	if count < 2 && (!head.Recovery() || merged.Body == "") {
 		return head, nil
 	}
 	if err := tx.FreezeProgressBatch(rows[:count], merged.Body, hashBytes(merged.Hash)); err != nil {

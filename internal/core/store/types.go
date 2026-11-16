@@ -192,7 +192,7 @@ type OutMsg struct {
 	AppendTo      string // original owner prompt; empty sends a separate message
 	HoldTurn      int64  // final waits in this outbox until its transcript prefix commits
 	AlternateKey  string // legacy identity; checked atomically, never body-only dedupe
-	ProgressGroup string // same execution; only complete adjacent progress records may combine
+	ProgressGroup string // execution progress or recovery group; complete adjacent parts may combine
 	DeliveryKey   string
 	Kind          string
 	Part          int // 1-based; 0 means 1
@@ -210,7 +210,7 @@ type Outbox struct {
 	HoldTurn      int64
 	BatchHead     int64
 	BatchBody     string
-	ProgressGroup string // same execution; only complete adjacent progress records may combine
+	ProgressGroup string // execution progress or recovery group; complete adjacent parts may combine
 	ID            int64
 	ConvID        int64
 	DeliveryKey   string

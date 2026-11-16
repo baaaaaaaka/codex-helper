@@ -2,11 +2,13 @@ package restart
 
 import (
 	"bytes"
+	"database/sql"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/baaaaaaaka/codex-helper/internal/core/transcript"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakegraph"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/harness"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/rollout"
@@ -222,9 +224,41 @@ func TestMirrorFollowsReplacedRollout(t *testing.T) {
 	})
 	s.Settle(2*time.Second, 10*time.Second)
 
+	// Observe the replacement checkpoint before appending the next live turn.
+	// Content already present at replacement detection is recovered history;
+	// that independent case is covered by MIR-RECOVERY-BATCH and MOVED-HOME.
+	status := s.RunCLIAs(10*time.Second, harness.CLIAs{Poll: true}, "teams", "status")
+	var storePath string
+	for _, line := range strings.Split(status.Stdout, "\n") {
+		if path, ok := strings.CutPrefix(line, "Store: "); ok {
+			storePath = strings.TrimSpace(path)
+		}
+	}
+	if storePath == "" {
+		t.Fatal("no store path in status")
+	}
+	db, err := sql.Open("sqlite", storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	waitReplacement := func() {
+		t.Helper()
+		info, err := transcript.Stat(r.Path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.Require("replacement checkpoint committed before live append", 20*time.Second, func() (bool, string) {
+			var inode int64
+			var offset int64
+			err := db.QueryRow(`SELECT inode,offset FROM transcript_sources WHERE path=?`, r.Path).Scan(&inode, &offset)
+			return err == nil && inode == info.Inode && offset >= info.Size, fmt.Sprintf("inode=%d offset=%d err=%v", inode, offset, err)
+		})
+	}
+
 	// 1. A shorter file: the session_meta marked paginated and only the
 	// newest turn; then a live turn.
-	err := r.Replace(func(lines [][]byte) [][]byte {
+	err = r.Replace(func(lines [][]byte) [][]byte {
 		out := [][]byte{bytes.Replace(lines[0], []byte(`"originator"`), []byte(`"history_mode":"paginated","originator"`), 1)}
 		start := len(lines)
 		for i := len(lines) - 1; i > 0; i-- {
@@ -238,6 +272,7 @@ func TestMirrorFollowsReplacedRollout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	waitReplacement()
 	three := add("three")
 	s.WaitFor("the turn after the shorter replacement is mirrored", 30*time.Second, func() (bool, string) {
 		return len(s.SUTMessagesContaining(chat.ID, three.answer)) > 0, "not yet"
@@ -256,6 +291,7 @@ func TestMirrorFollowsReplacedRollout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	waitReplacement()
 	four := add("four")
 	s.WaitFor("the turn after the longer replacement is mirrored", 30*time.Second, func() (bool, string) {
 		return len(s.SUTMessagesContaining(chat.ID, four.answer)) > 0, "not yet"
@@ -279,4 +315,5 @@ func TestMirrorFollowsReplacedRollout(t *testing.T) {
 	}
 	s.Check("the replaced rollout stays in its one chat", len(chats) == 0, "no other chat", fmt.Sprint(chats))
 	s.Check("mirroring never runs Codex", len(s.Codex.Calls()) == 0, "0", fmt.Sprint(len(s.Codex.Calls())))
+	s.Check("turns appended after recovery stay live", len(s.SUTMessagesContaining(chat.ID, "Recovered history")) == 0, "0 recovery posts", fmt.Sprint(len(s.SUTMessagesContaining(chat.ID, "Recovered history"))))
 }

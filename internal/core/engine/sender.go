@@ -94,7 +94,14 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 	}
 	err := e.update(func(tx *store.Tx) error {
 		jobs = jobs[:0]
-		rows, err := tx.NextSendable(ms(now))
+		allowRecovery := e.sendForeground >= 8
+		var rows []store.Outbox
+		var err error
+		if allowRecovery {
+			rows, err = tx.NextSendableWithRecovery(ms(now))
+		} else {
+			rows, err = tx.NextSendable(ms(now))
+		}
 		if err != nil {
 			return err
 		}
@@ -115,13 +122,13 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 				continue // shutdown: nothing after its reply is sent
 			}
 			class := sendClass(r.Kind)
-			if class == sendMirror && r.Seq <= e.liveThrough(r.ConvID) {
+			if !r.Recovery() && class == sendMirror && r.Seq <= e.liveThrough(r.ConvID) {
 				// Mirrored rows up to a live record (mirror.go): the
 				// local session is in use now; the rows before it go
 				// first, in order, in its rank.
 				class = sendLive
 			}
-			if class != sendReply {
+			if class != sendReply && !r.Recovery() {
 				// A reply queued behind this head (an answer behind a
 				// progress post) ranks the conversation as a reply: rows
 				// go out in order, so the head goes first, in the reply's
@@ -284,7 +291,12 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 				<-sem
 				return err
 			}
-			tok, err := tx.BeginSend(r.ID)
+			var tok string
+			if allowRecovery && r.Recovery() {
+				tok, err = tx.BeginRecoverySend(r.ID)
+			} else {
+				tok, err = tx.BeginSend(r.ID)
+			}
 			if err != nil {
 				<-sem
 				if errors.Is(err, store.ErrState) {
@@ -540,7 +552,7 @@ func (e *Engine) send(ctx context.Context, r store.Outbox, chat, token string, f
 		e.forgetFailures(r.ID)
 		e.wakeRunner(r.ConvID)
 		e.wakeDeliveryNotify(r)
-		if r.Kind != store.OutAck {
+		if r.Kind != store.OutAck && !r.Recovery() {
 			e.heat(r.ConvID)
 		}
 	case appended && channel.IsAmbiguous(err):

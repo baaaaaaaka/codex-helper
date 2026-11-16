@@ -102,6 +102,10 @@ func TestMovedHomeResumesOnTheNewMachine(t *testing.T) {
 		s.Check("R-10 "+c.name+" is in the chat exactly once", np == 1 && na == 1,
 			"prompt 1, answer 1", fmt.Sprintf("prompt %d, answer %d", np, na), s.Transcript(tuiChat, 20)...)
 	}
+	// This turn was written before the new host first observed the copied
+	// inode. It is fully delivered as recovery, rather than live activity.
+	recovery := s.SUTMessagesContaining(tuiChat, "Recovered history")
+	s.Check("the offline TUI turn is one complete recovery post", len(recovery) == 1 && strings.Contains(recovery[0].PlainText(), p2) && strings.Contains(recovery[0].PlainText(), a2), "one recovery post with the full question and answer", fmt.Sprint(len(recovery)))
 	notices := takeoverNotices(s, control.ID)
 	s.Check("the control chat gets one notice naming both machines", len(notices) == 1 &&
 		strings.Contains(notices[0], "host-b") && strings.Contains(notices[0], "host-a") && strings.Contains(notices[0], "stopped"),
