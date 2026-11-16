@@ -143,3 +143,31 @@ After that correction, `bash scripts/ci/test_tui_update_safety.sh all` passes
 again in a fresh isolated Linux container, including the real-CLI current-store
 checks, full native bootstrap suite, production PTY checks and pinned historical
 reinstall test. Log: `../tools/read-only-status-validation.log`.
+
+## Native CI and RC follow-up
+
+PR #179 CI run `43855329544` passes all 22 jobs on commit `4fe7a986`, after
+the store-status fixture correction. Downloaded native logs confirm actual
+PASS events for both the real CLI and pinned-bootstrap reinstall regressions
+on Linux, macOS 15, Windows 2022 and Windows 2025. All three E2E shards pass;
+each new managed npm upgrade scenario emits an actual PASS event.
+
+After the exact validated commit was fast-forwarded to main, CI run
+`43857173836` found an existing macOS timing assumption in
+`TestReadThrottleResumesWithActivityScan`. The test enabled a 429 after creating
+the control chat, before its first read necessarily finished. Production
+`scanLoop` deliberately yields to the first control read to avoid startup
+deadlock, covered separately by
+`TestControlFirstReadAfterAThrottleWithTheScanWaiting`. The recovery test must
+first observe `controlReadLocked`, then inject its post-startup throttle.
+The fix adds that bounded state wait; scan-first and read-count assertions,
+production behavior and timeouts remain unchanged.
+
+RC.44 Release run `43857227338` was cancelled before packaging/publication;
+its tag is retained. A fresh commit and RC.45 carry this test correction.
+Both startup/recovery tests pass ten race-enabled iterations with Go 1.25.11,
+`-parallel=16 -count=10 -timeout=5m`, on the local CPU-only unit-test host.
+No source-built helper lifecycle process is launched by those unit tests.
+Log: `../tools/read-recovery-unit-race.log`. The first attempted Docker race
+command did not execute tests because that image defaults to CGO disabled;
+it is not counted as a passing gate.

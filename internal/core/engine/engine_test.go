@@ -1462,6 +1462,15 @@ func TestReadThrottleResumesWithActivityScan(t *testing.T) {
 		c.Timing.PaceIncrease = 30 * time.Second // keep recovery active throughout this scenario
 	})
 	r.control()
+	// Chat creation is not completion of its first read. Before that read,
+	// scanLoop deliberately lets the control read go first to avoid a startup
+	// deadlock (TestControlFirstReadAfterAThrottleWithTheScanWaiting). This test
+	// owns recovery after startup, when the account-wide scan must go first.
+	r.wait("initial control read before recovery throttle", func() bool {
+		r.e.mu.Lock()
+		defer r.e.mu.Unlock()
+		return r.e.controlReadLocked()
+	})
 	sc.mu.Lock()
 	sc.storm = true
 	sc.mu.Unlock()
