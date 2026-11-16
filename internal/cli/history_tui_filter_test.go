@@ -108,3 +108,37 @@ func writeHistoryTuiSessionFixture(t *testing.T, sessionsDir, sessionID, cwd str
 		t.Fatalf("write session fixture: %v", err)
 	}
 }
+
+func TestLoadHistoryTuiProjectsUsesBoundedMetadataColdCache(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "sessions")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = codexhistory.CloseCaches() })
+	id := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+	writeHistoryTuiSessionFixture(t, dir, id, "/workspace/project")
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("fixture: %v", err)
+	}
+	f, err := os.OpenFile(filepath.Join(dir, entries[0].Name()), os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = f.WriteString(`{"type":"response_item","payload":{"type":"function_call_output","output":"` + strings.Repeat("x", 1024*1024) + `"}}` + "\n")
+	closeErr := f.Close()
+	if err != nil || closeErr != nil {
+		t.Fatalf("fixture tail: %v %v", err, closeErr)
+	}
+	projects, err := loadHistoryTuiProjects(context.Background(), root)
+	if err != nil || len(projects) != 1 || len(projects[0].Sessions) != 1 {
+		t.Fatalf("projects=%+v err=%v", projects, err)
+	}
+	if projects[0].Sessions[0].MessageCount != -1 {
+		t.Fatal("TUI required a full transcript count")
+	}
+	if _, err = os.Stat(filepath.Join(root, ".codex-proxy")); !os.IsNotExist(err) {
+		t.Fatalf("TUI built a full transcript catalog: %v", err)
+	}
+}

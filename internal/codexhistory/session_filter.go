@@ -17,7 +17,7 @@ func filterEmptySessions(sessions []Session) []Session {
 }
 
 func isEmptySession(session Session) bool {
-	if session.MessageCount > 0 {
+	if session.MessageCount != 0 {
 		return false
 	}
 	if strings.TrimSpace(session.FirstPrompt) != "" {

@@ -1034,7 +1034,9 @@ func TestSessionPreviewSQLiteWriteBudgetByMutation(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
-		assertSessionPreviewSQLiteMutationBudget(t, metrics, 0, 0)
+		// A timestamp change without growth may be a same-size middle edit.
+		// Revalidate the contents rather than trusting a bounded prefix hash.
+		assertSessionPreviewSQLiteMutationBudget(t, metrics, 1, 4)
 	})
 
 	t.Run("partial tail", func(t *testing.T) {
@@ -1597,5 +1599,35 @@ func assertSessionPreviewSQLiteMutationBudget(t *testing.T, metrics sessionPrevi
 	}
 	if metrics.writePages < minPages || metrics.writePages > maxPages {
 		t.Fatalf("page writes = %d, want %d..%d; metrics=%+v", metrics.writePages, minPages, maxPages, metrics)
+	}
+}
+
+func TestSessionPreviewSQLiteSameSizeMiddleRewrite(t *testing.T) {
+	payload := strings.Repeat("a", 256*1024)
+	path, _ := newSessionPreviewCachedFile(t, `{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"`+payload+`"}]}}`+"\n")
+	before, err := ReadSessionPreviewText(path, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = f.WriteAt([]byte("b"), info.Size()/2)
+	closeErr := f.Close()
+	if err != nil || closeErr != nil {
+		t.Fatalf("rewrite: %v %v", err, closeErr)
+	}
+	later := info.ModTime().Add(2 * time.Second)
+	if err = os.Chtimes(path, later, later); err != nil {
+		t.Fatal(err)
+	}
+	after, err := ReadSessionPreviewText(path, 0, 0)
+	if err != nil || after == before || strings.Count(after, "b") != 1 {
+		t.Fatalf("preview returned stale middle: changed=%v err=%v", after != before, err)
 	}
 }

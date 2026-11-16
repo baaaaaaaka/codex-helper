@@ -7,9 +7,11 @@ import (
 )
 
 type sessionFileCacheEntry struct {
-	fileKey fileCacheKey
-	meta    sessionFileMeta
-	hasMeta bool
+	fileKey    fileCacheKey
+	meta       sessionFileMeta
+	hasMeta    bool
+	summary    sessionFileMeta
+	hasSummary bool
 }
 
 var sessionFileCache = struct {

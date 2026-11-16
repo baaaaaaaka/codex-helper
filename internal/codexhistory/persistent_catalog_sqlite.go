@@ -314,7 +314,7 @@ func (store *catalogSQLiteStore) loadSessionMeta(ctx context.Context, path strin
 	}
 	entry.fileKey.HasFileID = hasFileID != 0
 	entry.fileKey.HasCtime = hasCtime != 0
-	entry.fileKey.Dev, _ = strconv.ParseUint(dev, 10, 64)
+	decodeCacheDeviceID(&entry.fileKey, dev)
 	entry.fileKey.Ino, _ = strconv.ParseUint(ino, 10, 64)
 	entry.meta.CreatedAt = cacheTimeFromUnixNano(createdNS)
 	entry.meta.ModifiedAt = cacheTimeFromUnixNano(modifiedNS)
@@ -427,7 +427,7 @@ func upsertCatalogSessionMeta(ctx context.Context, tx *sql.Tx, entry catalogSess
 		OR parent_thread_id <> excluded.parent_thread_id`,
 		entry.path, entry.parsedOffset, entry.prefixTailHash, entry.prefixTailSize,
 		entry.fileKey.Size, entry.fileKey.MtimeUnixNano, entry.fileKey.Mode,
-		boolInt(entry.fileKey.HasFileID), strconv.FormatUint(entry.fileKey.Dev, 10),
+		boolInt(entry.fileKey.HasFileID), cacheDeviceID(entry.fileKey),
 		strconv.FormatUint(entry.fileKey.Ino, 10), boolInt(entry.fileKey.HasCtime),
 		entry.fileKey.CtimeUnixNano, entry.meta.SessionID, entry.meta.ProjectPath,
 		entry.meta.FirstPrompt, entry.meta.MessageCount, cacheTimeUnixNano(entry.meta.CreatedAt),
@@ -461,7 +461,7 @@ func (store *catalogSQLiteStore) loadHistory(ctx context.Context, path string) (
 	}
 	entry.fileKey.HasFileID = hasFileID != 0
 	entry.fileKey.HasCtime = hasCtime != 0
-	entry.fileKey.Dev, _ = strconv.ParseUint(dev, 10, 64)
+	decodeCacheDeviceID(&entry.fileKey, dev)
 	entry.fileKey.Ino, _ = strconv.ParseUint(ino, 10, 64)
 
 	rows, err := store.db.QueryContext(ctx, `SELECT session_id, first_prompt,
@@ -500,7 +500,7 @@ func (store *catalogSQLiteStore) replaceHistory(ctx context.Context, expected ca
 			has_file_id = ?, source_dev = ?, source_ino = ?, has_ctime = ?, source_ctime_ns = ?
 			WHERE path = ? AND generation = ?`, offset, prefixHash, prefixSize,
 			key.Size, key.MtimeUnixNano, key.Mode, boolInt(key.HasFileID),
-			strconv.FormatUint(key.Dev, 10), strconv.FormatUint(key.Ino, 10),
+			cacheDeviceID(key), strconv.FormatUint(key.Ino, 10),
 			boolInt(key.HasCtime), key.CtimeUnixNano, expected.path, expected.generation)
 	} else {
 		result, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO history_source (
@@ -509,7 +509,7 @@ func (store *catalogSQLiteStore) replaceHistory(ctx context.Context, expected ca
 			source_ino, has_ctime, source_ctime_ns
 		) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, expected.path, offset,
 			prefixHash, prefixSize, key.Size, key.MtimeUnixNano, key.Mode,
-			boolInt(key.HasFileID), strconv.FormatUint(key.Dev, 10),
+			boolInt(key.HasFileID), cacheDeviceID(key),
 			strconv.FormatUint(key.Ino, 10), boolInt(key.HasCtime), key.CtimeUnixNano)
 	}
 	if err != nil {
@@ -549,7 +549,7 @@ func (store *catalogSQLiteStore) appendHistory(ctx context.Context, expected cat
 		source_ino = ?, has_ctime = ?, source_ctime_ns = ?
 		WHERE path = ? AND generation = ? AND parsed_offset = ?`, offset, prefixHash,
 		prefixSize, key.Size, key.MtimeUnixNano, key.Mode, boolInt(key.HasFileID),
-		strconv.FormatUint(key.Dev, 10), strconv.FormatUint(key.Ino, 10),
+		cacheDeviceID(key), strconv.FormatUint(key.Ino, 10),
 		boolInt(key.HasCtime), key.CtimeUnixNano, expected.path, expected.generation,
 		expected.parsedOffset)
 	if err != nil {

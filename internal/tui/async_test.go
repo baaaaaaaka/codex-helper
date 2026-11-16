@@ -660,3 +660,29 @@ func TestSelectSessionCancellationWhenWakeQueueIsFull(t *testing.T) {
 		t.Fatal("selector lost cancellation after a full wake queue")
 	}
 }
+
+func TestSelectSessionCtrlNDuringBlockedInitialLoad(t *testing.T) {
+	screen := tcell.NewSimulationScreen("UTF-8")
+	previous := newScreen
+	newScreen = func() (tcell.Screen, error) { return screen, nil }
+	t.Cleanup(func() { newScreen = previous })
+	started, stopped := make(chan struct{}), make(chan struct{})
+	cwd := t.TempDir()
+	selection, err := SelectSession(context.Background(), Options{
+		DefaultCwd: cwd,
+		LoadProjects: func(ctx context.Context) ([]codexhistory.Project, error) {
+			close(started)
+			<-ctx.Done()
+			close(stopped)
+			return nil, ctx.Err()
+		},
+		OnReady: func() error {
+			receive(t, started)
+			return screen.PostEvent(tcell.NewEventKey(tcell.KeyCtrlN, 0, tcell.ModNone))
+		},
+	})
+	if err != nil || selection == nil || selection.Cwd != cwd || selection.Session.SessionID != "" {
+		t.Fatalf("blocked loader prevented new session: %+v %v", selection, err)
+	}
+	receive(t, stopped)
+}

@@ -68,9 +68,15 @@ func canAppendCacheFile(path string, info os.FileInfo, previous fileCacheKey, of
 	if previous.Mode != current.Mode {
 		return false
 	}
+	// A changed timestamp without growth is a possible in-place rewrite,
+	// not an append. A bounded head/tail hash cannot detect a middle edit.
+	if current.Size == previous.Size && (current.MtimeUnixNano != previous.MtimeUnixNano ||
+		(previous.HasCtime && (!current.HasCtime || current.CtimeUnixNano != previous.CtimeUnixNano))) {
+		return false
+	}
 	sameFile := false
 	if previous.HasFileID && current.HasFileID {
-		sameFile = previous.Dev == current.Dev && previous.Ino == current.Ino
+		sameFile = previous.DevKind == current.DevKind && previous.Dev == current.Dev && previous.Ino == current.Ino
 	} else if previous.HasCtime && current.HasCtime {
 		sameFile = previous.CtimeUnixNano == current.CtimeUnixNano
 	}

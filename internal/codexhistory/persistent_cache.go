@@ -5,6 +5,8 @@ import (
 	"errors"
 	"os"
 	"reflect"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -17,6 +19,7 @@ type fileCacheKey struct {
 	Mode          uint32
 	HasFileID     bool
 	Dev           uint64
+	DevKind       string // empty: native device/volume ID; otherwise explicitly tagged
 	Ino           uint64
 	HasCtime      bool
 	CtimeUnixNano int64
@@ -36,13 +39,40 @@ func matchesFileInfo(path string, info os.FileInfo, key fileCacheKey) bool {
 	if current.Size != key.Size || current.MtimeUnixNano != key.MtimeUnixNano || current.Mode != key.Mode {
 		return false
 	}
-	if key.HasFileID && (!current.HasFileID || current.Dev != key.Dev || current.Ino != key.Ino) {
+	if key.HasFileID && (!current.HasFileID || current.DevKind != key.DevKind || current.Dev != key.Dev || current.Ino != key.Ino) {
 		return false
 	}
 	if key.HasCtime && (!current.HasCtime || current.CtimeUnixNano != key.CtimeUnixNano) {
 		return false
 	}
 	return true
+}
+
+// The existing TEXT column can distinguish stable filesystem IDs from legacy
+// device numbers without a schema reset. Old readers reject tagged IDs rather
+// than accidentally trusting them as native device numbers.
+func cacheDeviceID(key fileCacheKey) string {
+	id := strconv.FormatUint(key.Dev, 10)
+	if key.DevKind != "" {
+		return key.DevKind + ":" + id
+	}
+	return id
+}
+
+func decodeCacheDeviceID(key *fileCacheKey, value string) {
+	key.DevKind = ""
+	if kind, id, ok := strings.Cut(value, ":"); ok {
+		if kind != "ext4-fsid" {
+			key.DevKind, key.Dev = "invalid", 0
+			return
+		}
+		key.DevKind, value = kind, id
+	}
+	var err error
+	key.Dev, err = strconv.ParseUint(value, 10, 64)
+	if err != nil {
+		key.DevKind = "invalid"
+	}
 }
 
 func cloneHistorySessions(src map[string]*historySessionInfo) map[string]*historySessionInfo {

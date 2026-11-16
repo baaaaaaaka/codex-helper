@@ -842,17 +842,18 @@ func TestHandleKeyEnterIgnoredWhileProjectsLoading(t *testing.T) {
 	}
 }
 
-func TestHandleKeyCtrlNIgnoredWhileProjectsLoading(t *testing.T) {
+func TestHandleKeyCtrlNStartsDefaultSessionWhileProjectsLoading(t *testing.T) {
 	screen := newTestScreen(t, 120, 40)
 	state := newTestState(nil)
 	state.loadingProjects = true
 
-	selection, err := handleKey(context.Background(), screen, state, Options{DefaultCwd: t.TempDir()}, tcell.NewEventKey(tcell.KeyCtrlN, 0, 0))
+	dir := t.TempDir()
+	selection, err := handleKey(context.Background(), screen, state, Options{DefaultCwd: dir}, tcell.NewEventKey(tcell.KeyCtrlN, 0, 0))
 	if err != nil {
 		t.Fatalf("handleKey error: %v", err)
 	}
-	if selection != nil {
-		t.Fatalf("expected no selection while projects are loading, got %#v", selection)
+	if selection == nil || selection.Cwd != dir || selection.Session.SessionID != "" {
+		t.Fatalf("expected a new session in the default directory while loading, got %#v", selection)
 	}
 }
 

@@ -189,6 +189,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          go test ./internal/codexhistory -count=1 -run '^Test(SessionSummary|CacheFileIdentity|CacheDeviceID)' -v
+          go test ./internal/tui -count=1 -run '^Test(HandleKeyCtrlNStartsDefaultSessionWhileProjectsLoading|SelectSessionCtrlNDuringBlockedInitialLoad)$' -v
+          go test ./internal/cli -count=1 -run '^TestLoadHistoryTuiProjects' -v
+          go test ./internal/codexhistory -run '^$' -bench '^BenchmarkSessionSummaryLargeTranscript$' -benchtime=100x -count=1 -benchmem
           history_pattern='Test(ReadSessionPreviewMessages(DeduplicatesMirroredCodexEvents|DeduplicatesMirrorsWithDifferentSourceKinds|DeduplicatesMirroredUserAndStripsTeamsEnvelope|CleansEventOnlyUserPrompt|KeepsDistinctSameSourceIDsWithSameText|KeepsDistinctRepeatedUserPrompts|KeepsIdenticalCommentaryAndFinal|LimitCountsMirroredUserOnce)|ReadSessionPreviewText(AppendDeduplicatesMirroredMessage|ColdCacheRetainsSkippedMirrorSourceID)|ParseMessagePayload_PreservesTeamsHelperEnvelope|FirstPromptTitleText(StripsLastTeamsHelperSuffix|PreservesLeadingQuotedMarkerBeforeOuterSuffix)|ProcessMetaLine_SubagentFields|DiscoverProjects_SubagentAssociation|FlattenSessionGraphKeepsForkLineageSeparateFromSubagentClassification)$'
           tui_pattern='Test(IsPreviewNavKey|ApplyPreviewNavigation|PreviewArrowKeysScrollWhenFocused|RefreshState(UpdatesOrPreserves|PreservesSelectionIdentityAcrossListChanges)|SelectionIdentityLookupDoesNotAllocate|SelectSessionAutoRefreshPreservesSelection|HandleKeyEnterOpensTopLevelForkSession)$'
           go test ./internal/codexhistory -count=1 -run "$history_pattern" -v

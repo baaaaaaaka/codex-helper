@@ -717,7 +717,7 @@ func handleKey(
 			enterPressed = true
 		}
 	}
-	if state.loadingProjects && (ev.Key() == tcell.KeyCtrlN || enterPressed) {
+	if state.loadingProjects && enterPressed {
 		return nil, nil
 	}
 

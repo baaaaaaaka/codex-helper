@@ -756,7 +756,7 @@ func (store *sessionPreviewSQLiteStore) loadHeader(path string) (sessionPreviewS
 	}
 	entry.fileKey.HasFileID = hasFileID != 0
 	entry.fileKey.HasCtime = hasCtime != 0
-	entry.fileKey.Dev, _ = strconv.ParseUint(dev, 10, 64)
+	decodeCacheDeviceID(&entry.fileKey, dev)
 	entry.fileKey.Ino, _ = strconv.ParseUint(ino, 10, 64)
 
 	return entry, true, nil
@@ -923,7 +923,7 @@ func (store *sessionPreviewSQLiteStore) replace(
 			RETURNING id, generation`,
 			sessionPreviewFilterVersion, offset, prefixHash, prefixSize, key.Size,
 			key.MtimeUnixNano, key.Mode, boolInt(key.HasFileID),
-			strconv.FormatUint(key.Dev, 10), strconv.FormatUint(key.Ino, 10),
+			cacheDeviceID(key), strconv.FormatUint(key.Ino, 10),
 			boolInt(key.HasCtime), key.CtimeUnixNano, len(messages), sessionPreviewNow().UnixNano(),
 			expected.sessionID, expected.generation, expected.offset,
 		).Scan(&sessionID, &generation)
@@ -936,7 +936,7 @@ func (store *sessionPreviewSQLiteStore) replace(
 		ON CONFLICT(path) DO NOTHING
 		RETURNING id, generation`, filepath.Clean(path), sessionPreviewFilterVersion,
 			offset, prefixHash, prefixSize, key.Size, key.MtimeUnixNano, key.Mode,
-			boolInt(key.HasFileID), strconv.FormatUint(key.Dev, 10),
+			boolInt(key.HasFileID), cacheDeviceID(key),
 			strconv.FormatUint(key.Ino, 10), boolInt(key.HasCtime), key.CtimeUnixNano,
 			len(messages), sessionPreviewNow().UnixNano(),
 		).Scan(&sessionID, &generation)
@@ -991,7 +991,7 @@ func (store *sessionPreviewSQLiteStore) append(
 		has_ctime = ?, source_ctime_ns = ?, next_ordinal = next_ordinal + ?, last_write_ns = ?
 		WHERE id = ? AND generation = ? AND filter_version = ? AND parsed_offset = ? AND next_ordinal = ?`,
 		offset, prefixHash, prefixSize, key.Size, key.MtimeUnixNano, key.Mode,
-		boolInt(key.HasFileID), strconv.FormatUint(key.Dev, 10), strconv.FormatUint(key.Ino, 10),
+		boolInt(key.HasFileID), cacheDeviceID(key), strconv.FormatUint(key.Ino, 10),
 		boolInt(key.HasCtime), key.CtimeUnixNano, len(messages), sessionPreviewNow().UnixNano(),
 		entry.sessionID, entry.generation, sessionPreviewFilterVersion, entry.offset, entry.nextOrdinal,
 	)

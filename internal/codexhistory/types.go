@@ -21,7 +21,7 @@ type Session struct {
 	ThreadName      string `json:",omitempty"`
 	Summary         string
 	FirstPrompt     string
-	MessageCount    int
+	MessageCount    int // -1 means unknown for bounded browser summaries
 	CreatedAt       time.Time
 	ModifiedAt      time.Time
 	ProjectPath     string
@@ -168,7 +168,7 @@ type SubagentSession struct {
 	ThreadName      string `json:",omitempty"`
 	Summary         string
 	FirstPrompt     string
-	MessageCount    int
+	MessageCount    int // -1 means unknown for bounded browser summaries
 	CreatedAt       time.Time
 	ModifiedAt      time.Time
 	FilePath        string

@@ -17,6 +17,30 @@ func DiscoverProjects(codexDir string) ([]Project, error) {
 }
 
 func DiscoverProjectsContext(ctx context.Context, codexDir string) (projects []Project, retErr error) {
+	return discoverProjectsContext(ctx, codexDir, readSessionFileMetaCachedContext)
+}
+
+// DiscoverProjectSummariesContext builds the browser's directory without
+// requiring complete transcripts or a usable persistent session catalog.
+// MessageCount is -1 when only part of a transcript was examined.
+func DiscoverProjectSummariesContext(ctx context.Context, codexDir string) ([]Project, error) {
+	if ctx != nil && ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	root, err := ResolveCodexDir(codexDir)
+	if err != nil {
+		return nil, err
+	}
+	reader := sessionSummaryReader{}
+	// Reuse an existing catalog, without creating a missing one to list files.
+	source := filepath.Join(root, "history.jsonl")
+	if _, exists, err := existingCacheV2DatabasePath(source, cacheV2CatalogFile); err == nil && exists {
+		reader.catalog, _ = currentCatalogSQLiteStore(source)
+	}
+	return discoverProjectsContext(ctx, root, reader.read)
+}
+
+func discoverProjectsContext(ctx context.Context, codexDir string, readMeta func(context.Context, string) (sessionFileMeta, error)) (projects []Project, retErr error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -79,7 +103,7 @@ func DiscoverProjectsContext(ctx context.Context, codexDir string) (projects []P
 			continue
 		}
 
-		meta, err := readSessionFileMetaCachedContext(ctx, filePath)
+		meta, err := readMeta(ctx, filePath)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return nil, err

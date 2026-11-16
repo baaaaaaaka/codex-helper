@@ -43,7 +43,7 @@ var historyTuiExcludedProjectRoots = [...]string{
 }
 
 func loadHistoryTuiProjects(ctx context.Context, codexDir string) ([]codexhistory.Project, error) {
-	projects, err := codexhistory.DiscoverProjectsContext(ctx, codexDir)
+	projects, err := codexhistory.DiscoverProjectSummariesContext(ctx, codexDir)
 	return filterHistoryTuiProjects(projects), err
 }
 
