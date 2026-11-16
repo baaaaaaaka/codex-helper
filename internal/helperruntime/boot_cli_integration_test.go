@@ -114,7 +114,8 @@ func TestBootE2ERealCLIErrorNeverChangesConfirmedVersion(t *testing.T) {
 			if next, err := run("--version"); err != nil || !bytes.Equal(next, version) {
 				t.Fatalf("next invocation changed version: %v: %s", err, next)
 			}
-			if out, err := run("--config", cfg, "teams", "service", "status"); err != nil || !strings.Contains(string(out), storePath) || !strings.Contains(string(out), "Running version: v2.0.0-regression") {
+			// Read the business store without requiring an installed OS service.
+			if out, err := run("--config", cfg, "teams", "status"); err != nil || !strings.Contains(string(out), storePath) || !strings.Contains(string(out), "Running version: v2.0.0-regression") {
 				t.Fatalf("subsequent Teams store read failed: %v: %s", err, out)
 			}
 		})

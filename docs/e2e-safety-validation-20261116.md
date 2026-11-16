@@ -128,3 +128,18 @@ Post-merge checks through a fresh isolated Docker harness all pass:
 The process-test log is `../tools/post-merge-validation.log`. The fresh
 container was destroyed after successful completion. GitHub native platform
 validation remains a required subsequent gate before merging and tagging.
+
+The first PR CI run found that the new bootstrap/store regressions used
+`teams service status`, whose exit code also depends on a native service being
+installed. GitHub's Linux/macOS runners correctly read the database marker but
+returned missing-service errors. The final tests use the public read-only
+`teams status` command for the same current-store marker and path assertions.
+This removes the unrelated service-installation assumption without accepting
+nonzero command results or dropping database/dispatch checks. The original
+local results above describe the pre-submission test command; subsequent
+native PR runs validate this correction before merge.
+
+After that correction, `bash scripts/ci/test_tui_update_safety.sh all` passes
+again in a fresh isolated Linux container, including the real-CLI current-store
+checks, full native bootstrap suite, production PTY checks and pinned historical
+reinstall test. Log: `../tools/read-only-status-validation.log`.

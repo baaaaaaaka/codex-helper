@@ -424,7 +424,7 @@ func TestCandidateLegacyNativeReinstallFixesCommandRollback(t *testing.T) {
 	if out := runUpgradeCLI(t, entry, false, "--version"); !strings.Contains(string(out), "9.99.0") {
 		t.Fatalf("next start: %s", out)
 	}
-	if out := runUpgradeCLI(t, entry, false, "--config", config, "teams", "service", "status"); !strings.Contains(string(out), "Running version: v9.99.0-regression") {
+	if out := runUpgradeCLI(t, entry, false, "--config", config, "teams", "status"); !strings.Contains(string(out), "Running version: v9.99.0-regression") {
 		t.Fatalf("current store unreadable after failed command: %s", out)
 	}
 }
