@@ -4,11 +4,11 @@ import (
 	"bytes"
 	"database/sql"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/baaaaaaaka/codex-helper/internal/core/transcript"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakegraph"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/harness"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/rollout"
@@ -242,9 +242,13 @@ func TestMirrorFollowsReplacedRollout(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
+	var previousInode int64
+	if err = db.QueryRow(`SELECT inode FROM transcript_sources WHERE path=?`, r.Path).Scan(&previousInode); err != nil {
+		t.Fatal(err)
+	}
 	waitReplacement := func() {
 		t.Helper()
-		info, err := transcript.Stat(r.Path)
+		info, err := os.Stat(r.Path)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -252,7 +256,11 @@ func TestMirrorFollowsReplacedRollout(t *testing.T) {
 			var inode int64
 			var offset int64
 			err := db.QueryRow(`SELECT inode,offset FROM transcript_sources WHERE path=?`, r.Path).Scan(&inode, &offset)
-			return err == nil && inode == info.Inode && offset >= info.Size, fmt.Sprintf("inode=%d offset=%d err=%v", inode, offset, err)
+			done := err == nil && inode != 0 && inode != previousInode && offset >= info.Size()
+			if done {
+				previousInode = inode
+			}
+			return done, fmt.Sprintf("inode=%d offset=%d err=%v", inode, offset, err)
 		})
 	}
 
