@@ -70,3 +70,32 @@ The correction passed the focused race command on Linux/WSL Go 1.26.3:
 continuation, and both unconfirmed-stop cases on every iteration. Before the
 follow-up commit, another fetch and fast-forward merge check confirmed current
 upstream main `db2dd464e7d3a806372a286b05d963855336bcd5` was already included.
+
+## Send-receipt ordering follow-up
+
+The same RC.40 sweep later reported a second existing fixture failure in
+partition 1: `TestBreakerHoldsPromptsAndUnpauseDoesNotRunThem` did not observe a
+pause. The fake channel exposes a sent answer before the sender commits its
+outbox receipt. `classify` intentionally treats a copied hash as self while any
+matching outbox row is not `sent`; only a confirmed send copied under a different
+message ID is an echo for the breaker. The test copied the visible answer
+without waiting for that state, so the copy could be ignored permanently.
+
+The correction waits for the work conversation's `PendingOutbox` to be empty
+before posting the three marker-less copies. This API includes queued, sending,
+and unknown rows. The test's pause, hold, unpause, fresh-answer, and no-replay
+assertions remain unchanged. No production sender, classification, breaker,
+retry, timeout, schema, or scheduling behavior changes. The test now observes
+the durable precondition instead of relying on the scheduler's speed.
+
+RC.41 was intentionally cancelled before packaging when this additional evidence
+arrived; its tag and commit `1a949daa` remain. Cancellation propagated to the
+workflow's aggregate jobs; those aggregate failures are not new test failures.
+The next candidate includes both fixture corrections and uses a fresh RC tag.
+
+The corrected breaker fixture passed on Linux/WSL Go 1.26.3:
+`go test -race ./internal/core/engine -run '^TestBreakerHoldsPromptsAndUnpauseDoesNotRunThem$' -count=10 -parallel=16 -timeout=10m -v`
+(88.645 s). Before this follow-up commit, another fetch and fast-forward merge
+check confirmed current upstream main `1a949daaa46c50d3de1f9ac5cff8a1fef342de85`
+was already included. There are no new production-path performance or disk
+writes: the added receipt reads run only inside this test fixture.

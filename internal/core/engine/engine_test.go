@@ -640,6 +640,18 @@ func TestBreakerHoldsPromptsAndUnpauseDoesNotRunThem(t *testing.T) {
 	// echoing them) count toward the breaker.
 	r.ch.PostUser(work, "first prompt")
 	r.wait("answer", func() bool { return len(r.own(work, "ANSWER to first prompt")) == 1 })
+	// Send publishes to the fake chat before its receipt is committed. Echo
+	// only confirmed sends: unconfirmed copies are correctly treated as self.
+	conv := r.e.findLabel("s001").id
+	r.wait("helper sends committed", func() bool {
+		pending := 0
+		err := r.st.Read(func(tx *store.Tx) error {
+			rows, err := tx.PendingOutbox(conv)
+			pending = len(rows)
+			return err
+		})
+		return err == nil && pending == 0
+	})
 	var ours []string
 	for _, m := range r.ch.Messages(work) {
 		if m.Marker != "" {
