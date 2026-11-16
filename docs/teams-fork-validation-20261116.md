@@ -41,3 +41,32 @@ Tests use a private Git worktree and the bundled Docker real-process harness. Th
 An initial host-side unit invocation failed an existing environment snapshot assertion because the Teams-launched test child received the host proxy rather than the fixture proxy. This is separate from the fork defect. The clean container suite includes that assertion; host race execution excludes only `TestStartRemovesRuntimeMarkers` and records the exclusion explicitly.
 
 Windows amd64 and macOS arm64 test packages cross-compile. Native execution on those operating systems and real Microsoft Graph delivery are not part of the local run. The initial local validation did not invoke GitHub CI or publish a release. Submission and prerelease publication use the normal main CI and full Release workflow, including native-platform gates. The development host helper is not deployed or restarted by this change.
+
+## Prerelease follow-up
+
+Commit `db2dd464e7d3a806372a286b05d963855336bcd5` includes the production fix.
+Its [main CI](https://github.com/baaaaaaaka/codex-helper/actions/runs/43831875879)
+passed all 22 jobs. The first RC attempt, `v0.1.23-rc.40`, was blocked before
+packaging by the full-repository race sweep's partition 3:
+`TestSwitchCoalescesAndUsesPendingInput` timed out after the model switch was
+paused. The [failed Release run](https://github.com/baaaaaaaka/codex-helper/actions/runs/43831960776)
+records the failure; its tag is retained rather than moved or reused.
+
+That existing test deliberately holds `InterruptExecution` behind a channel
+while processing additional messages, but inherited the fast fixture's 5 s
+interrupt deadline. The busy runner exhausted that deadline before stop
+processing finished. This path uses an in-process fake and never calls fork.
+The follow-up changes only this ordering test's `CancelWait` to one minute;
+its condition assertions and controlled gates are unchanged. The individual
+condition waits still bound a broken test, and rig cleanup cancels the held
+operation. Production timeouts are unchanged. The separate
+`TestSwitchUnconfirmedStopPausesWithoutKillOrContinuation` still uses 100 ms
+and checks both rejected and unconfirmed interrupts without killing or resuming
+the execution. The next candidate uses a new commit and RC tag.
+
+The correction passed the focused race command on Linux/WSL Go 1.26.3:
+`go test -race ./internal/core/engine -run '^Test(SwitchCoalescesAndUsesPendingInput|SwitchUnconfirmedStop|BusyModelSwitch)' -count=10 -parallel=16 -timeout=10m -v`
+(127.694 s). This exercises the gated coalescing assertions, successful automatic
+continuation, and both unconfirmed-stop cases on every iteration. Before the
+follow-up commit, another fetch and fast-forward merge check confirmed current
+upstream main `db2dd464e7d3a806372a286b05d963855336bcd5` was already included.

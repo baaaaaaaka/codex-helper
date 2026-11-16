@@ -132,7 +132,13 @@ func TestSwitchCoalescesAndUsesPendingInput(t *testing.T) {
 	gate := make(chan struct{})
 	a := &switchTestAgent{fakeAgent: newAgent(), interruptGate: gate, interruptSeen: make(chan struct{})}
 	a.block["original task"] = make(chan struct{})
-	r := newRig(t, func(c *Config) { c.Agent = a; c.FilesDir = t.TempDir() })
+	r := newRig(t, func(c *Config) {
+		c.Agent = a
+		c.FilesDir = t.TempDir()
+		// This test holds the interrupt until queued input is committed.
+		// Its ordering is gated; interrupt expiry is tested separately.
+		c.Timing.CancelWait = time.Minute
+	})
 	r.ag = a.fakeAgent
 	work := r.newWork(t.TempDir())
 	r.ch.PostUser(work, "original task")
