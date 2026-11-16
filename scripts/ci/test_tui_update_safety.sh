@@ -50,6 +50,10 @@ else
     echo "critical native boot tests were not selected" >&2
     exit 1
   fi
+  if ! grep -Fxq 'TestBootE2ERealCLIErrorNeverChangesConfirmedVersion' <<<"$selected"; then
+    echo "production CLI rollback regression was not selected" >&2
+    exit 1
+  fi
   update_tests="$(go test -tags cxp_boot_e2e ./internal/update -list '^TestTUIAutoNativeDownloadThenRealNextInvocation$')"
   if ! grep -Fxq 'TestTUIAutoNativeDownloadThenRealNextInvocation' <<<"$update_tests"; then
     echo "critical native TUI update test was not selected" >&2

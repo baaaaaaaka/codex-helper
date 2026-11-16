@@ -41,7 +41,7 @@ type Verdict struct {
 	Routes     []string `json:"routes,omitempty"`
 	CodexCalls int      `json:"codex_calls"`
 	// Invariants are the teardown invariant results (name: "ok",
-	// "waived: <reason>" or the failures).
+	// "waived: <reason>", "not checked: <reason>" or the failures).
 	Invariants map[string]string `json:"invariants,omitempty"`
 	// Golden is "match", "updated", "written" or "mismatch".
 	Golden     string  `json:"golden,omitempty"`

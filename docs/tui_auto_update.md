@@ -1,7 +1,8 @@
 # Quiet TUI updates and safe startup
 
-The installed full CLI is a stable bootstrap and last-resort fallback. Automatic
-updates never replace it. Runtime versions are immutable files below the adjacent
+The installed full CLI is a stable bootstrap. Automatic updates never replace
+it. Once boot state exists, its embedded CLI is not a fallback runtime. Runtime
+versions are immutable files below the adjacent
 `.cxp-runtime/versions/` directory. Source builds with an unknown version and
 unmanaged invocations do not start the automatic worker.
 
@@ -45,7 +46,7 @@ windows continue to use A.
 
 ## Startup handoff and fallback
 
-For an interactive TUI, the stable bootstrap stays as a parent. A nonce-authenticated
+For a candidate TUI trial, the stable bootstrap stays as a parent. A nonce-authenticated
 loopback connection connects before local CLI initialization. The candidate
 waits for the parent to acknowledge process-tree ownership before continuing.
 It reports `READY` after the first draw and before accepting input or starting
@@ -55,8 +56,13 @@ readiness does not depend on GitHub, model service availability, or authenticati
 Before handoff, a crash or a 10-second deadline terminates the owned process tree,
 restores the terminal, and starts A in the same invocation. Recovery does not
 require a successful state write, lock, cleanup, or network request. Each
-invocation makes at most one fallback attempt. If the confirmed version itself
-fails startup, its retained previous version can be used. A fresh installation without boot evidence can use the full bootstrap CLI.
+invocation makes at most one fallback attempt, from the unconfirmed candidate
+to the existing confirmed runtime. The confirmed runtime is started directly,
+once per invocation. Its exit status is returned without replay, version
+selection changes, or fallback to `previous` or the embedded bootstrap CLI.
+Missing or unexecutable confirmed files stop with a startup error. Ordinary
+profile, argument, and configuration errors never mark a version unhealthy.
+A fresh installation without boot evidence can use the full bootstrap CLI.
 Corrupt, incompatible, or lost published boot state stops before application
 setup. An unavailable candidate instead uses the confirmed runtime.
 
@@ -66,6 +72,20 @@ they may wait indefinitely, but do not promote the candidate. A killed parent
 before handoff closes the connection and makes the candidate exit. Unix process
 groups and Windows Job Objects own startup descendants; handoff releases the
 Windows kill-on-close rule so ordinary detached terminal lifetimes stay intact.
+
+## Deploying the confirmed-runtime rollback fix
+
+The dispatch policy belongs to the physical bootstrap, not just the selected
+runtime. A runtime-only `cxp upgrade` or background TUI update preserves that
+bootstrap and cannot repair an older dispatcher's policy. Deploy this fix using
+the platform installer with the fixed release: it replaces the physical entry
+and invokes `--cxp-install-bootstrap --target <installed-entry>`. Do not edit
+boot records or downgrade a Teams database to work around the old policy.
+Existing windows keep their running executable. Teams helper lifecycle changes
+must be requested separately through its control chat.
+
+The regression gate reinstalls over a pinned historical native bootstrap and
+checks that an invalid profile leaves the new confirmed version selected.
 
 ## Download and publisher boundary
 
@@ -97,7 +117,9 @@ root. A digest in this manifest is **not** an offline signature or protection
 against a compromised publisher account. CI needs no new signing secret. Any
 future incompatible configuration or state migration must change the boot
 protocol and provide a tested automatic bootstrap migration. Automatic
-releases must remain readable by retained fallback versions.
+candidates must not make state unreadable by the still-confirmed version before
+confirmation. A retained `previous` is not an automatic recovery target; explicit
+recovery still requires the operator to establish data compatibility.
 
 ## Bounded I/O and failure handling
 

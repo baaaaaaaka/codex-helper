@@ -10,24 +10,25 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
-func TestInitProfileHostKeyRetryIntegration(t *testing.T) {
+func TestInitProfileHostKeyFirstUseIntegration(t *testing.T) {
 	if os.Getenv("SSH_TEST_ENABLED") != "1" {
 		t.Skip("SSH integration tests disabled")
 	}
-	if os.Getenv("SSH_HOSTKEY_RETRY_TEST") != "1" {
-		t.Skip("SSH host-key retry integration test disabled")
+	if os.Getenv("SSH_HOSTKEY_INIT_TEST") != "1" {
+		t.Skip("SSH first-use host-key integration test disabled")
 	}
 	host := os.Getenv("SSH_TEST_HOST")
 	port := os.Getenv("SSH_TEST_PORT")
 	user := os.Getenv("SSH_TEST_USER")
 	key := os.Getenv("SSH_TEST_KEY")
 	if host == "" || port == "" || user == "" || key == "" {
-		t.Skip("missing SSH_TEST_* env vars")
+		t.Fatal("SSH first-use host-key explicitly enabled but SSH_TEST_* fixture is incomplete")
 	}
 	if _, err := os.Stat(key); err != nil {
-		t.Skipf("SSH test key unavailable: %v", err)
+		t.Fatalf("SSH first-use host-key explicitly enabled but test key is unavailable: %v", err)
 	}
 
 	home := t.TempDir()
@@ -37,10 +38,12 @@ func TestInitProfileHostKeyRetryIntegration(t *testing.T) {
 	}
 	configPath := filepath.Join(sshDir, "config")
 	configText := strings.Join([]string{
-		"Host " + host,
+		"Host cxp-hostkey",
+		"  HostName " + host,
+		"  User " + user,
+		"  Port " + port,
 		"  IdentityFile " + key,
 		"  IdentitiesOnly yes",
-		"  StrictHostKeyChecking ask",
 		"  UserKnownHostsFile " + filepath.Join(sshDir, "known_hosts"),
 		"  GlobalKnownHostsFile /dev/null",
 		"  GSSAPIAuthentication no",
@@ -52,34 +55,38 @@ func TestInitProfileHostKeyRetryIntegration(t *testing.T) {
 	t.Setenv("HOME", home)
 
 	store := newTempStore(t)
-	input := strings.Join([]string{
-		"n",
-		host,
-		port,
-		user,
-		"y",
-		"yes",
-		"",
-	}, "\n")
+	// The obsolete interactive host-key retry was removed from production.
+	// Exercise the current config-host path with a genuinely empty host file.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	var out bytes.Buffer
 	prof, err := initProfileInteractiveWithDeps(
-		context.Background(),
+		ctx,
 		store,
-		bufio.NewReader(strings.NewReader(input)),
+		bufio.NewReader(strings.NewReader("y\n1\n")),
 		defaultSSHOps{},
 		&out,
 	)
 	if err != nil {
 		t.Fatalf("initProfileInteractiveWithDeps error: %v\noutput:\n%s", err, out.String())
 	}
-	if prof.Host != host || prof.User != user {
+	if prof.Host != "cxp-hostkey" || prof.User != user {
 		t.Fatalf("unexpected profile: %+v", prof)
 	}
-	if prof.SSHArgs != nil {
-		t.Fatalf("expected direct SSH profile without managed key args, got %v", prof.SSHArgs)
+	if len(prof.SSHArgs) != 2 || prof.SSHArgs[0] != "-F" || prof.SSHArgs[1] != configPath {
+		t.Fatalf("expected isolated SSH config, got %v", prof.SSHArgs)
 	}
-	if _, err := os.Stat(filepath.Join(sshDir, "known_hosts")); err != nil {
-		t.Fatalf("expected interactive host-key check to write known_hosts: %v", err)
+	knownHosts := filepath.Join(sshDir, "known_hosts")
+	first, err := os.ReadFile(knownHosts)
+	if err != nil || len(bytes.TrimSpace(first)) == 0 {
+		t.Fatalf("first connection did not persist the host key: %v", err)
+	}
+	if err := initialSSHProbe(ctx, defaultSSHOps{}, prof); err != nil {
+		t.Fatalf("repeat connection with recorded host key: %v", err)
+	}
+	again, err := os.ReadFile(knownHosts)
+	if err != nil || !bytes.Equal(first, again) {
+		t.Fatalf("repeat probe changed known hosts: %v", err)
 	}
 	cfg, err := store.Load()
 	if err != nil {

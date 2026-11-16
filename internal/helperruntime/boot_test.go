@@ -209,21 +209,52 @@ func TestSafeBootPromotionRetainsGoodAndInvalidatesOldSnapshot(t *testing.T) {
 	}
 }
 
-func TestSafeBootConfirmedFailureCannotUndoConcurrentExplicitSelection(t *testing.T) {
-	c, s := stageBootFixture(t)
-	claim, ok := consumeBootCandidate(c.Root, s)
-	if !ok {
-		t.Fatal("claim failed")
-	}
-	confirmBootCandidate(c.Root, claim)
-	s, _ = ReadBoot(c.Root)
-	if err := WithRootLock(context.Background(), c.Root, func() error { return Activate(c.Root, "v3.0.0") }); err != nil {
-		t.Fatal(err)
-	}
-	rejectBootGood(c.Root, s)
-	got, err := ReadBoot(c.Root)
-	if err != nil || got.Good != "v3.0.0" || got.Previous != "v2.0.0" {
-		t.Fatalf("stale failure changed explicit choice: %+v %v", got, err)
+func TestSafeBootConfirmedLaunchNeverReplaysOrWrites(t *testing.T) {
+	for _, execError := range []bool{false, true} {
+		t.Run(fmt.Sprint(execError), func(t *testing.T) {
+			c, s := stageBootFixture(t)
+			claim, ok := consumeBootCandidate(c.Root, s)
+			if !ok {
+				t.Fatal("claim failed")
+			}
+			confirmBootCandidate(c.Root, claim)
+			s, err := ReadBoot(c.Root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(filepath.Join(c.Root, BootFile))
+			if err != nil {
+				t.Fatal(err)
+			}
+			old := launchRuntimeFn
+			t.Cleanup(func() { launchRuntimeFn = old })
+			calls := 0
+			launchRuntimeFn = func(path string, args, env []string) (int, bool, error) {
+				calls++
+				if path != VersionPath(c.Root, s.Good, runtime.GOOS) {
+					t.Fatalf("wrong runtime: %s", path)
+				}
+				if execError {
+					return 0, false, fmt.Errorf("exec failed")
+				}
+				return 42, true, nil
+			}
+			code, handled, err := launchBoot(c.Root, c.EntryPath, []string{"cxp", "version"}, s)
+			if calls != 1 || !handled {
+				t.Fatalf("calls=%d handled=%v", calls, handled)
+			}
+			if execError {
+				if code != 1 || !errors.Is(err, ErrBootstrapState) {
+					t.Fatalf("%d %v", code, err)
+				}
+			} else if code != 42 || err != nil {
+				t.Fatalf("%d %v", code, err)
+			}
+			after, err := os.ReadFile(filepath.Join(c.Root, BootFile))
+			if err != nil || string(before) != string(after) {
+				t.Fatalf("launch rewrote state: %v", err)
+			}
+		})
 	}
 }
 

@@ -475,7 +475,7 @@ func TestBehaviorCatalog(t *testing.T) {
 			uncovered = append(uncovered, e.id)
 		}
 	}
-	t.Logf("catalog: %d rows; keep %d (implemented %d, partial %d, missing %d; no scenario %d, exempt %d); removed-by-owner %d; ask-owner %d; scenarios %d",
+	t.Logf("catalog: %d rows; keep %d (implementation: complete %d, partial %d, missing %d; E2E links: absent %d, exempt %d); removed-by-owner %d; ask-owner %d; scenario declarations %d (links do not prove branch execution)",
 		len(es), keep, impl, partial, missing, len(uncovered), exempt, removed, ask, len(sc.ids))
 	if len(uncovered) == 0 {
 		return

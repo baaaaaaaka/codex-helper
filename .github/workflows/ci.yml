@@ -372,6 +372,11 @@ jobs:
           go-version: "1.25.11"
           cache: true
 
+      - name: Node for offline managed Codex upgrade scenarios
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
       - name: Scenarios through the production entry point
         shell: bash
         env:

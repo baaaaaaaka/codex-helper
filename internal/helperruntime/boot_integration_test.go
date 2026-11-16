@@ -5,6 +5,7 @@ package helperruntime
 // Run only in a disposable Docker/native CI environment. These tests launch
 // native child processes using the production dispatcher, lock and IPC code.
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -165,30 +166,42 @@ func TestBootE2EProbeBoundsOutputAndKillsDescendants(t *testing.T) {
 	assertBootDescendantsStopped(t, events)
 }
 
-func TestBootE2EConfirmedStartupFailureUsesPreviousOnThisAndNextStart(t *testing.T) {
-	for _, mode := range []string{"crash", "missing"} {
+func TestBootE2EConfirmedStartupFailureNeverFallsBack(t *testing.T) {
+	for _, mode := range []string{"crash", "missing", "invalid-executable"} {
 		t.Run(mode, func(t *testing.T) {
 			c, dir := bootProcessFixture(t)
 			if err := writeBoot(c.Root, BootState{Schema: BootProtocol, Generation: 3, Good: "v2.0.0", Previous: "v1.0.0"}); err != nil {
 				t.Fatal(err)
 			}
+			path := VersionPath(c.Root, "v2.0.0", runtime.GOOS)
 			if mode == "missing" {
-				if err := os.Remove(VersionPath(c.Root, "v2.0.0", runtime.GOOS)); err != nil {
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+			} else if mode == "invalid-executable" {
+				if err := os.WriteFile(path, []byte("invalid executable"), 0755); err != nil {
 					t.Fatal(err)
 				}
 			}
+			before, err := os.ReadFile(filepath.Join(c.Root, BootFile))
+			if err != nil {
+				t.Fatal(err)
+			}
 			for i := 0; i < 2; i++ {
-				if out, err := bootCommand(t, c, dir, mode, "tui").CombinedOutput(); err != nil {
-					t.Fatalf("start %d: %s %v", i, out, err)
+				if out, err := bootCommand(t, c, dir, mode, "tui").CombinedOutput(); err == nil {
+					t.Fatalf("start %d hid confirmed runtime failure: %s", i, out)
 				}
 			}
-			s, err := ReadBoot(c.Root)
-			if err != nil || s.Good != "v1.0.0" || s.Previous != "" || s.Candidate != nil {
-				t.Fatalf("%+v %v", s, err)
+			after, err := os.ReadFile(filepath.Join(c.Root, BootFile))
+			if err != nil || !bytes.Equal(before, after) {
+				t.Fatalf("failure rewrote boot record: %v", err)
 			}
 			events := bootEvents(t, dir)
-			if strings.Count(events, "input v1.0.0") != 2 || strings.Count(events, "entered v2.0.0") > 1 {
-				t.Fatal(events)
+			if strings.Contains(events, "v1.0.0") || strings.Contains(events, "base") {
+				t.Fatalf("failure executed another version: %s", events)
+			}
+			if mode == "crash" && strings.Count(events, "entered v2.0.0") != 2 {
+				t.Fatalf("confirmed version was not attempted exactly once per command: %s", events)
 			}
 		})
 	}

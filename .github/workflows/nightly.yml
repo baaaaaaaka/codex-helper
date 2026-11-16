@@ -236,6 +236,13 @@ jobs:
           set -euo pipefail
           SSH_TEST_ENABLED=1 go test ./internal/ssh -count=1 -run 'TestTunnelIntegration(StartStop|AcceptsNewHostKey)$' -v
           SSH_TEST_ENABLED=1 SSH_STACK_INTEGRATION_TEST=1 go test ./internal/stack -count=1 -run 'TestStackIntegrationHTTPProxyConnectThroughSSHTunnel$' -v
+          SSH_TEST_ENABLED=1 SSH_HOSTKEY_INIT_TEST=1 go test ./internal/cli -count=1 -timeout=2m -run '^TestInitProfileHostKeyFirstUseIntegration$' -json | tee "$RUNNER_TEMP/ssh-hostkey-first-use.jsonl"
+          python3 -c '
+          import json, sys
+          with open(sys.argv[1]) as stream:
+              passed = any(event.get("Action") == "pass" and event.get("Test") == "TestInitProfileHostKeyFirstUseIntegration" for event in map(json.loads, stream))
+          sys.exit(0 if passed else "required SSH first-use test did not execute and pass")
+          ' "$RUNNER_TEMP/ssh-hostkey-first-use.jsonl"
           SSH_TEST_ENABLED=1 SSH_CONFIG_PROFILE_INIT_TEST=1 go test ./internal/cli -count=1 -run 'TestInitProfileSSHConfigProfileIntegration$' -v
 
       - name: SSH accept-new client support

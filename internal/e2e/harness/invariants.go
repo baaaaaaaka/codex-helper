@@ -199,23 +199,7 @@ func (s *Scenario) teardown() {
 			running = true
 		}
 	}
-	if running && !s.T.Failed() {
-		if s.Settle(IdleSettleQuiet, IdleSettleMax) {
-			from := s.Graph.LastSeq()
-			time.Sleep(IdleWindow)
-			for _, r := range s.Graph.Requests(fakegraph.RequestFilter{Since: from}) {
-				if isGraphWrite(r) && !s.idleAllowed(r) {
-					res.add(InvIdleQuiet, "idle helper wrote %s (%s) within %v after it settled: %s", r.Route, r.Instance, IdleWindow, clipBody(r.Body))
-				}
-			}
-		} else {
-			res.note[InvIdleQuiet] = "not checked: the helper did not settle (a turn or writes still running)"
-		}
-	} else if !running {
-		res.note[InvIdleQuiet] = "not checked: no helper running at teardown"
-	} else {
-		res.note[InvIdleQuiet] = "not checked: the scenario already failed"
-	}
+	s.checkIdle(res, running)
 
 	// 2. Stop every helper.
 	for _, u := range suts {
@@ -295,6 +279,30 @@ func (s *Scenario) teardown() {
 
 	summary := s.reportInvariants(res)
 	s.emitVerdict(summary, golden, cpu)
+}
+
+// checkIdle requires normal scenarios to finish their work before observing
+// silence. Fault scenarios may explicitly waive idle-quiet with a reason.
+func (s *Scenario) checkIdle(res *invResults, running bool) {
+	if _, waived := s.Opts.Invariants.Waive[InvIdleQuiet]; waived {
+		// A scenario that intentionally keeps work running must say so.
+	} else if running && !s.T.Failed() {
+		if s.Settle(IdleSettleQuiet, IdleSettleMax) {
+			from := s.Graph.LastSeq()
+			time.Sleep(IdleWindow)
+			for _, r := range s.Graph.Requests(fakegraph.RequestFilter{Since: from}) {
+				if isGraphWrite(r) && !s.idleAllowed(r) {
+					res.add(InvIdleQuiet, "idle helper wrote %s (%s) within %v after it settled: %s", r.Route, r.Instance, IdleWindow, clipBody(r.Body))
+				}
+			}
+		} else {
+			res.add(InvIdleQuiet, "helper did not settle within %v (a turn or writes still running); scenarios that intentionally keep work active must explicitly waive %s", IdleSettleMax, InvIdleQuiet)
+		}
+	} else if !running {
+		res.note[InvIdleQuiet] = "not checked: no helper running at teardown"
+	} else {
+		res.note[InvIdleQuiet] = "not checked: the scenario already failed"
+	}
 }
 
 // reportInvariants applies waivers and exceptions, fails the test for the

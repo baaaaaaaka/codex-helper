@@ -23,7 +23,7 @@ import (
 func TestCodexTooOldAndUpdateCommand(t *testing.T) {
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "CODEX-UPGRADE", harness.Options{
-		Guarantees: []string{"codex-auto-upgrade"},
+		Guarantees: []string{"F-SVC-12"},
 		Title:      "Codex rejects a request as too old: one notice, no automatic retry, `helper retry last` answers; `codex update now` with --codex-path is refused with the reason",
 		Budget:     90 * time.Second,
 	})

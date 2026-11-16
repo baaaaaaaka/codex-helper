@@ -305,10 +305,8 @@ func superviseBoot(target string, args, env []string, onReady func(), timeout ti
 // always use the confirmed version and cannot accidentally promote a trial.
 func launchBoot(root, entry string, args []string, s BootState) (int, bool, error) {
 	interactive := historyTUIArgs(args[1:])
-	recovering := false
 	if interactive && AutoUpdateAllowed() && s.Candidate != nil && s.Candidate.Attempt == "" {
 		if claim, ok := consumeBootCandidate(root, s); ok {
-			recovering = true
 			path, err := checkedRuntime(root, claim.Candidate.Version)
 			if err == nil {
 				r := superviseBoot(path, args, bootEnvironment(root, entry, claim.Candidate.Version), func() { confirmBootCandidate(root, claim) }, bootReadyTimeout)
@@ -320,24 +318,18 @@ func launchBoot(root, entry string, args []string, s BootState) (int, bool, erro
 		}
 	}
 	path, err := checkedRuntime(root, s.Good)
-	if err == nil {
-		if !interactive || recovering {
-			return launchRuntimeFn(path, append([]string{path}, args[1:]...), bootEnvironment(root, entry, s.Good))
-		}
-		r := superviseBoot(path, args, bootEnvironment(root, entry, s.Good), func() {}, bootReadyTimeout)
-		if r.ready || r.cancelled {
-			return r.code, true, nil
-		}
+	if err != nil {
+		return 1, true, fmt.Errorf("%w: confirmed runtime %s is unavailable: %v", ErrBootstrapState, s.Good, err)
 	}
-	if s.Previous != "" {
-		if previous, err := checkedRuntime(root, s.Previous); err == nil {
-			rejectBootGood(root, s)
-			return launchRuntimeFn(previous, append([]string{previous}, args[1:]...), bootEnvironment(root, entry, s.Previous))
-		}
+	// A normal command error says nothing about version health. Never supervise
+	// Good for rollback, replay its command on Previous, or rewrite its selection.
+	// Fail closed on exec errors too: the caller must not run the bootstrap's
+	// embedded CLI, which may be unable to read this version's business state.
+	code, handled, err := launchRuntimeFn(path, append([]string{path}, args[1:]...), bootEnvironment(root, entry, s.Good))
+	if err != nil {
+		return 1, true, fmt.Errorf("%w: launch confirmed runtime %s: %v", ErrBootstrapState, s.Good, err)
 	}
-	// The stable entry contains the original full CLI. Returning unhandled runs
-	// that copy directly, without dispatch, network, repair, or another retry.
-	return 0, false, nil
+	return code, handled, nil
 }
 
 func bootEnvironment(root, entry, version string) []string {

@@ -54,11 +54,31 @@ func Run(m *testing.M) int {
 }
 
 var (
-	binDir     string
-	fakeCodex  string
-	versionsMu sync.Mutex
-	versions   = map[string]string{}
+	binDir        string
+	fakeCodex     string
+	versionsMu    sync.Mutex
+	versions      = map[string]string{}
+	codexVersions = map[string]string{}
 )
+
+// VersionedFakeCodex is a real app-server fixture with a distinct --version.
+// It is installed through npm by the offline upgrade lifecycle scenarios.
+func VersionedFakeCodex(v string) (string, error) {
+	versionsMu.Lock()
+	defer versionsMu.Unlock()
+	if p, ok := codexVersions[v]; ok {
+		return p, nil
+	}
+	if binDir == "" || strings.ContainsAny(v, `/\\`) {
+		return "", fmt.Errorf("invalid fake Codex build request %q", v)
+	}
+	p := filepath.Join(binDir, "codex-"+v)
+	if err := goBuild(p, "./internal/e2e/fakecodex/cmd/fakecodex", "-ldflags", "-X main.version="+v); err != nil {
+		return "", err
+	}
+	codexVersions[v] = p
+	return p, nil
+}
 
 // VersionedCLI returns a cxp binary built like the SUT but reporting
 // version v (a newer release installed while the helper runs the

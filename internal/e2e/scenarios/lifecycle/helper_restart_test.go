@@ -17,9 +17,9 @@ import (
 // new SUT instance, after that instance's first Graph request, and the old
 // instance is silent from then on. Work continues afterwards.
 //
-// The SUT has to restart itself (as under its service supervisor); the
-// harness does not restart it. See the M3 report for the adapter gap on
-// the old core.
+// The SUT requests a restart by exiting with code 75. The harness models
+// the service supervisor by starting the same configured executable again.
+// Installed-entry selection and native service management have separate tests.
 func TestHelperRestartConfirmation(t *testing.T) {
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "RESTART", harness.Options{

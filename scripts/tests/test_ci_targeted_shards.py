@@ -43,6 +43,33 @@ def step_blocks(job: str) -> dict[str, str]:
 
 
 class TargetedShardWorkflowTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == "posix", "SSH integration gate uses Bash")
+    def test_hostkey_init_ci_requires_actual_pass(self):
+        step = step_blocks(targeted_job())["SSH live integration regressions (Linux only)"]
+        script = textwrap.dedent(step.split("run: |\n", 1)[1])
+        with tempfile.TemporaryDirectory(prefix="ssh-ci-gate-") as tmp:
+            root = pathlib.Path(tmp)
+            fake_go = root / "go"
+            fake_go.write_text("""#!/usr/bin/env bash
+if [[ "$*" == *TestInitProfileHostKeyFirstUseIntegration* ]]; then
+  [[ "${SSH_TEST_ENABLED:-}" == 1 && "${SSH_HOSTKEY_INIT_TEST:-}" == 1 ]] || exit 1
+  case "$SSH_GATE_RESULT" in
+    pass) echo '{"Action":"pass","Test":"TestInitProfileHostKeyFirstUseIntegration"}' ;;
+    skip) echo '{"Action":"skip","Test":"TestInitProfileHostKeyFirstUseIntegration"}' ;;
+    missing) echo '{"Action":"pass","Package":"cli"}' ;;
+    fail) echo '{"Action":"fail","Test":"TestInitProfileHostKeyFirstUseIntegration"}'; exit 1 ;;
+  esac
+fi
+""")
+            fake_go.chmod(0o700)
+            for result in ("pass", "skip", "missing", "fail"):
+                with self.subTest(result=result):
+                    env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ["PATH"],
+                               RUNNER_TEMP=str(root), SSH_GATE_RESULT=result)
+                    run = subprocess.run(["bash", "-c", script], env=env,
+                                         capture_output=True, text=True)
+                    self.assertEqual(run.returncode == 0, result == "pass", run.stdout + run.stderr)
+
     @unittest.skipUnless(os.name == "posix", "Linux race grouping uses Bash")
     def test_race_groups_cover_original_packages_once(self):
         original = subprocess.check_output(

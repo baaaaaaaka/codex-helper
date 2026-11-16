@@ -16,10 +16,14 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakecodex"
 )
 
+// Set by the offline npm upgrade scenarios so replacement is observable through
+// the real version probe, not just a scripted successful response.
+var version = "0.58.0"
+
 func main() {
 	args := os.Args[1:]
 	if len(args) > 0 && (args[0] == "--version" || args[0] == "-V") {
-		fmt.Println("codex-cli 0.58.0")
+		fmt.Println("codex-cli " + version)
 		return
 	}
 	if len(args) == 0 || args[0] != "app-server" {

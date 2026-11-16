@@ -312,21 +312,6 @@ func confirmBootCandidate(root string, claim BootState) {
 	})
 }
 
-func rejectBootGood(root string, snapshot BootState) {
-	if snapshot.Previous == "" {
-		return
-	}
-	_ = tryBootMutation(root, func(s BootState) error {
-		if s.Generation != snapshot.Generation || s.Good != snapshot.Good {
-			return fmt.Errorf("stale boot failure")
-		}
-		s.Good, s.Previous = s.Previous, ""
-		s.Candidate = nil
-		s.Generation++
-		return writeBoot(root, s)
-	})
-}
-
 func checkedRuntime(root, version string) (string, error) {
 	path := VersionPath(root, version, runtime.GOOS)
 	info, err := os.Stat(path)

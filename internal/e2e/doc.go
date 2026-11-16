@@ -18,6 +18,16 @@
 //     (docs/teams-e2e-test-seam.md): Microsoft endpoints, instance tag,
 //     timing profile, host name.
 //
+// The default adapter disables runtime dispatch, automatic updates and service
+// management, and models the supervisor by restarting the configured binary on
+// exit 75. Dedicated entry scenarios override runtime dispatch. Native service,
+// installer and bootstrap behavior belongs to its separate CI gates; a business
+// scenario passing here is not evidence that those lifecycle paths ran.
+// Managed Codex upgrade scenarios use real npm with an offline registry fixture.
+// Normal scenarios must settle before the idle check; intentional active-work
+// scenarios declare a reasoned idle-quiet waiver. Verdicts distinguish checked,
+// waived and not-checked invariants. Catalog links are not branch coverage.
+//
 // TestBlackBoxBoundary enforces the boundary on imports: E2E code may
 // import only the harness, the fakes, rollout, the standard library and
 // third-party packages.

@@ -367,3 +367,64 @@ func TestCandidateLegacyPreProtocolEntryRecovery(t *testing.T) {
 		t.Fatal("old runtime data removed", err)
 	}
 }
+
+// Runtime-only updates intentionally preserve the physical bootstrap. Installing
+// the fixed entry must remove the old dispatcher's automatic rollback behavior.
+func TestCandidateLegacyNativeReinstallFixesCommandRollback(t *testing.T) {
+	legacyEnvironment(t)
+	outer := os.Getenv("CXP_NATIVE_FIXTURE")
+	if outer == "" {
+		t.Fatal("CXP_NATIVE_FIXTURE is required")
+	}
+	install := t.TempDir()
+	entry := filepath.Join(install, helperruntime.BinaryName(runtime.GOOS))
+	root := filepath.Join(install, ".cxp-runtime")
+	copyUpgradeBinary(t, outer, entry)
+	runUpgradeCLI(t, entry, false, "--cxp-install-bootstrap", "--target", entry)
+	fixed := buildUpgradeCandidate(t, "v9.99.0")
+	copyUpgradeBinary(t, fixed, entry)
+	runUpgradeCLI(t, entry, false, "--cxp-install-bootstrap", "--target", entry)
+	// The pinned previous runtime understands schema 6. Keep actual current
+	// business data present; successful dispatch must still read it afterward.
+	storePath := filepath.Join(install, "core.sqlite")
+	st, err := store.Open(storePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Acquire(store.Ident{Host: "reinstall-regression", PID: os.Getpid(), BootID: "isolated"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Update(func(tx *store.Tx) error { return tx.SetMeta("engine_running_version", "v9.99.0-regression") }); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_HELPER_TEAMS_CORE_STORE", storePath)
+	before, err := os.ReadFile(filepath.Join(root, helperruntime.BootFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := filepath.Join(install, "config.json")
+	if err := os.WriteFile(config, []byte(`{"proxyEnabled":false,"profiles":[{"id":"existing","name":"existing"}]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	out := runUpgradeCLI(t, entry, true, "--config", config, "version")
+	if strings.Count(string(out), `profile "version" not found`) != 1 {
+		t.Fatalf("expected one ordinary profile error: %s", out)
+	}
+	after, err := os.ReadFile(filepath.Join(root, helperruntime.BootFile))
+	if err != nil || !bytes.Equal(before, after) {
+		t.Fatalf("reinstalled bootstrap downgraded: %v", err)
+	}
+	boot, err := helperruntime.ReadBoot(root)
+	if err != nil || boot.Good != "v9.99.0" || boot.Previous != "v0.1.22-rc.104" {
+		t.Fatalf("selection %+v: %v", boot, err)
+	}
+	if out := runUpgradeCLI(t, entry, false, "--version"); !strings.Contains(string(out), "9.99.0") {
+		t.Fatalf("next start: %s", out)
+	}
+	if out := runUpgradeCLI(t, entry, false, "--config", config, "teams", "service", "status"); !strings.Contains(string(out), "Running version: v9.99.0-regression") {
+		t.Fatalf("current store unreadable after failed command: %s", out)
+	}
+}
