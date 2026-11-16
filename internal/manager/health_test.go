@@ -1,8 +1,10 @@
 package manager
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"testing"
@@ -335,5 +337,49 @@ func startCustomHealthServer(t *testing.T, status int, body string) (port int, c
 	return tcp.Port, func() {
 		_ = srv.Shutdown(context.Background())
 		_ = ln.Close()
+	}
+}
+
+func TestHealthClientCONNECTCancellationAfterDial(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	defer close(release)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		req, err := http.ReadRequest(bufio.NewReader(conn))
+		if err == nil {
+			req.Body.Close()
+			close(entered)
+		}
+		<-release
+	}()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		result <- (HealthClient{Timeout: time.Minute}).CheckHTTPProxyCONNECTContext(ctx, ln.Addr().(*net.TCPAddr).Port, "graph.microsoft.com:443")
+	}()
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("CONNECT was not sent")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("CONNECT ignored cancellation")
 	}
 }

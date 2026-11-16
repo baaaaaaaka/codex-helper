@@ -159,3 +159,90 @@ commands 310.495s、cost 55.201s、delegation 20.213s 全部通过。初次默�
 复验在 TestMain 编译阶段遇到 fork/exec resource temporarily unavailable；限制编译
 并发后完成，不属于沙箱权限或产品功能失败。边界测试及 entry read/search/fetch 场景
 另以 -count=1 在 Docker 通过；主机边界测试、vet、diff --check 也通过。
+
+
+## 2026-11-16：读取入口按需建立 Graph 连接
+
+初轮基线：上游 `main` 的 `9a533187`；独立分支 `fix/teams-read-lease-20261116`。
+最终同步到上游 `cf24544f`（TUI 历史缓存修复），无冲突；同步后另行复验，见下表。
+发布前再次同步到 `2ed23ad4`，包含调度顺序和 entry 测试修复；无冲突。
+本轮源码/测试/skill/CI 指纹（不含本验收文档；算法同前）：`24235033fb90a9cb35dd507d290919ec250669948ae849e0869718afd597adf4`。
+工作区：`/home/baka/.local/state/codex-helper/workspaces/teams-read-lease-XNs2Tm5G`。
+以下更新覆盖前文关于“必须预先存在可复用代理”的旧网络约束；原读取、分页、下载与认证协议不变。
+
+### 行为和边界
+
+删除读取 CLI 独有的被动网络分支。read/search/fetch 共用已有 Graph HTTP client lease：
+按配置直连、复用健康代理，或建立仅属于本次调用的私有 stack。读取会话持有 Reader 和 lease，
+正常退出、读取失败时均释放；借用的代理不会被停止。HTTP client 不再附加固定 30 秒整体超时，
+仍由调用方 context 覆盖完整分页/下载。读取路径不调用 RetireSuspects，不清理其他代理，
+不获取 helper 状态、不改聊天绑定、不启动或重启 helper，不发布共享代理或新增数据库结构。
+没有加入新的自动重试层、跨进程锁、引用计数或回收服务。
+
+stack 新增 StartContext，旧 Start 保持后台 context 兼容入口。TCP/SOCKS 就绪等待和 Graph
+代理发现、CONNECT 探测接入调用方取消。取消后不再重试端口或启动新的 tunnel；成功取得的
+stack 由显式 Close 管理，不随启动 context 的取消自动停止。关闭使用独立的清理 context。
+现有 SSH 能力/host-key 准备仍保留其原有内部有界探测；本轮没有重写旧 SSH 兼容机制。
+因此操作取消允许已有准备探测与资源释放的收尾时间，不承诺整个进程在 deadline 瞬间退出。
+
+### 最终验证
+
+测试禁用 Go 结果缓存；保留编译缓存。主机 Go 1.26.3，容器 Go 1.25.11。
+主机 GOCACHE 使用已创建的 `/home/baka/.local/state/codex-helper/go-build`，GOTMPDIR 使用
+本次工作区相邻的 `teams-read-lease-XNs2Tm5G-tests/tmp`，编译并发限制为 2。
+
+| 环境 | 实际入口 | 结果 |
+| --- | --- | --- |
+| Linux amd64 | `go test -race -count=1 -timeout=5m ./internal/stack ./internal/manager ./internal/cli -run 'Test(StartContext\|HealthClient.*CONNECT\|Teams(Read\|Search\|Fetch\|GraphHTTP))'` | 通过，包含最终新增所有权测试 |
+| 隔离 Docker，Go 1.25.11 | `go test -p=1 -count=1 -timeout=10m ./internal/cli ./internal/stack ./internal/manager ./internal/channel/teams ./internal/skills` | 完整包通过；CLI 43.198s，stack 1.195s，manager 0.263s；最后仅补充了独立的成功所有权测试，已由 Linux race 和 Windows 原生执行 |
+| 同一隔离机制 | `go test -p=1 -count=1 -timeout=8m -v ./internal/e2e ./internal/e2e/scenarios/entry -run 'Test(BlackBoxBoundary\|DiagnosticsAreReadOnly\|TeamsReadSearchFetchWithoutHelper\|TeamsReadPrivateProxyProcessCleanup)$'` | 通过；entry 14.522s；实际 CLI 读取/分页/搜索/下载，真实 SSH 替身的退出与启动超时清理 |
+| 同一隔离机制 | `bash scripts/ci/run_e2e_shard.sh 2`，Go 结果缓存禁用 | 完整受影响分片通过；entry 253.114s、turns 87.301s、chats 32.038s、notify 29.416s、delegation 12.976s |
+| 原生 Windows amd64，CGO_ENABLED=0 | 交叉编译后由 Windows PowerShell 实际执行 CLI、stack、manager 测试程序 | `^TestTeams(Read\|GraphHTTP)`、`^TestStartContext`、`^TestHealthClient.*(CONNECT\|ContextCancellation)` 全部通过，无新增用例跳过 |
+| macOS arm64，CGO_ENABLED=0 | `GOOS=darwin GOARCH=arm64 go build ./internal/cli ./internal/stack ./internal/manager` | 交叉编译通过，未做 macOS 原生执行 |
+| Linux amd64 | `go vet ./internal/cli ./internal/stack ./internal/manager ./internal/channel/teams ./internal/e2e/scenarios/entry` | 通过 |
+| Linux amd64 | Release 中现有 Graph 诊断筛选式、manager 取消筛选式 | 通过；改名测试同步更新 Release 选择器 |
+| Linux amd64 | actionlint v1.7.11 检查 `.github/workflows/ci.yml`、`release.yml` | 通过 |
+| Linux amd64 | `git diff --check`、修改 Go 文件 gofmt 检查、`go test -count=1 ./internal/skills` | 通过 |
+
+同步上游 `cf24544f` 后，使用同一空 fixture 隔离容器重新执行上述完整相关包入口，全部通过：
+CLI 43.330s、stack 1.182s、manager 0.289s、Teams 2.914s、skills 1.041s。
+同时重跑上述边界/诊断/read/search/fetch/私有代理清理 E2E 入口，全部通过，entry 8.281s。
+Linux 同一 focused race 入口与 actionlint 也重新通过。上游新增的 TUI 修改没有触及本轮连接路径；
+完整分片及 Windows/macOS 结果来自同步前的相同连接实现，未重复执行整个平台矩阵。
+再次同步上游 `2ed23ad4` 后，Linux focused race 与隔离 Docker 完整 E2E 分片 2 均通过；
+entry 253.614s、turns 86.796s、chats 32.179s、notify 29.408s、delegation 12.982s。
+
+Docker 使用开发技能的临时容器脚本副本，仅在测试 Dockerfile 中加入构建阶段的 Go 工具链，
+使容器能执行 go test。通过 Windows Docker 客户端连接现有 Docker 服务；Linux Docker CLI
+链接目标及 socket 缺失属于测试环境问题，未修改宿主安装。容器使用空 Codex/CXP/SSH fixture，
+未复制生产凭据、Teams 状态或 PID；真实生命周期与 E2E 均在容器内，退出后销毁容器。
+测试脚本和完整日志保存在工作区相邻的私有测试目录，不进入产品源码或安装目录。
+
+### 回归有效性和已修正的测试问题
+
+旧 TestTeamsReadNetworkingHasNoLifecycle 固化了本次要修复的被动网络约束，改为验证
+无共享代理时自动创建私有 stack、多个 session 的资源隔离、配置和实例记录不变、失败释放及
+JSON 输出兼容。借用代理的测试补充 Close 后仍可访问代理的断言。
+通过 Go overlay 恢复旧的“无可复用代理立即报错”行为时，TestTeamsReadPrivateLeaseLifetime
+按预期失败，错误与原问题一致；overlay 仅替换编译输入，没有修改已测源码。
+
+真实进程 E2E 第一轮误用了配置数据库版本作为旧 JSON 输入版本，修正为 legacy version 1，
+未放宽产品迁移校验。第二轮的“立即重绑端口”断言把 Python socket 的正常 TIME_WAIT 当成
+监听泄漏；当时子进程已确认退出。最终改为验证该端口不再接受连接，并继续保留 PID 退出断言。
+未为这些 fixture 问题更改产品行为或弱化进程退出要求。
+
+### CI、性能与磁盘写入
+
+现有 CLI race 筛选增加 TeamsGraphHTTP；同一 engine race job 增加 StartContext 和 CONNECT
+回归入口。entry 包继续由现有 E2E 分片发现；没有新增 CI job。Release 的诊断测试改名与
+CONNECT 取消筛选同步更新，防止测试消失后空跑。Linux/Windows/macOS 普通包测试仍覆盖这些包。
+
+连接获取每次命令一次，分页和下载期间复用同一个 session；没有向消息、轮询或历史扫描循环
+添加工作。复用路径的探测和配置装载沿用原租约；CONNECT 仅增加取消通知与截止时间处理。
+临时连接使用现有动态端口与 stack 退出逻辑，不写入共享实例记录。配置访问沿用已有 store，
+首次访问可能执行已有 SQLite 初始化/旧配置迁移；认证仍可能刷新既有 token，SSH 仍可能更新
+既有 known_hosts，fetch 仍写显式下载目标。没有新增持久消息缓存、JSON 重写或后台任务。
+测试比较调用前后的配置和 instance 逻辑内容，确认没有新增共享状态。
+
+尚未验证真实租户 Graph 联网、macOS 原生运行或安装升级。本轮未推送、发布或更新运行中的 helper；
+源码与已安装运行时保持分离。

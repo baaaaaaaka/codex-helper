@@ -25,6 +25,8 @@ type teamsGraphHTTPClientLease struct {
 	suspectReusableProxies []config.Instance
 }
 
+var teamsGraphStackStart = stack.StartContext
+
 var teamsGraphProxyCONNECTTarget = "graph.microsoft.com:443"
 var teamsGraphProxyRetireGrace = 2 * time.Second
 var teamsGraphProxyLocalStatusTimeout = 500 * time.Millisecond
@@ -32,6 +34,9 @@ var teamsGraphProxyLocalStatusOverallTimeout = 2 * time.Second
 
 func (l teamsGraphHTTPClientLease) Close(ctx context.Context) error {
 	var err error
+	if l.Client != nil {
+		l.Client.CloseIdleConnections()
+	}
 	if l.close != nil {
 		err = l.close(ctx)
 	}
@@ -67,6 +72,9 @@ func (l teamsGraphHTTPClientLease) RetireSuspects(ctx context.Context, out io.Wr
 }
 
 func newTeamsGraphHTTPClientLease(ctx context.Context, root *rootOptions, out io.Writer) (teamsGraphHTTPClientLease, error) {
+	if err := ctx.Err(); err != nil {
+		return teamsGraphHTTPClientLease{}, err
+	}
 	if seam, err := loadTeamsTestSeam(); err != nil {
 		return teamsGraphHTTPClientLease{}, err
 	} else if seam != nil {
@@ -95,13 +103,13 @@ func newTeamsGraphHTTPClientLease(ctx context.Context, root *rootOptions, out io
 	}
 	hc := healthClientForProxyTarget(3*time.Second, "graph.microsoft.com", 443)
 	var suspects []config.Instance
-	if lease, suspect, ok, err := reusableTeamsGraphProxyLease(cfg, profile.ID, hc); ok || err != nil {
+	if lease, suspect, ok, err := reusableTeamsGraphProxyLease(ctx, cfg, profile.ID, hc); ok || err != nil {
 		return lease, err
 	} else {
 		suspects = appendTeamsGraphProxySuspect(suspects, suspect)
 	}
 	if fresh, err := store.Load(); err == nil {
-		if lease, suspect, ok, err := reusableTeamsGraphProxyLease(fresh, profile.ID, hc); ok || err != nil {
+		if lease, suspect, ok, err := reusableTeamsGraphProxyLease(ctx, fresh, profile.ID, hc); ok || err != nil {
 			return lease, err
 		} else {
 			suspects = appendTeamsGraphProxySuspect(suspects, suspect)
@@ -111,19 +119,22 @@ func newTeamsGraphHTTPClientLease(ctx context.Context, root *rootOptions, out io
 	if err != nil {
 		return teamsGraphHTTPClientLease{}, err
 	}
-	st, err := stackStart(profile, instanceID, stack.Options{})
+	st, err := teamsGraphStackStart(ctx, profile, instanceID, stack.Options{})
 	if err != nil {
+		if ctx.Err() != nil {
+			return teamsGraphHTTPClientLease{}, ctx.Err()
+		}
 		// A reusable proxy can become healthy while we are trying to start a
 		// fallback stack, especially on loaded machines. Re-check once before
 		// surfacing the fallback start error.
 		if fresh, loadErr := store.Load(); loadErr == nil {
-			if lease, suspect, ok, leaseErr := reusableTeamsGraphProxyLease(fresh, profile.ID, hc); ok || leaseErr != nil {
+			if lease, suspect, ok, leaseErr := reusableTeamsGraphProxyLease(ctx, fresh, profile.ID, hc); ok || leaseErr != nil {
 				return lease, leaseErr
 			} else {
 				suspects = appendTeamsGraphProxySuspect(suspects, suspect)
 			}
 		}
-		return teamsGraphHTTPClientLease{}, fmt.Errorf("start Teams Graph proxy stack: Teams service could not start the SSH proxy stack; Teams may appear silent because Graph traffic is configured to use that proxy: %w", err)
+		return teamsGraphHTTPClientLease{}, fmt.Errorf("start Teams Graph proxy stack: could not establish the configured SSH proxy connection: %w", err)
 	}
 	proxyURL := st.HTTPProxyURL()
 	client, err := newTeamsProxyHTTPClient(proxyURL)
@@ -264,12 +275,18 @@ func teamsGraphProxyProfileLabel(profile config.Profile) string {
 	return fmt.Sprintf("%q", profile.ID)
 }
 
-func reusableTeamsGraphProxyLease(cfg config.Config, profileID string, hc manager.HealthClient) (teamsGraphHTTPClientLease, *config.Instance, bool, error) {
-	inst := manager.FindReusableInstance(cfg.Instances, profileID, hc)
+func reusableTeamsGraphProxyLease(ctx context.Context, cfg config.Config, profileID string, hc manager.HealthClient) (teamsGraphHTTPClientLease, *config.Instance, bool, error) {
+	inst, err := manager.FindReusableInstanceContext(ctx, cfg.Instances, profileID, hc)
+	if err != nil {
+		return teamsGraphHTTPClientLease{}, nil, false, err
+	}
 	if inst == nil {
 		return teamsGraphHTTPClientLease{}, nil, false, nil
 	}
-	if err := hc.CheckHTTPProxyCONNECT(inst.HTTPPort, teamsGraphProxyCONNECTTarget); err != nil {
+	if err := hc.CheckHTTPProxyCONNECTContext(ctx, inst.HTTPPort, teamsGraphProxyCONNECTTarget); err != nil {
+		if ctx.Err() != nil {
+			return teamsGraphHTTPClientLease{}, nil, false, ctx.Err()
+		}
 		suspect := *inst
 		return teamsGraphHTTPClientLease{}, &suspect, false, nil
 	}

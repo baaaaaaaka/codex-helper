@@ -79,10 +79,10 @@ func TestTeamsGraphHTTPClientUsesDirectAfterProxyReset(t *testing.T) {
 		t.Fatalf("proxy reset: %v", err)
 	}
 
-	origStackStart := stackStart
-	t.Cleanup(func() { stackStart = origStackStart })
-	stackStart = func(config.Profile, string, stack.Options) (*stack.Stack, error) {
-		t.Fatal("stackStart should not be called after proxy reset clears profiles")
+	origStackStart := teamsGraphStackStart
+	t.Cleanup(func() { teamsGraphStackStart = origStackStart })
+	teamsGraphStackStart = func(context.Context, config.Profile, string, stack.Options) (*stack.Stack, error) {
+		t.Fatal("teamsGraphStackStart should not be called after proxy reset clears profiles")
 		return nil, errors.New("unexpected stack start")
 	}
 
@@ -158,9 +158,9 @@ func TestTeamsGraphHTTPClientUsesConfiguredReusableProxy(t *testing.T) {
 			LastSeenAt: time.Now(),
 		}},
 	})
-	origStackStart := stackStart
-	t.Cleanup(func() { stackStart = origStackStart })
-	stackStart = func(config.Profile, string, stack.Options) (*stack.Stack, error) {
+	origStackStart := teamsGraphStackStart
+	t.Cleanup(func() { teamsGraphStackStart = origStackStart })
+	teamsGraphStackStart = func(context.Context, config.Profile, string, stack.Options) (*stack.Stack, error) {
 		return nil, errors.New("fallback stack must not start when reusable proxy is healthy")
 	}
 	lease, err := newTeamsGraphHTTPClientLease(context.Background(), &rootOptions{configPath: store.Path()}, nil)
@@ -190,6 +190,12 @@ func TestTeamsGraphHTTPClientUsesConfiguredReusableProxy(t *testing.T) {
 		t.Fatal("reusable proxy must pass a CONNECT probe before use")
 	}
 	assertTeamsGraphTransportBounds(t, tr)
+	if err := lease.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := (manager.HealthClient{Timeout: time.Second}).CheckHTTPProxy(port, instanceID); err != nil {
+		t.Fatalf("closing borrowed lease stopped the shared proxy: %v", err)
+	}
 }
 
 func TestTeamsGraphHTTPClientSkipsReusableProxyWhenConnectProbeFails(t *testing.T) {
@@ -246,10 +252,10 @@ func TestTeamsGraphHTTPClientSkipsReusableProxyWhenConnectProbeFails(t *testing.
 	origTarget := teamsGraphProxyCONNECTTarget
 	t.Cleanup(func() { teamsGraphProxyCONNECTTarget = origTarget })
 	teamsGraphProxyCONNECTTarget = "graph.example.test:443"
-	origStackStart := stackStart
-	t.Cleanup(func() { stackStart = origStackStart })
+	origStackStart := teamsGraphStackStart
+	t.Cleanup(func() { teamsGraphStackStart = origStackStart })
 	sentinel := errors.New("fresh proxy stack requested")
-	stackStart = func(config.Profile, string, stack.Options) (*stack.Stack, error) {
+	teamsGraphStackStart = func(context.Context, config.Profile, string, stack.Options) (*stack.Stack, error) {
 		return nil, sentinel
 	}
 
@@ -257,7 +263,7 @@ func TestTeamsGraphHTTPClientSkipsReusableProxyWhenConnectProbeFails(t *testing.
 	if err != nil {
 		t.Fatalf("load config: %v", err)
 	}
-	_, suspect, ok, err := reusableTeamsGraphProxyLease(cfg, "p1", manager.HealthClient{Timeout: time.Second})
+	_, suspect, ok, err := reusableTeamsGraphProxyLease(context.Background(), cfg, "p1", manager.HealthClient{Timeout: time.Second})
 	if err != nil {
 		t.Fatalf("reusableTeamsGraphProxyLease: %v", err)
 	}
@@ -364,7 +370,7 @@ func TestTeamsGraphProxyLocalStatusHonorsCancellation(t *testing.T) {
 	}
 }
 
-func TestTeamsGraphHTTPClientLeaseStartFailureExplainsSilentTeams(t *testing.T) {
+func TestTeamsGraphHTTPClientLeaseStartFailurePreservesCause(t *testing.T) {
 	lockCLITestHooks(t)
 
 	store := newTeamsGraphProxyTestStore(t, config.Config{
@@ -379,10 +385,10 @@ func TestTeamsGraphHTTPClientLeaseStartFailureExplainsSilentTeams(t *testing.T) 
 			CreatedAt: time.Now(),
 		}},
 	})
-	origStackStart := stackStart
-	t.Cleanup(func() { stackStart = origStackStart })
+	origStackStart := teamsGraphStackStart
+	t.Cleanup(func() { teamsGraphStackStart = origStackStart })
 	sentinel := errors.New("ssh auth failed")
-	stackStart = func(config.Profile, string, stack.Options) (*stack.Stack, error) {
+	teamsGraphStackStart = func(context.Context, config.Profile, string, stack.Options) (*stack.Stack, error) {
 		return nil, sentinel
 	}
 
@@ -392,8 +398,7 @@ func TestTeamsGraphHTTPClientLeaseStartFailureExplainsSilentTeams(t *testing.T) 
 	}
 	for _, want := range []string{
 		"start Teams Graph proxy stack",
-		"Teams service could not start the SSH proxy stack",
-		"Teams may appear silent",
+		"could not establish the configured SSH proxy connection",
 	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error missing %q: %v", want, err)

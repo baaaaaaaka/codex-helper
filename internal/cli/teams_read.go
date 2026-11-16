@@ -6,7 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
+	"io"
 	"os"
 	"time"
 
@@ -14,51 +14,38 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// Read commands reuse configured networking without the lifecycle-capable
-// lease: no starting/retiring daemons and no helper state acquisition.
-func newTeamsReadHTTPClient(ctx context.Context, root *rootOptions) (*http.Client, error) {
-	if seam, e := loadTeamsTestSeam(); e != nil {
-		return nil, e
-	} else if seam != nil {
-		return seam.httpClient(), nil
-	}
-	status, e := loadTeamsGraphProxyLocalStatus(ctx, root)
-	if e != nil {
-		return nil, e
-	}
-	if !status.Enabled {
-		c := newTeamsDirectHTTPClient()
-		c.Timeout = 0
-		return c, nil
-	}
-	if status.ProfileErr != nil {
-		return nil, status.ProfileErr
-	}
-	if status.HealthyInstance == nil {
-		return nil, errors.New("Teams Graph proxy is enabled but no reusable proxy is available; start the configured proxy separately")
-	}
-	c, e := newTeamsProxyHTTPClient(fmt.Sprintf("http://127.0.0.1:%d", status.HealthyInstance.HTTPPort))
-	if e == nil {
-		c.Timeout = 0
-	}
-	return c, e
+// teamsReadSession owns the reader and its per-invocation networking. A borrowed
+// proxy is never stopped; a private fallback stack is closed with the session.
+type teamsReadSession struct {
+	*chteams.Reader
+	lease teamsGraphHTTPClientLease
 }
 
-var openTeamsReader = func(ctx context.Context, root *rootOptions) (*chteams.Reader, error) {
-	cfg, e := chteams.ResolveReadAuthConfig("")
-	if e != nil {
-		return nil, e
+func (s *teamsReadSession) Close() error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return errors.Join(s.Reader.Close(), s.lease.Close(ctx))
+}
+
+var openTeamsReader = func(ctx context.Context, root *rootOptions) (*teamsReadSession, error) {
+	cfg, err := chteams.ResolveReadAuthConfig("")
+	if err != nil {
+		return nil, err
 	}
-	hc, e := newTeamsReadHTTPClient(ctx, root)
-	if e != nil {
-		return nil, e
+	lease, err := newTeamsGraphHTTPClientLease(ctx, root, io.Discard)
+	if err != nil {
+		return nil, err
 	}
-	auth := chteams.NewDelegatedAuth(cfg, hc)
-	r, e := chteams.NewReader(chteams.Config{HTTP: hc, Tokens: auth, TenantID: cfg.TenantID, SharePointHosts: chteams.SharePointHostsFromEnv(os.Getenv("CODEX_HELPER_TEAMS_ALLOWED_SHAREPOINT_HOSTS"))})
-	if e != nil {
-		auth.Close()
+	// The command context bounds the whole operation, including long downloads.
+	lease.Client.Timeout = 0
+	auth := chteams.NewDelegatedAuth(cfg, lease.Client)
+	r, err := chteams.NewReader(chteams.Config{HTTP: lease.Client, Tokens: auth, TenantID: cfg.TenantID, SharePointHosts: chteams.SharePointHostsFromEnv(os.Getenv("CODEX_HELPER_TEAMS_ALLOWED_SHAREPOINT_HOSTS"))})
+	if err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		return nil, errors.Join(err, auth.Close(), lease.Close(ctx))
 	}
-	return r, e
+	return &teamsReadSession{Reader: r, lease: lease}, nil
 }
 
 func teamsReadFlags(cmd *cobra.Command, b *chteams.ReadBudget, jsonOut *bool) {
@@ -83,7 +70,7 @@ func teamsCursorFlags(cmd *cobra.Command, cursor string, names ...string) error 
 func newTeamsReadCmd(root *rootOptions) *cobra.Command {
 	var o chteams.ReadOptions
 	var jsonOut bool
-	cmd := &cobra.Command{Use: "read [Teams URL|ref ...]", Short: "Read Teams resources with explicit history or reply ranges", Long: "Read existing Teams resources with the current read identity. Bare read returns the linked resource only. --before/--latest apply to chats; --replies applies to channel messages. Does not send messages or change helper state or service lifecycle.", Args: cobra.ArbitraryArgs, RunE: func(cmd *cobra.Command, args []string) error {
+	cmd := &cobra.Command{Use: "read [Teams URL|ref ...]", Short: "Read Teams resources with explicit history or reply ranges", Long: "Read existing Teams resources with the current read identity. Bare read returns the linked resource only. --before/--latest apply to chats; --replies applies to channel messages. Automatically prepares configured networking. Does not send messages or change helper state or service lifecycle.", Args: cobra.ArbitraryArgs, RunE: func(cmd *cobra.Command, args []string) error {
 		if e := teamsCursorFlags(cmd, o.Cursor, "before", "latest", "replies", "limit"); e != nil {
 			return e
 		}

@@ -487,6 +487,15 @@ func reservePort() (int, net.Listener, error) {
 }
 
 func Start(profile config.Profile, instanceID string, opts Options) (*Stack, error) {
+	return StartContext(context.Background(), profile, instanceID, opts)
+}
+
+// StartContext bounds startup only. After success, the caller owns the stack
+// and must Close it independently of the startup context.
+func StartContext(ctx context.Context, profile config.Profile, instanceID string, opts Options) (*Stack, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if profile.Host == "" {
 		return nil, errors.New("profile host is required")
 	}
@@ -595,18 +604,26 @@ func Start(profile config.Profile, instanceID string, opts Options) (*Stack, err
 			socksReserve.Close()
 			socksReserve = nil
 		}
+		if err := ctx.Err(); err != nil {
+			closeProxySetup(ps)
+			return nil, err
+		}
 		t, terr := newStackTunnel(profile, socksPort)
 		if terr != nil {
 			closeProxySetup(ps)
 			return nil, terr
 		}
+		if err := ctx.Err(); err != nil {
+			closeProxySetup(ps)
+			return nil, err
+		}
 		if terr := t.Start(); terr != nil {
 			closeProxySetup(ps)
 			return nil, terr
 		}
-		if terr := waitForTCPTunnel(socksAddr, opts.SocksReadyTimeout, t); terr != nil {
+		if terr := waitForTCPTunnelContext(ctx, socksAddr, opts.SocksReadyTimeout, t); terr != nil {
 			_ = t.Stop(opts.TunnelStopGrace)
-			if canRetry && attempt < maxPortRetries {
+			if ctx.Err() == nil && canRetry && attempt < maxPortRetries {
 				// Reserve a new port (held open until the next iteration
 				// releases it), then rebuild the HTTP proxy for the new
 				// SOCKS address.
@@ -628,7 +645,7 @@ func Start(profile config.Profile, instanceID string, opts Options) (*Stack, err
 			closeProxySetup(ps)
 			return nil, terr
 		}
-		if terr := waitForSOCKS5(socksAddr, opts.SocksReadyTimeout, t); terr != nil {
+		if terr := waitForSOCKS5Context(ctx, socksAddr, opts.SocksReadyTimeout, t); terr != nil {
 			_ = t.Stop(opts.TunnelStopGrace)
 			closeProxySetup(ps)
 			return nil, terr
@@ -672,6 +689,10 @@ func Start(profile config.Profile, instanceID string, opts Options) (*Stack, err
 		_ = tun.Stop(opts.TunnelStopGrace)
 		closeProxySetup(ps)
 		return nil, fmt.Errorf("start host state observer: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		_ = s.Close(context.Background())
+		return nil, err
 	}
 	s.publishHostState(time.Time{}, time.Time{})
 	s.setRecoveryStateNow("ready", nil)

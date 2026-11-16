@@ -86,10 +86,11 @@ Fetch defaults: 100MiB and 300s, with a 2GiB hard size limit and a 10m time limi
 
 Use the configured read profile. The commands do not acquire helper state,
 change chat bindings, widen scopes, switch identity on permission failure,
-start/retire proxy daemons, or require Teams service online. A configured proxy
-must already be available; start it separately if necessary. Authentication can
-refresh the normal token cache. For missing authorization follow the foreground
-auth workflow; do not change the running helper from a Teams child turn.
+retire proxy daemons, or require Teams service online. They reuse a healthy
+configured proxy when available, otherwise create a private connection for the
+invocation and close it afterwards. No manual proxy startup is required.
+Authentication can refresh the normal token cache. For missing authorization
+follow the foreground auth workflow; do not change the running helper from a Teams child turn.
 
 Distinguish authentication, permission, not-found-or-invisible, throttling,
 network, output budget, and changed-data errors. Keep successful ranges when

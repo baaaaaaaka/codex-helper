@@ -87,7 +87,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go test ./internal/manager -count=1 -run 'Test(HealthClient_CheckHTTPProxyContextCancellation|FindReusableInstanceContextHonorsCancellation)$' -v
+          go test ./internal/manager -count=1 -run 'Test(HealthClient_CheckHTTPProxyContextCancellation|HealthClientCONNECTCancellationAfterDial|FindReusableInstanceContextHonorsCancellation)$' -v
 
       - name: Teams non-interactive stdin regressions
         shell: bash
@@ -99,7 +99,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go test ./internal/cli -count=1 -run 'Test(TeamsGraphProxyLocalStatus(DoesNotProbeTeamsConnect|HonorsCancellation)|TeamsGraphHTTPClientLeaseStartFailureExplainsSilentTeams|TeamsServiceStartWarnsOnlyForRegisteredUnhealthyProxyDaemon|TeamsServiceDoctorReportsTeamsGraphProxyLocalStatus)$' -v
+          go test ./internal/cli -count=1 -run 'Test(TeamsGraphProxyLocalStatus(DoesNotProbeTeamsConnect|HonorsCancellation)|TeamsGraphHTTPClientLeaseStartFailurePreservesCause|TeamsServiceStartWarnsOnlyForRegisteredUnhealthyProxyDaemon|TeamsServiceDoctorReportsTeamsGraphProxyLocalStatus)$' -v
 
       - name: Codex per-turn reasoning effort regressions
         shell: bash

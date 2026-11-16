@@ -2,11 +2,15 @@ package entry
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -121,4 +125,104 @@ func TestTeamsReadSearchFetchWithoutHelper(t *testing.T) {
 	}
 	s.Check("CLI reads never send Teams mutations", len(mutations) == 0, "no message/chat/file mutations", fmt.Sprint(mutations))
 	s.Check("no helper process needed", !s.SUT.Running(), "helper never started", fmt.Sprint(s.SUT.Running()))
+}
+
+// Bypass the Graph test seam deliberately: this regression must exercise the
+// production connection lease and a real child-process lifetime. The SSH double
+// serves readiness only; absent read credentials prevent any Graph request.
+func TestTeamsReadPrivateProxyProcessCleanup(t *testing.T) {
+	harness.Parallel(t)
+	s := harness.NewScenario(t, "TEAMS-READ-PROXY", harness.Options{NoStart: true, Budget: 60 * time.Second, Golden: harness.GoldenOptions{Skip: "assert private SSH child cleanup and no helper acquisition"}})
+	defer s.Finish()
+	python, err := exec.LookPath("python3")
+	if err != nil {
+		t.Fatal("python3 is required for the SSH process fixture")
+	}
+	bin := filepath.Join(s.Env.Home, "bin")
+	if err := os.MkdirAll(bin, 0700); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!" + python + `\nimport json, os, socket, sys, time
+if '-G' in sys.argv:
+    print('hostname example.invalid\nport 22')
+    sys.exit(0)
+port = int(sys.argv[sys.argv.index('-D') + 1].split(':')[-1])
+with open(os.environ['SSH_TEST_RECORD'], 'w') as f:
+    json.dump({'pid': os.getpid(), 'port': port}, f)
+if os.environ['SSH_TEST_BLOCK'] == '1':
+    time.sleep(60)
+s = socket.socket()
+s.bind(('127.0.0.1', port))
+s.listen()
+while True:
+    c, _ = s.accept()
+    if c.recv(3):
+        c.sendall(bytes([5, 0]))
+    c.close()
+`
+	// The shebang needs a real newline, not a literal escape in the raw script.
+	script = strings.Replace(script, `\n`, "\n", 1)
+	if err := os.WriteFile(filepath.Join(bin, "ssh"), []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	config := filepath.Join(s.Env.Home, "proxy.json")
+	// Public legacy configuration input; no product config types in black-box E2E.
+	if err := os.WriteFile(config, []byte(`{"version":1,"minReader":1,"proxyEnabled":true,"profiles":[{"id":"read-proxy","name":"read-proxy","host":"example.invalid","port":22,"user":"alice"}]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, block := range []bool{false, true} {
+		t.Run(fmt.Sprintf("blocked=%v", block), func(t *testing.T) {
+			record := filepath.Join(s.Env.Home, fmt.Sprintf("ssh-%v.json", block))
+			vars := map[string]string{}
+			for k, v := range s.Env.Vars {
+				vars[k] = v
+			}
+			vars["PATH"] = bin + string(os.PathListSeparator) + os.Getenv("PATH")
+			vars["SSH_TEST_RECORD"] = record
+			vars["SSH_TEST_BLOCK"] = "0"
+			budget := "5s"
+			if block {
+				vars["SSH_TEST_BLOCK"] = "1"
+				budget = "2s"
+			}
+			vars["CODEX_HELPER_TEAMS_READ_TOKEN_CACHE"] = filepath.Join(s.Env.Home, "no-read-token.sqlite")
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, harness.CLIBinary, "--config", config, "teams", "read", "https://teams.microsoft.com/l/message/chat/1", "--timeout", budget, "--json")
+			cmd.Dir = s.Env.Home
+			for k, v := range vars {
+				cmd.Env = append(cmd.Env, k+"="+v)
+			}
+			out, runErr := cmd.CombinedOutput()
+			if runErr == nil || ctx.Err() != nil {
+				t.Fatalf("expected controlled read failure, got %v, context %v: %s", runErr, ctx.Err(), out)
+			}
+			data, err := os.ReadFile(record)
+			if err != nil {
+				t.Fatalf("private SSH never started: %v; %s", err, out)
+			}
+			var child struct {
+				PID  int `json:"pid"`
+				Port int `json:"port"`
+			}
+			if err := json.Unmarshal(data, &child); err != nil || child.PID <= 0 {
+				t.Fatalf("invalid child record: %s", data)
+			}
+			proc, err := os.FindProcess(child.PID)
+			if err == nil && proc.Signal(syscall.Signal(0)) == nil {
+				t.Fatalf("private SSH child %d survived command exit", child.PID)
+			}
+			// A closed Python socket can leave TIME_WAIT entries. A failed
+			// rebind would not prove a live listener; check acceptability instead.
+			conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", child.Port), time.Second)
+			if err == nil {
+				conn.Close()
+				t.Fatal("private SOCKS listener still accepts connections")
+			}
+			if block && !strings.Contains(string(out), "context deadline exceeded") {
+				t.Fatalf("lost deadline cause: %s", out)
+			}
+		})
+	}
+	s.Check("helper was never started", !s.SUT.Running(), "no helper process", fmt.Sprint(s.SUT.Running()))
 }
