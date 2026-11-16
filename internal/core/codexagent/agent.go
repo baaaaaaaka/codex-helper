@@ -412,13 +412,14 @@ func (a *Agent) Kill(convID int64) {
 }
 
 // Fork forks threadID after lastTurnID into a new thread.
-func (a *Agent) Fork(ctx context.Context, convID int64, threadID, lastTurnID, cwd string) (engine.Forked, error) {
-	lease, err := a.pool.Acquire(ctx, key(convID), a.serverConfig(cwd))
-	if err != nil {
-		return engine.Forked{}, err
-	}
-	defer lease.Release()
-	th, err := lease.Server().ThreadFork(ctx, threadID, lastTurnID, cwd)
+func (a *Agent) Fork(ctx context.Context, _ int64, threadID, lastTurnID, cwd string) (engine.Forked, error) {
+	// thread/fork loads the child in its creator. Never use the parent's
+	// server: it may keep running while the child starts in another server.
+	var th codex.Thread
+	err := a.pool.WithTemporary(ctx, a.serverConfig(cwd), func(srv *codex.Server) (err error) {
+		th, err = srv.ThreadFork(ctx, threadID, lastTurnID, cwd)
+		return err
+	})
 	if err != nil {
 		return engine.Forked{}, err
 	}

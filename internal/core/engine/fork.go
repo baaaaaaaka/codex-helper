@@ -106,7 +106,7 @@ func (e *Engine) cmdFork(ctx context.Context, j cmdJob, cs *convState) {
 	defer e.imp.forking.Add(-1)
 	child, err := e.ag.Fork(ctx, cs.id, threadID, cutoff, cwd)
 	if err != nil {
-		e.reply(j, "Fork failed: "+userError(err.Error())+". Nothing was changed.", nil)
+		e.reply(j, "Fork could not be confirmed: "+userError(err.Error())+". It was not retried automatically.", nil)
 		return
 	}
 	prep := e.forkPrepare(cs.id, threadID, cutoff, child)

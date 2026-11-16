@@ -31,9 +31,10 @@ type PoolConfig struct {
 type Pool struct {
 	cfg PoolConfig
 
-	mu      sync.Mutex
-	servers map[string]*entry
-	closed  bool
+	mu           sync.Mutex
+	servers      map[string]*entry
+	closed       bool
+	temporarySeq uint64
 
 	// pidMu serializes PID file writes from snapshot to rename, so an
 	// older snapshot can never replace a newer one (review M3).
@@ -113,6 +114,37 @@ func (l *Lease) Loaded(threadID string) {
 
 // ErrPoolClosed is returned by Acquire after Close.
 var ErrPoolClosed = errors.New("codex: pool closed")
+
+// WithTemporary runs one operation in its own managed server. Success means
+// that server has exited, so threads it created can be loaded elsewhere.
+// Failed shutdown retains the entry and PID record for normal cleanup.
+func (p *Pool) WithTemporary(ctx context.Context, cfg Config, run func(*Server) error) (err error) {
+	p.mu.Lock()
+	p.temporarySeq++
+	key := fmt.Sprintf("temporary-%d", p.temporarySeq)
+	p.mu.Unlock()
+	lease, err := p.Acquire(ctx, key, cfg)
+	if err != nil {
+		return err
+	}
+	defer lease.Release()
+	defer func() {
+		srv := lease.Server()
+		// Cleanup must finish even when the caller's context was cancelled.
+		srv.Close(2 * time.Second)
+		if !srv.Exited() {
+			err = errors.Join(err, errors.New("codex: temporary app-server exit was not confirmed"))
+			return
+		}
+		p.mu.Lock()
+		if p.servers[key] == lease.e {
+			delete(p.servers, key)
+		}
+		p.mu.Unlock()
+		p.writePIDs(key)
+	}()
+	return run(lease.Server())
+}
 
 // Acquire returns a lease on the server of key, starting it with cfg when
 // there is none (or it exited).

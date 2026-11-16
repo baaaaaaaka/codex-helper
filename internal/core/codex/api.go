@@ -3,6 +3,7 @@ package codex
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 )
 
@@ -258,7 +259,9 @@ func (s *Server) TurnInterrupt(ctx context.Context, threadID, turnID string) err
 
 // ThreadFork forks a thread after lastTurnID ("" = all completed turns).
 func (s *Server) ThreadFork(ctx context.Context, threadID, lastTurnID, cwd string) (Thread, error) {
-	params := map[string]any{"threadId": threadID}
+	// The fork is persisted, but must not start inherited goals before its
+	// owning conversation is bound. History is imported from the snapshot.
+	params := map[string]any{"threadId": threadID, "ephemeral": false, "excludeTurns": true, "deferGoalContinuation": true}
 	if lastTurnID != "" {
 		params["lastTurnId"] = lastTurnID
 	}
@@ -269,6 +272,9 @@ func (s *Server) ThreadFork(ctx context.Context, threadID, lastTurnID, cwd strin
 		Thread Thread `json:"thread"`
 	}
 	err := s.Call(ctx, "thread/fork", params, &res)
+	if err == nil && strings.TrimSpace(res.Thread.ID) == "" {
+		err = fmt.Errorf("codex: thread/fork returned no child thread id")
+	}
 	return res.Thread, err
 }
 
