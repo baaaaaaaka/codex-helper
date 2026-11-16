@@ -70,6 +70,9 @@ func TestScheduledNativeWaitSuppressesHintsAndClearsOnCompletion(t *testing.T) {
 	r.ch.PostUser(work, "wait explicitly")
 	<-ready
 	r.wait("wait notice", func() bool { return len(r.own(work, "in-session wait")) == 1 })
+	// A slow agent may legitimately trigger a silence hint before it reports
+	// the wait. Only hints after the wait notice violate the wait policy.
+	earlyWorking, earlyStuck := len(r.own(work, "Still working")), len(r.own(work, "may be stuck"))
 	// The same engine must preserve ordinary behavior in another conversation.
 	r.ag.mu.Lock()
 	r.ag.during = nil
@@ -81,7 +84,7 @@ func TestScheduledNativeWaitSuppressesHintsAndClearsOnCompletion(t *testing.T) {
 	r.wait("parallel ordinary cancel", func() bool { return len(r.own(other, "Codex request canceled.")) == 1 })
 	// Cross both ordinary thresholds while the native wait is still valid.
 	time.Sleep(400 * time.Millisecond)
-	if len(r.own(work, "Still working"))+len(r.own(work, "may be stuck")) != 0 {
+	if len(r.own(work, "Still working")) != earlyWorking || len(r.own(work, "may be stuck")) != earlyStuck {
 		t.Fatal("valid wait produced ordinary silence hints")
 	}
 	h.Waiting("unrelated", time.Hour, false)
@@ -95,7 +98,7 @@ func TestScheduledNativeWaitSuppressesHintsAndClearsOnCompletion(t *testing.T) {
 	h.Waiting("sleep-1", time.Hour, true)
 	r.wait("one post-wait hint", func() bool { return len(r.own(work, "This run has not reported a result")) == 1 })
 	time.Sleep(350 * time.Millisecond)
-	if len(r.own(work, "This run has not reported a result")) != 1 || len(r.own(work, "Still working")) != 0 {
+	if len(r.own(work, "This run has not reported a result")) != 1 || len(r.own(work, "Still working")) != earlyWorking {
 		t.Fatal("post-wait silence repeated")
 	}
 	h.Waiting("sleep-2", time.Hour, true)
@@ -114,6 +117,35 @@ func TestScheduledNativeWaitSuppressesHintsAndClearsOnCompletion(t *testing.T) {
 	r.wait("ordinary silence behavior", func() bool { return len(r.own(work, "Still working")) >= 1 })
 	r.ch.PostUser(work, "helper cancel running")
 	r.wait("second cancel", func() bool { return len(r.own(work, "Codex request canceled.")) == 2 })
+}
+
+func TestScheduledWaitRejectsStaleSilenceDecision(t *testing.T) {
+	// Use the delegation inbox so a successful notice does not need a store;
+	// the return value still tells us whether the decision was accepted.
+	const conv, turn = 1, 2
+	rs := &runState{turnID: turn}
+	cs := &convState{id: conv, running: rs}
+	e := &Engine{convs: map[int64]*convState{conv: cs}, inboxID: conv, now: time.Now}
+
+	// The watcher observes an ordinary turn, then the wait starts before it
+	// tries to commit its ordinary hint. That stale hint must be rejected.
+	oldID, oldUntil := rs.waitID, rs.waitUntil
+	e.nativeWait(conv, turn, rs, "sleep-1", time.Hour, true)
+	if e.silenceNoticeForWaitState(cs, rs, oldID, oldUntil, "old", "old") {
+		t.Fatal("ordinary hint accepted after native wait began")
+	}
+	startedID, startedUntil := rs.waitID, rs.waitUntil
+	if !e.silenceNoticeForWaitState(cs, rs, startedID, startedUntil, "current", "current") {
+		t.Fatal("unchanged state rejected")
+	}
+	// An expired-wait hint must also be rejected if another wait starts
+	// before the earlier decision commits.
+	e.nativeWait(conv, turn, rs, "sleep-1", time.Hour, false)
+	endedID, endedUntil := rs.waitID, rs.waitUntil
+	e.nativeWait(conv, turn, rs, "sleep-2", time.Hour, true)
+	if e.silenceNoticeForWaitState(cs, rs, endedID, endedUntil, "old-wait", "old-wait") {
+		t.Fatal("expired-wait hint accepted after next wait began")
+	}
 }
 
 func TestScheduledWaitResultAndNotificationKeepOrdinaryTurnsUnchanged(t *testing.T) {

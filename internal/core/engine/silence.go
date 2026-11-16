@@ -49,7 +49,7 @@ func (e *Engine) watchSilence(ctx context.Context, cs *convState, tr store.Turn,
 			now := e.now()
 			e.mu.Lock()
 			waiting := e.questionWaiting[cs.id]
-			waitUntil, waitSeen := rs.waitUntil, rs.waitID != ""
+			waitUntil, waitID := rs.waitUntil, rs.waitID
 			last := rs.lastEvent.Load()
 			e.mu.Unlock()
 			if !waitUntil.IsZero() {
@@ -70,7 +70,7 @@ func (e *Engine) watchSilence(ctx context.Context, cs *convState, tr store.Turn,
 			quiet := now.Sub(fromMS(last))
 			// Only explicit native waits use the quieter policy. Ordinary turns
 			// retain the existing repeated hints, wording and thresholds.
-			if waitSeen {
+			if waitID != "" {
 				after := e.t.SilenceHint
 				if after <= 0 {
 					after = e.t.SilenceStuck
@@ -80,7 +80,7 @@ func (e *Engine) watchSilence(ctx context.Context, cs *convState, tr store.Turn,
 					if err != nil || pending {
 						continue
 					}
-					waitHint = e.silenceNotice(cs.id, fmt.Sprintf("turn:%d:wait-silence", tr.ID), "This run has not reported a result. You can keep waiting, or send `helper cancel running` to stop this run.")
+					waitHint = e.silenceNoticeForWaitState(cs, rs, waitID, waitUntil, fmt.Sprintf("turn:%d:wait-silence", tr.ID), "This run has not reported a result. You can keep waiting, or send `helper cancel running` to stop this run.")
 				}
 				continue
 			}
@@ -98,7 +98,7 @@ func (e *Engine) watchSilence(ctx context.Context, cs *convState, tr store.Turn,
 			if err != nil || pending {
 				continue
 			}
-			if e.silenceNotice(cs.id, fmt.Sprintf("turn:%d:silence:%d:%d", tr.ID, activityEpisode, hints+1), textSilence(quiet, e.t.SilenceCancelHint, e.t.SilenceStuck)) {
+			if e.silenceNoticeForWaitState(cs, rs, waitID, waitUntil, fmt.Sprintf("turn:%d:silence:%d:%d", tr.ID, activityEpisode, hints+1), textSilence(quiet, e.t.SilenceCancelHint, e.t.SilenceStuck)) {
 				lastHint = now
 				hints++
 				if e.t.SilenceStuck > 0 && quiet >= e.t.SilenceStuck {
@@ -108,6 +108,19 @@ func (e *Engine) watchSilence(ctx context.Context, cs *convState, tr store.Turn,
 		}
 	}()
 	return func() { close(stop) }
+}
+
+// Commit a silence notice only if the wait state used to choose it is still
+// current. nativeWait uses the same per-turn lock, so a transition cannot
+// overtake this check while the notice is being committed.
+func (e *Engine) silenceNoticeForWaitState(cs *convState, rs *runState, waitID string, waitUntil time.Time, key, text string) bool {
+	rs.silenceMu.Lock()
+	defer rs.silenceMu.Unlock()
+	e.mu.Lock()
+	valid := e.convs[cs.id] == cs && cs.running == rs && !rs.cancelled && !rs.switching &&
+		!e.questionWaiting[cs.id] && rs.waitID == waitID && rs.waitUntil.Equal(waitUntil)
+	e.mu.Unlock()
+	return valid && e.silenceNotice(cs.id, key, text)
 }
 
 func (e *Engine) silenceNotice(conv int64, key, text string) bool {

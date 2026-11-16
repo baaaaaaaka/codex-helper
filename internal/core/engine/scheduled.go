@@ -26,6 +26,8 @@ func (e *Engine) nativeWait(conv, turn int64, rs *runState, id string, duration 
 	if id == "" || duration <= 0 || duration > 12*time.Hour {
 		return
 	}
+	rs.silenceMu.Lock()
+	defer rs.silenceMu.Unlock()
 	e.mu.Lock()
 	if cs := e.convs[conv]; cs == nil || cs.running != rs || rs.turnID != turn || rs.cancelled || rs.switching {
 		e.mu.Unlock()

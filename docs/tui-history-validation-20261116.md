@@ -147,3 +147,31 @@ Windows/macOS execution and an actual WSL reboot have not been performed.
 Cross-compilation and deterministic device-renumbering tests have narrower scope.
 No release was published, no installed runtime was replaced, and the active Teams
 helper was not restarted, replaced or signaled.
+
+## Follow-up: scheduled-wait CI failure
+
+Release candidate `v0.1.23-rc.35` exposed a failure in
+`TestScheduledNativeWaitSuppressesHintsAndClearsOnCompletion` under the full
+nightly race partition. The log showed a native-wait notice followed by an
+ordinary silence notice. The original test also assumed no silence notice could
+legitimately precede the wait, although a slow agent can cross its 100 ms test
+threshold before emitting wait evidence.
+
+The silence watcher could choose a notice from a snapshot, then commit it after
+the wait state changed. Wait transitions and the final state check plus notice
+commit now share a per-turn mutex. The global engine mutex is released before
+the SQLite write; other turns do not share the new mutex. Both ordinary and
+expired-wait hints recheck the snapshot. Existing polling, notice keys, database
+writes and schemas are unchanged. A slow SQLite write can delay the wait callback
+for the same turn; callbacks already wrote their initial wait notice to SQLite.
+
+Regression coverage forces an old decision to be used after a wait transition,
+and holds a real store transaction while a notice and a wait compete, verifying
+the commit order. The integration-style test measures hints after the wait notice
+and continues to check ordinary behavior in a second conversation. Removing the
+new state guard caused the stale-decision test to fail as intended. The focused
+scheduled/silence race suite, `go test -race ./internal/core/engine -count=1
+-parallel=8 -timeout=15m` and `go vet ./internal/core/engine` passed; Linux CI and
+nightly full race partitions discover the new tests automatically. Engine test
+binaries cross-compiled for Windows/amd64 and macOS/arm64. GitHub CI provides the
+process isolation unavailable on this host, where Docker is absent.

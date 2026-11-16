@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -125,6 +126,8 @@ type recentPrompt struct {
 
 // runState is a turn being executed.
 type runState struct {
+	// Serializes wait transitions with silence-notice commits for this turn.
+	silenceMu    sync.Mutex
 	codexTurnID  string
 	steerExpired bool
 	turnID       int64
