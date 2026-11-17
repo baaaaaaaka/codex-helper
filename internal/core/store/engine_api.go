@@ -2,7 +2,10 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -203,14 +206,38 @@ func (t *Tx) RecentSent(convID int64, limit int) ([]Outbox, error) {
 WHERE conv_id = ? AND state = 'sent' ORDER BY seq DESC LIMIT ?`, convID, limit))
 }
 
-// LatestQuestionMarkerMessage returns the newest sent Codex output or
-// published native question message in a conversation.
+// LatestQuestionMarkerMessage includes successful appended receipts without
+// registering their user-authored target as an own post.
 func (t *Tx) LatestQuestionMarkerMessage(convID int64) (Outbox, bool, error) {
-	return one(t.row(`SELECT `+outboxCols+` FROM outbox
-WHERE conv_id=? AND state='sent' AND ext_msg_id IS NOT NULL AND ext_msg_id<>''
-AND (kind IN ('progress','final') OR (kind='mirror' AND (body LIKE '%<strong>🤖 ✅ Codex answer:%' OR body LIKE '%<strong>🤖 ⏳ Codex status:%'))
- OR (kind='notice' AND delivery_key LIKE 'question:%'))
+	if value, ok, err := t.Meta(questionTargetKey(convID)); err != nil {
+		return Outbox{}, false, err
+	} else if ok {
+		id, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return Outbox{}, false, err
+		}
+		row, found, err := t.Outbox(id)
+		if err != nil {
+			return row, false, err
+		}
+		if found && row.ConvID == convID && row.State == OutSent {
+			if row.ExtMsgID == "" {
+				row.ExtMsgID = row.AppendTo
+			}
+			if row.ExtMsgID != "" {
+				return row, true, nil
+			}
+		}
+	}
+
+	r, ok, err := one(t.row(`SELECT `+outboxCols+` FROM outbox
+WHERE conv_id=? AND state='sent' AND kind<>'title'
+AND (COALESCE(ext_msg_id,'')<>'' OR COALESCE(append_to,'')<>'')
 ORDER BY seq DESC LIMIT 1`, convID), scanOutbox)
+	if r.ExtMsgID == "" {
+		r.ExtMsgID = r.AppendTo
+	}
+	return r, ok, err
 }
 
 // PendingOutboxConvs lists the conversations with outbox rows still to
@@ -398,4 +425,81 @@ func (s *Store) RepresentedRecord(prefix string) (bool, error) {
 	var minPart, maxPart, minTotal, maxTotal, count int
 	err := s.r.QueryRowContext(context.Background(), `SELECT COALESCE(MIN(part),0),COALESCE(MAX(part),0),COALESCE(MIN(parts),0),COALESCE(MAX(parts),0),COUNT(DISTINCT part) FROM outbox WHERE delivery_key>=? AND delivery_key<? AND body IS NOT NULL`, prefix, prefix+"\U0010FFFF").Scan(&minPart, &maxPart, &minTotal, &maxTotal, &count)
 	return minPart == 1 && minTotal > 0 && minTotal == maxTotal && maxPart == maxTotal && count == maxTotal, err
+}
+
+func questionTargetKey(conv int64) string { return fmt.Sprintf("engine_question_target:%d", conv) }
+func questionTargetTimeKey(conv int64) string {
+	return fmt.Sprintf("engine_question_target_time:%d", conv)
+}
+
+// QuestionMarkerReceiptIsLatest checks before an appended receipt is sent.
+// Unknown creation times are deliberately left to the standalone refresh.
+func (t *Tx) QuestionMarkerReceiptIsLatest(row Outbox) (bool, error) {
+	var createdAt int64
+	err := t.row(`SELECT ext_time FROM inbound WHERE conv_id=? AND ext_msg_id=?`, row.ConvID, row.AppendTo).Scan(&createdAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil || createdAt <= 0 {
+		return false, err
+	}
+	if value, ok, err := t.Meta(questionTargetTimeKey(row.ConvID)); err != nil {
+		return false, err
+	} else if ok {
+		previous, err := strconv.ParseInt(value, 10, 64)
+		return createdAt >= previous, err
+	}
+	latest, ok, err := t.LatestQuestionMarkerMessage(row.ConvID)
+	if err != nil || !ok {
+		return !ok, err
+	}
+	if latest.ExtMsgID == row.AppendTo {
+		return true, nil
+	}
+	// Legacy installations have no recorded physical target time yet.
+	// SentAt is conservative for previously appended receipts.
+	return createdAt >= latest.SentAt, nil
+}
+
+// NoteQuestionMarkerTarget records confirmed physical delivery order without
+// sorting retained history. A late read-back of an older POST cannot displace
+// a newer visible message. Appended receipts use their user's creation time.
+func (t *Tx) NoteQuestionMarkerTarget(rowID, createdAt int64) error {
+	row, ok, err := t.Outbox(rowID)
+	if err != nil {
+		return err
+	}
+	if !ok || row.State != OutSent {
+		return ErrState
+	}
+	if row.ExtMsgID == "" && row.AppendTo != "" {
+		var userTime int64
+		err := t.row(`SELECT ext_time FROM inbound WHERE conv_id=? AND ext_msg_id=?`, row.ConvID, row.AppendTo).Scan(&userTime)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
+		if userTime > 0 {
+			createdAt = userTime
+		}
+	}
+	if createdAt <= 0 {
+		createdAt = row.SentAt
+	}
+	value, exists, err := t.Meta(questionTargetTimeKey(row.ConvID))
+	if err != nil {
+		return err
+	}
+	if exists {
+		old, err := strconv.ParseInt(value, 10, 64)
+		if err != nil {
+			return err
+		}
+		if createdAt < old {
+			return nil
+		}
+	}
+	if err := t.SetMeta(questionTargetKey(row.ConvID), strconv.FormatInt(rowID, 10)); err != nil {
+		return err
+	}
+	return t.SetMeta(questionTargetTimeKey(row.ConvID), strconv.FormatInt(createdAt, 10))
 }

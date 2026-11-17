@@ -104,3 +104,29 @@ func TestPromptConfirmationTargetAndFallbackPersist(t *testing.T) {
 		return err
 	}))
 }
+
+func TestPendingQuestionMarkerTargetsAppendedUserReceipt(t *testing.T) {
+	s, _ := openTest(t)
+	c := newWork(t, s, "receipt-marker")
+	mustT(t, s.Update(func(tx *Tx) error {
+		_, err := tx.Enqueue(c, []OutMsg{{DeliveryKey: "ack:receipt-marker", Kind: OutAck, Body: "accepted", AppendTo: "original-user-message"}})
+		if err != nil {
+			return err
+		}
+		if _, err := tx.BeginSend(1); err != nil {
+			return err
+		}
+		return tx.MarkSent(1, "")
+	}))
+	mustT(t, s.Read(func(tx *Tx) error {
+		row, ok, err := tx.LatestQuestionMarkerMessage(c)
+		if err != nil || !ok || row.ExtMsgID != "original-user-message" {
+			t.Fatalf("receipt target: %+v %v %v", row, ok, err)
+		}
+		own, err := tx.IsOwn(c, "original-user-message", nil, 0)
+		if own {
+			t.Fatal("receipt target became helper input echo")
+		}
+		return err
+	}))
+}

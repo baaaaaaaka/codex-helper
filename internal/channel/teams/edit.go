@@ -92,7 +92,17 @@ func (a *Adapter) EditHTML(ctx context.Context, chat, id string, rewrite func(ht
 // SetMessagePrefix adds or removes a separate first paragraph on one of this
 // account's messages. It keeps attachments, mentions, and the existing body.
 func (a *Adapter) SetMessagePrefix(ctx context.Context, chat, id, prefix string, present bool) error {
-	if strings.TrimSpace(id) == "" || strings.TrimSpace(prefix) == "" {
+	if strings.TrimSpace(prefix) == "" {
+		return channel.ErrNotEditable
+	}
+	return a.editMessageDecoration(ctx, chat, id, func(content string) (string, error) {
+		next, _ := messagePrefixEdit(content, prefix, present)
+		return next, nil
+	})
+}
+
+func (a *Adapter) editMessageDecoration(ctx context.Context, chat, id string, rewrite func(string) (string, error)) error {
+	if strings.TrimSpace(id) == "" {
 		return &channel.Rejected{Permanent: true, Err: fmt.Errorf("message prefix needs an id and text: %w", channel.ErrNotEditable)}
 	}
 	me, err := a.me(ctx)
@@ -114,8 +124,11 @@ func (a *Adapter) SetMessagePrefix(ctx context.Context, chat, id, prefix string,
 	if !isHTML {
 		content = asHTML(content, false)
 	}
-	next, changed := messagePrefixEdit(content, prefix, present)
-	if !changed {
+	next, err := rewrite(content)
+	if err != nil {
+		return err
+	}
+	if next == content {
 		return nil
 	}
 	in := map[string]any{"body": map[string]string{"contentType": "html", "content": next}}

@@ -536,9 +536,15 @@ func (e *Engine) send(ctx context.Context, r store.Outbox, chat, token string, f
 	case err == nil:
 		e.rememberOwnPost(r.ConvID, sent.ID)
 		e.noteFinalSent(r.ConvID, r.Kind, sent.Time) // F-TRN-1 (rename.go)
+		trackQuestionTarget := isQuestionMarkerMessage(r) && e.questionIsPending(r.ConvID) && r.ConvID != e.inboxID
 		persistErr := e.persist(ctx, "record send outcome", func(tx *store.Tx) error {
 			if err := tx.MarkSent(r.ID, sent.ID); err != nil {
 				return err
+			}
+			if trackQuestionTarget {
+				if err := tx.NoteQuestionMarkerTarget(r.ID, ms(sent.Time)); err != nil {
+					return err
+				}
 			}
 			return e.forkSettled(tx, r) // fork.go: a fork's marker releases its link
 		})
@@ -879,6 +885,8 @@ func (e *Engine) resolveOneWithReadback(ctx context.Context, id int64, windows m
 	}
 	hash := hex.EncodeToString(r.BodyHash)
 	var found string
+	var foundCreated int64
+	trackQuestionTarget := isQuestionMarkerMessage(r) && e.questionIsPending(r.ConvID) && r.ConvID != e.inboxID
 	err = e.update(func(tx *store.Tx) error {
 		found = ""
 		// Read-back ran outside the transaction. A manual retry or another
@@ -911,6 +919,7 @@ func (e *Engine) resolveOneWithReadback(ctx context.Context, id int64, windows m
 			}
 			if m.Marker != "" && markers[m.Marker] {
 				found = m.ID
+				foundCreated = ms(m.Created)
 				break
 			}
 		}
@@ -925,6 +934,7 @@ func (e *Engine) resolveOneWithReadback(ctx context.Context, id int64, windows m
 				}
 				if !own {
 					found = m.ID
+					foundCreated = ms(m.Created)
 					break
 				}
 			}
@@ -932,6 +942,11 @@ func (e *Engine) resolveOneWithReadback(ctx context.Context, id int64, windows m
 		if found != "" {
 			if err := tx.MarkSent(r.ID, found); err != nil {
 				return err
+			}
+			if trackQuestionTarget {
+				if err := tx.NoteQuestionMarkerTarget(r.ID, foundCreated); err != nil {
+					return err
+				}
 			}
 			return e.forkSettled(tx, r) // fork.go
 		}

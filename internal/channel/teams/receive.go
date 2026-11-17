@@ -258,6 +258,8 @@ func (a *Adapter) convert(chat string, gm graphMessage, owner string) channel.In
 		m.Marker = sm[1]
 	}
 	if strings.EqualFold(gm.Body.ContentType, "html") {
+		// Decorations are helper UI, not user input or echo-hash content.
+		content, _, _ = splitPendingQuestions(content, chat, gm.ID)
 		m.Text = plainText(content)
 		m.Links = namedLinks(content)
 	} else {

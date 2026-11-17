@@ -28,7 +28,26 @@ func (e *Engine) appendConfirmation(ctx context.Context, r store.Outbox, chat st
 		}
 		return err
 	}
-	return ann.Annotate(ctx, chat, r.AppendTo, channel.Annotation{Confirmation: &p, ConfirmationKey: r.DeliveryKey, Label: label, At: fromMS(r.CreatedAt).Local()})
+	an := channel.Annotation{Confirmation: &p, ConfirmationKey: r.DeliveryKey, Label: label, At: fromMS(r.CreatedAt).Local()}
+	if r.ConvID != e.inboxID && e.questionIsPending(r.ConvID) {
+		// The sender serializes writes per conversation. Do not move decoration
+		// back onto an older user message when a receipt is delivered late.
+		err := e.st.Read(func(tx *store.Tx) error {
+			latest, err := tx.QuestionMarkerReceiptIsLatest(r)
+			if err != nil || !latest {
+				return err
+			}
+			links, err := tx.PendingQuestionLinks(r.ConvID)
+			if err == nil {
+				an.PendingQuestions = &channel.PendingQuestions{Count: len(links), Items: pendingQuestionItems(links)}
+			}
+			return err
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return ann.Annotate(ctx, chat, r.AppendTo, an)
 }
 
 // Recovered receipts wait for the first membership check. Do not add owner

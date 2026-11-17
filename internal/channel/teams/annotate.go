@@ -68,6 +68,12 @@ func (a *Adapter) Annotate(ctx context.Context, chat, id string, an channel.Anno
 	}
 	content := strings.TrimSpace(m.Body.Content)
 	isHTML := m.Body.ContentType == "" || strings.EqualFold(m.Body.ContentType, "html")
+	// Keep the dynamic question decoration outside receipts/transcripts/notices.
+	var questionHead, questionTail string
+	if isHTML {
+		content, questionHead, questionTail = splitPendingQuestions(content, chat, id)
+	}
+
 	var next string
 	switch {
 	case an.Confirmation != nil:
@@ -83,8 +89,28 @@ func (a *Adapter) Annotate(ctx context.Context, chat, id string, an channel.Anno
 	default:
 		next, err = labelEdit(content, isHTML, atts, an.Label)
 	}
-	if err != nil || next == "" {
+	if err != nil {
 		return err
+	}
+	if next == "" {
+		if an.PendingQuestions == nil {
+			return nil
+		}
+		next = asHTML(m.Body.Content, isHTML)
+	} else {
+		next = questionHead + next + questionTail
+	}
+	if an.PendingQuestions != nil {
+		decorated, err := pendingQuestionsEdit(next, chat, id, *an.PendingQuestions)
+		if err != nil && !errors.Is(err, channel.ErrQuestionDecorationTooLarge) {
+			return err
+		}
+		if err == nil {
+			next = decorated
+		}
+	}
+	if next == m.Body.Content {
+		return nil
 	}
 	if len(next)+markerReserve > maxPartBytes {
 		return fmt.Errorf("annotation exceeds message size: %w", channel.ErrNotEditable)

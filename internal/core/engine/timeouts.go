@@ -94,6 +94,16 @@ func (c timedChannel) SetMessagePrefix(ctx context.Context, chat, id, prefix str
 	return editor.SetMessagePrefix(ctx, chat, id, prefix, present)
 }
 
+func (c timedChannel) SetPendingQuestions(ctx context.Context, chat, id string, pending channel.PendingQuestions) error {
+	editor, ok := c.Channel.(channel.QuestionDecorator)
+	if !ok {
+		return channel.ErrNotEditable
+	}
+	ctx, cancel := bounded(ctx, callTimeout)
+	defer cancel()
+	return editor.SetPendingQuestions(ctx, chat, id, pending)
+}
+
 func (c timedChannel) MarkUnread(ctx context.Context, chat string, readAt time.Time) error {
 	ctx, cancel := bounded(ctx, callTimeout)
 	defer cancel()
@@ -107,4 +117,14 @@ func (s timedScanner) ScanActivity(ctx context.Context, since time.Time) ([]chan
 	ctx, cancel := bounded(ctx, callTimeout)
 	defer cancel()
 	return s.ActivityScanner.ScanActivity(ctx, since)
+}
+
+func (c timedChannel) RenderQuestionDirectory(ctx context.Context, chat string, questions []channel.PendingQuestion) ([]channel.Part, error) {
+	editor, ok := c.Channel.(channel.QuestionDecorator)
+	if !ok {
+		return nil, channel.ErrNotEditable
+	}
+	ctx, cancel := bounded(ctx, callTimeout)
+	defer cancel()
+	return editor.RenderQuestionDirectory(ctx, chat, questions)
 }

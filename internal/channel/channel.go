@@ -12,6 +12,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"strings"
 	"time"
 	"unicode"
@@ -316,10 +317,37 @@ type MessagePrefixEditor interface {
 	SetMessagePrefix(ctx context.Context, chat, id, prefix string, present bool) error
 }
 
+// PendingQuestion is a navigation entry; MessageID is empty until publication.
+type PendingQuestion struct {
+	ID, Title, MessageID string
+}
+
+// PendingQuestions contains either direct question entries or directory-page
+// entries. Count always counts unanswered questions, not directory pages.
+type PendingQuestions struct {
+	Count int
+	Items []PendingQuestion
+}
+
+// ErrQuestionDecorationTooLarge asks the engine to publish a bounded directory.
+var ErrQuestionDecorationTooLarge = errors.New("question decoration exceeds message size")
+
+// QuestionDecorator atomically replaces the helper's question prefix and closing
+// section, preserving the message body, attachments, mentions and annotations.
+// An empty list removes the decoration. IDs are local to the supplied chat.
+type QuestionDecorator interface {
+	SetPendingQuestions(ctx context.Context, chat, id string, pending PendingQuestions) error
+	RenderQuestionDirectory(ctx context.Context, chat string, questions []PendingQuestion) ([]Part, error)
+}
+
 // Annotation is one in-place edit (Annotator). Label alone is the user
 // marker; Clips adds a voice transcript (the label too, when missing);
 // Notice appends a document below the message.
 type Annotation struct {
+	// PendingQuestions optionally refreshes decoration in the same write. Nil
+	// preserves it; an empty value clears it. Oversized decoration is deferred
+	// to the independent question refresh, without failing the annotation.
+	PendingQuestions *PendingQuestions
 	// Confirmation appends one already rendered initial prompt confirmation.
 	// ConfirmationKey is stable across delivery attempts, separate from own-post markers.
 	Confirmation    *Part

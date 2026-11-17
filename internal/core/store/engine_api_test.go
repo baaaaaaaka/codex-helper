@@ -88,7 +88,7 @@ func TestEngineAdditions(t *testing.T) {
 	}
 }
 
-func TestLatestQuestionMarkerSkipsUserMirrorsAndHelperNotices(t *testing.T) {
+func TestLatestQuestionMarkerIncludesUserMirrorsAndHelperNotices(t *testing.T) {
 	s, _ := openTest(t)
 	var conv int64
 	mustT(t, s.Update(func(tx *Tx) error {
@@ -122,12 +122,13 @@ func TestLatestQuestionMarkerSkipsUserMirrorsAndHelperNotices(t *testing.T) {
 			}
 		}
 		latest, ok, err := tx.LatestQuestionMarkerMessage(conv)
-		if err != nil || !ok || latest.DeliveryKey != "mirror:agent" {
+		if err != nil || !ok || latest.DeliveryKey != "helper:notice" {
 			t.Fatalf("latest question message %+v, %v, %v", latest, ok, err)
 		}
 		_, err = tx.Enqueue(conv, []OutMsg{
 			{DeliveryKey: "mirror:user-later", Kind: OutMirror, Body: `<strong>🧑‍💻 User:</strong> later user prompt`},
 			{DeliveryKey: "notice:ordinary", Kind: OutNotice, Body: "not an agent message"},
+			{DeliveryKey: "cmd:status", Kind: OutControl, Body: "status reply"},
 		})
 		if err != nil {
 			return err
@@ -145,7 +146,7 @@ func TestLatestQuestionMarkerSkipsUserMirrorsAndHelperNotices(t *testing.T) {
 			}
 		}
 		latest, ok, err = tx.LatestQuestionMarkerMessage(conv)
-		if err != nil || !ok || latest.DeliveryKey != "mirror:agent" {
+		if err != nil || !ok || latest.DeliveryKey != "cmd:status" {
 			t.Fatalf("helper notice became marker target: %+v, %v, %v", latest, ok, err)
 		}
 		return nil
@@ -272,4 +273,104 @@ func TestUpsertSourcesIsUpsertSourceInBulk(t *testing.T) {
 	if ids, err := bulk.Sources(); err != nil || len(ids) != 4 {
 		t.Fatalf("after a refused batch: %d sources, %v", len(ids), err)
 	}
+}
+
+func TestQuestionMarkerTargetUsesDeliveryTimeRatherThanQueueOrder(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		created int64
+		want    string
+	}{
+		{"late readback of older message", 100, "new-visible"},
+		{"older queued message delivered last", 300, "recovery-visible"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := openTest(t)
+			conv := newWork(t, s, "delivery-order")
+			mustT(t, s.Update(func(tx *Tx) error {
+				if _, err := tx.Enqueue(conv, []OutMsg{{DeliveryKey: "recovery", Kind: OutMirror, Body: "old queued record"}, {DeliveryKey: "live", Kind: OutFinal, Body: "live answer"}}); err != nil {
+					return err
+				}
+				if _, err := tx.BeginSend(1); err != nil {
+					return err
+				}
+				if err := tx.MarkUnknown(1, "unconfirmed"); err != nil {
+					return err
+				}
+				if _, err := tx.BeginSend(2); err != nil {
+					return err
+				}
+				if err := tx.MarkSent(2, "new-visible"); err != nil {
+					return err
+				}
+				if err := tx.NoteQuestionMarkerTarget(2, 200); err != nil {
+					return err
+				}
+				if err := tx.MarkSent(1, "recovery-visible"); err != nil {
+					return err
+				}
+				return tx.NoteQuestionMarkerTarget(1, tc.created)
+			}))
+			mustT(t, s.Read(func(tx *Tx) error {
+				target, ok, err := tx.LatestQuestionMarkerMessage(conv)
+				if !ok || target.ExtMsgID != tc.want {
+					t.Fatalf("target=%+v expected=%s", target, tc.want)
+				}
+				return err
+			}))
+		})
+	}
+}
+
+func TestQuestionMarkerReceiptIsLatest(t *testing.T) {
+	s, _ := openTest(t)
+	conv := newWork(t, s, "receipt-order")
+	mustT(t, s.Update(func(tx *Tx) error {
+		_, err := tx.AdmitWindow("receipt-order", conv, []InboundMsg{
+			{ExtMsgID: "older", ExtTime: 100, Sender: SenderOwner, Kind: InCommand, Body: "status"},
+			{ExtMsgID: "newer", ExtTime: 300, Sender: SenderOwner, Kind: InCommand, Body: "status"},
+		}, "")
+		return err
+	}))
+	check := func(id string, want bool) {
+		t.Helper()
+		mustT(t, s.Read(func(tx *Tx) error {
+			got, err := tx.QuestionMarkerReceiptIsLatest(Outbox{ConvID: conv, AppendTo: id})
+			if got != want {
+				t.Errorf("receipt %s eligible=%v want=%v", id, got, want)
+			}
+			return err
+		}))
+	}
+	check("older", true) // no earlier delivery
+	check("missing", false)
+	mustT(t, s.Update(func(tx *Tx) error {
+		_, err := tx.Enqueue(conv, []OutMsg{{DeliveryKey: "answer", Kind: OutFinal, Body: "answer"}})
+		if err != nil {
+			return err
+		}
+		if _, err := tx.BeginSend(1); err != nil {
+			return err
+		}
+		return tx.MarkSent(1, "answer")
+	}))
+	check("older", false) // legacy fallback: the reply was sent later
+	mustT(t, s.Update(func(tx *Tx) error { return tx.NoteQuestionMarkerTarget(1, 200) }))
+	check("older", false)
+	check("newer", true)
+	mustT(t, s.Update(func(tx *Tx) error {
+		_, err := tx.Enqueue(conv, []OutMsg{{DeliveryKey: "ack", Kind: OutAck, Body: "receipt", AppendTo: "newer"}})
+		if err != nil {
+			return err
+		}
+		if _, err := tx.BeginSend(2); err != nil {
+			return err
+		}
+		if err := tx.MarkSent(2, ""); err != nil {
+			return err
+		}
+		return tx.NoteQuestionMarkerTarget(2, 0)
+	}))
+	check("newer", true) // idempotent receipt retry on the current target
+	check("older", false)
 }

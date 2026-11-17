@@ -156,3 +156,66 @@ func BenchmarkQuestionsOrdinaryPromptLookup(b *testing.B) {
 		})
 	}
 }
+
+func TestPendingQuestionLinksLargeHistoryReadOnly(t *testing.T) {
+	s := questionHistoryFixture(t, 10000)
+	var id int64
+	mustT(t, s.Update(func(tx *Tx) error {
+		_, err := tx.AddQuestionGroup(QuestionGroup{Key: "navigation", ConvID: 1, ThreadID: "thread", Async: true, Questions: []Question{{NativeID: "private", Title: "do not repeat", Secret: true}, {NativeID: "normal", Title: "Choose"}}})
+		if err != nil {
+			return err
+		}
+		g, _, err := tx.QuestionGroup("navigation")
+		if err != nil {
+			return err
+		}
+		id = g.Questions[0].ID
+		_, err = tx.Enqueue(1, []OutMsg{{DeliveryKey: fmt.Sprintf("question:%d:body:1", id), Kind: OutNotice, Body: "private"}})
+		if err != nil {
+			return err
+		}
+		if _, err := tx.BeginSend(1); err != nil {
+			return err
+		}
+		return tx.MarkSent(1, "published-question")
+	}))
+	var before, after int64
+	mustT(t, s.w.QueryRow(`SELECT total_changes()`).Scan(&before))
+	for i := 0; i < 10; i++ {
+		mustT(t, s.Read(func(tx *Tx) error {
+			links, err := tx.PendingQuestionLinks(1)
+			if err != nil {
+				return err
+			}
+			if len(links) != 2 || links[0].ID != id || links[0].Title != "Private question" || links[0].MessageID != "published-question" || links[1].MessageID != "" {
+				t.Fatalf("navigation data: %+v", links)
+			}
+			return nil
+		}))
+	}
+	mustT(t, s.w.QueryRow(`SELECT total_changes()`).Scan(&after))
+	if before != after {
+		t.Fatalf("navigation read wrote rows: %d -> %d", before, after)
+	}
+}
+
+func BenchmarkPendingQuestionLinks(b *testing.B) {
+	for _, n := range []int{100, 10000} {
+		b.Run(fmt.Sprint(n), func(b *testing.B) {
+			s := questionHistoryFixture(b, n)
+			if err := s.Update(func(tx *Tx) error {
+				_, err := tx.AddQuestionGroup(QuestionGroup{Key: "active", ConvID: 1, ThreadID: "thread", Async: true, Questions: []Question{{NativeID: "q", Title: "Choose"}}})
+				return err
+			}); err != nil {
+				b.Fatal(err)
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := s.Read(func(tx *Tx) error { _, err := tx.PendingQuestionLinks(1); return err }); err != nil {
+					b.Fatal(err)
+				}
+			}
+		})
+	}
+}

@@ -263,6 +263,35 @@ func (f *Fake) SetMessagePrefix(_ context.Context, chatID, id, prefix string, pr
 	return &channel.Rejected{Permanent: true, Err: fmt.Errorf("message %s/%s: %w", chatID, id, channel.ErrNotFound)}
 }
 
+// SetPendingQuestions models one atomic decoration edit.
+func (f *Fake) SetPendingQuestions(ctx context.Context, chatID, id string, pending channel.PendingQuestions) error {
+	questions := pending.Items
+	const prefix = "❓Pending agent question"
+	if err := f.SetMessagePrefix(ctx, chatID, id, prefix, len(questions) > 0); err != nil {
+		return err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	c := f.chats[chatID]
+	for i := range c.msgs {
+		s := &c.msgs[i]
+		if s.msg.ID != id {
+			continue
+		}
+		body, _, _ := strings.Cut(s.msg.Text, "\n\n❓ Pending questions")
+		if len(questions) > 0 {
+			body += "\n\n❓ Pending questions"
+			for _, q := range questions {
+				body += "\n" + q.ID + " · " + q.Title + " -> " + q.MessageID
+			}
+		}
+		s.msg.Text = body
+		s.msg.Hash = channel.TextHash(body)
+		break
+	}
+	return nil
+}
+
 // MarkUnread records readAt for the chat; see Unread.
 func (f *Fake) MarkUnread(_ context.Context, chatID string, readAt time.Time) error {
 	f.mu.Lock()
@@ -560,4 +589,12 @@ func (f *Fake) combineParts(parts []channel.Part, recovery bool) (channel.Part, 
 		return channel.Part{}, false
 	}
 	return channel.Part{Index: 1, Count: 1, Body: body, Size: len(body), Hash: channel.TextHash(body)}, true
+}
+
+func (f *Fake) RenderQuestionDirectory(ctx context.Context, chat string, questions []channel.PendingQuestion) ([]channel.Part, error) {
+	var text strings.Builder
+	for _, q := range questions {
+		fmt.Fprintf(&text, "%s %s -> %s\n", q.ID, q.Title, q.MessageID)
+	}
+	return f.Render(ctx, channel.RichDoc{Label: "Pending question directory", Markdown: text.String()})
 }

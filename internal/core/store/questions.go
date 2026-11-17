@@ -319,3 +319,33 @@ func (t *Tx) SetQuestionDeadline(key string, at int64) (bool, error) {
 	n, err := r.RowsAffected()
 	return n > 0, err
 }
+
+// PendingQuestionLinks reads only navigation data for unanswered active questions.
+// The delivery-key lookup is indexed and does not load answers or options.
+func (t *Tx) PendingQuestionLinks(conv int64) ([]QuestionLink, error) {
+	rows, err := t.rows(`SELECT q.id, CASE WHEN q.secret<>0 THEN 'Private question' ELSE substr(q.title,1,160) END,
+ COALESCE((SELECT o.ext_msg_id FROM outbox o
+ WHERE o.conv_id=g.conv_id AND o.delivery_key='question:'||q.id||':body:1'
+ AND o.state='sent'), '')
+ FROM question_groups g JOIN questions q ON q.group_key=g.key
+ WHERE g.conv_id=? AND g.state IN ('open','submitting')
+ AND q.answer IS NULL AND q.skipped=0 ORDER BY q.id`, conv)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []QuestionLink
+	for rows.Next() {
+		var q QuestionLink
+		if err := rows.Scan(&q.ID, &q.Title, &q.MessageID); err != nil {
+			return nil, err
+		}
+		out = append(out, q)
+	}
+	return out, rows.Err()
+}
+
+type QuestionLink struct {
+	ID               int64
+	Title, MessageID string
+}

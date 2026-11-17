@@ -114,7 +114,11 @@ func TestAsyncQuestionMarkerMovesToNextAgentMessage(t *testing.T) {
 	s := harness.NewScenario(t, "QUESTIONS-MARKER-MOVE", harness.Options{Golden: harness.GoldenOptions{Skip: "The marker is an in-place message edit; explicit assertions verify the single current target."}, Title: "An async question marker moves from the question to the next agent answer", Budget: 90 * time.Second})
 	defer s.Finish()
 	token := s.Token("question")
+	follow := s.Token("follow")
 	s.Codex.SetScript(func(c harness.CodexCall) harness.CodexBehavior {
+		if c.HasToken(follow) {
+			return harness.CodexBehavior{Block: true}
+		}
 		if c.HasToken(token) {
 			return harness.CodexBehavior{Questions: scriptedQuestions(true, 1), Answer: "continued after question", Delay: 2 * time.Second}
 		}
@@ -150,6 +154,44 @@ func TestAsyncQuestionMarkerMovesToNextAgentMessage(t *testing.T) {
 			marked[0].ID == answers[0].ID && !questionMarked
 		return ok, fmt.Sprintf("%d marked message(s), question=%v answer=%v", len(marked), questionMarked, answerMarked)
 	})
+	steps.MustPost(s, work.ID, "helper status")
+	s.Require("ordinary helper reply carries question link", steps.CommandTimeout, func() (bool, string) {
+		var marked []fakegraph.Message
+		for _, m := range s.SUTMessages(work.ID) {
+			if hasPendingQuestionMarker(m) {
+				marked = append(marked, m)
+			}
+		}
+		questions := s.SUTMessagesContaining(work.ID, "Question from Codex")
+		if len(marked) != 1 || len(questions) != 1 {
+			return false, fmt.Sprintf("marked=%d questions=%d", len(marked), len(questions))
+		}
+		m := marked[0]
+		return !strings.Contains(m.PlainText(), "continued after question") && strings.Contains(m.Content, "/"+questions[0].ID+"?") && strings.Contains(m.PlainText(), "Pending questions"), m.PlainText()
+	})
+
+	user, err := s.Graph.PostAsUser(work.ID, "Continue "+follow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Require("appended receipt carries question navigation", steps.AnswerTimeout, func() (bool, string) {
+		m := messageByID(s.Graph.Messages(work.ID), user.ID)
+		questions := s.SUTMessagesContaining(work.ID, "Question from Codex")
+		if len(questions) != 1 {
+			return false, "waiting for source question"
+		}
+		return hasPendingQuestionMarker(m) && strings.Contains(m.PlainText(), "Request accepted.") && strings.Contains(m.Content, "/"+questions[0].ID+"?"), m.PlainText()
+	})
+	if got := messageByID(s.Graph.Messages(work.ID), user.ID); got.PatchCount != 1 {
+		t.Fatalf("receipt and question used %d PATCHes, want one", got.PatchCount)
+	}
+	s.Require("decorated user receipt creates one task", steps.AnswerTimeout, func() (bool, string) {
+		calls := s.Codex.CallsWithToken(follow)
+		return len(calls) == 1, fmt.Sprintf("%d task(s)", len(calls))
+	})
+	calls := s.Codex.CallsWithToken(follow)
+	s.Codex.Release(calls[0].Seq)
+
 }
 
 func messageByID(messages []fakegraph.Message, id string) fakegraph.Message {

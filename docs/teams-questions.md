@@ -60,6 +60,16 @@ Or use `helper answer Q42 <answer>`.
 
 通知能否成为系统推送仍受 Teams、Workflow 和用户通知设置影响；本地 E2E 验证请求与 @mention，不验证手机/桌面系统通知。
 
+## 当前问题入口
+
+会话最新的可编辑消息承载顶部 `❓Pending agent question` 标记和末尾 pending questions 区域。区域列出本会话所有尚未回答的问题，以 Q 编号、简短标题和原问题消息链接展示；回答、跳过、失效后移除。已记录答案等待其他题回答或正在提交，不再计入待回答数量。
+
+确认、命令回复、错误、文件、实时镜像和历史合并消息都可承载入口。接收回执附加到用户消息时，目标是该用户消息，但它仍保持用户消息身份。问题状态替换正文后会恢复入口；语音转写、回执和冻结提示保留入口并置于其前面。回读时剥离这个 helper 区域，避免进入用户 prompt 或改变正文去重哈希。
+
+问题尚未发布时显示发送中；私密问题不重复标题。长列表先缩短标题，再使用紧凑编号链接；仍然超限时通过现有 outbox 发送完整分片目录，末尾链接到各页。问题组尚在发布期间不反复生成不完整目录。
+
+只维护最新目标及一次迁移中的旧目标，不持续更新历史消息。新目标编辑成功后清理旧目标；重启可继续未完成迁移。其他成员的消息不编辑，跨会话通知保留原有来源语义，不汇总所有工作会话的问题。
+
 ## 存储与性能
 
 SQLite v3 新增三张 typed table：question groups、questions、options。历史表不重建。原生单次问题 payload 限制 128 KiB、最多 16 个问题、每题 32 个选项、每个 conversation 最多 64 个未解决问题组。正文渲染复用有界 sender worker，不阻塞原生 app-server 读取；渲染结束后再次检查问题状态，避免发布已经失效的操作引导。
@@ -97,3 +107,43 @@ SQLite v3 新增三张 typed table：question groups、questions、options。历
 容器内使用可执行的 `/var/tmp` 临时目录和受限的 Go 并行度，避免容器的 noexec 与 PID 配额影响测试。运行中的宿主机 Teams helper 未参与测试。
 
 发布前的 GitHub race 检查发现一个测试同步问题：断言状态编辑的用例必须先等待问题消息送达。已修复该时序，并新增阻塞渲染的用例，明确覆盖发布前提交结果未知时不重发、不发布过时操作。相关用例带 race 连续十轮通过，全量 core/channel race 再次通过；生产代码未因此改变。
+
+
+## 本轮验证记录（2026-11-18）
+
+源代码：`fix/teams-pending-question-links` 工作区，基于上游 `90e8642b` 的未提交变更。只修改源代码和测试，未更新、重启或替换宿主机 helper。
+
+行为边界：仅装饰最新可编辑目标；问题原文、回答协议、附件、mention、转写和接收回执保持原有职责。普通命令回复实际使用 `OutControl`，因此资格判断覆盖该路径，内部 inbox 仍按会话排除。旧测试中排除普通通知和用户镜像的断言已改为最新可见消息规则，并由命令回复和用户回执黑盒用例验证。
+
+验证入口：
+
+- Go 1.26.3/Linux：`go test ./internal/channel/... ./internal/core/store ./internal/core/engine -count=1 -timeout=300s` 分批通过；首次 store 测试编译错误在测试代码中修正后完整 store 包通过。
+- 扩展 race：`go test -race ./internal/core/... ./internal/channel/... -count=1 -timeout=600s -parallel=8` 中所有包通过，除未修改的 `core/codex` 环境继承测试因大小写代理变量同时存在而失败。随后执行 `env -u https_proxy -u http_proxy -u all_proxy -u no_proxy go test -race ./internal/core/codex -count=1 -timeout=180s`，整个包通过。这是测试环境冲突，未修改该包。
+- 最终送达顺序与状态改动后，重跑 `go test -race ./internal/core/store ./internal/core/engine -run '^Test(QuestionMarkerTarget|PendingQuestion|LatestQuestionMarker|Unknown)' -count=1 -timeout=180s`，通过。确定时序的测试覆盖新目标已写入而旧目标清理失败、恢复后只保留一个标记、长目录完整发布，以及未发布完毕时不生成重复目录。
+- Teams adapter 的完整 race 包测试通过，包含幂等、Teams 标签归一化、HTML 引用保护、截图和附件保留、接收回执顺序、回读排除装饰，以及 1,024 个问题的目录分片。
+- 最终隔离 Docker 问题黑盒回归：`go test ./internal/e2e/scenarios/turns -run '^(TestQuestions|TestAsyncQuestionMarker)' -count=1 -timeout=300s -parallel=3` 通过，8 个场景共约 51 秒。使用最终送达顺序实现，包含普通命令回复及原始用户消息接收回执上的问题链接与标记迁移。
+- `go vet ./internal/core/engine ./internal/core/store ./internal/channel/...`、`git diff --check` 和改动文件的 gofmt 检查通过。`CGO_ENABLED=0` 的 Windows amd64、macOS arm64 两个受影响包交叉编译通过；没有执行 Windows/macOS 原生测试。
+
+Docker 使用技能提供的临时容器框架、空 CXP fixture 配置和 fake Graph/fake Codex，无真实模型推理。框架默认 JSON 配置路径在本机不存在，使用独立 fixture；Docker 凭据助手所需 WSL socket 最初被沙箱阻止，获准后构建成功。容器继承的本机代理无法连接，最终仅在临时框架副本中增加对宿主机 Go 工具链和依赖缓存的只读挂载，离线运行测试，不修改仓库测试框架或已安装 helper。容器内测试使用 Go 1.26.3、`CGO_ENABLED=0`、`TMPDIR=/var/tmp`。
+
+性能与写入：pending 导航只读取当前会话的未回答问题及有索引的消息 ID，不加载选项、答案或历史 rollout；不增加轮询。成功发送期间的目标标量更新并入已有发送结果事务，不增加独立提交。迁移只保存当前/旧目标，原来的目标 ID 键保持单一 ID 格式；无 schema 迁移或历史重写。目录仅在溢出后按当前有界列表哈希去重，走原有 outbox。1 万组历史的只读测试确认零行写入；最终 benchmark 的 100/10,000 组历史分别约 27.8/28.6 µs、1.5 KB、31/32 次分配。未发现随历史规模明显增长的退化。
+
+CI 覆盖：普通测试由 `ci.yml` 的 `unit-linux` 及跨平台 unit job 收集；engine/store/Teams 测试进入 `race-core-exec` 的对应包分组；问题场景属于现有 turns E2E 包分片。无需新增 workflow 选择器。本轮未提交或触发 GitHub CI，未验证真实 Teams 客户端的列表预览和点击导航。
+
+### 同日补充：回执与 question 合并 PATCH
+
+仍在上述未提交工作区实现，不新增数据库状态、等待窗口或编辑批次。`Annotation` 支持可选 pending 状态，独立刷新和旧入口清理继续执行。回执路径只给应成为最新目标的原始用户消息附加 question；已有回执重试时仍能更新问题列表。超长装饰不会导致回执降级为单独 POST，独立刷新保留原有目录处理职责。转写和冻结提示没有增加主动状态查询。
+
+最终验证：
+
+- `go test -race ./internal/channel/teams ./internal/core/store ./internal/core/engine -run '^Test(PendingQuestion|QuestionMarker|PromptConfirmation|Copied|Transcript)' -count=1 -timeout=240s` 三包通过。新增测试覆盖一次合并 PATCH、写入成功但响应丢失后的幂等重试、独立刷新零额外 PATCH、回执不变但问题变化、nil 保留/空值清除、超长不影响回执，以及迟到旧回执不成为目标。engine 包实际运行了已有回执和问题恢复用例。
+- `go test -race ./internal/channel/teams -count=1 -timeout=180s` 完整包通过。
+- 隔离 Docker 中执行 `go test ./internal/e2e/scenarios/turns -run '^(TestQuestions|TestAsyncQuestionMarker)' -count=1 -timeout=300s -parallel=3`，8 个场景通过，约 53 秒。新增断言要求原始用户消息的接收回执和 question 合计只有一次 PATCH；既有迁移场景仍通过。环境沿用上述临时 Docker 框架、Go 1.26.3 和 fake Graph/fake Codex，宿主机 helper 未参与。
+- `go vet ./internal/core/engine ./internal/core/store ./internal/channel/...`、`git diff --check`，以及 Windows amd64/macOS arm64 的 `CGO_ENABLED=0 go build ./internal/core/engine ./internal/channel/teams` 通过。交叉编译不代表原生执行。
+- 新测试沿用现有 unit、core/channel race 和 turns E2E CI 入口，无需增加选择器。本轮未触发 GitHub CI，未实测真实 Teams 客户端。
+
+性能审查：只在存在 pending questions 的追加回执路径增加有索引的原消息时间读取、现有目标标量读取和当前未回答问题读取；不轮询、不扫描历史正文、不增加写事务。独立刷新可能保留一次 GET，但相同装饰不再 PATCH。数据库写入、目录持久化及恢复流程不变。
+
+发布前补充：在隔离 Docker 使用 `go test -p 4 ./... -count=1 -timeout=600s -parallel=4` 运行全仓，core engine/store 及 turns E2E 通过；命令 E2E 的 `TestEffortCommands` 因临时路径长度使控制上下文在 “These settings” 中途截断，原 golden 掩码只接受完整行而失败。场景内的实际命令回复和 effort 断言全部通过。已将该掩码限定为接受这一行的截断版本，未改变产品行为或移除回复断言；隔离 Docker 中单独重跑该场景通过。
+
+修正后实际运行 `bash scripts/ci/run_e2e_shard.sh 0` 通过；容器使用 `GOFLAGS=-p=2 GOMAXPROCS=2` 以适应 PID 配额。第一次运行该分片时默认编译并行度触发 `resource temporarily unavailable`，调整容器编译并行度后通过；与功能测试失败分开记录。

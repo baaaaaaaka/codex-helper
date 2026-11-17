@@ -144,8 +144,8 @@ func TestQuestionSyncCollectsAndSubmitsOnce(t *testing.T) {
 
 func TestPendingQuestionMarkerTracksLatestMessageAndRecovers(t *testing.T) {
 	if !isQuestionMarkerMessage(store.Outbox{Kind: store.OutMirror, Part: 1, Parts: 1, Body: `<strong>🤖 ✅ Codex answer:</strong>`}) ||
-		isQuestionMarkerMessage(store.Outbox{Kind: store.OutMirror, Part: 1, Parts: 1, Body: `<strong>🧑‍💻 User:</strong>`}) {
-		t.Fatal("agent mirror output should qualify; user mirror input should not")
+		!isQuestionMarkerMessage(store.Outbox{Kind: store.OutMirror, Part: 1, Parts: 1, Body: `<strong>🧑‍💻 User:</strong>`}) {
+		t.Fatal("all visible mirror output should qualify")
 	}
 	r, a, work := questionRig(t)
 	r.wait("seed answer unread mark", func() bool {
@@ -160,6 +160,10 @@ func TestPendingQuestionMarkerTracksLatestMessageAndRecovers(t *testing.T) {
 	r.wait("latest question marked", func() bool {
 		marked := pendingQuestionTexts(r, work)
 		return len(marked) == 1 && strings.Contains(marked[0], "使用哪个环境？ 1")
+	})
+	r.wait("both pending links published", func() bool {
+		marked := pendingQuestionTexts(r, work)
+		return len(marked) == 1 && strings.Contains(marked[0], "Q1 ·") && strings.Contains(marked[0], "Q2 ·") && !strings.Contains(marked[0], " -> \n")
 	})
 	r.wait("question marks chat unread once", func() bool {
 		_, n := r.ch.Unread(work)
@@ -178,6 +182,14 @@ func TestPendingQuestionMarkerTracksLatestMessageAndRecovers(t *testing.T) {
 		return false
 	})
 
+	r.wait("partial answer removes only answered navigation", func() bool {
+		marked := pendingQuestionTexts(r, work)
+		if len(marked) != 1 {
+			return false
+		}
+		_, tail, _ := strings.Cut(marked[0], "\n\n❓ Pending questions")
+		return strings.Contains(tail, "Q1 ·") && !strings.Contains(tail, "Q2 ·")
+	})
 	r.e.mu.Lock()
 	conv := r.e.byChat[work]
 	r.e.mu.Unlock()

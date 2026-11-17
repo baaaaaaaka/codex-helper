@@ -469,6 +469,12 @@ func TestEngineMetaScalarBoundaryAndServiceEvidence(t *testing.T) {
 	if err = s.Update(func(tx *Tx) error { return tx.SetMeta("engine_user_title:1", "a title") }); err != nil {
 		t.Fatal(err)
 	}
+	for _, key := range []string{"engine_question_marker:1", "engine_question_marker_previous:1"} {
+		if err := s.Update(func(tx *Tx) error { return tx.SetMeta(key, "message-id") }); err != nil {
+			t.Fatal(err)
+		}
+	}
+
 }
 
 func TestEngineMetaUnmappedLegacyStateRollsBack(t *testing.T) {

@@ -126,16 +126,40 @@ stuck wording normally appears at about 17 minutes. An open native question
 or pending content/notice prevents periodic notices from accumulating behind
 the backlog.
 
-While a chat has an unanswered native question, one first-line
-`❓Pending agent question` marker sits on its latest sent Codex final,
-progress message, agent-labeled local mirror, or question message. A new agent
-message moves the marker; question status edits restore it after replacing the
-message body. Answering or closing the last pending question removes it. The
-store keeps only that message's external id per chat, and startup reconciles
-pending questions and saved ids without reading chat history. The delivered
-question also marks its work chat unread once; this uses the existing
-notification/edit queue. Local user-prompt mirrors, incoming user or coworker
-messages, and ordinary helper notices are not marked.
+While a chat has an unanswered native question, its latest delivered visible
+message carries one `❓Pending agent question` first-line marker and a closing
+pending-question section. This includes command replies, notices, files, user
+mirrors and initial receipts appended to admitted owner messages, as well as
+Codex output and question messages. Protocol inbox records and title operations
+are excluded. Appended receipts retain user-message identity.
+
+The section lists stable Q numbers, short titles and links to the original
+question messages. Unpublished questions have a sending placeholder; secret
+questions use a private-question label. Answered or skipped questions leave the
+navigation even while their group is collecting other answers or submitting.
+Question status, transcript, receipt and freeze edits preserve the section at
+the end. Read-back excludes this decoration from user input and echo hashes.
+
+During a pending question, successful delivery records the actual target and
+message creation time in the existing send-outcome transaction. Recovery output
+can therefore follow live output without leaving the marker on a higher queue
+sequence. Delayed read-back cannot displace a newer message, and appended
+receipts use the original user message creation time. Indexed target lookup
+avoids sorting retained message history.
+
+The replacement target is decorated before the old target is cleared. Current
+and previous IDs are recorded together so startup can finish an interrupted
+handoff. The original current-ID metadata retains its single-ID format; no
+schema migration or history rewrite is required. An unchanged refresh does not
+PATCH Teams or rewrite marker metadata. Question delivery still marks its work
+chat unread once through the existing notification/edit queue.
+
+If shortened titles and then compact Q links cannot fit, the existing outbox
+publishes a split, complete question directory and the closing section links to
+its pages. Directory generation waits for the question messages to be delivered,
+uses a content-derived delivery key, and has no independent sender or retry loop.
+Other members' messages are not edited; Workflow notification cards keep their
+existing event-notification behavior.
 
 The reader processes at most 256 source records and its existing 8 MiB byte
 budget per file per pass. Its existing line-size rules still apply. At 256
@@ -205,3 +229,11 @@ unknown history. The migration adds only an index; it does not rewrite message
 bodies or add delivery states. Schema-v4-only binaries cannot open a v5 store.
 Task completion means execution finished, not that every message was delivered.
 Work-chat status reports unconfirmed output separately when it exists.
+
+### 回执与问题入口共用写入
+
+追加初始接收回执时，engine 按原始用户消息的创建时间检查它是否应成为最新问题入口；仅在存在 pending questions 且目标合适时，将问题状态作为可选字段交给 `Annotation`。迟到的旧回执不附加入口，未知创建时间则留给独立刷新。此检查仅做索引查询和标量读取，不增加持久化状态。
+
+Teams adapter 在同一次 GET 后完成业务正文变换与 question 装饰，最多一次 PATCH。`PendingQuestions == nil` 保留装饰，空值清除，非空值替换；已存在的回执不阻止 question 状态更新。装饰超长时仅完成原业务编辑并保留已有装饰，独立刷新继续负责精简、目录和迁移。只有明确的超长错误允许这种降级，网络错误仍沿用原操作的重试规则。
+
+独立 question 刷新不取消：若回执已写入相同装饰，读取后不再 PATCH，再按原流程清理旧入口。转写和冻结提示可复用可选字段，但本轮只在回执调用处接入，不引入全队列合并、等待窗口或额外完成标记。
