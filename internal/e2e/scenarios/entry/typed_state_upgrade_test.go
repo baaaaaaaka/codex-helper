@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/baaaaaaaka/codex-helper/internal/core/store"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/fakecodex"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/harness"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/steps"
@@ -19,6 +18,7 @@ import (
 // Unlike rc.59 conversion, this exercises the actual CLI's in-place upgrade
 // of a frozen core v5 database, then runs without any legacy authority.
 func TestEntryTypedSQLiteUpgradePreservesAttemptedNotice(t *testing.T) {
+	const expectedSchemaVersion = 13 // External upgrade contract, independent of the implementation package.
 	harness.Parallel(t)
 	path := filepath.Join(t.TempDir(), "core.sqlite")
 	s := harness.NewScenario(t, "ENTRY-TYPED-SQLITE-UPGRADE", harness.Options{
@@ -97,7 +97,7 @@ func TestEntryTypedSQLiteUpgradePreservesAttemptedNotice(t *testing.T) {
 	if err := db.QueryRow(`SELECT text FROM cli_result_lines WHERE request_id='completed' AND position=0`).Scan(&result); err != nil {
 		t.Fatal(err)
 	}
-	s.Check("upgrade committed typed state and removed old keys", version == store.SchemaVersion && recoveryTables == 1 && goalTables == 1 && deliveryIndexes == 2 && oldKeys == 0 && result == "original result", fmt.Sprintf("v%d; recovery and goal control tables; both delivery indexes; no old keys; original result", store.SchemaVersion), fmt.Sprintf("version=%d recovery_tables=%d goal_tables=%d delivery_indexes=%d old=%d result=%q", version, recoveryTables, goalTables, deliveryIndexes, oldKeys, result))
+	s.Check("upgrade committed typed state and removed old keys", version == expectedSchemaVersion && recoveryTables == 1 && goalTables == 1 && deliveryIndexes == 2 && oldKeys == 0 && result == "original result", fmt.Sprintf("v%d; recovery and goal control tables; both delivery indexes; no old keys; original result", expectedSchemaVersion), fmt.Sprintf("version=%d recovery_tables=%d goal_tables=%d delivery_indexes=%d old=%d result=%q", version, recoveryTables, goalTables, deliveryIndexes, oldKeys, result))
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
