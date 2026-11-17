@@ -40,6 +40,7 @@ func TestReadThreadNameIndexUsesLatestValidName(t *testing.T) {
 }
 
 func TestLoadThreadNameIndexCachesUntilFileChanges(t *testing.T) {
+	setTestUserCacheDir(t)
 	lockCodexHistoryTestHooks(t)
 	resetThreadNameIndexCache()
 	t.Cleanup(resetThreadNameIndexCache)
@@ -63,7 +64,7 @@ func TestLoadThreadNameIndexCachesUntilFileChanges(t *testing.T) {
 		if err != nil {
 			t.Fatalf("loadThreadNameIndexContext: %v", err)
 		}
-		if got := names["session-1"]; got != "first" {
+		if got := names.lookup("session-1"); got != "first" {
 			t.Fatalf("cached name = %q, want first", got)
 		}
 	}
@@ -87,7 +88,7 @@ func TestLoadThreadNameIndexCachesUntilFileChanges(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reload changed index: %v", err)
 	}
-	if got := names["session-1"]; got != "renamed" {
+	if got := names.lookup("session-1"); got != "renamed" {
 		t.Fatalf("changed name = %q, want renamed", got)
 	}
 	if opens != 2 {
@@ -96,6 +97,7 @@ func TestLoadThreadNameIndexCachesUntilFileChanges(t *testing.T) {
 }
 
 func TestLoadThreadNameIndexIsOptionalMetadata(t *testing.T) {
+	setTestUserCacheDir(t)
 	lockCodexHistoryTestHooks(t)
 	resetThreadNameIndexCache()
 	t.Cleanup(resetThreadNameIndexCache)
@@ -105,7 +107,7 @@ func TestLoadThreadNameIndexIsOptionalMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("missing index error: %v", err)
 	}
-	if len(names) != 0 {
+	if names.size() != 0 {
 		t.Fatalf("missing index names = %#v, want empty", names)
 	}
 
@@ -122,7 +124,7 @@ func TestLoadThreadNameIndexIsOptionalMetadata(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unreadable index error: %v", err)
 	}
-	if len(names) != 0 {
+	if names.size() != 0 {
 		t.Fatalf("unreadable index names = %#v, want empty", names)
 	}
 
@@ -236,6 +238,7 @@ func TestDiscoverProjectsRefreshesThreadNameWhenIndexChanges(t *testing.T) {
 }
 
 func BenchmarkLoadThreadNameIndexCached(b *testing.B) {
+	setBenchmarkUserCacheDir(b)
 	resetThreadNameIndexCache()
 	b.Cleanup(resetThreadNameIndexCache)
 

@@ -1,0 +1,160 @@
+历史阶段记录：本文反映当时的基线、实现与测试结果，不代表当前版本的状态。
+
+CXP SQLite 与 JSONL 缓存：剩余改动与最终验证
+日期：2026-11-17
+
+状态
+
+上一轮核对中指出的五项代码缺口均已补齐。本地适用检查通过。
+Docker 真实进程/E2E、真实 NFS/多主机和 Windows/macOS 原生验证仍未完成，
+所以“代码缺口已补齐”不等于“全部发布门禁已通过”。
+未提交、推送、发布或安装；没有启动、重启、替换或更改正在运行的 Teams helper。
+
+工作区：/home/baka/project/codex-helper/.worktrees/audit-sqlite-jsonl-20261117
+分支：audit/sqlite-jsonl-20261117
+基线：ecd719f9e839e1f86e07ba6f704545959179044c
+本轮日志：/home/baka/.local/state/codex-helper/source-validation/sqlite-jsonl-remaining-20261117
+第一轮日志：/home/baka/.local/state/codex-helper/source-validation/sqlite-jsonl-20261117
+第一轮详细记录：SQLITE_JSONL_IMPLEMENTATION.txt（历史记录）。
+本轮完整补丁包含第一轮与本轮全部改动，针对上述基线；不需要先应用第一轮补丁。
+
+五项缺口与最终实现
+
+1. history 正常追加不再复制完整 map
+   每个 catalog store 保留一个带 RWMutex 的 historyIndexData。
+   解析时仅构建本次变更 map；SQLite 成功提交后，在短写锁内合并变化。
+   读者只在单条 lookup 时持有读锁，并取得值副本。旧读者得到的是同步共享视图，
+   可以看到本进程稍后成功提交的追加；它不是不可变的历史时间点快照。
+   文件重建或检测到其他连接修改后，允许重新装载完整 map。
+   同一 store 的更新串行；读者锁不跨源文件或 SQLite I/O。
+   提交失败仅返回请求私有的少量变化，不能污染共享的已提交索引。
+   有效但无换行的尾记录也只叠加在请求私有 map；不推进持久游标。
+   删除 cloneHistorySessions，不增加持久变更日志或跨进程 map 同步。
+
+2. text/messages 模式切换不再重读尚未提交的 JSONL 尾段
+   messagesLoaded 只表示当前标准消息列表是否已装载，与本次请求展示模式分开。
+   从文本切到消息列表时，读取并校验 SQLite 中已提交的消息，然后接上已有 pendingMessages。
+   后续文本读取仍保留已有消息列表；追加同步更新它，避免失效后再次解析。
+   保留已提交 offset/ordinal/generation 的并发校验；冲突时丢弃内存状态并恢复。
+   完整消息列表返回给调用者时与缓存条目隔离，修改首条或 pending 尾条不会污染缓存。
+   64 KiB/30 秒批次阈值不变，没有为了模式切换额外提交事务。
+
+3. 真正共享一个 JSONL 窗口读取工具
+   新增 readJSONLWindow，小范围复用行对齐、流式逐行读取、取消、EOF 和读取错误处理。
+   history、preview、名称索引和完整元数据的窗口解析使用同一工具。
+   128 KiB summary 的提前停止规则继续独立；它有自己的读取预算和停止条件。
+   末尾完整 JSON 无换行仍可读取；是否临时展示、在哪里持久化由上层明确决定。
+   请求窗口尚未读够就遇到 EOF，返回 UnexpectedEOF，防止截断时发布虚假进度。
+   history 是可选的发现增强信息：源读取失败不阻断发现，不推进数据库；取消仍向上传递。
+   工具采用 64 KiB 读缓冲；超大单行仍可能分配更多内存，不声称固定内存上限。
+
+4. 删除全局 4096 项元数据 map
+   删除 sessionFileCache、get/set/reset 及其调用者，不留下空实现或第二套失效逻辑。
+   loader 只持有当前发现路径的 catalog 批量快照，context 释放后快照随之释放。
+   单文件独立调用直接使用现有 catalog；新 loader 能读取其他连接更新的记录。
+   数据库连接、history 和名称缓存各自的既有生命周期保持原有职责。
+
+5. summary 记录真实扫描覆盖范围
+   readSessionSummary 返回 consumed 字节数，session_meta.parsed_offset 存储实际扫描位置。
+   增加 is_summary 字段，替换负 offset 哨兵；未读到 EOF 时消息数仍为 -1，表示未知。
+   摘要不能作为完整元数据解析的续读基础，也不能降级同一来源的完整元数据。
+   重开后仍保留覆盖范围与摘要标志。
+   原业务库 conversion/migration 不变。派生缓存仍采用本补丁尚未发布的版本 4；
+   不匹配的派生 schema 会隔离并从 JSONL 重建，不维护双格式读写。
+   回归已模拟较早派生结构缺少 is_summary，确认能重建且源 JSONL 内容不变。
+
+新增回归
+
+remaining_plan_test.go 包含 9 项顶层回归，并有 JSONL 边界表驱动子项：
+- 受控持有读锁，确认 SQLite 已提交时 map 尚未被并发修改，释放后才合并；不复制未变记录。
+- 注入 SQLite INSERT 失败，共享 history 索引不变，请求仍能看到源数据，重试可恢复。
+- 连续 12 次追加并反复 text/messages 切换，仅解析 12 个新窗口；未到阈值不写 checkpoint。
+  修改返回列表首尾元素不污染缓存；强制提交后重开，14 条消息无丢失、无重复。
+- JSONL 空窗口、无换行、未对齐起点、有界前缀、短读、非法窗口、取消和回调错误。
+- summary 覆盖位置持久化；随后完整解析从零开始并得到准确消息数。
+- loader 快照随 context 隔离，新请求不被全局旧元数据遮蔽。
+- 解析中截断 history，发现正常退化，SQLite 游标不变。
+- 解析中截断完整元数据，返回读取错误，不发布缓存记录。
+- 较早派生缓存缺字段，隔离后重建，原始 JSONL 保持不变。
+
+现有测试仅改用同步索引查询、去除已删除缓存的 reset、适配 summary 返回覆盖范围。
+没有放宽消息可见性、事务原子性、零写入、页写预算或并发断言。
+
+最终适用检查
+
+共同 TMPDIR：/home/baka/.local/state/codex-helper/source-validation/sqlite-jsonl-20261117/tmp
+共同 GOCACHE：/home/baka/.local/state/codex-helper/source-validation/sqlite-jsonl-20261117/go-build
+均为已验证可写的隔离 state 路径，避免测试产生物写入仓库。
+
+PASS go test ./internal/codexhistory ./internal/tui . -count=1 -timeout=5m
+     history 3.209s；tui 0.371s；根目录格式/CI 合约 5.643s。
+PASS go test -race ./internal/codexhistory ./internal/tui -count=1 -timeout=5m
+     history 9.929s；tui 2.383s。
+PASS go test ./internal/cli -run '^(Test(ServiceSQLite|SupervisorSQLite|AuthSQLite|LoadHistoryTuiProjects|TeamsStatusPublisher|TeamsCoreStore|FirstStart))' -count=1 -timeout=5m
+     2.272s，匹配并执行了相关隔离单元测试。
+PASS go vet ./internal/codexhistory ./internal/tui ./internal/cli
+PASS CGO_ENABLED=0 go build -o <隔离目录>/cxp-linux ./cmd/codex-proxy
+     只构建，不启动源代码编译的 helper。
+PASS GOOS=windows CGO_ENABLED=0 go test -c -o <隔离目录>/history.windows.test.exe ./internal/codexhistory
+     仅交叉编译；没有声称执行 Windows 测试。
+PASS 最终 codexhistory 测试二进制在 strace 下执行两个 SQLite I/O probe。
+PASS 下述基准、gofmt、git diff --check 和完整补丁反向校验。
+
+本轮没有修改 Teams 业务 migration、store 或 engine 实现；其第一轮整包、竞态和
+旧 JSON/blob conversion 故障重试验证仍记录在第一轮日志，本轮未重复运行未受影响的长套件。
+最初构建命令误指根目录，因根目录只有测试而失败；改用真实入口 ./cmd/codex-proxy 后通过。
+这是命令目标错误，不是 sandbox、依赖或产品构建失败。
+
+性能：与第一轮交付实现比较
+
+Linux amd64，AMD Ryzen 9 7950X。归档第一轮补丁得到独立 before 源码，
+使用同一 BenchmarkAuditHistorySmallAppend、相同缓存环境、各 100 次迭代，顺序运行两轮。
+下表是两轮范围，包含追加文件和持久化事务；本地 fsync 存在波动，不作为 CI 毫秒阈值。
+
+工作负载                         第一轮实现              本轮最终实现
+1,000 history 单条新 session      2.733–2.855 ms           2.585–2.758 ms
+同上分配                         232,114–232,719 B        188,129–188,677 B
+同上分配次数                     1,241–1,242              184–186
+100,000 history 单条新 session    15.511–18.801 ms         2.650–2.783 ms
+同上分配                         8,447,142–8,447,251 B    208,120–208,165 B
+同上分配次数                     100,496                  183
+
+10 万条样本耗时进一步减少约 82%–86%，分配字节减少约 97.5%，分配次数减少约 99.8%。
+新增条目仍可能触发 Go map 偶发扩容；没有声称绝对固定成本或零分配。
+10 次迭代的补充对照中，未变 history、预览热命中、预览重开和预览小追加没有稳定的额外收益；
+本轮不把微小计时波动算作优化。预览小追加仍约 2.65 MB 分配，完整文本接口的复制成本保留。
+
+最终 I/O 复核
+
+由 strace 按 probe phase 统计进程 syscall 返回/请求字节；不是物理存储设备流量。
+
+阶段                         源 JSONL 读取     SQLite+日志写入
+catalog exact hit             0 B              0 B
+catalog steady state          1 B              0 B
+8 MiB transcript 追加约 4 KiB 135,341 B        16,924 B
+history 新增一条              208 B            25,124 B
+100 次预览 exact hit          100 B            0 B
+预览关闭                      0 B              0 B
+预览重开                      1 B              0 B
+未到阈值的小追加              700 B            0 B
+达到阈值的约 64 KiB 追加      131,592 B        98,860 B
+
+非零读取包含行边界和有界前缀校验；写入包含正常 SQLite 页/journal 事务开销。
+没有增加提交频率，也没有为了消除 map 复制而增加数据库日志或索引。
+
+未完成的验证与保留边界
+
+BLOCKED Docker harness smoke：cxp Docker test failed: Docker daemon is unavailable。
+        /var/run/docker.sock 与 /run/docker.sock 缺失；属于环境服务不可用，不是 sandbox 拒绝。
+        因此真实进程、Linux collector 和 E2E shards 未执行，未尝试启动 daemon 或改动宿主服务。
+UNRUN   真实 NFS/多主机、Windows/macOS 原生测试；没有提供相关可用目标。
+NONE    本轮没有 sandbox 拒绝、依赖下载失败、网络失败或目标机器测试失败。
+        上述“未执行”不能当作测试通过。
+
+技能要求真实生命周期和推理测试“only through the bundled ephemeral Docker harness”
+（/home/baka/.codex/skills/cxp-development/SKILL.md:53）。因此没有使用宿主 helper 绕过 Docker。
+
+完整文本复制、目录 WalkDir、正常 SQLite journal/索引成本、outbox 单条网络 JSON、
+业务状态历史保留、既有 conversion 与发布 lease 边界均按批准计划保留。
+没有新增后台 worker、watcher、持久变更日志、分页协议或双格式兼容运行分支。
+在上述外部发布门禁补齐前，不将这次结果描述为可直接发布的版本。

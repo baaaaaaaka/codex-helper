@@ -55,7 +55,6 @@ func resetPersistentCacheStatesForTest() {
 	resetSessionPreviewSQLiteForTest()
 	resetCatalogSQLiteForTest()
 	resetCacheV2ForTest()
-	resetSessionFileCache()
 }
 
 func TestCacheV2PathFollowsCodexDirAndScopesIdentity(t *testing.T) {
@@ -302,7 +301,6 @@ func TestSessionMetaCatalogPersistsAcrossProcessStateResetWithoutWriting(t *test
 		t.Fatal(err)
 	}
 
-	resetSessionFileCache()
 	resetCatalogSQLiteForTest()
 	previousOpen := openSessionMetaFile
 	openSessionMetaFile = func(string) (*os.File, error) {
@@ -344,7 +342,6 @@ func TestSessionMetaCatalogPersistsForkLineageWithoutSubagentClassification(t *t
 		t.Fatalf("parsed fork metadata = %#v, want top-level with retained parent", first)
 	}
 
-	resetSessionFileCache()
 	resetCatalogSQLiteForTest()
 	previousOpen := openSessionMetaFile
 	openSessionMetaFile = func(string) (*os.File, error) {
@@ -387,7 +384,6 @@ func TestSessionMetaCatalogAppendReadsOnlyNewBytes(t *testing.T) {
 		sizes = append(sizes, size)
 	}
 	t.Cleanup(func() { sessionMetaWindowReadHook = previousHook })
-	resetSessionFileCache()
 	meta, err := readSessionFileMetaCached(source)
 	if err != nil {
 		t.Fatal(err)
@@ -440,8 +436,8 @@ func TestHistoryCatalogAppendReadsOnlyTailAndExactHitDoesNotWrite(t *testing.T) 
 	if err := os.WriteFile(historyPath, []byte(firstLine), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := loadHistoryIndexContext(context.Background(), root); err != nil || got.sessions["s1"].FirstPrompt != "first prompt" {
-		t.Fatalf("initial history: %#v err=%v", got.sessions, err)
+	if got, err := loadHistoryIndexContext(context.Background(), root); err != nil || historyPromptForTest(got, "s1") != "first prompt" {
+		t.Fatalf("initial history: %#v err=%v", got, err)
 	}
 	oldInfo, err := os.Stat(historyPath)
 	if err != nil {
@@ -464,8 +460,8 @@ func TestHistoryCatalogAppendReadsOnlyTailAndExactHitDoesNotWrite(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if offset != oldInfo.Size() || size != newInfo.Size()-oldInfo.Size() || idx.sessions["s2"].FirstPrompt != "second prompt" || commits != 1 {
-		t.Fatalf("history append offset=%d size=%d session=%#v commits=%d", offset, size, idx.sessions["s2"], commits)
+	if offset != oldInfo.Size() || size != newInfo.Size()-oldInfo.Size() || historyPromptForTest(idx, "s2") != "second prompt" || commits != 1 {
+		t.Fatalf("history append offset=%d size=%d session=%#v commits=%d", offset, size, idx, commits)
 	}
 	store, err := currentCatalogSQLiteStore(historyPath)
 	if err != nil {
@@ -623,7 +619,6 @@ func TestCatalogBusyWriterFallsBackToSourcePromptly(t *testing.T) {
 	defer lockConn.ExecContext(context.Background(), `ROLLBACK`)
 
 	appendFile(t, source, `{"timestamp":"2026-01-01T00:02:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"second prompt"}]}}`+"\n")
-	resetSessionFileCache()
 	started := time.Now()
 	meta, err := readSessionFileMetaCached(source)
 	elapsed := time.Since(started)
@@ -750,7 +745,6 @@ func TestCatalogSQLiteSyscallProbe(t *testing.T) {
 	}
 	marker := func(name string) { _, _ = fmt.Fprintln(os.Stderr, "CXP_CATALOG_IO_PHASE", name) }
 
-	resetSessionFileCache()
 	marker("exact-hit-begin")
 	if _, err := readSessionFileMetaCached(source); err != nil {
 		t.Fatal(err)
@@ -758,7 +752,6 @@ func TestCatalogSQLiteSyscallProbe(t *testing.T) {
 	marker("exact-hit-end")
 
 	appendFile(t, source, `{"timestamp":"2026-01-01T00:02:00Z","type":"response_item","payload":{"id":"small-tail","type":"message","role":"assistant","content":[{"type":"output_text","text":"`+strings.Repeat("x", 4*1024)+`"}]}}`+"\n")
-	resetSessionFileCache()
 	marker("session-append-begin")
 	if _, err := readSessionFileMetaCached(source); err != nil {
 		t.Fatal(err)
@@ -772,7 +765,6 @@ func TestCatalogSQLiteSyscallProbe(t *testing.T) {
 	}
 	marker("history-append-end")
 
-	resetSessionFileCache()
 	marker("steady-state-begin")
 	if _, err := readSessionFileMetaCached(source); err != nil {
 		t.Fatal(err)

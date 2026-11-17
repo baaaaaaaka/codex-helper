@@ -203,6 +203,7 @@ func (f *Facade) streamResponse(w http.ResponseWriter, ctx context.Context, resp
 	nextOutputIndex := 0
 	text := ""
 	reasoning := ""
+	var textBuffer, reasoningBuffer strings.Builder
 	startedReasoningItem := false
 	reasoningOutputIndex := -1
 	var usage *Usage
@@ -285,7 +286,8 @@ func (f *Facade) streamResponse(w http.ResponseWriter, ctx context.Context, resp
 			switch event.Kind {
 			case ProviderEventReasoningDelta:
 				ensureReasoningItem()
-				reasoning += event.Delta
+				reasoningBuffer.WriteString(event.Delta)
+				reasoning = reasoningBuffer.String()
 				writeEvent("response.reasoning_text.delta", map[string]any{
 					"output_index":  reasoningOutputIndex,
 					"item_id":       reasoningItemID(responseID),
@@ -294,7 +296,8 @@ func (f *Facade) streamResponse(w http.ResponseWriter, ctx context.Context, resp
 				})
 			case ProviderEventTextDelta:
 				ensureMessageItem()
-				text += event.Delta
+				textBuffer.WriteString(event.Delta)
+				text = textBuffer.String()
 				writeEvent("response.output_text.delta", map[string]any{
 					"output_index":  messageOutputIndex,
 					"content_index": 0,
@@ -419,6 +422,7 @@ func validateProviderResultContract(result providerResult, req ProviderRequest) 
 
 func (f *Facade) collectProviderResult(ctx context.Context, stream <-chan ProviderEvent, tools []ChatTool) (providerResult, bool) {
 	result := providerResult{messageOutputIndex: -1, reasoningOutputIndex: -1}
+	var textBuffer, reasoningBuffer strings.Builder
 	toolCalls := newToolCallAccumulator("")
 	nextOutputIndex := 0
 	startedMessage := false
@@ -438,14 +442,16 @@ func (f *Facade) collectProviderResult(ctx context.Context, stream <-chan Provid
 					result.reasoningOutputIndex = nextOutputIndex
 					nextOutputIndex++
 				}
-				result.reasoningText += event.Delta
+				reasoningBuffer.WriteString(event.Delta)
+				result.reasoningText = reasoningBuffer.String()
 			case ProviderEventTextDelta:
 				if !startedMessage {
 					startedMessage = true
 					result.messageOutputIndex = nextOutputIndex
 					nextOutputIndex++
 				}
-				result.text += event.Delta
+				textBuffer.WriteString(event.Delta)
+				result.text = textBuffer.String()
 			case ProviderEventToolCallDelta:
 				if event.ToolCall != nil && strings.TrimSpace(event.ToolCall.Namespace) == "" {
 					event.ToolCall.Namespace = providerToolNamespace(event.ToolCall.Name, tools)
@@ -666,14 +672,15 @@ type toolCallAccumulator struct {
 }
 
 type toolCallState struct {
-	Index       int
-	OutputIndex int
-	ItemID      string
-	CallID      string
-	Name        string
-	Namespace   string
-	Arguments   string
-	Added       bool
+	Index           int
+	OutputIndex     int
+	ItemID          string
+	CallID          string
+	Name            string
+	Namespace       string
+	Arguments       string
+	argumentsBuffer strings.Builder
+	Added           bool
 }
 
 func newToolCallAccumulator(responseID string) *toolCallAccumulator {
@@ -713,7 +720,8 @@ func (a *toolCallAccumulator) apply(delta *ProviderToolCallDelta, nextOutputInde
 		}
 		call.Namespace = delta.Namespace
 	}
-	call.Arguments += delta.ArgumentsDelta
+	call.argumentsBuffer.WriteString(delta.ArgumentsDelta)
+	call.Arguments = call.argumentsBuffer.String()
 
 	added := false
 	if !call.Added && call.Name != "" {

@@ -75,22 +75,6 @@ func decodeCacheDeviceID(key *fileCacheKey, value string) {
 	}
 }
 
-func cloneHistorySessions(src map[string]*historySessionInfo) map[string]*historySessionInfo {
-	if len(src) == 0 {
-		return map[string]*historySessionInfo{}
-	}
-	dst := make(map[string]*historySessionInfo, len(src))
-	for key, value := range src {
-		if value == nil {
-			dst[key] = nil
-			continue
-		}
-		entry := *value
-		dst[key] = &entry
-	}
-	return dst
-}
-
 func newFileCacheKey(path string, info os.FileInfo) fileCacheKey {
 	key := fileCacheKey{}
 	if info == nil {

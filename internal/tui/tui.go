@@ -152,9 +152,12 @@ type previewErrorEntry struct {
 }
 
 type previewLinesCacheEntry struct {
-	key   string
-	lines []string
-	cost  int
+	body      string
+	bodyLines []string
+	width     int
+	key       string
+	lines     []string
+	cost      int
 }
 
 type projectLoadEvent struct {
@@ -191,6 +194,7 @@ type previewState struct {
 }
 
 type projectItem struct {
+	searchLabel   string
 	label         string
 	project       codexhistory.Project
 	isCurrent     bool
@@ -198,6 +202,7 @@ type projectItem struct {
 }
 
 type sessionItem struct {
+	searchLabel   string
 	label         string
 	session       codexhistory.Session
 	subagent      codexhistory.SubagentSession
@@ -1223,7 +1228,11 @@ func applyPreviewEvent(state *uiState, ev previewEvent) {
 		state.previewError[ev.cacheKey] = previewErrorEntry{message: ev.err.Error(), meta: ev.meta}
 		return
 	}
-	state.rememberPreview(ev.cacheKey, previewCacheEntry{text: ev.text, meta: ev.meta, revision: previewMetaRevision(ev.meta)})
+	revision := previewMetaRevision(ev.meta)
+	if old, ok := state.previewCache[ev.cacheKey]; ok && old.text == ev.text {
+		revision = previewCacheEntryRevision(old)
+	}
+	state.rememberPreview(ev.cacheKey, previewCacheEntry{text: ev.text, meta: ev.meta, revision: revision})
 	delete(state.previewError, ev.cacheKey)
 }
 
@@ -2286,7 +2295,11 @@ func filterProjects(items []projectItem, needle string) []projectItem {
 			out = append(out, it)
 			continue
 		}
-		if strings.Contains(strings.ToLower(it.label), n) {
+		label := it.searchLabel
+		if label == "" {
+			label = strings.ToLower(it.label)
+		}
+		if strings.Contains(label, n) {
 			out = append(out, it)
 		}
 	}
@@ -2331,7 +2344,11 @@ func filterSessions(items []sessionItem, needle string) []sessionItem {
 			out = append(out, it)
 			continue
 		}
-		if strings.Contains(strings.ToLower(it.label), n) {
+		label := it.searchLabel
+		if label == "" {
+			label = strings.ToLower(it.label)
+		}
+		if strings.Contains(label, n) {
 			out = append(out, it)
 		}
 	}

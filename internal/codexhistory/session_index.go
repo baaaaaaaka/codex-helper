@@ -109,6 +109,17 @@ func readSessionFileMetaContext(ctx context.Context, filePath string) (sessionFi
 // existing metadata value. Callers only pass complete-line boundaries, which
 // lets the persistent catalog advance without rescanning an older conversation.
 func readSessionFileMetaWindowContext(ctx context.Context, filePath string, offset int64, size int64, base sessionFileMeta) (sessionFileMeta, error) {
+	meta, err := readSessionFileMetaWindowRawContext(ctx, filePath, offset, size, base)
+	if err != nil {
+		return meta, err
+	}
+	if info, err := os.Stat(filePath); err == nil {
+		meta = sessionMetaWithFallbackTime(meta, info)
+	}
+	return meta, nil
+}
+
+func readSessionFileMetaWindowRawContext(ctx context.Context, filePath string, offset int64, size int64, base sessionFileMeta) (sessionFileMeta, error) {
 	meta := base
 	if err := ctx.Err(); err != nil {
 		return meta, err
@@ -125,34 +136,13 @@ func readSessionFileMetaWindowContext(ctx context.Context, filePath string, offs
 	}
 	defer f.Close()
 
-	reader := bufio.NewReaderSize(io.NewSectionReader(f, offset, size), 64*1024)
-	for {
-		if err := ctx.Err(); err != nil {
-			return meta, err
-		}
-		line, readErr := reader.ReadBytes('\n')
-		if readErr != nil && readErr != io.EOF {
-			return meta, readErr
-		}
-		line = bytes.TrimSpace(line)
-		if len(line) > 0 {
-			processMetaLine(line, &meta)
-		}
-		if readErr == io.EOF {
-			break
-		}
+	if err := readJSONLWindow(ctx, f, offset, size, func(line []byte) error {
+		processMetaLine(line, &meta)
+		return nil
+	}); err != nil {
+		return meta, err
 	}
 
-	if meta.CreatedAt.IsZero() || meta.ModifiedAt.IsZero() {
-		if st, err := os.Stat(filePath); err == nil {
-			if meta.CreatedAt.IsZero() {
-				meta.CreatedAt = st.ModTime()
-			}
-			if meta.ModifiedAt.IsZero() {
-				meta.ModifiedAt = st.ModTime()
-			}
-		}
-	}
 	return meta, nil
 }
 
@@ -405,4 +395,16 @@ func extractContentText(raw json.RawMessage) string {
 		}
 	}
 	return ""
+}
+
+// File timestamps are result fallbacks, not parsed prefix state. Persisting
+// them would mask an event timestamp that arrives in a provisional tail.
+func sessionMetaWithFallbackTime(meta sessionFileMeta, info os.FileInfo) sessionFileMeta {
+	if meta.CreatedAt.IsZero() {
+		meta.CreatedAt = info.ModTime()
+	}
+	if meta.ModifiedAt.IsZero() {
+		meta.ModifiedAt = info.ModTime()
+	}
+	return meta
 }

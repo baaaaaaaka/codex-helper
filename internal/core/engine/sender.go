@@ -767,19 +767,58 @@ func (e *Engine) resolvePass(ctx context.Context) time.Duration {
 		return until.Sub(now)
 	}
 	sort.Slice(due, func(i, j int) bool { return due[i] < due[j] })
+	windows := map[string]*resolverReadback{}
+	var pending []store.Outbox
+	if err := e.st.Read(func(tx *store.Tx) error {
+		for _, id := range due {
+			row, ok, err := tx.Outbox(id)
+			if err != nil {
+				return err
+			}
+			if ok && row.State == store.OutUnknown {
+				pending = append(pending, row)
+			}
+		}
+		return nil
+	}); err != nil {
+		return e.t.Tick
+	}
+	for _, row := range pending {
+		if cs := e.conv(row.ConvID); cs != nil {
+			e.mu.Lock()
+			chat := cs.chat
+			e.mu.Unlock()
+			since := fromMS(row.CreatedAt).Add(-time.Minute)
+			if old := windows[chat]; old == nil || since.Before(old.since) {
+				windows[chat] = &resolverReadback{since: since}
+			}
+		}
+	}
 	for _, id := range due {
+		if until := e.gate(e.gRead); e.now().Before(until) {
+			return until.Sub(e.now())
+		}
 		if ctx.Err() != nil {
 			return 0
 		}
-		e.resolveOne(ctx, id)
+		e.resolveOneWithReadback(ctx, id, windows)
 	}
 	return e.t.Tick
 }
 
-func (e *Engine) resolveOne(ctx context.Context, id int64) {
+type resolverReadback struct {
+	since   time.Time
+	started time.Time
+	done    bool
+	msgs    []channel.InboundMsg
+	err     error
+}
+
+func (e *Engine) resolveOne(ctx context.Context, id int64) { e.resolveOneWithReadback(ctx, id, nil) }
+func (e *Engine) resolveOneWithReadback(ctx context.Context, id int64, windows map[string]*resolverReadback) {
 	var r store.Outbox
 	var ok bool
-	if err := e.update(func(tx *store.Tx) error {
+	if err := e.st.Read(func(tx *store.Tx) error {
 		var err error
 		r, ok, err = tx.Outbox(id)
 		return err
@@ -800,8 +839,20 @@ func (e *Engine) resolveOne(ctx context.Context, id int64) {
 	chat := cs.chat
 	u := e.unknown[id]
 	e.mu.Unlock()
-	started := e.now()
-	msgs, err := e.ch.ReadBack(ctx, chat, fromMS(r.CreatedAt).Add(-time.Minute))
+	if u == nil {
+		return
+	}
+	since := fromMS(r.CreatedAt).Add(-time.Minute)
+	group := windows[chat]
+	if group == nil || since.Before(group.since) {
+		group = &resolverReadback{since: since}
+	}
+	if !group.done {
+		group.started = e.now()
+		group.msgs, group.err = e.ch.ReadBack(ctx, chat, group.since)
+		group.done = true
+	}
+	started, msgs, err := group.started, group.msgs, group.err
 	if ctx.Err() != nil {
 		return
 	}
@@ -830,6 +881,15 @@ func (e *Engine) resolveOne(ctx context.Context, id int64) {
 	var found string
 	err = e.update(func(tx *store.Tx) error {
 		found = ""
+		// Read-back ran outside the transaction. A manual retry or another
+		// settlement may have changed the row while the request was in flight.
+		current, exists, err := tx.Outbox(id)
+		if err != nil {
+			return err
+		}
+		if !exists || current.State != store.OutUnknown || current.AttemptToken != r.AttemptToken {
+			return store.ErrState
+		}
 		markers := map[string]bool{}
 		if marker != "" {
 			markers[marker] = true
@@ -842,6 +902,13 @@ func (e *Engine) resolveOne(ctx context.Context, id int64) {
 			markers[e.marker(prev)] = true
 		}
 		for _, m := range msgs {
+			modified := m.Modified
+			if modified.IsZero() {
+				modified = m.Created
+			}
+			if group.since.Before(since) && !modified.IsZero() && !modified.After(since) {
+				continue
+			}
 			if m.Marker != "" && markers[m.Marker] {
 				found = m.ID
 				break
@@ -918,6 +985,13 @@ func (e *Engine) resolveOne(ctx context.Context, id int64) {
 	}
 	// Non-content acknowledgements/notices keep their existing settlement.
 	err = e.update(func(tx *store.Tx) error {
+		current, exists, err := tx.Outbox(id)
+		if err != nil {
+			return err
+		}
+		if !exists || current.State != store.OutUnknown || current.AttemptToken != r.AttemptToken {
+			return store.ErrState
+		}
 		text := textUnconfirmed
 		if err := tx.Drop(r.ID, "not found by read-back"); err != nil {
 			return err

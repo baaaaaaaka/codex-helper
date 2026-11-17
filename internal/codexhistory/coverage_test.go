@@ -981,8 +981,8 @@ func TestFilterEmptySessions_Mixed(t *testing.T) {
 
 func TestLoadHistoryIndex_FileNotExist(t *testing.T) {
 	idx := loadHistoryIndex("/nonexistent/dir")
-	if len(idx.sessions) != 0 {
-		t.Errorf("expected empty index, got %d entries", len(idx.sessions))
+	if idx.len() != 0 {
+		t.Errorf("expected empty index, got %d entries", idx.len())
 	}
 }
 
@@ -997,8 +997,8 @@ func TestLoadHistoryIndex_ValidEntries(t *testing.T) {
 		t.Fatal(err)
 	}
 	idx := loadHistoryIndex(dir)
-	if len(idx.sessions) != 2 {
-		t.Fatalf("expected 2 sessions, got %d", len(idx.sessions))
+	if idx.len() != 2 {
+		t.Fatalf("expected 2 sessions, got %d", idx.len())
 	}
 	info, ok := idx.lookup("s1")
 	if !ok {
@@ -1076,8 +1076,8 @@ func TestLoadHistoryIndex_EmptyFile(t *testing.T) {
 		t.Fatal(err)
 	}
 	idx := loadHistoryIndex(dir)
-	if len(idx.sessions) != 0 {
-		t.Errorf("expected empty, got %d", len(idx.sessions))
+	if idx.len() != 0 {
+		t.Errorf("expected empty, got %d", idx.len())
 	}
 }
 
@@ -1105,7 +1105,7 @@ func TestLoadHistoryIndex_SkipsEmptyText(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestLookup_EmptySessionID(t *testing.T) {
-	idx := historyIndex{sessions: map[string]*historySessionInfo{}}
+	idx := historyIndex{data: &historyIndexData{sessions: map[string]*historySessionInfo{}}}
 	_, ok := idx.lookup("")
 	if ok {
 		t.Error("expected false for empty session ID")
@@ -1121,7 +1121,7 @@ func TestLookup_NilSessions(t *testing.T) {
 }
 
 func TestLookup_NilEntry(t *testing.T) {
-	idx := historyIndex{sessions: map[string]*historySessionInfo{"s1": nil}}
+	idx := historyIndex{data: &historyIndexData{sessions: map[string]*historySessionInfo{"s1": nil}}}
 	_, ok := idx.lookup("s1")
 	if ok {
 		t.Error("expected false for nil entry")
@@ -1256,7 +1256,6 @@ func TestCollectSessionFiles_Nested(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestSessionFileCache_HitAndMiss(t *testing.T) {
-	resetSessionFileCache()
 	f := filepath.Join(t.TempDir(), "cached.jsonl")
 	content := `{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"c1","cwd":"/tmp","source":"cli"}}
 {"timestamp":"2026-01-01T00:01:00Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"cached prompt"}]}}
@@ -1288,7 +1287,6 @@ func TestSessionFileCache_HitAndMiss(t *testing.T) {
 }
 
 func TestSessionFileCache_FileDeleted(t *testing.T) {
-	resetSessionFileCache()
 	f := filepath.Join(t.TempDir(), "del.jsonl")
 	if err := os.WriteFile(f, []byte(`{"timestamp":"2026-01-01T00:00:00Z","type":"session_meta","payload":{"id":"d1","cwd":"/tmp","source":"cli"}}`+"\n"), 0o644); err != nil {
 		t.Fatal(err)

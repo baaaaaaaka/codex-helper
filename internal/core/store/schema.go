@@ -4,7 +4,7 @@ package store
 const ApplicationID = 0x63787031
 
 // SchemaVersion is the PRAGMA user_version this code writes and understands.
-const SchemaVersion = 11
+const SchemaVersion = 13
 
 // migrations[i] upgrades user_version i to i+1. Each step runs in one
 // transaction together with the user_version bump. There is no pointer file.
@@ -62,6 +62,11 @@ var migrations = [][]string{
  thread_id TEXT NOT NULL, cwd TEXT NOT NULL, turn_id INTEGER NOT NULL, native_turn TEXT NOT NULL,
  pending INTEGER NOT NULL CHECK(pending IN (0,1))
  )`, `CREATE INDEX goal_controls_pending ON goal_controls(conv_id) WHERE pending=1`},
+	{`CREATE INDEX outbox_token ON outbox(conv_id,attempt_token,seq) WHERE attempt_token IS NOT NULL`},
+	// Extend the existing scheduling index instead of maintaining another B-tree.
+	// Counts can read state from the index without fetching large outbox bodies.
+	{`DROP INDEX outbox_pending`,
+		`CREATE INDEX outbox_pending ON outbox(conv_id,seq,state) WHERE state IN ('queued','sending','unknown')`},
 }
 
 // schemaV1 is the complete initial schema (STORE-DESIGN.md §3). No triggers

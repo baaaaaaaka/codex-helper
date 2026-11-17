@@ -3,6 +3,7 @@ package codexhistory
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -25,9 +26,14 @@ type messageProjector func(Message) (Message, bool)
 
 var sessionPreviewTailInitialBytes int64 = 256 * 1024
 
+var sessionMessagesWindowReadHook func(offset, size int64)
+
 const fallbackMessageDedupWindow = 100 * time.Millisecond
 
 type messageSeenState struct {
+	bytes              int64
+	delta              *sessionPreviewSeenDelta
+	parent             *messageSeenState
 	sourceKeys         map[string]bool
 	fallbackTimes      map[string]time.Time
 	fallbackSourceKind map[string]string
@@ -141,54 +147,36 @@ func readRecentSessionMessages(filePath string, maxMessages int, project message
 }
 
 func readSessionMessagesWindow(filePath string, offset int64, size int64, maxMessages int, project messageProjector, seenStates ...*messageSeenState) ([]Message, error) {
-	if size <= 0 {
-		return nil, nil
-	}
 	f, err := os.Open(filePath)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
+	return readSessionMessagesWindowFrom(f, offset, size, maxMessages, project, seenStates...)
+}
 
-	lineAligned := offset == 0
-	if offset > 0 {
-		var prev [1]byte
-		if n, err := f.ReadAt(prev[:], offset-1); err == nil && n == 1 && prev[0] == '\n' {
-			lineAligned = true
-		}
+func readSessionMessagesWindowFrom(f *os.File, offset, size int64, maxMessages int, project messageProjector, seenStates ...*messageSeenState) ([]Message, error) {
+	if size <= 0 {
+		return nil, nil
 	}
-
-	buf := make([]byte, size)
-	n, err := f.ReadAt(buf, offset)
-	if err != nil && err != io.EOF {
-		return nil, err
-	}
-	buf = buf[:n]
-	if !lineAligned {
-		newline := bytes.IndexByte(buf, '\n')
-		if newline < 0 {
-			return nil, nil
-		}
-		buf = buf[newline+1:]
-	}
-
 	var ring []Message
 	seen := newMessageSeenState()
 	if len(seenStates) > 0 && seenStates[0] != nil {
 		seen = seenStates[0]
 	}
-	for len(buf) > 0 {
-		line := buf
-		if idx := bytes.IndexByte(buf, '\n'); idx >= 0 {
-			line = buf[:idx]
-			buf = buf[idx+1:]
-		} else {
-			buf = nil
+	err := visitSessionMessagesWindowFrom(f, offset, size, project, func(msg Message) {
+		if markMessageSeen(msg, seen, project != nil) {
+			appendMessage(&ring, msg, maxMessages)
 		}
-		line = bytes.TrimSpace(line)
-		if len(line) == 0 {
-			continue
-		}
+	})
+	return ring, err
+}
+
+func visitSessionMessagesWindowFrom(f *os.File, offset, size int64, project messageProjector, visit func(Message)) error {
+	if sessionMessagesWindowReadHook != nil {
+		sessionMessagesWindowReadHook(offset, size)
+	}
+	return readJSONLWindow(context.Background(), f, offset, size, func(line []byte) error {
 		for _, msg := range parseLineMessages(line) {
 			if project != nil {
 				var keep bool
@@ -197,13 +185,10 @@ func readSessionMessagesWindow(filePath string, offset int64, size int64, maxMes
 					continue
 				}
 			}
-			if !markMessageSeen(msg, seen, project != nil) {
-				continue
-			}
-			appendMessage(&ring, msg, maxMessages)
+			visit(msg)
 		}
-	}
-	return ring, nil
+		return nil
+	})
 }
 
 func markMessageSeen(msg Message, seen *messageSeenState, dedupeUserMirrors bool) bool {
@@ -211,10 +196,14 @@ func markMessageSeen(msg Message, seen *messageSeenState, dedupeUserMirrors bool
 		return true
 	}
 	if key := sourceMessageDedupKey(msg.sourceID); key != "" {
-		if seen.sourceKeys[key] {
+		if seen.hasSource(key) {
 			return false
 		}
 		seen.sourceKeys[key] = true
+		seen.bytes += int64(len(key) + 64)
+		if seen.delta != nil {
+			seen.delta.sourceKeys = append(seen.delta.sourceKeys, key)
+		}
 	}
 	// Codex can persist one logical message as both event_msg and response_item
 	// records with different (or missing) source IDs. Preview projection opts user
@@ -225,14 +214,35 @@ func markMessageSeen(msg Message, seen *messageSeenState, dedupeUserMirrors bool
 		return true
 	}
 	sourceKind := messageSourceKind(msg.sourceID)
-	if previous, ok := seen.fallbackTimes[key]; ok &&
+	if previous, kind, ok := seen.fallback(key); ok &&
 		withinMessageDedupWindow(previous, msg.Timestamp) &&
-		fallbackSourcesCanMirror(seen.fallbackSourceKind[key], sourceKind) {
+		fallbackSourcesCanMirror(kind, sourceKind) {
 		return false
+	}
+	if _, ok := seen.fallbackTimes[key]; !ok {
+		seen.bytes += int64(len(key) + len(sourceKind) + 128)
+	} else {
+		seen.bytes += int64(len(sourceKind) - len(seen.fallbackSourceKind[key]))
 	}
 	seen.fallbackTimes[key] = msg.Timestamp
 	seen.fallbackSourceKind[key] = sourceKind
+	if seen.delta != nil {
+		seen.delta.fallback = append(seen.delta.fallback, persistentSessionPreviewFallbackMessage{Key: key, Timestamp: msg.Timestamp, SourceKind: sourceKind})
+	}
 	return true
+}
+
+func (s *messageSeenState) hasSource(key string) bool {
+	return s.sourceKeys[key] || (s.parent != nil && s.parent.hasSource(key))
+}
+func (s *messageSeenState) fallback(key string) (time.Time, string, bool) {
+	if v, ok := s.fallbackTimes[key]; ok {
+		return v, s.fallbackSourceKind[key], true
+	}
+	if s.parent != nil {
+		return s.parent.fallback(key)
+	}
+	return time.Time{}, "", false
 }
 
 func messageSourceKind(sourceID string) string {

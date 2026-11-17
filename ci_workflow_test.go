@@ -15,6 +15,16 @@ func readWorkflow(t *testing.T, name string) string {
 	return string(data)
 }
 
+func TestReleaseHotpathRegressionSelections(t *testing.T) {
+	workflow := readWorkflow(t, "release.yml")
+	requireStepContains(t, workflow,
+		"go test ./internal/responsesadapter -count=1 -run '^TestResponseAccumulation' -v",
+		"go test ./internal/core/store -count=1 -run '^Test(PendingCounts|PendingIndexMigration|TokenIndexConversion)' -v",
+		"go test ./internal/core/engine -count=1 -run '^TestHotResolver' -v",
+		"'^Test(SessionPreview|Preview|CacheV2|SessionMeta|ThreadNameShared|Names|",
+	)
+}
+
 // The pull-request tier (ci.yml) runs the whole unit suite on every OS, the
 // core packages under -race, the whole E2E suite, and the static checks.
 func TestCIWorkflowPullRequestTierRunsEverySuiteWithoutWeakeningRequiredChecks(t *testing.T) {
@@ -85,6 +95,8 @@ func TestCIWorkflowPullRequestTierRunsEverySuiteWithoutWeakeningRequiredChecks(t
 	race := workflowJobBlock(t, workflow, "race-core-exec")
 	requireStepContains(t, race, `group: [migrate, store, engine]`,
 		`bash scripts/ci/race_core_packages.sh "${{ matrix.group }}"`)
+	requireStepContains(t, workflowStepBlock(t, race, "TUI and history cache race checks"),
+		"go test -race -count=1 -timeout=5m ./internal/tui ./internal/codexhistory ./internal/responsesadapter")
 	requireStepContains(t, workflowJobBlock(t, workflow, "race-core"),
 		"needs: [race-core-exec]", `${{ needs.race-core-exec.result }}`)
 
