@@ -24,8 +24,8 @@ cat > "$out" <<'SCRIPT'
 #!/bin/bash
 case "$0" in
   */probe) printf '%s\\n' TestRealCodexNewChatTUI TestRealCodexGatewayRecoveryTUI TestRealCodexAAASharedTUI ;;
-  */agent) echo TestRealCodexSharedTUIThreadBinding ;;
-  */client) printf '%s\\n' TestRealCodexSharedModelSwitch TestRealCodexSharedSwitchInputBoundary ;;
+  */agent) printf '%s\\n' TestRealCodexSharedTUIThreadBinding TestRealCodexGoalDisabledStop TestRealCodexGoalReadDoesNotLoadExecution ;;
+  */client) printf '%s\\n' TestRealCodexSharedModelSwitch TestRealCodexSharedSwitchInputBoundary TestRealCodexGoalReadWithoutResume ;;
 esac
 SCRIPT
 chmod +x "$out"
@@ -36,6 +36,7 @@ chmod +x "$out"
 case "$*" in
  *GatewayRecovery*) printf '%s\\n' "$FAKE_RESULT" ;;
  *'/contracts/client'*) printf '%s\\n' "$FAKE_SWITCH_RESULT" ;;
+ *'/contracts/agent'*) printf '%s\\n' "$FAKE_AGENT_RESULT" ;;
  *) echo PASS ;;
 esac
 ''')
@@ -46,6 +47,8 @@ esac
             env = dict(os.environ, PATH=str(bin_dir) + os.pathsep + os.environ.get("PATH", ""), TMPDIR=tmp)
             passed_ui = "--- PASS: TestRealCodexNewChatTUI (0.1s)\n--- PASS: TestRealCodexGatewayRecoveryTUI (0.1s)\n--- PASS: TestRealCodexAAASharedTUI (0.1s)"
             passed_switch = "--- PASS: TestRealCodexSharedModelSwitch (0.1s)\n--- PASS: TestRealCodexSharedSwitchInputBoundary (0.1s)"
+            passed_switch += "\n--- PASS: TestRealCodexGoalReadWithoutResume (0.1s)"
+            passed_agent = "--- PASS: TestRealCodexGoalDisabledStop (0.1s)\n--- PASS: TestRealCodexGoalReadDoesNotLoadExecution (0.1s)"
             cases = (
                 (passed_ui, passed_switch, True),
                 (passed_ui.replace("--- PASS: TestRealCodexAAASharedTUI", "--- SKIP: TestRealCodexAAASharedTUI"), passed_switch, False),
@@ -60,6 +63,17 @@ esac
             )
             for output, switch_output, expected in cases:
                 result = subprocess.run(["bash", "scripts/ci/run_shared_codex_contracts.sh", str(codex)],
-                                        cwd=ROOT, env=dict(env, FAKE_RESULT=output, FAKE_SWITCH_RESULT=switch_output),
+                                        cwd=ROOT, env=dict(env, FAKE_RESULT=output, FAKE_SWITCH_RESULT=switch_output, FAKE_AGENT_RESULT=passed_agent),
                                         text=True, capture_output=True)
                 self.assertEqual(result.returncode == 0, expected, result.stdout + result.stderr)
+            for missing in ("TestRealCodexGoalDisabledStop", "TestRealCodexGoalReadDoesNotLoadExecution"):
+                result = subprocess.run(["bash", "scripts/ci/run_shared_codex_contracts.sh", str(codex)],
+                                        cwd=ROOT, env=dict(env, FAKE_RESULT=passed_ui, FAKE_SWITCH_RESULT=passed_switch,
+                                                           FAKE_AGENT_RESULT=passed_agent.replace("--- PASS: " + missing, "--- SKIP: " + missing)),
+                                        text=True, capture_output=True)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+            result = subprocess.run(["bash", "scripts/ci/run_shared_codex_contracts.sh", str(codex)],
+                                    cwd=ROOT, env=dict(env, FAKE_RESULT=passed_ui, FAKE_AGENT_RESULT=passed_agent,
+                                                       FAKE_SWITCH_RESULT=passed_switch.replace("--- PASS: TestRealCodexGoalReadWithoutResume", "--- SKIP: TestRealCodexGoalReadWithoutResume")),
+                                    text=True, capture_output=True)
+            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)

@@ -303,7 +303,7 @@ func TestCITitleProtocolContractSelection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(raw), "-test.run 'TestRealCodex(Shared|NativeQueue|Title)'") {
+	if !strings.Contains(string(raw), "-test.run 'TestRealCodex(Shared|NativeQueue|Title|Goal)'") {
 		t.Fatal("native title contract is not selected by CI")
 	}
 }

@@ -51,6 +51,8 @@ schema 从 10 升到 11，新增 `goal_controls`：每会话只有一行最新�
 - native：冷 observer 的读和 pause 不加载执行；冷 Agent 的查询与停止走真实生产适配器；默认关闭 goals 的普通取消不被锁住；冷连接显式激活已有 active goal 仍加载执行，且不重置 budget。
 - E2E：三个 CI 分片通过真实 source-built CXP、模拟 Teams Graph 与模拟 Codex，核对命令、消息、队列、取消、重启及共享 home 等场景。
 
+提交前 CI 修正：首次 PR CI 揭示仓库的选择器检查与模拟门禁依赖旧选择器；同步更新这两项，并验证任一新增 native goal 契约被 skip 时门禁都会失败。定向 Go 与 Python 测试通过。
+
 CI 可达性：core 测试由 `race-core-exec` 的 `store` 与 `engine` 分组收集；黑盒场景由三个 `e2e` 分片按 package 自动收集。原生 goal 契约加入 `run_shared_codex_contracts.sh` 的选择器，并检查测试名称及实际 PASS，防止跳过或改名后出现假绿。
 
 ## 已知边界
