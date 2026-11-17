@@ -1023,7 +1023,18 @@ func TestTooLargeBacklogSkippedWithOneNotice(t *testing.T) {
 	if len(notes) != 1 {
 		t.Fatalf("%d skip notices, want 1", len(notes))
 	}
-	if txt := notes[0].Text; !(strings.Contains(txt, "at least 10 messages") || strings.Contains(txt, "at least 11 messages")) || !strings.Contains(txt, "UTC") || !strings.Contains(txt, "Scroll up") {
+	// The fake's receive window includes helper messages as well as the burst.
+	// Startup messages can arrive before or during the pause, so its count is
+	// not necessarily exactly 10 or 11.
+	txt := notes[0].Text
+	count := 0
+	countStart := strings.Index(txt, "at least ")
+	countValid := false
+	if countStart >= 0 {
+		n, err := fmt.Sscanf(txt[countStart:], "at least %d messages", &count)
+		countValid = n == 1 && err == nil && count >= 10
+	}
+	if !countValid || !strings.Contains(txt, "UTC") || !strings.Contains(txt, "Scroll up") {
 		t.Errorf("notice does not say what was skipped and how to see it: %q", txt)
 	}
 	if n := r.ag.calls("burst"); n != 0 {

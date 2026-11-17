@@ -12,7 +12,7 @@ CACHE_NAME = "preview.sqlite3"
 PHASES = ("exact-hit", "close", "reopen", "batched-small", "threshold-append")
 MARKER_RE = re.compile(r"CXP_PREVIEW_IO_PHASE ([a-z-]+)")
 CALL_RE = re.compile(
-    r"\b(pwrite64|write|writev|fdatasync|fsync|ftruncate|unlink|unlinkat|"
+    r"\b(read|pread64|pwrite64|write|writev|fdatasync|fsync|ftruncate|unlink|unlinkat|"
     r"rename|renameat|chmod|fchmodat|msync)\("
 )
 RESULT_RE = re.compile(r"= (\d+)$")
@@ -32,6 +32,8 @@ def main() -> None:
     observed: set[str] = set()
     writes: dict[str, list[tuple[str, str]]] = {phase: [] for phase in PHASES}
     current: str | None = None
+    source_reads = {phase: 0 for phase in PHASES}
+    database_reads = {phase: 0 for phase in PHASES}
 
     for line in trace:
         marker = MARKER_RE.search(line)
@@ -48,10 +50,18 @@ def main() -> None:
                     fail(f"unbalanced end marker {name!r}; active phase is {current!r}")
                 current = None
             continue
-        if current is None or CACHE_NAME not in line:
+        if current is None:
             continue
         call = CALL_RE.search(line)
-        if call:
+        if call and call.group(1) in {"read", "pread64"}:
+            result = RESULT_RE.search(line)
+            if result:
+                if "session.jsonl>" in line:
+                    source_reads[current] += int(result.group(1))
+                if CACHE_NAME in line:
+                    database_reads[current] += int(result.group(1))
+            continue
+        if call and CACHE_NAME in line:
             writes[current].append((call.group(1), line))
 
     missing = set(PHASES) - observed
@@ -90,6 +100,20 @@ def main() -> None:
     if not 64 * 1024 <= written_bytes <= 512 * 1024:
         fail(f"64 KiB append wrote an unexpected {written_bytes} cache bytes", [line for _, line in threshold])
 
+    # The large fixture has 60,000 visible messages. Warm appends must not
+    # restore every seen key, and exact hits must not reload the full payload.
+    for phase, budget in {"exact-hit": 4096, "close": 0, "reopen": 65536,
+                          "batched-small": 512 * 1024, "threshold-append": 1024 * 1024}.items():
+        if source_reads[phase] > budget:
+            fail(f"{phase} reread {source_reads[phase]} source bytes; budget={budget}")
+    for phase, budget in {"exact-hit": 65536, "batched-small": 1024 * 1024,
+                          "threshold-append": 1024 * 1024}.items():
+        if database_reads[phase] > budget:
+            fail(f"{phase} read {database_reads[phase]} SQLite bytes; budget={budget}")
+    if source_reads["exact-hit"] == 0 or database_reads["reopen"] == 0:
+        fail("trace did not capture source and SQLite reads")
+
+    print(f"preview-cache reads: source={source_reads}; SQLite={database_reads}")
     print(
         "preview-cache I/O validation passed: "
         f"zero cache writes for exact-hit/close/reopen/batched-small; "

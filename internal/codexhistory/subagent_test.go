@@ -646,6 +646,7 @@ func writeSessionFile(t *testing.T, sessionsDir, sessionID, ts, projDir, sourceJ
 
 func setupCodexDir(t *testing.T) (tmpDir, sessionsDir, projDir string) {
 	t.Helper()
+	setTestUserCacheDir(t)
 	ResetCache()
 	tmpDir = t.TempDir()
 	sessionsDir = filepath.Join(tmpDir, "sessions")

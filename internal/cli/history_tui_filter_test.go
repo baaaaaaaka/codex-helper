@@ -138,7 +138,7 @@ func TestLoadHistoryTuiProjectsUsesBoundedMetadataColdCache(t *testing.T) {
 	if projects[0].Sessions[0].MessageCount != -1 {
 		t.Fatal("TUI required a full transcript count")
 	}
-	if _, err = os.Stat(filepath.Join(root, ".codex-proxy")); !os.IsNotExist(err) {
-		t.Fatalf("TUI built a full transcript catalog: %v", err)
+	if _, err = os.Stat(filepath.Join(root, ".codex-proxy")); err != nil {
+		t.Fatalf("TUI did not persist its bounded summary: %v", err)
 	}
 }

@@ -1,0 +1,190 @@
+历史阶段记录：本文反映当时的基线、实现与测试结果，不代表当前版本的状态。
+
+CXP SQLite 与 JSONL 缓存改造：第一轮实施与验证记录（历史记录）
+日期：2026-11-17
+
+本文件记录第一轮交付，不代表最终实现。之后发现的五项缺口及补齐结果见
+SQLITE_JSONL_REMAINING.txt；其中共享 history map、模式切换、统一窗口读取、
+全局元数据缓存及 summary 覆盖范围的最终说明，以后者为准。
+
+交付状态
+
+已在独立工作区实施批准方案的三批代码改动，并通过下述本地检查。
+需要 Docker 的进程级/E2E 验证仍受环境阻塞，不能将本次结果称为完整发布验收。
+没有提交、推送、发布、安装，也没有启动、重启或替换正在运行的 Teams helper。
+
+基线：origin/main ecd719f9e839e1f86e07ba6f704545959179044c（开始实施时 fetch 已核对）。
+分支：audit/sqlite-jsonl-20261117
+工作区：/home/baka/project/codex-helper/.worktrees/audit-sqlite-jsonl-20261117
+测试日志：/home/baka/.local/state/codex-helper/source-validation/sqlite-jsonl-20261117
+原检查记录 SQLITE_JSONL_AUDIT.md 描述的是实施前状态。
+
+实际改动
+
+1. Teams 业务库
+   schema 10 -> 11，通过现有事务 migration 增加部分索引：
+   CREATE INDEX outbox_token ON outbox(conv_id,attempt_token,seq)
+   WHERE attempt_token IS NOT NULL;
+   查询、排序及发送状态语义保持原样。没有引入内存索引或另一套迁移框架。
+   旧 JSON/blob 业务格式沿用已有 conversion 模块；本次未另写平行转换器。
+   core/migrate 整包测试覆盖现有旧数据转换、所有权丢失、发布失败及重试。
+
+2. history
+   先读取来源 header，再复用不可变索引；完全未变时不再重载 history_session 全表。
+   本进程成功写入后发布当前索引；发现其他连接改变 generation/offset 时重新加载。
+   追加解析只读新增窗口；截断或替换重建。无有效新记录的半条尾行不复制完整 map。
+   有效但无换行的尾记录临时展示，持久游标保留在尾记录起点。
+   写入前检查哈希读取成功及来源身份没有变化，不发布无法确认的进度。
+
+3. preview
+   每个活动文件只有一份解析状态，保存解析位置、已提交位置、唯一去重状态和待提交增量。
+   删除运行代码中的完整 seen 集合克隆/遍历差量，以及独立 dirty-path 注册表。
+   旧克隆/比较实现只保留在测试中，供独立两连接测试作为参考。
+   同一文件读取串行；固定 64 个锁，避免另造无限增长的锁表。
+   全局内存条目锁不包含文件读取、数据库打开或关闭。
+   保留 64 KiB/30 秒批量提交条件；没有新增后台 worker，也不是定时刷盘承诺。
+   header 有效后才读取消息；文本读取不加载 seen，首次追加时才加载。
+   解析、行边界检查及哈希尽量复用一个已打开的源文件描述符。
+   解析/提交失败丢弃内存所有权，下一次从已提交位置恢复；不做逐项回滚。
+   通过 generation/offset/ordinal CAS 防止两个连接重复追加；payload 读取后复核 header，
+   避免另一连接淘汰或重建数据时发布混合快照。
+   半条尾行使用临时去重 overlay，不污染完整前缀状态。保留末条完整 JSON 无换行的展示。
+   预览窗口改为流式逐行读取；不再为整个窗口分配大 buffer。
+
+4. catalog、名称与目录摘要
+   缓存版本 3 -> 4，派生缓存按现有机制失效重建，运行路径只访问当前格式。
+   index_source 复用来源进度语义，增加 thread_name 字段表，名称追加只解析新窗口。
+   保留“最后一条有效非空名称生效”。名称尾记录无换行时也不会在重开后重复写库。
+   summary 复用 session_meta 表，以负游标表示不可用于完整解析续读的摘要。
+   消息数未知仍为 -1；摘要不能降级同一来源的完整元数据。
+   每次发现过程按 256 个文件一批读取当前所需元数据；不加载已删除文件的旧缓存行。
+   此批量快照随 loader context 释放；原有进程内元数据加速表限制为 4096 项。
+   CloseCaches 同时释放数据库和进程内名称/元数据缓存。
+
+5. 容量
+   预览内存保留 64 项/估算 16 MiB，计入消息、seen 和未提交增量的主要容器开销。
+   名称内存限制为 16 个来源 root；history 保留当前 store 所属的一份快照。
+   preview SQLite 增加估算 128 MiB 的逻辑预算，仍保留 1024 个 session 上限。
+   清理发生在写事务中；未变读取不触发清理或写入。超大项先淘汰，避免挤走全部小项。
+   超大预览不额外保留内存副本；数据库文本按行读取，完整字符串仍需分配。
+   预算是估算值，不是 Go 进程堆、SQLite 文件、WAL/journal 或整个 catalog 的硬上限。
+
+刻意保留的边界
+
+outbox.body 的网络 JSON、低频子集合事务重写、快照发布与 rename、正常 SQLite 页和索引写入、
+Teams 历史保留策略、目录 WalkDir、完整文本接口均未重写。
+没有新增 watcher、变更日志、分页协议、后台索引服务或通用缓存框架。
+完整文本追加仍复制旧文本；流式 JSONL 的临时内存受最大单条记录影响，不是固定 64 KiB。
+其他进程改变缓存后允许重载完整索引；正常追加仍有有界前缀校验读取。
+业务升级没有反向 conversion；旧备份不能作为接收新消息后的无损降级方式。
+
+本机性能对照
+
+Linux amd64，AMD Ryzen 9 7950X。history/preview：同机基线源码归档与修改后各 10 次定长迭代；
+token：同一新代码测试夹具中移除/创建索引，各 100 次。计时不是 CI 硬阈值或生产 SLO。
+MB 使用十进制；MiB 只用于缓存预算。
+
+工作负载                                  基线                 修改后
+100,000 history 完全未变，每次耗时          64.809 ms             0.0637 ms
+同上，每次分配                             19,800,620 B          6,560 B
+同上，分配次数                             800,636               94
+1,000 history 完全未变，每次耗时            0.686 ms              0.0582 ms
+8,800 可见消息预览，内存命中                0.0268 ms             0.0253 ms
+预览数据库重开，每次耗时                    23.875 ms             12.682 ms
+同上，每次分配                             22,751,417 B          16,608,187 B
+大预览小追加，每次耗时                      9.164 ms              3.513 ms
+同上，每次分配                             6,406,839 B           2,655,426 B
+100,000 outbox token 未命中                  14.160 ms             0.0243 ms
+带 token 单条插入事务                       143.214 us            153.347 us
+
+token 查询样本约快 584 倍；该插入样本耗时约增加 7.1%。
+约 10 万条历史的建索引耗时 70.095 ms，已用 SQLite 页增加 2,453,504 B，约 2.45 MB。
+这是已用页计量；不等同于主文件即时增长或物理块写入。
+大预览小追加分配下降约 58.6%，剩余成本主要包含完整文本接口的复制。
+summary 原有受限解析基准没有改变算法，不把微秒级波动计为本次收益。
+
+I/O 验证
+
+通过 strace -f -s 256 -yy 跟踪隔离测试二进制，按测试 phase 标记统计。
+统计为进程系统调用请求/返回字节，不是物理存储设备流量。
+
+阶段                                    源 JSONL 读取     SQLite+日志写入
+100 次预览内存 exact hit                 100 B             0 B
+预览缓存重开                            1 B               0 B
+小追加尚未达到提交条件                  700 B             0 B
+达到阈值的约 64 KiB 追加                 131,592 B         98,860 B
+catalog 元数据 exact hit                 0 B               0 B
+catalog 稳态查询                         1 B               0 B
+8 MiB transcript 追加约 4 KiB            135,340 B         16,924 B
+history 新增一条                         207 B             25,124 B
+
+最后两项包含有界校验及正常 SQLite 事务开销；不是旧历史全量读取或整库重写。
+预览热命中每次仍读 1 B 检查尾换行，没有声称完全零源文件 I/O。
+原有页写预算和零写入测试继续执行，未放宽阈值。
+
+安全与兼容性回归
+
+新增 17 项 history/preview/catalog 回归，另有索引查询计划和业务库转换回归：
+- 连续 20 次小追加分别从已解析位置续读，达到条件后只提交完整待写批次。
+- 不完整尾行、完整但无换行尾记录及后续补换行，不重读旧前缀、不重复消息。
+- 16 个并发读取者在同一路径上得到一致结果。
+- 内存条目超预算淘汰后不遗留已修改的去重集合。
+- SQLite 触发器注入提交失败：源文件回退、后续恢复及重开均保持消息完整。
+- 解析期间替换源文件，不推进错误 checkpoint。
+- 消息列表追加后再读文本，旧文本不丢失；调用者修改返回切片不污染缓存。
+- header 读取后另一连接删除 session，不把空消息或空 seen 当有效缓存。
+- quota 淘汰级联删除派生消息，源文件保持可恢复；临时尾记录继续展示。
+- summary、名称在 CloseCaches 后复用持久缓存，名称追加保留最新有效非空值。
+- 未变化但带半条尾记录的名称/history 重开不写库。
+- summary 不覆盖同一来源的完整元数据；history 检出另一连接重建 generation。
+- 600 文件的元数据跨批次读取完整，排除不在本次目录中的旧记录。
+- schema 10 转换注入索引名称冲突：失败后版本仍为 10，原始载荷/token 和五种发送状态保留；
+  排除冲突后重试至 11；未来 schema 明确拒绝。
+- EXPLAIN QUERY PLAN 确认 token 查询使用 outbox_token。
+
+已执行检查（共同设置独立 TMPDIR/GOCACHE，日志在上述目录）
+
+PASS  go test ./internal/core/store ./internal/core/migrate ./internal/core/engine ./internal/channel/teams ./internal/tui -count=1 -timeout=10m
+      store 54.346s；migrate 36.753s；engine 136.881s；teams 4.321s；tui 0.226s。
+PASS  go test ./internal/codexhistory . -count=1 -timeout=5m
+      最终版本：history 5.686s；根目录静态/CI 合约测试 5.051s。
+PASS  go test -race ./internal/codexhistory ./internal/core/store ./internal/tui -count=1 -timeout=10m
+      store 199.802s；tui 1.998s；该次 history 7.952s。
+PASS  go test -race ./internal/codexhistory -count=1 -timeout=5m
+      最后一次 metadata 批量读取修改后再次运行：12.403s。
+PASS  go test ./internal/cli -run '^(Test(ServiceSQLite|SupervisorSQLite|AuthSQLite|LoadHistoryTuiProjects|TeamsStatusPublisher|TeamsCoreStore|FirstStart))' -count=1 -timeout=5m
+      最后一次运行 4.324s。均为隔离状态单元测试；未在宿主机启动 source-built helper。
+PASS  go vet ./internal/codexhistory ./internal/core/store ./internal/core/migrate ./internal/core/engine ./internal/channel/teams ./internal/tui
+PASS  CGO_ENABLED=0 Linux CLI build；Windows history/store 测试交叉编译。只编译，不执行 Windows 测试。
+PASS  CXP_SQLITE_PERF_PROBE=1 CXP_SQLITE_PERF_ROWS=10000 go test ./internal/core/store -run '^TestEngineSQLite(LargeMigration|SendChain)Probe$' -count=1 -timeout=5m -v
+      10,000 行旧 blob 转换约 208.6 ms；保留历史的 100 个完整发送存储链约 196.3 ms。
+      这是数据库事务链，不是 Graph/Codex 真实网络 E2E。
+PASS  两项 syscall probe 在 strace 下执行；原始 trace 和汇总随验证日志交付。
+PASS  上述 benchmark、gofmt 与 git diff --check。
+
+测试期望调整
+
+旧测试要求 summary 绝不创建目录缓存；批准方案现在要求持久化 summary，因此改为断言首次提交、
+重开复用、未知消息数保留及不污染完整元数据。没有删除受限读取或消息可见性断言。
+测试公共夹具统一隔离 user cache，避免新持久化行为访问真实用户缓存。
+初次根目录 gofmt 检查读到了仓库内测试 scratch 的 Go 自动生成文件，导致格式检查失败；
+已将整个 scratch 移至独立 state 目录，最终根目录测试通过。此为测试环境污染，不是格式放宽。
+
+CI 可达性
+
+现有 Linux/Windows/macOS 完整单元测试入口会自然选中新增包内测试。
+ci.yml 的 TUI race 步骤加入 ./internal/codexhistory；根目录 CI 合约测试明确检查此命令。
+没有跳过已有测试或降低覆盖率、页写预算及并发检查要求。
+没有提交到 GitHub，因此没有本轮远端 CI run；这里只报告本地已执行结果。
+
+未验证与环境阻塞
+
+BLOCKED  标准 Docker harness smoke：cxp Docker test failed: Docker daemon is unavailable。
+         /var/run/docker.sock 和 /run/docker.sock 不存在；不是 sandbox 拒绝，也没有尝试启动 daemon。
+         因此完整 Linux collector、E2E shards 0/1/2 和真实进程生命周期未执行。
+SKIPPED  真实 NFS/多主机：没有提供 CXP_CACHE_NFS_ROOT 或 STORE_MULTIHOST_DIR。
+UNRUN    Windows/macOS 原生执行；Windows 仅交叉编译通过。
+         默认需要显式环境开关的 nightly 性能/NFS/真实数据用例，不能算作普通包测试中已执行。
+
+本次没有依赖下载或 GPU/CUDA 测试，也没有通过扩大权限绕过环境问题。
+在 Docker E2E、真实 NFS 和原生平台门禁完成前，不应把本补丁视为可直接发布的版本。

@@ -105,10 +105,28 @@ func (s *Store) CodexTurnIDs() ([]string, error) {
 	return out, rows.Err()
 }
 
-// OutboxCounts returns the number of outbox rows per state that are not
-// sent yet (queued, sending, unknown; `teams service status`).
+// Conditional counts avoid a temporary GROUP BY tree when scanning the
+// scheduling index. Keep one covering index for both scheduling and stats.
+const pendingOutboxCountsSQL = `SELECT COUNT(*) FILTER(WHERE state='queued'), COUNT(*) FILTER(WHERE state='sending'), COUNT(*) FILTER(WHERE state='unknown') FROM outbox WHERE state IN ('queued','sending','unknown')`
+
+// OutboxCounts returns the number of pending outbox rows per state
+// (queued, sending, unknown; `teams service status`).
 func (s *Store) OutboxCounts() (map[string]int, error) {
-	return s.countByState(`SELECT state, COUNT(*) FROM outbox WHERE state IN ('queued','sending','unknown') GROUP BY state`)
+	var queued, sending, unknown int
+	if err := s.r.QueryRowContext(context.Background(), pendingOutboxCountsSQL).Scan(&queued, &sending, &unknown); err != nil {
+		return nil, err
+	}
+	out := map[string]int{}
+	if queued > 0 {
+		out[OutQueued] = queued
+	}
+	if sending > 0 {
+		out[OutSending] = sending
+	}
+	if unknown > 0 {
+		out[OutUnknown] = unknown
+	}
+	return out, nil
 }
 
 // DeliveryCounts reports active and unconfirmed output without loading bodies.

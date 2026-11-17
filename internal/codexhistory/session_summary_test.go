@@ -38,7 +38,7 @@ func TestSessionSummaryReadBudget(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			source := &summaryCountingReader{Reader: strings.NewReader(tt.body)}
-			meta, err := readSessionSummary(context.Background(), source, int64(len(tt.body)))
+			meta, _, err := readSessionSummary(context.Background(), source, int64(len(tt.body)))
 			if err != nil || meta.FirstPrompt != tt.title || meta.MessageCount != tt.count {
 				t.Fatalf("meta=%+v err=%v", meta, err)
 			}
@@ -53,7 +53,7 @@ func TestSessionSummaryReadBudget(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	reader := &summaryCountingReader{Reader: strings.NewReader(header)}
-	if _, err := readSessionSummary(ctx, reader, int64(len(header))); !errors.Is(err, context.Canceled) || reader.bytes != 0 {
+	if _, _, err := readSessionSummary(ctx, reader, int64(len(header))); !errors.Is(err, context.Canceled) || reader.bytes != 0 {
 		t.Fatalf("cancellation: %v bytes=%d", err, reader.bytes)
 	}
 }
@@ -143,7 +143,7 @@ func BenchmarkSessionSummaryLargeTranscript(b *testing.B) {
 	b.SetBytes(int64(len(header + prompt)))
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := readSessionSummary(context.Background(), strings.NewReader(body), int64(len(body))); err != nil {
+		if _, _, err := readSessionSummary(context.Background(), strings.NewReader(body), int64(len(body))); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -189,7 +189,7 @@ func TestSessionSummaryKeepsPromptAndVisibilityRules(t *testing.T) {
 	}
 }
 
-func TestSessionSummaryNeverWritesPartialCatalog(t *testing.T) {
+func TestSessionSummaryPersistsOnceAndReusesCatalog(t *testing.T) {
 	root, dir, project := setupCodexDir(t)
 	id := "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 	writeSessionFile(t, dir, id, "2026-01-01T00:00:00Z", project, `"cli"`, "task")
@@ -201,13 +201,13 @@ func TestSessionSummaryNeverWritesPartialCatalog(t *testing.T) {
 		if _, err := DiscoverProjectSummariesContext(context.Background(), root); err != nil {
 			t.Fatal(err)
 		}
-		resetSessionFileCache() // Include a process-memory-cold pass.
+		// Each pass reloads metadata from the catalog.
 	}
-	if commits != 0 {
-		t.Fatalf("directory reads wrote a catalog %d times", commits)
+	if commits != 1 {
+		t.Fatalf("summary commits=%d, want one batched publication", commits)
 	}
-	if _, err := os.Stat(filepath.Join(root, ".codex-proxy")); !os.IsNotExist(err) {
-		t.Fatalf("directory read created a cache: %v", err)
+	if _, err := os.Stat(filepath.Join(root, ".codex-proxy")); err != nil {
+		t.Fatalf("summary cache missing: %v", err)
 	}
 }
 

@@ -18,9 +18,10 @@ import (
 // It is not the cxp release version: bumping it means every cache database is
 // rebuilt in a new directory, while ordinary application upgrades reuse the
 // current cache unchanged.
-// Version 3 reparses session metadata because a fork source no longer implies
-// that the session is a subagent.
-const cacheVersion = 3
+// Version 5 indexes preview source IDs for candidate-key deduplication and
+// prevents evicted preview IDs from being reused by a later revision.
+// Source JSONL is unchanged; older derived caches are rebuilt.
+const cacheVersion = 5
 
 const (
 	cacheV2CatalogFile      = "catalog.sqlite3"
@@ -53,27 +54,26 @@ func CloseCaches() error {
 	if err := closeCatalogSQLiteCaches(); err != nil {
 		closeErrors = append(closeErrors, err)
 	}
-	resetSessionFileCache()
+	resetThreadNameIndexCache()
 	return errors.Join(closeErrors...)
 }
 
 func closeSessionPreviewSQLiteCache() error {
+	sessionPreviewSQLiteState.openMu.Lock()
+	defer sessionPreviewSQLiteState.openMu.Unlock()
 	sessionPreviewSQLiteState.mu.Lock()
-	var closeErr error
-	if sessionPreviewSQLiteState.db != nil {
-		closeErr = sessionPreviewSQLiteState.db.Close()
-	}
+	db := sessionPreviewSQLiteState.db
 	sessionPreviewSQLiteState.path = ""
 	sessionPreviewSQLiteState.db = nil
+	sessionPreviewSQLiteState.dbInfo = nil
 	sessionPreviewSQLiteState.memory = nil
 	sessionPreviewSQLiteState.memoryBytes = 0
 	sessionPreviewSQLiteState.memoryTick = 0
 	sessionPreviewSQLiteState.mu.Unlock()
-
-	sessionPreviewAppendState.mu.Lock()
-	sessionPreviewAppendState.dirtySince = nil
-	sessionPreviewAppendState.mu.Unlock()
-	return closeErr
+	if db != nil {
+		return db.Close()
+	}
+	return nil
 }
 
 func closeCatalogSQLiteCaches() error {

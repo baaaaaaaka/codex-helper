@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,11 +28,15 @@ var (
 )
 
 type catalogSQLiteStore struct {
-	path string
-	db   *sql.DB
+	path            string
+	db              *sql.DB
+	historyMu       sync.Mutex
+	historyUpdateMu sync.Mutex
+	history         catalogHistorySourceEntry
 }
 
 type catalogSessionMetaEntry struct {
+	isSummary      bool
 	path           string
 	fileKey        fileCacheKey
 	parsedOffset   int64
@@ -47,7 +52,7 @@ type catalogHistorySourceEntry struct {
 	parsedOffset   int64
 	prefixTailHash string
 	prefixTailSize int64
-	sessions       map[string]*historySessionInfo
+	index          *historyIndexData
 }
 
 type catalogSessionMetaBatch struct {
@@ -187,9 +192,10 @@ func initializeCatalogSQLiteSchema(db *sql.DB) error {
 			modified_at_ns INTEGER NOT NULL,
 			is_subagent INTEGER NOT NULL,
 			subagent_type TEXT NOT NULL,
-			parent_thread_id TEXT NOT NULL
+			parent_thread_id TEXT NOT NULL,
+			is_summary INTEGER NOT NULL DEFAULT 0
 		) STRICT`,
-		`CREATE TABLE history_source (
+		`CREATE TABLE index_source (
 			path TEXT PRIMARY KEY,
 			generation INTEGER NOT NULL,
 			parsed_offset INTEGER NOT NULL,
@@ -205,12 +211,18 @@ func initializeCatalogSQLiteSchema(db *sql.DB) error {
 			source_ctime_ns INTEGER NOT NULL
 		) STRICT`,
 		`CREATE TABLE history_session (
-			source_path TEXT NOT NULL REFERENCES history_source(path) ON DELETE CASCADE,
+			source_path TEXT NOT NULL REFERENCES index_source(path) ON DELETE CASCADE,
 			session_id TEXT NOT NULL,
 			first_prompt TEXT NOT NULL,
 			first_prompt_time_ns INTEGER NOT NULL,
 			PRIMARY KEY (source_path, session_id)
 		) STRICT, WITHOUT ROWID`,
+		`CREATE TABLE thread_name (
+            source_path TEXT NOT NULL REFERENCES index_source(path) ON DELETE CASCADE,
+            session_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            PRIMARY KEY(source_path,session_id)
+        ) STRICT, WITHOUT ROWID`,
 		fmt.Sprintf(`PRAGMA application_id = %d`, catalogSQLiteApplicationID),
 		fmt.Sprintf(`PRAGMA user_version = %d`, cacheVersion),
 	} {
@@ -226,14 +238,15 @@ func initializeCatalogSQLiteSchema(db *sql.DB) error {
 
 func validateCatalogSQLiteSchema(db *sql.DB) error {
 	queries := []string{
+		`SELECT source_path,session_id,name FROM thread_name LIMIT 0`,
 		`SELECT path, parsed_offset, prefix_tail_hash, prefix_tail_size,
 			source_size, source_mtime_ns, source_mode, has_file_id, source_dev,
 			source_ino, has_ctime, source_ctime_ns, session_id, project_path,
 			first_prompt, message_count, created_at_ns, modified_at_ns,
-			is_subagent, subagent_type, parent_thread_id FROM session_meta LIMIT 0`,
+			is_subagent, subagent_type, parent_thread_id, is_summary FROM session_meta LIMIT 0`,
 		`SELECT path, generation, parsed_offset, prefix_tail_hash, prefix_tail_size,
 			source_size, source_mtime_ns, source_mode, has_file_id, source_dev,
-			source_ino, has_ctime, source_ctime_ns FROM history_source LIMIT 0`,
+			source_ino, has_ctime, source_ctime_ns FROM index_source LIMIT 0`,
 		`SELECT source_path, session_id, first_prompt, first_prompt_time_ns
 			FROM history_session LIMIT 0`,
 	}
@@ -287,39 +300,125 @@ func quarantineCatalogSQLite(path string) error {
 	return nil
 }
 
-func (store *catalogSQLiteStore) loadSessionMeta(ctx context.Context, path string) (catalogSessionMetaEntry, bool, error) {
-	var entry catalogSessionMetaEntry
-	entry.path = filepath.Clean(path)
-	var hasFileID, hasCtime, isSubagent int
-	var dev, ino string
-	var createdNS, modifiedNS int64
-	err := store.db.QueryRowContext(ctx, `SELECT parsed_offset, prefix_tail_hash,
+const catalogMetaColumns = `parsed_offset, prefix_tail_hash,
 		prefix_tail_size, source_size, source_mtime_ns, source_mode, has_file_id,
 		source_dev, source_ino, has_ctime, source_ctime_ns, session_id,
 		project_path, first_prompt, message_count, created_at_ns, modified_at_ns,
-		is_subagent, subagent_type, parent_thread_id
-		FROM session_meta WHERE path = ?`, entry.path).Scan(
-		&entry.parsedOffset, &entry.prefixTailHash, &entry.prefixTailSize,
-		&entry.fileKey.Size, &entry.fileKey.MtimeUnixNano, &entry.fileKey.Mode,
-		&hasFileID, &dev, &ino, &hasCtime, &entry.fileKey.CtimeUnixNano,
-		&entry.meta.SessionID, &entry.meta.ProjectPath, &entry.meta.FirstPrompt,
-		&entry.meta.MessageCount, &createdNS, &modifiedNS, &isSubagent,
-		&entry.meta.SubagentType, &entry.meta.ParentThreadID,
-	)
-	if errors.Is(err, sql.ErrNoRows) {
-		return catalogSessionMetaEntry{}, false, nil
+		is_subagent, subagent_type, parent_thread_id, is_summary`
+
+func (store *catalogSQLiteStore) loadSessionMeta(ctx context.Context, path string) (catalogSessionMetaEntry, bool, error) {
+	return scanCatalogMeta(path, store.db.QueryRowContext(ctx, `SELECT `+catalogMetaColumns+` FROM session_meta WHERE path=?`, filepath.Clean(path)))
+}
+
+// Reuse Scan destinations across a directory batch. Individual SQLite values
+// still get decoded, but each row no longer allocates an argument vector and
+// a set of scalar destination objects.
+type catalogMetaScanner struct {
+	entry                 catalogSessionMetaEntry
+	path, dev             string
+	createdNS, modifiedNS int64
+	args                  [22]any
+}
+
+func newCatalogMetaScanner() *catalogMetaScanner {
+	s := new(catalogMetaScanner)
+	e := &s.entry
+	s.args = [22]any{&s.path,
+		&e.parsedOffset, &e.prefixTailHash, &e.prefixTailSize,
+		&e.fileKey.Size, &e.fileKey.MtimeUnixNano, &e.fileKey.Mode,
+		&e.fileKey.HasFileID, &s.dev, &e.fileKey.Ino, &e.fileKey.HasCtime, &e.fileKey.CtimeUnixNano,
+		&e.meta.SessionID, &e.meta.ProjectPath, &e.meta.FirstPrompt,
+		&e.meta.MessageCount, &s.createdNS, &s.modifiedNS, &e.meta.IsSubagent,
+		&e.meta.SubagentType, &e.meta.ParentThreadID, &e.isSummary,
 	}
-	if err != nil {
+	return s
+}
+
+func (s *catalogMetaScanner) scan(row interface{ Scan(...any) error }, withPath bool) (catalogSessionMetaEntry, bool, error) {
+	args := s.args[1:]
+	if withPath {
+		args = s.args[:]
+	}
+	if err := row.Scan(args...); errors.Is(err, sql.ErrNoRows) {
+		return catalogSessionMetaEntry{}, false, nil
+	} else if err != nil {
 		return catalogSessionMetaEntry{}, false, err
 	}
-	entry.fileKey.HasFileID = hasFileID != 0
-	entry.fileKey.HasCtime = hasCtime != 0
-	decodeCacheDeviceID(&entry.fileKey, dev)
-	entry.fileKey.Ino, _ = strconv.ParseUint(ino, 10, 64)
-	entry.meta.CreatedAt = cacheTimeFromUnixNano(createdNS)
-	entry.meta.ModifiedAt = cacheTimeFromUnixNano(modifiedNS)
-	entry.meta.IsSubagent = isSubagent != 0
-	return entry, true, nil
+	decodeCacheDeviceID(&s.entry.fileKey, s.dev)
+	s.entry.meta.CreatedAt = cacheTimeFromUnixNano(s.createdNS)
+	s.entry.meta.ModifiedAt = cacheTimeFromUnixNano(s.modifiedNS)
+	s.entry.path = s.path
+	return s.entry, true, nil
+}
+
+func scanCatalogMeta(path string, row interface{ Scan(...any) error }) (catalogSessionMetaEntry, bool, error) {
+	s := newCatalogMetaScanner()
+	s.path = filepath.Clean(path)
+	return s.scan(row, false)
+}
+
+type catalogMetadataKey struct{}
+
+// Batch only the discovered paths. The snapshot dies with the loader context;
+// removed transcripts must not inflate every subsequent directory load.
+func prefetchCatalogMetadata(ctx context.Context, root string, paths []string) context.Context {
+	store, err := currentCatalogSQLiteStore(filepath.Join(root, "history.jsonl"))
+	if err != nil {
+		return ctx
+	}
+	entries := make(map[string]*catalogSessionMetaEntry, len(paths))
+	values := make([]catalogSessionMetaEntry, len(paths))
+	scanner := newCatalogMetaScanner()
+	used := 0
+	const batchSize = 256
+	for start := 0; start < len(paths); start += batchSize {
+		end := start + batchSize
+		if end > len(paths) {
+			end = len(paths)
+		}
+		args := make([]any, 0, end-start)
+		for _, path := range paths[start:end] {
+			args = append(args, filepath.Clean(path))
+		}
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(args)), ",")
+		rows, err := store.db.QueryContext(ctx, `SELECT path,`+catalogMetaColumns+` FROM session_meta WHERE path IN (`+placeholders+`)`, args...)
+		if err != nil {
+			return ctx
+		}
+		for rows.Next() {
+			entry, _, err := scanner.scan(rows, true)
+			if err != nil {
+				rows.Close()
+				return ctx
+			}
+			// IN has at most len(paths) distinct rows across all batches.
+			// Repeated input paths reuse their slot.
+			if previous := entries[entry.path]; previous != nil {
+				*previous = entry
+			} else {
+				values[used] = entry
+				entries[entry.path] = &values[used]
+				used++
+			}
+		}
+		readErr := rows.Err()
+		closeErr := rows.Close()
+		if readErr != nil || closeErr != nil {
+			return ctx
+		}
+	}
+	return context.WithValue(ctx, catalogMetadataKey{}, entries)
+}
+
+func loadCatalogMetadata(ctx context.Context, store *catalogSQLiteStore, path string) (catalogSessionMetaEntry, bool, error) {
+	if entries, ok := ctx.Value(catalogMetadataKey{}).(map[string]*catalogSessionMetaEntry); ok {
+		e, found := entries[filepath.Clean(path)]
+		if !found {
+			return catalogSessionMetaEntry{}, false, nil
+		}
+		return *e, true, nil
+	}
+	return store.loadSessionMeta(ctx, path)
 }
 
 func (store *catalogSQLiteStore) writeSessionMetaBatch(ctx context.Context, updates map[string]catalogSessionMetaEntry, deletes map[string]struct{}) error {
@@ -382,8 +481,8 @@ func upsertCatalogSessionMeta(ctx context.Context, tx *sql.Tx, entry catalogSess
 		source_mtime_ns, source_mode, has_file_id, source_dev, source_ino,
 		has_ctime, source_ctime_ns, session_id, project_path, first_prompt,
 		message_count, created_at_ns, modified_at_ns, is_subagent, subagent_type,
-		parent_thread_id
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		parent_thread_id, is_summary
+	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	ON CONFLICT(path) DO UPDATE SET
 		parsed_offset = excluded.parsed_offset,
 		prefix_tail_hash = excluded.prefix_tail_hash,
@@ -404,8 +503,12 @@ func upsertCatalogSessionMeta(ctx context.Context, tx *sql.Tx, entry catalogSess
 		modified_at_ns = excluded.modified_at_ns,
 		is_subagent = excluded.is_subagent,
 		subagent_type = excluded.subagent_type,
-		parent_thread_id = excluded.parent_thread_id
-	WHERE parsed_offset <> excluded.parsed_offset
+		parent_thread_id = excluded.parent_thread_id,
+		is_summary = excluded.is_summary
+	WHERE NOT (excluded.is_summary=1 AND is_summary=0
+        AND (source_size,source_mtime_ns,source_mode,source_dev,source_ino,has_ctime,source_ctime_ns)
+        IS (excluded.source_size,excluded.source_mtime_ns,excluded.source_mode,excluded.source_dev,excluded.source_ino,excluded.has_ctime,excluded.source_ctime_ns))
+    AND (parsed_offset <> excluded.parsed_offset
 		OR prefix_tail_hash <> excluded.prefix_tail_hash
 		OR prefix_tail_size <> excluded.prefix_tail_size
 		OR source_size <> excluded.source_size
@@ -424,7 +527,8 @@ func upsertCatalogSessionMeta(ctx context.Context, tx *sql.Tx, entry catalogSess
 		OR modified_at_ns <> excluded.modified_at_ns
 		OR is_subagent <> excluded.is_subagent
 		OR subagent_type <> excluded.subagent_type
-		OR parent_thread_id <> excluded.parent_thread_id`,
+		OR parent_thread_id <> excluded.parent_thread_id
+        OR is_summary <> excluded.is_summary)`,
 		entry.path, entry.parsedOffset, entry.prefixTailHash, entry.prefixTailSize,
 		entry.fileKey.Size, entry.fileKey.MtimeUnixNano, entry.fileKey.Mode,
 		boolInt(entry.fileKey.HasFileID), cacheDeviceID(entry.fileKey),
@@ -432,7 +536,7 @@ func upsertCatalogSessionMeta(ctx context.Context, tx *sql.Tx, entry catalogSess
 		entry.fileKey.CtimeUnixNano, entry.meta.SessionID, entry.meta.ProjectPath,
 		entry.meta.FirstPrompt, entry.meta.MessageCount, cacheTimeUnixNano(entry.meta.CreatedAt),
 		cacheTimeUnixNano(entry.meta.ModifiedAt), boolInt(entry.meta.IsSubagent),
-		entry.meta.SubagentType, entry.meta.ParentThreadID,
+		entry.meta.SubagentType, entry.meta.ParentThreadID, boolInt(entry.isSummary),
 	)
 	if err != nil {
 		return 0, err
@@ -440,21 +544,25 @@ func upsertCatalogSessionMeta(ctx context.Context, tx *sql.Tx, entry catalogSess
 	return result.RowsAffected()
 }
 
-func (store *catalogSQLiteStore) loadHistory(ctx context.Context, path string) (catalogHistorySourceEntry, bool, error) {
-	entry := catalogHistorySourceEntry{path: filepath.Clean(path), sessions: map[string]*historySessionInfo{}}
+type catalogIndexReader interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func loadCatalogIndexHeader(ctx context.Context, db catalogIndexReader, path string) (catalogHistorySourceEntry, bool, error) {
+	entry := catalogHistorySourceEntry{path: filepath.Clean(path)}
 	var hasFileID, hasCtime int
 	var dev, ino string
-	err := store.db.QueryRowContext(ctx, `SELECT generation, parsed_offset,
+	err := db.QueryRowContext(ctx, `SELECT generation, parsed_offset,
 		prefix_tail_hash, prefix_tail_size, source_size, source_mtime_ns,
 		source_mode, has_file_id, source_dev, source_ino, has_ctime,
-		source_ctime_ns FROM history_source WHERE path = ?`, entry.path).Scan(
+		source_ctime_ns FROM index_source WHERE path = ?`, entry.path).Scan(
 		&entry.generation, &entry.parsedOffset, &entry.prefixTailHash,
 		&entry.prefixTailSize, &entry.fileKey.Size, &entry.fileKey.MtimeUnixNano,
 		&entry.fileKey.Mode, &hasFileID, &dev, &ino, &hasCtime,
 		&entry.fileKey.CtimeUnixNano,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
-		return catalogHistorySourceEntry{}, false, nil
+		return entry, false, nil
 	}
 	if err != nil {
 		return catalogHistorySourceEntry{}, false, err
@@ -464,7 +572,28 @@ func (store *catalogSQLiteStore) loadHistory(ctx context.Context, path string) (
 	decodeCacheDeviceID(&entry.fileKey, dev)
 	entry.fileKey.Ino, _ = strconv.ParseUint(ino, 10, 64)
 
-	rows, err := store.db.QueryContext(ctx, `SELECT session_id, first_prompt,
+	return entry, true, nil
+}
+
+func (store *catalogSQLiteStore) loadHistory(ctx context.Context, path string) (catalogHistorySourceEntry, bool, error) {
+	store.historyMu.Lock()
+	defer store.historyMu.Unlock()
+	tx, err := store.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return catalogHistorySourceEntry{}, false, err
+	}
+	defer tx.Rollback()
+	entry, found, err := loadCatalogIndexHeader(ctx, tx, path)
+	if err != nil || !found {
+		return entry, found, err
+	}
+
+	if h := store.history; h.path == entry.path && h.generation == entry.generation && h.parsedOffset == entry.parsedOffset && h.fileKey == entry.fileKey && h.index != nil {
+		return h, true, nil
+	}
+
+	entry.index = &historyIndexData{sessions: map[string]*historySessionInfo{}}
+	rows, err := tx.QueryContext(ctx, `SELECT session_id, first_prompt,
 		first_prompt_time_ns FROM history_session WHERE source_path = ?`, entry.path)
 	if err != nil {
 		return catalogHistorySourceEntry{}, false, err
@@ -478,94 +607,79 @@ func (store *catalogSQLiteStore) loadHistory(ctx context.Context, path string) (
 			return catalogHistorySourceEntry{}, false, err
 		}
 		info.FirstPromptTime = cacheTimeFromUnixNano(timestamp)
-		entry.sessions[sessionID] = &info
+		entry.index.sessions[sessionID] = &info
 	}
 	if err := rows.Err(); err != nil {
 		return catalogHistorySourceEntry{}, false, err
 	}
+	store.history = entry
 	return entry, true, nil
 }
 
-func (store *catalogSQLiteStore) replaceHistory(ctx context.Context, expected catalogHistorySourceEntry, expectedFound bool, key fileCacheKey, offset int64, prefixHash string, prefixSize int64, sessions map[string]*historySessionInfo) error {
+func (store *catalogSQLiteStore) replaceHistory(ctx context.Context, expected catalogHistorySourceEntry, found bool, key fileCacheKey, offset int64, hash string, size int64, index *historyIndexData) error {
+	err := store.writeIndex(ctx, expected, found, true, key, offset, hash, size, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM history_session WHERE source_path=?`, expected.path); err != nil {
+			return err
+		}
+		return insertCatalogHistorySessions(ctx, tx, expected.path, index.sessions)
+	})
+	if err == nil {
+		store.rememberHistory(expected, found, true, key, offset, hash, size, index)
+	}
+	return err
+}
+
+// A peer update is detected by the next header read. Local appends merge into
+// the shared index under its short-lived data lock.
+func (store *catalogSQLiteStore) rememberHistory(entry catalogHistorySourceEntry, found, reset bool, key fileCacheKey, offset int64, hash string, size int64, index *historyIndexData) {
+	if !found {
+		entry.generation = 1
+	} else if reset {
+		entry.generation++
+	}
+	entry.fileKey, entry.parsedOffset = key, offset
+	entry.prefixTailHash, entry.prefixTailSize = hash, size
+	entry.index = index
+	store.historyMu.Lock()
+	store.history = entry
+	store.historyMu.Unlock()
+}
+
+func (store *catalogSQLiteStore) appendHistory(ctx context.Context, expected catalogHistorySourceEntry, key fileCacheKey, offset int64, hash string, size int64, changed map[string]*historySessionInfo) error {
+	return store.writeIndex(ctx, expected, true, false, key, offset, hash, size, func(tx *sql.Tx) error { return insertCatalogHistorySessions(ctx, tx, expected.path, changed) })
+}
+
+// File progress and its derived rows always advance in the same transaction.
+func (store *catalogSQLiteStore) writeIndex(ctx context.Context, expected catalogHistorySourceEntry, found, reset bool, key fileCacheKey, offset int64, hash string, size int64, fill func(*sql.Tx) error) error {
 	tx, err := store.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback()
 	var result sql.Result
-	if expectedFound {
-		result, err = tx.ExecContext(ctx, `UPDATE history_source SET
-			generation = generation + 1, parsed_offset = ?, prefix_tail_hash = ?,
-			prefix_tail_size = ?, source_size = ?, source_mtime_ns = ?, source_mode = ?,
-			has_file_id = ?, source_dev = ?, source_ino = ?, has_ctime = ?, source_ctime_ns = ?
-			WHERE path = ? AND generation = ?`, offset, prefixHash, prefixSize,
-			key.Size, key.MtimeUnixNano, key.Mode, boolInt(key.HasFileID),
-			cacheDeviceID(key), strconv.FormatUint(key.Ino, 10),
-			boolInt(key.HasCtime), key.CtimeUnixNano, expected.path, expected.generation)
+	args := []any{offset, hash, size, key.Size, key.MtimeUnixNano, key.Mode, boolInt(key.HasFileID), cacheDeviceID(key), strconv.FormatUint(key.Ino, 10), boolInt(key.HasCtime), key.CtimeUnixNano}
+	if found {
+		args = append([]any{boolInt(reset)}, args...)
+		args = append(args, expected.path, expected.generation, expected.parsedOffset)
+		result, err = tx.ExecContext(ctx, `UPDATE index_source SET generation=generation+?,parsed_offset=?,prefix_tail_hash=?,prefix_tail_size=?,source_size=?,source_mtime_ns=?,source_mode=?,has_file_id=?,source_dev=?,source_ino=?,has_ctime=?,source_ctime_ns=? WHERE path=? AND generation=? AND parsed_offset=?`, args...)
 	} else {
-		result, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO history_source (
-			path, generation, parsed_offset, prefix_tail_hash, prefix_tail_size,
-			source_size, source_mtime_ns, source_mode, has_file_id, source_dev,
-			source_ino, has_ctime, source_ctime_ns
-		) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, expected.path, offset,
-			prefixHash, prefixSize, key.Size, key.MtimeUnixNano, key.Mode,
-			boolInt(key.HasFileID), cacheDeviceID(key),
-			strconv.FormatUint(key.Ino, 10), boolInt(key.HasCtime), key.CtimeUnixNano)
+		args = append([]any{expected.path}, args...)
+		result, err = tx.ExecContext(ctx, `INSERT OR IGNORE INTO index_source(path,generation,parsed_offset,prefix_tail_hash,prefix_tail_size,source_size,source_mtime_ns,source_mode,has_file_id,source_dev,source_ino,has_ctime,source_ctime_ns) VALUES(?,1,?,?,?,?,?,?,?,?,?,?,?)`, args...)
 	}
 	if err != nil {
 		return err
 	}
-	rows, err := result.RowsAffected()
+	n, err := result.RowsAffected()
 	if err != nil {
 		return err
 	}
-	if rows != 1 {
+	if n != 1 {
 		return errCatalogSQLiteConflict
 	}
-	if _, err := tx.ExecContext(ctx, `DELETE FROM history_session WHERE source_path = ?`, expected.path); err != nil {
+	if err = fill(tx); err != nil {
 		return err
 	}
-	if err := insertCatalogHistorySessions(ctx, tx, expected.path, sessions); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	if catalogSQLiteCommitHook != nil {
-		catalogSQLiteCommitHook(store.path)
-	}
-	return nil
-}
-
-func (store *catalogSQLiteStore) appendHistory(ctx context.Context, expected catalogHistorySourceEntry, key fileCacheKey, offset int64, prefixHash string, prefixSize int64, changed map[string]*historySessionInfo) error {
-	tx, err := store.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `UPDATE history_source SET
-		parsed_offset = ?, prefix_tail_hash = ?, prefix_tail_size = ?, source_size = ?,
-		source_mtime_ns = ?, source_mode = ?, has_file_id = ?, source_dev = ?,
-		source_ino = ?, has_ctime = ?, source_ctime_ns = ?
-		WHERE path = ? AND generation = ? AND parsed_offset = ?`, offset, prefixHash,
-		prefixSize, key.Size, key.MtimeUnixNano, key.Mode, boolInt(key.HasFileID),
-		cacheDeviceID(key), strconv.FormatUint(key.Ino, 10),
-		boolInt(key.HasCtime), key.CtimeUnixNano, expected.path, expected.generation,
-		expected.parsedOffset)
-	if err != nil {
-		return err
-	}
-	rows, err := result.RowsAffected()
-	if err != nil {
-		return err
-	}
-	if rows != 1 {
-		return errCatalogSQLiteConflict
-	}
-	if err := insertCatalogHistorySessions(ctx, tx, expected.path, changed); err != nil {
-		return err
-	}
-	if err := tx.Commit(); err != nil {
+	if err = tx.Commit(); err != nil {
 		return err
 	}
 	if catalogSQLiteCommitHook != nil {

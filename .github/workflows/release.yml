@@ -199,6 +199,9 @@ jobs:
           go test ./internal/tui -count=1 -run "$tui_pattern" -v
           async_tui_pattern='^Test(LatestWorker|PrepareLayout|LayoutCancellation|PreviewLayoutInput|Async|RuntimePreviewReader|ListViews|PreviewTextCache|SelectSessionNavigationAndQuitDuringBlockedRefresh|SelectSessionCancellationWhenWakeQueueIsFull)'
           go test ./internal/tui -count=1 -run "$async_tui_pattern" -v
+          go test ./internal/responsesadapter -count=1 -run '^TestResponseAccumulation' -v
+          go test ./internal/core/store -count=1 -run '^Test(PendingCounts|PendingIndexMigration|TokenIndexConversion)' -v
+          go test ./internal/core/engine -count=1 -run '^TestHotResolver' -v
           go test ./internal/tui -run '^$' -bench '^BenchmarkResolveSelectionForDrawLargeHistory$' -benchtime=10x -count=1 -benchmem
           thread_name_history_pattern='^Test(ReadThreadNameIndexUsesLatestValidName|LoadThreadNameIndex(CachesUntilFileChanges|IsOptionalMetadata)|DiscoverProjects(AndFindSessionUseThreadNameIndex|PreservesPromptWithoutValidThreadName|RefreshesThreadNameWhenIndexChanges)|SessionThreadNameJSONIsBackwardCompatibleWhenEmpty)$'
           go test ./internal/codexhistory -count=1 -run "$thread_name_history_pattern" -v
@@ -218,7 +221,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          go test ./internal/codexhistory -count=1 -run '^Test(SessionPreview(SQLite|CacheOff)|CacheV2|SessionMetaCatalog|ForkClassificationDoesNotReuseVersionTwoCatalogMetadata|DiscoverProjectsBatchesCatalog|HistoryCatalog|Catalog)' -v
+          go test ./internal/codexhistory -count=1 -run '^Test(SessionPreview|Preview|CacheV2|SessionMeta|ThreadNameShared|Names|ForkClassificationDoesNotReuseVersionTwoCatalogMetadata|DiscoverProjectsBatchesCatalog|HistoryCatalog|HistoryAppend|HistoryFailedAppend|Catalog)' -v
 
       - name: CXP preview SQLite actual syscall write budget (Linux only)
         if: runner.os == 'Linux'

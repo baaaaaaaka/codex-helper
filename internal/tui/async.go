@@ -103,6 +103,8 @@ type previewReadJob struct {
 	meta previewCacheMeta
 }
 type layoutJob struct {
+	body           string
+	reuse          previewLinesCacheEntry
 	key, search    string
 	lines, wrapped []string
 	width          int
@@ -146,14 +148,30 @@ func newUIWorkers(ctx context.Context, done <-chan struct{}, screen tcell.Screen
 
 func prepareLayout(ctx context.Context, j layoutJob) layoutResult {
 	lines := j.wrapped
-	if lines == nil {
-		lines = buildWrappedLinesContext(ctx, j.lines, j.width)
+	bodyLines := j.reuse.bodyLines
+	if j.reuse.body != j.body || j.reuse.width != j.width {
+		bodyLines = nil
 	}
-	result := layoutResult{entry: previewLinesCacheEntry{key: j.key, lines: lines}, search: j.search}
+	if lines == nil {
+		for _, line := range j.lines {
+			if ctx.Err() != nil {
+				break
+			}
+			if line == j.body && j.body != "" {
+				if bodyLines == nil {
+					bodyLines = wrapTextContext(ctx, line, j.width)
+				}
+				lines = append(lines, bodyLines...)
+			} else {
+				lines = append(lines, wrapTextContext(ctx, line, j.width)...)
+			}
+		}
+	}
+	result := layoutResult{entry: previewLinesCacheEntry{key: j.key, lines: lines, body: j.body, bodyLines: bodyLines, width: j.width}, search: j.search}
 	if ctx.Err() != nil {
 		return result
 	}
-	result.entry.cost = previewLinesCost(lines)
+	result.entry.cost = previewLinesCost(lines) + len(j.body)
 	n := strings.ToLower(strings.TrimSpace(j.search))
 	if n != "" {
 		for i, line := range lines {
@@ -288,7 +306,12 @@ func (s *uiState) asyncPreviewLines(project codexhistory.Project, session *codex
 	// every paint from re-submitting and starving the same job.
 	if s.layoutSubmitted != request {
 		s.layoutSubmitted = request
-		s.workers.layout.submit(layoutJob{key: key, search: s.previewSearch, lines: s.previewLayoutInput(project, session, subagent, isNew, opts), wrapped: entry.lines, width: width})
+		body := s.previewCache[previewCacheKey(session, subagent)].text
+		reuse := entry
+		if reuse.bodyLines == nil {
+			reuse = s.previewLines
+		}
+		s.workers.layout.submit(layoutJob{key: key, search: s.previewSearch, lines: s.previewLayoutInput(project, session, subagent, isNew, opts), wrapped: entry.lines, width: width, body: body, reuse: reuse})
 	}
 	if entry.key != "" {
 		return entry.lines

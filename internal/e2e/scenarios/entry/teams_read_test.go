@@ -212,12 +212,17 @@ while True:
 			if err == nil && proc.Signal(syscall.Signal(0)) == nil {
 				t.Fatalf("private SSH child %d survived command exit", child.PID)
 			}
-			// A closed Python socket can leave TIME_WAIT entries. A failed
-			// rebind would not prove a live listener; check acceptability instead.
-			conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", child.Port), time.Second)
-			if err == nil {
-				conn.Close()
-				t.Fatal("private SOCKS listener still accepts connections")
+			// The blocked fixture sleeps before creating a socket. The selected
+			// port can be reused by another parallel test, so a connection there
+			// cannot indicate a surviving listener from this child.
+			if !block {
+				// A closed socket can leave TIME_WAIT entries. Check whether it
+				// accepts connections rather than trying to rebind it.
+				conn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", child.Port), time.Second)
+				if err == nil {
+					conn.Close()
+					t.Fatal("private SOCKS listener still accepts connections")
+				}
 			}
 			if block && !strings.Contains(string(out), "context deadline exceeded") {
 				t.Fatalf("lost deadline cause: %s", out)

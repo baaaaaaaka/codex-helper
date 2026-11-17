@@ -251,7 +251,7 @@ func TestSessionPreviewSQLiteCompareAndAppendRejectsStaleWriter(t *testing.T) {
 	delta := diffMessageSeenState(seenBefore, entryOne.seen)
 	hash, hashSize, _ := sessionPreviewPrefixTailHash(path, completeOffset)
 	key := newFileCacheKey(path, info)
-	if err := storeOne.append(entryOne, key, completeOffset, hash, hashSize, tail, delta); err != nil {
+	if err := storeOne.append(entryOne.sessionPreviewSQLiteEntry, key, completeOffset, hash, hashSize, tail, delta); err != nil {
 		t.Fatalf("writer one append: %v", err)
 	}
 	text, err := ReadSessionPreviewText(path, 0, 0)
@@ -266,7 +266,7 @@ func TestSessionPreviewSQLiteCompareAndAppendRejectsStaleWriter(t *testing.T) {
 		t.Fatalf("stale writer retained obsolete memory: ok=%v entry=%#v", memoryOK, memory)
 	}
 	resetSessionPreviewSQLiteWriteCounters(t, storeTwo)
-	if err := storeTwo.append(entryTwo, key, completeOffset, hash, hashSize, tail, delta); !errors.Is(err, errSessionPreviewSQLiteConflict) {
+	if err := storeTwo.append(entryTwo.sessionPreviewSQLiteEntry, key, completeOffset, hash, hashSize, tail, delta); !errors.Is(err, errSessionPreviewSQLiteConflict) {
 		t.Fatalf("writer two error = %v, want conflict", err)
 	}
 	assertSessionPreviewSQLiteWritePages(t, storeTwo, 0)
@@ -863,7 +863,7 @@ func TestSessionPreviewSQLiteMemoryAndDirtyStateAreBounded(t *testing.T) {
 			nil,
 			fmt.Sprintf("preview-%04d", index),
 			false,
-			nil,
+			&sessionPreviewSQLiteEntry{committedOffset: 1, offset: 2, dirtySince: time.Now(), pendingMessages: []Message{{Content: "pending"}}},
 		)
 	}
 	sessionPreviewSQLiteState.mu.Lock()
@@ -884,26 +884,8 @@ func TestSessionPreviewSQLiteMemoryAndDirtyStateAreBounded(t *testing.T) {
 		t.Fatalf("oversized entry changed bounded memory count: %d", afterOversize)
 	}
 
-	now := time.Date(2026, 7, 6, 0, 0, 0, 0, time.UTC)
-	previousNow := sessionPreviewNow
-	sessionPreviewNow = func() time.Time { return now }
-	t.Cleanup(func() { sessionPreviewNow = previousNow })
-	for index := 0; index < sessionPreviewAppendMaxDirtyPaths+10; index++ {
-		if shouldFlushSessionPreviewAppend(fmt.Sprintf("/dirty/%04d.jsonl", index), 1) {
-			t.Fatalf("dirty path %d flushed before the batching delay", index)
-		}
-		now = now.Add(time.Second)
-	}
-	sessionPreviewAppendState.mu.Lock()
-	dirtyPaths := len(sessionPreviewAppendState.dirtySince)
-	_, oldestPresent := sessionPreviewAppendState.dirtySince[filepath.Clean("/dirty/0000.jsonl")]
-	sessionPreviewAppendState.mu.Unlock()
-	if dirtyPaths != sessionPreviewAppendMaxDirtyPaths {
-		t.Fatalf("dirty paths = %d, want %d", dirtyPaths, sessionPreviewAppendMaxDirtyPaths)
-	}
-	if oldestPresent {
-		t.Fatal("oldest dirty path was not evicted")
-	}
+	// Dirty progress now belongs to these same bounded entries; there is no
+	// independent dirty-path registry that can outlive cache eviction.
 }
 
 func TestSessionPreviewSQLiteAppendDoesNotRunSessionPruning(t *testing.T) {
@@ -1036,7 +1018,7 @@ func TestSessionPreviewSQLiteWriteBudgetByMutation(t *testing.T) {
 		})
 		// A timestamp change without growth may be a same-size middle edit.
 		// Revalidate the contents rather than trusting a bounded prefix hash.
-		assertSessionPreviewSQLiteMutationBudget(t, metrics, 1, 4)
+		assertSessionPreviewSQLiteMutationBudget(t, metrics, 1, 5)
 	})
 
 	t.Run("partial tail", func(t *testing.T) {
@@ -1160,7 +1142,7 @@ func TestSessionPreviewSQLiteFiveSecondRefreshesCoalesceWrites(t *testing.T) {
 			line: func(index int) string {
 				return fmt.Sprintf(`{"timestamp":"2026-01-01T00:00:%02dZ","type":"response_item","payload":{"id":"answer-%d","type":"message","role":"assistant","content":[{"type":"output_text","text":"answer %d"}]}}`, index+1, index+2, index+2)
 			},
-			wantPages: 4,
+			wantPages: 5,
 		},
 		{
 			name: "hidden messages",
@@ -1218,10 +1200,13 @@ func TestSessionPreviewSQLiteAppendWriteBudgetDoesNotScaleWithOtherSessions(t *t
 	}
 	t.Run("baseline", func(t *testing.T) { baseline = measure(t, 0) })
 	t.Run("500 unrelated sessions", func(t *testing.T) { populated = measure(t, 500) })
-	if baseline.writePages != populated.writePages {
-		t.Fatalf("append write budget scaled with unrelated cache: baseline=%+v populated=%+v", baseline, populated)
+	// Candidate lookup adds one source-id index. A leaf split may write its
+	// parent and new pages; the append must remain bounded, not rewrite the
+	// unrelated messages or their payload pages.
+	if populated.writePages > baseline.writePages+4 || populated.commits != 1 {
+		t.Fatalf("append exceeded indexed split budget: baseline=%+v populated=%+v", baseline, populated)
 	}
-	if baseline.writePages != 4 || baseline.commits != 1 {
+	if baseline.writePages != 5 || baseline.commits != 1 {
 		t.Fatalf("unexpected baseline append budget: %+v", baseline)
 	}
 }
@@ -1255,6 +1240,14 @@ func TestSessionPreviewSQLiteSyscallProbe(t *testing.T) {
 	setTestUserCacheDir(t)
 	path := filepath.Join(t.TempDir(), "session.jsonl")
 	line := `{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"id":"answer-1","type":"message","role":"assistant","content":[{"type":"output_text","text":"stable"}]}}` + "\n"
+	if os.Getenv("CXP_PREVIEW_IO_LARGE") == "1" {
+		var seed strings.Builder
+		seed.WriteString(line)
+		for i := 0; i < 60000; i++ {
+			fmt.Fprintf(&seed, `{"timestamp":"2026-01-01T00:00:00Z","type":"response_item","payload":{"id":"seed-%d","type":"message","role":"assistant","content":[{"type":"output_text","text":"%s"}]}}`+"\n", i, strings.Repeat("answer ", 32))
+		}
+		line = seed.String()
+	}
 	if err := os.WriteFile(path, []byte(line), 0o600); err != nil {
 		t.Fatal(err)
 	}

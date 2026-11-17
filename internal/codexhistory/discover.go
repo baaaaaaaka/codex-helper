@@ -32,11 +32,7 @@ func DiscoverProjectSummariesContext(ctx context.Context, codexDir string) ([]Pr
 		return nil, err
 	}
 	reader := sessionSummaryReader{}
-	// Reuse an existing catalog, without creating a missing one to list files.
-	source := filepath.Join(root, "history.jsonl")
-	if _, exists, err := existingCacheV2DatabasePath(source, cacheV2CatalogFile); err == nil && exists {
-		reader.catalog, _ = currentCatalogSQLiteStore(source)
-	}
+	reader.catalog, _ = currentCatalogSQLiteStore(filepath.Join(root, "history.jsonl"))
 	return discoverProjectsContext(ctx, root, reader.read)
 }
 
@@ -88,8 +84,10 @@ func discoverProjectsContext(ctx context.Context, codexDir string, readMeta func
 		return nil, err
 	}
 
+	ctx = prefetchCatalogMetadata(ctx, root, files)
+
 	var firstErr error
-	sessionIndex := map[string]int{}
+	sessionIndex := make(map[string]int, len(files))
 	sessions := make([]Session, 0, len(files))
 	var pendingSubagents []SubagentSession
 
@@ -147,7 +145,7 @@ func discoverProjectsContext(ctx context.Context, codexDir string, readMeta func
 				AgentID:         meta.SubagentType,
 				ParentSessionID: meta.ParentThreadID,
 				SessionID:       sessionID,
-				ThreadName:      threadNames[sessionID],
+				ThreadName:      threadNames.lookup(sessionID),
 				FirstPrompt:     meta.FirstPrompt,
 				MessageCount:    meta.MessageCount,
 				CreatedAt:       meta.CreatedAt,
@@ -161,7 +159,7 @@ func discoverProjectsContext(ctx context.Context, codexDir string, readMeta func
 		sess := Session{
 			SessionID:       sessionID,
 			ParentSessionID: meta.ParentThreadID,
-			ThreadName:      threadNames[sessionID],
+			ThreadName:      threadNames.lookup(sessionID),
 			FirstPrompt:     meta.FirstPrompt,
 			MessageCount:    meta.MessageCount,
 			CreatedAt:       meta.CreatedAt,
@@ -267,16 +265,28 @@ func attachSubagents(sessions []Session, sessionIndex map[string]int, pending []
 }
 
 func groupByProject(sessions []Session) []Project {
-	groups := map[string][]Session{}
+	counts := map[string]int{}
 	var keys []string
-	for _, sess := range sessions {
+	keyFor := func(sess Session) string {
 		key := strings.TrimSpace(sess.ProjectPath)
 		if key == "" {
-			key = "(unknown)"
+			return "(unknown)"
 		}
-		if _, ok := groups[key]; !ok {
+		return key
+	}
+	for _, sess := range sessions {
+		key := keyFor(sess)
+		if counts[key] == 0 {
 			keys = append(keys, key)
 		}
+		counts[key]++
+	}
+	groups := make(map[string][]Session, len(counts))
+	for key, count := range counts {
+		groups[key] = make([]Session, 0, count)
+	}
+	for _, sess := range sessions {
+		key := keyFor(sess)
 		groups[key] = append(groups[key], sess)
 	}
 	projects := make([]Project, 0, len(groups))
@@ -384,7 +394,7 @@ func FindSessionByID(codexDir, sessionID string) (*Session, error) {
 			}
 			sess := &Session{
 				SessionID:       sessionID,
-				ThreadName:      threadNames[sessionID],
+				ThreadName:      threadNames.lookup(sessionID),
 				FirstPrompt:     meta.FirstPrompt,
 				MessageCount:    meta.MessageCount,
 				CreatedAt:       meta.CreatedAt,
@@ -464,8 +474,7 @@ func globRecursive(sessionsDir, sessionID string) []string {
 	return matches
 }
 
-// ResetCache clears the session file cache. Useful for testing.
+// ResetCache clears the process-local thread-name cache. Useful for testing.
 func ResetCache() {
-	resetSessionFileCache()
 	resetThreadNameIndexCache()
 }

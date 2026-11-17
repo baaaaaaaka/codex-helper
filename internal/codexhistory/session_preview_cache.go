@@ -61,6 +61,15 @@ func sessionPreviewCacheBackend() string {
 }
 
 func canAppendCacheFile(path string, info os.FileInfo, previous fileCacheKey, offset int64, prefixTailHash string, prefixTailSize int64) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	return canAppendCacheFileFrom(f, path, info, previous, offset, prefixTailHash, prefixTailSize)
+}
+
+func canAppendCacheFileFrom(f *os.File, path string, info os.FileInfo, previous fileCacheKey, offset int64, prefixTailHash string, prefixTailSize int64) bool {
 	if info == nil || offset < 0 || offset > info.Size() {
 		return false
 	}
@@ -89,7 +98,7 @@ func canAppendCacheFile(path string, info os.FileInfo, previous fileCacheKey, of
 	if prefixTailSize <= 0 || prefixTailHash == "" {
 		return false
 	}
-	hash, size, ok := sessionPreviewPrefixTailHash(path, offset)
+	hash, size, ok := sessionPreviewPrefixTailHashFrom(f, offset)
 	return ok && size == prefixTailSize && hash == prefixTailHash
 }
 
@@ -102,6 +111,13 @@ func sessionPreviewPrefixTailHash(path string, offset int64) (string, int64, boo
 		return "", 0, false
 	}
 	defer f.Close()
+	return sessionPreviewPrefixTailHashFrom(f, offset)
+}
+
+func sessionPreviewPrefixTailHashFrom(f *os.File, offset int64) (string, int64, bool) {
+	if offset <= 0 {
+		return "", 0, true
+	}
 	headSize := sessionPreviewPrefixHashBytes / 2
 	if headSize > offset {
 		headSize = offset
@@ -132,16 +148,22 @@ func sessionPreviewCompleteOffset(path string, info os.FileInfo) (int64, bool) {
 	if info == nil {
 		return 0, false
 	}
-	size := info.Size()
-	if size <= 0 {
-		return 0, true
-	}
 	f, err := os.Open(path)
 	if err != nil {
 		return 0, false
 	}
 	defer f.Close()
+	return sessionPreviewCompleteOffsetFrom(f, info)
+}
 
+func sessionPreviewCompleteOffsetFrom(f *os.File, info os.FileInfo) (int64, bool) {
+	if info == nil {
+		return 0, false
+	}
+	size := info.Size()
+	if size <= 0 {
+		return 0, true
+	}
 	var last [1]byte
 	n, err := f.ReadAt(last[:], size-1)
 	if err != nil && n <= 0 {

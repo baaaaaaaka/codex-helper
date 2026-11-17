@@ -12,9 +12,9 @@ fi
 
 cd "$repo_root"
 go test -c -o "$tmp_dir/codexhistory-preview-io.test" ./internal/codexhistory
-env CXP_SESSION_PREVIEW_IO_PROBE=1 \
+env CXP_SESSION_PREVIEW_IO_PROBE=1 CXP_PREVIEW_IO_LARGE=1 \
   strace -f -yy -s 256 -o "$tmp_dir/trace.log" \
-    -e trace=pwrite64,write,writev,fdatasync,fsync,ftruncate,unlink,unlinkat,rename,renameat,mkdir,mkdirat,chmod,fchmodat,msync \
+    -e trace=read,pread64,pwrite64,write,writev,fdatasync,fsync,ftruncate,unlink,unlinkat,rename,renameat,mkdir,mkdirat,chmod,fchmodat,msync \
     "$tmp_dir/codexhistory-preview-io.test" \
       -test.run '^TestSessionPreviewSQLiteSyscallProbe$' -test.count=1 -test.v
 
