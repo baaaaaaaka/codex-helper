@@ -353,9 +353,9 @@ func (e *Engine) cmdModelChat(ctx context.Context, j cmdJob, cs *convState, arg 
 			e.reply(j, "usage: `model use <model> [effort]`", nil)
 			return
 		}
-		e.modelSwitch(j, c, rest, modelSrcChatOverride)
+		e.modelSwitch(ctx, j, c, rest, modelSrcChatOverride)
 	case "reset":
-		e.modelSwitch(j, c, "", modelSrcGlobalDefault)
+		e.modelSwitch(ctx, j, c, "", modelSrcGlobalDefault)
 	case "fork", "new":
 		if c.control {
 			e.reply(j, usage(), nil)
@@ -367,7 +367,7 @@ func (e *Engine) cmdModelChat(ctx context.Context, j cmdJob, cs *convState, arg 
 		}
 		e.modelFork(ctx, j, c, rest)
 	case "effort", "reasoning-effort", "thinking-effort":
-		e.effortCommand(j, c, rest)
+		e.effortCommand(ctx, j, c, rest)
 	case "default", "set-default":
 		if c.control {
 			e.reply(j, "Global defaults moved to the Control-only `default` command. Use `default model set <model>` or `default model reset`.", nil)
@@ -423,7 +423,7 @@ func (c modelChat) effortForSwitch(target Model) (string, string, string) {
 
 // modelSwitch is v0.1.20's switchChatModelProfileWithSource; ref "" is the
 // global default (`model reset`).
-func (e *Engine) modelSwitch(j cmdJob, c modelChat, ref, source string) {
+func (e *Engine) modelSwitch(ctx context.Context, j cmdJob, c modelChat, ref, source string) {
 	sel, target := "", Model{}
 	explicitEffort := ""
 	if source == modelSrcGlobalDefault {
@@ -453,7 +453,7 @@ func (e *Engine) modelSwitch(j cmdJob, c modelChat, ref, source string) {
 	if notice != "" && explicitEffort == "" {
 		text += "\n\n" + notice
 	}
-	e.applyModelEffort(j, c, sel, source, eff, effSrc, text)
+	e.applyModelEffort(ctx, j, c, sel, source, eff, effSrc, text)
 }
 
 // modelAndEffort first resolves the complete name, preserving display names
@@ -501,7 +501,7 @@ func (e *Engine) changeThread(tx *store.Tx, cs *convState, fn func(*store.Thread
 }
 
 // effortCommand is v0.1.20's handleReasoningEffortCommand.
-func (e *Engine) effortCommand(j cmdJob, c modelChat, arg string) {
+func (e *Engine) effortCommand(ctx context.Context, j cmdJob, c modelChat, arg string) {
 	sub, rest := commandParts(arg)
 	m, known := c.model()
 	switch sub {
@@ -518,24 +518,24 @@ func (e *Engine) effortCommand(j cmdJob, c modelChat, arg string) {
 			e.reply(j, "usage: `effort set <value>`", nil)
 			return
 		}
-		e.effortSet(j, c, m, known, rest, effortSrcExplicit)
+		e.effortSet(ctx, j, c, m, known, rest, effortSrcExplicit)
 	case "reset", "default":
 		// The global default effort when it suits the model, else the
 		// model's advertised default (v0.1.20).
 		if eff, src := globalDefaultEffort(c.defs, m); eff != "" {
-			e.effortSet(j, c, m, known, eff, src)
+			e.effortSet(ctx, j, c, m, known, eff, src)
 			return
 		}
 		if m.Effort == "" {
 			e.reply(j, fmt.Sprintf("model %q did not advertise a default reasoning effort", firstNonEmpty(m.ID, c.modelID())), nil)
 			return
 		}
-		e.effortSet(j, c, m, known, m.Effort, effortSrcModelDefault)
+		e.effortSet(ctx, j, c, m, known, m.Effort, effortSrcModelDefault)
 	case "help", "?":
 		e.reply(j, reasoningEffortUsage(), nil)
 	default:
 		if rest == "" {
-			e.effortSet(j, c, m, known, sub, effortSrcExplicit)
+			e.effortSet(ctx, j, c, m, known, sub, effortSrcExplicit)
 			return
 		}
 		e.reply(j, reasoningEffortUsage(), nil)
@@ -604,7 +604,7 @@ func (c modelChat) effortListText(m Model) string {
 }
 
 // effortSet is v0.1.20's setReasoningEffortFromCatalog.
-func (e *Engine) effortSet(j cmdJob, c modelChat, m Model, known bool, requested, source string) {
+func (e *Engine) effortSet(ctx context.Context, j cmdJob, c modelChat, m Model, known bool, requested, source string) {
 	if !known || len(m.Efforts) == 0 {
 		e.reply(j, fmt.Sprintf("could not list reasoning efforts: model %q did not advertise any reasoning efforts", firstNonEmpty(m.ID, c.modelID())), nil)
 		return
@@ -617,7 +617,7 @@ func (e *Engine) effortSet(j cmdJob, c modelChat, m Model, known bool, requested
 	prev := firstNonEmpty(c.th.PendingEffort, c.th.Effort, "unset")
 	text := fmt.Sprintf("Reasoning effort updated for this %s chat\nPrevious: `%s`\nEffective for next turn: `%s`\nModel: `%s`\nSource: %s\nApplies to turns that start after this change in this chat; an active task is interrupted and continued with the new settings.",
 		c.kind, prev, eff, m.ID, effortSourceLabel(source))
-	e.applyModelEffort(j, c, c.modelID(), c.th.ModelSource, eff, source, text)
+	e.applyModelEffort(ctx, j, c, c.modelID(), c.th.ModelSource, eff, source, text)
 }
 
 // globalDefaultEffort is v0.1.20's ResolveDefaultReasoningEffort for a
@@ -728,5 +728,5 @@ func (e *Engine) cmdEffortChat(ctx context.Context, j cmdJob, cs *convState, arg
 		e.reply(j, failed, nil)
 		return
 	}
-	e.effortCommand(j, c, arg)
+	e.effortCommand(ctx, j, c, arg)
 }

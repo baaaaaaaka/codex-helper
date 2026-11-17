@@ -3,7 +3,11 @@ package codex
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
+
+	"github.com/baaaaaaaka/codex-helper/internal/core/goal"
 )
 
 // Thread state the helper shows with Codex messages (owner request
@@ -17,10 +21,7 @@ import (
 // interrupted and its server is not reaped while it runs.
 
 // Goal is a thread goal.
-type Goal struct {
-	Objective string `json:"objective"`
-	Status    string `json:"status"` // active, paused, blocked, usageLimited, budgetLimited, complete
-}
+type Goal = goal.State
 
 // Goal statuses the helper sets.
 const (
@@ -30,11 +31,13 @@ const (
 
 // ThreadInfo is what a server knows of one loaded thread.
 type ThreadInfo struct {
-	Goal   *Goal // nil: no goal
-	Model  string
-	Effort string // "" = the model's default
-	Tier   string // the selected service tier ("" or "default" = standard)
-	Turn   string // the running turn ("" = idle)
+	Goal         *Goal // nil is absence only when GoalKnown
+	GoalKnown    bool
+	goalRevision uint64
+	Model        string
+	Effort       string // "" = the model's default
+	Tier         string // the selected service tier ("" or "default" = standard)
+	Turn         string // the running turn ("" = idle)
 }
 
 type threadSettings struct {
@@ -64,8 +67,11 @@ func (s *Server) Info(threadID string) ThreadInfo {
 		return ThreadInfo{}
 	}
 	out := *t
+	if s.exitErr != nil {
+		out.GoalKnown = false
+	}
 	if t.Goal != nil {
-		g := *t.Goal
+		g := t.Goal.Clone()
 		out.Goal = &g
 	}
 	return out
@@ -104,14 +110,21 @@ func (s *Server) track(method, threadID string, params json.RawMessage) {
 		var m struct {
 			Goal *Goal `json:"goal"`
 		}
-		if json.Unmarshal(params, &m) == nil && m.Goal != nil {
-			s.mu.Lock()
-			s.threadLocked(threadID).Goal = m.Goal
-			s.mu.Unlock()
+		err := json.Unmarshal(params, &m)
+		s.mu.Lock()
+		t := s.threadLocked(threadID)
+		t.goalRevision++
+		if err != nil || m.Goal == nil || m.Goal.Status == "" || strings.TrimSpace(m.Goal.Objective) == "" {
+			t.GoalKnown = false
+		} else {
+			t.Goal, t.GoalKnown = m.Goal, true
 		}
+		s.mu.Unlock()
 	case "thread/goal/cleared":
 		s.mu.Lock()
 		s.threadLocked(threadID).Goal = nil
+		s.threadLocked(threadID).GoalKnown = true
+		s.threadLocked(threadID).goalRevision++
 		s.mu.Unlock()
 	case "thread/settings/updated":
 		var m struct {
@@ -184,7 +197,7 @@ func (s *Server) loadedResponse(threadID string, raw json.RawMessage) {
 	s.setSettings(threadID, m.Model, effort, tier)
 }
 
-// GoalGet reads the goal of a loaded thread (nil: none). A Codex without
+// GoalGet reads the goal without loading execution (nil: confirmed none). A Codex without
 // goals answers with an error.
 func (s *Server) GoalGet(ctx context.Context, threadID string) (*Goal, error) {
 	var res struct {
@@ -193,13 +206,14 @@ func (s *Server) GoalGet(ctx context.Context, threadID string) (*Goal, error) {
 	if err := s.Call(ctx, "thread/goal/get", map[string]any{"threadId": threadID}, &res); err != nil {
 		return nil, err
 	}
-	s.mu.Lock()
-	s.threadLocked(threadID).Goal = res.Goal
-	s.mu.Unlock()
-	return res.Goal, nil
+	i := s.Info(threadID)
+	if !i.GoalKnown {
+		return nil, fmt.Errorf("goal query returned no confirmed snapshot")
+	}
+	return i.Goal, nil
 }
 
-// GoalSet sets the goal of a loaded thread as the user (origin "user", as
+// GoalSet sets the goal as the user (origin "user", as
 // the TUI's /goal): a new objective ("" keeps it) and/or a status ("" keeps
 // it; a new goal is active). An active goal on an idle thread makes Codex
 // start working on it.
@@ -217,20 +231,97 @@ func (s *Server) GoalSet(ctx context.Context, threadID, objective, status string
 	if err := s.Call(ctx, "thread/goal/set", params, &res); err != nil {
 		return Goal{}, err
 	}
-	g := res.Goal
-	s.mu.Lock()
-	s.threadLocked(threadID).Goal = &g
-	s.mu.Unlock()
-	return g, nil
+	i := s.Info(threadID)
+	if !i.GoalKnown || i.Goal == nil {
+		return Goal{}, fmt.Errorf("goal mutation returned no confirmed snapshot")
+	}
+	return *i.Goal, nil
 }
 
-// GoalClear removes the goal of a loaded thread.
+// GoalClear removes the goal without loading execution.
 func (s *Server) GoalClear(ctx context.Context, threadID string) error {
-	if err := s.Call(ctx, "thread/goal/clear", map[string]any{"threadId": threadID}, nil); err != nil {
+	if err := s.Call(ctx, "thread/goal/clear", map[string]any{"threadId": threadID, "origin": "user"}, nil); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	s.threadLocked(threadID).Goal = nil
-	s.mu.Unlock()
+	i := s.Info(threadID)
+	if !i.GoalKnown || i.Goal != nil {
+		return fmt.Errorf("goal clear was not confirmed")
+	}
 	return nil
+}
+
+// goalRPC is retained only while its request is pending. Results are applied by
+// the reader before waking the caller, preserving notification/response order.
+type goalRPC struct {
+	Thread, Method string
+	Revision       uint64
+}
+
+func goalRequest(method string, raw json.RawMessage) (goalRPC, bool) {
+	switch method {
+	case "thread/goal/get", "thread/goal/set", "thread/goal/clear":
+		var p struct {
+			Thread string `json:"threadId"`
+		}
+		if json.Unmarshal(raw, &p) == nil && p.Thread != "" {
+			return goalRPC{Thread: p.Thread, Method: method}, true
+		}
+	}
+	return goalRPC{}, false
+}
+
+// Called under s.mu. An RPC error cannot establish a goal snapshot.
+func (s *Server) goalResult(r goalRPC, raw json.RawMessage, rpcErr *RPCError) {
+	t := s.threadLocked(r.Thread)
+	if t.goalRevision != r.Revision {
+		return
+	} // a notification superseded this in-flight request
+	if rpcErr != nil {
+		t.GoalKnown = false
+		return
+	}
+	if r.Method == "thread/goal/clear" {
+		var p struct {
+			Cleared *bool `json:"cleared"`
+		}
+		if json.Unmarshal(raw, &p) != nil || p.Cleared == nil {
+			t.GoalKnown = false
+			return
+		}
+		t.Goal = nil
+		t.GoalKnown = true
+		return
+	}
+	var p struct {
+		Goal *Goal `json:"goal"`
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &p) != nil || json.Unmarshal(raw, &fields) != nil {
+		t.GoalKnown = false
+		return
+	}
+	if _, ok := fields["goal"]; !ok {
+		t.GoalKnown = false
+		return
+	}
+	if p.Goal != nil && (p.Goal.Status == "" || strings.TrimSpace(p.Goal.Objective) == "") {
+		t.GoalKnown = false
+		return
+	}
+	if r.Method == "thread/goal/set" && p.Goal == nil {
+		t.GoalKnown = false
+		return
+	}
+	t.Goal = p.Goal
+	t.GoalKnown = true
+}
+
+// IsGoalsUnavailable recognizes only definitive capability rejection. A timeout,
+// ownership conflict or database error must never be treated as no active goal.
+func IsGoalsUnavailable(err error) bool {
+	var rpc *RPCError
+	if !errors.As(err, &rpc) {
+		return false
+	}
+	return rpc.Code == -32601 || (rpc.Code == -32600 && strings.TrimSpace(rpc.Message) == "goals feature is disabled")
 }

@@ -497,6 +497,20 @@ func (e *Engine) workStatus(cs *convState) string {
 	if unconfirmed > 0 {
 		text += fmt.Sprintf(" Delivery: %d awaiting send, %d unconfirmed (retained without automatic resend; later messages can continue).", unsent, unconfirmed)
 	}
+	if _, ok := e.ag.(GoalAgent); ok {
+		g := e.turnInfo(cs.id).Goal
+		status := "unconfirmed"
+		if g.Known {
+			status = g.Status
+			if status == "" {
+				status = "none"
+			}
+		}
+		text += " Goal status: " + status + "."
+		if g.Known && g.Objective != "" {
+			text += " Goal: " + shortLine(g.Objective, goalNoteMax)
+		}
+	}
 	return text
 }
 

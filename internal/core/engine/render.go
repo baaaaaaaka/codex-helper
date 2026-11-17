@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/baaaaaaaka/codex-helper/internal/channel"
+	"github.com/baaaaaaaka/codex-helper/internal/core/goal"
 	"github.com/baaaaaaaka/codex-helper/internal/core/store"
 	"github.com/baaaaaaaka/codex-helper/internal/core/transcript"
 )
@@ -156,9 +157,12 @@ const (
 // of its thread (answer: the message is an answer, not a status).
 func infoNotes(info TurnInfo, answer bool) []channel.Note {
 	var out []channel.Note
-	if g := strings.TrimSpace(info.Goal); g != "" {
+	if info.GoalTriggered && !info.Goal.Known && info.Goal.Objective == "" {
+		out = append(out, channel.Note{Label: "🎯 Goal status", Text: "unconfirmed"})
+	}
+	if g := strings.TrimSpace(info.Goal.Objective); g != "" {
 		out = append(out, channel.Note{
-			Label: labelGoal, Text: shortLine(strings.Join(strings.Fields(g), " "), goalNoteMax),
+			Label: goalLabel(info.Goal), Text: shortLine(strings.Join(strings.Fields(g), " "), goalNoteMax),
 		})
 	}
 	if answer && strings.TrimSpace(info.Model) != "" {
@@ -202,4 +206,14 @@ func (e *Engine) turnInfo(conv int64) TurnInfo {
 		return TurnInfo{}
 	}
 	return ga.Info(conv, th)
+}
+
+func goalLabel(s goal.Snapshot) string {
+	if !s.Known {
+		return "🎯 Last recorded goal (unconfirmed)"
+	}
+	if s.Active() {
+		return labelGoal
+	}
+	return "🎯 Goal (" + s.Status + ")"
 }

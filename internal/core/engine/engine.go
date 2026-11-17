@@ -607,7 +607,7 @@ func (e *Engine) Run(ctx context.Context) error {
 	loops := []func(context.Context){
 		e.receiverLoop, e.runnerLoop, e.senderLoop, e.resolverLoop,
 		e.commandLoop, e.maintenanceLoop, e.asrLoop, e.notifyLoop,
-		e.legacyCheckLoop,
+		e.legacyCheckLoop, e.recoverGoalStops,
 	}
 	if e.cfg.SessionsDir != "" {
 		loops = append(loops, e.mirrorLoop, e.historyCheckLoop)

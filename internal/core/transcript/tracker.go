@@ -29,6 +29,7 @@ const CompactText = "Context compacted. Earlier turns were summarized so Codex c
 // "t:<turn>:<kind>:<line>" (final, prompt, status, compact; line is the
 // 1-based line of the record).
 type Output struct {
+	GoalTriggered  bool
 	helperInput    bool
 	localPrompt    bool   // an identified native TUI input inside a shared turn
 	LegacyRecordID string // line-based key used by older helpers
@@ -135,6 +136,7 @@ func (t *Tracker) stamp(out []Output, from int) {
 }
 
 type openTurn struct {
+	goalTriggered   bool
 	schedule        *Schedule
 	humanInput      bool
 	id              string
@@ -365,13 +367,14 @@ func (t *Tracker) apply(out []Output, ev Event, l Line) []Output {
 		}
 	case KindTurnStarted:
 		if t.turn != nil && ev.TurnID != "" && t.turn.id == ev.TurnID {
+			t.turn.goalTriggered = t.turn.goalTriggered || ev.GoalTriggered
 			if ev.Schedule != nil && t.turn.schedule == nil {
 				t.turn.schedule = ev.Schedule
 			}
 			return out // turn_context after task_started
 		}
 		out = t.end(out)
-		t.turn = &openTurn{id: ev.TurnID, started: true, start: l.Off, startLine: t.line - 1,
+		t.turn = &openTurn{goalTriggered: ev.GoalTriggered, id: ev.TurnID, started: true, start: l.Off, startLine: t.line - 1,
 			teams: ev.TurnID != "" && t.skip("", ev.TurnID), schedule: ev.Schedule}
 	case KindUserMessage:
 		text := strings.TrimSpace(ev.Text)
@@ -582,6 +585,7 @@ func (t *Tracker) end(out []Output) []Output {
 func resolve(o Output, tr *openTurn) Output {
 	if tr != nil {
 		o.TurnID = tr.id
+		o.GoalTriggered = tr.goalTriggered
 		if tr.schedule != nil && o.Kind != OutputPrompt && o.Schedule == nil {
 			s := *tr.schedule
 			o.Schedule = &s

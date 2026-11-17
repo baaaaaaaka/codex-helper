@@ -85,13 +85,13 @@ func TestGoalCommands(t *testing.T) {
 
 	c, ok = askNotified(s, control.ID, work.ID, "paused")
 	paused := answerText(s, work.ID, c)
-	s.Check("a paused goal has no goal line; the next message does not resume it",
-		ok && !strings.Contains(paused, "Active goal") && strings.Contains(paused, "🔧 Helper: model - gpt-5-codex"),
-		"model line, no goal line", clip(paused, 400))
+	s.Check("a paused goal is labeled paused; the next message does not resume it",
+		ok && strings.Contains(paused, "Goal (paused): "+objective) && !strings.Contains(paused, "Active goal") && strings.Contains(paused, "🔧 Helper: model - gpt-5-codex"),
+		"paused goal and model line", clip(paused, 400))
 	expect(s, work.ID, "helper goal", "Goal status: paused")
 
 	expect(s, work.ID, "helper goal active", "Goal active again.", "Goal status: active", "Goal: "+objective)
-	expect(s, work.ID, "helper cancel", "the active goal is paused")
+	expect(s, work.ID, "helper cancel", "The goal is paused too")
 	expect(s, work.ID, "helper goal", "Goal status: paused")
 	expect(s, work.ID, "helper goal resume", "Goal active again.")
 	expect(s, work.ID, "helper goal pause", "Goal paused.", "Goal status: paused", "Goal: "+objective)

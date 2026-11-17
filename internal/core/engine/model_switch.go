@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -12,6 +13,11 @@ import (
 // pendingSettings uses durable admitted commands, including during catalog
 // lookup and after restart. A slow validation never lets later input pass it.
 func pendingSettings(tx *store.Tx, conv int64, control bool) (bool, error) {
+	if g, ok, err := tx.GoalControl(conv); err != nil {
+		return false, err
+	} else if ok && g.Pending {
+		return true, nil
+	}
 	rows, err := tx.PendingCommands(conv)
 	if err != nil {
 		return false, err
@@ -26,6 +32,9 @@ func pendingSettings(tx *store.Tx, conv int64, control bool) (bool, error) {
 		}
 		if p.form != formCommand {
 			continue
+		}
+		if p.name == cmdGoalName && strings.TrimSpace(p.arg) != "" {
+			return true, nil
 		}
 		sub, rest := commandParts(p.arg)
 		if p.name == cmdModelName {
@@ -50,9 +59,24 @@ func pendingSettings(tx *store.Tx, conv int64, control bool) (bool, error) {
 	return false, nil
 }
 
-func (e *Engine) applyModelEffort(j cmdJob, c modelChat, model, modelSrc, effort, effortSrc, text string) {
+func (e *Engine) applyModelEffort(ctx context.Context, j cmdJob, c modelChat, model, modelSrc, effort, effortSrc, text string) {
 	info := e.turnInfo(c.cs.id)
-	if info.Goal != "" || info.SelfTurn {
+	goalActive := info.Goal.Active()
+	if ga, ok := e.ag.(GoalAgent); ok && c.th.ThreadID != "" {
+		// A cold or stale observation cannot authorize a model handoff through an
+		// independently active native goal. Read without resuming execution.
+		gctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		g, err := ga.Goal(gctx, c.cs.id, c.th.ThreadID, c.th.Cwd, GoalState{})
+		cancel()
+		if err != nil && !errors.Is(err, ErrGoalsUnavailable) {
+			e.reply(j, "Model switching is unavailable until the native goal state can be confirmed: "+userError(err.Error()), nil)
+			e.wakeRunner(c.cs.id)
+			return
+		}
+		info = e.turnInfo(c.cs.id)
+		goalActive = err == nil && g.Status == GoalActive
+	}
+	if goalActive || info.SelfTurn {
 		e.reply(j, "Model switching is unavailable while an independently continuing Codex goal or external turn is active.", nil)
 		e.wakeRunner(c.cs.id)
 		return

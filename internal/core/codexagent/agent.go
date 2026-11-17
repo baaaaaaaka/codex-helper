@@ -480,10 +480,15 @@ func (a *Agent) Info(convID int64, threadID string) engine.TurnInfo {
 	}
 	t := srv.Info(threadID)
 	out := engine.TurnInfo{Model: t.Model, Effort: t.Effort, Tier: t.Tier}
-	if t.Goal != nil && t.Goal.Status == codex.GoalActive {
-		out.Goal = t.Goal.Objective
+	out.Goal.Known = t.GoalKnown
+	out.Goal.Observed = true
+	if t.Goal != nil {
+		out.Goal.State = t.Goal.Clone()
 	}
 	out.SelfTurn = t.Turn != "" && t.Turn != a.ownTurn(convID, srv)
+	if out.SelfTurn {
+		out.NativeTurn = t.Turn
+	}
 	return out
 }
 
@@ -499,7 +504,7 @@ func (a *Agent) ownTurn(convID int64, srv *codex.Server) string {
 }
 
 // Goal reads or sets the goal of threadID on the conversation's
-// app-server (thread/resume first). Setting it active on an idle thread
+// app-server. Queries and pause never resume execution. Setting it active
 // starts Codex working on it in that server; its turns reach the chat
 // through the rollout mirror.
 func (a *Agent) Goal(ctx context.Context, convID int64, threadID, cwd string, change engine.GoalState) (engine.GoalState, error) {
@@ -508,49 +513,91 @@ func (a *Agent) Goal(ctx context.Context, convID int64, threadID, cwd string, ch
 		return engine.GoalState{}, err
 	}
 	defer lease.Release()
-	if err := lease.Load(ctx, threadID); err != nil {
-		if codex.IsActiveWriter(err) {
-			return engine.GoalState{}, engine.ErrActiveWriter
-		}
-		return engine.GoalState{}, err
-	}
 	srv := lease.Server()
 	if change.Objective == "" && change.Status == "" {
 		g, err := srv.GoalGet(ctx, threadID)
+		if codex.IsGoalsUnavailable(err) {
+			return engine.GoalState{}, fmt.Errorf("%w: %v", engine.ErrGoalsUnavailable, err)
+		}
 		if err != nil || g == nil {
 			return engine.GoalState{}, err
 		}
-		return engine.GoalState{Objective: g.Objective, Status: g.Status}, nil
+		return g.Clone(), nil
+	}
+	// Explicit activation must also reconcile an already-active persisted goal
+	// with a cold server. Avoid rewriting its budget/usage just to load it.
+	if change.Objective == "" && change.Status == engine.GoalActive {
+		cur, err := srv.GoalGet(ctx, threadID)
+		if err != nil {
+			return engine.GoalState{}, err
+		}
+		if cur != nil && cur.Status == codex.GoalActive {
+			if err := lease.Load(ctx, threadID); err != nil {
+				return engine.GoalState{}, err
+			}
+			return cur.Clone(), nil
+		}
 	}
 	g, err := srv.GoalSet(ctx, threadID, change.Objective, change.Status)
 	if err != nil {
 		return engine.GoalState{}, err
 	}
-	return engine.GoalState{Objective: g.Objective, Status: g.Status}, nil
+	// Only explicit activation loads the execution thread. Query and pause never resume it.
+	if g.Status == codex.GoalActive {
+		if err := lease.Load(ctx, threadID); err != nil {
+			return engine.GoalState{}, err
+		}
+	}
+	return g.Clone(), nil
 }
 
-// StopGoal pauses the active goal of threadID when the conversation's
-// app-server has the thread loaded (Codex's interrupt leaves a goal
-// active; the TUI pauses it the same way before interrupting) and
-// interrupts the turn Codex runs there by itself. A turn the helper runs
-// is left to Interrupt.
-func (a *Agent) StopGoal(ctx context.Context, convID int64, threadID string) (engine.GoalStopped, error) {
+// StopGoal reconciles the goal without resuming execution, then interrupts
+// only the selected independent native turn. The engine stops its own selected
+// helper execution separately, even when goal confirmation fails.
+func (a *Agent) StopGoal(ctx context.Context, convID int64, threadID, cwd, nativeTurn string) (engine.GoalStopped, error) {
 	var out engine.GoalStopped
-	srv := a.pool.Peek(key(convID))
-	if srv == nil || threadID == "" {
-		return out, nil
+	lease, err := a.pool.Acquire(ctx, key(convID), a.serverConfig(cwd))
+	if err != nil {
+		return out, err
 	}
-	t := srv.Info(threadID)
-	if t.Goal != nil && t.Goal.Status == codex.GoalActive {
-		g, err := srv.GoalSet(ctx, threadID, "", codex.GoalPaused)
+	defer lease.Release()
+	srv := lease.Server()
+	// Reconcile even when the observation is missing: nil is not proof of absence.
+	g, err := srv.GoalGet(ctx, threadID)
+	if err != nil && !codex.IsGoalsUnavailable(err) {
+		return out, err
+	}
+	if g != nil && g.Status == codex.GoalActive {
+		paused, err := srv.GoalSet(ctx, threadID, "", codex.GoalPaused)
 		if err != nil {
 			return out, err
 		}
-		out.Paused, out.Objective = true, g.Objective
+		if paused.Status != codex.GoalPaused {
+			return out, fmt.Errorf("goal pause was not confirmed: %s", paused.Status)
+		}
+		out.Paused, out.Objective = true, paused.Objective
 	}
-	if turn := srv.Info(threadID).Turn; turn != "" && turn != a.ownTurn(convID, srv) {
+	if turn := nativeTurn; turn != "" && srv.Info(threadID).Turn == turn && turn != a.ownTurn(convID, srv) {
+		// Subscribe before interrupting so a fast completion cannot be missed.
+		ended := make(chan struct{}, 1)
+		unsub := srv.Subscribe(threadID, func(n codex.Notification) {
+			if n.Method == "turn/completed" {
+				select {
+				case ended <- struct{}{}:
+				default:
+				}
+			}
+		})
+		defer unsub()
 		if err := srv.TurnInterrupt(ctx, threadID, turn); err != nil {
 			return out, err
+		}
+		for srv.Info(threadID).Turn == turn {
+			select {
+			case <-ended:
+			case <-ctx.Done():
+				return out, fmt.Errorf("goal paused but turn stop is unconfirmed: %w", ctx.Err())
+			}
 		}
 		out.Interrupted = true
 	}

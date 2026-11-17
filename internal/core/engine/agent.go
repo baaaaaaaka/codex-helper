@@ -3,6 +3,7 @@ package engine
 import (
 	"context"
 	"errors"
+	"github.com/baaaaaaaka/codex-helper/internal/core/goal"
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/core/store"
@@ -71,29 +72,31 @@ type GoalAgent interface {
 	// active goal on an idle thread makes Codex start working on it.
 	Goal(ctx context.Context, convID int64, threadID, cwd string, change GoalState) (GoalState, error)
 	// StopGoal is the goal part of `helper cancel`: it pauses the active
-	// goal of threadID (if the app-server of convID has it loaded) and
-	// interrupts a turn Codex runs by itself in it (a goal continuation).
-	StopGoal(ctx context.Context, convID int64, threadID string) (GoalStopped, error)
+	// goal of threadID, without resuming it, and
+	// interrupts only the selected nativeTurn (empty means no native target).
+	StopGoal(ctx context.Context, convID int64, threadID, cwd, nativeTurn string) (GoalStopped, error)
 }
 
-// ErrActiveWriter: Codex refused to load the thread because another
-// Codex process is writing to it (GoalAgent.Goal).
+// ErrGoalsUnavailable is a definitive native capability rejection.
+var ErrGoalsUnavailable = errors.New("native goals are disabled or unsupported")
+
+// ErrActiveWriter means another Codex process is writing to this thread.
 var ErrActiveWriter = errors.New("the session is open in another Codex window that is writing to it")
 
-// TurnInfo is shown with a Codex message: the objective of the active
-// goal ("" when no goal is active) and the effective model settings.
+// TurnInfo combines a native goal observation with effective model settings.
 type TurnInfo struct {
-	Goal                string
+	Goal                goal.Snapshot
+	GoalTriggered       bool // provenance of this response, never current thread state
 	Model, Effort, Tier string
 	// SelfTurn: Codex runs a turn in the thread that the helper did not
 	// start (a goal continuation).
 	SelfTurn bool
+	// NativeTurn identifies an independently running turn for targeted cancellation.
+	NativeTurn string
 }
 
 // GoalState is a thread goal (Status "" = no goal).
-type GoalState struct {
-	Objective, Status string
-}
+type GoalState = goal.State
 
 // Goal statuses the helper sets.
 const (

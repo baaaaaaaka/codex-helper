@@ -117,6 +117,10 @@ func TestCancelCommands(t *testing.T) {
 	bare, okBare := command(s, work.ID, "helper cancel", "Nothing to cancel")
 	s.Check("F-TRN-3 bare `helper cancel` with nothing to cancel explains and shows the usage",
 		okBare && strings.HasPrefix(bare, "Nothing to cancel: no request is running or queued.") && strings.Contains(bare, "helper cancel <turn-id>"), "Nothing to cancel + usage", bare)
+	s.WaitFor("both goal checks completed", steps.CommandTimeout, func() (bool, string) {
+		n := len(s.SUTMessagesContaining(work.ID, "Goal state checked: no active goal remains."))
+		return n == 2, fmt.Sprintf("confirmed checks=%d", n)
+	})
 	steps.MustPost(s, work.ID, "Next request "+next)
 	_, answered := steps.WaitAnswered(s, work.ID, next, steps.AnswerTimeout)
 	s.Settle(3*time.Second, 15*time.Second)

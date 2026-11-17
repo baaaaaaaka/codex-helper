@@ -14,11 +14,16 @@ import (
 // calls in order with the interrupts.
 type goalAgent struct {
 	*fakeAgent
-	gmu      sync.Mutex
-	goals    map[string]GoalState
-	settings TurnInfo // Model, Effort, Tier
-	selfTurn bool     // Codex runs a turn by itself (StopGoal interrupts it)
-	calls    []string
+	gmu        sync.Mutex
+	goals      map[string]GoalState
+	settings   TurnInfo // Model, Effort, Tier
+	selfTurn   bool     // Codex runs a turn by itself (StopGoal interrupts it)
+	calls      []string
+	stopHook   func(context.Context) error
+	goalHook   func(context.Context, GoalState) error
+	modelsHook func(context.Context) ([]Model, error)
+	hideGoal   bool
+	nativeTurn string
 }
 
 func newGoalAgent() *goalAgent {
@@ -45,19 +50,48 @@ func (g *goalAgent) Info(_ int64, threadID string) TurnInfo {
 	g.gmu.Lock()
 	defer g.gmu.Unlock()
 	out := g.settings
-	if s := g.goals[threadID]; s.Status == GoalActive {
-		out.Goal = s.Objective
+	out.Goal.Known = true
+	out.Goal.Observed = true
+	out.Goal.State = g.goals[threadID]
+	if g.hideGoal {
+		out.Goal.Known = false
+		out.Goal.State = GoalState{}
 	}
 	out.SelfTurn = g.selfTurn
+	if out.SelfTurn {
+		out.NativeTurn = firstNonEmpty(g.nativeTurn, "self-turn")
+	}
 	return out
 }
 
-func (g *goalAgent) Goal(_ context.Context, _ int64, threadID, _ string, change GoalState) (GoalState, error) {
+func (g *goalAgent) Models(ctx context.Context) ([]Model, error) {
+	g.gmu.Lock()
+	hook := g.modelsHook
+	g.gmu.Unlock()
+	if hook != nil {
+		return hook(ctx)
+	}
+	return g.fakeAgent.Models(ctx)
+}
+
+func (g *goalAgent) Goal(ctx context.Context, _ int64, threadID, _ string, change GoalState) (GoalState, error) {
+	g.gmu.Lock()
+	hook := g.goalHook
+	g.gmu.Unlock()
+	if hook != nil {
+		if err := hook(ctx, change); err != nil {
+			return GoalState{}, err
+		}
+	}
 	g.gmu.Lock()
 	defer g.gmu.Unlock()
 	cur := g.goals[threadID]
 	if change == (GoalState{}) {
 		g.calls = append(g.calls, "get")
+		return cur, nil
+	}
+	if change.Objective == "" && change.Status == GoalActive && cur.Status == GoalActive {
+		g.calls = append(g.calls, "activate")
 		return cur, nil
 	}
 	if change.Objective != "" {
@@ -71,7 +105,15 @@ func (g *goalAgent) Goal(_ context.Context, _ int64, threadID, _ string, change 
 	return cur, nil
 }
 
-func (g *goalAgent) StopGoal(_ context.Context, _ int64, threadID string) (GoalStopped, error) {
+func (g *goalAgent) StopGoal(ctx context.Context, _ int64, threadID, _, nativeTurn string) (GoalStopped, error) {
+	g.gmu.Lock()
+	hook := g.stopHook
+	g.gmu.Unlock()
+	if hook != nil {
+		if err := hook(ctx); err != nil {
+			return GoalStopped{}, err
+		}
+	}
 	g.gmu.Lock()
 	defer g.gmu.Unlock()
 	var out GoalStopped
@@ -80,7 +122,7 @@ func (g *goalAgent) StopGoal(_ context.Context, _ int64, threadID string) (GoalS
 		g.goals[threadID] = cur
 		out.Paused, out.Objective = true, cur.Objective
 	}
-	if g.selfTurn {
+	if g.selfTurn && nativeTurn == firstNonEmpty(g.nativeTurn, "self-turn") {
 		g.selfTurn, out.Interrupted = false, true
 	}
 	g.calls = append(g.calls, "stop")
@@ -120,7 +162,7 @@ func TestGoalAndModelLinesAndGoalCommand(t *testing.T) {
 	r.ch.PostUser(work, "first question")
 	r.wait("first answer", func() bool { return len(r.own(work, "ANSWER to first question")) == 1 })
 	ans := lastOwn(r, work, "ANSWER to first question")
-	if !strings.Contains(ans, "\n---\n🔧 Helper: model - gpt-test, effort - high, tier - fast\n🔧 Helper: ✅ Codex finished responding.") || strings.Contains(ans, "Active goal") || strings.Count(ans, "\n---\n") != 1 {
+	if !strings.Contains(ans, "\n---\n🔧 Helper: model - gpt-test, effort - high, tier - fast\n🔧 Helper: ✅ Codex finished responding.") || strings.Contains(ans, "🎯 Active goal:") || strings.Count(ans, "\n---\n") != 1 {
 		t.Fatalf("answer without a goal: %q", ans)
 	}
 
@@ -163,7 +205,7 @@ func TestGoalAndModelLinesAndGoalCommand(t *testing.T) {
 	r.wait("shown paused", func() bool { return len(r.own(work, "**Goal status:** paused")) >= 2 })
 	r.ch.PostUser(work, "third question")
 	r.wait("third answer", func() bool { return len(r.own(work, "ANSWER to third question")) == 1 })
-	if ans := lastOwn(r, work, "ANSWER to third question"); strings.Contains(ans, "Active goal") || !strings.Contains(ans, "model - gpt-test") {
+	if ans := lastOwn(r, work, "ANSWER to third question"); strings.Contains(ans, "🎯 Active goal:") || !strings.Contains(ans, "model - gpt-test") {
 		t.Fatalf("answer with a paused goal: %q", ans)
 	}
 	r.ch.PostUser(work, "/goal active")
@@ -234,7 +276,7 @@ func TestCancelPausesTheActiveGoal(t *testing.T) {
 		log := strings.Join(ga.callLog(), " | ")
 		return strings.Contains(log, "stop | interrupt")
 	})
-	if g := ga.Info(0, r.e.threadOf(convID(t, r, "s001"))); g.Goal != "" {
+	if g := ga.Info(0, r.e.threadOf(convID(t, r, "s001"))); g.Goal.Active() {
 		t.Fatalf("goal still active after the cancel: %+v", g)
 	}
 
@@ -245,7 +287,7 @@ func TestCancelPausesTheActiveGoal(t *testing.T) {
 	ga.selfTurn = true
 	ga.gmu.Unlock()
 	r.ch.PostUser(work, "helper cancel")
-	r.wait("self turn stopped", func() bool { return len(r.own(work, textCancelGoalTurn)) == 1 })
+	r.wait("self turn stopped", func() bool { return len(r.own(work, "selected native turn has stopped")) == 1 })
 	r.wait("stopped", func() bool {
 		ga.gmu.Lock()
 		defer ga.gmu.Unlock()
@@ -253,7 +295,7 @@ func TestCancelPausesTheActiveGoal(t *testing.T) {
 	})
 	// Nothing at all: the plain reply.
 	r.ch.PostUser(work, "helper cancel")
-	r.wait("nothing", func() bool { return len(r.own(work, "Nothing to cancel")) == 1 })
+	r.wait("nothing", func() bool { return len(r.own(work, "no active goal remains")) == 1 })
 }
 
 // waitIdle waits until conv has no running turn.
@@ -296,10 +338,10 @@ func TestMirroredRecordsCarryGoalAndModelLines(t *testing.T) {
 	r.wait("answer", func() bool { return len(r.own(chat, "local answer")) == 1 })
 	ans := lastOwn(r, chat, "local answer")
 	// turn_context (written by the turn) said gpt-5-codex / medium last.
-	if !strings.Contains(ans, "\n---\n🎯 Active goal: Make the build green\n🔧 Helper: model - gpt-5-codex, effort - medium, tier - flex\n🔧 Helper: ✅ Codex finished responding.") {
+	if !strings.Contains(ans, "\n---\n🎯 Last recorded goal (unconfirmed): Make the build green\n🔧 Helper: model - gpt-5-codex, effort - medium, tier - flex\n🔧 Helper: ✅ Codex finished responding.") {
 		t.Fatalf("mirrored answer: %q", ans)
 	}
-	if st := lastOwn(r, chat, "local status"); !strings.Contains(st, "\n---\n🎯 Active goal: Make the build green") || strings.Contains(st, "model - ") {
+	if st := lastOwn(r, chat, "local status"); !strings.Contains(st, "\n---\n🎯 Last recorded goal (unconfirmed): Make the build green") || strings.Contains(st, "model - ") {
 		t.Fatalf("mirrored status: %q", st)
 	}
 	if p := lastOwn(r, chat, "local prompt"); strings.Contains(p, "Active goal") {
@@ -323,7 +365,7 @@ func TestMirroredRecordsCarryGoalAndModelLines(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.wait("second answer", func() bool { return len(r.own(chat, "second answer")) == 1 })
-	if ans := lastOwn(r, chat, "second answer"); !strings.Contains(ans, "🎯 Active goal: Make the build green") || !strings.Contains(ans, "tier - flex") {
+	if ans := lastOwn(r, chat, "second answer"); !strings.Contains(ans, "🎯 Last recorded goal (unconfirmed): Make the build green") || !strings.Contains(ans, "tier - flex") {
 		t.Fatalf("after a restart: %q", ans)
 	}
 
@@ -336,7 +378,7 @@ func TestMirroredRecordsCarryGoalAndModelLines(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.wait("third answer", func() bool { return len(r.own(chat, "third answer")) == 1 })
-	if ans := lastOwn(r, chat, "third answer"); strings.Contains(ans, "Active goal") || !strings.Contains(ans, "model - gpt-5-codex") {
+	if ans := lastOwn(r, chat, "third answer"); strings.Contains(ans, "🎯 Active goal:") || !strings.Contains(ans, "model - gpt-5-codex") {
 		t.Fatalf("with the goal paused: %q", ans)
 	}
 }

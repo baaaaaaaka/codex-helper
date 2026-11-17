@@ -7,9 +7,9 @@ import (
 	"time"
 )
 
-func scheduledTurn(raw json.RawMessage, turnID string) *Schedule {
+func turnTrigger(raw json.RawMessage, turnID string) string {
 	if turnID == "" || !bytes.Contains(raw, []byte(`"turn_attribution"`)) {
-		return nil
+		return ""
 	}
 	var p struct {
 		Attribution struct {
@@ -18,9 +18,13 @@ func scheduledTurn(raw json.RawMessage, turnID string) *Schedule {
 		} `json:"turn_attribution"`
 	}
 	if json.Unmarshal(raw, &p) != nil || p.Attribution.TurnID != turnID {
-		return nil
+		return ""
 	}
-	switch p.Attribution.Trigger {
+	return p.Attribution.Trigger
+}
+
+func scheduledTrigger(trigger string) *Schedule {
+	switch trigger {
 	case "automation_cron_scheduled", "automation_cron_run_now", "automation_heartbeat_scheduled", "automation_heartbeat_run_now":
 		return &Schedule{}
 	}

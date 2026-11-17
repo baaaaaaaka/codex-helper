@@ -81,3 +81,37 @@ func TestTrackerPromptlessTurnIsDecidedAtItsFirstStatus(t *testing.T) {
 		t.Fatalf("steered local prompt: %q", got)
 	}
 }
+
+func TestGoalTriggerIsTurnEvidenceNotCurrentState(t *testing.T) {
+	p := writeLines(t,
+		`{"type":"session_meta","payload":{"id":"th","cwd":"/w"}}`+"\n",
+		`{"type":"event_msg","payload":{"type":"task_started","turn_id":"g1","turn_attribution":{"turn_id":"g1","turn_trigger":"goal"}}}`+"\n",
+		`{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"goal progress"}]}}`+"\n",
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"g1","last_agent_message":"goal answer"}}`+"\n",
+		`{"type":"event_msg","payload":{"type":"task_started","turn_id":"u2"}}`+"\n",
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"u2","last_agent_message":"ordinary answer"}}`+"\n")
+	tr := NewTracker("", 0, 0, nil)
+	out := readAll(t, p, tr)
+	if len(out) != 3 {
+		t.Fatalf("outputs %+v", out)
+	}
+	if !out[0].GoalTriggered || !out[1].GoalTriggered || out[2].GoalTriggered {
+		t.Fatalf("trigger leaked: %+v", out)
+	}
+	if tr.Info().Goal != nil {
+		t.Fatal("trigger invented authoritative goal state")
+	}
+}
+
+func TestGoalAttributionAfterTurnContext(t *testing.T) {
+	tr := NewTracker("thread", 0, 0, nil)
+	lines := scheduledLines(
+		`{"type":"turn_context","payload":{"turn_id":"g","model":"probe"}}`,
+		`{"type":"event_msg","payload":{"type":"task_started","turn_id":"g","turn_attribution":{"turn_id":"g","turn_trigger":"goal"}}}`,
+		`{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"progress"}]}}`,
+	)
+	out := tr.Feed(lines)
+	if len(out) != 1 || !out[0].GoalTriggered {
+		t.Fatalf("attribution lost: %+v", out)
+	}
+}

@@ -202,7 +202,8 @@ func (t *Tx) SetDashboardView(n *DashboardView) error {
 	return nil
 }
 
-// SourceInfo is comparable, including absent versus present empty goals.
+// SourceInfo is historical rollout metadata, including absent versus present
+// empty goal records. HasGoal does not establish the current native goal state.
 type SourceInfo struct {
 	Model         string
 	Effort        string

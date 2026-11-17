@@ -59,18 +59,19 @@ type SessionMeta struct {
 // used in mirror delivery keys; the event_msg duplicates only contribute
 // turn boundaries and the client id of a prompt.
 type Event struct {
-	Kind     Kind
-	Time     time.Time
-	TurnID   string
-	ThreadID string // item_completed thread id (a subagent's item has another)
-	RecordID string // response_item id ("msg_…"), may be empty
-	ClientID string // UserItem client_id (the turn/start clientUserMessageId)
-	Phase    string // AgentMessage phase: commentary | final_answer | ""; Compact: the record type
-	Text     string // message text; TurnComplete: last_agent_message
-	HasLast  bool   // TurnComplete carried a non-null last_agent_message
-	Meta     *SessionMeta
-	Info     *InfoUpdate // turn_context, thread_goal_updated, thread_settings_applied
-	Schedule *Schedule   // host-marked scheduled input, not inferred from text
+	GoalTriggered bool
+	Kind          Kind
+	Time          time.Time
+	TurnID        string
+	ThreadID      string // item_completed thread id (a subagent's item has another)
+	RecordID      string // response_item id ("msg_…"), may be empty
+	ClientID      string // UserItem client_id (the turn/start clientUserMessageId)
+	Phase         string // AgentMessage phase: commentary | final_answer | ""; Compact: the record type
+	Text          string // message text; TurnComplete: last_agent_message
+	HasLast       bool   // TurnComplete carried a non-null last_agent_message
+	Meta          *SessionMeta
+	Info          *InfoUpdate // turn_context, thread_goal_updated, thread_settings_applied
+	Schedule      *Schedule   // host-marked scheduled input, not inferred from text
 }
 
 // InfoUpdate is what a record says of the thread's goal and model
@@ -301,7 +302,9 @@ func Parse(line []byte) Event {
 	switch p.Type {
 	case "task_started":
 		ev.Kind = KindTurnStarted
-		ev.Schedule = scheduledTurn(env.Payload, p.TurnID)
+		trigger := turnTrigger(env.Payload, p.TurnID)
+		ev.GoalTriggered = trigger == "goal"
+		ev.Schedule = scheduledTrigger(trigger)
 	case "task_complete":
 		ev.Kind = KindTurnComplete
 		if p.LastAgentMessage != nil {

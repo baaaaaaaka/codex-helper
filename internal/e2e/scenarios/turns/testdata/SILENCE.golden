@@ -86,20 +86,24 @@
    | <p><strong>Prompt being canceled:</strong><br>
    | A task that goes silent E2E-SILENCE-silent-1</p>
    | <p>No other prompts are queued.</p>
+   | <p>Checking and stopping the goal; confirmation follows.</p>
 -- <msg:11> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Goal state checked: no active goal remains.</p>
+-- <msg:12> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Codex request canceled.</p>
--- <msg:12> owner (html)
+-- <msg:13> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Next prompt E2E-SILENCE-next-2</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
-   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:12>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:13>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>Next prompt E2E-SILENCE-next-2</p>
--- <msg:13> helper (html)
+-- <msg:14> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-SILENCE-next-2</p>
    | <hr/>

@@ -1086,7 +1086,9 @@ func (s *server) goal(method, threadID string, p map[string]any) (any, *rpcError
 	_, loaded := s.loaded[threadID]
 	s.mu.Unlock()
 	if !loaded {
-		return nil, invalid("thread not found: %s", threadID)
+		if _, err := s.cfg.Store.Load(threadID); err != nil {
+			return nil, invalid("thread not found: %s", threadID)
+		}
 	}
 	now := time.Now().Unix()
 	s.mu.Lock()

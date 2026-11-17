@@ -118,134 +118,143 @@ func (e *Engine) cmdCancel(ctx context.Context, j cmdJob, cs *convState, arg str
 	// The goal (goalcmds.go): a cancel that interrupts the running turn,
 	// or finds nothing of the helper's to cancel, pauses an active goal
 	// and stops the turn Codex runs by itself for it.
-	info := e.turnInfo(cs.id)
+	_, hasGoals := e.ag.(GoalAgent)
 	goalReply := func(text string) string {
-		if !interrupt || info.Goal == "" {
-			return text
+		if interrupt && hasGoals && e.threadOf(cs.id) != "" {
+			stopGoal = true
+			return text + "\n\nChecking and stopping the goal; confirmation follows."
 		}
-		stopGoal = true
-		return text + "\n\n" + textCancelGoal
+		return text
 	}
 	nothing := func(text string) string {
-		if info.Goal == "" && !info.SelfTurn {
-			return text
+		if hasGoals && e.threadOf(cs.id) != "" {
+			stopGoal = true
+			return text + "\n\nChecking and stopping the goal; confirmation follows."
 		}
-		stopGoal = true
-		if info.SelfTurn {
-			return textCancelGoalTurn
-		}
-		return textCancelGoalOnly
+		return text
 	}
+	var intent store.GoalControl
 	err := e.replyIn(j, func(tx *store.Tx) (string, error) {
-		interrupt, stopGoal = false, false
-		e.mu.Lock()
-		var runningID int64
-		if cs.running != nil {
-			runningID = cs.running.turnID
-		}
-		cancelID = runningID
-		e.mu.Unlock()
-		sw, switching, x := tx.ModelSwitch(cs.id)
-		if x != nil {
-			return "", x
-		}
-		if runningID == 0 && switching {
-			runningID = sw.SourceTurn
-			if sw.Continuation != 0 {
-				runningID = sw.Continuation
+		selectTarget := func() (string, error) {
+			interrupt, stopGoal = false, false
+			e.mu.Lock()
+			var runningID int64
+			if cs.running != nil {
+				runningID = cs.running.turnID
 			}
-		}
-		open, err := tx.OpenTurnsOf(cs.id)
-		if err != nil {
-			return "", err
-		}
-		if runningID == 0 {
-			for _, tr := range open {
-				if tr.ResumeFrom != 0 || tr.State == store.TurnStarting || tr.State == store.TurnRunning {
-					runningID = tr.ID
-					break
-				}
-			}
-		}
-		var queued []store.Turn
-		var running *store.Turn
-		for i := range open {
-			switch {
-			case open[i].ID == runningID:
-				running = &open[i]
-			case open[i].State == store.TurnQueued && open[i].ResumeFrom == 0:
-				queued = append(queued, open[i])
-			}
-		}
-		if running == nil && switching && runningID != 0 {
-			tr, found, x := tx.Turn(runningID)
+			cancelID = runningID
+			e.mu.Unlock()
+			sw, switching, x := tx.ModelSwitch(cs.id)
 			if x != nil {
 				return "", x
 			}
-			if found {
-				running = &tr
+			if runningID == 0 && switching {
+				runningID = sw.SourceTurn
+				if sw.Continuation != 0 {
+					runningID = sw.Continuation
+				}
 			}
-		}
-		newestQueued := func() *store.Turn {
-			if len(queued) == 0 {
-				return nil
-			}
-			return &queued[len(queued)-1]
-		}
-		var target *store.Turn
-		switch sel {
-		case "all":
-			if len(queued) == 0 && running == nil {
-				return nothing(textCancelNone), nil
-			}
-			text, err := e.cancelAll(tx, queued, running, &interrupt)
-			return goalReply(text), err
-		case "", "last":
-			if target = newestQueued(); target == nil {
-				target = running
-			}
-			if target == nil && sel == "" {
-				return nothing("Nothing to cancel: no request is running or queued.\n\n" + textCancelUsage), nil
-			}
-			if target == nil {
-				return nothing(textCancelNone), nil
-			}
-		case "queued":
-			if target = newestQueued(); target == nil {
-				return textCancelNoQueued, nil
-			}
-		case "running":
-			if target = running; target == nil {
-				return nothing(textCancelNoRunning), nil
-			}
-		default:
-			id, ok := parseTurnRef(sel)
-			if !ok {
-				return "turn not found in this session: " + strings.TrimSpace(arg), nil
-			}
-			tr, found, err := tx.Turn(id)
+			open, err := tx.OpenTurnsOf(cs.id)
 			if err != nil {
 				return "", err
 			}
-			if !found || tr.ConvID != cs.id {
-				return "turn not found in this session: " + strings.TrimSpace(arg), nil
+			if runningID == 0 {
+				for _, tr := range open {
+					if tr.ResumeFrom != 0 || tr.State == store.TurnStarting || tr.State == store.TurnRunning {
+						runningID = tr.ID
+						break
+					}
+				}
 			}
-			switch {
-			case running != nil && tr.ID == running.ID:
-				target = running
-			case tr.State == store.TurnQueued:
-				target = &tr
+			var queued []store.Turn
+			var running *store.Turn
+			for i := range open {
+				switch {
+				case open[i].ID == runningID:
+					running = &open[i]
+				case open[i].State == store.TurnQueued && open[i].ResumeFrom == 0:
+					queued = append(queued, open[i])
+				}
+			}
+			if running == nil && switching && runningID != 0 {
+				tr, found, x := tx.Turn(runningID)
+				if x != nil {
+					return "", x
+				}
+				if found {
+					running = &tr
+				}
+			}
+			newestQueued := func() *store.Turn {
+				if len(queued) == 0 {
+					return nil
+				}
+				return &queued[len(queued)-1]
+			}
+			var target *store.Turn
+			switch sel {
+			case "all":
+				if len(queued) == 0 && running == nil {
+					return nothing(textCancelNone), nil
+				}
+				text, err := e.cancelAll(tx, queued, running, &interrupt)
+				return goalReply(text), err
+			case "", "last":
+				if target = newestQueued(); target == nil {
+					target = running
+				}
+				if target == nil && sel == "" {
+					return nothing("Nothing to cancel: no request is running or queued.\n\n" + textCancelUsage), nil
+				}
+				if target == nil {
+					return nothing(textCancelNone), nil
+				}
+			case "queued":
+				if target = newestQueued(); target == nil {
+					return textCancelNoQueued, nil
+				}
+			case "running":
+				if target = running; target == nil {
+					return nothing(textCancelNoRunning), nil
+				}
 			default:
-				return fmt.Sprintf("turn %s is %s and cannot be canceled.", turnRef(tr.ID), turnStateText(tr.State)), nil
+				id, ok := parseTurnRef(sel)
+				if !ok {
+					return "turn not found in this session: " + strings.TrimSpace(arg), nil
+				}
+				tr, found, err := tx.Turn(id)
+				if err != nil {
+					return "", err
+				}
+				if !found || tr.ConvID != cs.id {
+					return "turn not found in this session: " + strings.TrimSpace(arg), nil
+				}
+				switch {
+				case running != nil && tr.ID == running.ID:
+					target = running
+				case tr.State == store.TurnQueued:
+					target = &tr
+				default:
+					return fmt.Sprintf("turn %s is %s and cannot be canceled.", turnRef(tr.ID), turnStateText(tr.State)), nil
+				}
 			}
+			text, err := e.cancelOne(tx, cs, *target, running != nil && target.ID == running.ID, queued, &interrupt)
+			return goalReply(text), err
 		}
-		text, err := e.cancelOne(tx, cs, *target, running != nil && target.ID == running.ID, queued, &interrupt)
-		return goalReply(text), err
+		text, err := selectTarget()
+		if err == nil && stopGoal {
+			nativeTurn := e.turnInfo(cs.id).NativeTurn
+			e.mu.Lock()
+			intent = store.GoalControl{Conv: cs.id, Inbound: j.inbound, Thread: cs.threadID, Cwd: cs.cwd, Turn: cancelID, NativeTurn: nativeTurn, Pending: true}
+			e.mu.Unlock()
+			err = tx.SetGoalControl(intent)
+		}
+		return text, err
 	})
 	if err == nil && stopGoal {
-		e.stopGoal(ctx, cs) // before the interrupt: its end must not restart the goal
+		e.finishGoalStop(ctx, intent)
 	}
-	if err == nil && interrupt {
+	if err == nil && interrupt && !stopGoal {
 		e.cancelRunningFor(ctx, cs.id, cancelID)
 	}
 	e.wakeRunner(cs.id)

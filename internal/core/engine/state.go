@@ -43,6 +43,8 @@ const (
 // Engine.mu and is a cache of the store plus scheduling data that is never
 // persisted.
 type convState struct {
+	// Serializes only native goal mutations, never slow model/fork commands.
+	goalMu                               sync.Mutex
 	id                                   int64
 	label, kind, state, chat, url, title string
 	paused, group                        bool

@@ -1260,21 +1260,23 @@ func (e *Engine) renderMirrorMode(ctx context.Context, thread string, o transcri
 	}
 	doc = scheduledDoc(doc, o)
 	if live && !o.User && o.Kind != transcript.OutputPrompt {
-		doc.Notes = infoNotes(mirrorInfo(o.Info), o.Kind == transcript.OutputFinal)
-		// Helper-owned progress keeps the runner's live goal annotation.
-		// Goal changes can arrive through the native API before rollout metadata.
-		owned := false
-		if e.mirror != nil {
-			e.mirror.mu.Lock()
-			owned = e.mirror.progressTurns[o.TurnID] != 0
-			e.mirror.mu.Unlock()
+		info := mirrorInfo(o.Info)
+		e.mu.Lock()
+		conv := e.byThread[thread]
+		e.mu.Unlock()
+		// The current native snapshot owns live goal labels for every message,
+		// regardless of which client started its turn. Logs remain historical.
+		native := e.turnInfo(conv)
+		if native.Goal.Observed {
+			if native.Goal.Known || native.Goal.Objective != "" {
+				info.Goal = native.Goal
+			} else {
+				info.Goal.Known = false
+				info.Goal.Observed = true
+			}
 		}
-		if owned && (o.Kind == transcript.OutputStatus || o.Kind == transcript.OutputCompact) {
-			e.mu.Lock()
-			conv := e.byThread[thread]
-			e.mu.Unlock()
-			doc.Notes = infoNotes(e.turnInfo(conv), false)
-		}
+		info.GoalTriggered = o.GoalTriggered
+		doc.Notes = infoNotes(info, o.Kind == transcript.OutputFinal)
 	}
 	parts, err := e.ch.Render(ctx, doc)
 	if err != nil {
@@ -1307,8 +1309,8 @@ func (e *Engine) renderMirrorMode(ctx context.Context, thread string, o transcri
 // mirrorInfo is the TurnInfo of a mirrored record.
 func mirrorInfo(i transcript.Info) TurnInfo {
 	out := TurnInfo{Model: i.Model, Effort: i.Effort, Tier: i.Tier}
-	if i.Goal != nil && i.Goal.Status == GoalActive {
-		out.Goal = i.Goal.Objective
+	if i.Goal != nil {
+		out.Goal.State = GoalState{Objective: i.Goal.Objective, Status: i.Goal.Status}
 	}
 	return out
 }

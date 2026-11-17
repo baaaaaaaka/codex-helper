@@ -25,7 +25,10 @@ CGO_ENABLED=0 go build -o "$contract_scratch/cxp" ./cmd/codex-proxy
 "$contract_scratch/probe" -test.list '^TestRealCodexAAASharedTUI$' | grep -qx TestRealCodexAAASharedTUI
 "$contract_scratch/probe" -test.list '^TestRealCodexGatewayRecoveryTUI$' | grep -qx TestRealCodexGatewayRecoveryTUI
 "$contract_scratch/agent" -test.list '^TestRealCodexSharedTUIThreadBinding$' | grep -qx TestRealCodexSharedTUIThreadBinding
-for critical_test in TestRealCodexSharedModelSwitch TestRealCodexSharedSwitchInputBoundary; do
+for critical_test in TestRealCodexGoalDisabledStop TestRealCodexGoalReadDoesNotLoadExecution; do
+ "$contract_scratch/agent" -test.list "^${critical_test}$" | grep -qx "$critical_test"
+done
+for critical_test in TestRealCodexSharedModelSwitch TestRealCodexSharedSwitchInputBoundary TestRealCodexGoalReadWithoutResume; do
  "$contract_scratch/client" -test.list "^${critical_test}$" | grep -qx "$critical_test"
 done
 for contract_suite in probe client agent; do
@@ -36,11 +39,17 @@ for contract_suite in probe client agent; do
   -w /work \
   "${CXP_CONTRACT_IMAGE:-golang:1.25.11-bookworm}" \
   "/contracts/$contract_suite" -test.v -test.count=3 -test.timeout=180s \
-  -test.run 'TestRealCodex(Shared|NativeQueue|Title)' | tee "$contract_scratch/$contract_suite.log"
+  -test.run 'TestRealCodex(Shared|NativeQueue|Title|Goal)' | tee "$contract_scratch/$contract_suite.log"
 done
-for critical_test in TestRealCodexSharedModelSwitch TestRealCodexSharedSwitchInputBoundary; do
+for critical_test in TestRealCodexSharedModelSwitch TestRealCodexSharedSwitchInputBoundary TestRealCodexGoalReadWithoutResume; do
  if ! grep -Eq "^--- PASS: ${critical_test}( |$)" "$contract_scratch/client.log"; then
-  echo "Model switch contract did not pass or was skipped: $critical_test" >&2
+  echo "Native contract did not pass or was skipped: $critical_test" >&2
+  exit 1
+ fi
+done
+for critical_test in TestRealCodexGoalDisabledStop TestRealCodexGoalReadDoesNotLoadExecution; do
+ if ! grep -Eq "^--- PASS: ${critical_test}( |$)" "$contract_scratch/agent.log"; then
+  echo "Goal adapter contract did not pass or was skipped: $critical_test" >&2
   exit 1
  fi
 done

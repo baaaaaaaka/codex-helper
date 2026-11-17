@@ -16,7 +16,7 @@ import (
 // hotFiles hold the runtime API. Every SQL statement in them is checked.
 // vacuum.go (maintenance) and import.go (one-shot converter) are not hot
 // paths.
-var hotFiles = []string{"store.go", "owner.go", "conversations.go", "receive.go", "turns.go", "outbox.go", "engine_api.go", "batch.go", "held_progress.go", "transcripts.go", "notifications.go", "engine_rows.go", "engine_collections.go", "delegated_threads.go", "attachments.go", "model_switch.go"}
+var hotFiles = []string{"store.go", "owner.go", "conversations.go", "receive.go", "turns.go", "outbox.go", "engine_api.go", "batch.go", "held_progress.go", "transcripts.go", "notifications.go", "engine_rows.go", "engine_collections.go", "delegated_threads.go", "attachments.go", "model_switch.go", "goal_controls.go"}
 
 // fragmentCompletions are representative full statements for SQL that the
 // code assembles from fragments (convUpdate, turnMove, outMove).
@@ -135,8 +135,8 @@ func evalStr(e ast.Expr, consts map[string]string) (string, bool) {
 // not by history. outbox_legacy_hash holds only imported rows not yet
 // re-hashed, and is empty after the first start.
 var (
-	hotTables    = regexp.MustCompile(`^SCAN (inbound|outbox|turns|transcript_sources)\b`)
-	partialIndex = regexp.MustCompile(`USING (COVERING )?INDEX (outbox_active|outbox_pending|turns_open|inbound_open|outbox_legacy_hash)\b`)
+	hotTables    = regexp.MustCompile(`^SCAN (inbound|outbox|turns|transcript_sources|goal_controls)\b`)
+	partialIndex = regexp.MustCompile(`USING (COVERING )?INDEX (outbox_active|outbox_pending|turns_open|inbound_open|outbox_legacy_hash|goal_controls_pending)\b`)
 )
 
 // TestHotQueriesUseIndexes runs EXPLAIN QUERY PLAN on every SQL statement of

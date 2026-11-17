@@ -91,6 +91,7 @@ type Server struct {
 	questionBackendID uint64
 	nextID            int64
 	pending           map[int64]chan rpcResult
+	goalRPCs          map[int64]goalRPC
 	subs              map[string]map[int]func(Notification)
 	threads           map[string]*ThreadInfo // threadstate.go
 	subSeq            int
@@ -281,10 +282,25 @@ func (s *Server) Call(ctx context.Context, method string, params, out any) error
 	s.nextID++
 	id := s.nextID
 	s.pending[id] = ch
+	if r, ok := goalRequest(method, raw); ok {
+		if s.goalRPCs == nil {
+			s.goalRPCs = map[int64]goalRPC{}
+		}
+		t := s.threadLocked(r.Thread)
+		t.goalRevision++
+		r.Revision = t.goalRevision
+		s.goalRPCs[id] = r
+	}
 	s.mu.Unlock()
 	drop := func() {
 		s.mu.Lock()
 		delete(s.pending, id)
+		if r, ok := s.goalRPCs[id]; ok {
+			if t := s.threadLocked(r.Thread); t.goalRevision == r.Revision {
+				t.GoalKnown = false
+			}
+			delete(s.goalRPCs, id)
+		}
 		s.mu.Unlock()
 	}
 	if err := s.write(wireMsg{ID: json.RawMessage(fmt.Sprint(id)), Method: method, Params: raw}); err != nil {
@@ -380,6 +396,7 @@ func (s *Server) readLoop(out io.Reader) {
 	s.exitErr = werr
 	pend := s.pending
 	s.pending = map[int64]chan rpcResult{}
+	s.goalRPCs = nil
 	s.mu.Unlock()
 	for _, ch := range pend {
 		ch <- rpcResult{err: ErrExited}
@@ -451,6 +468,10 @@ func (s *Server) handleLine(line []byte) {
 		s.mu.Lock()
 		ch := s.pending[id]
 		delete(s.pending, id)
+		if r, ok := s.goalRPCs[id]; ok {
+			s.goalResult(r, m.Result, m.Error)
+			delete(s.goalRPCs, id)
+		}
 		s.mu.Unlock()
 		if ch == nil {
 			return
@@ -562,6 +583,7 @@ func (s *Server) failPending() {
 	s.exitErr = ErrExited
 	pend := s.pending
 	s.pending = map[int64]chan rpcResult{}
+	s.goalRPCs = nil
 	s.mu.Unlock()
 	for _, ch := range pend {
 		ch <- rpcResult{err: ErrExited}

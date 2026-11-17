@@ -172,31 +172,39 @@
    | <ol><li>Running job E2E-CANCELCMDS-run-1</li>
    | </ol>
    | <p>No queued prompts remain.</p>
+   | <p>Checking and stopping the goal; confirmation follows.</p>
 -- <msg:21> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Goal state checked: no active goal remains.</p>
+-- <msg:22> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Codex request canceled.</p>
--- <msg:22> owner (html)
+-- <msg:23> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>helper cancel</p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>helper cancel</p>
--- <msg:23> helper (html)
+-- <msg:24> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
    | <p>Nothing to cancel: no request is running or queued.</p>
    | <p>usage: <code>helper cancel last</code>, <code>helper cancel queued</code>, <code>helper cancel running</code>, <code>helper cancel all</code>, <code>helper cancel &lt;turn-id&gt;</code>, or <code>!cancel &lt;turn-id&gt;</code></p>
    | <p>These commands apply to this Work chat.</p>
--- <msg:24> owner (html)
+   | <p>Checking and stopping the goal; confirmation follows.</p>
+-- <msg:25> helper (html)
+   | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
+   | <p>Goal state checked: no active goal remains.</p>
+-- <msg:26> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Next request E2E-CANCELCMDS-next-5</p>
    | <hr/>
    | <p><strong>🔧 Helper:</strong></p>
    | <p>⏳ Codex is working. Request accepted.</p>
-   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:24>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
+   | <p>Received at <a href="https://teams.microsoft.com/l/message/<chat:2>/<msg:26>?context=%7B%22contextType%22%3A%22chat%22%7D"><event-time></a></p>
    edited 1 time(s); earlier versions:
    [version 1]
    | <p>Next request E2E-CANCELCMDS-next-5</p>
--- <msg:25> helper (html)
+-- <msg:27> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🤖 ✅ Codex answer:</strong></p>
    | <p>E2EANSWER-<n> answer for E2E-CANCELCMDS-next-5</p>
    | <hr/>
