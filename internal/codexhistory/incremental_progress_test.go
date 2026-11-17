@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -349,7 +350,7 @@ func TestNamesUnchangedPartialTailDoesNotWriteOnReopen(t *testing.T) {
 	}
 }
 
-func TestPreviewSourceReplacedDuringParseDoesNotPublishCheckpoint(t *testing.T) {
+func TestPreviewSourceChangedDuringParseDoesNotPublishCheckpoint(t *testing.T) {
 	lockCodexHistoryTestHooks(t)
 	setTestUserCacheDir(t)
 	path, store := newSessionPreviewCachedFile(t, previewRecord(0)+"\n")
@@ -362,6 +363,14 @@ func TestPreviewSourceReplacedDuringParseDoesNotPublishCheckpoint(t *testing.T) 
 	t.Cleanup(func() { sessionMessagesWindowReadHook = old })
 	sessionMessagesWindowReadHook = func(int64, int64) {
 		sessionMessagesWindowReadHook = nil
+		if runtime.GOOS == "windows" {
+			// An open source file cannot be replaced on Windows. Truncating it
+			// still exercises a changed snapshot during the active read.
+			if err := os.WriteFile(path, []byte(previewRecord(9)+"\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			return
+		}
 		replacement := path + ".replacement"
 		if err := os.WriteFile(replacement, []byte(previewRecord(9)+"\n"), 0600); err != nil {
 			t.Fatal(err)
