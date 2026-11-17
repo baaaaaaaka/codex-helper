@@ -147,3 +147,5 @@ CI 覆盖：普通测试由 `ci.yml` 的 `unit-linux` 及跨平台 unit job 收�
 发布前补充：在隔离 Docker 使用 `go test -p 4 ./... -count=1 -timeout=600s -parallel=4` 运行全仓，core engine/store 及 turns E2E 通过；命令 E2E 的 `TestEffortCommands` 因临时路径长度使控制上下文在 “These settings” 中途截断，原 golden 掩码只接受完整行而失败。场景内的实际命令回复和 effort 断言全部通过。已将该掩码限定为接受这一行的截断版本，未改变产品行为或移除回复断言；隔离 Docker 中单独重跑该场景通过。
 
 修正后实际运行 `bash scripts/ci/run_e2e_shard.sh 0` 通过；容器使用 `GOFLAGS=-p=2 GOMAXPROCS=2` 以适应 PID 配额。第一次运行该分片时默认编译并行度触发 `resource temporarily unavailable`，调整容器编译并行度后通过；与功能测试失败分开记录。
+
+提交后的主分支 CI：E2E shard 2 的 `TestStatusWhileTheHelperRunsAndWithout` 在启动状态已有版本、但仍有一条通知排队时提前断言队列为空。该场景后来确认队列正常清空；已让等待条件包含队列清空和版本非空，保留原断言。隔离 Docker 中 `go test ./internal/e2e/scenarios/entry -run '^TestStatusWhileTheHelperRunsAndWithout$' -count=3 -timeout=180s` 通过。没有更改生产代码。

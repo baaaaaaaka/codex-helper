@@ -41,9 +41,10 @@ func TestStatusWhileTheHelperRunsAndWithout(t *testing.T) {
 	var out string
 	s.Poll(30*time.Second, func() bool {
 		out = run("teams", "status").Stdout
-		// The helper publishes its running version shortly after it starts.
+		// Startup can still have a queued notice after the version is published.
 		return statusLine(out, "Sessions:") == "Sessions: 0 (0 active, 0 parked)" &&
-			statusLine(out, "Running version:") != "Running version: unknown"
+			statusLine(out, "Running version:") != "" && statusLine(out, "Running version:") != "Running version: unknown" &&
+			statusLine(out, "Unsent messages:") == "Unsent messages: 0 queued, 0 sending, 0 unconfirmed"
 	})
 	s.Check("status while the helper runs shows its state in full",
 		strings.Contains(statusLine(out, "Owner:"), "(live)") && statusLine(out, "Store details:") == "" &&
