@@ -1,5 +1,9 @@
 # Teams native scheduled-task adaptation — validation
 
+The presentation described in the original validation below is superseded by
+[the event-only presentation](#event-only-presentation-2026-11-17). The original
+record is retained as release history.
+
 ## Integration candidate
 
 The original worktree below was integrated with upstream main at
@@ -271,3 +275,174 @@ the foreground-waiter check did not make the chat-creation integration test
 fail in one trial; the controlled test, not that timing-dependent trial, is
 the evidence for the exact next-token guarantee. Native macOS behavior requires
 the PR CI run.
+
+## Event-only presentation (2026-11-17)
+
+### Behavior and boundaries
+
+Native timing evidence now changes only event messages. Each observed wait
+starts with `🕒 Wait started` and its requested maximum duration. It closes
+with `🕒 Wait ended` only after a matching native completion. The end message
+does not claim expiry or interruption: the item event does not establish the
+cause. New input can end a wait early. A deadline passing alone never creates
+an end or trigger message. Ordinary final answers and owner notifications keep
+`🤖 ✅ Codex answer` and `✅ Codex finished`, including after multiple waits.
+
+A scheduled input is shown once as `🕒 Scheduled task started`, with its native
+ID when available and its instruction body. This wording covers automatic and
+manual native runs without claiming that an execution was due at a particular
+time. Human additions, progress, compaction, and final answers retain ordinary
+labels and completion footers. Heartbeat envelopes remain hidden; user text
+and instructions keep their original language. All helper-authored text is
+English. Trigger receipts reuse the input record's delivery key and source
+checkpoint, so history replay introduces no new live notification.
+
+CXP still does not create or manage schedules. No recurrence, time zone,
+next-run, persistence, or cancellation claim is inferred from sleep or trigger
+metadata. Plan-creation messages remain deferred until a verified native
+management interface supplies successful creation results and exact rules.
+Cancel, silence recovery, output ownership, and ambiguous-delivery fallback
+retain their existing contracts. Old persisted `wait` and `scheduled`
+notifications remain readable and use ordinary completion headings.
+
+### Ordering, persistence, and cost audit
+
+Wait events use the existing per-run silence lock and FIFO outbox. Their
+stable keys include the local turn ID, native item ID, and start/end phase.
+An indexed outbox insert rejects old starts before they can replace current
+wait state; no growing in-memory ID set or timer registry is added. Duplicate
+matching callbacks create no extra rows. A completion received before its
+start is remembered without fabricating either event message. Cancelled,
+superseded, unrelated, and invalid callbacks retain their existing guards.
+
+Each distinct observed wait adds at most two bounded event messages through
+the existing SQLite transaction and sender. This replaces the former single
+receipt per execution; output and retained rows therefore grow linearly with
+actual waits. Unchanged or duplicate input does not rewrite existing rows.
+There is no extra poller, history scan, JSON rewrite, schema migration, or
+per-token work. The rendering runs outside the store transaction. Scheduled
+input rendering replaces its old heading and adds no messages or writes.
+
+### Validation
+
+The implementation is on `investigate/timer-answer-title`, fast-forwarded from
+installed revision `5f695da4` to the local `origin/main` snapshot `ecd719f9`.
+Engine tests use an in-memory channel, fake agent, private
+SQLite stores and validated per-session scratch; they do not operate the
+installed helper. `TestScheduled*` is selected by the existing unit and
+`race-core` CI jobs. Release reuses CI and the nightly workflow. No CI selection
+change is needed for these existing tests.
+
+Regression coverage includes ordinary final labels after waits, ordinary
+Workflow and mention fallback notifications, repeated waits, stale callback
+replay after a newer wait, completion before start, invalid evidence, expiry
+without a fabricated end, silence ordering, cron and heartbeat instructions,
+manual additions, and restart catch-up without duplicate live notifications.
+Chinese fixture text tests preservation of user content, not helper wording.
+The former expectations for special result headings are intentionally replaced;
+the previous implementation fails the ordinary-heading assertions and the
+new per-wait event assertions.
+
+Live Teams transport, native hosted scheduling, OS-native lifecycle recovery,
+and remote CI were not exercised by this local presentation change. The change
+does not alter the native event parser or process lifecycle.
+
+Local checks (2026-11-17):
+
+- `go test ./internal/core/engine -run '^TestScheduled' -count=1`: passed.
+- `go test -race ./internal/core/engine -run '^TestScheduled' -count=1`:
+  passed before the final extra multiple-wait and expiry assertions. The full
+  engine race gate below covers those final assertions.
+- `go test -race ./internal/core/engine -count=1 -timeout=10m`: passed
+  on the final source and tests (241.233 seconds).
+- `go vet ./internal/core/engine`: passed.
+- `GOOS=windows GOARCH=amd64 go test -c -o <scratch>/engine.test.exe
+  ./internal/core/engine`: passed (cross-compilation, not native execution).
+
+Commands used `GOTMPDIR=/home/baka/.local/state/title-investigation.KxCfUk`.
+The real helper process and installed runtime were not changed.
+
+### Follow-up: remove obsolete schedule propagation
+
+After the event-only presentation change, repository-wide reference inspection
+confirmed that `Schedule.Mixed`, `openTurn.humanInput`, and the copied scheduling
+metadata on assistant outputs no longer had a runtime consumer. They existed
+only to generate the old result/status headings. They are now removed.
+`Schedule.Input` is also removed: a non-nil `Output.Schedule` now describes only
+the native scheduled input itself. Cron attribution retains one per-turn boolean
+so the initial input is recognized. Heartbeat instructions stay attached to
+their own input record; additional human input, progress, compaction, and finals
+carry no schedule metadata. No persisted format, delivery key, source offset,
+or checkpoint contract changes.
+
+The legacy `wait` and `scheduled` notification kinds are intentionally retained:
+older releases can leave these rows pending across an upgrade. The new
+`TestScheduledLegacyPendingNotificationsStillDeliver` exercises both kinds via
+Workflow delivery and ambiguous-delivery mention fallback, using ordinary
+completion headings. Wait IDs, deadlines, early sleep buffering, provenance
+validation, and native hooks remain in use and are not dead code.
+
+Regression assertions now check input-only provenance, human additions,
+multiple buffered heartbeat instruction bodies, cron's initial input, progress
+and compaction, final record identity, and deterministic replay. The renamed
+tracker tests retain the `TestScheduled` prefix; unit and race-core CI collect
+all of them without a workflow change.
+
+Cost audit: the tracker no longer allocates and copies a `Schedule` for every
+assistant output. It keeps one boolean for initial cron input and does not add
+I/O, scans, caches, or persistence writes. The existing history benchmark now
+also covers native scheduled attribution with 1,000 progress messages. Against
+baseline `ecd719f9`, three local samples using the same benchmark fixture gave:
+
+| Fixture | Before allocations/op | After allocations/op | Before bytes/op (median) | After bytes/op (median) |
+| --- | --- | --- | --- | --- |
+| Ordinary history | 29908 | 29908 | 1878817 | 1878819 |
+| Scheduled history | 30921 | 29920 | 1927419 | 1879333 |
+
+Scheduled-history median time was 3.234 ms before and 3.077 ms after. Ordinary
+history was 3.090 ms before and 3.131 ms after. Three samples are enough to
+check allocation removal, not to claim a general latency improvement.
+
+Follow-up validation uses the same isolated scratch and in-process test setup:
+
+- `go test ./internal/core/transcript -count=1`: passed.
+- `go test -race ./internal/core/transcript ./internal/core/engine -run
+  '^TestScheduled' -count=1`: passed, including legacy notification delivery.
+- `go test -race ./internal/core/transcript ./internal/core/engine -count=1
+  -timeout=10m`: passed on the final cleanup tree (transcript 2.576 seconds;
+  engine 238.155 seconds).
+- `GOOS=windows GOARCH=amd64 go test -c -o <scratch>/cleanup-engine.test.exe
+  ./internal/core/engine`: passed (cross-compilation only).
+- `go vet ./internal/core/transcript ./internal/core/engine`: passed.
+- Before/after benchmark: `go test ./internal/core/transcript -run '^$' -bench
+  '^BenchmarkTracker(Scheduled)?ProgressHistory$' -benchmem -count=3`: passed.
+
+The real helper and native scheduling configuration remain untouched.
+
+### Upstream integration before prerelease
+
+The candidate is based on upstream `4a71306a`. The transcript merge retains
+upstream goal-trigger evidence independently from the scheduled input. A new
+regression test covers a native heartbeat steered into a goal-triggered turn.
+
+A failed wait-start render or outbox insert must not suppress the actual wait
+state and its silence policy. The run retains the wait even if its receipt
+cannot be recorded; it emits an end event only when a start was recorded. A
+fault-injection test exercises this path. No automatic retry or new persistent
+state is introduced. Legacy pending notification kinds remain compatible.
+
+The focused race run for `TestScheduled` and `TestGoalTrigger` passed on the
+integrated tree. `go vet` passed for transcript and engine. Local Docker
+lifecycle validation was unavailable: `/usr/bin/docker` points into an
+unavailable Docker Desktop mount and `/var/run/docker.sock` is absent. The
+existing GitHub CI and release workflows must run the isolated E2E and native
+platform gates before this prerelease can be accepted.
+
+The integrated-tree `go test -race ./internal/core/transcript
+./internal/core/engine -count=1 -timeout=15m` passed (2.668 s and 245.100 s).
+After that run, the wait replay test gained a direct outbox row-count assertion;
+its focused race run passed with two waits producing four rows and duplicate
+callbacks adding none. The assertion reads through the store's existing
+read-only transaction. A first test draft opened a second SQLite connection and
+failed with `SQLITE_BUSY`; switching to the store's read pool resolved that
+test setup error. The runtime source did not change after the full race run.

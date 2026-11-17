@@ -90,7 +90,7 @@ func TestScheduledAttributionFailsOpen(t *testing.T) {
 	}
 }
 
-func TestScheduledTrackerScopedMixedAndReplay(t *testing.T) {
+func TestScheduledTrackerInputOnlyAndReplay(t *testing.T) {
 	start := `{"type":"event_msg","payload":{"type":"task_started","turn_id":"t"}}`
 	ack := `{"type":"event_msg","payload":{"type":"item_completed","turn_id":"t","item":{"type":"UserMessage","client_id":"local"}}}`
 	answer := `{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","id":"answer","content":[{"type":"output_text","text":"结果"}]}}`
@@ -106,7 +106,7 @@ func TestScheduledTrackerScopedMixedAndReplay(t *testing.T) {
 	if len(out) != 4 {
 		t.Fatalf("outputs %+v", out)
 	}
-	if out[0].Schedule == nil || out[1].Schedule == nil || out[1].Schedule.Mixed || !out[0].Schedule.Input || out[0].Text != strings.TrimSpace(testHeartbeat) {
+	if out[0].Schedule == nil || out[1].Schedule != nil || out[0].Text != strings.TrimSpace(testHeartbeat) {
 		t.Fatalf("scheduled outputs %+v", out[:2])
 	}
 	if out[2].Schedule != nil || out[3].Schedule != nil {
@@ -141,15 +141,15 @@ func TestScheduledTrackerScopedMixedAndReplay(t *testing.T) {
 	mixed.StableFallbackIDs()
 	ml := scheduledLines(start, scheduledUser(testHeartbeat, map[string]any{"content_item_kinds": []string{"user.heartbeat"}}), ack, scheduledUser("先别改代码", nil), ack, answer, end)
 	mo := mixed.Feed(ml)
-	if len(mo) != 3 || !mo[2].Schedule.Mixed || mo[1].Schedule.Input || mo[1].Text != "先别改代码" {
+	if len(mo) != 3 || mo[0].Schedule == nil || mo[2].Schedule != nil || mo[1].Schedule != nil || mo[1].Text != "先别改代码" {
 		t.Fatalf("mixed outputs %+v", mo)
 	}
 }
 
-func TestScheduledCronInitialPromptIsNotMixed(t *testing.T) {
+func TestScheduledCronAttributionAppliesOnlyToInitialPrompt(t *testing.T) {
 	tr := NewTracker("th", 0, 0, nil)
 	out := tr.Feed(scheduledLines(`{"type":"event_msg","payload":{"type":"task_started","turn_id":"t","turn_attribution":{"turn_id":"t","turn_trigger":"automation_cron_scheduled"}}}`, `{"type":"turn_context","payload":{"turn_id":"t","model":"model"}}`, scheduledUser("Check the PR", nil), `{"type":"event_msg","payload":{"type":"task_complete","turn_id":"t","last_agent_message":"Done"}}`))
-	if len(out) != 2 || out[1].Schedule == nil || out[1].Schedule.Mixed || !out[0].Schedule.Input {
+	if len(out) != 2 || out[1].Schedule != nil || out[0].Schedule == nil {
 		t.Fatalf("outputs %+v", out)
 	}
 }
@@ -177,8 +177,48 @@ func TestScheduledBufferedPromptsKeepTheirOwnInstructions(t *testing.T) {
 		} else if out[0].Schedule.ID != "watch-pr_123" || out[0].Schedule.Instructions != "检查 PR，有新意见就处理。" {
 			t.Fatalf("first scheduled prompt acquired later instructions: %+v", out[0].Schedule)
 		}
-		if out[1].Schedule.ID != "second-task" || out[1].Schedule.Instructions != "只检查 CI。" || !out[1].Schedule.Input || !out[2].Schedule.Mixed || out[2].Schedule.Input {
+		if out[1].Schedule.ID != "second-task" || out[1].Schedule.Instructions != "只检查 CI。" || out[2].Schedule != nil {
 			t.Fatalf("later source lost or result mislabeled: %+v", out)
 		}
+	}
+}
+
+func TestScheduledEvidenceStaysOnInput(t *testing.T) {
+	tr := NewTracker("th", 0, 0, nil)
+	out := tr.Feed(scheduledLines(
+		`{"type":"event_msg","payload":{"type":"task_started","turn_id":"t","turn_attribution":{"turn_id":"t","turn_trigger":"automation_cron_scheduled"}}}`,
+		scheduledUser("Check progress", nil),
+		`{"type":"event_msg","payload":{"type":"item_completed","turn_id":"t","item":{"type":"UserMessage","client_id":"local"}}}`,
+		`{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"Checking"}]}}`,
+		`{"type":"event_msg","payload":{"type":"context_compacted"}}`,
+		scheduledUser("Additional instructions", nil),
+		`{"type":"event_msg","payload":{"type":"item_completed","turn_id":"t","item":{"type":"UserMessage","client_id":"local"}}}`,
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"t","last_agent_message":"Done"}}`,
+	))
+	seen := map[OutputKind]bool{}
+	for i, o := range out {
+		if i == 0 {
+			if o.Kind != OutputPrompt || o.Text != "Check progress" || o.Schedule == nil {
+				t.Fatalf("scheduled input missing: %+v", o)
+			}
+		} else if o.Schedule != nil {
+			t.Fatalf("scheduled evidence leaked to later output: %+v", o)
+		}
+		seen[o.Kind] = true
+	}
+	if len(out) != 5 || !seen[OutputStatus] || !seen[OutputCompact] || !seen[OutputFinal] {
+		t.Fatalf("missing progress, compaction or final coverage: %+v", out)
+	}
+}
+
+func TestScheduledHeartbeatKeepsGoalAttribution(t *testing.T) {
+	tr := NewTracker("th", 0, 0, nil)
+	out := tr.Feed(scheduledLines(
+		`{"type":"event_msg","payload":{"type":"task_started","turn_id":"t","turn_attribution":{"turn_id":"t","turn_trigger":"goal"}}}`,
+		scheduledUser(testHeartbeat, map[string]any{"content_item_kinds": []string{"user.heartbeat"}}),
+		`{"type":"event_msg","payload":{"type":"task_complete","turn_id":"t","last_agent_message":"Done"}}`,
+	))
+	if len(out) != 2 || out[0].Schedule == nil || !out[0].GoalTriggered || out[1].Schedule != nil || !out[1].GoalTriggered {
+		t.Fatalf("goal and scheduled input attribution: %+v", out)
 	}
 }

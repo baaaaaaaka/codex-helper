@@ -98,7 +98,7 @@ func TestScheduledWaitOrdersInFlightSilenceNotice(t *testing.T) {
 		t.Fatal("wait did not complete after the store was released")
 	}
 	r.wait("both ordered notices delivered", func() bool {
-		return len(r.own(work, "controlled silence")) == 1 && len(r.own(work, "entered an in-session wait")) == 1
+		return len(r.own(work, "controlled silence")) == 1 && len(r.own(work, "🕒 Wait started")) == 1
 	})
 	msgs := r.ch.Messages(work)
 	var silence, wait int = -1, -1
@@ -106,7 +106,7 @@ func TestScheduledWaitOrdersInFlightSilenceNotice(t *testing.T) {
 		if strings.Contains(msg.Text, "controlled silence") {
 			silence = i
 		}
-		if strings.Contains(msg.Text, "entered an in-session wait") {
+		if strings.Contains(msg.Text, "🕒 Wait started") {
 			wait = i
 		}
 	}

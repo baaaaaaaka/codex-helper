@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/channel"
+	"github.com/baaaaaaaka/codex-helper/internal/core/store"
 	"github.com/baaaaaaaka/codex-helper/internal/core/transcript"
 	"github.com/baaaaaaaka/codex-helper/internal/e2e/rollout"
 )
@@ -22,30 +24,24 @@ func TestScheduledPresentationLeavesOrdinaryMessagesUnchanged(t *testing.T) {
 		}
 	}
 	s := &transcript.Schedule{ID: "watch-pr_123", Instructions: "检查 PR"}
-	o := transcript.Output{Schedule: s, Kind: transcript.OutputFinal, Text: "中文回答"}
-	doc := scheduledDoc(answerDoc(o.Text), o)
-	if doc.Label != "🕒 Scheduled task result (watch-pr_123)" || doc.Markdown != "中文回答" || doc.Footer != "" || doc.FooterLabel != "" {
-		t.Fatalf("scheduled doc %+v", doc)
+	for _, doc := range []channel.RichDoc{answerDoc("中文回答"), statusDoc("progress")} {
+		got := scheduledDoc(doc, transcript.Output{Schedule: s, Kind: transcript.OutputFinal})
+		if got.Label != doc.Label || got.Markdown != doc.Markdown || got.Footer != doc.Footer || got.FooterLabel != doc.FooterLabel {
+			t.Fatalf("scheduled output changed: %+v", got)
+		}
 	}
-	o.User, o.Kind, s.Input = true, transcript.OutputPrompt, true
-	doc = scheduledDoc(userDoc("<heartbeat>internal</heartbeat>"), o)
-	if doc.Label != "🕒 Scheduled task instructions (watch-pr_123)" || doc.Markdown != "检查 PR" {
-		t.Fatalf("instructions %+v", doc)
+	o := transcript.Output{Schedule: s, User: true, Kind: transcript.OutputPrompt}
+	doc := scheduledDoc(userDoc("<heartbeat>internal</heartbeat>"), o)
+	if doc.Label != "🕒 Scheduled task started (watch-pr_123)" || doc.Markdown != "检查 PR" {
+		t.Fatalf("execution event %+v", doc)
 	}
 	s.Instructions = ""
 	if empty := scheduledDoc(userDoc("<heartbeat>internal</heartbeat>"), o); empty.Markdown != "_No instructions were included in this scheduled input._" {
 		t.Fatalf("empty instructions exposed scheduler wrapper: %+v", empty)
 	}
-	s.Input = false
-	s.Mixed = true
-	doc = scheduledDoc(userDoc("先别修改"), o)
-	if !strings.Contains(doc.Label, "Additional input") || doc.Markdown != "先别修改" {
-		t.Fatalf("human input rewritten %+v", doc)
-	}
-	o.User, o.Kind = false, transcript.OutputStatus
-	doc = scheduledDoc(statusDoc("正在检查"), o)
-	if !strings.Contains(doc.Label, "Scheduled task status with additional input") || doc.Markdown != "正在检查" {
-		t.Fatalf("status mislabeled as a result %+v", doc)
+	s.ID = ""
+	if cron := scheduledDoc(userDoc("check progress"), o); cron.Label != "🕒 Scheduled task started" || cron.Markdown != "check progress" {
+		t.Fatalf("cron input changed: %+v", cron)
 	}
 }
 
@@ -69,7 +65,7 @@ func TestScheduledNativeWaitSuppressesHintsAndClearsOnCompletion(t *testing.T) {
 	work := r.newWork(t.TempDir())
 	r.ch.PostUser(work, "wait explicitly")
 	<-ready
-	r.wait("wait notice", func() bool { return len(r.own(work, "in-session wait")) == 1 })
+	r.wait("wait notice", func() bool { return len(r.own(work, "🕒 Wait started")) == 1 })
 	// A slow agent may legitimately trigger a silence hint before it reports
 	// the wait. Only hints after the wait notice violate the wait policy.
 	earlyWorking, earlyStuck := len(r.own(work, "Still working")), len(r.own(work, "may be stuck"))
@@ -103,8 +99,35 @@ func TestScheduledNativeWaitSuppressesHintsAndClearsOnCompletion(t *testing.T) {
 	}
 	h.Waiting("sleep-2", time.Hour, true)
 	h.Waiting("sleep-2", time.Hour, false)
-	if len(r.own(work, "entered an in-session wait")) != 1 {
-		t.Fatal("multiple native sleeps produced repeated wait notices")
+	r.wait("two wait pairs", func() bool {
+		return len(r.own(work, "🕒 Wait started")) == 2 && len(r.own(work, "🕒 Wait ended")) == 2
+	})
+	countWaitRows := func() int {
+		var count int
+		if err := r.st.View(func(q store.Querier) error {
+			return q.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM outbox WHERE delivery_key LIKE 'turn:%:wait:%'`).Scan(&count)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return count
+	}
+	if count := countWaitRows(); count != 4 {
+		t.Fatalf("two waits recorded %d event rows, want four", count)
+	}
+	r.e.mu.Lock()
+	rs := r.e.convs[r.e.byChat[work]].running
+	id, until := rs.waitID, rs.waitUntil
+	r.e.mu.Unlock()
+	h.Waiting("sleep-1", time.Hour, true)
+	h.Waiting("sleep-1", time.Hour, false)
+	r.e.mu.Lock()
+	changed := rs.waitID != id || !rs.waitUntil.Equal(until)
+	r.e.mu.Unlock()
+	if changed {
+		t.Fatal("old wait replay changed current wait state")
+	}
+	if count := countWaitRows(); count != 4 {
+		t.Fatalf("duplicate event added outbox rows: got %d, want four", count)
 	}
 	r.ch.PostUser(work, "helper cancel running")
 	r.wait("cancel", func() bool { return len(r.own(work, "Codex request canceled.")) == 1 })
@@ -160,18 +183,20 @@ func TestScheduledWaitResultAndNotificationKeepOrdinaryTurnsUnchanged(t *testing
 				c.Agent.(*fakeAgent).during = func(_ TurnRequest, h TurnHooks) {
 					h.Waiting("sleep-result", time.Second, true)
 					h.Waiting("sleep-result", time.Second, false)
+					h.Waiting("sleep-result-2", time.Second, true)
+					h.Waiting("sleep-result-2", time.Second, false)
 				}
 			})
 			work := r.newWork(t.TempDir())
 			r.ch.PostUser(work, "等一下再回答")
-			r.wait("answer after wait", func() bool { return len(r.own(work, "Codex answer after an in-session wait")) == 1 })
-			r.wait("wait result card", func() bool { return n.count("🕒 In-session wait result") == 1 })
+			r.wait("answer after wait", func() bool { return len(r.own(work, "🤖 ✅ Codex answer:")) == 1 })
+			r.wait("wait result card", func() bool { return n.count("✅ Codex finished") == 1 })
 			if failCard {
-				r.wait("wait result fallback", func() bool { return len(r.own(r.control(), "In-session wait result")) == 1 })
+				r.wait("wait result fallback", func() bool { return len(r.own(r.control(), "Codex finished")) == 1 })
 			}
 			n.mu.Lock()
 			for _, v := range n.notices {
-				if v.Heading == "🕒 In-session wait result" && !strings.Contains(v.Hint, "does not confirm a saved schedule") {
+				if v.Heading == "✅ Codex finished" && v.Hint != "The answer is ready in the work chat." {
 					t.Errorf("misleading hint %+v", v)
 				}
 			}
@@ -185,11 +210,11 @@ func TestScheduledWaitResultAndNotificationKeepOrdinaryTurnsUnchanged(t *testing
 			if strings.Contains(ordinary.Text, "in-session wait") || !strings.Contains(ordinary.Text, "Codex finished responding") {
 				t.Fatalf("ordinary answer changed %q", ordinary.Text)
 			}
-			r.wait("ordinary notification", func() bool { return n.count("✅ Codex finished") == 1 })
+			r.wait("ordinary notification", func() bool { return n.count("✅ Codex finished") == 2 })
 			r.stop()
 			r.start()
 			r.control()
-			if n.count("🕒 In-session wait result") != 1 {
+			if n.count("✅ Codex finished") != 2 {
 				t.Fatal("replayed wait notification")
 			}
 		})
@@ -207,6 +232,9 @@ func TestScheduledNativeWaitExpiryRestoresAttention(t *testing.T) {
 	work := r.newWork(t.TempDir())
 	r.ch.PostUser(work, "expire wait")
 	r.wait("expired wait hint", func() bool { return len(r.own(work, "This run has not reported a result")) == 1 })
+	if len(r.own(work, "🕒 Wait ended")) != 0 {
+		t.Fatal("deadline expiry fabricated a native completion")
+	}
 	if len(r.own(work, "Still working"))+len(r.own(work, "may be stuck")) != 0 {
 		t.Fatal("expired native wait used ordinary repeated hints")
 	}
@@ -302,21 +330,21 @@ func scheduledMirrorScenario(t *testing.T, mode string) {
 	local := r.localChat()
 	r.wait("scheduled result", func() bool { return len(r.own(local, "自动检查结果")) == 1 })
 	m := r.own(local, "自动检查结果")[0]
-	if !strings.HasPrefix(m.Text, "🕒 Scheduled task result") || strings.Contains(m.Text, "finished responding") {
+	if !strings.HasPrefix(m.Text, "🤖 ✅ Codex answer:") || !strings.Contains(m.Text, "finished responding") {
 		t.Fatalf("scheduled result %q", m.Text)
 	}
 	if mode == "workflow" {
-		r.wait("heartbeat instructions", func() bool { return len(r.own(local, "Scheduled task instructions (pr-watch)")) == 1 })
-		if instructions := r.own(local, "Scheduled task instructions (pr-watch)")[0]; !strings.Contains(instructions.Text, "检查 PR") || strings.Contains(instructions.Text, "<heartbeat>") {
+		r.wait("heartbeat instructions", func() bool { return len(r.own(local, "Scheduled task started (pr-watch)")) == 1 })
+		if instructions := r.own(local, "Scheduled task started (pr-watch)")[0]; !strings.Contains(instructions.Text, "检查 PR") || strings.Contains(instructions.Text, "<heartbeat>") {
 			t.Fatalf("heartbeat instructions rewritten incorrectly %q", instructions.Text)
 		}
 	}
 	if n != nil {
-		r.wait("scheduled card", func() bool { return n.count("🕒 Scheduled task result") == 1 })
+		r.wait("scheduled card", func() bool { return n.count("✅ Codex finished") == 1 })
 		n.mu.Lock()
 		for _, v := range n.notices {
-			if v.Heading == "🕒 Scheduled task result" {
-				if v.Hint != scheduledResultHint || mode == "workflow" && !strings.Contains(v.Request, "pr-watch") || mode != "workflow" && v.Request != "" {
+			if v.Heading == "✅ Codex finished" {
+				if v.Hint != "The answer is ready in the work chat." {
 					t.Errorf("misleading or redundant scheduled card %+v", v)
 				}
 			}
@@ -324,7 +352,7 @@ func scheduledMirrorScenario(t *testing.T, mode string) {
 		n.mu.Unlock()
 	}
 	if mode != "workflow" {
-		r.wait("scheduled notification", func() bool { return len(r.own(ctl, "Scheduled task")) == 1 })
+		r.wait("scheduled notification", func() bool { return len(r.own(ctl, "Codex finished")) == 1 })
 	}
 	r.stop()
 	r.start()
@@ -348,7 +376,87 @@ func scheduledMirrorScenario(t *testing.T, mode string) {
 	if mode == "workflow" {
 		wantMention = 0
 	}
-	if len(r.own(local, "自动检查结果")) != 1 || len(r.own(ctl, "Scheduled task")) != wantMention || n != nil && n.count("🕒 Scheduled task result") != 1 {
+	r.wait("ordinary completion notification", func() bool {
+		return len(r.own(ctl, "Codex finished")) == wantMention && (n == nil || n.count("✅ Codex finished") == 1)
+	})
+	if len(r.own(local, "自动检查结果")) != 1 || len(r.own(ctl, "Codex finished")) != wantMention || n != nil && n.count("✅ Codex finished") != 1 {
 		t.Fatal("restart duplicated scheduled output")
+	}
+}
+
+// A completion received without a start must not fabricate event messages.
+func TestScheduledWaitCompletionBeforeStart(t *testing.T) {
+	rs := &runState{turnID: 1}
+	e := &Engine{convs: map[int64]*convState{1: {running: rs}}}
+	e.nativeWait(1, 1, rs, "early", time.Second, false)
+	e.nativeWait(1, 1, rs, "early", time.Second, true)
+	if rs.waitID != "early" || !rs.waitUntil.IsZero() {
+		t.Fatal("late start resurrected an already completed wait")
+	}
+}
+
+// These kinds are no longer written, but an upgrade can leave pending rows.
+func TestScheduledLegacyPendingNotificationsStillDeliver(t *testing.T) {
+	for _, failCard := range []bool{false, true} {
+		t.Run(map[bool]string{false: "workflow", true: "fallback"}[failCard], func(t *testing.T) {
+			n := &noticeRecorder{}
+			if failCard {
+				n.err = errors.New("ambiguous Workflow response")
+			}
+			r := newRig(t, func(c *Config) { c.Notifier = n })
+			work := r.newWork(t.TempDir())
+			r.e.mu.Lock()
+			conv := r.e.byChat[work]
+			r.e.mu.Unlock()
+			for i, kind := range []string{notifyWait, notifyScheduled} {
+				if err := r.e.update(func(tx *store.Tx) error {
+					return r.e.addNotify(tx, pendingNotify{Conv: conv, Key: "legacy:" + kind, Kind: kind, Text: "old result", Request: "original task"})
+				}); err != nil {
+					t.Fatal(err)
+				}
+				r.e.wakeNotify()
+				r.wait("legacy completion card", func() bool { return n.count("✅ Codex finished") == i+1 })
+				if failCard {
+					r.wait("legacy mention fallback", func() bool { return len(r.own(r.control(), "**✅ Codex finished**")) == i+1 })
+				}
+			}
+		})
+	}
+}
+
+type rejectWaitStartChannel struct{ channel.Channel }
+
+func (c rejectWaitStartChannel) Render(ctx context.Context, doc channel.RichDoc) ([]channel.Part, error) {
+	if doc.Label == "🕒 Wait started" {
+		return nil, errors.New("injected wait render failure")
+	}
+	return c.Channel.Render(ctx, doc)
+}
+
+func TestScheduledWaitRenderFailurePreservesSilenceState(t *testing.T) {
+	var hooks TurnHooks
+	ready := make(chan struct{})
+	r := newRig(t, func(c *Config) {
+		c.Channel = rejectWaitStartChannel{c.Channel}
+		c.Agent.(*fakeAgent).block["wait render failure"] = make(chan struct{})
+		c.Agent.(*fakeAgent).during = func(_ TurnRequest, h TurnHooks) { hooks = h; close(ready) }
+	})
+	work := r.newWork(t.TempDir())
+	r.ch.PostUser(work, "wait render failure")
+	<-ready
+	hooks.Waiting("wait-failed", time.Hour, true)
+	r.e.mu.Lock()
+	rs := r.e.convs[r.e.byChat[work]].running
+	active := rs.waitID == "wait-failed" && !rs.waitUntil.IsZero() && !rs.waitAnnounced
+	r.e.mu.Unlock()
+	if !active {
+		t.Fatal("wait was not tracked after render failed")
+	}
+	hooks.Waiting("wait-failed", time.Hour, false)
+	r.e.mu.Lock()
+	ended := rs.waitUntil.IsZero()
+	r.e.mu.Unlock()
+	if !ended || len(r.own(work, "🕒 Wait ended")) != 0 {
+		t.Fatal("unannounced wait emitted an end event or stayed active")
 	}
 }

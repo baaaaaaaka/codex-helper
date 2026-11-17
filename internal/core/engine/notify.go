@@ -28,6 +28,7 @@ const notifyReady = "ready"
 const notifyService = "service"
 const notifyAttention = "attention"
 
+// Legacy persisted kinds remain accepted during upgrade recovery.
 const notifyScheduled = "scheduled"
 const notifyWait = "wait"
 
@@ -304,14 +305,9 @@ func (e *Engine) sendCard(ctx context.Context, n pendingNotify) bool {
 			err = e.cfg.Notifier.Notify(cctx, channel.OwnerNotice{Heading: heading, ChatTitle: firstNonEmpty(title, label), Hint: text, URL: url})
 		}
 	} else {
-		heading, hint := resultNotice(n.Kind)
+		heading, hint := "✅ Codex finished", "The answer is ready in the work chat."
 		notice := channel.OwnerNotice{Heading: heading, ChatTitle: firstNonEmpty(title, label), Request: n.Request, Hint: hint, Button: "Open answer", URL: url}
 		switch n.Kind {
-		case notifyScheduled:
-			notice.Request, _, _ = strings.Cut(n.Text, "\n")
-			if notice.Request == notice.Heading {
-				notice.Request = ""
-			}
 		case notifyService:
 			notice.Heading, notice.Hint, notice.Request, notice.Button = n.Request, n.Text, "", "Open Control"
 		case notifyAttention:

@@ -31,13 +31,11 @@ func scheduledTrigger(trigger string) *Schedule {
 	return nil
 }
 
-// Schedule describes evidence attached to this turn, never thread settings.
-// Missing evidence leaves the ordinary projection unchanged.
+// Schedule describes a native scheduled input, never thread settings.
+// An empty value on a turn-start event identifies its initial scheduled input.
 type Schedule struct {
 	ID           string
 	Instructions string
-	Mixed        bool
-	Input        bool // this output is the scheduled input itself
 }
 
 // heartbeat requires the host's provenance marker as well as the canonical

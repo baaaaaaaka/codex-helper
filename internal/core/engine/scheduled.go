@@ -1,26 +1,15 @@
 package engine
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/baaaaaaaka/codex-helper/internal/channel"
+	"github.com/baaaaaaaka/codex-helper/internal/core/store"
 	"github.com/baaaaaaaka/codex-helper/internal/core/transcript"
 )
-
-const scheduledResultHint = "Open the work chat for this run's result. This does not confirm that the schedule has ended."
-
-func resultNotice(kind string) (string, string) {
-	switch kind {
-	case notifyScheduled:
-		return "🕒 Scheduled task result", scheduledResultHint
-	case notifyWait:
-		return "🕒 In-session wait result", "Open the work chat for this run's result. An in-session wait does not confirm a saved schedule."
-	default:
-		return "✅ Codex finished", "The answer is ready in the work chat."
-	}
-}
 
 func (e *Engine) nativeWait(conv, turn int64, rs *runState, id string, duration time.Duration, started bool) {
 	if id == "" || duration <= 0 || duration > 12*time.Hour {
@@ -34,60 +23,84 @@ func (e *Engine) nativeWait(conv, turn int64, rs *runState, id string, duration 
 		return
 	}
 	if !started {
-		if rs.waitID == id && !rs.waitUntil.IsZero() {
+		ended := rs.waitID == id && !rs.waitUntil.IsZero()
+		if rs.waitID == "" {
+			// A completion can arrive before its start response. Remember it
+			// without inventing a start or an end message.
+			rs.waitID = id
+		}
+		announced := rs.waitAnnounced
+		if ended {
 			rs.waitUntil = time.Time{}
 			rs.lastEvent.Store(ms(e.now()))
 		}
 		e.mu.Unlock()
+		if ended && announced {
+			e.waitNotice(conv, fmt.Sprintf("turn:%d:wait:%s:end", turn, id), "🕒 Wait ended", "Continuing the task.")
+		}
 		return
 	}
 	if rs.waitID == id {
 		e.mu.Unlock()
 		return
 	}
-	first := rs.waitID == ""
-	// Keep the last ID after completion so replay cannot restart that wait.
-	rs.waitID, rs.waitUntil = id, e.now().Add(duration)
-	rs.lastEvent.Store(ms(e.now()))
 	e.mu.Unlock()
-	if first {
-		e.silenceNotice(conv, fmt.Sprintf("turn:%d:wait", turn), fmt.Sprintf("Codex entered an in-session wait (up to %s for this wait). New input can end a wait early. Further waits in this run will be quiet. This does not confirm a saved schedule.", duration))
+	// The durable outbox also rejects an older wait replayed after a newer
+	// wait. No growing in-memory set of item IDs is needed.
+	added, err := e.waitNotice(conv, fmt.Sprintf("turn:%d:wait:%s:start", turn, id), "🕒 Wait started", fmt.Sprintf("Waiting for up to %s. New input can end the wait early.", duration))
+	if err == nil && !added {
+		return // an older start already exists in the outbox
 	}
+	e.mu.Lock()
+	if cs := e.convs[conv]; cs != nil && cs.running == rs && !rs.cancelled && !rs.switching {
+		rs.waitID, rs.waitUntil = id, e.now().Add(duration)
+		rs.waitAnnounced = err == nil && added
+		rs.lastEvent.Store(ms(e.now()))
+	}
+	e.mu.Unlock()
 }
 
-// scheduledDoc only changes messages carrying native scheduling evidence.
-// Delivery identities, ordinary labels and notification defaults stay intact.
+// Called under the per-run silence lock so wait events retain their order.
+// Enqueue's indexed delivery key deduplicates all phases, including replay.
+func (e *Engine) waitNotice(conv int64, key, label, text string) (bool, error) {
+	if conv == e.inboxID {
+		return true, nil // the inbox carries protocol records only
+	}
+	msgs, err := e.render(context.Background(), channel.RichDoc{Label: label, Markdown: text}, store.OutNotice, key)
+	if err != nil {
+		e.logf("wait event in %d: %v", conv, err)
+		return false, err
+	}
+	added := 0
+	err = e.update(func(tx *store.Tx) error {
+		var err error
+		added, err = tx.Enqueue(conv, msgs)
+		return err
+	})
+	if err != nil {
+		e.logf("wait event in %d: %v", conv, err)
+		return false, err
+	}
+	if added > 0 {
+		e.wakeSender()
+	}
+	return added > 0, nil
+}
+
+// scheduledDoc presents the native scheduled input as a single execution
+// event. Later messages retain their normal labels and completion footer.
+// Reuse the input's delivery identity and checkpoint for replay deduplication.
 func scheduledDoc(doc channel.RichDoc, o transcript.Output) channel.RichDoc {
-	if o.Schedule == nil {
+	if o.Schedule == nil || !(o.User || o.Kind == transcript.OutputPrompt) {
 		return doc
 	}
-	doc.Label = scheduledLabel(o)
-	if o.Schedule.Input && o.Schedule.ID != "" {
+	doc.Label = "🕒 Scheduled task started"
+	if o.Schedule.ID != "" {
+		doc.Label += " (" + o.Schedule.ID + ")"
 		doc.Markdown = o.Schedule.Instructions
 		if strings.TrimSpace(doc.Markdown) == "" {
 			doc.Markdown = "_No instructions were included in this scheduled input._"
 		}
 	}
-	doc.FooterLabel, doc.Footer = "", ""
 	return doc
-}
-
-func scheduledLabel(o transcript.Output) string {
-	label := "🕒 Scheduled task result"
-	if o.Kind == transcript.OutputStatus || o.Kind == transcript.OutputCompact {
-		label = "🕒 Scheduled task status"
-	}
-	if o.Schedule.Mixed {
-		label += " with additional input"
-	}
-	if o.User || o.Kind == transcript.OutputPrompt {
-		label = "🕒 Additional input during scheduled task"
-		if o.Schedule.Input {
-			label = "🕒 Scheduled task instructions"
-		}
-	}
-	if o.Schedule.ID != "" {
-		label += " (" + o.Schedule.ID + ")"
-	}
-	return label
 }
