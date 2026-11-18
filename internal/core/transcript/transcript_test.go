@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -210,6 +211,54 @@ func TestReadSkipsOversizeLines(t *testing.T) {
 	}
 	if next != int64(len(big)+4) {
 		t.Fatalf("next %d", next)
+	}
+}
+
+func TestReadLimitedPreservesRecordsAndCursor(t *testing.T) {
+	path := writeLines(t, "skip\n", "first\n", strings.Repeat("x", MaxLine+1)+"\n", "third\n", "incomplete")
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	const start = 2 // Inside the first line, which must not count.
+	want, wantNext, err := Read(f, start, 0)
+	if err != nil || len(want) != 3 || !want[1].Oversize {
+		t.Fatalf("unlimited read got %d records at %d, err %v", len(want), wantNext, err)
+	}
+	next := int64(start)
+	var got []Line
+	for i, limit := range []int{1, 2} {
+		lines, after, err := ReadLimited(f, next, 0, limit)
+		if err != nil || len(lines) != limit || after != want[len(got)+limit-1].End {
+			t.Fatalf("batch %d got %d records, cursor %d, err %v", i, len(lines), after, err)
+		}
+		got = append(got, lines...)
+		next = after
+	}
+	if !reflect.DeepEqual(got, want) || next != wantNext {
+		t.Fatalf("batched records or cursor differ from the unlimited read")
+	}
+	if lines, after, err := ReadLimited(f, next, 0, 1); err != nil || len(lines) != 0 || after != next {
+		t.Fatalf("incomplete tail: got %d records, cursor %d, err %v", len(lines), after, err)
+	}
+	// The byte budget still finishes a long line even when room remains
+	// under the record cap.
+	if lines, after, err := ReadLimited(f, want[1].Off, 1, 5); err != nil || len(lines) != 1 || after != want[1].End {
+		t.Fatalf("byte cap: got %d records, cursor %d, err %v", len(lines), after, err)
+	}
+	out, err := os.OpenFile(path, os.O_WRONLY|os.O_APPEND, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = out.WriteString("\n")
+	closeErr := out.Close()
+	if err != nil || closeErr != nil {
+		t.Fatalf("complete tail: write %v, close %v", err, closeErr)
+	}
+	lines, after, err := ReadLimited(f, next, 0, 1)
+	if err != nil || len(lines) != 1 || string(lines[0].Data) != "incomplete" || after != next+int64(len("incomplete\n")) {
+		t.Fatalf("completed tail: got %d records, cursor %d, err %v", len(lines), after, err)
 	}
 }
 
