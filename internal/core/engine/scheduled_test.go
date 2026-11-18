@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -168,6 +169,82 @@ func TestScheduledWaitRejectsStaleSilenceDecision(t *testing.T) {
 	e.nativeWait(conv, turn, rs, "sleep-2", time.Hour, true)
 	if e.silenceNoticeForWaitState(cs, rs, endedID, endedUntil, "old-wait", "old-wait") {
 		t.Fatal("expired-wait hint accepted after next wait began")
+	}
+}
+
+func TestScheduledWaitNoticesRequireMoreThanOneMinute(t *testing.T) {
+	ready := make(chan TurnHooks, 1)
+	r := newRig(t, func(c *Config) {
+		c.Timing.SilenceHint, c.Timing.SilenceStuck = 0, 0
+		a := c.Agent.(*fakeAgent)
+		a.block["wait threshold"] = make(chan struct{})
+		a.during = func(_ TurnRequest, hooks TurnHooks) { ready <- hooks }
+	})
+	work := r.newWork(t.TempDir())
+	r.ch.PostUser(work, "wait threshold")
+	var hooks TurnHooks
+	select {
+	case hooks = <-ready:
+	case <-time.After(10 * time.Second):
+		t.Fatal("agent did not start")
+	}
+
+	waitState := func(id string, active, announced bool) {
+		t.Helper()
+		r.e.mu.Lock()
+		defer r.e.mu.Unlock()
+		rs := r.e.convs[r.e.byChat[work]].running
+		if rs.waitID != id || (!rs.waitUntil.IsZero()) != active || (active && rs.waitAnnounced != announced) {
+			t.Fatalf("wait state: id=%q until=%v announced=%v, want id=%q active=%v announced=%v",
+				rs.waitID, rs.waitUntil, rs.waitAnnounced, id, active, announced)
+		}
+	}
+	for _, tc := range []struct {
+		id       string
+		duration time.Duration
+	}{{"below", time.Minute - time.Millisecond}, {"at", time.Minute}} {
+		hooks.Waiting(tc.id, tc.duration, true)
+		waitState(tc.id, true, false)
+		hooks.Waiting(tc.id, tc.duration, false)
+		waitState(tc.id, false, false)
+	}
+	long := time.Minute + time.Millisecond
+	hooks.Waiting("above", long, true)
+	// Replay an older quiet wait while the visible wait is active.
+	hooks.Waiting("below", time.Minute-time.Millisecond, true)
+	hooks.Waiting("below", time.Minute-time.Millisecond, false)
+	waitState("above", true, true)
+	hooks.Waiting("above", long, false)
+	waitState("above", false, false)
+	r.wait("long wait notices", func() bool {
+		return len(r.own(work, "🕒 Wait started")) == 1 && len(r.own(work, "🕒 Wait ended")) == 1
+	})
+	var count int
+	if err := r.st.View(func(q store.Querier) error {
+		return q.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM outbox WHERE delivery_key LIKE 'turn:%:wait:%'`).Scan(&count)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if count != 2 {
+		t.Fatalf("wait outbox has %d rows, want only the long wait's two notices", count)
+	}
+}
+
+func TestScheduledQuietWaitReplayWindowIsBounded(t *testing.T) {
+	const conv, turn = 1, 2
+	rs := &runState{turnID: turn}
+	e := &Engine{convs: map[int64]*convState{conv: {running: rs}}, inboxID: conv, now: time.Now}
+	for i := 0; i < quietWaitReplayLimit+2; i++ {
+		id := fmt.Sprintf("wait-%d", i)
+		e.nativeWait(conv, turn, rs, id, time.Second, true)
+		e.nativeWait(conv, turn, rs, id, time.Second, false)
+	}
+	if len(rs.quietWaitIDs) != quietWaitReplayLimit || len(rs.quietWaitOrder) != quietWaitReplayLimit {
+		t.Fatalf("replay window has %d IDs and %d entries", len(rs.quietWaitIDs), len(rs.quietWaitOrder))
+	}
+	e.nativeWait(conv, turn, rs, "wait-2", time.Second, true)
+	if rs.waitID != fmt.Sprintf("wait-%d", quietWaitReplayLimit+1) {
+		t.Fatal("recent replay replaced the latest wait")
 	}
 }
 

@@ -446,3 +446,35 @@ callbacks adding none. The assertion reads through the store's existing
 read-only transaction. A first test draft opened a second SQLite connection and
 failed with `SQLITE_BUSY`; switching to the store's read pool resolved that
 test setup error. The runtime source did not change after the full race run.
+
+### Wait notice threshold (2026-11-18)
+
+On upstream base `beef52cd`, Teams shows the start and end notices only
+when the requested native wait exceeds 60 seconds. The engine still tracks
+short waits for silence handling. They skip rendering and outbox writes.
+The engine keeps the 4096 most recent quiet-wait IDs for the current run to
+reject replay. Older quiet events can be accepted again if replayed after that
+window.
+
+Linux validation with Go 1.26.3 used the in-process engine and protocol tests.
+`go test -race ./internal/core/engine -run '^TestScheduled' -count=1 -timeout=5m`
+and `go test -race ./internal/core/codex -run '^TestScheduled' -count=1 -timeout=2m`
+passed, as did `go vet ./internal/core/engine`. The new boundary test checks
+59.999, 60, and 60.001 seconds, confirms only the long wait writes notice rows,
+and replays a short wait while the long wait is active. A separate test sends
+4098 short waits and verifies the replay window stays at 4096 entries.
+`go test -race ./internal/core/engine -count=1 -timeout=15m` passed in
+245.320 seconds. The existing package race jobs run these tests. This change
+was not exercised on a live Teams chat.
+
+Each valid wait is handled once at start and completion. Short waits avoid the
+previous two render and outbox operations, while keeping at most 4096 IDs in
+memory per active run. Duplicate quiet starts perform a map lookup and no
+write. Long waits retain the existing delivery-key and outbox behavior.
+
+The three E2E shards ran in the isolated Docker harness with an offline Go
+module cache. Shards 0 and 1 passed. In shard 2, two entry scenarios timed
+out under parallel load; the other packages passed. The complete entry package
+then passed with test parallelism 2, including both previously timed-out
+scenarios. The original shard used parallelism 8; the retry does not establish
+why those timeouts occurred. GitHub CI must run the standard shard settings.

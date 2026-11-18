@@ -11,6 +11,9 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/core/transcript"
 )
 
+const waitNoticeThreshold = time.Minute
+const quietWaitReplayLimit = 4096
+
 func (e *Engine) nativeWait(conv, turn int64, rs *runState, id string, duration time.Duration, started bool) {
 	if id == "" || duration <= 0 || duration > 12*time.Hour {
 		return
@@ -40,22 +43,42 @@ func (e *Engine) nativeWait(conv, turn int64, rs *runState, id string, duration 
 		}
 		return
 	}
-	if rs.waitID == id {
+	if _, seen := rs.quietWaitIDs[id]; rs.waitID == id || seen {
 		e.mu.Unlock()
 		return
 	}
 	e.mu.Unlock()
-	// The durable outbox also rejects an older wait replayed after a newer
-	// wait. No growing in-memory set of item IDs is needed.
-	added, err := e.waitNotice(conv, fmt.Sprintf("turn:%d:wait:%s:start", turn, id), "🕒 Wait started", fmt.Sprintf("Waiting for up to %s. New input can end the wait early.", duration))
-	if err == nil && !added {
-		return // an older start already exists in the outbox
+	showNotice := duration > waitNoticeThreshold
+	announced := false
+	if showNotice {
+		// The outbox deduplicates visible waits even after a newer wait starts.
+		added, err := e.waitNotice(conv, fmt.Sprintf("turn:%d:wait:%s:start", turn, id), "🕒 Wait started", fmt.Sprintf("Waiting for up to %s. New input can end the wait early.", duration))
+		if err == nil && !added {
+			return
+		}
+		announced = err == nil && added
 	}
 	e.mu.Lock()
 	if cs := e.convs[conv]; cs != nil && cs.running == rs && !rs.cancelled && !rs.switching {
-		rs.waitID, rs.waitUntil = id, e.now().Add(duration)
-		rs.waitAnnounced = err == nil && added
-		rs.lastEvent.Store(ms(e.now()))
+		if !showNotice {
+			// Quiet waits have no outbox key. Remember them for this run so a
+			// replay cannot replace a newer wait's deadline or end notice.
+			if rs.quietWaitIDs == nil {
+				rs.quietWaitIDs = make(map[string]struct{})
+			}
+			if len(rs.quietWaitOrder) == quietWaitReplayLimit {
+				delete(rs.quietWaitIDs, rs.quietWaitOrder[rs.quietWaitNext])
+				rs.quietWaitOrder[rs.quietWaitNext] = id
+				rs.quietWaitNext = (rs.quietWaitNext + 1) % quietWaitReplayLimit
+			} else {
+				rs.quietWaitOrder = append(rs.quietWaitOrder, id)
+			}
+			rs.quietWaitIDs[id] = struct{}{}
+		}
+		now := e.now()
+		rs.waitID, rs.waitUntil = id, now.Add(duration)
+		rs.waitAnnounced = announced
+		rs.lastEvent.Store(ms(now))
 	}
 	e.mu.Unlock()
 }
