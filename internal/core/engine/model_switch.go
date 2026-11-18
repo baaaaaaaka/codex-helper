@@ -473,7 +473,7 @@ func (e *Engine) continuationRequest(tx *store.Tx, tr store.Turn, req TurnReques
 		if x != nil {
 			return req, x
 		}
-		body, images := codexInput(in.Body, files, e.outboundDir(tr.OutputKey))
+		body, images := codexInput(in.Body, files, e.conversationOutboundDir(tr.ConvID))
 		if failure := voiceFailure(in.Body, files); failure != "" {
 			body = "The following input was unavailable: " + failure
 		}

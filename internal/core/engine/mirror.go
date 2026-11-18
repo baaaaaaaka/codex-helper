@@ -118,6 +118,9 @@ type mirrorFile struct {
 	// which helper-run turns are mirrored too.
 	ns        string
 	keepTeams int64
+	// An explicit history import displays past answers without sending
+	// their files again. Startup catch-up and recovery can still send files.
+	historyEnd int64
 	// infoSaved is the tracker settings last persisted.
 	infoSaved store.SourceInfo
 }
@@ -1007,17 +1010,17 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 		if o.End <= f.proven && (o.Kind == transcript.OutputPrompt || o.Kind == transcript.OutputFinal) {
 			continue // found in the chat's history (history_check.go)
 		}
-		if o.Kind != transcript.OutputFinal || !strings.Contains(o.Text, "```"+artifactFence) {
-			complete, err := e.st.RepresentedRecord(transcript.MirrorKeyPrefix(thread, o.RecordID))
-			if err != nil {
-				f.tracker = e.mirrorTracker(f)
-				return
-			}
-			if complete {
-				continue
-			}
+		// Text and file rows for the same answer are committed together.
+		// Skip a represented record before staging its source files again.
+		complete, err := e.st.RepresentedRecord(transcript.MirrorKeyPrefix(thread, o.RecordID))
+		if err != nil {
+			f.tracker = e.mirrorTracker(f)
+			return
 		}
-		msgs, err := e.renderMirrorMode(ctx, thread, o, !f.catchingUp(o) && !recovery(o), recovery(o))
+		if complete {
+			continue
+		}
+		msgs, err := e.renderMirrorMode(ctx, f.src.ConvID, thread, o, !f.catchingUp(o) && !recovery(o), recovery(o), o.End <= f.historyEnd)
 		if err != nil {
 			// Re-read these records from the persisted position after a
 			// backoff (review M7): never lose them.
@@ -1186,6 +1189,9 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 		}
 	}
 	f.src.Offset, f.src.Line, f.src.Size, f.src.MTime, f.src.Inode = off, line, info.Size, ms(info.MTime), info.Inode
+	if off >= f.historyEnd {
+		f.historyEnd = 0 // the import offsets no longer apply after a rollout rewrite
+	}
 	f.infoSaved = saved
 	f.recoveryEnd = recoveryEnd
 	if !more {
@@ -1223,21 +1229,24 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 //
 // A live record (not catch-up) of Codex closes with the goal and model
 // lines of its thread as the rollout said them then (infoNotes).
-func (e *Engine) renderMirror(ctx context.Context, thread string, o transcript.Output, live bool) ([]store.OutMsg, error) {
-	return e.renderMirrorMode(ctx, thread, o, live, false)
+func (e *Engine) renderMirror(ctx context.Context, conv int64, thread string, o transcript.Output, live bool) ([]store.OutMsg, error) {
+	return e.renderMirrorMode(ctx, conv, thread, o, live, false, false)
 }
 
-func (e *Engine) renderMirrorMode(ctx context.Context, thread string, o transcript.Output, live, recovery bool) ([]store.OutMsg, error) {
+func (e *Engine) renderMirrorMode(ctx context.Context, conv int64, thread string, o transcript.Output, live, recovery, history bool) ([]store.OutMsg, error) {
 	var files []store.OutMsg
-	if o.Kind == transcript.OutputFinal && o.TurnID != "" && e.cfg.FilesDir != "" && strings.Contains(o.Text, "```"+artifactFence) {
-		key := sharedOutputKey(o.TurnID)
-		if _, err := os.Stat(e.outboundDir(key)); err == nil {
+	if o.Kind == transcript.OutputFinal && hasArtifactFence(o.Text) {
+		if history {
+			o.Text, _ = manifestBlocks(o.Text)
+		} else {
+			dirs := artifactDirs{chat: e.conversationOutboundDir(conv)}
+			if o.TurnID != "" {
+				dirs.legacy = e.outboundDir(sharedOutputKey(o.TurnID))
+			}
 			var problems []string
 			prefix := o.Key(thread, 0)
-			o.Text, files, problems = e.stageArtifactsAt(key, fmt.Sprintf("mirror-%x", sha256.Sum256([]byte(prefix))), prefix, o.Text)
-			if len(problems) > 0 {
-				o.Text = strings.TrimSpace(o.Text + "\n\n_Some files could not be attached:_\n- " + strings.Join(problems, "\n- "))
-			}
+			o.Text, files, problems = e.stageArtifactsAt(dirs, fmt.Sprintf("mirror-%x", sha256.Sum256([]byte(prefix))), prefix, o.Text)
+			o.Text = withArtifactProblems(o.Text, problems)
 			for i := range files {
 				files[i].Kind = store.OutMirror
 			}

@@ -51,8 +51,7 @@ func (e *Engine) cmdSendFile(j cmdJob, cs *convState, arg string) {
 		e.reply(j, textSendFileRejected(strings.ReplaceAll(err.Error(), "output directory", "outbound root"), root), nil)
 		return
 	}
-	// The root is where Codex writes its outputs (one directory per turn);
-	// it may not exist yet before the first turn.
+	// The outbound root may not exist yet before the first turn.
 	_ = os.MkdirAll(root, 0o700)
 	src := filepath.Join(root, filepath.FromSlash(clean))
 	if err := underDir(root, src); err != nil {

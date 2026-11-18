@@ -313,7 +313,7 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 		if th.PendingEffort != "" {
 			req.Effort = th.PendingEffort
 		}
-		req.Text, req.Images = codexInput(in.Body, files, e.outboundDir(turnOutputKey(tr))) // envelope.go (F-TRN-14)
+		req.Text, req.Images = codexInput(in.Body, files, e.conversationOutboundDir(id)) // envelope.go (F-TRN-14)
 		questionReply := false
 		if yes, x := tx.IsQuestionReply(in.ID); x != nil {
 			return x
@@ -418,7 +418,7 @@ func (e *Engine) tryStart(ctx context.Context, id int64, sem chan struct{}) bool
 	if control && tr.ResumeFrom == 0 {
 		e.afterControlStart(ctl) // batch B
 	}
-	rs := &runState{turnID: tr.ID, turnKey: turnOutputKey(tr), clientKey: tr.TurnKey, done: make(chan struct{}), request: request}
+	rs := &runState{turnID: tr.ID, clientKey: tr.TurnKey, done: make(chan struct{}), request: request}
 	e.mu.Lock()
 	cs.running = rs
 	if batch > cs.batchThrough {
@@ -643,7 +643,7 @@ func (e *Engine) execTurn(ctx context.Context, cs *convState, tr store.Turn, req
 			}
 		},
 	}
-	if dir := e.outboundDir(turnOutputKey(tr)); dir != "" {
+	if dir := e.conversationOutboundDir(id); kind == store.KindWork && dir != "" {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			e.logf("output directory of %s: %v", label, err)
 		}
@@ -840,10 +840,7 @@ func (e *Engine) finish(ctx context.Context, cs *convState, tr store.Turn, out T
 	case out.Status == StatusCompleted:
 		state = store.TurnCompleted
 		visible, files, problems := e.stageArtifacts(tr, out.Final)
-		final := strings.TrimSpace(visible)
-		if len(problems) > 0 {
-			final = strings.TrimSpace(final + "\n\n_Some files could not be attached:_\n- " + strings.Join(problems, "\n- "))
-		}
+		final := withArtifactProblems(visible, problems)
 		if final == "" && len(files) == 0 {
 			final = "_Codex finished without a text answer._"
 		}
@@ -1321,7 +1318,7 @@ func (e *Engine) reconcileTurn(ctx context.Context, cs *convState, tr store.Turn
 		threadID = e.turnThread(cs, tr)
 	}
 	tr.ThreadID = threadID
-	rs := &runState{turnID: tr.ID, turnKey: turnOutputKey(tr), clientKey: tr.TurnKey, done: make(chan struct{})}
+	rs := &runState{turnID: tr.ID, clientKey: tr.TurnKey, done: make(chan struct{})}
 	e.mu.Lock()
 	cs.running = rs
 	e.mu.Unlock()

@@ -16,9 +16,8 @@ import (
 	"github.com/baaaaaaaka/codex-helper/internal/core/transcript"
 )
 
-// Outbound files (the artifact manifest contract, SPEC F-RND-10). Every
-// turn gets its own output directory, named in the prompt. Codex writes the
-// files it wants to send there and lists them in a fenced
+// Outbound files (the artifact manifest contract, SPEC F-RND-10). Codex
+// writes files under the conversation directory and lists them in a fenced
 // `codex-helper-artifacts` block of its final answer. The engine strips the
 // block, snapshots each listed file into a staging directory and enqueues
 // one outbox row per file after the final text; the sender uploads it
@@ -35,12 +34,47 @@ const maxArtifactBytes = 250 << 20
 // mathContract asks Codex for formulas the channel can render.
 const mathContract = "Put fractions, sums, integrals, matrices, and display math in <m>TeX</m> on a separate line, never in prose, tables, or lists—even if asked for one line. Use backticks for simple inline/literal TeX. Never use $ or \\(...\\). Math markers are not artifacts."
 
-// outboundDir is the output directory of a turn ("" when files are off).
-func (e *Engine) outboundDir(turnKey string) string {
-	if e.cfg.FilesDir == "" || turnKey == "" {
+// outboundDir resolves a directory under the scoped outbound root.
+func (e *Engine) outboundDir(key string) string {
+	if e.cfg.FilesDir == "" || !filepath.IsLocal(key) || key == "." || strings.ContainsAny(key, `/\`) {
 		return ""
 	}
-	return filepath.Join(e.cfg.FilesDir, "outbound", turnKey)
+	return filepath.Join(e.cfg.FilesDir, "outbound", key)
+}
+
+// conversationOutboundDir is stable across turns and chat recreation. The
+// FilesDir is already scoped to this helper's Teams identity.
+func (e *Engine) conversationOutboundDir(conv int64) string {
+	if conv <= 0 {
+		return ""
+	}
+	return e.outboundDir(fmt.Sprintf("conversation-%d", conv))
+}
+
+type artifactDirs struct {
+	legacy string // v0/v1, supplied by the original execution
+	chat   string // v2, derived from the destination conversation
+}
+
+// isArtifactFence also recognizes a manifest fence with optional whitespace
+// or different casing, so the mirror can hide it on an upload failure.
+func isArtifactFence(line string) bool {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(line), "```")
+	return ok && strings.EqualFold(strings.TrimSpace(rest), artifactFence)
+}
+
+func hasArtifactFence(text string) bool {
+	start := strings.Index(text, "```")
+	if start < 0 {
+		return false
+	}
+	start = strings.LastIndexByte(text[:start], '\n') + 1
+	for line := range strings.Lines(text[start:]) {
+		if isArtifactFence(line) {
+			return true
+		}
+	}
+	return false
 }
 
 // manifestBlocks splits text into the visible part and the manifest blocks.
@@ -51,16 +85,15 @@ func manifestBlocks(text string) (string, [][]byte) {
 	var cur []string
 	in := false
 	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
 		if !in {
-			if strings.HasPrefix(trimmed, "```") && strings.EqualFold(strings.TrimSpace(strings.TrimPrefix(trimmed, "```")), artifactFence) {
+			if isArtifactFence(line) {
 				in, cur = true, nil
 				continue
 			}
 			out = append(out, line)
 			continue
 		}
-		if strings.HasPrefix(trimmed, "```") {
+		if strings.HasPrefix(strings.TrimSpace(line), "```") {
 			blocks = append(blocks, []byte(strings.Join(cur, "\n")))
 			in, cur = false, nil
 			continue
@@ -75,7 +108,7 @@ func manifestBlocks(text string) (string, [][]byte) {
 
 // artifact is one validated manifest entry.
 type artifact struct {
-	src  string // file under the turn's output directory
+	src  string // file under the manifest's output directory
 	name string // display name
 }
 
@@ -84,7 +117,7 @@ var windowsDrive = regexp.MustCompile(`^[A-Za-z]:(?:[\\/]|$)`)
 // parseManifest validates one manifest block against the output directory.
 // Entries that cannot be sent are reported by display name with a reason
 // (never a path).
-func parseManifest(block []byte, dir string) ([]artifact, []string) {
+func parseManifest(block []byte, dirs artifactDirs) ([]artifact, []string) {
 	text := string(block)
 	if strings.Contains(text, `"relative/path.ext"`) && strings.Contains(text, `"display-name.ext"`) {
 		return nil, nil // the placeholder echoed back
@@ -100,7 +133,22 @@ func parseManifest(block []byte, dir string) ([]artifact, []string) {
 	if err := dec.Decode(&m); err != nil {
 		return nil, []string{"the file list could not be read"}
 	}
-	if m.Version != 0 && m.Version != 1 {
+	dir := dirs.legacy
+	noDir := "the legacy output directory is unavailable for this reply"
+	switch m.Version {
+	case 0, 1:
+	case 2:
+		dir = dirs.chat
+		noDir = "files cannot be sent from this chat"
+		if dir != "" {
+			// An existing conversation directory must belong to this chat.
+			// Do not follow a symlink in place of that directory.
+			if fi, err := os.Lstat(dir); err != nil || !fi.IsDir() {
+				dir = ""
+				noDir = "the conversation output directory is unavailable"
+			}
+		}
+	default:
 		return nil, []string{fmt.Sprintf("unsupported file list version %d", m.Version)}
 	}
 	var out []artifact
@@ -120,7 +168,7 @@ func parseManifest(block []byte, dir string) ([]artifact, []string) {
 			continue
 		}
 		if dir == "" {
-			problems = append(problems, name+": files cannot be sent from this chat")
+			problems = append(problems, name+": "+noDir)
 			continue
 		}
 		src := filepath.Join(dir, filepath.FromSlash(clean))
@@ -174,24 +222,23 @@ func underDir(dir, p string) error {
 // outbox row per file, and the problems to show. Runs outside any
 // transaction (file I/O).
 func (e *Engine) stageArtifacts(tr store.Turn, final string) (string, []store.OutMsg, []string) {
-	return e.stageArtifactsAt(turnOutputKey(tr), fmt.Sprint(tr.ID), fmt.Sprintf("turn:%d", tr.ID), final)
+	dirs := artifactDirs{legacy: e.outboundDir(turnOutputKey(tr)), chat: e.conversationOutboundDir(tr.ConvID)}
+	return e.stageArtifactsAt(dirs, fmt.Sprint(tr.ID), fmt.Sprintf("turn:%d", tr.ID), final)
 }
 
-// Shared native executions have one stable output directory, independent of
-// how many Teams messages steer them. Mirror output uses its own delivery keys.
+// sharedOutputKey identifies the legacy directory for a native turn.
 func sharedOutputKey(turn string) string { return "cxp-shared-" + turn }
 
-func (e *Engine) stageArtifactsAt(turnKey, stagingID, deliveryPrefix, final string) (string, []store.OutMsg, []string) {
+func (e *Engine) stageArtifactsAt(dirs artifactDirs, stagingID, deliveryPrefix, final string) (string, []store.OutMsg, []string) {
 	visible, blocks := manifestBlocks(transcript.StripMemCitations(final)) // F-MIR-8
 	if len(blocks) == 0 {
 		return visible, nil, nil
 	}
-	dir := e.outboundDir(turnKey)
 	var arts []artifact
 	var problems []string
 	seen := map[string]bool{}
 	for _, b := range blocks {
-		a, p := parseManifest(b, dir)
+		a, p := parseManifest(b, dirs)
 		problems = append(problems, p...)
 		for _, x := range a {
 			if !seen[x.src] {
@@ -214,6 +261,13 @@ func (e *Engine) stageArtifactsAt(turnKey, stagingID, deliveryPrefix, final stri
 		})
 	}
 	return visible, msgs, problems
+}
+
+func withArtifactProblems(text string, problems []string) string {
+	if len(problems) == 0 {
+		return text
+	}
+	return strings.TrimSpace(text + "\n\n_Some files could not be attached:_\n- " + strings.Join(problems, "\n- "))
 }
 
 // snapshot copies a regular file to dst (replacing an earlier partial copy).

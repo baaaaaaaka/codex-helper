@@ -29,6 +29,7 @@ package harness
 //	<key:N>           cxp-<key>: the store's random turn-key prefix
 //	<turn:N>          cxp-<key>-<turn>: a turn's sequence number (store-wide,
 //	                  so it depends on the start order of concurrent chats)
+//	<conversation-dir> the stable attachment directory (the ID is tested separately)
 //	<file:N>          core-files/<n>/: the store row of a received file
 //	<id:N>            hex ids of 16+ digits after a prefix (del_, rec_,
 //	                  machine:, w-…); the prefix is kept; worker instance
@@ -93,6 +94,7 @@ var genericRules = []struct{ kind, pattern string }{
 	{"upload", `\bcodex-\d{8}-\d{6}-[0-9a-f]{8}\b`},
 	{"turnid", `\bcxp-[0-9a-f]{8}-\d+\b`},
 	{"turnkey", `\bcxp-[0-9a-f]{8}\b`},
+	{"conversationdir", `core-files/outbound/conversation-[0-9]+\b`},
 	{"corefile", `core-files/\d+/`},
 	{"hexid", `\b[a-z][a-z_]*[_:\-][0-9a-f]{16,}\b`},
 	{"hex", `\b[0-9a-f]{24,}\b`},
@@ -222,6 +224,8 @@ func (n *normalizer) norm(text string) string {
 			// turns in start order.
 			i := strings.LastIndexByte(m, '-')
 			return "cxp-" + n.placeholder("key", "\x00"+m[:i]) + "-" + n.placeholder("turn", "\x00"+m)
+		case kind == "conversationdir":
+			return "core-files/outbound/<conversation-dir>"
 		case kind == "corefile":
 			// core-files/<inbound message row>/
 			return "core-files/" + n.placeholder("file", "\x00"+m) + "/"

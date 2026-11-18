@@ -78,7 +78,7 @@ func TestR37_AgentFilesReachChat(t *testing.T) {
 			}
 		}
 		rel := filepath.Base(sub)
-		manifest, _ := json.Marshal(map[string]any{"version": 1, "files": []any{
+		manifest, _ := json.Marshal(map[string]any{"version": 2, "files": []any{
 			map[string]any{"path": rel + "/report.csv", "name": smallName},
 			map[string]any{"path": rel + "/large.bin", "name": largeName},
 		}})
@@ -150,8 +150,8 @@ func TestR37_AgentFilesReachChat(t *testing.T) {
 	}
 	s.Check("R-1 the visible answer is posted once", len(s.SUTMessagesContaining(work.ID, "here are the two files you asked for "+tok)) == 1,
 		"1", fmt.Sprint(len(s.SUTMessagesContaining(work.ID, "here are the two files you asked for "+tok))), tr...)
-	s.Check("F-RND-10 the manifest block is not shown to the user", len(s.SUTMessagesContaining(work.ID, `"version":1`)) == 0,
-		"no manifest JSON in chat", fmt.Sprint(len(s.SUTMessagesContaining(work.ID, `"version":1`))))
+	s.Check("F-RND-10 the manifest block is not shown to the user", len(s.SUTMessagesContaining(work.ID, `"version":2`)) == 0,
+		"no manifest JSON in chat", fmt.Sprint(len(s.SUTMessagesContaining(work.ID, `"version":2`))))
 
 	// Name conflict: a different file under the same name.
 	steps.MustPost(s, work.ID, "Send an updated report under the same name "+tok2)
@@ -193,7 +193,7 @@ func conflictTurn(c harness.CodexCall, tok, name string, data []byte, mu *sync.M
 	if err := os.WriteFile(filepath.Join(sub, "report.csv"), data, 0o600); err != nil {
 		*writeErr = err.Error()
 	}
-	manifest, _ := json.Marshal(map[string]any{"version": 1, "files": []any{
+	manifest, _ := json.Marshal(map[string]any{"version": 2, "files": []any{
 		map[string]any{"path": filepath.Base(sub) + "/report.csv", "name": name},
 	}})
 	return harness.CodexBehavior{Answer: "E2EANSWER here is the updated report " + tok + "\n\n```codex-helper-artifacts\n" + string(manifest) + "\n```\n"}

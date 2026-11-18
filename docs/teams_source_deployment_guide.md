@@ -280,16 +280,17 @@ profiles are no longer supported.
 
 ## 8. Files And Images
 
-Each Codex turn is given its own output directory in its prompt. To return
-files, Codex writes them there and lists them in its final answer:
+Each Teams conversation has a stable output directory named in the Codex
+prompt. Codex writes each new file to a new relative path there and lists
+the paths in its final answer.
 
 ````text
 ```codex-helper-artifacts
-{"version":1,"files":[{"path":"relative/path.ext","name":"display-name.ext"}]}
+{"version":2,"files":[{"path":"relative/path.ext","name":"display-name.ext"}]}
 ```
 ````
 
-The helper accepts only relative paths under that turn's directory, uploads
+The helper accepts only relative paths under that conversation's directory, uploads
 each file, and posts it as an attachment under the given name after the final
 answer. Files and images sent to a work chat are downloaded and handed to
 Codex with the prompt.

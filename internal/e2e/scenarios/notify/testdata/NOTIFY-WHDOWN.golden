@@ -132,14 +132,14 @@
    prompt| Put fractions, sums, integrals, matrices, and display math in <m>TeX</m> on a separate line, never in prose, tables, or lists—even if asked for one line. Use backticks for simple inline/literal TeX. Never use $ or \(...\). Math markers are not artifacts.
    prompt|
    prompt| If you need to return generated files or images to the Teams user, write them under this local directory:
-   prompt| <root>/home/.local/state/codex-helper/teams/core-files/outbound/cxp-<key:1>-<turn:1>
+   prompt| <root>/home/.local/state/codex-helper/teams/core-files/outbound/<conversation-dir>
    prompt|
    prompt| Then include this fenced manifest in your final answer:
    prompt| ```codex-helper-artifacts
-   prompt| {"version":1,"files":[{"path":"relative/path.ext","name":"display-name.ext"}]}
+   prompt| {"version":2,"files":[{"path":"relative/path.ext","name":"display-name.ext"}]}
    prompt| ```
    prompt|
-   prompt| Use only relative manifest paths under that directory. Keep your normal answer visible; the helper will upload listed files separately when file-write auth is available.
+   prompt| The directory is fixed for this Teams conversation. Use a new relative path for each newly generated file and leave it in place after listing it. Keep your normal answer visible; the helper will upload listed files separately when file-write auth is available.
    turn model=gpt-5-codex effort=medium: answered
    prompt| User message:
    prompt| Short question E2E-NOTIFYWHDOWN-final2-2
@@ -155,14 +155,14 @@
    prompt| Put fractions, sums, integrals, matrices, and display math in <m>TeX</m> on a separate line, never in prose, tables, or lists—even if asked for one line. Use backticks for simple inline/literal TeX. Never use $ or \(...\). Math markers are not artifacts.
    prompt|
    prompt| If you need to return generated files or images to the Teams user, write them under this local directory:
-   prompt| <root>/home/.local/state/codex-helper/teams/core-files/outbound/cxp-<key:1>-<turn:2>
+   prompt| <root>/home/.local/state/codex-helper/teams/core-files/outbound/<conversation-dir>
    prompt|
    prompt| Then include this fenced manifest in your final answer:
    prompt| ```codex-helper-artifacts
-   prompt| {"version":1,"files":[{"path":"relative/path.ext","name":"display-name.ext"}]}
+   prompt| {"version":2,"files":[{"path":"relative/path.ext","name":"display-name.ext"}]}
    prompt| ```
    prompt|
-   prompt| Use only relative manifest paths under that directory. Keep your normal answer visible; the helper will upload listed files separately when file-write auth is available.
+   prompt| The directory is fixed for this Teams conversation. Use a new relative path for each newly generated file and leave it in place after listing it. Keep your normal answer visible; the helper will upload listed files separately when file-write auth is available.
 
 == cli
 $ cxp teams workflow enable --webhook-url-file <root>/workflow-webhook-url

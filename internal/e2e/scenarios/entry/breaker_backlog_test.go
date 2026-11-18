@@ -38,9 +38,7 @@ func TestBreakerIgnoresBacklogAfterGap(t *testing.T) {
 		Title:      "first start after a gap: the old helper's last posts and the prompts queued meanwhile pause no chat; every prompt answered once; a live loop still trips",
 		Budget:     150 * time.Second,
 		NoStart:    true,
-		Golden: harness.GoldenOptions{FinishedNotices: "the two work chats answer their queued prompts concurrently",
-			Masks: []harness.Mask{{Pattern: regexp.MustCompile(`(core-files/outbound/cxp-[a-z0-9]+-)[0-9]+`), Replace: "${1}<inbound id>",
-				Reason: "the two chats' first reads are admitted in either order, so their prompts' inbound ids interleave either way"}}},
+		Golden:     harness.GoldenOptions{FinishedNotices: "the two work chats answer their queued prompts concurrently"},
 	})
 	defer s.Finish()
 	const control = "19:control@thread.v2"

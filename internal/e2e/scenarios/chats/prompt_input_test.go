@@ -35,22 +35,22 @@ const v0120Safety = "Teams helper safety:\n" +
 
 const v0120Math = "Put fractions, sums, integrals, matrices, and display math in <m>TeX</m> on a separate line, never in prose, tables, or lists—even if asked for one line. Use backticks for simple inline/literal TeX. Never use $ or \\(...\\). Math markers are not artifacts."
 
-// v0120Envelope is v0.1.20 TeamsCodexPrompt(user) with outbound root dir.
-func v0120Envelope(user, dir string) string {
+// workChatEnvelope spells out the supported Teams prompt and attachment contract.
+func workChatEnvelope(user, dir string) string {
 	return "User message:\n" + user + "\n\n" + v0120Safety + "\n\n" + v0120Math + "\n\n" +
 		"If you need to return generated files or images to the Teams user, write them under this local directory:\n" + dir + "\n\n" +
 		"Then include this fenced manifest in your final answer:\n```codex-helper-artifacts\n" +
-		`{"version":1,"files":[{"path":"relative/path.ext","name":"display-name.ext"}]}` + "\n```\n\n" +
-		"Use only relative manifest paths under that directory. Keep your normal answer visible; the helper will upload listed files separately when file-write auth is available."
+		`{"version":2,"files":[{"path":"relative/path.ext","name":"display-name.ext"}]}` + "\n```\n\n" +
+		"The directory is fixed for this Teams conversation. Use a new relative path for each newly generated file and leave it in place after listing it. Keep your normal answer visible; the helper will upload listed files separately when file-write auth is available."
 }
 
 // TestPromptEnvelope: F-TRN-14. A typed prompt reaches Codex wrapped exactly
-// as v0.1.20 wrapped it, and nothing of the wrapper reaches the chat.
+// with the session attachment contract, and nothing of the wrapper reaches the chat.
 func TestPromptEnvelope(t *testing.T) {
 	harness.Parallel(t)
 	s := harness.NewScenario(t, "F-TRN-14", harness.Options{
 		Guarantees: []string{"F-TRN-14", "R-23"},
-		Title:      "a Teams prompt reaches Codex in v0.1.20's envelope: User message section, safety block, math contract, outbound directory and manifest",
+		Title:      "a Teams prompt reaches Codex with the current envelope: User message section, safety block, math contract, outbound directory and manifest",
 		Budget:     60 * time.Second,
 	})
 	defer s.Finish()
@@ -68,8 +68,8 @@ func TestPromptEnvelope(t *testing.T) {
 	if m := outboundDirRE.FindStringSubmatch(prompt); m != nil {
 		dir = m[1]
 	}
-	want := v0120Envelope("Summarise the build log\nand list the failing tests "+tok, dir)
-	s.Check("F-TRN-14 the prompt is v0.1.20's envelope byte for byte", answered && dir != "" && prompt == want,
+	want := workChatEnvelope("Summarise the build log\nand list the failing tests "+tok, dir)
+	s.Check("F-TRN-14 the prompt matches the expected envelope byte for byte", answered && dir != "" && prompt == want,
 		"User message + safety + math + outbound directory + manifest instructions", firstDiff(prompt, want))
 	s.Check("F-TRN-14 the outbound directory is a directory of this helper", strings.HasPrefix(dir, s.Env.Root+"/"), "under the scenario root", dir)
 	var leaked []string

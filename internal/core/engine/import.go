@@ -336,9 +336,10 @@ func (e *Engine) importApplyOne(j importJob) bool {
 	old := e.mirror.files[path]
 	if old != nil && !job.Rewind && old.src.ConvID == job.Conv && old.src.ID == src.ID {
 		old.ns = job.NS // a sync: the cursor did not move
+		old.historyEnd = job.Until
 	} else {
 		f := &mirrorFile{src: src, info: transcript.FileInfo{Size: src.Size, MTime: fromMS(src.MTime), Inode: src.Inode},
-			ns: job.NS, catchUpEnd: job.Until, catchUpSet: true}
+			ns: job.NS, catchUpEnd: job.Until, catchUpSet: true, historyEnd: job.Until}
 		if job.KeepTeams {
 			f.keepTeams = job.Until
 		}
@@ -389,6 +390,7 @@ func (e *Engine) importRestore(f *mirrorFile) {
 		f.tracker.KeepTeams(j.Until)
 	}
 	f.catchUpEnd = max(f.catchUpEnd, j.Until)
+	f.historyEnd = j.Until
 }
 
 // importProgress records a mirror pass of f in its job (mirrorRead's

@@ -107,7 +107,7 @@ func TestGoalCurrentSnapshotOverridesHistoricalMirror(t *testing.T) {
 	ga.gmu.Lock()
 	ga.goals[th] = GoalState{Objective: "native objective", Status: GoalActive}
 	ga.gmu.Unlock()
-	out, err := r.e.renderMirror(context.Background(), th, transcript.Output{RecordID: "native-goal-no-log", Kind: transcript.OutputFinal, Text: "progress"}, true)
+	out, err := r.e.renderMirror(context.Background(), 0, th, transcript.Output{RecordID: "native-goal-no-log", Kind: transcript.OutputFinal, Text: "progress"}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +117,7 @@ func TestGoalCurrentSnapshotOverridesHistoricalMirror(t *testing.T) {
 	ga.gmu.Lock()
 	delete(ga.goals, th)
 	ga.gmu.Unlock()
-	out, err = r.e.renderMirror(context.Background(), th, transcript.Output{RecordID: "stale-goal-log", Kind: transcript.OutputFinal, Text: "progress", Info: transcript.Info{Goal: &transcript.Goal{Objective: "stale objective", Status: GoalActive}}}, true)
+	out, err = r.e.renderMirror(context.Background(), 0, th, transcript.Output{RecordID: "stale-goal-log", Kind: transcript.OutputFinal, Text: "progress", Info: transcript.Info{Goal: &transcript.Goal{Objective: "stale objective", Status: GoalActive}}}, true)
 	if err != nil {
 		t.Fatal(err)
 	}

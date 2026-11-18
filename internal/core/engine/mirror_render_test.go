@@ -37,7 +37,7 @@ func TestMirrorRendersV0120Labels(t *testing.T) {
 	}
 	const footer = "<p><strong>🔧 Helper:</strong> ✅ Codex finished responding.</p>"
 
-	short, err := e.renderMirror(ctx, "th", transcript.Output{RecordID: "r1", User: true, Text: "看一下这个问题"}, false)
+	short, err := e.renderMirror(ctx, 0, "th", transcript.Output{RecordID: "r1", User: true, Text: "看一下这个问题"}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +45,7 @@ func TestMirrorRendersV0120Labels(t *testing.T) {
 		t.Fatalf("short prompt: %q", content(short[0].Body))
 	}
 
-	ans, err := e.renderMirror(ctx, "th", transcript.Output{RecordID: "r3", Text: "Done."}, false)
+	ans, err := e.renderMirror(ctx, 0, "th", transcript.Output{RecordID: "r3", Text: "Done."}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -66,7 +66,7 @@ func TestMirrorRendersV0120Labels(t *testing.T) {
 		if user {
 			label = "🧑‍💻 User"
 		}
-		long, err := e.renderMirror(ctx, "th", transcript.Output{RecordID: "r2", User: user, Text: b.String()}, false)
+		long, err := e.renderMirror(ctx, 0, "th", transcript.Output{RecordID: "r2", User: user, Text: b.String()}, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -107,7 +107,7 @@ func TestSharedNativeAnswerStagesSteeredArtifacts(t *testing.T) {
 		t.Fatal(err)
 	}
 	o := transcript.Output{Kind: transcript.OutputFinal, RecordID: "answer", TurnID: "native-turn", Text: "Done.\n```codex-helper-artifacts\n{\"version\":1,\"files\":[{\"path\":\"result.txt\",\"name\":\"result.txt\"}]}\n```"}
-	msgs, err := e.renderMirror(context.Background(), "thread", o, true)
+	msgs, err := e.renderMirror(context.Background(), 1, "thread", o, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,8 +121,41 @@ func TestSharedNativeAnswerStagesSteeredArtifacts(t *testing.T) {
 	if err != nil || string(data) != "result" {
 		t.Fatalf("snapshot: %q %v", data, err)
 	}
-	again, err := e.renderMirror(context.Background(), "thread", o, true)
+	again, err := e.renderMirror(context.Background(), 1, "thread", o, true)
 	if err != nil || again[1].DeliveryKey != msgs[1].DeliveryKey {
 		t.Fatal("artifact delivery is not idempotent")
+	}
+}
+
+func TestMirrorArtifactFailuresAndHistoryHideManifest(t *testing.T) {
+	ad, err := teams.New(teams.Config{Tokens: fidelityTokens{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := &Engine{ch: ad, cfg: Config{FilesDir: t.TempDir()}}
+	o := transcript.Output{
+		RecordID: "answer", TurnID: "new-turn", Kind: transcript.OutputFinal, GoalTriggered: true,
+		Text: "Done.\n``` CODEX-HELPER-ARTIFACTS\n" +
+			`{"version":2,"files":[{"path":"result.txt"}]}` + "\n```",
+	}
+	missing, err := e.renderMirror(context.Background(), 2, "thread", o, true)
+	if err != nil || len(missing) != 1 || !strings.Contains(missing[0].Body, "result.txt: the conversation output directory is unavailable") ||
+		strings.Contains(missing[0].Body, "version") || missing[0].File != nil {
+		t.Fatalf("missing root: %v, %v", missing, err)
+	}
+	root := e.conversationOutboundDir(2)
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "result.txt"), []byte("result"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := e.renderMirrorMode(context.Background(), 2, "thread", o, false, false, true)
+	if err != nil || len(replayed) != 1 || strings.Contains(replayed[0].Body, "result.txt") || replayed[0].File != nil {
+		t.Fatalf("history: %v, %v", replayed, err)
+	}
+	recovered, err := e.renderMirrorMode(context.Background(), 2, "thread", o, false, true, false)
+	if err != nil || len(recovered) != 2 || recovered[1].File == nil {
+		t.Fatalf("recovery: %v, %v", recovered, err)
 	}
 }

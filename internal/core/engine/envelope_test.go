@@ -15,9 +15,8 @@ import (
 // TestCodexInputMatchesV0120 compares the Codex input of fixed messages
 // with v0.1.20's bytes (testdata/v0120_envelope.json: the output of
 // v0.1.20 executionInputWithPreparedTeamsContext for the same inputs, its
-// outbound root replaced by <ROOT>). The only differences are the owner's:
-// the `helper reload now` line is gone and the delegation line names native
-// subagents first (SPEC F-TRN-14, ae23659).
+// outbound root replaced by <ROOT>). Apply the documented safety updates
+// and version 2 attachment contract before comparing the rest byte for byte.
 func TestCodexInputMatchesV0120(t *testing.T) {
 	data, err := os.ReadFile(filepath.Join("testdata", "v0120_envelope.json"))
 	if err != nil {
@@ -33,6 +32,8 @@ func TestCodexInputMatchesV0120(t *testing.T) {
 	owner := strings.NewReplacer(
 		"- Tell the user to send `helper reload now` only for source-checkout development reloads when a local `codex-helper` source tree is available.\n", "",
 		"- For cross-machine agent delegation,", "- Subagent requests use native Codex subagents. For cross-machine agent delegation,",
+		`{"version":1,"files":[{"path":"relative/path.ext","name":"display-name.ext"}]}`, `{"version":2,"files":[{"path":"relative/path.ext","name":"display-name.ext"}]}`,
+		"Use only relative manifest paths under that directory.", "The directory is fixed for this Teams conversation. Use a new relative path for each newly generated file and leave it in place after listing it.",
 	)
 	dir := t.TempDir()
 	write := func(name, text string) string {

@@ -94,8 +94,12 @@ func TestCLIRequestRefusals(t *testing.T) {
 // gets the moved link, the session answers in the new one, and the same
 // request handed in again returns the saved result without a second chat.
 func TestCLIRecreateWorkChatOnceByChatID(t *testing.T) {
-	r, e := cliRig(t)
+	r, e := cliRig(t, func(c *Config) { c.FilesDir = t.TempDir() })
 	old := r.newWork(t.TempDir())
+	r.ch.PostUser(old, "before recreate")
+	r.wait("answer in the original chat", func() bool { return len(r.own(old, "ANSWER to before recreate")) == 1 })
+	first := r.ag.runLog()[0]
+	root := e.conversationOutboundDir(first.ConvID)
 	req := CLIRequest{ID: "17-ab", Op: CLIRecreateChat, Selector: strings.ToUpper(old)}
 	res := cliRun(t, e, req)
 	if res.Error != "" {
@@ -130,6 +134,10 @@ func TestCLIRecreateWorkChatOnceByChatID(t *testing.T) {
 
 	r.ch.PostUser(fresh, "after recreate")
 	r.wait("answer in the new chat", func() bool { return len(r.own(fresh, "ANSWER to after recreate")) == 1 })
+	resumed := r.ag.runLog()[1]
+	if resumed.ConvID != first.ConvID || !strings.Contains(first.Text, root+"\n") || !strings.Contains(resumed.Text, root+"\n") {
+		t.Fatalf("recreated chat did not keep the original conversation attachment directory %q", root)
+	}
 	r.ch.PostUser(old, "in the old chat")
 	time.Sleep(300 * time.Millisecond)
 	if n := len(r.own(old, "ANSWER to in the old chat")); n != 0 {

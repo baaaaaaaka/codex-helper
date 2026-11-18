@@ -52,7 +52,12 @@ func TestOrdinaryInputSteersWithoutAnotherTurnSlot(t *testing.T) {
 	if !strings.Contains(a.inputs[0].Text, teamsSteerSafety) || strings.Contains(a.inputs[0].Text, teamsRequestSafety) {
 		t.Fatal("steer must retain the active task's context")
 	}
-	ownerRoot := r.e.outboundDir(a.runLog()[0].TurnKey)
+	const directoryLead = "write them under this local directory:\n"
+	_, rst, ok := strings.Cut(a.runLog()[0].Text, directoryLead)
+	ownerRoot, _, _ := strings.Cut(rst, "\n")
+	if !ok || ownerRoot == "" {
+		t.Fatal("first request has no artifact directory")
+	}
 	if !strings.Contains(a.inputs[0].Text, ownerRoot) {
 		t.Fatal("steer changed the active execution's artifact directory")
 	}
@@ -119,7 +124,7 @@ func TestOrdinaryInputTargetsNativeTurnWithOrWithoutQueuedObserver(t *testing.T)
 			a := &steerAgent{fakeAgent: newAgent()}
 			release := make(chan struct{})
 			a.block["later task"] = release
-			r := newRig(t, func(c *Config) { c.Agent = a; c.Turns = 1 })
+			r := newRig(t, func(c *Config) { c.Agent = a; c.Turns = 1; c.FilesDir = t.TempDir() })
 			r.ag = a.fakeAgent
 			work := r.newWork(t.TempDir())
 			r.ch.PostUser(work, "seed")
@@ -134,8 +139,15 @@ func TestOrdinaryInputTargetsNativeTurnWithOrWithoutQueuedObserver(t *testing.T)
 			r.ch.PostUser(work, "additional direction")
 			r.wait("input delivered", func() bool { return a.count() == 1 })
 			a.smu.Lock()
-			target := a.targets[0]
+			target, prompt := a.targets[0], a.inputs[0].Text
 			a.smu.Unlock()
+			const directoryLead = "write them under this local directory:\n"
+			_, rest, ok := strings.Cut(a.runLog()[0].Text, directoryLead)
+			dir, _, _ := strings.Cut(rest, "\n")
+			if !ok || dir == "" || !strings.Contains(prompt, directoryLead+dir+"\n") ||
+				!strings.Contains(prompt, `"version":2`) {
+				t.Fatal("steer into native turn lost the original conversation directory or manifest version")
+			}
 			if target != "native-active" {
 				t.Fatalf("wrong target %q", target)
 			}

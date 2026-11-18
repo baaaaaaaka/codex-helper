@@ -137,7 +137,7 @@ Work chat commands:
 - `helper restart`: restart the helper (see `restart` above).
 - `helper help`: the command list.
 
-Codex returns files to a work chat by writing them under the per-turn directory named in its prompt and listing them in a `codex-helper-artifacts` block of the final answer.
+Codex returns files to a work chat by writing them under the conversation directory named in its prompt and listing their relative paths in a version 2 `codex-helper-artifacts` block of the final answer. Use a new relative path for each new file.
 
 ## Skills
 

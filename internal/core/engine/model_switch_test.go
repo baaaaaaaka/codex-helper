@@ -155,9 +155,14 @@ func TestSwitchCoalescesAndUsesPendingInput(t *testing.T) {
 	r.wait("latest setting committed", func() bool { return len(r.own(work, "Target model: Codex Official (`model-c`)")) > 0 })
 	close(gate)
 	r.wait("continuation with updates", func() bool { return len(a.runLog()) == 2 })
-	run := a.runLog()[1]
+	runs := a.runLog()
+	run := runs[1]
 	if run.Model != "model-c" || run.Effort != "high" || !strings.Contains(run.Text, "use staging") || !strings.Contains(run.Text, "keep the original scope") || !strings.Contains(run.Text, teamsSteerSafety) || strings.Contains(run.Text, teamsRequestSafety) || strings.Contains(run.Text, "original task") {
 		t.Fatalf("continuation: %+v", run)
+	}
+	root := r.e.conversationOutboundDir(run.ConvID)
+	if !strings.Contains(runs[0].Text, root+"\n") || strings.Count(run.Text, root+"\n") != 2 || !strings.Contains(run.Text, `"version":2`) {
+		t.Fatalf("continuation did not keep the original conversation directory: %s", run.Text)
 	}
 	r.wait("answer", func() bool { return len(r.own(work, "ANSWER to")) > 0 })
 }

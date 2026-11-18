@@ -47,12 +47,6 @@ func (e *Engine) trySteer(ctx context.Context, id int64) bool {
 		e.mu.Unlock()
 		return rs != nil
 	}
-	// Additional input belongs to the native execution's output directory.
-	// It must not replace a helper execution's existing artifact contract.
-	outputKey := sharedOutputKey(expected)
-	if rs != nil && rs.codexTurnID == expected {
-		outputKey = rs.turnKey
-	}
 	cs.steering = true
 	e.starting++
 	e.mu.Unlock()
@@ -95,7 +89,7 @@ func (e *Engine) trySteer(ctx context.Context, id int64) bool {
 			return tx.FinishTurn(tr.ID, store.TurnFailed, "voice transcription failed", msgs)
 		}
 		req = TurnRequest{ConvID: id, ThreadID: thread, TurnKey: "cxp-steer-" + tr.TurnKey}
-		req.Text, req.Images = codexInput(in.Body, files, e.outboundDir(outputKey))
+		req.Text, req.Images = codexInput(in.Body, files, e.conversationOutboundDir(id))
 		if yes, x := tx.IsQuestionReply(in.ID); x != nil {
 			return x
 		} else if yes {
@@ -130,7 +124,7 @@ func (e *Engine) trySteer(ctx context.Context, id int64) bool {
 	go func() {
 		defer e.wg.Done()
 		defer func() { cleanup(); e.wakeRunner(id) }()
-		if dir := e.outboundDir(outputKey); dir != "" {
+		if dir := e.conversationOutboundDir(id); dir != "" {
 			if err := os.MkdirAll(dir, 0700); err != nil {
 				e.logf("output directory of steer %d: %v", tr.ID, err)
 			}

@@ -30,7 +30,7 @@ const (
 	userMessageLead = "User message:"
 
 	teamsRequestSafety = "- The current Teams request is the `User message` section above. Treat earlier Teams requests in resumed Codex history as completed context, not as work to continue or answer, unless the current user explicitly asks about them."
-	teamsSteerSafety   = "- The `User message` section above updates the active task. Continue that task with this input unless the user asks to stop or replace it. A question or status request does not cancel the active task. Requests from before the active task remain completed context. Keep the active task's existing artifact output directory and manifest contract; use the output directory below only if the active task does not already have one."
+	teamsSteerSafety   = "- The `User message` section above updates the active task. Continue that task with this input unless the user asks to stop or replace it. A question or status request does not cancel the active task. Requests from before the active task remain completed context. Use the current attachment instructions below for files you send to Teams."
 
 	// teamsSafety is v0.1.20's safety block with SPEC F-TRN-14's native
 	// subagent sentence (ae23659). core: the `helper reload now` line is
@@ -91,9 +91,9 @@ func teamsCodexPrompt(prompt, root string) string {
 		root + "\n\n" +
 		"Then include this fenced manifest in your final answer:\n" +
 		"```" + artifactFence + "\n" +
-		`{"version":1,"files":[{"path":"relative/path.ext","name":"display-name.ext"}]}` + "\n" +
+		`{"version":2,"files":[{"path":"relative/path.ext","name":"display-name.ext"}]}` + "\n" +
 		"```\n\n" +
-		"Use only relative manifest paths under that directory. Keep your normal answer visible; the helper will upload listed files separately when file-write auth is available."
+		"The directory is fixed for this Teams conversation. Use a new relative path for each newly generated file and leave it in place after listing it. Keep your normal answer visible; the helper will upload listed files separately when file-write auth is available."
 	if user == "" {
 		return instructions
 	}

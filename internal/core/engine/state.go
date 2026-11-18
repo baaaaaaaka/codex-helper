@@ -133,7 +133,6 @@ type runState struct {
 	codexTurnID  string
 	steerExpired bool
 	turnID       int64
-	turnKey      string
 	clientKey    string
 	cancelled    bool
 	switching    bool
