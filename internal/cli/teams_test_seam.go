@@ -84,6 +84,8 @@ var teamsTestSeamTimingKnobs = map[string]func(*engine.Timing, time.Duration){
 	"SilenceRepeat":     func(t *engine.Timing, d time.Duration) { t.SilenceRepeat = d },
 	"SilenceCancelHint": func(t *engine.Timing, d time.Duration) { t.SilenceCancelHint = d },
 	"SilenceStuck":      func(t *engine.Timing, d time.Duration) { t.SilenceStuck = d },
+	"NativeQuietHint":   func(t *engine.Timing, d time.Duration) { t.NativeQuietHint = d },
+	"Maintenance":       func(t *engine.Timing, d time.Duration) { t.Maintenance = d },
 	// DuplicateFor: the window in which a repeated prompt is ignored (3 min).
 	"DuplicateFor": func(t *engine.Timing, d time.Duration) { t.DuplicateFor = d },
 	// Heartbeat: the store owner's heartbeat (30 s), which bounds how soon

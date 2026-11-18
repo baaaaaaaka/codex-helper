@@ -56,6 +56,15 @@ const activeSendOrder = `CASE WHEN state='sending' THEN 0 WHEN kind='mirror' AND
 const sendHeadSQL = `SELECT id FROM outbox WHERE conv_id=? AND state IN ('queued','sending') AND hold_turn IS NULL ORDER BY ` + activeSendOrder + ` LIMIT 1`
 const recoveryHeadSQL = `SELECT id FROM outbox WHERE conv_id=? AND state IN ('queued','sending') AND hold_turn IS NULL ORDER BY CASE WHEN state='sending' THEN 0 ELSE 1 END, seq LIMIT 1`
 
+// HasOtherActiveOutbox reports whether a conversation has sendable or
+// in-flight work besides the specified row (zero checks all rows).
+func (t *Tx) HasOtherActiveOutbox(convID, exceptID int64) (bool, error) {
+	var pending bool
+	err := t.row(`SELECT EXISTS(SELECT 1 FROM outbox
+WHERE conv_id=? AND state IN ('queued','sending') AND hold_turn IS NULL AND id<>?)`, convID, exceptID).Scan(&pending)
+	return pending, err
+}
+
 // NextSendable returns, for every conversation, its head pending row when
 // that row is queued and due. Queued recovery yields to current messages;
 // ordinary FIFO and in-flight ownership are preserved. Only queued/sending

@@ -53,7 +53,7 @@
    | <p>!status</p>
 -- <msg:4> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>s001 (active): idle, 0 queued. Directory: <code><root>/work/forms</code>. Auto park: on. Goal status: unconfirmed.</p>
+   | <p>s001 (active): idle, 0 queued. Directory: <code><root>/work/forms</code>. Auto park: on. Native turn: none observed. Goal status: unconfirmed.</p>
 -- <msg:5> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>/status</p>
@@ -62,7 +62,7 @@
    | <p>/status</p>
 -- <msg:6> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>s001 (active): idle, 0 queued. Directory: <code><root>/work/forms</code>. Auto park: on. Goal status: unconfirmed.</p>
+   | <p>s001 (active): idle, 0 queued. Directory: <code><root>/work/forms</code>. Auto park: on. Native turn: none observed. Goal status: unconfirmed.</p>
 -- <msg:7> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>cx st</p>
@@ -71,7 +71,7 @@
    | <p>cx st</p>
 -- <msg:8> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>s001 (active): idle, 0 queued. Directory: <code><root>/work/forms</code>. Auto park: on. Goal status: unconfirmed.</p>
+   | <p>s001 (active): idle, 0 queued. Directory: <code><root>/work/forms</code>. Auto park: on. Native turn: none observed. Goal status: unconfirmed.</p>
 -- <msg:9> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>codex status</p>
@@ -80,7 +80,7 @@
    | <p>codex status</p>
 -- <msg:10> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>s001 (active): idle, 0 queued. Directory: <code><root>/work/forms</code>. Auto park: on. Goal status: unconfirmed.</p>
+   | <p>s001 (active): idle, 0 queued. Directory: <code><root>/work/forms</code>. Auto park: on. Native turn: none observed. Goal status: unconfirmed.</p>
 -- <msg:11> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>Helper: status</p>
@@ -89,7 +89,7 @@
    | <p>Helper: status</p>
 -- <msg:12> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>s001 (active): idle, 0 queued. Directory: <code><root>/work/forms</code>. Auto park: on. Goal status: unconfirmed.</p>
+   | <p>s001 (active): idle, 0 queued. Directory: <code><root>/work/forms</code>. Auto park: on. Native turn: none observed. Goal status: unconfirmed.</p>
 -- <msg:13> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>!st</p>
@@ -98,7 +98,7 @@
    | <p>!st</p>
 -- <msg:14> helper (html)
    | <!-- codex-helper-outbox:<marker> --><p><strong>🔧 Helper:</strong></p>
-   | <p>s001 (active): idle, 0 queued. Directory: <code><root>/work/forms</code>. Auto park: on. Goal status: unconfirmed.</p>
+   | <p>s001 (active): idle, 0 queued. Directory: <code><root>/work/forms</code>. Auto park: on. Native turn: none observed. Goal status: unconfirmed.</p>
 -- <msg:15> owner (html)
    | <p><strong>🧑‍💻 User:</strong></p>
    | <p>!x</p>

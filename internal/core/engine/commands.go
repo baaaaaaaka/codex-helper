@@ -471,6 +471,7 @@ func (e *Engine) workStatus(cs *convState) string {
 	label, state, cwd, running, paused := cs.label, cs.state, cs.cwd, cs.running != nil, cs.paused
 	autoParkOff := cs.autoParkOff
 	e.mu.Unlock()
+	info := e.turnInfo(cs.id)
 	var queued, unsent, unconfirmed int
 	_ = e.update(func(tx *store.Tx) error {
 		open, err := tx.OpenTurnsOf(cs.id)
@@ -488,6 +489,8 @@ func (e *Engine) workStatus(cs *convState) string {
 	run := "idle"
 	if running {
 		run = "running a request"
+	} else if info.NativeTurn != "" {
+		run = "no helper request running"
 	}
 	p := ""
 	if paused {
@@ -498,7 +501,12 @@ func (e *Engine) workStatus(cs *convState) string {
 		text += fmt.Sprintf(" Delivery: %d awaiting send, %d unconfirmed (retained without automatic resend; later messages can continue).", unsent, unconfirmed)
 	}
 	if _, ok := e.ag.(GoalAgent); ok {
-		g := e.turnInfo(cs.id).Goal
+		g := info.Goal
+		if info.NativeTurn != "" {
+			text += " Native turn: running."
+		} else {
+			text += " Native turn: none observed."
+		}
 		status := "unconfirmed"
 		if g.Known {
 			status = g.Status

@@ -378,6 +378,23 @@ func (s *server) dispatch(msg message) (any, *rpcError) {
 		s.submitMu.Lock()
 		defer s.submitMu.Unlock()
 		return s.startTurn(p)
+	case "fakecodex/continueGoal":
+		thread := str("threadId")
+		s.submitMu.Lock()
+		defer s.submitMu.Unlock()
+		s.mu.Lock()
+		goal := s.goals[thread]
+		t := s.loaded[thread]
+		if goal["status"] != "active" || t == nil || t.Active() {
+			s.mu.Unlock()
+			return nil, invalid("no active goal on an idle loaded thread")
+		}
+		objective := goal["objective"]
+		s.mu.Unlock()
+		return s.startTurn(map[string]any{
+			"threadId": thread, "continueGoal": true,
+			"input": []any{map[string]any{"type": "text", "text": objective}},
+		})
 	case "turn/steer":
 		s.submitMu.Lock()
 		defer s.submitMu.Unlock()
@@ -588,9 +605,10 @@ func (s *server) startTurn(p map[string]any) (any, *rpcError) {
 		return nil, &rpcError{Code: -32603, Message: "client gone"}
 	}
 	now := time.Now().Unix()
-	turn := &Turn{
-		ID: turnID, Status: StatusInProgress, OwnerPID: os.Getpid(), StartedAt: now,
-		Items: []map[string]any{{"type": "userMessage", "id": newID(), "clientId": nullable(clientID), "content": content}},
+	goalContinuation, _ := p["continueGoal"].(bool)
+	turn := &Turn{ID: turnID, Status: StatusInProgress, OwnerPID: os.Getpid(), StartedAt: now}
+	if !goalContinuation {
+		turn.Items = []map[string]any{{"type": "userMessage", "id": newID(), "clientId": nullable(clientID), "content": content}}
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	rt := &runningTurn{threadID: threadID, turnID: turnID, cwd: cwd, plan: plan, ctx: ctx, cancel: cancel, done: make(chan struct{})}
@@ -602,7 +620,7 @@ func (s *server) startTurn(p map[string]any) (any, *rpcError) {
 	// Like Codex, the rollout gets the turn start and the user message
 	// right away; the rest is appended when the turn ends.
 	if w := s.rolloutLocked(t); w != nil {
-		open, werr := w.BeginTurn(rollout.Turn{ID: turnID, ClientID: clientID, Prompt: prompt})
+		open, werr := w.BeginTurn(rollout.Turn{ID: turnID, ClientID: clientID, Prompt: prompt, GoalContinuation: goalContinuation})
 		if werr != nil {
 			fmt.Fprintf(s.cfg.Log, "fakecodex: rollout: %v\n", werr)
 		} else {
@@ -618,7 +636,9 @@ func (s *server) startTurn(p map[string]any) (any, *rpcError) {
 		// Real Codex announces the turn right after accepting it.
 		time.Sleep(5 * time.Millisecond)
 		s.notify("turn/started", map[string]any{"threadId": threadID, "turn": view})
-		s.notify("item/completed", map[string]any{"threadId": threadID, "turnId": turnID, "item": map[string]any{"type": "userMessage", "clientId": clientID, "id": turnID + "-user", "content": content}})
+		if !goalContinuation {
+			s.notify("item/completed", map[string]any{"threadId": threadID, "turnId": turnID, "item": map[string]any{"type": "userMessage", "clientId": clientID, "id": turnID + "-user", "content": content}})
+		}
 		s.runTurn(rt, t, turn)
 	}()
 	if plan.MalformedStart {
@@ -690,6 +710,9 @@ func (s *server) runTurn(rt *runningTurn, t *Thread, turn *Turn) {
 	}
 	questionAnswer := s.askQuestions(rt, t, turn)
 	for _, command := range rt.plan.Exec {
+		item := map[string]any{"type": "commandExecution", "id": newID(), "command": command}
+		event := map[string]any{"threadId": rt.threadID, "turnId": rt.turnID, "item": item}
+		s.notify("item/started", event)
 		cctx, cancel := context.WithTimeout(rt.ctx, 60*time.Second)
 		cmd := exec.CommandContext(cctx, "sh", "-c", command)
 		cmd.Dir = rt.cwd
@@ -697,6 +720,7 @@ func (s *server) runTurn(rt *runningTurn, t *Thread, turn *Turn) {
 		err := cmd.Run()
 		cancel()
 		fmt.Fprintf(s.cfg.Log, "fakecodex: exec %q: %v\n", command, err)
+		s.notify("item/completed", event)
 	}
 	for i := 0; i < rt.plan.Compactions; i++ {
 		if rt.rollout != nil {

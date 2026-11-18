@@ -269,7 +269,8 @@ func (w *Writer) Written() []Written {
 
 // Turn describes one turn to append.
 type Turn struct {
-	Unphased bool
+	Unphased         bool
+	GoalContinuation bool // goal-triggered turn without a user item
 	// ID is the Codex turn id. Empty generates one.
 	ID string
 	// ClientID is the turn/start clientUserMessageId, recorded as client_id
@@ -328,7 +329,12 @@ func (w *Writer) BeginTurn(turn Turn) (OpenTurn, error) {
 		turnID = w.uuid()
 	}
 	startedAt := w.clock
-	w.logWritten("prompt", turn.Prompt)
+	trigger := "user"
+	if turn.GoalContinuation {
+		trigger = "goal"
+	} else {
+		w.logWritten("prompt", turn.Prompt)
+	}
 	userID := "msg_" + w.uuid()
 	clientID := turn.ClientID
 	if clientID == "" {
@@ -344,7 +350,7 @@ func (w *Writer) BeginTurn(turn Turn) (OpenTurn, error) {
 		line(w.tick(), "event_msg", map[string]any{
 			"type": "task_started",
 			"turn_attribution": map[string]any{
-				"turn_id": turnID, "turn_trigger": "user", "parent_turn_id": nil,
+				"turn_id": turnID, "turn_trigger": trigger, "parent_turn_id": nil,
 				"initiating_agent_path": nil, "root_turn_id": turnID,
 			},
 			"turn_id": turnID, "root_turn_id": turnID, "started_at": startedAt.Unix(),
@@ -356,20 +362,22 @@ func (w *Writer) BeginTurn(turn Turn) (OpenTurn, error) {
 			"sandbox_policy": map[string]any{"type": "workspace-write", "writable_roots": []any{}, "network_access": false},
 			"model":          "gpt-5-codex", "effort": "medium", "summary": "auto",
 		}),
-		line(w.tick(), "response_item", map[string]any{
+	}
+	if !turn.GoalContinuation {
+		recs = append(recs, line(w.tick(), "response_item", map[string]any{
 			"type": "message", "id": userID, "role": "user",
 			"content": content,
 			"internal_chat_message_metadata_passthrough": userPassthrough,
 		}),
-		line(w.tick(), "event_msg", w.itemCompleted(turnID, map[string]any{
-			"type": "UserMessage", "id": w.uuid(), "client_id": clientID,
-			"content": []any{map[string]any{"type": "text", "text": turn.Prompt, "text_elements": []any{}}},
-		})),
-		line(w.tick(), "response_item", map[string]any{
-			"type": "reasoning", "id": "rs_" + w.hex(48), "summary": []any{},
-			"encrypted_content": "gAAAAABe2e-not-real-reasoning",
-		}),
+			line(w.tick(), "event_msg", w.itemCompleted(turnID, map[string]any{
+				"type": "UserMessage", "id": w.uuid(), "client_id": clientID,
+				"content": []any{map[string]any{"type": "text", "text": turn.Prompt, "text_elements": []any{}}},
+			})))
 	}
+	recs = append(recs, line(w.tick(), "response_item", map[string]any{
+		"type": "reasoning", "id": "rs_" + w.hex(48), "summary": []any{},
+		"encrypted_content": "gAAAAABe2e-not-real-reasoning",
+	}))
 	return OpenTurn{ID: turnID, startedAt: startedAt}, w.append(recs...)
 }
 

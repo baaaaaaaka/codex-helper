@@ -97,8 +97,9 @@ type convState struct {
 	seen      map[string]time.Time // ext ids admitted or classified recently
 
 	// runner
-	running  *runState
-	steering bool
+	running     *runState
+	steering    bool
+	nativeQuiet nativeQuietState
 	// lastTurnEnd is when a started turn of this conversation last ended:
 	// a queued turn admitted before it waited behind it (R-35).
 	lastTurnEnd time.Time

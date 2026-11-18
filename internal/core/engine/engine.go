@@ -64,6 +64,7 @@ type Timing struct {
 	// turn is never stopped (F-TRN-18).
 	SilenceHint, SilenceCancelHint, SilenceStuck time.Duration
 	SilenceRepeat                                time.Duration // 0 disables repetition
+	NativeQuietHint                              time.Duration // delay before the one-shot native turn notice
 	// R-35: reminder cadence for a turn that stays queued (0 disables).
 	QueueReminder time.Duration
 	// ThrottleFloor is the wait after a throttle response that names no
@@ -98,14 +99,15 @@ func ProductionTiming() Timing {
 		DuplicateFor: 3 * time.Minute, BreakerWindow: time.Minute, BreakerCount: 3,
 		SilenceHint: 2 * time.Minute, SilenceRepeat: 5 * time.Minute,
 		SilenceCancelHint: 7 * time.Minute, SilenceStuck: 15 * time.Minute,
-		QueueReminder: 10 * time.Minute,
-		ThrottleFloor: 10 * time.Second,
-		PaceIncrease:  30 * time.Second,
-		Registry:      5 * time.Minute,
-		UpdateCheck:   30 * time.Minute,
-		UpdateDrain:   10 * time.Minute,
-		CodexDrain:    30 * time.Minute,
-		RetryStatus:   5 * time.Minute,
+		NativeQuietHint: 5 * time.Minute,
+		QueueReminder:   10 * time.Minute,
+		ThrottleFloor:   10 * time.Second,
+		PaceIncrease:    30 * time.Second,
+		Registry:        5 * time.Minute,
+		UpdateCheck:     30 * time.Minute,
+		UpdateDrain:     10 * time.Minute,
+		CodexDrain:      30 * time.Minute,
+		RetryStatus:     5 * time.Minute,
 	}
 }
 

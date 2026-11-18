@@ -1052,6 +1052,7 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 	}
 	e.mu.Unlock()
 	var posted int
+	var nativeProgressTurn string
 	var localActivity bool
 	released := false
 	var liveThrough int64 // the seq of the last row queued for a live record
@@ -1062,6 +1063,7 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 		saved = f.infoSaved
 		anyLive := false
 		localActivity = false
+		nativeProgressTurn = ""
 		var msgs []store.OutMsg
 		firstLive := false
 		for _, r := range rs {
@@ -1091,6 +1093,9 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 				firstLive = live
 			}
 			anyLive = anyLive || (live && len(r.msgs) > 0)
+			if live && len(r.msgs) > 0 && r.o.Kind == transcript.OutputStatus {
+				nativeProgressTurn = r.o.TurnID
+			}
 			localActivity = localActivity || (!recovery(r.o) && len(r.msgs) > 0)
 			msgs = append(msgs, r.msgs...)
 			posted++
@@ -1196,6 +1201,13 @@ func (e *Engine) mirrorRead(ctx context.Context, f *mirrorFile, info transcript.
 	f.recoveryEnd = recoveryEnd
 	if !more {
 		f.info = info
+	}
+	if nativeProgressTurn != "" {
+		e.mu.Lock()
+		if cs := e.convs[f.src.ConvID]; cs != nil && cs.nativeQuiet.turn == nativeProgressTurn {
+			cs.nativeQuiet.since = e.now()
+		}
+		e.mu.Unlock()
 	}
 	if liveThrough > 0 {
 		e.markLive(f.src.ConvID, liveThrough)

@@ -257,6 +257,19 @@ func (e *Engine) sendPass(ctx context.Context, sem chan struct{}) time.Duration 
 				soon(wait)
 				continue
 			}
+			if strings.HasPrefix(r.DeliveryKey, nativeQuietPrefix) {
+				valid, err := e.nativeQuietSendable(tx, r)
+				if err != nil {
+					return err
+				}
+				if !valid {
+					if err := tx.Drop(r.ID, "native turn notice is no longer current"); err != nil {
+						return err
+					}
+					soon(e.t.Tick)
+					continue
+				}
+			}
 			// The send slot first: a write token taken while every slot
 			// is busy would be wasted (review L9).
 			select {

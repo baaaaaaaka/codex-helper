@@ -168,6 +168,7 @@ func (e *Engine) maintenanceLoop(ctx context.Context) {
 			e.maintainQuestions(ctx)
 			e.ag.Maintain()
 			e.remindQueued()
+			e.remindQuietNativeTurns()
 			e.retryCreating()
 			e.announcePass()
 			e.parkIdle()
